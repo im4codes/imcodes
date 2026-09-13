@@ -210,30 +210,6 @@
   margin-left: 0;
 }
 
-.remote-desktop-workspace-picker {
-  position: absolute;
-  z-index: 3;
-  top: 48px;
-  right: 12px;
-  display: grid;
-  width: min(360px, calc(100% - 24px));
-  max-height: 340px;
-  overflow: auto;
-  gap: 6px;
-  padding: 10px;
-  border: 1px solid var(--chrome-line);
-  border-radius: 10px;
-  background: var(--chrome-panel);
-  box-shadow: 0 12px 36px rgb(0 0 0 / 28%);
-}
-
-.remote-desktop-workspace-picker > button {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  text-align: left;
-}
-
 .remote-desktop-workspace-wall {
   position: relative;
   flex: 1;

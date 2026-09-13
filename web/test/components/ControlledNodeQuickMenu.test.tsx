@@ -65,17 +65,70 @@ describe('ControlledNodeQuickMenu', () => {
     expect(screen.getByText('Offline Two')).toBeTruthy();
     expect(screen.getByText('Linux Three')).toBeTruthy();
 
-    const remoteButtons = screen.getAllByRole('menuitem', { name: /remote_desktop\.open/ });
-    expect(remoteButtons).toHaveLength(3);
-    expect((remoteButtons[0] as HTMLButtonElement).disabled).toBe(false);
-    expect((remoteButtons[1] as HTMLButtonElement).disabled).toBe(true);
+    // The whole row is the control: no separate per-row button any more.
+    expect(screen.queryByRole('menuitem', { name: /remote_desktop\.open/ })).toBeNull();
+    const rows = screen.getAllByRole('menuitem');
+    expect(rows).toHaveLength(3);
+    expect(rows[0].getAttribute('aria-disabled')).toBeNull();
+    expect(rows[1].getAttribute('aria-disabled')).toBe('true');
+    expect(rows[1].getAttribute('title')).toBe('controlled_nodes.offline');
     // A reported OS label is descriptive. The legacy capability itself is the
     // understood Windows profile, so contradictory metadata cannot revoke it.
-    expect((remoteButtons[2] as HTMLButtonElement).disabled).toBe(false);
+    expect(rows[2].getAttribute('aria-disabled')).toBeNull();
 
-    fireEvent.click(remoteButtons[0]);
+    // A disabled row does nothing and keeps the menu open.
+    fireEvent.click(rows[1]);
+    expect(onOpenRemoteDesktop).not.toHaveBeenCalled();
+    expect(screen.getByRole('menu')).toBeTruthy();
+
+    fireEvent.click(rows[0]);
     expect(onOpenRemoteDesktop).toHaveBeenCalledWith(online);
     await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
+    expect(trigger.getAttribute('aria-expanded')).toBe('false');
+  });
+
+  it('explains an online node with remote exec disabled', async () => {
+    machines = [node({ execEnabled: false })];
+    render(<ControlledNodeQuickMenu onOpenRemoteDesktop={() => {}} />);
+    fireEvent.click(screen.getByRole('button', { name: 'controlled_nodes.machines_title' }));
+    const row = await screen.findByRole('menuitem', { name: /Desktop One/ });
+    expect(row.getAttribute('aria-disabled')).toBe('true');
+    expect(row.getAttribute('title')).toBe('controlled_nodes.exec_off');
+  });
+
+  it('keeps the wall entry and closes when it is chosen', async () => {
+    machines = [node({})];
+    const onWall = vi.fn();
+    render(<ControlledNodeQuickMenu onOpenRemoteDesktop={() => {}} onOpenRemoteDesktopWall={onWall} />);
+    fireEvent.click(screen.getByRole('button', { name: 'controlled_nodes.machines_title' }));
+    fireEvent.click(await screen.findByRole('menuitem', { name: /remote_desktop\.workspace_wall/ }));
+    expect(onWall).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
+  });
+
+  it('closes on an outside pointer press', async () => {
+    machines = [node({})];
+    render(<ControlledNodeQuickMenu onOpenRemoteDesktop={() => {}} />);
+    fireEvent.click(screen.getByRole('button', { name: 'controlled_nodes.machines_title' }));
+    expect(await screen.findByRole('menu')).toBeTruthy();
+    fireEvent.pointerDown(document.body);
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
+  });
+
+  it('portals into the fullscreen element when it holds the trigger', async () => {
+    machines = [node({})];
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    Object.defineProperty(document, 'fullscreenElement', { configurable: true, get: () => host });
+    try {
+      render(<ControlledNodeQuickMenu onOpenRemoteDesktop={() => {}} />, { container: host });
+      fireEvent.click(screen.getByRole('button', { name: 'controlled_nodes.machines_title' }));
+      const menu = await screen.findByRole('menu');
+      expect(host.contains(menu)).toBe(true);
+    } finally {
+      delete (document as { fullscreenElement?: unknown }).fullscreenElement;
+      host.remove();
+    }
   });
 
   it('closes on Escape and restores focus to the chevron', async () => {
@@ -123,6 +176,12 @@ describe('ControlledNodeQuickMenu group tabs', () => {
     fireEvent.click(document.querySelector('[data-testid="controlled-node-quick-group-team-1"]') as HTMLButtonElement);
     await waitFor(() => expect(document.body.textContent).toContain('Theirs'));
     expect(document.body.textContent).toContain('Own');
+    expect(document.body.textContent).not.toContain('Loose');
+    // Rows under a group chip are still the click targets.
+    expect(screen.getAllByRole('menuitem').map((row) => row.textContent)).toEqual([
+      expect.stringContaining('Own'),
+      expect.stringContaining('Theirs'),
+    ]);
   });
 
   it('offers no group tabs when nothing is grouped', () => {

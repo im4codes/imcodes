@@ -575,3 +575,86 @@ describe('macOS remote-desktop authenticated local IPC contract', () => {
     }), NOW)).toThrow('macos_remote_desktop_ipc_invalid_worker_frame');
   });
 });
+
+describe('macOS remote-desktop privacy request/reply contract', () => {
+  const reply = (
+    launch: Pick<MacosRemoteDesktopIpcLaunch, 'workerGeneration'>,
+    overrides: Record<string, unknown> = {},
+  ) => frame({
+    type: MACOS_REMOTE_DESKTOP_IPC_MESSAGE.PRIVACY_REPLY,
+    ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+    workerGeneration: launch.workerGeneration,
+    requestId: 7,
+    shielded: true,
+    inputReleased: true,
+    realFrameGeneration: 42,
+    ...overrides,
+  });
+
+  it('pins the exact constants', () => {
+    expect(MACOS_REMOTE_DESKTOP_IPC_MESSAGE.PRIVACY_REQUEST)
+      .toBe('remote_desktop.macos_ipc.privacy_request');
+    expect(MACOS_REMOTE_DESKTOP_IPC_MESSAGE.PRIVACY_REPLY)
+      .toBe('remote_desktop.macos_ipc.privacy_reply');
+  });
+
+  it('encodes a privacy request with the exact native key order', () => {
+    const { authority, launch, session } = authenticate();
+    expect(authority.encodePrivacyRequest(session, 3, true)).toBe(
+      `{"type":"remote_desktop.macos_ipc.privacy_request","ipcVersion":${REMOTE_DESKTOP_WORKER_IPC_VERSION},`
+        + `"workerGeneration":${launch.workerGeneration},"requestId":3,"shield":true}`,
+    );
+    expect(JSON.parse(authority.encodePrivacyRequest(session, 4, false))).toMatchObject({
+      requestId: 4, shield: false,
+    });
+    for (const requestId of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => authority.encodePrivacyRequest(session, requestId, true))
+        .toThrow('macos_remote_desktop_ipc_invalid_host_frame');
+    }
+  });
+
+  it('refuses to encode for a stale session', () => {
+    const { authority, session } = authenticate();
+    authority.cleanup();
+    expect(() => authority.encodePrivacyRequest(session, 1, true))
+      .toThrow('macos_remote_desktop_ipc_stale_session');
+  });
+
+  it('accepts an exact privacy reply from the authenticated generation', () => {
+    const { authority, launch, session } = authenticate();
+    expect(authority.acceptPrivacyReply(session, reply(launch))).toEqual({
+      workerGeneration: launch.workerGeneration,
+      requestId: 7,
+      shielded: true,
+      inputReleased: true,
+      realFrameGeneration: 42,
+    });
+    expect(authority.acceptPrivacyReply(session, reply(launch, {
+      shielded: false, realFrameGeneration: 0,
+    }))).toMatchObject({ shielded: false, realFrameGeneration: 0 });
+  });
+
+  it.each([
+    ['extra key', { routes: [] }],
+    ['wrong generation', { workerGeneration: 99 }],
+    ['wrong ipc version', { ipcVersion: 999 }],
+    ['zero request id', { requestId: 0 }],
+    ['non-boolean shielded', { shielded: 'yes' }],
+    ['non-boolean inputReleased', { inputReleased: 1 }],
+    ['negative frame generation', { realFrameGeneration: -1 }],
+    ['fractional frame generation', { realFrameGeneration: 1.5 }],
+    ['wrong type', { type: MACOS_REMOTE_DESKTOP_IPC_MESSAGE.PRIVACY_REQUEST }],
+  ])('rejects a privacy reply with %s', (_label, overrides) => {
+    const { authority, launch, session } = authenticate();
+    expect(() => authority.acceptPrivacyReply(session, reply(launch, overrides)))
+      .toThrow('macos_remote_desktop_ipc_invalid_worker_frame');
+  });
+
+  it('rejects a privacy reply missing a key', () => {
+    const { authority, launch, session } = authenticate();
+    const value = JSON.parse(reply(launch)) as Record<string, unknown>;
+    delete value.inputReleased;
+    expect(() => authority.acceptPrivacyReply(session, frame(value)))
+      .toThrow('macos_remote_desktop_ipc_invalid_worker_frame');
+  });
+});

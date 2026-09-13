@@ -240,6 +240,21 @@ describe('macOS remote-desktop executable entry points', () => {
     expect([...worker.matchAll(/std::getenv/g)]).toHaveLength(1);
   });
 
+  it('receives the owner sign-in text only for a requested unlock and wipes it', async () => {
+    // The node keeps the sign-in text root-only. It reaches the worker solely
+    // as the answer to an unlock this worker asked for, is typed only while
+    // the Mac is still locked, and is wiped once typed.
+    expect(worker).toContain('macos::ParseUnlockReplyFrame(');
+    expect(worker).toContain('sink.OnUnlockReply(reply.configured, std::move(reply.sign_in_base64url));');
+    const reply = worker.slice(worker.indexOf('void WorkerTransportSink::OnUnlockReply('));
+    const body = reply.slice(0, reply.indexOf('\n}\n'));
+    expect(body).toContain('pending && on_lock_screen');
+    expect(body).toContain('WipeString(&decoded);');
+    expect(body).toContain('WipeString(&sign_in);');
+    // Only the unlock control asks for it, and it is rate bounded.
+    expect(worker).toContain('unlock_attempts_ms_.size() >= 10');
+  });
+
   it('requires a live separate disclosure before admitting a route', async () => {
     expect(worker).toContain('macos::DisclosureAdmission disclosure(');
     // The worker still owns the live admission object and hands it to the

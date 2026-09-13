@@ -2,6 +2,7 @@ import type { Socket } from 'node:net';
 import { describe, expect, it, vi } from 'vitest';
 import {
   REMOTE_DESKTOP_CANONICAL_BRANDING_CAPABILITY,
+  REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY,
   REMOTE_DESKTOP_INPUT_CAPABILITY,
   REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
 } from '../../shared/remote-desktop-access.js';
@@ -44,6 +45,11 @@ import type {
   MacosRemoteDesktopLifecycleSource,
 } from '../../src/node/macos-remote-desktop-launch-agent.js';
 import { MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY } from '../../src/node/macos-user-session.js';
+import {
+  WORKER_PRIVACY_FRAME,
+  parseWorkerPrivacyFrame,
+  type WorkerPrivacyInboundFrame,
+} from '../../src/node/remote-desktop-privacy-ipc.js';
 import {
   MACOS_REMOTE_DESKTOP_HOST_CLEANUP_REASON,
   MACOS_REMOTE_DESKTOP_HOST_CLEANUP_TIMEOUT_MS,
@@ -153,12 +159,21 @@ interface Harness {
   lifecycle: Lifecycle;
   stopped: ReturnType<typeof vi.fn>;
   serverStarts: ReturnType<typeof vi.fn>;
+  /** Everything written to the worker, in order: `command:<type>` or `privacy:<shield>`. */
+  outbound: string[];
+  privacyRequests: Array<{ requestId: number; shield: boolean; workerGeneration: number }>;
+  privacyReply(
+    requestId: number,
+    reply: { shielded: boolean; inputReleased?: boolean; realFrameGeneration: number },
+  ): void;
 }
 
 function harness(overrides: Partial<MacosRemoteDesktopWorkerHostOptions> = {}): Harness {
   const lifecycle = new Lifecycle();
   const sent: RemoteDesktopDaemonCommand[] = [];
   const messages: RemoteDesktopDaemonMessage[] = [];
+  const outbound: string[] = [];
+  const privacyRequests: Harness['privacyRequests'] = [];
   const stopped = vi.fn(async () => undefined);
   let serverOptions: MacosRemoteDesktopIpcServerOptions | null = null;
   let activeLaunch: MacosRemoteDesktopIpcLaunch | null = null;
@@ -178,6 +193,7 @@ function harness(overrides: Partial<MacosRemoteDesktopWorkerHostOptions> = {}): 
   });
   const options: MacosRemoteDesktopWorkerHostOptions = {
     runtime: { platform: 'darwin', arch: 'arm64' },
+    capturePrivacy: true,
     resolveVerifiedArtifact: async () => artifact(),
     resolveUserSession: async () => USER,
     inspectReadiness: async () => ({
@@ -192,7 +208,16 @@ function harness(overrides: Partial<MacosRemoteDesktopWorkerHostOptions> = {}): 
       serverOptions = createdOptions;
       return {
         start: serverStarts,
-        sendCommand: async (command) => { sent.push(command); },
+        sendCommand: async (command) => {
+          sent.push(command);
+          outbound.push(`command:${command.type}`);
+        },
+        sendPrivacyRequest: async (requestId, shield) => {
+          privacyRequests.push({
+            requestId, shield, workerGeneration: activeLaunch?.workerGeneration ?? 0,
+          });
+          outbound.push(`privacy:${String(shield)}`);
+        },
         stop: stopped,
       };
     },
@@ -208,7 +233,17 @@ function harness(overrides: Partial<MacosRemoteDesktopWorkerHostOptions> = {}): 
   };
   const host = new MacosRemoteDesktopWorkerHost((message) => messages.push(message), options);
   return {
-    host, sent, messages, lifecycle, stopped, serverStarts,
+    host, sent, messages, lifecycle, stopped, serverStarts, outbound, privacyRequests,
+    privacyReply: (requestId, reply) => {
+      const request = privacyRequests.find((entry) => entry.requestId === requestId);
+      void serverOptions?.onPrivacyReply?.({
+        workerGeneration: request?.workerGeneration ?? 0,
+        requestId,
+        shielded: reply.shielded,
+        inputReleased: reply.inputReleased ?? true,
+        realFrameGeneration: reply.realFrameGeneration,
+      });
+    },
     authenticate: (overrides = {}, sessionOverrides = {}) => {
       if (!serverOptions || !activeLaunch) return false;
       const explicit = serverOptions.principal;
@@ -392,6 +427,7 @@ describe('macOS remote-desktop worker host', () => {
     expect(view.host.adapterCapabilities()).toEqual([
       REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
       REMOTE_DESKTOP_CANONICAL_BRANDING_CAPABILITY,
+      REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY,
     ]);
     expect(await view.host.handle(prepare())).toBe(false);
     expect(await view.host.handle(prepare({
@@ -848,9 +884,258 @@ describe('macOS remote-desktop worker host', () => {
     }));
   });
 
-  it('does not expose Windows auto-unlock APIs', () => {
+  it('has no Windows-style worker-side secret mode: unlock support comes only from a node store', () => {
+    // Windows hands the secret to its SYSTEM worker binary. macOS never does:
+    // without the root store the host reports no support at all.
     const value = harness();
-    expect('applyAutoUnlockSecret' in value.host).toBe(false);
-    expect('autoUnlockConfigured' in value.host).toBe(false);
+    expect('spawnUnlockSecret' in (value.host as unknown as Record<string, unknown>)).toBe(false);
+    expect(value.host.supportsAutoUnlock()).toBe(false);
+  });
+});
+
+describe('macOS worker host auto unlock', () => {
+  it('keeps the sign-in secret in the injected root store and hands it to the IPC server', async () => {
+    let kept: string | null = null;
+    const unlockSecretStore = {
+      configured: async () => kept !== null,
+      reveal: async () => kept,
+      store: async (value: string) => { kept = value; return true; },
+      clear: async () => { kept = null; return true; },
+    };
+    const { host } = harness({ unlockSecretStore });
+    expect(host.supportsAutoUnlock()).toBe(true);
+    expect(await host.autoUnlockConfigured()).toBe(false);
+    expect(await host.applyAutoUnlockSecret('hunter2')).toBe(true);
+    expect(await host.autoUnlockConfigured()).toBe(true);
+    expect(await host.applyAutoUnlockSecret(null)).toBe(true);
+    expect(await host.autoUnlockConfigured()).toBe(false);
+    host.close();
+  });
+
+  it('offers no auto unlock without a store', async () => {
+    const { host } = harness();
+    expect(host.supportsAutoUnlock()).toBe(false);
+    expect(await host.applyAutoUnlockSecret('hunter2')).toBe(false);
+    expect(await host.autoUnlockConfigured()).toBe(false);
+    host.close();
+  });
+});
+
+describe('macOS worker host management privacy', () => {
+  const EPOCH_ID = 'epoch_1234567890abcdef';
+  const shieldFrame = (revision = 1) => ({
+    type: WORKER_PRIVACY_FRAME.SHIELD,
+    epochId: EPOCH_ID,
+    revision,
+    presentationSource: 'opaque',
+    routes: [],
+  });
+  const releaseFrame = (revision = 1) => ({
+    type: WORKER_PRIVACY_FRAME.RELEASE,
+    epochId: EPOCH_ID,
+    revision,
+  });
+  const collect = (host: MacosRemoteDesktopWorkerHost): WorkerPrivacyInboundFrame[] => {
+    const frames: WorkerPrivacyInboundFrame[] = [];
+    host.onPrivacyFrame((frame) => {
+      // Every emitted frame must be one the barrier itself would parse.
+      expect(parseWorkerPrivacyFrame(JSON.parse(JSON.stringify(frame)))).toEqual(frame);
+      frames.push(frame);
+    });
+    return frames;
+  };
+
+  it('advertises capture privacy with a default-shielded route', async () => {
+    const value = harness();
+    await startAuthenticated(value);
+    expect(value.host.adapterCapabilities()).toContain(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY);
+    expect(value.host.supportsDefaultShieldedRoute()).toBe(true);
+  });
+
+  it('shields the connected worker, reports its authorized routes, and releases on a newer real frame', async () => {
+    const value = harness();
+    await startAuthenticated(value);
+    expect(await value.host.handle(prepare())).toBe(true);
+    const frames = collect(value.host);
+
+    const shielding = value.host.sendPrivacyFrame(shieldFrame());
+    await vi.waitFor(() => expect(value.privacyRequests).toHaveLength(1));
+    expect(value.privacyRequests[0]).toMatchObject({ shield: true, workerGeneration: 1 });
+    // Nothing is claimed before the worker answers.
+    expect(frames).toEqual([]);
+    value.privacyReply(value.privacyRequests[0]!.requestId, {
+      shielded: true, realFrameGeneration: 4,
+    });
+    expect(await shielding).toBe(true);
+    expect(frames).toEqual([{
+      type: WORKER_PRIVACY_FRAME.SHIELDED,
+      epochId: EPOCH_ID,
+      revision: 1,
+      workerGeneration: 5,
+      inputReleased: true,
+      routes: [{ routeId: SESSION_ID, routeGeneration: 11 }],
+    }]);
+
+    // A route added under the shield is reported as a complete new set.
+    expect(await value.host.handle(prepare({
+      requestId: 'request_222222222',
+      sessionId: 'session_222222222',
+      capability: 'b'.repeat(43),
+      routeGeneration: 12,
+    }))).toBe(true);
+    expect(frames[1]).toEqual({
+      type: WORKER_PRIVACY_FRAME.SHIELDED,
+      epochId: EPOCH_ID,
+      revision: 1,
+      workerGeneration: 5,
+      inputReleased: true,
+      routes: [
+        { routeId: SESSION_ID, routeGeneration: 11 },
+        { routeId: 'session_222222222', routeGeneration: 12 },
+      ],
+    });
+
+    // A release for another epoch is not honoured.
+    expect(await value.host.sendPrivacyFrame({ ...releaseFrame(), epochId: 'epoch_9999999999999999' }))
+      .toBe(false);
+    const releasing = value.host.sendPrivacyFrame(releaseFrame());
+    await vi.waitFor(() => expect(value.privacyRequests).toHaveLength(2));
+    expect(value.privacyRequests[1]).toMatchObject({ shield: false });
+    value.privacyReply(value.privacyRequests[1]!.requestId, {
+      shielded: false, realFrameGeneration: 6,
+    });
+    expect(await releasing).toBe(true);
+    expect(frames[2]).toEqual({
+      type: WORKER_PRIVACY_FRAME.RELEASED,
+      epochId: EPOCH_ID,
+      secretCleanupComplete: true,
+      freshFrameWorkerGeneration: 7,
+    });
+    expect(frames).toHaveLength(3);
+  });
+
+  it('shields immediately with no routes when no worker is connected', async () => {
+    const value = harness();
+    const frames = collect(value.host);
+    expect(await value.host.sendPrivacyFrame(shieldFrame())).toBe(true);
+    expect(value.privacyRequests).toEqual([]);
+    expect(frames).toEqual([{
+      type: WORKER_PRIVACY_FRAME.SHIELDED,
+      epochId: EPOCH_ID,
+      revision: 1,
+      workerGeneration: 0,
+      inputReleased: true,
+      routes: [],
+    }]);
+    expect(await value.host.sendPrivacyFrame(releaseFrame())).toBe(true);
+    expect(frames[1]).toEqual({
+      type: WORKER_PRIVACY_FRAME.RELEASED,
+      epochId: EPOCH_ID,
+      secretCleanupComplete: true,
+      freshFrameWorkerGeneration: 1,
+    });
+  });
+
+  it('shields a newly admitted worker before forwarding any command to it', async () => {
+    const value = harness();
+    const frames = collect(value.host);
+    expect(await value.host.sendPrivacyFrame(shieldFrame())).toBe(true);
+
+    const starting = value.host.start();
+    await vi.waitFor(() => expect(value.authenticate()).toBe(true));
+    await vi.waitFor(() => expect(value.privacyRequests).toHaveLength(1));
+    expect(value.privacyRequests[0]).toMatchObject({ shield: true, workerGeneration: 1 });
+    // Held: the worker is not admitted until its shield is acknowledged.
+    expect(value.host.available()).toBe(false);
+    expect(await value.host.handle(prepare())).toBe(false);
+    expect(value.sent).toEqual([]);
+
+    value.privacyReply(value.privacyRequests[0]!.requestId, {
+      shielded: true, realFrameGeneration: 0,
+    });
+    await starting;
+    expect(value.host.available()).toBe(true);
+    expect(await value.host.handle(prepare())).toBe(true);
+    expect(value.outbound).toEqual(['privacy:true', `command:${REMOTE_DESKTOP_MSG.PREPARE}`]);
+    expect(frames.at(-1)).toEqual({
+      type: WORKER_PRIVACY_FRAME.SHIELDED,
+      epochId: EPOCH_ID,
+      revision: 1,
+      workerGeneration: 1,
+      inputReleased: true,
+      routes: [{ routeId: SESSION_ID, routeGeneration: 11 }],
+    });
+  });
+
+  it('never emits SHIELDED when the worker reply is missing or contradictory', async () => {
+    const value = harness({ privacyReplyTimeoutMs: 20 });
+    await startAuthenticated(value);
+    const frames = collect(value.host);
+
+    expect(await value.host.sendPrivacyFrame(shieldFrame())).toBe(false);
+    expect(value.privacyRequests).toHaveLength(1);
+
+    const contradictory = value.host.sendPrivacyFrame(shieldFrame(2));
+    await vi.waitFor(() => expect(value.privacyRequests).toHaveLength(2));
+    value.privacyReply(value.privacyRequests[1]!.requestId, {
+      shielded: false, realFrameGeneration: 3,
+    });
+    expect(await contradictory).toBe(false);
+    expect(frames).toEqual([]);
+    // Unconfirmed epochs cannot be released either.
+    expect(await value.host.sendPrivacyFrame(releaseFrame(2))).toBe(false);
+  });
+
+  it('tears the generation down when a shielded admission is not acknowledged', async () => {
+    const errors: unknown[] = [];
+    const value = harness({
+      privacyReplyTimeoutMs: 20,
+      onBackgroundError: (error) => errors.push(error),
+    });
+    expect(await value.host.sendPrivacyFrame(shieldFrame())).toBe(true);
+    const starting = value.host.start();
+    await vi.waitFor(() => expect(value.authenticate()).toBe(true));
+    await starting;
+    expect(value.host.available()).toBe(false);
+    expect(value.sent).toEqual([]);
+    expect(errors).toContainEqual(expect.objectContaining({
+      message: 'macos_remote_desktop_worker_host_privacy_shield_failed',
+    }));
+  });
+
+  it('keeps the frame generation monotonic across a worker restart', async () => {
+    const value = harness();
+    await startAuthenticated(value);
+    const frames = collect(value.host);
+    const shielding = value.host.sendPrivacyFrame(shieldFrame());
+    await vi.waitFor(() => expect(value.privacyRequests).toHaveLength(1));
+    value.privacyReply(value.privacyRequests[0]!.requestId, {
+      shielded: true, realFrameGeneration: 10,
+    });
+    expect(await shielding).toBe(true);
+    expect(frames[0]).toMatchObject({ workerGeneration: 11 });
+
+    value.lifecycle.emit({ type: 'lock' });
+    value.lifecycle.emit({ type: 'unlock' });
+    await vi.waitFor(() => expect(value.serverStarts).toHaveBeenCalledTimes(2));
+    expect(value.authenticate()).toBe(true);
+    await vi.waitFor(() => expect(value.privacyRequests).toHaveLength(2));
+    expect(value.privacyRequests[1]).toMatchObject({ shield: true, workerGeneration: 2 });
+    // The fresh worker counts from zero again.
+    value.privacyReply(value.privacyRequests[1]!.requestId, {
+      shielded: true, realFrameGeneration: 0,
+    });
+    await vi.waitFor(() => expect(value.host.available()).toBe(true));
+
+    const releasing = value.host.sendPrivacyFrame(releaseFrame());
+    await vi.waitFor(() => expect(value.privacyRequests).toHaveLength(3));
+    value.privacyReply(value.privacyRequests[2]!.requestId, {
+      shielded: false, realFrameGeneration: 1,
+    });
+    expect(await releasing).toBe(true);
+    const released = frames.at(-1)!;
+    expect(released).toMatchObject({ type: WORKER_PRIVACY_FRAME.RELEASED });
+    expect((released as { freshFrameWorkerGeneration: number }).freshFrameWorkerGeneration)
+      .toBeGreaterThan(11);
   });
 });

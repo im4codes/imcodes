@@ -85,6 +85,14 @@ describe('macOS remote-desktop cross-layer token agreement', () => {
       .toBe(MACOS_REMOTE_DESKTOP_IPC_MESSAGE.HOST_COMMAND);
     expect(ipcTokens.get('kIpcMessageWorkerMessage'))
       .toBe(MACOS_REMOTE_DESKTOP_IPC_MESSAGE.WORKER_MESSAGE);
+    expect(ipcTokens.get('kIpcMessageUnlockRequest'))
+      .toBe(MACOS_REMOTE_DESKTOP_IPC_MESSAGE.UNLOCK_REQUEST);
+    expect(ipcTokens.get('kIpcMessageUnlockReply'))
+      .toBe(MACOS_REMOTE_DESKTOP_IPC_MESSAGE.UNLOCK_REPLY);
+    expect(ipcTokens.get('kIpcMessagePrivacyRequest'))
+      .toBe(MACOS_REMOTE_DESKTOP_IPC_MESSAGE.PRIVACY_REQUEST);
+    expect(ipcTokens.get('kIpcMessagePrivacyReply'))
+      .toBe(MACOS_REMOTE_DESKTOP_IPC_MESSAGE.PRIVACY_REPLY);
     expect(ipcHeader).toContain(`kWorkerIpcVersion = ${REMOTE_DESKTOP_WORKER_IPC_VERSION}`);
     // The native bound must not exceed the host's, or the worker would emit a
     // frame the host refuses to decode.

@@ -24,6 +24,7 @@ import {
   MacosRemoteDesktopIpcAuthorityHost,
   macosRemoteDesktopIpcPrincipalBinding,
   macosRemoteDesktopIpcPrincipalPaths,
+  type MacosRemoteDesktopAcceptedPrivacyReply,
   type MacosRemoteDesktopExpectedCodeIdentity,
   type MacosRemoteDesktopFilesystemEntry,
   type MacosRemoteDesktopIpcLaunch,
@@ -129,10 +130,23 @@ interface MacosRemoteDesktopIpcServerCommonOptions {
    */
   virtualDisplayLease?: () => MacosVirtualDisplayProxyLease | null;
   virtualDisplaySeams?: MacosVirtualDisplayProxySeams;
+  /**
+   * The root-only sign-in secret store. Absent means no unlock support: every
+   * question is answered "not configured".
+   */
+  unlockSecret?: {
+    configured(): Promise<boolean>;
+    reveal(): Promise<string | null>;
+  };
   onPeerAuthenticated?(
     launch: MacosRemoteDesktopIpcLaunch,
     session: MacosRemoteDesktopIpcSession,
   ): void | Promise<void>;
+  /**
+   * One validated privacy reply from the authenticated worker. Absent means
+   * the reply is accepted (so the connection survives) and then dropped.
+   */
+  onPrivacyReply?(reply: MacosRemoteDesktopAcceptedPrivacyReply): void | Promise<void>;
   /**
    * First post-ACK frame for a LoginWindow peer. Production must bind this
    * native post-composition attestation to the current bootstrap grant before
@@ -581,6 +595,42 @@ export class MacosRemoteDesktopIpcServer {
     }
   }
 
+  /**
+   * Writes one privacy request to the authenticated worker. Serialized with
+   * host commands so a shield request issued before a command is also the
+   * one the worker reads first.
+   */
+  async sendPrivacyRequest(requestId: number, shield: boolean): Promise<void> {
+    const state = this.active;
+    if (!state?.session || !state.authenticated || !this.launch || state.socket.destroyed) {
+      fail(MACOS_REMOTE_DESKTOP_IPC_SERVER_ERROR.NOT_CONNECTED);
+    }
+    const expectedState = state;
+    const session = state.session;
+    const frame = `${this.options.authority.encodePrivacyRequest(session, requestId, shield)}\n`;
+    const bytes = Buffer.byteLength(frame);
+    if (this.pendingOutboundBytes + bytes > this.maxPendingOutboundBytes) {
+      fail(MACOS_REMOTE_DESKTOP_IPC_SERVER_ERROR.BACKPRESSURE);
+    }
+    this.pendingOutboundBytes += bytes;
+    const operation = this.outboundTail.then(async () => {
+      if (this.active !== expectedState || expectedState.session !== session
+        || expectedState.socket.destroyed) {
+        fail(MACOS_REMOTE_DESKTOP_IPC_SERVER_ERROR.NOT_CONNECTED);
+      }
+      await this.write(expectedState.socket, frame);
+    });
+    this.outboundTail = operation.catch(() => undefined);
+    try {
+      await operation;
+    } catch (error) {
+      void this.teardown('write_failed', errorOf(error));
+      throw error;
+    } finally {
+      this.pendingOutboundBytes -= bytes;
+    }
+  }
+
   async stop(): Promise<void> {
     await this.teardown('server_stopped');
   }
@@ -709,6 +759,23 @@ export class MacosRemoteDesktopIpcServer {
         if (peekFrameType(line)
           === MACOS_REMOTE_DESKTOP_IPC_MESSAGE.VIRTUAL_DISPLAY_REQUEST) {
           await this.serveVirtualDisplay(state, session, line);
+          continue;
+        }
+        if (peekFrameType(line) === MACOS_REMOTE_DESKTOP_IPC_MESSAGE.UNLOCK_REQUEST) {
+          await this.serveUnlock(state, session, line);
+          continue;
+        }
+        if (peekFrameType(line) === MACOS_REMOTE_DESKTOP_IPC_MESSAGE.PRIVACY_REPLY) {
+          // Malformed or foreign-generation replies throw here and take the
+          // connection down like any other malformed frame.
+          const reply = this.options.authority.acceptPrivacyReply(session, line);
+          if (this.options.onPrivacyReply) {
+            await withDeadline(
+              Promise.resolve(this.options.onPrivacyReply(reply)),
+              this.callbackTimeoutMs,
+              MACOS_REMOTE_DESKTOP_IPC_SERVER_ERROR.CALLBACK_TIMEOUT,
+            );
+          }
           continue;
         }
         const message = this.options.authority.acceptWorkerFrame(session, line, this.now());
@@ -946,6 +1013,51 @@ export class MacosRemoteDesktopIpcServer {
       await this.write(state.socket, frame);
     } catch (error) {
       void this.teardown('write_failed', errorOf(error));
+    }
+  }
+
+  private async serveUnlock(
+    state: ConnectionState,
+    session: MacosRemoteDesktopIpcSession,
+    line: string,
+  ): Promise<void> {
+    let accepted: { requestId: number; reveal: boolean };
+    try {
+      accepted = this.options.authority.acceptUnlockRequest(session, line);
+    } catch (error) {
+      this.reject(state, MACOS_REMOTE_DESKTOP_IPC_SERVER_ERROR.INVALID_FRAME,
+        error, 'frame_rejected');
+      return;
+    }
+    let configured = false;
+    let secret: string | null = null;
+    try {
+      const store = this.options.unlockSecret;
+      if (store) {
+        if (accepted.reveal) {
+          secret = await withDeadline(store.reveal(), this.callbackTimeoutMs,
+            MACOS_REMOTE_DESKTOP_IPC_SERVER_ERROR.CALLBACK_TIMEOUT);
+          configured = secret !== null;
+        } else {
+          configured = await withDeadline(store.configured(), this.callbackTimeoutMs,
+            MACOS_REMOTE_DESKTOP_IPC_SERVER_ERROR.CALLBACK_TIMEOUT);
+        }
+      }
+    } catch {
+      configured = false;
+      secret = null;
+    }
+    // The worker may have been replaced while the store answered; the secret
+    // only ever goes to the connection that asked.
+    if (state.socket.destroyed || this.active !== state) return;
+    try {
+      await this.write(state.socket, `${this.options.authority.encodeUnlockReply(
+        session, accepted.requestId, configured, secret,
+      )}\n`);
+    } catch (error) {
+      void this.teardown('write_failed', errorOf(error));
+    } finally {
+      secret = null;
     }
   }
 

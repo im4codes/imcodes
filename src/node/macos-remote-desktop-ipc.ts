@@ -49,6 +49,21 @@ export const MACOS_REMOTE_DESKTOP_IPC_MESSAGE = Object.freeze({
    */
   VIRTUAL_DISPLAY_REQUEST: 'remote_desktop.macos_ipc.virtual_display_request',
   VIRTUAL_DISPLAY_REPLY: 'remote_desktop.macos_ipc.virtual_display_reply',
+  /**
+   * Worker asks whether a sign-in secret is configured, or -- to perform an
+   * unlock the controller asked for -- for the secret itself. The daemon keeps
+   * the secret root-only and answers only this authenticated generation.
+   */
+  UNLOCK_REQUEST: 'remote_desktop.macos_ipc.unlock_request',
+  UNLOCK_REPLY: 'remote_desktop.macos_ipc.unlock_reply',
+  /**
+   * Daemon asks the worker to raise (shield=true) or lift (shield=false) the
+   * management-privacy frame shield. The worker answers once the shield is up
+   * and held input is released, or -- when lifting -- only after a real frame
+   * captured after the lift has been encoded.
+   */
+  PRIVACY_REQUEST: 'remote_desktop.macos_ipc.privacy_request',
+  PRIVACY_REPLY: 'remote_desktop.macos_ipc.privacy_reply',
 } as const);
 
 /** Large enough for the bounded SDP contract, but never an unbounded JSON stream. */
@@ -153,13 +168,64 @@ export interface MacosRemoteDesktopIpcVirtualDisplayReply {
   reply: MacosVirtualDisplayProxyReply;
 }
 
+export interface MacosRemoteDesktopIpcUnlockRequest {
+  type: typeof MACOS_REMOTE_DESKTOP_IPC_MESSAGE.UNLOCK_REQUEST;
+  ipcVersion: typeof REMOTE_DESKTOP_WORKER_IPC_VERSION;
+  workerGeneration: number;
+  requestId: number;
+  /** false: only whether one is configured. true: the secret, to type it now. */
+  reveal: boolean;
+}
+
+export interface MacosRemoteDesktopIpcUnlockReply {
+  type: typeof MACOS_REMOTE_DESKTOP_IPC_MESSAGE.UNLOCK_REPLY;
+  ipcVersion: typeof REMOTE_DESKTOP_WORKER_IPC_VERSION;
+  workerGeneration: number;
+  requestId: number;
+  configured: boolean;
+  /**
+   * base64url of the UTF-8 secret, empty unless revealed. Encoded so any
+   * character a password may contain survives the native worker's strict,
+   * escape-free frame parser unchanged.
+   */
+  secret: string;
+}
+
+export interface MacosRemoteDesktopIpcPrivacyRequest {
+  type: typeof MACOS_REMOTE_DESKTOP_IPC_MESSAGE.PRIVACY_REQUEST;
+  ipcVersion: typeof REMOTE_DESKTOP_WORKER_IPC_VERSION;
+  workerGeneration: number;
+  /** Host-assigned, strictly increasing. */
+  requestId: number;
+  shield: boolean;
+}
+
+export interface MacosRemoteDesktopIpcPrivacyReply {
+  type: typeof MACOS_REMOTE_DESKTOP_IPC_MESSAGE.PRIVACY_REPLY;
+  ipcVersion: typeof REMOTE_DESKTOP_WORKER_IPC_VERSION;
+  workerGeneration: number;
+  requestId: number;
+  shielded: boolean;
+  inputReleased: boolean;
+  /** Count of REAL (non-shield) frames this worker process has encoded. */
+  realFrameGeneration: number;
+}
+
+/** The authenticated, generation-checked content of one privacy reply. */
+export type MacosRemoteDesktopAcceptedPrivacyReply = Pick<
+  MacosRemoteDesktopIpcPrivacyReply,
+  'workerGeneration' | 'requestId' | 'shielded' | 'inputReleased' | 'realFrameGeneration'
+>;
+
 export type MacosRemoteDesktopIpcFrame =
   | MacosRemoteDesktopIpcHello
   | MacosRemoteDesktopIpcAuthenticated
   | MacosRemoteDesktopIpcHostCommand
   | MacosRemoteDesktopIpcWorkerMessage
   | MacosRemoteDesktopIpcVirtualDisplayRequest
-  | MacosRemoteDesktopIpcVirtualDisplayReply;
+  | MacosRemoteDesktopIpcVirtualDisplayReply
+  | MacosRemoteDesktopIpcPrivacyRequest
+  | MacosRemoteDesktopIpcPrivacyReply;
 
 /** Opaque by object identity: a JSON value can never forge an accepted session. */
 export interface MacosRemoteDesktopIpcSession {
@@ -405,6 +471,37 @@ function parseVirtualDisplayRequest(
   return { ...value, request } as MacosRemoteDesktopIpcVirtualDisplayRequest;
 }
 
+function parseUnlockRequest(value: unknown): MacosRemoteDesktopIpcUnlockRequest | null {
+  if (!isRemoteDesktopRecord(value)
+    || !hasExactRemoteDesktopKeys(value, [
+      'type', 'ipcVersion', 'workerGeneration', 'requestId', 'reveal',
+    ])
+    || value.type !== MACOS_REMOTE_DESKTOP_IPC_MESSAGE.UNLOCK_REQUEST
+    || value.ipcVersion !== REMOTE_DESKTOP_WORKER_IPC_VERSION
+    || !isSafePositiveInteger(value.workerGeneration)
+    || !isSafePositiveInteger(value.requestId)
+    || typeof value.reveal !== 'boolean') return null;
+  return value as unknown as MacosRemoteDesktopIpcUnlockRequest;
+}
+
+function parsePrivacyReply(value: unknown): MacosRemoteDesktopIpcPrivacyReply | null {
+  if (!isRemoteDesktopRecord(value)
+    || !hasExactRemoteDesktopKeys(value, [
+      'type', 'ipcVersion', 'workerGeneration', 'requestId',
+      'shielded', 'inputReleased', 'realFrameGeneration',
+    ])
+    || value.type !== MACOS_REMOTE_DESKTOP_IPC_MESSAGE.PRIVACY_REPLY
+    || value.ipcVersion !== REMOTE_DESKTOP_WORKER_IPC_VERSION
+    || !isSafePositiveInteger(value.workerGeneration)
+    || !isSafePositiveInteger(value.requestId)
+    || typeof value.shielded !== 'boolean'
+    || typeof value.inputReleased !== 'boolean'
+    || typeof value.realFrameGeneration !== 'number'
+    || !Number.isSafeInteger(value.realFrameGeneration)
+    || value.realFrameGeneration < 0) return null;
+  return value as unknown as MacosRemoteDesktopIpcPrivacyReply;
+}
+
 function parseWorkerMessage(value: unknown): MacosRemoteDesktopIpcWorkerMessage | null {
   if (!isRemoteDesktopRecord(value)
     || !hasExactRemoteDesktopKeys(value, [
@@ -615,6 +712,78 @@ export class MacosRemoteDesktopIpcAuthorityHost {
       requestId,
       reply,
     });
+  }
+
+  /** Accepts one unlock question from the authenticated worker of this generation. */
+  acceptUnlockRequest(
+    session: MacosRemoteDesktopIpcSession,
+    frame: string,
+  ): { requestId: number; reveal: boolean } {
+    this.assertActiveSession(session);
+    const envelope = parseUnlockRequest(decodeMacosRemoteDesktopIpcFrame(frame));
+    if (!envelope || envelope.workerGeneration !== session.workerGeneration) {
+      fail('macos_remote_desktop_ipc_invalid_worker_frame');
+    }
+    return { requestId: envelope.requestId, reveal: envelope.reveal };
+  }
+
+  encodeUnlockReply(
+    session: MacosRemoteDesktopIpcSession,
+    requestId: number,
+    configured: boolean,
+    secret: string | null,
+  ): string {
+    this.assertActiveSession(session);
+    return encodeMacosRemoteDesktopIpcFrame({
+      type: MACOS_REMOTE_DESKTOP_IPC_MESSAGE.UNLOCK_REPLY,
+      ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+      workerGeneration: session.workerGeneration,
+      requestId,
+      configured,
+      secret: secret === null ? '' : Buffer.from(secret, 'utf8').toString('base64url'),
+    });
+  }
+
+  /**
+   * Host-authored shield request for the authenticated worker of this
+   * generation. Key order is part of the native contract.
+   */
+  encodePrivacyRequest(
+    session: MacosRemoteDesktopIpcSession,
+    requestId: number,
+    shield: boolean,
+  ): string {
+    this.assertActiveSession(session);
+    if (!isSafePositiveInteger(requestId) || typeof shield !== 'boolean') {
+      fail('macos_remote_desktop_ipc_invalid_host_frame');
+    }
+    const request: MacosRemoteDesktopIpcPrivacyRequest = {
+      type: MACOS_REMOTE_DESKTOP_IPC_MESSAGE.PRIVACY_REQUEST,
+      ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+      workerGeneration: session.workerGeneration,
+      requestId,
+      shield,
+    };
+    return encodeMacosRemoteDesktopIpcFrame(request);
+  }
+
+  /** Accepts one privacy reply from the authenticated worker of this generation. */
+  acceptPrivacyReply(
+    session: MacosRemoteDesktopIpcSession,
+    frame: string,
+  ): MacosRemoteDesktopAcceptedPrivacyReply {
+    this.assertActiveSession(session);
+    const envelope = parsePrivacyReply(decodeMacosRemoteDesktopIpcFrame(frame));
+    if (!envelope || envelope.workerGeneration !== session.workerGeneration) {
+      fail('macos_remote_desktop_ipc_invalid_worker_frame');
+    }
+    return {
+      workerGeneration: session.workerGeneration,
+      requestId: envelope.requestId,
+      shielded: envelope.shielded,
+      inputReleased: envelope.inputReleased,
+      realFrameGeneration: envelope.realFrameGeneration,
+    };
   }
 
   acceptWorkerFrame(

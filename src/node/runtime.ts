@@ -172,6 +172,8 @@ export interface ControlledNodeRemoteDesktopWorker {
   supportsDefaultShieldedRoute?(): boolean;
   handle(message: RemoteDesktopDaemonCommand): Promise<boolean>;
   applyAutoUnlockSecret?(secret: string | null): Promise<boolean>;
+  /** macOS: whether this host has somewhere to keep a sign-in secret. */
+  supportsAutoUnlock?(): boolean;
   autoUnlockConfigured?(): Promise<boolean>;
   /** Retire connection-scoped routes while keeping a verified sidecar warm. */
   onDaemonDisconnected?(): void;
@@ -470,8 +472,12 @@ export function createControlledNodeRuntime(
       ]
       : [];
     const enabledAdapters = remoteDesktopEnabled ? workerAdapterCapabilities : [];
+    // Windows keeps the secret in its SYSTEM worker; macOS in the root node, so
+    // it additionally needs a host that actually has a store to keep it in.
     remoteDesktopAutoUnlockAvailable = remoteDesktopEnabled
-      && profile?.platform === 'windows';
+      && (profile?.platform === 'windows'
+        || (profile?.platform === 'macos'
+          && (remoteDesktopWorker.supportsAutoUnlock?.() ?? false)));
     try {
       defaultShieldedRouteAvailable = remoteDesktopEnabled
         && enabledAdapters.includes(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY)
@@ -482,7 +488,10 @@ export function createControlledNodeRuntime(
       defaultShieldedRouteAvailable = false;
     }
     try {
+      // The signed account shell is a Windows sidecar. A macOS profile that
+      // claimed it would be refused whole by the shared profile resolver.
       signedShellAvailable = remoteDesktopEnabled
+        && profile?.platform !== 'macos'
         && enabledAdapters.includes(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY)
         && defaultShieldedRouteAvailable
         && (options.remoteDesktopSignedShell?.available() ?? false);

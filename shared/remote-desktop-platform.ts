@@ -201,9 +201,9 @@ export function resolveRemoteDesktopSessionProfile(
   // The macOS runtime advertises lock-screen and display-control refinements
   // only after their local probes succeed, and both refine an input-capable
   // session. Refuse orphan action claims at ingress rather than widening a
-  // View-only profile. Capture privacy and signed shell remain unsupported.
-  if (platform === 'macos' && (capturePrivacy
-    || known.has(REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY)
+  // View-only profile. Capture privacy is implemented by the macOS worker's
+  // frame shield; the signed shell remains unsupported there.
+  if (platform === 'macos' && (known.has(REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY)
     || (!input && (lockScreen || displayControl)))) return null;
 
   return {

@@ -11,6 +11,11 @@
 
 namespace imcodes::remote_desktop::macos {
 
+// Stamped into kCGEventSourceUserData on every event this worker injects, so
+// the local curtain's event tap can drop physical keyboard/mouse input while
+// letting the remote controller's own events through.
+inline constexpr std::int64_t kImcodesSyntheticEventMarker = 0x494D434F444553;
+
 enum class CGEventInputErrorCode : std::uint8_t {
   kNone,
   kPermissionDenied,

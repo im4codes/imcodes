@@ -1,4 +1,8 @@
 import type { Socket } from 'node:net';
+import {
+  createMacosRemoteDesktopUnlockSecretStore,
+  type MacosRemoteDesktopUnlockSecretStore,
+} from './macos-remote-desktop-unlock-secret.js';
 import { dirname, join } from 'node:path';
 import {
   assertMacosRemoteDesktopStoreTrusted,
@@ -153,6 +157,8 @@ export type MacosRemoteDesktopResponsibleCommandRunner = (
 export type MacosRemoteDesktopSessionModel = 'per_user' | 'global_bootstrap';
 
 export interface MacosRemoteDesktopProductionDependencies {
+  /** Test seam; production keeps the sign-in secret beside the node credential. */
+  unlockSecretStore?: MacosRemoteDesktopUnlockSecretStore;
   sessionModel?: MacosRemoteDesktopSessionModel;
   /** Test seam for the per-user model's one-time removal of the global agent. */
   retireGlobalLaunchAgent?: () => Promise<unknown>;
@@ -1012,6 +1018,12 @@ export function createMacosRemoteDesktopProductionDependencies(
   return {
     runtime: { platform, arch },
     runtimeRoot: dependencies.runtimeRoot,
+    // Beside the node's own credential: root-only, never inside the artifact
+    // store the worker's user can see.
+    unlockSecretStore: dependencies.unlockSecretStore
+      ?? createMacosRemoteDesktopUnlockSecretStore(
+        join(dirname(defaultCredentialPath('darwin')), 'remote-desktop-unlock'),
+      ),
     ...graphicalBootstrapOptions,
     // Run the session from inside aiDesk.to by IM.codes.app whenever that app
     // carries this exact component set, so the one grant the person gave that

@@ -121,7 +121,7 @@ describe('remote desktop standalone window', () => {
       .toContain('Mac Complete:full-panel'));
     complete.unmount();
 
-    const incomplete = render(<RemoteDesktopStandalone serverId="mac-incomplete" />);
+    const incomplete = render(<RemoteDesktopStandalone serverId="mac-incomplete" retryWindowMs={0} />);
     await waitFor(() => expect(incomplete.getByRole('alert').textContent)
       .toBe('controlled_nodes.error_generic'));
     expect(incomplete.queryByTestId('standalone-desktop')).toBeNull();
@@ -133,10 +133,49 @@ describe('remote desktop standalone window', () => {
       displayName: 'Desktop One',
       online: false,
     }]);
-    const result = render(<RemoteDesktopStandalone serverId="desktop-1" />);
+    const result = render(<RemoteDesktopStandalone serverId="desktop-1" retryWindowMs={0} />);
 
     await waitFor(() => expect(result.getByRole('alert').textContent).toBe('controlled_nodes.error_generic'));
     expect(result.queryByTestId('standalone-desktop')).toBeNull();
+  });
+
+  it('keeps looking while the host is briefly unusable instead of failing on one sample', async () => {
+    const eligible = {
+      serverId: 'mac-complete',
+      refName: 'mac-complete',
+      displayName: 'Mac Complete',
+      os: 'mac',
+      online: true,
+      execEnabled: true,
+      capabilities: MAC_COMPLETE,
+    };
+    listControllableMachines
+      .mockRejectedValueOnce(new Error('network'))
+      .mockResolvedValueOnce([{ ...eligible, capabilities: [REMOTE_DESKTOP_SESSION_CAPABILITY] }])
+      .mockResolvedValue([eligible]);
+    const result = render(
+      <RemoteDesktopStandalone serverId="mac-complete" retryWindowMs={5_000} retryIntervalMs={10} />,
+    );
+    await waitFor(() => expect(result.getByTestId('standalone-desktop').textContent)
+      .toContain('Mac Complete:full-panel'));
+    expect(listControllableMachines).toHaveBeenCalledTimes(3);
+    expect(result.queryByRole('alert')).toBeNull();
+  });
+
+  it('offers a manual retry once the window is spent', async () => {
+    listControllableMachines.mockResolvedValueOnce([]).mockResolvedValue([{
+      serverId: 'mac-complete',
+      refName: 'mac-complete',
+      displayName: 'Mac Complete',
+      os: 'mac',
+      online: true,
+      execEnabled: true,
+      capabilities: MAC_COMPLETE,
+    }]);
+    const result = render(<RemoteDesktopStandalone serverId="mac-complete" retryWindowMs={0} />);
+    await waitFor(() => expect(result.getByRole('alert')).toBeTruthy());
+    act(() => { result.getByRole('button', { name: 'remote_desktop.retry' }).click(); });
+    await waitFor(() => expect(result.getByTestId('standalone-desktop')).toBeTruthy());
   });
 
   it('round-trips only bounded machine ids through the standalone URL', () => {

@@ -97,7 +97,11 @@ describe('cross-platform remote desktop session profiles', () => {
     ]],
     ['clipboard without input', [...MAC_VIEW, REMOTE_DESKTOP_EXPLICIT_CLIPBOARD_CAPABILITY]],
     ['legacy Windows alias on macOS', [...MAC_VIEW, REMOTE_DESKTOP_CAPABILITY]],
-    ['unsupported macOS capture privacy', [...MAC_VIEW, REMOTE_DESKTOP_ADAPTER_CAPABILITY.CAPTURE_PRIVACY]],
+    ['unsupported macOS signed account shell', [
+      ...MAC_VIEW,
+      REMOTE_DESKTOP_ADAPTER_CAPABILITY.CAPTURE_PRIVACY,
+      REMOTE_DESKTOP_ADAPTER_CAPABILITY.SIGNED_ACCOUNT_SHELL,
+    ]],
     ['unknown remote desktop capability', [...MAC_VIEW, 'remote.desktop.platform.plan9.v1']],
   ] as const)('fails closed for %s', (_label, capabilities) => {
     expect(resolveRemoteDesktopSessionProfile(capabilities)).toBeNull();
@@ -110,6 +114,18 @@ describe('cross-platform remote desktop session profiles', () => {
     const parsed = parseAdvertisedControlledNodeCapabilities([...MAC_VIEW, action]);
     expect(parsed).toEqual({ ok: true, value: [...MAC_VIEW, action] });
     expect(parsed.ok && resolveRemoteDesktopSessionProfile(parsed.value)).toBeNull();
+  });
+
+  it('accepts macOS capture privacy on View and Control profiles', () => {
+    expect(resolveRemoteDesktopSessionProfile([
+      ...MAC_VIEW,
+      REMOTE_DESKTOP_ADAPTER_CAPABILITY.CAPTURE_PRIVACY,
+    ])).toMatchObject({ platform: 'macos', input: false, capturePrivacy: true });
+    expect(resolveRemoteDesktopSessionProfile([
+      ...MAC_VIEW,
+      REMOTE_DESKTOP_ADAPTER_CAPABILITY.INPUT,
+      REMOTE_DESKTOP_ADAPTER_CAPABILITY.CAPTURE_PRIVACY,
+    ])).toMatchObject({ platform: 'macos', input: true, capturePrivacy: true });
   });
 
   it('accepts probe-backed macOS action refinements only on an input-capable profile', () => {

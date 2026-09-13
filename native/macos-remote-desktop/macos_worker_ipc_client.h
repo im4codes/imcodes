@@ -19,6 +19,14 @@ inline constexpr char kIpcMessageVirtualDisplayRequest[] =
     "remote_desktop.macos_ipc.virtual_display_request";
 inline constexpr char kIpcMessageVirtualDisplayReply[] =
     "remote_desktop.macos_ipc.virtual_display_reply";
+inline constexpr char kIpcMessageUnlockRequest[] =
+    "remote_desktop.macos_ipc.unlock_request";
+inline constexpr char kIpcMessageUnlockReply[] =
+    "remote_desktop.macos_ipc.unlock_reply";
+inline constexpr char kIpcMessagePrivacyRequest[] =
+    "remote_desktop.macos_ipc.privacy_request";
+inline constexpr char kIpcMessagePrivacyReply[] =
+    "remote_desktop.macos_ipc.privacy_reply";
 inline constexpr char kIpcMessageWorkerMessage[] =
     "remote_desktop.macos_ipc.worker_message";
 inline constexpr char kIpcMessageAuthenticated[] =
@@ -155,6 +163,8 @@ enum class HostFrameKind : std::uint8_t {
   kUnknown,
   kHostCommand,
   kVirtualDisplayReply,
+  kUnlockReply,
+  kPrivacyRequest,
 };
 
 [[nodiscard]] HostFrameKind ClassifyHostFrame(std::string_view frame) noexcept;
@@ -267,6 +277,49 @@ class FrameReader {
   std::size_t max_frame_bytes_;
   bool overflowed_ = false;
 };
+
+/**
+ * Asks the daemon whether a sign-in secret is configured (`reveal` false) or
+ * for the secret itself, to perform an unlock the controller requested.
+ */
+[[nodiscard]] bool BuildUnlockRequestFrame(std::uint64_t worker_generation,
+                                           std::uint64_t request_id,
+                                           bool reveal, std::string* out);
+
+struct UnlockReplyFrame {
+  std::uint64_t worker_generation = 0;
+  std::uint64_t request_id = 0;
+  bool configured = false;
+  // base64url of the UTF-8 secret; empty unless revealed. Callers decode it,
+  // use it once and wipe both copies.
+  std::string sign_in_base64url;
+};
+
+/** Exact unlock reply envelope; kStale for another generation. */
+[[nodiscard]] HostFrameOutcome ParseUnlockReplyFrame(
+    std::string_view frame, std::uint64_t expected_generation,
+    UnlockReplyFrame* out);
+
+struct PrivacyRequestFrame {
+  std::uint64_t worker_generation = 0;
+  std::uint64_t request_id = 0;
+  bool shield = false;
+};
+
+/** Exact privacy request envelope from the daemon; kStale for another generation. */
+[[nodiscard]] HostFrameOutcome ParsePrivacyRequestFrame(
+    std::string_view frame, std::uint64_t expected_generation,
+    PrivacyRequestFrame* out);
+
+/** The worker's answer: shield state, input release, real frames encoded. */
+[[nodiscard]] bool BuildPrivacyReplyFrame(std::uint64_t worker_generation,
+                                          std::uint64_t request_id,
+                                          bool shielded, bool input_released,
+                                          std::uint64_t real_frame_generation,
+                                          std::string* out);
+
+/** Strict base64url (no padding) decode; false on any non-alphabet byte. */
+[[nodiscard]] bool DecodeBase64Url(std::string_view encoded, std::string* out);
 
 }  // namespace imcodes::remote_desktop::macos
 

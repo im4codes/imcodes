@@ -172,11 +172,12 @@ describe('remote desktop Web session profile', () => {
       REMOTE_DESKTOP_SESSION_CAPABILITY,
       REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS,
     ])).toBeNull();
+    // Capture privacy is now a real macOS capability; the signed shell is not.
     expect(resolveRemoteDesktopWebProfile([
       ...MAC_VIEW,
       REMOTE_DESKTOP_INPUT_CAPABILITY,
       REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY,
-    ])).toBeNull();
+    ])).toMatchObject({ capturePrivacy: true });
   });
 
   it.each([

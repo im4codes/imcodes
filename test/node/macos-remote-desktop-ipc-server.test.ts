@@ -811,3 +811,135 @@ describe('macOS remote-desktop bounded Unix IPC transport', () => {
     expect((await lstat(paths.socketPath)).isFile()).toBe(true);
   });
 });
+
+describe('macOS remote-desktop unlock requests', () => {
+  const unlockRequest = (requestId: number, reveal: boolean) => `${JSON.stringify({
+    type: MACOS_REMOTE_DESKTOP_IPC_MESSAGE.UNLOCK_REQUEST,
+    ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+    workerGeneration: 1,
+    requestId,
+    reveal,
+  })}\n`;
+
+  it('answers configured-only questions without the secret', async () => {
+    const { server, authenticated } = await createFixture({
+      unlockSecret: { configured: async () => true, reveal: async () => 'hunter2' },
+    });
+    const launch = await server.start();
+    const socket = await authenticate(server, authenticated, launch);
+    socket.write(unlockRequest(3, false));
+    const answered = JSON.parse(await readLine(socket)) as Record<string, unknown>;
+    expect(answered).toEqual({
+      type: MACOS_REMOTE_DESKTOP_IPC_MESSAGE.UNLOCK_REPLY,
+      ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+      workerGeneration: 1,
+      requestId: 3,
+      configured: true,
+      secret: '',
+    });
+    expect(socket.destroyed).toBe(false);
+    socket.destroy();
+  });
+
+  it('reveals the secret base64url-encoded only when asked to', async () => {
+    const value = 'p@ss "wörd"';
+    const { server, authenticated } = await createFixture({
+      unlockSecret: { configured: async () => true, reveal: async () => value },
+    });
+    const launch = await server.start();
+    const socket = await authenticate(server, authenticated, launch);
+    socket.write(unlockRequest(4, true));
+    const answered = JSON.parse(await readLine(socket)) as Record<string, unknown>;
+    expect(answered.configured).toBe(true);
+    expect(Buffer.from(answered.secret as string, 'base64url').toString('utf8')).toBe(value);
+    socket.destroy();
+  });
+
+  it('answers not configured when the host has no store', async () => {
+    const { server, authenticated } = await createFixture();
+    const launch = await server.start();
+    const socket = await authenticate(server, authenticated, launch);
+    socket.write(unlockRequest(5, true));
+    const answered = JSON.parse(await readLine(socket)) as Record<string, unknown>;
+    expect(answered).toMatchObject({ requestId: 5, configured: false, secret: '' });
+    socket.destroy();
+  });
+
+  it('drops a connection that sends a malformed unlock request', async () => {
+    const { server, authenticated, disconnected } = await createFixture({
+      unlockSecret: { configured: async () => true, reveal: async () => 'hunter2' },
+    });
+    const launch = await server.start();
+    const socket = await authenticate(server, authenticated, launch);
+    socket.write(`${JSON.stringify({
+      type: MACOS_REMOTE_DESKTOP_IPC_MESSAGE.UNLOCK_REQUEST,
+      ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+      workerGeneration: 1,
+      requestId: 6,
+      reveal: 'yes',
+    })}\n`);
+    await expect(disconnected.promise).resolves.toBeDefined();
+    socket.destroy();
+  });
+});
+
+describe('macOS remote-desktop privacy requests', () => {
+  const privacyReply = (overrides: Record<string, unknown> = {}) => `${JSON.stringify({
+    type: MACOS_REMOTE_DESKTOP_IPC_MESSAGE.PRIVACY_REPLY,
+    ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+    workerGeneration: 1,
+    requestId: 9,
+    shielded: true,
+    inputReleased: true,
+    realFrameGeneration: 5,
+    ...overrides,
+  })}\n`;
+
+  it('writes a privacy request to the authenticated worker and dispatches its reply', async () => {
+    const replies: unknown[] = [];
+    const { server, authenticated } = await createFixture({
+      onPrivacyReply: (reply) => { replies.push(reply); },
+    });
+    const launch = await server.start();
+    const socket = await authenticate(server, authenticated, launch);
+    const line = readLine(socket);
+    await server.sendPrivacyRequest(9, true);
+    expect(JSON.parse(await line)).toEqual({
+      type: MACOS_REMOTE_DESKTOP_IPC_MESSAGE.PRIVACY_REQUEST,
+      ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+      workerGeneration: launch.workerGeneration,
+      requestId: 9,
+      shield: true,
+    });
+    socket.write(privacyReply());
+    await expect.poll(() => replies).toEqual([{
+      workerGeneration: launch.workerGeneration,
+      requestId: 9,
+      shielded: true,
+      inputReleased: true,
+      realFrameGeneration: 5,
+    }]);
+    expect(socket.destroyed).toBe(false);
+    socket.destroy();
+  });
+
+  it('refuses to write a privacy request with no authenticated worker', async () => {
+    const { server } = await createFixture();
+    await server.start();
+    await expect(server.sendPrivacyRequest(1, true))
+      .rejects.toThrow(MACOS_REMOTE_DESKTOP_IPC_SERVER_ERROR.NOT_CONNECTED);
+  });
+
+  it('drops a connection that sends a malformed privacy reply', async () => {
+    const replies: unknown[] = [];
+    const { server, authenticated, disconnected } = await createFixture({
+      onPrivacyReply: (reply) => { replies.push(reply); },
+    });
+    const launch = await server.start();
+    const socket = await authenticate(server, authenticated, launch);
+    socket.write(privacyReply({ realFrameGeneration: -1 }));
+    await expect(disconnected.promise).resolves.toBe('frame_rejected');
+    expect(replies).toEqual([]);
+    socket.destroy();
+  });
+});

@@ -17,6 +17,7 @@ import {
 } from '../../shared/remote-desktop-platform.js';
 import {
   MACOS_REMOTE_DESKTOP_READINESS_MODE,
+  MACOS_REMOTE_DESKTOP_CAPTURE_PRIVACY_QUALIFIED,
   resolveMacosRemoteDesktopRuntimeProfile,
   type MacosRemoteDesktopReadinessInput,
 } from '../../src/node/macos-remote-desktop-readiness.js';
@@ -29,9 +30,19 @@ const READY: MacosRemoteDesktopReadinessInput = {
   accessibility: true,
   clipboard: true,
   disclosure: true,
+  // The shield is implemented but gated on hardware qualification; these
+  // cases describe the qualified profile. The default is pinned below.
+  capturePrivacy: true,
 };
 
 describe('macOS remote-desktop runtime readiness', () => {
+  it('does not advertise the privacy shield until it is qualified', () => {
+    const { capturePrivacy: _qualified, ...unqualified } = READY;
+    expect(MACOS_REMOTE_DESKTOP_CAPTURE_PRIVACY_QUALIFIED).toBe(false);
+    expect(resolveMacosRemoteDesktopRuntimeProfile(unqualified).adapterCapabilities)
+      .not.toContain(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY);
+  });
+
   it.each([
     'artifactVerified',
     'activeUserQualified',
@@ -93,6 +104,7 @@ describe('macOS remote-desktop runtime readiness', () => {
     expect(profile.adapterCapabilities).toEqual([
       REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
       REMOTE_DESKTOP_CANONICAL_BRANDING_CAPABILITY,
+      REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY,
     ]);
     expect(resolveRemoteDesktopSessionProfile([
       ...profile.sessionCapabilities,
@@ -117,14 +129,16 @@ describe('macOS remote-desktop runtime readiness', () => {
     );
   });
 
-  it('advertises lock-screen control with control, and nothing else unsupported', () => {
+  it('advertises lock-screen control and capture privacy with control, and nothing else unsupported', () => {
     const profile = resolveMacosRemoteDesktopRuntimeProfile(READY);
     const advertised = [...profile.sessionCapabilities, ...profile.adapterCapabilities];
     // The session survives the screen locking, so control reaches the lock
     // screen; view-only is checked below and never claims it.
     expect(advertised).toContain(REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY);
     expect(resolveRemoteDesktopSessionProfile(advertised)).toMatchObject({ lockScreen: true });
-    expect(advertised).not.toContain(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY);
+    // The worker's frame shield backs management privacy.
+    expect(advertised).toContain(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY);
+    expect(resolveRemoteDesktopSessionProfile(advertised)).toMatchObject({ capturePrivacy: true });
     expect(advertised).not.toContain(REMOTE_DESKTOP_DISPLAY_CONTROL_CAPABILITY);
     expect(advertised).not.toContain(REMOTE_DESKTOP_PLATFORM_CAPABILITY.WINDOWS);
     expect(advertised).not.toContain(REMOTE_DESKTOP_PLATFORM_CAPABILITY.LINUX);
@@ -159,5 +173,7 @@ describe('macOS remote-desktop runtime readiness', () => {
     expect([...viewOnly.sessionCapabilities, ...viewOnly.adapterCapabilities])
       .not.toContain(REMOTE_DESKTOP_DISPLAY_CONTROL_CAPABILITY);
     expect(viewOnly.adapterCapabilities).not.toContain(REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY);
+    // Capture privacy needs capture, not control.
+    expect(viewOnly.adapterCapabilities).toContain(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY);
   });
 });

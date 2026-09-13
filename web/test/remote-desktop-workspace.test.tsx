@@ -71,7 +71,9 @@ vi.mock('../src/components/RemoteDesktopPanel.js', () => ({
 import { installFullscreenStub, removeFullscreenStub } from './support/fullscreen-stub.js';
 import type { RemoteDesktopConnectionManager } from '../src/remote-desktop-connection-manager.js';
 import { RemoteDesktopWorkspace } from '../src/components/RemoteDesktopWorkspace.js';
+import { __resetMachinesForTests } from '../src/hooks/useMachines.js';
 import {
+  REMOTE_DESKTOP_WORKSPACE_MAX_HOSTS,
   createRemoteDesktopWorkspaceState,
   openRemoteDesktopWorkspaceHost,
 } from '../src/remote-desktop-workspace-state.js';
@@ -129,6 +131,7 @@ afterEach(() => {
   vi.clearAllMocks();
   window.confirm = originalConfirm;
   removeFullscreenStub();
+  __resetMachinesForTests();
 });
 
 api.getRemoteDesktopWall.mockResolvedValue({ revision: 0, layout: 'grid', hostIds: [], hosts: [] });
@@ -313,10 +316,114 @@ describe('RemoteDesktopWorkspace', () => {
       onCloseWorkspace={vi.fn()}
     />);
 
-    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_add' }));
-    await waitFor(() => expect(screen.getByRole('button', { name: /C/ })).toBeDefined());
-    fireEvent.click(screen.getByRole('button', { name: /C/ }));
+    const add = screen.getByRole('button', { name: 'remote_desktop.workspace_add' });
+    fireEvent.click(add);
+    expect(add.getAttribute('aria-expanded')).toBe('true');
+    const menu = await screen.findByRole('menu', { name: 'remote_desktop.workspace_picker' });
+    const row = await screen.findByRole('menuitem', { name: /C/ });
+    expect(menu.contains(row)).toBe(true);
+    fireEvent.click(row);
     expect(openHost).toHaveBeenCalledWith(expect.objectContaining({ serverId: 'c' }));
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
+    expect(add.getAttribute('aria-expanded')).toBe('false');
+  });
+
+  it('hangs the picker menu from the + button, right-aligned when it would overflow', async () => {
+    api.listControllableMachines.mockResolvedValue([machine('c')]);
+    const { manager } = setupManager();
+    render(<RemoteDesktopWorkspace
+      state={createRemoteDesktopWorkspaceState()}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    const add = screen.getByRole('button', { name: 'remote_desktop.workspace_add' });
+    const viewportWidth = window.innerWidth;
+    add.getBoundingClientRect = () => ({
+      left: viewportWidth - 40, right: viewportWidth - 12, top: 10, bottom: 38,
+      width: 28, height: 28, x: viewportWidth - 40, y: 10, toJSON: () => ({}),
+    }) as DOMRect;
+    fireEvent.click(add);
+    const menu = await screen.findByRole('menu');
+    expect(menu.classList.contains('controlled-node-quick-menu')).toBe(true);
+    expect(menu.style.top).toBe('44px');
+    const width = parseFloat(menu.style.width);
+    expect(parseFloat(menu.style.left) + width).toBe(viewportWidth - 12);
+
+    // Clicking + again closes it rather than reopening it.
+    fireEvent.pointerDown(add);
+    fireEvent.click(add);
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
+  });
+
+  it('keeps open hosts pickable at the host limit and disables the rest', async () => {
+    let state = createRemoteDesktopWorkspaceState();
+    const open = Array.from({ length: REMOTE_DESKTOP_WORKSPACE_MAX_HOSTS }, (_, index) => machine(`open${index}`));
+    for (const host of open) state = openRemoteDesktopWorkspaceHost(state, host);
+    api.listControllableMachines.mockResolvedValue([open[0], machine('extra')]);
+    const { manager } = setupManager();
+    const openHost = vi.fn();
+    render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      onOpenHost={openHost}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_add' }));
+    const extra = await screen.findByRole('menuitem', { name: /EXTRA/ });
+    const limitText = `remote_desktop.workspace_limit:${REMOTE_DESKTOP_WORKSPACE_MAX_HOSTS}`;
+    expect(screen.getByRole('status').textContent).toBe(limitText);
+    expect(extra.getAttribute('aria-disabled')).toBe('true');
+    expect(extra.getAttribute('title')).toBe(limitText);
+    fireEvent.click(extra);
+    expect(openHost).not.toHaveBeenCalled();
+
+    const already = screen.getByRole('menuitem', { name: /OPEN0/ });
+    expect(already.getAttribute('aria-disabled')).toBeNull();
+    fireEvent.click(already);
+    expect(openHost).toHaveBeenCalledWith(expect.objectContaining({ serverId: 'open0' }));
+  });
+
+  it('reports a failed machine load in the picker', async () => {
+    api.listControllableMachines.mockRejectedValue(new Error('offline'));
+    const { manager } = setupManager();
+    render(<RemoteDesktopWorkspace
+      state={createRemoteDesktopWorkspaceState()}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_add' }));
+    expect((await screen.findByRole('alert')).textContent).toBe('remote_desktop.workspace_picker_failed');
+  });
+
+  it('renders the picker inside the workspace while it is fullscreen', async () => {
+    const stub = installFullscreenStub();
+    api.listControllableMachines.mockResolvedValue([machine('c')]);
+    const { manager } = setupManager();
+    const result = render(<RemoteDesktopWorkspace
+      state={createRemoteDesktopWorkspaceState()}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    const workspace = result.container.querySelector('.remote-desktop-workspace') as HTMLElement;
+    act(() => stub.setElement(workspace));
+    fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_add' }));
+    const menu = await screen.findByRole('menu');
+    expect(workspace.contains(menu)).toBe(true);
   });
 
   it('uses the real capability gate for complete and incomplete macOS profiles', async () => {
@@ -338,8 +445,12 @@ describe('RemoteDesktopWorkspace', () => {
     />);
 
     fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_add' }));
-    const complete = await screen.findByRole('button', { name: /MAC-COMPLETE/ });
-    expect(screen.queryByRole('button', { name: /MAC-INCOMPLETE/ })).toBeNull();
+    const complete = await screen.findByRole('menuitem', { name: /MAC-COMPLETE/ });
+    const incomplete = screen.getByRole('menuitem', { name: /MAC-INCOMPLETE/ });
+    expect(complete.getAttribute('aria-disabled')).toBeNull();
+    expect(incomplete.getAttribute('aria-disabled')).toBe('true');
+    fireEvent.click(incomplete);
+    expect(openHost).not.toHaveBeenCalled();
     fireEvent.click(complete);
     expect(openHost).toHaveBeenCalledWith(expect.objectContaining({ serverId: 'mac-complete' }));
   });
@@ -363,8 +474,10 @@ describe('RemoteDesktopWorkspace', () => {
       onCloseWorkspace={vi.fn()}
     />);
     fireEvent.click(screen.getByRole('button', { name: 'remote_desktop.workspace_add' }));
-    await waitFor(() => expect(result.container.textContent).toContain('1000000007'));
-    expect(result.container.textContent).toContain('Public workstation');
+    const menu = await screen.findByRole('menu');
+    await waitFor(() => expect(menu.textContent).toContain('1000000007'));
+    expect(menu.textContent).toContain('Public workstation');
+    expect(menu.textContent).not.toContain('internal-routing-secret');
     expect(result.container.textContent).not.toContain('internal-routing-secret');
   });
 

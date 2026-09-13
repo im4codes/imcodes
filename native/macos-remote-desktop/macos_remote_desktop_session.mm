@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <algorithm>
+#include <cstdio>
 #include <limits>
 #include <mutex>
 #include <utility>
@@ -736,6 +737,20 @@ class MacosRemoteDesktopSession::Impl final
 
   // The worker's periodic sample: this session's own captured-frame count and
   // the bytes upstream accepted, stamped with the live route.
+  void SetPrivacyShield(bool shielded) noexcept {
+    privacy_shielded_.store(shielded, std::memory_order_release);
+  }
+  [[nodiscard]] bool privacy_shielded() const noexcept {
+    return privacy_shielded_.load(std::memory_order_acquire);
+  }
+  [[nodiscard]] std::uint64_t real_frames_encoded() const noexcept {
+    return real_frames_encoded_.load(std::memory_order_acquire);
+  }
+  [[nodiscard]] bool media_active() {
+    std::lock_guard lock(mutex_);
+    return ActiveLocked() && media_started_;
+  }
+
   bool RecordMediaProgress(std::uint64_t outbound_video_bytes,
                            common::TransportTime now) {
     common::TransportCallbackStamp stamp;
@@ -1124,12 +1139,52 @@ class MacosRemoteDesktopSession::Impl final
     captured_frames_.fetch_add(1, std::memory_order_relaxed);
     const common::DisplayTopology* display =
         exposed_topology_.FindDisplay(selected_display_id_);
+    // A frame that does not match the selected display is dropped, not fatal.
+    // The capture surface changes size transiently -- the display sleeping
+    // behind the lock screen, a mode switch before topology catches up -- and
+    // ending a live session over one such frame took every locked-Mac session
+    // down within milliseconds of connecting.
     if (display == nullptr || !frame.IsValid() ||
         frame.encoded_pixels.width != display->encoded_pixels.width ||
-        frame.encoded_pixels.height != display->encoded_pixels.height ||
-        !dependencies_.adapters.encoder.Encode(std::move(frame), false)) {
+        frame.encoded_pixels.height != display->encoded_pixels.height) {
+      if (!reported_frame_mismatch_) {
+        reported_frame_mismatch_ = true;
+        std::fprintf(stderr,
+                     "macos_remote_desktop_session_frame_dropped reason=%s "
+                     "frame=%ux%u display=%ux%u\n",
+                     display == nullptr ? "no_display"
+                     : !frame.IsValid() ? "invalid_frame"
+                                        : "size_mismatch",
+                     frame.encoded_pixels.width, frame.encoded_pixels.height,
+                     display != nullptr ? display->encoded_pixels.width : 0U,
+                     display != nullptr ? display->encoded_pixels.height : 0U);
+      }
+      return;
+    }
+    // Management privacy: while the owner handles a secret on this Mac, no
+    // real pixel may reach any viewer. The swap happens here, before encoding,
+    // so every route and every capture backend (ScreenCaptureKit and the
+    // lock-screen CGDisplayStream path) is covered by one switch, and the
+    // stream keeps flowing so viewers see the shield rather than a stall.
+    const bool shielded = privacy_shielded_.load(std::memory_order_acquire);
+    if (shielded) {
+      frame = ShieldFrameLike(frame);
+    }
+    if (dependencies_.adapters.encoder.Encode(std::move(frame), false)) {
+      consecutive_encode_failures_ = 0;
+      if (!shielded)
+        real_frames_encoded_.fetch_add(1, std::memory_order_release);
+      return;
+    }
+    // The encoder refuses a frame under backpressure or while it rebuilds its
+    // session; the next frame retries. Only a sustained run -- about two
+    // seconds at the capture cadence -- means the encoder is actually gone.
+    if (++consecutive_encode_failures_ == 1) {
+      std::fprintf(stderr, "macos_remote_desktop_session_encode_refused\n");
+    }
+    if (consecutive_encode_failures_ >= kMaximumConsecutiveEncodeFailures) {
       TerminateLocked(Error(TerminalErrorCode::kEncoderUnavailable,
-                            "captured frame could not be encoded"),
+                            "captured frames could not be encoded"),
                       MacosSessionEndReason::kAdapterFailure);
     }
   }
@@ -1382,6 +1437,57 @@ class MacosRemoteDesktopSession::Impl final
   bool media_started_ = false;
   bool terminating_locally_ = false;
   std::atomic<std::uint64_t> captured_frames_{0};
+  std::atomic<bool> privacy_shielded_{false};
+  std::atomic<std::uint64_t> real_frames_encoded_{0};
+  // One reusable opaque frame per capture size; frames share its storage.
+  std::shared_ptr<const common::FrameStorage> shield_storage_;
+  common::PixelSize shield_pixels_{};
+
+  class ShieldStorage final : public common::FrameStorage {
+   public:
+    explicit ShieldStorage(std::vector<std::byte> bytes)
+        : bytes_(std::move(bytes)) {}
+    [[nodiscard]] const std::byte* data() const noexcept override {
+      return bytes_.data();
+    }
+    [[nodiscard]] std::size_t size() const noexcept override {
+      return bytes_.size();
+    }
+
+   private:
+    std::vector<std::byte> bytes_;
+  };
+
+  // The same flat brand surface Windows shows (#0F1724), at the captured size
+  // so the encoder and viewer layout are unchanged while shielded.
+  common::CapturedFrame ShieldFrameLike(const common::CapturedFrame& real) {
+    const common::PixelSize pixels = real.encoded_pixels;
+    if (shield_storage_ == nullptr || shield_pixels_.width != pixels.width ||
+        shield_pixels_.height != pixels.height) {
+      const std::size_t count =
+          static_cast<std::size_t>(pixels.width) * pixels.height;
+      std::vector<std::byte> bytes(count * 4);
+      for (std::size_t i = 0; i < count; ++i) {
+        bytes[i * 4] = std::byte{0x24};      // B
+        bytes[i * 4 + 1] = std::byte{0x17};  // G
+        bytes[i * 4 + 2] = std::byte{0x0F};  // R
+        bytes[i * 4 + 3] = std::byte{0xFF};  // A
+      }
+      shield_storage_ = std::make_shared<ShieldStorage>(std::move(bytes));
+      shield_pixels_ = pixels;
+    }
+    common::CapturedFrame shield;
+    shield.encoded_pixels = pixels;
+    shield.pixel_format = common::PixelFormat::kBgra8888;
+    shield.row_bytes = pixels.width * 4;
+    shield.capture_time_us = real.capture_time_us;
+    shield.color_primaries = real.color_primaries;
+    shield.storage = shield_storage_;
+    return shield;
+  }
+  static constexpr std::uint32_t kMaximumConsecutiveEncodeFailures = 60;
+  std::uint32_t consecutive_encode_failures_ = 0;
+  bool reported_frame_mismatch_ = false;
   bool cleaned_ = false;
 };
 
@@ -1666,6 +1772,22 @@ bool MacosRemoteDesktopSession::UpdateTransportQuality(
     const common::TransportCallbackStamp& stamp,
     const common::QualityTarget& target) {
   return impl_->UpdateTransportQuality(stamp, target);
+}
+
+void MacosRemoteDesktopSession::SetPrivacyShield(bool shielded) noexcept {
+  impl_->SetPrivacyShield(shielded);
+}
+
+bool MacosRemoteDesktopSession::privacy_shielded() const noexcept {
+  return impl_->privacy_shielded();
+}
+
+std::uint64_t MacosRemoteDesktopSession::real_frames_encoded() const noexcept {
+  return impl_->real_frames_encoded();
+}
+
+bool MacosRemoteDesktopSession::media_active() {
+  return impl_->media_active();
 }
 
 bool MacosRemoteDesktopSession::RecordMediaProgress(

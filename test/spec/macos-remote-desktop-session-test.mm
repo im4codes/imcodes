@@ -111,6 +111,7 @@ class FakeEncoder final : public common::EncoderAdapter {
   }
   bool Encode(common::CapturedFrame frame, bool) override {
     ++encode_count;
+    last_frame = frame;
     if (!encode_result || !frame.IsValid() || !sink) return false;
     sink({.bytes = {std::byte{0x01}},
           .presentation_time_us = frame.capture_time_us,
@@ -131,6 +132,7 @@ class FakeEncoder final : public common::EncoderAdapter {
   int stop_count = 0;
   bool configure_result = true;
   bool encode_result = true;
+  common::CapturedFrame last_frame;
 };
 
 class FakeInput final : public common::InputAdapter {
@@ -725,6 +727,69 @@ void TestReadinessAndMediaFailuresFailClosed() {
           "pinned sender rejection must be terminal, never custom fallback");
 }
 
+void TestPrivacyShieldReplacesEveryFrameBeforeEncoding() {
+  Fixture fixture;
+  Require(fixture.session.Start(Request()), "privacy fixture should start");
+  fixture.capture.Emit({1920, 1080});
+  Require(fixture.session.real_frames_encoded() == 1,
+          "a real frame counts toward the fresh-frame generation");
+
+  fixture.session.SetPrivacyShield(true);
+  Require(fixture.session.privacy_shielded(), "shield flag is observable");
+  fixture.capture.Emit({1920, 1080});
+  const common::CapturedFrame& shielded = fixture.encoder.last_frame;
+  Require(fixture.encoder.encode_count == 2 && shielded.IsValid() &&
+              shielded.encoded_pixels.width == 1920 &&
+              shielded.encoded_pixels.height == 1080,
+          "the stream keeps flowing at the captured size while shielded");
+  const auto* pixels = shielded.storage->data();
+  bool opaque = true;
+  for (std::size_t i = 0; i < 1920u * 1080u; i += 4099) {
+    opaque = opaque && pixels[i * 4] == std::byte{0x24} &&
+             pixels[i * 4 + 1] == std::byte{0x17} &&
+             pixels[i * 4 + 2] == std::byte{0x0F} &&
+             pixels[i * 4 + 3] == std::byte{0xFF};
+  }
+  Require(opaque, "every encoded pixel is the opaque brand surface, never the capture");
+  Require(fixture.session.real_frames_encoded() == 1,
+          "shield frames never count as fresh real frames");
+
+  fixture.session.SetPrivacyShield(false);
+  fixture.capture.Emit({1920, 1080});
+  Require(fixture.session.real_frames_encoded() == 2,
+          "the first real frame after release advances the generation");
+}
+
+void TestTransientCaptureAndEncodeFailuresDoNotEndSession() {
+  Fixture fixture;
+  Require(fixture.session.Start(Request()), "transient-failure fixture should start");
+  // A frame whose size disagrees with the selected display (the display
+  // sleeping behind the lock screen) is dropped, never fatal.
+  fixture.capture.Emit({640, 360});
+  Require(fixture.session.state() != common::SessionState::kTerminal &&
+              fixture.encoder.encode_count == 0,
+          "a mismatched frame must be dropped without ending the session");
+  fixture.capture.Emit({1920, 1080});
+  Require(fixture.encoder.encode_count == 1, "a matching frame still encodes");
+
+  // A short run of refused frames is backpressure; a sustained run is not.
+  fixture.encoder.encode_result = false;
+  for (int i = 0; i < 59; ++i) fixture.capture.Emit({1920, 1080});
+  Require(fixture.session.state() != common::SessionState::kTerminal,
+          "a transient run of encoder refusals must not end the session");
+  fixture.encoder.encode_result = true;
+  fixture.capture.Emit({1920, 1080});
+  fixture.encoder.encode_result = false;
+  for (int i = 0; i < 59; ++i) fixture.capture.Emit({1920, 1080});
+  Require(fixture.session.state() != common::SessionState::kTerminal,
+          "a successful encode resets the refusal run");
+  for (int i = 0; i < 2; ++i) fixture.capture.Emit({1920, 1080});
+  Require(fixture.session.state() == common::SessionState::kTerminal &&
+              fixture.session.terminal_error().code ==
+                  common::TerminalErrorCode::kEncoderUnavailable,
+          "a sustained run of encoder refusals ends the session");
+}
+
 void TestRouteAuthorityActivityModeAndExpiryUseCommonTransportCore() {
   Fixture fixture;
   macos::MacosRemoteDesktopStartRequest request = Request();
@@ -880,6 +945,8 @@ int main() {
   TestMonitorSelectionPublishesRevisionAndRejectsStaleInput();
   TestLifecycleBoundaryPerformsTerminalCleanupOnce();
   TestReadinessAndMediaFailuresFailClosed();
+  TestTransientCaptureAndEncodeFailuresDoNotEndSession();
+  TestPrivacyShieldReplacesEveryFrameBeforeEncoding();
   TestRouteAuthorityActivityModeAndExpiryUseCommonTransportCore();
   TestTransportAdapterFailureAndCompatibilityModeFailHonestly();
   TestRealTransportCallbacksFlowThroughCommonCore();

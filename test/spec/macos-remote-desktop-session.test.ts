@@ -150,7 +150,11 @@ describe('macOS SessionCore composition', () => {
         });
         expect(run.status, `${run.stdout}\n${run.stderr}`).toBe(0);
         expect(run.stdout).toBe('');
-        expect(run.stderr).toBe('');
+        // The only stderr allowed is the session's own one-line diagnostics for
+        // dropped or refused frames, which the transient-failure case provokes.
+        const unexpected = run.stderr.split('\n').filter((line) => line !== ''
+          && !/^macos_remote_desktop_session_(frame_dropped|encode_refused)\b/.test(line));
+        expect(unexpected).toEqual([]);
       } finally {
         rmSync(directory, { recursive: true, force: true });
       }

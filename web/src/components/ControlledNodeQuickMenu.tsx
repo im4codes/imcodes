@@ -1,27 +1,11 @@
-import { createPortal } from 'preact/compat';
-import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
+import { useCallback, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { MachineListItem } from '../api/machines.js';
-import { useMachines } from '../hooks/useMachines.js';
-import { canOpenRemoteDesktopMachine } from '../remote-desktop-profile.js';
-import {
-  MACHINE_GROUP_DIRECT,
-  machineGroupTabs,
-  machineGroupsOf,
-  machinesInGroup,
-} from '../machine-grouping.js';
-import { MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
+import { ControlledNodeMachineMenu } from './ControlledNodeMachineMenu.js';
 
 interface ControlledNodeQuickMenuProps {
-  onOpenRemoteDesktop(machine: MachineListItem): void;
+  onOpenRemoteDesktop?(machine: MachineListItem): void;
   onOpenRemoteDesktopWall?(): void;
-}
-
-interface MenuPosition {
-  left: number;
-  top: number;
-  width: number;
-  maxHeight: number;
 }
 
 /**
@@ -33,157 +17,10 @@ interface MenuPosition {
  */
 export function ControlledNodeQuickMenu({ onOpenRemoteDesktop, onOpenRemoteDesktopWall }: ControlledNodeQuickMenuProps) {
   const { t } = useTranslation();
-  const { machines, loaded, loading, error, refetch } = useMachines();
   const [open, setOpen] = useState(false);
-  const [group, setGroup] = useState<string>(MACHINE_GROUP_DIRECT);
-  const groups = machineGroupsOf(machines);
-  const visible = machinesInGroup(machines, group);
-  const [position, setPosition] = useState<MenuPosition | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
-  const menuRef = useRef<HTMLDivElement>(null);
-
-  const updatePosition = useCallback(() => {
-    const anchor = rootRef.current;
-    if (!anchor) return;
-    const rect = anchor.getBoundingClientRect();
-    const viewportWidth = window.innerWidth;
-    const viewportHeight = window.innerHeight;
-    const width = Math.min(360, Math.max(240, viewportWidth - 16));
-    const left = Math.max(8, Math.min(rect.left, viewportWidth - width - 8));
-    const top = Math.min(rect.bottom + 6, Math.max(8, viewportHeight - 176));
-    setPosition({ left, top, width, maxHeight: Math.max(144, viewportHeight - top - 12) });
-  }, []);
-
-  const close = useCallback((restoreFocus = false) => {
-    setOpen(false);
-    setPosition(null);
-    if (restoreFocus) triggerRef.current?.focus();
-  }, []);
-
-  const toggle = useCallback(() => {
-    if (open) {
-      close();
-      return;
-    }
-    updatePosition();
-    setOpen(true);
-    void refetch().catch(() => {});
-  }, [close, open, refetch, updatePosition]);
-
-  useEffect(() => {
-    if (!open) return;
-    const onPointerDown = (event: PointerEvent) => {
-      const target = event.target;
-      if (!(target instanceof Node)) return;
-      if (rootRef.current?.contains(target) || menuRef.current?.contains(target)) return;
-      close();
-    };
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return;
-      event.preventDefault();
-      close(true);
-    };
-    const reposition = () => updatePosition();
-    document.addEventListener('pointerdown', onPointerDown, true);
-    document.addEventListener('keydown', onKeyDown);
-    window.addEventListener('resize', reposition);
-    window.addEventListener('scroll', reposition, true);
-    return () => {
-      document.removeEventListener('pointerdown', onPointerDown, true);
-      document.removeEventListener('keydown', onKeyDown);
-      window.removeEventListener('resize', reposition);
-      window.removeEventListener('scroll', reposition, true);
-    };
-  }, [close, open, updatePosition]);
-
-  const menu = open && position && typeof document !== 'undefined' ? createPortal(
-    <div
-      ref={menuRef}
-      class="controlled-node-quick-menu"
-      role="menu"
-      aria-label={t('controlled_nodes.machines_title')}
-      style={{
-        left: position.left,
-        top: position.top,
-        width: position.width,
-        maxHeight: position.maxHeight,
-      }}
-    >
-      <div class="controlled-node-quick-menu-head">
-        <span>{t('controlled_nodes.machines_title')}</span>
-        <span class="controlled-node-quick-count">{visible.length}</span>
-      </div>
-      {/* A team is a group you can share. Picking one here is the same act as
-          picking one in the machines tab, so it is the same control. */}
-      {groups.length > 0 && (
-        <div class="controlled-node-quick-groups" role="none">
-          {machineGroupTabs(machines).map(({ id, name, count }) => (
-            <button
-              key={id}
-              type="button"
-              role="none"
-              class={`controlled-nodes-team-chip${group === id ? ' is-active' : ''}`}
-              data-testid={`controlled-node-quick-group-${id}`}
-              onClick={() => setGroup(id)}
-            >
-              {name ?? t(id === MACHINE_GROUP_DIRECT ? 'controlled_nodes.group_direct' : 'controlled_nodes.group_all')}
-              <span class="controlled-nodes-team-chip-count">{count}</span>
-            </button>
-          ))}
-        </div>
-      )}
-      {onOpenRemoteDesktopWall && <button
-        type="button"
-        class="controlled-node-quick-wall"
-        role="menuitem"
-        onClick={() => { close(); onOpenRemoteDesktopWall(); }}
-      ><span aria-hidden="true">▦</span>{t('remote_desktop.workspace_wall')}</button>}
-      {!loaded && loading && <div class="controlled-node-quick-state">{t('common.loading')}</div>}
-      {loaded && error && machines.length === 0 && (
-        <div class="controlled-node-quick-state is-error">{t('controlled_nodes.refresh_error')}</div>
-      )}
-      {loaded && visible.length === 0 && !error && (
-        <div class="controlled-node-quick-state">{t('controlled_nodes.empty')}</div>
-      )}
-      {visible.length > 0 && (
-        <ul class="controlled-node-quick-list">
-          {visible.map((machine) => {
-            const available = canOpenRemoteDesktopMachine(machine);
-            return (
-              <li key={machine.serverId} class="controlled-node-quick-row" role="none">
-                <span
-                  class={`controlled-node-quick-presence ${machine.online ? 'is-online' : 'is-offline'}`}
-                  aria-hidden="true"
-                />
-                <span class="controlled-node-quick-identity">
-                  <strong>{machine.displayName}</strong>
-                  <code>{machine.nodeId ?? MACHINE_IDENTITY_UNAVAILABLE}</code>
-                </span>
-                <button
-                  type="button"
-                  class="controlled-node-quick-remote"
-                  role="menuitem"
-                  disabled={!available}
-                  title={available ? t('remote_desktop.open') : (machine.online
-                    ? t('controlled_nodes.exec_off')
-                    : t('controlled_nodes.offline'))}
-                  onClick={() => {
-                    close();
-                    onOpenRemoteDesktop(machine);
-                  }}
-                >
-                  <span aria-hidden="true">🖥</span>
-                  {t('remote_desktop.open')}
-                </button>
-              </li>
-            );
-          })}
-        </ul>
-      )}
-    </div>,
-    document.body,
-  ) : null;
+  const close = useCallback(() => setOpen(false), []);
 
   return (
     <>
@@ -196,12 +33,26 @@ export function ControlledNodeQuickMenu({ onOpenRemoteDesktop, onOpenRemoteDeskt
           aria-expanded={open}
           aria-label={t('controlled_nodes.machines_title')}
           title={t('controlled_nodes.machines_title')}
-          onClick={toggle}
+          onClick={() => setOpen((current) => !current)}
         >
           <span aria-hidden="true">▾</span>
         </button>
       </div>
-      {menu}
+      <ControlledNodeMachineMenu
+        anchorRef={rootRef}
+        returnFocusRef={triggerRef}
+        open={open}
+        onClose={close}
+        onSelect={(machine) => onOpenRemoteDesktop?.(machine)}
+        header={onOpenRemoteDesktopWall && (
+          <button
+            type="button"
+            class="controlled-node-quick-wall"
+            role="menuitem"
+            onClick={() => { close(); onOpenRemoteDesktopWall(); }}
+          ><span aria-hidden="true">▦</span>{t('remote_desktop.workspace_wall')}</button>
+        )}
+      />
     </>
   );
 }

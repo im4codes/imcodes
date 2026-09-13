@@ -231,6 +231,14 @@ class MacosRemoteDesktopSession final {
                        common::TransportPath path);
   bool UpdateTransportQuality(const common::TransportCallbackStamp& stamp,
                               const common::QualityTarget& target);
+  // Management privacy shield: while set, every captured frame is replaced by
+  // an opaque brand frame before encoding. Real frames encoded so far let the
+  // host prove a fresh post-release frame.
+  void SetPrivacyShield(bool shielded) noexcept;
+  [[nodiscard]] bool privacy_shielded() const noexcept;
+  [[nodiscard]] std::uint64_t real_frames_encoded() const noexcept;
+  [[nodiscard]] bool media_active();
+
   // Periodic outbound-media sample for the live route (captured frames are
   // counted by the session itself).
   bool RecordMediaProgress(std::uint64_t outbound_video_bytes,

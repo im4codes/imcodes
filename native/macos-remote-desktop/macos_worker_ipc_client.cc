@@ -618,6 +618,8 @@ HostFrameKind ClassifyHostFrame(std::string_view frame) noexcept {
   if (type == kIpcMessageVirtualDisplayReply) {
     return HostFrameKind::kVirtualDisplayReply;
   }
+  if (type == kIpcMessageUnlockReply) return HostFrameKind::kUnlockReply;
+  if (type == kIpcMessagePrivacyRequest) return HostFrameKind::kPrivacyRequest;
   return HostFrameKind::kUnknown;
 }
 
@@ -791,6 +793,184 @@ bool FrameReader::Feed(std::string_view chunk,
     }
     buffer_.push_back(character);
   }
+  return true;
+}
+
+bool BuildUnlockRequestFrame(std::uint64_t worker_generation,
+                             std::uint64_t request_id, bool reveal,
+                             std::string* out) {
+  if (out == nullptr) return false;
+  if (worker_generation == 0 || worker_generation > kMaxWorkerGeneration) {
+    return false;
+  }
+  if (request_id == 0 || request_id > kMaxWorkerGeneration) return false;
+  std::string frame;
+  frame.append("{\"type\":\"").append(kIpcMessageUnlockRequest).append("\"");
+  frame.append(",\"ipcVersion\":").append(std::to_string(kWorkerIpcVersion));
+  frame.append(",\"workerGeneration\":")
+      .append(std::to_string(worker_generation));
+  frame.append(",\"requestId\":").append(std::to_string(request_id));
+  frame.append(",\"reveal\":").append(reveal ? "true" : "false").append("}");
+  *out = std::move(frame);
+  return true;
+}
+
+HostFrameOutcome ParseUnlockReplyFrame(std::string_view frame,
+                                       std::uint64_t expected_generation,
+                                       UnlockReplyFrame* out) {
+  if (out == nullptr) return HostFrameOutcome::kMalformed;
+  if (frame.empty() || frame.size() >= kIpcMaxFrameBytes ||
+      ContainsControlCharacter(frame)) {
+    return HostFrameOutcome::kMalformed;
+  }
+  std::size_t cursor = 0;
+  std::string type;
+  if (!ExpectLiteral(frame, &cursor, "{") ||
+      !ExpectLiteral(frame, &cursor, "\"type\":") ||
+      !ReadPlainString(frame, &cursor, &type) ||
+      type != kIpcMessageUnlockReply) {
+    return HostFrameOutcome::kMalformed;
+  }
+  std::uint64_t ipc_version = 0;
+  std::uint64_t generation = 0;
+  std::uint64_t request_id = 0;
+  if (!ExpectLiteral(frame, &cursor, ",") ||
+      !ReadUnsignedMember(frame, &cursor, "\"ipcVersion\":", &ipc_version) ||
+      ipc_version != static_cast<std::uint64_t>(kWorkerIpcVersion) ||
+      !ExpectLiteral(frame, &cursor, ",") ||
+      !ReadUnsignedMember(frame, &cursor, "\"workerGeneration\":", &generation) ||
+      !ExpectLiteral(frame, &cursor, ",") ||
+      !ReadUnsignedMember(frame, &cursor, "\"requestId\":", &request_id) ||
+      !ExpectLiteral(frame, &cursor, ",") ||
+      !ExpectLiteral(frame, &cursor, "\"configured\":")) {
+    return HostFrameOutcome::kMalformed;
+  }
+  bool configured = false;
+  if (ExpectLiteral(frame, &cursor, "true")) {
+    configured = true;
+  } else if (!ExpectLiteral(frame, &cursor, "false")) {
+    return HostFrameOutcome::kMalformed;
+  }
+  std::string secret;
+  if (!ExpectLiteral(frame, &cursor, ",") ||
+      !ExpectLiteral(frame, &cursor, "\"secret\":") ||
+      !ReadPlainString(frame, &cursor, &secret) ||
+      !ExpectLiteral(frame, &cursor, "}")) {
+    return HostFrameOutcome::kMalformed;
+  }
+  SkipWhitespace(frame, &cursor);
+  if (cursor != frame.size()) return HostFrameOutcome::kMalformed;
+  if (generation != expected_generation) return HostFrameOutcome::kStale;
+  if (request_id == 0 || (!configured && !secret.empty())) {
+    return HostFrameOutcome::kMalformed;
+  }
+  for (const char c : secret) {
+    const bool alphabet = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                          (c >= '0' && c <= '9') || c == '-' || c == '_';
+    if (!alphabet) return HostFrameOutcome::kMalformed;
+  }
+  out->worker_generation = generation;
+  out->request_id = request_id;
+  out->configured = configured;
+  out->sign_in_base64url = std::move(secret);
+  return HostFrameOutcome::kAccepted;
+}
+
+HostFrameOutcome ParsePrivacyRequestFrame(std::string_view frame,
+                                          std::uint64_t expected_generation,
+                                          PrivacyRequestFrame* out) {
+  if (out == nullptr) return HostFrameOutcome::kMalformed;
+  if (frame.empty() || frame.size() >= kIpcMaxFrameBytes ||
+      ContainsControlCharacter(frame)) {
+    return HostFrameOutcome::kMalformed;
+  }
+  std::size_t cursor = 0;
+  std::string type;
+  std::uint64_t ipc_version = 0;
+  std::uint64_t generation = 0;
+  std::uint64_t request_id = 0;
+  if (!ExpectLiteral(frame, &cursor, "{") ||
+      !ExpectLiteral(frame, &cursor, "\"type\":") ||
+      !ReadPlainString(frame, &cursor, &type) ||
+      type != kIpcMessagePrivacyRequest ||
+      !ExpectLiteral(frame, &cursor, ",") ||
+      !ReadUnsignedMember(frame, &cursor, "\"ipcVersion\":", &ipc_version) ||
+      ipc_version != static_cast<std::uint64_t>(kWorkerIpcVersion) ||
+      !ExpectLiteral(frame, &cursor, ",") ||
+      !ReadUnsignedMember(frame, &cursor, "\"workerGeneration\":", &generation) ||
+      !ExpectLiteral(frame, &cursor, ",") ||
+      !ReadUnsignedMember(frame, &cursor, "\"requestId\":", &request_id) ||
+      !ExpectLiteral(frame, &cursor, ",") ||
+      !ExpectLiteral(frame, &cursor, "\"shield\":")) {
+    return HostFrameOutcome::kMalformed;
+  }
+  bool shield = false;
+  if (ExpectLiteral(frame, &cursor, "true")) {
+    shield = true;
+  } else if (!ExpectLiteral(frame, &cursor, "false")) {
+    return HostFrameOutcome::kMalformed;
+  }
+  if (!ExpectLiteral(frame, &cursor, "}")) return HostFrameOutcome::kMalformed;
+  SkipWhitespace(frame, &cursor);
+  if (cursor != frame.size()) return HostFrameOutcome::kMalformed;
+  if (generation != expected_generation) return HostFrameOutcome::kStale;
+  if (request_id == 0) return HostFrameOutcome::kMalformed;
+  out->worker_generation = generation;
+  out->request_id = request_id;
+  out->shield = shield;
+  return HostFrameOutcome::kAccepted;
+}
+
+bool BuildPrivacyReplyFrame(std::uint64_t worker_generation,
+                            std::uint64_t request_id, bool shielded,
+                            bool input_released,
+                            std::uint64_t real_frame_generation,
+                            std::string* out) {
+  if (out == nullptr || worker_generation == 0 ||
+      worker_generation > kMaxWorkerGeneration || request_id == 0 ||
+      request_id > kMaxWorkerGeneration ||
+      real_frame_generation > kMaxWorkerGeneration) {
+    return false;
+  }
+  std::string frame;
+  frame.append("{\"type\":\"").append(kIpcMessagePrivacyReply).append("\"");
+  frame.append(",\"ipcVersion\":").append(std::to_string(kWorkerIpcVersion));
+  frame.append(",\"workerGeneration\":").append(std::to_string(worker_generation));
+  frame.append(",\"requestId\":").append(std::to_string(request_id));
+  frame.append(",\"shielded\":").append(shielded ? "true" : "false");
+  frame.append(",\"inputReleased\":").append(input_released ? "true" : "false");
+  frame.append(",\"realFrameGeneration\":")
+      .append(std::to_string(real_frame_generation));
+  frame.append("}");
+  *out = std::move(frame);
+  return true;
+}
+
+bool DecodeBase64Url(std::string_view encoded, std::string* out) {
+  if (out == nullptr || encoded.size() % 4 == 1) return false;
+  const auto value = [](char c) -> int {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '-') return 62;
+    if (c == '_') return 63;
+    return -1;
+  };
+  std::string decoded;
+  decoded.reserve(encoded.size() * 3 / 4);
+  std::uint32_t buffer = 0;
+  int bits = 0;
+  for (const char c : encoded) {
+    const int v = value(c);
+    if (v < 0) return false;
+    buffer = (buffer << 6) | static_cast<std::uint32_t>(v);
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      decoded.push_back(static_cast<char>((buffer >> bits) & 0xFF));
+    }
+  }
+  *out = std::move(decoded);
   return true;
 }
 

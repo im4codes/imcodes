@@ -1,5 +1,6 @@
 import {
   REMOTE_DESKTOP_CANONICAL_BRANDING_CAPABILITY,
+  REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY,
   REMOTE_DESKTOP_INPUT_CAPABILITY,
   REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
   REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY,
@@ -33,7 +34,17 @@ export type MacosRemoteDesktopReadinessMode = typeof MACOS_REMOTE_DESKTOP_READIN
   keyof typeof MACOS_REMOTE_DESKTOP_READINESS_MODE
 ];
 
+/**
+ * Whether the macOS management-privacy shield is qualified on real hardware.
+ * The worker and host implement it end to end; it is advertised only once a
+ * real Mac has proven the shield, so a regression there cannot silently hide or
+ * leak a secret-bearing flow. Flip after qualification.
+ */
+export const MACOS_REMOTE_DESKTOP_CAPTURE_PRIVACY_QUALIFIED = false;
+
 export interface MacosRemoteDesktopReadinessInput {
+  /** Advertise the management-privacy shield. Defaults to the qualification flag. */
+  capturePrivacy?: boolean;
   artifactVerified: boolean;
   activeUserQualified: boolean;
   screenRecording: boolean;
@@ -104,6 +115,12 @@ export function resolveMacosRemoteDesktopRuntimeProfile(
   const adapterCapabilities: readonly RemoteDesktopAdapterCapability[] = Object.freeze([
     REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
     REMOTE_DESKTOP_CANONICAL_BRANDING_CAPABILITY,
+    // Management privacy: the worker replaces every frame with an opaque one
+    // and releases held input on request, and proves a fresh real frame before
+    // the shield lifts. It needs capture, not control, so View carries it too.
+    ...((input.capturePrivacy ?? MACOS_REMOTE_DESKTOP_CAPTURE_PRIVACY_QUALIFIED)
+      ? [REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY]
+      : []),
     ...(control ? [REMOTE_DESKTOP_INPUT_CAPABILITY] : []),
     // The session survives the screen locking (the worker no longer ends it on
     // lock, and a locked console is accepted as ready), so with control the

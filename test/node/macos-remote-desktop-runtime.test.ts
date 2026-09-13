@@ -11,7 +11,9 @@ import {
 import {
   REMOTE_DESKTOP_CANONICAL_BRANDING_CAPABILITY,
   REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY,
+  REMOTE_DESKTOP_DEFAULT_SHIELDED_ROUTE_CAPABILITY,
   REMOTE_DESKTOP_INPUT_CAPABILITY,
+  REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY,
   REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
   REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY,
 } from '../../shared/remote-desktop-access.js';
@@ -32,6 +34,7 @@ import {
   translateServerDeadlines,
 } from '../../src/node/runtime.js';
 import { ServerClockEstimator } from '../../shared/clock-sync.js';
+import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from '../../shared/controlled-node-auto-unlock.js';
 import type { AuthenticatedWebSocketLike } from '../../src/transport/authenticated-websocket.js';
 
 const USER = {
@@ -115,6 +118,7 @@ function macosRuntimeOptions(
   } as const;
   return {
     resolveVerifiedArtifact: async () => verifiedArtifact(),
+    capturePrivacy: true,
     resolveUserSession: async () => USER,
     inspectReadiness: async () => ({
       screenRecording: true,
@@ -207,7 +211,11 @@ describe('macOS controlled-node remote-desktop runtime', () => {
     expect(advertised).not.toContain(REMOTE_DESKTOP_CAPABILITY);
     // Control reaches the lock screen: the session survives the Mac locking.
     expect(advertised).toContain(REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY);
-    expect(advertised).not.toContain(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY);
+    // The macOS worker host implements the privacy frame channel and shields
+    // every later route by default; the Windows-only signed shell stays out.
+    expect(advertised).toContain(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY);
+    expect(advertised).toContain(REMOTE_DESKTOP_DEFAULT_SHIELDED_ROUTE_CAPABILITY);
+    expect(advertised).not.toContain(REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY);
 
     const prepare = {
       type: REMOTE_DESKTOP_MSG.PREPARE,
@@ -252,6 +260,46 @@ describe('macOS controlled-node remote-desktop runtime', () => {
     expect(advertised).not.toContain(REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS);
     expect(advertised).not.toContain(REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY);
     runtime.stop();
+  });
+
+  it('advertises macOS auto unlock only with a host that can keep the secret', () => {
+    for (const supportsAutoUnlock of [true, false]) {
+      const socket = new MockSocket();
+      const runtime = createControlledNodeRuntime({
+        serverUrl: 'https://im.example',
+        serverId: 'controlled-1',
+        token: 'secret',
+        nodeRole: NODE_ROLE.CONTROLLED,
+      }, () => socket, {
+        platform: 'darwin',
+        arch: 'arm64',
+        remoteDesktopWorker: {
+          available: () => true,
+          sessionCapabilities: () => [
+            REMOTE_DESKTOP_SESSION_CAPABILITY,
+            REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS,
+            REMOTE_DESKTOP_CAPTURE_CAPABILITY.MACOS_SCREEN_CAPTURE_KIT,
+            REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+          ],
+          adapterCapabilities: () => [
+            REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+            REMOTE_DESKTOP_CANONICAL_BRANDING_CAPABILITY,
+            REMOTE_DESKTOP_INPUT_CAPABILITY,
+          ],
+          supportsAutoUnlock: () => supportsAutoUnlock,
+          applyAutoUnlockSecret: async () => true,
+          autoUnlockConfigured: async () => false,
+          handle: async () => true,
+          close: () => undefined,
+        },
+      });
+      runtime.start();
+      socket.open();
+      const advertised = JSON.parse(socket.sent[0]!).capabilities as string[];
+      if (supportsAutoUnlock) expect(advertised).toContain(CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY);
+      else expect(advertised).not.toContain(CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY);
+      runtime.stop();
+    }
   });
 
   it('re-samples a narrowed macOS profile for the next WebSocket generation', async () => {

@@ -16,6 +16,7 @@
 #import <ApplicationServices/ApplicationServices.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <Foundation/Foundation.h>
+#import <IOKit/pwr_mgt/IOPMLib.h>
 
 #include <fcntl.h>
 #include <mach-o/dyld.h>
@@ -532,6 +533,55 @@ class SessionControlServer {
   std::string path_;
 };
 
+// Types the stored sign-in secret into the lock screen, then Return.
+//
+// Keystrokes carry the characters themselves (CGEventKeyboardSetUnicodeString),
+// so no keyboard layout is assumed and any character a password may contain
+// arrives as typed. A modifier tap first raises the password field on a lock
+// screen that is only showing the clock. Every copy is wiped by the caller.
+void TypeSignIn(const std::string& utf8) {
+  @autoreleasepool {
+    NSString* value = [[NSString alloc] initWithBytes:utf8.data()
+                                               length:utf8.size()
+                                             encoding:NSUTF8StringEncoding];
+    if (value == nil || value.length == 0)
+      return;
+    const auto post = [](CGEventRef event) {
+      if (event == nullptr)
+        return;
+      CGEventPost(kCGHIDEventTap, event);
+      CFRelease(event);
+    };
+    constexpr CGKeyCode kShift = 56;
+    constexpr CGKeyCode kReturn = 36;
+    post(CGEventCreateKeyboardEvent(nullptr, kShift, true));
+    post(CGEventCreateKeyboardEvent(nullptr, kShift, false));
+    ::usleep(400'000);
+    const NSUInteger length = value.length;
+    for (NSUInteger index = 0; index < length; ++index) {
+      UniChar unit = [value characterAtIndex:index];
+      for (const bool down : {true, false}) {
+        CGEventRef event = CGEventCreateKeyboardEvent(nullptr, 0, down);
+        if (event != nullptr)
+          CGEventKeyboardSetUnicodeString(event, 1, &unit);
+        post(event);
+      }
+      unit = 0;
+      ::usleep(12'000);
+    }
+    post(CGEventCreateKeyboardEvent(nullptr, kReturn, true));
+    post(CGEventCreateKeyboardEvent(nullptr, kReturn, false));
+  }
+}
+
+void WipeString(std::string* value) noexcept {
+  if (value == nullptr)
+    return;
+  if (!value->empty())
+    std::fill(value->begin(), value->end(), '\0');
+  value->clear();
+}
+
 class WorkerTransportSink final : public macos::MacosTransportCallbackSink {
  public:
   void Bind(macos::MacosRemoteDesktopSession* session,
@@ -586,6 +636,13 @@ class WorkerTransportSink final : public macos::MacosTransportCallbackSink {
   [[nodiscard]] bool wake_ready() const noexcept { return wake_[0] >= 0; }
   void DrainEvents();
   void DrainQualityTarget();
+  // Unlock: the loop owns the socket, so the sink only asks it to send.
+  void SetUnlockRequester(std::function<bool(bool reveal)> requester) {
+    unlock_requester_ = std::move(requester);
+  }
+  // A reply from the daemon. `secret` is revealed only for a requested unlock
+  // and is wiped here after it has been typed.
+  void OnUnlockReply(bool configured, std::string sign_in);
   void SignalTerminal(std::string_view reason);
   void OnSessionTerminal(const rd::common::TerminalError& error);
   void OnQualityTarget(const rd::common::TransportCallbackStamp& stamp,
@@ -632,6 +689,10 @@ class WorkerTransportSink final : public macos::MacosTransportCallbackSink {
   std::vector<std::function<void()>> events_;
   std::array<int, 2> wake_{-1, -1};
   std::mutex quality_mutex_;
+  bool unlock_configured_ = false;
+  bool unlock_pending_ = false;
+  std::vector<std::int64_t> unlock_attempts_ms_;
+  std::function<bool(bool)> unlock_requester_;
   std::optional<
       std::pair<rd::common::TransportCallbackStamp, rd::common::QualityTarget>>
       pending_quality_target_;
@@ -1057,6 +1118,12 @@ class WorkerSocketEmitter final {
     return EmitWorkerMessage(descriptor_, generation_,
                              imcodes::rd::WriteJson(message));
   }
+  // A pre-built frame on the same serialized writer, so it can never interleave
+  // with a worker message written from another thread.
+  bool WriteRaw(const std::string& frame) {
+    std::lock_guard lock(mutex_);
+    return WriteFrame(descriptor_, frame);
+  }
   bool EmitLocalIce(const rd::common::IceCandidate& candidate) {
     std::lock_guard lock(mutex_);
     if (!authority_.has_value())
@@ -1396,12 +1463,13 @@ bool WorkerTransportSink::EmitStatus() {
   // was ended as negotiation_timeout 45 s in, even with video on screen.
   // The lock screen is part of the session now: say when the Mac is on it, so
   // the browser can show that state. Unlocking is typing the password through
-  // ordinary input -- there is no stored-secret unlock on macOS.
+  // ordinary input, or -- when the owner configured one -- the stored sign-in
+  // secret the node keeps root-only and releases for one requested unlock.
   const bool on_lock_screen =
       std::strcmp(WorkerReadinessProbe::ProbeConsoleSessionState(),
                   macos::kNativeSessionStateLocked) == 0;
   root["signInScreen"] = on_lock_screen;
-  root["unlockAvailable"] = false;
+  root["unlockAvailable"] = on_lock_screen && unlock_configured_;
   root["peerConnected"] = connected;
   root["dataChannelsReady"] = channels_ready;
   root["mediaStarted"] = diagnostics.last_outbound_video_bytes > 0;
@@ -1502,6 +1570,32 @@ void WorkerTransportSink::OnQualityTarget(
   pending_quality_target_ = std::make_pair(stamp, target);
 }
 
+void WorkerTransportSink::OnUnlockReply(bool configured, std::string sign_in) {
+  const bool changed = configured != unlock_configured_;
+  unlock_configured_ = configured;
+  if (!sign_in.empty()) {
+    std::string decoded;
+    const bool pending = unlock_pending_;
+    unlock_pending_ = false;
+    const bool on_lock_screen =
+        std::strcmp(WorkerReadinessProbe::ProbeConsoleSessionState(),
+                    macos::kNativeSessionStateLocked) == 0;
+    // Typed only for an unlock this worker asked for, and only if the Mac is
+    // still locked: a secret typed into an unlocked desktop would land in
+    // whatever window has focus.
+    if (pending && on_lock_screen && macos::DecodeBase64Url(sign_in, &decoded)) {
+      TypeSignIn(decoded);
+      std::cerr << "macos_remote_desktop_worker_unlock_typed\n";
+    }
+    WipeString(&decoded);
+    WipeString(&sign_in);
+  } else if (unlock_pending_) {
+    unlock_pending_ = false;
+  }
+  if (changed)
+    (void)EmitStatus();
+}
+
 void WorkerTransportSink::DrainQualityTarget() {
   std::optional<
       std::pair<rd::common::TransportCallbackStamp, rd::common::QualityTarget>>
@@ -1527,6 +1621,13 @@ void WorkerTransportSink::HandleDataChannelMessage(
   if (!authority.has_value() ||
       !imcodes::rd::ParseDataChannelMessage(payload, &message) ||
       !CorrelationMatches(message, *authority, stamp)) {
+    return;
+  }
+  // While the privacy shield is up no viewer input may reach this Mac: the
+  // owner is typing a secret here and the viewer cannot see where it lands.
+  if (session_->privacy_shielded() &&
+      (message.kind == imcodes::rd::DataChannelMessageKind::kPointer ||
+       message.kind == imcodes::rd::DataChannelMessageKind::kKeyboard)) {
     return;
   }
   const auto activity = [&]() {
@@ -1686,7 +1787,23 @@ void WorkerTransportSink::HandleDataChannelMessage(
                                   *message.control.display_id);
       }
     } else if (kind == "unlock") {
-      (void)SendControlRejected(kind, imcodes::rd::kRejectUnlockUnavailable);
+      // Same bounds as Windows: only on the lock screen, only with a stored
+      // secret, one attempt in flight, at most ten a minute.
+      const std::int64_t now_ms = SampleNow().monotonic_ms;
+      std::erase_if(unlock_attempts_ms_, [now_ms](std::int64_t at) {
+        return now_ms - at >= 60'000;
+      });
+      const bool on_lock_screen =
+          std::strcmp(WorkerReadinessProbe::ProbeConsoleSessionState(),
+                      macos::kNativeSessionStateLocked) == 0;
+      if (!on_lock_screen || !unlock_configured_ || unlock_pending_ ||
+          unlock_attempts_ms_.size() >= 10 || !unlock_requester_ ||
+          !unlock_requester_(true)) {
+        (void)SendControlRejected(kind, imcodes::rd::kRejectUnlockUnavailable);
+      } else {
+        unlock_attempts_ms_.push_back(now_ms);
+        unlock_pending_ = true;
+      }
       accepted = true;
     }
   }
@@ -1946,6 +2063,55 @@ bool HandleHostCommand(const macos::HostCommandFrame& frame,
  * the channel goes terminal, because a stream whose correlation has slipped
  * cannot be resynchronized by guessing.
  */
+// Keeps the physical display awake for the life of this worker (one session).
+//
+// A Mac left at the lock screen turns its display off after the idle timeout,
+// and every capture API then delivers a dark display: the viewer connected to a
+// black picture until some other tool woke the screen. UU Remote does exactly
+// this on connect -- a "UserIsActive" declaration to turn the display on, plus
+// an idle-sleep assertion while it is attached -- and so does this, released
+// with the session. Declaring activity is a documented power-management call;
+// it neither unlocks the Mac nor bypasses anything the lock screen enforces.
+class DisplayWakeGuard {
+ public:
+  DisplayWakeGuard() {
+    DeclareActivity();
+    (void)IOPMAssertionCreateWithName(
+        kIOPMAssertPreventUserIdleDisplaySleep, kIOPMAssertionLevelOn,
+        CFSTR("aiDesk.to remote desktop session"), &display_assertion_);
+  }
+  ~DisplayWakeGuard() {
+    if (display_assertion_ != kIOPMNullAssertionID)
+      (void)IOPMAssertionRelease(display_assertion_);
+    if (activity_assertion_ != kIOPMNullAssertionID)
+      (void)IOPMAssertionRelease(activity_assertion_);
+  }
+  DisplayWakeGuard(const DisplayWakeGuard&) = delete;
+  DisplayWakeGuard& operator=(const DisplayWakeGuard&) = delete;
+
+  // Re-declared periodically: the lock screen dims on its own idle timer even
+  // while display sleep is prevented.
+  void Refresh(std::int64_t monotonic_ms) {
+    if (monotonic_ms - last_declared_ms_ < kRedeclareIntervalMs)
+      return;
+    last_declared_ms_ = monotonic_ms;
+    DeclareActivity();
+  }
+
+ private:
+  static constexpr std::int64_t kRedeclareIntervalMs = 20'000;
+
+  void DeclareActivity() {
+    (void)IOPMAssertionDeclareUserActivity(
+        CFSTR("aiDesk.to remote desktop viewer attached"),
+        kIOPMUserActiveLocal, &activity_assertion_);
+  }
+
+  IOPMAssertionID display_assertion_ = kIOPMNullAssertionID;
+  IOPMAssertionID activity_assertion_ = kIOPMNullAssertionID;
+  std::int64_t last_declared_ms_ = 0;
+};
+
 class DaemonDisplayChannel {
  public:
   DaemonDisplayChannel(int descriptor, std::uint64_t worker_generation,
@@ -2236,6 +2402,9 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
   // separate supervisor stream would be a second live stream on the same
   // display whose frames reach no encoder, which proves nothing about whether
   // the session can capture.
+  // Wake the display before choosing and starting capture, so the first frames
+  // are of a lit screen rather than a sleeping one.
+  DisplayWakeGuard display_wake;
   std::unique_ptr<macos::ScreenCaptureKitBackend> capture_backend;
   {
     macos::LoginWindowCaptureRequest capture_request;
@@ -2391,6 +2560,31 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
 
   std::int64_t last_media_sample_ms = 0;
   bool media_status_sent = false;
+  std::uint64_t unlock_request_id = 0;
+  std::int64_t last_unlock_query_ms = -60'000;
+  const auto send_unlock_request = [&](bool reveal) {
+    std::string frame;
+    if (!macos::BuildUnlockRequestFrame(context.worker_generation,
+                                        ++unlock_request_id, reveal, &frame)) {
+      return false;
+    }
+    return emitter.WriteRaw(frame);
+  };
+  sink.SetUnlockRequester(send_unlock_request);
+  // A lifted shield is proven by a real frame encoded after the lift; the
+  // reply waits for it.
+  struct PendingPrivacyRelease {
+    std::uint64_t request_id = 0;
+    std::uint64_t baseline = 0;
+  };
+  std::optional<PendingPrivacyRelease> pending_privacy_release;
+  const auto send_privacy_reply = [&](std::uint64_t request_id, bool shielded,
+                                      std::uint64_t real_frames) {
+    std::string frame;
+    return macos::BuildPrivacyReplyFrame(context.worker_generation, request_id,
+                                         shielded, true, real_frames, &frame) &&
+           emitter.WriteRaw(frame);
+  };
   while (running) {
     std::array<pollfd, 4> poll_set{};
     poll_set[0] = {descriptor, POLLIN, 0};
@@ -2428,6 +2622,25 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
     // connected and fails every session at its negotiation deadline.
     {
       const rd::common::TransportTime now = SampleNow();
+      display_wake.Refresh(now.monotonic_ms);
+      if (pending_privacy_release.has_value()) {
+        const std::uint64_t real = session->real_frames_encoded();
+        // No media means no viewer can be shown anything; the lift is then
+        // proven by the next generation number rather than a frame that will
+        // never be captured.
+        if (real > pending_privacy_release->baseline || !session->media_active()) {
+          (void)send_privacy_reply(
+              pending_privacy_release->request_id, false,
+              std::max(real, pending_privacy_release->baseline + 1));
+          pending_privacy_release.reset();
+        }
+      }
+      // Whether a sign-in secret is configured changes only when the owner
+      // sets or clears it; a slow poll keeps unlockAvailable honest.
+      if (now.monotonic_ms - last_unlock_query_ms >= 15'000) {
+        last_unlock_query_ms = now.monotonic_ms;
+        (void)send_unlock_request(false);
+      }
       if (now.monotonic_ms - last_media_sample_ms >= 1'000) {
         last_media_sample_ms = now.monotonic_ms;
         const std::uint64_t bytes = media_binder_view->accepted_bytes();
@@ -2491,6 +2704,54 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
       break;
     }
     for (const std::string& frame : frames) {
+      if (macos::ClassifyHostFrame(frame) == macos::HostFrameKind::kPrivacyRequest) {
+        macos::PrivacyRequestFrame request;
+        if (macos::ParsePrivacyRequestFrame(frame, context.worker_generation,
+                                            &request) !=
+            macos::HostFrameOutcome::kAccepted) {
+          std::cerr << "macos_remote_desktop_worker_malformed_host_frame\n";
+          status = EX_PROTOCOL;
+          running = false;
+          break;
+        }
+        if (request.shield) {
+          // Shield first, then release every held key and button, then say so.
+          session->SetPrivacyShield(true);
+          pending_privacy_release.reset();
+          for (const char* controller :
+               {"control", "control:position", "keyboard", "pointer",
+                "pointer:position"}) {
+            session->ReleaseController(controller);
+          }
+          if (!send_privacy_reply(request.request_id, true,
+                                  session->real_frames_encoded())) {
+            status = EX_UNAVAILABLE;
+            running = false;
+            break;
+          }
+          std::cerr << "macos_remote_desktop_worker_privacy_shielded\n";
+        } else {
+          const std::uint64_t baseline = session->real_frames_encoded();
+          session->SetPrivacyShield(false);
+          pending_privacy_release =
+              PendingPrivacyRelease{request.request_id, baseline};
+          std::cerr << "macos_remote_desktop_worker_privacy_released\n";
+        }
+        continue;
+      }
+      if (macos::ClassifyHostFrame(frame) == macos::HostFrameKind::kUnlockReply) {
+        macos::UnlockReplyFrame reply;
+        const auto unlock_outcome = macos::ParseUnlockReplyFrame(
+            frame, context.worker_generation, &reply);
+        if (unlock_outcome != macos::HostFrameOutcome::kAccepted) {
+          std::cerr << "macos_remote_desktop_worker_malformed_host_frame\n";
+          status = EX_PROTOCOL;
+          running = false;
+          break;
+        }
+        sink.OnUnlockReply(reply.configured, std::move(reply.sign_in_base64url));
+        continue;
+      }
       macos::HostCommandFrame parsed;
       const auto outcome = macos::ParseHostCommandFrame(
           frame, context.worker_generation, &parsed);

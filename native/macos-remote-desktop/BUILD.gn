@@ -259,6 +259,26 @@ source_set("cg_event_input_adapter") {
   ]
 }
 
+# Local screen curtain for a controlled session: gamma-darkened physical
+# output and a marker-filtered event tap for local input. Restored by the OS
+# when the worker exits.
+source_set("macos_local_curtain") {
+  sources = [
+    "macos_local_curtain.h",
+    "macos_local_curtain.mm",
+  ]
+
+  public = [ "macos_local_curtain.h" ]
+  deps = [ ":cg_event_input_adapter" ]
+
+  cflags_objcc = [
+    "-fobjc-arc",
+    "-Werror=unguarded-availability-new",
+  ]
+
+  frameworks = [ "ApplicationServices.framework" ]
+}
+
 source_set("macos_permission_readiness") {
   sources = [
     "macos_permission_readiness.h",
@@ -981,6 +1001,7 @@ rtc_executable("imcodes_remote_desktop_worker") {
     ":macos_session_identity",
     ":macos_virtual_display_daemon_backend",
     ":macos_worker_ipc_client",
+    ":macos_local_curtain",
     ":pinned_libwebrtc_transport_backend",
   ]
 
@@ -993,6 +1014,7 @@ rtc_executable("imcodes_remote_desktop_worker") {
     "ApplicationServices.framework",
     "CoreGraphics.framework",
     "Foundation.framework",
+    "IOKit.framework",
   ]
 }
 

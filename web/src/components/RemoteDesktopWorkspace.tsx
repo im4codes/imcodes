@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
+import { useCallback, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import { listControllableMachines } from '../api/machines.js';
+import type { MachineListItem } from '../api/machines.js';
 import type { WsClient } from '../ws-client.js';
 import {
   RemoteDesktopConnectionManager,
@@ -20,8 +20,8 @@ import { useFullscreen } from '../hooks/useFullscreen.js';
 import { FloatingPanel } from './FloatingPanel.js';
 import { RemoteDesktopPanel } from './RemoteDesktopPanel.js';
 import type { UseQuickDataResult } from './QuickInputPanel.js';
+import { ControlledNodeMachineMenu } from './ControlledNodeMachineMenu.js';
 import './remote-desktop-workspace.css';
-import { MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
 import { REMOTE_DESKTOP_STOP_ORIGIN } from '@shared/remote-desktop.js';
 
 export interface RemoteDesktopWorkspaceProps {
@@ -73,22 +73,20 @@ export function RemoteDesktopWorkspace({
   // machine you had open.
   const fullscreen = useFullscreen(workspaceRef);
   const [pickerOpen, setPickerOpen] = useState(false);
-  const [pickerMachines, setPickerMachines] = useState<RemoteDesktopWorkspaceMachine[]>([]);
-  const [pickerError, setPickerError] = useState(false);
+  const addButtonRef = useRef<HTMLButtonElement | null>(null);
   const tabButtonsRef = useRef(new Map<RemoteDesktopWorkspaceTabId, HTMLButtonElement>());
   const hosts = remoteDesktopWorkspaceHosts(state);
 
-  useEffect(() => {
-    if (!pickerOpen) return;
-    let active = true;
-    setPickerError(false);
-    void listControllableMachines().then((machines) => {
-      if (active) setPickerMachines(machines.filter(canOpenRemoteDesktopMachine));
-    }).catch(() => {
-      if (active) setPickerError(true);
-    });
-    return () => { active = false; };
-  }, [pickerOpen]);
+  const atHostLimit = hosts.length >= REMOTE_DESKTOP_WORKSPACE_MAX_HOSTS;
+  const hostLimitNotice = t('remote_desktop.workspace_limit', { count: REMOTE_DESKTOP_WORKSPACE_MAX_HOSTS });
+  const closePicker = useCallback(() => setPickerOpen(false), []);
+  // A host already open is always pickable: picking it just brings it forward.
+  // At the limit, only those remain pickable.
+  const isPickable = useCallback((machine: MachineListItem) => canOpenRemoteDesktopMachine(machine)
+    && (!atHostLimit || !!state.hosts[remoteDesktopHostKey(machine)]), [atHostLimit, state.hosts]);
+  const pickDisabledReason = useCallback((machine: MachineListItem) => (
+    canOpenRemoteDesktopMachine(machine) ? hostLimitNotice : undefined
+  ), [hostLimitNotice]);
 
   const activate = useCallback((tabId: RemoteDesktopWorkspaceTabId) => {
     if (tabId === state.activeTabId) return;
@@ -132,8 +130,8 @@ export function RemoteDesktopWorkspace({
   }, [closeHost, state.activeTabId, state.hosts]);
 
   const selectHost = useCallback((machine: RemoteDesktopWorkspaceMachine) => {
-    onOpenHost(machine);
     setPickerOpen(false);
+    onOpenHost(machine);
   }, [onOpenHost]);
 
   const tabIds = [...state.orderedHostKeys];
@@ -197,6 +195,8 @@ export function RemoteDesktopWorkspace({
         <button
           type="button"
           class="remote-desktop-workspace-add remote-desktop-workspace-icon-button"
+          ref={addButtonRef}
+          aria-haspopup="menu"
           aria-expanded={pickerOpen}
           aria-label={t('remote_desktop.workspace_add')}
           onClick={() => setPickerOpen((current) => !current)}
@@ -255,27 +255,18 @@ export function RemoteDesktopWorkspace({
         </select>
       </label>
 
-      {pickerOpen && (
-        <div class="remote-desktop-workspace-picker" role="dialog" aria-label={t('remote_desktop.workspace_picker')}>
-          {pickerError && <p role="alert">{t('remote_desktop.workspace_picker_failed')}</p>}
-          {!pickerError && pickerMachines.length === 0 && <p>{t('remote_desktop.workspace_picker_empty')}</p>}
-          {pickerMachines.map((machine) => (
-            <button
-              type="button"
-              key={machine.serverId}
-              disabled={hosts.length >= REMOTE_DESKTOP_WORKSPACE_MAX_HOSTS
-                && !state.hosts[remoteDesktopHostKey(machine)]}
-              onClick={() => selectHost(machine)}
-            >
-              <strong>{machine.displayName}</strong>
-              <span>{machine.nodeId ?? MACHINE_IDENTITY_UNAVAILABLE}</span>
-            </button>
-          ))}
-          {hosts.length >= REMOTE_DESKTOP_WORKSPACE_MAX_HOSTS && (
-            <p role="status">{t('remote_desktop.workspace_limit', { count: REMOTE_DESKTOP_WORKSPACE_MAX_HOSTS })}</p>
-          )}
-        </div>
-      )}
+      <ControlledNodeMachineMenu
+        anchorRef={addButtonRef}
+        open={pickerOpen}
+        onClose={closePicker}
+        onSelect={selectHost}
+        isSelectable={isPickable}
+        disabledReason={pickDisabledReason}
+        label={t('remote_desktop.workspace_picker')}
+        emptyText={t('remote_desktop.workspace_picker_empty')}
+        errorText={t('remote_desktop.workspace_picker_failed')}
+        notice={atHostLimit ? hostLimitNotice : undefined}
+      />
 
       {hosts.map(({ hostKey, machine }) => (
         <RemoteDesktopPanel

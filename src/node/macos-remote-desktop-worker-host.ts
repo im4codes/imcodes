@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import type { MacosRemoteDesktopUnlockSecretStore } from './macos-remote-desktop-unlock-secret.js';
 import type { Socket } from 'node:net';
 import type {
   MacosVirtualDisplayProxyLease,
@@ -16,11 +17,20 @@ import {
 import {
   REMOTE_DESKTOP_INPUT_CAPABILITY,
   type RemoteDesktopAdapterCapability,
+  type RemoteDesktopRouteGeneration,
 } from '../../shared/remote-desktop-access.js';
+import { isRemoteDesktopId } from '../../shared/remote-desktop-contract-primitives.js';
+import {
+  WORKER_PRIVACY_FRAME,
+  type WorkerPrivacyInboundFrame,
+  type WorkerPrivacyReleasedFrame,
+  type WorkerPrivacyShieldedFrame,
+} from './remote-desktop-privacy-ipc.js';
 import type { VerifiedMacosRemoteDesktopArtifact } from './macos-remote-desktop-artifact.js';
 import {
   MacosRemoteDesktopIpcAuthorityHost,
   macosRemoteDesktopIpcPrincipalBinding,
+  type MacosRemoteDesktopAcceptedPrivacyReply,
   type MacosRemoteDesktopExpectedCodeIdentity,
   type MacosRemoteDesktopIpcLaunch,
   type MacosRemoteDesktopIpcPrincipalBinding,
@@ -86,6 +96,12 @@ interface MacosRemoteDesktopIpcTransport {
    * waiting for an answer that can no longer come.
    */
   revokeVirtualDisplayChannel?(): number;
+  /**
+   * Writes one privacy request to the authenticated worker. Absent means this
+   * transport cannot shield a worker, which fails every privacy request that
+   * needs one closed.
+   */
+  sendPrivacyRequest?(requestId: number, shield: boolean): Promise<void>;
 }
 
 interface MacosRemoteDesktopLaunchSupervisor {
@@ -119,7 +135,21 @@ export interface MacosRemoteDesktopHostCleanupOutcome {
  */
 export const MACOS_REMOTE_DESKTOP_HOST_CLEANUP_TIMEOUT_MS = 5_000;
 
+/**
+ * Upper bound on one worker privacy reply. Below the barrier's own ack
+ * deadline, so a wedged worker fails the request closed while the Server epoch
+ * is still waiting rather than after it gave up.
+ */
+export const MACOS_REMOTE_DESKTOP_PRIVACY_REPLY_TIMEOUT_MS = 10_000;
+
 export interface MacosRemoteDesktopWorkerHostOptions {
+  /**
+   * Root-only store for the sign-in secret that unlocks a locked Mac. Absent
+   * means this host offers no auto-unlock.
+   */
+  unlockSecretStore?: MacosRemoteDesktopUnlockSecretStore;
+  /** Advertise the management-privacy shield (defaults to its qualification flag). */
+  capturePrivacy?: boolean;
   /** Must resolve through the verified current/LKG artifact selector, never an unverified path. */
   resolveVerifiedArtifact(): Promise<VerifiedMacosRemoteDesktopArtifact | null>;
   /** Must resolve the exact active Aqua user and reject root/headless/session mismatch. */
@@ -234,6 +264,8 @@ export interface MacosRemoteDesktopWorkerHostOptions {
   readinessPollMs?: number;
   prepareReadyTimeoutMs?: number;
   offerAnswerTimeoutMs?: number;
+  /** Bound on one worker privacy reply; see MACOS_REMOTE_DESKTOP_PRIVACY_REPLY_TIMEOUT_MS. */
+  privacyReplyTimeoutMs?: number;
   createIpcServer?: (options: MacosRemoteDesktopIpcServerOptions) => MacosRemoteDesktopIpcTransport;
   /** Where the per-user agent is run from; see the supervisor dependency. */
   resolveLaunchAgentExecutable?: MacosRemoteDesktopLaunchAgentSupervisorDependencies['resolveLauncherExecutable'];
@@ -254,6 +286,29 @@ export type MacosRemoteDesktopHostCleanupReason = MacosRemoteDesktopLifecycleEve
   | 'close'
   | typeof MACOS_REMOTE_DESKTOP_HOST_CLEANUP_REASON.DAEMON_DISCONNECTED
   | typeof MACOS_REMOTE_DESKTOP_HOST_CLEANUP_REASON.READINESS_CHANGED;
+
+interface MacosPrivacyState {
+  epochId: string;
+  revision: number;
+  /** True once SHIELDED was emitted for exactly this epoch/revision. */
+  confirmed: boolean;
+  /** The last workerGeneration reported in SHIELDED for this epoch. */
+  shieldedGeneration: number;
+  routesKey: string | null;
+}
+
+interface PendingPrivacyReply {
+  workerGeneration: number;
+  resolve(reply: MacosRemoteDesktopAcceptedPrivacyReply | null): void;
+  timer: NodeJS.Timeout;
+}
+
+function routesKey(routes: readonly RemoteDesktopRouteGeneration[]): string {
+  return routes
+    .map((route) => `${route.routeId}\0${route.routeGeneration}`)
+    .sort()
+    .join('\n');
+}
 
 const EMPTY_PROFILE: MacosRemoteDesktopRuntimeProfile = Object.freeze({
   mode: MACOS_REMOTE_DESKTOP_READINESS_MODE.UNAVAILABLE,
@@ -386,6 +441,24 @@ export class MacosRemoteDesktopWorkerHost {
   private activeUser: MacosUserSession | null = null;
   private activePrincipal: MacosRemoteDesktopGraphicalSessionAuthority | null = null;
   private readinessTimer: NodeJS.Timeout | null = null;
+  /**
+   * Management-privacy epoch. Set the moment a SHIELD arrives, cleared only
+   * after RELEASED was emitted: while it exists every worker this host admits
+   * is shielded before it receives any command.
+   */
+  private privacy: MacosPrivacyState | null = null;
+  private readonly privacySubscribers = new Set<(frame: WorkerPrivacyInboundFrame) => void>();
+  /** Privacy operations and worker admission run strictly one after another. */
+  private privacyTail: Promise<unknown> = Promise.resolve();
+  private nextPrivacyRequestId = 0;
+  private readonly pendingPrivacyReplies = new Map<number, PendingPrivacyReply>();
+  /**
+   * Host-monotonic frame generation. A worker counts real frames from zero,
+   * so each worker generation is offset by a base above everything already
+   * reported; the value never goes backwards across worker restarts.
+   */
+  private privacyFrameBase: { workerGeneration: number; base: number } | null = null;
+  private lastPrivacyFrameGeneration = 0;
 
   constructor(
     private readonly onMessage: (message: RemoteDesktopDaemonMessage) => void,
@@ -400,6 +473,8 @@ export class MacosRemoteDesktopWorkerHost {
         this.invalidateAuthority();
         void this.shutdownResources();
       },
+      // A removed route changes the set a shielded epoch must report.
+      onAuthorityRemoved: () => this.emitShieldedUpdate(),
     });
   }
 
@@ -422,8 +497,54 @@ export class MacosRemoteDesktopWorkerHost {
       && this.profile.mode !== MACOS_REMOTE_DESKTOP_READINESS_MODE.UNAVAILABLE;
   }
 
+  /** Whether this host can keep a sign-in secret at all. */
+  supportsAutoUnlock(): boolean {
+    return this.options.unlockSecretStore !== undefined;
+  }
+
+  /**
+   * Stores (or with null, clears) the sign-in secret. It stays with this root
+   * process; a worker receives it only for an unlock the controller requested.
+   */
+  async applyAutoUnlockSecret(secret: string | null): Promise<boolean> {
+    const store = this.options.unlockSecretStore;
+    if (!store) return false;
+    return secret === null ? await store.clear() : await store.store(secret);
+  }
+
+  /** Whether a sign-in secret is stored, without handing its value anywhere. */
+  async autoUnlockConfigured(): Promise<boolean> {
+    return await this.options.unlockSecretStore?.configured() ?? false;
+  }
+
   sessionCapabilities(): readonly string[] {
     return this.available() ? this.profile.sessionCapabilities : Object.freeze([]);
+  }
+
+  /**
+   * The macOS worker remembers the shield across session starts and applies it
+   * to every source it creates later, and this host shields every newly
+   * admitted worker before forwarding its first command.
+   */
+  supportsDefaultShieldedRoute(): boolean {
+    return true;
+  }
+
+  onPrivacyFrame(handler: (frame: WorkerPrivacyInboundFrame) => void): () => void {
+    this.privacySubscribers.add(handler);
+    return () => { this.privacySubscribers.delete(handler); };
+  }
+
+  /**
+   * SHIELD/RELEASE from the privacy barrier. Resolves only after the matching
+   * SHIELDED/RELEASED was emitted, or false when it could not be proven -- in
+   * which case nothing is emitted and the barrier fails closed.
+   */
+  sendPrivacyFrame(frame: Record<string, unknown>): Promise<boolean> {
+    if (this.closed) return Promise.resolve(false);
+    if (frame.type === WORKER_PRIVACY_FRAME.SHIELD) return this.shield(frame);
+    if (frame.type === WORKER_PRIVACY_FRAME.RELEASE) return this.release(frame);
+    return Promise.resolve(false);
   }
 
   adapterCapabilities(): readonly RemoteDesktopAdapterCapability[] {
@@ -450,10 +571,15 @@ export class MacosRemoteDesktopWorkerHost {
         this.core.track(command, null);
         const sent = await this.sendCurrent(command, generation);
         if (!sent) this.core.untrack(command.sessionId);
-        else this.core.armPrepareReadyTimer(command.sessionId, {
-          connectionGeneration: this.connectionGeneration,
-          workerPid: null,
-        });
+        else {
+          this.core.armPrepareReadyTimer(command.sessionId, {
+            connectionGeneration: this.connectionGeneration,
+            workerPid: null,
+          });
+          // The worker applies its remembered shield to the new source; the
+          // epoch's complete route set grew by this route.
+          this.emitShieldedUpdate();
+        }
         return sent;
       } catch (error) {
         this.core.untrack(command.sessionId);
@@ -583,6 +709,7 @@ export class MacosRemoteDesktopWorkerHost {
         : await this.inspectLocalReadiness(artifact, principal, user);
       if (localReadiness) {
         const preflightProfile = resolveMacosRemoteDesktopRuntimeProfile({
+          capturePrivacy: this.options.capturePrivacy,
           artifactVerified: true,
           activeUserQualified: true,
           ...localReadiness,
@@ -661,9 +788,11 @@ export class MacosRemoteDesktopWorkerHost {
           }
           : undefined,
         onWorkerMessage: (message) => this.onWorkerMessage(message, generation),
+        onPrivacyReply: (reply) => this.onPrivacyReply(reply, generation),
         // Injected, so a display request reaches the agent instead of being
         // answered `agent_unavailable` by a server with no lease to ask.
         virtualDisplayLease: () => this.virtualDisplayAuthority?.lease() ?? null,
+        unlockSecret: this.options.unlockSecretStore,
         virtualDisplaySeams: {
           exchange: async (lease, line, timeoutMs) => await (
             this.virtualDisplayAuthority?.seams.exchange(lease, line, timeoutMs)
@@ -787,7 +916,27 @@ export class MacosRemoteDesktopWorkerHost {
       // generation (agent_crash filtering, generation-bound cleanup) silently
       // degraded to "whatever is live" as a result.
       this.activeWorkerGeneration = peerLaunch.workerGeneration;
-      this.authenticated = true;
+      // Admission runs in the privacy queue: while an epoch is shielded the new
+      // worker is shielded BEFORE it becomes authenticated, and nothing is
+      // forwarded to a worker that is not authenticated. A SHIELD/RELEASE that
+      // arrives meanwhile is ordered strictly before or after this admission.
+      const admitted = await this.enqueuePrivacy(async () => {
+        if (!this.isCurrent(generation)) return false;
+        if (this.privacy) {
+          const reply = await this.requestPrivacy(
+            server, peerLaunch.workerGeneration, true, generation,
+          );
+          if (!reply || !reply.shielded || !reply.inputReleased
+            || !this.isCurrent(generation)) return false;
+          this.privacyFrameGeneration(reply.workerGeneration, reply.realFrameGeneration);
+        }
+        this.authenticated = true;
+        return true;
+      });
+      if (!this.isCurrent(generation)) return;
+      if (!admitted) {
+        throw new Error('macos_remote_desktop_worker_host_privacy_shield_failed');
+      }
       // PHASE 2 -- ask the live agent, on the lease it is already holding.
       //
       // This is the only point at which display control can be answered
@@ -798,6 +947,7 @@ export class MacosRemoteDesktopWorkerHost {
       this.displayReadiness = await this.probeVirtualDisplayReadiness();
       if (!this.isCurrent(generation)) return;
       const profile = resolveMacosRemoteDesktopRuntimeProfile({
+          capturePrivacy: this.options.capturePrivacy,
         artifactVerified: true,
         activeUserQualified: true,
         ...localReadiness,
@@ -885,6 +1035,7 @@ export class MacosRemoteDesktopWorkerHost {
       // -- so the session would tear itself down seconds after starting.
       this.displayReadiness = await this.probeVirtualDisplayReadiness();
       next = resolveMacosRemoteDesktopRuntimeProfile({
+          capturePrivacy: this.options.capturePrivacy,
         artifactVerified: true,
         activeUserQualified: true,
         ...localReadiness,
@@ -1073,6 +1224,8 @@ export class MacosRemoteDesktopWorkerHost {
   }
 
   private invalidateAuthority(): void {
+    // Requests addressed to this worker can no longer be answered by it.
+    this.failPendingPrivacyReplies();
     this.clearAdvertisedProfile();
     if (this.connectionGeneration !== 0) {
       this.core.endConnection(this.connectionGeneration);
@@ -1184,4 +1337,218 @@ export class MacosRemoteDesktopWorkerHost {
     this.teardownPromise = operation;
     return operation;
   }
+
+  private enqueuePrivacy<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.privacyTail.then(operation, operation);
+    this.privacyTail = run.catch(() => undefined);
+    return run;
+  }
+
+  private shield(frame: Record<string, unknown>): Promise<boolean> {
+    const { epochId, revision } = frame;
+    if (typeof epochId !== 'string' || !isRemoteDesktopId(epochId)
+      || typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 0) {
+      return Promise.resolve(false);
+    }
+    const previous = this.privacy;
+    if (previous && previous.epochId === epochId && revision < previous.revision) {
+      return Promise.resolve(false);
+    }
+    // Recorded before any await: a worker admitted from here on is shielded
+    // first, even if this request is still waiting for its reply.
+    const state: MacosPrivacyState = {
+      epochId,
+      revision,
+      confirmed: false,
+      shieldedGeneration: previous?.shieldedGeneration ?? 0,
+      routesKey: null,
+    };
+    this.privacy = state;
+    return this.enqueuePrivacy(async () => {
+      if (this.privacy !== state) return false;
+      const target = this.privacyTarget();
+      let workerGeneration = this.lastPrivacyFrameGeneration;
+      let inputReleased = true;
+      if (target) {
+        const reply = await this.requestPrivacy(
+          target.server, target.workerGeneration, true, target.lifecycleGeneration,
+        );
+        if (!reply || !reply.shielded || this.privacy !== state || this.closed) return false;
+        workerGeneration = this.privacyFrameGeneration(
+          reply.workerGeneration, reply.realFrameGeneration,
+        );
+        inputReleased = reply.inputReleased;
+      }
+      const routes = this.privacyRoutes();
+      state.confirmed = true;
+      state.shieldedGeneration = workerGeneration;
+      state.routesKey = routesKey(routes);
+      this.emitPrivacy({
+        type: WORKER_PRIVACY_FRAME.SHIELDED,
+        epochId: state.epochId,
+        revision: state.revision,
+        workerGeneration,
+        inputReleased,
+        routes,
+      });
+      return true;
+    });
+  }
+
+  private release(frame: Record<string, unknown>): Promise<boolean> {
+    const state = this.privacy;
+    if (!state || !state.confirmed
+      || frame.epochId !== state.epochId || frame.revision !== state.revision) {
+      return Promise.resolve(false);
+    }
+    return this.enqueuePrivacy(async () => {
+      if (this.privacy !== state) return false;
+      const target = this.privacyTarget();
+      let fresh: number;
+      if (target) {
+        const reply = await this.requestPrivacy(
+          target.server, target.workerGeneration, false, target.lifecycleGeneration,
+        );
+        if (!reply || reply.shielded || !reply.inputReleased
+          || this.privacy !== state || this.closed) return false;
+        fresh = this.privacyFrameGeneration(reply.workerGeneration, reply.realFrameGeneration);
+      } else {
+        // No worker, so no pixel was captured under the shield; the proof
+        // generation still has to move past everything already reported.
+        fresh = this.lastPrivacyFrameGeneration + 1;
+        this.lastPrivacyFrameGeneration = fresh;
+      }
+      // Equal means a frame the host had already reported under the shield.
+      if (fresh <= state.shieldedGeneration) return false;
+      this.emitPrivacy({
+        type: WORKER_PRIVACY_FRAME.RELEASED,
+        epochId: state.epochId,
+        secretCleanupComplete: true,
+        freshFrameWorkerGeneration: fresh,
+      });
+      this.privacy = null;
+      return true;
+    });
+  }
+
+  /** The authenticated worker a privacy request can reach right now, if any. */
+  private privacyTarget(): {
+    server: MacosRemoteDesktopIpcTransport;
+    workerGeneration: number;
+    lifecycleGeneration: number;
+  } | null {
+    const server = this.ipcServer;
+    if (!server || this.closed || !this.authenticated
+      || this.activeWorkerGeneration <= 0) return null;
+    return {
+      server,
+      workerGeneration: this.activeWorkerGeneration,
+      lifecycleGeneration: this.lifecycleGeneration,
+    };
+  }
+
+  private requestPrivacy(
+    server: MacosRemoteDesktopIpcTransport,
+    workerGeneration: number,
+    shield: boolean,
+    lifecycleGeneration: number,
+  ): Promise<MacosRemoteDesktopAcceptedPrivacyReply | null> {
+    if (!server.sendPrivacyRequest || !this.isCurrent(lifecycleGeneration)) {
+      return Promise.resolve(null);
+    }
+    const requestId = ++this.nextPrivacyRequestId;
+    const reply = new Promise<MacosRemoteDesktopAcceptedPrivacyReply | null>((resolve) => {
+      const timer = setTimeout(
+        () => this.settlePrivacyReply(requestId, null),
+        this.options.privacyReplyTimeoutMs ?? MACOS_REMOTE_DESKTOP_PRIVACY_REPLY_TIMEOUT_MS,
+      );
+      timer.unref?.();
+      this.pendingPrivacyReplies.set(requestId, { workerGeneration, resolve, timer });
+    });
+    void server.sendPrivacyRequest(requestId, shield).catch((error: unknown) => {
+      this.options.onBackgroundError?.(error);
+      this.settlePrivacyReply(requestId, null);
+    });
+    return reply;
+  }
+
+  private onPrivacyReply(reply: MacosRemoteDesktopAcceptedPrivacyReply, generation: number): void {
+    if (!this.isCurrent(generation)) return;
+    const pending = this.pendingPrivacyReplies.get(reply.requestId);
+    // An unsolicited, repeated or foreign-generation reply proves nothing.
+    if (!pending || pending.workerGeneration !== reply.workerGeneration) return;
+    this.settlePrivacyReply(reply.requestId, reply);
+  }
+
+  private settlePrivacyReply(
+    requestId: number,
+    reply: MacosRemoteDesktopAcceptedPrivacyReply | null,
+  ): void {
+    const pending = this.pendingPrivacyReplies.get(requestId);
+    if (!pending) return;
+    this.pendingPrivacyReplies.delete(requestId);
+    clearTimeout(pending.timer);
+    pending.resolve(reply);
+  }
+
+  private failPendingPrivacyReplies(): void {
+    for (const requestId of [...this.pendingPrivacyReplies.keys()]) {
+      this.settlePrivacyReply(requestId, null);
+    }
+  }
+
+  /** Host-monotonic value for a worker-reported real frame count. */
+  private privacyFrameGeneration(workerGeneration: number, realFrameGeneration: number): number {
+    if (this.privacyFrameBase?.workerGeneration !== workerGeneration) {
+      this.privacyFrameBase = {
+        workerGeneration,
+        base: this.lastPrivacyFrameGeneration + 1,
+      };
+    }
+    const value = this.privacyFrameBase.base + realFrameGeneration;
+    this.lastPrivacyFrameGeneration = Math.max(this.lastPrivacyFrameGeneration, value);
+    return value;
+  }
+
+  /** Every route the authenticated worker is feeding; none without a worker. */
+  private privacyRoutes(): RemoteDesktopRouteGeneration[] {
+    if (!this.privacyTarget()) return [];
+    const routes: RemoteDesktopRouteGeneration[] = [];
+    for (const authority of this.core.authorities().values()) {
+      const routeGeneration = authority.prepare.routeGeneration;
+      if (routeGeneration === undefined) continue;
+      routes.push({ routeId: authority.sessionId, routeGeneration });
+    }
+    return routes;
+  }
+
+  /**
+   * Re-reports a confirmed epoch after its route set changed. Never before the
+   * epoch is confirmed: an update carrying the expected routes would otherwise
+   * be read as proof of a shield the worker has not acknowledged yet.
+   */
+  private emitShieldedUpdate(): void {
+    const state = this.privacy;
+    if (!state?.confirmed) return;
+    const routes = this.privacyRoutes();
+    const key = routesKey(routes);
+    if (key === state.routesKey) return;
+    state.routesKey = key;
+    state.shieldedGeneration = Math.max(state.shieldedGeneration, this.lastPrivacyFrameGeneration);
+    this.emitPrivacy({
+      type: WORKER_PRIVACY_FRAME.SHIELDED,
+      epochId: state.epochId,
+      revision: state.revision,
+      workerGeneration: state.shieldedGeneration,
+      inputReleased: true,
+      routes,
+    });
+  }
+
+  private emitPrivacy(frame: WorkerPrivacyShieldedFrame | WorkerPrivacyReleasedFrame): void {
+    for (const subscriber of [...this.privacySubscribers]) {
+      try { subscriber(frame); } catch { /* isolate subscribers */ }
+    }
+  }
+
 }

@@ -11,6 +11,7 @@
 #include <optional>
 #include <ranges>
 #include <set>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -202,9 +203,24 @@ public:
   bool MovePointer(const common::LogicalPoint &point) override {
     if (!AXIsProcessTrusted())
       return false;
-    CGEventRef event = CGEventCreateMouseEvent(nullptr, kCGEventMouseMoved,
+    // With a button held the system expects a drag, not a move: a window,
+    // selection or slider only follows ...MouseDragged events.
+    CGEventType type = kCGEventMouseMoved;
+    CGMouseButton button = kCGMouseButtonLeft;
+    if (!held_buttons_.empty()) {
+      const auto mapping = MapButton(*held_buttons_.begin());
+      if (mapping) {
+        button = mapping->button;
+        type = mapping->button == kCGMouseButtonLeft    ? kCGEventLeftMouseDragged
+               : mapping->button == kCGMouseButtonRight ? kCGEventRightMouseDragged
+                                                        : kCGEventOtherMouseDragged;
+      }
+    }
+    CGEventRef event = CGEventCreateMouseEvent(nullptr, type,
                                                CGPointMake(point.x, point.y),
-                                               kCGMouseButtonLeft);
+                                               button);
+    if (event != nullptr && type != kCGEventMouseMoved)
+      CGEventSetIntegerValueField(event, kCGMouseEventClickState, click_count_);
     return Post(event);
   }
 
@@ -227,9 +243,39 @@ public:
     const auto location = CurrentPointerLocation();
     if (!location)
       return false;
+    // macOS does not derive double-clicks from timing the way Windows does:
+    // an application sees one only when the event itself carries a click
+    // count. Count consecutive presses of the same button that land within the
+    // system double-click interval and a few points of the previous press,
+    // and stamp the count on both the press and its release.
+    const std::string name(button);
+    if (pressed) {
+      const auto now = std::chrono::steady_clock::now();
+      // The user's own System Settings value (what NSEvent.doubleClickInterval
+      // reports), read without pulling AppKit into the input adapter.
+      double interval = [[NSUserDefaults standardUserDefaults]
+          doubleForKey:@"com.apple.mouse.doubleClickThreshold"];
+      if (!(interval > 0.0 && interval <= 5.0))
+        interval = 0.5;
+      const bool continues =
+          click_count_ > 0 && name == last_click_button_ &&
+          std::chrono::duration<double>(now - last_click_time_).count() <= interval &&
+          std::hypot(location->x - last_click_location_.x,
+                     location->y - last_click_location_.y) <= kClickSlopPoints;
+      click_count_ = continues ? click_count_ + 1 : 1;
+      last_click_button_ = name;
+      last_click_time_ = now;
+      last_click_location_ = *location;
+      held_buttons_.insert(name);
+    } else {
+      held_buttons_.erase(name);
+    }
     CGEventRef event =
         CGEventCreateMouseEvent(nullptr, pressed ? mapping->down : mapping->up,
                                 *location, mapping->button);
+    if (event != nullptr)
+      CGEventSetIntegerValueField(event, kCGMouseEventClickState,
+                                  name == last_click_button_ ? click_count_ : 1);
     return Post(event);
   }
 
@@ -270,6 +316,10 @@ public:
       }
       CGEventKeyboardSetUnicodeString(down, code_units.size(),
                                       code_units.data());
+      CGEventSetIntegerValueField(down, kCGEventSourceUserData,
+                                  kImcodesSyntheticEventMarker);
+      CGEventSetIntegerValueField(up, kCGEventSourceUserData,
+                                  kImcodesSyntheticEventMarker);
       CGEventPost(kCGHIDEventTap, down);
       CGEventPost(kCGHIDEventTap, up);
       CFRelease(down);
@@ -282,10 +332,20 @@ private:
   static bool Post(CGEventRef event) {
     if (event == nullptr)
       return false;
+    CGEventSetIntegerValueField(event, kCGEventSourceUserData,
+                                kImcodesSyntheticEventMarker);
     CGEventPost(kCGHIDEventTap, event);
     CFRelease(event);
     return true;
   }
+
+  // A human hand never lands two clicks on the exact same point.
+  static constexpr double kClickSlopPoints = 4.0;
+  std::set<std::string> held_buttons_;
+  std::string last_click_button_;
+  std::chrono::steady_clock::time_point last_click_time_{};
+  CGPoint last_click_location_{};
+  std::int64_t click_count_ = 0;
 };
 
 } // namespace
