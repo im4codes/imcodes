@@ -5314,6 +5314,173 @@ describe('SupervisionTaskRegistry', () => {
     }
   });
 
+  it('atomically continues the same implementation object and deduplicates the exact fingerprint after reopen', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-implementation-continuation-'));
+    const dbPath = join(dir, 'supervision-state.sqlite');
+    const worker = identity('deck_alpha_continuation_worker');
+    const taskId = 'continuation-task';
+    const assignmentId = 'continuation-assignment';
+    const revision = 'continuation-r1';
+    let registry = new SupervisionTaskRegistry({ dbPath });
+    try {
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level',
+        objective: 'continue the same durable object', currentRevision: revision, now: 1_000,
+      })).toMatchObject({ ok: true });
+      expect(registry.createAssignment({
+        taskId, assignmentId, role: 'implementer', identity: worker,
+        auditRevision: revision, scopeFiles: ['src/continuation.ts'], now: 2_000,
+      })).toMatchObject({ ok: true });
+      expect(registry.updateTask({ taskId, status: 'implementing', currentRevision: revision, now: 3_000 }))
+        .toMatchObject({ ok: true });
+      expect(registry.updateAssignment({ assignmentId, identity: worker, status: 'implementing', now: 3_000 }))
+        .toMatchObject({ ok: true });
+      const before = registry.getAssignment(assignmentId)!;
+      const continuation = {
+        taskId, assignmentId, identity: worker, expectedRevision: revision,
+        attemptNumber: 1, clientMessageId: 'supervision-implementation-heartbeat:continuation-assignment:fp-1',
+        fingerprint: 'fp-1', now: 10_000,
+      };
+      expect(registry.recordImplementationContinuation(continuation)).toMatchObject({
+        ok: true,
+        value: {
+          assignmentId, taskId, identity: worker, scopeFiles: before.scopeFiles,
+          auditRevision: revision, leaseId: before.leaseId, generation: before.generation,
+          heartbeatAt: 10_000, updatedAt: before.updatedAt,
+        },
+      });
+      expect(registry.listAssignments(taskId)).toHaveLength(1);
+      const events = registry.listEvents(taskId);
+      expect(events.filter((event) => event.eventType === 'implementation_heartbeat')).toEqual([
+        expect.objectContaining({
+          payload: expect.objectContaining({
+            source: 'implementation_watchdog', fingerprint: 'fp-1',
+            leaseAction: 'preserve', generationBefore: 1, generationAfter: 1,
+          }),
+        }),
+      ]);
+      registry.close();
+      registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.recordImplementationContinuation({ ...continuation, now: 20_000 }))
+        .toMatchObject({ ok: true, replay: true, value: { heartbeatAt: 10_000 } });
+      expect(registry.listEvents(taskId)).toEqual(events);
+      expect(registry.listAssignments(taskId)).toHaveLength(1);
+    } finally {
+      registry.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers a missing continuation lease in place exactly once and increments only its generation', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-implementation-lease-recovery-'));
+    const dbPath = join(dir, 'supervision-state.sqlite');
+    const worker = identity('deck_alpha_lease_recovery_worker');
+    const taskId = 'lease-recovery-task';
+    const assignmentId = 'lease-recovery-assignment';
+    const revision = 'lease-recovery-r1';
+    let registry = new SupervisionTaskRegistry({ dbPath });
+    try {
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level',
+        objective: 'recover one interrupted lease', currentRevision: revision, now: 1_000,
+      })).toMatchObject({ ok: true });
+      expect(registry.createAssignment({
+        taskId, assignmentId, role: 'implementer', identity: worker, auditRevision: revision, now: 2_000,
+      })).toMatchObject({ ok: true });
+      expect(registry.updateTask({ taskId, status: 'implementing', currentRevision: revision, now: 3_000 }))
+        .toMatchObject({ ok: true });
+      expect(registry.updateAssignment({ assignmentId, identity: worker, status: 'implementing', now: 3_000 }))
+        .toMatchObject({ ok: true });
+      const corrupted = { ...registry.getAssignment(assignmentId)!, leaseId: '' };
+      registry.close();
+      const database = new DatabaseSync(dbPath);
+      rewritePersistedAssignment(database, corrupted);
+      database.close();
+      registry = new SupervisionTaskRegistry({ dbPath });
+      const input = {
+        taskId, assignmentId, identity: worker, expectedRevision: revision,
+        attemptNumber: 1, clientMessageId: 'lease-recovery-message', fingerprint: 'lease-recovery-fp', now: 10_000,
+      };
+      expect(registry.recordImplementationContinuation(input)).toMatchObject({
+        ok: true,
+        value: { assignmentId, taskId, identity: worker, leaseId: expect.any(String), generation: 2 },
+      });
+      const recovered = registry.getAssignment(assignmentId)!;
+      expect(recovered.leaseId).not.toBe('');
+      expect(registry.recordImplementationContinuation({ ...input, now: 20_000 }))
+        .toMatchObject({ ok: true, replay: true, value: { leaseId: recovered.leaseId, generation: 2 } });
+      expect(registry.listAssignments(taskId)).toHaveLength(1);
+    } finally {
+      registry.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('persists an exact implementation activity cursor and rejects replay, stale time, owner, and revision drift', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-implementation-activity-'));
+    const dbPath = join(dir, 'supervision-state.sqlite');
+    const worker = identity('deck_alpha_activity_worker');
+    const taskId = 'activity-task';
+    const assignmentId = 'activity-assignment';
+    const revision = 'activity-r1';
+    const generation = { scope: 'session' as const, sessionName: worker.sessionName, generation: 7 };
+    let registry = new SupervisionTaskRegistry({ dbPath });
+    try {
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level',
+        objective: 'persist real provider work', currentRevision: revision, now: 1_000,
+      })).toMatchObject({ ok: true });
+      expect(registry.createAssignment({
+        taskId, assignmentId, role: 'implementer', identity: worker, auditRevision: revision, now: 2_000,
+      })).toMatchObject({ ok: true });
+      expect(registry.updateTask({ taskId, status: 'implementing', currentRevision: revision, now: 3_000 }))
+        .toMatchObject({ ok: true });
+      expect(registry.updateAssignment({ assignmentId, identity: worker, status: 'implementing', now: 3_000 }))
+        .toMatchObject({ ok: true });
+      const input = {
+        taskId, assignmentId, identity: worker, expectedRevision: revision,
+        activityGeneration: generation, signal: 'provider_tool_call' as const,
+        eventId: 'build-call', fingerprint: 'build-call-fingerprint', turnId: 'turn-7', now: 10_000,
+      };
+      expect(registry.recordImplementationRuntimeActivity(input)).toMatchObject({
+        ok: true,
+        value: {
+          updatedAt: 10_000,
+          implementationActivity: {
+            eventId: 'build-call', fingerprint: 'build-call-fingerprint',
+            signal: 'provider_tool_call', observedAt: 10_000, identity: worker, turnId: 'turn-7',
+          },
+        },
+      });
+      const eventCount = registry.listEvents(taskId).length;
+      expect(registry.recordImplementationRuntimeActivity({ ...input, now: 20_000 }))
+        .toMatchObject({ ok: true, replay: true, value: { updatedAt: 10_000 } });
+      expect(registry.recordImplementationRuntimeActivity({
+        ...input, eventId: 'late-result', fingerprint: 'late-result-fingerprint', now: 9_000,
+      })).toMatchObject({ ok: true, replay: true, value: { updatedAt: 10_000 } });
+      expect(registry.recordImplementationRuntimeActivity({
+        ...input,
+        identity: identity('different-worker'),
+        activityGeneration: { scope: 'session', sessionName: 'different-worker', generation: 7 },
+        fingerprint: 'wrong-owner',
+        now: 11_000,
+      })).toEqual({ ok: false, reason: 'owner_mismatch' });
+      expect(registry.recordImplementationRuntimeActivity({
+        ...input, expectedRevision: 'activity-r0', fingerprint: 'wrong-revision', now: 11_000,
+      })).toEqual({ ok: false, reason: 'old_revision' });
+      expect(registry.listEvents(taskId)).toHaveLength(eventCount);
+      registry.close();
+      registry = new SupervisionTaskRegistry({ dbPath });
+      expect(registry.getAssignment(assignmentId)).toMatchObject({
+        updatedAt: 10_000,
+        implementationActivity: { fingerprint: 'build-call-fingerprint', observedAt: 10_000 },
+      });
+    } finally {
+      registry.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('CAS-deduplicates one no-progress blocker across SQLite reopen without moving progress', () => {
     const dir = mkdtempSync(join(tmpdir(), 'imcodes-implementation-no-progress-'));
     const dbPath = join(dir, 'supervision-state.sqlite');

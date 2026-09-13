@@ -172,7 +172,7 @@ export type AppendQueuedMessagesResult =
       queueSnapshot: QueueSnapshot;
       deliveryFacts: QueueDeliveryFact[];
     }
-  | { status: 'stale' | 'unsupported' | 'not_found' | 'attachments_unsupported' | 'control_unsupported' };
+  | { status: 'stale' | 'rejected' | 'unsupported' | 'not_found' | 'attachments_unsupported' | 'control_unsupported' };
 
 type SdkTurnLostRecoveryAttemptStatus =
   | 'detected'
@@ -2199,6 +2199,15 @@ export class TransportSessionRuntime implements SessionRuntime {
         : {}),
     };
 
+    // Revalidate daemon-owned control messages at the last synchronous edge
+    // before either direct provider dispatch or durable FIFO admission. The
+    // callback admits ordinary traffic, but a heartbeat whose identity or
+    // revision changed after scheduling is rejected without touching provider
+    // or queue state.
+    if (this._pendingDrainAdmission && !this._pendingDrainAdmission(entry)) {
+      throw new Error('transport message authority rejected before dispatch');
+    }
+
     const activity = this.getActivitySnapshot();
     if (activity.blockingWorkCount > 0) {
       if (metadata?.queuePlacement === 'front') {
@@ -2497,6 +2506,18 @@ export class TransportSessionRuntime implements SessionRuntime {
     const originalQueue = [...this._pendingMessages];
     const selected = originalQueue.filter((entry) => idSet.has(entry.clientMessageId));
     if (selected.length !== ids.length) return { status: 'not_found' };
+    // Authority can change while an APPEND waits behind an active provider
+    // turn. Revalidate before handoff reservation/provider admission and drop
+    // only the stale control rows. A distinct status lets the automatic flush
+    // continue to the next valid FIFO entry instead of parking it behind a
+    // removed head.
+    const rejected = this._pendingDrainAdmission
+      ? selected.filter((entry) => !this._pendingDrainAdmission!(entry))
+      : [];
+    if (rejected.length > 0) {
+      for (const entry of rejected) this.removePendingMessage(entry.clientMessageId);
+      return { status: 'rejected' };
+    }
     if (selected.some((entry) => (entry.attachments?.length ?? 0) > 0)) {
       return { status: 'attachments_unsupported' };
     }
@@ -3816,6 +3837,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         entry.clientMessageId,
         entry.activeTurnDeliveryKind ?? PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE,
       );
+      if (result.status === 'rejected') continue;
       if (result.status !== 'delivered') {
         logger.info(
           {

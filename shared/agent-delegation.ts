@@ -109,6 +109,14 @@ export const SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS = {
 export const SUPERVISION_IMPLEMENTATION_NO_PROGRESS_ERROR =
   'implementation heartbeat completed without durable progress or structured escalation' as const;
 
+/**
+ * A bounded SAME-assignment continuation budget was exhausted without any
+ * daemon-authenticated provider/runtime or lifecycle progress.  This is a
+ * hard failure and may be escalated; a single quiet heartbeat is not.
+ */
+export const SUPERVISION_IMPLEMENTATION_CONTINUATION_EXHAUSTED_ERROR =
+  'implementation continuation budget exhausted without authoritative work activity or structured escalation' as const;
+
 export interface SupervisionBlockerEscalationReport {
   taskId: string;
   assignmentId: string;

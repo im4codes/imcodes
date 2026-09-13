@@ -129,6 +129,7 @@ vi.mock('../../src/util/imc-dir.js', () => ({
 
 vi.mock('../../src/daemon/timeline-store.js', () => ({
   timelineStore: { append: vi.fn(), read: vi.fn(() => []), clear: vi.fn() },
+  readTailLines: vi.fn(() => []),
 }));
 
 // Import AFTER mocks — real timelineEmitter, real supervisionAutomation.

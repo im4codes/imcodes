@@ -1,5 +1,6 @@
 import {
   SUPERVISION_CONTRACT_IDS,
+  isTerminalSupervisionTaskStatus,
 } from '../../shared/supervision-config.js';
 import { getSession, listSessions, type SessionRecord } from '../store/session-store.js';
 import { resolvePeerAuditProviderFamily } from './peer-audit-candidates.js';
@@ -40,7 +41,7 @@ export function isExactContinuationEligible(input: {
   });
 }
 
-function liveIdentity(session: SessionRecord): PersistedSupervisionTaskAssignmentIdentity | undefined {
+export function liveSupervisionIdentity(session: SessionRecord): PersistedSupervisionTaskAssignmentIdentity | undefined {
   if (session.state === 'stopped' || !session.name.trim()) return undefined;
   return {
     sessionName: session.name,
@@ -70,6 +71,28 @@ function parkUnresolvedOnce(
       assignmentId: assignment.assignmentId,
       candidateCount,
       action: 'same_object_authoritative_rebind',
+    }),
+    now,
+  });
+}
+
+function parkRevisionConflictOnce(
+  taskId: string,
+  assignment: PersistedSupervisionTaskAssignment,
+  taskRevision: string | undefined,
+  now: number,
+): void {
+  if (assignment.blocker?.trim()) return;
+  getSupervisionTaskRegistry().updateAssignment({
+    assignmentId: assignment.assignmentId,
+    identity: assignment.identity,
+    blocker: JSON.stringify({
+      kind: 'implementation_heartbeat_revision_conflict',
+      taskId,
+      assignmentId: assignment.assignmentId,
+      taskCurrentRevision: taskRevision ?? null,
+      assignmentRevision: assignment.auditRevision ?? null,
+      action: 'same_object_revision_reconcile',
     }),
     now,
   });
@@ -108,18 +131,24 @@ export function resolveImplementationHeartbeatDelivery(input: {
   taskId: string;
   assignmentId: string;
   targetSessionName: string;
+  /** Implementer continuations preserve every runtime fencing field. */
+  requireExactIdentity?: boolean;
   now?: number;
 }): ImplementationHeartbeatAuthorityResult {
   const registry = getSupervisionTaskRegistry();
   const assignment = registry.getAssignment(input.assignmentId);
   const task = registry.getTaskRecord(input.taskId);
   if (!assignment || !task || assignment.taskId !== task.taskId) return { status: 'quarantined' };
+  // A delayed/replayed wake must never mutate a terminal object. Its durable
+  // terminal state is already the authoritative explanation for rejection.
+  if (isTerminalSupervisionTaskStatus(task.status)
+    || isTerminalSupervisionTaskStatus(assignment.status)) return { status: 'quarantined' };
   if (input.targetSessionName !== assignment.identity.sessionName) {
     parkUnresolvedOnce(input.taskId, assignment, 0, input.now ?? Date.now());
     return { status: 'quarantined' };
   }
   const candidates = listSessions().flatMap((session) => {
-    const identity = liveIdentity(session);
+    const identity = liveSupervisionIdentity(session);
     return identity && session.projectName?.trim()
       ? [{ projectName: session.projectName.trim(), identity }]
       : [];
@@ -131,6 +160,35 @@ export function resolveImplementationHeartbeatDelivery(input: {
     candidate.identity.sessionName === assignment.identity.sessionName
   ));
   if (sameSession.length === 0) return { status: 'transient_unavailable' };
+  if (input.requireExactIdentity) {
+    const exact = sameSession.filter((candidate) => (
+      candidate.projectName === task.projectName
+      && candidate.identity.sessionInstanceId === assignment.identity.sessionInstanceId
+      && candidate.identity.runtimeEpoch === assignment.identity.runtimeEpoch
+      && candidate.identity.agentType === assignment.identity.agentType
+      && candidate.identity.providerFamily === assignment.identity.providerFamily
+    ));
+    if (exact.length !== 1) {
+      parkUnresolvedOnce(input.taskId, assignment, exact.length, input.now ?? Date.now());
+      return { status: 'quarantined' };
+    }
+    if (task.currentRevision && assignment.auditRevision
+      && task.currentRevision !== assignment.auditRevision) {
+      parkRevisionConflictOnce(input.taskId, assignment, task.currentRevision, input.now ?? Date.now());
+      return { status: 'quarantined' };
+    }
+    if (!isExactContinuationEligible({
+      taskProjectName: task.projectName,
+      taskCurrentRevision: task.currentRevision,
+      assignment,
+      targetProjectName: exact[0]?.projectName,
+      targetIdentity: exact[0]?.identity ?? {},
+    })) {
+      parkUnresolvedOnce(input.taskId, assignment, exact.length, input.now ?? Date.now());
+      return { status: 'quarantined' };
+    }
+    return { status: 'authorized' };
+  }
   const converged = registry.convergeImplementationHeartbeatTarget({
     taskId: input.taskId,
     assignmentId: input.assignmentId,
@@ -142,7 +200,7 @@ export function resolveImplementationHeartbeatDelivery(input: {
     return { status: 'quarantined' };
   }
   const target = getSession(input.targetSessionName);
-  const targetIdentity = target && liveIdentity(target);
+  const targetIdentity = target && liveSupervisionIdentity(target);
   return targetIdentity && isExactContinuationEligible({
     taskProjectName: task.projectName,
     taskCurrentRevision: task.currentRevision,
@@ -156,6 +214,7 @@ export function authorizeImplementationHeartbeatDelivery(input: {
   taskId: string;
   assignmentId: string;
   targetSessionName: string;
+  requireExactIdentity?: boolean;
   now?: number;
 }): boolean {
   return resolveImplementationHeartbeatDelivery(input).status === 'authorized';
@@ -165,6 +224,7 @@ type HeartbeatBinding = {
   kind: 'implementation' | 'audit';
   taskId: string;
   assignmentId: string;
+  revision?: string;
   auditAttemptId?: string;
   auditRevision?: string;
 };
@@ -178,6 +238,7 @@ function parseHeartbeatBinding(text: string): HeartbeatBinding | undefined {
         assignmentId?: unknown;
         auditAttemptId?: unknown;
         auditRevision?: unknown;
+        revision?: unknown;
       };
       action?: unknown;
     };
@@ -186,7 +247,10 @@ function parseHeartbeatBinding(text: string): HeartbeatBinding | undefined {
       || typeof value.binding.assignmentId !== 'string') return undefined;
     if (value.contractRefs.includes(SUPERVISION_CONTRACT_IDS.IMPLEMENTATION_HEARTBEAT)
       && value.action === 'advance_safe_unfinished') {
-      return { kind: 'implementation', taskId: value.binding.taskId, assignmentId: value.binding.assignmentId };
+      return {
+        kind: 'implementation', taskId: value.binding.taskId, assignmentId: value.binding.assignmentId,
+        ...(typeof value.binding.revision === 'string' ? { revision: value.binding.revision } : {}),
+      };
     }
     if (value.contractRefs.includes(SUPERVISION_CONTRACT_IDS.AUDIT_HEARTBEAT)
       && value.action === 'complete_exact_audit'
@@ -226,6 +290,8 @@ export function authorizeQueuedSupervisionHeartbeatDelivery(input: {
     if (!assignment || !task || assignment.taskId !== task.taskId) return false;
     if (binding.kind === 'implementation') {
       if (!looksLikeImplementation || assignment.role !== 'implementer') return false;
+      const durableRevision = task.currentRevision ?? assignment.auditRevision;
+      if (binding.revision !== durableRevision) return false;
     } else if (!looksLikeAudit
       || assignment.role !== 'auditor'
       || assignment.auditAttemptId !== binding.auditAttemptId
@@ -238,6 +304,7 @@ export function authorizeQueuedSupervisionHeartbeatDelivery(input: {
       taskId: binding.taskId,
       assignmentId: binding.assignmentId,
       targetSessionName: input.targetSessionName,
+      ...(binding.kind === 'implementation' ? { requireExactIdentity: true } : {}),
       now: input.now,
     });
   } catch {

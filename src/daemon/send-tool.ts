@@ -51,7 +51,7 @@ import { isDiscoverableInterAgentSession, resolveEffectiveProjectName, resolveRu
 import {
   AGENT_DELEGATION_PURPOSES,
   SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS,
-  SUPERVISION_IMPLEMENTATION_NO_PROGRESS_ERROR,
+  SUPERVISION_IMPLEMENTATION_CONTINUATION_EXHAUSTED_ERROR,
   buildAgentDelegationBlockerReportInstruction,
   isAgentDelegationOpaqueId,
   isDelegationReplyCapableAgentType,
@@ -2526,9 +2526,10 @@ function readMatchingBlockerEscalation(
 }
 
 /**
- * Convert one completed no-progress heartbeat into one durable, actionable
- * disposition. Persistence happens before delivery, so a daemon restart or a
- * later watchdog tick cannot emit another refusal/no-op for the same state.
+ * Convert exhaustion of the bounded same-object continuation budget into one
+ * durable, actionable disposition. Persistence happens before delivery, so a
+ * daemon restart or a later watchdog tick cannot emit another refusal/no-op
+ * for the same state. A single quiet heartbeat never calls this boundary.
  */
 export async function reportImplementationNoProgressBlocker(
   input: { taskId: string; assignmentId: string },
@@ -2563,14 +2564,14 @@ export async function reportImplementationNoProgressBlocker(
     assignmentId: assignment.assignmentId,
     revision: task.currentRevision ?? assignment.auditRevision ?? '',
     status: assignment.status,
-    exactError: SUPERVISION_IMPLEMENTATION_NO_PROGRESS_ERROR,
+    exactError: SUPERVISION_IMPLEMENTATION_CONTINUATION_EXHAUSTED_ERROR,
   })).digest('hex');
   const messageId = deterministicSendMessageId(`implementation-blocker:${fingerprint}`);
   if (brain) {
     bindExistingQueueSupervisionReference(brain.name, messageId, {
       kind: 'implementation_blocker', taskId: task.taskId, assignmentId: assignment.assignmentId,
       revision: task.currentRevision ?? assignment.auditRevision ?? '',
-      exactError: SUPERVISION_IMPLEMENTATION_NO_PROGRESS_ERROR,
+      exactError: SUPERVISION_IMPLEMENTATION_CONTINUATION_EXHAUSTED_ERROR,
     });
   }
   const replay = readMatchingBlockerEscalation(assignment.blocker, fingerprint);
@@ -2584,8 +2585,8 @@ export async function reportImplementationNoProgressBlocker(
   const report: SupervisionBlockerEscalationReport = {
     taskId: task.taskId,
     assignmentId: assignment.assignmentId,
-    exactError: SUPERVISION_IMPLEMENTATION_NO_PROGRESS_ERROR,
-    completedSafeWork: 'one bounded implementation heartbeat completed; no lifecycle, Git, or replacement-object side effect was inferred',
+    exactError: SUPERVISION_IMPLEMENTATION_CONTINUATION_EXHAUSTED_ERROR,
+    completedSafeWork: 'the bounded same-assignment continuation budget completed without authoritative provider/runtime or lifecycle progress; no Git or replacement object was created',
     options: brainCanResolve
       ? ['repair_same_object_authority', 'resume_exact_assignment']
       : ['provide_missing_external_authority', 'select_one_authoritative_project_brain'],
@@ -2641,7 +2642,7 @@ export async function reportImplementationNoProgressBlocker(
       internalQueueSupervisionReference: {
         kind: 'implementation_blocker', taskId: task.taskId, assignmentId: assignment.assignmentId,
         revision: task.currentRevision ?? assignment.auditRevision ?? '',
-        exactError: SUPERVISION_IMPLEMENTATION_NO_PROGRESS_ERROR,
+        exactError: SUPERVISION_IMPLEMENTATION_CONTINUATION_EXHAUSTED_ERROR,
       },
     }, deps);
     if (dispatched.status !== 'accepted') {

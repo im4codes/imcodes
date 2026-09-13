@@ -685,6 +685,43 @@ describe('TransportSessionRuntime', () => {
     }
   });
 
+  it('revalidates a staged APPEND before provider admission and removes a stale control row', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    runtime.send('foreground work', 'foreground-stale-append');
+    await flushDispatch();
+    let admit = true;
+    runtime.pendingDrainAdmission = (entry) => (
+      !entry.clientMessageId.startsWith('supervision-implementation-heartbeat:') || admit
+    );
+    expect(runtime.send(
+      'continue exact assignment',
+      'supervision-implementation-heartbeat:asg_stale:queued',
+    )).toBe('queued');
+    admit = false;
+
+    await expect(runtime.appendPendingMessagesToActiveTurn(
+      ['supervision-implementation-heartbeat:asg_stale:queued'],
+      'stale-append-admission',
+    )).resolves.toEqual({ status: 'rejected' });
+    expect(mock.provider.notifyActiveDelegation).not.toHaveBeenCalled();
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
+  });
+
+  it('rejects a stale direct heartbeat at the final runtime edge without touching provider or queue', () => {
+    runtime.pendingDrainAdmission = (entry) => (
+      !entry.clientMessageId.startsWith('supervision-implementation-heartbeat:')
+    );
+    expect(() => runtime.send(
+      'stale direct continuation',
+      'supervision-implementation-heartbeat:asg_stale:direct',
+    )).toThrow('transport message authority rejected before dispatch');
+    expect(mock.provider.send).not.toHaveBeenCalled();
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
+  });
+
   it('directly appends an external MCP message without creating a pending queue row', async () => {
     mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
     mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
@@ -769,6 +806,53 @@ describe('TransportSessionRuntime', () => {
     expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
     expect(runtime.getHistory().filter((entry) => entry.role === 'user').map((entry) => entry.content))
       .toEqual(['A', 'B', 'C']);
+  });
+
+  it('continues the accepted APPEND flush after removing a stale head', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    let releaseDispatchBootstrap!: () => void;
+    let confirmProviderAdmission!: () => void;
+    (mock.provider.send as ReturnType<typeof vi.fn>).mockImplementationOnce(() => new Promise<void>((resolve) => {
+      confirmProviderAdmission = resolve;
+    }));
+    runtime.setContextBootstrapResolver(() => new Promise((resolve) => {
+      releaseDispatchBootstrap = () => resolve({
+        namespace: { scope: 'personal', projectId: 'test' }, diagnostics: [],
+      });
+    }));
+    let staleStillAuthorized = true;
+    runtime.pendingDrainAdmission = (entry) => (
+      entry.clientMessageId !== 'supervision-implementation-heartbeat:asg_stale:head'
+      || staleStillAuthorized
+    );
+
+    expect(runtime.send('A', 'append-flush-A')).toBe('sent');
+    expect(runtime.send(
+      'stale head', 'supervision-implementation-heartbeat:asg_stale:head', undefined, undefined,
+      { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND },
+    )).toBe('queued');
+    expect(runtime.send(
+      'valid tail', 'supervision-implementation-heartbeat:asg_valid:tail', undefined, undefined,
+      { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND },
+    )).toBe('queued');
+    staleStillAuthorized = false;
+    releaseDispatchBootstrap();
+    await waitForProviderSendCount(mock.provider, 1);
+    confirmProviderAdmission();
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline
+      && (mock.provider.notifyActiveDelegation as ReturnType<typeof vi.fn>).mock.calls.length < 1) {
+      await flushDispatch();
+    }
+
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      notificationId: 'supervision-implementation-heartbeat:asg_valid:tail',
+      text: 'valid tail',
+    }));
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
   });
 
   it('auto-appends through provider-native active work after the tracked dispatch has settled', async () => {

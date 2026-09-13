@@ -1,15 +1,17 @@
 import { readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { SupervisionAutomationPoolGateReason } from '../../shared/supervision-execution-pool.js';
 import { IMCODES_DELEGATION_UNAVAILABLE_MESSAGE } from '../../shared/delegation-availability.js';
 import { getSession, listSessions, upsertSession, type SessionRecord } from '../store/session-store.js';
 import { resolveAuthoritativeBrainIdentity } from './supervision-brain-authority.js';
 import {
   AUDIT_HEARTBEAT_MESSAGE_ID_PREFIX,
+  IMPLEMENTATION_HEARTBEAT_MESSAGE_ID_PREFIX,
   IMPLEMENTATION_HEARTBEAT_RUNTIME_RETRY_LIMIT,
   parkTransientRuntimeExhaustedOnce,
   resolveImplementationHeartbeatDelivery,
+  liveSupervisionIdentity,
 } from './supervision-participant-delivery.js';
 import { inspectSupervisionAssignmentWorktree } from './supervision-worktree-inspector.js';
 import { validateBrainAuditRoute } from './peer-audit-candidates.js';
@@ -79,6 +81,8 @@ import {
   isSupervisionAssignmentContinuable,
   SUPERVISION_STATE_VERSION,
   type PersistedSupervisionSessionIdentity,
+  type PersistedSupervisionTaskAssignmentIdentity,
+  type SupervisionImplementationActivitySignal,
   type PersistedSupervisionWaitState,
 } from './supervision-state-store.js';
 import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../shared/memory-mcp-contracts.js';
@@ -103,7 +107,12 @@ import { TIMELINE_EVENT_FILE_CHANGE, type FileChangePatch } from '../../shared/f
 import { peerAuditService } from './peer-audit-service.js';
 import type { SupervisionAuditDepth } from './supervision-broker.js';
 import { emitPeerAuditResult } from './peer-audit-result.js';
-import { isWorkingSessionState } from '../../shared/session-activity-types.js';
+import {
+  isWorkingSessionState,
+  normalizeActivityGeneration,
+  sameActivityGeneration,
+  type ActivityGenerationLike,
+} from '../../shared/session-activity-types.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
 import {
   getDelegationReplyStore,
@@ -199,7 +208,59 @@ const SUPERVISION_AUDIT_ENABLED_LABEL = 'Supervised + audit is enabled.';
 const SUPERVISION_WAITING_HEARTBEAT_MS = 10 * 60_000;
 const IMPLEMENTATION_IDLE_REMINDER_MS = 10 * 60_000;
 const IMPLEMENTATION_REMINDER_MAX_BACKOFF_MS = 60 * 60_000;
+/** Four quiet continuations span 80 minutes with the exponential schedule. */
+const IMPLEMENTATION_CONTINUATION_ATTEMPT_LIMIT = 4;
 const IMPLEMENTATION_WATCHDOG_TICK_MS = 60_000;
+
+function implementationActivitySignal(event: TimelineEvent):
+  SupervisionImplementationActivitySignal | undefined {
+  // Only provider/runtime rows accepted by the daemon or its authenticated
+  // lifecycle hook are authority. Human input, queue/status projections,
+  // heartbeat prompts and host-authored notes are absent from this allowlist.
+  if ((event.source !== 'daemon' && event.source !== 'hook') || event.confidence !== 'high') return undefined;
+  if (event.payload.automation === true || event.payload.memoryExcluded === true) return undefined;
+  if (event.type === 'tool.call') return 'provider_tool_call';
+  if (event.type === 'tool.result') {
+    // Restore reconciliation synthesizes terminal rows for orphaned tools.
+    // Those rows close stale UI state; they are not new provider work.
+    if (event.payload.synthetic === true || event.payload.source === 'daemon_synthetic') return undefined;
+    return 'provider_tool_result';
+  }
+  if (event.type === 'assistant.text') {
+    return typeof event.payload.text === 'string' && event.payload.text.length > 0
+      ? 'provider_assistant_output'
+      : undefined;
+  }
+  if (event.type === 'assistant.thinking') {
+    return typeof event.payload.text === 'string' && event.payload.text.length > 0
+      ? 'provider_analysis_output'
+      : undefined;
+  }
+  return undefined;
+}
+
+function implementationActivityFingerprint(input: {
+  taskId: string;
+  assignmentId: string;
+  identity: PersistedSupervisionTaskAssignmentIdentity;
+  activityGeneration: string;
+  signal: string;
+  eventId: string;
+  payload?: Record<string, unknown>;
+}): string {
+  return createHash('sha256').update(JSON.stringify({
+    taskId: input.taskId,
+    assignmentId: input.assignmentId,
+    identity: input.identity,
+    activityGeneration: input.activityGeneration,
+    signal: input.signal,
+    eventId: input.eventId,
+    // Stable streaming ids legitimately change as more provider output lands.
+    // Hashing the payload lets new output refresh activity while an identical
+    // replay remains idempotent. Only the digest is persisted.
+    payload: input.payload,
+  })).digest('hex');
+}
 /**
  * Backoff for a housekeeping batch that keeps throwing.
  *
@@ -1601,14 +1662,15 @@ class SupervisionAutomation {
             taskId: task.taskId,
             assignmentId: assignment.assignmentId,
             targetSessionName: assignment.identity.sessionName,
+            ...(watchdogKind === 'implementation' ? { requireExactIdentity: true } : {}),
             now,
           });
           // A delegated assignment has not started implementation yet. Its
           // original task delivery is durable and the first reminder is a
           // bounded wake-up for a queued/busy target; silence after that is not
           // evidence that implementation ran without progress. The authority
-          // call may still converge an observational runtime-identity rotation,
-          // but stop before runtime-outage accounting so it cannot turn an
+          // call has already fenced exact runtime identity, but stop before
+          // runtime-outage accounting so it cannot turn an
           // already-woken delegated assignment into a false blocker. The real
           // delegated -> implementing transition resets progress and re-enables
           // the started-work watchdog below.
@@ -1641,26 +1703,90 @@ class SupervisionAutomation {
         if (!rebound) continue;
         const runtime = getTransportRuntime(rebound.identity.sessionName);
         if (!runtime) continue;
+        if (watchdogKind === 'implementation') {
+          const diagnostic = runtime.getDiagnosticSnapshot(now);
+          const exactActiveOwners = registry.list({
+            projectName: task.projectName,
+            ownerSessionName: rebound.identity.sessionName,
+            includeArchived: true,
+          }).flatMap((candidateTask) => candidateTask.assignments.filter((candidate) => (
+            candidate.role === 'implementer'
+            && candidate.status === 'implementing'
+            && candidate.identity.sessionName === rebound.identity.sessionName
+            && candidate.identity.sessionInstanceId === rebound.identity.sessionInstanceId
+            && candidate.identity.runtimeEpoch === rebound.identity.runtimeEpoch
+            && candidate.identity.agentType === rebound.identity.agentType
+            && candidate.identity.providerFamily === rebound.identity.providerFamily
+            && isSupervisionAssignmentContinuable({
+              taskCurrentRevision: candidateTask.currentRevision,
+              assignment: candidate,
+            })
+          )));
+          // Runtime-wide diagnostics have no assignment id. They can refresh
+          // or defer exactly one active owner, never every task sharing a
+          // session. Structured timeline rows use the same uniqueness fence.
+          if (exactActiveOwners.length === 1
+            && exactActiveOwners[0]?.assignmentId === rebound.assignmentId) {
+            const runtimeGeneration = normalizeActivityGeneration(diagnostic.activityGeneration);
+            const lastProviderOutputAt = diagnostic.lastProviderOutputAt;
+            if (runtimeGeneration
+              && typeof lastProviderOutputAt === 'number'
+              && Number.isFinite(lastProviderOutputAt)
+              && lastProviderOutputAt > progressAt
+              && lastProviderOutputAt <= now) {
+              const eventId = `runtime-output:${rebound.identity.sessionName}:${runtimeGeneration}:${lastProviderOutputAt}`;
+              const fingerprint = implementationActivityFingerprint({
+                taskId: task.taskId,
+                assignmentId: rebound.assignmentId,
+                identity: rebound.identity,
+                activityGeneration: runtimeGeneration,
+                signal: 'provider_runtime_output',
+                eventId,
+              });
+              const activity = registry.recordImplementationRuntimeActivity({
+                taskId: task.taskId,
+                assignmentId: rebound.assignmentId,
+                identity: rebound.identity,
+                expectedRevision: task.currentRevision ?? rebound.auditRevision,
+                activityGeneration: diagnostic.activityGeneration,
+                signal: 'provider_runtime_output',
+                eventId,
+                fingerprint,
+                now: lastProviderOutputAt,
+              });
+              // Whether newly persisted or an idempotent replay, this exact
+              // provider output proves the no-progress window used by this stale
+              // loop snapshot is no longer current.
+              if (activity.ok) continue;
+            }
+            // An open provider tool is authoritative current work (long build,
+            // test, search or remote verification). Do not manufacture progress
+            // by refreshing on every identical snapshot, but do defer the
+            // watchdog until the tool emits a new lifecycle edge or closes.
+            if (typeof diagnostic.activeToolCount === 'number' && diagnostic.activeToolCount > 0) continue;
+          }
+        }
         // Durable FIFO can retain an append while the provider remains busy or
         // disconnected. Never enqueue a second watchdog reminder behind the
         // first one: cooldown controls cadence, this queue check provides the
         // independent hard bound of one pending reminder per assignment.
         const reminderIdPrefix = watchdogKind === 'audit'
           ? `${AUDIT_HEARTBEAT_MESSAGE_ID_PREFIX}${assignment.assignmentId}:${assignment.auditAttemptId}:`
-          : `supervision-implementation-heartbeat:${assignment.assignmentId}:`;
+          : `${IMPLEMENTATION_HEARTBEAT_MESSAGE_ID_PREFIX}${assignment.assignmentId}:`;
         if (runtime.pendingEntries.some((entry) => entry.clientMessageId.startsWith(reminderIdPrefix))) continue;
-        // One unanswered heartbeat is the bounded liveness probe. A second
-        // equivalent prompt would only solicit another refusal/no-op. Convert
-        // that state into one durable structured escalation instead; the
-        // persisted blocker above stops later ticks and process restarts.
-        if (reminders.length > 0) {
+        // Audit retains its historical single-wake policy. Implementation is
+        // different: quiet but still-authorized work is resumed on this SAME
+        // object with bounded exponential backoff, and only exhaustion of the
+        // complete budget becomes a structured hard failure.
+        if (watchdogKind === 'audit' && reminders.length > 0) {
           // One exact audit wake-up is enough. A later unchanged tick records
           // one structured waiting_for_brain blocker instead of stacking a
           // second prompt behind the first.
-          if (watchdogKind === 'audit') {
-            registry.recordAuditNoProgressBlocker({ assignmentId: assignment.assignmentId, now });
-            continue;
-          }
+          registry.recordAuditNoProgressBlocker({ assignmentId: assignment.assignmentId, now });
+          continue;
+        }
+        if (watchdogKind === 'implementation'
+          && reminders.length >= IMPLEMENTATION_CONTINUATION_ATTEMPT_LIMIT) {
           const escalationKey = `${task.taskId}\0${assignment.assignmentId}`;
           if (this.implementationBlockerEscalationsInFlight.has(escalationKey)) continue;
           this.implementationBlockerEscalationsInFlight.add(escalationKey);
@@ -1691,10 +1817,32 @@ class SupervisionAutomation {
           continue;
         }
         const reminderNumber = reminders.length + 1;
-        const clientMessageId = `${reminderIdPrefix}${reminderNumber}`;
+        const expectedRevision = task.currentRevision ?? rebound.auditRevision;
+        const continuationFingerprint = watchdogKind === 'implementation'
+          ? createHash('sha256').update(JSON.stringify({
+              taskId: task.taskId,
+              assignmentId: rebound.assignmentId,
+              identity: rebound.identity,
+              revision: expectedRevision ?? null,
+              progressAt,
+              reminderNumber,
+            })).digest('hex')
+          : undefined;
+        const clientMessageId = watchdogKind === 'implementation'
+          ? `${reminderIdPrefix}${continuationFingerprint}`
+          : `${reminderIdPrefix}${reminderNumber}`;
         const recorded = watchdogKind === 'audit'
           ? registry.recordAuditHeartbeat({ assignmentId: assignment.assignmentId, reminderNumber, clientMessageId, now })
-          : registry.recordImplementationHeartbeat({ assignmentId: assignment.assignmentId, reminderNumber, clientMessageId, now });
+          : registry.recordImplementationContinuation({
+              taskId: task.taskId,
+              assignmentId: assignment.assignmentId,
+              identity: rebound.identity,
+              expectedRevision,
+              attemptNumber: reminderNumber,
+              clientMessageId,
+              fingerprint: continuationFingerprint!,
+              now,
+            });
         if (!recorded.ok) continue;
         const prompt = watchdogKind === 'audit'
           ? JSON.stringify({
@@ -1711,7 +1859,10 @@ class SupervisionAutomation {
                 SUPERVISION_CONTRACT_IDS.MESSAGING,
                 SUPERVISION_CONTRACT_IDS.TASK_FINALIZATION,
               ],
-              binding: { mode: 'continue_existing', taskId: task.taskId, assignmentId: assignment.assignmentId },
+              binding: {
+                mode: 'continue_existing', taskId: task.taskId, assignmentId: assignment.assignmentId,
+                ...(expectedRevision ? { revision: expectedRevision } : {}),
+              },
               action: 'advance_safe_unfinished',
             });
         timelineEmitter.emit(
@@ -3176,7 +3327,107 @@ class SupervisionAutomation {
     }
   }
 
+  /**
+   * Project provider activity onto the one exact live implementation owner.
+   *
+   * This listener is deliberately independent of file tracking. Reads,
+   * searches, compilers, tests and remote-verification tools are work even
+   * when they do not modify the checkout. The cursor is persisted by the
+   * registry, so process restart does not erase that fact. Ambiguous owners,
+   * stale generations, synthetic restore rows and user-controlled text all
+   * fail closed without refreshing the progress clock.
+   */
+  private recordAuthoritativeImplementationActivity(event: TimelineEvent): void {
+    const signal = implementationActivitySignal(event);
+    if (!signal) return;
+    const session = getSession(event.sessionId);
+    const liveIdentity = session ? liveSupervisionIdentity(session) : undefined;
+    const projectName = session?.projectName?.trim();
+    const runtime = getTransportRuntime(event.sessionId);
+    if (!liveIdentity || !projectName || !runtime) return;
+    let diagnostic: ReturnType<typeof runtime.getDiagnosticSnapshot>;
+    try {
+      diagnostic = runtime.getDiagnosticSnapshot(event.ts);
+    } catch {
+      // Activity accounting is observational and must never interrupt the
+      // existing timeline/supervision state machine when runtime diagnostics
+      // are temporarily unavailable or an older adapter lacks the snapshot.
+      return;
+    }
+    const runtimeGeneration = diagnostic.activityGeneration;
+    const payloadGeneration = event.payload.activityGeneration as ActivityGenerationLike;
+    if (payloadGeneration !== undefined
+      && !sameActivityGeneration(payloadGeneration, runtimeGeneration)) return;
+    const normalizedGeneration = normalizeActivityGeneration(payloadGeneration ?? runtimeGeneration);
+    if (!normalizedGeneration) return;
+    const receivedAt = Date.now();
+    const providerOutputAt = typeof diagnostic.lastProviderOutputAt === 'number'
+      && Number.isFinite(diagnostic.lastProviderOutputAt)
+      && diagnostic.lastProviderOutputAt > 0
+      && diagnostic.lastProviderOutputAt <= receivedAt
+      ? diagnostic.lastProviderOutputAt
+      : 0;
+    // Stable streaming events retain their first timestamp for timeline
+    // ordering. Runtime output time is the unanchored authoritative edge that
+    // lets later deltas refresh liveness without trusting provider payload time.
+    const observedAt = Math.max(Math.min(event.ts, receivedAt), providerOutputAt);
+
+    const registry = getSupervisionTaskRegistry();
+    const candidates = registry.list({
+      projectName,
+      ownerSessionName: event.sessionId,
+      includeArchived: true,
+    }).flatMap((task) => task.assignments
+      .filter((assignment) => (
+        assignment.role === 'implementer'
+        && assignment.status === 'implementing'
+        && assignment.identity.sessionName === liveIdentity.sessionName
+        && assignment.identity.sessionInstanceId === liveIdentity.sessionInstanceId
+        && assignment.identity.runtimeEpoch === liveIdentity.runtimeEpoch
+        && assignment.identity.agentType === liveIdentity.agentType
+        && assignment.identity.providerFamily === liveIdentity.providerFamily
+        && event.ts >= assignment.createdAt
+        && isSupervisionAssignmentContinuable({
+          taskCurrentRevision: task.currentRevision,
+          assignment,
+        })
+      ))
+      .map((assignment) => ({ task, assignment })));
+    if (candidates.length !== 1) return;
+    const { task, assignment } = candidates[0]!;
+    const turnId = typeof event.payload.turnId === 'string' && event.payload.turnId.trim()
+      ? event.payload.turnId.trim()
+      : undefined;
+    const fingerprint = implementationActivityFingerprint({
+      taskId: task.taskId,
+      assignmentId: assignment.assignmentId,
+      identity: liveIdentity,
+      activityGeneration: normalizedGeneration,
+      signal,
+      eventId: event.eventId,
+      payload: event.payload,
+    });
+    try {
+      registry.recordImplementationRuntimeActivity({
+        taskId: task.taskId,
+        assignmentId: assignment.assignmentId,
+        identity: liveIdentity,
+        expectedRevision: task.currentRevision ?? assignment.auditRevision,
+        activityGeneration: payloadGeneration ?? runtimeGeneration,
+        signal,
+        eventId: event.eventId,
+        fingerprint,
+        ...(turnId ? { turnId } : {}),
+        now: observedAt,
+      });
+    } catch (error) {
+      logger.warn({ err: error, taskId: task.taskId, assignmentId: assignment.assignmentId },
+        'Supervision implementation activity persistence failed');
+    }
+  }
+
   private handleTimelineEvent(event: TimelineEvent): void {
+    this.recordAuthoritativeImplementationActivity(event);
     if (this.automaticPeerAuditCompatibilityForTests) {
       this.handleAuditTargetTimelineEvent(event);
     }

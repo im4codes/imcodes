@@ -894,6 +894,7 @@ describe('send-tool', () => {
       const report = JSON.parse(dispatchMessage.mock.calls[0]![1]);
       expect(report).toMatchObject({
         taskId, assignmentId, disposition: 'waiting_for_brain',
+        exactError: 'implementation continuation budget exhausted without authoritative work activity or structured escalation',
         reporter: { label: 'CC1', sessionName: worker.name },
         brain: { label: 'Project Brain', sessionName: brain.name },
       });

@@ -64,6 +64,7 @@ import {
   isValidSupervisionIntegrationBundleBinding,
   type SupervisionIntegrationBundle,
 } from './supervision-integration-bundle.js';
+import { normalizeActivityGeneration, type ActivityGenerationLike } from '../../shared/session-activity-types.js';
 
 const require = createRequire(import.meta.url);
 suppressSqliteExperimentalWarning();
@@ -670,7 +671,10 @@ export function isSupervisionAssignmentContinuable(input: {
 }): boolean {
   const { assignment } = input;
   if (assignment.role === 'implementer') {
-    return assignment.required && SUPERVISION_IMPLEMENTATION_CONTINUATION_STATUSES.has(assignment.status);
+    return assignment.required
+      && SUPERVISION_IMPLEMENTATION_CONTINUATION_STATUSES.has(assignment.status)
+      && (!assignment.auditRevision || !input.taskCurrentRevision
+        || assignment.auditRevision === input.taskCurrentRevision);
   }
   if (assignment.role === 'coordinator' || assignment.role === 'integration_owner') {
     return !SUPERVISION_OWNER_TERMINAL_STATUSES.has(assignment.status)
@@ -685,6 +689,23 @@ export function isSupervisionAssignmentContinuable(input: {
   return false;
 }
 
+export type SupervisionImplementationActivitySignal =
+  | 'provider_tool_call'
+  | 'provider_tool_result'
+  | 'provider_assistant_output'
+  | 'provider_analysis_output'
+  | 'provider_runtime_output';
+
+export interface PersistedSupervisionImplementationActivityCursor {
+  fingerprint: string;
+  eventId: string;
+  signal: SupervisionImplementationActivitySignal;
+  observedAt: number;
+  activityGeneration: string;
+  identity: PersistedSupervisionTaskAssignmentIdentity;
+  turnId?: string;
+}
+
 export interface PersistedSupervisionTaskAssignment {
   version: typeof SUPERVISION_TASK_REGISTRY_DB_VERSION;
   assignmentId: string;
@@ -697,6 +718,13 @@ export interface PersistedSupervisionTaskAssignment {
   /** Last durable liveness beat, ms epoch. Distinct from updatedAt: a beat
    *  proves the runtime is alive without claiming substantive progress. */
   heartbeatAt?: number;
+  /**
+   * Last daemon-authenticated provider/runtime activity for this exact
+   * assignment owner and transport generation. Persisted so a daemon restart
+   * cannot forget a long-running read/build/test turn and falsely declare it
+   * idle. User messages and replayed status snapshots never write this field.
+   */
+  implementationActivity?: PersistedSupervisionImplementationActivityCursor;
   /** Last recorded validation outcome. The console projects this directly;
    *  leaving it unwritten makes every row read 'unknown'. */
   validationState?: string;
@@ -3151,6 +3179,220 @@ export class SupervisionTaskRegistry {
     this.#recordAssignmentHeartbeat(assignment, now);
     const event = this.listEvents(assignment.taskId).at(-1);
     return event ? { ok: true, value: event } : { ok: false, reason: 'not_found' };
+  }
+
+  /**
+   * Atomically renew one SAME-object implementation continuation.
+   *
+   * The common case preserves lease id and generation and only advances the
+   * liveness beat. A corrupt/interrupted non-terminal row with no lease is
+   * repaired in place by minting exactly one lease and generation. Exact
+   * identity and revision are revalidated under BEGIN IMMEDIATE so a stale
+   * watchdog read cannot revive a replaced owner or superseded revision.
+   */
+  recordImplementationContinuation(input: {
+    taskId: string;
+    assignmentId: string;
+    identity: PersistedSupervisionTaskAssignmentIdentity;
+    expectedRevision?: string;
+    attemptNumber: number;
+    clientMessageId: string;
+    fingerprint: string;
+    now?: number;
+  }): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {
+    const taskId = normalizeTaskString(input.taskId);
+    const assignmentId = normalizeTaskString(input.assignmentId);
+    const expectedRevision = normalizeTaskString(input.expectedRevision);
+    const clientMessageId = normalizeTaskString(input.clientMessageId);
+    const fingerprint = normalizeTaskString(input.fingerprint);
+    if (!taskId || !assignmentId || !clientMessageId || !fingerprint
+      || !Number.isSafeInteger(input.attemptNumber) || input.attemptNumber < 1) {
+      return { ok: false, reason: 'invalid' };
+    }
+    const now = input.now ?? Date.now();
+    const idempotencyKey = `implementation_continuation\0${assignmentId}\0${fingerprint}`;
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const assignment = this.getAssignment(assignmentId);
+      const task = this.getTaskRecord(taskId);
+      if (!assignment || !task || assignment.taskId !== taskId) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'not_found' };
+      }
+      if (assignment.role !== 'implementer'
+        || !assignment.required
+        || !SUPERVISION_IMPLEMENTATION_CONTINUATION_STATUSES.has(assignment.status)
+        || Boolean(normalizeTaskString(assignment.blocker))
+        || isTerminalSupervisionTaskStatus(task.status)) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'invalid_transition' };
+      }
+      if (!runtimeIdentityMetadataMatches(assignment.identity, input.identity)) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'owner_mismatch' };
+      }
+      const durableRevision = normalizeTaskString(task.currentRevision)
+        ?? normalizeTaskString(assignment.auditRevision);
+      if ((expectedRevision && durableRevision && expectedRevision !== durableRevision)
+        || (task.currentRevision && assignment.auditRevision
+          && task.currentRevision !== assignment.auditRevision)) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'old_revision' };
+      }
+      const replay = this.#db.prepare(
+        'SELECT 1 AS ok FROM supervision_task_idempotency WHERE idempotency_key = ?',
+      ).get(idempotencyKey) as { ok?: number } | undefined;
+      if (replay?.ok === 1) {
+        this.#db.exec('COMMIT');
+        return { ok: true, value: assignment, replay: true };
+      }
+      const leaseRecovered = !normalizeTaskString(assignment.leaseId);
+      const renewed: PersistedSupervisionTaskAssignment = {
+        ...assignment,
+        heartbeatAt: now,
+        leaseId: leaseRecovered ? this.#mintLeaseId() : assignment.leaseId,
+        generation: leaseRecovered ? assignment.generation + 1 : assignment.generation,
+        updatedAt: leaseRecovered ? now : assignment.updatedAt,
+      };
+      this.#db.prepare(`UPDATE supervision_task_assignments
+        SET lease_id = ?, generation = ?, heartbeat_at = ?, payload_json = ?, updated_at = ?
+        WHERE assignment_id = ?`).run(
+        renewed.leaseId,
+        renewed.generation,
+        now,
+        JSON.stringify(renewed),
+        renewed.updatedAt,
+        assignmentId,
+      );
+      this.#appendEvent(taskId, assignmentId, 'implementation_heartbeat', renewed.status, {
+        source: 'implementation_watchdog',
+        substantiveProgress: false,
+        attemptNumber: input.attemptNumber,
+        reminderNumber: input.attemptNumber,
+        clientMessageId,
+        fingerprint,
+        expectedRevision: expectedRevision ?? null,
+        leaseAction: leaseRecovered ? 'recover' : 'preserve',
+        generationBefore: assignment.generation,
+        generationAfter: renewed.generation,
+      }, now);
+      this.#db.prepare(
+        'INSERT INTO supervision_task_idempotency (idempotency_key, task_id, assignment_id, created_at) VALUES (?, ?, ?, ?)',
+      ).run(idempotencyKey, taskId, assignmentId, now);
+      this.#db.exec('COMMIT');
+      return { ok: true, value: renewed };
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  /**
+   * Persist one authoritative provider/runtime activity cursor as substantive
+   * implementation progress. The fingerprint is replay-safe across timeline
+   * replacement, queue replay, and daemon restart; the exact identity,
+   * revision, assignment and activity generation are all fenced atomically.
+   */
+  recordImplementationRuntimeActivity(input: {
+    taskId: string;
+    assignmentId: string;
+    identity: PersistedSupervisionTaskAssignmentIdentity;
+    expectedRevision?: string;
+    activityGeneration: ActivityGenerationLike;
+    signal: SupervisionImplementationActivitySignal;
+    eventId: string;
+    fingerprint: string;
+    turnId?: string;
+    now?: number;
+  }): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {
+    const taskId = normalizeTaskString(input.taskId);
+    const assignmentId = normalizeTaskString(input.assignmentId);
+    const expectedRevision = normalizeTaskString(input.expectedRevision);
+    const eventId = normalizeTaskString(input.eventId);
+    const fingerprint = normalizeTaskString(input.fingerprint);
+    const activityGeneration = normalizeActivityGeneration(input.activityGeneration);
+    const turnId = normalizeTaskString(input.turnId);
+    if (!taskId || !assignmentId || !eventId || !fingerprint || !activityGeneration
+      || !activityGeneration.startsWith(`session:${input.identity.sessionName}:`)) {
+      return { ok: false, reason: 'invalid' };
+    }
+    const now = input.now ?? Date.now();
+    const idempotencyKey = `implementation_activity\0${assignmentId}\0${fingerprint}`;
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const assignment = this.getAssignment(assignmentId);
+      const task = this.getTaskRecord(taskId);
+      if (!assignment || !task || assignment.taskId !== taskId) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'not_found' };
+      }
+      if (assignment.role !== 'implementer'
+        || !assignment.required
+        || assignment.status !== 'implementing'
+        || Boolean(normalizeTaskString(assignment.blocker))
+        || isTerminalSupervisionTaskStatus(task.status)) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'invalid_transition' };
+      }
+      if (!runtimeIdentityMetadataMatches(assignment.identity, input.identity)) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'owner_mismatch' };
+      }
+      const durableRevision = normalizeTaskString(task.currentRevision)
+        ?? normalizeTaskString(assignment.auditRevision);
+      if ((expectedRevision && durableRevision && expectedRevision !== durableRevision)
+        || (task.currentRevision && assignment.auditRevision
+          && task.currentRevision !== assignment.auditRevision)) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'old_revision' };
+      }
+      const replay = this.#db.prepare(
+        'SELECT 1 AS ok FROM supervision_task_idempotency WHERE idempotency_key = ?',
+      ).get(idempotencyKey) as { ok?: number } | undefined;
+      if (replay?.ok === 1) {
+        this.#db.exec('COMMIT');
+        return { ok: true, value: assignment, replay: true };
+      }
+      // A late or reordered provider event is not newer liveness. Returning an
+      // idempotent-style replay leaves both the progress clock and cursor
+      // untouched while allowing callers to treat the observation as handled.
+      if (now <= assignment.updatedAt) {
+        this.#db.exec('COMMIT');
+        return { ok: true, value: assignment, replay: true };
+      }
+      const cursor: PersistedSupervisionImplementationActivityCursor = {
+        fingerprint,
+        eventId,
+        signal: input.signal,
+        observedAt: now,
+        activityGeneration,
+        identity: assignment.identity,
+        ...(turnId ? { turnId } : {}),
+      };
+      const recorded: PersistedSupervisionTaskAssignment = {
+        ...assignment,
+        implementationActivity: cursor,
+        updatedAt: Math.max(now, assignment.updatedAt),
+      };
+      this.#writeAssignment(recorded, 'implementation_progress', {
+        source: 'implementation_runtime_activity',
+        substantiveProgress: true,
+        signal: input.signal,
+        eventId,
+        fingerprint,
+        activityGeneration,
+        ...(turnId ? { turnId } : {}),
+        revision: durableRevision ?? null,
+      });
+      this.#db.prepare(
+        'INSERT INTO supervision_task_idempotency (idempotency_key, task_id, assignment_id, created_at) VALUES (?, ?, ?, ?)',
+      ).run(idempotencyKey, taskId, assignmentId, now);
+      this.#db.exec('COMMIT');
+      return { ok: true, value: recorded };
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   recordImplementationHeartbeatUnavailable(input: {

@@ -238,6 +238,17 @@ describe('TransportQueueStore', () => {
       revision: 'rev-1',
       exactError: 'implementation heartbeat completed without durable progress or structured escalation',
     });
+    const exhaustedError = 'implementation continuation budget exhausted without authoritative work activity or structured escalation';
+    const exhaustedFingerprint = createHash('sha256').update(JSON.stringify({
+      taskId: 'tsk_legacy', assignmentId: 'asg_worker', revision: 'rev-1', status: 'implementing',
+      exactError: exhaustedError,
+    })).digest('hex');
+    expect(resolveLegacySupervisionQueueReference(
+      deterministicSendMessageId(`implementation-blocker:${exhaustedFingerprint}`), [task],
+    )).toEqual({
+      kind: 'implementation_blocker', taskId: 'tsk_legacy', assignmentId: 'asg_worker',
+      revision: 'rev-1', exactError: exhaustedError,
+    });
     expect(resolveLegacySupervisionQueueReference('send_message_00000000-0000-5000-a000-000000000000', [task]))
       .toBeUndefined();
   });

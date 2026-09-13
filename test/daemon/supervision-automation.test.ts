@@ -42,6 +42,10 @@ const mockGetP2pRun = vi.fn();
 const mockListP2pRuns = vi.fn(() => [] as unknown[]);
 const mockSupervisionDecide = vi.fn(async () => ({ decision: 'complete', reason: 'done', confidence: 0.9 }));
 let mockTransportRuntimeWorking = false;
+let mockTransportRuntimeSessionName = 'deck_supervision_brain';
+let mockTransportRuntimeGeneration = 1;
+let mockTransportLastProviderOutputAt = 0;
+let mockTransportActiveToolCount = 0;
 /** Simulates a process-agent session that has no transport runtime at all. */
 let mockBrainRuntimeMissing = false;
 /**
@@ -80,6 +84,14 @@ const mockTransportRuntime = {
     pendingCount: 0,
     activeDispatchCount: mockTransportRuntimeWorking ? 1 : 0,
     blockingWorkCount: mockTransportRuntimeWorking ? 1 : 0,
+    activeToolCount: mockTransportActiveToolCount,
+    lastProviderOutputAt: mockTransportLastProviderOutputAt,
+    activityGeneration: {
+      scope: 'session' as const,
+      sessionName: mockTransportRuntimeSessionName,
+      generation: mockTransportRuntimeGeneration,
+    },
+    busyReasons: mockTransportActiveToolCount > 0 ? ['provider_tool_item'] : [],
   })),
 };
 let mockAuditTargetStatus = 'idle';
@@ -270,6 +282,10 @@ beforeEach(async () => {
   mockAuditTargetSending = false;
   mockAuditTargetLastProviderError = null;
   mockTransportRuntimeWorking = false;
+  mockTransportRuntimeSessionName = 'deck_supervision_brain';
+  mockTransportRuntimeGeneration = 1;
+  mockTransportLastProviderOutputAt = 0;
+  mockTransportActiveToolCount = 0;
   mockAuditTargetRuntime.send.mockReturnValue('sent');
   removeSession('deck_supervision_brain');
   removeSession('deck_sub_reviewer');
@@ -6106,6 +6122,7 @@ describe('SupervisionAutomation', () => {
       projectName = 'alpha',
       agentType = 'codex-sdk',
     ) {
+      mockTransportRuntimeSessionName = sessionName;
       workerSessionNames.add(sessionName);
       upsertSession({
         name: sessionName,
@@ -6135,12 +6152,58 @@ describe('SupervisionAutomation', () => {
       };
     }
 
+    function activeWorker(input: {
+      taskId: string;
+      assignmentId: string;
+      sessionName?: string;
+      agentType?: string;
+      revision?: string;
+      now?: number;
+    }) {
+      const registry = getSupervisionTaskRegistry();
+      const startedAt = input.now ?? 3_000;
+      const revision = input.revision ?? 'watchdog-r1';
+      const identity = liveWorkerIdentity(
+        input.sessionName ?? `deck_${input.assignmentId}`,
+        'alpha',
+        input.agentType ?? 'codex-sdk',
+      );
+      expect(registry.createOrGet({
+        taskId: input.taskId,
+        projectName: 'alpha',
+        classification: 'independent_top_level',
+        objective: 'observe authoritative provider work',
+        currentRevision: revision,
+        now: 1_000,
+      }).ok).toBe(true);
+      const created = registry.createAssignment({
+        assignmentId: input.assignmentId,
+        taskId: input.taskId,
+        role: 'implementer',
+        identity,
+        auditRevision: revision,
+        scopeFiles: ['src/activity.ts'],
+        now: 2_000,
+      });
+      if (!created.ok) throw new Error(created.reason);
+      expect(registry.updateTask({
+        taskId: input.taskId, status: 'implementing', currentRevision: revision, now: startedAt,
+      })).toMatchObject({ ok: true });
+      expect(registry.updateAssignment({
+        assignmentId: input.assignmentId, identity, status: 'implementing', now: startedAt,
+      })).toMatchObject({ ok: true });
+      return { registry, identity, revision, startedAt };
+    }
+
     beforeEach(() => {
       setSupervisionLiveParticipantsResolver((projectName) => resolveLiveSupervisionParticipants(projectName));
     });
 
     afterEach(() => {
-      for (const sessionName of workerSessionNames) removeSession(sessionName);
+      for (const sessionName of workerSessionNames) {
+        timelineEmitter.forgetSession(sessionName);
+        removeSession(sessionName);
+      }
       workerSessionNames.clear();
       setSupervisionLiveParticipantsResolver(undefined);
       mockTransportRuntime.pendingEntries.length = 0;
@@ -6194,6 +6257,332 @@ describe('SupervisionAutomation', () => {
       expect(registry.getAssignment(assignmentId)!.blocker).toBe('needs Brain adjudication');
     });
 
+    it.each([
+      ['tool start', 'tool.call', { id: 'read-1', name: 'Read', input: { path: 'src/activity.ts' } }, 'provider_tool_call'],
+      ['tool completion', 'tool.result', { id: 'test-1', text: 'vitest: 223 passed' }, 'provider_tool_result'],
+      ['assistant text', 'assistant.text', { text: 'Inspecting the queue admission path.' }, 'provider_assistant_output'],
+      ['assistant analysis', 'assistant.thinking', { text: 'Comparing the restart cursor.' }, 'provider_analysis_output'],
+    ] as const)('refreshes the watchdog from daemon-authenticated %s without a file write', async (
+      _label,
+      type,
+      payload,
+      signal,
+    ) => {
+      const taskId = `watchdog-activity-${type.replace('.', '-')}`;
+      const assignmentId = `${taskId}-assignment`;
+      const { registry, identity, revision } = activeWorker({ taskId, assignmentId });
+      supervisionAutomation.init();
+      mockTransportRuntime.send.mockClear();
+      const activityAt = 20_000;
+      const activityGeneration = {
+        scope: 'session' as const,
+        sessionName: identity.sessionName,
+        generation: mockTransportRuntimeGeneration,
+      };
+      timelineEmitter.emit(identity.sessionName, type, {
+        ...payload,
+        activityGeneration,
+        turnId: 'turn-authoritative-work',
+      }, {
+        source: 'daemon', confidence: 'high', eventId: `activity-${type}`, ts: activityAt,
+      });
+
+      expect(registry.getAssignment(assignmentId)).toMatchObject({
+        updatedAt: activityAt,
+        implementationActivity: {
+          eventId: `activity-${type}`,
+          signal,
+          observedAt: activityAt,
+          turnId: 'turn-authoritative-work',
+          identity,
+        },
+      });
+      expect(registry.listEvents(taskId).filter((event) => (
+        event.eventType === 'implementation_progress'
+        && event.payload?.source === 'implementation_runtime_activity'
+      ))).toHaveLength(1);
+
+      // Exact replay at a later wall-clock time keeps the original event ts and
+      // fingerprint, so neither the durable cursor nor the progress clock moves.
+      timelineEmitter.emit(identity.sessionName, type, {
+        ...payload,
+        activityGeneration,
+        turnId: 'turn-authoritative-work',
+      }, {
+        source: 'daemon', confidence: 'high', eventId: `activity-${type}`, ts: activityAt,
+      });
+      expect(registry.getAssignment(assignmentId)?.updatedAt).toBe(activityAt);
+      expect(registry.listEvents(taskId).filter((event) => (
+        event.eventType === 'implementation_progress'
+      ))).toHaveLength(1);
+
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(activityAt + 10 * 60_000 - 1);
+      expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(activityAt + 10 * 60_000);
+      expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
+      expect(mockTransportRuntime.send).toHaveBeenLastCalledWith(
+        expect.stringContaining(`"revision":"${revision}"`),
+        expect.stringMatching(new RegExp(`^supervision-implementation-heartbeat:${assignmentId}:[a-f0-9]{64}$`)),
+        undefined,
+        undefined,
+        expect.objectContaining({ deliveryMode: 'append' }),
+      );
+    });
+
+    it('normalizes authoritative activity across provider families', () => {
+      const taskId = 'watchdog-cross-provider-activity';
+      const assignmentId = 'watchdog-cross-provider-activity-assignment';
+      const { registry, identity } = activeWorker({
+        taskId, assignmentId, sessionName: 'deck_claude_activity', agentType: 'claude-code-sdk',
+      });
+      supervisionAutomation.init();
+      timelineEmitter.emit(identity.sessionName, 'tool.call', {
+        id: 'claude-search', name: 'Grep', input: { pattern: 'watchdog' },
+        activityGeneration: {
+          scope: 'session', sessionName: identity.sessionName, generation: mockTransportRuntimeGeneration,
+        },
+      }, { source: 'hook', confidence: 'high', eventId: 'claude-search-start', ts: 25_000 });
+      expect(registry.getAssignment(assignmentId)?.implementationActivity).toMatchObject({
+        signal: 'provider_tool_call', identity: { agentType: 'claude-code-sdk', providerFamily: 'anthropic' },
+      });
+    });
+
+    it('advances continuous assistant output with one stable streaming id but ignores an exact replay', () => {
+      const taskId = 'watchdog-streaming-output';
+      const assignmentId = 'watchdog-streaming-output-assignment';
+      const { registry, identity } = activeWorker({ taskId, assignmentId });
+      supervisionAutomation.init();
+      const activityGeneration = {
+        scope: 'session' as const, sessionName: identity.sessionName, generation: mockTransportRuntimeGeneration,
+      };
+      const emit = (text: string, ts: number) => {
+        mockTransportLastProviderOutputAt = ts;
+        return timelineEmitter.emit(identity.sessionName, 'assistant.text', {
+          text, streaming: true, activityGeneration, turnId: 'streaming-turn',
+        }, { source: 'daemon', confidence: 'high', eventId: 'stable-streaming-output', ts });
+      };
+      emit('Investigating', 10_000);
+      emit('Investigating the queue', 20_000);
+      emit('Investigating the queue', 20_000);
+
+      expect(registry.getAssignment(assignmentId)).toMatchObject({
+        updatedAt: 20_000,
+        implementationActivity: {
+          signal: 'provider_assistant_output', observedAt: 20_000, turnId: 'streaming-turn',
+        },
+      });
+      expect(registry.listEvents(taskId).filter((event) => event.eventType === 'implementation_progress'))
+        .toHaveLength(2);
+    });
+
+    it('defers during one long-running build without treating repeated snapshots as new progress', async () => {
+      const taskId = 'watchdog-long-build';
+      const assignmentId = 'watchdog-long-build-assignment';
+      const { registry } = activeWorker({ taskId, assignmentId });
+      mockTransportRuntime.send.mockClear();
+      mockTransportActiveToolCount = 1;
+      const due = 3_000 + 10 * 60_000;
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(due);
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(due + 24 * 60 * 60_000);
+      expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+      expect(registry.getAssignment(assignmentId)?.updatedAt).toBe(3_000);
+      expect(registry.getAssignment(assignmentId)?.implementationActivity).toBeUndefined();
+
+      mockTransportActiveToolCount = 0;
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(due + 24 * 60 * 60_000);
+      expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
+    });
+
+    it('uses the runtime provider-output cursor after restart and never counts a snapshot replay twice', async () => {
+      const taskId = 'watchdog-runtime-output';
+      const assignmentId = 'watchdog-runtime-output-assignment';
+      const { registry } = activeWorker({ taskId, assignmentId });
+      mockTransportRuntime.send.mockClear();
+      const originalDue = 3_000 + 10 * 60_000;
+      mockTransportLastProviderOutputAt = originalDue - 1_000;
+
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(originalDue);
+      expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+      expect(registry.getAssignment(assignmentId)).toMatchObject({
+        updatedAt: mockTransportLastProviderOutputAt,
+        implementationActivity: { signal: 'provider_runtime_output', observedAt: mockTransportLastProviderOutputAt },
+      });
+      const progressEvents = registry.listEvents(taskId).filter((event) => event.eventType === 'implementation_progress');
+      supervisionAutomation.__simulateProcessRestartForTests();
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(originalDue + 1);
+      expect(registry.listEvents(taskId).filter((event) => event.eventType === 'implementation_progress'))
+        .toHaveLength(progressEvents.length);
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(
+        mockTransportLastProviderOutputAt + 10 * 60_000,
+      );
+      expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
+    });
+
+    it('rejects user, automation, stale-generation, and ambiguous-assignment activity', () => {
+      const taskId = 'watchdog-forged-activity';
+      const assignmentId = 'watchdog-forged-activity-assignment';
+      const { registry, identity } = activeWorker({ taskId, assignmentId });
+      supervisionAutomation.init();
+      const generation = {
+        scope: 'session' as const, sessionName: identity.sessionName, generation: mockTransportRuntimeGeneration,
+      };
+      timelineEmitter.emit(identity.sessionName, 'user.message', { text: 'I am working', activityGeneration: generation },
+        { source: 'daemon', confidence: 'high', eventId: 'forged-user', ts: 10_000 });
+      timelineEmitter.emit(identity.sessionName, 'assistant.text', {
+        text: 'watchdog heartbeat', automation: true, activityGeneration: generation,
+      }, { source: 'daemon', confidence: 'high', eventId: 'automation-text', ts: 11_000 });
+      timelineEmitter.emit(identity.sessionName, 'tool.call', {
+        id: 'stale-tool', name: 'Read', input: {},
+        activityGeneration: { ...generation, generation: mockTransportRuntimeGeneration + 1 },
+      }, { source: 'daemon', confidence: 'high', eventId: 'stale-generation', ts: 12_000 });
+      expect(registry.getAssignment(assignmentId)?.updatedAt).toBe(3_000);
+
+      expect(registry.createOrGet({
+        taskId: 'watchdog-ambiguous-activity', projectName: 'alpha',
+        classification: 'independent_top_level', objective: 'make ownership ambiguous',
+        currentRevision: 'watchdog-r1', now: 1_000,
+      })).toMatchObject({ ok: true });
+      expect(registry.createAssignment({
+        taskId: 'watchdog-ambiguous-activity',
+        assignmentId: 'watchdog-ambiguous-activity-assignment',
+        role: 'implementer', identity, auditRevision: 'watchdog-r1', now: 2_000,
+      })).toMatchObject({ ok: true });
+      expect(registry.updateTask({
+        taskId: 'watchdog-ambiguous-activity', status: 'implementing', currentRevision: 'watchdog-r1', now: 3_000,
+      })).toMatchObject({ ok: true });
+      expect(registry.updateAssignment({
+        assignmentId: 'watchdog-ambiguous-activity-assignment', identity, status: 'implementing', now: 3_000,
+      })).toMatchObject({ ok: true });
+      timelineEmitter.emit(identity.sessionName, 'tool.result', {
+        id: 'ambiguous-result', text: 'build passed', activityGeneration: generation,
+      }, { source: 'daemon', confidence: 'high', eventId: 'ambiguous-result', ts: 13_000 });
+      expect(registry.getAssignment(assignmentId)?.updatedAt).toBe(3_000);
+      expect(registry.getAssignment('watchdog-ambiguous-activity-assignment')?.updatedAt).toBe(3_000);
+    });
+
+    it('recovers delivery after a failed durable continuation send without replacing the object', async () => {
+      const taskId = 'watchdog-send-recovery';
+      const assignmentId = 'watchdog-send-recovery-assignment';
+      const { registry } = activeWorker({ taskId, assignmentId });
+      const before = registry.getAssignment(assignmentId)!;
+      mockTransportRuntime.send.mockClear();
+      mockTransportRuntime.send.mockImplementationOnce(() => { throw new Error('queue temporarily unavailable'); });
+      const due = 3_000 + 10 * 60_000;
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(due);
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(due + 10 * 60_000);
+      expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+      expect(registry.listAssignments(taskId)).toHaveLength(1);
+      expect(registry.getAssignment(assignmentId)).toMatchObject({
+        assignmentId, taskId, leaseId: before.leaseId, generation: before.generation,
+      });
+      expect(registry.listEvents(taskId).filter((event) => event.eventType === 'implementation_heartbeat'))
+        .toHaveLength(2);
+    });
+
+    it('regression: tool and text activity alone prevent the post-heartbeat Brain wait', async () => {
+      const taskId = 'watchdog-live-no-file-regression';
+      const assignmentId = 'watchdog-live-no-file-regression-assignment';
+      const { registry, identity } = activeWorker({ taskId, assignmentId });
+      upsertSession({
+        name: 'deck_alpha_brain', label: 'Brain', projectName: 'alpha', role: 'brain',
+        agentType: 'codex-sdk', runtimeType: 'transport', providerId: 'codex-sdk',
+        projectDir: '/work/watchdog', state: 'idle', restarts: 0, restartTimestamps: [],
+        createdAt: Date.now(), updatedAt: Date.now(),
+      } as never);
+      mockTransportRuntime.send.mockClear();
+      const firstDue = 3_000 + 10 * 60_000;
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(firstDue);
+      expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
+
+      const activityAt = firstDue + 9 * 60_000;
+      const activityGeneration = {
+        scope: 'session' as const, sessionName: identity.sessionName, generation: mockTransportRuntimeGeneration,
+      };
+      timelineEmitter.emit(identity.sessionName, 'tool.call', {
+        id: 'incident-read', name: 'Read', input: { path: 'src/daemon/supervision-automation.ts' },
+        activityGeneration, turnId: 'incident-active-turn',
+      }, { source: 'daemon', confidence: 'high', eventId: 'incident-tool-call', ts: activityAt });
+      timelineEmitter.emit(identity.sessionName, 'assistant.thinking', {
+        text: 'Tracing watchdog state without writing files.', activityGeneration, turnId: 'incident-active-turn',
+      }, { source: 'daemon', confidence: 'high', eventId: 'incident-analysis', ts: activityAt + 1 });
+
+      // Old behavior escalated on this second quiet-window check because it
+      // ignored provider work without a file event. The exact live activity
+      // now resets the window and keeps the SAME assignment runnable.
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(firstDue + 10 * 60_000);
+      expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
+      expect(registry.getAssignment(assignmentId)?.blocker).toBeUndefined();
+      expect(registry.getAssignment(assignmentId)).toMatchObject({
+        assignmentId, taskId, generation: 1,
+        implementationActivity: { signal: 'provider_analysis_output', turnId: 'incident-active-turn' },
+      });
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(activityAt + 1 + 10 * 60_000);
+      expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+      expect(registry.getAssignment(assignmentId)?.blocker).toBeUndefined();
+      removeSession('deck_alpha_brain');
+    });
+
+    it('authorizes only the exact queued revision and parks a live revision conflict accurately', async () => {
+      const taskId = 'watchdog-revision-fence';
+      const assignmentId = 'watchdog-revision-fence-assignment';
+      const { registry, identity, revision } = activeWorker({ taskId, assignmentId });
+      mockTransportRuntime.send.mockClear();
+      const due = 3_000 + 10 * 60_000;
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(due);
+      const [prompt, clientMessageId] = mockTransportRuntime.send.mock.calls[0] as [string, string];
+      expect(authorizeQueuedSupervisionHeartbeatDelivery({
+        targetSessionName: identity.sessionName, clientMessageId, text: prompt, now: due,
+      })).toBe(true);
+      expect(authorizeQueuedSupervisionHeartbeatDelivery({
+        targetSessionName: identity.sessionName,
+        clientMessageId,
+        text: prompt.replace(`"revision":"${revision}"`, '"revision":"stale-r0"'),
+        now: due,
+      })).toBe(false);
+
+      expect(registry.updateTask({ taskId, currentRevision: 'watchdog-r2', now: due + 1 }))
+        .toMatchObject({ ok: true });
+      mockTransportRuntime.pendingEntries.length = 0;
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(due + 2 * 60 * 60_000);
+      expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
+      expect(JSON.parse(registry.getAssignment(assignmentId)!.blocker!)).toMatchObject({
+        kind: 'implementation_heartbeat_revision_conflict',
+        taskId,
+        assignmentId,
+        taskCurrentRevision: 'watchdog-r2',
+        assignmentRevision: revision,
+        action: 'same_object_revision_reconcile',
+      });
+    });
+
+    it('rejects a delayed continuation after terminal state without mutating terminal history', async () => {
+      const taskId = 'watchdog-terminal-fence';
+      const assignmentId = 'watchdog-terminal-fence-assignment';
+      const { registry, identity, revision } = activeWorker({ taskId, assignmentId });
+      const prompt = JSON.stringify({
+        contractRefs: [SUPERVISION_CONTRACT_IDS.IMPLEMENTATION_HEARTBEAT],
+        binding: { mode: 'continue_existing', taskId, assignmentId, revision },
+        action: 'advance_safe_unfinished',
+      });
+      expect(registry.updateTask({ taskId, status: 'cancelled', now: 9_000 })).toMatchObject({ ok: true });
+      const before = registry.get(taskId);
+      const eventCount = registry.listEvents(taskId).length;
+      expect(authorizeQueuedSupervisionHeartbeatDelivery({
+        targetSessionName: identity.sessionName,
+        clientMessageId: `supervision-implementation-heartbeat:${assignmentId}:terminal`,
+        text: prompt,
+        now: 10_000,
+      })).toBe(false);
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(20_000_000);
+      expect(mockTransportRuntime.send).not.toHaveBeenCalledWith(
+        expect.any(String),
+        expect.stringMatching(new RegExp(`^supervision-implementation-heartbeat:${assignmentId}:`)),
+        expect.anything(), expect.anything(), expect.anything(),
+      );
+      expect(registry.get(taskId)).toEqual(before);
+      expect(registry.listEvents(taskId)).toHaveLength(eventCount);
+    });
+
     it('wakes an idle delegated assignment on the same object before its first progress event', async () => {
       const registry = getSupervisionTaskRegistry();
       const taskId = 'watchdog-delegated-task';
@@ -6214,7 +6603,7 @@ describe('SupervisionAutomation', () => {
       expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
       expect(mockTransportRuntime.send).toHaveBeenCalledWith(
         expect.stringContaining(`"mode":"continue_existing","taskId":"${taskId}","assignmentId":"${assignmentId}"`),
-        `supervision-implementation-heartbeat:${assignmentId}:1`,
+        expect.stringMatching(new RegExp(`^supervision-implementation-heartbeat:${assignmentId}:[a-f0-9]{64}$`)),
         undefined,
         undefined,
         expect.objectContaining({ timelineCommitted: true, deliveryMode: 'append' }),
@@ -6236,21 +6625,21 @@ describe('SupervisionAutomation', () => {
       expect(registry.listEvents(taskId)).toHaveLength(eventsBeforeOutage);
       expect(registry.getAssignment(assignmentId)?.blocker).toBeUndefined();
 
-      // Restoring the durable session under a new runtime identity may repair
-      // observational fencing metadata, but still cannot mint another wake.
+      // A same-named replacement runtime is not the exact owner. It must park
+      // one structured identity blocker rather than mutating identity or
+      // minting another wake.
       const reboundIdentity = liveWorkerIdentity(identity.sessionName);
       await supervisionAutomation.__checkImplementationAssignmentsForTests(2_000 + 1_290 * 60_000);
       await sleep(25);
       expect(mockTransportRuntime.send, 'a queued assignment gets one wake-up, not a false implementation blocker')
         .toHaveBeenCalledOnce();
-      expect(registry.getAssignment(assignmentId)).toMatchObject({
-        status: 'delegated',
-        identity: {
-          sessionInstanceId: reboundIdentity.sessionInstanceId,
-          runtimeEpoch: reboundIdentity.runtimeEpoch,
-        },
+      expect(registry.getAssignment(assignmentId)).toMatchObject({ status: 'delegated', identity });
+      expect(reboundIdentity).not.toEqual(identity);
+      expect(JSON.parse(registry.getAssignment(assignmentId)!.blocker!)).toMatchObject({
+        kind: 'implementation_heartbeat_identity_rebind_required',
+        taskId,
+        assignmentId,
       });
-      expect(registry.getAssignment(assignmentId)?.blocker).toBeUndefined();
       expect(registry.listEvents(taskId).filter((event) => (
         event.eventType === 'implementation_heartbeat'
         && event.payload?.source === 'implementation_watchdog'
@@ -6413,7 +6802,7 @@ describe('SupervisionAutomation', () => {
       })).toBe(false);
     });
 
-    it('escalates one structured blocker instead of sending a second no-progress heartbeat', async () => {
+    it('continues the same object with backoff and escalates only after the full budget', async () => {
       const registry = getSupervisionTaskRegistry();
       const taskId = 'watchdog-noop-escalation-task';
       const assignmentId = 'watchdog-noop-escalation-implementer';
@@ -6439,17 +6828,29 @@ describe('SupervisionAutomation', () => {
       mockTransportRuntimeWorking = false;
 
       const firstDue = 3_000 + 10 * 60_000;
-      await supervisionAutomation.__checkImplementationAssignmentsForTests(firstDue);
-      expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
-      mockTransportRuntime.pendingEntries.length = 0;
+      for (const offsetMinutes of [0, 10, 30, 70]) {
+        await supervisionAutomation.__checkImplementationAssignmentsForTests(
+          firstDue + offsetMinutes * 60_000,
+        );
+        mockTransportRuntime.pendingEntries.length = 0;
+      }
+      expect(mockTransportRuntime.send).toHaveBeenCalledTimes(4);
+      expect(registry.getAssignment(assignmentId)?.blocker).toBeUndefined();
+      expect(registry.listAssignments(taskId)).toHaveLength(1);
+      expect(registry.getAssignment(assignmentId)).toMatchObject({
+        assignmentId,
+        taskId,
+        leaseId: expect.any(String),
+        generation: 1,
+      });
 
-      await supervisionAutomation.__checkImplementationAssignmentsForTests(firstDue + 10 * 60_000);
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(firstDue + 130 * 60_000);
       await sleep(25);
-      expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
+      expect(mockTransportRuntime.send).toHaveBeenCalledTimes(4);
       const blocker = JSON.parse(registry.getAssignment(assignmentId)!.blocker!);
       expect(blocker).toMatchObject({
         taskId, assignmentId,
-        exactError: 'implementation heartbeat completed without durable progress or structured escalation',
+        exactError: 'implementation continuation budget exhausted without authoritative work activity or structured escalation',
         completedSafeWork: expect.any(String),
         options: expect.any(Array),
         recommendedNextAction: expect.any(String),
@@ -6459,7 +6860,7 @@ describe('SupervisionAutomation', () => {
       supervisionAutomation.__simulateProcessRestartForTests();
       await supervisionAutomation.__checkImplementationAssignmentsForTests(firstDue + 24 * 60 * 60_000);
       await sleep(25);
-      expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
+      expect(mockTransportRuntime.send).toHaveBeenCalledTimes(4);
       expect(registry.listEvents(taskId)).toHaveLength(eventsAfterEscalation);
       removeSession('deck_alpha_brain');
     });
@@ -6495,7 +6896,7 @@ describe('SupervisionAutomation', () => {
       expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
       expect(mockTransportRuntime.send).toHaveBeenLastCalledWith(
         expect.stringContaining(`"mode":"continue_existing","taskId":"${taskId}","assignmentId":"${assignmentId}"`),
-        `supervision-implementation-heartbeat:${assignmentId}:1`,
+        expect.stringMatching(new RegExp(`^supervision-implementation-heartbeat:${assignmentId}:[a-f0-9]{64}$`)),
         undefined,
         undefined,
         expect.objectContaining({ timelineCommitted: true, deliveryMode: 'append' }),
@@ -6518,7 +6919,7 @@ describe('SupervisionAutomation', () => {
       // watchdog append. A busy/offline target therefore cannot accumulate an
       // unbounded line of semantically identical continue reminders.
       (mockTransportRuntime.pendingEntries as Array<{ clientMessageId: string }>).push({
-        clientMessageId: `supervision-implementation-heartbeat:${assignmentId}:2`,
+        clientMessageId: `supervision-implementation-heartbeat:${assignmentId}:pending`,
       });
       await supervisionAutomation.__checkImplementationAssignmentsForTests(progressAt + 2 * 60 * 60_000);
       expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
@@ -6712,7 +7113,7 @@ describe('SupervisionAutomation', () => {
         text,
       })).toBe(false);
 
-      const outage = vi.spyOn(registry, 'convergeImplementationHeartbeatTarget')
+      const outage = vi.spyOn(registry, 'getAssignment')
         .mockImplementation(() => { throw new Error('registry unavailable'); });
       expect(authorizeQueuedSupervisionHeartbeatDelivery({
         targetSessionName: identity.sessionName,
@@ -6749,11 +7150,11 @@ describe('SupervisionAutomation', () => {
       expect(authorizeQueuedSupervisionHeartbeatDelivery(input)).toBe(false);
       expect(registry.listEvents(taskId)).toHaveLength(events);
       expect(JSON.parse(registry.getAssignment(assignmentId)!.blocker!)).toMatchObject({
-        kind: 'implementation_heartbeat_identity_rebind_required', candidateCount: 1,
+        kind: 'implementation_heartbeat_identity_rebind_required', candidateCount: 0,
       });
     });
 
-    it('atomically rebinds a rotated runtime epoch before delivering to the same live participant', async () => {
+    it('fails closed on a rotated runtime epoch without mutating the same assignment', async () => {
       const registry = getSupervisionTaskRegistry();
       const taskId = 'watchdog-rotated-task';
       const assignmentId = 'watchdog-rotated-implementer';
@@ -6770,12 +7171,14 @@ describe('SupervisionAutomation', () => {
 
       await supervisionAutomation.__checkImplementationAssignmentsForTests(2_000 + 10 * 60_000);
 
-      expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
-      expect(registry.getAssignment(assignmentId)!.identity).toEqual(live);
-      expect(registry.getAssignment(assignmentId)!.blocker).toBeUndefined();
+      expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+      expect(registry.getAssignment(assignmentId)!.identity).toEqual(stale);
+      expect(JSON.parse(registry.getAssignment(assignmentId)!.blocker!)).toMatchObject({
+        kind: 'implementation_heartbeat_identity_rebind_required', taskId, assignmentId,
+      });
     });
 
-    it('normalizes the legacy claude family while preserving the same assignment', async () => {
+    it('fails closed on provider-family mismatch without normalizing implementation authority', async () => {
       const registry = getSupervisionTaskRegistry();
       const taskId = 'watchdog-legacy-family-task';
       const assignmentId = 'watchdog-legacy-family-implementer';
@@ -6797,8 +7200,9 @@ describe('SupervisionAutomation', () => {
 
       await supervisionAutomation.__checkImplementationAssignmentsForTests(2_000 + 10 * 60_000);
 
-      expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
-      expect(registry.getAssignment(assignmentId)).toMatchObject({ assignmentId, identity: live });
+      expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+      expect(registry.getAssignment(assignmentId)).toMatchObject({ assignmentId, identity: legacy });
+      expect(registry.getAssignment(assignmentId)?.blocker).toBeTruthy();
       expect(registry.listAssignments(taskId)).toHaveLength(1);
     });
 
@@ -6823,6 +7227,7 @@ describe('SupervisionAutomation', () => {
       await supervisionAutomation.__checkImplementationAssignmentsForTests(due);
       // A rehydrated automation tick observes the same durable FIFO entry and
       // must not append a duplicate, even long after the ordinary backoff.
+      supervisionAutomation.__simulateProcessRestartForTests();
       await supervisionAutomation.__checkImplementationAssignmentsForTests(due + 24 * 60 * 60_000);
 
       expect(mockTransportRuntime.send).toHaveBeenCalledOnce();

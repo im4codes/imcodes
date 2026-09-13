@@ -1,6 +1,9 @@
 import { createHash } from 'node:crypto';
 import type { PendingTransportMessage } from '../agent/transport-session-runtime.js';
-import { SUPERVISION_IMPLEMENTATION_NO_PROGRESS_ERROR } from '../../shared/agent-delegation.js';
+import {
+  SUPERVISION_IMPLEMENTATION_CONTINUATION_EXHAUSTED_ERROR,
+  SUPERVISION_IMPLEMENTATION_NO_PROGRESS_ERROR,
+} from '../../shared/agent-delegation.js';
 import { deterministicSendMessageId } from '../../shared/send-message-id.js';
 import { containsProhibitedQueueProjectionField } from '../../shared/transport-queue-privacy.js';
 import type { QueueSnapshot, QueueSupervisionReference } from '../../shared/transport-queue-types.js';
@@ -61,19 +64,24 @@ export function resolveLegacySupervisionQueueReference(
         }
         if (assignment.role !== 'implementer') continue;
         for (const status of IMPLEMENTER_STATUS_CANDIDATES) {
-          const fingerprint = createHash('sha256').update(JSON.stringify({
-            taskId: task.taskId,
-            assignmentId: assignment.assignmentId,
-            revision,
-            status,
-            exactError: SUPERVISION_IMPLEMENTATION_NO_PROGRESS_ERROR,
-          })).digest('hex');
-          if (deterministicSendMessageId(`implementation-blocker:${fingerprint}`) === clientMessageId) {
-            matches.push({
-              kind: 'implementation_blocker', taskId: task.taskId, assignmentId: assignment.assignmentId,
+          for (const exactError of [
+            SUPERVISION_IMPLEMENTATION_NO_PROGRESS_ERROR,
+            SUPERVISION_IMPLEMENTATION_CONTINUATION_EXHAUSTED_ERROR,
+          ]) {
+            const fingerprint = createHash('sha256').update(JSON.stringify({
+              taskId: task.taskId,
+              assignmentId: assignment.assignmentId,
               revision,
-              exactError: SUPERVISION_IMPLEMENTATION_NO_PROGRESS_ERROR,
-            });
+              status,
+              exactError,
+            })).digest('hex');
+            if (deterministicSendMessageId(`implementation-blocker:${fingerprint}`) === clientMessageId) {
+              matches.push({
+                kind: 'implementation_blocker', taskId: task.taskId, assignmentId: assignment.assignmentId,
+                revision,
+                exactError,
+              });
+            }
           }
         }
       }
