@@ -1,4 +1,5 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { CONTROLLED_NODE_OS_MAC, CONTROLLED_NODE_OS_WIN } from '../../../shared/controlled-node-artifacts.js';
 import type WebSocket from 'ws';
 import type { Database } from '../db/client.js';
 import {
@@ -16,7 +17,6 @@ import { resolveRemoteDesktopSessionProfile } from '../../../shared/remote-deskt
 import {
   REMOTE_DESKTOP_AUDIT_EVENT,
   REMOTE_DESKTOP_ACCESS_MODE,
-  REMOTE_DESKTOP_CAPABILITY,
   REMOTE_DESKTOP_ERROR,
   REMOTE_DESKTOP_LIMITS,
   REMOTE_DESKTOP_MSG,
@@ -1419,7 +1419,13 @@ export class RemoteDesktopRouter {
       return 'denied';
     }
     if (controlledNode && !access.exec_enabled) return 'exec_disabled';
-    if (controlledNode && access.os !== 'win') return 'unsupported_platform';
+    // Platform is decided against the advertised profile below, not assumed
+    // Windows: a macOS node that advertised a complete v3 profile was refused
+    // here as `unsupported_platform` before its capabilities were even read,
+    // so no session could ever reach one.
+    if (controlledNode && access.os !== CONTROLLED_NODE_OS_WIN && access.os !== CONTROLLED_NODE_OS_MAC) {
+      return 'unsupported_platform';
+    }
     if (access.status !== 'online'
       || typeof access.last_heartbeat_at !== 'number'
       || now - access.last_heartbeat_at >= MACHINE_PRESENCE_STALENESS_MS) {
@@ -1427,11 +1433,13 @@ export class RemoteDesktopRouter {
     }
     if (controlledNode) {
       const capabilities = validateControlledNodeCapabilities(access.controlled_capabilities);
-      if (!capabilities.ok
-        || !capabilities.value.includes(REMOTE_DESKTOP_CAPABILITY)
-        || resolveRemoteDesktopSessionProfile(capabilities.value) === null) {
-        return 'capability';
-      }
+      // The resolved profile is the authority -- it already accepts the legacy
+      // Windows v2 token and the cross-platform v3 profile. Requiring the
+      // Windows token on top made every non-Windows node fail here.
+      const profile = capabilities.ok ? resolveRemoteDesktopSessionProfile(capabilities.value) : null;
+      if (!profile) return 'capability';
+      const expectedOs = profile.platform === 'macos' ? CONTROLLED_NODE_OS_MAC : CONTROLLED_NODE_OS_WIN;
+      if (access.os !== expectedOs) return 'unsupported_platform';
     }
     return null;
   }

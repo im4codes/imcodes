@@ -9273,7 +9273,7 @@ export class WsBridge {
   private trySendRemoteDesktop(message: Record<string, unknown>, expectedGeneration: number): boolean {
     if (!this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN) return false;
     if (this.daemonGeneration !== expectedGeneration
-      || !this.hasDaemonCapability(REMOTE_DESKTOP_CAPABILITY)) return false;
+      || !this.daemonAdvertisesRemoteDesktopProfile()) return false;
     try {
       this.daemonWs.send(JSON.stringify(message));
       return true;
@@ -9895,7 +9895,21 @@ export class WsBridge {
     return this.authenticated
       && this.remoteDesktopAuthorityReadyGeneration === this.daemonGeneration
       && this.daemonWs?.readyState === WebSocket.OPEN
-      && this.hasDaemonCapability(REMOTE_DESKTOP_CAPABILITY);
+      && this.daemonAdvertisesRemoteDesktopProfile();
+  }
+
+  /**
+   * Whether the connected daemon advertises a complete remote-desktop session
+   * profile of any platform. The Windows v2 token alone was checked before,
+   * so signaling for a macOS v3 node was refused after admission had passed.
+   */
+  private daemonAdvertisesRemoteDesktopProfile(): boolean {
+    if (!this.daemonWs || this.daemonWs.readyState !== WebSocket.OPEN) return false;
+    return resolveRemoteDesktopSessionProfile(
+      this.daemonNodeRole === NODE_ROLE.CONTROLLED
+        ? [...this.controlledNodeCapabilities]
+        : this.daemonP2pWorkflowCapabilities?.capabilities,
+    ) !== null;
   }
 
   private applyRemoteDesktopGuestOutboxEffect(

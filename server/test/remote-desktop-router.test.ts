@@ -33,6 +33,7 @@ import { parseAdvertisedControlledNodeCapabilities } from '../../shared/controll
 import { NODE_ROLE } from '../../shared/remote-exec.js';
 import {
   REMOTE_DESKTOP_ACTOR_SOURCE,
+  REMOTE_DESKTOP_INPUT_CAPABILITY,
   REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
   type RemoteDesktopOutboxEvent,
 } from '../../shared/remote-desktop-access.js';
@@ -791,6 +792,54 @@ describe('RemoteDesktopRouter', () => {
     await f.router.handleBrowser(f.browserA, 'owner-user', start);
     expect(f.daemonMessages).toHaveLength(0);
     expect(f.messages(f.browserA)[0]).toMatchObject({ type: REMOTE_DESKTOP_MSG.ERROR, error });
+  });
+
+  it('admits a macOS controlled node advertising a complete v3 profile and sends it PREPARE', async () => {
+    // Every check here used to assume Windows: `os !== 'win'` refused the node
+    // as unsupported_platform and the Windows v2 token was required on top of
+    // the profile, so a Mac that advertised everything a session needs never
+    // received PREPARE and the browser sat on "connecting".
+    const macProfile = [
+      REMOTE_DESKTOP_SESSION_CAPABILITY,
+      REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS,
+      REMOTE_DESKTOP_CAPTURE_CAPABILITY.MACOS_SCREEN_CAPTURE_KIT,
+      REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+      REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+      REMOTE_DESKTOP_INPUT_CAPABILITY,
+    ];
+    const f = fixture({
+      access: { ...validAccess(), os: 'mac', controlled_capabilities: macProfile } as ControlledMachineAccessRow,
+    });
+    const authority = await authorize(f);
+    expect(f.daemonMessages[0]).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId,
+      sessionId: authority.sessionId,
+    });
+  });
+
+  it.each([
+    ['a macOS profile on a node enrolled as Windows', 'win', [
+      REMOTE_DESKTOP_SESSION_CAPABILITY,
+      REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS,
+      REMOTE_DESKTOP_CAPTURE_CAPABILITY.MACOS_SCREEN_CAPTURE_KIT,
+      REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+      REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+    ]],
+    ['the Windows token on a node enrolled as macOS', 'mac', [REMOTE_DESKTOP_CAPABILITY]],
+  ] as const)('refuses %s as unsupported_platform', async (_label, os, capabilities) => {
+    // The profile decides the platform, and the enrolled OS must agree with
+    // it. A node whose record and advertisement disagree is not trusted to be
+    // either.
+    const f = fixture({
+      access: { ...validAccess(), os, controlled_capabilities: [...capabilities] } as ControlledMachineAccessRow,
+    });
+    await f.router.handleBrowser(f.browserA, 'owner-user', start);
+    expect(f.daemonMessages).toHaveLength(0);
+    expect(f.messages(f.browserA)[0]).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.ERROR,
+      error: REMOTE_DESKTOP_ERROR.UNSUPPORTED_PLATFORM,
+    });
   });
 
   it('keeps an unknown remote-desktop advertisement fail-closed from ingress through admission', async () => {
