@@ -2120,7 +2120,15 @@ describe('sdk transport session restore', () => {
     });
   });
 
-  it('starts a fresh codex thread after restoring a transport session from persisted running state', async () => {
+  // A daemon restart while a codex session is mid-turn must not cost the
+  // conversation. This used to start a fresh thread whenever the persisted state
+  // was 'running' -- i.e. on every restart during activity -- and a live Brain
+  // lost a multi-megabyte working thread that resumed perfectly when pointed back
+  // at it by hand. What the restore must still guarantee is the part that fixed
+  // the original 211 deadlock: the restored runtime settles idle, never stuck
+  // 'running'. A thread that genuinely cannot continue is handled at the provider
+  // (active-writer conflict, unreadable or never-materialized history).
+  it('resumes the same codex thread, settled idle, after restoring a transport session from persisted running state', async () => {
     const persistedRecords: Array<Record<string, any> | null> = [];
     setSessionPersistCallback(async (record) => {
       persistedRecords.push(record);
@@ -2153,17 +2161,19 @@ describe('sdk transport session restore', () => {
 
     const runtime = getTransportRuntime('deck_sub_sdk_stale_running');
     expect(runtime?.getStatus()).toBe('idle');
-    expect(runtime?.providerSessionId).not.toBe('route-cx-stale-running');
+    // Resumed like any other restore: it rebinds the persisted route.
+    expect(runtime?.providerSessionId).toBe('route-cx-stale-running');
     expect(mocks.store.get('deck_sub_sdk_stale_running')?.state).toBe('idle');
-    expect(mocks.store.get('deck_sub_sdk_stale_running')?.codexSessionId).toBeUndefined();
-    expect(mocks.store.get('deck_sub_sdk_stale_running')?.startupMemoryInjected).toBeUndefined();
-    expect(mocks.store.get('deck_sub_sdk_stale_running')?.recentInjectionHistory).toBeUndefined();
-    expect(mocks.store.get('deck_sub_sdk_stale_running')?.summarySyncFingerprints).toBeUndefined();
+    // The conversation survives the restart: same thread, and the memory that
+    // thread already carries is not re-injected as if it were new.
+    expect(mocks.store.get('deck_sub_sdk_stale_running')?.codexSessionId).toBe('codex-thread-stale-running');
+    expect(mocks.store.get('deck_sub_sdk_stale_running')?.startupMemoryInjected).toBe(true);
+    expect(mocks.store.get('deck_sub_sdk_stale_running')?.recentInjectionHistory).toEqual([['memory-old']]);
     expect(persistedRecords.at(-1)).toMatchObject({
       name: 'deck_sub_sdk_stale_running',
       state: 'idle',
-      codexSessionId: undefined,
-      startupMemoryInjected: undefined,
+      codexSessionId: 'codex-thread-stale-running',
+      startupMemoryInjected: true,
     });
     expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
       'deck_sub_sdk_stale_running',
@@ -2191,14 +2201,15 @@ describe('sdk transport session restore', () => {
       label: 'Renamed while restored runtime stays attached',
     });
     runtime!.send('continue after daemon restart');
-    await settleCodexRun('deck_sub_sdk_stale_running', 'start', 'continue after daemon restart');
+    await settleCodexRun('deck_sub_sdk_stale_running', 'resume', 'continue after daemon restart');
 
-    expect(codexRunForSession('deck_sub_sdk_stale_running', 'resume')).toBeUndefined();
-    expect(codexRunForSession('deck_sub_sdk_stale_running', 'start')).toMatchObject({
-      mode: 'start',
+    expect(codexRunForSession('deck_sub_sdk_stale_running', 'start'), 'the interrupted thread must not be abandoned').toBeUndefined();
+    expect(codexRunForSession('deck_sub_sdk_stale_running', 'resume')).toMatchObject({
+      mode: 'resume',
+      id: 'codex-thread-stale-running',
       input: 'continue after daemon restart',
     });
-    expect(mocks.store.get('deck_sub_sdk_stale_running')?.codexSessionId).toBe('thread-restored');
+    expect(mocks.store.get('deck_sub_sdk_stale_running')?.codexSessionId).toBe('codex-thread-stale-running');
     expect(mocks.store.get('deck_sub_sdk_stale_running')?.label).toBe('Renamed while restored runtime stays attached');
   });
 

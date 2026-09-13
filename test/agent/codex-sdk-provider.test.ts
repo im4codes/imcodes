@@ -99,6 +99,18 @@ const childProcessMock = vi.hoisted(() => {
                   message: 'failed to read thread: thread-store internal error: failed to load thread history: stream did not contain valid UTF-8',
                 },
               });
+            } else if (msg.params?.threadId === 'thread-never-materialized') {
+              // Verbatim codex app-server answer for a thread that was started but
+              // never ran a turn, so no rollout was ever written.
+              childRecord.emits({
+                id: msg.id,
+                error: { message: 'no rollout found for thread id thread-never-materialized' },
+              });
+            } else if (msg.params?.threadId === 'thread-rollout-permission-denied') {
+              childRecord.emits({
+                id: msg.id,
+                error: { message: 'failed to open rollout for thread id thread-rollout-permission-denied: permission denied' },
+              });
             } else if (msg.params?.threadId === 'thread-malformed') {
               childRecord.child.stdout.write(`{"id":${msg.id},"result":{"thread":{"id":"${'x'.repeat(100_000)}\n`);
             } else {
@@ -2310,6 +2322,65 @@ describe('CodexSdkProvider', () => {
     expect(methods.filter((m) => m === 'turn/start').length).toBe(1);
   });
 
+  // Real codex-cli 0.144.1 -- the version this repository's lockfile pins --
+  // answers mcpServerStatus/list(detail: toolsAndAuthOnly) WITHOUT any
+  // runtimeStatus field. Shape captured from a live daemon, where it refused
+  // EVERY restored codex Brain turn with "authoritative IM delegation
+  // unavailable" although the server was up with both delegation tools; a
+  // Brain whose post-restore fresh thread never started was then left with no
+  // rollout and could not be resumed at all. The mocks above always carried
+  // runtimeStatus, which is why nothing noticed.
+  const statuslessEntry = {
+    name: 'imcodes-memory',
+    serverInfo: { name: 'imcodes-memory', version: '1.0.0' },
+    tools: { send_list_targets: {}, send_message: {}, supervision_task_start: {} },
+    resources: [],
+    resourceTemplates: [],
+    authStatus: 'unsupported',
+  };
+
+  it('starts a Brain turn for the real status-less inventory when the handshake completed with the exact tools', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'c1-statusless-ok', cwd: '/tmp/project' });
+    mcpStatusPages = [{ data: [statuslessEntry], nextCursor: null }];
+
+    await provider.send('c1-statusless-ok', brainPayload('c1-statusless-ok'));
+
+    const methods = childProcessMock.children[0]!.requests.map((request) => request.method);
+    expect(methods).toContain('mcpServerStatus/list');
+    expect(methods.filter((method) => method === 'turn/start')).toHaveLength(1);
+  });
+
+  const { serverInfo: _omittedServerInfo, ...statuslessWithoutHandshake } = statuslessEntry;
+  for (const [label, entry] of [
+    // No serverInfo means no initialize response: the server never came up.
+    ['status-less and never initialized', statuslessWithoutHandshake],
+    // The tool rule is independent of how connection is proven.
+    ['status-less without send_message', { ...statuslessEntry, tools: { send_list_targets: {} } }],
+    // An explicit status always wins; a handshake beside it proves nothing.
+    ['explicit starting status beside a handshake', { ...statuslessEntry, runtimeStatus: 'starting' }],
+    ['explicit failed status beside a handshake', { ...statuslessEntry, runtimeStatus: 'failed' }],
+  ] as const) {
+    it(`still refuses a Brain turn when delegation is not proven (${label})`, async () => {
+      const provider = createCodexProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      const key = `c1-statusless-${label.replace(/\W+/g, '-')}`;
+      await provider.createSession({ sessionKey: key, cwd: '/tmp/project' });
+      // The same shape on the re-check after reload, so the refusal is caused by
+      // the shape and not by the mock running out of inventory pages.
+      const page = { data: [entry], nextCursor: null };
+      mcpStatusPages = [page, page];
+
+      await expect(provider.send(key, brainPayload(key)))
+        .rejects.toThrow(/authoritative IM delegation unavailable/);
+
+      const methods = childProcessMock.children[0]!.requests.map((request) => request.method);
+      expect(methods, 'the gate must consult the authoritative inventory').toContain('mcpServerStatus/list');
+      expect(methods, 'an unproven inventory must never reach turn/start').not.toContain('turn/start');
+    });
+  }
+
   it('reloads and rehydrates the same Brain session once when authoritative IM delegation recovers', async () => {
     const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
@@ -3914,6 +3985,52 @@ describe('CodexSdkProvider', () => {
     expect(turnReq?.params?.threadId).toBe('thread-1');
     expect(errors).toEqual([]);
     expect(sessionInfo).toContainEqual({ resumeId: 'thread-1' });
+  });
+
+  // Field incident: an interrupted restore started a fresh thread, and that
+  // thread's first turn was refused before turn/start, so codex never wrote its
+  // rollout. The stored id then answered every resume with "no rollout found"
+  // and the session could not run again until someone edited it by hand.
+  // A thread with no rollout has no history to lose: replace it.
+  it('starts a replacement thread when the stored thread never materialized a rollout', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-no-rollout', cwd: '/tmp/project', resumeId: 'thread-never-materialized' });
+
+    const errors: string[] = [];
+    const sessionInfo: Array<Record<string, unknown>> = [];
+    provider.onError((_sid, error) => errors.push(error.message));
+    provider.onSessionInfo?.((_sid, info) => sessionInfo.push(info as Record<string, unknown>));
+
+    await provider.send('route-no-rollout', 'hello after a thread that never ran');
+
+    const child = childProcessMock.children[0];
+    const resumeReq = child.requests.find((req) => req.method === 'thread/resume');
+    const startReq = child.requests.find((req) => req.method === 'thread/start');
+    const turnReq = child.requests.find((req) => req.method === 'turn/start');
+    expect(resumeReq?.params?.threadId).toBe('thread-never-materialized');
+    expect(startReq?.params?.cwd).toBe('/tmp/project');
+    expect(turnReq?.params?.threadId).toBe('thread-1');
+    expect(errors).toEqual([]);
+    expect(sessionInfo).toContainEqual({ resumeId: 'thread-1' });
+  });
+
+  it('still surfaces a rollout it cannot open instead of forking away from existing history', async () => {
+    // Control for the case above: the history may well exist here, so silently
+    // starting a replacement thread would abandon it.
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-rollout-denied', cwd: '/tmp/project', resumeId: 'thread-rollout-permission-denied' });
+
+    const errors: string[] = [];
+    provider.onError((_sid, error) => errors.push(error.message));
+    await provider.send('route-rollout-denied', 'hello');
+
+    expect(errors.some((message) => /permission denied/.test(message)), 'the failure must surface').toBe(true);
+    const methods = childProcessMock.children[0]!.requests.map((req) => req.method);
+    expect(methods).toContain('thread/resume');
+    expect(methods, 'an unopenable history must not be replaced').not.toContain('thread/start');
+    expect(methods).not.toContain('turn/start');
   });
 
   it('rejects a malformed thread/resume response immediately, replaces the thread, and logs only bounded metadata', async () => {

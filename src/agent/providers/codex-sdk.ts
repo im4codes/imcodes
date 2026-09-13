@@ -218,6 +218,25 @@ const CODEX_NATIVE_COLLAB_DURABILITY = 'non_durable';
 /** Exact IM MCP server and the tools a Brain needs to delegate authoritatively. */
 const IMCODES_DELEGATION_MCP_SERVER = IMCODES_MEMORY_MCP_SERVER_NAME;
 const IMCODES_DELEGATION_REQUIRED_TOOLS = ['send_list_targets', 'send_message'] as const;
+
+/**
+ * Whether one `mcpServerStatus/list` entry proves the IM.codes server connected.
+ *
+ * An explicit `runtimeStatus` is authoritative in both directions: only
+ * `connected` passes, and `starting`, `failed` or anything else fails closed
+ * however healthy the other fields look. codex-cli 0.144.1 -- the version this
+ * repository's lockfile pins -- omits `runtimeStatus` entirely for
+ * `detail: toolsAndAuthOnly`; there the completed MCP initialize handshake
+ * (`serverInfo`) is the proof. Requiring the field unconditionally refused every
+ * restored Brain turn on that version while the server was up with both tools.
+ * The exact-tools rule is applied separately, whichever proof was used.
+ */
+function imcodesDelegationServerConnected(server: Record<string, unknown>): boolean {
+  if (server.runtimeStatus !== undefined) {
+    return meaningfulString(server.runtimeStatus) === 'connected';
+  }
+  return isRecord(server.serverInfo);
+}
 /** Bounded pagination: this is one authoritative snapshot per turn, not polling. */
 const MCP_STATUS_PAGE_LIMIT = 20;
 const CODEX_MCP_RPC_METHOD = {
@@ -739,6 +758,24 @@ class CodexMalformedRpcResponseError extends Error {
     super(`Codex app-server returned malformed JSON for request ${method} (id ${requestId})`);
     this.name = 'CodexMalformedRpcResponseError';
   }
+}
+
+/**
+ * Codex's `thread/resume` answer for a thread that was started but never ran a
+ * turn: the rollout is written lazily on the first turn, so no history exists.
+ *
+ * A thread id is recorded as soon as `thread/start` returns, so any failure
+ * before the first `turn/start` leaves exactly this behind. Field incident: an
+ * interrupted restore started a fresh thread whose first turn was refused
+ * before turn/start; every later resume then failed with this message and the
+ * session could not run again until its record was edited by hand. Replacing
+ * such a thread loses nothing -- there is no history to lose.
+ *
+ * Deliberately exact: a rollout that EXISTS but cannot be opened is a different
+ * failure, and replacing that thread would silently abandon real history.
+ */
+function isCodexThreadNeverMaterializedError(err: unknown): boolean {
+  return /\bno rollout found for thread id\b/i.test(errorMessage(err));
 }
 
 function isCodexThreadHistoryUnreadableError(err: unknown): boolean {
@@ -3235,7 +3272,7 @@ export class CodexSdkProvider implements TransportProvider {
     if (!completed) throw new ImcodesDelegationUnavailableError();
 
     const server = servers.find((entry) => meaningfulString(entry.name) === IMCODES_DELEGATION_MCP_SERVER);
-    if (!server || meaningfulString(server.runtimeStatus) !== 'connected') {
+    if (!server || !imcodesDelegationServerConnected(server)) {
       throw new ImcodesDelegationUnavailableError();
     }
     const tools = isRecord(server.tools) ? server.tools : undefined;
@@ -3772,8 +3809,10 @@ export class CodexSdkProvider implements TransportProvider {
         state.lastInjectedSessionSystemText = sessionSystemText;
         return;
       } catch (err) {
-        if (!isCodexThreadHistoryUnreadableError(err)) throw err;
+        if (!isCodexThreadNeverMaterializedError(err) && !isCodexThreadHistoryUnreadableError(err)) throw err;
 
+        // A never-materialized thread names no rollout file, so the repair below
+        // finds nothing to repair and falls through to the replacement thread.
         const repaired = await this.repairUnreadableThreadHistory(err).catch((repairErr) => {
           logger.warn({ provider: this.id, sessionId, threadId: state.threadId, err: repairErr }, 'Codex SDK failed to repair unreadable thread history');
           return false;

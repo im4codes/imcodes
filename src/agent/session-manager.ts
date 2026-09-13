@@ -120,15 +120,6 @@ function storedProviderResumeIdOwners(providerId: string, resumeId: string): str
     .map((record) => record.name);
 }
 
-function shouldStartFreshCodexThreadAfterInterruptedRestore(
-  record: Pick<SessionRecord, 'providerId' | 'agentType' | 'state' | 'codexSessionId'>,
-): boolean {
-  return (record.providerId ?? record.agentType) === 'codex-sdk'
-    && record.state === 'running'
-    && typeof record.codexSessionId === 'string'
-    && record.codexSessionId.trim().length > 0;
-}
-
 function shouldAutoRelaunchTransportRuntimeAfterError(
   providerError: TransportSessionRuntime['lastProviderError'],
 ): boolean {
@@ -2656,9 +2647,13 @@ export async function restoreTransportSessions(
       });
       // After cancel, qwenFreshOnResume is set — don't resume the stuck conversation.
       const freshAfterCancel = !!(s.qwenFreshOnResume && s.providerId === 'qwen');
-      const freshAfterInterruptedCodexRestore = shouldStartFreshCodexThreadAfterInterruptedRestore(s);
+      // A codex session persisted as 'running' is RESUMED, not replaced: a restart
+      // during a turn used to discard the whole conversation for a fresh thread.
+      // A thread that genuinely cannot continue is handled where that is known --
+      // the provider replaces it on an active-writer conflict and on unreadable or
+      // never-materialized history -- and the restored runtime still settles idle.
       const freshQoderRestore = s.providerId === 'qoder-sdk';
-      const freshOnRestore = freshAfterCancel || freshAfterInterruptedCodexRestore || freshQoderRestore;
+      const freshOnRestore = freshAfterCancel || freshQoderRestore;
       const needsEphemeralRouteKey = s.providerId === 'claude-code-sdk'
         || s.providerId === 'codex-sdk'
         || s.providerId === 'qoder-sdk'
@@ -2667,19 +2662,11 @@ export async function restoreTransportSessions(
       const resumeId = s.providerId === 'claude-code-sdk'
         ? s.ccSessionId
         : s.providerId === 'codex-sdk'
-          ? (freshAfterInterruptedCodexRestore ? undefined : s.codexSessionId)
+          ? s.codexSessionId
           : usesProviderResumeId(s.providerId)
             ? s.providerResumeId
             : undefined;
-      const preserveStartupMemoryOnRestore = s.startupMemoryInjected === true && !freshAfterInterruptedCodexRestore;
-      if (freshAfterInterruptedCodexRestore) {
-        logger.warn({
-          session: s.name,
-          providerId: s.providerId,
-          previousCodexSessionId: s.codexSessionId,
-          previousProviderSessionId: s.providerSessionId,
-        }, 'Codex SDK restore found interrupted running session; starting fresh thread');
-      }
+      const preserveStartupMemoryOnRestore = s.startupMemoryInjected === true;
       if (freshQoderRestore) {
         logger.info({
           session: s.name,
@@ -2848,14 +2835,6 @@ export async function restoreTransportSessions(
         ...currentForFinalize,
         state: 'idle',
         updatedAt: Date.now(),
-        ...(freshAfterInterruptedCodexRestore
-          ? {
-              codexSessionId: undefined,
-              startupMemoryInjected: undefined,
-              recentInjectionHistory: undefined,
-              summarySyncFingerprints: undefined,
-            }
-          : {}),
         ...(freshOnRestore ? { summarySyncFingerprints: undefined } : {}),
         ...(freshQoderRestore
           ? { providerResumeId: undefined }
@@ -2928,7 +2907,6 @@ export async function restoreTransportSessions(
         providerId: s.providerId,
         providerSid: s.providerSessionId,
         freshAfterCancel,
-        freshAfterInterruptedCodexRestore,
       }, 'Restored transport session runtime');
 
       // Drain messages that arrived while the provider was offline. The
