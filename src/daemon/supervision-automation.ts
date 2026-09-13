@@ -1608,7 +1608,7 @@ class SupervisionAutomation {
         // worker has no authority to clear it, so another heartbeat cannot
         // produce progress -- it only burns quota and hides the blocker behind
         // reminder noise. Leave the single blocker standing instead.
-        if (normalizeBlockerText(assignment.blocker)) continue;
+        if (normalizeBlockerText(assignment.blocker) || normalizeBlockerText(task.blocker)) continue;
         const assignmentEvents = events.filter((event) => event.assignmentId === assignment.assignmentId);
         // While work is only delegated, runtime identity repair is
         // observational rather than substantive implementation progress. Use

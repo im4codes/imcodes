@@ -2733,6 +2733,10 @@ export interface ReadyAuditDispatchDeps {
     | Promise<import('./supervision-worktree-inspector.js').SupervisionWorktreeSnapshot | undefined>;
   /** Test seam for the existing bounded, persistent housekeeping scheduler. */
   runScheduledWorktreeGcBatch?: (now: number) => Promise<unknown>;
+  /** Test/host seam for exact immutable-bundle integration provisioning. */
+  ensureIntegrationWorktree?: typeof defaultEnsureSupervisionAssignmentWorktree;
+  /** Test seam; production always applies through the verified bundle helper. */
+  applyIntegrationBundle?: typeof applySupervisionIntegrationBundle;
 }
 
 function automaticAuditAttemptId(taskId: string, revision: string): string {
@@ -4069,6 +4073,39 @@ export async function dispatchReadyIntegration(
   ));
   if (existingOwners.length > 1) return { status: 'blocked', reason: 'multiple live integration owners', reported: false };
   let owner = existingOwners[0];
+  // Task snapshots intentionally omit terminal assignments. Resolve the
+  // persisted pointer through the registry so a cancelled historical owner is
+  // recovered in place instead of becoming invisible and causing a replacement
+  // owner to be minted.
+  const pointedOwner = task.integrationOwnerAssignmentId
+    ? registry.getAssignment(task.integrationOwnerAssignmentId)
+    : undefined;
+  const staleOwnerPointer = pointedOwner?.taskId === task.taskId
+    && pointedOwner.role === 'integration_owner'
+    && pointedOwner.status === 'cancelled'
+    ? pointedOwner
+    : undefined;
+  if (!owner && staleOwnerPointer) {
+    const recovered = registry.recoverCancelledIntegrationOwner({
+      taskId: task.taskId,
+      assignmentId: staleOwnerPointer.assignmentId,
+      identity: coordinator.identity,
+      expectedRevision: revision,
+      expectedAttemptId: implementer.auditAttemptId!,
+      expectedGeneration: staleOwnerPointer.generation,
+      scopeFiles: integrationArtifact.files.map((file) => file.path),
+      reason: 'materialize the exact current PASS on the same historical integration owner',
+      now: (deps.now ?? Date.now)(),
+    });
+    if (!recovered.ok) {
+      return {
+        status: 'blocked',
+        reason: `integration owner recovery rejected: ${recovered.reason}`,
+        reported: false,
+      };
+    }
+    owner = recovered.value;
+  }
   if (!owner) {
     const created = registry.createAssignment({
       taskId: task.taskId,
@@ -4086,11 +4123,11 @@ export async function dispatchReadyIntegration(
   }
   let integrationWorktree: string | undefined;
   if (integrationArtifact.bundle) {
-    const ensured = await defaultEnsureSupervisionAssignmentWorktree({
+    const ensured = await (deps.ensureIntegrationWorktree ?? defaultEnsureSupervisionAssignmentWorktree)({
       projectRoot: brain.projectDir,
       sessionName: brain.name,
       assignmentId: owner.assignmentId,
-      baseRevision: task.baseRevision ?? integrationArtifact.bundle.headSha,
+      baseRevision: integrationArtifact.bundle.headSha,
     });
     if (!ensured.ok) {
       return {
@@ -4099,7 +4136,7 @@ export async function dispatchReadyIntegration(
         reported: false,
       };
     }
-    const applied = applySupervisionIntegrationBundle({
+    const applied = (deps.applyIntegrationBundle ?? applySupervisionIntegrationBundle)({
       bundle: integrationArtifact.bundle,
       worktreePath: ensured.worktreePath,
     });
@@ -4160,7 +4197,7 @@ export async function dispatchReadyIntegration(
       'Exact pathspec:',
       ...integrationArtifact.files.map((file) => `- ${file.path}`),
       '',
-      'Integrate only the verified bundle bytes already materialized in the prepared integration worktree. Record real commit/push evidence; if already present, record that fact. CI is optional smoke only: record ci_not_configured or ci_unavailable without dummy run ids, and record pending/failure/success only for an exact current-commit observation. Never poll, monitor, or let CI control finalization. Never stage openspec/ or docs/.',
+      'Before any Git side effect, call supervision_integration_preflight with this exact task/revision/attempt/owner and destination ref; retain its preflightToken. Integrate only the verified bundle bytes already materialized in the prepared integration worktree. Record real commit/push evidence; if recovering an exact verified bundle commit that is already reachable from that ref, use already_present without repeating Git and the pre-Git token may be omitted. Otherwise call supervision_integration_finalize once with the same metadata and preflightToken. Field-level refusals are recoverable inputs, not a request for Brain to guess an extra task_finish. CI is optional smoke only: record ci_not_configured or ci_unavailable without dummy run ids, and record pending/failure/success only for an exact current-commit observation. Never poll, monitor, or let CI control finalization. Never stage openspec/ or docs/.',
     ].join('\n'),
     idempotencyKey: `auto-integration:${task.taskId}:${revision}`,
     internalMessageId: messageId,
