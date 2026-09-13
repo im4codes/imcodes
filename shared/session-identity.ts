@@ -13,9 +13,9 @@ export const SESSION_IDENTITY_SCOPE_LIST = Object.freeze(
   Object.values(SESSION_IDENTITY_SCOPES),
 ) as readonly SessionIdentityScope[];
 
-export const SESSION_IDENTITY_USER_MAX_CHARS = 20_000;
-export const SESSION_IDENTITY_PROJECT_MAX_CHARS = 60_000;
-export const SESSION_IDENTITY_SESSION_MAX_CHARS = 100_000;
+export const SESSION_IDENTITY_USER_MAX_CHARS = 50_000;
+export const SESSION_IDENTITY_PROJECT_MAX_CHARS = 100_000;
+export const SESSION_IDENTITY_SESSION_MAX_CHARS = 200_000;
 /** Backward-compatible alias for the largest single profile (session scope). */
 export const SESSION_IDENTITY_MAX_CHARS = SESSION_IDENTITY_SESSION_MAX_CHARS;
 export const SESSION_IDENTITY_MAX_CHARS_BY_SCOPE: Readonly<Record<SessionIdentityScope, number>> = Object.freeze({
@@ -30,6 +30,20 @@ export const SESSION_IDENTITY_MAX_CHARS_BY_SCOPE: Readonly<Record<SessionIdentit
  * plus an optional BOM.
  */
 export const SESSION_IDENTITY_SOURCE_FILE_MAX_BYTES = SESSION_IDENTITY_SESSION_MAX_CHARS * 4 + 3;
+/**
+ * Largest identity contract a single session can carry once every scope is
+ * filled. Providers with a fixed context budget size their priority-aware
+ * truncation from this rather than from any one scope.
+ */
+export const SESSION_IDENTITY_COMBINED_MAX_CHARS = SESSION_IDENTITY_USER_MAX_CHARS
+  + SESSION_IDENTITY_PROJECT_MAX_CHARS
+  + SESSION_IDENTITY_SESSION_MAX_CHARS;
+/**
+ * Delimiters of the rendered identity block. Providers never search composed text
+ * for these; the trusted identity span is recorded structurally at composition.
+ */
+export const SESSION_IDENTITY_BLOCK_OPEN_TAG = '<imcodes-agent-identity>';
+export const SESSION_IDENTITY_BLOCK_CLOSE_TAG = '</imcodes-agent-identity>';
 export const SESSION_IDENTITY_SCOPE_KEY_MAX_CHARS = 512;
 export const SESSION_IDENTITY_SOURCE_FILE_MAX_CHARS = 1_024;
 export const SESSION_IDENTITY_API_PATH = '/api/session-identities';
@@ -65,6 +79,15 @@ export function normalizeSessionIdentityContent(value: string): string {
   return value.normalize('NFC').trim();
 }
 
+/**
+ * The one authoritative identity length: Unicode code points of the NFC-normalized,
+ * trimmed content. Write gates, persistence and every UI counter use this, so a
+ * displayed count can never disagree with what a gate accepts.
+ */
+export function sessionIdentityContentLength(value: string): number {
+  return Array.from(normalizeSessionIdentityContent(value)).length;
+}
+
 export function sessionIdentityMaxChars(scope: SessionIdentityScope): number {
   return SESSION_IDENTITY_MAX_CHARS_BY_SCOPE[scope];
 }
@@ -76,7 +99,7 @@ export function sessionIdentityContentError(
   if (typeof value !== 'string') return 'identity_content_required';
   const normalized = normalizeSessionIdentityContent(value);
   if (!normalized) return 'identity_content_required';
-  if (Array.from(normalized).length > sessionIdentityMaxChars(scope)) return 'identity_content_too_large';
+  if (sessionIdentityContentLength(normalized) > sessionIdentityMaxChars(scope)) return 'identity_content_too_large';
   if (normalized.includes('\0')) return 'identity_content_invalid';
   return null;
 }
@@ -103,13 +126,13 @@ export function renderSessionIdentityProfiles(
     .filter(Boolean);
   if (parts.length === 0) return undefined;
   return [
-    '<imcodes-agent-identity>',
+    SESSION_IDENTITY_BLOCK_OPEN_TAG,
     'The following user-authored identity contract is deterministic and scope-ordered. Later sections override conflicting earlier sections. The user\'s latest explicit instruction overrides every conflicting identity section and other IM.codes-authored contract text. Platform system/developer instructions, security boundaries, and tool authority remain higher priority.',
     ...ordered.flatMap((profile) => {
       const section = renderSessionIdentityProfileSection(profile.scope, profile.content);
       return section ? section.split('\n') : [];
     }),
-    '</imcodes-agent-identity>',
+    SESSION_IDENTITY_BLOCK_CLOSE_TAG,
   ].join('\n');
 }
 

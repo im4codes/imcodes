@@ -7,6 +7,12 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { vi } from 'vitest';
 import { markSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
+import {
+  SESSION_IDENTITY_PROJECT_MAX_CHARS,
+  SESSION_IDENTITY_SESSION_MAX_CHARS,
+  SESSION_IDENTITY_USER_MAX_CHARS,
+  renderSessionIdentityProfiles,
+} from '../../shared/session-identity.js';
 
 // This suite exercises the real persistence module. `vi.unmock` is hoisted by
 // Vitest, so it clears any worker-inherited session-store mock BEFORE module
@@ -21,6 +27,7 @@ const execFileAsync = promisify(execFile);
 async function loadStoreInFreshProcess(sessionName: string): Promise<{
   sessionInstanceId?: string;
   runtimeEpoch?: string;
+  identityPrompt?: string;
 }> {
   const resultMarker = '__IMCODES_SESSION_STORE_RESULT__';
   const moduleUrl = new URL('../../src/store/session-store.ts', import.meta.url).href;
@@ -64,6 +71,11 @@ async function loadStoreInFreshProcess(sessionName: string): Promise<{
       script,
     ], {
       cwd: process.cwd(),
+      // The child prints the whole restored session record. A session carrying a
+      // filled three-scope identity is legitimately larger than Node's 1 MiB
+      // default, which would otherwise surface as a harness failure rather than
+      // a persistence result.
+      maxBuffer: 64 * 1024 * 1024,
       env: {
         ...process.env,
         HOME: tempDir,
@@ -116,6 +128,7 @@ async function loadStoreInFreshProcess(sessionName: string): Promise<{
   return payload.session as {
     sessionInstanceId?: string;
     runtimeEpoch?: string;
+    identityPrompt?: string;
   };
 }
 
@@ -264,6 +277,32 @@ describe('session-store', () => {
       } finally {
         vi.doUnmock('node:fs/promises');
       }
+    });
+
+    it('restores a filled three-scope multibyte identity byte-for-byte in a fresh process', async () => {
+      const profile = (scope: 'user' | 'project' | 'session', content: string) => ({
+        scope, scopeKey: scope === 'user' ? '' : `${scope}-key`, content, contentHash: scope, revision: 1, updatedAt: 1, source: 'web' as const,
+      });
+      const identityPrompt = renderSessionIdentityProfiles([
+        profile('user', `${'中'.repeat(SESSION_IDENTITY_USER_MAX_CHARS - 2)}\n!`),
+        profile('project', `${'😀'.repeat(SESSION_IDENTITY_PROJECT_MAX_CHARS - 2)}\n!`),
+        profile('session', `${'é'.repeat(SESSION_IDENTITY_SESSION_MAX_CHARS - 2)}\n!`),
+      ])!;
+      await writeSessionsFixture({
+        sessions: {
+          deck_identitycap_brain: {
+            name: 'deck_identitycap_brain', projectName: 'identitycap', role: 'brain',
+            agentType: 'codex-sdk', projectDir: '/tmp/identitycap',
+            state: 'idle', restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1,
+            identityPrompt,
+          },
+        },
+      });
+
+      const restored = await loadStoreInFreshProcess('deck_identitycap_brain');
+
+      expect(restored.identityPrompt).toBe(identityPrompt);
+      expect(Array.from(restored.identityPrompt ?? '').length).toBe(Array.from(identityPrompt).length);
     });
 
     it('reports child and disk evidence when a fresh process cannot find the requested session', async () => {
@@ -555,3 +594,4 @@ describe('session-store', () => {
     expect(raw).toContain('deck_cd_brain');
   });
 });
+

@@ -15,6 +15,13 @@ import { VERIFICATION_MACHINE_MCP_TOOLS } from '../../shared/verification-machin
 import { ALIAS_MCP_TOOLS } from '../../shared/alias-types.js';
 import { MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
 import { AUDIT_CONVERGENCE_CONTRACT_ID } from '../../shared/audit-convergence.js';
+import {
+  SESSION_IDENTITY_PROJECT_MAX_CHARS as ID_PROJECT_MAX,
+  SESSION_IDENTITY_SESSION_MAX_CHARS as ID_SESSION_MAX,
+  SESSION_IDENTITY_USER_MAX_CHARS as ID_USER_MAX,
+  renderSessionIdentityProfiles as renderIdentityProfilesForAssembly,
+} from '../../shared/session-identity.js';
+import { compileAgentContextArtifact as compileArtifactForIdentity } from '../../src/agent/transport-runtime-assembly.js';
 
 function makeProvider(
   contextSupport: NonNullable<TransportProvider['capabilities']['contextSupport']>,
@@ -891,5 +898,23 @@ describe('buildProviderContextPayload', () => {
       expect(memoryIdx).toBeGreaterThan(realDeviceIdx);
       expect(progressIdx).toBeGreaterThan(memoryIdx);
     });
+  });
+});
+
+describe('identity through provider-neutral assembly', () => {
+  it('carries a filled three-scope identity into the stable system text without truncation', () => {
+    // Only the Codex adapter owns a context budget; the shared assembly that
+    // every other provider consumes must never shorten the identity.
+    const profile = (scope: 'user' | 'project' | 'session', content: string) => ({
+      scope, scopeKey: scope === 'user' ? '' : `${scope}-key`, content, contentHash: scope, revision: 1, updatedAt: 1, source: 'web' as const,
+    });
+    const identityPrompt = renderIdentityProfilesForAssembly([
+      profile('user', 'U'.repeat(ID_USER_MAX)),
+      profile('project', 'P'.repeat(ID_PROJECT_MAX)),
+      profile('session', 'S'.repeat(ID_SESSION_MAX)),
+    ])!;
+    const artifact = compileArtifactForIdentity({ userMessage: 'continue', identityPrompt });
+    expect(artifact.sessionSystemText).toContain(identityPrompt);
+    expect(artifact.systemText).toContain(identityPrompt);
   });
 });

@@ -36,7 +36,7 @@ import type { TransportAttachment } from '../../../shared/transport-attachments.
 import { DEFAULT_TRANSPORT_EFFORT, QWEN_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import logger from '../../util/logger.js';
 import { inferContextWindow } from '../../util/model-context.js';
-import { composeProviderSystemText, getProviderSystemTextParts } from '../provider-context-routing.js';
+import { composeProviderSystemText, getProviderSystemTextParts, composeProviderSystemTextSpanned } from '../provider-context-routing.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
 import {
   SESSION_CONTROL_METADATA_COMMAND_FIELD,
@@ -67,6 +67,36 @@ import {
   type SdkSubagentDiagnosticCode,
   type SdkSubagentNormalizedStatus,
 } from '../../../shared/sdk-subagent-status.js';
+import { capContextPreservingPriority, type PriorityPreservingCapMarkers, type SpannedText } from '../priority-preserving-context-cap.js';
+
+/**
+ * Linux caps each single argv string at MAX_ARG_STRLEN = 32 pages = 131072 bytes,
+ * including its terminating NUL. The qwen CLI only accepts the system prompt as
+ * the `--append-system-prompt` string argument (it has no file or stdin form), so
+ * an over-limit prompt makes spawn fail with E2BIG before qwen ever runs.
+ */
+export const LINUX_MAX_ARG_STRLEN_BYTES = 131_072;
+
+/**
+ * Byte budget for `--append-system-prompt`. Kept well under MAX_ARG_STRLEN so the
+ * argument stays spawnable on Linux and leaves headroom within macOS's combined
+ * argv+environment ARG_MAX alongside the prompt and the remaining arguments.
+ */
+export const QWEN_APPEND_SYSTEM_PROMPT_MAX_BYTES = 120_000;
+
+const QWEN_SYSTEM_PROMPT_CAP_MARKERS: PriorityPreservingCapMarkers = {
+  identityTruncated: (bodyBytes, maxBytes) => `\n[IM.codes: agent identity truncated from ${bodyBytes} bytes to fit the ${maxBytes}-byte qwen argument limit; IM.codes system and supervision instructions were preserved.]\n`,
+  contextTruncated: (bytes, maxBytes) => `\n\n[IM.codes: system prompt truncated from ${bytes} to ${maxBytes} bytes to fit the qwen argument limit.]`,
+};
+
+/**
+ * Deterministic, byte-safe, priority-preserving cap for the qwen system prompt.
+ * Overflow is spent on the user-authored identity block first, so IM.codes system,
+ * security and supervision instructions are never displaced by a large identity.
+ */
+export function capQwenAppendSystemPrompt(prompt: SpannedText | string): string {
+  return capContextPreservingPriority(prompt, QWEN_APPEND_SYSTEM_PROMPT_MAX_BYTES, 'utf8', QWEN_SYSTEM_PROMPT_CAP_MARKERS);
+}
 
 const execFileAsync = promisify(execFile);
 const QWEN_BIN = 'qwen';
@@ -873,15 +903,17 @@ export class QwenProvider implements TransportProvider {
     const systemParts = getProviderSystemTextParts(providerPayload);
     const sessionSystemText = systemParts.sessionSystemText;
     const includeSessionSystemText = !isCompactControl && !!sessionSystemText && state.sessionSystemTextInjected !== sessionSystemText;
-    const effectivePrompt = isCompactControl
+    // The identity boundary travels structurally from assembly; it is never
+    // rediscovered in this string, which also carries authored turn context.
+    const effectivePrompt: SpannedText | string | undefined = isCompactControl
       ? undefined
       : (
           systemParts.hasSplitSystemText
-            ? composeProviderSystemText(providerPayload, { includeSession: includeSessionSystemText, includeTurn: true })
-            : (composeProviderSystemText(providerPayload) || state.description?.trim())
+            ? composeProviderSystemTextSpanned(providerPayload, { includeSession: includeSessionSystemText, includeTurn: true })
+            : (composeProviderSystemTextSpanned(providerPayload) || state.description?.trim())
         );
-    if (effectivePrompt) {
-      args.push('--append-system-prompt', effectivePrompt);
+    if (effectivePrompt && (typeof effectivePrompt === 'string' ? effectivePrompt : effectivePrompt.text)) {
+      args.push('--append-system-prompt', capQwenAppendSystemPrompt(effectivePrompt));
     }
     if (state.model) {
       args.push('--model', state.model);

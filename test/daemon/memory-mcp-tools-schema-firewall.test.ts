@@ -13,6 +13,7 @@ import {
   MEMORY_MCP_TOOL_NAMES,
 } from '../../shared/memory-mcp-contracts.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
+import { SESSION_IDENTITY_SESSION_MAX_CHARS } from '../../shared/session-identity.js';
 import { buildSupervisionExecutionCapabilityId } from '../../shared/supervision-execution-pool.js';
 import { SUPERVISION_TASK_AUDIT_POLICIES } from '../../shared/supervision-config.js';
 import { createMemoryMcpServer } from '../../src/daemon/memory-mcp-server.js';
@@ -1750,5 +1751,68 @@ describe('memory MCP tool schema firewall', () => {
 
     expect(cronCreate.mock.calls[0][0]).toMatchObject({ name: '', cronExpr: '' });
     expect(cronList.mock.calls[0][0]).toEqual({ projectName: 'proj', limit: 5 });
+  });
+});
+
+describe('send_message identity ingress limit', () => {
+  // The MCP ingress rejects an oversized identity before anything is dispatched.
+  // send-tool validates again downstream, so this pins the earlier boundary and
+  // its exact contract rather than merely "rejected somewhere".
+  function handlersFor(root: string) {
+    const self = sessionRecord({ projectDir: root });
+    const dispatchMessage = vi.fn();
+    const handlers = createMemoryMcpToolHandlers(caller({ projectRoot: root }), {
+      sendDeps: { listSessions: () => [self], dispatchMessage },
+    });
+    return { handlers, dispatchMessage };
+  }
+
+  it('rejects an inline identity one code point over the session limit at ingress', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'imc-identity-ingress-'));
+    try {
+      const { handlers, dispatchMessage } = handlersFor(root);
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]({
+        message: 'spawn', idempotencyKey: 'ingress-inline-over', task: { autoProvision: true },
+        identity: { content: 'a'.repeat(SESSION_IDENTITY_SESSION_MAX_CHARS + 1) },
+      })).resolves.toMatchObject({
+        status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, message: 'identity is invalid',
+      });
+      expect(dispatchMessage).not.toHaveBeenCalled();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an identity file one code point over the session limit at ingress', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'imc-identity-ingress-file-'));
+    try {
+      // ASCII, so the file stays under the byte pre-read bound and only the
+      // character limit can reject it.
+      writeFileSync(join(root, 'oversized.md'), 'a'.repeat(SESSION_IDENTITY_SESSION_MAX_CHARS + 1), 'utf8');
+      const { handlers, dispatchMessage } = handlersFor(root);
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]({
+        message: 'spawn', idempotencyKey: 'ingress-file-over', task: { autoProvision: true },
+        identity: { filePath: 'oversized.md' },
+      })).resolves.toMatchObject({
+        status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, message: 'identity is invalid',
+      });
+      expect(dispatchMessage).not.toHaveBeenCalled();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not reject an identity at exactly the session limit at ingress', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'imc-identity-ingress-limit-'));
+    try {
+      const { handlers } = handlersFor(root);
+      const result = await handlers[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]({
+        message: 'spawn', idempotencyKey: 'ingress-inline-limit', task: { autoProvision: true },
+        identity: { content: 'a'.repeat(SESSION_IDENTITY_SESSION_MAX_CHARS) },
+      }) as { message?: string };
+      expect(result.message).not.toBe('identity is invalid');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

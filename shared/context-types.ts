@@ -124,9 +124,30 @@ export interface TransportMemoryRecallArtifact {
   sourceKind?: MemoryRecallSourceKind;
 }
 
+/**
+ * Where the user-authored identity body sits inside a composed prompt string.
+ *
+ * The span is recorded by the code that composes the string, from the known
+ * lengths of the parts it joined. It is never recovered by searching the text:
+ * the composed string also contains user-authored description and authored turn
+ * context, which may contain forged identity delimiters. `sha256` binds the span to
+ * the exact identity body bytes, so a span that no longer lines up with its text
+ * (for example after any intermediate rewrite) is rejected instead of trusted.
+ */
+export interface IdentitySegmentSpan {
+  /** UTF-16 offset of the first identity-body code unit. */
+  start: number;
+  /** UTF-16 offset just past the identity body. */
+  end: number;
+  /** Lowercase hex SHA-256 of `text.slice(start, end)` as UTF-8. */
+  sha256: string;
+}
+
 export interface CompiledAgentContextArtifact {
   /** Stable instructions that can be attached once per provider session/thread. */
   sessionSystemText?: string;
+  /** Structured position of the identity body inside `sessionSystemText`. */
+  sessionSystemTextIdentity?: IdentitySegmentSpan;
   /** Instructions that may vary per turn, such as authored context selected by file/language. */
   turnSystemText?: string;
   /**

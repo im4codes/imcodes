@@ -29,6 +29,7 @@ import {
 import { SUPERVISION_MCP_TOOLS } from '../../shared/supervision-mcp-tools.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 import { freezeSupervisionIntegrationBundle } from '../../src/daemon/supervision-integration-bundle.js';
+import { SESSION_IDENTITY_SESSION_MAX_CHARS } from '../../shared/session-identity.js';
 
 function session(overrides: Partial<SessionRecord> & Pick<SessionRecord, 'name' | 'projectName' | 'role'>): SessionRecord {
   return {
@@ -1455,5 +1456,30 @@ describe('send-tool', () => {
       status: 'error',
       reason: 'validation_failed',
     });
+  });
+});
+
+describe('send-tool auto-provision identity limit', () => {
+  const brain = session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain' });
+
+  it('rejects an auto-provision identity one code point over the session limit before dispatch', async () => {
+    const dispatchMessage = vi.fn();
+    await expect(dispatchSendMessage(caller, {
+      message: 'spawn a worker', idempotencyKey: 'identity-over-limit',
+      task: { autoProvision: true },
+      identity: { content: '😀'.repeat(SESSION_IDENTITY_SESSION_MAX_CHARS + 1) },
+    } as never, { listSessions: () => [brain], dispatchMessage })).resolves.toMatchObject({
+      status: 'error', error: 'identity_content_too_large',
+    });
+    expect(dispatchMessage).not.toHaveBeenCalled();
+  });
+
+  it('lets an identity at exactly the session limit through the identity gate', async () => {
+    const result = await dispatchSendMessage(caller, {
+      message: 'spawn a worker', idempotencyKey: 'identity-at-limit',
+      task: { autoProvision: true },
+      identity: { content: '😀'.repeat(SESSION_IDENTITY_SESSION_MAX_CHARS) },
+    } as never, { listSessions: () => [brain], dispatchMessage: vi.fn() }) as { error?: string };
+    expect(result.error).not.toBe('identity_content_too_large');
   });
 });

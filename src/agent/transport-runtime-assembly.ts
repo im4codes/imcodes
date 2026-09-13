@@ -39,6 +39,7 @@ import { buildAuditConvergenceContract } from '../../shared/audit-convergence.js
 /** Stable text: rendered once, registered in every managed session's system prompt. */
 const AUDIT_CONVERGENCE_SYSTEM_CONTRACT = buildAuditConvergenceContract();
 import type { SessionRecord } from '../store/session-store.js';
+import { identitySpanForSegment, joinSpanned } from './priority-preserving-context-cap.js';
 
 export interface TransportRuntimeAssemblyInput {
   userMessage: string;
@@ -426,19 +427,27 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
         input.sessionIdentity.label ?? undefined,
       )
     : undefined;
-  const sessionSystemText = [
+  // The identity span is recorded here, from the lengths of the parts being
+  // joined, so providers with a context budget can shrink exactly the identity
+  // body. It must never be recovered later by searching this string: the
+  // description, system prompt and authored turn context are user-authored and may
+  // contain forged identity delimiters.
+  const identitySegment = input.identityPrompt?.trim();
+  const composedSessionSystemText = joinSpanned([
     capabilityGuidance,
     mcpToolRefreshGuidance,
     input.description?.trim(),
     input.systemPrompt?.trim(),
-    input.identityPrompt?.trim(),
+    identitySegment ? { text: identitySegment, identity: identitySpanForSegment(identitySegment) } : undefined,
     identityPart,
     filePathReportingGuidance,
     realDeviceTestingGuidance,
     auditConvergenceContract,
     memorySearchGuidance,
     agentProgressGuidance,
-  ].filter(Boolean).join('\n\n') || undefined;
+  ], '\n\n');
+  const sessionSystemText = composedSessionSystemText?.text;
+  const sessionSystemTextIdentity = composedSessionSystemText?.identity;
   // Baseline delegation contract for a Brain, re-asserted EVERY turn, in the
   // variant the session's supervision mode selects.
   //
@@ -474,6 +483,7 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
     .filter(Boolean).join('\n\n') || undefined;
   return {
     sessionSystemText,
+    ...(sessionSystemTextIdentity ? { sessionSystemTextIdentity } : {}),
     turnSystemText,
     systemText: [sessionSystemText, turnSystemText].filter(Boolean).join('\n\n') || undefined,
     messagePreamble: input.messagePreamble?.trim() || undefined,
