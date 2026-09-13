@@ -14,6 +14,7 @@ import { REAL_DEVICE_TESTING_SYSTEM_GUIDANCE } from '../../shared/transport-runt
 import { VERIFICATION_MACHINE_MCP_TOOLS } from '../../shared/verification-machine.js';
 import { ALIAS_MCP_TOOLS } from '../../shared/alias-types.js';
 import { MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
+import { AUDIT_CONVERGENCE_CONTRACT_ID } from '../../shared/audit-convergence.js';
 
 function makeProvider(
   contextSupport: NonNullable<TransportProvider['capabilities']['contextSupport']>,
@@ -100,8 +101,8 @@ describe('buildProviderContextPayload', () => {
     expect(payload.systemText).toContain('available memory source-expansion tool');
     expect(payload.systemText).not.toMatch(/\bcall (?:search_memory|get_memory_sources)\b/);
     expect(payload.systemText).toContain('sourceLookup object');
-    expect(payload.systemText).toContain('Keep work updates sparse and high-signal.');
-    expect(payload.systemText).toContain('At key boundaries only');
+    expect(payload.systemText).toContain('Keep work updates short and high-signal');
+    expect(payload.systemText).toContain('at least every 5 minutes or every 15 tool calls');
     expect(payload.systemText).toContain('full absolute filesystem path');
     expect(payload.systemText).toContain('not a bare filename or relative path');
   });
@@ -275,6 +276,46 @@ describe('buildProviderContextPayload', () => {
     expect(payload.turnSystemText ?? '').not.toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
   });
 
+  // Any session can be an auditor, an implementer or an orchestrator, and audit
+  // messages only reference the convergence contract by id. So the body must be
+  // registered in the stable system prompt of every managed session -- once per
+  // thread, never resent through the per-turn channel or the user message.
+  it('registers the audit convergence contract in the stable system prompt of every managed provider', () => {
+    const body = `"contractId":"${AUDIT_CONVERGENCE_CONTRACT_ID}"`;
+    const providerIds = TRANSPORT_SESSION_AGENT_TYPES.filter((providerId) => providerId !== 'openclaw');
+    for (const providerId of providerIds) {
+      const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection', providerId), {
+        userMessage: 'review the change',
+        sessionIdentity: { sessionName: 'deck_proj_w1', label: 'W1', role: 'w1' },
+        namespace: { scope: 'personal', projectId: 'repo-1' },
+      });
+      expect(payload.sessionSystemText, providerId).toContain(body);
+      expect(payload.turnSystemText ?? '', providerId).not.toContain(body);
+      expect(payload.userMessage, providerId).not.toContain(body);
+    }
+    const slashControl = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+      userMessage: '/compact',
+      suppressMcpMemorySearchGuidance: true,
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+    });
+    expect(slashControl.sessionSystemText ?? '').not.toContain(body);
+  });
+
+  // Field complaint: long tasks ran for many minutes with no user-visible word.
+  // The old guidance only said "sparse, key boundaries only" and set no ceiling.
+  it('bounds how long a session may work without a user-visible progress update', () => {
+    const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+      userMessage: 'run the full regression and deploy',
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+    });
+    const text = payload.sessionSystemText ?? '';
+    expect(text).toContain('at least every 5 minutes or every 15 tool calls');
+    expect(text).toContain('Never work longer than that with no user-visible update');
+    expect(text).toContain('never turn a status into a long report');
+    expect(text).toContain('Before any step likely to take more than about 2 minutes');
+    expect(text).not.toContain('At key boundaries only');
+  });
+
   it('adds shared system guidance for every managed SDK provider id', () => {
     const providerIds = TRANSPORT_SESSION_AGENT_TYPES.filter((providerId) => providerId !== 'openclaw');
 
@@ -293,7 +334,7 @@ describe('buildProviderContextPayload', () => {
       expect(payload.systemText).toContain('available memory source-expansion tool with the returned fields');
       expect(payload.systemText).not.toMatch(/\bcall (?:search_memory|get_memory_sources)\b/);
       expect(payload.systemText).toContain('do not invent details from summaries alone');
-      expect(payload.systemText).toContain('Keep work updates sparse and high-signal.');
+      expect(payload.systemText).toContain('Keep work updates short and high-signal');
       expect(payload.systemText).toContain('skip routine narration and repeated summaries');
       expect(payload.systemText).toContain('full absolute filesystem path');
       expect(payload.sessionSystemText).toContain('cross-sdk identity sentinel');
@@ -322,7 +363,7 @@ describe('buildProviderContextPayload', () => {
     });
 
     expect(payload.systemText).not.toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
-    expect(payload.systemText).toContain('Keep work updates sparse and high-signal.');
+    expect(payload.systemText).toContain('Keep work updates short and high-signal');
   });
 
   it('renders startup memory and message recall into messagePreamble without mutating userMessage', () => {
@@ -834,7 +875,7 @@ describe('buildProviderContextPayload', () => {
       const capabilityIdx = systemText.indexOf('HIGHEST-PRIORITY IM.codes SERVICE ROUTING POLICY');
       const memoryIdx = systemText.indexOf('Use the available memory MCP tools');
       const realDeviceIdx = systemText.indexOf('REAL-DEVICE TESTING PRIORITY');
-      const progressIdx = systemText.indexOf('Keep work updates sparse and high-signal.');
+      const progressIdx = systemText.indexOf('Keep work updates short and high-signal');
       expect(userAuthorityIdx).toBe(0);
       expect(capabilityIdx).toBeGreaterThan(userAuthorityIdx);
       expect(systemText).toContain('Never rewrite, replace, narrow, or override any third-party provider or SDK tool definition');

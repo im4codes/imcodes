@@ -1,3 +1,4 @@
+import { AUDIT_CONVERGENCE_ROLES, buildAuditConvergenceContractRef } from './audit-convergence.js';
 import { P2P_ROUTING_FIELDS } from './p2p-routing-fields.js';
 import { isSessionAgentType } from './agent-types.js';
 import { CODEBUDDY_PROVIDER_IDS } from './codebuddy.js';
@@ -686,7 +687,9 @@ export function buildAgentDelegationOrchestrationPrompt(input: AgentDelegationOr
     copy.send(targetSession),
     `imcodes send --reply ${JSON.stringify(targetSession)} ${JSON.stringify(copy.fallback)}`,
     copy.wait,
-    ...(input.auditCycle ? auditCycle : []),
+    ...(input.auditCycle
+      ? [...auditCycle, buildAuditConvergenceContractRef(AUDIT_CONVERGENCE_ROLES.ORCHESTRATOR)]
+      : []),
   ].filter((line): line is string => line !== null).join('\n');
 }
 

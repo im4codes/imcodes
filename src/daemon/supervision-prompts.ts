@@ -1,4 +1,9 @@
 import {
+  AUDIT_CONVERGENCE_ROLES,
+  buildAuditConvergenceContractRef,
+  formatAuditBlockingSeverities,
+} from '../../shared/audit-convergence.js';
+import {
   AGENT_DELEGATION_BLOCKER_REPORT_FIELDS,
   SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS,
   buildAgentDelegationAuditEnvelope,
@@ -941,6 +946,7 @@ export function buildAutomaticAuditTaskPrompt(options: {
       : '',
     evidencePolicy,
     buildSupervisionContractsInForceLine(),
+    buildAuditConvergenceContractRef(AUDIT_CONVERGENCE_ROLES.ORCHESTRATOR),
   ].filter(Boolean).join('\n');
 }
 
@@ -1161,15 +1167,16 @@ export function buildPeerAuditBriefV1(input: PeerAuditBriefV1Input): string {
     `[Contract: ${PEER_AUDIT_PROMPT_VERSION}]`,
     'You are the independently selected peer auditor. Audit the completed result against the request and acceptance criteria below.',
     buildSupervisionContractsInForceLine(),
-    'This is a lightweight, single-pass audit. Do not start Team/P2P rounds, create a discussion, poll another session, or bulk-read OpenSpec artifact bodies.',
-    'Prioritize the highest-value checks within 15 minutes. Separate observed evidence from inference.',
+    buildAuditConvergenceContractRef(AUDIT_CONVERGENCE_ROLES.AUDITOR),
+    'This is a single-pass audit: report every finding in this one pass. Do not start Team/P2P rounds, create a discussion, poll another session, or bulk-read OpenSpec artifact bodies.',
+    'Time-box reruns, not review coverage. Separate observed evidence from inference.',
     ...evidencePolicy,
     'The normal audit is exact binding, code review, command/result acceptance, and only the necessary minimal directed counterexample. Submitted evidence is not invalid merely because the auditor did not personally rerun it.',
     'When the evidence policy above permits a rerun, you MAY use focused tests, typecheck, lint, build, read-only tools, and explicitly isolated fixtures. You MAY use already-authorized devices/environments only for read-only checks or isolated fixture operations.',
     'You MUST NOT modify tracked source, commit, push, deploy, mutate production, or alter persistent external/product state. Do not run reset/clean. Inspect worktree state before and after, preserve pre-existing changes, and stop/report if validation creates an unexpected tracked diff.',
     'Treat `git status` as a signal, not proof of a content change. Before classifying an unexpected EOL-only path as task contamination, compare the HEAD blob, raw working-tree bytes, and the attribute-cleaned hash (`git hash-object --path`). If raw bytes equal HEAD but the clean hash differs, report one repository-normalization defect; do not include that unrelated path in the candidate diff/archive, and do not hide it with reset, clean, or assume-unchanged. If raw bytes differ from HEAD, keep the normal fail-closed contamination rule. An explicit normalization task may include the path.',
     'Report exact commands/tools/devices/environments and observed outcomes. Explain unavailable checks; never invent a result.',
-    'VERDICT BOUNDARY: use REWORK only for a concrete defect in the audited bytes or behavior that materially violates an explicit acceptance criterion, creates a regression, or breaches a relevant safety/security invariant. Name the exact failing behavior and the smallest required fix.',
+    `VERDICT BOUNDARY: REWORK if and only if a ${formatAuditBlockingSeverities()} finding exists, with severities as defined by the referenced audit convergence contract. For each blocking finding name the violated invariant, every affected instance, and the required outcome for the whole class, not a minimal point patch.`,
     'Do NOT use REWORK merely because an optional check was unavailable or not personally rerun, evidence packaging/control-plane/receipt delivery failed, style or future hardening could improve, or a non-blocking observation exists. Record those separately as unavailable checks, infrastructure blockers, or follow-up observations; they do not block PASS when the implementation evidence is otherwise sufficient.',
     '',
     'Task request:',
@@ -1575,6 +1582,7 @@ export function buildReworkBriefPrompt(
   return [
     `[Contract: ${SUPERVISION_CONTRACT_IDS.REWORK_BRIEF}]`,
     buildSupervisionContractsInForceLine(),
+    buildAuditConvergenceContractRef(AUDIT_CONVERGENCE_ROLES.IMPLEMENTER),
     // NO task-finalization contract here, deliberately.
     //
     // A REWORK brief is sent precisely when finalization has been DEFERRED

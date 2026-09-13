@@ -42,6 +42,8 @@ import {
 } from '../../shared/agent-delegation.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
 
+import { AUDIT_CONVERGENCE_CONTRACT_ID } from '../../shared/audit-convergence.js';
+
 describe('readTrustedAgentDelegationReplyVerdict', () => {
   it.each(['PASS', 'REWORK'] as const)('accepts the exact top-level %s verdict', (verdict) => {
     expect(readTrustedAgentDelegationReplyVerdict({
@@ -437,5 +439,31 @@ describe('agent delegation shared contract', () => {
     expect(isAgentDelegationForwardedPayloadText(`${AGENT_DELEGATION_CONTEXT_TRUNCATED_MARKER} truncated`)).toBe(true);
     expect(isAgentDelegationForwardedPayloadText(buildAgentDelegationReplyInstruction('deck_repo_brain'))).toBe(true);
     expect(isAgentDelegationForwardedPayloadText('plain task')).toBe(false);
+  });
+});
+
+describe('Quick Audit orchestration references the audit convergence contract', () => {
+  const ref = `"contractRef":"${AUDIT_CONVERGENCE_CONTRACT_ID}"`;
+  const body = `"contractId":"${AUDIT_CONVERGENCE_CONTRACT_ID}"`;
+  for (const uiLocale of ['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko'] as const) {
+    it(`references the contract from the audit cycle without resending it (${uiLocale})`, () => {
+      const prompt = buildAgentDelegationOrchestrationPrompt({
+        targetSession: 'deck_repo_w1',
+        task: 'audit the recent work',
+        auditCycle: true,
+        uiLocale,
+      });
+      expect(prompt).toContain(ref);
+      expect(prompt).toContain('"role":"orchestrator"');
+      expect(prompt).not.toContain(body);
+    });
+  }
+
+  it('leaves a plain delegation without an audit cycle untouched', () => {
+    const prompt = buildAgentDelegationOrchestrationPrompt({
+      targetSession: 'deck_repo_w1',
+      task: 'discuss the recent work',
+    });
+    expect(prompt).not.toContain(ref);
   });
 });

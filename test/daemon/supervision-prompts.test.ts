@@ -35,6 +35,7 @@ import {
   buildSupervisionMessagingContract,
 } from '../../src/daemon/supervision-prompts.js';
 import { PEER_AUDIT_BRIEF_TOTAL_BYTES, peerAuditByteLength } from '../../shared/peer-audit.js';
+import { AUDIT_CONVERGENCE_CONTRACT_ID } from '../../shared/audit-convergence.js';
 
 describe('supervision prompts', () => {
   it('encodes the critical supervision semantics in compact canonical maps', () => {
@@ -557,7 +558,7 @@ describe('supervision prompts', () => {
     });
 
     expect(prompt).toContain('VERDICT BOUNDARY');
-    expect(prompt).toContain('materially violates an explicit acceptance criterion');
+    expect(prompt).toContain('REWORK if and only if a P0, P1 or P2 finding exists');
     expect(prompt).toContain('Do NOT use REWORK merely because an optional check was unavailable');
     expect(prompt).toContain('evidence packaging/control-plane/receipt delivery failed');
     expect(prompt).toContain('they do not block PASS');
@@ -974,4 +975,62 @@ describe('supervision user authority clause', () => {
     expect(buildSupervisionExecutionPreamble('en').length).toBeLessThan(4_900);
     expect(buildSupervisedAuditExecutionPreamble('en').length).toBeLessThan(5_200);
   });
+});
+
+describe('audit convergence contract on every supervision audit surface', () => {
+  const ref = `"contractRef":"${AUDIT_CONVERGENCE_CONTRACT_ID}"`;
+  const body = `"contractId":"${AUDIT_CONVERGENCE_CONTRACT_ID}"`;
+  const locales = ['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko'] as const;
+
+  it('references the contract in the peer auditor brief and drops the wording that made audits drip-feed', () => {
+    const prompt = buildPeerAuditBriefV1({
+      taskId: 'tsk_converge',
+      assignmentId: 'asg_converge',
+      attemptId: 'attempt_converge',
+      revision: 'revision-converge',
+      taskRequest: 'Implement the requested behavior',
+      completedResult: 'Implementation and focused validation complete',
+      acceptanceCriteria: ['Requested behavior works without regression'],
+      validations: [{ kind: 'test', label: 'focused suite', outcome: 'passed', summary: '12/12 passed' }],
+    });
+    expect(prompt).toContain(ref);
+    expect(prompt).toContain('"role":"auditor"');
+    expect(prompt).not.toContain(body);
+    // A minimal point fix is exactly what introduced the next round's defect.
+    expect(prompt).not.toContain('smallest required fix');
+    expect(prompt).toContain('whole class');
+    // A time box that limits review coverage is how findings arrive one per round.
+    expect(prompt).not.toContain('within 15 minutes');
+    expect(prompt).toContain('not review coverage');
+    expect(peerAuditByteLength(prompt)).toBeLessThanOrEqual(PEER_AUDIT_BRIEF_TOTAL_BYTES);
+  });
+
+  for (const uiLocale of locales) {
+    it(`references the contract in the automatic audit task the Brain forwards (${uiLocale})`, () => {
+      const prompt = buildAutomaticAuditTaskPrompt({
+        attemptId: `attempt-${uiLocale}`,
+        targetSession: 'deck_sub_reviewer',
+        auditedSessionName: 'deck_supervision_brain',
+        uiLocale,
+      });
+      expect(prompt).toContain(ref);
+      expect(prompt).toContain('"role":"orchestrator"');
+      expect(prompt).not.toContain(body);
+    });
+
+    it(`references the contract in the REWORK brief the implementer acts on (${uiLocale})`, () => {
+      const prompt = buildReworkBriefPrompt(
+        'deck_supervision_brain',
+        'Implement and deliver the fix',
+        'The first implementation is ready.',
+        'P1: the retry loop drops the last batch.',
+        { attempt: 1, limit: 3 },
+        'deck_sub_reviewer',
+        uiLocale,
+      );
+      expect(prompt).toContain(ref);
+      expect(prompt).toContain('"role":"implementer"');
+      expect(prompt).not.toContain(body);
+    });
+  }
 });

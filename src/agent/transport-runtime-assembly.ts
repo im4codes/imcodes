@@ -34,6 +34,10 @@ import {
   buildBrainManualOnlyDelegationContract,
   buildBrainWorkDelegationContractRef,
 } from '../daemon/supervision-prompts.js';
+import { buildAuditConvergenceContract } from '../../shared/audit-convergence.js';
+
+/** Stable text: rendered once, registered in every managed session's system prompt. */
+const AUDIT_CONVERGENCE_SYSTEM_CONTRACT = buildAuditConvergenceContract();
 import type { SessionRecord } from '../store/session-store.js';
 
 export interface TransportRuntimeAssemblyInput {
@@ -111,10 +115,15 @@ export const MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE = [
   'Do not call memory for bare control messages like "continue", "go on", "ok", "yes", "commit", "push", "run tests", or other short commands without searchable context.',
 ].join('\n');
 
+// "Sparse, key boundaries only" with no ceiling on silence let long tasks run
+// for many minutes with nothing the user could see. High-signal stays the rule;
+// silence now has an upper bound.
 const AGENT_PROGRESS_SYSTEM_GUIDANCE = [
-  'Keep work updates sparse and high-signal.',
-  'At key boundaries only (long scans, edits, tests, waits, blockers, commit/push), send one short status; skip routine narration and repeated summaries.',
-  'Do not paste logs or diffs unless asked; continue without confirmation unless blocked or the user requested a plan.',
+  'Keep work updates short and high-signal; never paste logs or diffs unless asked.',
+  'Before any step likely to take more than about 2 minutes (builds, test suites, deploys, restarts, waits, polling, multi-step investigation), say in one line what you are doing and why.',
+  'During long work, give a status at least every 5 minutes or every 15 tool calls, in one or two short sentences: what finished, what is running, what is next. Never work longer than that with no user-visible update; never turn a status into a long report.',
+  'Say at once when a hypothesis is disproven, a plan changes, or you are blocked; skip routine narration and repeated summaries.',
+  'Continue without confirmation unless blocked or the user requested a plan.',
 ].join('\n');
 
 export interface DispatchSharedContextSendOptions {
@@ -393,6 +402,12 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
   const realDeviceTestingGuidance = input.suppressMcpMemorySearchGuidance
     ? undefined
     : REAL_DEVICE_TESTING_SYSTEM_GUIDANCE;
+  // Any session can audit, implement or orchestrate an audit, and audit messages
+  // reference this contract by id only -- so its body belongs to the stable
+  // system prompt of every managed session, never to a message.
+  const auditConvergenceContract = input.suppressMcpMemorySearchGuidance
+    ? undefined
+    : AUDIT_CONVERGENCE_SYSTEM_CONTRACT;
   // Daemon-injected, session-stable identity block. NOT subject to
   // `USER_SESSION_TEXT_MAX_CHARS` — encodes IM.codes runtime behaviour
   // the model must always follow. p2p audit 37bfbb85-430 N-A: this used
@@ -420,6 +435,7 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
     identityPart,
     filePathReportingGuidance,
     realDeviceTestingGuidance,
+    auditConvergenceContract,
     memorySearchGuidance,
     agentProgressGuidance,
   ].filter(Boolean).join('\n\n') || undefined;
