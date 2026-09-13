@@ -3514,6 +3514,7 @@
   },
   "remote_desktop": {
     "open": "远程桌面",
+    "quick_input": "快捷输入",
     "workspace_title": "aiDesk.to 远程桌面工作区",
     "workspace_wall": "aiDesk.to 桌面墙",
     "wall_add": "添加到桌面墙",

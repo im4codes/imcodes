@@ -3513,6 +3513,7 @@
   },
   "remote_desktop": {
     "open": "リモートデスクトップ",
+    "quick_input": "クイック入力",
     "workspace_title": "aiDesk.to リモートデスクトップ ワークスペース",
     "workspace_wall": "aiDesk.to デスクトップウォール",
     "wall_add": "ウォールに追加",

@@ -3100,7 +3100,7 @@ html.native-ios-mac .chat-dl-btn {
 .qp-pill-default { background: #0f172a; border-color: #334155; color: #94a3b8; }
 .qp-pill-default:hover { background: #1e3a5f; border-color: #3b82f6; color: #93c5fd; }
 .qp-pill-custom { background: #1e293b; border-color: #475569; color: #cbd5e1; display: inline-flex; align-items: center; border-radius: 999px; overflow: hidden; padding: 0; }
-.qp-pill-text { padding: 4px 8px 4px 10px; font-size: 12px; cursor: pointer; }
+.qp-pill-text { padding: 4px 8px 4px 10px; border: 0; background: none; color: inherit; font: inherit; text-align: left; font-size: 12px; cursor: pointer; }
 .qp-pill-text:hover { background: #334155; }
 .qp-pill-edit { padding: 4px 4px 4px 2px; background: none; border: none; color: #475569; font-size: 10px; cursor: pointer; transition: color 0.1s; }
 .qp-pill-edit:hover { color: #60a5fa; }
@@ -10557,7 +10557,8 @@ button.quick-agent-delegation-preset.active {
 
 /* Standalone actions keep the same skin as a one-segment control. */
 .remote-desktop-files-trigger,
-.remote-desktop-unlock-trigger {
+.remote-desktop-unlock-trigger,
+.remote-desktop-quick-input {
   border: 1px solid rgb(94 165 214 / 22%) !important;
   border-radius: 10px !important;
   background:
@@ -10565,6 +10566,12 @@ button.quick-agent-delegation-preset.active {
   box-shadow:
     inset 0 1px 0 rgb(214 240 255 / 6%),
     0 1px 2px rgb(2 10 20 / 45%);
+}
+
+.remote-desktop-quick-input {
+  display: inline-flex;
+  flex: 0 0 auto;
+  overflow: hidden;
 }
 
 .remote-desktop-unlock-trigger {

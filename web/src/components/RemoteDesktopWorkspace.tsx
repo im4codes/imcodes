@@ -19,6 +19,7 @@ import { openRemoteDesktopWindow } from '../remote-desktop-window.js';
 import { useFullscreen } from '../hooks/useFullscreen.js';
 import { FloatingPanel } from './FloatingPanel.js';
 import { RemoteDesktopPanel } from './RemoteDesktopPanel.js';
+import type { UseQuickDataResult } from './QuickInputPanel.js';
 import './remote-desktop-workspace.css';
 import { MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
 import { REMOTE_DESKTOP_STOP_ORIGIN } from '@shared/remote-desktop.js';
@@ -44,6 +45,7 @@ export interface RemoteDesktopWorkspaceProps {
    * tab you cannot get back from.
    */
   allowStandaloneWindow?: boolean;
+  quickData?: UseQuickDataResult;
 }
 
 export function RemoteDesktopWorkspace({
@@ -62,6 +64,7 @@ export function RemoteDesktopWorkspace({
   onCloseWorkspace,
   wallHostKeys = new Set(),
   allowStandaloneWindow = false,
+  quickData,
 }: RemoteDesktopWorkspaceProps) {
   const { t } = useTranslation();
   const workspaceRef = useRef<HTMLDivElement | null>(null);
@@ -283,6 +286,7 @@ export function RemoteDesktopWorkspace({
           embedded
           active={state.activeTabId === hostKey}
           inputActive={state.activeTabId === hostKey}
+          quickData={quickData}
           onClose={() => closeHost(hostKey)}
           onAuthorityLost={() => closeHost(hostKey)}
         />

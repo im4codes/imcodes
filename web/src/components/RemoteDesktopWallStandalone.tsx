@@ -13,12 +13,14 @@ import {
 } from '../remote-desktop-workspace-state.js';
 import { RemoteDesktopWall } from './RemoteDesktopWall.js';
 import { RemoteDesktopWorkspace } from './RemoteDesktopWorkspace.js';
+import { useQuickData } from './QuickInputPanel.js';
 
 export function RemoteDesktopWallStandalone() {
   const { t } = useTranslation();
   const managerRef = useRef<RemoteDesktopConnectionManager | null>(null);
   const [wallHostKeys, setWallHostKeys] = useState<readonly string[]>([]);
   const [workspace, setWorkspace] = useState(createRemoteDesktopWorkspaceState);
+  const quickData = useQuickData();
   if (!managerRef.current) managerRef.current = new RemoteDesktopConnectionManager();
   const manager = managerRef.current;
   const retainedWallHostKeys = useMemo(() => new Set(wallHostKeys), [wallHostKeys]);
@@ -61,6 +63,7 @@ export function RemoteDesktopWallStandalone() {
         <RemoteDesktopWorkspace
           state={workspace}
           manager={manager}
+          quickData={quickData}
           zIndex={10020}
           onOpenHost={(machine) => setWorkspace((current) => (
             openRemoteDesktopWorkspaceHost(current, machine)

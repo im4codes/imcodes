@@ -3514,6 +3514,7 @@
   },
   "remote_desktop": {
     "open": "Remote Desktop",
+    "quick_input": "Quick input",
     "workspace_title": "aiDesk.to Remote Desktop Workspace",
     "workspace_wall": "aiDesk.to Desktop Wall",
     "wall_add": "Add to wall",

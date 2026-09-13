@@ -3514,6 +3514,7 @@
   },
   "remote_desktop": {
     "open": "Escritorio remoto",
+    "quick_input": "Entrada rápida",
     "workspace_title": "Espacio de escritorios remotos de aiDesk.to",
     "workspace_wall": "Muro de escritorios de aiDesk.to",
     "wall_add": "Añadir al muro",

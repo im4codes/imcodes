@@ -425,6 +425,16 @@ interface Props {
   /** Insert one long-lived verification-machine reference into the composer. */
   onInsertVerificationMachine?: (machine: VerificationMachineProfile) => void;
   anchorRef?: RefObject<HTMLElement>;
+  /** Restrict the shared picker to text/history surfaces for non-chat inputs. */
+  quickOnly?: boolean;
+  /** Optional portal layer for callers rendered inside higher desktop windows. */
+  portalZIndex?: number;
+  /**
+   * Optional host for the portal. Fullscreen callers must supply the active
+   * fullscreen element because document.body is outside the rendered
+   * fullscreen subtree.
+   */
+  portalContainer?: Element | null;
 }
 
 const HISTORY_PAGE_SIZE = 10;
@@ -451,7 +461,8 @@ export function QuickInputPanel({
   onAddCommand, onAddPhrase, onRemoveCommand, onRemovePhrase,
   onRemoveHistory, onRemoveSessionHistory, onClearHistory, onClearSessionHistory,
   ws, sessionCwd, onAppendPaths, onInsertAlias, machines = [], onInsertMachine,
-  projectKey, onInsertVerificationMachine, anchorRef,
+  projectKey, onInsertVerificationMachine, anchorRef, quickOnly = false, portalZIndex,
+  portalContainer,
 }: Props) {
   const { t } = useTranslation();
   const panelRef = useRef<HTMLDivElement>(null);
@@ -562,6 +573,10 @@ export function QuickInputPanel({
   }, [activeTab, machines.length]);
 
   useEffect(() => {
+    if (quickOnly && activeTab !== 'quick') setActiveTab('quick');
+  }, [activeTab, quickOnly]);
+
+  useEffect(() => {
     if (!open || typeof window === 'undefined') return;
     const refreshLayout = () => setLayoutTick((tick) => tick + 1);
     const viewport = window.visualViewport;
@@ -588,6 +603,33 @@ export function QuickInputPanel({
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
   }, [open, onClose, anchorRef]);
+
+  // Keep keyboard navigation inside the open picker. In particular, the
+  // trigger remains focused when the portal opens, so the first Tab must enter
+  // the dialog rather than continue through the remote-desktop toolbar.
+  useEffect(() => {
+    if (!open) return;
+    const handler = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        onClose();
+        return;
+      }
+      if (event.key !== 'Tab' || !panelRef.current) return;
+      const focusable = Array.from(panelRef.current.querySelectorAll<HTMLElement>(
+        'button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), [tabindex]:not([tabindex="-1"])',
+      ));
+      if (focusable.length === 0) return;
+      const currentIndex = focusable.indexOf(document.activeElement as HTMLElement);
+      const nextIndex = event.shiftKey
+        ? (currentIndex <= 0 ? focusable.length - 1 : currentIndex - 1)
+        : (currentIndex < 0 || currentIndex === focusable.length - 1 ? 0 : currentIndex + 1);
+      event.preventDefault();
+      focusable[nextIndex]?.focus({ preventScroll: true });
+    };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }, [open, onClose]);
 
   // Focus add/edit input when shown
   useEffect(() => {
@@ -791,10 +833,20 @@ export function QuickInputPanel({
 
   const panel = (
     <>
-      <div class="qp-backdrop" onClick={onClose} />
-      <div class="qp" ref={panelRef} style={panelStyle}>
+      <div
+        class="qp-backdrop"
+        style={portalZIndex === undefined ? undefined : { zIndex: portalZIndex - 1 }}
+        onClick={onClose}
+      />
+      <div
+        class="qp"
+        ref={panelRef}
+        style={portalZIndex === undefined ? panelStyle : { ...panelStyle, zIndex: portalZIndex }}
+        role="dialog"
+        aria-label={t('quick_input.title')}
+      >
         {/* Machine tab is present only when the account has controlled nodes. */}
-        <div class="qp-tabs">
+        {!quickOnly && <div class="qp-tabs">
           <button class={`qp-tab${activeTab === 'quick' ? ' active' : ''}`} onClick={() => setActiveTab('quick')}>
             ⚡ {t('quick_input.tab_quick')}
           </button>
@@ -814,7 +866,7 @@ export function QuickInputPanel({
           <button class={`qp-tab${activeTab === 'verification' ? ' active' : ''}`} onClick={() => setActiveTab('verification')}>
             🧪 {t('quick_input.tab_verification')}
           </button>
-        </div>
+        </div>}
 
         {/* Controlled-node tab — display names are mutable, canonical node IDs
             are stable. Connectivity is informational: an offline node can still
@@ -1122,7 +1174,7 @@ export function QuickInputPanel({
                     </span>
                   ) : (
                     <span key={cmd} class="qp-pill qp-pill-custom" title={cmd.length > TRUNCATE_THRESHOLD ? cmd : undefined}>
-                      <span class="qp-pill-text" onClick={() => handleSend(cmd)}>{formatPreviewText(cmd)}</span>
+                      <button type="button" class="qp-pill-text" onClick={() => handleSend(cmd)}>{formatPreviewText(cmd)}</button>
                       <button class="qp-pill-edit" onClick={() => startEdit('command', cmd)}>✎</button>
                       <button class="qp-pill-del" onClick={() => { if (confirm(t('quick_input.confirm_delete'))) onRemoveCommand(cmd); }}>✕</button>
                     </span>
@@ -1154,7 +1206,7 @@ export function QuickInputPanel({
                     </span>
                   ) : (
                     <span key={phrase} class="qp-pill qp-pill-custom" title={phrase.length > TRUNCATE_THRESHOLD ? phrase : undefined}>
-                      <span class="qp-pill-text" onClick={() => handleSend(phrase)}>{formatPreviewText(phrase)}</span>
+                      <button type="button" class="qp-pill-text" onClick={() => handleSend(phrase)}>{formatPreviewText(phrase)}</button>
                       <button class="qp-pill-edit" onClick={() => startEdit('phrase', phrase)}>✎</button>
                       <button class="qp-pill-del" onClick={() => { if (confirm(t('quick_input.confirm_delete'))) onRemovePhrase(phrase); }}>✕</button>
                     </span>
@@ -1208,5 +1260,5 @@ export function QuickInputPanel({
   );
 
   if (typeof document === 'undefined') return panel;
-  return createPortal(panel, document.body);
+  return createPortal(panel, portalContainer ?? document.body);
 }

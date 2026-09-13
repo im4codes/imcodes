@@ -6,11 +6,13 @@ import { dismissHtmlSplashForDirectEntry } from '../html-splash.js';
 import { RemoteDesktopConnectionManager } from '../remote-desktop-connection-manager.js';
 import { canOpenRemoteDesktopMachine } from '../remote-desktop-profile.js';
 import { RemoteDesktopPanel } from './RemoteDesktopPanel.js';
+import { useQuickData } from './QuickInputPanel.js';
 
 export function RemoteDesktopStandalone({ serverId }: { serverId: string }) {
   const { t } = useTranslation();
   const [machine, setMachine] = useState<MachineListItem | null>(null);
   const [failed, setFailed] = useState(false);
+  const quickData = useQuickData();
   const managerRef = useRef<RemoteDesktopConnectionManager | null>(null);
   if (!managerRef.current) managerRef.current = new RemoteDesktopConnectionManager();
 
@@ -51,6 +53,7 @@ export function RemoteDesktopStandalone({ serverId }: { serverId: string }) {
     <RemoteDesktopPanel
       machine={machine}
       connectionManager={managerRef.current}
+      quickData={quickData}
       standalone
       onClose={() => window.close()}
     />

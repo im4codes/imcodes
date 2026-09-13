@@ -7247,6 +7247,7 @@ export function App() {
         <RemoteDesktopWorkspace
           state={remoteDesktopWorkspace}
           manager={remoteDesktopConnectionManager}
+          quickData={quickData}
           ws={wsRef.current}
           minimized={remoteDesktopWorkspaceMinimized}
           zIndex={getDesktopWindowZIndex(

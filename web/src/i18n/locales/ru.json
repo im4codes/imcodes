@@ -3513,6 +3513,7 @@
   },
   "remote_desktop": {
     "open": "Удалённый рабочий стол",
+    "quick_input": "Быстрый ввод",
     "workspace_title": "Пространство удалённых рабочих столов aiDesk.to",
     "workspace_wall": "Стена рабочих столов aiDesk.to",
     "wall_add": "Добавить на стену",

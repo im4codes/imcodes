@@ -2,7 +2,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { act, cleanup, render } from '@testing-library/preact';
+import { act, cleanup, fireEvent, render } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   REMOTE_DESKTOP_ACCESS_MODE,
@@ -16,6 +16,8 @@ import {
   FILE_TRANSFER_DIRECTORY_CAPABILITY,
   FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
 } from '@shared/transport/file-transfer.js';
+import { SESSION_STOP_COMMAND } from '@shared/session-control-commands.js';
+import { DEFAULT_QUICK_PHRASES } from '../src/quick-commands.js';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string) => key }),
@@ -33,6 +35,7 @@ const setDisplayScale = vi.fn(() => true);
 const setMode = vi.fn(() => true);
 const key = vi.fn(() => true);
 const text = vi.fn(() => true);
+const textByServer = vi.fn<(serverId: string, value: string) => boolean>(() => true);
 const requestRemoteClipboard = vi.fn(async () => 'selected remotely');
 const selectDisplay = vi.fn(() => true);
 const stop = vi.fn();
@@ -56,7 +59,7 @@ let atomicButtonClickAdvertised = true;
 
 vi.mock('../src/remote-desktop-client.js', () => ({
   RemoteDesktopClient: class {
-    constructor(_serverId: string, hooks: { onSnapshot(value: unknown): void }) {
+    constructor(readonly serverId: string, hooks: { onSnapshot(value: unknown): void }) {
       clientHooks.push(hooks);
       queueMicrotask(() => hooks.onSnapshot({
         state: REMOTE_DESKTOP_STATE.DIRECT,
@@ -101,7 +104,10 @@ vi.mock('../src/remote-desktop-client.js', () => ({
     pointerMove = pointerMove;
     wheel = wheel;
     key = key;
-    text = text;
+    text = (value: string) => {
+      text(value);
+      return textByServer(this.serverId, value);
+    };
     setMode = setMode;
     selectDisplay = selectDisplay;
     setDisplayMode = setDisplayMode;
@@ -185,7 +191,13 @@ vi.mock('../src/components/FileBrowser.js', () => ({
 }));
 
 import { RemoteDesktopPanel } from '../src/components/RemoteDesktopPanel.js';
+import { RemoteDesktopWorkspace } from '../src/components/RemoteDesktopWorkspace.js';
+import type { UseQuickDataResult } from '../src/components/QuickInputPanel.js';
 import { RemoteDesktopConnectionManager } from '../src/remote-desktop-connection-manager.js';
+import {
+  createRemoteDesktopWorkspaceState,
+  openRemoteDesktopWorkspaceHost,
+} from '../src/remote-desktop-workspace-state.js';
 import {
   REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT,
   clearRemoteDesktopBrowserDiagnostics,
@@ -207,6 +219,7 @@ afterEach(() => {
   directoryAdapters.length = 0;
   atomicButtonClickAdvertised = true;
   localStorage.removeItem('rcc_float_remote-desktop-server-1');
+  delete (document as Document & { fullscreenElement?: Element | null }).fullscreenElement;
 });
 
 function pointer(
@@ -307,6 +320,10 @@ async function renderPanel(
     onClose?: () => void;
     connectionManager?: RemoteDesktopConnectionManager;
     standalone?: boolean;
+    embedded?: boolean;
+    active?: boolean;
+    inputActive?: boolean;
+    quickData?: UseQuickDataResult;
   } = {},
 ) {
   const result = render(<RemoteDesktopPanel
@@ -324,6 +341,10 @@ async function renderPanel(
     onClose={panelProps.onClose ?? vi.fn()}
     allowStandaloneWindow={panelProps.allowStandaloneWindow}
     standalone={panelProps.standalone}
+    embedded={panelProps.embedded}
+    active={panelProps.active}
+    inputActive={panelProps.inputActive}
+    quickData={panelProps.quickData}
     connectionManager={panelProps.connectionManager}
   />);
   await act(async () => { await Promise.resolve(); });
@@ -2054,5 +2075,431 @@ describe('RemoteDesktopPanel in a window of its own', () => {
     const panel = container.querySelector('.remote-desktop-panel');
     expect(panel!.classList.contains('is-standalone')).toBe(false);
     expect(container.querySelector('.remote-desktop-maximize')).not.toBeNull();
+  });
+});
+
+function quickDataWithText(textValue: string): UseQuickDataResult {
+  return {
+    data: {
+      history: [],
+      sessionHistory: {},
+      commands: [textValue],
+      phrases: [],
+    },
+    loaded: true,
+    recordHistory: vi.fn(),
+    addCommand: vi.fn(),
+    addPhrase: vi.fn(),
+    removeCommand: vi.fn(),
+    removePhrase: vi.fn(),
+    removeHistory: vi.fn(),
+    removeSessionHistory: vi.fn(),
+    clearHistory: vi.fn(),
+    clearSessionHistory: vi.fn(),
+  };
+}
+
+describe('RemoteDesktopPanel quick input', () => {
+  const exactText = `printf '%s\\n' "a&b; c"
+next --flag='x:y'`;
+  const styles = readFileSync(
+    resolve(dirname(fileURLToPath(import.meta.url)), '../src/styles.css'),
+    'utf8',
+  );
+
+  const setFullscreenElement = (element: Element) => {
+    Object.defineProperty(document, 'fullscreenElement', {
+      configurable: true,
+      value: element,
+    });
+    act(() => document.dispatchEvent(new Event('fullscreenchange')));
+  };
+
+  const enableImmediateAnimationFrames = () => vi.spyOn(window, 'requestAnimationFrame')
+    .mockImplementation((callback) => {
+      callback(0);
+      return 1;
+    });
+
+  it('injects saved multiline command punctuation through the bound keyboard channel and restores focus', async () => {
+    const animationFrame = enableImmediateAnimationFrames();
+    const quickData = quickDataWithText(exactText);
+    const ws = { targetsServer: () => true, send: vi.fn() };
+    const rendered = await renderPanel(ws, undefined, { quickData });
+
+    act(() => (rendered.getByRole('button', {
+      name: 'remote_desktop.quick_input',
+    }) as HTMLButtonElement).click());
+    const dialog = rendered.getByRole('dialog', { name: 'quick_input.title' });
+    expect(dialog.style.zIndex).toBe('10050');
+    expect(rendered.queryByRole('button', { name: 'alias.tab' })).toBeNull();
+    const command = document.querySelector('.qp-pill-custom .qp-pill-text') as HTMLElement;
+    expect(command.textContent).toContain('printf');
+    act(() => command.click());
+
+    expect(textByServer).toHaveBeenCalledWith('server-1', exactText);
+    expect(quickData.recordHistory).toHaveBeenCalledWith(
+      exactText,
+      'remote-desktop:server-1',
+    );
+    expect(document.activeElement).toBe(rendered.stage);
+
+    act(() => (rendered.getByRole('button', {
+      name: 'remote_desktop.quick_input',
+    }) as HTMLButtonElement).click());
+    act(() => (rendered.getByRole('button', {
+      name: DEFAULT_QUICK_PHRASES[0],
+    }) as HTMLButtonElement).click());
+    act(() => (rendered.getByRole('button', {
+      name: 'remote_desktop.quick_input',
+    }) as HTMLButtonElement).click());
+    act(() => (rendered.getByRole('button', {
+      name: SESSION_STOP_COMMAND,
+    }) as HTMLButtonElement).click());
+
+    expect(textByServer.mock.calls).toEqual([
+      ['server-1', exactText],
+      ['server-1', DEFAULT_QUICK_PHRASES[0]],
+      ['server-1', SESSION_STOP_COMMAND],
+    ]);
+    expect(ws.send).not.toHaveBeenCalled();
+    animationFrame.mockRestore();
+  });
+
+  it('keeps the picker inside a fullscreen panel and restores stage focus after injection', async () => {
+    const animationFrame = enableImmediateAnimationFrames();
+    const rendered = await renderPanel(undefined, undefined, {
+      quickData: quickDataWithText(exactText),
+    });
+    const panel = rendered.container.querySelector('.remote-desktop-panel') as HTMLElement;
+    setFullscreenElement(panel);
+
+    const trigger = rendered.getByRole('button', { name: 'remote_desktop.quick_input' });
+    fireEvent.click(trigger);
+    const dialog = rendered.getByRole('dialog', { name: 'quick_input.title' });
+    expect(trigger.getAttribute('aria-expanded')).toBe('true');
+    expect(panel.contains(dialog)).toBe(true);
+    expect(dialog.hidden).toBe(false);
+
+    fireEvent.click(dialog.querySelector('.qp-pill-custom .qp-pill-text') as HTMLButtonElement);
+    expect(textByServer).toHaveBeenCalledWith('server-1', exactText);
+    expect(document.activeElement).toBe(rendered.stage);
+    expect(trigger.getAttribute('aria-expanded')).toBe('false');
+    animationFrame.mockRestore();
+  });
+
+  it('keeps the picker inside the real fullscreen workspace root and remains interactable', async () => {
+    const animationFrame = enableImmediateAnimationFrames();
+    const machine = {
+      serverId: 'workspace-host',
+      refName: 'workspace-host',
+      displayName: 'Workspace host',
+      os: 'win',
+      online: true,
+      execEnabled: true,
+      accessRole: 'owner' as const,
+      capabilities: [REMOTE_DESKTOP_CAPABILITY],
+    };
+    const state = openRemoteDesktopWorkspaceHost(createRemoteDesktopWorkspaceState(), machine);
+    const rendered = render(<RemoteDesktopWorkspace
+      state={state}
+      manager={new RemoteDesktopConnectionManager()}
+      quickData={quickDataWithText(exactText)}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    await act(async () => { await Promise.resolve(); });
+    const workspace = rendered.container.querySelector('.remote-desktop-workspace') as HTMLElement;
+    const stage = rendered.container.querySelector('.remote-desktop-stage') as HTMLElement;
+    setFullscreenElement(workspace);
+
+    const trigger = rendered.getByRole('button', { name: 'remote_desktop.quick_input' });
+    fireEvent.click(trigger);
+    const dialog = rendered.getByRole('dialog', { name: 'quick_input.title' });
+    expect(workspace.contains(dialog)).toBe(true);
+    expect(dialog.hidden).toBe(false);
+
+    fireEvent.click(dialog.querySelector('.qp-pill-custom .qp-pill-text') as HTMLButtonElement);
+    expect(textByServer).toHaveBeenCalledWith('workspace-host', exactText);
+    expect(document.activeElement).toBe(stage);
+    animationFrame.mockRestore();
+  });
+
+  it('supports Tab and Enter activation, Escape focus return, and aria-expanded transitions', async () => {
+    const animationFrame = enableImmediateAnimationFrames();
+    const rendered = await renderPanel(undefined, undefined, {
+      quickData: quickDataWithText(exactText),
+    });
+    const trigger = rendered.getByRole('button', { name: 'remote_desktop.quick_input' }) as HTMLButtonElement;
+    trigger.focus();
+    fireEvent.click(trigger);
+    expect(trigger.getAttribute('aria-expanded')).toBe('true');
+
+    const entry = document.querySelector('.qp-pill-custom .qp-pill-text') as HTMLButtonElement;
+    for (let presses = 0; presses < 20 && document.activeElement !== entry; presses += 1) {
+      fireEvent.keyDown(document, { key: 'Tab' });
+    }
+    expect(document.activeElement).toBe(entry);
+    // jsdom does not perform a button's user-agent default action, so emulate
+    // the click that an uncancelled Enter key produces in a browser.
+    const runDefault = fireEvent.keyDown(entry, { key: 'Enter' });
+    if (runDefault) fireEvent.click(entry);
+    fireEvent.keyUp(entry, { key: 'Enter' });
+    expect(textByServer).toHaveBeenCalledWith('server-1', exactText);
+    expect(trigger.getAttribute('aria-expanded')).toBe('false');
+
+    fireEvent.click(trigger);
+    expect(trigger.getAttribute('aria-expanded')).toBe('true');
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(document.querySelector('.qp')).toBeNull();
+    expect(trigger.getAttribute('aria-expanded')).toBe('false');
+    expect(document.activeElement).toBe(trigger);
+    animationFrame.mockRestore();
+  });
+
+  it('keeps Quick Input usable in a mobile touch viewport beside the keyboard toolbar', async () => {
+    const innerWidth = Object.getOwnPropertyDescriptor(window, 'innerWidth');
+    const visualViewport = Object.getOwnPropertyDescriptor(window, 'visualViewport');
+    const matchMedia = Object.getOwnPropertyDescriptor(window, 'matchMedia');
+    const viewport = Object.assign(new EventTarget(), {
+      width: 390,
+      height: 700,
+      offsetLeft: 0,
+      offsetTop: 0,
+      pageLeft: 0,
+      pageTop: 0,
+      scale: 1,
+    });
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    Object.defineProperty(window, 'visualViewport', { configurable: true, value: viewport });
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: vi.fn((query: string) => ({
+        matches: query === '(pointer: coarse)',
+        media: query,
+        onchange: null,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+      })),
+    });
+    try {
+      const rendered = await renderPanel(undefined, undefined, {
+        quickData: quickDataWithText(exactText),
+      });
+      const mobileToolbar = rendered.container.querySelector('.remote-desktop-mobile-input-switch');
+      expect(mobileToolbar).not.toBeNull();
+      expect(rendered.getByRole('button', { name: 'remote_desktop.mobile_keyboard' })).toBeDefined();
+      const trigger = rendered.getByRole('button', { name: 'remote_desktop.quick_input' });
+      expect((trigger as HTMLButtonElement).disabled).toBe(false);
+
+      fireEvent.click(trigger);
+      const dialog = rendered.getByRole('dialog', { name: 'quick_input.title' });
+      expect(dialog.hidden).toBe(false);
+      expect(trigger.getAttribute('aria-expanded')).toBe('true');
+      expect(styles).toMatch(/@media \(max-width: 640px\)[\s\S]*?\.qp\s*\{[^}]*position:\s*fixed/);
+      expect(styles).toMatch(/@media \(pointer: coarse\)[\s\S]*?\.remote-desktop-mobile-input-switch\s*\{[^}]*display:\s*flex/);
+      fireEvent.click(dialog.querySelector('.qp-pill-custom .qp-pill-text') as HTMLButtonElement);
+      expect(textByServer).toHaveBeenCalledWith('server-1', exactText);
+    } finally {
+      if (innerWidth) Object.defineProperty(window, 'innerWidth', innerWidth);
+      else delete (window as Window & { innerWidth?: number }).innerWidth;
+      if (visualViewport) Object.defineProperty(window, 'visualViewport', visualViewport);
+      else delete (window as Window & { visualViewport?: VisualViewport }).visualViewport;
+      if (matchMedia) Object.defineProperty(window, 'matchMedia', matchMedia);
+      else delete (window as Window & { matchMedia?: typeof window.matchMedia }).matchMedia;
+    }
+  });
+
+  it('closes on reconnect and refuses a detached stale selection from the previous input epoch', async () => {
+    const rendered = await renderPanel(undefined, undefined, {
+      quickData: quickDataWithText(exactText),
+    });
+    act(() => (rendered.getByRole('button', {
+      name: 'remote_desktop.quick_input',
+    }) as HTMLButtonElement).click());
+    const staleCommand = document.querySelector('.qp-pill-custom .qp-pill-text') as HTMLElement;
+
+    act(() => clientHooks[0]!.onSnapshot({
+      state: REMOTE_DESKTOP_STATE.RECONNECTING,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 2,
+      inputEnabled: false,
+      displays: [],
+      layoutRevision: 1,
+      stream: null,
+    }));
+    expect(document.querySelector('.qp')).toBeNull();
+    act(() => staleCommand.click());
+    expect(textByServer).not.toHaveBeenCalled();
+  });
+
+  it('keeps add, edit, and delete mutations on the shared QuickInput persistence callbacks', async () => {
+    const quickData = quickDataWithText('/saved --flag="a&b"');
+    const rendered = await renderPanel(undefined, undefined, { quickData });
+    act(() => (rendered.getByRole('button', {
+      name: 'remote_desktop.quick_input',
+    }) as HTMLButtonElement).click());
+
+    fireEvent.click(rendered.getByRole('button', { name: 'quick_input.add_phrase' }));
+    const addInput = document.querySelector('.qp-add-input') as HTMLInputElement;
+    fireEvent.input(addInput, { target: { value: `say: 'yes' & wait` } });
+    fireEvent.click(document.querySelector('.qp-add-confirm') as HTMLButtonElement);
+    expect(quickData.addPhrase).toHaveBeenCalledWith(`say: 'yes' & wait`);
+
+    fireEvent.click(document.querySelector('.qp-pill-custom .qp-pill-edit') as HTMLButtonElement);
+    const editInput = document.querySelector('.qp-edit-input') as HTMLInputElement;
+    fireEvent.input(editInput, { target: { value: '/saved --flag="x:y"; next' } });
+    fireEvent.keyDown(editInput, { key: 'Enter' });
+    expect(quickData.removeCommand).toHaveBeenCalledWith('/saved --flag="a&b"');
+    expect(quickData.addCommand).toHaveBeenCalledWith('/saved --flag="x:y"; next');
+
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    fireEvent.click(document.querySelector('.qp-pill-custom .qp-pill-del') as HTMLButtonElement);
+    expect(confirm).toHaveBeenCalled();
+    expect(quickData.removeCommand).toHaveBeenLastCalledWith('/saved --flag="a&b"');
+    confirm.mockRestore();
+  });
+
+  it('closes and refuses stale selections after view-only, authority loss, or a workspace tab switch', async () => {
+    const manager = new RemoteDesktopConnectionManager();
+    const machine = {
+      serverId: 'server-1',
+      refName: 'controlled-1',
+      displayName: 'Windows',
+      os: 'win',
+      online: true,
+      execEnabled: true,
+      accessRole: 'owner' as const,
+      capabilities: [REMOTE_DESKTOP_CAPABILITY],
+    };
+    const quickData = quickDataWithText(exactText);
+    const rendered = render(<RemoteDesktopPanel
+      machine={machine}
+      connectionManager={manager}
+      embedded
+      active
+      inputActive
+      quickData={quickData}
+      onClose={vi.fn()}
+    />);
+    await act(async () => { await Promise.resolve(); });
+
+    const openAndCapture = () => {
+      act(() => (rendered.getByRole('button', {
+        name: 'remote_desktop.quick_input',
+      }) as HTMLButtonElement).click());
+      return document.querySelector('.qp-pill-custom .qp-pill-text') as HTMLElement;
+    };
+
+    let stale = openAndCapture();
+    act(() => clientHooks[0]!.onSnapshot({
+      state: REMOTE_DESKTOP_STATE.DIRECT,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 2,
+      inputEnabled: false,
+      displays: [],
+      layoutRevision: 1,
+      stream: null,
+    }));
+    act(() => stale.click());
+
+    act(() => clientHooks[0]!.onSnapshot({
+      state: REMOTE_DESKTOP_STATE.DIRECT,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 3,
+      inputEnabled: true,
+      displays: [],
+      layoutRevision: 1,
+      stream: null,
+    }));
+    stale = openAndCapture();
+    rendered.rerender(<RemoteDesktopPanel
+      machine={machine}
+      connectionManager={manager}
+      embedded
+      active={false}
+      inputActive={false}
+      quickData={quickData}
+      onClose={vi.fn()}
+    />);
+    await act(async () => { await Promise.resolve(); });
+    act(() => stale.click());
+
+    rendered.rerender(<RemoteDesktopPanel
+      machine={machine}
+      connectionManager={manager}
+      embedded
+      active
+      inputActive
+      quickData={quickData}
+      onClose={vi.fn()}
+    />);
+    await act(async () => { await Promise.resolve(); });
+    stale = openAndCapture();
+    act(() => clientHooks[0]!.onSnapshot({
+      state: REMOTE_DESKTOP_STATE.FAILED,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 4,
+      inputEnabled: false,
+      displays: [],
+      layoutRevision: 1,
+      stream: null,
+      terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED,
+    }));
+    act(() => stale.click());
+
+    expect(textByServer).not.toHaveBeenCalled();
+    expect(document.querySelector('.qp')).toBeNull();
+  });
+
+  it('never sends an old host selection after the active workspace host changes', async () => {
+    const quickData = quickDataWithText(exactText);
+    const manager = new RemoteDesktopConnectionManager();
+    const machine = (serverId: string) => ({
+      serverId,
+      refName: serverId,
+      displayName: serverId,
+      os: 'win',
+      online: true,
+      execEnabled: true,
+      accessRole: 'owner' as const,
+      capabilities: [REMOTE_DESKTOP_CAPABILITY],
+    });
+    const panels = (activeServer: string) => <>
+      {['host-a', 'host-b'].map((serverId) => <RemoteDesktopPanel
+        key={serverId}
+        machine={machine(serverId)}
+        connectionManager={manager}
+        embedded
+        active={activeServer === serverId}
+        inputActive={activeServer === serverId}
+        quickData={quickData}
+        onClose={vi.fn()}
+      />)}
+    </>;
+    const rendered = render(panels('host-a'));
+    await act(async () => { await Promise.resolve(); });
+
+    const activePanel = rendered.container.querySelector('[aria-label="remote_desktop.title"]:not([hidden])') as HTMLElement;
+    act(() => (activePanel.querySelector('.remote-desktop-quick-input button') as HTMLButtonElement).click());
+    const hostASelection = document.querySelector('.qp-pill-custom .qp-pill-text') as HTMLElement;
+
+    rendered.rerender(panels('host-b'));
+    await act(async () => { await Promise.resolve(); });
+    expect(document.querySelector('.qp')).toBeNull();
+    act(() => hostASelection.click());
+
+    const hostBPanel = rendered.container.querySelector('[aria-label="remote_desktop.title"]:not([hidden])') as HTMLElement;
+    act(() => (hostBPanel.querySelector('.remote-desktop-quick-input button') as HTMLButtonElement).click());
+    act(() => (document.querySelector('.qp-pill-custom .qp-pill-text') as HTMLElement).click());
+
+    expect(textByServer).toHaveBeenCalledTimes(1);
+    expect(textByServer).toHaveBeenCalledWith('host-b', exactText);
   });
 });

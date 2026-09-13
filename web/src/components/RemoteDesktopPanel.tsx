@@ -72,6 +72,11 @@ import { FloatingPanel } from './FloatingPanel.js';
 import { DesktopWindowMaximizeButton } from './DesktopWindowMaximizeButton.js';
 import { FileBrowser } from './FileBrowser.js';
 import {
+  EMPTY_QUICK_DATA,
+  QuickInputPanel,
+  type UseQuickDataResult,
+} from './QuickInputPanel.js';
+import {
   INITIAL_REMOTE_DESKTOP_VIEWPORT,
   clampRemoteDesktopViewport,
   panRemoteDesktopViewportAtEdge,
@@ -93,6 +98,20 @@ type DesktopPointerMoveSource =
   | 'stage-pointer'
   | 'surface-mouse'
   | 'surface-pointer';
+
+const NOOP_QUICK_DATA: UseQuickDataResult = {
+  data: EMPTY_QUICK_DATA,
+  loaded: true,
+  recordHistory: () => {},
+  addCommand: () => {},
+  addPhrase: () => {},
+  removeCommand: () => {},
+  removePhrase: () => {},
+  removeHistory: () => {},
+  removeSessionHistory: () => {},
+  clearHistory: () => {},
+  clearSessionHistory: () => {},
+};
 
 interface TouchPoint {
   x: number;
@@ -188,6 +207,7 @@ function displayModeOptions(
 
 /** How long a refused-command notice stays up before it fades on its own. */
 const CONTROL_NOTICE_MS = 6_000;
+const REMOTE_DESKTOP_QUICK_INPUT_Z_INDEX = 10_050;
 const TOUCH_LONG_PRESS_MS = 550;
 const TOUCH_DOUBLE_TAP_MS = 400;
 const DESKTOP_DOUBLE_CLICK_MS = 500;
@@ -228,6 +248,10 @@ function activeRemoteDesktopConnectionStep(
   }
 }
 
+export function remoteDesktopQuickInputHistoryKey(hostKey: string): string {
+  return `remote-desktop:${hostKey}`;
+}
+
 export interface RemoteDesktopPanelProps {
   machine: MachineListItem;
   connectionManager?: RemoteDesktopConnectionManager;
@@ -251,6 +275,8 @@ export interface RemoteDesktopPanelProps {
   zIndex?: number;
   /** Raise this window. Wired to a mousedown anywhere inside the panel. */
   onFocus?(): void;
+  /** Account-scoped quick-input state shared with chat and every desktop host. */
+  quickData?: UseQuickDataResult;
 }
 
 interface RemoteDesktopTransferRow {
@@ -294,6 +320,7 @@ export function RemoteDesktopPanel({
   onAuthorityLost,
   zIndex,
   onFocus,
+  quickData,
 }: RemoteDesktopPanelProps) {
   const { t } = useTranslation();
   const [snapshot, setSnapshot] = useState<RemoteDesktopSnapshot>(INITIAL_SNAPSHOT);
@@ -339,6 +366,8 @@ export function RemoteDesktopPanel({
   const [legacyFetchPath, setLegacyFetchPath] = useState('');
   const [fileDropActive, setFileDropActive] = useState(false);
   const [mobileTextOpen, setMobileTextOpen] = useState(false);
+  const [quickInputOpen, setQuickInputOpen] = useState(false);
+  const [quickInputPortalContainer, setQuickInputPortalContainer] = useState<Element | null>(null);
   const [displayModeMenu, setDisplayModeMenu] = useState<DisplayModeMenuState | null>(null);
   const [clipboardStatus, setClipboardStatus] = useState<ClipboardStatus>('idle');
   const [mediaPresented, setMediaPresented] = useState(false);
@@ -354,6 +383,13 @@ export function RemoteDesktopPanel({
   const lastFrameCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const panelRef = useRef<HTMLDivElement | null>(null);
+  const quickInputTriggerRef = useRef<HTMLDivElement | null>(null);
+  const quickInputSentRef = useRef(false);
+  const quickInputBindingRef = useRef<{
+    hostKey: string;
+    inputEpoch: number;
+    client: RemoteDesktopManagedConnection;
+  } | null>(null);
   // Shared with the workspace chrome, so that Esc, a second fullscreen
   // elsewhere on the page, and a browser that refuses outright all behave the
   // same wherever the button appears.
@@ -544,6 +580,11 @@ export function RemoteDesktopPanel({
   }
   const manager = connectionManager ?? ownedConnectionManagerRef.current!;
   const hostKey = remoteDesktopHostKey(machine);
+  const resolvedQuickData = quickData ?? NOOP_QUICK_DATA;
+  const quickInputContextRef = useRef({ active, inputActive, hostKey });
+  // Event handlers retained by a just-detached portal must consult the latest
+  // presentation, not the render in which the picker opened.
+  quickInputContextRef.current = { active, inputActive, hostKey };
 
   useEffect(() => () => machineDirectoryAdapter.destroy(), [machineDirectoryAdapter]);
 
@@ -561,6 +602,55 @@ export function RemoteDesktopPanel({
       if (clientRef.current === connection) clientRef.current = null;
     };
   }, [hostKey, inputActive, machine.serverId, manager]);
+
+  const hasQuickInputAuthority = useCallback((
+    connection: RemoteDesktopManagedConnection | null,
+    expected?: { hostKey: string; inputEpoch: number; client: RemoteDesktopManagedConnection } | null,
+  ): connection is RemoteDesktopManagedConnection => {
+    const context = quickInputContextRef.current;
+    if (!context.active || !context.inputActive || !connection) return false;
+    const current = connection.current();
+    if (current.state !== REMOTE_DESKTOP_STATE.DIRECT
+      && current.state !== REMOTE_DESKTOP_STATE.RELAYED) return false;
+    if (current.mode !== REMOTE_DESKTOP_ACCESS_MODE.CONTROL || !current.inputEnabled) return false;
+    return !expected || (
+      expected.client === connection
+      && expected.hostKey === context.hostKey
+      && expected.inputEpoch === current.inputEpoch
+    );
+  }, []);
+
+  useEffect(() => {
+    if (quickInputOpen && !hasQuickInputAuthority(
+      clientRef.current,
+      quickInputBindingRef.current,
+    )) {
+      quickInputBindingRef.current = null;
+      quickInputSentRef.current = false;
+      setQuickInputOpen(false);
+    }
+  }, [active, hasQuickInputAuthority, hostKey, inputActive, quickInputOpen, snapshot.inputEnabled, snapshot.inputEpoch, snapshot.mode, snapshot.state]);
+
+  useEffect(() => {
+    if (!quickInputOpen) return;
+    const syncPortalContainer = () => {
+      const fullscreenElement = document.fullscreenElement;
+      setQuickInputPortalContainer(
+        fullscreenElement && panelRef.current && fullscreenElement.contains(panelRef.current)
+          ? fullscreenElement
+          : null,
+      );
+    };
+    syncPortalContainer();
+    document.addEventListener('fullscreenchange', syncPortalContainer);
+    return () => document.removeEventListener('fullscreenchange', syncPortalContainer);
+  }, [quickInputOpen]);
+
+  useEffect(() => {
+    quickInputBindingRef.current = null;
+    quickInputSentRef.current = false;
+    setQuickInputOpen(false);
+  }, [hostKey]);
 
   useEffect(() => () => {
     if (!connectionManager) manager.stopAll(REMOTE_DESKTOP_STOP_ORIGIN.PANEL_UNMOUNT);
@@ -1676,6 +1766,58 @@ export function RemoteDesktopPanel({
     clientRef.current?.releaseAll();
   };
 
+  const openQuickInput = () => {
+    const client = clientRef.current;
+    if (!hasQuickInputAuthority(client)) return;
+    const current = client.current();
+    quickInputBindingRef.current = {
+      hostKey,
+      inputEpoch: current.inputEpoch,
+      client,
+    };
+    const fullscreenElement = document.fullscreenElement;
+    setQuickInputPortalContainer(
+      fullscreenElement && panelRef.current && fullscreenElement.contains(panelRef.current)
+        ? fullscreenElement
+        : null,
+    );
+    quickInputSentRef.current = false;
+    setQuickInputOpen(true);
+  };
+
+  const sendQuickInputText = (value: string) => {
+    const binding = quickInputBindingRef.current;
+    const client = clientRef.current;
+    const sent = Boolean(
+      value
+      && binding
+      && hasQuickInputAuthority(client, binding)
+      && binding.client.text(value),
+    );
+    quickInputSentRef.current = sent;
+    if (sent) {
+      resolvedQuickData.recordHistory(value, remoteDesktopQuickInputHistoryKey(hostKey));
+    }
+  };
+
+  const closeQuickInput = () => {
+    const sent = quickInputSentRef.current;
+    quickInputBindingRef.current = null;
+    quickInputSentRef.current = false;
+    setQuickInputOpen(false);
+    setQuickInputPortalContainer(null);
+    requestAnimationFrame(() => {
+      const context = quickInputContextRef.current;
+      if (!context.active || !context.inputActive) return;
+      if (sent && hasQuickInputAuthority(clientRef.current)) {
+        stageRef.current?.focus({ preventScroll: true });
+      } else {
+        quickInputTriggerRef.current?.querySelector<HTMLButtonElement>('button')
+          ?.focus({ preventScroll: true });
+      }
+    });
+  };
+
   const sendPastedText = (text: string): boolean => {
     if (!snapshot.inputEnabled || !text) return false;
     const sent = clientRef.current?.text(text) ?? false;
@@ -2090,6 +2232,39 @@ export function RemoteDesktopPanel({
               onClick={() => { clientRef.current?.requestUnlock(); }}
             >{t('remote_desktop.unlock')}</button>
           )}
+          <div class="remote-desktop-quick-input" ref={quickInputTriggerRef}>
+            <button
+              type="button"
+              aria-haspopup="dialog"
+              aria-label={t('remote_desktop.quick_input')}
+              aria-expanded={quickInputOpen}
+              disabled={!hasQuickInputAuthority(clientRef.current)}
+              title={inputBlockedHint()}
+              onClick={() => quickInputOpen ? closeQuickInput() : openQuickInput()}
+            >{t('remote_desktop.quick_input')}</button>
+            <QuickInputPanel
+              open={quickInputOpen}
+              onClose={closeQuickInput}
+              onSelect={sendQuickInputText}
+              onSend={sendQuickInputText}
+              agentType="claude-code"
+              sessionName={remoteDesktopQuickInputHistoryKey(hostKey)}
+              data={resolvedQuickData.data}
+              loaded={resolvedQuickData.loaded}
+              onAddCommand={resolvedQuickData.addCommand}
+              onAddPhrase={resolvedQuickData.addPhrase}
+              onRemoveCommand={resolvedQuickData.removeCommand}
+              onRemovePhrase={resolvedQuickData.removePhrase}
+              onRemoveHistory={resolvedQuickData.removeHistory}
+              onRemoveSessionHistory={resolvedQuickData.removeSessionHistory}
+              onClearHistory={resolvedQuickData.clearHistory}
+              onClearSessionHistory={resolvedQuickData.clearSessionHistory}
+              anchorRef={quickInputTriggerRef}
+              quickOnly
+              portalZIndex={REMOTE_DESKTOP_QUICK_INPUT_Z_INDEX}
+              portalContainer={quickInputPortalContainer}
+            />
+          </div>
           <button
             type="button"
             class="remote-desktop-files-trigger"

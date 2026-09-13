@@ -10,7 +10,7 @@ import zhTW from '../src/i18n/locales/zh-TW.json';
 const required = [
   'access_owner_title', 'access_public_id', 'access_create_link', 'access_secret_once', 'access_password_disable',
   'access_state_active', 'access_state_revoked', 'access_state_expired', 'access_expires_at', 'access_never_expires',
-  'access_privacy_recovery',
+  'access_privacy_recovery', 'quick_input',
 ] as const;
 
 const requiredGuest = [
