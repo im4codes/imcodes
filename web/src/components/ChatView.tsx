@@ -5,6 +5,15 @@ import { isNeverRenderedTimelineEventType, normalizeAssistantTextForDisplay } fr
  * Supports basic Markdown rendering (code blocks, inline code, bold).
  */
 import { loadFsLocalImagePreview } from '../fs-local-image-preview.js';
+import {
+  downloadPreviewWithDirectFallback,
+  isDirectFileTransferStaleHandleError,
+  isFileUploadCanceled,
+  selectPreviewDownloadDestination,
+  type DirectPreviewDownloadDestination,
+} from '../direct-file-transfer.js';
+import { beginDownloadTransfer, failDownloadTransfer } from '../download-transfer-store.js';
+import { createDownloadTransferWiring } from '../download-transfer-wiring.js';
 import { h } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } from 'preact/hooks';
 import { useCoalescedFrame } from '../hooks/useCoalescedFrame.js';
@@ -2217,26 +2226,75 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   }, [fileScopeSessionName, serverId, sessionId, t, workdir, ws]);
 
   const handleDownload = useCallback<ChatPathDownloadHandler>(async (path: string) => {
-    if (!serverId) throw new Error(t('upload.daemon_offline'));
+    if (!serverId || !ws) throw new Error(t('upload.daemon_offline'));
     const resolvedPath = resolvePreviewPath(path, workdir);
-    let downloadId = await requestPathDownloadId(resolvedPath);
-    const { downloadAttachment } = await import('../api.js');
+    const fileName = resolvedPath.split(/[/\\]/).pop() || undefined;
+    // The save dialog must open first, inside the click that asked for it; any
+    // await in front of it lets the browser refuse the picker. Choosing where
+    // the file goes is also what lets the finished row offer "Open file" and
+    // "Show in folder" — the same path the file browser downloads through.
+    let destination: DirectPreviewDownloadDestination | null;
     try {
-      if (sessionId) await downloadAttachment(serverId, downloadId, sessionId);
-      else await downloadAttachment(serverId, downloadId);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      const isStaleHandle = msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404');
-      if (!isStaleHandle) throw new Error(mapDownloadError(err));
-      downloadId = await requestPathDownloadId(resolvedPath);
-      try {
-        if (sessionId) await downloadAttachment(serverId, downloadId, sessionId);
-        else await downloadAttachment(serverId, downloadId);
-      } catch (retryErr) {
-        throw new Error(mapDownloadError(retryErr));
-      }
+      destination = await selectPreviewDownloadDestination(fileName);
+    } catch (error) {
+      if (isFileUploadCanceled(error)) return;
+      throw new Error(t('upload.download_failed'));
     }
-  }, [mapDownloadError, requestPathDownloadId, serverId, sessionId, t, workdir]);
+    const { downloadAttachment } = await import('../api.js');
+    const transfer = beginDownloadTransfer(fileName ?? resolvedPath);
+    const attempt = async (downloadId: string) => {
+      const wiring = createDownloadTransferWiring(transfer.id);
+      await downloadPreviewWithDirectFallback({
+        ws,
+        serverId,
+        previewHandle: downloadId,
+        suggestedName: fileName,
+        sessionName: fileScopeSessionName,
+        destination,
+        httpFallback: () => (sessionId
+          ? downloadAttachment(serverId, downloadId, sessionId, transfer.signal)
+          : downloadAttachment(serverId, downloadId, undefined, transfer.signal)),
+        signal: transfer.signal,
+        onSaveReady: wiring.onSaveReady,
+        onProgress: wiring.onProgress,
+        onMode: wiring.onMode,
+      });
+      wiring.complete(destination);
+    };
+    // requestPathDownloadId already rejects with a user-facing message; mapping
+    // it again would turn e.g. a timeout into a generic failure.
+    const alreadyMapped = new WeakSet<object>();
+    const requestDownloadId = async () => {
+      try {
+        return await requestPathDownloadId(resolvedPath);
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        alreadyMapped.add(error);
+        throw error;
+      }
+    };
+    const isStaleHandle = (err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      return isDirectFileTransferStaleHandleError(err)
+        || msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404');
+    };
+    try {
+      try {
+        await attempt(await requestDownloadId());
+      } catch (err) {
+        // A preview handle can expire between the request and the transfer:
+        // fetch a fresh one once, keeping the same chosen destination.
+        if (!isStaleHandle(err) || transfer.signal.aborted) throw err;
+        await attempt(await requestDownloadId());
+      }
+    } catch (err) {
+      const canceled = isFileUploadCanceled(err) || transfer.signal.aborted;
+      failDownloadTransfer(transfer.id, canceled);
+      if (canceled) return;
+      if (err instanceof Error && alreadyMapped.has(err)) throw err;
+      throw new Error(mapDownloadError(err));
+    }
+  }, [fileScopeSessionName, mapDownloadError, requestPathDownloadId, serverId, sessionId, t, workdir, ws]);
 
   const pathClickHandler = ws && !preview ? handlePathClick : undefined;
   const htmlPreviewHandler = ws && typeof ws.fsReadFile === 'function' && !preview ? handleHtmlPreview : undefined;

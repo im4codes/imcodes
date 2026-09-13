@@ -30,7 +30,6 @@ import { ImageLightbox } from './ImageLightbox.js';
 import type { ChatLocalImagePreviewLoader } from './ChatLocalImagePreview.js';
 import { buildAttachmentDownloadUrl, downloadAttachment } from '../api.js';
 import {
-  FILE_DOWNLOAD_TRANSPORT_MODE,
   downloadPreviewWithDirectFallback,
   isDirectFileTransferStaleHandleError,
   isFileUploadCanceled,
@@ -38,16 +37,11 @@ import {
   selectPreviewDownloadDestination,
   type DirectPreviewDownloadDestination,
 } from '../direct-file-transfer.js';
+import { createDownloadTransferWiring } from '../download-transfer-wiring.js';
 import {
-  DOWNLOAD_TRANSFER_ROUTE,
-  DOWNLOAD_TRANSFER_STATUS,
   beginDownloadTransfer,
-  completeDownloadTransfer,
   failDownloadTransfer,
-  reportDownloadTransferProgress,
-  setDownloadTransferSave,
   setDownloadTransferRetry,
-  updateDownloadTransfer,
 } from '../download-transfer-store.js';
 import {
   getSharedChangesKey,
@@ -1829,8 +1823,8 @@ export function FileBrowser({
     const transfer = beginDownloadTransfer(selectedPath.split(/[/\\]/).pop() || selectedPath);
     let authorizedHandle = selectedHandle;
     const runTransfer = async (signal: AbortSignal, requireCurrentSelection: boolean): Promise<void> => {
-      let handedOffToBrowser = false;
-      let savePending = false;
+      // One per attempt, so a retry starts from a clean route/save state.
+      const wiring = createDownloadTransferWiring(transfer.id);
       const download = async (handle: string) => downloadPreviewWithDirectFallback({
         ws,
         serverId,
@@ -1842,31 +1836,13 @@ export function FileBrowser({
         // retry classification and calls this at most once when it is eligible.
         httpFallback: () => downloadAttachment(serverId, handle, sessionName, signal),
         signal,
-        onSaveReady: (save) => {
-          savePending = true;
-          setDownloadTransferSave(transfer.id, save);
-        },
-        onProgress: ({ loadedBytes, totalBytes }) => {
-          reportDownloadTransferProgress(transfer.id, loadedBytes, totalBytes);
-        },
-        onMode: (mode) => {
-          if (mode === FILE_DOWNLOAD_TRANSPORT_MODE.CONNECTING) {
-            updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.PENDING, DOWNLOAD_TRANSFER_STATUS.CONNECTING);
-          } else if (mode === FILE_DOWNLOAD_TRANSPORT_MODE.DIRECT) {
-            updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.DIRECT, DOWNLOAD_TRANSFER_STATUS.TRANSFERRING);
-          } else if (mode === FILE_DOWNLOAD_TRANSPORT_MODE.FALLING_BACK) {
-            updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.HTTP, DOWNLOAD_TRANSFER_STATUS.FALLING_BACK);
-          } else if (mode === FILE_DOWNLOAD_TRANSPORT_MODE.HTTP) {
-            updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.HTTP, DOWNLOAD_TRANSFER_STATUS.TRANSFERRING);
-          } else {
-            handedOffToBrowser = true;
-            updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.BROWSER, DOWNLOAD_TRANSFER_STATUS.PREPARING);
-          }
-        },
+        onSaveReady: wiring.onSaveReady,
+        onProgress: wiring.onProgress,
+        onMode: wiring.onMode,
       });
       try {
         await download(authorizedHandle);
-        if (!savePending) completeDownloadTransfer(transfer.id, handedOffToBrowser);
+        wiring.complete(destination);
         return;
       } catch (error) {
         let failure = error;
@@ -1908,7 +1884,7 @@ export function FileBrowser({
               });
             }
             await download(freshId);
-            completeDownloadTransfer(transfer.id, handedOffToBrowser);
+            wiring.complete(destination);
             return;
           } catch (refreshError) {
             if (refreshed) failure = refreshError;

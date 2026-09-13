@@ -23,6 +23,13 @@ import {
   REMOTE_DESKTOP_OVERLAY_CLASS,
 } from '../remote-desktop-pointer-overlay.js';
 import { downloadAttachment } from '../api.js';
+import {
+  canRevealSavedDownload,
+  openSavedDownload,
+  revealSavedDownload,
+  savedDownloadFileHandle,
+  type SavedDownloadFileHandle,
+} from '../download-file-actions.js';
 import { createMachineFileHandle, type MachineListItem } from '../api/machines.js';
 import { MachineDirectoryWsAdapter } from '../machine-directory-ws-adapter.js';
 import {
@@ -383,6 +390,12 @@ export function RemoteDesktopPanel({
   } | null>(null);
   const lastTouchRemotePointRef = useRef<TouchPoint>({ x: 0.5, y: 0.5 });
   const transferControllersRef = useRef(new Map<string, AbortController>());
+  /**
+   * The saved file behind each finished fetch that has one. Only a fetch
+   * written through the save picker does; one handed to the browser's download
+   * manager is invisible to the page and gets no open/show buttons.
+   */
+  const savedFetchFilesRef = useRef(new Map<string, SavedDownloadFileHandle>());
   const displayTabLongPressRef = useRef<DisplayTabLongPress | null>(null);
   const suppressDisplayTabClickRef = useRef(false);
   const suppressDisplayTabClickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1892,6 +1905,7 @@ export function RemoteDesktopPanel({
       sampledBytes: 0,
     }]);
     setTransferError(null);
+    let handedOffToBrowser = false;
     try {
       const attachment = await createMachineFileHandle(machine.serverId, path, controller.signal);
       const transferWs = ws?.targetsServer(machine.serverId) ? ws : null;
@@ -1904,13 +1918,20 @@ export function RemoteDesktopPanel({
           destination,
           httpFallback: () => downloadAttachment(machine.serverId, attachment.id, undefined, controller.signal),
           signal: controller.signal,
-          onMode: (transport) => updateTransfer(id, { transport }),
+          onMode: (transport) => {
+            if (transport === FILE_DOWNLOAD_TRANSPORT_MODE.BROWSER) handedOffToBrowser = true;
+            updateTransfer(id, { transport });
+          },
           onProgress: ({ loadedBytes, totalBytes }) => updateDownloadTransferProgress(id, loadedBytes, totalBytes),
         });
       } else {
+        handedOffToBrowser = true;
         updateTransfer(id, { transport: FILE_DOWNLOAD_TRANSPORT_MODE.BROWSER });
         await downloadAttachment(machine.serverId, attachment.id, undefined, controller.signal);
       }
+      const savedFile = handedOffToBrowser ? null : savedDownloadFileHandle(destination?.handle);
+      // Recorded before the status flips so the finished row renders its buttons.
+      if (savedFile) savedFetchFilesRef.current.set(id, savedFile);
       updateTransfer(id, { progress: 100, status: 'done' });
     } catch (error) {
       if (isFileUploadCanceled(error)) {
@@ -2724,7 +2745,12 @@ export function RemoteDesktopPanel({
                 <button
                   type="button"
                   disabled={!transfers.some((transfer) => transfer.status !== 'transferring')}
-                  onClick={() => setTransfers((current) => current.filter((transfer) => transfer.status === 'transferring'))}
+                  onClick={() => setTransfers((current) => {
+                    for (const transfer of current) {
+                      if (transfer.status !== 'transferring') savedFetchFilesRef.current.delete(transfer.id);
+                    }
+                    return current.filter((transfer) => transfer.status === 'transferring');
+                  })}
                 >{t('remote_desktop.clear_completed_transfers')}</button>
               </div>
               <div class="remote-desktop-transfer-list" aria-live="polite">
@@ -2759,6 +2785,27 @@ export function RemoteDesktopPanel({
                         aria-label={t('remote_desktop.cancel_transfer', { name: transfer.name })}
                         onClick={() => cancelTransfer(transfer.id)}
                       >{t('upload.cancel')}</button>
+                    )}
+                    {transfer.direction === 'fetch' && transfer.status === 'done' && savedFetchFilesRef.current.has(transfer.id) && (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const savedFile = savedFetchFilesRef.current.get(transfer.id);
+                            if (savedFile) openSavedDownload(savedFile);
+                          }}
+                        >{t('downloads.open_file')}</button>
+                        {canRevealSavedDownload() && (
+                          <button
+                            type="button"
+                            title={t('downloads.open_folder_hint')}
+                            onClick={() => {
+                              const savedFile = savedFetchFilesRef.current.get(transfer.id);
+                              if (savedFile) revealSavedDownload(savedFile);
+                            }}
+                          >{t('downloads.open_folder')}</button>
+                        )}
+                      </>
                     )}
                   </div>
                 ))}

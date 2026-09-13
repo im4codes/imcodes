@@ -836,6 +836,69 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(fileApiMocks.downloadAttachment).not.toHaveBeenCalled();
   });
 
+  it('offers Open file and Show in folder on a finished fetch saved through the picker', async () => {
+    fileApiMocks.createMachineFileHandle.mockResolvedValue({ id: 'open-handle-1' });
+    const savedHandle = {
+      createWritable: vi.fn(),
+      getFile: vi.fn(async () => new File(['report'], 'report.txt', { type: 'text/plain' })),
+    };
+    directTransferMocks.selectPreviewDownloadDestination.mockResolvedValue({ handle: savedHandle });
+    directTransferMocks.downloadPreviewWithDirectFallback.mockImplementation(async (options: {
+      onMode?(mode: string): void;
+    }) => {
+      options.onMode?.('direct');
+    });
+    const picker = vi.fn(async () => []);
+    (globalThis as typeof globalThis & { showOpenFilePicker?: unknown }).showOpenFilePicker = picker;
+    const tab = { opener: {}, location: { href: '' }, close: vi.fn() };
+    const open = vi.spyOn(window, 'open').mockReturnValue(tab as unknown as Window);
+    try {
+      const ws = { targetsServer: vi.fn(() => true) };
+      const { container, getByRole, findByRole } = await renderPanel(ws, [
+        REMOTE_DESKTOP_CAPABILITY,
+        FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
+        FILE_TRANSFER_DIRECTORY_CAPABILITY,
+      ]);
+      act(() => { (getByRole('button', { name: 'remote_desktop.files' }) as HTMLButtonElement).click(); });
+      act(() => { (getByRole('button', { name: 'select-remote-file' }) as HTMLButtonElement).click(); });
+      act(() => { (getByRole('button', { name: 'remote_desktop.fetch_to_local' }) as HTMLButtonElement).click(); });
+      await vi.waitFor(() => expect(container.textContent).toContain('remote_desktop.transfer_status_done'));
+
+      act(() => { (getByRole('button', { name: 'downloads.open_file' }) as HTMLButtonElement).click(); });
+      expect(open).toHaveBeenCalledWith('', '_blank');
+      const folder = await findByRole('button', { name: 'downloads.open_folder' });
+      expect(folder.getAttribute('title')).toBe('downloads.open_folder_hint');
+      act(() => { (folder as HTMLButtonElement).click(); });
+      expect(picker).toHaveBeenCalledWith({ startIn: savedHandle });
+    } finally {
+      delete (globalThis as typeof globalThis & { showOpenFilePicker?: unknown }).showOpenFilePicker;
+      open.mockRestore();
+    }
+  });
+
+  it('offers no open buttons for a fetch handed to the browser download manager', async () => {
+    fileApiMocks.createMachineFileHandle.mockResolvedValue({ id: 'browser-handle-1' });
+    directTransferMocks.selectPreviewDownloadDestination.mockResolvedValue(null);
+    directTransferMocks.downloadPreviewWithDirectFallback.mockImplementation(async (options: {
+      onMode?(mode: string): void;
+    }) => {
+      options.onMode?.('browser');
+    });
+    const ws = { targetsServer: vi.fn(() => true) };
+    const { container, getByRole, queryByRole } = await renderPanel(ws, [
+      REMOTE_DESKTOP_CAPABILITY,
+      FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
+      FILE_TRANSFER_DIRECTORY_CAPABILITY,
+    ]);
+    act(() => { (getByRole('button', { name: 'remote_desktop.files' }) as HTMLButtonElement).click(); });
+    act(() => { (getByRole('button', { name: 'select-remote-file' }) as HTMLButtonElement).click(); });
+    act(() => { (getByRole('button', { name: 'remote_desktop.fetch_to_local' }) as HTMLButtonElement).click(); });
+    await vi.waitFor(() => expect(container.textContent).toContain('remote_desktop.transfer_status_done'));
+
+    expect(queryByRole('button', { name: 'downloads.open_file' })).toBeNull();
+    expect(queryByRole('button', { name: 'downloads.open_folder' })).toBeNull();
+  });
+
   it('classifies a canceled direct fetch as canceled instead of failed', async () => {
     fileApiMocks.createMachineFileHandle.mockResolvedValue({ id: 'cancel-handle-1' });
     directTransferMocks.selectPreviewDownloadDestination.mockResolvedValue({

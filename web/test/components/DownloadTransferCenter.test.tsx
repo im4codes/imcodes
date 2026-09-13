@@ -11,6 +11,7 @@ import {
   reportDownloadTransferProgress,
   setDownloadTransferSave,
   setDownloadTransferRetry,
+  setDownloadTransferSavedFile,
   updateDownloadTransfer,
 } from '../../src/download-transfer-store.js';
 import { DownloadTransferCenter } from '../../src/components/DownloadTransferCenter.js';
@@ -110,5 +111,38 @@ describe('DownloadTransferCenter', () => {
     await vi.waitFor(() => expect(save).toHaveBeenCalledOnce());
     expect(getDownloadTransfers()[0]?.status).toBe(DOWNLOAD_TRANSFER_STATUS.READY_TO_SAVE);
     expect(screen.getByText('downloads.save_share')).toBeTruthy();
+  });
+
+  it('offers Open file and Show in folder on a download saved to a file the page can read', () => {
+    const picker = vi.fn(async () => []);
+    (globalThis as typeof globalThis & { showOpenFilePicker?: unknown }).showOpenFilePicker = picker;
+    const tab = { opener: {}, location: { href: '' }, close: vi.fn() };
+    const open = vi.spyOn(window, 'open').mockReturnValue(tab as unknown as Window);
+    try {
+      const saved = beginDownloadTransfer('report.pdf');
+      completeDownloadTransfer(saved.id);
+      const handle = { getFile: vi.fn(async () => new File(['x'], 'report.pdf')), createWritable: vi.fn() };
+      setDownloadTransferSavedFile(saved.id, handle);
+
+      // Handed to the browser's download manager: nothing the page can open.
+      const handedOff = beginDownloadTransfer('elsewhere.zip');
+      completeDownloadTransfer(handedOff.id, true);
+
+      render(<DownloadTransferCenter />);
+
+      const openButtons = screen.getAllByText('downloads.open_file');
+      const folderButtons = screen.getAllByText('downloads.open_folder');
+      expect(openButtons).toHaveLength(1);
+      expect(folderButtons).toHaveLength(1);
+      expect(folderButtons[0]!.getAttribute('title')).toBe('downloads.open_folder_hint');
+
+      fireEvent.click(openButtons[0]!);
+      expect(open).toHaveBeenCalledWith('', '_blank');
+      fireEvent.click(folderButtons[0]!);
+      expect(picker).toHaveBeenCalledWith({ startIn: handle });
+    } finally {
+      delete (globalThis as typeof globalThis & { showOpenFilePicker?: unknown }).showOpenFilePicker;
+      open.mockRestore();
+    }
   });
 });
