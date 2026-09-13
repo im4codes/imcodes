@@ -31,6 +31,7 @@ import { CAPABILITY_AI_SYSTEM_INSTRUCTIONS } from '../../shared/capability-manag
 import { MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS } from '../../shared/mcp-tool-discovery.js';
 import {
   buildBrainSupervisedWorkDelegationContract,
+  buildBrainManualOnlyDelegationContract,
   buildBrainWorkDelegationContractRef,
 } from '../daemon/supervision-prompts.js';
 import type { SessionRecord } from '../store/session-store.js';
@@ -54,6 +55,13 @@ export interface TransportRuntimeAssemblyInput {
    * thread start/resume or a compaction, which is when the prior text is gone.
    */
   brainContractRegistered?: boolean;
+  /**
+   * This turn's answer of `isAutomaticSupervisionEnabled` for the session.
+   * Absent is treated exactly like false: a runtime that cannot establish the
+   * mode must never hand a Brain the automatic supervision duties.
+   * `brainContractRegistered` must refer to THIS variant's registration.
+   */
+  automaticSupervisionEnabled?: boolean;
   /** Full dynamic contracts that are not yet registered on this provider thread. */
   registeredSystemContractText?: string;
   attachments?: TransportAttachment[];
@@ -415,24 +423,36 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
     memorySearchGuidance,
     agentProgressGuidance,
   ].filter(Boolean).join('\n\n') || undefined;
-  // Baseline delegation/messaging contract for a Brain, re-asserted EVERY turn
-  // and deliberately independent of supervision.mode: with supervision off the
-  // Brain still must delegate through IM.codes send_message (it simply attaches
-  // no auditPolicy and runs no audit lifecycle). Audit/finalization contracts
-  // stay mode-conditional and are NOT added here.
+  // Baseline delegation contract for a Brain, re-asserted EVERY turn, in the
+  // variant the session's supervision mode selects.
+  //
+  // It used to be deliberately independent of supervision.mode, on the theory
+  // that with supervision off the Brain would "simply attach no auditPolicy and
+  // run no audit lifecycle". Nothing enforced that: the contract is a set of
+  // duties (delegate instead of implement, mint a task assignment, personally
+  // repair blocked lifecycles), and a supervision-off Brain obeyed them -- on a
+  // daily cron it minted a task, looped on recovery and dispatched its own audit.
+  // Automatic supervision is now decided by the same single authority every
+  // other automatic supervision action already asks. A supervision-off Brain
+  // keeps what the baseline exists for (delegate through IM.codes, never
+  // provider-native) and loses everything automatic; supervised work remains
+  // available when a user explicitly arranges it.
   //
   // This rides the existing turnSystemText assembly on purpose. sessionSystemText
   // becomes baseInstructions, which is sent once per thread/start|resume, so it
-  // cannot survive a compaction -- the exact failure this fixes. No parallel
-  // preamble and no persisted copy.
+  // cannot survive a compaction -- the exact failure the per-turn baseline fixes.
   // Re-asserted every turn, but by REFERENCE once registered: repeating the
   // full body each turn spends the per-turn budget on text the Brain already
   // holds. The body still returns after a thread start/resume or compaction,
-  // because that is exactly when the earlier registration is gone.
+  // and whenever the mode changes, because the other variant's registration
+  // does not stand in for this one.
+  const automaticSupervision = input.automaticSupervisionEnabled === true;
   const brainDelegationContract = input.sessionIdentity?.role === 'brain'
     ? (input.brainContractRegistered
-      ? buildBrainWorkDelegationContractRef()
-      : buildBrainSupervisedWorkDelegationContract())
+      ? buildBrainWorkDelegationContractRef(automaticSupervision)
+      : automaticSupervision
+        ? buildBrainSupervisedWorkDelegationContract()
+        : buildBrainManualOnlyDelegationContract())
     : undefined;
   const turnSystemText = [brainDelegationContract, input.registeredSystemContractText, renderedAuthoredSystemText]
     .filter(Boolean).join('\n\n') || undefined;

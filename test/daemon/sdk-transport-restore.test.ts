@@ -4,7 +4,7 @@ import path from 'node:path';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 import { writeProcessedProjection } from '../../src/store/context-store.js';
 import { isAuthoritativeCleanIdlePayload } from '../../shared/session-activity-types.js';
-import { DEFAULT_CODEX_SESSION_MODEL } from '../../src/shared/models/options.js';
+import { DEFAULT_CODEX_AUTOMATION_MODEL, DEFAULT_CODEX_SESSION_MODEL } from '../../src/shared/models/options.js';
 import { canonicalizeTransportCwd, normalizeTransportCwd } from '../../src/agent/transport-paths.js';
 
 const mocks = vi.hoisted(() => {
@@ -239,6 +239,14 @@ import { clearAllResend, enqueueResend, getResendCount, getResendEntries } from 
 import { getTransportQueueStore, resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
 import { appendTransportEvent, replayTransportHistory } from '../../src/daemon/transport-history.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
+import {
+  DEFAULT_SUPERVISION_BACKEND,
+  SUPERVISION_MODE,
+  SUPERVISION_TRANSPORT_CONFIG_KEY,
+  extractSessionSupervisionSnapshot,
+  isAutomaticSupervisionEnabled,
+  normalizeSessionSupervisionSnapshot,
+} from '../../shared/supervision-config.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
   SDK_SUBAGENT_DIAGNOSTIC,
@@ -1781,6 +1789,11 @@ describe('sdk transport session restore', () => {
     expect(mocks.claudeRuns.every((run: { prompt: string }) => promptCarriesDelegationContract(run.prompt))).toBe(true);
     expect(mocks.claudeRuns[0].prompt).toContain('"contractId":"supervision_brain_work_delegation_v1"');
     expect(mocks.claudeRuns[1].prompt).toContain('"contractRef":"supervision_brain_work_delegation_v1"');
+    // This Brain's record carries no supervision binding, so supervision is off:
+    // both the registration and its re-assertion must be the manual-only variant.
+    expect(mocks.claudeRuns[0].prompt).toContain('"automaticSupervision":false');
+    expect(mocks.claudeRuns[1].prompt).toContain('"automaticSupervision":false');
+    expect(mocks.claudeRuns.some((run: { prompt: string }) => run.prompt.includes('task_assignment'))).toBe(false);
     for (const text of ['offline-msg-1', 'offline-msg-2', 'offline-msg-3']) {
       const matchingUserEvents = timelineEmitterEmitMock.mock.calls.filter((call) => (
         call[0] === 'deck_sdk_drain_brain'
@@ -1789,6 +1802,74 @@ describe('sdk transport session restore', () => {
       ));
       expect(matchingUserEvents, `${text} should have exactly one timeline owner after restore drain`).toHaveLength(1);
     }
+  });
+
+  it('restored Brain reads its supervision mode from the LIVE session record on every turn', async () => {
+    // The wiring under test is session-manager's, not the runtime's: if the
+    // runtime were never handed a resolver it would fail closed to "off", and a
+    // Brain whose owner DID enable supervision would silently lose its contract.
+    // Built from the shared defaults, so a later model-list change cannot turn
+    // this into an unparseable (and therefore silently "off") fixture.
+    const supervised = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: DEFAULT_SUPERVISION_BACKEND,
+      model: DEFAULT_CODEX_AUTOMATION_MODEL,
+    });
+    const transportConfig: Record<string, unknown> = {
+      provider: { mode: 'safe' },
+      sharedContextNamespace: { scope: 'personal', projectId: 'sdk-mode-live' },
+      [SUPERVISION_TRANSPORT_CONFIG_KEY]: supervised,
+    };
+    // Non-vacuous precondition: the fixture really is an ENABLED snapshot.
+    expect(isAutomaticSupervisionEnabled(extractSessionSupervisionSnapshot(transportConfig))).toBe(true);
+
+    mocks.store.set('deck_sdk_mode_brain', {
+      name: 'deck_sdk_mode_brain',
+      projectName: 'sdkmode',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/sdk-mode',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      providerSessionId: 'route-mode-restore',
+      ccSessionId: 'cc-session-mode',
+      requestedModel: 'sonnet',
+      activeModel: 'sonnet',
+      transportConfig,
+    });
+    enqueueResend('deck_sdk_mode_brain', { text: 'while-supervised', commandId: 'cmd-mode-1', queuedAt: Date.now() });
+
+    await connectProvider('claude-code-sdk', {});
+    await restoreTransportSessions('claude-code-sdk');
+    const runsFor = () => mocks.claudeRuns.filter((run: { options: { env?: unknown } }) => (
+      (run.options.env as Record<string, unknown> | undefined)?.IMCODES_SESSION === 'deck_sdk_mode_brain'
+    ));
+    await vi.waitFor(() => expect(runsFor()).toHaveLength(1), { timeout: 5_000 });
+    expect(runsFor()[0].prompt).toContain('"automaticSupervision":true');
+    expect(runsFor()[0].prompt).toContain('task_assignment');
+
+    // The owner turns supervision OFF after restore. Nothing restarts; the very
+    // next turn must already see it.
+    const runtime = getTransportRuntime('deck_sdk_mode_brain');
+    expect(runtime).toBeDefined();
+    await vi.waitFor(() => expect(runtime!.getStatus()).toBe('idle'), { timeout: 5_000 });
+    const record = mocks.store.get('deck_sdk_mode_brain');
+    mocks.store.set('deck_sdk_mode_brain', {
+      ...record,
+      transportConfig: { ...transportConfig, [SUPERVISION_TRANSPORT_CONFIG_KEY]: { ...supervised, mode: SUPERVISION_MODE.OFF } },
+    });
+    runtime!.send('after-supervision-off', 'cmd-mode-2');
+    await vi.waitFor(() => expect(runsFor()).toHaveLength(2), { timeout: 5_000 });
+    const afterOff = runsFor()[1].prompt;
+    expect(afterOff, 'the variant changed, so the manual-only body is registered in full')
+      .toContain('"contractId":"supervision_brain_work_delegation_v1"');
+    expect(afterOff).toContain('"automaticSupervision":false');
+    expect(afterOff).not.toContain('task_assignment');
   });
 
   it('launchTransportSession awaits drainResend — fresh launch with pre-populated queue dispatches in order', async () => {

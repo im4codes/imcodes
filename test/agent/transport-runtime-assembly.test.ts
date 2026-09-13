@@ -174,58 +174,90 @@ describe('buildProviderContextPayload', () => {
     expect(text).not.toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
   });
 
-  for (const supervisionMode of ['off', 'manual', 'supervised_audit'] as const) {
-    it(`injects the baseline delegation contract every turn for a Brain (supervision ${supervisionMode})`, () => {
-      const build = () => buildProviderContextPayload(
-        makeProvider('full-normalized-context-injection'),
-        {
-          userMessage: 'assign these to sub-windows',
-          sessionIdentity: { sessionName: 'deck_proj_brain', label: 'Brain', role: 'brain' },
-          namespace: { scope: 'personal', projectId: 'repo-1' },
-        },
-      );
+  // The mode dimension, now REAL. The matrix this replaces iterated a mode
+  // variable it never passed into the assembly (and one of its three values,
+  // 'manual', is not even a supervision mode), so it proved only the role gate
+  // and would have passed for any mode at all.
+  //
+  // `automaticSupervisionEnabled` is the per-turn answer of the single mode
+  // authority, isAutomaticSupervisionEnabled(session supervision snapshot).
+  // Field incident behind the split: a supervision-OFF Brain on a daily cron
+  // received the full supervised-delegation contract every turn, so it minted a
+  // supervision task, drove recovery/rebind loops and dispatched its own audit
+  // for a morning report nobody asked to supervise.
+  const brainTurnText = (input: { automaticSupervisionEnabled?: boolean; brainContractRegistered?: boolean }) => (
+    buildProviderContextPayload(
+      makeProvider('full-normalized-context-injection'),
+      {
+        userMessage: 'assign these to sub-windows',
+        sessionIdentity: { sessionName: 'deck_proj_brain', label: 'Brain', role: 'brain' },
+        namespace: { scope: 'personal', projectId: 'repo-1' },
+        ...input,
+      },
+    ).turnSystemText ?? ''
+  );
 
-      // Turn 1, and turn 2 of the SAME session: both must carry it.
+  const AUTOMATIC_SUPERVISION_MARKERS = [
+    'task_assignment',
+    'coordinate_not_implement',
+    'blockedRecoveryDuty',
+    'authorityDuty',
+  ] as const;
+
+  // Absent is the fail-closed case: a runtime whose mode cannot be established
+  // must never be told to run supervision automatically.
+  for (const [label, automaticSupervisionEnabled] of [['off', false], ['absent', undefined]] as const) {
+    it(`gives a supervision-${label} Brain the manual-only contract and none of the automatic task route`, () => {
       for (const turn of [1, 2]) {
-        const payload = build();
-        expect(
-          payload.turnSystemText,
-          `turn ${turn} must carry the delegation contract per turn`,
-        ).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+        const text = brainTurnText({ automaticSupervisionEnabled });
+        // The per-turn baseline itself survives: the compaction fix stands.
+        expect(text, `turn ${turn} must still carry the delegation contract`)
+          .toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+        expect(text).toContain('"automaticSupervision":false');
+        // Supervised work is arranged by hand, never on the Brain's own initiative.
+        expect(text).toContain('explicit_user_request');
+        // The routing constraint the baseline exists for is preserved: when a
+        // Brain does delegate, it delegates through IM.codes, not provider-native.
+        expect(text).toContain('provider_native_spawn');
+        for (const automatic of AUTOMATIC_SUPERVISION_MARKERS) {
+          expect(text, `${automatic} must not reach a supervision-${label} Brain`).not.toContain(automatic);
+        }
       }
-
-      // First turn after restart/resume, and the turn after a compaction, are
-      // just fresh assemblies -- they must be identical in this respect.
-      const afterRestart = build();
-      expect(afterRestart.turnSystemText).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
-      const afterCompact = build();
-      expect(afterCompact.turnSystemText).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
     });
   }
 
-  // E (mode dimension) -- SCOPE OF THIS ASSERTION, stated precisely:
-  //
-  // This proves only that the PERMANENT BASELINE LAYER (turnSystemText) carries
-  // the same delegation contract for every mode and never smuggles audit or
-  // finalization contracts into it. It does NOT prove that supervised_audit has
-  // no audit lifecycle -- that lifecycle lives in the supervision broker's
-  // decision/continuation channel, where it remains mode-conditional and is
-  // covered by test/daemon/supervision-prompts.test.ts. Audit contracts must
-  // NOT be moved into turnSystemText to satisfy this matrix.
-  for (const mode of ['off', 'manual', 'supervised_audit'] as const) {
-    it(`keeps the baseline layer identical and audit-free for supervision ${mode}`, () => {
-      const payload = buildProviderContextPayload(
-        makeProvider('full-normalized-context-injection'),
-        {
-          userMessage: 'assign these to sub-windows',
-          sessionIdentity: { sessionName: 'deck_proj_brain', label: 'Brain', role: 'brain' },
-          namespace: { scope: 'personal', projectId: `mode-${mode}` },
-        },
-      );
-      expect(payload.turnSystemText).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
-      // Delegation authority does not drag the audit lifecycle in with it.
-      expect(payload.turnSystemText ?? '').not.toContain(SUPERVISION_CONTRACT_IDS.TASK_FINALIZATION);
-      expect(payload.turnSystemText ?? '').not.toContain(SUPERVISION_CONTRACT_IDS.CONTEXTUAL_AUDIT);
+  it('keeps the full supervised-delegation contract for a Brain with automatic supervision enabled', () => {
+    const text = brainTurnText({ automaticSupervisionEnabled: true });
+    expect(text).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+    expect(text).toContain('"automaticSupervision":true');
+    for (const automatic of AUTOMATIC_SUPERVISION_MARKERS) {
+      expect(text, `${automatic} is part of the automatic contract`).toContain(automatic);
+    }
+  });
+
+  it('makes every re-assertion name its variant, so an off reference can never stand in for the on body', () => {
+    const offRef = brainTurnText({ automaticSupervisionEnabled: false, brainContractRegistered: true });
+    const onRef = brainTurnText({ automaticSupervisionEnabled: true, brainContractRegistered: true });
+    for (const ref of [offRef, onRef]) {
+      expect(ref).toContain('"contractRef"');
+      expect(ref).not.toContain('"contractId"');
+    }
+    expect(offRef).toContain('"automaticSupervision":false');
+    expect(offRef, 'an off reference must not name the supervised carrier').not.toContain('"fullText"');
+    expect(onRef).toContain('"fullText":"supervisionDecision"');
+    expect(onRef).not.toContain('"automaticSupervision":false');
+  });
+
+  // Delegation authority never drags the audit lifecycle in with it, in either
+  // variant. The audit lifecycle lives in the supervision broker's decision and
+  // continuation channel, which is already mode-conditional; audit contracts
+  // must NOT be moved into turnSystemText.
+  for (const automaticSupervisionEnabled of [false, true, undefined]) {
+    it(`keeps the baseline layer audit-free (automaticSupervisionEnabled=${String(automaticSupervisionEnabled)})`, () => {
+      const text = brainTurnText({ automaticSupervisionEnabled });
+      expect(text).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+      expect(text).not.toContain(SUPERVISION_CONTRACT_IDS.TASK_FINALIZATION);
+      expect(text).not.toContain(SUPERVISION_CONTRACT_IDS.CONTEXTUAL_AUDIT);
     });
   }
 

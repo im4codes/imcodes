@@ -226,6 +226,7 @@ export function buildBrainSupervisedWorkDelegationContract(_locale?: Supervision
   return JSON.stringify({
     contractId: SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION,
     v: 1,
+    automaticSupervision: true,
     actor: 'Brain',
     trigger: 'user_requests_supervised_assignment_or_coordination',
     default: {
@@ -378,6 +379,48 @@ export function buildBrainSupervisedWorkDelegationContract(_locale?: Supervision
 }
 
 /**
+ * The Brain work-delegation contract for a Brain whose supervision is OFF.
+ *
+ * Chosen by the per-turn result of `isAutomaticSupervisionEnabled`, the single
+ * mode authority. The supervised variant above is a set of DUTIES -- delegate
+ * rather than implement, mint a task assignment, personally repair blocked
+ * lifecycles, never park -- and a Brain given those duties with nobody having
+ * enabled supervision runs the whole lifecycle on its own initiative. Field
+ * incident: a supervision-off Brain on a daily cron minted a supervision task,
+ * drove recovery/rebind loops and dispatched its own audit for a morning report.
+ *
+ * What is kept is the part the per-turn baseline exists for: WHEN this Brain
+ * delegates, it goes through IM.codes and never provider-native spawn. What is
+ * removed is everything automatic. Supervised work is still available -- it is
+ * arranged by hand, on an explicit user request, never by the Brain itself.
+ */
+export function buildBrainManualOnlyDelegationContract(_locale?: SupervisionUiLocale): string {
+  return JSON.stringify({
+    contractId: SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION,
+    v: 1,
+    automaticSupervision: false,
+    actor: 'Brain',
+    automatic: {
+      delegation: 'none',
+      supervisionTask: 'none',
+      audit: 'none',
+      lifecycleRecovery: 'none',
+      scheduledOrAutomatedTurn: 'no_task_no_dispatch_no_audit',
+    },
+    manual: {
+      when: 'explicit_user_request',
+      supervisionTaskAndAudit: 'allowed_as_requested',
+    },
+    delegation: {
+      when: 'explicit_user_request',
+      route: 'imcodes_visible_subsession',
+      sequence: ['send_list_targets', 'send_message'],
+      forbid: ['provider_native_spawn', 'provider_native_collaboration'],
+    },
+  });
+}
+
+/**
  * Compact re-assertion of the Brain work-delegation contract.
  *
  * The full contract is ~830 characters and belongs where Brain actually makes
@@ -391,11 +434,17 @@ export function buildBrainSupervisedWorkDelegationContract(_locale?: Supervision
  * mechanically distinguishable -- the same discipline the continuation prompts
  * already use.
  */
-export function buildBrainWorkDelegationContractRef(): string {
-  return JSON.stringify({
-    contractRef: SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION,
-    fullText: 'supervisionDecision',
-  });
+export function buildBrainWorkDelegationContractRef(automaticSupervision: boolean): string {
+  // Both variants share one contractId, so the reference must say which one it
+  // means. The supervised reference is byte-identical to what it always was --
+  // `fullText` names the supervision decision entrypoints that carry its body,
+  // and the execution preambles that embed it have no bytes to spare. The
+  // manual-only reference names its variant explicitly and has NO `fullText`:
+  // those entrypoints carry the supervised body, so pointing a supervision-off
+  // Brain there would hand it exactly the automatic duties it must not have.
+  return JSON.stringify(automaticSupervision
+    ? { contractRef: SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION, fullText: 'supervisionDecision' }
+    : { contractRef: SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION, automaticSupervision: false });
 }
 
 /**
@@ -637,7 +686,7 @@ export function buildSupervisedAuditExecutionPreamble(locale?: SupervisionUiLoca
   return [
     SUPERVISION_CONTRACT_PREAMBLE_START,
     buildSupervisionOrchestratorContext(locale),
-    buildBrainWorkDelegationContractRef(),
+    buildBrainWorkDelegationContractRef(true),
     buildSupervisionContinuationRepairContractRef(),
     buildSupervisionTaskFinalizationContract(locale),
     buildSupervisionTaskRegistryContract(locale),
@@ -654,7 +703,7 @@ export function buildSupervisionExecutionPreamble(locale?: SupervisionUiLocale):
   return [
     SUPERVISION_CONTRACT_PREAMBLE_START,
     buildSupervisionOrchestratorContext(locale),
-    buildBrainWorkDelegationContractRef(),
+    buildBrainWorkDelegationContractRef(true),
     buildSupervisionContinuationRepairContractRef(),
     buildSupervisionTaskFinalizationContract(locale),
     buildSupervisionTaskRegistryContract(locale),
@@ -1625,6 +1674,10 @@ export const SUPERVISION_PROMPT_BUILDER_REGISTRY_EXCLUSIONS = [
   {
     builderName: 'buildBrainSupervisedWorkDelegationContract',
     reason: 'Contract segment builder; it is injected into registered Brain-facing entrypoints instead of being a standalone prompt entrypoint.',
+  },
+  {
+    builderName: 'buildBrainManualOnlyDelegationContract',
+    reason: 'Contract segment builder; the per-turn assembly injects it for a supervision-off Brain instead of the supervised variant, never as a standalone prompt entrypoint.',
   },
   {
     builderName: 'buildSupervisionTaskFinalizationContract',

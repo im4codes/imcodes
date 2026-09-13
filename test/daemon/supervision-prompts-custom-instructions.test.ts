@@ -55,6 +55,9 @@ describe('supervision prompt custom-instructions merge', () => {
       expect(contract).toEqual({
         contractId: SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION,
         v: 1,
+        // The supervised variant names itself; a supervision-off Brain receives
+        // buildBrainManualOnlyDelegationContract instead of this body.
+        automaticSupervision: true,
         actor: 'Brain',
         trigger: 'user_requests_supervised_assignment_or_coordination',
         default: {
@@ -419,11 +422,24 @@ describe('Brain work-delegation contract placement and budget', () => {
   });
 
   it('names where the full text lives so the reference is actionable', () => {
-    const ref = JSON.parse(buildBrainWorkDelegationContractRef());
+    const ref = JSON.parse(buildBrainWorkDelegationContractRef(true));
     expect(ref.contractRef).toBe(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
     const carrier = SUPERVISION_PROMPT_ENTRYPOINTS
       .find((entry) => entry.id === ref.fullText);
     expect(carrier?.includesBrainWorkDelegationContract).toBe(true);
+  });
+
+  it('never points a supervision-off reference at the supervised full text', () => {
+    // Every entrypoint that carries a full delegation body carries the SUPERVISED
+    // body. A manual-only reference that named one of them would route a Brain
+    // whose supervision is off straight back to the automatic duties.
+    const ref = JSON.parse(buildBrainWorkDelegationContractRef(false));
+    expect(ref.contractRef).toBe(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+    expect(ref.automaticSupervision).toBe(false);
+    expect(ref.fullText).toBeUndefined();
+    for (const entry of SUPERVISION_PROMPT_ENTRYPOINTS.filter((candidate) => candidate.includesBrainWorkDelegationContract)) {
+      expect(entry.render()).not.toContain('"automaticSupervision":false');
+    }
   });
 
   it('keeps the contract standing via the trusted execution list', () => {
@@ -511,7 +527,7 @@ describe('Brain work-delegation contract placement and budget', () => {
     // `contractRef`, not `contractId`: referencing and carrying are kept
     // mechanically distinguishable, which is what makes the assertion above
     // ("not restated here") meaningful rather than accidental.
-    const ref = JSON.parse(buildBrainWorkDelegationContractRef()) as { contractRef: string };
+    const ref = JSON.parse(buildBrainWorkDelegationContractRef(true)) as { contractRef: string };
     expect(ref.contractRef).toBe(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
   });
 

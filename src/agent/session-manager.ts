@@ -102,6 +102,7 @@ import { clearSummarySyncHistory, getSummarySyncFingerprints } from '../context/
 import { getAuthenticatedCapabilityOwner } from '../capability/capability-authorization.js';
 import { registerMasterCompaction } from '../daemon/master-compaction-registry.js';
 import type { DaemonTransportQueuesSnapshot } from '../util/daemon-status.js';
+import { extractSessionSupervisionSnapshot } from '../../shared/supervision-config.js';
 
 function isStoredTransportSession(record: Pick<SessionRecord, 'runtimeType' | 'agentType'>): boolean {
   return record.runtimeType === RUNTIME_TYPES.TRANSPORT
@@ -1757,6 +1758,12 @@ function wireTransportCallbacks(
   sessionName: string,
   options: { deferProviderReadyDrain?: boolean } = {},
 ): void {
+  // The Brain delegation contract variant follows the session's supervision
+  // mode, read from the LIVE record on every turn -- never captured here -- so
+  // turning supervision off takes effect on the next turn without a restart.
+  runtime.setSupervisionSnapshotResolver(
+    () => extractSessionSupervisionSnapshot(getSession(sessionName)?.transportConfig ?? null),
+  );
   const transportUserEventId = (clientMessageId: string) => `transport-user:${clientMessageId}`;
   const persistTransportState = (state: unknown, error?: string): void => {
     if (state !== 'running' && state !== 'idle' && state !== 'error') return;

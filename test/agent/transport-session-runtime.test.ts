@@ -160,6 +160,92 @@ describe('TransportSessionRuntime memory provenance', () => {
     expect(secondPayload.systemText).not.toContain('inspect progress');
   });
 
+  // The Brain delegation contract is chosen from the session's LIVE supervision
+  // mode on every turn. A Brain whose supervision is off must never be handed the
+  // automatic task route, and the by-reference shortcut must never let one
+  // variant's registration stand in for the other after the mode changes.
+  describe('Brain delegation contract follows the live supervision mode', () => {
+    async function brainRuntime(sessionName: string) {
+      let complete: ((sessionId: string, message: AgentMessage) => void) | undefined;
+      const provider = makeProvider();
+      provider.onComplete = (callback) => {
+        complete = callback;
+        return () => undefined;
+      };
+      const runtime = new TransportSessionRuntime(provider, sessionName);
+      await runtime.initialize({ sessionKey: sessionName });
+      runtime.setSessionIdentity(sessionName, 'Brain', 'brain');
+      const send = provider.send as ReturnType<typeof vi.fn>;
+      let turn = 0;
+      const nextTurnText = async (): Promise<string> => {
+        turn += 1;
+        send.mockClear();
+        runtime.send(`turn-${turn}`, `turn-${turn}`);
+        await waitForProviderSend(provider);
+        const text = String(send.mock.calls[0]?.[1]?.systemText ?? '');
+        complete?.('provider-session-1', {
+          id: `done-${turn}`, sessionId: 'provider-session-1', kind: 'text', role: 'assistant',
+          content: 'done', timestamp: Date.now(), status: 'complete',
+        });
+        await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'));
+        return text;
+      };
+      return { runtime, nextTurnText };
+    }
+
+    const OFF_BODY = '"automaticSupervision":false';
+    const ON_BODY = '"automaticSupervision":true';
+    const FULL = '"contractId":"supervision_brain_work_delegation_v1"';
+    const REF = '"contractRef":"supervision_brain_work_delegation_v1"';
+
+    it('re-reads the mode every turn and re-registers the full body whenever the variant changes', async () => {
+      const { runtime, nextTurnText } = await brainRuntime('deck_mode_switch_brain');
+      let mode: 'off' | 'supervised' = 'off';
+      runtime.setSupervisionSnapshotResolver(() => ({ mode }));
+
+      const offFirst = await nextTurnText();
+      expect(offFirst).toContain(FULL);
+      expect(offFirst).toContain(OFF_BODY);
+      expect(offFirst).not.toContain('task_assignment');
+
+      const offAgain = await nextTurnText();
+      expect(offAgain, 'the same variant re-asserts by reference').toContain(REF);
+      expect(offAgain).not.toContain(FULL);
+      expect(offAgain).toContain(OFF_BODY);
+
+      mode = 'supervised';
+      const onFirst = await nextTurnText();
+      expect(onFirst, 'an off registration must not satisfy the on variant').toContain(FULL);
+      expect(onFirst).toContain(ON_BODY);
+      expect(onFirst).toContain('task_assignment');
+
+      mode = 'off';
+      const offAfterOn = await nextTurnText();
+      expect(offAfterOn, 'turning supervision off re-registers the manual-only body').toContain(FULL);
+      expect(offAfterOn).toContain(OFF_BODY);
+      expect(offAfterOn).not.toContain('task_assignment');
+    });
+
+    it('fails closed to the manual-only contract when the mode cannot be established', async () => {
+      const unresolved = await brainRuntime('deck_mode_unresolved_brain');
+      const noResolver = await unresolved.nextTurnText();
+      expect(noResolver).toContain(OFF_BODY);
+      expect(noResolver).not.toContain('task_assignment');
+
+      const throwing = await brainRuntime('deck_mode_throwing_brain');
+      throwing.runtime.setSupervisionSnapshotResolver(() => { throw new Error('session store unavailable'); });
+      const thrown = await throwing.nextTurnText();
+      expect(thrown).toContain(OFF_BODY);
+      expect(thrown).not.toContain('task_assignment');
+
+      const unknown = await brainRuntime('deck_mode_unknown_brain');
+      unknown.runtime.setSupervisionSnapshotResolver(() => ({ mode: 'manual' as never }));
+      const unknownText = await unknown.nextTurnText();
+      expect(unknownText).toContain(OFF_BODY);
+      expect(unknownText).not.toContain('task_assignment');
+    });
+  });
+
   it('preserves semantic recent-summary sourceSessionName through emitted memory.context', async () => {
     const result: MemorySearchResult = {
       items: [{

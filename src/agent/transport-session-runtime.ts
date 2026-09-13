@@ -89,6 +89,8 @@ import {
   SUPERVISION_CONTRACT_PREAMBLE_END,
   SUPERVISION_CONTRACT_PREAMBLE_START,
   SUPERVISION_CONTRACTS_IN_FORCE_REFERENCE,
+  isAutomaticSupervisionEnabled,
+  type SessionSupervisionSnapshot,
 } from '../../shared/supervision-config.js';
 import { clampUserSessionText } from '../../shared/user-session-text-caps.js';
 import { resolveRuntimeAuthoredContext } from '../context/shared-context-runtime.js';
@@ -513,11 +515,19 @@ export class TransportSessionRuntime implements SessionRuntime {
    */
   private _sessionIdentity: { sessionName: string; label: string | null; role?: SessionRecord['role'] } | undefined;
   /**
-   * Whether the full Brain work-delegation contract body has been registered on
-   * the CURRENT thread. Reset on thread (re)creation and on compaction, because
-   * those are exactly the points where the registered text no longer exists.
+   * Which Brain work-delegation contract VARIANT has its full body registered on
+   * the CURRENT thread: the automaticSupervision value it was built for, or null
+   * when none is. Reset on thread (re)creation and on compaction, because those
+   * are exactly the points where the registered text no longer exists. Keyed by
+   * variant because a registration of one never stands in for the other.
    */
-  private _brainContractRegistered = false;
+  private _brainContractRegisteredVariant: boolean | null = null;
+  /**
+   * Reads the session's CURRENT supervision snapshot. Consulted on every turn,
+   * so a mode change takes effect on the next turn without a restart.
+   */
+  private _supervisionSnapshotResolver:
+    (() => Pick<SessionSupervisionSnapshot, 'mode'> | null | undefined) | null = null;
   private _registeredSystemContractSignatures = new Map<string, string>();
   private _agentId: string | undefined;
   private _effort: TransportEffortLevel | undefined;
@@ -754,7 +764,7 @@ export class TransportSessionRuntime implements SessionRuntime {
           this.provider.refreshSessionSystemText?.(this._providerSessionId);
           // Compaction discards the registered contract body, so the next turn
           // must register it again rather than reference text that is gone.
-          this._brainContractRegistered = false;
+          this._brainContractRegisteredVariant = null;
           this._registeredSystemContractSignatures.clear();
         }
         this.clearStalePendingCancelFallbackTimer();
@@ -1029,6 +1039,27 @@ export class TransportSessionRuntime implements SessionRuntime {
       label: label?.trim() || null,
       ...(role ? { role } : {}),
     };
+  }
+  setSupervisionSnapshotResolver(
+    resolver: (() => Pick<SessionSupervisionSnapshot, 'mode'> | null | undefined) | null,
+  ): void {
+    this._supervisionSnapshotResolver = resolver;
+  }
+
+  /**
+   * This turn's answer from the single supervision mode authority. Anything that
+   * prevents establishing the mode -- no resolver, a throwing resolver, an
+   * unknown mode -- answers false: automatic supervision fails closed.
+   */
+  private resolveAutomaticSupervisionEnabled(): boolean {
+    const resolver = this._supervisionSnapshotResolver;
+    if (!resolver) return false;
+    try {
+      return isAutomaticSupervisionEnabled(resolver() ?? null);
+    } catch (err) {
+      logger.warn({ err, sessionKey: this.sessionKey }, 'supervision mode unavailable; treating automatic supervision as off');
+      return false;
+    }
   }
   setAgentId(agentId: string): void {
     this._agentId = agentId;
@@ -2060,7 +2091,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._initializingProviderSessionId = config.bindExistingKey ?? config.sessionKey;
     try {
       this._providerSessionId = await this.provider.createSession(config);
-      this._brainContractRegistered = false;
+      this._brainContractRegisteredVariant = null;
       this._registeredSystemContractSignatures.clear();
     } finally {
       this._initializingProviderSessionId = null;
@@ -3462,6 +3493,9 @@ export class TransportSessionRuntime implements SessionRuntime {
       // it does NOT ride the per-turn payload at all.
       this.bindActiveSummarySyncReservation(dispatchId, summarySyncReservation);
       summarySyncReservation = undefined;
+      // Decided once per turn and used for both the assembly and the
+      // registration below, so the variant sent is the variant recorded.
+      const automaticSupervisionEnabled = this.resolveAutomaticSupervisionEnabled();
       const dispatchResult = await dispatchSharedContextSend(this.provider, this._providerSessionId!, {
         userMessage: providerMessage,
         deliveryId: this._activeDispatchEntries.map((entry) => entry.clientMessageId).join('\n'),
@@ -3487,7 +3521,8 @@ export class TransportSessionRuntime implements SessionRuntime {
         authoredContextLanguage: isSlashControl ? undefined : this._contextAuthoredContextLanguage,
         authoredContextFilePath: isSlashControl ? undefined : this._contextAuthoredContextFilePath,
         ...(this._sessionIdentity ? { sessionIdentity: this._sessionIdentity } : {}),
-        brainContractRegistered: this._brainContractRegistered,
+        automaticSupervisionEnabled,
+        brainContractRegistered: this._brainContractRegisteredVariant === automaticSupervisionEnabled,
         registeredSystemContractText,
         ...(startupMemory ? { startupMemory } : {}),
         ...(memoryRecall ? { memoryRecall } : {}),
@@ -3530,9 +3565,10 @@ export class TransportSessionRuntime implements SessionRuntime {
         this.scheduleActiveAppendFlush(dispatchId);
       }
       this._recoverableDispatchRetries = 0;
-      // The contract body reached the provider on this turn, so later turns on
-      // the same thread re-assert it by reference instead of resending it.
-      this._brainContractRegistered = true;
+      // This variant's contract body (or its reference, when it was already
+      // registered) reached the provider on this turn, so later turns on the
+      // same thread re-assert it by reference -- until the mode changes.
+      this._brainContractRegisteredVariant = automaticSupervisionEnabled;
       for (const entry of this._activeDispatchEntries) {
         const contract = entry.registeredSystemContract;
         if (contract) this._registeredSystemContractSignatures.set(contract.contractId, contract.signature);
