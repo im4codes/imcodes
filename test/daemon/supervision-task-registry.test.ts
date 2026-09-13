@@ -1,5 +1,5 @@
-import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
+import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -33,6 +33,7 @@ import { createSupervisionRegistryPort } from '../../src/daemon/supervision-regi
 import { supervisionIdentityMatches } from '../../shared/supervision-participant-authority.js';
 import { getDelegationReplyStore } from '../../src/daemon/delegation-reply-store.js';
 import { resolveSupervisionAssignmentWorktree } from '../../src/daemon/supervision-worktree-inspector.js';
+import { freezeSupervisionIntegrationBundle } from '../../src/daemon/supervision-integration-bundle.js';
 
 /** Adapts the real registry to the audited handler port. */
 function supervisionRegistryPort(registryOverride?: SupervisionTaskRegistry) {
@@ -4282,6 +4283,474 @@ describe('SupervisionTaskRegistry', () => {
       registry.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('atomically supersedes the exact finalized R3 REWORK with PASS on unchanged frozen bytes', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'imcodes-tsk-hbd-audit-correction-'));
+    const source = join(root, 'source');
+    const taskId = 'tsk_hbd';
+    const implementerId = 'asg_hbg';
+    const auditorId = 'asg_hkf';
+    const attemptId = 'auto-audit-1be0ba7439a99c121e2aaf76';
+    const revision = 'retire-audit-ready-marker-cx1-r3-production-shape';
+    const sourceText = 'export const waitingMarker = true;\n';
+    const sourceIdentity = identity('deck_hbd_implementer');
+    const auditorIdentity = identity('deck_hbd_auditor', 'claude-code-sdk');
+    mkdirSync(join(source, 'src/daemon'), { recursive: true });
+    writeFileSync(join(source, 'src/daemon/supervision-prompts.ts'), sourceText);
+    const snapshot = {
+      worktreePath: source,
+      headSha: 'c'.repeat(40),
+      files: [{
+        path: 'src/daemon/supervision-prompts.ts',
+        sha256: createHash('sha256').update(sourceText).digest('hex'),
+      }],
+      stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
+    };
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    try {
+      expect(registry.createOrGet({
+        taskId, projectName: 'cd', classification: 'independent_top_level',
+        objective: 'Retire AUDIT_READY while preserving mandatory WAITING',
+        currentRevision: revision,
+      })).toMatchObject({ ok: true });
+      const implementer = registry.createAssignment({
+        taskId, assignmentId: implementerId, role: 'implementer', identity: sourceIdentity,
+        scopeFiles: snapshot.files.map((file) => file.path), auditRevision: revision,
+      });
+      if (!implementer.ok) throw new Error(implementer.reason);
+      expect(registry.applyTaskIntent({
+        taskId, assignmentId: implementerId, intent: 'start', toStatus: 'implementing',
+      })).toMatchObject({ ok: true });
+      const frozen = freezeSupervisionIntegrationBundle({
+        taskId, assignmentId: implementerId, revision, snapshot,
+        bundleRoot: join(root, 'bundles'),
+      });
+      if (!frozen.ok) throw new Error(frozen.reason);
+      expect(registry.bindIntegrationBundle({
+        taskId, assignmentId: implementerId, identity: sourceIdentity, revision, bundle: frozen.bundle,
+      })).toMatchObject({ ok: true });
+      expect(registry.applyTaskIntent({
+        taskId, assignmentId: implementerId, intent: 'record_validation',
+        toStatus: 'validated', validationState: 'passed',
+      })).toMatchObject({ ok: true });
+      expect(registry.applyTaskIntent({
+        taskId, assignmentId: implementerId, intent: 'open_audit', toStatus: 'ready_for_audit',
+      })).toMatchObject({ ok: true });
+      const auditor = registry.createAssignment({
+        taskId, assignmentId: auditorId, role: 'auditor', identity: auditorIdentity,
+        required: false, auditAttemptId: attemptId, auditRevision: revision,
+      });
+      if (!auditor.ok) throw new Error(auditor.reason);
+      expect(registry.updateAssignment({
+        assignmentId: auditorId, identity: auditorIdentity, status: 'auditing',
+        auditAttemptId: attemptId, auditRevision: revision,
+      })).toMatchObject({ ok: true });
+      const obsolete = registry.appendMatchingAuditReceipt({
+        taskId, auditorAssignmentId: auditorId, attemptId, revision,
+        receiptKind: 'final', verdict: 'REWORK', auditedSessionName: sourceIdentity.sessionName,
+        auditorSessionName: auditorIdentity.sessionName, auditorIdentity,
+        findings: 'Incorrectly treated mandatory WAITING as a failure.', validations: [], now: 100,
+      });
+      expect(obsolete).toMatchObject({ ok: true, value: { sequence: 1, verdict: 'REWORK' } });
+      expect(registry.finishAssignment({
+        assignmentId: auditorId, identity: auditorIdentity, revision, now: 110,
+      })).toMatchObject({ ok: true, value: { status: 'finalized' } });
+      expect(registry.get(taskId)).toMatchObject({ status: 'rework' });
+      expect(registry.getAssignment(implementerId)).toMatchObject({ status: 'rework', verdict: 'REWORK' });
+      const immutableObsoleteReceipt = JSON.stringify(registry.listAuditReceipts(taskId)[0]);
+
+      const peerAuditReply = vi.fn(async () => ({ ok: false, error: 'attempt_mismatch' }));
+      const inspectSupervisionWorktree = vi.fn(async () => ({ ok: true as const, snapshot }));
+      const handlers = createMemoryMcpToolHandlers({
+        userId: 'u', namespace: { scope: 'user_private', userId: 'u', projectId: 'cd' },
+        sessionName: auditorIdentity.sessionName, projectName: 'cd', projectRoot: source,
+        serverId: 'srv', transport: 'in_process', providerId: null,
+      }, {
+        peerAuditReply,
+        inspectSupervisionWorktree,
+        supervisionTaskRegistry: registry,
+        sendDeps: { listSessions: () => [session(auditorIdentity.sessionName, 'cd', 'claude-code-sdk')] },
+      });
+      const replyInput = {
+        taskId, assignmentId: auditorId, attemptId, revision,
+        receiptKind: 'final' as const, verdict: 'PASS' as const,
+        findings: 'PASS under the newer authoritative WAITING directive; bytes are unchanged.',
+        validations: [{ kind: 'test' as const, label: 'WAITING contract', outcome: 'passed' as const, summary: 'Exact R3 bytes satisfy the corrected directive.' }],
+      };
+      const rotated = {
+        ...session(auditorIdentity.sessionName, 'cd', 'claude-code-sdk'),
+        sessionInstanceId: 'foreign-instance', runtimeEpoch: 'foreign-epoch',
+      };
+      const rotatedHandlers = createMemoryMcpToolHandlers({
+        userId: 'u', namespace: { scope: 'user_private', userId: 'u', projectId: 'cd' },
+        sessionName: auditorIdentity.sessionName, projectName: 'cd', projectRoot: source,
+        serverId: 'srv', transport: 'in_process', providerId: null,
+      }, {
+        peerAuditReply, inspectSupervisionWorktree, supervisionTaskRegistry: registry,
+        sendDeps: { listSessions: () => [rotated] },
+      });
+
+      await expect(rotatedHandlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY](replyInput)).resolves.toMatchObject({
+        status: 'error', message: 'peer audit correction rejected: owner_mismatch',
+      });
+      expect(registry.listAuditReceipts(taskId)).toHaveLength(1);
+      const foreignProjectHandlers = createMemoryMcpToolHandlers({
+        userId: 'u', namespace: { scope: 'user_private', userId: 'u', projectId: 'foreign' },
+        sessionName: auditorIdentity.sessionName, projectName: 'foreign', projectRoot: source,
+        serverId: 'srv', transport: 'in_process', providerId: null,
+      }, {
+        peerAuditReply, inspectSupervisionWorktree, supervisionTaskRegistry: registry,
+        sendDeps: { listSessions: () => [session(auditorIdentity.sessionName, 'foreign', 'claude-code-sdk')] },
+      });
+      await expect(foreignProjectHandlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY](replyInput)).resolves.toMatchObject({
+        status: 'error', message: 'attempt_mismatch',
+      });
+      expect(registry.listAuditReceipts(taskId)).toHaveLength(1);
+      expect(peerAuditReply).toHaveBeenCalledTimes(1);
+      peerAuditReply.mockClear();
+
+      const exactTask = registry.get(taskId)!;
+      rewritePersistedTask(database, { ...exactTask, currentRevision: undefined });
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY](replyInput)).resolves.toMatchObject({
+        status: 'error', message: 'peer audit correction rejected: old_revision',
+      });
+      expect(registry.listAuditReceipts(taskId)).toHaveLength(1);
+      rewritePersistedTask(database, exactTask);
+
+      for (const [label, changedSnapshot] of [
+        ['different HEAD', { ...snapshot, headSha: 'd'.repeat(40) }],
+        ['different file bytes at the same HEAD', {
+          ...snapshot,
+          files: [{ ...snapshot.files[0]!, sha256: 'e'.repeat(64) }],
+        }],
+        ['staged bytes at the same HEAD', {
+          ...snapshot,
+          stagedPaths: [snapshot.files[0]!.path],
+        }],
+        ['conflicted bytes at the same HEAD', {
+          ...snapshot,
+          conflictedPaths: [snapshot.files[0]!.path],
+        }],
+      ] as const) {
+        inspectSupervisionWorktree.mockResolvedValueOnce({
+          ok: true as const,
+          snapshot: changedSnapshot,
+        });
+        await expect(
+          handlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY](replyInput),
+          label,
+        ).resolves.toMatchObject({
+          status: 'error', message: 'peer audit correction rejected: manifest_mismatch',
+        });
+        expect(registry.listAuditReceipts(taskId), label).toHaveLength(1);
+      }
+
+      for (const [label, taskPatch] of [
+        ['commit SHA', { commitSha: 'f'.repeat(40) }],
+        ['push ref', { pushRemoteRef: 'refs/remotes/origin/dev' }],
+      ] as const) {
+        const beforeGitBoundary = registry.getTaskRecord(taskId)!;
+        rewritePersistedTask(database, {
+          ...beforeGitBoundary,
+          status: 'rework',
+          ...taskPatch,
+        });
+        await expect(
+          handlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY](replyInput),
+          label,
+        ).resolves.toMatchObject({
+          status: 'error', message: 'peer audit correction rejected: receipt_closed',
+        });
+        expect(registry.getTaskRecord(taskId)?.status, label).toBe('rework');
+        expect(registry.listAuditReceipts(taskId), label).toHaveLength(1);
+        rewritePersistedTask(database, beforeGitBoundary);
+      }
+
+      const activeIntegrationOwner = registry.createAssignment({
+        taskId, assignmentId: 'asg_hbd_active_integration_owner', role: 'integration_owner',
+        identity: identity('deck_hbd_integration_owner'), required: false,
+        auditAttemptId: attemptId, auditRevision: revision,
+      });
+      if (!activeIntegrationOwner.ok) throw new Error(activeIntegrationOwner.reason);
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY](replyInput)).resolves.toMatchObject({
+        status: 'error', message: 'peer audit correction rejected: manifest_mismatch',
+      });
+      expect(registry.getTaskRecord(taskId)?.status).toBe('rework');
+      expect(registry.listAuditReceipts(taskId)).toHaveLength(1);
+      expect(registry.applyTaskIntent({
+        taskId, assignmentId: activeIntegrationOwner.value.assignmentId,
+        intent: 'cancel', toStatus: 'cancelled',
+      })).toMatchObject({ ok: true });
+
+      for (const claimedAssignmentId of [implementerId, auditorId]) {
+        database.prepare(`INSERT INTO supervision_task_file_claims
+          (task_id, assignment_id, file_path, claim_mode, created_at)
+          VALUES (?, ?, ?, 'exclusive', ?)`)
+          .run(taskId, claimedAssignmentId, snapshot.files[0]!.path, 120);
+        await expect(
+          handlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY](replyInput),
+          `active claim on ${claimedAssignmentId}`,
+        ).resolves.toMatchObject({
+          status: 'error', message: 'peer audit correction rejected: manifest_mismatch',
+        });
+        expect(registry.listAuditReceipts(taskId), claimedAssignmentId).toHaveLength(1);
+        database.prepare(`DELETE FROM supervision_task_file_claims
+          WHERE task_id = ? AND assignment_id = ?`).run(taskId, claimedAssignmentId);
+      }
+
+      const ambiguous = registry.createAssignment({
+        taskId, assignmentId: 'asg_hbd_ambiguous', role: 'implementer',
+        identity: identity('deck_hbd_other'), auditRevision: revision,
+      });
+      if (!ambiguous.ok) throw new Error(ambiguous.reason);
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY](replyInput)).resolves.toMatchObject({
+        status: 'error', message: 'peer audit correction rejected: manifest_mismatch',
+      });
+      expect(registry.listAuditReceipts(taskId)).toHaveLength(1);
+      expect(registry.applyTaskIntent({
+        taskId, assignmentId: ambiguous.value.assignmentId, intent: 'cancel', toStatus: 'cancelled',
+      })).toMatchObject({ ok: true });
+
+      const ambiguousAuditor = registry.createAssignment({
+        taskId, assignmentId: 'asg_hbd_ambiguous_auditor', role: 'auditor',
+        identity: identity('deck_hbd_other_auditor', 'claude-code-sdk'), required: false,
+        auditAttemptId: `${attemptId}-other`, auditRevision: revision,
+      });
+      if (!ambiguousAuditor.ok) throw new Error(ambiguousAuditor.reason);
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY](replyInput)).resolves.toMatchObject({
+        status: 'error', message: 'peer audit correction rejected: conflicting_replay',
+      });
+      expect(registry.listAuditReceipts(taskId)).toHaveLength(1);
+      expect(registry.applyTaskIntent({
+        taskId, assignmentId: ambiguousAuditor.value.assignmentId, intent: 'cancel', toStatus: 'cancelled',
+      })).toMatchObject({ ok: true });
+
+      const exactImplementer = registry.getAssignment(implementerId)!;
+      rewritePersistedAssignment(database, {
+        ...exactImplementer,
+        identity: identity(sourceIdentity.sessionName, 'claude-code-sdk'),
+      });
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY](replyInput)).resolves.toMatchObject({
+        status: 'error', message: 'peer audit correction rejected: manifest_mismatch',
+      });
+      expect(registry.listAuditReceipts(taskId)).toHaveLength(1);
+      rewritePersistedAssignment(database, exactImplementer);
+
+      const corrected = await handlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY](replyInput);
+
+      expect(corrected).toMatchObject({
+        status: 'ok', accepted: true, supersedingFinalReceipt: true,
+      });
+      expect(peerAuditReply).not.toHaveBeenCalled();
+      expect(inspectSupervisionWorktree).toHaveBeenCalledWith({
+        sessionName: sourceIdentity.sessionName, assignmentId: implementerId,
+      });
+      expect(registry.listAuditReceipts(taskId)).toEqual([
+        expect.objectContaining({ receiptId: obsolete.ok ? obsolete.value.receiptId : undefined, verdict: 'REWORK' }),
+        expect.objectContaining({ sequence: 2, verdict: 'PASS', supersedesReceiptId: obsolete.ok ? obsolete.value.receiptId : undefined }),
+      ]);
+      expect(JSON.stringify(registry.listAuditReceipts(taskId)[0])).toBe(immutableObsoleteReceipt);
+      expect(registry.get(taskId)).toMatchObject({ status: 'ready_for_integration' });
+      expect(registry.get(taskId)).not.toHaveProperty('blocker');
+      expect(registry.getAssignment(implementerId)).toMatchObject({
+        status: 'ready_for_integration', verdict: 'PASS', auditAttemptId: attemptId,
+        auditRevision: revision, crossVendorAuditPassed: true,
+      });
+      expect(registry.getAssignment(implementerId)).not.toHaveProperty('blocker');
+      expect(registry.getAssignment(auditorId)).toMatchObject({
+        status: 'finalized', verdict: 'PASS',
+      });
+      expect(registry.getAssignment(auditorId)).not.toHaveProperty('blocker');
+
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY](replyInput)).resolves.toMatchObject({
+        status: 'ok', accepted: true, supersedingFinalReceipt: true, idempotentReplay: true,
+      });
+      expect(registry.listAuditReceipts(taskId)).toHaveLength(2);
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY]({
+        ...replyInput, findings: `${replyInput.findings} changed`,
+      })).resolves.toMatchObject({
+        status: 'error', message: 'peer audit correction rejected: conflicting_replay',
+      });
+      expect(registry.listAuditReceipts(taskId)).toHaveLength(2);
+
+      await registry.convergeLifecycle(200, { limit: 4 });
+      expect(registry.get(taskId)).toMatchObject({ status: 'ready_for_integration' });
+      expect(registry.getAssignment(implementerId)).toMatchObject({
+        status: 'ready_for_integration', verdict: 'PASS', crossVendorAuditPassed: true,
+      });
+
+      for (const [label, stale, message] of [
+        [
+          'stale attempt',
+          { ...replyInput, attemptId: `${attemptId}-stale` },
+          'peer audit correction rejected: old_audit_attempt',
+        ],
+        [
+          'stale revision',
+          { ...replyInput, revision: `${revision}-stale` },
+          'peer audit correction rejected: old_revision',
+        ],
+      ] as const) {
+        await expect(
+          handlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY](stale),
+          label,
+        ).resolves.toMatchObject({ status: 'error', message });
+        expect(registry.listAuditReceipts(taskId), label).toHaveLength(2);
+      }
+
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY]({
+        ...replyInput, verdict: 'REWORK', findings: 'must not reverse the superseding PASS', validations: [],
+      })).resolves.toMatchObject({ status: 'error', message: 'attempt_mismatch' });
+      expect(registry.get(taskId)?.status).toBe('ready_for_integration');
+      expect(registry.getAssignment(implementerId)?.verdict).toBe('PASS');
+      expect(registry.listAuditReceipts(taskId)).toHaveLength(2);
+
+      await expect(rotatedHandlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY](replyInput)).resolves.toMatchObject({
+        status: 'error', message: 'peer audit correction rejected: owner_mismatch',
+      });
+      expect(registry.listAuditReceipts(taskId)).toHaveLength(2);
+
+      rewritePersistedTask(database, { ...registry.get(taskId)!, status: 'finalized' });
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY](replyInput)).resolves.toMatchObject({
+        status: 'error', message: 'peer audit correction rejected: receipt_closed',
+      });
+      expect(registry.listAuditReceipts(taskId)).toHaveLength(2);
+    } finally {
+      registry.close();
+      database.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    {
+      label: 'a wrong immutable manifest hash',
+      requestedOwnedFiles: ['src/evidence-bound-auditor.ts'],
+      auditorScopeFiles: ['src/evidence-bound-auditor.ts'],
+      manifestSha256: 'f'.repeat(64),
+    },
+    {
+      label: 'owned files different from the immutable bundle',
+      requestedOwnedFiles: ['src/different-owned-file.ts'],
+      auditorScopeFiles: ['src/different-owned-file.ts'],
+    },
+    {
+      label: 'auditor scope different from the requested owned files',
+      requestedOwnedFiles: ['src/evidence-bound-auditor.ts'],
+      auditorScopeFiles: ['src/different-auditor-scope.ts'],
+    },
+  ] as const)('rejects evidence-bound auditor recovery for $label without mutation', ({
+    label, requestedOwnedFiles, auditorScopeFiles, manifestSha256,
+  }) => {
+    const root = mkdtempSync(join(tmpdir(), 'imcodes-evidence-bound-auditor-recovery-'));
+    const source = join(root, 'source');
+    const taskId = `evidence-bound-auditor-${label.replaceAll(' ', '-')}`;
+    const implementerId = `${taskId}-implementer`;
+    const auditorId = `${taskId}-auditor`;
+    const revision = `${taskId}-r1`;
+    const attemptId = `${taskId}-attempt`;
+    const bundleFiles = ['src/evidence-bound-auditor.ts'];
+    const sourceText = 'export const evidenceBoundAuditor = true;\n';
+    const implementerIdentity = identity(`${taskId}-worker`);
+    const auditorIdentity = identity(`${taskId}-old-auditor`, 'claude-code-sdk');
+    const replacementIdentity = identity(`${taskId}-replacement-auditor`, 'claude-code-sdk');
+    mkdirSync(join(source, 'src'), { recursive: true });
+    writeFileSync(join(source, bundleFiles[0]!), sourceText);
+    const snapshot = {
+      worktreePath: source,
+      headSha: 'a'.repeat(40),
+      files: [{
+        path: bundleFiles[0]!,
+        sha256: createHash('sha256').update(sourceText).digest('hex'),
+      }],
+      stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
+    };
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    try {
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level',
+        objective: 'recover only the exact evidence-bound auditor',
+        currentRevision: revision, auditPolicy: 'auto_strict_cross_vendor',
+      })).toMatchObject({ ok: true });
+      const implementer = registry.createAssignment({
+        taskId, assignmentId: implementerId, role: 'implementer', required: true,
+        identity: implementerIdentity, scopeFiles: bundleFiles, auditRevision: revision,
+      });
+      if (!implementer.ok) throw new Error(implementer.reason);
+      expect(registry.applyTaskIntent({
+        taskId, assignmentId: implementerId, intent: 'start', toStatus: 'implementing',
+      })).toMatchObject({ ok: true });
+      const frozen = freezeSupervisionIntegrationBundle({
+        taskId, assignmentId: implementerId, revision, snapshot,
+        bundleRoot: join(root, 'bundles'),
+      });
+      if (!frozen.ok) throw new Error(frozen.reason);
+      expect(registry.bindIntegrationBundle({
+        taskId, assignmentId: implementerId, identity: implementerIdentity,
+        revision, bundle: frozen.bundle,
+      })).toMatchObject({ ok: true });
+      expect(registry.applyTaskIntent({
+        taskId, assignmentId: implementerId, intent: 'record_validation',
+        toStatus: 'validated', validationState: 'passed',
+      })).toMatchObject({ ok: true });
+      expect(registry.applyTaskIntent({
+        taskId, assignmentId: implementerId, intent: 'open_audit',
+        toStatus: 'ready_for_audit',
+      })).toMatchObject({ ok: true });
+      const auditor = registry.createAssignment({
+        taskId, assignmentId: auditorId, role: 'auditor', required: true,
+        identity: auditorIdentity, scopeFiles: bundleFiles,
+        auditAttemptId: attemptId, auditRevision: revision,
+      });
+      if (!auditor.ok) throw new Error(auditor.reason);
+
+      const exactRequest = {
+        taskId,
+        assignmentId: auditorId,
+        identity: replacementIdentity,
+        expectedGeneration: 1,
+        expectedRevision: revision,
+        auditAttemptId: attemptId,
+        callerProjectName: 'alpha',
+        supersededDeliveryMessageId: `${taskId}-old-delivery`,
+        deliveryMessageId: `${taskId}-replacement-delivery`,
+        idempotencyKey: `${taskId}-recovery`,
+        reason: 'recover only from exact immutable evidence',
+        ownedFiles: bundleFiles,
+        evidenceManifestSha256: frozen.bundle.manifestSha256,
+        validateOnly: true,
+      } as const;
+      const before = registry.get(taskId);
+      const eventsBefore = registry.listEvents(taskId);
+      const receiptsBefore = registry.listAuditReceipts(taskId);
+      expect(registry.recoverOrphanedDelegatedAuditor(exactRequest)).toMatchObject({ ok: true });
+      expect(registry.get(taskId)).toEqual(before);
+      expect(registry.listEvents(taskId)).toEqual(eventsBefore);
+      expect(registry.listAuditReceipts(taskId)).toEqual(receiptsBefore);
+
+      if (auditorScopeFiles[0] !== bundleFiles[0]) {
+        rewritePersistedAssignment(database, {
+          ...registry.getAssignment(auditorId)!,
+          scopeFiles: [...auditorScopeFiles],
+        });
+      }
+      const beforeNegative = registry.get(taskId);
+      expect(registry.recoverOrphanedDelegatedAuditor({
+        ...exactRequest,
+        ownedFiles: [...requestedOwnedFiles],
+        evidenceManifestSha256: manifestSha256 ?? frozen.bundle.manifestSha256,
+      })).toEqual({ ok: false, reason: 'manifest_mismatch' });
+      expect(registry.get(taskId)).toEqual(beforeNegative);
+      expect(registry.listEvents(taskId)).toEqual(eventsBefore);
+      expect(registry.listAuditReceipts(taskId)).toEqual(receiptsBefore);
+    } finally {
+      registry.close();
+      database.close();
+      rmSync(root, { recursive: true, force: true });
     }
   });
 

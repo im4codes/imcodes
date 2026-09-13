@@ -95,6 +95,7 @@ import { EXECUTION_CLONE_KIND, EXECUTION_CLONE_PARENT_STAGES, isExecutionClonePa
 import {
   PEER_AUDIT_VALIDATION_KINDS,
   PEER_AUDIT_VALIDATION_OUTCOMES,
+  validatePeerAuditPassEvidence,
   type PeerAuditReplyEnvelope,
 } from '../../shared/peer-audit.js';
 import {
@@ -137,8 +138,11 @@ import { getMemoryFeatureConfigStoreDiagnostics, getPersistedMemoryFeatureFlagVa
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { listSessions as listStoredSessions, loadStore, type SessionRecord } from '../store/session-store.js';
 import { dispatchDestroyExecutionClone, dispatchSendMessage, dispatchSendStop, listSendTargets, resolveProjectAuthoritativeSupervisionSnapshot, type SendMessageAgentIdentity, type SendMessageCloneRequest, type SendToolDeps } from './send-tool.js';
-import { getSupervisionTaskRegistry, type PersistedSupervisionTaskAssignmentIdentity } from './supervision-state-store.js';
 import {
+  getSupervisionTaskRegistry,
+  type PersistedSupervisionTaskAssignmentIdentity,
+  type SupervisionTaskRegistry,
+} from './supervision-state-store.js';import {
   inspectSupervisionAssignmentWorktree,
   resolveSupervisionAssignmentWorktree,
 } from './supervision-worktree-inspector.js';
@@ -334,6 +338,8 @@ export interface MemoryMcpToolDeps {
     options: { reset: boolean },
   ) => Promise<boolean> | boolean;
   peerAuditReply?: (envelope: PeerAuditReplyEnvelope) => Promise<Record<string, unknown>> | Record<string, unknown>;
+  inspectSupervisionWorktree?: typeof inspectSupervisionAssignmentWorktree;
+  supervisionTaskRegistry?: SupervisionTaskRegistry;
   delegationReply?: (envelope: AgentDelegationReplyEnvelope) => Promise<Record<string, unknown>> | Record<string, unknown>;
   getProcessedProjectionById?: (id: string) => Promise<ProcessedContextProjection | undefined> | ProcessedContextProjection | undefined;
   archiveMemory?: (id: string) => Promise<boolean> | boolean;
@@ -1872,7 +1878,67 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       // the daemon ingress has bound the exact assignment and live sender/destination.
       const decoded = decodePeerAuditReplyCommandStructure(input);
       if (!decoded.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, decoded.error);
-      const result = await deps.peerAuditReply(decoded.value);
+      const envelope = decoded.value;
+      const taskId = envelope.taskId?.trim();
+      const assignmentId = envelope.assignmentId?.trim();
+      const revision = envelope.revision?.trim();
+      // One closed-round exception exists: the exact finalized auditor may
+      // replace its own REWORK with PASS while the SAME immutable bytes are
+      // still waiting for integration. This cannot travel through the normal
+      // pending-delivery ingress because that authority is consumed by the
+      // first final. Authenticate the live MCP caller, inspect the frozen
+      // source bytes, then let one registry transaction recheck every fence.
+      const registry = deps.supervisionTaskRegistry ?? getSupervisionTaskRegistry();
+      const closedTask = taskId ? registry.getTaskRecord(taskId) : undefined;
+      const closedAudit = assignmentId ? registry.getAssignment(assignmentId) : undefined;
+      if (taskId && assignmentId && revision
+        && envelope.receiptKind === 'final' && envelope.verdict === 'PASS'
+        && closedTask?.projectName === caller.projectName
+        && closedAudit?.taskId === taskId && closedAudit.role === 'auditor'
+        && closedAudit.status === 'finalized'
+        && closedAudit.identity.sessionName === caller.sessionName) {
+        const identity = await supervisionTaskIdentity();
+        if (!identity) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'peer audit correction caller identity is unavailable');
+        const evidence = validatePeerAuditPassEvidence(envelope.verdict, envelope.validations);
+        if (!evidence.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, evidence.error);
+        const sourceAssignmentId = closedTask.integrationBundle?.sourceAssignmentId;
+        const source = sourceAssignmentId ? registry.getAssignment(sourceAssignmentId) : undefined;
+        if (!source) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'peer audit correction rejected: manifest_mismatch');
+        const inspect = deps.inspectSupervisionWorktree ?? inspectSupervisionAssignmentWorktree;
+        const inspected = await inspect({
+          sessionName: source.identity.sessionName,
+          assignmentId: source.assignmentId,
+        });
+        if (!inspected.ok) {
+          return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE,
+            `peer audit correction rejected: ${inspected.reason}`);
+        }
+        const corrected = registry.appendMatchingAuditReceipt({
+          taskId,
+          auditorAssignmentId: assignmentId,
+          attemptId: envelope.attemptId,
+          revision,
+          receiptKind: 'final',
+          verdict: 'PASS',
+          auditedSessionName: source.identity.sessionName,
+          auditorSessionName: identity.sessionName,
+          auditorIdentity: identity,
+          findings: envelope.findings,
+          validations: envelope.validations,
+          worktreeSnapshot: inspected.snapshot,
+        });
+        if (!corrected.ok) {
+          return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE,
+            `peer audit correction rejected: ${corrected.reason}`);
+        }
+        return {
+          status: 'ok', accepted: true,
+          supersedingFinalReceipt: true,
+          receiptId: corrected.value.receiptId,
+          idempotentReplay: corrected.replay === true,
+        };
+      }
+      const result = await deps.peerAuditReply(envelope);
       return result.ok === false
         ? error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, String(result.error ?? 'peer audit reply rejected'))
         : { status: 'ok', accepted: true };

@@ -62,6 +62,7 @@ import { SUPERVISION_INTEGRATION_FINALIZATION_STATUS_PATH } from './supervision-
 import type { SupervisionWorktreeSnapshot } from './supervision-worktree-inspector.js';
 import {
   isValidSupervisionIntegrationBundleBinding,
+  verifySupervisionIntegrationBundle,
   type SupervisionIntegrationBundle,
 } from './supervision-integration-bundle.js';
 import { normalizeActivityGeneration, type ActivityGenerationLike } from '../../shared/session-activity-types.js';
@@ -970,6 +971,11 @@ export interface SupervisionMatchingAuditReceiptInput {
   auditorIdentity?: PersistedSupervisionTaskAssignmentIdentity;
   findings?: string;
   validations?: readonly PeerAuditValidationItem[];
+  /**
+   * Daemon-observed source worktree used only for the narrowly fenced
+   * finalized REWORK -> PASS correction path. Ordinary receipts omit it.
+   */
+  worktreeSnapshot?: SupervisionWorktreeSnapshot;
   now?: number;
 }
 
@@ -1326,6 +1332,16 @@ function sameWorktreeManifest(
       && entry.sha256 === expected.sha256
       && entry.deleted === expected.deleted;
   });
+}
+
+function worktreeMatchesIntegrationBundle(
+  bundle: SupervisionIntegrationBundle,
+  snapshot: SupervisionWorktreeSnapshot,
+): boolean {
+  return snapshot.headSha === bundle.headSha
+    && snapshot.stagedPaths.length === 0
+    && snapshot.conflictedPaths.length === 0
+    && sameWorktreeManifest(bundle.files, snapshot.files);
 }
 
 /**
@@ -5957,6 +5973,9 @@ export class SupervisionTaskRegistry {
     deliveryMessageId: string;
     idempotencyKey: string;
     reason: string;
+    ownedFiles?: readonly string[];
+    evidenceManifestSha256?: string;
+    validateOnly?: boolean;
     now?: number;
   }): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {
     const taskId = normalizeTaskString(input.taskId);
@@ -5968,10 +5987,18 @@ export class SupervisionTaskRegistry {
     const deliveryMessageId = normalizeTaskString(input.deliveryMessageId);
     const idempotencyKey = normalizeTaskString(input.idempotencyKey);
     const reason = normalizeTaskString(input.reason);
+    const evidenceRecoveryRequested = input.ownedFiles !== undefined
+      || input.evidenceManifestSha256 !== undefined;
+    const ownedFiles = normalizeTaskArray(input.ownedFiles ?? []);
+    const evidenceManifestSha256 = normalizeTaskString(input.evidenceManifestSha256)?.toLowerCase();
     const expectedGeneration = input.expectedGeneration;
     if (!taskId || !assignmentId || !expectedRevision || !auditAttemptId
       || !callerProjectName || !supersededDeliveryMessageId || !deliveryMessageId
       || supersededDeliveryMessageId === deliveryMessageId || !idempotencyKey || !reason
+      || (evidenceRecoveryRequested && (!evidenceManifestSha256
+        || !FINALIZATION_SHA256_RE.test(evidenceManifestSha256)
+        || ownedFiles.length === 0 || ownedFiles.length !== (input.ownedFiles?.length ?? 0)
+        || !ownedFiles.every(validRepoPath)))
       || !Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1) {
       return { ok: false, reason: 'invalid' };
     }
@@ -5988,14 +6015,18 @@ export class SupervisionTaskRegistry {
         this.#db.exec('ROLLBACK');
         return { ok: false, reason: 'owner_mismatch' };
       }
-      const hasFormalReceipt = this.listAuditReceipts(taskId).some((receipt) => (
+      const matchingReceipts = this.listAuditReceipts(taskId).filter((receipt) => (
         receipt.assignmentId === assignmentId
         && receipt.attemptId === auditAttemptId
         && receipt.revision === expectedRevision
-        && receipt.receiptKind === 'final'
-        && (receipt.verdict === 'PASS' || receipt.verdict === 'REWORK')
       ));
-      if (hasFormalReceipt) {
+      const hasClosedReceipt = evidenceRecoveryRequested
+        ? matchingReceipts.length > 0
+        : matchingReceipts.some((receipt) => (
+          receipt.receiptKind === 'final'
+          && (receipt.verdict === 'PASS' || receipt.verdict === 'REWORK')
+        ));
+      if (hasClosedReceipt) {
         this.#db.exec('ROLLBACK');
         return { ok: false, reason: 'receipt_closed' };
       }
@@ -6021,6 +6052,14 @@ export class SupervisionTaskRegistry {
         && event.payload?.targetRuntimeEpoch === input.identity.runtimeEpoch
         && event.payload?.supersededDeliveryMessageId === supersededDeliveryMessageId
         && event.payload?.deliveryMessageId === deliveryMessageId
+        && (!evidenceRecoveryRequested
+          || (event.payload?.evidenceManifestSha256 === evidenceManifestSha256
+            && sameStringArray(
+              Array.isArray(event.payload?.ownedFiles)
+                ? event.payload.ownedFiles.map((path) => String(path))
+                : [],
+              ownedFiles,
+            )))
       ));
       if (priorEvents.length > 0) {
         this.#db.exec('ROLLBACK');
@@ -6038,6 +6077,25 @@ export class SupervisionTaskRegistry {
         && candidate.status === 'ready_for_audit'
         && candidate.auditRevision === expectedRevision
       ));
+      const evidenceSource = implementers.length === 1 ? implementers[0] : undefined;
+      const bundle = task.integrationBundle;
+      const bundlePaths = bundle?.files.map((file) => file.path).sort() ?? [];
+      const exactEvidence = !evidenceRecoveryRequested || Boolean(
+        bundle
+        && isValidSupervisionIntegrationBundleBinding(bundle)
+        && verifySupervisionIntegrationBundle(bundle).ok
+        && bundle.taskId === taskId
+        && bundle.revision === expectedRevision
+        && bundle.manifestSha256 === evidenceManifestSha256
+        && evidenceSource?.role === 'implementer'
+        && bundle.sourceAssignmentId === evidenceSource.assignmentId
+        && sameStringArray([...ownedFiles].sort(), bundlePaths)
+        && sameStringArray([...assignment.scopeFiles].sort(), [...ownedFiles].sort())
+      );
+      if (!exactEvidence) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'manifest_mismatch' };
+      }
       const competingAuditor = this.listAssignments(taskId).some((candidate) => (
         candidate.role === 'auditor'
         && candidate.assignmentId !== assignmentId
@@ -6061,7 +6119,9 @@ export class SupervisionTaskRegistry {
         || task.auditPolicy !== 'auto_strict_cross_vendor'
         || task.currentRevision !== expectedRevision
         || assignment.role !== 'auditor'
-        || (assignment.status !== 'delegated' && assignment.status !== 'auditing' && !brainAuthorizedCancellation)
+        || (evidenceRecoveryRequested
+          ? assignment.status !== 'delegated' || assignment.required !== true
+          : assignment.status !== 'delegated' && assignment.status !== 'auditing' && !brainAuthorizedCancellation)
         || assignment.auditAttemptId !== auditAttemptId
         || assignment.auditRevision !== expectedRevision
         || implementers.length !== 1
@@ -6075,6 +6135,10 @@ export class SupervisionTaskRegistry {
         && supervisionSelectedExecutionBindingMatches(assignment.executionBinding, input.executionBinding)) {
         this.#db.exec('ROLLBACK');
         return { ok: false, reason: 'conflicting_replay' };
+      }
+      if (input.validateOnly === true) {
+        this.#db.exec('ROLLBACK');
+        return { ok: true, value: assignment };
       }
       const rebound: PersistedSupervisionTaskAssignment = {
         ...assignment,
@@ -6103,7 +6167,26 @@ export class SupervisionTaskRegistry {
         targetSessionName: input.identity.sessionName,
         targetSessionInstanceId: input.identity.sessionInstanceId,
         targetRuntimeEpoch: input.identity.runtimeEpoch,
+        ...(evidenceRecoveryRequested ? { ownedFiles, evidenceManifestSha256 } : {}),
       });
+      const clearsRoutingBlocker = evidenceRecoveryRequested
+        && Boolean(task.blocker && evidenceSource?.blocker === task.blocker);
+      if (clearsRoutingBlocker && evidenceSource) {
+        this.#writeAssignment({ ...evidenceSource, blocker: undefined, updatedAt: now }, 'recovered', {
+          source: 'orphaned_automatic_auditor_rebind',
+          auditorAssignmentId: assignmentId,
+          revision: expectedRevision,
+          attemptId: auditAttemptId,
+          clearedObsoleteBlocker: true,
+        });
+        this.#writeTask({ ...task, blocker: undefined, updatedAt: now }, 'recovered', {
+          source: 'orphaned_automatic_auditor_rebind',
+          assignmentId,
+          revision: expectedRevision,
+          attemptId: auditAttemptId,
+          clearedObsoleteBlocker: true,
+        });
+      }
       this.#db.exec('COMMIT');
       return { ok: true, value: rebound };
     } catch (error) {
@@ -7314,7 +7397,7 @@ export class SupervisionTaskRegistry {
     // boundary BEFORE evaluating receipt authority, so a live round can be
     // resumed on its exact attempt/revision. Terminal auditors are refused by
     // the rule itself, so a closed round can never be reopened this way.
-    if (audit) {
+    if (audit && !input.worktreeSnapshot) {
       const authorizedAuditor = this.#authorizeParticipant(audit, input.auditorIdentity);
       if (authorizedAuditor
         && (authorizedAuditor.sessionInstanceId !== audit.identity.sessionInstanceId
@@ -7366,6 +7449,111 @@ export class SupervisionTaskRegistry {
         this.#db.exec('ROLLBACK');
         return { ok: false, reason: lockedAuthority.reason };
       }
+      const correctionSnapshot = input.worktreeSnapshot;
+      let correctionTarget: PersistedSupervisionTaskAssignment | undefined;
+      let correctionPriorReceipt: PersistedSupervisionAuditReceipt | undefined;
+      let correctionReplayEligible = false;
+      if (lockedAudit.status === 'finalized' && correctionSnapshot) {
+        if (input.receiptKind !== 'final' || input.verdict !== 'PASS'
+          || lockedAudit.leaseId) {
+          this.#db.exec('ROLLBACK');
+          return { ok: false, reason: 'receipt_closed' };
+        }
+        if (lockedTask.currentRevision !== revision) {
+          this.#db.exec('ROLLBACK');
+          return { ok: false, reason: 'old_revision' };
+        }
+        // A closed audit round has no restart-rebind authority. Its corrective
+        // attestation must come from the exact five-field identity that signed
+        // the immutable first final; session-name continuity alone is not
+        // sufficient at this exceptional boundary.
+        if (!runtimeIdentityMetadataMatches(lockedAudit.identity, input.auditorIdentity)) {
+          this.#db.exec('ROLLBACK');
+          return { ok: false, reason: 'owner_mismatch' };
+        }
+        const recordedVerdict = lockedAudit.verdict?.trim().toUpperCase();
+        const replayingCorrection = recordedVerdict === 'PASS';
+        if ((recordedVerdict !== 'REWORK' && !replayingCorrection)
+          || lockedTask.status !== (replayingCorrection ? 'ready_for_integration' : 'rework')
+          || lockedTask.finalization || lockedTask.commitSha || lockedTask.pushRemoteRef
+          || lockedTask.archivedAt) {
+          this.#db.exec('ROLLBACK');
+          return { ok: false, reason: 'receipt_closed' };
+        }
+        const lockedAssignments = this.listAssignments(taskId);
+        const currentAuditors = lockedAssignments.filter((candidate) => (
+          candidate.role === 'auditor'
+          && candidate.auditRevision === revision
+          && !['cancelled', 'recovered'].includes(candidate.status)
+        ));
+        const currentFinals = this.listAuditReceipts(taskId).filter((receipt) => (
+          receipt.receiptKind === 'final' && receipt.revision === revision
+        ));
+        const priorFinal = currentFinals[0];
+        const correctingFinal = currentFinals[1];
+        const exactInitialChain = currentFinals.length === 1
+          && priorFinal?.assignmentId === assignmentId
+          && priorFinal.attemptId === attemptId
+          && priorFinal.verdict === 'REWORK'
+          && !priorFinal.supersedesReceiptId
+          && runtimeIdentityMetadataMatches(priorFinal.senderIdentity, lockedAudit.identity);
+        const exactReplayChain = currentFinals.length === 2
+          && exactInitialChain === false
+          && priorFinal?.assignmentId === assignmentId
+          && priorFinal.attemptId === attemptId
+          && priorFinal.verdict === 'REWORK'
+          && !priorFinal.supersedesReceiptId
+          && runtimeIdentityMetadataMatches(priorFinal.senderIdentity, lockedAudit.identity)
+          && correctingFinal?.assignmentId === assignmentId
+          && correctingFinal.attemptId === attemptId
+          && correctingFinal.verdict === 'PASS'
+          && correctingFinal.supersedesReceiptId === priorFinal.receiptId
+          && runtimeIdentityMetadataMatches(correctingFinal.senderIdentity, lockedAudit.identity);
+        if (currentAuditors.length !== 1 || currentAuditors[0]!.assignmentId !== assignmentId
+          || currentAuditors[0]!.auditAttemptId !== attemptId
+          || (replayingCorrection ? !exactReplayChain : !exactInitialChain)) {
+          this.#db.exec('ROLLBACK');
+          return { ok: false, reason: 'conflicting_replay' };
+        }
+        const bundle = lockedTask.integrationBundle;
+        const implementers = lockedAssignments.filter((candidate) => (
+          candidate.role === 'implementer' && candidate.required && candidate.status !== 'cancelled'
+        ));
+        const source = implementers.length === 1 ? implementers[0] : undefined;
+        const integrationStarted = lockedAssignments.some((candidate) => (
+          candidate.role === 'integration_owner'
+          && !['cancelled', 'recovered', 'finalized'].includes(candidate.status)
+        ));
+        const claimedAssignmentIds = this.#claimedAssignmentIds(taskId);
+        if (!bundle || !isValidSupervisionIntegrationBundleBinding(bundle)
+          || !verifySupervisionIntegrationBundle(bundle).ok
+          || bundle.taskId !== taskId || bundle.revision !== revision
+          || !source || bundle.sourceAssignmentId !== source.assignmentId
+          || source.status !== (replayingCorrection ? 'ready_for_integration' : 'rework') || source.leaseId
+          || source.auditAttemptId !== attemptId || source.auditRevision !== revision
+          || source.verdict?.trim().toUpperCase() !== (replayingCorrection ? 'PASS' : 'REWORK')
+          || lockedAudit.identity.providerFamily === source.identity.providerFamily
+          || source.validationState !== 'passed' || lockedTask.validationState !== 'passed'
+          || input.auditedSessionName !== source.identity.sessionName
+          || !worktreeMatchesIntegrationBundle(bundle, correctionSnapshot)
+          || integrationStarted
+          || claimedAssignmentIds.has(source.assignmentId)
+          || claimedAssignmentIds.has(lockedAudit.assignmentId)
+          || !mayFinalizeEconomyAssignment({
+            pool: source.executionBinding?.pool,
+            primaryReviewPassed: source.primaryReviewPassed === true,
+            crossVendorAuditPassed: true,
+          })) {
+          this.#db.exec('ROLLBACK');
+          return { ok: false, reason: 'manifest_mismatch' };
+        }
+        if (replayingCorrection) {
+          correctionReplayEligible = true;
+        } else {
+          correctionTarget = source;
+          correctionPriorReceipt = priorFinal;
+        }
+      }
       let persistedDigest = digest;
       const existingDigest = this.#db.prepare(`
         SELECT receipt_id AS receiptId FROM supervision_audit_receipts
@@ -7374,6 +7562,19 @@ export class SupervisionTaskRegistry {
       if (typeof existingDigest?.receiptId === 'string') {
         const replay = this.listAuditReceipts(taskId).find((receipt) => receipt.receiptId === existingDigest.receiptId);
         if (replay && runtimeIdentityMetadataMatches(replay.senderIdentity, input.auditorIdentity)) {
+          const latestFinal = replay.receiptKind === 'final'
+            ? this.listAuditReceipts(taskId).filter((receipt) => (
+                receipt.assignmentId === assignmentId
+                && receipt.attemptId === attemptId
+                && receipt.revision === revision
+                && receipt.receiptKind === 'final'
+              )).at(-1)
+            : undefined;
+          if (lockedAudit.status === 'finalized' && latestFinal
+            && latestFinal.receiptId !== replay.receiptId) {
+            this.#db.exec('ROLLBACK');
+            return { ok: false, reason: 'conflicting_replay' };
+          }
           this.#db.exec('COMMIT');
           return { ok: true, value: replay, replay: true };
         }
@@ -7396,7 +7597,15 @@ export class SupervisionTaskRegistry {
           return replay ? { ok: true, value: replay, replay: true } : { ok: false, reason: 'not_found' };
         }
       }
-      if (['finalized', 'cancelled', 'committed', 'pushed'].includes(lockedAudit.status)
+      // Once the linked PASS exists, the only legal call is a byte-identical
+      // idempotent replay handled above. Different content must not append a
+      // third final receipt or supersede the correction in reverse.
+      if (correctionReplayEligible) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'conflicting_replay' };
+      }
+      if ((!correctionTarget && !correctionReplayEligible
+          && ['finalized', 'cancelled', 'committed', 'pushed'].includes(lockedAudit.status))
         || ['committed', 'pushed', 'finalized'].includes(lockedTask.status)) {
         this.#db.exec('ROLLBACK');
         return { ok: false, reason: 'receipt_closed' };
@@ -7414,7 +7623,8 @@ export class SupervisionTaskRegistry {
             ORDER BY sequence DESC LIMIT 1
           `).get(assignmentId, attemptId, revision) as { receiptId?: unknown } | undefined
         : undefined;
-      const supersedesReceiptId = typeof priorFinal?.receiptId === 'string' ? priorFinal.receiptId : undefined;
+      const supersedesReceiptId = correctionPriorReceipt?.receiptId
+        ?? (typeof priorFinal?.receiptId === 'string' ? priorFinal.receiptId : undefined);
       this.#db.prepare(`
         INSERT INTO supervision_audit_receipts (
           receipt_id, task_id, assignment_id, attempt_id, revision, sequence,
@@ -7431,6 +7641,7 @@ export class SupervisionTaskRegistry {
         status: lockedAudit.status === 'delegated' || lockedAudit.status === 'ready_for_audit' ? 'auditing' : lockedAudit.status,
         ...(input.receiptKind === 'final' ? {
           verdict: input.verdict,
+          crossVendorAuditPassed: correctionTarget ? true : lockedAudit.crossVendorAuditPassed,
           blocker: input.verdict === 'REWORK' ? normalizeTaskString(findings) : undefined,
         } : {}),
         updatedAt: now,
@@ -7441,6 +7652,48 @@ export class SupervisionTaskRegistry {
         ...(input.verdict ? { verdict: input.verdict } : {}),
         ...(supersedesReceiptId ? { supersedesReceiptId } : {}),
       });
+      if (correctionTarget) {
+        const correctedTarget: PersistedSupervisionTaskAssignment = {
+          ...correctionTarget,
+          status: 'ready_for_integration',
+          leaseId: '',
+          cleanupVersion: SUPERVISION_TASK_CLEANUP_VERSION,
+          auditAttemptId: attemptId,
+          auditRevision: revision,
+          verdict: 'PASS',
+          crossVendorAuditPassed: true,
+          blocker: undefined,
+          updatedAt: now,
+        };
+        this.#writeAssignment(correctedTarget, 'ready_for_integration', {
+          source: 'superseding_final_audit_receipt',
+          auditorAssignmentId: assignmentId,
+          auditAttemptId: attemptId,
+          revision,
+          receiptId,
+          supersedesReceiptId: correctionPriorReceipt!.receiptId,
+          verdict: 'PASS',
+          manifestSha256: lockedTask.integrationBundle!.manifestSha256,
+        });
+        this.#db.prepare('DELETE FROM supervision_task_file_claims WHERE assignment_id IN (?, ?)')
+          .run(correctionTarget.assignmentId, lockedAudit.assignmentId);
+        this.#writeTask({
+          ...lockedTask,
+          status: 'ready_for_integration',
+          blocker: undefined,
+          updatedAt: now,
+        }, 'ready_for_integration', {
+          source: 'superseding_final_audit_receipt',
+          assignmentId: correctionTarget.assignmentId,
+          auditorAssignmentId: assignmentId,
+          auditAttemptId: attemptId,
+          revision,
+          receiptId,
+          supersedesReceiptId: correctionPriorReceipt!.receiptId,
+          verdict: 'PASS',
+          manifestSha256: lockedTask.integrationBundle!.manifestSha256,
+        });
+      }
       this.#db.exec('COMMIT');
     } catch (error) {
       try { this.#db.exec('ROLLBACK'); } catch { /* transaction already closed */ }

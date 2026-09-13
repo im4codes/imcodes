@@ -3448,6 +3448,94 @@ describe('periodic supervision convergence tick', () => {
     })).toEqual({ ok: false, reason: 'receipt_closed' });
   });
 
+  it('evidence-binds Brain recovery to one unstarted auditor and fails closed after work, receipt, or scope drift', () => {
+    const setup = (suffix: string) => {
+      const taskId = `evidence-auditor-recovery-${suffix}`;
+      const revision = `evidence-auditor-recovery-${suffix}-r1`;
+      const attemptId = `auto-audit-evidence-${suffix}`;
+      const ready = makeReadyTask({ taskId, revision, auditPolicy: 'auto_strict_cross_vendor' });
+      const blocker = `rate-limited:${suffix}`;
+      expect(ready.registry.recordAutomaticAuditRoutingBlocker({
+        taskId, assignmentId: ready.worker.assignmentId, blocker, now: 90,
+      })).toMatchObject({ ok: true });
+      const oldIdentity = identity(`deck_alpha_old_auditor_${suffix}`, 'claude-code-sdk', 'anthropic');
+      const auditor = ready.registry.createAssignment({
+        taskId, role: 'auditor', required: true, identity: oldIdentity,
+        scopeFiles: ['src/exact.ts'], auditAttemptId: attemptId, auditRevision: revision, now: 100,
+      });
+      if (!auditor.ok) throw new Error(auditor.reason);
+      const target = identity(`deck_alpha_new_auditor_${suffix}`, 'claude-code-sdk', 'anthropic');
+      const selected = {
+        agentType: 'claude-code-sdk', providerFamily: 'anthropic', runtimeType: 'transport' as const,
+        model: 'claude-sonnet-4-6',
+      };
+      const executionBinding = {
+        pool: 'primary' as const,
+        requested: { ...selected, capabilityId: buildSupervisionExecutionCapabilityId(selected) },
+        actual: { ...target, runtimeType: 'transport' as const, model: selected.model },
+        origin: 'reused' as const,
+      };
+      const bundle = ready.registry.getTaskRecord(taskId)!.integrationBundle!;
+      const request = {
+        taskId, assignmentId: auditor.value.assignmentId, identity: target, executionBinding,
+        expectedGeneration: auditor.value.generation, expectedRevision: revision, auditAttemptId: attemptId,
+        callerProjectName: 'alpha',
+        supersededDeliveryMessageId: automaticMessageId(auditor.value.assignmentId, attemptId),
+        deliveryMessageId: deterministicAutomaticAuditDeliveryMessageId(
+          auditor.value.assignmentId, attemptId, auditor.value.generation + 1,
+        ),
+        idempotencyKey: `evidence-rebind:${suffix}`, reason: 'bound auditor rate limited before starting',
+        ownedFiles: ['src/exact.ts'], evidenceManifestSha256: bundle.manifestSha256, now: 200,
+      };
+      return { ...ready, attemptId, auditor: auditor.value, oldIdentity, target, bundle, request };
+    };
+
+    const accepted = setup('accepted');
+    const bundleBefore = accepted.registry.getTaskRecord(accepted.taskId)!.integrationBundle;
+    expect(accepted.registry.recoverOrphanedDelegatedAuditor(accepted.request)).toMatchObject({
+      ok: true,
+      value: {
+        assignmentId: accepted.auditor.assignmentId, status: 'delegated',
+        generation: accepted.auditor.generation + 1, auditAttemptId: accepted.attemptId,
+        auditRevision: accepted.revision, scopeFiles: ['src/exact.ts'], identity: accepted.target,
+      },
+    });
+    expect(accepted.registry.getTaskRecord(accepted.taskId)?.blocker).toBeUndefined();
+    expect(accepted.registry.getTaskRecord(accepted.taskId)?.integrationBundle).toEqual(bundleBefore);
+    expect(accepted.registry.getAssignment(accepted.worker.assignmentId)?.blocker).toBeUndefined();
+    expect(accepted.registry.listAssignments(accepted.taskId).filter((row) => row.role === 'auditor')).toHaveLength(1);
+    expect(accepted.registry.listAuditReceipts(accepted.taskId)).toEqual([]);
+    expect(accepted.registry.recoverOrphanedDelegatedAuditor(accepted.request))
+      .toMatchObject({ ok: true, replay: true });
+
+    const started = setup('started');
+    expect(started.registry.updateAssignment({
+      assignmentId: started.auditor.assignmentId, identity: started.oldIdentity,
+      status: 'auditing', auditAttemptId: started.attemptId, auditRevision: started.revision, now: 150,
+    })).toMatchObject({ ok: true });
+    expect(started.registry.recoverOrphanedDelegatedAuditor(started.request))
+      .toEqual({ ok: false, reason: 'invalid_transition' });
+    expect(started.registry.getAssignment(started.auditor.assignmentId)?.identity).toEqual(started.oldIdentity);
+
+    const received = setup('receipt');
+    expect(received.registry.appendMatchingAuditReceipt({
+      taskId: received.taskId, auditorAssignmentId: received.auditor.assignmentId,
+      auditorIdentity: received.oldIdentity, auditorSessionName: received.oldIdentity.sessionName,
+      attemptId: received.attemptId, revision: received.revision, receiptKind: 'progress',
+      findings: 'audit work has started', validations: [], now: 150,
+    })).toMatchObject({ ok: true });
+    expect(received.registry.recoverOrphanedDelegatedAuditor(received.request))
+      .toEqual({ ok: false, reason: 'receipt_closed' });
+    expect(received.registry.getAssignment(received.auditor.assignmentId)?.identity).toEqual(received.oldIdentity);
+
+    const changed = setup('changed');
+    expect(changed.registry.recoverOrphanedDelegatedAuditor({
+      ...changed.request, ownedFiles: ['src/foreign.ts'],
+    })).toEqual({ ok: false, reason: 'manifest_mismatch' });
+    expect(changed.registry.getAssignment(changed.auditor.assignmentId)?.identity).toEqual(changed.oldIdentity);
+
+  });
+
   it('routes tsk_79u from the authoritative coordinator pool instead of the worker legacy snapshot', async () => {
     const { registry, taskId, revision } = makeReadyTask({
       taskId: 'tsk_79u', auditPolicy: 'auto_strict_cross_vendor',

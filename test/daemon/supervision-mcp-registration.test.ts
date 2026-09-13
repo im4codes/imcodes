@@ -107,7 +107,7 @@ class FakeRegistry implements SupervisionRegistryPort {
     return { ok: true as const, value: { assignmentId: input.assignmentId } };
   }
   recoverOrphanedDelegatedAuditor(input: any) {
-    this.orphanedAuditorRebound.push(input);
+    if (input.validateOnly !== true) this.orphanedAuditorRebound.push(input);
     return { ok: true as const, value: { assignmentId: input.assignmentId } };
   }
   rebindValidatedImplementerAssignment(input: any) {
@@ -1309,6 +1309,138 @@ describe('administrative recover', () => {
     expect(dispatchReadyAudit).toHaveBeenCalledWith(taskId);
     expect(registry.rebound, 'must not use the loose legacy audit-rebind branch').toEqual([]);
     expect(registry.implementerRebound, 'must not use implementer evidence recovery').toEqual([]);
+  });
+
+  it('routes a Brain-owned evidence-bound unstarted auditor recovery to the SAME assignment and attempt', async () => {
+    const taskId = 'tsk_hlq';
+    const assignmentId = 'asg_hox';
+    const revision = 'peer-audit-superseding-final-receipt-cx3-r1-cb744b393b61';
+    const auditAttemptId = 'auto-audit-ef8fedc5607f1a6954d9d391';
+    const ownedFiles = [
+      'src/daemon/memory-mcp-tools.ts',
+      'src/daemon/supervision-state-store.ts',
+      'test/daemon/supervision-task-registry.test.ts',
+    ];
+    const evidenceManifestSha256 = '8e57a46233a8da0e2c796f21c5a32d0f72166e20ed5d9a820caa2df591d6aea7';
+    registry.statuses.set(taskId, 'ready_for_audit');
+    registry.currentRevisions.set(taskId, revision);
+    registry.assignmentStates.set(taskId, [
+      {
+        assignmentId: 'asg_hlr', role: 'coordinator', status: 'delegated', leaseId: '',
+        identity: testIdentity('deck_cd_brain'),
+      },
+      {
+        assignmentId: 'asg_hlt', role: 'implementer', required: true,
+        status: 'ready_for_audit', leaseId: '', auditRevision: revision,
+        identity: testIdentity('deck_sub_4s48141x'),
+      },
+      {
+        assignmentId, role: 'auditor', required: true, status: 'delegated', leaseId: '', generation: 1,
+        auditAttemptId, auditRevision: revision,
+        identity: {
+          ...testIdentity('deck_sub_0610320z'),
+          agentType: 'claude-code-sdk', providerFamily: 'anthropic',
+        },
+      },
+    ]);
+    const originalItem = registry.item.bind(registry);
+    registry.item = (id: string) => ({
+      ...originalItem(id),
+      auditPolicy: id === taskId ? 'auto_strict_cross_vendor' : undefined,
+      validationState: id === taskId ? 'passed' : undefined,
+    });
+    const replacement = {
+      ...testResolveSessionIdentity('deck_sub_1a2h2b1w'),
+      agentType: 'claude-code-sdk', providerFamily: 'anthropic',
+    };
+    const replacementBinding = {
+      pool: 'primary' as const,
+      requested: {
+        capabilityId: 'supervision-exec-v1:transport:claude-code-sdk:anthropic:sonnet',
+        agentType: 'claude-code-sdk', providerFamily: 'anthropic', runtimeType: 'transport' as const, model: 'sonnet',
+      },
+      actual: {
+        ...replacement, runtimeType: 'transport' as const, model: 'sonnet',
+      },
+      origin: 'reused' as const,
+    };
+    const retireSupersededAuditDelivery = vi.fn().mockReturnValue(true);
+    const handlers = createSupervisionMcpToolHandlers(CALLER, {
+      registry,
+      isProjectBrain: () => true,
+      resolveSessionIdentity: (name) => name === replacement.sessionName ? replacement : undefined,
+      resolveAuditorRecoveryBinding: (name) => name === replacement.sessionName ? replacementBinding : undefined,
+      retireSupersededAuditDelivery,
+      dispatchReadyAudit: vi.fn().mockResolvedValue({ status: 'dispatched', assignmentId, auditAttemptId }),
+    });
+
+    const result = await handlers[SUPERVISION_MCP_TOOLS.RECOVER]({
+      taskId, assignmentId, rebindSessionName: replacement.sessionName,
+      expectedRevision: revision, ownedFiles, evidenceManifestSha256,
+      reason: 'the bound auditor was rate limited before audit work began',
+    });
+
+    expect(result).toMatchObject({
+      status: 'ok', taskId, assignmentId, expectedRevision: revision, auditAttemptId,
+    });
+    expect(registry.orphanedAuditorRebound).toEqual([expect.objectContaining({
+      taskId, assignmentId, expectedRevision: revision, auditAttemptId,
+      ownedFiles, evidenceManifestSha256,
+    })]);
+    expect(registry.implementerRebound, 'must not route an auditor through implementer recovery').toEqual([]);
+
+    const nonCoordinator = createSupervisionMcpToolHandlers({
+      ...CALLER, sessionName: 'deck_admin_not_task_coordinator',
+    }, {
+      registry,
+      isAdmin: () => true,
+      isProjectBrain: () => true,
+      resolveSessionIdentity: (name) => name === replacement.sessionName ? replacement : undefined,
+      resolveAuditorRecoveryBinding: () => replacementBinding,
+    });
+    await expect(nonCoordinator[SUPERVISION_MCP_TOOLS.RECOVER]({
+      taskId, assignmentId, rebindSessionName: replacement.sessionName,
+      expectedRevision: revision, ownedFiles, evidenceManifestSha256,
+      reason: 'admin must not replace task coordinator authority',
+    })).resolves.toMatchObject({ status: 'error', reason: 'forbidden' });
+
+    const foreignRetire = vi.fn();
+    const foreignTarget = createSupervisionMcpToolHandlers(CALLER, {
+      registry,
+      isProjectBrain: () => true,
+      resolveSessionIdentity: (name) => name === replacement.sessionName
+        ? { ...replacement, projectName: 'foreign-project' }
+        : undefined,
+      resolveAuditorRecoveryBinding: () => replacementBinding,
+      retireSupersededAuditDelivery: foreignRetire,
+    });
+    await expect(foreignTarget[SUPERVISION_MCP_TOOLS.RECOVER]({
+      taskId, assignmentId, rebindSessionName: replacement.sessionName,
+      expectedRevision: revision, ownedFiles, evidenceManifestSha256,
+      reason: 'foreign target must remain rejected',
+    })).resolves.toMatchObject({ status: 'error', reason: 'identity_rejected' });
+    expect(foreignRetire).not.toHaveBeenCalled();
+
+    const originalRecover = registry.recoverOrphanedDelegatedAuditor.bind(registry);
+    registry.recoverOrphanedDelegatedAuditor = vi.fn((input: any) => (
+      input.validateOnly === true
+        ? { ok: false as const, reason: 'manifest_mismatch' }
+        : originalRecover(input)
+    ));
+    const staleRetire = vi.fn();
+    const staleEvidence = createSupervisionMcpToolHandlers(CALLER, {
+      registry,
+      isProjectBrain: () => true,
+      resolveSessionIdentity: (name) => name === replacement.sessionName ? replacement : undefined,
+      resolveAuditorRecoveryBinding: () => replacementBinding,
+      retireSupersededAuditDelivery: staleRetire,
+    });
+    await expect(staleEvidence[SUPERVISION_MCP_TOOLS.RECOVER]({
+      taskId, assignmentId, rebindSessionName: replacement.sessionName,
+      expectedRevision: revision, ownedFiles, evidenceManifestSha256,
+      reason: 'stale evidence must fail before queue authority changes',
+    })).resolves.toMatchObject({ status: 'error', reason: 'manifest_mismatch' });
+    expect(staleRetire).not.toHaveBeenCalled();
   });
 
   it('fails closed before rebind when exact superseded audit delivery cannot be retired', async () => {
