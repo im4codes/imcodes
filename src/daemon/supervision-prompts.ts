@@ -2,6 +2,7 @@ import {
   AUDIT_CONVERGENCE_ROLES,
   buildAuditConvergenceContractRef,
   formatAuditBlockingSeverities,
+  type AuditSeverity,
 } from '../../shared/audit-convergence.js';
 import {
   AGENT_DELEGATION_BLOCKER_REPORT_FIELDS,
@@ -883,6 +884,8 @@ export function buildAutomaticAuditTaskPrompt(options: {
   changeDir?: string;
   changedPaths?: string[];
   uiLocale?: SupervisionUiLocale;
+  /** Configured blocking severities; omitted means the P0-only default. */
+  blockingSeverities?: readonly AuditSeverity[];
 }): string {
   const markerLine = `${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS} / ${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK}`;
   const evidencePolicy = resolveExecutionPromptCopy(options.uiLocale).auditEvidencePolicy;
@@ -973,7 +976,7 @@ export function buildAutomaticAuditTaskPrompt(options: {
       : '',
     evidencePolicy,
     buildSupervisionContractsInForceLine(),
-    buildAuditConvergenceContractRef(AUDIT_CONVERGENCE_ROLES.ORCHESTRATOR),
+    buildAuditConvergenceContractRef(AUDIT_CONVERGENCE_ROLES.ORCHESTRATOR, options.blockingSeverities),
   ].filter(Boolean).join('\n');
 }
 
@@ -1063,6 +1066,8 @@ export interface PeerAuditBriefV1Input {
    * converging on the items that actually blocked.
    */
   priorReworkFindings?: string;
+  /** Configured blocking severities; omitted means the P0-only default. */
+  blockingSeverities?: readonly AuditSeverity[];
 }
 
 const PEER_AUDIT_ACCEPTANCE_TOTAL_BYTES = 4 * 1024;
@@ -1194,7 +1199,7 @@ export function buildPeerAuditBriefV1(input: PeerAuditBriefV1Input): string {
     `[Contract: ${PEER_AUDIT_PROMPT_VERSION}]`,
     'You are the independently selected peer auditor. Audit the completed result against the request and acceptance criteria below.',
     buildSupervisionContractsInForceLine(),
-    buildAuditConvergenceContractRef(AUDIT_CONVERGENCE_ROLES.AUDITOR),
+    buildAuditConvergenceContractRef(AUDIT_CONVERGENCE_ROLES.AUDITOR, input.blockingSeverities),
     'This is a single-pass audit: report every finding in this one pass. Do not start Team/P2P rounds, create a discussion, poll another session, or bulk-read OpenSpec artifact bodies.',
     'Time-box reruns, not review coverage. Separate observed evidence from inference.',
     ...evidencePolicy,
@@ -1203,7 +1208,7 @@ export function buildPeerAuditBriefV1(input: PeerAuditBriefV1Input): string {
     'You MUST NOT modify tracked source, commit, push, deploy, mutate production, or alter persistent external/product state. Do not run reset/clean. Inspect worktree state before and after, preserve pre-existing changes, and stop/report if validation creates an unexpected tracked diff.',
     'Treat `git status` as a signal, not proof of a content change. Before classifying an unexpected EOL-only path as task contamination, compare the HEAD blob, raw working-tree bytes, and the attribute-cleaned hash (`git hash-object --path`). If raw bytes equal HEAD but the clean hash differs, report one repository-normalization defect; do not include that unrelated path in the candidate diff/archive, and do not hide it with reset, clean, or assume-unchanged. If raw bytes differ from HEAD, keep the normal fail-closed contamination rule. An explicit normalization task may include the path.',
     'For checks you personally run, report exact commands/tools/devices/environments and observed outcomes. For accepted structured results, preserve the supplied label, outcome, and summary. Explain unavailable checks; never invent a result.',
-    `VERDICT BOUNDARY: REWORK if and only if a ${formatAuditBlockingSeverities()} finding exists, with severities as defined by the referenced audit convergence contract. For each blocking finding name the violated invariant, every affected instance, and the required outcome for the whole class, not a minimal point patch.`,
+    `VERDICT BOUNDARY: REWORK if and only if a ${formatAuditBlockingSeverities(input.blockingSeverities)} finding exists, with severities as defined by the referenced audit convergence contract. For each blocking finding name the violated invariant, every affected instance, and the required outcome for the whole class, not a minimal point patch.`,
     'Do NOT use REWORK merely because an optional check was unavailable or not personally rerun, raw logs/transcripts/hashes/bundle attachments are absent, evidence packaging/control-plane/receipt delivery failed, style or future hardening could improve, or a non-blocking observation exists. Record those separately as unavailable checks, infrastructure blockers, or follow-up observations; they do not block PASS when the structured implementation evidence is otherwise sufficient.',
     '',
     'Task request:',
@@ -1532,6 +1537,8 @@ export function buildReworkBriefPrompt(
   budget?: { attempt: number; limit: number },
   auditTargetSessionName?: string,
   uiLocale?: SupervisionUiLocale,
+  /** Configured blocking severities; omitted means the P0-only default. */
+  blockingSeverities?: readonly AuditSeverity[],
 ): string {
   const copy = resolveExecutionPromptCopy(uiLocale);
   const locale = uiLocale ?? 'en';
@@ -1609,7 +1616,7 @@ export function buildReworkBriefPrompt(
   return [
     `[Contract: ${SUPERVISION_CONTRACT_IDS.REWORK_BRIEF}]`,
     buildSupervisionContractsInForceLine(),
-    buildAuditConvergenceContractRef(AUDIT_CONVERGENCE_ROLES.IMPLEMENTER),
+    buildAuditConvergenceContractRef(AUDIT_CONVERGENCE_ROLES.IMPLEMENTER, blockingSeverities),
     // NO task-finalization contract here, deliberately.
     //
     // A REWORK brief is sent precisely when finalization has been DEFERRED

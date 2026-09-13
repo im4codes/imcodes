@@ -1,4 +1,6 @@
 import { z } from 'zod';
+import { execFile as execFileCallback } from 'node:child_process';
+import { promisify } from 'node:util';
 import { lstat, readFile, realpath } from 'node:fs/promises';
 import { isAbsolute, relative, resolve } from 'node:path';
 import type { CallToolResult, ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js';
@@ -154,6 +156,13 @@ import {
   resolveSupervisionAssignmentWorktree,
 } from './supervision-worktree-inspector.js';
 import { verifySupervisionIntegrationCommit } from './supervision-integration-bundle.js';
+import {
+  parseSupervisionIntegrationRemoteRef,
+  validateSupervisionIntegrationEvidence,
+  type SupervisionIntegrationObservationCause,
+  type SupervisionIntegrationRemoteObservation,
+} from '../../shared/supervision-integration-finalization.js';
+import { supervisionIdentityMatches } from '../../shared/supervision-participant-authority.js';
 import { advanceSupervisionTaskAfterFinish } from './supervision-convergence-wire.js';
 import { cronMcpCreate, cronMcpCreateSelf, cronMcpDelete, cronMcpList, cronMcpUpdate, cronMcpUpdateSelf, type CronMcpClientOptions } from './cron-mcp-client.js';
 import {
@@ -219,6 +228,7 @@ import {
 } from './verification-machine-mcp-client.js';
 
 type ToolResult = Record<string, unknown>;
+const execFileAsync = promisify(execFileCallback);
 
 const recordOnlyPathArraySchema = z.unknown().optional().transform((value) => (
   Array.isArray(value)
@@ -239,7 +249,7 @@ const recordOnlyManifestSchema = z.unknown().optional().transform((value) => (
     : []
 ));
 
-const integrationFinalizationSchema = z.object({
+const integrationPreflightSchema = z.object({
   assignmentId: z.string().min(1),
   revision: z.string().min(1),
   auditAttemptId: z.string().min(1),
@@ -248,8 +258,6 @@ const integrationFinalizationSchema = z.object({
   ownedFiles: recordOnlyPathArraySchema,
   integrationManifest: recordOnlyManifestSchema,
   integrationOwner: z.string().min(1),
-  commitSha: z.string().regex(/^[0-9a-f]{40}$/),
-  pushResult: z.enum(['pushed', 'already_present']),
   pushRemoteRef: z.string().min(1),
   stagedPaths: recordOnlyPathArraySchema,
   conflictedPaths: recordOnlyPathArraySchema,
@@ -258,6 +266,12 @@ const integrationFinalizationSchema = z.object({
   externalHeadSha: z.string().regex(/^[0-9a-f]{40}$/).optional(),
   externalTaskId: z.string().min(1).optional(),
   ciResult: z.enum(SUPERVISION_CI_SMOKE_STATUSES).optional(),
+}).strict();
+
+const integrationFinalizationSchema = integrationPreflightSchema.extend({
+  preflightToken: z.string().regex(/^sha256:[a-f0-9]{64}$/).optional(),
+  commitSha: z.string().regex(/^[0-9a-f]{40}$/),
+  pushResult: z.enum(['pushed', 'already_present']),
   evidence: z.string().optional(),
 }).strict();
 
@@ -369,6 +383,11 @@ export interface MemoryMcpToolDeps {
    * dep name and shape as the supervision MCP intent handler.
    */
   dispatchReadyAudit?: (taskId: string) => Promise<unknown>;
+  /**
+   * Git runner for integration remote observation (tests inject failures).
+   * Must reject with the child-process error shape (code/killed/signal/stderr).
+   */
+  integrationGitExec?: SupervisionIntegrationGitExec;
   sendDeps?: SendToolDeps;
   cronOptions?: CronMcpClientOptions;
   cronCreate?: typeof cronMcpCreate;
@@ -607,6 +626,238 @@ function disabled(disabledFlag: string, extra: Record<string, unknown> = {}): To
 
 function error(reason: MCPErrorReason, message?: string): ToolResult {
   return buildMcpErrorResult(reason, message);
+}
+
+function integrationRefusal(prefix: string, refusals: readonly object[]): ToolResult {
+  return {
+    ...error(MCP_ERROR_REASONS.VALIDATION_FAILED, `${prefix} rejected`),
+    refusals,
+  };
+}
+
+function integrationRegistryRefusal(prefix: string, reason: string): ToolResult {
+  const refusal = (() => {
+    switch (reason) {
+      case 'not_found':
+        return { code: 'identity_mismatch', field: 'assignmentId', expected: 'existing integration owner' };
+      case 'owner_mismatch':
+        return { code: 'identity_mismatch', field: 'ownerIdentity', expected: 'caller-bound integration owner' };
+      case 'role_forbidden':
+        return { code: 'role_mismatch', field: 'ownerRole', expected: 'integration_owner' };
+      case 'invalid_transition':
+        return { code: 'assignment_status_mismatch', field: 'assignmentStatus', expected: 'preflight-prepared owner' };
+      case 'old_revision':
+      case 'stale_audit_revision':
+        return { code: 'revision_mismatch', field: 'revision', expected: 'exact current audited revision' };
+      case 'old_audit_attempt':
+      case 'receipt_closed':
+        return { code: 'attempt_mismatch', field: 'auditAttemptId', expected: 'one open exact PASS attempt' };
+      case 'manifest_mismatch':
+        return { code: 'bundle_mismatch', field: 'bundle', expected: 'exact immutable bundle' };
+      case 'ambiguous_assignment':
+        return { code: 'ambiguous_authority', field: 'integrationOwnerAssignmentId', expected: 'one exact integration owner' };
+      case 'conflicting_replay':
+        return { code: 'conflicting_replay', field: 'preflightToken', expected: 'exact finalized payload' };
+      default:
+        return { code: 'invalid_format', field: 'assignmentId', expected: `accepted integration request (${reason})` };
+    }
+  })();
+  return integrationRefusal(prefix, [refusal]);
+}
+
+function zodIntegrationRefusals(errorValue: z.ZodError): Record<string, unknown>[] {
+  return errorValue.issues.map((issue) => ({
+    code: issue.code === 'invalid_type' ? 'missing_field' : 'invalid_format',
+    field: String(issue.path[0] ?? 'assignmentId'),
+    expected: issue.message,
+  }));
+}
+
+function equivalentIntegrationRemoteRef(left: string | undefined, right: string): boolean {
+  const branch = (value: string | undefined): string | undefined => {
+    if (!value) return undefined;
+    if (value.startsWith('refs/heads/')) return value.slice('refs/heads/'.length);
+    if (value.startsWith('refs/remotes/origin/')) return value.slice('refs/remotes/origin/'.length);
+    return value;
+  };
+  return branch(left) === branch(right);
+}
+
+function integrationAttributionRefusals(input: unknown, expected: {
+  ownedFiles: readonly string[];
+  integrationManifest: readonly { path: string; sha256: string }[];
+}): Record<string, unknown>[] {
+  if (!input || typeof input !== 'object') return [];
+  const record = input as Record<string, unknown>;
+  const refusals: Record<string, unknown>[] = [];
+  if (Object.prototype.hasOwnProperty.call(record, 'ownedFiles') && Array.isArray(record.ownedFiles)) {
+    const actual = [...new Set(record.ownedFiles.filter((item): item is string => typeof item === 'string')
+      .map((item) => item.trim()).filter(Boolean))].sort();
+    if (JSON.stringify(actual) !== JSON.stringify([...expected.ownedFiles].sort())) {
+      refusals.push({ code: 'bundle_mismatch', field: 'ownedFiles', expected: 'exact bundle path set', actual: actual.join(',') });
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(record, 'integrationManifest')
+    && Array.isArray(record.integrationManifest)) {
+    const actual = record.integrationManifest.flatMap((item) => {
+      if (!item || typeof item !== 'object') return [];
+      const path = Reflect.get(item, 'path');
+      const sha256 = Reflect.get(item, 'sha256');
+      return typeof path === 'string' && typeof sha256 === 'string'
+        ? [{ path: path.trim(), sha256: sha256.trim().toLowerCase() }]
+        : [];
+    }).sort((left, right) => left.path.localeCompare(right.path));
+    if (JSON.stringify(actual) !== JSON.stringify([...expected.integrationManifest]
+      .sort((left, right) => left.path.localeCompare(right.path)))) {
+      refusals.push({ code: 'bundle_mismatch', field: 'integrationManifest', expected: 'exact bundle manifest', actual: JSON.stringify(actual) });
+    }
+  }
+  return refusals;
+}
+
+export type SupervisionIntegrationGitExec = (
+  args: readonly string[],
+  options: { timeoutMs: number },
+) => Promise<{ stdout: string }>;
+
+const INTEGRATION_REMOTE_GIT_TIMEOUT_MS = 45_000;
+const INTEGRATION_LOCAL_GIT_TIMEOUT_MS = 15_000;
+
+const defaultIntegrationGitExec: SupervisionIntegrationGitExec = async (args, options) => {
+  const { stdout } = await execFileAsync('git', [...args], {
+    encoding: 'utf8',
+    timeout: options.timeoutMs,
+    maxBuffer: 256 * 1024,
+    // Never block on an interactive credential prompt; fail fast as `auth`.
+    env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+  });
+  return { stdout: String(stdout) };
+};
+
+/** Classify an operational Git failure. This never decides provenance. */
+export function classifySupervisionIntegrationGitFailure(errorValue: unknown): SupervisionIntegrationObservationCause {
+  const record = Object(errorValue) as Record<string, unknown>;
+  const text = `${String(record.stderr ?? '')}\n${String(record.message ?? '')}`;
+  if (record.killed === true || record.code === 'ETIMEDOUT' || /timed? ?out/i.test(String(record.signal ?? ''))) {
+    return 'timeout';
+  }
+  if (/authentication failed|permission denied|could not read (username|password)|terminal prompts disabled|access denied|\b40[13]\b/i.test(text)) {
+    return 'auth';
+  }
+  if (/could not resolve host|connection (refused|reset|timed out)|network is unreachable|no route to host|operation timed out|unable to access|early eof|remote end hung up|ssl/i.test(text)) {
+    return 'network';
+  }
+  return 'git_error';
+}
+
+/**
+ * Observe whether the exact commit is on the requested destination ref.
+ *
+ * Callers must already have authorized the integration owner and validated
+ * `requestedRef` with parseSupervisionIntegrationRemoteRef. Only a configured
+ * remote is fetched, options are terminated before the remote/ref, and every
+ * operational failure is returned as `unavailable` with its stage and cause:
+ * only a successful observation can prove drift.
+ */
+export async function observeSupervisionIntegrationRemote(input: {
+  worktreePath: string;
+  requestedRef: string;
+  requestedCommitSha: string;
+  exec?: SupervisionIntegrationGitExec;
+  remoteTimeoutMs?: number;
+  localTimeoutMs?: number;
+}): Promise<SupervisionIntegrationRemoteObservation> {
+  const exec = input.exec ?? defaultIntegrationGitExec;
+  const remoteTimeoutMs = input.remoteTimeoutMs ?? INTEGRATION_REMOTE_GIT_TIMEOUT_MS;
+  const localTimeoutMs = input.localTimeoutMs ?? INTEGRATION_LOCAL_GIT_TIMEOUT_MS;
+  const parsed = parseSupervisionIntegrationRemoteRef(input.requestedRef);
+  if (!parsed.ok || !/^[0-9a-f]{40}$/.test(input.requestedCommitSha)) {
+    return { status: 'unavailable', stage: 'remote_config', cause: 'unconfigured_remote' };
+  }
+  const { remote, branchRef } = parsed.value;
+  try {
+    const { stdout } = await exec(['-C', input.worktreePath, 'remote'], { timeoutMs: localTimeoutMs });
+    const configured = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    if (!configured.includes(remote)) {
+      return { status: 'unavailable', stage: 'remote_config', cause: 'unconfigured_remote' };
+    }
+  } catch (errorValue) {
+    return { status: 'unavailable', stage: 'remote_config', cause: classifySupervisionIntegrationGitFailure(errorValue) };
+  }
+  // Fetch only the requested destination ref into FETCH_HEAD. This is a
+  // current observation (not a possibly stale tracking ref) and materializes
+  // the tip needed for an ancestry proof. One bounded retry absorbs a
+  // transient timeout/network failure under load.
+  const fetchArgs = ['-C', input.worktreePath, 'fetch', '--no-tags', '--quiet', '--end-of-options', remote, branchRef];
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await exec(fetchArgs, { timeoutMs: remoteTimeoutMs });
+      break;
+    } catch (errorValue) {
+      const stderr = String(Reflect.get(Object(errorValue), 'stderr') ?? '');
+      if (/couldn't find remote ref/i.test(stderr)) {
+        // A proof, not a failure: the destination ref does not exist.
+        return { status: 'observed', ref: input.requestedRef, commitSha: null, containsRequestedCommit: false };
+      }
+      const cause = classifySupervisionIntegrationGitFailure(errorValue);
+      if (attempt === 0 && (cause === 'timeout' || cause === 'network')) continue;
+      return { status: 'unavailable', stage: 'fetch', cause };
+    }
+  }
+  let commitSha: string;
+  try {
+    const { stdout } = await exec(
+      ['-C', input.worktreePath, 'rev-parse', '--verify', 'FETCH_HEAD^{commit}'],
+      { timeoutMs: localTimeoutMs },
+    );
+    commitSha = stdout.trim().toLowerCase();
+  } catch (errorValue) {
+    return { status: 'unavailable', stage: 'rev_parse', cause: classifySupervisionIntegrationGitFailure(errorValue) };
+  }
+  if (!/^[0-9a-f]{40}$/.test(commitSha)) {
+    return { status: 'unavailable', stage: 'rev_parse', cause: 'git_error' };
+  }
+  if (commitSha === input.requestedCommitSha) {
+    return { status: 'observed', ref: input.requestedRef, commitSha, containsRequestedCommit: true };
+  }
+  try {
+    await exec(
+      ['-C', input.worktreePath, 'merge-base', '--is-ancestor', input.requestedCommitSha, commitSha],
+      { timeoutMs: localTimeoutMs },
+    );
+    return { status: 'observed', ref: input.requestedRef, commitSha, containsRequestedCommit: true };
+  } catch (errorValue) {
+    // Exit 1 is the deterministic non-ancestor proof; anything else is an
+    // operational failure and proves nothing.
+    if (Reflect.get(Object(errorValue), 'code') === 1) {
+      return { status: 'observed', ref: input.requestedRef, commitSha, containsRequestedCommit: false };
+    }
+    return { status: 'unavailable', stage: 'merge_base', cause: classifySupervisionIntegrationGitFailure(errorValue) };
+  }
+}
+
+/**
+ * Owner authority that must hold before any integration Git subprocess runs.
+ * Pure registry reads only; the registry re-checks everything under its lock.
+ */
+function integrationCallerAuthorityRefusals(input: {
+  owner: { role: string; identity: PersistedSupervisionTaskAssignmentIdentity };
+  identity: PersistedSupervisionTaskAssignmentIdentity;
+  integrationOwner: string;
+}): Record<string, unknown>[] {
+  const refusals: Record<string, unknown>[] = [];
+  if (input.owner.role !== 'integration_owner') {
+    refusals.push({ code: 'role_mismatch', field: 'ownerRole', expected: 'integration_owner', actual: input.owner.role });
+  }
+  if (!supervisionIdentityMatches(input.owner.identity, input.identity)
+    || input.integrationOwner !== input.owner.identity.sessionName) {
+    refusals.push({
+      code: 'identity_mismatch', field: 'ownerIdentity',
+      expected: input.owner.identity.sessionName,
+      actual: `${input.identity.sessionName}/${input.integrationOwner}`,
+    });
+  }
+  return refusals;
 }
 
 function stringArg(args: Record<string, unknown>, key: string): string | undefined {
@@ -2256,17 +2507,178 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       await advanceSupervisionTaskAfterFinish(existing.taskId, deps.dispatchReadyAudit);
       return { status: 'ok', item: updated.value };
     },
-    [MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE]: async (input) => {
-      const parsed = integrationFinalizationSchema.safeParse(input);
+    [MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_PREFLIGHT]: async (input) => {
+      const parsed = integrationPreflightSchema.safeParse(input);
       if (!parsed.success) {
-        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'integration_finalize rejected: invalid structured finalization');
+        return integrationRefusal('integration_preflight', zodIntegrationRefusals(parsed.error));
+      }
+      const pushRef = parseSupervisionIntegrationRemoteRef(parsed.data.pushRemoteRef);
+      if (!pushRef.ok) {
+        return integrationRefusal('integration_preflight', [{
+          code: 'invalid_format', field: 'pushRemoteRef', expected: pushRef.expected, actual: parsed.data.pushRemoteRef,
+        }]);
       }
       const identity = await supervisionTaskIdentity();
       if (!identity) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'supervision task caller identity is unavailable');
       const registry = getSupervisionTaskRegistry();
       const owner = registry.getAssignment(parsed.data.assignmentId);
       const task = owner ? registry.getTaskRecord(owner.taskId) : undefined;
-      if (task?.integrationBundle) {
+      if (!owner || !task?.integrationBundle) {
+        return integrationRefusal('integration_preflight', [{
+          code: 'bundle_mismatch', field: 'bundle',
+          expected: 'existing assignment with immutable integration bundle',
+          actual: owner ? 'missing bundle' : 'missing assignment',
+        }]);
+      }
+      // Authorize the exact caller before touching the owner worktree.
+      const preflightAuthority = integrationCallerAuthorityRefusals({
+        owner, identity, integrationOwner: parsed.data.integrationOwner,
+      });
+      if (preflightAuthority.length > 0) return integrationRefusal('integration_preflight', preflightAuthority);
+      const inspected = await inspectSupervisionAssignmentWorktree({
+        sessionName: owner.identity.sessionName,
+        assignmentId: owner.assignmentId,
+      });
+      if (!inspected.ok) {
+        return integrationRefusal('integration_preflight', [{
+          code: 'bundle_mismatch', field: 'bundle', expected: 'available safe worktree', actual: inspected.reason,
+        }]);
+      }
+      const files = new Map(inspected.snapshot.files.map((file) => [file.path, file]));
+      const mismatch = task.integrationBundle.files.find((file) => {
+        const actual = files.get(file.path);
+        return file.deleted === true
+          ? actual?.deleted !== true
+          : actual?.sha256 !== file.sha256 || actual?.deleted === true;
+      });
+      if (inspected.snapshot.headSha !== task.integrationBundle.headSha || mismatch) {
+        return integrationRefusal('integration_preflight', [{
+          code: 'bundle_mismatch', field: 'bundle',
+          expected: `${task.integrationBundle.headSha}:${mismatch?.path ?? 'exact manifest'}`,
+          actual: `${inspected.snapshot.headSha}:${mismatch?.path ?? 'head mismatch'}`,
+        }]);
+      }
+      const authoritativeOwnedFiles = task.integrationBundle.files.map((file) => file.path);
+      const authoritativeManifest = task.integrationBundle.files.flatMap((file) => (
+        file.deleted === true || !file.sha256 ? [] : [{ path: file.path, sha256: file.sha256 }]
+      ));
+      const attributionRefusals = integrationAttributionRefusals(input, {
+        ownedFiles: authoritativeOwnedFiles,
+        integrationManifest: authoritativeManifest,
+      });
+      if (attributionRefusals.length > 0) {
+        return integrationRefusal('integration_preflight', attributionRefusals);
+      }
+      const authoritativeEvidence = {
+        ...parsed.data,
+        ownedFiles: authoritativeOwnedFiles,
+        integrationManifest: authoritativeManifest,
+        stagedPaths: inspected.snapshot.stagedPaths,
+        conflictedPaths: inspected.snapshot.conflictedPaths,
+        untrackedOtherOwnerPaths: parsed.data.untrackedOtherOwnerPaths ?? [],
+      };
+      const preflight = registry.preflightIntegration({
+        assignmentId: owner.assignmentId,
+        identity,
+        evidence: authoritativeEvidence,
+        inspectedHeadSha: inspected.snapshot.headSha,
+        expectedPushRemoteRef: parsed.data.pushRemoteRef,
+      });
+      return preflight.ok
+        ? {
+          status: 'ok',
+          preflightToken: preflight.value.preflightToken,
+          ownerPreparation: preflight.value.ownerPreparation,
+          authority: {
+            taskId: task.taskId,
+            assignmentId: owner.assignmentId,
+            revision: parsed.data.revision,
+            auditAttemptId: parsed.data.auditAttemptId,
+            bundleManifestSha256: task.integrationBundle.manifestSha256,
+            bundleHeadSha: task.integrationBundle.headSha,
+          },
+        }
+        : integrationRefusal('integration_preflight', preflight.refusals);
+    },
+    [MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE]: async (input) => {
+      const parsed = integrationFinalizationSchema.safeParse(input);
+      if (!parsed.success) {
+        return integrationRefusal('integration_finalize', zodIntegrationRefusals(parsed.error));
+      }
+      // Pure field-level validation first (no registry, worktree or Git): an
+      // option-shaped pushRemoteRef or a CI status missing its exact run fields
+      // is refused naming each field, before any authority or side effect.
+      const structural = validateSupervisionIntegrationEvidence({
+        operation: 'finalize',
+        evidence: {
+          ...parsed.data,
+          ownedFiles: parsed.data.ownedFiles ?? [],
+          integrationManifest: parsed.data.integrationManifest ?? [],
+          stagedPaths: parsed.data.stagedPaths ?? [],
+          conflictedPaths: parsed.data.conflictedPaths ?? [],
+          untrackedOtherOwnerPaths: parsed.data.untrackedOtherOwnerPaths ?? [],
+        },
+      });
+      if (!structural.ok) return integrationRefusal('integration_finalize', structural.refusals);
+      if (parsed.data.pushResult === 'pushed' && !parsed.data.preflightToken) {
+        return integrationRefusal('integration_finalize', [{
+          code: 'missing_field', field: 'preflightToken',
+          expected: 'pre-Git authority token unless pushResult=already_present',
+        }]);
+      }
+      const identity = await supervisionTaskIdentity();
+      if (!identity) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'supervision task caller identity is unavailable');
+      const registry = getSupervisionTaskRegistry();
+      const owner = registry.getAssignment(parsed.data.assignmentId);
+      const task = owner ? registry.getTaskRecord(owner.taskId) : undefined;
+      if (!owner || !task?.integrationBundle) {
+        return integrationRefusal('integration_finalize', [{
+          code: owner ? 'bundle_mismatch' : 'identity_mismatch',
+          field: owner ? 'bundle' : 'assignmentId',
+          expected: owner ? 'existing immutable integration bundle' : 'existing integration owner',
+          actual: owner ? 'missing bundle' : parsed.data.assignmentId,
+        }]);
+      }
+      // Authorize the exact caller/owner BEFORE any Git subprocess (commit
+      // verification, worktree inspection, remote fetch).
+      const finalizeAuthority = integrationCallerAuthorityRefusals({
+        owner, identity, integrationOwner: parsed.data.integrationOwner,
+      });
+      if (finalizeAuthority.length > 0) return integrationRefusal('integration_finalize', finalizeAuthority);
+      const authoritativeOwnedFiles = task.integrationBundle.files.map((file) => file.path);
+      const authoritativeManifest = task.integrationBundle.files.flatMap((file) => (
+        file.deleted === true || !file.sha256 ? [] : [{ path: file.path, sha256: file.sha256 }]
+      ));
+      const attributionRefusals = integrationAttributionRefusals(input, {
+        ownedFiles: authoritativeOwnedFiles,
+        integrationManifest: authoritativeManifest,
+      });
+      if (attributionRefusals.length > 0) {
+        return integrationRefusal('integration_finalize', attributionRefusals);
+      }
+      // An exact replay is decided solely from the committed durable ledger.
+      // Do not make it depend on a worktree or remote that may legitimately be
+      // gone after terminal cleanup; the registry still rechecks caller,
+      // token, and the complete finalization fingerprint.
+      if (task.status === 'finalized' && task.finalization) {
+        const replayed = registry.finalizeIntegration({
+          ...parsed.data,
+          ownedFiles: authoritativeOwnedFiles,
+          integrationManifest: authoritativeManifest,
+          stagedPaths: parsed.data.stagedPaths ?? [],
+          conflictedPaths: parsed.data.conflictedPaths ?? [],
+          untrackedOtherOwnerPaths: parsed.data.untrackedOtherOwnerPaths ?? [],
+          inspectedHeadSha: task.integrationBundle.headSha,
+          identity,
+        });
+        return replayed.ok
+          ? { status: 'ok', item: replayed.value, idempotentReplay: replayed.replay === true }
+          : replayed.reason === 'integration_refused'
+            ? integrationRefusal('integration_finalize', replayed.refusals)
+            : integrationRegistryRefusal('integration_finalize', replayed.reason);
+      }
+      let inspected: Awaited<ReturnType<typeof inspectSupervisionAssignmentWorktree>> | undefined;
+      if (task.integrationBundle) {
         const verified = verifySupervisionIntegrationCommit({
           bundle: task.integrationBundle,
           worktreePath: resolveSupervisionAssignmentWorktree({
@@ -2276,24 +2688,69 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
           commitSha: parsed.data.commitSha,
         });
         if (!verified.ok) {
-          return error(MCP_ERROR_REASONS.VALIDATION_FAILED,
-            `integration_finalize rejected: bundle_${verified.reason}${verified.path ? `:${verified.path}` : ''}`);
+          return integrationRefusal('integration_finalize', [{
+            code: 'bundle_mismatch', field: 'bundle', expected: 'exact immutable bundle commit',
+            actual: `${verified.reason}${verified.path ? `:${verified.path}` : ''}`,
+          }]);
+        }
+        inspected = await inspectSupervisionAssignmentWorktree({
+          sessionName: owner!.identity.sessionName,
+          assignmentId: owner!.assignmentId,
+        });
+        if (!inspected.ok) {
+          return integrationRefusal('integration_finalize', [{
+            code: 'remote_drift', field: 'remoteCommit',
+            expected: `${parsed.data.pushRemoteRef}@${parsed.data.commitSha}`,
+            actual: inspected.reason,
+          }]);
         }
       }
+      const remoteObservation: SupervisionIntegrationRemoteObservation = owner && inspected?.ok
+        ? await observeSupervisionIntegrationRemote({
+          worktreePath: resolveSupervisionAssignmentWorktree({
+            sessionName: owner.identity.sessionName,
+            assignmentId: owner.assignmentId,
+          }),
+          requestedRef: parsed.data.pushRemoteRef,
+          requestedCommitSha: parsed.data.commitSha,
+          exec: deps.integrationGitExec,
+        })
+        : { status: 'unavailable', stage: 'not_observed', cause: 'git_error' };
+      // Never authorize finalization from a possibly stale local
+      // remote-tracking ref. The bounded fetch above is the provenance
+      // observation; an operational failure is observation_unavailable (fail
+      // closed, retryable), and only an actual observation can prove drift.
+      const explicitRemote = remoteObservation.status === 'observed' ? remoteObservation : undefined;
+      const observedRemoteCommitSha = explicitRemote?.commitSha ?? undefined;
+      const observedRemoteRef = explicitRemote?.ref;
       const finalized = registry.finalizeIntegration({
         ...parsed.data,
         // Keep the persisted record shape stable. Invalid caller metadata was
         // reduced to an empty record above and never supplies authorization.
-        ownedFiles: parsed.data.ownedFiles ?? [],
-        integrationManifest: parsed.data.integrationManifest ?? [],
-        stagedPaths: parsed.data.stagedPaths ?? [],
-        conflictedPaths: parsed.data.conflictedPaths ?? [],
+        ownedFiles: authoritativeOwnedFiles,
+        integrationManifest: authoritativeManifest,
+        stagedPaths: inspected?.ok ? inspected.snapshot.stagedPaths : parsed.data.stagedPaths ?? [],
+        conflictedPaths: inspected?.ok ? inspected.snapshot.conflictedPaths : parsed.data.conflictedPaths ?? [],
         untrackedOtherOwnerPaths: parsed.data.untrackedOtherOwnerPaths ?? [],
+        inspectedHeadSha: task?.integrationBundle?.headSha,
+        observedRemoteRef,
+        observedRemoteCommitSha,
+        observedPushMatchesRequestedRemote: Boolean(
+          observedRemoteCommitSha === parsed.data.commitSha
+          && equivalentIntegrationRemoteRef(observedRemoteRef, parsed.data.pushRemoteRef)
+        ),
+        observedPushContainsRequestedCommit: Boolean(
+          explicitRemote?.containsRequestedCommit
+          && equivalentIntegrationRemoteRef(observedRemoteRef, parsed.data.pushRemoteRef)
+        ),
+        remoteObservation,
         identity,
       });
       return finalized.ok
         ? { status: 'ok', item: finalized.value, idempotentReplay: finalized.replay === true }
-        : error(MCP_ERROR_REASONS.VALIDATION_FAILED, `integration_finalize rejected: ${finalized.reason}`);
+        : finalized.reason === 'integration_refused'
+          ? integrationRefusal('integration_finalize', finalized.refusals)
+          : integrationRegistryRefusal('integration_finalize', finalized.reason);
     },
     [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT]: async (input) => {
       const args = pickAllowedMcpArgs(input, ['assignmentId', 'filePath', 'operation', 'beforeHash', 'afterHash', 'tool', 'source', 'idempotencyKey']);
@@ -2937,6 +3394,7 @@ const schemas = {
   }),
   [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_UPDATE]: z.object({ assignmentId: z.string(), revision: z.string().optional(), auditAttemptId: z.string().optional(), auditRevision: z.string().optional(), verdict: z.string().optional(), blocker: z.string().optional(), externalRunId: z.string().optional(), externalHeadSha: z.string().optional(), externalTaskId: z.string().optional() }),
   [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH]: legacySupervisionFinishSchema,
+  [MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_PREFLIGHT]: integrationPreflightSchema,
   [MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE]: integrationFinalizationSchema,
   [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT]: z.object({ assignmentId: z.string(), filePath: z.string(), operation: z.enum(SUPERVISION_TASK_FILE_OPERATIONS), beforeHash: z.string().optional(), afterHash: z.string().optional(), tool: z.string().optional(), source: z.string().optional(), idempotencyKey: z.string().optional() }),
   [MEMORY_MCP_TOOL_NAMES.SEND_STOP]: z.object({

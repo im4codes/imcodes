@@ -1,3 +1,4 @@
+import { normalizeAuditBlockingSeverities, type AuditSeverity } from './audit-convergence.js';
 import type { SharedContextRuntimeBackend } from './context-types.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../src/shared/models/options.js';
 import { PROVIDER_ERROR_CODES } from './provider-error-codes.js';
@@ -1091,7 +1092,20 @@ export interface SessionSupervisionSnapshot extends SupervisorDefaultConfig {
   /** Present only with a canonical target + fingerprint. */
   peerAuditPromptVersion?: typeof PEER_AUDIT_PROMPT_VERSION;
   maxAuditLoops: number;
+  /**
+   * Severities whose findings block an audit (REWORK). Missing on legacy
+   * snapshots; readers must resolve it through
+   * resolveSupervisionAuditBlockingSeverities, which defaults to P0 only.
+   */
+  auditBlockingSeverities?: AuditSeverity[];
   taskRunPromptVersion: string;
+}
+
+/** Configured blocking severities for a snapshot; legacy/missing/invalid values mean P0 only. */
+export function resolveSupervisionAuditBlockingSeverities(
+  snapshot: Pick<SessionSupervisionSnapshot, 'auditBlockingSeverities'> | null | undefined,
+): AuditSeverity[] {
+  return normalizeAuditBlockingSeverities(snapshot?.auditBlockingSeverities);
 }
 
 export type SupervisionSessionSnapshot = SessionSupervisionSnapshot;
@@ -1415,6 +1429,11 @@ export function normalizeSessionSupervisionSnapshot(
       peerAuditPromptVersion: PEER_AUDIT_PROMPT_VERSION,
     } : {}),
     maxAuditLoops,
+    // Persist only an explicit choice so legacy snapshots stay byte-stable and
+    // keep resolving to the P0-only default.
+    ...(merged.auditBlockingSeverities !== undefined
+      ? { auditBlockingSeverities: normalizeAuditBlockingSeverities(merged.auditBlockingSeverities) }
+      : {}),
     taskRunPromptVersion: trimString(merged.taskRunPromptVersion) ?? SUPERVISION_DEFAULT_TASK_RUN_PROMPT_VERSION,
   };
 }
