@@ -70,10 +70,12 @@ export function buildAuditConvergenceContract(): string {
       reaudit: `repair delta plus closure of every prior ${blocking} class`,
     },
     evidence: {
+      structuredResults: 'exact-bound implementer or teammate structured test results are valid evidence after coherence review; no duplicate run required',
+      rawArtifacts: 'raw logs, transcripts, hashes, and bundle attachments are never PASS prerequisites; their absence never causes REWORK',
+      integrity: 'never fabricate results; a conflicting result or concrete implementation risk may justify a minimal targeted counterexample',
       dbMigration: 'production-shaped data: existing ids, soft-deleted rows, retry after partial DDL, concurrent writers',
       deployOrRollback: 'fault injection',
       postDeployGate: 'preflight required secrets and base URLs before running',
-      missing: 'P1',
     },
     slices: 'one combined audit of the integrated result; never audit slices one by one',
     commentOrDocOnly: 'binding check only, no re-audit',

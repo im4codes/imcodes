@@ -282,6 +282,8 @@ describe('buildProviderContextPayload', () => {
   // thread, never resent through the per-turn channel or the user message.
   it('registers the audit convergence contract in the stable system prompt of every managed provider', () => {
     const body = `"contractId":"${AUDIT_CONVERGENCE_CONTRACT_ID}"`;
+    const structuredEvidencePolicy = 'exact-bound implementer or teammate structured test results are valid evidence';
+    const rawArtifactPolicy = 'raw logs, transcripts, hashes, and bundle attachments are never PASS prerequisites';
     const providerIds = TRANSPORT_SESSION_AGENT_TYPES.filter((providerId) => providerId !== 'openclaw');
     for (const providerId of providerIds) {
       const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection', providerId), {
@@ -290,6 +292,9 @@ describe('buildProviderContextPayload', () => {
         namespace: { scope: 'personal', projectId: 'repo-1' },
       });
       expect(payload.sessionSystemText, providerId).toContain(body);
+      expect(payload.sessionSystemText, providerId).toContain(structuredEvidencePolicy);
+      expect(payload.sessionSystemText, providerId).toContain(rawArtifactPolicy);
+      expect(payload.sessionSystemText, providerId).not.toContain('"missing":"P1"');
       expect(payload.turnSystemText ?? '', providerId).not.toContain(body);
       expect(payload.userMessage, providerId).not.toContain(body);
     }

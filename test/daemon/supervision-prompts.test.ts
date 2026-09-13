@@ -261,7 +261,8 @@ describe('supervision prompts', () => {
     expect(prompt).toContain('compare the HEAD blob, raw working-tree bytes, and the attribute-cleaned hash');
     expect(prompt).toContain('do not hide it with reset, clean, or assume-unchanged');
     expect(prompt).toContain('If raw bytes differ from HEAD, keep the normal fail-closed contamination rule');
-    expect(prompt).toContain('Report exact commands/tools/devices/environments and observed outcomes');
+    expect(prompt).toContain('For checks you personally run, report exact commands/tools/devices/environments and observed outcomes');
+    expect(prompt).toContain('For accepted structured results, preserve the supplied label, outcome, and summary');
     expect(prompt).toContain(SUPERVISION_CONTRACT_IDS.MESSAGING);
     expect(prompt).toContain('imcodes audit-reply --task-id supervision_task_1 --assignment-id supervision_assignment_1 --attempt-id attempt_1 --revision revision_1 --receipt-kind final');
     expect(prompt).not.toContain('replyCapability');
@@ -275,7 +276,7 @@ describe('supervision prompts', () => {
     const prompt = buildPeerAuditBriefV1({
       attemptId: 'attempt_evidence_complete',
       taskRequest: 'Review the frozen revision',
-      completedResult: 'Manifest frozen; command and exit-code receipt attached.',
+      completedResult: 'Revision frozen; teammate reports the structured results below. No raw artifacts are attached.',
       acceptanceCriteria: ['Bind exact bytes and assess the result'],
       validations: [
         { kind: 'test', label: 'focused', outcome: 'passed', summary: 'exit=0; 48 passed' },
@@ -284,10 +285,40 @@ describe('supervision prompts', () => {
     });
 
     expect(prompt).toContain('EVIDENCE ACCEPTANCE FIRST');
+    expect(prompt).toContain("an implementer or teammate's structured validation result is valid evidence");
+    expect(prompt).toContain('needs no duplicate run');
+    expect(prompt).toContain('Raw logs, transcripts, hashes, and bundle attachments are not required');
+    expect(prompt).toContain('their absence must never cause REWORK');
     expect(prompt).toContain('Do NOT unconditionally repeat a full test, typecheck, lint, or build suite');
-    expect(prompt).toContain('rerunReason=<specific trigger>');
+    expect(prompt).toContain('rerunReason=<specific contradiction or risk>');
     expect(prompt).not.toContain('EVIDENCE GAP:');
+    expect(prompt).not.toContain('binding the frozen manifest');
     expect(prompt).not.toMatch(/(?:must|required to|always) (?:re-?run|repeat) (?:the )?full/iu);
+  });
+
+  it('accepts structured teammate results for device, CI, real transport, and immutable-bundle checks without raw artifacts', () => {
+    const prompt = buildPeerAuditBriefV1({
+      attemptId: 'attempt_structured_matrix',
+      taskRequest: 'Review the contract-level evidence policy',
+      completedResult: 'A teammate supplied only the structured validation rows below; no raw logs, hashes, or bundle files were attached.',
+      acceptanceCriteria: ['Treat each exact-bound structured result as valid evidence'],
+      validations: [
+        { kind: 'device', label: 'authorized device', outcome: 'passed', summary: 'permission scenario passed' },
+        { kind: 'environment', label: 'CI', outcome: 'passed', summary: 'required job passed' },
+        { kind: 'environment', label: 'real Codex transport', outcome: 'passed', summary: 'transport scenario passed' },
+        { kind: 'tool', label: 'immutable bundle', outcome: 'passed', summary: 'five scoped files verified' },
+      ],
+    });
+
+    for (const row of [
+      'device | passed | authorized device: permission scenario passed',
+      'environment | passed | CI: required job passed',
+      'environment | passed | real Codex transport: transport scenario passed',
+      'tool | passed | immutable bundle: five scoped files verified',
+    ]) expect(prompt).toContain(row);
+    expect(prompt).toContain("an implementer or teammate's structured validation result is valid evidence");
+    expect(prompt).toContain('Raw logs, transcripts, hashes, and bundle attachments are not required');
+    expect(prompt).toContain('their absence must never cause REWORK');
   });
 
   it('generates only a bounded rerun instruction when executable evidence is missing', () => {
@@ -301,7 +332,7 @@ describe('supervision prompts', () => {
 
     expect(prompt).toContain('EVIDENCE GAP:');
     expect(prompt).toContain('smallest bounded check needed to resolve that gap');
-    expect(prompt).toContain('rerunReason=<missing/conflicting/high-risk evidence>');
+    expect(prompt).toContain('rerunReason=<no-passed-structured-validation|conflicting-result|concrete-high-risk>');
     expect(prompt).toContain('do not default to the full matrix');
     expect(prompt).not.toContain('EVIDENCE ACCEPTANCE FIRST');
   });
@@ -560,7 +591,10 @@ describe('supervision prompts', () => {
     expect(prompt).toContain('VERDICT BOUNDARY');
     expect(prompt).toContain('REWORK if and only if a P0, P1 or P2 finding exists');
     expect(prompt).toContain('Do NOT use REWORK merely because an optional check was unavailable');
+    expect(prompt).toContain('raw logs/transcripts/hashes/bundle attachments are absent');
     expect(prompt).toContain('evidence packaging/control-plane/receipt delivery failed');
+    expect(prompt).toContain('an implementer or teammate structured result satisfies this');
+    expect(prompt).toContain('does not need raw artifacts or a duplicate run');
     expect(prompt).toContain('they do not block PASS');
   });
 
@@ -981,6 +1015,15 @@ describe('audit convergence contract on every supervision audit surface', () => 
   const ref = `"contractRef":"${AUDIT_CONVERGENCE_CONTRACT_ID}"`;
   const body = `"contractId":"${AUDIT_CONVERGENCE_CONTRACT_ID}"`;
   const locales = ['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko'] as const;
+  const evidencePolicySentinels: Record<typeof locales[number], readonly [string, string]> = {
+    en: ["implementer or teammate's structured test result is valid evidence", 'Raw logs, transcripts, hashes, or bundle attachments are never PASS prerequisites'],
+    'zh-CN': ['实现者或队友提交的结构化测试结果即为有效证据', '缺少这些原始材料不得导致 REWORK'],
+    'zh-TW': ['實作者或隊友提交的結構化測試結果即為有效證據', '缺少這些原始材料不得導致 REWORK'],
+    es: ['resultado estructurado de una prueba aportado por el implementador o un compañero es evidencia válida', 'su ausencia no debe causar REWORK'],
+    ru: ['структурированный результат теста от исполнителя или коллеги является допустимым доказательством', 'их отсутствие не должно приводить к REWORK'],
+    ja: ['実装者またはチームメイトの構造化テスト結果は有効な証拠', '不在を理由に REWORK にしてはいけません'],
+    ko: ['구현자나 팀 동료가 제출한 구조화된 테스트 결과는 유효한 증거', '없다는 이유로 REWORK하면 안 됩니다'],
+  };
 
   it('references the contract in the peer auditor brief and drops the wording that made audits drip-feed', () => {
     const prompt = buildPeerAuditBriefV1({
@@ -1015,6 +1058,7 @@ describe('audit convergence contract on every supervision audit surface', () => 
       });
       expect(prompt).toContain(ref);
       expect(prompt).toContain('"role":"orchestrator"');
+      for (const sentinel of evidencePolicySentinels[uiLocale]) expect(prompt).toContain(sentinel);
       expect(prompt).not.toContain(body);
     });
 

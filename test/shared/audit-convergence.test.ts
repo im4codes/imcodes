@@ -48,10 +48,17 @@ describe('audit convergence contract', () => {
     expect(contract.firstPass.timeBox).toMatch(/not coverage/);
     expect(contract.rework.fix).toMatch(/whole invariant class/);
     expect(contract.rework.forbid).toMatch(/point patch/);
+    expect(contract.evidence.structuredResults).toMatch(/implementer or teammate structured test results are valid evidence/);
+    expect(contract.evidence.structuredResults).toMatch(/no duplicate run required/);
+    expect(contract.evidence.rawArtifacts).toMatch(/raw logs, transcripts, hashes, and bundle attachments/);
+    expect(contract.evidence.rawArtifacts).toMatch(/never PASS prerequisites/);
+    expect(contract.evidence.rawArtifacts).toMatch(/absence never causes REWORK/);
+    expect(contract.evidence.integrity).toMatch(/never fabricate/);
+    expect(contract.evidence.integrity).toMatch(/concrete implementation risk/);
     expect(contract.evidence.dbMigration).toMatch(/production-shaped/);
     expect(contract.evidence.deployOrRollback).toMatch(/fault injection/);
     expect(contract.evidence.postDeployGate).toMatch(/secrets/);
-    expect(contract.evidence.missing).toBe('P1');
+    expect(contract.evidence).not.toHaveProperty('missing');
     expect(contract.slices).toMatch(/one combined audit/);
     expect(contract.commentOrDocOnly).toMatch(/binding check only/);
     // The body lives in the system prompt; briefs travel by reference only.

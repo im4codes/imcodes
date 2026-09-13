@@ -100,7 +100,7 @@ type ExecutionPromptCopy = {
 const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = {
   en: {
     auditPreamble: 'Peer-audit mode: finish implementation and validation, but DO NOT stage, commit, push, merge, release, publish, or deploy before PASS.',
-    auditEvidencePolicy: 'Audit evidence policy: briefs must say EVIDENCE ACCEPTANCE FIRST. After exact binding and coherence review, trust the implementer\'s frozen manifest, commands, exit codes, logs, and test results. Never request an unconditional full test/typecheck/build rerun; permit only a minimal targeted counterexample for missing, conflicting, contaminated, irreproducible, or concretely high-risk evidence, and require rerunReason.',
+    auditEvidencePolicy: 'Audit evidence policy: briefs must say EVIDENCE ACCEPTANCE FIRST. After exact binding and coherence review, an implementer or teammate\'s structured test result is valid evidence and needs no duplicate run. Raw logs, transcripts, hashes, or bundle attachments are never PASS prerequisites; their absence must not cause REWORK. Never request an unconditional full test/typecheck/build rerun. Permit a minimal targeted counterexample only when the structured result conflicts with reviewed code/state or a concrete high-risk implementation gap exists; require rerunReason and never invent a result.',
     reworkLoop: 'On REWORK, fix and validate immediately, then send the instructed reply-enabled re-audit; repeat until PASS or an exact blocker.',
     continueTask: 'Continue the same task.', executionMode: 'Execution mode', actionHint: 'Supervisor hint (verify first)', gapHint: 'Reported gap (advisory)', reasonHint: 'Rationale (advisory)',
     ownContext: 'Use your own context: advance safe unfinished work now; do not stop at a summary or repeat completed work.',
@@ -108,7 +108,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   },
   'zh-CN': {
     auditPreamble: '同伴审计模式：先完成实现与验证；PASS 前不得暂存、提交、推送、合并、发布或部署。',
-    auditEvidencePolicy: '审计证据策略：审计说明必须要求“先验收证据”。精确绑定并核对一致性后，默认信任实现者提交的冻结 manifest、命令、退出码、日志和测试结果；禁止无条件重跑完整测试/typecheck/build。仅当证据缺失、冲突、污染、不可复现或出现具体高风险缺口时，才允许最小定向反例，并必须记录 rerunReason。',
+    auditEvidencePolicy: '审计证据策略：审计说明必须要求“先验收证据”。精确绑定并核对一致性后，实现者或队友提交的结构化测试结果即为有效证据，无需重复执行。原始日志、transcript、哈希或 bundle 附件绝不是 PASS 前提；缺少这些原始材料不得导致 REWORK。禁止无条件重跑完整测试/typecheck/build。仅当结构化结果与已审代码/状态矛盾，或存在具体高风险实现缺口时，才允许最小定向反例；必须记录 rerunReason，且不得伪造结果。',
     reworkLoop: '收到 REWORK 后立即修复并验证，再按指示发送可回执复审；循环至 PASS 或明确阻断。',
     continueTask: '继续同一任务。', executionMode: '执行模式', actionHint: '监督提示（先核对）', gapHint: '监督报告缺口（仅供参考）', reasonHint: '监督理由（仅供参考）',
     ownContext: '以你自己的上下文为准：本轮立即推进可安全处理的未完成项；不要只做总结或重复已完成工作。',
@@ -116,7 +116,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   },
   'zh-TW': {
     auditPreamble: '同伴審計模式：先完成實作與驗證；PASS 前不得暫存、提交、推送、合併、發佈或部署。',
-    auditEvidencePolicy: '審計證據策略：審計說明必須要求「先驗收證據」。精確綁定並核對一致性後，預設信任實作者提交的凍結 manifest、命令、退出碼、日誌與測試結果；禁止無條件重跑完整測試/typecheck/build。僅在證據缺失、衝突、污染、不可重現或有具體高風險缺口時，才允許最小定向反例，並必須記錄 rerunReason。',
+    auditEvidencePolicy: '審計證據策略：審計說明必須要求「先驗收證據」。精確綁定並核對一致性後，實作者或隊友提交的結構化測試結果即為有效證據，無需重複執行。原始日誌、transcript、雜湊或 bundle 附件絕不是 PASS 前提；缺少這些原始材料不得導致 REWORK。禁止無條件重跑完整測試/typecheck/build。僅當結構化結果與已審程式碼/狀態矛盾，或存在具體高風險實作缺口時，才允許最小定向反例；必須記錄 rerunReason，且不得捏造結果。',
     reworkLoop: '收到 REWORK 後立即修復並驗證，再依指示發送可回執複審；循環至 PASS 或明確阻斷。',
     continueTask: '繼續同一任務。', executionMode: '執行模式', actionHint: '監督提示（先核對）', gapHint: '監督回報缺口（僅供參考）', reasonHint: '監督理由（僅供參考）',
     ownContext: '以你自己的上下文為準：本輪立即推進可安全處理的未完成項；不要只做摘要或重複已完成工作。',
@@ -124,7 +124,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   },
   es: {
     auditPreamble: 'Modo de auditoría: termina implementación y validación; antes de PASS no prepares, confirmes, envíes, fusiones, publiques ni despliegues.',
-    auditEvidencePolicy: 'Política de evidencia: el informe debe exigir EVIDENCE ACCEPTANCE FIRST. Tras enlazar exactamente y revisar coherencia, acepta el manifiesto congelado, comandos, códigos de salida, registros y resultados del implementador. No ordenes repetir incondicionalmente toda la matriz de tests/typecheck/build; permite solo un contraejemplo mínimo y dirigido ante evidencia ausente, contradictoria, contaminada, irreproducible o un riesgo concreto, registrando rerunReason.',
+    auditEvidencePolicy: 'Política de evidencia: el informe debe exigir EVIDENCE ACCEPTANCE FIRST. Tras enlazar exactamente y revisar la coherencia, el resultado estructurado de una prueba aportado por el implementador o un compañero es evidencia válida y no requiere otra ejecución. Los registros sin procesar, transcripciones, hashes o adjuntos de bundle nunca son requisitos para PASS; su ausencia no debe causar REWORK. No ordenes repetir incondicionalmente toda la matriz de tests/typecheck/build. Permite un contraejemplo mínimo y dirigido solo si el resultado estructurado contradice el código/estado revisado o existe un riesgo concreto de implementación; registra rerunReason y nunca inventes un resultado.',
     reworkLoop: 'Tras REWORK, corrige y valida de inmediato; luego envía la nueva auditoría con respuesta hasta PASS o un bloqueo exacto.',
     continueTask: 'Continúa la misma tarea.', executionMode: 'Modo de ejecución', actionHint: 'Sugerencia del supervisor (verifica primero)', gapHint: 'Falta informada (orientativa)', reasonHint: 'Motivo (orientativo)',
     ownContext: 'Usa tu propio contexto: avanza ahora el trabajo pendiente seguro; no te detengas en un resumen ni repitas lo completado.',
@@ -132,7 +132,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   },
   ru: {
     auditPreamble: 'Режим аудита: завершите реализацию и проверку; до PASS нельзя индексировать, коммитить, отправлять, сливать, публиковать или развёртывать.',
-    auditEvidencePolicy: 'Политика доказательств: brief должен требовать EVIDENCE ACCEPTANCE FIRST. После точной привязки и проверки согласованности принимайте замороженный manifest, команды, коды выхода, журналы и результаты тестов исполнителя. Не требуйте безусловного повтора полного набора tests/typecheck/build; допускайте только минимальный направленный контрпример при отсутствии, конфликте, загрязнении, невоспроизводимости или конкретном высоком риске и фиксируйте rerunReason.',
+    auditEvidencePolicy: 'Политика доказательств: brief должен требовать EVIDENCE ACCEPTANCE FIRST. После точной привязки и проверки согласованности структурированный результат теста от исполнителя или коллеги является допустимым доказательством и не требует повторного запуска. Исходные журналы, transcripts, хэши и вложения bundle никогда не являются условиями PASS; их отсутствие не должно приводить к REWORK. Не требуйте безусловного повтора полного набора tests/typecheck/build. Минимальный направленный контрпример допустим только при противоречии структурированного результата проверенному коду/состоянию или при конкретном высоком риске реализации; фиксируйте rerunReason и никогда не выдумывайте результат.',
     reworkLoop: 'После REWORK сразу исправьте и проверьте, затем отправьте указанную повторную проверку с ответом; повторяйте до PASS или точной блокировки.',
     continueTask: 'Продолжайте ту же задачу.', executionMode: 'Режим выполнения', actionHint: 'Подсказка надзора (сначала проверьте)', gapHint: 'Указанный пробел (справочно)', reasonHint: 'Причина (справочно)',
     ownContext: 'Опирайтесь на свой контекст: сейчас продвигайте безопасную незавершённую работу; не останавливайтесь на отчёте и не повторяйте готовое.',
@@ -140,7 +140,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   },
   ja: {
     auditPreamble: 'ピア監査モード：実装と検証を完了し、PASS 前はステージ、コミット、プッシュ、マージ、公開、デプロイをしないでください。',
-    auditEvidencePolicy: '監査証拠ポリシー：brief は EVIDENCE ACCEPTANCE FIRST を要求します。正確な binding と整合性確認後、実装者の凍結 manifest、command、exit code、log、test result を証拠として受理します。full test/typecheck/build の無条件再実行は禁止し、欠落・矛盾・汚染・再現不能または具体的な高リスクがある場合だけ最小の定向反例を許可し、rerunReason を記録します。',
+    auditEvidencePolicy: '監査証拠ポリシー：brief は EVIDENCE ACCEPTANCE FIRST を要求します。正確な binding と整合性確認後、実装者またはチームメイトの構造化テスト結果は有効な証拠であり、重複実行は不要です。raw log、transcript、hash、bundle 添付は PASS の前提ではなく、不在を理由に REWORK にしてはいけません。full test/typecheck/build の無条件再実行は禁止します。構造化結果が確認済みのコード/状態と矛盾する場合、または具体的な高リスク実装上の欠陥がある場合に限り、最小の定向反例を許可します。rerunReason を記録し、結果を捏造してはいけません。',
     reworkLoop: 'REWORK 後は直ちに修正・検証し、指示された返信可能な再監査を送信してください。PASS または明確な障害まで繰り返します。',
     continueTask: '同じタスクを続行してください。', executionMode: '実行モード', actionHint: '監督ヒント（先に確認）', gapHint: '報告された不足（参考）', reasonHint: '理由（参考）',
     ownContext: '自分の文脈を優先し、安全に進められる未完了作業を今すぐ進めてください。要約だけで止まらず、完了済み作業を繰り返さないでください。',
@@ -148,7 +148,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   },
   ko: {
     auditPreamble: '동료 감사 모드: 구현과 검증을 완료하고 PASS 전에는 스테이징, 커밋, 푸시, 병합, 게시, 배포하지 마세요.',
-    auditEvidencePolicy: '감사 증거 정책: brief는 EVIDENCE ACCEPTANCE FIRST를 요구해야 합니다. 정확한 binding과 일관성 검토 후 구현자가 제출한 동결 manifest, command, exit code, log, test result를 증거로 수용합니다. 전체 test/typecheck/build의 무조건 재실행은 금지하며, 증거 누락·충돌·오염·재현 불가 또는 구체적 고위험이 있을 때만 최소 정향 반례를 허용하고 rerunReason을 기록합니다.',
+    auditEvidencePolicy: '감사 증거 정책: brief는 EVIDENCE ACCEPTANCE FIRST를 요구해야 합니다. 정확한 binding과 일관성 검토 후 구현자나 팀 동료가 제출한 구조화된 테스트 결과는 유효한 증거이며 중복 실행이 필요하지 않습니다. 원시 로그, transcript, hash 또는 bundle 첨부물은 PASS의 전제 조건이 아니며, 없다는 이유로 REWORK하면 안 됩니다. 전체 test/typecheck/build의 무조건 재실행은 금지합니다. 구조화된 결과가 검토한 코드/상태와 충돌하거나 구체적인 고위험 구현 결함이 있을 때만 최소 정향 반례를 허용합니다. rerunReason을 기록하고 결과를 조작하지 마세요.',
     reworkLoop: 'REWORK 후 즉시 수정·검증하고 안내된 회신 가능 재감사를 보내세요. PASS 또는 명확한 차단 사유까지 반복합니다.',
     continueTask: '같은 작업을 계속하세요.', executionMode: '실행 모드', actionHint: '감독 힌트(먼저 확인)', gapHint: '보고된 누락(참고)', reasonHint: '이유(참고)',
     ownContext: '자신의 문맥을 기준으로 지금 안전한 미완료 작업을 진행하세요. 요약만 하고 멈추거나 완료한 작업을 반복하지 마세요.',
@@ -1021,7 +1021,7 @@ export interface PeerAuditBriefV1Input {
   changePath?: string;
   changedPaths?: readonly string[];
   validations?: readonly PeerAuditValidationItem[];
-  /** Explicit producer assessment that the submitted evidence bundle is complete. */
+  /** Explicit producer assessment that the structured validation summary is complete; raw artifacts are not required. */
   evidenceComplete?: boolean;
   /** Optional broker context; explicitly non-authoritative in the brief. */
   supervisorRationale?: string;
@@ -1155,12 +1155,12 @@ export function buildPeerAuditBriefV1(input: PeerAuditBriefV1Input): string {
     || (input.validations?.some((item) => item.outcome === 'passed') ?? false);
   const evidencePolicy = evidenceComplete
     ? [
-        'EVIDENCE ACCEPTANCE FIRST: the implementer supplied executable evidence. Start by binding the frozen manifest/revision and accepting the reported commands, exit codes, logs, and test results as evidence; verify their coherence with the reviewed bytes.',
-        'Do NOT unconditionally repeat a full test, typecheck, lint, or build suite. Run only a minimal targeted counterexample when a concrete evidence gap, conflict, contamination, irreproducibility, or high-risk code finding makes it necessary. If you rerun anything, record `rerunReason=<specific trigger>` with that validation.',
+        'EVIDENCE ACCEPTANCE FIRST: the implementer supplied structured executable evidence. After exact revision binding and coherence review, an implementer or teammate\'s structured validation result is valid evidence and needs no duplicate run. Raw logs, transcripts, hashes, and bundle attachments are not required and their absence must never cause REWORK.',
+        'Do NOT unconditionally repeat a full test, typecheck, lint, or build suite. Run only a minimal targeted counterexample when the structured result conflicts with reviewed code/state, validation contamination is concretely observed, or a high-risk implementation finding makes it necessary. If you rerun anything, record `rerunReason=<specific contradiction or risk>` with that validation.',
       ]
     : [
         'EVIDENCE GAP: no passed executable validation was supplied in the structured evidence summary. Run only the smallest bounded check needed to resolve that gap; do not default to the full matrix.',
-        'Every rerun must record `rerunReason=<missing/conflicting/high-risk evidence>` in its validation summary.',
+        'Every rerun must record `rerunReason=<no-passed-structured-validation|conflicting-result|concrete-high-risk>` in its validation summary.',
       ];
 
   const brief = [
@@ -1171,13 +1171,13 @@ export function buildPeerAuditBriefV1(input: PeerAuditBriefV1Input): string {
     'This is a single-pass audit: report every finding in this one pass. Do not start Team/P2P rounds, create a discussion, poll another session, or bulk-read OpenSpec artifact bodies.',
     'Time-box reruns, not review coverage. Separate observed evidence from inference.',
     ...evidencePolicy,
-    'The normal audit is exact binding, code review, command/result acceptance, and only the necessary minimal directed counterexample. Submitted evidence is not invalid merely because the auditor did not personally rerun it.',
+    'The normal audit is exact binding, code review, structured result acceptance, and only the necessary minimal directed counterexample. Submitted structured evidence is not invalid merely because the auditor did not personally rerun it or receive its raw transport artifacts.',
     'When the evidence policy above permits a rerun, you MAY use focused tests, typecheck, lint, build, read-only tools, and explicitly isolated fixtures. You MAY use already-authorized devices/environments only for read-only checks or isolated fixture operations.',
     'You MUST NOT modify tracked source, commit, push, deploy, mutate production, or alter persistent external/product state. Do not run reset/clean. Inspect worktree state before and after, preserve pre-existing changes, and stop/report if validation creates an unexpected tracked diff.',
     'Treat `git status` as a signal, not proof of a content change. Before classifying an unexpected EOL-only path as task contamination, compare the HEAD blob, raw working-tree bytes, and the attribute-cleaned hash (`git hash-object --path`). If raw bytes equal HEAD but the clean hash differs, report one repository-normalization defect; do not include that unrelated path in the candidate diff/archive, and do not hide it with reset, clean, or assume-unchanged. If raw bytes differ from HEAD, keep the normal fail-closed contamination rule. An explicit normalization task may include the path.',
-    'Report exact commands/tools/devices/environments and observed outcomes. Explain unavailable checks; never invent a result.',
+    'For checks you personally run, report exact commands/tools/devices/environments and observed outcomes. For accepted structured results, preserve the supplied label, outcome, and summary. Explain unavailable checks; never invent a result.',
     `VERDICT BOUNDARY: REWORK if and only if a ${formatAuditBlockingSeverities()} finding exists, with severities as defined by the referenced audit convergence contract. For each blocking finding name the violated invariant, every affected instance, and the required outcome for the whole class, not a minimal point patch.`,
-    'Do NOT use REWORK merely because an optional check was unavailable or not personally rerun, evidence packaging/control-plane/receipt delivery failed, style or future hardening could improve, or a non-blocking observation exists. Record those separately as unavailable checks, infrastructure blockers, or follow-up observations; they do not block PASS when the implementation evidence is otherwise sufficient.',
+    'Do NOT use REWORK merely because an optional check was unavailable or not personally rerun, raw logs/transcripts/hashes/bundle attachments are absent, evidence packaging/control-plane/receipt delivery failed, style or future hardening could improve, or a non-blocking observation exists. Record those separately as unavailable checks, infrastructure blockers, or follow-up observations; they do not block PASS when the structured implementation evidence is otherwise sufficient.',
     '',
     'Task request:',
     taskRequest || '(empty)',
@@ -1203,7 +1203,7 @@ export function buildPeerAuditBriefV1(input: PeerAuditBriefV1Input): string {
       'Previous REWORK findings:',
       priorFindings] : []),
     '',
-    'Append structured progress receipts as needed, then one current final receipt. PASS requires at least one accepted, exact-bound passed validation when an executable relevant check exists; an implementer result satisfies this after coherence/binding review and does not need a duplicate run. Otherwise list each unavailable check specifically. Empty/static-only PASS is rejected.',
+    'Append structured progress receipts as needed, then one current final receipt. PASS requires at least one accepted, exact-bound passed validation when an executable relevant check exists; an implementer or teammate structured result satisfies this after coherence/binding review and does not need raw artifacts or a duplicate run. Otherwise list each unavailable check specifically. Empty/static-only PASS is rejected.',
     'Prefer the available peer_audit_reply MCP tool with these exact fields:',
     `{ ${input.taskId ? `"taskId": "${input.taskId}", ` : ''}${input.assignmentId ? `"assignmentId": "${input.assignmentId}", ` : ''}"attemptId": "${input.attemptId}", ${input.revision ? `"revision": "${input.revision}", ` : ''}"receiptKind": "final", "verdict": "PASS|REWORK", "findings": "<bounded findings>", "validations": [{ "kind": "test", "label": "<check>", "outcome": "passed|failed|unavailable", "summary": "<exact result or reason>" }] }`,
     'Authority is the daemon-authenticated current session plus the bound registry attempt/revision; never create a new auditor assignment to repair a rejected receipt.',
