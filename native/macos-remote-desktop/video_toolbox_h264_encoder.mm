@@ -265,13 +265,27 @@ class ScopedPixelTransferSession {
   VTPixelTransferSessionRef value_ = nullptr;
 };
 
-bool CreateBgraPixelBuffer(common::PixelSize size,
-                           ScopedPixelBuffer* output,
-                           VideoToolboxEncoderError* error) {
-  NSDictionary* attributes = @{
+// Shared with the compression session's own sourceImageBufferAttributes
+// (CreateCompressionSession below), so VTCompressionSessionGetPixelBufferPool
+// vends buffers in the exact same format this function would otherwise
+// allocate by hand -- the fast Encode() path can fill and post one of the
+// session's own pooled buffers instead of asking CoreVideo for a brand new
+// IOSurface on every single frame.
+NSDictionary* BgraPixelBufferAttributes(common::PixelSize size) {
+  return @{
+    (__bridge NSString*)kCVPixelBufferPixelFormatTypeKey :
+        @(kCVPixelFormatType_32BGRA),
+    (__bridge NSString*)kCVPixelBufferWidthKey : @(size.width),
+    (__bridge NSString*)kCVPixelBufferHeightKey : @(size.height),
     (__bridge NSString*)kCVPixelBufferIOSurfacePropertiesKey : @{},
     (__bridge NSString*)kCVPixelBufferMetalCompatibilityKey : @YES,
   };
+}
+
+bool CreateBgraPixelBuffer(common::PixelSize size,
+                           ScopedPixelBuffer* output,
+                           VideoToolboxEncoderError* error) {
+  NSDictionary* attributes = BgraPixelBufferAttributes(size);
   const CVReturn result = CVPixelBufferCreate(
       kCFAllocatorDefault, size.width, size.height, kCVPixelFormatType_32BGRA,
       (__bridge CFDictionaryRef)attributes, output->out());
@@ -560,12 +574,20 @@ VTCompressionSessionRef CreateCompressionSession(
       return nullptr;
   }
 
+  // Declaring the exact source format up front, rather than leaving it null,
+  // is what makes VTCompressionSessionGetPixelBufferPool() usable later: it
+  // guarantees the session's own pool vends BGRA/IOSurface buffers matching
+  // BgraPixelBufferAttributes exactly, instead of some other format VT might
+  // otherwise have picked on its own for this codec/hardware combination.
+  NSDictionary* source_attributes =
+      BgraPixelBufferAttributes(configuration.encoded_pixels);
   VTCompressionSessionRef session = nullptr;
   const OSStatus status = VTCompressionSessionCreate(
       kCFAllocatorDefault, configuration.encoded_pixels.width,
       configuration.encoded_pixels.height, kCMVideoCodecType_H264,
-      (__bridge CFDictionaryRef)encoder_specification, nullptr, nullptr,
-      CompressionOutput, nullptr, &session);
+      (__bridge CFDictionaryRef)encoder_specification,
+      (__bridge CFDictionaryRef)source_attributes, nullptr, CompressionOutput,
+      nullptr, &session);
   if (status != noErr || session == nullptr) {
     if (error != nullptr) {
       *error = {VideoToolboxEncoderErrorCode::kEncoderCreationFailed,
@@ -701,7 +723,27 @@ class AppleVideoToolboxEncoderBackend final
     }
 
     ScopedPixelBuffer source;
-    if (!CreateBgraPixelBuffer(frame.encoded_pixels, &source, error)) {
+    // The common case -- no resize in flight -- vends a buffer from the
+    // session's own pool instead of asking CoreVideo for a brand new
+    // IOSurface on every single frame: CVPixelBufferCreate is a comparatively
+    // expensive kernel-mediated allocation to repeat 30-60 times a second,
+    // and this session's pool was declared (via sourceImageBufferAttributes
+    // in CreateCompressionSession) to vend exactly this BGRA/IOSurface shape.
+    // A resize in flight still falls back to the manual per-frame allocation
+    // below: the pool is sized for configuration_.encoded_pixels, not for
+    // whatever the still-transitioning capture stream just delivered.
+    bool vended_from_pool = false;
+    if (!scaling) {
+      if (CVPixelBufferPoolRef pool =
+              VTCompressionSessionGetPixelBufferPool(session_)) {
+        vended_from_pool = CVPixelBufferPoolCreatePixelBuffer(
+                                kCFAllocatorDefault, pool, source.out()) ==
+                                kCVReturnSuccess &&
+                            source.get() != nullptr;
+      }
+    }
+    if (!vended_from_pool &&
+        !CreateBgraPixelBuffer(frame.encoded_pixels, &source, error)) {
       return false;
     }
     std::uint64_t actual_copy_bytes = CVPixelBufferGetDataSize(source.get());
