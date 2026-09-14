@@ -1545,7 +1545,18 @@ export function buildTransportConfigWithSupervision(
   snapshot: Partial<SessionSupervisionSnapshot> | null | undefined,
 ): Record<string, unknown> | null {
   const normalized = normalizeSessionSupervisionSnapshot(snapshot);
-  if (normalized.mode === SUPERVISION_MODE.OFF && !normalized.auditTargetSessionName) {
+  // Execution pools gate manual `task{objective,acceptance}` dispatch
+  // eligibility independently of automatic-supervision `mode`; a Brain that
+  // dispatches by hand and never turns Auto on still needs this persisted.
+  // Deleting the whole `supervision` key whenever mode is off silently threw
+  // away a just-saved pool selection -- the save reported success while the
+  // daemon's routing check kept reading legacy_unconfigured from disk.
+  const hasConfiguredExecutionPools = normalized.executionPools.state === 'configured'
+    && (normalized.executionPools.primaryDevelopmentPool.configs.length > 0
+      || normalized.executionPools.economyTaskPool.configs.length > 0);
+  if (normalized.mode === SUPERVISION_MODE.OFF
+    && !normalized.auditTargetSessionName
+    && !hasConfiguredExecutionPools) {
     if (!transportConfig) return null;
     const next = { ...transportConfig };
     delete next[SUPERVISION_TRANSPORT_CONFIG_KEY];

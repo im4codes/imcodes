@@ -1896,7 +1896,17 @@ describe('SessionSettingsDialog supervision', () => {
     }));
   });
 
-  it('saves global supervisor defaults without patching the session when only defaults changed', async () => {
+  it('saves global supervisor defaults and carries the auto-derived execution pool onto this session even while automatic-supervision mode stays off', async () => {
+    // Regression coverage for a real production incident: a Brain that
+    // dispatches manually via send_message (mode stays 'off') configured its
+    // execution pool through this exact "global defaults" flow, "Save"
+    // reported success, but the daemon's routing check kept reading
+    // legacy_unconfigured from sessions.json because buildTransportConfigWithSupervision
+    // deleted the whole `supervision` key -- pool included -- whenever mode
+    // was off. The account-level default alone can never fix this: the
+    // daemon's manual task-dispatch eligibility check only ever reads this
+    // session's own persisted transportConfig, never the server-side
+    // account preference.
     render(
       <SessionSettingsDialog
         canControlAutomaticSupervision
@@ -1932,6 +1942,54 @@ describe('SessionSettingsDialog supervision', () => {
         model: CLAUDE_CODE_MODEL_IDS[0],
         timeoutMs: 30_000,
       }));
+    });
+    await waitFor(() => {
+      expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', expect.objectContaining({
+        transportConfig: expect.objectContaining({
+          supervision: expect.objectContaining({
+            mode: 'off',
+            executionPools: expect.objectContaining({
+              state: 'configured',
+              primaryDevelopmentPool: expect.objectContaining({
+                configs: [expect.objectContaining({
+                  agentType: 'claude-code-sdk',
+                  model: CLAUDE_CODE_MODEL_IDS[0],
+                })],
+              }),
+            }),
+          }),
+        }),
+      }));
+    });
+    expect(patchSubSessionMock).not.toHaveBeenCalled();
+  });
+
+  it('leaves the session untouched when only a global default with no derivable pool changes', async () => {
+    // Changing a field that never feeds withBrainPrimaryPoolDefault (here,
+    // just a backup runtime with no primary backend/model picked) must not
+    // fabricate a pool or patch the session -- the fix above is specifically
+    // about a GENUINELY configured pool, not every unrelated defaults edit.
+    render(
+      <SessionSettingsDialog
+        canControlAutomaticSupervision
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        transportConfig={null}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    const timeoutInput = screen.getByLabelText('supervision-defaults:timeout');
+    fireEvent.input(timeoutInput, { target: { value: '45' } });
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => {
+      expect(saveSupervisorDefaultsMock).toHaveBeenCalled();
     });
     expect(patchSessionMock).not.toHaveBeenCalled();
     expect(patchSubSessionMock).not.toHaveBeenCalled();

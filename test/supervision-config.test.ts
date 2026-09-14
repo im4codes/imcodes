@@ -10,6 +10,10 @@ import { CODEX_MODEL_IDS, DEFAULT_CODEX_AUTOMATION_MODEL } from '../src/shared/m
 import { DEFAULT_PRIMARY_CONTEXT_MODEL } from '../shared/context-model-defaults.js';
 import { PEER_AUDIT_PROMPT_VERSION } from '../shared/peer-audit.js';
 import {
+  buildSupervisionExecutionCapabilityId,
+  type SupervisionExecutionPoolsConfig,
+} from '../shared/supervision-execution-pool.js';
+import {
   DEFAULT_SUPERVISION_BACKEND,
   DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
   DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
@@ -27,6 +31,7 @@ import {
   RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER,
   SUPERVISION_TRANSPORT_CONFIG_KEY,
   TASK_RUN_STATUS_MARKERS,
+  buildTransportConfigWithSupervision,
   embedSessionSupervisionSnapshot,
   extractSessionSupervisionSnapshot,
   getSessionSupervisionSnapshotIssues,
@@ -497,6 +502,67 @@ describe('supervision config helpers', () => {
     ].join('\n'))).toEqual({ state: 'waiting', markerCount: 1 });
     expect(parseSupervisionExecutionStateDetailsFromText(`> ${advance}\n\`\`\`\n${ready}\n\`\`\``))
       .toEqual({ state: null, markerCount: 0 });
+  });
+
+  describe('buildTransportConfigWithSupervision', () => {
+    const claudePrimaryConfig = {
+      agentType: 'claude-code-sdk',
+      providerFamily: 'anthropic',
+      runtimeType: 'transport' as const,
+      model: DEFAULT_PRIMARY_CONTEXT_MODEL,
+    };
+    const configuredExecutionPools: SupervisionExecutionPoolsConfig = {
+      state: 'configured',
+      primaryDevelopmentPool: {
+        configs: [{
+          ...claudePrimaryConfig,
+          capabilityId: buildSupervisionExecutionCapabilityId(claudePrimaryConfig),
+        }],
+        controls: { maxConcurrency: 2, maxSpawned: 8, leaseMs: 60_000, changeBudget: 5, auditHeadroomPerProviderFamily: 1 },
+      },
+      economyTaskPool: {
+        configs: [],
+        controls: { maxConcurrency: 2, maxSpawned: 8, leaseMs: 60_000, changeBudget: 5, auditHeadroomPerProviderFamily: 1 },
+      },
+    };
+
+    it('keeps a configured execution pool even while automatic-supervision mode is off', () => {
+      // A Brain that dispatches manually via send_message never turns
+      // automatic mode on, but manual task{objective,acceptance} dispatch
+      // still gates on executionPools.state === 'configured'. Deleting the
+      // whole `supervision` key here silently discarded a just-saved pool
+      // selection -- the save reported success while the daemon's routing
+      // check kept reading legacy_unconfigured from disk.
+      const next = buildTransportConfigWithSupervision(null, {
+        mode: SUPERVISION_MODE.OFF,
+        executionPools: configuredExecutionPools,
+      });
+      expect(next).not.toBeNull();
+      const snapshot = extractSessionSupervisionSnapshot(next);
+      expect(snapshot?.executionPools.state).toBe('configured');
+      expect(snapshot?.executionPools.primaryDevelopmentPool.configs).toHaveLength(1);
+    });
+
+    it('still drops the supervision key when mode is off, there is no audit target, and pools are unconfigured', () => {
+      const next = buildTransportConfigWithSupervision({ other: 'field' }, {
+        mode: SUPERVISION_MODE.OFF,
+      });
+      expect(next).toEqual({ other: 'field' });
+      expect(next && SUPERVISION_TRANSPORT_CONFIG_KEY in next).toBe(false);
+    });
+
+    it('returns null when there is nothing left to persist', () => {
+      expect(buildTransportConfigWithSupervision(null, { mode: SUPERVISION_MODE.OFF })).toBeNull();
+      expect(buildTransportConfigWithSupervision(undefined, { mode: SUPERVISION_MODE.OFF })).toBeNull();
+    });
+
+    it('keeps the supervision key when mode is off but a remembered audit target is set', () => {
+      const next = buildTransportConfigWithSupervision(null, {
+        mode: SUPERVISION_MODE.OFF,
+        auditTargetSessionName: 'deck_sub_reviewer',
+      });
+      expect(extractSessionSupervisionSnapshot(next)?.auditTargetSessionName).toBe('deck_sub_reviewer');
+    });
   });
 
   describe('mergeTransportConfigPreservingSupervision', () => {
