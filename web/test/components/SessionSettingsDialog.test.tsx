@@ -1995,6 +1995,79 @@ describe('SessionSettingsDialog supervision', () => {
     expect(patchSubSessionMock).not.toHaveBeenCalled();
   });
 
+  it('keeps an already-configured execution pool when the user turns automatic supervision off', async () => {
+    // Turning Auto off for one session must not silently strip the pool that
+    // manual task{objective,acceptance} dispatch still depends on -- Auto and
+    // the execution pool are independent switches.
+    fetchSupervisorDefaultsMock.mockResolvedValue({
+      backend: 'claude-code-sdk',
+      model: CLAUDE_CODE_MODEL_IDS[0],
+      executionPools: {
+        state: 'configured',
+        primaryDevelopmentPool: {
+          configs: [{
+            capabilityId: `supervision-exec-v1:transport:claude-code-sdk:anthropic:${CLAUDE_CODE_MODEL_IDS[0]}`,
+            agentType: 'claude-code-sdk',
+            providerFamily: 'anthropic',
+            runtimeType: 'transport',
+            model: CLAUDE_CODE_MODEL_IDS[0],
+          }],
+          controls: DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS.primary,
+        },
+        economyTaskPool: { configs: [], controls: DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS.economy },
+      },
+    });
+    render(
+      <SessionSettingsDialog
+        canControlAutomaticSupervision
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        transportConfig={{
+          supervision: {
+            mode: 'supervised',
+            backend: 'claude-code-sdk',
+            model: CLAUDE_CODE_MODEL_IDS[0],
+            timeoutMs: 1_800_000,
+            promptVersion: 'supervision_decision_v1',
+            maxParseRetries: 1,
+            maxAutoContinueStreak: 2,
+            maxAutoContinueTotal: 0,
+            maxAuditLoops: 2,
+            taskRunPromptVersion: 'task_run_status_v1',
+          },
+        }}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect((screen.getByLabelText('supervision-session:mode') as HTMLSelectElement).value).toBe('supervised');
+    });
+    changeSupervisionMode('off');
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => {
+      expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', expect.objectContaining({
+        transportConfig: expect.objectContaining({
+          supervision: expect.objectContaining({
+            mode: 'off',
+            executionPools: expect.objectContaining({
+              state: 'configured',
+              primaryDevelopmentPool: expect.objectContaining({
+                configs: [expect.objectContaining({ agentType: 'claude-code-sdk', model: CLAUDE_CODE_MODEL_IDS[0] })],
+              }),
+            }),
+          }),
+        }),
+      }));
+    });
+  });
+
   it('persists an optional global backup runtime from the shared dropdown selector', async () => {
     render(
       <SessionSettingsDialog
