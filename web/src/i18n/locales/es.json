@@ -797,8 +797,8 @@
       "auditBlockingSeveritiesHelp": "Solo los hallazgos de los niveles marcados bloquean (REWORK). Los niveles sin marcar son mejoras no bloqueantes. Predeterminado: solo P0. Debe quedar al menos un nivel.",
       "auditBlockingSeveritiesAtLeastOne": "Debe quedar seleccionado al menos un nivel bloqueante",
       "auditSeverity": {
-        "P0": "Pérdida o corrupción de datos, fallo de seguridad, producción caída o irrecuperable",
-        "P1": "Incumple un criterio de aceptación explícito, regresión, cuelgue o bloqueo permanente, escritura parcial",
+        "P0": "Pérdida o corrupción de datos, brecha de seguridad, caída de producción o estado irrecuperable; requisito explícito y trazable o criterio de aceptación incumplido; regresión introducida por este cambio",
+        "P1": "Defecto funcional grave fuera de la aceptación explícita; bloqueo o suspensión permanente; escritura parcial",
         "P2": "Defecto en casos límite, concurrencia o rutas de error; el cambio carece de una prueba clave",
         "P3": "Problema de mantenibilidad sin impacto en la corrección",
         "P4": "Estilo, nombres, redacción o mejora opcional"

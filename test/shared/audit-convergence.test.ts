@@ -54,12 +54,21 @@ describe('audit convergence contract', () => {
     }
   });
 
+  it('classifies explicit requirement failures and introduced regressions as P0', () => {
+    expect(AUDIT_SEVERITY_DEFINITIONS.P0).toMatch(/explicit, traceable user requirement or acceptance criterion/);
+    expect(AUDIT_SEVERITY_DEFINITIONS.P0).toMatch(/regression introduced by this change/);
+    expect(AUDIT_SEVERITY_DEFINITIONS.P1).not.toMatch(/acceptance criterion|regression/);
+  });
+
   it('explicitly forbids nitpicking or manufacturing findings', () => {
     const contract = JSON.parse(buildAuditConvergenceContract());
     expect(contract.antiNitpick.rule).toMatch(/never nitpick, manufacture, or inflate findings/);
-    expect(contract.antiNitpick.severity).toMatch(/never upgrade a finding to reach a blocking level/);
+    expect(contract.antiNitpick.severity).toMatch(/never upgrade a finding merely to reach a blocking level/);
+    expect(contract.antiNitpick.p0Boundary).toMatch(/cite the exact explicit requirement or criterion/);
+    expect(contract.antiNitpick.p0Boundary).toMatch(/supported prior behavior/);
     expect(contract.antiNitpick.noFinding).toMatch(/PASS/);
-    expect(contract.antiNitpick.scope).toMatch(/do not expand acceptance/);
+    expect(contract.antiNitpick.scope).toMatch(/never invent requirements/);
+    expect(contract.antiNitpick.scope).toMatch(/out-of-scope extreme hypotheses/);
   });
 
   it('renders brief policy lines with the selected levels, the remainder and every definition', () => {

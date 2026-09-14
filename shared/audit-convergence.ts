@@ -48,8 +48,8 @@ export function normalizeAuditBlockingSeverities(value: unknown): AuditSeverity[
 }
 
 export const AUDIT_SEVERITY_DEFINITIONS: Readonly<Record<AuditSeverity, string>> = {
-  P0: 'data loss or corruption, security hole, production down or unrecoverable',
-  P1: 'violates an explicit acceptance criterion, regression, hang or permanent block, partial write',
+  P0: 'data loss or corruption, security hole, production down or unrecoverable; fails an explicit, traceable user requirement or acceptance criterion; regression introduced by this change',
+  P1: 'serious functional defect outside explicit acceptance; hang or permanent block; partial write',
   P2: 'edge-case, concurrency or error-path defect; changed behavior lacks a key test',
   P3: 'maintainability issue with no correctness impact',
   P4: 'style, naming, wording or optional improvement',
@@ -82,13 +82,14 @@ export function buildAuditConvergenceContract(): string {
     },
     antiNitpick: {
       rule: 'never nitpick, manufacture, or inflate findings to justify REWORK; do not hunt for problems for their own sake',
-      severity: 'assign the level that the definition actually matches, backed by concrete evidence; never upgrade a finding to reach a blocking level',
+      severity: 'assign the level that the definition actually matches, backed by concrete evidence; never upgrade a finding merely to reach a blocking level',
+      p0Boundary: 'acceptance-based P0 must cite the exact explicit requirement or criterion and show it is unmet; regression-based P0 must identify supported prior behavior and causally tie the break to this change',
       noFinding: 'when no finding reaches a configured blocking severity, PASS',
-      scope: 'judge against the stated acceptance and scope only; do not expand acceptance or reopen accepted non-blocking items',
+      scope: 'judge against the stated acceptance and scope only; never invent requirements, expand acceptance, use out-of-scope extreme hypotheses, or reopen accepted non-blocking items',
     },
     firstPass: {
       findings: 'all at once, each with severity, violated invariant, location and evidence',
-      acceptance: 'trace every criterion to evidence; an untraced criterion blocks PASS',
+      acceptance: 'trace every criterion to evidence; an unmet explicit criterion is P0 and an untraced criterion blocks PASS',
       timeBox: 'limits reruns, not coverage',
     },
     rework: {
