@@ -19,7 +19,6 @@ import {
   persistInstallIdentity,
   redeemEnrollmentV2,
   type ControlledNodeCredential,
-  type FileIdentity,
   type PendingInstallIdentity,
   type StagedExecutableReceipt,
   type VerifiedEnrollmentSource,
@@ -40,6 +39,7 @@ import {
   type InstallJournal,
   type InstallPhase,
   type ServiceReceipt,
+  type SourceArtifactIdentity,
 } from './install-journal.js';
 import {
   WINDOWS_COMPILED_RELEASE_SIGNER_SHA256,
@@ -89,6 +89,12 @@ export interface ControlledNodeBootstrapDeps {
   isStableRuntime: (journal: InstallJournal) => Promise<boolean>;
   assertElevated: () => void | Promise<void>;
   ensureReleasePublisherTrust: (executablePath: string) => Promise<void>;
+  /**
+   * Content identity of the installer the human launched. Injected so the
+   * bootstrap can be exercised without a real executable on disk; production
+   * reads it from the same verified inspection the staging path uses.
+   */
+  inspectSourceArtifact: (executablePath: string) => Promise<SourceArtifactIdentity>;
   prepareCredentialDir: () => Promise<void>;
   loadInstallJournal: (path: string) => Promise<InstallJournal>;
   writeInstallPhase: typeof writeInstallPhase;
@@ -132,6 +138,10 @@ export function defaultBootstrapDeps(now: number): ControlledNodeBootstrapDeps {
     startService: (receipt) => startService(receipt),
     verifyStagedExecutable: (receipt) => verifyStagedExecutableReceipt(receipt),
     isStableRuntime: (journal) => isCurrentExecutableStable(journal, sourceExecutablePath),
+    inspectSourceArtifact: async (executablePath) => {
+      const inspected = await inspectVerifiedExecutable(executablePath);
+      return { sha256: inspected.sha256, size: inspected.size };
+    },
     assertElevated: assertProcessElevated,
     ensureReleasePublisherTrust: async (executablePath) => {
       if (process.platform !== 'win32' || !/^[a-f0-9]{64}$/.test(WINDOWS_COMPILED_RELEASE_SIGNER_SHA256)) return;
@@ -156,6 +166,19 @@ export function defaultBootstrapDeps(now: number): ControlledNodeBootstrapDeps {
     now,
     warn: (message) => process.stderr.write(`imcodes-node: ${message}\n`),
   };
+}
+
+/**
+ * The phase label to write for a step that is being re-run as a repair.
+ *
+ * Phases are monotonic, so an enrolled or healthy machine re-running staging or
+ * enrollment must not stamp the journal back down to that earlier label — the
+ * journal refuses the backward transition and the repair dies. The step still
+ * records its data; the label simply stays at the furthest point the install
+ * has actually reached.
+ */
+function repairPhase(journal: Pick<InstallJournal, 'phase'>, step: InstallPhase): InstallPhase {
+  return phaseIndex(journal.phase) > phaseIndex(step) ? journal.phase : step;
 }
 
 export async function isCurrentExecutableStable(
@@ -241,92 +264,6 @@ export async function verifyStagedExecutableReceipt(receipt: StagedExecutableRec
 }
 
 /**
- * Re-derive the staged receipt when the installed copy no longer matches it.
- *
- * The receipt lives in the journal, but the executable it describes is replaced
- * by upgrade paths that do not all rewrite the journal. When they drift, the
- * installed copy fails its own byte-identity check and `isCurrentExecutableStable`
- * says false -- which the bootstrap reads as "I am an installer". It then stages
- * nothing (there is no enrollment trailer to stage), "hands off" to a service
- * that is already this process, and exits 0. The watchdog restarts it a minute
- * later into the same conclusion. A whole fleet of machines sat in that loop for
- * days: offline, exit code 0, not one line of log explaining it.
- *
- * Receipt drift at the installed path is a stale record, not an identity claim.
- * The honest discriminator between "installed copy" and "installer" is the
- * enrollment trailer, and the bootstrap already relies on it everywhere else, so
- * use it here: a trailer-free image running from stagedExePath IS the installed
- * copy, whatever the receipt remembers. Heal the receipt from the bytes on disk
- * and let the node run.
- *
- * This grants nothing to an attacker. The receipt is a local integrity note with
- * no signature behind it, sitting in the same SYSTEM-only directory as the
- * executable and the journal -- anyone able to swap the exe can rewrite the note
- * beside it. All it ever actually stopped was the machine's own recovery.
- */
-async function healStaleStagedReceipt(
-  deps: ControlledNodeBootstrapDeps,
-  journal: InstallJournal,
-): Promise<InstallJournal | null> {
-  if (!journal.stagedExePath || !journal.stagedReceipt) return null;
-  let stagedRealPath: string;
-  let currentRealPath: string;
-  try {
-    stagedRealPath = await realpath(journal.stagedExePath);
-    currentRealPath = await realpath(deps.sourceExecutablePath);
-  } catch {
-    return null;
-  }
-  if (stagedRealPath !== currentRealPath) return null;
-
-  let source: VerifiedEnrollmentSource | null = null;
-  try {
-    source = await deps.openVerifiedEnrollmentSource(deps.sourceExecutablePath);
-    // A trailer means this really is an installer package; leave it to the
-    // install path, which restages and hands off on purpose.
-    if (await source.readEnrollmentBlobWithRange()) return null;
-  } catch {
-    return null;
-  } finally {
-    if (source) await source.close().catch(() => {});
-  }
-
-  let receipt: StagedExecutableReceipt;
-  try {
-    const inspected = await inspectVerifiedExecutable(deps.sourceExecutablePath);
-    const st = await lstat(deps.sourceExecutablePath);
-    if (st.size !== inspected.size) return null;
-    const identity: FileIdentity = {
-      ...(typeof st.dev === 'number' ? { dev: st.dev } : {}),
-      ...(typeof st.ino === 'number' ? { ino: st.ino } : {}),
-      size: st.size,
-      mtimeMs: st.mtimeMs,
-      ctimeMs: st.ctimeMs,
-    };
-    receipt = {
-      path: journal.stagedExePath,
-      size: inspected.size,
-      sha256: inspected.sha256,
-      sourceIdentity: identity,
-      stagedIdentity: identity,
-    };
-  } catch {
-    return null;
-  }
-
-  deps.warn(
-    `staged executable no longer matches its install receipt and carries no enrollment trailer; `
-    + `adopting the installed image at ${journal.stagedExePath} as the stable runtime`,
-  );
-  return deps.writeInstallPhase(deps.journalPath, journal.phase, {
-    now: Math.max(deps.now, journal.updatedAt),
-    previous: journal,
-    stagedExePath: journal.stagedExePath,
-    stagedReceipt: receipt,
-  });
-}
-
-/**
  * Install publisher trust, but never let its failure cost the machine.
  *
  * The trust anchor gates native sidecars — the remote-desktop worker and the
@@ -401,12 +338,59 @@ async function ensureIdentityPrepared(
   if (journal.nodeTokenHash !== undefined && journal.nodeTokenHash !== identity.nodeTokenHash) {
     throw new Error('controlled node install identity does not match journal nodeTokenHash');
   }
-  // No sourceExePath equality gate. installId/nodeTokenHash identify the node
-  // and are checked above; sourceExePath only records which file this run was
-  // launched from, which legitimately differs on every reinstall from a fresh
-  // download. Machines whose journal already drifted from their identity file
-  // (the earlier build wrote the current run's path here) recover on the next
-  // run instead of being permanently unable to reinstall.
+
+  // Identify the installer the human launched by its CONTENT. The path it was
+  // downloaded to legitimately differs on a retry; the bytes do not. This exe
+  // has already passed release publisher trust and verified-source checks
+  // before reaching here, so the digest below is taken from a trusted artifact.
+  const sourceArtifact = await deps.inspectSourceArtifact(deps.sourceExecutablePath);
+
+  // P0-1. Compare the running executable against the pinned artifact on EVERY
+  // boot, before any phase advances, whether or not the path changed.
+  //
+  // Checking only when the path moved left the worst case open: drop different
+  // bytes at the SAME path the journal already trusts and nothing ever looked.
+  // The path is not the identity; these bytes are.
+  if (journal.sourceArtifact !== undefined
+    && (journal.sourceArtifact.sha256 !== sourceArtifact.sha256
+      || journal.sourceArtifact.size !== sourceArtifact.size)) {
+    throw new Error('controlled node install source executable does not match the journal source artifact');
+  }
+
+  // A journal written before `sourceArtifact` existed carries no content
+  // identity yet. Adopt one — but only inside the pre-enrollment retry window,
+  // and only here, after publisher trust and the verified enrollment source
+  // have already vouched for these bytes. From `enrolled` onwards nothing is
+  // adopted: an unpinned journal stays unpinned rather than being pinned to
+  // whatever happens to be running now.
+  const adoptingLegacyArtifact = journal.sourceArtifact === undefined
+    && phaseIndex(journal.phase) >= phaseIndex('credential_prepared')
+    && phaseIndex(journal.phase) <= phaseIndex('files_staged');
+  const migratingSourcePath = journal.sourceExePath !== undefined
+    && journal.sourceExePath !== deps.sourceExecutablePath;
+
+  // P0-2. The JOURNAL is the single authority for the source path.
+  //
+  // The journal is written and fsynced first; the durable identity is a cache
+  // of it. A crash in between used to leave the journal on the new path and the
+  // identity on the old one with nothing to reconcile them. Now the next boot
+  // simply re-derives the identity from the journal, which is idempotent, can
+  // only move forward, and needs no separate recovery mode.
+  if (migratingSourcePath || adoptingLegacyArtifact) {
+    journal = await deps.writeInstallPhase(deps.journalPath, journal.phase, {
+      now: deps.now,
+      previous: journal,
+      sourceExePath: deps.sourceExecutablePath,
+      sourceArtifact,
+    });
+  }
+  if (journal.sourceExePath !== undefined && identity.sourceExePath !== journal.sourceExePath) {
+    // Converge the cache onto the authority. Reached both in the same boot as
+    // the write above and on any later boot that finds the pair torn.
+    identity.sourceExePath = journal.sourceExePath;
+    await deps.persistInstallIdentity(identity);
+  }
+
   if (phaseIndex(journal.phase) < phaseIndex('credential_prepared')) {
     journal = await deps.writeInstallPhase(deps.journalPath, 'credential_prepared', {
       now: deps.now,
@@ -414,6 +398,7 @@ async function ensureIdentityPrepared(
       installId: identity.installId,
       nodeTokenHash: identity.nodeTokenHash,
       sourceExePath: identity.sourceExePath,
+      sourceArtifact,
     });
   }
   return { journal, identity };
@@ -450,7 +435,18 @@ async function ensureExecutableStaged(
     trailerRange.trailerStart,
     trailerRange.windowsAuthenticode,
   );
-  return deps.writeInstallPhase(deps.journalPath, 'files_staged', {
+  // Record the refreshed receipt at the phase the install is ALREADY in.
+  //
+  // Re-staging is a repair, not a rewind. An enrolled or healthy machine whose
+  // service copy drifted still needs a fresh receipt, but forcing the label
+  // back to `files_staged` is a backward transition the journal rightly
+  // refuses — which left exactly those machines with no way back. The staged
+  // target is still pinned, so this refreshes the bytes at that target and
+  // nothing else.
+  const restagePhase = phaseIndex(journal.phase) > phaseIndex('files_staged')
+    ? journal.phase
+    : 'files_staged';
+  return deps.writeInstallPhase(deps.journalPath, restagePhase, {
     now: deps.now,
     previous: journal,
     stagedExePath: deps.stagedExecutablePath,
@@ -478,7 +474,7 @@ async function ensureEnrolled(
     await deps.persistCredential(credential);
   } catch (err) {
     if (!recovering) {
-      await deps.writeInstallPhase(deps.journalPath, 'enrolled', {
+      await deps.writeInstallPhase(deps.journalPath, repairPhase(journal, 'enrolled'), {
         now: deps.now,
         previous: journal,
         installId: identity.installId,
@@ -501,7 +497,7 @@ async function ensureEnrolled(
     ? journal.cleanupStatus
     : 'skipped';
 
-  journal = await deps.writeInstallPhase(deps.journalPath, 'enrolled', {
+  journal = await deps.writeInstallPhase(deps.journalPath, repairPhase(journal, 'enrolled'), {
     now: deps.now,
     previous: journal,
     installId: identity.installId,
@@ -552,7 +548,7 @@ async function ensureServiceRegistered(
     });
   }
   const serviceReceipt = await deps.inspectDefinition(await deps.installDefinition(stagedPath));
-  return deps.writeInstallPhase(deps.journalPath, 'service_registered', {
+  return deps.writeInstallPhase(deps.journalPath, repairPhase(journal, 'service_registered'), {
     now: deps.now,
     previous: journal,
     serviceName: serviceReceipt.name,
@@ -674,7 +670,7 @@ async function ensureServiceStartRequested(
   journal = await ensureServiceRegistered(deps, journal);
   const receipt = receiptFromJournal(journal);
   if (phaseIndex(journal.phase) < phaseIndex('service_start_requested')) {
-    journal = await deps.writeInstallPhase(deps.journalPath, 'service_start_requested', {
+    journal = await deps.writeInstallPhase(deps.journalPath, repairPhase(journal, 'service_start_requested'), {
       now: deps.now,
       previous: journal,
       serviceStartRequestedAt: deps.now,
@@ -700,14 +696,7 @@ async function ensureServiceStartRequested(
 export async function bootstrapControlledNodeWithDisposition(deps: ControlledNodeBootstrapDeps): Promise<BootstrapResult> {
   const existing = await deps.loadCredential();
   let journal = await loadJournalOrThrow(deps);
-  let stableRuntime = await deps.isStableRuntime(journal);
-  if (existing && !stableRuntime) {
-    const healed = await healStaleStagedReceipt(deps, journal);
-    if (healed) {
-      journal = healed;
-      stableRuntime = true;
-    }
-  }
+  const stableRuntime = await deps.isStableRuntime(journal);
 
   if (existing && stableRuntime && phaseIndex(journal.phase) >= phaseIndex('service_registered')) {
     // A transient maintenance failure on an already healthy stable runtime must
@@ -739,7 +728,7 @@ export async function bootstrapControlledNodeWithDisposition(deps: ControlledNod
     // Legitimate crash window: the credential fsync completed, but the enrolled
     // journal write did not. Reconcile exactly one phase before service install.
     if (journal.phase === 'files_staged') {
-      journal = await deps.writeInstallPhase(deps.journalPath, 'enrolled', {
+      journal = await deps.writeInstallPhase(deps.journalPath, repairPhase(journal, 'enrolled'), {
         now: deps.now,
         previous: journal,
         serverId: existing.serverId,
