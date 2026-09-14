@@ -92,6 +92,7 @@ describe('shared daemon/server/web wire protocol contracts', () => {
       PEER_AUDIT_QUICK_START: 'peer_audit.quick_start',
       PEER_AUDIT_CANCEL: 'peer_audit.cancel',
       PEER_AUDIT_REPLY: 'peer_audit.reply',
+      SUPERVISOR_DEFAULTS_CHANGED: 'supervisor_defaults.changed',
     });
   });
 

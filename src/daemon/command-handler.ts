@@ -105,6 +105,7 @@ import { PROVIDER_ERROR_CODES } from '../agent/transport-provider.js';
 import { refreshCodexQuotaMetadataForSessions } from './codex-quota-refresh.js';
 import { fetchCodexResetCredits, consumeCodexResetCredit } from '../agent/codex-reset-credits.js';
 import { supervisionAutomation } from './supervision-automation.js';
+import { refreshSupervisorDefaultsCache } from './supervisor-defaults-cache.js';
 import { syncSessionIdentitiesForCommand } from './session-identity-sync.js';
 import {
   normalizeSessionIdentityContent,
@@ -1905,6 +1906,14 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       break;
     case DAEMON_COMMAND_TYPES.SERVER_DELETE:
       void handleServerDelete();
+      break;
+    case DAEMON_COMMAND_TYPES.SUPERVISOR_DEFAULTS_CHANGED:
+      // Best-effort, same as the periodic poll this preempts: a fetch
+      // failure here just leaves the existing cache in place until the
+      // next scheduled refresh.
+      void refreshSupervisorDefaultsCache().catch((err) => {
+        logger.debug({ err }, 'supervisor defaults changed push: refresh failed');
+      });
       break;
     case DAEMON_COMMAND_TYPES.DAEMON_UPGRADE:
       try {

@@ -9,9 +9,11 @@ vi.mock('../../src/bind/bind-flow.js', () => ({
 }));
 
 const {
+  __reloadSupervisorDefaultsCacheFromDiskForTests,
   __resetSupervisorDefaultsCacheForTests,
   __setCachedSupervisorDefaultsForTests,
   getCachedSupervisorDefaults,
+  getSupervisorDefaultsCacheAgeMs,
   overlayCachedExecutionPools,
   refreshSupervisorDefaultsCache,
 } = await import('../../src/daemon/supervisor-defaults-cache.js');
@@ -65,6 +67,60 @@ describe('supervisor defaults cache', () => {
       backupBackend: 'codex-sdk',
       backupModel: 'gpt-5.3-codex-spark',
       timeoutMs: 45_000,
+    });
+  });
+
+  describe('local SQLite mirror (survives a daemon restart)', () => {
+    it('is empty before any successful fetch, exactly like a fresh install', () => {
+      expect(getCachedSupervisorDefaults()).toBeNull();
+      __reloadSupervisorDefaultsCacheFromDiskForTests();
+      expect(getCachedSupervisorDefaults()).toBeNull();
+    });
+
+    it('recovers the last synced value from disk without a network round trip, simulating a restart', async () => {
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ defaults: { backend: 'qwen', model: 'qwen3-coder-plus', timeoutMs: 60_000 } }),
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      await refreshSupervisorDefaultsCache();
+      expect(getCachedSupervisorDefaults()).toMatchObject({ backend: 'qwen', model: 'qwen3-coder-plus' });
+
+      // Simulate the process restarting: the in-memory value is gone, but a
+      // fresh fetch has NOT happened yet (getSupervisorDefaultsCacheAgeMs
+      // would report Infinity). The disk mirror must still answer.
+      __setCachedSupervisorDefaultsForTests(null);
+      expect(getSupervisorDefaultsCacheAgeMs()).toBe(Infinity);
+      __reloadSupervisorDefaultsCacheFromDiskForTests();
+
+      expect(getCachedSupervisorDefaults()).toMatchObject({ backend: 'qwen', model: 'qwen3-coder-plus', timeoutMs: 60_000 });
+    });
+
+    it('overwrites the disk mirror with each new synced value rather than accumulating stale rows', async () => {
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ defaults: { backend: 'qwen', model: 'qwen3-coder-plus' } }) })
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ defaults: { backend: 'codex-sdk', model: 'gpt-5.6-sol' } }) });
+      vi.stubGlobal('fetch', fetchMock);
+
+      await refreshSupervisorDefaultsCache();
+      await refreshSupervisorDefaultsCache();
+      __reloadSupervisorDefaultsCacheFromDiskForTests();
+
+      expect(getCachedSupervisorDefaults()).toMatchObject({ backend: 'codex-sdk', model: 'gpt-5.6-sol' });
+    });
+
+    it('does not overwrite the disk mirror on a failed fetch', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ defaults: { backend: 'qwen', model: 'qwen3-coder-plus' } }),
+      }));
+      await refreshSupervisorDefaultsCache();
+
+      vi.stubGlobal('fetch', vi.fn().mockRejectedValueOnce(new Error('network down')));
+      await refreshSupervisorDefaultsCache();
+
+      __reloadSupervisorDefaultsCacheFromDiskForTests();
+      expect(getCachedSupervisorDefaults()).toMatchObject({ backend: 'qwen', model: 'qwen3-coder-plus' });
     });
   });
 

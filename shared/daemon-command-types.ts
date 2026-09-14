@@ -25,6 +25,12 @@ export const DAEMON_COMMAND_TYPES = {
   PEER_AUDIT_CANCEL: 'peer_audit.cancel',
   /** Auditor → daemon (daemon-only, no terminal-key fallback): submit the one structured reply. */
   PEER_AUDIT_REPLY: 'peer_audit.reply',
+  /**
+   * Server → daemon: the account-level supervisor defaults (backend/model,
+   * timeout, execution pools, ...) were just saved in PostgreSQL. Refresh the
+   * in-memory/disk cache now rather than waiting for the next periodic poll.
+   */
+  SUPERVISOR_DEFAULTS_CHANGED: 'supervisor_defaults.changed',
 } as const;
 
 export type DaemonCommandType =

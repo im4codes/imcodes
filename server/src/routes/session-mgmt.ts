@@ -527,6 +527,19 @@ sessionMgmtRoutes.put('/:id/sessions/:name/supervision/defaults', async (c) => {
     SUPERVISION_USER_DEFAULT_PREF_KEY,
     JSON.stringify(defaults),
   );
+  // PostgreSQL is the single source of truth; the daemon otherwise only
+  // notices this within its own five-second poll. A Brain that dispatches
+  // manual task{objective,acceptance} work right after a fresh pool save
+  // must not race that window, so push the connected daemon a refresh now.
+  const serverId = c.req.param('id')!;
+  try {
+    WsBridge.get(serverId).sendToDaemon(JSON.stringify({
+      type: DAEMON_COMMAND_TYPES.SUPERVISOR_DEFAULTS_CHANGED,
+    }));
+  } catch (err) {
+    // Best-effort: the daemon's own five-second poll remains the fallback.
+    logger.debug({ serverId, err }, 'supervisor defaults changed push failed');
+  }
   return c.json({ ok: true, defaults });
 });
 

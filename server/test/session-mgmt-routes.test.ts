@@ -1158,6 +1158,12 @@ describe('session-mgmt persistence routes', () => {
       model: 'MiniMax-M2.7',
       preset: 'MiniMax Owner',
     }));
+    // The daemon's own poll would notice this within five seconds regardless,
+    // but manual task dispatch right after a fresh save must not race that
+    // window -- the save pushes an immediate refresh over the existing WS link.
+    expect(sendToDaemonMock).toHaveBeenCalledWith(JSON.stringify({
+      type: DAEMON_COMMAND_TYPES.SUPERVISOR_DEFAULTS_CHANGED,
+    }));
   });
 
   it('reads, overwrites, and clears the machine owner identity for a covered participant', async () => {
