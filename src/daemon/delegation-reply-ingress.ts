@@ -5,7 +5,10 @@ import {
   AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
   AGENT_DELEGATION_REPLY_ERRORS,
   AGENT_DELEGATION_REPLY_STATUSES,
+  AGENT_DELEGATION_SUPERVISION_TASK_PROJECTION_VERSION,
   decodeAgentDelegationReplyEnvelope,
+  projectAgentDelegationSupervisionTaskTitle,
+  readTrustedAgentDelegationPeerAuditCompletionBinding,
   readTrustedAgentDelegationReplyVerdict,
   type AgentDelegationReplyEnvelope,
   type AgentDelegationReplyError,
@@ -122,6 +125,94 @@ function trustedStructuredVerdict(record: DelegationReplyRecord) {
   }
 }
 
+function supervisionTaskIdProjection(record: DelegationReplyRecord) {
+  const taskId = typeof record.taskId === 'string' ? record.taskId.trim() : '';
+  const assignmentId = typeof record.assignmentId === 'string' ? record.assignmentId.trim() : '';
+  if (!taskId || !assignmentId) return undefined;
+  return {
+    version: AGENT_DELEGATION_SUPERVISION_TASK_PROJECTION_VERSION,
+    taskId,
+    assignmentId,
+    ...(typeof record.auditAttemptId === 'string' && record.auditAttemptId.trim()
+      ? { attemptId: record.auditAttemptId.trim() }
+      : {}),
+    ...(typeof record.auditRevision === 'string' && record.auditRevision.trim()
+      ? { revision: record.auditRevision.trim() }
+      : {}),
+  };
+}
+
+function supervisionTaskProjection(record: DelegationReplyRecord) {
+  const base = supervisionTaskIdProjection(record);
+  if (!base) return undefined;
+  const { taskId, assignmentId } = base;
+
+  // A supervision-audit result is sender-controlled until its exact locally
+  // generated binding agrees with the durable reply authority. Keep the ids as
+  // a useful fallback, but never resolve registry details from contradictory or
+  // malformed result text.
+  if (record.purpose === AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT) {
+    let completion: ReturnType<typeof readTrustedAgentDelegationPeerAuditCompletionBinding>;
+    try {
+      completion = readTrustedAgentDelegationPeerAuditCompletionBinding(JSON.parse(record.result ?? ''));
+    } catch {
+      return base;
+    }
+    if (!completion
+      || completion.taskId !== taskId
+      || completion.assignmentId !== assignmentId
+      || completion.attemptId !== record.auditAttemptId
+      || completion.revision !== record.auditRevision) return base;
+  }
+
+  const registry = getSupervisionTaskRegistry();
+  const task = registry.getTaskRecord(taskId);
+  const assignment = registry.getAssignment(assignmentId);
+  const coordinatorAssignmentId = record.coordinatorAssignmentId?.trim();
+  const coordinator = coordinatorAssignmentId
+    ? registry.getAssignment(coordinatorAssignmentId)
+    : undefined;
+  const revisionMatches = !record.auditRevision
+    || (task?.currentRevision === record.auditRevision
+      && assignment?.auditRevision === record.auditRevision);
+  const attemptMatches = !record.auditAttemptId
+    || assignment?.auditAttemptId === record.auditAttemptId;
+  const coordinatorMatches = Boolean(coordinator
+    && coordinator.taskId === taskId
+    && coordinator.role === 'coordinator'
+    && identityMatches(record.origin, coordinator.identity));
+  const title = task
+    && task.taskId === taskId
+    && assignment?.taskId === taskId
+    && revisionMatches
+    && attemptMatches
+    && coordinatorMatches
+    ? projectAgentDelegationSupervisionTaskTitle(task.objective)
+    : undefined;
+  return title ? { ...base, title } : base;
+}
+
+function safeSupervisionTaskProjection(record: DelegationReplyRecord) {
+  const fallback = supervisionTaskIdProjection(record);
+  if (!fallback) return undefined;
+  try {
+    return supervisionTaskProjection(record);
+  } catch (error) {
+    // Task-title enrichment is presentation-only and runs after durable receipt.
+    // Registry contention/corruption (or any future projector failure) must not
+    // turn an accepted reply into an error, suppress its timeline event, skip
+    // background delivery, or stop the startup resume sweep. The bound ids are
+    // already durable authority and remain the privacy-safe fallback.
+    logger.warn({
+      error,
+      delegationId: record.delegationId,
+      taskId: fallback.taskId,
+      assignmentId: fallback.assignmentId,
+    }, 'supervision task title projection failed; using bound ids');
+    return fallback;
+  }
+}
+
 function emitDelegationReplyTimeline(record: DelegationReplyRecord): void {
   // The timeline is projected onto a session NAME, and this ran at three call
   // sites BEFORE any origin verification. A same-named replacement therefore saw
@@ -132,6 +223,7 @@ function emitDelegationReplyTimeline(record: DelegationReplyRecord): void {
   if (!identityMatches(record.origin, boundIdentity(getSession(record.origin.sessionName)))) return;
   const targetSession = getSession(record.target.sessionName);
   const verdict = trustedStructuredVerdict(record);
+  const supervisionTask = safeSupervisionTaskProjection(record);
   timelineEmitter.emit(
     record.origin.sessionName,
     AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
@@ -141,6 +233,7 @@ function emitDelegationReplyTimeline(record: DelegationReplyRecord): void {
       ...(targetSession?.label ? { sourceLabel: targetSession.label } : {}),
       result: record.result ?? '',
       ...(verdict ? { verdict } : {}),
+      ...(supervisionTask ? { supervisionTask } : {}),
     },
     {
       source: 'daemon',

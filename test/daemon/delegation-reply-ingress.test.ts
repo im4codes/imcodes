@@ -82,6 +82,7 @@ vi.mock('../../src/daemon/supervision-state-store.js', () => ({
 
 import {
   clearDelegationReplyIngressForTests,
+  resumePendingDelegationReplies,
   submitDelegationReply,
 } from '../../src/daemon/delegation-reply-ingress.js';
 import {
@@ -488,6 +489,717 @@ describe('delegation reply ingress', () => {
     expect(mocks.store.create).not.toHaveBeenCalled();
     expect(mocks.appendMatchingAuditReceipt).not.toHaveBeenCalled();
   });
+
+  it.each(['PASS', 'REWORK'] as const)(
+    'projects a concise registry title for an exact %s binding only after every authority check',
+    async (verdict) => {
+    const suffix = verdict.toLowerCase();
+    const auditRecord = {
+      ...record,
+      purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+      auditAttemptId: `attempt_title_${suffix}`,
+      auditRevision: `revision-title-${suffix}`,
+      auditedSessionName: origin.sessionName,
+      taskId: `tsk_title_${suffix}`,
+      assignmentId: `asg_title_auditor_${suffix}`,
+      coordinatorAssignmentId: `asg_title_coordinator_${suffix}`,
+    };
+    mocks.store.matchPendingAuditAuthority.mockReturnValue(auditRecord);
+    mocks.store.receive.mockImplementation((input: { result: string }) => ({
+      ok: true, record: { ...auditRecord, result: input.result }, replay: false,
+    }));
+    mocks.getTaskRecord.mockReturnValue({
+      taskId: auditRecord.taskId,
+      objective: '  Verify the payment retry race\nwithout duplicate charges.  ',
+      currentRevision: auditRecord.auditRevision,
+    });
+    mocks.getAssignment.mockImplementation((assignmentId: string) => assignmentId === auditRecord.assignmentId
+      ? {
+          assignmentId,
+          taskId: auditRecord.taskId,
+          role: 'auditor',
+          auditAttemptId: auditRecord.auditAttemptId,
+          auditRevision: auditRecord.auditRevision,
+          identity: { ...target, agentType: 'codex-sdk', providerFamily: 'openai' },
+        }
+      : assignmentId === auditRecord.coordinatorAssignmentId
+        ? {
+            assignmentId,
+            taskId: auditRecord.taskId,
+            role: 'coordinator',
+            identity: { ...origin, agentType: 'codex-sdk', providerFamily: 'openai' },
+          }
+        : undefined);
+
+    await expect(submitPeerAuditReply({
+      rawBody: JSON.stringify({
+        version: PEER_AUDIT_REPLY_VERSION,
+        taskId: auditRecord.taskId,
+        assignmentId: auditRecord.assignmentId,
+        attemptId: auditRecord.auditAttemptId,
+        revision: auditRecord.auditRevision,
+        receiptKind: 'final',
+        verdict,
+        findings: 'Exact title projection passed.',
+        validations: [{
+          kind: 'test',
+          label: 'title',
+          outcome: verdict === 'PASS' ? 'passed' : 'failed',
+          summary: verdict === 'PASS' ? 'green' : 'counterexample reproduced',
+        }],
+        taskName: 'FORGED SENDER TITLE',
+      }),
+      senderSessionName: target.sessionName,
+      now: 100,
+    })).resolves.toEqual({ ok: false, error: 'unknown_field:taskName' });
+
+    await expect(submitPeerAuditReply({
+      rawBody: JSON.stringify({
+        version: PEER_AUDIT_REPLY_VERSION,
+        taskId: auditRecord.taskId,
+        assignmentId: auditRecord.assignmentId,
+        attemptId: auditRecord.auditAttemptId,
+        revision: auditRecord.auditRevision,
+        receiptKind: 'final',
+        verdict,
+        findings: 'Exact title projection passed.',
+        validations: [{
+          kind: 'test',
+          label: 'title',
+          outcome: verdict === 'PASS' ? 'passed' : 'failed',
+          summary: verdict === 'PASS' ? 'green' : 'counterexample reproduced',
+        }],
+      }),
+      senderSessionName: target.sessionName,
+      now: 101,
+    })).resolves.toEqual({ ok: true });
+
+    expect(mocks.timelineEmit).toHaveBeenCalledWith(
+      origin.sessionName,
+      AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+      expect.objectContaining({
+        verdict,
+        supervisionTask: {
+          version: 1,
+          taskId: auditRecord.taskId,
+          assignmentId: auditRecord.assignmentId,
+          attemptId: auditRecord.auditAttemptId,
+          revision: auditRecord.auditRevision,
+          title: 'Verify the payment retry race without duplicate charges.',
+        },
+      }),
+      expect.any(Object),
+    );
+  });
+
+  it.each([
+    ['malformed completion', '{"status":"peer_audit_completed"'],
+    ['mismatched task', JSON.stringify({
+      status: PEER_AUDIT_DELEGATED_REPLY_STATUS,
+      taskId: 'tsk_other',
+      assignmentId: 'asg_fallback_1',
+      attemptId: 'attempt-fallback-1',
+      revision: 'revision-fallback-1',
+      verdict: 'REWORK',
+    })],
+    ['mismatched assignment', JSON.stringify({
+      status: PEER_AUDIT_DELEGATED_REPLY_STATUS,
+      taskId: 'tsk_fallback_1',
+      assignmentId: 'asg_other',
+      attemptId: 'attempt-fallback-1',
+      revision: 'revision-fallback-1',
+      verdict: 'REWORK',
+    })],
+    ['mismatched attempt', JSON.stringify({
+      status: PEER_AUDIT_DELEGATED_REPLY_STATUS,
+      taskId: 'tsk_fallback_1',
+      assignmentId: 'asg_fallback_1',
+      attemptId: 'attempt-other',
+      revision: 'revision-fallback-1',
+      verdict: 'REWORK',
+    })],
+    ['mismatched revision', JSON.stringify({
+      status: PEER_AUDIT_DELEGATED_REPLY_STATUS,
+      taskId: 'tsk_fallback_1',
+      assignmentId: 'asg_fallback_1',
+      attemptId: 'attempt-fallback-1',
+      revision: 'revision-other',
+      verdict: 'REWORK',
+    })],
+  ])('keeps authoritative ids but omits task details for %s', async (_label, result) => {
+    const taskRecord = {
+      ...record,
+      purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+      taskId: 'tsk_fallback_1',
+      assignmentId: 'asg_fallback_1',
+      coordinatorAssignmentId: 'asg_fallback_coordinator_1',
+      auditAttemptId: 'attempt-fallback-1',
+      auditRevision: 'revision-fallback-1',
+      result,
+    };
+    mocks.store.receive.mockReturnValue({ ok: true, record: taskRecord, replay: false });
+    mocks.getTaskRecord.mockReturnValue({
+      taskId: taskRecord.taskId,
+      objective: 'SECRET TITLE MUST NOT RENDER',
+      currentRevision: taskRecord.auditRevision,
+    });
+    mocks.getAssignment.mockImplementation((assignmentId: string) => assignmentId === taskRecord.assignmentId
+      ? {
+          assignmentId,
+          taskId: taskRecord.taskId,
+          role: 'auditor',
+          auditAttemptId: taskRecord.auditAttemptId,
+          auditRevision: taskRecord.auditRevision,
+          identity: { ...target, agentType: 'codex-sdk', providerFamily: 'openai' },
+        }
+      : assignmentId === taskRecord.coordinatorAssignmentId
+        ? {
+            assignmentId,
+            taskId: taskRecord.taskId,
+            role: 'coordinator',
+            identity: { ...origin, agentType: 'codex-sdk', providerFamily: 'openai' },
+          }
+        : undefined);
+
+    await expect(submitDelegationReply({
+      rawBody: { ...envelope, result },
+      senderSessionName: target.sessionName,
+    })).resolves.toEqual(expect.objectContaining({ ok: true }));
+
+    expect(mocks.timelineEmit).toHaveBeenCalledWith(
+      origin.sessionName,
+      AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+      expect.objectContaining({
+        supervisionTask: {
+          version: 1,
+          taskId: taskRecord.taskId,
+          assignmentId: taskRecord.assignmentId,
+          attemptId: taskRecord.auditAttemptId,
+          revision: taskRecord.auditRevision,
+        },
+      }),
+      expect.any(Object),
+    );
+  });
+
+  it('falls back to bound ids when the task registry row is inaccessible', async () => {
+    const taskRecord = {
+      ...record,
+      taskId: 'tsk_inaccessible_1',
+      assignmentId: 'asg_inaccessible_1',
+      coordinatorAssignmentId: 'asg_inaccessible_coordinator_1',
+      auditRevision: 'revision-inaccessible-1',
+      result: 'Completed without a sender-authored title.',
+    };
+    mocks.store.receive.mockReturnValue({ ok: true, record: taskRecord, replay: false });
+    mocks.getTaskRecord.mockReturnValue(undefined);
+
+    await expect(submitDelegationReply({
+      rawBody: { ...envelope, result: taskRecord.result },
+      senderSessionName: target.sessionName,
+    })).resolves.toEqual(expect.objectContaining({ ok: true }));
+
+    expect(mocks.timelineEmit).toHaveBeenCalledWith(
+      origin.sessionName,
+      AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+      expect.objectContaining({
+        supervisionTask: {
+          version: 1,
+          taskId: taskRecord.taskId,
+          assignmentId: taskRecord.assignmentId,
+          revision: taskRecord.auditRevision,
+        },
+      }),
+      expect.any(Object),
+    );
+  });
+
+  it.each(['task lookup', 'assignment lookup', 'title projection'] as const)(
+    'keeps an ordinary durable reply live when the cosmetic %s throws',
+    async (failure) => {
+      const taskRecord = {
+        ...record,
+        taskId: `tsk_registry_throw_${failure.replace(/\s/gu, '_')}`,
+        assignmentId: `asg_registry_throw_${failure.replace(/\s/gu, '_')}`,
+        coordinatorAssignmentId: `asg_registry_throw_coordinator_${failure.replace(/\s/gu, '_')}`,
+        result: 'Durable worker result.',
+      };
+      mocks.store.receive.mockReturnValue({ ok: true, record: taskRecord, replay: false });
+      const registryTask = failure === 'title projection'
+        ? Object.defineProperties({
+            taskId: taskRecord.taskId,
+            currentRevision: 'revision-registry-throw',
+          }, {
+            objective: {
+              enumerable: true,
+              get: () => { throw new Error('objective projection failed'); },
+            },
+          })
+        : {
+            taskId: taskRecord.taskId,
+            objective: 'Registry title must be optional',
+            currentRevision: 'revision-registry-throw',
+          };
+      mocks.getTaskRecord.mockImplementation(() => {
+        if (failure === 'task lookup') throw new Error('SQLITE_BUSY task lookup');
+        return registryTask;
+      });
+      mocks.getAssignment.mockImplementation((assignmentId: string) => {
+        if (failure === 'assignment lookup') throw new Error('SQLITE_BUSY assignment lookup');
+        if (assignmentId === taskRecord.assignmentId) {
+          return {
+            assignmentId,
+            taskId: taskRecord.taskId,
+            role: 'implementer',
+            identity: { ...target, agentType: 'codex-sdk', providerFamily: 'openai' },
+          };
+        }
+        if (assignmentId === taskRecord.coordinatorAssignmentId) {
+          return {
+            assignmentId,
+            taskId: taskRecord.taskId,
+            role: 'coordinator',
+            identity: { ...origin, agentType: 'codex-sdk', providerFamily: 'openai' },
+          };
+        }
+        return undefined;
+      });
+      const send = vi.fn(() => 'sent');
+      mocks.runtime = {
+        recipientIdentity: {
+          sessionInstanceId: origin.sessionInstanceId,
+          runtimeEpoch: origin.runtimeEpoch,
+        },
+        deliverDelegationNotification: vi.fn(),
+        send,
+      };
+
+      await expect(submitDelegationReply({
+        rawBody: { ...envelope, result: taskRecord.result },
+        senderSessionName: target.sessionName,
+      })).resolves.toEqual(expect.objectContaining({ ok: true, pending: true }));
+
+      expect(mocks.timelineEmit).toHaveBeenCalledWith(
+        origin.sessionName,
+        AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+        expect.objectContaining({
+          result: taskRecord.result,
+          supervisionTask: {
+            version: 1,
+            taskId: taskRecord.taskId,
+            assignmentId: taskRecord.assignmentId,
+          },
+        }),
+        expect.any(Object),
+      );
+      await vi.waitFor(() => expect(send).toHaveBeenCalledOnce());
+    },
+  );
+
+  it.each(['task lookup', 'assignment lookup'] as const)(
+    'keeps a peer-audit receipt live when the cosmetic %s throws',
+    async (failure) => {
+      const auditRecord = {
+        ...record,
+        purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+        taskId: `tsk_audit_registry_throw_${failure.replace(/\s/gu, '_')}`,
+        assignmentId: `asg_audit_registry_throw_${failure.replace(/\s/gu, '_')}`,
+        coordinatorAssignmentId: `asg_audit_registry_throw_coordinator_${failure.replace(/\s/gu, '_')}`,
+        auditAttemptId: `attempt-audit-registry-throw-${failure.replace(/\s/gu, '-')}`,
+        auditRevision: `revision-audit-registry-throw-${failure.replace(/\s/gu, '-')}`,
+        auditedSessionName: origin.sessionName,
+      };
+      const auditAssignment = {
+        assignmentId: auditRecord.assignmentId,
+        taskId: auditRecord.taskId,
+        role: 'auditor',
+        auditAttemptId: auditRecord.auditAttemptId,
+        auditRevision: auditRecord.auditRevision,
+        identity: { ...target, agentType: 'codex-sdk', providerFamily: 'openai' },
+      };
+      mocks.store.matchPendingAuditAuthority.mockReturnValue(auditRecord);
+      mocks.store.receive.mockImplementation((input: { result: string }) => ({
+        ok: true,
+        record: { ...auditRecord, result: input.result },
+        replay: false,
+      }));
+      mocks.getTaskRecord.mockImplementation(() => {
+        if (failure === 'task lookup') throw new Error('SQLITE_BUSY audit task lookup');
+        return {
+          taskId: auditRecord.taskId,
+          objective: 'Audit title must be optional',
+          currentRevision: auditRecord.auditRevision,
+        };
+      });
+      mocks.getAssignment.mockImplementation((assignmentId: string) => {
+        if (assignmentId === auditRecord.assignmentId) return auditAssignment;
+        if (assignmentId === auditRecord.coordinatorAssignmentId) {
+          if (failure === 'assignment lookup') throw new Error('SQLITE_BUSY audit assignment lookup');
+          return {
+            assignmentId,
+            taskId: auditRecord.taskId,
+            role: 'coordinator',
+            identity: { ...origin, agentType: 'codex-sdk', providerFamily: 'openai' },
+          };
+        }
+        return undefined;
+      });
+      const send = vi.fn(() => 'sent');
+      mocks.runtime = {
+        recipientIdentity: {
+          sessionInstanceId: origin.sessionInstanceId,
+          runtimeEpoch: origin.runtimeEpoch,
+        },
+        deliverDelegationNotification: vi.fn(),
+        send,
+      };
+
+      await expect(submitPeerAuditReply({
+        rawBody: JSON.stringify({
+          version: PEER_AUDIT_REPLY_VERSION,
+          taskId: auditRecord.taskId,
+          assignmentId: auditRecord.assignmentId,
+          attemptId: auditRecord.auditAttemptId,
+          revision: auditRecord.auditRevision,
+          receiptKind: 'final',
+          verdict: 'PASS',
+          findings: 'Registry exceptions cannot undo this receipt.',
+          validations: [{
+            kind: 'test', label: 'registry fallback', outcome: 'passed', summary: 'id-only fallback passed',
+          }],
+        }),
+        senderSessionName: target.sessionName,
+        now: 100,
+      })).resolves.toEqual({ ok: true });
+
+      expect(mocks.timelineEmit).toHaveBeenCalledWith(
+        origin.sessionName,
+        AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+        expect.objectContaining({
+          verdict: 'PASS',
+          supervisionTask: {
+            version: 1,
+            taskId: auditRecord.taskId,
+            assignmentId: auditRecord.assignmentId,
+            attemptId: auditRecord.auditAttemptId,
+            revision: auditRecord.auditRevision,
+          },
+        }),
+        expect.any(Object),
+      );
+      await vi.waitFor(() => expect(send).toHaveBeenCalledOnce());
+    },
+  );
+
+  it('continues an ordinary startup resume past a throwing task lookup', () => {
+    const first = {
+      ...record,
+      delegationId: 'delegation_resume_registry_throw_first',
+      notificationId: 'notification-resume-registry-throw-first',
+      taskId: 'tsk_resume_registry_throw_first',
+      assignmentId: 'asg_resume_registry_throw_first',
+      coordinatorAssignmentId: 'asg_resume_registry_throw_coordinator_first',
+      result: 'First durable result.',
+    };
+    const later = {
+      ...record,
+      delegationId: 'delegation_resume_registry_later',
+      notificationId: 'notification-resume-registry-later',
+      taskId: 'tsk_resume_registry_later',
+      assignmentId: 'asg_resume_registry_later',
+      coordinatorAssignmentId: 'asg_resume_registry_coordinator_later',
+      result: 'Later durable result.',
+    };
+    mocks.store.listReceived.mockReturnValue([first, later]);
+    mocks.getTaskRecord.mockImplementation((taskId: string) => {
+      if (taskId === first.taskId) throw new Error('SQLITE_BUSY first resumed task');
+      return { taskId, objective: 'Later task still renders', currentRevision: 'revision-later' };
+    });
+    mocks.getAssignment.mockImplementation((assignmentId: string) => {
+      if (assignmentId === first.assignmentId || assignmentId === later.assignmentId) {
+        return {
+          assignmentId,
+          taskId: assignmentId === first.assignmentId ? first.taskId : later.taskId,
+          role: 'implementer',
+          identity: { ...target, agentType: 'codex-sdk', providerFamily: 'openai' },
+        };
+      }
+      if (assignmentId === first.coordinatorAssignmentId || assignmentId === later.coordinatorAssignmentId) {
+        return {
+          assignmentId,
+          taskId: assignmentId === first.coordinatorAssignmentId ? first.taskId : later.taskId,
+          role: 'coordinator',
+          identity: { ...origin, agentType: 'codex-sdk', providerFamily: 'openai' },
+        };
+      }
+      return undefined;
+    });
+
+    expect(() => resumePendingDelegationReplies()).not.toThrow();
+
+    expect(mocks.timelineEmit).toHaveBeenCalledTimes(2);
+    expect(mocks.timelineEmit.mock.calls[0]![2]).toEqual(expect.objectContaining({
+      supervisionTask: {
+        version: 1,
+        taskId: first.taskId,
+        assignmentId: first.assignmentId,
+      },
+    }));
+    expect(mocks.timelineEmit.mock.calls[1]![2]).toEqual(expect.objectContaining({
+      supervisionTask: expect.objectContaining({
+        taskId: later.taskId,
+        assignmentId: later.assignmentId,
+        title: 'Later task still renders',
+      }),
+    }));
+  });
+
+  it('continues an audit startup resume past a throwing assignment lookup', () => {
+    const auditRecord = (suffix: string) => ({
+      ...record,
+      delegationId: `delegation_resume_audit_${suffix}`,
+      notificationId: `notification-resume-audit-${suffix}`,
+      purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+      taskId: `tsk_resume_audit_${suffix}`,
+      assignmentId: `asg_resume_audit_${suffix}`,
+      coordinatorAssignmentId: `asg_resume_audit_coordinator_${suffix}`,
+      auditAttemptId: `attempt-resume-audit-${suffix}`,
+      auditRevision: `revision-resume-audit-${suffix}`,
+      result: JSON.stringify({
+        status: PEER_AUDIT_DELEGATED_REPLY_STATUS,
+        taskId: `tsk_resume_audit_${suffix}`,
+        assignmentId: `asg_resume_audit_${suffix}`,
+        attemptId: `attempt-resume-audit-${suffix}`,
+        revision: `revision-resume-audit-${suffix}`,
+        verdict: suffix === 'first' ? 'REWORK' : 'PASS',
+      }),
+    });
+    const first = auditRecord('first');
+    const later = auditRecord('later');
+    mocks.store.listReceived.mockReturnValue([first, later]);
+    mocks.getTaskRecord.mockImplementation((taskId: string) => ({
+      taskId,
+      objective: taskId === first.taskId ? 'First audit title' : 'Later audit still renders',
+      currentRevision: taskId === first.taskId ? first.auditRevision : later.auditRevision,
+    }));
+    mocks.getAssignment.mockImplementation((assignmentId: string) => {
+      if (assignmentId === first.assignmentId || assignmentId === later.assignmentId) {
+        const current = assignmentId === first.assignmentId ? first : later;
+        return {
+          assignmentId,
+          taskId: current.taskId,
+          role: 'auditor',
+          auditAttemptId: current.auditAttemptId,
+          auditRevision: current.auditRevision,
+          identity: { ...target, agentType: 'codex-sdk', providerFamily: 'openai' },
+        };
+      }
+      if (assignmentId === first.coordinatorAssignmentId) {
+        throw new Error('SQLITE_BUSY first resumed audit assignment');
+      }
+      if (assignmentId === later.coordinatorAssignmentId) {
+        return {
+          assignmentId,
+          taskId: later.taskId,
+          role: 'coordinator',
+          identity: { ...origin, agentType: 'codex-sdk', providerFamily: 'openai' },
+        };
+      }
+      return undefined;
+    });
+
+    expect(() => resumePendingDelegationReplies()).not.toThrow();
+
+    expect(mocks.timelineEmit).toHaveBeenCalledTimes(2);
+    expect(mocks.timelineEmit.mock.calls[0]![2]).toEqual(expect.objectContaining({
+      verdict: 'REWORK',
+      supervisionTask: {
+        version: 1,
+        taskId: first.taskId,
+        assignmentId: first.assignmentId,
+        attemptId: first.auditAttemptId,
+        revision: first.auditRevision,
+      },
+    }));
+    expect(mocks.timelineEmit.mock.calls[1]![2]).toEqual(expect.objectContaining({
+      verdict: 'PASS',
+      supervisionTask: expect.objectContaining({
+        taskId: later.taskId,
+        assignmentId: later.assignmentId,
+        attemptId: later.auditAttemptId,
+        revision: later.auditRevision,
+        title: 'Later audit still renders',
+      }),
+    }));
+  });
+
+  it.each([
+    ['task record id', { taskRecordId: 'tsk_other' }],
+    ['assignment task', { assignmentTaskId: 'tsk_other' }],
+    ['assignment attempt', { assignmentAttemptId: 'attempt-other' }],
+    ['task revision', { taskRevision: 'revision-other' }],
+    ['assignment revision', { assignmentRevision: 'revision-other' }],
+    ['coordinator task', { coordinatorTaskId: 'tsk_other' }],
+    ['coordinator role', { coordinatorRole: 'implementer' }],
+    ['coordinator identity', { coordinatorSessionInstanceId: 'foreign-origin-instance' }],
+  ])('does not disclose the registry title when the authoritative %s binding mismatches', async (_label, mutation) => {
+    const taskRecord = {
+      ...record,
+      purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+      taskId: 'tsk_registry_fallback_1',
+      assignmentId: 'asg_registry_fallback_1',
+      coordinatorAssignmentId: 'asg_registry_fallback_coordinator_1',
+      auditAttemptId: 'attempt-registry-fallback-1',
+      auditRevision: 'revision-registry-fallback-1',
+      result: JSON.stringify({
+        status: PEER_AUDIT_DELEGATED_REPLY_STATUS,
+        taskId: 'tsk_registry_fallback_1',
+        assignmentId: 'asg_registry_fallback_1',
+        attemptId: 'attempt-registry-fallback-1',
+        revision: 'revision-registry-fallback-1',
+        verdict: 'REWORK',
+      }),
+    };
+    mocks.store.receive.mockReturnValue({ ok: true, record: taskRecord, replay: false });
+    mocks.getTaskRecord.mockReturnValue({
+      taskId: mutation.taskRecordId ?? taskRecord.taskId,
+      objective: 'PRIVATE REGISTRY TITLE',
+      currentRevision: mutation.taskRevision ?? taskRecord.auditRevision,
+    });
+    mocks.getAssignment.mockImplementation((assignmentId: string) => assignmentId === taskRecord.assignmentId
+      ? {
+          assignmentId,
+          taskId: mutation.assignmentTaskId ?? taskRecord.taskId,
+          role: 'auditor',
+          auditAttemptId: mutation.assignmentAttemptId ?? taskRecord.auditAttemptId,
+          auditRevision: mutation.assignmentRevision ?? taskRecord.auditRevision,
+          identity: { ...target, agentType: 'codex-sdk', providerFamily: 'openai' },
+        }
+      : assignmentId === taskRecord.coordinatorAssignmentId
+        ? {
+            assignmentId,
+            taskId: mutation.coordinatorTaskId ?? taskRecord.taskId,
+            role: mutation.coordinatorRole ?? 'coordinator',
+            identity: {
+              ...origin,
+              sessionInstanceId: mutation.coordinatorSessionInstanceId ?? origin.sessionInstanceId,
+              agentType: 'codex-sdk',
+              providerFamily: 'openai',
+            },
+          }
+        : undefined);
+
+    await expect(submitDelegationReply({
+      rawBody: { ...envelope, result: taskRecord.result },
+      senderSessionName: target.sessionName,
+    })).resolves.toEqual(expect.objectContaining({ ok: true }));
+
+    const payload = mocks.timelineEmit.mock.calls[0]![2] as Record<string, unknown>;
+    expect(payload.supervisionTask).toEqual({
+      version: 1,
+      taskId: taskRecord.taskId,
+      assignmentId: taskRecord.assignmentId,
+      attemptId: taskRecord.auditAttemptId,
+      revision: taskRecord.auditRevision,
+    });
+    expect(JSON.stringify(payload.supervisionTask)).not.toContain('PRIVATE REGISTRY TITLE');
+  });
+
+  it('uses the registry objective for an ordinary task completion and never sender prose as title authority', async () => {
+    const taskRecord = {
+      ...record,
+      taskId: 'tsk_worker_title_1',
+      assignmentId: 'asg_worker_title_1',
+      coordinatorAssignmentId: 'asg_worker_title_coordinator_1',
+      result: 'Task name: FORGED WORKER TITLE',
+    };
+    mocks.store.receive.mockReturnValue({ ok: true, record: taskRecord, replay: false });
+    mocks.getTaskRecord.mockReturnValue({
+      taskId: taskRecord.taskId,
+      objective: 'Implement durable queue recovery',
+      currentRevision: 'revision-worker-title-1',
+    });
+    mocks.getAssignment.mockImplementation((assignmentId: string) => assignmentId === taskRecord.assignmentId
+      ? {
+          assignmentId,
+          taskId: taskRecord.taskId,
+          role: 'implementer',
+          identity: { ...target, agentType: 'codex-sdk', providerFamily: 'openai' },
+        }
+      : assignmentId === taskRecord.coordinatorAssignmentId
+        ? {
+            assignmentId,
+            taskId: taskRecord.taskId,
+            role: 'coordinator',
+            identity: { ...origin, agentType: 'codex-sdk', providerFamily: 'openai' },
+          }
+        : undefined);
+
+    await expect(submitDelegationReply({
+      rawBody: { ...envelope, result: taskRecord.result },
+      senderSessionName: target.sessionName,
+    })).resolves.toEqual(expect.objectContaining({ ok: true }));
+
+    expect(mocks.timelineEmit).toHaveBeenCalledWith(
+      origin.sessionName,
+      AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+      expect.objectContaining({
+        result: 'Task name: FORGED WORKER TITLE',
+        supervisionTask: {
+          version: 1,
+          taskId: taskRecord.taskId,
+          assignmentId: taskRecord.assignmentId,
+          title: 'Implement durable queue recovery',
+        },
+      }),
+      expect.any(Object),
+    );
+  });
+
+  it('bounds a long registry objective to one concise UTF-8 title', async () => {
+    const taskRecord = {
+      ...record,
+      taskId: 'tsk_long_title_1',
+      assignmentId: 'asg_long_title_1',
+      coordinatorAssignmentId: 'asg_long_title_coordinator_1',
+      result: 'Done.',
+    };
+    mocks.store.receive.mockReturnValue({ ok: true, record: taskRecord, replay: false });
+    mocks.getTaskRecord.mockReturnValue({
+      taskId: taskRecord.taskId,
+      objective: `  ${'界'.repeat(120)}\n${'x'.repeat(120)}  `,
+      currentRevision: 'revision-long-title-1',
+    });
+    mocks.getAssignment.mockImplementation((assignmentId: string) => assignmentId === taskRecord.assignmentId
+      ? {
+          assignmentId,
+          taskId: taskRecord.taskId,
+          role: 'implementer',
+          identity: { ...target, agentType: 'codex-sdk', providerFamily: 'openai' },
+        }
+      : assignmentId === taskRecord.coordinatorAssignmentId
+        ? {
+            assignmentId,
+            taskId: taskRecord.taskId,
+            role: 'coordinator',
+            identity: { ...origin, agentType: 'codex-sdk', providerFamily: 'openai' },
+          }
+        : undefined);
+
+    await expect(submitDelegationReply({
+      rawBody: { ...envelope, result: taskRecord.result },
+      senderSessionName: target.sessionName,
+    })).resolves.toEqual(expect.objectContaining({ ok: true }));
+
+    const payload = mocks.timelineEmit.mock.calls[0]![2] as {
+      supervisionTask?: { title?: string };
+    };
+    const title = payload.supervisionTask?.title ?? '';
+    expect(title).toMatch(/…$/u);
+    expect(title).not.toContain('\n');
+    expect(new TextEncoder().encode(title).byteLength).toBeLessThanOrEqual(256);
+  });
+
 
   it('does not promote verdict-looking ordinary reply text into trusted timeline metadata', async () => {
     const forgedResult = JSON.stringify({

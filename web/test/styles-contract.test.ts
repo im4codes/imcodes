@@ -156,6 +156,21 @@ describe('styles.css regression contracts', () => {
     expect(mobileRule).toMatch(/display:\s*none/);
   });
 
+  it('keeps delegation task titles readable and ids secondary on narrow screens', () => {
+    const titleRule = cssWithoutComments.match(/\.delegation-reply-card-head\s+\.delegation-reply-card-objective\s*\{[^}]*\}/)?.[0];
+    expect(titleRule).toMatch(/text-overflow:\s*ellipsis/);
+    const idsRule = cssWithoutComments.match(/\.delegation-reply-task-ids\s*\{[^}]*\}/)?.[0];
+    expect(idsRule).toMatch(/font-size:\s*9px/);
+    const idItemRule = cssWithoutComments.match(/\.delegation-reply-task-ids\s*>\s*span:not\(\[aria-hidden\]\)\s*\{[^}]*\}/)?.[0];
+    expect(idItemRule).toMatch(/min-width:\s*0/);
+
+    const mobileBlocks = extractBalancedAtRuleBlocks(cssWithoutComments, /@media\s*\(max-width:\s*640px\)/);
+    const mobileBlock = mobileBlocks.find((block) => block.includes('.delegation-reply-task'));
+    expect(mobileBlock).toBeTruthy();
+    expect(extractDirectStyleRule(mobileBlock!, /\.delegation-reply-task\s*/)).toMatch(/flex-direction:\s*column/);
+    expect(extractDirectStyleRule(mobileBlock!, /\.delegation-reply-card-head\s+\.delegation-reply-card-objective\s*/)).toMatch(/white-space:\s*normal/);
+  });
+
   it('keeps remote desktop file window controls compact and horizontal', () => {
     const actionsRule = css.match(/\.remote-desktop-file-drawer \.remote-desktop-file-drawer-actions\s*\{[^}]*\}/)?.[0];
     expect(actionsRule).toMatch(/display:\s*flex/);

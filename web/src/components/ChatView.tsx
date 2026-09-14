@@ -83,7 +83,10 @@ import {
   isPeerAuditRuntimeDisposition,
   isPeerAuditVerdict,
 } from '@shared/peer-audit.js';
-import { AGENT_DELEGATION_REPLY_TIMELINE_EVENT } from '@shared/agent-delegation.js';
+import {
+  AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+  readAgentDelegationSupervisionTaskProjection,
+} from '@shared/agent-delegation.js';
 import { parseTimelineDisplayText } from '../timeline-display-text.js';
 import {
   MESSAGE_PIN_LIMITS,
@@ -4746,6 +4749,9 @@ const ChatEvent = memo(function ChatEvent({
           ? 'peerAuditQuick.result_pass'
           : 'peerAuditQuick.result_rework')
         : undefined;
+      const supervisionTask = event.source === 'daemon' && event.confidence === 'high'
+        ? readAgentDelegationSupervisionTaskProjection(event.payload.supervisionTask)
+        : undefined;
       return (
         <section
           class={`chat-event chat-system delegation-reply-card${verdictClass}`}
@@ -4753,7 +4759,16 @@ const ChatEvent = memo(function ChatEvent({
           {...(verdict ? { 'data-verdict': verdict } : {})}
         >
           <div class="delegation-reply-card-head">
-            <strong>{t('delegation.reply_title')}</strong>
+            <div class="delegation-reply-card-heading">
+              {supervisionTask?.title ? (
+                <>
+                  <span class="delegation-reply-card-kicker">{t('delegation.reply_title')}</span>
+                  <strong class="delegation-reply-card-objective">{supervisionTask.title}</strong>
+                </>
+              ) : (
+                <strong>{t('delegation.reply_title')}</strong>
+              )}
+            </div>
             <div class="delegation-reply-card-meta">
               {verdict && (
                 <span class="delegation-reply-verdict" aria-label={verdictLabel}>{verdict}</span>
@@ -4761,6 +4776,22 @@ const ChatEvent = memo(function ChatEvent({
               <span>{t('delegation.reply_from', { source })}</span>
             </div>
           </div>
+          {supervisionTask && (
+            <div
+              class={`delegation-reply-task${supervisionTask.title ? '' : ' is-fallback'}`}
+              data-testid="delegation-reply-task"
+              data-task-id={supervisionTask.taskId}
+              data-assignment-id={supervisionTask.assignmentId}
+              {...(supervisionTask.attemptId ? { 'data-attempt-id': supervisionTask.attemptId } : {})}
+              {...(supervisionTask.revision ? { 'data-revision': supervisionTask.revision } : {})}
+            >
+              <span class="delegation-reply-task-ids">
+                <span aria-label={`${t('delegation.claim.task_id')}: ${supervisionTask.taskId}`}>{supervisionTask.taskId}</span>
+                <span aria-hidden="true">·</span>
+                <span aria-label={`${t('delegation.claim.assignment_id')}: ${supervisionTask.assignmentId}`}>{supervisionTask.assignmentId}</span>
+              </span>
+            </div>
+          )}
           {result && (
             <div class="delegation-reply-card-body">
               <ChatMarkdown

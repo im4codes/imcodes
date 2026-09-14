@@ -5,6 +5,7 @@ import { CODEBUDDY_PROVIDER_IDS } from './codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from './hermes-agent.js';
 import { isValidImcodesSessionName } from './session-scope.js';
 import {
+  PEER_AUDIT_ID_MAX_BYTES,
   PEER_AUDIT_DELEGATED_REPLY_STATUS,
   PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS,
   isPeerAuditVerdict,
@@ -45,6 +46,8 @@ export const AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER = '<imcodes-ag
 export const AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER = '<imcodes-delegation-completed-v1>' as const;
 export const AGENT_DELEGATION_REPLY_TIMELINE_EVENT = 'delegation.reply' as const;
 export const AGENT_DELEGATION_REPLY_VERSION = 'agent_delegation_reply_v1' as const;
+export const AGENT_DELEGATION_SUPERVISION_TASK_PROJECTION_VERSION = 1 as const;
+export const AGENT_DELEGATION_SUPERVISION_TASK_TITLE_MAX_BYTES = 256;
 export const AGENT_DELEGATION_REPLY_TOTAL_BYTES = 64 * 1024;
 export const AGENT_DELEGATION_REPLY_RESULT_BYTES = 48 * 1024;
 export const AGENT_DELEGATION_REPLY_TTL_MS = 24 * 60 * 60_000;
@@ -71,6 +74,104 @@ export interface AgentDelegationReplyEnvelope {
   version: typeof AGENT_DELEGATION_REPLY_VERSION;
   delegationId: string;
   result: string;
+}
+
+/**
+ * Daemon-authored, browser-safe task identity attached to a delegation reply.
+ *
+ * `title` is optional on purpose. The durable reply record is authoritative for
+ * the ids even when the registry row is unavailable, but task details are only
+ * projected after the daemon has cross-checked the complete binding. Sender
+ * text (including the JSON `result`) is never a title source in the browser.
+ */
+export interface AgentDelegationSupervisionTaskProjection {
+  version: typeof AGENT_DELEGATION_SUPERVISION_TASK_PROJECTION_VERSION;
+  taskId: string;
+  assignmentId: string;
+  attemptId?: string;
+  revision?: string;
+  title?: string;
+}
+
+export interface AgentDelegationPeerAuditCompletionBinding {
+  taskId: string;
+  assignmentId: string;
+  attemptId: string;
+  revision: string;
+  verdict: PeerAuditVerdict;
+}
+
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
+
+function readBoundedId(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.trim();
+  if (!normalized || utf8ByteLength(normalized) > PEER_AUDIT_ID_MAX_BYTES) return undefined;
+  return normalized;
+}
+
+/** Collapse an authoritative registry objective into a concise one-line card title. */
+export function projectAgentDelegationSupervisionTaskTitle(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.replace(/\s+/gu, ' ').trim();
+  if (!normalized) return undefined;
+  if (utf8ByteLength(normalized) <= AGENT_DELEGATION_SUPERVISION_TASK_TITLE_MAX_BYTES) return normalized;
+  let output = '';
+  for (const character of normalized) {
+    const candidate = `${output}${character}`;
+    if (utf8ByteLength(`${candidate}…`) > AGENT_DELEGATION_SUPERVISION_TASK_TITLE_MAX_BYTES) break;
+    output = candidate;
+  }
+  return output ? `${output}…` : undefined;
+}
+
+/** Strictly reads only the daemon-owned top-level timeline projection. */
+export function readAgentDelegationSupervisionTaskProjection(
+  value: unknown,
+): AgentDelegationSupervisionTaskProjection | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (record.version !== AGENT_DELEGATION_SUPERVISION_TASK_PROJECTION_VERSION) return undefined;
+  const taskId = readBoundedId(record.taskId);
+  const assignmentId = readBoundedId(record.assignmentId);
+  if (!taskId || !assignmentId) return undefined;
+  const attemptId = record.attemptId === undefined ? undefined : readBoundedId(record.attemptId);
+  const revision = record.revision === undefined ? undefined : readBoundedId(record.revision);
+  if ((record.attemptId !== undefined && !attemptId) || (record.revision !== undefined && !revision)) {
+    return undefined;
+  }
+  const title = typeof record.title === 'string'
+    && record.title === projectAgentDelegationSupervisionTaskTitle(record.title)
+    ? record.title
+    : undefined;
+  return {
+    version: AGENT_DELEGATION_SUPERVISION_TASK_PROJECTION_VERSION,
+    taskId,
+    assignmentId,
+    ...(attemptId ? { attemptId } : {}),
+    ...(revision ? { revision } : {}),
+    ...(title ? { title } : {}),
+  };
+}
+
+/**
+ * Reads the exact binding from a locally generated peer_audit_completed result.
+ * This never reads a task name/objective: those remain registry-only authority.
+ */
+export function readTrustedAgentDelegationPeerAuditCompletionBinding(
+  value: unknown,
+): AgentDelegationPeerAuditCompletionBinding | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (record.status !== PEER_AUDIT_DELEGATED_REPLY_STATUS || !isPeerAuditVerdict(record.verdict)) return undefined;
+  const taskId = readBoundedId(record.taskId);
+  const assignmentId = readBoundedId(record.assignmentId);
+  const attemptId = readBoundedId(record.attemptId);
+  const revision = readBoundedId(record.revision);
+  if (!taskId || !assignmentId || !attemptId || !revision) return undefined;
+  return { taskId, assignmentId, attemptId, revision, verdict: record.verdict };
 }
 
 /**
