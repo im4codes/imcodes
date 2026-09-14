@@ -3651,8 +3651,6 @@
     "mobile_text_input": "Ввод на удалённом компьютере",
     "mobile_shortcuts": "Частые сочетания",
     "shortcut_select_all": "Выбрать всё",
-    "shortcut_copy": "Копировать удалённо",
-    "shortcut_paste": "Вставить удалённо",
     "shortcut_cut": "Вырезать",
     "shortcut_find": "Найти",
     "shortcut_undo": "Отменить",

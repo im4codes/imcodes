@@ -3652,8 +3652,6 @@
     "mobile_text_input": "输入到远端电脑",
     "mobile_shortcuts": "常用快捷键",
     "shortcut_select_all": "全选",
-    "shortcut_copy": "远端复制",
-    "shortcut_paste": "远端粘贴",
     "shortcut_cut": "剪切",
     "shortcut_find": "查找",
     "shortcut_undo": "撤销",

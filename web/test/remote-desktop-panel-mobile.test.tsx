@@ -1293,6 +1293,32 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith('selected remotely');
   });
 
+  it('shows a clipboard result as a floating toast that fades on its own', async () => {
+    // The toolbar used to reserve a permanent min-width column for this text,
+    // empty most of the time. It is now only in the DOM while a result is
+    // actually showing, and clears itself instead of sitting stale forever.
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: {
+        readText: vi.fn(async () => 'local clipboard'),
+        writeText: vi.fn(async () => {}),
+      },
+    });
+    const { container, getByRole } = await renderPanel();
+    expect(container.querySelector('.remote-desktop-clipboard-toast')).toBeNull();
+
+    vi.useFakeTimers();
+    await act(async () => {
+      (getByRole('button', { name: 'common.copy' }) as HTMLButtonElement).click();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const toast = container.querySelector('.remote-desktop-clipboard-toast');
+    expect(toast?.textContent).toBe('remote_desktop.clipboard_copied');
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_800); });
+    expect(container.querySelector('.remote-desktop-clipboard-toast')).toBeNull();
+  });
+
   it('keeps the mobile IME focused, commits composed text once, and sends shortcut chords', async () => {
     const { container, getByRole } = await renderPanel();
     const keyboardButton = getByRole('button', { name: 'remote_desktop.mobile_keyboard' });

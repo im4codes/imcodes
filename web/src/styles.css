@@ -10783,14 +10783,28 @@ button.quick-agent-delegation-preset.active {
 
 .remote-desktop-toolbar .remote-desktop-clipboard-switch button {
   min-height: 30px;
-  padding: 4px 9px;
+  padding: 4px 7px;
   font-size: 11.5px;
 }
 
-.remote-desktop-clipboard-status {
-  min-width: 54px;
+/* A result toast, not a reserved toolbar column: it floats below the button
+   group instead of widening it, and only exists in the DOM while a result is
+   showing, so there is nothing to keep empty between copies. */
+.remote-desktop-clipboard-toast {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: 6px;
+  padding: 3px 8px;
+  border: 1px solid rgb(94 165 214 / 22%);
+  border-radius: 6px;
+  background: rgb(12 27 44 / 92%);
   color: #9bdfff;
   font-size: 11px;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 1;
+  animation: toast-in .18s ease-out;
 }
 
 .remote-desktop-resolution-menu {

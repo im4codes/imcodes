@@ -49,8 +49,14 @@ export function remoteDesktopMobileDeletionKey(
 
 export const REMOTE_DESKTOP_MOBILE_SHORTCUTS = [
   { id: 'select_all', keys: [{ code: 'ControlLeft', key: 'Control' }, { code: 'KeyA', key: 'a' }] },
-  { id: 'copy', keys: [{ code: 'ControlLeft', key: 'Control' }, { code: 'KeyC', key: 'c' }] },
-  { id: 'paste', keys: [{ code: 'ControlLeft', key: 'Control' }, { code: 'KeyV', key: 'v' }] },
+  // Copy/paste are deliberately absent here: this row sends a literal
+  // Control chord, which is not bound to copy/paste on a macOS remote host
+  // (and can mean something else entirely, e.g. SIGINT in a terminal), so it
+  // silently did nothing there while looking identical to a working press.
+  // The dedicated copy/paste buttons rendered after this row answer both
+  // actions through the clipboard bridge instead, which works on every
+  // remote platform and actually moves text between the two clipboards
+  // rather than just replaying a keystroke.
   { id: 'cut', keys: [{ code: 'ControlLeft', key: 'Control' }, { code: 'KeyX', key: 'x' }] },
   { id: 'find', keys: [{ code: 'ControlLeft', key: 'Control' }, { code: 'KeyF', key: 'f' }] },
   { id: 'undo', keys: [{ code: 'ControlLeft', key: 'Control' }, { code: 'KeyZ', key: 'z' }] },
@@ -65,8 +71,6 @@ export const REMOTE_DESKTOP_MOBILE_SHORTCUTS = [
 
 export function remoteDesktopShortcutLabel(id: string): string {
   if (id === 'select_all') return 'Ctrl+A';
-  if (id === 'copy') return 'Ctrl+C';
-  if (id === 'paste') return 'Ctrl+V';
   if (id === 'cut') return 'Ctrl+X';
   if (id === 'find') return 'Ctrl+F';
   if (id === 'undo') return 'Ctrl+Z';

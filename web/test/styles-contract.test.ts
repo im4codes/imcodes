@@ -210,7 +210,7 @@ describe('styles.css regression contracts', () => {
     const rule = css.match(/\.remote-desktop-toolbar \.remote-desktop-clipboard-switch button\s*\{[^}]*\}/)?.[0];
     expect(rule).toBeTruthy();
     expect(rule).toMatch(/min-height:\s*30px/);
-    expect(rule).toMatch(/padding:\s*4px 9px/);
+    expect(rule).toMatch(/padding:\s*4px 7px/);
     expect(rule).toMatch(/font-size:\s*11\.5px/);
   });
 

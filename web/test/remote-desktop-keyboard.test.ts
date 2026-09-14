@@ -3,6 +3,7 @@ import {
   detectRemoteDesktopClipboardShortcut,
   mapRemoteDesktopKeyboardEvent,
   REMOTE_DESKTOP_CLIPBOARD_SHORTCUT,
+  REMOTE_DESKTOP_MOBILE_SHORTCUTS,
   remoteDesktopMobileDeletionKey,
   sendRemoteDesktopChord,
 } from '../src/remote-desktop-keyboard.js';
@@ -62,6 +63,19 @@ describe('remote desktop keyboard mapping', () => {
       { code: 'KeyA', key: 'a' },
     ], send, releaseAll)).toBe(false);
     expect(releaseAll).toHaveBeenCalledTimes(1);
+  });
+
+  it('never offers a raw Control-chord copy/paste chip', () => {
+    // ControlLeft+KeyC/KeyV is not bound to copy/paste on a macOS remote host
+    // (and can mean something else entirely, e.g. SIGINT in a terminal), so a
+    // chip that blindly replayed it looked identical to a working press while
+    // silently doing nothing there. The dedicated copy/paste buttons answer
+    // both actions through the clipboard bridge instead, which works on every
+    // remote platform, so this row must never grow a raw-keystroke copy/paste
+    // entry again.
+    const ids = REMOTE_DESKTOP_MOBILE_SHORTCUTS.map((shortcut) => shortcut.id);
+    expect(ids).not.toContain('copy');
+    expect(ids).not.toContain('paste');
   });
 
   it('maps mobile beforeinput deletion commands to remote editing keys', () => {

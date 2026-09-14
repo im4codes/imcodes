@@ -207,6 +207,8 @@ function displayModeOptions(
 
 /** How long a refused-command notice stays up before it fades on its own. */
 const CONTROL_NOTICE_MS = 6_000;
+/** How long the clipboard toast stays up before it fades on its own. */
+const CLIPBOARD_STATUS_TOAST_MS = 1_800;
 const REMOTE_DESKTOP_QUICK_INPUT_Z_INDEX = 10_050;
 const TOUCH_LONG_PRESS_MS = 550;
 const TOUCH_DOUBLE_TAP_MS = 400;
@@ -706,6 +708,20 @@ export function RemoteDesktopPanel({
     }, CONTROL_NOTICE_MS);
     return () => clearTimeout(timer);
   }, [snapshot.controlRejection?.id, t]);
+
+  // A finished clipboard action (copied/pasted/empty/failed) is a toast, not a
+  // permanent toolbar fixture: fade it back to idle on its own so the button
+  // group never keeps a stale result around, and never reserves layout space
+  // for it while nothing is showing.
+  useEffect(() => {
+    if (clipboardStatus === 'idle' || clipboardStatus === 'copying' || clipboardStatus === 'pasting') return;
+    const timer = setTimeout(() => {
+      setClipboardStatus((current) => (
+        current === 'idle' || current === 'copying' || current === 'pasting' ? current : 'idle'
+      ));
+    }, CLIPBOARD_STATUS_TOAST_MS);
+    return () => clearTimeout(timer);
+  }, [clipboardStatus]);
 
   useEffect(() => {
     if (!displayModeMenu) return;
@@ -2202,9 +2218,11 @@ export function RemoteDesktopPanel({
               title={inputBlockedHint()}
               onClick={() => { void pasteLocalClipboard(); }}
             >{t('remote_desktop.paste_local_clipboard')}</button>
-            <span class="remote-desktop-clipboard-status" aria-live="polite">
-              {clipboardStatus === 'idle' ? '' : t(`remote_desktop.clipboard_${clipboardStatus}`)}
-            </span>
+            {clipboardStatus !== 'idle' && (
+              <span class="remote-desktop-clipboard-toast" role="status" aria-live="polite">
+                {t(`remote_desktop.clipboard_${clipboardStatus}`)}
+              </span>
+            )}
           </div>
           <div class="remote-desktop-zoom-switch" role="group" aria-label={t('remote_desktop.zoom_label')}>
             <button type="button" aria-label={t('remote_desktop.zoom_out')} disabled={viewport.scale <= 1} onClick={() => changeZoom(-0.5)}>−</button>

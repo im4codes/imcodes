@@ -3652,8 +3652,6 @@
     "mobile_text_input": "Type on the remote computer",
     "mobile_shortcuts": "Common shortcuts",
     "shortcut_select_all": "Select all",
-    "shortcut_copy": "Copy on remote",
-    "shortcut_paste": "Paste on remote",
     "shortcut_cut": "Cut",
     "shortcut_find": "Find",
     "shortcut_undo": "Undo",
