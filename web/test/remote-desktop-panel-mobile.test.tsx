@@ -1603,6 +1603,50 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     }
   });
 
+  it('falls back to releaseAll when the synthetic Control release fails to send', async () => {
+    // A transient data-channel hiccup can make the release send return false
+    // without tearing down the session. If that dropped "up" were treated as
+    // done, the remote host's real Control key would stay physically down for
+    // the rest of the session -- exactly what was observed live on a Mac
+    // host, surfacing as every left click behaving like a right click.
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', {
+      configurable: true,
+      value: 'MacIntel',
+    });
+    key.mockImplementation((code: string, _label: string, down: boolean) => !(code === 'ControlLeft' && down === false));
+    try {
+      const { stage } = await renderPanel();
+      act(() => stage.dispatchEvent(new KeyboardEvent('keydown', {
+        bubbles: true,
+        cancelable: true,
+        code: 'KeyA',
+        key: 'a',
+        metaKey: true,
+      })));
+      expect(key).toHaveBeenCalledWith('ControlLeft', 'Control', true, false, { control: true, alt: false });
+      expect(releaseAll).not.toHaveBeenCalled();
+
+      act(() => stage.dispatchEvent(new KeyboardEvent('keyup', {
+        bubbles: true,
+        cancelable: true,
+        code: 'KeyA',
+        key: 'a',
+        metaKey: true,
+      })));
+
+      expect(key).toHaveBeenCalledWith('ControlLeft', 'Control', false, false, { control: false, alt: false });
+      expect(releaseAll).toHaveBeenCalledTimes(1);
+    } finally {
+      Object.defineProperty(navigator, 'platform', {
+        configurable: true,
+        value: originalPlatform,
+      });
+      key.mockReset();
+      key.mockImplementation(() => true);
+    }
+  });
+
   it('keeps sending desktop hover through the window capture path after a click', async () => {
     // A real desktop engine can stop the native video event before it bubbles
     // to the stage after pointer capture is released. The window capture path

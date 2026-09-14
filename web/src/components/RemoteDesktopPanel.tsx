@@ -1555,6 +1555,21 @@ export function RemoteDesktopPanel({
     if (!released) client.releaseAll();
   };
 
+  // A failed release send (channel transiently not open) must not be treated
+  // as done: the client's own contract says a failed up can be retried, and
+  // the caller here has no future retry point since syntheticCommandControlRef
+  // is what gates whether ControlLeft is still considered forwarded. Fall back
+  // to releaseAll() -- exactly the same rescue suppressCommandControlForMiddleDrag
+  // uses above -- so a dropped release message cannot leave Control physically
+  // stuck down on the remote host for the rest of the session.
+  const releaseSyntheticCommandControl = (altKey: boolean) => {
+    const client = clientRef.current;
+    if (!client) return;
+    const released = client.key('ControlLeft', 'Control', false, false, { control: false, alt: altKey });
+    syntheticCommandControlRef.current = false;
+    if (!released) client.releaseAll();
+  };
+
   const onPointerButton = (event: PointerEvent, down: boolean) => {
     if (down && snapshot.inputEnabled) {
       stageRef.current?.focus({ preventScroll: true });
@@ -1725,8 +1740,7 @@ export function RemoteDesktopPanel({
       if (down) forwardedCommandCodesRef.current.add(mapped.code);
       else forwardedCommandCodesRef.current.delete(mapped.code);
       if (!down && syntheticCommandControlRef.current) {
-        client.key('ControlLeft', 'Control', false, false, { control: false, alt: event.altKey });
-        syntheticCommandControlRef.current = false;
+        releaseSyntheticCommandControl(event.altKey);
       }
     } else if (mapped.commandAsControl && event.metaKey
       && forwardedCommandCodesRef.current.size === 0
@@ -1740,8 +1754,7 @@ export function RemoteDesktopPanel({
         { control: true, alt: event.altKey },
       );
     } else if (mapped.commandAsControl && !event.metaKey && syntheticCommandControlRef.current) {
-      client.key('ControlLeft', 'Control', false, false, { control: false, alt: event.altKey });
-      syntheticCommandControlRef.current = false;
+      releaseSyntheticCommandControl(event.altKey);
     }
     const sent = client.key(mapped.code, mapped.key, down, event.repeat, mapped.modifiers);
     if (sent) {
@@ -1752,8 +1765,7 @@ export function RemoteDesktopPanel({
     }
     if (mapped.commandAsControl && !commandEvent && !down && event.metaKey
       && forwardedCommandCodesRef.current.size === 0 && syntheticCommandControlRef.current) {
-      client.key('ControlLeft', 'Control', false, false, { control: false, alt: event.altKey });
-      syntheticCommandControlRef.current = false;
+      releaseSyntheticCommandControl(event.altKey);
     }
   };
 
