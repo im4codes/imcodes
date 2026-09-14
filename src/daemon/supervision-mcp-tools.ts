@@ -53,10 +53,16 @@ import { advanceSupervisionTaskAfterFinish } from './supervision-convergence-wir
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import { deterministicAutomaticAuditDeliveryMessageId } from '../../shared/send-message-id.js';
 import {
+  type SupervisionAuditDegradedReason,
+  type SupervisionAuditRoutingReason,
   supervisionSelectedExecutionBindingMatches,
   type SupervisionExecutionBinding,
   type SupervisionProvisioningEvidence,
 } from '../../shared/supervision-execution-pool.js';
+import {
+  evaluateSupervisionAuditorRecoveryRouting,
+  type SupervisionAuditorRecoveryCrossVendorAvailability,
+} from '../../shared/supervision-auditor-recovery.js';
 
 type ToolResult = Record<string, unknown>;
 
@@ -92,6 +98,8 @@ export interface SupervisionVisibilityItem {
     generation?: number;
     executionBinding?: SupervisionExecutionBinding;
     provisioning?: SupervisionProvisioningEvidence;
+    auditRoutingReason?: SupervisionAuditRoutingReason;
+    auditDegradedReason?: SupervisionAuditDegradedReason;
     identity?: {
       sessionName?: string;
       sessionInstanceId?: string;
@@ -282,6 +290,9 @@ export interface SupervisionRegistryPort {
       agentType: string; providerFamily: string;
     };
     executionBinding: SupervisionExecutionBinding;
+    /** The routing statement the SAME assignment carries after the rebind. */
+    auditRoutingReason?: SupervisionAuditRoutingReason;
+    auditDegradedReason?: SupervisionAuditDegradedReason;
     expectedGeneration: number;
     expectedRevision: string;
     auditAttemptId: string;
@@ -372,6 +383,16 @@ export interface SupervisionMcpToolDeps {
   } | undefined;
   /** Exact project-pool selection for an auditor recovery target. */
   resolveAuditorRecoveryBinding?: (sessionName: string) => SupervisionExecutionBinding | undefined;
+  /**
+   * Is any cross-vendor auditor usable for the audited session right now, by
+   * the pool-scoped automatic-audit eligibility? Consulted only before a
+   * same-family rebind under `auto_allow_degraded`; `undefined` refuses it.
+   */
+  resolveAuditorRecoveryCrossVendorAvailability?: (input: {
+    scopeSessionName: string;
+    auditedSessionName: string;
+  }) => SupervisionAuditorRecoveryCrossVendorAvailability | undefined
+    | Promise<SupervisionAuditorRecoveryCrossVendorAvailability | undefined>;
   /** Physical worktree cleanup shares the already-authorized housekeeping ingress. */
   worktreeGc?: (input: {
     mode: 'dryRun' | 'apply'; projectName: string; cursor?: string; limit?: number;
@@ -931,15 +952,17 @@ export function createSupervisionMcpToolHandlers(
         const priorSessionInstanceId = assignment.identity?.sessionInstanceId;
         const priorRuntimeEpoch = assignment.identity?.runtimeEpoch;
         const implementerProviderFamily = implementers[0]?.identity?.providerFamily;
-        if (!priorSessionName || !priorSessionInstanceId || !priorRuntimeEpoch || !implementerProviderFamily) {
+        const implementerSessionName = implementers[0]?.identity?.sessionName;
+        if (!priorSessionName || !priorSessionInstanceId || !priorRuntimeEpoch
+          || !implementerProviderFamily || !implementerSessionName) {
           return err('identity_rejected', 'orphaned auditor recovery requires complete durable assignment identities');
         }
         const identity = deps.resolveSessionIdentity?.(rebindSessionName);
         if (!identity) return err('identity_rejected', 'rebind target has no live daemon-observed identity');
         if (identity.projectName !== taskProjectName
           || getSessionRuntimeType(identity.agentType) !== 'transport'
-          || identity.providerFamily === implementerProviderFamily) {
-          return err('identity_rejected', 'orphaned auditor recovery requires one live same-project cross-vendor transport target');
+          || identity.sessionName === implementerSessionName) {
+          return err('identity_rejected', 'orphaned auditor recovery requires one live same-project independent transport target');
         }
         const executionBinding = deps.resolveAuditorRecoveryBinding?.(rebindSessionName);
         if (!executionBinding) {
@@ -951,6 +974,47 @@ export function createSupervisionMcpToolHandlers(
           && assignment.identity?.agentType === identity.agentType
           && assignment.identity?.providerFamily === identity.providerFamily
           && supervisionSelectedExecutionBindingMatches(assignment.executionBinding, executionBinding);
+        // The audit policy decides the target, from live pool-aware facts. A
+        // replay of a completed rebind keeps the routing it was admitted with:
+        // availability may have moved since, and the durable record decides.
+        let routing: { auditRoutingReason?: SupervisionAuditRoutingReason; auditDegradedReason?: SupervisionAuditDegradedReason };
+        if (alreadyRebound) {
+          routing = {
+            ...(assignment.auditRoutingReason ? { auditRoutingReason: assignment.auditRoutingReason } : {}),
+            ...(assignment.auditDegradedReason ? { auditDegradedReason: assignment.auditDegradedReason } : {}),
+          };
+        } else {
+          const sameFamily = identity.providerFamily === implementerProviderFamily;
+          let crossVendor: SupervisionAuditorRecoveryCrossVendorAvailability | undefined;
+          if (sameFamily && task.auditPolicy === 'auto_allow_degraded') {
+            const scopeSessionName = callerSession || task.assignments?.find((candidate) => (
+              candidate.role === 'coordinator'
+            ))?.identity?.sessionName || '';
+            try {
+              crossVendor = scopeSessionName
+                ? await deps.resolveAuditorRecoveryCrossVendorAvailability?.({
+                  scopeSessionName,
+                  auditedSessionName: implementerSessionName,
+                })
+                : undefined;
+            } catch {
+              crossVendor = undefined;
+            }
+          }
+          const decision = evaluateSupervisionAuditorRecoveryRouting({
+            auditPolicy: task.auditPolicy,
+            auditedProviderFamily: implementerProviderFamily,
+            targetProviderFamily: identity.providerFamily,
+            ...(crossVendor ? { crossVendor } : {}),
+          });
+          if (!decision.ok) {
+            return err('identity_rejected', `orphaned auditor recovery target refused by audit policy: ${decision.refusal}`);
+          }
+          routing = {
+            auditRoutingReason: decision.auditRoutingReason,
+            ...(decision.auditDegradedReason ? { auditDegradedReason: decision.auditDegradedReason } : {}),
+          };
+        }
         const deliveryGeneration = alreadyRebound
           ? assignment.generation!
           : assignment.generation! + 1;
@@ -975,6 +1039,7 @@ export function createSupervisionMcpToolHandlers(
             providerFamily: identity.providerFamily,
           },
           executionBinding,
+          ...routing,
           expectedGeneration: assignment.generation!,
           expectedRevision: effectiveRevision,
           auditAttemptId: effectiveAuditAttemptId,
@@ -1036,6 +1101,7 @@ export function createSupervisionMcpToolHandlers(
           rebindSessionName,
           expectedRevision: effectiveRevision,
           auditAttemptId: effectiveAuditAttemptId,
+          ...routing,
           replay: rebound.replay === true,
           ...(auditTrigger !== undefined ? { auditTrigger } : {}),
         });

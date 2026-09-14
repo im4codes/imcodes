@@ -59,7 +59,7 @@ class FakeRegistry implements SupervisionRegistryPort {
   assignmentStates = new Map<string, Array<{
     assignmentId: string; role: string; status: string; leaseId: string; auditAttemptId?: string;
     auditRevision?: string; verdict?: string; generation?: number;
-    executionBinding?: any;
+    executionBinding?: any; auditRoutingReason?: any; auditDegradedReason?: any;
     identity: { sessionName: string; sessionInstanceId?: string; runtimeEpoch?: string; agentType?: string; providerFamily?: string };
   }>>();
   currentRevisions = new Map<string, string>();
@@ -1627,6 +1627,183 @@ describe('administrative recover', () => {
       reason: 'old queue identity does not match',
     })).resolves.toMatchObject({ status: 'error', reason: 'identity_rejected' });
     expect(registry.orphanedAuditorRebound).toEqual([]);
+  });
+
+  describe('orphaned auditor recovery follows the task audit policy', () => {
+    const taskId = 'tsk_mnq';
+    const assignmentId = 'asg_n06';
+    const revision = 'mnq-exact-revision-r1';
+    const auditAttemptId = 'auto-audit-acb76eabbd36cd3d7e73d9af';
+    const implementer = { ...testIdentity('deck_cd_impl'), agentType: 'claude-code-sdk', providerFamily: 'anthropic' };
+    const staleOpenAiAuditor = testIdentity('deck_cd_codex_auditor');
+    const sameFamily = {
+      sessionName: 'deck_cd_cc_auditor',
+      sessionInstanceId: 'instance-deck_cd_cc_auditor',
+      runtimeEpoch: 'epoch-deck_cd_cc_auditor',
+      agentType: 'claude-code-sdk',
+      providerFamily: 'anthropic',
+      projectName: 'codedeck',
+    };
+    const crossVendor = { ...testResolveSessionIdentity('deck_cd_live_codex') };
+    const bindingFor = (target: typeof sameFamily) => ({
+      pool: 'primary' as const,
+      requested: {
+        capabilityId: `supervision-exec-v1:transport:${target.agentType}:${target.providerFamily}:m`,
+        agentType: target.agentType, providerFamily: target.providerFamily,
+        runtimeType: 'transport' as const, model: 'm',
+      },
+      actual: {
+        sessionName: target.sessionName, sessionInstanceId: target.sessionInstanceId,
+        runtimeEpoch: target.runtimeEpoch, agentType: target.agentType,
+        providerFamily: target.providerFamily, runtimeType: 'transport' as const, model: 'm',
+      },
+      origin: 'reused' as const,
+    });
+
+    function arrange(auditPolicy: 'auto_allow_degraded' | 'auto_strict_cross_vendor') {
+      registry.statuses.set(taskId, 'ready_for_audit');
+      registry.currentRevisions.set(taskId, revision);
+      registry.assignmentStates.set(taskId, [
+        { assignmentId: 'asg_mnq_coord', role: 'coordinator', status: 'delegated', leaseId: '', identity: testIdentity('deck_cd_brain') },
+        { assignmentId: 'asg_mnq_impl', role: 'implementer', status: 'ready_for_audit', leaseId: '', auditRevision: revision, identity: implementer },
+        {
+          assignmentId, role: 'auditor', status: 'delegated', leaseId: '', generation: 1,
+          auditAttemptId, auditRevision: revision, identity: staleOpenAiAuditor,
+          executionBinding: bindingFor({ ...staleOpenAiAuditor, projectName: 'codedeck' }),
+        },
+      ]);
+      const originalItem = registry.item.bind(registry);
+      registry.item = (id: string) => ({
+        ...originalItem(id),
+        auditPolicy: id === taskId ? auditPolicy : undefined,
+        validationState: id === taskId ? 'passed' : undefined,
+      });
+      const retireSupersededAuditDelivery = vi.fn().mockReturnValue(true);
+      const dispatchReadyAudit = vi.fn().mockResolvedValue({ status: 'dispatched', assignmentId });
+      const identities = new Map([[sameFamily.sessionName, sameFamily], [crossVendor.sessionName, crossVendor]]);
+      const deps = {
+        registry,
+        isProjectBrain: () => true,
+        resolveSessionIdentity: (name: string) => identities.get(name) ?? (
+          name === 'deck_cd_brain' ? testResolveSessionIdentity(name) : undefined
+        ),
+        resolveAuditorRecoveryBinding: (name: string) => {
+          const target = identities.get(name);
+          return target ? bindingFor(target) : undefined;
+        },
+        retireSupersededAuditDelivery,
+        dispatchReadyAudit,
+      };
+      const request = (rebindSessionName: string) => ({
+        taskId, assignmentId, rebindSessionName, expectedRevision: revision, auditAttemptId,
+        idempotencyKey: `orphan-auditor:${taskId}:${assignmentId}:${auditAttemptId}`,
+        reason: 'openai auditor is live but no longer selected by the execution pool',
+      });
+      return { deps, request, retireSupersededAuditDelivery, dispatchReadyAudit };
+    }
+
+    it('rebinds the SAME orphaned auditor to a selected same-family transport under auto_allow_degraded, stating why', async () => {
+      const { deps, request, retireSupersededAuditDelivery, dispatchReadyAudit } = arrange('auto_allow_degraded');
+      const availability = vi.fn().mockReturnValue({ available: false, degradedReason: 'no_cross_vendor_configured' });
+      const handlers = createSupervisionMcpToolHandlers(CALLER, {
+        ...deps, resolveAuditorRecoveryCrossVendorAvailability: availability,
+      });
+
+      const result = await handlers[SUPERVISION_MCP_TOOLS.RECOVER](request(sameFamily.sessionName));
+
+      expect(result).toMatchObject({
+        status: 'ok', taskId, assignmentId, auditAttemptId, expectedRevision: revision,
+        auditRoutingReason: 'same_family_degraded',
+        auditDegradedReason: 'no_cross_vendor_configured',
+        auditTrigger: { status: 'dispatched', assignmentId },
+      });
+      expect(availability).toHaveBeenCalledExactlyOnceWith({
+        scopeSessionName: 'deck_cd_brain', auditedSessionName: implementer.sessionName,
+      });
+      expect(registry.orphanedAuditorRebound).toEqual([expect.objectContaining({
+        taskId, assignmentId, auditAttemptId, expectedRevision: revision, expectedGeneration: 1,
+        identity: expect.objectContaining({ sessionName: sameFamily.sessionName, providerFamily: 'anthropic' }),
+        executionBinding: bindingFor(sameFamily),
+        auditRoutingReason: 'same_family_degraded',
+        auditDegradedReason: 'no_cross_vendor_configured',
+      })]);
+      expect(retireSupersededAuditDelivery).toHaveBeenCalledExactlyOnceWith({
+        sessionName: staleOpenAiAuditor.sessionName,
+        messageId: expect.stringMatching(/^send_message_/),
+        recipient: {
+          sessionInstanceId: staleOpenAiAuditor.sessionInstanceId,
+          runtimeEpoch: staleOpenAiAuditor.runtimeEpoch,
+        },
+      });
+      expect(dispatchReadyAudit).toHaveBeenCalledExactlyOnceWith(taskId);
+    });
+
+    it('keeps strict recovery cross-vendor-only and never degrades past a usable cross-vendor target', async () => {
+      const strict = arrange('auto_strict_cross_vendor');
+      const strictAvailability = vi.fn().mockReturnValue({ available: false, degradedReason: 'no_cross_vendor_configured' });
+      await expect(createSupervisionMcpToolHandlers(CALLER, {
+        ...strict.deps, resolveAuditorRecoveryCrossVendorAvailability: strictAvailability,
+      })[SUPERVISION_MCP_TOOLS.RECOVER](strict.request(sameFamily.sessionName))).resolves.toMatchObject({
+        status: 'error', reason: 'identity_rejected', detail: expect.stringContaining('strict_cross_vendor_required'),
+      });
+      expect(strictAvailability).not.toHaveBeenCalled();
+
+      const degraded = arrange('auto_allow_degraded');
+      for (const [availability, refusal] of [
+        [vi.fn().mockReturnValue({ available: true }), 'cross_vendor_target_available'],
+        [vi.fn().mockImplementation(() => { throw new Error('pool listing offline'); }), 'cross_vendor_availability_unknown'],
+        [undefined, 'cross_vendor_availability_unknown'],
+      ] as const) {
+        await expect(createSupervisionMcpToolHandlers(CALLER, {
+          ...degraded.deps,
+          ...(availability ? { resolveAuditorRecoveryCrossVendorAvailability: availability } : {}),
+        })[SUPERVISION_MCP_TOOLS.RECOVER](degraded.request(sameFamily.sessionName))).resolves.toMatchObject({
+          status: 'error', reason: 'identity_rejected', detail: expect.stringContaining(refusal),
+        });
+      }
+      expect(registry.orphanedAuditorRebound).toEqual([]);
+      expect(strict.retireSupersededAuditDelivery).not.toHaveBeenCalled();
+      expect(degraded.retireSupersededAuditDelivery).not.toHaveBeenCalled();
+
+      // The usable cross-vendor target itself is admitted without consulting availability.
+      const crossAvailability = vi.fn();
+      await expect(createSupervisionMcpToolHandlers(CALLER, {
+        ...degraded.deps, resolveAuditorRecoveryCrossVendorAvailability: crossAvailability,
+      })[SUPERVISION_MCP_TOOLS.RECOVER](degraded.request(crossVendor.sessionName))).resolves.toMatchObject({
+        status: 'ok', auditRoutingReason: 'cross_vendor_preferred',
+      });
+      expect(crossAvailability).not.toHaveBeenCalled();
+      expect(registry.orphanedAuditorRebound).toEqual([expect.objectContaining({
+        identity: expect.objectContaining({ sessionName: crossVendor.sessionName }),
+        auditRoutingReason: 'cross_vendor_preferred',
+      })]);
+      expect(registry.orphanedAuditorRebound[0]).not.toHaveProperty('auditDegradedReason');
+    });
+
+    it('still rejects process, cross-project, unselected and self targets for a degraded task', async () => {
+      const { deps, request, retireSupersededAuditDelivery } = arrange('auto_allow_degraded');
+      const availability = vi.fn().mockReturnValue({ available: false, degradedReason: 'no_cross_vendor_configured' });
+      const targets = new Map([
+        ['deck_cd_cc_process', { ...sameFamily, sessionName: 'deck_cd_cc_process', agentType: 'claude-code' }],
+        ['deck_other_cc_auditor', { ...sameFamily, sessionName: 'deck_other_cc_auditor', projectName: 'other' }],
+        ['deck_cd_cc_unselected', { ...sameFamily, sessionName: 'deck_cd_cc_unselected' }],
+        [implementer.sessionName, { ...implementer, projectName: 'codedeck' }],
+      ]);
+      const handlers = createSupervisionMcpToolHandlers(CALLER, {
+        ...deps,
+        resolveSessionIdentity: (name: string) => targets.get(name) ?? deps.resolveSessionIdentity(name),
+        resolveAuditorRecoveryBinding: (name: string) => (
+          name === 'deck_cd_cc_unselected' ? undefined : bindingFor(targets.get(name) ?? sameFamily)
+        ),
+        resolveAuditorRecoveryCrossVendorAvailability: availability,
+      });
+      for (const target of targets.keys()) {
+        await expect(handlers[SUPERVISION_MCP_TOOLS.RECOVER](request(target)))
+          .resolves.toMatchObject({ status: 'error', reason: 'identity_rejected' });
+      }
+      expect(registry.orphanedAuditorRebound).toEqual([]);
+      expect(retireSupersededAuditDelivery).not.toHaveBeenCalled();
+    });
   });
 
   it('rebinds a validated required implementer through the live same-session identity and frozen evidence', async () => {

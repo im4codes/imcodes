@@ -34,9 +34,20 @@ import {
   listSendTargets,
   __resetSupervisionConvergenceTickForTests,
   dispatchSendMessage,
+  resolveAutomaticAuditCrossVendorAvailability,
+  resolveSelectedSupervisionExecutionBinding,
   type SendMessageInput,
   type SendRuntimeCaller,
 } from '../../src/daemon/send-tool.js';
+import {
+  createSupervisionMcpToolHandlers,
+  type SupervisionRegistryPort,
+} from '../../src/daemon/supervision-mcp-tools.js';
+import { SUPERVISION_MCP_TOOLS } from '../../shared/supervision-mcp-tools.js';
+import { retireExactSupersededAuditDelivery } from '../../src/daemon/supervision-registry-port.js';
+import { resolvePeerAuditProviderFamily } from '../../src/daemon/peer-audit-candidates.js';
+import { resolveEffectiveProjectName } from '../../shared/session-scope.js';
+import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 import {
   SupervisionTaskRegistry,
   getSupervisionTaskRegistry,
@@ -186,6 +197,8 @@ function makeReadyTask(options: {
   registry?: SupervisionTaskRegistry;
   /** Which session holds the implementer assignment this audit is about. */
   implementerSession?: string;
+  /** The implementer's full identity, when its runtime family matters. */
+  implementerIdentity?: PersistedSupervisionTaskAssignmentIdentity;
 } = {}) {
   const registry = options.registry ?? new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
   const taskId = options.taskId ?? 'auto-audit-task';
@@ -208,7 +221,7 @@ function makeReadyTask(options: {
   const worker = registry.createAssignment({
     taskId,
     role: 'implementer',
-    identity: identity(options.implementerSession ?? 'deck_alpha_worker'),
+    identity: options.implementerIdentity ?? identity(options.implementerSession ?? 'deck_alpha_worker'),
     auditRevision: revision,
     scopeFiles: ['src/exact.ts'],
   });
@@ -3744,6 +3757,293 @@ describe('periodic supervision convergence tick', () => {
     })).toEqual({ ok: false, reason: 'invalid_transition' });
     expect(registry.getAssignment(genericAuditor.value.assignmentId)).toMatchObject({ status: 'cancelled' });
     expect(generic.worker.assignmentId).toBeTruthy();
+  });
+
+  it('recovers tsk_mnq/asg_n06 in place when the openai auditor is no longer pool-selected and only a same-family transport is (auto_allow_degraded)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-degraded-auditor-rebind-'));
+    const dbPath = join(dir, 'registry.sqlite');
+    const taskId = 'tsk_mnq';
+    const assignmentId = 'asg_n06';
+    const revision = 'mnq-degraded-auditor-recovery-r1';
+    // The daemon derives the automatic attempt from task + revision; each task
+    // below carries its own exact derived attempt, as tsk_mnq does in production.
+    const attemptFor = (id: string) => automaticAttempt(id, revision);
+    const attemptId = attemptFor(taskId);
+    const brain = session('deck_alpha_brain', 'brain');
+    const worker = session('deck_alpha_worker', 'w1', 'claude-code-sdk', 'anthropic');
+    // Live and reply-capable, but its configuration is no longer selected by the pool.
+    const staleCodex = session('deck_alpha_codex_auditor', 'w2');
+    const selectedCc = session('deck_alpha_cc_auditor', 'w3', 'claude-code-sdk', 'anthropic');
+    const liveCodex = session('deck_alpha_codex_live', 'w4');
+    const ccConfig = {
+      agentType: 'claude-code-sdk', providerFamily: 'anthropic', runtimeType: 'transport' as const, model: 'claude-sonnet-4-6',
+    };
+    const codexConfig = {
+      agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport' as const, model: 'gpt-5.6',
+    };
+    const selectPool = (...configs: Array<typeof ccConfig | typeof codexConfig>) => {
+      brain.transportConfig = {
+        supervision: normalizeSessionSupervisionSnapshot({
+          mode: 'supervised_audit',
+          executionPools: {
+            state: 'configured',
+            primaryDevelopmentPool: {
+              configs: configs.map((config) => ({ ...config, capabilityId: buildSupervisionExecutionCapabilityId(config) })),
+              controls: { maxSpawned: 1 },
+            },
+            economyTaskPool: { configs: [], controls: { maxSpawned: 0 } },
+          },
+        }),
+      };
+    };
+    selectPool(ccConfig);
+    const sessions = [brain, worker, staleCodex, selectedCc];
+    const listTargets: typeof listSendTargets = (caller, input) => (
+      listSendTargets(caller, input, { listSessions: () => sessions })
+    );
+    const implementerIdentity = identity(worker.name, 'claude-code-sdk', 'anthropic');
+    let registry = new SupervisionTaskRegistry({ database: new DatabaseSync(dbPath) });
+    const queueCancels: Array<[string, string, { sessionInstanceId: string; runtimeEpoch: string }]> = [];
+    const replacementMessageId = deterministicAutomaticAuditDeliveryMessageId(assignmentId, attemptId, 2);
+    let replacementDelivered = false;
+    const dispatch = vi.fn(async (_caller: SendRuntimeCaller, input: SendMessageInput) => {
+      replacementDelivered = true;
+      return {
+        status: 'accepted' as const,
+        dispatchId: 'send_dispatch_00000000-0000-4000-8000-0000000000f7' as const,
+        messageId: input.internalMessageId!,
+        deliveries: [{ target: input.target!, status: 'queued' as const }],
+        taskId: input.task!.taskId!,
+        assignmentId: input.task!.assignmentId!,
+      };
+    });
+    const readyDeps = {
+      get registry() { return registry; },
+      listSessions: () => sessions,
+      listTargets,
+      dispatch,
+      hasDeliveryEvidence: (sessionName: string, candidate: SendMessageId) => (
+        replacementDelivered && sessionName === selectedCc.name && candidate === replacementMessageId
+      ),
+      hasVisibleAuditAcceptance: () => replacementDelivered,
+    };
+    // Production wiring shape, with the session list injected.
+    const handlers = () => createSupervisionMcpToolHandlers({
+      userId: brain.name, sessionName: brain.name, projectName: 'alpha', projectRoot: '/work/alpha',
+    } as unknown as McpRuntimeCaller, {
+      registry: {
+        get: (id: string) => registry.get(id),
+        recoverOrphanedDelegatedAuditor: (input: Parameters<SupervisionTaskRegistry['recoverOrphanedDelegatedAuditor']>[0]) => (
+          registry.recoverOrphanedDelegatedAuditor(input)
+        ),
+      } as unknown as SupervisionRegistryPort,
+      isProjectBrain: () => true,
+      resolveSessionIdentity: (name: string) => {
+        const live = sessions.find((candidate) => candidate.name === name);
+        return live ? {
+          sessionName: live.name,
+          sessionInstanceId: live.sessionInstanceId!,
+          runtimeEpoch: live.runtimeEpoch!,
+          agentType: live.agentType,
+          providerFamily: resolvePeerAuditProviderFamily(live),
+          projectName: resolveEffectiveProjectName(live, sessions)!,
+        } : undefined;
+      },
+      resolveAuditorRecoveryBinding: (name: string) => {
+        const live = sessions.find((candidate) => candidate.name === name);
+        return live ? resolveSelectedSupervisionExecutionBinding('alpha', sessions, live) : undefined;
+      },
+      resolveAuditorRecoveryCrossVendorAvailability: (input) => (
+        resolveAutomaticAuditCrossVendorAvailability(input, { listSessions: () => sessions, listTargets })
+      ),
+      retireSupersededAuditDelivery: (input) => retireExactSupersededAuditDelivery({
+        cancelQueuedMessage: (sessionName: string, messageId: string, recipient: { sessionInstanceId: string; runtimeEpoch: string }) => {
+          queueCancels.push([sessionName, messageId, recipient]);
+          return { status: 'accepted' } as never;
+        },
+      }, input),
+      dispatchReadyAudit: (id: string) => dispatchReadyAudit(id, readyDeps),
+    });
+    const arrangeOrphanedAuditor = (id: string, auditPolicy: 'auto_allow_degraded' | 'auto_strict_cross_vendor' | undefined, exactAssignmentId?: string) => {
+      makeReadyTask({ taskId: id, revision, ...(auditPolicy ? { auditPolicy } : {}), registry, implementerIdentity });
+      const stale = identity(staleCodex.name);
+      const created = registry.createAssignment({
+        ...(exactAssignmentId ? { assignmentId: exactAssignmentId } : {}),
+        taskId: id, role: 'auditor', required: false, identity: stale,
+        auditAttemptId: attemptFor(id), auditRevision: revision,
+        executionBinding: {
+          pool: 'primary', origin: 'reused',
+          requested: { ...codexConfig, capabilityId: buildSupervisionExecutionCapabilityId(codexConfig) },
+          actual: { ...stale, runtimeType: 'transport', model: codexConfig.model },
+        },
+        idempotencyKey: `send:auto-audit:${id}:${revision}`, now: 100,
+      });
+      if (!created.ok) throw new Error(created.reason);
+      return created.value;
+    };
+    const request = (id: string, auditorId: string, rebindSessionName: string) => ({
+      taskId: id, assignmentId: auditorId, rebindSessionName, expectedRevision: revision, auditAttemptId: attemptFor(id),
+      idempotencyKey: `orphan-auditor:${id}:${auditorId}:${attemptFor(id)}`,
+      reason: 'openai auditor is live but no longer selected by the execution pool',
+    });
+    try {
+      const before = arrangeOrphanedAuditor(taskId, 'auto_allow_degraded', assignmentId);
+      expect(before).toMatchObject({ assignmentId, status: 'delegated', generation: 1 });
+      // The production shape: the old target is listed but no longer pool-eligible.
+      const listed = listTargets({ userId: brain.name, sessionName: brain.name, projectName: 'alpha', projectRoot: '/work/alpha' },
+        { executionPool: 'primary' });
+      expect(listed.status === 'ok' && listed.items.find((item) => item.target === staleCodex.name)).toBeFalsy();
+      expect(resolveSelectedSupervisionExecutionBinding('alpha', sessions, staleCodex)).toBeUndefined();
+
+      await expect(handlers()[SUPERVISION_MCP_TOOLS.RECOVER](request(taskId, assignmentId, selectedCc.name))).resolves.toMatchObject({
+        status: 'ok', taskId, assignmentId, auditAttemptId: attemptId, expectedRevision: revision,
+        auditRoutingReason: 'same_family_degraded',
+        auditDegradedReason: 'no_cross_vendor_configured',
+        replay: false,
+        auditTrigger: { status: 'dispatched', assignmentId, attemptId, messageId: replacementMessageId },
+      });
+      // The superseded exact delivery is retired from the old target, once.
+      expect(queueCancels).toEqual([[
+        staleCodex.name,
+        deterministicAutomaticAuditDeliveryMessageId(assignmentId, attemptId, 1),
+        { sessionInstanceId: staleCodex.sessionInstanceId, runtimeEpoch: staleCodex.runtimeEpoch },
+      ]]);
+      // The SAME deterministic audit delivery goes to the new identity, once, never strict.
+      expect(dispatch).toHaveBeenCalledOnce();
+      expect(dispatch.mock.calls[0]![1]).toMatchObject({
+        target: selectedCc.name,
+        internalMessageId: replacementMessageId,
+        task: { taskId, assignmentId, auditAttemptId: attemptId, auditRevision: revision },
+        audit: { attemptId, auditedSessionName: worker.name },
+      });
+      expect(dispatch.mock.calls[0]![1].audit).not.toHaveProperty('strictCrossVendor');
+      const recovered = registry.getAssignment(assignmentId)!;
+      expect(recovered).toMatchObject({
+        assignmentId, taskId, role: 'auditor', status: 'delegated',
+        auditAttemptId: attemptId, auditRevision: revision, generation: 2,
+        identity: identity(selectedCc.name, 'claude-code-sdk', 'anthropic'),
+        // The complete selected binding, as persisted (undefined fields do not survive storage).
+        executionBinding: JSON.parse(JSON.stringify(resolveSelectedSupervisionExecutionBinding('alpha', sessions, selectedCc))),
+        auditRoutingReason: 'same_family_degraded',
+        auditDegradedReason: 'no_cross_vendor_configured',
+      });
+      expect(registry.listAssignments(taskId).filter((item) => item.role === 'auditor')).toHaveLength(1);
+      expect(registry.listAuditReceipts(taskId)).toEqual([]);
+      const rebindEvents = () => registry.listEvents(taskId).filter((event) => (
+        event.assignmentId === assignmentId && event.payload?.source === 'orphaned_automatic_auditor_rebind'
+      ));
+      expect(rebindEvents()).toEqual([expect.objectContaining({
+        payload: expect.objectContaining({
+          auditPolicy: 'auto_allow_degraded',
+          auditRoutingReason: 'same_family_degraded',
+          auditDegradedReason: 'no_cross_vendor_configured',
+          priorGeneration: 1, targetGeneration: 2,
+          supersededSessionName: staleCodex.name, targetSessionName: selectedCc.name,
+        }),
+      })]);
+
+      // Replay, then replay across a restart: same object, nothing retired or re-sent.
+      await expect(handlers()[SUPERVISION_MCP_TOOLS.RECOVER](request(taskId, assignmentId, selectedCc.name)))
+        .resolves.toMatchObject({ status: 'ok', replay: true, auditRoutingReason: 'same_family_degraded' });
+      registry.close();
+      registry = new SupervisionTaskRegistry({ database: new DatabaseSync(dbPath) });
+      await expect(handlers()[SUPERVISION_MCP_TOOLS.RECOVER](request(taskId, assignmentId, selectedCc.name)))
+        .resolves.toMatchObject({
+          status: 'ok', replay: true,
+          auditRoutingReason: 'same_family_degraded', auditDegradedReason: 'no_cross_vendor_configured',
+        });
+      expect(queueCancels).toHaveLength(1);
+      expect(dispatch).toHaveBeenCalledOnce();
+      expect(registry.getAssignment(assignmentId)).toMatchObject({ generation: 2, auditRoutingReason: 'same_family_degraded' });
+      expect(rebindEvents()).toHaveLength(1);
+
+      // Strict tasks stay closed in the identical pool, and are left untouched.
+      const strictTaskId = `${taskId}-strict`;
+      const strictAuditor = arrangeOrphanedAuditor(strictTaskId, 'auto_strict_cross_vendor');
+      await expect(handlers()[SUPERVISION_MCP_TOOLS.RECOVER](
+        request(strictTaskId, strictAuditor.assignmentId, selectedCc.name),
+      )).resolves.toMatchObject({
+        status: 'error', reason: 'identity_rejected', detail: expect.stringContaining('strict_cross_vendor_required'),
+      });
+      expect(registry.getAssignment(strictAuditor.assignmentId)).toMatchObject({
+        generation: 1, identity: identity(staleCodex.name),
+      });
+      expect(registry.getAssignment(strictAuditor.assignmentId)).not.toHaveProperty('auditRoutingReason');
+      // The registry refuses the same-family strict rebind on its own, even with a forged statement.
+      expect(registry.recoverOrphanedDelegatedAuditor({
+        taskId: strictTaskId, assignmentId: strictAuditor.assignmentId,
+        identity: identity(selectedCc.name, 'claude-code-sdk', 'anthropic'),
+        executionBinding: resolveSelectedSupervisionExecutionBinding('alpha', sessions, selectedCc),
+        auditRoutingReason: 'same_family_degraded', auditDegradedReason: 'no_cross_vendor_configured',
+        expectedGeneration: 1, expectedRevision: revision, auditAttemptId: attemptFor(strictTaskId), callerProjectName: 'alpha',
+        supersededDeliveryMessageId: deterministicAutomaticAuditDeliveryMessageId(strictAuditor.assignmentId, attemptFor(strictTaskId), 1),
+        deliveryMessageId: deterministicAutomaticAuditDeliveryMessageId(strictAuditor.assignmentId, attemptFor(strictTaskId), 2),
+        idempotencyKey: 'forged-degraded-statement', reason: 'forged', now: 500,
+      })).toEqual({ ok: false, reason: 'invalid_transition' });
+
+      // Nor may the registry degrade an audit onto the audited implementer itself.
+      const selfTaskId = `${taskId}-self`;
+      const selfAuditor = arrangeOrphanedAuditor(selfTaskId, 'auto_allow_degraded');
+      expect(registry.recoverOrphanedDelegatedAuditor({
+        taskId: selfTaskId, assignmentId: selfAuditor.assignmentId,
+        identity: implementerIdentity,
+        executionBinding: resolveSelectedSupervisionExecutionBinding('alpha', sessions, worker),
+        auditRoutingReason: 'same_family_degraded', auditDegradedReason: 'no_cross_vendor_configured',
+        expectedGeneration: 1, expectedRevision: revision, auditAttemptId: attemptFor(selfTaskId), callerProjectName: 'alpha',
+        supersededDeliveryMessageId: deterministicAutomaticAuditDeliveryMessageId(selfAuditor.assignmentId, attemptFor(selfTaskId), 1),
+        deliveryMessageId: deterministicAutomaticAuditDeliveryMessageId(selfAuditor.assignmentId, attemptFor(selfTaskId), 2),
+        idempotencyKey: 'self-audit', reason: 'must not audit itself', now: 600,
+      })).toEqual({ ok: false, reason: 'invalid_transition' });
+
+      // A degraded task still requires a usable cross-vendor target when one is selected.
+      selectPool(ccConfig, codexConfig);
+      sessions.push(liveCodex);
+      // ...but an already-completed degraded rebind stays an idempotent replay:
+      // the durable record, not the moved pool, decides.
+      await expect(handlers()[SUPERVISION_MCP_TOOLS.RECOVER](request(taskId, assignmentId, selectedCc.name)))
+        .resolves.toMatchObject({ status: 'ok', replay: true, auditRoutingReason: 'same_family_degraded' });
+      expect(queueCancels).toHaveLength(1);
+      expect(dispatch).toHaveBeenCalledOnce();
+      const crossTaskId = `${taskId}-cross`;
+      const crossAuditor = arrangeOrphanedAuditor(crossTaskId, 'auto_allow_degraded');
+      await expect(handlers()[SUPERVISION_MCP_TOOLS.RECOVER](
+        request(crossTaskId, crossAuditor.assignmentId, selectedCc.name),
+      )).resolves.toMatchObject({
+        status: 'error', reason: 'identity_rejected', detail: expect.stringContaining('cross_vendor_target_available'),
+      });
+      await expect(handlers()[SUPERVISION_MCP_TOOLS.RECOVER](
+        request(crossTaskId, crossAuditor.assignmentId, liveCodex.name),
+      )).resolves.toMatchObject({ status: 'ok', auditRoutingReason: 'cross_vendor_preferred' });
+      expect(registry.getAssignment(crossAuditor.assignmentId)).toMatchObject({
+        generation: 2, identity: identity(liveCodex.name), auditRoutingReason: 'cross_vendor_preferred',
+      });
+      expect(registry.getAssignment(crossAuditor.assignmentId)?.auditDegradedReason).toBeUndefined();
+
+      // A task without an automatic audit policy keeps current-dev cross-vendor
+      // recovery, and still never degrades to the same family.
+      const unpolicedTaskId = `${taskId}-unpoliced`;
+      const unpolicedAuditor = arrangeOrphanedAuditor(unpolicedTaskId, undefined);
+      const unpolicedRequest = (target: typeof liveCodex, key: string) => ({
+        taskId: unpolicedTaskId, assignmentId: unpolicedAuditor.assignmentId,
+        identity: identity(target.name, target.agentType, resolvePeerAuditProviderFamily(target)),
+        executionBinding: resolveSelectedSupervisionExecutionBinding('alpha', sessions, target),
+        expectedGeneration: 1, expectedRevision: revision, auditAttemptId: attemptFor(unpolicedTaskId), callerProjectName: 'alpha',
+        supersededDeliveryMessageId: deterministicAutomaticAuditDeliveryMessageId(unpolicedAuditor.assignmentId, attemptFor(unpolicedTaskId), 1),
+        deliveryMessageId: deterministicAutomaticAuditDeliveryMessageId(unpolicedAuditor.assignmentId, attemptFor(unpolicedTaskId), 2),
+        idempotencyKey: key, reason: 'unpoliced orphaned auditor', now: 700,
+      });
+      expect(registry.recoverOrphanedDelegatedAuditor({
+        ...unpolicedRequest(selectedCc, 'unpoliced-same-family'),
+        auditRoutingReason: 'same_family_degraded', auditDegradedReason: 'no_cross_vendor_configured',
+      })).toEqual({ ok: false, reason: 'invalid_transition' });
+      expect(registry.recoverOrphanedDelegatedAuditor(unpolicedRequest(liveCodex, 'unpoliced-cross-vendor'))).toMatchObject({
+        ok: true,
+        value: { generation: 2, identity: identity(liveCodex.name), auditRoutingReason: 'cross_vendor_preferred' },
+      });
+    } finally {
+      registry.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('recovers auditing tsk_5w9/asg_e7r in place and replays exactly after restart', () => {

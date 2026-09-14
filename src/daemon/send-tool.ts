@@ -98,6 +98,7 @@ import type {
   SupervisionProvisionFailureReason,
   SupervisionProvisioningEvidence,
 } from '../../shared/supervision-execution-pool.js';
+import type { SupervisionAuditorRecoveryCrossVendorAvailability } from '../../shared/supervision-auditor-recovery.js';
 import type {
   SupervisionAutoProvisionRequest,
   SupervisionAutoProvisionResult,
@@ -3101,6 +3102,87 @@ function isAutomaticAuditTransportTarget(target: SessionRecord): boolean {
 }
 
 /**
+ * The pool-scoped targets that may take an automatic audit of one audited
+ * session: listed in the primary execution pool, dispatchable now (ready or
+ * busy), and a live started transport with an exact runtime identity. The ONE
+ * eligibility rule automatic routing and orphaned-auditor recovery share.
+ */
+function automaticAuditPoolEligibleItems(
+  items: readonly SendTargetInfo[],
+  sessions: readonly SessionRecord[],
+  auditedSessionName: string,
+): SendTargetInfo[] {
+  const liveByName = new Map(sessions.map((session) => [session.name, session]));
+  return items
+    .filter((item) => (
+      item.target !== auditedSessionName
+      && (item.dispatchMode === 'new_work' || item.dispatchMode === 'queue_only')
+      && item.eligiblePools?.includes('primary')
+      && (() => {
+        const live = liveByName.get(item.target);
+        return Boolean(
+          live
+          && (live.runtimeType ?? getSessionRuntimeType(live.agentType)) === 'transport'
+          && live.sessionInstanceId?.trim()
+          && live.runtimeEpoch?.trim(),
+        );
+      })()
+    ))
+    .sort((left, right) => left.target.localeCompare(right.target));
+}
+
+/**
+ * Is any cross-vendor auditor usable for this audited session right now, by the
+ * same pool-scoped eligibility automatic audit routing uses? A target that is
+ * live but no longer selected by the execution pool is NOT usable. When none
+ * is usable, the concrete degraded reason is returned. Anything that cannot be
+ * established (no scoped listing, unconfigured pools, unknown audited session)
+ * is `undefined`, which never licenses a degradation.
+ */
+export function resolveAutomaticAuditCrossVendorAvailability(
+  input: { scopeSessionName: string; auditedSessionName: string },
+  deps: Pick<ReadyAuditDispatchDeps, 'listSessions' | 'listTargets'> = {},
+): SupervisionAuditorRecoveryCrossVendorAvailability | undefined {
+  const sessions = (deps.listSessions ?? listSessions)();
+  const scope = sessions.find((session) => session.name === input.scopeSessionName);
+  const audited = sessions.find((session) => session.name === input.auditedSessionName);
+  if (!scope || !audited) return undefined;
+  const projectName = resolveEffectiveProjectName(scope, sessions);
+  if (!projectName || resolveEffectiveProjectName(audited, sessions) !== projectName) return undefined;
+  const listed = (deps.listTargets ?? listSendTargets)({
+    userId: scope.name,
+    sessionName: scope.name,
+    projectName,
+    projectRoot: scope.projectDir,
+  }, { executionPool: 'primary', limit: MAX_TARGET_LIST_LIMIT });
+  if (listed.status !== 'ok' || listed.executionPoolsState !== 'configured') return undefined;
+  const auditedFamily = resolvePeerAuditProviderFamily(audited);
+  const crossVendor = automaticAuditPoolEligibleItems(listed.items, sessions, audited.name)
+    .filter((item) => item.providerFamily !== auditedFamily);
+  if (crossVendor.length > 0) return { available: true };
+  const pools = resolveProjectAuthoritativeSupervisionPools(projectName, sessions);
+  if (pools.state !== 'configured') return undefined;
+  const crossVendorConfigured = pools.primaryDevelopmentPool.configs.some((config) => (
+    config.runtimeType === 'transport' && config.providerFamily !== auditedFamily
+  ));
+  if (!crossVendorConfigured) return { available: false, degradedReason: 'no_cross_vendor_configured' };
+  // Selected cross-vendor transports that exist but cannot take work now.
+  const selectedCrossVendor = listed.items.filter((item) => (
+    item.target !== audited.name
+    && item.providerFamily !== auditedFamily
+    && item.eligiblePools?.includes('primary')
+  ));
+  const states = selectedCrossVendor.map((item) => item.availability);
+  if (states.length > 0 && states.every((state) => state === DELEGATION_AVAILABILITY.LIMITED)) {
+    return { available: false, degradedReason: 'cross_vendor_limited' };
+  }
+  if (states.length > 0 && states.every((state) => state === DELEGATION_AVAILABILITY.OFFLINE)) {
+    return { available: false, degradedReason: 'cross_vendor_offline' };
+  }
+  return { available: false, degradedReason: 'cross_vendor_unavailable' };
+}
+
+/**
  * Choose an auditor AND claim it, in one synchronous step.
  *
  * Selecting and then awaiting a dispatch is what let four audits in the same
@@ -3129,24 +3211,8 @@ function eligibleAutomaticAuditTransportTargets(
     projectRoot: brain.projectDir,
   }, { executionPool: 'primary', limit: MAX_TARGET_LIST_LIMIT });
   if (listed.status !== 'ok') return {};
-  const liveByName = new Map(sessions.map((session) => [session.name, session]));
   const auditedFamily = resolvePeerAuditProviderFamily(auditedSession);
-  const eligible = listed.items
-    .filter((item) => (
-      item.target !== audited.identity.sessionName
-      && (item.dispatchMode === 'new_work' || item.dispatchMode === 'queue_only')
-      && item.eligiblePools?.includes('primary')
-      && (() => {
-        const live = liveByName.get(item.target);
-        return Boolean(
-          live
-          && (live.runtimeType ?? getSessionRuntimeType(live.agentType)) === 'transport'
-          && live.sessionInstanceId?.trim()
-          && live.runtimeEpoch?.trim(),
-        );
-      })()
-    ))
-    .sort((left, right) => left.target.localeCompare(right.target));
+  const eligible = automaticAuditPoolEligibleItems(listed.items, sessions, audited.identity.sessionName);
   const pick = (items: typeof eligible): string | undefined => (
     items.find((item) => item.providerFamily !== auditedFamily)?.target
     ?? (allowSameFamily ? items.find((item) => item.providerFamily === auditedFamily)?.target : undefined)

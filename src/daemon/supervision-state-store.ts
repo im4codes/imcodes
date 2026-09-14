@@ -50,6 +50,7 @@ import type {
   SupervisionProvisioningEvidence,
 } from '../../shared/supervision-execution-pool.js';
 import { mayFinalizeEconomyAssignment } from '../../shared/supervision-execution-pool.js';
+import { isSupervisionAuditorRecoveryRoutingConsistent } from '../../shared/supervision-auditor-recovery.js';
 import {
   evaluateSupervisionObservedIdentity,
   supervisionSelectedExecutionBindingMatches,
@@ -7289,6 +7290,14 @@ export class SupervisionTaskRegistry {
     assignmentId: string;
     identity: PersistedSupervisionTaskAssignmentIdentity;
     executionBinding?: SupervisionExecutionBinding;
+    /**
+     * The routing statement the SAME assignment carries after the rebind. A
+     * cross-vendor target implies `cross_vendor_preferred`; a same-family
+     * target is admissible only under `auto_allow_degraded` with an explicit
+     * `same_family_degraded` reason (supervision-auditor-recovery.ts).
+     */
+    auditRoutingReason?: SupervisionAuditRoutingReason;
+    auditDegradedReason?: SupervisionAuditDegradedReason;
     expectedGeneration: number;
     expectedRevision: string;
     auditAttemptId: string;
@@ -7439,6 +7448,14 @@ export class SupervisionTaskRegistry {
             actual: input.executionBinding.actual,
             pool: input.executionBinding.pool,
           }).ok);
+      const auditedProviderFamily = implementers[0]?.identity.providerFamily ?? '';
+      const routing = {
+        auditRoutingReason: input.auditRoutingReason
+          ?? (auditedProviderFamily && auditedProviderFamily !== input.identity.providerFamily
+            ? 'cross_vendor_preferred' as const
+            : undefined),
+        auditDegradedReason: input.auditDegradedReason,
+      };
       if (task.status !== 'ready_for_audit'
         || task.validationState !== 'passed'
         || task.currentRevision !== expectedRevision
@@ -7451,7 +7468,16 @@ export class SupervisionTaskRegistry {
         || implementers.length !== 1
         || competingAuditor
         || !bindingMatchesTarget
-        || implementers[0]!.identity.providerFamily === input.identity.providerFamily) {
+        || implementers[0]!.identity.sessionName === input.identity.sessionName
+        // One policy with the Brain ingress: strict tasks never take a
+        // same-family target; a degraded task takes one only with an explicit
+        // same_family_degraded statement and reason.
+        || !isSupervisionAuditorRecoveryRoutingConsistent({
+          auditPolicy: task.auditPolicy,
+          auditedProviderFamily,
+          targetProviderFamily: input.identity.providerFamily,
+          routing,
+        })) {
         this.#db.exec('ROLLBACK');
         return { ok: false, reason: 'invalid_transition' };
       }
@@ -7470,6 +7496,10 @@ export class SupervisionTaskRegistry {
         status: 'delegated',
         identity: input.identity,
         ...(input.executionBinding ? { executionBinding: input.executionBinding } : {}),
+        // The routing statement is replaced wholesale: a cross-vendor rebind
+        // clears a prior degradation, a degraded rebind states its reason.
+        auditRoutingReason: routing.auditRoutingReason,
+        auditDegradedReason: routing.auditDegradedReason,
         generation: assignment.generation + 1,
         verdict: undefined,
         blocker: undefined,
@@ -7481,6 +7511,9 @@ export class SupervisionTaskRegistry {
         source: 'orphaned_automatic_auditor_rebind',
         idempotencyKey,
         reason,
+        auditPolicy: task.auditPolicy,
+        auditRoutingReason: routing.auditRoutingReason,
+        ...(routing.auditDegradedReason ? { auditDegradedReason: routing.auditDegradedReason } : {}),
         revision: expectedRevision,
         attemptId: auditAttemptId,
         supersededDeliveryMessageId,

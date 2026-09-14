@@ -33,7 +33,10 @@ import { advancePendingRepliesForReboundCoordinator } from './delegation-reply-i
 import { setSupervisionLiveParticipantsResolver } from './supervision-state-store.js';
 import { resolveLiveSupervisionParticipants } from './supervision-brain-authority.js';
 import { getTransportQueueStore, type TransportQueueStore } from './transport-queue-store.js';
-import { resolveSelectedSupervisionExecutionBinding } from './send-tool.js';
+import {
+  resolveAutomaticAuditCrossVendorAvailability,
+  resolveSelectedSupervisionExecutionBinding,
+} from './send-tool.js';
 import { autoStartAssignmentFromAck } from './assignment-auto-start.js';
 import { SUPERVISION_ASSIGNMENT_START_EVIDENCE } from '../../shared/supervision-assignment-start.js';
 
@@ -427,6 +430,11 @@ export function createSupervisionMcpToolDeps(): SupervisionMcpToolDeps {
         ? resolveSelectedSupervisionExecutionBinding(projectName, sessions, session)
         : undefined;
     },
+    // Same pool-scoped eligibility as automatic audit routing, so recovery and
+    // routing can never disagree about whether a cross-vendor auditor exists.
+    resolveAuditorRecoveryCrossVendorAvailability: (input) => (
+      resolveAutomaticAuditCrossVendorAvailability(input)
+    ),
     worktreeGc: async (input) => runSupervisionWorktreeGc(input, createSupervisionWorktreeGcDeps()),
     dispatchReadyAudit: async (taskId) => {
       const { dispatchReadyAudit } = await import('./send-tool.js');
