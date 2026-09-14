@@ -243,6 +243,73 @@ export function detectRemoteDesktopClipboardShortcut(
   return null;
 }
 
+/**
+ * One key on the mobile "computer keyboard" tab -- the keys a software IME
+ * cannot reach at all (function keys, navigation cluster, modifiers held on
+ * their own). `modifier` marks the four keys that latch in combo mode
+ * instead of firing immediately: Control/Shift/Option-or-Alt/Command-or-Win.
+ */
+export interface RemoteDesktopComputerKeySpec {
+  code: string;
+  key: string;
+  modifier: boolean;
+}
+
+const modKey = (code: string, key: string): RemoteDesktopComputerKeySpec => ({ code, key, modifier: true });
+const plainKey = (code: string, key: string): RemoteDesktopComputerKeySpec => ({ code, key, modifier: false });
+
+/**
+ * Row-major layout for the on-screen computer keyboard: modifiers, then
+ * Esc/Tab/backtick/PrintScreen/ScrollLock/Pause, then three rows pairing
+ * F1-F9 with Insert/Home/PageUp/Delete/End/PageDown/CapsLock, and finally
+ * F10-F12 with the arrow cluster.
+ */
+export const REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS: readonly (readonly RemoteDesktopComputerKeySpec[])[] = [
+  [modKey('ControlLeft', 'Control'), modKey('ShiftLeft', 'Shift'), modKey('AltLeft', 'Alt'), modKey('MetaLeft', 'Meta')],
+  [plainKey('Escape', 'Escape'), plainKey('Tab', 'Tab'), plainKey('Backquote', '`'), plainKey('PrintScreen', 'PrintScreen'), plainKey('ScrollLock', 'ScrollLock'), plainKey('Pause', 'Pause')],
+  [plainKey('F1', 'F1'), plainKey('F2', 'F2'), plainKey('F3', 'F3'), plainKey('Insert', 'Insert'), plainKey('Home', 'Home'), plainKey('PageUp', 'PageUp')],
+  [plainKey('F4', 'F4'), plainKey('F5', 'F5'), plainKey('F6', 'F6'), plainKey('Delete', 'Delete'), plainKey('End', 'End'), plainKey('PageDown', 'PageDown')],
+  [plainKey('F7', 'F7'), plainKey('F8', 'F8'), plainKey('F9', 'F9'), plainKey('CapsLock', 'CapsLock'), plainKey('ArrowUp', 'ArrowUp')],
+  [plainKey('F10', 'F10'), plainKey('F11', 'F11'), plainKey('F12', 'F12'), plainKey('ArrowLeft', 'ArrowLeft'), plainKey('ArrowDown', 'ArrowDown'), plainKey('ArrowRight', 'ArrowRight')],
+];
+
+const COMPUTER_KEY_LABELS: Record<string, string> = {
+  Escape: 'Esc',
+  Backquote: '~ `',
+  PrintScreen: 'PrtScr',
+  ScrollLock: 'ScrLk',
+  Pause: 'Pause',
+  Insert: 'Ins',
+  Home: 'Home',
+  PageUp: 'PgUp',
+  Delete: 'Del',
+  End: 'End',
+  PageDown: 'PgDn',
+  CapsLock: 'Caps',
+  ArrowUp: '▲',
+  ArrowDown: '▼',
+  ArrowLeft: '◀',
+  ArrowRight: '▶',
+};
+
+/**
+ * The visible glyph for one computer-keyboard key. Control and Shift read
+ * the same on every target; Option/Alt and Command/Win are the two keys
+ * whose printed cap -- and so the label a controller expects -- differs
+ * between a macOS target and a Windows/Linux one.
+ */
+export function remoteDesktopComputerKeyLabel(
+  spec: RemoteDesktopComputerKeySpec,
+  targetPlatform: RemoteDesktopTargetPlatform,
+): string {
+  const macTarget = targetPlatform === 'macos';
+  if (spec.code === 'AltLeft') return macTarget ? 'Option' : 'Alt';
+  if (spec.code === 'MetaLeft') return macTarget ? '⌘' : 'Win';
+  if (spec.code === 'ControlLeft') return 'Control';
+  if (spec.code === 'ShiftLeft') return 'Shift';
+  return COMPUTER_KEY_LABELS[spec.code] ?? spec.key;
+}
+
 export function sendRemoteDesktopChord(
   keys: readonly RemoteDesktopChordKey[],
   send: (

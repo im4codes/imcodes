@@ -1416,6 +1416,76 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(container.querySelector('.remote-desktop-mobile-keyboard')).not.toBeNull();
   });
 
+  it('docks the mobile keyboard below the stage instead of layering it on top', async () => {
+    const { container, getByRole } = await renderPanel();
+    act(() => { (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });
+
+    const stage = container.querySelector('.remote-desktop-stage');
+    const keyboard = container.querySelector('.remote-desktop-mobile-keyboard');
+    expect(keyboard).not.toBeNull();
+    // A sibling of the stage, not a child of it -- so it takes its own space
+    // in the panel layout instead of covering the video.
+    expect(stage!.contains(keyboard)).toBe(false);
+    expect(getByRole('textbox', { name: 'remote_desktop.mobile_text_input' })).toBeDefined();
+
+    act(() => {
+      (getByRole('tab', { name: 'remote_desktop.mobile_keyboard_tab_keys' }) as HTMLButtonElement).click();
+    });
+    expect(container.querySelector('[aria-label="remote_desktop.mobile_text_input"]')).toBeNull();
+    expect(container.querySelector('.remote-desktop-computer-keyboard')).not.toBeNull();
+
+    act(() => {
+      (getByRole('tab', { name: 'remote_desktop.mobile_keyboard_tab_ime' }) as HTMLButtonElement).click();
+    });
+    expect(getByRole('textbox', { name: 'remote_desktop.mobile_text_input' })).toBeDefined();
+  });
+
+  it('sends a standalone computer-keyboard key, then one chord per combo-mode cycle', async () => {
+    const { container, getByRole } = await renderPanel();
+    act(() => { (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });
+    act(() => {
+      (getByRole('tab', { name: 'remote_desktop.mobile_keyboard_tab_keys' }) as HTMLButtonElement).click();
+    });
+    const keyButton = (label: string) => Array.from(
+      container.querySelectorAll<HTMLButtonElement>('.remote-desktop-computer-keyboard-row button'),
+    ).find((button) => button.textContent === label)!;
+
+    key.mockClear();
+    act(() => { keyButton('F5').click(); });
+    expect(key.mock.calls).toEqual([
+      ['F5', 'F5', true, false, { control: false, alt: false }],
+      ['F5', 'F5', false, false, { control: false, alt: false }],
+    ]);
+
+    const comboToggle = getByRole('checkbox', { name: 'remote_desktop.combo_mode' }) as HTMLInputElement;
+    act(() => { fireEvent.click(comboToggle); });
+    expect(comboToggle.checked).toBe(true);
+
+    key.mockClear();
+    act(() => { keyButton('Control').click(); });
+    expect(keyButton('Control').getAttribute('aria-pressed')).toBe('true');
+    act(() => { keyButton('Shift').click(); });
+    act(() => { keyButton('F5').click(); });
+    expect(key.mock.calls).toEqual([
+      ['ControlLeft', 'Control', true, false, { control: true, alt: false }],
+      ['ShiftLeft', 'Shift', true, false, { control: true, alt: false }],
+      ['F5', 'F5', true, false, { control: true, alt: false }],
+      ['F5', 'F5', false, false, { control: true, alt: false }],
+      ['ShiftLeft', 'Shift', false, false, { control: true, alt: false }],
+      ['ControlLeft', 'Control', false, false, { control: false, alt: false }],
+    ]);
+    // One-shot: firing the chord released the latch instead of leaving it
+    // held for whatever the operator taps next.
+    expect(keyButton('Control').getAttribute('aria-pressed')).toBe('false');
+
+    key.mockClear();
+    act(() => { keyButton('Shift').click(); }); // latch Shift only, then navigate away
+    act(() => {
+      (getByRole('tab', { name: 'remote_desktop.mobile_keyboard_tab_ime' }) as HTMLButtonElement).click();
+    });
+    expect(key).toHaveBeenCalledWith('ShiftLeft', 'Shift', false, false, { control: false, alt: false });
+  });
+
   it('opens the focused display resolution menu from the keyboard context-menu gesture', async () => {
     const { getByRole } = await renderPanel();
     const displayTab = getByRole('tab', { name: 'Display 1' });
