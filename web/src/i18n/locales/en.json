@@ -796,6 +796,8 @@
       "auditBlockingSeverities": "Blocking audit severities",
       "auditBlockingSeveritiesHelp": "Only findings at the checked levels block (REWORK). Unchecked levels are non-blocking follow-ups. Default: P0 only. At least one level must stay selected.",
       "auditBlockingSeveritiesAtLeastOne": "At least one blocking level must stay selected",
+      "auditNonFindingTitle": "Not findings",
+      "auditNonFindingHelp": "Invented requirements, expanded scope, out-of-scope hypotheses, evidence-free speculation, pure nitpicks, and extra security hardening not required by the acceptance criteria or applicable threat model are not P0–P4 findings. They cannot trigger REWORK, appear as follow-ups, or require implementation.",
       "auditSeverity": {
         "P0": "Data loss or corruption, security hole, production down or unrecoverable; unmet explicit, traceable requirement or acceptance criterion; regression introduced by this change",
         "P1": "Serious functional defect outside explicit acceptance; hang or permanent block; partial write",

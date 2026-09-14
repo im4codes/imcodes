@@ -796,6 +796,8 @@
       "auditBlockingSeverities": "稽核阻斷等級",
       "auditBlockingSeveritiesHelp": "僅勾選等級的問題會阻斷（REWORK）；未勾選等級為非阻斷的後續改進。預設僅 P0，至少保留一項。",
       "auditBlockingSeveritiesAtLeastOne": "至少需要保留一個阻斷等級",
+      "auditNonFindingTitle": "不構成稽核問題",
+      "auditNonFindingHelp": "臆造需求、擴大範圍、範圍外假設、無證據猜測、單純吹毛求疵，以及驗收標準或適用威脅模型未要求的額外安全加固，不屬於 P0–P4，不得觸發 REWORK、寫入後續改進或要求實作。",
       "auditSeverity": {
         "P0": "資料遺失或損壞、安全漏洞、生產環境不可用或無法復原；未滿足明確且可追溯的需求或驗收標準；本次變更引入回歸",
         "P1": "明確驗收範圍之外的嚴重功能缺陷；掛起或永久阻塞；部分寫入",

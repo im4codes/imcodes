@@ -1660,6 +1660,13 @@ export function SessionSettingsDialog({
                       </label>
                     );
                   })}
+                  <div
+                    data-testid="audit-non-finding-policy"
+                    style={{ marginTop: 8, padding: '8px 10px', borderRadius: 6, background: '#0f172a', color: '#94a3b8', fontSize: 11, lineHeight: 1.5 }}
+                  >
+                    <strong style={{ color: '#cbd5e1' }}>{t('session.supervision.auditNonFindingTitle')}</strong>
+                    <div>{t('session.supervision.auditNonFindingHelp')}</div>
+                  </div>
                 </div>
 
               </div>

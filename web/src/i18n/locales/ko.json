@@ -796,6 +796,8 @@
       "auditBlockingSeverities": "감사 차단 등급",
       "auditBlockingSeveritiesHelp": "체크한 등급의 발견만 차단(REWORK)합니다. 체크하지 않은 등급은 비차단 후속 개선입니다. 기본값은 P0만이며 최소 한 개는 선택해야 합니다.",
       "auditBlockingSeveritiesAtLeastOne": "차단 등급은 최소 한 개 선택해야 합니다",
+      "auditNonFindingTitle": "감사 발견 사항이 아님",
+      "auditNonFindingHelp": "만들어 낸 요구사항, 범위 확대, 범위 밖 가정, 근거 없는 추측, 단순한 흠잡기, 그리고 인수 기준이나 적용 위협 모델에서 요구하지 않은 추가 보안 강화는 P0–P4 발견 사항이 아닙니다. REWORK, 후속 조치 또는 구현 요구에 사용할 수 없습니다.",
       "auditSeverity": {
         "P0": "데이터 손실·손상, 보안 취약점, 프로덕션 중단 또는 복구 불가, 명시적이고 추적 가능한 요구사항·인수 기준 미충족, 이번 변경으로 발생한 회귀",
         "P1": "명시적 인수 범위 밖의 중대한 기능 결함, 중단 또는 영구 차단, 부분 쓰기",

@@ -796,6 +796,8 @@
       "auditBlockingSeverities": "审计阻断等级",
       "auditBlockingSeveritiesHelp": "仅勾选等级的问题会阻断（REWORK）；未勾选等级为非阻断的后续改进。默认仅 P0，至少保留一项。",
       "auditBlockingSeveritiesAtLeastOne": "至少需要保留一个阻断等级",
+      "auditNonFindingTitle": "不构成审计问题",
+      "auditNonFindingHelp": "臆造需求、扩大范围、范围外假设、无证据猜测、单纯吹毛求疵，以及验收标准或适用威胁模型未要求的额外安全加固，不属于 P0–P4，不得触发 REWORK、写入后续改进或要求实现。",
       "auditSeverity": {
         "P0": "数据丢失或损坏、安全漏洞、生产不可用或不可恢复；未满足明确且可追溯的需求或验收标准；本次变更引入回归",
         "P1": "明确验收范围之外的严重功能缺陷；挂起或永久阻塞；部分写入",

@@ -796,6 +796,8 @@
       "auditBlockingSeverities": "Severidades de auditoría bloqueantes",
       "auditBlockingSeveritiesHelp": "Solo los hallazgos de los niveles marcados bloquean (REWORK). Los niveles sin marcar son mejoras no bloqueantes. Predeterminado: solo P0. Debe quedar al menos un nivel.",
       "auditBlockingSeveritiesAtLeastOne": "Debe quedar seleccionado al menos un nivel bloqueante",
+      "auditNonFindingTitle": "No son hallazgos",
+      "auditNonFindingHelp": "Los requisitos inventados, la ampliación del alcance, las hipótesis fuera de alcance, las especulaciones sin pruebas, las objeciones insignificantes y el refuerzo de seguridad no exigido por los criterios de aceptación o el modelo de amenazas aplicable no son hallazgos P0–P4. No pueden provocar REWORK, aparecer como seguimientos ni exigir implementación.",
       "auditSeverity": {
         "P0": "Pérdida o corrupción de datos, brecha de seguridad, caída de producción o estado irrecuperable; requisito explícito y trazable o criterio de aceptación incumplido; regresión introducida por este cambio",
         "P1": "Defecto funcional grave fuera de la aceptación explícita; bloqueo o suspensión permanente; escritura parcial",

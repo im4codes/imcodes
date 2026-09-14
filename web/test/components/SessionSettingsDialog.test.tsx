@@ -672,6 +672,9 @@ describe('SessionSettingsDialog supervision', () => {
     }
     // The single remaining level cannot be cleared.
     expect(severityBox('P0').disabled).toBe(true);
+    expect(screen.getByTestId('audit-non-finding-policy').textContent).toBe(
+      'auditNonFindingTitleauditNonFindingHelp',
+    );
     expect(screen.getByTestId('audit-blocking-summary').textContent).toBe('summaryAuditBlocking:P0');
   });
 
