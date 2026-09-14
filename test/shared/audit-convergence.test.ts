@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   AUDIT_BLOCKING_SEVERITIES,
+  AUDIT_NON_FINDING_POLICY,
   AUDIT_DEFAULT_BLOCKING_SEVERITIES,
   AUDIT_CONVERGENCE_CONTRACT_ID,
   AUDIT_SEVERITY_DEFINITIONS,
@@ -60,6 +61,18 @@ describe('audit convergence contract', () => {
     expect(AUDIT_SEVERITY_DEFINITIONS.P1).not.toMatch(/acceptance criterion|regression/);
   });
 
+  it('excludes invented or out-of-scope audit material from every severity and follow-up', () => {
+    const contract = JSON.parse(buildAuditConvergenceContract());
+    expect(contract.nonFinding).toEqual(AUDIT_NON_FINDING_POLICY);
+    expect(AUDIT_NON_FINDING_POLICY.rule).toMatch(/invented requirements/);
+    expect(AUDIT_NON_FINDING_POLICY.rule).toMatch(/out-of-scope hypotheses/);
+    expect(AUDIT_NON_FINDING_POLICY.rule).toMatch(/extra security hardening not required/);
+    expect(AUDIT_NON_FINDING_POLICY.handling).toMatch(/do not assign them any P0-P4 severity/);
+    expect(AUDIT_NON_FINDING_POLICY.handling).toMatch(/record them as non-blocking follow-ups/);
+    expect(AUDIT_NON_FINDING_POLICY.handling).toMatch(/request implementation/);
+    expect(AUDIT_NON_FINDING_POLICY.boundary).toMatch(/concrete in-scope defect/);
+  });
+
   it('explicitly forbids nitpicking or manufacturing findings', () => {
     const contract = JSON.parse(buildAuditConvergenceContract());
     expect(contract.antiNitpick.rule).toMatch(/never nitpick, manufacture, or inflate findings/);
@@ -75,6 +88,9 @@ describe('audit convergence contract', () => {
     const lines = buildAuditSeverityPolicyLines(['P1', 'P0']).join('\n');
     expect(lines).toContain('Blocking severities (current configuration): P0, P1.');
     expect(lines).toContain('Non-blocking severities: P2, P3, P4.');
+    expect(lines).toContain(`Non-findings: ${AUDIT_NON_FINDING_POLICY.rule}.`);
+    expect(lines).toContain(`Non-finding handling: ${AUDIT_NON_FINDING_POLICY.handling}.`);
+    expect(lines).toContain(`Non-finding boundary: ${AUDIT_NON_FINDING_POLICY.boundary}.`);
     expect(lines).toMatch(/Do not nitpick or manufacture findings/);
     for (const level of AUDIT_SEVERITY_LEVELS) {
       expect(lines).toContain(`- ${level}: ${AUDIT_SEVERITY_DEFINITIONS[level]}`);

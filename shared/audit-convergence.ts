@@ -55,6 +55,12 @@ export const AUDIT_SEVERITY_DEFINITIONS: Readonly<Record<AuditSeverity, string>>
   P4: 'style, naming, wording or optional improvement',
 };
 
+export const AUDIT_NON_FINDING_POLICY = {
+  rule: 'invented requirements, expanded scope, out-of-scope hypotheses, evidence-free speculation, pure nitpicks, and extra security hardening not required by the stated acceptance or applicable threat model are not findings',
+  handling: 'do not assign them any P0-P4 severity, use them for REWORK, record them as non-blocking follow-ups, or request implementation for them',
+  boundary: 'this exclusion does not hide a concrete in-scope defect, an unmet explicit acceptance criterion, or a regression causally introduced by the change',
+} as const;
+
 export const AUDIT_CONVERGENCE_ROLES = {
   ORCHESTRATOR: 'orchestrator',
   AUDITOR: 'auditor',
@@ -80,6 +86,7 @@ export function buildAuditConvergenceContract(): string {
       nonBlocking: 'every other severity: record as follow-ups; never REWORK, no separate re-audit',
       briefMayNotRaiseBar: true,
     },
+    nonFinding: AUDIT_NON_FINDING_POLICY,
     antiNitpick: {
       rule: 'never nitpick, manufacture, or inflate findings to justify REWORK; do not hunt for problems for their own sake',
       severity: 'assign the level that the definition actually matches, backed by concrete evidence; never upgrade a finding merely to reach a blocking level',
@@ -148,6 +155,9 @@ export function buildAuditSeverityPolicyLines(blocking: readonly AuditSeverity[]
   return [
     `Blocking severities (current configuration): ${levels.join(', ')}. Only findings at these levels justify REWORK.`,
     `Non-blocking severities: ${nonBlocking.length > 0 ? nonBlocking.join(', ') : 'none'}. Record them as follow-ups; they never justify REWORK.`,
+    `Non-findings: ${AUDIT_NON_FINDING_POLICY.rule}.`,
+    `Non-finding handling: ${AUDIT_NON_FINDING_POLICY.handling}.`,
+    `Non-finding boundary: ${AUDIT_NON_FINDING_POLICY.boundary}.`,
     'Do not nitpick or manufacture findings; assign the level the definition matches, with concrete evidence.',
     'Severity definitions:',
     ...AUDIT_SEVERITY_LEVELS.map((level) => `- ${level}: ${AUDIT_SEVERITY_DEFINITIONS[level]}`),
