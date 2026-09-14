@@ -48,9 +48,9 @@ export function normalizeAuditBlockingSeverities(value: unknown): AuditSeverity[
 }
 
 export const AUDIT_SEVERITY_DEFINITIONS: Readonly<Record<AuditSeverity, string>> = {
-  P0: 'data loss or corruption, security hole, production down or unrecoverable; fails an explicit, traceable user requirement or acceptance criterion; regression introduced by this change',
-  P1: 'serious functional defect outside explicit acceptance; hang or permanent block; partial write',
-  P2: 'edge-case, concurrency or error-path defect; changed behavior lacks a key test',
+  P0: 'release-blocking development failure: unmet explicit, traceable requirement or acceptance criterion; regression introduced by this change; reachable in-scope correctness defect in normal, edge, concurrency, error, retry, restart, or recovery behavior; changed behavior lacks a key causal test; data loss or corruption, security hole, production down or unrecoverable, hang or permanent block, or partial write',
+  P1: 'material product-quality or operability degradation while required behavior remains correct and a safe workaround exists',
+  P2: 'minor bounded quality issue outside required behavior with a correct safe fallback',
   P3: 'maintainability issue with no correctness impact',
   P4: 'style, naming, wording or optional improvement',
 };

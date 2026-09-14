@@ -799,9 +799,9 @@
       "auditNonFindingTitle": "No son hallazgos",
       "auditNonFindingHelp": "Los requisitos inventados, la ampliación del alcance, las hipótesis fuera de alcance, las especulaciones sin pruebas, las objeciones insignificantes y el refuerzo de seguridad no exigido por los criterios de aceptación o el modelo de amenazas aplicable no son hallazgos P0–P4. No pueden provocar REWORK, aparecer como seguimientos ni exigir implementación.",
       "auditSeverity": {
-        "P0": "Pérdida o corrupción de datos, brecha de seguridad, caída de producción o estado irrecuperable; requisito explícito y trazable o criterio de aceptación incumplido; regresión introducida por este cambio",
-        "P1": "Defecto funcional grave fuera de la aceptación explícita; bloqueo o suspensión permanente; escritura parcial",
-        "P2": "Defecto en casos límite, concurrencia o rutas de error; el cambio carece de una prueba clave",
+        "P0": "Fallo de desarrollo que bloquea la entrega: requisito explícito y trazable o criterio de aceptación incumplido; regresión introducida por este cambio; defecto de corrección alcanzable y dentro del alcance en rutas normales, límite, concurrentes, de error, reintento, reinicio o recuperación; el comportamiento modificado carece de una prueba causal clave; pérdida o corrupción de datos, brecha de seguridad, caída de producción o estado irrecuperable, bloqueo permanente o escritura parcial",
+        "P1": "Degradación importante de la calidad del producto o de la operabilidad mientras el comportamiento requerido sigue siendo correcto y existe una alternativa segura",
+        "P2": "Problema de calidad menor y acotado fuera del comportamiento requerido, con una alternativa correcta y segura",
         "P3": "Problema de mantenibilidad sin impacto en la corrección",
         "P4": "Estilo, nombres, redacción o mejora opcional"
       },

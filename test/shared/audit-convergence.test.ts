@@ -55,10 +55,19 @@ describe('audit convergence contract', () => {
     }
   });
 
-  it('classifies explicit requirement failures and introduced regressions as P0', () => {
-    expect(AUDIT_SEVERITY_DEFINITIONS.P0).toMatch(/explicit, traceable user requirement or acceptance criterion/);
+  it('uses a development-delivery P0 rather than a traditional incident-only severity', () => {
+    expect(AUDIT_SEVERITY_DEFINITIONS.P0).toMatch(/release-blocking development failure/);
+    expect(AUDIT_SEVERITY_DEFINITIONS.P0).toMatch(/explicit, traceable requirement or acceptance criterion/);
     expect(AUDIT_SEVERITY_DEFINITIONS.P0).toMatch(/regression introduced by this change/);
-    expect(AUDIT_SEVERITY_DEFINITIONS.P1).not.toMatch(/acceptance criterion|regression/);
+    expect(AUDIT_SEVERITY_DEFINITIONS.P0).toMatch(/normal, edge, concurrency, error, retry, restart, or recovery behavior/);
+    expect(AUDIT_SEVERITY_DEFINITIONS.P0).toMatch(/lacks a key causal test/);
+    expect(AUDIT_SEVERITY_DEFINITIONS.P0).toMatch(/data loss or corruption/);
+    expect(AUDIT_SEVERITY_DEFINITIONS.P0).toMatch(/hang or permanent block, or partial write/);
+    for (const level of ['P1', 'P2'] as const) {
+      expect(AUDIT_SEVERITY_DEFINITIONS[level]).not.toMatch(
+        /acceptance criterion|regression|correctness defect|key causal test|data loss|security hole|partial write/,
+      );
+    }
   });
 
   it('excludes invented or out-of-scope audit material from every severity and follow-up', () => {
