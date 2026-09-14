@@ -102,7 +102,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   en: {
     auditPreamble: 'Peer-audit mode: finish implementation and validation, but DO NOT stage, commit, push, merge, release, publish, or deploy before PASS.',
     auditEvidencePolicy: 'Audit evidence policy: briefs must say EVIDENCE ACCEPTANCE FIRST. After exact binding and coherence review, an implementer or teammate\'s structured test result is valid evidence and needs no duplicate run. Raw logs, transcripts, hashes, or bundle attachments are never PASS prerequisites; their absence must not cause REWORK. Never request an unconditional full test/typecheck/build rerun. Permit a minimal targeted counterexample only when the structured result conflicts with reviewed code/state or a concrete high-risk implementation gap exists; require rerunReason and never invent a result.',
-    reworkLoop: 'On REWORK, fix and validate immediately, then send the instructed reply-enabled re-audit; repeat until PASS or an exact blocker.',
+    reworkLoop: 'On REWORK, fix the whole defect class the findings describe -- every affected instance and call site, not only the exact reported counterexample -- and validate immediately, then send the instructed reply-enabled re-audit; repeat until PASS or an exact blocker.',
     continueTask: 'Continue the same task.', executionMode: 'Execution mode', actionHint: 'Supervisor hint (verify first)', gapHint: 'Reported gap (advisory)', reasonHint: 'Rationale (advisory)',
     ownContext: 'Use your own context: advance safe unfinished work now; do not stop at a summary or repeat completed work.',
     userRules: 'User supervision rules', taskContext: 'Task context', lastResult: 'Last result',
@@ -110,7 +110,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   'zh-CN': {
     auditPreamble: '同伴审计模式：先完成实现与验证；PASS 前不得暂存、提交、推送、合并、发布或部署。',
     auditEvidencePolicy: '审计证据策略：审计说明必须要求“先验收证据”。精确绑定并核对一致性后，实现者或队友提交的结构化测试结果即为有效证据，无需重复执行。原始日志、transcript、哈希或 bundle 附件绝不是 PASS 前提；缺少这些原始材料不得导致 REWORK。禁止无条件重跑完整测试/typecheck/build。仅当结构化结果与已审代码/状态矛盾，或存在具体高风险实现缺口时，才允许最小定向反例；必须记录 rerunReason，且不得伪造结果。',
-    reworkLoop: '收到 REWORK 后立即修复并验证，再按指示发送可回执复审；循环至 PASS 或明确阻断。',
+    reworkLoop: '收到 REWORK 后，修复发现所指的整类缺陷——覆盖每一个受影响的实例和调用点，不能只针对给出的那个具体反例——并立即验证，再按指示发送可回执复审；循环至 PASS 或明确阻断。',
     continueTask: '继续同一任务。', executionMode: '执行模式', actionHint: '监督提示（先核对）', gapHint: '监督报告缺口（仅供参考）', reasonHint: '监督理由（仅供参考）',
     ownContext: '以你自己的上下文为准：本轮立即推进可安全处理的未完成项；不要只做总结或重复已完成工作。',
     userRules: '用户监督规则', taskContext: '任务上下文', lastResult: '最近结果',
@@ -118,7 +118,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   'zh-TW': {
     auditPreamble: '同伴審計模式：先完成實作與驗證；PASS 前不得暫存、提交、推送、合併、發佈或部署。',
     auditEvidencePolicy: '審計證據策略：審計說明必須要求「先驗收證據」。精確綁定並核對一致性後，實作者或隊友提交的結構化測試結果即為有效證據，無需重複執行。原始日誌、transcript、雜湊或 bundle 附件絕不是 PASS 前提；缺少這些原始材料不得導致 REWORK。禁止無條件重跑完整測試/typecheck/build。僅當結構化結果與已審程式碼/狀態矛盾，或存在具體高風險實作缺口時，才允許最小定向反例；必須記錄 rerunReason，且不得捏造結果。',
-    reworkLoop: '收到 REWORK 後立即修復並驗證，再依指示發送可回執複審；循環至 PASS 或明確阻斷。',
+    reworkLoop: '收到 REWORK 後，修復發現所指的整類缺陷——涵蓋每一個受影響的實例與呼叫點，不能只針對給出的那個具體反例——並立即驗證，再依指示發送可回執複審；循環至 PASS 或明確阻斷。',
     continueTask: '繼續同一任務。', executionMode: '執行模式', actionHint: '監督提示（先核對）', gapHint: '監督回報缺口（僅供參考）', reasonHint: '監督理由（僅供參考）',
     ownContext: '以你自己的上下文為準：本輪立即推進可安全處理的未完成項；不要只做摘要或重複已完成工作。',
     userRules: '使用者監督規則', taskContext: '任務上下文', lastResult: '最近結果',
@@ -126,7 +126,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   es: {
     auditPreamble: 'Modo de auditoría: termina implementación y validación; antes de PASS no prepares, confirmes, envíes, fusiones, publiques ni despliegues.',
     auditEvidencePolicy: 'Política de evidencia: el informe debe exigir EVIDENCE ACCEPTANCE FIRST. Tras enlazar exactamente y revisar la coherencia, el resultado estructurado de una prueba aportado por el implementador o un compañero es evidencia válida y no requiere otra ejecución. Los registros sin procesar, transcripciones, hashes o adjuntos de bundle nunca son requisitos para PASS; su ausencia no debe causar REWORK. No ordenes repetir incondicionalmente toda la matriz de tests/typecheck/build. Permite un contraejemplo mínimo y dirigido solo si el resultado estructurado contradice el código/estado revisado o existe un riesgo concreto de implementación; registra rerunReason y nunca inventes un resultado.',
-    reworkLoop: 'Tras REWORK, corrige y valida de inmediato; luego envía la nueva auditoría con respuesta hasta PASS o un bloqueo exacto.',
+    reworkLoop: 'Tras REWORK, corrige toda la clase de defecto que describen los hallazgos -- cada instancia y punto de llamada afectado, no solo el contraejemplo exacto reportado -- y valida de inmediato; luego envía la nueva auditoría con respuesta hasta PASS o un bloqueo exacto.',
     continueTask: 'Continúa la misma tarea.', executionMode: 'Modo de ejecución', actionHint: 'Sugerencia del supervisor (verifica primero)', gapHint: 'Falta informada (orientativa)', reasonHint: 'Motivo (orientativo)',
     ownContext: 'Usa tu propio contexto: avanza ahora el trabajo pendiente seguro; no te detengas en un resumen ni repitas lo completado.',
     userRules: 'Reglas de supervisión del usuario', taskContext: 'Contexto de la tarea', lastResult: 'Último resultado',
@@ -134,7 +134,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   ru: {
     auditPreamble: 'Режим аудита: завершите реализацию и проверку; до PASS нельзя индексировать, коммитить, отправлять, сливать, публиковать или развёртывать.',
     auditEvidencePolicy: 'Политика доказательств: brief должен требовать EVIDENCE ACCEPTANCE FIRST. После точной привязки и проверки согласованности структурированный результат теста от исполнителя или коллеги является допустимым доказательством и не требует повторного запуска. Исходные журналы, transcripts, хэши и вложения bundle никогда не являются условиями PASS; их отсутствие не должно приводить к REWORK. Не требуйте безусловного повтора полного набора tests/typecheck/build. Минимальный направленный контрпример допустим только при противоречии структурированного результата проверенному коду/состоянию или при конкретном высоком риске реализации; фиксируйте rerunReason и никогда не выдумывайте результат.',
-    reworkLoop: 'После REWORK сразу исправьте и проверьте, затем отправьте указанную повторную проверку с ответом; повторяйте до PASS или точной блокировки.',
+    reworkLoop: 'После REWORK исправьте весь класс дефекта, который описывают выводы, -- каждый затронутый экземпляр и место вызова, а не только приведённый контрпример, -- и сразу проверьте, затем отправьте указанную повторную проверку с ответом; повторяйте до PASS или точной блокировки.',
     continueTask: 'Продолжайте ту же задачу.', executionMode: 'Режим выполнения', actionHint: 'Подсказка надзора (сначала проверьте)', gapHint: 'Указанный пробел (справочно)', reasonHint: 'Причина (справочно)',
     ownContext: 'Опирайтесь на свой контекст: сейчас продвигайте безопасную незавершённую работу; не останавливайтесь на отчёте и не повторяйте готовое.',
     userRules: 'Правила надзора пользователя', taskContext: 'Контекст задачи', lastResult: 'Последний результат',
@@ -142,7 +142,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   ja: {
     auditPreamble: 'ピア監査モード：実装と検証を完了し、PASS 前はステージ、コミット、プッシュ、マージ、公開、デプロイをしないでください。',
     auditEvidencePolicy: '監査証拠ポリシー：brief は EVIDENCE ACCEPTANCE FIRST を要求します。正確な binding と整合性確認後、実装者またはチームメイトの構造化テスト結果は有効な証拠であり、重複実行は不要です。raw log、transcript、hash、bundle 添付は PASS の前提ではなく、不在を理由に REWORK にしてはいけません。full test/typecheck/build の無条件再実行は禁止します。構造化結果が確認済みのコード/状態と矛盾する場合、または具体的な高リスク実装上の欠陥がある場合に限り、最小の定向反例を許可します。rerunReason を記録し、結果を捏造してはいけません。',
-    reworkLoop: 'REWORK 後は直ちに修正・検証し、指示された返信可能な再監査を送信してください。PASS または明確な障害まで繰り返します。',
+    reworkLoop: 'REWORK 後は、所見が示す欠陥のクラス全体——影響を受けるすべてのインスタンスと呼び出し箇所——を修正してください。報告された具体的な反例だけを直すのではありません。直ちに検証し、指示された返信可能な再監査を送信してください。PASS または明確な障害まで繰り返します。',
     continueTask: '同じタスクを続行してください。', executionMode: '実行モード', actionHint: '監督ヒント（先に確認）', gapHint: '報告された不足（参考）', reasonHint: '理由（参考）',
     ownContext: '自分の文脈を優先し、安全に進められる未完了作業を今すぐ進めてください。要約だけで止まらず、完了済み作業を繰り返さないでください。',
     userRules: 'ユーザーの監督ルール', taskContext: 'タスク文脈', lastResult: '直近の結果',
@@ -150,7 +150,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   ko: {
     auditPreamble: '동료 감사 모드: 구현과 검증을 완료하고 PASS 전에는 스테이징, 커밋, 푸시, 병합, 게시, 배포하지 마세요.',
     auditEvidencePolicy: '감사 증거 정책: brief는 EVIDENCE ACCEPTANCE FIRST를 요구해야 합니다. 정확한 binding과 일관성 검토 후 구현자나 팀 동료가 제출한 구조화된 테스트 결과는 유효한 증거이며 중복 실행이 필요하지 않습니다. 원시 로그, transcript, hash 또는 bundle 첨부물은 PASS의 전제 조건이 아니며, 없다는 이유로 REWORK하면 안 됩니다. 전체 test/typecheck/build의 무조건 재실행은 금지합니다. 구조화된 결과가 검토한 코드/상태와 충돌하거나 구체적인 고위험 구현 결함이 있을 때만 최소 정향 반례를 허용합니다. rerunReason을 기록하고 결과를 조작하지 마세요.',
-    reworkLoop: 'REWORK 후 즉시 수정·검증하고 안내된 회신 가능 재감사를 보내세요. PASS 또는 명확한 차단 사유까지 반복합니다.',
+    reworkLoop: 'REWORK 후에는 발견 사항이 가리키는 결함 전체 클래스—영향을 받는 모든 인스턴스와 호출 지점—를 수정하세요. 보고된 구체적 반례만 고치는 것이 아닙니다. 즉시 검증하고 안내된 회신 가능 재감사를 보내세요. PASS 또는 명확한 차단 사유까지 반복합니다.',
     continueTask: '같은 작업을 계속하세요.', executionMode: '실행 모드', actionHint: '감독 힌트(먼저 확인)', gapHint: '보고된 누락(참고)', reasonHint: '이유(참고)',
     ownContext: '자신의 문맥을 기준으로 지금 안전한 미완료 작업을 진행하세요. 요약만 하고 멈추거나 완료한 작업을 반복하지 마세요.',
     userRules: '사용자 감독 규칙', taskContext: '작업 문맥', lastResult: '최근 결과',

@@ -539,7 +539,8 @@ describe('supervision prompts', () => {
     expect(prompt).toContain('Do not call send_list_targets');
     expect(prompt).toContain('do not wait for the daemon or user to start this next audit');
     expect(prompt).toContain('self-prepared re-audit cycle until PASS');
-    expect(prompt).toContain('On REWORK, fix and validate immediately');
+    expect(prompt).toContain('On REWORK, fix the whole defect class the findings describe');
+    expect(prompt).toContain('not only the exact reported counterexample');
     expect(prompt).not.toContain('the daemon starts one fresh audit for the repaired revision');
     expect(prompt).not.toContain('Do not delegate or poll an auditor yourself');
     expect(prompt).toContain('Do not stage, commit, push, merge, release, publish, or deploy until a fresh matching audit returns PASS.');
@@ -1095,6 +1096,32 @@ describe('audit convergence contract on every supervision audit surface', () => 
       expect(prompt).toContain(ref);
       expect(prompt).toContain('"role":"implementer"');
       expect(prompt).not.toContain(body);
+    });
+
+    it(`tells the implementer to fix the whole defect class, not only the reported counterexample (${uiLocale})`, () => {
+      // A narrow patch to the exact reported instance is exactly what left the
+      // next call site/window open for the following REWORK round. The
+      // auditor's own brief already demands "whole class, not a minimal point
+      // patch" findings; the implementer's marching orders must say the same.
+      const wholeClassMarker: Record<(typeof locales)[number], string> = {
+        en: 'fix the whole defect class the findings describe',
+        'zh-CN': '修复发现所指的整类缺陷',
+        'zh-TW': '修復發現所指的整類缺陷',
+        es: 'corrige toda la clase de defecto que describen los hallazgos',
+        ru: 'исправьте весь класс дефекта, который описывают выводы',
+        ja: '所見が示す欠陥のクラス全体',
+        ko: '발견 사항이 가리키는 결함 전체 클래스',
+      };
+      const prompt = buildReworkBriefPrompt(
+        'deck_supervision_brain',
+        'Implement and deliver the fix',
+        'The first implementation is ready.',
+        'P1: the retry loop drops the last batch.',
+        { attempt: 1, limit: 3 },
+        'deck_sub_reviewer',
+        uiLocale,
+      );
+      expect(prompt).toContain(wholeClassMarker[uiLocale]);
     });
   }
 });
