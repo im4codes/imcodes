@@ -75,6 +75,11 @@ import {
   type UsageSessionKind,
   type UsageSyncStatus,
 } from '../../shared/usage-analytics.js';
+import {
+  CODEX_CREDIT_HISTORY_DEFAULT_LIMIT,
+  CODEX_CREDIT_HISTORY_MAX_LIMIT,
+  type CodexCreditSnapshot,
+} from '../../shared/codex-credit-history.js';
 
 const require = createRequire(import.meta.url);
 suppressSqliteExperimentalWarning();
@@ -634,6 +639,26 @@ function ensureDb(): DatabaseSyncInstance {
       ON context_turn_usage_sync(usage_authority_id, usage_fact_id);
     CREATE INDEX IF NOT EXISTS idx_turn_usage_sync_status_attempt
       ON context_turn_usage_sync(sync_status, next_attempt_at_ms, created_at_ms);
+
+    -- Codex account-level pay-as-you-go usage credit balance, snapshotted
+    -- every time a real (non-cached) account/rateLimits/read refresh
+    -- happens (src/agent/codex-runtime-config.ts). Account-level, not
+    -- per-session -- one row per refresh, not per session. Distinct from the
+    -- rate-limit "reset credits" (shared/codex-reset-credits.ts), which are
+    -- never persisted (they're a live-fetched, on-demand action list).
+    CREATE TABLE IF NOT EXISTS codex_credit_snapshots (
+      id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+      captured_at            INTEGER NOT NULL,
+      account_id             TEXT,
+      plan_type              TEXT,
+      balance                TEXT    NOT NULL,
+      has_credits            INTEGER NOT NULL,
+      unlimited              INTEGER NOT NULL,
+      five_hour_left_percent REAL,
+      weekly_left_percent    REAL
+    );
+    CREATE INDEX IF NOT EXISTS idx_codex_credit_snapshots_captured
+      ON codex_credit_snapshots(captured_at DESC);
   `);
   // Round-2 audit (0699ea64-3e6 finding A1): every daemon restart re-emits
   // historical `usage.update` events from JSONL replay (gemini-watcher's
@@ -2470,6 +2495,101 @@ export function recordTurnUsage(input: TurnUsageRecord): void {
     warnOncePerHour('mem.turn_usage.record_failed', {
       err: err instanceof Error ? err.message : String(err),
     });
+  }
+}
+
+type CodexCreditSnapshotRow = {
+  captured_at: number;
+  account_id: string | null;
+  plan_type: string | null;
+  balance: string;
+  has_credits: number;
+  unlimited: number;
+  five_hour_left_percent: number | null;
+  weekly_left_percent: number | null;
+};
+
+function codexCreditSnapshotFromRow(row: CodexCreditSnapshotRow): CodexCreditSnapshot {
+  return {
+    capturedAt: row.captured_at,
+    ...(row.account_id ? { accountId: row.account_id } : {}),
+    ...(row.plan_type ? { planType: row.plan_type } : {}),
+    balance: row.balance,
+    hasCredits: !!row.has_credits,
+    unlimited: !!row.unlimited,
+    ...(row.five_hour_left_percent != null ? { fiveHourLeftPercent: row.five_hour_left_percent } : {}),
+    ...(row.weekly_left_percent != null ? { weeklyLeftPercent: row.weekly_left_percent } : {}),
+  };
+}
+
+/**
+ * Record one Codex pay-as-you-go credit-balance snapshot. Best-effort, like
+ * `recordTurnUsage`: a recording failure MUST NOT throw into the caller's
+ * quota-refresh hot path.
+ *
+ * Deduplicates against the single latest row — an unchanged
+ * balance/hasCredits/unlimited triple (the common case: quota refreshes fire
+ * far more often than the balance actually changes) is skipped so idle
+ * periods don't spam identical rows on every refresh.
+ */
+export function recordCodexCreditSnapshot(
+  input: Omit<CodexCreditSnapshot, 'capturedAt'> & { capturedAt?: number },
+): void {
+  try {
+    const database = ensureDb();
+    const capturedAt = input.capturedAt ?? Date.now();
+    const latest = database.prepare(
+      'SELECT balance, has_credits, unlimited FROM codex_credit_snapshots ORDER BY id DESC LIMIT 1',
+    ).get() as { balance: string; has_credits: number; unlimited: number } | undefined;
+    const unchanged = !!latest
+      && latest.balance === input.balance
+      && !!latest.has_credits === input.hasCredits
+      && !!latest.unlimited === input.unlimited;
+    if (unchanged) return;
+    database.prepare(`
+      INSERT INTO codex_credit_snapshots (
+        captured_at, account_id, plan_type, balance, has_credits, unlimited,
+        five_hour_left_percent, weekly_left_percent
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      capturedAt,
+      input.accountId ?? null,
+      input.planType ?? null,
+      input.balance,
+      input.hasCredits ? 1 : 0,
+      input.unlimited ? 1 : 0,
+      input.fiveHourLeftPercent ?? null,
+      input.weeklyLeftPercent ?? null,
+    );
+  } catch (err) {
+    incrementCounter('mem.codex_credit_snapshot.record_failed', {});
+    warnOncePerHour('mem.codex_credit_snapshot.record_failed', {
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/** Most recent Codex credit-balance snapshots, newest first. */
+export function listCodexCreditSnapshots(input: { limit?: number; sinceMs?: number } = {}): CodexCreditSnapshot[] {
+  try {
+    const database = ensureDb();
+    const limit = Math.max(1, Math.min(
+      CODEX_CREDIT_HISTORY_MAX_LIMIT,
+      Math.trunc(input.limit ?? CODEX_CREDIT_HISTORY_DEFAULT_LIMIT),
+    ));
+    const rows = (input.sinceMs != null
+      ? database.prepare(
+        'SELECT * FROM codex_credit_snapshots WHERE captured_at >= ? ORDER BY captured_at DESC, id DESC LIMIT ?',
+      ).all(input.sinceMs, limit)
+      : database.prepare(
+        'SELECT * FROM codex_credit_snapshots ORDER BY captured_at DESC, id DESC LIMIT ?',
+      ).all(limit)) as CodexCreditSnapshotRow[];
+    return rows.map(codexCreditSnapshotFromRow);
+  } catch (err) {
+    warnOncePerHour('mem.codex_credit_snapshot.list_failed', {
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return [];
   }
 }
 

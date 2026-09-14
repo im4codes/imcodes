@@ -474,6 +474,8 @@ export function SessionPane({
           quotaLabel={session.quotaLabel}
           quotaUsageLabel={session.quotaUsageLabel}
           quotaMeta={session.quotaMeta}
+          codexCreditsBalance={session.codexCreditsBalance}
+          codexCreditsUnlimited={session.codexCreditsUnlimited}
           showCost={!!lastCostEvent}
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}

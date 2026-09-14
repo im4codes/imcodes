@@ -109,6 +109,16 @@ export interface SessionRecord extends SessionContextBootstrapState {
   /** Structured quota metadata for client-side countdown rendering. */
   quotaMeta?: ProviderQuotaMeta;
   /**
+   * Codex pay-as-you-go usage credit balance (bought once the plan's
+   * included 5h/weekly quota runs out) — decimal string, e.g. "12.50".
+   * DIFFERENT from the rate-limit "reset credits" affordance
+   * (shared/codex-reset-credits.ts), which is never persisted on the
+   * session record. See shared/codex-credit-history.ts.
+   */
+  codexCreditsBalance?: string;
+  codexCreditsHasCredits?: boolean;
+  codexCreditsUnlimited?: boolean;
+  /**
    * Machine-readable provider limit, from a canonical {@link ProviderLimitSignal}.
    *
    * Persisted deliberately. A limit that lived only in memory would be

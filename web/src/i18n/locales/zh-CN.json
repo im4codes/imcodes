@@ -3127,6 +3127,14 @@
     "error_app_server_timeout": "Codex 超时。",
     "error_invalid_params": "请求无效。"
   },
+  "codex_credit_balance": {
+    "title": "Codex 使用积分余额",
+    "history_title": "积分消耗记录",
+    "no_consumption": "暂无消耗记录",
+    "spent": "消耗 {{amount}}",
+    "balance_now": "余额 {{amount}}",
+    "error_generic": "请求失败。"
+  },
   "sessionUsage": {
     "title": "会话用量",
     "group": "整组合计",

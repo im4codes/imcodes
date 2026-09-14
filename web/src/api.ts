@@ -974,6 +974,9 @@ export interface SubSessionData {
   quotaLabel?: string | null;
   quotaUsageLabel?: string | null;
   quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null;
+  codexCreditsBalance?: string | null;
+  codexCreditsHasCredits?: boolean | null;
+  codexCreditsUnlimited?: boolean | null;
   effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null;
   serviceTier?: string | null;
   contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace'] | null;

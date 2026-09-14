@@ -65,6 +65,10 @@ export interface SessionInfo {
   quotaLabel?: string;
   quotaUsageLabel?: string;
   quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null;
+  /** Codex pay-as-you-go usage credit balance — see shared/codex-credit-history.ts. */
+  codexCreditsBalance?: string;
+  codexCreditsHasCredits?: boolean;
+  codexCreditsUnlimited?: boolean;
   effort?: import('../../shared/effort-levels.js').TransportEffortLevel;
   /**
    * Provider service tier for this session. Codex reports `priority` while its

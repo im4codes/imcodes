@@ -6424,6 +6424,15 @@ html.native-ios-mac .chat-dl-btn {
 .codex-credits-refresh { flex: 0 0 auto; width: 20px; height: 20px; display: inline-flex; align-items: center; justify-content: center; background: rgba(55,65,81,0.92); border: 1px solid rgba(148,163,184,0.24); border-radius: 5px; color: #c4b5fd; cursor: pointer; font-size: 12px; line-height: 1; padding: 0; }
 .codex-credits-refresh:hover:not(:disabled) { color: #ede9fe; border-color: rgba(196,181,253,0.5); background: rgba(76,29,149,0.5); }
 .codex-credits-refresh:disabled { cursor: not-allowed; opacity: 0.45; }
+.codex-credit-balance { position: relative; display: inline-flex; flex: 0 0 auto; }
+.codex-credit-balance-trigger { background: none; border: none; cursor: pointer; color: #34d399; font-size: 10px; line-height: 1.2; padding: 0 2px; white-space: nowrap; }
+.codex-credit-balance-trigger:hover { color: #6ee7b7; }
+.codex-credit-balance-panel { position: fixed; z-index: 10000; width: 280px; min-width: min(220px, calc(100vw - 16px)); box-sizing: border-box; overflow: auto; background: #1f2937; border: 1px solid #374151; border-radius: 6px; padding: 8px; box-shadow: 0 4px 16px rgba(0,0,0,0.4); font-size: 11px; text-align: left; }
+.codex-credit-balance-panel-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.codex-credit-balance-panel-title { min-width: 0; color: #e5e7eb; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.codex-credit-balance-refresh { flex: 0 0 auto; width: 20px; height: 20px; display: inline-flex; align-items: center; justify-content: center; background: rgba(55,65,81,0.92); border: 1px solid rgba(148,163,184,0.24); border-radius: 5px; color: #6ee7b7; cursor: pointer; font-size: 12px; line-height: 1; padding: 0; }
+.codex-credit-balance-refresh:hover:not(:disabled) { color: #d1fae5; border-color: rgba(110,231,183,0.5); background: rgba(6,78,59,0.5); }
+.codex-credit-balance-refresh:disabled { cursor: not-allowed; opacity: 0.45; }
 .session-ctx-input { position: absolute; left: 0; top: 0; height: 100%; background: linear-gradient(90deg, var(--chrome-accent-2), var(--chrome-accent)); border-radius: 999px; box-shadow: 0 0 10px rgba(52,211,153,0.42); }
 .session-ctx-cache { position: absolute; left: 0; top: 0; height: 100%; background: linear-gradient(90deg, var(--chrome-accent-3), #818cf8); border-radius: 999px; box-shadow: 0 0 10px rgba(129,140,248,0.36); }
 

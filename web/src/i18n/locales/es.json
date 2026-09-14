@@ -3127,6 +3127,14 @@
     "error_app_server_timeout": "Codex agotó el tiempo.",
     "error_invalid_params": "Solicitud no válida."
   },
+  "codex_credit_balance": {
+    "title": "Saldo de créditos de uso de Codex",
+    "history_title": "Consumo de créditos",
+    "no_consumption": "Sin consumo registrado",
+    "spent": "Gastado {{amount}}",
+    "balance_now": "saldo {{amount}}",
+    "error_generic": "Error de solicitud."
+  },
   "sessionUsage": {
     "title": "Uso de sesión",
     "group": "Todo el grupo",

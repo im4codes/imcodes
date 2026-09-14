@@ -3126,6 +3126,14 @@
     "error_app_server_timeout": "Codex 시간 초과.",
     "error_invalid_params": "잘못된 요청."
   },
+  "codex_credit_balance": {
+    "title": "Codex 사용 크레딧 잔액",
+    "history_title": "크레딧 소비 내역",
+    "no_consumption": "아직 소비 내역이 없습니다",
+    "spent": "{{amount}} 사용됨",
+    "balance_now": "잔액 {{amount}}",
+    "error_generic": "요청 실패."
+  },
   "sessionUsage": {
     "title": "세션 사용량",
     "group": "그룹 합계",

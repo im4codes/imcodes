@@ -3126,6 +3126,14 @@
     "error_app_server_timeout": "Codex がタイムアウトしました。",
     "error_invalid_params": "無効なリクエストです。"
   },
+  "codex_credit_balance": {
+    "title": "Codex 利用クレジット残高",
+    "history_title": "クレジット消費履歴",
+    "no_consumption": "消費履歴はまだありません",
+    "spent": "{{amount}} 消費",
+    "balance_now": "残高 {{amount}}",
+    "error_generic": "リクエストに失敗しました。"
+  },
   "sessionUsage": {
     "title": "セッション使用量",
     "group": "グループ合計",

@@ -462,6 +462,8 @@ export function SubSessionWindow({
     quotaLabel: sub.quotaLabel ?? undefined,
     quotaUsageLabel: sub.quotaUsageLabel ?? undefined,
     quotaMeta: sub.quotaMeta ?? undefined,
+    codexCreditsBalance: sub.codexCreditsBalance ?? undefined,
+    codexCreditsUnlimited: sub.codexCreditsUnlimited ?? undefined,
     effort: sub.effort ?? undefined,
     runtimeType: effectiveRuntimeType,
     sessionInstanceId: sub.sessionInstanceId ?? undefined,
@@ -1018,6 +1020,8 @@ export function SubSessionWindow({
           quotaLabel={sessionInfo?.quotaLabel}
           quotaUsageLabel={(sessionInfo?.agentType === 'codex' || sessionInfo?.agentType === 'codex-sdk') ? undefined : sessionInfo?.quotaUsageLabel}
           quotaMeta={sessionInfo?.quotaMeta}
+          codexCreditsBalance={sessionInfo?.codexCreditsBalance}
+          codexCreditsUnlimited={sessionInfo?.codexCreditsUnlimited}
           showCost={!!lastCostEvent}
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}

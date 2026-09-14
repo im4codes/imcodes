@@ -690,6 +690,9 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         quotaLabel: stored?.quotaLabel,
         quotaUsageLabel: stored?.quotaUsageLabel,
         quotaMeta: stored?.quotaMeta,
+        codexCreditsBalance: stored?.codexCreditsBalance,
+        codexCreditsHasCredits: stored?.codexCreditsHasCredits,
+        codexCreditsUnlimited: stored?.codexCreditsUnlimited,
         effort: sub.effort ?? stored?.effort,
         // Layer existing under server-provided so supervision set locally survives
         // a rebuild even when the server row still holds the default `{}`.

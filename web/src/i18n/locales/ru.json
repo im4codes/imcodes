@@ -3126,6 +3126,14 @@
     "error_app_server_timeout": "Codex не ответил.",
     "error_invalid_params": "Неверный запрос."
   },
+  "codex_credit_balance": {
+    "title": "Баланс кредитов использования Codex",
+    "history_title": "Расход кредитов",
+    "no_consumption": "Расход пока не зафиксирован",
+    "spent": "Потрачено {{amount}}",
+    "balance_now": "баланс {{amount}}",
+    "error_generic": "Ошибка запроса."
+  },
   "sessionUsage": {
     "title": "Использование сессии",
     "group": "Вся группа",

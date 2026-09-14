@@ -49,6 +49,9 @@ export interface SessionListItem extends SessionContextBootstrapState {
   quotaLabel?: string;
   quotaUsageLabel?: string;
   quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta;
+  codexCreditsBalance?: string;
+  codexCreditsHasCredits?: boolean;
+  codexCreditsUnlimited?: boolean;
   effort?: import('../../shared/effort-levels.js').TransportEffortLevel;
   /** Provider service tier, so a viewer can be warned about Codex's Fast tier. */
   serviceTier?: string;
@@ -173,6 +176,9 @@ function baseItem(s: SessionRecord): SessionListItem {
     quotaLabel: s.quotaLabel,
     quotaUsageLabel: s.quotaUsageLabel,
     quotaMeta: s.quotaMeta,
+    codexCreditsBalance: s.codexCreditsBalance,
+    codexCreditsHasCredits: s.codexCreditsHasCredits,
+    codexCreditsUnlimited: s.codexCreditsUnlimited,
     effort: s.effort,
     serviceTier: s.serviceTier,
     contextNamespace: s.contextNamespace,

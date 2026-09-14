@@ -6,6 +6,8 @@ import {
   claimContextJob,
   deleteMemory,
   clearDirtyTarget,
+  listCodexCreditSnapshots,
+  recordCodexCreditSnapshot,
   enqueueContextJob,
   ensureContextNamespace,
   estimateStagedTokenUpperBound,
@@ -1123,6 +1125,51 @@ describe('context-store', () => {
       const restored = afterRestore.find((r) => r.id === projection.id);
       expect(restored).toBeDefined();
       expect(restored!.status).toBe('active');
+    });
+  });
+
+  describe('Codex credit snapshots', () => {
+    it('records a snapshot and lists it back, newest first', () => {
+      recordCodexCreditSnapshot({
+        capturedAt: 1_000, planType: 'pro', balance: '10.00', hasCredits: true, unlimited: false,
+      });
+      recordCodexCreditSnapshot({
+        capturedAt: 2_000, planType: 'pro', balance: '7.50', hasCredits: true, unlimited: false,
+        fiveHourLeftPercent: 40, weeklyLeftPercent: 60,
+      });
+      const rows = listCodexCreditSnapshots();
+      expect(rows).toEqual([
+        {
+          capturedAt: 2_000, planType: 'pro', balance: '7.50', hasCredits: true, unlimited: false,
+          fiveHourLeftPercent: 40, weeklyLeftPercent: 60,
+        },
+        { capturedAt: 1_000, planType: 'pro', balance: '10.00', hasCredits: true, unlimited: false },
+      ]);
+    });
+
+    it('skips an unchanged reading so idle refreshes do not spam identical rows', () => {
+      recordCodexCreditSnapshot({ capturedAt: 1_000, balance: '5.00', hasCredits: true, unlimited: false });
+      recordCodexCreditSnapshot({ capturedAt: 2_000, balance: '5.00', hasCredits: true, unlimited: false });
+      expect(listCodexCreditSnapshots()).toHaveLength(1);
+      expect(listCodexCreditSnapshots()[0]!.capturedAt).toBe(1_000);
+    });
+
+    it('records a new row once the balance, hasCredits, or unlimited actually changes', () => {
+      recordCodexCreditSnapshot({ capturedAt: 1_000, balance: '5.00', hasCredits: true, unlimited: false });
+      recordCodexCreditSnapshot({ capturedAt: 2_000, balance: '4.00', hasCredits: true, unlimited: false });
+      recordCodexCreditSnapshot({ capturedAt: 3_000, balance: '4.00', hasCredits: false, unlimited: false });
+      recordCodexCreditSnapshot({ capturedAt: 4_000, balance: '4.00', hasCredits: false, unlimited: true });
+      const rows = listCodexCreditSnapshots();
+      expect(rows.map((r) => r.capturedAt)).toEqual([4_000, 3_000, 2_000, 1_000]);
+    });
+
+    it('respects limit and returns an empty list when nothing has been recorded', () => {
+      expect(listCodexCreditSnapshots()).toEqual([]);
+      for (let i = 0; i < 5; i++) {
+        recordCodexCreditSnapshot({ capturedAt: 1_000 + i, balance: String(i), hasCredits: true, unlimited: false });
+      }
+      const rows = listCodexCreditSnapshots({ limit: 2 });
+      expect(rows.map((r) => r.capturedAt)).toEqual([1_004, 1_003]);
     });
   });
 });

@@ -3127,6 +3127,14 @@
     "error_app_server_timeout": "Codex 逾時。",
     "error_invalid_params": "請求無效。"
   },
+  "codex_credit_balance": {
+    "title": "Codex 使用點數餘額",
+    "history_title": "點數消耗記錄",
+    "no_consumption": "尚無消耗記錄",
+    "spent": "消耗 {{amount}}",
+    "balance_now": "餘額 {{amount}}",
+    "error_generic": "請求失敗。"
+  },
   "sessionUsage": {
     "title": "工作階段用量",
     "group": "整組合計",
