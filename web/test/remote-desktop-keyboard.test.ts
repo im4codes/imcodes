@@ -3,37 +3,90 @@ import {
   detectRemoteDesktopClipboardShortcut,
   mapRemoteDesktopKeyboardEvent,
   REMOTE_DESKTOP_CLIPBOARD_SHORTCUT,
-  REMOTE_DESKTOP_MOBILE_SHORTCUTS,
+  REMOTE_DESKTOP_MOBILE_SHORTCUT_IDS,
+  remoteDesktopCommandBridge,
   remoteDesktopMobileDeletionKey,
+  remoteDesktopMobileShortcutKeys,
+  remoteDesktopShortcutLabel,
   sendRemoteDesktopChord,
 } from '../src/remote-desktop-keyboard.js';
 
 describe('remote desktop keyboard mapping', () => {
-  it('maps Apple Command transitions and chords to Windows Control', () => {
-    expect(mapRemoteDesktopKeyboardEvent({
-      code: 'MetaLeft', key: 'Meta', ctrlKey: false, altKey: false, metaKey: true,
-    }, 'MacIntel')).toEqual({
-      code: 'ControlLeft',
-      key: 'Control',
-      modifiers: { control: true, alt: false },
-      commandAsControl: true,
-    });
-    expect(mapRemoteDesktopKeyboardEvent({
-      code: 'KeyA', key: 'a', ctrlKey: false, altKey: false, metaKey: true,
-    }, 'MacIntel')?.modifiers).toEqual({ control: true, alt: false });
+  it('maps Apple Command transitions and chords to Control when the target is not also a Mac', () => {
+    // No target platform resolved yet (null) preserves the original
+    // Windows-only-target behavior, same as an explicit 'windows'/'linux' target.
+    for (const targetPlatform of [null, 'windows', 'linux'] as const) {
+      expect(mapRemoteDesktopKeyboardEvent({
+        code: 'MetaLeft', key: 'Meta', ctrlKey: false, altKey: false, metaKey: true,
+      }, 'MacIntel', targetPlatform)).toEqual({
+        code: 'ControlLeft',
+        key: 'Control',
+        modifiers: { control: true, alt: false },
+        commandAsControl: true,
+        usesCommandBridge: true,
+      });
+      expect(mapRemoteDesktopKeyboardEvent({
+        code: 'KeyA', key: 'a', ctrlKey: false, altKey: false, metaKey: true,
+      }, 'MacIntel', targetPlatform)?.modifiers).toEqual({ control: true, alt: false });
+    }
   });
 
-  it('keeps Windows Control and does not forward the local Windows key', () => {
-    expect(mapRemoteDesktopKeyboardEvent({
-      code: 'KeyA', key: 'a', ctrlKey: true, altKey: false, metaKey: false,
-    }, 'Win32')).toMatchObject({
-      code: 'KeyA',
-      modifiers: { control: true, alt: false },
-      commandAsControl: false,
-    });
+  it('forwards Command as itself, untranslated, when the target is also a Mac', () => {
+    // This is the fix: Control is not bound to anything on macOS (and can mean
+    // something else entirely, e.g. SIGINT in a terminal), so translating an
+    // Apple controller's Command to Control for a macOS target used to make
+    // every Command-based shortcut a silent no-op there.
     expect(mapRemoteDesktopKeyboardEvent({
       code: 'MetaLeft', key: 'Meta', ctrlKey: false, altKey: false, metaKey: true,
-    }, 'Win32')).toBeNull();
+    }, 'MacIntel', 'macos')).toEqual({
+      code: 'MetaLeft',
+      key: 'Meta',
+      modifiers: { control: false, alt: false },
+      commandAsControl: false,
+      usesCommandBridge: true,
+    });
+    expect(mapRemoteDesktopKeyboardEvent({
+      code: 'MetaRight', key: 'Meta', ctrlKey: false, altKey: false, metaKey: true,
+    }, 'MacIntel', 'macos')?.code).toBe('MetaRight');
+    // Held Command does not fold into "control" for a Mac target -- it is a
+    // different remote modifier, not a stand-in for one.
+    expect(mapRemoteDesktopKeyboardEvent({
+      code: 'KeyZ', key: 'z', ctrlKey: false, altKey: false, metaKey: true,
+    }, 'MacIntel', 'macos')).toMatchObject({
+      code: 'KeyZ',
+      modifiers: { control: false, alt: false },
+    });
+  });
+
+  it('keeps Windows Control and does not forward the local Windows key from a non-Apple controller, on any target', () => {
+    for (const targetPlatform of [null, 'windows', 'linux', 'macos'] as const) {
+      expect(mapRemoteDesktopKeyboardEvent({
+        code: 'KeyA', key: 'a', ctrlKey: true, altKey: false, metaKey: false,
+      }, 'Win32', targetPlatform)).toMatchObject({
+        code: 'KeyA',
+        modifiers: { control: true, alt: false },
+        commandAsControl: false,
+        usesCommandBridge: false,
+      });
+      expect(mapRemoteDesktopKeyboardEvent({
+        code: 'MetaLeft', key: 'Meta', ctrlKey: false, altKey: false, metaKey: true,
+      }, 'Win32', targetPlatform)).toBeNull();
+    }
+  });
+
+  it('resolves the command bridge for every controller/target pairing', () => {
+    expect(remoteDesktopCommandBridge('MacIntel', 'windows')).toEqual({
+      appleController: true, translateToControl: true, code: 'ControlLeft', key: 'Control',
+    });
+    expect(remoteDesktopCommandBridge('MacIntel', null)).toEqual({
+      appleController: true, translateToControl: true, code: 'ControlLeft', key: 'Control',
+    });
+    expect(remoteDesktopCommandBridge('MacIntel', 'macos')).toEqual({
+      appleController: true, translateToControl: false, code: 'MetaLeft', key: 'Meta',
+    });
+    expect(remoteDesktopCommandBridge('Win32', 'macos')).toEqual({
+      appleController: false, translateToControl: false, code: 'ControlLeft', key: 'Control',
+    });
   });
 
   it('presses a shortcut in order and releases it in reverse order', () => {
@@ -65,17 +118,58 @@ describe('remote desktop keyboard mapping', () => {
     expect(releaseAll).toHaveBeenCalledTimes(1);
   });
 
-  it('never offers a raw Control-chord copy/paste chip', () => {
-    // ControlLeft+KeyC/KeyV is not bound to copy/paste on a macOS remote host
-    // (and can mean something else entirely, e.g. SIGINT in a terminal), so a
-    // chip that blindly replayed it looked identical to a working press while
-    // silently doing nothing there. The dedicated copy/paste buttons answer
-    // both actions through the clipboard bridge instead, which works on every
-    // remote platform, so this row must never grow a raw-keystroke copy/paste
-    // entry again.
-    const ids = REMOTE_DESKTOP_MOBILE_SHORTCUTS.map((shortcut) => shortcut.id);
-    expect(ids).not.toContain('copy');
-    expect(ids).not.toContain('paste');
+  it('never offers a raw-keystroke copy/paste chip', () => {
+    // The dedicated copy/paste buttons answer both actions through the
+    // clipboard bridge instead, which works on every remote platform, so this
+    // row must never grow a raw-keystroke copy/paste entry again.
+    expect(REMOTE_DESKTOP_MOBILE_SHORTCUT_IDS).not.toContain('copy');
+    expect(REMOTE_DESKTOP_MOBILE_SHORTCUT_IDS).not.toContain('paste');
+  });
+
+  it('sends mobile shortcut chips in the TARGET platform own terms, not the controller\'s', () => {
+    // A chip click has no physical keypress behind it -- there is no
+    // controller convention to reconcile, only the target host's own binding.
+    // Control+A/C/V/X/Z/etc. is not bound to anything on macOS (and can mean
+    // something else entirely, e.g. SIGINT in a terminal for Ctrl+C), so this
+    // used to be a silent no-op on a macOS target while looking identical to
+    // a working press there.
+    expect(remoteDesktopMobileShortcutKeys('select_all', 'windows')).toEqual([
+      { code: 'ControlLeft', key: 'Control' }, { code: 'KeyA', key: 'a' },
+    ]);
+    expect(remoteDesktopMobileShortcutKeys('select_all', 'macos')).toEqual([
+      { code: 'MetaLeft', key: 'Meta' }, { code: 'KeyA', key: 'a' },
+    ]);
+    expect(remoteDesktopMobileShortcutKeys('select_all', null)).toEqual([
+      { code: 'ControlLeft', key: 'Control' }, { code: 'KeyA', key: 'a' },
+    ]);
+    // Redo differs by more than the modifier on a Mac target.
+    expect(remoteDesktopMobileShortcutKeys('redo', 'windows')).toEqual([
+      { code: 'ControlLeft', key: 'Control' }, { code: 'KeyY', key: 'y' },
+    ]);
+    expect(remoteDesktopMobileShortcutKeys('redo', 'macos')).toEqual([
+      { code: 'MetaLeft', key: 'Meta' }, { code: 'ShiftLeft', key: 'Shift' }, { code: 'KeyZ', key: 'z' },
+    ]);
+    // Window switching is Alt+Tab on Windows/Linux but Command+Tab on macOS.
+    expect(remoteDesktopMobileShortcutKeys('switch_window', 'windows')).toEqual([
+      { code: 'AltLeft', key: 'Alt' }, { code: 'Tab', key: 'Tab' },
+    ]);
+    expect(remoteDesktopMobileShortcutKeys('switch_window', 'macos')).toEqual([
+      { code: 'MetaLeft', key: 'Meta' }, { code: 'Tab', key: 'Tab' },
+    ]);
+    // Modifier-free shortcuts are unaffected by target platform.
+    expect(remoteDesktopMobileShortcutKeys('escape', 'macos')).toEqual([
+      { code: 'Escape', key: 'Escape' },
+    ]);
+  });
+
+  it('labels mobile shortcut chips for the target platform', () => {
+    expect(remoteDesktopShortcutLabel('select_all', 'windows')).toBe('Ctrl+A');
+    expect(remoteDesktopShortcutLabel('select_all', 'macos')).toBe('⌘+A');
+    expect(remoteDesktopShortcutLabel('redo', 'windows')).toBe('Ctrl+Y');
+    expect(remoteDesktopShortcutLabel('redo', 'macos')).toBe('⌘+⇧+Z');
+    expect(remoteDesktopShortcutLabel('switch_window', 'windows')).toBe('Alt+Tab');
+    expect(remoteDesktopShortcutLabel('switch_window', 'macos')).toBe('⌘+Tab');
+    expect(remoteDesktopShortcutLabel('escape', 'macos')).toBe('Esc');
   });
 
   it('maps mobile beforeinput deletion commands to remote editing keys', () => {

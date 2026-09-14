@@ -48,16 +48,18 @@ import {
   type RemoteDesktopManagedConnection,
 } from '../remote-desktop-connection-manager.js';
 import {
-  REMOTE_DESKTOP_MOBILE_SHORTCUTS,
-  isAppleControllerPlatform,
+  REMOTE_DESKTOP_MOBILE_SHORTCUT_IDS,
   detectRemoteDesktopClipboardShortcut,
   mapRemoteDesktopKeyboardEvent,
   readControllerPlatform,
+  remoteDesktopCommandBridge,
+  remoteDesktopMobileShortcutKeys,
   REMOTE_DESKTOP_CLIPBOARD_SHORTCUT,
   remoteDesktopMobileDeletionKey,
   remoteDesktopShortcutLabel,
   sendRemoteDesktopChord,
 } from '../remote-desktop-keyboard.js';
+import { resolveRemoteDesktopSessionProfile } from '@shared/remote-desktop-platform.js';
 import { formatByteRate, formatByteSize } from '../util/byte-size.js';
 import { copyToClipboardWhenReady } from '../util/clipboard.js';
 import type { WsClient } from '../ws-client.js';
@@ -549,6 +551,19 @@ export function RemoteDesktopPanel({
   }, [recordVideoDiagnostic]);
   const supportsDirectoryTransfer = Boolean(machine.capabilities?.includes(FILE_TRANSFER_DIRECTORY_CAPABILITY));
   const supportsPathHandleTransfer = Boolean(machine.capabilities?.includes(FILE_TRANSFER_PATH_HANDLE_CAPABILITY));
+  // Descriptive OS metadata (machine.os) is deliberately not authority here,
+  // matching the rest of the remote-desktop stack: this is the same
+  // capability-resolved platform the readiness/profile resolver already
+  // uses to decide what the session can do, now also used to decide what an
+  // Apple controller's Command key means on the wire for THIS target.
+  const targetPlatform = useMemo(
+    () => resolveRemoteDesktopSessionProfile(machine.capabilities)?.platform ?? null,
+    [machine.capabilities],
+  );
+  const commandBridge = useMemo(
+    () => remoteDesktopCommandBridge(readControllerPlatform(), targetPlatform),
+    [targetPlatform],
+  );
   const fetchSourcePath = supportsPathHandleTransfer
     ? (supportsDirectoryTransfer ? selectedRemoteFile : legacyFetchPath.trim())
     : '';
@@ -1557,12 +1572,12 @@ export function RemoteDesktopPanel({
   const suppressCommandControlForMiddleDrag = () => {
     const client = clientRef.current;
     if (!client) return;
-    const controlCodes = new Set(forwardedCommandCodesRef.current);
-    if (syntheticCommandControlRef.current) controlCodes.add('ControlLeft');
+    const commandCodes = new Set(forwardedCommandCodesRef.current);
+    if (syntheticCommandControlRef.current) commandCodes.add(commandBridge.code);
     let released = true;
-    for (const code of controlCodes) {
+    for (const code of commandCodes) {
       suppressedCommandCodesRef.current.add(code);
-      if (!client.key(code, 'Control', false, false, { control: false, alt: false })) {
+      if (!client.key(code, commandBridge.key, false, false, { control: false, alt: false })) {
         released = false;
       }
     }
@@ -1574,14 +1589,15 @@ export function RemoteDesktopPanel({
   // A failed release send (channel transiently not open) must not be treated
   // as done: the client's own contract says a failed up can be retried, and
   // the caller here has no future retry point since syntheticCommandControlRef
-  // is what gates whether ControlLeft is still considered forwarded. Fall back
-  // to releaseAll() -- exactly the same rescue suppressCommandControlForMiddleDrag
-  // uses above -- so a dropped release message cannot leave Control physically
-  // stuck down on the remote host for the rest of the session.
+  // is what gates whether the command code is still considered forwarded. Fall
+  // back to releaseAll() -- exactly the same rescue suppressCommandControlForMiddleDrag
+  // uses above -- so a dropped release message cannot leave Control (or, on a
+  // macOS target, Command) physically stuck down on the remote host for the
+  // rest of the session.
   const releaseSyntheticCommandControl = (altKey: boolean) => {
     const client = clientRef.current;
     if (!client) return;
-    const released = client.key('ControlLeft', 'Control', false, false, { control: false, alt: altKey });
+    const released = client.key(commandBridge.code, commandBridge.key, false, false, { control: false, alt: altKey });
     syntheticCommandControlRef.current = false;
     if (!released) client.releaseAll();
   };
@@ -1613,7 +1629,7 @@ export function RemoteDesktopPanel({
     const startsCommandMiddleDrag = down
       && event.button === 0
       && event.metaKey
-      && isAppleControllerPlatform(readControllerPlatform());
+      && commandBridge.appleController;
     const continuingCommandMiddleDrag = !down
       && commandMiddleDragPointerRef.current === event.pointerId;
     const eventButton: DesktopPointerButton | null = startsCommandMiddleDrag || continuingCommandMiddleDrag ? 'middle'
@@ -1718,7 +1734,7 @@ export function RemoteDesktopPanel({
     // second time (observed consistently in Safari).
     event.stopPropagation();
     const client = clientRef.current;
-    const mapped = mapRemoteDesktopKeyboardEvent(event);
+    const mapped = mapRemoteDesktopKeyboardEvent(event, undefined, targetPlatform);
     if (!client || !mapped) return;
     // Copy and paste are answered by the clipboard bridge rather than forwarded
     // blind: the two machines have separate clipboards, so the keystroke alone
@@ -1745,31 +1761,31 @@ export function RemoteDesktopPanel({
       return;
     }
     const commandEvent = event.code === 'MetaLeft' || event.code === 'MetaRight';
-    if (mapped.commandAsControl && commandEvent
+    if (mapped.usesCommandBridge && commandEvent
       && suppressedCommandCodesRef.current.has(mapped.code)
       && !syntheticCommandControlRef.current) {
       if (!down) suppressedCommandCodesRef.current.delete(mapped.code);
       event.preventDefault();
       return;
     }
-    if (mapped.commandAsControl && commandEvent) {
+    if (mapped.usesCommandBridge && commandEvent) {
       if (down) forwardedCommandCodesRef.current.add(mapped.code);
       else forwardedCommandCodesRef.current.delete(mapped.code);
       if (!down && syntheticCommandControlRef.current) {
         releaseSyntheticCommandControl(event.altKey);
       }
-    } else if (mapped.commandAsControl && event.metaKey
+    } else if (mapped.usesCommandBridge && event.metaKey
       && forwardedCommandCodesRef.current.size === 0
       && !syntheticCommandControlRef.current) {
       suppressedCommandCodesRef.current.clear();
       syntheticCommandControlRef.current = client.key(
-        'ControlLeft',
-        'Control',
+        commandBridge.code,
+        commandBridge.key,
         true,
         false,
-        { control: true, alt: event.altKey },
+        { control: commandBridge.translateToControl, alt: event.altKey },
       );
-    } else if (mapped.commandAsControl && !event.metaKey && syntheticCommandControlRef.current) {
+    } else if (mapped.usesCommandBridge && !event.metaKey && syntheticCommandControlRef.current) {
       releaseSyntheticCommandControl(event.altKey);
     }
     const sent = client.key(mapped.code, mapped.key, down, event.repeat, mapped.modifiers);
@@ -1779,7 +1795,7 @@ export function RemoteDesktopPanel({
       }
       event.preventDefault();
     }
-    if (mapped.commandAsControl && !commandEvent && !down && event.metaKey
+    if (mapped.usesCommandBridge && !commandEvent && !down && event.metaKey
       && forwardedCommandCodesRef.current.size === 0 && syntheticCommandControlRef.current) {
       releaseSyntheticCommandControl(event.altKey);
     }
@@ -2562,14 +2578,14 @@ export function RemoteDesktopPanel({
                 onKeyUp={(event) => event.stopPropagation()}
               />
               <div class="remote-desktop-mobile-shortcuts" aria-label={t('remote_desktop.mobile_shortcuts')}>
-                {REMOTE_DESKTOP_MOBILE_SHORTCUTS.map((shortcut) => (
+                {REMOTE_DESKTOP_MOBILE_SHORTCUT_IDS.map((id) => (
                   <button
-                    key={shortcut.id}
+                    key={id}
                     type="button"
-                    aria-label={t(`remote_desktop.shortcut_${shortcut.id}`)}
+                    aria-label={t(`remote_desktop.shortcut_${id}`)}
                     onPointerDown={(event) => event.preventDefault()}
-                    onClick={() => sendMobileShortcut(shortcut.keys)}
-                  >{remoteDesktopShortcutLabel(shortcut.id)}</button>
+                    onClick={() => sendMobileShortcut(remoteDesktopMobileShortcutKeys(id, targetPlatform))}
+                  >{remoteDesktopShortcutLabel(id, targetPlatform)}</button>
                 ))}
                 <button
                   type="button"

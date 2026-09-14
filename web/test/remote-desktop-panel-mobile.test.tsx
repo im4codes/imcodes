@@ -17,7 +17,26 @@ import {
   FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
 } from '@shared/transport/file-transfer.js';
 import { SESSION_STOP_COMMAND } from '@shared/session-control-commands.js';
+import { REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY } from '@shared/remote-desktop-access.js';
+import {
+  REMOTE_DESKTOP_CAPTURE_CAPABILITY,
+  REMOTE_DESKTOP_ENCODER_CAPABILITY,
+  REMOTE_DESKTOP_PLATFORM_CAPABILITY,
+  REMOTE_DESKTOP_SESSION_CAPABILITY,
+} from '@shared/remote-desktop-platform.js';
 import { DEFAULT_QUICK_PHRASES } from '../src/quick-commands.js';
+
+// A complete v3 macOS session profile, resolved by
+// resolveRemoteDesktopSessionProfile the same way RemoteDesktopPanel itself
+// resolves it: this is what makes the command bridge choose Command over
+// Control for an Apple controller's shortcuts.
+const MAC_TARGET_CAPABILITIES = [
+  REMOTE_DESKTOP_SESSION_CAPABILITY,
+  REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS,
+  REMOTE_DESKTOP_CAPTURE_CAPABILITY.MACOS_SCREEN_CAPTURE_KIT,
+  REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+  REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+] as const;
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string) => key }),
@@ -1621,6 +1640,110 @@ describe('RemoteDesktopPanel mobile gestures', () => {
         ['ControlLeft', 'Control', false, false, { control: false, alt: false }],
       ]);
       expect(pointerButton).not.toHaveBeenCalledWith('left', true, expect.anything(), expect.anything());
+    } finally {
+      Object.defineProperty(navigator, 'platform', {
+        configurable: true,
+        value: originalPlatform,
+      });
+    }
+  });
+
+  it('forwards Command-based shortcuts to a macOS target as Command, not Control', async () => {
+    // Control is not bound to anything on macOS (and can mean something else
+    // entirely, e.g. SIGINT in a terminal), so translating Command to
+    // Control for a macOS target made every Command shortcut -- copy, paste,
+    // undo, save, all of it -- a silent no-op there.
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', {
+      configurable: true,
+      value: 'MacIntel',
+    });
+    try {
+      const { stage } = await renderPanel(undefined, [...MAC_TARGET_CAPABILITIES]);
+      act(() => stage.dispatchEvent(new KeyboardEvent('keydown', {
+        bubbles: true,
+        cancelable: true,
+        code: 'MetaLeft',
+        key: 'Meta',
+        metaKey: true,
+      })));
+      act(() => stage.dispatchEvent(new KeyboardEvent('keydown', {
+        bubbles: true,
+        cancelable: true,
+        code: 'KeyZ',
+        key: 'z',
+        metaKey: true,
+      })));
+      act(() => stage.dispatchEvent(new KeyboardEvent('keyup', {
+        bubbles: true,
+        cancelable: true,
+        code: 'KeyZ',
+        key: 'z',
+        metaKey: true,
+      })));
+      act(() => stage.dispatchEvent(new KeyboardEvent('keyup', {
+        bubbles: true,
+        cancelable: true,
+        code: 'MetaLeft',
+        key: 'Meta',
+      })));
+
+      expect(key.mock.calls).toEqual([
+        ['MetaLeft', 'Meta', true, false, { control: false, alt: false }],
+        ['KeyZ', 'z', true, false, { control: false, alt: false }],
+        ['KeyZ', 'z', false, false, { control: false, alt: false }],
+        ['MetaLeft', 'Meta', false, false, { control: false, alt: false }],
+      ]);
+      expect(key).not.toHaveBeenCalledWith('ControlLeft', expect.anything(), expect.anything(), expect.anything(), expect.anything());
+    } finally {
+      Object.defineProperty(navigator, 'platform', {
+        configurable: true,
+        value: originalPlatform,
+      });
+    }
+  });
+
+  it('suppresses Command, not Control, during a middle-drag on a macOS target', async () => {
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', {
+      configurable: true,
+      value: 'MacIntel',
+    });
+    try {
+      const { stage } = await renderPanel(undefined, [...MAC_TARGET_CAPABILITIES]);
+      act(() => stage.dispatchEvent(new KeyboardEvent('keydown', {
+        bubbles: true,
+        cancelable: true,
+        code: 'MetaLeft',
+        key: 'Meta',
+        metaKey: true,
+      })));
+      expect(key).toHaveBeenCalledWith('MetaLeft', 'Meta', true, false, {
+        control: false,
+        alt: false,
+      });
+
+      mousePointer(stage, 'pointerdown', {
+        pointerId: 20, clientX: 200, clientY: 150, metaKey: true,
+      });
+      mousePointer(stage, 'pointerup', {
+        pointerId: 20, clientX: 200, clientY: 150, metaKey: false,
+      });
+      act(() => stage.dispatchEvent(new KeyboardEvent('keyup', {
+        bubbles: true,
+        cancelable: true,
+        code: 'MetaLeft',
+        key: 'Meta',
+      })));
+
+      expect(pointerButton).toHaveBeenCalledWith('middle', true, expect.anything(), expect.anything());
+      // The middle-drag start must release the SAME code it forwarded (Meta,
+      // not Control) -- otherwise Command stays physically down on the
+      // remote Mac for the rest of the drag and beyond.
+      expect(key.mock.calls).toEqual([
+        ['MetaLeft', 'Meta', true, false, { control: false, alt: false }],
+        ['MetaLeft', 'Meta', false, false, { control: false, alt: false }],
+      ]);
     } finally {
       Object.defineProperty(navigator, 'platform', {
         configurable: true,

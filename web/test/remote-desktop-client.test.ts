@@ -1851,7 +1851,11 @@ describe('RemoteDesktopClient', () => {
 
   it('denies unknown keys and secure-attention input before the DataChannel', () => {
     expect(isRemoteDesktopKeyAllowed('KeyA', { control: false, alt: false })).toBe(true);
-    expect(isRemoteDesktopKeyAllowed('MetaLeft', { control: false, alt: false })).toBe(false);
+    // Command needs to reach a macOS target as itself (remote-desktop-keyboard's
+    // command bridge decides WHEN to forward it; this is just the wire allowlist,
+    // which must not block it on every target the way it used to).
+    expect(isRemoteDesktopKeyAllowed('MetaLeft', { control: false, alt: false })).toBe(true);
+    expect(isRemoteDesktopKeyAllowed('MetaRight', { control: false, alt: false })).toBe(true);
     expect(isRemoteDesktopKeyAllowed('Delete', { control: true, alt: true })).toBe(false);
     expect(isRemoteDesktopKeyAllowed('FutureKey', { control: false, alt: false })).toBe(false);
   });
