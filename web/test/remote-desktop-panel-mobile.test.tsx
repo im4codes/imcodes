@@ -17,7 +17,26 @@ import {
   FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
 } from '@shared/transport/file-transfer.js';
 import { SESSION_STOP_COMMAND } from '@shared/session-control-commands.js';
+import { REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY } from '@shared/remote-desktop-access.js';
+import {
+  REMOTE_DESKTOP_CAPTURE_CAPABILITY,
+  REMOTE_DESKTOP_ENCODER_CAPABILITY,
+  REMOTE_DESKTOP_PLATFORM_CAPABILITY,
+  REMOTE_DESKTOP_SESSION_CAPABILITY,
+} from '@shared/remote-desktop-platform.js';
 import { DEFAULT_QUICK_PHRASES } from '../src/quick-commands.js';
+
+// A complete v3 macOS session profile, resolved by
+// resolveRemoteDesktopSessionProfile the same way RemoteDesktopPanel itself
+// resolves it: this is what makes the command bridge choose Command over
+// Control for an Apple controller's shortcuts.
+const MAC_TARGET_CAPABILITIES = [
+  REMOTE_DESKTOP_SESSION_CAPABILITY,
+  REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS,
+  REMOTE_DESKTOP_CAPTURE_CAPABILITY.MACOS_SCREEN_CAPTURE_KIT,
+  REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+  REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+] as const;
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string) => key }),
@@ -1293,6 +1312,32 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith('selected remotely');
   });
 
+  it('shows a clipboard result as a floating toast that fades on its own', async () => {
+    // The toolbar used to reserve a permanent min-width column for this text,
+    // empty most of the time. It is now only in the DOM while a result is
+    // actually showing, and clears itself instead of sitting stale forever.
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: {
+        readText: vi.fn(async () => 'local clipboard'),
+        writeText: vi.fn(async () => {}),
+      },
+    });
+    const { container, getByRole } = await renderPanel();
+    expect(container.querySelector('.remote-desktop-clipboard-toast')).toBeNull();
+
+    vi.useFakeTimers();
+    await act(async () => {
+      (getByRole('button', { name: 'common.copy' }) as HTMLButtonElement).click();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const toast = container.querySelector('.remote-desktop-clipboard-toast');
+    expect(toast?.textContent).toBe('remote_desktop.clipboard_copied');
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_800); });
+    expect(container.querySelector('.remote-desktop-clipboard-toast')).toBeNull();
+  });
+
   it('keeps the mobile IME focused, commits composed text once, and sends shortcut chords', async () => {
     const { container, getByRole } = await renderPanel();
     const keyboardButton = getByRole('button', { name: 'remote_desktop.mobile_keyboard' });
@@ -1369,6 +1414,76 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       ['ControlLeft', 'Control', false, false, { control: true, alt: false }],
     ]);
     expect(container.querySelector('.remote-desktop-mobile-keyboard')).not.toBeNull();
+  });
+
+  it('docks the mobile keyboard below the stage instead of layering it on top', async () => {
+    const { container, getByRole } = await renderPanel();
+    act(() => { (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });
+
+    const stage = container.querySelector('.remote-desktop-stage');
+    const keyboard = container.querySelector('.remote-desktop-mobile-keyboard');
+    expect(keyboard).not.toBeNull();
+    // A sibling of the stage, not a child of it -- so it takes its own space
+    // in the panel layout instead of covering the video.
+    expect(stage!.contains(keyboard)).toBe(false);
+    expect(getByRole('textbox', { name: 'remote_desktop.mobile_text_input' })).toBeDefined();
+
+    act(() => {
+      (getByRole('tab', { name: 'remote_desktop.mobile_keyboard_tab_keys' }) as HTMLButtonElement).click();
+    });
+    expect(container.querySelector('[aria-label="remote_desktop.mobile_text_input"]')).toBeNull();
+    expect(container.querySelector('.remote-desktop-computer-keyboard')).not.toBeNull();
+
+    act(() => {
+      (getByRole('tab', { name: 'remote_desktop.mobile_keyboard_tab_ime' }) as HTMLButtonElement).click();
+    });
+    expect(getByRole('textbox', { name: 'remote_desktop.mobile_text_input' })).toBeDefined();
+  });
+
+  it('sends a standalone computer-keyboard key, then one chord per combo-mode cycle', async () => {
+    const { container, getByRole } = await renderPanel();
+    act(() => { (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });
+    act(() => {
+      (getByRole('tab', { name: 'remote_desktop.mobile_keyboard_tab_keys' }) as HTMLButtonElement).click();
+    });
+    const keyButton = (label: string) => Array.from(
+      container.querySelectorAll<HTMLButtonElement>('.remote-desktop-computer-keyboard-row button'),
+    ).find((button) => button.textContent === label)!;
+
+    key.mockClear();
+    act(() => { keyButton('F5').click(); });
+    expect(key.mock.calls).toEqual([
+      ['F5', 'F5', true, false, { control: false, alt: false }],
+      ['F5', 'F5', false, false, { control: false, alt: false }],
+    ]);
+
+    const comboToggle = getByRole('checkbox', { name: 'remote_desktop.combo_mode' }) as HTMLInputElement;
+    act(() => { fireEvent.click(comboToggle); });
+    expect(comboToggle.checked).toBe(true);
+
+    key.mockClear();
+    act(() => { keyButton('Control').click(); });
+    expect(keyButton('Control').getAttribute('aria-pressed')).toBe('true');
+    act(() => { keyButton('Shift').click(); });
+    act(() => { keyButton('F5').click(); });
+    expect(key.mock.calls).toEqual([
+      ['ControlLeft', 'Control', true, false, { control: true, alt: false }],
+      ['ShiftLeft', 'Shift', true, false, { control: true, alt: false }],
+      ['F5', 'F5', true, false, { control: true, alt: false }],
+      ['F5', 'F5', false, false, { control: true, alt: false }],
+      ['ShiftLeft', 'Shift', false, false, { control: true, alt: false }],
+      ['ControlLeft', 'Control', false, false, { control: false, alt: false }],
+    ]);
+    // One-shot: firing the chord released the latch instead of leaving it
+    // held for whatever the operator taps next.
+    expect(keyButton('Control').getAttribute('aria-pressed')).toBe('false');
+
+    key.mockClear();
+    act(() => { keyButton('Shift').click(); }); // latch Shift only, then navigate away
+    act(() => {
+      (getByRole('tab', { name: 'remote_desktop.mobile_keyboard_tab_ime' }) as HTMLButtonElement).click();
+    });
+    expect(key).toHaveBeenCalledWith('ShiftLeft', 'Shift', false, false, { control: false, alt: false });
   });
 
   it('opens the focused display resolution menu from the keyboard context-menu gesture', async () => {
@@ -1600,6 +1715,154 @@ describe('RemoteDesktopPanel mobile gestures', () => {
         configurable: true,
         value: originalPlatform,
       });
+    }
+  });
+
+  it('forwards Command-based shortcuts to a macOS target as Command, not Control', async () => {
+    // Control is not bound to anything on macOS (and can mean something else
+    // entirely, e.g. SIGINT in a terminal), so translating Command to
+    // Control for a macOS target made every Command shortcut -- copy, paste,
+    // undo, save, all of it -- a silent no-op there.
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', {
+      configurable: true,
+      value: 'MacIntel',
+    });
+    try {
+      const { stage } = await renderPanel(undefined, [...MAC_TARGET_CAPABILITIES]);
+      act(() => stage.dispatchEvent(new KeyboardEvent('keydown', {
+        bubbles: true,
+        cancelable: true,
+        code: 'MetaLeft',
+        key: 'Meta',
+        metaKey: true,
+      })));
+      act(() => stage.dispatchEvent(new KeyboardEvent('keydown', {
+        bubbles: true,
+        cancelable: true,
+        code: 'KeyZ',
+        key: 'z',
+        metaKey: true,
+      })));
+      act(() => stage.dispatchEvent(new KeyboardEvent('keyup', {
+        bubbles: true,
+        cancelable: true,
+        code: 'KeyZ',
+        key: 'z',
+        metaKey: true,
+      })));
+      act(() => stage.dispatchEvent(new KeyboardEvent('keyup', {
+        bubbles: true,
+        cancelable: true,
+        code: 'MetaLeft',
+        key: 'Meta',
+      })));
+
+      expect(key.mock.calls).toEqual([
+        ['MetaLeft', 'Meta', true, false, { control: false, alt: false }],
+        ['KeyZ', 'z', true, false, { control: false, alt: false }],
+        ['KeyZ', 'z', false, false, { control: false, alt: false }],
+        ['MetaLeft', 'Meta', false, false, { control: false, alt: false }],
+      ]);
+      expect(key).not.toHaveBeenCalledWith('ControlLeft', expect.anything(), expect.anything(), expect.anything(), expect.anything());
+    } finally {
+      Object.defineProperty(navigator, 'platform', {
+        configurable: true,
+        value: originalPlatform,
+      });
+    }
+  });
+
+  it('suppresses Command, not Control, during a middle-drag on a macOS target', async () => {
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', {
+      configurable: true,
+      value: 'MacIntel',
+    });
+    try {
+      const { stage } = await renderPanel(undefined, [...MAC_TARGET_CAPABILITIES]);
+      act(() => stage.dispatchEvent(new KeyboardEvent('keydown', {
+        bubbles: true,
+        cancelable: true,
+        code: 'MetaLeft',
+        key: 'Meta',
+        metaKey: true,
+      })));
+      expect(key).toHaveBeenCalledWith('MetaLeft', 'Meta', true, false, {
+        control: false,
+        alt: false,
+      });
+
+      mousePointer(stage, 'pointerdown', {
+        pointerId: 20, clientX: 200, clientY: 150, metaKey: true,
+      });
+      mousePointer(stage, 'pointerup', {
+        pointerId: 20, clientX: 200, clientY: 150, metaKey: false,
+      });
+      act(() => stage.dispatchEvent(new KeyboardEvent('keyup', {
+        bubbles: true,
+        cancelable: true,
+        code: 'MetaLeft',
+        key: 'Meta',
+      })));
+
+      expect(pointerButton).toHaveBeenCalledWith('middle', true, expect.anything(), expect.anything());
+      // The middle-drag start must release the SAME code it forwarded (Meta,
+      // not Control) -- otherwise Command stays physically down on the
+      // remote Mac for the rest of the drag and beyond.
+      expect(key.mock.calls).toEqual([
+        ['MetaLeft', 'Meta', true, false, { control: false, alt: false }],
+        ['MetaLeft', 'Meta', false, false, { control: false, alt: false }],
+      ]);
+    } finally {
+      Object.defineProperty(navigator, 'platform', {
+        configurable: true,
+        value: originalPlatform,
+      });
+    }
+  });
+
+  it('falls back to releaseAll when the synthetic Control release fails to send', async () => {
+    // A transient data-channel hiccup can make the release send return false
+    // without tearing down the session. If that dropped "up" were treated as
+    // done, the remote host's real Control key would stay physically down for
+    // the rest of the session -- exactly what was observed live on a Mac
+    // host, surfacing as every left click behaving like a right click.
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', {
+      configurable: true,
+      value: 'MacIntel',
+    });
+    key.mockImplementation((code: string, _label: string, down: boolean) => !(code === 'ControlLeft' && down === false));
+    try {
+      const { stage } = await renderPanel();
+      act(() => stage.dispatchEvent(new KeyboardEvent('keydown', {
+        bubbles: true,
+        cancelable: true,
+        code: 'KeyA',
+        key: 'a',
+        metaKey: true,
+      })));
+      expect(key).toHaveBeenCalledWith('ControlLeft', 'Control', true, false, { control: true, alt: false });
+      expect(releaseAll).not.toHaveBeenCalled();
+
+      act(() => stage.dispatchEvent(new KeyboardEvent('keyup', {
+        bubbles: true,
+        cancelable: true,
+        code: 'KeyA',
+        key: 'a',
+        metaKey: true,
+      })));
+
+      expect(key).toHaveBeenCalledWith('ControlLeft', 'Control', false, false, { control: false, alt: false });
+      expect(releaseAll).toHaveBeenCalledTimes(1);
+    } finally {
+      Object.defineProperty(navigator, 'platform', {
+        configurable: true,
+        value: originalPlatform,
+      });
+      key.mockReset();
+      key.mockImplementation(() => true);
     }
   });
 

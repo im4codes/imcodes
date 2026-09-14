@@ -48,16 +48,22 @@ import {
   type RemoteDesktopManagedConnection,
 } from '../remote-desktop-connection-manager.js';
 import {
-  REMOTE_DESKTOP_MOBILE_SHORTCUTS,
-  isAppleControllerPlatform,
+  REMOTE_DESKTOP_MOBILE_SHORTCUT_IDS,
+  REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS,
   detectRemoteDesktopClipboardShortcut,
   mapRemoteDesktopKeyboardEvent,
   readControllerPlatform,
+  remoteDesktopCommandBridge,
+  remoteDesktopComputerKeyLabel,
+  remoteDesktopMobileShortcutKeys,
   REMOTE_DESKTOP_CLIPBOARD_SHORTCUT,
   remoteDesktopMobileDeletionKey,
   remoteDesktopShortcutLabel,
   sendRemoteDesktopChord,
+  type RemoteDesktopChordKey,
+  type RemoteDesktopComputerKeySpec,
 } from '../remote-desktop-keyboard.js';
+import { resolveRemoteDesktopSessionProfile } from '@shared/remote-desktop-platform.js';
 import { formatByteRate, formatByteSize } from '../util/byte-size.js';
 import { copyToClipboardWhenReady } from '../util/clipboard.js';
 import type { WsClient } from '../ws-client.js';
@@ -90,6 +96,7 @@ import {
 
 type ViewScale = 'fit' | 'actual';
 type MobileInputMode = 'touch' | 'mouse';
+type MobileKeyboardTab = 'ime' | 'keys';
 type ClipboardStatus = 'idle' | 'copying' | 'copied' | 'pasting' | 'pasted' | 'empty' | 'failed';
 type DesktopPointerMoveSource =
   | 'window-mouse'
@@ -207,6 +214,8 @@ function displayModeOptions(
 
 /** How long a refused-command notice stays up before it fades on its own. */
 const CONTROL_NOTICE_MS = 6_000;
+/** How long the clipboard toast stays up before it fades on its own. */
+const CLIPBOARD_STATUS_TOAST_MS = 1_800;
 const REMOTE_DESKTOP_QUICK_INPUT_Z_INDEX = 10_050;
 const TOUCH_LONG_PRESS_MS = 550;
 const TOUCH_DOUBLE_TAP_MS = 400;
@@ -366,6 +375,11 @@ export function RemoteDesktopPanel({
   const [legacyFetchPath, setLegacyFetchPath] = useState('');
   const [fileDropActive, setFileDropActive] = useState(false);
   const [mobileTextOpen, setMobileTextOpen] = useState(false);
+  const [mobileKeyboardTab, setMobileKeyboardTab] = useState<MobileKeyboardTab>('ime');
+  const [comboMode, setComboMode] = useState(false);
+  // Modifiers latched down in combo mode, waiting for either a second tap
+  // (release) or a non-modifier key tap (fire the chord, then auto-release).
+  const [heldComboKeys, setHeldComboKeys] = useState<readonly RemoteDesktopChordKey[]>([]);
   const [quickInputOpen, setQuickInputOpen] = useState(false);
   const [quickInputPortalContainer, setQuickInputPortalContainer] = useState<Element | null>(null);
   const [displayModeMenu, setDisplayModeMenu] = useState<DisplayModeMenuState | null>(null);
@@ -547,6 +561,19 @@ export function RemoteDesktopPanel({
   }, [recordVideoDiagnostic]);
   const supportsDirectoryTransfer = Boolean(machine.capabilities?.includes(FILE_TRANSFER_DIRECTORY_CAPABILITY));
   const supportsPathHandleTransfer = Boolean(machine.capabilities?.includes(FILE_TRANSFER_PATH_HANDLE_CAPABILITY));
+  // Descriptive OS metadata (machine.os) is deliberately not authority here,
+  // matching the rest of the remote-desktop stack: this is the same
+  // capability-resolved platform the readiness/profile resolver already
+  // uses to decide what the session can do, now also used to decide what an
+  // Apple controller's Command key means on the wire for THIS target.
+  const targetPlatform = useMemo(
+    () => resolveRemoteDesktopSessionProfile(machine.capabilities)?.platform ?? null,
+    [machine.capabilities],
+  );
+  const commandBridge = useMemo(
+    () => remoteDesktopCommandBridge(readControllerPlatform(), targetPlatform),
+    [targetPlatform],
+  );
   const fetchSourcePath = supportsPathHandleTransfer
     ? (supportsDirectoryTransfer ? selectedRemoteFile : legacyFetchPath.trim())
     : '';
@@ -706,6 +733,20 @@ export function RemoteDesktopPanel({
     }, CONTROL_NOTICE_MS);
     return () => clearTimeout(timer);
   }, [snapshot.controlRejection?.id, t]);
+
+  // A finished clipboard action (copied/pasted/empty/failed) is a toast, not a
+  // permanent toolbar fixture: fade it back to idle on its own so the button
+  // group never keeps a stale result around, and never reserves layout space
+  // for it while nothing is showing.
+  useEffect(() => {
+    if (clipboardStatus === 'idle' || clipboardStatus === 'copying' || clipboardStatus === 'pasting') return;
+    const timer = setTimeout(() => {
+      setClipboardStatus((current) => (
+        current === 'idle' || current === 'copying' || current === 'pasting' ? current : 'idle'
+      ));
+    }, CLIPBOARD_STATUS_TOAST_MS);
+    return () => clearTimeout(timer);
+  }, [clipboardStatus]);
 
   useEffect(() => {
     if (!displayModeMenu) return;
@@ -1541,16 +1582,32 @@ export function RemoteDesktopPanel({
   const suppressCommandControlForMiddleDrag = () => {
     const client = clientRef.current;
     if (!client) return;
-    const controlCodes = new Set(forwardedCommandCodesRef.current);
-    if (syntheticCommandControlRef.current) controlCodes.add('ControlLeft');
+    const commandCodes = new Set(forwardedCommandCodesRef.current);
+    if (syntheticCommandControlRef.current) commandCodes.add(commandBridge.code);
     let released = true;
-    for (const code of controlCodes) {
+    for (const code of commandCodes) {
       suppressedCommandCodesRef.current.add(code);
-      if (!client.key(code, 'Control', false, false, { control: false, alt: false })) {
+      if (!client.key(code, commandBridge.key, false, false, { control: false, alt: false })) {
         released = false;
       }
     }
     forwardedCommandCodesRef.current.clear();
+    syntheticCommandControlRef.current = false;
+    if (!released) client.releaseAll();
+  };
+
+  // A failed release send (channel transiently not open) must not be treated
+  // as done: the client's own contract says a failed up can be retried, and
+  // the caller here has no future retry point since syntheticCommandControlRef
+  // is what gates whether the command code is still considered forwarded. Fall
+  // back to releaseAll() -- exactly the same rescue suppressCommandControlForMiddleDrag
+  // uses above -- so a dropped release message cannot leave Control (or, on a
+  // macOS target, Command) physically stuck down on the remote host for the
+  // rest of the session.
+  const releaseSyntheticCommandControl = (altKey: boolean) => {
+    const client = clientRef.current;
+    if (!client) return;
+    const released = client.key(commandBridge.code, commandBridge.key, false, false, { control: false, alt: altKey });
     syntheticCommandControlRef.current = false;
     if (!released) client.releaseAll();
   };
@@ -1582,7 +1639,7 @@ export function RemoteDesktopPanel({
     const startsCommandMiddleDrag = down
       && event.button === 0
       && event.metaKey
-      && isAppleControllerPlatform(readControllerPlatform());
+      && commandBridge.appleController;
     const continuingCommandMiddleDrag = !down
       && commandMiddleDragPointerRef.current === event.pointerId;
     const eventButton: DesktopPointerButton | null = startsCommandMiddleDrag || continuingCommandMiddleDrag ? 'middle'
@@ -1687,7 +1744,7 @@ export function RemoteDesktopPanel({
     // second time (observed consistently in Safari).
     event.stopPropagation();
     const client = clientRef.current;
-    const mapped = mapRemoteDesktopKeyboardEvent(event);
+    const mapped = mapRemoteDesktopKeyboardEvent(event, undefined, targetPlatform);
     if (!client || !mapped) return;
     // Copy and paste are answered by the clipboard bridge rather than forwarded
     // blind: the two machines have separate clipboards, so the keystroke alone
@@ -1714,34 +1771,32 @@ export function RemoteDesktopPanel({
       return;
     }
     const commandEvent = event.code === 'MetaLeft' || event.code === 'MetaRight';
-    if (mapped.commandAsControl && commandEvent
+    if (mapped.usesCommandBridge && commandEvent
       && suppressedCommandCodesRef.current.has(mapped.code)
       && !syntheticCommandControlRef.current) {
       if (!down) suppressedCommandCodesRef.current.delete(mapped.code);
       event.preventDefault();
       return;
     }
-    if (mapped.commandAsControl && commandEvent) {
+    if (mapped.usesCommandBridge && commandEvent) {
       if (down) forwardedCommandCodesRef.current.add(mapped.code);
       else forwardedCommandCodesRef.current.delete(mapped.code);
       if (!down && syntheticCommandControlRef.current) {
-        client.key('ControlLeft', 'Control', false, false, { control: false, alt: event.altKey });
-        syntheticCommandControlRef.current = false;
+        releaseSyntheticCommandControl(event.altKey);
       }
-    } else if (mapped.commandAsControl && event.metaKey
+    } else if (mapped.usesCommandBridge && event.metaKey
       && forwardedCommandCodesRef.current.size === 0
       && !syntheticCommandControlRef.current) {
       suppressedCommandCodesRef.current.clear();
       syntheticCommandControlRef.current = client.key(
-        'ControlLeft',
-        'Control',
+        commandBridge.code,
+        commandBridge.key,
         true,
         false,
-        { control: true, alt: event.altKey },
+        { control: commandBridge.translateToControl, alt: event.altKey },
       );
-    } else if (mapped.commandAsControl && !event.metaKey && syntheticCommandControlRef.current) {
-      client.key('ControlLeft', 'Control', false, false, { control: false, alt: event.altKey });
-      syntheticCommandControlRef.current = false;
+    } else if (mapped.usesCommandBridge && !event.metaKey && syntheticCommandControlRef.current) {
+      releaseSyntheticCommandControl(event.altKey);
     }
     const sent = client.key(mapped.code, mapped.key, down, event.repeat, mapped.modifiers);
     if (sent) {
@@ -1750,10 +1805,9 @@ export function RemoteDesktopPanel({
       }
       event.preventDefault();
     }
-    if (mapped.commandAsControl && !commandEvent && !down && event.metaKey
+    if (mapped.usesCommandBridge && !commandEvent && !down && event.metaKey
       && forwardedCommandCodesRef.current.size === 0 && syntheticCommandControlRef.current) {
-      client.key('ControlLeft', 'Control', false, false, { control: false, alt: event.altKey });
-      syntheticCommandControlRef.current = false;
+      releaseSyntheticCommandControl(event.altKey);
     }
   };
 
@@ -1993,8 +2047,82 @@ export function RemoteDesktopPanel({
 
   const openMobileKeyboard = () => {
     if (!snapshot.inputEnabled) return;
+    setMobileKeyboardTab('ime');
     setMobileTextOpen(true);
     requestAnimationFrame(() => mobileTextInputRef.current?.focus({ preventScroll: true }));
+  };
+
+  const comboModifierFlags = (keys: readonly RemoteDesktopChordKey[]) => ({
+    control: keys.some((k) => k.code === 'ControlLeft' || k.code === 'ControlRight'),
+    alt: keys.some((k) => k.code === 'AltLeft' || k.code === 'AltRight'),
+  });
+
+  /** Release every latched combo modifier, innermost (most recently pressed) first. */
+  const releaseHeldComboKeys = () => {
+    const client = clientRef.current;
+    if (client) {
+      let remaining = heldComboKeys;
+      for (const held of [...heldComboKeys].reverse()) {
+        remaining = remaining.filter((k) => k.code !== held.code);
+        client.key(held.code, held.key, false, false, comboModifierFlags(remaining));
+      }
+    }
+    if (heldComboKeys.length > 0) setHeldComboKeys([]);
+  };
+
+  const toggleComboMode = () => {
+    if (comboMode) releaseHeldComboKeys();
+    setComboMode((prev) => !prev);
+  };
+
+  const switchMobileKeyboardTab = (tab: MobileKeyboardTab) => {
+    if (mobileKeyboardTab === 'keys' && tab !== 'keys') releaseHeldComboKeys();
+    setMobileKeyboardTab(tab);
+    if (tab === 'ime') requestAnimationFrame(() => mobileTextInputRef.current?.focus({ preventScroll: true }));
+  };
+
+  const closeMobileKeyboard = () => {
+    releaseHeldComboKeys();
+    setMobileTextOpen(false);
+  };
+
+  /**
+   * A tap on the "computer keyboard" grid. Outside combo mode -- or on a
+   * non-modifier key with nothing latched -- this is just a standalone
+   * press+release. In combo mode, tapping a modifier latches/unlatches it
+   * (held down on the remote the whole time, so its own effect, e.g. Shift
+   * changing what a later tap types, is visible immediately); tapping a
+   * non-modifier while modifiers are latched fires the whole chord once and
+   * releases the modifiers, ready for the next chord.
+   */
+  const pressComputerKey = (spec: RemoteDesktopComputerKeySpec) => {
+    const client = clientRef.current;
+    if (!client || !snapshot.inputEnabled) return;
+    if (comboMode && spec.modifier) {
+      const isHeld = heldComboKeys.some((k) => k.code === spec.code);
+      if (isHeld) {
+        const remaining = heldComboKeys.filter((k) => k.code !== spec.code);
+        client.key(spec.code, spec.key, false, false, comboModifierFlags(remaining));
+        setHeldComboKeys(remaining);
+      } else {
+        const next = [...heldComboKeys, { code: spec.code, key: spec.key }];
+        client.key(spec.code, spec.key, true, false, comboModifierFlags(next));
+        setHeldComboKeys(next);
+      }
+      return;
+    }
+    if (comboMode && heldComboKeys.length > 0) {
+      const flags = comboModifierFlags(heldComboKeys);
+      client.key(spec.code, spec.key, true, false, flags);
+      client.key(spec.code, spec.key, false, false, flags);
+      releaseHeldComboKeys();
+      return;
+    }
+    sendRemoteDesktopChord(
+      [{ code: spec.code, key: spec.key }],
+      (code, keyName, down, repeat, modifiers) => client.key(code, keyName, down, repeat, modifiers),
+      () => client.releaseAll(),
+    );
   };
 
   const submitMobileText = (value: string) => {
@@ -2190,9 +2318,11 @@ export function RemoteDesktopPanel({
               title={inputBlockedHint()}
               onClick={() => { void pasteLocalClipboard(); }}
             >{t('remote_desktop.paste_local_clipboard')}</button>
-            <span class="remote-desktop-clipboard-status" aria-live="polite">
-              {clipboardStatus === 'idle' ? '' : t(`remote_desktop.clipboard_${clipboardStatus}`)}
-            </span>
+            {clipboardStatus !== 'idle' && (
+              <span class="remote-desktop-clipboard-toast" role="status" aria-live="polite">
+                {t(`remote_desktop.clipboard_${clipboardStatus}`)}
+              </span>
+            )}
           </div>
           <div class="remote-desktop-zoom-switch" role="group" aria-label={t('remote_desktop.zoom_label')}>
             <button type="button" aria-label={t('remote_desktop.zoom_out')} disabled={viewport.scale <= 1} onClick={() => changeZoom(-0.5)}>−</button>
@@ -2472,90 +2602,6 @@ export function RemoteDesktopPanel({
               onMouseEnter={onInputSurfaceMouseMove}
             />
           )}
-          {mobileTextOpen && (
-            <div class="remote-desktop-mobile-keyboard" role="group" aria-label={t('remote_desktop.mobile_keyboard')}>
-              <div class="remote-desktop-mobile-keyboard-head">
-                <span aria-hidden="true">⌨</span>
-                <button
-                  type="button"
-                  aria-label={t('remote_desktop.close_mobile_keyboard')}
-                  onClick={() => setMobileTextOpen(false)}
-                >×</button>
-              </div>
-              <textarea
-                ref={mobileTextInputRef}
-                rows={1}
-                inputMode="text"
-                enterkeyhint="enter"
-                autocapitalize="none"
-                autocomplete="off"
-                spellcheck={false}
-                aria-label={t('remote_desktop.mobile_text_input')}
-                placeholder={t('remote_desktop.mobile_text_input')}
-                onCompositionStart={(event) => {
-                  event.stopPropagation();
-                  mobileTextComposingRef.current = true;
-                  mobileTextLastCompositionCommitRef.current = null;
-                }}
-                onCompositionEnd={(event) => {
-                  event.stopPropagation();
-                  mobileTextComposingRef.current = false;
-                  const value = (event.currentTarget as HTMLTextAreaElement).value;
-                  if (value && mobileTextLastCompositionCommitRef.current !== value) {
-                    mobileTextLastCompositionCommitRef.current = value;
-                    submitMobileText(value);
-                  }
-                }}
-                onBeforeInput={(event) => {
-                  event.stopPropagation();
-                  const input = event.currentTarget as HTMLTextAreaElement;
-                  if (mobileTextComposingRef.current || event.isComposing || input.value) return;
-                  const deletionKey = remoteDesktopMobileDeletionKey(event.inputType);
-                  if (!deletionKey) return;
-                  event.preventDefault();
-                  sendMobileShortcut([deletionKey]);
-                }}
-                onInput={(event) => {
-                  event.stopPropagation();
-                  if (mobileTextComposingRef.current || event.isComposing) return;
-                  const input = event.currentTarget as HTMLTextAreaElement;
-                  const lastCompositionCommit = mobileTextLastCompositionCommitRef.current;
-                  if (lastCompositionCommit !== null
-                    && (input.value === '' || input.value === lastCompositionCommit)) {
-                    input.value = '';
-                    return;
-                  }
-                  mobileTextLastCompositionCommitRef.current = null;
-                  submitMobileText(input.value);
-                }}
-                onKeyDown={(event) => event.stopPropagation()}
-                onKeyUp={(event) => event.stopPropagation()}
-              />
-              <div class="remote-desktop-mobile-shortcuts" aria-label={t('remote_desktop.mobile_shortcuts')}>
-                {REMOTE_DESKTOP_MOBILE_SHORTCUTS.map((shortcut) => (
-                  <button
-                    key={shortcut.id}
-                    type="button"
-                    aria-label={t(`remote_desktop.shortcut_${shortcut.id}`)}
-                    onPointerDown={(event) => event.preventDefault()}
-                    onClick={() => sendMobileShortcut(shortcut.keys)}
-                  >{remoteDesktopShortcutLabel(shortcut.id)}</button>
-                ))}
-                <button
-                  type="button"
-                  aria-label={t('remote_desktop.copy_remote_selection')}
-                  onPointerDown={(event) => event.preventDefault()}
-                  onClick={() => { void copyRemoteSelection(); }}
-                >{t('remote_desktop.copy_remote_selection')}</button>
-                <button
-                  type="button"
-                  aria-label={t('remote_desktop.paste_local_clipboard')}
-                  onPointerDown={(event) => event.preventDefault()}
-                  onClick={() => { void pasteLocalClipboard(); }}
-                >{t('remote_desktop.paste_local_clipboard')}</button>
-              </div>
-            </div>
-          )}
           {mobileInputMode === 'mouse' && (
             <>
               <div
@@ -2678,6 +2724,145 @@ export function RemoteDesktopPanel({
               : 'remote_desktop.touch_hint')}
           </div>
         </div>
+
+        {/* Docked below the stage in normal flow (a grid row of its own, not an
+            overlay on top of the video) so opening it shrinks the visible
+            remote screen instead of covering it -- the previous floating panel
+            sat on top of the video and, combined with the OS's own on-screen
+            keyboard underneath it, could blot out most of a phone screen. */}
+        {mobileTextOpen && (
+          <div class="remote-desktop-mobile-keyboard" role="group" aria-label={t('remote_desktop.mobile_keyboard')}>
+            <div class="remote-desktop-mobile-keyboard-head">
+              <div class="remote-desktop-mobile-keyboard-tabs" role="tablist" aria-label={t('remote_desktop.mobile_keyboard')}>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={mobileKeyboardTab === 'ime'}
+                  class={mobileKeyboardTab === 'ime' ? 'is-active' : ''}
+                  onClick={() => switchMobileKeyboardTab('ime')}
+                >{t('remote_desktop.mobile_keyboard_tab_ime')}</button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={mobileKeyboardTab === 'keys'}
+                  class={mobileKeyboardTab === 'keys' ? 'is-active' : ''}
+                  onClick={() => switchMobileKeyboardTab('keys')}
+                >{t('remote_desktop.mobile_keyboard_tab_keys')}</button>
+              </div>
+              <button
+                type="button"
+                aria-label={t('remote_desktop.close_mobile_keyboard')}
+                onClick={closeMobileKeyboard}
+              >×</button>
+            </div>
+
+            {mobileKeyboardTab === 'ime' && (
+              <>
+                <textarea
+                  ref={mobileTextInputRef}
+                  rows={1}
+                  inputMode="text"
+                  enterkeyhint="enter"
+                  autocapitalize="none"
+                  autocomplete="off"
+                  spellcheck={false}
+                  aria-label={t('remote_desktop.mobile_text_input')}
+                  placeholder={t('remote_desktop.mobile_text_input')}
+                  onCompositionStart={(event) => {
+                    event.stopPropagation();
+                    mobileTextComposingRef.current = true;
+                    mobileTextLastCompositionCommitRef.current = null;
+                  }}
+                  onCompositionEnd={(event) => {
+                    event.stopPropagation();
+                    mobileTextComposingRef.current = false;
+                    const value = (event.currentTarget as HTMLTextAreaElement).value;
+                    if (value && mobileTextLastCompositionCommitRef.current !== value) {
+                      mobileTextLastCompositionCommitRef.current = value;
+                      submitMobileText(value);
+                    }
+                  }}
+                  onBeforeInput={(event) => {
+                    event.stopPropagation();
+                    const input = event.currentTarget as HTMLTextAreaElement;
+                    if (mobileTextComposingRef.current || event.isComposing || input.value) return;
+                    const deletionKey = remoteDesktopMobileDeletionKey(event.inputType);
+                    if (!deletionKey) return;
+                    event.preventDefault();
+                    sendMobileShortcut([deletionKey]);
+                  }}
+                  onInput={(event) => {
+                    event.stopPropagation();
+                    if (mobileTextComposingRef.current || event.isComposing) return;
+                    const input = event.currentTarget as HTMLTextAreaElement;
+                    const lastCompositionCommit = mobileTextLastCompositionCommitRef.current;
+                    if (lastCompositionCommit !== null
+                      && (input.value === '' || input.value === lastCompositionCommit)) {
+                      input.value = '';
+                      return;
+                    }
+                    mobileTextLastCompositionCommitRef.current = null;
+                    submitMobileText(input.value);
+                  }}
+                  onKeyDown={(event) => event.stopPropagation()}
+                  onKeyUp={(event) => event.stopPropagation()}
+                />
+                <div class="remote-desktop-mobile-shortcuts" aria-label={t('remote_desktop.mobile_shortcuts')}>
+                  {REMOTE_DESKTOP_MOBILE_SHORTCUT_IDS.map((id) => (
+                    <button
+                      key={id}
+                      type="button"
+                      aria-label={t(`remote_desktop.shortcut_${id}`)}
+                      onPointerDown={(event) => event.preventDefault()}
+                      onClick={() => sendMobileShortcut(remoteDesktopMobileShortcutKeys(id, targetPlatform))}
+                    >{remoteDesktopShortcutLabel(id, targetPlatform)}</button>
+                  ))}
+                  <button
+                    type="button"
+                    aria-label={t('remote_desktop.copy_remote_selection')}
+                    onPointerDown={(event) => event.preventDefault()}
+                    onClick={() => { void copyRemoteSelection(); }}
+                  >{t('remote_desktop.copy_remote_selection')}</button>
+                  <button
+                    type="button"
+                    aria-label={t('remote_desktop.paste_local_clipboard')}
+                    onPointerDown={(event) => event.preventDefault()}
+                    onClick={() => { void pasteLocalClipboard(); }}
+                  >{t('remote_desktop.paste_local_clipboard')}</button>
+                </div>
+              </>
+            )}
+
+            {mobileKeyboardTab === 'keys' && (
+              <div class="remote-desktop-computer-keyboard">
+                <label class="remote-desktop-combo-toggle">
+                  <input type="checkbox" checked={comboMode} onChange={toggleComboMode} />
+                  {t('remote_desktop.combo_mode')}
+                </label>
+                {REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS.map((row, rowIndex) => (
+                  <div class="remote-desktop-computer-keyboard-row" key={rowIndex}>
+                    {row.map((spec) => {
+                      const label = remoteDesktopComputerKeyLabel(spec, targetPlatform);
+                      const held = heldComboKeys.some((k) => k.code === spec.code);
+                      return (
+                        <button
+                          key={spec.code}
+                          type="button"
+                          class={held ? 'is-held' : ''}
+                          aria-label={t('remote_desktop.computer_key', { key: label })}
+                          aria-pressed={spec.modifier ? held : undefined}
+                          disabled={!snapshot.inputEnabled}
+                          onPointerDown={(event) => event.preventDefault()}
+                          onClick={() => pressComputerKey(spec)}
+                        >{label}</button>
+                      );
+                    })}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
         {filePanelOpen && fileDrawerMinimized && (() => {
           // Minimized to the corner of the window it belongs to, still showing
