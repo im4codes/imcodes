@@ -1885,6 +1885,20 @@ export class RemoteDesktopClient {
       inputEnabled: false,
       stream: null,
       terminalReason: reason,
+      // These fields only ever arrive on a live STATUS message, and no more
+      // of those are coming once the session is torn down -- publish() only
+      // merges the given keys, so leaving them out keeps whatever was last
+      // observed on the wire instead of reflecting that nobody is connected
+      // any more. Concretely: the "N viewing" footer kept reporting the last
+      // real viewer/controller count forever after Stop, on every platform,
+      // because this patch never zeroed it.
+      viewerCount: 0,
+      controllerCount: 0,
+      route: undefined,
+      quality: undefined,
+      signInScreen: false,
+      unlockAvailable: false,
+      inputBlocked: undefined,
     });
   }
 

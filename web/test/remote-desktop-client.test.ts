@@ -1003,6 +1003,73 @@ describe('RemoteDesktopClient', () => {
     });
   });
 
+  it('zeroes the viewer/controller footer and other live-only fields once the session tears down', async () => {
+    let socket!: FakeSocket;
+    const client = new RemoteDesktopClient('controlled-mac', { onSnapshot: vi.fn() }, {
+      fetchTicket: async () => 'ticket-teardown',
+      createSocket: () => {
+        socket = new FakeSocket();
+        queueMicrotask(() => socket.open());
+        return socket as unknown as WebSocket;
+      },
+      createPeer: () => new FakePeer() as unknown as RTCPeerConnection,
+    });
+
+    await client.start();
+    const start = JSON.parse(socket.sent[0]!) as { requestId: string };
+    const authority = {
+      requestId: start.requestId,
+      sessionId: 'session_12345678',
+      capability: 'a'.repeat(43),
+    };
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      ...authority,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 1,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      iceServers: ['stun:stun.example.test:3478'],
+    });
+    // A live STATUS reports someone actually watching -- this is exactly the
+    // state a stale-forever footer would keep showing after Stop.
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.STATUS,
+      ...authority,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      state: REMOTE_DESKTOP_STATE.DIRECT,
+      route: 'direct',
+      inputEnabled: true,
+      viewerCount: 1,
+      controllerCount: 1,
+      signInScreen: true,
+      unlockAvailable: true,
+    });
+    await vi.waitFor(() => expect(client.current().viewerCount).toBe(1));
+    expect(client.current()).toMatchObject({
+      route: 'direct',
+      viewerCount: 1,
+      controllerCount: 1,
+      signInScreen: true,
+      unlockAvailable: true,
+    });
+
+    client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+
+    expect(client.current()).toMatchObject({
+      state: REMOTE_DESKTOP_STATE.STOPPED,
+      viewerCount: 0,
+      controllerCount: 0,
+      route: undefined,
+      quality: undefined,
+      signInScreen: false,
+      unlockAvailable: false,
+      inputBlocked: undefined,
+    });
+  });
+
   it('chunks paste text on UTF-8 and UTF-16 boundaries without splitting surrogate pairs', () => {
     const chunks = chunkRemoteDesktopText(`${'界'.repeat(1_500)}${'😀'.repeat(1_100)}`);
     expect(chunks).not.toBeNull();
