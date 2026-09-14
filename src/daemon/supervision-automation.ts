@@ -36,6 +36,7 @@ import {
 } from './supervision-broker.js';
 import {
   getCachedSupervisorDefaults,
+  overlayCachedExecutionPools,
 } from './supervisor-defaults-cache.js';
 import logger from '../util/logger.js';
 import {
@@ -146,14 +147,24 @@ function isBrainOwnedAutomaticSupervision(
  * Apply the daemon-cached global supervisor runtime to every session. Session
  * snapshots retain legacy runtime fields as a cold-start fallback, but once
  * user defaults have been fetched they are authoritative for backend/model,
- * optional backup, timeout and global custom instructions.
+ * optional backup, timeout, global custom instructions, and -- once the
+ * account has actually configured one -- the execution pools.
+ *
+ * The pool is account-level policy keyed by model/agentType capability, not
+ * by which session happens to hold it: a Codex+GPT-5.6 or Claude+Sonnet
+ * entry means "this model type may run pooled work", independent of any one
+ * Brain session. Unlike backend/model (which normalizeSupervisorDefaultConfig
+ * always fills with a concrete value), an account that never configured a
+ * pool still reports 'legacy_unconfigured' here; overlaying that state would
+ * regress a session whose own transportConfig already has a real pool, so it
+ * is applied only once the cache itself is genuinely 'configured'.
  */
 export function enrichSnapshotWithGlobalDefaults(
   snapshot: SessionSupervisionSnapshot,
 ): SessionSupervisionSnapshot {
   const cached = getCachedSupervisorDefaults();
   if (!cached) return snapshot;
-  return {
+  return overlayCachedExecutionPools({
     ...snapshot,
     backend: cached.backend,
     model: cached.model,
@@ -172,7 +183,7 @@ export function enrichSnapshotWithGlobalDefaults(
     ...(cached.customInstructions
       ? { globalCustomInstructions: cached.customInstructions }
       : { globalCustomInstructions: undefined }),
-  };
+  });
 }
 
 type TaskRunPhase = 'execution' | 'auditing' | 'finalizing';

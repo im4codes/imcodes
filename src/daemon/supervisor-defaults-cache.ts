@@ -16,6 +16,7 @@ import logger from '../util/logger.js';
 import { loadCredentials } from '../bind/bind-flow.js';
 import {
   normalizeSupervisorDefaultConfig,
+  type SessionSupervisionSnapshot,
   type SupervisorDefaultConfig,
 } from '../../shared/supervision-config.js';
 
@@ -83,6 +84,29 @@ export function stopSupervisorDefaultsCacheRefresh(): void {
   if (!refreshTimer) return;
   clearInterval(refreshTimer);
   refreshTimer = null;
+}
+
+/**
+ * Overlay the cached account-level execution pool onto a snapshot, when the
+ * account has actually configured one.
+ *
+ * The pool is account-level policy keyed by model/agentType capability, not
+ * by which session happens to hold it. Unlike backend/model (which
+ * normalizeSupervisorDefaultConfig always fills with a concrete value), an
+ * account that never configured a pool still reports 'legacy_unconfigured'
+ * here; overlaying that state would regress a session whose own
+ * transportConfig already has a real pool, so it is applied only once the
+ * cache itself is genuinely 'configured'. Kept in this leaf module (no
+ * dependency on the daemon's other supervision files) so both the automation
+ * loop and send-tool's task-dispatch pool-eligibility check can share it
+ * without a static import between those two large, otherwise-decoupled files.
+ */
+export function overlayCachedExecutionPools<T extends Pick<SessionSupervisionSnapshot, 'executionPools'>>(
+  snapshot: T,
+): T {
+  const cached = cachedSupervisorDefaults;
+  if (!cached || cached.executionPools.state !== 'configured') return snapshot;
+  return { ...snapshot, executionPools: cached.executionPools };
 }
 
 /** Test-only hook. Resets cache state between tests. */
