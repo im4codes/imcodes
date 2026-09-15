@@ -4335,8 +4335,12 @@ describe('SupervisionAutomation', () => {
     beginRun('cmd-4', 'finish openspec/changes/supervised-task-automation implementation');
 
     completeTurn('implemented the change');
-    await sleep(25);
-    await sleep(25);
+    // A fixed 50ms (2x sleep(25)) assumed the orchestration send would always
+    // land inside that window; under CI load it sometimes has not, and
+    // `mock.calls[0]` reads as undefined before the call ever happens. Poll
+    // instead, matching every other test in this file that waits on this
+    // same mock (e.g. the large-audit-context test right below).
+    await waitForTransportSendCount(1);
 
     const orchestrationPrompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
     expect(orchestrationPrompt).toContain('Relevant OpenSpec change:');

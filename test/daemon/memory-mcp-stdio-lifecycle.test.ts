@@ -178,7 +178,14 @@ describeOrSkip('memory MCP stdio lifecycle (subprocess)', () => {
     }
   }, 120_000);
 
-  it('exits when it was already reparented before it ever ran, stdin still held', async () => {
+  it('exits when it was already reparented before it ever ran, stdin still held', { timeout: 240_000, retry: 2 }, async () => {
+    // Real signal-driven exit, not a computed value: how long the shared
+    // macOS runner takes to actually schedule and run this process's exit
+    // after SIGCONT is not something a fixed budget can guarantee, only
+    // bound generously and retry the rare miss. A 45s budget was still
+    // observed failing under heavy CI load with the guard correctly armed
+    // and the reparent correctly detected -- the process just had not
+    // finished exiting yet.
     // The shape PPID alone cannot see. If the owner dies between spawn and the
     // child's first instruction, the child's own snapshot is ALREADY the
     // reparent target, so every later poll compares that value against itself
@@ -247,19 +254,13 @@ describeOrSkip('memory MCP stdio lifecycle (subprocess)', () => {
       );
       expect(armed, 'the guard never armed, so nothing about leaking was tested').toBe(true);
 
-      // Matches the equivalent wait in the "dies BEFORE ready" test below
-      // (45_000) -- this one used a tighter 20_000 for no reasoned-about
-      // difference between the two, and was observed timing out under
-      // macOS CI load: the guard had armed and detected the reparent (the
-      // assertion above already passed), the process just hadn't finished
-      // exiting yet within the shorter window.
-      const gone = await waitFor(() => !pidAlive(serverPid), 45_000);
+      const gone = await waitFor(() => !pidAlive(serverPid), 90_000);
       expect(gone, 'a process born already reparented must not become the leak').toBe(true);
     } finally {
       if (serverPid > 0 && pidAlive(serverPid)) { try { process.kill(serverPid, 'SIGKILL'); } catch { /* gone */ } }
       rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
     }
-  }, 150_000);
+  });
 
   it('exits when its parent dies BEFORE the server is ready, stdin still held', async () => {
     // The hole this rework closes. The test above waits for the initialize
