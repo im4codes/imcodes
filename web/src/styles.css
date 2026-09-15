@@ -12167,14 +12167,15 @@ button.quick-agent-delegation-preset.active {
     display: none;
   }
 
-  /* Every control on screen, in full rows. Hiding half of them behind a swipe
-     bought nothing: the picture is limited by the phone's width, so the height
-     a taller toolbar takes comes out of the letterbox bars, never out of the
-     desktop being shown. */
+  /* Every control on screen, in full rows -- but kept as compact as a touch
+     target reasonably allows: once the docked mobile keyboard is open too,
+     the toolbar's height stops being free (letterboxing only covers so
+     much) and starts coming directly out of the video's own share of a
+     short portrait screen. */
   .remote-desktop-toolbar {
     flex-wrap: wrap;
-    gap: 7px;
-    padding: 8px 10px;
+    gap: 5px;
+    padding: 6px 8px;
     overflow: visible;
   }
 
@@ -12214,10 +12215,10 @@ button.quick-agent-delegation-preset.active {
   }
 
   .remote-desktop-toolbar button {
-    min-height: 38px;
-    padding-inline: 10px;
+    min-height: 32px;
+    padding-inline: 8px;
+    font-size: 12px;
   }
-
 
   .remote-desktop-mobile-input-switch {
     display: flex;

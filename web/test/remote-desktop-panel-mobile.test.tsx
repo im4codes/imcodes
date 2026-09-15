@@ -2121,6 +2121,54 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(pointerButton).not.toHaveBeenCalled();
   });
 
+  it('sends two-finger drag as remote scroll instead of pinching the local view', async () => {
+    const { stage, video } = await renderPanel();
+    wheel.mockClear();
+    act(() => {
+      pointer(stage, 'pointerdown', { pointerId: 1, clientX: 120, clientY: 150 });
+      pointer(stage, 'pointerdown', { pointerId: 2, clientX: 280, clientY: 150 });
+      // Both fingers move up together by the same amount -- the distance
+      // between them stays ~160, only the center moves -- unlike the pinch
+      // test above, where one finger moves and the other stays put.
+      pointer(stage, 'pointermove', { pointerId: 1, clientX: 120, clientY: 120 });
+      pointer(stage, 'pointermove', { pointerId: 2, clientX: 280, clientY: 120 });
+    });
+    // Local view untouched -- this was read as a scroll, not a pinch.
+    expect(video.style.transform).toContain('scale(1)');
+    expect(wheel).toHaveBeenCalled();
+    const [deltaX, deltaY] = wheel.mock.calls.at(-1)!;
+    // Dragging up scrolls down (content follows the finger), the same
+    // direction touch panning already uses elsewhere in this file.
+    expect(deltaY).toBeGreaterThan(0);
+    expect(deltaX).toBeCloseTo(0);
+
+    act(() => {
+      pointer(stage, 'pointerup', { pointerId: 1, clientX: 120, clientY: 120 });
+      pointer(stage, 'pointerup', { pointerId: 2, clientX: 280, clientY: 120 });
+    });
+    expect(pointerButton).not.toHaveBeenCalled();
+    expect(pointerClick).not.toHaveBeenCalled();
+  });
+
+  it('sends a horizontal two-finger drag as horizontal remote scroll', async () => {
+    const { stage, video } = await renderPanel();
+    wheel.mockClear();
+    act(() => {
+      pointer(stage, 'pointerdown', { pointerId: 1, clientX: 150, clientY: 100 });
+      pointer(stage, 'pointerdown', { pointerId: 2, clientX: 150, clientY: 260 });
+      // Both fingers move right together -- the vertical pair's distance
+      // stays ~160, only the center moves horizontally.
+      pointer(stage, 'pointermove', { pointerId: 1, clientX: 180, clientY: 100 });
+      pointer(stage, 'pointermove', { pointerId: 2, clientX: 180, clientY: 260 });
+    });
+    expect(video.style.transform).toContain('scale(1)');
+    expect(wheel).toHaveBeenCalled();
+    const [deltaX, deltaY] = wheel.mock.calls.at(-1)!;
+    // Dragging right scrolls left (content follows the finger).
+    expect(deltaX).toBeLessThan(0);
+    expect(deltaY).toBeCloseTo(0);
+  });
+
   it('maps a tap through the transformed video rect after mobile zoom', async () => {
     const { stage, video } = await renderPanel();
     act(() => {

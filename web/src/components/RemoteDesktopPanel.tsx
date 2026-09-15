@@ -134,12 +134,25 @@ type TouchSingleGesture = {
   viewport: RemoteDesktopViewport;
 };
 
-type TouchGesture = TouchSingleGesture | {
-  kind: 'pinch';
+/**
+ * A two-finger touch starts ambiguous ('pending') and resolves to exactly
+ * one of the other two phases on the first move past a small jitter
+ * threshold: fingers moving apart/together (distance changing) means
+ * pinch-to-zoom the local view, same as before; fingers moving together
+ * (center moving, distance roughly constant) means scroll the remote
+ * content instead. Once resolved the gesture stays that way for its whole
+ * duration -- re-deciding on every move would flip modes mid-drag.
+ */
+type TouchTwoFingerGesture = {
+  kind: 'two-finger';
+  phase: 'pending' | 'pinch' | 'scroll';
   initialCenter: TouchPoint;
   initialDistance: number;
   viewport: RemoteDesktopViewport;
+  lastCenter: TouchPoint;
 };
+
+type TouchGesture = TouchSingleGesture | TouchTwoFingerGesture;
 
 type VirtualMouseDrag = {
   kind: 'move';
@@ -223,6 +236,14 @@ const DESKTOP_DOUBLE_CLICK_MS = 500;
 // scaling and turn an intended double-click into two singles.
 const DESKTOP_DOUBLE_CLICK_DISTANCE_PX = 8;
 const TOUCH_DOUBLE_TAP_DISTANCE_PX = 32;
+// How far a two-finger touch has to move, in either the finger-to-finger
+// distance or the pair's center, before it commits to pinch vs. scroll --
+// below this it is still just jitter from two fingers landing imperfectly
+// together.
+const TOUCH_TWO_FINGER_CLASSIFY_PX = 8;
+// Matches the virtual-mouse wheel handle's own gain (below), so two-finger
+// scroll on the video and dragging that handle feel the same.
+const TOUCH_TWO_FINGER_SCROLL_GAIN = 8;
 const REMOTE_DESKTOP_CONNECTION_STEPS = [
   'authorize',
   'worker',
@@ -1293,19 +1314,45 @@ export function RemoteDesktopPanel({
     onVirtualMouseButton(event, 'left', false);
   };
 
-  const beginPinch = () => {
+  const beginTwoFingerGesture = () => {
     if (touchGestureRef.current?.kind === 'single' && touchGestureRef.current.longPressTimer) {
       clearTimeout(touchGestureRef.current.longPressTimer);
     }
     const points = [...touchPointsRef.current.values()];
     if (points.length < 2) return;
     const [first, second] = points;
+    const center = { x: (first.x + second.x) / 2, y: (first.y + second.y) / 2 };
     touchGestureRef.current = {
-      kind: 'pinch',
-      initialCenter: { x: (first.x + second.x) / 2, y: (first.y + second.y) / 2 },
+      kind: 'two-finger',
+      phase: 'pending',
+      initialCenter: center,
       initialDistance: Math.max(1, Math.hypot(second.x - first.x, second.y - first.y)),
       viewport: viewportRef.current,
+      lastCenter: center,
     };
+  };
+
+  /** Two-finger scroll: send the center point's frame-to-frame movement to
+   * the remote as wheel deltas, the same "content follows the finger"
+   * direction touch panning already uses elsewhere in this file -- drag up,
+   * the remote scrolls down (revealing what is below), like scrolling a
+   * page directly with a finger rather than a trackpad's inverted wheel. */
+  const sendTwoFingerScroll = (gesture: TouchTwoFingerGesture, center: TouchPoint) => {
+    const dx = center.x - gesture.lastCenter.x;
+    const dy = center.y - gesture.lastCenter.y;
+    gesture.lastCenter = center;
+    if (!snapshot.inputEnabled || (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5)) return;
+    const stage = stageRef.current;
+    if (!stage) return;
+    const rect = stage.getBoundingClientRect();
+    const normalized = normalizedClientPoint(rect.left + center.x, rect.top + center.y);
+    if (!normalized) return;
+    clientRef.current?.wheel(
+      -dx * TOUCH_TWO_FINGER_SCROLL_GAIN,
+      -dy * TOUCH_TWO_FINGER_SCROLL_GAIN,
+      normalized.x,
+      normalized.y,
+    );
   };
 
   const onTouchDown = (event: PointerEvent) => {
@@ -1342,7 +1389,7 @@ export function RemoteDesktopPanel({
       }, TOUCH_LONG_PRESS_MS);
       touchGestureRef.current = gesture;
     } else {
-      beginPinch();
+      beginTwoFingerGesture();
     }
   };
 
@@ -1355,17 +1402,40 @@ export function RemoteDesktopPanel({
     const gesture = touchGestureRef.current;
     if (!geometry || !gesture) return;
     const points = [...touchPointsRef.current.values()];
-    if (points.length >= 2 && gesture.kind === 'pinch') {
+    if (points.length >= 2 && gesture.kind === 'two-finger') {
       const [first, second] = points;
       const distance = Math.max(1, Math.hypot(second.x - first.x, second.y - first.y));
       const center = { x: (first.x + second.x) / 2, y: (first.y + second.y) / 2 };
-      commitViewport(viewportFromRemoteDesktopPinch(
-        gesture.viewport,
-        gesture.initialCenter,
-        center,
-        gesture.viewport.scale * distance / gesture.initialDistance,
-        geometry,
-      ));
+
+      if (gesture.phase === 'pending') {
+        const distanceDelta = Math.abs(distance - gesture.initialDistance);
+        const centerDelta = Math.hypot(
+          center.x - gesture.initialCenter.x,
+          center.y - gesture.initialCenter.y,
+        );
+        if (distanceDelta < TOUCH_TWO_FINGER_CLASSIFY_PX && centerDelta < TOUCH_TWO_FINGER_CLASSIFY_PX) {
+          return; // Still just two fingers landing imperfectly together.
+        }
+        gesture.phase = distanceDelta > centerDelta ? 'pinch' : 'scroll';
+        if (gesture.phase === 'scroll') {
+          // This move becomes the scroll baseline; deltas start from the next one.
+          gesture.lastCenter = center;
+          return;
+        }
+      }
+
+      if (gesture.phase === 'pinch') {
+        commitViewport(viewportFromRemoteDesktopPinch(
+          gesture.viewport,
+          gesture.initialCenter,
+          center,
+          gesture.viewport.scale * distance / gesture.initialDistance,
+          geometry,
+        ));
+        return;
+      }
+
+      sendTwoFingerScroll(gesture, center);
     } else if (points.length === 1 && gesture.kind === 'single'
       && gesture.pointerId === event.pointerId) {
       const dx = point.x - gesture.start.x;
@@ -1429,7 +1499,7 @@ export function RemoteDesktopPanel({
         viewport: viewportRef.current,
       };
     } else if (remaining.length >= 2) {
-      beginPinch();
+      beginTwoFingerGesture();
     } else {
       touchGestureRef.current = null;
     }
