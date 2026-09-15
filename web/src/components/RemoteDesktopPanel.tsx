@@ -2803,8 +2803,15 @@ export function RemoteDesktopPanel({
 
             {mobileKeyboardTab === 'ime' && (
               <>
+                {/* Not a compose box the operator reads back -- what they type
+                    lands directly on the remote screen, which is the only
+                    place it needs to be visible. This element exists purely
+                    to hold focus and capture keystrokes/IME composition so
+                    the OS keyboard has something to type into; it is never
+                    shown. */}
                 <textarea
                   ref={mobileTextInputRef}
+                  class="remote-desktop-mobile-hidden-input"
                   rows={1}
                   inputMode="text"
                   enterkeyhint="enter"
@@ -2812,7 +2819,6 @@ export function RemoteDesktopPanel({
                   autocomplete="off"
                   spellcheck={false}
                   aria-label={t('remote_desktop.mobile_text_input')}
-                  placeholder={t('remote_desktop.mobile_text_input')}
                   onCompositionStart={(event) => {
                     event.stopPropagation();
                     mobileTextComposingRef.current = true;

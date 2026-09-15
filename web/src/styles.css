@@ -10939,22 +10939,20 @@ button.quick-agent-delegation-preset.active {
   font-size: 20px;
 }
 
-.remote-desktop-mobile-keyboard textarea {
-  width: 100%;
-  min-height: 38px;
-  max-height: 88px;
-  resize: vertical;
-  padding: 8px 10px;
-  color: #f2fbff;
-  background: rgb(1 9 17 / 82%);
-  border: 1px solid #2d6686;
-  border-radius: 8px;
-  outline: none;
-}
-
-.remote-desktop-mobile-keyboard textarea:focus {
-  border-color: #67d8ff;
-  box-shadow: 0 0 0 2px rgb(99 216 255 / 15%);
+/* Focus/IME-composition target only -- what is typed goes straight to the
+   remote screen, so there is nothing here worth showing locally. Kept out of
+   `display: none` / `visibility: hidden`, both of which stop a programmatic
+   .focus() from raising the OS keyboard at all. */
+.remote-desktop-mobile-hidden-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+  overflow: hidden;
+  pointer-events: none;
 }
 
 .remote-desktop-mobile-shortcuts {

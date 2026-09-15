@@ -1345,6 +1345,9 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     act(() => { (keyboardButton as HTMLButtonElement).click(); });
 
     const input = getByRole('textbox', { name: 'remote_desktop.mobile_text_input' }) as HTMLTextAreaElement;
+    // Focus/composition target only -- what is typed lands on the remote
+    // screen, so this element itself must never render as a visible box.
+    expect(input.classList.contains('remote-desktop-mobile-hidden-input')).toBe(true);
     input.focus();
     expect(document.activeElement).toBe(input);
 
