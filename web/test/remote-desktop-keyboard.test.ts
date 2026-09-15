@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   detectRemoteDesktopClipboardShortcut,
+  focusRemoteDesktopMobileInput,
   mapRemoteDesktopKeyboardEvent,
   REMOTE_DESKTOP_CLIPBOARD_SHORTCUT,
+  REMOTE_DESKTOP_MOBILE_INPUT_ACCESSORY_SUPPRESS_MS,
   REMOTE_DESKTOP_MOBILE_SHORTCUT_IDS,
   remoteDesktopCommandBridge,
   remoteDesktopMobileDeletionKey,
@@ -208,5 +210,38 @@ describe('clipboard shortcuts', () => {
     expect(detectRemoteDesktopClipboardShortcut(key({ ctrlKey: true, altKey: true }), 'Win32')).toBeNull();
     expect(detectRemoteDesktopClipboardShortcut(key({ code: 'KeyX', ctrlKey: true }), 'Win32')).toBeNull();
     expect(detectRemoteDesktopClipboardShortcut(key({}), 'Win32')).toBeNull();
+  });
+});
+
+describe('focusRemoteDesktopMobileInput', () => {
+  it('does nothing for a null or undefined input', () => {
+    expect(() => focusRemoteDesktopMobileInput(null)).not.toThrow();
+    expect(() => focusRemoteDesktopMobileInput(undefined)).not.toThrow();
+  });
+
+  it('makes the field briefly read-only/disabled (so iOS never draws its accessory bar), then clears both and refocuses it', () => {
+    vi.useFakeTimers();
+    try {
+      const input = document.createElement('textarea');
+      document.body.appendChild(input);
+      const focusSpy = vi.spyOn(input, 'focus');
+
+      focusRemoteDesktopMobileInput(input);
+      // iOS decides whether to draw its accessory bar at this exact instant --
+      // the field must already look non-editable, and must not yet be refocused.
+      expect(input.hasAttribute('readonly')).toBe(true);
+      expect(input.hasAttribute('disabled')).toBe(true);
+      expect(focusSpy).not.toHaveBeenCalled();
+
+      vi.advanceTimersByTime(REMOTE_DESKTOP_MOBILE_INPUT_ACCESSORY_SUPPRESS_MS);
+      expect(input.hasAttribute('readonly')).toBe(false);
+      expect(input.hasAttribute('disabled')).toBe(false);
+      expect(focusSpy).toHaveBeenCalledTimes(1);
+      expect(focusSpy).toHaveBeenCalledWith({ preventScroll: true });
+
+      document.body.removeChild(input);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

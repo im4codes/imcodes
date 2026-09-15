@@ -1338,7 +1338,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(container.querySelector('.remote-desktop-clipboard-toast')).toBeNull();
   });
 
-  it('keeps the mobile IME focused, commits composed text once, and sends shortcut chords', async () => {
+  it('keeps the mobile IME focused and commits composed text once', async () => {
     const { container, getByRole } = await renderPanel();
     const keyboardButton = getByRole('button', { name: 'remote_desktop.mobile_keyboard' });
     expect(keyboardButton.textContent).toBe('⌨');
@@ -1405,17 +1405,6 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     ]);
     expect(text.mock.calls).toEqual([['你'], ['b']]);
     expect(document.activeElement).toBe(input);
-
-    key.mockClear();
-    act(() => {
-      (getByRole('button', { name: 'remote_desktop.shortcut_select_all' }) as HTMLButtonElement).click();
-    });
-    expect(key.mock.calls).toEqual([
-      ['ControlLeft', 'Control', true, false, { control: true, alt: false }],
-      ['KeyA', 'a', true, false, { control: true, alt: false }],
-      ['KeyA', 'a', false, false, { control: true, alt: false }],
-      ['ControlLeft', 'Control', false, false, { control: true, alt: false }],
-    ]);
     expect(container.querySelector('.remote-desktop-mobile-keyboard')).not.toBeNull();
   });
 

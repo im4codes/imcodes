@@ -10909,13 +10909,16 @@ button.quick-agent-delegation-preset.active {
 
 .remote-desktop-mobile-keyboard-tabs {
   display: flex;
+  flex: 1 1 auto;
   gap: 6px;
 }
 
 .remote-desktop-mobile-keyboard-tabs button {
+  flex: 1 1 50%;
   padding: 5px 12px;
   font-size: 13px;
   color: #9fd6ee;
+  text-align: center;
   background: rgb(15 41 59 / 70%);
   border: 1px solid rgb(101 207 255 / 24%);
   border-radius: 7px;
@@ -10953,29 +10956,6 @@ button.quick-agent-delegation-preset.active {
   opacity: 0;
   overflow: hidden;
   pointer-events: none;
-}
-
-.remote-desktop-mobile-shortcuts {
-  display: flex;
-  gap: 6px;
-  overflow-x: auto;
-  padding-bottom: 2px;
-  scrollbar-width: thin;
-}
-
-.remote-desktop-mobile-shortcuts button {
-  flex: 0 0 auto;
-  min-height: 34px;
-  padding: 5px 9px;
-  color: #dff7ff;
-  background: linear-gradient(180deg, #153b54, #0b2639);
-  border: 1px solid #326d8f;
-  border-radius: 8px;
-}
-
-.remote-desktop-mobile-shortcuts button:active {
-  color: #03131d;
-  background: #6bd9ff;
 }
 
 .remote-desktop-computer-keyboard {

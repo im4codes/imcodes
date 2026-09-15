@@ -48,17 +48,15 @@ import {
   type RemoteDesktopManagedConnection,
 } from '../remote-desktop-connection-manager.js';
 import {
-  REMOTE_DESKTOP_MOBILE_SHORTCUT_IDS,
   REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS,
   detectRemoteDesktopClipboardShortcut,
+  focusRemoteDesktopMobileInput,
   mapRemoteDesktopKeyboardEvent,
   readControllerPlatform,
   remoteDesktopCommandBridge,
   remoteDesktopComputerKeyLabel,
-  remoteDesktopMobileShortcutKeys,
   REMOTE_DESKTOP_CLIPBOARD_SHORTCUT,
   remoteDesktopMobileDeletionKey,
-  remoteDesktopShortcutLabel,
   sendRemoteDesktopChord,
   type RemoteDesktopChordKey,
   type RemoteDesktopComputerKeySpec,
@@ -2059,7 +2057,7 @@ export function RemoteDesktopPanel({
     if (!snapshot.inputEnabled) return;
     setMobileKeyboardTab('ime');
     setMobileTextOpen(true);
-    requestAnimationFrame(() => mobileTextInputRef.current?.focus({ preventScroll: true }));
+    requestAnimationFrame(() => focusRemoteDesktopMobileInput(mobileTextInputRef.current));
   };
 
   // Re-measure whenever the panel is open: the OS keyboard can come and go
@@ -2109,7 +2107,7 @@ export function RemoteDesktopPanel({
   const switchMobileKeyboardTab = (tab: MobileKeyboardTab) => {
     if (mobileKeyboardTab === 'keys' && tab !== 'keys') releaseHeldComboKeys();
     setMobileKeyboardTab(tab);
-    if (tab === 'ime') requestAnimationFrame(() => mobileTextInputRef.current?.focus({ preventScroll: true }));
+    if (tab === 'ime') requestAnimationFrame(() => focusRemoteDesktopMobileInput(mobileTextInputRef.current));
   };
 
   const closeMobileKeyboard = () => {
@@ -2175,7 +2173,7 @@ export function RemoteDesktopPanel({
       (code, key, down, repeat, modifiers) => client.key(code, key, down, repeat, modifiers),
       () => client.releaseAll(),
     );
-    mobileTextInputRef.current?.focus({ preventScroll: true });
+    focusRemoteDesktopMobileInput(mobileTextInputRef.current);
   };
 
   const fetchFile = async (requestedPath: string) => {
@@ -2858,29 +2856,6 @@ export function RemoteDesktopPanel({
                   onKeyDown={(event) => event.stopPropagation()}
                   onKeyUp={(event) => event.stopPropagation()}
                 />
-                <div class="remote-desktop-mobile-shortcuts" aria-label={t('remote_desktop.mobile_shortcuts')}>
-                  {REMOTE_DESKTOP_MOBILE_SHORTCUT_IDS.map((id) => (
-                    <button
-                      key={id}
-                      type="button"
-                      aria-label={t(`remote_desktop.shortcut_${id}`)}
-                      onPointerDown={(event) => event.preventDefault()}
-                      onClick={() => sendMobileShortcut(remoteDesktopMobileShortcutKeys(id, targetPlatform))}
-                    >{remoteDesktopShortcutLabel(id, targetPlatform)}</button>
-                  ))}
-                  <button
-                    type="button"
-                    aria-label={t('remote_desktop.copy_remote_selection')}
-                    onPointerDown={(event) => event.preventDefault()}
-                    onClick={() => { void copyRemoteSelection(); }}
-                  >{t('remote_desktop.copy_remote_selection')}</button>
-                  <button
-                    type="button"
-                    aria-label={t('remote_desktop.paste_local_clipboard')}
-                    onPointerDown={(event) => event.preventDefault()}
-                    onClick={() => { void pasteLocalClipboard(); }}
-                  >{t('remote_desktop.paste_local_clipboard')}</button>
-                </div>
               </>
             )}
 

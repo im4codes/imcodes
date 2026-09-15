@@ -310,6 +310,38 @@ export function remoteDesktopComputerKeyLabel(
   return COMPUTER_KEY_LABELS[spec.code] ?? spec.key;
 }
 
+/** How long the mobile IME target stays read-only/disabled before regaining focus — see {@link focusRemoteDesktopMobileInput}. */
+export const REMOTE_DESKTOP_MOBILE_INPUT_ACCESSORY_SUPPRESS_MS = 100;
+
+/**
+ * Focus the mobile hidden IME textarea while suppressing iOS Safari/
+ * WKWebView's own accessory toolbar — the "Previous"/"Next" field-navigation
+ * chevrons plus a Done/checkmark button it otherwise draws above the system
+ * keyboard for any focused text field. There is nothing to navigate to or
+ * confirm on this invisible IME target (what is typed lands directly on the
+ * remote screen), and the bar just eats screen space above an already
+ * cramped mobile keyboard.
+ *
+ * iOS decides whether to draw the bar at the exact moment a field becomes
+ * focused and editable, so the standard purely-web workaround is to make the
+ * field briefly read-only/disabled at that instant, then clear both and
+ * refocus a beat later: iOS never draws the bar for a field it observed as
+ * non-editable when the keyboard was requested. Every call site that focuses
+ * this textarea MUST go through here rather than calling `.focus()` directly,
+ * so the bar stays suppressed across every path (opening the panel,
+ * switching back from the Keys tab, and after sending a shortcut chord).
+ */
+export function focusRemoteDesktopMobileInput(input: HTMLTextAreaElement | null | undefined): void {
+  if (!input) return;
+  input.setAttribute('readonly', 'readonly');
+  input.setAttribute('disabled', 'true');
+  setTimeout(() => {
+    input.removeAttribute('readonly');
+    input.removeAttribute('disabled');
+    input.focus({ preventScroll: true });
+  }, REMOTE_DESKTOP_MOBILE_INPUT_ACCESSORY_SUPPRESS_MS);
+}
+
 export function sendRemoteDesktopChord(
   keys: readonly RemoteDesktopChordKey[],
   send: (
