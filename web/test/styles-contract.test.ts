@@ -1097,6 +1097,23 @@ describe('styles.css regression contracts', () => {
     expect(surfaceRule).toMatch(/pointer-events:\s*auto/);
   });
 
+  // iOS Safari's own long-press callout (the "Copy"/selection loupe) is a
+  // separate mechanism from touch-action: none, and fires on the actual
+  // touch target -- the input-surface div, since the video itself is
+  // pointer-events:none -- unless explicitly suppressed. Without this, a
+  // long-press meant to become a right-click showed the system callout
+  // instead of ever reaching RemoteDesktopPanel's own gesture timer.
+  it('suppresses iOS long-press callout on the remote-desktop touch surfaces', () => {
+    const stageRule = css.match(/\.remote-desktop-stage\s*\{[^}]*\}/)?.[0];
+    expect(stageRule, '.remote-desktop-stage rule missing').toBeTruthy();
+    expect(stageRule).toMatch(/-webkit-touch-callout:\s*none/);
+    expect(stageRule).toMatch(/-webkit-user-select:\s*none/);
+    const surfaceRule = css.match(/\.remote-desktop-input-surface\s*\{[^}]*\}/)?.[0];
+    expect(surfaceRule, '.remote-desktop-input-surface rule missing').toBeTruthy();
+    expect(surfaceRule).toMatch(/-webkit-touch-callout:\s*none/);
+    expect(surfaceRule).toMatch(/-webkit-user-select:\s*none/);
+  });
+
   // Transport sessions zero the toolbar's left padding, and they are the only
   // sessions that render a Stop button -- so matching `.shortcuts` alone would
   // leave the exact case this alignment exists for still misaligned.

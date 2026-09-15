@@ -10868,6 +10868,16 @@ button.quick-agent-delegation-preset.active {
   background: #02050a;
   outline: none;
   touch-action: none;
+  /* touch-action:none alone does not stop iOS Safari's own long-press
+     callout (the "Copy"/selection loupe, or a system haptic) from firing on
+     a touch that our JS reads perfectly correctly as a long-press-to-
+     right-click gesture: the two are separate mechanisms, and the native
+     callout intercepting the gesture is what made it look like long-press
+     simply did nothing. Same suppression this codebase already uses for
+     every other custom touch-gesture surface (.chat-view, .subsession-bar). */
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 .remote-desktop-mobile-keyboard {
@@ -11130,6 +11140,12 @@ button.quick-agent-delegation-preset.active {
   transform: translateZ(0);
   pointer-events: auto;
   touch-action: none;
+  /* This div, not the video underneath it (pointer-events:none there), is
+     the actual touch target -- so it is what needs iOS's own long-press
+     callout suppressed, the same as .remote-desktop-stage above. */
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 .remote-desktop-virtual-pointer {
