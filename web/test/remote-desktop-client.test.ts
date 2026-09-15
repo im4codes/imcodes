@@ -146,8 +146,14 @@ class FakePeer extends EventTarget {
   offerOptions: Array<RTCOfferOptions | undefined> = [];
   configuration: RTCConfiguration = {};
 
+  lastTransceiverReceiver: { playoutDelayHint?: number } = {};
+
   addTransceiver(): RTCRtpTransceiver {
-    return { setCodecPreferences: vi.fn() } as unknown as RTCRtpTransceiver;
+    this.lastTransceiverReceiver = {};
+    return {
+      setCodecPreferences: vi.fn(),
+      receiver: this.lastTransceiverReceiver,
+    } as unknown as RTCRtpTransceiver;
   }
 
   createDataChannel(label: string, options: RTCDataChannelInit): RTCDataChannel {
@@ -286,6 +292,45 @@ describe('RemoteDesktopClient', () => {
     peer.dispatchEvent(new Event('connectionstatechange'));
     expect(readRemoteDesktopBrowserDiagnostics('controlled-win')).toHaveLength(eventCountAtStop);
     vi.useRealTimers();
+  });
+
+  it('hints the video receiver to minimize jitter-buffer playout delay', async () => {
+    let socket!: FakeSocket;
+    let peer!: FakePeer;
+    const client = new RemoteDesktopClient('controlled-win', { onSnapshot: vi.fn() }, {
+      fetchTicket: async () => 'ticket-playout',
+      createSocket: () => {
+        socket = new FakeSocket();
+        queueMicrotask(() => socket.open());
+        return socket as unknown as WebSocket;
+      },
+      createPeer: () => {
+        peer = new FakePeer();
+        return peer as unknown as RTCPeerConnection;
+      },
+    });
+
+    await client.start();
+    const start = JSON.parse(socket.sent[0]!) as { requestId: string };
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      requestId: start.requestId,
+      sessionId: 'session_playout1',
+      capability: 'e'.repeat(43),
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 1,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      iceServers: [],
+    });
+    await vi.waitFor(() => expect(peer).toBeDefined());
+
+    // Every frame the jitter buffer holds back is uniform added latency for a
+    // desktop the operator is actively controlling live -- Chrome's default
+    // favors smooth playback over that, which is backwards here.
+    expect(peer.lastTransceiverReceiver.playoutDelayHint).toBe(0);
+    client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
   });
 
   it('retries a weak signaling path and resumes the same peer without remounting its stream', async () => {

@@ -1128,6 +1128,17 @@ export class RemoteDesktopClient {
       ? RTCRtpReceiver.getCapabilities?.('video')
       : null;
     if (capabilities) applyH264ReceiveCodecPreference(transceiver, capabilities.codecs);
+    // Non-standard, Chromium-only: hints the jitter buffer to minimize
+    // buffering rather than smooth over network jitter, the same tradeoff
+    // cloud-gaming/remote-control WebRTC products make. Chrome's default
+    // playout delay favors smooth video over latency, which is backwards for
+    // a desktop the operator is actively controlling live -- every frame the
+    // jitter buffer holds back is added, uniform latency regardless of how
+    // quickly the encoder and network actually delivered it. Best-effort:
+    // absent on Safari/Firefox, so this silently no-ops there.
+    if (transceiver.receiver) {
+      (transceiver.receiver as unknown as { playoutDelayHint?: number }).playoutDelayHint = 0;
+    }
     this.createDataChannels(peer);
     peer.addEventListener('track', (event) => {
       this.diagnosticTrackCleanup?.();
