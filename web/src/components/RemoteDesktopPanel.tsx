@@ -51,6 +51,7 @@ import {
   REMOTE_DESKTOP_COMPUTER_KEYBOARD_PAGES,
   detectRemoteDesktopClipboardShortcut,
   focusRemoteDesktopMobileInput,
+  isAppleControllerPlatform,
   mapRemoteDesktopKeyboardEvent,
   readControllerPlatform,
   remoteDesktopCommandBridge,
@@ -1864,11 +1865,20 @@ export function RemoteDesktopPanel({
     // selection — so an interrupt in a remote console keeps working.
     const clipboardShortcut = detectRemoteDesktopClipboardShortcut(event);
     if (clipboardShortcut === REMOTE_DESKTOP_CLIPBOARD_SHORTCUT.PASTE
-      && !navigator.clipboard?.readText) {
-      // No clipboard read here (Firefox, non-secure contexts): leave the key
-      // alone so the browser raises its own paste event, which carries the text
-      // without needing permission. Not forwarding it keeps the remote from
-      // pasting its own clipboard on top.
+      && (!navigator.clipboard?.readText || isAppleControllerPlatform(readControllerPlatform()))) {
+      // No clipboard read here: leave the key alone so the browser raises its
+      // own native paste event instead, which carries the text without going
+      // through navigator.clipboard.readText(). Two cases need this, for
+      // different reasons:
+      //  - Firefox and non-secure contexts: readText() isn't available at all.
+      //  - Safari/WebKit (macOS, and especially iOS/iPadOS): it IS available,
+      //    but calling it -- even synchronously inside this keydown's own
+      //    handler -- makes WebKit show its own "Paste" confirmation callout
+      //    every single time, which a real Cmd+V/Ctrl+V never needs. Letting
+      //    the OS's own paste gesture reach the browser natively (handled by
+      //    onPaste below) avoids that callout entirely.
+      // Not forwarding the keystroke to the remote either way keeps it from
+      // pasting its own clipboard on top once this one lands.
       return;
     }
     if (clipboardShortcut) {

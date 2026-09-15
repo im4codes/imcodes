@@ -1312,6 +1312,70 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith('selected remotely');
   });
 
+  it('defers Cmd+V on an Apple controller to the native paste event instead of prompting via readText()', async () => {
+    // Safari/WebKit shows its own "Paste" confirmation callout every time
+    // navigator.clipboard.readText() is called, even from inside the
+    // keydown handler itself -- something a real Cmd+V paste never needs.
+    // Leaving the keystroke alone lets the OS's own paste reach the browser
+    // as a native `paste` event instead, with no extra confirmation.
+    const readText = vi.fn(async () => 'should not be read');
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { readText, writeText: vi.fn(async () => {}) },
+    });
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'MacIntel' });
+    try {
+      const { stage } = await renderPanel();
+      const cmdV = new KeyboardEvent('keydown', {
+        bubbles: true,
+        cancelable: true,
+        code: 'KeyV',
+        key: 'v',
+        metaKey: true,
+      });
+      act(() => stage.dispatchEvent(cmdV));
+      expect(readText).not.toHaveBeenCalled();
+      expect(key).not.toHaveBeenCalledWith('KeyV', expect.anything(), expect.anything(), expect.anything(), expect.anything());
+      // The keystroke was left alone (not preventDefault'd, not forwarded),
+      // so it also never reaches the remote -- only the native paste event
+      // that follows a real Cmd+V does.
+      expect(cmdV.defaultPrevented).toBe(false);
+
+      const pasteEvent = new Event('paste', { bubbles: true, cancelable: true });
+      Object.defineProperty(pasteEvent, 'clipboardData', {
+        value: { getData: vi.fn(() => 'pasted via native event') },
+      });
+      act(() => stage.dispatchEvent(pasteEvent));
+      expect(text).toHaveBeenCalledWith('pasted via native event');
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
+  });
+
+  it('still reads the clipboard directly for Ctrl+V on a non-Apple controller', async () => {
+    const readText = vi.fn(async () => 'from readText');
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { readText, writeText: vi.fn(async () => {}) },
+    });
+    const { stage } = await renderPanel();
+    const ctrlV = new KeyboardEvent('keydown', {
+      bubbles: true,
+      cancelable: true,
+      code: 'KeyV',
+      key: 'v',
+      ctrlKey: true,
+    });
+    await act(async () => {
+      stage.dispatchEvent(ctrlV);
+      await Promise.resolve();
+    });
+    expect(readText).toHaveBeenCalledTimes(1);
+    expect(text).toHaveBeenCalledWith('from readText');
+    expect(ctrlV.defaultPrevented).toBe(true);
+  });
+
   it('shows a clipboard result as a floating toast that fades on its own', async () => {
     // The toolbar used to reserve a permanent min-width column for this text,
     // empty most of the time. It is now only in the DOM while a result is
