@@ -550,6 +550,13 @@ export function FileBrowser({
   const navigateToRef = useRef<(path: string) => void>(() => {});
   const currentLabelRef = useRef(currentLabel);
   useEffect(() => { currentLabelRef.current = currentLabel; }, [currentLabel]);
+  // The last root-level location a fetch actually resolved -- distinct from
+  // currentLabelRef, which by the time a failed fetch's response arrives
+  // already holds the OPTIMISTIC (possibly bogus, e.g. an unresolved
+  // ":downloads:" sentinel) label jumpTo set before the request even went
+  // out. A failed root navigation reverts HERE, not to whatever currentLabel
+  // happens to be at that moment.
+  const lastGoodLabelRef = useRef(initialTreeSnapshot?.currentLabel ?? startPath);
   useEffect(() => { onCurrentPathChange?.(currentLabel); }, [currentLabel, onCurrentPathChange]);
   const dataRef = useRef(data);
   useEffect(() => { dataRef.current = data; }, [data]);
@@ -845,6 +852,23 @@ export function FileBrowser({
 
         if (msg.status === 'error') {
           setError(msg.error ?? 'Unknown error');
+          // A failed fetch for the CURRENT root location (as opposed to one
+          // nested child the user expanded deeper in the tree) must not
+          // leave the browser stuck showing a fake, unresolved location with
+          // no way out -- e.g. a quick-access sentinel like ":downloads:"
+          // that the controlled node refused to resolve (see
+          // well-known-directories.ts's fail-closed behavior for a root
+          // LaunchDaemon with no verifiable console user). Bounce back to
+          // the last place a fetch actually succeeded, the same way a failed
+          // browser navigation does, instead of rendering an empty "folder"
+          // literally named after the sentinel forever. Guarded against
+          // reverting to itself (the very first fetch failing has nowhere
+          // better to go) so this can never loop.
+          const isRootLevelFailure = dataRef.current[0]?.id === nodeId;
+          if (isRootLevelFailure && lastGoodLabelRef.current !== nodeId) {
+            navigateToRef.current(lastGoodLabelRef.current);
+            return;
+          }
           setData((prev) => updateNode(prev, nodeId, { isLoading: false }));
           return;
         }
@@ -884,7 +908,12 @@ export function FileBrowser({
             return next;
           });
         }
-        setCurrentLabel(resolvedParent === WINDOWS_DRIVES_ROOT ? t('file_browser.this_pc') : resolvedParent);
+        const nextLabel = resolvedParent === WINDOWS_DRIVES_ROOT ? t('file_browser.this_pc') : resolvedParent;
+        setCurrentLabel(nextLabel);
+        // Only a root-level fetch changes "where the browser currently is";
+        // a nested child expanding deeper in the tree must not move the
+        // fallback a failed root navigation would revert to.
+        if (dataRef.current[0]?.id === nodeId) lastGoodLabelRef.current = nextLabel;
         setError(null);
 
         // If highlightPath is under this dir, auto-expand

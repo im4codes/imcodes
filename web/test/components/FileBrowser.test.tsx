@@ -58,6 +58,7 @@ vi.mock('../../src/direct-file-transfer.js', () => directFileTransferMocks);
 import { FileBrowser, __resetFileBrowserSharedChangesForTests, mergePreviewState, getParentDir } from '../../src/components/FileBrowser.js';
 import type { WsClient, ServerMessage } from '../../src/ws-client.js';
 import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
+import { FILE_TRANSFER_DIRECTORY_PATH } from '../../../shared/transport/file-transfer.js';
 import {
   __resetDownloadTransfersForTests,
   getDownloadTransfers,
@@ -84,6 +85,9 @@ vi.mock('react-i18next', () => {
     'file_browser.show_hidden': 'Hidden',
     'file_browser.this_pc': 'This PC',
     'file_browser.home': 'Home',
+    'file_browser.desktop': 'Desktop',
+    'file_browser.downloads': 'Downloads',
+    'file_browser.documents': 'Documents',
     'file_browser.timeout': 'Request timed out',
     'file_browser.mkdir_failed': 'Failed to create folder',
     'file_browser.create_file_failed': 'Failed to create file',
@@ -964,6 +968,80 @@ describe('FileBrowser', () => {
 
     // Error shown as ⚠ button with error message in title tooltip
     expect(getByTitle('forbidden_path')).toBeDefined();
+  });
+
+  it('bounces back to the last good location when a quick-access sentinel fails to resolve', async () => {
+    // Reproduces the stuck-Desktop/Downloads-button bug: a controlled node
+    // that fails closed on an unresolvable well-known directory (e.g. no
+    // verifiable console user) used to leave the browser permanently showing
+    // an empty folder literally named after the raw sentinel, with no way
+    // to navigate away. jumpTo() optimistically shows the sentinel before
+    // the fetch resolves; on error the browser must revert instead of
+    // getting stuck.
+    const { ws, respond, respondError, fsListDir } = makeWsFactory();
+    const onCurrentPathChange = vi.fn();
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="dir-only"
+        layout="panel"
+        initialPath="/home/user"
+        quickAccess
+        onCurrentPathChange={onCurrentPathChange}
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    await act(async () => { respond([{ name: 'projects', isDir: true }], '/home/user'); });
+    expect(onCurrentPathChange).toHaveBeenLastCalledWith('/home/user');
+
+    fsListDir.mockClear();
+    fireEvent.click(view.getByTitle('Downloads'));
+    expect(fsListDir).toHaveBeenCalledWith(FILE_TRANSFER_DIRECTORY_PATH.DOWNLOADS, false, false);
+    // Optimistic placeholder is showing the raw, unresolved sentinel.
+    expect(onCurrentPathChange).toHaveBeenLastCalledWith(FILE_TRANSFER_DIRECTORY_PATH.DOWNLOADS);
+
+    await act(async () => { respondError('directory_not_verifiable'); });
+
+    // Must have bounced back to the last known-good root, not stay stuck on
+    // the sentinel or show it as a real (empty) folder.
+    expect(onCurrentPathChange).toHaveBeenLastCalledWith('/home/user');
+    expect(fsListDir).toHaveBeenLastCalledWith('/home/user', false, false);
+
+    // And the bounce-back fetch resolving normally clears the error and
+    // shows real content again.
+    await act(async () => { respond([{ name: 'projects', isDir: true }], '/home/user'); });
+    expect(await view.findByText('projects')).toBeDefined();
+  });
+
+  it('does not treat a failed nested-child fetch as a reason to leave the current root', async () => {
+    // Only a failure of the CURRENTLY DISPLAYED root should trigger a bounce
+    // back to the last good location. A child the user expanded deeper in
+    // the tree failing to load must not yank the whole browser back to root.
+    const { ws, respond, respondError, fsListDir } = makeWsFactory();
+    const view = render(
+      <FileBrowser
+        ws={ws}
+        mode="dir-only"
+        layout="modal"
+        initialPath="/home/user"
+        onConfirm={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    await act(async () => { respond([{ name: 'projects', isDir: true }], '/home/user'); });
+
+    // Expand the child directory (its own fs.ls request); the response that
+    // eventually errors targets a *child* node, not the root.
+    await act(async () => { fireEvent.click(view.getByText('projects')); });
+    expect(fsListDir).toHaveBeenLastCalledWith('/home/user/projects', false, false);
+    fsListDir.mockClear();
+    await act(async () => { respondError('permission_denied'); });
+
+    // No bounce-back re-fetch of the root (or anywhere else) was triggered.
+    expect(fsListDir).not.toHaveBeenCalled();
+    expect(view.getByTitle('permission_denied')).toBeDefined();
   });
 
   it('does not re-fetch already loaded directories', async () => {
