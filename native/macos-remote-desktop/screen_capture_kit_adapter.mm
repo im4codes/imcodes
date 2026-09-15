@@ -524,8 +524,21 @@ class AppleScreenCaptureKitBackend final : public ScreenCaptureKitBackend {
 
     IMCodesScreenCaptureOutput* output =
         [[IMCodesScreenCaptureOutput alloc] init];
+    // Every captured frame is encoded synchronously on whatever thread
+    // SCStream calls this queue's block on (Encode() runs inline inside
+    // Deliver(), not dispatched elsewhere) -- so this queue's QoS is the
+    // scheduling priority of the entire capture-to-encode path, every frame,
+    // for the life of the session. An unqualified DISPATCH_QUEUE_SERIAL gets
+    // QOS_CLASS_UNSPECIFIED, which the system is free to schedule behind
+    // ordinary or even background work under any real contention (another
+    // app compiling, Spotlight indexing, thermal pressure); this is a
+    // real-time interactive stream the operator is watching live, so it gets
+    // the same top QoS class AVFoundation/ScreenCaptureKit's own sample code
+    // uses for capture output queues.
+    dispatch_queue_attr_t queue_attributes = dispatch_queue_attr_make_with_qos_class(
+        DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
     dispatch_queue_t queue = dispatch_queue_create(
-        "codes.im.remote-desktop.capture", DISPATCH_QUEUE_SERIAL);
+        "codes.im.remote-desktop.capture", queue_attributes);
     SCStream* stream = [[SCStream alloc] initWithFilter:filter
                                           configuration:stream_configuration
                                                delegate:output];
