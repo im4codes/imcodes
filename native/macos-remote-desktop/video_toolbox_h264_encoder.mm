@@ -161,6 +161,25 @@ bool ConfigureLowLatencyProperties(
                    kCFBooleanFalse, error)) {
     return false;
   }
+  // RealTime and AllowFrameReordering=false rule out B-frame reordering delay,
+  // but neither one bounds a SEPARATE VideoToolbox behavior: a hardware
+  // encoder is otherwise free to hold onto a short internal pipeline of
+  // pending frames -- multiple frames of real, user-visible latency, on top
+  // of whatever the reordering setting already prevents -- to keep its
+  // internal throughput up. 0 tells it to encode and emit every frame before
+  // accepting the next one, matching the single-frame-at-a-time pipeline
+  // this adapter already runs end to end (Encode() is synchronous; the
+  // shared limits.max_pending_frames backpressure is 2). Best-effort: some
+  // encoder/OS combination that does not support the property must not turn
+  // a latency tweak into "no video at all" by failing session creation.
+  {
+    const std::int32_t max_frame_delay_count_value = 0;
+    CFNumberRef max_frame_delay_count = CFNumberCreate(
+        kCFAllocatorDefault, kCFNumberSInt32Type, &max_frame_delay_count_value);
+    VTSessionSetProperty(session, kVTCompressionPropertyKey_MaxFrameDelayCount,
+                         max_frame_delay_count);
+    CFRelease(max_frame_delay_count);
+  }
 
   CFStringRef profile_level = ProfileLevel(configuration.profile);
   if (profile_level == nullptr) {
