@@ -3674,6 +3674,8 @@
     "mobile_keyboard_tab_keys": "Teclas",
     "combo_mode": "Modo de combinación de teclas",
     "computer_key": "Tecla {{key}}",
+    "computer_keyboard_pages": "Páginas del teclado",
+    "computer_keyboard_page": "Página {{page}}",
     "files": "Archivos",
     "close_files": "Cerrar panel de archivos",
     "file_transfer_hint": "Elige una carpeta remota y suelta archivos para enviarlos.",

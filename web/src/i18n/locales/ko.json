@@ -3673,6 +3673,8 @@
     "mobile_keyboard_tab_keys": "키보드",
     "combo_mode": "조합키 모드",
     "computer_key": "키 {{key}}",
+    "computer_keyboard_pages": "키보드 페이지",
+    "computer_keyboard_page": "{{page}} 페이지",
     "files": "파일",
     "close_files": "파일 패널 닫기",
     "file_transfer_hint": "원격 폴더를 고른 뒤 파일을 끌어 놓아 전송하세요.",

@@ -3673,6 +3673,8 @@
     "mobile_keyboard_tab_keys": "キーボード",
     "combo_mode": "組み合わせキーモード",
     "computer_key": "キー {{key}}",
+    "computer_keyboard_pages": "キーボードページ",
+    "computer_keyboard_page": "ページ {{page}}",
     "files": "ファイル",
     "close_files": "ファイルパネルを閉じる",
     "file_transfer_hint": "リモートフォルダーを選び、ファイルをドロップして送信します。",

@@ -1580,6 +1580,64 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(key).toHaveBeenCalledWith('ShiftLeft', 'Shift', false, false, { control: false, alt: false });
   });
 
+  it('swipes between computer-keyboard pages and sends a page-two letter key', async () => {
+    const { container, getByRole } = await renderPanel();
+    act(() => { (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });
+    act(() => {
+      (getByRole('tab', { name: 'remote_desktop.mobile_keyboard_tab_keys' }) as HTMLButtonElement).click();
+    });
+    const track = container.querySelector('.remote-desktop-computer-keyboard-track') as HTMLElement;
+    const pages = container.querySelector('.remote-desktop-computer-keyboard-pages') as HTMLElement;
+    Object.defineProperty(pages, 'clientWidth', { value: 400, configurable: true });
+    const keyButton = (label: string) => Array.from(
+      container.querySelectorAll<HTMLButtonElement>('.remote-desktop-computer-keyboard-row button'),
+    ).find((button) => button.textContent === label)!;
+
+    // Page one is showing by default.
+    expect(keyButton('F5')).toBeDefined();
+    expect(track.style.transform).toContain('translateX(calc(0%');
+
+    // A left-swipe well past the 20% commit threshold flips to page two.
+    act(() => {
+      pointer(pages, 'pointerdown', { pointerId: 9, clientX: 300, clientY: 200 });
+      pointer(pages, 'pointermove', { pointerId: 9, clientX: 200, clientY: 200 });
+      pointer(pages, 'pointermove', { pointerId: 9, clientX: 150, clientY: 200 });
+      pointer(pages, 'pointerup', { pointerId: 9, clientX: 150, clientY: 200 });
+    });
+    expect(track.style.transform).toContain('translateX(calc(-50%');
+
+    key.mockClear();
+    act(() => { keyButton('Q').click(); });
+    expect(key.mock.calls).toEqual([
+      ['KeyQ', 'q', true, false, { control: false, alt: false }],
+      ['KeyQ', 'q', false, false, { control: false, alt: false }],
+    ]);
+
+    // A tap on the first dot swipes back to page one.
+    const dots = container.querySelectorAll<HTMLButtonElement>('.remote-desktop-computer-keyboard-dots button');
+    expect(dots).toHaveLength(2);
+    act(() => { dots[0].click(); });
+    expect(track.style.transform).toContain('translateX(calc(0%');
+  });
+
+  it('does not flip pages on a drag that never crosses the commit threshold', async () => {
+    const { container, getByRole } = await renderPanel();
+    act(() => { (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });
+    act(() => {
+      (getByRole('tab', { name: 'remote_desktop.mobile_keyboard_tab_keys' }) as HTMLButtonElement).click();
+    });
+    const track = container.querySelector('.remote-desktop-computer-keyboard-track') as HTMLElement;
+    const pages = container.querySelector('.remote-desktop-computer-keyboard-pages') as HTMLElement;
+    Object.defineProperty(pages, 'clientWidth', { value: 400, configurable: true });
+
+    act(() => {
+      pointer(pages, 'pointerdown', { pointerId: 10, clientX: 300, clientY: 200 });
+      pointer(pages, 'pointermove', { pointerId: 10, clientX: 280, clientY: 200 });
+      pointer(pages, 'pointerup', { pointerId: 10, clientX: 280, clientY: 200 });
+    });
+    expect(track.style.transform).toContain('translateX(calc(0%');
+  });
+
   it('opens the focused display resolution menu from the keyboard context-menu gesture', async () => {
     const { getByRole } = await renderPanel();
     const displayTab = getByRole('tab', { name: 'Display 1' });

@@ -3674,6 +3674,8 @@
     "mobile_keyboard_tab_keys": "Keys",
     "combo_mode": "Combo key mode",
     "computer_key": "Key {{key}}",
+    "computer_keyboard_pages": "Keyboard pages",
+    "computer_keyboard_page": "Page {{page}}",
     "files": "Files",
     "close_files": "Close files",
     "file_transfer_hint": "Choose a remote folder, then drop files to send them.",

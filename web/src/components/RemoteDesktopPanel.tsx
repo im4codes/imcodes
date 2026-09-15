@@ -48,7 +48,7 @@ import {
   type RemoteDesktopManagedConnection,
 } from '../remote-desktop-connection-manager.js';
 import {
-  REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS,
+  REMOTE_DESKTOP_COMPUTER_KEYBOARD_PAGES,
   detectRemoteDesktopClipboardShortcut,
   focusRemoteDesktopMobileInput,
   mapRemoteDesktopKeyboardEvent,
@@ -244,6 +244,12 @@ const TOUCH_TWO_FINGER_CLASSIFY_PX = 8;
 // Matches the virtual-mouse wheel handle's own gain (below), so two-finger
 // scroll on the video and dragging that handle feel the same.
 const TOUCH_TWO_FINGER_SCROLL_GAIN = 8;
+// Same jitter-filter idea as the two-finger video gesture above, for
+// swiping between computer-keyboard pages: how far a drag has to move
+// before it commits to being a swipe, and what fraction of the page's own
+// width it then has to cross to flip pages instead of springing back.
+const COMPUTER_KEYBOARD_SWIPE_JITTER_PX = 8;
+const COMPUTER_KEYBOARD_SWIPE_COMMIT_RATIO = 0.2;
 const REMOTE_DESKTOP_CONNECTION_STEPS = [
   'authorize',
   'worker',
@@ -399,6 +405,23 @@ export function RemoteDesktopPanel({
   // Modifiers latched down in combo mode, waiting for either a second tap
   // (release) or a non-modifier key tap (fire the chord, then auto-release).
   const [heldComboKeys, setHeldComboKeys] = useState<readonly RemoteDesktopChordKey[]>([]);
+  // Which computer-keyboard page (modifiers/F-keys/navigation, or the full
+  // alphanumeric layout) is showing. A latched combo modifier survives a
+  // swipe between pages on purpose -- holding Control on page one, then
+  // swiping to page two to tap a letter, is a real way to build a chord.
+  const [computerKeyboardPage, setComputerKeyboardPage] = useState(0);
+  // Live horizontal drag offset (px) while a page swipe is in progress;
+  // reset to 0 once the drag commits or cancels, at which point
+  // `computerKeyboardPage` alone drives the resting position.
+  const [computerKeyboardSwipeOffset, setComputerKeyboardSwipeOffset] = useState(0);
+  const computerKeyboardSwipeRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    dragging: boolean;
+    deltaX: number;
+  } | null>(null);
+  const computerKeyboardPagesViewportRef = useRef<HTMLDivElement | null>(null);
   // How far the OS on-screen keyboard currently eats into the layout
   // viewport from the bottom. The docked keyboard panel normally just sits
   // in its own grid row, but a phone's own keyboard resizes only the visual
@@ -2136,6 +2159,7 @@ export function RemoteDesktopPanel({
   const openMobileKeyboard = () => {
     if (!snapshot.inputEnabled) return;
     setMobileKeyboardTab('ime');
+    setComputerKeyboardPage(0);
     setMobileTextOpen(true);
     requestAnimationFrame(() => focusRemoteDesktopMobileInput(mobileTextInputRef.current));
   };
@@ -2250,6 +2274,58 @@ export function RemoteDesktopPanel({
       (code, keyName, down, repeat, modifiers) => client.key(code, keyName, down, repeat, modifiers),
       () => client.releaseAll(),
     );
+  };
+
+  // Horizontal swipe between computer-keyboard pages. Deliberately its own
+  // gesture handling rather than reusing the video stage's touch code above:
+  // this operates on the key-grid buttons, not the remote pointer, and a
+  // committed page change only needs to beat a fraction of the viewport
+  // width, not track a pinch/scroll ambiguity.
+  const onComputerKeyboardPagesPointerDown = (event: PointerEvent) => {
+    if (computerKeyboardSwipeRef.current) return;
+    computerKeyboardSwipeRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      dragging: false,
+      deltaX: 0,
+    };
+  };
+
+  const onComputerKeyboardPagesPointerMove = (event: PointerEvent) => {
+    const drag = computerKeyboardSwipeRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const dx = event.clientX - drag.startX;
+    const dy = event.clientY - drag.startY;
+    if (!drag.dragging) {
+      if (Math.abs(dx) < COMPUTER_KEYBOARD_SWIPE_JITTER_PX && Math.abs(dy) < COMPUTER_KEYBOARD_SWIPE_JITTER_PX) return;
+      if (Math.abs(dy) >= Math.abs(dx)) {
+        // Vertical intent (scrolling the docked panel itself) -- not a page swipe.
+        computerKeyboardSwipeRef.current = null;
+        return;
+      }
+      drag.dragging = true;
+      (event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId);
+    }
+    event.preventDefault();
+    drag.deltaX = dx;
+    setComputerKeyboardSwipeOffset(dx);
+  };
+
+  const onComputerKeyboardPagesPointerUp = (event: PointerEvent) => {
+    const drag = computerKeyboardSwipeRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    computerKeyboardSwipeRef.current = null;
+    if (drag.dragging) {
+      const pageWidth = computerKeyboardPagesViewportRef.current?.clientWidth || 1;
+      const commitDistance = pageWidth * COMPUTER_KEYBOARD_SWIPE_COMMIT_RATIO;
+      if (drag.deltaX <= -commitDistance && computerKeyboardPage < REMOTE_DESKTOP_COMPUTER_KEYBOARD_PAGES.length - 1) {
+        setComputerKeyboardPage((page) => page + 1);
+      } else if (drag.deltaX >= commitDistance && computerKeyboardPage > 0) {
+        setComputerKeyboardPage((page) => page - 1);
+      }
+    }
+    setComputerKeyboardSwipeOffset(0);
   };
 
   const submitMobileText = (value: string) => {
@@ -2971,26 +3047,71 @@ export function RemoteDesktopPanel({
                   <input type="checkbox" checked={comboMode} onChange={toggleComboMode} />
                   {t('remote_desktop.combo_mode')}
                 </label>
-                {REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS.map((row, rowIndex) => (
-                  <div class="remote-desktop-computer-keyboard-row" key={rowIndex}>
-                    {row.map((spec) => {
-                      const label = remoteDesktopComputerKeyLabel(spec, targetPlatform);
-                      const held = heldComboKeys.some((k) => k.code === spec.code);
-                      return (
-                        <button
-                          key={spec.code}
-                          type="button"
-                          class={held ? 'is-held' : ''}
-                          aria-label={t('remote_desktop.computer_key', { key: label })}
-                          aria-pressed={spec.modifier ? held : undefined}
-                          disabled={!snapshot.inputEnabled}
-                          onPointerDown={(event) => event.preventDefault()}
-                          onClick={() => pressComputerKey(spec)}
-                        >{label}</button>
-                      );
-                    })}
+                <div
+                  class="remote-desktop-computer-keyboard-pages"
+                  ref={computerKeyboardPagesViewportRef}
+                  onPointerDown={onComputerKeyboardPagesPointerDown}
+                  onPointerMove={onComputerKeyboardPagesPointerMove}
+                  onPointerUp={onComputerKeyboardPagesPointerUp}
+                  onPointerCancel={onComputerKeyboardPagesPointerUp}
+                >
+                  <div
+                    class="remote-desktop-computer-keyboard-track"
+                    style={{
+                      width: `${REMOTE_DESKTOP_COMPUTER_KEYBOARD_PAGES.length * 100}%`,
+                      transform: `translateX(calc(${-computerKeyboardPage * (100 / REMOTE_DESKTOP_COMPUTER_KEYBOARD_PAGES.length)}% + ${computerKeyboardSwipeOffset}px))`,
+                      transition: computerKeyboardSwipeOffset === 0 ? 'transform 0.2s ease' : 'none',
+                    }}
+                  >
+                    {REMOTE_DESKTOP_COMPUTER_KEYBOARD_PAGES.map((page, pageIndex) => (
+                      <div
+                        class="remote-desktop-computer-keyboard-page"
+                        style={{ width: `${100 / REMOTE_DESKTOP_COMPUTER_KEYBOARD_PAGES.length}%` }}
+                        key={pageIndex}
+                      >
+                        {page.map((row, rowIndex) => (
+                          <div
+                            class="remote-desktop-computer-keyboard-row"
+                            style={{ gridTemplateColumns: `repeat(${row.length}, minmax(0, 1fr))` }}
+                            key={rowIndex}
+                          >
+                            {row.map((spec) => {
+                              const label = remoteDesktopComputerKeyLabel(spec, targetPlatform);
+                              const held = heldComboKeys.some((k) => k.code === spec.code);
+                              return (
+                                <button
+                                  key={spec.code}
+                                  type="button"
+                                  class={held ? 'is-held' : ''}
+                                  aria-label={t('remote_desktop.computer_key', { key: label })}
+                                  aria-pressed={spec.modifier ? held : undefined}
+                                  disabled={!snapshot.inputEnabled}
+                                  onPointerDown={(event) => event.preventDefault()}
+                                  onClick={() => pressComputerKey(spec)}
+                                >{label}</button>
+                              );
+                            })}
+                          </div>
+                        ))}
+                      </div>
+                    ))}
                   </div>
-                ))}
+                </div>
+                {REMOTE_DESKTOP_COMPUTER_KEYBOARD_PAGES.length > 1 && (
+                  <div class="remote-desktop-computer-keyboard-dots" role="tablist" aria-label={t('remote_desktop.computer_keyboard_pages')}>
+                    {REMOTE_DESKTOP_COMPUTER_KEYBOARD_PAGES.map((_, pageIndex) => (
+                      <button
+                        key={pageIndex}
+                        type="button"
+                        role="tab"
+                        aria-selected={computerKeyboardPage === pageIndex}
+                        class={computerKeyboardPage === pageIndex ? 'is-active' : ''}
+                        aria-label={t('remote_desktop.computer_keyboard_page', { page: pageIndex + 1 })}
+                        onClick={() => setComputerKeyboardPage(pageIndex)}
+                      />
+                    ))}
+                  </div>
+                )}
               </div>
             )}
           </div>

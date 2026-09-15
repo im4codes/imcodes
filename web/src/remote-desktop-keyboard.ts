@@ -273,6 +273,57 @@ export const REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS: readonly (readonly RemoteDes
   [plainKey('F10', 'F10'), plainKey('F11', 'F11'), plainKey('F12', 'F12'), plainKey('ArrowLeft', 'ArrowLeft'), plainKey('ArrowDown', 'ArrowDown'), plainKey('ArrowRight', 'ArrowRight')],
 ];
 
+const DIGIT_ROW_KEYS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'];
+const QWERTY_ROW_LETTERS = 'qwertyuiop';
+const HOME_ROW_LETTERS = 'asdfghjkl';
+const BOTTOM_ROW_LETTERS = 'zxcvbnm';
+
+const letterKey = (letter: string): RemoteDesktopComputerKeySpec => plainKey(
+  `Key${letter.toUpperCase()}`,
+  // Lowercase, matching the established convention for every other
+  // single-letter key sent from a chip click (e.g. remoteDesktopMobileShortcutKeys'
+  // `KeyA`/'a') -- there is no physical keypress behind a tap to reconcile
+  // against, only what the target host's own key-event handling expects for
+  // an unshifted letter. Combo mode can still produce the uppercase form: a
+  // latched Shift is a real ShiftLeft keydown already on the wire, so the
+  // target computes the capital itself exactly as it would from a real
+  // keyboard, regardless of the case sent here.
+  letter,
+);
+const digitKey = (digit: string): RemoteDesktopComputerKeySpec => plainKey(digit === '0' ? 'Digit0' : `Digit${digit}`, digit);
+
+/**
+ * Second computer-keyboard page: the full alphanumeric/punctuation layout a
+ * software IME already covers for typing, but as individually addressable
+ * keys instead of characters composed through an input method -- useful
+ * together with a modifier latched on the first page (e.g. Control from
+ * page one, then a letter here, form one chord same as tapping both on a
+ * single page would).
+ */
+export const REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS_PAGE2: readonly (readonly RemoteDesktopComputerKeySpec[])[] = [
+  [
+    plainKey('Minus', '-'), plainKey('Equal', '='),
+    plainKey('BracketLeft', '['), plainKey('BracketRight', ']'),
+    plainKey('Backslash', '\\'),
+    plainKey('Semicolon', ';'), plainKey('Quote', "'"),
+    plainKey('Comma', ','), plainKey('Period', '.'), plainKey('Slash', '/'),
+  ],
+  DIGIT_ROW_KEYS.map(digitKey),
+  QWERTY_ROW_LETTERS.split('').map(letterKey),
+  [...HOME_ROW_LETTERS.split('').map(letterKey), plainKey('Backspace', 'Backspace')],
+  [...BOTTOM_ROW_LETTERS.split('').map(letterKey), plainKey('Space', ' '), plainKey('Enter', 'Enter')],
+];
+
+/** Every computer-keyboard page, in swipe order. */
+export const REMOTE_DESKTOP_COMPUTER_KEYBOARD_PAGES: readonly (readonly (readonly RemoteDesktopComputerKeySpec[])[])[] = [
+  REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS,
+  REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS_PAGE2,
+];
+
+const LETTER_KEY_LABELS: Record<string, string> = Object.fromEntries(
+  'abcdefghijklmnopqrstuvwxyz'.split('').map((letter) => [`Key${letter.toUpperCase()}`, letter.toUpperCase()]),
+);
+
 const COMPUTER_KEY_LABELS: Record<string, string> = {
   Escape: 'Esc',
   Backquote: '~ `',
@@ -290,6 +341,12 @@ const COMPUTER_KEY_LABELS: Record<string, string> = {
   ArrowDown: '▼',
   ArrowLeft: '◀',
   ArrowRight: '▶',
+  ...LETTER_KEY_LABELS,
+  Digit1: '1', Digit2: '2', Digit3: '3', Digit4: '4', Digit5: '5',
+  Digit6: '6', Digit7: '7', Digit8: '8', Digit9: '9', Digit0: '0',
+  Minus: '-', Equal: '=', BracketLeft: '[', BracketRight: ']', Backslash: '\\',
+  Semicolon: ';', Quote: "'", Comma: ',', Period: '.', Slash: '/',
+  Space: 'Space', Enter: '↵', Backspace: '⌫',
 };
 
 /**

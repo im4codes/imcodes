@@ -3674,6 +3674,8 @@
     "mobile_keyboard_tab_keys": "电脑键盘",
     "combo_mode": "组合键模式",
     "computer_key": "按键 {{key}}",
+    "computer_keyboard_pages": "键盘页面",
+    "computer_keyboard_page": "第 {{page}} 页",
     "files": "文件",
     "close_files": "关闭文件面板",
     "file_transfer_hint": "选择远端目录后，可拖拽文件发送。",

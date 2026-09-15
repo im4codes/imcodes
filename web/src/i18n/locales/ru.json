@@ -3673,6 +3673,8 @@
     "mobile_keyboard_tab_keys": "Клавиши",
     "combo_mode": "Режим комбинаций клавиш",
     "computer_key": "Клавиша {{key}}",
+    "computer_keyboard_pages": "Страницы клавиатуры",
+    "computer_keyboard_page": "Страница {{page}}",
     "files": "Файлы",
     "close_files": "Закрыть панель файлов",
     "file_transfer_hint": "Выберите удалённую папку и перетащите файлы для отправки.",

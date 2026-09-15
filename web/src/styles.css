@@ -10971,9 +10971,47 @@ button.quick-agent-delegation-preset.active {
   font-size: 13px;
 }
 
+/* Swipeable pages (modifiers/F-keys/navigation, then the full alphanumeric
+   layout): a fixed-width track holding every page side by side, panned by
+   percentage of its own width so it works at any panel width, with the
+   live drag offset (px) added on top while a swipe is in progress. */
+.remote-desktop-computer-keyboard-pages {
+  overflow: hidden;
+  touch-action: pan-y;
+}
+
+.remote-desktop-computer-keyboard-track {
+  display: flex;
+}
+
+.remote-desktop-computer-keyboard-page {
+  flex: none;
+  display: grid;
+  gap: 6px;
+}
+
+.remote-desktop-computer-keyboard-dots {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  padding-top: 2px;
+}
+
+.remote-desktop-computer-keyboard-dots button {
+  width: 7px;
+  height: 7px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: rgb(159 214 238 / 35%);
+}
+
+.remote-desktop-computer-keyboard-dots button.is-active {
+  background: #6bd9ff;
+}
+
 .remote-desktop-computer-keyboard-row {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 6px;
 }
 
