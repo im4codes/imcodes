@@ -247,13 +247,19 @@ describeOrSkip('memory MCP stdio lifecycle (subprocess)', () => {
       );
       expect(armed, 'the guard never armed, so nothing about leaking was tested').toBe(true);
 
-      const gone = await waitFor(() => !pidAlive(serverPid), 20_000);
+      // Matches the equivalent wait in the "dies BEFORE ready" test below
+      // (45_000) -- this one used a tighter 20_000 for no reasoned-about
+      // difference between the two, and was observed timing out under
+      // macOS CI load: the guard had armed and detected the reparent (the
+      // assertion above already passed), the process just hadn't finished
+      // exiting yet within the shorter window.
+      const gone = await waitFor(() => !pidAlive(serverPid), 45_000);
       expect(gone, 'a process born already reparented must not become the leak').toBe(true);
     } finally {
       if (serverPid > 0 && pidAlive(serverPid)) { try { process.kill(serverPid, 'SIGKILL'); } catch { /* gone */ } }
       rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
     }
-  }, 120_000);
+  }, 150_000);
 
   it('exits when its parent dies BEFORE the server is ready, stdin still held', async () => {
     // The hole this rework closes. The test above waits for the initialize
