@@ -388,6 +388,16 @@ export function RemoteDesktopPanel({
   // itself directly above the OS keyboard instead of riding along with that
   // scroll.
   const [mobileKeyboardViewportInset, setMobileKeyboardViewportInset] = useState(0);
+  // Pinning the panel (above) takes it out of the grid flow entirely --
+  // `position: fixed` items are not grid items at all -- so without this the
+  // stage's grid row (minmax(0, 1fr)) would expand to reclaim the vacated
+  // row and grow well past where the video actually still fits above the OS
+  // keyboard, leaving a tall black gap with the video squeezed to the
+  // bottom of it. A same-height spacer left behind in the panel's normal
+  // grid slot keeps that row's space reserved while the real, pinned panel
+  // renders on top of the keyboard.
+  const mobileKeyboardPanelRef = useRef<HTMLDivElement | null>(null);
+  const [mobileKeyboardPanelHeight, setMobileKeyboardPanelHeight] = useState(0);
   const [quickInputOpen, setQuickInputOpen] = useState(false);
   const [quickInputPortalContainer, setQuickInputPortalContainer] = useState<Element | null>(null);
   const [displayModeMenu, setDisplayModeMenu] = useState<DisplayModeMenuState | null>(null);
@@ -2081,6 +2091,24 @@ export function RemoteDesktopPanel({
     };
   }, [mobileTextOpen]);
 
+  // Track the pinned panel's own rendered height (it varies by tab -- the
+  // Keys grid is much taller than the Input tab's now-invisible textarea) so
+  // the grid spacer left in its place reserves exactly that much space.
+  useEffect(() => {
+    if (!mobileTextOpen || typeof ResizeObserver === 'undefined') return;
+    const el = mobileKeyboardPanelRef.current;
+    if (!el) return;
+    const observer = new ResizeObserver((entries) => {
+      const height = entries[0]?.contentRect.height;
+      if (height !== undefined) setMobileKeyboardPanelHeight(Math.round(height));
+    });
+    observer.observe(el);
+    return () => {
+      observer.disconnect();
+      setMobileKeyboardPanelHeight(0);
+    };
+  }, [mobileTextOpen]);
+
   const comboModifierFlags = (keys: readonly RemoteDesktopChordKey[]) => ({
     control: keys.some((k) => k.code === 'ControlLeft' || k.code === 'ControlRight'),
     alt: keys.some((k) => k.code === 'AltLeft' || k.code === 'AltRight'),
@@ -2765,9 +2793,17 @@ export function RemoteDesktopPanel({
             carries the tab switcher above it off the top of the screen.
             Pin the panel to the visual viewport's bottom edge (measured
             above) whenever that is happening, so it rides directly on top
-            of the keyboard instead of being scrolled away from it. */}
-        {mobileTextOpen && (
+            of the keyboard instead of being scrolled away from it. Pinning
+            takes the panel out of the grid entirely, though, so a same-height
+            spacer stays behind in its grid slot -- otherwise the stage would
+            reclaim that row and balloon into a mostly-empty black rectangle
+            with the video squeezed into whatever was left. */}
+        {mobileTextOpen && (<>
+          {mobileKeyboardViewportInset > 0 && (
+            <div aria-hidden="true" style={{ height: `${mobileKeyboardPanelHeight}px` }} />
+          )}
           <div
+            ref={mobileKeyboardPanelRef}
             class={`remote-desktop-mobile-keyboard${mobileKeyboardViewportInset > 0 ? ' is-pinned' : ''}`}
             role="group"
             aria-label={t('remote_desktop.mobile_keyboard')}
@@ -2888,7 +2924,7 @@ export function RemoteDesktopPanel({
               </div>
             )}
           </div>
-        )}
+        </>)}
 
         {filePanelOpen && fileDrawerMinimized && (() => {
           // Minimized to the corner of the window it belongs to, still showing

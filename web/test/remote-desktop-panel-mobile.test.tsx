@@ -1477,6 +1477,63 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     }
   });
 
+  it('reserves the pinned panel\'s own height in the grid instead of letting the stage swallow it', async () => {
+    // Pinning (position: fixed) takes the panel out of grid layout entirely;
+    // without a same-height spacer left behind, the stage's `1fr` row would
+    // reclaim that space and grow into a mostly-empty black rectangle with
+    // the actual video squeezed into whatever was left over.
+    type ObserverEntry = { contentRect: { height: number } };
+    class FakeResizeObserver {
+      static instances: FakeResizeObserver[] = [];
+      constructor(private readonly cb: (entries: ObserverEntry[]) => void) {
+        FakeResizeObserver.instances.push(this);
+      }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+      trigger(height: number) { this.cb([{ contentRect: { height } }]); }
+    }
+    const originalResizeObserver = (window as unknown as { ResizeObserver?: unknown }).ResizeObserver;
+    Object.defineProperty(window, 'ResizeObserver', { configurable: true, value: FakeResizeObserver });
+    Object.defineProperty(globalThis, 'ResizeObserver', { configurable: true, value: FakeResizeObserver });
+
+    const visualViewport = Object.assign(new EventTarget(), { height: 700, offsetTop: 0 });
+    const originalVisualViewport = Object.getOwnPropertyDescriptor(window, 'visualViewport');
+    const originalInnerHeight = Object.getOwnPropertyDescriptor(window, 'innerHeight');
+    Object.defineProperty(window, 'visualViewport', { configurable: true, value: visualViewport });
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 700 });
+    try {
+      const { container, getByRole } = await renderPanel();
+      act(() => { (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });
+
+      const keyboard = () => container.querySelector('.remote-desktop-mobile-keyboard') as HTMLElement;
+      // Not pinned: the panel sits in its own grid row already, no spacer needed.
+      expect(keyboard().previousElementSibling?.getAttribute('aria-hidden')).not.toBe('true');
+
+      act(() => { FakeResizeObserver.instances.at(-1)?.trigger(224); });
+      act(() => {
+        visualViewport.height = 400;
+        visualViewport.dispatchEvent(new Event('resize'));
+      });
+      expect(keyboard().classList.contains('is-pinned')).toBe(true);
+      const spacer = keyboard().previousElementSibling as HTMLElement;
+      expect(spacer.getAttribute('aria-hidden')).toBe('true');
+      expect(spacer.style.height).toBe('224px');
+    } finally {
+      if (originalVisualViewport) Object.defineProperty(window, 'visualViewport', originalVisualViewport);
+      else delete (window as Window & { visualViewport?: VisualViewport }).visualViewport;
+      if (originalInnerHeight) Object.defineProperty(window, 'innerHeight', originalInnerHeight);
+      else delete (window as unknown as { innerHeight?: number }).innerHeight;
+      if (originalResizeObserver) {
+        Object.defineProperty(window, 'ResizeObserver', { configurable: true, value: originalResizeObserver });
+        Object.defineProperty(globalThis, 'ResizeObserver', { configurable: true, value: originalResizeObserver });
+      } else {
+        delete (window as unknown as { ResizeObserver?: unknown }).ResizeObserver;
+        delete (globalThis as unknown as { ResizeObserver?: unknown }).ResizeObserver;
+      }
+    }
+  });
+
   it('sends a standalone computer-keyboard key, then one chord per combo-mode cycle', async () => {
     const { container, getByRole } = await renderPanel();
     act(() => { (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });
