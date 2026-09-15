@@ -1,3 +1,8 @@
+import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { mkdtemp, realpath, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import type { SessionRecord } from '../../src/store/session-store.js';
 import {
@@ -8,10 +13,37 @@ import {
   dispatchSendMessage,
   dispatchSendStop,
   listSendTargets,
+  reportImplementationNoProgressBlocker,
 } from '../../src/daemon/send-tool.js';
 import { isSendDispatchId, isSendMessageId } from '../../shared/send-message-id.js';
 import { AGENT_DELEGATION_PURPOSES } from '../../shared/agent-delegation.js';
 import { getDelegationReplyStore } from '../../src/daemon/delegation-reply-store.js';
+import {
+  clearAllResend,
+  drainResend,
+  enqueueResend,
+  getResendCount,
+  getResendEntries,
+  RESEND_DISPATCH_CONTROL,
+} from '../../src/daemon/transport-resend-queue.js';
+import {
+  authorizeQueuedSupervisionHeartbeatDelivery,
+  resolveQueuedSupervisionHeartbeatDelivery,
+} from '../../src/daemon/supervision-participant-delivery.js';
+import { getTransportQueueStore } from '../../src/daemon/transport-queue-store.js';
+import { getSession, removeSession, upsertSession } from '../../src/store/session-store.js';
+import {
+  getSupervisionTaskRegistry,
+  resetSupervisionTaskRegistryForTests,
+} from '../../src/daemon/supervision-state-store.js';
+import {
+  createSupervisionMcpToolHandlers,
+  type SupervisionRegistryPort,
+} from '../../src/daemon/supervision-mcp-tools.js';
+import { SUPERVISION_MCP_TOOLS } from '../../shared/supervision-mcp-tools.js';
+import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
+import { freezeSupervisionIntegrationBundle } from '../../src/daemon/supervision-integration-bundle.js';
+import { SESSION_IDENTITY_SESSION_MAX_CHARS } from '../../shared/session-identity.js';
 
 function session(overrides: Partial<SessionRecord> & Pick<SessionRecord, 'name' | 'projectName' | 'role'>): SessionRecord {
   return {
@@ -45,7 +77,17 @@ describe('send-tool', () => {
     const result = listSendTargets(caller, {}, {
       listSessions: () => [
         session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain', label: 'Brain' }),
-        session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'Coder', agentType: 'codex', updatedAt: 20 }),
+        session({
+          name: 'deck_alpha_w1',
+          projectName: 'alpha',
+          role: 'w1',
+          label: 'Coder',
+          agentType: 'codex',
+          updatedAt: 20,
+          requestedModel: 'gpt-5.4',
+          modelDisplay: 'gpt-5.4-display',
+          activeModel: 'gpt-5.6',
+        }),
         session({ name: 'deck_beta_w1', projectName: 'beta', role: 'w1', label: 'Other', projectDir: '/work/beta' }),
       ],
     });
@@ -59,11 +101,39 @@ describe('send-tool', () => {
         sessionName: 'deck_alpha_w1',
         role: 'w1',
         agentType: 'codex',
+        model: 'gpt-5.6',
+        activeModel: 'gpt-5.6',
+        requestedModel: 'gpt-5.4',
+        modelDisplay: 'gpt-5.4-display',
         status: 'idle',
         lastActiveAt: 20,
+        // Delegation-eligibility projection required by the published contract.
+        providerFamily: 'openai',
+        availability: 'ready',
+        limitGroup: 'codex',
+        replyCapable: true,
       },
     ]);
     expect(result.items[0]).not.toHaveProperty('projectDir');
+  });
+
+  it('lists and filters by concrete model metadata', () => {
+    const result = listSendTargets(caller, { query: 'qwen3-coder' }, {
+      listSessions: () => [
+        session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain', label: 'Brain' }),
+        session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'Coder', agentType: 'codex-sdk', activeModel: 'gpt-5.6' }),
+        session({ name: 'deck_alpha_w2', projectName: 'alpha', role: 'w2', label: 'Qwen', agentType: 'qwen', qwenModel: 'qwen3-coder-plus' }),
+      ],
+    });
+
+    expect(result.status).toBe('ok');
+    if (result.status !== 'ok') throw new Error('expected ok');
+    expect(result.items).toEqual([expect.objectContaining({
+      target: 'deck_alpha_w2',
+      agentType: 'qwen',
+      model: 'qwen3-coder-plus',
+      qwenModel: 'qwen3-coder-plus',
+    })]);
   });
 
   it('hides unlabelled legacy project workers from discovery and ordinary sends', async () => {
@@ -122,6 +192,984 @@ describe('send-tool', () => {
     expect(result.deliveries).toHaveLength(1);
     expect(dispatchMessage).toHaveBeenCalledTimes(1);
     expect(dispatchMessage.mock.calls[0][1]).toBe('hello');
+    expect(dispatchMessage.mock.calls[0][2]).toMatchObject({ deliveryMode: 'append' });
+  });
+
+  it('names the executor on the receipt so a dispatch id needs no second lookup', async () => {
+    // The whole point: a caller holding `send_dispatch_…` should be able to say
+    // which session, model and provider ran it without fetching a task object
+    // and reasoning over it.
+    const dispatchMessage = vi.fn().mockResolvedValue('delivered');
+    const result = await dispatchSendMessage(caller, { target: 'Coder', message: 'hello' }, {
+      listSessions: () => [
+        session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain' }),
+        session({
+          name: 'deck_alpha_w1',
+          projectName: 'alpha',
+          role: 'w1',
+          label: 'Coder',
+          agentType: 'claude-code-sdk',
+          activeModel: 'claude-opus-5',
+        }),
+      ],
+      dispatchMessage,
+    });
+
+    if (result.status !== 'accepted') throw new Error('expected accepted');
+    expect(result.deliveries[0]?.execution).toMatchObject({
+      sessionName: 'deck_alpha_w1',
+      label: 'Coder',
+      agentType: 'claude-code-sdk',
+      model: 'claude-opus-5',
+      source: 'live',
+    });
+    // An unbound send has no lane, and a guessed one would be worse than none.
+    expect(result.deliveries[0]?.execution).not.toHaveProperty('pool');
+  });
+
+  it('lets the persisted binding outrank a same-name live runtime that now reports otherwise', async () => {
+    // The failure this pins is production-only: the pure resolver can rank the
+    // binding first and the wiring can still hand it the live record and never
+    // read the registry at all. A session re-created under the same name on a
+    // different provider must not be able to relabel work already dispatched,
+    // so the receipt has to state what the work was ADMITTED under.
+    resetSupervisionTaskRegistryForTests();
+    // Assignment provisioning realpaths the project, so this needs a real dir.
+    const projectRoot = await realpath(await mkdtemp(join(tmpdir(), 'imcodes-send-exec-')));
+    execFileSync('git', ['init', '-q'], { cwd: projectRoot });
+    execFileSync('git', ['commit', '-q', '--allow-empty', '-m', 'base'], {
+      cwd: projectRoot,
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: 'test', GIT_AUTHOR_EMAIL: 't@e',
+        GIT_COMMITTER_NAME: 'test', GIT_COMMITTER_EMAIL: 't@e',
+      },
+    });
+    const registry = getSupervisionTaskRegistry();
+    const target = session({
+      name: 'deck_alpha_w1',
+      projectName: 'alpha',
+      role: 'w1',
+      label: 'Coder',
+      agentType: 'codex-sdk',
+      runtimeType: 'transport',
+      activeModel: 'gpt-5.6-live',
+      projectDir: projectRoot,
+    } as never);
+    // The pool gate admits the target on its LIVE identity; the binding below
+    // records something else, which is exactly the drift under test.
+    const brain = session({
+      name: 'deck_alpha_brain',
+      projectName: 'alpha',
+      role: 'brain',
+      projectDir: projectRoot,
+      transportConfig: {
+        supervision: {
+          executionPools: {
+            state: 'configured',
+            primaryDevelopmentPool: {
+              configs: [{
+                agentType: 'codex-sdk',
+                providerFamily: 'openai',
+                runtimeType: 'transport',
+                model: 'gpt-5.6-live',
+                capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6-live',
+              }],
+              controls: {},
+            },
+            economyTaskPool: { configs: [], controls: {} },
+          },
+          mode: 'supervised_audit',
+          backend: 'codex-sdk',
+          model: 'gpt-5.3-codex-spark',
+          timeoutMs: 12_000,
+          promptVersion: 'supervision_decision_v1',
+          maxParseRetries: 1,
+          maxAuditLoops: 2,
+          taskRunPromptVersion: 'task_run_status_v1',
+        },
+      },
+    } as never);
+    const taskId = 'tsk_binding_precedence';
+    const assignmentId = 'asg_binding_precedence';
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', objective: 'binding outranks live', classification: 'independent_top_level',
+    }).ok).toBe(true);
+    // The caller must authoritatively participate; project + role is not
+    // ownership. This is the coordinator side of the same task.
+    expect(registry.createAssignment({
+      assignmentId: `${assignmentId}-coordinator`,
+      taskId,
+      role: 'coordinator',
+      scopeFiles: [],
+      identity: {
+        sessionName: brain.name,
+        sessionInstanceId: brain.sessionInstanceId,
+        runtimeEpoch: brain.runtimeEpoch,
+        agentType: brain.agentType,
+        providerFamily: 'openai',
+      },
+    }).ok).toBe(true);
+    expect(registry.createAssignment({
+      assignmentId,
+      taskId,
+      role: 'implementer',
+      scopeFiles: [],
+      identity: {
+        sessionName: target.name,
+        sessionInstanceId: target.sessionInstanceId,
+        runtimeEpoch: target.runtimeEpoch,
+        agentType: target.agentType,
+        providerFamily: 'openai',
+      },
+      executionBinding: {
+        pool: 'primary',
+        origin: 'configured',
+        requested: {
+          capabilityId: 'supervision-exec-v1:transport:claude-code-sdk:anthropic:opus',
+          agentType: 'claude-code-sdk',
+          providerFamily: 'anthropic',
+          runtimeType: 'transport',
+          model: 'opus',
+        },
+        actual: {
+          sessionName: target.name,
+          sessionInstanceId: target.sessionInstanceId,
+          runtimeEpoch: target.runtimeEpoch,
+          agentType: 'claude-code-sdk',
+          providerFamily: 'anthropic',
+          runtimeType: 'transport',
+          model: 'claude-opus-5-admitted',
+        },
+      },
+    }).ok).toBe(true);
+
+    const result = await dispatchSendMessage({ ...caller, projectRoot }, {
+      target: 'Coder',
+      message: 'continue',
+      task: { taskId, assignmentId, executionPool: 'primary' },
+    }, {
+      listSessions: () => [brain, target],
+      dispatchMessage: vi.fn().mockResolvedValue('delivered'),
+    });
+
+    if (result.status !== 'accepted') throw new Error(`expected accepted, got ${JSON.stringify(result)}`);
+    const execution = result.deliveries[0]?.execution;
+    // Every discriminating field comes from the binding, none from the live row.
+    expect(execution).toMatchObject({
+      sessionName: 'deck_alpha_w1',
+      agentType: 'claude-code-sdk',
+      providerFamily: 'anthropic',
+      model: 'claude-opus-5-admitted',
+      pool: 'primary',
+      source: 'assignment',
+    });
+    expect(execution?.model).not.toBe('gpt-5.6-live');
+    expect(execution?.agentType).not.toBe('codex-sdk');
+    resetSupervisionTaskRegistryForTests();
+  });
+
+  it('fails closed before dispatch when an exact assignment binding still names another session', async () => {
+    resetSupervisionTaskRegistryForTests();
+    const registry = getSupervisionTaskRegistry();
+    const target = session({
+      name: 'deck_alpha_rebound_auditor', projectName: 'alpha', role: 'w1', label: 'Auditor',
+      agentType: 'codex-sdk', runtimeType: 'transport', activeModel: 'gpt-5.6',
+    } as never);
+    const brain = session({
+      name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain',
+      agentType: 'codex-sdk', runtimeType: 'transport', activeModel: 'gpt-5.6',
+      transportConfig: {
+        supervision: {
+          executionPools: {
+            state: 'configured',
+            primaryDevelopmentPool: {
+              configs: [{
+                agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport', model: 'gpt-5.6',
+                capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6',
+              }],
+              controls: {},
+            },
+            economyTaskPool: { configs: [], controls: {} },
+          },
+          mode: 'supervised_audit', backend: 'codex-sdk', model: 'gpt-5.6', timeoutMs: 12_000,
+          promptVersion: 'supervision_decision_v1', maxParseRetries: 1, maxAuditLoops: 2,
+          taskRunPromptVersion: 'task_run_status_v1',
+        },
+      },
+    } as never);
+    const taskId = 'tsk_stale_execution_target';
+    const assignmentId = 'asg_stale_execution_target';
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level', objective: 'fail closed',
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      assignmentId: `${assignmentId}-coordinator`, taskId, role: 'coordinator', scopeFiles: [],
+      identity: {
+        sessionName: brain.name, sessionInstanceId: brain.sessionInstanceId!, runtimeEpoch: brain.runtimeEpoch!,
+        agentType: brain.agentType, providerFamily: 'openai',
+      },
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      assignmentId, taskId, role: 'implementer', scopeFiles: [],
+      identity: {
+        sessionName: target.name, sessionInstanceId: target.sessionInstanceId!, runtimeEpoch: target.runtimeEpoch!,
+        agentType: target.agentType, providerFamily: 'openai',
+      },
+      executionBinding: {
+        pool: 'primary', origin: 'reused',
+        requested: {
+          capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6',
+          agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport', model: 'gpt-5.6',
+        },
+        actual: {
+          sessionName: 'deck_alpha_old_openai_auditor', sessionInstanceId: 'old-instance', runtimeEpoch: 'old-epoch',
+          agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport', model: 'gpt-5.6',
+        },
+      },
+    })).toMatchObject({ ok: true });
+    const dispatchMessage = vi.fn();
+    try {
+      await expect(dispatchSendMessage(caller, {
+        target: target.name, message: 'must not follow stale binding',
+        task: { taskId, assignmentId, executionPool: 'primary' },
+      }, {
+        listSessions: () => [brain, target], dispatchMessage,
+        ensureSupervisionAssignmentWorktree: async () => ({
+          ok: true, worktreePath: '/work/alpha/asg', baseRevision: 'a'.repeat(40), created: false,
+        }),
+      })).resolves.toMatchObject({
+        status: 'error', reason: 'identity_rejected',
+        error: 'task assignment execution binding conflicts with exact target; authoritative rebind required',
+      });
+      expect(dispatchMessage).not.toHaveBeenCalled();
+    } finally {
+      resetSupervisionTaskRegistryForTests();
+    }
+  });
+
+  it('atomically refreshes recovered identity, execution binding, and provisioning before SAME assignment continuation', async () => {
+    resetSupervisionTaskRegistryForTests();
+    const registry = getSupervisionTaskRegistry();
+    const taskId = 'tsk_recovered_execution_target';
+    const assignmentId = 'asg_recovered_execution_target';
+    const coordinatorAssignmentId = `${assignmentId}-coordinator`;
+    const brain = session({
+      name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain', label: 'Brain',
+      agentType: 'codex-sdk', runtimeType: 'transport', activeModel: 'gpt-5.6',
+      transportConfig: {
+        supervision: {
+          executionPools: {
+            state: 'configured',
+            primaryDevelopmentPool: {
+              configs: [{
+                agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport', model: 'gpt-5.6',
+                capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6',
+              }],
+              controls: {},
+            },
+            economyTaskPool: { configs: [], controls: {} },
+          },
+          mode: 'supervised_audit', backend: 'codex-sdk', model: 'gpt-5.6', timeoutMs: 12_000,
+          promptVersion: 'supervision_decision_v1', maxParseRetries: 1, maxAuditLoops: 2,
+          taskRunPromptVersion: 'task_run_status_v1',
+        },
+      },
+    } as never);
+    const oldWorker = session({
+      name: 'deck_alpha_old_cc', projectName: 'alpha', role: 'w1', label: 'Old CC',
+      agentType: 'claude-code-sdk', runtimeType: 'transport', activeModel: 'opus',
+    } as never);
+    const worker = session({
+      name: 'deck_alpha_recovered_cx', projectName: 'alpha', role: 'w1', label: 'Recovered Cx',
+      agentType: 'codex-sdk', runtimeType: 'transport', activeModel: 'gpt-5.6',
+    } as never);
+    const oldConfig = {
+      capabilityId: 'supervision-exec-v1:transport:claude-code-sdk:anthropic:opus',
+      agentType: 'claude-code-sdk', providerFamily: 'anthropic', runtimeType: 'transport' as const, model: 'opus',
+    };
+    const replacementConfig = {
+      capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6',
+      agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport' as const, model: 'gpt-5.6',
+    };
+    const replacementBinding = {
+      pool: 'primary' as const,
+      requested: replacementConfig,
+      actual: {
+        sessionName: worker.name, sessionInstanceId: worker.sessionInstanceId!, runtimeEpoch: worker.runtimeEpoch!,
+        agentType: worker.agentType, providerFamily: 'openai', runtimeType: 'transport' as const, model: 'gpt-5.6',
+      },
+      origin: 'reused' as const,
+    };
+    const replacementIdentity = {
+      sessionName: worker.name,
+      sessionInstanceId: worker.sessionInstanceId!,
+      runtimeEpoch: worker.runtimeEpoch!,
+      agentType: worker.agentType,
+      providerFamily: 'openai',
+    };
+    const replacementProvisioning = {
+      selectedPool: 'primary' as const,
+      selectedConfig: replacementConfig,
+      origin: 'reused' as const,
+    };
+    const r1 = 'execution-authority-r1';
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level', objective: 'recover exact owner',
+      currentRevision: r1,
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      assignmentId: coordinatorAssignmentId, taskId, role: 'coordinator', required: false, scopeFiles: [],
+      identity: {
+        sessionName: brain.name, sessionInstanceId: brain.sessionInstanceId!, runtimeEpoch: brain.runtimeEpoch!,
+        agentType: brain.agentType, providerFamily: 'openai',
+      },
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      assignmentId, taskId, role: 'implementer', scopeFiles: ['authority.txt'], auditRevision: r1,
+      identity: {
+        sessionName: oldWorker.name, sessionInstanceId: oldWorker.sessionInstanceId!, runtimeEpoch: oldWorker.runtimeEpoch!,
+        agentType: oldWorker.agentType, providerFamily: 'anthropic',
+      },
+      executionBinding: {
+        pool: 'primary', origin: 'spawned', requested: oldConfig,
+        actual: {
+          sessionName: oldWorker.name, sessionInstanceId: oldWorker.sessionInstanceId!, runtimeEpoch: oldWorker.runtimeEpoch!,
+          agentType: oldWorker.agentType, providerFamily: 'anthropic', runtimeType: 'transport', model: 'opus',
+        },
+      },
+      provisioning: {
+        selectedPool: 'primary', selectedConfig: oldConfig, origin: 'spawned',
+        provisionAttemptId: 'old-provision-attempt', createdSessionName: oldWorker.name,
+      },
+    })).toMatchObject({ ok: true });
+    expect(registry.applyTaskIntent({
+      taskId, assignmentId, intent: 'start', toStatus: 'implementing',
+    })).toMatchObject({ ok: true });
+    const bundleSource = await realpath(await mkdtemp(join(tmpdir(), 'imcodes-recovery-authority-')));
+    await writeFile(join(bundleSource, 'authority.txt'), 'r1 frozen authority\n');
+    const frozen = freezeSupervisionIntegrationBundle({
+      taskId, assignmentId, revision: r1,
+      scopeFiles: ['authority.txt'],
+      snapshot: {
+        worktreePath: bundleSource,
+        headSha: 'a'.repeat(40),
+        files: [{
+          path: 'authority.txt',
+          sha256: createHash('sha256').update('r1 frozen authority\n').digest('hex'),
+        }],
+        stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
+      },
+      bundleRoot: join(bundleSource, 'bundles'),
+    });
+    if (!frozen.ok) throw new Error(frozen.reason);
+    expect(registry.bindIntegrationBundle({
+      taskId, assignmentId,
+      identity: registry.getAssignment(assignmentId)!.identity,
+      revision: r1, bundle: frozen.bundle,
+    })).toMatchObject({ ok: true });
+    const expectedGeneration = registry.getAssignment(assignmentId)!.generation;
+
+    const registryPort = {
+      getStatus: (id: string) => registry.get(id)?.status,
+      applyIntent: (input: Parameters<typeof registry.applyTaskIntent>[0]) => registry.applyTaskIntent(input),
+      list: (filter: Parameters<typeof registry.list>[0]) => registry.list(filter) as never,
+      get: (id: string) => registry.get(id) as never,
+      recover: (input: Parameters<typeof registry.recoverTask>[0]) => registry.recoverTask(input),
+      coordinateTaskAssignment: (input: Parameters<typeof registry.coordinateTaskAssignment>[0]) => (
+        registry.coordinateTaskAssignment(input)
+      ),
+      housekeeping: (input: Parameters<typeof registry.housekeeping>[0]) => registry.housekeeping(input),
+    } as unknown as SupervisionRegistryPort;
+    const resolveIdentity = (name: string) => name === worker.name ? {
+      sessionName: worker.name, sessionInstanceId: worker.sessionInstanceId!, runtimeEpoch: worker.runtimeEpoch!,
+      agentType: worker.agentType, providerFamily: 'openai', projectName: 'alpha',
+    } : name === brain.name ? {
+      sessionName: brain.name, sessionInstanceId: brain.sessionInstanceId!, runtimeEpoch: brain.runtimeEpoch!,
+      agentType: brain.agentType, providerFamily: 'openai', projectName: 'alpha',
+    } : undefined;
+    const brainCaller = {
+      userId: 'user-1', sessionName: brain.name, projectName: 'alpha', transport: 'stdio',
+    } as McpRuntimeCaller;
+    const withoutBindingResolver = createSupervisionMcpToolHandlers(brainCaller, {
+      registry: registryPort,
+      isProjectBrain: () => true,
+      resolveSessionIdentity: resolveIdentity,
+    });
+    const brainHandlers = createSupervisionMcpToolHandlers(brainCaller, {
+      registry: registryPort,
+      isProjectBrain: () => true,
+      resolveSessionIdentity: resolveIdentity,
+      resolveAuditorRecoveryBinding: (name) => name === worker.name ? replacementBinding : undefined,
+    });
+    const recoveryRequest = {
+      taskId, assignmentId, taskStatus: 'delegated', assignmentStatus: 'delegated',
+      leaseAction: 'renew', rebindSessionName: worker.name,
+      expectedRevision: r1, expectedGeneration,
+      evidenceManifestSha256: frozen.bundle.manifestSha256,
+      idempotencyKey: 'recover-execution-target-once', reason: 'replace unavailable Claude owner with live Codex owner',
+    } as const;
+    try {
+      const authoritySnapshot = () => JSON.stringify({
+        task: registry.get(taskId),
+        events: registry.listEvents(taskId),
+      });
+      const storeRecoveryBase = {
+        taskId,
+        assignmentId,
+        leaseAction: 'renew' as const,
+        identity: replacementIdentity,
+        expectedRevision: r1,
+        expectedGeneration,
+        evidenceManifestSha256: frozen.bundle.manifestSha256,
+      };
+
+      const beforeBindingWithoutProvisioning = authoritySnapshot();
+      expect(registry.coordinateTaskAssignment({
+        taskId,
+        assignmentId: coordinatorAssignmentId,
+        leaseAction: 'renew',
+        identity: replacementIdentity,
+        executionBinding: replacementBinding,
+        idempotencyKey: 'reject-binding-without-provisioning',
+        reason: 'execution authority must be replaced atomically',
+      })).toMatchObject({ ok: false, reason: 'invalid' });
+      expect(authoritySnapshot()).toBe(beforeBindingWithoutProvisioning);
+
+      const beforeAuthorityWithoutIdentity = authoritySnapshot();
+      expect(registry.coordinateTaskAssignment({
+        taskId,
+        assignmentId: coordinatorAssignmentId,
+        leaseAction: 'renew',
+        executionBinding: replacementBinding,
+        provisioning: replacementProvisioning,
+        idempotencyKey: 'reject-authority-without-identity',
+        reason: 'execution authority requires the exact runtime identity',
+      })).toMatchObject({ ok: false, reason: 'invalid' });
+      expect(authoritySnapshot()).toBe(beforeAuthorityWithoutIdentity);
+
+      const contradictoryAuthority = [
+        {
+          label: 'selected pool contradicts the execution binding',
+          executionBinding: replacementBinding,
+          provisioning: { ...replacementProvisioning, selectedPool: 'economy' as const },
+        },
+        {
+          label: 'recovered provisioning claims a spawned origin',
+          executionBinding: replacementBinding,
+          provisioning: { ...replacementProvisioning, origin: 'spawned' as const },
+        },
+        {
+          label: 'recovered provisioning retains a provision attempt',
+          executionBinding: replacementBinding,
+          provisioning: { ...replacementProvisioning, provisionAttemptId: 'stale-attempt' },
+        },
+      ];
+      for (const [index, contradiction] of contradictoryAuthority.entries()) {
+        const before = authoritySnapshot();
+        expect(registry.coordinateTaskAssignment({
+          ...storeRecoveryBase,
+          executionBinding: contradiction.executionBinding,
+          provisioning: contradiction.provisioning,
+          idempotencyKey: `reject-contradictory-authority-${index}`,
+          reason: contradiction.label,
+        })).toMatchObject({ ok: false, reason: 'invalid' });
+        expect(authoritySnapshot()).toBe(before);
+      }
+
+      const beforeFencedCoordinationWithoutRebind = authoritySnapshot();
+      await expect(brainHandlers[SUPERVISION_MCP_TOOLS.RECOVER]({
+        taskId,
+        assignmentId,
+        taskStatus: 'delegated',
+        assignmentStatus: 'delegated',
+        leaseAction: 'renew',
+        expectedRevision: r1,
+        expectedGeneration,
+        evidenceManifestSha256: frozen.bundle.manifestSha256,
+        idempotencyKey: 'reject-fenced-coordination-without-rebind',
+        reason: 'revision fences are valid only for an execution-authority rebind',
+      })).resolves.toMatchObject({ status: 'error', reason: 'validation_failed' });
+      expect(authoritySnapshot()).toBe(beforeFencedCoordinationWithoutRebind);
+
+      const beforeGenerationMismatch = JSON.stringify(registry.get(taskId));
+      await expect(brainHandlers[SUPERVISION_MCP_TOOLS.RECOVER]({
+        ...recoveryRequest,
+        expectedGeneration: expectedGeneration + 1,
+        idempotencyKey: 'reject-stale-r1-generation', reason: 'must bind exact assignment generation',
+      })).resolves.toMatchObject({ status: 'error', reason: 'conflicting_replay' });
+      expect(JSON.stringify(registry.get(taskId))).toBe(beforeGenerationMismatch);
+
+      const beforeEvidenceMismatch = JSON.stringify(registry.get(taskId));
+      await expect(brainHandlers[SUPERVISION_MCP_TOOLS.RECOVER]({
+        ...recoveryRequest,
+        evidenceManifestSha256: 'f'.repeat(64),
+        idempotencyKey: 'reject-wrong-r1-evidence', reason: 'must bind exact frozen evidence',
+      })).resolves.toMatchObject({ status: 'error', reason: 'manifest_mismatch' });
+      expect(JSON.stringify(registry.get(taskId))).toBe(beforeEvidenceMismatch);
+
+      await expect(withoutBindingResolver[SUPERVISION_MCP_TOOLS.RECOVER](recoveryRequest))
+        .resolves.toMatchObject({
+          status: 'error', reason: 'identity_rejected',
+          detail: 'coordination identity target has no selected execution binding',
+        });
+      expect(registry.getAssignment(assignmentId)).toMatchObject({
+        identity: { sessionName: oldWorker.name },
+        executionBinding: { actual: { sessionName: oldWorker.name } },
+        provisioning: { createdSessionName: oldWorker.name },
+      });
+
+      await expect(brainHandlers[SUPERVISION_MCP_TOOLS.RECOVER](recoveryRequest))
+        .resolves.toMatchObject({ status: 'ok', taskId, assignmentId, replay: false });
+
+      const workerHandlers = createSupervisionMcpToolHandlers({
+        userId: 'user-1', sessionName: worker.name, projectName: 'alpha', transport: 'stdio',
+      } as McpRuntimeCaller, { registry: registryPort, resolveSessionIdentity: resolveIdentity });
+      await expect(workerHandlers[SUPERVISION_MCP_TOOLS.INTENT]({
+        taskId, assignmentId, intent: 'start',
+      })).resolves.toMatchObject({ status: 'ok', fromStatus: 'delegated', toStatus: 'implementing' });
+
+      expect(registry.getAssignment(assignmentId)).toMatchObject({
+        identity: { sessionName: worker.name, agentType: 'codex-sdk', providerFamily: 'openai' },
+        executionBinding: replacementBinding,
+        provisioning: { selectedPool: 'primary', selectedConfig: replacementConfig, origin: 'reused' },
+      });
+      expect(registry.getAssignment(assignmentId)?.provisioning).not.toHaveProperty('createdSessionName');
+      expect(registry.getAssignment(assignmentId)?.provisioning).not.toHaveProperty('provisionAttemptId');
+      const recoveredGeneration = registry.getAssignment(assignmentId)?.generation;
+      await expect(brainHandlers[SUPERVISION_MCP_TOOLS.RECOVER](recoveryRequest))
+        .resolves.toMatchObject({ status: 'ok', taskId, assignmentId, replay: true });
+      expect(registry.getAssignment(assignmentId)?.generation).toBe(recoveredGeneration);
+      expect(registry.getAssignment(assignmentId)?.status).toBe('implementing');
+
+      expect(registry.coordinateTaskAssignment({
+        taskId,
+        assignmentId,
+        leaseAction: 'renew',
+        identity: replacementIdentity,
+        executionBinding: replacementBinding,
+        provisioning: replacementProvisioning,
+        expectedRevision: r1,
+        expectedGeneration: recoveredGeneration,
+        evidenceManifestSha256: frozen.bundle.manifestSha256,
+        idempotencyKey: 'drift-authority-after-recorded-recovery',
+        reason: 'simulate a later authoritative recovery before an old replay arrives',
+      })).toMatchObject({ ok: true });
+      const beforeDriftedReplay = authoritySnapshot();
+      await expect(brainHandlers[SUPERVISION_MCP_TOOLS.RECOVER](recoveryRequest))
+        .resolves.toMatchObject({ status: 'error', reason: 'conflicting_replay' });
+      expect(authoritySnapshot()).toBe(beforeDriftedReplay);
+
+      expect(registry.updateTask({ taskId, currentRevision: 'execution-authority-r2' }))
+        .toMatchObject({ ok: true });
+      const beforeDelayedR1 = JSON.stringify(registry.get(taskId));
+      await expect(brainHandlers[SUPERVISION_MCP_TOOLS.RECOVER](recoveryRequest))
+        .resolves.toMatchObject({ status: 'error', reason: 'old_revision' });
+      expect(JSON.stringify(registry.get(taskId))).toBe(beforeDelayedR1);
+
+      const dispatchMessage = vi.fn().mockResolvedValue('delivered');
+      await expect(dispatchSendMessage(caller, {
+        target: oldWorker.name, message: 'must not return to superseded owner',
+        task: { taskId, assignmentId, executionPool: 'primary' },
+      }, { listSessions: () => [brain, oldWorker, worker], dispatchMessage }))
+        .resolves.toMatchObject({ status: 'error', reason: 'identity_rejected' });
+      expect(dispatchMessage).not.toHaveBeenCalled();
+      await expect(dispatchSendMessage(caller, {
+        target: worker.name, message: 'resume SAME recovered assignment',
+        task: { taskId, assignmentId, executionPool: 'primary' },
+      }, {
+        listSessions: () => [brain, worker], dispatchMessage,
+        ensureSupervisionAssignmentWorktree: async () => ({
+          ok: true, worktreePath: '/work/alpha/recovered/repo', baseRevision: 'a'.repeat(40), created: false,
+        }),
+      })).resolves.toMatchObject({ status: 'accepted', taskId, assignmentId });
+      expect(dispatchMessage).toHaveBeenCalledOnce();
+    } finally {
+      resetSupervisionTaskRegistryForTests();
+    }
+  });
+
+  it('lets the unique authoritative project Brain continue a same-project legacy task without a coordinator row', async () => {
+    resetSupervisionTaskRegistryForTests();
+    const registry = getSupervisionTaskRegistry();
+    const taskId = 'legacy-no-coordinator-task';
+    const assignmentId = 'legacy-no-coordinator-implementer';
+    const target = session({
+      name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'CC1',
+      agentType: 'codex-sdk', runtimeType: 'transport', activeModel: 'gpt-5.6',
+    } as never);
+    const brain = session({
+      name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain', label: 'Brain',
+      agentType: 'codex-sdk', runtimeType: 'transport', activeModel: 'gpt-5.6',
+      transportConfig: {
+        supervision: {
+          executionPools: {
+            state: 'configured',
+            primaryDevelopmentPool: {
+              configs: [{
+                agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport', model: 'gpt-5.6',
+                capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6',
+              }],
+              controls: {},
+            },
+            economyTaskPool: { configs: [], controls: {} },
+          },
+          mode: 'supervised_audit', backend: 'codex-sdk', model: 'gpt-5.6', timeoutMs: 12_000,
+          promptVersion: 'supervision_decision_v1', maxParseRetries: 1, maxAuditLoops: 2,
+          taskRunPromptVersion: 'task_run_status_v1',
+        },
+      },
+    } as never);
+    const competingBrain = session({
+      name: 'deck_alpha_brain_2', projectName: 'alpha', role: 'brain', label: 'Other Brain',
+      agentType: 'codex-sdk', runtimeType: 'transport', activeModel: 'gpt-5.6',
+    } as never);
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level', objective: 'legacy continuation',
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      assignmentId, taskId, role: 'implementer', identity: {
+        sessionName: target.name, sessionInstanceId: target.sessionInstanceId!, runtimeEpoch: target.runtimeEpoch!,
+        agentType: target.agentType, providerFamily: 'openai',
+      },
+      executionBinding: {
+        pool: 'primary', origin: 'reused',
+        requested: {
+          capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6',
+          agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport', model: 'gpt-5.6',
+        },
+        actual: {
+          sessionName: target.name, sessionInstanceId: target.sessionInstanceId!, runtimeEpoch: target.runtimeEpoch!,
+          agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport', model: 'gpt-5.6',
+        },
+      },
+    })).toMatchObject({ ok: true });
+    const dispatchMessage = vi.fn().mockResolvedValue('delivered');
+    try {
+      await expect(dispatchSendMessage(caller, {
+        target: target.name,
+        message: 'must fail closed while Brain authority is ambiguous',
+        task: { taskId, assignmentId, executionPool: 'primary' },
+      }, { listSessions: () => [brain, competingBrain, target], dispatchMessage }))
+        .resolves.toMatchObject({ status: 'error', reason: 'identity_rejected' });
+      expect(dispatchMessage).not.toHaveBeenCalled();
+      const result = await dispatchSendMessage(caller, {
+        target: target.name,
+        message: 'resume the exact legacy assignment',
+        task: { taskId, assignmentId, executionPool: 'primary' },
+      }, {
+        listSessions: () => [brain, target],
+        dispatchMessage,
+        ensureSupervisionAssignmentWorktree: async () => ({
+          ok: true, worktreePath: '/work/alpha/.imcodes/asg', baseRevision: 'a'.repeat(40), created: false,
+        }),
+      });
+      expect(result).toMatchObject({ status: 'accepted', taskId, assignmentId });
+      expect(dispatchMessage).toHaveBeenCalledOnce();
+    } finally {
+      resetSupervisionTaskRegistryForTests();
+    }
+  });
+
+  it('durably reports one Brain-resolvable blocker with readable and internal identities', async () => {
+    resetSupervisionTaskRegistryForTests();
+    const registry = getSupervisionTaskRegistry();
+    const taskId = 'one-structured-blocker-task';
+    const assignmentId = 'one-structured-blocker-assignment';
+    const worker = session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'CC1' });
+    const brain = session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain', label: 'Project Brain' });
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level', objective: 'escalate once',
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      assignmentId, taskId, role: 'implementer', identity: {
+        sessionName: worker.name, sessionInstanceId: worker.sessionInstanceId!, runtimeEpoch: worker.runtimeEpoch!,
+        agentType: worker.agentType, providerFamily: 'openai',
+      },
+    })).toMatchObject({ ok: true });
+    expect(registry.updateTask({ taskId, status: 'implementing' })).toMatchObject({ ok: true });
+    expect(registry.updateAssignment({
+      assignmentId,
+      identity: {
+        sessionName: worker.name, sessionInstanceId: worker.sessionInstanceId!, runtimeEpoch: worker.runtimeEpoch!,
+        agentType: worker.agentType, providerFamily: 'openai',
+      },
+      status: 'implementing',
+    })).toMatchObject({ ok: true });
+    const dispatchMessage = vi.fn().mockResolvedValue('delivered');
+    const deps = {
+      listSessions: () => [brain, worker], dispatchMessage,
+      hasDeliveryEvidence: () => false,
+    };
+    try {
+      const first = await reportImplementationNoProgressBlocker({ taskId, assignmentId }, deps);
+      const second = await reportImplementationNoProgressBlocker({ taskId, assignmentId }, deps);
+      expect(first).toMatchObject({ status: 'waiting', replay: false });
+      expect(second).toMatchObject({ status: 'waiting', replay: true });
+      expect(dispatchMessage).toHaveBeenCalledOnce();
+      const report = JSON.parse(dispatchMessage.mock.calls[0]![1]);
+      expect(report).toMatchObject({
+        taskId, assignmentId, disposition: 'waiting_for_brain',
+        exactError: 'implementation continuation budget exhausted without authoritative work activity or structured escalation',
+        reporter: { label: 'CC1', sessionName: worker.name },
+        brain: { label: 'Project Brain', sessionName: brain.name },
+      });
+      expect(report.options).toEqual(expect.arrayContaining(['repair_same_object_authority']));
+      expect(report).not.toHaveProperty('missing');
+      expect(JSON.parse(registry.getAssignment(assignmentId)!.blocker!)).toEqual(report);
+    } finally {
+      resetSupervisionTaskRegistryForTests();
+    }
+  });
+
+  it('authorizes a no-progress escalation through durable dispatch and drain', async () => {
+    resetSupervisionTaskRegistryForTests();
+    clearAllResend();
+    const registry = getSupervisionTaskRegistry();
+    const taskId = 'durable-no-progress-task';
+    const assignmentId = 'durable-no-progress-worker';
+    const revision = 'durable-no-progress-r1';
+    const worker = session({
+      name: 'deck_durable_no_progress_worker', projectName: 'alpha', role: 'w1', label: 'Worker',
+      agentType: 'codex-sdk', runtimeType: 'transport', providerId: 'codex-sdk',
+    } as never);
+    const brain = session({
+      name: 'deck_durable_no_progress_brain', projectName: 'alpha', role: 'brain', label: 'Brain',
+      agentType: 'codex-sdk', runtimeType: 'transport', providerId: 'codex-sdk',
+    } as never);
+    upsertSession(worker);
+    upsertSession(brain);
+    const liveWorker = getSession(worker.name)!;
+    const liveBrain = getSession(brain.name)!;
+    try {
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'independent_top_level',
+        // Production can legitimately have no task.currentRevision yet; the
+        // producer binds the row to assignment.auditRevision in that shape.
+        objective: 'deliver no-progress escalation',
+      })).toMatchObject({ ok: true });
+      expect(registry.createAssignment({
+        taskId, role: 'coordinator', required: false, identity: {
+          sessionName: liveBrain.name,
+          sessionInstanceId: liveBrain.sessionInstanceId!,
+          runtimeEpoch: liveBrain.runtimeEpoch!,
+          agentType: liveBrain.agentType,
+          providerFamily: 'openai',
+        },
+      })).toMatchObject({ ok: true });
+      expect(registry.createAssignment({
+        assignmentId, taskId, role: 'implementer', identity: {
+          sessionName: liveWorker.name,
+          sessionInstanceId: liveWorker.sessionInstanceId!,
+          runtimeEpoch: liveWorker.runtimeEpoch!,
+          agentType: liveWorker.agentType,
+          providerFamily: 'openai',
+        }, auditRevision: revision,
+      })).toMatchObject({ ok: true });
+      expect(registry.updateTask({ taskId, status: 'implementing' })).toMatchObject({ ok: true });
+      expect(registry.updateAssignment({
+        assignmentId,
+        identity: registry.getAssignment(assignmentId)!.identity,
+        status: 'implementing',
+      })).toMatchObject({ ok: true });
+
+      const result = await reportImplementationNoProgressBlocker({ taskId, assignmentId }, {
+        listSessions: () => [liveBrain, liveWorker],
+        hasDeliveryEvidence: () => false,
+        dispatchMessage: async (target, message, options) => {
+          const queued = enqueueResend(target.name, {
+            text: message,
+            commandId: options.messageId,
+            clientMessageId: options.messageId,
+            deliveryMode: options.deliveryMode,
+            supervisionReference: options.queueSupervisionReference,
+            queuedAt: Date.now(),
+          });
+          if (!queued.accepted) throw new Error('queue rejected');
+          return 'queued';
+        },
+      });
+      expect(result).toMatchObject({ status: 'waiting', replay: false });
+      expect(getResendCount(liveBrain.name)).toBe(1);
+      const queuedMessageId = getResendEntries(liveBrain.name)[0]!.clientMessageId!;
+
+      let deliveredReference: unknown;
+      let deliveredCount = 0;
+      const deliver = async (entry: Parameters<typeof enqueueResend>[1]) => {
+        deliveredReference = entry.supervisionReference;
+        const delivery = {
+          targetSessionName: liveBrain.name,
+          clientMessageId: entry.clientMessageId ?? entry.commandId ?? '',
+          text: entry.text,
+          supervisionReference: entry.supervisionReference,
+        };
+        const initialAdmission = resolveQueuedSupervisionHeartbeatDelivery(delivery);
+        if (initialAdmission === 'retry') return RESEND_DISPATCH_CONTROL.RETRY;
+        if (initialAdmission === 'stale') return RESEND_DISPATCH_CONTROL.STALE;
+        // The deterministic id is part of the durable blocker authority, not
+        // optional dedupe metadata. A replay under a different id is stale.
+        expect(resolveQueuedSupervisionHeartbeatDelivery({
+          ...delivery,
+          clientMessageId: 'send_message_wrong_blocker_fingerprint',
+        })).toBe('stale');
+        const durableBlocker = registry.getAssignment(assignmentId)!.blocker!;
+        expect(registry.updateAssignment({
+          assignmentId,
+          identity: registry.getAssignment(assignmentId)!.identity,
+          blocker: 'waiting on CI logs; will retry',
+        })).toMatchObject({ ok: true });
+        expect(resolveQueuedSupervisionHeartbeatDelivery(delivery)).toBe('stale');
+        expect(registry.updateAssignment({
+          assignmentId,
+          identity: registry.getAssignment(assignmentId)!.identity,
+          blocker: durableBlocker,
+        })).toMatchObject({ ok: true });
+        expect(resolveQueuedSupervisionHeartbeatDelivery(delivery)).toBe('authorized');
+        deliveredCount += 1;
+        return 'sent' as const;
+      };
+
+      removeSession(liveBrain.name);
+      await expect(drainResend(liveBrain.name, deliver)).resolves.toBe(0);
+      expect(getResendCount(liveBrain.name)).toBe(1);
+      expect(getTransportQueueStore().hasDeliveryTombstone(liveBrain.name, queuedMessageId))
+        .toBe(false);
+
+      upsertSession({ ...liveBrain, state: 'stopped', updatedAt: liveBrain.updatedAt + 1 });
+      await expect(drainResend(liveBrain.name, deliver)).resolves.toBe(0);
+      expect(getResendCount(liveBrain.name)).toBe(1);
+      expect(getTransportQueueStore().hasDeliveryTombstone(liveBrain.name, queuedMessageId))
+        .toBe(false);
+
+      upsertSession({ ...liveBrain, state: 'idle', updatedAt: liveBrain.updatedAt + 2 });
+      await expect(drainResend(liveBrain.name, deliver)).resolves.toBe(1);
+      await expect(drainResend(liveBrain.name, deliver)).resolves.toBe(0);
+      expect(deliveredCount).toBe(1);
+      expect(deliveredReference).toMatchObject({
+        kind: 'implementation_blocker', taskId, assignmentId, revision,
+      });
+      expect(getResendCount(liveBrain.name)).toBe(0);
+    } finally {
+      clearAllResend();
+      removeSession(worker.name);
+      removeSession(brain.name);
+      resetSupervisionTaskRegistryForTests();
+    }
+  });
+
+  it('refuses to fabricate an implementation no-progress blocker before a delegated assignment starts', async () => {
+    resetSupervisionTaskRegistryForTests();
+    const registry = getSupervisionTaskRegistry();
+    const taskId = 'delegated-is-not-implementation-no-progress';
+    const assignmentId = 'delegated-implementer';
+    const worker = session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'CC1' });
+    const brain = session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain', label: 'Project Brain' });
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level', objective: 'wait for initial delivery',
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      assignmentId, taskId, role: 'implementer', identity: {
+        sessionName: worker.name, sessionInstanceId: worker.sessionInstanceId!, runtimeEpoch: worker.runtimeEpoch!,
+        agentType: worker.agentType, providerFamily: 'openai',
+      },
+    })).toMatchObject({ ok: true });
+    const dispatchMessage = vi.fn();
+    try {
+      await expect(reportImplementationNoProgressBlocker({ taskId, assignmentId }, {
+        listSessions: () => [brain, worker], dispatchMessage,
+      })).resolves.toEqual({ status: 'ignored', reason: 'implementation_not_started' });
+      expect(registry.getAssignment(assignmentId)?.blocker).toBeUndefined();
+      expect(dispatchMessage).not.toHaveBeenCalled();
+    } finally {
+      resetSupervisionTaskRegistryForTests();
+    }
+  });
+
+  it('uses NEEDS_INPUT only when no unique same-project Brain can resolve the blocker', async () => {
+    resetSupervisionTaskRegistryForTests();
+    const registry = getSupervisionTaskRegistry();
+    const taskId = 'external-input-blocker-task';
+    const assignmentId = 'external-input-blocker-assignment';
+    const worker = session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'CC1' });
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level', objective: 'need external input',
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      assignmentId, taskId, role: 'implementer', identity: {
+        sessionName: worker.name, sessionInstanceId: worker.sessionInstanceId!, runtimeEpoch: worker.runtimeEpoch!,
+        agentType: worker.agentType, providerFamily: 'openai',
+      },
+    })).toMatchObject({ ok: true });
+    expect(registry.updateTask({ taskId, status: 'implementing' })).toMatchObject({ ok: true });
+    expect(registry.updateAssignment({
+      assignmentId,
+      identity: {
+        sessionName: worker.name, sessionInstanceId: worker.sessionInstanceId!, runtimeEpoch: worker.runtimeEpoch!,
+        agentType: worker.agentType, providerFamily: 'openai',
+      },
+      status: 'implementing',
+    })).toMatchObject({ ok: true });
+    const dispatchMessage = vi.fn();
+    try {
+      const result = await reportImplementationNoProgressBlocker({ taskId, assignmentId }, {
+        listSessions: () => [worker], dispatchMessage,
+      });
+      expect(result).toMatchObject({
+        status: 'needs_input', replay: false,
+        report: { disposition: 'needs_input', missing: expect.stringContaining('authoritative same-project Brain') },
+      });
+      expect(dispatchMessage).not.toHaveBeenCalled();
+    } finally {
+      resetSupervisionTaskRegistryForTests();
+    }
+  });
+
+  it('carries the executor on a queued delivery too, not just an accepted one', async () => {
+    // A message parked behind a busy turn is exactly when the caller most wants
+    // to know who it is waiting on.
+    const dispatchMessage = vi.fn().mockResolvedValue('queued');
+    const result = await dispatchSendMessage(caller, {
+      target: 'Coder',
+      message: 'wait your turn',
+      deliveryMode: 'queue',
+    }, {
+      listSessions: () => [
+        session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain' }),
+        session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'Coder' }),
+      ],
+      dispatchMessage,
+    });
+
+    if (result.status !== 'accepted') throw new Error('expected accepted');
+    expect(result.deliveries[0]).toMatchObject({
+      status: 'queued',
+      execution: { sessionName: 'deck_alpha_w1', source: 'live' },
+    });
+  });
+
+  it('honors explicit queue delivery without attempting active-turn append', async () => {
+    const dispatchMessage = vi.fn().mockResolvedValue('queued');
+    const result = await dispatchSendMessage(caller, {
+      target: 'Coder',
+      message: 'wait your turn',
+      deliveryMode: 'queue',
+    }, {
+      listSessions: () => [
+        session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain' }),
+        session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'Coder' }),
+      ],
+      dispatchMessage,
+    });
+
+    expect(result).toMatchObject({
+      status: 'accepted',
+      deliveries: [expect.objectContaining({ target: 'deck_alpha_w1', status: 'queued' })],
+    });
+    expect(dispatchMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'deck_alpha_w1' }),
+      'wait your turn',
+      expect.objectContaining({ deliveryMode: 'queue' }),
+    );
   });
 
   it('send_stop force-stops a resolved sibling via cancelSession', async () => {
@@ -474,7 +1522,11 @@ describe('send-tool', () => {
     });
 
     expect(result.queued).toEqual(['deck_alpha_brain']);
+    expect(result.messages).toEqual([
+      expect.objectContaining({ target: 'deck_alpha_brain', status: 'queued' }),
+    ]);
     expect(dispatchMessage.mock.calls[0][2]).toMatchObject({
+      deliveryMode: 'append',
       sharedActor: {
         actorDisplayName: 'CC1',
         effectiveActorRole: 'server-member',
@@ -503,7 +1555,16 @@ describe('send-tool', () => {
   it('persists strict supervision audit purpose only for one reply-enabled target', async () => {
     const dispatchMessage = vi.fn().mockResolvedValue(undefined);
     const origin = session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain' });
-    const target = session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1', label: 'Auditor' });
+    // A real third session is the audit SUBJECT. The dispatching Brain is
+    // neither auditor nor audited, so it must not stand in as either.
+    const audited = session({
+      name: 'deck_alpha_impl', projectName: 'alpha', role: 'w2',
+      parentSession: 'deck_alpha_brain', label: 'Impl',
+    });
+    const target = session({
+      name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1',
+      parentSession: 'deck_alpha_brain', label: 'Auditor',
+    });
     const result = await dispatchSendMessage(caller, {
       target: target.name,
       message: 'perform the configured audit',
@@ -511,9 +1572,10 @@ describe('send-tool', () => {
       audit: {
         kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
         attemptId: 'automatic_audit_attempt_1',
+        auditedSessionName: 'deck_alpha_impl',
       },
     }, {
-      listSessions: () => [origin, target],
+      listSessions: () => [origin, audited, target],
       dispatchMessage,
     });
 
@@ -525,6 +1587,9 @@ describe('send-tool', () => {
       purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
       auditAttemptId: 'automatic_audit_attempt_1',
     });
+    expect(dispatchMessage.mock.calls[0][1]).toContain('peer_audit_reply');
+    expect(dispatchMessage.mock.calls[0][1]).toContain('"attemptId":"automatic_audit_attempt_1"');
+    expect(dispatchMessage.mock.calls[0][1]).not.toContain('Use the delegation_reply tool');
 
     await expect(dispatchSendMessage(caller, {
       target: target.name,
@@ -532,13 +1597,39 @@ describe('send-tool', () => {
       audit: {
         kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
         attemptId: 'automatic_audit_attempt_2',
+        auditedSessionName: 'deck_alpha_impl',
       },
     }, {
-      listSessions: () => [origin, target],
+      listSessions: () => [origin, audited, target],
       dispatchMessage,
     })).resolves.toMatchObject({
       status: 'error',
       reason: 'validation_failed',
     });
+  });
+});
+
+describe('send-tool auto-provision identity limit', () => {
+  const brain = session({ name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain' });
+
+  it('rejects an auto-provision identity one code point over the session limit before dispatch', async () => {
+    const dispatchMessage = vi.fn();
+    await expect(dispatchSendMessage(caller, {
+      message: 'spawn a worker', idempotencyKey: 'identity-over-limit',
+      task: { autoProvision: true },
+      identity: { content: '😀'.repeat(SESSION_IDENTITY_SESSION_MAX_CHARS + 1) },
+    } as never, { listSessions: () => [brain], dispatchMessage })).resolves.toMatchObject({
+      status: 'error', error: 'identity_content_too_large',
+    });
+    expect(dispatchMessage).not.toHaveBeenCalled();
+  });
+
+  it('lets an identity at exactly the session limit through the identity gate', async () => {
+    const result = await dispatchSendMessage(caller, {
+      message: 'spawn a worker', idempotencyKey: 'identity-at-limit',
+      task: { autoProvision: true },
+      identity: { content: '😀'.repeat(SESSION_IDENTITY_SESSION_MAX_CHARS) },
+    } as never, { listSessions: () => [brain], dispatchMessage: vi.fn() }) as { error?: string };
+    expect(result.error).not.toBe('identity_content_too_large');
   });
 });

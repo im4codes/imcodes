@@ -12,15 +12,53 @@
  * terminal.stream_reset and unsubscribes the browser from that session.
  */
 
-import WebSocket from 'ws';
+import WebSocket, { type RawData } from 'ws';
+import { CLOCK_SYNC_FIELD } from '../../../shared/clock-sync.js';
 import { performance } from 'node:perf_hooks';
 import { randomUUID } from 'node:crypto';
 import type { Database } from '../db/client.js';
 import type { Env } from '../env.js';
 import { MemoryRateLimiter } from './rate-limiter.js';
 import { randomHex, sha256Hex } from '../security/crypto.js';
+import { issueSharedMachineAuthorityForSession } from '../share/shared-machine-authority.js';
+import { SHARED_MACHINE_AUTHORITY_FIELD } from '../../../shared/shared-machine-authority.js';
 import { resolveServerRole } from '../security/authorization.js';
 import { DAEMON_MSG } from '../../../shared/daemon-events.js';
+import type {
+  CapabilityFinding,
+  CapabilityInstallState,
+  CapabilityOperationActivateFrame,
+  CapabilityOperationCommitAckFrame,
+  CapabilityOperationCommitAbortFrame,
+  CapabilityOperationCommitResultFrame,
+  CapabilityOperationCancelFrame,
+  CapabilityOperationConfirmFrame,
+  CapabilityOperationInstallFrame,
+  CapabilityOperationProgressFrame,
+  CapabilityOperationManageFrame,
+  CapabilityOperationManageAckFrame,
+  CapabilityOperationManageResultFrame,
+} from '../../../shared/capability-management.js';
+import {
+  CAPABILITY_BLOB_ACTION,
+  CAPABILITY_AUDIT_VERDICT,
+  CAPABILITY_ERROR,
+  CAPABILITY_FINDING_SEVERITY,
+  CAPABILITY_KIND,
+  CAPABILITY_INSTALL_STATE,
+  CAPABILITY_LIMITS,
+  CAPABILITY_MANAGE_ACTION,
+  CAPABILITY_MANAGE_PHASE,
+  CAPABILITY_MANAGE_RESULT_PHASE,
+  CAPABILITY_OPERATION_MSG,
+  CAPABILITY_READINESS,
+  CAPABILITY_SCOPE,
+  CAPABILITY_SOURCE_KIND,
+  CAPABILITY_SYNC_MSG,
+  isCapabilityInstallState,
+  normalizeCapabilityMcpDefinition,
+} from '../../../shared/capability-management.js';
+import { issueCapabilityBlobAccess } from '../services/capability-package-storage.js';
 import { CRON_MSG, normalizeCronExecutionDetail } from '../../../shared/cron-types.js';
 import {
   abandonPriorGenerations,
@@ -31,6 +69,7 @@ import {
 } from './machine-exec-registry.js';
 import { resolvePendingComputerUse, abandonComputerUsePriorGenerations } from './computer-use-registry.js';
 import { resolvePendingAutoUnlock } from './auto-unlock-registry.js';
+import { notifyRemoteDesktopAutoUnlock } from '../services/remote-desktop-auto-unlock-notification.js';
 import { validateControlledNodeAutoUnlockResult } from '../../../shared/controlled-node-auto-unlock.js';
 import {
   NODE_ROLE,
@@ -48,12 +87,18 @@ import { PEER_AUDIT_COMMAND_ERRORS, PEER_AUDIT_MESSAGES } from '../../../shared/
 import { PeerAuditUnicastRouter } from './peer-audit-unicast-router.js';
 import { DirectFileTransferRouter } from './direct-file-transfer-router.js';
 import { RemoteDesktopRouter } from './remote-desktop-router.js';
+import type {
+  RemoteDesktopGuestDeliveryResult,
+  RemoteDesktopGuestOutboxAuthorityMatch,
+  RemoteDesktopGuestOutboxExecutionTarget,
+} from '../services/remote-desktop-guest-outbox-worker.js';
 import { createTurnIceServerAuthority } from './turn-credentials.js';
 import {
   DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES,
   isDirectConnectivityRuntimeStatus,
 } from '../../../shared/direct-file-transfer.js';
 import { FS_TRANSPORT_MSG } from '../../../shared/fs-transport-messages.js';
+import { FS_GENERIC_ERROR_CODES } from '../../../shared/fs-error-codes.js';
 import { FS_SESSION_ROOT_PATH } from '../../../src/shared/transport/fs.js';
 import {
   FILE_TRANSFER_MSG,
@@ -71,15 +116,80 @@ import {
 } from '../../../shared/controlled-node-capabilities.js';
 import {
   REMOTE_DESKTOP_CAPABILITY,
+  REMOTE_DESKTOP_MSG,
   REMOTE_DESKTOP_TERMINAL_REASON,
+  validateRemoteDesktopBrowserMessage,
+  type RemoteDesktopAccessMode,
   type RemoteDesktopTerminalReason,
 } from '../../../shared/remote-desktop.js';
+import {
+  REMOTE_DESKTOP_ACTOR_SOURCE,
+  REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY,
+  REMOTE_DESKTOP_CONSENT_CANCEL_REASON,
+  REMOTE_DESKTOP_CONSENT_MSG,
+  REMOTE_DESKTOP_DEFAULT_SHIELDED_ROUTE_CAPABILITY,
+  REMOTE_DESKTOP_LINK_LIMITS,
+  REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY,
+  REMOTE_DESKTOP_NODE_CONTEXT_MSG,
+  REMOTE_DESKTOP_PRIVACY_MSG,
+  REMOTE_DESKTOP_PRIVACY_PHASE,
+  REMOTE_DESKTOP_SHELL_MSG,
+  REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY,
+  validateRemoteDesktopBootstrapProof,
+  validateRemoteDesktopConsentMessage,
+  validateRemoteDesktopNodeAuthorityContext,
+  validateRemoteDesktopPrivacyMessage,
+  validateRemoteDesktopShellMessage,
+  type RemoteDesktopShellLaunchContext,
+  type RemoteDesktopOutboxEvent,
+  type RemoteDesktopActor,
+  type RemoteDesktopPrivacyBegin,
+  type RemoteDesktopPrivacyEnd,
+} from '../../../shared/remote-desktop-access.js';
+import {
+  redeemBootstrapForRoute,
+  resolveRedeemedGuestActor,
+} from '../services/remote-desktop-guest-bootstrap.js';
+import { hashBrowserKey } from '../services/remote-desktop-guest-links.js';
+import {
+  REMOTE_DESKTOP_CONSENT_STATE,
+  REMOTE_DESKTOP_CONSENT_CANCEL_TRIGGER,
+  cancelAttendedConsents,
+  consumeApprovedAttendedConsent,
+  createRemoteDesktopConsentResultConsumer,
+  getAttendedConsent,
+  remoteDesktopConsentCancellation,
+  requestAttendedConsent,
+  type RemoteDesktopConsentDispatchCommand,
+} from '../services/remote-desktop-consent-coordinator.js';
+import {
+  acknowledgeFreshFrame,
+  acknowledgeShield,
+  getPrivacyState,
+  markRecoveryRequired,
+  setRemoteDesktopPendingRouteCancellationDispatcher,
+  type RemoteDesktopManagementPrivacyCommand,
+  type RemoteDesktopPendingRouteCancellationCommand,
+} from '../services/remote-desktop-management-privacy.js';
+import type {
+  RemoteDesktopShellEndpointAuthority,
+  RemoteDesktopShellLaunchContextDispatcher,
+} from '../services/remote-desktop-shell-launch-context.js';
+import { readDatabaseClock } from '../services/remote-desktop-guest-due-worker.js';
 import { isRemoteDesktopFeatureEnabled } from '../../../shared/remote-desktop-feature.js';
+import { resolveRemoteDesktopSessionProfile } from '../../../shared/remote-desktop-platform.js';
 import {
   REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
+  REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY,
   REMOTE_DESKTOP_INSTALL_MSG,
+  REMOTE_DESKTOP_PERMISSION_MSG,
 } from '../../../shared/remote-desktop-install.js';
-import { CONTROLLED_NODE_OS_WIN, isControlledNodeOs, type ControlledNodeOs } from '../../../shared/controlled-node-artifacts.js';
+import {
+  CONTROLLED_NODE_OS_WIN,
+  isControlledNodeArch,
+  isControlledNodeOs,
+  type ControlledNodeOs,
+} from '../../../shared/controlled-node-artifacts.js';
 import {
   CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY,
   CONTROLLED_NODE_UPGRADE_RESCUE_AUDIT_ACTION,
@@ -161,9 +271,41 @@ import { isStreamingResponse } from '../../../shared/preview-stream-policy.js';
 import { getSessionRuntimeType } from '../../../shared/agent-types.js';
 import { LocalWebPreviewRegistry, setPreviewActiveRelayHook, setPreviewEvictedHook } from '../preview/registry.js';
 import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, getSubSessionById, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent, getUserPref, setUserPref, deleteUserPref, getDbSessionsByServer, getUserById, insertDiscussionComment } from '../db/queries.js';
+import {
+  activateCapabilityVersion,
+  advanceCapabilityOperation,
+  updateCapabilityOperation,
+  acknowledgeCapabilityReadiness,
+  completeCapabilityCommit,
+  expireCapabilityPendingActivations,
+  expireCapabilityPreActivationOperations,
+  failCapabilityOperationsForDisconnectedServer,
+  getCapabilityOperation,
+  getCapabilitySyncSnapshot,
+  getCapabilityAuthorityRecordSet,
+  getPendingCapabilityAuthorization,
+  listPendingCapabilityAuthorizations,
+  listPendingCapabilityBlobUploads,
+  failCapabilityPendingActivation,
+  advanceLocalCapabilityManageResult,
+  markLocalCapabilityManageCommitSent,
+  listReplayableLocalCapabilityManageRequests,
+  manageCapability,
+  type LocalCapabilityManageRequestView,
+} from '../db/capabilities.js';
 import { toDiscussionCommentView } from '../share/discussion-comment-view.js';
 import { resolveCoveredSessionNames } from '../share/covered-sessions.js';
 import logger from '../util/logger.js';
+import {
+  toCapabilityOperationAuthorizeFrame,
+  toCapabilitySummary,
+  toCapabilitySyncSnapshot,
+  toCapabilitySyncAuthorityFrame,
+} from '../services/capability-wire.js';
+import {
+  createCapabilityAuthorizationSigner,
+  type CapabilityAuthorizationSigner,
+} from '../services/capability-authorization.js';
 import {
   TIMELINE_DELIVERY_METRICS,
   countableTimelineEventType,
@@ -199,6 +341,7 @@ import {
 import { DaemonUpgradeCoordinator, type DaemonUpgradeSource, type RequestDaemonUpgradeResult } from './daemon-upgrade-coordinator.js';
 import {
   SHARE_REASONS,
+  buildSharedActorEnvelope,
   commandSessionName,
   evaluateShareCommand,
   filterShareDaemonMessage,
@@ -397,6 +540,17 @@ const SESSION_GROUP_CLONE_CONTEXT_TTL_MS = 10 * 60 * 1000;
  * the limiter back on, flip the flag — no other changes required.
  */
 const BROWSER_RATE_LIMIT_ENABLED = false;
+// Dedicated read-plane limiter stays enabled even while the legacy global
+// limiter is disabled. It cannot block session.send/STOP/control traffic and
+// bounds old browsers that predate owner-side single-flight.
+const BROWSER_DATA_READ_RATE_LIMIT = 64;
+const BROWSER_DATA_READ_RATE_WINDOW_MS = 10_000;
+const BROWSER_DATA_READ_TYPES: ReadonlySet<string> = new Set([
+  'fs.ls',
+  'fs.git_status',
+  TRANSPORT_MSG.LIST_MODELS,
+  TIMELINE_MESSAGES.HISTORY_REQUEST,
+]);
 // 4MB per (session, browser). Heavy output (build logs, large `cat`, log tail)
 // can burst tens of KB per frame; at 1MB the queue overflowed within a few
 // frames during heavy output and triggered stream_reset cascades, which the
@@ -404,6 +558,14 @@ const BROWSER_RATE_LIMIT_ENABLED = false;
 // at typical egress rates without holding meaningful memory (a single ws
 // per session, queue is reset on overflow anyway).
 const QUEUE_MAX_BYTES = 4 * 1024 * 1024;
+/** Resume sending only after in-flight bytes drain to a quarter of the budget.
+ *  Resuming at the high-water mark would flap: one callback frees a few KB and
+ *  the next full frame immediately re-triggers the overflow. */
+const QUEUE_LOW_WATER_BYTES = QUEUE_MAX_BYTES / 4;
+/** How long a socket may stay paused before its budget is forgiven once. Bounds
+ *  the damage of a wedged peer without letting every dropped frame buy a fresh
+ *  budget the way the old queue-replacement did. */
+const QUEUE_PAUSE_GRACE_MS = 2_000;
 const SUBSESSION_OWNERSHIP_RETRY_DELAYS_MS = [50, 150, 350] as const;
 
 /**
@@ -442,24 +604,114 @@ function safeSend(ws: WebSocket, data: string | Buffer, onComplete?: (err?: Erro
  */
 class TerminalForwardQueue {
   private bufferedBytes = 0;
+  /** True once the high-water mark was hit; stays true until in-flight bytes
+   *  drain back below the low-water mark. While set, terminal frames are
+   *  dropped WITHOUT re-notifying the client (see `overflowNotified`). */
+  private paused = false;
+  private pausedSince = 0;
+  /** Bumped when the grace valve forgives the outstanding budget. Frames sent
+   *  before the bump belong to a dead generation: their `ws.send` callbacks
+   *  must NOT decrement the new accounting, or a late callback would push
+   *  `bufferedBytes` negative and hand the socket credit it never earned —
+   *  re-opening the unbounded-in-flight hole this class exists to close. */
+  private epoch = 0;
+  /** One stream_reset per overflow episode, not one per dropped frame. */
+  private overflowNotified = false;
 
-  send(ws: WebSocket, data: string | Buffer, onOverflow: () => void): void {
+  /** In-flight bytes this queue has handed to `ws.send` and not yet seen
+   *  acknowledged. Exposed so overflow handling can decide when the socket is
+   *  writable again instead of resetting the counter. */
+  get inFlightBytes(): number {
+    return this.bufferedBytes;
+  }
+
+  /** True while the socket is above the high-water mark. */
+  get isPaused(): boolean {
+    return this.paused;
+  }
+
+  /**
+   * @returns `'sent'` | `'dropped'` — `'dropped'` means the frame did not go
+   *          out. The caller decides whether that is the FIRST drop of this
+   *          episode (worth a stream_reset) by checking `takeOverflowNotice()`.
+   */
+  send(ws: WebSocket, data: string | Buffer, onOverflow: () => void): 'sent' | 'dropped' {
     const size = typeof data === 'string' ? Buffer.byteLength(data, 'utf8') : data.byteLength;
-    this.bufferedBytes += size;
 
-    if (this.bufferedBytes > QUEUE_MAX_BYTES) {
-      this.bufferedBytes -= size;
-      onOverflow();
-      return;
+    const now = Date.now();
+    if (this.paused || this.bufferedBytes + size > QUEUE_MAX_BYTES) {
+      // A single frame larger than the whole budget with NOTHING in flight is
+      // not congestion — there is no backlog to drain. Drop just that frame and
+      // let the next one through; pausing here would stall a healthy socket.
+      //
+      // Such a drop must NOT consume the overflow episode's one-shot notice.
+      // It is not an episode: nothing is paused, so nothing will ever clear
+      // `overflowNotified` again, and the next REAL congestion episode would be
+      // silently swallowed — the browser would keep a gap it is never told
+      // about and would sit there until the user reloads.
+      if (!this.paused && this.bufferedBytes === 0) {
+        const hadNotice = this.overflowNotified;
+        onOverflow();
+        this.overflowNotified = hadNotice;
+        return 'dropped';
+      }
+      if (!this.paused) {
+        this.paused = true;
+        this.pausedSince = now;
+      }
+      // Escape valve. If the socket never acknowledges (a wedged connection, or
+      // a peer whose main thread has stopped reading), staying paused forever
+      // would freeze the terminal — the exact "终端卡住不更新, 刷新才恢复"
+      // regression the stream_reset design was written to avoid. So the budget
+      // IS eventually forgiven, but at most once per grace window instead of on
+      // every dropped frame: the old code replaced the whole queue on each
+      // overflow, which handed out a brand-new 4MB while the previous 4MB was
+      // still unacknowledged, so one socket's real backlog had no bound at all.
+      if (now - this.pausedSince >= QUEUE_PAUSE_GRACE_MS) {
+        // Forgive the outstanding budget, and retire the generation with it so
+        // the still-unacknowledged frames cannot decrement the fresh counter.
+        this.epoch += 1;
+        this.bufferedBytes = 0;
+        this.paused = false;
+        this.overflowNotified = false;
+        this.pausedSince = 0;
+      } else {
+        onOverflow();
+        return 'dropped';
+      }
     }
 
+    this.bufferedBytes += size;
+    const sentEpoch = this.epoch;
     safeSend(ws, data, (err) => {
-      this.bufferedBytes -= size;
+      // A callback from a forgiven generation refers to bytes that were already
+      // written off. Decrementing here would drive the counter negative and let
+      // the next burst exceed the high-water mark by exactly that much.
+      const sameEpoch = sentEpoch === this.epoch;
+      if (sameEpoch) this.bufferedBytes -= size;
       if (err) {
         // Socket closed or errored — treat as overflow to trigger cleanup
+        this.paused = true;
         onOverflow();
+        return;
+      }
+      // Drained far enough to resume. The low-water mark (a quarter of the
+      // budget) gives the socket real headroom instead of flapping at the
+      // threshold.
+      if (sameEpoch && this.paused && this.bufferedBytes <= QUEUE_LOW_WATER_BYTES) {
+        this.paused = false;
+        this.overflowNotified = false;
       }
     });
+    return 'sent';
+  }
+
+  /** True exactly once per overflow episode — use it to send a single
+   *  `terminal.stream_reset` instead of one per dropped frame. */
+  takeOverflowNotice(): boolean {
+    if (this.overflowNotified) return false;
+    this.overflowNotified = true;
+    return true;
   }
 }
 
@@ -1189,14 +1441,106 @@ export function __setShareBridgeClockForTests(clock: (() => number) | null): voi
  */
 const SHARE_COVERAGE_MAX_STALENESS_MS = 60_000;
 
+function capabilityOpaqueId(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() && value.length <= 128 ? value : null;
+}
+
+function capabilityDigest(value: unknown): string | null {
+  return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value) ? value : null;
+}
+
+function capabilityStringList(value: unknown, max: number): string[] | null {
+  if (!Array.isArray(value) || value.length > max) return null;
+  const output: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== 'string' || entry.length > CAPABILITY_LIMITS.FINDING_TEXT_BYTES) return null;
+    output.push(entry);
+  }
+  return output;
+}
+
+function sanitizeCapabilityFindings(value: unknown): CapabilityFinding[] | null {
+  if (!Array.isArray(value) || value.length > CAPABILITY_LIMITS.FINDINGS) return null;
+  const output: CapabilityFinding[] = [];
+  for (const raw of value) {
+    if (typeof raw !== 'object' || raw === null) return null;
+    const finding = raw as Record<string, unknown>;
+    if (typeof finding.code !== 'string'
+      || finding.code.length > 128
+      || typeof finding.message !== 'string'
+      || finding.message.length > CAPABILITY_LIMITS.FINDING_TEXT_BYTES
+      || typeof finding.severity !== 'string'
+      || !Object.values(CAPABILITY_FINDING_SEVERITY).includes(finding.severity as CapabilityFinding['severity'])
+      || typeof finding.source !== 'string'
+      || !['scanner', 'auditor', 'runtime'].includes(finding.source)
+      || typeof finding.blocking !== 'boolean') return null;
+    output.push({
+      code: finding.code,
+      severity: finding.severity as CapabilityFinding['severity'],
+      message: finding.message,
+      ...(typeof finding.path === 'string' ? { path: finding.path.slice(0, CAPABILITY_LIMITS.PATH_BYTES) } : {}),
+      ...(typeof finding.remediation === 'string'
+        ? { remediation: finding.remediation.slice(0, CAPABILITY_LIMITS.FINDING_TEXT_BYTES) }
+        : {}),
+      source: finding.source as CapabilityFinding['source'],
+      blocking: finding.blocking,
+    });
+  }
+  return output;
+}
+
+function toCapabilityManageJournalFrame(
+  request: LocalCapabilityManageRequestView,
+  phase: typeof CAPABILITY_MANAGE_PHASE[keyof typeof CAPABILITY_MANAGE_PHASE],
+): CapabilityOperationManageFrame {
+  return {
+    type: CAPABILITY_OPERATION_MSG.MANAGE,
+    requestId: request.requestId,
+    phase,
+    ownerId: request.ownerUserId,
+    serverId: request.serverId,
+    capabilityId: request.itemId,
+    bindingId: request.bindingId,
+    action: request.action,
+    expectedRevision: request.expectedRevision,
+    authorityRevision: request.authorityRevision,
+    ...(request.targetVersionId ? { versionId: request.targetVersionId } : {}),
+    ...(request.authorization ? { authorization: request.authorization } : {}),
+  };
+}
+
+/**
+ * The heartbeat ack doubles as the clock-sync round trip: echo the peer's send
+ * time and add this Server's own, so the peer can place Server-stamped
+ * deadlines on its local clock (shared/clock-sync.ts). Peers that send no
+ * timestamp get the Server time alone, which older peers ignore.
+ */
+function heartbeatAckWithClock(heartbeat: Record<string, unknown>): Record<string, unknown> {
+  const sentAt = heartbeat[CLOCK_SYNC_FIELD.SENT_AT];
+  return {
+    type: 'heartbeat_ack',
+    [CLOCK_SYNC_FIELD.SERVER_TIME]: Date.now(),
+    ...(typeof sentAt === 'number' && Number.isFinite(sentAt) ? { [CLOCK_SYNC_FIELD.SENT_AT]: sentAt } : {}),
+  };
+}
+
 export class WsBridge {
   private static instances = new Map<string, WsBridge>();
+  private static remoteDesktopReconnectRevalidator: ((serverId: string) => Promise<void>) | null = null;
 
   private daemonWs: WebSocket | null = null;
   /** Bumped on every new daemon connection; binds pending MACHINE_EXEC results to a generation. */
   private daemonGeneration = 0;
   /** Persistent JWT key used only for stateless direct-file lease resume tickets. */
   private directFileTransferTicketSigningKey: string | null = null;
+  private capabilityBlobSigningKey: string | null = null;
+  private capabilityAuthorizationSigner: CapabilityAuthorizationSigner | null = null;
+  private pendingCapabilityManage = new Map<string, {
+    ownerUserId: string;
+    frame: CapabilityOperationManageFrame;
+    resolve: (result: CapabilityOperationManageResultFrame | null) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
 
   /** Count of inbound frames dropped from CONTROLLED nodes by the 10.2 allowlist (diagnostics/tests). */
   static controlledInboundDropped = 0;
@@ -1206,12 +1550,71 @@ export class WsBridge {
   static invalidMachineExecChunksDropped = 0;
   /** Count of malformed/oversized COMPUTER_USE_RESULT frames rejected before pending-RPC resolution. */
   static invalidComputerUseResultsDropped = 0;
+  /** Count of malformed, reverse-direction, stale or non-owning privacy frames. */
+  static invalidRemoteDesktopPrivacyFramesDropped = 0;
+  /** Count of malformed, stale or non-owning signed-shell lifecycle frames. */
+  static invalidRemoteDesktopShellFramesDropped = 0;
   /** DB-authoritative role of the connected daemon (controlled nodes are a restricted surface). */
   private daemonNodeRole: NodeRole = NODE_ROLE.FULL;
   private authenticated = false;
+  /** Current daemon generation has completed durable route reconciliation. */
+  private remoteDesktopAuthorityReadyGeneration: number | null = null;
   private daemonVersion: string | null = null;
   private daemonControlledOs: ControlledNodeOs | null = null;
   private daemonOwnerUserId: string | null = null;
+  private lastCapabilityRevisionSent = 0;
+  private capabilitySyncInitialized = false;
+
+  /**
+   * Publish the two authority coordinates a controlled node cannot derive:
+   * its canonical physical-host principal and this Server connection's
+   * generation. Absence is fail closed -- the node may stay online, but it
+   * cannot answer attended-consent requests against a guessed identity.
+   */
+  private async sendRemoteDesktopNodeContext(
+    db: Database,
+    ws: WebSocket,
+    connectionGeneration: number,
+  ): Promise<void> {
+    if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED
+      || this.daemonWs !== ws
+      || this.daemonGeneration !== connectionGeneration
+      || !this.authenticated) return;
+    const sendUnavailable = () => {
+      if (this.daemonWs !== ws
+        || this.daemonGeneration !== connectionGeneration
+        || !this.authenticated) return;
+      ws.send(JSON.stringify({
+        type: REMOTE_DESKTOP_NODE_CONTEXT_MSG.UNAVAILABLE,
+        daemonGeneration: connectionGeneration,
+      }));
+    };
+    try {
+      const row = await db.queryOne<{ host_id: string }>(
+        'SELECT host_id FROM remote_desktop_host_endpoints WHERE server_id = $1',
+        [this.serverId],
+      );
+      const context = row ? validateRemoteDesktopNodeAuthorityContext({
+        type: REMOTE_DESKTOP_NODE_CONTEXT_MSG.CURRENT,
+        hostId: row.host_id,
+        daemonGeneration: connectionGeneration,
+      }) : null;
+      if (!context?.ok) {
+        sendUnavailable();
+        return;
+      }
+      if (this.daemonWs !== ws
+        || this.daemonGeneration !== connectionGeneration
+        || !this.authenticated) return;
+      ws.send(JSON.stringify(context.value));
+    } catch (error) {
+      // Host backfill/migration failure removes consent authority; it must not
+      // take unrelated controlled-node exec/file-transfer liveness down.
+      logger.warn({ error, serverId: this.serverId },
+        'could not publish remote desktop canonical-host context');
+      sendUnavailable();
+    }
+  }
   private legacyUpgradeRescuePreparedGeneration: number | null = null;
   /** A safe-self-upgrade node can still retain its process-local latch when a
    *  detached task fails before replacing the process. Arm the same verified
@@ -1260,6 +1663,7 @@ export class WsBridge {
   private upgradeBlockedSyncCompleteGeneration: number | null = null;
   private seenUpgradeBlockedFailures = new Map<string, number>();
   private browserRateLimiter = new MemoryRateLimiter();
+  private browserDataReadRateLimiter = new MemoryRateLimiter();
 
   /** browser socket → session name → raw-enabled flag */
   private browserSubscriptions = new Map<WebSocket, Map<string, boolean>>();
@@ -1366,11 +1770,21 @@ export class WsBridge {
     // capability, not the node role, is what gates the feature.
     daemonAvailable: () => Boolean(
       this.authenticated
+      && this.remoteDesktopAuthorityReadyGeneration === this.daemonGeneration
       && this.daemonWs?.readyState === WebSocket.OPEN
       && (this.daemonNodeRole === NODE_ROLE.CONTROLLED
         || this.hasDaemonCapability(REMOTE_DESKTOP_CAPABILITY)),
     ),
-    daemonSupportsRemoteDesktop: () => this.hasDaemonCapability(REMOTE_DESKTOP_CAPABILITY),
+    daemonSupportsRemoteDesktop: () => resolveRemoteDesktopSessionProfile(
+      this.daemonNodeRole === NODE_ROLE.CONTROLLED
+        ? [...this.controlledNodeCapabilities]
+        : this.daemonP2pWorkflowCapabilities?.capabilities,
+    ) !== null,
+    daemonRemoteDesktopCapabilities: () => (
+      this.daemonNodeRole === NODE_ROLE.CONTROLLED
+        ? [...this.controlledNodeCapabilities]
+        : [...(this.daemonP2pWorkflowCapabilities?.capabilities ?? [])]
+    ),
     featureEnabled: () => isRemoteDesktopFeatureEnabled(
       process.env.IMCODES_REMOTE_DESKTOP_ENABLED,
       process.env.NODE_ENV,
@@ -1379,6 +1793,73 @@ export class WsBridge {
     iceServers: (userId) => createTurnIceServerAuthority(userId),
     sendDaemon: (message, generation) => this.trySendRemoteDesktop(message, generation),
     sendBrowser: (socket, message) => { safeSend(socket, JSON.stringify(message)); },
+    redeemGuestBootstrap: async ({ proof, routeGeneration, clientIp, now }) => {
+      const db = this.db;
+      if (!db) return null;
+      const redeemed = await redeemBootstrapForRoute({
+        db,
+        proof,
+        redeemingServerId: this.serverId,
+        routeGeneration,
+        clientIp,
+        now,
+      });
+      if (!redeemed) return null;
+      // Bootstrap storage binds the independent route incarnation.  Runtime
+      // actor authority remains bound to the authenticated daemon channel.
+      return {
+        ...redeemed,
+        actor: { ...redeemed.actor, endpointGeneration: this.daemonGeneration },
+      };
+    },
+    resolveGuestActor: async (actor, now) => {
+      const db = this.db;
+      if (!db) return null;
+      return resolveRedeemedGuestActor({
+        db,
+        previous: actor,
+        serverId: this.serverId,
+        endpointGeneration: this.daemonGeneration,
+        now,
+      });
+    },
+    requestAttendedConsent: (input) => this.requestRemoteDesktopAttendedConsent(input),
+    cancelPendingGuestConsent: async (actor, cause) => {
+      const db = this.db;
+      if (!db || actor.source !== REMOTE_DESKTOP_ACTOR_SOURCE.ATTENDED_LINK) return;
+      const dispatch = (command: RemoteDesktopConsentDispatchCommand) => (
+        this.trySendRemoteDesktopConsent(command)
+      );
+      if (cause === 'privacy_epoch') {
+        await cancelAttendedConsents(db, {
+          selector: { actorAuditId: actor.auditId },
+          reason: REMOTE_DESKTOP_CONSENT_CANCEL_REASON.LOCAL_UI_FAILED,
+          trigger: REMOTE_DESKTOP_CONSENT_CANCEL_TRIGGER.CALLER_CANCEL,
+          dispatch,
+        });
+      } else if (cause === 'authority_revoked') {
+        await remoteDesktopConsentCancellation.linkRevoked(db, actor.auditId, dispatch);
+      } else {
+        await remoteDesktopConsentCancellation.browserDisconnected(
+          db,
+          hashBrowserKey(actor.browserKeyThumbprint),
+          dispatch,
+        );
+      }
+    },
+    cancelHostAttendedConsents: async (hostId) => {
+      const db = this.db;
+      if (!db) return;
+      await remoteDesktopConsentCancellation.localStop(
+        db,
+        hostId,
+        (command) => this.trySendRemoteDesktopConsent(command),
+      );
+    },
+    supportsDefaultShieldedRoute: () => (
+      this.hasDaemonCapability(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY)
+      && this.hasDaemonCapability(REMOTE_DESKTOP_DEFAULT_SHIELDED_ROUTE_CAPABILITY)
+    ),
     audit: (event, fields) => {
       incrementCounter('remote_desktop.session_event', { event });
       const db = this.db;
@@ -1390,6 +1871,12 @@ export class WsBridge {
         action: event,
         details,
       }, db);
+    },
+    autoUnlockSucceeded: (event) => {
+      const db = this.db;
+      const env = this.pushEnv;
+      if (!db || !env) return;
+      void notifyRemoteDesktopAutoUnlock(db, env, event);
     },
   });
 
@@ -1409,6 +1896,8 @@ export class WsBridge {
   /** Content-bearing timeline events discarded because nobody was subscribed. */
   private timelineNoSubscriberDrops = 0;
   private lastTimelineNoSubscriberLogAt = 0;
+  /** Push credentials of the daemon connection, for owner security pushes. */
+  private pushEnv: Env | null = null;
   private pendingIdlePushes = new Map<string, {
     timer: ReturnType<typeof setTimeout> | null;
     db: Database;
@@ -1499,6 +1988,9 @@ export class WsBridge {
   private ackHousekeepingTimer: ReturnType<typeof setInterval> | null = null;
 
   private constructor(private serverId: string) {
+    setRemoteDesktopPendingRouteCancellationDispatcher(
+      (command) => WsBridge.dispatchRemoteDesktopPendingRouteCancellation(command),
+    );
     // Start periodic cleanup sweep (shared across all bridge instances)
     if (!cleanupSweepHandle) {
       cleanupSweepHandle = setInterval(() => {
@@ -1538,6 +2030,1129 @@ export class WsBridge {
 
   static getAll(): Map<string, WsBridge> {
     return WsBridge.instances;
+  }
+
+  static setRemoteDesktopReconnectRevalidator(
+    revalidator: ((serverId: string) => Promise<void>) | null,
+  ): void {
+    WsBridge.remoteDesktopReconnectRevalidator = revalidator;
+  }
+
+  /** Deliver one durable privacy command only through the currently
+   * authenticated, generation-bound daemon channel. It is never queued or
+   * replayed onto a replacement generation. */
+  static dispatchRemoteDesktopManagementPrivacy(
+    command: RemoteDesktopManagementPrivacyCommand,
+  ): boolean {
+    const bridge = WsBridge.instances.get(command.executionServerId);
+    return bridge?.trySendRemoteDesktopManagementPrivacy(
+      command.message,
+      command.daemonGeneration,
+    ) ?? false;
+  }
+
+  /**
+   * Production adapter for one-use signed-shell launch contexts. Resolution
+   * and delivery both re-check the same live, authenticated controlled-node
+   * generation and never queue onto a replacement connection.
+   */
+  static remoteDesktopShellLaunchContextDispatcher(): RemoteDesktopShellLaunchContextDispatcher {
+    return {
+      currentControlledEndpoint: async (input) => {
+        let selected: RemoteDesktopShellEndpointAuthority | null = null;
+        for (const bridge of WsBridge.instances.values()) {
+          const candidate = await bridge.currentRemoteDesktopShellEndpoint(input);
+          if (!candidate) continue;
+          // More than one live controlled endpoint for one canonical host is
+          // ambiguous presentation identity, not a reason to pick the first.
+          if (selected) return null;
+          selected = candidate;
+        }
+        return selected;
+      },
+      dispatch: async (input) => {
+        const bridge = WsBridge.instances.get(input.executionServerId);
+        return bridge?.trySendRemoteDesktopShellLaunchContext(
+          input.ownerUserId,
+          input.hostId,
+          input.context,
+          input.endpointGeneration,
+        ) ?? false;
+      },
+    };
+  }
+
+  static dispatchRemoteDesktopPendingRouteCancellation(
+    command: RemoteDesktopPendingRouteCancellationCommand,
+  ): boolean {
+    const bridge = WsBridge.instances.get(command.executionServerId);
+    if (!bridge) return false;
+    bridge.remoteDesktopRouter.cancelPendingRoutes(command.hostId, command.routes);
+    return true;
+  }
+
+  /** Resolve only an already-created bridge on this pod. Merely observing an
+   * outbox row must never instantiate a fake owner. */
+  static remoteDesktopGuestOutboxTarget(
+    serverId: string,
+  ): RemoteDesktopGuestOutboxExecutionTarget | null {
+    const bridge = WsBridge.instances.get(serverId);
+    if (!bridge) return null;
+    return {
+      isAvailable: () => bridge.isRemoteDesktopGuestOutboxTargetAvailable(),
+      apply: (event, routeId, routeGeneration, authority) => (
+        bridge.applyRemoteDesktopGuestOutboxEffect(event, routeId, routeGeneration, authority)
+      ),
+    };
+  }
+
+  /** Immediate same-process fan-out; heartbeat revision checks cover other pods. */
+  static async broadcastCapabilitySync(
+    ownerUserId: string,
+    db: Database,
+    afterRevision: number,
+  ): Promise<number> {
+    const record = await getCapabilitySyncSnapshot(db, {
+      ownerUserId,
+      maxItems: CAPABILITY_LIMITS.LIST_MAX,
+      afterRevision,
+    });
+    let delivered = 0;
+    for (const bridge of WsBridge.instances.values()) {
+      if (!bridge.canAcceptCapabilityOperation(ownerUserId)
+        || !bridge.daemonWs
+        || !bridge.capabilitySyncInitialized) continue;
+      try {
+        const keys = bridge.capabilityAuthorizationSigner ? [bridge.capabilityAuthorizationSigner.key] : [];
+        bridge.daemonWs.send(JSON.stringify(toCapabilitySyncSnapshot(
+          record,
+          CAPABILITY_SYNC_MSG.DELTA,
+          keys,
+        )));
+        const authority = await getCapabilityAuthorityRecordSet(db, {
+          ownerUserId,
+          serverId: bridge.serverId,
+        });
+        bridge.daemonWs.send(JSON.stringify(toCapabilitySyncAuthorityFrame(authority, keys)));
+        bridge.lastCapabilityRevisionSent = record.revision;
+        delivered += 1;
+      } catch (error) {
+        logger.warn({ error, serverId: bridge.serverId }, 'Capability sync fan-out failed');
+      }
+    }
+    return delivered;
+  }
+
+  static async dispatchPendingCapabilityAuthorization(
+    ownerUserId: string,
+    db: Database,
+    operationId: string,
+  ): Promise<boolean> {
+    const pending = await getPendingCapabilityAuthorization(db, { ownerUserId, operationId });
+    if (!pending) return false;
+    const bridge = WsBridge.instances.get(pending.targetServerId);
+    if (!bridge?.canAcceptCapabilityOperation(ownerUserId)
+      || !bridge.daemonWs
+      || !bridge.capabilityAuthorizationSigner) return false;
+    try {
+      bridge.daemonWs.send(JSON.stringify(toCapabilityOperationAuthorizeFrame(
+        pending,
+        [bridge.capabilityAuthorizationSigner.key],
+      )));
+      return true;
+    } catch (error) {
+      logger.warn({ error, serverId: pending.targetServerId, operationId }, 'Capability authorization dispatch failed');
+      return false;
+    }
+  }
+
+  /**
+   * True only for the authenticated same-account FULL daemon currently bound
+   * to this bridge. HTTP capability intake uses this before creating durable
+   * queued work so an offline/wrong-account/controlled target fails fast.
+   */
+  canAcceptCapabilityOperation(ownerUserId: string): boolean {
+    return this.authenticated
+      && this.daemonNodeRole === NODE_ROLE.FULL
+      && this.daemonOwnerUserId === ownerUserId
+      && this.daemonWs?.readyState === WebSocket.OPEN;
+  }
+
+  /** Operation install frames are live-generation control messages, never replayed. */
+  dispatchCapabilityInstall(ownerUserId: string, frame: CapabilityOperationInstallFrame): boolean {
+    if (!this.canAcceptCapabilityOperation(ownerUserId) || !this.daemonWs) return false;
+    try {
+      this.daemonWs.send(JSON.stringify(frame));
+      return true;
+    } catch (error) {
+      logger.warn({ error, serverId: this.serverId }, 'Capability install dispatch failed');
+      return false;
+    }
+  }
+
+  /** Browser confirmation is delivered live to the same owner daemon only. */
+  dispatchCapabilityConfirmation(ownerUserId: string, frame: CapabilityOperationConfirmFrame): boolean {
+    if (!this.canAcceptCapabilityOperation(ownerUserId) || !this.daemonWs) return false;
+    try {
+      this.daemonWs.send(JSON.stringify(frame));
+      return true;
+    } catch (error) {
+      logger.warn({ error, serverId: this.serverId }, 'Capability confirmation dispatch failed');
+      return false;
+    }
+  }
+
+  /** Owner cancellation is authoritative server-side; delivery only cleans up live work. */
+  dispatchCapabilityCancellation(ownerUserId: string, frame: CapabilityOperationCancelFrame): boolean {
+    if (!this.canAcceptCapabilityOperation(ownerUserId) || !this.daemonWs) return false;
+    try {
+      this.daemonWs.send(JSON.stringify(frame));
+      return true;
+    } catch (error) {
+      logger.warn({ error, serverId: this.serverId }, 'Capability cancellation dispatch failed');
+      return false;
+    }
+  }
+
+  /** Local authority mutates only after the exact daemon reports durable success. */
+  dispatchCapabilityManage(
+    ownerUserId: string,
+    frame: CapabilityOperationManageFrame,
+    timeoutMs = 10_000,
+  ): Promise<CapabilityOperationManageResultFrame | null> {
+    if (!this.canAcceptCapabilityOperation(ownerUserId) || !this.daemonWs) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        const pending = this.pendingCapabilityManage.get(frame.requestId);
+        if (!pending) return;
+        this.pendingCapabilityManage.delete(frame.requestId);
+        pending.resolve(null);
+      }, timeoutMs);
+      timer.unref?.();
+      this.pendingCapabilityManage.set(frame.requestId, { ownerUserId, frame, resolve, timer });
+      try {
+        this.daemonWs!.send(JSON.stringify(frame));
+      } catch (error) {
+        clearTimeout(timer);
+        this.pendingCapabilityManage.delete(frame.requestId);
+        logger.warn({ error, serverId: this.serverId, requestId: frame.requestId }, 'Capability manage dispatch failed');
+        resolve(null);
+      }
+    });
+  }
+
+  private rejectPendingCapabilityManage(): void {
+    for (const [requestId, pending] of this.pendingCapabilityManage) {
+      clearTimeout(pending.timer);
+      this.pendingCapabilityManage.delete(requestId);
+      pending.resolve(null);
+    }
+  }
+
+  private failDisconnectedCapabilityOperations(db: Database, ownerUserId: string): void {
+    this.rejectPendingCapabilityManage();
+    void failCapabilityOperationsForDisconnectedServer(db, {
+      ownerUserId,
+      serverId: this.serverId,
+    }).then((operations) => {
+      for (const operation of operations) {
+        this.broadcastToBrowsers(JSON.stringify({
+          type: CAPABILITY_OPERATION_MSG.PROGRESS,
+          operationId: operation.id,
+          revision: operation.revision,
+          state: operation.state,
+          errorCode: operation.errorCode,
+        }));
+      }
+    }).catch((error: unknown) => {
+      logger.warn({ error, serverId: this.serverId }, 'Failed to terminate disconnected capability operations');
+    });
+  }
+
+  private async sendCapabilitySnapshot(
+    db: Database,
+    socket: WebSocket,
+    expectedGeneration: number,
+    afterRevision?: number,
+  ): Promise<void> {
+    const ownerUserId = this.daemonOwnerUserId;
+    if (!ownerUserId || !this.canAcceptCapabilityOperation(ownerUserId)) return;
+    await this.expirePreActivationCapabilityOperations(
+      db,
+      socket,
+      expectedGeneration,
+      ownerUserId,
+    );
+    const record = await getCapabilitySyncSnapshot(db, {
+      ownerUserId,
+      maxItems: CAPABILITY_LIMITS.LIST_MAX,
+      afterRevision,
+    });
+    if (this.daemonWs !== socket || this.daemonGeneration !== expectedGeneration) return;
+    socket.send(JSON.stringify(toCapabilitySyncSnapshot(
+      record,
+      afterRevision === undefined ? CAPABILITY_SYNC_MSG.SNAPSHOT : CAPABILITY_SYNC_MSG.DELTA,
+      this.capabilityAuthorizationSigner ? [this.capabilityAuthorizationSigner.key] : [],
+    )));
+    const authority = await getCapabilityAuthorityRecordSet(db, {
+      ownerUserId,
+      serverId: this.serverId,
+    });
+    if (this.daemonWs !== socket || this.daemonGeneration !== expectedGeneration) return;
+    socket.send(JSON.stringify(toCapabilitySyncAuthorityFrame(
+      authority,
+      this.capabilityAuthorizationSigner ? [this.capabilityAuthorizationSigner.key] : [],
+    )));
+    this.lastCapabilityRevisionSent = record.revision;
+    this.capabilitySyncInitialized = true;
+    await this.replayPendingCapabilityBlobUploads(db, socket, expectedGeneration, ownerUserId);
+    await this.replayPendingCapabilityAuthorizations(db, socket, expectedGeneration, ownerUserId);
+    await this.replayLocalCapabilityManageRequests(db, socket, expectedGeneration, ownerUserId);
+  }
+
+  private async refreshCapabilitySyncOnHeartbeat(
+    db: Database,
+    socket: WebSocket,
+    expectedGeneration: number,
+  ): Promise<void> {
+    const ownerUserId = this.daemonOwnerUserId;
+    if (!ownerUserId
+      || !this.capabilitySyncInitialized
+      || !this.canAcceptCapabilityOperation(ownerUserId)) return;
+    await this.expirePreActivationCapabilityOperations(
+      db,
+      socket,
+      expectedGeneration,
+      ownerUserId,
+    );
+    const expired = await expireCapabilityPendingActivations(db, {
+      ownerUserId,
+      targetServerId: this.serverId,
+    });
+    for (const entry of expired) {
+      this.broadcastToBrowsers(JSON.stringify({
+        type: CAPABILITY_OPERATION_MSG.PROGRESS,
+        operationId: entry.operation.id,
+        revision: entry.operation.revision,
+        state: entry.operation.state,
+        errorCode: entry.operation.errorCode,
+      }));
+      if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+        socket.send(JSON.stringify({
+          type: CAPABILITY_OPERATION_MSG.COMMIT_ABORT,
+          operationId: entry.operation.id,
+          capabilityId: entry.capabilityId,
+          versionId: entry.versionId,
+          bindingId: entry.bindingId,
+          authorityRevision: entry.authorityRevision,
+          errorCode: CAPABILITY_ERROR.RUNTIME_PENDING,
+        } satisfies CapabilityOperationCommitAbortFrame));
+      }
+    }
+    const record = await getCapabilitySyncSnapshot(db, {
+      ownerUserId,
+      maxItems: CAPABILITY_LIMITS.LIST_MAX,
+      afterRevision: this.lastCapabilityRevisionSent,
+    });
+    if (record.revision <= this.lastCapabilityRevisionSent
+      || this.daemonWs !== socket
+      || this.daemonGeneration !== expectedGeneration) return;
+    socket.send(JSON.stringify(toCapabilitySyncSnapshot(
+      record,
+      CAPABILITY_SYNC_MSG.DELTA,
+      this.capabilityAuthorizationSigner ? [this.capabilityAuthorizationSigner.key] : [],
+    )));
+    const authority = await getCapabilityAuthorityRecordSet(db, {
+      ownerUserId,
+      serverId: this.serverId,
+    });
+    if (this.daemonWs !== socket || this.daemonGeneration !== expectedGeneration) return;
+    socket.send(JSON.stringify(toCapabilitySyncAuthorityFrame(
+      authority,
+      this.capabilityAuthorizationSigner ? [this.capabilityAuthorizationSigner.key] : [],
+    )));
+    this.lastCapabilityRevisionSent = record.revision;
+  }
+
+  private async expirePreActivationCapabilityOperations(
+    db: Database,
+    socket: WebSocket,
+    expectedGeneration: number,
+    ownerUserId: string,
+  ): Promise<void> {
+    // A few non-capability bridge embedders intentionally expose a read-only
+    // Database-shaped test seam. Expiry requires a real transactional store;
+    // skipping it there keeps the snapshot itself available.
+    if (typeof db.transaction !== 'function') return;
+    const expired = await expireCapabilityPreActivationOperations(db, {
+      ownerUserId,
+      serverId: this.serverId,
+    });
+    for (const operation of expired) {
+      this.broadcastToBrowsers(JSON.stringify({
+        type: CAPABILITY_OPERATION_MSG.PROGRESS,
+        operationId: operation.id,
+        revision: operation.revision,
+        state: operation.state,
+        errorCode: operation.errorCode,
+      }));
+      if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+        socket.send(JSON.stringify({
+          type: CAPABILITY_OPERATION_MSG.CANCEL,
+          operationId: operation.id,
+          expectedRevision: operation.revision,
+        } satisfies CapabilityOperationCancelFrame));
+      }
+    }
+  }
+
+  private async replayPendingCapabilityAuthorizations(
+    db: Database,
+    socket: WebSocket,
+    expectedGeneration: number,
+    ownerUserId: string,
+  ): Promise<void> {
+    if (!this.capabilityAuthorizationSigner) return;
+    const expired = await expireCapabilityPendingActivations(db, {
+      ownerUserId,
+      targetServerId: this.serverId,
+    });
+    for (const entry of expired) {
+      const { operation } = entry;
+      this.broadcastToBrowsers(JSON.stringify({
+        type: CAPABILITY_OPERATION_MSG.PROGRESS,
+        operationId: operation.id,
+        revision: operation.revision,
+        state: operation.state,
+        errorCode: operation.errorCode,
+      }));
+      if (entry.targetServerId === this.serverId
+        && this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+        socket.send(JSON.stringify({
+          type: CAPABILITY_OPERATION_MSG.COMMIT_ABORT,
+          operationId: operation.id,
+          capabilityId: entry.capabilityId,
+          versionId: entry.versionId,
+          bindingId: entry.bindingId,
+          authorityRevision: entry.authorityRevision,
+          errorCode: CAPABILITY_ERROR.RUNTIME_PENDING,
+        } satisfies CapabilityOperationCommitAbortFrame));
+      }
+    }
+    const pending = await listPendingCapabilityAuthorizations(db, {
+      ownerUserId,
+      serverId: this.serverId,
+    });
+    for (const entry of pending) {
+      if (this.daemonWs !== socket || this.daemonGeneration !== expectedGeneration) return;
+      socket.send(JSON.stringify(toCapabilityOperationAuthorizeFrame(
+        entry,
+        [this.capabilityAuthorizationSigner.key],
+      )));
+    }
+  }
+
+  private async replayPendingCapabilityBlobUploads(
+    db: Database,
+    socket: WebSocket,
+    expectedGeneration: number,
+    ownerUserId: string,
+  ): Promise<void> {
+    if (!this.capabilityBlobSigningKey) return;
+    const pending = await listPendingCapabilityBlobUploads(db, {
+      ownerUserId,
+      serverId: this.serverId,
+    });
+    for (const entry of pending) {
+      if (this.daemonWs !== socket || this.daemonGeneration !== expectedGeneration) return;
+      const access = await issueCapabilityBlobAccess(db, {
+        ownerUserId,
+        serverId: this.serverId,
+        capabilityId: entry.capabilityId,
+        versionId: entry.versionId,
+        action: CAPABILITY_BLOB_ACTION.UPLOAD,
+        signingKey: this.capabilityBlobSigningKey,
+      });
+      if (access) socket.send(JSON.stringify({
+        type: CAPABILITY_SYNC_MSG.BLOB_CAPABILITY,
+        operationId: entry.operationId,
+        expectedRevision: entry.expectedRevision,
+        access,
+      }));
+    }
+  }
+
+  private async replayLocalCapabilityManageRequests(
+    db: Database,
+    socket: WebSocket,
+    expectedGeneration: number,
+    ownerUserId: string,
+  ): Promise<void> {
+    const requests = await listReplayableLocalCapabilityManageRequests(db, {
+      ownerUserId,
+      serverId: this.serverId,
+    });
+    for (const request of requests) {
+      if (this.daemonWs !== socket || this.daemonGeneration !== expectedGeneration) return;
+      if (request.phase === 'committed') {
+        socket.send(JSON.stringify({
+          type: CAPABILITY_OPERATION_MSG.MANAGE_ACK,
+          requestId: request.requestId,
+          capabilityId: request.itemId,
+          bindingId: request.bindingId,
+          authorityRevision: request.authorityRevision,
+        } satisfies CapabilityOperationManageAckFrame));
+        continue;
+      }
+      if (request.phase === 'aborted') {
+        socket.send(JSON.stringify({
+          type: CAPABILITY_OPERATION_MSG.MANAGE_ACK,
+          requestId: request.requestId,
+          capabilityId: request.itemId,
+          bindingId: request.bindingId,
+          authorityRevision: request.authorityRevision,
+        } satisfies CapabilityOperationManageAckFrame));
+        continue;
+      }
+      const phase = request.phase === 'prepare_sent'
+        ? CAPABILITY_MANAGE_PHASE.PREPARE
+        : CAPABILITY_MANAGE_PHASE.COMMIT;
+      socket.send(JSON.stringify(toCapabilityManageJournalFrame(request, phase)));
+    }
+  }
+
+  private async handleCapabilityDaemonMessage(
+    msg: Record<string, unknown>,
+    db: Database,
+    socket: WebSocket,
+    expectedGeneration: number,
+  ): Promise<boolean> {
+    const ownerUserId = this.daemonOwnerUserId;
+    if (!ownerUserId || !this.canAcceptCapabilityOperation(ownerUserId)) return false;
+
+    if (msg.type === CAPABILITY_SYNC_MSG.REQUEST) {
+      const afterRevision = msg.afterRevision === undefined
+        ? undefined
+        : Number.isSafeInteger(msg.afterRevision) && (msg.afterRevision as number) >= 0
+          ? msg.afterRevision as number
+          : null;
+      if (afterRevision === null) return true;
+      await this.sendCapabilitySnapshot(db, socket, expectedGeneration, afterRevision);
+      return true;
+    }
+
+    if (msg.type === CAPABILITY_SYNC_MSG.READINESS) {
+      const capabilityId = capabilityOpaqueId(msg.capabilityId);
+      const revision = Number.isSafeInteger(msg.revision) && (msg.revision as number) >= 0
+        ? msg.revision as number
+        : null;
+      const readiness = Object.values(CAPABILITY_READINESS).find((candidate) => candidate === msg.readiness);
+      const reasons = capabilityStringList(msg.reasons, CAPABILITY_LIMITS.FINDINGS);
+      if (!capabilityId || revision === null || !readiness || !reasons) return true;
+      const result = await acknowledgeCapabilityReadiness(db, {
+        ownerUserId,
+        itemId: capabilityId,
+        serverId: this.serverId,
+        state: readiness,
+        reasonCode: reasons[0] ?? null,
+        accountRevision: revision,
+        manifestDigest: msg.manifestDigest === undefined ? null : capabilityDigest(msg.manifestDigest),
+      });
+      if (result && this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+        socket.send(JSON.stringify({
+          type: CAPABILITY_SYNC_MSG.ACK,
+          revision,
+          digest: sha256Hex(JSON.stringify({ capabilityId, readiness, revision })),
+        }));
+      }
+      return true;
+    }
+
+    if (msg.type === CAPABILITY_OPERATION_MSG.MANAGE_RESULT) {
+      const frame = msg as unknown as CapabilityOperationManageResultFrame;
+      const requestId = capabilityOpaqueId(frame.requestId);
+      const capabilityId = capabilityOpaqueId(frame.capabilityId);
+      const bindingId = capabilityOpaqueId(frame.bindingId);
+      const expectedRevision = Number.isSafeInteger(frame.expectedRevision) && frame.expectedRevision >= 1
+        ? frame.expectedRevision
+        : null;
+      const authorityRevision = Number.isSafeInteger(frame.authorityRevision) && frame.authorityRevision >= 1
+        ? frame.authorityRevision
+        : null;
+      const resultPhase = Object.values(CAPABILITY_MANAGE_RESULT_PHASE)
+        .find((candidate) => candidate === frame.phase);
+      const action = Object.values(CAPABILITY_MANAGE_ACTION).find((candidate) => candidate === frame.action);
+      if (!requestId || !capabilityId || !bindingId || expectedRevision === null
+        || authorityRevision === null || !resultPhase || !action
+        || action === CAPABILITY_MANAGE_ACTION.DELETE_CREDENTIALS
+        || action === CAPABILITY_MANAGE_ACTION.CANCEL_OPERATION
+        || typeof frame.ok !== 'boolean') return true;
+      const pending = this.pendingCapabilityManage.get(requestId);
+      if (pending && (pending.ownerUserId !== ownerUserId
+        || pending.frame.capabilityId !== capabilityId
+        || pending.frame.bindingId !== bindingId
+        || pending.frame.action !== frame.action
+        || pending.frame.expectedRevision !== expectedRevision
+        || pending.frame.authorityRevision !== authorityRevision)) return true;
+      const journal = await advanceLocalCapabilityManageResult(db, {
+        requestId,
+        ownerUserId,
+        serverId: this.serverId,
+        itemId: capabilityId,
+        bindingId,
+        action,
+        expectedRevision,
+        authorityRevision,
+        resultPhase,
+        ok: frame.ok,
+        errorCode: frame.errorCode,
+      });
+      if (!journal) return true;
+      if (resultPhase === CAPABILITY_MANAGE_RESULT_PHASE.ABORTED) {
+        if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+          socket.send(JSON.stringify({
+            type: CAPABILITY_OPERATION_MSG.MANAGE_ACK,
+            requestId,
+            capabilityId,
+            bindingId,
+            authorityRevision,
+          } satisfies CapabilityOperationManageAckFrame));
+        }
+        if (pending) {
+          clearTimeout(pending.timer);
+          this.pendingCapabilityManage.delete(requestId);
+          pending.resolve(frame);
+        }
+        return true;
+      }
+      if (!frame.ok) {
+        if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+          socket.send(JSON.stringify(toCapabilityManageJournalFrame(journal, CAPABILITY_MANAGE_PHASE.ABORT)));
+        }
+        if (pending) {
+          clearTimeout(pending.timer);
+          this.pendingCapabilityManage.delete(requestId);
+          pending.resolve(frame);
+        }
+        return true;
+      }
+      if (resultPhase === CAPABILITY_MANAGE_RESULT_PHASE.PREPARED) {
+        const commit = await markLocalCapabilityManageCommitSent(db, {
+          requestId,
+          ownerUserId,
+          serverId: this.serverId,
+        });
+        if (commit && this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+          socket.send(JSON.stringify(toCapabilityManageJournalFrame(commit, CAPABILITY_MANAGE_PHASE.COMMIT)));
+        }
+        return true;
+      }
+      if (!this.capabilityAuthorizationSigner) return true;
+      const committed = await manageCapability(db, {
+        ownerUserId,
+        itemId: capabilityId,
+        expectedRevision,
+        action,
+        bindingId,
+        targetVersionId: journal.targetVersionId,
+        scope: CAPABILITY_SCOPE.LOCAL,
+        serverId: this.serverId,
+        localRequestId: requestId,
+        authorizationSigner: this.capabilityAuthorizationSigner,
+      });
+      if (committed.status !== 'ok') {
+        logger.warn({ serverId: this.serverId, requestId, status: committed.status }, 'Capability local manage commit rejected');
+        const aborted = await advanceLocalCapabilityManageResult(db, {
+          requestId,
+          ownerUserId,
+          serverId: this.serverId,
+          itemId: capabilityId,
+          bindingId,
+          action,
+          expectedRevision,
+          authorityRevision,
+          resultPhase: CAPABILITY_MANAGE_RESULT_PHASE.ABORTED,
+          ok: false,
+          errorCode: CAPABILITY_ERROR.CONFLICT,
+        });
+        if (aborted && this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+          socket.send(JSON.stringify(toCapabilityManageJournalFrame(aborted, CAPABILITY_MANAGE_PHASE.ABORT)));
+        }
+        return true;
+      }
+      if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+        socket.send(JSON.stringify({
+          type: CAPABILITY_OPERATION_MSG.MANAGE_ACK,
+          requestId,
+          capabilityId,
+          bindingId,
+          authorityRevision,
+        } satisfies CapabilityOperationManageAckFrame));
+      }
+      await WsBridge.broadcastCapabilitySync(
+        ownerUserId,
+        db,
+        Math.max(0, committed.accountRevision - 1),
+      );
+      if (pending) {
+        clearTimeout(pending.timer);
+        this.pendingCapabilityManage.delete(requestId);
+        pending.resolve(frame);
+      }
+      return true;
+    }
+
+    if (msg.type === CAPABILITY_OPERATION_MSG.PROGRESS) {
+      const frame = msg as unknown as CapabilityOperationProgressFrame;
+      const operationId = capabilityOpaqueId(frame.operationId);
+      const expectedRevision = Number.isSafeInteger(frame.expectedRevision) && frame.expectedRevision >= 1
+        ? frame.expectedRevision
+        : null;
+      const state = isCapabilityInstallState(frame.state) ? frame.state : null;
+      const artifactDigest = frame.artifactDigest === undefined ? undefined : capabilityDigest(frame.artifactDigest);
+      const auditDigest = frame.auditDigest === undefined ? undefined : capabilityDigest(frame.auditDigest);
+      const findings = frame.findings === undefined ? [] : sanitizeCapabilityFindings(frame.findings);
+      const auditVerdict = frame.auditVerdict === undefined
+        ? undefined
+        : Object.values(CAPABILITY_AUDIT_VERDICT).find((candidate) => candidate === frame.auditVerdict);
+      const errorCode = frame.errorCode === undefined
+        ? undefined
+        : Object.values(CAPABILITY_ERROR).find((candidate) => candidate === frame.errorCode);
+      const stdioCommand = frame.stdioCommand === undefined
+        ? undefined
+        : capabilityStringList(frame.stdioCommand, CAPABILITY_LIMITS.PATH_BYTES);
+      const tools = frame.tools === undefined
+        ? undefined
+        : capabilityStringList(frame.tools, CAPABILITY_LIMITS.FINDINGS);
+      const permissions = frame.permissions === undefined
+        ? undefined
+        : capabilityStringList(frame.permissions, CAPABILITY_LIMITS.FINDINGS);
+      const updateDiff = frame.updateDiff === undefined
+        ? undefined
+        : capabilityStringList(frame.updateDiff, CAPABILITY_LIMITS.FINDINGS);
+      const allowedProgressFrom: Partial<Record<CapabilityInstallState, CapabilityInstallState[]>> = {
+        [CAPABILITY_INSTALL_STATE.ACQUIRING]: [CAPABILITY_INSTALL_STATE.QUEUED],
+        [CAPABILITY_INSTALL_STATE.SCANNING]: [CAPABILITY_INSTALL_STATE.ACQUIRING],
+        [CAPABILITY_INSTALL_STATE.AUDITING]: [CAPABILITY_INSTALL_STATE.SCANNING],
+        // Current daemon versions may run the full local acquisition/scan/audit
+        // pipeline and emit only the terminal pre-confirmation frame.
+        [CAPABILITY_INSTALL_STATE.AWAITING_CONFIRMATION]: [
+          CAPABILITY_INSTALL_STATE.QUEUED,
+          CAPABILITY_INSTALL_STATE.AUDITING,
+        ],
+        [CAPABILITY_INSTALL_STATE.SYNCING]: [CAPABILITY_INSTALL_STATE.INSTALLING],
+        [CAPABILITY_INSTALL_STATE.REWORK]: [
+          CAPABILITY_INSTALL_STATE.QUEUED,
+          CAPABILITY_INSTALL_STATE.SCANNING,
+          CAPABILITY_INSTALL_STATE.AUDITING,
+        ],
+        [CAPABILITY_INSTALL_STATE.FAILED]: [
+          CAPABILITY_INSTALL_STATE.QUEUED,
+          CAPABILITY_INSTALL_STATE.ACQUIRING,
+          CAPABILITY_INSTALL_STATE.SCANNING,
+          CAPABILITY_INSTALL_STATE.AUDITING,
+          CAPABILITY_INSTALL_STATE.INSTALLING,
+          CAPABILITY_INSTALL_STATE.SYNCING,
+        ],
+      };
+      const allowedCurrentStates = state ? allowedProgressFrom[state] : undefined;
+      if (!operationId || expectedRevision === null || !state || !allowedCurrentStates || findings === null
+        || (frame.artifactDigest !== undefined && !artifactDigest)
+        || (frame.auditDigest !== undefined && !auditDigest)
+        || (frame.auditVerdict !== undefined && !auditVerdict)
+        || (frame.errorCode !== undefined && !errorCode)
+        || (frame.stdioCommand !== undefined && !stdioCommand)
+        || (frame.tools !== undefined && !tools)
+        || (frame.permissions !== undefined && !permissions)
+        || (frame.updateDiff !== undefined && !updateDiff)
+        || (state === CAPABILITY_INSTALL_STATE.AWAITING_CONFIRMATION
+          && (!artifactDigest || !auditDigest || auditVerdict !== CAPABILITY_AUDIT_VERDICT.PASS))) return true;
+
+      const evidence = auditVerdict && artifactDigest && auditDigest
+        ? {
+          kind: 'audit',
+          evidenceDigest: auditDigest,
+          artifactDigest,
+          policyVersion: 'daemon-isolated-auditor-v1',
+          verdict: auditVerdict,
+          findings,
+        } as const
+        : findings.length > 0 && artifactDigest
+          ? {
+          kind: 'scan',
+          evidenceDigest: sha256Hex(JSON.stringify({
+            policyVersion: 'daemon-deterministic-scan-v1',
+            artifactDigest,
+            findings,
+          })),
+          artifactDigest,
+          policyVersion: 'daemon-deterministic-scan-v1',
+          verdict: null,
+          findings,
+          } as const
+          : undefined;
+
+      const updated = await advanceCapabilityOperation(db, {
+        ownerUserId,
+        operationId,
+        expectedRevision,
+        state,
+        artifactDigest,
+        auditDigest,
+        errorCode,
+        allowedCurrentStates,
+        evidence,
+        requestSummaryPatch: {
+          ...(typeof frame.displayName === 'string'
+            ? { displayName: frame.displayName.slice(0, CAPABILITY_LIMITS.DISPLAY_NAME_CHARS) }
+            : {}),
+          ...(frame.hasScripts !== undefined ? { hasScripts: frame.hasScripts === true } : {}),
+          ...(frame.hasExecutables !== undefined ? { hasExecutables: frame.hasExecutables === true } : {}),
+          ...(stdioCommand ? { stdioCommand } : {}),
+          ...(tools ? { tools } : {}),
+          ...(permissions ? { permissions } : {}),
+          ...(updateDiff ? { updateDiff } : {}),
+        },
+      });
+      if (!updated) {
+        // A reviewed candidate is durable on the daemon before this progress
+        // frame is sent.  After reconnect it may replay the same exact frame
+        // whether or not the first write reached us.  Treat only the precise
+        // already-applied awaiting-confirmation transition as idempotent;
+        // every other stale revision remains rejected.
+        if (state === CAPABILITY_INSTALL_STATE.AWAITING_CONFIRMATION) {
+          const current = await getCapabilityOperation(db, { ownerUserId, operationId });
+          if (current?.state === CAPABILITY_INSTALL_STATE.AWAITING_CONFIRMATION
+            && current.revision === expectedRevision + 1
+            && current.artifactDigest === artifactDigest
+            && current.auditDigest === auditDigest) {
+            this.broadcastToBrowsers(JSON.stringify({ ...frame, revision: current.revision }));
+            return true;
+          }
+        }
+        logger.warn({ serverId: this.serverId, operationId, expectedRevision }, 'Dropped stale capability progress');
+        return true;
+      }
+      this.broadcastToBrowsers(JSON.stringify({ ...frame, revision: updated.revision }));
+      return true;
+    }
+
+    if (msg.type === CAPABILITY_OPERATION_MSG.ACTIVATE) {
+      const frame = msg as unknown as CapabilityOperationActivateFrame;
+      const operationId = capabilityOpaqueId(frame.operationId);
+      const capabilityId = capabilityOpaqueId(frame.capability?.id);
+      const versionId = capabilityOpaqueId(frame.version?.id);
+      const bindingId = capabilityOpaqueId(frame.binding?.id);
+      const expectedRevision = Number.isSafeInteger(frame.expectedRevision) && frame.expectedRevision >= 1
+        ? frame.expectedRevision
+        : null;
+      const artifactDigest = capabilityDigest(frame.version?.artifactDigest);
+      const blobDigest = frame.version?.blobDigest === undefined
+        ? undefined
+        : capabilityDigest(frame.version.blobDigest);
+      const blobByteSize = frame.version?.blobByteSize === undefined
+        ? undefined
+        : Number.isSafeInteger(frame.version.blobByteSize)
+          && frame.version.blobByteSize > 0
+          && frame.version.blobByteSize <= CAPABILITY_LIMITS.PACKAGE_BYTES
+          ? frame.version.blobByteSize
+          : null;
+      const auditDigest = capabilityDigest(frame.version?.auditDigest);
+      const scope = Object.values(CAPABILITY_SCOPE).find((candidate) => candidate === frame.binding?.scope);
+      const sourceKind = Object.values(CAPABILITY_SOURCE_KIND).find((candidate) => candidate === frame.version?.sourceKind);
+      const name = typeof frame.capability?.name === 'string'
+        && frame.capability.name.trim()
+        && frame.capability.name.length <= CAPABILITY_LIMITS.DISPLAY_NAME_CHARS
+        ? frame.capability.name.trim()
+        : null;
+      const providers = capabilityStringList(frame.binding?.providers, CAPABILITY_LIMITS.PROVIDERS);
+      const machines = capabilityStringList(frame.binding?.machines, CAPABILITY_LIMITS.MACHINES);
+      const tools = capabilityStringList(frame.capability?.tools ?? [], CAPABILITY_LIMITS.FINDINGS);
+      const permissions = capabilityStringList(frame.capability?.permissions ?? [], CAPABILITY_LIMITS.FINDINGS);
+      const activationFindings = sanitizeCapabilityFindings(frame.capability?.findings ?? []);
+      const scopeId = frame.binding?.scopeId === undefined
+        ? undefined
+        : capabilityOpaqueId(frame.binding.scopeId);
+      const normalizedDefinition = frame.capability?.kind === CAPABILITY_KIND.MCP && frame.definition
+        ? normalizeCapabilityMcpDefinition({
+          kind: CAPABILITY_SOURCE_KIND.MCP_CONFIG,
+          mcpConfig: frame.definition as unknown as Record<string, unknown>,
+        })
+        : null;
+      const synchronizedSkill = frame.capability?.kind === CAPABILITY_KIND.SKILL
+        && scope !== CAPABILITY_SCOPE.LOCAL;
+      if (!operationId || !capabilityId || !versionId || !bindingId || expectedRevision === null
+        || !artifactDigest || !auditDigest || !scope || !sourceKind || !name
+        || !providers || !machines || !tools || !permissions || !activationFindings
+        || (frame.binding?.scopeId !== undefined && !scopeId)
+        || frame.version.capabilityId !== capabilityId
+        || frame.binding.capabilityId !== capabilityId
+        || frame.binding.versionId !== versionId
+        || frame.version.auditVerdict !== CAPABILITY_AUDIT_VERDICT.PASS
+        || frame.capability.artifactDigest !== artifactDigest
+        || frame.capability.kind !== CAPABILITY_KIND.SKILL && frame.capability.kind !== CAPABILITY_KIND.MCP
+        || (frame.capability.kind === CAPABILITY_KIND.MCP && !normalizedDefinition)
+        || (frame.capability.kind === CAPABILITY_KIND.SKILL && frame.definition !== undefined)
+        || (frame.version.blobDigest !== undefined && !blobDigest)
+        || (frame.version.blobByteSize !== undefined && blobByteSize === null)
+        || (synchronizedSkill && (!blobDigest || blobByteSize === undefined))
+        || (!synchronizedSkill && (blobDigest !== undefined || blobByteSize !== undefined))) return true;
+
+      if (!this.capabilityAuthorizationSigner) return true;
+      let activationError: unknown = null;
+      const activated = await activateCapabilityVersion(db, {
+        ownerUserId,
+        targetServerId: this.serverId,
+        operationId,
+        expectedOperationRevision: expectedRevision,
+        requestedItemId: capabilityId,
+        requestedBindingId: bindingId,
+        name,
+        kind: frame.capability.kind,
+        sourceKind,
+        sourceSummary: frame.capability.sourceLabel?.slice(0, CAPABILITY_LIMITS.SOURCE_CHARS) ?? '',
+        artifactDigest,
+        blobDigest,
+        blobByteSize,
+        auditDigest,
+        manifest: {
+          findings: activationFindings,
+          scripts: frame.capability.hasScripts ? ['declared'] : [],
+          executables: frame.capability.hasExecutables ? ['declared'] : [],
+          tools,
+        },
+        definition: frame.capability.kind === CAPABILITY_KIND.MCP
+          ? normalizedDefinition!
+          : null,
+        permissionSummary: permissions,
+        scope,
+        projectKey: scope === CAPABILITY_SCOPE.PROJECT ? scopeId ?? null : null,
+        sessionKey: scope === CAPABILITY_SCOPE.SESSION ? scopeId ?? null : null,
+        serverId: scope === CAPABILITY_SCOPE.LOCAL ? this.serverId : null,
+        providerFilter: providers,
+        machineFilter: machines,
+        authorizationSigner: this.capabilityAuthorizationSigner,
+      }).catch((error: unknown) => {
+        activationError = error;
+        logger.warn({ error, serverId: this.serverId, operationId }, 'Capability activation rejected');
+        return null;
+      });
+      if (!activated) {
+        const errorCode = activationError instanceof Error
+          && activationError.message === 'capability_sync_item_quota_exceeded'
+          ? CAPABILITY_ERROR.CONFLICT
+          : CAPABILITY_ERROR.INTEGRITY_FAILED;
+        const failed = await updateCapabilityOperation(db, {
+          ownerUserId,
+          operationId,
+          expectedRevision,
+          state: CAPABILITY_INSTALL_STATE.FAILED,
+          errorCode,
+          allowedCurrentStates: [CAPABILITY_INSTALL_STATE.INSTALLING],
+        });
+        if (failed) {
+          if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+            socket.send(JSON.stringify({
+              type: CAPABILITY_OPERATION_MSG.CANCEL,
+              operationId,
+              expectedRevision: failed.revision,
+            } satisfies CapabilityOperationCancelFrame));
+          }
+          this.broadcastToBrowsers(JSON.stringify({
+            type: CAPABILITY_OPERATION_MSG.PROGRESS,
+            operationId,
+            revision: failed.revision,
+            state: failed.state,
+            errorCode: failed.errorCode,
+          }));
+        } else {
+          // A periodic expiry sweep may already have failed this durable
+          // daemon journal while it was offline. Its replay is still useful:
+          // answer with the current authoritative revision so the daemon can
+          // discard the stale candidate instead of replaying forever.
+          const current = await getCapabilityOperation(db, { ownerUserId, operationId });
+          if (current
+            && current.requestSummary.targetServerId === this.serverId
+            && this.daemonWs === socket
+            && this.daemonGeneration === expectedGeneration) {
+            socket.send(JSON.stringify({
+              type: CAPABILITY_OPERATION_MSG.CANCEL,
+              operationId,
+              expectedRevision: current.revision,
+            } satisfies CapabilityOperationCancelFrame));
+          }
+        }
+        return true;
+      }
+      if (activated.pendingBlob && this.capabilityBlobSigningKey) {
+        const access = await issueCapabilityBlobAccess(db, {
+          ownerUserId,
+          serverId: this.serverId,
+          capabilityId: activated.item.id,
+          versionId: activated.candidate.versionId,
+          action: CAPABILITY_BLOB_ACTION.UPLOAD,
+          signingKey: this.capabilityBlobSigningKey,
+        }).catch((error: unknown) => {
+          logger.warn({ error, serverId: this.serverId, operationId }, 'Capability blob upload access failed');
+          return null;
+        });
+        if (access && this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+          socket.send(JSON.stringify({
+            type: CAPABILITY_SYNC_MSG.BLOB_CAPABILITY,
+            operationId,
+            expectedRevision: activated.operation.revision,
+            access,
+          }));
+        } else if (!access) {
+          const failed = await failCapabilityPendingActivation(db, {
+            ownerUserId,
+            operationId,
+            errorCode: CAPABILITY_ERROR.RUNTIME_PENDING,
+            expectedRevision: activated.operation.revision,
+            capabilityId: activated.item.id,
+            versionId: activated.candidate.versionId,
+            bindingId: activated.candidate.bindingId,
+            targetServerId: this.serverId,
+          });
+          if (failed) this.broadcastToBrowsers(JSON.stringify({
+            type: CAPABILITY_OPERATION_MSG.PROGRESS,
+            operationId,
+            revision: failed.revision,
+            state: failed.state,
+            errorCode: failed.errorCode,
+          }));
+          return true;
+        }
+      } else if (this.capabilityAuthorizationSigner) {
+        const pending = await getPendingCapabilityAuthorization(db, { ownerUserId, operationId });
+        if (pending && this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+          socket.send(JSON.stringify(toCapabilityOperationAuthorizeFrame(
+            pending,
+            [this.capabilityAuthorizationSigner.key],
+          )));
+        }
+      }
+      this.broadcastToBrowsers(JSON.stringify({
+        type: CAPABILITY_OPERATION_MSG.PROGRESS,
+        operationId,
+        revision: activated.operation.revision,
+        state: activated.operation.state,
+      }));
+      return true;
+    }
+
+    if (msg.type === CAPABILITY_OPERATION_MSG.COMMIT_RESULT) {
+      const frame = msg as unknown as CapabilityOperationCommitResultFrame;
+      const operationId = capabilityOpaqueId(frame.operationId);
+      const capabilityId = capabilityOpaqueId(frame.capabilityId);
+      const versionId = capabilityOpaqueId(frame.versionId);
+      const bindingId = capabilityOpaqueId(frame.bindingId);
+      const expectedRevision = Number.isSafeInteger(frame.expectedRevision) && frame.expectedRevision >= 1
+        ? frame.expectedRevision
+        : null;
+      const authorityRevision = Number.isSafeInteger(frame.authorityRevision) && frame.authorityRevision >= 1
+        ? frame.authorityRevision
+        : null;
+      const errorCode = frame.errorCode === undefined
+        ? CAPABILITY_ERROR.RUNTIME_PENDING
+        : Object.values(CAPABILITY_ERROR).find((candidate) => candidate === frame.errorCode);
+      if (!operationId || !capabilityId || !versionId || !bindingId || expectedRevision === null
+        || authorityRevision === null
+        || typeof frame.ok !== 'boolean' || !errorCode) return true;
+      if (!frame.ok) {
+        const failed = await failCapabilityPendingActivation(db, {
+          ownerUserId,
+          operationId,
+          errorCode,
+          expectedRevision,
+          capabilityId,
+          versionId,
+          bindingId,
+          authorityRevision,
+          targetServerId: this.serverId,
+        });
+        if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+          socket.send(JSON.stringify({
+            type: CAPABILITY_OPERATION_MSG.COMMIT_ABORT,
+            operationId,
+            capabilityId,
+            versionId,
+            bindingId,
+            authorityRevision,
+            errorCode,
+          } satisfies CapabilityOperationCommitAbortFrame));
+        }
+        if (failed) this.broadcastToBrowsers(JSON.stringify({
+          type: CAPABILITY_OPERATION_MSG.PROGRESS,
+          operationId,
+          revision: failed.revision,
+          state: failed.state,
+          errorCode: failed.errorCode,
+        }));
+        return true;
+      }
+      const completed = await completeCapabilityCommit(db, {
+        ownerUserId,
+        targetServerId: this.serverId,
+        operationId,
+        expectedRevision,
+        capabilityId,
+        versionId,
+        bindingId,
+        authorityRevision,
+      });
+      if (completed.status !== 'ok') {
+        logger.warn({ serverId: this.serverId, operationId, status: completed.status }, 'Capability commit rejected');
+        if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+          socket.send(JSON.stringify({
+            type: CAPABILITY_OPERATION_MSG.COMMIT_ABORT,
+            operationId,
+            capabilityId,
+            versionId,
+            bindingId,
+            authorityRevision,
+            errorCode: CAPABILITY_ERROR.RUNTIME_PENDING,
+          } satisfies CapabilityOperationCommitAbortFrame));
+        }
+        return true;
+      }
+      if (this.daemonWs === socket && this.daemonGeneration === expectedGeneration) {
+        socket.send(JSON.stringify({
+          type: CAPABILITY_OPERATION_MSG.COMMIT_ACK,
+          operationId,
+          capabilityId,
+          versionId,
+          bindingId,
+          authorityRevision,
+        } satisfies CapabilityOperationCommitAckFrame));
+      }
+      await WsBridge.broadcastCapabilitySync(
+        ownerUserId,
+        db,
+        Math.max(0, completed.accountRevision - 1),
+      ).catch((error: unknown) => {
+        logger.warn({ error, serverId: this.serverId, operationId }, 'Capability commit sync fan-out failed');
+        return 0;
+      });
+      this.broadcastToBrowsers(JSON.stringify({
+        type: CAPABILITY_OPERATION_MSG.ACTIVATE,
+        operationId,
+        capability: toCapabilitySummary(completed.item),
+      }));
+      return true;
+    }
+
+    return false;
+  }
+
+  /** Narrow test seam for validated daemon capability frames. */
+  async handleCapabilityDaemonMessageForTests(
+    msg: Record<string, unknown>,
+    db: Database,
+    socket: WebSocket,
+    expectedGeneration: number,
+  ): Promise<boolean> {
+    return this.handleCapabilityDaemonMessage(msg, db, socket, expectedGeneration);
   }
 
   /**
@@ -1701,6 +3316,49 @@ export class WsBridge {
     safeSend(ws, JSON.stringify(withBridgeActualPayloadBytes(
       timelineDataPlaneErrorResponse(msg, responseType, errorReason),
     )));
+  }
+
+  private rejectBrowserDataReadOverload(ws: WebSocket, msg: Record<string, unknown>): void {
+    const type = optionalString(msg.type);
+    if (type === TIMELINE_MESSAGES.HISTORY_REQUEST) {
+      this.sendTimelineRequestError(ws, msg, TIMELINE_REQUEST_ERROR_REASONS.QUEUE_FULL);
+      return;
+    }
+    if (type === 'fs.ls') {
+      safeSend(ws, JSON.stringify({
+        type: 'fs.ls_response',
+        requestId: msg.requestId,
+        path: optionalString(msg.path) ?? '',
+        status: 'error',
+        error: FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_QUEUE_FULL,
+        recoverable: true,
+      }));
+      return;
+    }
+    if (type === 'fs.git_status') {
+      safeSend(ws, JSON.stringify({
+        type: 'fs.git_status_response',
+        requestId: msg.requestId,
+        path: optionalString(msg.path) ?? '',
+        status: 'error',
+        files: [],
+        error: FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_QUEUE_FULL,
+        recoverable: true,
+      }));
+      return;
+    }
+    if (type === TRANSPORT_MSG.LIST_MODELS) {
+      safeSend(ws, JSON.stringify({
+        type: TRANSPORT_MSG.MODELS_RESPONSE,
+        requestId: msg.requestId,
+        agentType: optionalString(msg.agentType) ?? '',
+        ...(optionalString(msg.sessionName) ? { sessionName: optionalString(msg.sessionName) } : {}),
+        ...(optionalString(msg.ccPreset) ? { ccPreset: optionalString(msg.ccPreset) } : {}),
+        models: [],
+        error: TIMELINE_REQUEST_ERROR_REASONS.QUEUE_FULL,
+        recoverable: true,
+      }));
+    }
   }
 
   private async verifyTimelineBrowserRequest(ws: WebSocket, msg: Record<string, unknown>): Promise<boolean> {
@@ -2616,9 +4274,30 @@ export class WsBridge {
 
   handleDaemonConnection(ws: WebSocket, db: Database, env: Env, onAuthenticated?: () => void): void {
     this.db = db;
+    this.pushEnv = env;
     this.directFileTransferTicketSigningKey = env.JWT_SIGNING_KEY;
+    // Production startup already enforces a strong JWT_SIGNING_KEY. Some
+    // narrowly-scoped bridge tests and embedded callers intentionally omit it;
+    // keep unrelated daemon transport alive while capability signing remains
+    // fail-closed unavailable instead of deriving from an undefined value.
+    const capabilitySigningKey = typeof env.JWT_SIGNING_KEY === 'string' && env.JWT_SIGNING_KEY.length > 0
+      ? env.JWT_SIGNING_KEY
+      : null;
+    this.capabilityBlobSigningKey = capabilitySigningKey;
+    this.capabilityAuthorizationSigner = capabilitySigningKey
+      ? createCapabilityAuthorizationSigner(capabilitySigningKey)
+      : null;
     // Replace existing daemon connection
     if (this.daemonWs) {
+      const replacedGeneration = this.daemonGeneration;
+      void remoteDesktopConsentCancellation.endpointReplaced(
+        db,
+        this.serverId,
+        replacedGeneration,
+      ).catch(() => {});
+      if (this.daemonOwnerUserId) {
+        this.failDisconnectedCapabilityOperations(db, this.daemonOwnerUserId);
+      }
       // `ws.close()` completes asynchronously in production. Reject the old
       // generation's request waiters before swapping `daemonWs`; otherwise the
       // old socket's identity-guarded close handler cannot see or drain them.
@@ -2626,11 +4305,26 @@ export class WsBridge {
       try { this.daemonWs.close(1001, 'replaced'); } catch { /* ignore */ }
     }
     this.daemonWs = ws;
+    // A test double or abrupt transport can emit `close` synchronously while
+    // the old socket is being replaced, causing maybeCleanup() to remove this
+    // otherwise live bridge before the assignment above. Re-register the same
+    // object; this never manufactures ownership because the new socket still
+    // has to authenticate and complete durable reconciliation.
+    WsBridge.instances.set(this.serverId, this);
     // New connection generation: abandon any pending exec bound to a prior
     // generation (they resolve as indeterminate) so a reconnect never delivers a
     // stale result to a new waiter (10.6).
     this.daemonGeneration++;
     const connectionGeneration = this.daemonGeneration;
+    // `daemon.hello.helloEpoch` is process-local and restarts from one after a
+    // daemon upgrade.  Scope the cached capability advertisement to this exact
+    // transport generation: when a replacement socket closes asynchronously,
+    // its identity-guarded close handler cannot clear the old cache after
+    // `daemonWs` has already moved to `ws`.  Retaining it would make the new
+    // process's lower hello epoch look stale forever, leaving browsers on the
+    // pre-upgrade capability snapshot even though the new daemon is healthy.
+    this.daemonP2pWorkflowCapabilities = null;
+    this.remoteDesktopAuthorityReadyGeneration = null;
     this.directFileTransferRouter.setDaemonGeneration(connectionGeneration);
     this.remoteDesktopRouter.setDaemonGeneration(connectionGeneration);
     abandonPriorGenerations(this.serverId, this.daemonGeneration);
@@ -2640,6 +4334,8 @@ export class WsBridge {
     this.peerAuditRouter.setDaemonGeneration(this.daemonGeneration);
     abandonComputerUsePriorGenerations(this.serverId, this.daemonGeneration);
     this.authenticated = false;
+    this.lastCapabilityRevisionSent = 0;
+    this.capabilitySyncInitialized = false;
     this.controlledNodeCapabilities.clear();
     // New connection: drop any auth promise from a prior connection so
     // late-arriving messages don't await a stale (and possibly resolved
@@ -2810,6 +4506,31 @@ export class WsBridge {
         this.clearPendingIdlePushes();
         this.activeMainSessions.clear();
         this.hasActiveMainSessionSnapshot = false;
+        try {
+          const recovered = await this.remoteDesktopRouter.reconcileDaemonReplacement(connectionGeneration);
+          // The legacy reconciler closes every process-lost route.  Running it
+          // after a privacy-fenced transparent replacement would immediately
+          // destroy that replacement, so it is used only when no in-memory
+          // route was recovered.  Failed replacements are already terminated
+          // and durably closed by the Router.
+          if (recovered === 0) {
+            await WsBridge.remoteDesktopReconnectRevalidator?.(this.serverId);
+          }
+          if (isCurrentAuthConnection()) {
+            this.remoteDesktopAuthorityReadyGeneration = connectionGeneration;
+          }
+        } catch (error) {
+          // Keep the daemon available for unrelated services, but fail closed
+          // for remote desktop until a later reconnect can reconcile durable
+          // authority. Do not replay process-local remote authority.
+          logger.warn({ error, serverId: this.serverId },
+            'Remote desktop reconnect authority reconciliation failed');
+        }
+        await this.sendRemoteDesktopNodeContext(db, ws, connectionGeneration);
+        if (!isCurrentAuthConnection()) {
+          finishLocalAuth();
+          return;
+        }
         logger.info({ serverId: this.serverId, daemonVersion: this.daemonVersion }, 'Daemon authenticated');
         onAuthenticated?.();
 
@@ -2818,6 +4539,12 @@ export class WsBridge {
           this.serverId,
           this.daemonVersion,
           this.daemonNodeRole === NODE_ROLE.CONTROLLED ? [...this.controlledNodeCapabilities] : undefined,
+          // Validated before it is stored: this column is read by artifact
+          // selection, and an unrecognised value is worse than the stale one
+          // it would replace.
+          typeof msg.runtimeArch === 'string' && isControlledNodeArch(msg.runtimeArch)
+            ? msg.runtimeArch
+            : null,
         ).catch((err) =>
           logger.error({ err }, 'Failed to update heartbeat on auth'),
         );
@@ -2833,6 +4560,20 @@ export class WsBridge {
             this.sendMemoryFeatureConfigApply(memoryFeatureFlags);
           } catch (err) {
             logger.warn({ err, serverId: this.serverId }, 'failed to push global memory feature config on daemon auth');
+          }
+          if (!isCurrentAuthConnection()) {
+            finishLocalAuth();
+            return;
+          }
+        }
+        if (this.daemonNodeRole === NODE_ROLE.FULL) {
+          try {
+            await this.sendCapabilitySnapshot(db, ws, connectionGeneration);
+          } catch (error) {
+            // Capability sync is fail-closed and independent from core daemon
+            // liveness. Keep the connection, report the unavailable slice, and
+            // let the daemon retry with CAPABILITY_SYNC_MSG.REQUEST.
+            logger.warn({ error, serverId: this.serverId }, 'Initial capability snapshot failed');
           }
           if (!isCurrentAuthConnection()) {
             finishLocalAuth();
@@ -2972,6 +4713,52 @@ export class WsBridge {
         return;
       }
 
+      // Local-consent results/cancels are endpoint/generation bound and are
+      // never relayed to browsers. Request is Server→node only.
+      if (typeof msg.type === 'string' && msg.type.startsWith('remote_desktop.consent.')) {
+        const parsed = validateRemoteDesktopConsentMessage(msg);
+        if (parsed.ok
+          && (parsed.value.type === REMOTE_DESKTOP_CONSENT_MSG.RESULT
+            || parsed.value.type === REMOTE_DESKTOP_CONSENT_MSG.CANCEL)
+          && this.db && this.authenticated
+          && this.daemonGeneration === connectionGeneration
+          && this.remoteDesktopAuthorityReadyGeneration === connectionGeneration
+          && this.hasDaemonCapability(REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY)) {
+          await createRemoteDesktopConsentResultConsumer(this.db)({
+            executionServerId: this.serverId,
+            daemonGeneration: connectionGeneration,
+            message: parsed.value,
+          }).catch(() => false);
+        }
+        return;
+      }
+
+      // A shell may only report fail-closed recovery state in this direction.
+      // Launch is Server→node only; malformed/reversed frames are consumed and
+      // never reach browsers or the generic CONTROLLED-node allowlist.
+      if (msg.type === REMOTE_DESKTOP_SHELL_MSG.LAUNCH
+        || msg.type === REMOTE_DESKTOP_SHELL_MSG.RECOVERY_REQUIRED) {
+        if (msg.type === REMOTE_DESKTOP_SHELL_MSG.RECOVERY_REQUIRED) {
+          await this.handleRemoteDesktopShellRecoveryRequired(msg, connectionGeneration);
+        } else {
+          WsBridge.invalidRemoteDesktopShellFramesDropped += 1;
+        }
+        return;
+      }
+
+      // Privacy ACK is a Server-only control response. Consume the entire
+      // exact type before the ordinary remote-desktop namespace/CONTROLLED
+      // allowlist so malformed or stale acknowledgements cannot fall through
+      // to browser relay.
+      if (typeof msg.type === 'string' && msg.type.startsWith('management_privacy.')) {
+        if (msg.type === REMOTE_DESKTOP_PRIVACY_MSG.ACK) {
+          await this.handleRemoteDesktopManagementPrivacyAck(msg, connectionGeneration);
+        } else {
+          WsBridge.invalidRemoteDesktopPrivacyFramesDropped += 1;
+        }
+        return;
+      }
+
       // Remote desktop is the only continuous CONTROLLED-node extension and is
       // admitted through its exact validator/session/generation registry before
       // the legacy allowlist. The router consumes the entire namespace, including
@@ -3064,10 +4851,20 @@ export class WsBridge {
           updateServerHeartbeat(db, this.serverId, hbVersion).catch((err) =>
             logger.error({ err }, 'Failed to update heartbeat'),
           );
-          try { ws.send(JSON.stringify({ type: 'heartbeat_ack' })); } catch { /* ignore */ }
+          try { ws.send(JSON.stringify(heartbeatAckWithClock(msg))); } catch { /* ignore */ }
+          void this.sendRemoteDesktopNodeContext(db, ws, connectionGeneration);
           return;
         }
         WsBridge.controlledInboundDropped++;
+        return;
+      }
+
+      // Preserve the synchronous ordering of every established daemon message
+      // family (notably preview RESPONSE_START followed immediately by binary
+      // body frames). Only capability frames may cross this async DB boundary;
+      // unknown capability frames are default-denied rather than broadcast.
+      if (typeof msg.type === 'string' && msg.type.startsWith('capability.')) {
+        await this.handleCapabilityDaemonMessage(msg, db, ws, connectionGeneration);
         return;
       }
 
@@ -3126,7 +4923,10 @@ export class WsBridge {
           logger.error({ err }, 'Failed to update heartbeat'),
         );
         // Ack heartbeat so daemon watchdog doesn't consider the connection dead
-        try { ws.send(JSON.stringify({ type: 'heartbeat_ack' })); } catch { /* ignore */ }
+        try { ws.send(JSON.stringify(heartbeatAckWithClock(msg))); } catch { /* ignore */ }
+        void this.refreshCapabilitySyncOnHeartbeat(db, ws, connectionGeneration).catch((error: unknown) => {
+          logger.warn({ error, serverId: this.serverId }, 'Capability heartbeat sync refresh failed');
+        });
       }
 
       this.relayToBrowsers(msg);
@@ -3183,6 +4983,7 @@ export class WsBridge {
 
     ws.on('close', () => {
       if (this.daemonWs === ws) {
+        const disconnectedOwnerUserId = this.daemonOwnerUserId;
         this.daemonWs = null;
         this.authenticated = false;
         // Audit fix (78-server reconnect-storm) — drop the auth promise
@@ -3214,8 +5015,16 @@ export class WsBridge {
         this.controlledNodeCapabilities.clear();
         this.daemonControlledOs = null;
         this.daemonOwnerUserId = null;
+        if (disconnectedOwnerUserId) {
+          this.failDisconnectedCapabilityOperations(db, disconnectedOwnerUserId);
+        }
         this.resetLegacyUpgradeRescueForGeneration(this.daemonGeneration);
-        this.remoteDesktopRouter.stopAll(REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED);
+        void remoteDesktopConsentCancellation.daemonDisconnected(
+          db,
+          this.serverId,
+          connectionGeneration,
+        ).catch(() => {});
+        this.remoteDesktopRouter.suspendDaemonGeneration(connectionGeneration);
         this.openspecAutoDeliverProjectionCache.clearActive();
         this.broadcastToBrowsers(JSON.stringify({ type: DAEMON_MSG.DISCONNECTED }));
         void clearProviderStatus(db, this.serverId).catch(() => {});
@@ -3264,14 +5073,18 @@ export class WsBridge {
       isMobile?: boolean;
     },
   ): void {
+    const effectiveTarget = options.snapshot.serverParticipantAuthority === true
+      ? { kind: 'server' as const, serverId: options.target.serverId }
+      : options.target;
     this.browserShareStates.set(ws, {
       userId,
       actorDisplayName: userId,
       ticketId: options.ticketId,
-      target: options.target,
+      target: effectiveTarget,
+      requestedTarget: options.target,
       snapshot: options.snapshot,
       connectedAt: shareClockNow(),
-      coveredSessionNames: this.baseCoveredSessionNames(options.target),
+      coveredSessionNames: this.baseCoveredSessionNames(effectiveTarget),
     });
     this.handleBrowserConnection(ws, userId, db, options.isMobile ?? false);
     void this.refreshShareActorDisplayName(ws);
@@ -3334,6 +5147,103 @@ export class WsBridge {
     reason: RemoteDesktopTerminalReason = REMOTE_DESKTOP_TERMINAL_REASON.INTERNAL_ERROR,
   ): void {
     this.remoteDesktopRouter.stopAll(reason);
+  }
+
+  /**
+   * Anonymous remote-desktop signaling socket. It has no browser/session
+   * subscriptions and cannot reach any ordinary bridge command. The sole
+   * bounded first frame is the shared bootstrap proof, or an exact route-
+   * scoped RESUME after a transient socket loss; only after either authority
+   * check can standard remote-desktop signaling enter the Router.
+   */
+  handleGuestRemoteDesktopConnection(ws: WebSocket, db: Database, clientIp = '0.0.0.0'): void {
+    this.db = db;
+    let state: 'quarantined' | 'verifying' | 'admitted' | 'closed' = 'quarantined';
+    let receivedFirstFrame = false;
+    let inbound = Promise.resolve();
+    let quarantineTimer: ReturnType<typeof setTimeout> | null = null;
+    const closeUniformly = () => {
+      if (state === 'closed') return;
+      state = 'closed';
+      if (quarantineTimer) clearTimeout(quarantineTimer);
+      quarantineTimer = null;
+      this.remoteDesktopRouter.dropSocket(ws);
+      try { ws.close(1008, 'unavailable'); } catch { /* socket already gone */ }
+    };
+    quarantineTimer = setTimeout(
+      closeUniformly,
+      REMOTE_DESKTOP_LINK_LIMITS.BOOTSTRAP_TTL_MS,
+    );
+    quarantineTimer.unref?.();
+    const handleMessage = async (data: RawData) => {
+      const raw = (data as Buffer).toString();
+      if (state === 'closed') return;
+      if (state === 'quarantined') {
+        if (Buffer.byteLength(raw, 'utf8') > 1024) {
+          closeUniformly();
+          return;
+        }
+        let value: unknown;
+        try { value = JSON.parse(raw); } catch { closeUniformly(); return; }
+        const resume = validateRemoteDesktopBrowserMessage(value);
+        if (resume.ok && resume.value.type === REMOTE_DESKTOP_MSG.RESUME) {
+          state = 'verifying';
+          const resumed = await this.remoteDesktopRouter.resumeGuestBrowser(ws, resume.value);
+          if (!resumed || (state as string) === 'closed') {
+            closeUniformly();
+            return;
+          }
+          state = 'admitted';
+          if (quarantineTimer) clearTimeout(quarantineTimer);
+          quarantineTimer = null;
+          return;
+        }
+        const proof = validateRemoteDesktopBootstrapProof(value);
+        if (!proof.ok) { closeUniformly(); return; }
+        state = 'verifying';
+        const admitted = await this.remoteDesktopRouter.redeemGuestBootstrap(ws, proof.value, clientIp);
+        if (!admitted || (state as string) === 'closed') {
+          this.remoteDesktopRouter.dropSocket(ws);
+          closeUniformly();
+          return;
+        }
+        state = 'admitted';
+        if (quarantineTimer) clearTimeout(quarantineTimer);
+        quarantineTimer = null;
+        if (!safeSend(ws, JSON.stringify({ type: REMOTE_DESKTOP_MSG.BOOTSTRAP_REDEEMED }))) {
+          closeUniformly();
+        }
+        return;
+      }
+      if (state !== 'admitted' || Buffer.byteLength(raw, 'utf8') > SERVER_WS_MAX_PAYLOAD_BYTES) {
+        closeUniformly();
+        return;
+      }
+      let message: unknown;
+      try { message = JSON.parse(raw); } catch { closeUniformly(); return; }
+      const handled = await this.remoteDesktopRouter.handleGuestBrowser(ws, message);
+      if (!handled) closeUniformly();
+    };
+    ws.on('message', (data) => {
+      // The bootstrap proof is the sole frame permitted before atomic
+      // redemption. Record first-frame receipt synchronously: a same-tick
+      // second frame must close even before the async verifier advances state.
+      if (!receivedFirstFrame) {
+        receivedFirstFrame = true;
+      } else if (state !== 'admitted') {
+        closeUniformly();
+        return;
+      }
+      // Once admitted, preserve signaling order across async Router handlers.
+      inbound = inbound.then(() => handleMessage(data)).catch(closeUniformly);
+    });
+    ws.once('close', () => {
+      state = 'closed';
+      if (quarantineTimer) clearTimeout(quarantineTimer);
+      quarantineTimer = null;
+      this.remoteDesktopRouter.dropSocket(ws);
+    });
+    ws.once('error', closeUniformly);
   }
 
   async revalidateShareSocketsForTarget(target: ShareTarget): Promise<void> {
@@ -3479,6 +5389,20 @@ export class WsBridge {
       const browserMessageType = typeof msg.type === 'string' ? msg.type : '';
       if (!browserMessageType) {
         return;
+      }
+
+      if (BROWSER_DATA_READ_TYPES.has(browserMessageType)) {
+        const browserId = this.getBrowserId(ws);
+        if (!this.browserDataReadRateLimiter.check(
+          `data-read:${browserId}`,
+          BROWSER_DATA_READ_RATE_LIMIT,
+          BROWSER_DATA_READ_RATE_WINDOW_MS,
+        )) {
+          incrementCounter('ws_bridge_browser_data_read_rate_limited', { type: browserMessageType });
+          logger.warn({ serverId: this.serverId, type: browserMessageType }, 'Browser data read rate limit exceeded');
+          this.rejectBrowserDataReadOverload(ws, msg);
+          return;
+        }
       }
 
       if (this.directFileTransferRouter.handleBrowser(ws, userId, msg)) {
@@ -3770,7 +5694,10 @@ export class WsBridge {
       //
       // In all cases we record an inflight entry so that the later command.ack
       // (or timeout / disconnect) can correlate back to the right browser.
-      if ((msg.type === 'session.send' || msg.type === DAEMON_COMMAND_TYPES.SESSION_CANCEL) && typeof msg.commandId === 'string') {
+      if ((msg.type === 'session.send'
+        || msg.type === DAEMON_COMMAND_TYPES.SESSION_CANCEL
+        || msg.type === 'session.undo_queued_message')
+        && typeof msg.commandId === 'string') {
         const sessionName = typeof msg.sessionName === 'string'
           ? msg.sessionName
           : (typeof msg.session === 'string' ? msg.session : '');
@@ -3874,6 +5801,29 @@ export class WsBridge {
       runtimeType,
       activeDispatchId: sessionName ? this.activeDispatchIds.get(sessionName) ?? null : null,
     });
+    if (decision.allowed && sessionName && msg.type === 'session.send' && decision.stampedMessage) {
+      const actor = decision.stampedMessage.sharedActor as SharedActorEnvelope | undefined;
+      const signingKey = this.directFileTransferTicketSigningKey;
+      const token = actor && signingKey && this.db
+        ? await issueSharedMachineAuthorityForSession(this.db, {
+            actorUserId: actor.actorUserId,
+            sourceServerId: this.serverId,
+            sessionName,
+            shareTarget: actor.snapshot.target,
+            actionId: actor.actionId,
+            signingKey,
+          })
+        : null;
+      if (!token) {
+        const denied: ShareCommandDecision = { allowed: false, reason: SHARE_REASONS.TARGET_UNAVAILABLE };
+        await this.auditShareScopedBrowserCommand(current, msg, denied);
+        return denied;
+      }
+      decision.stampedMessage = {
+        ...decision.stampedMessage,
+        [SHARED_MACHINE_AUTHORITY_FIELD]: token,
+      };
+    }
     if (decision.allowed && sessionName) {
       const rateLimitReason = this.evaluateShareScopedRateLimit(current, msg, sessionName, shareClockNow());
       if (rateLimitReason) {
@@ -4135,7 +6085,7 @@ export class WsBridge {
       db: this.db,
       serverId: this.serverId,
       userId: state.userId,
-      target: state.target,
+      target: state.requestedTarget ?? state.target,
       now: shareClockNow(),
     });
   }
@@ -4145,11 +6095,14 @@ export class WsBridge {
     state: ShareScopedSocketState,
     coverage: EffectiveCoverage,
   ): Promise<ShareScopedSocketState> {
+    const effectiveTarget = coverage.serverParticipantAuthority === true
+      ? { kind: 'server' as const, serverId: coverage.target.serverId }
+      : coverage.target;
     const next: ShareScopedSocketState = {
       ...state,
-      target: coverage.target,
+      target: effectiveTarget,
       snapshot: coverage,
-      coveredSessionNames: await this.resolveShareCoveredSessionNames(coverage.target),
+      coveredSessionNames: await this.resolveShareCoveredSessionNames(effectiveTarget),
     };
     if (state.snapshot.effectiveRole !== coverage.effectiveRole) {
       safeSend(ws, JSON.stringify({
@@ -4338,6 +6291,7 @@ export class WsBridge {
       sendError('forbidden');
       return;
     }
+    const shareState = this.browserShareStates.get(ws);
 
     const role = await resolveServerRole(db, this.serverId, userId);
     if (role !== 'owner' && role !== 'admin') {
@@ -4383,6 +6337,13 @@ export class WsBridge {
         serverId: this.serverId,
         ...(operationId ? { operationId } : {}),
         ...(idempotencyKey ? { idempotencyKey } : {}),
+        ...(shareState ? {
+          sharedActor: buildSharedActorEnvelope(
+            shareState,
+            idempotencyKey || operationId || `share-action-${shareClockNow()}`,
+            shareClockNow(),
+          ),
+        } : {}),
       }));
       return;
     }
@@ -4430,6 +6391,9 @@ export class WsBridge {
       serverId: this.serverId,
       sourceMainSessionName,
       idempotencyKey,
+      ...(shareState ? {
+        sharedActor: buildSharedActorEnvelope(shareState, idempotencyKey, shareClockNow()),
+      } : {}),
     };
     if (targetProjectName.value !== undefined) payload.targetProjectName = targetProjectName.value;
     if (cwdOverride.value !== undefined) payload.cwdOverride = cwdOverride.value;
@@ -5534,6 +7498,17 @@ export class WsBridge {
       return;
     }
 
+    // A daemon-originated terminal reset belongs only to the browsers watching
+    // that session. Falling through to default-allow broadcast made every other
+    // tab reset a terminal it was never subscribed to and that never congested.
+    if (type === 'terminal.stream_reset') {
+      const session = typeof msg.session === 'string' ? msg.session : '';
+      if (session) {
+        this.sendJsonToSessionSubscribers(session, JSON.stringify(msg));
+        return;
+      }
+    }
+
     // ── Default-allow: forward unrecognised types to all browsers ─────────────
     this.broadcastToBrowsers(JSON.stringify(msg));
   }
@@ -5862,6 +7837,13 @@ export class WsBridge {
   }
 
   private handleQueueOverflow(sessionName: string, ws: WebSocket): void {
+    // One reset per overflow EPISODE, not per dropped frame. Every reset makes
+    // the client ask for a fresh full-frame snapshot, which is exactly the work
+    // that overflowed the socket in the first place — notifying per frame turns
+    // congestion into a feedback loop.
+    const queue = this.terminalQueues.get(sessionName)?.get(ws);
+    if (queue && !queue.takeOverflowNotice()) return;
+
     const resetMsg = JSON.stringify({
       type: 'terminal.stream_reset',
       session: sessionName,
@@ -5898,10 +7880,15 @@ export class WsBridge {
     // full re-subscribe roundtrip. The fresh queue gives us a clean budget
     // for subsequent sends; orphaned in-flight callbacks from the old
     // queue still decrement only their own (now-unreachable) counter.
-    const sessionQueues = this.terminalQueues.get(sessionName);
-    if (sessionQueues?.has(ws)) {
-      sessionQueues.set(ws, new TerminalForwardQueue());
-    }
+    // Deliberately NOT `sessionQueues.set(ws, new TerminalForwardQueue())`.
+    //
+    // Replacing the queue handed out a fresh 4MB budget while the previous
+    // ~4MB was still sitting unacknowledged in the socket/kernel: the orphaned
+    // callbacks only decremented a counter nobody could read any more. Repeated
+    // overflows could therefore keep buying new budget, so the real in-flight
+    // backlog for one socket was unbounded — the opposite of backpressure. The
+    // queue now stays put, keeps its counter, and resumes on its own once
+    // in-flight bytes drain below the low-water mark.
   }
 
   private getOrCreateQueue(sessionName: string, ws: WebSocket): TerminalForwardQueue {
@@ -6309,7 +8296,17 @@ export class WsBridge {
     }
 
     // Fully offline (no daemon WS, no grace window): fail fast.
-    this.emitCommandFailed(ws, commandId, sessionName, ACK_FAILURE_DAEMON_OFFLINE);
+    this.emitInflightFailure({
+      commandId,
+      sessionName,
+      browser: ws,
+      rawPayload: raw,
+      state: 'buffered',
+      sentAt: Date.now(),
+      dispatchAttempts: 0,
+      timeoutTimer: null,
+      share: this.inflightShareMetadata(ws),
+    }, ACK_FAILURE_DAEMON_OFFLINE);
   }
 
   /** Replay buffered + dispatched commands to the daemon after reconnect. */
@@ -6380,40 +8377,35 @@ export class WsBridge {
     if (!entry.share) return true;
     const state = this.browserShareStates.get(entry.browser);
     if (!state || state.userId !== entry.share.userId) {
-      this.emitCommandFailed(entry.browser, entry.commandId, entry.sessionName, SHARE_REASONS.REVOKED);
+      this.emitInflightFailure(entry, SHARE_REASONS.REVOKED);
       this.removeInflight(entry.commandId);
       return false;
     }
     const coverage = await this.resolveLiveShareCoverage(state);
     if (!coverage) {
-      this.emitCommandFailed(
-        entry.browser,
-        entry.commandId,
-        entry.sessionName,
-        this.shareStateLooksExpired(state) ? SHARE_REASONS.EXPIRED : SHARE_REASONS.REVOKED,
-      );
+      this.emitInflightFailure(entry, this.shareStateLooksExpired(state) ? SHARE_REASONS.EXPIRED : SHARE_REASONS.REVOKED);
       this.removeInflight(entry.commandId);
       return false;
     }
     const current = await this.applyShareCoverage(entry.browser, state, coverage);
     if (!shareStateCoversSession(current, entry.sessionName)) {
-      this.emitCommandFailed(entry.browser, entry.commandId, entry.sessionName, SHARE_REASONS.TARGET_UNAVAILABLE);
+      this.emitInflightFailure(entry, SHARE_REASONS.TARGET_UNAVAILABLE);
       this.removeInflight(entry.commandId);
       return false;
     }
     const sameTarget = shareTargetKey(current.target) === shareTargetKey(entry.share.target);
     if (!sameTarget || !shareStateCoversSession(current, entry.sessionName)) {
-      this.emitCommandFailed(entry.browser, entry.commandId, entry.sessionName, SHARE_REASONS.TARGET_UNAVAILABLE);
+      this.emitInflightFailure(entry, SHARE_REASONS.TARGET_UNAVAILABLE);
       this.removeInflight(entry.commandId);
       return false;
     }
     if (this.shareStateLooksExpired(current)) {
-      this.emitCommandFailed(entry.browser, entry.commandId, entry.sessionName, SHARE_REASONS.EXPIRED);
+      this.emitInflightFailure(entry, SHARE_REASONS.EXPIRED);
       this.removeInflight(entry.commandId);
       return false;
     }
     if (entry.share.requiredRole === 'participant' && current.snapshot.effectiveRole !== 'participant') {
-      this.emitCommandFailed(entry.browser, entry.commandId, entry.sessionName, SHARE_REASONS.ROLE_DENIED);
+      this.emitInflightFailure(entry, SHARE_REASONS.ROLE_DENIED);
       this.removeInflight(entry.commandId);
       return false;
     }
@@ -6450,7 +8442,7 @@ export class WsBridge {
       this.broadcastToBrowsers(JSON.stringify({ type: MSG_DAEMON_OFFLINE }));
     }
     for (const entry of [...this.inflightCommands.values()]) {
-      this.emitCommandFailed(entry.browser, entry.commandId, entry.sessionName, ACK_FAILURE_DAEMON_OFFLINE);
+      this.emitInflightFailure(entry, ACK_FAILURE_DAEMON_OFFLINE);
       this.removeInflight(entry.commandId);
     }
   }
@@ -6469,7 +8461,7 @@ export class WsBridge {
           dispatchAttempts: entry.dispatchAttempts,
           retryLimit: ACK_TIMEOUT_RETRY_LIMIT,
         },
-        'command.ack timeout — retrying session.send',
+        'command.ack timeout — retrying reliable session command',
       );
       void this.dispatchInflightToDaemon(entry, true);
       return;
@@ -6483,7 +8475,7 @@ export class WsBridge {
       return;
     }
     logger.warn({ serverId: this.serverId, commandId, sessionName: entry.sessionName }, 'command.ack timeout');
-    this.emitCommandFailed(entry.browser, commandId, entry.sessionName, ACK_FAILURE_ACK_TIMEOUT);
+    this.emitInflightFailure(entry, ACK_FAILURE_ACK_TIMEOUT);
     this.removeInflight(commandId);
   }
 
@@ -6538,6 +8530,34 @@ export class WsBridge {
     } catch (err) {
       logger.warn({ commandId, err }, 'failed to deliver command.failed to browser');
     }
+  }
+
+  private emitInflightFailure(entry: InflightCommand, reason: AckFailureReason | ShareReason): void {
+    const type = this.rawPayloadType(entry.rawPayload);
+    if (type === 'session.undo_queued_message') {
+      const payload = JSON.stringify({
+        type: MSG_COMMAND_ACK,
+        commandId: entry.commandId,
+        session: entry.sessionName,
+        sessionName: entry.sessionName,
+        status: 'error',
+        error: reason,
+      });
+      try {
+        if (entry.browser.readyState === WebSocket.OPEN) {
+          entry.browser.send(payload);
+        }
+      } catch (err) {
+        logger.warn({ commandId: entry.commandId, err }, 'failed to deliver queue mutation error ack to browser');
+      }
+      // The initiating browser may have reconnected/rotated while the daemon
+      // was down. Session subscribers are the authoritative multi-device/user
+      // projection, so the terminal failure must reach the replacement socket
+      // too instead of leaving it on a permanent optimistic tombstone.
+      this.sendJsonToSessionSubscribers(entry.sessionName, payload);
+      return;
+    }
+    this.emitCommandFailed(entry.browser, entry.commandId, entry.sessionName, reason);
   }
 
   /** Start periodic GC timer (idempotent). */
@@ -7163,6 +9183,16 @@ export class WsBridge {
   /** Force-close the daemon WebSocket. Use after token rotation to evict the stale connection. */
   kickDaemon(): void {
     if (this.daemonWs) {
+      if (this.db) {
+        void remoteDesktopConsentCancellation.daemonDisconnected(
+          this.db,
+          this.serverId,
+          this.daemonGeneration,
+        ).catch(() => {});
+      }
+      if (this.db && this.daemonOwnerUserId) {
+        this.failDisconnectedCapabilityOperations(this.db, this.daemonOwnerUserId);
+      }
       // Production WebSocket close is asynchronous. Drain request waiters before
       // clearing the socket identity, or the guarded close handler cannot do it.
       this.rejectAllPendingFileTransfers('daemon_disconnected');
@@ -7224,13 +9254,36 @@ export class WsBridge {
   tryInstallControlledNodeRemoteDesktopWorker(expectedGeneration: number): 'sent' | 'offline' | 'generation_changed' | 'send_failed' {
     if (!this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN) return 'offline';
     if (this.daemonGeneration !== expectedGeneration) return 'generation_changed';
+    // Either platform's install offer. Checking only the Windows capability
+    // refused the request from a macOS node that had just advertised it could
+    // install -- the browser showed the button, the node was ready to act, and
+    // the relay in between dropped it.
     if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED
-      || !this.hasDaemonCapability(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY)) return 'offline';
+      || !(this.hasDaemonCapability(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY)
+        || this.hasDaemonCapability(REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY))) return 'offline';
     try {
       this.daemonWs.send(JSON.stringify({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST }));
       return 'sent';
     } catch (err) {
       logger.error({ serverId: this.serverId, err }, 'Failed to request remote desktop worker repair');
+      return 'send_failed';
+    }
+  }
+
+  /**
+   * Ask a node to raise its own permission dialog. Never queued or replayed:
+   * a prompt that appears minutes later, on a machine nobody is watching, is
+   * worse than none -- the person who asked for it has gone.
+   */
+  tryRequestControlledNodeRemoteDesktopPermissions(expectedGeneration: number): 'sent' | 'offline' | 'generation_changed' | 'send_failed' {
+    if (!this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN) return 'offline';
+    if (this.daemonGeneration !== expectedGeneration) return 'generation_changed';
+    if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED) return 'offline';
+    try {
+      this.daemonWs.send(JSON.stringify({ type: REMOTE_DESKTOP_PERMISSION_MSG.REQUEST }));
+      return 'sent';
+    } catch (err) {
+      logger.error({ serverId: this.serverId, err }, 'Failed to request remote desktop permissions');
       return 'send_failed';
     }
   }
@@ -7265,13 +9318,263 @@ export class WsBridge {
   private trySendRemoteDesktop(message: Record<string, unknown>, expectedGeneration: number): boolean {
     if (!this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN) return false;
     if (this.daemonGeneration !== expectedGeneration
-      || !this.hasDaemonCapability(REMOTE_DESKTOP_CAPABILITY)) return false;
+      || !this.daemonAdvertisesRemoteDesktopProfile()) return false;
     try {
       this.daemonWs.send(JSON.stringify(message));
       return true;
     } catch {
       incrementCounter('remote_desktop.signaling_send_failed', { type: String(message.type ?? 'unknown') });
       return false;
+    }
+  }
+
+  private trySendRemoteDesktopConsent(command: RemoteDesktopConsentDispatchCommand): boolean {
+    const parsed = validateRemoteDesktopConsentMessage(command.message);
+    if (!parsed.ok || parsed.value.type === REMOTE_DESKTOP_CONSENT_MSG.RESULT) return false;
+    if (command.executionServerId !== this.serverId
+      || command.daemonGeneration !== this.daemonGeneration
+      || !this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN
+      || this.remoteDesktopAuthorityReadyGeneration !== this.daemonGeneration
+      || !this.hasDaemonCapability(REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY)) return false;
+    try {
+      this.daemonWs.send(JSON.stringify(parsed.value));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async requestRemoteDesktopAttendedConsent(input: {
+    actor: RemoteDesktopActor;
+    sessionId: string;
+    routeGeneration: number;
+    daemonGeneration: number;
+    mode: RemoteDesktopAccessMode;
+  }): Promise<'approved' | 'denied' | 'timeout' | 'cancelled' | 'unavailable'> {
+    const db = this.db;
+    if (!db || input.actor.source !== REMOTE_DESKTOP_ACTOR_SOURCE.ATTENDED_LINK
+      || input.daemonGeneration !== this.daemonGeneration
+      || input.actor.endpointGeneration !== input.daemonGeneration) return 'unavailable';
+    const now = await readDatabaseClock(db);
+    const deadlineAt = now + REMOTE_DESKTOP_LINK_LIMITS.CONSENT_DEADLINE_MS;
+    const localWaitUntil = Date.now() + REMOTE_DESKTOP_LINK_LIMITS.CONSENT_DEADLINE_MS;
+    const consent = await requestAttendedConsent(db, {
+      hostId: input.actor.hostId,
+      actorAuditId: input.actor.auditId,
+      browserKeyHash: hashBrowserKey(input.actor.browserKeyThumbprint),
+      executionServerId: this.serverId,
+      endpointGeneration: input.actor.endpointGeneration,
+      daemonGeneration: input.daemonGeneration,
+      mode: input.mode,
+      requesterLabel: 'Remote guest',
+      deadlineAt,
+    }, { dispatch: (command) => this.trySendRemoteDesktopConsent(command) }).catch(() => null);
+    if (!consent) return 'unavailable';
+
+    while (Date.now() < localWaitUntil) {
+      const current = await getAttendedConsent(db, consent.approvalId).catch(() => null);
+      if (!current) return 'unavailable';
+      if (current.state === REMOTE_DESKTOP_CONSENT_STATE.DENIED) return 'denied';
+      if (current.state === REMOTE_DESKTOP_CONSENT_STATE.CANCELLED) return 'cancelled';
+      if (current.state === REMOTE_DESKTOP_CONSENT_STATE.TIMED_OUT) return 'timeout';
+      if (current.state === REMOTE_DESKTOP_CONSENT_STATE.APPROVED) {
+        return consumeApprovedAttendedConsent(db, {
+          approvalId: current.approvalId,
+          hostId: input.actor.hostId,
+          actorAuditId: input.actor.auditId,
+          browserKeyHash: hashBrowserKey(input.actor.browserKeyThumbprint),
+          executionServerId: this.serverId,
+          endpointGeneration: input.actor.endpointGeneration,
+          daemonGeneration: input.daemonGeneration,
+          mode: input.mode,
+          sessionId: input.sessionId,
+        }).then(() => 'approved' as const, () => 'unavailable' as const);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      if (this.daemonGeneration !== input.daemonGeneration || !this.authenticated) return 'cancelled';
+    }
+    return 'timeout';
+  }
+
+  private async currentRemoteDesktopShellEndpoint(input: {
+    ownerUserId: string;
+    hostId: string;
+  }): Promise<RemoteDesktopShellEndpointAuthority | null> {
+    const db = this.db;
+    const socket = this.daemonWs;
+    const generation = this.daemonGeneration;
+    if (!db || !socket || socket.readyState !== WebSocket.OPEN
+      || !this.authenticated
+      || this.daemonNodeRole !== NODE_ROLE.CONTROLLED
+      || this.daemonOwnerUserId !== input.ownerUserId
+      || this.remoteDesktopAuthorityReadyGeneration !== generation
+      || !this.hasDaemonCapability(REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY)) return null;
+    const mapping = await db.queryOne<{ server_id: string }>(
+      `SELECT server_id
+         FROM remote_desktop_host_endpoints
+        WHERE server_id = $1 AND host_id = $2 AND owner_user_id = $3
+          AND endpoint_role = 'controlled'`,
+      [this.serverId, input.hostId, input.ownerUserId],
+    );
+    if (!mapping
+      || this.daemonWs !== socket
+      || this.daemonGeneration !== generation
+      || !this.authenticated
+      || this.remoteDesktopAuthorityReadyGeneration !== generation
+      || !this.hasDaemonCapability(REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY)) return null;
+    return { serverId: this.serverId, endpointGeneration: generation };
+  }
+
+  private async trySendRemoteDesktopShellLaunchContext(
+    ownerUserId: string,
+    hostId: string,
+    context: RemoteDesktopShellLaunchContext,
+    expectedGeneration: number,
+  ): Promise<boolean> {
+    const parsed = validateRemoteDesktopShellMessage({
+      type: REMOTE_DESKTOP_SHELL_MSG.LAUNCH,
+      context,
+    });
+    if (!parsed.ok || parsed.value.type !== REMOTE_DESKTOP_SHELL_MSG.LAUNCH
+      || parsed.value.context.hostId !== hostId
+      || parsed.value.context.endpointGeneration !== expectedGeneration) return false;
+    const endpoint = await this.currentRemoteDesktopShellEndpoint({ ownerUserId, hostId });
+    if (!endpoint || endpoint.endpointGeneration !== expectedGeneration) return false;
+    const socket = this.daemonWs;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+    try {
+      socket.send(JSON.stringify(parsed.value));
+      return this.daemonWs === socket
+        && this.daemonGeneration === expectedGeneration
+        && this.authenticated;
+    } catch {
+      incrementCounter('remote_desktop.shell_launch_send_failed');
+      return false;
+    }
+  }
+
+  /** Management privacy uses the authenticated node socket and no secondary
+   * nonce. Exact shared validation plus capability/generation checks prevent
+   * an account/session secret or a stale command entering the node channel. */
+  private trySendRemoteDesktopManagementPrivacy(
+    message: RemoteDesktopPrivacyBegin | RemoteDesktopPrivacyEnd,
+    expectedGeneration: number,
+  ): boolean {
+    const parsed = validateRemoteDesktopPrivacyMessage(message);
+    if (!parsed.ok || parsed.value.type === REMOTE_DESKTOP_PRIVACY_MSG.ACK) return false;
+    if (!this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN) return false;
+    if (this.daemonGeneration !== expectedGeneration
+      || !this.hasDaemonCapability(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY)) return false;
+    try {
+      this.daemonWs.send(JSON.stringify(parsed.value));
+      return true;
+    } catch {
+      incrementCounter('remote_desktop.privacy_send_failed', { type: parsed.value.type });
+      return false;
+    }
+  }
+
+  private async handleRemoteDesktopManagementPrivacyAck(
+    message: Record<string, unknown>,
+    connectionGeneration: number,
+  ): Promise<void> {
+    const reject = () => { WsBridge.invalidRemoteDesktopPrivacyFramesDropped += 1; };
+    const parsed = validateRemoteDesktopPrivacyMessage(message);
+    const db = this.db;
+    if (!parsed.ok
+      || parsed.value.type !== REMOTE_DESKTOP_PRIVACY_MSG.ACK
+      || !db
+      || !this.authenticated
+      || this.daemonGeneration !== connectionGeneration
+      || !this.hasDaemonCapability(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY)) {
+      reject();
+      return;
+    }
+
+    try {
+      const ack = parsed.value;
+      const state = await getPrivacyState(db, ack.hostId);
+      if (!state
+        || state.epochId !== ack.epochId
+        || state.revision !== ack.revision
+        || state.executionServerId !== this.serverId
+        || state.daemonGeneration !== connectionGeneration) {
+        reject();
+        return;
+      }
+      const now = await readDatabaseClock(db);
+      if (state.phase === REMOTE_DESKTOP_PRIVACY_PHASE.STARTING) {
+        await acknowledgeShield(db, {
+          hostId: ack.hostId,
+          epochId: ack.epochId,
+          revision: ack.revision,
+          executionServerId: this.serverId,
+          daemonGeneration: connectionGeneration,
+          workerGeneration: ack.workerGeneration,
+          acknowledgedRoutes: ack.routes,
+          now,
+        });
+        return;
+      }
+      if (state.phase === REMOTE_DESKTOP_PRIVACY_PHASE.ENDING) {
+        await acknowledgeFreshFrame(db, {
+          hostId: ack.hostId,
+          epochId: ack.epochId,
+          revision: ack.revision,
+          executionServerId: this.serverId,
+          daemonGeneration: connectionGeneration,
+          freshFrameGeneration: ack.workerGeneration,
+          acknowledgedRoutes: ack.routes,
+          now,
+        });
+        return;
+      }
+      reject();
+    } catch {
+      // All mismatches remain fail closed in durable state. ACK payloads are
+      // intentionally not logged because route IDs are unnecessary here.
+      reject();
+    }
+  }
+
+  private async handleRemoteDesktopShellRecoveryRequired(
+    message: Record<string, unknown>,
+    connectionGeneration: number,
+  ): Promise<void> {
+    const reject = () => { WsBridge.invalidRemoteDesktopShellFramesDropped += 1; };
+    const parsed = validateRemoteDesktopShellMessage(message);
+    const db = this.db;
+    if (!parsed.ok
+      || parsed.value.type !== REMOTE_DESKTOP_SHELL_MSG.RECOVERY_REQUIRED
+      || !db
+      || !this.authenticated
+      || this.daemonNodeRole !== NODE_ROLE.CONTROLLED
+      || this.daemonGeneration !== connectionGeneration
+      || this.remoteDesktopAuthorityReadyGeneration !== connectionGeneration
+      || parsed.value.endpointGeneration !== connectionGeneration
+      || !this.hasDaemonCapability(REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY)) {
+      reject();
+      return;
+    }
+    try {
+      const state = await getPrivacyState(db, parsed.value.hostId);
+      if (!state
+        || state.epochId !== parsed.value.epochId
+        || state.executionServerId !== this.serverId
+        || state.daemonGeneration !== connectionGeneration) {
+        reject();
+        return;
+      }
+      await markRecoveryRequired(db, {
+        hostId: parsed.value.hostId,
+        epochId: parsed.value.epochId,
+        reason: parsed.value.reason,
+        now: await readDatabaseClock(db),
+      });
+    } catch {
+      // Durable state remains closed on every failure. The payload is never
+      // logged because it is unnecessary for recovery and may contain IDs.
+      reject();
     }
   }
 
@@ -7305,6 +9608,7 @@ export class WsBridge {
       || parsedType === MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST
       || parsedType === MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST
       || (typeof parsedType === 'string' && parsedType.startsWith('remote_desktop.'))
+      || (typeof parsedType === 'string' && parsedType.startsWith('management_privacy.'))
     ) {
       logger.warn({ serverId: this.serverId, type: parsedType }, 'Dropped control command sent via generic sendToDaemon');
       return;
@@ -7630,6 +9934,37 @@ export class WsBridge {
   /** Returns true if the daemon WebSocket is connected and authenticated. */
   isDaemonConnected(): boolean {
     return !!(this.daemonWs && this.authenticated);
+  }
+
+  private isRemoteDesktopGuestOutboxTargetAvailable(): boolean {
+    return this.authenticated
+      && this.remoteDesktopAuthorityReadyGeneration === this.daemonGeneration
+      && this.daemonWs?.readyState === WebSocket.OPEN
+      && this.daemonAdvertisesRemoteDesktopProfile();
+  }
+
+  /**
+   * Whether the connected daemon advertises a complete remote-desktop session
+   * profile of any platform. The Windows v2 token alone was checked before,
+   * so signaling for a macOS v3 node was refused after admission had passed.
+   */
+  private daemonAdvertisesRemoteDesktopProfile(): boolean {
+    if (!this.daemonWs || this.daemonWs.readyState !== WebSocket.OPEN) return false;
+    return resolveRemoteDesktopSessionProfile(
+      this.daemonNodeRole === NODE_ROLE.CONTROLLED
+        ? [...this.controlledNodeCapabilities]
+        : this.daemonP2pWorkflowCapabilities?.capabilities,
+    ) !== null;
+  }
+
+  private applyRemoteDesktopGuestOutboxEffect(
+    event: RemoteDesktopOutboxEvent,
+    routeId: string,
+    routeGeneration: number,
+    authority: RemoteDesktopGuestOutboxAuthorityMatch,
+  ): RemoteDesktopGuestDeliveryResult {
+    if (!this.isRemoteDesktopGuestOutboxTargetAvailable()) return { status: 'not_owner' };
+    return this.remoteDesktopRouter.applyGuestOutboxEffect(event, routeId, routeGeneration, authority);
   }
 
   /**
@@ -8643,6 +10978,7 @@ export class WsBridge {
       && this.pendingPreviewWsUpgrades.size === 0
     ) {
       this.browserRateLimiter.stop();
+      this.browserDataReadRateLimiter.stop();
       if (this.shareExpirySweepTimer) {
         clearInterval(this.shareExpirySweepTimer);
         this.shareExpirySweepTimer = null;

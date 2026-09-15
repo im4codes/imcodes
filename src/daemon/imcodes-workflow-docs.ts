@@ -37,6 +37,21 @@ Notes:
 - If the user wants the agent to coordinate with another session, ask another worker to help, or hand work/results to a sibling session, this is usually actionable through \`imcodes send\` and should not by itself force human intervention.
 `.trim();
 
+/**
+ * Append inter-agent communication docs to a memory string.
+ * Returns the combined memory with send docs appended.
+ *
+ * Kept in this dependency-light module (not memory-inject) on purpose: it is a
+ * pure function of AGENT_SEND_DOCS, and loading memory-inject pulls in ~100
+ * daemon modules (memory recall, timeline, summary sync, metrics).
+ */
+export function appendAgentSendDocs(memory: string | null): string {
+  if (memory?.trim()) {
+    return `${memory.trim()}\n\n${AGENT_SEND_DOCS}`;
+  }
+  return AGENT_SEND_DOCS;
+}
+
 export const OPENSPEC_WORKFLOW_DOCS = `
 ## OpenSpec Workflow
 

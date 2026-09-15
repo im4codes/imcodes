@@ -200,6 +200,7 @@ export function useSubSessions(
     title: string;
     type: string;
     parentSessionName: string | null;
+    supervisionMode?: SubSessionData['supervisionMode'];
   }>) => {
     const now = Date.now();
     setSubSessions((prev) => {
@@ -222,6 +223,7 @@ export function useSubSessions(
         parentSession: item.parentSessionName,
         description: null,
         ccPresetId: null,
+        supervisionMode: item.supervisionMode ?? null,
       }, previousById.get(item.subSessionId)));
     });
     setLoadedServerId(serverIdForShare);
@@ -325,6 +327,7 @@ export function useSubSessions(
                     updated[existingIdx].transportConfig,
                   ),
                 }),
+                ...(m.supervisionMode !== undefined && { supervisionMode: m.supervisionMode }),
                 ...transportPendingPatch,
                 ...(m.qwenModel != null && { qwenModel: m.qwenModel }),
                 ...(m.qwenAuthType != null && { qwenAuthType: m.qwenAuthType }),
@@ -371,6 +374,7 @@ export function useSubSessions(
               executionCloneKind: m.executionCloneKind ?? null,
               parentRunId: m.parentRunId ?? null,
               transportConfig: m.transportConfig ?? null,
+              supervisionMode: m.supervisionMode ?? null,
               ...transportPendingPatch,
             }];
           });
@@ -422,6 +426,7 @@ export function useSubSessions(
                   s.transportConfig,
                 ),
               } : {}),
+              ...(m.supervisionMode !== undefined ? { supervisionMode: m.supervisionMode } : {}),
               ...transportPendingPatch,
             };
           }));

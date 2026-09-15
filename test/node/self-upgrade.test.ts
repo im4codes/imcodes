@@ -1,8 +1,9 @@
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { promisify } from 'node:util';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
@@ -18,11 +19,18 @@ import {
 import {
   buildPosixControlledNodeUpgradeScript,
   buildWindowsControlledNodeUpgradeScript,
+  CONTROLLED_NODE_UPGRADE_ABSOLUTE_TTL_MS,
+  CONTROLLED_NODE_UPGRADE_DIR_PREFIX,
+  CONTROLLED_NODE_UPGRADE_OWNERSHIP_MARKER,
+  CONTROLLED_NODE_UPGRADE_PROGRESS_FILE,
+  CONTROLLED_NODE_UPGRADE_STALE_AFTER_MS,
   controlledNodeArtifactTarget,
   controlledNodeArtifactUpgradeUrl,
+  downloadControlledNodeExecutable,
   downloadControlledNodeRemoteDesktopWorker,
   scheduleLinuxControlledNodeUpgrade,
   scheduleWindowsControlledNodeUpgrade,
+  scavengeStaleControlledNodeUpgradeDirs,
   startControlledNodeSelfUpgrade,
   windowsControlledNodeUpgradeTaskXml,
 } from '../../src/node/self-upgrade.js';
@@ -46,7 +54,126 @@ const credential = {
   nodeRole: NODE_ROLE.CONTROLLED,
 } as const;
 
+async function holdWindowsFileLock(
+  filePath: string,
+  directory: string,
+  durationMs: number,
+): Promise<ReturnType<typeof spawn>> {
+  const scriptPath = join(directory, `hold-lock-${durationMs}.ps1`);
+  const readyPath = join(directory, `lock-ready-${durationMs}`);
+  const quotedFile = filePath.replaceAll("'", "''");
+  const quotedReady = readyPath.replaceAll("'", "''");
+  await writeFile(scriptPath, [
+    "$ErrorActionPreference = 'Stop'",
+    `$handle = [IO.File]::Open('${quotedFile}', [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)`,
+    'try {',
+    `  Set-Content -LiteralPath '${quotedReady}' -Value 'ready' -Encoding ascii`,
+    `  [Threading.Thread]::Sleep(${durationMs})`,
+    '} finally {',
+    '  $handle.Dispose()',
+    '}',
+  ].join('\r\n'));
+  const child = spawn('powershell.exe', [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath,
+  ], { stdio: 'ignore', windowsHide: true });
+  const readyDeadline = Date.now() + 5_000;
+  while (!(await readFile(readyPath).then(() => true, () => false))) {
+    if (Date.now() >= readyDeadline) {
+      if (child.exitCode === null) child.kill();
+      throw new Error('Windows replacement lock holder did not become ready');
+    }
+    await new Promise((resolveReady) => setTimeout(resolveReady, 25));
+  }
+  return child;
+}
+
+function createWindowsUpgradeFetch(version = '2026.7.1'): typeof fetch {
+  const main = Buffer.from('signed controlled node');
+  const worker = Buffer.from('signed remote desktop worker');
+  const virtualDisplay = Buffer.from('signed virtual display');
+  const workerManifest = Buffer.from(JSON.stringify({
+    manifestVersion: 2,
+    workerVersion: version,
+    protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+    ipcVersion: 1,
+    os: 'win32',
+    arch: 'x64',
+    fileName: REMOTE_DESKTOP_WORKER_FILENAME,
+    size: worker.length,
+    sha256: createHash('sha256').update(worker).digest('hex'),
+    authenticodeSignerSha256: WINDOWS_SIGNER_SHA256,
+    libwebrtcRevision: WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.mediaStackDecision.libwebrtcRevision,
+    virtualDisplay: {
+      archiveFileName: 'imcodes-virtual-display.zip',
+      packageManifestFileName: 'imcodes-virtual-display.manifest.json',
+      size: virtualDisplay.length,
+      sha256: createHash('sha256').update(virtualDisplay).digest('hex'),
+    },
+    toolchain: {
+      msvc: '14.44',
+      windowsSdk: '10.0.26100.0',
+      cmake: 'not-used-gn',
+      ninja: '1.13.1',
+      depotTools: WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.mediaStackDecision.depotToolsRevision,
+    },
+  }));
+  return (async (url: string) => {
+    if (url.includes('asset=computer-use-helper')) return new Response(null, { status: 404 });
+    const isManifest = url.includes('asset=remote-desktop-worker-manifest');
+    const isVirtualDisplay = url.includes('asset=remote-desktop-virtual-display');
+    const isWorker = url.includes('asset=remote-desktop-worker');
+    const body = isManifest ? workerManifest : isVirtualDisplay ? virtualDisplay : isWorker ? worker : main;
+    return new Response(body, {
+      status: 200,
+      headers: {
+        [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: createHash('sha256').update(body).digest('hex'),
+        [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(body.length),
+        [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: isManifest
+          ? `${REMOTE_DESKTOP_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`
+          : isVirtualDisplay ? 'imcodes-virtual-display.zip' : isWorker ? REMOTE_DESKTOP_WORKER_FILENAME : 'imcodes-node.exe',
+        [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: version,
+        ...(!isManifest && !isVirtualDisplay && !isWorker
+          ? { [CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256]: WINDOWS_SIGNER_SHA256 }
+          : {}),
+      },
+    });
+  }) as unknown as typeof fetch;
+}
+
+async function createOwnedUpgradeDir(input: {
+  root: string;
+  suffix: string;
+  createdAt: number;
+  pid?: number;
+  marker?: boolean;
+  bom?: boolean;
+}): Promise<string> {
+  const path = join(input.root, `${CONTROLLED_NODE_UPGRADE_DIR_PREFIX}${input.suffix}`);
+  await mkdir(path);
+  if (input.marker !== false) {
+    await writeFile(join(path, CONTROLLED_NODE_UPGRADE_OWNERSHIP_MARKER), `${input.bom ? '\ufeff' : ''}${JSON.stringify({
+      schemaVersion: 1,
+      product: 'imcodes-controlled-node-upgrade',
+      directoryName: `${CONTROLLED_NODE_UPGRADE_DIR_PREFIX}${input.suffix}`,
+      ownerToken: '12345678-1234-4123-8123-123456789abc',
+      createdAt: input.createdAt,
+      pid: input.pid ?? 999_999,
+    })}\n`);
+  }
+  const timestamp = new Date(input.createdAt);
+  if (input.marker !== false) await utimes(join(path, CONTROLLED_NODE_UPGRADE_OWNERSHIP_MARKER), timestamp, timestamp);
+  await utimes(path, timestamp, timestamp);
+  return path;
+}
+
 describe('controlled-node self-upgrade', () => {
+  it('keeps the production controlled-node bundle independent of the native addon that requires quiesce', async () => {
+    const { stdout } = await execFileAsync(process.execPath, ['scripts/check-node-exe-deps.mjs'], {
+      cwd: process.cwd(),
+    });
+    expect(stdout).toContain('node-datachannel excluded');
+  });
+
   it('maps only canonical platform artifacts', () => {
     expect(controlledNodeArtifactTarget('win32', 'x64')).toEqual({ os: 'win', arch: 'x64' });
     expect(controlledNodeArtifactTarget('darwin', 'arm64')).toEqual({ os: 'mac', arch: 'universal' });
@@ -66,6 +193,124 @@ describe('controlled-node self-upgrade', () => {
     expect(url).toBe(`https://im.example${CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH}?serverId=srv-1&os=win&arch=x64`);
     const helperUrl = controlledNodeArtifactUpgradeUrl(credential, { os: 'win', arch: 'x64' }, CONTROLLED_NODE_ARTIFACT_ASSETS.COMPUTER_USE_HELPER);
     expect(helperUrl).toBe(`https://im.example${CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH}?serverId=srv-1&os=win&arch=x64&asset=computer-use-helper`);
+  });
+
+  it('streams the controlled-node executable to disk without buffering the whole response body', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-node-streaming-download-test-'));
+    dirs.push(dir);
+    const chunks = [
+      Buffer.alloc(64 * 1024, 0x61),
+      Buffer.alloc(64 * 1024, 0x62),
+      Buffer.from('final-chunk'),
+    ];
+    const size = chunks.reduce((total, chunk) => total + chunk.length, 0);
+    const hash = createHash('sha256');
+    chunks.forEach((chunk) => hash.update(chunk));
+    const sha256 = hash.digest('hex');
+    let nextChunk = 0;
+    const response = new Response(new ReadableStream<Uint8Array>({
+      pull(controller) {
+        const chunk = chunks[nextChunk++];
+        if (chunk) controller.enqueue(chunk);
+        else controller.close();
+      },
+    }), {
+      status: 200,
+      headers: {
+        [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: sha256,
+        [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(size),
+        [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: 'imcodes-node.exe',
+        [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.9.1',
+        [CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256]: WINDOWS_SIGNER_SHA256,
+      },
+    });
+    const wholeBodyRead = vi.fn(async () => {
+      throw new Error('whole_body_buffered');
+    });
+    Object.defineProperty(response, 'arrayBuffer', { value: wholeBodyRead });
+
+    const downloaded = await downloadControlledNodeExecutable({
+      credential,
+      target: { os: 'win', arch: 'x64' },
+      dir,
+      fetchImpl: (async () => response) as unknown as typeof fetch,
+    });
+
+    expect(wholeBodyRead).not.toHaveBeenCalled();
+    expect(downloaded).toMatchObject({ sha256, sizeBytes: size });
+    expect(await readFile(downloaded!.artifactPath)).toEqual(Buffer.concat(chunks));
+  });
+
+  it('removes a rejected streamed download without replacing an existing artifact', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-node-streaming-reject-test-'));
+    dirs.push(dir);
+    const artifactPath = join(dir, 'imcodes-node.exe');
+    await writeFile(artifactPath, 'existing verified artifact');
+    const bytes = Buffer.from('corrupt replacement');
+
+    await expect(downloadControlledNodeExecutable({
+      credential,
+      target: { os: 'win', arch: 'x64' },
+      dir,
+      fetchImpl: (async () => new Response(bytes, {
+        status: 200,
+        headers: {
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: 'a'.repeat(64),
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(bytes.length),
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: 'imcodes-node.exe',
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.9.1',
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256]: WINDOWS_SIGNER_SHA256,
+        },
+      })) as unknown as typeof fetch,
+    })).rejects.toThrow('artifact_sha256_mismatch');
+
+    expect(await readFile(artifactPath, 'utf8')).toBe('existing verified artifact');
+    expect(await readdir(dir)).toEqual(['imcodes-node.exe']);
+  });
+
+  it('leaves a durable phase trail when the artifact body aborts before its first chunk', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-node-download-phase-test-'));
+    dirs.push(root);
+    const bytes = Buffer.from('unread artifact');
+    const fetchImpl = (async (url: string) => {
+      if (url.includes('asset=')) return new Response(null, { status: 404 });
+      return new Response(new ReadableStream<Uint8Array>({
+        pull(controller) {
+          controller.error(new Error('simulated_body_read_abort'));
+        },
+      }), {
+        status: 200,
+        headers: {
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: createHash('sha256').update(bytes).digest('hex'),
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(bytes.length),
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: 'imcodes-node.exe',
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.9.1',
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256]: WINDOWS_SIGNER_SHA256,
+        },
+      });
+    }) as unknown as typeof fetch;
+
+    await expect(startControlledNodeSelfUpgrade(credential, '2026.9.1', {
+      fetchImpl,
+      platform: 'win32',
+      arch: 'x64',
+      execPath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe',
+      tmpdir: () => root,
+      removeUpgradeDir: async () => {},
+    })).rejects.toThrow('simulated_body_read_abort');
+
+    const stagingDirs = await readdir(root);
+    expect(stagingDirs).toHaveLength(1);
+    const progress = (await readFile(join(
+      root,
+      stagingDirs[0]!,
+      CONTROLLED_NODE_UPGRADE_PROGRESS_FILE,
+    ), 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as { phase: string });
+    expect(progress.map(({ phase }) => phase)).toEqual([
+      'staging_created',
+      'artifact_request_started',
+      'artifact_response_open',
+    ]);
   });
 
   it('downloads the Windows remote-desktop worker only with its matching pinned manifest', async () => {
@@ -211,6 +456,7 @@ describe('controlled-node self-upgrade', () => {
       installId: 'install-1',
       nodeTokenHash: 'a'.repeat(64),
       sourceExePath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe',
+      sourceArtifact: { sha256: 'a'.repeat(64), size: 2048 },
       stagedExePath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe',
       stagedReceipt: {
         path: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe',
@@ -291,8 +537,49 @@ describe('controlled-node self-upgrade', () => {
     ) as { artifact: { authenticodeSignerSha256?: string } };
     expect(stagedManifest.artifact.authenticodeSignerSha256).toBe(WINDOWS_SIGNER_SHA256);
     const script = await readFile(result.scriptPath!, 'utf8');
+    expect(script).toContain("targetVersion = '2026.7.1'");
+    expect(script).toContain(`artifactSha256 = '${sha256}'`);
+    const ownershipMarkerPath = join(dirname(result.scriptPath!), CONTROLLED_NODE_UPGRADE_OWNERSHIP_MARKER);
+    const ownershipMarker = JSON.parse(await readFile(ownershipMarkerPath, 'utf8')) as {
+      directoryName: string;
+      ownerToken: string;
+      pid: number;
+    };
+    expect(ownershipMarker.directoryName).toBe(dirname(result.scriptPath!).split('/').at(-1));
+    expect(ownershipMarker.pid).toBe(process.pid);
+    expect(script).toContain(`$stagingOwnershipMarker = '${ownershipMarkerPath}'`);
+    expect(script).toContain(`$stagingOwnerToken = '${ownershipMarker.ownerToken}'`);
+    expect(script).toContain('$stagingMarkerState.pid = $PID');
+    const progress = (await readFile(join(
+      dirname(result.scriptPath!),
+      CONTROLLED_NODE_UPGRADE_PROGRESS_FILE,
+    ), 'utf8')).trim().split('\n').map((line) => JSON.parse(line) as { phase: string });
+    expect(progress.map(({ phase }) => phase)).toEqual([
+      'staging_created',
+      'artifact_request_started',
+      'artifact_response_open',
+      'artifact_first_chunk',
+      'artifact_body_complete',
+      'artifact_verified',
+      'artifact_published',
+      'handoff_ready',
+    ]);
+    expect(script.indexOf('$stagingMarkerState.pid = $PID'))
+      .toBeLessThan(script.indexOf('Get-AuthenticodeSignature -LiteralPath $src'));
     expect(script).toContain('Stop-ScheduledTask');
     expect(script).toContain('Start-ScheduledTask');
+    expect(script).toContain('$waitForNodeExecutableRelease = { param([int]$timeoutMs = 30000)');
+    expect(script).toContain("[IO.FileShare]::None");
+    expect(script).toContain("throw 'controlled node executable remained locked after stop'");
+    expect(script.indexOf('& $waitForNodeExecutableRelease'))
+      .toBeLessThan(script.indexOf('Copy-Item -Force $src $dst'));
+    expect(script).toContain("$rollbackExecutableReleased = [bool](& $runRecovery 'stop_new_node' { Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue; & $waitForNodeExecutableRelease; return $true })");
+    const rollbackReleaseGuard = script.indexOf('if ($rollbackExecutableReleased) {');
+    const rollbackMainRestore = script.indexOf("& $runRecovery 'restore_main'");
+    const rollbackSkip = script.indexOf('restore_artifacts: skipped because the controlled node executable release fence failed');
+    expect(rollbackReleaseGuard).toBeGreaterThan(script.indexOf('$rollbackExecutableReleased = [bool]'));
+    expect(rollbackMainRestore).toBeGreaterThan(rollbackReleaseGuard);
+    expect(rollbackSkip).toBeGreaterThan(rollbackMainRestore);
     expect(script).toContain("$upgradeMarker = Join-Path (Split-Path -Parent $dst) 'upgrade-in-progress.json'");
     expect(script).not.toContain('Disable-ScheduledTask -TaskName $watchdogTask');
     expect(script).not.toContain('Stop-ScheduledTask -TaskName $watchdogTask');
@@ -353,6 +640,7 @@ describe('controlled-node self-upgrade', () => {
       scheduleWindowsUpgrade,
     })).rejects.toThrow('download_failed_503');
     expect(scheduleWindowsUpgrade).not.toHaveBeenCalled();
+    expect(await readdir(dir)).toEqual([]);
   });
 
   it('rejects artifact checksum mismatches before spawning', async () => {
@@ -375,6 +663,398 @@ describe('controlled-node self-upgrade', () => {
       spawnDetached: spawned,
     })).rejects.toThrow(/artifact_sha256_mismatch/);
     expect(spawned).not.toHaveBeenCalled();
+    expect(await readdir(dir)).toEqual([]);
+  });
+
+  it('best-effort removes its staging directory on download failure without masking the authoritative error', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-self-upgrade-download-cleanup-'));
+    dirs.push(root);
+    const diagnostics: Array<{ outcome: string; code: string }> = [];
+    await expect(startControlledNodeSelfUpgrade(credential, '2026.7.1', {
+      fetchImpl: (async () => new Response(null, { status: 503 })) as unknown as typeof fetch,
+      platform: 'win32',
+      arch: 'x64',
+      tmpdir: () => root,
+      removeUpgradeDir: async () => {
+        const error = new Error('disk is full') as NodeJS.ErrnoException;
+        error.code = 'ENOSPC';
+        throw error;
+      },
+      onCleanupDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    })).rejects.toThrow('download_failed_503');
+    expect(diagnostics).toContainEqual(expect.objectContaining({ outcome: 'failed', code: 'ENOSPC' }));
+    expect(diagnostics.map((entry) => JSON.stringify(entry)).join('\n')).not.toContain(root);
+  });
+
+  it.each([
+    ['upgrade marker write', 'marker_write_failed'],
+    ['upgrade script write', 'script_write_failed'],
+    ['upgrade XML write', 'xml_write_failed'],
+    ['schtasks Create', 'create_failed'],
+    ['schtasks Run', 'run_failed'],
+  ] as const)('removes its owned staging directory when %s fails before handoff', async (failurePoint, expectedError) => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-self-upgrade-handoff-cleanup-'));
+    dirs.push(root);
+    await expect(startControlledNodeSelfUpgrade(credential, '2026.7.1', {
+      fetchImpl: createWindowsUpgradeFetch(),
+      platform: 'win32',
+      arch: 'x64',
+      execPath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe',
+      tmpdir: () => root,
+      writeUpgradeFile: async (path, data, options) => {
+        if (failurePoint === 'upgrade marker write' && path.endsWith(CONTROLLED_NODE_UPGRADE_OWNERSHIP_MARKER)) throw new Error(expectedError);
+        if (failurePoint === 'upgrade script write' && path.endsWith('upgrade.ps1')) throw new Error(expectedError);
+        if (failurePoint === 'upgrade XML write' && path.endsWith('upgrade-task.xml')) throw new Error(expectedError);
+        await writeFile(path, data, options);
+      },
+      scheduleWindowsUpgrade: (taskName, taskXmlPath) => {
+        scheduleWindowsControlledNodeUpgrade(taskName, taskXmlPath, (_file, args) => {
+          if (failurePoint === 'schtasks Create' && args[0] === '/Create') throw new Error(expectedError);
+          if (failurePoint === 'schtasks Run' && args[0] === '/Run') throw new Error(expectedError);
+        });
+      },
+    })).rejects.toThrow(expectedError);
+    expect(await readdir(root)).toEqual([]);
+  });
+
+  it('removes its staging directory when journal preparation fails closed', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-self-upgrade-journal-cleanup-'));
+    dirs.push(root);
+    const journalPath = join(root, 'install-journal.json');
+    await writeFile(journalPath, '{not-json');
+    await expect(startControlledNodeSelfUpgrade(credential, '2026.7.1', {
+      fetchImpl: createWindowsUpgradeFetch(),
+      platform: 'win32',
+      arch: 'x64',
+      execPath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe',
+      journalPath,
+      tmpdir: () => root,
+    })).rejects.toThrow('install journal JSON is invalid');
+    expect(await readdir(root)).toEqual(['install-journal.json']);
+  });
+
+  it('emits ownership-bound helper cleanup from preflight and terminal finally paths', () => {
+    const script = buildWindowsControlledNodeUpgradeScript({
+      stagedArtifactPath: 'C:\\Windows\\Temp\\imcodes-node-upgrade-ABC123\\imcodes-node.exe',
+      stagedManifestPath: 'C:\\Windows\\Temp\\imcodes-node-upgrade-ABC123\\imcodes-node.exe.manifest.json',
+      destinationPath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe',
+      destinationManifestPath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe.manifest.json',
+      upgradeTaskName: 'imcodes-node-upgrade-test',
+      stagingOwnership: {
+        directoryPath: 'C:\\Windows\\Temp\\imcodes-node-upgrade-ABC123',
+        markerPath: 'C:\\Windows\\Temp\\imcodes-node-upgrade-ABC123\\.imcodes-controlled-node-upgrade.json',
+        ownerToken: '12345678-1234-4123-8123-123456789abc',
+      },
+    });
+    expect(script.match(/Remove-Item -LiteralPath \$stagingDir -Recurse -Force -ErrorAction Stop/g)).toHaveLength(2);
+    expect(script).toContain("$stagingItem.Name -cnotmatch '^imcodes-node-upgrade-");
+    expect(script).toContain('$stagingItem.Attributes -band [IO.FileAttributes]::ReparsePoint');
+    expect(script).toContain('[string]$stagingMarker.ownerToken -cne $stagingOwnerToken');
+    expect(script).toContain('$stagingMarkerState.pid = $PID');
+    const finallyStart = script.lastIndexOf('} finally {');
+    const finalCleanup = script.indexOf('Remove-Item -LiteralPath $stagingDir', finallyStart);
+    expect(finallyStart).toBeGreaterThan(script.indexOf("status = 'success'"));
+    expect(finallyStart).toBeGreaterThan(script.indexOf('$rollbackStatus ='));
+    expect(script.indexOf("Unregister-ScheduledTask -TaskName 'imcodes-node-upgrade-test'", finallyStart))
+      .toBeLessThan(finalCleanup);
+  });
+
+  it('persists bounded Windows handoff evidence before owned staging cleanup', () => {
+    const script = buildWindowsControlledNodeUpgradeScript({
+      stagedArtifactPath: 'C:\\Windows\\Temp\\imcodes-node-upgrade-ABC123\\imcodes-node.exe',
+      stagedManifestPath: 'C:\\Windows\\Temp\\imcodes-node-upgrade-ABC123\\imcodes-node.exe.manifest.json',
+      destinationPath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe',
+      destinationManifestPath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe.manifest.json',
+      targetVersion: '2026.9.9999',
+      artifactSha256: 'd'.repeat(64),
+      upgradeTaskName: 'imcodes-node-upgrade-test',
+      stagingOwnership: {
+        directoryPath: 'C:\\Windows\\Temp\\imcodes-node-upgrade-ABC123',
+        markerPath: 'C:\\Windows\\Temp\\imcodes-node-upgrade-ABC123\\.imcodes-controlled-node-upgrade.json',
+        ownerToken: '12345678-1234-4123-8123-123456789abc',
+      },
+    });
+
+    expect(script).toContain("$persistentUpgradeResult = Join-Path (Split-Path -Parent $dst) 'last-upgrade-result.json'");
+    expect(script).toContain("targetVersion = '2026.9.9999'");
+    expect(script).toContain("artifactSha256 = 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'");
+    expect(script).toContain("if ('dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd' -and $srcHash -cne 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd')");
+    expect(script).toContain('mainArtifactVerified = [bool]$mainArtifactVerified');
+    expect(script).toContain('helperArtifactVerified = [bool]$helperArtifactVerified');
+    expect(script).toContain('remoteDesktopArtifactVerified = [bool]$remoteDesktopArtifactVerified');
+    expect(script).toContain('$persistentUpgradeResultTemp = "$persistentUpgradeResult.pending-$PID"');
+    expect(script).toContain('Move-Item -Force -LiteralPath $persistentUpgradeResultTemp -Destination $persistentUpgradeResult');
+    expect(script).toContain("status = 'preflight_failed'; phase = 'preflight'");
+    expect(script).toContain("status = 'success'; phase = 'complete'");
+    expect(script).toContain("status = $rollbackStatus; phase = 'rollback'");
+    expect(script.match(/error = \$failureMessage/g)).toHaveLength(3);
+    expect(script.match(/failedPhase = \$upgradePhase/g)).toHaveLength(2);
+    expect(script).toContain("$upgradePhase = 'restart_health'");
+    expect(script).toContain('if ($recoveryFailure.Length -gt 240)');
+    const preflightPersist = script.indexOf("status = 'preflight_failed'; phase = 'preflight'");
+    const preflightCleanup = script.indexOf('Remove-Item -LiteralPath $stagingDir', preflightPersist);
+    expect(preflightPersist).toBeGreaterThan(0);
+    expect(preflightCleanup).toBeGreaterThan(preflightPersist);
+    expect(script).toContain("if (-not $upgradeResultPersisted) { Write-Warning 'IMCODES_UPGRADE_CLEANUP_SKIPPED phase=helper_finally code=result_not_persisted'");
+  });
+
+  it('scavenges only old direct owned non-reparse staging directories and preserves live/new/unowned entries', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-self-upgrade-scavenge-'));
+    dirs.push(root);
+    const now = Date.now();
+    const old = now - CONTROLLED_NODE_UPGRADE_STALE_AFTER_MS - 60_000;
+    const stale = await createOwnedUpgradeDir({ root, suffix: 'stale01', createdAt: old, bom: true });
+    const recent = await createOwnedUpgradeDir({ root, suffix: 'recent1', createdAt: now - 1_000 });
+    const live = await createOwnedUpgradeDir({ root, suffix: 'active1', createdAt: old, pid: process.pid });
+    const unowned = await createOwnedUpgradeDir({ root, suffix: 'nomark1', createdAt: old, marker: false });
+    const wrongPrefix = join(root, 'other-product-upgrade-stale01');
+    await mkdir(wrongPrefix);
+    const external = join(root, 'external-target');
+    await mkdir(external);
+    await writeFile(join(external, 'keep.txt'), 'keep');
+    const linked = join(root, `${CONTROLLED_NODE_UPGRADE_DIR_PREFIX}linked1`);
+    await symlink(external, linked, 'dir');
+
+    const diagnostics: Array<{ outcome: string; code: string }> = [];
+    const removed = await scavengeStaleControlledNodeUpgradeDirs(root, {
+      now: () => now,
+      uptime: () => 30 * 24 * 60 * 60,
+      isProcessAlive: (pid) => pid === process.pid,
+      onCleanupDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    });
+    expect(removed).toBe(1);
+    await expect(readFile(join(stale, CONTROLLED_NODE_UPGRADE_OWNERSHIP_MARKER))).rejects.toThrow();
+    expect((await readdir(root)).sort()).toEqual([
+      'external-target',
+      `${CONTROLLED_NODE_UPGRADE_DIR_PREFIX}active1`,
+      `${CONTROLLED_NODE_UPGRADE_DIR_PREFIX}linked1`,
+      `${CONTROLLED_NODE_UPGRADE_DIR_PREFIX}nomark1`,
+      `${CONTROLLED_NODE_UPGRADE_DIR_PREFIX}recent1`,
+      'other-product-upgrade-stale01',
+    ].sort());
+    expect(await readFile(join(external, 'keep.txt'), 'utf8')).toBe('keep');
+    expect(await readFile(join(recent, CONTROLLED_NODE_UPGRADE_OWNERSHIP_MARKER), 'utf8')).toContain('recent1');
+    expect(await readFile(join(live, CONTROLLED_NODE_UPGRADE_OWNERSHIP_MARKER), 'utf8')).toContain('active1');
+    expect(await readdir(unowned)).toEqual([]);
+    expect(diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ outcome: 'skipped', code: 'pid_alive' }),
+      expect.objectContaining({ outcome: 'skipped', code: 'marker_missing' }),
+    ]));
+  });
+
+  it('deletes a pre-boot staging directory even when its recorded pid was reused', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-self-upgrade-scavenge-preboot-'));
+    dirs.push(root);
+    const now = Date.now();
+    const candidate = await createOwnedUpgradeDir({
+      root,
+      suffix: 'preboot1',
+      createdAt: now - (2 * CONTROLLED_NODE_UPGRADE_STALE_AFTER_MS),
+      pid: 2_805_176,
+    });
+    const isProcessAlive = vi.fn(() => true);
+
+    const removed = await scavengeStaleControlledNodeUpgradeDirs(root, {
+      now: () => now,
+      uptime: () => 24 * 60 * 60,
+      isProcessAlive,
+    });
+
+    expect(removed).toBe(1);
+    expect(isProcessAlive).not.toHaveBeenCalled();
+    await expect(lstat(candidate)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('deletes staging beyond the absolute TTL even when the system and pid stayed alive', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-self-upgrade-scavenge-ttl-'));
+    dirs.push(root);
+    const now = Date.now();
+    const candidate = await createOwnedUpgradeDir({
+      root,
+      suffix: 'expired1',
+      createdAt: now - CONTROLLED_NODE_UPGRADE_ABSOLUTE_TTL_MS - 1,
+      pid: 4,
+    });
+    const isProcessAlive = vi.fn(() => true);
+
+    const removed = await scavengeStaleControlledNodeUpgradeDirs(root, {
+      now: () => now,
+      uptime: () => 30 * 24 * 60 * 60,
+      isProcessAlive,
+    });
+
+    expect(removed).toBe(1);
+    expect(isProcessAlive).not.toHaveBeenCalled();
+    await expect(lstat(candidate)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('fails open when stale cleanup cannot remove an owned directory and emits only a structured code', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-self-upgrade-scavenge-failure-'));
+    dirs.push(root);
+    const now = Date.now();
+    const stale = await createOwnedUpgradeDir({
+      root,
+      suffix: 'stale02',
+      createdAt: now - CONTROLLED_NODE_UPGRADE_STALE_AFTER_MS - 60_000,
+    });
+    const diagnostics: Array<{ outcome: string; code: string }> = [];
+    const removed = await scavengeStaleControlledNodeUpgradeDirs(root, {
+      now: () => now,
+      isProcessAlive: () => false,
+      removeUpgradeDir: async () => {
+        const error = new Error('secret filesystem detail') as NodeJS.ErrnoException;
+        error.code = 'ENOSPC';
+        throw error;
+      },
+      onCleanupDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    });
+    expect(removed).toBe(0);
+    expect(await readFile(join(stale, CONTROLLED_NODE_UPGRADE_OWNERSHIP_MARKER), 'utf8')).toContain('stale02');
+    expect(diagnostics).toEqual([expect.objectContaining({ outcome: 'failed', code: 'ENOSPC' })]);
+    expect(JSON.stringify(diagnostics)).not.toContain('secret filesystem detail');
+    expect(JSON.stringify(diagnostics)).not.toContain(root);
+  });
+
+  it('hard-bounds directory iteration, lstat, marker reads, and deletes in a crowded Temp root', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-self-upgrade-scavenge-bounds-'));
+    dirs.push(root);
+    const now = Date.now();
+    const old = now - CONTROLLED_NODE_UPGRADE_STALE_AFTER_MS - 60_000;
+    for (let index = 0; index < 192; index += 1) {
+      await createOwnedUpgradeDir({ root, suffix: `bulk${String(index).padStart(4, '0')}`, createdAt: old });
+    }
+    const operations = { enumerate: 0, lstat: 0, marker_read: 0, delete: 0 };
+    const removed = await scavengeStaleControlledNodeUpgradeDirs(root, {
+      now: () => now,
+      uptime: () => 30 * 24 * 60 * 60,
+      isProcessAlive: () => true,
+      onStaleScavengeOperation: (operation) => { operations[operation] += 1; },
+    });
+    expect(removed).toBe(0);
+    expect(operations).toEqual({ enumerate: 128, lstat: 128, marker_read: 64, delete: 0 });
+    expect((await readdir(root))).toHaveLength(192);
+  });
+
+  it('uses a streaming directory iterator rather than eagerly materializing Windows Temp', async () => {
+    const source = await readFile(join(process.cwd(), 'src/node/self-upgrade.ts'), 'utf8');
+    expect(source).toContain('const directory = await opendir(canonicalRoot)');
+    expect(source).toContain('for await (const entry of directory)');
+    expect(source).not.toMatch(/await readdir\((?:tempRoot|canonicalRoot)/);
+  });
+
+  it('deletes at most 32 fully-qualified stale candidates per upgrade attempt', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-self-upgrade-scavenge-delete-bound-'));
+    dirs.push(root);
+    const now = Date.now();
+    const old = now - CONTROLLED_NODE_UPGRADE_STALE_AFTER_MS - 60_000;
+    for (let index = 0; index < 40; index += 1) {
+      await createOwnedUpgradeDir({ root, suffix: `stale${String(index).padStart(2, '0')}`, createdAt: old });
+    }
+    const operations: string[] = [];
+    const removed = await scavengeStaleControlledNodeUpgradeDirs(root, {
+      now: () => now,
+      isProcessAlive: () => false,
+      onStaleScavengeOperation: (operation) => operations.push(operation),
+    });
+    expect(removed).toBe(32);
+    expect(operations.filter((operation) => operation === 'delete')).toHaveLength(32);
+    expect(await readdir(root)).toHaveLength(8);
+  });
+
+  it('counts failed stale removals against the 32-attempt budget and continues the upgrade', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-self-upgrade-scavenge-failed-delete-bound-'));
+    dirs.push(root);
+    const now = Date.now();
+    const old = now - CONTROLLED_NODE_UPGRADE_STALE_AFTER_MS - 60_000;
+    for (let index = 0; index < 40; index += 1) {
+      await createOwnedUpgradeDir({ root, suffix: `failed${String(index).padStart(2, '0')}`, createdAt: old });
+    }
+    const operations = { enumerate: 0, lstat: 0, marker_read: 0, delete: 0 };
+    const diagnostics: Array<{ outcome: string; code: string }> = [];
+    let removeCalls = 0;
+    const scheduleWindowsUpgrade = vi.fn();
+    const result = await startControlledNodeSelfUpgrade(credential, '2026.7.1', {
+      fetchImpl: createWindowsUpgradeFetch(),
+      platform: 'win32',
+      arch: 'x64',
+      execPath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe',
+      tmpdir: () => root,
+      now: () => now,
+      isProcessAlive: () => false,
+      removeUpgradeDir: async () => {
+        removeCalls += 1;
+        const error = new Error('unbounded private filesystem detail') as NodeJS.ErrnoException;
+        error.code = 'ENOSPC';
+        throw error;
+      },
+      onStaleScavengeOperation: (operation) => { operations[operation] += 1; },
+      onCleanupDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+      scheduleWindowsUpgrade,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(scheduleWindowsUpgrade).toHaveBeenCalledOnce();
+    expect(removeCalls).toBe(32);
+    expect(operations.delete).toBe(32);
+    expect(operations.enumerate).toBeLessThanOrEqual(128);
+    expect(operations.lstat).toBeLessThanOrEqual(128);
+    expect(operations.marker_read).toBeLessThanOrEqual(64);
+    expect(diagnostics.filter((diagnostic) => diagnostic.outcome === 'failed')).toEqual(Array.from({ length: 32 }, () => expect.objectContaining({
+      outcome: 'failed',
+      code: 'ENOSPC',
+    })));
+    expect(diagnostics).toContainEqual(expect.objectContaining({ outcome: 'skipped', code: 'budget_exhausted' }));
+    expect(JSON.stringify(diagnostics)).not.toContain('unbounded private filesystem detail');
+    expect(JSON.stringify(diagnostics)).not.toContain(root);
+    expect(await readdir(root)).toHaveLength(41);
+  });
+
+  it.each([
+    'freshened directory',
+    'revived owner',
+    'changed marker',
+    'replacement reparse point',
+  ] as const)('refuses a stale candidate whose %s changes before final adjacent revalidation', async (mutation) => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-self-upgrade-scavenge-race-'));
+    dirs.push(root);
+    const now = Date.now();
+    const old = now - CONTROLLED_NODE_UPGRADE_STALE_AFTER_MS - 60_000;
+    const candidate = await createOwnedUpgradeDir({ root, suffix: 'racing1', createdAt: old });
+    const external = join(root, 'external-race-target');
+    await mkdir(external);
+    await writeFile(join(external, 'keep.txt'), 'keep');
+    let livenessChecks = 0;
+    const removed = await scavengeStaleControlledNodeUpgradeDirs(root, {
+      now: () => now,
+      uptime: () => 30 * 24 * 60 * 60,
+      isProcessAlive: () => {
+        livenessChecks += 1;
+        return mutation === 'revived owner' && livenessChecks > 1;
+      },
+      beforeStaleCandidateRevalidation: async (candidatePath) => {
+        expect(candidatePath).toBe(candidate);
+        if (mutation === 'freshened directory') {
+          const fresh = new Date(now);
+          await utimes(candidate, fresh, fresh);
+        } else if (mutation === 'changed marker') {
+          const markerPath = join(candidate, CONTROLLED_NODE_UPGRADE_OWNERSHIP_MARKER);
+          const marker = JSON.parse(await readFile(markerPath, 'utf8')) as { ownerToken: string };
+          marker.ownerToken = '87654321-4321-4432-8432-cba987654321';
+          await writeFile(markerPath, `${JSON.stringify(marker)}\n`);
+          const oldTime = new Date(old);
+          await utimes(markerPath, oldTime, oldTime);
+        } else if (mutation === 'replacement reparse point') {
+          await rm(candidate, { recursive: true, force: true });
+          await symlink(external, candidate, 'dir');
+        }
+      },
+    });
+    expect(removed).toBe(0);
+    if (mutation === 'replacement reparse point') {
+      expect(await readFile(join(external, 'keep.txt'), 'utf8')).toBe('keep');
+    } else {
+      expect(await readdir(candidate)).toContain(CONTROLLED_NODE_UPGRADE_OWNERSHIP_MARKER);
+    }
   });
 
   it('rejects an artifact whose embedded version cannot satisfy the requested upgrade', async () => {
@@ -548,6 +1228,18 @@ describe('controlled-node self-upgrade', () => {
       file: 'schtasks.exe',
       args: ['/Delete', '/TN', 'upgrade-fail', '/F'],
     });
+
+    const cleanupFailures: unknown[] = [];
+    expect(() => scheduleWindowsControlledNodeUpgrade('upgrade-fail-delete', 'C:\\tmp\\upgrade.xml', (_file, args) => {
+      if (args[0] === '/Run') throw new Error('authoritative run failure');
+      if (args[0] === '/Delete') {
+        const error = new Error('task cleanup failed') as NodeJS.ErrnoException;
+        error.code = 'EACCES';
+        throw error;
+      }
+    }, (error) => cleanupFailures.push(error))).toThrow('authoritative run failure');
+    expect(cleanupFailures).toHaveLength(1);
+    expect((cleanupFailures[0] as NodeJS.ErrnoException).code).toBe('EACCES');
   });
 
   it('starts Linux replacement in a transient unit outside the node service cgroup', () => {
@@ -668,7 +1360,13 @@ describe('controlled-node self-upgrade', () => {
         'function Get-CimInstance { param($ClassName, $Filter); @() }',
         generated,
       ].join('\r\n'));
-      await execFileAsync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', harnessPath], { timeout: 30_000 });
+      const lockHolder = await holdWindowsFileLock(destinationPath, dir, 1500);
+      try {
+        await execFileAsync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', harnessPath], { timeout: 30_000 });
+        if (lockHolder.exitCode === null) await once(lockHolder, 'exit');
+      } finally {
+        if (lockHolder.exitCode === null) lockHolder.kill();
+      }
     } else {
       const binDir = join(dir, 'bin');
       await mkdir(binDir);
@@ -709,5 +1407,103 @@ describe('controlled-node self-upgrade', () => {
       expect(serviceLog).toContain('stop');
       expect(serviceLog).toContain('start');
     }
+  });
+
+  it.runIf(process.platform === 'win32')('restores after a transient rollback lock and preserves bytes after a permanent lock timeout', async () => {
+    const runRollbackLockCase = async (name: string, releaseTimeoutMs: number, lockDurationMs: number) => {
+      const dir = await mkdtemp(join(tmpdir(), `imcodes-native-upgrade-rollback-${name}-`));
+      dirs.push(dir);
+      const destinationPath = join(dir, 'imcodes-node.exe');
+      const destinationManifestPath = `${destinationPath}.manifest.json`;
+      const backupPath = `${destinationPath}.upgrade-old`;
+      const backupManifestPath = `${destinationManifestPath}.upgrade-old`;
+      const stagedArtifactPath = join(dir, 'staged-node.exe');
+      const stagedManifestPath = `${stagedArtifactPath}.manifest.json`;
+      const outcomePath = join(dir, 'outcome.json');
+      await writeFile(destinationPath, 'new-native-artifact');
+      await writeFile(destinationManifestPath, 'new-native-manifest');
+      await writeFile(backupPath, 'old-native-artifact');
+      await writeFile(backupManifestPath, 'old-native-manifest');
+
+      const generated = buildWindowsControlledNodeUpgradeScript({
+        stagedArtifactPath,
+        stagedManifestPath,
+        destinationPath,
+        destinationManifestPath,
+      });
+      const supportStart = generated.indexOf('$recoveryFailures =');
+      const supportSentinel = "  throw 'controlled node executable remained locked after stop'\r\n}\r\n";
+      const supportEnd = generated.indexOf(supportSentinel, supportStart) + supportSentinel.length;
+      const rollbackStart = generated.indexOf('$rollbackExecutableReleased = [bool]');
+      const rollbackEnd = generated.indexOf('$rollbackStatus =', rollbackStart);
+      expect(supportStart).toBeGreaterThanOrEqual(0);
+      expect(supportEnd).toBeGreaterThan(supportStart);
+      expect(rollbackStart).toBeGreaterThan(supportEnd);
+      expect(rollbackEnd).toBeGreaterThan(rollbackStart);
+      const support = generated.slice(supportStart, supportEnd)
+        .replace('param([int]$timeoutMs = 30000)', `param([int]$timeoutMs = ${releaseTimeoutMs})`);
+      const rollback = generated.slice(rollbackStart, rollbackEnd);
+      const oldHash = createHash('sha256').update('old-native-artifact').digest('hex');
+      const oldManifestHash = createHash('sha256').update('old-native-manifest').digest('hex');
+      const quote = (value: string): string => value.replaceAll("'", "''");
+      const harnessPath = join(dir, 'rollback-lock-harness.ps1');
+      await writeFile(harnessPath, [
+        "$ErrorActionPreference = 'Stop'",
+        `$task = 'imcodes-node'`,
+        `$dst = '${quote(destinationPath)}'`,
+        `$dstManifest = '${quote(destinationManifestPath)}'`,
+        `$backupDst = '${quote(backupPath)}'`,
+        `$backupManifest = '${quote(backupManifestPath)}'`,
+        `$currentMainHash = '${oldHash}'`,
+        `$currentManifestHash = '${oldManifestHash}'`,
+        '$mainBackedUp = $true',
+        '$mainPublished = $true',
+        '$manifestBackedUp = $true',
+        '$manifestPublished = $true',
+        'function Stop-ScheduledTask { param($TaskName, $ErrorAction) }',
+        'function Get-CimInstance { param($ClassName, $Filter, $ErrorAction); @() }',
+        support,
+        rollback,
+        `[pscustomobject]@{ released = $rollbackExecutableReleased; failures = @($recoveryFailures) } | ConvertTo-Json -Compress | Set-Content -LiteralPath '${quote(outcomePath)}' -Encoding utf8`,
+      ].join('\r\n'));
+
+      const lockHolder = await holdWindowsFileLock(destinationPath, dir, lockDurationMs);
+      try {
+        await execFileAsync('powershell.exe', [
+          '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', harnessPath,
+        ], { timeout: 10_000 });
+      } finally {
+        if (lockHolder.exitCode === null) lockHolder.kill();
+      }
+      const outcome = JSON.parse((await readFile(outcomePath, 'utf8')).replace(/^\uFEFF/, '')) as {
+        released: boolean;
+        failures: string[];
+      };
+      return {
+        outcome,
+        executable: await readFile(destinationPath, 'utf8'),
+        manifest: await readFile(destinationManifestPath, 'utf8'),
+      };
+    };
+
+    const transient = await runRollbackLockCase('transient', 3000, 500);
+    expect(transient).toEqual({
+      outcome: { released: true, failures: [] },
+      executable: 'old-native-artifact',
+      manifest: 'old-native-manifest',
+    });
+
+    const permanent = await runRollbackLockCase('permanent', 250, 1500);
+    expect(permanent).toEqual({
+      outcome: {
+        released: false,
+        failures: [
+          'stop_new_node: controlled node executable remained locked after stop',
+          'restore_artifacts: skipped because the controlled node executable release fence failed',
+        ],
+      },
+      executable: 'new-native-artifact',
+      manifest: 'new-native-manifest',
+    });
   });
 });

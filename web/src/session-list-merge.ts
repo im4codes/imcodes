@@ -62,11 +62,15 @@ export interface IncomingSessionListEntry {
   quotaLabel?: string | null;
   quotaUsageLabel?: string | null;
   quotaMeta?: SessionInfo['quotaMeta'];
+  codexCreditsBalance?: SessionInfo['codexCreditsBalance'];
+  codexCreditsHasCredits?: SessionInfo['codexCreditsHasCredits'];
+  codexCreditsUnlimited?: SessionInfo['codexCreditsUnlimited'];
   effort?: SessionInfo['effort'];
   serviceTier?: SessionInfo['serviceTier'];
   contextNamespace?: SessionInfo['contextNamespace'];
   contextNamespaceDiagnostics?: string[];
   transportConfig?: Record<string, unknown> | null;
+  supervisionMode?: SessionInfo['supervisionMode'];
   transportPendingMessages?: unknown;
   transportPendingMessageEntries?: unknown;
   pendingMessageEntries?: unknown;
@@ -174,6 +178,9 @@ export function mergeSessionListEntry(
     quotaLabel: incoming.quotaLabel ?? (preservesProviderQuota ? existing?.quotaLabel : undefined),
     quotaUsageLabel: incoming.quotaUsageLabel ?? (preservesProviderQuota ? existing?.quotaUsageLabel : undefined),
     quotaMeta: incoming.quotaMeta ?? (preservesProviderQuota ? existing?.quotaMeta : undefined),
+    codexCreditsBalance: incoming.codexCreditsBalance ?? (preservesProviderQuota ? existing?.codexCreditsBalance : undefined),
+    codexCreditsHasCredits: incoming.codexCreditsHasCredits ?? (preservesProviderQuota ? existing?.codexCreditsHasCredits : undefined),
+    codexCreditsUnlimited: incoming.codexCreditsUnlimited ?? (preservesProviderQuota ? existing?.codexCreditsUnlimited : undefined),
     effort: incoming.effort ?? existing?.effort,
     serviceTier: incoming.serviceTier ?? existing?.serviceTier,
     contextNamespace: incoming.contextNamespace ?? existing?.contextNamespace,
@@ -182,6 +189,9 @@ export function mergeSessionListEntry(
       incoming.transportConfig,
       existing?.transportConfig,
     ),
+    supervisionMode: incoming.supervisionMode !== undefined
+      ? incoming.supervisionMode
+      : existing?.supervisionMode,
     transportPendingMessages: nextPendingMessages,
     transportPendingMessageEntries: nextPendingEntries,
     queueEpoch: hasPendingSyncPatch ? (pendingSyncPatch.queueEpoch ?? existing?.queueEpoch) : existing?.queueEpoch,

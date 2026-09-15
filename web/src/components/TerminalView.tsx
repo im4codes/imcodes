@@ -1,4 +1,5 @@
 import { useEffect, useRef, useCallback, useState } from 'preact/hooks';
+import { useCoalescedFrame } from '../hooks/useCoalescedFrame.js';
 import { Terminal } from 'xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import 'xterm/css/xterm.css';
@@ -105,16 +106,26 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
   // Only changed by real user scroll actions (onScroll), NOT by onLineFeed/writes.
   // This prevents intermediate xterm write states from corrupting the follow flag.
   const autoFollowRef = useRef(true);
-  // Count of in-progress term.write() calls. While > 0, onScroll must NOT update
-  // autoFollowRef — xterm fires onScroll internally during write (cursor-follow),
-  // which would corrupt the user's sticky intent.
-  const writingCountRef = useRef(0);
-  // True while a fit/resize is in progress — suppress scroll-up intent detection
-  // because fitAddon.fit() causes xterm buffer reflow which can fire onScroll
-  // with viewportY=0 even though the user never scrolled up.
-  const fittingRef = useRef(false);
+  // NOTE: two write-only refs used to live here. Nothing ever READ them, so
+  // they suppressed nothing while their comments claimed otherwise — which
+  // repeatedly misled freeze investigations. They are removed rather than
+  // "restored": rebuilding a scroll-intent guard from a stale comment risks
+  // swallowing real user scrolls, and that belongs in its own change with its
+  // own acceptance criteria.
 
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+
+  // Coalesced scroll-to-bottom for the diff data path. Repeat requests replace
+  // the pending frame instead of appending a new one, and the frame is
+  // cancelled on unmount. See useCoalescedFrame for the lock-screen rationale.
+  const scheduleFrame = useCoalescedFrame();
+  const scheduleScrollToBottom = useCallback(() => {
+    scheduleFrame(() => {
+      const term = termRef.current;
+      if (!term) return;
+      term.scrollToBottom();
+    });
+  }, [scheduleFrame]);
 
   // Scroll state: show button + progress bar when scrolled up
   const [scrolledUp, setScrolledUp] = useState(false);
@@ -140,9 +151,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
     const term = termRef.current;
     if (!term) return;
     lastRawWriteAtRef.current = Date.now();
-    writingCountRef.current++;
     term.write(data, () => {
-      writingCountRef.current--;
       // Snap to bottom after each PTY write. CC redraws its UI from cursor-home
       // (\x1b[H) which makes xterm follow the cursor to the top; snapping here
       // ensures the viewport stays at the bottom showing the latest output.
@@ -218,9 +227,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
         if (!activeRef.current) return;
         const el = containerRef.current;
         if (el && el.clientWidth > 0 && el.clientHeight > 0) {
-          fittingRef.current = true;
           fitAddon.fit();
-          requestFrame(() => { fittingRef.current = false; });
           fitDone = true;
         }
       };
@@ -232,9 +239,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
       fitTimer = setTimeout(() => {
         if (!activeRef.current) return;
         if (!fitDone) {
-          fittingRef.current = true;
           fitAddon.fit();
-          requestFrame(() => { fittingRef.current = false; });
           fitDone = true;
         }
       }, 400);
@@ -311,17 +316,55 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
     onScrollBottomFn?.(() => { autoFollowRef.current = true; term.scrollToBottom(); });
 
     // Expose fit function so parent can trigger resize on send / focus
-    const doFitAndSnap = () => {
-      if (!activeRef.current) return;
-      fittingRef.current = true;
+    // Applies a fit only when xterm's own proposed dimensions actually change.
+    // Comparing the container rect is not enough: font loading, zoom and DPR
+    // changes move the cell metrics while the rect stays identical, and the two
+    // observed elements report different rects for the same layout.
+    // `force` bypasses the equality check for resume/refocus, where one explicit
+    // fit is wanted even if the dimensions look unchanged.
+    const applyFit = (force = false): boolean => {
+      if (!activeRef.current) return false;
+      const el = containerRef.current;
+      // display:none ancestors report 0x0; fitting against that yields garbage
+      // dimensions, so skip entirely until the element is laid out again.
+      if (!el || el.clientWidth === 0 || el.clientHeight === 0) return false;
+      if (!force) {
+        const proposed = fitAddon.proposeDimensions();
+        if (!proposed || !Number.isFinite(proposed.cols) || !Number.isFinite(proposed.rows)) return false;
+        if (proposed.cols === term.cols && proposed.rows === term.rows) return false;
+      }
       fitAddon.fit();
-      // Use rAF so the reflow onScroll events fire before we clear fittingRef
-      requestFrame(() => {
-        fittingRef.current = false;
-        term.scrollToBottom();
-        autoFollowRef.current = true;
+      return true;
+    };
+
+    // At most one pending fit frame. A ResizeObserver can fire many times per
+    // frame (two observed targets, layout settling after unlock) and focus can
+    // fire repeatedly on unlock; queueing one callback per event is what turns a
+    // resume into a burst of forced layouts.
+    let pendingFitFrame: ReturnType<typeof requestFrame> | null = null;
+    let pendingFitForce = false;
+    const cancelPendingFit = () => {
+      if (pendingFitFrame === null) return;
+      if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(pendingFitFrame as number);
+      else clearTimeout(pendingFitFrame as ReturnType<typeof setTimeout>);
+      pendingFitFrame = null;
+    };
+    const scheduleFit = (force = false) => {
+      pendingFitForce = pendingFitForce || force;
+      if (pendingFitFrame !== null) return;
+      pendingFitFrame = requestFrame(() => {
+        pendingFitFrame = null;
+        const forceThisPass = pendingFitForce;
+        pendingFitForce = false;
+        if (applyFit(forceThisPass)) {
+          // Snap to bottom after fit (reflow can reset viewportY to 0)
+          term.scrollToBottom();
+          autoFollowRef.current = true;
+        }
       });
     };
+
+    const doFitAndSnap = () => { scheduleFit(true); };
     onFitFn?.(doFitAndSnap);
 
     // Re-fit when window regains focus or tab becomes visible.
@@ -332,23 +375,17 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
     window.addEventListener('focus', onWindowFocus);
     document.addEventListener('visibilitychange', onVisibilityChange);
 
-    const handleResize = (rect?: DOMRectReadOnly) => {
-      if (!activeRef.current) return;
-      // Skip when container is hidden (display:none → dimensions are 0)
-      if (!rect || rect.width === 0 || rect.height === 0) return;
-      fittingRef.current = true;
-      fitAddon.fit();
-      // Snap to bottom immediately after fit (reflow can reset viewportY to 0)
-      term.scrollToBottom();
-      autoFollowRef.current = true;
-      requestFrame(() => { fittingRef.current = false; });
-      // NOTE: do NOT repaint linesRef.current here — xterm reflows on resize natively,
-      // and repainting with stale diff buffer clobbers live PTY output (especially on mobile
-      // where viewport resizes frequently due to address bar / keyboard show/hide).
-    };
-
+    // NOTE: do NOT repaint linesRef.current on resize — xterm reflows natively,
+    // and repainting with a stale diff buffer clobbers live PTY output (especially
+    // on mobile where the viewport resizes on address bar / keyboard show/hide).
     const observer = new ResizeObserver((entries) => {
-      handleResize(entries[0]?.contentRect);
+      if (!activeRef.current) return;
+      // Every entry in the batch is considered, not just entries[0]: two targets
+      // are observed and the interesting one is not always first. An all-zero
+      // batch means a hidden ancestor — nothing to fit against.
+      const laidOut = entries.some((e) => e.contentRect.width > 0 && e.contentRect.height > 0);
+      if (!laidOut) return;
+      scheduleFit(false);
     });
     const containerEl = containerRef.current;
     if (containerEl) {
@@ -360,6 +397,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
 
     return () => {
       if (fitTimer) clearTimeout(fitTimer);
+      cancelPendingFit();
       discardPendingRaw();
       containerRef.current?.removeEventListener('paste', handlePaste, { capture: true });
       window.removeEventListener('focus', onWindowFocus);
@@ -451,9 +489,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
         if (i < linesRef.current.length - 1) buf += '\r\n';
       }
       buf += '\x1b[J';
-      writingCountRef.current++;
       term.write(buf, () => {
-        writingCountRef.current--;
         autoFollowRef.current = true;
         term.scrollToBottom();
       });
@@ -474,10 +510,16 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
     }
 
     // Always scroll to bottom on new content (fullFrame handles its own scroll internally).
-    if (!diff.fullFrame) {
-      requestFrame(() => term.scrollToBottom());
-    }
-  }, []);
+    //
+    // Single-flight. This is the highest-frequency frame scheduler in the
+    // component: one `terminal.diff` arrives per PTY update, and diffs keep
+    // arriving while the display is asleep because WebSocket messages are I/O,
+    // not throttled timers. `requestAnimationFrame` on the other hand does not
+    // run at all with no frames being produced, so a naive rAF-per-diff builds
+    // an unbounded backlog for the whole lock and the browser executes every
+    // one of them inside the first frame after unlock.
+    if (!diff.fullFrame) scheduleScrollToBottom();
+  }, [scheduleScrollToBottom]);
 
   const applyHistory = useCallback((content: string) => {
     if (!activeRef.current) return;

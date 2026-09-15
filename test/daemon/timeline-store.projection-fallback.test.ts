@@ -14,8 +14,16 @@ const projectionMocks = vi.hoisted(() => ({
   deleteSession: vi.fn(),
 }));
 
+class TimelineProjectionBusyErrorStub extends Error {
+  constructor() {
+    super('timeline_projection_busy');
+    this.name = 'TimelineProjectionBusyError';
+  }
+}
+
 vi.mock('../../src/daemon/timeline-projection.js', () => ({
   timelineProjection: projectionMocks,
+  TimelineProjectionBusyError: TimelineProjectionBusyErrorStub,
 }));
 
 vi.mock('../../src/util/logger.js', () => ({
@@ -210,5 +218,27 @@ describe('timeline-store SQLite-preferred reads', () => {
     ], sessionId);
     const latest = await timelineStore.getLatestPreferred(sessionId);
     expect(latest).toBeNull();
+  });
+});
+
+describe('timeline-store reports a busy projection as busy, not absent', () => {
+  it('maps a projection timeout to projection_busy so the caller cannot read it as absence', async () => {
+    // The command layer only runs the heavy main-thread path when the projection
+    // is genuinely ABSENT. If a saturated projection reports absence, saturation
+    // is answered with main-thread SQLite/synthesize/sanitize -- the incident.
+    projectionMocks.queryByTypes.mockRejectedValueOnce(new TimelineProjectionBusyErrorStub());
+    const { timelineStore } = await import('../../src/daemon/timeline-store.js');
+    const { TIMELINE_HISTORY_ERROR_REASONS } = await import('../../shared/timeline-history-errors.js');
+
+    await expect(timelineStore.readByTypesPreferred('deck_busy', ['assistant.text'], { limit: 10 }))
+      .rejects.toMatchObject({ reason: TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY });
+  });
+
+  it('still reports a genuinely unavailable projection as projection_unavailable', async () => {
+    projectionMocks.queryByTypes.mockResolvedValueOnce(null);
+    const { timelineStore } = await import('../../src/daemon/timeline-store.js');
+    const { TIMELINE_HISTORY_ERROR_REASONS } = await import('../../shared/timeline-history-errors.js');
+    await expect(timelineStore.readByTypesPreferred('deck_absent', ['assistant.text'], { limit: 10 }))
+      .rejects.toMatchObject({ reason: TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE });
   });
 });

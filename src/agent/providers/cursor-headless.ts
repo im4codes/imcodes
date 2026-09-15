@@ -1,6 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import type { ChildProcess } from 'node:child_process';
+import {
+  agentResourceOwner,
+  bindAgentProcessResource,
+  type AgentProcessResource,
+} from './agent-process-resource.js';
+import type { SessionResourceOwner } from '../../daemon/session-resource-registry.js';
+import { killProcessTree } from '../../util/kill-process-tree.js';
 import readline from 'node:readline';
 import type {
   TransportProvider,
@@ -28,7 +35,6 @@ import {
   normalizeTransportCwd,
   resolveBinaryWithWindowsFallbacks,
   resolveExecutableForSpawn,
-  terminateChildProcess,
 } from '../transport-paths.js';
 import {
   parseCursorStreamLine,
@@ -47,6 +53,7 @@ import {
   MEMORY_MCP_STATUS,
   type MemoryMcpProviderStatusView,
 } from '../../../shared/memory-ws.js';
+import { NATIVE_AGENT_ADMISSION_MODES } from '../../../shared/native-collaboration-policy.js';
 
 const CURSOR_BIN = 'cursor-agent';
 const CONNECT_PROBE_TIMEOUT_MS = 15_000;
@@ -68,6 +75,10 @@ interface CursorSessionState {
   model?: string;
   mcpEnv?: Record<string, string>;
   child: ChildProcess | null;
+  /** Owner identity for the registry lease on the spawned agent CLI. */
+  resourceOwner?: SessionResourceOwner | null;
+  /** Registry lease for `child`; released when the child exits or is reaped. */
+  agentResource?: AgentProcessResource;
   currentMessageId: string | null;
   currentText: string;
   pendingFinalText?: string;
@@ -145,6 +156,9 @@ export class CursorHeadlessProvider implements TransportProvider {
       cancellation: 'none',
       reason: 'Verified with cursor-agent 2026.05.05-84a231c: CLI help exposes no compact/compress command or compact API for the headless adapter.',
     },
+    // No per-call veto and no per-session disable for native agents: this
+    // runtime cannot send or receive supervised work.
+    nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.UNENFORCEABLE,
   };
 
   private config: ProviderConfig | null = null;
@@ -275,7 +289,13 @@ export class CursorHeadlessProvider implements TransportProvider {
   async disconnect(): Promise<void> {
     for (const state of this.sessions.values()) {
       if (state.child && !state.child.killed) {
-        terminateChildProcess(state.child, CANCEL_ESCALATION_MS);
+        // Reap the group this provider owns. terminateChildProcess signals a
+        // single pid and walks nothing, so it cannot reach a descendant whose
+        // parent already exited.
+        await killProcessTree(state.child, {
+          gracefulMs: CANCEL_ESCALATION_MS,
+          ownsProcessGroup: true,
+        });
       }
     }
     this.sessions.clear();
@@ -312,6 +332,7 @@ export class CursorHeadlessProvider implements TransportProvider {
 
     const carryExistingHistory = !!existingEntry && !config.fresh;
     const state: CursorSessionState = {
+      resourceOwner: agentResourceOwner(config) ?? existingEntry?.[1]?.resourceOwner ?? null,
       routeId,
       resumeId,
       cwd,
@@ -340,7 +361,10 @@ export class CursorHeadlessProvider implements TransportProvider {
     const [resolvedId, state] = this.findSessionByAnyId(sessionId) ?? [];
     if (!state) return;
     if (state.child && !state.child.killed) {
-      terminateChildProcess(state.child, CANCEL_ESCALATION_MS);
+      await killProcessTree(state.child, {
+        gracefulMs: CANCEL_ESCALATION_MS,
+        ownsProcessGroup: true,
+      });
     }
     this.sessions.delete(resolvedId ?? sessionId);
   }
@@ -442,6 +466,11 @@ export class CursorHeadlessProvider implements TransportProvider {
     ];
     const { spawn } = await cursorHeadlessRuntimeHooks.loadChildProcess();
     const child = spawn(resolved.executable, args, {
+      // Own process group and session on POSIX. A reparented descendant keeps
+      // its PGID but loses its PPID, so after the agent parent dies this is the
+      // only ownership token teardown still has. Without it the eight vitest
+      // workers of the incident were unreachable on PPID=1.
+      detached: process.platform !== 'win32',
       cwd: state.cwd,
       env: {
         ...process.env,
@@ -453,6 +482,9 @@ export class CursorHeadlessProvider implements TransportProvider {
       windowsHide: true,
     });
     state.child = child;
+    // Crash coverage: if the daemon dies without running teardown, the startup
+    // sweep reaps this group using the registry's process-start fingerprint.
+    state.agentResource = bindAgentProcessResource(state.resourceOwner ?? null, child);
 
     let completed = false;
     let sawError = false;
@@ -695,7 +727,10 @@ export class CursorHeadlessProvider implements TransportProvider {
     const state = this.getSessionState(sessionId);
     if (!state?.child || state.child.killed) return;
     state.cancelled = true;
-    terminateChildProcess(state.child, CANCEL_ESCALATION_MS);
+    await killProcessTree(state.child, {
+      gracefulMs: CANCEL_ESCALATION_MS,
+      ownsProcessGroup: true,
+    });
   }
 
   private resolveBinaryPath(config: ProviderConfig | null): string {

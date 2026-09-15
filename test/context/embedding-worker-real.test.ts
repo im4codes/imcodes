@@ -8,17 +8,17 @@ import {
   __setEmbeddingEngineKindForTests,
 } from '../../src/context/embedding.js';
 
-// Real-model integration for the WORKER engine (the production path). Gated
+// Real-model integration for the isolated-process engine (the production path). Gated
 // behind the same flag as embedding-real.test.ts so CI doesn't download the
-// model. Validates that inference runs off the main thread end-to-end:
+// model. Validates that inference runs outside the daemon process end-to-end:
 // host WorkerEmbeddingEngine -> embedding-worker.ts -> transformers.js.
 const RUN_REAL = process.env.RUN_REAL_EMBEDDING_TESTS === '1';
 const describeReal = RUN_REAL ? describe : describe.skip;
 
-describeReal('embedding worker engine (real model, off main thread)', () => {
+describeReal('embedding worker engine (real model, isolated process)', () => {
   afterAll(() => { __setEmbeddingEngineKindForTests(null); });
 
-  it('loads the model in a worker and returns 384-dim vectors', async () => {
+  it('loads the model in a child process and returns 384-dim vectors', async () => {
     __setEmbeddingEngineKindForTests('worker');
     expect(await isEmbeddingAvailable()).toBe(true);
 

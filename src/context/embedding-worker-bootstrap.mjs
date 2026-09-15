@@ -1,8 +1,8 @@
 /**
  * Bootstrap entry for the embedding inference worker.
  *
- * `new Worker(url)` spawns a fresh Node thread whose loader hooks are NOT
- * inherited, so under `tsx` (dev / vitest) the worker can't resolve our
+ * The forked Node process does not inherit tsx loader hooks because the host
+ * deliberately clears execArgv, so under `tsx` (dev / vitest) it can't resolve our
  * `.js`-suffixed TypeScript siblings. This plain-ESM file registers tsx's
  * loader best-effort, then imports the real worker module. In production the
  * register call no-ops and the compiled `.js` import works directly.

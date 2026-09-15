@@ -20,7 +20,8 @@ export interface AuthenticatedWebSocketOptions {
   connectTimeoutMs?: number;
   heartbeatMs?: number;
   silenceTimeoutMs?: number;
-  heartbeatMessage?: Record<string, unknown>;
+  /** A function is evaluated per send, so each heartbeat can carry its own send time. */
+  heartbeatMessage?: Record<string, unknown> | (() => Record<string, unknown>);
 }
 
 /** Minimal authenticated reconnecting transport shared by thin clients. */
@@ -58,6 +59,25 @@ export class AuthenticatedWebSocketClient {
     // The close listener intentionally ignores a socket once stop() clears its
     // identity, so invoke lifecycle cleanup here exactly once as well.
     this.options.onClose?.();
+  }
+
+  /**
+   * End the current socket generation and connect a fresh one.
+   *
+   * For state that is only ever sent when a connection authenticates. The
+   * server reads a node's capabilities from its auth frame and nowhere else,
+   * so a change after connecting -- components just installed, a permission
+   * just granted -- is invisible until the next connection. Without a way to
+   * start one, the browser kept showing the old state no matter how often the
+   * operator pressed the button that had already worked.
+   *
+   * Goes through the ordinary loss path rather than `stop()`: that runs the
+   * same once-only finalisation and reconnect a network drop would, instead of
+   * the permanent shutdown `stop()` performs.
+   */
+  reconnect(): void {
+    if (this.stopped || !this.socket) return;
+    this.failSocket(this.socket);
   }
 
   send(message: unknown): boolean {
@@ -140,7 +160,10 @@ export class AuthenticatedWebSocketClient {
         this.failSocket(socket);
         return;
       }
-      if (socket.readyState === 1) socket.send(JSON.stringify(this.options.heartbeatMessage));
+      if (socket.readyState === 1) {
+        const heartbeat = this.options.heartbeatMessage;
+        socket.send(JSON.stringify(typeof heartbeat === 'function' ? heartbeat() : heartbeat));
+      }
     }, heartbeatMs);
     this.watchdogTimer.unref?.();
   }

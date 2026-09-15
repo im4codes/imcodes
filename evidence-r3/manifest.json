@@ -1,0 +1,126 @@
+{
+  "assignmentId": "asg_nbp",
+  "baseCommit": "48b897534d88269a7729c63677773489a8ac7a4c",
+  "evidence": [
+    {
+      "path": "evidence-r3/ACCEPTANCE-TRACE-R2-BASIS.md",
+      "sha256": "8d5c5e98e3df5d6a4bb3e71acea7f7a189a57626599c801ca88ace337e752dd7"
+    },
+    {
+      "path": "evidence-r3/R3-MIGRATION-AND-VALIDATION.md",
+      "sha256": "2c69c66015aaad8417a27e421be727239cd1b89f14b4765742bb607289a08546"
+    },
+    {
+      "path": "evidence-r3/logs/01-tsc-daemon.txt",
+      "sha256": "bd359d4613d12edc53b99a1391259901fa496fc0da36803c974863cef925a4bf"
+    },
+    {
+      "path": "evidence-r3/logs/02-tsc-server.txt",
+      "sha256": "418a5c17f33c70e99b0cc0a07fce69191489cfedc94164bfa903785777c5bd4b"
+    },
+    {
+      "path": "evidence-r3/logs/03-tsc-web.txt",
+      "sha256": "418a5c17f33c70e99b0cc0a07fce69191489cfedc94164bfa903785777c5bd4b"
+    },
+    {
+      "path": "evidence-r3/logs/04-build.txt",
+      "sha256": "9b3625ce325b11d0f8ff87bde11f8aa5c174eabd686c0db885a0ba00efc050f4"
+    },
+    {
+      "path": "evidence-r3/logs/05-daemon-affected-and-full.txt",
+      "sha256": "584c93881bc2e7f9c9f8208e920d46a71a2c2cb49cf494266f0e909644dd0416"
+    },
+    {
+      "path": "evidence-r3/logs/06-server-identity-routes.txt",
+      "sha256": "4786474b9fcd4dd24c4a9e7b77d289e59ea2ce92a7f4a5c147895430d4eab87f"
+    },
+    {
+      "path": "evidence-r3/logs/07-web-identity-and-i18n.txt",
+      "sha256": "38ec4b76cfe4f20fc872acbca527becf6292ff4a273f3af402dde49b93a6a02e"
+    },
+    {
+      "path": "evidence-r3/logs/08-stdio-lifecycle-flake-check.txt",
+      "sha256": "266b8e622306065d8a075c2382e3ad2f44efb330b624ff0cc54b47e6090ca7b2"
+    },
+    {
+      "path": "evidence-r3/mutants/r3-mutants-results.txt",
+      "sha256": "a4b81edeab5c065bab843edd5b209fd211ec1e70b9bbbfcebaa3e402929a78ed"
+    },
+    {
+      "path": "evidence-r3/mutants/r3-mutants.py",
+      "sha256": "cbd669e3fec56108fa2a76c730323c60057832385ebc2096814b1c9ba8068a4e"
+    },
+    {
+      "path": "evidence-r3/revision.diff",
+      "sha256": "29e7c54f3a2c24874f7f16b9dd2902a0ffaf3ae9b4ba58909890e5fe6da7b3ef"
+    }
+  ],
+  "files": [
+    {
+      "path": "server/test/session-identities-routes.test.ts",
+      "sha256": "1c1e6c06458b72e6e7e51f56de13dc6954ed1bd135b919740f14c93b3fdfc7ef"
+    },
+    {
+      "path": "shared/memory-mcp-contracts.ts",
+      "sha256": "8da0a63f84ef46b3679fb9a8b960f14780dda1a53e8afd661b78b5fc8910f4c0"
+    },
+    {
+      "path": "shared/session-identity.ts",
+      "sha256": "facc9c51ca67d76462888985ed3d261c0cb5a8b8aeafbb3ee79eb4711b92ee3d"
+    },
+    {
+      "path": "src/agent/priority-preserving-context-cap.ts",
+      "sha256": "415407290fcacdc0a0c5d63881881696f6a184e4418b5cfdb6d003e185e1143c"
+    },
+    {
+      "path": "src/agent/providers/codex-sdk.ts",
+      "sha256": "70856eee5f6e578c027e6341395be2153e9d0b9bf61080bec7360adaa47457b6"
+    },
+    {
+      "path": "src/agent/providers/qwen.ts",
+      "sha256": "06a3e6b6fdc2127f7fe1b0bcdae6406f4f7ba1f0bb1dc22b13970f377efdebcc"
+    },
+    {
+      "path": "test/agent/codex-sdk-provider.test.ts",
+      "sha256": "8c70df3056d0b541f558dc264fedc0815e0a43cef358bc6b4e1706f149a6d49c"
+    },
+    {
+      "path": "test/agent/priority-preserving-context-cap.test.ts",
+      "sha256": "cb745d2b849c2ccb4f35ff6da63e3bf0b90bf14c443dce85cadc0ca5955cadba"
+    },
+    {
+      "path": "test/agent/qwen-provider.test.ts",
+      "sha256": "d44df9dae932d7e497e2511ab50de5d3d0754a6ad6a5096062233fdb752574d9"
+    },
+    {
+      "path": "test/agent/transport-runtime-assembly.test.ts",
+      "sha256": "079a133c9a383ec34593f456c691955bde4308e69f5348e9d5602131133363ff"
+    },
+    {
+      "path": "test/daemon/memory-mcp-tools-schema-firewall.test.ts",
+      "sha256": "7fd9680a7e69571d0e9bacb678a45eeb267add405bef13e3d0cb8393268d2e18"
+    },
+    {
+      "path": "test/daemon/send-tool.test.ts",
+      "sha256": "2682c5920b96a1ac1c905ff6f219a6c6a1a9f00572ae4e3a495ec10735969e40"
+    },
+    {
+      "path": "test/shared/session-identity.test.ts",
+      "sha256": "097b6d6217576540455cc619602cb7efc24ba32496cc3cc2d4b96186ae5366c5"
+    },
+    {
+      "path": "test/store/session-store.test.ts",
+      "sha256": "24c8f5a595824f55f693cf0c5891799646cc284689e594d021bba7d97edb36d0"
+    },
+    {
+      "path": "web/test/components/SessionIdentityTabs.limit.test.tsx",
+      "sha256": "77e3b1a99ffcb9030e1c16a99f983e1a403f30a1c48beeaf42105ed8d9b374bc"
+    }
+  ],
+  "patch": {
+    "path": "evidence-r3/revision.diff",
+    "sha256": "29e7c54f3a2c24874f7f16b9dd2902a0ffaf3ae9b4ba58909890e5fe6da7b3ef"
+  },
+  "revision": "identity-limit-expansion-r3-current-dev-48b897534-qwen-safe",
+  "taskId": "tsk_nbm"
+}

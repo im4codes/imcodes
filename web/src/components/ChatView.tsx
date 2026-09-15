@@ -1,10 +1,22 @@
+import { isNeverRenderedTimelineEventType, normalizeAssistantTextForDisplay } from '../../../src/shared/timeline/types.js';
 /**
  * ChatView — renders TimelineEvent[] as a chat-style view.
  * Merges consecutive streaming assistant.text events into single blocks.
  * Supports basic Markdown rendering (code blocks, inline code, bold).
  */
+import { loadFsLocalImagePreview } from '../fs-local-image-preview.js';
+import {
+  downloadPreviewWithDirectFallback,
+  isDirectFileTransferStaleHandleError,
+  isFileUploadCanceled,
+  selectPreviewDownloadDestination,
+  type DirectPreviewDownloadDestination,
+} from '../direct-file-transfer.js';
+import { beginDownloadTransfer, failDownloadTransfer } from '../download-transfer-store.js';
+import { createDownloadTransferWiring } from '../download-transfer-wiring.js';
 import { h } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } from 'preact/hooks';
+import { useCoalescedFrame } from '../hooks/useCoalescedFrame.js';
 import { memo, createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type {
@@ -28,6 +40,7 @@ import {
   SDK_SUBAGENT_TASK_TYPES,
 } from '@shared/sdk-subagent-status.js';
 import { parseUnifiedDiff } from '@shared/unified-diff.js';
+
 import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-preview.js';
 import { FileBrowser, type FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
@@ -36,6 +49,7 @@ import {
   type ChatLocalWebPreviewOpenHandler,
 } from './ChatLoopbackLink.js';
 import { AgentTodoList } from './AgentTodoList.js';
+import { DelegationClaimBadge, readDelegationClaimMetadata } from './DelegationClaimBadge.js';
 import {
   CHAT_MOUNT_SETTLE_MS,
   CHAT_MOUNT_SETTLE_TICK_MS,
@@ -64,8 +78,15 @@ import { ZoomedTextDialog } from './ZoomedTextDialog.js';
 import { formatSharedActorLabel } from '../tab-sharing-ui.js';
 import { deriveSessionLiveStatus } from '../session-live-status.js';
 import { isWorkingSessionState } from '@shared/session-activity-types.js';
-import { isPeerAuditRuntimeDisposition } from '@shared/peer-audit.js';
-import { AGENT_DELEGATION_REPLY_TIMELINE_EVENT } from '@shared/agent-delegation.js';
+import {
+  PEER_AUDIT_VERDICTS,
+  isPeerAuditRuntimeDisposition,
+  isPeerAuditVerdict,
+} from '@shared/peer-audit.js';
+import {
+  AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+  readAgentDelegationSupervisionTaskProjection,
+} from '@shared/agent-delegation.js';
 import { parseTimelineDisplayText } from '../timeline-display-text.js';
 import {
   MESSAGE_PIN_LIMITS,
@@ -86,6 +107,11 @@ import {
   type SdkSubagentDiagnostic,
   type SdkSubagentStatusRow,
 } from '../timeline/sdk-subagent-aggregator.js';
+import {
+  deriveLiveAssignmentStatuses,
+  liveAssignmentStatusesKey,
+  type LiveAssignmentStatus,
+} from '../timeline/supervision-assignment-status.js';
 import { resizeHandleHoverEvents } from './window-resize.js';
 
 interface Props {
@@ -155,6 +181,10 @@ interface ViewItem {
   /** Source event ids represented by an assistant block (for old-pin locate). */
   eventIds?: string[];
   assistantAutomation?: boolean;
+  /** Metadata record of the block's completed assistant message, when it
+   *  carries the structured delegation-claim projection. Passed through by
+   *  reference so the memoized AssistantBlock keeps a stable prop identity. */
+  delegationMetadata?: Record<string, unknown>;
   /** All events in a collapsed tool group (first, middle..., last) */
   toolEvents?: TimelineEvent[];
   /** memory.context events linked to this event via relatedToEventId */
@@ -171,6 +201,11 @@ interface AssistantBlockProps {
   text: string;
   automation?: boolean;
   ts: number;
+  /** Completed assistant message metadata carrying the delegation-claim
+   *  projection, when the runtime attached one. */
+  delegationMetadata?: Record<string, unknown>;
+  /** Daemon-announced per-assignment lifecycle status for the dispatch card. */
+  liveAssignmentStatuses?: ReadonlyMap<string, LiveAssignmentStatus>;
   /** Stable identifier for this merged block. Wired through to a
    *  `data-event-id` attribute so the mobile double-tap detector can pair
    *  taps by event id instead of HTMLElement reference — DOM nodes are
@@ -187,26 +222,43 @@ interface AssistantBlockProps {
 
 const USER_MESSAGE_COLLAPSE_LINE_LIMIT = 10;
 const CHAT_LOCAL_IMAGE_PREVIEW_CACHE_LIMIT = 256;
-const chatLocalImagePreviewCache = new Map<string, Promise<ChatLocalImagePreviewResult>>();
+/**
+ * tsk_5rf R2: a streamed preview caches a download-handle URL, and that handle
+ * expires server-side (4h). An LRU with no TTL therefore served dead URLs
+ * indefinitely. This bound is deliberately well under the handle lifetime so a
+ * cached entry can never outlive the handle it points at.
+ */
+const CHAT_LOCAL_IMAGE_PREVIEW_CACHE_TTL_MS = 30 * 60 * 1000;
+interface ChatLocalImagePreviewCacheEntry {
+  promise: Promise<ChatLocalImagePreviewResult>;
+  createdAt: number;
+}
+const chatLocalImagePreviewCache = new Map<string, ChatLocalImagePreviewCacheEntry>();
+
+function invalidateChatLocalImagePreview(cacheKey: string): void {
+  chatLocalImagePreviewCache.delete(cacheKey);
+}
 
 function getCachedChatLocalImagePreview(
   cacheKey: string,
   load: () => Promise<ChatLocalImagePreviewResult>,
+  now: number = Date.now(),
 ): Promise<ChatLocalImagePreviewResult> {
   const existing = chatLocalImagePreviewCache.get(cacheKey);
-  if (existing) {
+  if (existing && now - existing.createdAt <= CHAT_LOCAL_IMAGE_PREVIEW_CACHE_TTL_MS) {
     chatLocalImagePreviewCache.delete(cacheKey);
     chatLocalImagePreviewCache.set(cacheKey, existing);
-    return existing;
+    return existing.promise;
   }
+  if (existing) chatLocalImagePreviewCache.delete(cacheKey);
 
   const pending = load().catch((err) => {
-    if (chatLocalImagePreviewCache.get(cacheKey) === pending) {
+    if (chatLocalImagePreviewCache.get(cacheKey)?.promise === pending) {
       chatLocalImagePreviewCache.delete(cacheKey);
     }
     throw err;
   });
-  chatLocalImagePreviewCache.set(cacheKey, pending);
+  chatLocalImagePreviewCache.set(cacheKey, { promise: pending, createdAt: now });
   while (chatLocalImagePreviewCache.size > CHAT_LOCAL_IMAGE_PREVIEW_CACHE_LIMIT) {
     const oldestKey = chatLocalImagePreviewCache.keys().next().value;
     if (typeof oldestKey !== 'string') break;
@@ -218,6 +270,13 @@ function getCachedChatLocalImagePreview(
 export function __clearChatLocalImagePreviewCacheForTests() {
   chatLocalImagePreviewCache.clear();
 }
+
+/** Test seam for the streamed-URL cache boundary (tsk_5rf R2). */
+export const __chatLocalImagePreviewCacheInternals = {
+  get: getCachedChatLocalImagePreview,
+  invalidate: invalidateChatLocalImagePreview,
+  ttlMs: CHAT_LOCAL_IMAGE_PREVIEW_CACHE_TTL_MS,
+};
 
 /** Extract a chat event's visible text while preserving block/list/code
  *  formatting. Uses `domNodeToPlainText` rather than `textContent` so that
@@ -300,6 +359,74 @@ export function formatChatDateTime(ts: number, now = Date.now(), locale?: string
     && date.getMonth() === today.getMonth()
     && date.getDate() === today.getDate();
   return chatDateTimeFormatter(locale, !isToday).format(date);
+}
+
+const PINNED_MEMORY_SUMMARY_PREVIEW_MAX = 240;
+const MEMORY_PROBLEM_HEADING_RE = /^#{1,6}\s*(?:user\s+problem|problem|issue|问题|問題)\s*[:：]?\s*$/i;
+const MEMORY_PROBLEM_INLINE_RE = /^(?:user\s+problem|problem|issue|问题|問題)\s*[:：]\s*(.+)$/i;
+const MARKDOWN_HEADING_RE = /^#{1,6}\s+/;
+
+function compactMemorySummaryPreview(text: string): string | null {
+  const cleaned = text
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .split('\n')
+    .map((line) => line.trim().replace(/^[-*]\s+/, '').replace(/^\d+\.\s+/, ''))
+    .filter(Boolean)
+    .join(' · ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned) return null;
+  return cleaned.length > PINNED_MEMORY_SUMMARY_PREVIEW_MAX
+    ? `${cleaned.slice(0, PINNED_MEMORY_SUMMARY_PREVIEW_MAX - 1).trimEnd()}…`
+    : cleaned;
+}
+
+function extractMemoryProblemPreview(summary: string): string | null {
+  const normalized = summary.replace(/\r\n?/g, '\n').trim();
+  if (!normalized) return null;
+  const lines = normalized.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    const inline = MEMORY_PROBLEM_INLINE_RE.exec(line);
+    if (inline?.[1]?.trim()) return compactMemorySummaryPreview(inline[1]);
+    if (!MEMORY_PROBLEM_HEADING_RE.test(line)) continue;
+    const body: string[] = [];
+    for (let j = i + 1; j < lines.length; j++) {
+      const nextLine = lines[j].trim();
+      if (MARKDOWN_HEADING_RE.test(nextLine)) break;
+      body.push(lines[j]);
+    }
+    const preview = compactMemorySummaryPreview(body.join('\n'));
+    if (preview) return preview;
+  }
+  return compactMemorySummaryPreview(
+    lines.filter((line) => !MARKDOWN_HEADING_RE.test(line.trim())).join('\n'),
+  );
+}
+
+function getLatestRecentMemoryProblemPreview(
+  events: TimelineEvent[],
+  sessionId: string | null | undefined,
+  relatedToEventId: string | null | undefined,
+): string | null {
+  if (!sessionId || !relatedToEventId) return null;
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i];
+    if (event.type !== 'memory.context') continue;
+    const payload = event.payload as unknown as Partial<MemoryContextTimelinePayload>;
+    if (payload.relatedToEventId !== relatedToEventId) continue;
+    if (!Array.isArray(payload.items)) continue;
+    for (const item of payload.items) {
+      if (item?.projectionClass !== 'recent_summary') continue;
+      if (item.sourceSessionName !== sessionId) continue;
+      const preview = extractMemoryProblemPreview(String(item.summary ?? ''));
+      if (preview) return preview;
+    }
+  }
+  return null;
 }
 
 type MemoryContextSection =
@@ -732,6 +859,25 @@ const TOOL_LIKE_EVENT_TYPES = new Set<string>([
   'assistant.thinking',
 ]);
 
+/**
+ * Types that reach `ChatEvent` and always come back as `null`:
+ * `assistant.thinking` returns null outright, and the `transport.queue.*`
+ * family has no case at all and falls through to `default`.
+ *
+ * They must not become ViewItems. A ViewItem that draws nothing still counts
+ * towards `viewItems.length`, which gates BOTH the "load earlier messages"
+ * button and the suppression of the empty-state placeholder — so a window made
+ * only of these rendered as a button floating above an empty scroller, with no
+ * spinner and no "no messages" text.
+ *
+ * They are deliberately NOT removed by `isVisibleChatTimelineEvent`: they still
+ * have to flow through `buildViewItems`, where `assistant.thinking` is a
+ * grouping boundary that flushes pending text and tool runs. Filtering them out
+ * earlier would silently merge assistant blocks that are currently separate.
+ * Only the item PUSH is suppressed; every grouping side effect still happens.
+ */
+
+
 function isVisibleChatTimelineEvent(event: TimelineEvent, showToolCalls: boolean): boolean {
   // Filter out transient/noisy event types that don't belong in the chat log:
   // - agent.status, usage.update: stats, not chat content
@@ -868,14 +1014,31 @@ const VIEW_TAIL_MARGIN_ITEMS = 24;
 /** First guess at events-per-item. Tool groups collapse many events into one. */
 const VIEW_TAIL_EVENTS_PER_ITEM = 4;
 
+/**
+ * Passes before giving up and deriving everything.
+ *
+ * Each pass quadruples the window, so four billion events are covered in
+ * sixteen. Reaching this cap means the arithmetic below is wrong, and the
+ * correct response is a slow full derivation rather than another pass.
+ */
+const VIEW_TAIL_MAX_WIDENING_PASSES = 16;
+
 function buildViewItemsTail(
   events: TimelineEvent[],
   showToolCalls: boolean,
   wantItems: number,
 ): DerivedViewTail {
-  const target = wantItems + VIEW_TAIL_MARGIN_ITEMS;
+  // Every exit below is a numeric comparison, and every comparison against NaN
+  // is false — a non-finite want would therefore loop forever, on the main
+  // thread, wedging the tab past the point where even a reload can run. The
+  // callers pass finite numbers today; this does not depend on them continuing
+  // to.
+  const want = Number.isFinite(wantItems) && wantItems > 0
+    ? Math.floor(wantItems)
+    : CHAT_INITIAL_RENDER_ITEM_LIMIT;
+  const target = want + VIEW_TAIL_MARGIN_ITEMS;
   let windowSize = Math.min(events.length, Math.max(target * VIEW_TAIL_EVENTS_PER_ITEM, 200));
-  for (;;) {
+  for (let pass = 0; pass < VIEW_TAIL_MAX_WIDENING_PASSES; pass += 1) {
     const startIndex = Math.max(0, events.length - windowSize);
     const items = buildViewItems(startIndex === 0 ? events : events.slice(startIndex), showToolCalls);
     // Enough, or there is nothing older to widen into.
@@ -886,6 +1049,7 @@ function buildViewItemsTail(
     // items, so widening by a constant factor rather than a constant count.
     windowSize = Math.min(events.length, windowSize * 4);
   }
+  return { items: buildViewItems(events, showToolCalls), windowStartIndex: 0 };
 }
 
 /** Test seam for the windowed derivation; production goes through the memo. */
@@ -1081,6 +1245,7 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
   let pendingKey = '';
   let pendingEventIds: string[] = [];
   let pendingAssistantAutomation = false;
+  let pendingDelegationMetadata: Record<string, unknown> | undefined;
   let pendingTools: TimelineEvent[] = [];
   let deferredEvents: TimelineEvent[] = [];
 
@@ -1092,12 +1257,14 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
         text: pendingText.join('\n'),
         eventIds: [...pendingEventIds],
         assistantAutomation: pendingAssistantAutomation,
+        ...(pendingDelegationMetadata ? { delegationMetadata: pendingDelegationMetadata } : {}),
         ts: pendingFirstTs,
         lastTs: pendingLastTs,
       });
       pendingText = [];
       pendingEventIds = [];
       pendingAssistantAutomation = false;
+      pendingDelegationMetadata = undefined;
     }
   };
 
@@ -1121,7 +1288,10 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
     }
     pendingTools = [];
     // Flush any session.state events that were deferred to avoid breaking the group
-    for (const ev of deferredEvents) items.push({ key: ev.eventId, type: 'event', event: ev });
+    for (const ev of deferredEvents) {
+      if (isNeverRenderedTimelineEventType(ev.type)) continue;
+      items.push({ key: ev.eventId, type: 'event', event: ev });
+    }
     deferredEvents = [];
   };
 
@@ -1132,7 +1302,7 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
       // single live activity rail instead of many tiny rows.
       if (showToolCalls) flushTools();
       // Trim and collapse 3+ consecutive blank lines to 1 (CC output often has many trailing newlines)
-      const text = String(event.payload.text ?? '').trim().replace(/\n{3,}/g, '\n\n');
+      const text = normalizeAssistantTextForDisplay(event.payload.text);
       if (!text) continue;
       const assistantAutomation = event.payload.automation === true;
       if (pendingText.length > 0 && pendingAssistantAutomation !== assistantAutomation) {
@@ -1143,6 +1313,10 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
         pendingFirstTs = event.ts;
         pendingAssistantAutomation = assistantAutomation;
       }
+      // Only the turn's completed message carries the delegation-claim
+      // projection, so the newest event that has one wins for the block.
+      const delegationMetadata = readDelegationClaimMetadata(event.payload);
+      if (delegationMetadata) pendingDelegationMetadata = delegationMetadata;
       pendingLastTs = event.ts;
       pendingText.push(text);
       pendingEventIds.push(event.eventId);
@@ -1159,6 +1333,9 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
     } else {
       flushPending();
       if (showToolCalls || event.type === 'user.message') flushTools();
+      // Flushing above is the grouping contract and still runs; only the
+      // unrenderable item itself is withheld.
+      if (isNeverRenderedTimelineEventType(event.type)) continue;
       items.push({
         key: event.eventId,
         type: 'event',
@@ -1805,9 +1982,15 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     }
     return null;
   }, [events, t]);
-  // Reset the expand state whenever the pinned target changes so a new
+  const recentMemoryProblemPreview = useMemo(
+    () => getLatestRecentMemoryProblemPreview(events, sessionId, lastSentUserMessage?.eventId),
+    [events, sessionId, lastSentUserMessage?.eventId],
+  );
+  const pinnedPreviewText = recentMemoryProblemPreview ?? lastSentUserMessage?.text ?? '';
+  const pinnedPreviewUsesMemory = !!recentMemoryProblemPreview;
+  // Reset the expand state whenever the pinned target/summary changes so a new
   // message never inherits the expanded state of an older one.
-  useEffect(() => { setPinnedExpanded(false); }, [lastSentUserMessage?.eventId]);
+  useEffect(() => { setPinnedExpanded(false); }, [lastSentUserMessage?.eventId, recentMemoryProblemPreview]);
 
   const suppressLoadOlder = useCallback((durationMs = 1200) => {
     suppressLoadOlderUntilRef.current = Date.now() + durationMs;
@@ -2025,75 +2208,103 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     })
   ), [fileScopeSessionName, mapDownloadError, t, ws]);
 
-  const handleImagePreview = useCallback<ChatLocalImagePreviewLoader>((path: string) => (
-    new Promise((resolve, reject) => {
-      if (!ws || typeof ws.fsReadFile !== 'function' || typeof ws.onMessage !== 'function') {
-        reject(new Error(t('file_browser.preview_error')));
-        return;
-      }
-
-      let unsub: (() => void) | undefined;
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const resolvedPath = resolvePreviewPath(path, workdir);
-      const cacheScope = serverId ? `server:${serverId}` : `session:${sessionId ?? 'unknown'}`;
-      const cacheKey = `${cacheScope}\0${resolvedPath}`;
-      const cleanup = () => {
-        if (timer) clearTimeout(timer);
-        unsub?.();
-      };
-
-      getCachedChatLocalImagePreview(cacheKey, () => new Promise<ChatLocalImagePreviewResult>((resolveCached, rejectCached) => {
-        try {
-          const reqId = fileScopeSessionName ? ws.fsReadFile(resolvedPath, fileScopeSessionName) : ws.fsReadFile(resolvedPath);
-          timer = setTimeout(() => {
-            cleanup();
-            rejectCached(new Error(t('upload.download_timeout')));
-          }, 30_000);
-          unsub = ws.onMessage((msg) => {
-            if (msg.type !== 'fs.read_response' || msg.requestId !== reqId) return;
-            cleanup();
-            if (msg.status === 'error') {
-              rejectCached(new Error(t('file_browser.preview_error')));
-              return;
-            }
-            if (msg.encoding === 'base64' && typeof msg.mimeType === 'string' && msg.mimeType.startsWith('image/')) {
-              resolveCached({
-                dataUrl: `data:${msg.mimeType};base64,${msg.content ?? ''}`,
-                alt: resolvedPath.split(/[/\\]/).pop() || resolvedPath,
-              });
-              return;
-            }
-            rejectCached(new Error(t('file_browser.preview_error')));
-          });
-        } catch (err) {
-          cleanup();
-          rejectCached(err instanceof Error ? err : new Error(String(err)));
-        }
-      })).then(resolve, reject);
-    })
-  ), [fileScopeSessionName, serverId, sessionId, t, workdir, ws]);
+  // tsk_5rf: this used to carry its own copy of the fs.read_response loader and
+  // accepted ONLY base64. After 6a169ad3c the daemon answers image previews with
+  // metadata plus a download handle, so that copy rejected every streamed image
+  // and the chat thumbnail vanished while FileBrowser (the other copy) kept
+  // working. There is now one shared loader, so a contract change cannot fix one
+  // surface and silently break the other.
+  const handleImagePreview = useCallback<ChatLocalImagePreviewLoader>((path: string) => {
+    if (!ws || typeof ws.fsReadFile !== 'function' || typeof ws.onMessage !== 'function') {
+      return Promise.reject(new Error(t('file_browser.preview_error')));
+    }
+    const resolvedPath = resolvePreviewPath(path, workdir);
+    const cacheScope = serverId ? `server:${serverId}` : `session:${sessionId ?? 'unknown'}`;
+    const cacheKey = `${cacheScope}\0${resolvedPath}`;
+    return getCachedChatLocalImagePreview(cacheKey, () => loadFsLocalImagePreview(ws, resolvedPath, {
+      sessionName: fileScopeSessionName,
+      serverId: serverId ?? undefined,
+      timeoutMs: 30_000,
+      errorMessage: t('file_browser.preview_error'),
+      timeoutMessage: t('upload.download_timeout'),
+    }).then((result) => ({
+      ...result,
+      // Evict on a real <img> failure so the retry calls fsReadFile again for a
+      // fresh handle instead of replaying a dead URL.
+      onLoadFailed: () => invalidateChatLocalImagePreview(cacheKey),
+    })));
+  }, [fileScopeSessionName, serverId, sessionId, t, workdir, ws]);
 
   const handleDownload = useCallback<ChatPathDownloadHandler>(async (path: string) => {
-    if (!serverId) throw new Error(t('upload.daemon_offline'));
+    if (!serverId || !ws) throw new Error(t('upload.daemon_offline'));
     const resolvedPath = resolvePreviewPath(path, workdir);
-    let downloadId = await requestPathDownloadId(resolvedPath);
-    const { downloadAttachment } = await import('../api.js');
+    const fileName = resolvedPath.split(/[/\\]/).pop() || undefined;
+    // The save dialog must open first, inside the click that asked for it; any
+    // await in front of it lets the browser refuse the picker. Choosing where
+    // the file goes is also what lets the finished row offer "Show in folder"
+    // — the same path the file browser downloads through.
+    let destination: DirectPreviewDownloadDestination | null;
     try {
-      if (sessionId) await downloadAttachment(serverId, downloadId, sessionId);
-      else await downloadAttachment(serverId, downloadId);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      const isStaleHandle = msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404');
-      if (!isStaleHandle) throw new Error(mapDownloadError(err));
-      downloadId = await requestPathDownloadId(resolvedPath);
-      try {
-        if (sessionId) await downloadAttachment(serverId, downloadId, sessionId);
-        else await downloadAttachment(serverId, downloadId);
-      } catch (retryErr) {
-        throw new Error(mapDownloadError(retryErr));
-      }
+      destination = await selectPreviewDownloadDestination(fileName);
+    } catch (error) {
+      if (isFileUploadCanceled(error)) return;
+      throw new Error(t('upload.download_failed'));
     }
-  }, [mapDownloadError, requestPathDownloadId, serverId, sessionId, t, workdir]);
+    const { downloadAttachment } = await import('../api.js');
+    const transfer = beginDownloadTransfer(fileName ?? resolvedPath);
+    const attempt = async (downloadId: string) => {
+      const wiring = createDownloadTransferWiring(transfer.id);
+      await downloadPreviewWithDirectFallback({
+        ws,
+        serverId,
+        previewHandle: downloadId,
+        suggestedName: fileName,
+        sessionName: fileScopeSessionName,
+        destination,
+        httpFallback: () => (sessionId
+          ? downloadAttachment(serverId, downloadId, sessionId, transfer.signal)
+          : downloadAttachment(serverId, downloadId, undefined, transfer.signal)),
+        signal: transfer.signal,
+        onSaveReady: wiring.onSaveReady,
+        onProgress: wiring.onProgress,
+        onMode: wiring.onMode,
+      });
+      wiring.complete(destination);
+    };
+    // requestPathDownloadId already rejects with a user-facing message; mapping
+    // it again would turn e.g. a timeout into a generic failure.
+    const alreadyMapped = new WeakSet<object>();
+    const requestDownloadId = async () => {
+      try {
+        return await requestPathDownloadId(resolvedPath);
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        alreadyMapped.add(error);
+        throw error;
+      }
+    };
+    const isStaleHandle = (err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      return isDirectFileTransferStaleHandleError(err)
+        || msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404');
+    };
+    try {
+      try {
+        await attempt(await requestDownloadId());
+      } catch (err) {
+        // A preview handle can expire between the request and the transfer:
+        // fetch a fresh one once, keeping the same chosen destination.
+        if (!isStaleHandle(err) || transfer.signal.aborted) throw err;
+        await attempt(await requestDownloadId());
+      }
+    } catch (err) {
+      const canceled = isFileUploadCanceled(err) || transfer.signal.aborted;
+      failDownloadTransfer(transfer.id, canceled);
+      if (canceled) return;
+      if (err instanceof Error && alreadyMapped.has(err)) throw err;
+      throw new Error(mapDownloadError(err));
+    }
+  }, [fileScopeSessionName, mapDownloadError, requestPathDownloadId, serverId, sessionId, t, workdir, ws]);
 
   const pathClickHandler = ws && !preview ? handlePathClick : undefined;
   const htmlPreviewHandler = ws && typeof ws.fsReadFile === 'function' && !preview ? handleHtmlPreview : undefined;
@@ -2161,6 +2372,15 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   }, [showToolCallsPref]);
   const [sdkAgentsNow, setSdkAgentsNow] = useState(() => Date.now());
   const hasSdkAgentEvents = useMemo(() => hasSdkSubagentTimelineEvent(events), [events]);
+  // Keyed by content so assistant blocks re-render only when a status changes.
+  const liveAssignmentStatusesSignature = useMemo(
+    () => liveAssignmentStatusesKey(deriveLiveAssignmentStatuses(events)),
+    [events],
+  );
+  const liveAssignmentStatuses = useMemo(
+    () => new Map<string, LiveAssignmentStatus>(JSON.parse(liveAssignmentStatusesSignature) as Array<[string, LiveAssignmentStatus]>),
+    [liveAssignmentStatusesSignature],
+  );
   useEffect(() => {
     if (!hasSdkAgentEvents) return;
     setSdkAgentsNow(Date.now());
@@ -2400,6 +2620,12 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   // follow/suppress policy stays synchronous so ordering against callers that
   // set state right after is unchanged.
   const pendingScrollFrameRef = useRef<number | null>(null);
+  // Single-flight frame for every "follow the bottom" request in this view.
+  // These fire from timeline updates, scroll handling and ResizeObserver — all
+  // of which keep running while the display is asleep and frames are not
+  // produced. A raw rAF per request therefore builds an unbounded backlog that
+  // the browser executes in one post-unlock frame. See useCoalescedFrame.
+  const scheduleFollowFrame = useCoalescedFrame();
 
   const scrollToBottom = (engageFollow: boolean = true) => {
     const el = scrollRef.current;
@@ -2439,8 +2665,8 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     setShowScrollBtn(false);
     // Force scroll to bottom on tab switch — the auto-scroll effect may not fire
     // if no new events arrived while this tab was inactive.
-    requestAnimationFrame(() => scrollToBottom(true));
-  }, [sessionId]);
+    scheduleFollowFrame(() => scrollToBottom(true));
+  }, [sessionId, scheduleFollowFrame]);
 
   // On mobile: when keyboard opens, viewport shrinks and scrollTop can reset to 0.
   // Save the relative bottom offset on focusin, then restore against the new layout
@@ -2465,7 +2691,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       if (vv.height !== prevHeight) {
         suppressLoadOlder();
         if (savedWasNearBottom || autoScrollRef.current) {
-          requestAnimationFrame(() => scrollToBottom());
+          scheduleFollowFrame(() => scrollToBottom());
         } else if (vv.height < prevHeight) {
           const targetTop = Math.max(0, el.scrollHeight - el.clientHeight - savedBottomOffset);
           el.scrollTop = targetTop;
@@ -2679,13 +2905,13 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     prevVisibleTsRef.current = lastVisibleTs;
     if (!changed && !preview) return;
     if (layoutHandledVisibleTsRef.current === lastVisibleTs) return;
-    requestAnimationFrame(() => {
+    scheduleFollowFrame(() => {
       // Re-check inside the rAF callback so a state flip during the frame
       // window (e.g. a user scroll-up that lands between schedule and fire)
       // is honoured. Preview always follows by design.
       if (preview || autoScrollRef.current) scrollToBottom(false);
     });
-  }, [lastVisibleTs, preview]);
+  }, [lastVisibleTs, preview, scheduleFollowFrame]);
 
   const lastScrollActivityRef = useRef(Date.now());
   // (Previously SCROLL_IDLE_RESUME_MS = 60_000 drove a setInterval that
@@ -2784,7 +3010,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       && Date.now() < suppressLoadOlderUntilRef.current;
     if (transientTopJump) {
       setShowScrollBtn(false);
-      requestAnimationFrame(() => scrollToBottom(true));
+      scheduleFollowFrame(() => scrollToBottom(true));
       return;
     }
     // Adaptive + hysteresis thresholds (avoid boundary flicker during streaming
@@ -2846,14 +3072,14 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       // Re-check follow state INSIDE the rAF: a user scroll-up that disengages
       // during the frame gap must still win, or we'd snap them back against
       // their intent.
-      requestAnimationFrame(() => {
+      scheduleFollowFrame(() => {
         if (autoScrollRef.current) scrollToBottom();
       });
     });
 
     ro.observe(el);
     return () => ro.disconnect();
-  }, [preview]);
+  }, [preview, scheduleFollowFrame]);
 
   // Hold the bottom through the post-mount layout settle.
   //
@@ -3313,7 +3539,9 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
             class={`chat-pinned-last-sent${pinnedExpanded ? ' chat-pinned-expanded' : ''}`}
             role="button"
             tabIndex={0}
-            aria-label={t('chat.pinned_last_sent_aria', 'Jump to your last sent message')}
+            aria-label={pinnedPreviewUsesMemory
+              ? t('chat.pinned_recent_summary_aria', 'Show recent summary and jump to your last sent message')
+              : t('chat.pinned_last_sent_aria', 'Jump to your last sent message')}
             onClick={() => {
               // Tap once → toggle 2-line clamp; tap again (while expanded)
               // behaves like a jump-to-message. Holds the expand state so a
@@ -3336,13 +3564,17 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
             }}
           >
             <span class="chat-pinned-last-sent-meta">
-              <span class="chat-pinned-last-sent-label">{t('chat.pinned_last_sent_label', 'Last sent')}</span>
+              <span class="chat-pinned-last-sent-label">
+                {pinnedPreviewUsesMemory
+                  ? t('chat.pinned_recent_summary_label', 'Recent summary')
+                  : t('chat.pinned_last_sent_label', 'Last sent')}
+              </span>
               {lastSentUserMessage.actorLabel && (
                 <span class="chat-pinned-last-sent-actor">{lastSentUserMessage.actorLabel}</span>
               )}
               <span class="chat-pinned-last-sent-time">{formatChatDateTime(lastSentUserMessage.ts, Date.now(), locale)}</span>
             </span>
-            <span class="chat-pinned-last-sent-text">{lastSentUserMessage.text}</span>
+            <span class="chat-pinned-last-sent-text">{pinnedPreviewText}</span>
           </div>
         )}
         <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} style={chatFontStyle} onScroll={preview ? undefined : handleScroll}
@@ -3368,7 +3600,13 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
           } : undefined}
         >
           {!preview && <AgentTodoList events={events} sessionState={sessionState} />}
-          {loading ? (
+          {/* The spinner is for an EMPTY pane only. It used to be an exclusive
+           *  branch on `loading` alone, which — together with the `!loading`
+           *  guard on the message list below — blanked a pane whose cached
+           *  events were already in state, purely because a background
+           *  refresh was in flight. Cached history must stay on screen while
+           *  the network catches up. */}
+          {loading && viewItems.length === 0 ? (
             <div class="chat-loading">{t('chat.loading')}</div>
           ) : viewItems.length === 0 ? (
             // Suppress the "no events" placeholder while history bootstrap
@@ -3450,7 +3688,8 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
               </button>
             </div>
           )}
-          {!loading && renderedViewItems.map((item) => {
+          {/* No `loading` guard: whatever is already restored renders now. */}
+          {renderedViewItems.map((item) => {
             if (item.type === 'assistant-block') {
               return (
                 <AssistantBlock
@@ -3458,6 +3697,8 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
                   eventId={item.key}
                   text={item.text!}
                   automation={item.assistantAutomation === true}
+                  delegationMetadata={item.delegationMetadata}
+                  liveAssignmentStatuses={item.delegationMetadata ? liveAssignmentStatuses : undefined}
                   ts={item.lastTs ?? item.ts ?? 0}
                   onPathClick={pathClickHandler}
                   onUrlClick={urlClickHandler}
@@ -4251,6 +4492,8 @@ const AssistantBlock = memo(function AssistantBlock({
   automation,
   ts,
   eventId,
+  delegationMetadata,
+  liveAssignmentStatuses,
   onPathClick,
   onUrlClick,
   onDownload,
@@ -4264,6 +4507,7 @@ const AssistantBlock = memo(function AssistantBlock({
       data-event-id={eventId}
     >
       <ChatMarkdown text={parseTimelineDisplayText(text)} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} />
+      <DelegationClaimBadge metadata={delegationMetadata} liveAssignmentStatuses={liveAssignmentStatuses} messageTs={ts} />
       <ChatTime ts={ts} />
     </div>
   );
@@ -4498,22 +4742,68 @@ const ChatEvent = memo(function ChatEvent({
     case AGENT_DELEGATION_REPLY_TIMELINE_EVENT: {
       const source = String(event.payload.sourceLabel ?? event.payload.sourceSessionName ?? '—');
       const result = typeof event.payload.result === 'string' ? event.payload.result : '';
+      const verdict = isPeerAuditVerdict(event.payload.verdict) ? event.payload.verdict : undefined;
+      const verdictClass = verdict ? ` delegation-reply-card--${verdict.toLowerCase()}` : '';
+      const verdictLabel = verdict
+        ? t(verdict === PEER_AUDIT_VERDICTS[0]
+          ? 'peerAuditQuick.result_pass'
+          : 'peerAuditQuick.result_rework')
+        : undefined;
+      const supervisionTask = event.source === 'daemon' && event.confidence === 'high'
+        ? readAgentDelegationSupervisionTaskProjection(event.payload.supervisionTask)
+        : undefined;
       return (
-        <section class="chat-event chat-system delegation-reply-card" data-event-id={event.eventId}>
+        <section
+          class={`chat-event chat-system delegation-reply-card${verdictClass}`}
+          data-event-id={event.eventId}
+          {...(verdict ? { 'data-verdict': verdict } : {})}
+        >
           <div class="delegation-reply-card-head">
-            <strong>{t('delegation.reply_title')}</strong>
-            <span>{t('delegation.reply_from', { source })}</span>
+            <div class="delegation-reply-card-heading">
+              {supervisionTask?.title ? (
+                <>
+                  <span class="delegation-reply-card-kicker">{t('delegation.reply_title')}</span>
+                  <strong class="delegation-reply-card-objective">{supervisionTask.title}</strong>
+                </>
+              ) : (
+                <strong>{t('delegation.reply_title')}</strong>
+              )}
+            </div>
+            <div class="delegation-reply-card-meta">
+              {verdict && (
+                <span class="delegation-reply-verdict" aria-label={verdictLabel}>{verdict}</span>
+              )}
+              <span>{t('delegation.reply_from', { source })}</span>
+            </div>
           </div>
+          {supervisionTask && (
+            <div
+              class={`delegation-reply-task${supervisionTask.title ? '' : ' is-fallback'}`}
+              data-testid="delegation-reply-task"
+              data-task-id={supervisionTask.taskId}
+              data-assignment-id={supervisionTask.assignmentId}
+              {...(supervisionTask.attemptId ? { 'data-attempt-id': supervisionTask.attemptId } : {})}
+              {...(supervisionTask.revision ? { 'data-revision': supervisionTask.revision } : {})}
+            >
+              <span class="delegation-reply-task-ids">
+                <span aria-label={`${t('delegation.claim.task_id')}: ${supervisionTask.taskId}`}>{supervisionTask.taskId}</span>
+                <span aria-hidden="true">·</span>
+                <span aria-label={`${t('delegation.claim.assignment_id')}: ${supervisionTask.assignmentId}`}>{supervisionTask.assignmentId}</span>
+              </span>
+            </div>
+          )}
           {result && (
-            <ChatMarkdown
-              text={result}
-              onPathClick={onPathClick}
-              onUrlClick={onUrlClick}
-              onDownload={onDownload}
-              onHtmlPreview={onHtmlPreview}
-              onImagePreview={onImagePreview}
-              onOpenLocalWebPreview={onOpenLocalWebPreview}
-            />
+            <div class="delegation-reply-card-body">
+              <ChatMarkdown
+                text={result}
+                onPathClick={onPathClick}
+                onUrlClick={onUrlClick}
+                onDownload={onDownload}
+                onHtmlPreview={onHtmlPreview}
+                onImagePreview={onImagePreview}
+                onOpenLocalWebPreview={onOpenLocalWebPreview}
+              />
+            </div>
           )}
           <ChatTime ts={event.ts} />
         </section>
@@ -5069,6 +5359,27 @@ function countHardLines(text: string): number {
   return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n').length;
 }
 
+/**
+ * Measure visual line overflow from the browser's rendered box. `scrollHeight`
+ * includes soft-wrapped content even while the element is capped, so this
+ * catches long paragraphs without guessing from character count.
+ */
+export function renderedUserMessageExceedsLineLimit(
+  element: HTMLElement,
+  lineLimit = USER_MESSAGE_COLLAPSE_LINE_LIMIT,
+): boolean | null {
+  const style = window.getComputedStyle(element);
+  const fontSize = Number.parseFloat(style.fontSize);
+  const rawLineHeight = Number.parseFloat(style.lineHeight);
+  const lineHeight = style.lineHeight.endsWith('px')
+    ? rawLineHeight
+    : Number.isFinite(rawLineHeight) && Number.isFinite(fontSize)
+      ? rawLineHeight * fontSize
+      : Number.NaN;
+  if (!Number.isFinite(lineHeight) || lineHeight <= 0 || element.scrollHeight <= 0) return null;
+  return element.scrollHeight > (lineHeight * lineLimit) + 0.5;
+}
+
 function UserMessageText({
   text,
   onPathClick,
@@ -5087,14 +5398,53 @@ function UserMessageText({
   onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
 }) {
   const { t } = useTranslation();
-  const lineCount = countHardLines(text);
-  const shouldFold = lineCount > USER_MESSAGE_COLLAPSE_LINE_LIMIT;
+  const contentRef = useRef<HTMLDivElement>(null);
+  const hardLineOverflow = countHardLines(text) > USER_MESSAGE_COLLAPSE_LINE_LIMIT;
+  const [renderedOverflow, setRenderedOverflow] = useState<boolean | null>(
+    hardLineOverflow ? true : null,
+  );
   const [expanded, setExpanded] = useState(false);
+  const shouldFold = renderedOverflow === true;
+  const measuring = renderedOverflow === null;
   const folded = shouldFold && !expanded;
 
+  useLayoutEffect(() => {
+    const content = contentRef.current;
+    if (!content) return;
+    let active = true;
+    const measure = () => {
+      const measured = renderedUserMessageExceedsLineLimit(content);
+      const next = hardLineOverflow || measured;
+      if (!active || next === null) return;
+      setRenderedOverflow((current) => current === next ? current : next);
+    };
+
+    measure();
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure);
+    observer?.observe(content);
+    if (content.parentElement) observer?.observe(content.parentElement);
+    window.addEventListener('resize', measure);
+
+    const fonts = document.fonts;
+    fonts?.addEventListener?.('loadingdone', measure);
+    void fonts?.ready.then(() => {
+      if (active) measure();
+    });
+
+    return () => {
+      active = false;
+      observer?.disconnect();
+      window.removeEventListener('resize', measure);
+      fonts?.removeEventListener?.('loadingdone', measure);
+    };
+  }, [hardLineOverflow, text]);
+
   return (
-    <div class={`chat-user-message-fold${shouldFold ? ' is-foldable' : ''}${folded ? ' is-folded' : ''}`}>
-      <div class={`chat-bubble-content chat-user-message-fold-content${folded ? ' is-folded' : ''}`}>
+    <div class={`chat-user-message-fold${shouldFold ? ' is-foldable' : ''}${folded ? ' is-folded' : ''}${measuring ? ' is-measuring' : ''}`}>
+      <div
+        ref={contentRef}
+        class={`chat-bubble-content chat-user-message-fold-content${folded ? ' is-folded' : ''}${measuring ? ' is-measuring' : ''}`}
+      >
         {splitPathsAndUrls(text, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview)}
       </div>
       {shouldFold && (
@@ -5184,3 +5534,10 @@ function splitPathsAndUrls(
 
   return parts.length ? parts : [<span>{text}</span>];
 }
+
+/**
+ * Test seam: the renderer itself, so a contract test can measure what a type
+ * ACTUALLY draws instead of trusting the classification it is meant to check.
+ * Same convention as `__buildViewItemsForTests` above.
+ */
+export const __ChatEventForTests = ChatEvent;

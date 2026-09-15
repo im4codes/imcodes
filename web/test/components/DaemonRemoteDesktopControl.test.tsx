@@ -13,6 +13,17 @@ import { h } from 'preact';
 import { render, cleanup, act, fireEvent } from '@testing-library/preact';
 
 const mintTicket = vi.fn(async () => ({ ticket: 'ticket_minted_value' }));
+/**
+ * One mintable Desk, auto-selected. Before R5 this call passed `serverId` where
+ * the Desk now sits; both are strings, so TypeScript could not catch it. The
+ * assertion below therefore pins the exact argument ORDER, not just presence.
+ */
+const TEST_DESK = { id: 'desk-1', name: 'Ops Desk', role: 'owner' as const };
+const listMintableDesks = vi.fn(async () => [TEST_DESK]);
+vi.mock('../../src/api.js', async (importOriginal) => ({
+  ...(await importOriginal() as Record<string, unknown>),
+  listMintableDesks: () => listMintableDesks(),
+}));
 vi.mock('../../src/api/machines.js', async (importOriginal) => ({
   ...(await importOriginal() as Record<string, unknown>),
   mintControlledNodeExecutableTicket: (...args: unknown[]) => mintTicket(...args as []),
@@ -105,12 +116,16 @@ describe('DaemonRemoteDesktopControl', () => {
     expect(button.getAttribute('title')).toBe('remote_desktop.daemon_control');
     fireEvent.click(button);
     expect(onOpen).toHaveBeenCalledTimes(1);
-    // The panel is keyed by serverId, and gates on these fields.
-    expect(onOpen.mock.calls[0]![0]).toMatchObject({
+    // The panel is keyed by serverId and capability authority. Pin the whole
+    // synthetic daemon projection so descriptive OS metadata cannot return as
+    // an implicit launch gate.
+    expect(onOpen.mock.calls[0]![0]).toEqual({
       serverId: 'server_1',
-      os: 'win',
+      refName: '',
+      displayName: 'winbox',
       online: true,
       execEnabled: true,
+      accessRole: 'owner',
       capabilities: [REMOTE_DESKTOP_CAPABILITY],
     });
   });
@@ -188,16 +203,33 @@ describe('DaemonRemoteDesktopControl', () => {
       expect(onOpen).toHaveBeenCalledWith(expect.objectContaining({ serverId: 'server_1' }));
     });
 
-    it('mints a ticket bound to this daemon and hands it over', async () => {
+    it('mints a ticket bound to this daemon, with no group involved', async () => {
       const { view, sent } = mount(ready);
       fireEvent.click(view.container.querySelectorAll('button')[1]!);
       await act(async () => { await Promise.resolve(); });
+      // The daemon id is the host binding and the only argument there is.
+      // It used to sit behind a group id, and because both are strings, passing
+      // the daemon where the group belonged compiled silently.
       expect(mintTicket).toHaveBeenCalledWith({ os: 'win', arch: 'x64' }, 'server_1');
       expect(sent).toEqual([{
         type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST,
         ticket: 'ticket_minted_value',
       }]);
     });
+
+    it('can mint immediately, with no group list to wait for', async () => {
+      // The control used to stay disabled until a group list resolved, and
+      // refuse outright if the account had none. Enrolment binds this machine
+      // to its user; there is nothing to wait for.
+      mintTicket.mockClear();
+      const { view } = mount(ready);
+      const button = view.container.querySelectorAll('button')[1]!;
+      expect(button.hasAttribute('disabled')).toBe(false);
+      fireEvent.click(button);
+      await act(async () => { await Promise.resolve(); });
+      expect(mintTicket).toHaveBeenCalledTimes(1);
+    });
+
 
     it('reports a dismissed prompt without losing the retry', async () => {
       const { view, emit } = mount(ready);

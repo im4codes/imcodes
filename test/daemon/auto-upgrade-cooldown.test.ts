@@ -17,8 +17,13 @@
  * Pure-function harness — file IO is injected via `readSentinel` so
  * the tests don't need a tmpdir. Production wiring in
  * handleDaemonUpgrade reads ~/.imcodes/last-upgrade-at; upgrade.sh
- * writes it on a successful step 5 health check.
+ * writes it UNCONDITIONALLY after every upgrade attempt (a slow-but-
+ * successful restart used to miss the 14s health check and never write
+ * it, so the cooldown never armed and the node thrashed).
  */
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { evaluateAutoUpgradeCooldown } from '../../src/daemon/command-handler.js';
 
@@ -156,5 +161,36 @@ describe('evaluateAutoUpgradeCooldown', () => {
     });
     expect(v.onCooldown).toBe(true);
     expect(v.lastAt).toBe(lastAt);
+  });
+});
+
+/**
+ * The cooldown function above is only half the fix. The other half lives in the
+ * generated upgrade.sh: the sentinel must be written whether or not the 14s
+ * post-restart health check saw the new daemon. Gating it on the health check
+ * meant a slow-but-successful startup never armed the cooldown, so a busy node
+ * re-upgraded on every dev-tag poll (endless restart thrash). This is a
+ * source-level guard because the shell template is built inline inside
+ * handleDaemonUpgrade and is not separately invocable.
+ */
+describe('upgrade.sh cooldown sentinel is written unconditionally', () => {
+  const source = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'src', 'daemon', 'command-handler.ts'),
+    'utf8',
+  );
+
+  it('writes the sentinel outside the health-check success branch', () => {
+    const write = 'last-upgrade-at" 2>/dev/null || true';
+    const healthIf = source.indexOf('if [ -z "$HEALTH_PID" ]; then');
+    const writeAt = source.indexOf(write, healthIf);
+    expect(healthIf).toBeGreaterThan(-1);
+    expect(writeAt).toBeGreaterThan(-1);
+    // The `fi` that closes the health-check block must come BEFORE the sentinel
+    // write, i.e. the write is no longer nested in the success `else` branch.
+    const fiAt = source.indexOf('\nfi\n', healthIf);
+    expect(fiAt).toBeGreaterThan(-1);
+    expect(fiAt).toBeLessThan(writeAt);
+    // And there is no `else` between the health `if` and its closing `fi`.
+    expect(source.slice(healthIf, fiAt)).not.toContain('\nelse\n');
   });
 });

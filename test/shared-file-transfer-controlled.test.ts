@@ -104,7 +104,10 @@ describe('controlled file-transfer trust boundary', () => {
       requestId: 'directory-1',
       path: 'C:\\Users',
       resolvedPath: 'C:\\Users',
-      entries: [{ name: 'Public', path: 'C:\\Users\\Public', isDir: true, hidden: false }],
+      entries: [
+        { name: 'Public', path: 'C:\\Users\\Public', isDir: true, hidden: false },
+        { name: 'report.txt', path: 'C:\\Users\\report.txt', isDir: false, hidden: false },
+      ],
     }).ok).toBe(true);
     expect(validateControlledFileTransferResponse({
       type: FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE,

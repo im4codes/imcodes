@@ -93,6 +93,7 @@ import {
 import { PROJECT_ROOT } from './util/project-root.js';
 import { asReleaseChannel, getReleaseChannel } from '../shared/imcodes-version.js';
 import { INSTALLER_CONFIG_BASENAME, normalizeRegistryBase } from '../shared/installer-contract.js';
+import { daemonProcessAppearsRunning, isRecordedProcessIdentityCurrent, readInstanceLockMetadata } from './daemon/instance-lock.js';
 
 const { version } = JSON.parse(readFileSync(join(PROJECT_ROOT, 'package.json'), 'utf8')) as { version: string };
 
@@ -272,6 +273,12 @@ function killStaleImcodesProcesses(): void {
     if (!pid || pid <= 0 || pid === process.pid) return;
   } catch { return; /* no PID file — nothing to kill */ }
 
+  const owner = readInstanceLockMetadata();
+  if (!owner || owner.pid !== pid || !isRecordedProcessIdentityCurrent(owner)) {
+    console.warn(`[imcodes-daemon] refusing PID-only cleanup for ${pid}: exact PID+start identity is unavailable or stale`);
+    return;
+  }
+
   // Check if process is actually alive
   try { process.kill(pid, 0); } catch { return; /* already gone */ }
 
@@ -308,12 +315,24 @@ function ensureServiceForeground(): void {
     const svc = resolve(homedir(), '.config/systemd/user/imcodes.service');
     if (!existsSync(svc)) return;
     const content = readFileSync(svc, 'utf8');
-    if (content.includes('--foreground')) return;
-    const patched = content.replace(/^(ExecStart=.*imcodes start)$/m, '$1 --foreground');
+    if (content.includes('--foreground')
+      && /^KillMode=control-group$/m.test(content)
+      && /^TimeoutStopSec=45s$/m.test(content)
+      && /^SendSIGKILL=yes$/m.test(content)) return;
+    let patched = content.replace(/^(ExecStart=.*imcodes start)$/m, '$1 --foreground');
+    for (const [pattern, line] of [
+      [/^KillMode=.*$/m, 'KillMode=control-group'],
+      [/^TimeoutStopSec=.*$/m, 'TimeoutStopSec=45s'],
+      [/^SendSIGKILL=.*$/m, 'SendSIGKILL=yes'],
+    ] as const) {
+      patched = pattern.test(patched)
+        ? patched.replace(pattern, line)
+        : patched.replace(/^\[Service\]$/m, `[Service]\n${line}`);
+    }
     if (patched !== content) {
       writeFileSync(svc, patched, 'utf8');
       try { execSync('systemctl --user daemon-reload', { stdio: 'ignore' }); } catch { /* ok */ }
-      console.log('Patched systemd service: added --foreground');
+      console.log('Patched systemd service: foreground + bounded control-group shutdown authority');
     }
   }
 }
@@ -338,24 +357,16 @@ program
     if (opts.foreground) {
       // Acquire single-instance lock before installing global error handlers
       // so duplicate-instance errors propagate cleanly instead of being swallowed.
-      const { startup } = await import('./daemon/lifecycle.js');
+      const { startup, shutdown, describeDaemonStartupFailure } = await import('./daemon/lifecycle.js');
       try {
         await startup();
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (msg.includes('already running')) {
-          // Duplicate instance: this is the ONLY startup error that should exit.
-          console.error(msg);
-          process.exit(1);
-        }
-        // All other startup errors: log + keep the daemon alive.
-        // Exiting here would cause systemd to rapid-restart in a crash loop
-        // (see pre-fix daemon.log — 479 fatal errors, all transient tmux issues).
-        // Subsystems that failed to initialize will retry lazily when used.
-        // Uncaught errors hitting the global handlers at the top of this file
-        // are the backstop for any post-startup crashes.
-        logger.error({ err }, 'startup() failed — daemon stays alive with degraded state');
+        const diagnostic = describeDaemonStartupFailure(err);
+        console.error(`[imcodes-daemon] startup failed: ${JSON.stringify(diagnostic)}`);
+        logger.error({ err, diagnostic }, 'startup() failed — releasing authority and exiting fail-closed');
         forwardDaemonError('uncaughtException', err);
+        await shutdown(1);
+        return;
       }
       // Called by launchd/systemd plist/unit — run inline.
       // Global error handlers are registered at the top of this file.
@@ -460,27 +471,23 @@ program
       const storedPid = readFileSync(pidFile, 'utf8').trim();
       if (storedPid) {
         daemonPid = storedPid;
-        // Check if process is actually running
-        try {
-          process.kill(parseInt(storedPid, 10), 0);
-          daemonRunning = true;
-        } catch (err: any) {
-          // On Windows, EPERM means the process IS alive but was spawned in
-          // a different security context (e.g. VBS/watchdog detached launch).
-          // Treating EPERM as "dead" causes `imcodes status` to show "stopped"
-          // when the daemon is actually running fine.
-          if (err?.code === 'EPERM') {
-            daemonRunning = true;
-          }
-          // ESRCH = no such process = actually dead
-        }
+        // `kill(pid, 0)` succeeds for a zombie, so it reported a reaped daemon as
+        // running. The shared probe only reports `reclaimable` on positive proof
+        // (absent, or a Z/X/x state), and `unknown` still displays as running so
+        // the Windows cross-security-context case keeps its previous behaviour.
+        daemonRunning = daemonProcessAppearsRunning(Number.parseInt(storedPid, 10));
       }
     } catch { /* no PID file */ }
     // Fallback: systemd (Linux only)
     if (!daemonRunning && process.platform === 'linux') {
       try {
         const out = execSync('systemctl --user show imcodes --property=MainPID --value 2>/dev/null', { encoding: 'utf8' }).trim();
-        if (out && out !== '0') { daemonPid = out; daemonRunning = true; }
+        // systemd keeps reporting a non-zero MainPID while the unit is falsely
+        // active with a zombie main process, so the PID alone proves nothing.
+        if (out && out !== '0' && daemonProcessAppearsRunning(Number.parseInt(out, 10))) {
+          daemonPid = out;
+          daemonRunning = true;
+        }
       } catch { /* not using systemd */ }
     }
     const daemonPidNumber = daemonPid ? parseInt(daemonPid, 10) : NaN;
@@ -839,16 +846,22 @@ async function postToHookServer(
 
 program
   .command('audit-reply')
-  .description('Submit one structured peer-audit reply to the running daemon (no terminal fallback)')
+  .description('Append a structured peer-audit receipt to the running daemon (no terminal fallback)')
+  .requiredOption('--task-id <id>', 'Exact supervision task id')
+  .requiredOption('--assignment-id <id>', 'Exact auditor assignment id')
   .requiredOption('--attempt-id <id>', 'Opaque peer-audit attempt id')
-  .requiredOption('--capability <capability>', 'One-time peer-audit reply capability')
-  .requiredOption('--verdict <verdict>', 'PASS or REWORK')
+  .requiredOption('--revision <revision>', 'Exact audited revision')
+  .requiredOption('--receipt-kind <kind>', 'progress or final')
+  .option('--verdict <verdict>', 'PASS or REWORK; required for final receipts')
   .requiredOption('--findings-file <path>', 'UTF-8 findings file')
   .requiredOption('--validations-file <path>', 'JSON array of validation summary items')
   .action(async (opts: {
+    taskId: string;
+    assignmentId: string;
     attemptId: string;
-    capability: string;
-    verdict: string;
+    revision: string;
+    receiptKind: string;
+    verdict?: string;
     findingsFile: string;
     validationsFile: string;
   }) => {
@@ -876,8 +889,12 @@ program
   .option('--turn-host <host>', 'Separate DNS-only TURN hostname (default: turn.<domain>; never orange-cloud proxied)')
   .option('--turn-port <port>', 'TURN UDP/TCP listener port (default: 3479)')
   .option('--turn-external-ip <ipv4>', 'Public IPv4 advertised by coturn')
-  .option('--turn-relay-min-port <port>', 'First TURN relay UDP port (default: 49160)')
-  .option('--turn-relay-max-port <port>', 'Last TURN relay UDP port (default: 49200)')
+  .option(
+    '--turn-relay-capacity <allocations>',
+    'Maximum concurrent TURN relay allocations, not users (1-30000, default: 100)',
+  )
+  .option('--turn-relay-min-port <port>', 'First TURN relay UDP port (explicit override; needs --turn-relay-max-port)')
+  .option('--turn-relay-max-port <port>', 'Last TURN relay UDP port (explicit override; needs --turn-relay-min-port)')
   .option('--turn-dns-only', 'Confirm the TURN hostname is not proxied by Cloudflare or another HTTP proxy')
   .action(async (opts: {
     domain: string;
@@ -886,6 +903,7 @@ program
     turnHost?: string;
     turnPort?: string;
     turnExternalIp?: string;
+    turnRelayCapacity?: string;
     turnRelayMinPort?: string;
     turnRelayMaxPort?: string;
     turnDnsOnly?: boolean;
@@ -897,6 +915,7 @@ program
       turnHost: opts.turnHost,
       turnPort: opts.turnPort,
       turnExternalIp: opts.turnExternalIp,
+      turnRelayCapacity: opts.turnRelayCapacity,
       turnRelayMinPort: opts.turnRelayMinPort,
       turnRelayMaxPort: opts.turnRelayMaxPort,
       turnDnsOnly: opts.turnDnsOnly,
@@ -1255,6 +1274,17 @@ program
     } else {
       console.log('Watchdog files regenerated. Daemon will start on next login (Startup shortcut).');
     }
+  });
+
+program
+  .command('recover-service')
+  .description('One bounded check for a falsely-active daemon unit (run by imcodes-recovery.timer)')
+  .action(async () => {
+    // Executed by the shipped oneshot unit, outside imcodes.service's cgroup,
+    // because a zombie main process cannot run its own recovery.
+    const { runShippedServiceRecovery } = await import('./daemon/service-recovery-runner.js');
+    const outcome = await runShippedServiceRecovery();
+    console.log(JSON.stringify(outcome));
   });
 
 // ── Memory search CLI ────────────────────────────────────────────────────────

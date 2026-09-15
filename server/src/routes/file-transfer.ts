@@ -37,9 +37,10 @@ import {
   validateMachineDirectUploadRequest,
 } from '../../../shared/machine-direct-file-transfer.js';
 import {
-  canOperateControlledMachine,
-  resolveControlledMachineAccess,
+  resolveControlledMachineOperatorAccess,
 } from '../share/machine-access.js';
+import { resolveMachineOperationalAccess } from '../share/shared-machine-authority.js';
+import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../../shared/shared-machine-authority.js';
 import { FS_GENERIC_ERROR_CODES } from '../../../shared/fs-error-codes.js';
 import type {
   AttachmentRef,
@@ -112,15 +113,13 @@ async function hasCurrentControlledStageAccess(
   entry: { serverId: string; controlledAccessUserId?: string },
 ): Promise<boolean> {
   if (!entry.controlledAccessUserId) return true;
-  const access = await resolveControlledMachineAccess(
+  const access = await resolveControlledMachineOperatorAccess(
     db,
     entry.controlledAccessUserId,
     entry.serverId,
     Date.now(),
   );
-  return access != null
-    && canOperateControlledMachine(access.access_role)
-    && access.exec_enabled;
+  return access != null && access.exec_enabled;
 }
 
 function settleStagedDownloadReady(downloadId: string, settle: (entry: NonNullable<ReturnType<typeof stagedDownloads.get>>) => void): void {
@@ -435,8 +434,18 @@ async function authorizeControlledFileTarget(
   if (!authenticatedFullDaemon && !authenticatedInteractiveUser) {
     return { ok: false, reason: 'scoped_auth' };
   }
-  const access = await resolveControlledMachineAccess(c.env.DB, userId, serverId, Date.now());
-  if (!access || !canOperateControlledMachine(access.access_role)) {
+  const now = Date.now();
+  const access = authenticatedFullDaemon
+    ? (await resolveMachineOperationalAccess(c.env.DB, {
+        token: c.req.header(SHARED_MACHINE_AUTHORITY_HEADER),
+        signingKey: c.env.JWT_SIGNING_KEY,
+        authenticatedSourceServerId: sourceServerId!,
+        sourceOwnerUserId: userId,
+        targetServerId: serverId,
+        now,
+      }))?.target ?? null
+    : await resolveControlledMachineOperatorAccess(c.env.DB, userId, serverId, now);
+  if (!access) {
     return { ok: false, reason: 'target_forbidden' };
   }
   if (!access.exec_enabled) return { ok: false, reason: 'exec_disabled' };

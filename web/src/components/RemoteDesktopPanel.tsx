@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import {
   REMOTE_DESKTOP_ACCESS_MODE,
@@ -6,8 +6,8 @@ import {
   REMOTE_DESKTOP_COMMON_DISPLAY_MODES,
   REMOTE_DESKTOP_DPI_SCALE_PERCENTS,
   REMOTE_DESKTOP_ERROR,
-  REMOTE_DESKTOP_LIMITS,
   REMOTE_DESKTOP_STATE,
+  REMOTE_DESKTOP_STOP_ORIGIN,
   REMOTE_DESKTOP_TERMINAL_REASON,
   mapRemoteDesktopVideoPoint,
   type RemoteDesktopNormalizedPoint,
@@ -15,35 +15,72 @@ import {
 import {
   FILE_TRANSFER_DIRECTORY_CAPABILITY,
   FILE_TRANSFER_DIRECTORY_PATH,
+  isFileTransferWellKnownDirectoryPath,
+  FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
 } from '@shared/transport/file-transfer.js';
+import {
+  isPointOverRemoteDesktopOverlay,
+  REMOTE_DESKTOP_OVERLAY_CLASS,
+} from '../remote-desktop-pointer-overlay.js';
 import { downloadAttachment } from '../api.js';
+import {
+  canRevealSavedDownload,
+  revealSavedDownload,
+  savedDownloadFileHandle,
+  type SavedDownloadFileHandle,
+} from '../download-file-actions.js';
 import { createMachineFileHandle, type MachineListItem } from '../api/machines.js';
 import { MachineDirectoryWsAdapter } from '../machine-directory-ws-adapter.js';
 import {
+  FILE_DOWNLOAD_TRANSPORT_MODE,
   FILE_UPLOAD_TRANSPORT_MODE,
+  downloadPreviewWithDirectFallback,
   isFileUploadCanceled,
+  selectPreviewDownloadDestination,
   uploadFileWithDirectFallback,
+  type FileDownloadTransportMode,
   type FileUploadTransportMode,
 } from '../direct-file-transfer.js';
-import { RemoteDesktopClient, type RemoteDesktopSnapshot } from '../remote-desktop-client.js';
+import type { RemoteDesktopSnapshot } from '../remote-desktop-client.js';
 import {
-  REMOTE_DESKTOP_MOBILE_SHORTCUTS,
-  isAppleControllerPlatform,
+  RemoteDesktopConnectionManager,
+  remoteDesktopHostKey,
+  type RemoteDesktopManagedConnection,
+} from '../remote-desktop-connection-manager.js';
+import {
+  REMOTE_DESKTOP_COMPUTER_KEYBOARD_PAGES,
   detectRemoteDesktopClipboardShortcut,
+  focusRemoteDesktopMobileInput,
+  isAppleControllerPlatform,
   mapRemoteDesktopKeyboardEvent,
   readControllerPlatform,
+  remoteDesktopCommandBridge,
+  remoteDesktopComputerKeyLabel,
   REMOTE_DESKTOP_CLIPBOARD_SHORTCUT,
   remoteDesktopMobileDeletionKey,
-  remoteDesktopShortcutLabel,
   sendRemoteDesktopChord,
+  type RemoteDesktopChordKey,
+  type RemoteDesktopComputerKeySpec,
 } from '../remote-desktop-keyboard.js';
+import { resolveRemoteDesktopSessionProfile } from '@shared/remote-desktop-platform.js';
 import { formatByteRate, formatByteSize } from '../util/byte-size.js';
-import { copyToClipboard } from '../util/clipboard.js';
+import { copyToClipboardWhenReady } from '../util/clipboard.js';
 import type { WsClient } from '../ws-client.js';
 import { openRemoteDesktopWindow } from '../remote-desktop-window.js';
+import { useFullscreen } from '../hooks/useFullscreen.js';
+import {
+  REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT,
+  recordRemoteDesktopBrowserDiagnostic,
+  type RemoteDesktopBrowserDiagnosticEvent,
+} from '../remote-desktop-browser-diagnostics.js';
 import { FloatingPanel } from './FloatingPanel.js';
 import { DesktopWindowMaximizeButton } from './DesktopWindowMaximizeButton.js';
 import { FileBrowser } from './FileBrowser.js';
+import {
+  EMPTY_QUICK_DATA,
+  QuickInputPanel,
+  type UseQuickDataResult,
+} from './QuickInputPanel.js';
 import {
   INITIAL_REMOTE_DESKTOP_VIEWPORT,
   clampRemoteDesktopViewport,
@@ -58,6 +95,7 @@ import {
 
 type ViewScale = 'fit' | 'actual';
 type MobileInputMode = 'touch' | 'mouse';
+type MobileKeyboardTab = 'ime' | 'keys';
 type ClipboardStatus = 'idle' | 'copying' | 'copied' | 'pasting' | 'pasted' | 'empty' | 'failed';
 type DesktopPointerMoveSource =
   | 'window-mouse'
@@ -66,6 +104,20 @@ type DesktopPointerMoveSource =
   | 'stage-pointer'
   | 'surface-mouse'
   | 'surface-pointer';
+
+const NOOP_QUICK_DATA: UseQuickDataResult = {
+  data: EMPTY_QUICK_DATA,
+  loaded: true,
+  recordHistory: () => {},
+  addCommand: () => {},
+  addPhrase: () => {},
+  removeCommand: () => {},
+  removePhrase: () => {},
+  removeHistory: () => {},
+  removeSessionHistory: () => {},
+  clearHistory: () => {},
+  clearSessionHistory: () => {},
+};
 
 interface TouchPoint {
   x: number;
@@ -83,12 +135,25 @@ type TouchSingleGesture = {
   viewport: RemoteDesktopViewport;
 };
 
-type TouchGesture = TouchSingleGesture | {
-  kind: 'pinch';
+/**
+ * A two-finger touch starts ambiguous ('pending') and resolves to exactly
+ * one of the other two phases on the first move past a small jitter
+ * threshold: fingers moving apart/together (distance changing) means
+ * pinch-to-zoom the local view, same as before; fingers moving together
+ * (center moving, distance roughly constant) means scroll the remote
+ * content instead. Once resolved the gesture stays that way for its whole
+ * duration -- re-deciding on every move would flip modes mid-drag.
+ */
+type TouchTwoFingerGesture = {
+  kind: 'two-finger';
+  phase: 'pending' | 'pinch' | 'scroll';
   initialCenter: TouchPoint;
   initialDistance: number;
   viewport: RemoteDesktopViewport;
+  lastCenter: TouchPoint;
 };
+
+type TouchGesture = TouchSingleGesture | TouchTwoFingerGesture;
 
 type VirtualMouseDrag = {
   kind: 'move';
@@ -137,7 +202,6 @@ const INITIAL_SNAPSHOT: RemoteDesktopSnapshot = {
   capabilityVersion: REMOTE_DESKTOP_CAPABILITY,
 };
 
-const MAX_REMOTE_DESKTOP_RECONNECTS = REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS;
 /**
  * The resolutions to offer for a display: the ones its driver reported, or the
  * common sizes when the node is too old to report any. A node that reports them
@@ -162,6 +226,9 @@ function displayModeOptions(
 
 /** How long a refused-command notice stays up before it fades on its own. */
 const CONTROL_NOTICE_MS = 6_000;
+/** How long the clipboard toast stays up before it fades on its own. */
+const CLIPBOARD_STATUS_TOAST_MS = 1_800;
+const REMOTE_DESKTOP_QUICK_INPUT_Z_INDEX = 10_050;
 const TOUCH_LONG_PRESS_MS = 550;
 const TOUCH_DOUBLE_TAP_MS = 400;
 const DESKTOP_DOUBLE_CLICK_MS = 500;
@@ -170,16 +237,20 @@ const DESKTOP_DOUBLE_CLICK_MS = 500;
 // scaling and turn an intended double-click into two singles.
 const DESKTOP_DOUBLE_CLICK_DISTANCE_PX = 8;
 const TOUCH_DOUBLE_TAP_DISTANCE_PX = 32;
-const RECONNECTABLE_REMOTE_DESKTOP_FAILURES = new Set<string>([
-  REMOTE_DESKTOP_ERROR.DAEMON_OFFLINE,
-  REMOTE_DESKTOP_ERROR.NEGOTIATION_TIMEOUT,
-  REMOTE_DESKTOP_TERMINAL_REASON.BROWSER_DISCONNECTED,
-  REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED,
-  REMOTE_DESKTOP_TERMINAL_REASON.NEGOTIATION_TIMEOUT,
-  REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED,
-  REMOTE_DESKTOP_TERMINAL_REASON.WORKER_FAILED,
-]);
-
+// How far a two-finger touch has to move, in either the finger-to-finger
+// distance or the pair's center, before it commits to pinch vs. scroll --
+// below this it is still just jitter from two fingers landing imperfectly
+// together.
+const TOUCH_TWO_FINGER_CLASSIFY_PX = 8;
+// Matches the virtual-mouse wheel handle's own gain (below), so two-finger
+// scroll on the video and dragging that handle feel the same.
+const TOUCH_TWO_FINGER_SCROLL_GAIN = 8;
+// Same jitter-filter idea as the two-finger video gesture above, for
+// swiping between computer-keyboard pages: how far a drag has to move
+// before it commits to being a swipe, and what fraction of the page's own
+// width it then has to cross to flip pages instead of springing back.
+const COMPUTER_KEYBOARD_SWIPE_JITTER_PX = 8;
+const COMPUTER_KEYBOARD_SWIPE_COMMIT_RATIO = 0.2;
 const REMOTE_DESKTOP_CONNECTION_STEPS = [
   'authorize',
   'worker',
@@ -212,24 +283,25 @@ function activeRemoteDesktopConnectionStep(
   }
 }
 
-export function canOpenRemoteDesktop(machine: MachineListItem): boolean {
-  const role = machine.accessRole ?? 'owner';
-  return machine.os === 'win'
-    && machine.online
-    && machine.execEnabled
-    && (role === 'owner' || role === 'participant')
-    && Boolean(machine.capabilities?.includes(REMOTE_DESKTOP_CAPABILITY));
+export function remoteDesktopQuickInputHistoryKey(hostKey: string): string {
+  return `remote-desktop:${hostKey}`;
 }
 
 export interface RemoteDesktopPanelProps {
   machine: MachineListItem;
+  connectionManager?: RemoteDesktopConnectionManager;
   ws?: WsClient | null;
-  minimized?: boolean;
   standalone?: boolean;
   allowStandaloneWindow?: boolean;
-  onMinimize?(): void;
-  onRestore?(): void;
+  /** Render inside the single remote-desktop workspace root, without another floating shell. */
+  embedded?: boolean;
+  /** Presentation visibility inside the workspace. The connection remains mounted while hidden. */
+  active?: boolean;
+  /** Only the active ordinary host tab may own keyboard/pointer input. */
+  inputActive?: boolean;
   onClose(): void;
+  /** Clear protected workspace metadata when Server authority is terminally lost. */
+  onAuthorityLost?(): void;
   /**
    * Managed desktop-stack z-index. Without it the panel sat at a hardcoded
    * 10020, above every stack-managed window, so no other window could ever be
@@ -238,13 +310,18 @@ export interface RemoteDesktopPanelProps {
   zIndex?: number;
   /** Raise this window. Wired to a mousedown anywhere inside the panel. */
   onFocus?(): void;
+  /** Account-scoped quick-input state shared with chat and every desktop host. */
+  quickData?: UseQuickDataResult;
 }
 
 interface RemoteDesktopTransferRow {
   id: string;
   name: string;
+  direction: 'send' | 'fetch';
+  sourcePath: string;
+  destinationPath: string;
   progress: number;
-  transport: FileUploadTransportMode;
+  transport: FileUploadTransportMode | FileDownloadTransportMode;
   status: 'transferring' | 'done' | 'canceled' | 'error';
   /** Known for a file being sent; a fetch learns it only on completion. */
   sizeBytes?: number;
@@ -267,15 +344,18 @@ function activeTransferProgress(rows: readonly RemoteDesktopTransferRow[]): {
 
 export function RemoteDesktopPanel({
   machine,
+  connectionManager,
   ws = null,
-  minimized = false,
   standalone = false,
   allowStandaloneWindow = false,
-  onMinimize,
-  onRestore,
+  embedded = false,
+  active = true,
+  inputActive = true,
   onClose,
+  onAuthorityLost,
   zIndex,
   onFocus,
+  quickData,
 }: RemoteDesktopPanelProps) {
   const { t } = useTranslation();
   const [snapshot, setSnapshot] = useState<RemoteDesktopSnapshot>(INITIAL_SNAPSHOT);
@@ -284,7 +364,6 @@ export function RemoteDesktopPanel({
   const [viewport, setViewport] = useState<RemoteDesktopViewport>(INITIAL_REMOTE_DESKTOP_VIEWPORT);
   const [virtualMouse, setVirtualMouse] = useState<TouchPoint>({ x: 0, y: 0 });
   const [viewportGeometryRevision, setViewportGeometryRevision] = useState(0);
-  const [clientGeneration, setClientGeneration] = useState(0);
   /**
    * How many hover/drag moves this panel actually received from the browser,
    * next to how many the client managed to send. Reported side by side because
@@ -314,27 +393,92 @@ export function RemoteDesktopPanel({
   );
   const [transfers, setTransfers] = useState<RemoteDesktopTransferRow[]>([]);
   const [transferError, setTransferError] = useState<string | null>(null);
-  const [fetchPath, setFetchPath] = useState('');
   const [filePanelOpen, setFilePanelOpen] = useState(false);
   const [fileDrawerMinimized, setFileDrawerMinimized] = useState(false);
-  const [directoryPickerOpen, setDirectoryPickerOpen] = useState(false);
   const [destinationDirectory, setDestinationDirectory] = useState('');
+  const [selectedLocalFiles, setSelectedLocalFiles] = useState<File[]>([]);
+  const [selectedRemoteFile, setSelectedRemoteFile] = useState('');
+  const [legacyFetchPath, setLegacyFetchPath] = useState('');
   const [fileDropActive, setFileDropActive] = useState(false);
   const [mobileTextOpen, setMobileTextOpen] = useState(false);
+  const [mobileKeyboardTab, setMobileKeyboardTab] = useState<MobileKeyboardTab>('ime');
+  const [comboMode, setComboMode] = useState(false);
+  // Modifiers latched down in combo mode, waiting for either a second tap
+  // (release) or a non-modifier key tap (fire the chord, then auto-release).
+  const [heldComboKeys, setHeldComboKeys] = useState<readonly RemoteDesktopChordKey[]>([]);
+  // Which computer-keyboard page (modifiers/F-keys/navigation, or the full
+  // alphanumeric layout) is showing. A latched combo modifier survives a
+  // swipe between pages on purpose -- holding Control on page one, then
+  // swiping to page two to tap a letter, is a real way to build a chord.
+  const [computerKeyboardPage, setComputerKeyboardPage] = useState(0);
+  // Live horizontal drag offset (px) while a page swipe is in progress;
+  // reset to 0 once the drag commits or cancels, at which point
+  // `computerKeyboardPage` alone drives the resting position.
+  const [computerKeyboardSwipeOffset, setComputerKeyboardSwipeOffset] = useState(0);
+  const computerKeyboardSwipeRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    dragging: boolean;
+    deltaX: number;
+  } | null>(null);
+  const computerKeyboardPagesViewportRef = useRef<HTMLDivElement | null>(null);
+  // How far the OS on-screen keyboard currently eats into the layout
+  // viewport from the bottom. The docked keyboard panel normally just sits
+  // in its own grid row, but a phone's own keyboard resizes only the visual
+  // viewport (not the layout viewport this panel is sized against), so the
+  // browser instead scrolls the focused textarea into view -- carrying the
+  // panel's own tab switcher, which sits above that textarea, off the top
+  // of the screen along with it. Tracking the inset lets the panel pin
+  // itself directly above the OS keyboard instead of riding along with that
+  // scroll.
+  const [mobileKeyboardViewportInset, setMobileKeyboardViewportInset] = useState(0);
+  // Pinning the panel (above) takes it out of the grid flow entirely --
+  // `position: fixed` items are not grid items at all -- so without this the
+  // stage's grid row (minmax(0, 1fr)) would expand to reclaim the vacated
+  // row and grow well past where the video actually still fits above the OS
+  // keyboard, leaving a tall black gap with the video squeezed to the
+  // bottom of it. A same-height spacer left behind in the panel's normal
+  // grid slot keeps that row's space reserved while the real, pinned panel
+  // renders on top of the keyboard.
+  const mobileKeyboardPanelRef = useRef<HTMLDivElement | null>(null);
+  const [mobileKeyboardPanelHeight, setMobileKeyboardPanelHeight] = useState(0);
+  const [quickInputOpen, setQuickInputOpen] = useState(false);
+  const [quickInputPortalContainer, setQuickInputPortalContainer] = useState<Element | null>(null);
   const [displayModeMenu, setDisplayModeMenu] = useState<DisplayModeMenuState | null>(null);
   const [clipboardStatus, setClipboardStatus] = useState<ClipboardStatus>('idle');
   const [mediaPresented, setMediaPresented] = useState(false);
+  const [mediaRecovering, setMediaRecovering] = useState(false);
+  const [hasCachedFrame, setHasCachedFrame] = useState(false);
   const [desktopMaximized, setDesktopMaximized] = useState(false);
+  const [nerdStatsOpen, setNerdStatsOpen] = useState(false);
   const [controlNotice, setControlNotice] = useState<{ id: number; text: string } | null>(null);
-  const clientRef = useRef<RemoteDesktopClient | null>(null);
+  const clientRef = useRef<RemoteDesktopManagedConnection | null>(null);
+  const ownedConnectionManagerRef = useRef<RemoteDesktopConnectionManager | null>(null);
+  const presentationRef = useRef<object>({});
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const lastFrameCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const panelRef = useRef<HTMLDivElement | null>(null);
+  const quickInputTriggerRef = useRef<HTMLDivElement | null>(null);
+  const quickInputSentRef = useRef(false);
+  const quickInputBindingRef = useRef<{
+    hostKey: string;
+    inputEpoch: number;
+    client: RemoteDesktopManagedConnection;
+  } | null>(null);
+  // Shared with the workspace chrome, so that Esc, a second fullscreen
+  // elsewhere on the page, and a browser that refuses outright all behave the
+  // same wherever the button appears.
+  const fullscreen = useFullscreen(panelRef);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const mobileTextInputRef = useRef<HTMLTextAreaElement | null>(null);
   const mobileTextComposingRef = useRef(false);
   const mobileTextLastCompositionCommitRef = useRef<string | null>(null);
-  const machineDirectoryAdapterRef = useRef<MachineDirectoryWsAdapter | null>(null);
+  const machineDirectoryAdapter = useMemo(
+    () => new MachineDirectoryWsAdapter(machine.serverId),
+    [machine.serverId],
+  );
   const displayModeMenuRef = useRef<HTMLDivElement | null>(null);
   const viewportRef = useRef<RemoteDesktopViewport>(INITIAL_REMOTE_DESKTOP_VIEWPORT);
   const virtualMouseRef = useRef<TouchPoint>({ x: 0, y: 0 });
@@ -357,112 +501,263 @@ export function RemoteDesktopPanel({
     normalized: TouchPoint;
   } | null>(null);
   const lastTouchRemotePointRef = useRef<TouchPoint>({ x: 0.5, y: 0.5 });
-  const reconnectCountRef = useRef(0);
-  const forceWorkerRecycleRef = useRef(false);
-  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const reconnectStabilityTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const transferControllersRef = useRef(new Map<string, AbortController>());
-  const unmountedRef = useRef(false);
+  /**
+   * The saved file behind each finished fetch that has one. Only a fetch
+   * written through the save picker does; one handed to the browser's download
+   * manager is invisible to the page and gets no "Show in folder" button.
+   */
+  const savedFetchFilesRef = useRef(new Map<string, SavedDownloadFileHandle>());
   const displayTabLongPressRef = useRef<DisplayTabLongPress | null>(null);
   const suppressDisplayTabClickRef = useRef(false);
   const suppressDisplayTabClickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const previousInputEnabledRef = useRef(false);
   const mediaPresentedRef = useRef(false);
+  const mediaRecoveringRef = useRef(false);
+  const hasCachedFrameRef = useRef(false);
+  const lastCachedFrameAtRef = useRef(Number.NEGATIVE_INFINITY);
+  const lastVideoDiagnosticAtRef = useRef(Number.NEGATIVE_INFINITY);
   const forwardedCommandCodesRef = useRef(new Set<string>());
   const suppressedCommandCodesRef = useRef(new Set<string>());
   const syntheticCommandControlRef = useRef(false);
   const commandMiddleDragPointerRef = useRef<number | null>(null);
   const forwardedPasteShortcutAtRef = useRef(0);
+
+  const recordVideoDiagnostic = useCallback((
+    type: RemoteDesktopBrowserDiagnosticEvent,
+    callbackNowMs?: number,
+    metadata?: VideoFrameCallbackMetadata,
+  ) => {
+    const video = videoRef.current;
+    recordRemoteDesktopBrowserDiagnostic(machine.serverId, {
+      type,
+      videoReadyState: video?.readyState,
+      videoNetworkState: video?.networkState,
+      videoCurrentTimeMs: video && Number.isFinite(video.currentTime)
+        ? Math.max(0, Math.round(video.currentTime * 1_000))
+        : undefined,
+      videoWidth: video?.videoWidth,
+      videoHeight: video?.videoHeight,
+      callbackNowMs: callbackNowMs === undefined ? undefined : Math.round(callbackNowMs),
+      mediaTimeMs: metadata && Number.isFinite(metadata.mediaTime)
+        ? Math.max(0, Math.round(metadata.mediaTime * 1_000))
+        : undefined,
+      presentedFrames: metadata && Number.isFinite(metadata.presentedFrames)
+        ? Math.max(0, Math.round(metadata.presentedFrames))
+        : undefined,
+      documentVisible: document.visibilityState === 'visible',
+    });
+  }, [machine.serverId]);
+
+  const clearCachedFrame = useCallback(() => {
+    const canvas = lastFrameCanvasRef.current;
+    const hadFrame = hasCachedFrameRef.current;
+    if (canvas && hadFrame) {
+      canvas.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height);
+      // Resetting the backing store releases the pixel buffer immediately;
+      // hiding a canvas alone would retain the last remote desktop in memory.
+      canvas.width = 1;
+      canvas.height = 1;
+    }
+    hasCachedFrameRef.current = false;
+    const wasRecovering = mediaRecoveringRef.current;
+    mediaRecoveringRef.current = false;
+    lastCachedFrameAtRef.current = Number.NEGATIVE_INFINITY;
+    if (hadFrame) setHasCachedFrame(false);
+    if (wasRecovering) setMediaRecovering(false);
+    if (hadFrame) {
+      recordVideoDiagnostic(REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.VIDEO_FALLBACK_CLEARED);
+    }
+  }, [recordVideoDiagnostic]);
+
+  const showCachedFrame = useCallback((type: RemoteDesktopBrowserDiagnosticEvent) => {
+    recordVideoDiagnostic(type);
+    if (!hasCachedFrameRef.current || mediaRecoveringRef.current) return;
+    mediaRecoveringRef.current = true;
+    setMediaRecovering(true);
+    recordVideoDiagnostic(REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.VIDEO_FALLBACK_SHOWN);
+  }, [recordVideoDiagnostic]);
+
+  const cachePresentedFrame = useCallback((
+    video: HTMLVideoElement,
+    callbackNowMs: number,
+    metadata: VideoFrameCallbackMetadata,
+  ) => {
+    if (video.videoWidth <= 0 || video.videoHeight <= 0) return;
+    if (!hasCachedFrameRef.current
+      || callbackNowMs - lastCachedFrameAtRef.current >= 250) {
+      const canvas = lastFrameCanvasRef.current;
+      const context = canvas?.getContext('2d');
+      if (canvas && context) {
+        const scale = Math.min(1, 1_280 / video.videoWidth, 720 / video.videoHeight);
+        const width = Math.max(1, Math.round(video.videoWidth * scale));
+        const height = Math.max(1, Math.round(video.videoHeight * scale));
+        if (canvas.width !== width) canvas.width = width;
+        if (canvas.height !== height) canvas.height = height;
+        try {
+          context.drawImage(video, 0, 0, width, height);
+          lastCachedFrameAtRef.current = callbackNowMs;
+          if (!hasCachedFrameRef.current) {
+            hasCachedFrameRef.current = true;
+            setHasCachedFrame(true);
+          }
+        } catch {
+          // A browser may temporarily refuse a draw while the decoder changes
+          // surfaces. Keep the already cached frame; never replace it with
+          // blank pixels merely because this refresh failed.
+        }
+      }
+    }
+    if (callbackNowMs - lastVideoDiagnosticAtRef.current >= 1_000) {
+      lastVideoDiagnosticAtRef.current = callbackNowMs;
+      recordVideoDiagnostic(
+        REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.VIDEO_FRAME,
+        callbackNowMs,
+        metadata,
+      );
+    }
+    if (mediaRecoveringRef.current) {
+      mediaRecoveringRef.current = false;
+      setMediaRecovering(false);
+      recordVideoDiagnostic(REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.VIDEO_FALLBACK_HIDDEN);
+    }
+  }, [recordVideoDiagnostic]);
   const supportsDirectoryTransfer = Boolean(machine.capabilities?.includes(FILE_TRANSFER_DIRECTORY_CAPABILITY));
-
-  if (!machineDirectoryAdapterRef.current) {
-    machineDirectoryAdapterRef.current = new MachineDirectoryWsAdapter(machine.serverId);
+  const supportsPathHandleTransfer = Boolean(machine.capabilities?.includes(FILE_TRANSFER_PATH_HANDLE_CAPABILITY));
+  // Descriptive OS metadata (machine.os) is deliberately not authority here,
+  // matching the rest of the remote-desktop stack: this is the same
+  // capability-resolved platform the readiness/profile resolver already
+  // uses to decide what the session can do, now also used to decide what an
+  // Apple controller's Command key means on the wire for THIS target.
+  const targetPlatform = useMemo(
+    () => resolveRemoteDesktopSessionProfile(machine.capabilities)?.platform ?? null,
+    [machine.capabilities],
+  );
+  const commandBridge = useMemo(
+    () => remoteDesktopCommandBridge(readControllerPlatform(), targetPlatform),
+    [targetPlatform],
+  );
+  const fetchSourcePath = supportsPathHandleTransfer
+    ? (supportsDirectoryTransfer ? selectedRemoteFile : legacyFetchPath.trim())
+    : '';
+  const handleRemotePathChange = useCallback((path: string) => {
+    // A sentinel is a REQUEST, not a location. The browser publishes it the
+    // instant navigation starts and only rewrites it to the daemon's
+    // `resolvedPath` once the listing lands, so accepting it here would briefly
+    // advertise ":downloads:" as the send destination -- and a send in that
+    // window would target a directory that does not exist.
+    const isUnresolved = path === FILE_TRANSFER_DIRECTORY_PATH.WINDOWS_DRIVES
+      || path === FILE_TRANSFER_DIRECTORY_PATH.WINDOWS_DRIVES_ROOT
+      || isFileTransferWellKnownDirectoryPath(path)
+      || path === t('file_browser.this_pc');
+    setDestinationDirectory(isUnresolved ? '' : path);
+    setSelectedRemoteFile('');
+  }, [t]);
+  const handleRemoteSelectionChange = useCallback((path: string | null, isDirectory: boolean) => {
+    if (!path) {
+      setSelectedRemoteFile('');
+      return;
+    }
+    if (isDirectory) {
+      setDestinationDirectory(path);
+      setSelectedRemoteFile('');
+      return;
+    }
+    setSelectedRemoteFile(path);
+  }, []);
+  if (!connectionManager && !ownedConnectionManagerRef.current) {
+    ownedConnectionManagerRef.current = new RemoteDesktopConnectionManager();
   }
+  const manager = connectionManager ?? ownedConnectionManagerRef.current!;
+  const hostKey = remoteDesktopHostKey(machine);
+  const resolvedQuickData = quickData ?? NOOP_QUICK_DATA;
+  const quickInputContextRef = useRef({ active, inputActive, hostKey });
+  // Event handlers retained by a just-detached portal must consult the latest
+  // presentation, not the render in which the picker opened.
+  quickInputContextRef.current = { active, inputActive, hostKey };
 
-  useEffect(() => () => {
-    machineDirectoryAdapterRef.current?.destroy();
-    machineDirectoryAdapterRef.current = null;
+  useEffect(() => () => machineDirectoryAdapter.destroy(), [machineDirectoryAdapter]);
+
+  useEffect(() => {
+    const connection = manager.presentation(machine, presentationRef.current);
+    clientRef.current = connection;
+    const unsubscribe = connection.subscribe(
+      presentationRef.current,
+      setSnapshot,
+      { controlsInput: inputActive },
+    );
+    void connection.start();
+    return () => {
+      unsubscribe();
+      if (clientRef.current === connection) clientRef.current = null;
+    };
+  }, [hostKey, inputActive, machine.serverId, manager]);
+
+  const hasQuickInputAuthority = useCallback((
+    connection: RemoteDesktopManagedConnection | null,
+    expected?: { hostKey: string; inputEpoch: number; client: RemoteDesktopManagedConnection } | null,
+  ): connection is RemoteDesktopManagedConnection => {
+    const context = quickInputContextRef.current;
+    if (!context.active || !context.inputActive || !connection) return false;
+    const current = connection.current();
+    if (current.state !== REMOTE_DESKTOP_STATE.DIRECT
+      && current.state !== REMOTE_DESKTOP_STATE.RELAYED) return false;
+    if (current.mode !== REMOTE_DESKTOP_ACCESS_MODE.CONTROL || !current.inputEnabled) return false;
+    return !expected || (
+      expected.client === connection
+      && expected.hostKey === context.hostKey
+      && expected.inputEpoch === current.inputEpoch
+    );
   }, []);
 
   useEffect(() => {
-    let disposed = false;
-    const publishSnapshot = (next: RemoteDesktopSnapshot) => {
-      if (disposed || unmountedRef.current) return;
-      const connected = next.state === REMOTE_DESKTOP_STATE.DIRECT
-        || next.state === REMOTE_DESKTOP_STATE.RELAYED;
-      if (!connected && reconnectStabilityTimerRef.current) {
-        clearTimeout(reconnectStabilityTimerRef.current);
-        reconnectStabilityTimerRef.current = null;
-      }
-      if (connected && reconnectCountRef.current > 0
-        && !reconnectStabilityTimerRef.current) {
-        reconnectStabilityTimerRef.current = setTimeout(() => {
-          reconnectStabilityTimerRef.current = null;
-          if (disposed || unmountedRef.current) return;
-          reconnectCountRef.current = 0;
-          setSnapshot((current) => ({ ...current, reconnectCount: 0 }));
-        }, REMOTE_DESKTOP_LIMITS.RECONNECT_STABILITY_RESET_MS);
-      }
-      const reason = next.terminalReason ?? next.error;
-      const reconnectableFailure = next.state === REMOTE_DESKTOP_STATE.FAILED
-        && Boolean(reason && RECONNECTABLE_REMOTE_DESKTOP_FAILURES.has(reason));
-      // stop()/terminal cleanup can publish more than one FAILED snapshot for
-      // the same client. Once a retry is scheduled, keep the recovery UI in
-      // place instead of briefly exposing worker_failed (and a dead Retry
-      // button) while the old authority finishes closing.
-      if (reconnectableFailure && reconnectTimerRef.current) return;
-      if (reconnectableFailure
-        && reconnectCountRef.current < MAX_REMOTE_DESKTOP_RECONNECTS) {
-        reconnectCountRef.current++;
-        const reconnectCount = reconnectCountRef.current;
-        setSnapshot({
-          ...next,
-          state: REMOTE_DESKTOP_STATE.RECONNECTING,
-          inputEnabled: false,
-          reconnectCount,
-        });
-        reconnectTimerRef.current = setTimeout(() => {
-          reconnectTimerRef.current = null;
-          if (!unmountedRef.current) setClientGeneration((current) => current + 1);
-        }, REMOTE_DESKTOP_LIMITS.RECONNECT_BACKOFF_BASE_MS
-          * (2 ** (reconnectCount - 1)));
-        return;
-      }
-      setSnapshot({ ...next, reconnectCount: reconnectCountRef.current });
+    if (quickInputOpen && !hasQuickInputAuthority(
+      clientRef.current,
+      quickInputBindingRef.current,
+    )) {
+      quickInputBindingRef.current = null;
+      quickInputSentRef.current = false;
+      setQuickInputOpen(false);
+    }
+  }, [active, hasQuickInputAuthority, hostKey, inputActive, quickInputOpen, snapshot.inputEnabled, snapshot.inputEpoch, snapshot.mode, snapshot.state]);
+
+  useEffect(() => {
+    if (!quickInputOpen) return;
+    const syncPortalContainer = () => {
+      const fullscreenElement = document.fullscreenElement;
+      setQuickInputPortalContainer(
+        fullscreenElement && panelRef.current && fullscreenElement.contains(panelRef.current)
+          ? fullscreenElement
+          : null,
+      );
     };
-    const client = new RemoteDesktopClient(machine.serverId, { onSnapshot: publishSnapshot });
-    clientRef.current = client;
-    const reconnectAttempt = forceWorkerRecycleRef.current
-      ? Math.max(1, reconnectCountRef.current)
-      : reconnectCountRef.current;
-    forceWorkerRecycleRef.current = false;
-    void client.start(reconnectAttempt).catch(() => publishSnapshot({
-      ...client.current(),
-      state: REMOTE_DESKTOP_STATE.FAILED,
-      inputEnabled: false,
-      error: REMOTE_DESKTOP_ERROR.DAEMON_OFFLINE,
-    }));
-    return () => {
-      disposed = true;
-      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
-      reconnectTimerRef.current = null;
-      if (reconnectStabilityTimerRef.current) {
-        clearTimeout(reconnectStabilityTimerRef.current);
-      }
-      reconnectStabilityTimerRef.current = null;
-      client.stop();
-      if (clientRef.current === client) clientRef.current = null;
-    };
-  }, [machine.serverId, clientGeneration]);
+    syncPortalContainer();
+    document.addEventListener('fullscreenchange', syncPortalContainer);
+    return () => document.removeEventListener('fullscreenchange', syncPortalContainer);
+  }, [quickInputOpen]);
+
+  useEffect(() => {
+    quickInputBindingRef.current = null;
+    quickInputSentRef.current = false;
+    setQuickInputOpen(false);
+  }, [hostKey]);
 
   useEffect(() => () => {
-    unmountedRef.current = true;
+    if (!connectionManager) manager.stopAll(REMOTE_DESKTOP_STOP_ORIGIN.PANEL_UNMOUNT);
+  }, [connectionManager, manager]);
+
+  useEffect(() => {
+    const authorityLost = snapshot.terminalReason === REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED
+      || snapshot.terminalReason === REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_EXPIRED
+      || snapshot.error === REMOTE_DESKTOP_ERROR.INVALID_AUTHORITY
+      || snapshot.error === REMOTE_DESKTOP_ERROR.AUTHORITY_EXPIRED
+      || snapshot.error === REMOTE_DESKTOP_ERROR.ACCESS_DENIED;
+    if (authorityLost) onAuthorityLost?.();
+  }, [onAuthorityLost, snapshot.error, snapshot.terminalReason]);
+
+  useEffect(() => () => {
     for (const controller of transferControllersRef.current.values()) controller.abort();
     transferControllersRef.current.clear();
-    if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
-    reconnectTimerRef.current = null;
-    if (reconnectStabilityTimerRef.current) clearTimeout(reconnectStabilityTimerRef.current);
-    reconnectStabilityTimerRef.current = null;
     if (virtualMouseEdgeFrameRef.current !== null) {
       if (typeof cancelAnimationFrame === 'function') {
         cancelAnimationFrame(virtualMouseEdgeFrameRef.current);
@@ -502,6 +797,20 @@ export function RemoteDesktopPanel({
     return () => clearTimeout(timer);
   }, [snapshot.controlRejection?.id, t]);
 
+  // A finished clipboard action (copied/pasted/empty/failed) is a toast, not a
+  // permanent toolbar fixture: fade it back to idle on its own so the button
+  // group never keeps a stale result around, and never reserves layout space
+  // for it while nothing is showing.
+  useEffect(() => {
+    if (clipboardStatus === 'idle' || clipboardStatus === 'copying' || clipboardStatus === 'pasting') return;
+    const timer = setTimeout(() => {
+      setClipboardStatus((current) => (
+        current === 'idle' || current === 'copying' || current === 'pasting' ? current : 'idle'
+      ));
+    }, CLIPBOARD_STATUS_TOAST_MS);
+    return () => clearTimeout(timer);
+  }, [clipboardStatus]);
+
   useEffect(() => {
     if (!displayModeMenu) return;
     const closeOutside = (event: PointerEvent) => {
@@ -524,21 +833,77 @@ export function RemoteDesktopPanel({
   }, [displayModeMenu]);
 
   useEffect(() => {
+    // A new MediaStream can represent another execution route. Never carry a
+    // cached screen across that authority boundary, even if both routes point
+    // at the same display.
+    clearCachedFrame();
     mediaPresentedRef.current = false;
     setMediaPresented(false);
     if (videoRef.current && videoRef.current.srcObject !== snapshot.stream) {
       videoRef.current.srcObject = snapshot.stream;
     }
-  }, [snapshot.stream]);
+    const track = snapshot.stream
+      && typeof snapshot.stream.getVideoTracks === 'function'
+      ? snapshot.stream.getVideoTracks()[0]
+      : undefined;
+    if (!track) return;
+    const onMute = () => showCachedFrame(REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.VIDEO_WAITING);
+    const onEnded = () => clearCachedFrame();
+    track.addEventListener('mute', onMute);
+    track.addEventListener('ended', onEnded);
+    return () => {
+      track.removeEventListener('mute', onMute);
+      track.removeEventListener('ended', onEnded);
+    };
+  }, [clearCachedFrame, showCachedFrame, snapshot.stream]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    const onWaiting = () => showCachedFrame(REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.VIDEO_WAITING);
+    const onStalled = () => showCachedFrame(REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.VIDEO_STALLED);
+    const onEmptied = () => snapshot.stream
+      ? showCachedFrame(REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.VIDEO_EMPTIED)
+      : clearCachedFrame();
+    const onPlaying = () => recordVideoDiagnostic(
+      REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.VIDEO_PLAYING,
+    );
+    video.addEventListener('waiting', onWaiting);
+    video.addEventListener('stalled', onStalled);
+    video.addEventListener('emptied', onEmptied);
+    video.addEventListener('playing', onPlaying);
+    return () => {
+      video.removeEventListener('waiting', onWaiting);
+      video.removeEventListener('stalled', onStalled);
+      video.removeEventListener('emptied', onEmptied);
+      video.removeEventListener('playing', onPlaying);
+    };
+  }, [clearCachedFrame, recordVideoDiagnostic, showCachedFrame, snapshot.stream]);
+
+  useEffect(() => {
+    if (snapshot.state === REMOTE_DESKTOP_STATE.STOPPING
+      || snapshot.state === REMOTE_DESKTOP_STATE.STOPPED
+      || snapshot.state === REMOTE_DESKTOP_STATE.FAILED
+      || snapshot.terminalReason === REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED
+      || snapshot.terminalReason === REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_EXPIRED
+      || snapshot.error === REMOTE_DESKTOP_ERROR.INVALID_AUTHORITY
+      || snapshot.error === REMOTE_DESKTOP_ERROR.AUTHORITY_EXPIRED
+      || snapshot.error === REMOTE_DESKTOP_ERROR.ACCESS_DENIED) {
+      clearCachedFrame();
+    }
+  }, [clearCachedFrame, snapshot.error, snapshot.state, snapshot.terminalReason]);
+
+  useEffect(() => () => clearCachedFrame(), [clearCachedFrame]);
 
   useEffect(() => {
     const video = videoRef.current;
     if (!video || typeof video.requestVideoFrameCallback !== 'function') return;
     let disposed = false;
     let callbackId: number | null = null;
-    const onPresentedFrame = () => {
+    const onPresentedFrame: VideoFrameRequestCallback = (now, metadata) => {
       if (disposed) return;
       if (video.videoWidth > 0 && video.videoHeight > 0) {
+        cachePresentedFrame(video, now, metadata);
         if (!mediaPresentedRef.current) {
           mediaPresentedRef.current = true;
           setMediaPresented(true);
@@ -550,9 +915,9 @@ export function RemoteDesktopPanel({
     callbackId = video.requestVideoFrameCallback(onPresentedFrame);
     return () => {
       disposed = true;
-      if (callbackId !== null) video.cancelVideoFrameCallback(callbackId);
+      if (callbackId !== null) video.cancelVideoFrameCallback?.(callbackId);
     };
-  }, []);
+  }, [cachePresentedFrame]);
 
   useEffect(() => {
     const refresh = () => setViewportGeometryRevision((current) => current + 1);
@@ -675,22 +1040,7 @@ export function RemoteDesktopPanel({
   };
 
   const retryConnection = () => {
-    if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
-    reconnectTimerRef.current = null;
-    if (reconnectStabilityTimerRef.current) clearTimeout(reconnectStabilityTimerRef.current);
-    reconnectStabilityTimerRef.current = null;
-    reconnectCountRef.current = 0;
-    forceWorkerRecycleRef.current = true;
-    setSnapshot((current) => ({
-      ...current,
-      state: REMOTE_DESKTOP_STATE.RECONNECTING,
-      inputEnabled: false,
-      stream: null,
-      reconnectCount: 0,
-      error: undefined,
-      terminalReason: undefined,
-    }));
-    setClientGeneration((current) => current + 1);
+    clientRef.current?.retry();
   };
 
   /**
@@ -988,19 +1338,45 @@ export function RemoteDesktopPanel({
     onVirtualMouseButton(event, 'left', false);
   };
 
-  const beginPinch = () => {
+  const beginTwoFingerGesture = () => {
     if (touchGestureRef.current?.kind === 'single' && touchGestureRef.current.longPressTimer) {
       clearTimeout(touchGestureRef.current.longPressTimer);
     }
     const points = [...touchPointsRef.current.values()];
     if (points.length < 2) return;
     const [first, second] = points;
+    const center = { x: (first.x + second.x) / 2, y: (first.y + second.y) / 2 };
     touchGestureRef.current = {
-      kind: 'pinch',
-      initialCenter: { x: (first.x + second.x) / 2, y: (first.y + second.y) / 2 },
+      kind: 'two-finger',
+      phase: 'pending',
+      initialCenter: center,
       initialDistance: Math.max(1, Math.hypot(second.x - first.x, second.y - first.y)),
       viewport: viewportRef.current,
+      lastCenter: center,
     };
+  };
+
+  /** Two-finger scroll: send the center point's frame-to-frame movement to
+   * the remote as wheel deltas, the same "content follows the finger"
+   * direction touch panning already uses elsewhere in this file -- drag up,
+   * the remote scrolls down (revealing what is below), like scrolling a
+   * page directly with a finger rather than a trackpad's inverted wheel. */
+  const sendTwoFingerScroll = (gesture: TouchTwoFingerGesture, center: TouchPoint) => {
+    const dx = center.x - gesture.lastCenter.x;
+    const dy = center.y - gesture.lastCenter.y;
+    gesture.lastCenter = center;
+    if (!snapshot.inputEnabled || (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5)) return;
+    const stage = stageRef.current;
+    if (!stage) return;
+    const rect = stage.getBoundingClientRect();
+    const normalized = normalizedClientPoint(rect.left + center.x, rect.top + center.y);
+    if (!normalized) return;
+    clientRef.current?.wheel(
+      -dx * TOUCH_TWO_FINGER_SCROLL_GAIN,
+      -dy * TOUCH_TWO_FINGER_SCROLL_GAIN,
+      normalized.x,
+      normalized.y,
+    );
   };
 
   const onTouchDown = (event: PointerEvent) => {
@@ -1037,7 +1413,7 @@ export function RemoteDesktopPanel({
       }, TOUCH_LONG_PRESS_MS);
       touchGestureRef.current = gesture;
     } else {
-      beginPinch();
+      beginTwoFingerGesture();
     }
   };
 
@@ -1050,17 +1426,40 @@ export function RemoteDesktopPanel({
     const gesture = touchGestureRef.current;
     if (!geometry || !gesture) return;
     const points = [...touchPointsRef.current.values()];
-    if (points.length >= 2 && gesture.kind === 'pinch') {
+    if (points.length >= 2 && gesture.kind === 'two-finger') {
       const [first, second] = points;
       const distance = Math.max(1, Math.hypot(second.x - first.x, second.y - first.y));
       const center = { x: (first.x + second.x) / 2, y: (first.y + second.y) / 2 };
-      commitViewport(viewportFromRemoteDesktopPinch(
-        gesture.viewport,
-        gesture.initialCenter,
-        center,
-        gesture.viewport.scale * distance / gesture.initialDistance,
-        geometry,
-      ));
+
+      if (gesture.phase === 'pending') {
+        const distanceDelta = Math.abs(distance - gesture.initialDistance);
+        const centerDelta = Math.hypot(
+          center.x - gesture.initialCenter.x,
+          center.y - gesture.initialCenter.y,
+        );
+        if (distanceDelta < TOUCH_TWO_FINGER_CLASSIFY_PX && centerDelta < TOUCH_TWO_FINGER_CLASSIFY_PX) {
+          return; // Still just two fingers landing imperfectly together.
+        }
+        gesture.phase = distanceDelta > centerDelta ? 'pinch' : 'scroll';
+        if (gesture.phase === 'scroll') {
+          // This move becomes the scroll baseline; deltas start from the next one.
+          gesture.lastCenter = center;
+          return;
+        }
+      }
+
+      if (gesture.phase === 'pinch') {
+        commitViewport(viewportFromRemoteDesktopPinch(
+          gesture.viewport,
+          gesture.initialCenter,
+          center,
+          gesture.viewport.scale * distance / gesture.initialDistance,
+          geometry,
+        ));
+        return;
+      }
+
+      sendTwoFingerScroll(gesture, center);
     } else if (points.length === 1 && gesture.kind === 'single'
       && gesture.pointerId === event.pointerId) {
       const dx = point.x - gesture.start.x;
@@ -1124,7 +1523,7 @@ export function RemoteDesktopPanel({
         viewport: viewportRef.current,
       };
     } else if (remaining.length >= 2) {
-      beginPinch();
+      beginTwoFingerGesture();
     } else {
       touchGestureRef.current = null;
     }
@@ -1204,6 +1603,21 @@ export function RemoteDesktopPanel({
       pointerMovesOutsideRef.current += 1;
       return;
     }
+    // The file window floats ON TOP of the desktop, so being inside the stage
+    // rect no longer means the pointer is on the desktop. Dragging or resizing
+    // that window was also driving the remote cursor, which is what made the
+    // remote screen flicker and the drag feel like it kept breaking.
+    //
+    // Hit-testing rather than `event.target` on purpose: pointer capture
+    // retargets events to the dragged window even when the pointer is over the
+    // desktop, which is why target ownership was rejected here originally.
+    // `elementFromPoint` is pure geometry, so it answers the occlusion
+    // question without inheriting that problem.
+    if (filePanelOpen && !fileDrawerMinimized
+      && isPointOverRemoteDesktopOverlay(clientX, clientY)) {
+      pointerMovesOutsideRef.current += 1;
+      return;
+    }
     pointerMovesSeenRef.current += 1;
     const normalized = normalizedClientPoint(clientX, clientY);
     const point = normalized && stickRemoteDesktopPointerToEdges(
@@ -1215,7 +1629,10 @@ export function RemoteDesktopPanel({
       return;
     }
     clientRef.current?.pointerMove(point.x, point.y);
-  }, [normalizedClientPoint]);
+    // The window-open flags are read above, so they must be dependencies:
+    // without them the effect below keeps the FIRST closure and the guard
+    // would still see the window as closed after it is opened.
+  }, [normalizedClientPoint, filePanelOpen, fileDrawerMinimized]);
 
   useEffect(() => {
     const onWindowMouseMove = (event: globalThis.MouseEvent) => {
@@ -1277,16 +1694,32 @@ export function RemoteDesktopPanel({
   const suppressCommandControlForMiddleDrag = () => {
     const client = clientRef.current;
     if (!client) return;
-    const controlCodes = new Set(forwardedCommandCodesRef.current);
-    if (syntheticCommandControlRef.current) controlCodes.add('ControlLeft');
+    const commandCodes = new Set(forwardedCommandCodesRef.current);
+    if (syntheticCommandControlRef.current) commandCodes.add(commandBridge.code);
     let released = true;
-    for (const code of controlCodes) {
+    for (const code of commandCodes) {
       suppressedCommandCodesRef.current.add(code);
-      if (!client.key(code, 'Control', false, false, { control: false, alt: false })) {
+      if (!client.key(code, commandBridge.key, false, false, { control: false, alt: false })) {
         released = false;
       }
     }
     forwardedCommandCodesRef.current.clear();
+    syntheticCommandControlRef.current = false;
+    if (!released) client.releaseAll();
+  };
+
+  // A failed release send (channel transiently not open) must not be treated
+  // as done: the client's own contract says a failed up can be retried, and
+  // the caller here has no future retry point since syntheticCommandControlRef
+  // is what gates whether the command code is still considered forwarded. Fall
+  // back to releaseAll() -- exactly the same rescue suppressCommandControlForMiddleDrag
+  // uses above -- so a dropped release message cannot leave Control (or, on a
+  // macOS target, Command) physically stuck down on the remote host for the
+  // rest of the session.
+  const releaseSyntheticCommandControl = (altKey: boolean) => {
+    const client = clientRef.current;
+    if (!client) return;
+    const released = client.key(commandBridge.code, commandBridge.key, false, false, { control: false, alt: altKey });
     syntheticCommandControlRef.current = false;
     if (!released) client.releaseAll();
   };
@@ -1318,7 +1751,7 @@ export function RemoteDesktopPanel({
     const startsCommandMiddleDrag = down
       && event.button === 0
       && event.metaKey
-      && isAppleControllerPlatform(readControllerPlatform());
+      && commandBridge.appleController;
     const continuingCommandMiddleDrag = !down
       && commandMiddleDragPointerRef.current === event.pointerId;
     const eventButton: DesktopPointerButton | null = startsCommandMiddleDrag || continuingCommandMiddleDrag ? 'middle'
@@ -1423,7 +1856,7 @@ export function RemoteDesktopPanel({
     // second time (observed consistently in Safari).
     event.stopPropagation();
     const client = clientRef.current;
-    const mapped = mapRemoteDesktopKeyboardEvent(event);
+    const mapped = mapRemoteDesktopKeyboardEvent(event, undefined, targetPlatform);
     if (!client || !mapped) return;
     // Copy and paste are answered by the clipboard bridge rather than forwarded
     // blind: the two machines have separate clipboards, so the keystroke alone
@@ -1432,11 +1865,20 @@ export function RemoteDesktopPanel({
     // selection — so an interrupt in a remote console keeps working.
     const clipboardShortcut = detectRemoteDesktopClipboardShortcut(event);
     if (clipboardShortcut === REMOTE_DESKTOP_CLIPBOARD_SHORTCUT.PASTE
-      && !navigator.clipboard?.readText) {
-      // No clipboard read here (Firefox, non-secure contexts): leave the key
-      // alone so the browser raises its own paste event, which carries the text
-      // without needing permission. Not forwarding it keeps the remote from
-      // pasting its own clipboard on top.
+      && (!navigator.clipboard?.readText || isAppleControllerPlatform(readControllerPlatform()))) {
+      // No clipboard read here: leave the key alone so the browser raises its
+      // own native paste event instead, which carries the text without going
+      // through navigator.clipboard.readText(). Two cases need this, for
+      // different reasons:
+      //  - Firefox and non-secure contexts: readText() isn't available at all.
+      //  - Safari/WebKit (macOS, and especially iOS/iPadOS): it IS available,
+      //    but calling it -- even synchronously inside this keydown's own
+      //    handler -- makes WebKit show its own "Paste" confirmation callout
+      //    every single time, which a real Cmd+V/Ctrl+V never needs. Letting
+      //    the OS's own paste gesture reach the browser natively (handled by
+      //    onPaste below) avoids that callout entirely.
+      // Not forwarding the keystroke to the remote either way keeps it from
+      // pasting its own clipboard on top once this one lands.
       return;
     }
     if (clipboardShortcut) {
@@ -1450,34 +1892,32 @@ export function RemoteDesktopPanel({
       return;
     }
     const commandEvent = event.code === 'MetaLeft' || event.code === 'MetaRight';
-    if (mapped.commandAsControl && commandEvent
+    if (mapped.usesCommandBridge && commandEvent
       && suppressedCommandCodesRef.current.has(mapped.code)
       && !syntheticCommandControlRef.current) {
       if (!down) suppressedCommandCodesRef.current.delete(mapped.code);
       event.preventDefault();
       return;
     }
-    if (mapped.commandAsControl && commandEvent) {
+    if (mapped.usesCommandBridge && commandEvent) {
       if (down) forwardedCommandCodesRef.current.add(mapped.code);
       else forwardedCommandCodesRef.current.delete(mapped.code);
       if (!down && syntheticCommandControlRef.current) {
-        client.key('ControlLeft', 'Control', false, false, { control: false, alt: event.altKey });
-        syntheticCommandControlRef.current = false;
+        releaseSyntheticCommandControl(event.altKey);
       }
-    } else if (mapped.commandAsControl && event.metaKey
+    } else if (mapped.usesCommandBridge && event.metaKey
       && forwardedCommandCodesRef.current.size === 0
       && !syntheticCommandControlRef.current) {
       suppressedCommandCodesRef.current.clear();
       syntheticCommandControlRef.current = client.key(
-        'ControlLeft',
-        'Control',
+        commandBridge.code,
+        commandBridge.key,
         true,
         false,
-        { control: true, alt: event.altKey },
+        { control: commandBridge.translateToControl, alt: event.altKey },
       );
-    } else if (mapped.commandAsControl && !event.metaKey && syntheticCommandControlRef.current) {
-      client.key('ControlLeft', 'Control', false, false, { control: false, alt: event.altKey });
-      syntheticCommandControlRef.current = false;
+    } else if (mapped.usesCommandBridge && !event.metaKey && syntheticCommandControlRef.current) {
+      releaseSyntheticCommandControl(event.altKey);
     }
     const sent = client.key(mapped.code, mapped.key, down, event.repeat, mapped.modifiers);
     if (sent) {
@@ -1486,10 +1926,9 @@ export function RemoteDesktopPanel({
       }
       event.preventDefault();
     }
-    if (mapped.commandAsControl && !commandEvent && !down && event.metaKey
+    if (mapped.usesCommandBridge && !commandEvent && !down && event.metaKey
       && forwardedCommandCodesRef.current.size === 0 && syntheticCommandControlRef.current) {
-      client.key('ControlLeft', 'Control', false, false, { control: false, alt: event.altKey });
-      syntheticCommandControlRef.current = false;
+      releaseSyntheticCommandControl(event.altKey);
     }
   };
 
@@ -1500,6 +1939,58 @@ export function RemoteDesktopPanel({
     commandMiddleDragPointerRef.current = null;
     forwardedPasteShortcutAtRef.current = 0;
     clientRef.current?.releaseAll();
+  };
+
+  const openQuickInput = () => {
+    const client = clientRef.current;
+    if (!hasQuickInputAuthority(client)) return;
+    const current = client.current();
+    quickInputBindingRef.current = {
+      hostKey,
+      inputEpoch: current.inputEpoch,
+      client,
+    };
+    const fullscreenElement = document.fullscreenElement;
+    setQuickInputPortalContainer(
+      fullscreenElement && panelRef.current && fullscreenElement.contains(panelRef.current)
+        ? fullscreenElement
+        : null,
+    );
+    quickInputSentRef.current = false;
+    setQuickInputOpen(true);
+  };
+
+  const sendQuickInputText = (value: string) => {
+    const binding = quickInputBindingRef.current;
+    const client = clientRef.current;
+    const sent = Boolean(
+      value
+      && binding
+      && hasQuickInputAuthority(client, binding)
+      && binding.client.text(value),
+    );
+    quickInputSentRef.current = sent;
+    if (sent) {
+      resolvedQuickData.recordHistory(value, remoteDesktopQuickInputHistoryKey(hostKey));
+    }
+  };
+
+  const closeQuickInput = () => {
+    const sent = quickInputSentRef.current;
+    quickInputBindingRef.current = null;
+    quickInputSentRef.current = false;
+    setQuickInputOpen(false);
+    setQuickInputPortalContainer(null);
+    requestAnimationFrame(() => {
+      const context = quickInputContextRef.current;
+      if (!context.active || !context.inputActive) return;
+      if (sent && hasQuickInputAuthority(clientRef.current)) {
+        stageRef.current?.focus({ preventScroll: true });
+      } else {
+        quickInputTriggerRef.current?.querySelector<HTMLButtonElement>('button')
+          ?.focus({ preventScroll: true });
+      }
+    });
   };
 
   const sendPastedText = (text: string): boolean => {
@@ -1527,29 +2018,27 @@ export function RemoteDesktopPanel({
   const copyRemoteSelection = async () => {
     if (!snapshot.inputEnabled) return;
     setClipboardStatus('copying');
-    const text = await clientRef.current?.requestRemoteClipboard();
+    // Engage the clipboard with the promise, inside the tap. Waiting for the
+    // remote machine to answer and only then writing is refused on iOS, where
+    // the write is only allowed while the tap still counts.
+    const pending = Promise.resolve(clientRef.current?.requestRemoteClipboard())
+      .then((text) => text ?? '');
+    const copied = new Promise<boolean>((resolve) => {
+      copyToClipboardWhenReady(pending, () => resolve(true), () => resolve(false));
+    });
+    const text = await pending;
     if (!text) {
       setClipboardStatus('empty');
       return;
     }
-    copyToClipboard(text, () => setClipboardStatus('copied'));
+    setClipboardStatus(await copied ? 'copied' : 'failed');
   };
 
   const stopAndClose = () => {
-    clientRef.current?.stop();
+    clientRef.current?.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
     onClose();
   };
 
-  const minimizePanel = () => {
-    releaseCapturedInput();
-    setDesktopMaximized(false);
-    onMinimize?.();
-  };
-
-  const toggleFullscreen = async () => {
-    if (document.fullscreenElement) await document.exitFullscreen();
-    else await panelRef.current?.requestFullscreen();
-  };
 
   const updateTransfer = (id: string, patch: Partial<RemoteDesktopTransferRow>) => {
     setTransfers((current) => current.map((row) => (
@@ -1586,6 +2075,29 @@ export function RemoteDesktopPanel({
     }));
   };
 
+  const updateDownloadTransferProgress = (id: string, loadedBytes: number, totalBytes: number | null) => {
+    setTransfers((current) => current.map((row) => {
+      if (row.id !== id) return row;
+      const now = Date.now();
+      const progress = totalBytes && totalBytes > 0
+        ? Math.min(99, Math.round((loadedBytes / totalBytes) * 100))
+        : row.progress;
+      const elapsed = now - (row.sampledAt ?? now);
+      const delta = loadedBytes - (row.sampledBytes ?? 0);
+      const instant = elapsed >= 250 && delta > 0 ? (delta * 1000) / elapsed : 0;
+      return {
+        ...row,
+        progress,
+        ...(totalBytes && totalBytes > 0 ? { sizeBytes: totalBytes } : {}),
+        ...(instant > 0 ? {
+          bytesPerSecond: row.bytesPerSecond ? row.bytesPerSecond * 0.6 + instant * 0.4 : instant,
+          sampledAt: now,
+          sampledBytes: loadedBytes,
+        } : {}),
+      };
+    }));
+  };
+
   const sendFile = async (file: File) => {
     const id = crypto.randomUUID();
     const controller = new AbortController();
@@ -1593,6 +2105,9 @@ export function RemoteDesktopPanel({
     setTransfers((current) => [...current, {
       id,
       name: file.name || 'file',
+      direction: 'send',
+      sourcePath: file.name || 'file',
+      destinationPath: destinationDirectory || t('remote_desktop.compatible_upload_location'),
       progress: 0,
       transport: FILE_UPLOAD_TRANSPORT_MODE.CONNECTING,
       status: 'transferring',
@@ -1630,10 +2145,197 @@ export function RemoteDesktopPanel({
     }
   };
 
+  const stageLocalFiles = (files: readonly File[]) => {
+    setSelectedLocalFiles((current) => {
+      const next = [...current];
+      const known = new Set(current.map((file) => `${file.name}:${file.size}:${file.lastModified}`));
+      for (const file of files) {
+        const key = `${file.name}:${file.size}:${file.lastModified}`;
+        if (known.has(key)) continue;
+        known.add(key);
+        next.push(file);
+      }
+      return next;
+    });
+  };
+
+  const sendSelectedFiles = () => {
+    if (selectedLocalFiles.length === 0) return;
+    const files = selectedLocalFiles;
+    setSelectedLocalFiles([]);
+    void sendFiles(files);
+  };
+
   const openMobileKeyboard = () => {
     if (!snapshot.inputEnabled) return;
+    setMobileKeyboardTab('ime');
+    setComputerKeyboardPage(0);
     setMobileTextOpen(true);
-    requestAnimationFrame(() => mobileTextInputRef.current?.focus({ preventScroll: true }));
+    requestAnimationFrame(() => focusRemoteDesktopMobileInput(mobileTextInputRef.current));
+  };
+
+  // Re-measure whenever the panel is open: the OS keyboard can come and go
+  // (switching tabs, or the textarea losing/regaining focus) without the
+  // panel itself closing.
+  useEffect(() => {
+    if (!mobileTextOpen || typeof window === 'undefined' || !window.visualViewport) return;
+    const viewport = window.visualViewport;
+    const recompute = () => {
+      setMobileKeyboardViewportInset(Math.max(0, Math.round(
+        window.innerHeight - (viewport.height + viewport.offsetTop),
+      )));
+    };
+    recompute();
+    viewport.addEventListener('resize', recompute);
+    viewport.addEventListener('scroll', recompute);
+    return () => {
+      viewport.removeEventListener('resize', recompute);
+      viewport.removeEventListener('scroll', recompute);
+      setMobileKeyboardViewportInset(0);
+    };
+  }, [mobileTextOpen]);
+
+  // Track the pinned panel's own rendered height (it varies by tab -- the
+  // Keys grid is much taller than the Input tab's now-invisible textarea) so
+  // the grid spacer left in its place reserves exactly that much space.
+  useEffect(() => {
+    if (!mobileTextOpen || typeof ResizeObserver === 'undefined') return;
+    const el = mobileKeyboardPanelRef.current;
+    if (!el) return;
+    const observer = new ResizeObserver((entries) => {
+      const height = entries[0]?.contentRect.height;
+      if (height !== undefined) setMobileKeyboardPanelHeight(Math.round(height));
+    });
+    observer.observe(el);
+    return () => {
+      observer.disconnect();
+      setMobileKeyboardPanelHeight(0);
+    };
+  }, [mobileTextOpen]);
+
+  const comboModifierFlags = (keys: readonly RemoteDesktopChordKey[]) => ({
+    control: keys.some((k) => k.code === 'ControlLeft' || k.code === 'ControlRight'),
+    alt: keys.some((k) => k.code === 'AltLeft' || k.code === 'AltRight'),
+  });
+
+  /** Release every latched combo modifier, innermost (most recently pressed) first. */
+  const releaseHeldComboKeys = () => {
+    const client = clientRef.current;
+    if (client) {
+      let remaining = heldComboKeys;
+      for (const held of [...heldComboKeys].reverse()) {
+        remaining = remaining.filter((k) => k.code !== held.code);
+        client.key(held.code, held.key, false, false, comboModifierFlags(remaining));
+      }
+    }
+    if (heldComboKeys.length > 0) setHeldComboKeys([]);
+  };
+
+  const toggleComboMode = () => {
+    if (comboMode) releaseHeldComboKeys();
+    setComboMode((prev) => !prev);
+  };
+
+  const switchMobileKeyboardTab = (tab: MobileKeyboardTab) => {
+    if (mobileKeyboardTab === 'keys' && tab !== 'keys') releaseHeldComboKeys();
+    setMobileKeyboardTab(tab);
+    if (tab === 'ime') requestAnimationFrame(() => focusRemoteDesktopMobileInput(mobileTextInputRef.current));
+  };
+
+  const closeMobileKeyboard = () => {
+    releaseHeldComboKeys();
+    setMobileTextOpen(false);
+  };
+
+  /**
+   * A tap on the "computer keyboard" grid. Outside combo mode -- or on a
+   * non-modifier key with nothing latched -- this is just a standalone
+   * press+release. In combo mode, tapping a modifier latches/unlatches it
+   * (held down on the remote the whole time, so its own effect, e.g. Shift
+   * changing what a later tap types, is visible immediately); tapping a
+   * non-modifier while modifiers are latched fires the whole chord once and
+   * releases the modifiers, ready for the next chord.
+   */
+  const pressComputerKey = (spec: RemoteDesktopComputerKeySpec) => {
+    const client = clientRef.current;
+    if (!client || !snapshot.inputEnabled) return;
+    if (comboMode && spec.modifier) {
+      const isHeld = heldComboKeys.some((k) => k.code === spec.code);
+      if (isHeld) {
+        const remaining = heldComboKeys.filter((k) => k.code !== spec.code);
+        client.key(spec.code, spec.key, false, false, comboModifierFlags(remaining));
+        setHeldComboKeys(remaining);
+      } else {
+        const next = [...heldComboKeys, { code: spec.code, key: spec.key }];
+        client.key(spec.code, spec.key, true, false, comboModifierFlags(next));
+        setHeldComboKeys(next);
+      }
+      return;
+    }
+    if (comboMode && heldComboKeys.length > 0) {
+      const flags = comboModifierFlags(heldComboKeys);
+      client.key(spec.code, spec.key, true, false, flags);
+      client.key(spec.code, spec.key, false, false, flags);
+      releaseHeldComboKeys();
+      return;
+    }
+    sendRemoteDesktopChord(
+      [{ code: spec.code, key: spec.key }],
+      (code, keyName, down, repeat, modifiers) => client.key(code, keyName, down, repeat, modifiers),
+      () => client.releaseAll(),
+    );
+  };
+
+  // Horizontal swipe between computer-keyboard pages. Deliberately its own
+  // gesture handling rather than reusing the video stage's touch code above:
+  // this operates on the key-grid buttons, not the remote pointer, and a
+  // committed page change only needs to beat a fraction of the viewport
+  // width, not track a pinch/scroll ambiguity.
+  const onComputerKeyboardPagesPointerDown = (event: PointerEvent) => {
+    if (computerKeyboardSwipeRef.current) return;
+    computerKeyboardSwipeRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      dragging: false,
+      deltaX: 0,
+    };
+  };
+
+  const onComputerKeyboardPagesPointerMove = (event: PointerEvent) => {
+    const drag = computerKeyboardSwipeRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const dx = event.clientX - drag.startX;
+    const dy = event.clientY - drag.startY;
+    if (!drag.dragging) {
+      if (Math.abs(dx) < COMPUTER_KEYBOARD_SWIPE_JITTER_PX && Math.abs(dy) < COMPUTER_KEYBOARD_SWIPE_JITTER_PX) return;
+      if (Math.abs(dy) >= Math.abs(dx)) {
+        // Vertical intent (scrolling the docked panel itself) -- not a page swipe.
+        computerKeyboardSwipeRef.current = null;
+        return;
+      }
+      drag.dragging = true;
+      (event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId);
+    }
+    event.preventDefault();
+    drag.deltaX = dx;
+    setComputerKeyboardSwipeOffset(dx);
+  };
+
+  const onComputerKeyboardPagesPointerUp = (event: PointerEvent) => {
+    const drag = computerKeyboardSwipeRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    computerKeyboardSwipeRef.current = null;
+    if (drag.dragging) {
+      const pageWidth = computerKeyboardPagesViewportRef.current?.clientWidth || 1;
+      const commitDistance = pageWidth * COMPUTER_KEYBOARD_SWIPE_COMMIT_RATIO;
+      if (drag.deltaX <= -commitDistance && computerKeyboardPage < REMOTE_DESKTOP_COMPUTER_KEYBOARD_PAGES.length - 1) {
+        setComputerKeyboardPage((page) => page + 1);
+      } else if (drag.deltaX >= commitDistance && computerKeyboardPage > 0) {
+        setComputerKeyboardPage((page) => page - 1);
+      }
+    }
+    setComputerKeyboardSwipeOffset(0);
   };
 
   const submitMobileText = (value: string) => {
@@ -1655,30 +2357,66 @@ export function RemoteDesktopPanel({
       (code, key, down, repeat, modifiers) => client.key(code, key, down, repeat, modifiers),
       () => client.releaseAll(),
     );
-    mobileTextInputRef.current?.focus({ preventScroll: true });
+    focusRemoteDesktopMobileInput(mobileTextInputRef.current);
   };
 
-  const fetchFile = async () => {
-    const path = fetchPath.trim();
+  const fetchFile = async (requestedPath: string) => {
+    const path = requestedPath.trim();
     if (!path) return;
+    let destination;
+    try {
+      destination = await selectPreviewDownloadDestination(path.split(/[/\\]/).pop() || undefined);
+    } catch (error) {
+      if (isFileUploadCanceled(error)) return;
+      setTransferError(t('remote_desktop.file_transfer_failed'));
+      return;
+    }
     const id = crypto.randomUUID();
     const controller = new AbortController();
     transferControllersRef.current.set(id, controller);
     setTransfers((current) => [...current, {
       id,
-      name: path,
+      name: path.split(/[/\\]/).pop() || path,
+      direction: 'fetch',
+      sourcePath: path,
+      destinationPath: t('remote_desktop.browser_downloads'),
       progress: 0,
-      transport: FILE_UPLOAD_TRANSPORT_MODE.RELAY,
+      transport: FILE_DOWNLOAD_TRANSPORT_MODE.CONNECTING,
       status: 'transferring',
+      sampledAt: Date.now(),
+      sampledBytes: 0,
     }]);
     setTransferError(null);
+    let handedOffToBrowser = false;
     try {
       const attachment = await createMachineFileHandle(machine.serverId, path, controller.signal);
-      updateTransfer(id, { progress: 70 });
-      await downloadAttachment(machine.serverId, attachment.id, undefined, controller.signal);
+      const transferWs = ws?.targetsServer(machine.serverId) ? ws : null;
+      if (transferWs) {
+        await downloadPreviewWithDirectFallback({
+          ws: transferWs,
+          serverId: machine.serverId,
+          previewHandle: attachment.id,
+          suggestedName: path.split(/[/\\]/).pop() || undefined,
+          destination,
+          httpFallback: () => downloadAttachment(machine.serverId, attachment.id, undefined, controller.signal),
+          signal: controller.signal,
+          onMode: (transport) => {
+            if (transport === FILE_DOWNLOAD_TRANSPORT_MODE.BROWSER) handedOffToBrowser = true;
+            updateTransfer(id, { transport });
+          },
+          onProgress: ({ loadedBytes, totalBytes }) => updateDownloadTransferProgress(id, loadedBytes, totalBytes),
+        });
+      } else {
+        handedOffToBrowser = true;
+        updateTransfer(id, { transport: FILE_DOWNLOAD_TRANSPORT_MODE.BROWSER });
+        await downloadAttachment(machine.serverId, attachment.id, undefined, controller.signal);
+      }
+      const savedFile = handedOffToBrowser ? null : savedDownloadFileHandle(destination?.handle);
+      // Recorded before the status flips so the finished row renders its buttons.
+      if (savedFile) savedFetchFilesRef.current.set(id, savedFile);
       updateTransfer(id, { progress: 100, status: 'done' });
     } catch (error) {
-      if (error instanceof Error && error.name === 'AbortError') {
+      if (isFileUploadCanceled(error)) {
         updateTransfer(id, { status: 'canceled' });
         return;
       }
@@ -1700,79 +2438,20 @@ export function RemoteDesktopPanel({
     && mediaPresented
     && videoRef.current?.srcObject === snapshot.stream);
   const activeConnectionStep = activeRemoteDesktopConnectionStep(snapshot, currentStreamPresented);
+  const controllerCount = snapshot.controllerCount ?? (
+    snapshot.mode === REMOTE_DESKTOP_ACCESS_MODE.CONTROL ? 1 : 0
+  );
+  const viewerCount = Math.max(0, (snapshot.viewerCount ?? 1) - controllerCount);
 
-  return (
-    <>
-      <div class="remote-desktop-window-host" hidden={minimized}>
-        <FloatingPanel
-      id={`remote-desktop-${machine.serverId}`}
-      title={t('remote_desktop.title', { machine: machine.displayName })}
-      onClose={stopAndClose}
-      zIndex={zIndex ?? 10020}
-      onFocus={onFocus}
-      defaultW={1200}
-      defaultH={760}
-      minW={640}
-      minH={420}
-      enableMaximize
-      isMaximized={desktopMaximized}
-      onToggleMaximized={() => setDesktopMaximized((current) => !current)}
-      className="remote-desktop-floating-shell"
-      hideTitleBar
-      dragHandleSelector=".remote-desktop-header"
-    >
+  const panelBody = (
       <div
         ref={panelRef}
-        class={`remote-desktop-panel ${snapshot.route === 'direct' ? 'is-direct' : ''}`.trim()}
-        role="dialog"
+        class={`remote-desktop-panel${snapshot.route === 'direct' ? ' is-direct' : ''}${standalone ? ' is-standalone' : ''}`}
+        role={embedded ? 'tabpanel' : 'dialog'}
         aria-modal="false"
         aria-label={t('remote_desktop.title', { machine: machine.displayName })}
+        hidden={embedded && !active}
       >
-        <header class="remote-desktop-header">
-          <div>
-            <strong>{machine.displayName}</strong>
-            <span>{t(`remote_desktop.state.${snapshot.state}`)}</span>
-          </div>
-          <div class="remote-desktop-presence" aria-live="polite">
-            <span>{t('remote_desktop.viewers', { count: snapshot.viewerCount ?? 1 })}</span>
-            <span>{t('remote_desktop.controllers', { count: snapshot.controllerCount ?? (snapshot.mode === 'control' ? 1 : 0) })}</span>
-          </div>
-          <div class="remote-desktop-window-actions">
-            {!standalone && allowStandaloneWindow && (
-              <button
-                type="button"
-                class="subsession-minimize-btn remote-desktop-open-window"
-                aria-label={t('remote_desktop.open_new_window')}
-                title={t('remote_desktop.open_new_window')}
-                onClick={() => {
-                  if (openRemoteDesktopWindow(machine.serverId)) stopAndClose();
-                }}
-              >↗</button>
-            )}
-            <DesktopWindowMaximizeButton
-              maximized={desktopMaximized}
-              class="subsession-minimize-btn remote-desktop-maximize"
-              onClick={() => setDesktopMaximized((current) => !current)}
-            />
-            {onMinimize && (
-              <button
-                type="button"
-                class="subsession-minimize-btn remote-desktop-minimize"
-                aria-label={t('window.minimize')}
-                title={t('window.minimize')}
-                onClick={minimizePanel}
-              >▾</button>
-            )}
-            <button
-              type="button"
-              class="subsession-close-btn remote-desktop-stop"
-              aria-label={t('remote_desktop.stop')}
-              title={t('remote_desktop.stop')}
-              onClick={stopAndClose}
-            >×</button>
-          </div>
-        </header>
-
         <div class="remote-desktop-toolbar">
           <div class="remote-desktop-display-tabs" role="tablist" aria-label={t('remote_desktop.displays')}>
             {snapshot.displays.map((display) => (
@@ -1831,7 +2510,13 @@ export function RemoteDesktopPanel({
           <div class="remote-desktop-view-switch" role="group" aria-label={t('remote_desktop.scale_label')}>
             <button type="button" aria-pressed={viewScale === 'fit'} onClick={() => setViewScale('fit')}>{t('remote_desktop.fit')}</button>
             <button type="button" aria-pressed={viewScale === 'actual'} onClick={() => setViewScale('actual')}>{t('remote_desktop.actual_size')}</button>
-            <button type="button" onClick={() => { void toggleFullscreen(); }}>{t('remote_desktop.fullscreen')}</button>
+            {fullscreen.supported && (
+              <button
+                type="button"
+                aria-pressed={fullscreen.active}
+                onClick={() => { void fullscreen.toggle(); }}
+              >{t(fullscreen.active ? 'remote_desktop.exit_fullscreen' : 'remote_desktop.fullscreen')}</button>
+            )}
           </div>
           <div class="remote-desktop-clipboard-switch" role="group" aria-label={t('remote_desktop.clipboard_label')}>
             <button
@@ -1839,16 +2524,18 @@ export function RemoteDesktopPanel({
               disabled={!snapshot.inputEnabled || clipboardStatus === 'copying'}
               title={inputBlockedHint()}
               onClick={() => { void copyRemoteSelection(); }}
-            >{t('remote_desktop.copy_remote_selection')}</button>
+            >{t('common.copy')}</button>
             <button
               type="button"
               disabled={!snapshot.inputEnabled || clipboardStatus === 'pasting'}
               title={inputBlockedHint()}
               onClick={() => { void pasteLocalClipboard(); }}
             >{t('remote_desktop.paste_local_clipboard')}</button>
-            <span class="remote-desktop-clipboard-status" aria-live="polite">
-              {clipboardStatus === 'idle' ? '' : t(`remote_desktop.clipboard_${clipboardStatus}`)}
-            </span>
+            {clipboardStatus !== 'idle' && (
+              <span class="remote-desktop-clipboard-toast" role="status" aria-live="polite">
+                {t(`remote_desktop.clipboard_${clipboardStatus}`)}
+              </span>
+            )}
           </div>
           <div class="remote-desktop-zoom-switch" role="group" aria-label={t('remote_desktop.zoom_label')}>
             <button type="button" aria-label={t('remote_desktop.zoom_out')} disabled={viewport.scale <= 1} onClick={() => changeZoom(-0.5)}>−</button>
@@ -1888,6 +2575,39 @@ export function RemoteDesktopPanel({
               onClick={() => { clientRef.current?.requestUnlock(); }}
             >{t('remote_desktop.unlock')}</button>
           )}
+          <div class="remote-desktop-quick-input" ref={quickInputTriggerRef}>
+            <button
+              type="button"
+              aria-haspopup="dialog"
+              aria-label={t('remote_desktop.quick_input')}
+              aria-expanded={quickInputOpen}
+              disabled={!hasQuickInputAuthority(clientRef.current)}
+              title={inputBlockedHint()}
+              onClick={() => quickInputOpen ? closeQuickInput() : openQuickInput()}
+            >{t('remote_desktop.quick_input')}</button>
+            <QuickInputPanel
+              open={quickInputOpen}
+              onClose={closeQuickInput}
+              onSelect={sendQuickInputText}
+              onSend={sendQuickInputText}
+              agentType="claude-code"
+              sessionName={remoteDesktopQuickInputHistoryKey(hostKey)}
+              data={resolvedQuickData.data}
+              loaded={resolvedQuickData.loaded}
+              onAddCommand={resolvedQuickData.addCommand}
+              onAddPhrase={resolvedQuickData.addPhrase}
+              onRemoveCommand={resolvedQuickData.removeCommand}
+              onRemovePhrase={resolvedQuickData.removePhrase}
+              onRemoveHistory={resolvedQuickData.removeHistory}
+              onRemoveSessionHistory={resolvedQuickData.removeSessionHistory}
+              onClearHistory={resolvedQuickData.clearHistory}
+              onClearSessionHistory={resolvedQuickData.clearSessionHistory}
+              anchorRef={quickInputTriggerRef}
+              quickOnly
+              portalZIndex={REMOTE_DESKTOP_QUICK_INPUT_Z_INDEX}
+              portalContainer={quickInputPortalContainer}
+            />
+          </div>
           <button
             type="button"
             class="remote-desktop-files-trigger"
@@ -1895,6 +2615,36 @@ export function RemoteDesktopPanel({
             aria-pressed={filePanelOpen}
             onClick={() => setFilePanelOpen((open) => !open)}
           >{t('remote_desktop.files')}</button>
+          {!embedded && (
+            <div class="remote-desktop-window-actions">
+              {!standalone && allowStandaloneWindow && (
+                <button
+                  type="button"
+                  class="subsession-minimize-btn remote-desktop-open-window"
+                  aria-label={t('remote_desktop.open_new_window')}
+                  title={t('remote_desktop.open_new_window')}
+                  onClick={() => {
+                    if (openRemoteDesktopWindow(machine.serverId)) stopAndClose();
+                  }}
+                >↗</button>
+              )}
+              {/* Nothing to maximise into when the window IS the panel. */}
+              {!standalone && (
+                <DesktopWindowMaximizeButton
+                  maximized={desktopMaximized}
+                  class="subsession-minimize-btn remote-desktop-maximize"
+                  onClick={() => setDesktopMaximized((current) => !current)}
+                />
+              )}
+              <button
+                type="button"
+                class="subsession-close-btn remote-desktop-stop"
+                aria-label={t('remote_desktop.stop')}
+                title={t('remote_desktop.stop')}
+                onClick={stopAndClose}
+              >×</button>
+            </div>
+          )}
         </div>
 
         {controlNotice && (
@@ -1961,6 +2711,7 @@ export function RemoteDesktopPanel({
         <div
           ref={stageRef}
           class={`remote-desktop-stage is-${viewScale} ${snapshot.inputEnabled ? 'is-controlling' : 'is-viewing'}`}
+          aria-busy={mediaRecovering || undefined}
           tabIndex={snapshot.inputEnabled ? 0 : -1}
           onPointerMove={onStagePointerMove}
           onMouseMove={onStageMouseMove}
@@ -2020,6 +2771,9 @@ export function RemoteDesktopPanel({
             muted
             draggable={false}
             onLoadedData={() => {
+              recordVideoDiagnostic(
+                REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.VIDEO_LOADED_DATA,
+              );
               if (!mediaPresentedRef.current) {
                 mediaPresentedRef.current = true;
                 setMediaPresented(true);
@@ -2034,7 +2788,24 @@ export function RemoteDesktopPanel({
             }}
             aria-label={t('remote_desktop.video_label', { machine: machine.displayName })}
           />
-          {currentStreamPresented && (
+          <canvas
+            ref={lastFrameCanvasRef}
+            class={`remote-desktop-last-frame ${mediaRecovering && hasCachedFrame ? 'is-visible' : ''}`.trim()}
+            style={{
+              ...(viewScale === 'actual' && selectedDisplay
+                ? { width: `${selectedDisplay.width}px`, height: `${selectedDisplay.height}px` }
+                : {}),
+              transform: `translate3d(${viewport.x}px, ${viewport.y}px, 0) scale(${viewport.scale})`,
+              transformOrigin: 'center center',
+            }}
+            aria-hidden="true"
+          />
+          {mediaRecovering && hasCachedFrame && (
+            <div class="remote-desktop-media-recovery" role="status" aria-live="polite">
+              {t('remote_desktop.media_recovering')}
+            </div>
+          )}
+          {currentStreamPresented && !mediaRecovering && (
             <div
               class="remote-desktop-input-surface"
               data-testid="remote-desktop-input-surface"
@@ -2043,90 +2814,6 @@ export function RemoteDesktopPanel({
               onMouseMove={onInputSurfaceMouseMove}
               onMouseEnter={onInputSurfaceMouseMove}
             />
-          )}
-          {mobileTextOpen && (
-            <div class="remote-desktop-mobile-keyboard" role="group" aria-label={t('remote_desktop.mobile_keyboard')}>
-              <div class="remote-desktop-mobile-keyboard-head">
-                <span aria-hidden="true">⌨</span>
-                <button
-                  type="button"
-                  aria-label={t('remote_desktop.close_mobile_keyboard')}
-                  onClick={() => setMobileTextOpen(false)}
-                >×</button>
-              </div>
-              <textarea
-                ref={mobileTextInputRef}
-                rows={1}
-                inputMode="text"
-                enterkeyhint="enter"
-                autocapitalize="none"
-                autocomplete="off"
-                spellcheck={false}
-                aria-label={t('remote_desktop.mobile_text_input')}
-                placeholder={t('remote_desktop.mobile_text_input')}
-                onCompositionStart={(event) => {
-                  event.stopPropagation();
-                  mobileTextComposingRef.current = true;
-                  mobileTextLastCompositionCommitRef.current = null;
-                }}
-                onCompositionEnd={(event) => {
-                  event.stopPropagation();
-                  mobileTextComposingRef.current = false;
-                  const value = (event.currentTarget as HTMLTextAreaElement).value;
-                  if (value && mobileTextLastCompositionCommitRef.current !== value) {
-                    mobileTextLastCompositionCommitRef.current = value;
-                    submitMobileText(value);
-                  }
-                }}
-                onBeforeInput={(event) => {
-                  event.stopPropagation();
-                  const input = event.currentTarget as HTMLTextAreaElement;
-                  if (mobileTextComposingRef.current || event.isComposing || input.value) return;
-                  const deletionKey = remoteDesktopMobileDeletionKey(event.inputType);
-                  if (!deletionKey) return;
-                  event.preventDefault();
-                  sendMobileShortcut([deletionKey]);
-                }}
-                onInput={(event) => {
-                  event.stopPropagation();
-                  if (mobileTextComposingRef.current || event.isComposing) return;
-                  const input = event.currentTarget as HTMLTextAreaElement;
-                  const lastCompositionCommit = mobileTextLastCompositionCommitRef.current;
-                  if (lastCompositionCommit !== null
-                    && (input.value === '' || input.value === lastCompositionCommit)) {
-                    input.value = '';
-                    return;
-                  }
-                  mobileTextLastCompositionCommitRef.current = null;
-                  submitMobileText(input.value);
-                }}
-                onKeyDown={(event) => event.stopPropagation()}
-                onKeyUp={(event) => event.stopPropagation()}
-              />
-              <div class="remote-desktop-mobile-shortcuts" aria-label={t('remote_desktop.mobile_shortcuts')}>
-                {REMOTE_DESKTOP_MOBILE_SHORTCUTS.map((shortcut) => (
-                  <button
-                    key={shortcut.id}
-                    type="button"
-                    aria-label={t(`remote_desktop.shortcut_${shortcut.id}`)}
-                    onPointerDown={(event) => event.preventDefault()}
-                    onClick={() => sendMobileShortcut(shortcut.keys)}
-                  >{remoteDesktopShortcutLabel(shortcut.id)}</button>
-                ))}
-                <button
-                  type="button"
-                  aria-label={t('remote_desktop.copy_remote_selection')}
-                  onPointerDown={(event) => event.preventDefault()}
-                  onClick={() => { void copyRemoteSelection(); }}
-                >{t('remote_desktop.copy_remote_selection')}</button>
-                <button
-                  type="button"
-                  aria-label={t('remote_desktop.paste_local_clipboard')}
-                  onPointerDown={(event) => event.preventDefault()}
-                  onClick={() => { void pasteLocalClipboard(); }}
-                >{t('remote_desktop.paste_local_clipboard')}</button>
-              </div>
-            </div>
           )}
           {mobileInputMode === 'mouse' && (
             <>
@@ -2200,7 +2887,7 @@ export function RemoteDesktopPanel({
                   <strong>
                     {snapshot.state === REMOTE_DESKTOP_STATE.RECONNECTING
                       ? t('remote_desktop.connection_retrying', { count: snapshot.reconnectCount ?? 1 })
-                      : t(`remote_desktop.state.${snapshot.state}`)}
+                      : t('remote_desktop.connection_optimizing')}
                   </strong>
                   {snapshot.state === REMOTE_DESKTOP_STATE.RECONNECTING
                     && (snapshot.terminalReason ?? snapshot.error) && (
@@ -2214,7 +2901,14 @@ export function RemoteDesktopPanel({
                       })}
                     </small>
                   )}
-                  <ol aria-label={t('remote_desktop.connection_progress')}>
+                  {/* Four dots, one per stage. The stage names stay in the DOM
+                      for screen readers -- dropping them would leave a
+                      non-sighted user with four unlabelled shapes and no way to
+                      tell which part of connecting is slow. */}
+                  <ol
+                    class="remote-desktop-connection-dots"
+                    aria-label={t('remote_desktop.connection_progress')}
+                  >
                     {REMOTE_DESKTOP_CONNECTION_STEPS.map((step, index) => {
                       const complete = index < activeConnectionStep;
                       const current = index === activeConnectionStep;
@@ -2223,9 +2917,12 @@ export function RemoteDesktopPanel({
                           key={step}
                           class={complete ? 'is-complete' : current ? 'is-current' : 'is-pending'}
                           aria-current={current ? 'step' : undefined}
+                          title={t(`remote_desktop.connection_steps.${step}`)}
                         >
-                          <span aria-hidden="true">{complete ? '✓' : index + 1}</span>
-                          <span>{t(`remote_desktop.connection_steps.${step}`)}</span>
+                          <span class="remote-desktop-connection-dot" aria-hidden="true" />
+                          <span class="remote-desktop-connection-step-label">
+                            {t(`remote_desktop.connection_steps.${step}`)}
+                          </span>
                         </li>
                       );
                     })}
@@ -2240,6 +2937,195 @@ export function RemoteDesktopPanel({
               : 'remote_desktop.touch_hint')}
           </div>
         </div>
+
+        {/* Docked below the stage in normal flow (a grid row of its own, not an
+            overlay on top of the video) so opening it shrinks the visible
+            remote screen instead of covering it -- the previous floating panel
+            sat on top of the video and, combined with the OS's own on-screen
+            keyboard underneath it, could blot out most of a phone screen.
+            While the OS keyboard is actually up, though, staying in normal
+            flow backfires: the layout viewport does not shrink for it, so
+            the browser scrolls the focused textarea into view instead and
+            carries the tab switcher above it off the top of the screen.
+            Pin the panel to the visual viewport's bottom edge (measured
+            above) whenever that is happening, so it rides directly on top
+            of the keyboard instead of being scrolled away from it. Pinning
+            takes the panel out of the grid entirely, though, so a same-height
+            spacer stays behind in its grid slot -- otherwise the stage would
+            reclaim that row and balloon into a mostly-empty black rectangle
+            with the video squeezed into whatever was left. */}
+        {mobileTextOpen && (<>
+          {mobileKeyboardViewportInset > 0 && (
+            <div aria-hidden="true" style={{ height: `${mobileKeyboardPanelHeight}px` }} />
+          )}
+          <div
+            ref={mobileKeyboardPanelRef}
+            class={`remote-desktop-mobile-keyboard${mobileKeyboardViewportInset > 0 ? ' is-pinned' : ''}`}
+            role="group"
+            aria-label={t('remote_desktop.mobile_keyboard')}
+            style={mobileKeyboardViewportInset > 0
+              ? { position: 'fixed', left: 0, right: 0, bottom: `${mobileKeyboardViewportInset}px` }
+              : undefined}
+          >
+            <div class="remote-desktop-mobile-keyboard-head">
+              <div class="remote-desktop-mobile-keyboard-tabs" role="tablist" aria-label={t('remote_desktop.mobile_keyboard')}>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={mobileKeyboardTab === 'ime'}
+                  class={mobileKeyboardTab === 'ime' ? 'is-active' : ''}
+                  onClick={() => switchMobileKeyboardTab('ime')}
+                >{t('remote_desktop.mobile_keyboard_tab_ime')}</button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={mobileKeyboardTab === 'keys'}
+                  class={mobileKeyboardTab === 'keys' ? 'is-active' : ''}
+                  onClick={() => switchMobileKeyboardTab('keys')}
+                >{t('remote_desktop.mobile_keyboard_tab_keys')}</button>
+              </div>
+              <button
+                type="button"
+                aria-label={t('remote_desktop.close_mobile_keyboard')}
+                onClick={closeMobileKeyboard}
+              >×</button>
+            </div>
+
+            {mobileKeyboardTab === 'ime' && (
+              <>
+                {/* Not a compose box the operator reads back -- what they type
+                    lands directly on the remote screen, which is the only
+                    place it needs to be visible. This element exists purely
+                    to hold focus and capture keystrokes/IME composition so
+                    the OS keyboard has something to type into; it is never
+                    shown. */}
+                <textarea
+                  ref={mobileTextInputRef}
+                  class="remote-desktop-mobile-hidden-input"
+                  rows={1}
+                  inputMode="text"
+                  enterkeyhint="enter"
+                  autocapitalize="none"
+                  autocomplete="off"
+                  spellcheck={false}
+                  aria-label={t('remote_desktop.mobile_text_input')}
+                  onCompositionStart={(event) => {
+                    event.stopPropagation();
+                    mobileTextComposingRef.current = true;
+                    mobileTextLastCompositionCommitRef.current = null;
+                  }}
+                  onCompositionEnd={(event) => {
+                    event.stopPropagation();
+                    mobileTextComposingRef.current = false;
+                    const value = (event.currentTarget as HTMLTextAreaElement).value;
+                    if (value && mobileTextLastCompositionCommitRef.current !== value) {
+                      mobileTextLastCompositionCommitRef.current = value;
+                      submitMobileText(value);
+                    }
+                  }}
+                  onBeforeInput={(event) => {
+                    event.stopPropagation();
+                    const input = event.currentTarget as HTMLTextAreaElement;
+                    if (mobileTextComposingRef.current || event.isComposing || input.value) return;
+                    const deletionKey = remoteDesktopMobileDeletionKey(event.inputType);
+                    if (!deletionKey) return;
+                    event.preventDefault();
+                    sendMobileShortcut([deletionKey]);
+                  }}
+                  onInput={(event) => {
+                    event.stopPropagation();
+                    if (mobileTextComposingRef.current || event.isComposing) return;
+                    const input = event.currentTarget as HTMLTextAreaElement;
+                    const lastCompositionCommit = mobileTextLastCompositionCommitRef.current;
+                    if (lastCompositionCommit !== null
+                      && (input.value === '' || input.value === lastCompositionCommit)) {
+                      input.value = '';
+                      return;
+                    }
+                    mobileTextLastCompositionCommitRef.current = null;
+                    submitMobileText(input.value);
+                  }}
+                  onKeyDown={(event) => event.stopPropagation()}
+                  onKeyUp={(event) => event.stopPropagation()}
+                />
+              </>
+            )}
+
+            {mobileKeyboardTab === 'keys' && (
+              <div class="remote-desktop-computer-keyboard">
+                <label class="remote-desktop-combo-toggle">
+                  <input type="checkbox" checked={comboMode} onChange={toggleComboMode} />
+                  {t('remote_desktop.combo_mode')}
+                </label>
+                <div
+                  class="remote-desktop-computer-keyboard-pages"
+                  ref={computerKeyboardPagesViewportRef}
+                  onPointerDown={onComputerKeyboardPagesPointerDown}
+                  onPointerMove={onComputerKeyboardPagesPointerMove}
+                  onPointerUp={onComputerKeyboardPagesPointerUp}
+                  onPointerCancel={onComputerKeyboardPagesPointerUp}
+                >
+                  <div
+                    class="remote-desktop-computer-keyboard-track"
+                    style={{
+                      width: `${REMOTE_DESKTOP_COMPUTER_KEYBOARD_PAGES.length * 100}%`,
+                      transform: `translateX(calc(${-computerKeyboardPage * (100 / REMOTE_DESKTOP_COMPUTER_KEYBOARD_PAGES.length)}% + ${computerKeyboardSwipeOffset}px))`,
+                      transition: computerKeyboardSwipeOffset === 0 ? 'transform 0.2s ease' : 'none',
+                    }}
+                  >
+                    {REMOTE_DESKTOP_COMPUTER_KEYBOARD_PAGES.map((page, pageIndex) => (
+                      <div
+                        class="remote-desktop-computer-keyboard-page"
+                        style={{ width: `${100 / REMOTE_DESKTOP_COMPUTER_KEYBOARD_PAGES.length}%` }}
+                        key={pageIndex}
+                      >
+                        {page.map((row, rowIndex) => (
+                          <div
+                            class="remote-desktop-computer-keyboard-row"
+                            style={{ gridTemplateColumns: `repeat(${row.length}, minmax(0, 1fr))` }}
+                            key={rowIndex}
+                          >
+                            {row.map((spec) => {
+                              const label = remoteDesktopComputerKeyLabel(spec, targetPlatform);
+                              const held = heldComboKeys.some((k) => k.code === spec.code);
+                              return (
+                                <button
+                                  key={spec.code}
+                                  type="button"
+                                  class={held ? 'is-held' : ''}
+                                  aria-label={t('remote_desktop.computer_key', { key: label })}
+                                  aria-pressed={spec.modifier ? held : undefined}
+                                  disabled={!snapshot.inputEnabled}
+                                  onPointerDown={(event) => event.preventDefault()}
+                                  onClick={() => pressComputerKey(spec)}
+                                >{label}</button>
+                              );
+                            })}
+                          </div>
+                        ))}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                {REMOTE_DESKTOP_COMPUTER_KEYBOARD_PAGES.length > 1 && (
+                  <div class="remote-desktop-computer-keyboard-dots" role="tablist" aria-label={t('remote_desktop.computer_keyboard_pages')}>
+                    {REMOTE_DESKTOP_COMPUTER_KEYBOARD_PAGES.map((_, pageIndex) => (
+                      <button
+                        key={pageIndex}
+                        type="button"
+                        role="tab"
+                        aria-selected={computerKeyboardPage === pageIndex}
+                        class={computerKeyboardPage === pageIndex ? 'is-active' : ''}
+                        aria-label={t('remote_desktop.computer_keyboard_page', { page: pageIndex + 1 })}
+                        onClick={() => setComputerKeyboardPage(pageIndex)}
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </>)}
 
         {filePanelOpen && fileDrawerMinimized && (() => {
           // Minimized to the corner of the window it belongs to, still showing
@@ -2280,7 +3166,14 @@ export function RemoteDesktopPanel({
         })()}
 
         {filePanelOpen && !fileDrawerMinimized && (
-          <aside class="remote-desktop-file-drawer" aria-label={t('remote_desktop.files')}>
+          // Covers the whole remote desktop window rather than floating over it.
+          // A draggable window here fought the desktop for pointer input at its
+          // edges and could not move anyway once it was this large, so the size
+          // that makes it useful is the size that makes a window pointless.
+          <aside
+            class={`remote-desktop-file-drawer ${REMOTE_DESKTOP_OVERLAY_CLASS}`}
+            aria-label={t('remote_desktop.files')}
+          >
             <div class="remote-desktop-file-drawer-head">
               <div class="remote-desktop-file-drawer-copy">
                 <strong>{t('remote_desktop.files')}</strong>
@@ -2292,10 +3185,7 @@ export function RemoteDesktopPanel({
                   class="remote-desktop-file-control"
                   aria-label={t('remote_desktop.minimize_files')}
                   title={t('remote_desktop.minimize_files')}
-                  onClick={() => {
-                    setDirectoryPickerOpen(false);
-                    setFileDrawerMinimized(true);
-                  }}
+                  onClick={() => setFileDrawerMinimized(true)}
                 >
                   <svg viewBox="0 0 16 16" aria-hidden="true">
                     <path d="M3.5 8h9" />
@@ -2306,10 +3196,7 @@ export function RemoteDesktopPanel({
                   class="remote-desktop-file-control is-close"
                   aria-label={t('remote_desktop.close_files')}
                   title={t('remote_desktop.close_files')}
-                  onClick={() => {
-                    setDirectoryPickerOpen(false);
-                    setFilePanelOpen(false);
-                  }}
+                  onClick={() => setFilePanelOpen(false)}
                 >
                   <svg viewBox="0 0 16 16" aria-hidden="true">
                     <path d="m4.5 4.5 7 7m0-7-7 7" />
@@ -2318,22 +3205,6 @@ export function RemoteDesktopPanel({
               </div>
             </div>
 
-            {supportsDirectoryTransfer ? (
-              <div class="remote-desktop-file-destination">
-                <span>{t('remote_desktop.destination_folder')}</span>
-                <code title={destinationDirectory || undefined}>
-                  {destinationDirectory || t('remote_desktop.choose_destination_folder')}
-                </code>
-                <button type="button" onClick={() => setDirectoryPickerOpen(true)}>
-                  {t('remote_desktop.choose_folder')}
-                </button>
-              </div>
-            ) : (
-              <div class="remote-desktop-file-compatibility">
-                {t('remote_desktop.file_destination_upgrade_hint')}
-              </div>
-            )}
-
             <input
               ref={fileInputRef}
               type="file"
@@ -2341,171 +3212,319 @@ export function RemoteDesktopPanel({
               multiple
               onChange={(event) => {
                 const files = Array.from((event.currentTarget as HTMLInputElement).files ?? []);
-                if (files.length > 0) void sendFiles(files);
+                if (files.length > 0) stageLocalFiles(files);
                 (event.currentTarget as HTMLInputElement).value = '';
               }}
             />
-            <button
-              type="button"
-              class={`remote-desktop-file-drop${fileDropActive ? ' is-active' : ''}`}
-              disabled={supportsDirectoryTransfer && !destinationDirectory}
-              onClick={() => fileInputRef.current?.click()}
-              onDragEnter={(event) => {
-                event.preventDefault();
-                if (!supportsDirectoryTransfer || destinationDirectory) setFileDropActive(true);
-              }}
-              onDragOver={(event) => {
-                event.preventDefault();
-                if (!supportsDirectoryTransfer || destinationDirectory) {
-                  if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
-                  setFileDropActive(true);
-                }
-              }}
-              onDragLeave={(event) => {
-                if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setFileDropActive(false);
-              }}
-              onDrop={(event) => {
-                event.preventDefault();
-                setFileDropActive(false);
-                if (supportsDirectoryTransfer && !destinationDirectory) return;
-                const files = Array.from(event.dataTransfer?.files ?? []);
-                if (files.length > 0) void sendFiles(files);
-              }}
-            >
-              <span aria-hidden="true">⇧</span>
-              <strong>{supportsDirectoryTransfer && !destinationDirectory
-                ? t('remote_desktop.choose_destination_first')
-                : t('remote_desktop.drop_files_here')}</strong>
-              <small>{t('remote_desktop.drop_files_hint')}</small>
-            </button>
-
-            <div class="remote-desktop-fetch-row">
-              <input
-                value={fetchPath}
-                onInput={(event) => setFetchPath((event.currentTarget as HTMLInputElement).value)}
-                placeholder={t('remote_desktop.fetch_path')}
-                aria-label={t('remote_desktop.fetch_path')}
-              />
-              <button type="button" disabled={!fetchPath.trim()} onClick={() => { void fetchFile(); }}>
-                {t('remote_desktop.fetch_file')}
-              </button>
-            </div>
-
-            <div class="remote-desktop-transfer-list" aria-live="polite">
-              {transfers.map((transfer) => (
-                <div class="remote-desktop-transfer-row" key={transfer.id}>
-                  <span class="remote-desktop-transfer-name">{transfer.name}</span>
-                  <span>{t(`upload.transport.${transfer.transport}`)}</span>
-                  <progress
-                    value={transfer.progress}
-                    max={100}
-                    aria-label={t('remote_desktop.transfer_progress', { progress: transfer.progress })}
-                  />
-                  <span class="remote-desktop-transfer-meta">
-                    {transfer.progress}%
-                    {transfer.status === 'transferring' && transfer.bytesPerSecond
-                      ? ` · ${formatByteRate(transfer.bytesPerSecond)}`
-                      : ''}
-                    {transfer.sizeBytes ? ` · ${formatByteSize(transfer.sizeBytes)}` : ''}
-                  </span>
-                  <span>{t(`remote_desktop.transfer_status_${transfer.status}`)}</span>
-                  {transfer.status === 'transferring' && (
+            <div class="remote-desktop-file-explorer">
+              <section class="remote-desktop-file-pane remote-desktop-file-pane-local" aria-label={t('remote_desktop.local_files')}>
+                <div class="remote-desktop-file-pane-head">
+                  <div>
+                    <span>{t('remote_desktop.local_badge')}</span>
+                    <strong>{t('remote_desktop.local_files')}</strong>
+                  </div>
+                  <div class="remote-desktop-file-pane-actions">
+                    <button type="button" onClick={() => fileInputRef.current?.click()}>
+                      {t('remote_desktop.choose_local_files')}
+                    </button>
                     <button
                       type="button"
-                      aria-label={t('remote_desktop.cancel_transfer', { name: transfer.name })}
-                      onClick={() => cancelTransfer(transfer.id)}
-                    >{t('upload.cancel')}</button>
+                      disabled={selectedLocalFiles.length === 0}
+                      onClick={() => setSelectedLocalFiles([])}
+                    >{t('remote_desktop.clear_selection')}</button>
+                  </div>
+                </div>
+                <div class="remote-desktop-file-path">{t('remote_desktop.browser_selected_files')}</div>
+                <div
+                  class={`remote-desktop-local-file-list${fileDropActive ? ' is-active' : ''}`}
+                  onDragEnter={(event) => {
+                    event.preventDefault();
+                    setFileDropActive(true);
+                  }}
+                  onDragOver={(event) => {
+                    event.preventDefault();
+                    if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+                    setFileDropActive(true);
+                  }}
+                  onDragLeave={(event) => {
+                    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setFileDropActive(false);
+                  }}
+                  onDrop={(event) => {
+                    event.preventDefault();
+                    setFileDropActive(false);
+                    stageLocalFiles(Array.from(event.dataTransfer?.files ?? []));
+                  }}
+                >
+                  {selectedLocalFiles.length === 0 ? (
+                    <button type="button" class="remote-desktop-file-empty" onClick={() => fileInputRef.current?.click()}>
+                      <strong>{t('remote_desktop.drop_files_here')}</strong>
+                      <small>{t('remote_desktop.local_selection_hint')}</small>
+                    </button>
+                  ) : selectedLocalFiles.map((file) => (
+                    <div class="remote-desktop-local-file-row" key={`${file.name}:${file.size}:${file.lastModified}`}>
+                      <span title={file.name}>{file.name}</span>
+                      <small>{formatByteSize(file.size)}</small>
+                      <button
+                        type="button"
+                        aria-label={t('remote_desktop.remove_selected_file', { name: file.name })}
+                        onClick={() => setSelectedLocalFiles((current) => current.filter((candidate) => candidate !== file))}
+                      >{t('remote_desktop.remove_file')}</button>
+                    </div>
+                  ))}
+                </div>
+              </section>
+
+              <div class="remote-desktop-file-direction-actions" aria-label={t('remote_desktop.transfer_actions')}>
+                <button
+                  type="button"
+                  aria-label={t('remote_desktop.send_to_remote')}
+                  disabled={selectedLocalFiles.length === 0 || (supportsDirectoryTransfer && !destinationDirectory)}
+                  onClick={sendSelectedFiles}
+                >
+                  <strong>{t('remote_desktop.send_to_remote')}</strong>
+                  <small>{selectedLocalFiles.length > 0
+                    ? t('remote_desktop.selected_files_count', { count: selectedLocalFiles.length })
+                    : t('remote_desktop.select_local_files')}</small>
+                </button>
+                <button
+                  type="button"
+                  aria-label={t('remote_desktop.fetch_to_local')}
+                  disabled={!fetchSourcePath}
+                  onClick={() => { void fetchFile(fetchSourcePath); }}
+                >
+                  <strong>{t('remote_desktop.fetch_to_local')}</strong>
+                  <small>{fetchSourcePath
+                    ? fetchSourcePath.split(/[/\\]/).pop()
+                    : t('remote_desktop.select_remote_file')}</small>
+                </button>
+              </div>
+
+              <section class="remote-desktop-file-pane remote-desktop-file-pane-remote" aria-label={t('remote_desktop.remote_files')}>
+                <div class="remote-desktop-file-pane-head">
+                  <div>
+                    <span class="is-remote">{t('remote_desktop.remote_badge')}</span>
+                    <strong>{machine.displayName}</strong>
+                  </div>
+                  <small>{supportsDirectoryTransfer
+                    ? t('remote_desktop.remote_folder_ready')
+                    : supportsPathHandleTransfer
+                      ? t('remote_desktop.fetch_path')
+                      : t('remote_desktop.file_destination_upgrade_hint')}</small>
+                </div>
+                <div
+                  class="remote-desktop-file-path"
+                  title={(supportsDirectoryTransfer ? destinationDirectory : fetchSourcePath) || undefined}
+                >
+                  {supportsDirectoryTransfer
+                    ? destinationDirectory || t('remote_desktop.choose_destination_folder')
+                    : fetchSourcePath || t('remote_desktop.fetch_path')}
+                </div>
+                <div class="remote-desktop-remote-browser">
+                  {supportsDirectoryTransfer ? (
+                    <FileBrowser
+                      ws={machineDirectoryAdapter.asWsClient()}
+                      mode="file-single"
+                      layout="panel"
+                      initialPath={FILE_TRANSFER_DIRECTORY_PATH.WINDOWS_DRIVES}
+                      serverId={machine.serverId}
+                      readOnly
+                      hideFooter
+                      hideBreadcrumbConfirm
+                      quickAccess
+                      onCurrentPathChange={handleRemotePathChange}
+                      onSelectedPathChange={handleRemoteSelectionChange}
+                      onPreviewFile={() => {}}
+                      onConfirm={(paths) => setSelectedRemoteFile(paths[0] ?? '')}
+                    />
+                  ) : supportsPathHandleTransfer ? (
+                    <label class="remote-desktop-legacy-fetch">
+                      <span>{t('remote_desktop.fetch_path')}</span>
+                      <input
+                        value={legacyFetchPath}
+                        onInput={(event) => setLegacyFetchPath((event.currentTarget as HTMLInputElement).value)}
+                        placeholder={t('remote_desktop.fetch_path')}
+                        aria-label={t('remote_desktop.fetch_path')}
+                        autoComplete="off"
+                        spellcheck={false}
+                      />
+                      <small>{t('remote_desktop.file_destination_upgrade_hint')}</small>
+                    </label>
+                  ) : (
+                    <div class="remote-desktop-file-empty is-compatibility">
+                      <strong>{t('remote_desktop.file_destination_upgrade_hint')}</strong>
+                    </div>
                   )}
                 </div>
-              ))}
+              </section>
             </div>
-            {transferError && <span role="alert">{transferError}</span>}
 
-            {directoryPickerOpen && machineDirectoryAdapterRef.current && (
-              <div class="remote-desktop-directory-picker">
-                <FileBrowser
-                  key={`${machine.serverId}:${destinationDirectory}`}
-                  ws={machineDirectoryAdapterRef.current.asWsClient()}
-                  mode="dir-only"
-                  layout="panel"
-                  initialPath={destinationDirectory || FILE_TRANSFER_DIRECTORY_PATH.WINDOWS_DRIVES}
-                  serverId={`${machine.serverId}:remote-directory`}
-                  readOnly
-                  onConfirm={(paths) => {
-                    const selected = paths[0];
-                    if (!selected
-                      || selected === FILE_TRANSFER_DIRECTORY_PATH.WINDOWS_DRIVES
-                      || selected === FILE_TRANSFER_DIRECTORY_PATH.WINDOWS_DRIVES_ROOT) return;
-                    setDestinationDirectory(selected);
-                    setDirectoryPickerOpen(false);
-                  }}
-                  onClose={() => setDirectoryPickerOpen(false)}
-                />
+            <section class="remote-desktop-transfer-queue" aria-label={t('remote_desktop.transfer_queue')}>
+              <div class="remote-desktop-transfer-queue-head">
+                <div>
+                  <strong>{t('remote_desktop.transfer_queue')}</strong>
+                  <span>{t('remote_desktop.transfer_queue_count', { count: transfers.length })}</span>
+                </div>
+                <button
+                  type="button"
+                  disabled={!transfers.some((transfer) => transfer.status !== 'transferring')}
+                  onClick={() => setTransfers((current) => {
+                    for (const transfer of current) {
+                      if (transfer.status !== 'transferring') savedFetchFilesRef.current.delete(transfer.id);
+                    }
+                    return current.filter((transfer) => transfer.status === 'transferring');
+                  })}
+                >{t('remote_desktop.clear_completed_transfers')}</button>
               </div>
-            )}
+              <div class="remote-desktop-transfer-list" aria-live="polite">
+                {transfers.length === 0 ? (
+                  <div class="remote-desktop-transfer-empty">{t('remote_desktop.no_transfer_tasks')}</div>
+                ) : transfers.map((transfer) => (
+                  <div class="remote-desktop-transfer-row" key={transfer.id}>
+                    <span class="remote-desktop-transfer-name">{transfer.name}</span>
+                    <span class={`remote-desktop-transfer-direction is-${transfer.direction}`}>
+                      {t(`remote_desktop.transfer_direction_${transfer.direction}`)}
+                    </span>
+                    <span>{t(`upload.transport.${transfer.transport}`)}</span>
+                    <progress
+                      value={transfer.progress}
+                      max={100}
+                      aria-label={t('remote_desktop.transfer_progress', { progress: transfer.progress })}
+                    />
+                    <span class="remote-desktop-transfer-meta">
+                      {transfer.progress}%
+                      {transfer.status === 'transferring' && transfer.bytesPerSecond
+                        ? ` · ${formatByteRate(transfer.bytesPerSecond)}`
+                        : ''}
+                      {transfer.sizeBytes ? ` · ${formatByteSize(transfer.sizeBytes)}` : ''}
+                    </span>
+                    <span class="remote-desktop-transfer-paths" title={`${transfer.sourcePath} → ${transfer.destinationPath}`}>
+                      {transfer.sourcePath} → {transfer.destinationPath}
+                    </span>
+                    <span>{t(`remote_desktop.transfer_status_${transfer.status}`)}</span>
+                    {transfer.status === 'transferring' && (
+                      <button
+                        type="button"
+                        aria-label={t('remote_desktop.cancel_transfer', { name: transfer.name })}
+                        onClick={() => cancelTransfer(transfer.id)}
+                      >{t('upload.cancel')}</button>
+                    )}
+                    {transfer.direction === 'fetch' && transfer.status === 'done'
+                      && savedFetchFilesRef.current.has(transfer.id) && canRevealSavedDownload() && (
+                      <button
+                        type="button"
+                        title={t('downloads.open_folder_hint')}
+                        onClick={() => {
+                          const savedFile = savedFetchFilesRef.current.get(transfer.id);
+                          if (savedFile) revealSavedDownload(savedFile);
+                        }}
+                      >{t('downloads.open_folder')}</button>
+                    )}
+                  </div>
+                ))}
+              </div>
+              {transferError && <span role="alert">{transferError}</span>}
+            </section>
           </aside>
         )}
 
         <footer class="remote-desktop-footer">
-          <div class="remote-desktop-diagnostics" aria-label={t('remote_desktop.diagnostics')}>
-            <span>{t('remote_desktop.route', { route: snapshot.route ?? '—' })}</span>
-            {selectedDisplay && <span>{selectedDisplay.width}×{selectedDisplay.height} · {Math.round(selectedDisplay.dpiScale * 100)}% DPI</span>}
-            {snapshot.quality && (
-              <>
-                <span>{snapshot.quality.width}×{snapshot.quality.height} · {snapshot.quality.fps.toFixed(0)} FPS</span>
-                <span>{(snapshot.quality.bitrateBps / 1_000_000).toFixed(1)} Mbps · {snapshot.quality.rttMs.toFixed(0)} ms</span>
-                <span>{t('remote_desktop.encoder', { encoder: snapshot.quality.encoderClass })}</span>
-                <span>{t('remote_desktop.quality', { preset: snapshot.quality.preset })}</span>
-                <span>{t('remote_desktop.dropped_frames', { count: snapshot.quality.droppedFrames })}</span>
-              </>
-            )}
-            {snapshot.pointerMovesSent !== undefined && (
-              <span>{t('remote_desktop.pointer_move_connection', {
-                calls: snapshot.pointerMoveCalls ?? 0,
-                sent: snapshot.pointerMovesSent,
-                mirrored: snapshot.pointerMovesMirrored ?? 0,
-                gate: snapshot.pointerMoveGateRejected ?? 0,
-                channel: snapshot.pointerMoveChannelUnavailable ?? 0,
-                backpressure: snapshot.pointerMoveBackpressureDrops ?? 0,
-                failed: snapshot.pointerMoveSendFailures ?? 0,
-              })}</span>
-            )}
-            <span title={`window mouse ${pointerMoveIngressBySource['window-mouse']} · window pointer ${pointerMoveIngressBySource['window-pointer']} · stage mouse ${pointerMoveIngressBySource['stage-mouse']} · stage pointer ${pointerMoveIngressBySource['stage-pointer']}`}>
-              {t('remote_desktop.pointer_move_browser', {
-                ingress: pointerMovesIngress,
-                accepted: pointerMovesSeen,
-                unmapped: pointerMovesUnmapped,
-                outside: pointerMovesOutside,
-              })}
-            </span>
-            {/* Belongs with the session's other facts, not in the toolbar
-                between the buttons it explains. */}
-            {inputBlockedHint() && (
-              <span class="remote-desktop-input-blocked">{inputBlockedHint()}</span>
-            )}
-            <span>{t('remote_desktop.duration', { seconds: Math.floor((snapshot.durationMs ?? 0) / 1000) })}</span>
-            <span>{t('remote_desktop.reconnects', { count: snapshot.reconnectCount ?? 0 })}</span>
-            <span>{t('remote_desktop.capability', { version: snapshot.capabilityVersion ?? REMOTE_DESKTOP_CAPABILITY })}</span>
+          {/* Always on: the facts you read while judging whether the session is
+              usable -- who is on it, over which link, at what resolution, frame
+              rate, bitrate and loss, and for how long. The nerd toggle keeps the
+              counters that only matter once something is already wrong. */}
+          <div class="remote-desktop-connection-summary">
+            <div class="remote-desktop-stats" aria-label={t('remote_desktop.diagnostics')}>
+              <span class="remote-desktop-diagnostic-machine">{machine.displayName}</span>
+              <span>{t(`remote_desktop.state.${snapshot.state}`)}</span>
+              <span aria-live="polite" data-viewer-count={viewerCount}>{t('remote_desktop.viewers', { count: viewerCount })}</span>
+              <span aria-live="polite" data-controller-count={controllerCount}>{t('remote_desktop.controllers', { count: controllerCount })}</span>
+              <span>{t('remote_desktop.route', { route: snapshot.route ?? '—' })}</span>
+              {selectedDisplay && <span>{selectedDisplay.width}×{selectedDisplay.height} · {Math.round(selectedDisplay.dpiScale * 100)}% DPI</span>}
+              {snapshot.quality && (
+                <>
+                  <span>{snapshot.quality.width}×{snapshot.quality.height} · {snapshot.quality.fps.toFixed(0)} FPS</span>
+                  <span>{(snapshot.quality.bitrateBps / 1_000_000).toFixed(1)} Mbps · {snapshot.quality.rttMs.toFixed(0)} ms</span>
+                  <span>{t('remote_desktop.encoder', { encoder: snapshot.quality.encoderClass })}</span>
+                  <span>{t('remote_desktop.quality', { preset: snapshot.quality.preset })}</span>
+                  <span>{t('remote_desktop.dropped_frames', { count: snapshot.quality.droppedFrames })}</span>
+                </>
+              )}
+              <span>{t('remote_desktop.duration', { seconds: Math.floor((snapshot.durationMs ?? 0) / 1000) })}</span>
+            </div>
+            <button
+              type="button"
+              class="remote-desktop-nerd-toggle"
+              aria-label={t(nerdStatsOpen
+                ? 'remote_desktop.nerd_stats_hide'
+                : 'remote_desktop.nerd_stats_show')}
+              aria-expanded={nerdStatsOpen}
+              aria-controls={`remote-desktop-diagnostics-${machine.serverId}`}
+              onClick={() => setNerdStatsOpen((open) => !open)}
+            >{t('remote_desktop.nerd_stats')}</button>
           </div>
+          {nerdStatsOpen && (
+            <div
+              id={`remote-desktop-diagnostics-${machine.serverId}`}
+              class="remote-desktop-diagnostics"
+              aria-label={t('remote_desktop.diagnostics')}
+            >
+              {snapshot.pointerMovesSent !== undefined && (
+                <span>{t('remote_desktop.pointer_move_connection', {
+                  calls: snapshot.pointerMoveCalls ?? 0,
+                  sent: snapshot.pointerMovesSent,
+                  mirrored: snapshot.pointerMovesMirrored ?? 0,
+                  gate: snapshot.pointerMoveGateRejected ?? 0,
+                  channel: snapshot.pointerMoveChannelUnavailable ?? 0,
+                  backpressure: snapshot.pointerMoveBackpressureDrops ?? 0,
+                  failed: snapshot.pointerMoveSendFailures ?? 0,
+                })}</span>
+              )}
+              <span title={`window mouse ${pointerMoveIngressBySource['window-mouse']} · window pointer ${pointerMoveIngressBySource['window-pointer']} · stage mouse ${pointerMoveIngressBySource['stage-mouse']} · stage pointer ${pointerMoveIngressBySource['stage-pointer']}`}>
+                {t('remote_desktop.pointer_move_browser', {
+                  ingress: pointerMovesIngress,
+                  accepted: pointerMovesSeen,
+                  unmapped: pointerMovesUnmapped,
+                  outside: pointerMovesOutside,
+                })}
+              </span>
+              {inputBlockedHint() && (
+                <span class="remote-desktop-input-blocked">{inputBlockedHint()}</span>
+              )}
+              <span>{t('remote_desktop.reconnects', { count: snapshot.reconnectCount ?? 0 })}</span>
+              <span>{t('remote_desktop.capability', { version: snapshot.capabilityVersion ?? REMOTE_DESKTOP_CAPABILITY })}</span>
+            </div>
+          )}
         </footer>
       </div>
-        </FloatingPanel>
-      </div>
-      {minimized && (
-        <button
-          type="button"
-          class="remote-desktop-minimized-dock"
-          aria-label={t('remote_desktop.title', { machine: machine.displayName })}
-          onClick={onRestore}
-        >
-          <span class={`remote-desktop-minimized-status${connected ? ' is-online' : ''}`} aria-hidden="true" />
-          <span class="remote-desktop-minimized-copy">
-            <strong>{machine.displayName}</strong>
-            <small>{t(`remote_desktop.state.${snapshot.state}`)}</small>
-          </span>
-          <span class="remote-desktop-minimized-restore" aria-hidden="true">↗</span>
-        </button>
-      )}
-    </>
+  );
+
+  if (embedded) return panelBody;
+
+  // A window of its own is already the right size. Wrapping it in a draggable
+  // 1200x760 panel meant every tear-off opened small inside an empty window and
+  // had to be maximised by hand -- and a floating panel that fills its own
+  // window can only be moved off its own edges.
+  if (standalone) return panelBody;
+
+  return (
+    <FloatingPanel
+      id={`remote-desktop-${machine.serverId}`}
+      title={t('remote_desktop.title', { machine: machine.displayName })}
+      onClose={stopAndClose}
+      zIndex={zIndex ?? 10020}
+      onFocus={onFocus}
+      defaultW={1200}
+      defaultH={760}
+      minW={640}
+      minH={420}
+      enableMaximize
+      isMaximized={desktopMaximized}
+      onToggleMaximized={() => setDesktopMaximized((current) => !current)}
+      className="remote-desktop-floating-shell"
+      hideTitleBar
+      dragHandleSelector=".remote-desktop-toolbar"
+    >
+      {panelBody}
+    </FloatingPanel>
   );
 }

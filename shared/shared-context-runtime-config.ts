@@ -138,6 +138,38 @@ export function normalizeSharedContextPresetValue(
   return trimmed;
 }
 
+export interface OptionalSharedContextRuntimeSelection {
+  backend?: SharedContextRuntimeBackend;
+  model?: string;
+  preset?: string;
+}
+
+/**
+ * Normalize an optional fallback runtime without manufacturing one when the
+ * user left it unset. Shared Context and automatic supervision deliberately
+ * use the same backend/model/preset semantics so third-party presets behave
+ * identically in both features.
+ */
+export function normalizeOptionalSharedContextRuntimeSelection(input: {
+  backend?: string | null;
+  model?: string | null;
+  preset?: string | null;
+} | null | undefined): OptionalSharedContextRuntimeSelection {
+  const backend = normalizeSharedContextRuntimeBackend(input?.backend)
+    ?? inferSharedContextRuntimeBackend(input?.model);
+  if (!backend) return {};
+  const preset = normalizeSharedContextPresetValue(backend, input?.preset ?? undefined);
+  const rawModel = trimModelValue(input?.model ?? undefined);
+  const model = rawModel && isKnownSharedContextModelForBackend(backend, rawModel, preset)
+    ? rawModel
+    : getDefaultSharedContextModelForBackend(backend);
+  return {
+    backend,
+    model,
+    ...(preset ? { preset } : {}),
+  };
+}
+
 export function normalizeSharedContextRuntimeConfig(
   input: Partial<ContextModelConfig> | null | undefined,
 ): ContextModelConfig {
@@ -149,18 +181,11 @@ export function normalizeSharedContextRuntimeConfig(
   const primaryContextModel = rawPrimaryContextModel && isKnownSharedContextModelForBackend(normalizedPrimaryBackend, rawPrimaryContextModel, primaryContextPreset)
     ? rawPrimaryContextModel
     : getDefaultSharedContextModelForBackend(normalizedPrimaryBackend);
-  const normalizedBackupBackendCandidate = normalizeSharedContextRuntimeBackend(input?.backupContextBackend)
-    ?? inferSharedContextRuntimeBackend(input?.backupContextModel);
-  const rawBackupContextModel = trimModelValue(input?.backupContextModel);
-  const backupContextBackend = normalizedBackupBackendCandidate;
-  const backupContextPreset = normalizeSharedContextPresetValue(backupContextBackend, input?.backupContextPreset);
-  const backupContextModel = backupContextBackend
-    ? (rawBackupContextModel
-      ? (isKnownSharedContextModelForBackend(backupContextBackend, rawBackupContextModel, backupContextPreset)
-        ? rawBackupContextModel
-        : getDefaultSharedContextModelForBackend(backupContextBackend))
-      : getDefaultSharedContextModelForBackend(backupContextBackend))
-    : undefined;
+  const backup = normalizeOptionalSharedContextRuntimeSelection({
+    backend: input?.backupContextBackend,
+    model: input?.backupContextModel,
+    preset: input?.backupContextPreset,
+  });
   const rawMinInterval = input?.materializationMinIntervalMs;
   const materializationMinIntervalMs = typeof rawMinInterval === 'number' && rawMinInterval > 0 ? rawMinInterval : undefined;
   const memoryRecallMinScore = normalizeMemoryRecallMinScore(input?.memoryRecallMinScore);
@@ -170,9 +195,9 @@ export function normalizeSharedContextRuntimeConfig(
     primaryContextModel,
     primaryContextPreset,
     primaryContextSdk: trimModelValue(input?.primaryContextSdk),
-    backupContextBackend,
-    backupContextModel,
-    backupContextPreset,
+    backupContextBackend: backup.backend,
+    backupContextModel: backup.model,
+    backupContextPreset: backup.preset,
     backupContextSdk: trimModelValue(input?.backupContextSdk),
     materializationMinIntervalMs,
     memoryRecallMinScore,

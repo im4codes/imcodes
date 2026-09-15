@@ -2,7 +2,7 @@
  * Sub-session manager — creates/stops/rebuilds tmux sessions for sub-sessions.
  */
 
-import { newSession, killSession, sessionExists } from '../agent/tmux.js';
+import { newSession, killSession, sessionExists, getPaneId } from '../agent/tmux.js';
 import { getDriver, getTransportRuntime, launchTransportSession, stopTransportRuntimeSession } from '../agent/session-manager.js';
 import type { AgentType } from '../agent/detect.js';
 import { isTransportAgent } from '../agent/detect.js';
@@ -15,12 +15,19 @@ import { randomUUID } from 'node:crypto';
 import { resolveStructuredSessionBootstrap } from '../agent/structured-session-bootstrap.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import { usesProviderResumeId } from '../agent/transport-resume-opts.js';
+import { isCodeBuddyProviderId } from '../../shared/codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
 
 import logger from '../util/logger.js';
 import { getAgentVersion } from '../agent/agent-version.js';
 import { closeSingleSession, type CloseFailure, type CloseTreeResult } from '../agent/session-close.js';
 import { emitSessionInlineError } from './session-error.js';
 import { resolveSubSessionCwd } from './subsession-cwd.js';
+import { clearResend } from './transport-resend-queue.js';
+import { registerTmuxSessionResource, releaseSessionResources, resourceOwnerEnv } from './session-resource-service.js';
+import { markSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
+import { isNativeAgentFenceRequiredForLaunch } from './native-collaboration-guard.js';
+import { processLaunchFence } from '../agent/native-agent-fence.js';
 
 export interface SubSessionRecord {
   id: string;
@@ -47,10 +54,16 @@ export interface SubSessionRecord {
   parentSession?: string | null;
   /** CC env preset name (e.g. "MiniMax", "DeepSeek"). Resolves to env vars at launch. */
   ccPreset?: string | null;
+  /** Durable server/web spelling used by subsession.rebuild_all. */
+  ccPresetId?: string | null;
   /** Extra init prompt injected after session starts. */
   ccInitPrompt?: string | null;
   /** Session description/persona — injected as background info on start and respawn. */
   description?: string | null;
+  /** Exact session-scoped Agent identity contract injected as stable system context. */
+  identityPrompt?: string | null;
+  /** Stable digest used to keep auto-provisioned Agent identity associations disjoint. */
+  provisionedIdentityHash?: string | null;
   effort?: TransportEffortLevel;
   fresh?: boolean;
   _fileSnapshot?: Set<string>;
@@ -135,6 +148,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
         projectDir: sub.cwd ?? process.cwd(),
         label: sub.label ?? undefined,
         description: sub.description ?? undefined,
+        identityPrompt: sub.identityPrompt ?? undefined,
         requestedModel: sub.requestedModel ?? undefined,
         qwenModel: sub.qwenModel ?? undefined,
         transportConfig: sub.transportConfig ?? undefined,
@@ -146,6 +160,10 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
         userCreated: true,
         parentSession: sub.parentSession ?? undefined,
       });
+      if (sub.provisionedIdentityHash) {
+        const created = getSession(sessionName);
+        if (created) upsertSession({ ...created, provisionedIdentityHash: sub.provisionedIdentityHash, updatedAt: Date.now() });
+      }
       return;
     }
     await launchTransportSession({
@@ -156,6 +174,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
       projectDir: sub.cwd ?? process.cwd(),
       label: sub.label ?? undefined,
       description: sub.description ?? undefined,
+      identityPrompt: sub.identityPrompt ?? undefined,
       requestedModel: sub.requestedModel ?? undefined,
       qwenModel: sub.qwenModel ?? undefined,
       transportConfig: sub.transportConfig ?? undefined,
@@ -167,7 +186,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
       ...(sub.providerSessionId ? { ccSessionId: sub.ccSessionId ?? undefined, codexSessionId: sub.codexSessionId ?? undefined, fresh: sub.fresh } : {}),
       ...(!sub.providerSessionId && agentType === 'claude-code-sdk' ? { ccSessionId: randomUUID(), fresh: true } : {}),
       ...((agentType === 'codex-sdk' && !sub.providerSessionId)
-        || ((agentType === 'kimi-sdk' || agentType === 'grok-sdk' || agentType === 'deepseek-harness' || agentType === 'pi') && !providerResumeId)
+        || ((agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === 'deepseek-harness' || agentType === 'pi' || isCodeBuddyProviderId(agentType)) && !providerResumeId)
         ? { fresh: true }
         : {}),
       ...(sub.effort ? { effort: sub.effort } : {}),
@@ -179,6 +198,10 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
       userCreated: true,
       parentSession: sub.parentSession ?? undefined,
     });
+    if (sub.provisionedIdentityHash) {
+      const created = getSession(sessionName);
+      if (created) upsertSession({ ...created, provisionedIdentityHash: sub.provisionedIdentityHash, updatedAt: Date.now() });
+    }
     return;
   }
 
@@ -193,6 +216,12 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
   const agentVersion = await getAgentVersion(agentType, sub.shellBin ?? undefined);
 
   if (await sessionExists(sessionName)) return;
+  if (storedBeforeLaunch) {
+    const previousResources = await releaseSessionResources(storedBeforeLaunch);
+    if (previousResources.failed > 0) {
+      throw new Error(`session resource cleanup failed for ${previousResources.failed} resource(s)`);
+    }
+  }
 
   // Forced fresh (process families): never feed stored identity ids into the
   // bootstrap resolver or launch opts. Drop them up front so bootstrap mints
@@ -232,8 +261,16 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     if (existsSync(jsonlPath)) useResume = true;
   }
 
+  // Decided from managed authority (a Brain's child, a marker, a live
+  // assignment) on the path that launches the process.
+  const nativeAgentsFenced = isNativeAgentFenceRequiredForLaunch({
+    sessionName,
+    role: 'w1',
+    parentSession: sub.parentSession ?? undefined,
+  });
   const launchOpts = {
     cwd: sub.cwd ?? undefined,
+    nativeAgentsFenced,
     ...(sub.shellBin ? { shellBin: sub.shellBin } : {}),
     ...(sub.ccSessionId ? { ccSessionId: sub.ccSessionId } : {}),
     ...(sub.codexModel ? { codexModel: sub.codexModel } : {}),
@@ -253,7 +290,12 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     : driver.buildLaunchCommand(sessionName, launchOpts);
 
   // Resolve CC env preset if specified
-  const launchEnv: Record<string, string> = { IMCODES_SESSION: sessionName };
+  const resourceSessionInstanceId = storedBeforeLaunch?.sessionInstanceId ?? randomUUID();
+  const resourceRuntimeEpoch = createRuntimeEpoch();
+  const launchEnv: Record<string, string> = {
+    IMCODES_SESSION: sessionName,
+    ...resourceOwnerEnv({ sessionName, sessionInstanceId: resourceSessionInstanceId, runtimeEpoch: resourceRuntimeEpoch }),
+  };
   let presetInitMessage: string | undefined;
   if (sub.ccPreset && agentType === 'claude-code') {
     const { resolvePresetEnv, getPreset, getPresetInitMessage } = await import('./cc-presets.js');
@@ -262,8 +304,13 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     const preset = await getPreset(sub.ccPreset);
     if (preset) presetInitMessage = getPresetInitMessage(preset);
   }
+  Object.assign(launchEnv, {
+    IMCODES_SESSION: sessionName,
+    ...resourceOwnerEnv({ sessionName, sessionInstanceId: resourceSessionInstanceId, runtimeEpoch: resourceRuntimeEpoch }),
+  });
 
   await newSession(sessionName, launchCmd, { cwd: sub.cwd ?? undefined, env: launchEnv });
+  const paneId = await getPaneId(sessionName);
 
   if (agentType === 'opencode' && !sub.opencodeSessionId && sub.cwd) {
     const { waitForOpenCodeSessionId } = await import('./opencode-history.js');
@@ -283,6 +330,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
   // Auto-dismiss startup prompts, then inject init message
   const initParts: string[] = [];
   if (sub.description) initParts.push(sub.description);
+  if (sub.identityPrompt) initParts.push(sub.identityPrompt);
   if (presetInitMessage) initParts.push(presetInitMessage);
   if (sub.ccInitPrompt) initParts.push(sub.ccInitPrompt);
   const injectInit = async () => {
@@ -303,12 +351,13 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
   void injectInit();
   timelineEmitter.emit(sessionName, 'session.state', { state: 'started' });
 
-  upsertSession({
+  const record = markSessionLaunchIdentity<SessionRecord>({
     name: sessionName, projectName, agentType: sub.type, agentVersion, role: 'w1', state: 'idle',
-    sessionInstanceId: storedBeforeLaunch?.sessionInstanceId,
+    sessionInstanceId: resourceSessionInstanceId,
     // Reaching this write means a previously absent process authority was
     // created above. Preserve the logical identity but install a new epoch.
-    runtimeEpoch: createRuntimeEpoch(),
+    runtimeEpoch: resourceRuntimeEpoch,
+    paneId,
     projectDir: sub.cwd ?? '', label: sub.label ?? undefined,
     ccSessionId: sub.ccSessionId ?? undefined,
     codexSessionId: sub.codexSessionId ?? undefined,
@@ -317,13 +366,31 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     parentSession: sub.parentSession ?? undefined,
     ccPreset: sub.ccPreset ?? undefined,
     description: sub.description ?? undefined,
+    identityPrompt: sub.identityPrompt ?? undefined,
+    provisionedIdentityHash: sub.provisionedIdentityHash ?? undefined,
     // shellBin (already host-normalized above) persisted for shell/script so a
     // clone/restore that inherited it keeps a runnable launch binary. Config,
     // not identity.
     ...((agentType === 'shell' || agentType === 'script') && sub.shellBin ? { shellBin: sub.shellBin } : {}),
     ...(sub.effort ? { effort: sub.effort } : {}),
+    nativeAgentLaunchFence: {
+      fence: processLaunchFence(agentType, {
+        nativeAgentsFenced,
+        resumesExistingConversation: useResume || Boolean(sub.codexSessionId) || !sub.fresh,
+      }),
+      sessionInstanceId: resourceSessionInstanceId,
+      runtimeEpoch: resourceRuntimeEpoch,
+      decidedAt: Date.now(),
+    },
     restarts: 0, restartTimestamps: [], createdAt: storedBeforeLaunch?.createdAt ?? Date.now(), updatedAt: Date.now()
   });
+  try {
+    await registerTmuxSessionResource(record);
+  } catch (error) {
+    await killSession(sessionName).catch(() => {});
+    throw error;
+  }
+  upsertSession(record);
 
   // Start Watchers
   if (agentType === 'claude-code' && sub.ccSessionId && sub.cwd) {
@@ -406,6 +473,10 @@ export async function stopSubSession(
         throw new Error('session still exists after kill');
       }
     },
+    cleanupResources: async () => {
+      const result = await releaseSessionResources(record);
+      if (result.failed > 0) throw new Error(`session resource cleanup failed for ${result.failed} resource(s)`);
+    },
     emitSuccess: async () => {
       timelineEmitter.emit(sessionName, 'session.state', { state: 'stopped' });
     },
@@ -414,6 +485,7 @@ export async function stopSubSession(
       if (serverLink && id !== sessionName) {
         serverLink.send({ type: 'subsession.closed', id, sessionName });
       }
+      clearResend(sessionName, 'session_removed');
       removeSession(sessionName);
       timelineEmitter.forgetSession(sessionName);
     },
@@ -434,6 +506,57 @@ export async function stopSubSession(
   });
 }
 
+/**
+ * Is this rebuild a no-op for an already-correct record?
+ *
+ * `updatedAt` is excluded deliberately: the rebuild stamps it with `now` on
+ * every pass, so comparing it would report a change for a record where nothing
+ * of substance moved — which is exactly how a replayed rebuild turned into
+ * continuous store churn. Every other field participates, so a real change is
+ * still written.
+ */
+/**
+ * The state a rebuild may assign without undoing a deliberate decision.
+ *
+ * `error` is set by the restart-loop breaker in session-manager after
+ * MAX_RESTARTS failures in the window, and the health sweep skips sessions in
+ * that state — that pair is the whole stop mechanism. Rebuild is REPLAYED on
+ * every server reconnect, and it forced `idle` unconditionally, so each replay
+ * cleared the marker, the sweep respawned the session, it died again, and the
+ * breaker re-fired. Measured on a live daemon: two sub-sessions producing
+ * "Restart loop detected" 8 times in 300s, forever. Preserve the terminal
+ * marker; everything else may be re-derived.
+ */
+function rebuiltSessionState(
+  stored: SessionRecord | undefined,
+  fallback: SessionRecord['state'] = 'idle',
+): SessionRecord['state'] {
+  return stored?.state === 'error' ? 'error' : fallback;
+}
+
+function sameRebuiltTransportRecord(
+  existing: SessionRecord | undefined,
+  next: SessionRecord,
+): boolean {
+  if (!existing) return false;
+  const keys = new Set<string>([
+    ...Object.keys(existing as unknown as Record<string, unknown>),
+    ...Object.keys(next as unknown as Record<string, unknown>),
+  ]);
+  keys.delete('updatedAt');
+  const a = existing as unknown as Record<string, unknown>;
+  const b = next as unknown as Record<string, unknown>;
+  for (const key of keys) {
+    const left = a[key];
+    const right = b[key];
+    if (left === right) continue;
+    // Structural compare for the few object-valued fields (transportConfig,
+    // restartTimestamps). Cheap because these records are small and flat.
+    if (JSON.stringify(left ?? null) !== JSON.stringify(right ?? null)) return false;
+  }
+  return true;
+}
+
 export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promise<void> {
   const { startWatchingFile, findJsonlPathBySessionId, ensureClaudeSessionFile, preClaimFile, isWatching } = await import('./jsonl-watcher.js');
   const { startWatchingById, isWatching: isCodexWatching, isFileClaimedByOther } = await import('./codex-watcher.js');
@@ -448,8 +571,22 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
       continue;
     }
     const projectName = parentProjectName(sub, sessionName);
+    const existing = getSession(sessionName);
+    // The web/server projection deliberately calls this durable identifier
+    // `ccPresetId`, while local SessionRecord and runtime assembly call it
+    // `ccPreset`. Treat an explicitly supplied wire value (including null) as
+    // authoritative after restart; only fall back to the local record when an
+    // older rebuild caller omitted both spellings entirely.
+    const hasWirePreset = Object.prototype.hasOwnProperty.call(sub, 'ccPresetId');
+    const hasLegacyPreset = Object.prototype.hasOwnProperty.call(sub, 'ccPreset');
+    const suppliedPreset = hasWirePreset ? sub.ccPresetId : hasLegacyPreset ? sub.ccPreset : undefined;
+    const normalizedSuppliedPreset = typeof suppliedPreset === 'string' && suppliedPreset.trim()
+      ? suppliedPreset.trim()
+      : undefined;
+    const rebuildCcPreset = hasWirePreset || hasLegacyPreset
+      ? normalizedSuppliedPreset
+      : existing?.ccPreset;
     if (isTransportAgent(sub.type)) {
-      const existing = getSession(sessionName);
       const existingRuntime = getTransportRuntime(sessionName);
       const now = Date.now();
       const nextRecord: SessionRecord = {
@@ -459,7 +596,7 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         role: 'w1',
         agentType: sub.type,
         projectDir: sub.cwd ?? existing?.projectDir ?? process.cwd(),
-        state: existingRuntime ? (existing?.state ?? 'idle') : 'idle',
+        state: rebuiltSessionState(existing, existingRuntime ? (existing?.state ?? 'idle') : 'idle'),
         runtimeType: 'transport',
         providerId: sub.providerId ?? sub.type,
         restarts: existing?.restarts ?? 0,
@@ -477,22 +614,31 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         effort: sub.effort ?? existing?.effort,
         transportConfig: sub.transportConfig ?? existing?.transportConfig,
         description: sub.description ?? existing?.description,
-        ccPreset: sub.ccPreset ?? existing?.ccPreset,
+        ccPreset: rebuildCcPreset,
       };
-      upsertSession(nextRecord);
-      if (!existingRuntime) {
-        logger.info(
-          { sessionName, agentType: sub.type, providerId: nextRecord.providerId },
-          'Transport sub-session rebuild deferred until first send',
-        );
+      // Rebuild is REPLAYED, not one-shot: the server re-sends it on every
+      // reconnect. Writing all of them unconditionally made a reconnect cost a
+      // full rewrite of every sub-session record, and `updatedAt: now` alone
+      // guaranteed every record always compared as changed — so the store was
+      // reserialized and every one of these lines logged, every time, for
+      // records that were already correct. With ~113 sub-sessions and a stall
+      // driving reconnects, that fed itself.
+      if (!sameRebuiltTransportRecord(existing, nextRecord)) {
+        upsertSession(nextRecord);
+        if (!existingRuntime) {
+          logger.info(
+            { sessionName, agentType: sub.type, providerId: nextRecord.providerId },
+            'Transport sub-session rebuild deferred until first send',
+          );
+        }
       }
       continue;
     }
     const exists = await sessionExists(sessionName);
     if (!exists) {
-      await startSubSession(sub).catch(() => {});
+      await startSubSession({ ...sub, ccPreset: rebuildCcPreset }).catch(() => {});
     } else {
-      const stored = getSession(sessionName);
+      const stored = existing ?? getSession(sessionName);
       const effectiveCcSessionId = sub.ccSessionId ?? stored?.ccSessionId;
       if (sub.type === 'claude-code' && effectiveCcSessionId && sub.cwd && !isWatching(sessionName)) {
         // Pre-claim before seed creation to prevent main session's watchDir from stealing the file
@@ -525,7 +671,7 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
       const effectiveGeminiSessionId = sub.geminiSessionId ?? stored?.geminiSessionId;
       const effectiveOpenCodeSessionId = sub.opencodeSessionId ?? stored?.opencodeSessionId;
       upsertSession({
-        name: sessionName, projectName, agentType: sub.type, agentVersion: stored?.agentVersion ?? await getAgentVersion(sub.type as AgentType, sub.shellBin ?? undefined), role: 'w1', state: 'idle',
+        name: sessionName, projectName, agentType: sub.type, agentVersion: stored?.agentVersion ?? await getAgentVersion(sub.type as AgentType, sub.shellBin ?? undefined), role: 'w1', state: rebuiltSessionState(stored),
         sessionInstanceId: stored?.sessionInstanceId,
         runtimeEpoch: stored?.runtimeEpoch,
         projectDir: sub.cwd ?? '', label: sub.label ?? stored?.label ?? undefined,
@@ -544,6 +690,9 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         quotaLabel: stored?.quotaLabel,
         quotaUsageLabel: stored?.quotaUsageLabel,
         quotaMeta: stored?.quotaMeta,
+        codexCreditsBalance: stored?.codexCreditsBalance,
+        codexCreditsHasCredits: stored?.codexCreditsHasCredits,
+        codexCreditsUnlimited: stored?.codexCreditsUnlimited,
         effort: sub.effort ?? stored?.effort,
         // Layer existing under server-provided so supervision set locally survives
         // a rebuild even when the server row still holds the default `{}`.
@@ -559,7 +708,7 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
         // don't copy forward gets wiped. Without carrying these over, daemon
         // restart resets preset/description/userCreated/memory-dedup state
         // and the next respawn spawns the raw CLI without preset env.
-        ...(sub.ccPreset ?? stored?.ccPreset ? { ccPreset: sub.ccPreset ?? stored?.ccPreset ?? undefined } : {}),
+        ...(rebuildCcPreset ? { ccPreset: rebuildCcPreset } : {}),
         ...(sub.description ?? stored?.description ? { description: sub.description ?? stored?.description ?? undefined } : {}),
         ...(stored?.userCreated ? { userCreated: stored.userCreated } : {}),
         ...(stored?.startupMemoryInjected ? { startupMemoryInjected: true } : {}),

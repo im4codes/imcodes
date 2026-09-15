@@ -88,7 +88,7 @@ import {
   type P2pRun,
 } from './p2p-orchestrator.js';
 import { resolveConfiguredP2pTargets } from './p2p-target-selection.js';
-import { enqueueResend, removeResendEntries } from './transport-resend-queue.js';
+import { enqueueResend, removeResendEntries, recipientFromSessionRecord } from './transport-resend-queue.js';
 import type { ExecutionCloneParentStage } from '../../shared/execution-clone.js';
 
 /**
@@ -326,6 +326,7 @@ const implementationMarkerPollTimers = new Map<string, ReturnType<typeof setTime
 const implementationAwaitingDispatchIdleTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const promptIdleAdvanceTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const acceptanceResultFilePollTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const acceptanceAuditIdleRecheckTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const acceptanceAuditAdvancesInFlight = new Map<string, Promise<void>>();
 let timelineUnsubscribe: (() => void) | null = null;
 const execFileAsync = promisify(execFile);
@@ -424,6 +425,7 @@ function queueAutoDeliverPromptForTransportResend(
 ): AutoDeliverPromptSendMode {
   if (isOpenSpecAutoDeliverTerminalStage(run.status)) return 'skipped_terminal';
   const enqueueResult = enqueueResend(run.targetImplementationSessionName, {
+    ...(recipientFromSessionRecord(getSession(run.targetImplementationSessionName)) ? { recipient: recipientFromSessionRecord(getSession(run.targetImplementationSessionName)) } : {}),
     text: prompt,
     commandId,
     clientMessageId: `auto-deliver:${randomUUID()}`,
@@ -595,6 +597,45 @@ function clearAcceptanceResultFilePollTimer(runId: string): void {
   const timer = acceptanceResultFilePollTimers.get(runId);
   if (timer) clearTimeout(timer);
   acceptanceResultFilePollTimers.delete(runId);
+}
+
+function clearAcceptanceAuditIdleRecheckTimer(runId: string): void {
+  const timer = acceptanceAuditIdleRecheckTimers.get(runId);
+  if (timer) clearTimeout(timer);
+  acceptanceAuditIdleRecheckTimers.delete(runId);
+}
+
+/**
+ * Preserve a real idle edge that arrived before the transport runtime finished
+ * its active turn. Timeline state dedupe may suppress the later idle snapshot,
+ * so merely returning from the listener can otherwise strand the acceptance
+ * audit forever. This timer is intentionally distinct from result-file polling:
+ * polling may consume an already-written result while busy, but it must not
+ * independently dispatch a repair prompt.
+ */
+function schedulePostRepairAcceptanceAuditIdleRecheck(run: AutoDeliverRun): void {
+  clearAcceptanceAuditIdleRecheckTimer(run.runId);
+  if (!run.activeAcceptanceAudit || !run.activeCommandId || run.status !== run.activeAcceptanceAudit.stage) return;
+  const attemptId = run.activeAcceptanceAudit.attemptId;
+  const commandId = run.activeCommandId;
+  const stage = run.status;
+  acceptanceAuditIdleRecheckTimers.set(run.runId, setTimeout(() => {
+    acceptanceAuditIdleRecheckTimers.delete(run.runId);
+    const current = runsById.get(run.runId);
+    if (!current || isOpenSpecAutoDeliverTerminalStage(current.status)) return;
+    if (
+      current.activeAcceptanceAudit?.attemptId !== attemptId
+      || current.activeCommandId !== commandId
+      || current.status !== stage
+    ) return;
+    if (isTransportRuntimeBusyForIdleAdvance(current)) {
+      schedulePostRepairAcceptanceAuditIdleRecheck(current);
+      return;
+    }
+    void advanceAfterPostRepairAcceptanceAuditIdle(current).catch((error) => {
+      terminalizeAndSend(current, 'failed', error instanceof Error ? error.message : 'post_repair_acceptance_audit_idle_recheck_failed');
+    });
+  }, OPENSPEC_AUTO_DELIVER_ACCEPTANCE_RESULT_FILE_POLL_MS));
 }
 
 function schedulePostRepairAcceptanceResultFilePoll(run: AutoDeliverRun): void {
@@ -1139,15 +1180,30 @@ async function readTaskStatsForRun(run: AutoDeliverRun): Promise<OpenSpecAutoDel
   // tasks.md can be transiently unreadable/half-written while the agent is
   // checking tasks off; retry a few times before treating it as unreadable so a
   // momentary read race does not hard-fail the run.
+  //
+  // A truncated read does not throw, so the retry above never saw the worst
+  // case. `writeFile` truncates before it writes, and an agent checking a task
+  // off rewrites tasks.md exactly that way, so a poll landing inside the write
+  // parses an EMPTY file and reports `total: 0`. Callers read that as
+  // tasks_missing_checkboxes and terminalize the run -- permanently, for a
+  // file that was intact microseconds later. A run that has already observed
+  // checkboxes cannot legitimately lose every one of them, so treat that
+  // reading as transient too and put it on the same retry budget. A tasks.md
+  // that is genuinely empty still answers zero once the retries are spent.
+  const observedTasksBefore = run.taskStats.total > 0;
   let lastError: unknown;
+  let emptyStats: OpenSpecAutoDeliverTaskStats | undefined;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      return await readTaskStats(run.changeRoot);
+      const stats = await readTaskStats(run.changeRoot);
+      if (!observedTasksBefore || stats.total > 0) return stats;
+      emptyStats = stats;
     } catch (error) {
       lastError = error;
-      if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 200));
     }
+    if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 200));
   }
+  if (emptyStats) return emptyStats;
   throw lastError instanceof Error ? lastError : new Error('tasks_unreadable');
 }
 
@@ -2012,6 +2068,7 @@ function buildPostRepairAcceptanceAuditResultRepairPrompt(
 }
 
 async function dispatchPostRepairAcceptanceAuditPrompt(run: AutoDeliverRun): Promise<OpenSpecAutoDeliverProjection> {
+  clearAcceptanceAuditIdleRecheckTimer(run.runId);
   const elapsedProjection = enforceElapsedLimit(run);
   if (elapsedProjection) return elapsedProjection;
   const stage: AuditRepairStage = run.postRepairAcceptanceStage ?? 'implementation_audit_repair';
@@ -2077,6 +2134,7 @@ async function dispatchPostRepairAcceptanceAuditResultRepairPrompt(
   active: NonNullable<AutoDeliverRun['activeAcceptanceAudit']>,
   reason: string,
 ): Promise<OpenSpecAutoDeliverProjection> {
+  clearAcceptanceAuditIdleRecheckTimer(run.runId);
   const repairAttemptNumber = markResultFileRepairPromptDispatched(active);
   run.activeAcceptanceAudit = active;
   run.activeCommandId = `${active.attemptId}:result-file-repair:${repairAttemptNumber}`;
@@ -2904,6 +2962,7 @@ function terminalize(run: AutoDeliverRun, status: Extract<AutoDeliverRunStatus, 
   }
   run.activeAcceptanceAudit = undefined;
   clearAcceptanceResultFilePollTimer(run.runId);
+  clearAcceptanceAuditIdleRecheckTimer(run.runId);
   clearAuditFixRetryTimer(run.runId);
   clearImplementationReminderTimer(run.runId);
   clearImplementationMarkerPollTimer(run.runId);
@@ -3718,7 +3777,10 @@ function ensureTimelineListener(): void {
       && !!candidate.activeAcceptanceAudit
     );
     if (acceptanceAuditRun) {
-      if (isTransportRuntimeBusyForIdleAdvance(acceptanceAuditRun)) return;
+      if (isTransportRuntimeBusyForIdleAdvance(acceptanceAuditRun)) {
+        schedulePostRepairAcceptanceAuditIdleRecheck(acceptanceAuditRun);
+        return;
+      }
       void advanceAfterPostRepairAcceptanceAuditIdle(acceptanceAuditRun).catch((error) => {
         terminalizeAndSend(acceptanceAuditRun, 'failed', error instanceof Error ? error.message : 'post_repair_acceptance_audit_idle_advance_failed');
       });
@@ -4102,7 +4164,16 @@ export function describeOpenSpecAutoDeliverRunsForTests(): Array<{
   }));
 }
 
-export function clearOpenSpecAutoDeliverRunsForTests(): void {
+export async function clearOpenSpecAutoDeliverRunsForTests(): Promise<void> {
+  // Timeline events intentionally launch async advances without blocking the
+  // emitter. Quiesce the tracked acceptance advances before test fixtures tear
+  // down their project roots or reset shared transport mocks; otherwise a
+  // completion from the previous test can observe the removed tasks.md and
+  // publish a misleading `tasks_unreadable` terminal into the next test.
+  const acceptanceAdvances = [...acceptanceAuditAdvancesInFlight.values()];
+  if (acceptanceAdvances.length > 0) {
+    await Promise.allSettled(acceptanceAdvances);
+  }
   for (const timer of auditPollTimers.values()) clearTimeout(timer);
   auditPollTimers.clear();
   for (const timer of auditFixRetryTimers.values()) clearTimeout(timer);
@@ -4117,6 +4188,8 @@ export function clearOpenSpecAutoDeliverRunsForTests(): void {
   promptIdleAdvanceTimers.clear();
   for (const timer of acceptanceResultFilePollTimers.values()) clearTimeout(timer);
   acceptanceResultFilePollTimers.clear();
+  for (const timer of acceptanceAuditIdleRecheckTimers.values()) clearTimeout(timer);
+  acceptanceAuditIdleRecheckTimers.clear();
   acceptanceAuditAdvancesInFlight.clear();
   for (const run of runsById.values()) {
     releaseAutoDeliverP2pLock(run.owningMainSessionName, run.runId);

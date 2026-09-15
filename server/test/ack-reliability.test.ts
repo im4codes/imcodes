@@ -144,6 +144,87 @@ describe('WsBridge — command ack reliability', () => {
     expect(bridge._getInflightCountForTest()).toBe(1);
   });
 
+  it('buffers and replays queued-message deletion across daemon restart with one stable commandId', async () => {
+    const bridge = WsBridge.get(serverId);
+    const daemonWs = await connectAndAuthenticateDaemon(bridge, serverId);
+    const browser = addBrowserSubscriber(bridge, 'deck_test_brain');
+    daemonWs.close();
+    await flushAsync();
+
+    browser.emit('message', Buffer.from(JSON.stringify({
+      type: 'session.undo_queued_message',
+      sessionName: 'deck_test_brain',
+      clientMessageId: 'queued-1',
+      commandId: 'UNDO-STABLE-1',
+    })));
+    await flushAsync();
+    expect(bridge._getInflightCountForTest()).toBe(1);
+
+    const daemonWs2 = await connectAndAuthenticateDaemon(bridge, serverId);
+    const replay = daemonWs2.sentByType('session.undo_queued_message');
+    expect(replay).toHaveLength(1);
+    expect(replay[0]).toEqual(expect.objectContaining({
+      clientMessageId: 'queued-1',
+      commandId: 'UNDO-STABLE-1',
+    }));
+  });
+
+  it('bounds queued-message deletion retries and returns an explicit command ack error', async () => {
+    vi.useFakeTimers();
+    const bridge = WsBridge.get(serverId);
+    const daemonWs = await connectAndAuthenticateDaemon(bridge, serverId);
+    const browser = addBrowserSubscriber(bridge, 'deck_test_brain');
+
+    browser.emit('message', Buffer.from(JSON.stringify({
+      type: 'session.undo_queued_message',
+      sessionName: 'deck_test_brain',
+      clientMessageId: 'queued-2',
+      commandId: 'UNDO-EXHAUST-1',
+    })));
+    await flushAsync();
+    for (let attempt = 0; attempt <= ACK_TIMEOUT_RETRY_LIMIT; attempt++) {
+      vi.advanceTimersByTime(ACK_TIMEOUT_MS + 100);
+      await flushAsync();
+    }
+
+    expect(daemonWs.sentByType('session.undo_queued_message')).toHaveLength(ACK_TIMEOUT_RETRY_LIMIT + 1);
+    expect(browser.sentByType(MSG_COMMAND_ACK)).toContainEqual(expect.objectContaining({
+      commandId: 'UNDO-EXHAUST-1',
+      status: 'error',
+      error: 'ack_timeout',
+    }));
+    expect(browser.sentByType(MSG_COMMAND_FAILED)).toHaveLength(0);
+  });
+
+  it('projects deletion exhaustion to a replacement subscribed browser after reconnect rotation', async () => {
+    vi.useFakeTimers();
+    const bridge = WsBridge.get(serverId);
+    const daemonWs = await connectAndAuthenticateDaemon(bridge, serverId);
+    const original = addBrowserSubscriber(bridge, 'deck_test_brain');
+    daemonWs.close();
+    await flushAsync();
+
+    original.emit('message', Buffer.from(JSON.stringify({
+      type: 'session.undo_queued_message',
+      sessionName: 'deck_test_brain',
+      clientMessageId: 'queued-rotated-browser',
+      commandId: 'UNDO-ROTATED-BROWSER',
+    })));
+    await flushAsync();
+    original.close();
+
+    const replacement = addBrowserSubscriber(bridge, 'deck_test_brain');
+    (bridge as any).transportSubscriptions.get(replacement)?.add('deck_test_brain');
+    vi.advanceTimersByTime(RECONNECT_GRACE_MS + 100);
+    await flushAsync();
+
+    expect(replacement.sentByType(MSG_COMMAND_ACK)).toContainEqual(expect.objectContaining({
+      commandId: 'UNDO-ROTATED-BROWSER',
+      status: 'error',
+      error: 'daemon_offline',
+    }));
+  });
+
   it('does not forward an in-flight duplicate commandId to the daemon', async () => {
     const bridge = WsBridge.get(serverId);
     const daemonWs = await connectAndAuthenticateDaemon(bridge, serverId);

@@ -1,5 +1,6 @@
 import type { AgentDriver, LaunchOptions } from './base.js';
 import { cwdPrefix } from './base.js';
+import { codexNativeAgentFenceFlags } from '../native-agent-fence.js';
 import type { AgentStatus } from '../detect.js';
 import { detectStatus } from '../detect.js';
 
@@ -21,14 +22,17 @@ export class CodexDriver implements AgentDriver {
   buildLaunchCommand(_sessionName: string, opts?: LaunchOptions): string {
     const cwd = cwdPrefix(opts?.cwd);
     const modelFlag = opts?.codexModel ? ` -m ${JSON.stringify(opts.codexModel)}` : '';
+    // Global flags, so they precede `resume`. They fence only threads this
+    // process CREATES; a resumed thread keeps its own creation-time state.
+    const fence = opts?.nativeAgentsFenced ? codexNativeAgentFenceFlags() : '';
     if (opts?.codexSessionId) {
-      return `${cwd}codex${modelFlag} -s danger-full-access resume ${opts.codexSessionId}`;
+      return `${cwd}codex${modelFlag}${fence} -s danger-full-access resume ${opts.codexSessionId}`;
     }
     if (opts?.fresh) {
-      return `${cwd}codex${modelFlag} -s danger-full-access`;
+      return `${cwd}codex${modelFlag}${fence} -s danger-full-access`;
     }
     // Default: resume last session; fall back to fresh if no history
-    return `${cwd}codex${modelFlag} -s danger-full-access resume --last || codex${modelFlag} -s danger-full-access`;
+    return `${cwd}codex${modelFlag}${fence} -s danger-full-access resume --last || codex${modelFlag}${fence} -s danger-full-access`;
   }
 
   buildResumeCommand(_sessionName: string, opts?: LaunchOptions): string {

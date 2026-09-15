@@ -430,17 +430,6 @@ TEST(WorkerPolicyTest, KeepsHardwareFallbackStickyAcrossRateReconfiguration) {
   EXPECT_FALSE(ShouldAttemptHardwareEncoder(false, true));
 }
 
-TEST(WorkerPolicyTest, RequiresBothFreshCaptureAndStalledRtpForFailover) {
-  EXPECT_FALSE(MediaProgressShouldFailover(100, 101, 20, 30,
-                                           kMediaProgressTimeoutMs));
-  EXPECT_FALSE(MediaProgressShouldFailover(100, 100, 20, 20,
-                                           kMediaProgressTimeoutMs));
-  EXPECT_FALSE(MediaProgressShouldFailover(100, 100, 20, 30,
-                                           kMediaProgressTimeoutMs - 1));
-  EXPECT_TRUE(MediaProgressShouldFailover(100, 100, 20, 21,
-                                          kMediaProgressTimeoutMs));
-}
-
 TEST(WorkerPolicyTest, AcceptsZeroAsTheFirstChannelSequenceOnly) {
   EXPECT_TRUE(InputSequenceIsFresh(false, 0, 0));
   EXPECT_TRUE(InputSequenceIsFresh(false, 42, 0));

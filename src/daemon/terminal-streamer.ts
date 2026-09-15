@@ -79,6 +79,11 @@ function isBlankTerminalSnapshot(value: string): boolean {
 
 export type { TerminalDiff, TerminalHistory } from '../shared/transport/terminal.js';
 
+/** How long a just-broadcast snapshot is treated as current, so a burst of
+ *  requests from several browser tabs collapses to one `capture-pane`. Kept
+ *  well below human perception so a reused frame is never visibly stale. */
+const SNAPSHOT_FRESHNESS_MS = 250;
+
 export interface StreamSubscriber {
   sessionName: string;
   /** Send a fullFrame snapshot or diff (snapshot uses fullFrame: true). */
@@ -96,6 +101,14 @@ interface SubscriberState {
   snapshotPending: boolean;
   rawBuffer: Buffer[];
   rawBufferBytes: number;
+  /**
+   * Set when the first-paint capture blew its deadline. A capture that settles
+   * afterwards must not publish: the stall re-probe has already repainted with
+   * newer content, and a late full frame would rewrite the pane from cursor
+   * home and regress it -- the same staleness the re-probe's rawGuardSince
+   * barrier prevents.
+   */
+  firstPaintAbandoned?: boolean;
 }
 
 interface PipeState {
@@ -130,6 +143,14 @@ export class TerminalStreamer {
    *  `cat` is then orphaned. Observed a ~5% orphan rate (10 of 215 pipe
    *  starts) on a leaking production daemon before this guard. */
   private pipeStartLocks = new Set<string>();
+
+  /** Sessions with a `capture-pane` currently running. See `requestSnapshot`. */
+  private snapshotInFlight = new Set<string>();
+  /** Timestamp until which the last broadcast snapshot is considered current. */
+  private snapshotFreshUntil = new Map<string, number>();
+  /** Sessions invalidated (resized) while a capture was in flight — each earns
+   *  exactly one trailing capture so the new geometry is not lost. */
+  private snapshotStaleWhileCapturing = new Set<string>();
 
   /** Grace period before tearing down a pipe whose subscriber count
    *  dropped to zero. Without it, any browser-side subscriber churn
@@ -219,6 +240,7 @@ export class TerminalStreamer {
       snapshotPending: hasPipe,
       rawBuffer: [],
       rawBufferBytes: 0,
+      firstPaintAbandoned: false,
     };
     subs.set(subscriber, subState);
 
@@ -278,7 +300,42 @@ export class TerminalStreamer {
     // 1. Take snapshot. A thrown capture (e.g. tmux "can't find pane") is NOT a
     //    blank snapshot; it is treated as 'failed' so the deadline re-probe
     //    below can decide between repaint and restart.
-    const firstSnapshot = await this.captureAndSendSnapshot(sessionName, subscriber);
+    // Bounded first paint.
+    //
+    // `tmuxRun` uses execFile with no timeout, so a wedged `capture-pane`
+    // settles neither way. Both the `snapshotPending = false` release and the
+    // stall-watch arming below sit after this await, so an unbounded wait left
+    // the subscriber buffering raw silently forever -- a blank pane that
+    // reopening the window could not fix, because the pipe still existed and
+    // every new subscriber wedged identically. Only a daemon restart cleared it.
+    //
+    // This is NOT a longer timeout or a retry: it converts an unbounded wait
+    // into the 'failed' outcome the existing deadline re-probe already handles,
+    // which repaints a live pane and restarts a genuinely dead one.
+    //
+    // SCOPE, stated plainly: the bound is on the CONSUMER, not the child. A
+    // wedged `tmux capture-pane` process is not killed here and may still be
+    // running; execFile owns that lifetime. What this guarantees is that the
+    // daemon never waits on it unboundedly and never spawns captures in a loop
+    // because of it -- bootstrap issues at most one capture plus one re-probe
+    // capture, then reports through the existing stall path.
+    let firstPaintDeadline: ReturnType<typeof setTimeout> | undefined;
+    const firstSnapshot = await Promise.race([
+      this.captureAndSendSnapshot(sessionName, subscriber).finally(() => {
+        // Clear the deadline as soon as the capture settles. Leaving it armed
+        // would let an orphan timer flip firstPaintAbandoned on a subscriber
+        // whose first paint SUCCEEDED, poisoning healthy state 1.5s later --
+        // the same class of latent wedge this whole fix exists to remove.
+        if (firstPaintDeadline !== undefined) clearTimeout(firstPaintDeadline);
+      }),
+      new Promise<'failed'>((resolve) => {
+        firstPaintDeadline = setTimeout(() => {
+          const liveState = this.subscribers.get(sessionName)?.get(subscriber);
+          if (liveState) liveState.firstPaintAbandoned = true;
+          resolve('failed');
+        }, BLANK_BOOTSTRAP_STALL_MS);
+      }),
+    ]);
     const snapshotWasBlank = firstSnapshot === 'blank';
     const snapshotFailed = firstSnapshot === 'failed';
 
@@ -350,7 +407,18 @@ export class TerminalStreamer {
           // watch start as the raw guard so a byte arriving during the async
           // capture suppresses the now-stale frame instead of clobbering it
           // (at this point lastStreamRawAt is known < bootstrapWatchStartedAt).
-          const probe = await this.captureAndSendSnapshot(sessionName, subscriber, bootstrapWatchStartedAt);
+          // Bounded here too. The re-probe is the RECOVERY path, so if it awaits
+          // the same wedged capture it inherits the identical unbounded wait and
+          // the stall signal is never delivered -- the first-paint bound alone
+          // would move the hang one level down instead of removing it.
+          let probeDeadline: ReturnType<typeof setTimeout> | undefined;
+          const probe = await Promise.race([
+            this.captureAndSendSnapshot(sessionName, subscriber, bootstrapWatchStartedAt)
+              .finally(() => { if (probeDeadline !== undefined) clearTimeout(probeDeadline); }),
+            new Promise<'failed'>((resolve) => {
+              probeDeadline = setTimeout(() => resolve('failed'), BLANK_BOOTSTRAP_STALL_MS);
+            }),
+          ]);
           if (probe === 'sent') return;
           if (!this.subscribers.get(sessionName)?.has(subscriber)) return;
           if ((this.lastStreamRawAt.get(sessionName) ?? 0) >= bootstrapWatchStartedAt) return;
@@ -400,7 +468,10 @@ export class TerminalStreamer {
         newLineCount: 0,
       };
 
-      if (!this.subscribers.get(sessionName)?.has(subscriber)) return blank ? 'blank' : 'sent';
+      const liveState = this.subscribers.get(sessionName)?.get(subscriber);
+      if (!liveState) return blank ? 'blank' : 'sent';
+      // A capture that came back after its deadline is stale by definition.
+      if (rawGuardSince === undefined && liveState.firstPaintAbandoned) return blank ? 'blank' : 'sent';
       subscriber.send(diff);
       return blank ? 'blank' : 'sent';
     } catch (err) {
@@ -440,6 +511,9 @@ export class TerminalStreamer {
       const currentSubs = this.subscribers.get(sessionName);
       if (!currentSubs || currentSubs.size > 0) return;
       this.subscribers.delete(sessionName);
+      // No subscribers left — drop snapshot coalescing state so a session that
+      // comes back later is not gated by a stale freshness window.
+      this.clearSnapshotCoalescing(sessionName);
       void this.stopPipe(sessionName);
       this.clearIdleTimer(sessionName);
       this.lastRawAt.delete(sessionName);
@@ -453,13 +527,46 @@ export class TerminalStreamer {
     logger.debug({ sessionName, graceMs: TerminalStreamer.PIPE_STOP_GRACE_MS }, 'pipe-stop scheduled with grace');
   }
 
-  /** Request an on-demand snapshot for all subscribers of a session. */
+  /**
+   * Request an on-demand snapshot for all subscribers of a session.
+   *
+   * COALESCED, and deliberately so. Every browser tab that has this session
+   * open asks for a snapshot on reconnect — and each tab asks more than once,
+   * because `SessionPane` / `SubSessionWindow` each render a `TerminalView`
+   * that also asks. Ungoverned, each of those requests forked its own
+   * `capture-pane`, and the resulting full frame is broadcast to EVERY
+   * subscriber of the session, so the delivered bytes grew with
+   * (requests x subscribers). After a lock/sleep, when every tab reconnects at
+   * once, that is a subscription storm.
+   *
+   * Two gates, and BOTH are needed:
+   *  - in-flight: a capture already running absorbs later requests;
+   *  - freshness: a capture that finished microseconds ago is reused. Without
+   *    this, a client that spaces its requests out (the client staggers them)
+   *    would see "nothing in flight" every single time — a local capture-pane
+   *    finishes far faster than the stagger — and re-capture on every request.
+   *
+   * The snapshot is authoritative for the whole session (tmux keeps ONE size
+   * per session; `SubscriberState` carries no per-subscriber dimensions), so a
+   * single capture broadcast once is correct for every subscriber.
+   */
   requestSnapshot(sessionName: string): void {
     // Transport sessions have no tmux pane — snapshot requests are no-ops.
     if (isTransportSessionName(sessionName)) return;
     const subs = this.subscribers.get(sessionName);
     if (!subs || subs.size === 0) return;
 
+    // Already capturing — that capture's broadcast covers this request too.
+    if (this.snapshotInFlight.has(sessionName)) return;
+    // Captured moments ago and nothing invalidated it — reuse, do not re-fork.
+    const freshUntil = this.snapshotFreshUntil.get(sessionName) ?? 0;
+    if (Date.now() < freshUntil) return;
+
+    this.snapshotInFlight.add(sessionName);
+    // Same barrier the bootstrap re-probe uses: raw forwarded while we await
+    // the capture is NEWER than the captured screen, so publishing that frame
+    // afterwards would rewrite the pane from cursor home and regress it.
+    const rawGuardSince = Date.now();
     void (async () => {
       try {
         const size = await this.getSize(sessionName);
@@ -480,8 +587,12 @@ export class TerminalStreamer {
           newLineCount: 0,
         };
 
-        for (const [sub] of subs) {
-          try { sub.send(diff); } catch { /* ignore */ }
+        // The raw already reached the subscriber and proves the pane is live;
+        // a capture older than it must not be published over it.
+        if ((this.lastStreamRawAt.get(sessionName) ?? 0) < rawGuardSince) {
+          for (const [sub] of subs) {
+            try { sub.send(diff); } catch { /* ignore */ }
+          }
         }
 
         // ConPTY: ring buffer snapshot is approximate (no cursor/ANSI state).
@@ -500,15 +611,47 @@ export class TerminalStreamer {
         }
 
         timelineEmitter.emit(sessionName, 'terminal.snapshot', { lines, cols: size.cols, rows: size.rows });
+        // Only a SUCCESSFUL capture earns a freshness window. A failure must
+        // not suppress the next attempt.
+        this.snapshotFreshUntil.set(sessionName, Date.now() + SNAPSHOT_FRESHNESS_MS);
       } catch (err) {
         logger.warn({ sessionName, err }, 'requestSnapshot failed');
+      } finally {
+        // Released in `finally` so a rejected capture cannot wedge the session
+        // into "permanently in flight" — that would turn one failure into a
+        // terminal that never refreshes again.
+        this.snapshotInFlight.delete(sessionName);
+        // A resize (or anything else) that landed WHILE the capture was running
+        // invalidated it: the frame just broadcast may describe the old
+        // geometry. Drop the freshness window and run exactly one more capture
+        // — bounded, because this flag is cleared before re-entering.
+        if (this.snapshotStaleWhileCapturing.delete(sessionName)) {
+          this.snapshotFreshUntil.delete(sessionName);
+          if ((this.subscribers.get(sessionName)?.size ?? 0) > 0) {
+            this.requestSnapshot(sessionName);
+          }
+        }
       }
     })();
+  }
+
+  /** Drop any coalescing state for a session (unsubscribe / teardown). */
+  private clearSnapshotCoalescing(sessionName: string): void {
+    this.snapshotInFlight.delete(sessionName);
+    this.snapshotFreshUntil.delete(sessionName);
+    this.snapshotStaleWhileCapturing.delete(sessionName);
   }
 
   /** Invalidate size cache (call after resize events). */
   invalidateSize(sessionName: string): void {
     this.sizeCache.delete(sessionName);
+    // The cached snapshot describes the OLD geometry — never serve it as fresh.
+    this.snapshotFreshUntil.delete(sessionName);
+    // If a capture is mid-flight it is already reading stale geometry; mark it
+    // so exactly one trailing capture runs once it settles.
+    if (this.snapshotInFlight.has(sessionName)) {
+      this.snapshotStaleWhileCapturing.add(sessionName);
+    }
   }
 
   /** No-op in new design (no polling loop to nudge). Kept for API compat. */
@@ -560,6 +703,12 @@ export class TerminalStreamer {
     this.idleState.clear();
     this.sizeCache.clear();
     this.frameSeqs.clear();
+    // Snapshot coalescing state is per-session bookkeeping, not a resource —
+    // but leaving it behind means a rebuilt streamer (or a reused instance)
+    // could be gated by a freshness window that outlived its session.
+    this.snapshotInFlight.clear();
+    this.snapshotFreshUntil.clear();
+    this.snapshotStaleWhileCapturing.clear();
   }
 
   destroy(): void {
@@ -821,10 +970,15 @@ export class TerminalStreamer {
   }
 
   private failSubscriber(sessionName: string, sub: StreamSubscriber, state: SubscriberState): void {
-    // Discard buffer and remove subscriber
+    // Overflow is a buffer problem, not a subscription problem. Removing the
+    // subscriber made the reset unrecoverable: the client's only reaction to
+    // stream_reset is a snapshot request, and requestSnapshot() returns early
+    // when the session has no subscribers, so the pane stayed dead until a full
+    // socket reconnect. Discard the buffered bytes and stop buffering, but keep
+    // the exact subscriber so the reset it receives can actually resync.
     state.rawBuffer = [];
     state.rawBufferBytes = 0;
-    this.removeSubscriber(sessionName, sub);
+    state.snapshotPending = false;
 
     // Notify client to reset and resubscribe
     try {

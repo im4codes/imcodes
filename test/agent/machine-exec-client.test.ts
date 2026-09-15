@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { execRemote, listMachines, MachineControlPlaneError } from '../../src/daemon/machine-exec-client.js';
 import {
   encodeMachineExecHttpEnvelope,
@@ -11,6 +11,7 @@ import {
   REMOTE_EXEC_MAX_OUTPUT_BYTES,
   type RemoteExecResult,
 } from '../../shared/remote-exec.js';
+import { CONTROLLED_NODE_ID_MIN } from '../../shared/controlled-node-identity.js';
 
 // Build a valid server envelope exactly as the server route encodes it.
 function envelope(outcome: Parameters<typeof encodeMachineExecHttpEnvelope>[0], result?: RemoteExecResult): typeof fetch {
@@ -183,7 +184,10 @@ describe('listMachines client — bounded strict, typed control-plane failure', 
     { serverId: 'a', name: 'a', refName: 'a', displayName: 'A', online: true, nodeRole: 'controlled', execEnabled: true, os: 'linux' },
     { serverId: 'b', name: 'b', refName: 'b', displayName: 'B', online: false, nodeRole: 'controlled', execEnabled: true },
     { serverId: 'c', name: 'c', refName: 'c', displayName: 'C', online: true, nodeRole: 'controlled', execEnabled: false },
-  ];
+  ].map((item, index) => ({
+    ...item,
+    nodeId: String(BigInt(CONTROLLED_NODE_ID_MIN) + BigInt(index)),
+  }));
   const list200 = (machines: unknown) => (async () => new Response(JSON.stringify({ machines }), { status: 200 })) as unknown as typeof fetch;
   const opts = { serverUrl: base.serverUrl, sourceServerId: 's1', sourceToken: 't1' };
   it('excludes offline + exec-disabled by default; forwards canonical os', async () => {
@@ -192,6 +196,25 @@ describe('listMachines client — bounded strict, typed control-plane failure', 
   });
   it('includes all when includeOffline is set', async () => {
     expect((await listMachines({ ...opts, includeOffline: true, fetchImpl: list200(items) })).length).toBe(3);
+  });
+  it('forwards the private shared-turn authority during discovery', async () => {
+    const fetchImpl = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      expect(new Headers(init?.headers).get('x-imcodes-shared-machine-authority')).toBe('signed-turn');
+      return new Response(JSON.stringify({ machines: items }), { status: 200 });
+    });
+    await listMachines({ ...opts, sharedMachineAuthority: 'signed-turn', fetchImpl: fetchImpl as typeof fetch });
+    expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+  it('accepts a mixed legacy + post-migration list where empty refName means no deprecated alias', async () => {
+    const mixed = [
+      { ...items[0], refName: '' },
+      { ...items[1], refName: 'legacy-node' },
+    ];
+    await expect(listMachines({
+      ...opts,
+      includeOffline: true,
+      fetchImpl: list200(mixed),
+    })).resolves.toEqual(mixed);
   });
   it('accepts access roles from a new server and rejects unknown roles', async () => {
     const shared = [{ ...items[0], accessRole: 'participant' }];
@@ -225,10 +248,24 @@ describe('listMachines client — bounded strict, typed control-plane failure', 
     await expect(listMachines({ ...opts, fetchImpl: list200([{ ...items[0], bogus: 1 }]) })).rejects.toBeInstanceOf(MachineControlPlaneError);
     await expect(listMachines({ ...opts, fetchImpl: list200([{ ...items[0], os: 'solaris' }]) })).rejects.toBeInstanceOf(MachineControlPlaneError);
     await expect(listMachines({ ...opts, fetchImpl: list200([{ ...items[0], nodeRole: 'full' }]) })).rejects.toBeInstanceOf(MachineControlPlaneError);
+    await expect(listMachines({ ...opts, fetchImpl: list200([{ ...items[0], nodeId: 1234567890 }]) })).rejects.toBeInstanceOf(MachineControlPlaneError);
+    await expect(listMachines({ ...opts, fetchImpl: list200([{ ...items[0], nodeId: '0123456789' }]) })).rejects.toBeInstanceOf(MachineControlPlaneError);
     await expect(listMachines({ ...opts, fetchImpl: list200([{ ...items[0], refName: 'bad target' }]) })).rejects.toBeInstanceOf(MachineControlPlaneError);
     const tooMany = Array.from({ length: MACHINE_LIST_MAX_ITEMS + 1 }, (_v, i) => ({ ...items[0], serverId: `s${i}`, refName: `r${i}` }));
     await expect(listMachines({ ...opts, fetchImpl: list200(tooMany) })).rejects.toBeInstanceOf(MachineControlPlaneError);
   });
+  it('accepts hostServerId, the additive field that took the control plane down', async () => {
+    // A controlled node co-located with a daemon carries host_server_id, and the
+    // Server emits it as `hostServerId`. It was added to the machine DTO but
+    // never added to this allow-list nor to the Server's daemon-strip list, so
+    // every daemon rejected the WHOLE list -- `machine control plane: malformed`
+    // -- the moment any one machine had a canonical host. Presentation only:
+    // access is still resolved server-side per request.
+    const withHost = [{ ...items[0], hostServerId: 'daemon-server-id' }];
+    const r = await listMachines({ ...opts, fetchImpl: list200(withHost) });
+    expect(r.map((m) => m.serverId)).toEqual(['a']);
+  });
+
   it('only a valid empty {machines:[]} is a real empty account', async () => {
     expect(await listMachines({ ...opts, fetchImpl: list200([]) })).toEqual([]);
     await expect(listMachines({

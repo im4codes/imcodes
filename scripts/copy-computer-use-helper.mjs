@@ -12,7 +12,7 @@
  * IMCODES_REQUIRE_COMPUTER_USE_HELPER=1.
  */
 import { execFileSync, spawnSync } from 'node:child_process';
-import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, statSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { createRequire } from 'node:module';
@@ -38,15 +38,33 @@ const copyDist = args.size === 0 || args.has('--dist');
 const copyNodeExe = args.size === 0 || args.has('--node-exe');
 const requireHelper = process.env.IMCODES_REQUIRE_COMPUTER_USE_HELPER === '1'
   || process.env.IMCODES_REQUIRE_COMPUTER_USE_HELPER === 'true';
+const rootPackage = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+const pinnedOpenComputerUseVersion = rootPackage.devDependencies?.['open-computer-use'];
+if (typeof pinnedOpenComputerUseVersion !== 'string'
+  || !/^\d+\.\d+\.\d+$/.test(pinnedOpenComputerUseVersion)) {
+  throw new Error('copy-computer-use-helper: open-computer-use must use an exact semver pin');
+}
+
+function resolveValidatedNpmPackageRoot() {
+  let manifestPath;
+  try {
+    manifestPath = require.resolve('open-computer-use/package.json');
+  } catch {
+    return null;
+  }
+  const manifestStat = lstatSync(manifestPath);
+  if (!manifestStat.isFile() || manifestStat.isSymbolicLink()) {
+    throw new Error('copy-computer-use-helper: npm package manifest must be a regular non-symlink file');
+  }
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  if (manifest.name !== 'open-computer-use' || manifest.version !== pinnedOpenComputerUseVersion) {
+    throw new Error(`copy-computer-use-helper: expected open-computer-use@${pinnedOpenComputerUseVersion}, received ${String(manifest.name)}@${String(manifest.version)}`);
+  }
+  return dirname(manifestPath);
+}
 
 function sourceCandidates() {
-  const npmPackageRoot = (() => {
-    try {
-      return dirname(require.resolve('open-computer-use/package.json'));
-    } catch {
-      return null;
-    }
-  })();
+  const npmPackageRoot = resolveValidatedNpmPackageRoot();
   const npmPackagedBinary = npmPackageRoot
     ? process.platform === 'darwin'
       ? join(npmPackageRoot, 'dist', macosAppName)
@@ -63,7 +81,12 @@ function findSource() {
   for (const candidate of sourceCandidates()) {
     const full = resolve(candidate);
     if (!existsSync(full)) continue;
-    if (process.platform !== 'darwin') return full;
+    const fullStat = lstatSync(full);
+    if (fullStat.isSymbolicLink()) continue;
+    if (process.platform !== 'darwin') {
+      if (fullStat.isFile() || fullStat.isDirectory()) return full;
+      continue;
+    }
     const app = basename(full) === macosAppName ? full : join(full, macosAppName);
     if (existsSync(app) && lstatSync(app).isDirectory() && !lstatSync(app).isSymbolicLink()) return app;
   }

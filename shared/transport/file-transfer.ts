@@ -77,10 +77,46 @@ export const FILE_TRANSFER_DIRECTORY_CAPABILITY = 'file.transfer.directory.v1' a
 export const FILE_TRANSFER_PATH_MAX_BYTES = 4 * 1024;
 export const FILE_TRANSFER_ERROR_MAX_BYTES = 256;
 export const FILE_TRANSFER_DIRECTORY_MAX_ENTRIES = 512;
+/**
+ * Sentinel paths the daemon resolves on the REMOTE machine's behalf.
+ *
+ * Only the daemon knows where these actually live: `Downloads` may have been
+ * redirected on Windows, and on Linux it is whatever `user-dirs.dirs` says --
+ * possibly localized ("Téléchargements"). So the browser asks by NAME and the
+ * daemon answers with the real path in `resolvedPath`.
+ *
+ * They ride in the existing `path` field on purpose. `validateFileDirectoryListRequest`
+ * enforces `hasOnlyKeys(['type','requestId','path'])` and the server route
+ * re-checks the same key set, so a new request field would be a breaking change
+ * across three layers; a new sentinel value is not. `:drives:` already
+ * established the pattern.
+ */
 export const FILE_TRANSFER_DIRECTORY_PATH = {
   WINDOWS_DRIVES: ':drives:',
   WINDOWS_DRIVES_ROOT: '__imcodes_windows_drives__',
+  HOME: ':home:',
+  DESKTOP: ':desktop:',
+  DOWNLOADS: ':downloads:',
+  DOCUMENTS: ':documents:',
 } as const;
+
+/** The sentinels that resolve to a well-known user directory. */
+export const FILE_TRANSFER_WELL_KNOWN_DIRECTORY_PATHS = [
+  FILE_TRANSFER_DIRECTORY_PATH.HOME,
+  FILE_TRANSFER_DIRECTORY_PATH.DESKTOP,
+  FILE_TRANSFER_DIRECTORY_PATH.DOWNLOADS,
+  FILE_TRANSFER_DIRECTORY_PATH.DOCUMENTS,
+] as const;
+
+export type FileTransferWellKnownDirectoryPath =
+  (typeof FILE_TRANSFER_WELL_KNOWN_DIRECTORY_PATHS)[number];
+
+export function isFileTransferWellKnownDirectoryPath(
+  value: unknown,
+): value is FileTransferWellKnownDirectoryPath {
+  return typeof value === 'string'
+    && (FILE_TRANSFER_WELL_KNOWN_DIRECTORY_PATHS as readonly string[]).includes(value);
+}
 
 /** Machine-readable upload-error codes shared by the daemon (producer), server
  *  (relay) and web (localized display). */
@@ -187,8 +223,22 @@ export interface FileDirectoryListRequest {
 export interface FileDirectoryEntry {
   name: string;
   path: string;
-  isDir: true;
+  isDir: boolean;
   hidden: boolean;
+  /**
+   * Capacity of the filesystem this entry sits on, when the daemon could
+   * measure it. Only populated for volume roots -- a per-file `statfs` on a
+   * 512-entry listing would be 512 syscalls for a number that is the same for
+   * every one of them.
+   */
+  totalBytes?: number;
+  freeBytes?: number;
+}
+
+/** Non-negative, finite, and small enough to be a real byte count. */
+function isByteCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    && value <= Number.MAX_SAFE_INTEGER;
 }
 
 export interface FileDirectoryListDone {
@@ -528,14 +578,25 @@ export function validateControlledFileTransferResponse(
     const entries: FileDirectoryEntry[] = [];
     for (const entry of v.entries) {
       if (!isObject(entry)
-        || !hasOnlyKeys(entry, new Set(['name', 'path', 'isDir', 'hidden']))
+        || !hasOnlyKeys(entry, new Set(['name', 'path', 'isDir', 'hidden', 'totalBytes', 'freeBytes']))
         || !isBoundedString(entry.name, 1024)
         || !isBoundedString(entry.path, FILE_TRANSFER_PATH_MAX_BYTES)
-        || entry.isDir !== true
-        || typeof entry.hidden !== 'boolean') {
+        || typeof entry.isDir !== 'boolean'
+        || typeof entry.hidden !== 'boolean'
+        || (entry.totalBytes !== undefined && !isByteCount(entry.totalBytes))
+        || (entry.freeBytes !== undefined && !isByteCount(entry.freeBytes))) {
         return { ok: false, error: 'invalid_directory_entry' };
       }
-      entries.push(entry as unknown as FileDirectoryEntry);
+      // Rebuilt field by field, so anything not listed here is dropped rather
+      // than forwarded; the capacity fields have to be carried explicitly.
+      entries.push({
+        name: entry.name,
+        path: entry.path,
+        isDir: entry.isDir,
+        hidden: entry.hidden,
+        ...(entry.totalBytes !== undefined ? { totalBytes: entry.totalBytes } : {}),
+        ...(entry.freeBytes !== undefined ? { freeBytes: entry.freeBytes } : {}),
+      } as FileDirectoryEntry);
     }
     return {
       ok: true,

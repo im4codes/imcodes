@@ -23,6 +23,8 @@ import { githubAuthRoutes } from './routes/github-auth.js';
 import { adminRoutes } from './routes/admin.js';
 import { bindRoutes } from './routes/bind.js';
 import { enrollRoutes, runEnrollmentRetention } from './routes/enroll.js';
+import { controlledNodeInstallCommandRoutes } from './routes/controlled-node-install.js';
+import { CONTROLLED_NODE_INSTALL_COMMAND_PATH } from './services/controlled-node-install-command.js';
 import { machinesRoutes } from './routes/machines.js';
 import { machineExecRoutes } from './routes/machine-exec.js';
 import { machineComputerUseRoutes } from './routes/machine-computer-use.js';
@@ -37,6 +39,7 @@ import { pushRoutes } from './routes/push.js';
 import { quickDataRoutes } from './routes/quick-data.js';
 import { watchRoutes } from './routes/watch.js';
 import { messagePinRoutes } from './routes/message-pins.js';
+import { capabilityRoutes } from './routes/capabilities.js';
 import { memoryRoutes } from './routes/memory.js';
 import { sessionMgmtRoutes } from './routes/session-mgmt.js';
 import { subSessionRoutes } from './routes/sub-sessions.js';
@@ -45,12 +48,25 @@ import { tabSharingRoutes } from './routes/tab-sharing.js';
 import { preferencesRoutes } from './routes/preferences.js';
 import { aliasRoutes } from './routes/aliases.js';
 import { ALIAS_API_PATH } from '../../shared/alias-types.js';
+import { sessionIdentityRoutes } from './routes/session-identities.js';
+import { SESSION_IDENTITY_API_PATH } from '../../shared/session-identity.js';
+import { verificationMachineRoutes } from './routes/verification-machines.js';
+import { VERIFICATION_MACHINE_API_PATH } from '../../shared/verification-machine.js';
 import { CLIENT_TIMEZONE_HEADER, DEVICE_TIMEZONE_HEADER, EXPECTED_USER_ID_HEADER } from '../../shared/http-header-names.js';
 import { tokenUsageRoutes } from './routes/token-usage.js';
 import { embeddingRoutes } from './routes/embedding.js';
 import { shutdownEmbeddingPool } from './util/embedding-pool.js';
 import { fileTransferRoutes } from './routes/file-transfer.js';
 import { passkeyRoutes } from './routes/passkey-auth.js';
+import { remoteDesktopAccountAuthRoutes } from './routes/remote-desktop-account-auth.js';
+import { remoteDesktopShellLaunchContextRoutes } from './routes/remote-desktop-shell-launch-context.js';
+import { setRemoteDesktopShellLaunchContextDispatcher } from './services/remote-desktop-shell-launch-context.js';
+import { remoteDesktopGuestAccessRoutes } from './routes/remote-desktop-guest-access.js';
+import {
+  createRemoteDesktopUnattendedPasswordPublicRoutes,
+  remoteDesktopUnattendedPasswordRoutes,
+} from './routes/remote-desktop-unattended-password.js';
+import { remoteDesktopWallRoutes } from './routes/remote-desktop-wall.js';
 import { localWebPreviewRoutes } from './routes/local-web-preview.js';
 import { resolveLocalPreviewAccess, commitAuthorizedAccess } from './preview/access.js';
 import { sanitizePreviewRequestHeaders, stripPreviewAccessTokenFromUpstreamPath } from '../../shared/preview-policy.js';
@@ -59,6 +75,11 @@ import { COOKIE_SESSION, COOKIE_PREVIEW_ACCESS } from '../../shared/cookie-names
 import { healthCheckCron } from './cron/health-check.js';
 import { jobDispatchCron } from './cron/job-dispatch.js';
 import { memoryPruningCron } from './cron/memory-pruning.js';
+import {
+  expireCapabilityPendingActivations,
+  sweepExpiredCapabilityHistory,
+  sweepExpiredCapabilityPreActivationOperations,
+} from './db/capabilities.js';
 import { SERVER_WS_MAX_PAYLOAD_BYTES, WsBridge } from './ws/bridge.js';
 import {
   REMOTE_DESKTOP_SERVER_ID_QUERY,
@@ -77,6 +98,22 @@ import { cors } from 'hono/cors';
 import { verifyJwt } from './security/crypto.js';
 import { resolveServerWebSocketAccess } from './security/authorization.js';
 import logger from './util/logger.js';
+import { getPodIdentity } from './util/pod-identity.js';
+import { RemoteDesktopGuestDueWorker } from './services/remote-desktop-guest-due-worker.js';
+import {
+  PostgresRemoteDesktopGuestOutboxDeliveryAdapter,
+  PostgresRemoteDesktopGuestOutboxListener,
+  RemoteDesktopGuestBackgroundRuntime,
+  RemoteDesktopGuestOutboxWorker,
+  reconcileRemoteDesktopEndpointOnReconnect,
+} from './services/remote-desktop-guest-outbox-worker.js';
+import { RemoteDesktopManagementPrivacyWorker } from './services/remote-desktop-management-privacy-worker.js';
+import { setRemoteDesktopManagementPrivacyDispatcher } from './services/remote-desktop-management-privacy.js';
+import {
+  createLazyPostgresUnattendedPasswordProofService,
+  selectUnattendedPasswordServerSecret,
+  type RemoteDesktopUnattendedPasswordProofService,
+} from './services/remote-desktop-unattended-password.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // Docker: /app/dist/index.js → /app/web/dist
@@ -87,13 +124,32 @@ const UPDATES_DIST = process.env.UPDATES_DIST_PATH ?? join(__dirname, '..', '..'
 
 // ── Daemon connection protection ──────────────────────────────────────────────
 const daemonConnectLimiter = new MemoryRateLimiter();
+const remoteDesktopGuestConnectLimiter = new MemoryRateLimiter();
 let unauthenticatedDaemonCount = 0;
 const MAX_UNAUTH_CONNECTIONS = 1000;
 
 // ── Hono app ──────────────────────────────────────────────────────────────────
 
-export function buildApp(env: Env) {
+export interface BuildAppOptions {
+  /** Focused-test seam; production always uses the lazy PostgreSQL stack. */
+  unattendedPasswordProofService?: Pick<RemoteDesktopUnattendedPasswordProofService, 'prove'>;
+}
+
+export function buildApp(env: Env, options: BuildAppOptions = {}) {
   const app = new Hono<{ Bindings: Env }>();
+  const unattendedPasswordProofService = options.unattendedPasswordProofService
+    ?? createLazyPostgresUnattendedPasswordProofService({
+      db: env.DB,
+      serverSecret: selectUnattendedPasswordServerSecret({
+        botEncryptionKey: env.BOT_ENCRYPTION_KEY,
+        jwtSigningKey: env.JWT_SIGNING_KEY,
+      }),
+      // Resolve only the already-owned, generation-reconciled daemon runtime.
+      // This observes authority; it never instantiates a bridge or dispatches.
+      runtimeAuthorityAvailable: async (serverId) => (
+        WsBridge.remoteDesktopGuestOutboxTarget(serverId)?.isAvailable() ?? false
+      ),
+    });
 
   // Inject env into every request context
   app.use('*', async (c, next) => {
@@ -174,6 +230,9 @@ export function buildApp(env: Env) {
   app.route('/api/auth/github', githubAuthRoutes);
   app.route('/api/bind', bindRoutes);
   app.route('/api/enroll', enrollRoutes);
+  // Top-level and deliberately short: this URL is typed by hand, read off a
+  // phone screen and dictated over the phone. It serves a script, never data.
+  app.route(CONTROLLED_NODE_INSTALL_COMMAND_PATH, controlledNodeInstallCommandRoutes);
   app.route('/api/machines', machinesRoutes);
   app.route('/api/machine/exec', machineExecRoutes);
   app.route('/api/machine/computer-use', machineComputerUseRoutes);
@@ -189,6 +248,15 @@ export function buildApp(env: Env) {
   app.route('/api/quick-data', quickDataRoutes);
   app.route('/api', watchRoutes);
   app.route('/api', messagePinRoutes);
+  app.route('/api', capabilityRoutes);
+  app.route('/api', remoteDesktopUnattendedPasswordRoutes);
+  app.route('/api', createRemoteDesktopUnattendedPasswordPublicRoutes(
+    unattendedPasswordProofService,
+  ));
+  app.route('/api', remoteDesktopWallRoutes);
+  // Flat mount: the public half is reached before any `serverId` is known, so it
+  // must not sit under a pod-sticky `/api/server/:serverId/...` path.
+  app.route('/api', remoteDesktopGuestAccessRoutes);
   app.route('/api', tabSharingRoutes);
   app.route('/api', tokenUsageRoutes);
   // Pod-sticky memory routes: serverId is read from the `?serverId=` query
@@ -207,8 +275,12 @@ export function buildApp(env: Env) {
   // User-level alias store: flat, pod-independent (no serverId). Mounted under
   // /api/* so it inherits the global CORS + CSRF middleware.
   app.route(ALIAS_API_PATH, aliasRoutes);
+  app.route(SESSION_IDENTITY_API_PATH, sessionIdentityRoutes);
+  app.route(VERIFICATION_MACHINE_API_PATH, verificationMachineRoutes);
   app.route('/api/embedding', embeddingRoutes);
   app.route('/api/auth/passkey', passkeyRoutes);
+  app.route('/api/auth/remote-desktop', remoteDesktopAccountAuthRoutes);
+  app.route('/api/auth/remote-desktop', remoteDesktopShellLaunchContextRoutes);
   app.route('/api/admin', adminRoutes);
 
   app.get('/health', (c) => c.json({ ok: true, ts: Date.now() }));
@@ -360,6 +432,24 @@ export function createServerWebSocketServer(): WebSocketServer {
   });
 }
 
+/**
+ * Per-IP ceiling for daemon WebSocket upgrades, in the same 10s window as the
+ * per-daemon budget. Deliberately far above a real fleet's steady state: a
+ * daemon at its 5s reconnect ceiling costs 2 attempts per 10s, so this leaves
+ * room for ~50 co-located daemons before the ceiling is the binding constraint.
+ * It exists to bound abuse from one source, not to pace legitimate reconnects.
+ */
+const DAEMON_CONNECT_PER_IP_CEILING = 100;
+
+/**
+ * `Retry-After` is included because the client cannot otherwise distinguish a
+ * rate-limit refusal from a network fault: both surface as a non-101 upgrade
+ * failure, and the daemon then retries on its short reconnect backoff, which is
+ * what kept the budget exhausted.
+ */
+const DAEMON_CONNECT_RATE_LIMIT_RESPONSE =
+  'HTTP/1.1 429 Too Many Requests\r\nRetry-After: 10\r\nContent-Length: 0\r\n\r\n';
+
 export function setupWebSocketUpgrade(server: import('node:http').Server, env: Env) {
   const wss = createServerWebSocketServer();
   // Compile trust function once — same proxy-addr library used by HTTP middleware
@@ -388,19 +478,82 @@ export function setupWebSocketUpgrade(server: import('node:http').Server, env: E
     const serverId = remoteDesktopServerId ?? match![1]!;
     const hasBrowserTicket = url.searchParams.has('ticket');
 
-    // The query-routed remote desktop signaling endpoint is browser-only.
-    // Daemons retain the established path-bound endpoint and authentication.
+    if (remoteDesktopServerId && hasBrowserTicket) {
+      const keys = [...url.searchParams.keys()].sort();
+      if (keys.length !== 2
+        || keys[0] !== REMOTE_DESKTOP_SERVER_ID_QUERY
+        || keys[1] !== 'ticket') {
+        socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+    }
+
+    // A ticket-less query-routed socket is the anonymous guest quarantine,
+    // never a daemon. Its URL contains only the post-proof routing key; raw
+    // bootstrap possession proof is accepted later as the bounded first frame.
     if (remoteDesktopServerId && !hasBrowserTicket) {
-      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-      socket.destroy();
+      const queryKeys = [...url.searchParams.keys()];
+      const origin = req.headers.origin ?? '';
+      const ip = proxyAddr(req as never, wsTrust);
+      if (queryKeys.length !== 1 || queryKeys[0] !== REMOTE_DESKTOP_SERVER_ID_QUERY
+        || origin.length === 0
+        || !validateOrigin(origin, env)) {
+        socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      if (!remoteDesktopGuestConnectLimiter.check(`rd-guest:${ip}`, 20, 60_000)) {
+        socket.write('HTTP/1.1 429 Too Many Requests\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      if (unauthenticatedDaemonCount >= MAX_UNAUTH_CONNECTIONS) {
+        socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      unauthenticatedDaemonCount++;
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        let counted = true;
+        const decrement = () => {
+          if (!counted) return;
+          counted = false;
+          unauthenticatedDaemonCount = Math.max(0, unauthenticatedDaemonCount - 1);
+        };
+        WsBridge.get(serverId).handleGuestRemoteDesktopConnection(ws, env.DB, ip);
+        ws.once('close', decrement);
+        ws.once('error', decrement);
+      });
       return;
     }
 
     if (!hasBrowserTicket) {
-      // Daemon connection — per-IP rate limit + global cap
+      // Daemon connection — per-DAEMON rate limit, then a per-IP abuse ceiling.
+      //
+      // This budget used to be keyed on the client IP alone, which made it one
+      // shared bucket for every daemon behind the same address. Two things then
+      // compounded: `TRUSTED_PROXIES` is empty in production, so `proxyAddr`
+      // returns the reverse proxy's own address and EVERY daemon collapsed onto
+      // a single key; and a node whose token had been revoked retried roughly
+      // twice a second forever. One such node consumed ~17 attempts per 10s
+      // against a 5-per-10s budget and every other daemon was answered 429 —
+      // a non-101 status, which their WebSocket client reports as close 1002.
+      // A single machine could therefore take the entire fleet offline.
+      //
+      // `serverId` comes from the URL and is unauthenticated at this point,
+      // which is exactly why the per-IP ceiling below is kept: identity is not
+      // trusted yet, so isolation is keyed on the claimed id while abuse from
+      // one source is still bounded. The ceiling is set far above what any
+      // legitimate fleet reaches, so it never schedules normal reconnects.
       const ip = proxyAddr(req as never, wsTrust);
-      if (!daemonConnectLimiter.check(`daemon:${ip}`, 5, 10_000)) {
-        socket.write('HTTP/1.1 429 Too Many Requests\r\n\r\n');
+      if (!daemonConnectLimiter.check(`daemon:${serverId}`, 5, 10_000)) {
+        socket.write(DAEMON_CONNECT_RATE_LIMIT_RESPONSE);
+        socket.destroy();
+        return;
+      }
+      if (!daemonConnectLimiter.check(`daemon-ip:${ip}`, DAEMON_CONNECT_PER_IP_CEILING, 10_000)) {
+        socket.write(DAEMON_CONNECT_RATE_LIMIT_RESPONSE);
         socket.destroy();
         return;
       }
@@ -678,6 +831,12 @@ function scheduleCrons(env: Env) {
   });
   cron.schedule('* * * * *', () => {
     jobDispatchCron(env).catch((err) => logger.error({ err }, 'Job dispatch cron failed'));
+    sweepExpiredCapabilityPreActivationOperations(env.DB)
+      .catch((err) => logger.error({ err }, 'Capability pre-activation expiry sweep failed'));
+    expireCapabilityPendingActivations(env.DB)
+      .catch((err) => logger.error({ err }, 'Capability candidate expiry sweep failed'));
+    sweepExpiredCapabilityHistory(env.DB)
+      .catch((err) => logger.error({ err }, 'Capability retention sweep failed'));
   });
   logger.info({}, 'Cron jobs scheduled');
 }
@@ -730,6 +889,50 @@ async function main() {
   await ensureDefaultAdmin(db, envConfig);
   await initializeAuthNonceCleanup(db);
 
+  const podId = getPodIdentity();
+  const guestOutboxAdapter = new PostgresRemoteDesktopGuestOutboxDeliveryAdapter(
+    db,
+    (serverId) => WsBridge.remoteDesktopGuestOutboxTarget(serverId),
+  );
+  const guestDueWorker = new RemoteDesktopGuestDueWorker(
+    db,
+    `${podId}:remote-desktop-due`,
+    (error) => logger.error({ error, podId }, 'Remote desktop due worker failed'),
+  );
+  const guestOutboxWorker = new RemoteDesktopGuestOutboxWorker(
+    db,
+    podId,
+    guestOutboxAdapter,
+    new PostgresRemoteDesktopGuestOutboxListener(envConfig.DATABASE_URL),
+    (error) => logger.error({ error, podId }, 'Remote desktop outbox worker failed'),
+    (event, latencyMs) => logger.warn({
+      eventId: event.id,
+      effect: event.effect,
+      hostId: event.hostId,
+      latencyMs,
+    }, 'Remote desktop guest effect exceeded delivery SLO'),
+  );
+  const guestBackgroundRuntime = new RemoteDesktopGuestBackgroundRuntime(
+    guestDueWorker,
+    guestOutboxWorker,
+  );
+  const managementPrivacyWorker = new RemoteDesktopManagementPrivacyWorker(
+    db,
+    (error) => logger.error({ error, podId }, 'Remote desktop privacy worker failed'),
+  );
+  setRemoteDesktopManagementPrivacyDispatcher((command) => (
+    WsBridge.dispatchRemoteDesktopManagementPrivacy(command)
+  ));
+  setRemoteDesktopShellLaunchContextDispatcher(
+    WsBridge.remoteDesktopShellLaunchContextDispatcher(),
+  );
+  WsBridge.setRemoteDesktopReconnectRevalidator(async (serverId) => {
+    await reconcileRemoteDesktopEndpointOnReconnect(db, serverId);
+    guestOutboxWorker.wake();
+  });
+  await guestBackgroundRuntime.start();
+  managementPrivacyWorker.start();
+
   import('./util/memory-noise-cleanup.js').then(({ purgeRemoteMemoryNoiseProjections }) =>
     purgeRemoteMemoryNoiseProjections(db).catch((err) => logger.warn({ err }, 'Remote memory-noise cleanup failed (non-fatal)'))
   ).catch(() => {});
@@ -752,11 +955,29 @@ async function main() {
   // Graceful shutdown — terminate the embedding worker so it doesn't keep
   // the process alive after SIGTERM (k8s rolling restart, docker stop, etc).
   const shutdown = async (signal: string) => {
-    logger.info({ signal }, 'Shutting down — closing embedding pool');
+    logger.info({ signal }, 'Shutting down — closing background workers');
+    // Keep reconnects fail-closed while pollers drain; a null hook means the
+    // embedded/test mode where no durable outbox runtime is configured.
+    WsBridge.setRemoteDesktopReconnectRevalidator(async () => {
+      throw new Error('remote_desktop_outbox_shutting_down');
+    });
+    setRemoteDesktopManagementPrivacyDispatcher(null);
+    setRemoteDesktopShellLaunchContextDispatcher(null);
+    await managementPrivacyWorker.stop();
+    try {
+      await guestBackgroundRuntime.stop();
+    } catch (err) {
+      logger.warn({ err }, 'Remote desktop background worker shutdown failed (non-fatal)');
+    }
     try {
       await shutdownEmbeddingPool();
     } catch (err) {
       logger.warn({ err }, 'Embedding pool shutdown failed (non-fatal)');
+    }
+    try {
+      await db.close();
+    } catch (err) {
+      logger.warn({ err }, 'Database shutdown failed (non-fatal)');
     }
     process.exit(0);
   };

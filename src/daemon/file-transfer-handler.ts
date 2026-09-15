@@ -3,7 +3,7 @@
  * Handles upload persistence, download resolution, and lifecycle cleanup.
  */
 import { constants as fsConstants, createReadStream, createWriteStream, realpathSync } from 'node:fs';
-import { copyFile, link, mkdir, open, writeFile, readFile, readdir, stat, lstat, unlink, realpath as fsRealpath } from 'node:fs/promises';
+import { copyFile, link, mkdir, open, writeFile, readFile, readdir, stat, statfs, lstat, unlink, realpath as fsRealpath } from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
@@ -14,6 +14,7 @@ import {
   FILE_TRANSFER_LIMITS,
   FILE_TRANSFER_DIRECTORY_MAX_ENTRIES,
   FILE_TRANSFER_DIRECTORY_PATH,
+  isFileTransferWellKnownDirectoryPath,
   FILE_TRANSFER_MSG,
   FILE_TRANSFER_DELETE_ERROR,
   FILE_TRANSFER_UPLOAD_ERROR_CODE,
@@ -39,10 +40,24 @@ import {
   validateFileDeleteRequest,
   validateFileDirectoryListRequest,
 } from '../../shared/transport/file-transfer.js';
+import {
+  resolveWellKnownDirectory,
+  WELL_KNOWN_DIRECTORY,
+  type WellKnownDirectoryKind,
+} from './well-known-directories.js';
+import { DIRECT_FILE_TRANSFER_COMMIT_INTENT_SUFFIX } from '../../shared/direct-file-transfer.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 import { resolveCanonical, validateCanonicalRealPath } from './file-preview-path-policy.js';
 import type { ValidatedRealPath } from './file-preview-path-policy.js';
 export type { ValidatedRealPath } from './file-preview-path-policy.js';
+
+/** Sentinel path -> the directory it names. */
+const WELL_KNOWN_DIRECTORY_BY_SENTINEL: Record<string, WellKnownDirectoryKind> = {
+  [FILE_TRANSFER_DIRECTORY_PATH.HOME]: WELL_KNOWN_DIRECTORY.HOME,
+  [FILE_TRANSFER_DIRECTORY_PATH.DESKTOP]: WELL_KNOWN_DIRECTORY.DESKTOP,
+  [FILE_TRANSFER_DIRECTORY_PATH.DOWNLOADS]: WELL_KNOWN_DIRECTORY.DOWNLOADS,
+  [FILE_TRANSFER_DIRECTORY_PATH.DOCUMENTS]: WELL_KNOWN_DIRECTORY.DOCUMENTS,
+};
 
 /** Minimal reusable sender boundary implemented by both ServerLink and the thin node runtime. */
 export interface FileTransferSender {
@@ -451,7 +466,24 @@ export async function finalizeDirectUploadedFile(params: {
   mime?: string;
   resolved: string;
   size: number;
+  destinationDirectory?: string;
 }): Promise<AttachmentRef> {
+  if (params.destinationDirectory) {
+    const destination = await commitUploadedFileToDirectory(
+      params.resolved,
+      params.destinationDirectory,
+      params.originalName,
+    );
+    const destinationStat = await lstat(destination);
+    return createProjectFileHandleFromValidatedPath(
+      toValidatedRealPath(await fsRealpath(destination)),
+      params.originalName,
+      params.mime,
+      destinationStat.size,
+      { device: destinationStat.dev, inode: destinationStat.ino },
+      params.clientUploadId,
+    );
+  }
   const now = Date.now();
   await writeFile(`${params.resolved}.meta.json`, JSON.stringify({
     originalName: params.originalName,
@@ -570,10 +602,23 @@ async function fetchRelayUpload(
 
 let initialized = false;
 
+/**
+ * Make the upload directory exist. Nothing more.
+ *
+ * Separated from `initFileTransfer` so a caller that only needs somewhere to
+ * write — the transfer worker, which owns no attachment state — does not also
+ * build a second copy of the attachment registry in its own isolate. A
+ * registry that is written in one isolate and read in another is the exact
+ * split-brain the host-call boundary exists to prevent.
+ */
+export async function ensureUploadDirectory(): Promise<void> {
+  await mkdir(UPLOAD_DIR, { recursive: true }).catch(() => {});
+}
+
 export async function initFileTransfer(): Promise<void> {
   if (initialized) return;
   initialized = true;
-  await mkdir(UPLOAD_DIR, { recursive: true }).catch(() => {});
+  await ensureUploadDirectory();
   await cleanupExpiredUploads();
   await recoverRegistry();
 }
@@ -585,6 +630,9 @@ async function recoverRegistry(): Promise<void> {
     const now = Date.now();
     for (const file of files) {
       if (file.endsWith('.meta.json')) continue; // skip sidecar files
+      // A commit intent describes an upload mid-publish; it is bookkeeping, not
+      // an uploaded file, and must never surface as a downloadable attachment.
+      if (file.endsWith(DIRECT_FILE_TRANSFER_COMMIT_INTENT_SUFFIX)) continue;
       if (attachmentRegistry.has(file)) continue;
       try {
         const filePath = path.join(UPLOAD_DIR, file);
@@ -976,7 +1024,31 @@ function sendDirectoryListError(sender: FileTransferSender, requestId: string, e
   } satisfies FileDirectoryListError);
 }
 
-/** Controlled-node directory-only browser used by the integrated remote desktop picker. */
+/** Bounded controlled-node browser used by the integrated remote desktop file manager. */
+/**
+ * Free and total bytes for the volume a path sits on, or nothing.
+ *
+ * Reported only for volume ROOTS. Running this per entry would be one syscall
+ * per row for a number identical across all of them, and a 512-entry listing
+ * is on the critical path of a click.
+ *
+ * `statfs` is unavailable on older runtimes and can fail on a drive that is
+ * present but not ready (an empty card reader, a disconnected network drive),
+ * so a failure degrades to "no capacity shown" rather than dropping the drive
+ * from the listing entirely.
+ */
+async function volumeCapacity(target: string): Promise<{ totalBytes?: number; freeBytes?: number }> {
+  try {
+    const info = await statfs(target);
+    const total = Number(info.blocks) * Number(info.bsize);
+    const free = Number(info.bavail) * Number(info.bsize);
+    if (!Number.isFinite(total) || !Number.isFinite(free) || total <= 0) return {};
+    return { totalBytes: total, freeBytes: Math.max(0, Math.min(free, total)) };
+  } catch {
+    return {};
+  }
+}
+
 export async function handleFileDirectoryList(cmd: Record<string, unknown>, sender: FileTransferSender): Promise<void> {
   const parsed = validateFileDirectoryListRequest(cmd);
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : '';
@@ -992,7 +1064,7 @@ export async function handleFileDirectoryList(cmd: Record<string, unknown>, send
           .map(async (drive): Promise<FileDirectoryEntry | null> => {
             try {
               await readdir(drive);
-              return { name: drive, path: drive, isDir: true, hidden: false };
+              return { name: drive, path: drive, isDir: true, hidden: false, ...(await volumeCapacity(drive)) };
             } catch {
               return null;
             }
@@ -1008,21 +1080,32 @@ export async function handleFileDirectoryList(cmd: Record<string, unknown>, send
       return;
     }
 
-    const canonical = await resolveCanonical(parsed.value.path, 'strict');
+    // A well-known sentinel becomes a concrete path HERE, before the gate --
+    // never instead of it. `resolveCanonical` and the sensitive-path denylist
+    // still decide whether the resolved directory may be listed, so a shortcut
+    // can only ever reach somewhere the user could already have typed.
+    const requestedPath = isFileTransferWellKnownDirectoryPath(parsed.value.path)
+      ? await resolveWellKnownDirectory(WELL_KNOWN_DIRECTORY_BY_SENTINEL[parsed.value.path])
+      : parsed.value.path;
+
+    const canonical = await resolveCanonical(requestedPath, 'strict');
     if (!canonical) throw new Error(FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH);
     const directoryStat = await lstat(canonical.realPath);
     if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory()) {
       throw new Error('not_directory');
     }
     const entries = (await readdir(canonical.realPath, { withFileTypes: true }))
-      .filter((entry) => entry.isDirectory())
+      .filter((entry) => entry.isDirectory() || entry.isFile())
       .map((entry): FileDirectoryEntry => ({
         name: entry.name,
         path: path.join(canonical.realPath, entry.name),
-        isDir: true,
+        isDir: entry.isDirectory(),
         hidden: entry.name.startsWith('.'),
       }))
-      .sort((a, b) => a.name === b.name ? 0 : a.name < b.name ? -1 : 1)
+      .sort((a, b) => {
+        if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+        return a.name === b.name ? 0 : a.name < b.name ? -1 : 1;
+      })
       .slice(0, FILE_TRANSFER_DIRECTORY_MAX_ENTRIES);
     sender.send({
       type: FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE,

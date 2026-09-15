@@ -7,6 +7,7 @@ import { configureSharedContextRuntime } from '../../src/context/shared-context-
 import { makeMemoryShortRef, resetMemoryShortRefsForTests, resolveMemoryShortRef } from '../../src/context/memory-short-ref.js';
 import { ensureContextNamespace, writeContextObservation, writeProcessedProjection } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
+import { projectionOwnerCache } from '../../src/daemon/memory-projection-owner-cache.js';
 
 const detectRepoMock = vi.hoisted(() => vi.fn());
 
@@ -27,6 +28,7 @@ describe('resolveTransportContextBootstrap', () => {
   beforeEach(() => {
     detectRepoMock.mockReset();
     resetMemoryShortRefsForTests();
+    projectionOwnerCache.clear();
     configureSharedContextRuntime(null);
     vi.unstubAllGlobals();
     vi.unstubAllEnvs();
@@ -513,6 +515,33 @@ describe('resolveTransportContextBootstrap', () => {
     }));
     expect(result.startupMemory?.items.map((item) => item.id)).not.toContain('cloud-other-project');
     expect(result.startupMemory?.items.map((item) => item.id)).not.toContain('cloud-other-scope');
+  });
+
+  it('never surfaces proj:7326uk25z6pnx outside the target consumer namespace', async () => {
+    const projectionId = '455678dc-ab00-4e94-b12c-cac37417a3b8';
+    const remoteItem = {
+      type: 'processed' as const,
+      id: projectionId,
+      projectId: 'github.com/acme/repo',
+      scope: 'personal',
+      userId: 'brain-user',
+      projectionClass: 'recent_summary' as const,
+      summary: 'Brain-only projection must not become a recoverable CC3 action',
+      createdAt: 1,
+      originServerId: 'server-brain',
+    };
+    const brain = await buildTransportStartupMemory({
+      scope: 'personal', projectId: 'github.com/acme/repo', userId: 'brain-user',
+    }, { remoteItems: [remoteItem] });
+    expect(brain?.injectedText).toContain('proj:');
+    expect(brain?.items.map((item) => item.id)).toContain(projectionId);
+    expect(projectionOwnerCache.get(projectionId)).toBe('server-brain');
+
+    const cc3 = await buildTransportStartupMemory({
+      scope: 'personal', projectId: 'github.com/acme/repo', userId: 'cc3-user',
+    }, { remoteItems: [remoteItem] });
+    expect(cc3?.items.map((item) => item.id) ?? []).not.toContain(projectionId);
+    expect(cc3?.injectedText ?? '').not.toContain('proj:7326uk25z6pnx');
   });
 
   it('buildTransportStartupMemory keeps up to 20 durable plus 30 recent memories', async () => {

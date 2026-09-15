@@ -2,6 +2,72 @@ import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
+function* cssStructuralBraces(source: string, start = 0): Generator<{ character: '{' | '}'; index: number }> {
+  let quote: '"' | "'" | undefined;
+  let escaped = false;
+  for (let index = start; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (character === '\\') escaped = true;
+      else if (character === quote) quote = undefined;
+      continue;
+    }
+    if (character === '"' || character === "'") quote = character;
+    else if (character === '{' || character === '}') yield { character, index };
+  }
+}
+
+function findBalancedClosingBrace(source: string, open: number): number | undefined {
+  let depth = 0;
+  for (const brace of cssStructuralBraces(source, open)) {
+    if (brace.character === '{') depth += 1;
+    else if (depth > 0) depth -= 1;
+    if (depth === 0) return brace.index;
+  }
+  return undefined;
+}
+
+function braceDepthAt(source: string, index: number): number {
+  let depth = 0;
+  for (const brace of cssStructuralBraces(source)) {
+    if (brace.index >= index) break;
+    depth += brace.character === '{' ? 1 : -1;
+  }
+  return depth;
+}
+
+function extractBalancedAtRuleBlocks(source: string, prelude: RegExp): string[] {
+  const flags = `${prelude.flags.replaceAll('g', '').replaceAll('y', '')}g`;
+  const matcher = new RegExp(prelude.source, flags);
+  const blocks: string[] = [];
+
+  for (let match = matcher.exec(source); match; match = matcher.exec(source)) {
+    const open = source.indexOf('{', matcher.lastIndex);
+    if (open === -1 || source.slice(matcher.lastIndex, open).trim() !== '') continue;
+
+    const close = findBalancedClosingBrace(source, open);
+    if (close !== undefined) blocks.push(source.slice(match.index, close + 1));
+  }
+
+  return blocks;
+}
+
+function extractDirectStyleRule(block: string, selector: RegExp): string | undefined {
+  const flags = `${selector.flags.replaceAll('g', '').replaceAll('y', '')}g`;
+  const matcher = new RegExp(selector.source, flags);
+
+  for (let match = matcher.exec(block); match; match = matcher.exec(block)) {
+    if (braceDepthAt(block, match.index) !== 1) continue;
+
+    const open = block.indexOf('{', matcher.lastIndex);
+    if (open === -1 || block.slice(matcher.lastIndex, open).trim() !== '') continue;
+    const close = findBalancedClosingBrace(block, open);
+    if (close !== undefined) return block.slice(match.index, close + 1);
+  }
+  return undefined;
+}
+
 /**
  * Style contracts that must NOT regress.
  *
@@ -14,6 +80,97 @@ describe('styles.css regression contracts', () => {
   const css = readFileSync(resolve(__dirname, '../src/styles.css'), 'utf8');
   const cssWithoutComments = css.replace(/\/\*[\s\S]*?\*\//g, '');
 
+  it('keeps the desktop rail exactly one bottom card wide and its vertical cards compact and scrollable', () => {
+    const rootRule = cssWithoutComments.match(/:root\s*\{[^}]*\}/)?.[0];
+    expect(rootRule).toMatch(/--subsession-compact-card-width:\s*54px/);
+
+    const bottomCardRule = cssWithoutComments.match(/\.subsession-card\s*\{[^}]*\}/)?.[0];
+    expect(bottomCardRule).toMatch(/width:\s*var\(--subsession-compact-card-width\)/);
+    expect(bottomCardRule).toMatch(/min-width:\s*var\(--subsession-compact-card-width\)/);
+
+    const hostRule = cssWithoutComments.match(/\.subsession-vertical-rail-host\s*\{[^}]*\}/)?.[0];
+    expect(hostRule).toBeTruthy();
+    expect(hostRule).toMatch(/display:\s*flex/);
+    expect(hostRule).toMatch(/flex:\s*0\s+0\s+var\(--subsession-compact-card-width\)/);
+    for (const property of ['width', 'min-width', 'max-width']) {
+      expect(hostRule).toMatch(new RegExp(`${property}:\\s*var\\(--subsession-compact-card-width\\)`));
+    }
+    expect(hostRule).not.toMatch(/position:\s*(fixed|absolute)/);
+
+    const leftRule = cssWithoutComments.match(/\.subsession-vertical-rail-host-left\s*\{[^}]*\}/)?.[0];
+    const rightRule = cssWithoutComments.match(/\.subsession-vertical-rail-host-right\s*\{[^}]*\}/)?.[0];
+    expect(leftRule).toMatch(/border-right:/);
+    expect(rightRule).toMatch(/border-left:/);
+    expect(leftRule).not.toMatch(/position:\s*(fixed|absolute)/);
+    expect(rightRule).not.toMatch(/position:\s*(fixed|absolute)/);
+
+    const scrollRule = cssWithoutComments.match(/\.subsession-vertical-rail-scroll\s*\{[^}]*\}/)?.[0];
+    expect(scrollRule).toBeTruthy();
+    expect(scrollRule).toMatch(/overflow-y:\s*auto/);
+    expect(scrollRule).toMatch(/overflow-x:\s*hidden/);
+    expect(scrollRule).toMatch(/flex-direction:\s*column/);
+    expect(scrollRule).toMatch(/gap:\s*4px/);
+    expect(scrollRule).toMatch(/padding:\s*5px\s+2px\s+8px/);
+
+    const railCardRule = cssWithoutComments.match(/\.subsession-card-rail\s*\{[^}]*\}/)?.[0];
+    expect(railCardRule).toMatch(/min-height:\s*48px/);
+    expect(railCardRule).toMatch(/flex-direction:\s*column/);
+    expect(railCardRule).toMatch(/gap:\s*1px/);
+    expect(railCardRule).toMatch(/padding:\s*4px\s+1px\s+5px/);
+
+    const mobileBottomCardRule = cssWithoutComments.match(
+      /@media\s*\(max-width:\s*640px\)\s*\{\s*\.subsession-card:not\(\.subsession-card-rail\)\s*\{[^}]*\}/,
+    )?.[0];
+    expect(mobileBottomCardRule).toMatch(/min-height:\s*50px/);
+    expect(mobileBottomCardRule).toMatch(/gap:\s*1px/);
+    expect(mobileBottomCardRule).toMatch(/padding:\s*3px\s+1px/);
+
+    expect(cssWithoutComments).not.toMatch(/\.subsession-vertical-rail-host\s*\{[^}]*(?:136px|148px)/);
+  });
+
+  it('keeps the Team discussion rail narrow, in root flex flow, and independently scrollable', () => {
+    const rootRule = cssWithoutComments.match(/:root\s*\{[^}]*\}/)?.[0];
+    expect(rootRule).toMatch(/--team-discussion-rail-width:\s*clamp\(184px,\s*17vw,\s*220px\)/);
+
+    const hostRule = cssWithoutComments.match(/\.team-discussion-rail-host\s*\{[^}]*\}/)?.[0];
+    expect(hostRule).toMatch(/display:\s*flex/);
+    expect(hostRule).toMatch(/flex:\s*0\s+0\s+var\(--team-discussion-rail-width\)/);
+    expect(hostRule).not.toMatch(/position:\s*(fixed|absolute)/);
+    for (const property of ['width', 'min-width', 'max-width']) {
+      expect(hostRule).toMatch(new RegExp(`${property}:\\s*var\\(--team-discussion-rail-width\\)`));
+    }
+
+    const scrollRule = cssWithoutComments.match(/\.team-discussion-rail-scroll\s*\{[^}]*\}/)?.[0];
+    expect(scrollRule).toMatch(/overflow-y:\s*auto/);
+    expect(scrollRule).toMatch(/overflow-x:\s*hidden/);
+    expect(scrollRule).toMatch(/touch-action:\s*pan-y/);
+  });
+
+  it('shows the fast-audit label on desktop and keeps the mobile control icon-only', () => {
+    const desktopRule = css.match(/\.shortcut-btn-peer-audit-label\s*\{[^}]*\}/)?.[0];
+    expect(desktopRule).toBeTruthy();
+    expect(desktopRule).not.toMatch(/display:\s*none/);
+
+    const mobileRule = css.match(/@media\s*\(max-width:\s*640px\)\s*\{[\s\S]*?\.shortcut-btn-peer-audit-label\s*\{[^}]*\}/)?.[0];
+    expect(mobileRule).toBeTruthy();
+    expect(mobileRule).toMatch(/display:\s*none/);
+  });
+
+  it('keeps delegation task titles readable and ids secondary on narrow screens', () => {
+    const titleRule = cssWithoutComments.match(/\.delegation-reply-card-head\s+\.delegation-reply-card-objective\s*\{[^}]*\}/)?.[0];
+    expect(titleRule).toMatch(/text-overflow:\s*ellipsis/);
+    const idsRule = cssWithoutComments.match(/\.delegation-reply-task-ids\s*\{[^}]*\}/)?.[0];
+    expect(idsRule).toMatch(/font-size:\s*9px/);
+    const idItemRule = cssWithoutComments.match(/\.delegation-reply-task-ids\s*>\s*span:not\(\[aria-hidden\]\)\s*\{[^}]*\}/)?.[0];
+    expect(idItemRule).toMatch(/min-width:\s*0/);
+
+    const mobileBlocks = extractBalancedAtRuleBlocks(cssWithoutComments, /@media\s*\(max-width:\s*640px\)/);
+    const mobileBlock = mobileBlocks.find((block) => block.includes('.delegation-reply-task'));
+    expect(mobileBlock).toBeTruthy();
+    expect(extractDirectStyleRule(mobileBlock!, /\.delegation-reply-task\s*/)).toMatch(/flex-direction:\s*column/);
+    expect(extractDirectStyleRule(mobileBlock!, /\.delegation-reply-card-head\s+\.delegation-reply-card-objective\s*/)).toMatch(/white-space:\s*normal/);
+  });
+
   it('keeps remote desktop file window controls compact and horizontal', () => {
     const actionsRule = css.match(/\.remote-desktop-file-drawer \.remote-desktop-file-drawer-actions\s*\{[^}]*\}/)?.[0];
     expect(actionsRule).toMatch(/display:\s*flex/);
@@ -21,6 +178,40 @@ describe('styles.css regression contracts', () => {
     expect(controlRule).toMatch(/width:\s*30px/);
     expect(controlRule).toMatch(/height:\s*30px/);
     expect(controlRule).toMatch(/border-radius:\s*999px/);
+  });
+
+  it('keeps the mobile remote desktop file manager viewport-bound and in document flow', () => {
+    const mobileStart = css.indexOf('@media (max-width: 720px)');
+    const mobileEnd = css.indexOf('@media (max-height: 520px)', mobileStart);
+    const mobileBlock = mobileStart >= 0 && mobileEnd > mobileStart
+      ? css.slice(mobileStart, mobileEnd)
+      : '';
+    expect(mobileBlock).toBeTruthy();
+
+    // The guarantee is unchanged -- bounded to the visible area, and laid out
+    // in document flow. It is back on one element: the drawer covers the
+    // remote desktop panel directly (`position: absolute; inset: 0`) instead
+    // of being the content of a floating window that owned its own geometry.
+    const desktopRule = css.match(/\n\.remote-desktop-file-drawer\s*\{[^}]*\}/)?.[0];
+    expect(desktopRule, 'the drawer must bound itself to the panel').toBeTruthy();
+    expect(desktopRule).toMatch(/position:\s*absolute/);
+    expect(desktopRule).toMatch(/inset:\s*0/);
+
+    const drawerRule = mobileBlock.match(/\.remote-desktop-file-drawer\s*\{[^}]*\}/)?.[0];
+    expect(drawerRule).toMatch(/display:\s*block/);
+    expect(drawerRule).toMatch(/overflow:\s*auto/);
+    const explorerRule = mobileBlock.match(/\.remote-desktop-file-explorer\s*\{[^}]*\}/)?.[0];
+    expect(explorerRule).toMatch(/grid-template-columns:\s*minmax\(0, 1fr\)/);
+    const queueRule = mobileBlock.match(/\.remote-desktop-transfer-queue\s*\{[^}]*\}/)?.[0];
+    expect(queueRule).toMatch(/margin-top:\s*11px/);
+  });
+
+  it('keeps the remote desktop clipboard actions compact', () => {
+    const rule = css.match(/\.remote-desktop-toolbar \.remote-desktop-clipboard-switch button\s*\{[^}]*\}/)?.[0];
+    expect(rule).toBeTruthy();
+    expect(rule).toMatch(/min-height:\s*30px/);
+    expect(rule).toMatch(/padding:\s*4px 7px/);
+    expect(rule).toMatch(/font-size:\s*11\.5px/);
   });
 
   it('keeps feature announcements visible and dismissible on desktop and mobile', () => {
@@ -71,10 +262,87 @@ describe('styles.css regression contracts', () => {
     expect(mobileButtonRule).toMatch(/width:\s*auto/);
   });
 
-  it('keeps long delegation replies at content height inside the chat flex scroller', () => {
-    const rule = cssWithoutComments.match(/\.delegation-reply-card\s*\{[^}]*\}/)?.[0];
-    expect(rule).toBeTruthy();
-    expect(rule).toMatch(/flex:\s*0\s+0\s+auto/);
+  it('keeps delegation replies readable by scrolling after ten lines instead of clipping text', () => {
+    const cardRule = cssWithoutComments.match(/\.delegation-reply-card\s*\{[^}]*\}/)?.[0];
+    expect(cardRule).toBeTruthy();
+    expect(cardRule).toMatch(/flex:\s*0\s+0\s+auto/);
+
+    const bodyRule = cssWithoutComments.match(/\.delegation-reply-card-body\s*\{[^}]*\}/)?.[0];
+    expect(bodyRule).toBeTruthy();
+    expect(bodyRule).toMatch(/font-size:\s*12px/);
+    expect(bodyRule).toMatch(/line-height:\s*1\.5/);
+    expect(bodyRule).toMatch(/max-height:\s*calc\(1\.5em \* 10\)/);
+    expect(bodyRule).toMatch(/overflow-y:\s*auto/);
+    expect(bodyRule).not.toMatch(/overscroll-behavior/);
+  });
+
+  it('gives trusted delegation verdicts restrained accessible state styling across interaction and viewport modes', () => {
+    const passRule = cssWithoutComments.match(/\.delegation-reply-card--pass\s*\{[^}]*\}/)?.[0];
+    const reworkRule = cssWithoutComments.match(/\.delegation-reply-card--rework\s*\{[^}]*\}/)?.[0];
+    expect(passRule).toMatch(/--delegation-verdict-rgb:\s*34,\s*197,\s*94/);
+    expect(reworkRule).toMatch(/--delegation-verdict-rgb:\s*239,\s*68,\s*68/);
+
+    const stateRule = cssWithoutComments.match(/\.delegation-reply-card\[data-verdict\]\s*\{[^}]*\}/)?.[0];
+    expect(stateRule).toMatch(/border-color:\s*rgba\(var\(--delegation-verdict-rgb\)/);
+    expect(stateRule).toMatch(/box-shadow:\s*inset/);
+
+    expect(cssWithoutComments).toMatch(/\.delegation-reply-card\[data-verdict\]:hover/);
+    expect(cssWithoutComments).toMatch(/\.delegation-reply-card\[data-verdict\]\.chat-highlight\s*\{/);
+
+    const mobileRule = extractBalancedAtRuleBlocks(
+      cssWithoutComments,
+      /@media\s*\(\s*max-width\s*:\s*640px\s*\)/,
+    ).map((block) => extractDirectStyleRule(block, /\.delegation-reply-card\[data-verdict\]/))
+      .find((rule) => rule !== undefined);
+    expect(mobileRule, 'the verdict card mobile rule must live directly in the 640px media block').toBeTruthy();
+    expect(mobileRule).toMatch(/padding:\s*9px\s+10px/);
+
+    const lightRule = extractBalancedAtRuleBlocks(
+      cssWithoutComments,
+      /@media\s*\(\s*prefers-color-scheme\s*:\s*light\s*\)/,
+    ).map((block) => extractDirectStyleRule(block, /\.delegation-reply-card\[data-verdict\]/))
+      .find((rule) => rule !== undefined);
+    expect(lightRule, 'the verdict card light rule must live directly in the light-scheme media block').toBeTruthy();
+
+    const reducedMotionRule = extractBalancedAtRuleBlocks(
+      cssWithoutComments,
+      /@media\s*\(\s*prefers-reduced-motion\s*:\s*reduce\s*\)/,
+    ).map((block) => extractDirectStyleRule(block, /\.delegation-reply-card\[data-verdict\]::before/))
+      .find((rule) => rule !== undefined);
+    expect(
+      reducedMotionRule,
+      'the verdict scan-line rule must live directly in the reduced-motion media block',
+    ).toBeTruthy();
+    expect(reducedMotionRule).toMatch(/animation:\s*none/);
+  });
+
+  it('extracts repeated media blocks without leaking through nested or wrong media', () => {
+    const fixture = `
+      @media (max-width: 640px) {
+        @supports (display: grid) { .target { color: red; } }
+      }
+      @media (max-width: 640px) and (orientation: portrait) { .target { color: blue; } }
+      @media (max-width: 641px) { .target { color: orange; } }
+      @media (max-width: 640px) { .target { color: green; } }
+    `;
+    const blocks = extractBalancedAtRuleBlocks(fixture, /@media\s*\(\s*max-width\s*:\s*640px\s*\)/);
+    expect(blocks).toHaveLength(2);
+    expect(extractDirectStyleRule(blocks[0]!, /\.target/)).toBeUndefined();
+    expect(extractDirectStyleRule(blocks[1]!, /\.target/)).toMatch(/color:\s*green/);
+    expect(blocks.join('\n')).not.toContain('color: blue');
+    expect(blocks.join('\n')).not.toContain('color: orange');
+  });
+
+  it('ignores structural braces and escaped quotes inside CSS strings', () => {
+    const fixture = `
+      @media (max-width: 640px) {
+        .quoted-brace::before { content: "escaped \\" quote then }"; }
+        .after-quoted-brace { color: purple; }
+      }
+    `;
+    const blocks = extractBalancedAtRuleBlocks(fixture, /@media\s*\(\s*max-width\s*:\s*640px\s*\)/);
+    expect(blocks).toHaveLength(1);
+    expect(extractDirectStyleRule(blocks[0]!, /\.after-quoted-brace/)).toMatch(/color:\s*purple/);
   });
 
   it('.chat-view-preview must NOT be a scroll container', () => {
@@ -102,6 +370,14 @@ describe('styles.css regression contracts', () => {
     const subcardRule = css.match(/\.subcard-preview\s*\{[^}]*\}/);
     expect(subcardRule).not.toBeNull();
     expect(subcardRule![0]).toMatch(/overflow-y:\s*auto/);
+  });
+
+  it('keeps collapsed tool hover peeks above sub-session windows without covering modal overlays', () => {
+    const rule = cssWithoutComments.match(/\.chat-tool-peek\s*\{[^}]*\}/)?.[0];
+    expect(rule).toBeTruthy();
+    const zIndex = Number(rule?.match(/z-index:\s*(\d+)/)?.[1]);
+    expect(zIndex).toBeGreaterThan(7000);
+    expect(zIndex).toBeLessThan(10050);
   });
 
   it('keeps the expanded tool fold header visible while its details scroll', () => {
@@ -326,6 +602,15 @@ describe('styles.css regression contracts', () => {
     expect(mobileP2pRule![0]).toMatch(/z-index:\s*2147483646/);
     expect(mobileP2pRule![0]).toMatch(/max-height:\s*min\(72vh,\s*calc\(var\(--vvh,\s*100dvh\)/);
     expect(mobileP2pRule![0]).toMatch(/overflow-y:\s*auto/);
+  });
+
+  it('lets the terminal shortcut strip own remaining width and scroll horizontally', () => {
+    const shortcutStripRule = css.match(/\.shortcuts\s*\{[^}]*\}/);
+    expect(shortcutStripRule).not.toBeNull();
+    expect(shortcutStripRule![0]).toMatch(/flex:\s*1/);
+    expect(shortcutStripRule![0]).toMatch(/min-width:\s*0/);
+    expect(shortcutStripRule![0]).toMatch(/overflow-x:\s*auto/);
+    expect(css).toMatch(/\.shortcuts::-webkit-scrollbar\s*\{\s*display:\s*none/);
   });
 
   it('context meters keep the segmented static tech styling', () => {
@@ -812,6 +1097,23 @@ describe('styles.css regression contracts', () => {
     expect(surfaceRule).toMatch(/pointer-events:\s*auto/);
   });
 
+  // iOS Safari's own long-press callout (the "Copy"/selection loupe) is a
+  // separate mechanism from touch-action: none, and fires on the actual
+  // touch target -- the input-surface div, since the video itself is
+  // pointer-events:none -- unless explicitly suppressed. Without this, a
+  // long-press meant to become a right-click showed the system callout
+  // instead of ever reaching RemoteDesktopPanel's own gesture timer.
+  it('suppresses iOS long-press callout on the remote-desktop touch surfaces', () => {
+    const stageRule = css.match(/\.remote-desktop-stage\s*\{[^}]*\}/)?.[0];
+    expect(stageRule, '.remote-desktop-stage rule missing').toBeTruthy();
+    expect(stageRule).toMatch(/-webkit-touch-callout:\s*none/);
+    expect(stageRule).toMatch(/-webkit-user-select:\s*none/);
+    const surfaceRule = css.match(/\.remote-desktop-input-surface\s*\{[^}]*\}/)?.[0];
+    expect(surfaceRule, '.remote-desktop-input-surface rule missing').toBeTruthy();
+    expect(surfaceRule).toMatch(/-webkit-touch-callout:\s*none/);
+    expect(surfaceRule).toMatch(/-webkit-user-select:\s*none/);
+  });
+
   // Transport sessions zero the toolbar's left padding, and they are the only
   // sessions that render a Stop button -- so matching `.shortcuts` alone would
   // leave the exact case this alignment exists for still misaligned.
@@ -837,5 +1139,153 @@ describe('styles.css regression contracts', () => {
     const open = (stripped.match(/\{/g) ?? []).length;
     const close = (stripped.match(/\}/g) ?? []).length;
     expect(close - open).toBe(0);
+  });
+
+  it('places every assignment-card child outside the 7px icon track', () => {
+    // SessionButton has five possible children. CSS grid auto-placement put
+    // the fourth child (work/execution health) into row 2 / column 1, whose
+    // track is only 7px wide, rendering CJK one character per line. Keep every
+    // child explicit so inserting optional CI cannot shift an earlier fact.
+    const placement = (selector: string) => cssWithoutComments.match(
+      new RegExp(`\\.${selector}\\s*\\{[^}]*\\}`),
+    )?.[0];
+    const expectPlacement = (selector: string, column: RegExp, row: number) => {
+      const rule = placement(selector);
+      expect(rule, `${selector} needs an explicit grid placement`).toBeTruthy();
+      expect(rule).toMatch(column);
+      expect(rule).toMatch(new RegExp(`grid-row:\\s*${row}(?:;|\\s)`));
+    };
+
+    expectPlacement('supervision-task-console-session-icon', /grid-column:\s*1(?:;|\s)/, 1);
+    expectPlacement('supervision-task-console-session-copy', /grid-column:\s*2(?:;|\s)/, 1);
+    expectPlacement('supervision-task-console-session-state', /grid-column:\s*3(?:;|\s)/, 1);
+    expectPlacement('supervision-task-console-session-health', /grid-column:\s*2\s*\/\s*-1/, 2);
+    expectPlacement('supervision-task-console-session-ci', /grid-column:\s*2\s*\/\s*-1/, 3);
+
+    const readableFacts = cssWithoutComments.match(
+      /\.supervision-task-console-session-state,\s*\.supervision-task-console-session-health,\s*\.supervision-task-console-session-ci\s*\{[^}]*\}/,
+    )?.[0];
+    expect(readableFacts, 'variable text facts need one shared safe-overflow rule').toBeTruthy();
+    expect(readableFacts).toMatch(/min-width:\s*0/);
+    expect(readableFacts).toMatch(/overflow:\s*hidden/);
+    expect(readableFacts).toMatch(/text-overflow:\s*ellipsis/);
+    expect(readableFacts).toMatch(/white-space:\s*nowrap/);
+  });
+
+  it('collapses the supervision console to one readable column with real touch targets on a phone', () => {
+    // At ~375px the console still forced its role tracks into two columns while
+    // every sibling grid collapsed to one, so the tracks overflowed the viewport.
+    // The same breakpoint left every control at desktop density, well under the
+    // 44px minimum tap target.
+    // styles.css has many 640px blocks; select the one that owns the console.
+    let mobile = '';
+    for (let at = cssWithoutComments.indexOf('@media (max-width: 640px)');
+      at !== -1;
+      at = cssWithoutComments.indexOf('@media (max-width: 640px)', at + 1)) {
+      const end = cssWithoutComments.indexOf('\n}', at);
+      const block = cssWithoutComments.slice(at, end === -1 ? undefined : end);
+      if (block.includes('.supervision-task-console-grid')) { mobile = block; break; }
+    }
+    expect(mobile, 'the console mobile breakpoint must exist').not.toBe('');
+
+    const roleTracks = mobile.match(/\.supervision-task-console-role-tracks\s*\{[^}]*\}/)?.[0];
+    expect(roleTracks, 'the mobile block must address the role tracks').toBeTruthy();
+    expect(
+      roleTracks,
+      'role tracks must not stay two-up on a phone',
+    ).not.toMatch(/grid-template-columns:\s*repeat\(2/);
+    expect(roleTracks).toMatch(/grid-template-columns:\s*minmax\(0,\s*1fr\)/);
+
+    for (const selector of [
+      '\\.supervision-task-console-tabs button',
+      '\\.supervision-task-console-session',
+      '\\.supervision-task-console-close',
+    ]) {
+      const rule = mobile.match(new RegExp(`${selector}\\s*\\{[^}]*\\}`))?.[0];
+      expect(rule, `${selector} must be sized for touch on a phone`).toBeTruthy();
+      expect(rule, `${selector} must meet the 44px tap target`).toMatch(/min-height:\s*44px/);
+    }
+  });
+
+
+  // tsk_5zv. The running indicator was a 3.6s whole-card border/glow pulse
+  // (`subcard-sci-fi`) that users could not identify at a glance. It is replaced
+  // by a fast marquee on the BOTTOM edge only: the top 3px is the session accent
+  // colour strip and must stay completely static and uncovered.
+  describe('running session marquee (tsk_5zv)', () => {
+    const runningTrack = () => cssWithoutComments.match(
+      /\.subcard-running-pulse::after\s*\{[^}]*\}/,
+    )?.[0];
+
+    it('animates a bottom-edge track and never the top accent strip', () => {
+      const track = runningTrack();
+      expect(track, 'running needs a bottom-edge marquee track').toBeTruthy();
+      // Pinned to the bottom edge...
+      expect(track).toMatch(/bottom:\s*0/);
+      // ...and explicitly NOT spanning from the top, which would sit over the
+      // 3px accent strip.
+      expect(track).not.toMatch(/\btop:\s*0/);
+      expect(track).toMatch(/animation:/);
+      // It must not intercept drag/reorder/close clicks.
+      expect(track).toMatch(/pointer-events:\s*none/);
+    });
+
+    it('drives the marquee by background-position at a fast, steady rate', () => {
+      const track = runningTrack() ?? '';
+      const name = track.match(/animation:\s*([\w-]+)\s+([\d.]+)s\s+linear/);
+      expect(name, 'marquee must be linear with an explicit duration').toBeTruthy();
+      const seconds = Number(name?.[2]);
+      expect(seconds).toBeGreaterThanOrEqual(0.6);
+      expect(seconds).toBeLessThanOrEqual(1.4);
+      const frames = cssWithoutComments.match(
+        new RegExp(`@keyframes\\s+${name?.[1]}\\s*\\{[^@]*?\\}\\s*\\}`),
+      )?.[0];
+      expect(frames, 'the marquee keyframes must exist').toBeTruthy();
+      expect(frames).toMatch(/background-position/);
+      // The old slow whole-card pulse must be gone from the running class.
+      const runningRule = cssWithoutComments.match(/\.subcard-running-pulse\s*\{[^}]*\}/)?.[0] ?? '';
+      expect(runningRule).not.toMatch(/subcard-sci-fi/);
+    });
+
+    it('keeps a non-animated running signal and a static bottom edge under reduced motion', () => {
+      // Regex cannot do this safely: a lazy scan can start at an EARLIER
+      // reduced-motion block and run forward to this selector, so the assertion
+      // passed even with the rule deleted (mutant M3 survived twice). Brace-match
+      // each reduced-motion block and require the rule to live INSIDE one.
+      const reducedBlocks: string[] = [];
+      const marker = '@media (prefers-reduced-motion: reduce)';
+      for (let at = cssWithoutComments.indexOf(marker); at !== -1; at = cssWithoutComments.indexOf(marker, at + 1)) {
+        const open = cssWithoutComments.indexOf('{', at);
+        if (open === -1) continue;
+        let depth = 0;
+        let close = open;
+        for (; close < cssWithoutComments.length; close += 1) {
+          const ch = cssWithoutComments[close];
+          if (ch === '{') depth += 1;
+          else if (ch === '}') { depth -= 1; if (depth === 0) break; }
+        }
+        reducedBlocks.push(cssWithoutComments.slice(open, close + 1));
+      }
+      const reduced = reducedBlocks.find((block) => block.includes('.subcard-running-pulse::after'));
+      expect(reduced, 'reduced motion must neutralise the marquee').toBeTruthy();
+      expect(reduced).toMatch(/animation:\s*none/);
+      // Motion stops, but the edge stays visibly highlighted.
+      expect(reduced).toMatch(/background/);
+    });
+
+    it('does not apply the marquee to idle cards', () => {
+      // The track selector must be gated on the running class, never on the bare card.
+      expect(cssWithoutComments).not.toMatch(/^\s*\.subcard::after\s*\{[^}]*animation:/m);
+      expect(cssWithoutComments).not.toMatch(/^\s*\.subsession-card::after\s*\{[^}]*animation:/m);
+    });
+
+    it('leaves the top accent border owned by the session colour, unanimated', () => {
+      // The running class may re-assert the accent colour, but must not animate it.
+      const accentRules = cssWithoutComments.match(/\.subcard-running-pulse[^{]*\{[^}]*border-top[^}]*\}/g) ?? [];
+      for (const rule of accentRules) {
+        expect(rule).toMatch(/var\(--subsession-accent-color/);
+        expect(rule).not.toMatch(/animation/);
+      }
+    });
   });
 });

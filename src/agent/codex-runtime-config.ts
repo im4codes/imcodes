@@ -6,6 +6,8 @@ import { CODEX_MODEL_IDS } from '../shared/models/options.js';
 import { killProcessTree } from '../util/kill-process-tree.js';
 import type { ProviderQuotaMeta } from '../../shared/provider-quota.js';
 import { formatProviderQuotaLabel } from '../../shared/provider-quota.js';
+import { isMeaningfulCodexCreditsPayload } from '../../shared/codex-credit-history.js';
+import { getContextStoreClient } from '../store/context-store-worker-client.js';
 
 const CACHE_TTL_MS = 30_000;
 const APP_SERVER_TIMEOUT_MS = 5_000;
@@ -23,6 +25,10 @@ export interface CodexRuntimeConfig {
   quotaLabel?: string;
   quotaUsageLabel?: string;
   quotaMeta?: ProviderQuotaMeta;
+  /** Pay-as-you-go usage credit balance (bought once the plan's included quota runs out). Decimal string, e.g. "12.50". */
+  creditsBalance?: string;
+  creditsHasCredits?: boolean;
+  creditsUnlimited?: boolean;
   availableModels?: string[];
   models?: CodexModelInfo[];
   defaultModel?: string;
@@ -41,10 +47,24 @@ interface RateLimitWindow {
   resetsAt?: number;
 }
 
+/**
+ * The pay-as-you-go usage credit balance sub-object the codex backend nests
+ * under `rateLimits` — DIFFERENT from `rateLimitResetCredits`
+ * (shared/codex-reset-credits.ts), which force-resets the 5h/weekly window
+ * early rather than being a spendable balance. Verified against the live
+ * `account/rateLimits/read` app-server RPC response shape.
+ */
+interface RateLimitCredits {
+  hasCredits?: boolean;
+  unlimited?: boolean;
+  balance?: string;
+}
+
 interface RateLimitSnapshot {
   primary?: RateLimitWindow | null;
   secondary?: RateLimitWindow | null;
   planType?: string | null;
+  credits?: RateLimitCredits | null;
 }
 
 function capitalize(value: string | undefined): string | undefined {
@@ -97,6 +117,45 @@ function buildQuotaDisplay(snapshot: RateLimitSnapshot | null | undefined): Pick
     ...(quotaLabel ? { quotaLabel } : {}),
     ...(snapshot ? { quotaMeta: { primary: snapshot.primary ?? undefined, secondary: snapshot.secondary ?? undefined } } : {}),
   };
+}
+
+/**
+ * Pull the pay-as-you-go credit balance out of a rate-limit snapshot, if the
+ * codex backend reported one (older/unauthenticated states omit it).
+ */
+function buildCreditsDisplay(
+  snapshot: RateLimitSnapshot | null | undefined,
+): Pick<CodexRuntimeConfig, 'creditsBalance' | 'creditsHasCredits' | 'creditsUnlimited'> {
+  const credits = snapshot?.credits;
+  if (!isMeaningfulCodexCreditsPayload(credits)) return {};
+  return {
+    creditsBalance: credits.balance,
+    creditsHasCredits: credits.hasCredits,
+    creditsUnlimited: credits.unlimited,
+  };
+}
+
+const FIVE_HOUR_WINDOW_MINS = 5 * 60;
+const WEEKLY_WINDOW_MINS = 7 * 24 * 60;
+const WINDOW_DURATION_TOLERANCE_MINS = 15;
+
+/**
+ * Find the window matching `targetDurationMins` (5h or 7d) among `primary`/
+ * `secondary` and return its "percent left". `primary`/`secondary` are NOT a
+ * reliable positional (5h, weekly) pair — verified against the real
+ * `account/rateLimits/read` response, whose top-level `rateLimits.primary`
+ * can itself be the 7d window with `secondary: null` once the 5h window
+ * stops being reported for that limitId. `windowDurationMins` is the only
+ * trustworthy signal for which window is which.
+ */
+function findWindowLeftPercent(snapshot: RateLimitSnapshot | null | undefined, targetDurationMins: number): number | undefined {
+  for (const window of [snapshot?.primary, snapshot?.secondary]) {
+    if (!window || typeof window.windowDurationMins !== 'number' || typeof window.usedPercent !== 'number') continue;
+    if (Math.abs(window.windowDurationMins - targetDurationMins) <= WINDOW_DURATION_TOLERANCE_MINS) {
+      return 100 - window.usedPercent;
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -486,11 +545,30 @@ export async function getCodexRuntimeConfig(options: CodexRuntimeConfigOptions =
     ?? await readCodexRateLimitsViaAppServer().catch(() => undefined);
   const planLabel = capitalize((rateLimits?.planType ?? authPlanType ?? undefined) || undefined);
   const quotaDisplay = buildQuotaDisplay(rateLimits);
+  const creditsDisplay = buildCreditsDisplay(rateLimits);
+  // This function only runs on a real (non-cached) refresh — the CACHE_TTL_MS
+  // gate above already throttles every caller to at most once per 30s, so no
+  // separate poll loop is needed to keep the local history reasonably dense.
+  // Dispatched through the async context-store worker client (never the
+  // synchronous context-store.js export directly — see
+  // scripts/lint-no-sync-context-store.mjs) and never awaited: best-effort
+  // telemetry that must never block or throw into this hot path.
+  if (isMeaningfulCodexCreditsPayload(rateLimits?.credits)) {
+    void getContextStoreClient().run('recordCodexCreditSnapshot', [{
+      planType: rateLimits?.planType ?? undefined,
+      balance: rateLimits!.credits!.balance,
+      hasCredits: rateLimits!.credits!.hasCredits,
+      unlimited: rateLimits!.credits!.unlimited,
+      fiveHourLeftPercent: findWindowLeftPercent(rateLimits, FIVE_HOUR_WINDOW_MINS),
+      weeklyLeftPercent: findWindowLeftPercent(rateLimits, WEEKLY_WINDOW_MINS),
+    }]).catch(() => {});
+  }
   const models = discoveredModels && discoveredModels.length > 0 ? discoveredModels : fallbackCodexModels();
   const defaultModel = models.find((model) => model.isDefault)?.id ?? models[0]?.id;
   const value: CodexRuntimeConfig = {
     ...(planLabel ? { planLabel } : {}),
     ...quotaDisplay,
+    ...creditsDisplay,
     availableModels: models.map((model) => model.id),
     models,
     ...(defaultModel ? { defaultModel } : {}),

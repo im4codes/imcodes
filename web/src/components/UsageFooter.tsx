@@ -15,6 +15,7 @@ import { usePref, parseBooleanish } from '../hooks/usePref.js';
 import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
 import { CLAUDE_WEEKLY_QUOTA_PREF_KEY } from '@shared/claude-quota.js';
 import { CodexResetCredits } from './CodexResetCredits.js';
+import { CodexCreditBalance } from './CodexCreditBalance.js';
 import { SessionUsagePanel } from './SessionUsagePanel.js';
 import type { WsClient } from '../ws-client.js';
 import type { ExecutionCloneLaunchState } from '../hooks/useExecutionCloneLaunch.js';
@@ -33,6 +34,9 @@ interface Props {
   quotaLabel?: string | null;
   quotaUsageLabel?: string | null;
   quotaMeta?: ProviderQuotaMeta | null;
+  /** Codex pay-as-you-go usage credit balance — see shared/codex-credit-history.ts. */
+  codexCreditsBalance?: string | null;
+  codexCreditsUnlimited?: boolean | null;
   /** Show cost tracking (requires costUsd events to have been recorded). */
   showCost?: boolean;
   /** Active thinking timestamp — shows elapsed time spinner. */
@@ -68,7 +72,7 @@ const fmt = (n: number) =>
   : n >= 1000 ? `${(n / 1000).toFixed(0)}k`
   : String(n);
 
-export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, activeTimelineTurn, pendingUserSend, transportActivityDetail, sessionError, now, onRunExecutionClones, runExecutionClonesBusy, runExecutionClonesDisabled, runExecutionClonesTitle, runExecutionClonesCount, runExecutionClonesFeedback, wsClient, connected }: Props) {
+export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, codexCreditsBalance, codexCreditsUnlimited, showCost, activeThinkingTs, statusText, activeToolCall, activeTimelineTurn, pendingUserSend, transportActivityDetail, sessionError, now, onRunExecutionClones, runExecutionClonesBusy, runExecutionClonesDisabled, runExecutionClonesTitle, runExecutionClonesCount, runExecutionClonesFeedback, wsClient, connected }: Props) {
   const { t } = useTranslation();
   const [sessionUsageOpen, setSessionUsageOpen] = useState(false);
 
@@ -309,6 +313,14 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
         <div class="session-usage-codex-row">
           {isCodexSession && wsClient && (
             <CodexResetCredits wsClient={wsClient} connected={connected !== false} />
+          )}
+          {isCodexSession && wsClient && codexCreditsBalance != null && (
+            <CodexCreditBalance
+              wsClient={wsClient}
+              connected={connected !== false}
+              balance={codexCreditsBalance}
+              unlimited={codexCreditsUnlimited}
+            />
           )}
           {(providerQuotaLines.length > 0 || showWeeklyAuthPrompt) && (
             <div class="session-usage-codex-quota">

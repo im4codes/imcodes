@@ -7,11 +7,12 @@ const grantsBySession = new Map<string, Set<string>>();
 const loadedSessions = new Set<string>();
 const loadInflight = new Map<string, Promise<void>>();
 
-// ChatMarkdown turns inline-code local paths into file-preview actions. Keep
-// daemon authorization aligned with that trusted presentation contract: only
-// an assistant-authored, backtick-delimited absolute path grants one exact
-// read. Plain user text, tool arguments/results, prefixes, and parent
-// directories never grant access.
+// ChatMarkdown turns inline-code local paths and standalone path lines into
+// file-preview actions. Keep daemon authorization aligned with that trusted
+// presentation contract: an assistant-authored path grants one exact read
+// only when it is backtick-delimited or occupies a whole line. Plain user
+// text, incidental paths embedded in prose, tool arguments/results, prefixes,
+// and parent directories never grant access.
 const INLINE_CODE_RE = /`([^`\r\n]+)`/g;
 
 function normalizedAbsolutePath(value: string): string | null {
@@ -26,6 +27,10 @@ export function extractAssistantFileReadGrants(text: string): string[] {
   let match: RegExpExecArray | null;
   while ((match = INLINE_CODE_RE.exec(text)) !== null) {
     const normalized = normalizedAbsolutePath(match[1] ?? '');
+    if (normalized) paths.add(normalized);
+  }
+  for (const line of text.split(/\r?\n/)) {
+    const normalized = normalizedAbsolutePath(line);
     if (normalized) paths.add(normalized);
   }
   return [...paths];

@@ -169,7 +169,7 @@ describe('SubSessionCard', () => {
   });
 
 
-  it('treats an open but unfocused card as an active timeline consumer', () => {
+  it('keeps an open but unfocused card passive while remaining visible', () => {
     render(
       <SubSessionCard
         sub={makeSubSession()}
@@ -184,7 +184,43 @@ describe('SubSessionCard', () => {
     );
 
     expect(useTimelineSpy).toHaveBeenLastCalledWith('deck_sub_sub-card-1', null, undefined, {
+      isActiveSession: false,
+      isVisible: true,
+    });
+  });
+
+  it('lets the focused preview own recovery only when no floating window owns the session', () => {
+    const view = render(
+      <SubSessionCard
+        sub={makeSubSession()}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        isFocused={true}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    expect(useTimelineSpy).toHaveBeenLastCalledWith('deck_sub_sub-card-1', null, undefined, {
       isActiveSession: true,
+      isVisible: true,
+    });
+
+    view.rerender(
+      <SubSessionCard
+        sub={makeSubSession()}
+        ws={null}
+        connected={true}
+        isOpen={true}
+        isFocused={true}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    expect(useTimelineSpy).toHaveBeenLastCalledWith('deck_sub_sub-card-1', null, undefined, {
+      isActiveSession: false,
       isVisible: true,
     });
   });

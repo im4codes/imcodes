@@ -184,6 +184,33 @@ function choosePreferredTimelineEvent(existing: TimelineEvent, incoming: Timelin
  * previous version of this comment described the old order and would have
  * talked the next reader into restoring it.
  */
+/**
+ * Winner between two LAST-VALUE signals.
+ *
+ * `preferTimelineEvent` exists to merge revisions of ONE event (same eventId),
+ * where ranking a hydrated payload above a truncated one is right. Last-value
+ * signals are different: they compete across different eventIds and the whole
+ * contract is "the newest value is the current value". Reusing the same-eventId
+ * comparator let an OLDER hydrated row outrank the newer current one — and the
+ * drain deletes the row it just replayed, so that stale value became permanent.
+ *
+ * Freshness therefore decides first. Completeness is only a tiebreak once
+ * epoch, seq and ts are all equal, where there is no freshness signal left and
+ * the richer payload is the better of two equals.
+ */
+export function preferLastValueSignal(existing: TimelineEvent, incoming: TimelineEvent): TimelineEvent {
+  const epochCmp = compareNumbers(incoming.epoch, existing.epoch);
+  if (epochCmp !== 0) return epochCmp > 0 ? incoming : existing;
+
+  const seqCmp = compareNumbers(incoming.seq, existing.seq);
+  if (seqCmp !== 0) return seqCmp > 0 ? incoming : existing;
+
+  const tsCmp = compareNumbers(incoming.ts, existing.ts);
+  if (tsCmp !== 0) return tsCmp > 0 ? incoming : existing;
+
+  return preferTimelineEvent(existing, incoming);
+}
+
 export function preferTimelineEvent(existing: TimelineEvent, incoming: TimelineEvent): TimelineEvent {
   const preferred = choosePreferredTimelineEvent(existing, incoming);
   const alternate = preferred === existing ? incoming : existing;

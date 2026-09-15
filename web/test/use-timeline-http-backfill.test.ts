@@ -1320,10 +1320,21 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
       sendTimelineHistoryRequest: vi.fn(() => 'history'),
     } as unknown as WsClient;
 
+    function TimelineProbe({ sessionName, active }: { sessionName: string; active: boolean }) {
+      useTimeline(sessionName, ws, serverId, { isActiveSession: active, isVisible: true });
+      return null;
+    }
+
     function Probe() {
-      useTimeline(activeSession, ws, serverId, { isActiveSession: true });
-      useTimeline(inactiveSession, ws, serverId, { isActiveSession: false });
-      return h('div', { 'data-testid': 'probe' }, 'mounted');
+      const visibleSessions = [activeSession, inactiveSession];
+      return h('div', { 'data-testid': 'probe' }, [
+        'mounted',
+        ...visibleSessions.map((sessionName, index) => h(TimelineProbe, {
+          key: sessionName,
+          sessionName,
+          active: index === 0,
+        })),
+      ]);
     }
 
     vi.useFakeTimers({ shouldAdvanceTime: true });
@@ -1348,6 +1359,69 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     });
 
     // ONLY the active session should have fired a backfill.
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledWith(serverId, activeSession, expect.anything());
+
+  });
+
+  it('a many-window resume starts one recovery fetch instead of one per visible timeline', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const sessionNames = Array.from({ length: 16 }, (_, index) => `deck_resume_many_${index}_${Date.now()}`);
+    const activeSession = sessionNames[11]!;
+    const serverId = `srv-resume-many-${Date.now()}`;
+    fetchSpy.mockResolvedValue({ events: [], epoch: 1, hasMore: false, nextCursor: null });
+
+    for (const name of sessionNames) {
+      ingestTimelineEventForCache({
+        eventId: `${name}-seed`,
+        sessionId: name,
+        ts: 1000,
+        epoch: 1,
+        seq: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'assistant.text',
+        payload: { text: 'seed' },
+      }, serverId);
+    }
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineReplayRequest: vi.fn(() => 'replay'),
+      sendTimelineHistoryRequest: vi.fn(() => 'history'),
+    } as unknown as WsClient;
+
+    function TimelineProbe({ sessionName }: { sessionName: string }) {
+      useTimeline(sessionName, ws, serverId, {
+        isActiveSession: sessionName === activeSession,
+        isVisible: true,
+      });
+      return null;
+    }
+
+    render(h('div', { 'data-testid': 'many-probe' }, sessionNames.map((sessionName) => h(TimelineProbe, {
+      key: sessionName,
+      sessionName,
+    }))));
+    await waitFor(() => expect(screen.getByTestId('many-probe')).toBeTruthy());
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    fetchSpy.mockClear();
+    __resetBackfillCooldownsForTests();
+
+    await act(async () => {
+      window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT));
+      await vi.advanceTimersByTimeAsync(50);
+    });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledWith(serverId, activeSession, expect.anything());
+
+    // The periodic foreground watchdog must obey the same sole-owner rule.
+    // Otherwise the resume itself is bounded but the next stale tick starts
+    // sixteen full-window fetches and recreates the freeze a minute later.
+    fetchSpy.mockClear();
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     expect(fetchSpy).toHaveBeenCalledWith(serverId, activeSession, expect.anything());
   });

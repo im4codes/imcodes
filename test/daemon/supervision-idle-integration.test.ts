@@ -19,6 +19,9 @@
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  SUPERVISION_EXECUTION_STATUS_MARKERS,
+  RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER,
+  RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER,
   SUPERVISION_MODE,
   normalizeSessionSupervisionSnapshot,
 } from '../../shared/supervision-config.js';
@@ -126,6 +129,7 @@ vi.mock('../../src/util/imc-dir.js', () => ({
 
 vi.mock('../../src/daemon/timeline-store.js', () => ({
   timelineStore: { append: vi.fn(), read: vi.fn(() => []), clear: vi.fn() },
+  readTailLines: vi.fn(() => []),
 }));
 
 // Import AFTER mocks — real timelineEmitter, real supervisionAutomation.
@@ -156,6 +160,20 @@ function seedSupervisedSession(mode: 'supervised' | 'supervised_audit' = 'superv
     auditMode: 'audit',
     maxAuditLoops: 2,
     taskRunPromptVersion: 'supervision_continue_v1',
+    executionPools: {
+      state: 'configured',
+      primaryDevelopmentPool: {
+        configs: [{
+          agentType: 'codex-sdk',
+          providerFamily: 'openai',
+          runtimeType: 'transport',
+          model: 'gpt-5.6-sol',
+          capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6-sol',
+        }],
+        controls: {},
+      },
+      economyTaskPool: { configs: [], controls: {} },
+    },
   });
   getSessionMock.mockReturnValue({
     name: SESSION,
@@ -201,7 +219,19 @@ describe('supervision → idle → broker integration', () => {
     await flushAsync();
 
     // handleSend must have dispatched the message and registered the task intent.
-    expect(transportSend).toHaveBeenCalledWith('implement the feature', 'cmd-int-1');
+    expect(transportSend).toHaveBeenCalledWith(
+      'implement the feature',
+      'cmd-int-1',
+      undefined,
+      expect.stringContaining('"waiting":"all_nonterminal"'),
+    );
+    const executionPreamble = String(transportSend.mock.calls[0]?.[3]);
+    expect(executionPreamble.match(/<!-- IMCODES_EXEC: [A-Z_]+ -->/g)).toEqual([
+      SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING,
+      SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT,
+    ]);
+    expect(executionPreamble).not.toContain(RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER);
+    expect(executionPreamble).not.toContain(RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER);
     expect(supervisionAutomation.getActiveRun(SESSION)).toBeTruthy();
 
     // Now simulate the transport runtime's status flow: streaming → idle.
@@ -403,7 +433,7 @@ describe('supervision → idle → broker integration', () => {
     expect(note).toBeTruthy();
   });
 
-  it('fails closed when idle arrives before the final assistant text for an active supervised run', async () => {
+  it('evaluates when idle arrives just before the final assistant text for an active supervised run', async () => {
     const transportSend = vi.fn(() => 'sent');
     getTransportRuntimeMock.mockReturnValue({
       providerSessionId: SESSION,
@@ -429,30 +459,21 @@ describe('supervision → idle → broker integration', () => {
 
     timelineEmitter.emit(SESSION, 'session.state', { state: 'running' });
     timelineEmitter.emit(SESSION, 'session.state', { state: 'idle' });
-    await flushAsync();
+    timelineEmitter.emit(SESSION, 'assistant.text', {
+      text: 'Refactor completed and tested.',
+      streaming: false,
+    });
+    await waitFor(() => supervisionDecideMock.mock.calls.length > 0, 1_000);
     unsubscribe();
 
-    expect(supervisionDecideMock).not.toHaveBeenCalled();
-    expect(seen).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        type: 'assistant.text',
-        payload: expect.objectContaining({
-          automation: true,
-          automationKind: 'supervision-warning',
-          text: '⚠️ Automation stopped because no completed assistant response was available for that turn. Manual continuation is required.',
-        }),
-      }),
-      expect.objectContaining({
-        type: 'agent.status',
-        payload: expect.objectContaining({
-          status: 'supervision_needs_input',
-          label: 'Supervised: returned control to you.',
-        }),
-      }),
-    ]));
+    expect(supervisionDecideMock).toHaveBeenCalledWith(expect.objectContaining({
+      taskRequest: 'finish the refactor',
+      assistantResponse: 'Refactor completed and tested.',
+    }));
+    expect(seen.some((event) => event.payload.automationKind === 'supervision-warning')).toBe(false);
   });
 
-  it('fails closed when idle arrives before the final assistant text for an implicit supervised run', async () => {
+  it('evaluates when idle arrives just before the final assistant text for an implicit supervised run', async () => {
     seedSupervisedSession('supervised');
     const seen: Array<{ type: string; payload: Record<string, unknown> }> = [];
     const unsubscribe = timelineEmitter.on((event) => {
@@ -465,27 +486,18 @@ describe('supervision → idle → broker integration', () => {
     });
     timelineEmitter.emit(SESSION, 'session.state', { state: 'running' });
     timelineEmitter.emit(SESSION, 'session.state', { state: 'idle' });
-    await flushAsync();
+    timelineEmitter.emit(SESSION, 'assistant.text', {
+      text: 'Queue race fixed and covered.',
+      streaming: false,
+    });
+    await waitFor(() => supervisionDecideMock.mock.calls.length > 0, 1_000);
     unsubscribe();
 
-    expect(supervisionDecideMock).not.toHaveBeenCalled();
-    expect(seen).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        type: 'assistant.text',
-        payload: expect.objectContaining({
-          automation: true,
-          automationKind: 'supervision-warning',
-          text: '⚠️ Automation stopped because no completed assistant response was available for that turn. Manual continuation is required.',
-        }),
-      }),
-      expect.objectContaining({
-        type: 'agent.status',
-        payload: expect.objectContaining({
-          status: 'supervision_needs_input',
-          label: 'Supervised: returned control to you.',
-        }),
-      }),
-    ]));
+    expect(supervisionDecideMock).toHaveBeenCalledWith(expect.objectContaining({
+      taskRequest: 'fix the queue bug',
+      assistantResponse: 'Queue race fixed and covered.',
+    }));
+    expect(seen.some((event) => event.payload.automationKind === 'supervision-warning')).toBe(false);
   });
 
   it('does not evaluate on snapshot update before idle when a turn is still running', async () => {

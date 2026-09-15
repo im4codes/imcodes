@@ -8,6 +8,7 @@ import {
   TURN_SERVICE_ENV,
   isTurnServiceHost,
   isTurnServiceIpv4,
+  parseTurnRelayRange,
   parseTurnServicePort,
   type TurnServiceConfig,
 } from '../../../shared/turn-service.js';
@@ -48,12 +49,21 @@ export function readTurnServiceConfig(env: NodeJS.ProcessEnv = process.env): Tur
     || typeof sharedSecret !== 'string'
     || sharedSecret.length < TURN_SERVICE_DEFAULTS.SHARED_SECRET_BYTES * 2
     || !credentialTtlSeconds
-    || !relayMinPort
-    || !relayMaxPort
-    || relayMinPort > relayMaxPort
-    || relayMaxPort - relayMinPort > 255
-    || (port >= relayMinPort && port <= relayMaxPort)) return undefined;
-  return { host, port, externalIp, sharedSecret, credentialTtlSeconds, relayMinPort, relayMaxPort };
+    ) return undefined;
+  // One shared rule, so the installer and the runtime cannot disagree about
+  // what a valid relay range is. They did, and that disagreement served every
+  // client a STUN-only ICE list against a perfectly healthy coturn.
+  const relayRange = parseTurnRelayRange({ port, relayMinPort, relayMaxPort });
+  if ('rejection' in relayRange) return undefined;
+  return {
+    host,
+    port,
+    externalIp,
+    sharedSecret,
+    credentialTtlSeconds,
+    relayMinPort: relayRange.relayMinPort,
+    relayMaxPort: relayRange.relayMaxPort,
+  };
 }
 
 export function createTurnIceServerAuthority(

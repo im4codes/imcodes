@@ -1,5 +1,9 @@
 import { DAEMON_COMMAND_TYPES } from './daemon-command-types.js';
 import { DAEMON_MSG } from './daemon-events.js';
+import {
+  isSessionResourceOwnerIdentity,
+  type SessionResourceOwnerIdentity,
+} from './session-resource-lifecycle.js';
 
 export const COMPUTER_USE_TOOLS = [
   'list_apps',
@@ -23,6 +27,27 @@ export const COMPUTER_USE_TOOLS = [
 ] as const;
 
 export type ComputerUseToolName = (typeof COMPUTER_USE_TOOLS)[number];
+
+/**
+ * Tools that only look. Re-running one of these changes nothing on the remote
+ * machine, so a request whose answer was lost can simply be asked again.
+ *
+ * Everything not listed here acts: a click, a keystroke, a shell command, a
+ * navigation. When the answer to one of those goes missing there is no way to
+ * tell from here whether it ran, and asking again risks doing it twice --
+ * which is worse than reporting that the answer went missing. The list is
+ * therefore an allowlist, so a tool added later is treated as acting until
+ * someone says otherwise.
+ */
+export const COMPUTER_USE_READ_ONLY_TOOLS = [
+  'list_apps',
+  'get_app_state',
+  'browser_snapshot',
+] as const satisfies readonly ComputerUseToolName[];
+
+export function isReadOnlyComputerUseTool(tool: ComputerUseToolName): boolean {
+  return (COMPUTER_USE_READ_ONLY_TOOLS as readonly string[]).includes(tool);
+}
 
 export const COMPUTER_USE_DOC_TOPICS = [
   'overview',
@@ -68,6 +93,7 @@ export const COMPUTER_USE_HTTP_REASON = {
   SCOPED_AUTH: 'scoped_auth',
   TARGET_FORBIDDEN: 'target_forbidden',
   EXEC_DISABLED: 'exec_disabled',
+  TARGET_UNAVAILABLE: 'target_unavailable',
   RELAY_DEADLINE: 'relay_deadline',
   INVALID_RESULT: 'invalid_result',
 } as const;
@@ -79,6 +105,7 @@ export interface ComputerUseRequest {
   tool: ComputerUseToolName;
   arguments?: Record<string, unknown>;
   timeoutMs?: number;
+  resourceOwner?: SessionResourceOwnerIdentity;
 }
 
 export interface ComputerUseContentItem {
@@ -151,7 +178,7 @@ function isContentItem(value: unknown): value is ComputerUseContentItem {
   return utf8ByteLength(value.data) <= COMPUTER_USE_MAX_IMAGE_BASE64_BYTES;
 }
 
-const COMPUTER_USE_REQUEST_KEYS = new Set(['type', 'correlationId', 'tool', 'arguments', 'timeoutMs']);
+const COMPUTER_USE_REQUEST_KEYS = new Set(['type', 'correlationId', 'tool', 'arguments', 'timeoutMs', 'resourceOwner']);
 const COMPUTER_USE_RESULT_KEYS = new Set(['type', 'correlationId', 'ok', 'tool', 'content', 'durationMs', 'error', 'timedOut', 'truncated']);
 const COMPUTER_USE_HTTP_ENVELOPE_KEYS = new Set(['protocol', 'version', 'outcome', 'result', 'reason']);
 const COMPUTER_USE_HTTP_REASONS: ReadonlySet<string> = new Set(Object.values(COMPUTER_USE_HTTP_REASON));
@@ -170,6 +197,10 @@ export function validateComputerUseFrame(raw: unknown): ValidationResult<Compute
     && (typeof timeoutMs !== 'number' || !Number.isInteger(timeoutMs) || timeoutMs < COMPUTER_USE_MIN_TIMEOUT_MS || timeoutMs > maxTimeoutMs)) {
     return { ok: false, error: 'invalid_timeoutMs' };
   }
+  const resourceOwner = raw.resourceOwner;
+  if (resourceOwner !== undefined) {
+    if (!isSessionResourceOwnerIdentity(resourceOwner)) return { ok: false, error: 'invalid_resourceOwner' };
+  }
   return {
     ok: true,
     value: {
@@ -178,6 +209,7 @@ export function validateComputerUseFrame(raw: unknown): ValidationResult<Compute
       tool: raw.tool,
       ...(raw.arguments !== undefined ? { arguments: raw.arguments } : {}),
       ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      ...(resourceOwner !== undefined ? { resourceOwner } : {}),
     },
   };
 }
@@ -264,19 +296,22 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
       return [
         'Computer Use controls GUI apps either on the current full imcodes daemon host (machine=local) or on a controlled machine through a typed helper running in the active user desktop session.',
         'The agent never receives shell access for this surface: call computer_use_call with one named tool and JSON arguments.',
-        'Target controlled machines accept either their stable ref_name or the complete ^^(ref_name) marker. When the message already contains a marker, pass either form without calling list_machines first; use list_machines only for discovery or an explicit status request. On full imcodes daemons, machine=local/localhost/self/this controls the daemon host directly. Results are bounded text/image MCP-style content.',
+        'A request that names a CLI, executable, script, terminal command, or shell operation is not a GUI request. Route it through exec_remote for session-0/SYSTEM, or through shell_session1 only when it genuinely requires the active signed-in user session; never select OCU merely because the target is a Windows machine.',
+        'An OCU/helper error proves that the GUI route failed, not that the machine is unauthorized or uncontrollable. If the original intent is a shell command and exec_remote is authorized, use that correct route rather than reporting an authorization refusal.',
+        'Target controlled machines use their canonical 10-digit nodeId or complete ^^(nodeId) marker. A deprecated noncanonical legacy ref_name remains accepted only for migration compatibility. When the message already contains a marker, pass either form without calling list_machines first; use list_machines only for discovery or an explicit status request. On full imcodes daemons, machine=local/localhost/self/this controls the daemon host directly. Results are bounded text/image MCP-style content.',
         'When the user asks to use a browser on the daemon host, call computer_use_call with machine=local and the built-in CDP-backed browser_* tools; do not probe for or install a separate Playwright runtime through a shell.',
         'Open Computer Use (OCU) supplies the integrated cross-platform desktop-app control path; browser_* is IM.codes\' separate CDP implementation and should be preferred over coordinate GUI control for web pages.',
       ].join('\n');
     case 'workflow':
       return [
         'Recommended workflow:',
-        '1. Use machine=local/localhost/self/this for this daemon host. For a controlled node, pass either a known stable ref_name or the complete ^^(ref_name) marker directly; call list_machines only when no exact target is available or the user asks for status.',
-        '2. computer_use_docs for the relevant topic/tool details only.',
-        '3. computer_use_call tool=list_apps to discover app ids.',
-        '4. For element/index actions, call computer_use_call tool=get_app_state first to discover stable element indexes; pure coordinate click can use the fast path directly when the target is known.',
-        '5. Prefer element/index based actions when precision matters; use coordinate actions for low-latency direct control and verify when needed.',
-        '6. For web pages, prefer browser_* tools and pull computer_use_docs topic=browser only when browser automation details are needed.',
+        '1. Use machine=local/localhost/self/this for this daemon host. For a controlled node, pass its canonical 10-digit nodeId or complete ^^(nodeId) marker directly; a deprecated noncanonical legacy ref_name is compatibility-only. Call list_machines only when no exact target is available or the user asks for status.',
+        '2. Classify intent before selecting a tool: executable/CLI/script/terminal work uses exec_remote (SYSTEM/session 0), or shell_session1 only for required active-user semantics. Use OCU only for actual GUI interaction.',
+        '3. computer_use_docs for the relevant topic/tool details only.',
+        '4. computer_use_call tool=list_apps to discover app ids.',
+        '5. For element/index actions, call computer_use_call tool=get_app_state first to discover stable element indexes; pure coordinate click can use the fast path directly when the target is known.',
+        '6. Prefer element/index based actions when precision matters; use coordinate actions for low-latency direct control and verify when needed.',
+        '7. For web pages, prefer browser_* tools and pull computer_use_docs topic=browser only when browser automation details are needed.',
       ].join('\n');
     case 'tools':
       return [

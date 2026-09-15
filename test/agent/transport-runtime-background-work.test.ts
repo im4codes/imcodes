@@ -15,6 +15,29 @@ import {
   SDK_SUBAGENT_WAKE_PROMPT_HEADER,
 } from '../../shared/sdk-subagent-status.js';
 
+// This suite verifies the transport wake state machine, not memory retrieval.
+// Without this boundary the test-only (non-production-owner) recall fallback
+// can open the local context store / embedding path and spend several seconds
+// before provider.send(), making a 25 ms wake test depend on machine load. The
+// daemon path never takes that fallback once the context-store owner is
+// started. Keep recall deterministic here so a failure means the wake contract
+// itself regressed.
+vi.mock('../../src/context/memory-recall-client.js', () => ({
+  searchLocalMemorySemanticFrontOfTurn: vi.fn(async () => ({
+    items: [],
+    stats: {
+      totalRecords: 0,
+      matchedRecords: 0,
+      recentSummaryCount: 0,
+      durableCandidateCount: 0,
+      projectCount: 0,
+      stagedEventCount: 0,
+      dirtyTargetCount: 0,
+      pendingJobCount: 0,
+    },
+  })),
+}));
+
 afterEach(() => vi.unstubAllEnvs());
 
 /**

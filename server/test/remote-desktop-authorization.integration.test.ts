@@ -6,8 +6,10 @@ import { NODE_ROLE } from '../../shared/remote-exec.js';
 import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
 import { createUser } from '../src/db/queries.js';
+import { ensureCanonicalHostForServer } from '../src/services/remote-desktop-host-identity.js';
 import { createOrUpdateShare } from '../src/db/tab-sharing.js';
 import { RemoteDesktopRouter } from '../src/ws/remote-desktop-router.js';
+import { generateControlledNodeId } from '../src/services/controlled-node-identity.js';
 
 const hex = (bytes: number) => randomBytes(bytes).toString('hex');
 const sha256 = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -20,15 +22,39 @@ beforeAll(async () => {
 
 afterAll(async () => { await db.close(); });
 
+/**
+ * Desk scope: a controlled node is bound to exactly one Desk, and a share only
+ * grants access to a current member of it. These helpers therefore bind the
+ * machine and enrol the grantee, so the role/expiry/revocation contracts below
+ * are exercised on a realistic machine rather than on a legacy unbound one
+ * (which now admits nobody but its owner).
+ */
+async function seedDesk(ownerId: string): Promise<string> {
+  const teamId = `rd-desk-${ownerId}`;
+  const now = Date.now();
+  await db.execute(
+    `INSERT INTO teams (id, name, owner_id, plan, created_at)
+     VALUES ($1, 'AI Desk', $2, 'free', $3) ON CONFLICT DO NOTHING`,
+    [teamId, ownerId, now],
+  );
+  await db.execute(
+    `INSERT INTO team_members (team_id, user_id, role, joined_at)
+     VALUES ($1, $2, 'owner', $3) ON CONFLICT DO NOTHING`,
+    [teamId, ownerId, now],
+  );
+  return teamId;
+}
+
 async function createControlledNode(ownerId: string): Promise<string> {
   const serverId = `rd-ctl-${hex(6)}`;
+  const teamId = await seedDesk(ownerId);
   await db.execute(
     `INSERT INTO servers
        (id, user_id, name, token_hash, status, created_at, last_heartbeat_at,
         node_role, exec_enabled, revoked_at, ref_name, display_name, os,
-        controlled_capabilities)
+        controlled_capabilities, node_id, team_id)
      VALUES ($1,$2,'remote-desktop',$3,'online',$4,$4,$5,true,NULL,$6,
-             'Remote desktop test','win',$7::jsonb)`,
+             'Remote desktop test','win',$7::jsonb,$8,$9)`,
     [
       serverId,
       ownerId,
@@ -37,8 +63,11 @@ async function createControlledNode(ownerId: string): Promise<string> {
       NODE_ROLE.CONTROLLED,
       `rd-ref-${hex(4)}`,
       JSON.stringify([REMOTE_DESKTOP_CAPABILITY]),
+      generateControlledNodeId(),
+      teamId,
     ],
   );
+  await ensureCanonicalHostForServer({ db, serverId, now: Date.now() });
   return serverId;
 }
 
@@ -49,6 +78,10 @@ async function grant(
   role: 'viewer' | 'participant',
   expiresAt: number | null = null,
 ) {
+  // The recipient is deliberately NOT put in the machine's team. Team
+  // membership is a grant in its own right, so adding it here would keep the
+  // session alive after this share is downgraded or expires -- and downgrade
+  // and expiry are exactly what these tests exist to prove.
   return createOrUpdateShare(db, {
     id: `rd-share-${hex(8)}`,
     target: { kind: 'server', serverId },
@@ -68,6 +101,7 @@ function fixture(serverId: string) {
     database: () => db,
     daemonAvailable: () => true,
     daemonSupportsRemoteDesktop: () => true,
+    daemonRemoteDesktopCapabilities: () => [REMOTE_DESKTOP_CAPABILITY],
     featureEnabled: () => true,
     daemonGeneration: () => 7,
     iceServers: () => ({ iceServers: [] }),

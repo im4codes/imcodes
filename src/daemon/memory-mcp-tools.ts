@@ -1,6 +1,10 @@
 import { z } from 'zod';
+import { execFile as execFileCallback } from 'node:child_process';
+import { promisify } from 'node:util';
+import { lstat, readFile, realpath } from 'node:fs/promises';
+import { isAbsolute, relative, resolve } from 'node:path';
 import type { CallToolResult, ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js';
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { McpServer, RegisteredTool } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
 import {
   MEMORY_FEATURE_FLAGS,
@@ -18,8 +22,10 @@ import {
   buildMcpDisabledResult,
   buildMcpErrorResult,
   MEMORY_MCP_CAPS,
+  MEMORY_MCP_SEND_DELIVERY_MODES,
   pickAllowedMcpArgs,
   advertisedMcpToolNames,
+  type MemoryMcpSendDeliveryMode,
   type MemoryMcpToolName,
 } from '../../shared/memory-mcp-contracts.js';
 import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
@@ -63,10 +69,17 @@ import {
 } from '../../shared/computer-use.js';
 import { FILE_TRANSFER_LIMITS, FILE_TRANSFER_PATH_MAX_BYTES } from '../../shared/transport/file-transfer.js';
 import { MACHINE_FILE_TRANSFER_TRANSPORT, type MachineFileTransferTransport } from '../../shared/machine-direct-file-transfer.js';
-import { isValidMachineName, isValidMachineTarget, normalizeMachineTarget } from '../../shared/machine-reference.js';
+import { isValidMachineTarget, normalizeMachineTarget } from '../../shared/machine-reference.js';
+import { isControlledNodeId } from '../../shared/controlled-node-identity.js';
 import { MEMORY_PROJECT_SCOPE_REASON } from '../../shared/memory-project-scope.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
 import { resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
+import { isDiscoverableInterAgentSession } from '../../shared/session-scope.js';
+import { isDelegationReplyCapableAgentType } from '../../shared/agent-delegation.js';
+import { getSessionRuntimeType } from '../../shared/agent-types.js';
+import { resolveEffectiveSessionModel } from '../../shared/session-model.js';
+import { DAEMON_VERSION } from '../util/version.js';
+import { resolvePeerAuditNormalizedModelId, resolvePeerAuditProviderFamily } from './peer-audit-candidates.js';
 import {
   MCP_FEATURE_FLAGS_BY_NAME,
   isMcpFeatureEnabled,
@@ -84,8 +97,26 @@ import { EXECUTION_CLONE_KIND, EXECUTION_CLONE_PARENT_STAGES, isExecutionClonePa
 import {
   PEER_AUDIT_VALIDATION_KINDS,
   PEER_AUDIT_VALIDATION_OUTCOMES,
+  validatePeerAuditPassEvidence,
   type PeerAuditReplyEnvelope,
 } from '../../shared/peer-audit.js';
+import {
+  SUPERVISION_CI_SMOKE_STATUSES,
+  SUPERVISION_TASK_AUDIT_POLICIES,
+  SUPERVISION_TASK_CLASSIFICATIONS,
+  SUPERVISION_TASK_FILE_OPERATIONS,
+  SUPERVISION_TASK_LIFECYCLE_STATUSES,
+  isAuditableSupervisionTaskClassification,
+  isSupervisionTaskAuditPolicy,
+  supervisionTaskAuditPolicyFromSnapshot,
+  type SupervisionTaskMetadata,
+} from '../../shared/supervision-config.js';
+import {
+  SUPERVISION_EXECUTION_POOL_KINDS,
+  normalizeSupervisionEconomyTaskPolicy,
+  normalizeSupervisionExecutionConfig,
+  type SupervisionExecutionPoolKind,
+} from '../../shared/supervision-execution-pool.js';
 import {
   AGENT_DELEGATION_PURPOSES,
   AGENT_DELEGATION_REPLY_VERSION,
@@ -94,6 +125,8 @@ import {
   type AgentDelegationAuditRequest,
   type AgentDelegationReplyEnvelope,
 } from '../../shared/agent-delegation.js';
+import type { CapabilityService } from '../../shared/capability-management.js';
+import type { CapabilityRuntimeIdentity } from './capability-mcp-tools.js';
 import { decodePeerAuditReplyCommandStructure } from './peer-audit-reply-ingress.js';
 import { deriveMemoryToolCaller, type McpRuntimeCaller } from './memory-mcp-caller.js';
 import { memoryGetSources } from '../context/memory-read-tools.js';
@@ -106,18 +139,49 @@ import { publishRuntimeMemoryCacheInvalidation } from '../context/runtime-memory
 import { getMemoryFeatureConfigStoreDiagnostics, getPersistedMemoryFeatureFlagValues, getRuntimeMemoryFeatureFlagValues } from '../store/memory-feature-config-store.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { listSessions as listStoredSessions, loadStore, type SessionRecord } from '../store/session-store.js';
-import { dispatchDestroyExecutionClone, dispatchSendMessage, dispatchSendStop, listSendTargets, type SendMessageCloneRequest, type SendToolDeps } from './send-tool.js';
+import { dispatchDestroyExecutionClone, dispatchSendMessage, dispatchSendStop, listSendTargets, resolveProjectAuthoritativeSupervisionSnapshot, type SendMessageAgentIdentity, type SendMessageCloneRequest, type SendToolDeps } from './send-tool.js';
+import {
+  getSupervisionTaskRegistry,
+  type PersistedSupervisionTaskAssignmentIdentity,
+  type SupervisionTaskRegistry,
+} from './supervision-state-store.js';
+import { autoStartAssignmentFromAck } from './assignment-auto-start.js';
+import {
+  SUPERVISION_ASSIGNMENT_START_EVIDENCE,
+  SUPERVISION_ASSIGNMENT_START_HELD,
+  describeAssignmentStartRefusal,
+} from '../../shared/supervision-assignment-start.js';
+import {
+  inspectSupervisionAssignmentWorktree,
+  resolveSupervisionAssignmentWorktree,
+} from './supervision-worktree-inspector.js';
+import { verifySupervisionIntegrationCommit } from './supervision-integration-bundle.js';
+import {
+  parseSupervisionIntegrationRemoteRef,
+  validateSupervisionIntegrationEvidence,
+  type SupervisionIntegrationObservationCause,
+  type SupervisionIntegrationRemoteObservation,
+} from '../../shared/supervision-integration-finalization.js';
+import { supervisionIdentityMatches } from '../../shared/supervision-participant-authority.js';
+import { advanceSupervisionTaskAfterFinish } from './supervision-convergence-wire.js';
 import { cronMcpCreate, cronMcpCreateSelf, cronMcpDelete, cronMcpList, cronMcpUpdate, cronMcpUpdateSelf, type CronMcpClientOptions } from './cron-mcp-client.js';
 import {
   registerMemoryShortRef,
   resolveMemoryShortRefCandidatesWithStore,
   resolveMemoryShortRefWithStore,
 } from '../context/memory-short-ref.js';
+import {
+  MEMORY_MCP_DAEMON_TOOL_NAMES,
+  type MemoryMcpDaemonToolName,
+} from '../../shared/memory-mcp-daemon-rpc.js';
 
 /** Upper bound on records expanded for one colliding handle. */
 const AMBIGUOUS_REF_CANDIDATE_CAP = 4;
 import { GitOriginRepositoryIdentityService } from '../agent/repository-identity-service.js';
 import { ALIAS_DESCRIPTION_MAX, ALIAS_MCP_TOOLS, toAliasMetadata, type AliasMcpToolName } from '../../shared/alias-types.js';
+import { mapLegacySupervisionUpdate, mapLegacySupervisionFinish } from './supervision-compat-shims.js';
+import { resolveSupervisionIntent } from './supervision-intent-ops.js';
+import { supervisionCallerParticipates } from './supervision-mcp-tools.js';
 import {
   aliasMcpList,
   aliasMcpResolve,
@@ -125,8 +189,98 @@ import {
   aliasMcpDelete,
   type AliasMcpClientOptions,
 } from './alias-mcp-client.js';
+import {
+  SESSION_IDENTITY_SOURCE_FILE_MAX_BYTES,
+  SESSION_IDENTITY_SOURCE_FILE_MAX_CHARS,
+  SESSION_IDENTITY_SCOPE_LIST,
+  SESSION_IDENTITY_SCOPES,
+  isSessionIdentityScope,
+  normalizeSessionIdentityContent,
+  renderSessionIdentityProfiles,
+  sessionIdentityContentError,
+  type SessionIdentityScope,
+} from '../../shared/session-identity.js';
+import {
+  clearSessionIdentityProfile,
+  getEffectiveSessionIdentityProfiles,
+  getSessionIdentityProfile,
+  setSessionIdentityProfile,
+  type SessionIdentityClientOptions,
+} from './session-identity-mcp-client.js';
+import {
+  VERIFICATION_MACHINE_KIND_LIST,
+  VERIFICATION_MACHINE_KINDS,
+  VERIFICATION_MACHINE_SCOPE_LIST,
+  VERIFICATION_MACHINE_SCOPES,
+  VERIFICATION_MACHINE_STATUSES,
+  isVerificationMachineId,
+  normalizeVerificationMachineAlias,
+  normalizeVerificationMachineTarget,
+  verificationMachineAliasError,
+  verificationMachineTargetError,
+  type VerificationMachineStatus,
+} from '../../shared/verification-machine.js';
+import {
+  listVerificationMachineProfiles,
+  recordVerificationMachineProfileStatus,
+  removeVerificationMachineProfile,
+  setVerificationMachineProfile,
+} from './verification-machine-mcp-client.js';
 
 type ToolResult = Record<string, unknown>;
+const execFileAsync = promisify(execFileCallback);
+
+const recordOnlyPathArraySchema = z.unknown().optional().transform((value) => (
+  Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+    : []
+));
+
+const recordOnlyManifestSchema = z.unknown().optional().transform((value) => (
+  Array.isArray(value)
+    ? value.flatMap((item) => {
+      if (!item || typeof item !== 'object') return [];
+      const path = Reflect.get(item, 'path');
+      const sha256 = Reflect.get(item, 'sha256');
+      return typeof path === 'string' && typeof sha256 === 'string'
+        ? [{ path, sha256 }]
+        : [];
+    })
+    : []
+));
+
+const integrationPreflightSchema = z.object({
+  assignmentId: z.string().min(1),
+  revision: z.string().min(1),
+  auditAttemptId: z.string().min(1),
+  auditRevision: z.string().min(1),
+  verdict: z.literal('PASS'),
+  ownedFiles: recordOnlyPathArraySchema,
+  integrationManifest: recordOnlyManifestSchema,
+  integrationOwner: z.string().min(1),
+  pushRemoteRef: z.string().min(1),
+  stagedPaths: recordOnlyPathArraySchema,
+  conflictedPaths: recordOnlyPathArraySchema,
+  untrackedOtherOwnerPaths: recordOnlyPathArraySchema,
+  externalRunId: z.string().min(1).optional(),
+  externalHeadSha: z.string().regex(/^[0-9a-f]{40}$/).optional(),
+  externalTaskId: z.string().min(1).optional(),
+  ciResult: z.enum(SUPERVISION_CI_SMOKE_STATUSES).optional(),
+}).strict();
+
+const integrationFinalizationSchema = integrationPreflightSchema.extend({
+  preflightToken: z.string().regex(/^sha256:[a-f0-9]{64}$/).optional(),
+  commitSha: z.string().regex(/^[0-9a-f]{40}$/),
+  pushResult: z.enum(['pushed', 'already_present']),
+  evidence: z.string().optional(),
+}).strict();
+
+const legacySupervisionFinishSchema = z.object({
+  // `revision` is the caller's revision authority and is mandatory: a delayed
+  // or retried predecessor FINISHED must be refused, never applied to R2.
+  assignmentId: z.string(), revision: z.string().min(1), evidence: z.string().optional(),
+}).strict();
+
 export interface MemoryMcpToolContext {
   signal?: AbortSignal;
   onProgress?: (chunk: RemoteExecOutputChunk) => void | Promise<void>;
@@ -146,6 +300,19 @@ type MemoryMcpListSummaries = (query: {
 const repositoryIdentityService = new GitOriginRepositoryIdentityService();
 
 export interface MemoryMcpToolDeps {
+  /**
+   * Production stdio seam: execute memory-owning tools in the daemon process,
+   * whose process-wide context-store and embedding workers are shared by all
+   * sessions. When present, local MCP memory implementations are unreachable.
+   */
+  invokeDaemonMemoryTool?: (
+    name: MemoryMcpDaemonToolName,
+    input?: unknown,
+  ) => Promise<Record<string, unknown>> | Record<string, unknown>;
+  /** Registered-node AI-managed MCP/Skill service. Capability tools are absent when unavailable. */
+  capabilityService?: CapabilityService;
+  /** Caller context resolver used only when activating binding-scoped Skill instructions. */
+  resolveCapabilityIdentity?: (caller: McpRuntimeCaller) => Promise<CapabilityRuntimeIdentity | null>;
   featureFlags?: MCPFeatureFlagValues;
   isMemoryFeatureEnabled?: (flag: MemoryFeatureFlag) => boolean;
   searchMemory?: MemoryMcpSearch;
@@ -170,7 +337,32 @@ export interface MemoryMcpToolDeps {
   orchestratorDeps?: OrchestratorDeps;
   saveObservation?: typeof saveObservation;
   savePreference?: typeof savePreference;
+  identityClientOptions?: SessionIdentityClientOptions;
+  getIdentityProfile?: typeof getSessionIdentityProfile;
+  getEffectiveIdentityProfiles?: typeof getEffectiveSessionIdentityProfiles;
+  setIdentityProfile?: typeof setSessionIdentityProfile;
+  clearIdentityProfile?: typeof clearSessionIdentityProfile;
+  listVerificationMachines?: typeof listVerificationMachineProfiles;
+  setVerificationMachine?: typeof setVerificationMachineProfile;
+  removeVerificationMachine?: typeof removeVerificationMachineProfile;
+  recordVerificationMachineStatus?: typeof recordVerificationMachineProfileStatus;
+  listVerificationAliases?: typeof aliasMcpList;
+  applyEffectiveIdentity?: (
+    sessionName: string,
+    prompt: string | undefined,
+    options?: { refresh?: boolean },
+  ) => Promise<Record<string, unknown>> | Record<string, unknown>;
+  /**
+   * Daemon-owned exact-session restart. The stdio MCP child must delegate this
+   * operation instead of trying to mutate the daemon's runtime maps itself.
+   */
+  restartSession?: (
+    target: SessionRecord,
+    options: { reset: boolean },
+  ) => Promise<boolean> | boolean;
   peerAuditReply?: (envelope: PeerAuditReplyEnvelope) => Promise<Record<string, unknown>> | Record<string, unknown>;
+  inspectSupervisionWorktree?: typeof inspectSupervisionAssignmentWorktree;
+  supervisionTaskRegistry?: SupervisionTaskRegistry;
   delegationReply?: (envelope: AgentDelegationReplyEnvelope) => Promise<Record<string, unknown>> | Record<string, unknown>;
   getProcessedProjectionById?: (id: string) => Promise<ProcessedContextProjection | undefined> | ProcessedContextProjection | undefined;
   archiveMemory?: (id: string) => Promise<boolean> | boolean;
@@ -183,6 +375,19 @@ export interface MemoryMcpToolDeps {
     updatedByUserId?: string;
   }) => Promise<ProcessedContextProjection | null> | ProcessedContextProjection | null;
   recordMemoryHits?: (ids: string[]) => Promise<void> | void;
+  /**
+   * Convergence dispatch used after a successful legacy assignment finish.
+   * Injected so the post-finish wire is OBSERVABLE: the shared helper
+   * otherwise resolves it through a lazy `import('./send-tool.js')`, which no
+   * test can see, so deleting the call here produced no failing test. Same
+   * dep name and shape as the supervision MCP intent handler.
+   */
+  dispatchReadyAudit?: (taskId: string) => Promise<unknown>;
+  /**
+   * Git runner for integration remote observation (tests inject failures).
+   * Must reject with the child-process error shape (code/killed/signal/stderr).
+   */
+  integrationGitExec?: SupervisionIntegrationGitExec;
   sendDeps?: SendToolDeps;
   cronOptions?: CronMcpClientOptions;
   cronCreate?: typeof cronMcpCreate;
@@ -207,7 +412,7 @@ export interface MemoryMcpToolDeps {
   nodeRole?: NodeRole;
 }
 
-/** One machine in the `list_machines` result (agent-facing, ref_name-keyed). */
+/** One machine in the `list_machines` result (agent-facing, canonical-nodeId keyed). */
 export interface MachineSummaryForTool {
   name: string;
   displayName?: string;
@@ -294,16 +499,16 @@ export type MachineExecToolSuccess = Record<string, unknown> & (
   | ({ status: 'ok'; outcome: 'spawn_error'; ok: false; exitCode: null; timedOut: false; error: string } & MachineExecTerminalFields)
 );
 
-const machineRefNameRuntimeSchema = z.string().refine(isValidMachineName, {
-  message: 'must be a valid bare stable machine ref_name',
+const controlledNodeIdRuntimeSchema = z.string().refine(isControlledNodeId, {
+  message: 'must be a canonical controlled-node nodeId',
 });
 
 const machineTargetRuntimeSchema = z.string().refine(isValidMachineTarget, {
-  message: 'must be a valid stable machine ref_name or complete ^^(ref_name) marker',
+  message: 'must be a canonical nodeId/^^(nodeId) or deprecated noncanonical legacy alias',
 });
 
 const machineSummaryShape = {
-  name: machineRefNameRuntimeSchema,
+  name: controlledNodeIdRuntimeSchema,
   displayName: z.string().optional(),
   os: z.enum(ENROLLMENT_OSES).optional(),
   online: z.boolean(),
@@ -423,6 +628,238 @@ function error(reason: MCPErrorReason, message?: string): ToolResult {
   return buildMcpErrorResult(reason, message);
 }
 
+function integrationRefusal(prefix: string, refusals: readonly object[]): ToolResult {
+  return {
+    ...error(MCP_ERROR_REASONS.VALIDATION_FAILED, `${prefix} rejected`),
+    refusals,
+  };
+}
+
+function integrationRegistryRefusal(prefix: string, reason: string): ToolResult {
+  const refusal = (() => {
+    switch (reason) {
+      case 'not_found':
+        return { code: 'identity_mismatch', field: 'assignmentId', expected: 'existing integration owner' };
+      case 'owner_mismatch':
+        return { code: 'identity_mismatch', field: 'ownerIdentity', expected: 'caller-bound integration owner' };
+      case 'role_forbidden':
+        return { code: 'role_mismatch', field: 'ownerRole', expected: 'integration_owner' };
+      case 'invalid_transition':
+        return { code: 'assignment_status_mismatch', field: 'assignmentStatus', expected: 'preflight-prepared owner' };
+      case 'old_revision':
+      case 'stale_audit_revision':
+        return { code: 'revision_mismatch', field: 'revision', expected: 'exact current audited revision' };
+      case 'old_audit_attempt':
+      case 'receipt_closed':
+        return { code: 'attempt_mismatch', field: 'auditAttemptId', expected: 'one open exact PASS attempt' };
+      case 'manifest_mismatch':
+        return { code: 'bundle_mismatch', field: 'bundle', expected: 'exact immutable bundle' };
+      case 'ambiguous_assignment':
+        return { code: 'ambiguous_authority', field: 'integrationOwnerAssignmentId', expected: 'one exact integration owner' };
+      case 'conflicting_replay':
+        return { code: 'conflicting_replay', field: 'preflightToken', expected: 'exact finalized payload' };
+      default:
+        return { code: 'invalid_format', field: 'assignmentId', expected: `accepted integration request (${reason})` };
+    }
+  })();
+  return integrationRefusal(prefix, [refusal]);
+}
+
+function zodIntegrationRefusals(errorValue: z.ZodError): Record<string, unknown>[] {
+  return errorValue.issues.map((issue) => ({
+    code: issue.code === 'invalid_type' ? 'missing_field' : 'invalid_format',
+    field: String(issue.path[0] ?? 'assignmentId'),
+    expected: issue.message,
+  }));
+}
+
+function equivalentIntegrationRemoteRef(left: string | undefined, right: string): boolean {
+  const branch = (value: string | undefined): string | undefined => {
+    if (!value) return undefined;
+    if (value.startsWith('refs/heads/')) return value.slice('refs/heads/'.length);
+    if (value.startsWith('refs/remotes/origin/')) return value.slice('refs/remotes/origin/'.length);
+    return value;
+  };
+  return branch(left) === branch(right);
+}
+
+function integrationAttributionRefusals(input: unknown, expected: {
+  ownedFiles: readonly string[];
+  integrationManifest: readonly { path: string; sha256: string }[];
+}): Record<string, unknown>[] {
+  if (!input || typeof input !== 'object') return [];
+  const record = input as Record<string, unknown>;
+  const refusals: Record<string, unknown>[] = [];
+  if (Object.prototype.hasOwnProperty.call(record, 'ownedFiles') && Array.isArray(record.ownedFiles)) {
+    const actual = [...new Set(record.ownedFiles.filter((item): item is string => typeof item === 'string')
+      .map((item) => item.trim()).filter(Boolean))].sort();
+    if (JSON.stringify(actual) !== JSON.stringify([...expected.ownedFiles].sort())) {
+      refusals.push({ code: 'bundle_mismatch', field: 'ownedFiles', expected: 'exact bundle path set', actual: actual.join(',') });
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(record, 'integrationManifest')
+    && Array.isArray(record.integrationManifest)) {
+    const actual = record.integrationManifest.flatMap((item) => {
+      if (!item || typeof item !== 'object') return [];
+      const path = Reflect.get(item, 'path');
+      const sha256 = Reflect.get(item, 'sha256');
+      return typeof path === 'string' && typeof sha256 === 'string'
+        ? [{ path: path.trim(), sha256: sha256.trim().toLowerCase() }]
+        : [];
+    }).sort((left, right) => left.path.localeCompare(right.path));
+    if (JSON.stringify(actual) !== JSON.stringify([...expected.integrationManifest]
+      .sort((left, right) => left.path.localeCompare(right.path)))) {
+      refusals.push({ code: 'bundle_mismatch', field: 'integrationManifest', expected: 'exact bundle manifest', actual: JSON.stringify(actual) });
+    }
+  }
+  return refusals;
+}
+
+export type SupervisionIntegrationGitExec = (
+  args: readonly string[],
+  options: { timeoutMs: number },
+) => Promise<{ stdout: string }>;
+
+const INTEGRATION_REMOTE_GIT_TIMEOUT_MS = 45_000;
+const INTEGRATION_LOCAL_GIT_TIMEOUT_MS = 15_000;
+
+const defaultIntegrationGitExec: SupervisionIntegrationGitExec = async (args, options) => {
+  const { stdout } = await execFileAsync('git', [...args], {
+    encoding: 'utf8',
+    timeout: options.timeoutMs,
+    maxBuffer: 256 * 1024,
+    // Never block on an interactive credential prompt; fail fast as `auth`.
+    env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+  });
+  return { stdout: String(stdout) };
+};
+
+/** Classify an operational Git failure. This never decides provenance. */
+export function classifySupervisionIntegrationGitFailure(errorValue: unknown): SupervisionIntegrationObservationCause {
+  const record = Object(errorValue) as Record<string, unknown>;
+  const text = `${String(record.stderr ?? '')}\n${String(record.message ?? '')}`;
+  if (record.killed === true || record.code === 'ETIMEDOUT' || /timed? ?out/i.test(String(record.signal ?? ''))) {
+    return 'timeout';
+  }
+  if (/authentication failed|permission denied|could not read (username|password)|terminal prompts disabled|access denied|\b40[13]\b/i.test(text)) {
+    return 'auth';
+  }
+  if (/could not resolve host|connection (refused|reset|timed out)|network is unreachable|no route to host|operation timed out|unable to access|early eof|remote end hung up|ssl/i.test(text)) {
+    return 'network';
+  }
+  return 'git_error';
+}
+
+/**
+ * Observe whether the exact commit is on the requested destination ref.
+ *
+ * Callers must already have authorized the integration owner and validated
+ * `requestedRef` with parseSupervisionIntegrationRemoteRef. Only a configured
+ * remote is fetched, options are terminated before the remote/ref, and every
+ * operational failure is returned as `unavailable` with its stage and cause:
+ * only a successful observation can prove drift.
+ */
+export async function observeSupervisionIntegrationRemote(input: {
+  worktreePath: string;
+  requestedRef: string;
+  requestedCommitSha: string;
+  exec?: SupervisionIntegrationGitExec;
+  remoteTimeoutMs?: number;
+  localTimeoutMs?: number;
+}): Promise<SupervisionIntegrationRemoteObservation> {
+  const exec = input.exec ?? defaultIntegrationGitExec;
+  const remoteTimeoutMs = input.remoteTimeoutMs ?? INTEGRATION_REMOTE_GIT_TIMEOUT_MS;
+  const localTimeoutMs = input.localTimeoutMs ?? INTEGRATION_LOCAL_GIT_TIMEOUT_MS;
+  const parsed = parseSupervisionIntegrationRemoteRef(input.requestedRef);
+  if (!parsed.ok || !/^[0-9a-f]{40}$/.test(input.requestedCommitSha)) {
+    return { status: 'unavailable', stage: 'remote_config', cause: 'unconfigured_remote' };
+  }
+  const { remote, branchRef } = parsed.value;
+  try {
+    const { stdout } = await exec(['-C', input.worktreePath, 'remote'], { timeoutMs: localTimeoutMs });
+    const configured = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    if (!configured.includes(remote)) {
+      return { status: 'unavailable', stage: 'remote_config', cause: 'unconfigured_remote' };
+    }
+  } catch (errorValue) {
+    return { status: 'unavailable', stage: 'remote_config', cause: classifySupervisionIntegrationGitFailure(errorValue) };
+  }
+  // Fetch only the requested destination ref into FETCH_HEAD. This is a
+  // current observation (not a possibly stale tracking ref) and materializes
+  // the tip needed for an ancestry proof. One bounded retry absorbs a
+  // transient timeout/network failure under load.
+  const fetchArgs = ['-C', input.worktreePath, 'fetch', '--no-tags', '--quiet', '--end-of-options', remote, branchRef];
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await exec(fetchArgs, { timeoutMs: remoteTimeoutMs });
+      break;
+    } catch (errorValue) {
+      const stderr = String(Reflect.get(Object(errorValue), 'stderr') ?? '');
+      if (/couldn't find remote ref/i.test(stderr)) {
+        // A proof, not a failure: the destination ref does not exist.
+        return { status: 'observed', ref: input.requestedRef, commitSha: null, containsRequestedCommit: false };
+      }
+      const cause = classifySupervisionIntegrationGitFailure(errorValue);
+      if (attempt === 0 && (cause === 'timeout' || cause === 'network')) continue;
+      return { status: 'unavailable', stage: 'fetch', cause };
+    }
+  }
+  let commitSha: string;
+  try {
+    const { stdout } = await exec(
+      ['-C', input.worktreePath, 'rev-parse', '--verify', 'FETCH_HEAD^{commit}'],
+      { timeoutMs: localTimeoutMs },
+    );
+    commitSha = stdout.trim().toLowerCase();
+  } catch (errorValue) {
+    return { status: 'unavailable', stage: 'rev_parse', cause: classifySupervisionIntegrationGitFailure(errorValue) };
+  }
+  if (!/^[0-9a-f]{40}$/.test(commitSha)) {
+    return { status: 'unavailable', stage: 'rev_parse', cause: 'git_error' };
+  }
+  if (commitSha === input.requestedCommitSha) {
+    return { status: 'observed', ref: input.requestedRef, commitSha, containsRequestedCommit: true };
+  }
+  try {
+    await exec(
+      ['-C', input.worktreePath, 'merge-base', '--is-ancestor', input.requestedCommitSha, commitSha],
+      { timeoutMs: localTimeoutMs },
+    );
+    return { status: 'observed', ref: input.requestedRef, commitSha, containsRequestedCommit: true };
+  } catch (errorValue) {
+    // Exit 1 is the deterministic non-ancestor proof; anything else is an
+    // operational failure and proves nothing.
+    if (Reflect.get(Object(errorValue), 'code') === 1) {
+      return { status: 'observed', ref: input.requestedRef, commitSha, containsRequestedCommit: false };
+    }
+    return { status: 'unavailable', stage: 'merge_base', cause: classifySupervisionIntegrationGitFailure(errorValue) };
+  }
+}
+
+/**
+ * Owner authority that must hold before any integration Git subprocess runs.
+ * Pure registry reads only; the registry re-checks everything under its lock.
+ */
+function integrationCallerAuthorityRefusals(input: {
+  owner: { role: string; identity: PersistedSupervisionTaskAssignmentIdentity };
+  identity: PersistedSupervisionTaskAssignmentIdentity;
+  integrationOwner: string;
+}): Record<string, unknown>[] {
+  const refusals: Record<string, unknown>[] = [];
+  if (input.owner.role !== 'integration_owner') {
+    refusals.push({ code: 'role_mismatch', field: 'ownerRole', expected: 'integration_owner', actual: input.owner.role });
+  }
+  if (!supervisionIdentityMatches(input.owner.identity, input.identity)
+    || input.integrationOwner !== input.owner.identity.sessionName) {
+    refusals.push({
+      code: 'identity_mismatch', field: 'ownerIdentity',
+      expected: input.owner.identity.sessionName,
+      actual: `${input.identity.sessionName}/${input.integrationOwner}`,
+    });
+  }
+  return refusals;
+}
+
 function stringArg(args: Record<string, unknown>, key: string): string | undefined {
   const value = args[key];
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
@@ -440,6 +877,13 @@ function numberArg(args: Record<string, unknown>, key: string): number | undefin
 
 function boolArg(args: Record<string, unknown>, key: string): boolean | undefined {
   return typeof args[key] === 'boolean' ? args[key] : undefined;
+}
+
+function sendDeliveryModeArg(value: unknown): MemoryMcpSendDeliveryMode | undefined | 'invalid' {
+  if (value === undefined) return undefined;
+  return Object.values(MEMORY_MCP_SEND_DELIVERY_MODES).includes(value as MemoryMcpSendDeliveryMode)
+    ? value as MemoryMcpSendDeliveryMode
+    : 'invalid';
 }
 
 function listProjectionClassArg(args: Record<string, unknown>): MemoryMcpListProjectionClass | undefined {
@@ -482,18 +926,79 @@ function parseCloneArg(value: unknown): SendMessageCloneRequest | undefined | 'i
   };
 }
 
-const AUDIT_ARG_ALLOWED_KEYS: ReadonlySet<string> = new Set(['kind', 'attemptId']);
 
-function parseAuditArg(value: unknown): AgentDelegationAuditRequest | undefined | 'invalid' {
+const TASK_ARG_ALLOWED_KEYS: ReadonlySet<string> = new Set([
+  'taskId', 'assignmentId', 'topLevelTaskId', 'sliceId', 'classification', 'objective', 'acceptance',
+  'ownedFiles', 'sharedFiles', 'dependencies', 'integrationOwner', 'baseRevision',
+  'currentRevision', 'auditAttemptId', 'auditRevision', 'auditPolicy', 'executionPool',
+  'autoProvision', 'requestedExecutionType', 'economyPolicy',
+]);
+
+function parseTaskArg(value: unknown): SupervisionTaskMetadata | undefined | 'invalid' {
   if (value === undefined || value === null) return undefined;
   if (typeof value !== 'object' || Array.isArray(value)) return 'invalid';
   const record = value as Record<string, unknown>;
+  if (Object.keys(record).some((key) => !TASK_ARG_ALLOWED_KEYS.has(key))) return 'invalid';
+  const stringField = (key: string): string | undefined => typeof record[key] === 'string' && record[key].trim() ? record[key].trim() : undefined;
+  const arrayField = (key: string): string[] | undefined => Array.isArray(record[key]) ? (record[key] as unknown[]).filter((item): item is string => typeof item === 'string') : undefined;
+  const requestedExecutionType = normalizeSupervisionExecutionConfig(record.requestedExecutionType);
+  const economyPolicy = normalizeSupervisionEconomyTaskPolicy(record.economyPolicy);
+  if (record.requestedExecutionType != null && !requestedExecutionType) return 'invalid';
+  if (record.economyPolicy != null && !economyPolicy) return 'invalid';
+  if (record.executionPool != null && record.executionPool !== 'primary' && record.executionPool !== 'economy') return 'invalid';
+  if (record.auditPolicy != null && !isSupervisionTaskAuditPolicy(record.auditPolicy)) return 'invalid';
+  if (record.autoProvision !== undefined && record.autoProvision !== true) return 'invalid';
+  return {
+    taskId: stringField('taskId'),
+    assignmentId: stringField('assignmentId'),
+    topLevelTaskId: stringField('topLevelTaskId'),
+    sliceId: stringField('sliceId'),
+    classification: typeof record.classification === 'string' ? record.classification as never : undefined,
+    objective: stringField('objective'),
+    acceptance: arrayField('acceptance'),
+    ownedFiles: arrayField('ownedFiles'),
+    sharedFiles: arrayField('sharedFiles'),
+    dependencies: arrayField('dependencies'),
+    integrationOwner: stringField('integrationOwner'),
+    baseRevision: stringField('baseRevision'),
+    currentRevision: stringField('currentRevision'),
+    auditAttemptId: stringField('auditAttemptId'),
+    auditRevision: stringField('auditRevision'),
+    auditPolicy: isSupervisionTaskAuditPolicy(record.auditPolicy) ? record.auditPolicy : undefined,
+    executionPool: record.executionPool as 'primary' | 'economy' | undefined,
+    autoProvision: record.autoProvision === true ? true : undefined,
+    ...(requestedExecutionType ? { requestedExecutionType } : {}),
+    ...(economyPolicy ? { economyPolicy } : {}),
+  };
+}
+
+const AUDIT_ARG_ALLOWED_KEYS: ReadonlySet<string> = new Set(['kind', 'attemptId', 'auditedSessionName', 'strictCrossVendor']);
+
+/**
+ * Parse the strict supervision-audit envelope.
+ *
+ * `auditedSessionName` is REQUIRED and must be a real session name. It is not
+ * defaulted from the caller or the target: a Supervisor Brain dispatching an
+ * audit is neither the auditor nor the audited, so any such default silently
+ * mislabels the subject. Absent or malformed fails closed as 'invalid'.
+ */
+export function parseAuditArg(value: unknown): AgentDelegationAuditRequest | undefined | 'invalid' {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'object' || Array.isArray(value)) return 'invalid';
+  const record = value as Record<string, unknown>;
+  const auditedSessionName = typeof record.auditedSessionName === 'string'
+    ? record.auditedSessionName.trim() : '';
   if (Object.keys(record).some((key) => !AUDIT_ARG_ALLOWED_KEYS.has(key))
     || record.kind !== AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT
-    || !isAgentDelegationOpaqueId(record.attemptId)) return 'invalid';
+    || !isAgentDelegationOpaqueId(record.attemptId)
+    || !auditedSessionName
+    || auditedSessionName !== record.auditedSessionName
+    || (record.strictCrossVendor !== undefined && record.strictCrossVendor !== true)) return 'invalid';
   return {
     kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
     attemptId: record.attemptId,
+    auditedSessionName,
+    ...(record.strictCrossVendor === true ? { strictCrossVendor: true } : {}),
   };
 }
 
@@ -519,8 +1024,6 @@ function localUnavailableToolFields(result: Pick<MemoryMcpSearchResult, 'degrade
   return { reason: degradedReasons[0] ?? MEMORY_MCP_DEGRADED_REASON.LOCAL_CONTEXT_STORE_UNAVAILABLE, degradedReasons };
 }
 
-const SEND_SESSION_SNAPSHOT_FALLBACK_TTL_MS = 30_000;
-
 function sendVisibleSiblingCount(caller: McpRuntimeCaller, sessions: SessionRecord[]): number {
   if (!caller.sessionName) return 0;
   const callerProjectName = resolveRuntimeScope(caller, sessions).projectName;
@@ -537,17 +1040,31 @@ function hasSendCaller(caller: McpRuntimeCaller, sessions: SessionRecord[]): boo
   return Boolean(caller.sessionName && sessions.some((session) => session.name === caller.sessionName));
 }
 
-function shouldUsePreviousSendSessions(
-  caller: McpRuntimeCaller,
+async function defaultSessionAuthorityActive(session: SessionRecord): Promise<boolean> {
+  if (session.state === 'stopped' || session.state === 'error') return false;
+  const runtimeType = session.runtimeType ?? getSessionRuntimeType(session.agentType);
+  if (runtimeType === 'transport') {
+    const { getTransportRuntime } = await import('../agent/session-manager.js');
+    return Boolean(getTransportRuntime(session.name));
+  }
+  const { sessionExists } = await import('../agent/tmux.js');
+  return sessionExists(session.name).catch(() => false);
+}
+
+async function mergeAuthoritativelyActiveSendSessions(
   current: SessionRecord[],
-  previous: SessionRecord[] | null,
-  previousAt: number,
-  now: number,
-): previous is SessionRecord[] {
-  if (!previous || previous.length === 0) return false;
-  if (now - previousAt > SEND_SESSION_SNAPSHOT_FALLBACK_TTL_MS) return false;
-  if (hasSendCaller(caller, previous) && !hasSendCaller(caller, current)) return true;
-  return sendVisibleSiblingCount(caller, previous) > 0 && sendVisibleSiblingCount(caller, current) === 0;
+  priorCandidates: SessionRecord[],
+  active: (session: SessionRecord) => boolean | Promise<boolean>,
+): Promise<SessionRecord[]> {
+  const byName = new Map(current.map((session) => [session.name, session]));
+  for (const candidate of priorCandidates) {
+    // An explicit current record is authoritative, including stopped/error.
+    // Only absence is eligible for recovery from a prior directory snapshot.
+    if (byName.has(candidate.name)) continue;
+    if (candidate.state === 'stopped' || candidate.state === 'error') continue;
+    if (await active(candidate)) byName.set(candidate.name, candidate);
+  }
+  return [...byName.values()];
 }
 
 function memoryGate(
@@ -802,6 +1319,80 @@ function callerProjectId(caller: { namespace: Pick<ContextNamespace, 'projectId'
   return projectId || undefined;
 }
 
+async function readIdentityFile(
+  filePath: string,
+  projectRoot: string | null,
+  allowOutsideProject: boolean,
+): Promise<string> {
+  const requested = filePath.trim();
+  if (!requested || (!isAbsolute(requested) && requested.split(/[\\/]+/u).includes('..'))) {
+    throw new Error('identity_file_path_invalid');
+  }
+  const root = projectRoot ? await realpath(projectRoot) : null;
+  if (!isAbsolute(requested) && !root) throw new Error('identity_file_path_invalid');
+  const candidate = isAbsolute(requested) ? requested : resolve(root!, requested);
+  if (root) {
+    const rel = relative(root, candidate);
+    const insideProject = !!rel && !rel.startsWith('..') && !isAbsolute(rel);
+    if (!insideProject && !allowOutsideProject) throw new Error('identity_file_path_invalid');
+  } else if (!allowOutsideProject) {
+    throw new Error('identity_file_path_invalid');
+  }
+  const stat = await lstat(candidate);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > SESSION_IDENTITY_SOURCE_FILE_MAX_BYTES) {
+    throw new Error('identity_file_invalid');
+  }
+  const exact = await realpath(candidate);
+  if (root) {
+    const exactRel = relative(root, exact);
+    const exactInsideProject = !!exactRel && !exactRel.startsWith('..') && !isAbsolute(exactRel);
+    if (!exactInsideProject && !allowOutsideProject) throw new Error('identity_file_path_invalid');
+  }
+  return readFile(exact, 'utf8');
+}
+
+const SEND_IDENTITY_ARG_ALLOWED_KEYS: ReadonlySet<string> = new Set(['content', 'filePath']);
+
+async function parseSendIdentityArg(
+  value: unknown,
+  projectRoot: string | null,
+): Promise<SendMessageAgentIdentity | undefined | 'invalid'> {
+  if (value === undefined || value === null) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return 'invalid';
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).some((key) => !SEND_IDENTITY_ARG_ALLOWED_KEYS.has(key))) return 'invalid';
+  const inline = typeof record.content === 'string' && record.content.trim() ? record.content : undefined;
+  const filePath = typeof record.filePath === 'string' && record.filePath.trim() ? record.filePath.trim() : undefined;
+  if (Boolean(inline) === Boolean(filePath)) return 'invalid';
+  let content: string;
+  try {
+    if (filePath) {
+      if (filePath.length > SESSION_IDENTITY_SOURCE_FILE_MAX_CHARS) return 'invalid';
+      content = await readIdentityFile(filePath, projectRoot, true);
+    } else {
+      content = inline ?? '';
+    }
+  } catch {
+    return 'invalid';
+  }
+  if (sessionIdentityContentError(content, SESSION_IDENTITY_SCOPES.SESSION)) return 'invalid';
+  return {
+    content: normalizeSessionIdentityContent(content),
+    ...(filePath ? { sourceFile: filePath } : {}),
+  };
+}
+
+function sendIdentityProjectRoot(
+  caller: McpRuntimeCaller,
+  sessions: SessionRecord[],
+): string | null {
+  const injectedRoot = caller.projectRoot?.trim();
+  if (injectedRoot) return injectedRoot;
+  if (!caller.sessionName) return null;
+  const sessionRoot = sessions.find((session) => session.name === caller.sessionName)?.projectDir?.trim();
+  return sessionRoot || null;
+}
+
 function canManageProjectionNamespace(projectionNamespace: ContextNamespace, callerNamespace: ContextNamespace, callerUserId: string): boolean {
   if (serializeContextNamespace(projectionNamespace) === serializeContextNamespace(callerNamespace)) return true;
   if (projectionNamespace.scope !== 'personal' || callerNamespace.scope !== 'personal') return false;
@@ -853,29 +1444,47 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
   const searchMemory = deps.searchMemory ?? searchMcpMemoryRecall;
   const listMemorySummaries = deps.listMemorySummaries ?? listMcpMemorySummaries;
   let lastGoodSendSessions: SessionRecord[] | null = null;
-  let lastGoodSendSessionsAt = 0;
   const sendSessions = async (): Promise<SessionRecord[]> => {
-    if (deps.sendDeps?.listSessions) return deps.sendDeps.listSessions();
-    await loadStore({ probe: false });
-    const current = listStoredSessions();
-    const now = Date.now();
-    const selected = shouldUsePreviousSendSessions(
-      caller,
+    // Keep the in-memory directory before disk refresh. A valid but stale
+    // sessions.json snapshot can omit one live SDK/tmux session without being
+    // empty or malformed; replacing the whole store made that target vanish
+    // from both list and send until a later writer restored it.
+    const beforeRefresh = deps.sendDeps?.listSessions
+      ? []
+      : listStoredSessions();
+    if (!deps.sendDeps?.listSessions) await loadStore({ probe: false });
+    const current = deps.sendDeps?.listSessions
+      ? deps.sendDeps.listSessions()
+      : listStoredSessions();
+    const priorCandidates = [...beforeRefresh, ...(lastGoodSendSessions ?? [])];
+    const selected = await mergeAuthoritativelyActiveSendSessions(
       current,
-      lastGoodSendSessions,
-      lastGoodSendSessionsAt,
-      now,
-    ) ? lastGoodSendSessions : current;
+      priorCandidates,
+      deps.sendDeps?.isSessionAuthoritativelyActive ?? defaultSessionAuthorityActive,
+    );
     if (hasSendCaller(caller, selected) || sendVisibleSiblingCount(caller, selected) > 0) {
       lastGoodSendSessions = selected;
-      lastGoodSendSessionsAt = now;
     }
     return selected;
   };
   const sendDepsWithSessions = (sessions: SessionRecord[], extra: Partial<SendToolDeps> = {}): SendToolDeps => ({
     ...deps.sendDeps,
     ...extra,
-    listSessions: () => sessions,
+    // Keep the authority-filtered call snapshot stable, but admit sessions
+    // created by auto-provisioning during this same send. Without this merge,
+    // provisioning succeeded and the immediately following exact-target
+    // resolution falsely returned `target not found`.
+    listSessions: () => {
+      const current = deps.sendDeps?.listSessions
+        ? deps.sendDeps.listSessions()
+        : listStoredSessions();
+      const combined = [...sessions];
+      const names = new Set(combined.map((session) => session.name));
+      for (const session of current) {
+        if (!names.has(session.name)) combined.push(session);
+      }
+      return combined;
+    },
   });
   // Orchestrated path is the production wiring; the legacy `getMemorySources`
   // dep is retained for tests that only want to verify the local SQLite
@@ -912,7 +1521,114 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
 
   const memoryCaller = () => deriveMemoryToolCaller(scopedCallerForDeps(caller, deps));
 
-  return wrapHandlers({
+  const identityOptions = deps.identityClientOptions ?? {};
+  const identityGet = deps.getIdentityProfile ?? getSessionIdentityProfile;
+  const identityGetEffective = deps.getEffectiveIdentityProfiles ?? getEffectiveSessionIdentityProfiles;
+  const identitySet = deps.setIdentityProfile ?? setSessionIdentityProfile;
+  const identityClear = deps.clearIdentityProfile ?? clearSessionIdentityProfile;
+  const verificationList = deps.listVerificationMachines ?? listVerificationMachineProfiles;
+  const verificationSet = deps.setVerificationMachine ?? setVerificationMachineProfile;
+  const verificationRemove = deps.removeVerificationMachine ?? removeVerificationMachineProfile;
+  const verificationRecordStatus = deps.recordVerificationMachineStatus ?? recordVerificationMachineProfileStatus;
+  const verificationAliasList = deps.listVerificationAliases ?? aliasMcpList;
+  const identityApply = deps.applyEffectiveIdentity ?? (async (sessionName, prompt, options) => {
+    const { applyEffectiveSessionIdentity } = await import('../agent/session-manager.js');
+    return applyEffectiveSessionIdentity(sessionName, prompt, options);
+  });
+
+  const resolveIdentityTarget = async (rawTarget: string | undefined): Promise<
+    { status: 'ok'; target: SessionRecord } | { status: 'error'; result: ToolResult }
+  > => {
+    const sessions = await sendSessions();
+    const callerRecord = caller.sessionName
+      ? sessions.find((session) => session.name === caller.sessionName)
+      : undefined;
+    if (!callerRecord) return { status: 'error', result: error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'current session identity is unavailable') };
+    const targetName = rawTarget?.trim() || callerRecord.name;
+    const target = sessions.find((session) => session.name === targetName && session.state !== 'stopped');
+    if (!target) return { status: 'error', result: error(MCP_ERROR_REASONS.VALIDATION_FAILED, `target "${targetName}" not found`) };
+    if (target.projectName !== callerRecord.projectName) {
+      return { status: 'error', result: error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'target is outside the caller project') };
+    }
+    if (target.name !== callerRecord.name && callerRecord.role !== 'brain') {
+      return { status: 'error', result: error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain may change a sibling identity') };
+    }
+    return { status: 'ok', target };
+  };
+
+  const resolveRestartTarget = async (rawTarget: string | undefined): Promise<
+    { status: 'ok'; target: SessionRecord } | { status: 'error'; result: ToolResult }
+  > => {
+    const targetName = rawTarget?.trim();
+    if (!targetName) {
+      return { status: 'error', result: error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'target is required') };
+    }
+    const sessions = await sendSessions();
+    const callerRecord = caller.sessionName
+      ? sessions.find((session) => session.name === caller.sessionName)
+      : undefined;
+    if (!callerRecord) {
+      return { status: 'error', result: error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'current session identity is unavailable') };
+    }
+    const target = sessions.find((session) => session.name === targetName);
+    if (!target) {
+      return { status: 'error', result: error(MCP_ERROR_REASONS.VALIDATION_FAILED, `target "${targetName}" not found`) };
+    }
+    const callerProject = resolveEffectiveProjectName(callerRecord, sessions);
+    const targetProject = resolveEffectiveProjectName(target, sessions);
+    if (!callerProject || targetProject !== callerProject) {
+      return { status: 'error', result: error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'target is outside the caller project') };
+    }
+    return { status: 'ok', target };
+  };
+
+  const identityScopeKey = (scope: SessionIdentityScope, target: SessionRecord): string => {
+    if (scope === SESSION_IDENTITY_SCOPES.USER) return '';
+    if (scope === SESSION_IDENTITY_SCOPES.PROJECT) {
+      return target.contextNamespace?.projectId?.trim() || target.projectName;
+    }
+    return `${caller.serverId ?? 'local'}:${target.name}`;
+  };
+
+  const refreshIdentityTarget = async (target: SessionRecord) => {
+    const effective = await identityGetEffective({
+      projectKey: identityScopeKey(SESSION_IDENTITY_SCOPES.PROJECT, target),
+      sessionKey: identityScopeKey(SESSION_IDENTITY_SCOPES.SESSION, target),
+    }, identityOptions);
+    if (effective.status !== 'ok') return effective;
+    const prompt = renderSessionIdentityProfiles(effective.profiles);
+    const applied = await identityApply(target.name, prompt, { refresh: true });
+    return { status: 'ok' as const, target: target.name, profiles: effective.profiles, prompt, applied };
+  };
+
+  const refreshAffectedIdentities = async (scope: SessionIdentityScope, target: SessionRecord) => {
+    const sessions = await sendSessions();
+    const affected = scope === SESSION_IDENTITY_SCOPES.USER
+      ? sessions.filter((session) => session.state !== 'stopped')
+      : scope === SESSION_IDENTITY_SCOPES.PROJECT
+        ? sessions.filter((session) => session.state !== 'stopped' && session.projectName === target.projectName)
+        : [target];
+    const results = [];
+    for (const session of affected) results.push(await refreshIdentityTarget(session));
+    return results;
+  };
+
+
+  const supervisionTaskIdentity = async (): Promise<PersistedSupervisionTaskAssignmentIdentity | undefined> => {
+    if (!caller.sessionName) return undefined;
+    const sessions = await sendSessions();
+    const record = sessions.find((session) => session.name === caller.sessionName);
+    if (!record?.sessionInstanceId || !record.runtimeEpoch) return undefined;
+    return {
+      sessionName: record.name,
+      sessionInstanceId: record.sessionInstanceId,
+      runtimeEpoch: record.runtimeEpoch,
+      agentType: record.agentType,
+      providerFamily: resolvePeerAuditProviderFamily(record),
+    };
+  };
+
+  const handlers: Record<MemoryMcpToolName, MemoryMcpToolHandler> = {
     [MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]: async (input) => {
       const gate = memoryGate(deps, MEMORY_FEATURE_FLAGS_BY_NAME.quickSearch, MEMORY_MCP_DISABLED_FLAGS.QUICK_SEARCH, { items: [] });
       if (gate) return gate;
@@ -1181,13 +1897,308 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (gate) return gate;
       return await savePreferenceTool(pickAllowedMcpArgs(input, ['text', 'idempotencyKey']), memoryCaller()) as unknown as ToolResult;
     },
+    [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_GET]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['target']);
+      const resolved = await resolveIdentityTarget(stringArg(args, 'target'));
+      if (resolved.status === 'error') return resolved.result;
+      const { target } = resolved;
+      const result = await identityGetEffective({
+        projectKey: identityScopeKey(SESSION_IDENTITY_SCOPES.PROJECT, target),
+        sessionKey: identityScopeKey(SESSION_IDENTITY_SCOPES.SESSION, target),
+      }, identityOptions);
+      if (result.status !== 'ok') return result;
+      const prompt = renderSessionIdentityProfiles(result.profiles);
+      return {
+        status: 'ok',
+        target: target.name,
+        projectName: target.projectName,
+        profiles: result.profiles,
+        effectiveIdentity: prompt ?? null,
+      };
+    },
+    [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['identityScope', 'target', 'content', 'filePath', 'expectedRevision']);
+      const scopeValue = stringArg(args, 'identityScope');
+      if (!isSessionIdentityScope(scopeValue)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'scope is invalid');
+      const resolved = await resolveIdentityTarget(stringArg(args, 'target'));
+      if (resolved.status === 'error') return resolved.result;
+      const { target } = resolved;
+      const callerRecord = (await sendSessions()).find((session) => session.name === caller.sessionName);
+      if ((scopeValue === SESSION_IDENTITY_SCOPES.USER || scopeValue === SESSION_IDENTITY_SCOPES.PROJECT)
+        && callerRecord?.role !== 'brain') {
+        return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain may change user/project identity defaults');
+      }
+      const inline = stringArg(args, 'content');
+      const filePath = stringArg(args, 'filePath');
+      if (Boolean(inline) === Boolean(filePath)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'provide exactly one of content or filePath');
+      }
+      let content: string;
+      try {
+        content = filePath
+          ? await readIdentityFile(
+            filePath,
+            target.projectDir,
+            scopeValue === SESSION_IDENTITY_SCOPES.SESSION,
+          )
+          : inline ?? '';
+      } catch (err) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, err instanceof Error ? err.message : 'identity_file_invalid');
+      }
+      const contentReason = sessionIdentityContentError(content, scopeValue);
+      if (contentReason) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, contentReason);
+      const saved = await identitySet({
+        scope: scopeValue,
+        scopeKey: identityScopeKey(scopeValue, target),
+        content: normalizeSessionIdentityContent(content),
+        ...(filePath ? { sourceFile: filePath } : {}),
+      }, identityOptions);
+      if (saved.status !== 'ok') return saved;
+      const refreshed = await refreshAffectedIdentities(scopeValue, target);
+      return {
+        status: 'ok',
+        saved: true,
+        target: target.name,
+        profile: { ...saved.profile, content: undefined },
+        refreshed: refreshed.map((item) => item.status === 'ok' ? item.target : null).filter(Boolean),
+      };
+    },
+    [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_CLEAR]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['identityScope', 'target', 'expectedRevision']);
+      const scopeValue = stringArg(args, 'identityScope');
+      if (!isSessionIdentityScope(scopeValue)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'scope is invalid');
+      const resolved = await resolveIdentityTarget(stringArg(args, 'target'));
+      if (resolved.status === 'error') return resolved.result;
+      const { target } = resolved;
+      const callerRecord = (await sendSessions()).find((session) => session.name === caller.sessionName);
+      if ((scopeValue === SESSION_IDENTITY_SCOPES.USER || scopeValue === SESSION_IDENTITY_SCOPES.PROJECT)
+        && callerRecord?.role !== 'brain') {
+        return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain may clear user/project identity defaults');
+      }
+      const cleared = await identityClear(
+        scopeValue,
+        identityScopeKey(scopeValue, target),
+        undefined,
+        identityOptions,
+      );
+      if (cleared.status !== 'ok') return cleared;
+      const refreshed = await refreshAffectedIdentities(scopeValue, target);
+      return {
+        status: 'ok',
+        deleted: cleared.deleted,
+        target: target.name,
+        refreshed: refreshed.map((item) => item.status === 'ok' ? item.target : null).filter(Boolean),
+      };
+    },
+    [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_REFRESH]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['target']);
+      const resolved = await resolveIdentityTarget(stringArg(args, 'target'));
+      if (resolved.status === 'error') return resolved.result;
+      const { target } = resolved;
+      const refreshed = await refreshIdentityTarget(target);
+      if (refreshed.status !== 'ok') return refreshed;
+      return {
+        status: 'ok',
+        target: target.name,
+        runtimeType: target.runtimeType ?? 'process',
+        codexThreadResumePending: target.agentType === 'codex-sdk',
+        applied: refreshed.applied,
+      };
+    },
+    [MEMORY_MCP_TOOL_NAMES.SESSION_RESTART]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['target', 'reset']);
+      const resolved = await resolveRestartTarget(stringArg(args, 'target'));
+      if (resolved.status === 'error') return resolved.result;
+      if (!deps.restartSession) {
+        return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'daemon session restart control is unavailable');
+      }
+      const reset = boolArg(args, 'reset') === true;
+      try {
+        const scheduled = await deps.restartSession(resolved.target, { reset });
+        if (!scheduled) {
+          return error(MCP_ERROR_REASONS.TARGET_UNAVAILABLE, 'session restart was not accepted');
+        }
+        return { status: 'ok', target: resolved.target.name, reset, scheduled: true };
+      } catch (restartError) {
+        return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, sanitizeMcpErrorMessage(restartError));
+      }
+    },
+    [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_LIST]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['includeDisabled']);
+      const scoped = scopedCallerForDeps(caller, deps);
+      const projectKey = scoped.namespace.projectId?.trim() || scoped.projectName?.trim() || undefined;
+      const result = await verificationList(projectKey);
+      if (result.status !== 'ok') return result;
+      const includeDisabled = boolArg(args, 'includeDisabled') === true;
+      return {
+        status: 'ok',
+        projectKey: projectKey ?? null,
+        machines: result.profiles
+          .filter((profile) => includeDisabled || profile.enabled)
+          .map((profile) => ({ ...profile })),
+      };
+    },
+    [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_SET]: async (input) => {
+      const args = pickAllowedMcpArgs(input, [
+        'id', 'verificationScope', 'alias', 'kind', 'target', 'enabled', 'expectedRevision',
+      ]);
+      const scope = stringArg(args, 'verificationScope');
+      const kind = stringArg(args, 'kind');
+      const alias = stringArg(args, 'alias');
+      const target = stringArg(args, 'target');
+      if (!(VERIFICATION_MACHINE_SCOPE_LIST as readonly string[]).includes(scope ?? '')) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'verificationScope is invalid');
+      }
+      if (!(VERIFICATION_MACHINE_KIND_LIST as readonly string[]).includes(kind ?? '')) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'kind is invalid');
+      }
+      const typedKind = kind as (typeof VERIFICATION_MACHINE_KIND_LIST)[number];
+      const aliasReason = verificationMachineAliasError(alias);
+      if (aliasReason) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, aliasReason);
+      const targetReason = verificationMachineTargetError(typedKind, target);
+      if (targetReason) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, targetReason);
+      const id = stringArg(args, 'id');
+      if (id !== undefined && !isVerificationMachineId(id)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'verification machine id is invalid');
+      }
+      const scoped = scopedCallerForDeps(caller, deps);
+      const projectKey = scoped.namespace.projectId?.trim() || scoped.projectName?.trim();
+      if (scope === VERIFICATION_MACHINE_SCOPES.PROJECT && !projectKey) {
+        return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'current project identity is unavailable');
+      }
+      return await verificationSet({
+        ...(id ? { id } : {}),
+        scope: scope as (typeof VERIFICATION_MACHINE_SCOPE_LIST)[number],
+        scopeKey: scope === VERIFICATION_MACHINE_SCOPES.USER ? '' : projectKey!,
+        alias: normalizeVerificationMachineAlias(alias!),
+        kind: typedKind,
+        target: normalizeVerificationMachineTarget(target!),
+        enabled: boolArg(args, 'enabled') ?? true,
+        ...(numberArg(args, 'expectedRevision') === undefined ? {} : { expectedRevision: numberArg(args, 'expectedRevision') }),
+      });
+    },
+    [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_REMOVE]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['id', 'expectedRevision']);
+      const id = stringArg(args, 'id');
+      if (!isVerificationMachineId(id)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'verification machine id is invalid');
+      return await verificationRemove(id, numberArg(args, 'expectedRevision'));
+    },
+    [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_VERIFY]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['id']);
+      const id = stringArg(args, 'id');
+      if (!isVerificationMachineId(id)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'verification machine id is invalid');
+      const scoped = scopedCallerForDeps(caller, deps);
+      const projectKey = scoped.namespace.projectId?.trim() || scoped.projectName?.trim() || undefined;
+      const listed = await verificationList(projectKey);
+      if (listed.status !== 'ok') return listed;
+      const profile = listed.profiles.find((item) => item.id === id);
+      if (!profile) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'verification machine not found in the current scope');
+      let status: VerificationMachineStatus;
+      if (!profile.enabled) {
+        status = VERIFICATION_MACHINE_STATUSES.UNAUTHORIZED;
+      } else if (profile.kind === VERIFICATION_MACHINE_KINDS.SSH) {
+        // An SSH entry authorizes a stable alias association. Connectivity is
+        // deliberately not registry authority: the model resolves/uses the
+        // alias when the task actually needs the machine.
+        const aliases = await verificationAliasList();
+        status = aliases.status === 'ok' && aliases.aliases.some((entry) => entry.id === profile.target)
+          ? VERIFICATION_MACHINE_STATUSES.VERIFIED
+          : VERIFICATION_MACHINE_STATUSES.UNAUTHORIZED;
+      } else if (!deps.machineDeps) {
+        status = VERIFICATION_MACHINE_STATUSES.UNREACHABLE;
+      } else {
+        try {
+          const machines = await deps.machineDeps.listMachines({ includeOffline: true });
+          const target = machines.find((machine) => machine.name === profile.target);
+          if (!target) {
+            status = VERIFICATION_MACHINE_STATUSES.UNAUTHORIZED;
+          } else if (!target.online || !target.execEnabled) {
+            status = VERIFICATION_MACHINE_STATUSES.UNREACHABLE;
+          } else {
+            const probe = await deps.machineDeps.execRemote({
+              machine: profile.target,
+              command: 'echo imcodes-verification',
+              timeoutMs: 10_000,
+            });
+            status = probe.outcome === REMOTE_EXEC_OUTCOMES[2] && probe.exitCode === 0
+              ? VERIFICATION_MACHINE_STATUSES.VERIFIED
+              : VERIFICATION_MACHINE_STATUSES.UNREACHABLE;
+          }
+        } catch {
+          status = VERIFICATION_MACHINE_STATUSES.UNREACHABLE;
+        }
+      }
+      const recorded = await verificationRecordStatus(id, status);
+      if (recorded.status !== 'ok') return recorded;
+      return { status: 'ok', verificationMachineId: id, verificationStatus: status, profile: recorded.profile };
+    },
     [MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY]: async (input) => {
       if (!deps.peerAuditReply) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'peer audit reply ingress is unavailable');
       // This is deliberately structure-only. Evidence policy runs only after
-      // the daemon ingress has bound capability and live sender/destination.
+      // the daemon ingress has bound the exact assignment and live sender/destination.
       const decoded = decodePeerAuditReplyCommandStructure(input);
       if (!decoded.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, decoded.error);
-      const result = await deps.peerAuditReply(decoded.value);
+      const envelope = decoded.value;
+      const taskId = envelope.taskId?.trim();
+      const assignmentId = envelope.assignmentId?.trim();
+      const revision = envelope.revision?.trim();
+      // One closed-round exception exists: the exact finalized auditor may
+      // replace its own REWORK with PASS while the SAME immutable bytes are
+      // still waiting for integration. This cannot travel through the normal
+      // pending-delivery ingress because that authority is consumed by the
+      // first final. Authenticate the live MCP caller, inspect the frozen
+      // source bytes, then let one registry transaction recheck every fence.
+      const registry = deps.supervisionTaskRegistry ?? getSupervisionTaskRegistry();
+      const closedTask = taskId ? registry.getTaskRecord(taskId) : undefined;
+      const closedAudit = assignmentId ? registry.getAssignment(assignmentId) : undefined;
+      if (taskId && assignmentId && revision
+        && envelope.receiptKind === 'final' && envelope.verdict === 'PASS'
+        && closedTask?.projectName === caller.projectName
+        && closedAudit?.taskId === taskId && closedAudit.role === 'auditor'
+        && closedAudit.status === 'finalized'
+        && closedAudit.identity.sessionName === caller.sessionName) {
+        const identity = await supervisionTaskIdentity();
+        if (!identity) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'peer audit correction caller identity is unavailable');
+        const evidence = validatePeerAuditPassEvidence(envelope.verdict, envelope.validations);
+        if (!evidence.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, evidence.error);
+        const sourceAssignmentId = closedTask.integrationBundle?.sourceAssignmentId;
+        const source = sourceAssignmentId ? registry.getAssignment(sourceAssignmentId) : undefined;
+        if (!source) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'peer audit correction rejected: manifest_mismatch');
+        const inspect = deps.inspectSupervisionWorktree ?? inspectSupervisionAssignmentWorktree;
+        const inspected = await inspect({
+          sessionName: source.identity.sessionName,
+          assignmentId: source.assignmentId,
+        });
+        if (!inspected.ok) {
+          return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE,
+            `peer audit correction rejected: ${inspected.reason}`);
+        }
+        const corrected = registry.appendMatchingAuditReceipt({
+          taskId,
+          auditorAssignmentId: assignmentId,
+          attemptId: envelope.attemptId,
+          revision,
+          receiptKind: 'final',
+          verdict: 'PASS',
+          auditedSessionName: source.identity.sessionName,
+          auditorSessionName: identity.sessionName,
+          auditorIdentity: identity,
+          findings: envelope.findings,
+          validations: envelope.validations,
+          worktreeSnapshot: inspected.snapshot,
+        });
+        if (!corrected.ok) {
+          return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE,
+            `peer audit correction rejected: ${corrected.reason}`);
+        }
+        return {
+          status: 'ok', accepted: true,
+          supersedingFinalReceipt: true,
+          receiptId: corrected.value.receiptId,
+          idempotentReplay: corrected.replay === true,
+        };
+      }
+      const result = await deps.peerAuditReply(envelope);
       return result.ok === false
         ? error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, String(result.error ?? 'peer audit reply rejected'))
         : { status: 'ok', accepted: true };
@@ -1213,34 +2224,110 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
           };
     },
     [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['query', 'limit', 'executionPool']);
+      const rawExecutionPool = args.executionPool;
+      if (rawExecutionPool !== undefined
+        && (typeof rawExecutionPool !== 'string'
+          || !(SUPERVISION_EXECUTION_POOL_KINDS as readonly string[]).includes(rawExecutionPool))) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'executionPool must be primary or economy');
+      }
+      const executionPoolValue = rawExecutionPool as SupervisionExecutionPoolKind | undefined;
       const sessions = await sendSessions();
-      const args = pickAllowedMcpArgs(input, ['query', 'limit']);
       return listSendTargets(caller, {
         query: stringArg(args, 'query'),
         limit: numberArg(args, 'limit'),
+        executionPool: executionPoolValue,
       }, sendDepsWithSessions(sessions, {
         isDispatchEnabled: () => deps.sendDeps?.isDispatchEnabled?.() ?? true,
       })) as unknown as ToolResult;
     },
+    [MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]: async (input) => {
+      if (input && typeof input === 'object' && !Array.isArray(input) && Object.keys(input as Record<string, unknown>).length > 0) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'session_runtime_identity_get takes no arguments');
+      if (!caller.sessionName) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'bound caller session is unavailable');
+      const sessions = await sendSessions();
+      const session = sessions.find((candidate) => candidate.name === caller.sessionName);
+      if (!session || !session.sessionInstanceId || !session.runtimeEpoch) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'live caller runtime identity is unavailable');
+      const effectiveModel = resolveEffectiveSessionModel(session);
+      const normalizedModelId = resolvePeerAuditNormalizedModelId(session);
+      const modelSource = session.activeModel ? 'active_model'
+        : session.requestedModel ? 'requested_model'
+          : session.modelDisplay ? 'model_display'
+            : session.qwenModel ? 'qwen_model' : 'unknown';
+      return {
+        status: 'ok',
+        identity: {
+          sessionName: session.name,
+          sessionInstanceId: session.sessionInstanceId,
+          runtimeEpoch: session.runtimeEpoch,
+          agentType: session.agentType,
+          runtimeType: session.runtimeType ?? getSessionRuntimeType(session.agentType),
+          providerId: session.providerId ?? null,
+          providerFamily: resolvePeerAuditProviderFamily(session),
+          normalizedModelId: normalizedModelId === 'unknown' ? null : normalizedModelId,
+          effectiveModelId: effectiveModel ?? null,
+          activeModel: session.activeModel ?? null,
+          requestedModel: session.requestedModel ?? null,
+          modelDisplay: session.modelDisplay ?? null,
+          qwenModel: session.qwenModel ?? null,
+          modelMetadataState: effectiveModel ? 'known' : 'unknown',
+          modelMetadataSource: modelSource,
+          modelMetadataConfidence: session.activeModel ? 'daemon_observed' : effectiveModel ? 'configured' : 'none',
+          ...(effectiveModel ? {} : { unknownReason: 'no_daemon_model_metadata' }),
+          daemonVersion: DAEMON_VERSION,
+          daemonBuildRevision: process.env.IMCODES_BUILD_REVISION ?? process.env.GIT_COMMIT ?? null,
+          state: session.state,
+          replyCapable: isDelegationReplyCapableAgentType(session.agentType),
+          discoverable: isDiscoverableInterAgentSession(session),
+          projectName: resolveEffectiveProjectName(session, sessions) ?? null,
+        },
+      };
+    },
     [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: async (input) => {
       const sessions = await sendSessions();
-      const args = pickAllowedMcpArgs(input, ['target', 'message', 'files', 'reply', 'audit', 'broadcast', 'idempotencyKey', 'clone']);
+      const effectiveProjectRoot = sendIdentityProjectRoot(caller, sessions);
+      const args = pickAllowedMcpArgs(input, ['target', 'message', 'files', 'reply', 'audit', 'task', 'identity', 'broadcast', 'idempotencyKey', 'deliveryMode', 'clone']);
       const clone = parseCloneArg(args.clone);
       if (clone === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'clone request is invalid');
       const audit = parseAuditArg(args.audit);
       if (audit === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'audit request is invalid');
-      return dispatchSendMessage(caller, {
+      const task = parseTaskArg(args.task);
+      if (task === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'task metadata is invalid');
+      // A session's working project directory is authoritative even when the
+      // directory is not a Git checkout. Older/restored MCP registrations can
+      // omit PROJECT_ROOT, so recover it from the live session record before
+      // resolving a relative identity document.
+      const identity = await parseSendIdentityArg(args.identity, effectiveProjectRoot);
+      if (identity === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'identity is invalid');
+      const deliveryMode = sendDeliveryModeArg(args.deliveryMode);
+      if (deliveryMode === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'deliveryMode is invalid');
+      return dispatchSendMessage({ ...caller, projectRoot: effectiveProjectRoot }, {
         target: stringArg(args, 'target'),
         message: stringArg(args, 'message'),
         files: stringArrayArg(args, 'files'),
         reply: boolArg(args, 'reply'),
         ...(audit ? { audit } : {}),
+        ...(task ? { task } : {}),
+        ...(identity ? { identity } : {}),
         broadcast: boolArg(args, 'broadcast'),
         idempotencyKey: stringArg(args, 'idempotencyKey'),
+        ...(deliveryMode ? { deliveryMode } : {}),
         ...(clone ? { clone } : {}),
       }, sendDepsWithSessions(sessions, {
         isDispatchEnabled: () => deps.sendDeps?.isDispatchEnabled?.() ?? true,
         exactTargetOnly: true,
+        applyProvisionedIdentity: async (target, provisionedIdentity) => {
+          const saved = await identitySet({
+            scope: SESSION_IDENTITY_SCOPES.SESSION,
+            scopeKey: identityScopeKey(SESSION_IDENTITY_SCOPES.SESSION, target),
+            content: provisionedIdentity.content,
+            ...(provisionedIdentity.sourceFile ? { sourceFile: provisionedIdentity.sourceFile } : {}),
+          }, identityOptions);
+          if (saved.status !== 'ok') return { ok: false, error: saved.message };
+          const refreshed = await refreshIdentityTarget(target);
+          return refreshed.status === 'ok'
+            ? { ok: true }
+            : { ok: false, error: refreshed.message };
+        },
       })) as unknown as Promise<ToolResult>;
     },
     [MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE]: async (input) => {
@@ -1252,6 +2339,454 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       }, sendDepsWithSessions(sessions, {
         isDispatchEnabled: () => deps.sendDeps?.isDispatchEnabled?.() ?? true,
       })) as unknown as Promise<ToolResult>;
+    },
+
+    [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['taskId', 'topLevelTaskId', 'classification', 'role', 'objective', 'acceptance', 'scopeFiles', 'idempotencyKey']);
+      const identity = await supervisionTaskIdentity();
+      if (!identity) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'supervision task caller identity is unavailable');
+      const registry = getSupervisionTaskRegistry();
+      const projectName = caller.projectName?.trim();
+      if (!projectName) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'supervision task caller project is unavailable');
+      const requestedRole = typeof args.role === 'string' ? args.role : 'implementer';
+      // A project Brain coordinates; it never becomes its own implementer or
+      // auditor. Self-assignment minted a real taskId/assignmentId for work done
+      // in the Brain's own window (or by its provider-native agents), which is
+      // exactly the participation IM.codes delegation exists to route to a
+      // separate, visible sub-session. Refuse before any task row is created.
+      const callerRecord = (await sendSessions()).find((session) => session.name === caller.sessionName);
+      if (callerRecord?.role === 'brain' && !callerRecord.parentSession
+        && (requestedRole === 'implementer' || requestedRole === 'auditor')) {
+        return error(
+          MCP_ERROR_REASONS.SCOPE_FORBIDDEN,
+          `a project Brain cannot assign ${requestedRole} work to itself; dispatch it to a non-self IM.codes sub-session with send_message and task`,
+        );
+      }
+      const requestedTaskId = stringArg(args, 'taskId')?.trim();
+      const existing = requestedTaskId ? registry.get(requestedTaskId) : undefined;
+      // taskId is a reference, never a create hint. Missing, cross-project and
+      // non-participant tasks share one refusal so this tool cannot probe the
+      // registry or silently mint a replacement task.
+      if (requestedTaskId && (
+        !existing
+        || existing.projectName !== projectName
+        || !supervisionCallerParticipates(existing, identity, projectName)
+      )) {
+        return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'task is not visible to this caller');
+      }
+      const classification = typeof args.classification === 'string'
+        ? args.classification as never
+        : 'integration_slice';
+      const taskAuditPolicy = isAuditableSupervisionTaskClassification(classification)
+        ? supervisionTaskAuditPolicyFromSnapshot(
+            resolveProjectAuthoritativeSupervisionSnapshot(projectName, await sendSessions()),
+          )
+        : undefined;
+      const task = existing
+        ? { ok: true as const, value: existing, replay: true as const }
+        : registry.createOrGet({
+            projectName,
+            topLevelTaskId: stringArg(args, 'topLevelTaskId'),
+            classification,
+            objective: stringArg(args, 'objective'),
+            acceptance: stringArrayArg(args, 'acceptance'),
+            ...(taskAuditPolicy ? { auditPolicy: taskAuditPolicy } : {}),
+            idempotencyKey: stringArg(args, 'idempotencyKey'),
+          });
+      if (!task.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `task_start rejected: ${task.reason}`);
+      if (existing && requestedRole === 'implementer') {
+        const active = existing.assignments.filter((assignment) => (
+          assignment.role === 'implementer'
+          && !['cancelled', 'blocked', 'ready_for_audit', 'ready_for_integration', 'committed', 'pushed', 'finalized']
+            .includes(assignment.status)
+        ));
+        if (active.length > 0) {
+          const same = active.length === 1
+            && active[0]!.identity.sessionName === identity.sessionName
+            && active[0]!.identity.sessionInstanceId === identity.sessionInstanceId
+            && active[0]!.identity.runtimeEpoch === identity.runtimeEpoch
+            && active[0]!.identity.agentType === identity.agentType
+            && active[0]!.identity.providerFamily === identity.providerFamily;
+          return same
+            ? {
+                status: 'ok', taskId: task.value.taskId,
+                assignmentId: active[0]!.assignmentId, idempotentReplay: true,
+              }
+            : error(
+                MCP_ERROR_REASONS.VALIDATION_FAILED,
+                'existing task continuation must use send_message deliveryMode=append; task_start cannot mint another implementer assignment',
+              );
+        }
+      }
+      const assignment = registry.createAssignment({
+        taskId: task.value.taskId,
+        role: requestedRole as never,
+        identity,
+        scopeFiles: stringArrayArg(args, 'scopeFiles'),
+        idempotencyKey: stringArg(args, 'idempotencyKey'),
+      });
+      if (!assignment.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `assignment rejected: ${assignment.reason}`);
+      return { status: 'ok', taskId: task.value.taskId, assignmentId: assignment.value.assignmentId, idempotentReplay: task.replay === true || assignment.replay === true };
+    },
+    [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_UPDATE]: async (input) => {
+      // Intent-only compatibility shim: the caller supplies metadata, never a
+      // lifecycle destination. The daemon derives the status from the intent.
+      const mapped = mapLegacySupervisionUpdate(input);
+      if (!mapped.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, mapped.detail);
+      const identity = await supervisionTaskIdentity();
+      if (!identity) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'supervision task caller identity is unavailable');
+      const registry = getSupervisionTaskRegistry();
+      const existing = registry.getAssignment(mapped.assignmentId);
+      if (!existing) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'task_update rejected: not_found');
+      const outcome = resolveSupervisionIntent({
+        request: { intent: mapped.intent, taskId: existing.taskId, assignmentId: mapped.assignmentId },
+        currentStatus: existing.status,
+      });
+      if (!outcome.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `task_update rejected: ${outcome.refusal}`);
+      const updated = registry.updateAssignment({
+        assignmentId: mapped.assignmentId, identity,
+        status: (outcome.toStatus ?? existing.status) as never,
+        revision: mapped.metadata.revision,
+        auditAttemptId: mapped.metadata.auditAttemptId,
+        auditRevision: mapped.metadata.auditRevision,
+        verdict: mapped.metadata.verdict,
+        blocker: mapped.metadata.blocker,
+        externalRunId: mapped.metadata.externalRunId,
+        externalHeadSha: mapped.metadata.externalHeadSha,
+        externalTaskId: mapped.metadata.externalTaskId,
+      });
+      return updated.ok ? { status: 'ok', item: updated.value } : error(MCP_ERROR_REASONS.VALIDATION_FAILED, `task_update rejected: ${updated.reason}`);
+    },
+    [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH]: async (input) => {
+      // Legacy assignment-only finish remains compatible; it can never close
+      // a whole integration task from evidence prose.
+      const mapped = mapLegacySupervisionFinish(input);
+      if (!mapped.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, mapped.detail);
+      const identity = await supervisionTaskIdentity();
+      if (!identity) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'supervision task caller identity is unavailable');
+      const registry = getSupervisionTaskRegistry();
+      const existing = registry.getAssignment(mapped.assignmentId);
+      if (!existing) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'task_finish rejected: not_found');
+      // Caller revision authority is mandatory for every legacy finish shape,
+      // including cancelled completion evidence; it is never inferred.
+      const expectedRevision = typeof mapped.metadata.revision === 'string' ? mapped.metadata.revision.trim() : '';
+      if (!expectedRevision) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'task_finish rejected: expected_revision_required');
+      }
+      if (existing.status === 'cancelled' && existing.role !== 'auditor' && existing.role !== 'coordinator') {
+        const inspected = await inspectSupervisionAssignmentWorktree({
+          sessionName: existing.identity.sessionName,
+          assignmentId: existing.assignmentId,
+        });
+        if (!inspected.ok || inspected.snapshot.files.length === 0) {
+          return error(MCP_ERROR_REASONS.VALIDATION_FAILED,
+            `task_finish rejected: ${inspected.ok ? 'manifest_mismatch' : inspected.reason}`);
+        }
+        const evidence = registry.recordCancelledCompletionEvidence({
+          taskId: existing.taskId,
+          assignmentId: existing.assignmentId,
+          identity,
+          revision: expectedRevision,
+          worktreeSnapshot: inspected.snapshot,
+          evidence: mapped.metadata.evidence,
+        });
+        return evidence.ok
+          ? { status: 'ok', item: evidence.value }
+          : error(MCP_ERROR_REASONS.VALIDATION_FAILED, `task_finish rejected: ${evidence.reason}`);
+      }
+      const updated = registry.finishAssignment({
+        assignmentId: mapped.assignmentId,
+        identity,
+        expectedRevision,
+        evidence: mapped.metadata.evidence,
+      });
+      if (!updated.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `task_finish rejected: ${updated.reason}`);
+      // Same event, same single wire as the intent path: a legacy
+      // assignment-only finish must not need a Brain call or the next poll to
+      // carry the aggregate to its next automatic step.
+      await advanceSupervisionTaskAfterFinish(existing.taskId, deps.dispatchReadyAudit);
+      return { status: 'ok', item: updated.value };
+    },
+    [MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_PREFLIGHT]: async (input) => {
+      const parsed = integrationPreflightSchema.safeParse(input);
+      if (!parsed.success) {
+        return integrationRefusal('integration_preflight', zodIntegrationRefusals(parsed.error));
+      }
+      const pushRef = parseSupervisionIntegrationRemoteRef(parsed.data.pushRemoteRef);
+      if (!pushRef.ok) {
+        return integrationRefusal('integration_preflight', [{
+          code: 'invalid_format', field: 'pushRemoteRef', expected: pushRef.expected, actual: parsed.data.pushRemoteRef,
+        }]);
+      }
+      const identity = await supervisionTaskIdentity();
+      if (!identity) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'supervision task caller identity is unavailable');
+      const registry = getSupervisionTaskRegistry();
+      const owner = registry.getAssignment(parsed.data.assignmentId);
+      const task = owner ? registry.getTaskRecord(owner.taskId) : undefined;
+      if (!owner || !task?.integrationBundle) {
+        return integrationRefusal('integration_preflight', [{
+          code: 'bundle_mismatch', field: 'bundle',
+          expected: 'existing assignment with immutable integration bundle',
+          actual: owner ? 'missing bundle' : 'missing assignment',
+        }]);
+      }
+      // Authorize the exact caller before touching the owner worktree.
+      const preflightAuthority = integrationCallerAuthorityRefusals({
+        owner, identity, integrationOwner: parsed.data.integrationOwner,
+      });
+      if (preflightAuthority.length > 0) return integrationRefusal('integration_preflight', preflightAuthority);
+      const inspected = await inspectSupervisionAssignmentWorktree({
+        sessionName: owner.identity.sessionName,
+        assignmentId: owner.assignmentId,
+      });
+      if (!inspected.ok) {
+        return integrationRefusal('integration_preflight', [{
+          code: 'bundle_mismatch', field: 'bundle', expected: 'available safe worktree', actual: inspected.reason,
+        }]);
+      }
+      const files = new Map(inspected.snapshot.files.map((file) => [file.path, file]));
+      const mismatch = task.integrationBundle.files.find((file) => {
+        const actual = files.get(file.path);
+        return file.deleted === true
+          ? actual?.deleted !== true
+          : actual?.sha256 !== file.sha256 || actual?.deleted === true;
+      });
+      if (inspected.snapshot.headSha !== task.integrationBundle.headSha || mismatch) {
+        return integrationRefusal('integration_preflight', [{
+          code: 'bundle_mismatch', field: 'bundle',
+          expected: `${task.integrationBundle.headSha}:${mismatch?.path ?? 'exact manifest'}`,
+          actual: `${inspected.snapshot.headSha}:${mismatch?.path ?? 'head mismatch'}`,
+        }]);
+      }
+      const authoritativeOwnedFiles = task.integrationBundle.files.map((file) => file.path);
+      const authoritativeManifest = task.integrationBundle.files.flatMap((file) => (
+        file.deleted === true || !file.sha256 ? [] : [{ path: file.path, sha256: file.sha256 }]
+      ));
+      const attributionRefusals = integrationAttributionRefusals(input, {
+        ownedFiles: authoritativeOwnedFiles,
+        integrationManifest: authoritativeManifest,
+      });
+      if (attributionRefusals.length > 0) {
+        return integrationRefusal('integration_preflight', attributionRefusals);
+      }
+      const authoritativeEvidence = {
+        ...parsed.data,
+        ownedFiles: authoritativeOwnedFiles,
+        integrationManifest: authoritativeManifest,
+        stagedPaths: inspected.snapshot.stagedPaths,
+        conflictedPaths: inspected.snapshot.conflictedPaths,
+        untrackedOtherOwnerPaths: parsed.data.untrackedOtherOwnerPaths ?? [],
+      };
+      const preflight = registry.preflightIntegration({
+        assignmentId: owner.assignmentId,
+        identity,
+        evidence: authoritativeEvidence,
+        inspectedHeadSha: inspected.snapshot.headSha,
+        expectedPushRemoteRef: parsed.data.pushRemoteRef,
+      });
+      return preflight.ok
+        ? {
+          status: 'ok',
+          preflightToken: preflight.value.preflightToken,
+          ownerPreparation: preflight.value.ownerPreparation,
+          authority: {
+            taskId: task.taskId,
+            assignmentId: owner.assignmentId,
+            revision: parsed.data.revision,
+            auditAttemptId: parsed.data.auditAttemptId,
+            bundleManifestSha256: task.integrationBundle.manifestSha256,
+            bundleHeadSha: task.integrationBundle.headSha,
+          },
+        }
+        : integrationRefusal('integration_preflight', preflight.refusals);
+    },
+    [MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE]: async (input) => {
+      const parsed = integrationFinalizationSchema.safeParse(input);
+      if (!parsed.success) {
+        return integrationRefusal('integration_finalize', zodIntegrationRefusals(parsed.error));
+      }
+      // Pure field-level validation first (no registry, worktree or Git): an
+      // option-shaped pushRemoteRef or a CI status missing its exact run fields
+      // is refused naming each field, before any authority or side effect.
+      const structural = validateSupervisionIntegrationEvidence({
+        operation: 'finalize',
+        evidence: {
+          ...parsed.data,
+          ownedFiles: parsed.data.ownedFiles ?? [],
+          integrationManifest: parsed.data.integrationManifest ?? [],
+          stagedPaths: parsed.data.stagedPaths ?? [],
+          conflictedPaths: parsed.data.conflictedPaths ?? [],
+          untrackedOtherOwnerPaths: parsed.data.untrackedOtherOwnerPaths ?? [],
+        },
+      });
+      if (!structural.ok) return integrationRefusal('integration_finalize', structural.refusals);
+      if (parsed.data.pushResult === 'pushed' && !parsed.data.preflightToken) {
+        return integrationRefusal('integration_finalize', [{
+          code: 'missing_field', field: 'preflightToken',
+          expected: 'pre-Git authority token unless pushResult=already_present',
+        }]);
+      }
+      const identity = await supervisionTaskIdentity();
+      if (!identity) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'supervision task caller identity is unavailable');
+      const registry = getSupervisionTaskRegistry();
+      const owner = registry.getAssignment(parsed.data.assignmentId);
+      const task = owner ? registry.getTaskRecord(owner.taskId) : undefined;
+      if (!owner || !task?.integrationBundle) {
+        return integrationRefusal('integration_finalize', [{
+          code: owner ? 'bundle_mismatch' : 'identity_mismatch',
+          field: owner ? 'bundle' : 'assignmentId',
+          expected: owner ? 'existing immutable integration bundle' : 'existing integration owner',
+          actual: owner ? 'missing bundle' : parsed.data.assignmentId,
+        }]);
+      }
+      // Authorize the exact caller/owner BEFORE any Git subprocess (commit
+      // verification, worktree inspection, remote fetch).
+      const finalizeAuthority = integrationCallerAuthorityRefusals({
+        owner, identity, integrationOwner: parsed.data.integrationOwner,
+      });
+      if (finalizeAuthority.length > 0) return integrationRefusal('integration_finalize', finalizeAuthority);
+      const authoritativeOwnedFiles = task.integrationBundle.files.map((file) => file.path);
+      const authoritativeManifest = task.integrationBundle.files.flatMap((file) => (
+        file.deleted === true || !file.sha256 ? [] : [{ path: file.path, sha256: file.sha256 }]
+      ));
+      const attributionRefusals = integrationAttributionRefusals(input, {
+        ownedFiles: authoritativeOwnedFiles,
+        integrationManifest: authoritativeManifest,
+      });
+      if (attributionRefusals.length > 0) {
+        return integrationRefusal('integration_finalize', attributionRefusals);
+      }
+      // An exact replay is decided solely from the committed durable ledger.
+      // Do not make it depend on a worktree or remote that may legitimately be
+      // gone after terminal cleanup; the registry still rechecks caller,
+      // token, and the complete finalization fingerprint.
+      if (task.status === 'finalized' && task.finalization) {
+        const replayed = registry.finalizeIntegration({
+          ...parsed.data,
+          ownedFiles: authoritativeOwnedFiles,
+          integrationManifest: authoritativeManifest,
+          stagedPaths: parsed.data.stagedPaths ?? [],
+          conflictedPaths: parsed.data.conflictedPaths ?? [],
+          untrackedOtherOwnerPaths: parsed.data.untrackedOtherOwnerPaths ?? [],
+          inspectedHeadSha: task.integrationBundle.headSha,
+          identity,
+        });
+        return replayed.ok
+          ? { status: 'ok', item: replayed.value, idempotentReplay: replayed.replay === true }
+          : replayed.reason === 'integration_refused'
+            ? integrationRefusal('integration_finalize', replayed.refusals)
+            : integrationRegistryRefusal('integration_finalize', replayed.reason);
+      }
+      let inspected: Awaited<ReturnType<typeof inspectSupervisionAssignmentWorktree>> | undefined;
+      if (task.integrationBundle) {
+        const verified = verifySupervisionIntegrationCommit({
+          bundle: task.integrationBundle,
+          worktreePath: resolveSupervisionAssignmentWorktree({
+            sessionName: owner!.identity.sessionName,
+            assignmentId: owner!.assignmentId,
+          }),
+          commitSha: parsed.data.commitSha,
+        });
+        if (!verified.ok) {
+          return integrationRefusal('integration_finalize', [{
+            code: 'bundle_mismatch', field: 'bundle', expected: 'exact immutable bundle commit',
+            actual: `${verified.reason}${verified.path ? `:${verified.path}` : ''}`,
+          }]);
+        }
+        inspected = await inspectSupervisionAssignmentWorktree({
+          sessionName: owner!.identity.sessionName,
+          assignmentId: owner!.assignmentId,
+        });
+        if (!inspected.ok) {
+          return integrationRefusal('integration_finalize', [{
+            code: 'remote_drift', field: 'remoteCommit',
+            expected: `${parsed.data.pushRemoteRef}@${parsed.data.commitSha}`,
+            actual: inspected.reason,
+          }]);
+        }
+      }
+      const remoteObservation: SupervisionIntegrationRemoteObservation = owner && inspected?.ok
+        ? await observeSupervisionIntegrationRemote({
+          worktreePath: resolveSupervisionAssignmentWorktree({
+            sessionName: owner.identity.sessionName,
+            assignmentId: owner.assignmentId,
+          }),
+          requestedRef: parsed.data.pushRemoteRef,
+          requestedCommitSha: parsed.data.commitSha,
+          exec: deps.integrationGitExec,
+        })
+        : { status: 'unavailable', stage: 'not_observed', cause: 'git_error' };
+      // Never authorize finalization from a possibly stale local
+      // remote-tracking ref. The bounded fetch above is the provenance
+      // observation; an operational failure is observation_unavailable (fail
+      // closed, retryable), and only an actual observation can prove drift.
+      const explicitRemote = remoteObservation.status === 'observed' ? remoteObservation : undefined;
+      const observedRemoteCommitSha = explicitRemote?.commitSha ?? undefined;
+      const observedRemoteRef = explicitRemote?.ref;
+      const finalized = registry.finalizeIntegration({
+        ...parsed.data,
+        // Keep the persisted record shape stable. Invalid caller metadata was
+        // reduced to an empty record above and never supplies authorization.
+        ownedFiles: authoritativeOwnedFiles,
+        integrationManifest: authoritativeManifest,
+        stagedPaths: inspected?.ok ? inspected.snapshot.stagedPaths : parsed.data.stagedPaths ?? [],
+        conflictedPaths: inspected?.ok ? inspected.snapshot.conflictedPaths : parsed.data.conflictedPaths ?? [],
+        untrackedOtherOwnerPaths: parsed.data.untrackedOtherOwnerPaths ?? [],
+        inspectedHeadSha: task?.integrationBundle?.headSha,
+        observedRemoteRef,
+        observedRemoteCommitSha,
+        observedPushMatchesRequestedRemote: Boolean(
+          observedRemoteCommitSha === parsed.data.commitSha
+          && equivalentIntegrationRemoteRef(observedRemoteRef, parsed.data.pushRemoteRef)
+        ),
+        observedPushContainsRequestedCommit: Boolean(
+          explicitRemote?.containsRequestedCommit
+          && equivalentIntegrationRemoteRef(observedRemoteRef, parsed.data.pushRemoteRef)
+        ),
+        remoteObservation,
+        identity,
+      });
+      return finalized.ok
+        ? { status: 'ok', item: finalized.value, idempotentReplay: finalized.replay === true }
+        : finalized.reason === 'integration_refused'
+          ? integrationRefusal('integration_finalize', finalized.refusals)
+          : integrationRegistryRefusal('integration_finalize', finalized.reason);
+    },
+    [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['assignmentId', 'filePath', 'operation', 'beforeHash', 'afterHash', 'tool', 'source', 'idempotencyKey']);
+      const identity = await supervisionTaskIdentity();
+      if (!identity) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'supervision task caller identity is unavailable');
+      const assignmentId = stringArg(args, 'assignmentId');
+      const path = stringArg(args, 'filePath');
+      const operation = stringArg(args, 'operation');
+      if (!assignmentId || !path || !operation) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'assignmentId, filePath and operation are required');
+      // A controlled file event from the recipient of a delegated implementer
+      // assignment is execution evidence: start it first, fail closed if it
+      // cannot start (an unstartable assignment must not accumulate work).
+      const bound = getSupervisionTaskRegistry().getAssignment(assignmentId);
+      if (bound?.role === 'implementer' && bound.status === 'delegated' && bound.identity.sessionName === identity.sessionName) {
+        const sessions = await sendSessions();
+        const record = sessions.find((session) => session.name === identity.sessionName);
+        const projectName = record ? resolveEffectiveProjectName(record, sessions) : undefined;
+        if (projectName) {
+          const started = autoStartAssignmentFromAck({
+            taskId: bound.taskId,
+            assignmentId,
+            projectName,
+            callerIdentity: identity,
+            evidence: SUPERVISION_ASSIGNMENT_START_EVIDENCE.FILE_EVENT,
+            evidenceEventId: `supervision_task_file_event:${operation}:${path}`,
+          });
+          if (started.status === 'refused' || started.status === 'held') {
+            const refused = describeAssignmentStartRefusal(
+              started.status === 'refused' ? started.refusal : SUPERVISION_ASSIGNMENT_START_HELD,
+            );
+            return error(refused.reason, refused.detail);
+          }
+        }
+      }
+      const recorded = getSupervisionTaskRegistry().recordFileEvent({ assignmentId, path, operation: operation as never, identity, beforeHash: stringArg(args, 'beforeHash'), afterHash: stringArg(args, 'afterHash'), tool: stringArg(args, 'tool'), source: stringArg(args, 'source'), idempotencyKey: stringArg(args, 'idempotencyKey') });
+      return recorded.ok ? { status: 'ok', item: recorded.value } : error(MCP_ERROR_REASONS.VALIDATION_FAILED, `task_file_event rejected: ${recorded.reason}`);
     },
     [MEMORY_MCP_TOOL_NAMES.SEND_STOP]: async (input) => {
       const sessions = await sendSessions();
@@ -1486,7 +3021,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const args = pickAllowedMcpArgs(input, ['machine', 'command', 'shell', 'timeoutMs']);
       const machine = machineArg(args);
       const command = stringArg(args, 'command');
-      if (!machine) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'machine must be a valid stable ref_name');
+      if (!machine) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'machine must be a canonical nodeId or deprecated legacy alias');
       if (!command) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'command is required');
       if (utf8ByteLength(command) > REMOTE_EXEC_MAX_COMMAND_BYTES) {
         return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `command must be at most ${REMOTE_EXEC_MAX_COMMAND_BYTES} UTF-8 bytes`);
@@ -1528,7 +3063,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const args = pickAllowedMcpArgs(input, ['machine', 'sourcePath']);
       const machine = machineArg(args);
       const sourcePath = stringArg(args, 'sourcePath');
-      if (!machine || !sourcePath) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'a valid machine ref_name and sourcePath are required');
+      if (!machine || !sourcePath) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'a canonical nodeId (or deprecated legacy alias) and sourcePath are required');
       if (utf8ByteLength(sourcePath) > FILE_TRANSFER_PATH_MAX_BYTES) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'sourcePath is too long');
       const result = await deps.machineDeps.sendFileToMachine({
         machine,
@@ -1547,7 +3082,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const sourcePath = stringArg(args, 'sourcePath');
       const destinationPath = stringArg(args, 'destinationPath');
       const overwrite = boolArg(args, 'overwrite') ?? false;
-      if (!machine || !sourcePath || !destinationPath) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'a valid machine ref_name, sourcePath, and destinationPath are required');
+      if (!machine || !sourcePath || !destinationPath) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'a canonical nodeId (or deprecated legacy alias), sourcePath, and destinationPath are required');
       if (utf8ByteLength(sourcePath) > FILE_TRANSFER_PATH_MAX_BYTES || utf8ByteLength(destinationPath) > FILE_TRANSFER_PATH_MAX_BYTES) {
         return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'file path is too long');
       }
@@ -1583,7 +3118,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const args = pickAllowedMcpArgs(input, ['machine', 'tool', 'arguments', 'timeoutMs']);
       const machine = machineArg(args);
       const toolRaw = stringArg(args, 'tool');
-      if (!machine) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'machine must be a valid stable ref_name or local alias');
+      if (!machine) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'machine must be a canonical nodeId, deprecated legacy alias, or local alias');
       if (!toolRaw || !(COMPUTER_USE_TOOLS as readonly string[]).includes(toolRaw)) {
         return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `tool must be one of ${COMPUTER_USE_TOOLS.join(', ')}`);
       }
@@ -1614,7 +3149,13 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         ? { status: 'ok', outcome: result.outcome }
         : { status: 'ok', outcome: result.outcome, result: result.result };
     },
-  });
+  };
+  if (deps.invokeDaemonMemoryTool) {
+    for (const name of MEMORY_MCP_DAEMON_TOOL_NAMES) {
+      handlers[name] = (input) => deps.invokeDaemonMemoryTool!(name, input);
+    }
+  }
+  return wrapHandlers(handlers);
 }
 
 function wrapHandlers(handlers: Record<MemoryMcpToolName, MemoryMcpToolHandler>): Record<MemoryMcpToolName, MemoryMcpToolHandler> {
@@ -1661,6 +3202,7 @@ function computerUseTopLevelContent(result: ToolResult): CallToolResult['content
       )),
     },
   };
+
   return [
     { type: 'text', text: JSON.stringify(textResult) },
     ...images.map((item) => ({ type: 'image' as const, data: item.data, mimeType: item.mimeType })),
@@ -1693,31 +3235,31 @@ const schemas = {
     kind: z.enum(['projection', 'observation']).optional().describe('Kind from sourceLookup.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.ARCHIVE_MEMORY]: z.object({
-    projectionId: z.string().optional().describe('Projection id to archive.'),
+    projectionId: z.string().optional(),
     ref: z.string().optional().describe('Compact proj: ref.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.RESTORE_MEMORY]: z.object({
-    projectionId: z.string().optional().describe('Projection id to restore.'),
+    projectionId: z.string().optional(),
     ref: z.string().optional().describe('Compact proj: ref.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.DELETE_MEMORY]: z.object({
-    projectionId: z.string().optional().describe('Projection id to delete.'),
+    projectionId: z.string().optional(),
     ref: z.string().optional().describe('Compact proj: ref.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.UPDATE_MEMORY]: z.object({
-    projectionId: z.string().optional().describe('Projection id to update.'),
+    projectionId: z.string().optional(),
     ref: z.string().optional().describe('Compact proj: ref.'),
     text: z.string().describe('Replacement summary.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.MEMORY_FEEDBACK]: z.object({
-    projectionId: z.string().optional().describe('Projection id.'),
+    projectionId: z.string().optional(),
     ref: z.string().optional().describe('Compact proj: ref.'),
     feedback: z.enum(['not_relevant', 'relevant']).describe('Archive or strengthen ranking.'),
-    reason: z.string().optional().describe('Short audit reason.'),
+    reason: z.string().optional(),
   }),
   [MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION]: z.object({
     content: z.string().describe('Durable fact or decision.'),
-    tags: z.array(z.string()).optional().describe('Short tags.'),
+    tags: z.array(z.string()).optional(),
     turnId: z.string().optional().describe('Source turn/event id.'),
     idempotencyKey: z.string().optional().describe('Retry key.'),
   }),
@@ -1725,10 +3267,58 @@ const schemas = {
     text: z.string().describe('Stable preference text.'),
     idempotencyKey: z.string().optional().describe('Retry key.'),
   }),
+  [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_GET]: z.object({
+    target: z.string().optional().describe('Exact session name; defaults to the current session.'),
+  }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET]: z.object({
+    identityScope: z.enum(SESSION_IDENTITY_SCOPE_LIST),
+    target: z.string().optional().describe('Exact session name used to resolve project/session scope.'),
+    content: z.string().optional().describe('Inline identity contract.'),
+    filePath: z.string().optional().describe('UTF-8 identity file. User/project scope is project-relative; session scope also accepts an absolute daemon-host path.'),
+    expectedRevision: z.number().int().nonnegative().optional(),
+  }).strict().superRefine((value, context) => {
+    if (Boolean(value.content) === Boolean(value.filePath)) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: 'provide exactly one of content or filePath' });
+    }
+  }),
+  [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_CLEAR]: z.object({
+    identityScope: z.enum(SESSION_IDENTITY_SCOPE_LIST),
+    target: z.string().optional().describe('Exact session name used to resolve project/session scope.'),
+    expectedRevision: z.number().int().nonnegative().optional(),
+  }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_REFRESH]: z.object({
+    target: z.string().optional().describe('Exact session name; defaults to the current session.'),
+  }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.SESSION_RESTART]: z.object({
+    target: z.string().trim().min(1).describe('Exact session name.'),
+    reset: z.boolean().optional().describe('False/omitted: resume. True: start over.'),
+  }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_LIST]: z.object({
+    includeDisabled: z.boolean().optional(),
+  }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_SET]: z.object({
+    id: z.string().regex(/^[a-f0-9]{32}$/u).optional(),
+    verificationScope: z.enum(VERIFICATION_MACHINE_SCOPE_LIST),
+    alias: z.string(),
+    kind: z.enum(VERIFICATION_MACHINE_KIND_LIST),
+    target: z.string(),
+    enabled: z.boolean().optional(),
+    expectedRevision: z.number().int().nonnegative().optional(),
+  }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_REMOVE]: z.object({
+    id: z.string().regex(/^[a-f0-9]{32}$/u),
+    expectedRevision: z.number().int().nonnegative().optional(),
+  }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_VERIFY]: z.object({
+    id: z.string().regex(/^[a-f0-9]{32}$/u),
+  }).strict(),
   [MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY]: z.object({
+    taskId: z.string(),
+    assignmentId: z.string(),
     attemptId: z.string(),
-    replyCapability: z.string(),
-    verdict: z.enum(['PASS', 'REWORK']),
+    revision: z.string(),
+    receiptKind: z.enum(['progress', 'final']),
+    verdict: z.enum(['PASS', 'REWORK']).optional(),
     findings: z.string(),
     validations: z.array(z.object({
       kind: z.enum(PEER_AUDIT_VALIDATION_KINDS),
@@ -1739,78 +3329,117 @@ const schemas = {
   }).strict(),
   [MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY]: z.object({
     delegationId: z.string(),
-    replyCapability: z.string(),
     result: z.string(),
   }).strict(),
   [MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]: z.object({
-    query: z.string().optional().describe('Case-insensitive name/display-label filter.'),
-    limit: z.number().int().min(1).max(100).optional().describe('Maximum targets.'),
+    query: z.string().optional().describe('Name/label filter.'),
+    limit: z.number().int().min(1).max(100).optional().describe('Max targets.'),
+    executionPool: z.enum(SUPERVISION_EXECUTION_POOL_KINDS).optional()
+      .describe('Optional primary/economy filter; omit for all siblings.'),
   }),
+  [MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]: z.object({}).strict(),
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: z.object({
-    target: z.string().describe('Exact send_list_targets target; never the caller.'),
-    message: z.string().describe('Complete task/request and expected output.'),
-    files: z.array(z.string()).optional().describe('Project-root path refs; no file bytes.'),
-    reply: z.boolean().optional().describe('Request a reply/report.'),
+    target: z.string().optional().describe('Exact target; omit only for autoProvision.'),
+    message: z.string().describe('Request and expected output.'),
+    deliveryMode: z.enum(Object.values(MEMORY_MCP_SEND_DELIVERY_MODES) as [MemoryMcpSendDeliveryMode, ...MemoryMcpSendDeliveryMode[]])
+      .optional(),
+    files: z.array(z.string()).optional(),
+    reply: z.boolean().optional(),
+    task: z.object({
+      taskId: z.string().optional(), assignmentId: z.string().optional(), topLevelTaskId: z.string().optional(), sliceId: z.string().optional(), classification: z.enum(SUPERVISION_TASK_CLASSIFICATIONS).optional(),
+      objective: z.string().optional(), acceptance: z.array(z.string()).optional(), ownedFiles: z.array(z.string()).optional(), sharedFiles: z.array(z.string()).optional(), dependencies: z.array(z.string()).optional(),
+      integrationOwner: z.string().optional(), baseRevision: z.string().optional(), currentRevision: z.string().optional(), auditAttemptId: z.string().optional(), auditRevision: z.string().optional(),
+      auditPolicy: z.enum(SUPERVISION_TASK_AUDIT_POLICIES).optional(),
+      executionPool: z.enum(['primary', 'economy']).optional(), autoProvision: z.literal(true).optional(),
+      requestedExecutionType: z.object({
+        capabilityId: z.string(),
+        agentType: z.string(),
+        providerFamily: z.string(),
+        runtimeType: z.enum(['process', 'transport']),
+        model: z.string(),
+        ccPresetId: z.string().min(1).optional(),
+      }).strict().optional(),
+    }).strict().optional(),
+    identity: z.object({
+      content: z.string().optional().describe('Inline session-scoped Agent identity contract.'),
+      filePath: z.string().max(SESSION_IDENTITY_SOURCE_FILE_MAX_CHARS).optional()
+        .describe('Local identity file path. Relative paths resolve from the caller project; absolute paths are allowed for session-scoped startup identity.'),
+    }).strict().refine((value) => Boolean(value.content?.trim()) !== Boolean(value.filePath?.trim()), {
+      message: 'provide exactly one of content or filePath',
+    }).describe('Startup identity for an auto-provisioned Agent. Provide exactly one of content or filePath.').optional(),
     audit: z.object({
       kind: z.literal(AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT),
       attemptId: z.string().min(1),
-    }).strict().optional().describe('Automatic supervision audit metadata; requires reply=true and one exact target.'),
-    broadcast: z.boolean().optional().describe('Only when the user asks every/all sessions.'),
-    idempotencyKey: z.string().optional().describe('Accepted-send replay key.'),
+      auditedSessionName: z.string().min(1).describe('Audited session.'),
+      strictCrossVendor: z.literal(true).optional().describe('Forbid same-family degradation.'),
+    }).strict().optional().describe('Audit metadata; requires reply and exact target.'),
+    broadcast: z.boolean().optional().describe('All sessions only.'),
+    idempotencyKey: z.string().optional().describe('Replay key.'),
     clone: z.object({
-      kind: z.literal(EXECUTION_CLONE_KIND).describe('Clone kind.'),
-      ephemeral: z.literal(true).describe('Always true.'),
-      parentRunId: z.string().min(1).describe('Owning parent run id.'),
-      parentStage: z.enum(EXECUTION_CLONE_PARENT_STAGES).describe('Creating parent stage.'),
-    }).strict().optional().describe('Route to a new ephemeral target clone; returns clone.target; forbids broadcast.'),
+      kind: z.literal(EXECUTION_CLONE_KIND),
+      ephemeral: z.literal(true),
+      parentRunId: z.string().min(1),
+      parentStage: z.enum(EXECUTION_CLONE_PARENT_STAGES),
+    }).strict().optional().describe('Fresh ephemeral clone; no broadcast.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE]: z.object({
     target: z.string().describe('Exact result.clone.target.'),
     idempotencyKey: z.string().optional().describe('Accepted-destroy replay key.'),
   }),
+
+  [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START]: z.object({
+    taskId: z.string().optional(), topLevelTaskId: z.string().optional(), classification: z.enum(SUPERVISION_TASK_CLASSIFICATIONS).optional(),
+    role: z.enum(['coordinator', 'integration_owner', 'implementer', 'auditor']), objective: z.string(), acceptance: z.array(z.string()).optional(),
+    scopeFiles: z.array(z.string()).optional(), idempotencyKey: z.string().optional(),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_UPDATE]: z.object({ assignmentId: z.string(), revision: z.string().optional(), auditAttemptId: z.string().optional(), auditRevision: z.string().optional(), verdict: z.string().optional(), blocker: z.string().optional(), externalRunId: z.string().optional(), externalHeadSha: z.string().optional(), externalTaskId: z.string().optional() }),
+  [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH]: legacySupervisionFinishSchema,
+  [MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_PREFLIGHT]: integrationPreflightSchema,
+  [MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE]: integrationFinalizationSchema,
+  [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FILE_EVENT]: z.object({ assignmentId: z.string(), filePath: z.string(), operation: z.enum(SUPERVISION_TASK_FILE_OPERATIONS), beforeHash: z.string().optional(), afterHash: z.string().optional(), tool: z.string().optional(), source: z.string().optional(), idempotencyKey: z.string().optional() }),
   [MEMORY_MCP_TOOL_NAMES.SEND_STOP]: z.object({
-    target: z.string().optional().describe('Exact sibling target; required unless broadcast.'),
-    broadcast: z.boolean().optional().describe('Stop all sendable siblings.'),
-    idempotencyKey: z.string().optional().describe('Accepted-stop replay key.'),
+    target: z.string().optional().describe('Exact target unless broadcast.'),
+    broadcast: z.boolean().optional().describe('Stop all siblings.'),
+    idempotencyKey: z.string().optional().describe('Replay key.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF]: z.object({
     cronExpr: z.string().describe(`${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES}-minute minimum interval.`),
-    message: z.string().describe('Message to this session.'),
-    name: z.string().optional().describe('Job name; derived from message by default.'),
-    timezone: z.string().optional().describe('Schedule timezone.'),
-    expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Epoch-ms or explicit-offset ISO expiration.'),
+    message: z.string(),
+    name: z.string().optional().describe('Optional job name.'),
+    timezone: z.string().optional(),
+    expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Epoch-ms/ISO expiry.'),
     completionPolicy: z.enum([
       CRON_COMPLETION_POLICY.RECURRING,
       CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
-    ]).optional().describe('Defaults to recurring; use until_complete only for a bounded overall goal.'),
+    ]).optional().describe('recurring or bounded until_complete.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF]: z.object({
     id: z.string().describe('Current-session job id.'),
-    cronExpr: z.string().optional().describe(`Replacement schedule; ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES}-minute minimum.`),
-    message: z.string().optional().describe('Replacement wake-up message.'),
-    name: z.string().optional().describe('Replacement name.'),
-    timezone: z.string().optional().describe('Replacement timezone.'),
-    expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Replacement epoch-ms/offset-ISO expiration.'),
+    cronExpr: z.string().optional().describe(`Schedule; ≥${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES} min.`),
+    message: z.string().optional().describe('Wakeup message.'),
+    name: z.string().optional(),
+    timezone: z.string().optional(),
+    expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Epoch-ms/ISO expiry.'),
     completionPolicy: z.enum([
       CRON_COMPLETION_POLICY.RECURRING,
       CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
-    ]).optional().describe('Replacement lifecycle policy.'),
-    force: z.boolean().optional().describe('Required to change recurring to until_complete.'),
+    ]).optional().describe('Lifecycle policy.'),
+    force: z.boolean().optional().describe('Required for recurring→until_complete.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF]: z.object({
-    id: z.string().optional().describe('Exact current-session job id.'),
-    name: z.string().optional().describe('Exact unique current-session job name.'),
-    all: z.boolean().optional().describe('Cancel every current-session job.'),
-    force: z.boolean().optional().describe('Required for recurring jobs; use only after an explicit user request.'),
+    id: z.string().optional().describe('Exact job id.'),
+    name: z.string().optional().describe('Exact unique job name.'),
+    all: z.boolean().optional().describe('Cancel all self jobs.'),
+    force: z.boolean().optional().describe('Required for recurring jobs.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.CRON_CREATE]: z.object({
-    name: z.string().describe('Job name.'),
+    name: z.string(),
     cronExpr: z.string().describe(`${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES}-minute minimum; every-minute schedules are invalid.`),
     projectName: z.string().optional().describe('Project; defaults to caller project.'),
     targetRole: z.string().optional().describe('Source role; defaults to project brain.'),
     targetSessionName: z.string().nullable().optional().describe('Source session; target resolves among its siblings and cannot be itself.'),
     action: z.record(z.string(), z.unknown()).describe('Send action: {type:"send", target, message, reply?, broadcast?, idempotencyKey?}.'),
-    timezone: z.string().optional().describe('Schedule timezone only.'),
+    timezone: z.string().optional(),
     expiresAt: z.union([z.number(), z.string(), z.null()]).optional().describe('Epoch-ms/offset-ISO, ≤90 days; affects future sends only.'),
     completionPolicy: z.enum([
       CRON_COMPLETION_POLICY.RECURRING,
@@ -1822,8 +3451,8 @@ const schemas = {
     limit: z.number().int().min(1).max(100).optional().describe('Page size.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.CRON_UPDATE]: z.object({
-    id: z.string().describe('Job id.'),
-    name: z.string().optional().describe('Replacement name.'),
+    id: z.string(),
+    name: z.string().optional(),
     cronExpr: z.string().optional().describe(`Replacement schedule; ${MEMORY_MCP_CAPS.CRON_MIN_INTERVAL_MINUTES}-minute minimum.`),
     projectName: z.string().optional().describe('Replacement project.'),
     targetRole: z.string().optional().describe('Replacement source role.'),
@@ -1838,33 +3467,33 @@ const schemas = {
     force: z.boolean().optional().describe('Required to change recurring to until_complete.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.CRON_DELETE]: z.object({
-    id: z.string().describe('Job id.'),
+    id: z.string(),
     force: z.boolean().optional().describe('Required for agent deletion of recurring jobs.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.LIST_MACHINES]: z.strictObject({
-    includeOffline: z.boolean().optional().describe('Include offline and exec-disabled machines; default false. Presence is advisory.'),
+    includeOffline: z.boolean().optional().describe('Include offline/exec-disabled machines; default false, advisory only.'),
   }),
   [MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE]: z.strictObject({
-    machine: machineTargetRuntimeSchema.describe('Bare stable ref_name or complete ^^(ref_name) marker; no list_machines preflight when known.'),
-    command: z.string().describe('One shell command.'),
-    shell: z.enum(REMOTE_EXEC_SHELLS).optional().describe('Shell.'),
-    timeoutMs: z.number().int().min(REMOTE_EXEC_MIN_TIMEOUT_MS).max(REMOTE_EXEC_MAX_TIMEOUT_MS).optional().describe('Timeout ms.'),
+    machine: machineTargetRuntimeSchema.describe('10-digit nodeId or ^^(nodeId); legacy alias is compatibility-only. No list_machines preflight.'),
+    command: z.string(),
+    shell: z.enum(REMOTE_EXEC_SHELLS).optional(),
+    timeoutMs: z.number().int().min(REMOTE_EXEC_MIN_TIMEOUT_MS).max(REMOTE_EXEC_MAX_TIMEOUT_MS).optional(),
   }),
   [MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE]: z.strictObject({
-    machine: machineTargetRuntimeSchema.describe('Bare stable ref_name or complete ^^(ref_name) marker.'),
+    machine: machineTargetRuntimeSchema.describe('10-digit nodeId or ^^(nodeId); legacy alias is compatibility-only.'),
     sourcePath: boundedUtf8String(FILE_TRANSFER_PATH_MAX_BYTES),
   }),
   [MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE]: z.strictObject({
-    machine: machineTargetRuntimeSchema.describe('Bare stable ref_name or complete ^^(ref_name) marker.'),
+    machine: machineTargetRuntimeSchema.describe('10-digit nodeId or ^^(nodeId); legacy alias is compatibility-only.'),
     sourcePath: boundedUtf8String(FILE_TRANSFER_PATH_MAX_BYTES),
     destinationPath: boundedUtf8String(FILE_TRANSFER_PATH_MAX_BYTES),
     overwrite: z.boolean().optional(),
   }),
   [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS]: z.strictObject({
-    topic: z.enum(COMPUTER_USE_DOC_TOPICS).describe('Documentation topic.'),
+    topic: z.enum(COMPUTER_USE_DOC_TOPICS),
   }),
   [MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL]: z.strictObject({
-    machine: machineTargetRuntimeSchema.describe('Bare stable ref_name, complete ^^(ref_name) marker, or local/localhost/self/this; do not preflight list_machines when known.'),
+    machine: machineTargetRuntimeSchema.describe('10-digit nodeId, ^^(nodeId), legacy alias, or local/self; no list_machines preflight.'),
     tool: z.enum(COMPUTER_USE_TOOLS).describe('Method name.'),
     arguments: z.record(z.string(), z.unknown()).optional().describe(`Method arguments. Windows coordinate drag additionally accepts duration_ms=${COMPUTER_USE_DRAG_DURATION_MIN_MS}..${COMPUTER_USE_DRAG_DURATION_MAX_MS}.`),
     timeoutMs: z.number().int().min(COMPUTER_USE_MIN_TIMEOUT_MS).max(COMPUTER_USE_SHELL_SESSION1_MAX_TIMEOUT_MS).optional().describe('Timeout ms; GUI/browser max 120000, shell_session1 max 900000.'),
@@ -1961,14 +3590,19 @@ export function listMemoryMcpToolDescriptors(role: NodeRole = NODE_ROLE.FULL) {
   return advertisedMcpToolNames(role).map((name) => MEMORY_MCP_TOOL_CONTRACTS[name]);
 }
 
-export function registerMemoryMcpTools(server: McpServer, caller: McpRuntimeCaller, deps: MemoryMcpToolDeps = {}): void {
+export function registerMemoryMcpTools(
+  server: McpServer,
+  caller: McpRuntimeCaller,
+  deps: MemoryMcpToolDeps = {},
+): ReadonlyMap<string, RegisteredTool> {
   const handlers = createMemoryMcpToolHandlers(caller, deps);
+  const registered = new Map<string, RegisteredTool>();
   // Role-gate the advertised surface: a controlled node never registers the
   // FULL-only machine tools, so its daemon.hello / tools/list excludes them (10.12).
   for (const name of advertisedMcpToolNames(deps.nodeRole ?? NODE_ROLE.FULL)) {
     const contract = MEMORY_MCP_TOOL_CONTRACTS[name];
     const outputSchema = machineToolOutputSchemas[name];
-    server.registerTool(name, {
+    registered.set(name, server.registerTool(name, {
       description: contract.description,
       inputSchema: schemas[name],
       // Machine tools publish an output schema so the SDK validates structuredContent
@@ -1991,8 +3625,9 @@ export function registerMemoryMcpTools(server: McpServer, caller: McpRuntimeCall
         };
       }
       return toolResult(await handlers[name](args, context), name);
-    });
+    }));
   }
+  return registered;
 }
 
 // ---------------------------------------------------------------------------
@@ -2128,12 +3763,18 @@ export function createAliasMcpToolHandlers(
   return wrapped;
 }
 
-export function registerAliasMcpTools(server: McpServer, caller: McpRuntimeCaller, deps: AliasMcpToolDeps = {}): void {
+export function registerAliasMcpTools(
+  server: McpServer,
+  caller: McpRuntimeCaller,
+  deps: AliasMcpToolDeps = {},
+): ReadonlyMap<string, RegisteredTool> {
   const handlers = createAliasMcpToolHandlers(caller, deps);
+  const registered = new Map<string, RegisteredTool>();
   for (const name of ALIAS_MCP_TOOL_NAME_LIST) {
-    server.registerTool(name, {
+    registered.set(name, server.registerTool(name, {
       description: ALIAS_MCP_TOOL_DESCRIPTIONS[name],
       inputSchema: aliasSchemas[name],
-    }, async (args: unknown) => toolResult(await handlers[name](args)));
+    }, async (args: unknown) => toolResult(await handlers[name](args))));
   }
+  return registered;
 }

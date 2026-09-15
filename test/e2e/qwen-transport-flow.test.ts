@@ -273,6 +273,8 @@ describe('qwen transport flow e2e', () => {
     mocks.store.clear();
     mocks.emitted.length = 0;
     vi.clearAllMocks();
+    mocks.nextUuid.mockReset();
+    mocks.nextUuid.mockReturnValue('11111111-1111-4111-8111-111111111111');
   });
 
   it('launches qwen main session and emits typewriter-friendly timeline events on send', async () => {
@@ -448,9 +450,7 @@ describe('qwen transport flow e2e', () => {
   });
 
   it('restarts qwen by reusing the persisted provider session id instead of creating a new session', async () => {
-    mocks.nextUuid
-      .mockReturnValueOnce('11111111-1111-4111-8111-111111111111')
-      .mockReturnValue('22222222-2222-4222-8222-222222222222');
+    mocks.nextUuid.mockReturnValue('11111111-1111-4111-8111-111111111111');
 
     await launchSession({
       name: SESSION,
@@ -462,6 +462,7 @@ describe('qwen transport flow e2e', () => {
 
     const initial = mocks.store.get(SESSION);
     expect(initial?.providerSessionId).toBe('11111111-1111-4111-8111-111111111111');
+    mocks.nextUuid.mockReturnValue('22222222-2222-4222-8222-222222222222');
 
     const serverLink = { send: vi.fn() } as any;
     handleWebCommand({

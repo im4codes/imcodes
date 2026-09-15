@@ -1,0 +1,18 @@
+{
+  "manifestVersion": 2,
+  "repository": "im4codes/imcodes",
+  "releaseTag": "libwebrtc-sdk-macos-arm64-f99aaf4a8c5baa9e-e6ca73076b1475db",
+  "assetName": "imcodes-libwebrtc-sdk-macos-arm64.tar.gz",
+  "sha256": "e6ca73076b1475dbc96d4fcc4e55f9f2bdf291e36129847266d18ac0d318a64b",
+  "sourceSha256": "f99aaf4a8c5baa9e228226f4c64ed638d41f1aa3448381abb8495667f90178da",
+  "sourceCommit": "be0ad3fe555ade9f49d87d89589174f83a46af14",
+  "libwebrtcRevision": "f20ebb8adbf4fa781830e4384c61f732bd28a217",
+  "depotToolsRevision": "a1bda5b6167435ad0666191f0353f242104f5845",
+  "sdkManifestSha256": "9697a2c42e20f3357f655fcdb7e7ecbb6dc297597bdb74a048d9871ed1b31872",
+  "toolchain": {
+    "xcode": "26.6",
+    "macosSdk": "26.5",
+    "clang": "llvmorg-23-init-19482-g53d18800-1",
+    "hostArch": "arm64"
+  }
+}

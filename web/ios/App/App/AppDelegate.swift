@@ -105,12 +105,21 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
 
         bridge.registerPluginInstance(AuthSessionPlugin())
         bridge.registerPluginInstance(WatchBridgePlugin())
-        configureInputChromeForMacIfNeeded(bridge.webView)
+        configureInputChrome(bridge.webView)
         didRegisterLocalPlugins = true
     }
 
-    private func configureInputChromeForMacIfNeeded(_ webView: WKWebView?) {
-        guard #available(iOS 14.0, *), ProcessInfo.processInfo.isiOSAppOnMac else { return }
+    /// Removes the leading/trailing shortcuts-bar button groups -- the
+    /// Previous/Next field-navigation chevrons and Done/checkmark button
+    /// WebKit draws above the keyboard for any focused text field -- from
+    /// every text field in the app's single WKWebView. `UITextInputAssistantItem`
+    /// is the Apple-documented, native-only extension point for that bar;
+    /// there is no equivalent web/JS API, so this cannot be done from `web/`
+    /// itself. This used to run only for the iOS-app-on-Mac idiom, but the
+    /// exact same bar shows up identically on a real iPhone/iPad, so it now
+    /// always runs.
+    private func configureInputChrome(_ webView: WKWebView?) {
+        guard #available(iOS 14.0, *) else { return }
         webView?.inputAssistantItem.leadingBarButtonGroups = []
         webView?.inputAssistantItem.trailingBarButtonGroups = []
         webView?.scrollView.keyboardDismissMode = .interactive

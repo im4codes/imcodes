@@ -1,1115 +1,1056 @@
-import { createHash } from 'node:crypto';
-import { open, statfs, unlink, rename } from 'node:fs/promises';
-import type { FileHandle } from 'node:fs/promises';
-import path from 'node:path';
+/**
+ * Main-thread proxy for the direct file transfer data plane.
+ *
+ * The transfer state machine itself lives in `direct-file-transfer-worker.ts`
+ * and runs in an OS child process: RTC/ICE/DataChannel callbacks, no-progress and
+ * lease timers, sha256 hashing and every file read/write execute there. A
+ * blocked daemon event loop therefore cannot starve them, which is the failure
+ * this split exists to remove — transfers previously died because the loop was
+ * busy, not because the peer connection was broken.
+ *
+ * This file owns only what must stay on the main thread: the WebSocket senders,
+ * child lifecycle, and a bounded capability projection. File bytes never cross
+ * the boundary; only control envelopes do.
+ */
 import logger from '../util/logger.js';
 import {
-  DIRECT_CONNECTIVITY_RUNTIME_ERROR,
   DIRECT_CONNECTIVITY_RUNTIME_STATE,
-  DIRECT_FILE_TRANSFER_DATA_MSG,
-  DIRECT_FILE_TRANSFER_DIRECTION,
   DIRECT_FILE_TRANSFER_ERROR,
-  DIRECT_FILE_TRANSFER_HEALTH_CHANNEL_PREFIX,
   DIRECT_FILE_TRANSFER_ERROR_SCOPE,
-  DIRECT_FILE_TRANSFER_LEASE_CAPABILITY,
+  DIRECT_FILE_TRANSFER_HOST_METHOD,
   DIRECT_FILE_TRANSFER_LIMITS,
   DIRECT_FILE_TRANSFER_MSG,
-  DIRECT_FILE_TRANSFER_OPERATION_STATE,
   DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
-  DIRECT_FILE_TRANSFER_TERMINAL_STATE,
+  DIRECT_FILE_TRANSFER_WORKER_KIND,
+  DIRECT_FILE_TRANSFER_WORKER_MSG,
+  DIRECT_FILE_TRANSFER_WORKER_PROTOCOL_VERSION,
+  isCurrentDirectFileTransferWorkerGeneration,
   validateDirectFileTransferDaemonCommand,
-  validateDirectFileTransferDataMessage,
-  type DirectFileTransferAttemptBinding,
-  type DirectFileTransferDaemonCommand,
-  type DirectFileTransferDirection,
-  type DirectFileTransferError,
-  type DirectFileTransferIceServerConfig,
-  type DirectFileTransferLeaseIce,
-  type DirectFileTransferLeaseOffer,
-  type DirectFileTransferLeasePrepare,
-  type DirectConnectivityCandidateInfo,
-  type DirectFileTransferPrepare,
-  type DirectFileTransferTerminalState,
-  type DirectConnectivityRuntimeError,
+  isDirectFileTransferOperationDischarged,
+  validateDirectFileTransferDaemonMessage,
+  validateDirectFileTransferWorkerEnvelope,
   type DirectConnectivityRuntimeStatus,
+  type DirectFileTransferDaemonCommand,
+  type DirectFileTransferLeaseBinding,
+  type DirectFileTransferLeasePrepared,
 } from '../../shared/direct-file-transfer.js';
-import type { AttachmentRef } from '../../shared/transport/file-transfer.js';
 import {
-  createDirectUploadFilename,
-  finalizeDirectUploadedFile,
-  initFileTransfer,
+  spawnDirectFileTransferChild,
+  type DirectFileTransferIsolate,
+  type DirectFileTransferIsolateOptions,
+} from './direct-file-transfer-ipc.js';
+import type { FileTransferSender } from './file-transfer-handler.js';
+import {
   lookupAttachmentByClientUploadId,
   releaseClientUploadClaim,
   resolveDirectFileDownloadSource,
-  resolveUploadPath,
   tryClaimClientUpload,
-  type DirectFileDownloadSource,
-  type FileTransferSender,
 } from './file-transfer-handler.js';
 
-type NodeDataChannel = typeof import('node-datachannel');
-type PeerConnection = import('node-datachannel').PeerConnection;
-type DataChannel = import('node-datachannel').DataChannel;
-type NodeDataChannelIceServer = string | import('node-datachannel').IceServer;
+export { toNodeDataChannelIceServers } from './direct-file-transfer-worker.js';
 
-interface PendingLeaseCandidate {
-  requestId: string;
-  candidate: string;
-  mid: string;
+export const DIRECT_FILE_TRANSFER_RESTART_BASE_MS = 100;
+export const DIRECT_FILE_TRANSFER_RESTART_MAX_MS = 10_000;
+export const DIRECT_FILE_TRANSFER_STABLE_WINDOW_MS = 60_000;
+export const DIRECT_FILE_TRANSFER_READY_TIMEOUT_MS = 15_000;
+export const SHUTDOWN_ACK_TIMEOUT_MS = 5_000;
+
+interface WorkerHandle {
+  worker: DirectFileTransferIsolate;
+  generation: number;
+  ready: Promise<boolean>;
+  state: 'pending' | 'ready' | 'failed';
+  settleReady: (ready: boolean) => void;
+  retirement: Promise<number> | null;
 }
 
-interface DirectLease {
-  binding: Omit<DirectFileTransferLeasePrepare, 'type' | 'protocolVersion' | 'requestId' | 'iceServers'>;
-  peer: PeerConnection;
-  /** Retained so an abandoned browser peer can be replaced on the same lease. */
-  iceServers: NodeDataChannelIceServer[];
-  sender: FileTransferSender;
-  expiresAt: number;
-  idleTimer: ReturnType<typeof setTimeout> | null;
-  remoteDescriptionSet: boolean;
-  /** Candidates are scoped to the SDP exchange that produced them. */
-  pendingRemoteCandidates: PendingLeaseCandidate[];
-  negotiationRequestId: string | null;
-  activeAttempts: Set<string>;
-}
-
-interface ActiveDirectTransfer {
-  authority: DirectFileTransferPrepare;
-  lease: DirectLease;
-  channel: DataChannel | null;
-  uploadFileHandle: FileHandle | null;
-  downloadFileHandle: FileHandle | null;
-  partPath: string | null;
-  finalPath: string | null;
-  finalFilename: string | null;
-  uploadClaim: symbol | null;
-  received: number;
-  pendingBytes: number;
-  downloadCredit: number;
-  downloadSource: DirectFileDownloadSource | null;
-  downloadPumping: boolean;
-  hash: ReturnType<typeof createHash>;
-  writeChain: Promise<void>;
-  started: boolean;
-  sourceFinished: boolean;
-  settled: boolean;
-  idleTimer: ReturnType<typeof setTimeout> | null;
-}
-
-interface LedgerRecord {
-  serverId: string;
-  browserTabId: string;
-  leaseId: string;
-  leaseGeneration: number;
-  direction: DirectFileTransferDirection;
-  operationId: string;
-  state: typeof DIRECT_FILE_TRANSFER_OPERATION_STATE[keyof typeof DIRECT_FILE_TRANSFER_OPERATION_STATE];
-  terminalState?: DirectFileTransferTerminalState;
-  attachment?: AttachmentRef;
-  error?: DirectFileTransferError;
-  expiresAt: number;
-}
-
-let rtc: NodeDataChannel | null = null;
-let loadAttempted = false;
-let rtcLoadError: DirectConnectivityRuntimeError | undefined;
-const leases = new Map<string, DirectLease>();
-const activeAttempts = new Map<string, ActiveDirectTransfer>();
-const recentOperations = new Map<string, LedgerRecord>();
-
-const TURN_URL_RE = /^(turn|turns):(\[[^\]]+\]|[^:?]+)(?::(\d{1,5}))?(?:\?transport=(udp|tcp))?$/i;
+let handle: WorkerHandle | null = null;
+let generationCounter = 0;
+let restarts = 0;
+/**
+ * Generation whose exit was declared a planned retirement recycle.
+ *
+ * A recycle is the child killing itself on purpose, so the exit is
+ * indistinguishable from a crash at the OS boundary. Charging it to the crash
+ * counter made the replacement start later and later -- 100/200/400/800/1600/
+ * 3200ms -- while the browser is holding a lease it has just been told is dead
+ * and retrying on its own schedule. By the sixth recycle every client attempt
+ * lands before the daemon even starts the replacement, and the lease parks.
+ * Planned recycles therefore restart at the base delay and do not escalate;
+ * real crashes still do, so a crash loop cannot flap the child.
+ */
+let plannedRecycleGeneration: number | null = null;
+let shuttingDown = false;
+let restartTimer: ReturnType<typeof setTimeout> | null = null;
+let stableTimer: ReturnType<typeof setTimeout> | null = null;
 
 /**
- * Transport-only observability.  Keep this deliberately small and structural:
- * values here describe lifecycle, route and byte counts, never user supplied
- * names/paths/content or any credential-bearing control-plane field.
+ * Availability is projected, not queried.
+ *
+ * `server-link` asks for this synchronously while building a capability
+ * payload, and the answer lives in another process. Caching the child's last
+ * declaration keeps that call synchronous without blocking the loop on IPC —
+ * which would reintroduce exactly the stall being removed.
  */
-function directFileMetric(
-  event: string,
-  fields: Record<string, string | number | boolean | undefined> = {},
-): void {
-  logger.info(
-    { event: `direct_file_v2.${event}`, ...fields },
-    'Direct file transfer v2 metric',
-  );
-}
+let availableProjection = false;
+let runtimeStatusProjection: DirectConnectivityRuntimeStatus = {
+  state: DIRECT_CONNECTIVITY_RUNTIME_STATE.RUNTIME_UNAVAILABLE,
+};
 
-function leaseKey(leaseId: string, generation: number): string {
-  return `${leaseId}:${generation}`;
-}
+const sendersById = new Map<string, FileTransferSender>();
+const idsBySender = new WeakMap<FileTransferSender, string>();
+let senderSeq = 0;
+/**
+ * Exported so the boundary regression can drive past the REAL ceiling rather
+ * than re-deriving it; a test that hardcodes 512 stops testing anything the
+ * day this changes.
+ */
+export const MAX_PROXY_SENDERS = DIRECT_FILE_TRANSFER_LIMITS.OPERATION_LEDGER_CAPACITY * 2;
 
-function ledgerKey(binding: Pick<DirectFileTransferAttemptBinding, 'serverId' | 'browserTabId' | 'leaseId' | 'leaseGeneration' | 'direction' | 'operationId'>): string {
-  return [binding.serverId, binding.browserTabId, binding.leaseId, binding.leaseGeneration, binding.direction, binding.operationId].join(':');
-}
-
-function attemptBinding(authority: DirectFileTransferPrepare): DirectFileTransferAttemptBinding {
-  return {
-    serverId: authority.serverId,
-    browserTabId: authority.browserTabId,
-    leaseId: authority.leaseId,
-    leaseGeneration: authority.leaseGeneration,
-    daemonGeneration: authority.daemonGeneration,
-    requestId: authority.requestId,
-    attemptId: authority.attemptId,
-    attempt: authority.attempt,
-    direction: authority.direction,
-    operationId: authority.operationId,
-  };
-}
-
-function sameAttempt(authority: DirectFileTransferPrepare, value: Record<string, unknown>): boolean {
-  return value.serverId === authority.serverId
-    && value.browserTabId === authority.browserTabId
-    && value.leaseId === authority.leaseId
-    && value.leaseGeneration === authority.leaseGeneration
-    && value.daemonGeneration === authority.daemonGeneration
-    && value.requestId === authority.requestId
-    && value.attemptId === authority.attemptId
-    && value.attempt === authority.attempt
-    && value.direction === authority.direction
-    && value.operationId === authority.operationId;
-}
-
-function errorDetail(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-export function toNodeDataChannelIceServers(
-  iceServers: readonly DirectFileTransferIceServerConfig[],
-): NodeDataChannelIceServer[] {
-  const resolved: NodeDataChannelIceServer[] = [];
-  for (const entry of iceServers) {
-    if (typeof entry === 'string') {
-      resolved.push(entry);
-      continue;
-    }
-    for (const url of entry.urls) {
-      if (/^stuns?:/i.test(url)) {
-        resolved.push(url);
-        continue;
-      }
-      const match = TURN_URL_RE.exec(url);
-      if (!match || !entry.username || !entry.credential) throw new Error('Invalid authenticated TURN server configuration');
-      const secure = match[1].toLowerCase() === 'turns';
-      const port = Number(match[3] ?? (secure ? 5349 : 3478));
-      if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error('Invalid TURN server port');
-      resolved.push({
-        hostname: match[2].replace(/^\[|\]$/g, ''),
-        port,
-        username: entry.username,
-        password: entry.credential,
-        relayType: secure ? 'TurnTls' : match[4]?.toLowerCase() === 'tcp' ? 'TurnTcp' : 'TurnUdp',
-      });
-    }
+/** Stable opaque id per transport, so the worker can address it without holding it. */
+function senderIdFor(sender: FileTransferSender): string {
+  const existing = idsBySender.get(sender);
+  if (existing) {
+    sendersById.set(existing, sender);
+    return existing;
   }
-  return resolved;
-}
-
-export async function initializeDirectFileTransfer(): Promise<boolean> {
-  if (loadAttempted) return rtc !== null;
-  loadAttempted = true;
-  try {
-    rtc = await import('node-datachannel');
-    // Native transport diagnostics can include SDP/candidate material.  Keep
-    // this lifecycle signal structural rather than forwarding that payload.
-    rtc.initLogger('Warning', () => logger.debug({ event: 'direct_file_v2.native_warning' }, 'node-datachannel warning'));
-    rtcLoadError = undefined;
-    logger.info({ capability: DIRECT_FILE_TRANSFER_LEASE_CAPABILITY }, 'Direct file transfer v2 available');
-  } catch (error) {
-    rtc = null;
-    const detail = error instanceof Error ? `${error.message}\n${error.stack ?? ''}` : String(error);
-    rtcLoadError = detail.includes('node_datachannel.node') || detail.includes('MODULE_NOT_FOUND')
-      ? DIRECT_CONNECTIVITY_RUNTIME_ERROR.NATIVE_MODULE_MISSING
-      : DIRECT_CONNECTIVITY_RUNTIME_ERROR.LOAD_FAILED;
-    logger.info({ event: 'direct_file_v2.runtime_unavailable', reason: rtcLoadError }, 'Direct file transfer unavailable; HTTP transfer remains enabled');
-  }
-  return rtc !== null;
-}
-
-export function isDirectFileTransferAvailable(): boolean {
-  return rtc !== null;
-}
-
-export function getDirectConnectivityRuntimeStatus(): DirectConnectivityRuntimeStatus {
-  return rtc
-    ? { state: DIRECT_CONNECTIVITY_RUNTIME_STATE.AVAILABLE }
-    : { state: DIRECT_CONNECTIVITY_RUNTIME_STATE.RUNTIME_UNAVAILABLE, ...(rtcLoadError ? { error: rtcLoadError } : {}) };
-}
-
-function sendControl(lease: DirectLease, message: Record<string, unknown>): void {
-  lease.sender.send(message);
-}
-
-function sendAttemptError(
-  transfer: ActiveDirectTransfer,
-  error: DirectFileTransferError,
-  retryable: boolean,
-  detail?: string,
-): void {
-  sendControl(transfer.lease, {
-    type: DIRECT_FILE_TRANSFER_MSG.ERROR,
-    protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
-    scope: DIRECT_FILE_TRANSFER_ERROR_SCOPE.OPERATION,
-    ...attemptBinding(transfer.authority),
-    error,
-    retryable,
-    ...(detail ? { detail: detail.slice(0, DIRECT_FILE_TRANSFER_LIMITS.ERROR_DETAIL_BYTES) } : {}),
-  });
-  if (transfer.channel) {
-    try {
-      transfer.channel.sendMessage(JSON.stringify({
-        type: DIRECT_FILE_TRANSFER_DATA_MSG.ERROR,
-        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
-        ...attemptBinding(transfer.authority),
-        error,
-      }));
-    } catch { /* peer already closed */ }
-  }
-}
-
-function putLedger(
-  authority: DirectFileTransferPrepare,
-  state: LedgerRecord['state'],
-  terminalState?: DirectFileTransferTerminalState,
-  attachment?: AttachmentRef,
-  error?: DirectFileTransferError,
-): void {
-  const key = ledgerKey(authority);
-  recentOperations.set(key, {
-    serverId: authority.serverId,
-    browserTabId: authority.browserTabId,
-    leaseId: authority.leaseId,
-    leaseGeneration: authority.leaseGeneration,
-    direction: authority.direction,
-    operationId: authority.operationId,
-    state,
-    ...(terminalState ? { terminalState } : {}),
-    ...(attachment ? { attachment } : {}),
-    ...(error ? { error } : {}),
-    expiresAt: Date.now() + DIRECT_FILE_TRANSFER_LIMITS.OPERATION_LEDGER_TTL_MS,
-  });
-  while (recentOperations.size > DIRECT_FILE_TRANSFER_LIMITS.OPERATION_LEDGER_CAPACITY) {
-    const oldest = recentOperations.keys().next().value as string | undefined;
+  senderSeq += 1;
+  const id = `dft-sender-${senderSeq}`;
+  idsBySender.set(sender, id);
+  sendersById.set(id, sender);
+  while (sendersById.size > MAX_PROXY_SENDERS) {
+    const oldest = sendersById.keys().next().value as string | undefined;
     if (!oldest) break;
-    recentOperations.delete(oldest);
+    sendersById.delete(oldest);
   }
+  return id;
 }
 
-function findLedger(binding: DirectFileTransferAttemptBinding): LedgerRecord | undefined {
-  const record = recentOperations.get(ledgerKey(binding));
-  if (!record) return undefined;
-  if (record.expiresAt <= Date.now()) {
-    recentOperations.delete(ledgerKey(binding));
-    return undefined;
-  }
-  return record;
+// Keep the relative path in a variable. Vite rewrites a literal
+// `new URL('./asset', import.meta.url)` to its browser dev-server URL even when
+// this daemon module is imported by Node integration tests; Worker rejects
+// that http: URL. The runtime expression remains a file: URL in Node while
+// production builds still copy the bootstrap beside this module.
+const DIRECT_FILE_TRANSFER_WORKER_BOOTSTRAP = './direct-file-transfer-worker-bootstrap.mjs';
+
+function workerModuleUrl(): URL {
+  return new URL(DIRECT_FILE_TRANSFER_WORKER_BOOTSTRAP, import.meta.url);
 }
 
-function resetLeaseIdleTimer(lease: DirectLease): void {
-  if (lease.idleTimer) clearTimeout(lease.idleTimer);
-  if (lease.activeAttempts.size > 0) {
-    lease.idleTimer = null;
-    return;
-  }
-  lease.idleTimer = setTimeout(() => { void closeLease(lease, true); }, DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS);
-  lease.idleTimer.unref?.();
+type DirectFileTransferWorkerFactory = (
+  url: URL,
+  options: DirectFileTransferIsolateOptions,
+) => DirectFileTransferIsolate;
+
+const spawnRealWorker: DirectFileTransferWorkerFactory = spawnDirectFileTransferChild;
+let workerFactory: DirectFileTransferWorkerFactory = spawnRealWorker;
+type FinalizeDirectUploadedFile = typeof import('./file-transfer-handler.js').finalizeDirectUploadedFile;
+
+/**
+ * Keep the newly added finalization authority out of this module's eager import
+ * surface. A large set of command-handler tests intentionally replaces
+ * file-transfer-handler with a narrow mock that predates direct P2P uploads;
+ * eagerly reading the new named export makes Vitest abort those suites during
+ * module evaluation even though they never execute a direct upload. Production
+ * still resolves the exact authority module at the first real finalization.
+ */
+const finalizeDirectUploadedFileOnDemand: FinalizeDirectUploadedFile = async (params) => {
+  const handler = await import('./file-transfer-handler.js');
+  return await handler.finalizeDirectUploadedFile(params);
+};
+
+let finalizeUploadedFileOnHost: FinalizeDirectUploadedFile = finalizeDirectUploadedFileOnDemand;
+
+/**
+ * Test seam for the worker factory.
+ *
+ * Crash retry/backoff and stale-generation behaviour must be provable
+ * deterministically. Racing a real thread to die on cue would make those tests
+ * timing-dependent, so tests substitute a controllable double here. Production
+ * always uses the real spawn.
+ */
+export function __setDirectFileTransferWorkerFactoryForTests(
+  factory: DirectFileTransferWorkerFactory | null,
+): void {
+  workerFactory = factory ?? spawnRealWorker;
 }
 
-function resetTransferIdleTimer(transfer: ActiveDirectTransfer): void {
-  if (transfer.idleTimer) clearTimeout(transfer.idleTimer);
-  transfer.idleTimer = setTimeout(() => {
-    void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.NO_PROGRESS_TIMEOUT, true, 'Direct file attempt made no progress');
-  }, DIRECT_FILE_TRANSFER_LIMITS.NO_PROGRESS_TIMEOUT_MS);
-  transfer.idleTimer.unref?.();
+export function __setDirectFileTransferFinalizeForTests(
+  finalize: FinalizeDirectUploadedFile | null,
+): void {
+  finalizeUploadedFileOnHost = finalize ?? finalizeDirectUploadedFileOnDemand;
 }
 
-function routeMetricClass(lease: DirectLease): 'direct' | 'relay' | 'unknown' {
-  try {
-    const selected = lease.peer.getSelectedCandidatePair();
-    const localType = typeof selected?.local?.type === 'string' ? selected.local.type.toLowerCase() : '';
-    const remoteType = typeof selected?.remote?.type === 'string' ? selected.remote.type.toLowerCase() : '';
-    if (!localType || !remoteType) return 'unknown';
-    return localType === 'relay' || remoteType === 'relay' ? 'relay' : 'direct';
-  } catch {
-    return 'unknown';
-  }
-}
-
-async function closeTransferResources(transfer: ActiveDirectTransfer, removePart: boolean): Promise<void> {
-  if (transfer.idleTimer) clearTimeout(transfer.idleTimer);
-  transfer.idleTimer = null;
-  await transfer.writeChain.catch(() => {});
-  if (transfer.uploadFileHandle) await transfer.uploadFileHandle.close().catch(() => {});
-  if (transfer.downloadFileHandle) await transfer.downloadFileHandle.close().catch(() => {});
-  transfer.uploadFileHandle = null;
-  transfer.downloadFileHandle = null;
-  try { transfer.channel?.close(); } catch { /* already closed */ }
-  if (removePart && transfer.partPath) await unlink(transfer.partPath).catch(() => {});
-  activeAttempts.delete(transfer.authority.attemptId);
-  transfer.lease.activeAttempts.delete(transfer.authority.attemptId);
-  if (transfer.uploadClaim) releaseClientUploadClaim(transfer.authority.operationId, transfer.uploadClaim);
-  resetLeaseIdleTimer(transfer.lease);
-}
-
-async function closeLease(lease: DirectLease, cancelActive: boolean): Promise<void> {
-  if (lease.idleTimer) clearTimeout(lease.idleTimer);
-  lease.idleTimer = null;
-  leases.delete(leaseKey(lease.binding.leaseId, lease.binding.leaseGeneration));
-  directFileMetric('lease_evicted', { activeAttempts: lease.activeAttempts.size, canceled: cancelActive });
-  if (cancelActive) {
-    const transfers = [...activeAttempts.values()].filter((transfer) => transfer.lease === lease);
-    await Promise.all(transfers.map((transfer) => failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.CHANNEL_CLOSED, true)));
-  }
-  try { lease.peer.close(); } catch { /* already closed */ }
-}
-
-async function failTransfer(
-  transfer: ActiveDirectTransfer,
-  error: DirectFileTransferError,
-  retryable: boolean,
-  detail?: string,
-): Promise<void> {
-  if (transfer.settled) return;
-  transfer.settled = true;
-  directFileMetric(
-    error === DIRECT_FILE_TRANSFER_ERROR.CANCELED ? 'canceled' : 'attempt_failed',
-    {
-      direction: transfer.authority.direction,
-      attempt: transfer.authority.attempt,
-      retryable,
-      bytes: transfer.received,
-    },
-  );
-  putLedger(transfer.authority, DIRECT_FILE_TRANSFER_OPERATION_STATE.FAILED, DIRECT_FILE_TRANSFER_TERMINAL_STATE.FAILED, undefined, error);
-  sendAttemptError(transfer, error, retryable, detail);
-  sendControl(transfer.lease, {
-    type: DIRECT_FILE_TRANSFER_MSG.TERMINAL,
-    protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
-    ...attemptBinding(transfer.authority),
-    state: DIRECT_FILE_TRANSFER_TERMINAL_STATE.FAILED,
-    error,
-  });
-  await closeTransferResources(transfer, true);
-}
-
-async function ensureDiskCapacity(size: number, targetPath: string): Promise<void> {
-  const stats = await statfs(path.dirname(targetPath));
-  const free = Number(stats.bavail) * Number(stats.bsize);
-  if (!Number.isFinite(free) || free - DIRECT_FILE_TRANSFER_LIMITS.DISK_RESERVE_BYTES < size) throw new Error(DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED);
-}
-
-function makeDataBinding(authority: DirectFileTransferPrepare): DirectFileTransferAttemptBinding {
-  return attemptBinding(authority);
-}
-
-function channelMatches(transfer: ActiveDirectTransfer, channel: DataChannel): boolean {
-  try { return channel.getLabel() === transfer.authority.channelLabel; } catch { return false; }
-}
-
-function isLeaseHealthChannel(channel: DataChannel): boolean {
-  try { return channel.getLabel().startsWith(DIRECT_FILE_TRANSFER_HEALTH_CHANNEL_PREFIX); } catch { return false; }
-}
-
-function toCandidateInfo(value: unknown): DirectConnectivityCandidateInfo | null {
-  if (!value || typeof value !== 'object') return null;
-  const candidate = value as Record<string, unknown>;
-  if (typeof candidate.address !== 'string' || typeof candidate.port !== 'number'
-    || !Number.isInteger(candidate.port) || candidate.port < 1 || candidate.port > 65_535
-    || typeof candidate.type !== 'string' || typeof candidate.transportType !== 'string') return null;
-  return {
-    address: candidate.address,
-    port: candidate.port,
-    type: candidate.type,
-    transportType: candidate.transportType,
-  };
+/** Reset all module state between tests so cases cannot leak into each other. */
+export function __resetDirectFileTransferForTests(): void {
+  if (restartTimer) clearTimeout(restartTimer);
+  if (stableTimer) clearTimeout(stableTimer);
+  restartTimer = null;
+  stableTimer = null;
+  void handle?.worker.terminate().catch(() => undefined);
+  nativeAdmissionClosed = false;
+  nativeQuiesceCompleted = false;
+  inFlightNativeQuiesce = null;
+  handle = null;
+  generationCounter = 0;
+  restarts = 0;
+  plannedRecycleGeneration = null;
+  shuttingDown = false;
+  availableProjection = false;
+  runtimeStatusProjection = { state: DIRECT_CONNECTIVITY_RUNTIME_STATE.RUNTIME_UNAVAILABLE };
+  sendersById.clear();
+  senderSeq = 0;
+  controlEnvelopeObserver = null;
+  pendingByKey.clear();
+  establishedLeases.clear();
+  claimTokensByHandle.clear();
+  claimHandleSeq = 0;
+  inFlightHostMutations.clear();
+  finalizeUploadedFileOnHost = finalizeDirectUploadedFileOnDemand;
 }
 
 /**
- * The explicit connectivity diagnostic is allowed on a ready lease, but is
- * deliberately incapable of opening a file operation: it has no authority,
- * no operation binding, and accepts only a bounded nonce probe.
+ * Test observer for inbound control envelopes.
+ *
+ * The worker-stamped emission time is the only way to prove the worker kept
+ * working while this thread was blocked; delivery time cannot show it, because
+ * delivery necessarily happens after the loop frees. Production ignores this.
  */
-function attachLeaseHealthChannel(lease: DirectLease, channel: DataChannel): void {
-  channel.onMessage((message) => {
-    if (typeof message !== 'string') {
-      try { channel.close(); } catch { /* invalid health payload */ }
-      return;
-    }
-    let raw: unknown;
-    try { raw = JSON.parse(message); } catch { raw = null; }
-    const parsed = validateDirectFileTransferDataMessage(raw);
-    if (!parsed.ok || parsed.value.type !== DIRECT_FILE_TRANSFER_DATA_MSG.HEALTH_PROBE
-      || parsed.value.serverId !== lease.binding.serverId
-      || parsed.value.browserTabId !== lease.binding.browserTabId
-      || parsed.value.leaseId !== lease.binding.leaseId
-      || parsed.value.leaseGeneration !== lease.binding.leaseGeneration
-      || parsed.value.daemonGeneration !== lease.binding.daemonGeneration) {
-      try { channel.close(); } catch { /* invalid health payload */ }
-      return;
-    }
-    const selected = lease.peer.getSelectedCandidatePair();
-    const localCandidate = toCandidateInfo(selected?.local);
-    const remoteCandidate = toCandidateInfo(selected?.remote);
-    if (!localCandidate || !remoteCandidate) {
-      try { channel.close(); } catch { /* no route to report */ }
-      return;
-    }
-    try {
-      channel.sendMessage(JSON.stringify({
-        type: DIRECT_FILE_TRANSFER_DATA_MSG.HEALTH_PONG,
-        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
-        serverId: lease.binding.serverId,
-        browserTabId: lease.binding.browserTabId,
-        leaseId: lease.binding.leaseId,
-        leaseGeneration: lease.binding.leaseGeneration,
-        daemonGeneration: lease.binding.daemonGeneration,
-        nonce: parsed.value.nonce,
-        rttMs: Math.max(0, lease.peer.rtt()),
-        localCandidate,
-        remoteCandidate,
-      }));
-    } finally {
-      try { channel.close(); } catch { /* diagnostic complete */ }
-    }
+let controlEnvelopeObserver: ((emittedAt: number) => void) | null = null;
+
+export function __observeDirectFileTransferControlForTests(
+  observer: ((emittedAt: number) => void) | null,
+): void {
+  controlEnvelopeObserver = observer;
+}
+
+/** Current worker generation, or 0 when no worker is running. */
+export function __directFileTransferWorkerGenerationForTests(): number {
+  return handle?.generation ?? 0;
+}
+
+export function __directFileTransferChildPidForTests(): number | undefined {
+  return handle?.worker.pid;
+}
+
+function postToWorker(active: WorkerHandle, envelope: Record<string, unknown>): void {
+  active.worker.postMessage({
+    v: DIRECT_FILE_TRANSFER_WORKER_PROTOCOL_VERSION,
+    generation: active.generation,
+    ...envelope,
   });
 }
 
-async function startUpload(transfer: ActiveDirectTransfer): Promise<void> {
-  const authority = transfer.authority;
-  if (authority.direction !== DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD || transfer.started) return;
-  const existing = lookupAttachmentByClientUploadId(authority.clientUploadId);
-  if (existing) {
-    transfer.started = true;
-    transfer.settled = true;
-    putLedger(authority, DIRECT_FILE_TRANSFER_OPERATION_STATE.COMMITTED, DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED, existing);
-    transfer.channel?.sendMessage(JSON.stringify({
-      type: DIRECT_FILE_TRANSFER_DATA_MSG.UPLOAD_COMMITTED,
-      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
-      ...makeDataBinding(authority),
-      attachment: existing,
-    }));
-    sendControl(transfer.lease, {
-      type: DIRECT_FILE_TRANSFER_MSG.TERMINAL,
-      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
-      ...makeDataBinding(authority),
-      state: DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED,
-      attachment: existing,
-    });
-    await closeTransferResources(transfer, false);
-    return;
+interface PendingDispatch {
+  /**
+   * The transport itself, not an id to look up later.
+   *
+   * `sendersById` is a bounded ROUTING INDEX: it evicts its oldest entry at
+   * MAX_PROXY_SENDERS. Resolving through it here meant a request whose id had
+   * been displaced by 512 later transports got no failure at all when its
+   * generation died -- and the sweep then cleared the obligation anyway. The
+   * browser deliberately keeps an active attempt alive across LEASE_LOST and
+   * relies on exactly this correlated error to fail it, so losing it puts that
+   * attempt back on the ICE-timeout path this whole change removes. A pending
+   * lease that was never established gets neither signal, which is worse.
+   *
+   * Same fix as `establishedLeases`, applied to its sibling: reachability lasts
+   * as long as the obligation, and the obligation is already bounded here by
+   * OPERATION_LEDGER_CAPACITY.
+   */
+  sender: FileTransferSender;
+  failure: Record<string, unknown>;
+}
+
+const pendingByKey = new Map<string, PendingDispatch>();
+
+function pendingKey(senderId: string, requestId: string): string {
+  return `${senderId}\u0000${requestId}`;
+}
+
+function rememberPending(
+  sender: FileTransferSender,
+  senderId: string,
+  command: DirectFileTransferDaemonCommand,
+): boolean {
+  // ICE is an event, not a request: the child intentionally emits no matching
+  // acknowledgement. Retaining it would fill the bounded proxy ledger during
+  // a long negotiation and eventually reject real work even though nothing is
+  // in flight. Every other command has a correlated response or terminal.
+  if (command.type === DIRECT_FILE_TRANSFER_MSG.LEASE_ICE) return true;
+  const requestId = (command as { requestId?: unknown }).requestId;
+  if (typeof requestId === 'string') {
+    const key = pendingKey(senderId, requestId);
+    if (!pendingByKey.has(key)
+      && pendingByKey.size >= DIRECT_FILE_TRANSFER_LIMITS.OPERATION_LEDGER_CAPACITY) return false;
+    pendingByKey.set(key, { sender, failure: runtimeRecoveringMessage(command) });
   }
-  await initFileTransfer();
-  const filename = createDirectUploadFilename(authority.filename);
-  const finalPath = resolveUploadPath(filename);
-  await ensureDiskCapacity(authority.size, finalPath);
-  transfer.partPath = `${finalPath}.${authority.attemptId}.part`;
-  transfer.finalPath = finalPath;
-  transfer.finalFilename = filename;
-  transfer.uploadFileHandle = await open(transfer.partPath, 'wx');
-  transfer.started = true;
-  resetTransferIdleTimer(transfer);
-  transfer.channel?.sendMessage(JSON.stringify({
-    type: DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED,
-    protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
-    ...makeDataBinding(authority),
-    direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD,
-  }));
-}
-
-async function startDownload(transfer: ActiveDirectTransfer): Promise<void> {
-  const authority = transfer.authority;
-  if (authority.direction !== DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD || transfer.started) return;
-  let source: DirectFileDownloadSource;
-  try {
-    source = await resolveDirectFileDownloadSource(authority.previewHandle);
-  } catch (error) {
-    const detail = errorDetail(error);
-    await failTransfer(
-      transfer,
-      // A preview handle expiring is distinct from the per-attempt authority
-      // expiring.  The browser is permitted to mint one fresh preview handle
-      // for this former case, so both registry expiry and disappearance use
-      // the stable, non-sensitive preview-handle error code.
-      detail === 'expired' || detail === 'not_found' ? DIRECT_FILE_TRANSFER_ERROR.PREVIEW_HANDLE_INVALID
-          : DIRECT_FILE_TRANSFER_ERROR.PREVIEW_POLICY_DENIED,
-      false,
-    );
-    return;
-  }
-  transfer.downloadSource = source;
-  transfer.downloadFileHandle = await open(source.readPath, 'r');
-  transfer.started = true;
-  resetTransferIdleTimer(transfer);
-  transfer.channel?.sendMessage(JSON.stringify({
-    type: DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED,
-    protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
-    ...makeDataBinding(authority),
-    direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD,
-    filename: source.filename,
-    ...(source.mime ? { mime: source.mime } : {}),
-    size: source.size,
-  }));
-}
-
-function enqueueUploadChunk(transfer: ActiveDirectTransfer, bytes: Uint8Array): void {
-  if (!transfer.started || transfer.settled || !transfer.uploadFileHandle) return;
-  const authority = transfer.authority;
-  if (authority.direction !== DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD
-    || transfer.received + transfer.pendingBytes + bytes.byteLength > authority.size) {
-    void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.SIZE_MISMATCH, false);
-    return;
-  }
-  transfer.pendingBytes += bytes.byteLength;
-  if (transfer.pendingBytes > DIRECT_FILE_TRANSFER_LIMITS.DATA_BUFFER_HIGH_WATER_BYTES) {
-    void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED, true, 'Receiver disk backlog exceeded');
-    return;
-  }
-  const copy = Buffer.from(bytes);
-  transfer.writeChain = transfer.writeChain.then(async () => {
-    if (!transfer.uploadFileHandle || transfer.settled) return;
-    await transfer.uploadFileHandle.write(copy);
-    transfer.hash.update(copy);
-    transfer.received += copy.byteLength;
-    transfer.pendingBytes -= copy.byteLength;
-    resetTransferIdleTimer(transfer);
-  }).catch((error) => {
-    transfer.pendingBytes = Math.max(0, transfer.pendingBytes - copy.byteLength);
-    void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED, true, errorDetail(error));
-  });
-}
-
-async function finishUpload(transfer: ActiveDirectTransfer, totalBytes: number, sha256?: string): Promise<void> {
-  const authority = transfer.authority;
-  if (authority.direction !== DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD) return;
-  await transfer.writeChain;
-  if (transfer.settled) return;
-  if (!transfer.started || !transfer.uploadFileHandle || !transfer.partPath || !transfer.finalPath || !transfer.finalFilename
-    || totalBytes !== transfer.received || transfer.received !== authority.size) {
-    await failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.SIZE_MISMATCH, false);
-    return;
-  }
-  const digest = transfer.hash.digest('hex');
-  if ((sha256 ?? authority.sha256) && digest !== (sha256 ?? authority.sha256)) {
-    await failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.CHECKSUM_MISMATCH, false);
-    return;
-  }
-  await transfer.uploadFileHandle.sync();
-  await transfer.uploadFileHandle.close();
-  transfer.uploadFileHandle = null;
-  await rename(transfer.partPath, transfer.finalPath);
-  const attachment = await finalizeDirectUploadedFile({
-    clientUploadId: authority.clientUploadId,
-    filename: transfer.finalFilename,
-    originalName: authority.filename,
-    mime: authority.mime,
-    resolved: transfer.finalPath,
-    size: transfer.received,
-  });
-  transfer.settled = true;
-  directFileMetric('direct_success', {
-    direction: authority.direction,
-    attempt: authority.attempt,
-    bytes: transfer.received,
-    route: routeMetricClass(transfer.lease),
-  });
-  putLedger(authority, DIRECT_FILE_TRANSFER_OPERATION_STATE.COMMITTED, DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED, attachment);
-  transfer.channel?.sendMessage(JSON.stringify({
-    type: DIRECT_FILE_TRANSFER_DATA_MSG.UPLOAD_COMMITTED,
-    protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
-    ...makeDataBinding(authority),
-    attachment,
-  }));
-  sendControl(transfer.lease, {
-    type: DIRECT_FILE_TRANSFER_MSG.TERMINAL,
-    protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
-    ...makeDataBinding(authority),
-    state: DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED,
-    attachment,
-  });
-  await closeTransferResources(transfer, false);
-}
-
-async function waitForChannelBuffer(channel: DataChannel): Promise<void> {
-  if (channel.bufferedAmount() <= DIRECT_FILE_TRANSFER_LIMITS.DOWNLOAD_CHANNEL_BUFFER_HIGH_WATER_BYTES) return;
-  channel.setBufferedAmountLowThreshold(DIRECT_FILE_TRANSFER_LIMITS.DOWNLOAD_CHANNEL_BUFFER_LOW_WATER_BYTES);
-  await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('buffer_timeout')), DIRECT_FILE_TRANSFER_LIMITS.NO_PROGRESS_TIMEOUT_MS);
-    timer.unref?.();
-    channel.onBufferedAmountLow(() => { clearTimeout(timer); resolve(); });
-  });
-}
-
-async function pumpDownload(transfer: ActiveDirectTransfer): Promise<void> {
-  if (transfer.downloadPumping || transfer.settled || !transfer.started || !transfer.channel || !transfer.downloadSource || !transfer.downloadFileHandle) return;
-  transfer.downloadPumping = true;
-  try {
-    while (!transfer.settled && transfer.downloadCredit > 0 && transfer.received < transfer.downloadSource.size) {
-      await waitForChannelBuffer(transfer.channel);
-      const count = Math.min(
-        DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES,
-        transfer.downloadCredit,
-        transfer.downloadSource.size - transfer.received,
-      );
-      const buffer = Buffer.allocUnsafe(count);
-      const result = await transfer.downloadFileHandle.read(buffer, 0, count, transfer.received);
-      if (result.bytesRead <= 0) throw new Error('source_short_read');
-      const chunk = buffer.subarray(0, result.bytesRead);
-      transfer.channel.sendMessageBinary(new Uint8Array(chunk));
-      transfer.downloadCredit -= result.bytesRead;
-      transfer.received += result.bytesRead;
-      resetTransferIdleTimer(transfer);
-    }
-    if (!transfer.settled && transfer.downloadSource && transfer.received === transfer.downloadSource.size && !transfer.sourceFinished) {
-      transfer.sourceFinished = true;
-      await transfer.downloadFileHandle?.close().catch(() => {});
-      transfer.downloadFileHandle = null;
-      putLedger(transfer.authority, DIRECT_FILE_TRANSFER_OPERATION_STATE.SOURCE_FINISHED_AWAITING_ACK);
-      transfer.channel.sendMessage(JSON.stringify({
-        type: DIRECT_FILE_TRANSFER_DATA_MSG.FINISH,
-        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
-        ...makeDataBinding(transfer.authority),
-        totalBytes: transfer.received,
-      }));
-      resetTransferIdleTimer(transfer);
-    }
-  } catch (error) {
-    await failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED, true, errorDetail(error));
-  } finally {
-    transfer.downloadPumping = false;
-  }
-}
-
-async function completeDownload(transfer: ActiveDirectTransfer, totalBytes: number): Promise<void> {
-  if (transfer.authority.direction !== DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD || !transfer.sourceFinished
-    || !transfer.downloadSource || totalBytes !== transfer.received || totalBytes !== transfer.downloadSource.size) {
-    await failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.SIZE_MISMATCH, false);
-    return;
-  }
-  transfer.settled = true;
-  directFileMetric('direct_success', {
-    direction: transfer.authority.direction,
-    attempt: transfer.authority.attempt,
-    bytes: transfer.received,
-    route: routeMetricClass(transfer.lease),
-  });
-  putLedger(transfer.authority, DIRECT_FILE_TRANSFER_OPERATION_STATE.COMMITTED, DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED);
-  sendControl(transfer.lease, {
-    type: DIRECT_FILE_TRANSFER_MSG.TERMINAL,
-    protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
-    ...makeDataBinding(transfer.authority),
-    state: DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED,
-  });
-  await closeTransferResources(transfer, false);
-}
-
-function attachChannel(transfer: ActiveDirectTransfer, channel: DataChannel): void {
-  if (!channelMatches(transfer, channel)) {
-    try { channel.close(); } catch { /* invalid channel */ }
-    return;
-  }
-  transfer.channel = channel;
-  // A channel arriving is progress, so the no-progress window restarts here.
-  // It is armed at authorization, before any channel exists, which means the
-  // browser's ICE and DTLS work was being charged against a timer meant to
-  // measure a stalled transfer. That was harmless while the browser gave up
-  // after a few seconds; now that a relayed path is allowed to take longer to
-  // open, keep the two independent rather than merely far enough apart.
-  resetTransferIdleTimer(transfer);
-  channel.onMessage((message) => {
-    if (typeof message !== 'string') {
-      const bytes = message instanceof ArrayBuffer
-        ? new Uint8Array(message)
-        : new Uint8Array(message.buffer, message.byteOffset, message.byteLength);
-      enqueueUploadChunk(transfer, bytes);
-      return;
-    }
-    let raw: unknown;
-    try { raw = JSON.parse(message); } catch { raw = null; }
-    const parsed = validateDirectFileTransferDataMessage(raw);
-    if (!parsed.ok || !sameAttempt(transfer.authority, parsed.value as unknown as Record<string, unknown>)) {
-      void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY, false);
-      return;
-    }
-    if (parsed.value.type === DIRECT_FILE_TRANSFER_DATA_MSG.START) {
-      if (parsed.value.authority !== transfer.authority.authority || Date.now() >= transfer.authority.authorityExpiresAt) {
-        void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY, false);
-      } else if (transfer.authority.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD) {
-        void startUpload(transfer).catch((error) => void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED, true, errorDetail(error)));
-      } else {
-        void startDownload(transfer).catch((error) => void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.PREVIEW_POLICY_DENIED, false, errorDetail(error)));
-      }
-      return;
-    }
-    if (parsed.value.type === DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT) {
-      if (transfer.authority.direction !== DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD || !transfer.started || transfer.sourceFinished) return;
-      transfer.downloadCredit = Math.min(
-        DIRECT_FILE_TRANSFER_LIMITS.DATA_CREDIT_BYTES,
-        transfer.downloadCredit + parsed.value.creditBytes,
-      );
-      resetTransferIdleTimer(transfer);
-      void pumpDownload(transfer);
-      return;
-    }
-    if (parsed.value.type === DIRECT_FILE_TRANSFER_DATA_MSG.FINISH) {
-      void finishUpload(transfer, parsed.value.totalBytes, parsed.value.sha256).catch((error) => {
-        void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED, true, errorDetail(error));
-      });
-      return;
-    }
-    if (parsed.value.type === DIRECT_FILE_TRANSFER_DATA_MSG.DOWNLOAD_COMMITTED) {
-      void completeDownload(transfer, parsed.value.totalBytes);
-    }
-  });
-  channel.onClosed(() => { if (!transfer.settled) void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.CHANNEL_CLOSED, true); });
-  channel.onError((error) => { void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED, true, error); });
-}
-
-function attachLeasePeer(lease: DirectLease): void {
-  lease.peer.onDataChannel((channel) => {
-    const transfer = [...activeAttempts.values()].find((candidate) => candidate.lease === lease && channelMatches(candidate, channel));
-    if (!transfer) {
-      if (isLeaseHealthChannel(channel)) {
-        attachLeaseHealthChannel(lease, channel);
-        return;
-      }
-      try { channel.close(); } catch { /* unknown channel */ }
-      return;
-    }
-    attachChannel(transfer, channel);
-  });
-  lease.peer.onLocalDescription((sdp, type) => {
-    if (type !== 'answer') return;
-    if (!lease.negotiationRequestId) return;
-    sendControl(lease, {
-      type: DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER,
-      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
-      requestId: lease.negotiationRequestId,
-      serverId: lease.binding.serverId,
-      browserTabId: lease.binding.browserTabId,
-      leaseId: lease.binding.leaseId,
-      leaseGeneration: lease.binding.leaseGeneration,
-      daemonGeneration: lease.binding.daemonGeneration,
-      sdp,
-    });
-  });
-  lease.peer.onLocalCandidate((candidate, mid) => {
-    if (!lease.negotiationRequestId) return;
-    sendControl(lease, {
-      type: DIRECT_FILE_TRANSFER_MSG.LEASE_ICE,
-      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
-      requestId: lease.negotiationRequestId,
-      serverId: lease.binding.serverId,
-      browserTabId: lease.binding.browserTabId,
-      leaseId: lease.binding.leaseId,
-      leaseGeneration: lease.binding.leaseGeneration,
-      daemonGeneration: lease.binding.daemonGeneration,
-      candidate,
-      mid,
-    });
-  });
-  lease.peer.onStateChange((state) => {
-    if (state !== 'failed' && state !== 'closed' && state !== 'disconnected') return;
-    for (const transfer of [...activeAttempts.values()]) {
-      if (transfer.lease === lease && !transfer.settled) void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED, true, state);
-    }
-  });
-}
-
-async function prepareLease(command: DirectFileTransferLeasePrepare, sender: FileTransferSender): Promise<void> {
-  if (!rtc) return;
-  const key = leaseKey(command.leaseId, command.leaseGeneration);
-  const existing = leases.get(key);
-  if (existing) {
-    // A Server/WebSocket reconnect intentionally advances the *lease control*
-    // generation while retaining this daemon's live peer.  Active data
-    // channels retain their original, authority-bound generation until they
-    // finish: the browser cannot safely switch an in-flight START/CREDIT/
-    // FINISH binding before it receives LEASE_REBOUND.  New signalling and
-    // status recovery use the fresh lease generation below.
-    if (existing.binding.serverId !== command.serverId || existing.binding.browserTabId !== command.browserTabId) return;
-    existing.sender = sender;
-    existing.expiresAt = command.expiresAt;
-    existing.binding.daemonGeneration = command.daemonGeneration;
-    existing.binding.expiresAt = command.expiresAt;
-    resetLeaseIdleTimer(existing);
-    directFileMetric('lease_reuse', { activeAttempts: existing.activeAttempts.size });
-    sender.send({
-      type: DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARED,
-      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
-      requestId: command.requestId,
-      serverId: command.serverId,
-      browserTabId: command.browserTabId,
-      leaseId: command.leaseId,
-      leaseGeneration: command.leaseGeneration,
-      daemonGeneration: command.daemonGeneration,
-    });
-    return;
-  }
-  const iceServers = toNodeDataChannelIceServers(command.iceServers);
-  let peer: PeerConnection;
-  try {
-    peer = new rtc.PeerConnection(`imcodes-file-lease-${command.leaseId}`, {
-      iceServers,
-      maxMessageSize: DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES,
-    });
-  } catch {
-    logger.warn({ event: 'direct_file_v2.lease_prepare_failed' }, 'Failed to prepare direct file lease');
-    return;
-  }
-  const lease: DirectLease = {
-    binding: {
-      serverId: command.serverId,
-      browserTabId: command.browserTabId,
-      leaseId: command.leaseId,
-      leaseGeneration: command.leaseGeneration,
-      daemonGeneration: command.daemonGeneration,
-      expiresAt: command.expiresAt,
-    },
-    peer,
-    iceServers,
-    sender,
-    expiresAt: command.expiresAt,
-    idleTimer: null,
-    remoteDescriptionSet: false,
-    pendingRemoteCandidates: [],
-    negotiationRequestId: null,
-    activeAttempts: new Set(),
-  };
-  leases.set(key, lease);
-  directFileMetric('lease_prepared');
-  attachLeasePeer(lease);
-  resetLeaseIdleTimer(lease);
-  sender.send({
-    type: DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARED,
-    protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
-    requestId: command.requestId,
-    serverId: command.serverId,
-    browserTabId: command.browserTabId,
-    leaseId: command.leaseId,
-    leaseGeneration: command.leaseGeneration,
-    daemonGeneration: command.daemonGeneration,
-  });
-}
-
-async function prepareOperation(authority: DirectFileTransferPrepare, sender: FileTransferSender): Promise<void> {
-  if (!rtc) return;
-  if (Date.now() >= authority.authorityExpiresAt) return;
-  const lease = leases.get(leaseKey(authority.leaseId, authority.leaseGeneration));
-  if (!lease || lease.binding.serverId !== authority.serverId || lease.binding.browserTabId !== authority.browserTabId
-    || lease.binding.daemonGeneration !== authority.daemonGeneration) return;
-  lease.sender = sender;
-  if (lease.activeAttempts.size >= DIRECT_FILE_TRANSFER_LIMITS.MAX_ACTIVE_CHANNELS_PER_LEASE) return;
-  if (activeAttempts.has(authority.attemptId)) return;
-  directFileMetric('attempt_started', { direction: authority.direction, attempt: authority.attempt });
-  if (authority.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD) {
-    const existing = lookupAttachmentByClientUploadId(authority.clientUploadId);
-    if (existing) {
-      putLedger(authority, DIRECT_FILE_TRANSFER_OPERATION_STATE.COMMITTED, DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED, existing);
-      sendControl(lease, {
-        type: DIRECT_FILE_TRANSFER_MSG.TERMINAL,
-        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
-        ...attemptBinding(authority),
-        state: DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED,
-        attachment: existing,
-      });
-      return;
-    }
-  }
-  const transfer: ActiveDirectTransfer = {
-    authority,
-    lease,
-    channel: null,
-    uploadFileHandle: null,
-    downloadFileHandle: null,
-    partPath: null,
-    finalPath: null,
-    finalFilename: null,
-    uploadClaim: authority.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD ? tryClaimClientUpload(authority.operationId) : null,
-    received: 0,
-    pendingBytes: 0,
-    downloadCredit: 0,
-    downloadSource: null,
-    downloadPumping: false,
-    hash: createHash('sha256'),
-    writeChain: Promise.resolve(),
-    started: false,
-    sourceFinished: false,
-    settled: false,
-    idleTimer: null,
-  };
-  if (authority.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD && !transfer.uploadClaim) return;
-  activeAttempts.set(authority.attemptId, transfer);
-  lease.activeAttempts.add(authority.attemptId);
-  resetLeaseIdleTimer(lease);
-  resetTransferIdleTimer(transfer);
-}
-
-function findActive(command: { attemptId: string; authority: string }): ActiveDirectTransfer | undefined {
-  const transfer = activeAttempts.get(command.attemptId);
-  if (!transfer || transfer.authority.authority !== command.authority || !sameAttempt(transfer.authority, command as unknown as Record<string, unknown>)) return undefined;
-  return transfer;
-}
-
-function findLeaseForSignal(command: DirectFileTransferLeaseOffer | DirectFileTransferLeaseIce): DirectLease | undefined {
-  const lease = leases.get(leaseKey(command.leaseId, command.leaseGeneration));
-  if (!lease
-    || lease.binding.serverId !== command.serverId
-    || lease.binding.browserTabId !== command.browserTabId
-    || lease.binding.daemonGeneration !== command.daemonGeneration) return undefined;
-  return lease;
-}
-
-/**
- * A browser refresh loses its RTCPeerConnection but intentionally retains the
- * tab id and lease ticket.  The next offer therefore belongs to the same
- * lease, not to the daemon's old peer.  Recreate the inert peer before
- * accepting it; never do this while a file channel is active.
- */
-function replaceInactiveLeasePeer(lease: DirectLease): boolean {
-  if (!rtc || lease.activeAttempts.size > 0) return false;
-  let peer: PeerConnection;
-  try {
-    peer = new rtc.PeerConnection(`imcodes-file-lease-${lease.binding.leaseId}`, {
-      iceServers: lease.iceServers,
-      maxMessageSize: DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES,
-    });
-  } catch {
-    return false;
-  }
-  const previous = lease.peer;
-  lease.peer = peer;
-  lease.remoteDescriptionSet = false;
-  lease.negotiationRequestId = null;
-  attachLeasePeer(lease);
-  try { previous.close(); } catch { /* already closed */ }
   return true;
 }
 
-function sendLeaseSignalFailure(lease: DirectLease, requestId: string): void {
-  sendControl(lease, {
+function settlePending(senderId: string, message: Record<string, unknown>): void {
+  if (typeof message.requestId === 'string') {
+    pendingByKey.delete(pendingKey(senderId, message.requestId));
+  }
+}
+
+function runtimeRecoveringMessage(command: DirectFileTransferDaemonCommand): Record<string, unknown> {
+  const value = command as unknown as Record<string, unknown>;
+  const operation = typeof value.attemptId === 'string'
+    && typeof value.operationId === 'string'
+    && typeof value.direction === 'string';
+  if (operation) {
+    return {
+      type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      scope: DIRECT_FILE_TRANSFER_ERROR_SCOPE.OPERATION,
+      serverId: value.serverId,
+      browserTabId: value.browserTabId,
+      leaseId: value.leaseId,
+      leaseGeneration: value.leaseGeneration,
+      daemonGeneration: value.daemonGeneration,
+      requestId: value.requestId,
+      attemptId: value.attemptId,
+      attempt: value.attempt,
+      direction: value.direction,
+      operationId: value.operationId,
+      error: DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED,
+      retryable: true,
+      detail: 'direct_runtime_child_recovering',
+    };
+  }
+  return {
     type: DIRECT_FILE_TRANSFER_MSG.ERROR,
     protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
     scope: DIRECT_FILE_TRANSFER_ERROR_SCOPE.LEASE,
-    requestId,
+    requestId: value.requestId,
     error: DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED,
     retryable: true,
+    detail: 'direct_runtime_child_recovering',
+  };
+}
+
+function sendRuntimeRecovering(sender: FileTransferSender, command: DirectFileTransferDaemonCommand): void {
+  const message = runtimeRecoveringMessage(command);
+  sendFailClosedMessage(sender, message);
+}
+
+function sendFailClosedMessage(sender: FileTransferSender, message: Record<string, unknown>): void {
+  if (!validateDirectFileTransferDaemonMessage(message).ok) return;
+  try { sender.send(message); } catch { /* disconnected sender */ }
+}
+
+function failPendingForLostWorker(): void {
+  for (const pending of pendingByKey.values()) {
+    sendFailClosedMessage(pending.sender, pending.failure);
+  }
+  pendingByKey.clear();
+}
+
+/**
+ * Established leases, and the transport that owns each one.
+ *
+ * `pendingByKey` cannot serve this: it is cleared the moment LEASE_PREPARED
+ * settles, which is precisely when a lease becomes established. So an idle
+ * lease has no correlated request, the lost-worker sweep above finds nothing
+ * to fail, and a child that dies holding that lease takes it away silently.
+ *
+ * The browser then discovers the loss only when its own ICE consent check
+ * expires. Production measured a median ~57s of that, against a replacement
+ * child this parent had already spawned ~200ms after the kill.
+ */
+const establishedLeases = new Map<string, { sender: FileTransferSender; binding: DirectFileTransferLeaseBinding }>();
+
+function leaseRegistryKey(leaseId: string, leaseGeneration: number): string {
+  return `${leaseId}\u0000${leaseGeneration}`;
+}
+
+function rememberEstablishedLease(sender: FileTransferSender, message: DirectFileTransferLeasePrepared): void {
+  // Deliberately uncapped, and bounded by LEASE_CLOSED instead.
+  //
+  // A ceiling here can only ever fail open: nothing else bounds live leases at
+  // any particular number -- not the worker's own `leases` map, not the
+  // Server's admission -- so evicting the oldest entry silently drops the
+  // obligation to notify a browser that still holds a working route, which is
+  // exactly the dead window this whole change removes. The worker already
+  // holds a whole PeerConnection per live lease, so one small binding record
+  // per lease is strictly cheaper than what it is willing to carry, and the
+  // worker reports every close so this map shrinks with its own.
+  // The transport is held here, not looked up later through `sendersById`.
+  // That map is a bounded routing index and evicts its oldest entry at
+  // MAX_PROXY_SENDERS; resolving through it made a lease's only route to its
+  // browser expire on an unrelated counter, so the sweep below skipped a live
+  // lease and then cleared its obligation. Reachability now lasts exactly as
+  // long as the lease does: LEASE_CLOSED and generation loss both drop it.
+  establishedLeases.set(leaseRegistryKey(message.leaseId, message.leaseGeneration), {
+    sender,
+    binding: {
+      serverId: message.serverId,
+      browserTabId: message.browserTabId,
+      leaseId: message.leaseId,
+      leaseGeneration: message.leaseGeneration,
+      daemonGeneration: message.daemonGeneration,
+    },
   });
 }
 
-async function receiveLeaseOffer(command: DirectFileTransferLeaseOffer): Promise<void> {
-  const lease = findLeaseForSignal(command);
-  if (!lease) return;
-  if (lease.remoteDescriptionSet && lease.negotiationRequestId === command.requestId) return;
-  if (lease.negotiationRequestId !== null && lease.negotiationRequestId !== command.requestId
-    && !replaceInactiveLeasePeer(lease)) {
-    // An active file channel cannot be silently replaced. Let the browser
-    // retry after its authoritative operation outcome instead of stranding it
-    // behind an 8-second answer timeout.
-    sendLeaseSignalFailure(lease, command.requestId);
-    return;
+/**
+ * Tell every established lease that it did not survive this child.
+ *
+ * Lease-scoped on purpose. Withdrawing the advertised capability would be the
+ * wrong granularity: a crash loop would flap the whole feature set, and this
+ * daemon's ability to serve direct transfers is unchanged -- only these peer
+ * connections, which died with the child's address space, are gone.
+ */
+function invalidateEstablishedLeasesForLostWorker(): void {
+  for (const entry of establishedLeases.values()) {
+    sendFailClosedMessage(entry.sender, {
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_LOST,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...entry.binding,
+    });
   }
-  try {
-    lease.negotiationRequestId = command.requestId;
-    lease.peer.setRemoteDescription(command.sdp, 'offer');
-    lease.remoteDescriptionSet = true;
-    const pending = lease.pendingRemoteCandidates.splice(0)
-      .filter((candidate) => candidate.requestId === command.requestId);
-    for (const candidate of pending) {
-      lease.peer.addRemoteCandidate(candidate.candidate, candidate.mid);
+  establishedLeases.clear();
+}
+
+/* --------------------------------------------------------------------------
+ * Host authority dispatcher.
+ *
+ * The attachment registry and client-upload claims live here, on the one thread
+ * that also runs the relay path, so direct and relay contend for the SAME
+ * authority instead of two per-isolate copies. The worker calls in; nothing but
+ * metadata crosses, and the claim symbol never leaves this thread.
+ * ------------------------------------------------------------------------ */
+
+/**
+ * Claim symbols are not cloneable, so the worker holds an opaque handle.
+ *
+ * The claimed id is kept beside the token because releasing requires both, and
+ * a worker that dies takes its handles with it: without the id here, a crashed
+ * transfer's claim would stay held in the registry forever and the relay could
+ * never take over that upload.
+ */
+const claimTokensByHandle = new Map<string, {
+  clientUploadId: string;
+  token: symbol;
+  generation: number;
+}>();
+let claimHandleSeq = 0;
+
+/**
+ * Mutating host calls that have crossed the child boundary and started on the
+ * daemon thread. A dead child cannot cancel such a continuation: finalization
+ * may already have renamed a file and be committing attachment metadata. The
+ * claim must therefore remain authoritative until that admitted mutation has
+ * settled, even though its HOST_RESULT is no longer deliverable.
+ */
+const inFlightHostMutations = new Map<string, number>();
+
+function hostMutationKey(generation: number, clientUploadId: string): string {
+  return `${generation}\u0000${clientUploadId}`;
+}
+
+function finalizationClientUploadId(method: string, args: unknown[]): string | null {
+  if (method !== DIRECT_FILE_TRANSFER_HOST_METHOD.FINALIZE_DIRECT_UPLOADED_FILE) return null;
+  const value = args[0];
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const clientUploadId = (value as { clientUploadId?: unknown }).clientUploadId;
+  return typeof clientUploadId === 'string' && clientUploadId ? clientUploadId : null;
+}
+
+function beginHostMutation(generation: number, method: string, args: unknown[]): string | null {
+  const clientUploadId = finalizationClientUploadId(method, args);
+  if (!clientUploadId) return null;
+  const key = hostMutationKey(generation, clientUploadId);
+  inFlightHostMutations.set(key, (inFlightHostMutations.get(key) ?? 0) + 1);
+  return clientUploadId;
+}
+
+function finishHostMutation(generation: number, clientUploadId: string | null): void {
+  if (!clientUploadId) return;
+  const key = hostMutationKey(generation, clientUploadId);
+  const remaining = (inFlightHostMutations.get(key) ?? 1) - 1;
+  if (remaining > 0) inFlightHostMutations.set(key, remaining);
+  else inFlightHostMutations.delete(key);
+  // If this generation died while the mutation was running, its claim was
+  // deliberately retained. Release it now that no admitted mutation can still
+  // publish under that authority.
+  if (!handle || handle.generation !== generation) releaseClaimsForLostWorker(generation);
+}
+
+async function invokeHostMethod(generation: number, method: string, args: unknown[]): Promise<unknown> {
+  switch (method) {
+    case DIRECT_FILE_TRANSFER_HOST_METHOD.TRY_CLAIM_CLIENT_UPLOAD: {
+      const clientUploadId = String(args[0] ?? '');
+      const token = tryClaimClientUpload(clientUploadId);
+      if (!token) return null;
+      claimHandleSeq += 1;
+      const handle = `dft-claim-${claimHandleSeq}`;
+      claimTokensByHandle.set(handle, { clientUploadId, token, generation });
+      return handle;
     }
-  } catch {
-    lease.remoteDescriptionSet = false;
-    logger.warn({ event: 'direct_file_v2.lease_offer_failed' }, 'Failed to accept direct file lease offer');
-    sendLeaseSignalFailure(lease, command.requestId);
+    case DIRECT_FILE_TRANSFER_HOST_METHOD.RELEASE_CLIENT_UPLOAD_CLAIM: {
+      const handle = String(args[1] ?? '');
+      const claim = claimTokensByHandle.get(handle);
+      // Unknown handle is a no-op rather than an error: release must stay
+      // idempotent across a worker restart that lost its handles.
+      if (!claim) return null;
+      claimTokensByHandle.delete(handle);
+      releaseClientUploadClaim(claim.clientUploadId, claim.token);
+      return null;
+    }
+    case DIRECT_FILE_TRANSFER_HOST_METHOD.LOOKUP_ATTACHMENT_BY_CLIENT_UPLOAD_ID:
+      return lookupAttachmentByClientUploadId(String(args[0] ?? '')) ?? null;
+    case DIRECT_FILE_TRANSFER_HOST_METHOD.RESOLVE_DIRECT_FILE_DOWNLOAD_SOURCE:
+      return await resolveDirectFileDownloadSource(String(args[0] ?? ''));
+    case DIRECT_FILE_TRANSFER_HOST_METHOD.FINALIZE_DIRECT_UPLOADED_FILE:
+      return await finalizeUploadedFileOnHost(
+        args[0] as Parameters<FinalizeDirectUploadedFile>[0],
+      );
+    default:
+      // Unreachable: the validator allowlists the method before we get here.
+      throw new Error(`unsupported_host_method:${method}`);
   }
 }
 
-async function receiveLeaseIce(command: DirectFileTransferLeaseIce): Promise<void> {
-  const lease = findLeaseForSignal(command);
-  if (!lease) return;
-  try {
-    if (!lease.remoteDescriptionSet || lease.negotiationRequestId !== command.requestId) {
-      // setLocalDescription() can emit a trickle candidate before the browser
-      // has posted its matching offer. Preserve it for that request, but keep
-      // the queue bounded and discard every nonmatching request at offer time.
-      if (lease.pendingRemoteCandidates.length < DIRECT_FILE_TRANSFER_LIMITS.PENDING_ICE_CANDIDATE_LIMIT) {
-        lease.pendingRemoteCandidates.push({ requestId: command.requestId, candidate: command.candidate, mid: command.mid });
-      }
+/**
+ * Release every claim a dead worker generation still held.
+ *
+ * Forgetting the handles is not releasing the claims: the registry lives on
+ * this thread and would keep every dead transfer's id locked, blocking both the
+ * relay path and any retry for the lifetime of the daemon. Each one is handed
+ * back explicitly.
+ */
+function releaseClaimsForLostWorker(generation?: number): void {
+  for (const [handle, claim] of [...claimTokensByHandle]) {
+    if (generation !== undefined && claim.generation !== generation) continue;
+    if ((inFlightHostMutations.get(hostMutationKey(claim.generation, claim.clientUploadId)) ?? 0) > 0) {
+      continue;
+    }
+    claimTokensByHandle.delete(handle);
+    try {
+      releaseClientUploadClaim(claim.clientUploadId, claim.token);
+    } catch (error) {
+      logger.warn(
+        { err: error, event: 'direct_file_v2.claim_release_failed' },
+        'Could not release a lost worker claim',
+      );
+    }
+  }
+}
+
+function handleWorkerMessage(active: WorkerHandle, raw: unknown, markReady: () => void): void {
+  const envelope = validateDirectFileTransferWorkerEnvelope(raw);
+  if (!envelope) return;
+  // An error/timeout can precede OS-process exit. The failed generation stays
+  // registered only as a reap fence; it has no authority to drive transports
+  // or start new host mutations while termination is pending.
+  if (active.state === 'failed') return;
+  // Fail closed on identity: a reply from a worker that has since crashed and
+  // been replaced carries the previous generation. Applying it would let a dead
+  // worker drive live transports, so it is dropped.
+  if (!handle || active.generation !== handle.generation) return;
+  if (!isCurrentDirectFileTransferWorkerGeneration(envelope, handle.generation)) return;
+
+  if (envelope.type === DIRECT_FILE_TRANSFER_WORKER_MSG.CONTROL) {
+    controlEnvelopeObserver?.(envelope.emittedAt);
+    const sender = sendersById.get(envelope.senderId);
+    if (!sender) return;
+    // The transport is a shared, authenticated channel to the browser. A worker
+    // may only put a message on it that the daemon protocol actually describes;
+    // "it is a plain object" is not the same statement.
+    const validated = validateDirectFileTransferDaemonMessage(envelope.message);
+    if (!validated.ok) {
+      logger.warn(
+        { event: 'direct_file_v2.control_rejected', messageType: (envelope.message as { type?: unknown }).type },
+        'worker control message failed daemon protocol validation and was not forwarded',
+      );
       return;
     }
-    lease.peer.addRemoteCandidate(command.candidate, command.mid);
-  } catch {
-    logger.warn({ event: 'direct_file_v2.lease_ice_failed' }, 'Failed to add direct file lease ICE candidate');
+    // A non-terminal STATUS is NOT an answer. STATUS_QUERY deliberately reuses
+    // the active attempt's requestId, so settling on a `streaming`/`attempting`
+    // reply deleted the obligation that OPERATION PREPARE registered: a later
+    // child recycle then emitted LEASE_LOST with no correlated operation error,
+    // and the browser -- which keeps active attempts alive across LEASE_LOST
+    // exactly because it expects that error -- fell back to ICE detection.
+    if (envelope.message.type === DIRECT_FILE_TRANSFER_MSG.ERROR
+      || envelope.message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARED
+      || envelope.message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER
+      || envelope.message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_REBOUND
+      || isDirectFileTransferOperationDischarged(envelope.message as { type: string; state?: unknown })) {
+      settlePending(envelope.senderId, envelope.message);
+    }
+    if (validated.value.type === DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARED) {
+      rememberEstablishedLease(sender, validated.value);
+    }
+    try {
+      sender.send(envelope.message);
+    } catch (error) {
+      logger.debug({ err: error, event: 'direct_file_v2.control_send_failed' }, 'control send failed');
+    }
+    return;
+  }
+
+  if (envelope.type === DIRECT_FILE_TRANSFER_WORKER_MSG.HOST_CALL) {
+    const mutationClientUploadId = beginHostMutation(active.generation, envelope.method, envelope.args);
+    void invokeHostMethod(active.generation, envelope.method, envelope.args)
+      .then((value) => {
+        if (handle?.generation !== active.generation || active.state === 'failed') return;
+        try {
+          postToWorker(active, {
+            type: DIRECT_FILE_TRANSFER_WORKER_MSG.HOST_RESULT, callId: envelope.callId, ok: true, value,
+          });
+        } catch {
+          failWorkerGeneration(active, 'ipc_send_failed', null, null, true);
+        }
+      })
+      .catch((error: unknown) => {
+        if (handle?.generation !== active.generation || active.state === 'failed') return;
+        try {
+          postToWorker(active, {
+            type: DIRECT_FILE_TRANSFER_WORKER_MSG.HOST_RESULT,
+            callId: envelope.callId,
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        } catch {
+          failWorkerGeneration(active, 'ipc_send_failed', null, null, true);
+        }
+      })
+      .finally(() => finishHostMutation(active.generation, mutationClientUploadId));
+    return;
+  }
+
+  if (envelope.type === DIRECT_FILE_TRANSFER_WORKER_MSG.RECYCLING) {
+    // Bound to this exact generation: a late declaration from a corpse must not
+    // excuse a genuine crash of the generation that replaced it.
+    plannedRecycleGeneration = active.generation;
+    return;
+  }
+
+  if (envelope.type === DIRECT_FILE_TRANSFER_WORKER_MSG.LEASE_CLOSED) {
+    // A lease that ended normally is not a lease that was lost with its child.
+    establishedLeases.delete(leaseRegistryKey(envelope.leaseId, envelope.leaseGeneration));
+    return;
+  }
+
+  if (envelope.type === DIRECT_FILE_TRANSFER_WORKER_MSG.READY) {
+    // The worker publishes STATUS_REPLY immediately before READY, so the
+    // projection is already current when the boot promise resolves.
+    markReady();
+    return;
+  }
+
+  if (envelope.type === DIRECT_FILE_TRANSFER_WORKER_MSG.STATUS_REPLY) {
+    availableProjection = envelope.available;
+    runtimeStatusProjection = envelope.available
+      ? { state: DIRECT_CONNECTIVITY_RUNTIME_STATE.AVAILABLE }
+      : { state: DIRECT_CONNECTIVITY_RUNTIME_STATE.RUNTIME_UNAVAILABLE };
   }
 }
 
-export async function handleDirectFileTransferCommand(message: unknown, sender: FileTransferSender): Promise<boolean> {
+function armStableWorkerWindow(active: WorkerHandle): void {
+  if (stableTimer) clearTimeout(stableTimer);
+  stableTimer = setTimeout(() => {
+    stableTimer = null;
+    if (!handle || handle.generation !== active.generation) return;
+    restarts = 0;
+  }, DIRECT_FILE_TRANSFER_STABLE_WINDOW_MS);
+  stableTimer.unref?.();
+}
+
+function finalizeWorkerGenerationFailure(
+  active: WorkerHandle,
+  code: number | null,
+  signal: NodeJS.Signals | null,
+): void {
+  if (!handle || handle.generation !== active.generation || active.state !== 'failed') return;
+  handle = null;
+  releaseClaimsForLostWorker(active.generation);
+  scheduleWorkerRestart(code, signal, active.generation);
+}
+
+function failWorkerGeneration(
+  active: WorkerHandle,
+  reason: string,
+  code: number | null,
+  signal: NodeJS.Signals | null,
+  terminate: boolean,
+): void {
+  if (!handle || handle.generation !== active.generation) return;
+  if (active.state !== 'failed') {
+    active.state = 'failed';
+    active.settleReady(false);
+    if (stableTimer) clearTimeout(stableTimer);
+    stableTimer = null;
+    failPendingForLostWorker();
+    invalidateEstablishedLeasesForLostWorker();
+    availableProjection = true;
+    runtimeStatusProjection = { state: DIRECT_CONNECTIVITY_RUNTIME_STATE.AVAILABLE };
+    logger.warn(
+      { event: 'direct_file_v2.child_generation_failed', generation: active.generation, reason },
+      'transfer child generation failed',
+    );
+  }
+  if (!terminate) {
+    // An exit event is the authority that this OS generation can no longer
+    // mutate files. Only now may its claims be released and a successor spawn.
+    finalizeWorkerGenerationFailure(active, code, signal);
+    return;
+  }
+  if (active.retirement) return;
+  // IPC/error/READY-timeout paths observe a still-live process. Keep the
+  // failed handle and its claims authoritative until terminate() has reaped
+  // that exact child; otherwise old and replacement generations can overlap.
+  active.retirement = active.worker.terminate();
+  void active.retirement
+    .then((exitCode) => finalizeWorkerGenerationFailure(active, exitCode, signal))
+    .catch((error: unknown) => {
+      logger.error(
+        { err: error, event: 'direct_file_v2.child_reap_failed', generation: active.generation },
+        'transfer child could not be reaped; refusing an overlapping replacement',
+      );
+    });
+}
+
+function scheduleWorkerRestart(code: number | null, signal: NodeJS.Signals | null, generation: number): void {
+  if (shuttingDown || nativeAdmissionClosed || restartTimer) return;
+  const planned = plannedRecycleGeneration === generation;
+  plannedRecycleGeneration = null;
+  if (!planned) restarts = Math.min(Number.MAX_SAFE_INTEGER, restarts + 1);
+  const delayMs = planned
+    ? DIRECT_FILE_TRANSFER_RESTART_BASE_MS
+    : Math.min(
+      DIRECT_FILE_TRANSFER_RESTART_MAX_MS,
+      DIRECT_FILE_TRANSFER_RESTART_BASE_MS * (2 ** Math.min(7, restarts - 1)),
+    );
+  logger.warn(
+    { event: 'direct_file_v2.child_crash', code, signal, generation, crashCount: restarts },
+    'transfer child exited; daemon and sessions remain online',
+  );
+  logger.warn(
+    { event: 'direct_file_v2.retry_scheduled', generation, crashCount: restarts, delayMs },
+    'scheduling transfer child recovery',
+  );
+  logger.info(
+    { event: 'direct_file_v2.recovering', generation, delayMs },
+    'direct transfer child recovering; capability remains advertised',
+  );
+  restartTimer = setTimeout(() => {
+    restartTimer = null;
+    if (handle || shuttingDown || nativeAdmissionClosed) return;
+    try {
+      spawnWorker();
+    } catch (error) {
+      availableProjection = true;
+      runtimeStatusProjection = { state: DIRECT_CONNECTIVITY_RUNTIME_STATE.AVAILABLE };
+      logger.warn(
+        { err: error, event: 'direct_file_v2.child_spawn_failed', generation },
+        'transfer child spawn failed; recovery remains scheduled',
+      );
+      scheduleWorkerRestart(null, null, generation);
+    }
+  }, delayMs);
+  restartTimer.unref?.();
+}
+
+function spawnWorker(): WorkerHandle {
+  generationCounter += 1;
+  const generation = generationCounter;
+  const worker = workerFactory(workerModuleUrl(), {
+    workerData: { kind: DIRECT_FILE_TRANSFER_WORKER_KIND, generation },
+  });
+  let resolveReady: (ready: boolean) => void = () => {};
+  const ready = new Promise<boolean>((resolve) => { resolveReady = resolve; });
+  let readySettled = false;
+  let readyTimer: ReturnType<typeof setTimeout>;
+  const active: WorkerHandle = {
+    worker,
+    generation,
+    ready,
+    state: 'pending',
+    retirement: null,
+    settleReady(workerBecameReady) {
+      if (readySettled) return;
+      readySettled = true;
+      clearTimeout(readyTimer);
+      if (workerBecameReady) active.state = 'ready';
+      resolveReady(workerBecameReady);
+      if (!workerBecameReady) return;
+      armStableWorkerWindow(active);
+      if (restarts > 0 && availableProjection) {
+        logger.info(
+          { event: 'direct_file_v2.recovered', generation: active.generation, crashCount: restarts },
+          'direct transfer child recovered',
+        );
+      }
+    },
+  };
+  readyTimer = setTimeout(() => {
+    if (!handle || handle.generation !== generation || active.state !== 'pending') return;
+    failWorkerGeneration(active, 'ready_timeout', null, null, true);
+  }, DIRECT_FILE_TRANSFER_READY_TIMEOUT_MS);
+  readyTimer.unref?.();
+
+  worker.on('message', (raw: unknown) => handleWorkerMessage(active, raw, () => active.settleReady(true)));
+  worker.on('error', (error) => {
+    logger.warn({ err: error, event: 'direct_file_v2.worker_error', generation }, 'transfer worker error');
+    failWorkerGeneration(active, 'child_process_error', null, null, true);
+  });
+  worker.on('exit', (code: number | null, signal: NodeJS.Signals | null = null) => {
+    failWorkerGeneration(active, 'child_exit', code, signal, false);
+  });
+
+  handle = active;
+  return active;
+}
+
+function ensureWorker(): WorkerHandle | null {
+  if (handle) return handle;
+  if (restartTimer) return null;
+  try {
+    return spawnWorker();
+  } catch (error) {
+    availableProjection = true;
+    runtimeStatusProjection = { state: DIRECT_CONNECTIVITY_RUNTIME_STATE.AVAILABLE };
+    logger.warn({ err: error, event: 'direct_file_v2.child_spawn_failed' }, 'transfer child spawn failed');
+    scheduleWorkerRestart(null, null, generationCounter);
+    return null;
+  }
+}
+
+export async function initializeDirectFileTransfer(): Promise<boolean> {
+  shuttingDown = false;
+  const active = ensureWorker();
+  if (!active) return false;
+  const ready = await active.ready;
+  return ready && availableProjection;
+}
+
+export function isDirectFileTransferAvailable(): boolean {
+  return availableProjection;
+}
+
+export function getDirectConnectivityRuntimeStatus(): DirectConnectivityRuntimeStatus {
+  return runtimeStatusProjection;
+}
+
+export async function handleDirectFileTransferCommand(
+  message: unknown,
+  sender: FileTransferSender,
+): Promise<boolean> {
+  // Once the addon is quiesced the worker is gone and must not come back: a
+  // fresh one would map the very file the upgrade is about to replace.
+  if (shuttingDown || nativeAdmissionClosed) return false;
+  // Validated HERE, before the structured clone, not after it in the worker.
+  // The worker checks again on receipt and must, but by the time it can the
+  // main thread has already paid to copy whatever it was handed — and that copy
+  // is precisely the main-loop cost this split exists to remove.
   const parsed = validateDirectFileTransferDaemonCommand(message);
   if (!parsed.ok) return false;
-  const command = parsed.value;
-  if (command.type === DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARE) {
-    await prepareLease(command, sender);
-    return true;
+  const active = ensureWorker();
+  if (!active) {
+    sendRuntimeRecovering(sender, parsed.value);
+    return false;
   }
-  if (command.type === DIRECT_FILE_TRANSFER_MSG.LEASE_REBIND) {
-    const lease = leases.get(leaseKey(command.leaseId, command.leaseGeneration));
-    if (lease) lease.sender = sender;
-    return true;
+  if (active.state === 'failed') {
+    sendRuntimeRecovering(sender, parsed.value);
+    return false;
   }
-  if (command.type === DIRECT_FILE_TRANSFER_MSG.PREPARE) {
-    await prepareOperation(command, sender);
-    return true;
+  // The initial child may accept a bounded command while bootstrapping, but a
+  // replacement generation is not trusted until it has emitted READY. During
+  // recovery callers receive the explicit retryable outcome instead of writing
+  // into a live-but-mute child.
+  if (active.state !== 'ready' && restarts > 0) {
+    sendRuntimeRecovering(sender, parsed.value);
+    return false;
   }
-  if (command.type === DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY) {
-    const lease = leases.get(leaseKey(command.leaseId, command.leaseGeneration));
-    if (!lease || lease.binding.serverId !== command.serverId || lease.binding.browserTabId !== command.browserTabId
-      || lease.binding.daemonGeneration !== command.daemonGeneration) return true;
-    lease.sender = sender;
-    const ledger = findLedger(command);
-    directFileMetric('status_recovery', {
-      direction: command.direction,
-      attempt: command.attempt,
-      state: ledger?.state ?? DIRECT_FILE_TRANSFER_OPERATION_STATE.ATTEMPTING,
+  const senderId = senderIdFor(sender);
+  if (!rememberPending(sender, senderId, parsed.value)) {
+    sendRuntimeRecovering(sender, parsed.value);
+    return false;
+  }
+  try {
+    postToWorker(active, {
+      type: DIRECT_FILE_TRANSFER_WORKER_MSG.COMMAND,
+      senderId,
+      command: parsed.value,
     });
-    const {
-      type: _type,
-      protocolVersion: _protocolVersion,
-      ...binding
-    } = command;
-    sendControl(lease, {
-      type: DIRECT_FILE_TRANSFER_MSG.STATUS,
-      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
-      // Status recovery is bound by the exact scope/operation tuple rather
-      // than a consumed single-use authority.
-      ...binding,
-      state: ledger?.state ?? DIRECT_FILE_TRANSFER_OPERATION_STATE.ATTEMPTING,
-      ...(ledger?.attachment ? { attachment: ledger.attachment } : {}),
-    });
-    return true;
+  } catch {
+    const requestId = (parsed.value as { requestId?: unknown }).requestId;
+    if (typeof requestId === 'string') pendingByKey.delete(pendingKey(senderId, requestId));
+    failWorkerGeneration(active, 'ipc_send_failed', null, null, true);
+    sendRuntimeRecovering(sender, parsed.value);
+    return false;
   }
-  if (command.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER) {
-    await receiveLeaseOffer(command);
-    return true;
-  }
-  if (command.type === DIRECT_FILE_TRANSFER_MSG.LEASE_ICE) {
-    await receiveLeaseIce(command);
-    return true;
-  }
-  const transfer = findActive(command);
-  if (!transfer) return true;
-  if (command.type === DIRECT_FILE_TRANSFER_MSG.CANCEL) {
-    await failTransfer(transfer, command.reason, false);
-    return true;
-  }
+  // Handing the command to the worker is the main thread's whole job here; the
+  // reply arrives asynchronously as a CONTROL envelope.
   return true;
 }
 
-export async function shutdownDirectFileTransfers(): Promise<void> {
-  const current = [...leases.values()];
-  await Promise.all(current.map((lease) => closeLease(lease, true)));
-  recentOperations.clear();
-  if (rtc) {
-    try { rtc.cleanup(); } catch { /* native runtime already cleaned */ }
+/* --------------------------------------------------------------------------
+ * Upgrade quiesce, across the boundary.
+ *
+ * The upgrade path replaces node_datachannel.node in place while this daemon
+ * may still have it mapped; calling into the addon afterwards faults. The
+ * mapping now lives in the worker, so the main thread cannot inspect it — it
+ * asks the isolate that owns it to drain its peers and clean up, and only a
+ * real answer authorizes replacement.
+ *
+ * This is strictly stronger than draining in-process was: on success the thread
+ * itself is ended, so the old mapping is not merely idle, it is unreachable.
+ * ------------------------------------------------------------------------ */
+
+const DIRECT_FILE_TRANSFER_NATIVE_QUIESCE_TIMEOUT_MS = 10_000;
+
+/** Admission closed: no command is accepted and no worker may be spawned. */
+let nativeAdmissionClosed = false;
+/**
+ * Quiesce COMPLETED: the worker proved it drained and cleaned up, and its
+ * thread is gone. Distinct from admission closure on purpose — closing
+ * admission is the first step, not proof that the addon is safe to replace.
+ */
+let nativeQuiesceCompleted = false;
+/** In-flight quiesce, so concurrent callers share the one real outcome. */
+let inFlightNativeQuiesce: Promise<{ ok: boolean; reason?: string; closedLeases: number }> | null = null;
+
+/** Ask the worker for the real outcome, bounded so a mute worker cannot hang the upgrade. */
+function requestWorkerQuiesce(
+  active: WorkerHandle,
+  timeoutMs: number,
+): Promise<{ ok: boolean; reason?: string; closedLeases: number }> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result: { ok: boolean; reason?: string; closedLeases: number }) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      active.worker.off('message', onMessage);
+      active.worker.off('exit', onExit);
+      resolve(result);
+    };
+    // The worker owns the drain deadline; this outer one only covers a worker
+    // that never answers at all. Silence is not proof, so it fails closed.
+    const timer = setTimeout(
+      () => finish({ ok: false, reason: 'quiesce_result_timeout', closedLeases: 0 }),
+      timeoutMs + SHUTDOWN_ACK_TIMEOUT_MS,
+    );
+    if (typeof timer.unref === 'function') timer.unref();
+    const onMessage = (raw: unknown) => {
+      const envelope = validateDirectFileTransferWorkerEnvelope(raw);
+      if (!envelope || envelope.type !== DIRECT_FILE_TRANSFER_WORKER_MSG.QUIESCE_RESULT) return;
+      if (envelope.generation !== active.generation) return;
+      finish({
+        ok: envelope.ok,
+        closedLeases: envelope.closedLeases,
+        ...(envelope.reason ? { reason: envelope.reason } : {}),
+      });
+    };
+    // A worker that died mid-quiesce proved nothing about the mapping it held.
+    const onExit = () => finish({ ok: false, reason: 'quiesce_worker_exited', closedLeases: 0 });
+    active.worker.on('message', onMessage);
+    active.worker.on('exit', onExit);
+    postToWorker(active, { type: DIRECT_FILE_TRANSFER_WORKER_MSG.QUIESCE, timeoutMs });
+  });
+}
+
+export async function quiesceDirectFileTransferNative(
+  timeoutMs = DIRECT_FILE_TRANSFER_NATIVE_QUIESCE_TIMEOUT_MS,
+): Promise<{ ok: boolean; reason?: string; closedLeases: number }> {
+  // Only a COMPLETED quiesce is standing authority. Admission closure is not.
+  if (nativeQuiesceCompleted) return { ok: true, closedLeases: 0 };
+  // Concurrent callers must observe the REAL outcome, not a second half-run.
+  if (inFlightNativeQuiesce) return inFlightNativeQuiesce;
+  const run = (async () => {
+    // Closed first and synchronously, so nothing is admitted mid-drain and a
+    // worker that dies during it is not replaced by a fresh one that would map
+    // the addon all over again.
+    nativeAdmissionClosed = true;
+    if (restartTimer) clearTimeout(restartTimer);
+    restartTimer = null;
+    const active = handle;
+    if (!active) {
+      // No isolate holds the mapping, so there is nothing that could fault.
+      nativeQuiesceCompleted = true;
+      return { ok: true, closedLeases: 0 };
+    }
+    const result = await requestWorkerQuiesce(active, timeoutMs);
+    // Fail closed: the caller must not replace anything. Admission stays shut,
+    // so the daemon keeps running with direct transfer degraded to relay.
+    if (!result.ok) return result;
+    handle = null;
+    availableProjection = false;
+    runtimeStatusProjection = { state: DIRECT_CONNECTIVITY_RUNTIME_STATE.RUNTIME_UNAVAILABLE };
+    // Ending the child process is what turns "drained" into "unreachable".
+    await active.worker.terminate();
+    releaseClaimsForLostWorker(active.generation);
+    sendersById.clear();
+    nativeQuiesceCompleted = true;
+    logger.info(
+      { event: 'direct_file_v2.native_quiesced', closedLeases: result.closedLeases },
+      'Direct file transfer native runtime quiesced',
+    );
+    return result;
+  })();
+  inFlightNativeQuiesce = run;
+  try {
+    return await run;
+  } finally {
+    inFlightNativeQuiesce = null;
   }
-  rtc = null;
+}
+
+/** Whether new peers/leases are refused because the addon was quiesced. */
+export function isDirectTransferNativeQuiesced(): boolean {
+  return nativeAdmissionClosed;
+}
+
+export async function shutdownDirectFileTransfers(): Promise<void> {
+  shuttingDown = true;
+  nativeAdmissionClosed = true;
+  if (restartTimer) clearTimeout(restartTimer);
+  restartTimer = null;
+  failPendingForLostWorker();
+  const active = handle;
+  if (!active) {
+    // Nothing holds the addon, which is exactly what completion means here.
+    nativeQuiesceCompleted = true;
+    return;
+  }
+  // Fail closed on absence as well as on failure: a missing ack is strictly
+  // less evidence of a clean stop than a failing one, so the timeout resolves
+  // to "not ok" rather than to silence.
+  const acked = new Promise<{ cleanupOk: boolean; detail?: string }>((resolve) => {
+    const timer = setTimeout(() => resolve({ cleanupOk: false, detail: 'shutdown_ack_timeout' }), SHUTDOWN_ACK_TIMEOUT_MS);
+    if (typeof timer.unref === 'function') timer.unref();
+    const onMessage = (raw: unknown) => {
+      const envelope = validateDirectFileTransferWorkerEnvelope(raw);
+      if (!envelope || envelope.type !== DIRECT_FILE_TRANSFER_WORKER_MSG.SHUTDOWN_ACK) return;
+      if (envelope.generation !== active.generation) return;
+      clearTimeout(timer);
+      active.worker.off('message', onMessage);
+      resolve({ cleanupOk: envelope.cleanupOk, ...(envelope.detail ? { detail: envelope.detail } : {}) });
+    };
+    active.worker.on('message', onMessage);
+  });
+  postToWorker(active, { type: DIRECT_FILE_TRANSFER_WORKER_MSG.SHUTDOWN });
+  const outcome = await acked;
+  // Terminate unconditionally after the ack window: the native RTC runtime does
+  // not always release the worker's loop, so waiting for a natural exit can hang
+  // daemon shutdown indefinitely.
+  handle = null;
+  availableProjection = false;
+  runtimeStatusProjection = { state: DIRECT_CONNECTIVITY_RUNTIME_STATE.RUNTIME_UNAVAILABLE };
+  await active.worker.terminate();
+  releaseClaimsForLostWorker(active.generation);
+  sendersById.clear();
+  nativeQuiesceCompleted = true;
+  if (!outcome.cleanupOk) {
+    // Teardown of local state is complete, but the worker did not reach a safe
+    // resting point. Surfacing this is the whole point: the caller decides, and
+    // it must never be able to mistake this for an orderly stop.
+    throw new Error(
+      `direct file transfer worker shutdown cleanup failed: ${outcome.detail ?? 'unknown'}`,
+    );
+  }
 }

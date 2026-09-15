@@ -120,14 +120,14 @@ describe('exec_remote / list_machines handlers (10.12)', () => {
   it('list_machines returns the machines from the dep', async () => {
     const machineDeps: MachineToolDeps = {
       listMachines: async ({ includeOffline }) => (includeOffline ? [
-        { name: 'a', os: 'win', online: true, execEnabled: true, role: 'controlled' },
-        { name: 'b', os: 'linux', online: false, execEnabled: true, role: 'controlled' },
-      ] : [{ name: 'a', os: 'win', online: true, execEnabled: true, role: 'controlled' }]),
+        { name: '1000000001', os: 'win', online: true, execEnabled: true, role: 'controlled' },
+        { name: '1000000002', os: 'linux', online: false, execEnabled: true, role: 'controlled' },
+      ] : [{ name: '1000000001', os: 'win', online: true, execEnabled: true, role: 'controlled' }]),
       execRemote: async () => ({ outcome: 'completed' as const }),
     };
     const handlers = createMemoryMcpToolHandlers(caller(), { machineDeps });
-    expect(await handlers[listMachines]({})).toMatchObject({ status: 'ok', machines: [{ name: 'a' }] });
-    expect(await handlers[listMachines]({ includeOffline: true })).toMatchObject({ status: 'ok', machines: [{ name: 'a' }, { name: 'b' }] });
+    expect(await handlers[listMachines]({})).toMatchObject({ status: 'ok', machines: [{ name: '1000000001' }] });
+    expect(await handlers[listMachines]({ includeOffline: true })).toMatchObject({ status: 'ok', machines: [{ name: '1000000001' }, { name: '1000000002' }] });
   });
 
   it('computer_use_docs returns focused documentation without machine deps', async () => {

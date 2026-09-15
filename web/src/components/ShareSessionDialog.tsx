@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from 'preact/hooks';
+import type { JSX } from 'preact';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { ApiError, createShare, listSharesForTarget, revokeShare, updateShare } from '../api.js';
 import {
@@ -10,6 +11,12 @@ import {
   type ShareRole,
   type ShareTarget,
 } from '../tab-sharing-ui.js';
+import { RemoteDesktopOwnerAccess } from './RemoteDesktopOwnerAccess.js';
+
+interface RemoteDesktopShareAccess {
+  hostId: string | null;
+  endpointLabel: string;
+}
 
 interface Props {
   target: ShareDialogTarget;
@@ -18,9 +25,12 @@ interface Props {
   /** Fixed machine targets reuse grant management without exposing Tab/server scope choices. */
   fixedTarget?: ShareTarget;
   variant?: 'session' | 'machine';
+  /** Owner-only public remote-desktop access lives inside the machine share dialog. */
+  remoteDesktopAccess?: RemoteDesktopShareAccess;
 }
 
 type TargetChoice = 'current-tab' | 'server';
+type MachineShareSection = 'account' | 'remote-desktop';
 
 function formatShareError(error: unknown): string {
   if (error instanceof ApiError) return error.body || error.message;
@@ -32,9 +42,17 @@ function getGrantDisplayName(grant: ShareGrantSummary): string {
   return grant.targetUserDisplayName?.trim() || grant.targetUserId;
 }
 
-export function ShareSessionDialog({ target, onClose, onSharesChanged, fixedTarget, variant = 'session' }: Props) {
+export function ShareSessionDialog({
+  target,
+  onClose,
+  onSharesChanged,
+  fixedTarget,
+  variant = 'session',
+  remoteDesktopAccess,
+}: Props) {
   const { t } = useTranslation();
   const [targetChoice, setTargetChoice] = useState<TargetChoice>('current-tab');
+  const [machineSection, setMachineSection] = useState<MachineShareSection>('account');
   const [role, setRole] = useState<ShareRole>('viewer');
   const [targetUser, setTargetUser] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -42,6 +60,9 @@ export function ShareSessionDialog({ target, onClose, onSharesChanged, fixedTarg
   const [shares, setShares] = useState<ShareGrantSummary[]>([]);
   const [sharesLoading, setSharesLoading] = useState(false);
   const [updatingShareId, setUpdatingShareId] = useState<string | null>(null);
+  const accountTabRef = useRef<HTMLButtonElement>(null);
+  const remoteDesktopTabRef = useRef<HTMLButtonElement>(null);
+  const hasRemoteDesktopSection = variant === 'machine' && remoteDesktopAccess !== undefined;
 
   // ControlledNodesPanel refreshes presence in the background and recreates
   // its inline target objects on every render. Depend on the target identity,
@@ -141,6 +162,16 @@ export function ShareSessionDialog({ target, onClose, onSharesChanged, fixedTarg
     }
   }, [onSharesChanged, replaceShare, t, target.serverId, updatingShareId]);
 
+  const handleMachineTabKeyDown = useCallback((event: JSX.TargetedKeyboardEvent<HTMLButtonElement>) => {
+    let next: MachineShareSection | null = null;
+    if (event.key === 'ArrowLeft' || event.key === 'Home') next = 'account';
+    if (event.key === 'ArrowRight' || event.key === 'End') next = 'remote-desktop';
+    if (!next) return;
+    event.preventDefault();
+    setMachineSection(next);
+    (next === 'account' ? accountTabRef : remoteDesktopTabRef).current?.focus();
+  }, []);
+
   return (
     <div class="ask-dialog-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
       <div class="ask-dialog share-dialog" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label={t(variant === 'machine' ? 'controlled_nodes.share.title' : 'share.dialogTitle')}>
@@ -149,113 +180,171 @@ export function ShareSessionDialog({ target, onClose, onSharesChanged, fixedTarg
           <div class="share-dialog-subtitle">{t(variant === 'machine' ? 'controlled_nodes.share.subtitle' : 'share.dialogSubtitle', { target: targetLabel })}</div>
         </div>
 
-        {!fixedTarget && <div class="share-field">
-          <div class="share-field-label">{t('share.target.label')}</div>
-          <div class="share-choice-row" role="radiogroup" aria-label={t('share.target.label')}>
-            <label class="share-choice">
-              <input
-                type="radio"
-                checked={targetChoice === 'current-tab'}
-                onChange={() => setTargetChoice('current-tab')}
-              />
-              <span>{t('share.target.currentTab')}</span>
-            </label>
-            <label class="share-choice">
-              <input
-                type="radio"
-                checked={targetChoice === 'server'}
-                onChange={() => setTargetChoice('server')}
-              />
-              <span>{t('share.target.server')}</span>
-            </label>
-          </div>
-        </div>}
-
-        <div class="share-field">
-          <div class="share-field-label">{t('share.role.label')}</div>
-          <div class="share-choice-row" role="radiogroup" aria-label={t('share.role.label')}>
-            <label class="share-choice">
-              <input type="radio" checked={role === 'viewer'} onChange={() => setRole('viewer')} />
-              <span>{t('share.role.viewer')}</span>
-            </label>
-            <label class="share-choice">
-              <input type="radio" checked={role === 'participant'} onChange={() => setRole('participant')} />
-              <span>{t('share.role.participant')}</span>
-            </label>
-          </div>
-          <div class="share-help">{t(`${roleHelpPrefix}.${role}`)}</div>
-        </div>
-
-        {isParticipantRole(role) && (
-          <div class="share-trust-disclosure" role="note">
-            <strong>{t(variant === 'machine' ? 'controlled_nodes.share.trust_title' : 'share.trust.title')}</strong>
-            <span>{t(variant === 'machine' ? 'controlled_nodes.share.trust_body' : 'share.trust.body')}</span>
+        {hasRemoteDesktopSection && (
+          <div class="share-dialog-tabs" role="tablist" aria-label={t('controlled_nodes.share.sections_label')}>
+            <button
+              ref={accountTabRef}
+              id="machine-account-share-tab"
+              class={`share-dialog-tab${machineSection === 'account' ? ' is-active' : ''}`}
+              type="button"
+              role="tab"
+              aria-selected={machineSection === 'account'}
+              aria-controls="machine-account-share-panel"
+              tabIndex={machineSection === 'account' ? 0 : -1}
+              onClick={() => setMachineSection('account')}
+              onKeyDown={handleMachineTabKeyDown}
+            >
+              {t('controlled_nodes.share.account_tab')}
+            </button>
+            <button
+              ref={remoteDesktopTabRef}
+              id="machine-remote-desktop-share-tab"
+              class={`share-dialog-tab${machineSection === 'remote-desktop' ? ' is-active' : ''}`}
+              type="button"
+              role="tab"
+              aria-selected={machineSection === 'remote-desktop'}
+              aria-controls="machine-remote-desktop-share-panel"
+              tabIndex={machineSection === 'remote-desktop' ? 0 : -1}
+              onClick={() => setMachineSection('remote-desktop')}
+              onKeyDown={handleMachineTabKeyDown}
+            >
+              {t('controlled_nodes.share.remote_desktop_tab')}
+            </button>
           </div>
         )}
 
-        <div class="share-field">
-          <label class="share-field-label" for="share-target-user">{t('share.recipient.label')}</label>
-          <input
-            id="share-target-user"
-            class="share-input"
-            value={targetUser}
-            onInput={(e) => setTargetUser((e.target as HTMLInputElement).value)}
-            placeholder={t('share.recipient.placeholder')}
-          />
-        </div>
-
-        {error && <div class="share-error" role="alert">{error}</div>}
-
-        <div class="share-list" aria-label={t('share.list.label')}>
-          <div class="share-list-title">{t('share.list.title')}</div>
-          {sharesLoading ? (
-            <div class="share-list-empty">{t('common.loading')}</div>
-          ) : shares.length === 0 ? (
-            <div class="share-list-empty">{t('share.list.empty')}</div>
-          ) : (
-            shares.map((share) => (
-              <div class="share-list-row" key={share.id}>
-                <div class="share-list-main">
-                  <div class="share-list-name">{getGrantDisplayName(share)}</div>
-                  <div class="share-list-meta">
-                    <span>{t(`share.status.${share.status}`)}</span>
-                    {share.targetLabel && <span>{share.targetLabel}</span>}
-                  </div>
-                </div>
-                <div class="share-list-actions">
-                  <select
-                    class="share-role-select"
-                    aria-label={t('share.manage.roleFor', { user: getGrantDisplayName(share) })}
-                    value={share.role}
-                    disabled={share.status !== 'active' || updatingShareId === share.id}
-                    onInput={(e) => void handleRoleChange(share, (e.currentTarget as HTMLSelectElement).value as ShareRole)}
-                  >
-                    <option value="viewer">{t('share.role.viewer')}</option>
-                    <option value="participant">{t('share.role.participant')}</option>
-                  </select>
-                  <button
-                    class="share-revoke-btn"
-                    type="button"
-                    disabled={share.status !== 'active' || updatingShareId === share.id}
-                    onClick={() => void handleRevoke(share)}
-                  >
-                    {t('share.manage.revoke')}
-                  </button>
-                </div>
+        {(!hasRemoteDesktopSection || machineSection === 'account') && (
+          <div
+            id={hasRemoteDesktopSection ? 'machine-account-share-panel' : undefined}
+            class="share-dialog-panel"
+            role={hasRemoteDesktopSection ? 'tabpanel' : undefined}
+            aria-labelledby={hasRemoteDesktopSection ? 'machine-account-share-tab' : undefined}
+          >
+            {!fixedTarget && <div class="share-field">
+              <div class="share-field-label">{t('share.target.label')}</div>
+              <div class="share-choice-row" role="radiogroup" aria-label={t('share.target.label')}>
+                <label class="share-choice">
+                  <input
+                    type="radio"
+                    checked={targetChoice === 'current-tab'}
+                    onChange={() => setTargetChoice('current-tab')}
+                  />
+                  <span>{t('share.target.currentTab')}</span>
+                </label>
+                <label class="share-choice">
+                  <input
+                    type="radio"
+                    checked={targetChoice === 'server'}
+                    onChange={() => setTargetChoice('server')}
+                  />
+                  <span>{t('share.target.server')}</span>
+                </label>
               </div>
-            ))
-          )}
-        </div>
+            </div>}
+
+            <div class="share-field">
+              <div class="share-field-label">{t('share.role.label')}</div>
+              <div class="share-choice-row" role="radiogroup" aria-label={t('share.role.label')}>
+                <label class="share-choice">
+                  <input type="radio" checked={role === 'viewer'} onChange={() => setRole('viewer')} />
+                  <span>{t('share.role.viewer')}</span>
+                </label>
+                <label class="share-choice">
+                  <input type="radio" checked={role === 'participant'} onChange={() => setRole('participant')} />
+                  <span>{t('share.role.participant')}</span>
+                </label>
+              </div>
+              <div class="share-help">{t(`${roleHelpPrefix}.${role}`)}</div>
+            </div>
+
+            {isParticipantRole(role) && (
+              <div class="share-trust-disclosure" role="note">
+                <strong>{t(variant === 'machine' ? 'controlled_nodes.share.trust_title' : 'share.trust.title')}</strong>
+                <span>{t(variant === 'machine' ? 'controlled_nodes.share.trust_body' : 'share.trust.body')}</span>
+              </div>
+            )}
+
+            <div class="share-field">
+              <label class="share-field-label" for="share-target-user">{t('share.recipient.label')}</label>
+              <input
+                id="share-target-user"
+                class="share-input"
+                value={targetUser}
+                onInput={(e) => setTargetUser((e.target as HTMLInputElement).value)}
+                placeholder={t('share.recipient.placeholder')}
+              />
+            </div>
+
+            {error && <div class="share-error" role="alert">{error}</div>}
+
+            <div class="share-list" aria-label={t('share.list.label')}>
+              <div class="share-list-title">{t('share.list.title')}</div>
+              {sharesLoading ? (
+                <div class="share-list-empty">{t('common.loading')}</div>
+              ) : shares.length === 0 ? (
+                <div class="share-list-empty">{t('share.list.empty')}</div>
+              ) : (
+                shares.map((share) => (
+                  <div class="share-list-row" key={share.id}>
+                    <div class="share-list-main">
+                      <div class="share-list-name">{getGrantDisplayName(share)}</div>
+                      <div class="share-list-meta">
+                        <span>{t(`share.status.${share.status}`)}</span>
+                        {share.targetLabel && <span>{share.targetLabel}</span>}
+                      </div>
+                    </div>
+                    <div class="share-list-actions">
+                      <select
+                        class="share-role-select"
+                        aria-label={t('share.manage.roleFor', { user: getGrantDisplayName(share) })}
+                        value={share.role}
+                        disabled={share.status !== 'active' || updatingShareId === share.id}
+                        onInput={(e) => void handleRoleChange(share, (e.currentTarget as HTMLSelectElement).value as ShareRole)}
+                      >
+                        <option value="viewer">{t('share.role.viewer')}</option>
+                        <option value="participant">{t('share.role.participant')}</option>
+                      </select>
+                      <button
+                        class="share-revoke-btn"
+                        type="button"
+                        disabled={share.status !== 'active' || updatingShareId === share.id}
+                        onClick={() => void handleRevoke(share)}
+                      >
+                        {t('share.manage.revoke')}
+                      </button>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        )}
+
+        {hasRemoteDesktopSection && machineSection === 'remote-desktop' && (
+          <div
+            id="machine-remote-desktop-share-panel"
+            class="share-dialog-panel share-dialog-remote-desktop"
+            role="tabpanel"
+            aria-labelledby="machine-remote-desktop-share-tab"
+          >
+            <RemoteDesktopOwnerAccess
+              hostId={remoteDesktopAccess.hostId}
+              endpointLabel={remoteDesktopAccess.endpointLabel}
+            />
+          </div>
+        )}
 
         <div class="ask-actions">
           <button class="ask-btn-cancel" onClick={onClose}>{t('common.cancel')}</button>
-          <button
-            class="ask-btn-submit"
-            disabled={!targetUser.trim() || submitting}
-            onClick={submit}
-          >
-            {submitting ? t('share.creating') : t('share.create')}
-          </button>
+          {(!hasRemoteDesktopSection || machineSection === 'account') && (
+            <button
+              class="ask-btn-submit"
+              disabled={!targetUser.trim() || submitting}
+              onClick={submit}
+            >
+              {submitting ? t('share.creating') : t('share.create')}
+            </button>
+          )}
         </div>
       </div>
     </div>

@@ -23,9 +23,13 @@ const SOURCE_PATHS = [
   'native/windows-remote-desktop/worker_policy.cc',
   'native/windows-remote-desktop/unlock_secret.cc',
   'native/windows-remote-desktop/worker_policy.h',
+  'native/windows-remote-desktop/windows_platform_adapters.cc',
   'native/windows-virtual-display/virtual_display_driver.cc',
   'native/windows-virtual-display/imcodes-virtual-display.inf',
+  'native/remote-desktop-common/quality_ladder.cc',
+  'native/remote-desktop-common/transport_session_core.cc',
   'src/node/remote-desktop-worker-host.ts',
+  'src/node/remote-desktop-worker-host-core.ts',
   'src/node/self-upgrade.ts',
   'src/node/windows-user-session.ts',
   'scripts/build-node-exe.mjs',
@@ -103,7 +107,14 @@ const contracts: Contract[] = [
       },
       {
         path: 'server/src/ws/remote-desktop-router.ts',
-        needle: "if (controlledNode && access.os !== 'win')",
+        // The platform gate is now the node's enrolled OS agreeing with the
+        // platform of the profile it advertises -- Windows or macOS -- rather
+        // than a Windows-only check that refused every Mac.
+        needle: "if (controlledNode && access.os !== CONTROLLED_NODE_OS_WIN && access.os !== CONTROLLED_NODE_OS_MAC)",
+      },
+      {
+        path: 'server/src/ws/remote-desktop-router.ts',
+        needle: "if (access.os !== expectedOs) return 'unsupported_platform';",
       },
     ],
   },
@@ -112,7 +123,7 @@ const contracts: Contract[] = [
     guards: [
       {
         path: 'server/src/ws/remote-desktop-router.ts',
-        needle: 'this.hooks.resolveAccess ?? resolveRemoteDesktopHostAccess',
+        needle: 'this.hooks.resolveAccess ?? resolveRemoteDesktopHostOperatorAccess',
         minimum: 2,
       },
       {
@@ -481,7 +492,7 @@ const contracts: Contract[] = [
       },
       {
         path: 'native/windows-remote-desktop/worker_main.cc',
-        needle: 'SelectAutoUnlockStep(\n        UnlockSecret::Configured(), ControllerPresentOnSignaling(),',
+        needle: 'SelectAutoUnlockStep(\n        UnlockSecret::Configured(), ControllerPresentOnSignaling(),\n        g_input_desktop_ready.load()',
       },
       {
         // The secret reaches the worker through stdin, never argv.
@@ -491,7 +502,7 @@ const contracts: Contract[] = [
       {
         // The Server relays and records a boolean, never the value.
         path: 'server/src/routes/machines.ts',
-        needle: 'auto_unlock_configured = $3',
+        needle: 'auto_unlock_configured = $2',
       },
     ],
   },
@@ -508,7 +519,7 @@ const contracts: Contract[] = [
       },
       {
         path: 'src/node/remote-desktop-worker-host.ts',
-        needle: 'this.retryOnOtherDesktop(parsed.value, tracked)',
+        needle: 'this.retryOnOtherDesktop(event.value, tracked)',
       },
       {
         path: 'native/windows-remote-desktop/worker_main.cc',
@@ -636,8 +647,8 @@ const contracts: Contract[] = [
         needle: 'TerminateProcess(GetCurrentProcess(), 20)',
       },
       {
-        path: 'src/node/remote-desktop-worker-host.ts',
-        needle: 'validateRemoteDesktopWorkerCrash(value, this.nonce)',
+        path: 'src/node/remote-desktop-worker-host-core.ts',
+        needle: 'validateRemoteDesktopWorkerCrash(value, this.options.nonce)',
       },
     ],
   },
@@ -666,12 +677,12 @@ const contracts: Contract[] = [
         needle: 'if (winsock.error() != 0) return 14;',
       },
       {
-        path: 'native/windows-remote-desktop/peer_session.cc',
-        needle: 'pending_remote_ice_.Push(mid, candidate)',
+        path: 'native/remote-desktop-common/transport_session_core.cc',
+        needle: 'pending_remote_ice_.push_back(std::move(candidate));',
       },
       {
-        path: 'native/windows-remote-desktop/peer_session.cc',
-        needle: 'FlushPendingRemoteIce()',
+        path: 'native/remote-desktop-common/transport_session_core.cc',
+        needle: 'return FlushRemoteIce();',
       },
     ],
   },
@@ -696,7 +707,7 @@ const contracts: Contract[] = [
         minimum: 2,
       },
       {
-        path: 'native/windows-remote-desktop/quality_ladder.cc',
+        path: 'native/remote-desktop-common/quality_ladder.cc',
         needle: 'direct ? kInitialVideoBitrateBps : kInitialTransportBitrateBps',
       },
       {
@@ -747,7 +758,7 @@ const contracts: Contract[] = [
       },
       {
         path: 'native/windows-remote-desktop/peer_session.cc',
-        needle: 'MediaProgressShouldFailover(',
+        needle: 'transport_core_.RecordMediaProgress(',
       },
       {
         path: 'native/windows-remote-desktop/peer_session.cc',
@@ -782,11 +793,11 @@ const contracts: Contract[] = [
       },
       {
         path: 'native/windows-remote-desktop/peer_session.cc',
-        needle: 'if (source_ && release_source_) release_source_(source_->display());',
+        needle: 'source_.reset();',
       },
       {
         path: 'native/windows-remote-desktop/peer_session.cc',
-        needle: 'if (previous_display && release_source_) release_source_(*previous_display);',
+        needle: 'previous_source.reset();',
       },
     ],
   },
@@ -866,8 +877,8 @@ const contracts: Contract[] = [
         needle: 'bool IsAllowedRemoteDisplayMode(int width, int height)',
       },
       {
-        path: 'native/windows-remote-desktop/peer_session.cc',
-        needle: 'ChangeDisplaySettingsExW(found->device_name.c_str(), &mode, nullptr,',
+        path: 'native/windows-remote-desktop/windows_platform_adapters.cc',
+        needle: 'ChangeDisplaySettingsExW(display->device_name.c_str(), &mode, nullptr,',
         minimum: 2,
       },
       {
@@ -953,7 +964,8 @@ const contracts: Contract[] = [
         // One cold start at a time: the memo is set with no await after the
         // check that decides to start.
         path: 'src/node/remote-desktop-worker-host.ts',
-        needle: 'const attempt = this.startPromise ?? this.beginWorkerStart(forceSecureConsole);\n    this.startPromise = attempt;',
+        needle:
+          'const attempt = this.startPromise\n      ?? this.beginWorkerStart(\n        requestedMode,\n        forceSecureConsole,\n        correlationId,\n        startedAt,\n      );\n    this.startPromise = attempt;',
       },
       {
         // Handing the listener back never waits on connections that may never
@@ -965,13 +977,14 @@ const contracts: Contract[] = [
         // The offer that follows a PREPARE waits for that PREPARE's cold start
         // instead of being declined as a dead worker.
         path: 'src/node/remote-desktop-worker-host.ts',
-        needle: 'if (!this.tracked.has(command.sessionId)) return false;\n      await this.ensureStarted();',
+        needle:
+          'const diagnosticAuthority = this.core.get(command.sessionId);\n      if (!diagnosticAuthority) return false;\n      await this.ensureStarted(\n        WORKER_LAUNCH_MODE.SESSION,\n        false,\n        diagnosticAuthority.metadata.correlationId,\n        diagnosticAuthority.metadata.startedAt,\n      );',
       },
       {
         // Waiting for process start alone is insufficient: concurrent
         // continuations may otherwise write OFFER before PREPARE.
         path: 'src/node/remote-desktop-worker-host.ts',
-        needle: 'await this.preparing.get(command.sessionId);',
+        needle: 'await this.core.waitForPreparing(command.sessionId);',
       },
     ],
   },
@@ -1227,7 +1240,7 @@ const mutations: Mutation[] = [
     name: 'let the stored secret be typed without a watching controller',
     contract: 'auto unlock stays write-only and operator-gated',
     path: 'native/windows-remote-desktop/worker_main.cc',
-    needle: 'SelectAutoUnlockStep(\n        UnlockSecret::Configured(), ControllerPresentOnSignaling(),',
+    needle: 'SelectAutoUnlockStep(\n        UnlockSecret::Configured(), ControllerPresentOnSignaling(),\n        g_input_desktop_ready.load()',
   },
   {
     name: 'put the sign-in secret on the worker command line',
@@ -1257,7 +1270,7 @@ const mutations: Mutation[] = [
     name: 'let a stale desktop choice stand',
     contract: 'one console-session worker that follows the desktop',
     path: 'src/node/remote-desktop-worker-host.ts',
-    needle: 'this.retryOnOtherDesktop(parsed.value, tracked)',
+    needle: 'this.retryOnOtherDesktop(event.value, tracked)',
   },
   {
     name: 'stop reporting a wrong-desktop prepare',
@@ -1286,8 +1299,8 @@ const mutations: Mutation[] = [
   {
     name: 'drop the daemon side of the crash report',
     contract: 'native worker faults are reported, never silent',
-    path: 'src/node/remote-desktop-worker-host.ts',
-    needle: 'validateRemoteDesktopWorkerCrash(value, this.nonce)',
+    path: 'src/node/remote-desktop-worker-host-core.ts',
+    needle: 'validateRemoteDesktopWorkerCrash(value, this.options.nonce)',
   },
   {
     name: 'let the media engine build the platform audio device',
@@ -1311,7 +1324,7 @@ const mutations: Mutation[] = [
     name: 'remove access revalidation',
     contract: 'continuous access revalidation',
     path: 'server/src/ws/remote-desktop-router.ts',
-    needle: 'this.hooks.resolveAccess ?? resolveRemoteDesktopHostAccess',
+    needle: 'this.hooks.resolveAccess ?? resolveRemoteDesktopHostOperatorAccess',
   },
   {
     name: 'remove requester socket binding',
@@ -1424,8 +1437,8 @@ const mutations: Mutation[] = [
   {
     name: 'remove pre-SDP trickle ICE queueing',
     contract: 'Windows WebRTC socket and trickle ICE readiness',
-    path: 'native/windows-remote-desktop/peer_session.cc',
-    needle: 'pending_remote_ice_.Push(mid, candidate)',
+    path: 'native/remote-desktop-common/transport_session_core.cc',
+    needle: 'pending_remote_ice_.push_back(std::move(candidate));',
   },
   {
     name: 'remove upstream desktop bitrate allocation',
@@ -1467,13 +1480,13 @@ const mutations: Mutation[] = [
     name: 'remove capture-source release on media teardown',
     contract: 'bounded native media teardown before reconnect',
     path: 'native/windows-remote-desktop/peer_session.cc',
-    needle: 'if (source_ && release_source_) release_source_(source_->display());',
+    needle: 'source_.reset();',
   },
   {
     name: 'remove old capture-source release after successful replacement',
     contract: 'bounded native media teardown before reconnect',
     path: 'native/windows-remote-desktop/peer_session.cc',
-    needle: 'if (previous_display && release_source_) release_source_(*previous_display);',
+    needle: 'previous_source.reset();',
   },
   {
     name: 'remove reviewed TURN conversion',
@@ -1551,13 +1564,14 @@ const mutations: Mutation[] = [
     name: 'decline a tracked session message while its worker is still starting',
     contract: 'a dead idle pipe cold-starts a replacement instead of failing the session',
     path: 'src/node/remote-desktop-worker-host.ts',
-    needle: 'if (!this.tracked.has(command.sessionId)) return false;\n      await this.ensureStarted();',
+    needle:
+      'const diagnosticAuthority = this.core.get(command.sessionId);\n      if (!diagnosticAuthority) return false;\n      await this.ensureStarted(\n        WORKER_LAUNCH_MODE.SESSION,\n        false,\n        diagnosticAuthority.metadata.correlationId,\n        diagnosticAuthority.metadata.startedAt,\n      );',
   },
   {
     name: 'allow an offer to overtake its prepare after a cold start',
     contract: 'a dead idle pipe cold-starts a replacement instead of failing the session',
     path: 'src/node/remote-desktop-worker-host.ts',
-    needle: 'await this.preparing.get(command.sessionId);',
+    needle: 'await this.core.waitForPreparing(command.sessionId);',
   },
   {
     name: 'let a settled start promise stand in for a live worker',

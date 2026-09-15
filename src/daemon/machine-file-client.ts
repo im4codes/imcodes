@@ -20,6 +20,7 @@ import {
   type MachineDirectUploadRequest,
 } from '../../shared/machine-direct-file-transfer.js';
 import { startMachineDirectFetchReceiver, startMachineDirectSender } from './machine-direct-transfer.js';
+import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../shared/shared-machine-authority.js';
 
 const MAX_CONTROL_RESPONSE_BYTES = 64 * 1024;
 
@@ -28,6 +29,7 @@ interface MachineFileBaseOptions {
   sourceServerId: string;
   sourceToken: string;
   targetServerId: string;
+  sharedMachineAuthority?: string;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
 }
@@ -50,8 +52,12 @@ export interface MachineFileTransferResult {
   destinationPath?: string;
 }
 
-function authHeaders(sourceServerId: string, sourceToken: string): Record<string, string> {
-  return { 'X-Server-Id': sourceServerId, authorization: `Bearer ${sourceToken}` };
+function authHeaders(sourceServerId: string, sourceToken: string, sharedMachineAuthority?: string): Record<string, string> {
+  return {
+    'X-Server-Id': sourceServerId,
+    authorization: `Bearer ${sourceToken}`,
+    ...(sharedMachineAuthority ? { [SHARED_MACHINE_AUTHORITY_HEADER]: sharedMachineAuthority } : {}),
+  };
 }
 
 function boundedTransferSignal(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
@@ -139,7 +145,7 @@ export async function sendFileToMachine(options: SendFileToMachineOptions): Prom
           `${options.serverUrl.replace(/\/+$/, '')}/api/server/${encodeURIComponent(options.targetServerId)}/machine-direct-upload`,
           {
             method: 'POST',
-            headers: { ...authHeaders(options.sourceServerId, options.sourceToken), 'content-type': 'application/json' },
+            headers: { ...authHeaders(options.sourceServerId, options.sourceToken, options.sharedMachineAuthority), 'content-type': 'application/json' },
             body: JSON.stringify({ ...requestBase, candidates: sender.candidates }),
             signal: boundedTransferSignal(options.signal, FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS),
           },
@@ -179,7 +185,7 @@ export async function sendFileToMachine(options: SendFileToMachineOptions): Prom
       `${options.serverUrl.replace(/\/+$/, '')}/api/server/${encodeURIComponent(options.targetServerId)}/upload`,
       {
         method: 'POST',
-        headers: authHeaders(options.sourceServerId, options.sourceToken),
+        headers: authHeaders(options.sourceServerId, options.sourceToken, options.sharedMachineAuthority),
         body: form,
         signal: boundedTransferSignal(options.signal, FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS),
       },
@@ -235,7 +241,7 @@ async function commitDownloadedFile(temp: string, destination: string, overwrite
 export async function fetchFileFromMachine(options: FetchFileFromMachineOptions): Promise<MachineFileTransferResult> {
   const doFetch = options.fetchImpl ?? fetch;
   const base = options.serverUrl.replace(/\/+$/, '');
-  const headers = authHeaders(options.sourceServerId, options.sourceToken);
+  const headers = authHeaders(options.sourceServerId, options.sourceToken, options.sharedMachineAuthority);
   const prepared = await prepareDestination(options.destinationPath, options.overwrite === true);
 
   {

@@ -152,6 +152,10 @@ export function DaemonRemoteDesktopControl({
             })
             : t('remote_desktop.login_screen_hint')}
           onClick={() => {
+            // No group is read or required. Enrolment binds this machine to its
+            // user; a group is an association made afterwards. Gating the
+            // install on one meant a user with no group could not install the
+            // login-screen component at all.
             setLoginScreen({ state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.DOWNLOADING });
             void mintControlledNodeExecutableTicket({ os: 'win', arch: 'x64' }, serverId)
               .then((minted) => {

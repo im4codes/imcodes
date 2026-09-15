@@ -10,9 +10,12 @@ import { resolveLiveHookPort } from '../daemon/hook-port.js';
 import { detectSenderSession } from '../util/detect-session.js';
 
 export interface AuditReplyCommandOptions {
+  taskId: string;
+  assignmentId: string;
   attemptId: string;
-  capability: string;
-  verdict: string;
+  revision: string;
+  receiptKind: string;
+  verdict?: string;
   findingsFile: string;
   validationsFile: string;
 }
@@ -81,9 +84,12 @@ export async function runAuditReplyCommand(
   }
   const decoded = decodePeerAuditReplyEnvelope({
     version: PEER_AUDIT_REPLY_VERSION,
+    taskId: options.taskId,
+    assignmentId: options.assignmentId,
     attemptId: options.attemptId,
-    replyCapability: options.capability,
-    verdict: options.verdict,
+    revision: options.revision,
+    receiptKind: options.receiptKind,
+    ...(options.verdict ? { verdict: options.verdict } : {}),
     findings: deps.readText(options.findingsFile),
     validations,
   });
@@ -93,7 +99,6 @@ export async function runAuditReplyCommand(
   if (!port) throw new Error('peer-audit daemon ingress unavailable');
   const result = await deps.post(port, decoded.value, sender);
   if (result.ok !== true) {
-    // Never include the one-time capability or the full envelope in errors.
     throw new Error(`peer-audit reply rejected: ${String(result.error ?? 'unknown_error')}`);
   }
 }

@@ -1,3 +1,4 @@
+import { oneWayServerOffsetMs } from '@shared/clock-sync.js';
 import {
   REMOTE_DESKTOP_ACCESS_MODE,
   REMOTE_DESKTOP_CAPABILITY,
@@ -31,9 +32,17 @@ import {
   type RemoteDesktopRoute,
   type RemoteDesktopServerMessage,
   type RemoteDesktopState,
+  type RemoteDesktopStopOrigin,
 } from '@shared/remote-desktop.js';
+import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { PendingWebRtcCandidates, toWebRtcIceServers } from '@shared/webrtc-connectivity.js';
+import type { RemoteDesktopBootstrapProof } from '@shared/remote-desktop-access.js';
 import { apiFetch, getApiBaseUrl } from './api.js';
+import {
+  REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT,
+  recordRemoteDesktopBrowserDiagnostic,
+  type RemoteDesktopBrowserDiagnosticInput,
+} from './remote-desktop-browser-diagnostics.js';
 
 const DATA_BUFFER_HIGH_WATER_BYTES = 256 * 1024;
 /**
@@ -130,6 +139,8 @@ export interface RemoteDesktopSnapshot {
 
 export interface RemoteDesktopClientHooks {
   onSnapshot(snapshot: RemoteDesktopSnapshot): void;
+  /** The exact signaling bridge observed an authenticated replacement daemon. */
+  onDaemonReconnected?(): void;
 }
 
 export interface RemoteDesktopClientDependencies {
@@ -140,6 +151,9 @@ export interface RemoteDesktopClientDependencies {
   isDocumentVisible?: () => boolean;
   requestAnimationFrame?: (callback: FrameRequestCallback) => number;
   cancelAnimationFrame?: (handle: number) => void;
+  /** Anonymous guest bootstrap proof. It is sent as the bounded first WebSocket
+   * frame and cleared from this dependency object immediately afterwards. */
+  guestBootstrapProof?: RemoteDesktopBootstrapProof;
 }
 
 function isOpen(channel: RTCDataChannel | null): channel is RTCDataChannel {
@@ -156,6 +170,12 @@ function defaultSocketUrl(serverId: string, ticket: string): string {
     [REMOTE_DESKTOP_SERVER_ID_QUERY]: serverId,
     ticket,
   });
+  return `${base}${REMOTE_DESKTOP_SIGNALING_PATH}?${query.toString()}`;
+}
+
+function defaultGuestSocketUrl(serverId: string): string {
+  const base = getApiBaseUrl().replace(/^http/, 'ws').replace(/\/$/, '');
+  const query = new URLSearchParams({ [REMOTE_DESKTOP_SERVER_ID_QUERY]: serverId });
   return `${base}${REMOTE_DESKTOP_SIGNALING_PATH}?${query.toString()}`;
 }
 
@@ -206,7 +226,7 @@ export function isRemoteDesktopKeyAllowed(
   code: string,
   modifiers: { control: boolean; alt: boolean },
 ): boolean {
-  if (!/^(?:Key[A-Z]|Digit[0-9]|F(?:[1-9]|1[0-2])|Numpad(?:[0-9]|Add|Subtract|Multiply|Divide|Decimal|Enter)|Arrow(?:Up|Down|Left|Right)|Backspace|Tab|Enter|Escape|Space|Delete|Insert|Home|End|PageUp|PageDown|ShiftLeft|ShiftRight|ControlLeft|ControlRight|AltLeft|AltRight|CapsLock|NumLock|ScrollLock|Semicolon|Equal|Comma|Minus|Period|Slash|Backquote|BracketLeft|Backslash|BracketRight|Quote)$/.test(code)) {
+  if (!/^(?:Key[A-Z]|Digit[0-9]|F(?:[1-9]|1[0-2])|Numpad(?:[0-9]|Add|Subtract|Multiply|Divide|Decimal|Enter)|Arrow(?:Up|Down|Left|Right)|Backspace|Tab|Enter|Escape|Space|Delete|Insert|Home|End|PageUp|PageDown|ShiftLeft|ShiftRight|ControlLeft|ControlRight|AltLeft|AltRight|MetaLeft|MetaRight|CapsLock|NumLock|ScrollLock|Semicolon|Equal|Comma|Minus|Period|Slash|Backquote|BracketLeft|Backslash|BracketRight|Quote)$/.test(code)) {
     return false;
   }
   // Windows secure attention is never synthesized. The native worker repeats
@@ -243,42 +263,128 @@ export function chunkRemoteDesktopText(value: string): string[] | null {
 class RemoteDesktopSignalingSocket {
   private socket: WebSocket | null = null;
   private ticketAbort: AbortController | null = null;
+  private readonly guest: boolean;
 
-  constructor(private readonly deps: RemoteDesktopClientDependencies) {}
+  constructor(private readonly deps: RemoteDesktopClientDependencies) {
+    this.guest = deps.guestBootstrapProof !== undefined;
+  }
 
   async connect(
     serverId: string,
     onMessage: (value: unknown) => void,
     onClose: () => void,
+    onDaemonReconnected?: () => void,
+    resume = false,
   ): Promise<void> {
     const abort = new AbortController();
     this.ticketAbort = abort;
-    const ticket = await (this.deps.fetchTicket ?? defaultFetchTicket)(serverId, abort.signal);
+    const guestBootstrapProof = resume ? undefined : this.deps.guestBootstrapProof;
+    const fetchTicket = this.deps.fetchTicket ?? defaultFetchTicket;
+    let ticket = '';
+    if (!this.guest) {
+      if (resume) {
+        ticket = await new Promise<string>((resolve, reject) => {
+          const timer = setTimeout(() => {
+            abort.abort();
+            reject(new Error('remote_desktop_ticket_timeout'));
+          }, REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_ATTEMPT_TIMEOUT_MS);
+          void fetchTicket(serverId, abort.signal).then(
+            (value) => { clearTimeout(timer); resolve(value); },
+            (error: unknown) => { clearTimeout(timer); reject(error); },
+          );
+        });
+      } else {
+        ticket = await fetchTicket(serverId, abort.signal);
+      }
+    }
+    const socketUrl = this.guest
+      ? defaultGuestSocketUrl(serverId)
+      : defaultSocketUrl(serverId, ticket);
     if (abort.signal.aborted) throw new Error('remote_desktop_canceled');
-    const socket = (this.deps.createSocket ?? ((url) => new WebSocket(url)))(defaultSocketUrl(serverId, ticket));
+    const socket = (this.deps.createSocket ?? ((url) => new WebSocket(url)))(socketUrl);
     this.socket = socket;
     socket.binaryType = 'arraybuffer';
     await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        socket.close(4000, 'remote_desktop_open_timeout');
-        reject(new Error('remote_desktop_open_timeout'));
-      }, START_TIMEOUT_MS);
-      const opened = () => {
-        clearTimeout(timer);
-        socket.removeEventListener('error', failed);
-        resolve();
-      };
-      const failed = () => {
+      let settled = false;
+      const cleanup = () => {
         clearTimeout(timer);
         socket.removeEventListener('open', opened);
-        reject(new Error('remote_desktop_socket_failed'));
+        socket.removeEventListener('error', failed);
+        socket.removeEventListener('close', closed);
+        socket.removeEventListener('message', redeemed);
       };
+      const succeed = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve();
+      };
+      const fail = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      };
+      const timer = setTimeout(() => {
+        socket.close(4000, 'remote_desktop_open_timeout');
+        fail(new Error('remote_desktop_open_timeout'));
+      }, resume
+        ? REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_ATTEMPT_TIMEOUT_MS
+        : START_TIMEOUT_MS);
+      const redeemed = (event: MessageEvent) => {
+        if (typeof event.data !== 'string') {
+          socket.close(4000, 'remote_desktop_bootstrap_failed');
+          fail(new Error('remote_desktop_bootstrap_failed'));
+          return;
+        }
+        let value: unknown;
+        try { value = JSON.parse(event.data); } catch {
+          socket.close(4000, 'remote_desktop_bootstrap_failed');
+          fail(new Error('remote_desktop_bootstrap_failed'));
+          return;
+        }
+        const parsed = validateRemoteDesktopServerMessage(value);
+        if (!parsed.ok || parsed.value.type !== REMOTE_DESKTOP_MSG.BOOTSTRAP_REDEEMED) {
+          socket.close(4000, 'remote_desktop_bootstrap_failed');
+          fail(new Error('remote_desktop_bootstrap_failed'));
+          return;
+        }
+        succeed();
+      };
+      const opened = () => {
+        if (guestBootstrapProof) {
+          try {
+            socket.send(JSON.stringify(guestBootstrapProof));
+            this.deps.guestBootstrapProof = undefined;
+            socket.addEventListener('message', redeemed);
+          } catch {
+            socket.close(4000, 'remote_desktop_bootstrap_failed');
+            fail(new Error('remote_desktop_bootstrap_failed'));
+            return;
+          }
+          return;
+        }
+        succeed();
+      };
+      const failed = () => {
+        fail(new Error('remote_desktop_socket_failed'));
+      };
+      const closed = () => fail(new Error('remote_desktop_socket_failed'));
       socket.addEventListener('open', opened, { once: true });
       socket.addEventListener('error', failed, { once: true });
+      socket.addEventListener('close', closed, { once: true });
     });
     socket.addEventListener('message', (event) => {
       if (this.socket !== socket || typeof event.data !== 'string') return;
-      try { onMessage(JSON.parse(event.data)); } catch { /* strict parser below */ }
+      try {
+        const value = JSON.parse(event.data) as unknown;
+        if (value && typeof value === 'object' && !Array.isArray(value)
+          && (value as { type?: unknown }).type === DAEMON_MSG.RECONNECTED) {
+          onDaemonReconnected?.();
+          return;
+        }
+        onMessage(value);
+      } catch { /* strict parser below */ }
     });
     socket.addEventListener('close', () => {
       if (this.socket !== socket) return;
@@ -293,6 +399,10 @@ class RemoteDesktopSignalingSocket {
     if (new TextEncoder().encode(encoded).byteLength > REMOTE_DESKTOP_LIMITS.SDP_BYTES) return false;
     this.socket.send(encoded);
     return true;
+  }
+
+  isOpen(): boolean {
+    return this.socket?.readyState === WebSocket.OPEN;
   }
 
   close(): void {
@@ -334,7 +444,13 @@ export class RemoteDesktopClient {
   private statsInFlight = false;
   private iceRestartCount = 0;
   private iceRestartInFlight = false;
+  private pendingIceRestart = false;
   private disconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private signalingReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private signalingReconnectAttempts = 0;
+  private signalingReconnectInFlight = false;
+  private signalingStableState: RemoteDesktopState | null = null;
+  private signalingDisconnectedAt: number | null = null;
   private awaitingAnswer = false;
   private previousInboundStats: { bytes: number; timestamp: number } | null = null;
   private lastMediaBytesReceived: number | null = null;
@@ -373,6 +489,7 @@ export class RemoteDesktopClient {
     timer: ReturnType<typeof setTimeout>;
   }>();
   private controlRejectionId = 0;
+  private diagnosticTrackCleanup: (() => void) | null = null;
   private snapshot: RemoteDesktopSnapshot = {
     state: REMOTE_DESKTOP_STATE.AUTHORIZING,
     mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
@@ -398,6 +515,10 @@ export class RemoteDesktopClient {
     return this.snapshot;
   }
 
+  private recordBrowserDiagnostic(event: RemoteDesktopBrowserDiagnosticInput): void {
+    recordRemoteDesktopBrowserDiagnostic(this.serverId, event);
+  }
+
   async start(reconnectAttempt = 0): Promise<void> {
     if (this.requestId || this.stopped) throw new Error('remote_desktop_already_started');
     this.startedAt = this.deps.now?.() ?? Date.now();
@@ -409,7 +530,8 @@ export class RemoteDesktopClient {
           this.fail(REMOTE_DESKTOP_TERMINAL_REASON.PROTOCOL_ERROR);
         });
       },
-      () => this.fail(REMOTE_DESKTOP_TERMINAL_REASON.BROWSER_DISCONNECTED),
+      () => this.handleSignalingClose(),
+      this.hooks.onDaemonReconnected,
     );
     const requestId = randomRequestId();
     this.requestId = requestId;
@@ -742,7 +864,7 @@ export class RemoteDesktopClient {
     }
   }
 
-  stop(): void {
+  stop(stopOrigin: RemoteDesktopStopOrigin): void {
     if (this.stopped) return;
     this.releaseAll();
     if (this.requestId && this.sessionId && this.capability) {
@@ -751,6 +873,7 @@ export class RemoteDesktopClient {
         requestId: this.requestId,
         sessionId: this.sessionId,
         capability: this.capability,
+        stopOrigin,
         ...(this.aggregateBytesReceived > 0
           ? { aggregateBytesReceived: this.aggregateBytesReceived }
           : {}),
@@ -827,12 +950,64 @@ export class RemoteDesktopClient {
 
   private async handleServer(value: unknown): Promise<void> {
     const parsed = validateRemoteDesktopServerMessage(value);
-    if (!parsed.ok || !this.requestId || parsed.value.requestId !== this.requestId || this.stopped) return;
+    if (!parsed.ok || this.stopped) return;
+    // Consumed by the signaling handshake before START; ignore a duplicate
+    // rather than letting a content-free acknowledgement affect a session.
+    if (parsed.value.type === REMOTE_DESKTOP_MSG.BOOTSTRAP_REDEEMED) return;
+    if (!this.requestId || parsed.value.requestId !== this.requestId) return;
     const message = parsed.value;
     if (message.type === REMOTE_DESKTOP_MSG.AUTHORIZED) {
       if (this.sessionId || !validateRemoteDesktopAuthorized(message).ok) return;
       this.authorized = message;
       await this.preparePeer(message);
+      return;
+    }
+    if (message.type === REMOTE_DESKTOP_MSG.RESUMED) {
+      if (!this.matchesAuthority(message) || !this.peer) return;
+      this.authorized = { ...message, type: REMOTE_DESKTOP_MSG.AUTHORIZED };
+      this.daemonGeneration = message.daemonGeneration;
+      this.expiresAt = this.serverDeadlineToLocal(message.expiresAt, message.serverTime);
+      this.signalingReconnectAttempts = 0;
+      this.signalingReconnectInFlight = false;
+      this.signalingDisconnectedAt = null;
+      this.clearSignalingReconnectTimer();
+      this.clearStartTimer();
+      this.workerInputEnabled = false;
+      this.clearInputAck();
+      this.requirePresentedFrameForCurrentTopology();
+      const peerState = this.peer.connectionState;
+      try {
+        this.peer.setConfiguration({ iceServers: toWebRtcIceServers(message.iceServers) });
+      } catch {
+        // A connected direct path does not need fresh TURN credentials yet.
+        // If recovery needs ICE now, however, continuing with credentials that
+        // may have expired during the outage would only manufacture a doomed
+        // restart and hide the real failure.
+        if (this.pendingIceRestart || peerState === 'disconnected' || peerState === 'failed') {
+          this.fail(REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED);
+          return;
+        }
+      }
+      this.publish({
+        state: peerState === 'connected' && this.signalingStableState
+          ? this.signalingStableState
+          : REMOTE_DESKTOP_STATE.RECONNECTING,
+        mode: message.mode,
+        inputEpoch: message.inputEpoch,
+        inputEnabled: false,
+      });
+      this.signalingStableState = null;
+      if (isOpen(this.controlChannel)) {
+        this.sendControl({
+          type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
+          ...this.inputBase(),
+          kind: REMOTE_DESKTOP_CONTROL_KIND.HELLO,
+        });
+      }
+      if (this.pendingIceRestart || peerState === 'disconnected' || peerState === 'failed') {
+        this.pendingIceRestart = false;
+        await this.restartIce(this.peer);
+      }
       return;
     }
     if (!this.matchesAuthority(message)) return;
@@ -922,11 +1097,21 @@ export class RemoteDesktopClient {
     if (message.type === REMOTE_DESKTOP_MSG.ERROR) this.fail(message.error);
   }
 
+  /**
+   * The Server's absolute deadline on this browser's clock. A browser clock
+   * minutes off otherwise ends the session early or keeps input enabled past
+   * the grant. Without a Server time (older Server) it is used as sent.
+   */
+  private serverDeadlineToLocal(serverDeadline: number, serverTime: number | undefined): number {
+    const offset = oneWayServerOffsetMs(serverTime, this.deps.now?.() ?? Date.now());
+    return serverDeadline - offset;
+  }
+
   private async preparePeer(authority: Extract<RemoteDesktopServerMessage, { type: typeof REMOTE_DESKTOP_MSG.AUTHORIZED }>): Promise<void> {
     this.sessionId = authority.sessionId;
     this.capability = authority.capability;
     this.daemonGeneration = authority.daemonGeneration;
-    this.expiresAt = authority.expiresAt;
+    this.expiresAt = this.serverDeadlineToLocal(authority.expiresAt, authority.serverTime);
     this.publish({
       state: REMOTE_DESKTOP_STATE.PREPARING,
       mode: authority.mode,
@@ -943,8 +1128,46 @@ export class RemoteDesktopClient {
       ? RTCRtpReceiver.getCapabilities?.('video')
       : null;
     if (capabilities) applyH264ReceiveCodecPreference(transceiver, capabilities.codecs);
+    // Non-standard, Chromium-only: hints the jitter buffer to minimize
+    // buffering rather than smooth over network jitter, the same tradeoff
+    // cloud-gaming/remote-control WebRTC products make. Chrome's default
+    // playout delay favors smooth video over latency, which is backwards for
+    // a desktop the operator is actively controlling live -- every frame the
+    // jitter buffer holds back is added, uniform latency regardless of how
+    // quickly the encoder and network actually delivered it. Best-effort:
+    // absent on Safari/Firefox, so this silently no-ops there.
+    if (transceiver.receiver) {
+      (transceiver.receiver as unknown as { playoutDelayHint?: number }).playoutDelayHint = 0;
+    }
     this.createDataChannels(peer);
     peer.addEventListener('track', (event) => {
+      this.diagnosticTrackCleanup?.();
+      const track = event.track;
+      const recordTrackState = (
+        type: typeof REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.TRACK
+          | typeof REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.TRACK_MUTE
+          | typeof REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.TRACK_UNMUTE
+          | typeof REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.TRACK_ENDED,
+      ) => {
+        if (this.stopped || this.peer !== peer) return;
+        this.recordBrowserDiagnostic({
+          type,
+          trackMuted: track.muted,
+          trackReadyState: track.readyState,
+        });
+      };
+      const onMute = () => recordTrackState(REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.TRACK_MUTE);
+      const onUnmute = () => recordTrackState(REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.TRACK_UNMUTE);
+      const onEnded = () => recordTrackState(REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.TRACK_ENDED);
+      track.addEventListener('mute', onMute);
+      track.addEventListener('unmute', onUnmute);
+      track.addEventListener('ended', onEnded);
+      this.diagnosticTrackCleanup = () => {
+        track.removeEventListener('mute', onMute);
+        track.removeEventListener('unmute', onUnmute);
+        track.removeEventListener('ended', onEnded);
+      };
+      recordTrackState(REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.TRACK);
       const stream = event.streams[0] ?? new MediaStream([event.track]);
       this.publish({ stream });
     });
@@ -964,6 +1187,12 @@ export class RemoteDesktopClient {
     });
     peer.addEventListener('connectionstatechange', () => {
       if (this.peer !== peer) return;
+      this.recordBrowserDiagnostic({
+        type: REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.PEER_CONNECTION_STATE,
+        connectionState: peer.connectionState,
+        iceConnectionState: peer.iceConnectionState,
+        signalingState: peer.signalingState,
+      });
       if (peer.connectionState === 'failed' || peer.connectionState === 'closed') {
         if (peer.connectionState === 'failed') void this.restartIce(peer);
         else this.fail(REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED);
@@ -984,6 +1213,24 @@ export class RemoteDesktopClient {
         this.iceRestartInFlight = false;
         this.startStats(peer);
       }
+    });
+    peer.addEventListener('iceconnectionstatechange', () => {
+      if (this.stopped || this.peer !== peer) return;
+      this.recordBrowserDiagnostic({
+        type: REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.PEER_ICE_STATE,
+        connectionState: peer.connectionState,
+        iceConnectionState: peer.iceConnectionState,
+        signalingState: peer.signalingState,
+      });
+    });
+    peer.addEventListener('signalingstatechange', () => {
+      if (this.stopped || this.peer !== peer) return;
+      this.recordBrowserDiagnostic({
+        type: REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.PEER_SIGNALING_STATE,
+        connectionState: peer.connectionState,
+        iceConnectionState: peer.iceConnectionState,
+        signalingState: peer.signalingState,
+      });
     });
     const offer = await peer.createOffer();
     await peer.setLocalDescription(offer);
@@ -1209,6 +1456,32 @@ export class RemoteDesktopClient {
       });
       const inbound = entries.find((value) => value.type === 'inbound-rtp'
         && (value.kind === 'video' || value.mediaType === 'video'));
+      if (inbound) {
+        const diagnosticNumber = (name: string, multiplier = 1): number | undefined => {
+          const value = inbound[name];
+          return typeof value === 'number' && Number.isFinite(value)
+            ? Math.max(0, Math.round(value * multiplier))
+            : undefined;
+        };
+        this.recordBrowserDiagnostic({
+          type: REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT.INBOUND_STATS,
+          connectionState: peer.connectionState,
+          iceConnectionState: peer.iceConnectionState,
+          signalingState: peer.signalingState,
+          bytesReceived: diagnosticNumber('bytesReceived'),
+          packetsReceived: diagnosticNumber('packetsReceived'),
+          framesReceived: diagnosticNumber('framesReceived'),
+          framesDecoded: diagnosticNumber('framesDecoded'),
+          keyFramesDecoded: diagnosticNumber('keyFramesDecoded'),
+          framesDropped: diagnosticNumber('framesDropped'),
+          freezeCount: diagnosticNumber('freezeCount'),
+          totalFreezesDurationMs: diagnosticNumber('totalFreezesDuration', 1_000),
+          jitterBufferDelayMs: diagnosticNumber('jitterBufferDelay', 1_000),
+          jitterBufferEmittedCount: diagnosticNumber('jitterBufferEmittedCount'),
+          documentVisible: this.deps.isDocumentVisible?.()
+            ?? (typeof document === 'undefined' || document.visibilityState === 'visible'),
+        });
+      }
       const quality = this.snapshot.quality;
       const durationMs = Math.max(0, (this.deps.now?.() ?? Date.now()) - this.startedAt);
       if (!inbound || !quality) {
@@ -1262,11 +1535,24 @@ export class RemoteDesktopClient {
         } else if (this.lastMediaBytesReceived === null
           || inbound.bytesReceived !== this.lastMediaBytesReceived
           || this.lastMediaProgressAt === null) {
+          // Media is flowing again, so the recovery that got us here is over.
+          // The restart budget bounds a single incident; without releasing it
+          // on proof of recovery, a long healthy session eventually spends its
+          // lifetime allowance and is torn down by its own weak-network guard.
+          if (this.lastMediaBytesReceived !== null
+            && inbound.bytesReceived > this.lastMediaBytesReceived) {
+            this.iceRestartCount = 0;
+          }
           this.lastMediaBytesReceived = inbound.bytesReceived;
           this.lastMediaProgressAt = now;
         } else if (now - this.lastMediaProgressAt
           >= REMOTE_DESKTOP_LIMITS.MEDIA_PROGRESS_TIMEOUT_MS) {
-          this.fail(REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED);
+          // Some weak paths keep ICE nominally "connected" after media has
+          // stopped flowing. Give that black-holed path the same bounded,
+          // in-place recovery as an explicit connection-state failure instead
+          // of discarding the mounted stream and starting the whole flow over.
+          this.lastMediaProgressAt = now;
+          await this.restartIce(peer);
           return;
         }
         this.aggregateBytesReceived = Math.max(this.aggregateBytesReceived, inbound.bytesReceived);
@@ -1307,6 +1593,13 @@ export class RemoteDesktopClient {
 
   private async restartIce(peer: RTCPeerConnection): Promise<void> {
     if (this.iceRestartInFlight) return;
+    if (!this.signaling.isOpen()) {
+      this.pendingIceRestart = true;
+      this.releaseAll();
+      this.workerInputEnabled = false;
+      this.publish({ state: REMOTE_DESKTOP_STATE.RECONNECTING, inputEnabled: false });
+      return;
+    }
     if (this.stopped || this.peer !== peer || !this.authorityReady()
       || this.iceRestartCount >= REMOTE_DESKTOP_LIMITS.MAX_ICE_RESTARTS
       || this.expiresAt <= (this.deps.now?.() ?? Date.now())) {
@@ -1315,6 +1608,12 @@ export class RemoteDesktopClient {
     }
     this.iceRestartInFlight = true;
     this.iceRestartCount++;
+    // An ICE restart re-gathers a whole new candidate generation, just like
+    // `renegotiate()`. The flood cap bounds one negotiation, so it has to be
+    // rezeroed here too; counting across generations turns a recovering peer
+    // into a protocol_error.
+    this.localIceCandidates = 0;
+    this.remoteIceCandidates = 0;
     this.releaseAll();
     this.workerInputEnabled = false;
     this.requirePresentedFrameForCurrentTopology();
@@ -1341,6 +1640,102 @@ export class RemoteDesktopClient {
       );
     } catch {
       this.fail(REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED);
+    }
+  }
+
+  private handleSignalingClose(): void {
+    if (this.stopped) return;
+    // A socket can close after connect() resolved but before RESUMED arrives.
+    // Release the in-flight latch so that close itself schedules the next
+    // bounded attempt rather than stranding the session in reconnecting.
+    this.signalingReconnectInFlight = false;
+    if (!this.authorityReady() || !this.peer) {
+      this.fail(REMOTE_DESKTOP_TERMINAL_REASON.BROWSER_DISCONNECTED);
+      return;
+    }
+    const now = this.deps.now?.() ?? Date.now();
+    this.signalingDisconnectedAt ??= now;
+    if (this.snapshot.state === REMOTE_DESKTOP_STATE.DIRECT
+      || this.snapshot.state === REMOTE_DESKTOP_STATE.RELAYED) {
+      this.signalingStableState = this.snapshot.state;
+    }
+    this.clearStartTimer();
+    this.releaseAll();
+    this.workerInputEnabled = false;
+    this.clearInputAck();
+    if (this.peer.connectionState !== 'connected') this.pendingIceRestart = true;
+    this.publish({
+      state: REMOTE_DESKTOP_STATE.RECONNECTING,
+      inputEnabled: false,
+      reconnectCount: this.signalingReconnectAttempts + 1,
+    });
+    this.scheduleSignalingReconnect();
+  }
+
+  private scheduleSignalingReconnect(): void {
+    if (this.stopped || this.signalingReconnectTimer || this.signalingReconnectInFlight) return;
+    const now = this.deps.now?.() ?? Date.now();
+    const disconnectedAt = this.signalingDisconnectedAt ?? now;
+    const elapsed = now - disconnectedAt;
+    if (elapsed >= REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_GRACE_MS
+      || this.signalingReconnectAttempts >= REMOTE_DESKTOP_LIMITS.MAX_SIGNALING_RECONNECT_ATTEMPTS
+      || this.expiresAt <= now) {
+      this.fail(REMOTE_DESKTOP_TERMINAL_REASON.BROWSER_DISCONNECTED);
+      return;
+    }
+    const backoff = REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_BACKOFF_MS
+      * (2 ** this.signalingReconnectAttempts);
+    const remaining = REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_GRACE_MS - elapsed;
+    this.signalingReconnectTimer = setTimeout(() => {
+      this.signalingReconnectTimer = null;
+      void this.resumeSignaling();
+    }, Math.min(
+      backoff,
+      REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_MAX_BACKOFF_MS,
+      remaining,
+    ));
+  }
+
+  private async resumeSignaling(): Promise<void> {
+    if (this.stopped || this.signalingReconnectInFlight || !this.authorityReady()) return;
+    this.signalingReconnectInFlight = true;
+    this.signalingReconnectAttempts += 1;
+    try {
+      await this.signaling.connect(
+        this.serverId,
+        (value) => {
+          void this.handleServer(value).catch(() => {
+            this.fail(REMOTE_DESKTOP_TERMINAL_REASON.PROTOCOL_ERROR);
+          });
+        },
+        () => this.handleSignalingClose(),
+        this.hooks.onDaemonReconnected,
+        true,
+      );
+      if (!this.signaling.send({
+        type: REMOTE_DESKTOP_MSG.RESUME,
+        protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+        ...this.authorityFields(),
+      })) throw new Error('resume_signal_failed');
+      this.signalingReconnectInFlight = false;
+      const now = this.deps.now?.() ?? Date.now();
+      const elapsed = now - (this.signalingDisconnectedAt ?? now);
+      this.clearStartTimer();
+      this.startTimer = setTimeout(
+        () => {
+          this.startTimer = null;
+          this.signaling.close();
+          this.signalingReconnectInFlight = false;
+          this.scheduleSignalingReconnect();
+        },
+        Math.max(1, Math.min(
+          REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_ATTEMPT_TIMEOUT_MS,
+          REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_GRACE_MS - elapsed,
+        )),
+      );
+    } catch {
+      this.signalingReconnectInFlight = false;
+      this.scheduleSignalingReconnect();
     }
   }
 
@@ -1423,7 +1818,9 @@ export class RemoteDesktopClient {
   }
 
   private matchesAuthority(message: RemoteDesktopServerMessage): boolean {
-    if (message.type === REMOTE_DESKTOP_MSG.ERROR || message.type === REMOTE_DESKTOP_MSG.AUTHORIZED) return false;
+    if (message.type === REMOTE_DESKTOP_MSG.BOOTSTRAP_REDEEMED
+      || message.type === REMOTE_DESKTOP_MSG.ERROR
+      || message.type === REMOTE_DESKTOP_MSG.AUTHORIZED) return false;
     return message.sessionId === this.sessionId && message.capability === this.capability;
   }
 
@@ -1454,6 +1851,10 @@ export class RemoteDesktopClient {
     if (this.stopped) return;
     this.stopped = true;
     this.clearStartTimer();
+    this.clearSignalingReconnectTimer();
+    this.signalingReconnectInFlight = false;
+    this.signalingDisconnectedAt = null;
+    this.pendingIceRestart = false;
     this.releaseAll();
     try { this.controlChannel?.close(); } catch { /* closed */ }
     try { this.keyboardChannel?.close(); } catch { /* closed */ }
@@ -1463,6 +1864,8 @@ export class RemoteDesktopClient {
     this.keyboardChannel = null;
     this.pointerChannel = null;
     this.peer = null;
+    this.diagnosticTrackCleanup?.();
+    this.diagnosticTrackCleanup = null;
     this.channelsReady = false;
     this.workerInputEnabled = false;
     if (this.statsTimer) clearInterval(this.statsTimer);
@@ -1493,6 +1896,20 @@ export class RemoteDesktopClient {
       inputEnabled: false,
       stream: null,
       terminalReason: reason,
+      // These fields only ever arrive on a live STATUS message, and no more
+      // of those are coming once the session is torn down -- publish() only
+      // merges the given keys, so leaving them out keeps whatever was last
+      // observed on the wire instead of reflecting that nobody is connected
+      // any more. Concretely: the "N viewing" footer kept reporting the last
+      // real viewer/controller count forever after Stop, on every platform,
+      // because this patch never zeroed it.
+      viewerCount: 0,
+      controllerCount: 0,
+      route: undefined,
+      quality: undefined,
+      signInScreen: false,
+      unlockAvailable: false,
+      inputBlocked: undefined,
     });
   }
 
@@ -1504,6 +1921,11 @@ export class RemoteDesktopClient {
   private clearDisconnectTimer(): void {
     if (this.disconnectTimer) clearTimeout(this.disconnectTimer);
     this.disconnectTimer = null;
+  }
+
+  private clearSignalingReconnectTimer(): void {
+    if (this.signalingReconnectTimer) clearTimeout(this.signalingReconnectTimer);
+    this.signalingReconnectTimer = null;
   }
 
   private beginLayoutTransition(): void {

@@ -1,5 +1,21 @@
 import { defineConfig } from 'vitest/config';
 
+/**
+ * Probe files owned by test/setup/isolated-home.test.ts. They are NOT tests in
+ * their own right: each one only means something when the harness runs it
+ * through a throwaway config that installs the isolated-home setup (or, for the
+ * leak probe, deliberately breaks it). Collected by any standing config they
+ * either fail -- IMCODES_HOME is unset there -- or silently rewrite HOME for the
+ * rest of that run.
+ *
+ * They used to be kept out of the daemon project only because their names happen
+ * to end in `.integration.test.ts`. That same suffix is exactly what
+ * vitest.integration.config.ts collects, which is how they leaked into
+ * `npm run test:integration` (CI run 34745118391). Exclude them by LOCATION, in
+ * every standing config, from this one constant.
+ */
+export const HARNESS_OWNED_PROBE_FIXTURES = 'test/setup/fixtures/**';
+
 // Every suite is a project; `--project <name>` selects one (see the test:*
 // scripts). This replaced a separate `vitest.workspace.ts`, which vitest 3
 // deprecates and vitest 4 removes. The root previously also carried its own
@@ -13,9 +29,19 @@ export default defineConfig({
         test: {
           name: 'daemon',
           include: ['src/**/*.test.ts', 'test/**/*.test.ts'],
-          exclude: ['test/e2e/**', 'test/**/*.integration.test.ts', '**/node_modules/**'],
+          exclude: ['test/e2e/**', 'test/**/*.integration.test.ts', HARNESS_OWNED_PROBE_FIXTURES, '**/node_modules/**'],
           environment: 'node',
           globals: false,
+          // Runs before each test file is imported, which is the only point
+          // early enough: daemon modules resolve ~/.imcodes paths at import
+          // time (src/util/logger.ts even opens daemon.log there), so without
+          // this the suite appends to the developer's real production log.
+          // See test/setup/isolated-home.ts.
+          setupFiles: ['./test/setup/isolated-home.ts'],
+          // Owns the directory those per-worker homes live in and removes it once
+          // every worker has exited — including workers that were killed. See
+          // test/setup/isolated-home-global.ts.
+          globalSetup: ['./test/setup/isolated-home-global.ts'],
           // The context-store-worker-isolation change adds real-Worker-thread tests
           // (context-store-worker / context-store-production-owner / memory-recall-l3-*
           // / materialization warm-worker e2e) that spawn threads + do real SQLite work,

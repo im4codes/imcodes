@@ -403,11 +403,11 @@ describe('file-transfer local handle hardening', () => {
     }));
   });
 
-  it('lists only child directories through the bounded directory picker', async () => {
+  it('lists child directories and regular files through the bounded remote file browser', async () => {
     const parent = path.join(rootDir, 'directory-picker');
     await mkdir(path.join(parent, 'visible'), { recursive: true });
     await mkdir(path.join(parent, '.hidden'), { recursive: true });
-    await writeFile(path.join(parent, 'ignored.txt'), 'not a directory');
+    await writeFile(path.join(parent, 'report.txt'), 'downloadable file');
     const transfer = await loadFileTransferHandler(fakeHome);
     const result = createServerLinkMock();
 
@@ -425,6 +425,7 @@ describe('file-transfer local handle hardening', () => {
       entries: [
         { name: '.hidden', path: path.join(await realpath(parent), '.hidden'), isDir: true, hidden: true },
         { name: 'visible', path: path.join(await realpath(parent), 'visible'), isDir: true, hidden: false },
+        { name: 'report.txt', path: path.join(await realpath(parent), 'report.txt'), isDir: false, hidden: false },
       ],
     }]);
   });
@@ -475,6 +476,38 @@ describe('file-transfer local handle hardening', () => {
       uploadId: 'upload-existing-destination',
     }));
     await expect(stat(path.join(destinationDirectory, 'report.txt'))).resolves.toMatchObject({ size: 5 });
+  });
+
+  it('commits a direct upload into the same validated destination seam', async () => {
+    const destinationDirectory = path.join(rootDir, 'direct-destination');
+    const stagedPath = path.join(rootDir, 'direct-upload.part');
+    await mkdir(destinationDirectory, { recursive: true });
+    await writeFile(stagedPath, 'hello');
+    const transfer = await loadFileTransferHandler(fakeHome);
+
+    const attachment = await transfer.finalizeDirectUploadedFile({
+      clientUploadId: 'client-direct-directory',
+      filename: 'direct-staged.txt',
+      originalName: 'report.txt',
+      mime: 'text/plain',
+      resolved: stagedPath,
+      size: 5,
+      destinationDirectory,
+    });
+
+    const destination = path.join(destinationDirectory, 'report.txt');
+    await expect(stat(destination)).resolves.toMatchObject({ size: 5 });
+    await expect(stat(stagedPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(attachment).toMatchObject({
+      source: 'local',
+      daemonPath: await realpath(destination),
+      originalName: 'report.txt',
+      size: 5,
+    });
+    expect(transfer.lookupAttachmentByClientUploadId('client-direct-directory')).toMatchObject({
+      id: attachment.id,
+      daemonPath: await realpath(destination),
+    });
   });
 
   it('deletes a completed upload and its metadata while refusing local project handles', async () => {

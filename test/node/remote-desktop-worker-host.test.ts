@@ -15,6 +15,17 @@ import {
 } from '../../shared/remote-desktop.js';
 import { WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN } from '../../shared/remote-desktop-qualification.js';
 import {
+  REMOTE_DESKTOP_CANONICAL_BRANDING_CAPABILITY,
+  REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY,
+  REMOTE_DESKTOP_INPUT_CAPABILITY,
+  REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY,
+  REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+  REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY,
+  REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY,
+} from '../../shared/remote-desktop-access.js';
+import { WORKER_CONSENT_FRAME } from '../../src/node/remote-desktop-consent-ipc.js';
+import { WORKER_PRIVACY_FRAME } from '../../src/node/remote-desktop-privacy-ipc.js';
+import {
   REMOTE_DESKTOP_WORKER_CRASH_TYPE,
   REMOTE_DESKTOP_WORKER_FILENAME,
   REMOTE_DESKTOP_WORKER_HELLO_TYPE,
@@ -32,10 +43,15 @@ import {
   type VerifiedRemoteDesktopWorkerArtifact,
 } from '../../src/node/remote-desktop-worker-host.js';
 import {
+  REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT,
+  type RemoteDesktopWorkerDiagnosticEvent,
+} from '../../src/node/remote-desktop-worker-diagnostics.js';
+import {
   launchWindowsActiveUserCommand,
   launchWindowsActiveUserElevatedCommand,
   launchWindowsRemoteDesktopCommand,
 } from '../../src/node/windows-user-session.js';
+import { createRemoteDesktopWorkerTestEndpoint } from './remote-desktop-worker-test-endpoint.js';
 
 const requestId = 'request_12345678';
 const sessionId = 'session_12345678';
@@ -84,6 +100,12 @@ afterEach(async () => {
   for (const fn of cleanup.splice(0).reverse()) await fn();
 });
 
+function workerTestPipePath(namespace: string): string {
+  const endpoint = createRemoteDesktopWorkerTestEndpoint(namespace);
+  cleanup.push(endpoint.cleanup);
+  return endpoint.path;
+}
+
 function quotedArgs(argsLine: string): string[] {
   return [...argsLine.matchAll(/"([^"]*)"/g)].map((match) => match[1]!);
 }
@@ -95,6 +117,234 @@ function decodePowerShellStdinCommand(value: string): string {
 }
 
 describe('remote desktop worker artifact and IPC host', () => {
+  it('declares only adapter capabilities implemented by the current worker', () => {
+    const host = new RemoteDesktopWorkerHost(() => {}, {
+      ...trustedHostOptions,
+      platform: 'win32',
+      artifact,
+    });
+    expect(host.adapterCapabilities()).toEqual([
+      REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY,
+      REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY,
+      REMOTE_DESKTOP_INPUT_CAPABILITY,
+      REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY,
+      REMOTE_DESKTOP_CANONICAL_BRANDING_CAPABILITY,
+      REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+    ]);
+    expect(host.adapterCapabilities()).not.toContain(REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY);
+    expect(host.supportsDefaultShieldedRoute()).toBe(true);
+  });
+
+  it('close unconditionally retires connection and privacy state without a live socket', () => {
+    const host = new RemoteDesktopWorkerHost(() => {}, {
+      ...trustedHostOptions,
+      platform: 'win32',
+      artifact,
+    });
+    const core = Reflect.get(host, 'core') as {
+      beginConnection(): number;
+      isCurrentConnection(generation: number): boolean;
+      readonly isPrivacyEpochArmed: boolean;
+      markPrivacyShielded(): void;
+      pushInbound(chunk: string, generation: number): { events: unknown[] };
+    };
+    const generation = core.beginConnection();
+    core.pushInbound('{\"partial\":', generation);
+    core.markPrivacyShielded();
+    expect(core.isCurrentConnection(generation)).toBe(true);
+    expect(core.isPrivacyEpochArmed).toBe(true);
+
+    // No socket was ever installed, reproducing shutdown after a failed or
+    // generation-stale connection. The next idle PREPARE must not inherit the
+    // old privacy epoch and suppress worker recovery.
+    host.close();
+
+    expect(core.isCurrentConnection(generation)).toBe(false);
+    expect(core.isPrivacyEpochArmed).toBe(false);
+    expect(core.pushInbound('true}\n', generation).events).toEqual([]);
+  });
+
+  it('releases a portable endpoint before a replacement host binds the same address', async () => {
+    const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-endpoint-reuse-'));
+    cleanup.push(() => rm(temp, { recursive: true, force: true }));
+    const pipePath = workerTestPipePath(temp);
+    const helpers: net.Socket[] = [];
+    const hosts: RemoteDesktopWorkerHost[] = [];
+    cleanup.push(() => {
+      for (const host of hosts) host.close();
+      for (const helper of helpers) helper.destroy();
+    });
+
+    const startHost = async (pid: number): Promise<RemoteDesktopWorkerHost> => {
+      const host = new RemoteDesktopWorkerHost(() => {}, {
+        ...trustedHostOptions,
+        platform: 'win32',
+        artifact,
+        pipePath,
+        allowPipeClients: () => {},
+        launch: (_executable, _argsLine, _secure, args) => {
+          const actual = [...(args ?? [])];
+          const helper = net.createConnection(pipePath, () => {
+            helper.write(`${JSON.stringify({
+              type: REMOTE_DESKTOP_WORKER_HELLO_TYPE,
+              ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+              nonce: actual[actual.indexOf('--nonce') + 1],
+              pid,
+            })}\n`);
+          });
+          helpers.push(helper);
+        },
+      });
+      hosts.push(host);
+      await expect(host.sendConsentFrame({
+        type: WORKER_CONSENT_FRAME.SURFACE_QUERY,
+      })).resolves.toBe(true);
+      return host;
+    };
+
+    const first = await startHost(801);
+    const firstServer = Reflect.get(first, 'server') as net.Server;
+    const firstServerClosed = new Promise<void>((resolveClosed) => {
+      firstServer.once('close', resolveClosed);
+    });
+    first.close();
+    helpers[0]!.destroy();
+    await expect(Promise.race([
+      firstServerClosed,
+      new Promise<never>((_resolve, reject) => {
+        setTimeout(() => reject(new Error('worker_test_endpoint_cleanup_timeout')), 1_000);
+      }),
+    ])).resolves.toBeUndefined();
+
+    const replacement = await startHost(802);
+    expect(replacement).toBeInstanceOf(RemoteDesktopWorkerHost);
+  });
+
+  it('launches a prompt-only worker before PREPARE and replaces it before session authority', async () => {
+    const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-consent-only-'));
+    cleanup.push(() => rm(temp, { recursive: true, force: true }));
+    const pipePath = workerTestPipePath(temp);
+    const helpers: net.Socket[] = [];
+    const receivedByLaunch: string[] = [];
+    const launches: string[][] = [];
+    const launch = vi.fn((_executable: string, _argsLine: string, _secure?: boolean, args?: readonly string[]) => {
+      const actual = [...(args ?? [])];
+      launches.push(actual);
+      const launchIndex = helpers.length;
+      const helper = net.createConnection(pipePath, () => {
+        helper.write(`${JSON.stringify({
+          type: REMOTE_DESKTOP_WORKER_HELLO_TYPE,
+          ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+          nonce: actual[actual.indexOf('--nonce') + 1],
+          pid: 600 + launchIndex,
+        })}\n`);
+      });
+      helper.setEncoding('utf8');
+      helper.on('data', (chunk) => { receivedByLaunch[launchIndex] = (receivedByLaunch[launchIndex] ?? '') + chunk; });
+      helpers.push(helper);
+    });
+    const host = new RemoteDesktopWorkerHost(() => {}, {
+      ...trustedHostOptions,
+      platform: 'win32',
+      artifact,
+      pipePath,
+      allowPipeClients: () => {},
+      launch,
+    });
+    cleanup.push(() => {
+      host.close();
+      for (const helper of helpers) helper.destroy();
+    });
+
+    await expect(host.sendConsentFrame({
+      type: WORKER_CONSENT_FRAME.SURFACE_QUERY,
+    })).resolves.toBe(true);
+    await vi.waitFor(() => expect(receivedByLaunch[0]).toContain(WORKER_CONSENT_FRAME.SURFACE_QUERY));
+    expect(launches[0]).toEqual([
+      '--pipe', pipePath, '--nonce', expect.any(String), '--consent-only',
+    ]);
+
+    const prepare = {
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId,
+      sessionId,
+      capability,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      iceServers: ['stun:stun.example.test:3478'],
+    } as const;
+    await expect(host.handle(prepare)).resolves.toBe(true);
+    await vi.waitFor(() => expect(receivedByLaunch[1]).toContain(REMOTE_DESKTOP_MSG.PREPARE));
+    expect(launches[1]).toEqual([
+      '--pipe', pipePath, '--nonce', expect.any(String),
+    ]);
+    expect(receivedByLaunch[0]).not.toContain(REMOTE_DESKTOP_MSG.PREPARE);
+    expect(helpers[0]!.destroyed).toBe(true);
+  });
+
+  it('cold-starts a privacy-only Worker and promotes that exact process for PREPARE', async () => {
+    const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-privacy-before-prepare-'));
+    cleanup.push(() => rm(temp, { recursive: true, force: true }));
+    const pipePath = workerTestPipePath(temp);
+    const received: string[] = [];
+    const launches: string[][] = [];
+    const helperSockets: net.Socket[] = [];
+    const launch = vi.fn((_executable: string, _argsLine: string, _secure?: boolean, args?: readonly string[]) => {
+      const actual = [...(args ?? [])];
+      launches.push(actual);
+      const helper = net.createConnection(pipePath, () => {
+        helper.write(`${JSON.stringify({
+          type: REMOTE_DESKTOP_WORKER_HELLO_TYPE,
+          ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+          nonce: actual[actual.indexOf('--nonce') + 1],
+          pid: 700,
+        })}\n`);
+      });
+      helper.setEncoding('utf8');
+      helper.on('data', (chunk) => received.push(String(chunk)));
+      helperSockets.push(helper);
+    });
+    const host = new RemoteDesktopWorkerHost(() => {}, {
+      ...trustedHostOptions,
+      platform: 'win32', artifact, pipePath, allowPipeClients: () => {}, launch,
+    });
+    cleanup.push(() => {
+      host.close();
+      for (const helper of helperSockets) helper.destroy();
+    });
+
+    await expect(host.sendPrivacyFrame({
+      type: WORKER_PRIVACY_FRAME.SHIELD,
+      epochId: 'epoch-0000000000000000001',
+      revision: 2,
+      presentationSource: 'signed_shell',
+      routes: [{ routeId: sessionId, routeGeneration: 17 }],
+    })).resolves.toBe(true);
+    await vi.waitFor(() => expect(received.join('')).toContain(WORKER_PRIVACY_FRAME.SHIELD));
+    expect(launches).toEqual([[
+      '--pipe', pipePath, '--nonce', expect.any(String), '--privacy-only',
+    ]]);
+
+    await expect(host.handle({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId,
+      sessionId,
+      capability,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 8,
+      routeGeneration: 17,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      iceServers: [],
+    })).resolves.toBe(true);
+    await vi.waitFor(() => expect(received.join('')).toContain(REMOTE_DESKTOP_MSG.PREPARE));
+    expect(launches).toHaveLength(1);
+  });
+
   it('accepts only the exact pinned immutable manifest contract', () => {
     expect(validateRemoteDesktopWorkerManifest(manifest)).toEqual(manifest);
     expect(validateRemoteDesktopWorkerManifest({ ...manifest, protocolVersion: 1 })).toBeNull();
@@ -231,6 +481,12 @@ describe('remote desktop worker artifact and IPC host', () => {
       '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', '-',
     ]);
     expect(script).toContain('CreateEnvironmentBlock(out env, primary, false)');
+    expect(script).toContain('const uint CREATE_NO_WINDOW = 0x08000000;');
+    expect(script).toContain('si.dwFlags = STARTF_USESHOWWINDOW;');
+    expect(script).toContain('si.wShowWindow = SW_HIDE;');
+    expect(script).toContain('uint creationFlags = CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;');
+    expect(script).toContain('CreateProcessAsUser(primary, exe, cmd, IntPtr.Zero, IntPtr.Zero, false, creationFlags');
+    expect(script).toContain('CreateProcessWithTokenW(primary, LOGON_WITH_PROFILE, exe, cmd, creationFlags');
     expect(script).toContain('WTSGetActiveConsoleSessionId');
     expect(script).toContain('s.State == WTSDisconnected');
     expect(script).toContain('s.SessionID <= 0 || !HasUserToken(s.SessionID)');
@@ -323,7 +579,7 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('authenticates one active-user worker and forwards only strict bounded envelopes', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-test-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const received: RemoteDesktopDaemonMessage[] = [];
     let helper: net.Socket | null = null;
     let helperBuffer = '';
@@ -424,10 +680,11 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('kills and reports a worker that never completes PREPARE, so the panel can retry', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-prepare-watchdog-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const received: RemoteDesktopDaemonMessage[] = [];
     const terminated: number[] = [];
     const timedOut = vi.fn();
+    const lifecycle: RemoteDesktopWorkerDiagnosticEvent[] = [];
     let helper: net.Socket | null = null;
     const host = new RemoteDesktopWorkerHost((message) => received.push(message), {
       ...trustedHostOptions,
@@ -438,6 +695,7 @@ describe('remote desktop worker artifact and IPC host', () => {
       prepareReadyTimeoutMs: 20,
       terminateProcess: (pid) => terminated.push(pid),
       onPrepareTimeout: timedOut,
+      onLifecycleEvent: (event) => lifecycle.push(event),
       launch: (_executable, argsLine) => {
         const args = quotedArgs(argsLine);
         const nonce = args[3]!;
@@ -478,6 +736,19 @@ describe('remote desktop worker artifact and IPC host', () => {
     ]), { timeout: 1_000 });
     expect(terminated).toEqual([91]);
     expect(timedOut).toHaveBeenCalledTimes(1);
+    expect(lifecycle.map((event) => event.event)).toEqual(expect.arrayContaining([
+      REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.SPAWN_VERIFIED,
+      REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.PREPARE_SENT,
+      REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.PREPARE_TIMEOUT,
+      REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.CLEANUP,
+    ]));
+    const correlated = lifecycle.filter((event) => event.event !== 'spawn_verified');
+    expect(new Set(correlated.map((event) => event.correlationId)).size).toBe(1);
+    expect(correlated).toContainEqual(expect.objectContaining({
+      event: REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.PREPARE_TIMEOUT,
+      workerPid: 91,
+      workerGeneration: expect.any(Number),
+    }));
     const tracked = (host as unknown as { tracked: Map<string, unknown> }).tracked;
     expect(tracked.size).toBe(0);
   });
@@ -485,7 +756,7 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('does not arm a late PREPARE watchdog after an immediate MODE_STATE', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-prepare-ready-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const received: RemoteDesktopDaemonMessage[] = [];
     const terminated: number[] = [];
     let helper: net.Socket | null = null;
@@ -549,10 +820,11 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('recycles the authenticated worker when PREPARE completes but OFFER never gets an ANSWER', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-offer-watchdog-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const received: RemoteDesktopDaemonMessage[] = [];
     const terminated: number[] = [];
     const timedOut = vi.fn();
+    const lifecycle: RemoteDesktopWorkerDiagnosticEvent[] = [];
     let helper: net.Socket | null = null;
     let buffered = '';
     const host = new RemoteDesktopWorkerHost((message) => received.push(message), {
@@ -564,6 +836,7 @@ describe('remote desktop worker artifact and IPC host', () => {
       offerAnswerTimeoutMs: 20,
       terminateProcess: (pid) => terminated.push(pid),
       onOfferTimeout: timedOut,
+      onLifecycleEvent: (event) => lifecycle.push(event),
       launch: (_executable, argsLine) => {
         const nonce = quotedArgs(argsLine)[3]!;
         helper = net.createConnection(pipePath, () => {
@@ -627,12 +900,160 @@ describe('remote desktop worker artifact and IPC host', () => {
     })), { timeout: 1_000 });
     expect(terminated).toEqual([93]);
     expect(timedOut).toHaveBeenCalledTimes(1);
+    expect(lifecycle.map((event) => event.event)).toEqual(expect.arrayContaining([
+      REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.PREPARE_READY,
+      REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.OFFER_SENT,
+      REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.OFFER_TIMEOUT,
+      REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.CLEANUP,
+    ]));
+  });
+
+  it('reaps the worker process when the worker itself declares a terminal', async () => {
+    // REGRESSION, observed on a real Windows node (2026-09-02, dev.4297):
+    // a worker sent its own TERMINAL, the host logged
+    // cleanupReason="worker_terminal" at ~15s, and then the worker PROCESS
+    // stayed alive for 60.7 minutes holding the session. Every retry in that
+    // hour failed as protocol_error, and remote desktop only recovered when
+    // the wedged process finally exited on its own and a fresh worker spawned.
+    //
+    // The watchdog-timeout path already terminates the pid. The
+    // worker-declared terminal path did not, so a worker that says "I am done"
+    // but does not exit was never reaped. Ending a session must not depend on
+    // the worker's goodwill.
+    const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-terminal-reap-'));
+    cleanup.push(() => rm(temp, { recursive: true, force: true }));
+    const pipePath = workerTestPipePath(temp);
+    const received: RemoteDesktopDaemonMessage[] = [];
+    const helpers: net.Socket[] = [];
+    const terminated: number[] = [];
+    const lifecycle: RemoteDesktopWorkerDiagnosticEvent[] = [];
+    const host = new RemoteDesktopWorkerHost((message) => received.push(message), {
+      ...trustedHostOptions,
+      platform: 'win32',
+      artifact,
+      pipePath,
+      allowPipeClients: () => {},
+      onLifecycleEvent: (event) => lifecycle.push(event),
+      terminateProcess: (pid) => terminated.push(pid),
+      launch: (_executable, argsLine) => {
+        if (argsLine.includes('--release-all-input')) return;
+        const nonce = quotedArgs(argsLine)[3]!;
+        const helper = net.createConnection(pipePath, () => {
+          helper.write(`${JSON.stringify({
+            type: REMOTE_DESKTOP_WORKER_HELLO_TYPE,
+            ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+            nonce,
+            pid: 4242,
+          })}\n`);
+        });
+        helpers.push(helper);
+      },
+    });
+    cleanup.push(() => { host.close(); helpers.forEach((helper) => helper.destroy()); });
+
+    await expect(host.handle({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId,
+      sessionId,
+      capability,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      iceServers: [],
+    })).resolves.toBe(true);
+    await vi.waitFor(() => expect(helpers).toHaveLength(1));
+
+    // The worker declares its own terminal and then, like the real wedged
+    // worker, does NOT exit: the helper socket stays open.
+    helpers[0]!.write(`${JSON.stringify({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      requestId,
+      sessionId,
+      capability,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.WORKER_FAILED,
+    })}\n`);
+
+    await vi.waitFor(() => expect(received).toContainEqual(expect.objectContaining({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      sessionId,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.WORKER_FAILED,
+    })), { timeout: 1_000 });
+
+    // The process must be reaped even though it never closed its own pipe.
+    await vi.waitFor(() => expect(terminated).toEqual([4242]), { timeout: 1_000 });
+    await vi.waitFor(() => expect(lifecycle).toContainEqual(expect.objectContaining({
+      event: REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.CLEANUP,
+      cleanupReason: 'worker_terminal',
+      terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.WORKER_FAILED,
+    })), { timeout: 1_000 });
+  });
+
+  it('does not reap on a controller stop, so a graceful worker exits on its own', async () => {
+    // Boundary counter-test for the reap above. Without this, reaping on EVERY
+    // cleanup reason passes the suite equally, and nothing stops the guard
+    // being widened later. A controller stop is an orderly end: the worker is
+    // told to stop and is expected to exit itself. Signalling it there would
+    // race a graceful shutdown for no evidenced benefit -- the observed wedge
+    // was specifically the worker-declared terminal path.
+    const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-stop-noreap-'));
+    cleanup.push(() => rm(temp, { recursive: true, force: true }));
+    const pipePath = workerTestPipePath(temp);
+    const received: RemoteDesktopDaemonMessage[] = [];
+    const helpers: net.Socket[] = [];
+    const terminated: number[] = [];
+    const host = new RemoteDesktopWorkerHost((message) => received.push(message), {
+      ...trustedHostOptions,
+      platform: 'win32',
+      artifact,
+      pipePath,
+      allowPipeClients: () => {},
+      terminateProcess: (pid) => terminated.push(pid),
+      launch: (_executable, argsLine) => {
+        if (argsLine.includes('--release-all-input')) return;
+        const nonce = quotedArgs(argsLine)[3]!;
+        const helper = net.createConnection(pipePath, () => {
+          helper.write(`${JSON.stringify({
+            type: REMOTE_DESKTOP_WORKER_HELLO_TYPE,
+            ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+            nonce,
+            pid: 5150,
+          })}\n`);
+        });
+        helpers.push(helper);
+      },
+    });
+    cleanup.push(() => { host.close(); helpers.forEach((helper) => helper.destroy()); });
+
+    await expect(host.handle({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId,
+      sessionId,
+      capability,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      iceServers: [],
+    })).resolves.toBe(true);
+    await vi.waitFor(() => expect(helpers).toHaveLength(1));
+
+    await expect(host.handle({
+      type: REMOTE_DESKTOP_MSG.STOP,
+      requestId,
+      sessionId,
+      capability,
+    })).resolves.toBe(true);
+
+    expect(terminated).toEqual([]);
   });
 
   it('replaces a worker that answers PREPARE with protected_desktop, exactly once', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-desktop-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const received: RemoteDesktopDaemonMessage[] = [];
     const helpers: net.Socket[] = [];
     const forced: (boolean | undefined)[] = [];
@@ -710,7 +1131,7 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('sends the replacement to the user desktop when the privileged worker reports the switch', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-unlock-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const received: RemoteDesktopDaemonMessage[] = [];
     const helpers: net.Socket[] = [];
     const forced: (boolean | undefined)[] = [];
@@ -830,9 +1251,10 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('surfaces a native worker crash frame and ignores forged ones', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-fault-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const received: RemoteDesktopDaemonMessage[] = [];
     const crashes: RemoteDesktopWorkerCrash[] = [];
+    const lifecycle: RemoteDesktopWorkerDiagnosticEvent[] = [];
     let helper: net.Socket | null = null;
     let workerNonce = '';
     const host = new RemoteDesktopWorkerHost((message) => received.push(message), {
@@ -842,6 +1264,7 @@ describe('remote desktop worker artifact and IPC host', () => {
       pipePath,
       allowPipeClients: () => {},
       onWorkerCrash: (crash) => crashes.push(crash),
+      onLifecycleEvent: (event) => lifecycle.push(event),
       launch: (_executable, argsLine) => {
         workerNonce = quotedArgs(argsLine)[3]!;
         helper = net.createConnection(pipePath, () => {
@@ -898,6 +1321,13 @@ describe('remote desktop worker artifact and IPC host', () => {
       moduleOffset: 4242,
       pid: 44,
     })]);
+    expect(lifecycle).toContainEqual(expect.objectContaining({
+      event: REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.CRASH_FRAME,
+      workerPid: 44,
+      workerGeneration: expect.any(Number),
+    }));
+    expect(JSON.stringify(lifecycle)).not.toContain('imcodes-remote-desktop-worker.exe');
+    expect(JSON.stringify(lifecycle)).not.toContain('3221225477');
     // The crash frame is diagnostic only: it never reaches the Server path.
     expect(received).toHaveLength(0);
   });
@@ -905,7 +1335,7 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('launches a content-free release-only recovery after an active worker crashes', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-crash-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     let helper: net.Socket | null = null;
     const launch = vi.fn((_executable: string, argsLine: string) => {
       if (argsLine.includes('--release-all-input')) return;
@@ -965,7 +1395,7 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('discards a poisoned worker pipe after a failed write and cold-starts the next session', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-write-failure-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const helpers: net.Socket[] = [];
     const launch = vi.fn((_executable: string, argsLine: string) => {
       if (argsLine.includes('--release-all-input')) return;
@@ -982,6 +1412,7 @@ describe('remote desktop worker artifact and IPC host', () => {
     });
     const verifyArtifactForLaunch = vi.fn(async () => artifact);
     const received: RemoteDesktopDaemonMessage[] = [];
+    const lifecycle: RemoteDesktopWorkerDiagnosticEvent[] = [];
     const host = new RemoteDesktopWorkerHost((message) => received.push(message), {
       ...trustedHostOptions,
       verifyArtifactForLaunch,
@@ -990,6 +1421,7 @@ describe('remote desktop worker artifact and IPC host', () => {
       pipePath,
       allowPipeClients: () => {},
       launch,
+      onLifecycleEvent: (event) => lifecycle.push(event),
     });
     cleanup.push(() => {
       host.close();
@@ -1024,6 +1456,11 @@ describe('remote desktop worker artifact and IPC host', () => {
 
     expect(poisonedSocket.destroyed).toBe(true);
     expect((host as unknown as { socket: net.Socket | null }).socket).toBeNull();
+    expect(lifecycle).toContainEqual(expect.objectContaining({
+      event: REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.PIPE_ERROR,
+      errorCode: 'UNKNOWN',
+      workerPid: 61,
+    }));
     expect(received).toContainEqual(expect.objectContaining({
       type: REMOTE_DESKTOP_MSG.TERMINAL,
       sessionId: 'session_poisoned',
@@ -1050,7 +1487,7 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('transparently replaces a stale idle worker pipe before admitting the next session', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-idle-write-failure-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const helpers: net.Socket[] = [];
     const helperBuffers: string[] = [];
     const launch = vi.fn((_executable: string, argsLine: string) => {
@@ -1070,6 +1507,7 @@ describe('remote desktop worker artifact and IPC host', () => {
       helpers.push(helper);
     });
     const received: RemoteDesktopDaemonMessage[] = [];
+    const lifecycle: RemoteDesktopWorkerDiagnosticEvent[] = [];
     const host = new RemoteDesktopWorkerHost((message) => received.push(message), {
       ...trustedHostOptions,
       platform: 'win32',
@@ -1077,6 +1515,7 @@ describe('remote desktop worker artifact and IPC host', () => {
       pipePath,
       allowPipeClients: () => {},
       launch,
+      onLifecycleEvent: (event) => lifecycle.push(event),
     });
     cleanup.push(() => {
       host.close();
@@ -1124,6 +1563,26 @@ describe('remote desktop worker artifact and IPC host', () => {
     await vi.waitFor(() => expect(helperBuffers[1]).toContain(recovered.sessionId));
     expect(JSON.parse(helperBuffers[1]!.trim())).toEqual(recovered);
     expect((host as unknown as { socket: net.Socket }).socket).not.toBe(staleSocket);
+    const recoveredCorrelation = lifecycle.findLast((event) => (
+      event.event === REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.PREPARE_SENT
+      && event.workerPid === 91
+    ))?.correlationId;
+    expect(recoveredCorrelation).toMatch(/^[a-f0-9]{24}$/);
+    expect(lifecycle.filter((event) => (
+      event.event === REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.CLEANUP
+      && event.correlationId === recoveredCorrelation
+    ))).toHaveLength(0);
+
+    await expect(host.handle({
+      type: REMOTE_DESKTOP_MSG.STOP,
+      requestId: recovered.requestId,
+      sessionId: recovered.sessionId,
+      capability: recovered.capability,
+    })).resolves.toBe(true);
+    expect(lifecycle.filter((event) => (
+      event.event === REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.CLEANUP
+      && event.correlationId === recoveredCorrelation
+    ))).toEqual([expect.objectContaining({ cleanupReason: 'controller_stop' })]);
   });
 
   it('cold-starts when the idle pipe closes between the check and the write', async () => {
@@ -1133,7 +1592,7 @@ describe('remote desktop worker artifact and IPC host', () => {
     // cold-start a replacement, not end the session the browser just opened.
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-idle-close-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const helpers: net.Socket[] = [];
     const helperBuffers: string[] = [];
     const launch = vi.fn((_executable: string, argsLine: string) => {
@@ -1153,6 +1612,7 @@ describe('remote desktop worker artifact and IPC host', () => {
       helpers.push(helper);
     });
     const received: RemoteDesktopDaemonMessage[] = [];
+    const lifecycle: RemoteDesktopWorkerDiagnosticEvent[] = [];
     const host = new RemoteDesktopWorkerHost((message) => received.push(message), {
       ...trustedHostOptions,
       platform: 'win32',
@@ -1160,6 +1620,7 @@ describe('remote desktop worker artifact and IPC host', () => {
       pipePath,
       allowPipeClients: () => {},
       launch,
+      onLifecycleEvent: (event) => lifecycle.push(event),
     });
     cleanup.push(() => {
       host.close();
@@ -1215,6 +1676,25 @@ describe('remote desktop worker artifact and IPC host', () => {
     await vi.waitFor(() => expect(helperBuffers[2]).toContain(next.sessionId));
     expect(JSON.parse(helperBuffers[2]!.trim())).toEqual(next);
     expect((host as unknown as { socket: net.Socket }).socket).not.toBe(staleSocket);
+    const recoveredCorrelation = lifecycle.findLast((event) => (
+      event.event === REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.PREPARE_SENT
+      && event.workerPid === 72
+    ))?.correlationId;
+    expect(recoveredCorrelation).toMatch(/^[a-f0-9]{24}$/);
+    expect(lifecycle.filter((event) => (
+      event.event === REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.CLEANUP
+      && event.correlationId === recoveredCorrelation
+    ))).toHaveLength(0);
+    await expect(host.handle({
+      type: REMOTE_DESKTOP_MSG.STOP,
+      requestId: next.requestId,
+      sessionId: next.sessionId,
+      capability: next.capability,
+    })).resolves.toBe(true);
+    expect(lifecycle.filter((event) => (
+      event.event === REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.CLEANUP
+      && event.correlationId === recoveredCorrelation
+    ))).toEqual([expect.objectContaining({ cleanupReason: 'controller_stop' })]);
   });
 
   it('drops the authority when the replacement worker never comes up', async () => {
@@ -1224,7 +1704,7 @@ describe('remote desktop worker artifact and IPC host', () => {
     // skips this very recovery.
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-recovery-fail-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const received: RemoteDesktopDaemonMessage[] = [];
     const host = new RemoteDesktopWorkerHost((message) => received.push(message), {
       ...trustedHostOptions,
@@ -1267,7 +1747,7 @@ describe('remote desktop worker artifact and IPC host', () => {
     // launch their own worker.
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-single-flight-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const helpers: net.Socket[] = [];
     const launch = vi.fn((_executable: string, argsLine: string) => {
       const args = quotedArgs(argsLine);
@@ -1324,7 +1804,7 @@ describe('remote desktop worker artifact and IPC host', () => {
     // it holds the listener's connection count up and the next start with it.
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-handshake-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const silent: net.Socket[] = [];
     const tricklers: ReturnType<typeof setInterval>[] = [];
     cleanup.push(() => { for (const timer of tricklers) clearInterval(timer); });
@@ -1385,7 +1865,7 @@ describe('remote desktop worker artifact and IPC host', () => {
     // session that was seconds away from working.
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-offer-race-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const helpers: net.Socket[] = [];
     const helperBuffers: string[] = [];
     const timers: ReturnType<typeof setTimeout>[] = [];
@@ -1463,7 +1943,7 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('recycles an idle warm worker before every new session', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-reconnect-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     const helpers: net.Socket[] = [];
     const launch = vi.fn((_executable: string, argsLine: string) => {
       const args = quotedArgs(argsLine);
@@ -1528,7 +2008,7 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('adds a shared virtual display only after an explicit headless result', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-headless-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     let helper: net.Socket | null = null;
     let helperBuffer = '';
     const controller = new EventEmitter() as EventEmitter & {
@@ -1667,7 +2147,7 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('cancels an in-flight virtual display start when its only session stops', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-cancel-headless-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     let helper: net.Socket | null = null;
     let releaseVirtualVerification: (() => void) | undefined;
     const virtualVerification = new Promise<void>((resolve) => {
@@ -1748,7 +2228,7 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('shares one headless controller across concurrent sessions and removes it only after the last session', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-shared-headless-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     let helper: net.Socket | null = null;
     let helperBuffer = '';
     const controller = new EventEmitter() as EventEmitter & {
@@ -1846,7 +2326,7 @@ describe('remote desktop worker artifact and IPC host', () => {
   it('does not loop virtual-display recovery after the shared controller crashes', async () => {
     const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-controller-crash-'));
     cleanup.push(() => rm(temp, { recursive: true, force: true }));
-    const pipePath = join(temp, 'worker.sock');
+    const pipePath = workerTestPipePath(temp);
     let helper: net.Socket | null = null;
     let helperBuffer = '';
     const controller = new EventEmitter() as EventEmitter & {
@@ -1916,5 +2396,143 @@ describe('remote desktop worker artifact and IPC host', () => {
       }),
     ]));
     expect(launchVirtualDisplay).toHaveBeenCalledOnce();
+  });
+
+  it('keeps the Windows launch and authenticated envelope contract after core extraction', async () => {
+    const temp = await mkdtemp(join(tmpdir(), 'imcodes-rd-host-core-equivalence-'));
+    cleanup.push(() => rm(temp, { recursive: true, force: true }));
+    const pipePath = workerTestPipePath(temp);
+    const workerCommands: Record<string, unknown>[] = [];
+    const serverMessages: RemoteDesktopDaemonMessage[] = [];
+    const lifecycle: RemoteDesktopWorkerDiagnosticEvent[] = [];
+    let helper: net.Socket | null = null;
+    let workerBuffer = '';
+    const launch = vi.fn((_executable: string, argsLine: string) => {
+      const args = quotedArgs(argsLine);
+      helper = net.createConnection(pipePath, () => {
+        helper!.write(`${JSON.stringify({
+          type: REMOTE_DESKTOP_WORKER_HELLO_TYPE,
+          ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+          nonce: args[3],
+          pid: 147,
+        })}\n`);
+      });
+      helper.setEncoding('utf8');
+      helper.on('data', (chunk) => {
+        workerBuffer += String(chunk);
+        const lines = workerBuffer.split('\n');
+        workerBuffer = lines.pop() ?? '';
+        for (const line of lines) {
+          if (line) workerCommands.push(JSON.parse(line) as Record<string, unknown>);
+        }
+      });
+    });
+    const host = new RemoteDesktopWorkerHost((message) => serverMessages.push(message), {
+      ...trustedHostOptions,
+      platform: 'win32',
+      artifact,
+      pipePath,
+      allowPipeClients: () => {},
+      launch,
+      onLifecycleEvent: (event) => lifecycle.push(event),
+    });
+    cleanup.push(() => { host.close(); helper?.destroy(); });
+    const prepare = {
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId,
+      sessionId,
+      capability,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      iceServers: [],
+    } as const;
+
+    await expect(host.handle(prepare)).resolves.toBe(true);
+    await vi.waitFor(() => expect(workerCommands).toEqual([prepare]));
+    expect(launch).toHaveBeenCalledOnce();
+    expect(launch.mock.calls[0]?.[0]).toBe(artifact.executablePath);
+    expect(quotedArgs(String(launch.mock.calls[0]?.[1]))).toEqual([
+      '--pipe', pipePath, '--nonce', expect.any(String),
+    ]);
+    expect(launch.mock.calls[0]?.[2]).toBe(false);
+    expect(launch.mock.calls[0]?.[3]).toEqual([
+      '--pipe', pipePath, '--nonce', expect.any(String),
+    ]);
+
+    helper!.write(`${JSON.stringify({
+      type: REMOTE_DESKTOP_MSG.MODE_STATE,
+      requestId,
+      sessionId,
+      capability,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      reason: REMOTE_DESKTOP_MODE_REASON.INITIAL,
+    })}\n`);
+    await vi.waitFor(() => expect(serverMessages).toEqual([
+      expect.objectContaining({ type: REMOTE_DESKTOP_MSG.MODE_STATE, sessionId }),
+    ]));
+    const offerSdp = 'v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n';
+    await expect(host.handle({
+      type: REMOTE_DESKTOP_MSG.OFFER,
+      requestId,
+      sessionId,
+      capability,
+      sdp: offerSdp,
+    })).resolves.toBe(true);
+    await vi.waitFor(() => expect(workerCommands.at(-1)).toEqual(expect.objectContaining({
+      type: REMOTE_DESKTOP_MSG.OFFER,
+      sdp: offerSdp,
+    })));
+    const answerSdp = 'v=0\r\no=- 2 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n';
+    helper!.write(`${JSON.stringify({
+      type: REMOTE_DESKTOP_MSG.ANSWER,
+      requestId,
+      sessionId,
+      capability,
+      sdp: answerSdp,
+    })}\n`);
+    await vi.waitFor(() => expect(serverMessages).toContainEqual(expect.objectContaining({
+      type: REMOTE_DESKTOP_MSG.ANSWER,
+      sdp: answerSdp,
+    })));
+    await expect(host.handle({
+      type: REMOTE_DESKTOP_MSG.STOP,
+      requestId,
+      sessionId,
+      capability,
+    })).resolves.toBe(true);
+    await vi.waitFor(() => expect(workerCommands.at(-1)).toEqual({
+      type: REMOTE_DESKTOP_MSG.STOP,
+      requestId,
+      sessionId,
+      capability,
+    }));
+    helper!.destroy();
+    await vi.waitFor(() => expect(lifecycle.map((event) => event.event)).toEqual(
+      expect.arrayContaining([
+        REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.SPAWN_VERIFIED,
+        REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.PREPARE_SENT,
+        REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.PREPARE_READY,
+        REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.OFFER_SENT,
+        REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.ANSWER,
+        REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.CLEANUP,
+        REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.PIPE_CLOSE,
+        REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.PROCESS_EXIT,
+      ]),
+    ));
+    expect(new Set(lifecycle.map((event) => event.correlationId)).size).toBe(1);
+    expect(lifecycle).toContainEqual(expect.objectContaining({
+      event: REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.PROCESS_EXIT,
+      workerPid: 147,
+      exitCode: null,
+      signal: null,
+      observedBy: 'pipe_close',
+    }));
+    expect(JSON.stringify(lifecycle)).not.toContain(offerSdp);
+    expect(JSON.stringify(lifecycle)).not.toContain(answerSdp);
+    expect((host as unknown as { tracked: ReadonlyMap<string, unknown> }).tracked.size).toBe(0);
   });
 });

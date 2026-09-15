@@ -4,6 +4,7 @@
  * Right-edge drag handle lets user resize width independently per card.
  */
 import { useRef, useState, useCallback, useMemo, useEffect } from 'preact/hooks';
+import { useCoalescedFrame } from '../hooks/useCoalescedFrame.js';
 import type { JSX } from 'preact';
 import { useTranslation } from 'react-i18next';
 import { resizeHandleHoverEvents } from './window-resize.js';
@@ -35,6 +36,8 @@ import { buildAliasSendExtra } from '../util/alias-send.js';
 import { parseAliasMarkers } from '@shared/alias-types.js';
 import { useMachines } from '../hooks/useMachines.js';
 import { buildMachineSendExtra } from '../util/machine-send.js';
+import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 
 const TYPE_ICON: Record<string, string> = {
   'claude-code': '⚡',
@@ -51,8 +54,11 @@ const TYPE_ICON: Record<string, string> = {
   'gemini-sdk': '♊',
   'grok-sdk': '𝕏',
   'kimi-sdk': '月',
+  [HERMES_AGENT_PROVIDER_ID]: 'H',
   'deepseek-harness': '🐳',
   pi: 'π',
+  [CODEBUDDY_PROVIDER_IDS.CHINA]: '云',
+  [CODEBUDDY_PROVIDER_IDS.INTERNATIONAL]: 'CB',
   'shell': '🐚',
   'script': '🔄',
 };
@@ -126,6 +132,7 @@ function buildCompactSessionInfo(sub: SubSession): SessionInfo {
     quotaMeta: sub.quotaMeta ?? undefined,
     effort: sub.effort ?? undefined,
     transportConfig: sub.transportConfig ?? undefined,
+    supervisionMode: sub.supervisionMode ?? undefined,
     transportPendingMessages: sub.transportPendingMessages ?? undefined,
     transportPendingMessageEntries: sub.transportPendingMessageEntries ?? undefined,
     transportPendingMessageVersion: sub.transportPendingMessageVersion ?? undefined,
@@ -163,10 +170,14 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   const timeline = isShell
     ? { events: [], refreshing: false, addOptimisticUserMessage: undefined, retryOptimisticMessage: undefined }
     : useTimeline(sub.sessionName, ws, serverId, {
-      // Open cards are active timeline consumers even when not focused. Keeping
-      // only the focused card active let open sub-session previews miss history
-      // retry/replay until the user clicked or switched windows.
-      isActiveSession: !!(isOpen || isFocused),
+      // Only the focused card owns opportunistic recovery. Open-but-unfocused
+      // cards remain visible/subscribed below, and catch up when focused,
+      // without multiplying resume work by the number of open cards.
+      // When the corresponding floating window is open it is the sole active
+      // presentation. The bar card remains a passive preview; otherwise the
+      // same session owns two hook-local recovery timers and can issue the
+      // same resume fetch twice before either request records its cooldown.
+      isActiveSession: !!isFocused && !isOpen,
       // Keep the live timeline hook attached even while preview hydration is
       // delayed. Without this, sub-session cards miss the typewriter phase and
       // only jump to cached/final text when the timer flips `timelineHydrated`.
@@ -242,6 +253,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     sharedState,
   }), [sharedState, sub]);
 
+  const scheduleFollowFrame = useCoalescedFrame();
   const forceFollowLatest = useCallback(() => {
     if (isShell) termScrollRef.current?.();
     else chatScrollRef.current?.();
@@ -284,8 +296,8 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
       addOptimisticUserMessage?.(text, commandId);
     }
     cardInputRef.current!.value = '';
-    requestAnimationFrame(() => { forceFollowLatest(); });
-  }, [addOptimisticUserMessage, aliasAll, aliasError, aliasLoaded, machineAll, ws, connected, sub.sessionName, forceFollowLatest]);
+    scheduleFollowFrame(() => { forceFollowLatest(); });
+  }, [addOptimisticUserMessage, aliasAll, aliasError, aliasLoaded, machineAll, ws, connected, sub.sessionName, forceFollowLatest, scheduleFollowFrame]);
 
   const handleTransportStop = useCallback(() => {
     // Stop is highest-priority — must fire even when the WS is briefly in
@@ -337,9 +349,13 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     handleScroll();
     return () => el.removeEventListener('scroll', handleScroll);
   }, []);
+  // Coalesced: a raw rAF here queued one uncancelled callback per timeline
+  // update. With the display asleep nothing drains that queue, so a long
+  // lock plus several open cards built a backlog the browser then ran in a
+  // single post-unlock frame. See useCoalescedFrame for the full rationale.
   useEffect(() => {
-    requestAnimationFrame(() => { forceFollowLatest(); });
-  }, [events, sub.state, forceFollowLatest]);
+    scheduleFollowFrame(() => { forceFollowLatest(); });
+  }, [events, sub.state, forceFollowLatest, scheduleFollowFrame]);
   const scrollToBottom = useCallback(() => {
     forceFollowLatest();
   }, [forceFollowLatest]);

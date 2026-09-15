@@ -1,20 +1,21 @@
 import { loadStore, flushStore, listSessions, getSession, upsertSession, removeSession, type SessionRecord } from '../store/session-store.js';
-import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute, resyncTransportSessionStatesAfterLinkRestore } from '../agent/session-manager.js';
+import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, setTransportSessionRestoredCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute, resyncTransportSessionStatesAfterLinkRestore } from '../agent/session-manager.js';
 import { sessionExists, isPaneAlive, BACKEND, killSession } from '../agent/tmux.js';
 import { detectRepo } from '../repo/detector.js';
 import { repoCache, RepoCache } from '../repo/cache.js';
-import { ServerLink, setServerLinkReconnectResyncHandler } from './server-link.js';
+import { ServerLink, setServerLinkDisconnectSecurityHandler, setServerLinkReconnectResyncHandler } from './server-link.js';
 import { DaemonRemoteDesktop } from './remote-desktop-daemon.js';
 import { closeDaemonRemoteDesktop, setDaemonRemoteDesktop } from './remote-desktop-registry.js';
 import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata } from './command-handler.js';
 import { dispatchSessionMessageByName } from './session-dispatch.js';
+import { dispatchReadyAuditSweep } from './send-tool.js';
 import { initFileTransfer, startCleanupTimer } from './file-transfer-handler.js';
 import { initializeDirectFileTransfer, shutdownDirectFileTransfers } from './direct-file-transfer.js';
 import { loadMemoryShortRefsFromStore } from '../context/memory-short-ref.js';
 import { notifySessionIdle, listP2pRuns, serializeP2pRun } from './p2p-orchestrator.js';
 import { isP2pParticipantMemoryNoise } from './p2p-memory-filter.js';
 import { handlePreviewBinaryFrame } from './preview-relay.js';
-import { buildSessionList } from './session-list.js';
+import { buildSessionList, resolveAuthoritativeSessionListState } from './session-list.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { isExecutionClone, sweepExecutionClones, destroyExecutionClone, resolveExecutionCloneRetentionMs } from './execution-clone.js';
 import { EXECUTION_CLONE_TIMELINE } from '../../shared/execution-clone.js';
@@ -23,20 +24,16 @@ import { supervisionAutomation } from './supervision-automation.js';
 import { peerAuditService } from './peer-audit-service.js';
 import { timelineStore } from './timeline-store.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
-import { startHookServer, drainQueue } from './hook-server.js';
+import { closeHookServer, drainQueue, startHookServer } from './hook-server.js';
 import { initTempFileStore } from '../store/temp-file-store.js';
 import { setupCCHooks } from '../agent/signal.js';
 import type http from 'http';
-import net from 'node:net';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { loadConfig, type Config } from '../config.js';
 import { loadCredentials } from '../bind/bind-flow.js';
 import logger from '../util/logger.js';
 import { recordDaemonStart } from '../util/daemon-status.js';
 import { installDaemonRuntimeDiagnosticsProvider } from './runtime-diagnostics.js';
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-import * as os from 'node:os';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import { pickReadableSessionDisplay } from '../../shared/session-display.js';
 import { buildWorkerSessionPersistBody, mergeWorkerSessionSnapshot, shouldPersistMainSessionToWorkerOnStartup } from './session-bootstrap.js';
@@ -68,6 +65,55 @@ import { buildTransportQueueSnapshotPayload } from './transport-queue-projection
 import { getStaleSessionCompressionRun, resolveSessionCompressionWatchRuns } from '../context/summary-compressor.js';
 import { isServerLinkResyncStatePayload, normalizeActivityGeneration } from '../../shared/session-activity-types.js';
 import type { TransportRuntimeDiagnosticSnapshot } from '../agent/transport-session-runtime.js';
+import { CAPABILITY_OPERATION_MSG, CAPABILITY_SYNC_MSG } from '../../shared/capability-management.js';
+import { CapabilityOperationHandler } from '../capability/capability-operation-handler.js';
+import { clearCapabilityAuthorizationKeys } from '../capability/capability-authorization.js';
+import { DaemonCapabilityServiceAdapter } from '../capability/capability-service-adapter.js';
+import { createCapabilityBlobHttpClient } from '../capability/capability-blob-http-client.js';
+import { CapabilitySyncService } from '../capability/capability-sync-service.js';
+import { createCapabilitySyncRuntime } from '../capability/capability-sync-runtime.js';
+import { CapabilitySyncFrameHandler } from '../capability/capability-sync-handler.js';
+import { CapabilitySourceConvergenceStore } from '../capability/capability-source-convergence.js';
+import { cleanupAbandonedCapabilityQuarantine } from '../capability/skill-acquisition.js';
+import { clearResend } from './transport-resend-queue.js';
+import {
+  createProductionSupervisionConsoleBinding,
+  isAuthorizedSupervisionConsoleScope,
+  type SupervisionConsoleBinding,
+} from './supervision-console-binding.js';
+import { setSupervisionLiveParticipantsResolver } from './supervision-state-store.js';
+import { resolveLiveSupervisionParticipants } from './supervision-brain-authority.js';
+import {
+  acquireInstanceLock,
+  releaseInstanceLock,
+  updateInstanceLockDiagnostics,
+  type DaemonInstanceLockError,
+  type InstanceLockHandle,
+} from './instance-lock.js';
+import {
+  startDaemonCgroupValidationProbes,
+  type CgroupValidationProbeController,
+} from './cgroup-validation-probes.js';
+import { runOrderedDaemonShutdown } from './ordered-shutdown.js';
+import { startSessionIdentitySync, stopSessionIdentitySync } from './session-identity-sync.js';
+
+export { acquireInstanceLock, releaseInstanceLock } from './instance-lock.js';
+
+let supervisionConsole: SupervisionConsoleBinding | undefined;
+
+/** Exposed for diagnostics/tests; undefined until the link is bound. */
+export function getSupervisionConsoleBinding(): SupervisionConsoleBinding | undefined {
+  return supervisionConsole;
+}
+
+/** Preserve durable registry time when an assignment owner has no live session record. */
+export function resolveMissingSupervisionSessionPresentation(durableObservedAt: number): {
+  state: 'offline';
+  source: 'registry';
+  observedAt: number;
+} {
+  return { state: 'offline', source: 'registry', observedAt: durableObservedAt };
+}
 
 function latestAssistantTextFromEvents(events: Array<{ type?: unknown; payload?: unknown }>): string | undefined {
   for (let i = events.length - 1; i >= 0; i--) {
@@ -257,6 +303,9 @@ async function dropLocalSession(session: SessionRecord): Promise<void> {
     await killSession(session.name).catch(() => {});
   }
 
+  // ONE removal boundary: durable queue work must never outlive its session
+  // and become deliverable to a later same-named instance.
+  clearResend(session.name, 'session_removed');
   removeSession(session.name);
 }
 
@@ -449,65 +498,29 @@ function scheduleDaemonStartupBackgroundTask(label: string, task: () => Promise<
   timer.unref?.();
 }
 
-/** Write PID file so restart can reliably find the old process. */
-function writePidFile(): void {
-  const pidPath = path.join(os.homedir(), '.imcodes', 'daemon.pid');
-  try {
-    fs.mkdirSync(path.dirname(pidPath), { recursive: true });
-    fs.writeFileSync(pidPath, String(process.pid), 'utf8');
-  } catch { /* best-effort */ }
+let lockServer: InstanceLockHandle | null = null;
+let cgroupValidationProbes: CgroupValidationProbeController | null = null;
+
+export interface DaemonStartupFailureDiagnostic {
+  reason: string;
+  code: string;
+  sessionIds: string[];
+  residualResources: string[];
 }
 
-let lockServer: net.Server | null = null;
-
-/** Acquire a single-instance lock via Unix domain socket.
- *  If another daemon is already running, the socket is in use and we exit.
- *  The lock auto-releases when the process exits (even on crash).
- *  @param sockPath — override for testing; defaults to ~/.imcodes/daemon.sock */
-export async function acquireInstanceLock(sockPath?: string): Promise<net.Server> {
-  // Windows: use a named pipe instead of Unix domain socket (UDS has path length limits and AV issues)
-  const p = process.platform === 'win32'
-    ? '\\\\.\\pipe\\imcodes-daemon-lock'
-    : (sockPath ?? path.join(os.homedir(), '.imcodes', 'daemon.sock'));
-
-  if (process.platform !== 'win32') {
-    fs.mkdirSync(path.dirname(p), { recursive: true });
-  }
-
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-
-    server.on('error', (err: NodeJS.ErrnoException) => {
-      if (err.code === 'EADDRINUSE') {
-        // Socket/pipe exists — check if another daemon is actually alive
-        const client = net.connect(p, () => {
-          // Connection succeeded → another daemon is running
-          client.destroy();
-          reject(new Error(`Another imcodes daemon is already running. Use 'imcodes restart' to restart it.`));
-        });
-        client.on('error', () => {
-          // Connection failed → stale socket from a crashed process, reclaim it
-          if (process.platform !== 'win32') {
-            try { fs.unlinkSync(p); } catch { /* ignore */ }
-          }
-          server.listen(p, () => resolve(server));
-        });
-      } else {
-        reject(err);
-      }
-    });
-
-    server.listen(p, () => resolve(server));
-  });
-}
-
-/** Release a single-instance lock. */
-export function releaseInstanceLock(server: net.Server, sockPath?: string): void {
-  server.close();
-  if (process.platform !== 'win32') {
-    const p = sockPath ?? path.join(os.homedir(), '.imcodes', 'daemon.sock');
-    try { fs.unlinkSync(p); } catch { /* ignore */ }
-  }
+export function describeDaemonStartupFailure(error: unknown): DaemonStartupFailureDiagnostic {
+  const lockError = error as Partial<DaemonInstanceLockError>;
+  const owner = lockError.owner;
+  const sessions = owner?.sessionIds ?? listSessions().map((session) => session.name);
+  const resources = owner?.residualResources
+    ?? lockServer?.metadata.residualResources
+    ?? sessions.map((sessionId) => `session:${sessionId}`);
+  return {
+    reason: error instanceof Error ? error.message : String(error),
+    code: typeof lockError.code === 'string' ? lockError.code : 'DAEMON_STARTUP_FAILED',
+    sessionIds: [...new Set(sessions)].sort(),
+    residualResources: [...new Set(resources)].sort(),
+  };
 }
 
 /** Startup sequence: config → store → memory → sessions → server link */
@@ -518,7 +531,7 @@ export async function startup(): Promise<DaemonContext> {
     changeId: 'memory-system-1.1-foundations',
   }, 'Daemon starting');
   lockServer = await acquireInstanceLock();
-  writePidFile();
+  cgroupValidationProbes = startDaemonCgroupValidationProbes();
   installDaemonRuntimeDiagnosticsProvider();
   // Captures an initial heap snapshot into the runtime status; subsequent
   // refreshes ride the heartbeat write (no dedicated timer / extra I/O).
@@ -529,6 +542,17 @@ export async function startup(): Promise<DaemonContext> {
 
   await loadStore();
   logger.info('Session store loaded');
+  updateInstanceLockDiagnostics(lockServer, {
+    sessionIds: listSessions().map((session) => session.name),
+    residualResources: [
+      `instance-lock:${lockServer.socketPath}`,
+      ...listSessions().map((session) => (
+        session.runtimeType === 'transport' || isTransportAgent(session.agentType)
+          ? `transport-session:${session.name}`
+          : `terminal-session:${session.name}`
+      )),
+    ],
+  });
 
   await initTempFileStore();
   logger.info('Temp file store initialized');
@@ -545,13 +569,30 @@ export async function startup(): Promise<DaemonContext> {
   logger.info('File transfer initialized');
   await initializeDirectFileTransfer();
 
+  const useContextStoreWorker = !(process.env.VITEST || process.env.NODE_ENV === 'test');
+  if (useContextStoreWorker) {
+    // Start the context-store worker BEFORE any context-store-backed warm-load.
+    // Regression: the short-ref warm-load used to fire above this point, so a
+    // production daemon could open the SQLite store on the main thread before the
+    // worker became the single owner. That poisoned the worker-only invariant and
+    // showed up later as repeated worker timeouts plus failed short-ref persists.
+    getContextStoreClient().start();
+    // The worker is now the single long-lived DB owner — let it (not the
+    // main-thread connection) run the archive-backfill timer.
+    setArchiveBackfillSchedulingEnabled(false);
+  }
+
   // Warm the memory short-ref index so handles injected before this restart
   // still resolve. Resolution is synchronous (it runs inside render paths), so
-  // the durable map is read once here rather than per lookup. Best-effort: a
-  // cold index only means a handle re-registers on its next injection.
-  void loadMemoryShortRefsFromStore()
-    .then((loaded) => { if (loaded > 0) logger.info({ loaded }, 'Memory short-ref index warmed'); })
-    .catch(() => { /* non-fatal: handles are a pure function of the id */ });
+  // the durable map is read once here rather than per lookup. In production this
+  // must wait for the worker owner instead of falling back to an in-process
+  // SQLite connection; tests/CLI keep the original in-process path. Best-effort:
+  // a cold index only means a handle re-registers on its next injection.
+  void (async () => {
+    if (useContextStoreWorker) await getContextStoreClient().whenReady();
+    const loaded = await loadMemoryShortRefsFromStore();
+    if (loaded > 0) logger.info({ loaded }, 'Memory short-ref index warmed');
+  })().catch(() => { /* non-fatal: handles are a pure function of the id */ });
 
   // Clean up old timeline files (>7 days) and truncate oversized ones.
   //
@@ -598,32 +639,27 @@ export async function startup(): Promise<DaemonContext> {
   const serverId = creds?.serverId ?? '';
   const token = creds?.token ?? '';
   configureSharedContextRuntime(creds ? { workerUrl: workerUrl!, serverId, token } : null);
-  // Warm the context-store worker at boot so front-of-turn recall + store access
-  // run off the daemon main thread. Skipped under test (the in-process path is
-  // used there, matching the embedding engine's test behavior); recall callers
-  // fall back to in-process automatically until the worker reports ready.
-  if (!(process.env.VITEST || process.env.NODE_ENV === 'test')) {
-    getContextStoreClient().start();
-    // The worker is now the single long-lived DB owner — let it (not the
-    // main-thread connection) run the archive-backfill timer.
-    setArchiveBackfillSchedulingEnabled(false);
-  }
   if (creds) {
+    cleanupAbandonedCapabilityQuarantine();
     try {
       const runtimeConfig = await fetchBackendSharedContextRuntimeConfig({ workerUrl: workerUrl!, serverId, token });
       setContextModelRuntimeConfig(runtimeConfig);
     } catch (err) {
       logger.warn({ err, serverId }, 'shared-context runtime config bootstrap failed');
     }
-    // Prime the supervisor global-defaults cache so the very first
-    // supervision dispatch after startup uses the current custom
-    // instructions even if no session's cached snapshot carries them.
+    // Prime the account-level supervisor runtime so the first decision uses
+    // the current primary/backup selection and global instructions even when
+    // a session carries an older compatibility snapshot.
     // Fire-and-forget: failure just means the daemon falls through to
     // the snapshot mirror. The WS-reconnect hook below keeps it fresh.
     void (async () => {
       try {
-        const { refreshSupervisorDefaultsCache } = await import('./supervisor-defaults-cache.js');
+        const {
+          refreshSupervisorDefaultsCache,
+          startSupervisorDefaultsCacheRefresh,
+        } = await import('./supervisor-defaults-cache.js');
         await refreshSupervisorDefaultsCache();
+        startSupervisorDefaultsCacheRefresh();
       } catch (err) {
         logger.debug({ err }, 'supervisor-defaults-cache: startup prime failed');
       }
@@ -684,6 +720,9 @@ export async function startup(): Promise<DaemonContext> {
       }
       return resolveTransportContextBootstrap({
         projectDir: latest.projectDir,
+        sessionId: latest.name,
+        providerId: latest.providerId ?? latest.agentType,
+        serverId: serverId || undefined,
         transportConfig: latest.transportConfig ?? {},
         startupMemoryAlreadyInjected: true,
       });
@@ -697,6 +736,96 @@ export async function startup(): Promise<DaemonContext> {
   let scheduleServerLinkRestoreBroadcast: (() => void) | null = null;
   if (creds) {
     serverLink = new ServerLink({ workerUrl: workerUrl!, serverId, token });
+    const capabilityBlobClient = createCapabilityBlobHttpClient({
+      serverId,
+      loadCredentials: async () => ({ serverId, token, workerUrl: workerUrl! }),
+    });
+    const capabilitySourceConvergenceStore = new CapabilitySourceConvergenceStore();
+    const capabilityServicesByOwner = new Map<string, DaemonCapabilityServiceAdapter>();
+    const capabilitySyncServicesByOwner = new Map<string, CapabilitySyncService>();
+    setServerLinkDisconnectSecurityHandler(() => {
+      for (const ownerId of new Set([...capabilityServicesByOwner.keys(), ...capabilitySyncServicesByOwner.keys()])) {
+        clearCapabilityAuthorizationKeys(ownerId, serverId);
+      }
+    });
+    const capabilitySyncServiceForOwner = (ownerId: string): CapabilitySyncService => {
+      let service = capabilitySyncServicesByOwner.get(ownerId);
+      if (!service) {
+        const runtime = createCapabilitySyncRuntime({
+          ownerId,
+          serverId,
+          blobClient: capabilityBlobClient,
+          convergenceStore: capabilitySourceConvergenceStore,
+        });
+        service = new CapabilitySyncService({
+          ownerId,
+          serverId,
+          loadSkillContent: runtime.loadSkillContent,
+          publishSkill: runtime.publishSkill,
+          reconcileSkill: runtime.reconcileSkill,
+          send: (frame) => serverLink!.send(frame),
+        });
+        capabilitySyncServicesByOwner.set(ownerId, service);
+      }
+      return service;
+    };
+    const capabilityOperationHandler = new CapabilityOperationHandler({
+      isFullDaemon: true,
+      serverId,
+      serviceForOwner: (ownerId) => {
+        let service = capabilityServicesByOwner.get(ownerId);
+        if (!service) {
+          service = new DaemonCapabilityServiceAdapter({
+            ownerId,
+            serverId,
+            conversationIdentity: `imcodes-server-capability:${serverId}`,
+          });
+          capabilityServicesByOwner.set(ownerId, service);
+        }
+        return service;
+      },
+      send: (frame) => serverLink!.send(frame),
+      blobClient: capabilityBlobClient,
+      convergenceStore: capabilitySourceConvergenceStore,
+      onBlobUploadFailure: (failure) => {
+        logger.warn({
+          capabilityId: failure.capabilityId,
+          versionId: failure.versionId,
+          readiness: failure.readiness,
+          errorCode: failure.errorCode,
+        }, 'Capability source blob upload failed closed');
+      },
+    });
+    if (capabilityCandidateCleanupTimer) clearInterval(capabilityCandidateCleanupTimer);
+    capabilityCandidateCleanupTimer = setInterval(() => {
+      void capabilityOperationHandler.cleanupExpiredCandidates().catch((error) => {
+        logger.warn({ error }, 'Expired capability candidate cleanup failed closed');
+      });
+    }, 60_000);
+    capabilityCandidateCleanupTimer.unref?.();
+    serverLink.onOpen(() => {
+      void capabilityOperationHandler.replayPending().catch((error) => {
+        logger.warn({ error }, 'Capability operation outbox replay failed');
+      });
+    });
+    const capabilitySyncHandler = new CapabilitySyncFrameHandler({
+      serviceForOwner: capabilitySyncServiceForOwner,
+      requestFullSnapshot: () => serverLink!.send({ type: CAPABILITY_SYNC_MSG.REQUEST }),
+      onError: (error, context) => {
+        if (context.ownerId) clearCapabilityAuthorizationKeys(context.ownerId, serverId);
+        else {
+          for (const ownerId of capabilitySyncServicesByOwner.keys()) {
+            clearCapabilityAuthorizationKeys(ownerId, serverId);
+          }
+        }
+        // Logged under `err` so pino's error serializer runs. Under a plain
+        // `error` key the Error's `message` and `stack` are non-enumerable and
+        // are silently dropped, leaving only own properties like `code` — which
+        // is how a Windows fleet spent hours emitting this warning every 30s
+        // with no indication of what actually failed.
+        logger.warn({ err: error, ...context }, 'Capability synchronization failed closed');
+      },
+    });
     // Heal the exact loss window observed on deck_sub_26624c1t: an
     // authoritative `session.state: idle` emitted while the ServerLink socket
     // was down is silently dropped (control-plane, no replay), leaving the
@@ -733,6 +862,28 @@ export async function startup(): Promise<DaemonContext> {
       onCapabilityChange: () => link.refreshDaemonCapabilities(),
     }));
     serverLink.onMessage((msg) => {
+      const type = msg && typeof msg === 'object' && 'type' in msg ? (msg as { type?: unknown }).type : undefined;
+      if (type === CAPABILITY_OPERATION_MSG.INSTALL
+        || type === CAPABILITY_OPERATION_MSG.CONFIRM
+        || type === CAPABILITY_OPERATION_MSG.CANCEL
+        || type === CAPABILITY_OPERATION_MSG.AUTHORIZE
+        || type === CAPABILITY_OPERATION_MSG.COMMIT_ACK
+        || type === CAPABILITY_OPERATION_MSG.COMMIT_ABORT
+        || type === CAPABILITY_OPERATION_MSG.MANAGE
+        || type === CAPABILITY_OPERATION_MSG.MANAGE_ACK
+        || type === CAPABILITY_SYNC_MSG.BLOB_CAPABILITY) {
+        void capabilityOperationHandler.handle(msg).catch((error) => {
+          logger.warn({ error, type }, 'Capability operation handler failed closed');
+        });
+        return;
+      }
+      if (type === CAPABILITY_SYNC_MSG.SNAPSHOT
+        || type === CAPABILITY_SYNC_MSG.DELTA
+        || type === CAPABILITY_SYNC_MSG.TOMBSTONE
+        || type === CAPABILITY_SYNC_MSG.AUTHORITY) {
+        void capabilitySyncHandler.handle(msg);
+        return;
+      }
       handleWebCommand(msg, serverLink!);
     });
     serverLink.onBinaryMessage((data) => {
@@ -821,6 +972,9 @@ export async function startup(): Promise<DaemonContext> {
               quotaLabel: session.quotaLabel ?? null,
               quotaUsageLabel: session.quotaUsageLabel ?? null,
               quotaMeta: session.quotaMeta ?? null,
+              codexCreditsBalance: session.codexCreditsBalance ?? null,
+              codexCreditsHasCredits: session.codexCreditsHasCredits ?? null,
+              codexCreditsUnlimited: session.codexCreditsUnlimited ?? null,
               effort: session.effort ?? null,
               transportConfig: session.transportConfig ?? null,
               ...(transportRuntime ? buildTransportQueueSnapshotPayload(session.name, 'lifecycle') : {}),
@@ -1169,26 +1323,118 @@ export async function startup(): Promise<DaemonContext> {
         serverLink.send({ type: 'session.tool', session: payload.session, tool: null });
       }
     } catch { /* not connected */ }
+  }, {
+    // Memory MCP children receive this same daemon-owned ServerLink id in
+    // their sanitized environment. Supplying it independently here lets the
+    // hook accept legacy daemon-local namespaces without trusting a
+    // child-provided server id or waiting for capability authority hydration.
+    memoryMcpServerId: serverId || undefined,
+    // The daemon owns this listener for the whole process lifetime, so an
+    // unexpected loss must self-heal (rebind + republish authority) instead of
+    // leaving the machine with no hook endpoint until a full daemon restart.
+    rebindOnListenerLoss: true,
   });
   hookServer = hookResult.server;
   // Rewrite all CC hook scripts with the actual port (may differ from last run)
   await setupCCHooks().catch((e) => logger.warn({ err: e }, 'CC hook setup failed'));
 
+  setTransportSessionRestoredCallback((sessionName) => {
+    supervisionAutomation.applyPersistedSnapshot(sessionName);
+  });
   supervisionAutomation.init();
   supervisionAutomation.setServerLink(serverLink);
+  // One recovery pass closes the durable ready_for_audit -> dispatch crash
+  // window. Post-open hooks own normal materialization; no polling worker.
+  // Restart identity convergence needs the daemon's real view of live runtimes.
+  // Without this the singleton registry had no resolver and every rotated
+  // instance/epoch was refused as owner_mismatch in production while passing in
+  // tests that injected one.
+  setSupervisionLiveParticipantsResolver(
+    (projectName) => resolveLiveSupervisionParticipants(projectName),
+  );
+  void dispatchReadyAuditSweep().catch((err) => {
+    logger.warn({ err }, 'automatic supervision audit boot sweep failed');
+  });
+
+  // Supervision task console: durable SQLite projection -> outbox -> this link.
+  // Capability injection, no process-global registry: the binding receives the
+  // link and its own database and owns nothing ambient. A failure here must not
+  // take the daemon down, so it is logged and the rest of startup continues.
+  try {
+    if (!serverLink) throw new Error('no server link');
+    supervisionConsole = createProductionSupervisionConsoleBinding({
+      serverLink,
+      // Only the coordinator that owns a project scope may subscribe to it.
+      authorize: (scope) => isAuthorizedSupervisionConsoleScope(scope, listSessions()),
+      resolveSessionPresentation: (sessionName, durableObservedAt) => {
+        const record = getSession(sessionName);
+        if (!record) {
+          return resolveMissingSupervisionSessionPresentation(durableObservedAt);
+        }
+        if (supervisionAutomation.isWaitingForUserInput(sessionName)) {
+          return {
+            label: record.label,
+            state: 'needs_input',
+            source: 'supervision',
+            observedAt: record.updatedAt,
+          };
+        }
+        const observed = resolveAuthoritativeSessionListState(record);
+        return {
+          label: record.label,
+          state: observed === 'running' || observed === 'queued'
+            ? 'running'
+            : observed === 'idle'
+              ? 'idle'
+              : observed === 'error' || observed === 'stopped'
+                ? 'offline'
+                : 'unknown',
+          source: observed === 'running' || observed === 'queued' || observed === 'idle'
+            ? 'runtime'
+            : 'registry',
+          observedAt: record.updatedAt,
+        };
+      },
+      onError: (error) => logger.warn({ error }, 'supervision console projection unavailable'),
+    });
+    logger.info({ epoch: supervisionConsole.projectionEpoch }, 'supervision console bound');
+  } catch (err) {
+    supervisionConsole = undefined;
+    logger.warn({ err }, 'supervision console binding failed');
+  }
 
   ctx = { config, serverLink, persistBinding, removeBinding, sendSessionEvent };
+  updateInstanceLockDiagnostics(lockServer, {
+    sessionIds: listSessions().map((session) => session.name),
+    residualResources: [
+      `instance-lock:${lockServer.socketPath}`,
+      ...(hookServer ? ['mcp-ingress:hook-server'] : []),
+      ...(serverLink ? ['browser-link:server-websocket'] : []),
+      ...(process.platform === 'linux' ? ['container-authority:systemd-control-group'] : []),
+      ...listSessions().map((session) => (
+        session.runtimeType === 'transport' || isTransportAgent(session.agentType)
+          ? `transport-session:${session.name}`
+          : `terminal-session:${session.name}`
+      )),
+    ],
+  });
   setupSignalHandlers();
   startHealthPoller();
   startCodexQuotaPoller(serverLink);
   startContextReplicationPoller(workerUrl, serverId, token);
   startUsageSyncWorker(workerUrl, serverId, token);
+  if (creds) {
+    startSessionIdentitySync({ endpoint: { workerUrl: creds.workerUrl, serverId: creds.serverId, token: creds.token } }, (message) => {
+      logger.warn({ reason: message }, 'session identity synchronization failed');
+    });
+  }
   startContextMaterializationPoller(liveContextIngestion);
   startGcPoller();
   startEventLoopDelayMonitor();
   startLatencyTracer();
 
   logger.info('Daemon started');
+  cgroupValidationProbes?.markReady();
 
   if (serverLink) {
     serverLink.connect();
@@ -1396,43 +1642,88 @@ async function autoReconnectProviders(): Promise<void> {
   }
 }
 
-/** Shutdown sequence: flush store, disconnect WS, release lock, exit cleanly */
-export async function shutdown(exitCode = 0): Promise<void> {
+let shutdownInFlight: Promise<void> | null = null;
+
+/** Shutdown sequence: flush store, disconnect WS, release lock, exit cleanly. */
+export function shutdown(exitCode = 0): Promise<void> {
+  if (shutdownInFlight) return shutdownInFlight;
+  shutdownInFlight = performShutdown(exitCode);
+  return shutdownInFlight;
+}
+
+async function performShutdown(exitCode: number): Promise<void> {
   logger.info('Daemon shutting down');
-
-  // Peer-audit attempts are intentionally not restart-resumable. Cancel
-  // deadlines/queued dispatches and close the dedicated reply ingress before
-  // timeline and queue stores are drained.
-  peerAuditService.shutdown();
-
-  await shutdownDirectFileTransfers().catch((err) => {
-    logger.warn({ err }, 'Daemon shutdown direct file transfer cleanup failed');
-  });
-
-  // The native worker is a separate process; leaving it running would keep a
-  // capture session and its named pipe alive past the daemon that owns it.
-  closeDaemonRemoteDesktop();
-
-  // Kill all ConPTY sessions (they don't survive daemon exit like tmux)
-  if ((BACKEND as string) === 'conpty') {
-    try {
-      const conpty = await import('../agent/conpty.js');
-      const names: string[] = conpty.conptyListSessions();
-      for (const name of names) {
-        try {
-          conpty.conptyKillSession(name);
-        } catch (e) {
-          logger.warn({ err: e, session: name }, 'Failed to kill ConPTY session during shutdown');
-        }
+  const orderedShutdown = await runOrderedDaemonShutdown({
+    session: async () => {
+      logger.info({ shutdownPhase: 'session' }, 'Daemon shutdown phase session started');
+      // Stop new delegated/session work before tearing down its transports.
+      peerAuditService.shutdown();
+      if ((BACKEND as string) === 'conpty') {
+        const conpty = await import('../agent/conpty.js');
+        for (const name of conpty.conptyListSessions()) conpty.conptyKillSession(name);
       }
-    } catch { /* conpty not available */ }
-  }
-
-  try {
-    const { terminalStreamer } = await import('./terminal-streamer.js');
-    await terminalStreamer.destroyAsync();
-  } catch (err) {
-    logger.warn({ err }, 'Daemon shutdown terminal streamer drain failed');
+      await cgroupValidationProbes?.stopPhase('session');
+      logger.info({ shutdownPhase: 'session' }, 'Daemon shutdown phase session completed');
+    },
+    mcp: async () => {
+      logger.info({ shutdownPhase: 'mcp' }, 'Daemon shutdown phase MCP started');
+      // SDK transport sessions own their MCP child processes. Disconnecting
+      // every provider closes those children before browser/container teardown.
+      const { disconnectAll } = await import('../agent/provider-registry.js');
+      await disconnectAll();
+      if (hookServer) {
+        // MUST go through closeHookServer: a bare close() now looks like an
+        // unexpected listener loss and would arm the hook server's rebind path
+        // in the middle of shutdown.
+        await closeHookServer(hookServer);
+        hookServer = null;
+      }
+      await cgroupValidationProbes?.stopPhase('mcp');
+      logger.info({ shutdownPhase: 'mcp' }, 'Daemon shutdown phase MCP completed');
+    },
+    browser: async () => {
+      logger.info({ shutdownPhase: 'browser' }, 'Daemon shutdown phase browser started');
+      try {
+        const { shutdownDefaultPreviewReadCoordinatorForDaemon } = await import('./file-preview-read-coordinator.js');
+        await shutdownDefaultPreviewReadCoordinatorForDaemon();
+      } catch (err) {
+        logger.warn({ errorKind: err instanceof Error ? err.name : typeof err }, 'Daemon shutdown preview read drain failed');
+      }
+      const { terminalStreamer } = await import('./terminal-streamer.js');
+      await terminalStreamer.destroyAsync();
+      closeDaemonRemoteDesktop();
+      ctx?.serverLink?.disconnect();
+      try {
+        const { closeComputerUseRuntimeForProcessExit } = await import('../node/computer-use-runner.js');
+        await closeComputerUseRuntimeForProcessExit();
+      } catch (error) {
+        logger.warn({ errorKind: error instanceof Error ? error.name : typeof error }, 'Daemon shutdown browser runtime cleanup failed');
+        throw error;
+      }
+      await cgroupValidationProbes?.stopPhase('browser');
+      logger.info({ shutdownPhase: 'browser' }, 'Daemon shutdown phase browser completed');
+    },
+    container: async () => {
+      logger.info({ shutdownPhase: 'container' }, 'Daemon shutdown phase container started');
+      await shutdownDirectFileTransfers();
+      await cgroupValidationProbes?.stopPhase('container');
+      logger.info({ shutdownPhase: 'container' }, 'Daemon shutdown phase container completed');
+    },
+  }, {
+    phaseTimeoutMs: 10_000,
+    forceKill: async (phase, failure) => {
+      // Individual runtime owners already perform TERM→KILL escalation. If a
+      // phase still times out, exit non-zero below; systemd's control-group
+      // authority then applies the final bounded SIGKILL to every descendant.
+      logger.error({ phase, failure }, 'Daemon shutdown phase failed; forcing bounded process-group cleanup');
+      if (phase === 'browser') {
+        closeDaemonRemoteDesktop();
+        ctx?.serverLink?.disconnect();
+      }
+    },
+  });
+  if (!orderedShutdown.ok) {
+    logger.error({ failures: orderedShutdown.failures }, 'Daemon shutdown failed closed');
   }
 
   try {
@@ -1482,18 +1773,6 @@ export async function shutdown(exitCode = 0): Promise<void> {
   }
 
   try {
-    const { disconnectAll } = await import('../agent/provider-registry.js');
-    await disconnectAll();
-  } catch { /* ignore */ }
-
-  try {
-    const { shutdownDefaultPreviewReadCoordinatorForDaemon } = await import('./file-preview-read-coordinator.js');
-    await shutdownDefaultPreviewReadCoordinatorForDaemon();
-  } catch (err) {
-    logger.warn({ errorKind: err instanceof Error ? err.name : typeof err }, 'Daemon shutdown preview read drain failed');
-  }
-
-  try {
     const { shutdownDefaultTimelineHistoryWorkerPoolForDaemon } = await import('./timeline-history-pool.js');
     await shutdownDefaultTimelineHistoryWorkerPoolForDaemon();
   } catch (err) {
@@ -1519,21 +1798,30 @@ export async function shutdown(exitCode = 0): Promise<void> {
     if (codexQuotaTimer) clearInterval(codexQuotaTimer);
     if (contextReplicationTimer) clearInterval(contextReplicationTimer);
     usageSyncWorker?.stop();
+    stopSessionIdentitySync();
     if (contextMaterializationTimer) clearInterval(contextMaterializationTimer);
     if (gcTimer) clearInterval(gcTimer);
     if (eventLoopDelayTimer) clearInterval(eventLoopDelayTimer);
+    if (capabilityCandidateCleanupTimer) {
+      clearInterval(capabilityCandidateCleanupTimer);
+      capabilityCandidateCleanupTimer = null;
+    }
     workerSessionSyncRetrier?.stop();
     workerSessionSyncRetrier = null;
-    hookServer?.close();
-    ctx?.serverLink?.disconnect();
     configureSharedContextRuntime(null);
+    const { stopSupervisorDefaultsCacheRefresh } = await import('./supervisor-defaults-cache.js');
+    stopSupervisorDefaultsCacheRefresh();
     await flushStore();
     logger.info('Store flushed');
   } catch (e) {
     logger.error({ err: e }, 'Error during shutdown');
   }
 
-  if (lockServer) releaseInstanceLock(lockServer);
+  if (lockServer) {
+    await releaseInstanceLock(lockServer);
+    lockServer = null;
+  }
+  cgroupValidationProbes = null;
 
   if ((BACKEND as string) === 'conpty') {
     logger.info('Daemon stopped (ConPTY sessions killed)');
@@ -1541,7 +1829,7 @@ export async function shutdown(exitCode = 0): Promise<void> {
     // tmux/wezterm sessions are intentionally NOT killed — they keep running
     logger.info('Daemon stopped (tmux sessions left running)');
   }
-  process.exit(exitCode);
+  process.exit(Math.max(exitCode, orderedShutdown.exitCode));
 }
 
 const HEALTH_POLL_MS = 30_000;
@@ -1569,6 +1857,7 @@ let usageSyncWorker: UsageSyncWorker | null = null;
 let contextMaterializationTimer: ReturnType<typeof setInterval> | null = null;
 let gcTimer: ReturnType<typeof setInterval> | null = null;
 let eventLoopDelayTimer: ReturnType<typeof setInterval> | null = null;
+let capabilityCandidateCleanupTimer: ReturnType<typeof setInterval> | null = null;
 let hookServer: http.Server | null = null;
 
 /** Mark an execution clone whose tmux pane has died as completed so the GC

@@ -1,0 +1,612 @@
+.remote-desktop-workspace-shell > .floating-panel-content,
+.remote-desktop-wall-shell > .floating-panel-content {
+  padding: 0;
+  overflow: hidden;
+}
+
+.remote-desktop-workspace {
+  display: flex;
+  min-height: 0;
+  height: 100%;
+  flex-direction: column;
+  background: var(--chrome-bg);
+}
+
+/* Fullscreen takes the workspace out of its floating panel, so it has to say
+   its own size here -- inheriting `height: 100%` from a parent that is no
+   longer laying it out leaves it collapsed in the corner of a black screen. */
+.remote-desktop-workspace:fullscreen {
+  width: 100vw;
+  height: 100vh;
+  border-radius: 0;
+}
+
+.remote-desktop-wall {
+  display: flex;
+  min-height: 0;
+  height: 100%;
+  flex-direction: column;
+  background: #050b13;
+}
+
+.remote-desktop-wall-standalone {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+}
+
+.remote-desktop-wall-header,
+.remote-desktop-workspace-tabbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--chrome-line-soft);
+}
+
+.remote-desktop-wall-header {
+  justify-content: space-between;
+  cursor: move;
+  background:
+    linear-gradient(90deg, rgb(14 28 47 / 98%), rgb(8 18 32 / 98%)),
+    var(--chrome-panel);
+  box-shadow: inset 0 -1px rgb(56 189 248 / 8%);
+}
+
+.remote-desktop-workspace-actions,
+.remote-desktop-workspace-tabbar > [role="tablist"],
+.remote-desktop-workspace-host-tab {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.remote-desktop-workspace-actions {
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
+.remote-desktop-workspace-tabbar > [role="tablist"] {
+  min-width: 0;
+  overflow-x: auto;
+  flex: 0 1 auto;
+}
+
+.remote-desktop-workspace-tabbar {
+  justify-content: flex-start;
+  cursor: move;
+}
+
+.remote-desktop-workspace-tab,
+.remote-desktop-workspace-icon-button,
+.remote-desktop-workspace-chrome-button {
+  display: inline-grid;
+  min-width: 30px;
+  min-height: 30px;
+  place-items: center;
+  border: 1px solid rgb(76 168 218 / 24%);
+  border-radius: 7px;
+  color: #a9cfe5;
+  background: linear-gradient(180deg, rgb(20 43 66 / 78%), rgb(8 21 36 / 88%));
+  box-shadow: inset 0 1px rgb(255 255 255 / 4%), 0 0 0 1px rgb(0 0 0 / 18%);
+  transition: border-color 140ms ease, color 140ms ease, box-shadow 140ms ease, transform 140ms ease;
+}
+
+.remote-desktop-workspace-tab {
+  display: inline-flex;
+  padding-inline: 12px;
+  white-space: nowrap;
+}
+
+.remote-desktop-workspace-icon-button svg,
+.remote-desktop-workspace-chrome-button svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentcolor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.remote-desktop-workspace-tab:hover:not(:disabled),
+.remote-desktop-workspace-icon-button:hover:not(:disabled),
+.remote-desktop-workspace-chrome-button:hover:not(:disabled) {
+  border-color: rgb(74 210 255 / 72%);
+  color: #d8f7ff;
+  box-shadow: 0 0 16px rgb(34 211 238 / 16%), inset 0 1px rgb(255 255 255 / 7%);
+  transform: translateY(-1px);
+}
+
+.remote-desktop-workspace-tab:focus-visible,
+.remote-desktop-workspace-icon-button:focus-visible,
+.remote-desktop-workspace-chrome-button:focus-visible {
+  outline: 2px solid rgb(56 189 248 / 76%);
+  outline-offset: 2px;
+}
+
+.remote-desktop-workspace-tab[aria-selected="true"] {
+  border-color: rgb(34 211 238 / 72%);
+  color: #d9fbff;
+  background: linear-gradient(180deg, rgb(13 73 101 / 82%), rgb(7 37 57 / 94%));
+  box-shadow: inset 0 -2px #22d3ee, 0 0 18px rgb(34 211 238 / 13%);
+}
+
+.remote-desktop-workspace-icon-button:disabled {
+  opacity: .28;
+}
+
+.remote-desktop-workspace-chrome-button:disabled {
+  opacity: .34;
+  cursor: default;
+  transform: none;
+}
+
+.remote-desktop-wall-retry-all {
+  display: inline-flex;
+  min-width: 34px;
+  gap: 5px;
+  padding-inline: 7px;
+}
+
+.remote-desktop-wall-column-toggle {
+  display: none;
+}
+
+.remote-desktop-wall-retry-all > span {
+  min-width: 14px;
+  color: #d8f7ff;
+  font: 700 10px/1 ui-monospace, monospace;
+}
+
+.remote-desktop-workspace-icon-button.is-danger:hover:not(:disabled),
+.remote-desktop-workspace-chrome-button.is-danger:hover:not(:disabled) {
+  border-color: rgb(251 113 133 / 65%);
+  color: #fecdd3;
+  box-shadow: 0 0 14px rgb(244 63 94 / 13%);
+}
+
+.remote-desktop-workspace-host-tab {
+  gap: 0;
+  white-space: nowrap;
+}
+
+.remote-desktop-workspace-host-tab .remote-desktop-workspace-tab {
+  border-radius: 7px 0 0 7px;
+}
+
+.remote-desktop-workspace-tab-close {
+  display: inline-grid;
+  min-width: 28px;
+  min-height: 30px;
+  place-items: center;
+  border: 1px solid rgb(76 168 218 / 24%);
+  border-left: 0;
+  border-radius: 0 7px 7px 0;
+  color: #7899ad;
+  background: linear-gradient(180deg, rgb(20 43 66 / 78%), rgb(8 21 36 / 88%));
+  cursor: pointer;
+}
+
+.remote-desktop-workspace-tab-close svg {
+  display: block;
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentcolor;
+  stroke-width: 2;
+  stroke-linecap: round;
+}
+
+.remote-desktop-workspace-tab-close:hover,
+.remote-desktop-workspace-tab-close:focus-visible {
+  color: #fecdd3;
+  background: rgb(95 26 43 / 42%);
+  outline: 1px solid rgb(251 113 133 / 48%);
+}
+
+.remote-desktop-workspace-add {
+  flex: 0 0 auto;
+  margin-left: 0;
+}
+
+.remote-desktop-workspace-wall {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 10px;
+  background:
+    radial-gradient(circle at 50% 0%, rgb(17 77 105 / 13%), transparent 42%),
+    #050b13;
+}
+
+.remote-desktop-wall-grid {
+  display: grid;
+  width: 100%;
+  min-height: 100%;
+  grid-template-columns: repeat(var(--remote-desktop-wall-columns, 1), minmax(0, 1fr));
+  grid-auto-rows: minmax(0, 1fr);
+  gap: 8px;
+}
+
+.remote-desktop-wall-tile {
+  position: relative;
+  display: block;
+  min-width: 0;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border: 1px solid rgb(77 154 196 / 20%);
+  border-radius: 8px;
+  background: #02060b;
+  box-shadow: 0 10px 26px rgb(0 0 0 / 28%), inset 0 0 0 1px rgb(255 255 255 / 2%);
+  cursor: pointer;
+  user-select: none;
+}
+
+.remote-desktop-wall-picture:focus-visible {
+  outline: 2px solid var(--chrome-accent);
+  outline-offset: -3px;
+}
+
+.remote-desktop-wall-tile[data-health="failed"],
+.remote-desktop-wall-tile[data-health="stale"] {
+  border-color: var(--danger, #ef4444);
+}
+
+.remote-desktop-wall-tile-title {
+  position: absolute;
+  inset: 0 0 auto;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 3px 9px;
+  overflow: hidden;
+  border-bottom: 1px solid rgb(90 190 230 / 18%);
+  color: #dff7ff;
+  background: linear-gradient(180deg, rgb(3 15 25 / 92%), rgb(3 15 25 / 70%));
+  box-shadow: 0 5px 14px rgb(0 0 0 / 22%);
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.2;
+  letter-spacing: .025em;
+  text-shadow: 0 1px 8px rgb(0 0 0 / 80%);
+  pointer-events: none;
+}
+
+.remote-desktop-wall-tile-title > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remote-desktop-wall-picture {
+  display: block;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: inherit;
+  background: transparent;
+  cursor: pointer;
+}
+
+.remote-desktop-wall-picture video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  border-radius: inherit;
+  background: #05070a;
+}
+
+.remote-desktop-wall-state {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  color: #b8d4e3;
+  background:
+    radial-gradient(circle at 50% 45%, rgb(15 61 86 / 22%), transparent 52%),
+    linear-gradient(180deg, rgb(2 6 11 / 40%), rgb(2 6 11 / 86%));
+  pointer-events: none;
+}
+
+.remote-desktop-wall-state-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid rgb(88 180 224 / 18%);
+  border-radius: 999px;
+  background: rgb(4 16 27 / 78%);
+  box-shadow: 0 0 18px rgb(14 165 233 / 7%);
+  font-size: 12px;
+  letter-spacing: .02em;
+}
+
+.remote-desktop-wall-status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #38bdf8;
+  box-shadow: 0 0 10px rgb(56 189 248 / 70%);
+}
+
+.remote-desktop-wall-state.is-connecting .remote-desktop-wall-status-dot,
+.remote-desktop-wall-state.is-reconnecting .remote-desktop-wall-status-dot {
+  animation: remote-desktop-wall-status-pulse 1.2s ease-in-out infinite;
+}
+
+.remote-desktop-wall-state.is-failed .remote-desktop-wall-status-dot,
+.remote-desktop-wall-state.is-stale .remote-desktop-wall-status-dot {
+  background: #fb7185;
+  box-shadow: 0 0 10px rgb(251 113 133 / 72%);
+}
+
+.remote-desktop-wall-tile-retry {
+  min-height: 30px;
+  padding: 6px 13px;
+  border: 1px solid rgb(56 189 248 / 46%);
+  border-radius: 7px;
+  color: #ddf8ff;
+  background: linear-gradient(180deg, rgb(13 78 106 / 92%), rgb(6 42 62 / 96%));
+  box-shadow: 0 0 18px rgb(14 165 233 / 12%);
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.remote-desktop-wall-tile-retry:hover,
+.remote-desktop-wall-tile-retry:focus-visible {
+  border-color: rgb(103 232 249 / 82%);
+  box-shadow: 0 0 20px rgb(34 211 238 / 20%);
+  outline: none;
+}
+
+@keyframes remote-desktop-wall-status-pulse {
+  0%, 100% { opacity: .45; transform: scale(.8); }
+  50% { opacity: 1; transform: scale(1.15); }
+}
+
+.remote-desktop-wall-add-slot {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  aspect-ratio: 16 / 9;
+  place-items: center;
+  border: 1px dashed rgb(56 189 248 / 42%);
+  border-radius: 8px;
+  color: rgb(125 211 252 / 76%);
+  background:
+    linear-gradient(135deg, rgb(14 35 54 / 62%), rgb(5 15 26 / 82%)),
+    repeating-linear-gradient(0deg, transparent 0 22px, rgb(56 189 248 / 3%) 23px),
+    repeating-linear-gradient(90deg, transparent 0 22px, rgb(56 189 248 / 3%) 23px);
+  box-shadow: inset 0 0 26px rgb(14 165 233 / 5%);
+  cursor: pointer;
+  transition: border-color 140ms ease, color 140ms ease, box-shadow 140ms ease;
+}
+
+.remote-desktop-wall-add-slot > span {
+  font: 300 clamp(34px, 6vw, 64px)/1 ui-monospace, monospace;
+  text-shadow: 0 0 18px rgb(34 211 238 / 34%);
+}
+
+.remote-desktop-wall-add-slot:hover,
+.remote-desktop-wall-add-slot:focus-visible {
+  border-color: rgb(103 232 249 / 82%);
+  color: #cffafe;
+  box-shadow: inset 0 0 36px rgb(14 165 233 / 10%), 0 0 20px rgb(34 211 238 / 12%);
+  outline: none;
+}
+
+.remote-desktop-wall-picker {
+  position: absolute;
+  z-index: 5;
+  top: 56px;
+  right: 12px;
+  display: grid;
+  width: min(360px, calc(100% - 24px));
+  max-height: calc(100% - 68px);
+  overflow: auto;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid rgb(56 189 248 / 35%);
+  border-radius: 10px;
+  background: rgb(5 15 27 / 97%);
+  box-shadow: 0 18px 46px rgb(0 0 0 / 55%), 0 0 24px rgb(14 165 233 / 8%);
+}
+
+.remote-desktop-wall-picker-head,
+.remote-desktop-wall-picker > button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.remote-desktop-wall-picker > button {
+  padding: 9px 10px;
+  border: 1px solid rgb(56 189 248 / 18%);
+  border-radius: 7px;
+  color: #c9e8f5;
+  background: rgb(12 32 50 / 82%);
+  text-align: left;
+}
+
+.remote-desktop-wall-context-menu {
+  position: fixed;
+  z-index: 20000;
+  display: grid;
+  width: 238px;
+  gap: 4px;
+  padding: 7px;
+  border: 1px solid rgb(56 189 248 / 35%);
+  border-radius: 10px;
+  background: rgb(5 15 27 / 98%);
+  box-shadow: 0 18px 48px rgb(0 0 0 / 62%), 0 0 22px rgb(14 165 233 / 10%);
+  backdrop-filter: blur(14px);
+}
+
+.remote-desktop-wall-context-menu button {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 9px;
+  border: 0;
+  border-radius: 6px;
+  color: #c8e4f2;
+  background: transparent;
+  text-align: left;
+}
+
+.remote-desktop-wall-context-menu button:hover,
+.remote-desktop-wall-context-menu button:focus-visible {
+  color: #e6fbff;
+  background: rgb(14 116 144 / 25%);
+  outline: 1px solid rgb(34 211 238 / 38%);
+}
+
+.remote-desktop-wall-context-menu button.is-danger { color: #fda4af; }
+
+.remote-desktop-wall-context-group {
+  display: grid;
+  gap: 2px;
+  padding-block: 4px;
+  border-block: 1px solid rgb(56 189 248 / 13%);
+}
+
+.remote-desktop-wall-context-group > span {
+  padding: 3px 9px;
+  color: #6f99ae;
+  font-size: 10px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.remote-desktop-workspace > .remote-desktop-panel {
+  flex: 1;
+  min-height: 0;
+}
+
+/* The panel's author-level `display:flex` otherwise overrides the browser's
+   built-in `[hidden]` rule and turns tabs into an accidental split view. Keep
+   every connection presentation mounted, but paint exactly the active tab. */
+.remote-desktop-workspace > .remote-desktop-panel[hidden],
+.remote-desktop-workspace-window[hidden] {
+  display: none !important;
+}
+
+.remote-desktop-workspace-mobile-selector {
+  display: none;
+}
+
+@media (max-width: 700px) {
+  .remote-desktop-workspace-window,
+  .remote-desktop-workspace-shell,
+  .remote-desktop-wall-window,
+  .remote-desktop-wall-shell {
+    position: fixed !important;
+    inset: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+  }
+
+  .remote-desktop-workspace-tabbar > [role="tablist"] {
+    display: flex;
+    min-width: 0;
+    flex: 1 1 auto;
+    overflow-x: auto;
+  }
+
+  .remote-desktop-workspace-tabbar {
+    gap: 4px;
+    padding: 6px;
+  }
+
+  .remote-desktop-workspace-host-tab {
+    flex: 0 0 auto;
+  }
+
+  .remote-desktop-workspace-host-tab .remote-desktop-workspace-tab {
+    max-width: 132px;
+    overflow: hidden;
+    padding-inline: 9px;
+    text-overflow: ellipsis;
+  }
+
+  .remote-desktop-workspace-actions {
+    margin-left: 0;
+  }
+
+  .remote-desktop-wall-header {
+    gap: 6px;
+    padding: 6px 8px;
+  }
+
+  .remote-desktop-wall-column-toggle {
+    display: inline-grid;
+  }
+
+  .remote-desktop-workspace-wall {
+    padding: 6px;
+  }
+
+  .remote-desktop-wall-grid {
+    min-height: 0;
+    grid-auto-rows: auto;
+    align-content: start;
+    gap: 6px;
+  }
+
+  .remote-desktop-wall-grid[data-mobile-columns="1"] {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .remote-desktop-wall-grid[data-mobile-columns="2"] {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 4px;
+  }
+
+  .remote-desktop-wall-grid[data-mobile-columns="2"] .remote-desktop-wall-tile,
+  .remote-desktop-wall-grid[data-mobile-columns="2"] .remote-desktop-wall-add-slot {
+    border-radius: 5px;
+    box-shadow: inset 0 0 0 1px rgb(255 255 255 / 2%);
+  }
+
+  .remote-desktop-wall-grid[data-mobile-columns="2"] .remote-desktop-wall-tile-title {
+    min-height: 18px;
+    padding: 2px 5px;
+    font-size: 9px;
+    letter-spacing: 0;
+  }
+
+  .remote-desktop-wall-grid[data-mobile-columns="2"] .remote-desktop-wall-state {
+    gap: 5px;
+    padding: 6px;
+  }
+
+  .remote-desktop-wall-grid[data-mobile-columns="2"] .remote-desktop-wall-state-copy {
+    gap: 4px;
+    padding: 3px 6px;
+    font-size: 9px;
+  }
+
+  .remote-desktop-wall-grid[data-mobile-columns="2"] .remote-desktop-wall-tile-retry {
+    min-height: 24px;
+    padding: 3px 7px;
+    font-size: 10px;
+  }
+
+  .remote-desktop-wall-grid[data-mobile-columns="2"] .remote-desktop-wall-add-slot > span {
+    font-size: 28px;
+  }
+
+}

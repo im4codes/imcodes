@@ -1,5 +1,6 @@
-import { execFile, spawn, type ChildProcess } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import {
   chmod,
   chown,
@@ -12,27 +13,26 @@ import {
   rm,
   writeFile,
 } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import {
   controlledNodeComputerUseHelperFilename,
   CONTROLLED_NODE_OS_MAC,
 } from '../../shared/controlled-node-artifacts.js';
+import type { MacosUserSession } from './user-session-launcher.js';
 
 export const MACOS_COMPUTER_USE_RUNTIME_ROOT = '/Library/Application Support/imcodes-node-computer-use';
 export const MACOS_COMPUTER_USE_APP_NAME = 'Open Computer Use.app';
+export const MACOS_AIDESK_APP_NAME = 'aiDesk.to by IM.codes.app';
 
 const MACOS_COMPUTER_USE_EXECUTABLE = 'OpenComputerUse';
+export const MACOS_AIDESK_EXECUTABLE = 'aidesk-agent';
 const MACOS_COMPUTER_USE_BUNDLE_ID = 'com.ifuryst.opencomputeruse';
 const MACOS_COMPUTER_USE_TEAM_ID = 'J9P29FA5BX';
+export const MACOS_AIDESK_BUNDLE_ID = 'to.aidesk.app';
+export const MACOS_AIDESK_TEAM_ID = 'M675E26Q67';
 const MACOS_COMPUTER_USE_SOURCE_DIGEST = '.open-computer-use-source.sha256';
 
-export interface MacosConsoleUser {
-  name: string;
-  uid: number;
-  gid: number;
-  home: string;
-  tempDir: string;
-}
+export type MacosConsoleUser = MacosUserSession;
 
 export interface MacosComputerUseRuntime {
   helperExecutable: string;
@@ -80,7 +80,7 @@ async function defaultVerifyCodeSignature(path: string, deep: boolean): Promise<
   ]);
 }
 
-async function defaultVerifyAppBundle(path: string): Promise<void> {
+export async function verifyMacosComputerUseAppBundle(path: string): Promise<void> {
   await defaultVerifyCodeSignature(path, true);
   const details = await new Promise<string>((resolve, reject) => {
     execFile('/usr/bin/codesign', ['-dv', '--verbose=4', path], { encoding: 'utf8', timeout: 15_000 }, (error, stdout, stderr) => {
@@ -91,26 +91,65 @@ async function defaultVerifyAppBundle(path: string): Promise<void> {
       resolve(`${stdout}\n${stderr}`);
     });
   });
-  if (!details.includes(`Identifier=${MACOS_COMPUTER_USE_BUNDLE_ID}`)
-    || !details.includes(`TeamIdentifier=${MACOS_COMPUTER_USE_TEAM_ID}`)
-    || !details.includes('Authority=Developer ID Application:')) {
+  const legacy = details.includes(`Identifier=${MACOS_COMPUTER_USE_BUNDLE_ID}`)
+    && details.includes(`TeamIdentifier=${MACOS_COMPUTER_USE_TEAM_ID}`);
+  const aiDesk = details.includes(`Identifier=${MACOS_AIDESK_BUNDLE_ID}`)
+    && details.includes(`TeamIdentifier=${MACOS_AIDESK_TEAM_ID}`);
+  if ((!legacy && !aiDesk) || !details.includes('Authority=Developer ID Application:')) {
     throw new Error('computer_use_app_untrusted_signature');
+  }
+}
+
+export function macosComputerUseAppBundleForExecutable(executablePath: string): string | null {
+  const appPath = dirname(dirname(dirname(resolve(executablePath))));
+  const appName = basename(appPath);
+  const executable = appName === MACOS_AIDESK_APP_NAME
+    ? MACOS_AIDESK_EXECUTABLE
+    : appName === MACOS_COMPUTER_USE_APP_NAME
+      ? MACOS_COMPUTER_USE_EXECUTABLE
+      : null;
+  if (!executable) return null;
+  return resolve(executablePath) === join(appPath, 'Contents', 'MacOS', executable)
+    ? appPath
+    : null;
+}
+
+export async function verifyMacosComputerUseExecutable(
+  executablePath: string,
+  verifyAppBundle: (path: string) => Promise<void> = verifyMacosComputerUseAppBundle,
+): Promise<void> {
+  const appPath = macosComputerUseAppBundleForExecutable(executablePath);
+  if (!appPath || !await isRegularFile(executablePath)) {
+    throw new Error('signed_macos_open_computer_use_helper_authenticity_failed');
+  }
+  const appStat = await lstat(appPath).catch(() => null);
+  if (!appStat?.isDirectory() || appStat.isSymbolicLink()) {
+    throw new Error('signed_macos_open_computer_use_helper_authenticity_failed');
+  }
+  try {
+    await verifyAppBundle(appPath);
+  } catch {
+    throw new Error('signed_macos_open_computer_use_helper_authenticity_failed');
   }
 }
 
 export function validateMacosComputerUseArchiveEntries(entries: readonly string[]): void {
   if (entries.length === 0) throw new Error('computer_use_app_archive_empty');
+  const roots = new Set<string>();
   for (const rawEntry of entries) {
     const entry = rawEntry.endsWith('/') ? rawEntry.slice(0, -1) : rawEntry;
     const components = entry.split('/');
     if (!entry
       || entry.startsWith('/')
       || entry.includes('\\')
-      || components[0] !== MACOS_COMPUTER_USE_APP_NAME
+      || (components[0] !== MACOS_COMPUTER_USE_APP_NAME
+        && components[0] !== MACOS_AIDESK_APP_NAME)
       || components.some((component) => component === '' || component === '.' || component === '..')) {
       throw new Error('computer_use_app_archive_unsafe');
     }
+    roots.add(components[0]);
   }
+  if (roots.size !== 1) throw new Error('computer_use_app_archive_unsafe');
 }
 
 async function validateExtractedAppTree(path: string): Promise<void> {
@@ -152,31 +191,50 @@ async function readSourceDigest(path: string): Promise<string | null> {
 
 async function publishAppBundle(
   sourceArchive: string,
-  appPath: string,
+  runtimeRoot: string,
   options: Required<Pick<MacosComputerUseRuntimeOptions, 'verifyAppBundle' | 'extractAppArchive'>>,
-): Promise<void> {
+): Promise<string> {
   if (!await isRegularFile(sourceArchive)) throw new Error('computer_use_helper_not_installed');
   const sourceDigest = await sha256File(sourceArchive);
-  const digestPath = join(dirname(appPath), MACOS_COMPUTER_USE_SOURCE_DIGEST);
-  const appExecutable = join(appPath, 'Contents', 'MacOS', MACOS_COMPUTER_USE_EXECUTABLE);
-  if (await readSourceDigest(digestPath) === sourceDigest && await isRegularFile(appExecutable)) {
-    try {
-      await options.verifyAppBundle(appPath);
-      return;
-    } catch {
-      // A matching archive digest never authorizes an invalid or replaced app.
+  const digestPath = join(runtimeRoot, MACOS_COMPUTER_USE_SOURCE_DIGEST);
+  if (await readSourceDigest(digestPath) === sourceDigest) {
+    for (const [name, executable] of [
+      [MACOS_AIDESK_APP_NAME, MACOS_AIDESK_EXECUTABLE],
+      [MACOS_COMPUTER_USE_APP_NAME, MACOS_COMPUTER_USE_EXECUTABLE],
+    ] as const) {
+      const existing = join(runtimeRoot, name);
+      if (!await isRegularFile(join(existing, 'Contents', 'MacOS', executable))) continue;
+      try {
+        await options.verifyAppBundle(existing);
+        return existing;
+      } catch {
+        // A matching archive digest never authorizes an invalid or replaced app.
+      }
     }
   }
 
-  const extractionRoot = join(dirname(appPath), `.open-computer-use-extract-${process.pid}-${randomUUID()}`);
-  const extractedApp = join(extractionRoot, MACOS_COMPUTER_USE_APP_NAME);
-  const backupApp = `${appPath}.${process.pid}.${randomUUID()}.old`;
+  const extractionRoot = join(runtimeRoot, `.open-computer-use-extract-${process.pid}-${randomUUID()}`);
+  let appPath = '';
+  let extractedApp = '';
+  let backupApp = '';
   await rm(extractionRoot, { recursive: true, force: true });
   await mkdir(extractionRoot, { recursive: true, mode: 0o755 });
   try {
     await options.extractAppArchive(sourceArchive, extractionRoot);
+    const extractedNames: string[] = [];
+    for (const name of [MACOS_AIDESK_APP_NAME, MACOS_COMPUTER_USE_APP_NAME]) {
+      if (await lstat(join(extractionRoot, name)).then(() => true, () => false)) extractedNames.push(name);
+    }
+    if (extractedNames.length !== 1) throw new Error('computer_use_app_archive_unsafe');
+    const appName = extractedNames[0]!;
+    extractedApp = join(extractionRoot, appName);
+    appPath = join(runtimeRoot, appName);
+    backupApp = `${appPath}.${process.pid}.${randomUUID()}.old`;
     await validateExtractedAppTree(extractedApp);
-    if (!await isRegularFile(join(extractedApp, 'Contents', 'MacOS', MACOS_COMPUTER_USE_EXECUTABLE))) {
+    const executable = appName === MACOS_AIDESK_APP_NAME
+      ? MACOS_AIDESK_EXECUTABLE
+      : MACOS_COMPUTER_USE_EXECUTABLE;
+    if (!await isRegularFile(join(extractedApp, 'Contents', 'MacOS', executable))) {
       throw new Error('computer_use_helper_not_installed');
     }
     await options.verifyAppBundle(extractedApp);
@@ -193,6 +251,9 @@ async function publishAppBundle(
       publishedNew = true;
       await options.verifyAppBundle(appPath);
       await rm(backupApp, { recursive: true, force: true });
+      if (appName === MACOS_AIDESK_APP_NAME) {
+        await rm(join(runtimeRoot, MACOS_COMPUTER_USE_APP_NAME), { recursive: true, force: true });
+      }
     } catch (error) {
       if (publishedNew) await rm(appPath, { recursive: true, force: true }).catch(() => {});
       if (movedExisting) await rename(backupApp, appPath).catch(() => {});
@@ -208,6 +269,46 @@ async function publishAppBundle(
   } finally {
     await rm(extractionRoot, { recursive: true, force: true }).catch(() => {});
   }
+  return appPath;
+}
+
+/**
+ * Installs the signed app from the archive the node delivered into
+ * `installRoot` (root-owned, 0755), reusing the verified copy already there
+ * when the archive has not changed. Returns null when no archive was delivered.
+ */
+export async function installMacosAideskAppFromArchive(
+  sourceArchive: string,
+  installRoot: string,
+  options: Pick<MacosComputerUseRuntimeOptions, 'verifyAppBundle' | 'extractAppArchive'> = {},
+): Promise<string | null> {
+  if (!await isRegularFile(sourceArchive)) return null;
+  await mkdir(installRoot, { recursive: true, mode: 0o755 });
+  const rootStat = await lstat(installRoot);
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+    throw new Error('computer_use_runtime_root_not_directory');
+  }
+  await chmod(installRoot, 0o755);
+  const extract = options.extractAppArchive ?? defaultExtractAppArchive;
+  const runningAsRoot = process.geteuid?.() === 0;
+  if (runningAsRoot) {
+    await chown(installRoot, 0, 0);
+    // An app left behind owned by someone else is never reused, whatever its digest.
+    const installed = await lstat(join(installRoot, MACOS_AIDESK_APP_NAME)).catch(() => null);
+    if (installed && installed.uid !== 0) {
+      await rm(join(installRoot, MACOS_COMPUTER_USE_SOURCE_DIGEST), { force: true });
+    }
+  }
+  return await publishAppBundle(sourceArchive, installRoot, {
+    verifyAppBundle: options.verifyAppBundle ?? verifyMacosComputerUseAppBundle,
+    // ditto keeps the archive's owners, which name whoever built it. The app
+    // aiDesk launches helpers from must be root's alone before it is verified
+    // and published, or that user could swap its contents afterwards.
+    extractAppArchive: async (archivePath, destinationRoot) => {
+      await extract(archivePath, destinationRoot);
+      if (runningAsRoot) await execFileText('/usr/sbin/chown', ['-R', 'root:wheel', destinationRoot]);
+    },
+  });
 }
 
 export async function prepareMacosComputerUseRuntime(
@@ -217,11 +318,10 @@ export async function prepareMacosComputerUseRuntime(
 ): Promise<MacosComputerUseRuntime> {
   const runtimeRoot = options.runtimeRoot ?? MACOS_COMPUTER_USE_RUNTIME_ROOT;
   const verifyCodeSignature = options.verifyCodeSignature ?? defaultVerifyCodeSignature;
-  const verifyAppBundle = options.verifyAppBundle ?? defaultVerifyAppBundle;
+  const verifyAppBundle = options.verifyAppBundle ?? verifyMacosComputerUseAppBundle;
   const extractAppArchive = options.extractAppArchive ?? defaultExtractAppArchive;
   const helperExecutable = join(runtimeRoot, 'imcodes-computer-use-helper');
-  const appPath = join(runtimeRoot, MACOS_COMPUTER_USE_APP_NAME);
-  const openComputerUseExecutable = join(appPath, 'Contents', 'MacOS', MACOS_COMPUTER_USE_EXECUTABLE);
+  let appPath = join(runtimeRoot, MACOS_AIDESK_APP_NAME);
 
   await mkdir(runtimeRoot, { recursive: true, mode: 0o755 });
   const runtimeStat = await lstat(runtimeRoot);
@@ -233,115 +333,39 @@ export async function prepareMacosComputerUseRuntime(
   await verifyCodeSignature(helperExecutable, false);
 
   if (sourceOpenComputerUseArchive) {
-    await publishAppBundle(sourceOpenComputerUseArchive, appPath, { verifyAppBundle, extractAppArchive });
+    appPath = await publishAppBundle(sourceOpenComputerUseArchive, runtimeRoot, { verifyAppBundle, extractAppArchive });
     await publishFile(
       sourceOpenComputerUseArchive,
       join(runtimeRoot, controlledNodeComputerUseHelperFilename(CONTROLLED_NODE_OS_MAC)),
       0o644,
     );
-  } else if (!await isRegularFile(openComputerUseExecutable)) {
-    throw new Error('computer_use_helper_not_installed');
   } else {
-    await verifyAppBundle(appPath);
+    const candidates = [
+      join(runtimeRoot, MACOS_AIDESK_APP_NAME),
+      join(runtimeRoot, MACOS_COMPUTER_USE_APP_NAME),
+    ];
+    const existing = candidates.find((candidate) => {
+      const executable = basename(candidate) === MACOS_AIDESK_APP_NAME
+        ? MACOS_AIDESK_EXECUTABLE : MACOS_COMPUTER_USE_EXECUTABLE;
+      return existsSync(join(candidate, 'Contents', 'MacOS', executable));
+    });
+    if (!existing) throw new Error('computer_use_helper_not_installed');
+    appPath = existing;
+    await verifyAppBundle(existing);
   }
 
+  const openComputerUseExecutable = join(
+    appPath,
+    'Contents',
+    'MacOS',
+    basename(appPath) === MACOS_AIDESK_APP_NAME
+      ? MACOS_AIDESK_EXECUTABLE
+      : MACOS_COMPUTER_USE_EXECUTABLE,
+  );
   return { helperExecutable, openComputerUseExecutable };
-}
-
-function validMacosUserName(value: string): boolean {
-  return /^[A-Za-z0-9._-]+$/.test(value)
-    && value !== 'root'
-    && value !== 'loginwindow'
-    && value !== '_mbsetupuser';
-}
-
-function positiveInteger(value: string): number | null {
-  if (!/^\d+$/.test(value)) return null;
-  const parsed = Number(value);
-  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
-}
-
-export async function resolveMacosConsoleUser(): Promise<MacosConsoleUser> {
-  const name = await execFileText('/usr/bin/stat', ['-f', '%Su', '/dev/console']);
-  if (!validMacosUserName(name)) throw new Error('computer_use_no_active_gui_session');
-  const uid = positiveInteger(await execFileText('/usr/bin/id', ['-u', name]));
-  const gid = positiveInteger(await execFileText('/usr/bin/id', ['-g', name]));
-  if (uid === null || gid === null) throw new Error('computer_use_invalid_console_user');
-  const home = await execFileText('/usr/bin/dscl', ['.', '-read', `/Users/${name}`, 'NFSHomeDirectory'])
-    .then((line) => line.replace(/^NFSHomeDirectory:\s*/, '').trim());
-  if (!home.startsWith('/') || home.includes('\n')) throw new Error('computer_use_invalid_console_user_home');
-  const tempDir = await execFileText('/usr/bin/sudo', [
-    '-n',
-    '-u',
-    name,
-    '/usr/bin/getconf',
-    'DARWIN_USER_TEMP_DIR',
-  ]);
-  if (!tempDir.startsWith('/') || tempDir.includes('\n')) throw new Error('computer_use_invalid_console_user_temp');
-  return { name, uid, gid, home, tempDir };
 }
 
 export async function authorizeMacosComputerUseSocket(path: string, user: MacosConsoleUser): Promise<void> {
   await chown(path, user.uid, user.gid);
   await chmod(path, 0o600);
-}
-
-export function macosUserSessionHelperArgs(
-  user: MacosConsoleUser,
-  runtime: MacosComputerUseRuntime,
-  pipe: string,
-): string[] {
-  return [
-    ...macosUserSessionCommandPrefix(user),
-    `IMCODES_COMPUTER_USE_EXE=${runtime.openComputerUseExecutable}`,
-    runtime.helperExecutable,
-    '--computer-use-helper',
-    '--pipe',
-    pipe,
-  ];
-}
-
-function macosUserSessionCommandPrefix(user: MacosConsoleUser): string[] {
-  return [
-    'asuser',
-    String(user.uid),
-    '/usr/bin/sudo',
-    '-n',
-    '-u',
-    user.name,
-    '/usr/bin/env',
-    `HOME=${user.home}`,
-    `TMPDIR=${user.tempDir}`,
-  ];
-}
-
-export function macosComputerUseDoctorArgs(
-  user: MacosConsoleUser,
-  runtime: MacosComputerUseRuntime,
-): string[] {
-  return [
-    ...macosUserSessionCommandPrefix(user),
-    runtime.openComputerUseExecutable,
-    'doctor',
-  ];
-}
-
-export async function runMacosComputerUseDoctor(
-  user: MacosConsoleUser,
-  runtime: MacosComputerUseRuntime,
-): Promise<void> {
-  await execFileText('/bin/launchctl', macosComputerUseDoctorArgs(user, runtime), 10_000);
-}
-
-export function launchMacosUserSessionHelper(
-  user: MacosConsoleUser,
-  runtime: MacosComputerUseRuntime,
-  pipe: string,
-): ChildProcess {
-  const child = spawn('/bin/launchctl', macosUserSessionHelperArgs(user, runtime, pipe), {
-    detached: true,
-    stdio: 'ignore',
-  });
-  child.unref();
-  return child;
 }

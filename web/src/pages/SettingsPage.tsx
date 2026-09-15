@@ -66,7 +66,7 @@ export function SettingsPage({ displayName, username, hasPassword, serverUrl, on
       import('../biometric-auth.js'),
       import('../plugins/auth-session.js'),
     ]);
-    const key = await getAuthKey();
+    const key = await getAuthKey(serverUrl);
     if (!key) {
       setSetupMsg({ type: 'err', text: t('settings.password_setup_error') });
       return;
@@ -241,7 +241,7 @@ export function SettingsPage({ displayName, username, hasPassword, serverUrl, on
 
   return (
     <div style={{ background: '#0a0e1a', color: '#e2e8f0', minHeight: '100%', padding: '20px', overflowY: 'auto' }}>
-      <div style={{ maxWidth: '520px', margin: '0 auto' }}>
+      <div style={{ maxWidth: '920px', margin: '0 auto' }}>
         <button onClick={onBack} style={{ ...btnSecondary, marginBottom: '20px' }}>
           {t('settings.back')}
         </button>

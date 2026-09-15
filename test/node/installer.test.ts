@@ -27,6 +27,8 @@ import {
   LINUX_UNIT_PATH,
   isProcessElevated,
   assertProcessElevated,
+  windowsPowerShellExecutablePath,
+  windowsSchtasksExecutablePath,
   installDefinition,
   inspectDefinition,
   inspectServiceState,
@@ -37,6 +39,7 @@ import {
 const EXE = '/opt/imcodes-node/imcodes-node';
 const WINDOWS_EXE = 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe';
 const WINDOWS_WATCHDOG_NOW = new Date(2026, 6, 14, 11, 36, 7);
+const WINDOWS_SCHTASKS = 'C:\\Windows\\System32\\schtasks.exe';
 
 describe('controlled-node installer artifacts (4.1-4.4)', () => {
   it('detects POSIX root without attempting privilege escalation', () => {
@@ -47,7 +50,58 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
   it('detects Windows Administrator membership through a testable probe', () => {
     expect(isProcessElevated({ platform: 'win32', runCommand: () => 'True\r\n' })).toBe(true);
     expect(isProcessElevated({ platform: 'win32', runCommand: () => 'False\r\n' })).toBe(false);
-    expect(isProcessElevated({ platform: 'win32', runCommand: () => { throw new Error('denied'); } })).toBe(false);
+  });
+
+  it('probes the absolute System32 PowerShell before the PATH-resolved name', () => {
+    // A downloaded installer can be started with a PATH that lacks System32,
+    // so the absolute path must be tried first rather than depended upon as a
+    // fallback that only runs after a confusing failure.
+    const seen: string[] = [];
+    expect(isProcessElevated({
+      platform: 'win32',
+      runCommand: (file) => { seen.push(file); return 'True\r\n'; },
+    })).toBe(true);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatch(/System32[\\/]WindowsPowerShell[\\/]v1\.0[\\/]powershell\.exe$/i);
+  });
+
+  it('resolves trusted Windows system executables without consulting PATH', () => {
+    expect(windowsSchtasksExecutablePath({
+      SystemRoot: 'D:\\TrustedWindows',
+      WINDIR: 'E:\\IgnoredWindows',
+    })).toBe('D:\\TrustedWindows\\System32\\schtasks.exe');
+    expect(windowsSchtasksExecutablePath({
+      WINDIR: 'E:\\Windows',
+    })).toBe('E:\\Windows\\System32\\schtasks.exe');
+    expect(windowsSchtasksExecutablePath({})).toBe(WINDOWS_SCHTASKS);
+    expect(windowsPowerShellExecutablePath({
+      SystemRoot: 'D:\\TrustedWindows',
+      WINDIR: 'E:\\IgnoredWindows',
+    })).toBe('D:\\TrustedWindows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe');
+  });
+
+  it('falls back to the PATH name when the absolute probe cannot run', () => {
+    const seen: string[] = [];
+    expect(isProcessElevated({
+      platform: 'win32',
+      runCommand: (file) => {
+        seen.push(file);
+        if (seen.length === 1) throw new Error('ENOENT');
+        return 'True\r\n';
+      },
+    })).toBe(true);
+    expect(seen).toHaveLength(2);
+    expect(seen[1]).toBe('powershell.exe');
+  });
+
+  it('refuses to report an administrator as unprivileged when PowerShell cannot run', () => {
+    // Returning false here would be a lie with a specific, damaging
+    // consequence: a user who DID run as administrator is told to run as
+    // administrator, and has no way to discover the real fault.
+    expect(() => isProcessElevated({
+      platform: 'win32',
+      runCommand: () => { throw new Error('denied'); },
+    })).toThrow(/PowerShell could not be executed/);
   });
 
   it('fails with the existing Administrator/root precondition when not elevated', () => {
@@ -136,7 +190,7 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
         watchdogScript = content;
       },
       runCommand: (file, args) => {
-        expect(file).toBe('schtasks');
+        expect(file).toBe(WINDOWS_SCHTASKS);
         if (args[0] === '/Create') {
           const taskName = String(args[2]);
           const expectedArgs = taskName === CONTROLLED_NODE_SERVICE.WINDOWS_TASK
@@ -390,7 +444,7 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
       readWindowsWatchdogScript: async () => windowsControlledNodeHealthWatchdogScript(action),
       runCommand: (file, args) => {
         calls.push({ file, args: [...args] });
-        if (file !== 'schtasks') return 'Running';
+        if (file !== WINDOWS_SCHTASKS) return 'Running';
         return args.includes(CONTROLLED_NODE_SERVICE.WINDOWS_WATCHDOG_TASK) ? watchdogXml : xml;
       },
     });
@@ -409,7 +463,7 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
       runState: 'running',
       errors: [],
     });
-    expect(calls.map(({ file }) => file)).toEqual(['schtasks', 'schtasks', 'powershell.exe']);
+    expect(calls.map(({ file }) => file)).toEqual([WINDOWS_SCHTASKS, WINDOWS_SCHTASKS, 'powershell.exe']);
     expect(calls.flatMap(({ args }) => args)).not.toContain('/Create');
     expect(calls.flatMap(({ args }) => args)).not.toContain('/Run');
   });
@@ -435,7 +489,7 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
       platform: 'win32',
       readWindowsWatchdogScript: async () => windowsControlledNodeHealthWatchdogScript(action),
       runCommand: (file, args) => {
-        if (file !== 'schtasks') return 'Running';
+        if (file !== WINDOWS_SCHTASKS) return 'Running';
         return args.includes(CONTROLLED_NODE_SERVICE.WINDOWS_WATCHDOG_TASK)
           ? normalizedWatchdog
           : normalized;
@@ -480,7 +534,7 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
       platform: 'win32',
       readWindowsWatchdogScript: async () => watchdogScript,
       runCommand: (file, args) => {
-        if (file !== 'schtasks') return 'Running';
+        if (file !== WINDOWS_SCHTASKS) return 'Running';
         if (args.includes(CONTROLLED_NODE_SERVICE.WINDOWS_WATCHDOG_TASK)) {
           if (watchdogTaskXml === undefined) throw new Error('watchdog missing');
           return watchdogTaskXml;
@@ -532,7 +586,7 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
       platform: 'win32',
       readWindowsWatchdogScript: async () => windowsControlledNodeHealthWatchdogScript(receiptAction),
       runCommand: (file, args) => {
-        if (file !== 'schtasks') return 'Running';
+        if (file !== WINDOWS_SCHTASKS) return 'Running';
         return args.includes(CONTROLLED_NODE_SERVICE.WINDOWS_WATCHDOG_TASK) ? watchdogXml : staleXml;
       },
     });

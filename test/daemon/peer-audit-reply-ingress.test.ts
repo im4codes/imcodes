@@ -10,16 +10,13 @@ import {
   PeerAuditReplyRateLimiter,
   clearPeerAuditReplyIngressRateLimits,
   decodePeerAuditReplyCommandStructure,
-  peerAuditCapabilityMatches,
   registerPeerAuditReplyIngressHandler,
   submitPeerAuditReply,
 } from '../../src/daemon/peer-audit-reply-ingress.js';
 
-const capability = 'A'.repeat(32);
 const valid = {
   version: PEER_AUDIT_REPLY_VERSION,
   attemptId: 'attempt_1',
-  replyCapability: capability,
   verdict: 'PASS',
   findings: 'Reviewed and validated.',
   validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: '1 passed' }],
@@ -48,14 +45,14 @@ describe('peer audit reply ingress', () => {
     }));
   });
 
-  it('defers PASS evidence policy until after capability and identity validation', async () => {
-    const handler = vi.fn().mockReturnValue({ ok: false, error: 'invalid_capability' });
+  it('defers PASS evidence policy until after attempt and identity validation', async () => {
+    const handler = vi.fn().mockReturnValue({ ok: false, error: 'attempt_mismatch' });
     registerPeerAuditReplyIngressHandler(handler);
     await expect(submitPeerAuditReply({
       rawBody: JSON.stringify({ ...valid, validations: [] }),
       senderSessionName: 'deck_sub_a',
       now: 101,
-    })).resolves.toEqual({ ok: false, error: 'invalid_capability' });
+    })).resolves.toEqual({ ok: false, error: 'attempt_mismatch' });
     expect(handler).toHaveBeenCalledWith(expect.objectContaining({
       envelope: expect.objectContaining({ verdict: 'PASS', validations: [] }),
     }));
@@ -99,10 +96,10 @@ describe('peer audit reply ingress', () => {
   });
 
   it('uses an independent bounded sender rate limit', async () => {
-    registerPeerAuditReplyIngressHandler(() => ({ ok: false, error: 'invalid_capability' }));
+    registerPeerAuditReplyIngressHandler(() => ({ ok: false, error: 'attempt_mismatch' }));
     for (let i = 0; i < 12; i += 1) {
       const result = await submitPeerAuditReply({ rawBody: JSON.stringify(valid), senderSessionName: 'deck_sub_a', now: i + 1 });
-      expect(result).toEqual({ ok: false, error: 'invalid_capability' });
+      expect(result).toEqual({ ok: false, error: 'attempt_mismatch' });
     }
     await expect(submitPeerAuditReply({
       rawBody: JSON.stringify(valid), senderSessionName: 'deck_sub_a', now: 20,
@@ -110,7 +107,7 @@ describe('peer audit reply ingress', () => {
   });
 
   it('keys ingress rate limits by logical instance and runtime epoch, not reusable name', async () => {
-    registerPeerAuditReplyIngressHandler(() => ({ ok: false, error: 'invalid_capability' }));
+    registerPeerAuditReplyIngressHandler(() => ({ ok: false, error: 'attempt_mismatch' }));
     for (let i = 0; i < 12; i += 1) {
       await submitPeerAuditReply({ rawBody: JSON.stringify(valid), senderSessionName: 'deck_sub_a', now: i + 1 });
     }
@@ -123,14 +120,14 @@ describe('peer audit reply ingress', () => {
     });
     await expect(submitPeerAuditReply({
       rawBody: JSON.stringify(valid), senderSessionName: 'deck_sub_a', now: 21,
-    })).resolves.toEqual({ ok: false, error: 'invalid_capability' });
+    })).resolves.toEqual({ ok: false, error: 'attempt_mismatch' });
 
     getSessionMock.mockReturnValue({
       name: 'deck_sub_a', state: 'idle', sessionInstanceId: 'instance_recreated', runtimeEpoch: 'epoch_replaced',
     });
     await expect(submitPeerAuditReply({
       rawBody: JSON.stringify(valid), senderSessionName: 'deck_sub_a', now: 22,
-    })).resolves.toEqual({ ok: false, error: 'invalid_capability' });
+    })).resolves.toEqual({ ok: false, error: 'attempt_mismatch' });
   });
 
   it('bounds limiter state with TTL and LRU eviction', () => {
@@ -165,16 +162,17 @@ describe('peer audit reply ingress', () => {
     getSessionMock.mockReturnValue({
       name: 'deck_sub_recovered', state: 'idle', sessionInstanceId: 'instance_2', runtimeEpoch: 'epoch_2',
     });
-    registerPeerAuditReplyIngressHandler(() => ({ ok: false, error: 'invalid_capability' }));
+    registerPeerAuditReplyIngressHandler(() => ({ ok: false, error: 'attempt_mismatch' }));
     await expect(submitPeerAuditReply({
       rawBody: JSON.stringify(valid), senderSessionName: 'deck_sub_recovered', now: 200,
-    })).resolves.toEqual({ ok: false, error: 'invalid_capability' });
+    })).resolves.toEqual({ ok: false, error: 'attempt_mismatch' });
   });
 
-  it('compares capabilities without prefix or length equivalence', () => {
-    expect(peerAuditCapabilityMatches(capability, capability)).toBe(true);
-    expect(peerAuditCapabilityMatches(capability, `${capability}A`)).toBe(false);
-    expect(peerAuditCapabilityMatches(capability, `${capability.slice(0, -1)}B`)).toBe(false);
+  it('does not expose or require a bearer capability field', () => {
+    expect(valid).not.toHaveProperty('replyCapability');
+    const decoded = decodePeerAuditReplyCommandStructure({ ...valid, replyCapability: 'legacy-token' });
+    expect(decoded.ok).toBe(true);
+    if (decoded.ok) expect(decoded.value).not.toHaveProperty('replyCapability');
   });
 
   it('provides one structure-only seam for versioned CLI and versionless MCP inputs', () => {

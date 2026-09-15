@@ -3,6 +3,10 @@ import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '.
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { MEMORY_MCP_ENV_KEYS } from '../../shared/memory-mcp-env.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
+import {
+  IMCODES_MEMORY_MCP_LAUNCH_ARGS,
+  IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
+} from '../../src/agent/providers/getDefaultMcpServers.js';
 import { writeProcessedProjection } from '../../src/store/context-store.js';
 
 const SESSION_CC = `deck_ccsdk_${Math.random().toString(36).slice(2, 8)}_brain`;
@@ -28,6 +32,40 @@ const mocks = vi.hoisted(() => {
   const codexCalls: Array<{ mode: 'start' | 'resume'; id: string | null; input: string; options: Record<string, unknown> }> = [];
   return { store, emitted, claudeCalls, codexCalls };
 });
+
+const presetRouteMocks = vi.hoisted(() => ({
+  qwen: vi.fn(async (_preset: string) => ({
+    env: {
+      ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+      ANTHROPIC_API_KEY: 'test-qwen-key',
+      ANTHROPIC_MODEL: 'MiniMax-M3',
+      OPENAI_BASE_URL: 'https://api.minimax.io/anthropic',
+      OPENAI_API_KEY: 'test-qwen-key',
+    },
+    settings: {
+      security: { auth: { selectedType: 'anthropic' } },
+      model: { name: 'MiniMax-M3' },
+    },
+    model: 'MiniMax-M3',
+    availableModels: ['MiniMax-M3'],
+  })),
+  dsh: vi.fn(async (_preset: string, model?: string) => ({
+    env: { ANTHROPIC_MODEL: model ?? 'MiniMax-M3' },
+    llm: {
+      provider: 'minimax', model: model ?? 'MiniMax-M3',
+      baseUrl: 'https://api.minimax.io/anthropic', apiKey: 'test-dsh-key',
+    },
+    model: model ?? 'MiniMax-M3',
+  })),
+  pi: vi.fn(async (_preset: string, model?: string) => ({
+    env: { ANTHROPIC_MODEL: model ?? 'MiniMax-M3' },
+    piLlm: {
+      provider: 'minimax', model: model ?? 'MiniMax-M3',
+      baseUrl: 'https://api.minimax.io/anthropic', apiKey: 'test-pi-key',
+    },
+    model: model ?? 'MiniMax-M3',
+  })),
+}));
 
 const PRESET_ENV = {
   ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
@@ -56,8 +94,8 @@ function expectMemoryMcpEnv(
 ): void {
   const server = (serverConfig as Record<string, any> | undefined)?.[IMCODES_MEMORY_MCP_SERVER_NAME];
   expect(server).toMatchObject({
-    command: 'imcodes',
-    args: ['memory', 'mcp'],
+    command: IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
+    args: [...IMCODES_MEMORY_MCP_LAUNCH_ARGS],
   });
   expect(server?.env).toMatchObject({
     [MEMORY_MCP_ENV_KEYS.SESSION_NAME]: expected.sessionName,
@@ -100,6 +138,9 @@ vi.mock('../../src/daemon/cc-presets.js', () => ({
     name.trim().toLowerCase() === 'minimax' ? 200000 : undefined
   )),
   getPresetInitMessage: vi.fn(() => 'preset-init'),
+  getQwenPresetTransportConfig: presetRouteMocks.qwen,
+  getDshPresetTransportConfig: presetRouteMocks.dsh,
+  getPiPresetTransportConfig: presetRouteMocks.pi,
   invalidateCache: vi.fn(),
 }));
 
@@ -253,6 +294,7 @@ vi.mock('../../src/daemon/timeline-emitter.js', () => ({
     }),
     on: vi.fn(() => () => {}),
     epoch: 0,
+    getBufferedEvents: vi.fn(() => []),
     replay: vi.fn(() => ({ events: [], truncated: false })),
   },
 }));
@@ -324,9 +366,9 @@ vi.mock('../../src/agent/tmux.js', () => ({
   getPaneStartCommand: vi.fn().mockResolvedValue(''),
   cleanupOrphanFifos: vi.fn().mockResolvedValue(undefined), BACKEND: 'tmux',
 }));
-vi.mock('../../src/daemon/jsonl-watcher.js', () => ({ startWatching: vi.fn(), startWatchingFile: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false), findJsonlPathBySessionId: vi.fn() }));
-vi.mock('../../src/daemon/codex-watcher.js', () => ({ startWatching: vi.fn(), startWatchingSpecificFile: vi.fn(), startWatchingById: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false), findRolloutPathByUuid: vi.fn(async () => null) }));
-vi.mock('../../src/daemon/gemini-watcher.js', () => ({ startWatching: vi.fn(), startWatchingLatest: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false) }));
+vi.mock('../../src/daemon/jsonl-watcher.js', () => ({ startWatching: vi.fn(), startWatchingFile: vi.fn(), ensureClaudeSessionFile: vi.fn(), preClaimFile: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false), findJsonlPathBySessionId: vi.fn() }));
+vi.mock('../../src/daemon/codex-watcher.js', () => ({ startWatching: vi.fn(), startWatchingSpecificFile: vi.fn(), startWatchingById: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false), isFileClaimedByOther: vi.fn(() => false), findRolloutPathByUuid: vi.fn(async () => null) }));
+vi.mock('../../src/daemon/gemini-watcher.js', () => ({ startWatching: vi.fn(), startWatchingLatest: vi.fn(), startWatchingDiscovered: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false) }));
 vi.mock('../../src/daemon/opencode-watcher.js', () => ({ startWatching: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false) }));
 vi.mock('../../src/agent/structured-session-bootstrap.js', () => ({ resolveStructuredSessionBootstrap: vi.fn(async (x) => x) }));
 vi.mock('../../src/agent/provider-display.js', () => ({ getQwenDisplayMetadata: vi.fn(() => ({})) }));
@@ -339,9 +381,14 @@ vi.mock('../../src/agent/codex-runtime-config.js', () => ({
 }));
 vi.mock('../../src/agent/brain-dispatcher.js', () => ({ BrainDispatcher: vi.fn().mockImplementation(() => ({ start: vi.fn(), stop: vi.fn() })) }));
 
-import { getTransportRuntime, launchSession } from '../../src/agent/session-manager.js';
+import { ensureTransportRuntimeAvailable, getTransportRuntime, launchSession } from '../../src/agent/session-manager.js';
 import { disconnectAll } from '../../src/agent/provider-registry.js';
+import { ClaudeCodeSdkProvider } from '../../src/agent/providers/claude-code-sdk.js';
+import { QwenProvider } from '../../src/agent/providers/qwen.js';
+import { DeepseekHarnessProvider } from '../../src/agent/providers/deepseek-harness.js';
+import { PiProvider } from '../../src/agent/providers/pi.js';
 import { handleWebCommand } from '../../src/daemon/command-handler.js';
+import { rebuildSubSessions } from '../../src/daemon/subsession-manager.js';
 import { newSession } from '../../src/agent/tmux.js';
 
 describe('sdk transport flow e2e', () => {
@@ -860,6 +907,139 @@ describe('sdk transport flow e2e', () => {
     }));
   });
 
+  it('rehydrates a CC preset from the durable rebuild wire before the first post-restart turn', async () => {
+    const sessionName = 'deck_sub_ccsdk_preset_rebuild';
+    mocks.store.set(sessionName, {
+      name: sessionName,
+      projectName: 'parent',
+      role: 'w1',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/ccsdk-preset-rebuild',
+      state: 'idle',
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+    });
+
+    await rebuildSubSessions([{
+      id: 'ccsdk_preset_rebuild',
+      type: 'claude-code-sdk',
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      cwd: '/tmp/ccsdk-preset-rebuild',
+      parentSession: 'deck_parent_brain',
+      ccPresetId: 'MiniMax',
+      requestedModel: 'MiniMax-M3',
+    }]);
+
+    expect(mocks.store.get(sessionName)).toMatchObject({
+      ccPreset: 'MiniMax',
+      requestedModel: 'MiniMax-M3',
+    });
+
+    const createSessionSpy = vi.spyOn(ClaudeCodeSdkProvider.prototype, 'createSession');
+    try {
+      await ensureTransportRuntimeAvailable(sessionName);
+      expect(getTransportRuntime(sessionName)).toBeDefined();
+      expect(createSessionSpy).toHaveBeenCalledWith(expect.objectContaining({
+        agentId: 'MiniMax-M3',
+        env: expect.objectContaining({
+          ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+          ANTHROPIC_API_KEY: expect.any(String),
+          ANTHROPIC_MODEL: 'MiniMax-M3',
+        }),
+      }));
+    } finally {
+      createSessionSpy.mockRestore();
+    }
+  });
+
+  it('rehydrates Qwen, DSH, and Pi preset routes through their real post-restart runtime assembly', async () => {
+    const qwenCreate = vi.spyOn(QwenProvider.prototype, 'createSession');
+    const dshCreate = vi.spyOn(DeepseekHarnessProvider.prototype, 'createSession');
+    const piCreate = vi.spyOn(PiProvider.prototype, 'createSession');
+    try {
+      await rebuildSubSessions([
+        {
+          id: 'qwen_preset_rebuild', type: 'qwen', runtimeType: 'transport',
+          providerId: 'qwen', cwd: '/tmp/qwen-preset-rebuild',
+          ccPresetId: 'MiniMax', requestedModel: 'stale-qwen-model',
+        },
+        {
+          id: 'dsh_preset_rebuild', type: 'deepseek-harness', runtimeType: 'transport',
+          providerId: 'deepseek-harness', cwd: '/tmp/dsh-preset-rebuild',
+          ccPresetId: 'MiniMax', requestedModel: 'MiniMax-M3',
+        },
+        {
+          id: 'pi_preset_rebuild', type: 'pi', runtimeType: 'transport',
+          providerId: 'pi', cwd: '/tmp/pi-preset-rebuild',
+          ccPresetId: 'MiniMax', requestedModel: 'MiniMax-M3',
+        },
+      ]);
+
+      await ensureTransportRuntimeAvailable('deck_sub_qwen_preset_rebuild');
+      await ensureTransportRuntimeAvailable('deck_sub_dsh_preset_rebuild');
+      await ensureTransportRuntimeAvailable('deck_sub_pi_preset_rebuild');
+
+      expect(presetRouteMocks.qwen).toHaveBeenCalledWith('MiniMax');
+      expect(qwenCreate).toHaveBeenCalledWith(expect.objectContaining({
+        agentId: 'MiniMax-M3',
+        env: expect.objectContaining({
+          OPENAI_BASE_URL: 'https://api.minimax.io/anthropic',
+          OPENAI_API_KEY: 'test-qwen-key',
+        }),
+        settings: expect.objectContaining({ model: { name: 'MiniMax-M3' } }),
+      }));
+      expect(presetRouteMocks.dsh).toHaveBeenCalledWith('MiniMax', 'MiniMax-M3');
+      expect(dshCreate).toHaveBeenCalledWith(expect.objectContaining({
+        agentId: 'MiniMax-M3',
+        llm: expect.objectContaining({ provider: 'minimax', model: 'MiniMax-M3', apiKey: 'test-dsh-key' }),
+      }));
+      expect(presetRouteMocks.pi).toHaveBeenCalledWith('MiniMax', 'MiniMax-M3');
+      expect(piCreate).toHaveBeenCalledWith(expect.objectContaining({
+        agentId: 'MiniMax-M3',
+        piLlm: expect.objectContaining({ provider: 'minimax', model: 'MiniMax-M3', apiKey: 'test-pi-key' }),
+      }));
+    } finally {
+      qwenCreate.mockRestore();
+      dshCreate.mockRestore();
+      piCreate.mockRestore();
+    }
+  });
+
+  it('does not synthesize a preset or credential route for direct DSH and Pi rebuilds', async () => {
+    presetRouteMocks.dsh.mockClear();
+    presetRouteMocks.pi.mockClear();
+    const dshCreate = vi.spyOn(DeepseekHarnessProvider.prototype, 'createSession');
+    const piCreate = vi.spyOn(PiProvider.prototype, 'createSession');
+    try {
+      await rebuildSubSessions([
+        {
+          id: 'dsh_direct_rebuild', type: 'deepseek-harness', runtimeType: 'transport',
+          providerId: 'deepseek-harness', cwd: '/tmp/dsh-direct-rebuild', requestedModel: 'deepseek-v4-flash',
+        },
+        {
+          id: 'pi_direct_rebuild', type: 'pi', runtimeType: 'transport',
+          providerId: 'pi', cwd: '/tmp/pi-direct-rebuild', requestedModel: 'provider-owned-model',
+        },
+      ]);
+
+      await ensureTransportRuntimeAvailable('deck_sub_dsh_direct_rebuild');
+      await ensureTransportRuntimeAvailable('deck_sub_pi_direct_rebuild');
+
+      expect(presetRouteMocks.dsh).not.toHaveBeenCalled();
+      expect(presetRouteMocks.pi).not.toHaveBeenCalled();
+      expect(dshCreate).toHaveBeenCalledWith(expect.not.objectContaining({ llm: expect.anything() }));
+      expect(piCreate).toHaveBeenCalledWith(expect.not.objectContaining({ piLlm: expect.anything() }));
+    } finally {
+      dshCreate.mockRestore();
+      piCreate.mockRestore();
+    }
+  });
+
 
   it('surfaces resolved transport bootstrap context in subsession.sync for transport sub-sessions', async () => {
     const serverLink = { send: vi.fn() } as any;
@@ -905,7 +1085,7 @@ describe('sdk transport flow e2e', () => {
     });
   });
 
-  it('applies live sub-session transportConfig supervision updates without restart and re-syncs the sub-session', async () => {
+  it('rejects live sub-session automatic supervision updates without mutation or re-sync', async () => {
     const sessionName = 'deck_sub_live_supervision';
     mocks.store.set(sessionName, {
       name: sessionName,
@@ -945,7 +1125,6 @@ describe('sdk transport flow e2e', () => {
       },
     }, serverLink);
     await flushAsync();
-    await waitForCondition(() => serverLink.send.mock.calls.some((call) => call[0]?.type === 'subsession.sync' && call[0]?.id === 'live_supervision'));
 
     const record = mocks.store.get(sessionName);
     expect(record).toMatchObject({
@@ -953,32 +1132,12 @@ describe('sdk transport flow e2e', () => {
       providerId: 'codex-sdk',
       providerSessionId: sessionName,
       codexSessionId: 'thread-codex-live-sub',
-      transportConfig: {
-        supervision: {
-          mode: 'supervised_audit',
-          backend: 'codex-sdk',
-          model: 'gpt-5.3-codex-spark',
-          taskRunPromptVersion: 'task_run_status_v1',
-          auditMode: 'audit',
-          maxAuditLoops: 2,
-        },
-      },
     });
+    expect(record?.transportConfig).toBeUndefined();
 
-    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'subsession.sync',
-      id: 'live_supervision',
-      transportConfig: expect.objectContaining({
-        supervision: expect.objectContaining({
-          mode: 'supervised_audit',
-          backend: 'codex-sdk',
-          model: 'gpt-5.3-codex-spark',
-          taskRunPromptVersion: 'task_run_status_v1',
-          auditMode: 'audit',
-          maxAuditLoops: 2,
-        }),
-      }),
-    }));
+    expect(serverLink.send.mock.calls.some((call) => (
+      call[0]?.type === 'subsession.sync' && call[0]?.id === 'live_supervision'
+    ))).toBe(false);
   });
 
   it('syncs codex-sdk sub-session model changes back to the frontend', async () => {
@@ -1105,6 +1264,36 @@ describe('sdk transport flow e2e', () => {
     expect(record?.runtimeType).toBe('transport');
     expect(record?.providerId).toBe('claude-code-sdk');
     expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'session.error' }));
+  });
+
+  it('carries a selected-file identity from session.start into the first SDK system prompt', async () => {
+    const serverLink = { send: vi.fn() } as any;
+    const sessionName = 'deck_identity_file_prompt_brain';
+    const identityDocument = '中'.repeat(49_323);
+
+    handleWebCommand({
+      type: 'session.start',
+      project: 'identity file prompt',
+      dir: '/tmp/identity-file-prompt-e2e',
+      agentType: 'claude-code-sdk',
+      identityPrompt: identityDocument,
+    }, serverLink);
+    await flushAsync();
+    await waitForCondition(() => !!mocks.store.get(sessionName));
+
+    handleWebCommand({
+      type: 'session.send',
+      session: sessionName,
+      text: 'Report your identity.',
+      commandId: 'cmd-identity-file-first-turn',
+    }, serverLink);
+    await flushAsync();
+    await waitForCondition(() => mocks.claudeCalls.some((call) => (
+      String(call.options.appendSystemPrompt ?? '').includes(identityDocument)
+    )));
+
+    expect(mocks.store.get(sessionName)?.identityPrompt).toBe(identityDocument);
+    expect(mocks.claudeCalls.at(-1)?.options.appendSystemPrompt).toContain(identityDocument);
   });
 
   it('starts a selected compatible model without duplicating the CC preset', async () => {
@@ -1432,6 +1621,15 @@ describe('sdk transport flow e2e', () => {
     }, serverLink);
     await flushAsync();
     await waitForCondition(() => mocks.store.get(SESSION_CX)?.codexSessionId === 'thread-codex-e2e');
+    // The thread id arrives on thread.started, which PRECEDES every item this
+    // test then asserts. Waiting only for the id returns in the window before
+    // the turn has produced anything, and the assertions below read an empty
+    // timeline -- invisible on an idle machine, wide open on a loaded runner.
+    // Wait for the settled final message, which is the last thing the turn
+    // emits.
+    await waitForCondition(() => mocks.emitted.some((e) => e.session === SESSION_CX
+      && e.type === 'assistant.text'
+      && e.payload.streaming === false));
 
     const record = mocks.store.get(SESSION_CX);
     expect(record?.runtimeType).toBe('transport');

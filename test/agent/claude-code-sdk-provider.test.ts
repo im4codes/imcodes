@@ -1,6 +1,7 @@
 import { mkdtemp, mkdir, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { EventEmitter } from 'node:events';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 const childProcessMock = vi.hoisted(() => ({
@@ -12,15 +13,28 @@ const childProcessMock = vi.hoisted(() => ({
     cb?.(null, 'ok\n', '');
     return {} as never;
   }),
-  spawn: vi.fn(() => ({
-    killed: false,
-    kill: vi.fn(function (this: { killed: boolean }) {
-      this.killed = true;
+  // A real EventEmitter that dies when signalled, because that is what a
+  // process does and what teardown now waits for. The previous fake had no-op
+  // `once`/`on`, so it modelled a child that never reports its own death: with
+  // the audited awaited teardown, killProcessTree could then only escape via
+  // its grace timer, and under fake timers nothing advances that timer once the
+  // test's advance window has passed. The provider was fine; the fake could not
+  // answer the question teardown had started asking.
+  spawn: vi.fn(() => {
+    const child = new EventEmitter() as EventEmitter & {
+      killed: boolean;
+      kill: (signal?: NodeJS.Signals) => boolean;
+    };
+    child.killed = false;
+    child.kill = vi.fn((_signal?: NodeJS.Signals) => {
+      child.killed = true;
+      // Asynchronous, like a real signal delivery: teardown must observe the
+      // exit through its listener, not synchronously inside kill().
+      setImmediate(() => child.emit('exit', null, _signal ?? 'SIGTERM'));
       return true;
-    }),
-    once: vi.fn(),
-    on: vi.fn(),
-  }) as never),
+    }) as never;
+    return child;
+  }) as never,
 }));
 
 vi.mock('node:child_process', () => ({
@@ -98,7 +112,7 @@ vi.mock('../../src/util/logger.js', () => ({
   default: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-import { ClaudeCodeSdkProvider } from '../../src/agent/providers/claude-code-sdk.js';
+import { ClaudeCodeSdkProvider, isClaudeAuthFailureMessage } from '../../src/agent/providers/claude-code-sdk.js';
 import { PROVIDER_ACTIVE_TURN_DELIVERY_KINDS } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, ToolCallEvent } from '../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
@@ -179,7 +193,10 @@ describe('ClaudeCodeSdkProvider', () => {
     await sendPromise;
   });
 
-  it('inserts an appended message at Claude\'s next safe boundary instead of preempting it', async () => {
+  it.each([
+    PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE,
+    PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.MCP_MESSAGE,
+  ])('inserts %s at Claude\'s next safe boundary instead of preempting it', async (deliveryKind) => {
     sdkMock.setWaitForClose(true);
     const provider = new ClaudeCodeSdkProvider();
     await provider.connect({ binaryPath: 'claude' });
@@ -196,7 +213,7 @@ describe('ClaudeCodeSdkProvider', () => {
       delegationId: 'queue-append:queued_notification_identity',
       sourceSessionName: 'deck_project_brain',
       text: 'append at the next safe boundary',
-      deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE,
+      deliveryKind,
     });
 
     expect(result).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
@@ -888,6 +905,11 @@ describe('ClaudeCodeSdkProvider', () => {
 
     expect(run.closed).toBe(true);
     expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+    // The awaited teardown resolved on the child's own exit, so no escalation
+    // was needed. Pinning the absence matters: if teardown ever stops observing
+    // the exit it would sit out the whole grace window and SIGKILL a process
+    // that had already died.
+    expect(child.kill).not.toHaveBeenCalledWith('SIGKILL');
   });
 
   it('fresh createSession ignores previous internal continuity for the same route', async () => {
@@ -1066,6 +1088,41 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(sdkMock.runs.slice(1).every((run) => run.options.resume === 'session-connection-retry')).toBe(true);
     expect(completed).toEqual(['Recovered answer']);
     expect(errors).toEqual([]);
+  });
+
+  it('does not append recovery guidance to prose that merely mentions a 401', () => {
+    // Every string here came from, or models, a real successful answer. Telling
+    // the user their session is broken because their reply contained the digits
+    // 401 is worse than saying nothing: it sends them to /logout for no reason.
+    const innocuous = [
+      '平均每 G 毛利 401.61 元/G/月（12.96 元/G/天）',
+      'Total: $401.00',
+      'See server/src/routes/enroll.ts:401 for the guard.',
+      'The endpoint returns 401 when the bearer token is missing.',
+      'Detector matches the `[API Error: 401 Invalid API Key]` shape exactly.',
+      'Service listens on port 4011 and answered in 4010ms.',
+      'HEAD is now at 401abc9.',
+      'All 402 tests passed.',
+    ];
+    for (const text of innocuous) {
+      expect({ text, isAuthFailure: isClaudeAuthFailureMessage(text) })
+        .toEqual({ text, isAuthFailure: false });
+    }
+  });
+
+  it('still recognizes a real auth failure, including inside a joined SDK error list', () => {
+    const genuine = [
+      'Failed to authenticate. API Error: 401 Invalid authentication credentials',
+      'API Error: 401 Unauthorized',
+      'Invalid authentication credentials',
+      // SDK errors arrive joined with '; ', so the notice is not always first.
+      'stream closed; Failed to authenticate. API Error: 401 Invalid authentication credentials',
+      'first line\nAPI Error: 401 Unauthorized',
+    ];
+    for (const text of genuine) {
+      expect({ text, isAuthFailure: isClaudeAuthFailureMessage(text) })
+        .toEqual({ text, isAuthFailure: true });
+    }
   });
 
   it('tells users to logout, fully exit, and login again after a 401', async () => {

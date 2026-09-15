@@ -24,7 +24,6 @@ const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const mocks = vi.hoisted(() => {
   const sessions = new Map<string, Record<string, unknown>>();
-  const uuidQueue = ['cc-main-e2e-uuid', 'codex-main-e2e-uuid'];
   return {
     sessions,
     startWatchingFile: vi.fn().mockResolvedValue(undefined),
@@ -36,15 +35,6 @@ const mocks = vi.hoisted(() => {
     findRolloutPathByUuid: vi.fn((uuid: string) => Promise.resolve(`/mock/${uuid}.jsonl`)),
     resolveGeminiSessionId: vi.fn().mockResolvedValue('gemini-main-e2e-uuid'),
     injectGeminiMemoryWithTimeline: vi.fn().mockResolvedValue(undefined),
-    nextUuid: vi.fn(() => uuidQueue.shift() ?? `uuid-${Math.random().toString(36).slice(2, 10)}`),
-  };
-});
-
-vi.mock('node:crypto', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('node:crypto')>();
-  return {
-    ...actual,
-    randomUUID: mocks.nextUuid,
   };
 });
 
@@ -199,26 +189,28 @@ describe.skipIf(SKIP)('main-session structured bootstrap e2e', () => {
     const codexPane = (await capturePane(CODEX_SESSION)).join('\n');
     const geminiPane = (await capturePane(GEMINI_SESSION)).join('\n');
 
-    expect(claudePane).toContain('CLAUDE:cc-main-e2e-uuid');
-    expect(codexPane).toContain('CODEX:codex-main-e2e-uuid');
-    expect(geminiPane).toContain('GEMINI:gemini-main-e2e-uuid');
-
     const claudeRecord = mocks.sessions.get(CLAUDE_SESSION);
     const codexRecord = mocks.sessions.get(CODEX_SESSION);
     const geminiRecord = mocks.sessions.get(GEMINI_SESSION);
+    const claudeId = String(claudeRecord?.ccSessionId ?? '');
+    const codexId = String(codexRecord?.codexSessionId ?? '');
 
-    expect(claudeRecord?.ccSessionId).toBe('cc-main-e2e-uuid');
-    expect(codexRecord?.codexSessionId).toBe('codex-main-e2e-uuid');
+    expect(claudeId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(codexId).toMatch(/^[0-9a-f-]{36}$/);
+    expect(claudeId).not.toBe(codexId);
     expect(geminiRecord?.geminiSessionId).toBe('gemini-main-e2e-uuid');
+    expect(claudePane).toContain(`CLAUDE:${claudeId}`);
+    expect(codexPane).toContain(`CODEX:${codexId}`);
+    expect(geminiPane).toContain('GEMINI:gemini-main-e2e-uuid');
 
     expect(mocks.startWatchingFile).toHaveBeenCalledWith(
       CLAUDE_SESSION,
-      expect.stringContaining('cc-main-e2e-uuid.jsonl'),
-      'cc-main-e2e-uuid',
+      expect.stringContaining(`${claudeId}.jsonl`),
+      claudeId,
     );
     expect(mocks.startCodexWatchingSpecificFile).toHaveBeenCalledWith(
       CODEX_SESSION,
-      '/mock/codex-main-e2e-uuid.jsonl',
+      `/mock/${codexId}.jsonl`,
     );
     expect(mocks.startGeminiWatching).toHaveBeenCalledWith(
       GEMINI_SESSION,

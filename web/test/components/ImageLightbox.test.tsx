@@ -1,4 +1,4 @@
-import { act, fireEvent, render, waitFor } from '@testing-library/preact';
+import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ImageLightbox } from '../../src/components/ImageLightbox.js';
 
@@ -31,10 +31,13 @@ function setMobilePointer() {
 
 describe('ImageLightbox', () => {
   afterEach(() => {
+    cleanup();
     vi.useRealTimers();
     vi.restoreAllMocks();
     delete (globalThis as typeof globalThis & { ClipboardItem?: unknown }).ClipboardItem;
     delete (globalThis as typeof globalThis & { showSaveFilePicker?: unknown }).showSaveFilePicker;
+    delete (navigator as Navigator & { share?: Navigator['share'] }).share;
+    delete (navigator as Navigator & { canShare?: Navigator['canShare'] }).canShare;
     Object.defineProperty(navigator, 'clipboard', {
       configurable: true,
       value: undefined,
@@ -113,6 +116,41 @@ describe('ImageLightbox', () => {
     expect(copyButton.textContent).toBe('image_copied');
   });
 
+  it('uses the system share surface for standalone mobile image downloads when available', async () => {
+    setMobilePointer();
+    const share = vi.fn().mockResolvedValue(undefined);
+    const canShare = vi.fn(() => true);
+    Object.defineProperties(navigator, {
+      share: { configurable: true, value: share },
+      canShare: { configurable: true, value: canShare },
+    });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      blob: () => Promise.resolve(new Blob(['image'], { type: 'image/png' })),
+    } as Response);
+    const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+
+    const { container } = render(
+      <ImageLightbox
+        src="data:image/png;base64,aW1n"
+        alt="result"
+        onClose={vi.fn()}
+      />,
+    );
+
+    const image = container.querySelector('.fb-lightbox img') as HTMLImageElement;
+    fireEvent.contextMenu(image);
+    const saveButton = container.querySelector('.fb-lightbox-action') as HTMLButtonElement;
+    fireEvent.click(saveButton);
+
+    await waitFor(() => {
+      expect(fetchSpy).toHaveBeenCalledWith('data:image/png;base64,aW1n');
+      expect(share).toHaveBeenCalledOnce();
+    });
+    expect(canShare).toHaveBeenCalledOnce();
+    expect(anchorClick).not.toHaveBeenCalled();
+    expect(saveButton.textContent).toBe('image_downloaded');
+  });
+
   it('falls back to blob URL download when no linked download handler is provided', async () => {
     setMobilePointer();
     const createObjectURL = vi.fn(() => 'blob:image-preview');
@@ -147,8 +185,8 @@ describe('ImageLightbox', () => {
       expect(fetchSpy).toHaveBeenCalledWith('data:image/webp;base64,aW1n');
       expect(createObjectURL).toHaveBeenCalledTimes(1);
       expect(anchorClick).toHaveBeenCalledTimes(1);
+      expect(saveButton.textContent).toBe('image_downloaded');
     });
-    expect(saveButton.textContent).toBe('image_downloaded');
   });
 
   it('keeps the native desktop image context menu', () => {

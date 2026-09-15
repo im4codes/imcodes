@@ -438,7 +438,10 @@ describe('file-transfer upload route', () => {
       requestId: 'a'.repeat(32),
       path: 'C:\\Users',
       resolvedPath: 'C:\\Users',
-      entries: [{ name: 'Public', path: 'C:\\Users\\Public', isDir: true, hidden: false }],
+      entries: [
+        { name: 'Public', path: 'C:\\Users\\Public', isDir: true, hidden: false },
+        { name: 'report.txt', path: 'C:\\Users\\report.txt', isDir: false, hidden: false },
+      ],
     });
     const res = await makeApp().request('/api/server/controlled-1/machine-file-list', {
       method: 'POST',
@@ -449,7 +452,10 @@ describe('file-transfer upload route', () => {
     await expect(res.json()).resolves.toEqual({
       ok: true,
       resolvedPath: 'C:\\Users',
-      entries: [{ name: 'Public', path: 'C:\\Users\\Public', isDir: true, hidden: false }],
+      entries: [
+        { name: 'Public', path: 'C:\\Users\\Public', isDir: true, hidden: false },
+        { name: 'report.txt', path: 'C:\\Users\\report.txt', isDir: false, hidden: false },
+      ],
     });
     expect(hasDaemonCapabilityMock).toHaveBeenCalledWith(FILE_TRANSFER_DIRECTORY_CAPABILITY);
     expect(sendFileTransferRequestMock).toHaveBeenCalledWith(

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import { saveBlobViaDownloadAnchor } from '../browser-download.js';
+import { shareBlobOrDownload } from '../browser-download.js';
 
 interface Props {
   src: string;
@@ -81,7 +81,7 @@ function shouldUseMobileImageActions(): boolean {
 async function downloadImage(src: string, fileName: string) {
   const inferredMimeType = getMimeTypeFromDataUrl(src);
   const blob = await readImageBlob(src);
-  saveBlobViaDownloadAnchor(blob, ensureImageFileName(fileName, blob.type || inferredMimeType));
+  await shareBlobOrDownload(blob, ensureImageFileName(fileName, blob.type || inferredMimeType));
 }
 
 async function copyImageToClipboard(src: string) {

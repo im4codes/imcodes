@@ -14,8 +14,34 @@ export class MachineDirectoryWsAdapter {
 
   constructor(private readonly serverId: string) {}
 
+  /**
+   * Hand this to components that want a `WsClient`.
+   *
+   * The cast is a promise this class only partly keeps, and an unkept part is
+   * not a graceful degradation: a consumer reaching a method that is missing
+   * gets a bare `TypeError` thrown mid-render, which takes down the whole
+   * component tree rather than just the file picker. So every method any
+   * reachable consumer touches must exist here, and
+   * `machine-directory-ws-adapter.test.ts` checks that against the real call
+   * sites rather than trusting this comment.
+   */
   asWsClient(): WsClient {
     return this as unknown as WsClient;
+  }
+
+  /**
+   * A directory-only adapter fronts an HTTP route, not a daemon socket, so
+   * there is no capability snapshot. `null` is the same answer a real client
+   * gives before `daemon.hello` arrives, which consumers already handle.
+   */
+  getDaemonCapabilitySnapshot(): null {
+    return null;
+  }
+
+  /** Reports the (permanently) absent snapshot once, then never changes. */
+  onDaemonCapabilitySnapshot(listener: (snapshot: null) => void): () => void {
+    listener(null);
+    return () => {};
   }
 
   onMessage(listener: MessageListener): () => void {
@@ -47,6 +73,51 @@ export class MachineDirectoryWsAdapter {
       });
     }).finally(() => this.controllers.delete(controller));
     return requestId;
+  }
+
+  /**
+   * Everything below exists because FileBrowser calls it, not because a
+   * directory-only adapter can do it.
+   *
+   * The picker is mounted `readOnly`, so these should be unreachable -- but
+   * "should be unreachable" and "throws a TypeError that unmounts the remote
+   * desktop" are a bad pair. Each answers with the same failed-response shape
+   * the caller already handles for a real error, so the UI degrades to
+   * "unsupported here" instead of the whole tree disappearing.
+   */
+  private failedResponse<T extends Record<string, unknown>>(message: T): string {
+    const requestId = crypto.randomUUID();
+    queueMicrotask(() => this.emit({
+      ...message,
+      requestId,
+      status: 'error',
+      error: 'machine_directory_read_only',
+    } as unknown as ServerMessage));
+    return requestId;
+  }
+
+  fsReadFile(path: string): string {
+    return this.failedResponse({ type: 'fs.read_response', path });
+  }
+
+  fsWriteFile(path: string): string {
+    return this.failedResponse({ type: 'fs.write_response', path });
+  }
+
+  fsMkdir(path: string): string {
+    return this.failedResponse({ type: 'fs.mkdir_response', path });
+  }
+
+  fsRename(path: string): string {
+    return this.failedResponse({ type: 'fs.rename_response', path });
+  }
+
+  fsDelete(path: string): string {
+    return this.failedResponse({ type: 'fs.delete_response', path });
+  }
+
+  fsGitDiff(path: string): string {
+    return this.failedResponse({ type: 'fs.git_diff_response', path });
   }
 
   fsGitStatus(path: string): string {

@@ -1,8 +1,8 @@
 /**
- * Context-store worker — the single long-lived owner of
+ * Context-store child process — the single long-lived owner of
  * `shared-agent-context.sqlite` in daemon production. It reuses the synchronous
  * `context-store.ts` implementation (so the SQL/transaction logic lives in one
- * place) and exposes it to the main thread ONLY through the allowlisted RPC
+ * place) and exposes it to the daemon broker ONLY through the allowlisted RPC
  * protocol in `shared/context-store-rpc.ts`.
  *
  * Responsibilities (Phase 1 / foundation):
@@ -21,7 +21,7 @@
  * shared allowlist; their worker orchestration handlers land in Phases 2/3.
  * Until then a call to one resolves to a stable `unsupported_operation` error.
  */
-import { parentPort } from 'node:worker_threads';
+import { resolveWorkerRuntime } from '../util/worker-runtime-port.js';
 import * as store from './context-store.js';
 import {
   CONTEXT_STORE_RPC_ERROR,
@@ -32,8 +32,7 @@ import {
 } from '../../shared/context-store-rpc.js';
 import { buildContextStoreOpHandlers } from './context-store-op-handlers.js';
 
-const port = parentPort;
-if (!port) throw new Error('context-store-worker must run as a worker thread');
+const { port } = resolveWorkerRuntime();
 
 /** How often (ms) the idle checkpoint timer fires. */
 const IDLE_CHECKPOINT_INTERVAL_MS = 30_000;
