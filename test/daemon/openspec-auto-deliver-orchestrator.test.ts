@@ -119,7 +119,14 @@ const execFileAsync = promisify(execFile);
 // ~1.5s alone and the complete file passes). Keep the wait bounded, but leave
 // enough headroom for full-suite contention; a genuinely absent send still
 // fails explicitly at the deadline.
-const SEND_WAIT_MS = 30_000;
+//
+// 30s (bumped from the original 15s above) still wasn't enough headroom: a
+// plain (non-coverage) Node 22 CI run timed out on the 'commit&push' wait in
+// the "audit PASS when opted in" case, which chains several of these waits
+// back to back around real git operations. The suite has only grown since
+// the 15s->30s bump, so the contention this constant exists for has grown
+// with it. 45s, still comfortably short of a hung/genuinely-broken send.
+const SEND_WAIT_MS = 45_000;
 const COVERAGE_CONTENDED_SEND_WAIT_MS = 60_000;
 /**
  * Floor on how many times a wait actually looks, independent of the clock.
