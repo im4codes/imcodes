@@ -5402,7 +5402,29 @@ async function handleAppendQueuedTransportMessages(cmd: Record<string, unknown>,
         });
         return;
       }
-      reject(error);
+      // Every other failure here (most concretely 'stale': the turn this
+      // tried to append to already finished by the time the daemon looked)
+      // can ALSO mean the browser's belief about "is a turn still active" is
+      // now wrong. Previously this branch rejected with no state update at
+      // all, so a browser that thought a turn was running had nothing to
+      // ever correct it: it kept showing "working" with a live Stop control,
+      // and kept queueing behind a turn that would never resume -- exactly
+      // the stuck-forever state this closure exists to prevent for
+      // 'not_found'. The queued messages themselves are untouched by any of
+      // these statuses (none of them consume from the pending queue), so
+      // only the state fields are needed here, not a card-retirement ack.
+      const queuePayload = buildTransportQueueSnapshotPayload(sessionName, 'command_handler');
+      timelineEmitter.emit(sessionName, 'session.state', {
+        state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
+        ...queuePayload,
+      }, { source: 'daemon', confidence: 'high' });
+      reject(error, {
+        queueEpoch: queuePayload.queueEpoch,
+        queueAuthorityId: queuePayload.queueAuthorityId,
+        pendingMessageVersion: queuePayload.pendingMessageVersion,
+        ...(queuePayload.degraded !== undefined ? { degraded: queuePayload.degraded } : {}),
+        ...(queuePayload.degradedReason ? { degradedReason: queuePayload.degradedReason } : {}),
+      });
       return;
     }
 

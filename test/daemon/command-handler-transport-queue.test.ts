@@ -5262,6 +5262,55 @@ describe('handleWebCommand transport queue behavior', () => {
     }));
   });
 
+  it('corrects the browser\'s active-turn belief when append reports stale, instead of leaving it stuck', async () => {
+    // The turn this tried to append to already finished by the time the
+    // daemon looked (appendPendingMessagesToActiveTurn's very first check).
+    // This used to reject with no session.state update at all: a browser
+    // that believed a turn was still running never learned otherwise, so it
+    // kept showing "working" with a live Stop control and kept queueing new
+    // messages behind a turn that would never resume -- stuck forever, with
+    // nothing to ever correct it short of a manual reload.
+    const store = getTransportQueueStore();
+    store.enqueue({
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'append-stale-turn',
+      commandId: 'append-stale-turn',
+      text: 'this turn already finished',
+      privateMaterialJson: JSON.stringify({ text: 'this turn already finished' }),
+    });
+    const appendPendingMessagesToActiveTurn = vi.fn().mockResolvedValue({ status: 'stale' });
+    getTransportRuntimeMock.mockReturnValue({
+      appendPendingMessagesToActiveTurn,
+      rehydratePendingFromStore: vi.fn(),
+      pendingEntries: [{
+        clientMessageId: 'append-stale-turn',
+        text: 'this turn already finished',
+      }],
+      pendingCount: 0,
+      sending: false,
+    });
+
+    handleWebCommand({
+      type: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
+      sessionName: 'deck_transport_brain',
+      clientMessageIds: ['append-stale-turn'],
+      commandId: 'cmd-append-stale-turn',
+    }, serverLink as any);
+    await flushAsync();
+
+    // The fix: the daemon now tells the browser the TRUE current state
+    // (idle, nothing pending/sending) instead of leaving it to guess.
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'session.state',
+      expect.objectContaining({ state: 'idle' }),
+      expect.any(Object),
+    );
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      commandId: 'cmd-append-stale-turn', status: 'error', error: 'The active turn already finished',
+    }));
+  });
+
   it('carries the whole recipient-gated queue authority on the not-found ack itself', async () => {
     // The snapshot used to travel ONLY on a best-effort timeline session.state.
     // command.ack is the reliable, replayable frame, so a browser that loses the
