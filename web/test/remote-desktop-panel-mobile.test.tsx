@@ -1440,6 +1440,51 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(getByRole('textbox', { name: 'remote_desktop.mobile_text_input' })).toBeDefined();
   });
 
+  it('pins the keyboard panel above the OS keyboard instead of letting it scroll away', async () => {
+    const visualViewport = Object.assign(new EventTarget(), {
+      height: 700,
+      offsetTop: 0,
+    });
+    const originalVisualViewport = Object.getOwnPropertyDescriptor(window, 'visualViewport');
+    const originalInnerHeight = Object.getOwnPropertyDescriptor(window, 'innerHeight');
+    Object.defineProperty(window, 'visualViewport', { configurable: true, value: visualViewport });
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 700 });
+    try {
+      const { container, getByRole } = await renderPanel();
+      act(() => { (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });
+
+      const keyboard = () => container.querySelector('.remote-desktop-mobile-keyboard') as HTMLElement;
+      // No OS keyboard yet: normal document flow, same as before.
+      expect(keyboard().style.position).toBe('');
+      expect(keyboard().classList.contains('is-pinned')).toBe(false);
+
+      // The OS keyboard opens and eats 300px from the bottom of the visual
+      // viewport; the browser would otherwise scroll the tab switcher (which
+      // sits above the now-focused textarea) off the top of the screen.
+      act(() => {
+        visualViewport.height = 400;
+        visualViewport.dispatchEvent(new Event('resize'));
+      });
+      expect(keyboard().style.position).toBe('fixed');
+      expect(keyboard().style.bottom).toBe('300px');
+      expect(keyboard().classList.contains('is-pinned')).toBe(true);
+
+      // Dismissing the OS keyboard (e.g. switching to the Keys tab) restores
+      // the visual viewport, and the panel returns to normal flow.
+      act(() => {
+        visualViewport.height = 700;
+        visualViewport.dispatchEvent(new Event('resize'));
+      });
+      expect(keyboard().style.position).toBe('');
+      expect(keyboard().classList.contains('is-pinned')).toBe(false);
+    } finally {
+      if (originalVisualViewport) Object.defineProperty(window, 'visualViewport', originalVisualViewport);
+      else delete (window as Window & { visualViewport?: VisualViewport }).visualViewport;
+      if (originalInnerHeight) Object.defineProperty(window, 'innerHeight', originalInnerHeight);
+      else delete (window as unknown as { innerHeight?: number }).innerHeight;
+    }
+  });
+
   it('sends a standalone computer-keyboard key, then one chord per combo-mode cycle', async () => {
     const { container, getByRole } = await renderPanel();
     act(() => { (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });

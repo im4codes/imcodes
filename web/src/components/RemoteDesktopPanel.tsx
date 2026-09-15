@@ -380,6 +380,16 @@ export function RemoteDesktopPanel({
   // Modifiers latched down in combo mode, waiting for either a second tap
   // (release) or a non-modifier key tap (fire the chord, then auto-release).
   const [heldComboKeys, setHeldComboKeys] = useState<readonly RemoteDesktopChordKey[]>([]);
+  // How far the OS on-screen keyboard currently eats into the layout
+  // viewport from the bottom. The docked keyboard panel normally just sits
+  // in its own grid row, but a phone's own keyboard resizes only the visual
+  // viewport (not the layout viewport this panel is sized against), so the
+  // browser instead scrolls the focused textarea into view -- carrying the
+  // panel's own tab switcher, which sits above that textarea, off the top
+  // of the screen along with it. Tracking the inset lets the panel pin
+  // itself directly above the OS keyboard instead of riding along with that
+  // scroll.
+  const [mobileKeyboardViewportInset, setMobileKeyboardViewportInset] = useState(0);
   const [quickInputOpen, setQuickInputOpen] = useState(false);
   const [quickInputPortalContainer, setQuickInputPortalContainer] = useState<Element | null>(null);
   const [displayModeMenu, setDisplayModeMenu] = useState<DisplayModeMenuState | null>(null);
@@ -2052,6 +2062,27 @@ export function RemoteDesktopPanel({
     requestAnimationFrame(() => mobileTextInputRef.current?.focus({ preventScroll: true }));
   };
 
+  // Re-measure whenever the panel is open: the OS keyboard can come and go
+  // (switching tabs, or the textarea losing/regaining focus) without the
+  // panel itself closing.
+  useEffect(() => {
+    if (!mobileTextOpen || typeof window === 'undefined' || !window.visualViewport) return;
+    const viewport = window.visualViewport;
+    const recompute = () => {
+      setMobileKeyboardViewportInset(Math.max(0, Math.round(
+        window.innerHeight - (viewport.height + viewport.offsetTop),
+      )));
+    };
+    recompute();
+    viewport.addEventListener('resize', recompute);
+    viewport.addEventListener('scroll', recompute);
+    return () => {
+      viewport.removeEventListener('resize', recompute);
+      viewport.removeEventListener('scroll', recompute);
+      setMobileKeyboardViewportInset(0);
+    };
+  }, [mobileTextOpen]);
+
   const comboModifierFlags = (keys: readonly RemoteDesktopChordKey[]) => ({
     control: keys.some((k) => k.code === 'ControlLeft' || k.code === 'ControlRight'),
     alt: keys.some((k) => k.code === 'AltLeft' || k.code === 'AltRight'),
@@ -2729,9 +2760,23 @@ export function RemoteDesktopPanel({
             overlay on top of the video) so opening it shrinks the visible
             remote screen instead of covering it -- the previous floating panel
             sat on top of the video and, combined with the OS's own on-screen
-            keyboard underneath it, could blot out most of a phone screen. */}
+            keyboard underneath it, could blot out most of a phone screen.
+            While the OS keyboard is actually up, though, staying in normal
+            flow backfires: the layout viewport does not shrink for it, so
+            the browser scrolls the focused textarea into view instead and
+            carries the tab switcher above it off the top of the screen.
+            Pin the panel to the visual viewport's bottom edge (measured
+            above) whenever that is happening, so it rides directly on top
+            of the keyboard instead of being scrolled away from it. */}
         {mobileTextOpen && (
-          <div class="remote-desktop-mobile-keyboard" role="group" aria-label={t('remote_desktop.mobile_keyboard')}>
+          <div
+            class={`remote-desktop-mobile-keyboard${mobileKeyboardViewportInset > 0 ? ' is-pinned' : ''}`}
+            role="group"
+            aria-label={t('remote_desktop.mobile_keyboard')}
+            style={mobileKeyboardViewportInset > 0
+              ? { position: 'fixed', left: 0, right: 0, bottom: `${mobileKeyboardViewportInset}px` }
+              : undefined}
+          >
             <div class="remote-desktop-mobile-keyboard-head">
               <div class="remote-desktop-mobile-keyboard-tabs" role="tablist" aria-label={t('remote_desktop.mobile_keyboard')}>
                 <button

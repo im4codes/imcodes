@@ -10888,6 +10888,16 @@ button.quick-agent-delegation-preset.active {
   box-shadow: inset 0 1px 0 rgb(255 255 255 / 9%);
 }
 
+/* Pinned directly above the OS on-screen keyboard (see the visualViewport
+   tracking in RemoteDesktopPanel) instead of sitting in normal flow, so it
+   cannot be scrolled off along with the rest of the panel while that
+   keyboard is up. */
+.remote-desktop-mobile-keyboard.is-pinned {
+  z-index: 20;
+  max-height: 40vh;
+  box-shadow: 0 -8px 24px rgb(0 0 0 / 45%), inset 0 1px 0 rgb(255 255 255 / 9%);
+}
+
 .remote-desktop-mobile-keyboard-head {
   display: flex;
   align-items: center;
