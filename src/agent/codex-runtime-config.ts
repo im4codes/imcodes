@@ -7,7 +7,7 @@ import { killProcessTree } from '../util/kill-process-tree.js';
 import type { ProviderQuotaMeta } from '../../shared/provider-quota.js';
 import { formatProviderQuotaLabel } from '../../shared/provider-quota.js';
 import { isMeaningfulCodexCreditsPayload } from '../../shared/codex-credit-history.js';
-import { recordCodexCreditSnapshot } from '../store/context-store.js';
+import { getContextStoreClient } from '../store/context-store-worker-client.js';
 
 const CACHE_TTL_MS = 30_000;
 const APP_SERVER_TIMEOUT_MS = 5_000;
@@ -549,16 +549,19 @@ export async function getCodexRuntimeConfig(options: CodexRuntimeConfigOptions =
   // This function only runs on a real (non-cached) refresh — the CACHE_TTL_MS
   // gate above already throttles every caller to at most once per 30s, so no
   // separate poll loop is needed to keep the local history reasonably dense.
-  // recordCodexCreditSnapshot is itself best-effort/never-throws.
+  // Dispatched through the async context-store worker client (never the
+  // synchronous context-store.js export directly — see
+  // scripts/lint-no-sync-context-store.mjs) and never awaited: best-effort
+  // telemetry that must never block or throw into this hot path.
   if (isMeaningfulCodexCreditsPayload(rateLimits?.credits)) {
-    recordCodexCreditSnapshot({
+    void getContextStoreClient().run('recordCodexCreditSnapshot', [{
       planType: rateLimits?.planType ?? undefined,
       balance: rateLimits!.credits!.balance,
       hasCredits: rateLimits!.credits!.hasCredits,
       unlimited: rateLimits!.credits!.unlimited,
       fiveHourLeftPercent: findWindowLeftPercent(rateLimits, FIVE_HOUR_WINDOW_MINS),
       weeklyLeftPercent: findWindowLeftPercent(rateLimits, WEEKLY_WINDOW_MINS),
-    });
+    }]).catch(() => {});
   }
   const models = discoveredModels && discoveredModels.length > 0 ? discoveredModels : fallbackCodexModels();
   const defaultModel = models.find((model) => model.isDefault)?.id ?? models[0]?.id;

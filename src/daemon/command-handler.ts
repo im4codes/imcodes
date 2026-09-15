@@ -100,12 +100,11 @@ import { buildSessionList } from './session-list.js';
 import { setClaudeUsageQuotaOptIn, recordClaudeQuotaActivity } from '../agent/claude-usage-quota.js';
 import { CLAUDE_QUOTA_MSG } from '../../shared/claude-quota.js';
 import { CODEX_RESET_CREDITS_MSG } from '../../shared/codex-reset-credits.js';
-import { CODEX_CREDIT_HISTORY_MSG } from '../../shared/codex-credit-history.js';
+import { CODEX_CREDIT_HISTORY_MSG, type CodexCreditSnapshot } from '../../shared/codex-credit-history.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
 import { PROVIDER_ERROR_CODES } from '../agent/transport-provider.js';
 import { refreshCodexQuotaMetadataForSessions } from './codex-quota-refresh.js';
 import { fetchCodexResetCredits, consumeCodexResetCredit } from '../agent/codex-reset-credits.js';
-import { listCodexCreditSnapshots } from '../store/context-store.js';
 import { supervisionAutomation } from './supervision-automation.js';
 import { refreshSupervisorDefaultsCache } from './supervisor-defaults-cache.js';
 import { syncSessionIdentitiesForCommand } from './session-identity-sync.js';
@@ -1815,7 +1814,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       void handleCodexResetCreditsConsume(cmd, serverLink);
       break;
     case CODEX_CREDIT_HISTORY_MSG.REQUEST:
-      handleCodexCreditHistoryRequest(cmd, serverLink);
+      void handleCodexCreditHistoryRequest(cmd, serverLink);
       break;
     case 'subsession.detect_shells':
       void handleSubSessionDetectShells(serverLink);
@@ -2243,19 +2242,23 @@ async function handleCodexResetCreditsConsume(cmd: Record<string, unknown>, serv
 
 /**
  * Recorded Codex pay-as-you-go credit-balance history (codex_credit_snapshots,
- * populated by getCodexRuntimeConfig on every real quota refresh). Purely
- * local SQLite read — no app-server round trip, so this replies synchronously.
+ * populated by getCodexRuntimeConfig on every real quota refresh). Read via
+ * the async context-store worker client — never the synchronous
+ * context-store.js export directly (see scripts/lint-no-sync-context-store.mjs).
  */
-function handleCodexCreditHistoryRequest(cmd: Record<string, unknown>, serverLink: ServerLink): void {
+async function handleCodexCreditHistoryRequest(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
   if (!requestId) return;
   const limit = typeof cmd.limit === 'number' ? cmd.limit : undefined;
   try {
-    const snapshots = listCodexCreditSnapshots({ limit });
+    const snapshots = await getContextStoreClient().run<CodexCreditSnapshot[]>(
+      'listCodexCreditSnapshots',
+      [{ limit }],
+    );
     serverLink?.send({ type: CODEX_CREDIT_HISTORY_MSG.RESPONSE, requestId, ok: true, snapshots });
   } catch (err) {
     logger.warn({ err }, 'codex.credit_history.request failed');
-    serverLink?.send({ type: CODEX_CREDIT_HISTORY_MSG.RESPONSE, requestId, ok: false, error: 'internal_error' });
+    serverLink?.send({ type: CODEX_CREDIT_HISTORY_MSG.RESPONSE, requestId, ok: false, error: FS_GENERIC_ERROR_CODES.INTERNAL_ERROR });
   }
 }
 

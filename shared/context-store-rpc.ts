@@ -87,6 +87,7 @@ export const CONTEXT_STORE_L1_OPS = [
   'backfillTurnUsageSyncMetadata',
   'selectTurnUsageSyncBatch',
   'getTurnUsageSyncDiagnostics',
+  'listCodexCreditSnapshots',
   // writes / mutations
   'recordContextEvent',
   'enqueueContextJob',
@@ -115,6 +116,7 @@ export const CONTEXT_STORE_L1_OPS = [
   'recordTurnUsage',
   'recordTurnUsageSyncResults',
   'recordTurnUsageSyncRequestFailure',
+  'recordCodexCreditSnapshot',
   'recordMemoryHits',
   'pruneLocalMemory',
   'pruneArchiveIfDue',

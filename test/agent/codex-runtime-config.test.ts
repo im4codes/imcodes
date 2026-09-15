@@ -113,8 +113,8 @@ const providerRegistryMock = vi.hoisted(() => ({
   getProvider: vi.fn(() => undefined),
 }));
 
-const contextStoreMock = vi.hoisted(() => ({
-  recordCodexCreditSnapshot: vi.fn(),
+const contextStoreClientMock = vi.hoisted(() => ({
+  run: vi.fn().mockResolvedValue(undefined),
 }));
 
 const fsMock = vi.hoisted(() => ({
@@ -140,10 +140,13 @@ vi.mock('../../src/agent/provider-registry.js', () => ({
 }));
 
 // codex-runtime-config.ts records a local SQLite snapshot on every real
-// refresh (src/store/context-store.js). Mocked so this unit test never
-// touches the real ~/.imcodes SQLite file as a side effect of importing it.
-vi.mock('../../src/store/context-store.js', () => ({
-  recordCodexCreditSnapshot: contextStoreMock.recordCodexCreditSnapshot,
+// refresh, dispatched through the async context-store worker client (never
+// the synchronous context-store.js export directly — see
+// scripts/lint-no-sync-context-store.mjs). Mocked so this unit test never
+// spawns the real worker / touches the real ~/.imcodes SQLite file as a side
+// effect of importing it.
+vi.mock('../../src/store/context-store-worker-client.js', () => ({
+  getContextStoreClient: () => contextStoreClientMock,
 }));
 
 import { getCodexRuntimeConfig, getCodexBaseInstructions } from '../../src/agent/codex-runtime-config.js';
@@ -154,7 +157,8 @@ describe('getCodexRuntimeConfig', () => {
     childProcessMock.children.length = 0;
     providerRegistryMock.getProvider.mockReset();
     providerRegistryMock.getProvider.mockReturnValue(undefined);
-    contextStoreMock.recordCodexCreditSnapshot.mockReset();
+    contextStoreClientMock.run.mockReset();
+    contextStoreClientMock.run.mockResolvedValue(undefined);
     fsMock.readFile.mockReset();
     fsMock.readFile.mockImplementation(async () => {
       throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
@@ -179,8 +183,8 @@ describe('getCodexRuntimeConfig', () => {
     expect(config.creditsBalance).toBe('4.25');
     expect(config.creditsHasCredits).toBe(true);
     expect(config.creditsUnlimited).toBe(false);
-    expect(contextStoreMock.recordCodexCreditSnapshot).toHaveBeenCalledTimes(1);
-    expect(contextStoreMock.recordCodexCreditSnapshot).toHaveBeenCalledWith({
+    expect(contextStoreClientMock.run).toHaveBeenCalledTimes(1);
+    expect(contextStoreClientMock.run).toHaveBeenCalledWith('recordCodexCreditSnapshot', [{
       planType: 'pro',
       balance: '4.25',
       hasCredits: true,
@@ -190,7 +194,7 @@ describe('getCodexRuntimeConfig', () => {
       fiveHourLeftPercent: 88,
       // No secondary window in the fixture — never guessed from position.
       weeklyLeftPercent: undefined,
-    });
+    }]);
   });
 
   it('returns codex-cached base_instructions on exact slug match', async () => {
@@ -273,8 +277,9 @@ describe('getCodexRuntimeConfig', () => {
     // the one-shot app-server spawn path.
     expect(config.creditsBalance).toBe('0');
     expect(config.creditsUnlimited).toBe(true);
-    expect(contextStoreMock.recordCodexCreditSnapshot).toHaveBeenCalledWith(
-      expect.objectContaining({ balance: '0', hasCredits: false, unlimited: true }),
+    expect(contextStoreClientMock.run).toHaveBeenCalledWith(
+      'recordCodexCreditSnapshot',
+      [expect.objectContaining({ balance: '0', hasCredits: false, unlimited: true })],
     );
   });
 
@@ -294,13 +299,14 @@ describe('getCodexRuntimeConfig', () => {
     });
 
     await getCodexRuntimeConfig(true);
-    expect(contextStoreMock.recordCodexCreditSnapshot).toHaveBeenCalledWith(
-      expect.objectContaining({
+    expect(contextStoreClientMock.run).toHaveBeenCalledWith(
+      'recordCodexCreditSnapshot',
+      [expect.objectContaining({
         // 100 - 99, correctly attributed to the weekly bucket by duration.
         weeklyLeftPercent: 1,
         // No window matched the 5h duration — never guessed from position.
         fiveHourLeftPercent: undefined,
-      }),
+      })],
     );
   });
 });
