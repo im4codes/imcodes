@@ -102,7 +102,12 @@ describe('remote desktop quick input entry points', () => {
 
     const panel = rendered.getByTestId('quick-input-enabled-panel');
     expect(panel.dataset.quickData).toBe('shared');
-    expect(panel.dataset.standalone).toBe('true');
+    // The single popped-out window now hosts the same RemoteDesktopWorkspace
+    // the other two entry points below already use (so it can add a second
+    // machine via the same "+"), so its panel is `embedded` like theirs --
+    // not `standalone`, which was only ever true for the old bare-panel
+    // layout this window no longer renders.
+    expect(panel.dataset.embedded).toBe('true');
   });
 
   it('provides the same QuickInput data to every embedded workspace panel', () => {
