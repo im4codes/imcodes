@@ -1,5 +1,5 @@
 /** @vitest-environment jsdom */
-import { act, cleanup, render, waitFor } from '@testing-library/preact';
+import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY } from '@shared/remote-desktop-access.js';
 import {
@@ -25,14 +25,26 @@ vi.mock('../src/api/machines.js', () => ({
   listControllableMachines,
 }));
 
-vi.mock('../src/components/RemoteDesktopPanel.js', () => ({
-  RemoteDesktopPanel: ({ machine, standalone, onClose }: {
-    machine: { displayName: string };
-    standalone: boolean;
-    onClose(): void;
+// Mirrors remote-desktop-wall-standalone.test.tsx's own mock of the SAME
+// component: the wrapper's job is seeding/closing hosts in the workspace
+// state, not rendering the tab bar or the panels inside it, so the mock only
+// needs to expose the state it was handed and the callbacks that mutate it.
+vi.mock('../src/components/RemoteDesktopWorkspace.js', () => ({
+  RemoteDesktopWorkspace: ({ state, onOpenHost, onCloseHost, onCloseWorkspace }: {
+    state: { orderedHostKeys: readonly string[]; hosts: Record<string, { machine: { displayName: string } }> };
+    onOpenHost(machine: unknown): void;
+    onCloseHost(hostKey: string): void;
+    onCloseWorkspace(): void;
   }) => <div data-testid="standalone-desktop">
-    {machine.displayName}:{standalone ? 'full-panel' : 'embedded'}
-    <button onClick={onClose}>stop-standalone</button>
+    {state.orderedHostKeys.map((key) => state.hosts[key]?.machine.displayName).join(',')}
+    <button type="button" onClick={() => onOpenHost({
+      serverId: 'desktop-2', refName: 'desktop-2', displayName: 'Desktop Two',
+      online: true, execEnabled: true, capabilities: [REMOTE_DESKTOP_CAPABILITY],
+    })}>add-host</button>
+    {state.orderedHostKeys.map((key) => (
+      <button key={key} type="button" onClick={() => onCloseHost(key)}>close-host-{key}</button>
+    ))}
+    <button type="button" onClick={onCloseWorkspace}>close-workspace</button>
   </div>,
 }));
 
@@ -72,7 +84,7 @@ describe('remote desktop standalone window', () => {
     expect(result.getByRole('status').textContent).toBe('controlled_nodes.loading');
   });
 
-  it('loads the selected machine and closes only its own browser window', async () => {
+  it('seeds the workspace with its own machine, supports adding a second one, and only closes the window once every host is gone', async () => {
     listControllableMachines.mockResolvedValue([{
       serverId: 'desktop-1',
       refName: 'desktop-ref',
@@ -86,12 +98,44 @@ describe('remote desktop standalone window', () => {
     const result = render(<RemoteDesktopStandalone serverId="desktop-1" />);
 
     expect(result.getByRole('status').textContent).toBe('controlled_nodes.loading');
-    await waitFor(() => expect(result.getByTestId('standalone-desktop').textContent).toContain('Desktop One:full-panel'));
+    await waitFor(() => expect(result.getByTestId('standalone-desktop').textContent).toContain('Desktop One'));
 
-    act(() => result.getByText('stop-standalone').click());
+    // The "+" the report asked for: adding a second remote desktop into the
+    // SAME popped-out window, not just viewing the one it was opened for.
+    fireEvent.click(result.getByText('add-host'));
+    expect(result.getByTestId('standalone-desktop').textContent).toContain('Desktop One,Desktop Two');
+
+    // Closing one of two hosts must not close the window that still has a
+    // live second one.
+    act(() => result.getByText('close-host-desktop-1').click());
+    expect(close).not.toHaveBeenCalled();
+    expect(result.getByTestId('standalone-desktop').textContent).not.toContain('Desktop One');
+    expect(result.getByTestId('standalone-desktop').textContent).toContain('Desktop Two');
+
+    // Closing the last remaining host closes the browser window, matching
+    // what the single-panel version always did on its one panel's close.
+    act(() => result.getByText('close-host-desktop-2').click());
     expect(close).toHaveBeenCalledTimes(1);
+
     result.unmount();
     expect(stopAll).toHaveBeenCalledWith(REMOTE_DESKTOP_STOP_ORIGIN.STANDALONE_UNMOUNT);
+  });
+
+  it('also closes the window when every host is closed at once via close-workspace', async () => {
+    listControllableMachines.mockResolvedValue([{
+      serverId: 'desktop-1',
+      refName: 'desktop-ref',
+      displayName: 'Desktop One',
+      online: true,
+      execEnabled: true,
+      capabilities: [REMOTE_DESKTOP_CAPABILITY],
+    }]);
+    const close = vi.spyOn(window, 'close').mockImplementation(() => undefined);
+    const result = render(<RemoteDesktopStandalone serverId="desktop-1" />);
+    await waitFor(() => expect(result.getByTestId('standalone-desktop').textContent).toContain('Desktop One'));
+
+    act(() => result.getByText('close-workspace').click());
+    expect(close).toHaveBeenCalledTimes(1);
   });
 
   it('uses the real capability gate for complete and incomplete macOS profiles', async () => {
@@ -118,7 +162,7 @@ describe('remote desktop standalone window', () => {
 
     const complete = render(<RemoteDesktopStandalone serverId="mac-complete" />);
     await waitFor(() => expect(complete.getByTestId('standalone-desktop').textContent)
-      .toContain('Mac Complete:full-panel'));
+      .toContain('Mac Complete'));
     complete.unmount();
 
     const incomplete = render(<RemoteDesktopStandalone serverId="mac-incomplete" retryWindowMs={0} />);
@@ -157,7 +201,7 @@ describe('remote desktop standalone window', () => {
       <RemoteDesktopStandalone serverId="mac-complete" retryWindowMs={5_000} retryIntervalMs={10} />,
     );
     await waitFor(() => expect(result.getByTestId('standalone-desktop').textContent)
-      .toContain('Mac Complete:full-panel'));
+      .toContain('Mac Complete'));
     expect(listControllableMachines).toHaveBeenCalledTimes(3);
     expect(result.queryByRole('alert')).toBeNull();
   });

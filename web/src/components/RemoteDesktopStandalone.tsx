@@ -5,13 +5,33 @@ import { listControllableMachines, type MachineListItem } from '../api/machines.
 import { dismissHtmlSplashForDirectEntry } from '../html-splash.js';
 import { RemoteDesktopConnectionManager } from '../remote-desktop-connection-manager.js';
 import { canOpenRemoteDesktopMachine } from '../remote-desktop-profile.js';
-import { RemoteDesktopPanel } from './RemoteDesktopPanel.js';
+import {
+  activateRemoteDesktopWorkspaceTab,
+  closeRemoteDesktopWorkspace,
+  closeRemoteDesktopWorkspaceHost,
+  createRemoteDesktopWorkspaceState,
+  openRemoteDesktopWorkspaceHost,
+  reorderRemoteDesktopWorkspaceHost,
+} from '../remote-desktop-workspace-state.js';
+import { RemoteDesktopWorkspace } from './RemoteDesktopWorkspace.js';
 import { useQuickData } from './QuickInputPanel.js';
 
 /** How long a freshly opened tab keeps looking for a usable host. */
 export const REMOTE_DESKTOP_STANDALONE_RETRY_WINDOW_MS = 20_000;
 export const REMOTE_DESKTOP_STANDALONE_RETRY_INTERVAL_MS = 1_500;
 
+/**
+ * A single machine popped out into its own browser window.
+ *
+ * This used to render one bare, unremovable `RemoteDesktopPanel` -- a window
+ * that could only ever show the one machine it was opened for, with no way
+ * to bring another machine into the SAME window the way the inline app and
+ * the wall window both already let you. It now hosts the same tabbed
+ * `RemoteDesktopWorkspace` they use, seeded with this window's own machine as
+ * the first tab, so its "+" adds a second remote desktop right here instead
+ * of forcing a trip back to the main app (or yet another popped-out window)
+ * for anything beyond the first machine.
+ */
 export function RemoteDesktopStandalone({
   serverId,
   retryWindowMs = REMOTE_DESKTOP_STANDALONE_RETRY_WINDOW_MS,
@@ -28,6 +48,13 @@ export function RemoteDesktopStandalone({
   const [attempt, setAttempt] = useState(0);
   const managerRef = useRef<RemoteDesktopConnectionManager | null>(null);
   if (!managerRef.current) managerRef.current = new RemoteDesktopConnectionManager();
+  const manager = managerRef.current;
+  const [workspace, setWorkspace] = useState(createRemoteDesktopWorkspaceState);
+  // Whether the workspace has ever held a host, so the very first render (no
+  // machine resolved yet, workspace legitimately empty) is not mistaken for
+  // "the user closed everything" and closes the window before it has shown
+  // anything.
+  const everOpenedRef = useRef(false);
 
   useLayoutEffect(() => {
     dismissHtmlSplashForDirectEntry();
@@ -77,9 +104,31 @@ export function RemoteDesktopStandalone({
     };
   }, [serverId, attempt, retryWindowMs, retryIntervalMs]);
 
-  useEffect(() => () => managerRef.current?.stopAll(
+  // Seeds the workspace with this window's own machine as soon as it
+  // resolves. `openRemoteDesktopWorkspaceHost` is a no-op re-activate if the
+  // host is already there, so this stays safe if `machine` is ever
+  // re-resolved to a fresh object for the same server.
+  useEffect(() => {
+    if (!machine) return;
+    setWorkspace((current) => openRemoteDesktopWorkspaceHost(current, machine));
+  }, [machine]);
+
+  // The window's only purpose is showing remote desktops. Once it has shown
+  // at least one and the user closes every tab (individually, or via the
+  // workspace's own "close all"), there is nothing left for the window to
+  // do, so close it the same way the single-panel version always closed on
+  // its one panel's own close button.
+  useEffect(() => {
+    if (workspace.open) {
+      everOpenedRef.current = true;
+      return;
+    }
+    if (everOpenedRef.current) window.close();
+  }, [workspace.open]);
+
+  useEffect(() => () => manager.stopAll(
     REMOTE_DESKTOP_STOP_ORIGIN.STANDALONE_UNMOUNT,
-  ), []);
+  ), [manager]);
 
   if (failed) {
     return (
@@ -96,16 +145,21 @@ export function RemoteDesktopStandalone({
       </div>
     );
   }
-  if (!machine) {
+  if (!workspace.open) {
     return <div class="remote-desktop-standalone-status" role="status">{t('controlled_nodes.loading')}</div>;
   }
   return (
-    <RemoteDesktopPanel
-      machine={machine}
-      connectionManager={managerRef.current}
+    <RemoteDesktopWorkspace
+      state={workspace}
+      manager={manager}
       quickData={quickData}
-      standalone
-      onClose={() => window.close()}
+      onOpenHost={(added) => setWorkspace((current) => openRemoteDesktopWorkspaceHost(current, added))}
+      onActivateTab={(tabId) => setWorkspace((current) => activateRemoteDesktopWorkspaceTab(current, tabId))}
+      onCloseHost={(hostKey) => setWorkspace((current) => closeRemoteDesktopWorkspaceHost(current, hostKey))}
+      onReorderHost={(hostKey, direction) => setWorkspace((current) => (
+        reorderRemoteDesktopWorkspaceHost(current, hostKey, direction)
+      ))}
+      onCloseWorkspace={() => setWorkspace((current) => closeRemoteDesktopWorkspace(current))}
     />
   );
 }
