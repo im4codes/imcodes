@@ -213,3 +213,19 @@ export function getSessionAgentLabel(
 ): string {
   return choice.labelKey ? t(choice.labelKey) : choice.fallbackLabel;
 }
+
+/**
+ * Agent types offered for a project's default coder/auditor role (AddProject,
+ * ProjectSettings) — a narrower, differently-curated list than
+ * `SESSION_AGENT_CHOICES` above (no openclaw/shell/script: those aren't
+ * meaningful "which agent fills this project role" choices). Single source
+ * so AddProject.tsx and ProjectSettings.tsx can't drift out of sync with
+ * each other, the way their previous hand-duplicated copies of this exact
+ * array could.
+ */
+export const PROJECT_ROLE_AGENT_TYPES: string[] = [
+  'claude-code', 'claude-code-sdk', 'codex', 'codex-sdk', 'qoder-sdk', 'copilot-sdk',
+  'cursor-headless', 'opencode-sdk', 'opencode', 'gemini', 'gemini-sdk', 'grok-sdk',
+  'kimi-sdk', HERMES_AGENT_PROVIDER_ID, 'deepseek-harness', 'pi',
+  CODEBUDDY_PROVIDER_IDS.CHINA, CODEBUDDY_PROVIDER_IDS.INTERNATIONAL,
+];
