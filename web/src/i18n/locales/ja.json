@@ -3783,6 +3783,7 @@
     "transfers_running": "{{count}} 件の転送 · {{progress}}%",
     "daemon_control": "リモート操作",
     "install_worker": "リモート操作を有効化",
+    "install_confirm": "{{server}} でリモートデスクトップ操作を有効にしますか?この操作を行うと、ここからそのマシンの画面を表示・操作できるようになります。",
     "install_retry": "ダウンロードし直す",
     "installing": "ダウンロード中…",
     "install_failed": "リモート操作コンポーネントのインストールに失敗しました",

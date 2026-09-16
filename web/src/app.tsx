@@ -6345,6 +6345,17 @@ export function App() {
                 )}
               </div>
               <div class="mobile-server-actions">
+                {/* Left of the file-manager button, on purpose: remote-desktop
+                    launch/enable is the first action in this row. */}
+                <DaemonRemoteDesktopControl
+                  compact
+                  offerLoginScreenSetup={false}
+                  ws={wsRef.current}
+                  serverId={selectedServerId}
+                  serverName={selectedServerInfo?.name}
+                  daemonOnline={daemonOnline}
+                  onOpen={openRemoteDesktop}
+                />
                 {activeSession && (
                   <button
                     class="view-toggle"
@@ -6373,15 +6384,6 @@ export function App() {
                     {viewMode === 'chat' ? '⌨' : '💬'}
                   </button>
                 )}
-                <DaemonRemoteDesktopControl
-                  compact
-                  offerLoginScreenSetup={false}
-                  ws={wsRef.current}
-                  serverId={selectedServerId}
-                  serverName={selectedServerInfo?.name}
-                  daemonOnline={daemonOnline}
-                  onOpen={openRemoteDesktop}
-                />
                 <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 0, lineHeight: 1.2 }}>
                   <span class={`badge ${daemonBadgeState === 'online' ? 'badge-online' : daemonBadgeState === 'connecting' ? 'badge-connecting' : 'badge-offline'}`} style={{ fontSize: 10 }}>
                     {daemonBadgeState === 'online'
@@ -6468,6 +6470,16 @@ export function App() {
             {/* Desktop view mode toggle — mobile uses the one in mobile-server-bar */}
             {!isMobile && resolvedActiveSessionExists && (
               <div class="desktop-view-toggle">
+                {/* Left of the file-manager button, on purpose: remote-desktop
+                    launch/enable is the first action in this row. */}
+                <DaemonRemoteDesktopControl
+                  compact
+                  ws={wsRef.current}
+                  serverId={selectedServerId}
+                  serverName={selectedServerInfo?.name}
+                  daemonOnline={daemonOnline}
+                  onOpen={openRemoteDesktop}
+                />
                 <button
                   class="view-toggle"
                   title={trans('picker.files')}
@@ -6505,14 +6517,6 @@ export function App() {
                     {viewMode === 'chat' ? '⌨ Terminal' : '💬 Chat'}
                   </button>
                 )}
-                <DaemonRemoteDesktopControl
-                  compact
-                  ws={wsRef.current}
-                  serverId={selectedServerId}
-                  serverName={selectedServerInfo?.name}
-                  daemonOnline={daemonOnline}
-                  onOpen={openRemoteDesktop}
-                />
               </div>
             )}
 

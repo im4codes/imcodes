@@ -3784,6 +3784,7 @@
     "transfers_running": "{{count}} 个传输 · {{progress}}%",
     "daemon_control": "远程控制",
     "install_worker": "启用远程控制",
+    "install_confirm": "要在 {{server}} 上启用远程桌面控制吗?启用后可以在这里查看并操控那台机器的屏幕。",
     "install_retry": "重新下载",
     "installing": "正在下载…",
     "install_failed": "远程控制组件安装失败",

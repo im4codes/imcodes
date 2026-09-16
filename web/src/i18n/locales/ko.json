@@ -3783,6 +3783,7 @@
     "transfers_running": "전송 {{count}}건 · {{progress}}%",
     "daemon_control": "원격 제어",
     "install_worker": "원격 제어 사용",
+    "install_confirm": "{{server}}에서 원격 데스크톱 제어를 사용하시겠습니까? 이 작업을 수행하면 여기에서 해당 컴퓨터의 화면을 보고 제어할 수 있습니다.",
     "install_retry": "다시 다운로드",
     "installing": "다운로드 중…",
     "install_failed": "원격 제어 구성 요소 설치 실패",

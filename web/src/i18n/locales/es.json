@@ -3784,6 +3784,7 @@
     "transfers_running": "{{count}} transferencia(s) · {{progress}}%",
     "daemon_control": "Control remoto",
     "install_worker": "Activar control remoto",
+    "install_confirm": "¿Activar el control de escritorio remoto en {{server}}? Esto te permitirá ver y controlar la pantalla de esa máquina desde aquí.",
     "install_retry": "Reintentar descarga",
     "installing": "Descargando…",
     "install_failed": "Fallo al instalar el control remoto",

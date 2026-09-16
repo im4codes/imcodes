@@ -3784,6 +3784,7 @@
     "transfers_running": "{{count}} 個傳輸 · {{progress}}%",
     "daemon_control": "遠端控制",
     "install_worker": "啟用遠端控制",
+    "install_confirm": "要在 {{server}} 上啟用遠端桌面控制嗎?啟用後可以在這裡檢視並操控該機器的畫面。",
     "install_retry": "重新下載",
     "installing": "正在下載…",
     "install_failed": "遠端控制元件安裝失敗",

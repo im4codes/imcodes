@@ -152,6 +152,9 @@ export function DaemonRemoteDesktopControl({
             })
             : t('remote_desktop.login_screen_hint')}
           onClick={() => {
+            if (!window.confirm(t('remote_desktop.install_confirm', {
+              server: serverName ?? serverId ?? '',
+            }))) return;
             // No group is read or required. Enrolment binds this machine to its
             // user; a group is an association made afterwards. Gating the
             // install on one meant a user with no group could not install the
@@ -198,6 +201,14 @@ export function DaemonRemoteDesktopControl({
       disabled={downloading}
       title={failed ? failureLabel : t('remote_desktop.install_worker')}
       onClick={() => {
+        // A one-time-per-click confirmation, not a config toggle: enabling
+        // remote control of this machine is worth a deliberate second step,
+        // the same way the login-screen and revoke actions elsewhere in
+        // this codebase already ask before doing something with this much
+        // reach (see ControlledNodesPanel's own window.confirm() calls).
+        if (!window.confirm(t('remote_desktop.install_confirm', {
+          server: serverName ?? serverId ?? '',
+        }))) return;
         setInstall({ state: REMOTE_DESKTOP_INSTALL_STATE.DOWNLOADING });
         ws?.send({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST });
       }}
