@@ -11268,6 +11268,37 @@ button.quick-agent-delegation-preset.active {
   cursor: grabbing;
 }
 
+/* Touch mode's draggable cursor: a fingertip-sized ring sitting exactly
+   where the remote cursor is. Dragging it moves the cursor relatively (the
+   same math as the mouse-mode handle above); a long-press without moving
+   turns it hollow for a moment to confirm the right-click it just fired,
+   via .is-right below. */
+.remote-desktop-touch-ring {
+  display: none;
+  position: absolute;
+  z-index: 6;
+  width: 64px;
+  height: 64px;
+  padding: 0;
+  translate: -50% -50%;
+  border-radius: 50%;
+  border: 3px solid rgb(255 255 255 / 85%);
+  background: rgb(41 121 255 / 45%);
+  box-shadow: 0 0 0 1px rgb(0 0 0 / 35%), 0 6px 18px rgb(0 0 0 / 40%);
+  touch-action: none;
+  transition: background 120ms ease-out, border-color 120ms ease-out, scale 120ms ease-out;
+}
+
+.remote-desktop-touch-ring:active {
+  scale: .92;
+}
+
+.remote-desktop-touch-ring.is-right {
+  background: transparent;
+  border-color: #fff;
+  box-shadow: 0 0 0 1px rgb(0 0 0 / 35%), 0 0 16px rgb(255 255 255 / 55%);
+}
+
 .remote-desktop-touch-right-button {
   position: absolute;
   z-index: 7;
@@ -12423,6 +12454,10 @@ button.quick-agent-delegation-preset.active {
   }
 
   .remote-desktop-touch-right-button {
+    display: block;
+  }
+
+  .remote-desktop-touch-ring {
     display: block;
   }
 

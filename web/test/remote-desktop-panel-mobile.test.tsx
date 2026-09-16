@@ -1767,6 +1767,94 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     ]);
   });
 
+  it('defaults touch-mode display to actual size instead of scaled-to-fit', async () => {
+    const { getByRole } = await renderPanel();
+    expect(getByRole('button', { name: 'remote_desktop.actual_size' }).getAttribute('aria-pressed'))
+      .toBe('true');
+    expect(getByRole('button', { name: 'remote_desktop.fit' }).getAttribute('aria-pressed'))
+      .toBe('false');
+  });
+
+  it('moves the ring to wherever the screen is tapped, and taps it there to left-click', async () => {
+    const { stage, getByLabelText } = await renderPanel();
+    act(() => {
+      // clientY stays on the vertical center so the video's 16:9-into-4:3
+      // letterboxing doesn't complicate the expected normalized Y below --
+      // that mapping is exercised by other tests already.
+      pointer(stage, 'pointerdown', { pointerId: 3, clientX: 300, clientY: 150 });
+      pointer(stage, 'pointerup', { pointerId: 3, clientX: 300, clientY: 150 });
+    });
+    const ring = getByLabelText('remote_desktop.touch_ring');
+    expect(ring.style.left).toBe('300px');
+    expect(ring.style.top).toBe('150px');
+
+    pointerClick.mockClear();
+    act(() => {
+      pointer(ring, 'pointerdown', { pointerId: 12, clientX: 300, clientY: 150 });
+      pointer(ring, 'pointerup', { pointerId: 12, clientX: 300, clientY: 150 });
+    });
+    expect(pointerClick).toHaveBeenCalledWith('left', 0.75, 0.5);
+  });
+
+  it('drags the touch-mode ring to move the remote cursor relatively, without clicking', async () => {
+    const { stage, getByLabelText } = await renderPanel();
+    act(() => {
+      // Seed a known ring position: a tap that lands exactly on the ring
+      // (0,0 in this harness before any interaction) both places it there
+      // and left-clicks once, which the drag assertions below account for.
+      pointer(stage, 'pointerdown', { pointerId: 8, clientX: 200, clientY: 150 });
+      pointer(stage, 'pointerup', { pointerId: 8, clientX: 200, clientY: 150 });
+    });
+    const ring = getByLabelText('remote_desktop.touch_ring');
+    pointerMove.mockClear();
+    pointerClick.mockClear();
+    act(() => { pointer(ring, 'pointerdown', { pointerId: 9, clientX: 200, clientY: 150 }); });
+    act(() => { pointer(ring, 'pointermove', { pointerId: 9, clientX: 250, clientY: 150 }); });
+    expect(pointerMove).toHaveBeenCalledWith(0.625, 0.5);
+    expect(ring.style.left).toBe('250px');
+    act(() => { pointer(ring, 'pointerup', { pointerId: 9, clientX: 250, clientY: 150 }); });
+    // The drag itself moved the cursor; release must not additionally click.
+    expect(pointerClick).not.toHaveBeenCalled();
+    expect(pointerButton).not.toHaveBeenCalled();
+  });
+
+  it('long-presses the ring without moving to right-click and flash the ring hollow', async () => {
+    vi.useFakeTimers();
+    const { stage, getByLabelText } = await renderPanel();
+    act(() => {
+      pointer(stage, 'pointerdown', { pointerId: 8, clientX: 200, clientY: 150 });
+      pointer(stage, 'pointerup', { pointerId: 8, clientX: 200, clientY: 150 });
+    });
+    const ring = getByLabelText('remote_desktop.touch_ring');
+    pointerClick.mockClear();
+    act(() => { pointer(ring, 'pointerdown', { pointerId: 11, clientX: 200, clientY: 150 }); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(550); });
+    expect(pointerClick).toHaveBeenCalledWith('right', 0.5, 0.5);
+    expect(ring.className).toContain('is-right');
+    act(() => { pointer(ring, 'pointerup', { pointerId: 11, clientX: 200, clientY: 150 }); });
+    // The long-press already fired the click; releasing must not add a
+    // second, left-button one.
+    expect(pointerClick).toHaveBeenCalledTimes(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+    expect(ring.className).not.toContain('is-right');
+  });
+
+  it('cancels the ring long-press once a drag moves past the threshold', async () => {
+    vi.useFakeTimers();
+    const { stage, getByLabelText } = await renderPanel();
+    act(() => {
+      pointer(stage, 'pointerdown', { pointerId: 8, clientX: 200, clientY: 150 });
+      pointer(stage, 'pointerup', { pointerId: 8, clientX: 200, clientY: 150 });
+    });
+    const ring = getByLabelText('remote_desktop.touch_ring');
+    pointerClick.mockClear();
+    act(() => { pointer(ring, 'pointerdown', { pointerId: 13, clientX: 200, clientY: 150 }); });
+    act(() => { pointer(ring, 'pointermove', { pointerId: 13, clientX: 230, clientY: 150 }); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(550); });
+    expect(pointerClick).not.toHaveBeenCalledWith('right', expect.anything(), expect.anything());
+    expect(ring.className).not.toContain('is-right');
+  });
+
   it('releases a captured mouse button even when pointer-up is outside video content', async () => {
     const { stage } = await renderPanel();
     let capturedPointerId: number | null = null;

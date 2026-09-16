@@ -169,6 +169,20 @@ type VirtualMouseDrag = {
 type VirtualMouseButton = 'left' | 'middle' | 'right';
 type DesktopPointerButton = VirtualMouseButton | 'back' | 'forward';
 
+/**
+ * Touch-mode's draggable cursor ring: press-drag moves the remote cursor
+ * relatively (like the mouse-mode handle), a plain tap-without-drag left
+ * clicks where it sits, and a long-press-without-drag right clicks there --
+ * mirrored visually by `is-right` while `longPressFired` is true.
+ */
+interface TouchRingPress {
+  pointerId: number;
+  start: TouchPoint;
+  moved: boolean;
+  longPressFired: boolean;
+  longPressTimer: ReturnType<typeof setTimeout> | null;
+}
+
 interface DesktopPointerPress {
   button: DesktopPointerButton;
   clientPoint: TouchPoint;
@@ -359,10 +373,18 @@ export function RemoteDesktopPanel({
 }: RemoteDesktopPanelProps) {
   const { t } = useTranslation();
   const [snapshot, setSnapshot] = useState<RemoteDesktopSnapshot>(INITIAL_SNAPSHOT);
-  const [viewScale, setViewScale] = useState<ViewScale>('fit');
+  // Actual size by default: a phone/tablet touch session is read at native
+  // pixels far more often than it needs the whole remote desktop crammed to
+  // fit, and "fit" is one tap away in the toolbar for whoever wants it.
+  const [viewScale, setViewScale] = useState<ViewScale>('actual');
   const [mobileInputMode, setMobileInputMode] = useState<MobileInputMode>('touch');
   const [viewport, setViewport] = useState<RemoteDesktopViewport>(INITIAL_REMOTE_DESKTOP_VIEWPORT);
   const [virtualMouse, setVirtualMouse] = useState<TouchPoint>({ x: 0, y: 0 });
+  // Brief visual confirmation that a long-press on the touch-mode ring just
+  // fired a right-click -- cleared a moment later by touchRingArmedTimerRef,
+  // not by the next gesture, so it reads as a flash rather than a mode a user
+  // has to remember to back out of.
+  const [touchRingArmed, setTouchRingArmed] = useState(false);
   const [viewportGeometryRevision, setViewportGeometryRevision] = useState(0);
   /**
    * How many hover/drag moves this panel actually received from the browser,
@@ -501,6 +523,8 @@ export function RemoteDesktopPanel({
     normalized: TouchPoint;
   } | null>(null);
   const lastTouchRemotePointRef = useRef<TouchPoint>({ x: 0.5, y: 0.5 });
+  const touchRingPressRef = useRef<TouchRingPress | null>(null);
+  const touchRingArmedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const transferControllersRef = useRef(new Map<string, AbortController>());
   /**
    * The saved file behind each finished fetch that has one. Only a fetch
@@ -773,6 +797,14 @@ export function RemoteDesktopPanel({
       clearTimeout(touchGestureRef.current.longPressTimer);
     }
     touchGestureRef.current = null;
+    if (touchRingPressRef.current?.longPressTimer) {
+      clearTimeout(touchRingPressRef.current.longPressTimer);
+    }
+    touchRingPressRef.current = null;
+    if (touchRingArmedTimerRef.current) {
+      clearTimeout(touchRingArmedTimerRef.current);
+      touchRingArmedTimerRef.current = null;
+    }
     if (displayTabLongPressRef.current) clearTimeout(displayTabLongPressRef.current.timer);
     displayTabLongPressRef.current = null;
     if (suppressDisplayTabClickTimerRef.current) {
@@ -963,6 +995,15 @@ export function RemoteDesktopPanel({
     touchGestureRef.current = null;
     virtualMouseDragRef.current = null;
     stopVirtualMouseEdgePan();
+    if (touchRingPressRef.current?.longPressTimer) {
+      clearTimeout(touchRingPressRef.current.longPressTimer);
+    }
+    touchRingPressRef.current = null;
+    if (touchRingArmedTimerRef.current) {
+      clearTimeout(touchRingArmedTimerRef.current);
+      touchRingArmedTimerRef.current = null;
+    }
+    setTouchRingArmed(false);
   }, [snapshot.inputEnabled]);
 
   useEffect(() => {
@@ -994,6 +1035,10 @@ export function RemoteDesktopPanel({
     touchGestureRef.current = null;
     virtualMouseDragRef.current = null;
     virtualMouseEdgePointRef.current = null;
+    if (touchRingPressRef.current?.longPressTimer) {
+      clearTimeout(touchRingPressRef.current.longPressTimer);
+    }
+    touchRingPressRef.current = null;
   }, [
     snapshot.selectedDisplayId,
     snapshot.layoutRevision,
@@ -1338,6 +1383,87 @@ export function RemoteDesktopPanel({
     onVirtualMouseButton(event, 'left', false);
   };
 
+  /**
+   * Fires `button` wherever the ring/virtual-mouse currently sits -- shared
+   * by a plain tap (left) and a long-press (right) so both click exactly
+   * where the ring is visually resting, not wherever the finger first
+   * touched down.
+   */
+  const sendVirtualMouseClick = (button: DesktopPointerButton) => {
+    const clientPoint = virtualMouseClientPoint();
+    const normalized = clientPoint ? normalizedClientPoint(clientPoint.x, clientPoint.y) : null;
+    if (normalized) sendTouchClick(button, normalized);
+  };
+
+  /** Brief ring flash confirming a long-press just fired the right click --
+   * cleared on a timer, not by the next gesture, so it always reads as a
+   * momentary confirmation rather than a mode the user has to back out of. */
+  const flashTouchRingArmed = () => {
+    if (touchRingArmedTimerRef.current) clearTimeout(touchRingArmedTimerRef.current);
+    setTouchRingArmed(true);
+    touchRingArmedTimerRef.current = setTimeout(() => {
+      touchRingArmedTimerRef.current = null;
+      setTouchRingArmed(false);
+    }, 380);
+  };
+
+  // Touch mode's draggable cursor ring. A press on the ring always starts a
+  // relative move (identical math to the mouse-mode handle, via
+  // beginVirtualMouseMove/onVirtualMouseMove/endVirtualMouseDrag) plus a
+  // long-press timer; whichever fires first -- movement past the threshold,
+  // or the timer -- decides whether release does nothing further (drag
+  // already moved the cursor), right-clicks (long-press), or left-clicks
+  // (a plain tap that did neither).
+  const beginTouchRing = (event: PointerEvent) => {
+    if (!snapshot.inputEnabled) return;
+    const point = localTouchPoint(event);
+    if (!point) return;
+    beginVirtualMouseMove(event);
+    const press: TouchRingPress = {
+      pointerId: event.pointerId,
+      start: point,
+      moved: false,
+      longPressFired: false,
+      longPressTimer: null,
+    };
+    press.longPressTimer = setTimeout(() => {
+      if (touchRingPressRef.current !== press || press.moved) return;
+      press.longPressFired = true;
+      sendVirtualMouseClick('right');
+      flashTouchRingArmed();
+    }, TOUCH_LONG_PRESS_MS);
+    touchRingPressRef.current = press;
+  };
+
+  const onTouchRingMove = (event: PointerEvent) => {
+    const press = touchRingPressRef.current;
+    if (press && press.pointerId === event.pointerId && !press.moved) {
+      const point = localTouchPoint(event);
+      if (point && Math.hypot(point.x - press.start.x, point.y - press.start.y) > 6) {
+        press.moved = true;
+        if (press.longPressTimer) clearTimeout(press.longPressTimer);
+      }
+    }
+    onVirtualMouseMove(event);
+  };
+
+  const endTouchRing = (event: PointerEvent) => {
+    const press = touchRingPressRef.current;
+    const shouldClick = press?.pointerId === event.pointerId
+      && !press.moved && !press.longPressFired;
+    if (press?.longPressTimer) clearTimeout(press.longPressTimer);
+    touchRingPressRef.current = null;
+    endVirtualMouseDrag(event);
+    if (shouldClick) sendVirtualMouseClick('left');
+  };
+
+  const cancelTouchRing = (event: PointerEvent) => {
+    const press = touchRingPressRef.current;
+    if (press?.longPressTimer) clearTimeout(press.longPressTimer);
+    touchRingPressRef.current = null;
+    endVirtualMouseDrag(event);
+  };
+
   const beginTwoFingerGesture = () => {
     if (touchGestureRef.current?.kind === 'single' && touchGestureRef.current.longPressTimer) {
       clearTimeout(touchGestureRef.current.longPressTimer);
@@ -1410,6 +1536,12 @@ export function RemoteDesktopPanel({
         lastTouchTapRef.current = null;
         lastTouchRemotePointRef.current = normalized;
         sendTouchClick('right', normalized);
+        // The ring is the touch-mode cursor now, not just the drag handle --
+        // a long-press anywhere on the screen right-clicks there, so the ring
+        // needs to jump there too, with the same brief confirmation flash a
+        // long-press directly on the ring gives.
+        commitVirtualMouse(current.start);
+        flashTouchRingArmed();
       }, TOUCH_LONG_PRESS_MS);
       touchGestureRef.current = gesture;
     } else {
@@ -1502,6 +1634,10 @@ export function RemoteDesktopPanel({
         const target = doubleTap ? previous.normalized : normalized;
         lastTouchRemotePointRef.current = target;
         sendTouchClick('left', target);
+        // Tapping the screen moves the mouse there too -- the ring should
+        // land on whichever point actually got clicked, which on a
+        // double-tap is the first tap's position, not this second one.
+        commitVirtualMouse(doubleTap ? previous.point : point);
         lastTouchTapRef.current = doubleTap ? null : {
           at: now,
           point,
@@ -2861,6 +2997,19 @@ export function RemoteDesktopPanel({
                 ><span aria-hidden="true">✥</span></button>
               </div>
             </>
+          )}
+          {mobileInputMode === 'touch' && snapshot.inputEnabled && (
+            <button
+              type="button"
+              class={`remote-desktop-touch-ring ${touchRingArmed ? 'is-right' : ''}`.trim()}
+              aria-label={t('remote_desktop.touch_ring')}
+              style={{ left: `${virtualMouse.x}px`, top: `${virtualMouse.y}px` }}
+              onPointerDown={beginTouchRing}
+              onPointerMove={onTouchRingMove}
+              onPointerUp={endTouchRing}
+              onPointerCancel={cancelTouchRing}
+              onLostPointerCapture={cancelTouchRing}
+            />
           )}
           {mobileInputMode === 'touch' && snapshot.inputEnabled && (
             <button
