@@ -8,6 +8,23 @@ on:
   pull_request:
     branches: [main, master]
 
+# Without this, every push to a shared branch (dev, in particular, taking
+# commits from several concurrent sessions within minutes of each other)
+# spawns its own full ~25-30 min matrix that runs to completion even after a
+# newer commit has already superseded it -- burning runner capacity on
+# results nobody will act on and queueing the CHECK THAT ACTUALLY MATTERS
+# (the latest commit's) behind them. Grouping by ref and cancelling the
+# stale run the moment a newer one starts fixes that: only the most recent
+# push/PR-sync per ref ever runs to completion. `pull_request` and `push`
+# land in different groups automatically (github.ref is the PR merge ref
+# for one, the branch ref for the other), so this never cancels a push run
+# because of an unrelated PR sync or vice versa. Release tags are excluded
+# on purpose -- a tag is not something a later push "supersedes", and a
+# half-finished release build is worse than a slightly slow one.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 env:
   NODE_VERSION_PRIMARY: '24'
   NODE_VERSION_SERVER: '22'
