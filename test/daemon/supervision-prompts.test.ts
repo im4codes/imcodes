@@ -157,9 +157,13 @@ describe('supervision prompts', () => {
       mode: SUPERVISION_MODE.SUPERVISED_AUDIT,
     });
     expect(enabled).toContain('[Contract: supervision_auto_audit_mode_control_v1]');
+    expect(enabled).toContain('project=alpha');
+    expect(enabled).toContain('sourceSession=deck_alpha_brain');
     expect(enabled).toContain('autoAudit=enabled');
-    expect(enabled).toContain('exactly one automatic audit');
-    expect(enabled).toContain('must not create, cancel, replay, or duplicate');
+    // Terse key=value, not restated prose: the policy itself lives in the
+    // eligibility/finalization/messaging contracts already in force, and
+    // this is explicitly not an audit lifecycle event, so it takes no reply.
+    expect(enabled).toContain('noReplyRequired=true');
 
     const disabled = buildAutoAuditModeControlPrompt({
       projectName: 'alpha',
@@ -167,7 +171,7 @@ describe('supervision prompts', () => {
       mode: SUPERVISION_MODE.OFF,
     });
     expect(disabled).toContain('autoAudit=disabled');
-    expect(disabled).toContain('Policy revoked immediately');
+    expect(disabled).toContain('noReplyRequired=true');
   });
 
   it('uses one shared compact reference for continuation turns', () => {

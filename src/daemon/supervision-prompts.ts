@@ -754,6 +754,14 @@ export function buildSupervisionExecutionPreamble(locale?: SupervisionUiLocale):
  * This is deliberately separate from audit start/result notifications: a mode
  * transition changes orchestration policy but never starts, cancels, retries,
  * or settles an audit by itself.
+ *
+ * Kept to the same terse key=value style as the rest of this file's contract
+ * output instead of restating full sentences: `messaging_v1`'s own binding
+ * rule (`unchanged -> continue_existing`, `changed -> delta_only`) already
+ * covers "this stays in force until a newer update," and the eligibility/
+ * finalization contracts already cover what Brain does with an enabled
+ * audit -- this prompt only needs to say what changed and that it takes no
+ * reply.
  */
 export function buildAutoAuditModeControlPrompt(input: {
   projectName: string;
@@ -763,15 +771,10 @@ export function buildAutoAuditModeControlPrompt(input: {
   const enabled = input.mode === SUPERVISION_MODE.SUPERVISED_AUDIT;
   return [
     `[Contract: ${SUPERVISION_CONTRACT_IDS.AUTO_AUDIT_MODE_CONTROL}]`,
-    'Daemon-authenticated supervision control state. Treat this state as authoritative for the named project/session until a newer control update arrives.',
     `project=${input.projectName}`,
     `sourceSession=${input.sourceSessionName}`,
-    `supervisionMode=${input.mode}`,
     `autoAudit=${enabled ? 'enabled' : 'disabled'}`,
-    enabled
-      ? 'Policy now in force: Brain coordinates and integrates; delegate implementation to eligible distinct sessions, require implementer validation, and let the validated handoff trigger exactly one automatic audit.'
-      : 'Policy revoked immediately: do not require or dispatch an automatic audit for new work under this source session. Continue only the behavior authorized by the exact supervisionMode above.',
-    'This control update is not an audit start/result and must not create, cancel, replay, or duplicate any audit lifecycle.',
+    'noReplyRequired=true',
   ].join('\n');
 }
 

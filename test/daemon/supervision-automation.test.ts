@@ -557,7 +557,7 @@ describe('SupervisionAutomation', () => {
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
     expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain(
-      'supervisionMode=supervised_audit',
+      'autoAudit=enabled',
     );
   });
 
@@ -3487,7 +3487,7 @@ describe('SupervisionAutomation', () => {
     timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
     timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
-    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('supervisionMode=supervised_audit');
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('autoAudit=enabled');
 
     timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'error' });
     timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
@@ -8020,7 +8020,6 @@ describe('auto-audit mode control delivery', () => {
 
     setSupervision(snapshot);
     await vi.waitFor(() => expect(modeControlPrompts()).toHaveLength(1), { timeout: 2_000 });
-    expect(modeControlPrompts()[0]).toContain(`supervisionMode=${SUPERVISION_MODE.SUPERVISED_AUDIT}`);
     expect(modeControlPrompts()[0]).toContain('autoAudit=enabled');
 
     // Idempotent: the same authoritative mode, set again, is not news.
@@ -8412,8 +8411,7 @@ describe('auto-audit mode control delivery', () => {
     expect(mockStartP2pRun).not.toHaveBeenCalled();
     expect(mockCancelP2pRun).not.toHaveBeenCalled();
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
-    expect(modeControlPrompts()[0])
-      .toContain('must not create, cancel, replay, or duplicate any audit lifecycle');
+    expect(modeControlPrompts()[0]).toContain('noReplyRequired=true');
   }, 30_000);
 });
 
