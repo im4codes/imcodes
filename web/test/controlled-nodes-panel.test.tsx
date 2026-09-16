@@ -738,6 +738,50 @@ describe('ControlledNodesPanel (12.3)', () => {
     expect(card.querySelector('.controlled-nodes-mobile-menu-panel')).toBeNull();
   });
 
+  it('shows the auto-unlock password field placeholder naming the machine\'s own OS, not a hardcoded "Windows"', async () => {
+    machines = [
+      machine({
+        serverId: 'mac-owner',
+        displayName: 'Mac Owner Node',
+        os: 'mac',
+        accessRole: 'owner',
+        execEnabled: true,
+        capabilities: [REMOTE_DESKTOP_CAPABILITY, CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY],
+      }),
+      machine({
+        serverId: 'win-owner',
+        displayName: 'Win Owner Node',
+        os: 'win',
+        accessRole: 'owner',
+        execEnabled: true,
+        capabilities: [REMOTE_DESKTOP_CAPABILITY, CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY],
+      }),
+    ];
+    const { container } = render(<ControlledNodesPanel />);
+    const rows = await waitFor(() => {
+      const candidates = container.querySelectorAll('.controlled-nodes-machine-row');
+      if (candidates.length !== 2) throw new Error('expected both machine rows to be present');
+      return candidates;
+    });
+
+    const setButtonIn = (row: Element): HTMLButtonElement => {
+      const button = Array.from(row.querySelectorAll('button'))
+        .find((b) => b.textContent === 'controlled_nodes.auto_unlock_set');
+      if (!button) throw new Error('missing auto_unlock_set button');
+      return button as HTMLButtonElement;
+    };
+
+    fireEvent.click(setButtonIn(rows[0]!));
+    const macInput = rows[0]!.querySelector('input[type="password"]') as HTMLInputElement;
+    expect(macInput.placeholder).toBe('controlled_nodes.auto_unlock_placeholder_mac');
+    expect(macInput.getAttribute('aria-label')).toBe('controlled_nodes.auto_unlock_placeholder_mac');
+
+    fireEvent.click(setButtonIn(rows[1]!));
+    const winInput = rows[1]!.querySelector('input[type="password"]') as HTMLInputElement;
+    expect(winInput.placeholder).toBe('controlled_nodes.auto_unlock_placeholder');
+    expect(winInput.getAttribute('aria-label')).toBe('controlled_nodes.auto_unlock_placeholder');
+  });
+
   it('uses a compact role-aware action row for a Participant at a 390x944 CSS-pixel viewport', async () => {
     setViewportSize(390, 944);
     machines = [machine({

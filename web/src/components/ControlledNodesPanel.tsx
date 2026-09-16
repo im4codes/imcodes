@@ -23,6 +23,7 @@ import {
   type ControlledNodeOs,
 } from '../api/machines.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from '@shared/controlled-node-auto-unlock.js';
+import { CONTROLLED_NODE_OS_MAC } from '@shared/controlled-node-artifacts.js';
 import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY, REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY } from '@shared/remote-desktop-install.js';
 import {
   REMOTE_DESKTOP_WEB_READINESS,
@@ -679,8 +680,17 @@ export function ControlledNodesPanel({
                   type="password"
                   autoComplete="new-password"
                   value={autoUnlockValue}
-                  placeholder={t('controlled_nodes.auto_unlock_placeholder')}
-                  aria-label={t('controlled_nodes.auto_unlock_placeholder')}
+                  // The placeholder names the OS whose sign-in password this
+                  // actually wants -- it defaulted to "Windows ..." even for
+                  // a macOS machine's own account password, which risks the
+                  // operator saving the wrong secret from confusion about
+                  // what is even being asked for here.
+                  placeholder={t(machine.os === CONTROLLED_NODE_OS_MAC
+                    ? 'controlled_nodes.auto_unlock_placeholder_mac'
+                    : 'controlled_nodes.auto_unlock_placeholder')}
+                  aria-label={t(machine.os === CONTROLLED_NODE_OS_MAC
+                    ? 'controlled_nodes.auto_unlock_placeholder_mac'
+                    : 'controlled_nodes.auto_unlock_placeholder')}
                   onInput={(event) => setAutoUnlockValue((event.target as HTMLInputElement).value)}
                 />
                 <button type="submit" disabled={!autoUnlockValue || busyServerId === machine.serverId}>

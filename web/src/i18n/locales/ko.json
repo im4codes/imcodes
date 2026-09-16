@@ -3226,6 +3226,7 @@
     "auto_unlock_set": "자동 잠금 해제…",
     "auto_unlock_clear": "자동 잠금 해제 삭제",
     "auto_unlock_placeholder": "Windows 로그인 암호",
+    "auto_unlock_placeholder_mac": "Mac 로그인 암호",
     "auto_unlock_hint": "노드 자체에 암호화되어 저장되며 다시 읽을 수 없습니다. 설정하면 원격 데스크톱을 시작할 수 있는 사람은 로그인된 데스크톱에 접근합니다.",
     "auto_unlock_badge": "자동 해제",
     "auto_unlock_badge_hint": "조작자가 보고 있는 동안 이 노드가 자체 로그인 화면에 응답할 수 있습니다.",

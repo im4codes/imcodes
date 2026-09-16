@@ -3227,6 +3227,7 @@
     "auto_unlock_set": "自动解锁…",
     "auto_unlock_clear": "删除自动解锁",
     "auto_unlock_placeholder": "Windows 登录密码",
+    "auto_unlock_placeholder_mac": "Mac 登录密码",
     "auto_unlock_hint": "加密保存在节点本机，之后无法再读出。启用后，能发起远控的人即可进入已登录桌面。",
     "auto_unlock_badge": "自动解锁",
     "auto_unlock_badge_hint": "有人在远控观看时，该节点可自行应答登录界面。",

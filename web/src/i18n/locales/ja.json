@@ -3226,6 +3226,7 @@
     "auto_unlock_set": "自動ロック解除…",
     "auto_unlock_clear": "自動ロック解除を削除",
     "auto_unlock_placeholder": "Windows サインイン パスワード",
+    "auto_unlock_placeholder_mac": "Mac サインイン パスワード",
     "auto_unlock_hint": "ノード本体に暗号化して保存され、以後読み出せません。設定すると、リモートデスクトップを開始できる人はサインイン済みデスクトップに到達できます。",
     "auto_unlock_badge": "自動解除",
     "auto_unlock_badge_hint": "操作者が見ている間、このノードは自分のサインイン画面に応答できます。",
