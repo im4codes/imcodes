@@ -437,7 +437,7 @@ export interface WellKnownDirectoryResolution {
   permissionDenied: boolean;
 }
 
-interface WellKnownDirectoryResolutionInternal extends WellKnownDirectoryResolution {}
+type WellKnownDirectoryResolutionInternal = WellKnownDirectoryResolution;
 
 const resolutionCache = new Map<string, Promise<WellKnownDirectoryResolutionInternal>>();
 
