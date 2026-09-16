@@ -104,16 +104,52 @@ export function resolveBinaryWithWindowsFallbacks(name: string, windowsCandidate
 }
 
 /** Common per-user `claude` install locations on macOS/Linux, checked when the
- *  daemon's (systemd/launchd) PATH is too sparse to contain `claude`. */
-function getUnixClaudeInstallCandidates(): string[] {
+ *  daemon's (systemd/launchd) PATH is too sparse to contain `claude`. Covers
+ *  every package/version manager a user is plausibly running the native
+ *  installer or `npm install -g` under, not just the two most common ones —
+ *  a daemon started by systemd/launchd inherits none of a login shell's rc
+ *  files, so PATH alone cannot be trusted to contain any of these. Exported
+ *  so tests can assert each candidate directly (via HOME override) without
+ *  going through the bundled-binary short-circuit in
+ *  `resolveClaudeCodePathForSdk`. */
+export function getUnixClaudeInstallCandidates(): string[] {
   const home = process.env.HOME;
   return uniqueNonEmpty([
     home ? path.join(home, '.local', 'bin', 'claude') : undefined,
     home ? path.join(home, '.claude', 'local', 'claude') : undefined,
     home ? path.join(home, '.npm-global', 'bin', 'claude') : undefined,
+    home ? path.join(home, 'bin', 'claude') : undefined, // XDG user bin
+    home ? path.join(home, '.bun', 'bin', 'claude') : undefined,
+    home ? path.join(home, '.cargo', 'bin', 'claude') : undefined,
+    home ? path.join(home, '.yarn', 'bin', 'claude') : undefined,
+    home ? path.join(home, '.asdf', 'shims', 'claude') : undefined,
+    // Native installer's XDG data variant, when only ~/.local/bin's launcher
+    // symlink (already covered above) is missing but the underlying install
+    // is not. Deliberately shallow: this does not enumerate version dirs.
+    home ? path.join(home, '.local', 'share', 'claude', 'claude') : undefined,
     '/usr/local/bin/claude',
     '/opt/homebrew/bin/claude',
+    '/opt/claude/bin/claude',
+    '/snap/bin/claude',
+    '/var/lib/snapd/snap/bin/claude',
+    '/nix/var/nix/profiles/default/bin/claude',
   ]);
+}
+
+/** Last-resort fallback: walk PATH directories looking for an executable
+ *  file named `binaryName`, for hosts where `claude` lives somewhere
+ *  PATH-manageable (a custom install dir, a version-manager shim directory
+ *  not covered above) that isn't in the fixed per-user candidate list.
+ *  Unix-only — Windows has its own PATH+PATHEXT walker
+ *  (`resolveBinaryOnWindows`) because it also needs extension matching. */
+export function walkPathForBinary(binaryName: string, pathEnv = process.env.PATH): string | undefined {
+  if (!pathEnv) return undefined;
+  for (const dir of pathEnv.split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, binaryName);
+    if (existsSync(candidate)) return candidate;
+  }
+  return undefined;
 }
 
 /** Locate the native `claude` binary that ships inside our own
@@ -147,17 +183,36 @@ function resolveBundledClaudeBinary(): string | undefined {
 /** Resolve a CLI path suitable for passing to an SDK option like
  *  `pathToClaudeCodeExecutable`.
  *
- *  Windows: npm global installs expose `claude.cmd`; SDKs that spawn the path
- *  without `shell: true` need the underlying `.js`/`.exe`, so we convert shims
- *  and search common install dirs.
- *
- *  macOS/Linux: a daemon launched by systemd/launchd has a sparse PATH that
- *  usually lacks `claude`, which made the SDK fail with "Claude Code native
- *  binary not found at claude". So for the default name we resolve the binary
- *  bundled with our `@anthropic-ai/claude-agent-sdk` dependency, then common
- *  per-user install locations, and only fall back to a bare PATH lookup last.
- *  An explicit caller-provided name/path is always honoured as-is. */
+ *  Precedence, highest first:
+ *   1. An explicit caller-provided name/path (`name !== 'claude'`, e.g. a
+ *      per-session `config.binaryPath`) is always honoured as-is, on every
+ *      platform — this function never second-guesses a caller that already
+ *      knows which binary it wants.
+ *   2. `IMCODES_CLAUDE_BINARY_PATH`, if set and pointing at a file that
+ *      exists: an ops-level override for deployments (e.g. a systemd unit's
+ *      `Environment=`) that can set an env var but cannot easily touch every
+ *      session's config. Checked before any platform-specific resolution so
+ *      it applies uniformly to Windows and Unix.
+ *   3. Windows: npm global installs expose `claude.cmd`; SDKs that spawn the
+ *      path without `shell: true` need the underlying `.js`/`.exe`, so we
+ *      convert shims and search common install dirs.
+ *   4. macOS/Linux: a daemon launched by systemd/launchd has a sparse PATH
+ *      that usually lacks `claude` (and none of a login shell's rc files
+ *      that might otherwise extend it), which made the SDK fail with
+ *      "Claude Code native binary not found at claude". So for the default
+ *      name we resolve the binary bundled with our
+ *      `@anthropic-ai/claude-agent-sdk` dependency, then common per-user
+ *      install locations, then a manual PATH walk, and only fall back to
+ *      the bare name last. */
 export function resolveClaudeCodePathForSdk(name = 'claude'): string {
+  // Gated on the DEFAULT name only, on both platforms: a caller that already
+  // passed its own explicit name/path (e.g. a per-session config.binaryPath)
+  // is never second-guessed, matching this function's existing contract
+  // below (and the Windows branch's own use of a caller-supplied `name`).
+  if (name === 'claude') {
+    const override = process.env.IMCODES_CLAUDE_BINARY_PATH;
+    if (override && existsSync(override)) return override;
+  }
   if (process.platform === 'win32') {
     const resolved = resolveBinaryWithWindowsFallbacks(name, getWindowsClaudeInstallCandidates(name));
     if (/\.(cmd|bat)$/i.test(resolved)) {
@@ -171,7 +226,7 @@ export function resolveClaudeCodePathForSdk(name = 'claude'): string {
   for (const candidate of getUnixClaudeInstallCandidates()) {
     if (existsSync(candidate)) return candidate;
   }
-  return name;
+  return walkPathForBinary(name) ?? name;
 }
 
 /** Result of resolving a binary that may be an npm .cmd shim.
