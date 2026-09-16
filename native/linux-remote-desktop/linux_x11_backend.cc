@@ -482,6 +482,7 @@ std::optional<DesktopTopology> X11DisplayAdapter::EnumerateTopology() {
   if (resources == nullptr) return std::nullopt;
 
   DesktopTopology topology;
+  topology.generation = generation_;
   topology.revision = ++revision_;
   for (int i = 0; i < resources->ncrtc; ++i) {
     XRRCrtcInfo* crtc = XRRGetCrtcInfo(display, resources, resources->crtcs[i]);
@@ -489,6 +490,7 @@ std::optional<DesktopTopology> X11DisplayAdapter::EnumerateTopology() {
     if (crtc->width > 0 && crtc->height > 0) {
       DisplayTopology entry;
       entry.display_id = std::to_string(static_cast<unsigned long>(resources->crtcs[i]));
+      entry.generation = generation_;
       entry.encoded_pixels = PixelSize{crtc->width, crtc->height};
       entry.logical_input_bounds = common::LogicalRect{
           static_cast<double>(crtc->x), static_cast<double>(crtc->y),
@@ -526,6 +528,126 @@ bool X11DisplayAdapter::SetMode(std::string_view, PixelSize) {
 bool X11DisplayAdapter::SetScale(std::string_view, double) {
   // Not implemented in this slice; EnumerateTopology advertises set_scale=false.
   return false;
+}
+
+// ── X11DisclosureAdapter ────────────────────────────────────────────────────
+
+namespace {
+constexpr int kDisclosureWidth = 300;
+constexpr int kDisclosureHeight = 34;
+constexpr int kDisclosureMargin = 12;
+// A strong, unmistakable color -- the same "this is being watched" register
+// screen-recording indicators everywhere use, not a color that could be
+// mistaken for ordinary desktop chrome.
+constexpr unsigned long kDisclosureBackground = 0xC0392B;  // 0xRRGGBB
+constexpr unsigned long kDisclosureForeground = 0xFFFFFF;
+}  // namespace
+
+X11DisclosureAdapter::X11DisclosureAdapter(
+    std::shared_ptr<X11Connection> connection) noexcept
+    : connection_(std::move(connection)) {}
+
+X11DisclosureAdapter::~X11DisclosureAdapter() { Hide(); }
+
+ReadinessState X11DisclosureAdapter::ProbeReadiness() {
+  return Dpy(connection_) != nullptr ? ReadinessState::kReady
+                                     : ReadinessState::kUnavailable;
+}
+
+void X11DisclosureAdapter::Draw() {
+  Display* display = Dpy(connection_);
+  if (display == nullptr || window_ == 0) return;
+  std::string text;
+  {
+    std::lock_guard<std::mutex> lock(text_mutex_);
+    text = text_;
+  }
+  GC gc = reinterpret_cast<GC>(gc_);
+  XSetForeground(display, gc, kDisclosureBackground);
+  XFillRectangle(display, window_, gc, 0, 0, kDisclosureWidth, kDisclosureHeight);
+  XSetForeground(display, gc, kDisclosureForeground);
+  XDrawString(display, window_, gc, 12, kDisclosureHeight / 2 + 5,
+             text.c_str(), static_cast<int>(text.size()));
+  XFlush(display);
+}
+
+void X11DisclosureAdapter::RedrawLoop() {
+  Display* display = Dpy(connection_);
+  while (running_.load(std::memory_order_relaxed)) {
+    // XCheckWindowEvent, not XNextEvent/XPending: this Display connection is
+    // shared with the capture/input/clipboard adapters (each running on its
+    // own thread), and a plain XNextEvent here would dequeue events
+    // belonging to THEM -- most dangerously the clipboard adapter's
+    // SelectionRequest events, silently breaking clipboard while this
+    // indicator is showing. XCheckWindowEvent only ever removes events for
+    // this exact window and mask, leaving everything else in the queue for
+    // its own owner to find.
+    XEvent event;
+    while (XCheckWindowEvent(display, window_, ExposureMask, &event)) {
+      if (event.type == Expose) Draw();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+}
+
+bool X11DisclosureAdapter::Show(std::uint32_t viewers,
+                                std::uint32_t controllers) {
+  Display* display = Dpy(connection_);
+  if (display == nullptr) return false;
+
+  {
+    std::lock_guard<std::mutex> lock(text_mutex_);
+    text_ = "\xE2\x97\x8F Remote session: " + std::to_string(viewers) +
+            " viewer(s), " + std::to_string(controllers) + " controlling";
+  }
+
+  if (window_ != 0) {
+    Draw();
+    return true;
+  }
+
+  const int screen = DefaultScreen(display);
+  const int screen_width = DisplayWidth(display, screen);
+  const int x = screen_width - kDisclosureWidth - kDisclosureMargin;
+  const int y = kDisclosureMargin;
+
+  XSetWindowAttributes attributes;
+  attributes.override_redirect = True;  // Bypasses the window manager
+                                        // entirely: no decoration, and always
+                                        // stacked above ordinary (WM-managed)
+                                        // windows -- exactly what an
+                                        // indicator the local user must be
+                                        // able to see needs, without
+                                        // depending on any particular WM's
+                                        // cooperation with "always on top".
+  attributes.background_pixel = kDisclosureBackground;
+  attributes.event_mask = ExposureMask;
+  window_ = XCreateWindow(
+      display, DefaultRootWindow(display), x, y, kDisclosureWidth,
+      kDisclosureHeight, 0, CopyFromParent, InputOutput, CopyFromParent,
+      CWOverrideRedirect | CWBackPixel | CWEventMask, &attributes);
+  if (window_ == 0) return false;
+  gc_ = static_cast<unsigned long>(reinterpret_cast<uintptr_t>(
+      XCreateGC(display, window_, 0, nullptr)));
+  XMapRaised(display, window_);
+  Draw();
+
+  running_ = true;
+  redraw_thread_ = std::thread(&X11DisclosureAdapter::RedrawLoop, this);
+  return true;
+}
+
+void X11DisclosureAdapter::Hide() noexcept {
+  running_ = false;
+  if (redraw_thread_.joinable()) redraw_thread_.join();
+  Display* display = Dpy(connection_);
+  if (display != nullptr && window_ != 0) {
+    if (gc_ != 0) XFreeGC(display, reinterpret_cast<GC>(gc_));
+    XDestroyWindow(display, window_);
+    XFlush(display);
+  }
+  window_ = 0;
+  gc_ = 0;
 }
 
 }  // namespace imcodes::remote_desktop::linux_platform

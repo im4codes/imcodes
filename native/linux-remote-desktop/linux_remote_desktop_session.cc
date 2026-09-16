@@ -214,26 +214,17 @@ bool LinuxRemoteDesktopSession::StartTransport(
 
   // SessionCore owns input-ledger dispatch independently of the transport;
   // starting it here (once capture/display are already known good, same as
-  // the video track above) is what would make ApplyPointerMove/ApplyKey/etc.
-  // below actually reach the X11 input adapter.
-  //
-  // CapabilityReadiness::ViewReady() (value_types.cc) requires BOTH encoder
-  // and disclosure to read kReady, not just capture/input/display -- correct
-  // for macOS/Windows, where both are real capabilities, but Linux has
-  // neither yet: LinuxNoopEncoderAdapter is deliberately always
-  // kUnavailable (see its own comment), and LinuxDisclosureAdapter has no
-  // Linux surface in this slice at all. So this always fails right now, on
-  // every real host, not just this qualification's Xvfb one. Left failing
-  // loudly (non-fatal to the transport/video that already started above)
-  // rather than papering over it by lying about encoder/disclosure
-  // readiness -- that gate needs an actual answer (a real Linux disclosure
-  // adapter, or a documented case for why Linux's kControl readiness
-  // shouldn't require it) before this can honestly report kViewing.
+  // the video track above) is what makes ApplyPointerMove/ApplyKey/etc.
+  // below actually reach the X11 input adapter. See this file's top-of-file
+  // comment for why both of SessionCore::Start()'s gates (CapabilityReadiness
+  // ::ViewReady() and DesktopTopology::IsValid()) are now honestly
+  // satisfiable on Linux -- `*topology` here is the same EnumerateTopology()
+  // result already used for native_capture_.Acquire() above, so its
+  // `generation` field being nonzero (X11DisplayAdapter's own fix) is what
+  // makes IsValid() pass here too.
   core_started_ = core_.Start(adapters_.MeasureReadiness(), *topology);
   if (!core_started_) {
-    std::fprintf(stderr,
-                "linux session: SessionCore::Start failed (expected for now -- "
-                "see the comment above; input dispatch stays unavailable)\n");
+    std::fprintf(stderr, "linux session: SessionCore::Start failed\n");
   }
   return true;
 }

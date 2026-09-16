@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -159,6 +160,47 @@ class X11DisplayAdapter final : public common::DisplayAdapter {
   std::shared_ptr<X11Connection> connection_;
   std::string selected_display_;
   common::TopologyRevision revision_ = 0;
+  // Matches Windows' ToCommonDesktopTopology/generation_ pattern: a nonzero
+  // worker-generation identity is required for DesktopTopology::IsValid()/
+  // DisplayTopology::IsValid() to accept the topology at all (both check
+  // generation != 0). There is no daemon-assigned worker generation plumbed
+  // into this adapter yet, so this stays fixed at 1 for the process
+  // lifetime -- honest for a single-worker-per-process model, and easy to
+  // wire to a real value later without changing EnumerateTopology's shape.
+  common::WorkerGeneration generation_ = 1;
+};
+
+/**
+ * The on-screen "you are being watched/controlled" indicator: a small,
+ * always-on-top, override-redirect window in the screen's top-right corner,
+ * shown for as long as a session has a viewer or controller attached.
+ *
+ * This is a genuine consent/transparency surface, not a cosmetic one --
+ * macOS and Windows both ship a real one (a signed helper process and a
+ * local indicator process respectively), and CapabilityReadiness::ViewReady()
+ * requires it precisely so a session cannot become viewable without it. A
+ * physically-present user at a Linux desktop deserves the same visibility.
+ */
+class X11DisclosureAdapter final : public common::DisclosureAdapter {
+ public:
+  explicit X11DisclosureAdapter(std::shared_ptr<X11Connection> connection) noexcept;
+  ~X11DisclosureAdapter() override;
+
+  [[nodiscard]] common::ReadinessState ProbeReadiness() override;
+  bool Show(std::uint32_t viewers, std::uint32_t controllers) override;
+  void Hide() noexcept override;
+
+ private:
+  void RedrawLoop();
+  void Draw();
+
+  std::shared_ptr<X11Connection> connection_;
+  unsigned long window_ = 0;   // X11 Window; kept opaque so Xlib stays out of this header.
+  unsigned long gc_ = 0;       // X11 GC.
+  std::thread redraw_thread_;
+  std::atomic<bool> running_{false};
+  std::mutex text_mutex_;
+  std::string text_;
 };
 
 }  // namespace imcodes::remote_desktop::linux_platform

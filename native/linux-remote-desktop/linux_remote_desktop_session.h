@@ -10,12 +10,20 @@
 //
 // Also wires common::SessionCore (input-ledger-backed ApplyPointerMove/
 // ApplyKey/ApplyButton/ApplyWheel/ApplyText dispatch to the X11 input
-// adapter) -- but CapabilityReadiness::ViewReady() requires encoder AND
-// disclosure readiness, and Linux has neither yet (see
-// LinuxNoopEncoderAdapter's own comment, and LinuxDisclosureAdapter),
-// so SessionCore::Start() currently fails on every real host. Left failing
-// loudly rather than faked; see the comment at its call site in
-// StartTransport().
+// adapter). SessionCore::Start() gates on TWO independent checks, both of
+// which used to fail unconditionally on Linux and now honestly pass:
+//   - CapabilityReadiness::ViewReady() requires capture/encoder/disclosure/
+//     graphical_session all kReady. LinuxNoopEncoderAdapter documents why
+//     kReady is correct for this delivery model (see its own comment), the
+//     on-screen X11DisclosureAdapter (linux_x11_backend.h) is a real,
+//     working consent indicator rather than a stub, and
+//     LinuxPlatformAdapters::MeasureReadiness() now actually populates
+//     graphical_session (previously left at its kUnknown default, which
+//     silently failed ViewReady() forever regardless of the other three).
+//   - DesktopTopology::IsValid()/DisplayTopology::IsValid() both require a
+//     nonzero `generation`. X11DisplayAdapter::EnumerateTopology() left it
+//     at 0 (only `revision` was ever incremented); it now stamps the same
+//     WorkerGeneration matching Windows' ToCommonDesktopTopology pattern.
 //
 // DELIBERATELY NOT YET DONE, scoped as follow-up: the data-channel wire
 // protocol (pointer/keyboard/clipboard JSON messages the web/mobile client
@@ -55,10 +63,37 @@ using LinuxEmitIceCandidate =
 // push-a-CapturedFrame/emit-an-H264AccessUnit model. SessionCore only ever
 // calls Stop() on it (session_core.cc's StopPlatformResources), so a no-op
 // is exactly correct, not a stub standing in for missing behavior.
+// kReady, not kUnavailable: this is a genuine "not applicable" case, not a
+// missing capability standing in as unavailable. CaptureAdapter/EncoderAdapter
+// describe ONE of platform_interfaces.h's two documented delivery models
+// (push a CapturedFrame, get an H264AccessUnit back) -- macOS's model. This
+// session uses the OTHER one (NativeCaptureAdapter's pooled VideoTrackSource
+// + libwebrtc's own VideoEncoderFactory), the same one Windows uses, where
+// encoding happens inside libwebrtc and is never observable through this
+// interface at all. There is no SEPARATE Linux encoder object whose
+// readiness this could honestly report as anything else; the real
+// admission check for this delivery model is CreatePeerConnectionOrError/
+// CreateVideoTrack actually succeeding in StartTransport, which is exactly
+// where a real failure already surfaces (independent of SessionCore's
+// gate). Reporting kUnavailable here would not describe a missing
+// capability -- it would permanently fail CapabilityReadiness::ViewReady()
+// for a delivery model that was never going to populate this field.
+//
+// NOTE ON WHO ACTUALLY GATES ViewReady()'s encoder field: SessionCore never
+// calls ProbeReadiness() on this class directly (session_core.cc only ever
+// calls Stop() on the encoder adapter, per the comment above). The
+// CapabilityReadiness passed into SessionCore::Start() comes from
+// LinuxPlatformAdapters::MeasureReadiness() (linux_platform_adapters.cc),
+// which mirrors readiness.encoder from readiness.capture rather than
+// consulting this method -- "the encoder rides the capture path and can
+// never outrank it," in that function's own words. This method's kReady
+// return is kept in sync with that conclusion (and stays the honest answer
+// for any future caller that does query this class directly), but it is not
+// itself the mechanism that satisfies the gate.
 class LinuxNoopEncoderAdapter final : public common::EncoderAdapter {
  public:
   common::ReadinessState ProbeReadiness() override {
-    return common::ReadinessState::kUnavailable;
+    return common::ReadinessState::kReady;
   }
   bool Configure(const common::EncoderConfiguration&,
                 common::H264AccessUnitSink) override {

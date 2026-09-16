@@ -54,14 +54,6 @@ class PortalCaptureAdapter final : public common::CaptureAdapter {
   std::string unavailable_reason_;
 };
 
-/** Disclosure has no Linux surface in this slice and stays unavailable. */
-class LinuxDisclosureAdapter final : public common::DisclosureAdapter {
- public:
-  [[nodiscard]] common::ReadinessState ProbeReadiness() override;
-  bool Show(std::uint32_t viewers, std::uint32_t controllers) override;
-  void Hide() noexcept override;
-};
-
 /** Lifecycle readiness observed from the session bus. */
 class LinuxSessionMonitor final : public common::SessionMonitor {
  public:
@@ -99,7 +91,7 @@ class LinuxPlatformAdapters {
   [[nodiscard]] X11InputAdapter& input() const noexcept { return *input_; }
   [[nodiscard]] X11ClipboardAdapter& clipboard() const noexcept { return *clipboard_; }
   [[nodiscard]] X11DisplayAdapter& display() const noexcept { return *display_; }
-  [[nodiscard]] LinuxDisclosureAdapter& disclosure() const noexcept { return *disclosure_; }
+  [[nodiscard]] X11DisclosureAdapter& disclosure() const noexcept { return *disclosure_; }
   [[nodiscard]] LinuxSessionMonitor& session_monitor() const noexcept {
     return *session_monitor_;
   }
@@ -128,7 +120,7 @@ class LinuxPlatformAdapters {
   std::unique_ptr<X11InputAdapter> input_;
   std::unique_ptr<X11ClipboardAdapter> clipboard_;
   std::unique_ptr<X11DisplayAdapter> display_;
-  std::unique_ptr<LinuxDisclosureAdapter> disclosure_;
+  std::unique_ptr<X11DisclosureAdapter> disclosure_;
   std::unique_ptr<LinuxSessionMonitor> session_monitor_;
 };
 

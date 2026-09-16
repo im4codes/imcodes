@@ -42,16 +42,6 @@ bool PortalCaptureAdapter::Start(const common::DisplayTopology&,
 
 void PortalCaptureAdapter::Stop() noexcept {}
 
-// ── LinuxDisclosureAdapter ─────────────────────────────────────────────────
-
-ReadinessState LinuxDisclosureAdapter::ProbeReadiness() {
-  return ReadinessState::kUnavailable;
-}
-
-bool LinuxDisclosureAdapter::Show(std::uint32_t, std::uint32_t) { return false; }
-
-void LinuxDisclosureAdapter::Hide() noexcept {}
-
 // ── LinuxSessionMonitor ────────────────────────────────────────────────────
 
 LinuxSessionMonitor::LinuxSessionMonitor(SessionFacts facts) noexcept
@@ -97,7 +87,7 @@ std::unique_ptr<LinuxPlatformAdapters> LinuxPlatformAdapters::Create(
   adapters->input_ = std::make_unique<X11InputAdapter>(connection);
   adapters->clipboard_ = std::make_unique<X11ClipboardAdapter>(connection);
   adapters->display_ = std::make_unique<X11DisplayAdapter>(connection);
-  adapters->disclosure_ = std::make_unique<LinuxDisclosureAdapter>();
+  adapters->disclosure_ = std::make_unique<X11DisclosureAdapter>(connection);
   adapters->session_monitor_ = std::make_unique<LinuxSessionMonitor>(adapters->facts_);
 
   // Prefer the portal, then fall back — but only to a backend that is really
@@ -130,6 +120,15 @@ CapabilityReadiness LinuxPlatformAdapters::MeasureReadiness() {
   readiness.clipboard = clipboard_->ProbeReadiness();
   readiness.display = display_->ProbeReadiness();
   readiness.disclosure = disclosure_->ProbeReadiness();
+  // Measured once, at connection-open time (facts_), not re-probed live --
+  // if the graphical session genuinely ended the X connection itself would
+  // not have survived to be asked. CapabilityReadiness::ViewReady() checks
+  // this field too; leaving it at its kUnknown default (readiness's own
+  // field-initializer) silently failed that check forever, independent of
+  // capture/input/disclosure all being kReady.
+  readiness.graphical_session = facts_.graphical_session_present
+      ? ReadinessState::kReady
+      : ReadinessState::kUnavailable;
   return readiness;
 }
 
