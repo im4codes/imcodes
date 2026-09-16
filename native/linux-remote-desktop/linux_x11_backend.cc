@@ -86,6 +86,13 @@ unsigned int ButtonNumber(std::string_view button) noexcept {
 // ── X11Connection ──────────────────────────────────────────────────────────
 
 std::shared_ptr<X11Connection> X11Connection::Open(std::string_view display_name) {
+  // X11CaptureAdapter polls on its own background thread while input/
+  // clipboard calls happen on whichever thread the caller drives the session
+  // from, all against this one shared Display*. XInitThreads() makes Xlib's
+  // own locking cover that, and it must run before the FIRST XOpenDisplay
+  // call in the process -- calling it here, unconditionally, is safe: Xlib
+  // documents repeat calls as a no-op after the first.
+  XInitThreads();
   const std::string name(display_name);
   Display* display = XOpenDisplay(name.empty() ? nullptr : name.c_str());
   if (display == nullptr) return nullptr;
@@ -175,17 +182,51 @@ bool X11CaptureAdapter::CaptureOnce(const DisplayTopology& display_topology,
   return true;
 }
 
+namespace {
+// 30fps: comfortably inside what a plain (non-shared-memory) XGetImage poll
+// sustains for a qualification/demo capture, and a sane default frame rate
+// for a screen-share session generally. Real bitrate/frame-rate selection
+// belongs to the quality ladder, once this adapter is driven by a real
+// session rather than a one-shot Start() caller.
+constexpr auto kPollInterval = std::chrono::milliseconds(33);
+}  // namespace
+
 bool X11CaptureAdapter::Start(const DisplayTopology& display_topology,
                               common::CapturedFrameSink sink) {
   if (ProbeReadiness() != ReadinessState::kReady || !sink) return false;
+  if (running_.exchange(true)) return false;  // already started
   CapturedFrame frame;
-  if (!CaptureOnce(display_topology, &frame)) return false;
-  running_ = true;
-  sink(std::move(frame));
+  if (!CaptureOnce(display_topology, &frame)) {
+    running_ = false;
+    return false;
+  }
+  sink(frame);
+  // The first frame is delivered synchronously so a caller (e.g. a
+  // qualification harness) learns immediately whether capture actually
+  // works; the poll thread then keeps the feed alive for as long as a real
+  // session runs.
+  poll_thread_ = std::thread(&X11CaptureAdapter::PollLoop, this,
+                             display_topology, std::move(sink));
   return true;
 }
 
-void X11CaptureAdapter::Stop() noexcept { running_ = false; }
+void X11CaptureAdapter::PollLoop(DisplayTopology display,
+                                 common::CapturedFrameSink sink) {
+  while (running_.load(std::memory_order_relaxed)) {
+    const auto tick_started = std::chrono::steady_clock::now();
+    CapturedFrame frame;
+    if (CaptureOnce(display, &frame)) sink(frame);
+    const auto elapsed = std::chrono::steady_clock::now() - tick_started;
+    if (elapsed < kPollInterval) {
+      std::this_thread::sleep_for(kPollInterval - elapsed);
+    }
+  }
+}
+
+void X11CaptureAdapter::Stop() noexcept {
+  running_ = false;
+  if (poll_thread_.joinable()) poll_thread_.join();
+}
 
 // ── X11InputAdapter ────────────────────────────────────────────────────────
 

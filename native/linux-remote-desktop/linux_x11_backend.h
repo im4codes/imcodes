@@ -10,12 +10,14 @@
 // release semantics for input stay in common::InputLedger, which wraps the
 // InputAdapter below.
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <set>
 #include <string>
 #include <string_view>
+#include <thread>
 
 #include "../remote-desktop-common/platform_interfaces.h"
 #include "../remote-desktop-common/value_types.h"
@@ -65,6 +67,11 @@ class X11CaptureAdapter final : public common::CaptureAdapter {
   ~X11CaptureAdapter() override;
 
   [[nodiscard]] common::ReadinessState ProbeReadiness() override;
+  // Captures the first frame synchronously (so a caller learns immediately
+  // whether capture actually works), then keeps capturing on a background
+  // poll thread at kPollIntervalMs until Stop() -- a single synchronous frame
+  // is enough for a one-shot qualification harness, but not for a real
+  // session, which needs a live video feed for as long as it runs.
   bool Start(const common::DisplayTopology& display,
              common::CapturedFrameSink sink) override;
   void Stop() noexcept override;
@@ -74,8 +81,11 @@ class X11CaptureAdapter final : public common::CaptureAdapter {
                                  common::CapturedFrame* frame);
 
  private:
+  void PollLoop(common::DisplayTopology display, common::CapturedFrameSink sink);
+
   std::shared_ptr<X11Connection> connection_;
-  bool running_ = false;
+  std::atomic<bool> running_{false};
+  std::thread poll_thread_;
 };
 
 /**
