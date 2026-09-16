@@ -102,6 +102,12 @@ struct VideoToolboxEncoderStatistics {
   std::uint64_t ignored_late_outputs = 0;
   std::uint64_t emitted_access_unit_bytes = 0;
   std::uint32_t pending_frames = 0;
+  // Rises fast on a backpressure drop, decays slowly on a frame that keeps
+  // up -- see ApplyEncodeBacklogPressure in quality_ladder.h, which
+  // Reconfigure() feeds this through so a locally struggling encoder pulls
+  // itself down a rung independently of whatever the network estimator
+  // currently authorizes. 0 means the encoder is keeping up with capture.
+  std::uint32_t backlog_pressure = 0;
 };
 
 using VideoToolboxBackendOutputSink =
