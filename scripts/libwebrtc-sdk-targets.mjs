@@ -34,6 +34,19 @@ const WINDOWS_SOURCE_INPUTS = [
   'native/windows-remote-desktop/generate-libwebrtc-sdk-notices.py',
 ];
 
+const LINUX_SOURCE_INPUTS = [
+  'shared/remote-desktop-native-pins.json',
+  'native/linux-remote-desktop/sdk.BUILD.gn',
+  'native/linux-remote-desktop/libwebrtc-sdk.gni',
+  'native/linux-remote-desktop/sdk_anchor.cc',
+  'native/linux-remote-desktop/build-libwebrtc-sdk.sh',
+  // Its own copy, not an import of the Windows generator -- see that file's
+  // header comment for why. Part of the SDK's identity for the same reason
+  // the macOS/Windows generators are part of theirs: a change to how the
+  // notices are derived must produce a different SDK.
+  'native/linux-remote-desktop/generate-libwebrtc-sdk-notices.py',
+];
+
 const MACOS_SOURCE_INPUTS = [
   'shared/remote-desktop-native-pins.json',
   'native/macos-remote-desktop/sdk.BUILD.gn',
@@ -148,6 +161,27 @@ function macosBuildArgs(arch) {
   ].join(' ');
 }
 
+/**
+ * The GN argument string the Linux producer writes into `sdk-build.json`,
+ * compared byte-for-byte at publish time.
+ *
+ * native/linux-remote-desktop/build-libwebrtc-sdk.sh's own GN_ARGS is a bash
+ * shell variable, so (like the macOS producer's own GN_ARGS, and unlike
+ * PowerShell's single-quoted array) the shell consumes the backslashes
+ * before `gn gen` or `sdk-build.json` ever see them -- plain double quotes,
+ * same reasoning as macosBuildArgs above.
+ */
+const LINUX_BUILD_ARGS = [
+  'target_os="linux"',
+  'target_cpu="x64"',
+  'is_debug=false',
+  'is_component_build=false',
+  'rtc_include_tests=true',
+  'rtc_build_examples=false',
+  'rtc_enable_protobuf=false',
+  'use_rtti=false',
+].join(' ');
+
 function defineTarget({
   id,
   os,
@@ -257,6 +291,58 @@ const TARGETS = Object.freeze({
     noticesFormat: 'macos-inventory',
     noticeTargets: MACOS_SDK_LIBWEBRTC_NOTICE_TARGETS,
     releaseTitlePrefix: 'Pinned macOS x64 libwebrtc SDK',
+  }),
+  'linux-x64': defineTarget({
+    id: 'linux-x64',
+    os: 'linux',
+    arch: 'x64',
+    archiveFormat: 'tar.gz',
+    lockRelativePath: 'native/linux-remote-desktop/libwebrtc-sdk.lock.json',
+    sourceInputs: LINUX_SOURCE_INPUTS,
+    requiredTopLevelEntries: [
+      'THIRD_PARTY_NOTICES.webrtc.md',
+      'gen',
+      'include',
+      'lib',
+      'sdk-build.json',
+      'sdk-compile-flags.json',
+      'toolchain',
+    ],
+    requiredFiles: [
+      'lib/libimcodes_linux_libwebrtc_sdk.a',
+      'lib/libimcodes_linux_libwebrtc_test_sdk.a',
+      // libimcodes_linux_libwebrtc_sdk.a does not contain the C++ runtime it
+      // was compiled against: libc++ is linked at the final link step, never
+      // archived, so without this every std::__Cr:: symbol is undefined at a
+      // consumer's link. The build's own libc++.a is a thin archive pointing
+      // into the build directory, so this one is re-archived from the objects
+      // -- same reasoning as the macOS producer's own runtime archive.
+      'lib/libimcodes_linux_libcxx_runtime_sdk.a',
+      // Linked by the components through //native/remote-desktop-common and
+      // contained in neither libwebrtc archive, because the curated overlay
+      // dependency list does not pull it in on its own.
+      'lib/libjsoncpp.a',
+      // The objects were compiled against Chromium's bundled libc++ (the
+      // `std::__Cr` inline namespace), so a consumer's host clang/gcc and
+      // system libc++ mangle every name differently and match nothing in the
+      // archive -- the compiler travels with the objects, exactly as on
+      // macOS and Windows.
+      'toolchain/bin/clang',
+      'toolchain/bin/lld',
+      // clang's own -fuse-ld=lld looks for a binary literally named ld.lld on
+      // Linux; the producer stages a real copy (not a symlink -- this SDK's
+      // own verifier rejects any symlink in the staged tree) so a consumer's
+      // compile recipe never has to know that.
+      'toolchain/bin/ld.lld',
+      'toolchain/bin/llvm-ar',
+      'toolchain/bin/llvm-strip',
+      'include/buildtools/third_party/libc++/__config_site',
+      'include/third_party/libc++/src/include/__config',
+    ],
+    toolchainKeys: ['clang', 'sysroot'],
+    buildArgs: LINUX_BUILD_ARGS,
+    noticesFormat: 'linux-sections',
+    releaseTitlePrefix: 'Pinned Linux x64 libwebrtc SDK',
   }),
 });
 

@@ -262,6 +262,16 @@ stage_tool clang clang
 stage_tool lld lld
 stage_tool llvm-ar llvm-ar
 stage_tool llvm-strip llvm-strip
+# clang's own -fuse-ld=lld looks for a binary literally named ld.lld on
+# Linux (unlike lld-link on Windows or ld64.lld on macOS, both already exact
+# matches for their driver's expected name). Staging it here means a
+# consumer's compile recipe never has to know that and carry its own
+# workaround symlink. A real copy, not a symlink: the SDK verifier rejects any
+# symlink in the staged tree (collectSdkFiles in
+# scripts/libwebrtc-sdk-artifacts.mjs), and an archive/extract round trip is
+# not guaranteed to preserve one anyway.
+cp -L "$ARTIFACT_ROOT/toolchain/bin/lld" "$ARTIFACT_ROOT/toolchain/bin/ld.lld"
+chmod 0755 "$ARTIFACT_ROOT/toolchain/bin/ld.lld"
 
 CLANG_MAJOR="$(basename "$(find "$LLVM_ROOT/lib/clang" -mindepth 1 -maxdepth 1 -type d | head -1)")"
 [[ -n "$CLANG_MAJOR" ]] || { echo 'pinned toolchain has no versioned clang resource directory' >&2; exit 1; }
@@ -280,9 +290,61 @@ done
 SYSROOT_SRC="$WEBRTC_ROOT/build/linux/debian_bullseye_amd64-sysroot"
 [[ -d "$SYSROOT_SRC" ]] || { echo "pinned sysroot is missing: $SYSROOT_SRC" >&2; exit 1; }
 mkdir -p "$ARTIFACT_ROOT/toolchain/sysroot"
-cp -a "$SYSROOT_SRC/." "$ARTIFACT_ROOT/toolchain/sysroot/"
+# -L, not -a: a real Debian sysroot is full of internal symlinks (compat
+# libs, systemd units, ...), and the SDK verifier rejects any symlink
+# anywhere in the staged tree (collectSdkFiles in
+# scripts/libwebrtc-sdk-artifacts.mjs) -- a rule shared with macOS/Windows,
+# neither of which stages a redistributable sysroot at all, so loosening it
+# for Linux would touch code an already-published SDK release depends on.
+# Dereferencing here instead keeps that shared rule untouched and makes the
+# staged sysroot fully self-contained besides.
+cp -rL "$SYSROOT_SRC/." "$ARTIFACT_ROOT/toolchain/sysroot/"
+# The sysroot tarball is Chromium's own sysroot-creator.py output: it
+# installs real .deb packages into a rootfs and ships whatever that leaves
+# behind, not a hand-picked compile surface. -isysroot/--sysroot only ever
+# resolves headers and libraries under bin/sbin/lib/lib64/usr/etc, so the
+# packaging-only trees below are dead weight a compile-time sysroot never
+# needed -- and dead weight that actively breaks staging: `debian/` and
+# `var/lib/dpkg` are dpkg/apt package metadata (not filesystem content),
+# and among the (Python stdlib copies, docs, ...) apt pulled in along with
+# the actual C libraries are enough Debian-packaging-only files to trip the
+# SDK manifest's general corruption checks: systemd's own escaping
+# convention names one unit file with a literal backslash (e.g.
+# system-systemd\x2dcryptsetup.slice, rejected by
+# file.path.includes('\\') in validateLibwebrtcSdkManifest -- a check aimed
+# at a stray Windows-style path separator, not a legitimate POSIX filename
+# character), and Python's own empty __init__.py/py.typed markers trip
+# file.size <= 0 (a zero-byte file cannot be a header any translation unit's
+# declarations depend on, nor a library with any symbols to link against,
+# so the check is correct -- these files were never going to matter).
+# Pruned rather than either manifest rule loosened, for the same "do not
+# touch what an already-published SDK depends on" reason as the symlink
+# dereference above.
+for packaging_tree in debian .stamp var/lib/dpkg var/cache/apt lib/systemd usr/lib/systemd etc/systemd; do
+  rm -rf "${ARTIFACT_ROOT:?}/toolchain/sysroot/${packaging_tree:?}"
+done
+find "$ARTIFACT_ROOT/toolchain/sysroot" -type f -empty -delete
+REMAINING_BACKSLASH="$(find "$ARTIFACT_ROOT/toolchain/sysroot" -name '*\\*' | head -1)"
+[[ -z "$REMAINING_BACKSLASH" ]] \
+  || { echo "staged sysroot still has a backslash filename: $REMAINING_BACKSLASH" >&2; exit 1; }
 
 find "$ARTIFACT_ROOT" -type f ! -path "$ARTIFACT_ROOT/toolchain/bin/*" -exec chmod 0644 {} +
+
+# --- notices --------------------------------------------------------------
+# Fail-closed third-party notices for exactly what the two archives above
+# link, generated from the SAME pinned checkout and build directory this SDK
+# was built from -- see generate-libwebrtc-sdk-notices.py's own comment for
+# why this is its own file rather than an import of the Windows generator.
+NOTICES_STAGING="$(mktemp -d)"
+trap 'rm -rf "$NOTICES_STAGING"' EXIT
+python3 "$SCRIPT_DIR/generate-libwebrtc-sdk-notices.py" \
+  --webrtc-root "$WEBRTC_ROOT" \
+  --build-directory "$BUILD_DIR" \
+  --target "//$OVERLAY_RELATIVE:imcodes_linux_libwebrtc_sdk" \
+  --target "//$OVERLAY_RELATIVE:imcodes_linux_libwebrtc_test_sdk" \
+  --output-directory "$NOTICES_STAGING"
+[[ -s "$NOTICES_STAGING/LICENSE.md" ]] || { echo 'libwebrtc SDK notices were not produced' >&2; exit 1; }
+install -m 0644 "$NOTICES_STAGING/LICENSE.md" "$ARTIFACT_ROOT/THIRD_PARTY_NOTICES.webrtc.md"
 
 # --- consumer compile configuration ---------------------------------------
 # The exact flags a translation unit must be compiled with to link against
@@ -383,12 +445,57 @@ chmod 0644 "$ARTIFACT_ROOT/sdk-compile-flags.json"
 [[ -s "$ARTIFACT_ROOT/sdk-compile-flags.json" ]] \
   || { echo 'sdk-compile-flags.json was not produced' >&2; exit 1; }
 
-cat > "$ARTIFACT_ROOT/sdk-build.json" <<EOF
-{
-  "libwebrtcRevision": "$REVISION",
-  "targetCpu": "$TARGET_CPU",
-  "targetOs": "linux"
-}
-EOF
+# toolchain identity for the manifest below: read from the anchor's own
+# defines rather than restated, same "the ninja file is the one source of
+# truth" reasoning as the compile flags above.
+read -r TOOLCHAIN_CLANG TOOLCHAIN_SYSROOT <<<"$(python3 - "$ANCHOR_NINJA" <<'TOOLCHAIN'
+import shlex, sys
+
+with open(sys.argv[1], encoding='utf-8') as handle:
+    defines = next(line for line in handle if line.startswith('defines = '))
+tokens = shlex.split(defines[len('defines = '):].strip())
+values = {}
+for token in tokens:
+    if token.startswith('-DCR_CLANG_REVISION='):
+        values['clang'] = token[len('-DCR_CLANG_REVISION='):].strip('"')
+    elif token.startswith('-DCR_SYSROOT_KEY='):
+        values['sysroot'] = token[len('-DCR_SYSROOT_KEY='):]
+for key in ('clang', 'sysroot'):
+    if key not in values:
+        raise SystemExit(f'anchor ninja defines have no {key} marker')
+print(values['clang'], values['sysroot'])
+TOOLCHAIN
+)"
+[[ -n "$TOOLCHAIN_CLANG" && -n "$TOOLCHAIN_SYSROOT" ]] \
+  || { echo 'could not read toolchain identity from the anchor ninja file' >&2; exit 1; }
+
+# The exact GN args this SDK was built with, byte-for-byte what reached `gn`
+# (bash already consumed the backslashes in GN_ARGS above, so this is plain
+# double quotes -- see the "quoting differs per producer" comment in
+# scripts/libwebrtc-sdk-targets.mjs, which compares this string verbatim).
+# Written via json.dump, not a shell heredoc: GN_ARGS itself contains double
+# quotes (target_os="linux"), which a plain `"$GN_ARGS"` heredoc interpolation
+# drops into the JSON string unescaped and produces invalid JSON.
+TARGET_CPU="$TARGET_CPU" REVISION="$REVISION" DEPOT_TOOLS_REVISION="$DEPOT_TOOLS_REVISION" \
+GN_ARGS="$GN_ARGS" TOOLCHAIN_CLANG="$TOOLCHAIN_CLANG" TOOLCHAIN_SYSROOT="$TOOLCHAIN_SYSROOT" \
+python3 - "$ARTIFACT_ROOT/sdk-build.json" <<'BUILD_JSON'
+import json, os, sys
+
+with open(sys.argv[1], 'w', encoding='utf-8') as handle:
+    json.dump({
+        'manifestVersion': 1,
+        'os': 'linux',
+        'arch': os.environ['TARGET_CPU'],
+        'libwebrtcRevision': os.environ['REVISION'],
+        'depotToolsRevision': os.environ['DEPOT_TOOLS_REVISION'],
+        'buildArgs': os.environ['GN_ARGS'],
+        'toolchain': {
+            'clang': os.environ['TOOLCHAIN_CLANG'],
+            'sysroot': os.environ['TOOLCHAIN_SYSROOT'],
+        },
+    }, handle, indent=2)
+    handle.write('\n')
+BUILD_JSON
+chmod 0644 "$ARTIFACT_ROOT/sdk-build.json"
 
 echo "built the Linux libwebrtc SDK for $TARGET_CPU at $ARTIFACT_ROOT"
