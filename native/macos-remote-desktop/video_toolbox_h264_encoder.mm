@@ -22,11 +22,6 @@ constexpr std::uint32_t kMaximumDimension = 16'384;
 constexpr std::uint32_t kMaximumFrameRate = 120;
 constexpr std::uint32_t kMinimumBitrateBps = 100'000;
 constexpr std::uint32_t kMaximumBitrateBps = 100'000'000;
-// ApplyEncodeBacklogPressure's own internal cap (quality_ladder.cc) makes
-// anything above it equivalent, so this just needs to be at least that high
-// to avoid clamping the counter's climb before the pressure function would
-// have flattened out anyway.
-constexpr std::uint32_t kMaxTrackedBacklogPressure = 24;
 constexpr std::array<std::byte, 4> kAnnexBStartCode = {
     std::byte{0}, std::byte{0}, std::byte{0}, std::byte{1}};
 
@@ -912,26 +907,14 @@ struct DeliveryState {
     }
     if (pending.size() >= max_pending_frames) {
       ++statistics.dropped_backpressure_frames;
-      // Rises twice as fast as it decays: a genuinely struggling encoder
-      // that drops most frames climbs quickly, while a handful of isolated
-      // blips among mostly-successful submissions decays back to 0 rather
-      // than lingering as a false "still behind" signal.
-      statistics.backlog_pressure =
-          std::min(statistics.backlog_pressure + 2, kMaxTrackedBacklogPressure);
       return std::nullopt;
     }
     const std::uint64_t id = next_submission_id++;
     pending.insert(id);
     statistics.pending_frames = static_cast<std::uint32_t>(pending.size());
-    if (statistics.backlog_pressure > 0) --statistics.backlog_pressure;
     const bool force = request_keyframe || force_next_keyframe;
     force_next_keyframe = false;
     return std::pair{id, force};
-  }
-
-  std::uint32_t BacklogPressure() const {
-    std::lock_guard lock(mutex);
-    return statistics.backlog_pressure;
   }
 
   void Reject(std::uint64_t id, VideoToolboxEncoderError error) {
@@ -1279,32 +1262,14 @@ class VideoToolboxH264Encoder::Impl {
                      "common quality selection is invalid"};
       return false;
     }
-    // Congestion control chose `selection` from what the NETWORK can carry;
-    // it has no visibility into whether THIS encoder can actually keep up
-    // producing it. Discount its bitrate by any locally observed backlog and
-    // re-run the same ladder with `selection`'s own dimensions as the
-    // ceiling, so a struggling encoder can land on a smaller/slower rung
-    // than the network alone would have chosen -- never a larger one.
-    imcodes::rd::QualitySelection effective = selection;
-    const std::uint32_t backlog_pressure = state_->BacklogPressure();
-    if (backlog_pressure > 0) {
-      const std::uint32_t pressured_bitrate =
-          imcodes::rd::ApplyEncodeBacklogPressure(selection.bitrate_bps,
-                                                  backlog_pressure);
-      if (pressured_bitrate < selection.bitrate_bps) {
-        effective = imcodes::rd::SelectQuality(pressured_bitrate,
-                                               selection.width,
-                                               selection.height);
-      }
-    }
     common::EncoderConfiguration next{
-        .encoded_pixels = {static_cast<std::uint32_t>(effective.width),
-                           static_cast<std::uint32_t>(effective.height)},
-        .frame_rate = static_cast<std::uint32_t>(effective.fps),
+        .encoded_pixels = {static_cast<std::uint32_t>(selection.width),
+                           static_cast<std::uint32_t>(selection.height)},
+        .frame_rate = static_cast<std::uint32_t>(selection.fps),
         // Congestion control reports whatever it currently estimates, which
         // on a fresh or constrained path is far below what VideoToolbox
         // accepts. Clamp rather than refuse.
-        .bitrate_bps = std::clamp(effective.bitrate_bps, kMinimumBitrateBps,
+        .bitrate_bps = std::clamp(selection.bitrate_bps, kMinimumBitrateBps,
                                   kMaximumBitrateBps),
         .profile = profile,
     };
