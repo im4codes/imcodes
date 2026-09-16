@@ -378,10 +378,11 @@ export function RemoteDesktopPanel({
 }: RemoteDesktopPanelProps) {
   const { t } = useTranslation();
   const [snapshot, setSnapshot] = useState<RemoteDesktopSnapshot>(INITIAL_SNAPSHOT);
-  // Actual size by default: a phone/tablet touch session is read at native
-  // pixels far more often than it needs the whole remote desktop crammed to
-  // fit, and "fit" is one tap away in the toolbar for whoever wants it.
-  const [viewScale, setViewScale] = useState<ViewScale>('actual');
+  // Fit by default: the whole remote screen scaled to the visible window is
+  // what makes a session usable at a glance, especially on a phone where
+  // "actual size" at native desktop pixels shows only a small cropped
+  // fraction of the screen. "Actual size" stays one toolbar tap away.
+  const [viewScale, setViewScale] = useState<ViewScale>('fit');
   const [mobileInputMode, setMobileInputMode] = useState<MobileInputMode>('touch');
   const [viewport, setViewport] = useState<RemoteDesktopViewport>(INITIAL_REMOTE_DESKTOP_VIEWPORT);
   const [virtualMouse, setVirtualMouse] = useState<TouchPoint>({ x: 0, y: 0 });

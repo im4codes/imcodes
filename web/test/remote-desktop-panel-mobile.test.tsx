@@ -1767,11 +1767,11 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     ]);
   });
 
-  it('defaults touch-mode display to actual size instead of scaled-to-fit', async () => {
+  it('defaults touch-mode display to fit-to-window instead of actual size', async () => {
     const { getByRole } = await renderPanel();
-    expect(getByRole('button', { name: 'remote_desktop.actual_size' }).getAttribute('aria-pressed'))
-      .toBe('true');
     expect(getByRole('button', { name: 'remote_desktop.fit' }).getAttribute('aria-pressed'))
+      .toBe('true');
+    expect(getByRole('button', { name: 'remote_desktop.actual_size' }).getAttribute('aria-pressed'))
       .toBe('false');
   });
 
