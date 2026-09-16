@@ -3,6 +3,7 @@ import { cwdPrefix } from './base.js';
 import { claudeNativeAgentFenceFlag } from '../native-agent-fence.js';
 import type { AgentStatus } from '../detect.js';
 import { detectStatus } from '../detect.js';
+import { resolveClaudeCodePathForTmux } from '../transport-paths.js';
 
 const OVERLAY_PATTERNS = [
   /Allow|Deny/,
@@ -44,20 +45,29 @@ export class ClaudeCodeDriver implements AgentDriver {
   buildLaunchCommand(_sessionName: string, opts?: LaunchOptions): string {
     const cwd = cwdPrefix(opts?.cwd);
     const fence = opts?.nativeAgentsFenced ? claudeNativeAgentFenceFlag() : '';
+    // Resolved to an absolute path when the daemon's own environment (which
+    // tmux inherits when it spawns the session's shell) has a sparse PATH
+    // that would otherwise leave a bare `claude` unresolvable — falls
+    // through to the bare name unchanged when resolution finds nothing, so
+    // an interactive shell that already resolves `claude` fine sees no
+    // change. See resolveClaudeCodePathForTmux's doc comment for why this
+    // is deliberately narrower than the SDK-transport resolver.
+    const bin = resolveClaudeCodePathForTmux();
     if (opts?.ccSessionId) {
-      return `${cwd}claude --dangerously-skip-permissions${fence} --session-id ${opts.ccSessionId}`;
+      return `${cwd}${bin} --dangerously-skip-permissions${fence} --session-id ${opts.ccSessionId}`;
     }
     if (opts?.fresh) {
-      return `${cwd}claude --dangerously-skip-permissions${fence}`;
+      return `${cwd}${bin} --dangerously-skip-permissions${fence}`;
     }
-    return `${cwd}claude --dangerously-skip-permissions${fence} -c || claude --dangerously-skip-permissions${fence}`;
+    return `${cwd}${bin} --dangerously-skip-permissions${fence} -c || ${bin} --dangerously-skip-permissions${fence}`;
   }
 
   buildResumeCommand(_sessionName: string, opts?: LaunchOptions): string {
     const cwd = cwdPrefix(opts?.cwd);
     const fence = opts?.nativeAgentsFenced ? claudeNativeAgentFenceFlag() : '';
     if (opts?.ccSessionId) {
-      return `${cwd}claude --dangerously-skip-permissions${fence} --resume ${opts.ccSessionId}`;
+      const bin = resolveClaudeCodePathForTmux();
+      return `${cwd}${bin} --dangerously-skip-permissions${fence} --resume ${opts.ccSessionId}`;
     }
     return this.buildLaunchCommand(_sessionName, opts);
   }

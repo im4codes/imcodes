@@ -116,6 +116,173 @@ function getUnixClaudeInstallCandidates(): string[] {
   ]);
 }
 
+/** Binary-specific extras beyond the generic package/version-manager
+ *  directories every CLI might land in — e.g. an installer that also drops a
+ *  copy under a tool-named XDG-ish path (`~/.claude/local/claude`), which
+ *  isn't a location any OTHER CLI would plausibly use. */
+export interface CliInstallCandidateOptions {
+  /** Extra HOME-relative paths, already including the binary name, e.g.
+   *  `['.claude/local/claude']`. */
+  extraHomeRelative?: string[];
+  /** Extra absolute paths, already including the binary name. */
+  extraAbsolute?: string[];
+}
+
+/** Common per-user/system CLI install locations on macOS/Linux, checked when
+ *  the daemon's (systemd/launchd) PATH is too sparse to contain `binaryName`
+ *  — a daemon started by systemd/launchd inherits none of a login shell's rc
+ *  files, so PATH alone cannot be trusted to contain any of these. Shared
+ *  across every agent CLI we spawn (claude, codex, ...): the package/version
+ *  manager directory shape is identical for all of them, only the binary
+ *  name (and the rare tool-specific extra location, see
+ *  `CliInstallCandidateOptions`) changes. */
+export function getUnixCliInstallCandidates(binaryName: string, options: CliInstallCandidateOptions = {}): string[] {
+  const home = process.env.HOME;
+  return uniqueNonEmpty([
+    home ? path.join(home, '.local', 'bin', binaryName) : undefined,
+    home ? path.join(home, '.npm-global', 'bin', binaryName) : undefined,
+    home ? path.join(home, 'bin', binaryName) : undefined, // XDG user bin
+    home ? path.join(home, '.bun', 'bin', binaryName) : undefined,
+    home ? path.join(home, '.cargo', 'bin', binaryName) : undefined,
+    home ? path.join(home, '.yarn', 'bin', binaryName) : undefined,
+    home ? path.join(home, '.asdf', 'shims', binaryName) : undefined,
+    // Native-installer-style XDG data variant. Deliberately shallow: this
+    // does not enumerate version dirs.
+    home ? path.join(home, '.local', 'share', binaryName, binaryName) : undefined,
+    ...(home ? (options.extraHomeRelative ?? []).map((rel) => path.join(home, rel)) : []),
+    path.join('/usr/local/bin', binaryName),
+    path.join('/opt/homebrew/bin', binaryName),
+    path.join('/opt', binaryName, 'bin', binaryName),
+    path.join('/snap/bin', binaryName),
+    path.join('/var/lib/snapd/snap/bin', binaryName),
+    path.join('/nix/var/nix/profiles/default/bin', binaryName),
+    ...(options.extraAbsolute ?? []),
+  ]);
+}
+
+/** Last-resort fallback: walk PATH directories looking for an executable
+ *  file named `binaryName`, for hosts where the CLI lives somewhere
+ *  PATH-manageable (a custom install dir, a version-manager shim directory
+ *  not covered above) that isn't in the fixed per-user candidate list.
+ *  Unix-only — Windows has its own PATH+PATHEXT walker
+ *  (`resolveBinaryOnWindows`) because it also needs extension matching. */
+export function walkPathForBinary(binaryName: string, pathEnv = process.env.PATH): string | undefined {
+  if (!pathEnv) return undefined;
+  for (const dir of pathEnv.split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, binaryName);
+    if (existsSync(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+/** Options for {@link resolveCliPathForSdk}; every field is optional so a
+ *  CLI with no bundled binary and no Windows-specific install dirs (e.g.
+ *  codex, today) can still get candidate-list + PATH-walk + env-override
+ *  hardening for free. */
+export interface ResolveCliPathOptions {
+  /** Env var checked before any resolution when `name` is still the
+   *  default, e.g. `'IMCODES_CODEX_BINARY_PATH'`. Omit to skip this tier. */
+  envOverrideVar?: string;
+  /** Passed through to {@link getUnixCliInstallCandidates}. */
+  candidateOptions?: CliInstallCandidateOptions;
+  /** Locate a binary bundled inside our own dependency tree, checked before
+   *  the fixed per-user candidates (mirrors `resolveBundledClaudeBinary`). */
+  resolveBundled?: () => string | undefined;
+  /** Windows-specific install directories for this binary, beyond the
+   *  generic PATH+PATHEXT walk `resolveBinaryOnWindows` already does. */
+  windowsCandidates?: (name: string) => string[];
+}
+
+/** Generic form of {@link resolveClaudeCodePathForSdk} for any CLI binary we
+ *  spawn programmatically (no shell) from a systemd/launchd-started daemon.
+ *  Precedence, highest first: explicit caller-provided name/path → env
+ *  override (default name only, both platforms) → Windows-specific dirs →
+ *  bundled binary → fixed per-user/system candidates → PATH walk → bare
+ *  name. See `resolveClaudeCodePathForSdk`'s doc comment for the full
+ *  rationale; this only generalizes the *mechanism*, not the specific
+ *  per-binary knowledge (bundled-binary lookup, Windows install dirs, extra
+ *  candidate paths) — that comes from `options`. */
+export function resolveCliPathForSdk(binaryName: string, name = binaryName, options: ResolveCliPathOptions = {}): string {
+  if (name === binaryName && options.envOverrideVar) {
+    const override = process.env[options.envOverrideVar];
+    if (override && existsSync(override)) return override;
+  }
+  if (process.platform === 'win32') {
+    const resolved = resolveBinaryWithWindowsFallbacks(name, options.windowsCandidates?.(name) ?? []);
+    if (/\.(cmd|bat)$/i.test(resolved)) {
+      return parseNpmCmdShim(resolved) ?? resolved;
+    }
+    return resolved;
+  }
+  if (name !== binaryName) return name;
+  const bundled = options.resolveBundled?.();
+  if (bundled) return bundled;
+  for (const candidate of getUnixCliInstallCandidates(binaryName, options.candidateOptions)) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return walkPathForBinary(name) ?? name;
+}
+
+/** Env var an operator can set (e.g. a systemd unit's `Environment=`) to pin
+ *  the codex binary path, for the same reason `IMCODES_CLAUDE_BINARY_PATH`
+ *  exists — a daemon-wide override that doesn't require touching every
+ *  session's config. Per-binary (not a single shared "IMCODES_AGENT_..."
+ *  variable) because a deployment may need to pin different binaries to
+ *  different paths at once; a single shared variable could only ever name
+ *  one of them. */
+export const IMCODES_CODEX_BINARY_PATH_ENV = 'IMCODES_CODEX_BINARY_PATH';
+
+/** Resolve a `codex` binary path for programmatic (no-shell) spawning —
+ *  see `codex-sdk.ts`'s `connect()`/`startAppServer()`, which previously
+ *  passed a bare `'codex'` straight to `child_process.spawn()` and hit the
+ *  exact "spawn ENOENT" failure `resolveClaudeCodePathForSdk` already fixed
+ *  for claude on a sparse-PATH systemd/launchd daemon.
+ *
+ *  Unlike claude, this does NOT attempt to resolve a bundled binary out of
+ *  `@openai/codex-<platform>-<arch>`: that package nests the real binary
+ *  under a Rust target-triple directory (e.g.
+ *  `vendor/aarch64-apple-darwin/bin/codex`) whose naming this repo can only
+ *  verify on the one platform it happens to run tests on. Guessing the
+ *  triple for every platform risked shipping a silently wrong path, which is
+ *  worse than the pre-existing behavior; the candidate-list + PATH-walk
+ *  tiers below are the actual fix for the sparse-PATH bug and carry no such
+ *  risk. Revisit if/when the triple mapping is verified for every supported
+ *  platform. */
+export function resolveCodexPathForSdk(name = 'codex'): string {
+  return resolveCliPathForSdk('codex', name, { envOverrideVar: IMCODES_CODEX_BINARY_PATH_ENV });
+}
+
+/** Resolve `claude` to an absolute path suitable for embedding directly into
+ *  a shell command string (see `ClaudeCodeDriver.buildLaunchCommand`), as
+ *  opposed to `resolveClaudeCodePathForSdk`'s target of a no-shell
+ *  `child_process.spawn` call.
+ *
+ *  Deliberately narrower than `resolveClaudeCodePathForSdk`:
+ *  - No bundled-binary preference: an interactive session should keep
+ *    running whatever `claude` the user actually has installed (their own
+ *    version, any wrapper/shim/version-manager they rely on), not silently
+ *    switch to the version pinned inside our own SDK dependency just
+ *    because it happens to exist.
+ *  - Windows/ConPTY: returns the bare name unchanged. A resolved Windows
+ *    path is often a `.cmd` shim or an extracted `(node, script.js)` pair
+ *    (see `resolveExecutableForSpawn`) — neither embeds into a plain
+ *    command string the same simple way an absolute Unix binary path does,
+ *    and the sparse-PATH bug this hardens against was systemd/launchd-
+ *    specific (Unix). A typed `claude` command still resolves through the
+ *    interactive shell's own PATH here, exactly as before this change.
+ *
+ *  Falls through to the bare name whenever nothing resolves, which
+ *  reproduces the exact pre-hardening command string — an existing user
+ *  whose interactive shell already resolves `claude` fine sees no change. */
+export function resolveClaudeCodePathForTmux(name = 'claude'): string {
+  if (process.platform === 'win32') return name;
+  return resolveCliPathForSdk('claude', name, {
+    envOverrideVar: 'IMCODES_CLAUDE_BINARY_PATH',
+    candidateOptions: { extraHomeRelative: [path.join('.claude', 'local', 'claude')] },
+  });
+}
+
 /** Locate the native `claude` binary that ships inside our own
  *  `@anthropic-ai/claude-agent-sdk` dependency. The SDK publishes the binary in
  *  a platform-specific sibling package (e.g. `@anthropic-ai/claude-agent-sdk-linux-x64`),

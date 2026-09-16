@@ -1,4 +1,6 @@
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
+import * as fs from 'node:fs';
+import path from 'node:path';
 import { ClaudeCodeDriver } from '../../../src/agent/drivers/claude-code.js';
 import { CodexDriver } from '../../../src/agent/drivers/codex.js';
 import { OpenCodeDriver } from '../../../src/agent/drivers/opencode.js';
@@ -32,6 +34,81 @@ describe('ClaudeCodeDriver', () => {
   it('buildResumeCommand includes -c flag', () => {
     const cmd = driver.buildResumeCommand('deck_proj_brain');
     expect(cmd).toContain('-c');
+  });
+
+  // Sparse-PATH hardening: the daemon's own environment (which tmux inherits
+  // when it spawns the session's shell) may be too sparse to resolve a bare
+  // `claude`, exactly like the "spawn claude ENOENT" bug already fixed for
+  // the SDK-transport path. buildLaunchCommand/buildResumeCommand now embed
+  // an absolute path when resolution finds one.
+  describe('sparse-PATH binary resolution', () => {
+    let origHome: string | undefined;
+    let origPath: string | undefined;
+    let origClaudeEnv: string | undefined;
+    let origPlatform: string;
+    let tmpDir: string;
+
+    beforeEach(() => {
+      origHome = process.env.HOME;
+      origPath = process.env.PATH;
+      origClaudeEnv = process.env.IMCODES_CLAUDE_BINARY_PATH;
+      origPlatform = process.platform;
+      delete process.env.IMCODES_CLAUDE_BINARY_PATH;
+      // No fixed candidate covers this HOME, so resolution must fall through
+      // to the PATH walk to find anything at all.
+      process.env.HOME = '/tmp/imcodes-fake-home-drivers-test-xyz';
+      tmpDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'claude-driver-path-test-'));
+    });
+    afterEach(() => {
+      if (origHome === undefined) delete process.env.HOME; else process.env.HOME = origHome;
+      if (origPath === undefined) delete process.env.PATH; else process.env.PATH = origPath;
+      if (origClaudeEnv === undefined) delete process.env.IMCODES_CLAUDE_BINARY_PATH; else process.env.IMCODES_CLAUDE_BINARY_PATH = origClaudeEnv;
+      Object.defineProperty(process, 'platform', { value: origPlatform });
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it('buildLaunchCommand embeds the absolute path when PATH-walk finds claude, not the bare name', () => {
+      if (process.platform === 'win32') return;
+      const claudePath = path.join(tmpDir, 'claude');
+      fs.writeFileSync(claudePath, '#!/bin/sh\necho fake claude\n');
+      process.env.PATH = tmpDir;
+
+      const cmd = driver.buildLaunchCommand('deck_proj_brain');
+      expect(cmd).toContain(claudePath);
+      // Every occurrence of the binary in the retry-fallback command is the
+      // resolved path, not a lingering bare 'claude' from only some of them
+      // having been substituted.
+      expect(cmd.split(claudePath).length - 1).toBe(2);
+    });
+
+    it('buildLaunchCommand(fresh) and buildResumeCommand(ccSessionId) also embed the resolved path', () => {
+      if (process.platform === 'win32') return;
+      const claudePath = path.join(tmpDir, 'claude');
+      fs.writeFileSync(claudePath, '#!/bin/sh\necho fake claude\n');
+      process.env.PATH = tmpDir;
+
+      expect(driver.buildLaunchCommand('deck_proj_brain', { fresh: true })).toContain(claudePath);
+      expect(driver.buildLaunchCommand('deck_proj_brain', { ccSessionId: 'abc' })).toContain(claudePath);
+      expect(driver.buildResumeCommand('deck_proj_brain', { ccSessionId: 'abc' })).toContain(claudePath);
+    });
+
+    it('falls back to the bare name (unchanged pre-hardening behavior) when nothing resolves', () => {
+      if (process.platform === 'win32') return;
+      process.env.PATH = '/does/not/exist';
+      const cmd = driver.buildLaunchCommand('deck_proj_brain');
+      expect(cmd).toContain('claude --dangerously-skip-permissions');
+    });
+
+    it('does not touch the command string on win32 — ConPTY embedding is out of scope', () => {
+      const claudePath = path.join(tmpDir, 'claude');
+      fs.writeFileSync(claudePath, '#!/bin/sh\necho fake claude\n');
+      process.env.PATH = tmpDir;
+      Object.defineProperty(process, 'platform', { value: 'win32' });
+
+      const cmd = driver.buildLaunchCommand('deck_proj_brain');
+      expect(cmd).not.toContain(claudePath);
+      expect(cmd).toContain('claude --dangerously-skip-permissions');
+    });
   });
 
   it('isOverlay detects permission dialog', () => {

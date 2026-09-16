@@ -8,6 +8,12 @@ import {
   parseNpmCmdShim,
   resolveExecutableForSpawn,
   resolveClaudeCodePathForSdk,
+  getUnixCliInstallCandidates,
+  walkPathForBinary,
+  resolveCliPathForSdk,
+  resolveCodexPathForSdk,
+  IMCODES_CODEX_BINARY_PATH_ENV,
+  resolveClaudeCodePathForTmux,
 } from '../../src/agent/transport-paths.js';
 
 describe('normalizeTransportCwd', () => {
@@ -54,6 +60,273 @@ describe('resolveClaudeCodePathForSdk (macOS/Linux bundled-binary resolution)', 
     if (process.platform === 'win32') return;
     expect(resolveClaudeCodePathForSdk('/custom/bin/claude')).toBe('/custom/bin/claude');
     expect(resolveClaudeCodePathForSdk('claude-canary')).toBe('claude-canary');
+  });
+});
+
+describe('getUnixCliInstallCandidates (generalized, any CLI binary)', () => {
+  let origHome: string | undefined;
+  const FAKE_HOME = '/tmp/imcodes-fake-home-for-tests';
+
+  beforeEach(() => {
+    origHome = process.env.HOME;
+    process.env.HOME = FAKE_HOME;
+  });
+  afterEach(() => {
+    if (origHome === undefined) delete process.env.HOME; else process.env.HOME = origHome;
+  });
+
+  it.each([
+    ['~/.local/bin', path.join(FAKE_HOME, '.local', 'bin', 'codex')],
+    ['~/.npm-global/bin', path.join(FAKE_HOME, '.npm-global', 'bin', 'codex')],
+    ['~/bin (XDG user bin)', path.join(FAKE_HOME, 'bin', 'codex')],
+    ['~/.bun/bin (Bun)', path.join(FAKE_HOME, '.bun', 'bin', 'codex')],
+    ['~/.cargo/bin (rustup/cargo)', path.join(FAKE_HOME, '.cargo', 'bin', 'codex')],
+    ['~/.yarn/bin (Yarn)', path.join(FAKE_HOME, '.yarn', 'bin', 'codex')],
+    ['~/.asdf/shims (asdf)', path.join(FAKE_HOME, '.asdf', 'shims', 'codex')],
+    ['~/.local/share/<bin>/<bin>', path.join(FAKE_HOME, '.local', 'share', 'codex', 'codex')],
+    ['/usr/local/bin', path.join('/usr/local/bin', 'codex')],
+    ['/opt/homebrew/bin', path.join('/opt/homebrew/bin', 'codex')],
+    ['/opt/<bin>/bin/<bin>', path.join('/opt', 'codex', 'bin', 'codex')],
+    ['/snap/bin', path.join('/snap/bin', 'codex')],
+    ['/var/lib/snapd/snap/bin', path.join('/var/lib/snapd/snap/bin', 'codex')],
+    ['/nix/var/nix/profiles/default/bin', path.join('/nix/var/nix/profiles/default/bin', 'codex')],
+  ])('includes the %s candidate for an arbitrary binary name', (_label, expected) => {
+    expect(getUnixCliInstallCandidates('codex')).toContain(expected);
+  });
+
+  it('substitutes the binary name consistently across every candidate (no hardcoded "claude")', () => {
+    const candidates = getUnixCliInstallCandidates('opencode');
+    expect(candidates.length).toBeGreaterThan(0);
+    for (const candidate of candidates) {
+      expect(path.basename(candidate)).toBe('opencode');
+      expect(candidate).not.toContain('claude');
+    }
+  });
+
+  it('appends extraHomeRelative and extraAbsolute candidates when provided', () => {
+    const candidates = getUnixCliInstallCandidates('claude', {
+      extraHomeRelative: [path.join('.claude', 'local', 'claude')],
+      extraAbsolute: ['/custom/claude-root/claude'],
+    });
+    expect(candidates).toContain(path.join(FAKE_HOME, '.claude', 'local', 'claude'));
+    expect(candidates).toContain('/custom/claude-root/claude');
+  });
+
+  it('omits every HOME-relative candidate when HOME is unset, without throwing', () => {
+    delete process.env.HOME;
+    const candidates = getUnixCliInstallCandidates('codex');
+    expect(candidates.every((c) => !c.includes(FAKE_HOME))).toBe(true);
+    expect(candidates).toContain(path.join('/usr/local/bin', 'codex'));
+  });
+});
+
+describe('walkPathForBinary', () => {
+  let tmpDir: string;
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'agent-path-walk-test-'));
+  });
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('finds an executable on a PATH directory the fixed candidate list does not cover', () => {
+    const binPath = path.join(tmpDir, 'codex');
+    fs.writeFileSync(binPath, '#!/bin/sh\necho fake codex\n');
+    const fakePath = ['/does/not/exist', tmpDir, '/also/does/not/exist'].join(path.delimiter);
+    expect(walkPathForBinary('codex', fakePath)).toBe(binPath);
+  });
+
+  it('returns undefined when no PATH directory has the binary', () => {
+    const fakePath = ['/does/not/exist', '/also/does/not/exist'].join(path.delimiter);
+    expect(walkPathForBinary('codex', fakePath)).toBeUndefined();
+  });
+
+  it('returns undefined for an explicitly empty PATH instead of throwing', () => {
+    expect(walkPathForBinary('codex', '')).toBeUndefined();
+  });
+
+  it('skips empty PATH segments (e.g. a leading/trailing/doubled delimiter)', () => {
+    const binPath = path.join(tmpDir, 'codex');
+    fs.writeFileSync(binPath, '#!/bin/sh\necho fake codex\n');
+    const fakePath = ['', tmpDir, ''].join(path.delimiter);
+    expect(walkPathForBinary('codex', fakePath)).toBe(binPath);
+  });
+});
+
+describe('resolveCliPathForSdk (generic resolver)', () => {
+  let origHome: string | undefined;
+  let tmpDir: string;
+
+  beforeEach(() => {
+    origHome = process.env.HOME;
+    tmpDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'resolve-cli-path-test-'));
+  });
+  afterEach(() => {
+    if (origHome === undefined) delete process.env.HOME; else process.env.HOME = origHome;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('honours an explicit caller-provided name/path unchanged, without touching the env override', () => {
+    if (process.platform === 'win32') return;
+    const overridePath = path.join(tmpDir, 'widget');
+    fs.writeFileSync(overridePath, '#!/bin/sh\n');
+    const origEnv = process.env.IMCODES_WIDGET_BINARY_PATH;
+    process.env.IMCODES_WIDGET_BINARY_PATH = overridePath;
+    try {
+      expect(resolveCliPathForSdk('widget', '/explicit/widget-canary', { envOverrideVar: 'IMCODES_WIDGET_BINARY_PATH' }))
+        .toBe('/explicit/widget-canary');
+    } finally {
+      if (origEnv === undefined) delete process.env.IMCODES_WIDGET_BINARY_PATH; else process.env.IMCODES_WIDGET_BINARY_PATH = origEnv;
+    }
+  });
+
+  it('applies the env override for the default name only, before candidates/PATH-walk', () => {
+    if (process.platform === 'win32') return;
+    const overridePath = path.join(tmpDir, 'widget');
+    fs.writeFileSync(overridePath, '#!/bin/sh\n');
+    process.env.HOME = '/tmp/imcodes-nonexistent-home-xyz';
+    const origEnv = process.env.IMCODES_WIDGET_BINARY_PATH;
+    process.env.IMCODES_WIDGET_BINARY_PATH = overridePath;
+    try {
+      expect(resolveCliPathForSdk('widget', 'widget', { envOverrideVar: 'IMCODES_WIDGET_BINARY_PATH' })).toBe(overridePath);
+    } finally {
+      if (origEnv === undefined) delete process.env.IMCODES_WIDGET_BINARY_PATH; else process.env.IMCODES_WIDGET_BINARY_PATH = origEnv;
+    }
+  });
+
+  it('falls back to bundled → candidates → PATH-walk → bare name when no override is configured', () => {
+    if (process.platform === 'win32') return;
+    process.env.HOME = '/tmp/imcodes-nonexistent-home-xyz';
+    expect(resolveCliPathForSdk('widget-not-a-real-binary-xyz')).toBe('widget-not-a-real-binary-xyz');
+  });
+
+  it('prefers resolveBundled over fixed candidates and PATH-walk when provided', () => {
+    if (process.platform === 'win32') return;
+    const bundledPath = path.join(tmpDir, 'widget');
+    fs.writeFileSync(bundledPath, '#!/bin/sh\n');
+    expect(resolveCliPathForSdk('widget', 'widget', { resolveBundled: () => bundledPath })).toBe(bundledPath);
+  });
+});
+
+describe('resolveCodexPathForSdk', () => {
+  let origHome: string | undefined;
+  let origEnv: string | undefined;
+  let tmpDir: string;
+
+  beforeEach(() => {
+    origHome = process.env.HOME;
+    origEnv = process.env[IMCODES_CODEX_BINARY_PATH_ENV];
+    tmpDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'codex-path-test-'));
+  });
+  afterEach(() => {
+    if (origHome === undefined) delete process.env.HOME; else process.env.HOME = origHome;
+    if (origEnv === undefined) delete process.env[IMCODES_CODEX_BINARY_PATH_ENV]; else process.env[IMCODES_CODEX_BINARY_PATH_ENV] = origEnv;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('uses IMCODES_CODEX_BINARY_PATH as the env override variable', () => {
+    expect(IMCODES_CODEX_BINARY_PATH_ENV).toBe('IMCODES_CODEX_BINARY_PATH');
+  });
+
+  it('resolves the env override for the default name', () => {
+    if (process.platform === 'win32') return;
+    const overridePath = path.join(tmpDir, 'codex');
+    fs.writeFileSync(overridePath, '#!/bin/sh\n');
+    process.env[IMCODES_CODEX_BINARY_PATH_ENV] = overridePath;
+    expect(resolveCodexPathForSdk()).toBe(overridePath);
+  });
+
+  it('finds codex via a fixed per-user candidate under a HOME override', () => {
+    if (process.platform === 'win32') return;
+    delete process.env[IMCODES_CODEX_BINARY_PATH_ENV];
+    process.env.HOME = tmpDir;
+    const candidatePath = path.join(tmpDir, '.local', 'bin', 'codex');
+    fs.mkdirSync(path.dirname(candidatePath), { recursive: true });
+    fs.writeFileSync(candidatePath, '#!/bin/sh\n');
+    expect(resolveCodexPathForSdk()).toBe(candidatePath);
+  });
+
+  it('does NOT override an explicit caller-provided path (regression guard)', () => {
+    if (process.platform === 'win32') return;
+    const overridePath = path.join(tmpDir, 'codex');
+    fs.writeFileSync(overridePath, '#!/bin/sh\n');
+    process.env[IMCODES_CODEX_BINARY_PATH_ENV] = overridePath;
+    expect(resolveCodexPathForSdk('/explicit/custom/codex-canary')).toBe('/explicit/custom/codex-canary');
+  });
+});
+
+describe('resolveClaudeCodePathForTmux', () => {
+  let origHome: string | undefined;
+  let origEnv: string | undefined;
+  let tmpDir: string;
+
+  beforeEach(() => {
+    origHome = process.env.HOME;
+    origEnv = process.env.IMCODES_CLAUDE_BINARY_PATH;
+    tmpDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'claude-tmux-path-test-'));
+  });
+  afterEach(() => {
+    if (origHome === undefined) delete process.env.HOME; else process.env.HOME = origHome;
+    if (origEnv === undefined) delete process.env.IMCODES_CLAUDE_BINARY_PATH; else process.env.IMCODES_CLAUDE_BINARY_PATH = origEnv;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('returns the bare name unchanged on win32 (ConPTY command-string embedding is out of scope)', () => {
+    const origPlatform = process.platform;
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    try {
+      expect(resolveClaudeCodePathForTmux()).toBe('claude');
+    } finally {
+      Object.defineProperty(process, 'platform', { value: origPlatform });
+    }
+  });
+
+  it('finds claude via a fixed per-user candidate under a HOME override, on non-Windows', () => {
+    if (process.platform === 'win32') return;
+    delete process.env.IMCODES_CLAUDE_BINARY_PATH;
+    process.env.HOME = tmpDir;
+    const candidatePath = path.join(tmpDir, '.local', 'bin', 'claude');
+    fs.mkdirSync(path.dirname(candidatePath), { recursive: true });
+    fs.writeFileSync(candidatePath, '#!/bin/sh\n');
+    expect(resolveClaudeCodePathForTmux()).toBe(candidatePath);
+  });
+
+  it('finds claude via the claude-specific ~/.claude/local/claude extra candidate', () => {
+    if (process.platform === 'win32') return;
+    delete process.env.IMCODES_CLAUDE_BINARY_PATH;
+    process.env.HOME = tmpDir;
+    const candidatePath = path.join(tmpDir, '.claude', 'local', 'claude');
+    fs.mkdirSync(path.dirname(candidatePath), { recursive: true });
+    fs.writeFileSync(candidatePath, '#!/bin/sh\n');
+    expect(resolveClaudeCodePathForTmux()).toBe(candidatePath);
+  });
+
+  it('respects IMCODES_CLAUDE_BINARY_PATH, the same env var the SDK-transport resolver uses', () => {
+    if (process.platform === 'win32') return;
+    const overridePath = path.join(tmpDir, 'claude');
+    fs.writeFileSync(overridePath, '#!/bin/sh\n');
+    process.env.IMCODES_CLAUDE_BINARY_PATH = overridePath;
+    expect(resolveClaudeCodePathForTmux()).toBe(overridePath);
+  });
+
+  it('does NOT override an explicit caller-provided path (regression guard)', () => {
+    if (process.platform === 'win32') return;
+    process.env.IMCODES_CLAUDE_BINARY_PATH = path.join(tmpDir, 'claude');
+    fs.writeFileSync(process.env.IMCODES_CLAUDE_BINARY_PATH, '#!/bin/sh\n');
+    expect(resolveClaudeCodePathForTmux('/explicit/custom/claude-canary')).toBe('/explicit/custom/claude-canary');
+  });
+
+  it('falls through to the bare name when nothing resolves, reproducing pre-hardening behavior', () => {
+    if (process.platform === 'win32') return;
+    delete process.env.IMCODES_CLAUDE_BINARY_PATH;
+    process.env.HOME = '/tmp/imcodes-nonexistent-home-xyz-tmux';
+    const origPath = process.env.PATH;
+    process.env.PATH = '/does/not/exist';
+    try {
+      expect(resolveClaudeCodePathForTmux()).toBe('claude');
+    } finally {
+      process.env.PATH = origPath;
+    }
   });
 });
 

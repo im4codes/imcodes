@@ -65,7 +65,7 @@ import {
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
 import logger from '../../util/logger.js';
 import { CODEX_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
-import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
+import { normalizeTransportCwd, resolveExecutableForSpawn, resolveCodexPathForSdk } from '../transport-paths.js';
 import { getCodexBaseInstructions } from '../codex-runtime-config.js';
 import { buildGeneratedImageReportingPrompt } from '../../../shared/transport-runtime-prompts.js';
 import { composeProviderSystemText, getProviderSystemTextParts, composeProviderSystemTextSpanned, getProviderSessionSystemTextSpanned } from '../provider-context-routing.js';
@@ -6749,8 +6749,17 @@ export class CodexSdkProvider implements TransportProvider {
     for (const cb of this.errorCallbacks) cb(sessionId, error);
   }
 
-  private resolveBinaryPath(config: ProviderConfig | null): string {
+  private getConfiguredBinaryPath(config: ProviderConfig | null): string {
     return typeof config?.binaryPath === 'string' && config.binaryPath.trim() ? config.binaryPath : CODEX_BIN;
+  }
+
+  /** Hardened against the sparse-PATH systemd/launchd daemon spawn ENOENT —
+   *  see `resolveCodexPathForSdk`'s doc comment. Every caller here feeds this
+   *  straight into `child_process.spawn`/`resolveExecutableForSpawn`, not a
+   *  shell, so a bare 'codex' name only works when PATH happens to contain
+   *  it. */
+  private resolveBinaryPath(config: ProviderConfig | null): string {
+    return resolveCodexPathForSdk(this.getConfiguredBinaryPath(config));
   }
 
   private normalizeError(err: unknown, details?: unknown): ProviderError {
