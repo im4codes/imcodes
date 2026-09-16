@@ -8,6 +8,15 @@
 // unlike the throwaway loopback qualification, offer/ICE come from an actual
 // caller (ApplyOffer/AddRemoteIceCandidate), not an in-process peer.
 //
+// Also wires common::SessionCore (input-ledger-backed ApplyPointerMove/
+// ApplyKey/ApplyButton/ApplyWheel/ApplyText dispatch to the X11 input
+// adapter) -- but CapabilityReadiness::ViewReady() requires encoder AND
+// disclosure readiness, and Linux has neither yet (see
+// LinuxNoopEncoderAdapter's own comment, and LinuxDisclosureAdapter),
+// so SessionCore::Start() currently fails on every real host. Left failing
+// loudly rather than faked; see the comment at its call site in
+// StartTransport().
+//
 // DELIBERATELY NOT YET DONE, scoped as follow-up: the data-channel wire
 // protocol (pointer/keyboard/clipboard JSON messages the web/mobile client
 // actually sends -- macOS and Windows each parse their own copy of this,
@@ -28,6 +37,7 @@
 #include "rtc_base/thread.h"
 
 #include "../remote-desktop-common/quality_ladder.h"
+#include "../remote-desktop-common/session_core.h"
 #include "../remote-desktop-common/transport_session_core.h"
 #include "linux_native_video_source.h"
 #include "linux_platform_adapters.h"
@@ -36,6 +46,27 @@ namespace imcodes::remote_desktop::linux_platform {
 
 using LinuxEmitIceCandidate =
     std::function<void(const std::string& mid, const std::string& sdp)>;
+
+// common::PlatformAdapters (and therefore common::SessionCore, which this
+// session uses for the SAME input-ledger-backed dispatch macOS's
+// MacosRemoteDesktopSession wraps) requires an EncoderAdapter reference.
+// Linux has none: frames leave via NativeCaptureAdapter's pooled
+// VideoTrackSource, never through CaptureAdapter/EncoderAdapter's
+// push-a-CapturedFrame/emit-an-H264AccessUnit model. SessionCore only ever
+// calls Stop() on it (session_core.cc's StopPlatformResources), so a no-op
+// is exactly correct, not a stub standing in for missing behavior.
+class LinuxNoopEncoderAdapter final : public common::EncoderAdapter {
+ public:
+  common::ReadinessState ProbeReadiness() override {
+    return common::ReadinessState::kUnavailable;
+  }
+  bool Configure(const common::EncoderConfiguration&,
+                common::H264AccessUnitSink) override {
+    return false;
+  }
+  bool Encode(common::CapturedFrame, bool) override { return false; }
+  void Stop() noexcept override {}
+};
 
 class LinuxRemoteDesktopSession final
     : public webrtc::PeerConnectionObserver,
@@ -65,6 +96,21 @@ class LinuxRemoteDesktopSession final
 
   [[nodiscard]] common::TransportDiagnostics diagnostics() const;
   [[nodiscard]] bool closed() const noexcept { return closed_; }
+
+  // Real input dispatch through common::SessionCore/InputLedger -- the same
+  // ownership/release/epoch-fencing semantics macOS's session wraps, backed
+  // here by the already-qualified X11InputAdapter. NOT YET called from
+  // anywhere: wiring these to the data-channel wire protocol (parsing the
+  // pointer/keyboard JSON messages the web/mobile client actually sends) is
+  // the next piece, deliberately not done in this pass -- see this file's
+  // header comment.
+  common::InputResult ApplyPointerMove(const common::PointerMove& move);
+  common::InputResult ApplyKey(const common::KeyTransition& transition);
+  common::InputResult ApplyButton(const common::ButtonTransition& transition);
+  common::InputResult ClickButton(const common::ButtonTransition& transition);
+  common::InputResult ApplyWheel(const common::WheelInput& input);
+  common::InputResult ApplyText(const common::TextInput& input);
+  void ReleaseController(std::string_view controller_id) noexcept;
 
   // webrtc::PeerConnectionObserver.
   void OnSignalingChange(
@@ -121,6 +167,13 @@ class LinuxRemoteDesktopSession final
   std::map<std::string, webrtc::scoped_refptr<webrtc::DataChannelInterface>>
       channels_;
   common::TransportSessionCore transport_core_;
+  // Declared after the adapters it wraps (adapters_ is a reference to the
+  // caller-owned LinuxPlatformAdapters, which must outlive this session
+  // anyway) so SessionCore's own StopPlatformResources() runs before
+  // anything it depends on is torn down.
+  LinuxNoopEncoderAdapter noop_encoder_;
+  common::SessionCore core_;
+  bool core_started_ = false;
   bool closed_ = false;
 };
 

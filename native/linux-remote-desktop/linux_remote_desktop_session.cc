@@ -136,7 +136,11 @@ LinuxRemoteDesktopSession::LinuxRemoteDesktopSession(
       native_capture_(adapters.capture()),
       signaling_thread_(signaling_thread),
       emit_ice_candidate_(std::move(emit_ice_candidate)),
-      transport_core_(*this, quality_ladder_) {}
+      transport_core_(*this, quality_ladder_),
+      core_(common::PlatformAdapters{
+          adapters.capture(), noop_encoder_, adapters.input(),
+          adapters.clipboard(), adapters.display(), adapters.disclosure(),
+          adapters.session_monitor()}) {}
 
 LinuxRemoteDesktopSession::~LinuxRemoteDesktopSession() { Stop(); }
 
@@ -207,6 +211,30 @@ bool LinuxRemoteDesktopSession::StartTransport(
     peer_ = nullptr;
     return false;
   }
+
+  // SessionCore owns input-ledger dispatch independently of the transport;
+  // starting it here (once capture/display are already known good, same as
+  // the video track above) is what would make ApplyPointerMove/ApplyKey/etc.
+  // below actually reach the X11 input adapter.
+  //
+  // CapabilityReadiness::ViewReady() (value_types.cc) requires BOTH encoder
+  // and disclosure to read kReady, not just capture/input/display -- correct
+  // for macOS/Windows, where both are real capabilities, but Linux has
+  // neither yet: LinuxNoopEncoderAdapter is deliberately always
+  // kUnavailable (see its own comment), and LinuxDisclosureAdapter has no
+  // Linux surface in this slice at all. So this always fails right now, on
+  // every real host, not just this qualification's Xvfb one. Left failing
+  // loudly (non-fatal to the transport/video that already started above)
+  // rather than papering over it by lying about encoder/disclosure
+  // readiness -- that gate needs an actual answer (a real Linux disclosure
+  // adapter, or a documented case for why Linux's kControl readiness
+  // shouldn't require it) before this can honestly report kViewing.
+  core_started_ = core_.Start(adapters_.MeasureReadiness(), *topology);
+  if (!core_started_) {
+    std::fprintf(stderr,
+                "linux session: SessionCore::Start failed (expected for now -- "
+                "see the comment above; input dispatch stays unavailable)\n");
+  }
   return true;
 }
 
@@ -265,6 +293,10 @@ void LinuxRemoteDesktopSession::CloseTransport() noexcept {
   if (peer_) {
     peer_->Close();
     peer_ = nullptr;
+  }
+  if (core_started_) {
+    core_.Stop(common::TerminalError{});
+    core_started_ = false;
   }
   closed_ = true;
 }
@@ -376,6 +408,47 @@ void LinuxRemoteDesktopSession::OnConnectionChange(
   }
   common::TransportTime now{};
   transport_core_.OnPeerConnectionState(CallbackStamp(), mapped, now);
+}
+
+// --- real input dispatch through common::SessionCore -----------------------
+// Not yet called from anywhere (no data-channel message parsing exists yet
+// to call them from -- see this file's header comment), but a real,
+// independently exercisable surface backed by the already-qualified
+// X11InputAdapter, ready for that wiring.
+
+common::InputResult LinuxRemoteDesktopSession::ApplyPointerMove(
+    const common::PointerMove& move) {
+  return core_.ApplyPointerMove(move);
+}
+
+common::InputResult LinuxRemoteDesktopSession::ApplyKey(
+    const common::KeyTransition& transition) {
+  return core_.ApplyKey(transition);
+}
+
+common::InputResult LinuxRemoteDesktopSession::ApplyButton(
+    const common::ButtonTransition& transition) {
+  return core_.ApplyButton(transition);
+}
+
+common::InputResult LinuxRemoteDesktopSession::ClickButton(
+    const common::ButtonTransition& transition) {
+  return core_.ClickButton(transition);
+}
+
+common::InputResult LinuxRemoteDesktopSession::ApplyWheel(
+    const common::WheelInput& input) {
+  return core_.ApplyWheel(input);
+}
+
+common::InputResult LinuxRemoteDesktopSession::ApplyText(
+    const common::TextInput& input) {
+  return core_.ApplyText(input);
+}
+
+void LinuxRemoteDesktopSession::ReleaseController(
+    std::string_view controller_id) noexcept {
+  core_.ReleaseController(controller_id);
 }
 
 }  // namespace imcodes::remote_desktop::linux_platform
