@@ -14,3 +14,15 @@ export function formatUsageCost(micros: number | null, unknownLabel: string): st
     maximumFractionDigits: 4,
   }).format(micros / 1_000_000);
 }
+
+/**
+ * `part`'s share of `total` as a whole-percent string, e.g. for showing what
+ * fraction of a token breakdown (input/cache/output) one category is.
+ * `total` is the sum of all categories here (see `computeTotalTokens`), not
+ * a model context window, so this is a share-of-whole, not a quota level.
+ * Returns `—` when there is nothing to divide by, rather than NaN/Infinity.
+ */
+export function formatUsageSharePercent(part: number, total: number): string {
+  if (!Number.isFinite(part) || !Number.isFinite(total) || total <= 0) return '—';
+  return `${Math.round((part / total) * 100)}%`;
+}
