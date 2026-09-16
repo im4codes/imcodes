@@ -2590,6 +2590,17 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
   int status = EX_OK;
   bool running = true;
 
+  // Negotiations that hang instead of failing outright (peer never reaches
+  // an ICE/DTLS terminal state, e.g. a dead network path) never trip any of
+  // the callback-driven terminal checks below, and leave a worker plus its
+  // disclosure overlay idling forever -- observed live as a stuck "1
+  // viewing" indicator on a target that was never actually connected to.
+  // `media_status_sent` latches true the first time real media has ever
+  // flowed and never resets, so gating on it below cannot affect a
+  // connection that did establish, however long it then sits idle.
+  const std::int64_t worker_started_ms = SampleNow().monotonic_ms;
+  constexpr std::int64_t kConnectionEstablishTimeoutMs = 60'000;
+
   std::int64_t last_media_sample_ms = 0;
   bool media_status_sent = false;
   std::uint64_t unlock_request_id = 0;
@@ -2681,6 +2692,16 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
         if (bytes > 0 && !media_status_sent) {
           media_status_sent = true;
           (void)sink.RefreshStatus();
+        }
+        // Auto-clean a connection that never established: no real media
+        // has ever flowed and the grace window has elapsed. Route through
+        // the same transport-terminal path a live peer disconnect uses so
+        // the existing unconditional disclosure/session teardown below
+        // still runs -- no separate cleanup path to keep in sync.
+        if (!media_status_sent &&
+            now.monotonic_ms - worker_started_ms >= kConnectionEstablishTimeoutMs) {
+          std::cerr << "macos_remote_desktop_worker_connection_never_established\n";
+          sink.SignalTerminal("connection_never_established");
         }
         if (sink.terminal())
           continue;
