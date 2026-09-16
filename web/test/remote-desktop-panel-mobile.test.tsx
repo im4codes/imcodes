@@ -238,6 +238,7 @@ afterEach(() => {
   directoryAdapters.length = 0;
   atomicButtonClickAdvertised = true;
   localStorage.removeItem('rcc_float_remote-desktop-server-1');
+  localStorage.removeItem('imcodes.web.remote-desktop.zoom.v1.server-1');
   delete (document as Document & { fullscreenElement?: Element | null }).fullscreenElement;
 });
 
@@ -1773,6 +1774,39 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       .toBe('true');
     expect(getByRole('button', { name: 'remote_desktop.actual_size' }).getAttribute('aria-pressed'))
       .toBe('false');
+  });
+
+  it('restores this machine\'s remembered display scale instead of the default', async () => {
+    localStorage.setItem(
+      'imcodes.web.remote-desktop.zoom.v1.server-1',
+      JSON.stringify({ version: 1, viewScale: 'actual', scale: 2 }),
+    );
+    const { getByRole, getByLabelText } = await renderPanel();
+    expect(getByRole('button', { name: 'remote_desktop.actual_size' }).getAttribute('aria-pressed'))
+      .toBe('true');
+    expect(getByLabelText('remote_desktop.zoom_reset').textContent).toBe('200%');
+  });
+
+  it('ignores another machine\'s remembered scale and uses this machine\'s own', async () => {
+    localStorage.setItem(
+      'imcodes.web.remote-desktop.zoom.v1.some-other-server',
+      JSON.stringify({ version: 1, viewScale: 'actual', scale: 3 }),
+    );
+    const { getByRole } = await renderPanel();
+    expect(getByRole('button', { name: 'remote_desktop.fit' }).getAttribute('aria-pressed'))
+      .toBe('true');
+  });
+
+  it('remembers a new zoom ratio for this machine once it settles, without saving on every intermediate change', async () => {
+    vi.useFakeTimers();
+    const { getByLabelText } = await renderPanel();
+    act(() => { (getByLabelText('remote_desktop.zoom_in') as HTMLButtonElement).click(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(200); });
+    // Still within the debounce window -- nothing written yet.
+    expect(localStorage.getItem('imcodes.web.remote-desktop.zoom.v1.server-1')).toBeNull();
+    await act(async () => { await vi.advanceTimersByTimeAsync(200); });
+    expect(JSON.parse(localStorage.getItem('imcodes.web.remote-desktop.zoom.v1.server-1')!))
+      .toEqual({ version: 1, viewScale: 'fit', scale: 1.5 });
   });
 
   it('moves the ring and its bound cursor marker to wherever the screen is tapped, and taps the ring there to left-click', async () => {

@@ -86,12 +86,18 @@ import {
   clampRemoteDesktopViewport,
   panRemoteDesktopViewportAtEdge,
   remoteDesktopMouseModeViewport,
+  REMOTE_DESKTOP_MAX_ZOOM,
+  REMOTE_DESKTOP_MIN_ZOOM,
   REMOTE_DESKTOP_POINTER_EDGE_STICKY_RATIO,
   REMOTE_DESKTOP_POINTER_EDGE_STICKY_RATIO_PRECISE,
   stickRemoteDesktopPointerToEdges,
   viewportFromRemoteDesktopPinch,
   type RemoteDesktopViewport,
 } from '../remote-desktop-viewport.js';
+import {
+  loadRemoteDesktopZoomPreference,
+  saveRemoteDesktopZoomPreference,
+} from '../remote-desktop-zoom-preference.js';
 
 type ViewScale = 'fit' | 'actual';
 type MobileInputMode = 'touch' | 'mouse';
@@ -378,13 +384,28 @@ export function RemoteDesktopPanel({
 }: RemoteDesktopPanelProps) {
   const { t } = useTranslation();
   const [snapshot, setSnapshot] = useState<RemoteDesktopSnapshot>(INITIAL_SNAPSHOT);
+  // Computed once, lazily, rather than on every render: what this machine's
+  // display scale was left at last time, if anything was ever saved for it.
+  const [storedZoomPreference] = useState(() => loadRemoteDesktopZoomPreference(machine.serverId));
   // Fit by default: the whole remote screen scaled to the visible window is
   // what makes a session usable at a glance, especially on a phone where
   // "actual size" at native desktop pixels shows only a small cropped
-  // fraction of the screen. "Actual size" stays one toolbar tap away.
-  const [viewScale, setViewScale] = useState<ViewScale>('fit');
+  // fraction of the screen. "Actual size" stays one toolbar tap away. A
+  // remembered preference for this machine overrides the default so a
+  // session doesn't reset to it every time.
+  const [viewScale, setViewScale] = useState<ViewScale>(() => storedZoomPreference?.viewScale ?? 'fit');
   const [mobileInputMode, setMobileInputMode] = useState<MobileInputMode>('touch');
-  const [viewport, setViewport] = useState<RemoteDesktopViewport>(INITIAL_REMOTE_DESKTOP_VIEWPORT);
+  const [viewport, setViewport] = useState<RemoteDesktopViewport>(() => (
+    storedZoomPreference
+      ? {
+        ...INITIAL_REMOTE_DESKTOP_VIEWPORT,
+        scale: Math.max(
+          REMOTE_DESKTOP_MIN_ZOOM,
+          Math.min(REMOTE_DESKTOP_MAX_ZOOM, storedZoomPreference.scale),
+        ),
+      }
+      : INITIAL_REMOTE_DESKTOP_VIEWPORT
+  ));
   const [virtualMouse, setVirtualMouse] = useState<TouchPoint>({ x: 0, y: 0 });
   // Brief visual confirmation that a long-press on the touch-mode ring just
   // fired a right-click -- cleared a moment later by touchRingArmedTimerRef,
@@ -508,7 +529,14 @@ export function RemoteDesktopPanel({
     [machine.serverId],
   );
   const displayModeMenuRef = useRef<HTMLDivElement | null>(null);
-  const viewportRef = useRef<RemoteDesktopViewport>(INITIAL_REMOTE_DESKTOP_VIEWPORT);
+  // Seeded from viewport's own (possibly restored) initial value, not the
+  // bare default -- they must never start out of sync with each other.
+  const viewportRef = useRef<RemoteDesktopViewport>(viewport);
+  // The mode/display viewport-reset effect below must not discard a scale
+  // just restored from this machine's saved preference on its very first
+  // (mount-time) run -- only real, later display/mode changes should reset
+  // it back to the plain default.
+  const hasResetViewportOnMountRef = useRef(false);
   const virtualMouseRef = useRef<TouchPoint>({ x: 0, y: 0 });
   const virtualMouseDragRef = useRef<VirtualMouseDrag | null>(null);
   const virtualMouseEdgePointRef = useRef<TouchPoint | null>(null);
@@ -1024,9 +1052,18 @@ export function RemoteDesktopPanel({
       contentWidth: video.offsetWidth,
       contentHeight: video.offsetHeight,
     } : null;
+    // "Mount" isn't just this effect's very first run: a fresh connection's
+    // own snapshot lands asynchronously, so the run that first sees a real
+    // selected display (not the earlier one with none yet) is the one that
+    // marks initialization done -- only after that does a later run mean a
+    // real, later display/mode change that should reset to the default.
+    const isMountRun = !hasResetViewportOnMountRef.current;
+    if (display) hasResetViewportOnMountRef.current = true;
     const nextViewport = mobileInputMode === 'mouse' && geometry && display
       ? remoteDesktopMouseModeViewport(display, geometry)
-      : INITIAL_REMOTE_DESKTOP_VIEWPORT;
+      // Mount already seeded viewportRef with any remembered scale for this
+      // machine; only a later, real display/mode change resets to default.
+      : isMountRun ? viewportRef.current : INITIAL_REMOTE_DESKTOP_VIEWPORT;
     viewportRef.current = nextViewport;
     setViewport(nextViewport);
     if (stage) {
@@ -1052,6 +1089,22 @@ export function RemoteDesktopPanel({
     mobileInputMode,
     viewportGeometryRevision,
   ]);
+
+  // Remembers this machine's display scale locally, debounced so a live
+  // pinch gesture doesn't write on every frame -- only once it settles.
+  // Skips its own first run so it doesn't immediately write back the value
+  // it (or the default) was just seeded with on mount.
+  const skipFirstZoomPersistRef = useRef(true);
+  useEffect(() => {
+    if (skipFirstZoomPersistRef.current) {
+      skipFirstZoomPersistRef.current = false;
+      return;
+    }
+    const timer = setTimeout(() => {
+      saveRemoteDesktopZoomPreference(machine.serverId, { viewScale, scale: viewport.scale });
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [machine.serverId, viewScale, viewport.scale]);
 
   const normalizedClientPoint = useCallback((clientX: number, clientY: number) => {
     const video = videoRef.current;
