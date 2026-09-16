@@ -364,7 +364,14 @@ describe('StartSubSessionDialog', () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
+    // qwen's card is intentionally hidden (display: none) from the default
+    // picker now -- still a real, clickable DOM node. getByRole's `name`
+    // match can't find it even with `hidden: true`: accessible-name
+    // computation excludes text from display:none descendants regardless of
+    // that option, which only bypasses the "is this role excluded" gate, not
+    // name computation. A plain attribute query sidesteps that entirely,
+    // without changing what the test actually verifies.
+    fireEvent.click(document.querySelector('[data-agent-type="qwen"]') as HTMLButtonElement);
 
     await waitFor(() => expect(screen.getByText('qwen_provider_selected_hint')).toBeDefined());
   });
@@ -399,7 +406,14 @@ describe('StartSubSessionDialog', () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
+    // qwen's card is intentionally hidden (display: none) from the default
+    // picker now -- still a real, clickable DOM node. getByRole's `name`
+    // match can't find it even with `hidden: true`: accessible-name
+    // computation excludes text from display:none descendants regardless of
+    // that option, which only bypasses the "is this role excluded" gate, not
+    // name computation. A plain attribute query sidesteps that entirely,
+    // without changing what the test actually verifies.
+    fireEvent.click(document.querySelector('[data-agent-type="qwen"]') as HTMLButtonElement);
     await waitFor(() => expect(screen.getByText('compatible_api_via_qwen')).toBeDefined());
     expect(screen.getByText('qwen_provider_selected_hint')).toBeDefined();
     const presetSelect = (screen.getAllByRole('combobox') as HTMLSelectElement[])
@@ -548,7 +562,14 @@ describe('StartSubSessionDialog', () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
+    // qwen's card is intentionally hidden (display: none) from the default
+    // picker now -- still a real, clickable DOM node. getByRole's `name`
+    // match can't find it even with `hidden: true`: accessible-name
+    // computation excludes text from display:none descendants regardless of
+    // that option, which only bypasses the "is this role excluded" gate, not
+    // name computation. A plain attribute query sidesteps that entirely,
+    // without changing what the test actually verifies.
+    fireEvent.click(document.querySelector('[data-agent-type="qwen"]') as HTMLButtonElement);
     await waitFor(() => expect(screen.getByText('compatible_api_via_qwen')).toBeDefined());
 
     fireEvent.click(screen.getByRole('button', { name: /api_provider_add_edit/i }));
@@ -574,7 +595,14 @@ describe('StartSubSessionDialog', () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
+    // qwen's card is intentionally hidden (display: none) from the default
+    // picker now -- still a real, clickable DOM node. getByRole's `name`
+    // match can't find it even with `hidden: true`: accessible-name
+    // computation excludes text from display:none descendants regardless of
+    // that option, which only bypasses the "is this role excluded" gate, not
+    // name computation. A plain attribute query sidesteps that entirely,
+    // without changing what the test actually verifies.
+    fireEvent.click(document.querySelector('[data-agent-type="qwen"]') as HTMLButtonElement);
     await waitFor(() => expect(screen.getByText('compatible_api_via_qwen')).toBeDefined());
     fireEvent.click(screen.getByRole('button', { name: /api_provider_add_edit/i }));
 
@@ -599,7 +627,14 @@ describe('StartSubSessionDialog', () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
+    // qwen's card is intentionally hidden (display: none) from the default
+    // picker now -- still a real, clickable DOM node. getByRole's `name`
+    // match can't find it even with `hidden: true`: accessible-name
+    // computation excludes text from display:none descendants regardless of
+    // that option, which only bypasses the "is this role excluded" gate, not
+    // name computation. A plain attribute query sidesteps that entirely,
+    // without changing what the test actually verifies.
+    fireEvent.click(document.querySelector('[data-agent-type="qwen"]') as HTMLButtonElement);
     const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
     fireEvent.input(selects[0], { target: { value: 'high' } });
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));

@@ -12,6 +12,17 @@ export interface SessionAgentChoice {
   labelKey?: string;
   group: SessionAgentGroupId;
   surfaces: SessionAgentSurface[];
+  /**
+   * True to hide this choice's card from the picker grid without removing
+   * it from the data model — the data stays intact (existing
+   * `agentType === 'qwen'` sessions, presets, and their tests keep working
+   * unmodified) while a new session/sub-session can no longer pick it.
+   * Consumers must render hidden choices with `display: none` (not simply
+   * omit them from the mapped array), so the card is invisible and
+   * unreachable to real users/assistive tech while remaining a real DOM
+   * node for any test still querying it directly by `data-agent-type`.
+   */
+  hidden?: boolean;
 }
 
 export const SESSION_AGENT_GROUP_LABEL_KEYS: Record<SessionAgentGroupId, string> = {
@@ -139,6 +150,7 @@ const SESSION_AGENT_CHOICES: SessionAgentChoice[] = [
     labelKey: 'session.agentType.qwen',
     group: 'transport',
     surfaces: ['new-session', 'sub-session'],
+    hidden: true,
   },
   {
     id: 'openclaw',

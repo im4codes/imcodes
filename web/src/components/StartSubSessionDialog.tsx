@@ -433,6 +433,17 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
                           type="button"
                           class={`session-agent-card${type === choice.id ? ' active' : ''}`}
                           data-agent-type={choice.id}
+                          // Hidden choices (e.g. qwen) stay real DOM nodes --
+                          // just invisible and out of the tab/accessibility
+                          // order -- rather than being omitted from
+                          // visibleItems, so the underlying data/behavior
+                          // stays fully intact for any test still querying
+                          // it directly. A hidden choice that was explicitly
+                          // allow-listed via allowedAgentTypes (e.g. the
+                          // supervision-pool worker-type picker, which still
+                          // legitimately offers qwen as a backend) is a
+                          // deliberate exception and renders normally.
+                          style={(choice.hidden && !allowedAgentTypeSet?.has(choice.id)) ? { display: 'none' } : undefined}
                           disabled={customProviderSdk && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id)}
                           aria-pressed={type === choice.id}
                           onClick={() => selectType(choice.id)}

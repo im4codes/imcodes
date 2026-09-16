@@ -788,6 +788,13 @@ export function NewSessionDialog({
                       key={choice.id}
                       data-agent-type={choice.id}
                       class={`session-agent-card${agentType === choice.id ? " active" : ""}`}
+                      // Hidden choices (e.g. qwen) stay real DOM nodes -- just
+                      // invisible and out of the tab/accessibility order --
+                      // rather than being omitted from visibleItems, so the
+                      // choice is unreachable for a real user while the
+                      // underlying data/behavior (and any test that still
+                      // queries it directly) stays fully intact.
+                      style={choice.hidden ? { display: 'none' } : undefined}
                       disabled={starting || (customProviderSdk && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id))}
                       aria-pressed={agentType === choice.id}
                       onClick={() => selectAgentType(choice.id as AgentType)}
