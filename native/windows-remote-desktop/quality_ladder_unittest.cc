@@ -57,5 +57,38 @@ TEST(QualityLadderTest, EnforcesPerPeerAndAggregateBitrateBudgets) {
   EXPECT_EQ(ClampAggregateVideoBitrate(1'000'000, 0, 60'000'000), 0u);
 }
 
+TEST(QualityLadderTest, BacklogPressureLeavesAnUnstrugglingEncoderAlone) {
+  EXPECT_EQ(ApplyEncodeBacklogPressure(6'000'000, 0), 6'000'000u);
+}
+
+TEST(QualityLadderTest, BacklogPressureNeverIncreasesTheTarget) {
+  uint32_t previous = 6'000'000;
+  for (uint32_t pressure = 1; pressure <= 24; ++pressure) {
+    const uint32_t current = ApplyEncodeBacklogPressure(6'000'000, pressure);
+    EXPECT_LE(current, previous);
+    EXPECT_LE(current, 6'000'000u);
+    EXPECT_GE(current, kMinVideoBitrateBps);
+    previous = current;
+  }
+}
+
+TEST(QualityLadderTest, BacklogPressureNeverDropsBelowTheMinimumFloor) {
+  EXPECT_EQ(ApplyEncodeBacklogPressure(400'000, 12), kMinVideoBitrateBps);
+  EXPECT_EQ(ApplyEncodeBacklogPressure(400'000, 24), kMinVideoBitrateBps);
+}
+
+TEST(QualityLadderTest, BacklogPressureFeedsBackIntoALowerLadderRung) {
+  // Sustained local backlog lands on a smaller/slower rung than the network
+  // alone would have chosen, entirely independent of congestion control.
+  const QualitySelection unpressured = SelectQuality(6'000'000, 1920, 1080);
+  EXPECT_STREQ(unpressured.id, "1080p30");
+
+  const uint32_t pressured_bitrate =
+      ApplyEncodeBacklogPressure(6'000'000, 9);
+  const QualitySelection pressured =
+      SelectQuality(pressured_bitrate, 1920, 1080);
+  EXPECT_STRNE(pressured.id, unpressured.id);
+}
+
 }  // namespace
 }  // namespace imcodes::rd

@@ -59,6 +59,33 @@ QualitySelection SelectQuality(uint32_t target_bitrate_bps,
                                int source_width,
                                int source_height);
 
+/**
+ * Discounts `target_bitrate_bps` in proportion to `backlog_pressure`, a
+ * caller-tracked, unitless measure of how far a LOCAL encode pipeline is
+ * falling behind capture (e.g. a rolling counter that rises when frames are
+ * dropped for still being busy with the previous ones and decays on frames
+ * that keep up). Feed the result back into `SelectQuality` to land on a
+ * lower rung of the ladder.
+ *
+ * Network congestion control has nothing to say about this: a CPU-bound
+ * software encode path, or a GPU shared with something else, can fall
+ * behind capture on a fast, completely uncongested link, and the bandwidth
+ * estimator will keep authorizing a target the encoder cannot actually
+ * sustain. Left alone, that grows an ever-larger backlog of stale frames
+ * instead of a smaller, live picture -- exactly backwards from "keep it
+ * blurry, keep it live." This turns local lateness into the same kind of
+ * downward pressure network congestion already applies, so a struggling
+ * encoder pulls itself down a rung even while the network stays perfectly
+ * happy with the higher target.
+ *
+ * `backlog_pressure` of 0 returns `target_bitrate_bps` unchanged. The
+ * reduction never lowers the result below `kMinVideoBitrateBps` and never
+ * raises it above `target_bitrate_bps` -- this only ever discounts what the
+ * caller already decided, never overrides it upward.
+ */
+uint32_t ApplyEncodeBacklogPressure(uint32_t target_bitrate_bps,
+                                    uint32_t backlog_pressure);
+
 }  // namespace imcodes::rd
 
 #endif  // IMCODES_REMOTE_DESKTOP_COMMON_QUALITY_LADDER_H_

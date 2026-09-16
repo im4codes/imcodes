@@ -89,4 +89,22 @@ QualitySelection SelectQuality(uint32_t target_bitrate_bps,
   };
 }
 
+uint32_t ApplyEncodeBacklogPressure(uint32_t target_bitrate_bps,
+                                    uint32_t backlog_pressure) {
+  if (backlog_pressure == 0) return target_bitrate_bps;
+  // Beyond this the reduction is already deep enough that kMinVideoBitrateBps
+  // clamping dominates; capping keeps the pow() argument small and bounded.
+  constexpr uint32_t kMaxBacklogPressure = 12;
+  const uint32_t capped = std::min(backlog_pressure, kMaxBacklogPressure);
+  // Halves roughly every 3 steps of sustained pressure: gentle enough that a
+  // couple of isolated blips do not visibly change anything, steep enough
+  // that real, sustained backlog reaches the floor within a handful of
+  // frames rather than degrading so slowly the queue keeps growing anyway.
+  const double reduction = std::pow(0.5, static_cast<double>(capped) / 3.0);
+  const double reduced = static_cast<double>(target_bitrate_bps) * reduction;
+  return static_cast<uint32_t>(std::clamp(
+      reduced, static_cast<double>(kMinVideoBitrateBps),
+      static_cast<double>(target_bitrate_bps)));
+}
+
 }  // namespace imcodes::rd
