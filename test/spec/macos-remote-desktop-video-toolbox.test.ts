@@ -174,6 +174,7 @@ describe('macOS VideoToolbox H.264 encoder adapter', () => {
       resolve(ROOT, 'test/spec/macos-remote-desktop-video-toolbox-test.mm'),
       resolve(ROOT, 'native/macos-remote-desktop/video_toolbox_h264_encoder.mm'),
       resolve(ROOT, 'native/remote-desktop-common/value_types.cc'),
+      resolve(ROOT, 'native/remote-desktop-common/quality_ladder.cc'),
       '-framework', 'CoreMedia',
       '-framework', 'CoreVideo',
       '-framework', 'Foundation',

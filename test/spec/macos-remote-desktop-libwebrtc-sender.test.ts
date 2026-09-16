@@ -71,6 +71,7 @@ describe('macOS pinned-libwebrtc H.264 sender bridge', () => {
       resolve(ROOT, 'native/macos-remote-desktop/h264_sender_bridge.cc'),
       resolve(ROOT, 'native/macos-remote-desktop/video_toolbox_h264_encoder.mm'),
       resolve(ROOT, 'native/remote-desktop-common/value_types.cc'),
+      resolve(ROOT, 'native/remote-desktop-common/quality_ladder.cc'),
       '-framework', 'CoreMedia',
       '-framework', 'CoreVideo',
       '-framework', 'Foundation',

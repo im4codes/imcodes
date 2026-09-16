@@ -117,6 +117,7 @@ describe('macOS SessionCore composition', () => {
           'native/remote-desktop-common/transport_session_core.cc',
           'native/remote-desktop-common/input_ledger.cc',
           'native/remote-desktop-common/value_types.cc',
+          'native/remote-desktop-common/quality_ladder.cc',
         ].map((path) => resolve(ROOT, path));
         const compile = await runTool('xcrun', [
           'clang++',
