@@ -191,7 +191,12 @@ describe('assignment auto-start through the unified transport ingress', () => {
     process.env.HOME = originalHome;
     if (originalProjectionPath === undefined) delete process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH;
     else process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH = originalProjectionPath;
-    await rm(testHome, { recursive: true, force: true });
+    // A store's debounced write (e.g. sqlite WAL checkpoint or session-store
+    // save) can still be settling right as this runs, recreating an entry
+    // mid-traversal and failing the final rmdir with ENOTEMPTY. Let Node
+    // retry the recursive removal, matching the same real race already
+    // handled this way in test/store/session-store.test.ts.
+    await rm(testHome, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
   });
 
   it.each(PROVIDERS)('$providerId: delivery -> first activity -> implementing, with no model start/claim', ({ providerId, agentType, capabilities }) => {
