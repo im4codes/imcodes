@@ -8,7 +8,7 @@
  * the capability itself means "the verified worker is installed". A host that
  * advertises neither must render nothing rather than a button that will fail.
  */
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { h } from 'preact';
 import { render, cleanup, act, fireEvent } from '@testing-library/preact';
 
@@ -88,7 +88,17 @@ function mount(capabilities: string[], overrides: Record<string, unknown> = {}) 
   return { ...ws, onOpen, view };
 }
 
-afterEach(() => { cleanup(); });
+// These buttons now ask for confirmation before enabling remote desktop
+// (window.confirm) -- stub it to "yes" so these tests keep exercising the
+// mint/send behavior beyond the prompt, which is what they actually assert.
+let confirmSpy: ReturnType<typeof vi.spyOn>;
+beforeEach(() => {
+  confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+});
+afterEach(() => {
+  confirmSpy.mockRestore();
+  cleanup();
+});
 
 describe('DaemonRemoteDesktopControl', () => {
   it('renders nothing for a daemon that cannot serve remote control', () => {
@@ -146,6 +156,15 @@ describe('DaemonRemoteDesktopControl', () => {
     const button = view.container.querySelector('button')!;
     expect(button.hasAttribute('disabled')).toBe(false);
     expect(button.getAttribute('title')).toBe('remote_desktop.install_error_not_available');
+  });
+
+  it('asks for confirmation before requesting an install, and sends nothing if declined', () => {
+    confirmSpy.mockReturnValue(false);
+    const { view, sent } = mount([REMOTE_DESKTOP_INSTALLABLE_CAPABILITY]);
+    fireEvent.click(view.container.querySelector('button')!);
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    expect(sent).toEqual([]);
+    expect(view.container.querySelector('button')!.hasAttribute('disabled')).toBe(false);
   });
 
   describe('login-screen control', () => {
@@ -230,6 +249,15 @@ describe('DaemonRemoteDesktopControl', () => {
       expect(mintTicket).toHaveBeenCalledTimes(1);
     });
 
+    it('asks for confirmation before enabling the login screen, and mints nothing if declined', async () => {
+      confirmSpy.mockReturnValue(false);
+      mintTicket.mockClear();
+      const { view } = mount(ready);
+      fireEvent.click(view.container.querySelectorAll('button')[1]!);
+      await act(async () => { await Promise.resolve(); });
+      expect(confirmSpy).toHaveBeenCalledTimes(1);
+      expect(mintTicket).not.toHaveBeenCalled();
+    });
 
     it('reports a dismissed prompt without losing the retry', async () => {
       const { view, emit } = mount(ready);
