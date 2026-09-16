@@ -146,6 +146,11 @@ export const FILE_TRANSFER_MSG = {
   DELETE: 'file.delete_attachment',
   DELETE_DONE: 'file.delete_attachment_done',
   DELETE_ERROR: 'file.delete_attachment_error',
+  /** Server -> controlled node: reveal the native Full Disk Access settings
+   *  pane, macOS only. See `MACOS_OPEN_FULL_DISK_ACCESS_ERROR`. */
+  MACOS_OPEN_FULL_DISK_ACCESS: 'file.macos_open_full_disk_access',
+  MACOS_OPEN_FULL_DISK_ACCESS_DONE: 'file.macos_open_full_disk_access_done',
+  MACOS_OPEN_FULL_DISK_ACCESS_ERROR: 'file.macos_open_full_disk_access_error',
 } as const;
 
 export const FILE_TRANSFER_DELETE_ERROR = {
@@ -165,6 +170,38 @@ export const FILE_PATH_HANDLE_ERROR = {
 } as const;
 
 export type FilePathHandleErrorReason = typeof FILE_PATH_HANDLE_ERROR[keyof typeof FILE_PATH_HANDLE_ERROR];
+
+/**
+ * Machine-readable `file.directory_list_error` codes shared by the daemon
+ * (producer), server (relay) and web (localized display + remediation UI).
+ * Generic failures (not found, forbidden, timeout, ...) ride as free-form
+ * strings already; this is only for reasons the web needs to react to
+ * specifically rather than just display.
+ */
+export const FILE_TRANSFER_DIRECTORY_LIST_ERROR = {
+  /**
+   * macOS denied access to a well-known user folder (Desktop/Downloads/
+   * Documents) because the daemon binary lacks Full Disk Access. The web
+   * client shows a persistent prompt with a button that asks the daemon to
+   * open the native Full Disk Access settings pane, instead of silently
+   * falling back to the home directory.
+   */
+  MACOS_FULL_DISK_ACCESS_REQUIRED: 'macos_full_disk_access_required',
+} as const;
+
+export type FileTransferDirectoryListErrorReason =
+  typeof FILE_TRANSFER_DIRECTORY_LIST_ERROR[keyof typeof FILE_TRANSFER_DIRECTORY_LIST_ERROR];
+
+/** Why the daemon could not reveal the native Full Disk Access settings pane. */
+export const MACOS_OPEN_FULL_DISK_ACCESS_ERROR = {
+  /** The controlled node is not running on macOS. */
+  UNSUPPORTED_PLATFORM: 'unsupported_platform',
+  /** No signed-in Aqua console user to open System Settings in front of. */
+  NO_ACTIVE_GUI_SESSION: 'no_active_gui_session',
+} as const;
+
+export type MacosOpenFullDiskAccessErrorReason =
+  typeof MACOS_OPEN_FULL_DISK_ACCESS_ERROR[keyof typeof MACOS_OPEN_FULL_DISK_ACCESS_ERROR];
 
 export interface FileUploadRequest {
   type: 'file.upload';
@@ -261,6 +298,17 @@ export interface FileDeleteRequest {
   attachmentId: string;
 }
 
+/**
+ * Server -> controlled node: reveal the native Full Disk Access settings
+ * pane in the signed-in user's own session, macOS only. Issued after a
+ * `file.directory_list_error` carrying
+ * `FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED`.
+ */
+export interface MacosOpenFullDiskAccessRequest {
+  type: typeof FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS;
+  requestId: string;
+}
+
 // ── Daemon → Server messages ──────────────────────────────────────────────────
 
 export interface FileUploadDone {
@@ -324,6 +372,18 @@ export interface FileDeleteDone {
   requestId: string;
 }
 
+/** The settings pane was told to open. Not proof the user granted access. */
+export interface MacosOpenFullDiskAccessDone {
+  type: typeof FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS_DONE;
+  requestId: string;
+}
+
+export interface MacosOpenFullDiskAccessError {
+  type: typeof FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS_ERROR;
+  requestId: string;
+  error: MacosOpenFullDiskAccessErrorReason;
+}
+
 export interface FileDeleteError {
   type: typeof FILE_TRANSFER_MSG.DELETE_ERROR;
   requestId: string;
@@ -342,7 +402,9 @@ export type FileTransferDaemonMessage =
   | FileDirectoryListDone
   | FileDirectoryListError
   | FileDeleteDone
-  | FileDeleteError;
+  | FileDeleteError
+  | MacosOpenFullDiskAccessDone
+  | MacosOpenFullDiskAccessError;
 
 export type FileTransferServerMessage =
   | FileUploadRequest
@@ -351,7 +413,8 @@ export type FileTransferServerMessage =
   | FileDownloadStreamRequest
   | FilePathHandleRequest
   | FileDirectoryListRequest
-  | FileDeleteRequest;
+  | FileDeleteRequest
+  | MacosOpenFullDiskAccessRequest;
 
 export type ControlledFileTransferResponse =
   | FileUploadDone
@@ -365,7 +428,9 @@ export type ControlledFileTransferResponse =
   | FileDirectoryListDone
   | FileDirectoryListError
   | FileDeleteDone
-  | FileDeleteError;
+  | FileDeleteError
+  | MacosOpenFullDiskAccessDone
+  | MacosOpenFullDiskAccessError;
 
 export type ControlledFileTransferRequest =
   | FileUploadFetchRequest
@@ -373,7 +438,8 @@ export type ControlledFileTransferRequest =
   | FileDownloadStreamRequest
   | FilePathHandleRequest
   | FileDirectoryListRequest
-  | FileDeleteRequest;
+  | FileDeleteRequest
+  | MacosOpenFullDiskAccessRequest;
 
 export type FileTransferValidationResult<T> =
   | { ok: true; value: T }
@@ -461,6 +527,16 @@ export function validateFileDeleteRequest(value: unknown): FileTransferValidatio
   return { ok: true, value: value as unknown as FileDeleteRequest };
 }
 
+export function validateMacosOpenFullDiskAccessRequest(
+  value: unknown,
+): FileTransferValidationResult<MacosOpenFullDiskAccessRequest> {
+  if (!isObject(value)) return { ok: false, error: 'invalid_object' };
+  if (!hasOnlyKeys(value, new Set(['type', 'requestId']))) return { ok: false, error: 'unknown_field' };
+  if (value.type !== FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS) return { ok: false, error: 'invalid_type' };
+  if (!isTransferId(value.requestId)) return { ok: false, error: 'invalid_request_id' };
+  return { ok: true, value: value as unknown as MacosOpenFullDiskAccessRequest };
+}
+
 /** Strict validator for the bounded file controls accepted by the thin node. */
 export function validateControlledFileTransferRequest(
   value: unknown,
@@ -469,6 +545,7 @@ export function validateControlledFileTransferRequest(
   if (value.type === FILE_TRANSFER_MSG.PATH_HANDLE) return validateFilePathHandleRequest(value);
   if (value.type === FILE_TRANSFER_MSG.DIRECTORY_LIST) return validateFileDirectoryListRequest(value);
   if (value.type === FILE_TRANSFER_MSG.DELETE) return validateFileDeleteRequest(value);
+  if (value.type === FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS) return validateMacosOpenFullDiskAccessRequest(value);
   if (value.type === 'file.upload_fetch') {
     if (!hasOnlyKeys(value, new Set(['type', 'uploadId', 'filename', 'originalName', 'mime', 'size', 'downloadUrl', 'clientUploadId', 'destinationDirectory']))
       || !isTransferId(value.uploadId)
@@ -631,6 +708,20 @@ export function validateControlledFileTransferResponse(
       return { ok: false, error: 'invalid_lifecycle_error' };
     }
     return { ok: true, value: v as unknown as FileDeleteError };
+  }
+  if (v.type === FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS_DONE) {
+    if (!hasOnlyKeys(v, new Set(['type', 'requestId'])) || !isTransferId(v.requestId)) {
+      return { ok: false, error: 'invalid_lifecycle_done' };
+    }
+    return { ok: true, value: v as unknown as MacosOpenFullDiskAccessDone };
+  }
+  if (v.type === FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS_ERROR) {
+    if (!hasOnlyKeys(v, new Set(['type', 'requestId', 'error']))
+      || !isTransferId(v.requestId)
+      || !Object.values(MACOS_OPEN_FULL_DISK_ACCESS_ERROR).includes(v.error as MacosOpenFullDiskAccessErrorReason)) {
+      return { ok: false, error: 'invalid_lifecycle_error' };
+    }
+    return { ok: true, value: v as unknown as MacosOpenFullDiskAccessError };
   }
   return { ok: false, error: 'invalid_type' };
 }

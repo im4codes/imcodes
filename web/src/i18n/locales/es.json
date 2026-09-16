@@ -967,7 +967,11 @@
     "downloads": "Descargas",
     "documents": "Documentos",
     "capacity_free": "{{free}} libres",
-    "capacity_detail": "{{free}} libres de {{total}}"
+    "capacity_detail": "{{free}} libres de {{total}}",
+    "macos_fda_prompt": "Este Mac no ha concedido acceso total al disco, así que no se puede leer Descargas/Escritorio/Documentos.",
+    "macos_fda_prompt_action": "Abrir Ajustes en ese Mac",
+    "macos_fda_prompt_opening": "Abriendo…",
+    "macos_fda_prompt_open_failed": "No se pudieron abrir los Ajustes en ese Mac. Ábrelos tú mismo: Ajustes del Sistema → Privacidad y seguridad → Acceso total al disco."
   },
   "toast": {
     "finished": "terminó",

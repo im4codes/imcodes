@@ -19,6 +19,8 @@ import {
   FILE_TRANSFER_DELETE_ERROR,
   FILE_TRANSFER_UPLOAD_ERROR_CODE,
   FILE_PATH_HANDLE_ERROR,
+  FILE_TRANSFER_DIRECTORY_LIST_ERROR,
+  MACOS_OPEN_FULL_DISK_ACCESS_ERROR,
   type AttachmentRef,
   type FileUploadRequest,
   type FileUploadFetchRequest,
@@ -37,14 +39,18 @@ import {
   type FileDirectoryListError,
   type FileDeleteDone,
   type FileDeleteError,
+  type MacosOpenFullDiskAccessDone,
+  type MacosOpenFullDiskAccessError,
   validateFileDeleteRequest,
   validateFileDirectoryListRequest,
 } from '../../shared/transport/file-transfer.js';
 import {
-  resolveWellKnownDirectory,
+  resolveWellKnownDirectoryDetailed,
+  isPermissionDeniedError,
   WELL_KNOWN_DIRECTORY,
   type WellKnownDirectoryKind,
 } from './well-known-directories.js';
+import { resolveMacosUserSession, launchMacosUserSessionCommand } from '../node/user-session-launcher.js';
 import { DIRECT_FILE_TRANSFER_COMMIT_INTENT_SUFFIX } from '../../shared/direct-file-transfer.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 import { resolveCanonical, validateCanonicalRealPath } from './file-preview-path-policy.js';
@@ -1084,9 +1090,18 @@ export async function handleFileDirectoryList(cmd: Record<string, unknown>, send
     // never instead of it. `resolveCanonical` and the sensitive-path denylist
     // still decide whether the resolved directory may be listed, so a shortcut
     // can only ever reach somewhere the user could already have typed.
-    const requestedPath = isFileTransferWellKnownDirectoryPath(parsed.value.path)
-      ? await resolveWellKnownDirectory(WELL_KNOWN_DIRECTORY_BY_SENTINEL[parsed.value.path])
-      : parsed.value.path;
+    let requestedPath = parsed.value.path;
+    if (isFileTransferWellKnownDirectoryPath(parsed.value.path)) {
+      const resolved = await resolveWellKnownDirectoryDetailed(WELL_KNOWN_DIRECTORY_BY_SENTINEL[parsed.value.path]);
+      // Access to the well-known folder itself was denied (the macOS Full
+      // Disk Access signature): report that distinctly rather than silently
+      // listing the fallback home directory mislabeled as the folder the
+      // user actually asked for -- the bug this whole branch exists to fix.
+      if (resolved.permissionDenied) {
+        throw new Error(FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED);
+      }
+      requestedPath = resolved.path;
+    }
 
     const canonical = await resolveCanonical(requestedPath, 'strict');
     if (!canonical) throw new Error(FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH);
@@ -1115,12 +1130,62 @@ export async function handleFileDirectoryList(cmd: Record<string, unknown>, send
       entries,
     } satisfies FileDirectoryListDone);
   } catch (error) {
-    const code = isNotFoundError(error)
-      ? 'not_found'
-      : error instanceof Error && /^[a-z0-9_:-]{1,128}$/.test(error.message)
-        ? error.message
-        : 'directory_list_failed';
+    // Covers both the explicit throw above (well-known resolution already
+    // determined FDA is missing) and a later `lstat`/`readdir` failing with
+    // EPERM/EACCES on a well-known sentinel that the resolution step's own
+    // stat happened to let through -- TCC enforces some macOS protections at
+    // `readdir` rather than `stat`.
+    const isMacosFdaDenial = process.platform === 'darwin'
+      && isFileTransferWellKnownDirectoryPath(parsed.value.path)
+      && (
+        (error instanceof Error && error.message === FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED)
+        || isPermissionDeniedError(error)
+      );
+    const code = isMacosFdaDenial
+      ? FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED
+      : isNotFoundError(error)
+        ? 'not_found'
+        : error instanceof Error && /^[a-z0-9_:-]{1,128}$/.test(error.message)
+          ? error.message
+          : 'directory_list_failed';
     sendDirectoryListError(sender, parsed.value.requestId, code);
+  }
+}
+
+/**
+ * macOS-only: reveal the native Full Disk Access settings pane in the
+ * signed-in user's own session so they can grant it to this binary
+ * themselves, after a well-known-directory listing failed for exactly that
+ * reason. Fire-and-forget once launched -- there is no callback for "the
+ * user flipped the switch"; the next directory-list retry is the real test.
+ */
+export async function handleMacosOpenFullDiskAccess(cmd: Record<string, unknown>, sender: FileTransferSender): Promise<void> {
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : '';
+  if (!requestId) return;
+  if (process.platform !== 'darwin') {
+    sender.send({
+      type: FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS_ERROR,
+      requestId,
+      error: MACOS_OPEN_FULL_DISK_ACCESS_ERROR.UNSUPPORTED_PLATFORM,
+    } satisfies MacosOpenFullDiskAccessError);
+    return;
+  }
+  try {
+    const user = await resolveMacosUserSession();
+    launchMacosUserSessionCommand(user, {
+      executable: '/usr/bin/open',
+      args: ['x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles'],
+    });
+    sender.send({
+      type: FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS_DONE,
+      requestId,
+    } satisfies MacosOpenFullDiskAccessDone);
+  } catch {
+    sender.send({
+      type: FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS_ERROR,
+      requestId,
+      error: MACOS_OPEN_FULL_DISK_ACCESS_ERROR.NO_ACTIVE_GUI_SESSION,
+    } satisfies MacosOpenFullDiskAccessError);
   }
 }
 

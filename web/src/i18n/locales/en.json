@@ -967,7 +967,11 @@
     "downloads": "Downloads",
     "documents": "Documents",
     "capacity_free": "{{free}} free",
-    "capacity_detail": "{{free}} free of {{total}}"
+    "capacity_detail": "{{free}} free of {{total}}",
+    "macos_fda_prompt": "This Mac hasn't granted Full Disk Access, so Downloads/Desktop/Documents can't be read.",
+    "macos_fda_prompt_action": "Open Settings on that Mac",
+    "macos_fda_prompt_opening": "Opening…",
+    "macos_fda_prompt_open_failed": "Couldn't open Settings on that Mac. Open System Settings → Privacy & Security → Full Disk Access there yourself."
   },
   "toast": {
     "finished": "finished",

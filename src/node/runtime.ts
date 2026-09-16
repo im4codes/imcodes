@@ -37,6 +37,7 @@ import {
   handleFilePathHandle,
   handleFileUploadFetch,
   handleFileDelete,
+  handleMacosOpenFullDiskAccess,
   type FileTransferSender,
 } from '../daemon/file-transfer-handler.js';
 import {
@@ -1222,7 +1223,8 @@ export function createControlledNodeRuntime(
         || message.type === FILE_TRANSFER_MSG.DOWNLOAD_STREAM
         || message.type === FILE_TRANSFER_MSG.DIRECTORY_LIST
         || message.type === FILE_TRANSFER_MSG.PATH_HANDLE
-        || message.type === FILE_TRANSFER_MSG.DELETE) {
+        || message.type === FILE_TRANSFER_MSG.DELETE
+        || message.type === FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS) {
         const parsed = validateControlledFileTransferRequest(message);
         if (!parsed.ok) return;
         const relayUrl = parsed.value.type === 'file.upload_fetch'
@@ -1247,6 +1249,8 @@ export function createControlledNodeRuntime(
           await handleFileDelete(parsed.value as unknown as Record<string, unknown>, fileSender);
         } else if (parsed.value.type === FILE_TRANSFER_MSG.DIRECTORY_LIST) {
           await handleFileDirectoryList(parsed.value as unknown as Record<string, unknown>, fileSender);
+        } else if (parsed.value.type === FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS) {
+          await handleMacosOpenFullDiskAccess(parsed.value as unknown as Record<string, unknown>, fileSender);
         } else {
           await handleFilePathHandle(parsed.value as unknown as Record<string, unknown>, fileSender);
         }

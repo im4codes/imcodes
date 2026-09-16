@@ -967,7 +967,11 @@
     "downloads": "下载",
     "documents": "文档",
     "capacity_free": "剩余 {{free}}",
-    "capacity_detail": "剩余 {{free}} / 共 {{total}}"
+    "capacity_detail": "剩余 {{free}} / 共 {{total}}",
+    "macos_fda_prompt": "这台 Mac 尚未授予「完全磁盘访问权限」，无法读取下载/桌面/文档。",
+    "macos_fda_prompt_action": "在该 Mac 上打开系统设置",
+    "macos_fda_prompt_opening": "正在打开…",
+    "macos_fda_prompt_open_failed": "未能在该 Mac 上打开系统设置，请自行前往「系统设置 → 隐私与安全性 → 完全磁盘访问权限」授权。"
   },
   "toast": {
     "finished": "完成了",

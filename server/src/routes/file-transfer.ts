@@ -18,9 +18,11 @@ import {
   FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
   FILE_TRANSFER_PATH_MAX_BYTES,
   FILE_TRANSFER_MSG,
+  MACOS_OPEN_FULL_DISK_ACCESS_ERROR,
   validateFileDeleteRequest,
   validateFileDirectoryListRequest,
   validateFilePathHandleRequest,
+  validateMacosOpenFullDiskAccessRequest,
 } from '../../../shared/transport/file-transfer.js';
 import {
   DIRECT_FILE_TRANSFER_UPLOAD_RECOVERY_CAPABILITY,
@@ -366,6 +368,7 @@ const authMiddleware = requireAuth();
 fileTransferRoutes.use('/:id/upload', authMiddleware);
 fileTransferRoutes.use('/:id/machine-file-handle', authMiddleware);
 fileTransferRoutes.use('/:id/machine-file-list', authMiddleware);
+fileTransferRoutes.use('/:id/macos-open-full-disk-access', authMiddleware);
 fileTransferRoutes.use('/:id/machine-direct-upload', authMiddleware);
 fileTransferRoutes.use('/:id/machine-direct-fetch', authMiddleware);
 fileTransferRoutes.use('/:id/uploads/:attachmentId/download-token', authMiddleware);
@@ -749,6 +752,59 @@ fileTransferRoutes.post('/:id/machine-file-list', async (c) => {
     }
     if (reason === 'timeout') return c.json({ error: 'timeout' }, 504);
     return c.json({ error: 'directory_list_failed' }, 500);
+  }
+});
+
+/**
+ * Reveal the native macOS Full Disk Access settings pane on the controlled
+ * node, in the signed-in user's own session, after `/machine-file-list`
+ * reported `macos_full_disk_access_required`. No request body; reuses the
+ * directory capability gate since only a daemon that can list directories
+ * ever needs this. Non-macOS daemons answer `unsupported_platform`.
+ */
+fileTransferRoutes.post('/:id/macos-open-full-disk-access', async (c) => {
+  const serverId = c.req.param('id')!;
+  const gate = await authorizeControlledFileTarget(
+    c,
+    serverId,
+    FILE_TRANSFER_DIRECTORY_CAPABILITY,
+    true,
+    true,
+  );
+  if (!gate.ok) return controlledTargetGateError(c, gate.reason);
+
+  const requestId = randomHex(16);
+  const parsed = validateMacosOpenFullDiskAccessRequest({
+    type: FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS,
+    requestId,
+  });
+  if (!parsed.ok) return c.json({ error: FS_GENERIC_ERROR_CODES.INVALID_REQUEST }, 400);
+
+  try {
+    const result = await gate.bridge.sendFileTransferRequest(
+      requestId,
+      parsed.value as unknown as Record<string, unknown>,
+      FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS,
+      undefined,
+      gate.daemonGeneration,
+    );
+    if (result.type === FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS_ERROR) {
+      const reason = Object.values(MACOS_OPEN_FULL_DISK_ACCESS_ERROR).includes(result.error as never)
+        ? result.error
+        : 'open_failed';
+      return c.json({ error: reason }, 400);
+    }
+    if (result.type !== FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS_DONE) {
+      return c.json({ error: 'invalid_daemon_response' }, 502);
+    }
+    return c.json({ ok: true });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : 'open_failed';
+    if (reason === 'daemon_offline' || reason === 'daemon_disconnected' || reason === 'daemon_generation_changed') {
+      return c.json({ error: 'daemon_offline' }, 503);
+    }
+    if (reason === 'timeout') return c.json({ error: 'timeout' }, 504);
+    return c.json({ error: 'open_failed' }, 500);
   }
 });
 

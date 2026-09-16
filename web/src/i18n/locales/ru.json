@@ -967,7 +967,11 @@
     "downloads": "Загрузки",
     "documents": "Документы",
     "capacity_free": "Свободно {{free}}",
-    "capacity_detail": "Свободно {{free}} из {{total}}"
+    "capacity_detail": "Свободно {{free}} из {{total}}",
+    "macos_fda_prompt": "На этом Mac не предоставлен полный доступ к диску, поэтому папки Загрузки/Рабочий стол/Документы недоступны.",
+    "macos_fda_prompt_action": "Открыть настройки на этом Mac",
+    "macos_fda_prompt_opening": "Открывается…",
+    "macos_fda_prompt_open_failed": "Не удалось открыть настройки на этом Mac. Откройте их сами: Системные настройки → Конфиденциальность и безопасность → Полный доступ к диску."
   },
   "toast": {
     "finished": "завершено",

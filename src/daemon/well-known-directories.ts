@@ -124,6 +124,17 @@ export interface WellKnownDirectoryDeps {
   readWindowsRegistryValue?: (key: string, valueName: string) => Promise<string | null>;
   /** True when the path exists and is a directory. */
   directoryExists?: (candidate: string) => Promise<boolean>;
+  /**
+   * True when `candidate` exists but access was denied for a PERMISSION
+   * reason (EPERM/EACCES) rather than genuinely not existing -- the macOS
+   * Full Disk Access signature, where TCC lets a stat through but the
+   * directory is otherwise off limits to this process.
+   *
+   * Defaults to a no-op (always false) so every existing caller/test that
+   * never mentions this dep keeps its exact current behavior; only
+   * `resolveWellKnownDirectoryDetailed` wires the real filesystem check.
+   */
+  checkPermissionDenied?: (candidate: string) => Promise<boolean>;
 }
 
 async function defaultDirectoryExists(candidate: string): Promise<boolean> {
@@ -131,6 +142,21 @@ async function defaultDirectoryExists(candidate: string): Promise<boolean> {
     return (await fsStat(candidate)).isDirectory();
   } catch {
     return false;
+  }
+}
+
+/** Node's signature for "exists, but this process may not touch it." */
+export function isPermissionDeniedError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === 'EPERM' || code === 'EACCES';
+}
+
+async function defaultCheckPermissionDenied(candidate: string): Promise<boolean> {
+  try {
+    await fsStat(candidate);
+    return false;
+  } catch (error) {
+    return isPermissionDeniedError(error);
   }
 }
 
@@ -397,11 +423,82 @@ export async function wellKnownDirectoryCandidates(
   return wellKnownDirectoryCandidatesForTarget(kind, platform, target, deps);
 }
 
-const resolutionCache = new Map<string, Promise<string>>();
+export interface WellKnownDirectoryResolution {
+  /** The resolved path -- same value `resolveWellKnownDirectory` returns. */
+  path: string;
+  /**
+   * True when every well-known candidate existed but was denied for a
+   * permission reason (never true for HOME, and only ever true on darwin):
+   * the macOS Full Disk Access signature. A caller that cares --
+   * `handleFileDirectoryList` -- can surface that distinctly instead of
+   * silently landing in `path` (the fallback home directory) mislabeled as
+   * whichever folder the user actually asked for.
+   */
+  permissionDenied: boolean;
+}
+
+interface WellKnownDirectoryResolutionInternal extends WellKnownDirectoryResolution {}
+
+const resolutionCache = new Map<string, Promise<WellKnownDirectoryResolutionInternal>>();
 
 /** Drop memoized lookups. Tests use this; production has no reason to. */
 export function clearWellKnownDirectoryCache(): void {
   resolutionCache.clear();
+}
+
+/**
+ * The first candidate that exists, or the home directory.
+ *
+ * Never returns a path that does not exist: a shortcut button that reports
+ * "not found" teaches the user nothing, whereas landing in the target home is
+ * recoverable and the resolved path is echoed back in `resolvedPath`. A macOS
+ * root daemon with no active Aqua user rejects instead of exposing root's home.
+ *
+ * Shared by `resolveWellKnownDirectory` (below) and
+ * `resolveWellKnownDirectoryDetailed`, which differ only in whether a real
+ * permission check is wired by default -- see `checkPermissionDenied` on
+ * `WellKnownDirectoryDeps`.
+ */
+async function resolveWellKnownDirectoryInternal(
+  kind: WellKnownDirectoryKind,
+  deps: WellKnownDirectoryDeps,
+): Promise<WellKnownDirectoryResolutionInternal> {
+  const ownHome = deps.homedir?.() ?? osHomedir();
+  const platform = deps.platform ?? process.platform;
+  const env = deps.env ?? process.env;
+  const target = await resolveTargetUser(platform, ownHome, env, deps);
+
+  // A service's own home is stable while its interactive account can switch,
+  // so the resolved target home must be part of the identity. The permission
+  // checker's presence is part of the key too, so a plain
+  // `resolveWellKnownDirectory` call (no-op checker) and a
+  // `resolveWellKnownDirectoryDetailed` call (real checker) for the same
+  // kind/identity never share a cache entry.
+  const cacheKey = `${platform}:${ownHome}:${target.home}:${kind}:${deps.checkPermissionDenied ? 'checked' : 'unchecked'}`;
+  const cached = resolutionCache.get(cacheKey);
+  if (cached) return cached;
+
+  const directoryExists = deps.directoryExists ?? defaultDirectoryExists;
+  const checkPermissionDenied = deps.checkPermissionDenied ?? (async () => false);
+  const pending = (async (): Promise<WellKnownDirectoryResolutionInternal> => {
+    const candidates = await wellKnownDirectoryCandidatesForTarget(kind, platform, target, deps);
+    // HOME yields exactly one candidate and must not be existence-filtered
+    // down to our own profile; an unreachable home is still the right answer.
+    if (kind === WELL_KNOWN_DIRECTORY.HOME) {
+      return { path: candidates[0] ?? ownHome, permissionDenied: false };
+    }
+    let permissionDenied = false;
+    for (const candidate of candidates) {
+      if (await directoryExists(candidate)) return { path: candidate, permissionDenied: false };
+      if (platform === 'darwin' && await checkPermissionDenied(candidate)) permissionDenied = true;
+    }
+    // Last resort is the TARGET's home, not ours -- falling back to the
+    // service profile is the bug this whole path exists to avoid.
+    return { path: candidates.at(-1) ?? ownHome, permissionDenied };
+  })().catch((): WellKnownDirectoryResolutionInternal => ({ path: target.home, permissionDenied: false }));
+
+  resolutionCache.set(cacheKey, pending);
+  return pending;
 }
 
 /**
@@ -416,31 +513,23 @@ export async function resolveWellKnownDirectory(
   kind: WellKnownDirectoryKind,
   deps: WellKnownDirectoryDeps = {},
 ): Promise<string> {
-  const ownHome = deps.homedir?.() ?? osHomedir();
-  const platform = deps.platform ?? process.platform;
-  const env = deps.env ?? process.env;
-  const target = await resolveTargetUser(platform, ownHome, env, deps);
+  return (await resolveWellKnownDirectoryInternal(kind, deps)).path;
+}
 
-  // A service's own home is stable while its interactive account can switch,
-  // so the resolved target home must be part of the identity.
-  const cacheKey = `${platform}:${ownHome}:${target.home}:${kind}`;
-  const cached = resolutionCache.get(cacheKey);
-  if (cached) return cached;
-
-  const directoryExists = deps.directoryExists ?? defaultDirectoryExists;
-  const pending = (async () => {
-    const candidates = await wellKnownDirectoryCandidatesForTarget(kind, platform, target, deps);
-    // HOME yields exactly one candidate and must not be existence-filtered
-    // down to our own profile; an unreachable home is still the right answer.
-    if (kind === WELL_KNOWN_DIRECTORY.HOME) return candidates[0] ?? ownHome;
-    for (const candidate of candidates) {
-      if (await directoryExists(candidate)) return candidate;
-    }
-    // Last resort is the TARGET's home, not ours -- falling back to the
-    // service profile is the bug this whole path exists to avoid.
-    return candidates.at(-1) ?? ownHome;
-  })().catch(() => target.home);
-
-  resolutionCache.set(cacheKey, pending);
-  return pending;
+/**
+ * Same resolution as `resolveWellKnownDirectory`, but also reports whether
+ * candidates existed yet were denied for a permission reason (macOS Full
+ * Disk Access) rather than genuinely not existing, so a caller that cares --
+ * `handleFileDirectoryList` -- can surface that distinctly instead of
+ * silently returning the fallback home directory mislabeled as the folder
+ * the user actually asked for.
+ */
+export async function resolveWellKnownDirectoryDetailed(
+  kind: WellKnownDirectoryKind,
+  deps: WellKnownDirectoryDeps = {},
+): Promise<WellKnownDirectoryResolution> {
+  return resolveWellKnownDirectoryInternal(kind, {
+    checkPermissionDenied: defaultCheckPermissionDenied,
+    ...deps,
+  });
 }

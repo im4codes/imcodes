@@ -189,6 +189,27 @@ export async function listMachineDirectories(
   return { resolvedPath: result.resolvedPath, entries };
 }
 
+/**
+ * Ask a controlled node running macOS to reveal its native Full Disk Access
+ * settings pane, in the signed-in user's own session, so they can grant it
+ * to the daemon themselves. Call this after `listMachineDirectories` throws
+ * an `ApiError` whose `code` is
+ * `FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED`.
+ * Throws on failure; the thrown `ApiError.code` is one of
+ * `MACOS_OPEN_FULL_DISK_ACCESS_ERROR` (or a transport code such as
+ * `daemon_offline`/`timeout`).
+ */
+export async function openMacosFullDiskAccessSettings(
+  serverId: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const result = await apiFetch<{ ok?: boolean }>(
+    `/api/server/${encodeURIComponent(serverId)}/macos-open-full-disk-access`,
+    { method: 'POST', body: JSON.stringify({}), signal },
+  );
+  if (result.ok !== true) throw new Error('macos_open_full_disk_access_failed');
+}
+
 const ENROLL_V2_AVAILABILITY_PATH = '/api/enroll/v2/availability';
 const ENROLL_V2_TICKET_PATH = '/api/enroll/v2/ticket';
 const ENROLL_V2_BOOTSTRAP_PATH = '/api/enroll/v2/bootstrap';

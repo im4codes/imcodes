@@ -967,7 +967,11 @@
     "downloads": "下載",
     "documents": "文件",
     "capacity_free": "剩餘 {{free}}",
-    "capacity_detail": "剩餘 {{free}} / 共 {{total}}"
+    "capacity_detail": "剩餘 {{free}} / 共 {{total}}",
+    "macos_fda_prompt": "這台 Mac 尚未授予「完整磁碟取用權限」，無法讀取下載/桌面/文件。",
+    "macos_fda_prompt_action": "在該 Mac 上開啟系統設定",
+    "macos_fda_prompt_opening": "正在開啟…",
+    "macos_fda_prompt_open_failed": "未能在該 Mac 上開啟系統設定，請自行前往「系統設定 → 隱私權與安全性 → 完整磁碟取用權限」授權。"
   },
   "toast": {
     "finished": "已完成",

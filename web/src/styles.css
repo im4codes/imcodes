@@ -11493,6 +11493,46 @@ button.quick-agent-delegation-preset.active {
   text-overflow: ellipsis;
 }
 
+.fb-macos-fda-prompt {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding: 6px 10px;
+  margin: 4px 6px 0;
+  font-size: 12px;
+  color: #ffe8b8;
+  background: rgb(89 58 8 / 55%);
+  border: 1px solid rgb(255 196 92 / 40%);
+  border-radius: 8px;
+}
+
+.fb-macos-fda-prompt-text {
+  flex: 1 1 auto;
+  min-width: 160px;
+}
+
+.fb-macos-fda-prompt-btn {
+  flex: 0 0 auto;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: #1a1200;
+  white-space: nowrap;
+  cursor: pointer;
+  background: #ffc45c;
+  border: none;
+  border-radius: 999px;
+}
+
+.fb-macos-fda-prompt-btn:hover:not(:disabled) {
+  background: #ffd685;
+}
+
+.fb-macos-fda-prompt-btn:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
 .remote-desktop-file-drawer {
   /* Covers the whole remote desktop panel. It used to be a draggable window,
      which fought the desktop for pointer input along its edges and could not

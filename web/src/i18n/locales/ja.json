@@ -967,7 +967,11 @@
     "downloads": "ダウンロード",
     "documents": "書類",
     "capacity_free": "空き {{free}}",
-    "capacity_detail": "空き {{free}} / 全体 {{total}}"
+    "capacity_detail": "空き {{free}} / 全体 {{total}}",
+    "macos_fda_prompt": "このMacはフルディスクアクセスが許可されていないため、ダウンロード/デスクトップ/書類を読み取れません。",
+    "macos_fda_prompt_action": "そのMacで設定を開く",
+    "macos_fda_prompt_opening": "開いています…",
+    "macos_fda_prompt_open_failed": "そのMacで設定を開けませんでした。Macで「システム設定」→「プライバシーとセキュリティ」→「フルディスクアクセス」を自分で開いてください。"
   },
   "toast": {
     "finished": "完了",

@@ -967,7 +967,11 @@
     "downloads": "다운로드",
     "documents": "문서",
     "capacity_free": "{{free}} 남음",
-    "capacity_detail": "{{total}} 중 {{free}} 남음"
+    "capacity_detail": "{{total}} 중 {{free}} 남음",
+    "macos_fda_prompt": "이 Mac에서 전체 디스크 접근 권한이 허용되지 않아 다운로드/데스크탑/문서를 읽을 수 없습니다.",
+    "macos_fda_prompt_action": "해당 Mac에서 설정 열기",
+    "macos_fda_prompt_opening": "여는 중…",
+    "macos_fda_prompt_open_failed": "해당 Mac에서 설정을 열지 못했습니다. 직접 시스템 설정 → 개인정보 보호 및 보안 → 전체 디스크 접근 권한에서 열어주세요."
   },
   "toast": {
     "finished": "완료됨",

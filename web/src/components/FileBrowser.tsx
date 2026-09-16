@@ -1,6 +1,7 @@
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { FS_TRANSPORT_MSG } from '@shared/fs-transport-messages.js';
-import { FILE_TRANSFER_DIRECTORY_PATH } from '@shared/transport/file-transfer.js';
+import { FILE_TRANSFER_DIRECTORY_PATH, FILE_TRANSFER_DIRECTORY_LIST_ERROR } from '@shared/transport/file-transfer.js';
+import { openMacosFullDiskAccessSettings } from '../api/machines.js';
 import { formatByteSize } from '../util/byte-size.js';
 /**
  * FileBrowser — universal reusable file/directory browser.
@@ -561,6 +562,11 @@ export function FileBrowser({
   const dataRef = useRef(data);
   useEffect(() => { dataRef.current = data; }, [data]);
   const [error, setError] = useState<string | null>(null);
+  // Set only for the specific "this machine's Downloads/Desktop/Documents
+  // are TCC-blocked" signal, never for generic errors -- those keep using
+  // the small ⚠ nav-button indicator. Cleared on the next successful fetch
+  // and whenever the user dismisses or acts on it.
+  const [macosFdaPrompt, setMacosFdaPrompt] = useState<{ requesting: boolean; requestFailed: boolean } | null>(null);
   const [showHidden, setShowHidden] = useState(DEFAULT_SHOW_HIDDEN_FILES);
   const [preview, setPreview] = useState<FileBrowserPreviewState>(() => initialPreview ?? { status: 'idle' });
   const previewRef = useRef<FileBrowserPreviewState>(preview);
@@ -852,6 +858,11 @@ export function FileBrowser({
 
         if (msg.status === 'error') {
           setError(msg.error ?? 'Unknown error');
+          setMacosFdaPrompt(
+            msg.error === FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED
+              ? { requesting: false, requestFailed: false }
+              : null,
+          );
           // A failed fetch for the CURRENT root location (as opposed to one
           // nested child the user expanded deeper in the tree) must not
           // leave the browser stuck showing a fake, unresolved location with
@@ -915,6 +926,7 @@ export function FileBrowser({
         // fallback a failed root navigation would revert to.
         if (dataRef.current[0]?.id === nodeId) lastGoodLabelRef.current = nextLabel;
         setError(null);
+        setMacosFdaPrompt(null);
 
         // If highlightPath is under this dir, auto-expand
         if (highlightPath && (highlightPath.startsWith(resolvedParent + '/') || highlightPath.startsWith(resolvedParent + '\\'))) {
@@ -1430,6 +1442,20 @@ export function FileBrowser({
       navigateTo(parent);
     }
   }, [currentLabel, navigateTo]);
+
+  // Only ever invoked from the `macosFdaPrompt` banner below, which only
+  // renders after a `file.directory_list_error` carrying
+  // FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED --
+  // meaning `serverId` is guaranteed present (the sentinel came from a
+  // remote machine, not this browser).
+  const requestMacosFullDiskAccess = useCallback(() => {
+    if (!serverId) return;
+    setMacosFdaPrompt({ requesting: true, requestFailed: false });
+    void openMacosFullDiskAccessSettings(serverId).then(
+      () => { if (mountedRef.current) setMacosFdaPrompt({ requesting: false, requestFailed: false }); },
+      () => { if (mountedRef.current) setMacosFdaPrompt({ requesting: false, requestFailed: true }); },
+    );
+  }, [serverId]);
 
   // Load root on mount and re-load when ws changes (server switch).
   // fetchDir changes when ws changes (useCallback dep), so this also re-runs on server switch.
@@ -2383,6 +2409,21 @@ export function FileBrowser({
               <span class="fb-quick-access-label">{target.label}</span>
             </button>
           ))}
+        </div>
+      )}
+      {quickAccess && macosFdaPrompt && (
+        <div class="fb-macos-fda-prompt" role="alert">
+          <span class="fb-macos-fda-prompt-text">
+            {t(macosFdaPrompt.requestFailed ? 'file_browser.macos_fda_prompt_open_failed' : 'file_browser.macos_fda_prompt')}
+          </span>
+          <button
+            type="button"
+            class="fb-macos-fda-prompt-btn"
+            disabled={macosFdaPrompt.requesting}
+            onClick={requestMacosFullDiskAccess}
+          >
+            {t(macosFdaPrompt.requesting ? 'file_browser.macos_fda_prompt_opening' : 'file_browser.macos_fda_prompt_action')}
+          </button>
         </div>
       )}
       <div class="fb-nav">

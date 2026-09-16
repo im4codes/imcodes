@@ -9605,6 +9605,7 @@ export class WsBridge {
       || parsedType === FILE_TRANSFER_MSG.PATH_HANDLE
       || parsedType === FILE_TRANSFER_MSG.DIRECTORY_LIST
       || parsedType === FILE_TRANSFER_MSG.DELETE
+      || parsedType === FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS
       || parsedType === MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST
       || parsedType === MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST
       || (typeof parsedType === 'string' && parsedType.startsWith('remote_desktop.'))

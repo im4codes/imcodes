@@ -1,4 +1,5 @@
 import { listMachineDirectories } from './api/machines.js';
+import { ApiError } from './api.js';
 import type { ServerMessage, WsClient } from './ws-client.js';
 
 type MessageListener = (message: ServerMessage) => void;
@@ -64,12 +65,18 @@ export class MachineDirectoryWsAdapter {
       });
     }, (error) => {
       if (controller.signal.aborted) return;
+      // An HTTP-level failure (4xx/5xx) throws an `ApiError` whose `.code` is
+      // the exact machine-readable string the route sent (e.g.
+      // `macos_full_disk_access_required`) -- `.message` wraps it in
+      // "API <status>: <code>" for logs, which FileBrowser must not have to
+      // parse to react to a specific code.
+      const code = error instanceof ApiError && typeof error.code === 'string' ? error.code : null;
       this.emit({
         type: 'fs.ls_response',
         requestId,
         path,
         status: 'error',
-        error: error instanceof Error ? error.message : 'machine_file_list_failed',
+        error: code ?? (error instanceof Error ? error.message : 'machine_file_list_failed'),
       });
     }).finally(() => this.controllers.delete(controller));
     return requestId;
