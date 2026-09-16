@@ -52,6 +52,14 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
+  // TRUNCATE CASCADE handles all FK dependencies (teams, team_members, ...)
+  // automatically. Without it, a fixed username like 'Alice' below can
+  // collide with a same-named user left behind by another integration test
+  // file sharing this one real Postgres container (e.g.
+  // password-register.integration.test.ts registers a real 'alice'), and
+  // the case-insensitive username lookup in resolveUserByIdentifier has no
+  // way to prefer this run's own row when more than one matches.
+  await db.exec('TRUNCATE users CASCADE');
   ownerId = await createUser(`owner-${hex(6)}`, `owner_${hex(4)}`);
   teamId = `team-${hex(8)}`;
   await db.execute(
