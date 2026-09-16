@@ -51,6 +51,7 @@ import {
 } from './agent-delegation.js';
 import {
   SUPERVISION_CI_SMOKE_STATUSES,
+  SUPERVISION_MODES,
   SUPERVISION_TASK_AUDIT_POLICIES,
   SUPERVISION_TASK_CLASSIFICATIONS,
   SUPERVISION_TASK_FILE_OPERATIONS,
@@ -589,6 +590,15 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
         type: 'string',
         enum: [...SUPERVISION_EXECUTION_POOL_KINDS],
         description: 'Echoed only when the caller requested an executionPool filter.',
+      },
+      supervisionMode: {
+        type: 'string',
+        enum: [...SUPERVISION_MODES],
+        description: "Project's supervision mode, from its Brain session.",
+      },
+      autoAudit: {
+        type: 'boolean',
+        description: 'True when supervisionMode is supervised_audit.',
       },
       items: {
         type: 'array',

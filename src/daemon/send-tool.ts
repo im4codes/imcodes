@@ -67,12 +67,14 @@ import {
   SUPERVISION_MODE,
   SUPERVISION_CONTRACT_IDS,
   isAuditableSupervisionTaskClassification,
+  isAutomaticSupervisionEnabled,
   isTerminalSupervisionTaskStatus,
   isSupervisionTaskAuditPolicy,
   readSupervisionSnapshotFromTransportConfig,
   resolveSupervisionAuditBlockingSeverities,
   supervisionTaskAuditPolicyFromSnapshot,
   type SessionSupervisionSnapshot,
+  type SupervisionMode,
   type SupervisionTaskMetadata,
 } from '../../shared/supervision-config.js';
 import { overlayCachedExecutionPools } from './supervisor-defaults-cache.js';
@@ -271,6 +273,17 @@ export type SendListTargetsResult =
       items: SendTargetInfo[];
       executionPoolsState: SupervisionExecutionPoolsConfig['state'];
       appliedExecutionPool?: SupervisionExecutionPoolKind;
+      /**
+       * The caller's project's current authoritative supervision mode (from
+       * its unique Brain session), surfaced on the tool the delegation
+       * eligibility contract already requires calling before every new
+       * dispatch -- so a Brain always sees the live switch state as part of
+       * a call it already makes, instead of relying on remembering a
+       * previously injected daemon control prompt.
+       */
+      supervisionMode: SupervisionMode;
+      /** `true` exactly when supervisionMode is 'supervised_audit'. */
+      autoAudit: boolean;
     }
   | { status: 'disabled'; reason: typeof MCP_ERROR_REASONS.FEATURE_DISABLED; disabledFlag: typeof SEND_MCP_DISPATCH_FEATURE_FLAG; items: [] }
   | { status: 'error'; reason: SendToolErrorReason; error: string; items: [] };
@@ -1009,9 +1022,12 @@ export function listSendTargets(
   // search. Same resolver as `dispatchSendMessage`, so a target this list
   // offers is never one the next send refuses.
   const availability = resolveDelegationTargets(delegationTargetInputs(allSessions), d.now());
+  const authoritativeSnapshot = resolveProjectAuthoritativeSupervisionSnapshot(callerProjectName, allSessions);
   return {
     status: 'ok',
     executionPoolsState: executionPools.state,
+    supervisionMode: authoritativeSnapshot.mode,
+    autoAudit: isAutomaticSupervisionEnabled(authoritativeSnapshot),
     ...(requestedPool === undefined ? {} : { appliedExecutionPool: requestedPool }),
     items: filtered.slice(0, limit).map(({ target, eligiblePools }) => toTargetInfo(
       target,

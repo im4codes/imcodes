@@ -16,6 +16,7 @@ import {
   reportImplementationNoProgressBlocker,
 } from '../../src/daemon/send-tool.js';
 import { isSendDispatchId, isSendMessageId } from '../../shared/send-message-id.js';
+import { normalizeSessionSupervisionSnapshot } from '../../shared/supervision-config.js';
 import { AGENT_DELEGATION_PURPOSES } from '../../shared/agent-delegation.js';
 import { getDelegationReplyStore } from '../../src/daemon/delegation-reply-store.js';
 import {
@@ -115,6 +116,55 @@ describe('send-tool', () => {
       },
     ]);
     expect(result.items[0]).not.toHaveProperty('projectDir');
+  });
+
+  it('surfaces the caller project\'s current supervision mode and auto-audit flag', () => {
+    const enabledSnapshot = normalizeSessionSupervisionSnapshot({
+      mode: 'supervised_audit',
+      backend: 'codex-sdk',
+      model: 'gpt-5.3-codex-spark',
+    });
+    const enabled = listSendTargets(caller, {}, {
+      listSessions: () => [
+        session({
+          name: 'deck_alpha_brain',
+          projectName: 'alpha',
+          role: 'brain',
+          transportConfig: { supervision: enabledSnapshot },
+        }),
+      ],
+    });
+    expect(enabled.status).toBe('ok');
+    if (enabled.status !== 'ok') throw new Error('expected ok');
+    expect(enabled.supervisionMode).toBe('supervised_audit');
+    expect(enabled.autoAudit).toBe(true);
+
+    const disabled = listSendTargets(caller, {}, {
+      listSessions: () => [
+        session({
+          name: 'deck_alpha_brain',
+          projectName: 'alpha',
+          role: 'brain',
+          transportConfig: { supervision: { mode: 'off' } },
+        }),
+      ],
+    });
+    expect(disabled.status).toBe('ok');
+    if (disabled.status !== 'ok') throw new Error('expected ok');
+    expect(disabled.supervisionMode).toBe('off');
+    expect(disabled.autoAudit).toBe(false);
+
+    // No Brain session at all (or no supervision configured yet) still
+    // answers with the fail-closed default instead of an absent field.
+    const noBrain = listSendTargets(caller, {}, {
+      listSessions: () => [
+        session({ name: 'deck_alpha_w1', projectName: 'alpha', role: 'w1' }),
+      ],
+    });
+    expect(noBrain.status).toBe('ok');
+    if (noBrain.status !== 'ok') throw new Error('expected ok');
+    expect(noBrain.supervisionMode).toBe('off');
+    expect(noBrain.autoAudit).toBe(false);
   });
 
   it('lists and filters by concrete model metadata', () => {
