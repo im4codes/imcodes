@@ -1,5 +1,7 @@
 #include "linux_platform_adapters.h"
 
+#include <cstdlib>
+#include <string>
 #include <utility>
 
 namespace imcodes::remote_desktop::linux_platform {
@@ -7,6 +9,33 @@ namespace imcodes::remote_desktop::linux_platform {
 using common::CapabilityReadiness;
 using common::GraphicalSessionEvent;
 using common::ReadinessState;
+
+namespace {
+
+/**
+ * Look for a real, already-configured VNC password in the conventional
+ * places a VNC install leaves one -- $HOME/.vnc/passwd (the classic
+ * vncserver/TigerVNC default) and $HOME/.vnc/x11vnc.passwd (x11vnc's own
+ * default when pointed at a per-user directory rather than an explicit
+ * path). Returns empty when nothing decodes, which is also the correct
+ * password to try against a server that only offers security type 1
+ * (None) -- VncCaptureAdapter never sends it unless the server actually
+ * asks for VNC Authentication.
+ */
+std::string DiscoverVncPassword() {
+  const char* home = std::getenv("HOME");
+  if (home == nullptr || home[0] == '\0') return {};
+  for (const std::string& candidate : {
+      std::string(home) + "/.vnc/passwd",
+      std::string(home) + "/.vnc/x11vnc.passwd",
+  }) {
+    std::string password = DecryptVncPasswordFile(candidate);
+    if (!password.empty()) return password;
+  }
+  return {};
+}
+
+}  // namespace
 
 // ── PortalCaptureAdapter ───────────────────────────────────────────────────
 
@@ -84,15 +113,29 @@ std::unique_ptr<LinuxPlatformAdapters> LinuxPlatformAdapters::Create(
 
   adapters->portal_capture_ = std::make_unique<PortalCaptureAdapter>(adapters->facts_);
   adapters->x11_capture_ = std::make_unique<X11CaptureAdapter>(connection);
+  // Constructed unconditionally, matching portal_capture_/x11_capture_ above,
+  // even though it is only ever selected as a last resort: readiness is
+  // still probed live below, not assumed from construction succeeding.
+  // 127.0.0.1:5900 is the RFB default and what this repo's own
+  // scripts/install-linux-desktop-environment.sh --with-vnc wires up.
+  adapters->vnc_capture_ = std::make_unique<VncCaptureAdapter>(
+      "127.0.0.1", static_cast<std::uint16_t>(5900), DiscoverVncPassword());
   adapters->input_ = std::make_unique<X11InputAdapter>(connection);
   adapters->clipboard_ = std::make_unique<X11ClipboardAdapter>(connection);
   adapters->display_ = std::make_unique<X11DisplayAdapter>(connection);
   adapters->disclosure_ = std::make_unique<X11DisclosureAdapter>(connection);
   adapters->session_monitor_ = std::make_unique<LinuxSessionMonitor>(adapters->facts_);
 
-  // Prefer the portal, then fall back — but only to a backend that is really
-  // ready. Asking the adapters rather than trusting the policy keeps a
-  // half-available portal from stranding an otherwise working X11 host.
+  // Prefer the portal, then direct X11, then VNC as a last resort -- in
+  // strictly decreasing order of performance, never the other way. Asking
+  // the adapters rather than trusting policy keeps a half-available portal
+  // (or a VNC server that turns out unreachable) from stranding an
+  // otherwise working host; VNC in particular only gets picked when this
+  // process could not otherwise capture anything, since it hands the whole
+  // encode/decode round trip to a second process this session does not
+  // control. See linux_vnc_backend.h's own header comment for that
+  // performance reasoning and linux_platform_adapters.h's class comment for
+  // this exact ordering restated at the class level.
   if (adapters->portal_capture_->ProbeReadiness() == ReadinessState::kReady) {
     adapters->capture_ = adapters->portal_capture_.get();
     adapters->active_backend_ = CaptureBackend::kPortalPipeWire;
@@ -100,6 +143,9 @@ std::unique_ptr<LinuxPlatformAdapters> LinuxPlatformAdapters::Create(
              && adapters->x11_capture_->ProbeReadiness() == ReadinessState::kReady) {
     adapters->capture_ = adapters->x11_capture_.get();
     adapters->active_backend_ = CaptureBackend::kX11Shm;
+  } else if (adapters->vnc_capture_->ProbeReadiness() == ReadinessState::kReady) {
+    adapters->capture_ = adapters->vnc_capture_.get();
+    adapters->active_backend_ = CaptureBackend::kVnc;
   } else {
     // Nothing qualified. Keep a non-null adapter so callers never dereference
     // null, but leave the backend as none so readiness stays unavailable.

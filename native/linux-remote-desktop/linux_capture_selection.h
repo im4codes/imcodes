@@ -16,6 +16,16 @@ enum class CaptureBackend : std::uint8_t {
   kPortalPipeWire,
   /** Explicit fallback: direct X11 server capture (XShm when available). */
   kX11Shm,
+  /**
+   * Last-resort fallback: an already-running VNC (RFB) server on this host,
+   * consumed as a client (linux_vnc_backend.h). Strictly slower and higher
+   * latency than kX11Shm -- it adds a whole extra RFB encode/decode hop
+   * before this process's own H264/VP8 encoder ever sees a frame -- so
+   * LinuxPlatformAdapters::Create() only reaches for it when neither Portal
+   * nor direct X11 capture actually works, never as a first choice. See
+   * that function's own comment for the exact live selection order.
+   */
+  kVnc,
 };
 
 /**
@@ -30,6 +40,15 @@ enum class CaptureBackend : std::uint8_t {
  * Selecting a backend is not permission to stream. `ProbeCaptureReadiness`
  * still gates the session, and a backend may be selected while readiness is
  * unavailable — the caller must check both.
+ *
+ * KNOWN GAP: this function is deliberately pure and fact-only (no network
+ * I/O), so it does not and cannot pick kVnc -- detecting a real VNC server
+ * requires an actual TCP probe, which belongs in the live, adapter-owning
+ * path (LinuxPlatformAdapters::Create()), not in this side-effect-free
+ * pre-advertisement policy check. A host whose only working capture path is
+ * VNC will therefore under-report itself here even though a live session on
+ * it would actually work. Left as a known, documented gap rather than
+ * quietly grown into a function every existing caller assumed had no I/O.
  */
 [[nodiscard]] CaptureBackend SelectCaptureBackend(const SessionFacts& facts) noexcept;
 

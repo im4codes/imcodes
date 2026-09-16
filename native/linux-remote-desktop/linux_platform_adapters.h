@@ -13,6 +13,7 @@
 #include "../remote-desktop-common/platform_interfaces.h"
 #include "linux_capability_probe.h"
 #include "linux_capture_selection.h"
+#include "linux_vnc_backend.h"
 #include "linux_x11_backend.h"
 
 namespace imcodes::remote_desktop::linux_platform {
@@ -76,10 +77,17 @@ class LinuxSessionMonitor final : public common::SessionMonitor {
 /**
  * The concrete adapters for one Linux session, owned together.
  *
- * `capture` is chosen at runtime rather than from policy alone: the portal is
- * preferred, but if the portal adapter does not report ready the X11 fallback
- * is used when the session is genuinely X11. That keeps "prefer portal" from
- * degrading a working X11 host into no capture at all.
+ * `capture` is chosen at runtime rather than from policy alone, in
+ * strictly-decreasing-performance order: Portal/PipeWire first when ready
+ * (the only sanctioned path under Wayland), then direct X11 capture when
+ * ready (one capture-then-encode hop, the fastest path this process itself
+ * controls), then -- only when NEITHER of those actually works -- a VNC
+ * server already running on this host, reused as a client rather than
+ * requiring this session to have its own X11/XTest access. VNC is
+ * deliberately last: routing frames through a second, independent RFB
+ * encode/decode round trip is real added latency and CPU that a host
+ * capable of Portal or direct X11 has no reason to pay. See Create()'s own
+ * comment at the selection call site for exactly how each tier is probed.
  */
 class LinuxPlatformAdapters {
  public:
@@ -116,6 +124,7 @@ class LinuxPlatformAdapters {
   CaptureBackend active_backend_ = CaptureBackend::kNone;
   std::unique_ptr<PortalCaptureAdapter> portal_capture_;
   std::unique_ptr<X11CaptureAdapter> x11_capture_;
+  std::unique_ptr<VncCaptureAdapter> vnc_capture_;
   common::CaptureAdapter* capture_ = nullptr;
   std::unique_ptr<X11InputAdapter> input_;
   std::unique_ptr<X11ClipboardAdapter> clipboard_;

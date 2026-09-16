@@ -34,6 +34,7 @@ std::string_view CaptureBackendName(CaptureBackend backend) noexcept {
   switch (backend) {
     case CaptureBackend::kPortalPipeWire: return "portal-pipewire";
     case CaptureBackend::kX11Shm: return "x11-shm";
+    case CaptureBackend::kVnc: return "vnc";
     case CaptureBackend::kNone: break;
   }
   return "none";
