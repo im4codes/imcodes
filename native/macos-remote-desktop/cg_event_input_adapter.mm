@@ -282,7 +282,15 @@ public:
   bool EmitWheel(double delta_x, double delta_y) override {
     if (!AXIsProcessTrusted())
       return false;
-    const auto vertical = static_cast<std::int32_t>(std::llround(delta_y));
+    // delta_y arrives in DOM WheelEvent convention: positive means the
+    // operator scrolled toward later/lower content (content moves up).
+    // CGEventCreateScrollWheelEvent's vertical wheel count is the opposite
+    // sign -- positive scrolls UP (toward earlier/higher content), the same
+    // convention as Win32's MOUSEEVENTF_WHEEL, which the Windows backend
+    // already negates for exactly this reason (input_injector.cc). This
+    // backend was missing the equivalent negation, so every vertical scroll
+    // sent to a macOS target came out inverted.
+    const auto vertical = static_cast<std::int32_t>(std::llround(-delta_y));
     const auto horizontal = static_cast<std::int32_t>(std::llround(delta_x));
     if (vertical == 0 && horizontal == 0)
       return true;
