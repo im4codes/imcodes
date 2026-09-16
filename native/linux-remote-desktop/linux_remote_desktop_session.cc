@@ -1,5 +1,6 @@
 #include "linux_remote_desktop_session.h"
 
+#include <chrono>
 #include <cstdio>
 #include <utility>
 
@@ -95,6 +96,35 @@ class CreateAnswerObs : public webrtc::CreateSessionDescriptionObserver {
   std::function<void(std::unique_ptr<webrtc::SessionDescriptionInterface>)>
       on_success_;
 };
+
+/**
+ * A real, freshly-sampled TransportTime -- unix_ms from the wall clock,
+ * monotonic_ms from a genuine monotonic clock (never the same source as
+ * unix_ms, even though both happen to be "milliseconds since some epoch"):
+ * TransportSessionCore::ObserveTime() rejects any call whose monotonic_ms
+ * goes backward relative to the last one it saw, which callers such as
+ * Start() already satisfy correctly by construction, but
+ * webrtc::PeerConnectionObserver callbacks like OnConnectionChange take no
+ * "now" parameter from outside (unlike, e.g., macOS's
+ * MacosRemoteDesktopSession, whose OnPeerConnectionState() is fed a real
+ * SampleNow() from its own worker main file) -- this session has to
+ * synthesize one internally. A previous version of OnConnectionChange
+ * passed TransportTime{} (zero-initialized), which reads as valid on its
+ * own (TransportTime::IsValid() only requires non-negative fields) but is
+ * always less than whatever real monotonic value an earlier Start() call
+ * already recorded, immediately failing that regression check and
+ * terminating the transport the instant OnConnectionChange ever fired again
+ * -- silently, since ObserveTime's own failure path reports
+ * kProtocolViolation, not anything that named the real cause.
+ */
+common::TransportTime SampleNow() noexcept {
+  const auto unix_now = std::chrono::system_clock::now().time_since_epoch();
+  const auto steady_now = std::chrono::steady_clock::now().time_since_epoch();
+  return common::TransportTime{
+      std::chrono::duration_cast<std::chrono::milliseconds>(unix_now).count(),
+      std::chrono::duration_cast<std::chrono::milliseconds>(steady_now).count(),
+  };
+}
 
 }  // namespace
 
@@ -397,8 +427,7 @@ void LinuxRemoteDesktopSession::OnConnectionChange(
       mapped = PeerConnectionState::kClosed;
       break;
   }
-  common::TransportTime now{};
-  transport_core_.OnPeerConnectionState(CallbackStamp(), mapped, now);
+  transport_core_.OnPeerConnectionState(CallbackStamp(), mapped, SampleNow());
 }
 
 // --- real input dispatch through common::SessionCore -----------------------

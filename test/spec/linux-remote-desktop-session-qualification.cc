@@ -175,10 +175,20 @@ int main() {
   authority.identity.route_generation = 1;
   authority.mode = common::TransportSessionMode::kView;
   authority.input_epoch = 1;
-  const int64_t now_unix_ms = 1'700'000'000'000;
+  // Real wall-clock and monotonic time, not a fixed historical placeholder:
+  // LinuxRemoteDesktopSession::OnConnectionChange() (see its own SampleNow()
+  // comment) samples a REAL current TransportTime once the connection
+  // actually progresses, and TransportSessionCore::AuthorityAlive() checks
+  // that real "now" against expires_at_unix_ms/lease_expires_at_unix_ms --
+  // a hardcoded November-2023 authority reads as already expired by any
+  // later real clock reading.
+  const int64_t now_unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+  const int64_t now_monotonic_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
   authority.expires_at_unix_ms = now_unix_ms + 60'000;
   authority.lease_expires_at_unix_ms = now_unix_ms + 60'000;
-  common::TransportTime now{now_unix_ms, 0};
+  common::TransportTime now{now_unix_ms, now_monotonic_ms};
 
   if (!session->Start(authority, now)) {
     std::fprintf(stderr, "session->Start failed\n");
