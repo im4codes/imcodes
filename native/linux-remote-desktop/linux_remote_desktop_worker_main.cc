@@ -153,8 +153,15 @@ class WorkerSession {
   void ApplyOffer(const imcodes::rd::Authority& request_authority, const std::string& sdp) {
     session_->ApplyOffer(sdp, [request_authority](bool ok, const std::string& answer_sdp) {
       if (!ok) {
+        // "worker_failed", not a made-up string: shared/remote-desktop.ts's
+        // REMOTE_DESKTOP_TERMINAL_REASON is the exact, closed wire
+        // vocabulary validateRemoteDesktopDaemonMessage enforces, and this
+        // is the same fallback macOS's own worker uses for an
+        // adapter/session-level failure with no more specific reason code
+        // (see WorkerTransportSink::OnSessionTerminal in
+        // macos_remote_desktop_worker_main.mm).
         WriteLine(imcodes::rd::TerminalEnvelope(request_authority,
-                                                "adapter_failure"));
+                                                "worker_failed"));
         return;
       }
       Json::Value answer = imcodes::rd::BaseEnvelope(imcodes::rd::kAnswerType, request_authority);
@@ -201,7 +208,13 @@ class Worker {
         auto session = std::make_shared<WorkerSession>(
             factory_, adapters_, signaling_thread_, signal.authority);
         if (!session->Start(signal.authority)) {
-          WriteLine(imcodes::rd::TerminalEnvelope(signal.authority, "adapter_failure"));
+          // "protocol_error": TransportSessionCore::Start() only refuses an
+          // authority that fails its own validity check (bad identity,
+          // already-expired lease, control mode with no input epoch, ...),
+          // which is a malformed/invalid request, not an adapter/media
+          // failure -- see this file's other TerminalEnvelope call for why
+          // that gets "worker_failed" instead.
+          WriteLine(imcodes::rd::TerminalEnvelope(signal.authority, "protocol_error"));
           return;
         }
         sessions_.emplace(session_id, std::move(session));
@@ -221,7 +234,12 @@ class Worker {
         auto it = sessions_.find(signal.authority.session_id);
         if (it == sessions_.end()) return;
         it->second->Stop();
-        WriteLine(imcodes::rd::TerminalEnvelope(signal.authority, "stopped"));
+        // "stopped_by_controller": a STOP always originates from the
+        // daemon/server side of the wire (there is no local-user stop
+        // surface on this delivery model), matching macOS's own worker
+        // comment on why explicit STOP gets its terminal reply from the
+        // command handler rather than from OnTerminal's kStopped case.
+        WriteLine(imcodes::rd::TerminalEnvelope(signal.authority, "stopped_by_controller"));
         sessions_.erase(it);
         return;
       }

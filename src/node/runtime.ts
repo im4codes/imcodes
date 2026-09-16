@@ -70,6 +70,7 @@ import {
   MacosRemoteDesktopWorkerHost,
   type MacosRemoteDesktopWorkerHostOptions,
 } from './macos-remote-desktop-worker-host.js';
+import { LinuxRemoteDesktopWorkerHost } from './linux-remote-desktop-worker-host.js';
 import {
   REMOTE_DESKTOP_SESSION_PROFILE_CAPABILITIES,
   resolveRemoteDesktopSessionProfile,
@@ -219,6 +220,9 @@ export function createPlatformRemoteDesktopWorkerHost(input: {
       runtime: { platform: input.platform, arch: input.arch },
     });
     return { worker, startup: () => worker.start() };
+  }
+  if (input.platform === 'linux' && input.arch === 'x64') {
+    return { worker: new LinuxRemoteDesktopWorkerHost(input.onMessage) };
   }
   return { worker: new UnavailableRemoteDesktopWorkerHost() };
 }
