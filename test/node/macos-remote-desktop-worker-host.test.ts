@@ -749,6 +749,35 @@ describe('macOS remote-desktop worker host', () => {
     expect(value.serverStarts).toHaveBeenCalledTimes(3);
   });
 
+  it('stops restarting after repeated agent_crash events instead of looping forever', async () => {
+    // Reproduces the observed production failure: a resident agent whose
+    // worker keeps exiting almost immediately (a CoreMedia/ScreenCaptureKit
+    // setup failure) reported 'agent_crash' every ~1.3s, and each one used to
+    // unconditionally call start() again -- forever, since a fresh
+    // MacosRemoteDesktopLaunchAgentSupervisor is constructed on every start()
+    // and so never accumulates enough crash history to trip its OWN breaker.
+    // This host now keeps its own crash window and must give up after
+    // MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_LIMITS.defaultMaxCrashRestarts (3).
+    const value = harness();
+    await startAuthenticated(value);
+    expect(value.serverStarts).toHaveBeenCalledTimes(1);
+
+    // Crashes 1-3: each is within budget and restarts into a fresh generation.
+    for (let crash = 1; crash <= 3; crash += 1) {
+      value.lifecycle.emit({ type: 'agent_crash', workerGeneration: crash });
+      await vi.waitFor(() => expect(value.serverStarts).toHaveBeenCalledTimes(crash + 1));
+      expect(value.authenticate()).toBe(true);
+      await vi.waitFor(() => expect(value.host.available()).toBe(true));
+    }
+
+    // Crash 4: budget exhausted. No further restart -- serverStarts must not
+    // advance again, and the host must not spin retrying.
+    value.lifecycle.emit({ type: 'agent_crash', workerGeneration: 4 });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(value.serverStarts).toHaveBeenCalledTimes(4);
+    expect(value.host.available()).toBe(false);
+  });
+
   it('retires a changed Control profile and relaunches View-only before accepting a new route', async () => {
     let accessibility = true;
     const releaseInput = vi.fn();

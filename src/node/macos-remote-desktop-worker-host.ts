@@ -47,6 +47,7 @@ import {
   type MacosRemoteDesktopNativePeerVerificationSeams,
 } from './macos-remote-desktop-peer-verifier.js';
 import {
+  MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_LIMITS,
   MacosRemoteDesktopLaunchAgentSupervisor,
   type MacosRemoteDesktopLaunchAgentSnapshot,
   type MacosRemoteDesktopLaunchAgentSupervisorDependencies,
@@ -462,6 +463,20 @@ export class MacosRemoteDesktopWorkerHost {
     reject(error: unknown): void;
   } | null = null;
   private teardownPromise: Promise<void> = Promise.resolve();
+  /**
+   * 'agent_crash' timestamps, one host-lifetime window -- NOT the
+   * per-generation supervisor's own crash counter. A fresh
+   * `MacosRemoteDesktopLaunchAgentSupervisor` is constructed on every
+   * `start()`, including every restart this class itself issues below, so its
+   * internal `crashTimes` resets on each cycle and its breaker never
+   * accumulates enough history to trip. A resident agent whose worker keeps
+   * dying immediately (observed: a CoreMedia/VideoToolbox setup failure that
+   * exits the worker in well under a second, over and over) produced an
+   * unthrottled restart every ~1.3s here, forever, with launchctl
+   * bootstrap/kickstart the whole time it ran -- this is the guard that
+   * should have stopped it.
+   */
+  private readonly agentCrashTimes: number[] = [];
   private lifecycleGeneration = 0;
   private connectionGeneration = 0;
   private activeWorkerGeneration = 0;
@@ -1210,6 +1225,23 @@ export class MacosRemoteDesktopWorkerHost {
     }
   }
 
+  /**
+   * Bounds how many 'agent_crash'-triggered restarts this host will issue in
+   * a rolling window, mirroring `MacosRemoteDesktopLaunchAgentSupervisor`'s
+   * own (per-instance, and so ineffective here -- see `agentCrashTimes`)
+   * breaker. Every call records an attempt; only the return value says
+   * whether it may proceed.
+   */
+  private allowAgentCrashRestart(): boolean {
+    const now = Date.now();
+    const windowMs = MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_LIMITS.defaultCrashWindowMs;
+    while (this.agentCrashTimes.length > 0 && now - this.agentCrashTimes[0]! > windowMs) {
+      this.agentCrashTimes.shift();
+    }
+    this.agentCrashTimes.push(now);
+    return this.agentCrashTimes.length <= MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_LIMITS.defaultMaxCrashRestarts;
+  }
+
   private handleLifecycleEvent(event: MacosRemoteDesktopLifecycleEvent): void {
     if (this.closed) return;
     // Every one of these tears the generation down. Named, because a Mac that
@@ -1225,13 +1257,19 @@ export class MacosRemoteDesktopWorkerHost {
       if (event.serviceGeneration <= this.serviceGeneration) return;
       this.serviceGeneration = event.serviceGeneration;
     }
+    const crashLoop = event.type === 'agent_crash' && !this.allowAgentCrashRestart();
+    if (crashLoop) {
+      this.options.onBackgroundError?.(
+        new Error('macos_remote_desktop_worker_host_agent_crash_loop'),
+      );
+    }
     const generation = this.lifecycleGeneration;
     const cleanupSettled = this.runLocalCleanup(event);
-    const restart = event.type === 'wake'
+    const restart = !crashLoop && (event.type === 'wake'
       || event.type === 'unlock'
       || event.type === 'fast_user_switch'
       || event.type === 'agent_crash'
-      || event.type === 'service_generation';
+      || event.type === 'service_generation');
     this.invalidateForLifecycle(generation, restart, cleanupSettled);
   }
 
