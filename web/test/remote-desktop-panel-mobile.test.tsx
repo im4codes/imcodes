@@ -1775,8 +1775,8 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       .toBe('false');
   });
 
-  it('moves the ring to wherever the screen is tapped, and taps it there to left-click', async () => {
-    const { stage, getByLabelText } = await renderPanel();
+  it('moves the ring and its bound cursor marker to wherever the screen is tapped, and taps the ring there to left-click', async () => {
+    const { container, stage, getByLabelText } = await renderPanel();
     act(() => {
       // clientY stays on the vertical center so the video's 16:9-into-4:3
       // letterboxing doesn't complicate the expected normalized Y below --
@@ -1784,20 +1784,28 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       pointer(stage, 'pointerdown', { pointerId: 3, clientX: 300, clientY: 150 });
       pointer(stage, 'pointerup', { pointerId: 3, clientX: 300, clientY: 150 });
     });
+    // The cursor marker sits exactly where a click lands; the ring is offset
+    // below it so a dragging finger never covers that spot, but the two move
+    // together off the same underlying position.
+    const cursor = container.querySelector('.remote-desktop-virtual-pointer') as HTMLElement;
+    expect(cursor.style.left).toBe('300px');
+    expect(cursor.style.top).toBe('150px');
     const ring = getByLabelText('remote_desktop.touch_ring');
     expect(ring.style.left).toBe('300px');
-    expect(ring.style.top).toBe('150px');
+    expect(ring.style.top).toBe(`${150 + 72}px`);
 
     pointerClick.mockClear();
     act(() => {
       pointer(ring, 'pointerdown', { pointerId: 12, clientX: 300, clientY: 150 });
       pointer(ring, 'pointerup', { pointerId: 12, clientX: 300, clientY: 150 });
     });
+    // Even though the ring itself is drawn lower, the click it fires lands at
+    // the cursor marker's (true, unoffset) position.
     expect(pointerClick).toHaveBeenCalledWith('left', 0.75, 0.5);
   });
 
   it('drags the touch-mode ring to move the remote cursor relatively, without clicking', async () => {
-    const { stage, getByLabelText } = await renderPanel();
+    const { container, stage, getByLabelText } = await renderPanel();
     act(() => {
       // Seed a known ring position: a tap that lands exactly on the ring
       // (0,0 in this harness before any interaction) both places it there
@@ -1806,11 +1814,15 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       pointer(stage, 'pointerup', { pointerId: 8, clientX: 200, clientY: 150 });
     });
     const ring = getByLabelText('remote_desktop.touch_ring');
+    const cursor = container.querySelector('.remote-desktop-virtual-pointer') as HTMLElement;
     pointerMove.mockClear();
     pointerClick.mockClear();
     act(() => { pointer(ring, 'pointerdown', { pointerId: 9, clientX: 200, clientY: 150 }); });
     act(() => { pointer(ring, 'pointermove', { pointerId: 9, clientX: 250, clientY: 150 }); });
     expect(pointerMove).toHaveBeenCalledWith(0.625, 0.5);
+    // The cursor marker and the ring are bound to the same underlying
+    // position -- dragging the ring carries the marker along with it.
+    expect(cursor.style.left).toBe('250px');
     expect(ring.style.left).toBe('250px');
     act(() => { pointer(ring, 'pointerup', { pointerId: 9, clientX: 250, clientY: 150 }); });
     // The drag itself moved the cursor; release must not additionally click.

@@ -251,6 +251,11 @@ const DESKTOP_DOUBLE_CLICK_MS = 500;
 // scaling and turn an intended double-click into two singles.
 const DESKTOP_DOUBLE_CLICK_DISTANCE_PX = 8;
 const TOUCH_DOUBLE_TAP_DISTANCE_PX = 32;
+// The ring is drawn below the actual cursor position, not on top of it -- a
+// fingertip dragging the ring would otherwise sit directly on top of
+// whatever it is about to click, hiding the one thing the user needs to see
+// to aim it. The cursor marker itself stays exactly where clicks land.
+const TOUCH_RING_OFFSET_Y_PX = 72;
 // How far a two-finger touch has to move, in either the finger-to-finger
 // distance or the pair's center, before it commits to pinch vs. scroll --
 // below this it is still just jitter from two fingers landing imperfectly
@@ -2999,17 +3004,30 @@ export function RemoteDesktopPanel({
             </>
           )}
           {mobileInputMode === 'touch' && snapshot.inputEnabled && (
-            <button
-              type="button"
-              class={`remote-desktop-touch-ring ${touchRingArmed ? 'is-right' : ''}`.trim()}
-              aria-label={t('remote_desktop.touch_ring')}
-              style={{ left: `${virtualMouse.x}px`, top: `${virtualMouse.y}px` }}
-              onPointerDown={beginTouchRing}
-              onPointerMove={onTouchRingMove}
-              onPointerUp={endTouchRing}
-              onPointerCancel={cancelTouchRing}
-              onLostPointerCapture={cancelTouchRing}
-            />
+            <>
+              {/* The actual cursor position -- exactly where a click lands --
+                  stays uncovered by the finger, which sits on the ring below
+                  it instead. */}
+              <div
+                class="remote-desktop-virtual-pointer"
+                aria-hidden="true"
+                style={{ left: `${virtualMouse.x}px`, top: `${virtualMouse.y}px` }}
+              />
+              <button
+                type="button"
+                class={`remote-desktop-touch-ring ${touchRingArmed ? 'is-right' : ''}`.trim()}
+                aria-label={t('remote_desktop.touch_ring')}
+                style={{
+                  left: `${virtualMouse.x}px`,
+                  top: `${virtualMouse.y + TOUCH_RING_OFFSET_Y_PX}px`,
+                }}
+                onPointerDown={beginTouchRing}
+                onPointerMove={onTouchRingMove}
+                onPointerUp={endTouchRing}
+                onPointerCancel={cancelTouchRing}
+                onLostPointerCapture={cancelTouchRing}
+              />
+            </>
           )}
           {mobileInputMode === 'touch' && snapshot.inputEnabled && (
             <button
