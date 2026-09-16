@@ -11158,6 +11158,16 @@ button.quick-agent-delegation-preset.active {
   filter: drop-shadow(0 2px 3px #000) drop-shadow(0 0 5px rgb(65 211 255 / 65%));
 }
 
+/* Touch mode is the default on every platform, including a desktop app
+   driven by a real mouse -- unlike explicit "mouse mode" above (a deliberate
+   user choice, always shown), the marker paired with the touch-mode ring
+   must stay hidden unless the ring itself is (@media (pointer: coarse)
+   below), or it renders as an inert cursor frozen at the stage center on any
+   session that never touches the (already correctly hidden) ring. */
+.remote-desktop-virtual-pointer.is-touch-ring-marker {
+  display: none;
+}
+
 .remote-desktop-virtual-pointer::before {
   content: "";
   position: absolute;
@@ -12461,6 +12471,10 @@ button.quick-agent-delegation-preset.active {
   }
 
   .remote-desktop-touch-ring {
+    display: block;
+  }
+
+  .remote-desktop-virtual-pointer.is-touch-ring-marker {
     display: block;
   }
 

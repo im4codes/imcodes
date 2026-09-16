@@ -1824,6 +1824,11 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     const cursor = container.querySelector('.remote-desktop-virtual-pointer') as HTMLElement;
     expect(cursor.style.left).toBe('300px');
     expect(cursor.style.top).toBe('150px');
+    // Touch mode is the default even on a desktop session driven by a real
+    // mouse -- this marker must carry the modifier that keeps it hidden
+    // outside a coarse (touch) pointer, unlike mouse mode's own always-shown
+    // use of the same base class.
+    expect(cursor.classList.contains('is-touch-ring-marker')).toBe(true);
     const ring = getByLabelText('remote_desktop.touch_ring');
     expect(ring.style.left).toBe('300px');
     expect(ring.style.top).toBe(`${150 + 72}px`);
@@ -2520,7 +2525,11 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(pointerMove).toHaveBeenCalled();
     expect(pointerMove).toHaveBeenCalledWith(1, 0.5);
     expect(video.style.transform).toMatch(/translate3d\(-/);
-    expect(container.querySelector('.remote-desktop-virtual-pointer')).not.toBeNull();
+    // Mouse mode is an explicit choice, so its marker must stay unconditionally
+    // visible -- it must not carry touch mode's coarse-pointer-only modifier.
+    const mouseModeMarker = container.querySelector('.remote-desktop-virtual-pointer');
+    expect(mouseModeMarker).not.toBeNull();
+    expect(mouseModeMarker!.classList.contains('is-touch-ring-marker')).toBe(false);
     expect(stage.textContent).toContain('remote_desktop.mouse_hint');
   });
 

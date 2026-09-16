@@ -491,6 +491,30 @@ describe('styles.css regression contracts', () => {
     expect(coarsePointerRule).toMatch(/display:\s*block/);
   });
 
+  it('keeps the touch-mode ring and its cursor marker touch-only, unlike mouse mode\'s always-shown marker', () => {
+    const ringDesktopRule = css.match(/\.remote-desktop-touch-ring\s*\{[^}]*\}/)?.[0];
+    expect(ringDesktopRule).toBeTruthy();
+    expect(ringDesktopRule).toMatch(/display:\s*none/);
+    const ringCoarseRule = css.match(
+      /@media\s*\(pointer:\s*coarse\)\s*\{[\s\S]*?\.remote-desktop-touch-ring\s*\{[^}]*\}/,
+    )?.[0];
+    expect(ringCoarseRule).toBeTruthy();
+    expect(ringCoarseRule).toMatch(/display:\s*block/);
+
+    // The marker is shared with mouse mode's own, always-visible use of the
+    // base class -- only this specific modifier combination is gated.
+    const markerDesktopRule = css.match(
+      /\.remote-desktop-virtual-pointer\.is-touch-ring-marker\s*\{[^}]*\}/,
+    )?.[0];
+    expect(markerDesktopRule).toBeTruthy();
+    expect(markerDesktopRule).toMatch(/display:\s*none/);
+    const markerCoarseRule = css.match(
+      /@media\s*\(pointer:\s*coarse\)\s*\{[\s\S]*?\.remote-desktop-virtual-pointer\.is-touch-ring-marker\s*\{[^}]*\}/,
+    )?.[0];
+    expect(markerCoarseRule).toBeTruthy();
+    expect(markerCoarseRule).toMatch(/display:\s*block/);
+  });
+
   it('fits portrait videos by available preview height without stretching them to full width', () => {
     const videoContainerRule = css.match(/\.fb-preview-video\s*\{[^}]*\}/);
     expect(videoContainerRule).not.toBeNull();

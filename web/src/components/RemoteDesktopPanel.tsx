@@ -3061,9 +3061,13 @@ export function RemoteDesktopPanel({
             <>
               {/* The actual cursor position -- exactly where a click lands --
                   stays uncovered by the finger, which sits on the ring below
-                  it instead. */}
+                  it instead. is-touch-ring-marker keeps this hidden outside
+                  a coarse (touch) pointer, matching the ring itself -- touch
+                  mode is the default even on a desktop app driven by a real
+                  mouse, where this would otherwise render as a stray cursor
+                  frozen at the stage center. */}
               <div
-                class="remote-desktop-virtual-pointer"
+                class="remote-desktop-virtual-pointer is-touch-ring-marker"
                 aria-hidden="true"
                 style={{ left: `${virtualMouse.x}px`, top: `${virtualMouse.y}px` }}
               />
