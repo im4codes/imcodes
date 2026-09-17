@@ -4,6 +4,7 @@ import {
   REMOTE_DESKTOP_LIMITS,
   REMOTE_DESKTOP_MODE_REASON,
   REMOTE_DESKTOP_MSG,
+  REMOTE_DESKTOP_TERMINAL_REASON,
   type RemoteDesktopPrepare,
 } from '../../shared/remote-desktop.js';
 import { REMOTE_DESKTOP_WORKER_IPC_VERSION } from '../../shared/remote-desktop-worker.js';
@@ -464,6 +465,51 @@ describe('macOS remote-desktop authenticated local IPC contract', () => {
       { workerGeneration: launch.workerGeneration + 1 },
       lease,
     ), NOW)).toThrow('macos_remote_desktop_ipc_invalid_host_frame');
+  });
+
+  it('accepts the worker\'s own TERMINAL acknowledgment of a stop it was just sent', () => {
+    // Regression: acceptHostFrame used to delete the route the instant the
+    // daemon decided to stop -- before the worker had even seen the command,
+    // let alone answered it. The worker ALWAYS acknowledges a stop with its
+    // own TERMINAL message, which comes back through acceptWorkerFrame and
+    // requires the route to still exist. Deleting it eagerly guaranteed that
+    // legitimate, correctly-ordered acknowledgment was rejected as
+    // route_authority_rejected, tearing down the whole IPC connection over a
+    // stop that worked exactly as asked (live evidence: node mini-2, a real
+    // session stopped ~8s into a normal ICE exchange, rejected 25-31ms later).
+    const { authority, launch, session } = authorizeRoute();
+    const stop = {
+      type: REMOTE_DESKTOP_MSG.STOP,
+      requestId: REQUEST_ID,
+      sessionId: SESSION_ID,
+      capability: CAPABILITY,
+    } as const;
+    expect(authority.acceptHostFrame(session, hostCommand(launch, stop), NOW)).toEqual(stop);
+
+    const terminal = {
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      requestId: REQUEST_ID,
+      sessionId: SESSION_ID,
+      capability: CAPABILITY,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.STOPPED_BY_CONTROLLER,
+    } as const;
+    // Before the fix this threw macos_remote_desktop_ipc_route_authority_rejected.
+    expect(authority.acceptWorkerFrame(session, frame({
+      type: MACOS_REMOTE_DESKTOP_IPC_MESSAGE.WORKER_MESSAGE,
+      ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+      workerGeneration: launch.workerGeneration,
+      message: terminal,
+    }), NOW)).toEqual(terminal);
+
+    // The route IS still retired -- by the worker's own TERMINAL, not by the
+    // daemon's stop intent. A second frame for the same session now correctly
+    // finds no route.
+    expect(() => authority.acceptWorkerFrame(session, frame({
+      type: MACOS_REMOTE_DESKTOP_IPC_MESSAGE.WORKER_MESSAGE,
+      ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+      workerGeneration: launch.workerGeneration,
+      message: terminal,
+    }), NOW)).toThrow('macos_remote_desktop_ipc_route_authority_rejected');
   });
 
   it('accepts Server deadlines when this host clock trails the Server by a little', () => {

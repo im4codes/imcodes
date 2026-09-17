@@ -2598,8 +2598,24 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
   // `media_status_sent` latches true the first time real media has ever
   // flowed and never resets, so gating on it below cannot affect a
   // connection that did establish, however long it then sits idle.
-  const std::int64_t worker_started_ms = SampleNow().monotonic_ms;
+  //
+  // The clock starts at the first REAL host command (PREPARE/OFFER/ICE/STOP),
+  // not at process start. This worker is routinely spawned pre-emptively by
+  // the resident LaunchAgent, well before any daemon peer has a session to
+  // route to it -- an idle standby worker with nobody addressing it yet is
+  // not a hung negotiation, and timing it out was the real cause behind a
+  // ~60s worker-spawn/self-terminate/relaunch cascade (RunResidentLoop's own
+  // "the worker's exit ends the agent" rule treats ANY worker exit, including
+  // this one, as the agent's job being done, so launchd's KeepAlive relaunched
+  // it into an identical idle worker that timed out again 60s later, forever)
+  // -- exactly the churn that starved real connection attempts of an
+  // available worker, producing the reported worker_failed /
+  // route_authority_rejected on a real prepare/offer/ice. Gating the clock on
+  // a real command preserves the original fix's actual target (a negotiation
+  // that DID start but got stuck) while never arming for a worker nothing has
+  // ever addressed.
   constexpr std::int64_t kConnectionEstablishTimeoutMs = 60'000;
+  std::int64_t negotiation_started_ms = -1;
 
   std::int64_t last_media_sample_ms = 0;
   bool media_status_sent = false;
@@ -2693,13 +2709,17 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
           media_status_sent = true;
           (void)sink.RefreshStatus();
         }
-        // Auto-clean a connection that never established: no real media
-        // has ever flowed and the grace window has elapsed. Route through
-        // the same transport-terminal path a live peer disconnect uses so
-        // the existing unconditional disclosure/session teardown below
-        // still runs -- no separate cleanup path to keep in sync.
-        if (!media_status_sent &&
-            now.monotonic_ms - worker_started_ms >= kConnectionEstablishTimeoutMs) {
+        // Auto-clean a connection that never established: a real negotiation
+        // started (negotiation_started_ms >= 0, set at the first accepted
+        // host command) but no real media has ever flowed and the grace
+        // window has elapsed since THAT point. Route through the same
+        // transport-terminal path a live peer disconnect uses so the
+        // existing unconditional disclosure/session teardown below still
+        // runs -- no separate cleanup path to keep in sync. A worker with no
+        // negotiation started yet (negotiation_started_ms < 0) is an idle
+        // standby with nobody addressing it -- never arm the clock for it.
+        if (!media_status_sent && negotiation_started_ms >= 0 &&
+            now.monotonic_ms - negotiation_started_ms >= kConnectionEstablishTimeoutMs) {
           std::cerr << "macos_remote_desktop_worker_connection_never_established\n";
           sink.SignalTerminal("connection_never_established");
         }
@@ -2824,6 +2844,12 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
         running = false;
         break;
       }
+      // A real, accepted host command (PREPARE/OFFER/ICE/STOP) proves the
+      // daemon has actually begun addressing this worker -- arm the
+      // connection-establish watchdog from here, once, the first time it
+      // happens. See the watchdog's own comment above for why this must not
+      // be the worker's process-start time.
+      if (negotiation_started_ms < 0) negotiation_started_ms = SampleNow().monotonic_ms;
       if (!HandleHostCommand(parsed, &command_session, &disclosure, &emitter)) {
         status = EX_PROTOCOL;
         running = false;

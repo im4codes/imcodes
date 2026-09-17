@@ -666,10 +666,23 @@ export class MacosRemoteDesktopIpcAuthorityHost {
       }
       route.leaseExpiresAt = command.leaseExpiresAt;
     }
-    if (command.type === REMOTE_DESKTOP_MSG.STOP
-      || command.type === REMOTE_DESKTOP_MSG.CANCEL) {
-      this.routes.delete(command.sessionId);
-    }
+    // STOP/CANCEL must NOT delete the route here. This runs the instant the
+    // daemon DECIDES to stop the session -- before the worker has even seen
+    // the command, let alone answered it. The worker always acknowledges a
+    // stop with its own TERMINAL message (WorkerTransportSink::SignalTerminal
+    // is unconditional on a stop/cancel), which arrives back through
+    // acceptWorkerFrame and requires this exact route to still exist. Deleting
+    // it here guaranteed that legitimate, correctly-ordered acknowledgment
+    // would find `!route` and be rejected as macos_remote_desktop_ipc_route_authority_rejected
+    // -- tearing down the whole IPC connection over a stop that worked exactly
+    // as asked, live evidence: node mini-2, a real session stopped ~8s into a
+    // normal ICE exchange, rejected 25-31ms after the stop command was sent.
+    // acceptWorkerFrame's own TERMINAL handling (below) is the correct, sole
+    // place the route is retired: it deletes it once the worker's own
+    // acknowledgment proves the session is actually over, not merely intended
+    // to be. A worker that never acknowledges still bounds this: the route's
+    // own expiresAt/leaseExpiresAt naturally lapse, and generation cleanup()
+    // clears everything regardless.
     return command;
   }
 
