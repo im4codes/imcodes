@@ -175,6 +175,7 @@ class WorkerSession {
   }
 
   [[nodiscard]] bool Start(const imcodes::rd::Authority& authority) {
+    session_->SetIceServers(authority.ice_servers);
     return session_->Start(ToRouteAuthority(authority), SampleTransportTime());
   }
 

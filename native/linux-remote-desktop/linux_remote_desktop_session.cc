@@ -222,6 +222,30 @@ bool LinuxRemoteDesktopSession::StartTransport(
     const common::RouteAuthority& authority) {
   webrtc::PeerConnectionInterface::RTCConfiguration config;
   config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
+  config.bundle_policy = webrtc::PeerConnectionInterface::kBundlePolicyMaxBundle;
+  config.continual_gathering_policy =
+      webrtc::PeerConnectionInterface::GATHER_CONTINUALLY;
+  // Windows' PeerSession::StartTransport wires authority_.ice_servers (the
+  // deployment's STUN/TURN, from PREPARE) into config.servers the same way;
+  // this file never did, so every Linux session ran host-candidates-only.
+  // On a host with many virtual interfaces (211: ~10 Docker bridge networks,
+  // each producing its own host candidate) that is not just slower --
+  // ICE has no relay to fall back to when the pair it settles on stops
+  // working (a NAT binding timing out, STUN consent-freshness failing),
+  // so peer.connectionState genuinely flips to "failed" after a while,
+  // the browser calls restartIce(), and every restart is doomed to hit the
+  // exact same host-only candidate set and fail the same way -- burning
+  // through REMOTE_DESKTOP_LIMITS.MAX_ICE_RESTARTS (8) and then
+  // terminating the whole route with protocol_error. Windows/macOS sessions
+  // do not show this because they always had a TURN relay to actually fall
+  // back to.
+  for (const imcodes::rd::IceServer& source : ice_servers_) {
+    webrtc::PeerConnectionInterface::IceServer server;
+    server.urls = source.urls;
+    server.username = source.username;
+    server.password = source.credential;
+    config.servers.push_back(std::move(server));
+  }
 
   webrtc::PeerConnectionDependencies pc_deps(this);
   auto result = factory_->CreatePeerConnectionOrError(config, std::move(pc_deps));

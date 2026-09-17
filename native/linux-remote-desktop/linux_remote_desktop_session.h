@@ -55,6 +55,7 @@
 
 #include "../remote-desktop-common/data_channel_payload.h"
 #include "../remote-desktop-common/quality_ladder.h"
+#include "../remote-desktop-common/signaling_types.h"
 #include "../remote-desktop-common/session_core.h"
 #include "../remote-desktop-common/transport_session_core.h"
 #include "linux_native_video_source.h"
@@ -128,6 +129,14 @@ class LinuxRemoteDesktopSession final
   // Route authority lifecycle -- see common::TransportSessionCore for the
   // exact contract (deadlines, renewal, mode changes).
   bool Start(const common::RouteAuthority& authority, common::TransportTime now);
+  // Called before Start() with PREPARE's ice_servers (STUN/TURN) -- Start()
+  // only receives common::RouteAuthority, which (unlike the wire-level
+  // imcodes::rd::Authority WorkerSession holds) has no field for them, so
+  // this is the only path they can reach StartTransport() through. See
+  // StartTransport()'s own comment for why never wiring these in mattered.
+  void SetIceServers(std::vector<imcodes::rd::IceServer> ice_servers) {
+    ice_servers_ = std::move(ice_servers);
+  }
   bool Tick(common::TransportTime now);
   void Stop() noexcept;
 
@@ -265,6 +274,7 @@ class LinuxRemoteDesktopSession final
   [[maybe_unused]] webrtc::Thread* const signaling_thread_;
   LinuxEmitIceCandidate emit_ice_candidate_;
   webrtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_;
+  std::vector<imcodes::rd::IceServer> ice_servers_;
   std::unique_ptr<common::NativeVideoSourceLease> video_lease_;
   webrtc::scoped_refptr<webrtc::VideoTrackInterface> video_track_;
   std::map<std::string, webrtc::scoped_refptr<webrtc::DataChannelInterface>>
