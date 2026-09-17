@@ -218,7 +218,7 @@ common::TransportCallbackStamp LinuxRemoteDesktopSession::CallbackStamp()
 // --- common::TransportSessionAdapter ---------------------------------------
 
 bool LinuxRemoteDesktopSession::StartTransport(
-    const common::RouteAuthority&) {
+    const common::RouteAuthority& authority) {
   webrtc::PeerConnectionInterface::RTCConfiguration config;
   config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
 
@@ -269,6 +269,23 @@ bool LinuxRemoteDesktopSession::StartTransport(
   core_started_ = core_.Start(adapters_.MeasureReadiness(), *topology);
   if (!core_started_) {
     std::fprintf(stderr, "linux session: SessionCore::Start failed\n");
+  }
+  // SessionCore::Start() always lands in kViewing, never kControlling on its
+  // own (see its own header/source: only an explicit SetControlActive(true)
+  // moves it there) -- exactly mirroring macOS's MacosRemoteDesktopSession,
+  // which calls this same seam right after its own core_.Start() succeeds,
+  // gated on the requested mode. Without this, EnsureControlAvailable()
+  // (session_core.cc: requires state() == kControlling) silently refuses
+  // every ApplyPointerMove/ApplyKey/ApplyButton/ApplyWheel/ApplyText call
+  // forever, for every session, regardless of anything the data-channel
+  // dispatch above gets right -- confirmed live via gdb: a real, correctly
+  // correlated pointer move reached this class's own ApplyPointerMove with
+  // the right display_id and normalized coordinates, and the X11 cursor
+  // still never moved, because the ledger itself was refusing control it
+  // was never told this session actually holds.
+  if (core_started_ &&
+      authority.mode == common::TransportSessionMode::kControl) {
+    core_.SetControlActive(true);
   }
   return true;
 }
