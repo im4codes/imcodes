@@ -1,9 +1,9 @@
 // Linux-only, on-host qualification of the concrete platform adapters.
 //
-// Exercises capture, input (including release), clipboard, display topology
-// and lifecycle against a live X server, and proves the portal path stays
-// unavailable. Exit 0 means the X11 fallback qualified end to end; any other
-// exit names the failure.
+// Exercises capture, input (including release), clipboard, display topology,
+// on-screen disclosure and lifecycle against a live X server, and proves the
+// portal path stays unavailable. Exit 0 means the X11 fallback qualified end
+// to end; any other exit names the failure.
 
 #include <cstdio>
 #include <string>
@@ -187,17 +187,34 @@ int main() {
   monitor.Emit(common::GraphicalSessionEvent::kLocked);
   if (saw_locked) return Fail("stopped monitor must not deliver events", 84);
 
-  // ── Disclosure stays unavailable ─────────────────────────────────────────
+  // ── Disclosure is real: a live X connection means a real on-screen banner
+  // ─────────────────────────────────────────────────────────────────────
+  // X11DisclosureAdapter::ProbeReadiness() (linux_x11_backend.cc) returns
+  // kReady whenever the shared X connection is open -- it does not depend
+  // on anything session-specific, so it is ready before any session has
+  // even been offered. This test used to assert the opposite ("must stay
+  // unavailable in this slice"), written back when the adapter really was a
+  // stub; it went stale once Show()/Draw()/RedrawLoop() became real and
+  // started silently asserting a false expectation instead of catching a
+  // regression. Caught only by actually running this binary against a live
+  // X server, not by reading the source.
   auto& disclosure = adapters->disclosure();
-  if (disclosure.ProbeReadiness() != common::ReadinessState::kUnavailable) {
-    return Fail("disclosure must stay unavailable in this slice", 90);
+  if (disclosure.ProbeReadiness() != common::ReadinessState::kReady) {
+    return Fail("disclosure must be ready against a live X connection", 90);
   }
-  if (disclosure.Show(1, 1)) return Fail("disclosure must refuse to show", 91);
+  if (!disclosure.Show(1, 1)) return Fail("disclosure must be able to show", 91);
+  // Idempotent: a second Show() (e.g. a viewer count changing) must not
+  // create a second window or otherwise misbehave.
+  if (!disclosure.Show(2, 1)) return Fail("disclosure must accept a second show", 92);
+  disclosure.Hide();
+  // Hide() must be safe to call again with nothing showing.
+  disclosure.Hide();
+  std::printf("disclosure: shown and hidden without error\n");
 
   // ── Aggregate readiness ──────────────────────────────────────────────────
   const auto readiness = adapters->MeasureReadiness();
-  if (readiness.disclosure != common::ReadinessState::kUnavailable) {
-    return Fail("aggregate must not invent a disclosure surface", 100);
+  if (readiness.disclosure != common::ReadinessState::kReady) {
+    return Fail("aggregate must reflect the real disclosure surface", 100);
   }
   if (readiness.encoder != readiness.capture) {
     return Fail("encoder readiness must track capture", 101);

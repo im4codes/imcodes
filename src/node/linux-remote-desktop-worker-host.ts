@@ -9,6 +9,13 @@ import {
   validateRemoteDesktopDaemonCommand,
   type RemoteDesktopDaemonMessage,
 } from '../../shared/remote-desktop.js';
+import {
+  REMOTE_DESKTOP_CAPTURE_CAPABILITY,
+  REMOTE_DESKTOP_ENCODER_CAPABILITY,
+  REMOTE_DESKTOP_PLATFORM_CAPABILITY,
+  REMOTE_DESKTOP_SESSION_CAPABILITY,
+} from '../../shared/remote-desktop-platform.js';
+import { REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY } from '../../shared/remote-desktop-access.js';
 import { RemoteDesktopWorkerHostCore } from './remote-desktop-worker-host-core.js';
 import type { ControlledNodeRemoteDesktopWorker } from './runtime.js';
 import logger from '../util/logger.js';
@@ -77,33 +84,56 @@ export class LinuxRemoteDesktopWorkerHost implements ControlledNodeRemoteDesktop
   }
 
   /**
-   * Deliberately empty, even once the worker binary is present.
+   * The v3 profile, once the worker binary is present -- NOT the bare
+   * legacy REMOTE_DESKTOP_CAPABILITY token. resolveRemoteDesktopSessionProfile
+   * (shared/remote-desktop-platform.ts) treats a bare legacy token as the
+   * LEGACY v2 profile and hard-codes it to `platform: 'windows', capture:
+   * 'windows_dxgi'` -- there is no "legacy Linux" shape, only "legacy
+   * Windows". Advertising the bare token here would make a Linux node's
+   * session look like a Windows one to every downstream consumer of
+   * `profile.platform`/`profile.capture`.
    *
-   * `resolveRemoteDesktopSessionProfile` (shared/remote-desktop-platform.ts)
-   * treats a bare REMOTE_DESKTOP_CAPABILITY token as the LEGACY v2 profile
-   * and hard-codes it to `platform: 'windows', capture: 'windows_dxgi'` --
-   * there is no "legacy Linux" shape, only "legacy Windows". Advertising it
-   * from here would make a Linux node's session look like a Windows one to
-   * every downstream consumer of `profile.platform`/`profile.capture`.
+   * REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY is included because the
+   * on-screen notice it promises is real, not aspirational:
+   * X11DisclosureAdapter (linux_x11_backend.h) draws an actual always-on-top
+   * X11 banner window naming the viewer/controller count, and
+   * LinuxPlatformAdapters wires its readiness into SessionCore::Start()'s
+   * ViewReady() gate -- a session on a machine where the disclosure window
+   * cannot actually be created will be refused natively, before any frame is
+   * captured, independent of what this method advertises. That native gate,
+   * not this method, is the real enforcement point: this worker has no
+   * protocol message yet for probing per-machine capture/disclosure
+   * readiness before a session is attempted (unlike macOS's worker host,
+   * which calls a real inspectReadiness probe here) -- see resolveLinux
+   * RemoteDesktopWorkerPath's sidecar-existence check being the only signal
+   * available -- so this is an optimistic, worker-present-based
+   * advertisement that the native session start will honestly refuse if
+   * wrong, not a claim that every Linux machine is definitely ready.
    *
-   * The correct advertisement is the v3 profile (REMOTE_DESKTOP_SESSION_
-   * CAPABILITY + REMOTE_DESKTOP_PLATFORM_CAPABILITY.LINUX + a capture
-   * capability + the H264 encoder token), but that profile unconditionally
-   * also requires REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY: macOS earns
-   * that token with a whole separate signed on-screen-notice component
-   * (imcodes-remote-desktop-disclosure) telling the person physically at the
-   * machine that their screen is being captured, and Linux has no equivalent
-   * yet. Advertising readiness without it would enable real capture sessions
-   * with no on-screen notice, which the shared profile resolver's own
-   * comment calls out as exactly what that requirement exists to prevent.
+   * REMOTE_DESKTOP_CAPTURE_CAPABILITY.LINUX_X11, not the portal/PipeWire
+   * token: PortalCaptureAdapter (linux_platform_adapters.cc) exists but its
+   * own readiness probe always reports unavailable ("portal stream
+   * negotiation not implemented in this slice") -- X11 direct capture is
+   * the only backend that has ever actually passed a real session end to
+   * end (the qualification tests this file's own header describes). VNC is
+   * a last-resort fallback for machines with no X11 access at all
+   * (linux_capture_selection.h) and is not advertised as the platform
+   * capability either, for the same reason: it is not the primary path.
    *
-   * So: `available()` can be true (the worker binary exists, and `handle()`
-   * will actually spawn it and speak the real protocol -- this is what the
-   * qualification tests exercise), but nothing is advertised to the server
-   * or browser as a usable session until the disclosure component exists.
+   * No REMOTE_DESKTOP_INPUT_CAPABILITY: the data-channel wire protocol for
+   * pointer/keyboard/clipboard messages is not wired to the input adapters
+   * yet (linux_remote_desktop_session.h's own "DELIBERATELY NOT YET DONE"
+   * note) -- this is honestly a View-only session today.
    */
   sessionCapabilities(): readonly string[] {
-    return [];
+    if (!this.available()) return [];
+    return [
+      REMOTE_DESKTOP_SESSION_CAPABILITY,
+      REMOTE_DESKTOP_PLATFORM_CAPABILITY.LINUX,
+      REMOTE_DESKTOP_CAPTURE_CAPABILITY.LINUX_X11,
+      REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+      REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+    ];
   }
 
   async handle(message: unknown): Promise<boolean> {

@@ -14,6 +14,8 @@ import {
   LinuxRemoteDesktopWorkerHost,
   resolveLinuxRemoteDesktopWorkerPath,
 } from '../../src/node/linux-remote-desktop-worker-host.js';
+import { resolveRemoteDesktopSessionProfile } from '../../shared/remote-desktop-platform.js';
+import { REMOTE_DESKTOP_CAPABILITY } from '../../shared/remote-desktop.js';
 
 describe('resolveLinuxRemoteDesktopWorkerPath', () => {
   it('resolves the worker sidecar next to the controlled-node executable', () => {
@@ -63,17 +65,28 @@ describe('LinuxRemoteDesktopWorkerHost', () => {
    * LEGACY v2 profile shape, and resolveRemoteDesktopSessionProfile
    * (shared/remote-desktop-platform.ts) hard-codes that shape to
    * `platform: 'windows', capture: 'windows_dxgi'` -- there is no "legacy
-   * Linux". Advertising it here would make a Linux controlled node's
-   * session look like a Windows one to every downstream consumer of
-   * profile.platform/profile.capture. The correct v3 advertisement also
-   * requires a local on-screen disclosure component this worker does not
-   * have yet, so the honest advertisement today is nothing at all -- even
-   * though the worker binary is present and handle() will really spawn it.
+   * Linux". This must never be advertised: a Linux controlled node's
+   * session would look like a Windows one to every downstream consumer of
+   * profile.platform/profile.capture. The full v3 token set below is the
+   * correct advertisement instead -- see sessionCapabilities()'s own
+   * comment for why it is honest despite this worker having no
+   * per-machine readiness probe yet.
    */
-  it('never advertises the bare legacy capability, even when available', () => {
+  it('advertises the full v3 profile, not the bare legacy capability, once available', () => {
     const { host } = makeHost({ workerExists: true });
     expect(host.available()).toBe(true);
-    expect(host.sessionCapabilities()).toEqual([]);
+    const capabilities = host.sessionCapabilities();
+    expect(capabilities).not.toContain(REMOTE_DESKTOP_CAPABILITY);
+    const profile = resolveRemoteDesktopSessionProfile(capabilities);
+    expect(profile).not.toBeNull();
+    expect(profile?.kind).toBe('common_v3');
+    expect(profile?.platform).toBe('linux');
+    expect(profile?.capture).toBe('linux_x11');
+    expect(profile?.encoder).toBe('h264');
+    expect(profile?.localDisclosure).toBe(true);
+    // Honest View-only: the data-channel wire protocol for pointer/keyboard/
+    // clipboard is not wired to the input adapters yet.
+    expect(profile?.input).toBe(false);
   });
 
   it('refuses every command when the sidecar binary is missing', async () => {
