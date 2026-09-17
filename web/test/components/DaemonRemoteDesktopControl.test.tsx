@@ -40,6 +40,7 @@ vi.mock('react-i18next', () => ({
 const { REMOTE_DESKTOP_CAPABILITY } = await import('@shared/remote-desktop.js');
 const {
   REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
+  REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY,
   REMOTE_DESKTOP_INSTALL_MSG,
   REMOTE_DESKTOP_INSTALL_STATE,
   REMOTE_DESKTOP_INSTALL_ERROR,
@@ -111,10 +112,35 @@ describe('DaemonRemoteDesktopControl', () => {
     expect(view.container.querySelector('button')).toBeNull();
   });
 
-  it('offers the download when the host could serve remote control but has no worker', () => {
+  it('offers the download when the host could serve remote control but has no worker (Windows or Linux — both repair by self-upgrade under this one wire capability)', () => {
     const { view } = mount([REMOTE_DESKTOP_INSTALLABLE_CAPABILITY]);
     const button = view.container.querySelector('button')!;
     expect(button.getAttribute('title')).toBe('remote_desktop.install_worker');
+  });
+
+  /**
+   * The daemon advertises a SEPARATE capability for macOS
+   * (`REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY`) because it installs by a
+   * different mechanism (component-store publish, not self-upgrade) — but
+   * this component's own `installable` check only ever recognized the
+   * Windows/Linux one, so a macOS host missing its component set rendered
+   * nothing at all: no button, no install offer, nothing to click. Same
+   * fixture shape as the sibling Windows/Linux test above, proving the two
+   * wire names now reach an identical rendered result.
+   */
+  it('offers the download when a macOS host could serve remote control but has no components installed', () => {
+    const { view } = mount([REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY]);
+    const button = view.container.querySelector('button')!;
+    expect(button.getAttribute('title')).toBe('remote_desktop.install_worker');
+  });
+
+  it('requests an install for a macOS host through the same generic, field-less request the Windows/Linux path uses', () => {
+    const { view, sent } = mount([REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY]);
+    fireEvent.click(view.container.querySelector('button')!);
+    // No platform field: the daemon/controlled-node side already knows its
+    // own platform and branches there (installMacosRemoteDesktopComponents
+    // vs repairMissingRemoteDesktopWorker) — the frontend only has to ask.
+    expect(sent).toEqual([{ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST }]);
   });
 
   it('opens the daemon machine once the worker is installed', () => {

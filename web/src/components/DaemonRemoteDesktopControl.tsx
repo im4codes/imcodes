@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
 import {
   REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
+  REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY,
   REMOTE_DESKTOP_INSTALL_MSG,
   REMOTE_DESKTOP_INSTALL_STATE,
   validateRemoteDesktopInstallStateMessage,
@@ -49,11 +50,18 @@ export interface DaemonRemoteDesktopControlProps {
  * Remote control for the daemon's own machine.
  *
  * A daemon has no entry in the controlled-machine list, so its remote-desktop
- * state comes from the capabilities it advertises in `daemon.hello`: the
- * `installable` capability means "this is a Windows host that could serve remote
- * control", and the capability itself means "the native worker is installed and
- * verified". Anything else renders nothing at all — a machine that cannot serve
- * remote control should not offer a button that will fail.
+ * state comes from the capabilities it advertises in `daemon.hello`: an
+ * `installable` capability (`REMOTE_DESKTOP_INSTALLABLE_CAPABILITY` for
+ * Windows and Linux, which share the same repair-by-self-upgrade mechanism;
+ * `REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY` under its own name for macOS,
+ * which installs by publishing into a component store instead) means "this
+ * host could serve remote control but needs one install/repair step first",
+ * and the capability itself means "the native worker is installed and
+ * verified". Anything else renders nothing at all — a machine that cannot
+ * serve remote control should not offer a button that will fail. Both
+ * installable capabilities resolve to the same generic, field-less
+ * `REMOTE_DESKTOP_INSTALL_MSG.REQUEST` on click; the daemon/controlled-node
+ * side already branches on its own platform to run the right install path.
  */
 export function DaemonRemoteDesktopControl({
   ws,
@@ -113,7 +121,12 @@ export function DaemonRemoteDesktopControl({
     // `loginScreen` is a dependency so a completed install is picked up without
     // the user reloading: the node it just enrolled is what the button steers to.
   }, [machines, ready, serverId, loginScreen?.state]);
-  const installable = capabilities.includes(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY);
+  // Two separate wire names for the same meaning (see the class doc comment):
+  // Windows/Linux repair by self-upgrade under the legacy Windows-named
+  // constant, macOS component-store install under its own. A host that
+  // advertises neither is not offering anything this button could trigger.
+  const installable = capabilities.includes(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY)
+    || capabilities.includes(REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY);
   if (!serverId || !daemonOnline || (!ready && !installable)) return null;
 
   // A controlled node enrolled from this daemon is the same physical machine.
