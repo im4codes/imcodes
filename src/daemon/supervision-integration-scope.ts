@@ -51,18 +51,40 @@ function uniqueCanonicalPaths(paths: readonly string[]): string[] | undefined {
  * authority boundary that prevents unrelated dirty files from becoming
  * immutable implementation evidence.
  *
- * Scope is fail-closed: an empty, ambiguous, or non-canonical scope can never
- * fall back to "all dirty files". Outside-scope staging/conflicts/untracked
- * files belong to another owner and are excluded alongside their manifest
- * rows. Inside-scope staging/conflicts remain visible for the caller's normal
- * refusal checks.
+ * Scope is fail-closed: a REAL declared scope that is ambiguous or
+ * non-canonical can never fall back to "all dirty files", and a real
+ * declared scope that matches nothing in the snapshot is `empty_manifest`.
+ * Outside-scope staging/conflicts/untracked files belong to another owner
+ * and are excluded alongside their manifest rows. Inside-scope
+ * staging/conflicts remain visible for the caller's normal refusal checks.
+ *
+ * `scopeFiles: []` is NOT treated as "a real scope declared as empty" --
+ * per this project's own supervision_task_registry_v1 contract, scopeFiles
+ * is record-only, non-authoritative metadata (`mode: 'record_only'`,
+ * `authority: false`), and today every assignment that never had a scope
+ * set (the norm: callers routinely omit ownedFiles/scopeFiles) is persisted
+ * as `scopeFiles: []` -- indistinguishable at the type level from a
+ * deliberately-empty scope, which would be a degenerate declaration no real
+ * caller intends (it can only ever exclude every file). Treating `[]` as
+ * "no scope was ever declared" and falling back to trusting the
+ * already-verified snapshot (`snapshot.files`, which by the time this runs
+ * reflects the real committed diff since the task's base revision, not
+ * uncommitted-only state) preserves the actual security boundary -- an
+ * implementer who DID declare a real, non-empty scope is still fail-closed
+ * to exactly that scope, unchanged -- while no longer rejecting every
+ * assignment that simply never set one.
  */
 export function projectSupervisionSnapshotToAssignmentScope(input: {
   snapshot: SupervisionWorktreeSnapshot;
   scopeFiles: readonly string[];
 }): SupervisionIntegrationScopeResult {
-  const scopeFiles = uniqueCanonicalPaths(input.scopeFiles);
-  if (!scopeFiles) return { ok: false, reason: 'invalid_scope' };
+  const scopeDeclared = input.scopeFiles.length > 0;
+  let scopeFiles: string[] = [];
+  if (scopeDeclared) {
+    const canonical = uniqueCanonicalPaths(input.scopeFiles);
+    if (!canonical) return { ok: false, reason: 'invalid_scope' };
+    scopeFiles = canonical;
+  }
 
   const snapshot = input.snapshot;
   const filePaths = snapshot.files.map((file) => file.path);
@@ -81,13 +103,15 @@ export function projectSupervisionSnapshotToAssignmentScope(input: {
     return { ok: false, reason: 'invalid_snapshot' };
   }
 
-  const allowed = new Set(scopeFiles);
+  // No declared scope trusts every already-verified snapshot file (the real
+  // committed diff); a declared scope still filters down to exactly itself.
+  const allowed = scopeDeclared ? new Set(scopeFiles) : filePathSet;
   const files = snapshot.files.filter((file) => allowed.has(file.path));
   if (files.length === 0) return { ok: false, reason: 'empty_manifest' };
   const included = new Set(files.map((file) => file.path));
   return {
     ok: true,
-    scopeFiles,
+    scopeFiles: scopeDeclared ? scopeFiles : filePaths.slice().sort(),
     snapshot: {
       ...snapshot,
       files,

@@ -76,10 +76,9 @@ describe('supervision integration assignment scope', () => {
     )));
   });
 
-  it('fails closed for empty, duplicate, or non-canonical assignment scope', () => {
+  it('fails closed for duplicate or non-canonical (but non-empty) assignment scope', () => {
     const observed = snapshot(['src/a.ts']);
     for (const scopeFiles of [
-      [],
       ['src/a.ts', 'src/a.ts'],
       ['./src/a.ts'],
       ['src/../outside.ts'],
@@ -91,6 +90,71 @@ describe('supervision integration assignment scope', () => {
       expect(projectSupervisionSnapshotToAssignmentScope({ snapshot: observed, scopeFiles }), scopeFiles.join(','))
         .toEqual({ ok: false, reason: 'invalid_scope' });
     }
+  });
+
+  it('regression: an assignment with an empty (never-declared) scopeFiles no longer rejects a real committed change', () => {
+    // Before the fix, `scopeFiles: []` made `allowed = new Set([])`, so
+    // `snapshot.files.filter((f) => allowed.has(f.path))` was ALWAYS empty
+    // and every projection failed (`invalid_scope` via
+    // `uniqueCanonicalPaths([])`, or `empty_manifest` once that returned a
+    // scope) regardless of what the implementer actually committed. This is
+    // the norm today: send_message's task object has no required
+    // scopeFiles/ownedFiles, so a caller who never sets one gets
+    // `scopeFiles: []` on the assignment -- indistinguishable from a
+    // (degenerate, never-real) "declared empty" scope.
+    const committed = ['src/real-change.ts', 'test/real-change.test.ts'];
+    const observed = snapshot(committed, {
+      stagedPaths: [],
+      untrackedPaths: ['test/real-change.test.ts'],
+    });
+
+    const projected = projectSupervisionSnapshotToAssignmentScope({
+      snapshot: observed,
+      scopeFiles: [],
+    });
+
+    expect(projected).toMatchObject({ ok: true, excludedPaths: [] });
+    if (!projected.ok) throw new Error(projected.reason);
+    // No scope declared -> the fix trusts the already-verified committed
+    // diff (every file in the snapshot) as the scope, not "reject outright".
+    expect(projected.scopeFiles).toEqual([...committed].sort());
+    expect(projected.snapshot.files.map((file) => file.path).sort()).toEqual([...committed].sort());
+    expect(projected.snapshot.untrackedPaths).toEqual(['test/real-change.test.ts']);
+  });
+
+  it('a genuinely empty snapshot with no declared scope still fails closed (nothing to freeze)', () => {
+    const projected = projectSupervisionSnapshotToAssignmentScope({
+      snapshot: snapshot([]),
+      scopeFiles: [],
+    });
+    expect(projected).toEqual({ ok: false, reason: 'empty_manifest' });
+  });
+
+  it('safety property preserved: a genuinely restrictive non-empty scope still excludes out-of-scope files exactly as before', () => {
+    const owned = ['src/owned-a.ts', 'src/owned-b.ts'];
+    const observed = snapshot([...owned, 'src/unrelated-dirty-file.ts', 'native/windows/unclaimed.ps1']);
+
+    const projected = projectSupervisionSnapshotToAssignmentScope({
+      snapshot: observed,
+      scopeFiles: owned,
+    });
+
+    expect(projected).toMatchObject({
+      ok: true,
+      scopeFiles: [...owned].sort(),
+      excludedPaths: ['native/windows/unclaimed.ps1', 'src/unrelated-dirty-file.ts'],
+    });
+    if (!projected.ok) throw new Error(projected.reason);
+    expect(projected.snapshot.files.map((file) => file.path).sort()).toEqual([...owned].sort());
+
+    // A declared scope that matches NOTHING in the snapshot is still a real
+    // restriction that excludes everything -- must stay `empty_manifest`,
+    // never silently fall back to "trust everything" like the [] case.
+    const noMatch = projectSupervisionSnapshotToAssignmentScope({
+      snapshot: observed,
+      scopeFiles: ['src/never-touched.ts'],
+    });
+    expect(noMatch).toEqual({ ok: false, reason: 'empty_manifest' });
   });
 
   it('includes a newly observed file only after durable scope expansion', () => {
