@@ -685,12 +685,42 @@ void LinuxRemoteDesktopSession::HandleDataChannelMessage(
     ReleaseController("keyboard");
     ReleaseController("pointer");
     ReleaseController("pointer:position");
+  } else if (message.kind == imcodes::rd::DataChannelMessageKind::kControl &&
+             channel == DataChannelKind::kControl &&
+             message.control.kind == "frame_presented") {
+    // The one "control" kind that IS acted on despite the general "not yet
+    // routed" comment below: the Server's negotiationTimer
+    // (server/src/ws/remote-desktop-router.ts, REMOTE_DESKTOP_LIMITS.
+    // NEGOTIATION_TIMEOUT_MS, 45s) never clears without this, no matter how
+    // healthy offer/ICE/lease/mode_state are -- see FramePresented()'s own
+    // comment in the header. Validated exactly like macOS's equivalent
+    // branch: the acknowledged display must be the (only) one this session
+    // has, and the presented frame's aspect ratio must be compatible with
+    // it -- both already bounded upstream by data_channel_payload.h's shared
+    // parser, re-checked here the same defense-in-depth way macOS does.
+    const common::DesktopTopology* topology = core_.topology();
+    if (topology == nullptr || topology->displays.empty() ||
+        !message.control.display_id.has_value() ||
+        *message.control.display_id != topology->displays.front().display_id ||
+        !message.control.frame_width.has_value() ||
+        !message.control.frame_height.has_value() ||
+        *message.control.frame_width == 0 || *message.control.frame_height == 0 ||
+        *message.control.frame_width > 16'384 ||
+        *message.control.frame_height > 16'384 ||
+        !common::PresentedFrameCompatibleWithDisplay(
+            {static_cast<std::uint32_t>(*message.control.frame_width),
+             static_cast<std::uint32_t>(*message.control.frame_height)},
+            topology->displays.front().encoded_pixels)) {
+      return;
+    }
+    presented_layout_revision_ = topology->revision;
   }
-  // "control" messages other than release_all ("hello", "keepalive", and
-  // anything display/clipboard/unlock-shaped) are parsed but not acted on --
-  // see this file's header comment for why those have nothing to route to
-  // yet on Linux. Silently accepting rather than closing the channel: an
-  // unimplemented-but-well-formed control kind is not a protocol violation.
+  // "control" messages other than release_all/frame_presented ("hello",
+  // "keepalive", and anything display/clipboard/unlock-shaped) are parsed
+  // but not acted on -- see this file's header comment for why those have
+  // nothing to route to yet on Linux. Silently accepting rather than closing
+  // the channel: an unimplemented-but-well-formed control kind is not a
+  // protocol violation.
 }
 
 void LinuxRemoteDesktopSession::OnIceCandidate(

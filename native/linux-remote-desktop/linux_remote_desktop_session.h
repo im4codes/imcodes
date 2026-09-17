@@ -156,6 +156,24 @@ class LinuxRemoteDesktopSession final
   [[nodiscard]] const common::DesktopTopology* topology() const noexcept {
     return core_.topology();
   }
+  // True once the browser has acknowledged actually decoding/presenting a
+  // frame for the CURRENT topology revision -- set by HandleDataChannelMessage's
+  // "frame_presented" branch, mirroring macOS's own frame_ready computation
+  // (macos_remote_desktop_worker_main.mm's EmitStatus: "the four facts the
+  // Server requires before it calls the session connected and disarms its
+  // negotiation timeout"). Server-side, server/src/ws/remote-desktop-router.ts's
+  // connectionReady strictly requires peerConnected && dataChannelsReady &&
+  // mediaStarted && firstFramePresented all === true before it clears
+  // route.negotiationTimer (REMOTE_DESKTOP_LIMITS.NEGOTIATION_TIMEOUT_MS,
+  // 45s) -- omitting this field left it permanently undefined, so every
+  // Linux session (however healthy) was killed by the negotiation timeout
+  // exactly 45s after PREPARE, then immediately re-prepared by the browser,
+  // which looked like a disconnect/reconnect loop but was really a session
+  // that could structurally never finish connecting.
+  [[nodiscard]] bool FramePresented() const noexcept {
+    const common::DesktopTopology* current = topology();
+    return current != nullptr && presented_layout_revision_ == current->revision;
+  }
 
   // Real input dispatch through common::SessionCore/InputLedger -- the same
   // ownership/release/epoch-fencing semantics macOS's session wraps, backed
@@ -289,6 +307,12 @@ class LinuxRemoteDesktopSession final
   // sends out over a data channel (topology today; matches macOS/Windows'
   // own outbound_sequence_ convention).
   std::uint64_t outbound_sequence_ = 0;
+  // Topology revision the browser last acknowledged actually presenting a
+  // compatible decoded frame for -- see FramePresented() above. Zero (never
+  // equal to a real topology's revision, which starts at 1 -- matches
+  // macOS's own presented_layout_revision_ default) until the first valid
+  // "frame_presented" control message arrives.
+  common::TopologyRevision presented_layout_revision_ = 0;
   common::TransportSessionCore transport_core_;
   // Declared after the adapters it wraps (adapters_ is a reference to the
   // caller-owned LinuxPlatformAdapters, which must outlive this session

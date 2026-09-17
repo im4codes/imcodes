@@ -217,6 +217,10 @@ class WorkerSession {
     return session_->topology();
   }
 
+  [[nodiscard]] bool FramePresented() const noexcept {
+    return session_->FramePresented();
+  }
+
  private:
   imcodes::rd::Authority authority_;
   std::shared_ptr<rd::LinuxRemoteDesktopSession> session_;
@@ -303,6 +307,13 @@ class Worker {
       status["peerConnected"] = diagnostics.peer_state == common::PeerConnectionState::kConnected;
       status["dataChannelsReady"] = diagnostics.required_channels_ready;
       status["mediaStarted"] = diagnostics.last_outbound_video_bytes > 0;
+      // The fourth fact the Server requires before it disarms
+      // NEGOTIATION_TIMEOUT_MS and calls the session connected -- see
+      // LinuxRemoteDesktopSession::FramePresented()'s own comment. Left
+      // unset (permanently undefined over the wire, so === true always
+      // failed server-side) meant every Linux session, however healthy,
+      // was killed by the negotiation timeout exactly 45s after PREPARE.
+      status["firstFramePresented"] = it->second->FramePresented();
       // Real now: linux_remote_desktop_session.cc's own DataChannelObserver
       // dispatches pointer/keyboard once this is true. Conservative (not the
       // full mode/channels/frame/state formula macOS's own EmitStatus uses)
