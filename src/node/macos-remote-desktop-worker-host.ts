@@ -479,7 +479,7 @@ export class MacosRemoteDesktopWorkerHost {
   } | null = null;
   private teardownPromise: Promise<void> = Promise.resolve();
   /**
-   * 'agent_crash' timestamps, one host-lifetime window -- NOT the
+   * Automatic-restart timestamps, one host-lifetime window -- NOT the
    * per-generation supervisor's own crash counter. A fresh
    * `MacosRemoteDesktopLaunchAgentSupervisor` is constructed on every
    * `start()`, including every restart this class itself issues below, so its
@@ -490,8 +490,23 @@ export class MacosRemoteDesktopWorkerHost {
    * unthrottled restart every ~1.3s here, forever, with launchctl
    * bootstrap/kickstart the whole time it ran -- this is the guard that
    * should have stopped it.
+   *
+   * Shared across BOTH automatic-restart triggers this host has -- the
+   * lifecycle-event 'agent_crash' path AND the IPC socket's own `onDisconnect`
+   * restart (reason 'peer_disconnected' / 'write_failed' / 'callback_failed').
+   * The second one was found live on node mini-2, still completely
+   * unthrottled after the first fix: an authenticated worker that fails
+   * during its OWN encoder/CoreMedia setup (after authenticating, so
+   * `restart` below was already true) disconnects with `peer_disconnected`,
+   * which is not `agent_crash` and so never touched the original,
+   * narrower-named counter -- three fresh worker processes were observed
+   * spawning within about one second before the underlying failure finally
+   * surfaced to the browser as `worker_failed`. Both triggers mean the exact
+   * same thing to an operator -- "this host just auto-restarted a worker
+   * that failed on its own, not by user or system request" -- so they share
+   * one budget rather than each getting their own 3-per-60s allowance.
    */
-  private readonly agentCrashTimes: number[] = [];
+  private readonly autoRestartTimes: number[] = [];
   private lifecycleGeneration = 0;
   private connectionGeneration = 0;
   private activeWorkerGeneration = 0;
@@ -917,11 +932,26 @@ export class MacosRemoteDesktopWorkerHost {
           // user-visible "1 viewing" flash with nobody ever connected. A
           // generation that DID carry a real tracked session still restarts
           // immediately, exactly as before.
-          const restart = this.authenticated && this.core.authorities().size > 0 && (
+          const failureTriggeredRestart = this.authenticated && this.core.authorities().size > 0 && (
             reason === 'peer_disconnected'
             || reason === 'write_failed'
             || reason === 'callback_failed'
           );
+          // Live evidence on node mini-2: a worker that authenticates fine and
+          // only THEN fails during its own encoder/CoreMedia setup disconnects
+          // with `peer_disconnected` -- `failureTriggeredRestart` above is
+          // true, same as a real session's peer going away, and nothing here
+          // previously bounded how many times that can repeat. Three fresh
+          // worker processes were observed spawning within about a second
+          // before the browser ever saw a terminal frame. Same shared budget
+          // as the 'agent_crash' path (see `autoRestartTimes`) -- both mean
+          // "this host just auto-restarted a worker that failed on its own."
+          const restart = failureTriggeredRestart && this.allowAutomaticRestart();
+          if (failureTriggeredRestart && !restart) {
+            this.options.onBackgroundError?.(
+              new Error('macos_remote_desktop_worker_host_disconnect_restart_loop'),
+            );
+          }
           this.invalidateForLifecycle(generation, restart);
         },
       } satisfies Omit<MacosRemoteDesktopIpcServerOptions,
@@ -1255,20 +1285,23 @@ export class MacosRemoteDesktopWorkerHost {
   }
 
   /**
-   * Bounds how many 'agent_crash'-triggered restarts this host will issue in
-   * a rolling window, mirroring `MacosRemoteDesktopLaunchAgentSupervisor`'s
-   * own (per-instance, and so ineffective here -- see `agentCrashTimes`)
-   * breaker. Every call records an attempt; only the return value says
-   * whether it may proceed.
+   * Bounds how many automatic, failure-triggered restarts this host will
+   * issue in a rolling window -- 'agent_crash' lifecycle events AND
+   * `onDisconnect`'s own 'peer_disconnected'/'write_failed'/'callback_failed'
+   * restart, both funneled through this one shared budget (see
+   * `autoRestartTimes`'s own doc comment for why). Mirrors
+   * `MacosRemoteDesktopLaunchAgentSupervisor`'s own (per-instance, and so
+   * ineffective here) breaker. Every call records an attempt; only the
+   * return value says whether it may proceed.
    */
-  private allowAgentCrashRestart(): boolean {
+  private allowAutomaticRestart(): boolean {
     const now = Date.now();
     const windowMs = MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_LIMITS.defaultCrashWindowMs;
-    while (this.agentCrashTimes.length > 0 && now - this.agentCrashTimes[0]! > windowMs) {
-      this.agentCrashTimes.shift();
+    while (this.autoRestartTimes.length > 0 && now - this.autoRestartTimes[0]! > windowMs) {
+      this.autoRestartTimes.shift();
     }
-    this.agentCrashTimes.push(now);
-    return this.agentCrashTimes.length <= MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_LIMITS.defaultMaxCrashRestarts;
+    this.autoRestartTimes.push(now);
+    return this.autoRestartTimes.length <= MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_LIMITS.defaultMaxCrashRestarts;
   }
 
   private handleLifecycleEvent(event: MacosRemoteDesktopLifecycleEvent): void {
@@ -1286,7 +1319,7 @@ export class MacosRemoteDesktopWorkerHost {
       if (event.serviceGeneration <= this.serviceGeneration) return;
       this.serviceGeneration = event.serviceGeneration;
     }
-    const crashLoop = event.type === 'agent_crash' && !this.allowAgentCrashRestart();
+    const crashLoop = event.type === 'agent_crash' && !this.allowAutomaticRestart();
     if (crashLoop) {
       this.options.onBackgroundError?.(
         new Error('macos_remote_desktop_worker_host_agent_crash_loop'),

@@ -778,6 +778,78 @@ describe('macOS remote-desktop worker host', () => {
     expect(value.host.available()).toBe(false);
   });
 
+  it('stops restarting after repeated peer_disconnected failures instead of looping forever', async () => {
+    // Live evidence on node mini-2: an authenticated worker with a real
+    // tracked session (so `restart` below was already true, same as a
+    // genuine peer going away) that instead fails during its OWN encoder/
+    // CoreMedia setup disconnects with 'peer_disconnected' -- a completely
+    // different trigger from 'agent_crash' above, one the earlier fix's
+    // (then agent_crash-only) counter never saw. Three fresh worker
+    // processes were observed spawning within about a second before the
+    // browser ever received a terminal frame. This path shares the same
+    // host-level budget as 'agent_crash' (see `autoRestartTimes`'s own doc
+    // comment) and must give up after
+    // MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_LIMITS.defaultMaxCrashRestarts (3).
+    const value = harness();
+    await startAuthenticated(value);
+    await value.host.handle(prepare());
+    expect(value.serverStarts).toHaveBeenCalledTimes(1);
+
+    // Disconnects 1-3: each is within budget and restarts into a fresh
+    // generation, exactly like a real, rare failure always has.
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      value.disconnect('peer_disconnected');
+      await vi.waitFor(() => expect(value.serverStarts).toHaveBeenCalledTimes(attempt + 1));
+      expect(value.authenticate()).toBe(true);
+      await vi.waitFor(() => expect(value.host.available()).toBe(true));
+      await value.host.handle(prepare());
+    }
+
+    // Disconnect 4: budget exhausted. No further restart -- serverStarts
+    // must not advance again, and the host must not spin retrying.
+    value.disconnect('peer_disconnected');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(value.serverStarts).toHaveBeenCalledTimes(4);
+    expect(value.host.available()).toBe(false);
+  });
+
+  it('shares one restart budget across agent_crash and peer_disconnected, not one each', async () => {
+    // The two triggers mean the exact same thing to an operator -- "this
+    // host just auto-restarted a worker that failed on its own" -- so they
+    // must not each get their own independent 3-per-window allowance (which
+    // would let a flapping worker restart up to 6 times before either
+    // throttle noticed).
+    const value = harness();
+    await startAuthenticated(value);
+    await value.host.handle(prepare());
+    expect(value.serverStarts).toHaveBeenCalledTimes(1);
+
+    value.lifecycle.emit({ type: 'agent_crash', workerGeneration: 1 });
+    await vi.waitFor(() => expect(value.serverStarts).toHaveBeenCalledTimes(2));
+    expect(value.authenticate()).toBe(true);
+    await vi.waitFor(() => expect(value.host.available()).toBe(true));
+    await value.host.handle(prepare());
+
+    value.disconnect('peer_disconnected');
+    await vi.waitFor(() => expect(value.serverStarts).toHaveBeenCalledTimes(3));
+    expect(value.authenticate()).toBe(true);
+    await vi.waitFor(() => expect(value.host.available()).toBe(true));
+    await value.host.handle(prepare());
+
+    value.lifecycle.emit({ type: 'agent_crash', workerGeneration: 3 });
+    await vi.waitFor(() => expect(value.serverStarts).toHaveBeenCalledTimes(4));
+    expect(value.authenticate()).toBe(true);
+    await vi.waitFor(() => expect(value.host.available()).toBe(true));
+    await value.host.handle(prepare());
+
+    // 4th auto-restart total (2 agent_crash + 2 peer_disconnected would be
+    // needed if the budgets were separate) -- this one must be refused.
+    value.disconnect('peer_disconnected');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(value.serverStarts).toHaveBeenCalledTimes(4);
+    expect(value.host.available()).toBe(false);
+  });
+
   it('retires a changed Control profile and relaunches View-only before accepting a new route', async () => {
     let accessibility = true;
     const releaseInput = vi.fn();
