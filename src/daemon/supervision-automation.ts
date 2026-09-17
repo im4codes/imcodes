@@ -2754,6 +2754,35 @@ class SupervisionAutomation {
         return;
       }
       if (!this.isSessionIdle(latest.sessionName) || latest.evaluating) return;
+      // Live evidence (deck_cd_brain, seq 2562-2567 and 3451-3456 in its
+      // timeline): a genuine completion had already landed and been
+      // evaluated well before this; what actually raced this exact 2s
+      // deadline was a LATER re-arm -- two session.state queued/idle pairs
+      // firing within ~100ms of each other (a real subsequent nudge/turn
+      // being dispatched) -- followed immediately by this timer finding
+      // !sawAssistantOutput and failing closed after only
+      // SUPERVISION_COMPLETION_GRACE_MS (2s), the exact gap observed between
+      // the last idle edge and the false warning both times. Two seconds is
+      // not a realistic budget for a brand-new turn's first token, let alone
+      // its completion, under real provider latency or concurrent load.
+      // Mirror the sibling sawAssistantOutput branch above: give this the
+      // same SUPERVISION_COMPLETION_WAIT_MAX_MS budget, re-armed every grace
+      // interval and reset while diagnostics-backed evidence of real
+      // dispatch exists, before concluding the response is genuinely
+      // missing rather than just not here yet.
+      if (this.hasActiveRuntimeEvidence(latest.sessionName)) {
+        latest.completionWaitStartedAt = Date.now();
+        this.armCompletionGrace(latest);
+        return;
+      }
+      if (latest.completionWaitStartedAt === undefined) {
+        latest.completionWaitStartedAt = Date.now();
+      }
+      if (Date.now() - latest.completionWaitStartedAt < SUPERVISION_COMPLETION_WAIT_MAX_MS) {
+        this.armCompletionGrace(latest);
+        return;
+      }
+      latest.completionWaitStartedAt = undefined;
       this.failClosedMissingCompletion(latest.sessionName);
       this.finishRun(latest.sessionName, 'needs_input', { preserveStatus: true });
     }, SUPERVISION_COMPLETION_GRACE_MS);

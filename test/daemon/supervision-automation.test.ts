@@ -3846,7 +3846,7 @@ describe('SupervisionAutomation', () => {
   });
 
   it('fails closed when a supervised run reaches idle without a completed assistant response', async () => {
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
     const snapshot = await seedSession('supervised');
     try {
       supervisionAutomation.init();
@@ -3861,8 +3861,30 @@ describe('SupervisionAutomation', () => {
       expect(mockSupervisionDecide).not.toHaveBeenCalled();
       expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeTruthy();
 
+      // Live evidence (deck_cd_brain timeline, seq 2562-2567 / 3451-3456): a
+      // fixed, unconditional 2s deadline here failed a run that had a real
+      // turn genuinely still in flight -- the exact same
+      // SUPERVISION_COMPLETION_GRACE_MS gap observed between the session's
+      // last idle edge and the false "no completed assistant response"
+      // warning both times. This branch must give the same
+      // SUPERVISION_COMPLETION_WAIT_MAX_MS (60s) budget the sibling
+      // sawAssistantOutput branch already gets, re-armed every grace
+      // interval, before concluding a response never showed up -- so at the
+      // old 2s mark the run must still be alive.
       await vi.advanceTimersByTimeAsync(1);
       expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeTruthy();
+
+      // Well within the new budget (60s from the first check): still
+      // genuinely nothing ever arrived, so it must still be waiting, not yet
+      // failed -- this is the exact window the old code got wrong.
+      await vi.advanceTimersByTimeAsync(58_000);
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeTruthy();
+
+      // Only once the FULL budget is exhausted with truly no evidence of any
+      // work at all does this legitimately fail closed -- the original
+      // guarantee this test protects, now on the correct timeline.
+      await vi.advanceTimersByTimeAsync(5_000);
       expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
       const events = timelineEmitter.replay('deck_supervision_brain', 0).events;
       expect(events).toEqual(expect.arrayContaining([
