@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-shot bootstrap for a headless Debian/Ubuntu box with no desktop at all:
-# installs a minimal-but-real GUI session (Xvfb virtual display, openbox
-# window manager, plank dock, lxterminal, Firefox) and wires it up as a
+# installs a real, full-featured GUI session (Xvfb virtual display, XFCE
+# with the Whisker Menu plugin on its panel, Firefox) and wires it up as a
 # persistent systemd service, so the box becomes something IM.codes'
 # remote-desktop native adapters (X11 direct capture, or the VNC backend --
 # see --with-vnc below) can actually connect to and show a working desktop
@@ -36,7 +36,7 @@ usage: install-linux-desktop-environment.sh [--user NAME] [--display :NN]
                 box is reachable over VNC in addition to direct X11 capture.
   --vnc-port    RFB port for x11vnc. Default: 5900
   --no-firefox  Skip installing Firefox (useful on a box that already has it,
-                or where you only want the WM + dock + terminal).
+                or where you only want the desktop environment itself).
 USAGE
   exit 2
 }
@@ -71,9 +71,15 @@ BASE_PACKAGES=(
   xvfb
   x11-xserver-utils
   dbus-x11
-  openbox
-  plank
-  lxterminal
+  # A real, full desktop environment, not a bare window manager + dock --
+  # xfce4 pulls in xfwm4, the panel, the desktop manager, and xfce4-terminal;
+  # xfce4-goodies is deliberately skipped (adds a large app set this
+  # remote-desktop test target does not need). The Whisker Menu plugin
+  # replaces the panel's default plain "Applications" text button with a
+  # real searchable start menu -- installed here, wired onto the panel by
+  # the session script below once XFCE's own panel process is actually up.
+  xfce4
+  xfce4-whiskermenu-plugin
   fonts-noto-core
   fonts-noto-color-emoji
   # A fully headless box (no sound card at all -- true of most VMs/CI
@@ -132,12 +138,13 @@ cat > /usr/local/lib/imcodes/imcodes-desktop-session.sh <<SESSION
 #!/usr/bin/env bash
 # Launched by imcodes-desktop-session.service, as \$TARGET_USER, once Xvfb on
 # \$DISPLAY_NUM is already up (After=imcodes-desktop-xvfb.service). Starts a
-# dbus session bus (Firefox and plank both expect one), a per-session
+# dbus session bus (Firefox and XFCE both expect one), a per-session
 # pulseaudio (so a real remote-desktop session's AudioDeviceModule has a real
 # device to open even on a box with no sound card at all -- see the package
-# install step's own comment), the openbox window manager, the plank dock,
-# one lxterminal window, and Firefox -- so the display isn't just a running X
-# server with nothing on it.
+# install step's own comment), the full XFCE session (window manager, panel,
+# desktop manager), the Whisker Menu plugin added onto the panel once it is
+# actually up, and Firefox -- so the display isn't just a running X server
+# with nothing on it.
 set -euo pipefail
 export DISPLAY="$DISPLAY_NUM"
 export HOME="$TARGET_HOME"
@@ -145,13 +152,15 @@ export XDG_RUNTIME_DIR="\${XDG_RUNTIME_DIR:-/run/$RUNTIME_DIR_NAME}"
 
 exec dbus-launch --exit-with-session bash -c '
   pulseaudio --start --exit-idle-time=-1 || true
-  openbox-session &
-  # plank and the app launches race the window manager coming up; a fixed
-  # settle delay is simpler and just as reliable here as a poll loop, since
-  # this is a one-shot session start, not a latency-sensitive path.
-  sleep 2
-  plank &
-  lxterminal &
+  startxfce4 &
+  # The panel process races xfce4-panel --add below the same way plank used
+  # to race openbox; a fixed settle delay is simpler and just as reliable
+  # here as a poll loop, since this is a one-shot session start, not a
+  # latency-sensitive path. --add is itself idempotent-ish: safe to leave in
+  # place if the session script re-runs against an already-running panel
+  # (worst case, a second Whisker Menu instance on the panel, not a crash).
+  sleep 4
+  xfce4-panel --add=whiskermenu 2>/dev/null || true
   $([[ "$WITH_FIREFOX" -eq 1 ]] && echo 'firefox &')
   wait
 '
@@ -175,7 +184,7 @@ UNIT
 
 cat > /etc/systemd/system/imcodes-desktop-session.service <<UNIT
 [Unit]
-Description=IM.codes desktop session (openbox + plank + terminal + firefox) on $DISPLAY_NUM
+Description=IM.codes desktop session (XFCE + Whisker Menu + firefox) on $DISPLAY_NUM
 After=imcodes-desktop-xvfb.service
 Requires=imcodes-desktop-xvfb.service
 
