@@ -489,8 +489,20 @@ bool LinuxRemoteDesktopSession::SendTopology() {
     bounds["width"] = display.logical_input_bounds.width;
     bounds["height"] = display.logical_input_bounds.height;
     encoded["inputBounds"] = std::move(bounds);
+    // Wire shape is shared/remote-desktop.ts's isDisplayOperations(): EXACTLY
+    // setMode/setScale, nothing else. display.operations.selectable is a
+    // native-side-only concept (DisplayOperations in value_types.h) with no
+    // wire counterpart -- sending it as a third key made
+    // hasExactKeys(value.operations, ['setMode','setScale']) reject every
+    // display entry, which made isDisplay() reject the whole array, which
+    // made validateDisplayTopology() reject the entire message: confirmed
+    // live, this worker's own topology reached the browser exactly as
+    // built (verified with a raw WebRTC listener bypassing the app's
+    // validator), but the real app silently dropped it right here, so
+    // snapshot.displays never populated and input never enabled -- despite
+    // every other piece (SetControlActive, STATUS fields, sending topology
+    // at all) being correct.
     Json::Value operations(Json::objectValue);
-    operations["selectable"] = display.operations.selectable;
     operations["setMode"] = display.operations.set_mode;
     operations["setScale"] = display.operations.set_scale;
     encoded["operations"] = std::move(operations);
@@ -550,7 +562,6 @@ bool LinuxRemoteDesktopSession::CorrelationMatches(
 
 void LinuxRemoteDesktopSession::HandleDataChannelMessage(
     DataChannelKind channel, const std::string& payload) {
-
   imcodes::rd::DataChannelMessage message;
   if (!imcodes::rd::ParseDataChannelMessage(payload, &message) ||
       !CorrelationMatches(message)) {
