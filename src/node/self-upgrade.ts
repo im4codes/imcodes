@@ -34,10 +34,12 @@ import {
   REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX,
   REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME,
   REMOTE_DESKTOP_VIRTUAL_DISPLAY_MANIFEST_FILENAME,
+  REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
   decodeRemoteDesktopMacosComponentSetPrefix,
   remoteDesktopMacosComponentSetFilename,
   validateRemoteDesktopWorkerManifest,
   validateRemoteDesktopWorkerReleaseManifest,
+  validateRemoteDesktopLinuxWorkerManifest,
   type RemoteDesktopMacosArchitecture,
 } from '../../shared/remote-desktop-worker.js';
 import {
@@ -886,6 +888,77 @@ export async function downloadControlledNodeRemoteDesktopWorker(input: {
   }
 }
 
+/**
+ * The Linux equivalent of downloadControlledNodeRemoteDesktopWorker above,
+ * much smaller because there is no code-signing authority to pin, no
+ * virtual-display sidecar, and no legacy v1 upgrade path to serve --
+ * RemoteDesktopLinuxWorkerManifest (shared/remote-desktop-worker.ts) is
+ * deliberately a two-field schema. Exists because bundling the worker
+ * directly into the controlled-node build (build-node-exe.yml) only gets it
+ * onto a FRESH install: self-upgrade replaces just the main executable's own
+ * artifact, never a sidecar it does not own, so a node that was already
+ * running before the worker existed -- or before a fixed build of it shipped
+ * -- would otherwise never receive one.
+ */
+export async function downloadControlledNodeLinuxRemoteDesktopWorker(input: {
+  credential: ArtifactDownloadCredential;
+  target: ControlledNodeArtifactTarget;
+  dir: string;
+  fetchImpl: typeof fetch;
+  expectedVersion?: string;
+}): Promise<{ workerDir: string; artifactPath: string; manifestPath: string; sha256: string } | undefined> {
+  if (input.target.os !== CONTROLLED_NODE_OS_LINUX || input.target.arch !== CONTROLLED_NODE_ARCH_X64) return undefined;
+  const workerDir = join(input.dir, 'remote-desktop-worker', 'linux-x64');
+  await mkdir(workerDir, { recursive: true });
+  try {
+    const executable = await downloadArtifact({
+      credential: input.credential,
+      target: input.target,
+      dir: workerDir,
+      fetchImpl: input.fetchImpl,
+      asset: CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER,
+      expectedFileName: REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
+      expectedVersion: input.expectedVersion,
+      fileMode: 0o755,
+    });
+    const manifestFilename = `${REMOTE_DESKTOP_LINUX_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`;
+    const manifestDownload = await downloadArtifact({
+      credential: input.credential,
+      target: input.target,
+      dir: workerDir,
+      fetchImpl: input.fetchImpl,
+      asset: CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST,
+      expectedFileName: manifestFilename,
+      expectedVersion: input.expectedVersion,
+      fileMode: 0o644,
+    });
+    const manifest = validateRemoteDesktopLinuxWorkerManifest(
+      JSON.parse(await readFile(manifestDownload.artifactPath, 'utf8')),
+    );
+    if (!manifest
+      || (input.expectedVersion !== undefined && manifest.build.version !== input.expectedVersion)
+      || manifest.artifact.sha256 !== executable.sha256
+      || manifest.artifact.size !== executable.sizeBytes
+      || manifest.artifact.fileName !== executable.filename) {
+      throw new Error('remote_desktop_worker_manifest_mismatch');
+    }
+    await rm(manifestDownload.manifestPath, { force: true });
+    return {
+      workerDir,
+      artifactPath: executable.artifactPath,
+      manifestPath: manifestDownload.artifactPath,
+      sha256: executable.sha256,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (input.expectedVersion === undefined
+      && (/^download_failed_(404|409|503)$/.test(message) || message === 'artifact_filename_mismatch')) {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
 export function buildWindowsControlledNodeUpgradeScript(input: {
   stagedArtifactPath: string;
   stagedManifestPath: string;
@@ -1322,6 +1395,15 @@ export function buildPosixControlledNodeUpgradeScript(input: {
   stagedArtifactPath: string;
   stagedManifestPath: string;
   stagedComputerUseHelperDir?: string;
+  // Swap the platform-root as one directory, matching Windows' own
+  // stagedRemoteDesktopWorkerDir convention, so the installed layout stays
+  // remote-desktop-worker/linux-x64/<worker+manifest> -- the exact path
+  // resolveLinuxRemoteDesktopWorkerPath (linux-remote-desktop-worker-host.ts)
+  // expects next to the main executable. darwin never passes this: its
+  // remote-desktop component set is fetched by its own always-running
+  // bootstrap coordinator (macos-remote-desktop-production.ts), not staged
+  // through this upgrade script.
+  stagedRemoteDesktopWorkerDir?: string;
   stagedJournalPath?: string;
   destinationPath: string;
   destinationManifestPath: string;
@@ -1336,6 +1418,11 @@ export function buildPosixControlledNodeUpgradeScript(input: {
     : `find ${shQuote(helperDir)} -type f -name 'open-computer-use' -exec chmod 755 {} \\; 2>/dev/null || true\n`;
   const helperCopy = input.stagedComputerUseHelperDir
     ? `rm -rf ${shQuote(helperDir)}\nmkdir -p ${shQuote(helperDir)}\ncp -R ${shQuote(`${input.stagedComputerUseHelperDir}/.`)} ${shQuote(helperDir)}/ 2>/dev/null || true\n${helperPermissions}`
+    : '';
+  const remoteDesktopWorkerRoot = join(dirname(input.destinationPath), 'remote-desktop-worker');
+  const remoteDesktopWorkerCopy = input.stagedRemoteDesktopWorkerDir
+    ? `rm -rf ${shQuote(remoteDesktopWorkerRoot)}\nmkdir -p ${shQuote(remoteDesktopWorkerRoot)}\ncp -R ${shQuote(`${input.stagedRemoteDesktopWorkerDir}/.`)} ${shQuote(remoteDesktopWorkerRoot)}/ 2>/dev/null || true\n`
+      + `find ${shQuote(remoteDesktopWorkerRoot)} -type f -name '${REMOTE_DESKTOP_LINUX_WORKER_FILENAME}' -exec chmod 755 {} \\; 2>/dev/null || true\n`
     : '';
   // Publish the new executable through a temp file + rename(2), NEVER `cp -f`
   // straight onto the destination.
@@ -1373,8 +1460,8 @@ export function buildPosixControlledNodeUpgradeScript(input: {
     + `fi\n`
     + `if [ "$SKIP" = "0" ]; then\n`
     + `  cp -f ${shQuote(input.stagedManifestPath)} ${shQuote(input.destinationManifestPath)} 2>/dev/null || true\n`
-    + `${helperCopy}${journalCopy}`.split('\n').filter(Boolean).map((line) => `  ${line}`).join('\n')
-    + (helperCopy || journalCopy ? '\n' : '')
+    + `${helperCopy}${remoteDesktopWorkerCopy}${journalCopy}`.split('\n').filter(Boolean).map((line) => `  ${line}`).join('\n')
+    + (helperCopy || remoteDesktopWorkerCopy || journalCopy ? '\n' : '')
     + `fi\n`
     + `rm -f ${shQuote(pending)} 2>/dev/null || true\n`;
   if (input.platform === 'linux') {
@@ -1538,16 +1625,27 @@ export async function startControlledNodeSelfUpgrade(
     });
     if (!downloaded.version) throw new Error('missing_artifact_version');
     const helper = await downloadControlledNodeComputerUseHelper({ credential, target, dir: updateDir, fetchImpl });
-    // A Windows release is one publication unit. Installing the runtime without
-    // its same-version worker bundle strands the node after its runtime version
-    // converges, because version-based auto-upgrade will no longer retry.
-    const remoteDesktopWorker = await downloadControlledNodeRemoteDesktopWorker({
+    // A Windows/Linux release is one publication unit. Installing the runtime
+    // without its same-version worker bundle strands the node after its
+    // runtime version converges, because version-based auto-upgrade will no
+    // longer retry. Both download functions gate on target.os internally and
+    // return undefined immediately for the wrong platform, so calling both
+    // unconditionally (macOS gets neither -- its own bootstrap coordinator
+    // fetches its component set independently) is cheap and simpler than
+    // branching on platform here too.
+    const remoteDesktopWorker = (await downloadControlledNodeRemoteDesktopWorker({
       credential,
       target,
       dir: updateDir,
       fetchImpl,
       expectedVersion: downloaded.version,
-    });
+    })) ?? (await downloadControlledNodeLinuxRemoteDesktopWorker({
+      credential,
+      target,
+      dir: updateDir,
+      fetchImpl,
+      expectedVersion: downloaded.version,
+    }));
     const destinationPath = deps.execPath ?? defaultStagedExecutablePath(platform);
     const destinationManifestPath = `${destinationPath}.manifest.json`;
     const destinationJournalPath = deps.journalPath ?? join(dirname(defaultCredentialPath(platform)), 'install-journal.json');
@@ -1595,6 +1693,12 @@ export async function startControlledNodeSelfUpgrade(
         stagedArtifactPath: downloaded.artifactPath,
         stagedManifestPath: downloaded.manifestPath,
         stagedComputerUseHelperDir: helper?.helperDir,
+        // Undefined on darwin: remoteDesktopWorker is always undefined there
+        // (see the comment above where it is downloaded), so this only ever
+        // carries a value on linux.
+        stagedRemoteDesktopWorkerDir: remoteDesktopWorker
+          ? dirname(remoteDesktopWorker.workerDir)
+          : undefined,
         stagedJournalPath,
         destinationPath,
         destinationManifestPath,

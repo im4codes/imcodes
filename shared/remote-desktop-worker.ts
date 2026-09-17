@@ -67,6 +67,11 @@ export const REMOTE_DESKTOP_MACOS_COMPONENT_SET_MAX_BYTES =
   + Object.values(REMOTE_DESKTOP_MACOS_COMPONENT_LIMITS).reduce((total, size) => total + size, 0);
 export const REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME = 'imcodes-virtual-display.zip' as const;
 export const REMOTE_DESKTOP_VIRTUAL_DISPLAY_MANIFEST_FILENAME = 'imcodes-virtual-display.manifest.json' as const;
+// The Linux worker's own filename (native/linux-remote-desktop/build-worker-
+// from-sdk.sh's WORKER_FILENAME) and the sidecar path LinuxRemoteDesktopWorker
+// Host resolves it at (src/node/linux-remote-desktop-worker-host.ts) both
+// derive from this rather than repeating the literal.
+export const REMOTE_DESKTOP_LINUX_WORKER_FILENAME = 'imcodes-linux-remote-desktop-worker' as const;
 export const REMOTE_DESKTOP_WORKER_HELLO_TYPE = 'remote_desktop.worker_hello' as const;
 // Last words of a worker that hit a structured exception. The worker writes one
 // bounded frame from its unhandled-exception filter and then terminates, so a
@@ -569,6 +574,53 @@ export function validateRemoteDesktopWorkerReleaseManifest(
 /** Windows-only compatibility entry point for the currently shipped host. */
 export function validateRemoteDesktopWorkerManifest(value: unknown): RemoteDesktopWorkerManifest | null {
   return validateWindowsRemoteDesktopWorkerManifest(value);
+}
+
+/**
+ * The Linux worker's own manifest shape, written by build-worker-from-sdk.sh
+ * and read back by both the self-upgrade download (src/node/self-upgrade.ts)
+ * and the server's artifact route (server/src/routes/enroll.ts). Bundled
+ * directly into the controlled-node build rather than code-signed and
+ * notarized the way Windows/macOS are (no signing authority to pin, no
+ * virtual-display sidecar, no legacy v1 upgrade path), so this is
+ * deliberately a much smaller schema than RemoteDesktopWindowsWorkerManifest
+ * -- widen it later only if a real second field needs authenticating.
+ */
+export interface RemoteDesktopLinuxWorkerManifest {
+  schemaVersion: 1;
+  artifact: {
+    fileName: typeof REMOTE_DESKTOP_LINUX_WORKER_FILENAME;
+    os: 'linux';
+    arch: 'x64';
+    size: number;
+    sha256: string;
+  };
+  build: {
+    source: string;
+    version: string;
+  };
+}
+
+export function validateRemoteDesktopLinuxWorkerManifest(
+  value: unknown,
+): RemoteDesktopLinuxWorkerManifest | null {
+  if (!record(value)
+    || !exactKeys(value, ['schemaVersion', 'artifact', 'build'])
+    || value.schemaVersion !== 1
+    || !record(value.artifact)
+    || !exactKeys(value.artifact, ['fileName', 'os', 'arch', 'size', 'sha256'])
+    || value.artifact.fileName !== REMOTE_DESKTOP_LINUX_WORKER_FILENAME
+    || value.artifact.os !== 'linux'
+    || value.artifact.arch !== 'x64'
+    || !validPositiveSize(value.artifact.size)
+    || typeof value.artifact.sha256 !== 'string' || !SHA256_RE.test(value.artifact.sha256)
+    || !record(value.build)
+    || !exactKeys(value.build, ['source', 'version'])
+    || typeof value.build.source !== 'string' || value.build.source.length === 0
+    || typeof value.build.version !== 'string' || !VERSION_RE.test(value.build.version)) {
+    return null;
+  }
+  return value as unknown as RemoteDesktopLinuxWorkerManifest;
 }
 
 /**

@@ -24,6 +24,7 @@ import {
   CONTROLLED_NODE_ARTIFACT_ASSETS,
   CONTROLLED_NODE_ARTIFACT_HEADERS,
   CONTROLLED_NODE_ENROLL_AUDIT_ACTION,
+  CONTROLLED_NODE_OS_LINUX,
   CONTROLLED_NODE_OS_MAC,
   CONTROLLED_NODE_OS_WIN,
   CONTROLLED_NODE_TICKET_DELIVERY,
@@ -56,10 +57,12 @@ import {
   REMOTE_DESKTOP_WORKER_FILENAME,
   REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX,
   REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME,
+  REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
   validateRemoteDesktopWorkerReleaseManifest,
   type RemoteDesktopMacosArchitecture,
   type RemoteDesktopMacosWorkerManifest,
   validateRemoteDesktopWorkerManifest,
+  validateRemoteDesktopLinuxWorkerManifest,
 } from '../../../shared/remote-desktop-worker.js';
 import {
   createArtifactCatalog,
@@ -1157,6 +1160,115 @@ async function openRemoteDesktopWorkerArtifact(
   }
 }
 
+/**
+ * The Linux equivalent of openRemoteDesktopWorkerArtifact above, much
+ * smaller for the same reason downloadControlledNodeLinuxRemoteDesktopWorker
+ * (src/node/self-upgrade.ts) is: no code-signing authority to pin, no
+ * virtual-display sidecar, no legacy v1 manifest to serve. Same safety
+ * property kept: lstat (reject symlinks) -> open -> re-fstat and compare
+ * identity to the lstat result, so a swap between the two calls is refused
+ * rather than silently served.
+ */
+async function openLinuxRemoteDesktopWorkerArtifact(
+  dir: string,
+  asset: typeof CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
+    | typeof CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST,
+): Promise<{
+  handle?: FileHandle;
+  bytes?: Buffer;
+  close: () => Promise<void>;
+  filename: string;
+  sizeBytes: number;
+  sha256: string;
+  version: string;
+} | null> {
+  const workerDir = join(dir, 'remote-desktop-worker', 'linux-x64');
+  const executablePath = join(workerDir, REMOTE_DESKTOP_LINUX_WORKER_FILENAME);
+  const manifestFilename = `${REMOTE_DESKTOP_LINUX_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`;
+  const manifestPath = join(workerDir, manifestFilename);
+  let executable: FileHandle | null = null;
+  let manifestHandle: FileHandle | null = null;
+  let requested: FileHandle | null = null;
+  try {
+    const [executablePathStat, manifestPathStat] = await Promise.all([
+      lstat(executablePath),
+      lstat(manifestPath),
+    ]);
+    if (!executablePathStat.isFile() || executablePathStat.isSymbolicLink()
+      || !manifestPathStat.isFile() || manifestPathStat.isSymbolicLink()
+      || manifestPathStat.size <= 0 || manifestPathStat.size > 64 * 1024) return null;
+    manifestHandle = await open(manifestPath, 'r');
+    const manifestStat = await manifestHandle.stat();
+    if (!manifestStat.isFile() || manifestStat.size !== manifestPathStat.size
+      || manifestStat.mtimeMs !== manifestPathStat.mtimeMs
+      || manifestStat.ctimeMs !== manifestPathStat.ctimeMs) return null;
+    const rawManifest = await manifestHandle.readFile();
+    await manifestHandle.close();
+    manifestHandle = null;
+    const manifest = validateRemoteDesktopLinuxWorkerManifest(JSON.parse(rawManifest.toString('utf8')));
+    if (!manifest || manifest.artifact.size !== executablePathStat.size) return null;
+
+    executable = await open(executablePath, 'r');
+    const executableStat = await executable.stat();
+    if (!executableStat.isFile() || executableStat.size !== executablePathStat.size
+      || executableStat.mtimeMs !== executablePathStat.mtimeMs
+      || executableStat.ctimeMs !== executablePathStat.ctimeMs) return null;
+    const executableHash = createHash('sha256');
+    const executableBuffer = Buffer.alloc(64 * 1024);
+    let executablePosition = 0;
+    while (executablePosition < executableStat.size) {
+      const { bytesRead } = await executable.read(
+        executableBuffer,
+        0,
+        Math.min(executableBuffer.length, executableStat.size - executablePosition),
+        executablePosition,
+      );
+      if (bytesRead <= 0) return null;
+      executableHash.update(executableBuffer.subarray(0, bytesRead));
+      executablePosition += bytesRead;
+    }
+    if (executableHash.digest('hex') !== manifest.artifact.sha256) return null;
+
+    const requestedPath = asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
+      ? executablePath : manifestPath;
+    const requestedPathStat = asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
+      ? executablePathStat : manifestPathStat;
+    requested = asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
+      ? executable
+      : await open(requestedPath, 'r');
+    if (requested === executable) executable = null;
+    const requestedStat = await requested.stat();
+    if (!requestedStat.isFile() || requestedStat.size !== requestedPathStat.size
+      || requestedStat.mtimeMs !== requestedPathStat.mtimeMs
+      || requestedStat.ctimeMs !== requestedPathStat.ctimeMs) return null;
+    const requestedHash = asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
+      ? manifest.artifact.sha256
+      : createHash('sha256').update(rawManifest).digest('hex');
+    let closed = false;
+    const pinned = requested;
+    requested = null;
+    return {
+      handle: pinned,
+      close: async () => {
+        if (closed) return;
+        closed = true;
+        await pinned.close().catch(() => {});
+      },
+      filename: asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER
+        ? REMOTE_DESKTOP_LINUX_WORKER_FILENAME : manifestFilename,
+      sizeBytes: requestedStat.size,
+      sha256: requestedHash,
+      version: manifest.build.version,
+    };
+  } catch {
+    return null;
+  } finally {
+    await executable?.close().catch(() => {});
+    await manifestHandle?.close().catch(() => {});
+    await requested?.close().catch(() => {});
+  }
+}
+
 interface OpenedMacosRemoteDesktopComponentSet {
   prefix: Buffer;
   manifestBytes: Buffer;
@@ -1491,7 +1603,15 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
     );
   }
   if (isRemoteDesktopArtifactAsset(asset)) {
-    if (artifactTarget.os !== 'win' || artifactTarget.arch !== 'x64') {
+    const isWindowsTarget = artifactTarget.os === CONTROLLED_NODE_OS_WIN && artifactTarget.arch === 'x64';
+    const isLinuxTarget = artifactTarget.os === CONTROLLED_NODE_OS_LINUX && artifactTarget.arch === 'x64';
+    if (!isWindowsTarget && !isLinuxTarget) {
+      return c.json({ error: 'remote_desktop_worker_unsupported', os: artifactTarget.os, arch: artifactTarget.arch }, 404);
+    }
+    // Linux has no virtual-display component (no separate display driver --
+    // it captures the real X11/Wayland output directly), so this asset only
+    // ever exists for Windows.
+    if (isLinuxTarget && asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_VIRTUAL_DISPLAY) {
       return c.json({ error: 'remote_desktop_worker_unsupported', os: artifactTarget.os, arch: artifactTarget.arch }, 404);
     }
     const requestedProtocol = c.req.header(
@@ -1505,9 +1625,25 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
     // v1 nodes predate the request header and embed a strict v1 manifest
     // validator. Give only those legacy manifest requests a v1-shaped view of
     // the same hash-pinned v2 worker so they can make the one-hop upgrade.
-    const legacyManifest = asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST
+    // Linux never shipped a v1 worker, so it has no legacy manifest to serve.
+    const legacyManifest = isWindowsTarget
+      && asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_WORKER_MANIFEST
       && requestedProtocol === undefined;
-    const openedWorker = await openRemoteDesktopWorkerArtifact(dir, asset, legacyManifest);
+    // The Linux asset set has no REMOTE_DESKTOP_VIRTUAL_DISPLAY component (no
+    // separate display driver -- Linux captures the real X11/Wayland output
+    // directly): openLinuxRemoteDesktopWorkerArtifact's own parameter type
+    // only accepts the worker + its manifest, so a Linux target requesting
+    // that asset fails to typecheck here rather than silently resolving
+    // through the wrong opener.
+    const openedWorker = isWindowsTarget
+      ? await openRemoteDesktopWorkerArtifact(dir, asset, legacyManifest)
+      // Unreachable given the guard above (already refused this asset for a
+      // Linux target), but narrows asset's type so the Linux opener's own
+      // narrower parameter type -- worker + manifest only, no virtual
+      // display -- typechecks instead of needing a cast.
+      : asset === CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_VIRTUAL_DISPLAY
+        ? null
+        : await openLinuxRemoteDesktopWorkerArtifact(dir, asset);
     if (!openedWorker) return c.json({ error: 'remote_desktop_worker_not_built', os: artifactTarget.os, arch: artifactTarget.arch }, 503);
     c.header('Content-Length', String(openedWorker.sizeBytes));
     c.header('Content-Type', 'application/octet-stream');

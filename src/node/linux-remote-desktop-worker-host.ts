@@ -16,25 +16,29 @@ import {
   REMOTE_DESKTOP_SESSION_CAPABILITY,
 } from '../../shared/remote-desktop-platform.js';
 import { REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY } from '../../shared/remote-desktop-access.js';
+import { REMOTE_DESKTOP_LINUX_WORKER_FILENAME } from '../../shared/remote-desktop-worker.js';
 import { RemoteDesktopWorkerHostCore } from './remote-desktop-worker-host-core.js';
 import type { ControlledNodeRemoteDesktopWorker } from './runtime.js';
 import logger from '../util/logger.js';
 
 /**
  * A real, standalone native worker binary (native/linux-remote-desktop/
- * linux_remote_desktop_worker_main.cc), not downloaded on demand the way
- * Windows' worker is: bundled as a sidecar alongside the controlled node's
- * own executable at build time (build-node-exe.yml's ubuntu-latest job),
- * mirroring the Computer Use helper's own established sidecar convention
- * (see computer-use-runner.ts's `join(dirname(process.execPath),
- * 'computer-use-helper', binary)`) rather than inventing a new one. No
- * download/manifest/signature machinery: the same build that produced this
- * process produced the sidecar sitting next to it.
+ * linux_remote_desktop_worker_main.cc), living at a sidecar path next to the
+ * controlled node's own executable -- mirroring the Computer Use helper's
+ * established sidecar convention (see computer-use-runner.ts's
+ * `join(dirname(process.execPath), 'computer-use-helper', binary)`) rather
+ * than inventing a new one. Two ways it gets there, same path either way:
+ * build-node-exe.yml's ubuntu-latest job bundles it directly for a fresh
+ * install, and downloadControlledNodeLinuxRemoteDesktopWorker (src/node/
+ * self-upgrade.ts) fetches and hash-verifies it against the manifest server/
+ * src/routes/enroll.ts serves, for a controlled node whose main executable
+ * self-upgraded without this sidecar (it is not part of the main executable's
+ * own artifact, so replacing just that file never brings this along).
  */
 const WORKER_SIDECAR_RELATIVE_PATH = [
   'remote-desktop-worker',
   'linux-x64',
-  'imcodes-linux-remote-desktop-worker',
+  REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
 ] as const;
 
 export function resolveLinuxRemoteDesktopWorkerPath(execPath: string = process.execPath): string {
