@@ -3,10 +3,13 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "api/make_ref_counted.h"
 #include "api/video/i420_buffer.h"
@@ -109,20 +112,119 @@ class Source : public webrtc::AdaptedVideoTrackSource {
   bool first_frame_seen_ = false;
 };
 
+// Real product requirement, not an edge case: this desktop must be
+// watchable/controllable by more than one connection at once (an owner plus
+// a guest viewer, or simply a reconnect landing before the old route has
+// torn down) -- see this file's own header and CaptureAdapter's contract in
+// platform_interfaces.h for why capture itself has no concept of "more than
+// one caller." X11CaptureAdapter is a single process-wide instance
+// (LinuxPlatformAdapters owns exactly one), and its own Start()/Stop() are
+// exclusive by design (`running_.exchange(true)` rejects a second Start()
+// outright) -- correct for a capture adapter that has no way to know how
+// many callers it has, since Stop() takes no parameters to say which one is
+// leaving. Rather than change that shared contract (used by VNC/Portal too,
+// and mirrored on Windows/macOS), this multiplexer sits in FRONT of it,
+// entirely on the Linux side: the first Lease to Start() is the only one
+// that ever actually calls the real capture.Start(); every later Lease just
+// registers its own sink and immediately gets fed the same frames. Only the
+// last remaining Lease's destruction calls the real capture.Stop().
+//
+// Real, live-observed failure this fixes: a still-active session's capture
+// was still running when a second, unrelated PREPARE arrived for the same
+// worker process (session_id genuinely different, not a duplicate message) --
+// the second session's Start() call hit the exclusive guard, returned false,
+// and the browser's whole connection attempt died with protocol_error within
+// seconds, while the FIRST session was healthy the entire time.
+class SharedCaptureMultiplexer {
+ public:
+  bool Subscribe(CaptureAdapter& capture, const DisplayTopology& display,
+                 std::uint64_t id, common::CapturedFrameSink sink) {
+    bool need_start = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      sinks_[id] = std::move(sink);
+      need_start = !started_;
+    }
+    if (!need_start) return true;
+    // capture.Start() delivers its first frame SYNCHRONOUSLY (X11CaptureAdapter
+    // ::Start() calls sink() before returning, deliberately, so a caller learns
+    // immediately whether capture actually works) -- and that sink is Fanout(),
+    // which locks mutex_ itself. Calling Start() while still holding mutex_
+    // here would self-deadlock the very first Subscribe() on every session,
+    // forever, on this same (single, signaling) thread that always drives this
+    // multiplexer -- confirmed live: the worker hung with zero stdout output,
+    // not even a WebRTC answer, on literally the first session of a rebuild
+    // that otherwise compiled and linked cleanly.
+    const bool started = capture.Start(display, [this](CapturedFrame frame) {
+      Fanout(frame);
+    });
+    std::lock_guard<std::mutex> lock(mutex_);
+    started_ = started;
+    if (!started) {
+      sinks_.erase(id);
+      return false;
+    }
+    return true;
+  }
+
+  void Unsubscribe(CaptureAdapter& capture, std::uint64_t id) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    sinks_.erase(id);
+    if (sinks_.empty() && started_) {
+      capture.Stop();
+      started_ = false;
+    }
+  }
+
+ private:
+  void Fanout(const CapturedFrame& frame) {
+    // Copy sinks out before invoking them: a sink can synchronously trigger
+    // work that re-enters this multiplexer (e.g. a WebRTC callback tearing
+    // its own Lease down), which must not deadlock or invalidate sinks_
+    // while this loop is iterating it.
+    std::vector<common::CapturedFrameSink> targets;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      targets.reserve(sinks_.size());
+      for (auto& [id, sink] : sinks_) targets.push_back(sink);
+    }
+    for (auto& sink : targets) sink(frame);
+  }
+
+  std::mutex mutex_;
+  std::unordered_map<std::uint64_t, common::CapturedFrameSink> sinks_;
+  bool started_ = false;
+};
+
+SharedCaptureMultiplexer& GlobalCaptureMultiplexer() {
+  static SharedCaptureMultiplexer instance;
+  return instance;
+}
+
+std::uint64_t NextLeaseId() noexcept {
+  static std::atomic<std::uint64_t> counter{1};
+  return counter.fetch_add(1, std::memory_order_relaxed);
+}
+
 class Lease final : public common::NativeVideoSourceLease {
  public:
   Lease(CaptureAdapter& capture, DisplayTopology display)
       : capture_(capture),
         display_(std::move(display)),
-        source_(webrtc::make_ref_counted<Source>()) {}
+        source_(webrtc::make_ref_counted<Source>()),
+        id_(NextLeaseId()) {}
 
-  ~Lease() override { capture_.Stop(); }
+  ~Lease() override {
+    if (started_) GlobalCaptureMultiplexer().Unsubscribe(capture_, id_);
+  }
 
   bool Start() override {
-    return capture_.Start(display_, [this](CapturedFrame frame) {
-      ++captured_frames_;
-      source_->PushFrame(frame);
-    });
+    started_ = GlobalCaptureMultiplexer().Subscribe(
+        capture_, display_, id_, [this](CapturedFrame frame) {
+          ++captured_frames_;
+          source_->PushFrame(frame);
+        });
+    return started_;
   }
 
   bool WaitForFirstFrame(std::chrono::milliseconds timeout) override {
@@ -153,6 +255,8 @@ class Lease final : public common::NativeVideoSourceLease {
   std::string display_id_storage_ = display_.display_id;
   webrtc::scoped_refptr<Source> source_;
   std::uint64_t captured_frames_ = 0;
+  const std::uint64_t id_;
+  bool started_ = false;
 };
 
 }  // namespace
