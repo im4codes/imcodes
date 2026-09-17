@@ -990,13 +990,13 @@ jobs:
       # environment.sh installs the same X11 client libraries on a controlled
       # node for the same reason; this is the CI-only equivalent, narrowed to
       # just the link-time libs and Xvfb rather than a full desktop session.
-      - name: Install X11 development libraries and Xvfb
+      - name: Install X11 development libraries, Xvfb, and pulseaudio
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libx11-dev libxext-dev libxtst-dev libxfixes-dev libxrandr-dev xvfb
+            libx11-dev libxext-dev libxtst-dev libxfixes-dev libxrandr-dev xvfb pulseaudio
       - name: Build and test the Linux remote-desktop worker from the SDK
         if: runner.os == 'Linux'
         env:
@@ -1030,6 +1030,15 @@ jobs:
             [ -e /tmp/.X11-unix/X99 ] && break
             sleep 0.1
           done
+          # A bare CI runner has no /proc/asound/cards entry at all (no sound
+          # card, real or virtual), which makes WebRTC's
+          # AudioDeviceModule::Init() hard-abort at session start ("Fatal
+          # error ... Check failed: 0 == adm->Init()") even though the
+          # qualification test never asked for audio -- there was simply
+          # nothing to open. Same fix as install-linux-desktop-environment.sh
+          # uses for a real headless server: pulseaudio gives it a real, if
+          # silent, device.
+          pulseaudio --start --exit-idle-time=-1 || true
           bash native/linux-remote-desktop/build-worker-from-sdk.sh \
             --sdk-root "$sdk" \
             --artifact-root dist-node-exe/remote-desktop-worker/linux-x64 \
