@@ -422,12 +422,60 @@ export function createControlledNodeRuntime(
    * left a Mac with a working worker showing no remote-desktop button at all.
    */
   let permissionRequiredCapabilities: readonly string[] = [];
+  /**
+   * Set once this node's worker has become available at least once.
+   *
+   * The 30s retry below exists to recover a start that FAILED (the usual cause
+   * is a state a person changes in seconds, like an unlocked screen) -- not to
+   * keep an already-proven-healthy worker perpetually alive. Once it has
+   * authenticated at least one generation, a later idle worker closing itself
+   * (nobody ever asked for it) is not a failure to retry: forcing it back up
+   * every 30s only respawns a fresh disclosure overlay -- unconditionally
+   * visible the instant its process starts, real peer or not -- to idle for a
+   * minute and repeat, an endless user-visible "1 viewing" flash. A real,
+   * later PREPARE still starts the worker on demand (see the lazy-start guard
+   * around `dispatchRemoteDesktopCommand` below).
+   *
+   * Declared here (not lower, where it used to live) so `refreshRemote
+   * DesktopCapabilityState` below can read it on its very first call.
+   */
+  let macosRemoteDesktopEverAvailable = false;
+  /**
+   * macOS only: the component set's own on-disk installed-and-verified state
+   * for this exact release (see `isInstalledForThisRelease` inside
+   * `installMacosRemoteDesktopComponents`, which is what actually sets this).
+   * Independent of `macosRemoteDesktopEverAvailable`: a machine can be fully
+   * installed while its worker has not yet live-started even once this run
+   * (the code above's own locked-screen example), and this signal still
+   * proves it in that gap.
+   */
+  let macosRemoteDesktopInstalledForRelease = false;
+  /**
+   * macOS only: the session/adapter capabilities a live connection most
+   * recently proved this machine can actually serve. `available()` on
+   * `src/node/macos-remote-desktop-worker-host.ts` is keyed to
+   * `authenticated` -- true only while a worker's control socket happens to
+   * be connected RIGHT NOW, false the instant it disconnects, including the
+   * ordinary, expected gap between one worker generation closing and the
+   * next one authenticating (`onDisconnect`'s own restart there, unrelated to
+   * and not changed by this fix). Without this cache, that transient,
+   * entirely normal gap made a fully-installed, actively-used machine
+   * advertise itself as "please install remote desktop" every time the
+   * capability snapshot was read during it -- confirmed live on two
+   * real machines (m3, mini-2), each flipping to that wrong state on a
+   * ~60s cycle. `ready` and `installable` must reflect whether this
+   * machine's component set is installed and has been proven to work, not
+   * whether a worker process happens to be connected at this exact instant.
+   */
+  let macosRemoteDesktopProvenSessionCapabilities: readonly string[] = [];
+  let macosRemoteDesktopProvenAdapterCapabilities: readonly RemoteDesktopAdapterCapability[] = [];
 
   const refreshRemoteDesktopCapabilityState = (): void => {
+    let remoteDesktopWorkerAvailableNow = false;
     try {
-      remoteDesktopWorkerAvailable = remoteDesktopWorker.available();
+      remoteDesktopWorkerAvailableNow = remoteDesktopWorker.available();
     } catch {
-      remoteDesktopWorkerAvailable = false;
+      remoteDesktopWorkerAvailableNow = false;
     }
     let declaredAdapterCapabilities: readonly RemoteDesktopAdapterCapability[] = [];
     try {
@@ -435,7 +483,7 @@ export function createControlledNodeRuntime(
     } catch {
       // A broken feature probe cannot widen the node's advertisement.
     }
-    workerAdapterCapabilities = remoteDesktopWorkerAvailable && remoteDesktopFeatureEnabled
+    const filteredAdapterCapabilities = remoteDesktopWorkerAvailableNow && remoteDesktopFeatureEnabled
       ? [...new Set(declaredAdapterCapabilities)].filter((capability) => {
         if (!(REMOTE_DESKTOP_ADAPTER_CAPABILITIES as readonly string[]).includes(capability)) return false;
         if (capability === REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY) {
@@ -456,11 +504,40 @@ export function createControlledNodeRuntime(
     } catch {
       declaredSessionCapabilities = [];
     }
-    workerSessionCapabilities = remoteDesktopWorkerAvailable && remoteDesktopFeatureEnabled
+    const filteredSessionCapabilities = remoteDesktopWorkerAvailableNow && remoteDesktopFeatureEnabled
       ? [...new Set(declaredSessionCapabilities)].filter((capability) => (
         capability === REMOTE_DESKTOP_CAPABILITY
         || (REMOTE_DESKTOP_SESSION_PROFILE_CAPABILITIES as readonly string[]).includes(capability)
       ))
+      : [];
+    if (remoteDesktopWorkerAvailableNow && filteredSessionCapabilities.length > 0) {
+      // Remember exactly what a live connection just proved this machine can
+      // do, so the ordinary gap before the next worker generation
+      // authenticates (see macos-remote-desktop-worker-host.ts's own
+      // onDisconnect restart -- unrelated to and unchanged by this fix) has
+      // something real to fall back to instead of nothing.
+      macosRemoteDesktopProvenSessionCapabilities = filteredSessionCapabilities;
+      macosRemoteDesktopProvenAdapterCapabilities = filteredAdapterCapabilities;
+    }
+    // macOS only: a worker proven to work at least once this run, or whose
+    // component set is independently verified installed for this release
+    // (macosRemoteDesktopInstalledForRelease covers the gap before that first
+    // proof -- e.g. a locked screen at daemon start), is READY even while
+    // genuinely disconnected between generations. That gap is the worker's
+    // own connection lifecycle, not this machine's install state, and the
+    // two must not be conflated -- every other platform's `available()`
+    // already means exactly "ready" with nothing to fall back to, so this
+    // only ever widens macOS, and only when there is a real proven profile to
+    // widen it with.
+    const macosProvenReady = platform === 'darwin'
+      && (macosRemoteDesktopEverAvailable || macosRemoteDesktopInstalledForRelease)
+      && macosRemoteDesktopProvenSessionCapabilities.length > 0;
+    remoteDesktopWorkerAvailable = remoteDesktopWorkerAvailableNow || macosProvenReady;
+    workerAdapterCapabilities = remoteDesktopWorkerAvailable && remoteDesktopFeatureEnabled
+      ? (remoteDesktopWorkerAvailableNow ? filteredAdapterCapabilities : macosRemoteDesktopProvenAdapterCapabilities)
+      : [];
+    workerSessionCapabilities = remoteDesktopWorkerAvailable && remoteDesktopFeatureEnabled
+      ? (remoteDesktopWorkerAvailableNow ? filteredSessionCapabilities : macosRemoteDesktopProvenSessionCapabilities)
       : [];
     const profile = resolveRemoteDesktopSessionProfile([
       ...workerSessionCapabilities,
@@ -532,21 +609,8 @@ export function createControlledNodeRuntime(
   let macosRemoteDesktopInstallInFlight = false;
   let macosRemoteDesktopInstallNextAttemptAt = 0;
   let macosRemoteDesktopStartNextAttemptAt = 0;
-  /**
-   * Set once this node's worker has become available at least once.
-   *
-   * The 30s retry below exists to recover a start that FAILED (the usual cause
-   * is a state a person changes in seconds, like an unlocked screen) -- not to
-   * keep an already-proven-healthy worker perpetually alive. Once it has
-   * authenticated at least one generation, a later idle worker closing itself
-   * (nobody ever asked for it) is not a failure to retry: forcing it back up
-   * every 30s only respawns a fresh disclosure overlay -- unconditionally
-   * visible the instant its process starts, real peer or not -- to idle for a
-   * minute and repeat, an endless user-visible "1 viewing" flash. A real,
-   * later PREPARE still starts the worker on demand (see the lazy-start guard
-   * around `dispatchRemoteDesktopCommand` below).
-   */
-  let macosRemoteDesktopEverAvailable = false;
+  // macosRemoteDesktopEverAvailable now declared above, alongside
+  // refreshRemoteDesktopCapabilityState, which reads it on its first call.
   let upgradeInFlight = false;
   let upgradeHandoffDeadlineAt: number | null = null;
   const armUpgradeHandoffWatchdog = (): void => {
@@ -723,6 +787,10 @@ export function createControlledNodeRuntime(
       let installedForThisRelease = false;
       try {
         installedForThisRelease = await isInstalledForThisRelease();
+        // The capability computation's own persistent, connection-lifecycle-
+        // independent "is this machine set up" signal -- see
+        // macosRemoteDesktopInstalledForRelease's own doc comment.
+        macosRemoteDesktopInstalledForRelease = installedForThisRelease;
         if (installedForThisRelease) {
           // Retry the START itself only until it first succeeds (or on an
           // explicit force). After that this worker has proven it CAN come up;
@@ -796,6 +864,7 @@ export function createControlledNodeRuntime(
       const installed = await install();
       if (installed) {
         logger.info('installed the macOS remote-desktop component set');
+        macosRemoteDesktopInstalledForRelease = true;
         // START what was just installed. The adapter's startup runs once,
         // before the socket connects -- on a machine installing for the first
         // time that is exactly when there is nothing to start, so it failed,

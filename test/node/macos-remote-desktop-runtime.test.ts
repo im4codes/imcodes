@@ -35,6 +35,7 @@ import {
 } from '../../src/node/runtime.js';
 import { ServerClockEstimator } from '../../shared/clock-sync.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from '../../shared/controlled-node-auto-unlock.js';
+import { REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY } from '../../shared/remote-desktop-install.js';
 import type { AuthenticatedWebSocketLike } from '../../src/transport/authenticated-websocket.js';
 
 const USER = {
@@ -53,6 +54,12 @@ class MockSocket extends EventEmitter implements AuthenticatedWebSocketLike {
   send(data: string): void { this.sent.push(data); }
   close(): void { this.readyState = 3; this.emit('close'); }
   open(): void { this.readyState = 1; this.emit('open'); }
+}
+
+/** The auth frame's own `capabilities`, which is the only thing the server ever reads. */
+function authCapabilities(socket: MockSocket): string[] {
+  const auth = socket.sent.map((frame) => JSON.parse(frame)).find((frame) => frame.type === 'auth');
+  return (auth?.capabilities ?? []) as string[];
 }
 
 function verifiedArtifact(): VerifiedMacosRemoteDesktopArtifact {
@@ -361,12 +368,19 @@ describe('macOS controlled-node remote-desktop runtime', () => {
     // the daemon's own heartbeat-driven keepalive must not bring an idle,
     // already-proven-healthy worker back up on its own, while a REAL PREPARE
     // still starts it (lazily, on demand) rather than failing worker_failed.
-    // A capability change (available -> unavailable, or back) is only ever
-    // seen by the server through a fresh auth frame, so the runtime opens a
-    // NEW socket whenever what it advertises changes -- exactly like "tells
-    // the server once installed components change what the node can do"
-    // above. Every socket after the first must therefore be tracked and
-    // opened in turn, not just the first one.
+    // A GENUINE capability change (e.g. component set install/uninstall) is
+    // only ever seen by the server through a fresh auth frame, and still
+    // opens a new socket -- exactly like "tells the server once installed
+    // components change what the node can do" above. What must NOT open one
+    // is this worker's own routine generation turnover: once proven
+    // available, `ready`/`installable` fall back to the last proven session
+    // capabilities for exactly this gap (see runtime.ts's own
+    // macosRemoteDesktopProvenSessionCapabilities), so nothing the server
+    // reads actually changes and this machine never flashes "please install
+    // remote desktop" between one generation closing and the next
+    // authenticating -- confirmed live on two real, fully-installed,
+    // actively-used machines (m3, mini-2) each doing exactly that, every
+    // ~60s, before this fix.
     const sockets: MockSocket[] = [];
     const createSocket = vi.fn(() => {
       const socket = new MockSocket();
@@ -436,24 +450,36 @@ describe('macOS controlled-node remote-desktop runtime', () => {
 
     // The initial connect starts the worker once and it authenticates.
     await vi.waitFor(() => expect(launchAgentStarts).toBe(1));
+    const readyCapabilities = authCapabilities(sockets[0]!);
+    expect(readyCapabilities).toContain(REMOTE_DESKTOP_SESSION_CAPABILITY);
+    expect(readyCapabilities).not.toContain(REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY);
 
     // Nothing real ever asked for it. Its own "connection_never_established"
-    // watchdog closing it with zero tracked authorities looks exactly like
-    // this from the host's perspective: an authenticated peer disconnecting
-    // with no real session in progress. Availability narrows to false, which
-    // reconnects (a fresh auth frame is the only way the server learns).
+    // watchdog closes it with zero tracked authorities -- an authenticated
+    // peer disconnecting with no real session in progress. This is the
+    // ORDINARY, expected gap the fix is about: no second socket, and the
+    // capabilities the server already has on file are still accurate --
+    // still ready, still not "please install" -- even though no worker
+    // process is live right now.
     serverOptions?.onDisconnect?.('peer_disconnected');
-    await vi.waitFor(() => expect(sockets).toHaveLength(2));
-    sockets[1]!.open();
+    // Longer than AuthenticatedWebSocketClient's own 500ms initial reconnect
+    // backoff (src/transport/authenticated-websocket.ts), so this genuinely
+    // proves no reconnect was even scheduled -- not just that one hadn't
+    // fired yet.
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    expect(sockets).toHaveLength(1);
+    const duringGapCapabilities = authCapabilities(sockets[0]!);
+    expect(duringGapCapabilities).toContain(REMOTE_DESKTOP_SESSION_CAPABILITY);
+    expect(duringGapCapabilities).not.toContain(REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY);
 
     now += 31_000; // past the 30s heartbeat retry throttle
-    sockets.at(-1)!.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    sockets[0]!.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
     await new Promise((resolve) => setTimeout(resolve, 50));
     // Proven healthy once already: the heartbeat must not keep respawning it
-    // purely to idle again -- that is the endless "1 viewing" flash. No third
-    // socket means capabilities never changed again, i.e. nothing restarted.
+    // purely to idle again -- that is the endless "1 viewing" flash. Still
+    // one socket, still one launch: nothing restarted.
     expect(launchAgentStarts).toBe(1);
-    expect(sockets).toHaveLength(2);
+    expect(sockets).toHaveLength(1);
 
     // A real PREPARE is real demand arriving right now: it must still start
     // the worker lazily rather than leave the feature silently unavailable.
@@ -470,8 +496,39 @@ describe('macOS controlled-node remote-desktop runtime', () => {
       inputEpoch: 3,
       iceServers: [],
     } as const;
-    sockets.at(-1)!.emit('message', JSON.stringify(prepare));
+    sockets[0]!.emit('message', JSON.stringify(prepare));
     await vi.waitFor(() => expect(launchAgentStarts).toBe(2));
+    runtime.stop();
+  });
+
+  it('never claims ready for a machine that has not actually proven itself, even once the store reports it installed', async () => {
+    // The fallback above must only ever widen an already-PROVEN machine. A
+    // node whose worker has never once actually connected successfully --
+    // whether genuinely never installed, or claiming installed but broken --
+    // has no proven session capabilities to fall back to, and so must keep
+    // reporting exactly what it could before this fix: installable, not
+    // ready. `macosRemoteDesktopComponentsInstalled` alone is deliberately
+    // NOT sufficient on its own; this proves the cache-emptiness guard.
+    const socket = new MockSocket();
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, {
+      platform: 'darwin',
+      arch: 'arm64',
+      macosRemoteDesktopComponentsInstalled: async () => true,
+      // No macosRemoteDesktopWorker: the worker can never actually connect,
+      // so it can never become proven, no matter what the store reports.
+    });
+    runtime.start();
+    socket.open();
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const capabilities = authCapabilities(socket);
+    expect(capabilities).toContain(REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY);
+    expect(capabilities).not.toContain(REMOTE_DESKTOP_SESSION_CAPABILITY);
     runtime.stop();
   });
 });
