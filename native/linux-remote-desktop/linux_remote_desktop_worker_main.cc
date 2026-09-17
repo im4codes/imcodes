@@ -13,10 +13,11 @@
 // are handled. LEASE renewal and MODE_STATE (view/control switching mid-
 // session) are accepted and parsed but not yet acted on -- a session starts
 // in whatever mode PREPARE requested and stays there. The data-channel wire
-// protocol (pointer/keyboard/clipboard) is still not wired to the input
-// adapters, exactly as documented in linux_remote_desktop_session.h's own
-// header comment; nothing in this file changes that. One process serves
-// however many concurrent sessions PREPARE for, matching
+// protocol's pointer/keyboard messages ARE wired to the input adapters now
+// (linux_remote_desktop_session.cc's own DataChannelObserver); clipboard,
+// display selection/mode/scale, and auto-unlock are not, exactly as
+// documented in linux_remote_desktop_session.h's own header comment. One
+// process serves however many concurrent sessions PREPARE for, matching
 // RemoteDesktopWorkerHostCore's own multi-authority design on the other end
 // of the pipe.
 #include <chrono>
@@ -297,7 +298,18 @@ class Worker {
       status["peerConnected"] = diagnostics.peer_state == common::PeerConnectionState::kConnected;
       status["dataChannelsReady"] = diagnostics.required_channels_ready;
       status["mediaStarted"] = diagnostics.last_outbound_video_bytes > 0;
-      status["inputEnabled"] = false;  // input dispatch is not wired yet; see header comment.
+      // Real now: linux_remote_desktop_session.cc's own DataChannelObserver
+      // dispatches pointer/keyboard once this is true. Conservative (not the
+      // full mode/channels/frame/state formula macOS's own EmitStatus uses)
+      // but never reports enabled before the browser could plausibly act on
+      // it: Control mode granted, and the keyboard/pointer/control channels
+      // all actually open. A hardcoded false here -- left over from when
+      // dispatch genuinely did not exist -- is exactly why a browser that
+      // reads this field to decide whether to show/send input at all kept
+      // finding nothing to do even after dispatch was wired.
+      status["inputEnabled"] =
+          diagnostics.mode == common::TransportSessionMode::kControl &&
+          diagnostics.required_channels_ready;
       WriteLine(status);
       ++it;
     }
