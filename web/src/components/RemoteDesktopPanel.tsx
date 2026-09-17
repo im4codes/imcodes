@@ -59,6 +59,7 @@ import {
   REMOTE_DESKTOP_CLIPBOARD_SHORTCUT,
   remoteDesktopMobileDeletionKey,
   sendRemoteDesktopChord,
+  splitRemoteDesktopMobileTextEnter,
   type RemoteDesktopChordKey,
   type RemoteDesktopComputerKeySpec,
 } from '../remote-desktop-keyboard.js';
@@ -2555,6 +2556,28 @@ export function RemoteDesktopPanel({
     focusRemoteDesktopMobileInput(mobileTextInputRef.current);
   };
 
+  /**
+   * Same as `submitMobileText`, but first extracts a trailing Enter -- see
+   * `splitRemoteDesktopMobileTextEnter`'s own doc comment for the full
+   * reasoning. Every mobile-IME commit path (composition end, plain
+   * non-composing input) must go through this instead of calling
+   * `submitMobileText` directly, or Return silently stops reaching the
+   * remote target again exactly as before this fix.
+   */
+  const submitMobileTextAndEnter = (value: string) => {
+    const { text, enter } = splitRemoteDesktopMobileTextEnter(value);
+    if (text) submitMobileText(text);
+    if (enter) {
+      sendMobileShortcut([{ code: 'Enter', key: 'Enter' }]);
+      // `submitMobileText` above only clears the field on its own successful
+      // send, which never runs at all when `text` is empty (Enter with
+      // nothing ahead of it) -- left alone, the DOM value would still hold
+      // the very "\n" this function exists to strip out.
+      const input = mobileTextInputRef.current;
+      if (input) input.value = '';
+    }
+  };
+
   const fetchFile = async (requestedPath: string) => {
     const path = requestedPath.trim();
     if (!path) return;
@@ -3245,7 +3268,7 @@ export function RemoteDesktopPanel({
                     const value = (event.currentTarget as HTMLTextAreaElement).value;
                     if (value && mobileTextLastCompositionCommitRef.current !== value) {
                       mobileTextLastCompositionCommitRef.current = value;
-                      submitMobileText(value);
+                      submitMobileTextAndEnter(value);
                     }
                   }}
                   onBeforeInput={(event) => {
@@ -3268,7 +3291,7 @@ export function RemoteDesktopPanel({
                       return;
                     }
                     mobileTextLastCompositionCommitRef.current = null;
-                    submitMobileText(input.value);
+                    submitMobileTextAndEnter(input.value);
                   }}
                   onKeyDown={(event) => event.stopPropagation()}
                   onKeyUp={(event) => event.stopPropagation()}

@@ -89,6 +89,46 @@ export function remoteDesktopMobileDeletionKey(
   return null;
 }
 
+export interface RemoteDesktopMobileTextSplit {
+  /** Whatever ordinary text preceded the line break, if any. */
+  text: string;
+  /** Whether the value ended in a line break at all. */
+  enter: boolean;
+}
+
+/**
+ * Separates a trailing Enter/Return from mobile IME-committed text.
+ *
+ * A mobile on-screen keyboard's Enter/Return/Go key is not a distinguishable
+ * `keydown` with `key === 'Enter'` here the way a physical keyboard's is --
+ * this hidden target's own `onKeyDown` is a no-op by design (see its call
+ * site), because mobile IMEs do not reliably fire keydown for composed
+ * input at all. Instead, mobile Enter shows up as an ordinary line break
+ * character bundled into the committed text itself: either the value handed
+ * to `compositionend` when Enter closes an active composition, or the value
+ * of a plain, non-composing `input` event when it does not. Sending that
+ * value straight through `RemoteDesktopClient.text()` -- the remote TEXT/
+ * paste channel, which inserts literal Unicode content -- silently drops
+ * it: nothing about that channel synthesizes a keypress, so an embedded
+ * "\n" reached the remote as nothing at all, exactly like the keystroke had
+ * never happened.
+ *
+ * Splits it out instead, the same way `remoteDesktopMobileDeletionKey`
+ * above already splits deletion out of the same input stream: a call site
+ * sends `text` (if non-empty) through the ordinary text channel, then sends
+ * a real Enter key chord through the KEY_DOWN/KEY_UP channel when `enter` is
+ * true -- so Return reaches the remote target as what it actually is, a
+ * keypress, regardless of whether it arrived alone or trailing other text in
+ * the same event.
+ */
+export function splitRemoteDesktopMobileTextEnter(
+  value: string,
+): RemoteDesktopMobileTextSplit {
+  const lineBreak = /\r\n$|[\r\n]$/.exec(value);
+  if (!lineBreak) return { text: value, enter: false };
+  return { text: value.slice(0, -lineBreak[0].length), enter: true };
+}
+
 // Copy/paste are deliberately absent here: this row sends a literal chord
 // straight to the remote, and the dedicated copy/paste buttons rendered
 // after it already answer both actions through the clipboard bridge, which

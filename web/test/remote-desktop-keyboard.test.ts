@@ -11,6 +11,7 @@ import {
   remoteDesktopMobileShortcutKeys,
   remoteDesktopShortcutLabel,
   sendRemoteDesktopChord,
+  splitRemoteDesktopMobileTextEnter,
 } from '../src/remote-desktop-keyboard.js';
 
 describe('remote desktop keyboard mapping', () => {
@@ -186,6 +187,34 @@ describe('remote desktop keyboard mapping', () => {
     });
     expect(remoteDesktopMobileDeletionKey('insertText')).toBeNull();
     expect(remoteDesktopMobileDeletionKey('deleteByCut')).toBeNull();
+  });
+
+  it('splits a trailing mobile-IME line break off committed text as a real Enter', () => {
+    // The bug this exists to fix: a mobile on-screen keyboard's Enter/Return/
+    // Go key shows up as an ordinary "\n" bundled into the committed text
+    // (compositionend's value, or a plain non-composing input event's value)
+    // -- never as a distinguishable keydown here -- and sending that value
+    // straight through the remote TEXT channel silently drops it, since that
+    // channel inserts literal Unicode and does not itself synthesize a
+    // keypress. Nothing reached the remote target: Enter just did nothing.
+    expect(splitRemoteDesktopMobileTextEnter('hello')).toEqual({ text: 'hello', enter: false });
+    expect(splitRemoteDesktopMobileTextEnter('hello\n')).toEqual({ text: 'hello', enter: true });
+    // CRLF: the whole line-break sequence is stripped, not just the last
+    // character -- a naive `.slice(0, -1)` would leave a stray trailing "\r"
+    // riding along in the text portion.
+    expect(splitRemoteDesktopMobileTextEnter('hello\r\n')).toEqual({ text: 'hello', enter: true });
+    expect(splitRemoteDesktopMobileTextEnter('hello\r')).toEqual({ text: 'hello', enter: true });
+    // Enter pressed with nothing composed ahead of it -- a real, common case
+    // (see the acceptance criteria: "Enter pressed with no active
+    // composition") -- still correctly recognized, with no text to send.
+    expect(splitRemoteDesktopMobileTextEnter('\n')).toEqual({ text: '', enter: true });
+    expect(splitRemoteDesktopMobileTextEnter('')).toEqual({ text: '', enter: false });
+    // A line break that is not TRAILING is not this function's concern --
+    // Enter is a distinct, subsequent event on this single-row field, not
+    // something that arrives pre-embedded mid-string.
+    expect(splitRemoteDesktopMobileTextEnter('hello\nworld')).toEqual({
+      text: 'hello\nworld', enter: false,
+    });
   });
 });
 
