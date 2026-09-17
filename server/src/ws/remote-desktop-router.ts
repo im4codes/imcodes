@@ -1,5 +1,5 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
-import { CONTROLLED_NODE_OS_MAC, CONTROLLED_NODE_OS_WIN } from '../../../shared/controlled-node-artifacts.js';
+import { CONTROLLED_NODE_OS_LINUX, CONTROLLED_NODE_OS_MAC, CONTROLLED_NODE_OS_WIN } from '../../../shared/controlled-node-artifacts.js';
 import type WebSocket from 'ws';
 import type { Database } from '../db/client.js';
 import {
@@ -1453,8 +1453,14 @@ export class RemoteDesktopRouter {
     // Platform is decided against the advertised profile below, not assumed
     // Windows: a macOS node that advertised a complete v3 profile was refused
     // here as `unsupported_platform` before its capabilities were even read,
-    // so no session could ever reach one.
-    if (controlledNode && access.os !== CONTROLLED_NODE_OS_WIN && access.os !== CONTROLLED_NODE_OS_MAC) {
+    // so no session could ever reach one. Linux joined the same way and was
+    // refused here for the same reason: this early gate never learned about
+    // it, so every Linux node was rejected before its own v3 profile (linux
+    // platform, x11 capture, disclosure) was ever read below.
+    if (controlledNode
+      && access.os !== CONTROLLED_NODE_OS_WIN
+      && access.os !== CONTROLLED_NODE_OS_MAC
+      && access.os !== CONTROLLED_NODE_OS_LINUX) {
       return 'unsupported_platform';
     }
     if (access.status !== 'online'
@@ -1469,7 +1475,11 @@ export class RemoteDesktopRouter {
       // Windows token on top made every non-Windows node fail here.
       const profile = capabilities.ok ? resolveRemoteDesktopSessionProfile(capabilities.value) : null;
       if (!profile) return 'capability';
-      const expectedOs = profile.platform === 'macos' ? CONTROLLED_NODE_OS_MAC : CONTROLLED_NODE_OS_WIN;
+      const expectedOs = profile.platform === 'macos'
+        ? CONTROLLED_NODE_OS_MAC
+        : profile.platform === 'linux'
+          ? CONTROLLED_NODE_OS_LINUX
+          : CONTROLLED_NODE_OS_WIN;
       if (access.os !== expectedOs) return 'unsupported_platform';
     }
     return null;

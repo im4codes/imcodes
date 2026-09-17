@@ -820,7 +820,13 @@ describe('RemoteDesktopRouter', () => {
   it.each([
     ['viewer', { access_role: 'viewer' }, REMOTE_DESKTOP_ERROR.ACCESS_DENIED],
     ['disabled', { exec_enabled: false }, REMOTE_DESKTOP_ERROR.EXECUTION_DISABLED],
-    ['non-Windows', { os: 'linux' }, REMOTE_DESKTOP_ERROR.UNSUPPORTED_PLATFORM],
+    // Enrolled as linux but still advertising the bare legacy Windows token
+    // (validAccess()'s default capabilities) -- a genuine mismatch, not the
+    // old blanket "linux is never supported" rejection. That blanket
+    // rejection is what refused every real Linux node before its own
+    // capabilities were ever read; see the dedicated admission test below
+    // for a Linux node that actually advertises a matching v3 profile.
+    ['enrolled-Linux node still advertising the Windows legacy token', { os: 'linux' }, REMOTE_DESKTOP_ERROR.UNSUPPORTED_PLATFORM],
     ['stale presence', { last_heartbeat_at: 1 }, REMOTE_DESKTOP_ERROR.DAEMON_OFFLINE],
     ['unknown capability', { controlled_capabilities: ['remote.desktop.windows.h264.v3'] }, REMOTE_DESKTOP_ERROR.CAPABILITY_UNAVAILABLE],
     ['unsupported persisted profile', {
@@ -860,6 +866,32 @@ describe('RemoteDesktopRouter', () => {
     });
   });
 
+  it('admits a Linux controlled node advertising a complete v3 profile and sends it PREPARE', async () => {
+    // Same production bug as the macOS case above, on the same early gate:
+    // `os !== 'win' && os !== 'mac'` refused every Linux node as
+    // unsupported_platform before its own capabilities (linux platform,
+    // x11 capture, disclosure) were ever read -- confirmed live on a real
+    // Linux controlled node whose session sat on "connecting" forever with
+    // a `remote_desktop.error: unsupported_platform` frame the browser
+    // never surfaced, and zero activity ever reaching its daemon.
+    const linuxProfile = [
+      REMOTE_DESKTOP_SESSION_CAPABILITY,
+      REMOTE_DESKTOP_PLATFORM_CAPABILITY.LINUX,
+      REMOTE_DESKTOP_CAPTURE_CAPABILITY.LINUX_X11,
+      REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+      REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+    ];
+    const f = fixture({
+      access: { ...validAccess(), os: 'linux', controlled_capabilities: linuxProfile } as ControlledMachineAccessRow,
+    });
+    const authority = await authorize(f);
+    expect(f.daemonMessages[0]).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId,
+      sessionId: authority.sessionId,
+    });
+  });
+
   it.each([
     ['a macOS profile on a node enrolled as Windows', 'win', [
       REMOTE_DESKTOP_SESSION_CAPABILITY,
@@ -869,6 +901,14 @@ describe('RemoteDesktopRouter', () => {
       REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
     ]],
     ['the Windows token on a node enrolled as macOS', 'mac', [REMOTE_DESKTOP_CAPABILITY]],
+    ['a Linux profile on a node enrolled as Windows', 'win', [
+      REMOTE_DESKTOP_SESSION_CAPABILITY,
+      REMOTE_DESKTOP_PLATFORM_CAPABILITY.LINUX,
+      REMOTE_DESKTOP_CAPTURE_CAPABILITY.LINUX_X11,
+      REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+      REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+    ]],
+    ['the Windows token on a node enrolled as linux', 'linux', [REMOTE_DESKTOP_CAPABILITY]],
   ] as const)('refuses %s as unsupported_platform', async (_label, os, capabilities) => {
     // The profile decides the platform, and the enrolled OS must agree with
     // it. A node whose record and advertisement disagree is not trusted to be
