@@ -35,6 +35,7 @@
 #include "api/enable_media.h"
 #include "api/video_codecs/builtin_video_decoder_factory.h"
 #include "api/video_codecs/builtin_video_encoder_factory.h"
+#include "modules/audio_device/include/audio_device_default.h"
 #include "rtc_base/ssl_adapter.h"
 
 #include "../remote-desktop-common/json_protocol.h"
@@ -46,6 +47,32 @@ namespace rd = imcodes::remote_desktop::linux_platform;
 namespace common = imcodes::remote_desktop::common;
 
 namespace {
+
+// Remote desktop carries no audio (this is a view-only screen session; the
+// data-channel wire protocol is pointer/keyboard/clipboard, never audio).
+// Without an explicit override here, PeerConnectionFactory lazily builds a
+// REAL platform audio device module the first time a PeerConnection is
+// created -- not at factory-creation time, but inside
+// ConnectionContext::AddRefMediaEngine() -> WebRtcVoiceEngine::Init() ->
+// webrtc::adm_helpers::Init(), triggered by this worker's own Start(), i.e.
+// on the very first PREPARE. On a machine where this worker runs as a
+// systemd-launched root service with no reachable PulseAudio/ALSA user
+// session (confirmed live: a real X11 desktop and Xvfb were both healthy,
+// only the audio device module's own Init() failed), that real ADM's
+// Init() fails internally, and webrtc's own RTC_CHECK on that failure calls
+// abort() -- SIGABRT, mid-session, on every single attempt, confirmed via a
+// full symbolized backtrace (adm_helpers::Init -> WebRtcVoiceEngine::Init ->
+// ConnectionContext::AddRefMediaEngine -> PeerConnection::PeerConnection,
+// called from this file's own StartTransport()). Windows' worker_main.cc
+// already carries the identical fix for the identical reason (its own
+// comment: "Remote desktop carries no audio. The media engine would
+// otherwise build the platform Core Audio device, which opens the
+// microphone stack this product never uses") -- mirrored here, not
+// reinvented, using the same cross-platform AudioDeviceModuleDefault base
+// WebRTC ships for exactly this "I genuinely have no audio" case.
+class SilentAudioDeviceModule
+    : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
+          webrtc::AudioDeviceModule> {};
 
 std::mutex g_stdout_mutex;
 
@@ -310,6 +337,14 @@ int main() {
   factory_deps.network_thread = network_thread.get();
   factory_deps.worker_thread = worker_thread.get();
   factory_deps.signaling_thread = signaling_thread.get();
+  // Set before EnableMedia() below, which is what actually captures it into
+  // the deferred media-engine construction path -- see SilentAudioDeviceModule's
+  // own comment for why a real platform ADM here aborts this exact process.
+  factory_deps.adm = webrtc::make_ref_counted<SilentAudioDeviceModule>();
+  if (!factory_deps.adm) {
+    std::fprintf(stderr, "linux worker: failed to construct silent audio device module\n");
+    return 13;
+  }
   factory_deps.audio_encoder_factory = webrtc::CreateBuiltinAudioEncoderFactory();
   factory_deps.audio_decoder_factory = webrtc::CreateBuiltinAudioDecoderFactory();
   factory_deps.video_encoder_factory = webrtc::CreateBuiltinVideoEncoderFactory();
