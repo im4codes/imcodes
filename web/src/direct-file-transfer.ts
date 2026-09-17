@@ -1616,6 +1616,15 @@ function makeDataBinding(lease: Lease, active: ActiveAttempt) {
   return expected;
 }
 
+/**
+ * Reads one chunk of `file` starting at `start`, sized to the shared
+ * DATA_CHUNK_BYTES envelope both peers negotiate around.
+ */
+function readUploadChunk(file: File, start: number): Promise<ArrayBuffer> {
+  const end = Math.min(file.size, start + DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES);
+  return file.slice(start, end).arrayBuffer();
+}
+
 async function pumpUpload(
   channel: RTCDataChannel,
   lease: Lease,
@@ -1629,11 +1638,28 @@ async function pumpUpload(
   // disk on the far side; re-sending it is exactly the whole-file restart this
   // exists to avoid.
   let offset = commit?.committedBytes ?? 0;
+  // Read one chunk ahead of what is actually being sent. `File.slice(...).
+  // arrayBuffer()` is not free: for a real on-disk File, a browser typically
+  // has to round-trip to its own file/blob storage to satisfy it, a fixed
+  // per-call cost that has nothing to do with network speed. Awaiting that
+  // read and only THEN sending -- and only starting the next read after that
+  // send returns -- serializes this fixed cost behind every single chunk, on
+  // top of network time, which is what made this loop top out at a small
+  // fraction of both the link's and the disk's actual throughput (well below
+  // e.g. a plain `scp` on the same link, which has no such per-chunk
+  // round-trip). Starting the next read immediately, before waiting on
+  // backpressure or on the current chunk's own bytes, lets that read latency
+  // overlap network time instead of stacking on top of it. This changes
+  // nothing about what is sent or in what order -- only when the read for
+  // the NEXT chunk begins relative to the CURRENT chunk's send.
+  let pendingChunk: Promise<ArrayBuffer> | null = offset < file.size ? readUploadChunk(file, offset) : null;
   while (offset < file.size) {
     if (commit?.fatal) throw commit.fatal;
-    await waitForBufferedAmount(channel, commit);
     const end = Math.min(file.size, offset + DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES);
-    channel.send(await file.slice(offset, end).arrayBuffer());
+    const nextChunk = end < file.size ? readUploadChunk(file, end) : null;
+    await waitForBufferedAmount(channel, commit);
+    channel.send(await pendingChunk!);
+    pendingChunk = nextChunk;
     if (commit) commit.sentBytes = end;
     if (offset === 0) {
       recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.STAGE, {

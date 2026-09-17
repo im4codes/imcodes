@@ -2834,6 +2834,70 @@ describe('direct file transfer v2 browser broker', () => {
   }, 60_000);
 
   /**
+   * The reported symptom was throughput, not correctness: P2P uploads landed
+   * at a small fraction of both the link's and the disk's actual speed (well
+   * under a plain `scp` on the same link). `pumpUpload` read exactly one
+   * chunk via `File.slice(...).arrayBuffer()`, awaited it, sent it, and only
+   * THEN read the next chunk -- serializing each chunk's read latency behind
+   * the previous chunk's send, on top of network time, every single chunk of
+   * the whole file. That per-chunk round trip is not free for a real on-disk
+   * File (a browser typically has to go fetch the bytes from its own file/
+   * blob storage to satisfy it), and paying it serially, chunk after chunk,
+   * is what capped this loop's throughput independent of how fast the
+   * network or the disk actually are on their own.
+   *
+   * Proven by call order rather than by timing: the read for chunk N+1 must
+   * already have been issued by the time chunk N is handed to the channel,
+   * so that (in production) its latency overlaps chunk N's network time
+   * instead of stacking after it. This is true regardless of how fast the
+   * mocked `arrayBuffer()` resolves, because the ORDER of the synchronous
+   * `file.slice(...)` call relative to `channel.send(...)` is a direct,
+   * deterministic consequence of the pump's control flow around its `await`
+   * points, not of any injected delay.
+   */
+  it('reads the next chunk while the current one is still in flight, instead of serializing disk reads behind network sends', async () => {
+    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { ws } = createWs(directCapabilities);
+    const chunk = DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES;
+    const file = createLargeUploadFile('pipeline.bin', chunk * 4);
+
+    const events: string[] = [];
+    let sliceIndex = 0;
+    const innerSlice = (file as unknown as { slice: (s: number, e: number) => { arrayBuffer(): Promise<ArrayBuffer> } }).slice;
+    Object.defineProperty(file, 'slice', {
+      value: (start: number, end: number) => {
+        events.push(`slice:${sliceIndex++}`);
+        return innerSlice(start, end);
+      },
+      configurable: true,
+      writable: true,
+    });
+
+    let sendIndex = 0;
+    const inner = FakePeerConnection.onDataChannel;
+    FakePeerConnection.onDataChannel = (channel, value) => {
+      inner?.(channel, value);
+      if (typeof value !== 'string') events.push(`send:${sendIndex++}`);
+    };
+
+    try {
+      await expect(uploadFileWithDirectFallback({ ws, serverId: 'server-1', file })).resolves.toMatchObject({
+        attachment: { id: 'direct-attachment' },
+      });
+    } finally {
+      FakePeerConnection.onDataChannel = inner;
+    }
+
+    expect(events).toEqual([
+      'slice:0',
+      'slice:1', 'send:0',
+      'slice:2', 'send:1',
+      'slice:3', 'send:2',
+      'send:3',
+    ]);
+  });
+
+  /**
    * RED — the browser accepts a commit report on requestId + attemptId alone.
    *
    * The daemon validates the FULL attempt tuple before it acts on a frame
