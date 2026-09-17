@@ -1046,6 +1046,12 @@ class SupervisionAutomation {
   private consumedAuditAttemptIds = new Set<string>();
   private lastObservedSessionStates = new Map<string, string>();
   private implicitCompletionGraceTimers = new Map<string, NodeJS.Timeout>();
+  /**
+   * Wall-clock start of the current no-runtime-evidence wait for an implicit
+   * (no-active-run) task candidate. Mirrors `ActiveTaskRunState.completionWaitStartedAt`
+   * for the sibling `armImplicitCompletionGrace` path -- see that method.
+   */
+  private implicitCompletionWaitStartedAt = new Map<string, number>();
   private recoveredImplicitCompletionKeys: string[] = [];
   private recoveredImplicitCompletionKeySet = new Set<string>();
   private recoverySuppressedUntilNextUser = new Set<string>();
@@ -1944,7 +1950,7 @@ class SupervisionAutomation {
       this.clearCompletionGrace(state);
     }
     this.deletePersistedWaitState(sessionName);
-    this.clearImplicitCompletionGrace(sessionName);
+    this.resetImplicitCompletionWait(sessionName);
     this.activeRuns.delete(sessionName);
     this.pendingTaskIntents.delete(sessionName);
     this.recentTaskCandidates.delete(sessionName);
@@ -2426,7 +2432,7 @@ class SupervisionAutomation {
   ): ActiveTaskRunState | null {
     if (!isBrainOwnedAutomaticSupervision(sessionName, snapshot)) return null;
     this.heartbeatPausedForNeedsInput.delete(sessionName);
-    this.clearImplicitCompletionGrace(sessionName);
+    this.resetImplicitCompletionWait(sessionName);
     this.recoverySuppressedUntilNextUser.delete(sessionName);
     const existing = this.activeRuns.get(sessionName);
     if (existing?.phase === 'auditing') {
@@ -2702,6 +2708,19 @@ class SupervisionAutomation {
     this.implicitCompletionGraceTimers.delete(sessionName);
   }
 
+  /**
+   * Full teardown of implicit-candidate completion tracking: the timer AND
+   * the no-evidence wait clock. Use this at genuine abandonment points (run
+   * torn down, superseded by a new candidate/run, or resolved). Do NOT use
+   * this for `armImplicitCompletionGrace`'s own re-arm -- that must keep
+   * accumulating the same wait clock across repeated arms, or the budget
+   * never actually expires under real provider latency / concurrent load.
+   */
+  private resetImplicitCompletionWait(sessionName: string): void {
+    this.clearImplicitCompletionGrace(sessionName);
+    this.implicitCompletionWaitStartedAt.delete(sessionName);
+  }
+
   private evaluateIdleRun(run: ActiveTaskRunState): void {
     if (run.evaluating || !run.sawAssistantOutput) return;
     if (run.phase !== 'execution' && run.phase !== 'finalizing') return;
@@ -2793,6 +2812,21 @@ class SupervisionAutomation {
     run.completionGraceTimer = timer;
   }
 
+  /**
+   * Bounded wait for an implicit (no-active-run) task candidate's matching
+   * assistant reply. This is the sibling of `armCompletionGrace`'s
+   * `!sawAssistantOutput` branch, and needs the exact same fix that branch
+   * already got (see its comment): a single fixed `SUPERVISION_COMPLETION_GRACE_MS`
+   * (2s) was never a realistic budget for a brand-new turn's first token
+   * under real provider latency / concurrent load, and this function was not
+   * touched by that earlier fix -- it kept failing closed after exactly 2s,
+   * every time an idle snapshot update found a still-pending candidate with
+   * no fresh assistant reply yet, which is routine under heavy concurrent
+   * load. Only diagnostics-backed activity (`hasActiveRuntimeEvidence`)
+   * resets the no-evidence wait clock; time merely re-arming (e.g. a fresh
+   * snapshot update for the same still-pending candidate) must keep
+   * consuming the budget, exactly like the sibling branch.
+   */
   private armImplicitCompletionGrace(
     sessionName: string,
     snapshot: SessionSupervisionSnapshot,
@@ -2803,10 +2837,31 @@ class SupervisionAutomation {
     timer = setTimeout(() => {
       if (this.implicitCompletionGraceTimers.get(sessionName) !== timer) return;
       this.implicitCompletionGraceTimers.delete(sessionName);
-      if (this.activeRuns.has(sessionName) || !this.isSessionIdle(sessionName)) return;
+      if (this.activeRuns.has(sessionName) || !this.isSessionIdle(sessionName)) {
+        this.implicitCompletionWaitStartedAt.delete(sessionName);
+        return;
+      }
       const latestCandidate = this.recentTaskCandidates.get(sessionName);
-      if (!latestCandidate || latestCandidate.sequence !== candidate.sequence) return;
-      if (this.tryStartImplicitRun(sessionName, snapshot)) return;
+      if (!latestCandidate || latestCandidate.sequence !== candidate.sequence) {
+        this.implicitCompletionWaitStartedAt.delete(sessionName);
+        return;
+      }
+      if (this.tryStartImplicitRun(sessionName, snapshot)) {
+        this.implicitCompletionWaitStartedAt.delete(sessionName);
+        return;
+      }
+      if (this.hasActiveRuntimeEvidence(sessionName)) {
+        this.implicitCompletionWaitStartedAt.set(sessionName, Date.now());
+        this.armImplicitCompletionGrace(sessionName, snapshot, candidate);
+        return;
+      }
+      const waitStartedAt = this.implicitCompletionWaitStartedAt.get(sessionName) ?? Date.now();
+      this.implicitCompletionWaitStartedAt.set(sessionName, waitStartedAt);
+      if (Date.now() - waitStartedAt < SUPERVISION_COMPLETION_WAIT_MAX_MS) {
+        this.armImplicitCompletionGrace(sessionName, snapshot, candidate);
+        return;
+      }
+      this.implicitCompletionWaitStartedAt.delete(sessionName);
       this.failClosedImplicitCandidate(sessionName, snapshot);
     }, SUPERVISION_COMPLETION_GRACE_MS);
     timer.unref?.();
@@ -3573,7 +3628,7 @@ class SupervisionAutomation {
         if (isAutomaticSupervisionEnabled(liveSnapshot)) {
           this.heartbeatPausedForNeedsInput.delete(event.sessionId);
         }
-        this.clearImplicitCompletionGrace(event.sessionId);
+        this.resetImplicitCompletionWait(event.sessionId);
         this.recoverySuppressedUntilNextUser.delete(event.sessionId);
         if (!isBareSupervisionContinueText(text)) {
           this.recentTaskCandidates.set(event.sessionId, {
@@ -3611,7 +3666,7 @@ class SupervisionAutomation {
             ? extractSessionSupervisionSnapshot(record.transportConfig ?? null)
             : null;
           if (isAutomaticSupervisionEnabled(snapshot)) {
-            this.clearImplicitCompletionGrace(event.sessionId);
+            this.resetImplicitCompletionWait(event.sessionId);
             if (!this.tryStartImplicitRun(event.sessionId, snapshot)) {
               this.tryRecoverImplicitRunFromTimeline(event.sessionId, snapshot);
             }
@@ -4371,7 +4426,7 @@ class SupervisionAutomation {
     this.clearAuditTargetRecovery(run);
     this.clearWaitingTimers(run);
     this.clearCompletionGrace(run);
-    this.clearImplicitCompletionGrace(sessionName);
+    this.resetImplicitCompletionWait(sessionName);
     this.deletePersistedWaitState(sessionName);
     run.terminalState = state;
     if (state === 'needs_input') this.heartbeatPausedForNeedsInput.add(sessionName);

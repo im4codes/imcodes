@@ -3909,6 +3909,74 @@ describe('SupervisionAutomation', () => {
     }
   });
 
+  it('gives an implicit (no-active-run) task candidate the same 60s no-evidence budget instead of failing closed after 2s', async () => {
+    // Regression for the recurring false "Automation stopped because no
+    // completed assistant response was available for that turn" warning
+    // observed firing roughly every 55-65s throughout a long-running,
+    // heavily-loaded Brain session. The earlier fix (armCompletionGrace's
+    // `!sawAssistantOutput` branch, covered by the sibling test above) only
+    // budgets an ACTIVE run's completion wait. `armImplicitCompletionGrace`
+    // is a completely separate mechanism for a task candidate that never got
+    // an active run at all (the ordinary path when a real user/nudge message
+    // arrives and the session goes idle before a matching assistant reply
+    // lands) -- it was untouched by that fix and still used a single
+    // unconditional SUPERVISION_COMPLETION_GRACE_MS (2s) deadline with no
+    // retry budget, so it failed closed on essentially every idle boundary
+    // under real provider latency / concurrent load.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const snapshot = await seedSession('supervised');
+    try {
+      supervisionAutomation.init();
+
+      // A real message becomes a "recent task candidate" with NO active run
+      // registered for it -- this is what routes through
+      // armImplicitCompletionGrace instead of armCompletionGrace.
+      timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+        text: 'continue the delegated work',
+        clientMessageId: 'cmd-implicit-heartbeat',
+        allowDuplicate: true,
+      });
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', {
+        state: 'idle',
+      });
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+
+      const hasWarning = () => timelineEmitter.replay('deck_supervision_brain', 0).events.some(
+        (event) => event.type === 'assistant.text'
+          && (event.payload as Record<string, unknown>).automationKind === 'supervision-warning',
+      );
+
+      // At the OLD unconditional 2s deadline, a reply that simply has not
+      // landed yet must not have been failed closed -- this is exactly the
+      // false-positive window the old code got wrong.
+      await vi.advanceTimersByTimeAsync(2_001);
+      expect(hasWarning()).toBe(false);
+
+      // Well within the new 60s budget: still genuinely nothing arrived,
+      // still must be waiting, not yet failed.
+      await vi.advanceTimersByTimeAsync(58_000);
+      expect(hasWarning()).toBe(false);
+
+      // Only once the full budget is exhausted with truly no evidence at all
+      // does this legitimately fail closed.
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(hasWarning()).toBe(true);
+      const events = timelineEmitter.replay('deck_supervision_brain', 0).events;
+      expect(events).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          type: 'assistant.text',
+          payload: expect.objectContaining({
+            automation: true,
+            automationKind: 'supervision-warning',
+            text: '⚠️ Automation stopped because no completed assistant response was available for that turn. Manual continuation is required.',
+          }),
+        }),
+      ]));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   /** Re-seat the reviewer with a topology/state override, to make it INELIGIBLE. */
   function reseatReviewer(overrides: Record<string, unknown>) {
     removeSession('deck_sub_reviewer');
