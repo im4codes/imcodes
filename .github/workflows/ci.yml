@@ -1208,6 +1208,24 @@ jobs:
           path: server/controlled-node-artifacts
           merge-multiple: true
 
+      # actions/upload-artifact -> download-artifact does not reliably
+      # preserve the executable bit through its zip transport: the Linux
+      # worker was uploaded chmod 0755 by build-worker-from-sdk.sh and came
+      # back `-rw-r--r--` here (confirmed with `ls -la` in CI, not inferred).
+      # remote-desktop-worker-artifacts.mjs verify checks size/sha256/file-
+      # ness but never the executable bit, so a macOS worker losing it the
+      # same way would pass every check below and still fail to exec once
+      # copied into the image. Restore +x on every artifact except the data
+      # files that must never have it (a `.exe` still needs it on the
+      # Windows node that runs it, but not on this Linux runner, and giving
+      # it +x here is harmless either way).
+      - name: Restore executable bits actions/download-artifact drops
+        run: |
+          set -euo pipefail
+          find server/controlled-node-artifacts -type f \
+            ! -name '*.json' ! -name '*.zip' ! -name '*.dmg' ! -name '*.dll' ! -name '*.cat' \
+            -exec chmod +x {} +
+
       - name: Verify controlled-node executable set
         env:
           IMCODES_BUILD_VERSION: ${{ needs.release_version.outputs.app_version }}
@@ -1233,17 +1251,12 @@ jobs:
               server/controlled-node-artifacts "$IMCODES_BUILD_VERSION" darwin "$arch"
           done
           # Same narrower gate as the post-build smoke test (see its own
-          # comment) -- but checked HERE, on the runner's own filesystem right
-          # after download-artifact, before the ~10-minute Docker build step.
-          # The smoke test's equivalent check started failing with no other
-          # signal (docker run --entrypoint test produces no stderr on a
-          # false condition), so this either fails fast in under a minute if
-          # the artifact never had the file after download/merge, or proves
-          # the runner-side file is fine and the loss happens in the Docker
-          # build/COPY step instead.
+          # comment): remote-desktop-worker-artifacts.mjs has no linux
+          # schema yet, so this is presence+executable-bit rather than a
+          # full manifest verify -- checked here too, right after the chmod
+          # restore above, so a regression is caught in under a minute
+          # instead of the ~15 the smoke test takes to reach the same file.
           LINUX_WORKER="server/controlled-node-artifacts/remote-desktop-worker/linux-x64/imcodes-linux-remote-desktop-worker"
-          ls -la server/controlled-node-artifacts/remote-desktop-worker/ 2>&1 || true
-          ls -la server/controlled-node-artifacts/remote-desktop-worker/linux-x64/ 2>&1 || true
           [ -f "$LINUX_WORKER" ] || { echo "::error::missing $LINUX_WORKER after download-artifact" >&2; exit 1; }
           [ -x "$LINUX_WORKER" ] || { echo "::error::$LINUX_WORKER is not executable after download-artifact" >&2; exit 1; }
           echo "Linux remote-desktop worker present and executable on the runner: $LINUX_WORKER"
