@@ -1202,6 +1202,7 @@ import { REMOTE_DESKTOP_LOGIN_SCREEN_MSG } from '../../shared/remote-desktop-log
 import { handleDaemonRemoteDesktopMessage } from './remote-desktop-registry.js';
 import { handleDirectFileTransferCommand, quiesceDirectFileTransferNative } from './direct-file-transfer.js';
 import { REPO_MSG } from '../shared/repo-types.js';
+import { SUPERVISION_TASK_CONSOLE_MSG } from '../../shared/supervision-task-console.js';
 import { handlePreviewCommand } from './preview-relay.js';
 import { PREVIEW_MSG } from '../../shared/preview-types.js';
 import type { TransportAttachment } from '../../shared/transport-attachments.js';
@@ -2117,6 +2118,21 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       break;
     case TRANSPORT_MSG.LIST_MODELS:
       void traceCommandAsync(cmd, 'web_command.transport_list_models', () => handleTransportListModels(cmd, serverLink));
+      break;
+    case SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE:
+    case SUPERVISION_TASK_CONSOLE_MSG.UNSUBSCRIBE:
+    case SUPERVISION_TASK_CONSOLE_MSG.ACK:
+      // Already handled: createProductionSupervisionConsoleBinding (wired in
+      // lifecycle.ts) registers its OWN serverLink.onMessage handler, and
+      // ServerLink.onMessage is multi-subscriber -- every handler, including
+      // this switch's caller, receives the exact same message. Reproduced
+      // live (test/daemon/supervision-console-dispatch-wiring.test.ts): the
+      // browser genuinely gets its SNAPSHOT/ACK/UNSUBSCRIBE reply through
+      // that path today. The ONLY real gap was this switch having no case for
+      // these 3 types, so every legitimate subscribe/ack/unsubscribe also
+      // fell through to the generic "Unknown web command type" warning below
+      // -- noise indistinguishable from an actually-broken console, which is
+      // what prompted this fix. Nothing to dispatch here; just stop warning.
       break;
     case REPO_MSG.DETECT:
       void traceCommandAsync(cmd, 'web_command.repo_detect', async () => { handleRepoCommand(cmd, serverLink); });
