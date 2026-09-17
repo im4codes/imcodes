@@ -2477,6 +2477,9 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         const inspected = await inspectSupervisionAssignmentWorktree({
           sessionName: existing.identity.sessionName,
           assignmentId: existing.assignmentId,
+          // Without the task's base, `files` only ever reflects uncommitted
+          // working-tree state -- empty for a properly-committed change.
+          baseRevision: registry.getTaskRecord(existing.taskId)?.baseRevision,
         });
         if (!inspected.ok || inspected.snapshot.files.length === 0) {
           return error(MCP_ERROR_REASONS.VALIDATION_FAILED,
@@ -2538,6 +2541,12 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const inspected = await inspectSupervisionAssignmentWorktree({
         sessionName: owner.identity.sessionName,
         assignmentId: owner.assignmentId,
+        // Without the task's base, `files` only ever reflects uncommitted
+        // working-tree state, so a correctly-committed change would always
+        // mismatch the frozen bundle below (every real entry looking
+        // "missing" from an empty snapshot) rather than actually being
+        // compared.
+        baseRevision: task.baseRevision,
       });
       if (!inspected.ok) {
         return integrationRefusal('integration_preflight', [{
@@ -2696,6 +2705,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         inspected = await inspectSupervisionAssignmentWorktree({
           sessionName: owner!.identity.sessionName,
           assignmentId: owner!.assignmentId,
+          baseRevision: task.baseRevision,
         });
         if (!inspected.ok) {
           return integrationRefusal('integration_finalize', [{

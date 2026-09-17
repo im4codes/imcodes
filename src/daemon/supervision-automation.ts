@@ -1583,9 +1583,12 @@ class SupervisionAutomation {
           projectName, undefined, sessionName,
         ),
         inspectAssignmentWorktree: async (assignment) => {
+          // Without the task's base, `files` only ever reflects uncommitted
+          // working-tree state -- empty for a properly-committed change.
           const inspected = await inspectSupervisionAssignmentWorktree({
             sessionName: assignment.identity.sessionName,
             assignmentId: assignment.assignmentId,
+            baseRevision: registry.getTaskRecord(assignment.taskId)?.baseRevision,
           });
           return inspected.ok ? inspected.snapshot : undefined;
         },

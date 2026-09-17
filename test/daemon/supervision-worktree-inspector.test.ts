@@ -121,6 +121,64 @@ describe('authoritative supervision worktree inspection', () => {
     })).toMatchObject({ ok: true, snapshot: { stagedPaths: ['base.txt'] } });
   });
 
+  it('reflects a properly-committed change against the task base revision, not just the working tree', async () => {
+    // Live evidence (tsk_t2f): every implementer today correctly committed
+    // before record_validation/open_audit -- the required, documented
+    // workflow -- and `files` still came back empty every time, because the
+    // inspector only ever diffed the working tree against its OWN HEAD. A
+    // clean-relative-to-HEAD tree is exactly what a properly-committed change
+    // looks like; the real diff lives between the task's base and HEAD.
+    const shape = fixture();
+    const baseSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: shape.repo, encoding: 'utf8' }).trim();
+    writeFileSync(join(shape.repo, 'base.txt'), 'implemented\n');
+    execFileSync('git', ['commit', '-qam', 'implement the feature'], { cwd: shape.repo });
+
+    // No base supplied: unchanged default behaviour, preserved on purpose --
+    // a caller that only cares about uncommitted/staged/conflicted state (or
+    // does not know the task's base) must see exactly what it saw before.
+    expect(await inspectSupervisionAssignmentWorktree({
+      sessionName: 'ignored', assignmentId: 'ignored', worktreePath: shape.repo,
+    })).toMatchObject({
+      ok: true,
+      snapshot: { files: [], stagedPaths: [], conflictedPaths: [], untrackedPaths: [] },
+    });
+
+    // The task's real base supplied: the committed change is real evidence.
+    expect(await inspectSupervisionAssignmentWorktree({
+      sessionName: 'ignored', assignmentId: 'ignored', worktreePath: shape.repo, baseRevision: baseSha,
+    })).toMatchObject({
+      ok: true,
+      snapshot: {
+        files: [{ path: 'base.txt', sha256: createHash('sha256').update('implemented\n').digest('hex') }],
+        stagedPaths: [],
+        conflictedPaths: [],
+        untrackedPaths: [],
+      },
+    });
+  });
+
+  it('degrades to no committed-diff contribution, not a failed inspection, when the base does not resolve', async () => {
+    const shape = fixture();
+    writeFileSync(join(shape.repo, 'base.txt'), 'implemented\n');
+    execFileSync('git', ['commit', '-qam', 'implement the feature'], { cwd: shape.repo });
+    const unresolvableSha = 'f'.repeat(40);
+
+    expect(await inspectSupervisionAssignmentWorktree({
+      sessionName: 'ignored', assignmentId: 'ignored', worktreePath: shape.repo, baseRevision: unresolvableSha,
+    })).toMatchObject({ ok: true, snapshot: { files: [] } });
+  });
+
+  it('ignores a malformed base revision instead of trusting an unvalidated string into git', async () => {
+    const shape = fixture();
+    writeFileSync(join(shape.repo, 'base.txt'), 'implemented\n');
+    execFileSync('git', ['commit', '-qam', 'implement the feature'], { cwd: shape.repo });
+
+    expect(await inspectSupervisionAssignmentWorktree({
+      sessionName: 'ignored', assignmentId: 'ignored', worktreePath: shape.repo,
+      baseRevision: 'HEAD~5; rm -rf /',
+    })).toMatchObject({ ok: true, snapshot: { files: [] } });
+  });
+
   it('continues to report conflicted paths for the registry gate', async () => {
     const shape = fixture();
     const mainBranch = execFileSync('git', ['branch', '--show-current'], {

@@ -798,6 +798,9 @@ export async function submitDelegationReply(input: {
         const inspected = await inspectSupervisionAssignmentWorktree({
           sessionName: assignment.identity.sessionName,
           assignmentId: assignment.assignmentId,
+          // Without the task's base, `files` only ever reflects uncommitted
+          // working-tree state -- empty for a properly-committed change.
+          baseRevision: registry.getTaskRecord(assignment.taskId)?.baseRevision,
         });
         if (inspected.ok && inspected.snapshot.files.length > 0) {
           const recorded = registry.recordCancelledCompletionEvidence({

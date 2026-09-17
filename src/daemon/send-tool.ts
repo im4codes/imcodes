@@ -3976,11 +3976,21 @@ export type DeterministicContinuationDispatchResult =
 async function inspectAssignmentForConvergence(
   assignment: PersistedSupervisionTaskAssignment,
   deps: ReadyAuditDispatchDeps,
+  baseRevision?: string,
 ): Promise<import('./supervision-worktree-inspector.js').SupervisionWorktreeSnapshot | undefined> {
   if (deps.inspectAssignmentWorktree) return deps.inspectAssignmentWorktree(assignment);
+  // `baseRevision` (the task's registry-tracked base -- see
+  // supervision-state-store.ts) makes `files` reflect the actual COMMITTED
+  // diff, not just uncommitted working-tree state. Without it, an
+  // implementer who correctly committed before validation (the required,
+  // documented workflow) has a clean tree relative to their own HEAD, and
+  // `files` comes back empty no matter how large the real change is -- the
+  // root cause of "authoritative immutable integration bundle unavailable or
+  // mismatched" reproduced on tsk_t2f.
   const inspected = await inspectSupervisionAssignmentWorktree({
     sessionName: assignment.identity.sessionName,
     assignmentId: assignment.assignmentId,
+    baseRevision,
   });
   return inspected.ok ? inspected.snapshot : undefined;
 }
@@ -4007,7 +4017,7 @@ async function resolveIntegrationArtifact(
   if (!revision) return undefined;
   const persisted = task.integrationBundle;
   if (deps.inspectAssignmentWorktree) {
-    const snapshot = await inspectAssignmentForConvergence(implementer, deps);
+    const snapshot = await inspectAssignmentForConvergence(implementer, deps, task.baseRevision);
     const authorityScope = implementer.role === 'integration_owner' && persisted
       ? (persisted.scopeFiles ?? persisted.files.map((file) => file.path))
       : implementer.scopeFiles;
@@ -4054,7 +4064,7 @@ async function resolveIntegrationArtifact(
     })) return undefined;
   }
   if (!allowFreeze) return undefined;
-  const snapshot = await inspectAssignmentForConvergence(implementer, deps);
+  const snapshot = await inspectAssignmentForConvergence(implementer, deps, task.baseRevision);
   if (!snapshot) return undefined;
   const projected = projectSupervisionSnapshotToAssignmentScope({
     snapshot, scopeFiles: implementer.scopeFiles,
@@ -4526,9 +4536,13 @@ export async function runSupervisionConvergenceTick(
           sessionName,
         ),
         inspectAssignmentWorktree: async (assignment) => {
+          // Same fix as inspectAssignmentForConvergence above: without the
+          // task's base, `files` only ever reflects uncommitted working-tree
+          // state, which is empty for every properly-committed change.
           const inspected = await inspectSupervisionAssignmentWorktree({
             sessionName: assignment.identity.sessionName,
             assignmentId: assignment.assignmentId,
+            baseRevision: registry.getTaskRecord(assignment.taskId)?.baseRevision,
           });
           return inspected.ok ? inspected.snapshot : undefined;
         },

@@ -185,9 +185,16 @@ export function createSupervisionRegistryPort(): SupervisionRegistryPort {
         taskId, assignmentId, revision, allowLegacy: true,
       });
       if (!validationAuthority) return { ok: false, reason: 'stale_audit_revision' };
+      // Without the task's base, `files` only ever reflects uncommitted
+      // working-tree state: an implementer who committed before validation
+      // (the required, documented workflow) has a clean tree relative to
+      // their own HEAD, so freezing would see zero files no matter how large
+      // the real change is -- the exact "authoritative immutable integration
+      // bundle unavailable or mismatched" failure reproduced on tsk_t2f.
       const inspected = await inspectSupervisionAssignmentWorktree({
         sessionName: assignment.identity.sessionName,
         assignmentId: assignment.assignmentId,
+        baseRevision: task.baseRevision,
       });
       if (!inspected.ok) return { ok: false, reason: inspected.reason };
       const projected = projectSupervisionSnapshotToAssignmentScope({
@@ -215,6 +222,7 @@ export function createSupervisionRegistryPort(): SupervisionRegistryPort {
         const current = await inspectSupervisionAssignmentWorktree({
           sessionName: candidate.identity.sessionName,
           assignmentId: candidate.assignmentId,
+          baseRevision: task.baseRevision,
         });
         return current.ok ? current.snapshot : undefined;
       });

@@ -483,25 +483,37 @@ interface CacheEntry {
 const cache = new Map<string, CacheEntry>();
 const inFlight = new Map<string, Promise<SupervisionWorktreeInspectionResult>>();
 
+/**
+ * Cache/in-flight-coalescing key. `worktreePath` alone is not enough once an
+ * inspection can be asked for a specific `baseRevision`: two callers of the
+ * same worktree with different bases must never share a cached snapshot or a
+ * coalesced pass, or one caller's committed-diff-since-base would silently
+ * answer for the other's different base.
+ */
+function cacheKeyFor(worktreePath: string, baseRevision: string | undefined): string {
+  return `${worktreePath} ${baseRevision ?? ''}`;
+}
+
 async function cachedResult(
   worktreePath: string,
+  cacheKey: string,
   deadlineAt: number,
 ): Promise<SupervisionWorktreeInspectionResult | undefined> {
-  const entry = cache.get(worktreePath);
+  const entry = cache.get(cacheKey);
   if (!entry) return undefined;
   if (Date.now() - entry.storedAt > CACHE_TTL_MS) {
-    cache.delete(worktreePath);
+    cache.delete(cacheKey);
     return undefined;
   }
   let identity: string;
   try {
     identity = worktreeIdentity(worktreePath, entry.reportedPaths);
   } catch {
-    cache.delete(worktreePath);
+    cache.delete(cacheKey);
     return undefined;
   }
   if (identity !== entry.identity) {
-    cache.delete(worktreePath);
+    cache.delete(cacheKey);
     return undefined;
   }
   // The fork-free key proves HEAD, the index, every remote ref and every path
@@ -512,22 +524,23 @@ async function cachedResult(
   try {
     dirty = await dirtyPathProbe(worktreePath, deadlineAt);
   } catch {
-    cache.delete(worktreePath);
+    cache.delete(cacheKey);
     return undefined;
   }
   if (dirty.size !== entry.dirtyPaths.length
     || entry.dirtyPaths.some((path) => !dirty.has(path))) {
-    cache.delete(worktreePath);
+    cache.delete(cacheKey);
     return undefined;
   }
   // Refresh recency for the LRU bound.
-  cache.delete(worktreePath);
-  cache.set(worktreePath, entry);
+  cache.delete(cacheKey);
+  cache.set(cacheKey, entry);
   return entry.result;
 }
 
 function storeResult(
   worktreePath: string,
+  cacheKey: string,
   reportedPaths: string[],
   dirtyPaths: string[],
   result: SupervisionWorktreeInspectionResult,
@@ -538,8 +551,8 @@ function storeResult(
   } catch {
     return; // Un-keyable worktree: never cache it.
   }
-  cache.delete(worktreePath);
-  cache.set(worktreePath, { identity, reportedPaths, dirtyPaths, result, storedAt: Date.now() });
+  cache.delete(cacheKey);
+  cache.set(cacheKey, { identity, reportedPaths, dirtyPaths, result, storedAt: Date.now() });
   while (cache.size > CACHE_MAX_ENTRIES) {
     const oldest = cache.keys().next().value as string | undefined;
     if (oldest === undefined) break;
@@ -547,7 +560,11 @@ function storeResult(
   }
 }
 
-async function inspectUncached(worktreePath: string, deadlineAt: number): Promise<{
+async function inspectUncached(
+  worktreePath: string,
+  deadlineAt: number,
+  baseRevision: string | undefined,
+): Promise<{
   result: SupervisionWorktreeInspectionResult;
   reportedPaths: string[];
   dirtyPaths: string[];
@@ -571,17 +588,40 @@ async function inspectUncached(worktreePath: string, deadlineAt: number): Promis
   // that same flag is exactly the old "list, then re-test each path" pair,
   // without one process per tracked path. Untracked files are always exact.
   const dirtyPaths = [...await dirtyPathProbe(worktreePath, deadlineAt)].sort();
-  const [trackedText, stagedText, conflictedText, untrackedText] = await Promise.all([
+  // `tracked` (working tree vs HEAD) only ever proves UNCOMMITTED edits: an
+  // implementer who committed their change first -- the required, documented
+  // workflow -- has a clean tree relative to their own HEAD, so this is
+  // empty for every properly-committed change, no matter how large the real
+  // diff is. It stays, unioned with the committed diff below, because
+  // detecting genuine uncommitted WIP is real, separately-tested behaviour
+  // (see supervision-worktree-inspector.test.ts) this must not regress.
+  //
+  // The actual committed change lives between the task's base and HEAD.
+  // `baseRevision` is the caller-supplied reference point (the registry's
+  // `task.baseRevision` -- see supervision-state-store.ts, kept current by
+  // the same Brain-authorized rebind that moves it on a real base change).
+  // A missing/invalid base, or one that no longer resolves in this worktree
+  // (pruned, not yet fetched), degrades to no committed-diff contribution
+  // rather than failing the whole inspection -- the caller loses the
+  // committed-diff signal for that one call, not the uncommitted/staged/
+  // conflicted safety gates below.
+  const committedDiffArgs = baseRevision && baseRevision !== headSha
+    ? gitText(worktreePath, ['diff', '--name-only', '--ignore-cr-at-eol', baseRevision, 'HEAD', '--'], deadlineAt)
+      .catch(() => '')
+    : Promise.resolve('');
+  const [trackedText, stagedText, conflictedText, untrackedText, committedText] = await Promise.all([
     gitText(worktreePath, ['diff', '--name-only', '--ignore-cr-at-eol', 'HEAD', '--'], deadlineAt),
     gitText(worktreePath, ['diff', '--cached', '--name-only', 'HEAD', '--'], deadlineAt),
     gitText(worktreePath, ['diff', '--name-only', '--diff-filter=U', '--'], deadlineAt),
     gitText(worktreePath, ['ls-files', '--others', '--exclude-standard'], deadlineAt),
+    committedDiffArgs,
   ]);
   const tracked = lines(trackedText);
   const stagedPaths = lines(stagedText);
   const conflictedPaths = lines(conflictedText);
   const rawUntrackedPaths = lines(untrackedText);
-  if (![...tracked, ...stagedPaths, ...rawUntrackedPaths, ...conflictedPaths].every(validRepoPath)) {
+  const committedPaths = lines(committedText);
+  if (![...tracked, ...stagedPaths, ...rawUntrackedPaths, ...conflictedPaths, ...committedPaths].every(validRepoPath)) {
     return { result: { ok: false, reason: 'worktree_unsafe' }, reportedPaths: [], dirtyPaths: [] };
   }
   // Tooling caches may be linked into an isolated worktree for local builds.
@@ -592,7 +632,7 @@ async function inspectUncached(worktreePath: string, deadlineAt: number): Promis
     if (!within(worktreePath, absolute)) throw new Error('unsafe worktree path');
     try { return !lstatSync(absolute).isSymbolicLink(); } catch { return true; }
   });
-  const changedPaths = [...new Set([...tracked, ...stagedPaths, ...untrackedPaths])].sort();
+  const changedPaths = [...new Set([...tracked, ...committedPaths, ...stagedPaths, ...untrackedPaths])].sort();
   const sizes = new Map<string, number>();
   const files = changedPaths.map((path): SupervisionWorktreeFileSnapshot => {
     const absolute = resolve(worktreePath, path);
@@ -625,14 +665,23 @@ async function inspectUncached(worktreePath: string, deadlineAt: number): Promis
  * Inspect the exact assignment worktree. Registry file metadata is deliberately
  * absent from this API: callers cannot use it to fabricate or veto Git state.
  *
- * Asynchronous by contract. Concurrent callers for the same worktree share one
- * underlying pass, and an unchanged worktree is answered without spawning git.
+ * `baseRevision`, when given, is the ONE piece of registry-tracked reference
+ * the caller supplies -- not to fabricate or veto Git state, but to tell Git
+ * which range to diff. `files` still comes entirely from real, freshly-read
+ * Git objects; an invalid or unresolvable base just loses the committed-diff
+ * contribution for that call, it never fabricates a result.
+ *
+ * Asynchronous by contract. Concurrent callers for the same worktree AND the
+ * same base share one underlying pass; an unchanged worktree is answered
+ * without spawning git.
  */
 export function inspectSupervisionAssignmentWorktree(input: {
   sessionName: string;
   assignmentId: string;
   worktreePath?: string;
   env?: NodeJS.ProcessEnv;
+  /** The task's base revision (see supervision-state-store.ts `baseRevision`). */
+  baseRevision?: string;
 }): Promise<SupervisionWorktreeInspectionResult> {
   const configured = resolve(input.worktreePath ?? resolveSupervisionAssignmentWorktree(input));
   let worktreePath: string;
@@ -641,28 +690,31 @@ export function inspectSupervisionAssignmentWorktree(input: {
   } catch {
     return Promise.resolve({ ok: false, reason: 'worktree_unavailable' });
   }
+  const requestedBase = input.baseRevision?.trim().toLowerCase();
+  const baseRevision = requestedBase && COMMIT_RE.test(requestedBase) ? requestedBase : undefined;
+  const cacheKey = cacheKeyFor(worktreePath, baseRevision);
   // Coalescing comes first so that concurrent callers share even the cheap
   // reuse probe, and the deadline starts at the caller's ask, not at a slot.
-  const running = inFlight.get(worktreePath);
+  const running = inFlight.get(cacheKey);
   if (running) return running;
   const deadlineAt = Date.now() + limits.totalDeadlineMs;
 
   const pass = (async (): Promise<SupervisionWorktreeInspectionResult> => {
     try {
-      const hit = await cachedResult(worktreePath, deadlineAt);
+      const hit = await cachedResult(worktreePath, cacheKey, deadlineAt);
       if (hit) return hit;
-      const { result, reportedPaths, dirtyPaths } = await inspectUncached(worktreePath, deadlineAt);
-      storeResult(worktreePath, reportedPaths, dirtyPaths, result);
+      const { result, reportedPaths, dirtyPaths } = await inspectUncached(worktreePath, deadlineAt, baseRevision);
+      storeResult(worktreePath, cacheKey, reportedPaths, dirtyPaths, result);
       return result;
     } catch {
       // Saturation, deadline expiry, git failure and output overflow all land
       // here: an inspection that could not be completed is never a snapshot.
       return { ok: false, reason: 'worktree_unavailable' };
     } finally {
-      inFlight.delete(worktreePath);
+      inFlight.delete(cacheKey);
     }
   })();
-  inFlight.set(worktreePath, pass);
+  inFlight.set(cacheKey, pass);
   return pass;
 }
 
