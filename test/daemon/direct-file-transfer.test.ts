@@ -766,6 +766,98 @@ describe('daemon direct file transfer v2 lease broker', () => {
     await vi.waitFor(() => expect(secondChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.UPLOAD_COMMITTED)));
   });
 
+  /**
+   * The scenario above proves resume works within one process's lifetime.
+   * This is the production bug it did NOT cover: `uploadResumeStates` is
+   * this process's own memory, and a hard native-resource recycle (see
+   * DIRECT_FILE_TRANSFER_MAX_RETIRED_NATIVE_RESOURCES) wipes it exactly like
+   * a crash would, mid-upload, even with a transfer still active. Before the
+   * durable sidecar twin, a legitimate resume against a fresh ledger was
+   * rejected with INVALID_AUTHORITY -- indistinguishable, to the browser,
+   * from a hostile request -- forcing a large upload to restart from byte
+   * zero instead of resuming, which is exactly what was reported in
+   * production: a multi-GB upload failing near the end and starting over.
+   */
+  it('resumes across a lost in-memory ledger (hard recycle/crash) via the durable sidecar', async () => {
+    const { direct, sender } = await readyLease();
+    const chunk = DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES;
+    const total = chunk * 2;
+    const first = uploadPrepare({ size: total });
+    await direct.handleDirectFileTransferCommand(first, sender);
+    const firstChannel = new FakeDataChannel(first.channelLabel as string);
+    FakePeerConnection.latest!.emitDataChannel(firstChannel);
+    firstChannel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding(), authority: first.authority,
+    }));
+    await vi.waitFor(() => expect(firstChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    firstChannel.emit(Buffer.alloc(chunk, 7));
+    await vi.waitFor(() => expect(firstChannel.sent.some((m) => typeof m === 'string' && m.includes('"committedBytes"'))).toBe(true));
+
+    // Transient loss, same as the scenario above...
+    firstChannel.close();
+    // ...except this time the process ALSO forgot: simulates the exact
+    // effect of a hard recycle or crash between the two attempts, with
+    // nothing else (leases, disk state) disturbed.
+    direct.__clearUploadResumeStatesForTests();
+
+    const second = uploadPrepare({
+      ...binding({ requestId: 'sidecar-resume-request-2', attemptId: 'sidecar-resume-attempt-2' }),
+      size: total,
+      authority: 'R'.repeat(43),
+      channelLabel: 'imcodes-file-upload-sidecar-0002',
+    });
+    await direct.handleDirectFileTransferCommand(second, sender);
+    const secondChannel = new FakeDataChannel(second.channelLabel as string);
+    FakePeerConnection.latest!.emitDataChannel(secondChannel);
+    secondChannel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding({ requestId: 'sidecar-resume-request-2', attemptId: 'sidecar-resume-attempt-2' }),
+      authority: second.authority,
+      resumeOffset: chunk,
+    }));
+    // Without the sidecar, this would instead receive an INVALID_AUTHORITY
+    // TERMINAL error and never see ACCEPTED.
+    await vi.waitFor(() => expect(secondChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+
+    const committed = secondChannel.sent
+      .filter((m): m is string => typeof m === 'string')
+      .map((m) => { try { return JSON.parse(m) as Record<string, unknown>; } catch { return null; } })
+      .filter((m): m is Record<string, unknown> => !!m && m.type === DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT)
+      .map((m) => m.committedBytes as number);
+    expect(committed[0], 'rehydrated via the sidecar, the resumed attempt must still start credited at the confirmed offset, not zero').toBe(chunk);
+
+    secondChannel.emit(Buffer.alloc(chunk, 9));
+    secondChannel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.FINISH,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding({ requestId: 'sidecar-resume-request-2', attemptId: 'sidecar-resume-attempt-2' }),
+      totalBytes: total,
+    }));
+    await vi.waitFor(() => expect(secondChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.UPLOAD_COMMITTED)));
+  });
+
+  it('rejects a resume offset when no sidecar exists either (genuinely unknown operation)', async () => {
+    const { direct, sender } = await readyLease();
+    const chunk = DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES;
+    direct.__clearUploadResumeStatesForTests();
+    const attempt = uploadPrepare({ size: chunk * 2 });
+    await direct.handleDirectFileTransferCommand(attempt, sender);
+    const channel = new FakeDataChannel(attempt.channelLabel as string);
+    FakePeerConnection.latest!.emitDataChannel(channel);
+    channel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding(), authority: attempt.authority,
+      resumeOffset: chunk,
+    }));
+    await vi.waitFor(() => expect(channel.sent.length).toBeGreaterThan(0));
+    expect(channel.sent.some((m) => typeof m === 'string' && m.includes(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED))).toBe(false);
+    expect(channel.sent.some((m) => typeof m === 'string' && m.includes(DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY))).toBe(true);
+  });
+
   it('fails closed on a resume offset that does not match the partial, and keeps the partial', async () => {
     const { direct, sender } = await readyLease();
     const chunk = DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES;

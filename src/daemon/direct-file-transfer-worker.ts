@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { open, readdir, readFile, stat, statfs, unlink, rename } from 'node:fs/promises';
+import { open, readdir, readFile, stat, statfs, unlink, rename, writeFile } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import logger from '../util/logger.js';
@@ -369,7 +369,97 @@ async function releaseUploadResumeState(operationId: string, state: UploadResume
   if (partialIsInUse(state.partPath, operationId)) return false;
   uploadResumeStates.delete(operationId);
   await unlink(state.partPath).catch(() => {});
+  await removeUploadResumeSidecar(state.partPath);
   return true;
+}
+
+/**
+ * Durable twin of one `uploadResumeStates` entry, co-located next to the
+ * partial it describes (`<partPath>.resume.json`) so the orphan sweep's own
+ * existing per-`.part` bookkeeping keeps them associated with no separate
+ * index to maintain.
+ *
+ * Exists because `uploadResumeStates` is this child process's own memory: a
+ * hard native-resource recycle (see DIRECT_FILE_TRANSFER_MAX_RETIRED_NATIVE_RESOURCES)
+ * or a genuine crash wipes it, but the partial bytes on disk survive fine —
+ * without this, ANY multi-minute upload that outlives one such recycle
+ * permanently loses resume eligibility and a legitimate retry is rejected
+ * with INVALID_AUTHORITY (see startUpload), even though nothing was actually
+ * wrong with the request. `operationId` rides along in the JSON because the
+ * sidecar's own filename carries no identity of its own (it borrows the
+ * `.part` file's already-safe, server-random name) — recovery finds it by
+ * operationId via loadUploadResumeSidecar's directory scan, not by name.
+ */
+type UploadResumeSidecar = UploadResumeState & { operationId: string };
+
+function uploadResumeSidecarPath(partPath: string): string {
+  return `${partPath}.resume.json`;
+}
+
+/** Best-effort by design: resume durability is an optimization on top of an
+ *  upload that already works without it. A write failure here must never
+ *  fail, slow, or retry the transfer itself — it only means this operation
+ *  falls back to today's behavior (no resume across a recycle), not that the
+ *  upload in progress is affected at all. */
+async function writeUploadResumeSidecar(operationId: string, state: UploadResumeState): Promise<void> {
+  const sidecar: UploadResumeSidecar = { operationId, ...state };
+  try {
+    await writeFile(uploadResumeSidecarPath(state.partPath), JSON.stringify(sidecar), 'utf8');
+  } catch { /* best-effort; see comment above */ }
+}
+
+async function removeUploadResumeSidecar(partPath: string): Promise<void> {
+  await unlink(uploadResumeSidecarPath(partPath)).catch(() => {});
+}
+
+/**
+ * Rehydrate a resume-eligible state that outlived this process's own memory.
+ *
+ * Bounded directory scan, not a second index: sidecars are one-per-in-flight-
+ * upload (rare), and this only ever runs on an in-memory ledger MISS for a
+ * resume request — at most once per operation per process generation, never
+ * on the hot path of an already-tracked transfer. Every field is
+ * type-checked and the TTL is honored exactly like the in-memory path before
+ * this is trusted: a rehydrated state still has to pass the SAME identity and
+ * on-disk size checks startUpload already applies to an in-memory one, so
+ * this adds no new trust boundary — only a second place that state can come
+ * from.
+ */
+async function loadUploadResumeSidecar(operationId: string): Promise<UploadResumeState | undefined> {
+  let directory: string;
+  try {
+    directory = path.dirname(resolveUploadPath('probe.bin'));
+  } catch { return undefined; }
+  let entries: string[];
+  try {
+    entries = await readdir(directory);
+  } catch { return undefined; }
+  for (const entry of entries.slice(0, ORPHAN_SWEEP_MAX_ENTRIES)) {
+    if (!entry.endsWith('.resume.json')) continue;
+    let parsed: Partial<UploadResumeSidecar> | null = null;
+    try {
+      parsed = JSON.parse(await readFile(path.join(directory, entry), 'utf8')) as Partial<UploadResumeSidecar>;
+    } catch { continue; }
+    if (!parsed || parsed.operationId !== operationId) continue;
+    if (typeof parsed.partPath !== 'string' || typeof parsed.finalPath !== 'string'
+      || typeof parsed.finalFilename !== 'string' || typeof parsed.size !== 'number'
+      || typeof parsed.serverId !== 'string' || typeof parsed.browserTabId !== 'string'
+      || typeof parsed.leaseId !== 'string' || typeof parsed.expiresAt !== 'number') {
+      return undefined;
+    }
+    if (parsed.expiresAt <= Date.now()) return undefined;
+    return {
+      partPath: parsed.partPath,
+      finalPath: parsed.finalPath,
+      finalFilename: parsed.finalFilename,
+      size: parsed.size,
+      serverId: parsed.serverId,
+      browserTabId: parsed.browserTabId,
+      leaseId: parsed.leaseId,
+      expiresAt: parsed.expiresAt,
+    };
+  }
+  return undefined;
 }
 
 /**
@@ -436,6 +526,7 @@ export async function scavengeOrphanUploadPartials(now = Date.now()): Promise<nu
     if (!info || !info.isFile()) continue;
     if (now - info.mtimeMs <= DIRECT_FILE_TRANSFER_LIMITS.OPERATION_LEDGER_TTL_MS) continue;
     await unlink(candidate).catch(() => {});
+    await removeUploadResumeSidecar(candidate);
     removed += 1;
   }
   if (removed > 0) {
@@ -588,6 +679,7 @@ async function discardUploadResumeState(operationId: string): Promise<void> {
   if (!state) return;
   uploadResumeStates.delete(operationId);
   await unlink(state.partPath).catch(() => {});
+  await removeUploadResumeSidecar(state.partPath);
 }
 
 
@@ -663,8 +755,26 @@ let nativeRecycleTimer: ReturnType<typeof setTimeout> | null = null;
  * Reaching it fences new work and recycles the whole child address space. The
  * parent keeps the capability advertised and applies its normal retryable,
  * capped-backoff generation recovery.
+ *
+ * A retirement is not just a completed transfer: every lease teardown retires
+ * its peer AND its health channel (see closeOrRetireNative call sites), and a
+ * lease is torn down every time a client's File Browser closes (prewarm/
+ * release), not only when a transfer finishes. Production logs showed the
+ * previous ceiling of 16 -- only ~8 ordinary open/close cycles -- getting hit
+ * every 6-18 minutes under completely routine, transfer-free usage, which
+ * forces this hard recycle (SIGKILL, unlike the idle-only recycle path,
+ * regardless of any transfer active on the connection at that instant) far
+ * more often than the rare/pathological case this ceiling exists for. Each
+ * retired wrapper holds a modest, bounded amount of native state (no file
+ * bytes -- those stream through, never retained), so raising this by 16x
+ * bounds worst-case leaked memory at a small, acceptable cost in exchange for
+ * making this disruption roughly 16x rarer -- turning a routine multi-minute
+ * occurrence into an edge case that only sustained, heavy, gap-free usage
+ * would reach (the opportunistic idle-recycle path in
+ * scheduleNativeRecycleWhenIdle still reclaims well before this ceiling
+ * whenever the system actually goes idle).
  */
-export const DIRECT_FILE_TRANSFER_MAX_RETIRED_NATIVE_RESOURCES = 16;
+export const DIRECT_FILE_TRANSFER_MAX_RETIRED_NATIVE_RESOURCES = 256;
 let nativeRetirementRecycleRequested = false;
 
 /**
@@ -1327,7 +1437,22 @@ async function startUpload(transfer: ActiveDirectTransfer, requestedResumeOffset
   await ensureUploadDirectory();
   await pruneUploadResumeStates(authority.operationId);
   const resumeOffset = requestedResumeOffset;
-  const priorResume = uploadResumeStates.get(authority.operationId);
+  let priorResume = uploadResumeStates.get(authority.operationId);
+  // This process's own ledger has no memory of the operation (a hard native
+  // recycle or a genuine crash happened since it started) — before treating
+  // this as a request for something that never existed, check whether it
+  // actually did: the partial and its sidecar durably survive on disk across
+  // exactly that kind of restart. Every field this rehydrates through is
+  // still subject to the SAME identity/size/TTL checks below as an
+  // in-memory hit; this only widens where a legitimate state can come from,
+  // never what counts as authorization to use it.
+  if (!priorResume && resumeOffset > 0) {
+    const rehydrated = await loadUploadResumeSidecar(authority.operationId);
+    if (rehydrated) {
+      priorResume = rehydrated;
+      uploadResumeStates.set(authority.operationId, rehydrated);
+    }
+  }
   // Identity is checked before anything is opened. A partial file belongs to
   // one operation under one authorized identity; a request that does not match
   // must never be able to read, extend or destroy it.
@@ -1382,6 +1507,11 @@ async function startUpload(transfer: ActiveDirectTransfer, requestedResumeOffset
     // that its offset was accepted.
     transfer.committedReported = 0;
     priorResume.expiresAt = Date.now() + DIRECT_FILE_TRANSFER_LIMITS.OPERATION_LEDGER_TTL_MS;
+    // Refresh the durable twin's TTL too, so a SECOND recycle later in this
+    // same long-running upload still finds a not-yet-expired sidecar rather
+    // than one whose durability clock started (and ended) at the very first
+    // attempt.
+    void writeUploadResumeSidecar(authority.operationId, priorResume);
     transfer.started = true;
     resetTransferIdleTimer(transfer);
     reportUploadCommit(transfer);
@@ -1411,7 +1541,7 @@ async function startUpload(transfer: ActiveDirectTransfer, requestedResumeOffset
   // this operation is replaced rather than silently appended to.
   await unlink(partPath).catch(() => {});
   transfer.uploadFileHandle = await open(partPath, 'wx');
-  uploadResumeStates.set(authority.operationId, {
+  const freshResumeState: UploadResumeState = {
     partPath,
     finalPath,
     finalFilename: filename,
@@ -1420,7 +1550,13 @@ async function startUpload(transfer: ActiveDirectTransfer, requestedResumeOffset
     browserTabId: authority.browserTabId,
     leaseId: authority.leaseId,
     expiresAt: Date.now() + DIRECT_FILE_TRANSFER_LIMITS.OPERATION_LEDGER_TTL_MS,
-  });
+  };
+  uploadResumeStates.set(authority.operationId, freshResumeState);
+  // Best-effort durable twin (see writeUploadResumeSidecar): lets a LATER
+  // resume attempt against this exact operation survive a hard native-
+  // resource recycle or a genuine crash of this process, instead of the
+  // eligibility to resume dying with it.
+  void writeUploadResumeSidecar(authority.operationId, freshResumeState);
   transfer.started = true;
   resetTransferIdleTimer(transfer);
   transfer.channel?.sendMessage(JSON.stringify({
@@ -1562,8 +1698,11 @@ async function finishUpload(transfer: ActiveDirectTransfer, totalBytes: number, 
   // direction or the other, never into an unreferenced published file.
   await writeUploadCommitIntent(intent);
   await rename(partPath, finalPath);
-  // Committed: the partial no longer exists, so neither should the resume state.
+  // Committed: the partial no longer exists, so neither should the resume state
+  // (in-memory or its durable sidecar twin — the rename does not take that
+  // co-located file with it).
   uploadResumeStates.delete(transfer.authority.operationId);
+  await removeUploadResumeSidecar(partPath);
   const attachment = await finalizeDirectUploadedFile({ ...intent });
   // The registry now references the file; the write-ahead record has done its
   // job. A leftover here is harmless — replay is idempotent via lookup.
@@ -2610,6 +2749,19 @@ export function __nativeRetirementBudgetForTests(): { retired: number; limit: nu
 export function __setNativeRetirementBackpressureForTests(value: boolean): void {
   if (process.env.NODE_ENV !== 'test') throw new Error('test-only native retirement backpressure seam');
   nativeRetirementRecycleRequested = value;
+}
+
+/**
+ * Simulates exactly what a hard native-resource recycle (or a genuine crash)
+ * does to resume eligibility: wipes this process's in-memory
+ * `uploadResumeStates` ledger while leaving everything else — leases, active
+ * attempts, the partial bytes and sidecar files already on disk — untouched.
+ * Lets a test prove a resume survives losing the in-memory ledger via
+ * loadUploadResumeSidecar, without simulating a full child-process restart.
+ */
+export function __clearUploadResumeStatesForTests(): void {
+  if (process.env.NODE_ENV !== 'test') throw new Error('test-only upload resume ledger seam');
+  uploadResumeStates.clear();
 }
 
 /** Whether new peers/leases are refused because the addon was quiesced. */
