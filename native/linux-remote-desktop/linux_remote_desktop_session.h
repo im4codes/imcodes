@@ -203,6 +203,23 @@ class LinuxRemoteDesktopSession final
   // which posts across a socket boundary this process does not have).
   void HandleDataChannelMessage(common::DataChannelKind channel,
                                 const std::string& payload);
+  // Mirrors macOS's WorkerTransportSink::SendTopology(): the browser's own
+  // display list (snapshot.displays) starts empty and is ONLY ever
+  // populated by a remote_desktop.data.display_topology message over the
+  // control channel -- nothing else on the wire tells it a display exists
+  // at all. Never sending this meant snapshot.displays stayed permanently
+  // empty for every real Linux session, which made the browser's own
+  // statusMatchesConsumedTopology gate (remote-desktop-client.ts) false
+  // forever regardless of anything STATUS carries, which in turn meant
+  // acknowledgePresentedFrame() never had a pending frame to acknowledge,
+  // so FRAME_PRESENTED never got sent either -- input never enabled,
+  // client-side, no matter how correct the native dispatch/STATUS fields
+  // were. Sent once, right when the control channel opens (same trigger
+  // macOS uses).
+  bool SendTopology();
+  // Called from LinuxDataChannelObserver::OnStateChange() once a channel's
+  // own DataChannelInterface::state() actually reaches kOpen.
+  void OnChannelReady(common::DataChannelKind kind);
   [[nodiscard]] bool CorrelationMatches(
       const imcodes::rd::DataChannelMessage& message) const;
   [[nodiscard]] common::InputStamp InputStampFor(
@@ -219,7 +236,13 @@ class LinuxRemoteDesktopSession final
    public:
     LinuxDataChannelObserver(std::weak_ptr<LinuxRemoteDesktopSession> session,
                              common::DataChannelKind channel);
-    void OnStateChange() override {}
+    // OnDataChannel fires when the channel is created/negotiated, NOT when
+    // it is actually open -- calling DataChannelInterface::Send() that
+    // early returns false every time (confirmed live: topology/authority
+    // both present, channel found in channels_, Send() still returned 0).
+    // This is the real "did open" signal; SendTopology() belongs here, not
+    // in OnDataChannel.
+    void OnStateChange() override;
     void OnMessage(const webrtc::DataBuffer& buffer) override;
 
    private:
@@ -252,6 +275,10 @@ class LinuxRemoteDesktopSession final
   // channel_observers_ is the same shape for the same reason).
   std::map<std::string, std::unique_ptr<LinuxDataChannelObserver>>
       channel_observers_;
+  // Monotonically increasing sequence stamped on every message this session
+  // sends out over a data channel (topology today; matches macOS/Windows'
+  // own outbound_sequence_ convention).
+  std::uint64_t outbound_sequence_ = 0;
   common::TransportSessionCore transport_core_;
   // Declared after the adapters it wraps (adapters_ is a reference to the
   // caller-owned LinuxPlatformAdapters, which must outlive this session

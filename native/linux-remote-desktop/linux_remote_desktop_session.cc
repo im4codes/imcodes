@@ -18,6 +18,7 @@
 
 #include "../remote-desktop-common/data_channel_constants.h"
 #include "../remote-desktop-common/data_channel_payload.h"
+#include "../remote-desktop-common/json_protocol.h"
 #include "../remote-desktop-common/quality_ladder.h"
 
 namespace imcodes::remote_desktop::linux_platform {
@@ -439,6 +440,70 @@ void LinuxRemoteDesktopSession::OnDataChannel(
                                      DataChannelState::kOpen);
 }
 
+void LinuxRemoteDesktopSession::LinuxDataChannelObserver::OnStateChange() {
+  if (auto session = session_.lock()) {
+    session->OnChannelReady(channel_);
+  }
+}
+
+void LinuxRemoteDesktopSession::OnChannelReady(DataChannelKind kind) {
+  auto it = channels_.find(ChannelLabel(kind));
+  if (it == channels_.end() || !it->second ||
+      it->second->state() != webrtc::DataChannelInterface::kOpen) {
+    return;
+  }
+  if (kind == DataChannelKind::kControl) {
+    SendTopology();
+  }
+}
+
+bool LinuxRemoteDesktopSession::SendTopology() {
+  const common::DesktopTopology* topology = core_.topology();
+  const common::RouteAuthority* authority = transport_core_.authority();
+  auto it = channels_.find(ChannelLabel(DataChannelKind::kControl));
+  if (topology == nullptr || authority == nullptr ||
+      it == channels_.end() || !it->second) {
+    return false;
+  }
+  Json::Value root(Json::objectValue);
+  root["type"] = imcodes::rd::kTopologyType;
+  root["protocolVersion"] = imcodes::rd::kProtocolVersion;
+  root["sessionId"] = authority->identity.session_id;
+  root["sequence"] = Json::UInt64(outbound_sequence_++);
+  root["layoutRevision"] = Json::UInt64(topology->revision);
+  Json::Value displays(Json::arrayValue);
+  for (std::size_t index = 0; index < topology->displays.size(); ++index) {
+    const common::DisplayTopology& display = topology->displays[index];
+    Json::Value encoded(Json::objectValue);
+    encoded["id"] = display.display_id;
+    encoded["label"] = display.display_id;
+    encoded["primary"] = index == 0;
+    encoded["available"] = true;
+    encoded["width"] = display.encoded_pixels.width;
+    encoded["height"] = display.encoded_pixels.height;
+    encoded["dpiScale"] = display.scale;
+    encoded["rotation"] = static_cast<unsigned int>(display.rotation);
+    Json::Value bounds(Json::objectValue);
+    bounds["x"] = display.logical_input_bounds.x;
+    bounds["y"] = display.logical_input_bounds.y;
+    bounds["width"] = display.logical_input_bounds.width;
+    bounds["height"] = display.logical_input_bounds.height;
+    encoded["inputBounds"] = std::move(bounds);
+    Json::Value operations(Json::objectValue);
+    operations["selectable"] = display.operations.selectable;
+    operations["setMode"] = display.operations.set_mode;
+    operations["setScale"] = display.operations.set_scale;
+    encoded["operations"] = std::move(operations);
+    displays.append(std::move(encoded));
+  }
+  root["displays"] = std::move(displays);
+  if (!topology->displays.empty()) {
+    root["selectedDisplayId"] = topology->displays.front().display_id;
+  }
+  const std::string payload = imcodes::rd::WriteJson(root);
+  return it->second->Send(webrtc::DataBuffer(payload));
+}
+
 LinuxRemoteDesktopSession::LinuxDataChannelObserver::LinuxDataChannelObserver(
     std::weak_ptr<LinuxRemoteDesktopSession> session, DataChannelKind channel)
     : session_(std::move(session)), channel_(channel) {}
@@ -485,6 +550,7 @@ bool LinuxRemoteDesktopSession::CorrelationMatches(
 
 void LinuxRemoteDesktopSession::HandleDataChannelMessage(
     DataChannelKind channel, const std::string& payload) {
+
   imcodes::rd::DataChannelMessage message;
   if (!imcodes::rd::ParseDataChannelMessage(payload, &message) ||
       !CorrelationMatches(message)) {
