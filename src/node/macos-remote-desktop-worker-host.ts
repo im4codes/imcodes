@@ -74,7 +74,22 @@ import {
 } from './user-session-launcher.js';
 
 const DEFAULT_AUTHENTICATION_TIMEOUT_MS = 15_000;
-const DEFAULT_READINESS_POLL_MS = 1_000;
+// Was 1_000. Each poll is not a cheap in-process check: inspectReadiness
+// spawns a real --imcodes-readiness-v1 subprocess that opens a fresh
+// connection to com.apple.coremedia.videoencoder to probe encoder
+// readiness (see LocalReadiness / inspectLocalReadiness). At the 1s default
+// this authenticates ~3,600 fresh videoencoder connections per hour for the
+// entire lifetime of every authenticated session, indefinitely -- observed
+// in production as a sustained ~1/s subprocess-spawn rate that never let up.
+// Real screen-recording apps on the same machine (a third-party remote-
+// desktop tool) kept working fine throughout, which rules out genuine
+// system-wide hardware/encoder exhaustion and points at this host's own
+// connection rate specifically -- consistent with the coremedia XPC service
+// applying its own throttling to a client that reconnects this often,
+// independent of anything actually wrong with the hardware. 20s keeps
+// readiness changes (permission revoked, display unplugged, etc.) visible
+// within a reasonable window while cutting the connection rate by 20x.
+const DEFAULT_READINESS_POLL_MS = 20_000;
 const MIN_AUTHENTICATION_TIMEOUT_MS = 10;
 const MAX_AUTHENTICATION_TIMEOUT_MS = 120_000;
 const MIN_READINESS_POLL_MS = 100;
