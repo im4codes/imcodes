@@ -280,6 +280,10 @@ type HttpBackfillOpts = {
   force?: boolean;
   mode?: HttpBackfillMode;
   _retryAttempt?: number;
+  /** Resume a chained round from a prior round's `resumeBeforeTs`. */
+  _resumeBeforeTs?: number;
+  /** Chained-round counter (bounds automatic cap_hit continuation). */
+  _roundsChained?: number;
 };
 
 function createHttpBackfillCountState(): Record<HttpBackfillMode, number> {
@@ -3437,6 +3441,21 @@ export function useTimeline(
   // fire a fresh backfill, and the WS path remains the primary.
   const HTTP_BACKFILL_RETRY_DELAYS_MS = [800, 2000] as const;
 
+  // Live evidence (real, not hypothetical): a client closed/offline for a
+  // long time can accumulate a backlog far larger than one round's budget
+  // (CATCHUP_TAIL_MAX_PAGES x MAX_MEMORY_EVENTS = 1500 events). Before this,
+  // a `cap_hit` round just stopped -- the pager's own docs called this an
+  // "accepted product trade-off" for a DIFFERENT, narrower gap (an event
+  // older than the local tail racing a live one), but in practice it meant
+  // ANY backlog over 1500 events silently stayed unrecovered forever unless
+  // the user somehow knew to keep manually re-triggering a refresh. Chaining
+  // automatically closes that: bounded (never unbounded, matching the
+  // pager's own philosophy), generous enough for a realistic long-offline
+  // backlog (up to CATCHUP_TAIL_MAX_ROUNDS rounds), and paced with a short
+  // delay between rounds rather than firing every request back to back.
+  const CATCHUP_TAIL_MAX_ROUNDS = 20;
+  const CATCHUP_TAIL_CHAIN_DELAY_MS = 150;
+
   const fireHttpBackfill = useCallback((delayMs: number, opts?: HttpBackfillOpts) => {
     // Read `isActiveSession` via ref so this gate always reflects the latest
     // render's value, never a stale closure. The closure value only desynchs
@@ -3461,6 +3480,8 @@ export function useTimeline(
     const phase = opts?.phase ?? 'refresh';
     const visible = opts?.visible === true;
     const retryAttempt = opts?._retryAttempt ?? 0;
+    const resumeBeforeTs = opts?._resumeBeforeTs;
+    const roundsChained = opts?._roundsChained ?? 0;
     const mode = opts?.mode ?? 'tail';
     const backfillSessionId = sessionId;
     const backfillCacheKey = cacheKey;
@@ -3530,6 +3551,7 @@ export function useTimeline(
           const outcome = await runNewestWindowBackfill(afterTs, {
             limit: MAX_MEMORY_EVENTS,
             maxPages,
+            initialBeforeTs: resumeBeforeTs,
             fetchPage: ({ afterTs: at, beforeTs: bt }) => Promise.resolve(fetchTimelineHistoryHttp(serverId, backfillSessionId, {
               afterTs: at,
               ...(bt !== undefined ? { beforeTs: bt } : {}),
@@ -3582,6 +3604,32 @@ export function useTimeline(
               backfillDebug('fireHttpBackfill: null result → give up', { sessionId: backfillSessionId, retryAttempt });
             }
             return;
+          }
+          // `cap_hit` while still making real progress (every page full,
+          // strictly descending) means the window genuinely holds more below
+          // this round's budget -- the real-world shape of "closed for a long
+          // time, backlog bigger than 1500 events". Chain another round from
+          // exactly where this one stopped instead of leaving it unrecovered.
+          // The mode-scoped in-flight/timer gates below let this reuse the
+          // SAME dedupe/coalescing every other fireHttpBackfill call goes
+          // through; only the resume cursor and round counter carry forward.
+          if (outcome.terminal === 'cap_hit' && outcome.resumeBeforeTs !== undefined
+            && roundsChained < CATCHUP_TAIL_MAX_ROUNDS) {
+            backfillDebug('fireHttpBackfill: cap_hit → chaining next round', {
+              sessionId: backfillSessionId, roundsChained: roundsChained + 1, resumeBeforeTs: outcome.resumeBeforeTs,
+            });
+            setTimeout(() => {
+              fireHttpBackfillRef.current(0, {
+                ...opts,
+                _resumeBeforeTs: outcome.resumeBeforeTs,
+                _roundsChained: roundsChained + 1,
+                _retryAttempt: 0,
+              });
+            }, CATCHUP_TAIL_CHAIN_DELAY_MS);
+          } else if (outcome.terminal === 'cap_hit' && outcome.resumeBeforeTs !== undefined) {
+            backfillDebug('fireHttpBackfill: cap_hit → round budget exhausted, giving up for now', {
+              sessionId: backfillSessionId, roundsChained,
+            });
           }
           if (backfillCacheKey && outcome.terminal === 'caught_up') {
             lastHttpBackfillResponseAt.set(backfillCacheKey, Date.now());

@@ -211,6 +211,64 @@ describe('runNewestWindowBackfill (Tier-0 newest-first window)', () => {
     expect(outcome.pageCount).toBe(1);
   });
 
+  it('V-W2c: cap_hit while still making progress carries a resumeBeforeTs the next page would have used', async () => {
+    let top = 100;
+    const outcome = await runNewestWindowBackfill(0, {
+      limit: 2,
+      fetchPage: async () => { const p = { events: [{ ts: top }, { ts: top - 1 }], hasMore: false } as BackfillPage; top -= 10; return p; },
+      mergePage: countingMerge,
+    });
+    expect(outcome.terminal).toBe('cap_hit');
+    // 5 full pages of {top, top-1} starting at 100, each descending by 10:
+    // page5's minTs is 100-4*10-1=59, so the next page would start at 60.
+    expect(outcome.resumeBeforeTs).toBe(60);
+  });
+
+  it('V-W2d: a resume (real progress every time) reaches caught_up without re-walking already-merged pages', async () => {
+    // Real backend shape: a long, steadily-descending backlog spanning MORE
+    // pages than one round's budget (7 full pages, then a short one — 8
+    // total against a 5-page-per-round cap). First round caps at page 5;
+    // a second round resumes from resumeBeforeTs and finishes the window
+    // in its own 3 pages, well inside its own budget.
+    const merged: number[] = [];
+    const mergePage = (events: unknown[]) => {
+      for (const e of events as Array<{ ts: number }>) merged.push(e.ts);
+      return countingMerge(events);
+    };
+    let top = 200;
+    let fetches = 0;
+    const seenBeforeTs: Array<number | undefined> = [];
+    const fetchPage = async ({ beforeTs }: { afterTs: number | undefined; beforeTs?: number }) => {
+      seenBeforeTs.push(beforeTs);
+      fetches += 1;
+      if (fetches > 7) return { events: [{ ts: top }], hasMore: false } as BackfillPage; // short (page 8) → caught_up
+      const events = [{ ts: top }, { ts: top - 1 }];
+      top -= 10;
+      return { events, hasMore: false } as BackfillPage;
+    };
+    const first = await runNewestWindowBackfill(0, { limit: 2, fetchPage, mergePage });
+    expect(first.terminal).toBe('cap_hit');
+    expect(first.pageCount).toBe(CATCHUP_TAIL_MAX_PAGES);
+    const firstMergedCount = merged.length;
+    expect(firstMergedCount).toBe(CATCHUP_TAIL_MAX_PAGES * 2);
+
+    const second = await runNewestWindowBackfill(0, {
+      limit: 2, fetchPage, mergePage, initialBeforeTs: first.resumeBeforeTs,
+    });
+    // The resumed round never re-requests a beforeTs the first round already
+    // used (no wasted re-fetch of already-merged pages).
+    const firstRoundBeforeTs = seenBeforeTs.slice(0, CATCHUP_TAIL_MAX_PAGES);
+    const secondRoundBeforeTs = seenBeforeTs.slice(CATCHUP_TAIL_MAX_PAGES);
+    for (const bt of secondRoundBeforeTs) expect(firstRoundBeforeTs).not.toContain(bt);
+    expect(second.terminal).toBe('caught_up');
+    expect(second.pageCount).toBe(3);
+    expect(merged.length).toBeGreaterThan(firstMergedCount);
+    // The FULL backlog (8 pages' worth) ends up merged across both rounds —
+    // this is the actual bug fix: without a resume, a backlog past one
+    // round's budget stayed permanently unrecovered.
+    expect(merged.length).toBe(CATCHUP_TAIL_MAX_PAGES * 2 + 2 * 2 + 1);
+  });
+
   it('respects an explicit maxPages override', async () => {
     let top = 100;
     const fetchPage = vi.fn(async () => { const p = { events: [{ ts: top }, { ts: top - 1 }], hasMore: false } as BackfillPage; top -= 10; return p; });

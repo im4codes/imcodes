@@ -1644,6 +1644,112 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     expect(screen.getByTestId('probe').textContent).toBe('mounted');
   });
 
+  it('a backlog bigger than one round automatically chains rounds instead of stopping at cap_hit (real user report: long-offline client loses messages)', async () => {
+    // Live user report: "手机端长时间没开，很多消息会丢掉，同步不过来。电脑也一样"
+    // (mobile/desktop: closed for a long time, many messages get lost, can't
+    // sync back). Root cause: one backfill round is bounded to
+    // CATCHUP_TAIL_MAX_PAGES (5) pages of MAX_MEMORY_EVENTS (300) = 1500
+    // events; a real backlog bigger than that used to stop permanently at
+    // `cap_hit` with nothing to automatically continue it. This constructs a
+    // 2150-event backlog (7 full pages + 1 short) spanning TWO rounds and
+    // asserts the fetch sequence actually crosses the old single-round
+    // boundary, ending caught up rather than silently giving up at page 5.
+    const sessionName = `deck_long_offline_${Date.now()}`;
+    const serverId = `srv-long-offline-${Date.now()}`;
+    const PAGE_SIZE = 300; // MAX_MEMORY_EVENTS in useTimeline.ts
+    const FULL_PAGES = 7; // > CATCHUP_TAIL_MAX_PAGES (5): forces a chained 2nd round
+
+    function makePage(sessionId: string, fromTs: number, toTs: number): TimelineEvent[] {
+      const events: TimelineEvent[] = [];
+      for (let ts = fromTs; ts <= toTs; ts++) {
+        events.push({
+          eventId: `${sessionId}-e${ts}`,
+          sessionId,
+          ts,
+          epoch: 1,
+          seq: ts,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'assistant.text',
+          payload: { text: `msg-${ts}` },
+        });
+      }
+      return events;
+    }
+
+    // Newest-first window pager: page 1 is the NEWEST slice, each subsequent
+    // page descends. Page k covers ts [2150 - k*300 + 1, 2150 - (k-1)*300].
+    for (let page = 1; page <= FULL_PAGES; page++) {
+      const toTs = 2150 - (page - 1) * PAGE_SIZE;
+      const fromTs = toTs - PAGE_SIZE + 1;
+      fetchSpy.mockResolvedValueOnce({
+        events: makePage(sessionName, fromTs, toTs), epoch: 1, hasMore: false, nextCursor: null,
+      });
+    }
+    // Final short page (50 events): proves the window is exhausted, caught_up.
+    fetchSpy.mockResolvedValueOnce({
+      events: makePage(sessionName, 1, 50), epoch: 1, hasMore: false, nextCursor: null,
+    });
+
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-seed`,
+      sessionId: sessionName,
+      ts: 0,
+      epoch: 1,
+      seq: 0,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'seed' },
+    }, serverId);
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineReplayRequest: vi.fn(() => 'replay'),
+      sendTimelineHistoryRequest: vi.fn(() => 'history'),
+    } as unknown as WsClient;
+
+    function Probe() {
+      useTimeline(sessionName, ws, serverId);
+      return h('div', { 'data-testid': 'probe' }, 'mounted');
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe));
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toBe('mounted');
+    });
+
+    // Round 1 (mount-time, 200ms delay) fetches 5 full pages, hits cap_hit,
+    // and chains round 2 after a short (150ms) delay. Round 2 fetches the
+    // remaining 2 full pages + the short page and ends caught_up.
+    await act(async () => { await vi.advanceTimersByTimeAsync(200 + 5 * 0 + 150 + 3 * 0 + 500); });
+
+    // This is the actual regression proof: without automatic chaining the
+    // OLD code stopped at exactly 5 calls and never issued a 6th. Crossing
+    // that boundary (8 total: 5 + 3) is only possible if cap_hit resumed.
+    expect(fetchSpy).toHaveBeenCalledTimes(FULL_PAGES + 1);
+
+    // No further calls once genuinely caught up — chaining is bounded and
+    // self-terminating, not an unconditional poll loop.
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+    expect(fetchSpy).toHaveBeenCalledTimes(FULL_PAGES + 1);
+
+    // Every call actually descended the window (each beforeTs strictly below
+    // the previous, never repeating or skipping) across BOTH rounds, proving
+    // the resume genuinely continued the same descent rather than
+    // restarting from the newest event again.
+    const seenBeforeTs = fetchSpy.mock.calls.map(([, , opts]) => (opts as { beforeTs?: number }).beforeTs);
+    expect(seenBeforeTs[0]).toBeUndefined(); // round 1 page 1: newest
+    for (let i = 1; i < seenBeforeTs.length; i++) {
+      expect(seenBeforeTs[i]).toBeDefined();
+      if (i > 0 && seenBeforeTs[i - 1] !== undefined) {
+        expect(seenBeforeTs[i]!).toBeLessThan(seenBeforeTs[i - 1]!);
+      }
+    }
+  });
+
   it('15s cooldown coalesces back-to-back activation events for the same session', async () => {
     // Pins the user-reported regression: clicking a session triggered 2-3
     // backfills back-to-back (mount + isActiveSession transition + a stray

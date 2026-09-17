@@ -107,12 +107,33 @@ export interface NewestWindowBackfillDeps {
   limit: number;
   /** Max window pages (default `CATCHUP_TAIL_MAX_PAGES`). */
   maxPages?: number;
+  /**
+   * Resume a round's upper bound from a PRIOR round's `resumeBeforeTs`
+   * (see `NewestWindowBackfillOutcome`), instead of starting at the newest
+   * event. `afterTs` (the lower bound) must be the SAME value the prior
+   * round used -- this only moves where descent starts, never the window's
+   * floor. Omit / `undefined` to start at the newest event, as before.
+   */
+  initialBeforeTs?: number;
 }
 
 export interface NewestWindowBackfillOutcome {
   terminal: BackfillTerminal;
   pageCount: number;
   totalNew: number;
+  /**
+   * Present ONLY when `terminal === 'cap_hit'` because the page BUDGET ran
+   * out while pages were still making real downward progress (full pages,
+   * `minTs` strictly descending): the exact `beforeTs` the NEXT page would
+   * have used. A caller MAY resume with a fresh round
+   * (`initialBeforeTs: resumeBeforeTs`, same `afterTs`) to continue exactly
+   * where this one stopped, rather than re-walking from the newest event.
+   *
+   * Absent for the OTHER `cap_hit` cause (no usable cursor, or a same-`ts`
+   * cluster at least `limit` wide) -- that window is genuinely stuck, and a
+   * resume would just reproduce the identical stall forever.
+   */
+  resumeBeforeTs?: number;
 }
 
 function pageIsIncomplete(page: BackfillPage): boolean {
@@ -137,7 +158,9 @@ export async function runNewestWindowBackfill(
 ): Promise<NewestWindowBackfillOutcome> {
   const maxPages = deps.maxPages ?? CATCHUP_TAIL_MAX_PAGES;
   const afterTs = lowerAfterTs; // fixed lower bound for the whole round
-  let beforeTs: number | undefined; // moving upper bound (undefined = newest)
+  // Moving upper bound (undefined = newest). A caller-supplied resume point
+  // continues a PRIOR round's descent instead of re-walking from the top.
+  let beforeTs: number | undefined = deps.initialBeforeTs;
   let prevMinTs = Number.POSITIVE_INFINITY;
   let pageCount = 0;
   let totalNew = 0;
@@ -168,5 +191,8 @@ export async function runNewestWindowBackfill(
     prevMinTs = minTs;
     beforeTs = minTs + 1; // +1 re-includes the boundary ms; merge dedups it.
   }
-  return { terminal: 'cap_hit', pageCount, totalNew };
+  // Budget exhausted while still making real progress (every page so far was
+  // full and strictly descending) -- `beforeTs` is exactly where the next
+  // page would have started, so a resumed round can continue from here.
+  return { terminal: 'cap_hit', pageCount, totalNew, resumeBeforeTs: beforeTs };
 }
