@@ -212,6 +212,10 @@ class WorkerSession {
 
   [[nodiscard]] const imcodes::rd::Authority& authority() const noexcept { return authority_; }
 
+  [[nodiscard]] const common::DesktopTopology* topology() const noexcept {
+    return session_->topology();
+  }
+
  private:
   imcodes::rd::Authority authority_;
   std::shared_ptr<rd::LinuxRemoteDesktopSession> session_;
@@ -310,6 +314,23 @@ class Worker {
       status["inputEnabled"] =
           diagnostics.mode == common::TransportSessionMode::kControl &&
           diagnostics.required_channels_ready;
+      // The browser's own gate (remote-desktop-client.ts's
+      // statusMatchesConsumedTopology/statusMatchesPresentedFrame) refuses to
+      // enable input until a STATUS carries a selectedDisplayId/layoutRevision
+      // that matches what it already has and has itself presented a decoded
+      // frame for -- exactly like Windows' and macOS's own STATUS payloads
+      // already do. Leaving these two fields unset here (as this worker did
+      // until now) meant every browser session sat with inputEnabled=true
+      // over the wire but the client's own snapshot.inputEnabled permanently
+      // false: video visibly playing, every click/keystroke silently
+      // dropped by the client before it ever reached a data channel. Linux
+      // has exactly one fixed display, so "selected" is simply the one
+      // display topology already reports.
+      if (const common::DesktopTopology* topology = it->second->topology();
+          topology != nullptr && !topology->displays.empty()) {
+        status["selectedDisplayId"] = topology->displays.front().display_id;
+        status["layoutRevision"] = Json::UInt64(topology->revision);
+      }
       WriteLine(status);
       ++it;
     }
