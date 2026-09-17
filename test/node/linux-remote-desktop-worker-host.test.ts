@@ -16,6 +16,7 @@ import {
 } from '../../src/node/linux-remote-desktop-worker-host.js';
 import { resolveRemoteDesktopSessionProfile } from '../../shared/remote-desktop-platform.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '../../shared/remote-desktop.js';
+import { REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY } from '../../shared/remote-desktop-access.js';
 
 describe('resolveLinuxRemoteDesktopWorkerPath', () => {
   it('resolves the worker sidecar next to the controlled-node executable', () => {
@@ -71,11 +72,21 @@ describe('LinuxRemoteDesktopWorkerHost', () => {
    * correct advertisement instead -- see sessionCapabilities()'s own
    * comment for why it is honest despite this worker having no
    * per-machine readiness probe yet.
+   *
+   * Combines sessionCapabilities() with adapterCapabilities() before
+   * resolving, exactly as runtime.ts's refreshRemoteDesktopCapabilityState
+   * does (profile = resolveRemoteDesktopSessionProfile([...session,
+   * ...adapter])). Resolving from sessionCapabilities() alone previously
+   * passed this test while the real auth frame advertised nothing at all,
+   * because LOCAL_DISCLOSURE lived in sessionCapabilities() -- where
+   * runtime.ts's session-side filter (REMOTE_DESKTOP_SESSION_PROFILE_
+   * CAPABILITIES) silently drops it -- instead of adapterCapabilities(),
+   * where runtime.ts actually looks for adapter tokens.
    */
   it('advertises the full v3 profile, not the bare legacy capability, once available', () => {
     const { host } = makeHost({ workerExists: true });
     expect(host.available()).toBe(true);
-    const capabilities = host.sessionCapabilities();
+    const capabilities = [...host.sessionCapabilities(), ...host.adapterCapabilities()];
     expect(capabilities).not.toContain(REMOTE_DESKTOP_CAPABILITY);
     const profile = resolveRemoteDesktopSessionProfile(capabilities);
     expect(profile).not.toBeNull();
@@ -87,6 +98,26 @@ describe('LinuxRemoteDesktopWorkerHost', () => {
     // Honest View-only: the data-channel wire protocol for pointer/keyboard/
     // clipboard is not wired to the input adapters yet.
     expect(profile?.input).toBe(false);
+  });
+
+  /**
+   * sessionCapabilities() alone must NOT resolve a profile: it is
+   * deliberately missing the adapter-side LOCAL_DISCLOSURE token that the
+   * v3 profile requires. Pinning this the other way (sessionCapabilities()
+   * alone resolving successfully) is exactly the shape of the production
+   * bug this file's other test above documents -- session and adapter
+   * capabilities must both be present, from their own respective methods.
+   */
+  it('resolves no profile from sessionCapabilities() alone, without adapterCapabilities()', () => {
+    const { host } = makeHost({ workerExists: true });
+    expect(resolveRemoteDesktopSessionProfile(host.sessionCapabilities())).toBeNull();
+  });
+
+  it('advertises the real on-screen disclosure adapter once available, nothing when missing', () => {
+    const { host: availableHost } = makeHost({ workerExists: true });
+    expect(availableHost.adapterCapabilities()).toEqual([REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY]);
+    const { host: missingHost } = makeHost({ workerExists: false });
+    expect(missingHost.adapterCapabilities()).toEqual([]);
   });
 
   it('refuses every command when the sidecar binary is missing', async () => {

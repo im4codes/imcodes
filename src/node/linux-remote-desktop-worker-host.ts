@@ -15,7 +15,10 @@ import {
   REMOTE_DESKTOP_PLATFORM_CAPABILITY,
   REMOTE_DESKTOP_SESSION_CAPABILITY,
 } from '../../shared/remote-desktop-platform.js';
-import { REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY } from '../../shared/remote-desktop-access.js';
+import {
+  REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+  type RemoteDesktopAdapterCapability,
+} from '../../shared/remote-desktop-access.js';
 import { REMOTE_DESKTOP_LINUX_WORKER_FILENAME } from '../../shared/remote-desktop-worker.js';
 import { RemoteDesktopWorkerHostCore } from './remote-desktop-worker-host-core.js';
 import type { ControlledNodeRemoteDesktopWorker } from './runtime.js';
@@ -97,22 +100,21 @@ export class LinuxRemoteDesktopWorkerHost implements ControlledNodeRemoteDesktop
    * session look like a Windows one to every downstream consumer of
    * `profile.platform`/`profile.capture`.
    *
-   * REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY is included because the
-   * on-screen notice it promises is real, not aspirational:
-   * X11DisclosureAdapter (linux_x11_backend.h) draws an actual always-on-top
-   * X11 banner window naming the viewer/controller count, and
-   * LinuxPlatformAdapters wires its readiness into SessionCore::Start()'s
-   * ViewReady() gate -- a session on a machine where the disclosure window
-   * cannot actually be created will be refused natively, before any frame is
-   * captured, independent of what this method advertises. That native gate,
-   * not this method, is the real enforcement point: this worker has no
-   * protocol message yet for probing per-machine capture/disclosure
-   * readiness before a session is attempted (unlike macOS's worker host,
-   * which calls a real inspectReadiness probe here) -- see resolveLinux
-   * RemoteDesktopWorkerPath's sidecar-existence check being the only signal
-   * available -- so this is an optimistic, worker-present-based
-   * advertisement that the native session start will honestly refuse if
-   * wrong, not a claim that every Linux machine is definitely ready.
+   * REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY is NOT included here even
+   * though it is real (see adapterCapabilities() below) -- runtime.ts's
+   * refreshRemoteDesktopCapabilityState() filters this method's return
+   * value against REMOTE_DESKTOP_SESSION_PROFILE_CAPABILITIES only, which
+   * does not contain the adapter-capability tokens (LOCAL_DISCLOSURE,
+   * LOCAL_CONSENT, CAPTURE_PRIVACY, INPUT, LOCK_SCREEN, CANONICAL_BRANDING).
+   * Putting it here silently dropped it before it ever reached
+   * resolveRemoteDesktopSessionProfile, which requires it for the v3
+   * profile to resolve at all -- observed in production as a worker that
+   * was present, running, and fully wired, still advertising zero remote-
+   * desktop capabilities, because the one token profile resolution needs
+   * was filtered out one layer up. Windows' RemoteDesktopWorkerHost gets
+   * this right by advertising LOCAL_DISCLOSURE (among others) from its own
+   * adapterCapabilities(), never from sessionCapabilities() -- mirrored
+   * below instead of inventing a different split for Linux.
    *
    * REMOTE_DESKTOP_CAPTURE_CAPABILITY.LINUX_X11, not the portal/PipeWire
    * token: PortalCaptureAdapter (linux_platform_adapters.cc) exists but its
@@ -136,8 +138,18 @@ export class LinuxRemoteDesktopWorkerHost implements ControlledNodeRemoteDesktop
       REMOTE_DESKTOP_PLATFORM_CAPABILITY.LINUX,
       REMOTE_DESKTOP_CAPTURE_CAPABILITY.LINUX_X11,
       REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
-      REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
     ];
+  }
+
+  /**
+   * The real on-screen disclosure banner (X11DisclosureAdapter,
+   * linux_x11_backend.h -- see the long comment on sessionCapabilities()
+   * above for why this lives here and not there). Windows' equivalent host
+   * advertises its adapter set the same way, from this method alone.
+   */
+  adapterCapabilities(): readonly RemoteDesktopAdapterCapability[] {
+    if (!this.available()) return [];
+    return [REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY];
   }
 
   async handle(message: unknown): Promise<boolean> {

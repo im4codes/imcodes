@@ -13,6 +13,8 @@ import {
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
 } from '../../shared/transport/file-transfer.js';
 import { markServiceHealthy } from '../../src/node/bootstrap.js';
+import { LinuxRemoteDesktopWorkerHost } from '../../src/node/linux-remote-desktop-worker-host.js';
+import { resolveRemoteDesktopSessionProfile } from '../../shared/remote-desktop-platform.js';
 import { encodeEnrollmentBlob, parseEnrollmentBlob } from '../../src/node/enrollment.js';
 import { loadInstallJournal } from '../../src/node/install-journal.js';
 import {
@@ -849,6 +851,50 @@ describe('controlled node enrollment and runtime', () => {
     socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
     await Promise.resolve();
     expect(repairMissingRemoteDesktopWorker).toHaveBeenCalledOnce();
+    runtime.stop();
+  });
+
+  it('sends a resolvable v3 remote-desktop profile from a real LinuxRemoteDesktopWorkerHost once its sidecar exists', async () => {
+    // Regression coverage for a production bug: a real worker binary
+    // present on disk, running, with the fix above landed, still produced
+    // an auth frame with ZERO remote-desktop capabilities. Root cause was
+    // one layer up from the LinuxRemoteDesktopWorkerHost unit tests --
+    // runtime.ts's refreshRemoteDesktopCapabilityState() merges
+    // sessionCapabilities() and adapterCapabilities() through two
+    // DIFFERENT filters, and the disclosure token was advertised from the
+    // wrong one, so it was silently dropped before resolveRemoteDesktop
+    // SessionProfile ever saw it -- and without it, the v3 profile refuses
+    // to resolve at all. A host-level test that resolves a profile
+    // straight from sessionCapabilities() alone cannot catch that; only
+    // going through the real runtime merge, with a REAL
+    // LinuxRemoteDesktopWorkerHost (not a hand-built capability list),
+    // exercises the actual code path that broke in production.
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-linux-worker-e2e-'));
+    temporaryDirs.push(dir);
+    const workerPath = join(dir, 'imcodes-linux-remote-desktop-worker');
+    await writeFile(workerPath, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const remoteDesktopWorker = new LinuxRemoteDesktopWorkerHost(() => {}, { workerPath });
+    const socket = new MockSocket();
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, {
+      platform: 'linux',
+      arch: 'x64',
+      remoteDesktopWorker,
+    });
+    runtime.start();
+    socket.open();
+
+    const authFrame = JSON.parse(socket.sent[0]!) as { capabilities: string[] };
+    const profile = resolveRemoteDesktopSessionProfile(authFrame.capabilities);
+    expect(profile).not.toBeNull();
+    expect(profile?.kind).toBe('common_v3');
+    expect(profile?.platform).toBe('linux');
+    expect(profile?.capture).toBe('linux_x11');
+    expect(profile?.localDisclosure).toBe(true);
     runtime.stop();
   });
 
