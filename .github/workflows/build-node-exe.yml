@@ -211,6 +211,70 @@ jobs:
             # runner still has the signing and packaging steps to do.
             rm -rf "$download" "$sdk"
           done
+      # The Linux remote-desktop worker, from the same published, locked SDK
+      # build-libwebrtc-sdk.sh produces once. See ci.yml's own copy of this
+      # block for the full rationale; kept in sync with it deliberately.
+      - name: Install X11 runtime libraries and Xvfb
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libx11-6 libxext6 libxtst6 libxfixes3 libxrandr2 xvfb
+      - name: Build and test the Linux remote-desktop worker from the SDK
+        if: runner.os == 'Linux'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          lock="native/linux-remote-desktop/libwebrtc-sdk.lock.json"
+          tag="$(node -p "require('./$lock').releaseTag")"
+          asset="$(node -p "require('./$lock').assetName")"
+          repository="$(node -p "require('./$lock').repository")"
+          download="$RUNNER_TEMP/libwebrtc-sdk-archives-linux"
+          sdk="$RUNNER_TEMP/libwebrtc-sdk-linux"
+          mkdir -p "$download"
+          gh release download "$tag" --repo "$repository" --pattern "$asset" \
+            --dir "$download" --clobber
+          node scripts/install-libwebrtc-sdk.mjs --target linux-x64 \
+            "$download/$asset" "$sdk"
+          node scripts/libwebrtc-sdk-artifacts.mjs verify-sdk-lock \
+            --target linux-x64 "$lock" "$sdk"
+          Xvfb :99 -screen 0 1920x1080x24 &
+          echo $! > "$RUNNER_TEMP/xvfb.pid"
+          export DISPLAY=:99
+          for _ in $(seq 1 50); do
+            [ -e /tmp/.X11-unix/X99 ] && break
+            sleep 0.1
+          done
+          bash native/linux-remote-desktop/build-worker-from-sdk.sh \
+            --sdk-root "$sdk" \
+            --artifact-root dist-node-exe/remote-desktop-worker/linux-x64 \
+            --worker-version "$IMCODES_BUILD_VERSION" \
+            --run-native-tests
+          kill "$(cat "$RUNNER_TEMP/xvfb.pid")" 2>/dev/null || true
+          rm -rf "$download" "$sdk"
+      - name: Verify the Linux remote-desktop worker artifact
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          ARTIFACT="dist-node-exe/remote-desktop-worker/linux-x64/imcodes-linux-remote-desktop-worker"
+          MANIFEST="$ARTIFACT.manifest.json"
+          [ -f "$ARTIFACT" ] || { echo "missing $ARTIFACT" >&2; exit 1; }
+          [ -x "$ARTIFACT" ] || { echo "$ARTIFACT is not executable" >&2; exit 1; }
+          [ -f "$MANIFEST" ] || { echo "missing $MANIFEST" >&2; exit 1; }
+          node -e "
+            const fs = require('node:fs');
+            const crypto = require('node:crypto');
+            const manifest = JSON.parse(fs.readFileSync('$MANIFEST', 'utf8'));
+            const bytes = fs.readFileSync('$ARTIFACT');
+            const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
+            if (manifest.artifact.fileName !== 'imcodes-linux-remote-desktop-worker') throw new Error('manifest fileName mismatch');
+            if (manifest.artifact.os !== 'linux' || manifest.artifact.arch !== 'x64') throw new Error('manifest os/arch mismatch');
+            if (manifest.artifact.size !== bytes.length) throw new Error('manifest size mismatch: ' + manifest.artifact.size + ' vs ' + bytes.length);
+            if (manifest.artifact.sha256 !== sha256) throw new Error('manifest sha256 mismatch');
+            console.log('Linux remote-desktop worker manifest matches artifact:', sha256);
+          "
       - name: Resolve fixed libwebrtc SDK release
         if: runner.os == 'Windows'
         id: libwebrtc_sdk

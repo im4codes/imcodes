@@ -966,6 +966,95 @@ jobs:
             node scripts/remote-desktop-worker-artifacts.mjs verify \
               dist-node-exe "$IMCODES_BUILD_VERSION" darwin "$arch"
           done
+      # The Linux remote-desktop worker. Same reasoning as the macOS block
+      # above: without this the image ships a Linux controlled node that can
+      # self-upgrade but has no worker binary, so LinuxRemoteDesktopWorkerHost
+      # .available() is permanently false and remote desktop is simply
+      # unavailable -- with nothing in CI saying so. Built from the published,
+      # locked SDK (build-libwebrtc-sdk.sh built it once, hours; this is a
+      # ~15s compile+link against the immutable result).
+      - name: Restore the locked Linux libwebrtc SDK archive
+        if: runner.os == 'Linux'
+        id: linux_libwebrtc_sdk_cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/libwebrtc-sdk-archives-linux
+          key: imcodes-libwebrtc-linux-${{ hashFiles('native/linux-remote-desktop/libwebrtc-sdk.lock.json') }}-v1
+      # Runtime libraries the worker dynamically links against (capture,
+      # input injection, cursor/output geometry) plus a virtual display to
+      # actually run the qualification test against below -- ubuntu-latest is
+      # headless by default. install-linux-desktop-environment.sh installs
+      # the same X11 client libraries on a controlled node for the same
+      # reason; this is the CI-only equivalent, narrowed to just the runtime
+      # libs and Xvfb rather than a full desktop session.
+      - name: Install X11 runtime libraries and Xvfb
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libx11-6 libxext6 libxtst6 libxfixes3 libxrandr2 xvfb
+      - name: Build and test the Linux remote-desktop worker from the SDK
+        if: runner.os == 'Linux'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          lock="native/linux-remote-desktop/libwebrtc-sdk.lock.json"
+          tag="$(node -p "require('./$lock').releaseTag")"
+          asset="$(node -p "require('./$lock').assetName")"
+          repository="$(node -p "require('./$lock').repository")"
+          download="$RUNNER_TEMP/libwebrtc-sdk-archives-linux"
+          sdk="$RUNNER_TEMP/libwebrtc-sdk-linux"
+          mkdir -p "$download"
+          # Downloaded only on a cache miss. The installer verifies the
+          # archive against the lock's digest either way, so a cached file is
+          # never trusted for being cached.
+          if [ ! -f "$download/$asset" ]; then
+            gh release download "$tag" --repo "$repository" --pattern "$asset" \
+              --dir "$download" --clobber
+          fi
+          node scripts/install-libwebrtc-sdk.mjs --target linux-x64 \
+            "$download/$asset" "$sdk"
+          node scripts/libwebrtc-sdk-artifacts.mjs verify-sdk-lock \
+            --target linux-x64 "$lock" "$sdk"
+          Xvfb :99 -screen 0 1920x1080x24 &
+          echo $! > "$RUNNER_TEMP/xvfb.pid"
+          export DISPLAY=:99
+          # Bounded: Xvfb forks and returns before its socket is necessarily
+          # accepting connections.
+          for _ in $(seq 1 50); do
+            [ -e /tmp/.X11-unix/X99 ] && break
+            sleep 0.1
+          done
+          bash native/linux-remote-desktop/build-worker-from-sdk.sh \
+            --sdk-root "$sdk" \
+            --artifact-root dist-node-exe/remote-desktop-worker/linux-x64 \
+            --worker-version "$IMCODES_BUILD_VERSION" \
+            --run-native-tests
+          kill "$(cat "$RUNNER_TEMP/xvfb.pid")" 2>/dev/null || true
+          rm -rf "$sdk"
+      - name: Verify the Linux remote-desktop worker artifact
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          ARTIFACT="dist-node-exe/remote-desktop-worker/linux-x64/imcodes-linux-remote-desktop-worker"
+          MANIFEST="$ARTIFACT.manifest.json"
+          [ -f "$ARTIFACT" ] || { echo "missing $ARTIFACT" >&2; exit 1; }
+          [ -x "$ARTIFACT" ] || { echo "$ARTIFACT is not executable" >&2; exit 1; }
+          [ -f "$MANIFEST" ] || { echo "missing $MANIFEST" >&2; exit 1; }
+          node -e "
+            const fs = require('node:fs');
+            const crypto = require('node:crypto');
+            const manifest = JSON.parse(fs.readFileSync('$MANIFEST', 'utf8'));
+            const bytes = fs.readFileSync('$ARTIFACT');
+            const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
+            if (manifest.artifact.fileName !== 'imcodes-linux-remote-desktop-worker') throw new Error('manifest fileName mismatch');
+            if (manifest.artifact.os !== 'linux' || manifest.artifact.arch !== 'x64') throw new Error('manifest os/arch mismatch');
+            if (manifest.artifact.size !== bytes.length) throw new Error('manifest size mismatch: ' + manifest.artifact.size + ' vs ' + bytes.length);
+            if (manifest.artifact.sha256 !== sha256) throw new Error('manifest sha256 mismatch');
+            console.log('Linux remote-desktop worker manifest matches artifact:', sha256);
+          "
       - name: Resolve fixed libwebrtc SDK release
         if: runner.os == 'Windows'
         id: libwebrtc_sdk
@@ -1225,6 +1314,13 @@ jobs:
               scripts/remote-desktop-worker-artifacts.mjs verify \
               /app/controlled-node-executables "${{ needs.release_version.outputs.app_version }}" darwin "$arch"
           done
+          # Linux has no manifestVersion-2/component-set schema for
+          # remote-desktop-worker-artifacts.mjs to check yet, so this is a
+          # narrower presence+executable-bit gate rather than a full verify --
+          # still enough to catch the image shipping with no worker at all,
+          # which is the failure mode every check above exists to catch.
+          docker run --rm --entrypoint test imcodes-smoke:test \
+            -x /app/controlled-node-executables/remote-desktop-worker/linux-x64/imcodes-linux-remote-desktop-worker
 
       - name: Build and push (cache hit — only pushes layers)
         id: build_push
