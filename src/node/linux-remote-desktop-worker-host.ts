@@ -16,6 +16,7 @@ import {
   REMOTE_DESKTOP_SESSION_CAPABILITY,
 } from '../../shared/remote-desktop-platform.js';
 import {
+  REMOTE_DESKTOP_INPUT_CAPABILITY,
   REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
   type RemoteDesktopAdapterCapability,
 } from '../../shared/remote-desktop-access.js';
@@ -176,10 +177,11 @@ export class LinuxRemoteDesktopWorkerHost implements ControlledNodeRemoteDesktop
    * (linux_capture_selection.h) and is not advertised as the platform
    * capability either, for the same reason: it is not the primary path.
    *
-   * No REMOTE_DESKTOP_INPUT_CAPABILITY: the data-channel wire protocol for
-   * pointer/keyboard/clipboard messages is not wired to the input adapters
-   * yet (linux_remote_desktop_session.h's own "DELIBERATELY NOT YET DONE"
-   * note) -- this is honestly a View-only session today.
+   * REMOTE_DESKTOP_INPUT_CAPABILITY is real now too (see adapterCapabilities()
+   * below for why it lives there, not here) -- the data-channel wire
+   * protocol for pointer/keyboard messages is wired to the input adapters.
+   * Clipboard/display-selection/scale/auto-unlock remain unadvertised; see
+   * linux_remote_desktop_session.h's own header comment for that boundary.
    */
   sessionCapabilities(): readonly string[] {
     if (!this.available()) return [];
@@ -196,10 +198,21 @@ export class LinuxRemoteDesktopWorkerHost implements ControlledNodeRemoteDesktop
    * linux_x11_backend.h -- see the long comment on sessionCapabilities()
    * above for why this lives here and not there). Windows' equivalent host
    * advertises its adapter set the same way, from this method alone.
+   *
+   * REMOTE_DESKTOP_INPUT_CAPABILITY is now real too:
+   * linux_remote_desktop_session.cc registers a real webrtc::
+   * DataChannelObserver on every channel the browser opens and dispatches
+   * pointer/keyboard messages through the same SessionCore/InputLedger the
+   * already-qualified X11InputAdapter sits behind -- this worker is no
+   * longer honestly view-only. Display selection/mode/scale, clipboard, and
+   * auto-unlock remain unadvertised: Linux has one fixed display and none
+   * of REMOTE_DESKTOP_CLIPBOARD_CAPABILITY/CONTROLLED_NODE_AUTO_UNLOCK_
+   * CAPABILITY's own adapters, so claiming those would be the exact
+   * dishonest advertisement this file's own header warns against.
    */
   adapterCapabilities(): readonly RemoteDesktopAdapterCapability[] {
     if (!this.available()) return [];
-    return [REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY];
+    return [REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY, REMOTE_DESKTOP_INPUT_CAPABILITY];
   }
 
   async handle(message: unknown): Promise<boolean> {

@@ -17,7 +17,10 @@ import {
 } from '../../src/node/linux-remote-desktop-worker-host.js';
 import { resolveRemoteDesktopSessionProfile } from '../../shared/remote-desktop-platform.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '../../shared/remote-desktop.js';
-import { REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY } from '../../shared/remote-desktop-access.js';
+import {
+  REMOTE_DESKTOP_INPUT_CAPABILITY,
+  REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+} from '../../shared/remote-desktop-access.js';
 
 describe('resolveLinuxRemoteDesktopWorkerPath', () => {
   it('resolves the worker sidecar next to the controlled-node executable', () => {
@@ -96,9 +99,11 @@ describe('LinuxRemoteDesktopWorkerHost', () => {
     expect(profile?.capture).toBe('linux_x11');
     expect(profile?.encoder).toBe('h264');
     expect(profile?.localDisclosure).toBe(true);
-    // Honest View-only: the data-channel wire protocol for pointer/keyboard/
-    // clipboard is not wired to the input adapters yet.
-    expect(profile?.input).toBe(false);
+    // Real now: linux_remote_desktop_session.cc registers a webrtc::
+    // DataChannelObserver on every channel and dispatches pointer/keyboard
+    // through SessionCore/InputLedger to the already-qualified
+    // X11InputAdapter.
+    expect(profile?.input).toBe(true);
   });
 
   /**
@@ -114,9 +119,12 @@ describe('LinuxRemoteDesktopWorkerHost', () => {
     expect(resolveRemoteDesktopSessionProfile(host.sessionCapabilities())).toBeNull();
   });
 
-  it('advertises the real on-screen disclosure adapter once available, nothing when missing', () => {
+  it('advertises the real on-screen disclosure adapter and input once available, nothing when missing', () => {
     const { host: availableHost } = makeHost({ workerExists: true });
-    expect(availableHost.adapterCapabilities()).toEqual([REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY]);
+    expect(availableHost.adapterCapabilities()).toEqual([
+      REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+      REMOTE_DESKTOP_INPUT_CAPABILITY,
+    ]);
     const { host: missingHost } = makeHost({ workerExists: false });
     expect(missingHost.adapterCapabilities()).toEqual([]);
   });

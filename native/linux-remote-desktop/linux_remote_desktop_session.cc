@@ -1,6 +1,7 @@
 #include "linux_remote_desktop_session.h"
 
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <utility>
 
@@ -15,6 +16,8 @@
 #include "api/video_codecs/builtin_video_decoder_factory.h"
 #include "api/video_codecs/builtin_video_encoder_factory.h"
 
+#include "../remote-desktop-common/data_channel_constants.h"
+#include "../remote-desktop-common/data_channel_payload.h"
 #include "../remote-desktop-common/quality_ladder.h"
 
 namespace imcodes::remote_desktop::linux_platform {
@@ -23,6 +26,7 @@ namespace {
 using common::DataChannelKind;
 using common::DataChannelState;
 using common::IceCandidate;
+using common::InputResult;
 using common::PeerConnectionState;
 using common::QualitySelection;
 using common::QualityTarget;
@@ -34,19 +38,29 @@ using common::TransportPath;
 using common::TransportTerminalReason;
 using common::TransportTime;
 
+// Real wire labels (shared/remote-desktop.ts's REMOTE_DESKTOP_CHANNEL,
+// data_channel_constants.h's own kControlChannel/kKeyboardChannel/
+// kPointerChannel) -- NOT the bare "keyboard"/"pointer" this pair used to
+// compare against, which meant every channel the browser actually creates
+// ("imcodes-rd-keyboard", not "keyboard") fell through to kControl here.
+// Readiness/state tracking is not sensitive to that misclassification --
+// TransportSessionCore only counts "is a channel with this kind open," not
+// which kind it thinks it is when there is only ever one of each -- but
+// dispatch below (kind-gated pointer/keyboard routing) is, so this had to
+// be fixed together with adding that dispatch, not before it mattered.
 DataChannelKind ChannelKindFromLabel(const std::string& label) {
-  if (label == "keyboard") return DataChannelKind::kKeyboard;
-  if (label == "pointer") return DataChannelKind::kPointer;
+  if (label == imcodes::rd::kKeyboardChannel) return DataChannelKind::kKeyboard;
+  if (label == imcodes::rd::kPointerChannel) return DataChannelKind::kPointer;
   return DataChannelKind::kControl;
 }
 
 const char* ChannelLabel(DataChannelKind kind) {
   switch (kind) {
-    case DataChannelKind::kControl: return "control";
-    case DataChannelKind::kKeyboard: return "keyboard";
-    case DataChannelKind::kPointer: return "pointer";
+    case DataChannelKind::kControl: return imcodes::rd::kControlChannel;
+    case DataChannelKind::kKeyboard: return imcodes::rd::kKeyboardChannel;
+    case DataChannelKind::kPointer: return imcodes::rd::kPointerChannel;
   }
-  return "control";
+  return imcodes::rd::kControlChannel;
 }
 
 class SetLocalObs : public webrtc::SetLocalDescriptionObserverInterface {
@@ -300,8 +314,10 @@ void LinuxRemoteDesktopSession::CloseDataChannel(
   const std::string label = ChannelLabel(channel);
   auto it = channels_.find(label);
   if (it == channels_.end()) return;
+  it->second->UnregisterObserver();
   it->second->Close();
   channels_.erase(it);
+  channel_observers_.erase(label);
 }
 
 void LinuxRemoteDesktopSession::CloseTransport() noexcept {
@@ -309,8 +325,12 @@ void LinuxRemoteDesktopSession::CloseTransport() noexcept {
     video_track_ = nullptr;
   }
   video_lease_.reset();
-  for (auto& [label, channel] : channels_) channel->Close();
+  for (auto& [label, channel] : channels_) {
+    channel->UnregisterObserver();
+    channel->Close();
+  }
   channels_.clear();
+  channel_observers_.clear();
   if (peer_) {
     peer_->Close();
     peer_ = nullptr;
@@ -392,9 +412,167 @@ bool LinuxRemoteDesktopSession::AddRemoteIce(const std::string& mid,
 void LinuxRemoteDesktopSession::OnDataChannel(
     webrtc::scoped_refptr<webrtc::DataChannelInterface> channel) {
   const std::string label = channel->label();
+  const DataChannelKind kind = ChannelKindFromLabel(label);
+  auto observer = std::make_unique<LinuxDataChannelObserver>(
+      weak_from_this(), kind);
+  channel->RegisterObserver(observer.get());
   channels_[label] = channel;
-  transport_core_.OnDataChannelState(CallbackStamp(), ChannelKindFromLabel(label),
+  channel_observers_[label] = std::move(observer);
+  transport_core_.OnDataChannelState(CallbackStamp(), kind,
                                      DataChannelState::kOpen);
+}
+
+LinuxRemoteDesktopSession::LinuxDataChannelObserver::LinuxDataChannelObserver(
+    std::weak_ptr<LinuxRemoteDesktopSession> session, DataChannelKind channel)
+    : session_(std::move(session)), channel_(channel) {}
+
+void LinuxRemoteDesktopSession::LinuxDataChannelObserver::OnMessage(
+    const webrtc::DataBuffer& buffer) {
+  if (buffer.binary || buffer.size() == 0 ||
+      buffer.size() > imcodes::rd::kMaxDataMessageBytes) {
+    return;
+  }
+  if (auto session = session_.lock()) {
+    session->HandleDataChannelMessage(
+        channel_,
+        std::string(reinterpret_cast<const char*>(buffer.data.data()),
+                    buffer.data.size()));
+  }
+}
+
+common::InputStamp LinuxRemoteDesktopSession::InputStampFor(
+    const imcodes::rd::DataChannelMessage& message,
+    DataChannelKind channel,
+    bool position) const {
+  const char* controller = "control";
+  if (channel == DataChannelKind::kKeyboard) controller = "keyboard";
+  else if (channel == DataChannelKind::kPointer) controller = "pointer";
+  return {
+      .controller_id = position ? std::string(controller) + ":position"
+                                : std::string(controller),
+      .epoch = message.correlation.input_epoch,
+      .sequence = message.correlation.sequence,
+      .topology_revision = message.correlation.layout_revision,
+  };
+}
+
+bool LinuxRemoteDesktopSession::CorrelationMatches(
+    const imcodes::rd::DataChannelMessage& message) const {
+  const RouteAuthority* authority = transport_core_.authority();
+  const common::DesktopTopology* current_topology = core_.topology();
+  return authority != nullptr && current_topology != nullptr &&
+         message.correlation.session_id == authority->identity.session_id &&
+         message.correlation.input_epoch == authority->input_epoch &&
+         message.correlation.layout_revision == current_topology->revision;
+}
+
+void LinuxRemoteDesktopSession::HandleDataChannelMessage(
+    DataChannelKind channel, const std::string& payload) {
+  imcodes::rd::DataChannelMessage message;
+  if (!imcodes::rd::ParseDataChannelMessage(payload, &message) ||
+      !CorrelationMatches(message)) {
+    return;
+  }
+  const RouteAuthority* authority = transport_core_.authority();
+  if (authority == nullptr) return;
+  const auto applied = [](InputResult result) {
+    return result == InputResult::kApplied;
+  };
+  const common::DesktopTopology* current_topology = core_.topology();
+  const std::string display_id = current_topology != nullptr &&
+                                         !current_topology->displays.empty()
+                                     ? current_topology->displays.front().display_id
+                                     : std::string();
+
+  if (message.kind == imcodes::rd::DataChannelMessageKind::kPointer &&
+      (channel == DataChannelKind::kPointer ||
+       channel == DataChannelKind::kControl)) {
+    if (display_id.empty()) return;
+    if (message.pointer.x.has_value() && message.pointer.y.has_value() &&
+        message.pointer.kind != imcodes::rd::PointerKind::kMove) {
+      // Every non-move pointer event also carries the cursor's current
+      // position (the same "position" controller macOS/Windows fence
+      // separately from the button/wheel action itself) so a click lands
+      // exactly where the browser's own cursor was, not wherever the last
+      // explicit move happened to leave the X11 pointer.
+      if (!applied(ApplyPointerMove({
+              InputStampFor(message, channel, true),
+              display_id,
+              *message.pointer.x,
+              *message.pointer.y,
+          }))) {
+        return;
+      }
+    }
+    switch (message.pointer.kind) {
+      case imcodes::rd::PointerKind::kMove:
+        if (!message.pointer.x.has_value() || !message.pointer.y.has_value()) return;
+        ApplyPointerMove({
+            InputStampFor(message, channel, true),
+            display_id,
+            *message.pointer.x,
+            *message.pointer.y,
+        });
+        break;
+      case imcodes::rd::PointerKind::kButtonDown:
+      case imcodes::rd::PointerKind::kButtonUp:
+      case imcodes::rd::PointerKind::kButtonClick: {
+        static constexpr const char* kButtons[] = {"left", "middle", "right",
+                                                    "back", "forward"};
+        if (!message.pointer.button.has_value()) return;
+        const std::size_t index =
+            static_cast<std::size_t>(*message.pointer.button);
+        if (index >= sizeof(kButtons) / sizeof(kButtons[0])) return;
+        common::ButtonTransition transition{
+            InputStampFor(message, channel),
+            kButtons[index],
+            message.pointer.kind == imcodes::rd::PointerKind::kButtonDown,
+        };
+        if (message.pointer.kind == imcodes::rd::PointerKind::kButtonClick) {
+          ClickButton(transition);
+        } else {
+          ApplyButton(transition);
+        }
+        break;
+      }
+      case imcodes::rd::PointerKind::kWheel:
+        if (!message.pointer.delta_x.has_value() ||
+            !message.pointer.delta_y.has_value()) {
+          return;
+        }
+        ApplyWheel({
+            InputStampFor(message, channel),
+            *message.pointer.delta_x,
+            *message.pointer.delta_y,
+        });
+        break;
+    }
+  } else if (message.kind == imcodes::rd::DataChannelMessageKind::kKeyboard &&
+             channel == DataChannelKind::kKeyboard) {
+    if (message.keyboard.kind == imcodes::rd::KeyboardKind::kText) {
+      if (!message.keyboard.text.has_value()) return;
+      ApplyText({InputStampFor(message, channel), *message.keyboard.text});
+    } else {
+      if (!message.keyboard.code.has_value()) return;
+      ApplyKey({
+          InputStampFor(message, channel),
+          *message.keyboard.code,
+          message.keyboard.kind == imcodes::rd::KeyboardKind::kKeyDown,
+      });
+    }
+  } else if (message.kind == imcodes::rd::DataChannelMessageKind::kReleaseAll &&
+             channel == DataChannelKind::kControl) {
+    ReleaseController("control");
+    ReleaseController("control:position");
+    ReleaseController("keyboard");
+    ReleaseController("pointer");
+    ReleaseController("pointer:position");
+  }
+  // "control" messages other than release_all ("hello", "keepalive", and
+  // anything display/clipboard/unlock-shaped) are parsed but not acted on --
+  // see this file's header comment for why those have nothing to route to
+  // yet on Linux. Silently accepting rather than closing the channel: an
+  // unimplemented-but-well-formed control kind is not a protocol violation.
 }
 
 void LinuxRemoteDesktopSession::OnIceCandidate(

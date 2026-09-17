@@ -25,13 +25,22 @@
 //     at 0 (only `revision` was ever incremented); it now stamps the same
 //     WorkerGeneration matching Windows' ToCommonDesktopTopology pattern.
 //
-// DELIBERATELY NOT YET DONE, scoped as follow-up: the data-channel wire
-// protocol (pointer/keyboard/clipboard JSON messages the web/mobile client
-// actually sends -- macOS and Windows each parse their own copy of this,
-// there is no shared implementation to reuse yet) and the daemon-side worker
-// process/challenge/generation protocol. Channels open and are tracked by
-// TransportSessionCore for readiness purposes; incoming messages on them are
-// not yet parsed or dispatched to the input/clipboard adapters.
+// Data-channel dispatch (pointer/keyboard, plus the "hello"/"keepalive"/
+// release_all slice of "control"): parsed with data_channel_payload.h, the
+// SAME bounded parser Windows and macOS both consume ("a divergence here
+// would be a divergence in what each platform accepts as input" -- that
+// header's own comment), then routed through this session's own
+// SessionCore/InputLedger, exactly as ApplyPointerMove/ApplyKey/etc.'s own
+// header comment already promised they would be. NOT YET DONE, scoped as a
+// real follow-up: display selection/mode/scale, clipboard, and auto-unlock --
+// Linux has one fixed display and does not advertise
+// REMOTE_DESKTOP_CLIPBOARD_CAPABILITY or CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY,
+// so those "control" kinds have nothing to route to yet and stay silently
+// ignored (an unknown-but-well-formed control kind), matching this file's own
+// established "never claim readiness this session cannot back" convention.
+//
+// DELIBERATELY NOT YET DONE, scoped as follow-up: the daemon-side worker
+// process/challenge/generation protocol.
 
 #include <cstdint>
 #include <functional>
@@ -44,6 +53,7 @@
 #include "api/scoped_refptr.h"
 #include "rtc_base/thread.h"
 
+#include "../remote-desktop-common/data_channel_payload.h"
 #include "../remote-desktop-common/quality_ladder.h"
 #include "../remote-desktop-common/session_core.h"
 #include "../remote-desktop-common/transport_session_core.h"
@@ -131,14 +141,18 @@ class LinuxRemoteDesktopSession final
 
   [[nodiscard]] common::TransportDiagnostics diagnostics() const;
   [[nodiscard]] bool closed() const noexcept { return closed_; }
+  // Linux has exactly one display in its topology (no selection/mode/scale
+  // surface yet -- see this file's header comment), so nothing downstream
+  // needs a display_id parameter the way macOS's multi-display session does.
+  [[nodiscard]] const common::DesktopTopology* topology() const noexcept {
+    return core_.topology();
+  }
 
   // Real input dispatch through common::SessionCore/InputLedger -- the same
   // ownership/release/epoch-fencing semantics macOS's session wraps, backed
-  // here by the already-qualified X11InputAdapter. NOT YET called from
-  // anywhere: wiring these to the data-channel wire protocol (parsing the
-  // pointer/keyboard JSON messages the web/mobile client actually sends) is
-  // the next piece, deliberately not done in this pass -- see this file's
-  // header comment.
+  // here by the already-qualified X11InputAdapter. Called from
+  // HandleDataChannelMessage() below, which is what OnDataChannel's own
+  // observer feeds.
   common::InputResult ApplyPointerMove(const common::PointerMove& move);
   common::InputResult ApplyKey(const common::KeyTransition& transition);
   common::InputResult ApplyButton(const common::ButtonTransition& transition);
@@ -182,6 +196,37 @@ class LinuxRemoteDesktopSession final
 
   common::TransportCallbackStamp CallbackStamp() const;
 
+  // Invoked from LinuxDataChannelObserver::OnMessage -- itself always on the
+  // signaling thread (a webrtc::DataChannelObserver guarantee), which is
+  // also where every other caller into this class already runs, so no
+  // cross-thread post is needed here (unlike macOS's IPC-process worker,
+  // which posts across a socket boundary this process does not have).
+  void HandleDataChannelMessage(common::DataChannelKind channel,
+                                const std::string& payload);
+  [[nodiscard]] bool CorrelationMatches(
+      const imcodes::rd::DataChannelMessage& message) const;
+  [[nodiscard]] common::InputStamp InputStampFor(
+      const imcodes::rd::DataChannelMessage& message,
+      common::DataChannelKind channel,
+      bool position = false) const;
+
+  // Mirrors Windows' PeerDataObserver: a thin webrtc::DataChannelObserver
+  // that exists only to hand bytes back to the owning session, which is what
+  // actually owns InputLedger/SessionCore state. Holds a weak reference so
+  // an observer outliving its session (libwebrtc may deliver a final
+  // OnStateChange after Close()) never resurrects a torn-down session.
+  class LinuxDataChannelObserver final : public webrtc::DataChannelObserver {
+   public:
+    LinuxDataChannelObserver(std::weak_ptr<LinuxRemoteDesktopSession> session,
+                             common::DataChannelKind channel);
+    void OnStateChange() override {}
+    void OnMessage(const webrtc::DataBuffer& buffer) override;
+
+   private:
+    const std::weak_ptr<LinuxRemoteDesktopSession> session_;
+    const common::DataChannelKind channel_;
+  };
+
   class LinuxQualityLadder final : public common::QualityLadder {
    public:
     common::QualitySelection Select(
@@ -201,6 +246,12 @@ class LinuxRemoteDesktopSession final
   webrtc::scoped_refptr<webrtc::VideoTrackInterface> video_track_;
   std::map<std::string, webrtc::scoped_refptr<webrtc::DataChannelInterface>>
       channels_;
+  // Keeps each LinuxDataChannelObserver alive for exactly as long as the
+  // DataChannelInterface it is registered on -- libwebrtc does not take
+  // ownership of an observer itself, only a raw pointer to it (Windows'
+  // channel_observers_ is the same shape for the same reason).
+  std::map<std::string, std::unique_ptr<LinuxDataChannelObserver>>
+      channel_observers_;
   common::TransportSessionCore transport_core_;
   // Declared after the adapters it wraps (adapters_ is a reference to the
   // caller-owned LinuxPlatformAdapters, which must outlive this session

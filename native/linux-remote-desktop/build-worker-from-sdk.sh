@@ -111,6 +111,7 @@ PYEOF
 # platform layer, then the worker's own entry point last.
 SOURCES=(
   native/remote-desktop-common/json_protocol.cc
+  native/remote-desktop-common/data_channel_payload.cc
   native/remote-desktop-common/input_ledger.cc
   native/remote-desktop-common/quality_ladder.cc
   native/remote-desktop-common/session_core.cc
