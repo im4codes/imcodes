@@ -963,6 +963,40 @@ describe('macOS remote-desktop worker host', () => {
     }
   });
 
+  it('does not respawn a worker generation that never carried a real tracked session', async () => {
+    // Live evidence on node m3 (mac): a worker authenticates, its disclosure
+    // overlay claims "1 viewing" immediately, nobody ever sends a real
+    // PREPARE, its own 60s "connection_never_established" watchdog closes it
+    // (a socket close with no TERMINAL frame -- see
+    // WorkerTransportSink::SignalTerminal, which is a no-op without a bound
+    // authority), and the OLD restart-on-authenticated-disconnect logic
+    // immediately spun up a fresh generation to repeat the exact same cycle
+    // forever: an endless, user-visible "1 viewing" flash with nobody ever
+    // connected. This asserts the fix: no PREPARE was ever tracked, so the
+    // disconnect must not respawn a successor generation.
+    const onProfileChanged = vi.fn();
+    const errors: unknown[] = [];
+    const value = harness({
+      onProfileChanged,
+      onBackgroundError: (error) => errors.push(error),
+    });
+    await startAuthenticated(value);
+    expect(value.serverStarts).toHaveBeenCalledTimes(1);
+    value.disconnect('peer_disconnected');
+    expect(value.host.available()).toBe(false);
+    // Real-timer settle, not a microtask flush: the old code's restart was
+    // `teardown.then(() => this.start())`, and start() itself chains several
+    // more awaited mocks (artifact/user resolution, IPC authority, the mock
+    // server's own start()) before it would call serverStarts() again -- long
+    // enough that a couple of `await Promise.resolve()` ticks does not prove
+    // the restart's absence. A mutant that drops the authorities-size guard
+    // (restoring the old unconditional restart) reaches serverStarts() a
+    // second time well within this window -- verified live against this same
+    // assertion while preparing this fix.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(value.serverStarts).toHaveBeenCalledTimes(1);
+  });
+
   it('withdraws a retained profile when the proven-exit replacement cannot become ready', async () => {
     let encoder = true;
     const onProfileChanged = vi.fn();

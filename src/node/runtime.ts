@@ -532,6 +532,21 @@ export function createControlledNodeRuntime(
   let macosRemoteDesktopInstallInFlight = false;
   let macosRemoteDesktopInstallNextAttemptAt = 0;
   let macosRemoteDesktopStartNextAttemptAt = 0;
+  /**
+   * Set once this node's worker has become available at least once.
+   *
+   * The 30s retry below exists to recover a start that FAILED (the usual cause
+   * is a state a person changes in seconds, like an unlocked screen) -- not to
+   * keep an already-proven-healthy worker perpetually alive. Once it has
+   * authenticated at least one generation, a later idle worker closing itself
+   * (nobody ever asked for it) is not a failure to retry: forcing it back up
+   * every 30s only respawns a fresh disclosure overlay -- unconditionally
+   * visible the instant its process starts, real peer or not -- to idle for a
+   * minute and repeat, an endless user-visible "1 viewing" flash. A real,
+   * later PREPARE still starts the worker on demand (see the lazy-start guard
+   * around `dispatchRemoteDesktopCommand` below).
+   */
+  let macosRemoteDesktopEverAvailable = false;
   let upgradeInFlight = false;
   let upgradeHandoffDeadlineAt: number | null = null;
   const armUpgradeHandoffWatchdog = (): void => {
@@ -709,10 +724,24 @@ export function createControlledNodeRuntime(
       try {
         installedForThisRelease = await isInstalledForThisRelease();
         if (installedForThisRelease) {
-          try {
-            await remoteDesktopWorkerStartup?.();
-          } catch (error) {
-            logger.warn({ err: error }, 'installed macOS remote-desktop components did not start');
+          // Retry the START itself only until it first succeeds (or on an
+          // explicit force). After that this worker has proven it CAN come up;
+          // an idle close from here on is real demand disappearing, not a
+          // start-up failure, and forcing it back up every retry window would
+          // only be an endless respawn -- see macosRemoteDesktopEverAvailable.
+          if (force || !macosRemoteDesktopEverAvailable) {
+            try {
+              await remoteDesktopWorkerStartup?.();
+            } catch (error) {
+              logger.warn({ err: error }, 'installed macOS remote-desktop components did not start');
+            }
+            try {
+              macosRemoteDesktopEverAvailable = macosRemoteDesktopEverAvailable
+                || remoteDesktopWorker.available();
+            } catch {
+              // Leave the flag as-is; a broken availability probe is not proof
+              // of either state.
+            }
           }
           republishCapabilitiesIfChanged();
         }
@@ -778,6 +807,13 @@ export function createControlledNodeRuntime(
           await remoteDesktopWorkerStartup?.();
         } catch (error) {
           logger.warn({ err: error }, 'installed macOS remote-desktop components did not start');
+        }
+        try {
+          macosRemoteDesktopEverAvailable = macosRemoteDesktopEverAvailable
+            || remoteDesktopWorker.available();
+        } catch {
+          // Leave the flag as-is; a broken availability probe is not proof of
+          // either state.
         }
         // Re-read rather than assume: starting does not imply readiness, and
         // screen recording may not be granted yet.
@@ -1165,6 +1201,28 @@ export function createControlledNodeRuntime(
           }
           return;
         }
+        // A macOS worker that idled itself down after nobody used it (see
+        // macosRemoteDesktopEverAvailable above) is no longer kept warm by the
+        // heartbeat poller on purpose. A real PREPARE is real demand arriving
+        // right now, so start it lazily, on this request, instead of forcing
+        // dispatch to answer worker_failed for a worker that would have
+        // started fine a moment later. Best-effort: dispatch below still
+        // answers a bounded terminal frame if this does not bring it up.
+        if ((message as Record<string, unknown>).type === REMOTE_DESKTOP_MSG.PREPARE && remoteDesktopWorkerStartup) {
+          let currentlyAvailable = false;
+          try {
+            currentlyAvailable = remoteDesktopWorker.available();
+          } catch {
+            currentlyAvailable = false;
+          }
+          if (!currentlyAvailable) {
+            try {
+              await remoteDesktopWorkerStartup();
+            } catch (error) {
+              logger.warn({ err: error }, 'remote-desktop worker did not start for an incoming PREPARE');
+            }
+          }
+        }
         await dispatchRemoteDesktopCommand({
           message,
           enabled: remoteDesktopEnabled,
@@ -1313,6 +1371,19 @@ export function createControlledNodeRuntime(
         await remoteDesktopWorkerStartup();
       } catch (error) {
         reportAuthenticationError(error);
+      }
+      // This gated startup runs exactly once, before the first socket -- the
+      // only call site that starts the macOS worker outside
+      // installMacosRemoteDesktopComponents's own throttled retry. Record a
+      // success here too, or the very first heartbeat after this one still
+      // finds macosRemoteDesktopEverAvailable false and restarts the worker a
+      // second time immediately, defeating the guard below entirely.
+      try {
+        macosRemoteDesktopEverAvailable = macosRemoteDesktopEverAvailable
+          || remoteDesktopWorker.available();
+      } catch {
+        // Leave the flag as-is; a broken availability probe is not proof of
+        // either state.
       }
       refreshRemoteDesktopCapabilityState();
       ensureSignedShellController();

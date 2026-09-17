@@ -903,7 +903,21 @@ export class MacosRemoteDesktopWorkerHost {
             return;
           }
           this.options.onBackgroundError?.(error ?? new Error(`macos_remote_desktop_worker_disconnected:${reason}`));
-          const restart = this.authenticated && (
+          // Reached only when hasWorkerTerminationProof() above was false --
+          // i.e. no TERMINAL ever arrived for this generation. The native
+          // worker's own SignalTerminal() is a no-op without a bound
+          // authority (see WorkerTransportSink::SignalTerminal), so a worker
+          // that authenticated but never received a real PREPARE (no browser
+          // peer ever asked for it) closes silently: this is that generation's
+          // own "connection_never_established" watchdog cleanly retiring
+          // itself, not a session getting interrupted. Restarting it
+          // immediately respawns a fresh worker -- and its disclosure
+          // overlay, unconditionally visible from the instant the process
+          // starts -- purely to idle for another 60s and repeat: an endless,
+          // user-visible "1 viewing" flash with nobody ever connected. A
+          // generation that DID carry a real tracked session still restarts
+          // immediately, exactly as before.
+          const restart = this.authenticated && this.core.authorities().size > 0 && (
             reason === 'peer_disconnected'
             || reason === 'write_failed'
             || reason === 'callback_failed'

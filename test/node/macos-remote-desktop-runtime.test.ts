@@ -350,6 +350,130 @@ describe('macOS controlled-node remote-desktop runtime', () => {
     expect(advertised).not.toContain(REMOTE_DESKTOP_INPUT_CAPABILITY);
     runtime.stop();
   });
+
+  it('stops proactively restarting a macOS worker once it has proven itself available, and starts it lazily for a real PREPARE', async () => {
+    // Live evidence on node m3 (mac): every ~60-90s a brand new
+    // aidesk-agent/worker/disclosure process chain appeared, each one
+    // unconditionally claiming "1 viewing" the instant it started, with
+    // nobody ever connecting. The worker's own generation was already fixed
+    // not to respawn itself on a no-real-session disconnect (see
+    // macos-remote-desktop-worker-host.test.ts); this proves the OTHER half:
+    // the daemon's own heartbeat-driven keepalive must not bring an idle,
+    // already-proven-healthy worker back up on its own, while a REAL PREPARE
+    // still starts it (lazily, on demand) rather than failing worker_failed.
+    // A capability change (available -> unavailable, or back) is only ever
+    // seen by the server through a fresh auth frame, so the runtime opens a
+    // NEW socket whenever what it advertises changes -- exactly like "tells
+    // the server once installed components change what the node can do"
+    // above. Every socket after the first must therefore be tracked and
+    // opened in turn, not just the first one.
+    const sockets: MockSocket[] = [];
+    const createSocket = vi.fn(() => {
+      const socket = new MockSocket();
+      sockets.push(socket);
+      return socket;
+    });
+    let serverOptions: MacosRemoteDesktopIpcServerOptions | null = null;
+    let workerGeneration = 0;
+    let launchAgentStarts = 0;
+    let now = Date.now();
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, createSocket, {
+      platform: 'darwin',
+      arch: 'arm64',
+      now: () => now,
+      macosRemoteDesktopComponentsInstalled: async () => true,
+      macosRemoteDesktopWorker: {
+        resolveVerifiedArtifact: async () => verifiedArtifact(),
+        capturePrivacy: true,
+        resolveUserSession: async () => USER,
+        inspectReadiness: async () => ({
+          screenRecording: true, encoder: true, accessibility: true, clipboard: true, disclosure: true,
+        }),
+        inspectPeerUid: async (_socket: Socket) => USER.uid,
+        verifyPeerCodeIdentity: async (_socket: Socket, expected) => expected,
+        createIpcServer: (options: MacosRemoteDesktopIpcServerOptions) => {
+          serverOptions = options;
+          return {
+            start: async () => {
+              workerGeneration += 1;
+              return {
+                workerGeneration,
+                challenge: 'A'.repeat(43),
+                socketPath: '/private/var/run/imcodes/501/remote-desktop.sock',
+              };
+            },
+            sendCommand: async () => undefined,
+            stop: async () => undefined,
+          };
+        },
+        createLaunchAgentSupervisor: (
+          dependencies: MacosRemoteDesktopLaunchAgentSupervisorDependencies,
+        ) => ({
+          start: async () => {
+            launchAgentStarts += 1;
+            dependencies.markAuthorityUnavailable('start');
+            const active = dependencies.beginIpcLaunch();
+            queueMicrotask(() => serverOptions?.onPeerAuthenticated?.(active));
+            return {
+              user: USER,
+              workerGeneration: active.workerGeneration,
+              serviceTarget: 'gui/501/cc.imcodes.node.remote-desktop',
+              socketPath: active.socketPath,
+            };
+          },
+          stop: async () => undefined,
+        }),
+      },
+    });
+    runtime.start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    sockets[0]!.open();
+
+    // The initial connect starts the worker once and it authenticates.
+    await vi.waitFor(() => expect(launchAgentStarts).toBe(1));
+
+    // Nothing real ever asked for it. Its own "connection_never_established"
+    // watchdog closing it with zero tracked authorities looks exactly like
+    // this from the host's perspective: an authenticated peer disconnecting
+    // with no real session in progress. Availability narrows to false, which
+    // reconnects (a fresh auth frame is the only way the server learns).
+    serverOptions?.onDisconnect?.('peer_disconnected');
+    await vi.waitFor(() => expect(sockets).toHaveLength(2));
+    sockets[1]!.open();
+
+    now += 31_000; // past the 30s heartbeat retry throttle
+    sockets.at(-1)!.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Proven healthy once already: the heartbeat must not keep respawning it
+    // purely to idle again -- that is the endless "1 viewing" flash. No third
+    // socket means capabilities never changed again, i.e. nothing restarted.
+    expect(launchAgentStarts).toBe(1);
+    expect(sockets).toHaveLength(2);
+
+    // A real PREPARE is real demand arriving right now: it must still start
+    // the worker lazily rather than leave the feature silently unavailable.
+    const prepare = {
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId: 'request_12345678',
+      sessionId: 'session_12345678',
+      capability: 'a'.repeat(43),
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      routeGeneration: 11,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 3,
+      iceServers: [],
+    } as const;
+    sockets.at(-1)!.emit('message', JSON.stringify(prepare));
+    await vi.waitFor(() => expect(launchAgentStarts).toBe(2));
+    runtime.stop();
+  });
 });
 
 describe('translateServerDeadlines', () => {
