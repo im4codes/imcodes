@@ -13,10 +13,18 @@ import {
   REMOTE_DESKTOP_EXPLICIT_CLIPBOARD_CAPABILITY,
   REMOTE_DESKTOP_PLATFORM_CAPABILITY,
   REMOTE_DESKTOP_SESSION_CAPABILITY,
+  REMOTE_DESKTOP_SUPPORTED_CONTROLLED_NODE_OSES,
   REMOTE_DESKTOP_UNSUPPORTED_PROFILE_CAPABILITY,
+  controlledNodeOsForRemoteDesktopPlatform,
+  isRemoteDesktopSupportedControlledNodeOs,
   remoteDesktopSessionProfileIdentity,
   resolveRemoteDesktopSessionProfile,
 } from '../../shared/remote-desktop-platform.js';
+import {
+  CONTROLLED_NODE_OS_LINUX,
+  CONTROLLED_NODE_OS_MAC,
+  CONTROLLED_NODE_OS_WIN,
+} from '../../shared/controlled-node-artifacts.js';
 
 const MAC_VIEW = [
   REMOTE_DESKTOP_SESSION_CAPABILITY,
@@ -167,5 +175,38 @@ describe('cross-platform remote desktop session profiles', () => {
       value: [...MAC_VIEW, REMOTE_DESKTOP_UNSUPPORTED_PROFILE_CAPABILITY],
     });
     expect(parsed.ok && resolveRemoteDesktopSessionProfile(parsed.value)).toBeNull();
+  });
+});
+
+/**
+ * Regression coverage for a production bug: remote-desktop-router.ts's
+ * accessFault() used to re-decide "which controlled-node OSes support
+ * remote desktop" inline, in two separate spots, each its own hand-written
+ * list. Windows and macOS were correct in both; Linux was missing from
+ * both, and a Linux node's every session was refused as
+ * `unsupported_platform` before its own capabilities were ever read --
+ * confirmed live in production. These are now the one place that decision
+ * is made.
+ */
+describe('controlledNodeOsForRemoteDesktopPlatform / isRemoteDesktopSupportedControlledNodeOs', () => {
+  it('maps every RemoteDesktopPlatform to its controlled-node OS', () => {
+    expect(controlledNodeOsForRemoteDesktopPlatform('windows')).toBe(CONTROLLED_NODE_OS_WIN);
+    expect(controlledNodeOsForRemoteDesktopPlatform('macos')).toBe(CONTROLLED_NODE_OS_MAC);
+    expect(controlledNodeOsForRemoteDesktopPlatform('linux')).toBe(CONTROLLED_NODE_OS_LINUX);
+  });
+
+  it('lists exactly windows, macos, and linux as supported -- no more, no fewer', () => {
+    expect([...REMOTE_DESKTOP_SUPPORTED_CONTROLLED_NODE_OSES].sort()).toEqual(
+      [CONTROLLED_NODE_OS_WIN, CONTROLLED_NODE_OS_MAC, CONTROLLED_NODE_OS_LINUX].sort(),
+    );
+  });
+
+  it('accepts every supported OS and rejects null/unknown values', () => {
+    expect(isRemoteDesktopSupportedControlledNodeOs(CONTROLLED_NODE_OS_WIN)).toBe(true);
+    expect(isRemoteDesktopSupportedControlledNodeOs(CONTROLLED_NODE_OS_MAC)).toBe(true);
+    expect(isRemoteDesktopSupportedControlledNodeOs(CONTROLLED_NODE_OS_LINUX)).toBe(true);
+    expect(isRemoteDesktopSupportedControlledNodeOs(null)).toBe(false);
+    expect(isRemoteDesktopSupportedControlledNodeOs('plan9')).toBe(false);
+    expect(isRemoteDesktopSupportedControlledNodeOs('')).toBe(false);
   });
 });

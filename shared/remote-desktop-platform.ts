@@ -11,6 +11,12 @@ import {
 import { REMOTE_DESKTOP_CAPABILITY } from './remote-desktop.js';
 import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY } from './remote-desktop-install.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from './controlled-node-auto-unlock.js';
+import {
+  CONTROLLED_NODE_OS_LINUX,
+  CONTROLLED_NODE_OS_MAC,
+  CONTROLLED_NODE_OS_WIN,
+  type ControlledNodeOs,
+} from './controlled-node-artifacts.js';
 
 /**
  * Additive profile marker. The legacy Windows v2 capability remains valid on
@@ -29,6 +35,46 @@ export type RemoteDesktopPlatform = 'windows' | 'macos' | 'linux';
 export type RemoteDesktopPlatformCapability = typeof REMOTE_DESKTOP_PLATFORM_CAPABILITY[
   keyof typeof REMOTE_DESKTOP_PLATFORM_CAPABILITY
 ];
+
+/**
+ * The one controlled-node OS a resolved session profile's platform must
+ * agree with -- the single owned answer to "does this enrolled OS agree
+ * with what this node's own capabilities say it is."
+ *
+ * Written as an exhaustive switch so a fourth RemoteDesktopPlatform is a
+ * compile error here until this function learns about it, instead of a
+ * silently incomplete inline check. remote-desktop-router.ts's
+ * accessFault() used to ask this same question twice, inline, in its own
+ * two admission gates -- one excluded every non-Windows/non-macOS OS
+ * outright, the other only ever mapped to WIN or MAC. Windows and macOS
+ * were both already correct there; Linux was missing from both, confirmed
+ * live in production as a Linux node whose every session was refused as
+ * `unsupported_platform` before its own capabilities were ever read. Both
+ * gates now call this function instead of re-deciding the same mapping.
+ */
+export function controlledNodeOsForRemoteDesktopPlatform(
+  platform: RemoteDesktopPlatform,
+): ControlledNodeOs {
+  switch (platform) {
+    case 'windows': return CONTROLLED_NODE_OS_WIN;
+    case 'macos': return CONTROLLED_NODE_OS_MAC;
+    case 'linux': return CONTROLLED_NODE_OS_LINUX;
+  }
+}
+
+const REMOTE_DESKTOP_PLATFORMS: readonly RemoteDesktopPlatform[] = ['windows', 'macos', 'linux'];
+
+/** Every controlled-node OS capable of a remote-desktop session at all. */
+export const REMOTE_DESKTOP_SUPPORTED_CONTROLLED_NODE_OSES: readonly ControlledNodeOs[] =
+  REMOTE_DESKTOP_PLATFORMS.map(controlledNodeOsForRemoteDesktopPlatform);
+
+/** Type guard so callers holding a plain `os: string | null` DB column never need to cast. */
+export function isRemoteDesktopSupportedControlledNodeOs(
+  os: string | null,
+): os is ControlledNodeOs {
+  return os !== null
+    && (REMOTE_DESKTOP_SUPPORTED_CONTROLLED_NODE_OSES as readonly string[]).includes(os);
+}
 
 export const REMOTE_DESKTOP_CAPTURE_CAPABILITY = {
   WINDOWS_DXGI: 'remote.desktop.capture.windows.dxgi.v1',

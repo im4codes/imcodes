@@ -1,5 +1,4 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
-import { CONTROLLED_NODE_OS_LINUX, CONTROLLED_NODE_OS_MAC, CONTROLLED_NODE_OS_WIN } from '../../../shared/controlled-node-artifacts.js';
 import type WebSocket from 'ws';
 import type { Database } from '../db/client.js';
 import {
@@ -13,7 +12,11 @@ import {
   type MachineAccessRole,
 } from '../../../shared/remote-exec.js';
 import { validateControlledNodeCapabilities } from '../../../shared/controlled-node-capabilities.js';
-import { resolveRemoteDesktopSessionProfile } from '../../../shared/remote-desktop-platform.js';
+import {
+  controlledNodeOsForRemoteDesktopPlatform,
+  isRemoteDesktopSupportedControlledNodeOs,
+  resolveRemoteDesktopSessionProfile,
+} from '../../../shared/remote-desktop-platform.js';
 import {
   REMOTE_DESKTOP_AUDIT_EVENT,
   REMOTE_DESKTOP_ACCESS_MODE,
@@ -1453,14 +1456,13 @@ export class RemoteDesktopRouter {
     // Platform is decided against the advertised profile below, not assumed
     // Windows: a macOS node that advertised a complete v3 profile was refused
     // here as `unsupported_platform` before its capabilities were even read,
-    // so no session could ever reach one. Linux joined the same way and was
-    // refused here for the same reason: this early gate never learned about
-    // it, so every Linux node was rejected before its own v3 profile (linux
-    // platform, x11 capture, disclosure) was ever read below.
-    if (controlledNode
-      && access.os !== CONTROLLED_NODE_OS_WIN
-      && access.os !== CONTROLLED_NODE_OS_MAC
-      && access.os !== CONTROLLED_NODE_OS_LINUX) {
+    // so no session could ever reach one. Linux joined the same way once and
+    // was refused for the same reason -- this early gate, and the platform/os
+    // agreement check below, each independently re-decided "which OSes exist"
+    // inline instead of asking one owned place, so fixing the gap for macOS
+    // here did not fix it for Linux, and had to be fixed again later. Both
+    // gates now defer to shared/remote-desktop-platform.ts's own mapping.
+    if (controlledNode && !isRemoteDesktopSupportedControlledNodeOs(access.os)) {
       return 'unsupported_platform';
     }
     if (access.status !== 'online'
@@ -1475,12 +1477,7 @@ export class RemoteDesktopRouter {
       // Windows token on top made every non-Windows node fail here.
       const profile = capabilities.ok ? resolveRemoteDesktopSessionProfile(capabilities.value) : null;
       if (!profile) return 'capability';
-      const expectedOs = profile.platform === 'macos'
-        ? CONTROLLED_NODE_OS_MAC
-        : profile.platform === 'linux'
-          ? CONTROLLED_NODE_OS_LINUX
-          : CONTROLLED_NODE_OS_WIN;
-      if (access.os !== expectedOs) return 'unsupported_platform';
+      if (access.os !== controlledNodeOsForRemoteDesktopPlatform(profile.platform)) return 'unsupported_platform';
     }
     return null;
   }

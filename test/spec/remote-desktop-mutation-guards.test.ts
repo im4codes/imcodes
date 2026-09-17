@@ -108,13 +108,15 @@ const contracts: Contract[] = [
       {
         path: 'server/src/ws/remote-desktop-router.ts',
         // The platform gate is now the node's enrolled OS agreeing with the
-        // platform of the profile it advertises -- Windows or macOS -- rather
-        // than a Windows-only check that refused every Mac.
-        needle: "if (controlledNode && access.os !== CONTROLLED_NODE_OS_WIN && access.os !== CONTROLLED_NODE_OS_MAC)",
+        // platform of the profile it advertises -- Windows, macOS, or Linux
+        // -- rather than a hand-written list that silently excluded whichever
+        // platform its own two copies (this gate and the one below) forgot.
+        // Both now defer to shared/remote-desktop-platform.ts's own mapping.
+        needle: 'if (controlledNode && !isRemoteDesktopSupportedControlledNodeOs(access.os))',
       },
       {
         path: 'server/src/ws/remote-desktop-router.ts',
-        needle: "if (access.os !== expectedOs) return 'unsupported_platform';",
+        needle: "if (access.os !== controlledNodeOsForRemoteDesktopPlatform(profile.platform)) return 'unsupported_platform';",
       },
     ],
   },
