@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import { DIRECT_FILE_TRANSFER_WORKER_KIND } from '../../shared/direct-file-transfer.js';
 import { spawnDirectFileTransferChild } from '../../src/daemon/direct-file-transfer-ipc.js';
+import { DIRECT_FILE_TRANSFER_MAX_RETIRED_NATIVE_RESOURCES } from '../../src/daemon/direct-file-transfer-worker.js';
 
 async function waitForChildMessage(child: ReturnType<typeof spawnDirectFileTransferChild>): Promise<unknown> {
   return await Promise.race([
@@ -100,8 +101,8 @@ describe('P0 direct transfer native crash containment', () => {
       expect(evidence).toEqual([1, 2, 3].map((generation) => expect.objectContaining({
         type: 'fixture.native-retirement-budget',
         generation,
-        retired: 16,
-        limit: 16,
+        retired: DIRECT_FILE_TRANSFER_MAX_RETIRED_NATIVE_RESOURCES,
+        limit: DIRECT_FILE_TRANSFER_MAX_RETIRED_NATIVE_RESOURCES,
         fenced: true,
       })));
       expect(evidence.every((entry) => entry.pid !== parentPid && entry.retired <= entry.limit)).toBe(true);
