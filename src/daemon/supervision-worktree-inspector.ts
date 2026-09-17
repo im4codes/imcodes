@@ -491,7 +491,7 @@ const inFlight = new Map<string, Promise<SupervisionWorktreeInspectionResult>>()
  * answer for the other's different base.
  */
 function cacheKeyFor(worktreePath: string, baseRevision: string | undefined): string {
-  return `${worktreePath} ${baseRevision ?? ''}`;
+  return `${worktreePath}\0${baseRevision ?? ''}`;
 }
 
 async function cachedResult(
