@@ -980,20 +980,23 @@ jobs:
         with:
           path: ${{ runner.temp }}/libwebrtc-sdk-archives-linux
           key: imcodes-libwebrtc-linux-${{ hashFiles('native/linux-remote-desktop/libwebrtc-sdk.lock.json') }}-v1
-      # Runtime libraries the worker dynamically links against (capture,
-      # input injection, cursor/output geometry) plus a virtual display to
-      # actually run the qualification test against below -- ubuntu-latest is
-      # headless by default. install-linux-desktop-environment.sh installs
-      # the same X11 client libraries on a controlled node for the same
-      # reason; this is the CI-only equivalent, narrowed to just the runtime
-      # libs and Xvfb rather than a full desktop session.
-      - name: Install X11 runtime libraries and Xvfb
+      # The -dev packages, not just the runtime .so.N libraries: ld.lld's -lX11
+      # etc. look for the unversioned .so symlink each -dev package ships (the
+      # runtime-only packages install just libX11.so.6, with nothing named
+      # libX11.so, and the link step below failed with "unable to find
+      # library -lX11" on a bare ubuntu-latest runner before this was -dev).
+      # Also a virtual display to actually run the qualification test against
+      # below -- ubuntu-latest is headless by default. install-linux-desktop-
+      # environment.sh installs the same X11 client libraries on a controlled
+      # node for the same reason; this is the CI-only equivalent, narrowed to
+      # just the link-time libs and Xvfb rather than a full desktop session.
+      - name: Install X11 development libraries and Xvfb
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libx11-6 libxext6 libxtst6 libxfixes3 libxrandr2 xvfb
+            libx11-dev libxext-dev libxtst-dev libxfixes-dev libxrandr-dev xvfb
       - name: Build and test the Linux remote-desktop worker from the SDK
         if: runner.os == 'Linux'
         env:

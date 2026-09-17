@@ -214,13 +214,13 @@ jobs:
       # The Linux remote-desktop worker, from the same published, locked SDK
       # build-libwebrtc-sdk.sh produces once. See ci.yml's own copy of this
       # block for the full rationale; kept in sync with it deliberately.
-      - name: Install X11 runtime libraries and Xvfb
+      - name: Install X11 development libraries and Xvfb
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libx11-6 libxext6 libxtst6 libxfixes3 libxrandr2 xvfb
+            libx11-dev libxext-dev libxtst-dev libxfixes-dev libxrandr-dev xvfb
       - name: Build and test the Linux remote-desktop worker from the SDK
         if: runner.os == 'Linux'
         env:
