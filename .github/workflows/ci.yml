@@ -8,22 +8,29 @@ on:
   pull_request:
     branches: [main, master]
 
-# Without this, every push to a shared branch (dev, in particular, taking
-# commits from several concurrent sessions within minutes of each other)
-# spawns its own full ~25-30 min matrix that runs to completion even after a
-# newer commit has already superseded it -- burning runner capacity on
-# results nobody will act on and queueing the CHECK THAT ACTUALLY MATTERS
-# (the latest commit's) behind them. Grouping by ref and cancelling the
-# stale run the moment a newer one starts fixes that: only the most recent
-# push/PR-sync per ref ever runs to completion. `pull_request` and `push`
-# land in different groups automatically (github.ref is the PR merge ref
-# for one, the branch ref for the other), so this never cancels a push run
-# because of an unrelated PR sync or vice versa. Release tags are excluded
-# on purpose -- a tag is not something a later push "supersedes", and a
-# half-finished release build is worse than a slightly slow one.
+# Grouping by ref and cancelling a stale run the moment a newer one starts
+# is genuinely safe for `pull_request` syncs (nobody acts on a superseded
+# PR check) and for throwaway `repro/**` branches (never publish/docker,
+# see each job's own `if:` below) -- so those two keep the original
+# behavior. It stopped being safe for `main`/`master`/`dev`: those are the
+# ONLY refs the Publish-to-npm and Docker-Build-&-Push jobs ever run on
+# (`if: github.ref == 'refs/heads/master' || ... == 'refs/heads/main' ||
+# ... == 'refs/heads/dev'`), and cancel-in-progress kills the WHOLE run --
+# every job in it, including one already mid-`npm publish` or mid-`docker
+# push` -- the instant a newer commit lands on the same branch. On `dev`
+# in particular, taking pushes from several concurrent sessions within
+# minutes of each other, this meant Publish/Docker routinely never
+# finished at all: superseded before reaching them, forever (live,
+# repeatedly observed). A half-finished publish/Docker push is worse than
+# a slightly slow one, exactly like this file's own original reasoning
+# for excluding release tags -- main/master/dev now get that same
+# protection. Lint/typecheck/test on those three branches pay for this
+# with an occasional wasted matrix run on a commit a newer push already
+# superseded; that is strictly cheaper than an interrupted publish.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request'
+    || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/repro/')) }}
 
 env:
   NODE_VERSION_PRIMARY: '24'
