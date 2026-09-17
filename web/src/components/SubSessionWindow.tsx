@@ -16,6 +16,8 @@ import { SessionControls } from './SessionControls.js';
 import { UsageFooter } from './UsageFooter.js';
 import { FloatingPanel } from './FloatingPanel.js';
 import { DesktopWindowMaximizeButton } from './DesktopWindowMaximizeButton.js';
+import { DaemonRemoteDesktopControl } from './DaemonRemoteDesktopControl.js';
+import type { MachineListItem } from '../api/machines.js';
 import { requestActiveTimelineRefreshAfterUserAction, useTimeline } from '../hooks/useTimeline.js';
 import { useTerminalRawHold } from '../hooks/useTerminalRawHold.js';
 import { findTrailingAskQuestion, type TrailingAskQuestion } from '../find-pending-question.js';
@@ -132,6 +134,16 @@ interface Props {
   inP2p?: boolean;
   sharedState?: SharedStateSummary | null;
   accentColor?: string;
+  /**
+   * Whether the daemon behind `serverId` is currently reachable. Gates the
+   * remote-desktop quick-open/install button placed to the left of this
+   * window's own file-browser toggle — same machine `serverId` and the
+   * nested FileBrowser already target, same signal the main-session toolbar
+   * uses for its own DaemonRemoteDesktopControl.
+   */
+  daemonOnline?: boolean;
+  /** Opens the remote-desktop workspace for a machine. Same callback the main-session toolbar passes to its own DaemonRemoteDesktopControl. */
+  onOpenRemoteDesktop?: (machine: MachineListItem) => void;
 }
 
 type ViewMode = 'terminal' | 'chat';
@@ -262,7 +274,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, visible = true, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onPreviewFile, onOpenLocalWebPreview, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR,
+  sub, ws, connected, active, visible = true, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onPreviewFile, onOpenLocalWebPreview, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, daemonOnline, onOpenRemoteDesktop,
 }: Props) {
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
@@ -920,6 +932,18 @@ export function SubSessionWindow({
         {sub.ccPresetId && <span style={{ fontSize: 11, color: '#f59e0b' }} title={`Custom API: ${sub.ccPresetId}`}>◉</span>}
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 10 }}>
           {!isShell && !isTransport && <button class="subsession-mode-btn" onClick={() => { const next = viewMode === 'chat' ? 'terminal' : 'chat'; setViewMode(next); if (next === 'chat') requestAnimationFrame(() => chatScrollRef.current?.()); }} title={viewMode === 'chat' ? 'Switch to terminal' : 'Switch to chat'}>{viewMode === 'chat' ? '⌨' : '💬'}</button>}
+          {/* Left of the file-manager button, on purpose — same convention
+              as the main-session toolbar's DaemonRemoteDesktopControl: it
+              targets the exact same `serverId` (and so the exact same
+              machine) this window's own FileBrowser below is rooted on. */}
+          <DaemonRemoteDesktopControl
+            compact
+            offerLoginScreenSetup={false}
+            ws={ws}
+            serverId={serverId ?? null}
+            daemonOnline={daemonOnline ?? false}
+            onOpen={(machine) => onOpenRemoteDesktop?.(machine)}
+          />
           {/* File browser — placed to the LEFT of the pin button in the
               sub-session window header. Each sub-session owns its own
               FileBrowser instance rooted at sub.cwd, so selected paths land

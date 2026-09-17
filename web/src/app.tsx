@@ -7465,6 +7465,8 @@ export function App() {
               sub={sub}
               ws={wsRef.current}
               connected={connected}
+              daemonOnline={daemonOnline}
+              onOpenRemoteDesktop={openRemoteDesktop}
               active={windowVisible && (isMobile || focusedSubId === sub.id)}
               visible={windowVisible}
               onPendingQuestion={surfaceAskQuestionFromHistory}

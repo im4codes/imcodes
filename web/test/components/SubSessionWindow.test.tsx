@@ -136,6 +136,8 @@ vi.mock('../../src/git-status-store.js', async (importOriginal) => {
 
 import { SubSessionWindow } from '../../src/components/SubSessionWindow.js';
 import type { SubSession } from '../../src/hooks/useSubSessions.js';
+import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
+import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY, REMOTE_DESKTOP_INSTALL_MSG } from '@shared/remote-desktop-install.js';
 
 function makeSubSession(overrides: Partial<SubSession> = {}): SubSession {
   return {
@@ -195,6 +197,10 @@ describe('SubSessionWindow metadata wiring', () => {
     unsubscribeTerminal: vi.fn(),
     sendSnapshotRequest: vi.fn(),
     sendResize: vi.fn(),
+    // The real client always exposes the daemon capability snapshot;
+    // SubSessionWindow's own DaemonRemoteDesktopControl reads it on mount.
+    getDaemonCapabilitySnapshot: vi.fn(() => null),
+    onDaemonCapabilitySnapshot: vi.fn(() => () => undefined),
   } as any;
 
   beforeEach(() => {
@@ -778,6 +784,8 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
     holdTerminalRaw: vi.fn(() => releaseHold),
     sendSnapshotRequest: vi.fn(),
     sendResize: vi.fn(),
+    getDaemonCapabilitySnapshot: vi.fn(() => null),
+    onDaemonCapabilitySnapshot: vi.fn(() => () => undefined),
   } as any;
 
   beforeEach(() => {
@@ -1590,6 +1598,10 @@ describe('SubSessionWindow desktop file-browser stack integration', () => {
     unsubscribeTerminal: vi.fn(),
     sendSnapshotRequest: vi.fn(),
     sendResize: vi.fn(),
+    // The real client always exposes the daemon capability snapshot;
+    // SubSessionWindow's own DaemonRemoteDesktopControl reads it on mount.
+    getDaemonCapabilitySnapshot: vi.fn(() => null),
+    onDaemonCapabilitySnapshot: vi.fn(() => () => undefined),
   } as any;
 
   beforeEach(() => {
@@ -1731,5 +1743,161 @@ describe('SubSessionWindow desktop file-browser stack integration', () => {
     await waitFor(() => {
       expect(onClose).toHaveBeenCalled();
     });
+  });
+});
+
+describe('SubSessionWindow remote-desktop quick-open', () => {
+  let confirmSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+    confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+  });
+
+  afterEach(() => {
+    confirmSpy.mockRestore();
+  });
+
+  function wsWithCapabilities(capabilities: string[]) {
+    const sent: unknown[] = [];
+    return {
+      onMessage: vi.fn(() => () => undefined),
+      subscribeTerminal: vi.fn(),
+      unsubscribeTerminal: vi.fn(),
+      sendSnapshotRequest: vi.fn(),
+      sendResize: vi.fn(),
+      getDaemonCapabilitySnapshot: vi.fn(() => ({ capabilities })),
+      onDaemonCapabilitySnapshot: vi.fn(() => () => undefined),
+      send: vi.fn((message: unknown) => { sent.push(message); }),
+      sent,
+    } as any;
+  }
+
+  it("renders the remote-desktop button to the LEFT of the file-browser toggle, opening THIS sub-session's own machine directly", () => {
+    const ws = wsWithCapabilities([REMOTE_DESKTOP_CAPABILITY]);
+    const sub = makeSubSession();
+    const onOpenRemoteDesktop = vi.fn();
+    const { container } = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        daemonOnline={true}
+        onOpenRemoteDesktop={onOpenRemoteDesktop}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={5010}
+        onFocus={vi.fn()}
+        serverId="srv-1"
+      />,
+    );
+
+    const header = container.querySelector('.subsession-header') as HTMLElement;
+    const buttons = Array.from(header.querySelectorAll('button'));
+    const rdIndex = buttons.findIndex((b) => b.classList.contains('daemon-remote-desktop-btn'));
+    const filesIndex = buttons.findIndex((b) => b.getAttribute('title') === 'picker.files');
+    expect(rdIndex, 'remote-desktop button must be present').toBeGreaterThanOrEqual(0);
+    expect(filesIndex, 'file-browser toggle must still be present').toBeGreaterThanOrEqual(0);
+    expect(rdIndex, 'remote-desktop button must render to the LEFT of the file-browser toggle').toBeLessThan(filesIndex);
+
+    buttons[rdIndex].click();
+    expect(onOpenRemoteDesktop).toHaveBeenCalledTimes(1);
+    // "This sub-session's own machine" — the same serverId its own FileBrowser is rooted on.
+    expect(onOpenRemoteDesktop.mock.calls[0][0]).toMatchObject({ serverId: 'srv-1' });
+  });
+
+  it('renders no remote-desktop button when the daemon advertises neither capability, but keeps the file-browser toggle', () => {
+    const ws = wsWithCapabilities([]);
+    const sub = makeSubSession();
+    const { container } = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        daemonOnline={true}
+        onOpenRemoteDesktop={vi.fn()}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={5010}
+        onFocus={vi.fn()}
+        serverId="srv-1"
+      />,
+    );
+    expect(container.querySelector('.daemon-remote-desktop-btn')).toBeNull();
+    expect(container.querySelector('button[title="picker.files"]')).toBeTruthy();
+  });
+
+  it('asks for confirmation and triggers the real install flow when the machine is not yet activated', async () => {
+    const ws = wsWithCapabilities([REMOTE_DESKTOP_INSTALLABLE_CAPABILITY]);
+    const sub = makeSubSession();
+    const { container } = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        daemonOnline={true}
+        onOpenRemoteDesktop={vi.fn()}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={5010}
+        onFocus={vi.fn()}
+        serverId="srv-1"
+      />,
+    );
+
+    const rdButton = container.querySelector('.daemon-remote-desktop-btn') as HTMLButtonElement;
+    expect(rdButton).toBeTruthy();
+    rdButton.click();
+
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    await waitFor(() => {
+      expect(ws.sent).toEqual([{ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST }]);
+    });
+  });
+
+  it('does nothing when the user declines the install confirmation', () => {
+    const ws = wsWithCapabilities([REMOTE_DESKTOP_INSTALLABLE_CAPABILITY]);
+    confirmSpy.mockReturnValue(false);
+    const sub = makeSubSession();
+    const { container } = render(
+      <SubSessionWindow
+        sub={sub}
+        ws={ws}
+        connected={true}
+        daemonOnline={true}
+        onOpenRemoteDesktop={vi.fn()}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={5010}
+        onFocus={vi.fn()}
+        serverId="srv-1"
+      />,
+    );
+
+    const rdButton = container.querySelector('.daemon-remote-desktop-btn') as HTMLButtonElement;
+    rdButton.click();
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    expect(ws.sent).toEqual([]);
   });
 });
