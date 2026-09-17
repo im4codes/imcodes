@@ -13,6 +13,7 @@ import { join, dirname } from 'node:path';
 import {
   LinuxRemoteDesktopWorkerHost,
   resolveLinuxRemoteDesktopWorkerPath,
+  resolveWorkerDisplayEnv,
 } from '../../src/node/linux-remote-desktop-worker-host.js';
 import { resolveRemoteDesktopSessionProfile } from '../../shared/remote-desktop-platform.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '../../shared/remote-desktop.js';
@@ -129,5 +130,63 @@ describe('LinuxRemoteDesktopWorkerHost', () => {
     const { host, messages } = makeHost({ workerExists: true });
     expect(() => host.close()).not.toThrow();
     expect(messages).toEqual([]);
+  });
+});
+
+/**
+ * Regression coverage for a production bug: imcodes-node.service has no
+ * `Environment=DISPLAY=...` line (unlike scripts/install-linux-desktop-
+ * environment.sh's own x11vnc unit, which sets one on itself for exactly
+ * this reason), so the worker this host spawns inherited an unset $DISPLAY
+ * and could never open the X server -- even with a real Xvfb running and
+ * every capability correctly advertised. Observed as a session that never
+ * left its first "connecting" step. resolveWorkerDisplayEnv is what
+ * ensureSpawned() now passes as the spawned child's env.
+ */
+describe('resolveWorkerDisplayEnv', () => {
+  const socketDirs: string[] = [];
+  afterEach(() => {
+    while (socketDirs.length > 0) {
+      rmSync(socketDirs.pop()!, { recursive: true, force: true });
+    }
+  });
+
+  function makeSocketDir(names: readonly string[]): string {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-x11-unix-test-'));
+    socketDirs.push(dir);
+    for (const name of names) writeFileSync(join(dir, name), '');
+    return dir;
+  }
+
+  it('never overrides an already-set DISPLAY, even with live sockets present', () => {
+    const socketDir = makeSocketDir(['X0', 'X99']);
+    const env = resolveWorkerDisplayEnv({ DISPLAY: ':7' }, socketDir);
+    expect(env.DISPLAY).toBe(':7');
+  });
+
+  it('targets the lowest-numbered live X11 socket when DISPLAY is unset', () => {
+    const socketDir = makeSocketDir(['X99', 'X0', 'X12']);
+    const env = resolveWorkerDisplayEnv({}, socketDir);
+    expect(env.DISPLAY).toBe(':0');
+  });
+
+  it('falls back to the install script default when no socket exists at all', () => {
+    const socketDir = makeSocketDir([]);
+    expect(resolveWorkerDisplayEnv({}, socketDir).DISPLAY).toBe(':99');
+  });
+
+  it('falls back to the install script default when the socket directory does not exist', () => {
+    expect(resolveWorkerDisplayEnv({}, '/nonexistent/x11-unix-dir').DISPLAY).toBe(':99');
+  });
+
+  it('ignores unrelated files in the socket directory', () => {
+    const socketDir = makeSocketDir(['.X11-lock', 'X42', 'not-a-socket']);
+    expect(resolveWorkerDisplayEnv({}, socketDir).DISPLAY).toBe(':42');
+  });
+
+  it('preserves the rest of the environment unchanged', () => {
+    const socketDir = makeSocketDir(['X5']);
+    const env = resolveWorkerDisplayEnv({ PATH: '/usr/bin', LANG: 'en_US.UTF-8' }, socketDir);
+    expect(env).toEqual({ PATH: '/usr/bin', LANG: 'en_US.UTF-8', DISPLAY: ':5' });
   });
 });

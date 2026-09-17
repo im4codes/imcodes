@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { type ChildProcessByStdio, spawn } from 'node:child_process';
 import type { Readable, Writable } from 'node:stream';
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import {
   REMOTE_DESKTOP_MSG,
@@ -46,6 +46,56 @@ const WORKER_SIDECAR_RELATIVE_PATH = [
 
 export function resolveLinuxRemoteDesktopWorkerPath(execPath: string = process.execPath): string {
   return join(dirname(execPath), ...WORKER_SIDECAR_RELATIVE_PATH);
+}
+
+/** Matches an X11 abstract/unix socket name in /tmp/.X11-unix, e.g. "X99". */
+const X11_SOCKET_NAME_PATTERN = /^X(\d+)$/;
+const X11_SOCKET_DIR = '/tmp/.X11-unix';
+/**
+ * scripts/install-linux-desktop-environment.sh's own default (--display
+ * defaults to ":99"), used only when nothing live is found on disk -- this
+ * keeps the fallback aligned with the one path that has ever actually been
+ * exercised, rather than inventing a second, independent default.
+ */
+const DEFAULT_X11_DISPLAY = ':99';
+
+/**
+ * The controlled-node service (imcodes-node.service) that spawns this
+ * worker is a plain systemd unit with no `Environment=DISPLAY=...` line --
+ * unlike scripts/install-linux-desktop-environment.sh's own x11vnc unit,
+ * which sets DISPLAY on itself for exactly this reason. Without it, the
+ * worker's XOpenDisplay(nullptr) call (linux_x11_backend.cc) reads an unset
+ * $DISPLAY and fails outright, even with a real Xvfb already running --
+ * observed in production as a session that never leaves its first
+ * connecting step, no matter how healthy the advertised capability set is.
+ *
+ * Never overrides an operator's own explicit DISPLAY (respects whatever the
+ * process environment already provides). Otherwise scans the standard X11
+ * socket directory for a live server and targets it directly, so this
+ * tracks whatever display number is ACTUALLY running rather than assuming
+ * one -- multiple sockets pick the lowest number for determinism. Falls
+ * back to the install script's own default only when no socket exists at
+ * all, which leaves the worker no worse off than before this existed.
+ */
+export function resolveWorkerDisplayEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  socketDir: string = X11_SOCKET_DIR,
+): NodeJS.ProcessEnv {
+  if (typeof env.DISPLAY === 'string' && env.DISPLAY.length > 0) return env;
+  let entries: string[];
+  try {
+    entries = readdirSync(socketDir);
+  } catch {
+    entries = [];
+  }
+  const numbers = entries
+    .map((name) => X11_SOCKET_NAME_PATTERN.exec(name)?.[1])
+    .filter((value): value is string => value !== undefined)
+    .map(Number)
+    .filter((value) => Number.isSafeInteger(value) && value >= 0)
+    .sort((a, b) => a - b);
+  const display = numbers.length > 0 ? `:${numbers[0]}` : DEFAULT_X11_DISPLAY;
+  return { ...env, DISPLAY: display };
 }
 
 /**
@@ -187,7 +237,10 @@ export class LinuxRemoteDesktopWorkerHost implements ControlledNodeRemoteDesktop
     if (this.child) return true;
     let child: ChildProcessByStdio<Writable, Readable, null>;
     try {
-      child = spawn(this.workerPath, [], { stdio: ['pipe', 'pipe', 'inherit'] });
+      child = spawn(this.workerPath, [], {
+        stdio: ['pipe', 'pipe', 'inherit'],
+        env: resolveWorkerDisplayEnv(),
+      });
     } catch (err) {
       logger.warn({ err }, 'linux remote desktop worker spawn failed');
       return false;
