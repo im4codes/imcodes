@@ -515,7 +515,7 @@ export function createControlledNodeRuntime(
     ];
   };
   refreshRemoteDesktopCapabilityState();
-  const missingRemoteDesktopWorkerCanRepair = platform === 'win32'
+  const missingRemoteDesktopWorkerCanRepair = (platform === 'win32' || platform === 'linux')
     && arch === 'x64'
     && remoteDesktopFeatureEnabled
     && !remoteDesktopWorkerAvailable;

@@ -791,6 +791,67 @@ describe('controlled node enrollment and runtime', () => {
     runtime.stop();
   });
 
+  it('self-repairs a missing Linux worker even when the main version already matches', async () => {
+    // A Linux node that upgraded to a version whose own self-upgrade.ts did
+    // not yet know how to fetch the worker sidecar (i.e. it upgraded through
+    // the exact release that added this repair) is stuck at a version that
+    // now CAN fetch the sidecar but never gets asked to, because nothing
+    // else changes on that node again. This mirrors the Windows repair test
+    // above; Linux must get the same self-heal, not just the same download
+    // function.
+    const socket = new MockSocket();
+    let now = 10_000;
+    const repairMissingRemoteDesktopWorker = vi.fn(async () => ({
+      ok: true as const,
+      targetVersion: 'current',
+      artifactSha256: 'c'.repeat(64),
+    }));
+    const remoteDesktopWorker = {
+      available: vi.fn(() => false),
+      handle: vi.fn(async () => false),
+      applyAutoUnlockSecret: vi.fn(async () => false),
+      autoUnlockConfigured: vi.fn(async () => false),
+      close: vi.fn(),
+    };
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, {
+      platform: 'linux',
+      arch: 'x64',
+      remoteDesktopWorker,
+      repairMissingRemoteDesktopWorker,
+      now: () => now,
+    });
+    runtime.start();
+    socket.open();
+
+    expect((JSON.parse(socket.sent[0]!).capabilities as string[])).toContain(
+      REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
+    );
+
+    expect(repairMissingRemoteDesktopWorker).not.toHaveBeenCalled();
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await Promise.resolve();
+    expect(repairMissingRemoteDesktopWorker).not.toHaveBeenCalled();
+    now += 10_000;
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(repairMissingRemoteDesktopWorker).toHaveBeenCalledOnce());
+    expect(repairMissingRemoteDesktopWorker).toHaveBeenCalledWith(DAEMON_VERSION);
+    expect(socket.sent.map((raw) => JSON.parse(raw))).toContainEqual({
+      type: DAEMON_MSG.UPGRADING,
+      targetVersion: DAEMON_VERSION,
+      artifactSha256: 'c'.repeat(64),
+    });
+
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await Promise.resolve();
+    expect(repairMissingRemoteDesktopWorker).toHaveBeenCalledOnce();
+    runtime.stop();
+  });
+
   it('backs off a failed missing-worker repair and retries on a later authenticated heartbeat', async () => {
     const socket = new MockSocket();
     let now = 10_000;
