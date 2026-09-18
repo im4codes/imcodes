@@ -1066,6 +1066,32 @@ export function createControlledNodeRuntime(
       .finally(() => { localDaemonsScanInFlight = false; });
   };
   refreshAuthCapabilities();
+
+  // Remote-desktop commands for one session are dispatched strictly in order.
+  // A PREPARE can wait below for a macOS worker to (re)start; its OFFER and
+  // ICE arrive on the same socket a moment later and used to be dispatched
+  // meanwhile, found no live worker and were answered worker_failed -- failing
+  // the browser's attempt -- while the held PREPARE still reached the new
+  // worker afterwards and left it holding a session nobody would ever offer
+  // to. A Mac worker serves one session, so the browser's retry was then
+  // refused by that worker too (measured on node mini-2: every reconnect
+  // within a couple of seconds of a stop took three attempts and ~20 s).
+  // Different sessions stay independent of each other.
+  const remoteDesktopSessionOrder = new Map<string, Promise<void>>();
+  const inRemoteDesktopSessionOrder = (
+    sessionId: string | undefined,
+    task: () => Promise<void>,
+  ): Promise<void> => {
+    if (!sessionId) return task();
+    const previous = remoteDesktopSessionOrder.get(sessionId) ?? Promise.resolve();
+    const run = previous.then(task, task);
+    const tail = run.then(() => undefined, () => undefined);
+    remoteDesktopSessionOrder.set(sessionId, tail);
+    void tail.then(() => {
+      if (remoteDesktopSessionOrder.get(sessionId) === tail) remoteDesktopSessionOrder.delete(sessionId);
+    });
+    return run;
+  };
   const clientOptions: AuthenticatedWebSocketOptions = {
     url: controlledNodeWebSocketUrl(credential.serverUrl, credential.serverId),
     auth: authFrame,
@@ -1323,40 +1349,46 @@ export function createControlledNodeRuntime(
           }
           return;
         }
-        // A macOS worker that idled itself down after nobody used it (see
-        // macosRemoteDesktopEverAvailable above) is no longer kept warm by the
-        // heartbeat poller on purpose. A real PREPARE is real demand arriving
-        // right now, so start it lazily, on this request, instead of forcing
-        // dispatch to answer worker_failed for a worker that would have
-        // started fine a moment later. Best-effort: dispatch below still
-        // answers a bounded terminal frame if this does not bring it up.
-        if ((message as Record<string, unknown>).type === REMOTE_DESKTOP_MSG.PREPARE && remoteDesktopWorkerStartup) {
-          let currentlyAvailable = false;
-          try {
-            currentlyAvailable = remoteDesktopWorker.available();
-          } catch {
-            currentlyAvailable = false;
-          }
-          if (!currentlyAvailable) {
-            try {
-              await remoteDesktopWorkerStartup();
-            } catch (error) {
-              logger.warn({ err: error }, 'remote-desktop worker did not start for an incoming PREPARE');
+        const command: Record<string, unknown> = message;
+        await inRemoteDesktopSessionOrder(
+          typeof command.sessionId === 'string' ? command.sessionId : undefined,
+          async () => {
+            // A macOS worker that idled itself down after nobody used it (see
+            // macosRemoteDesktopEverAvailable above) is no longer kept warm by the
+            // heartbeat poller on purpose. A real PREPARE is real demand arriving
+            // right now, so start it lazily, on this request, instead of forcing
+            // dispatch to answer worker_failed for a worker that would have
+            // started fine a moment later. Best-effort: dispatch below still
+            // answers a bounded terminal frame if this does not bring it up.
+            if (command.type === REMOTE_DESKTOP_MSG.PREPARE && remoteDesktopWorkerStartup) {
+              let currentlyAvailable = false;
+              try {
+                currentlyAvailable = remoteDesktopWorker.available();
+              } catch {
+                currentlyAvailable = false;
+              }
+              if (!currentlyAvailable) {
+                try {
+                  await remoteDesktopWorkerStartup();
+                } catch (error) {
+                  logger.warn({ err: error }, 'remote-desktop worker did not start for an incoming PREPARE');
+                }
+              }
             }
-          }
-        }
-        await dispatchRemoteDesktopCommand({
-          message,
-          enabled: remoteDesktopEnabled,
-          target: remoteDesktopWorker,
-          send: (reply) => {
-            logger.info({
-              type: (reply as { type?: unknown }).type,
-              reason: (reply as { reason?: unknown }).reason,
-            }, 'remote-desktop reply sent');
-            client.send(reply);
+            await dispatchRemoteDesktopCommand({
+              message: command,
+              enabled: remoteDesktopEnabled,
+              target: remoteDesktopWorker,
+              send: (reply) => {
+                logger.info({
+                  type: (reply as { type?: unknown }).type,
+                  reason: (reply as { reason?: unknown }).reason,
+                }, 'remote-desktop reply sent');
+                client.send(reply);
+              },
+            });
           },
-        });
+        );
         return;
       }
       if (message.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST) {

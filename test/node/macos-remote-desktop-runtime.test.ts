@@ -501,6 +501,129 @@ describe('macOS controlled-node remote-desktop runtime', () => {
     runtime.stop();
   });
 
+  it('holds a reconnect\'s offer and ICE behind its PREPARE while the replacement worker starts', async () => {
+    // Live evidence on node mini-2: a reconnect sent within a couple of
+    // seconds of a stop always failed twice before it connected. Its PREPARE
+    // waited here for the replacement worker, while its OFFER and ICE -- sent
+    // by the Server right behind it -- were dispatched meanwhile, found no
+    // live session and were answered worker_failed, which ended the
+    // browser's attempt. The PREPARE then still reached the new worker and
+    // left it holding a session nobody would ever offer to.
+    const sockets: MockSocket[] = [];
+    const createSocket = vi.fn(() => {
+      const socket = new MockSocket();
+      sockets.push(socket);
+      return socket;
+    });
+    let serverOptions: MacosRemoteDesktopIpcServerOptions | null = null;
+    let workerGeneration = 0;
+    let launchAgentStarts = 0;
+    let authenticateReplacement: (() => void) | null = null;
+    const commands: RemoteDesktopDaemonCommand[] = [];
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, createSocket, {
+      platform: 'darwin',
+      arch: 'arm64',
+      macosRemoteDesktopComponentsInstalled: async () => true,
+      macosRemoteDesktopWorker: {
+        resolveVerifiedArtifact: async () => verifiedArtifact(),
+        capturePrivacy: true,
+        resolveUserSession: async () => USER,
+        inspectReadiness: async () => ({
+          screenRecording: true, encoder: true, accessibility: true, clipboard: true, disclosure: true,
+        }),
+        inspectPeerUid: async (_socket: Socket) => USER.uid,
+        verifyPeerCodeIdentity: async (_socket: Socket, expected) => expected,
+        createIpcServer: (options: MacosRemoteDesktopIpcServerOptions) => {
+          serverOptions = options;
+          return {
+            start: async () => {
+              workerGeneration += 1;
+              return {
+                workerGeneration,
+                challenge: 'A'.repeat(43),
+                socketPath: '/private/var/run/imcodes/501/remote-desktop.sock',
+              };
+            },
+            sendCommand: async (command: RemoteDesktopDaemonCommand) => { commands.push(command); },
+            stop: async () => undefined,
+          };
+        },
+        createLaunchAgentSupervisor: (
+          dependencies: MacosRemoteDesktopLaunchAgentSupervisorDependencies,
+        ) => ({
+          start: async () => {
+            launchAgentStarts += 1;
+            dependencies.markAuthorityUnavailable('start');
+            const active = dependencies.beginIpcLaunch();
+            const authenticate = (): void => { serverOptions?.onPeerAuthenticated?.(active); };
+            // The first worker comes up at once; its replacement is still
+            // launching when the reconnect's commands arrive.
+            if (launchAgentStarts === 1) queueMicrotask(authenticate);
+            else authenticateReplacement = authenticate;
+            return {
+              user: USER,
+              workerGeneration: active.workerGeneration,
+              serviceTarget: 'gui/501/cc.imcodes.node.remote-desktop',
+              socketPath: active.socketPath,
+            };
+          },
+          stop: async () => undefined,
+        }),
+      },
+    });
+    runtime.start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    const socket = sockets[0]!;
+    socket.open();
+    await vi.waitFor(() => expect(authCapabilities(socket)).toContain(REMOTE_DESKTOP_SESSION_CAPABILITY));
+
+    // The previous worker is gone and no replacement is up yet.
+    serverOptions!.onDisconnect?.('peer_disconnected');
+
+    const route = {
+      requestId: 'request_12345678',
+      sessionId: 'session_12345678',
+      capability: 'a'.repeat(43),
+    } as const;
+    const prepare = {
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      ...route,
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      routeGeneration: 11,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 3,
+      iceServers: [],
+    } as const;
+    socket.emit('message', JSON.stringify(prepare));
+    socket.emit('message', JSON.stringify({ type: REMOTE_DESKTOP_MSG.OFFER, ...route, sdp: 'v=0' }));
+    socket.emit('message', JSON.stringify({
+      type: REMOTE_DESKTOP_MSG.ICE, ...route, candidate: 'candidate:1 1 udp 1 127.0.0.1 9 typ host', mid: '0',
+    }));
+    await vi.waitFor(() => expect(authenticateReplacement).not.toBeNull());
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const terminals = (): unknown[] => socket.sent
+      .map((frame) => JSON.parse(frame) as { type?: unknown })
+      .filter((frame) => frame.type === REMOTE_DESKTOP_MSG.TERMINAL);
+    expect(terminals()).toEqual([]);
+    expect(commands).toEqual([]);
+
+    authenticateReplacement!();
+    await vi.waitFor(() => expect(commands.map((command) => command.type)).toEqual([
+      REMOTE_DESKTOP_MSG.PREPARE,
+      REMOTE_DESKTOP_MSG.OFFER,
+      REMOTE_DESKTOP_MSG.ICE,
+    ]));
+    expect(terminals()).toEqual([]);
+    runtime.stop();
+  });
+
   it('never claims ready for a machine that has not actually proven itself, even once the store reports it installed', async () => {
     // The fallback above must only ever widen an already-PROVEN machine. A
     // node whose worker has never once actually connected successfully --
