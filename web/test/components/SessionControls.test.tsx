@@ -4,6 +4,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, fireEvent, cleanup, within, waitFor, act } from '@testing-library/preact';
+import { SESSION_SEND_DELIVERY_MODES } from '../../../shared/session-send-delivery.js';
+import { selectQueueDeliveryMode } from '../fixtures/delivery-mode.js';
 import { useRef, useState } from 'preact/hooks';
 import { FILE_TRANSFER_LIMITS } from '../../../shared/transport/file-transfer.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../../shared/hermes-agent.js';
@@ -552,6 +554,8 @@ async function openVoiceComboConfirmation(ws: ReturnType<typeof makeWs>, session
   const dialog = screen.getByText('combo_send_confirm_title').closest('.dialog') as HTMLElement;
   return { attachmentPath, dialog, onSend, voiceSend };
 }
+
+
 
 describe('SessionControls', () => {
 afterEach(() => {
@@ -3842,6 +3846,45 @@ afterEach(() => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
+  it('puts a running Append-mode send straight into the timeline instead of the queue strip', () => {
+    const ws = makeWs();
+    const onSend = vi.fn();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          agentType: 'qwen',
+          state: 'running',
+        })}
+        quickData={makeQuickData() as any}
+        onSend={onSend}
+      />,
+    );
+
+    // Append is the account default -- no toggle needed.
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'steer the running turn';
+    fireEvent.input(input);
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: false });
+
+    const payload = gatherSendCalls(ws)[0];
+    expect(payload).toMatchObject({
+      sessionName: 'qwen-session',
+      text: 'steer the running turn',
+      deliveryMode: SESSION_SEND_DELIVERY_MODES.APPEND,
+    });
+    // Optimistic timeline bubble, keyed by the same id the daemon echoes.
+    expect(onSend).toHaveBeenCalledOnce();
+    expect(onSend.mock.calls[0]![1]).toBe('steer the running turn');
+    expect(onSend.mock.calls[0]![2]).toMatchObject({
+      commandId: payload.commandId,
+      extra: { deliveryMode: SESSION_SEND_DELIVERY_MODES.APPEND },
+    });
+    // ...and no local queue card for it.
+    expect(screen.queryByText('steer the running turn')).toBeNull();
+  });
+
   it('shows a running transport send in the queue instead of injecting a timeline bubble', () => {
     const ws = makeWs();
     const onSend = vi.fn();
@@ -3858,6 +3901,7 @@ afterEach(() => {
       />,
     );
 
+    selectQueueDeliveryMode();
     const input = screen.getByRole('textbox') as HTMLDivElement;
     input.textContent = 'queue this while busy';
     fireEvent.input(input);
@@ -3888,6 +3932,7 @@ afterEach(() => {
       />,
     );
 
+    selectQueueDeliveryMode();
     const input = screen.getByRole('textbox') as HTMLDivElement;
     input.textContent = 'queue from thinking';
     fireEvent.input(input);
@@ -3918,6 +3963,7 @@ afterEach(() => {
       />,
     );
 
+    selectQueueDeliveryMode();
     const input = screen.getByRole('textbox') as HTMLDivElement;
     input.textContent = 'queue after assistant text';
     fireEvent.input(input);
@@ -4046,6 +4092,7 @@ afterEach(() => {
       />,
     );
 
+    selectQueueDeliveryMode();
     const input = screen.getByRole('textbox') as HTMLDivElement;
     input.textContent = 'failed queued send';
     fireEvent.input(input);
@@ -4073,6 +4120,7 @@ afterEach(() => {
       />,
     );
 
+    selectQueueDeliveryMode();
     const input = screen.getByRole('textbox') as HTMLDivElement;
     input.textContent = 'do not disappear';
     fireEvent.input(input);
@@ -4114,6 +4162,7 @@ afterEach(() => {
     );
     expect(screen.getByText('old daemon queued')).toBeDefined();
 
+    selectQueueDeliveryMode();
     const input = screen.getByRole('textbox') as HTMLDivElement;
     input.textContent = 'new local send must stay';
     fireEvent.input(input);
@@ -4152,6 +4201,7 @@ afterEach(() => {
       />,
     );
 
+    selectQueueDeliveryMode();
     const input = screen.getByRole('textbox') as HTMLDivElement;
     input.textContent = 'queued then drained';
     fireEvent.input(input);
@@ -4503,6 +4553,7 @@ afterEach(() => {
       />,
     );
 
+    selectQueueDeliveryMode();
     const input = screen.getByRole('textbox') as HTMLDivElement;
     input.textContent = 'sent while browser was offline';
     fireEvent.input(input);
@@ -4544,6 +4595,7 @@ afterEach(() => {
       />,
     );
 
+    selectQueueDeliveryMode();
     const input = screen.getByRole('textbox') as HTMLDivElement;
     input.textContent = 'new send after empty baseline';
     fireEvent.input(input);
@@ -4569,6 +4621,7 @@ afterEach(() => {
       />,
     );
 
+    selectQueueDeliveryMode();
     const input = screen.getByRole('textbox') as HTMLDivElement;
     input.textContent = 'fast drained local send';
     fireEvent.input(input);
@@ -4607,6 +4660,7 @@ afterEach(() => {
       />,
     );
 
+    selectQueueDeliveryMode();
     const input = screen.getByRole('textbox') as HTMLDivElement;
     input.textContent = 'queued text fallback';
     fireEvent.input(input);
@@ -4647,6 +4701,7 @@ afterEach(() => {
       />,
     );
 
+    selectQueueDeliveryMode();
     const input = screen.getByRole('textbox') as HTMLDivElement;
     input.textContent = 'failed but visible';
     fireEvent.input(input);
@@ -4682,6 +4737,7 @@ afterEach(() => {
       />,
     );
 
+    selectQueueDeliveryMode();
     const input = screen.getByRole('textbox') as HTMLDivElement;
     input.textContent = 'local only';
     fireEvent.input(input);
@@ -5203,6 +5259,7 @@ afterEach(() => {
       />,
     );
 
+    selectQueueDeliveryMode();
     const input = screen.getByRole('textbox') as HTMLDivElement;
     input.textContent = 'append before daemon echo';
     fireEvent.input(input);
@@ -5235,6 +5292,7 @@ afterEach(() => {
       />,
     );
 
+    selectQueueDeliveryMode();
     const input = screen.getByRole('textbox') as HTMLDivElement;
     input.textContent = 'stop must append immediately';
     fireEvent.input(input);
@@ -5271,6 +5329,7 @@ afterEach(() => {
       />,
     );
 
+    selectQueueDeliveryMode();
     const input = screen.getByRole('textbox') as HTMLDivElement;
     input.textContent = 'failed rows must not append';
     fireEvent.input(input);
@@ -6495,6 +6554,7 @@ afterEach(() => {
       />,
     );
 
+    selectQueueDeliveryMode();
     const input = screen.getByRole('textbox') as HTMLDivElement;
     input.textContent = 'delete me from the backend too';
     fireEvent.input(input);

@@ -15,6 +15,7 @@ import { h } from 'preact';
 import { useEffect } from 'preact/hooks';
 import i18next from 'i18next';
 import type { ServerMessage, WsClient } from '../src/ws-client.js';
+import { SESSION_SEND_DELIVERY_MODES } from '../../shared/session-send-delivery.js';
 
 // Mock api.js so tests can control whether the HTTP-send fallback "succeeds"
 // (resolves) or "fails" (rejects). The auto-retry-on-command.failed flow ends
@@ -304,6 +305,97 @@ describe('useTimeline optimistic send flow', () => {
 
     expect(ref.current!.events).toHaveLength(1);
     expect(ref.current!.events[0].type).toBe('session.state');
+  });
+
+  it('keeps an Append-mode bubble in the timeline through queue frames until the daemon appended user.message replaces it', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_append' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('steer this turn', 'cmd-append', {
+        resendExtra: { deliveryMode: SESSION_SEND_DELIVERY_MODES.APPEND },
+      });
+    });
+    act(() => { vi.advanceTimersByTime(20); });
+    const optimisticBubbles = () => ref.current!.events.filter(
+      (event) => event.type === 'user.message' && event.eventId.startsWith('optimistic:'),
+    );
+    expect(optimisticBubbles()).toHaveLength(1);
+
+    // The daemon stages an Append row in its durable queue while it waits for
+    // the provider's next safe boundary, so a queued snapshot DOES list it.
+    // That must not retire the bubble the way it retires a FIFO send.
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'append-queued-state',
+          sessionId: 'deck_opt_append',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 4,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'session.state',
+          payload: {
+            state: 'queued',
+            queueEpoch: 'epoch-append',
+            queueAuthorityId: 'authority-append',
+            pendingMessageVersion: 1,
+            pendingMessageEntries: [{ clientMessageId: 'cmd-append', text: 'steer this turn' }],
+          },
+        },
+      } as unknown as ServerMessage);
+    });
+    act(() => { vi.advanceTimersByTime(20); });
+    expect(optimisticBubbles()).toHaveLength(1);
+
+    // Provider admission finalizes the row (delivery fact) ...
+    act(() => {
+      handlerBox.fn?.({
+        type: 'transport.queue.delivery',
+        sessionName: 'deck_opt_append',
+        clientMessageId: 'cmd-append',
+        queueEpoch: 'epoch-append',
+        queueAuthorityId: 'authority-append',
+        pendingMessageVersion: 2,
+        deliveryFrameId: 'frame-append',
+        deliveryFrameVersion: 2,
+      } as unknown as ServerMessage);
+    });
+    act(() => { vi.advanceTimersByTime(20); });
+    expect(optimisticBubbles()).toHaveLength(1);
+
+    // ... and the daemon's own row for it arrives keyed only by clientMessageId
+    // (command-handler's append path carries no commandId).
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'transport-user:cmd-append',
+          sessionId: 'deck_opt_append',
+          ts: Date.now() + 5_000,
+          epoch: 1,
+          seq: 6,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'user.message',
+          payload: {
+            text: 'steer this turn',
+            clientMessageId: 'cmd-append',
+            allowDuplicate: true,
+            queueAppended: true,
+          },
+        },
+      } as unknown as ServerMessage);
+    });
+    act(() => { vi.advanceTimersByTime(20); });
+
+    const userMessages = ref.current!.events.filter((event) => event.type === 'user.message');
+    expect(userMessages).toHaveLength(1);
+    expect(userMessages[0]!.eventId).toBe('transport-user:cmd-append');
   });
 
   it('routes structured queue snapshots through the shared reducer and ignores pendingCount as authority', () => {

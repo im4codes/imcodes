@@ -4234,8 +4234,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       localFailure = err instanceof Error ? err.message : String(err || 'Send failed');
     }
     if (!localFailure) quickData.recordHistory(payload.delegation?.task ?? payload.text, activeSession.name);
+    // An Append-mode send is headed INTO the running turn, not behind it, so it
+    // belongs in the timeline immediately (optimistic bubble reconciled by the
+    // daemon's user.message for the same id), not in the FIFO card strip.
+    // Parking it as a queue card made it vanish whenever a snapshot/delivery
+    // frame retired the card before the timeline echo arrived.
     const shouldShowAsQueued = effectiveRuntimeType === 'transport'
       && transportSendShouldQueue
+      && !directAppendRequested
       && !isP2pSend
       && !isDelegationSend
       && !payload.text.trim().startsWith('/');

@@ -86,6 +86,7 @@ import {
 import { TIMELINE_HISTORY_CONTENT_TYPES } from '../../../src/shared/timeline/types.js';
 import { fetchTimelineHistoryHttp, sendSessionViaHttp } from '../api.js';
 import { MESSAGE_PIN_LIMITS } from '@shared/message-pins.js';
+import { SESSION_SEND_DELIVERY_MODES } from '@shared/session-send-delivery.js';
 import { runNewestWindowBackfill } from '../timeline/catchup/backfill-pager.js';
 import { buildTransportPendingSyncPatch, normalizeTransportPendingEntries } from '../transport-queue.js';
 
@@ -1026,6 +1027,21 @@ function getUserMessageCommandId(event: TimelineEvent): string | undefined {
 
 function isLocalOptimisticUserMessage(event: TimelineEvent): boolean {
   return event.type === 'user.message' && event.eventId.startsWith(OPTIMISTIC_EVENT_ID_PREFIX);
+}
+
+/**
+ * A local bubble for an Append-mode send. It is steered INTO the running turn,
+ * so its timeline slot is final from the moment it is sent: a queue snapshot
+ * or delivery frame that still lists its id must not retire it (that retire
+ * path exists for FIFO sends, whose card lives in the queue strip instead).
+ * Only the daemon's own user.message for the same id replaces it.
+ */
+function isOptimisticAppendUserMessage(event: TimelineEvent): boolean {
+  if (!isLocalOptimisticUserMessage(event)) return false;
+  const extra = event.payload._resendExtra;
+  return !!extra
+    && typeof extra === 'object'
+    && (extra as { deliveryMode?: unknown }).deliveryMode === SESSION_SEND_DELIVERY_MODES.APPEND;
 }
 
 function isAuthoritativeSendProgressEvent(event: TimelineEvent): boolean {
@@ -2760,6 +2776,7 @@ export function useTimeline(
       let changed = false;
       const next = base.filter((event) => {
         if (!isLocalOptimisticUserMessage(event)) return true;
+        if (isOptimisticAppendUserMessage(event)) return true;
         const commandId = typeof event.payload.commandId === 'string' ? event.payload.commandId : '';
         if (!commandId || !queuedIds.has(commandId)) return true;
         optimisticIdsByCommandRef.current.delete(commandId);
