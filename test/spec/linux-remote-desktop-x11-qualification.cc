@@ -274,6 +274,89 @@ int main() {
     std::printf("EmitText: no held state leaked\n");
   }
 
+  // -- A plain key transition (EmitKey, not EmitText) is fed
+  //    message.keyboard.code -- the browser's physical KeyboardEvent.code
+  //    ("Digit1", "KeyA", "Enter", ...), never a literal character or an X11
+  //    keysym name. Before KeySymForName learned to translate that, EVERY
+  //    plain key transition failed unconditionally: XStringToKeysym only
+  //    knows X11's own keysym names, and the single-character fallback never
+  //    fires for a multi-character code string like "Digit1". EmitKey
+  //    returning false there is not a dropped keystroke -- SessionCore
+  //    treats an adapter failure as unrecoverable and tears the whole
+  //    session down (see session_core.cc's ReportAdapterFailure). This is
+  //    the exact real-world report this fix was written for ("even the
+  //    digit '1' kills the session instantly"), proved against the real
+  //    worker binary's EmitKey and read back from the server's own keyboard
+  //    state, same philosophy as every other section in this file.
+  {
+    auto connection = rd::X11Connection::Open();
+    if (!connection) {
+      std::fprintf(stderr, "X11Connection::Open failed for the EmitKey section\n");
+      XCloseDisplay(display);
+      return 70;
+    }
+    rd::X11InputAdapter input(connection);
+
+    const auto key_down_at_server = [&](KeyCode code) {
+      char keymap[32];
+      XQueryKeymap(display, keymap);
+      return (keymap[code / 8] & (1 << (code % 8))) != 0;
+    };
+
+    const KeyCode digit1 = XKeysymToKeycode(display, XK_1);
+    if (digit1 == 0) {
+      XCloseDisplay(display);
+      return 71;
+    }
+    if (!input.EmitKey("Digit1", true)) {
+      std::fprintf(stderr, "EmitKey(\"Digit1\", down) returned false\n");
+      XCloseDisplay(display);
+      return 72;
+    }
+    XSync(display, False);
+    const bool digit1_seen = key_down_at_server(digit1);
+    if (!input.EmitKey("Digit1", false)) {
+      std::fprintf(stderr, "EmitKey(\"Digit1\", up) returned false\n");
+      XCloseDisplay(display);
+      return 73;
+    }
+    XSync(display, False);
+    if (!digit1_seen) {
+      std::fprintf(stderr, "Digit1 keydown not observed in server keymap\n");
+      XCloseDisplay(display);
+      return 74;
+    }
+    if (key_down_at_server(digit1)) {
+      std::fprintf(stderr, "Digit1 stuck down after EmitKey(..., false)\n");
+      XCloseDisplay(display);
+      return 75;
+    }
+    std::printf("EmitKey \"Digit1\": verified pressed and released at the server\n");
+
+    if (!input.EmitKey("KeyA", true) || !input.EmitKey("KeyA", false)) {
+      std::fprintf(stderr, "EmitKey(\"KeyA\", ...) returned false\n");
+      XCloseDisplay(display);
+      return 77;
+    }
+    std::printf("EmitKey \"KeyA\": ok\n");
+
+    // DOM code "Enter" must map to X11's "Return" -- the two are spelled
+    // differently, so this fails without the named-code translation table.
+    if (!input.EmitKey("Enter", true) || !input.EmitKey("Enter", false)) {
+      std::fprintf(stderr, "EmitKey(\"Enter\", ...) returned false\n");
+      XCloseDisplay(display);
+      return 78;
+    }
+    std::printf("EmitKey \"Enter\": ok\n");
+
+    if (input.held_count() != 0) {
+      std::fprintf(stderr, "EmitKey left %zu key(s) held\n", input.held_count());
+      XCloseDisplay(display);
+      return 79;
+    }
+    std::printf("EmitKey: no held state leaked\n");
+  }
+
   XCloseDisplay(display);
   std::printf("linux x11 fallback qualification: ok\n");
   return 0;
