@@ -30,12 +30,13 @@ vi.mock('../src/api/machines.js', () => ({
 // state, not rendering the tab bar or the panels inside it, so the mock only
 // needs to expose the state it was handed and the callbacks that mutate it.
 vi.mock('../src/components/RemoteDesktopWorkspace.js', () => ({
-  RemoteDesktopWorkspace: ({ state, onOpenHost, onCloseHost, onCloseWorkspace }: {
+  RemoteDesktopWorkspace: ({ state, standalone, onOpenHost, onCloseHost, onCloseWorkspace }: {
     state: { orderedHostKeys: readonly string[]; hosts: Record<string, { machine: { displayName: string } }> };
+    standalone?: boolean;
     onOpenHost(machine: unknown): void;
     onCloseHost(hostKey: string): void;
     onCloseWorkspace(): void;
-  }) => <div data-testid="standalone-desktop">
+  }) => <div data-testid="standalone-desktop" data-standalone={String(standalone === true)}>
     {state.orderedHostKeys.map((key) => state.hosts[key]?.machine.displayName).join(',')}
     <button type="button" onClick={() => onOpenHost({
       serverId: 'desktop-2', refName: 'desktop-2', displayName: 'Desktop Two',
@@ -99,6 +100,9 @@ describe('remote desktop standalone window', () => {
 
     expect(result.getByRole('status').textContent).toBe('controlled_nodes.loading');
     await waitFor(() => expect(result.getByTestId('standalone-desktop').textContent).toContain('Desktop One'));
+    // Its own browser window: the workspace fills it instead of floating a
+    // remembered-size panel inside it.
+    expect(result.getByTestId('standalone-desktop').getAttribute('data-standalone')).toBe('true');
 
     // The "+" the report asked for: adding a second remote desktop into the
     // SAME popped-out window, not just viewing the one it was opened for.

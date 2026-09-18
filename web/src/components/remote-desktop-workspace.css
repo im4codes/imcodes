@@ -35,6 +35,22 @@
   overflow: hidden;
 }
 
+/* A popped-out workspace is its own browser window: fill it edge to edge, the
+   same as the wall's standalone window, rather than floating a remembered
+   1240x800 panel in the corner of it. */
+.remote-desktop-workspace-standalone {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.remote-desktop-workspace-standalone > .remote-desktop-workspace {
+  flex: 1;
+  min-height: 0;
+}
+
 .remote-desktop-wall-header,
 .remote-desktop-workspace-tabbar {
   display: flex;

@@ -152,6 +152,7 @@ export function RemoteDesktopStandalone({
     <RemoteDesktopWorkspace
       state={workspace}
       manager={manager}
+      standalone
       quickData={quickData}
       onOpenHost={(added) => setWorkspace((current) => openRemoteDesktopWorkspaceHost(current, added))}
       onActivateTab={(tabId) => setWorkspace((current) => activateRemoteDesktopWorkspaceTab(current, tabId))}

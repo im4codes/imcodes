@@ -45,6 +45,12 @@ export interface RemoteDesktopWorkspaceProps {
    * tab you cannot get back from.
    */
   allowStandaloneWindow?: boolean;
+  /**
+   * The workspace is its own browser window: fill it edge to edge instead of
+   * floating a remembered-size panel inside it. Mirrors RemoteDesktopWall's
+   * own `standalone`.
+   */
+  standalone?: boolean;
   quickData?: UseQuickDataResult;
 }
 
@@ -64,6 +70,7 @@ export function RemoteDesktopWorkspace({
   onCloseWorkspace,
   wallHostKeys = new Set(),
   allowStandaloneWindow = false,
+  standalone = false,
   quickData,
 }: RemoteDesktopWorkspaceProps) {
   const { t } = useTranslation();
@@ -284,6 +291,10 @@ export function RemoteDesktopWorkspace({
       ))}
     </div>
   );
+
+  if (standalone) {
+    return <div class="remote-desktop-workspace-standalone">{content}</div>;
+  }
 
   return (
     <>

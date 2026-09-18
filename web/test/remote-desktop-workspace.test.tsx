@@ -74,6 +74,7 @@ import { RemoteDesktopWorkspace } from '../src/components/RemoteDesktopWorkspace
 import { __resetMachinesForTests } from '../src/hooks/useMachines.js';
 import {
   REMOTE_DESKTOP_WORKSPACE_MAX_HOSTS,
+  REMOTE_DESKTOP_WORKSPACE_WINDOW_ID,
   createRemoteDesktopWorkspaceState,
   openRemoteDesktopWorkspaceHost,
 } from '../src/remote-desktop-workspace-state.js';
@@ -237,6 +238,36 @@ describe('RemoteDesktopWorkspace', () => {
     const dock = screen.getByRole('button', { name: 'remote_desktop.workspace_restore:2' });
     fireEvent.click(dock);
     expect(restore).toHaveBeenCalledTimes(1);
+  });
+
+  it('fills its own browser window instead of floating a panel when standalone', () => {
+    const state = openRemoteDesktopWorkspaceHost(createRemoteDesktopWorkspaceState(), machine('a'));
+    const { manager } = setupManager();
+    const props = {
+      state,
+      manager,
+      onOpenHost: vi.fn(),
+      onActivateTab: vi.fn(),
+      onCloseHost: vi.fn(),
+      onReorderHost: vi.fn(),
+      onCloseWorkspace: vi.fn(),
+    };
+    const floating = render(<RemoteDesktopWorkspace {...props} />);
+    expect(floating.queryByTestId(REMOTE_DESKTOP_WORKSPACE_WINDOW_ID)).not.toBeNull();
+    expect(floating.container.querySelector('.remote-desktop-workspace-standalone')).toBeNull();
+    floating.unmount();
+
+    const standalone = render(<RemoteDesktopWorkspace {...props} standalone />);
+    expect(standalone.queryByTestId(REMOTE_DESKTOP_WORKSPACE_WINDOW_ID)).toBeNull();
+    const shell = standalone.container.querySelector('.remote-desktop-workspace-standalone');
+    expect(shell?.querySelector(':scope > .remote-desktop-workspace')).not.toBeNull();
+    expect(screen.getByTestId('panel-a')).not.toBeNull();
+    expect(workspaceCss).toMatch(
+      /\.remote-desktop-workspace-standalone\s*\{[^}]*position:\s*fixed;[^}]*inset:\s*0;/,
+    );
+    expect(workspaceCss).toMatch(
+      /\.remote-desktop-workspace-standalone\s*>\s*\.remote-desktop-workspace\s*\{[^}]*flex:\s*1;/,
+    );
   });
 
   it('closes a single-tab workspace without an unnecessary confirmation', () => {
