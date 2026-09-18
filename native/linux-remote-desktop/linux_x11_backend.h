@@ -115,9 +115,27 @@ class X11InputAdapter final : public common::InputAdapter {
   }
 
  private:
+  // A keysym XKeysymToKeycode cannot find in the current layout -- every
+  // CJK/non-Latin character, on a plain US/Xvfb layout -- is remapped onto
+  // one scratch keycode instead. See EmitKey's own .cc comment for why and
+  // EnsureScratchKeycodeFor's own comment for exactly how. Plain
+  // unsigned long in and out (the real X11 KeySym/KeyCode types, respectively)
+  // rather than Xlib's own typedefs, matching this header's existing
+  // X11Connection::display() -- this file stays buildable by anything that
+  // merely consumes the InputAdapter interface, without leaking Xlib's own
+  // headers/macros into it. Resolves its own Display* from connection_
+  // internally (Dpy(), .cc-only), so no X11 type needs to cross this header
+  // at all.
+  [[nodiscard]] unsigned long EnsureScratchKeycodeFor(unsigned long symbol);
+
   std::shared_ptr<X11Connection> connection_;
   std::set<std::uint32_t> held_keys_;
   std::set<std::uint32_t> held_buttons_;
+  // The keysym currently mapped onto that scratch keycode, so a run of the
+  // same non-layout character does not re-remap on every keystroke. NoSymbol
+  // (0) until first used; always a real X11 keysym constant, never a raw
+  // codepoint.
+  unsigned long scratch_mapped_keysym_ = 0;
 };
 
 /** CLIPBOARD selection ownership and retrieval over X11. */

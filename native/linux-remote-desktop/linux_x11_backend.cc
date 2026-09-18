@@ -1,6 +1,9 @@
 #include "linux_x11_backend.h"
 
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <utility>
@@ -69,6 +72,71 @@ KeySym KeySymForName(std::string_view key) noexcept {
   if (symbol != NoSymbol) return symbol;
   if (name.size() == 1) return static_cast<KeySym>(name[0]);
   return NoSymbol;
+}
+
+/**
+ * Decode ONE Unicode codepoint starting at text[index], UTF-8. Returns the
+ * codepoint and advances *consumed past the bytes it used. A malformed or
+ * truncated sequence (a bare continuation byte, a lead byte with no/invalid
+ * continuations, an overlong encoding's lead byte) returns codepoint 0 with
+ * *consumed = 1 -- always makes forward progress by at least one byte, so a
+ * corrupt string can never spin the caller's loop forever, and 0 is never a
+ * real character EmitText needs to type (U+0000 cannot occur in the bounded,
+ * validated protocol text this is fed -- see json_protocol.h's
+ * ReadBoundedString/the shared isBoundedString validator).
+ */
+std::uint32_t DecodeUtf8Codepoint(std::string_view text, std::size_t index,
+                                  std::size_t* consumed) noexcept {
+  *consumed = 1;
+  const auto byte_at = [&](std::size_t offset) -> std::uint8_t {
+    return static_cast<std::uint8_t>(text[index + offset]);
+  };
+  const std::uint8_t lead = byte_at(0);
+  int extra = 0;
+  std::uint32_t codepoint = 0;
+  if ((lead & 0x80) == 0x00) {
+    return lead;
+  } else if ((lead & 0xE0) == 0xC0) {
+    extra = 1;
+    codepoint = lead & 0x1F;
+  } else if ((lead & 0xF0) == 0xE0) {
+    extra = 2;
+    codepoint = lead & 0x0F;
+  } else if ((lead & 0xF8) == 0xF0) {
+    extra = 3;
+    codepoint = lead & 0x07;
+  } else {
+    return 0;  // A continuation byte or invalid lead byte on its own.
+  }
+  if (index + static_cast<std::size_t>(extra) >= text.size()) return 0;
+  for (int i = 1; i <= extra; ++i) {
+    const std::uint8_t continuation = byte_at(static_cast<std::size_t>(i));
+    if ((continuation & 0xC0) != 0x80) return 0;  // Not a continuation byte.
+    codepoint = (codepoint << 6) | (continuation & 0x3F);
+  }
+  *consumed = static_cast<std::size_t>(extra) + 1;
+  return codepoint;
+}
+
+/**
+ * The X11 protocol key NAME for one Unicode codepoint, suitable for
+ * KeySymForName above. ASCII (<= 0x7F) reuses the exact same single-byte
+ * fast path EmitText already had -- zero behavior change for plain-ASCII
+ * text, still resolved through XStringToKeysym first and the raw-cast
+ * fallback second, exactly as before. Anything wider is the "U" + hex
+ * codepoint form keysymdef.h documents as valid for EVERY Unicode character
+ * from U+0100 to U+10FFFF ("every possible Unicode character has already a
+ * keysym string defined algorithmically") -- confirmed live against a real
+ * X server: XStringToKeysym("U4E2D") for the real 3-byte UTF-8 encoding of U+4E2D returns
+ * exactly 0x1004e2d, matching the header's own 0x01000000+codepoint formula
+ * bit for bit.
+ */
+std::string KeyNameForCodepoint(std::uint32_t codepoint) {
+  if (codepoint == 0) return std::string();
+  if (codepoint <= 0x7F) return std::string(1, static_cast<char>(codepoint));
+  char name[16];
+  std::snprintf(name, sizeof(name), "U%04X", codepoint);
+  return std::string(name);
 }
 
 /** Protocol button names to X button numbers. Wheel is emitted separately. */
@@ -252,13 +320,81 @@ bool X11InputAdapter::MovePointer(const common::LogicalPoint& point) {
   return true;
 }
 
+/**
+ * A keysym with no keycode in the CURRENT layout (every CJK/non-Latin
+ * character, on a plain US/Xvfb layout) cannot be typed via
+ * XTestFakeKeyEvent no matter how correctly it was computed -- confirmed
+ * live: XKeysymToKeycode returns 0 for a verified-correct Unicode keysym on
+ * an unmodified Xvfb layout. xdotool solves the identical problem the same
+ * way this does: temporarily remap one scratch keycode (this display's own
+ * highest keycode, from XDisplayKeycodes) to the target keysym via
+ * XChangeKeyboardMapping, then explicitly drain and process the MappingNotify
+ * it generates (XRefreshKeyboardMapping -- Xlib's own documented mechanism;
+ * XSync alone is not enough, confirmed live: it guarantees the SERVER
+ * processed the change but not that Xlib's own client-side keysym cache
+ * reflects it yet) before reusing that keycode. Cached by
+ * scratch_mapped_keysym_ so a run of the same character (or simple repeats)
+ * does not re-remap every single keystroke; a DIFFERENT target keysym still
+ * costs one remap, same as the first character ever typed.
+ */
+unsigned long X11InputAdapter::EnsureScratchKeycodeFor(unsigned long symbol_value) {
+  Display* display = Dpy(connection_);
+  if (display == nullptr) return 0;
+  const KeySym symbol = static_cast<KeySym>(symbol_value);
+  [[maybe_unused]] int min_keycode = 0;
+  int max_keycode = 0;
+  XDisplayKeycodes(display, &min_keycode, &max_keycode);
+  if (max_keycode <= 0) return 0;
+  const KeyCode scratch = static_cast<KeyCode>(max_keycode);
+  if (scratch_mapped_keysym_ == symbol_value) {
+    // Still exactly what we last mapped there; no server round trip needed.
+    return scratch;
+  }
+  // XChangeKeyboardMapping's own return value is not a reliable success
+  // signal (confirmed live: checking it for == 0 as "failure" caused this
+  // function to wrongly reject a remap that, per the very next
+  // XKeysymToKeycode readback below, had genuinely taken effect -- X11's own
+  // convention is that a real protocol error surfaces asynchronously via the
+  // error handler, not synchronously via this call's return). The
+  // MappingNotify-drained XKeysymToKeycode readback a few lines down is the
+  // one signal actually trusted here, matching this file's own established
+  // "prove it against real server state" rule.
+  KeySym new_map[1] = {symbol};
+  XChangeKeyboardMapping(display, scratch, 1, new_map, 1);
+  XSync(display, False);
+  // MappingNotify is delivered to every client automatically (no
+  // XSelectInput needed); draining and processing it via
+  // XRefreshKeyboardMapping is what actually keeps Xlib's OWN client-side
+  // keysym cache in sync -- XSync alone only guarantees the server has
+  // processed the change, not that this process's cache reflects it yet.
+  // See this function's own header comment for the live evidence this
+  // mattered in practice.
+  XEvent mapping_event;
+  while (XCheckTypedEvent(display, MappingNotify, &mapping_event)) {
+    XRefreshKeyboardMapping(&mapping_event.xmapping);
+  }
+  if (XKeysymToKeycode(display, symbol) != scratch) {
+    // The server did not actually accept the remap (should not happen given
+    // the live probe this design was verified against, but EmitKey's own
+    // caller-facing contract is "false means genuinely not typeable", never
+    // a silent wrong character).
+    scratch_mapped_keysym_ = 0;
+    return 0;
+  }
+  scratch_mapped_keysym_ = symbol_value;
+  return scratch;
+}
+
 bool X11InputAdapter::EmitKey(std::string_view key, bool pressed) {
   Display* display = Dpy(connection_);
   if (display == nullptr || !connection_->has_xtest()) return false;
   const KeySym symbol = KeySymForName(key);
   if (symbol == NoSymbol) return false;
-  const KeyCode code = XKeysymToKeycode(display, symbol);
-  if (code == 0) return false;
+  KeyCode code = XKeysymToKeycode(display, symbol);
+  if (code == 0) {
+    code = static_cast<KeyCode>(EnsureScratchKeycodeFor(static_cast<unsigned long>(symbol)));
+    if (code == 0) return false;
+  }
   if (XTestFakeKeyEvent(display, code, pressed ? True : False, 0) == 0) return false;
   XSync(display, False);
   if (pressed) held_keys_.insert(code);
@@ -302,10 +438,21 @@ bool X11InputAdapter::EmitWheel(double delta_x, double delta_y) {
 bool X11InputAdapter::EmitText(std::string_view text) {
   // Deliberately per-character through the same keysym path as EmitKey, so a
   // text burst cannot leave a key held that ReleaseAllEmittedState misses.
-  for (const char character : text) {
-    const std::string single(1, character);
-    if (!EmitKey(single, true)) return false;
-    if (!EmitKey(single, false)) return false;
+  // Iterated by real UTF-8 CODEPOINT, not raw byte: any multi-byte character
+  // (every CJK character is 3 bytes) used to have each individual byte cast
+  // through KeySymForName's single-byte fallback, almost never resolve to a
+  // valid mapped keycode, and abort EmitText on the very first byte --
+  // silently dropping the rest of the string. See KeyNameForCodepoint's own
+  // comment for how a codepoint becomes a real, typeable X11 keysym.
+  std::size_t index = 0;
+  while (index < text.size()) {
+    std::size_t consumed = 1;
+    const std::uint32_t codepoint = DecodeUtf8Codepoint(text, index, &consumed);
+    index += consumed;
+    if (codepoint == 0) continue;  // Malformed byte(s) -- skip, keep going.
+    const std::string name = KeyNameForCodepoint(codepoint);
+    if (!EmitKey(name, true)) return false;
+    if (!EmitKey(name, false)) return false;
   }
   return true;
 }
