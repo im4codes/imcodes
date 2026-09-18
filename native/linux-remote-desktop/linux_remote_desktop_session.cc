@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
+#include <limits>
 #include <utility>
 
 #include "api/audio_codecs/builtin_audio_decoder_factory.h"
@@ -13,6 +14,8 @@
 #include "api/make_ref_counted.h"
 #include "api/set_local_description_observer_interface.h"
 #include "api/set_remote_description_observer_interface.h"
+#include "api/stats/rtc_stats_collector_callback.h"
+#include "api/stats/rtcstats_objects.h"
 #include "api/video_codecs/builtin_video_decoder_factory.h"
 #include "api/video_codecs/builtin_video_encoder_factory.h"
 
@@ -196,6 +199,70 @@ bool LinuxRemoteDesktopSession::Start(const common::RouteAuthority& authority,
 
 bool LinuxRemoteDesktopSession::Tick(common::TransportTime now) {
   return transport_core_.Tick(now);
+}
+
+namespace {
+// Real outbound video RTP bytes, from the peer connection's OWN stats --
+// mirrors Windows' PeerMediaStatsObserver (peer_session.cc) and macOS' own
+// equivalent exactly: sum RTCOutboundRtpStreamStats::bytes_sent across every
+// "video" kind stream. A CapturedFrame reaching Source::PushFrame (see
+// linux_native_video_source.cc) proves the local pipeline works, not that a
+// byte ever left this process -- this is the one signal that proves that.
+class LinuxMediaStatsObserver : public webrtc::RTCStatsCollectorCallback {
+ public:
+  explicit LinuxMediaStatsObserver(
+      std::weak_ptr<LinuxRemoteDesktopSession> session)
+      : session_(std::move(session)) {}
+
+  void OnStatsDelivered(
+      const webrtc::scoped_refptr<const webrtc::RTCStatsReport>& report)
+      override {
+    bool has_outbound_video = false;
+    std::uint64_t outbound_bytes = 0;
+    if (report) {
+      for (const auto* stats :
+           report->GetStatsOfType<webrtc::RTCOutboundRtpStreamStats>()) {
+        if (!stats->kind.has_value() || *stats->kind != "video" ||
+            !stats->bytes_sent.has_value()) {
+          continue;
+        }
+        has_outbound_video = true;
+        const std::uint64_t bytes = *stats->bytes_sent;
+        outbound_bytes =
+            std::numeric_limits<std::uint64_t>::max() - outbound_bytes < bytes
+                ? std::numeric_limits<std::uint64_t>::max()
+                : outbound_bytes + bytes;
+      }
+    }
+    if (auto session = session_.lock()) {
+      session->HandleMediaStats(has_outbound_video, outbound_bytes);
+    }
+  }
+
+ private:
+  const std::weak_ptr<LinuxRemoteDesktopSession> session_;
+};
+}  // namespace
+
+void LinuxRemoteDesktopSession::CheckMediaProgress() {
+  if (closed_ || !peer_ ||
+      peer_->peer_connection_state() !=
+          webrtc::PeerConnectionInterface::PeerConnectionState::kConnected) {
+    return;
+  }
+  if (media_stats_in_flight_) return;
+  media_stats_in_flight_ = true;
+  peer_->GetStats(webrtc::make_ref_counted<LinuxMediaStatsObserver>(
+      weak_from_this()).get());
+}
+
+void LinuxRemoteDesktopSession::HandleMediaStats(
+    bool has_outbound_video, std::uint64_t outbound_bytes) {
+  media_stats_in_flight_ = false;
+  if (closed_ || !has_outbound_video || !video_lease_) return;
+  const std::uint64_t source_frames = video_lease_->captured_frames();
+  (void)transport_core_.RecordMediaProgress(
+      CallbackStamp(), source_frames, outbound_bytes, SampleNow());
 }
 
 void LinuxRemoteDesktopSession::Stop() noexcept {

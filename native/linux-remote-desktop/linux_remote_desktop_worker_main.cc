@@ -221,6 +221,15 @@ class WorkerSession {
     return session_->FramePresented();
   }
 
+  // Kicks off an async GetStats() round trip so common::TransportDiagnostics::
+  // last_outbound_video_bytes (and therefore this tick's own "mediaStarted")
+  // stays current -- see LinuxRemoteDesktopSession::CheckMediaProgress()'s
+  // own comment for why this is required at all. Internally rate-limited via
+  // its own in-flight guard, so unconditionally every PublishStatus tick is
+  // exactly the cadence Windows' worker_main.cc uses for its own
+  // PeerSession::CheckMediaProgress() call.
+  void CheckMediaProgress() { session_->CheckMediaProgress(); }
+
  private:
   imcodes::rd::Authority authority_;
   std::shared_ptr<rd::LinuxRemoteDesktopSession> session_;
@@ -297,6 +306,7 @@ class Worker {
         it = sessions_.erase(it);
         continue;
       }
+      it->second->CheckMediaProgress();
       const common::TransportDiagnostics diagnostics = it->second->diagnostics();
       Json::Value status = imcodes::rd::BaseEnvelope(
           imcodes::rd::kStatusType, it->second->authority());

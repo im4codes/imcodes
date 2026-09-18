@@ -138,6 +138,27 @@ class LinuxRemoteDesktopSession final
     ice_servers_ = std::move(ice_servers);
   }
   bool Tick(common::TransportTime now);
+  // Real outbound video RTP bytes, from the peer connection's OWN stats --
+  // not merely "a frame was pushed into the local WebRTC pipeline" (see
+  // linux_native_video_source.cc's SharedCaptureMultiplexer/Lease, which
+  // proves capture itself works but says nothing about whether a byte ever
+  // left this process). Without this, common::TransportDiagnostics::
+  // last_outbound_video_bytes stays permanently 0 -- mirrors Windows'
+  // PeerSession::CheckMediaProgress/HandleMediaStats and macOS' own
+  // RecordMediaProgress plumbing exactly (see their own worker_main tick
+  // loops), which this Linux session never had at all until now. Rate-limited
+  // internally (a stats round trip is not free); safe to call every
+  // PublishStatus tick.
+  void CheckMediaProgress();
+  // Callback target for LinuxMediaStatsObserver (linux_remote_desktop_session
+  // .cc), a free class (not a member/friend) in that file's anonymous
+  // namespace -- public for the same reason Windows' own
+  // PeerSession::HandleMediaStats() is (peer_session.h): posts back onto the
+  // signaling thread itself if libwebrtc ever delivers off it (it does not
+  // today, but PeerConnection::GetStats' own contract does not promise
+  // otherwise), matching this class's own signaling-thread-confinement rule
+  // (see this file's header comment).
+  void HandleMediaStats(bool has_outbound_video, std::uint64_t outbound_bytes);
   void Stop() noexcept;
 
   // Real, externally-driven signaling (not the loopback qualification's
@@ -313,6 +334,10 @@ class LinuxRemoteDesktopSession final
   // macOS's own presented_layout_revision_ default) until the first valid
   // "frame_presented" control message arrives.
   common::TopologyRevision presented_layout_revision_ = 0;
+  // Guards CheckMediaProgress()'s GetStats() round trip against overlap --
+  // a callback can still be in flight when the next PublishStatus tick asks
+  // again; this keeps at most one outstanding per session.
+  bool media_stats_in_flight_ = false;
   common::TransportSessionCore transport_core_;
   // Declared after the adapters it wraps (adapters_ is a reference to the
   // caller-owned LinuxPlatformAdapters, which must outlive this session
