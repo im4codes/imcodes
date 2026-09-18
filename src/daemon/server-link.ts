@@ -30,6 +30,7 @@ import { SESSION_GROUP_CLONE_CAPABILITY_V1 } from '../../shared/session-group-cl
 import { EXECUTION_CLONE_CAPABILITY_V1 } from '../../shared/execution-clone.js';
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../shared/git-remote-url.js';
 import {
+  TIMELINE_HISTORY_CANCEL_CAPABILITY,
   TIMELINE_MESSAGES,
   TIMELINE_PROTOCOL_CAPABILITY,
   TIMELINE_PROTOCOL_REVISION,
@@ -57,6 +58,7 @@ import {
   stringifyForServerSend,
 } from './latency-tracer.js';
 import { getDaemonBuildInfo } from './build-info.js';
+import { CLOCK_SYNC_FIELD } from '../../shared/clock-sync.js';
 import { daemonRemoteDesktopCapabilities } from './remote-desktop-registry.js';
 import { incrementCounter } from '../util/metrics.js';
 import {
@@ -130,6 +132,22 @@ const DEFAULT_DATA_PLANE_OVERLOAD_RESERVE_ITEMS = 1_024;
 const DEFAULT_DATA_PLANE_WS_HIGH_WATER_BYTES = 8 * 1024 * 1024;
 const DEFAULT_DATA_PLANE_WS_LOW_WATER_BYTES = 2 * 1024 * 1024;
 const DATA_PLANE_DRAIN_RECHECK_MS = 25;
+/**
+ * Uplink congestion, measured as the heartbeat round trip (the server echoes
+ * the heartbeat's send time on its ack, so the delay includes every queue in
+ * the path: this daemon's socket buffer, the kernel, the network, the
+ * server). The 8 MiB/2 MiB watermarks above assume a link that drains
+ * megabytes per second; on a congested intercontinental path (observed
+ * ~8 KB/s) they let minutes of bulk data sit in front of every heartbeat,
+ * command.ack and session.state, so the link looks stale and messages look
+ * unanswered. While congested, keep only a small slice of bulk data in the
+ * socket so control frames reach the wire within seconds.
+ */
+const LINK_CONGESTION_ENTER_DELAY_MS = 3_000;
+const LINK_CONGESTION_EXIT_DELAY_MS = 1_000;
+const CONGESTED_DATA_PLANE_WS_HIGH_WATER_BYTES = 64 * 1024;
+const CONGESTED_DATA_PLANE_WS_LOW_WATER_BYTES = 16 * 1024;
+const MAX_TRACKED_UNACKED_HEARTBEATS = 64;
 const DATA_PLANE_BACKPRESSURE_LOG_INTERVAL_MS = 5_000;
 // Bumped from 30s → 24h. 30s was the same regression: a brief WS hiccup
 // (Wi-Fi handoff, mobile background) silently expired the queued history /
@@ -253,6 +271,7 @@ const DAEMON_STATIC_CAPABILITIES = [
   EXECUTION_CLONE_CAPABILITY_V1,
   GIT_REMOTE_CLONE_CAPABILITY_V1,
   TIMELINE_PROTOCOL_CAPABILITY,
+  TIMELINE_HISTORY_CANCEL_CAPABILITY,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
 ] as const;
@@ -454,6 +473,10 @@ export class ServerLink {
   private timelineDropsWhileLinkDown = 0;
   private lastTimelineDropLogAt = 0;
   private lastPong = 0;               // timestamp of last received message (any message counts as proof of life)
+  /** Send times (Date.now) of heartbeats not yet acked, oldest first. */
+  private unackedHeartbeatSentAts: number[] = [];
+  private lastHeartbeatRoundTripMs: number | null = null;
+  private uplinkCongested = false;
   private seq = 0;
   private readonly workerUrl: string;
   private readonly serverId: string;
@@ -550,6 +573,7 @@ export class ServerLink {
       this.backoffMs = INITIAL_BACKOFF_MS;
       this.dataPlaneSocketBackpressured = false;
       this.dataPlaneOverloadReconnectRequested = false;
+      this.resetLinkCongestion();
       this.lastPong = Date.now();
       this.recordRuntimeLinkStatus({
         state: 'connected',
@@ -705,6 +729,7 @@ export class ServerLink {
           return;
         }
         if (msg?.type === 'heartbeat_ack') {
+          this.observeHeartbeatAck(msg[CLOCK_SYNC_FIELD.SENT_AT], this.lastPong);
           // Heartbeat acks are the CLI/status proof-of-life source. They must
           // not be throttled behind a just-written heartbeat-sent record, or
           // the runtime file can report a false stale link while acks are
@@ -1028,15 +1053,24 @@ export class ServerLink {
   private isDataPlaneSocketBelowWatermark(): boolean {
     if (!this.isLinkSendable()) return false;
     const bufferedAmount = typeof this.ws?.bufferedAmount === 'number' ? this.ws.bufferedAmount : 0;
+    const congested = this.isUplinkCongested();
+    const highWater = congested
+      ? Math.min(dataPlaneWsHighWaterBytes, CONGESTED_DATA_PLANE_WS_HIGH_WATER_BYTES)
+      : dataPlaneWsHighWaterBytes;
+    const lowWater = congested
+      ? Math.min(dataPlaneWsLowWaterBytes, CONGESTED_DATA_PLANE_WS_LOW_WATER_BYTES)
+      : dataPlaneWsLowWaterBytes;
     if (this.dataPlaneSocketBackpressured) {
-      if (bufferedAmount > dataPlaneWsLowWaterBytes) return false;
+      if (bufferedAmount > lowWater) return false;
       this.dataPlaneSocketBackpressured = false;
       incrementCounter('serverlink_data_plane_socket_backpressure_recovered');
       return true;
     }
-    if (bufferedAmount >= dataPlaneWsHighWaterBytes) {
+    if (bufferedAmount >= highWater) {
       this.dataPlaneSocketBackpressured = true;
-      incrementCounter('serverlink_data_plane_socket_backpressure', { reason: 'high_water' });
+      incrementCounter('serverlink_data_plane_socket_backpressure', {
+        reason: congested ? 'congested_high_water' : 'high_water',
+      });
       return false;
     }
     return true;
@@ -1049,6 +1083,85 @@ export class ServerLink {
       this.scheduleDataPlaneFlush();
     }, DATA_PLANE_DRAIN_RECHECK_MS);
     this.dataPlaneDrainTimer.unref?.();
+  }
+
+  private resetLinkCongestion(): void {
+    this.unackedHeartbeatSentAts = [];
+    this.lastHeartbeatRoundTripMs = null;
+    this.uplinkCongested = false;
+  }
+
+  private trackHeartbeatSent(sentAt: number): void {
+    this.unackedHeartbeatSentAts.push(sentAt);
+    if (this.unackedHeartbeatSentAts.length > MAX_TRACKED_UNACKED_HEARTBEATS) {
+      // Keep the OLDEST outstanding send: it is the one that proves how long
+      // the link has been failing to return an ack.
+      this.unackedHeartbeatSentAts.splice(1, 1);
+    }
+  }
+
+  private observeHeartbeatAck(echoedSentAt: unknown, receivedAt: number): void {
+    // Acks from servers that predate the clock echo carry no send time and
+    // cannot be matched; they leave congestion tracking unchanged.
+    if (typeof echoedSentAt !== 'number' || !Number.isFinite(echoedSentAt)) return;
+    this.lastHeartbeatRoundTripMs = Math.max(0, receivedAt - echoedSentAt);
+    this.unackedHeartbeatSentAts = this.unackedHeartbeatSentAts.filter((sentAt) => sentAt > echoedSentAt);
+  }
+
+  /** Current end-to-end link delay: the last measured heartbeat round trip,
+   *  or longer if an outstanding heartbeat has already waited longer. */
+  linkDelayMs(now: number = Date.now()): number {
+    const oldestUnacked = this.unackedHeartbeatSentAts[0];
+    const waiting = oldestUnacked === undefined ? 0 : Math.max(0, now - oldestUnacked);
+    return Math.max(this.lastHeartbeatRoundTripMs ?? 0, waiting);
+  }
+
+  /** True while the uplink is too slow for bulk data to share the socket
+   *  freely with control frames. Hysteresis avoids flapping around one value. */
+  isUplinkCongested(now: number = Date.now()): boolean {
+    const delay = this.linkDelayMs(now);
+    if (this.uplinkCongested) {
+      if (delay <= LINK_CONGESTION_EXIT_DELAY_MS) {
+        this.uplinkCongested = false;
+        incrementCounter('serverlink_uplink_congestion_cleared');
+      }
+    } else if (delay >= LINK_CONGESTION_ENTER_DELAY_MS) {
+      this.uplinkCongested = true;
+      incrementCounter('serverlink_uplink_congestion_entered');
+      logger.warn({ delayMs: delay }, 'ServerLink: uplink congested; limiting bulk data in the socket');
+    }
+    return this.uplinkCongested;
+  }
+
+  /**
+   * Drop queued, not-yet-written data-plane replies for a request the server
+   * has already abandoned (it timed out or its requester went away). Writing
+   * them would spend a congested uplink on bytes the server discards on
+   * arrival. Anything already handed to the socket is past recall.
+   */
+  cancelQueuedDataPlaneRequest(requestId: string): number {
+    if (!requestId || this.dataPlaneSendQueue.length === 0) return 0;
+    const now = performance.now();
+    const live: DataPlaneSendQueueItem[] = [];
+    let cancelled = 0;
+    for (const item of this.dataPlaneSendQueue) {
+      // A fan-out reply (`requestIds`) also serves other requesters; one
+      // requester giving up must not take it away from the rest.
+      const fanout = (item.msg as { requestIds?: unknown } | null)?.requestIds;
+      const servesOthers = Array.isArray(fanout) && fanout.length > 0;
+      if (item.requestId === requestId && !servesOthers) {
+        this.dataPlaneSendQueueBytes = Math.max(0, this.dataPlaneSendQueueBytes - item.estimatedBytes);
+        this.recordDataPlaneSendItemDropped(item, now, 'server_cancelled');
+        cancelled += 1;
+      } else {
+        live.push(item);
+      }
+    }
+    if (cancelled === 0) return 0;
+    this.dataPlaneSendQueue = live;
+    this.dataPlaneQueueStartedAt = this.dataPlaneSendQueue[0]?.enqueuedAt ?? null;
+    incrementCounter('serverlink_data_plane_server_cancelled');
+    return cancelled;
   }
 
   dataPlaneQueueStatsForTests(): { depth: number; bytes: number; socketBackpressured: boolean } {
@@ -1316,7 +1429,14 @@ export class ServerLink {
           this.recycleSilentConnection('heartbeat_silent_connection', silenceMs);
           return;
         }
-        const sent = this.trySend({ type: 'heartbeat', daemonVersion: this.daemonVersion, ...collectSystemStats() });
+        const heartbeatSentAt = Date.now();
+        const sent = this.trySend({
+          type: 'heartbeat',
+          daemonVersion: this.daemonVersion,
+          ...collectSystemStats(),
+          [CLOCK_SYNC_FIELD.SENT_AT]: heartbeatSentAt,
+        });
+        if (sent) this.trackHeartbeatSent(heartbeatSentAt);
         this.recordRuntimeLinkStatus({
           state: sent ? 'connected' : 'disconnected',
           lastHeartbeatSentAt: now,

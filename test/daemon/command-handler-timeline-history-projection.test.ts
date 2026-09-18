@@ -197,6 +197,36 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
     }));
   });
 
+  it('serves a small history page while the server link reports uplink congestion', async () => {
+    shouldUseHistoryWorkerMock.mockReturnValue(true);
+    getSessionMock.mockReturnValue({ name: 'deck_worker', agentType: 'codex' });
+    historyWorkerDispatchMock.mockResolvedValue({
+      events: [], detailCandidates: [], eventsRead: 0, payloadBytes: 2,
+      droppedEvents: 0, truncatedEvents: 0, readMs: 1, sanitizeMs: 0,
+    });
+    const congestedLink = { ...serverLink, isUplinkCongested: vi.fn(() => true) };
+
+    handleWebCommand({
+      type: 'timeline.history_request',
+      sessionName: 'deck_worker',
+      requestId: 'hist-congested',
+      limit: 300,
+      budgetBytes: 1024 * 1024,
+    }, congestedLink as any);
+    await flushAsync();
+
+    expect(historyWorkerDispatchMock).toHaveBeenCalledWith(
+      expect.objectContaining({ maxResponseBytes: 64 * 1024 }),
+      expect.anything(),
+    );
+  });
+
+  it('routes a server history cancel to the link so an unsent reply is dropped', () => {
+    const cancelLink = { ...serverLink, cancelQueuedDataPlaneRequest: vi.fn(() => 1) };
+    handleWebCommand({ type: TIMELINE_MESSAGES.HISTORY_CANCEL, requestId: 'hist-abandoned' }, cancelLink as any);
+    expect(cancelLink.cancelQueuedDataPlaneRequest).toHaveBeenCalledWith('hist-abandoned');
+  });
+
   it('uses the full page/detail budget for timeline.history even without an explicit larger budget', async () => {
     shouldUseHistoryWorkerMock.mockReturnValue(true);
     getSessionMock.mockReturnValue({ name: 'deck_worker', agentType: 'codex' });

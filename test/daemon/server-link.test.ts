@@ -37,6 +37,7 @@ import { TIMELINE_MESSAGES, TIMELINE_PROTOCOL_CAPABILITY } from '../../shared/ti
 import { TRANSPORT_EVENT } from '../../shared/transport-events.js';
 import { FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY } from '../../shared/transport/file-transfer.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import { CLOCK_SYNC_FIELD } from '../../shared/clock-sync.js';
 import {
   DIRECT_FILE_TRANSFER_DIRECTORY_UPLOAD_CAPABILITY,
   DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES,
@@ -533,6 +534,100 @@ describe('ServerLink', () => {
       .filter((message) => message.type !== 'command.ack');
     expect(sentData.map((message) => message.requestId)).toEqual(['ls-1', 'git-2']);
     expect(link.dataPlaneQueueStatsForTests()).toMatchObject({ depth: 0, bytes: 0, socketBackpressured: false });
+  });
+
+  it('stamps heartbeats with a send time and limits bulk socket backlog while the uplink round trip is congested', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(100_000);
+    link.connect();
+    const openHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'open')?.[1] as
+      | (() => void)
+      | undefined;
+    const messageHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'message')?.[1] as
+      | ((event: MessageEvent) => void)
+      | undefined;
+    openHandler?.();
+    mockWsInstance.send.mockClear();
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    const heartbeat = mockWsInstance.send.mock.calls
+      .map(([raw]) => JSON.parse(String(raw)) as Record<string, unknown>)
+      .find((message) => message.type === 'heartbeat');
+    expect(heartbeat?.[CLOCK_SYNC_FIELD.SENT_AT]).toEqual(expect.any(Number));
+    expect(link.isUplinkCongested()).toBe(false);
+
+    // A 100 KiB socket backlog is nothing for the default 8 MiB high-water...
+    mockWsInstance.bufferedAmount = 100 * 1024;
+    // ...but the server's ack shows the round trip took 4s: congested.
+    messageHandler?.({
+      data: JSON.stringify({ type: 'heartbeat_ack', [CLOCK_SYNC_FIELD.SENT_AT]: Date.now() - 4_000 }),
+    } as MessageEvent);
+    expect(link.isUplinkCongested()).toBe(true);
+
+    mockWsInstance.send.mockClear();
+    link.send({ type: 'fs.ls_response', requestId: 'bulk-while-congested', path: '/a', status: 'ok', entries: [] });
+    await vi.advanceTimersByTimeAsync(50);
+    expect(mockWsInstance.send).not.toHaveBeenCalled();
+    expect(link.dataPlaneQueueStatsForTests()).toMatchObject({ depth: 1, socketBackpressured: true });
+
+    // Control frames still go straight out.
+    link.send({ type: 'command.ack', commandId: 'ack-while-congested' });
+    expect(JSON.parse(String(mockWsInstance.send.mock.calls[0]![0]))).toMatchObject({ type: 'command.ack' });
+
+    // A fast round trip clears congestion and the held bulk reply drains.
+    messageHandler?.({
+      data: JSON.stringify({ type: 'heartbeat_ack', [CLOCK_SYNC_FIELD.SENT_AT]: Date.now() - 200 }),
+    } as MessageEvent);
+    mockWsInstance.bufferedAmount = 16 * 1024;
+    await vi.advanceTimersByTimeAsync(50);
+    expect(link.isUplinkCongested()).toBe(false);
+    const drained = mockWsInstance.send.mock.calls
+      .map(([raw]) => JSON.parse(String(raw)) as Record<string, unknown>)
+      .filter((message) => message.type === 'fs.ls_response');
+    expect(drained.map((message) => message.requestId)).toEqual(['bulk-while-congested']);
+    mockWsInstance.bufferedAmount = 0;
+  });
+
+  it('counts an unacked heartbeat that has waited long enough as congestion', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(200_000);
+    link.connect();
+    const openHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'open')?.[1] as
+      | (() => void)
+      | undefined;
+    openHandler?.();
+    await vi.advanceTimersByTimeAsync(5_000); // heartbeat sent, never acked
+    expect(link.isUplinkCongested()).toBe(false);
+    vi.setSystemTime(Date.now() + 3_500);
+    expect(link.isUplinkCongested()).toBe(true);
+  });
+
+  it('drops only the cancelled request\'s queued reply and keeps fan-out replies for other requesters', async () => {
+    __setServerLinkDataPlaneQueueConfigForTests({
+      maxBytes: 1024 * 1024,
+      wsHighWaterBytes: 1024,
+      wsLowWaterBytes: 256,
+      staleMs: 60_000,
+    });
+    mockWsInstance.bufferedAmount = 2048;
+    link.connect();
+    link.send({ type: TIMELINE_MESSAGES.HISTORY, requestId: 'req-a', sessionName: 's', events: [] });
+    link.send({ type: TIMELINE_MESSAGES.HISTORY, requestId: 'req-b', sessionName: 's', events: [] });
+    link.send({ type: 'fs.read_response', requestId: 'req-a', requestIds: ['req-a', 'req-c'], status: 'ok' });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(link.dataPlaneQueueStatsForTests().depth).toBe(3);
+
+    expect(link.cancelQueuedDataPlaneRequest('req-a')).toBe(1);
+    expect(link.cancelQueuedDataPlaneRequest('req-unknown')).toBe(0);
+
+    mockWsInstance.bufferedAmount = 0;
+    await new Promise<void>((resolve) => setTimeout(resolve, 35));
+    for (let i = 0; i < 4; i += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+    const sent = mockWsInstance.send.mock.calls.map(([raw]) => JSON.parse(String(raw)) as Record<string, unknown>);
+    expect(sent.map((message) => `${message.type}:${message.requestId}`)).toEqual([
+      `${TIMELINE_MESSAGES.HISTORY}:req-b`,
+      'fs.read_response:req-a',
+    ]);
   });
 
   it('keeps a mixed one-megabyte flood under the configured retained-byte ceiling', () => {

@@ -199,6 +199,37 @@ const cacheListeners = new Map<string, Set<(events: TimelineEvent[]) => void>>()
 //      idle/responding poll rate.
 const lastHttpBackfillResponseAt = new Map<string, number>();
 const MOUNT_BACKFILL_COOLDOWN_MS = 60_000;
+/**
+ * Background (non-visible) HTTP backfills share one gate per cacheKey across
+ * every hook mount of the session (main pane, sub-session card, window...).
+ * On a slow daemon uplink each backfill is a large reply that takes longer
+ * than its own timeout to arrive; without this gate every trigger (terminal
+ * tail reconcile, optimistic-send catch-up, watchdog) fired another one on
+ * top, the replies queued behind each other on the daemon's link, and
+ * heartbeats/acks queued behind them -- the link looked stale and messages
+ * looked unanswered. Only user-visible refreshes (manual ↻, visible
+ * recovery) bypass it.
+ */
+const BACKGROUND_BACKFILL_FAILURE_BACKOFF_BASE_MS = 5_000;
+const BACKGROUND_BACKFILL_FAILURE_BACKOFF_MAX_MS = 60_000;
+const backgroundBackfillGateByCacheKey = new Map<string, { inFlight: number; failureStreak: number; nextAllowedAt: number }>();
+/** A (re)connect is new evidence the link works again: let the next
+ *  background catch-up run instead of waiting out a failure backoff. */
+function liftBackgroundBackfillBackoff(cacheKey: string | null | undefined): void {
+  if (!cacheKey) return;
+  const gate = backgroundBackfillGateByCacheKey.get(cacheKey);
+  if (!gate) return;
+  gate.failureStreak = 0;
+  gate.nextAllowedAt = 0;
+}
+function backgroundBackfillGate(cacheKey: string) {
+  let gate = backgroundBackfillGateByCacheKey.get(cacheKey);
+  if (!gate) {
+    gate = { inFlight: 0, failureStreak: 0, nextAllowedAt: 0 };
+    backgroundBackfillGateByCacheKey.set(cacheKey, gate);
+  }
+  return gate;
+}
 /** Scenario-based HTTP timeout for catch-up backfills. The keystone weak-network
  *  fix was lifting the 2.5s default (which aborted before a slow daemon could
  *  answer on a weak link). But a flat 10s also wastes the everyday silent path's
@@ -307,6 +338,12 @@ function resetBackfillCooldowns(): void {
   lastHttpBackfillResponseAt.clear();
   // A genuine resume should let the watchdog probe immediately again.
   watchdogStateByCacheKey.clear();
+  // ...and lift any background failure backoff, but keep in-flight counts:
+  // those requests are still running and must still gate duplicates.
+  for (const gate of backgroundBackfillGateByCacheKey.values()) {
+    gate.failureStreak = 0;
+    gate.nextAllowedAt = 0;
+  }
 }
 
 /** Diagnostic logging for the backfill chain. Off by default; flip
@@ -1346,6 +1383,7 @@ export function __resetTimelineCacheForTests(): void {
   cacheListeners.clear();
   lastHttpBackfillResponseAt.clear();
   watchdogStateByCacheKey.clear();
+  backgroundBackfillGateByCacheKey.clear();
 }
 
 export function __resetBackfillCooldownsForTests(): void {
@@ -3542,6 +3580,22 @@ export function useTimeline(
       // aren't re-downloaded. Manual ↻ is different: it intentionally asks for
       // the daemon's latest 300-event window with no lower timestamp bound, so
       // a newly-pushed event cannot mask the missing middle history below it.
+      // Bounded internal continuations (legacy null-retry, chained cap_hit
+      // rounds) keep their own timing; only fresh background triggers are
+      // gated.
+      const gatedBackground = !visible && !!backfillCacheKey && retryAttempt === 0 && roundsChained === 0;
+      const gate = backfillCacheKey ? backgroundBackfillGate(backfillCacheKey) : null;
+      if (gatedBackground && gate) {
+        if (gate.inFlight > 0) {
+          backfillDebug('fireHttpBackfill: background skip, backfill in flight', { sessionId: backfillSessionId, mode });
+          return;
+        }
+        if (Date.now() < gate.nextAllowedAt) {
+          backfillDebug('fireHttpBackfill: background skip, failure backoff', { sessionId: backfillSessionId, mode, nextAllowedAt: gate.nextAllowedAt });
+          return;
+        }
+      }
+      if (gate) gate.inFlight += 1;
       const afterTs = mode === 'manualLatestWindow' ? undefined : getTimelineHistoryAfterTs(eventsRef.current);
       const maxPages = mode === 'manualLatestWindow' ? 1 : undefined;
       backfillDebug('fireHttpBackfill: requesting', { sessionId: backfillSessionId, phase, mode, afterTs, retryAttempt });
@@ -3657,6 +3711,19 @@ export function useTimeline(
           /* opportunistic — WS path is primary */
         }
         finally {
+          if (gate) {
+            gate.inFlight = Math.max(0, gate.inFlight - 1);
+            if (terminal === 'error' || terminal === 'transient_null') {
+              gate.failureStreak += 1;
+              gate.nextAllowedAt = Date.now() + Math.min(
+                BACKGROUND_BACKFILL_FAILURE_BACKOFF_BASE_MS * 2 ** (gate.failureStreak - 1),
+                BACKGROUND_BACKFILL_FAILURE_BACKOFF_MAX_MS,
+              );
+            } else if (terminal !== null) {
+              gate.failureStreak = 0;
+              gate.nextAllowedAt = 0;
+            }
+          }
           if (visible) {
             httpBackfillInFlightRef.current[mode] = Math.max(0, httpBackfillInFlightRef.current[mode] - 1);
             updateHistoryStep('http', terminal === 'caught_up' ? 'done' : 'pending', phase);
@@ -4365,6 +4432,7 @@ export function useTimeline(
 
       // ── Reconnect: daemon restarted → epoch changed, replay is useless. Request only new events. ──
       if (msg.type === DAEMON_MSG.RECONNECTED) {
+        liftBackgroundBackfillBackoff(cacheKeyRef.current);
         // Only the active card's hook should refresh from daemon — N
         // SubSessionCards mounted in the bar would otherwise herd the daemon
         // with N concurrent timeline.history_request RPCs on every daemon
@@ -4435,6 +4503,7 @@ export function useTimeline(
           dispatchActiveTimelineRefresh();
           return;
         }
+        liftBackgroundBackfillBackoff(cacheKeyRef.current);
         // Same gate as the DAEMON_MSG.RECONNECTED path — restrict the
         // browser-WS reconnect refresh to the active card's hook so we
         // don't herd the daemon with N timeline.history_request +

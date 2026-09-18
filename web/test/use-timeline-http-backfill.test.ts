@@ -55,6 +55,60 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     vi.restoreAllMocks();
   });
 
+  it('runs one background backfill at a time per session and backs off after a failed one', async () => {
+    const sessionName = `deck_bg_gate_${Date.now()}`;
+    const serverId = `srv-bg-gate-${Date.now()}`;
+    const firstFetch = deferred<unknown>();
+    fetchSpy.mockImplementationOnce(() => firstFetch.promise);
+    fetchSpy.mockResolvedValue({ events: [] });
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineReplayRequest: vi.fn(() => 'replay-gate'),
+      sendTimelineHistoryRequest: vi.fn(() => 'history-gate'),
+    } as unknown as WsClient;
+    const hook: { current: ReturnType<typeof useTimeline> | null } = { current: null };
+    function Probe() {
+      hook.current = useTimeline(sessionName, ws, serverId);
+      return h('div', null, 'mounted');
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe));
+    // Mount fires the first background backfill; its reply is slow (the
+    // weak-uplink shape): it stays in flight.
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    // Optimistic sends each schedule a background catch-up. With one already
+    // in flight they must not stack another request on the slow link.
+    await act(async () => {
+      hook.current!.addOptimisticUserMessage('first', 'cmd-gate-1');
+      await vi.advanceTimersByTimeAsync(1_500);
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    // The slow request finally fails: background triggers back off.
+    await act(async () => {
+      firstFetch.reject(new Error('timeout'));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await act(async () => {
+      hook.current!.addOptimisticUserMessage('second', 'cmd-gate-2');
+      await vi.advanceTimersByTimeAsync(1_500);
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    // After the backoff window the next background trigger runs again.
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+    await act(async () => {
+      hook.current!.addOptimisticUserMessage('third', 'cmd-gate-3');
+      await vi.advanceTimersByTimeAsync(1_500);
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
   it('manual force refresh pulls the daemon latest window without afterTs so a pushed latest event cannot hide middle history', async () => {
     const sessionName = `deck_manual_middle_gap_${Date.now()}`;
     const serverId = `srv-manual-middle-${Date.now()}`;

@@ -1776,6 +1776,9 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case TIMELINE_MESSAGES.PAGE_REQUEST:
       void traceCommandAsync(cmd, 'web_command.timeline_page', () => handleTimelineHistory(cmd, serverLink));
       break;
+    case TIMELINE_MESSAGES.HISTORY_CANCEL:
+      if (typeof cmd.requestId === 'string') serverLink.cancelQueuedDataPlaneRequest(cmd.requestId);
+      break;
     case TIMELINE_MESSAGES.DETAIL_REQUEST:
       traceSync('web_command.timeline_detail', {
         sessionName: typeof cmd.sessionName === 'string' ? cmd.sessionName : undefined,
@@ -5784,6 +5787,10 @@ function timelineHistoryResponseTypeForRequest(cmd: Record<string, unknown>): ty
   return cmd.type === TIMELINE_MESSAGES.PAGE_REQUEST ? TIMELINE_MESSAGES.PAGE : TIMELINE_MESSAGES.HISTORY;
 }
 
+/** Per-reply ceiling for timeline history/page responses while the server
+ *  link reports uplink congestion (see ServerLink.isUplinkCongested). */
+const CONGESTED_TIMELINE_RESPONSE_BUDGET_BYTES = 64 * 1024;
+
 function resolveTimelineHistoryBudgetBytes(cmd: Record<string, unknown>): number {
   const requested = optionalFiniteNumber(cmd.budgetBytes);
   const cap = TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL;
@@ -6526,7 +6533,13 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
     : undefined;
   const afterTs = optionalFiniteNumber(cmd.afterTs) ?? optionalFiniteNumber(cursor?.afterTs);
   const beforeTs = optionalFiniteNumber(cmd.beforeTs) ?? optionalFiniteNumber(cursor?.beforeTs);
-  const maxResponseBytes = resolveTimelineHistoryBudgetBytes(cmd);
+  // On a congested uplink one full-budget reply (up to 1 MiB) occupies the
+  // socket for minutes and every heartbeat/ack/session.state queues behind
+  // it. Serve a smaller page instead; the response already reports
+  // hasMore/droppedEvents, so the client pages for the rest.
+  const maxResponseBytes = serverLink.isUplinkCongested?.()
+    ? Math.min(resolveTimelineHistoryBudgetBytes(cmd), CONGESTED_TIMELINE_RESPONSE_BUDGET_BYTES)
+    : resolveTimelineHistoryBudgetBytes(cmd);
 
   if (!sessionName) {
     logger.warn({ requestId }, 'timeline.history_request: missing sessionName');

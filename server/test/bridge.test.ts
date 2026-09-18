@@ -30,6 +30,7 @@ import { REPO_MSG } from '../../shared/repo-types.js';
 import { FS_TRANSPORT_MSG } from '../../shared/fs-transport-messages.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 import {
+  TIMELINE_HISTORY_CANCEL_CAPABILITY,
   TIMELINE_MESSAGES,
   TIMELINE_PROTOCOL_CAPABILITY,
   TIMELINE_PROTOCOL_REVISION,
@@ -1760,6 +1761,66 @@ describe('WsBridge', () => {
         source: 'auto',
       });
       expect.soft(nextAuto.deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+    });
+
+    it('tells a cancel-capable daemon to drop the reply when an HTTP history request times out', async () => {
+      vi.useFakeTimers();
+      try {
+        const bridge = WsBridge.get(serverId);
+        const daemonWs = new MockWs();
+        bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+        daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token' }));
+        await vi.advanceTimersByTimeAsync(0);
+        daemonWs.emit('message', JSON.stringify({
+          type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+          daemonId: serverId,
+          capabilities: [TIMELINE_HISTORY_CANCEL_CAPABILITY],
+          helloEpoch: 1,
+          sentAt: Date.now(),
+        }));
+        await vi.advanceTimersByTimeAsync(0);
+
+        const pending = bridge.requestTimelineHistory({ sessionName: 'deck_slow_uplink', timeoutMs: 1_000 });
+        const rejected = expect(pending).rejects.toThrow('timeout');
+        const outbound = daemonWs.sentStrings.find((raw) => raw.includes(`"type":"${TIMELINE_MESSAGES.HISTORY_REQUEST}"`));
+        const requestId = JSON.parse(outbound!).requestId as string;
+
+        await vi.advanceTimersByTimeAsync(1_001);
+        await rejected;
+        const cancels = daemonWs.sentStrings
+          .map((raw) => { try { return JSON.parse(raw) as Record<string, unknown>; } catch { return null; } })
+          .filter((msg) => msg?.type === TIMELINE_MESSAGES.HISTORY_CANCEL);
+        expect(cancels).toEqual([{ type: TIMELINE_MESSAGES.HISTORY_CANCEL, requestId }]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('never sends a history cancel to a daemon that does not advertise support', async () => {
+      vi.useFakeTimers();
+      try {
+        const bridge = WsBridge.get(serverId);
+        const daemonWs = new MockWs();
+        bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+        daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token' }));
+        await vi.advanceTimersByTimeAsync(0);
+        daemonWs.emit('message', JSON.stringify({
+          type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+          daemonId: serverId,
+          capabilities: [],
+          helloEpoch: 1,
+          sentAt: Date.now(),
+        }));
+        await vi.advanceTimersByTimeAsync(0);
+
+        const pending = bridge.requestTimelineHistory({ sessionName: 'deck_old_daemon', timeoutMs: 1_000 });
+        const rejected = expect(pending).rejects.toThrow('timeout');
+        await vi.advanceTimersByTimeAsync(1_001);
+        await rejected;
+        expect(daemonWs.sentStrings.some((raw) => raw.includes(TIMELINE_MESSAGES.HISTORY_CANCEL))).toBe(false);
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('does not let an error from a replaced socket reject current-generation requests', async () => {

@@ -395,6 +395,7 @@ import { p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../../.
 import { isP2pSavedConfig, type P2pSavedConfig } from '../../../shared/p2p-modes.js';
 import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
 import {
+  TIMELINE_HISTORY_CANCEL_CAPABILITY,
   TIMELINE_MESSAGES,
   TIMELINE_PROTOCOL_CAPABILITY,
   TIMELINE_RESPONSE_SOURCES,
@@ -3304,9 +3305,27 @@ export class WsBridge {
       clearTimeout(previous.timer);
       logger.warn({ requestId, serverId: this.serverId, type: msg.type }, 'WsBridge: duplicate timeline request id replaced');
     }
-    const timer = setTimeout(() => this.pendingTimelineRequests.delete(requestId), TIMELINE_PENDING_UNICAST_TIMEOUT_MS);
+    const timer = setTimeout(() => {
+      this.pendingTimelineRequests.delete(requestId);
+      this.cancelDaemonTimelineRequest(requestId);
+    }, TIMELINE_PENDING_UNICAST_TIMEOUT_MS);
     timer.unref?.();
     this.pendingTimelineRequests.set(requestId, { socket: ws, timer });
+  }
+
+  /**
+   * Tell the daemon nobody is waiting for this timeline reply any more, so it
+   * can drop it if still queued unsent. On a slow daemon uplink those replies
+   * otherwise keep occupying the link long after we would discard them
+   * ("timeline response missing pending request - dropped"). Best effort;
+   * daemons that do not advertise the capability are never sent the frame.
+   */
+  private cancelDaemonTimelineRequest(requestId: string): void {
+    if (!this.isDaemonConnected() || !this.hasDaemonCapability(TIMELINE_HISTORY_CANCEL_CAPABILITY)) return;
+    try {
+      this.daemonWs!.send(JSON.stringify({ type: TIMELINE_MESSAGES.HISTORY_CANCEL, requestId }));
+      incrementCounter('ws_bridge_timeline_request_cancelled');
+    } catch { /* daemon socket closing; nothing to cancel against */ }
   }
 
   private sendTimelineRequestError(
@@ -8078,6 +8097,7 @@ export class WsBridge {
       if (pending.socket === ws) {
         clearTimeout(pending.timer);
         this.pendingTimelineRequests.delete(reqId);
+        this.cancelDaemonTimelineRequest(reqId);
       }
     }
     for (const [reqId, pending] of this.pendingMemoryManagementRequests) {
@@ -9728,6 +9748,7 @@ export class WsBridge {
       const timer = setTimeout(() => {
         const current = this.pendingHttpTimelineRequests.get(requestId) ?? pending;
         this.settlePendingHttpTimelineRequest(requestId, current, () => reject(new Error('timeout')));
+        this.cancelDaemonTimelineRequest(requestId);
       }, timeoutMs);
       timer.unref?.();
 
@@ -9739,6 +9760,7 @@ export class WsBridge {
             route: 'http_request',
           });
           this.settlePendingHttpTimelineRequest(requestId, pending, () => reject(new Error(TIMELINE_REQUEST_ERROR_REASONS.REQUEST_CANCELED)));
+          this.cancelDaemonTimelineRequest(requestId);
         };
         params.abortSignal.addEventListener('abort', pending.abortHandler, { once: true });
       }
