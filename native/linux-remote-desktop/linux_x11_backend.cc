@@ -61,16 +61,129 @@ class XImageStorage final : public common::FrameStorage {
 };
 
 /**
+ * The browser's physical KeyboardEvent.code ("Digit1", "KeyA", "Enter", ...)
+ * for one named/punctuation/modifier/navigation key, translated to the X11
+ * keysym NAME string XStringToKeysym expects. Mirrors cg_event_input_adapter
+ * .mm's kNamedKeys table on macOS entry-for-entry (same DOM code coverage) --
+ * that file maps the same input straight to a native CGKeyCode; this one
+ * maps it to an X11 keysym name instead and lets the existing
+ * XStringToKeysym/EnsureScratchKeycodeFor machinery below resolve the actual
+ * keycode, since an X11 keysym (not a raw keycode) is the layout-portable
+ * abstraction here. A handful of entries (Delete, End, Escape, Home, Insert,
+ * Tab) already equal their own X11 name and so are already handled by the
+ * plain XStringToKeysym try in KeySymForName below before this table is even
+ * consulted -- included anyway so this is a complete, directly auditable
+ * port of the macOS list, not a subset that silently drifts from it.
+ *
+ * A linear scan over 42 entries on a human keypress is not a hot path; kept
+ * as plain data rather than a sorted/binary-searched table (or a
+ * function-local static std::map, which macOS's own comment explains is an
+ * exit-time-destructor hazard) purely to keep this diff small and obviously
+ * correct.
+ */
+const char* NamedCodeKeysymName(std::string_view code) noexcept {
+  static constexpr std::pair<std::string_view, const char*> kNamedKeys[] = {
+      {"AltLeft", "Alt_L"},
+      {"AltRight", "Alt_R"},
+      {"ArrowDown", "Down"},
+      {"ArrowLeft", "Left"},
+      {"ArrowRight", "Right"},
+      {"ArrowUp", "Up"},
+      {"Backquote", "grave"},
+      {"Backslash", "backslash"},
+      {"Backspace", "BackSpace"},
+      {"BracketLeft", "bracketleft"},
+      {"BracketRight", "bracketright"},
+      {"CapsLock", "Caps_Lock"},
+      {"Comma", "comma"},
+      {"ControlLeft", "Control_L"},
+      {"ControlRight", "Control_R"},
+      {"Delete", "Delete"},
+      {"End", "End"},
+      {"Enter", "Return"},
+      {"Equal", "equal"},
+      {"Escape", "Escape"},
+      {"Home", "Home"},
+      {"Insert", "Insert"},
+      {"MetaLeft", "Super_L"},
+      {"MetaRight", "Super_R"},
+      {"Minus", "minus"},
+      {"NumLock", "Num_Lock"},
+      {"NumpadAdd", "KP_Add"},
+      {"NumpadDecimal", "KP_Decimal"},
+      {"NumpadDivide", "KP_Divide"},
+      {"NumpadEnter", "KP_Enter"},
+      {"NumpadMultiply", "KP_Multiply"},
+      {"NumpadSubtract", "KP_Subtract"},
+      {"PageDown", "Next"},
+      {"PageUp", "Prior"},
+      {"Period", "period"},
+      {"Quote", "apostrophe"},
+      {"Semicolon", "semicolon"},
+      {"ShiftLeft", "Shift_L"},
+      {"ShiftRight", "Shift_R"},
+      {"Slash", "slash"},
+      {"Space", "space"},
+      {"Tab", "Tab"},
+  };
+  for (const auto& entry : kNamedKeys) {
+    if (entry.first == code) return entry.second;
+  }
+  return nullptr;
+}
+
+/**
  * Map a protocol key name to an X keysym.
  *
  * Named keys go through XStringToKeysym; a single character falls back to its
- * literal keysym so ordinary typing works without a lookup table.
+ * literal keysym so EmitText's ASCII fast path works without a lookup table.
+ *
+ * EmitKey's caller (HandleDataChannelMessage, linux_remote_desktop_session.cc)
+ * feeds this function message.keyboard.code -- the browser's physical
+ * KeyboardEvent.code, e.g. "Digit1"/"KeyA"/"Enter" -- not .key, exactly like
+ * the macOS adapter's own EmitKey call does (see cg_event_input_adapter.mm).
+ * A physical key TRANSITION should mean the same physical key regardless of
+ * which modifiers happen to be held, which is what .code (not the
+ * modifier/layout-dependent .key) represents.
+ *
+ * Before the two algorithmic branches and the NamedCodeKeysymName table
+ * below existed, NEITHER of the two tries above could ever resolve a DOM
+ * code: XStringToKeysym only knows X11's own keysym names, and the
+ * single-character fallback never fires for a multi-character code string
+ * like "Digit1". EmitKey returned false for every plain (non-text) key
+ * transition as a result -- confirmed live as the actual cause of an "any
+ * physical keypress kills the session instantly" regression: false
+ * propagates through InputLedger::ApplyKey to SessionCore::HandleLedgerResult
+ * as InputResult::kAdapterFailure, which SessionCore::ReportAdapterFailure
+ * treats as unrecoverable and tears the whole session down via Stop() --
+ * not merely drops the one keystroke. Text input (EmitText, IME/paste) was
+ * never affected; it never reaches this path.
  */
 KeySym KeySymForName(std::string_view key) noexcept {
   const std::string name(key);
   KeySym symbol = XStringToKeysym(name.c_str());
   if (symbol != NoSymbol) return symbol;
   if (name.size() == 1) return static_cast<KeySym>(name[0]);
+  if (name.size() == 4 && name[0] == 'K' && name[1] == 'e' && name[2] == 'y' &&
+      name[3] >= 'A' && name[3] <= 'Z') {
+    // "KeyA".."KeyZ" -> the lowercase letter itself; X11/XTest applies
+    // Shift from whatever modifier keys are separately held, the same way a
+    // real keyboard would, rather than this needing to ask for the
+    // currently-shifted symbol directly.
+    return static_cast<KeySym>(name[3] - 'A' + 'a');
+  }
+  if (name.size() == 6 && name.compare(0, 5, "Digit") == 0 && name[5] >= '0' &&
+      name[5] <= '9') {
+    return static_cast<KeySym>(name[5]);
+  }
+  if (name.size() == 7 && name.compare(0, 6, "Numpad") == 0 &&
+      name[6] >= '0' && name[6] <= '9') {
+    const char kp_name[5] = {'K', 'P', '_', name[6], '\0'};
+    return XStringToKeysym(kp_name);
+  }
+  if (const char* named = NamedCodeKeysymName(name); named != nullptr) {
+    return XStringToKeysym(named);
+  }
   return NoSymbol;
 }
 
