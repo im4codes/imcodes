@@ -88,11 +88,32 @@ interface ManagedEntry {
   connection: RemoteDesktopManagedConnection;
 }
 
+/** Whether anyone can currently see this page, and when that becomes true again. */
+export interface RemoteDesktopPageVisibility {
+  isVisible(): boolean;
+  /** Calls `listener` each time the page becomes visible; returns the unsubscribe. */
+  onVisible(listener: () => void): () => void;
+}
+
 export interface RemoteDesktopConnectionManagerDependencies {
   createClient?(
     serverId: string,
     hooks: RemoteDesktopClientHooks,
   ): RemoteDesktopConnectionClient;
+  visibility?: RemoteDesktopPageVisibility;
+}
+
+function documentPageVisibility(): RemoteDesktopPageVisibility {
+  const visible = () => typeof document === 'undefined' || document.visibilityState !== 'hidden';
+  return {
+    isVisible: visible,
+    onVisible: (listener) => {
+      if (typeof document === 'undefined') return () => {};
+      const handler = () => { if (visible()) listener(); };
+      document.addEventListener('visibilitychange', handler);
+      return () => document.removeEventListener('visibilitychange', handler);
+    },
+  };
 }
 
 const RECONNECTABLE_FAILURES = new Set<string>([
@@ -118,10 +139,15 @@ export function remoteDesktopHostKey(target: RemoteDesktopHostTarget): string {
 export class RemoteDesktopConnectionManager {
   private readonly entries = new Map<string, ManagedEntry>();
   private readonly createClient: NonNullable<RemoteDesktopConnectionManagerDependencies['createClient']>;
+  private readonly visibility: RemoteDesktopPageVisibility;
+  /** Connections that failed while the page was hidden, retried once it is seen. */
+  private readonly waitingForVisible = new Set<ManagedEntry>();
+  private stopWatchingVisibility: (() => void) | null = null;
 
   constructor(dependencies: RemoteDesktopConnectionManagerDependencies = {}) {
     this.createClient = dependencies.createClient
       ?? ((serverId, hooks) => new RemoteDesktopClient(serverId, hooks));
+    this.visibility = dependencies.visibility ?? documentPageVisibility();
   }
 
   connection(target: RemoteDesktopHostTarget): RemoteDesktopManagedConnection {
@@ -333,6 +359,21 @@ export class RemoteDesktopConnectionManager {
 
     const reconnectable = this.isReconnectableFailure(next);
     if (reconnectable && entry.reconnectTimer) return;
+    if (reconnectable && !this.visibility.isVisible()) {
+      // A hidden page never presents a video frame, and the Server does not
+      // call a route connected until one has been presented, so every
+      // attempt made now would run into the negotiation timeout and use up
+      // the retry budget -- leaving a background tab "failed" by the time
+      // anyone looks at it. Wait until the page is seen, then start over.
+      this.publish(entry, {
+        ...next,
+        state: REMOTE_DESKTOP_STATE.RECONNECTING,
+        inputEnabled: false,
+        reconnectCount: entry.reconnectCount,
+      });
+      this.retryWhenVisible(entry);
+      return;
+    }
     if (reconnectable && entry.reconnectCount < REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS) {
       entry.reconnectCount += 1;
       const reconnectAttempt = entry.reconnectCount;
@@ -424,5 +465,16 @@ export class RemoteDesktopConnectionManager {
     if (entry.reconnectStabilityTimer) clearTimeout(entry.reconnectStabilityTimer);
     entry.reconnectTimer = null;
     entry.reconnectStabilityTimer = null;
+    if (this.waitingForVisible.delete(entry) && this.waitingForVisible.size === 0) {
+      this.stopWatchingVisibility?.();
+      this.stopWatchingVisibility = null;
+    }
+  }
+
+  private retryWhenVisible(entry: ManagedEntry): void {
+    this.waitingForVisible.add(entry);
+    this.stopWatchingVisibility ??= this.visibility.onVisible(() => {
+      for (const waiting of [...this.waitingForVisible]) this.retry(waiting);
+    });
   }
 }

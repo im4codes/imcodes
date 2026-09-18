@@ -3181,7 +3181,7 @@ export function RemoteDesktopPanel({
                 <div class="remote-desktop-connection-progress">
                   <strong>
                     {snapshot.state === REMOTE_DESKTOP_STATE.RECONNECTING
-                      ? t('remote_desktop.connection_retrying', { count: snapshot.reconnectCount ?? 1 })
+                      ? t('remote_desktop.connection_retrying', { count: Math.max(1, snapshot.reconnectCount ?? 1) })
                       : t('remote_desktop.connection_optimizing')}
                   </strong>
                   {snapshot.state === REMOTE_DESKTOP_STATE.RECONNECTING

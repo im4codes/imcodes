@@ -307,6 +307,85 @@ describe('RemoteDesktopConnectionManager', () => {
     });
   });
 
+  it('waits for a hidden page to be seen instead of spending the retry budget', async () => {
+    // A hidden page never presents a frame, so the Server times every attempt
+    // out: retrying there only burned the budget and left a background tab
+    // "failed" by the time anyone came back to it.
+    vi.useFakeTimers();
+    let visible = false;
+    const listeners = new Set<() => void>();
+    const clients: FakeConnectionClient[] = [];
+    const manager = new RemoteDesktopConnectionManager({
+      createClient: (_serverId, hooks) => {
+        const client = new FakeConnectionClient(hooks);
+        clients.push(client);
+        return client;
+      },
+      visibility: {
+        isVisible: () => visible,
+        onVisible: (listener) => {
+          listeners.add(listener);
+          return () => listeners.delete(listener);
+        },
+      },
+    });
+    const connection = manager.connection({ serverId: 'server-a' });
+    await connection.start();
+
+    clients[0].emit({
+      state: REMOTE_DESKTOP_STATE.FAILED,
+      terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.NEGOTIATION_TIMEOUT,
+    });
+    await vi.advanceTimersByTimeAsync(REMOTE_DESKTOP_LIMITS.RECONNECT_BACKOFF_BASE_MS * 16);
+    expect(clients).toHaveLength(1);
+    expect(connection.current()).toMatchObject({
+      state: REMOTE_DESKTOP_STATE.RECONNECTING,
+      reconnectCount: 0,
+    });
+    expect(listeners.size).toBe(1);
+
+    visible = true;
+    for (const listener of [...listeners]) listener();
+
+    expect(clients).toHaveLength(2);
+    expect(clients[0].stopOrigins).toEqual([REMOTE_DESKTOP_STOP_ORIGIN.MANAGER_RECONNECT]);
+    expect(clients[1].startAttempts).toEqual([1]);
+    expect(connection.current()).toMatchObject({ reconnectCount: 0 });
+    // Seen once is enough: nothing stays subscribed.
+    expect(listeners.size).toBe(0);
+  });
+
+  it('stops waiting for the page when the connection is closed meanwhile', async () => {
+    const listeners = new Set<() => void>();
+    const clients: FakeConnectionClient[] = [];
+    const manager = new RemoteDesktopConnectionManager({
+      createClient: (_serverId, hooks) => {
+        const client = new FakeConnectionClient(hooks);
+        clients.push(client);
+        return client;
+      },
+      visibility: {
+        isVisible: () => false,
+        onVisible: (listener) => {
+          listeners.add(listener);
+          return () => listeners.delete(listener);
+        },
+      },
+    });
+    const connection = manager.connection({ serverId: 'server-a' });
+    await connection.start();
+    clients[0].emit({
+      state: REMOTE_DESKTOP_STATE.FAILED,
+      terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.PEER_FAILED,
+    });
+    expect(listeners.size).toBe(1);
+
+    manager.stop('server-a', REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+
+    expect(listeners.size).toBe(0);
+    expect(clients).toHaveLength(1);
+  });
+
   it('native resume revives only an exhausted reconnectable failure', async () => {
     vi.useFakeTimers();
     const { manager, clients } = setupManager();
