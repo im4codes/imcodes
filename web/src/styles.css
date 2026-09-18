@@ -8458,7 +8458,10 @@ html.native-ios-mac .chat-dl-btn {
 .fb-preview-audio-name { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; color: #cbd5e1; }
 .fb-preview-audio audio { outline: none; }
 .fb-lightbox { position: fixed; inset: 0; z-index: 9999; background: rgba(0,0,0,0.85); display: flex; align-items: center; justify-content: center; cursor: zoom-out; padding: calc(var(--sat, 0px) + 12px) calc(env(safe-area-inset-right, 0px) + 12px) calc(env(safe-area-inset-bottom, 0px) + 12px) calc(env(safe-area-inset-left, 0px) + 12px); box-sizing: border-box; }
-.fb-lightbox img { max-width: min(92vw, 100%); max-height: min(92vh, 100%); object-fit: contain; border-radius: 6px; cursor: default; }
+/* touch-action: none hands every touch gesture on the image to JS (pinch-zoom,
+   pan, drag-to-dismiss) instead of letting the browser's own native pinch
+   zoom the whole page or scroll behind the modal. */
+.fb-lightbox img { max-width: min(92vw, 100%); max-height: min(92vh, 100%); object-fit: contain; border-radius: 6px; cursor: default; touch-action: none; }
 .fb-lightbox-close { position: absolute; top: calc(var(--sat, 0px) + 16px); right: calc(env(safe-area-inset-right, 0px) + 16px); background: rgba(255,255,255,0.15); border: none; color: #fff; font-size: 20px; width: 36px; height: 36px; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; }
 /* Paging arrows. Semi-transparent at rest so they never compete with the photo,
    and reachable at the vertical middle on both pointer and touch. They sit
