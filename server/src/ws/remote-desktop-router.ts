@@ -679,11 +679,14 @@ export class RemoteDesktopRouter {
     ));
     if (suspended.length === 0) return 0;
     const db = this.hooks.database();
-    if (!db || !this.hooks.supportsDefaultShieldedRoute?.()) {
+    if (!db) {
       for (const route of suspended) {
         this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED, false);
       }
       return 0;
+    }
+    if (!this.hooks.supportsDefaultShieldedRoute?.()) {
+      return this.reconcileDaemonReplacementUnshielded(suspended, daemonGeneration);
     }
 
     const byHost = new Map<string, RemoteDesktopRoute[]>();
@@ -819,6 +822,87 @@ export class RemoteDesktopRouter {
           this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED, false);
         }
       }
+    }
+    return recovered;
+  }
+
+  /**
+   * A daemon that never advertised REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY
+   * and REMOTE_DESKTOP_DEFAULT_SHIELDED_ROUTE_CAPABILITY -- every Linux
+   * controlled node today, which has no capture-privacy-shield adapter to
+   * coordinate a shielded handoff with -- cannot take the epoch-joined path
+   * above at all: it requires a real shield acknowledgement the daemon side
+   * never sends. Before this, that meant EVERY active route on such a
+   * daemon was killed outright the instant its signaling WS so much as
+   * reconnected, unconditionally, with zero attempt at recovery -- observed
+   * live as a deterministic ~LEASE_DURATION_MS-scale session death on Linux
+   * that tracked nothing the browser did. The underlying native worker
+   * process is not what the daemon-generation change represents (it is a
+   * separate, persistent OS process that survives a signaling reconnect
+   * fine, by design -- see LinuxRemoteDesktopWorkerHost.onDaemonDisconnected)
+   * -- only this router's bookkeeping considered the route dead.
+   *
+   * This sends the exact same plain PREPARE a fresh connect sends (see
+   * authorize() above) to the new daemon generation -- no epoch, no
+   * DB-tracked shield acknowledgement to wait on, because there is no
+   * privacy shield being coordinated for a daemon that never claimed to
+   * have one. A route only survives if the new daemon generation accepts
+   * the send and its own authority/lease window has not already run out;
+   * anything else fails exactly as the shielded path already does.
+   */
+  private reconcileDaemonReplacementUnshielded(
+    suspended: RemoteDesktopRoute[],
+    daemonGeneration: number,
+  ): number {
+    let recovered = 0;
+    const now = this.now();
+    for (const route of suspended) {
+      if (this.routesBySession.get(route.sessionId) !== route
+        || route.expiresAt <= now
+        || route.leaseExpiresAt <= now) {
+        this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_EXPIRED, true);
+        continue;
+      }
+      let iceAuthority: TurnIceServerAuthority;
+      try {
+        iceAuthority = this.hooks.iceServers(route.userId ?? route.actor.auditId);
+      } catch {
+        this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED, false);
+        continue;
+      }
+      route.daemonGeneration = daemonGeneration;
+      route.reconnectAttempt += 1;
+      route.state = REMOTE_DESKTOP_STATE.PREPARING;
+      route.workerInputEnabled = false;
+      route.auditedInputEnabled = false;
+      route.statusReceived = false;
+      const authority = {
+        requestId: route.requestId,
+        sessionId: route.sessionId,
+        capability: this.deriveCapability(route.requestId, route.sessionId),
+        expiresAt: route.expiresAt,
+        leaseExpiresAt: route.leaseExpiresAt,
+        daemonGeneration,
+        mode: route.mode,
+        inputEpoch: route.inputEpoch,
+        iceServers: iceAuthority.iceServers,
+      };
+      if (!this.hooks.sendDaemon({
+        type: REMOTE_DESKTOP_MSG.PREPARE,
+        ...authority,
+        routeGeneration: route.registryIdentity.routeGeneration,
+        reconnectAttempt: route.reconnectAttempt,
+      }, daemonGeneration)) {
+        this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED, false);
+        continue;
+      }
+      route.daemonSuspended = false;
+      this.hooks.sendBrowser(route.socket, {
+        type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+        serverTime: this.now(),
+        ...authority,
+      });
+      recovered++;
     }
     return recovered;
   }

@@ -1415,7 +1415,7 @@ describe('RemoteDesktopRouter', () => {
     }
   });
 
-  it('suspends on daemon replacement and still tears down malformed frames', async () => {
+  it('suspends on daemon replacement, recovers the unshielded route, and still tears down malformed frames', async () => {
     const replaced = fixture();
     const firstAuthority = await authorize(replaced);
     replaced.setGeneration(8);
@@ -1430,11 +1430,25 @@ describe('RemoteDesktopRouter', () => {
       error: REMOTE_DESKTOP_ERROR.INVALID_AUTHORITY,
     });
     expect(replaced.daemonMessages).toHaveLength(1);
-    await expect(replaced.router.reconcileDaemonReplacement(8)).resolves.toBe(0);
+    // No supportsDefaultShieldedRoute hook in this fixture -- exactly every
+    // Linux controlled node today. The route must survive the daemon
+    // replacement via a plain re-PREPARE, not die outright the way it would
+    // have before this recovery path existed.
+    await expect(replaced.router.reconcileDaemonReplacement(8)).resolves.toBe(1);
     expect(replaced.messages(replaced.browserA).at(-1)).toMatchObject({
-      type: REMOTE_DESKTOP_MSG.TERMINAL,
-      reason: REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED,
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      requestId: firstAuthority.requestId,
+      sessionId: firstAuthority.sessionId,
+      daemonGeneration: 8,
     });
+    expect(replaced.daemonMessages.at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId: firstAuthority.requestId,
+      sessionId: firstAuthority.sessionId,
+      daemonGeneration: 8,
+      reconnectAttempt: 1,
+    });
+    expect(replaced.router.stats().active).toBe(1);
 
     const malformed = fixture();
     const thirdAuthority = await authorize(malformed);
