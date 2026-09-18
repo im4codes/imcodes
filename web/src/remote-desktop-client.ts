@@ -264,11 +264,6 @@ class RemoteDesktopSignalingSocket {
   private socket: WebSocket | null = null;
   private ticketAbort: AbortController | null = null;
   private readonly guest: boolean;
-  // See SIGNALING_PING_INTERVAL_MS's own doc comment: this socket carries
-  // nothing periodic of its own otherwise, and was found to be exactly what
-  // an idle-connection reaper somewhere in the path was closing at a
-  // consistent ~61s after connecting.
-  private pingTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(private readonly deps: RemoteDesktopClientDependencies) {
     this.guest = deps.guestBootstrapProof !== undefined;
@@ -383,27 +378,17 @@ class RemoteDesktopSignalingSocket {
       if (this.socket !== socket || typeof event.data !== 'string') return;
       try {
         const value = JSON.parse(event.data) as unknown;
-        if (value && typeof value === 'object' && !Array.isArray(value)) {
-          const type = (value as { type?: unknown }).type;
-          if (type === DAEMON_MSG.RECONNECTED) {
-            onDaemonReconnected?.();
-            return;
-          }
-          // The bare transport-level pong this socket's own periodic ping
-          // below provokes -- never a remote-desktop protocol message, and
-          // never forwarded to the session layer, same as RECONNECTED above.
-          if (type === 'pong') return;
+        if (value && typeof value === 'object' && !Array.isArray(value)
+          && (value as { type?: unknown }).type === DAEMON_MSG.RECONNECTED) {
+          onDaemonReconnected?.();
+          return;
         }
         onMessage(value);
       } catch { /* strict parser below */ }
     });
-    this.pingTimer = setInterval(() => {
-      this.send({ type: 'ping' });
-    }, REMOTE_DESKTOP_LIMITS.SIGNALING_PING_INTERVAL_MS);
     socket.addEventListener('close', () => {
       if (this.socket !== socket) return;
       this.socket = null;
-      if (this.pingTimer) { clearInterval(this.pingTimer); this.pingTimer = null; }
       onClose();
     });
   }
@@ -423,7 +408,6 @@ class RemoteDesktopSignalingSocket {
   close(): void {
     this.ticketAbort?.abort();
     this.ticketAbort = null;
-    if (this.pingTimer) { clearInterval(this.pingTimer); this.pingTimer = null; }
     const socket = this.socket;
     this.socket = null;
     socket?.close(1000, 'remote_desktop_client_closed');

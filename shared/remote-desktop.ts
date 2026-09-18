@@ -369,24 +369,6 @@ export const REMOTE_DESKTOP_LIMITS = {
   LEASE_RENEW_INTERVAL_MS: 15_000,
   KEEPALIVE_TIMEOUT_MS: 15_000,
   DATA_KEEPALIVE_INTERVAL_MS: 30_000,
-  /**
-   * The signaling WebSocket (browser <-> Server, RemoteDesktopClient's own
-   * `this.socket` -- a separate connection from the shared app WS ws-client.ts
-   * already heartbeats) carries nothing periodic on its own: LEASE renewals
-   * are Server-to-daemon only, and DATA_KEEPALIVE_INTERVAL_MS above only
-   * keeps the WebRTC DataChannel alive, a completely different connection.
-   * Between AUTHORIZED and the next real state change, this socket was
-   * completely silent. Confirmed live: sessions were closing with
-   * `browserDisconnected: true` at a strikingly consistent ~61s after
-   * connecting -- an idle-connection reaper somewhere in the path (proxy or
-   * transport) reclaiming a quiet-too-long socket, not any lease/authority
-   * check (every one of those failure reasons was absent from the audit
-   * trail). The server already answers a bare `{type:'ping'}` with
-   * `{type:'pong'}` on every browser connection unconditionally, before any
-   * feature-specific routing (see WsBridge's own message handler) -- reusing
-   * that existing, already-proven mechanism rather than inventing a new one.
-   */
-  SIGNALING_PING_INTERVAL_MS: 10_000,
   MEDIA_PROGRESS_TIMEOUT_MS: 10_000,
   /**
    * How long a connected peer may take to deliver its first video bytes.
