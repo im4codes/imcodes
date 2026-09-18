@@ -176,7 +176,10 @@ export function RemoteDesktopWorkspace({
       <div class="remote-desktop-workspace-tabbar">
         <div role="tablist" aria-label={t('remote_desktop.workspace_tabs')}>
           {hosts.map(({ hostKey, machine }) => (
-            <span class="remote-desktop-workspace-host-tab" key={hostKey}>
+            <span
+              class={`remote-desktop-workspace-host-tab${state.activeTabId === hostKey ? ' is-active' : ''}`}
+              key={hostKey}
+            >
               <button
                 class="remote-desktop-workspace-tab"
                 type="button"

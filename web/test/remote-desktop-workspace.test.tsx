@@ -160,6 +160,10 @@ describe('RemoteDesktopWorkspace', () => {
     expect((screen.getByTestId('panel-a') as HTMLElement).hidden).toBe(true);
     expect((screen.getByTestId('panel-b') as HTMLElement).hidden).toBe(false);
     expect(workspaceCss).toMatch(/\.remote-desktop-workspace\s*>\s*\.remote-desktop-panel\[hidden\][\s\S]*display:\s*none\s*!important/);
+    // Only the active host's tab (tab + its close control) is marked active,
+    // which is what visually lifts it off the tab rail into the toolbar.
+    expect(screen.getByRole('tab', { name: 'B' }).closest('.remote-desktop-workspace-host-tab')?.classList.contains('is-active')).toBe(true);
+    expect(screen.getByRole('tab', { name: 'A' }).closest('.remote-desktop-workspace-host-tab')?.classList.contains('is-active')).toBe(false);
     fireEvent.keyDown(screen.getByRole('tab', { name: 'B' }), { key: 'ArrowLeft' });
     expect(events).toEqual(['release:a', 'activate:a']);
     fireEvent.keyDown(screen.getByRole('tab', { name: 'B' }), { key: 'ArrowLeft', altKey: true });

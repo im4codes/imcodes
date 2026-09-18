@@ -91,9 +91,21 @@
 .remote-desktop-workspace-tabbar {
   justify-content: flex-start;
   cursor: move;
+  /* Window tabs sit on a darker rail and attach to its bottom edge, so they
+     read as a different level from the pill-shaped toolbar controls below. */
+  align-items: flex-end;
+  padding: 6px 12px 0;
+  background:
+    linear-gradient(180deg, rgb(3 8 15 / 98%), rgb(6 13 23 / 98%));
+  border-bottom: 1px solid rgb(34 211 238 / 22%);
 }
 
-.remote-desktop-workspace-tab,
+.remote-desktop-workspace-tabbar > .remote-desktop-workspace-add,
+.remote-desktop-workspace-tabbar > .remote-desktop-workspace-actions {
+  align-self: center;
+  margin-bottom: 5px;
+}
+
 .remote-desktop-workspace-icon-button,
 .remote-desktop-workspace-chrome-button {
   display: inline-grid;
@@ -110,8 +122,15 @@
 
 .remote-desktop-workspace-tab {
   display: inline-flex;
-  padding-inline: 12px;
+  min-height: 34px;
+  align-items: center;
+  padding-inline: 14px 8px;
+  border: 0;
+  color: #6f93a8;
+  background: transparent;
+  font-weight: 500;
   white-space: nowrap;
+  transition: color 140ms ease;
 }
 
 .remote-desktop-workspace-icon-button svg,
@@ -125,7 +144,6 @@
   stroke-linejoin: round;
 }
 
-.remote-desktop-workspace-tab:hover:not(:disabled),
 .remote-desktop-workspace-icon-button:hover:not(:disabled),
 .remote-desktop-workspace-chrome-button:hover:not(:disabled) {
   border-color: rgb(74 210 255 / 72%);
@@ -134,18 +152,26 @@
   transform: translateY(-1px);
 }
 
-.remote-desktop-workspace-tab:focus-visible,
 .remote-desktop-workspace-icon-button:focus-visible,
 .remote-desktop-workspace-chrome-button:focus-visible {
   outline: 2px solid rgb(56 189 248 / 76%);
   outline-offset: 2px;
 }
 
+.remote-desktop-workspace-tab:hover {
+  color: #cdeefc;
+}
+
+.remote-desktop-workspace-tab:focus-visible {
+  outline: 2px solid rgb(56 189 248 / 76%);
+  outline-offset: -3px;
+  border-radius: 7px;
+}
+
 .remote-desktop-workspace-tab[aria-selected="true"] {
-  border-color: rgb(34 211 238 / 72%);
-  color: #d9fbff;
-  background: linear-gradient(180deg, rgb(13 73 101 / 82%), rgb(7 37 57 / 94%));
-  box-shadow: inset 0 -2px #22d3ee, 0 0 18px rgb(34 211 238 / 13%);
+  color: #eafdff;
+  font-weight: 600;
+  text-shadow: 0 0 12px rgb(34 211 238 / 45%);
 }
 
 .remote-desktop-workspace-icon-button:disabled {
@@ -183,31 +209,64 @@
 }
 
 .remote-desktop-workspace-host-tab {
+  position: relative;
   gap: 0;
+  margin-bottom: -1px; /* sit on (and, when active, cover) the rail's bottom line */
+  border: 1px solid transparent;
+  border-bottom: 0;
+  border-radius: 9px 9px 0 0;
+  background: rgb(14 28 44 / 55%);
   white-space: nowrap;
+  transition: background 140ms ease, border-color 140ms ease;
 }
 
-.remote-desktop-workspace-host-tab .remote-desktop-workspace-tab {
-  border-radius: 7px 0 0 7px;
+.remote-desktop-workspace-host-tab:hover {
+  background: rgb(20 40 60 / 78%);
+  border-color: rgb(76 168 218 / 18%);
+}
+
+/* The active tab takes the toolbar's own background and opens into it, with a
+   glowing cyan top edge -- the one element on the rail that looks "lit". */
+.remote-desktop-workspace-host-tab.is-active {
+  z-index: 1;
+  border-color: rgb(34 211 238 / 42%);
+  background: rgb(11 24 40);
+  box-shadow: 0 -6px 18px rgb(34 211 238 / 10%);
+}
+
+.remote-desktop-workspace-host-tab.is-active::before {
+  content: "";
+  position: absolute;
+  inset: -1px -1px auto;
+  height: 2px;
+  border-radius: 9px 9px 0 0;
+  background: linear-gradient(90deg, #22d3ee, #38bdf8 55%, #818cf8);
+  box-shadow: 0 0 10px rgb(34 211 238 / 70%);
+  pointer-events: none;
 }
 
 .remote-desktop-workspace-tab-close {
   display: inline-grid;
-  min-width: 28px;
-  min-height: 30px;
+  width: 22px;
+  height: 22px;
+  min-width: 22px;
+  margin-right: 8px;
   place-items: center;
-  border: 1px solid rgb(76 168 218 / 24%);
-  border-left: 0;
-  border-radius: 0 7px 7px 0;
-  color: #7899ad;
-  background: linear-gradient(180deg, rgb(20 43 66 / 78%), rgb(8 21 36 / 88%));
+  border: 0;
+  border-radius: 6px;
+  color: #56768a;
+  background: transparent;
   cursor: pointer;
+}
+
+.remote-desktop-workspace-host-tab.is-active .remote-desktop-workspace-tab-close {
+  color: #8fc4dc;
 }
 
 .remote-desktop-workspace-tab-close svg {
   display: block;
-  width: 16px;
-  height: 16px;
+  width: 14px;
+  height: 14px;
   fill: none;
   stroke: currentcolor;
   stroke-width: 2;
@@ -217,8 +276,8 @@
 .remote-desktop-workspace-tab-close:hover,
 .remote-desktop-workspace-tab-close:focus-visible {
   color: #fecdd3;
-  background: rgb(95 26 43 / 42%);
-  outline: 1px solid rgb(251 113 133 / 48%);
+  background: rgb(95 26 43 / 55%);
+  outline: none;
 }
 
 .remote-desktop-workspace-add {
@@ -544,7 +603,7 @@
 
   .remote-desktop-workspace-tabbar {
     gap: 4px;
-    padding: 6px;
+    padding: 6px 6px 0;
   }
 
   .remote-desktop-workspace-host-tab {

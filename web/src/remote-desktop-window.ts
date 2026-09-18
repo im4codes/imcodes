@@ -56,7 +56,33 @@ export function buildRemoteDesktopWallWindowUrl(currentUrl = window.location.hre
  * the caller needs the handle to tell "opened" from "blocked". The opener is
  * severed below instead, which achieves the same isolation.
  */
-function remoteDesktopWindowFeatures(width: number, height: number): string {
+interface WindowBounds {
+  width: number;
+  height: number;
+  left?: number;
+  top?: number;
+}
+
+/**
+ * A remote desktop wants every pixel: open the window over the whole usable
+ * screen area (what a maximized window covers) instead of a fixed small size
+ * the user then has to drag larger. Falls back to the fixed size only when the
+ * screen cannot be measured.
+ */
+export function remoteDesktopWindowBounds(fallbackWidth: number, fallbackHeight: number): WindowBounds {
+  const scr = typeof window !== 'undefined' ? window.screen as Screen & { availLeft?: number; availTop?: number } : undefined;
+  const width = Math.trunc(scr?.availWidth ?? 0);
+  const height = Math.trunc(scr?.availHeight ?? 0);
+  if (width <= 0 || height <= 0) return { width: fallbackWidth, height: fallbackHeight };
+  return {
+    width,
+    height,
+    left: Math.trunc(scr?.availLeft ?? 0),
+    top: Math.trunc(scr?.availTop ?? 0),
+  };
+}
+
+function remoteDesktopWindowFeatures(bounds: WindowBounds): string {
   return [
     'popup=yes',
     'location=no',
@@ -64,8 +90,10 @@ function remoteDesktopWindowFeatures(width: number, height: number): string {
     'menubar=no',
     'status=no',
     'resizable=yes',
-    `width=${width}`,
-    `height=${height}`,
+    `width=${bounds.width}`,
+    `height=${bounds.height}`,
+    ...(bounds.left !== undefined ? [`left=${bounds.left}`] : []),
+    ...(bounds.top !== undefined ? [`top=${bounds.top}`] : []),
   ].join(',');
 }
 
@@ -76,8 +104,10 @@ function remoteDesktopWindowFeatures(width: number, height: number): string {
  * settings and enterprise policy can route every popup into a tab, and nothing
  * a page does overrides that.
  */
-function openDetachedWindow(url: string, width: number, height: number): Window | null {
-  const opened = window.open(url, '_blank', remoteDesktopWindowFeatures(width, height));
+function openDetachedWindow(url: string, fallbackWidth: number, fallbackHeight: number): Window | null {
+  const opened = window.open(url, '_blank', remoteDesktopWindowFeatures(
+    remoteDesktopWindowBounds(fallbackWidth, fallbackHeight),
+  ));
   if (opened) {
     try { opened.opener = null; } catch { /* Browser policy may already isolate the popup. */ }
   }

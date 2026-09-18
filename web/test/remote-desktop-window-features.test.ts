@@ -74,6 +74,18 @@ describe.each([
     expect(Number(features.get('height'))).toBeGreaterThan(0);
   });
 
+  it('covers the whole usable screen instead of opening a small window', () => {
+    const screenSpy = vi.spyOn(window, 'screen', 'get').mockReturnValue({
+      availWidth: 2560, availHeight: 1415, availLeft: 0, availTop: 25,
+    } as unknown as Screen);
+    const features = captureFeatures(open);
+    screenSpy.mockRestore();
+    expect(features.get('width')).toBe('2560');
+    expect(features.get('height')).toBe('1415');
+    expect(features.get('left')).toBe('0');
+    expect(features.get('top')).toBe('25');
+  });
+
   it('never asks for noopener, which would hide whether the window opened', () => {
     // With `noopener` the call returns null, and callers read null as
     // "blocked by the browser" -- they would stop a working session.
