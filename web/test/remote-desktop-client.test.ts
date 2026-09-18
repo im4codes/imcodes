@@ -333,6 +333,65 @@ describe('RemoteDesktopClient', () => {
     client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
   });
 
+  it('pings the signaling socket periodically and never surfaces the pong reply', async () => {
+    vi.useFakeTimers();
+    try {
+      let socket!: FakeSocket;
+      let peer!: FakePeer;
+      const onSnapshot = vi.fn();
+      const client = new RemoteDesktopClient('controlled-win', { onSnapshot }, {
+        fetchTicket: async () => 'ticket-ping',
+        createSocket: () => {
+          socket = new FakeSocket();
+          queueMicrotask(() => socket.open());
+          return socket as unknown as WebSocket;
+        },
+        createPeer: () => {
+          peer = new FakePeer();
+          return peer as unknown as RTCPeerConnection;
+        },
+      });
+
+      await client.start();
+      const start = JSON.parse(socket.sent[0]!) as { requestId: string };
+      socket.receive({
+        type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+        requestId: start.requestId,
+        sessionId: 'session_pingtest1',
+        capability: 'f'.repeat(43),
+        expiresAt: Date.now() + 60_000,
+        leaseExpiresAt: Date.now() + 15_000,
+        daemonGeneration: 1,
+        mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+        inputEpoch: 0,
+        iceServers: [],
+      });
+      await vi.waitFor(() => expect(peer).toBeDefined());
+
+      // Nothing else on this socket is periodic -- LEASE renewal is
+      // Server-to-daemon only, and the DataChannel keepalive is a completely
+      // separate connection -- so without this, the socket goes fully silent
+      // right here, which is exactly what closed real sessions at a
+      // consistent ~61s in production.
+      const sentBeforePing = socket.sent.length;
+      await vi.advanceTimersByTimeAsync(REMOTE_DESKTOP_LIMITS.SIGNALING_PING_INTERVAL_MS);
+      const pings = socket.sent.slice(sentBeforePing).map((raw) => JSON.parse(raw) as { type?: string });
+      expect(pings).toContainEqual({ type: 'ping' });
+
+      // The server answers with a bare {type:'pong'} unconditionally, before
+      // any remote-desktop-specific routing -- it must never reach the
+      // session layer as if it were a real protocol message.
+      const snapshotCallsBeforePong = onSnapshot.mock.calls.length;
+      expect(() => socket.receive({ type: 'pong' })).not.toThrow();
+      expect(onSnapshot.mock.calls.length).toBe(snapshotCallsBeforePong);
+      expect(socket.readyState).toBe(FakeSocket.OPEN);
+
+      client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('retries a weak signaling path and resumes the same peer without remounting its stream', async () => {
     vi.useFakeTimers();
     try {
