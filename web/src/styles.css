@@ -3887,8 +3887,8 @@ html.native-ios-mac .chat-dl-btn {
 .controlled-node-quick-groups {
   display: flex;
   flex-wrap: wrap;
-  gap: 5px;
-  padding: 6px 10px 2px;
+  gap: 9px 12px; /* room for each chip's corner count */
+  padding: 10px 12px 2px;
 }
 
 .controlled-node-quick-groups .controlled-nodes-team-chip {
@@ -3912,13 +3912,15 @@ html.native-ios-mac .chat-dl-btn {
 .controlled-nodes-group-filter {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 10px 14px; /* room for each chip's corner count */
+  padding-top: 6px;
   margin-bottom: 10px;
 }
 
 .controlled-nodes-team-switch { display: flex; flex-wrap: wrap; gap: 6px; }
 
 .controlled-nodes-team-chip {
+  position: relative;
   min-height: 32px;
   padding: 5px 13px;
   border: 1px solid rgba(125, 211, 252, 0.18);
@@ -3936,18 +3938,35 @@ html.native-ios-mac .chat-dl-btn {
 }
 
 /* The superscript on a group tab: how many machines are behind it, so the
-   tabs can be told apart without opening each one. Raised off the baseline
-   because it annotates the name rather than being part of it. */
+   tabs can be told apart without opening each one. A true superscript: it
+   sits on the chip's top-right corner, out of the flow, so it adds no width
+   to the chip. The ring in the panel's background colour cuts it cleanly out
+   of the chip's border. */
 .controlled-nodes-team-chip-count {
-  display: inline-block;
-  transform: translateY(-5px);
-  margin-left: 5px;
-  padding: 1px 6px;
+  position: absolute;
+  top: -8px;
+  right: -9px;
+  min-width: 17px;
+  height: 17px;
+  padding: 0 5px;
+  box-sizing: border-box;
+  display: inline-grid;
+  place-items: center;
   border-radius: 999px;
-  background: rgba(125, 211, 252, 0.14);
-  color: #a5f3fc;
-  font-size: 10px;
+  border: 1.5px solid #0b1220;
+  background: linear-gradient(180deg, #334155, #1e293b);
+  color: #cbd5e1;
+  font: 700 9.5px/1 var(--imcodes-app-font-family);
   font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+  box-shadow: 0 2px 6px rgba(2, 6, 23, 0.55);
+  pointer-events: none;
+}
+
+.controlled-nodes-team-chip.is-active .controlled-nodes-team-chip-count {
+  background: linear-gradient(180deg, #22d3ee, #0891b2);
+  color: #04202a;
+  box-shadow: 0 0 10px rgba(34, 211, 238, 0.55), 0 2px 6px rgba(2, 6, 23, 0.5);
 }
 
 .controlled-nodes-team-header {
