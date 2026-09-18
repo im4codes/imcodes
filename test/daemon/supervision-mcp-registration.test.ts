@@ -26,6 +26,16 @@ import {
 import { SUPERVISION_CONSOLE_VALIDATION_STATES } from '../../shared/supervision-task-console.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 import { SupervisionTaskRegistry } from '../../src/daemon/supervision-state-store.js';
+import logger from '../../src/util/logger.js';
+
+vi.mock('../../src/util/logger.js', () => ({
+  default: {
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    debug: vi.fn(),
+  },
+}));
 
 const CALLER = {
   userId: 'u1', serverId: 's1', projectName: 'codedeck',
@@ -340,6 +350,81 @@ describe('production MCP registration', () => {
     })).resolves.toMatchObject({ status: 'error' });
     expect(dispatchReadyAudit).toHaveBeenCalledTimes(2);
   });
+
+  it.each(['record_validation', 'open_audit'] as const)(
+    'surfaces a non-delivering %s reactive audit dispatch instead of discarding it silently (tsk_v4n/tsk_v2a regression)',
+    async (intent) => {
+      // Real incident: an audit sat with zero auditor assignment for several
+      // minutes with nothing anywhere explaining why, because a non-throwing
+      // `ignored`/`blocked` dispatch outcome here used to be awaited and
+      // discarded exactly like a genuine `dispatched` success -- no log, no
+      // trace, nothing to diagnose from after the fact.
+      const directRegistry = new FakeRegistry();
+      directRegistry.statuses.set('tsk_a', intent === 'record_validation' ? 'implementing' : 'validated');
+      directRegistry.assignmentStates.set('tsk_a', [{
+        assignmentId: 'worker-a', role: 'implementer', status: directRegistry.statuses.get('tsk_a')!,
+        leaseId: 'lease-a', identity: testIdentity('deck_cd_brain'),
+      }]);
+      const dispatchReadyAudit = vi.fn().mockResolvedValue({ status: 'ignored', reason: 'manual_policy' });
+      const handlers = createSupervisionMcpToolHandlers(CALLER, {
+        resolveSessionIdentity: testResolveSessionIdentity,
+        registry: directRegistry,
+        dispatchReadyAudit,
+      });
+
+      const input = intent === 'record_validation'
+        // record_validation requires expectedRevision (dc4aed9de, "bind
+        // validation to caller revision") -- unrelated to this test's own
+        // subject (the dispatch-outcome logging below), but this fake
+        // registry does not enforce a revision match, so any non-empty
+        // string satisfies the presence check.
+        ? { intent, taskId: 'tsk_a', assignmentId: 'worker-a', validationState: 'passed' as const, expectedRevision: 'fake-rev-a' }
+        : { intent, taskId: 'tsk_a', assignmentId: 'worker-a' };
+      await expect(handlers[SUPERVISION_MCP_TOOLS.INTENT](input))
+        .resolves.toMatchObject({ status: 'ok', intent });
+      expect(dispatchReadyAudit).toHaveBeenCalledOnce();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          taskId: 'tsk_a',
+          intent,
+          result: { status: 'ignored', reason: 'manual_policy' },
+        }),
+        expect.any(String),
+      );
+    },
+  );
+
+  it.each(['record_validation', 'open_audit'] as const)(
+    'logs a thrown %s reactive audit dispatch instead of discarding it silently',
+    async (intent) => {
+      const directRegistry = new FakeRegistry();
+      directRegistry.statuses.set('tsk_a', intent === 'record_validation' ? 'implementing' : 'validated');
+      directRegistry.assignmentStates.set('tsk_a', [{
+        assignmentId: 'worker-a', role: 'implementer', status: directRegistry.statuses.get('tsk_a')!,
+        leaseId: 'lease-a', identity: testIdentity('deck_cd_brain'),
+      }]);
+      const dispatchReadyAudit = vi.fn().mockRejectedValue(new Error('transport down'));
+      const handlers = createSupervisionMcpToolHandlers(CALLER, {
+        resolveSessionIdentity: testResolveSessionIdentity,
+        registry: directRegistry,
+        dispatchReadyAudit,
+      });
+
+      const input = intent === 'record_validation'
+        // Same expectedRevision requirement as the sibling test above.
+        ? { intent, taskId: 'tsk_a', assignmentId: 'worker-a', validationState: 'passed' as const, expectedRevision: 'fake-rev-a' }
+        : { intent, taskId: 'tsk_a', assignmentId: 'worker-a' };
+      // The commit/handoff stays authoritative -- a thrown dispatch must
+      // never turn a successful state transition into an error response.
+      await expect(handlers[SUPERVISION_MCP_TOOLS.INTENT](input))
+        .resolves.toMatchObject({ status: 'ok', intent });
+      expect(dispatchReadyAudit).toHaveBeenCalledOnce();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ taskId: 'tsk_a', intent, err: expect.any(Error) }),
+        expect.any(String),
+      );
+    },
+  );
 
   it('carries the aggregate forward automatically after a successful implementer finish', async () => {
     // The finish COMMIT is the event that can leave a task ready for its next

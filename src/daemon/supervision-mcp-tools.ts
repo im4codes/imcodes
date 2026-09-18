@@ -50,6 +50,7 @@ import {
 } from '../../shared/supervision-participant-authority.js';
 import type { McpRuntimeCaller } from './memory-mcp-caller.js';
 import { advanceSupervisionTaskAfterFinish } from './supervision-convergence-wire.js';
+import logger from '../util/logger.js';
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import { deterministicAutomaticAuditDeliveryMessageId } from '../../shared/send-message-id.js';
 import {
@@ -356,6 +357,27 @@ export interface SupervisionRegistryPort {
     reason: string;
   }): { ok: true; value?: unknown; replay?: boolean } | { ok: false; reason: string };
   housekeeping(input: { mode: 'dryRun' | 'apply'; projectName: string; cursor?: string; limit?: number }): unknown;
+}
+
+/**
+ * A reactive post-validation/post-open audit dispatch that resolves WITHOUT
+ * throwing but also without actually delivering anything (`ignored`, or
+ * `blocked` for a reason the daemon-side dispatcher did not itself already
+ * report to a coordinator) used to be indistinguishable from a genuine
+ * `dispatched`/`replayed` success at these call sites -- both were simply
+ * awaited and discarded. That silence is exactly what made a real incident
+ * (tsk_v4n/tsk_v2a: an audit sat with zero auditor assignment for several
+ * minutes) impossible to diagnose from any log. This does not change control
+ * flow or retry behavior -- the periodic 60s watchdog tick remains the sole
+ * retry mechanism, unchanged -- it only makes a non-delivering outcome
+ * visible instead of invisible.
+ */
+function logNonDeliveringAuditDispatch(taskId: string, intent: string, result: unknown): void {
+  const status = result && typeof result === 'object' && 'status' in result
+    ? (result as { status?: unknown }).status
+    : undefined;
+  if (status === 'dispatched' || status === 'replayed') return;
+  logger.warn({ taskId, intent, result }, 'Reactive audit dispatch did not deliver');
 }
 
 export interface SupervisionMcpToolDeps {
@@ -732,19 +754,35 @@ export function createSupervisionMcpToolHandlers(
           convergenceOutcome = error instanceof Error ? error.message : String(error);
         }
         try {
-          await deps.dispatchReadyAudit?.(taskId);
-        } catch {
+          const auditTrigger = await deps.dispatchReadyAudit?.(taskId);
+          logNonDeliveringAuditDispatch(taskId, 'record_validation', auditTrigger);
+        } catch (error) {
           // The validation and handoff commits remain authoritative. The
-          // deterministic dispatcher records its own blocker and can replay.
+          // deterministic dispatcher records its own blocker and can replay --
+          // but a thrown error here must still be VISIBLE, not silently
+          // discarded. A real incident (tsk_v4n/tsk_v2a) sat with zero
+          // auditor for minutes and left no trace anywhere explaining why,
+          // because this exact catch block previously swallowed everything.
+          logger.warn(
+            { err: error, taskId, intent: 'record_validation' },
+            'Reactive post-validation audit dispatch threw',
+          );
         }
       }
       if (outcome.intent === 'open_audit') {
         try {
-          await deps.dispatchReadyAudit?.(taskId);
-        } catch {
+          const auditTrigger = await deps.dispatchReadyAudit?.(taskId);
+          logNonDeliveringAuditDispatch(taskId, 'open_audit', auditTrigger);
+        } catch (error) {
           // The ready_for_audit commit is authoritative. The dispatcher owns
           // its durable blocker report and the one-shot boot sweep retries a
-          // crash between this commit and materialization.
+          // crash between this commit and materialization -- but see the
+          // comment on the `record_validation` branch above: this must not
+          // be silently discarded.
+          logger.warn(
+            { err: error, taskId, intent: 'open_audit' },
+            'Reactive post-open audit dispatch threw',
+          );
         }
       }
       return ok({

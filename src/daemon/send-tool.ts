@@ -3833,10 +3833,25 @@ export async function dispatchReadyAudit(
     const recoveredHandoff = recoverAutomaticAuditHandoff(target.name, messageId, deps);
     const hasEvidence = deps.hasDeliveryEvidence ?? hasDurableDeliveryEvidence;
     const hasExistingEvidence = hasEvidence(target.name, messageId);
-    if (!recoveredHandoff && hasExistingEvidence) {
-      const now = deps.now?.() ?? Date.now();
-      const staleDelegated = existingAudit.status === AUDITOR_REDELIVERY_STATUS
-        && now - existingAudit.updatedAt >= AUDITOR_STALE_REDELIVERY_MS;
+    const now = deps.now?.() ?? Date.now();
+    const staleDelegated = existingAudit.status === AUDITOR_REDELIVERY_STATUS
+      && now - existingAudit.updatedAt >= AUDITOR_STALE_REDELIVERY_MS;
+    // Staleness must be checked here even when there is NO delivery evidence
+    // at all, not only when evidence exists but the assignee went quiet after
+    // starting. The two cases look identical from here on out (still
+    // `delegated`, zero engagement) and need the exact same redelivery
+    // decision: a real audit (tsk_uzm/asg_v0r) sat for 2.4 hours because this
+    // branch used to be gated on `hasExistingEvidence` alone, so a dispatch
+    // whose very first send never actually reached the target (no evidence
+    // was ever recorded) kept reusing that SAME original `internalMessageId`
+    // on every 60s convergence tick. `internalDurableQueue`/`internalMessageId`
+    // exist specifically to make repeat calls idempotent, so the periodic tick
+    // WAS running -- it just kept "resending" a message id the durable queue
+    // had already (silently, from the target's perspective) accepted, and a
+    // silently-swallowed first send can never earn a genuinely new delivery
+    // attempt without a genuinely new id. Once truly stale, treat "no
+    // evidence" the same as "evidence but no engagement" and mint one.
+    if (!recoveredHandoff && (hasExistingEvidence || staleDelegated)) {
       const exactExecution = {
         taskId: task.taskId,
         assignmentId: existingAudit.assignmentId,
@@ -3867,8 +3882,9 @@ export async function dispatchReadyAudit(
     // An assignment may have been transactionally rebound from an orphaned
     // target. Delivery evidence is target-scoped, so the replacement has none;
     // nevertheless it must reuse the assignment's canonical message id rather
-    // than minting a second logical delivery.
-    if (!recoveredHandoff && !hasExistingEvidence) {
+    // than minting a second logical delivery -- unless it is ALSO stale, which
+    // the block above has already handled by minting a fresh redelivery id.
+    if (!recoveredHandoff && !hasExistingEvidence && !staleDelegated) {
       recoveredExistingMessageId = messageId;
     }
   }

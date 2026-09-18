@@ -1518,6 +1518,108 @@ describe('automatic supervision audit materialization', () => {
     registry.close();
   });
 
+  it('mints a fresh redelivery id once a dispatched audit that left no delivery evidence at all goes stale (tsk_uzm/asg_v0r regression)', async () => {
+    // Real incident: an already-dispatched auditor assignment (tsk_uzm/asg_v0r)
+    // sat completely untouched for ~2.4 hours, well past the 10-minute
+    // AUDITOR_STALE_REDELIVERY_MS budget, because the staleness/redelivery
+    // check used to be gated on `hasExistingEvidence` alone. When the very
+    // first send never left any recorded delivery evidence at all (the
+    // strictly harder "never landed in the first place" case, not "landed
+    // then the assignee went quiet"), the code fell straight through to
+    // reusing the exact same original `internalMessageId` forever. Every 60s
+    // convergence tick genuinely re-ran this function -- `internalMessageId`
+    // + `internalDurableQueue: true` exist specifically to make repeat calls
+    // idempotent, so each retry was silently treated as "already handled"
+    // and never produced a real new delivery attempt.
+    function messageIdOf(result: { status: string; messageId?: SendMessageId }): SendMessageId | undefined {
+      return result.messageId;
+    }
+    const { registry, taskId, revision } = makeReadyTask({ auditPolicy: 'auto_allow_degraded' });
+    const sessions = [
+      session('deck_alpha_brain', 'brain'),
+      session('deck_alpha_worker', 'w1'),
+      session('deck_alpha_auditor', 'w2', 'claude-code-sdk', 'anthropic'),
+    ];
+    // `registry.createAssignment` stamps `updatedAt`/`createdAt` from the
+    // real wall clock internally (it does not accept an injected `now`), so
+    // the fake clock this test advances must start near real epoch time --
+    // an arbitrary small fake epoch would make `now - existingAudit.updatedAt`
+    // permanently negative and never cross the staleness threshold.
+    let now = Date.now();
+    let assignmentId: string | undefined;
+    const attemptId = automaticAttempt(taskId, revision);
+    const dispatch = vi.fn(async (_caller: SendRuntimeCaller, input: SendMessageInput) => {
+      if (!assignmentId) {
+        const created = registry.createAssignment({
+          taskId,
+          role: 'auditor',
+          identity: identity('deck_alpha_auditor', 'claude-code-sdk', 'anthropic'),
+          auditAttemptId: input.audit!.attemptId,
+          auditRevision: revision,
+          idempotencyKey: `send:${input.idempotencyKey}`,
+        });
+        if (!created.ok) throw new Error(created.reason);
+        assignmentId = created.value.assignmentId;
+      }
+      return {
+        status: 'accepted' as const,
+        dispatchId: 'send_dispatch_00000000-0000-4000-8000-000000000000' as const,
+        messageId: (input.internalMessageId ?? automaticMessageId(assignmentId, attemptId)) as SendMessageId,
+        deliveries: [{ target: 'deck_alpha_auditor', status: 'queued' as const }],
+        taskId,
+        assignmentId,
+      };
+    });
+    const deps = {
+      registry,
+      listSessions: () => sessions,
+      listTargets: listTargetRecords(sessions[2]!),
+      dispatch,
+      // The exact incident condition: never ANY recorded delivery evidence,
+      // for the whole scenario -- not "evidence exists but is stale".
+      hasDeliveryEvidence: () => false,
+      now: () => now,
+      inspectAssignmentWorktree: () => ({
+        worktreePath: '/tmp/authoritative-auto-audit/repo',
+        headSha: 'a'.repeat(40),
+        files: [{ path: 'src/exact.ts', sha256: '1'.repeat(64) }],
+        stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
+      }),
+    };
+
+    const first = await dispatchReadyAudit(taskId, deps);
+    expect(first).toMatchObject({ status: 'dispatched', attemptId });
+    const originalMessageId = messageIdOf(first);
+    expect(originalMessageId).toBeTruthy();
+
+    // Well within the redelivery window (5 of the 10 minutes): must keep
+    // using the exact same message id. Redelivering this early would be its
+    // own false-positive bug -- a genuinely slow but real first attempt must
+    // not be treated as abandoned.
+    now += 5 * 60_000;
+    const stillFresh = await dispatchReadyAudit(taskId, deps);
+    expect(messageIdOf(stillFresh)).toBe(originalMessageId);
+
+    // Past the 10-minute AUDITOR_STALE_REDELIVERY_MS budget with STILL zero
+    // delivery evidence -- exactly the tsk_uzm/asg_v0r incident shape. This
+    // must now mint a genuinely new redelivery id instead of perpetually
+    // resending the original one that never actually landed.
+    now += 6 * 60_000;
+    const redelivered = await dispatchReadyAudit(taskId, deps);
+    expect(redelivered).toMatchObject({ status: 'dispatched', assignmentId, attemptId });
+    const redeliveredMessageId = messageIdOf(redelivered);
+    expect(redeliveredMessageId).toBeTruthy();
+    expect(
+      redeliveredMessageId,
+      'a stale never-evidenced dispatch must get a fresh message id, not the same one forever',
+    ).not.toBe(originalMessageId);
+    expect(redeliveredMessageId)
+      .toBe(deterministicSendMessageId(`auto-audit-redelivery:${assignmentId}:${attemptId}`));
+    // Redelivery reuses the SAME durable assignment; it must never mint a
+    // second logical auditor row for the same revision.
+    expect(registry.listAssignments(taskId).filter((item) => item.role === 'auditor')).toHaveLength(1);
+  });
+
   it('adopts one exact durable audit delivery when its auditor row was not materialized (tsk_f1x)', async () => {
     const { registry, taskId, revision } = makeReadyTask({
       taskId: 'tsk_f1x',
@@ -3810,6 +3912,15 @@ describe('periodic supervision convergence tick', () => {
         && replacementEvidence
       ),
       hasVisibleAuditAcceptance: () => replacementEvidence,
+      // Same fixture clock as the `recoverOrphanedDelegatedAuditor` call just
+      // above (`now: 300`): the dispatch tick below fires essentially
+      // immediately after that rebind, exactly like production (both use the
+      // real wall clock there). Without this, staleness is now evaluated
+      // even with zero delivery evidence yet (the fix under test), and the
+      // real `Date.now()` default minus this fixture's tiny `updatedAt: 300`
+      // would look like months of elapsed time -- an artifact of the fixture
+      // clock, not a real stale-redelivery scenario.
+      now: () => 300,
     };
     await expect(dispatchReadyAudit(taskId, deps)).resolves.toMatchObject({
       status: 'dispatched', assignmentId: auditor.value.assignmentId, attemptId,
