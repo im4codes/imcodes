@@ -221,7 +221,7 @@ class Lease final : public common::NativeVideoSourceLease {
   bool Start() override {
     started_ = GlobalCaptureMultiplexer().Subscribe(
         capture_, display_, id_, [this](CapturedFrame frame) {
-          ++captured_frames_;
+          captured_frames_.fetch_add(1, std::memory_order_release);
           source_->PushFrame(frame);
         });
     return started_;
@@ -244,7 +244,7 @@ class Lease final : public common::NativeVideoSourceLease {
     return display_.encoded_pixels;
   }
   std::uint64_t captured_frames() const noexcept override {
-    return captured_frames_;
+    return captured_frames_.load(std::memory_order_acquire);
   }
   std::uint64_t dropped_frames() const noexcept override { return 0; }
   bool protected_content_masked() const noexcept override { return false; }
@@ -254,7 +254,18 @@ class Lease final : public common::NativeVideoSourceLease {
   DisplayTopology display_;
   std::string display_id_storage_ = display_.display_id;
   webrtc::scoped_refptr<Source> source_;
-  std::uint64_t captured_frames_ = 0;
+  // Written on the capture poll thread (X11CaptureAdapter::PollLoop's own
+  // dedicated std::thread, via the Subscribe() sink lambda above), read on
+  // the signaling thread (LinuxRemoteDesktopSession::HandleMediaStats, via
+  // the libwebrtc GetStats() callback) -- a genuine cross-thread race on a
+  // plain integer otherwise; std::atomic with acquire/release is the fix,
+  // not just a defensive habit. Confirmed live via targeted instrumentation
+  // during the investigation into an intermittent second-concurrent-session
+  // media-delivery stall: this counter (and therefore the native
+  // TransportSessionCore::Tick() media-stall watchdog that reads it via
+  // captured_frames()) is the only place this specific race could produce a
+  // stale read.
+  std::atomic<std::uint64_t> captured_frames_{0};
   const std::uint64_t id_;
   bool started_ = false;
 };
