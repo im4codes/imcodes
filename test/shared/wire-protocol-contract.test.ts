@@ -75,6 +75,7 @@ describe('shared daemon/server/web wire protocol contracts', () => {
       MACHINE_EXEC_RESULT: 'machine.exec_result',
       COMPUTER_USE_RESULT: 'computer.use_result',
       CONTROLLED_NODE_AUTO_UNLOCK_RESULT: 'controlled_node.auto_unlock_result',
+      CONTROLLED_NODE_LOCAL_DAEMONS: 'controlled_node.local_daemons',
     });
 
     expect(DAEMON_COMMAND_TYPES).toEqual({
