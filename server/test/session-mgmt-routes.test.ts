@@ -25,6 +25,7 @@ const mockDbExecute = vi.fn(async () => ({ changes: 1 }));
 const sendToDaemonMock = vi.fn();
 const countSharePendingCommandsForUserMock = vi.fn(() => 0);
 const getActiveDispatchIdForSessionMock = vi.fn(() => 'dispatch-1');
+const resolveSessionIdentityProjectKeyMock = vi.fn<(sessionName: string) => string | null>(() => null);
 const mockDb = { queryOne: mockDbQueryOne, query: mockDbQuery, execute: mockDbExecute };
 
 vi.mock('../src/security/authorization.js', () => ({
@@ -63,6 +64,7 @@ vi.mock('../src/ws/bridge.js', () => ({
       sendToDaemon: sendToDaemonMock,
       countSharePendingCommandsForUser: countSharePendingCommandsForUserMock,
       getActiveDispatchIdForSession: getActiveDispatchIdForSessionMock,
+      resolveSessionIdentityProjectKey: resolveSessionIdentityProjectKeyMock,
     }),
   },
 }));
@@ -1214,6 +1216,92 @@ describe('session-mgmt persistence routes', () => {
     expect(mockDbExecute).toHaveBeenLastCalledWith(expect.stringContaining('DELETE FROM session_identity_profiles'), [
       'owner-user', 'project', 'repo-stable-id', null,
     ]);
+  });
+
+  it('reads a participant\'s project identity under the daemon\'s canonical project key, not the browser\'s guess', async () => {
+    // Share recipients never receive contextNamespace, so the browser can
+    // only send the bare project name; the owner's daemon keys the project
+    // identity by the canonical project id.
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      actor: { kind: 'share', effectiveActorRole: 'participant' },
+    });
+    resolveSessionIdentityProjectKeyMock.mockImplementation((name) => (
+      name === 'deck_proj_brain' ? 'github-org/repo' : null
+    ));
+    mockDbQueryOne.mockResolvedValue({
+      scope: 'project', scope_key: 'github-org/repo', content: 'Owner project identity',
+      content_hash: 'h', revision: 1, updated_at: 10, source: 'web', source_file: null,
+    });
+    const app = await buildApp();
+
+    const read = await app.request('/api/server/srv-1/sessions/deck_proj_brain/identity?scope=project&scopeKey=proj');
+    expect(read.status).toBe(200);
+    expect(mockDbQueryOne).toHaveBeenLastCalledWith(expect.stringContaining('FROM session_identity_profiles'), [
+      'owner-user', 'project', 'github-org/repo',
+    ]);
+
+    const write = await app.request('/api/server/srv-1/sessions/deck_proj_brain/identity', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scope: 'project', scopeKey: 'proj', content: 'Edited by participant' }),
+    });
+    expect(write.status).toBe(200);
+    expect(mockDbQueryOne).toHaveBeenLastCalledWith(expect.stringContaining('INSERT INTO session_identity_profiles'),
+      expect.arrayContaining(['owner-user', 'project', 'github-org/repo', 'Edited by participant']));
+    resolveSessionIdentityProjectKeyMock.mockReset();
+    resolveSessionIdentityProjectKeyMock.mockImplementation(() => null);
+  });
+
+  it('pins the session identity key to the covered session', async () => {
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      actor: { kind: 'share', effectiveActorRole: 'participant' },
+    });
+    mockDbQueryOne.mockResolvedValue(null);
+    const app = await buildApp();
+
+    const read = await app.request('/api/server/srv-1/sessions/deck_proj_brain/identity?scope=session&scopeKey=srv-1:deck_other_brain');
+    expect(read.status).toBe(200);
+    expect(mockDbQueryOne).toHaveBeenLastCalledWith(expect.stringContaining('FROM session_identity_profiles'), [
+      'owner-user', 'session', 'srv-1:deck_proj_brain',
+    ]);
+  });
+
+  it('serves the machine owner\'s identity to a whole-server participant before any session exists', async () => {
+    mockResolveHttpShareAccess.mockResolvedValue({
+      membership: 'none',
+      actor: { kind: 'share', effectiveActorRole: 'participant' },
+      shareProvenance: 'server',
+    });
+    mockDbQueryOne.mockResolvedValue({
+      scope: 'project', scope_key: 'proj', content: 'Owner project identity',
+      content_hash: 'h', revision: 1, updated_at: 10, source: 'web', source_file: null,
+    });
+    const app = await buildApp();
+
+    const read = await app.request('/api/server/srv-1/identity?scope=project&scopeKey=proj');
+    expect(read.status).toBe(200);
+    await expect(read.json()).resolves.toEqual({
+      profile: expect.objectContaining({ scope: 'project', content: 'Owner project identity' }),
+    });
+    expect(mockDbQueryOne).toHaveBeenLastCalledWith(expect.stringContaining('FROM session_identity_profiles'), [
+      'owner-user', 'project', 'proj',
+    ]);
+  });
+
+  it('refuses the server-level identity route to session-scoped participants and viewers', async () => {
+    const app = await buildApp();
+    mockResolveHttpShareAccess.mockResolvedValueOnce({
+      membership: 'none',
+      actor: { kind: 'share', effectiveActorRole: 'participant' },
+      shareProvenance: 'session',
+    });
+    expect((await app.request('/api/server/srv-1/identity?scope=user&scopeKey=')).status).toBe(403);
+    mockResolveHttpShareAccess.mockResolvedValueOnce({
+      membership: 'none',
+      actor: { kind: 'share', effectiveActorRole: 'viewer' },
+      shareProvenance: 'server',
+    });
+    expect((await app.request('/api/server/srv-1/identity?scope=user&scopeKey=')).status).toBe(403);
   });
 
   it('projects every valid owner-group execution candidate to a participant even when both pools are empty', async () => {

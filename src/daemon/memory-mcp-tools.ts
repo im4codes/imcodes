@@ -198,6 +198,8 @@ import {
   normalizeSessionIdentityContent,
   renderSessionIdentityProfiles,
   sessionIdentityContentError,
+  sessionIdentityProjectKey,
+  sessionIdentitySessionKey,
   type SessionIdentityScope,
 } from '../../shared/session-identity.js';
 import {
@@ -1585,9 +1587,9 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
   const identityScopeKey = (scope: SessionIdentityScope, target: SessionRecord): string => {
     if (scope === SESSION_IDENTITY_SCOPES.USER) return '';
     if (scope === SESSION_IDENTITY_SCOPES.PROJECT) {
-      return target.contextNamespace?.projectId?.trim() || target.projectName;
+      return sessionIdentityProjectKey({ contextNamespace: target.contextNamespace, project: target.projectName });
     }
-    return `${caller.serverId ?? 'local'}:${target.name}`;
+    return sessionIdentitySessionKey(caller.serverId ?? 'local', target.name);
   };
 
   const refreshIdentityTarget = async (target: SessionRecord) => {

@@ -83,7 +83,9 @@ import {
   handleSessionIdentityDelete,
   handleSessionIdentityGet,
   handleSessionIdentityPut,
+  type SessionIdentityCanonicalScopeKey,
 } from './session-identity-http.js';
+import { SESSION_IDENTITY_SCOPES, sessionIdentitySessionKey } from '../../../shared/session-identity.js';
 
 export const sessionMgmtRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -548,22 +550,92 @@ sessionMgmtRoutes.put('/:id/sessions/:name/supervision/defaults', async (c) => {
  * or writing the participant account's same-named profile would acknowledge a
  * save that the owner's daemon can never observe.
  */
+/**
+ * Server-level identity access (the new-session dialog, before a session
+ * exists). The session will run on the machine owner's daemon under the
+ * owner's profiles, so a server participant must edit those -- not the
+ * participant account's own, which that daemon never reads. Only whole-server
+ * participants qualify: a session-scoped share cannot create sessions.
+ */
+async function resolveServerIdentityOwner(
+  c: Context<{ Bindings: Env; Variables: { userId: string; role: string } }>,
+): Promise<{ ok: true; ownerUserId: string } | { ok: false; response: Response }> {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('id')!;
+  const access = await resolveHttpShareAccess(c.env.DB, {
+    serverId,
+    userId,
+    target: { kind: 'server', serverId },
+  });
+  if (access.actor.kind === 'none') {
+    return { ok: false, response: c.json({ error: 'forbidden', reason: 'not_authorized_for_server' }, 403) };
+  }
+  if (access.actor.kind === 'share'
+    && (access.actor.effectiveActorRole !== 'participant' || access.shareProvenance !== 'server')) {
+    return { ok: false, response: c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403) };
+  }
+  const server = await getServerById(c.env.DB, serverId);
+  if (!server) return { ok: false, response: c.json({ error: 'not_found' }, 404) };
+  return { ok: true, ownerUserId: server.user_id };
+}
+
+sessionMgmtRoutes.get('/:id/identity', async (c) => {
+  const resolved = await resolveServerIdentityOwner(c);
+  if (!resolved.ok) return resolved.response;
+  return handleSessionIdentityGet(c, resolved.ownerUserId);
+});
+
+sessionMgmtRoutes.put('/:id/identity', async (c) => {
+  const resolved = await resolveServerIdentityOwner(c);
+  if (!resolved.ok) return resolved.response;
+  return handleSessionIdentityPut(c, resolved.ownerUserId);
+});
+
+sessionMgmtRoutes.delete('/:id/identity', async (c) => {
+  const resolved = await resolveServerIdentityOwner(c);
+  if (!resolved.ok) return resolved.response;
+  return handleSessionIdentityDelete(c, resolved.ownerUserId);
+});
+
+/**
+ * Session-bound identity keys come from the session itself, not the browser.
+ * A share recipient's session list omits `contextNamespace`, so its browser
+ * could only guess the project key (the bare project name) and read/write a
+ * profile the owner's daemon never uses -- participants saw an empty project
+ * identity. The session key is pinned the same way.
+ */
+function canonicalSessionIdentityScopeKey(
+  serverId: string,
+  sessionName: string,
+): SessionIdentityCanonicalScopeKey {
+  return (scope) => {
+    if (scope === SESSION_IDENTITY_SCOPES.SESSION) return sessionIdentitySessionKey(serverId, sessionName);
+    if (scope === SESSION_IDENTITY_SCOPES.PROJECT) {
+      return WsBridge.get(serverId).resolveSessionIdentityProjectKey(sessionName);
+    }
+    return null;
+  };
+}
+
 sessionMgmtRoutes.get('/:id/sessions/:name/identity', async (c) => {
   const resolved = await resolveSupervisorDefaultsOwner(c);
   if (!resolved.ok) return resolved.response;
-  return handleSessionIdentityGet(c, resolved.ownerUserId);
+  return handleSessionIdentityGet(c, resolved.ownerUserId,
+    canonicalSessionIdentityScopeKey(c.req.param('id')!, c.req.param('name')!));
 });
 
 sessionMgmtRoutes.put('/:id/sessions/:name/identity', async (c) => {
   const resolved = await resolveSupervisorDefaultsOwner(c);
   if (!resolved.ok) return resolved.response;
-  return handleSessionIdentityPut(c, resolved.ownerUserId);
+  return handleSessionIdentityPut(c, resolved.ownerUserId,
+    canonicalSessionIdentityScopeKey(c.req.param('id')!, c.req.param('name')!));
 });
 
 sessionMgmtRoutes.delete('/:id/sessions/:name/identity', async (c) => {
   const resolved = await resolveSupervisorDefaultsOwner(c);
   if (!resolved.ok) return resolved.response;
-  return handleSessionIdentityDelete(c, resolved.ownerUserId);
+  return handleSessionIdentityDelete(c, resolved.ownerUserId,
+    canonicalSessionIdentityScopeKey(c.req.param('id')!, c.req.param('name')!));
 });
 
 /** PATCH /api/server/:id/sessions/:name — update session settings (label, description, cwd) */

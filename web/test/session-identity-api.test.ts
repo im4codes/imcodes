@@ -44,4 +44,19 @@ describe('session identity API routing', () => {
     expect(fetchMock).toHaveBeenNthCalledWith(2, path, expect.objectContaining({ method: 'PUT' }));
     expect(fetchMock).toHaveBeenNthCalledWith(3, `${path}?scope=project&scopeKey=repo%2Fstable`, expect.objectContaining({ method: 'DELETE' }));
   });
+
+  it('uses the machine-owner server route before a session exists', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ profile: null }), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    }));
+    const { fetchSessionIdentityProfile } = await import('../src/api.js');
+
+    await fetchSessionIdentityProfile('project', 'proj', { serverId: 'srv-1' });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/server/srv-1/identity?scope=project&scopeKey=proj',
+      expect.objectContaining({ cache: 'no-store' }),
+    );
+  });
 });

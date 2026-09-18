@@ -3,6 +3,8 @@ import { listSessions, type SessionRecord } from '../store/session-store.js';
 import {
   SESSION_IDENTITY_SCOPES,
   renderSessionIdentityProfiles,
+  sessionIdentityProjectKey,
+  sessionIdentitySessionKey,
   type SessionIdentityProfile,
 } from '../../shared/session-identity.js';
 import {
@@ -40,8 +42,11 @@ function profilesForSession(
   session: SessionRecord,
   serverId: string,
 ): SessionIdentityProfile[] {
-  const sessionKey = `${serverId}:${session.name}`;
-  const projectKey = session.contextNamespace?.projectId?.trim() || session.projectName;
+  const sessionKey = sessionIdentitySessionKey(serverId, session.name);
+  const projectKey = sessionIdentityProjectKey({
+    contextNamespace: session.contextNamespace,
+    project: session.projectName,
+  });
   return profiles.filter((profile) => (
     (profile.scope === SESSION_IDENTITY_SCOPES.USER && profile.scopeKey === '')
     || (profile.scope === SESSION_IDENTITY_SCOPES.PROJECT && profile.scopeKey === projectKey)

@@ -7,6 +7,7 @@ import {
   sessionIdentityContentError,
   sessionIdentityContentLength,
   sessionIdentityMaxChars,
+  sessionIdentitySessionKey,
   type SessionIdentityProfile,
   type SessionIdentityScope,
 } from '@shared/session-identity.js';
@@ -52,9 +53,9 @@ export function SessionIdentityTabs({
   const scopeKey = useMemo(() => ({
     user: '',
     project: projectKey?.trim() ?? '',
-    session: sessionName ? `${serverId}:${sessionName}` : '',
+    session: sessionName ? sessionIdentitySessionKey(serverId, sessionName) : '',
   }), [projectKey, serverId, sessionName]);
-  const accessContext = useMemo(() => sessionName ? { serverId, sessionName } : undefined, [serverId, sessionName]);
+  const accessContext = useMemo(() => (sessionName ? { serverId, sessionName } : { serverId }), [serverId, sessionName]);
 
   useEffect(() => {
     let live = true;

@@ -389,6 +389,7 @@ import {
   type SessionGroupCloneSkippedMember,
   type SessionGroupCloneWarning,
 } from '../../../shared/session-group-clone.js';
+import { sessionIdentityProjectKey } from '../../../shared/session-identity.js';
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../../shared/git-remote-url.js';
 import { P2P_CONFIG_MSG } from '../../../shared/p2p-config-events.js';
 import { p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../../../shared/p2p-config-scope.js';
@@ -1916,6 +1917,14 @@ export class WsBridge {
   /** Latest daemon-owned active sub-session snapshot for push title resolution. */
   private activeSubSessions = new Map<string, WatchActiveSubSessionRow>();
   private hasActiveMainSessionSnapshot = false;
+  /**
+   * Project-identity scope key per session, exactly as the daemon derives it
+   * (sessionIdentityProjectKey). Browser session lists for share recipients
+   * omit `contextNamespace`, so a participant's browser cannot know the key;
+   * the shared identity route resolves it here instead.
+   */
+  private mainIdentityProjectKeys = new Map<string, string>();
+  private subIdentityProjectKeys = new Map<string, string>();
 
   /**
    * File transfer correlation: requestId → { resolve, reject, timer }.
@@ -7157,6 +7166,10 @@ export class WsBridge {
             ? getSessionRuntimeType(agentType)
             : undefined;
         this.activeSubSessions.set(subSessionName, { name: subSessionName, label, parentSession, agentType, runtimeType });
+        const subIdentityProjectKey = sessionIdentityProjectKey({
+          contextNamespace: msg.contextNamespace as { projectId?: unknown } | null | undefined,
+        });
+        if (subIdentityProjectKey) this.subIdentityProjectKeys.set(subSessionName, subIdentityProjectKey);
         this.sessionRuntimeTypes.set(subSessionName, this.normalizeRuntimeType(runtimeType));
         if (msg.state === 'idle') this.activeDispatchIds.delete(subSessionName);
       }
@@ -7660,12 +7673,18 @@ export class WsBridge {
 
   private replaceActiveMainSessions(rawSessions: unknown): void {
     this.activeMainSessions.clear();
+    this.mainIdentityProjectKeys.clear();
     this.hasActiveMainSessionSnapshot = true;
     if (!Array.isArray(rawSessions)) return;
     for (const item of rawSessions) {
       if (!item || typeof item !== 'object') continue;
       const row = item as Record<string, unknown>;
       const name = typeof row.name === 'string' ? row.name : '';
+      const identityProjectKey = sessionIdentityProjectKey({
+        contextNamespace: row.contextNamespace as { projectId?: unknown } | null | undefined,
+        project: row.project,
+      });
+      if (name && identityProjectKey) this.mainIdentityProjectKeys.set(name, identityProjectKey);
       const project = typeof row.project === 'string' ? row.project : '';
       const state = typeof row.state === 'string' ? row.state : 'stopped';
       const agentType = typeof row.agentType === 'string' ? row.agentType : '';
@@ -11055,6 +11074,20 @@ export class WsBridge {
       ...this.daemonP2pWorkflowCapabilities,
       capabilities: [...this.daemonP2pWorkflowCapabilities.capabilities],
     };
+  }
+
+  /**
+   * The project-identity scope key the daemon uses for this session, or null
+   * when this pod has not seen the session reported yet. A sub-session without
+   * its own context namespace shares its parent's project.
+   */
+  resolveSessionIdentityProjectKey(sessionName: string): string | null {
+    const main = this.mainIdentityProjectKeys.get(sessionName);
+    if (main) return main;
+    const sub = this.subIdentityProjectKeys.get(sessionName);
+    if (sub) return sub;
+    const parent = this.activeSubSessions.get(sessionName)?.parentSession;
+    return (parent && this.mainIdentityProjectKeys.get(parent)) || null;
   }
 
   hasDaemonCapability(capability: string, _now = Date.now()): boolean {

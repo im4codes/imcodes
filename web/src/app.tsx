@@ -19,6 +19,7 @@ import {
   type FileBrowserPreviewUpdate,
 } from './components/file-browser-lazy.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
+import { sessionIdentityProjectKey } from '@shared/session-identity.js';
 import { AUTH_IDENTITY_ERRORS } from '@shared/auth-identity.js';
 import { REMOTE_DESKTOP_STOP_ORIGIN } from '@shared/remote-desktop.js';
 import { FS_SESSION_ROOT_PATH } from '../../src/shared/transport/fs.js';
@@ -581,6 +582,27 @@ function findSharedEntryForHash(
     if (subSession) return subSession;
   }
   return candidates.find((entry) => entry.target.kind === 'server') ?? null;
+}
+
+/**
+ * The project key the identity editor starts from. A sub-session is not in the
+ * main-session list, so it falls back to its own namespace and then to its
+ * parent's project (share recipients never see `contextNamespace`; the server
+ * replaces the key with the daemon's canonical one on the session-bound route).
+ */
+function settingsIdentityProjectKey(
+  target: { sessionName: string; subId?: string; parentSession?: string | null },
+  sessions: ReadonlyArray<{ name: string; project?: string; contextNamespace?: { projectId?: unknown } | null }>,
+  subSessions: ReadonlyArray<{ id: string; sessionName: string; parentSession?: string | null; contextNamespace?: { projectId?: unknown } | null }>,
+): string | undefined {
+  const main = sessions.find((session) => session.name === target.sessionName);
+  if (main) return sessionIdentityProjectKey(main) || undefined;
+  const sub = subSessions.find((candidate) => candidate.id === target.subId || candidate.sessionName === target.sessionName);
+  const own = sub ? sessionIdentityProjectKey({ contextNamespace: sub.contextNamespace }) : '';
+  if (own) return own;
+  const parentName = sub?.parentSession ?? target.parentSession;
+  const parent = parentName ? sessions.find((session) => session.name === parentName) : undefined;
+  return (parent && sessionIdentityProjectKey(parent)) || undefined;
 }
 
 export function App() {
@@ -7636,8 +7658,7 @@ export function App() {
           activeModel={settingsTarget.activeModel}
           requestedModel={settingsTarget.requestedModel}
           providerId={settingsTarget.providerId}
-          projectKey={sessions.find((session) => session.name === settingsTarget.sessionName)?.contextNamespace?.projectId
-            || sessions.find((session) => session.name === settingsTarget.sessionName)?.project}
+          projectKey={settingsIdentityProjectKey(settingsTarget, sessions, subSessions)}
           peerAuditSessions={peerAuditSettingsSessions}
           poolSessionDialogOpen={poolAddTarget != null}
           onAddPoolSession={canCreateSubSession ? (pool) => {

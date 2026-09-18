@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
+  sessionIdentityProjectKey,
+  sessionIdentitySessionKey,
   SESSION_IDENTITY_BLOCK_CLOSE_TAG,
   SESSION_IDENTITY_BLOCK_OPEN_TAG,
   SESSION_IDENTITY_COMBINED_MAX_CHARS,
@@ -179,5 +181,18 @@ describe('sessionIdentityContentLength is the single authoritative unit', () => 
         expect(sessionIdentityContentError(build(limit + 1), scope)).toBe('identity_content_too_large');
       }
     }
+  });
+});
+
+describe('session identity scope keys', () => {
+  it('keys a project identity by the canonical project id, falling back to the project name', () => {
+    expect(sessionIdentityProjectKey({ contextNamespace: { projectId: ' github-org/repo ' }, project: 'repo' })).toBe('github-org/repo');
+    expect(sessionIdentityProjectKey({ contextNamespace: { projectId: '  ' }, project: ' repo ' })).toBe('repo');
+    expect(sessionIdentityProjectKey({ contextNamespace: null, project: 'repo' })).toBe('repo');
+    expect(sessionIdentityProjectKey({})).toBe('');
+  });
+
+  it('keys a session identity by server and session name', () => {
+    expect(sessionIdentitySessionKey('srv-1', 'deck_proj_brain')).toBe('srv-1:deck_proj_brain');
   });
 });

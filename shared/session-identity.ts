@@ -70,6 +70,28 @@ export interface SessionIdentityProfile {
   sourceFile?: string;
 }
 
+/**
+ * The scope key a session's PROJECT identity lives under: the session's
+ * canonical project id when its context namespace is known, else its project
+ * name. Daemon sync, the server's shared-access route and the web editor must
+ * agree on this exactly, or an edit lands under a key the daemon never reads.
+ */
+export function sessionIdentityProjectKey(session: {
+  contextNamespace?: { projectId?: unknown } | null;
+  project?: unknown;
+}): string {
+  const projectId = typeof session.contextNamespace?.projectId === 'string'
+    ? session.contextNamespace.projectId.trim()
+    : '';
+  if (projectId) return projectId;
+  return typeof session.project === 'string' ? session.project.trim() : '';
+}
+
+/** The scope key a session's SESSION identity lives under. */
+export function sessionIdentitySessionKey(serverId: string, sessionName: string): string {
+  return `${serverId}:${sessionName}`;
+}
+
 export function isSessionIdentityScope(value: unknown): value is SessionIdentityScope {
   return typeof value === 'string'
     && (SESSION_IDENTITY_SCOPE_LIST as readonly string[]).includes(value);

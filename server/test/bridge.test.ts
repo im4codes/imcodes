@@ -1823,6 +1823,38 @@ describe('WsBridge', () => {
       }
     });
 
+    it('tracks each session\'s identity project key exactly as the daemon derives it', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token' }));
+      await flushAsync();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'session_list',
+        sessions: [
+          { name: 'deck_repo_brain', project: 'repo', state: 'idle', contextNamespace: { projectId: 'github-org/repo' } },
+          { name: 'deck_plain_brain', project: 'plain', state: 'idle' },
+        ],
+      }));
+      await flushAsync();
+      expect(bridge.resolveSessionIdentityProjectKey('deck_repo_brain')).toBe('github-org/repo');
+      expect(bridge.resolveSessionIdentityProjectKey('deck_plain_brain')).toBe('plain');
+      expect(bridge.resolveSessionIdentityProjectKey('deck_unknown_brain')).toBeNull();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'subsession.sync', id: 'kid1', parentSession: 'deck_repo_brain', sessionType: 'claude-code', cwd: '/home/k/work/repo',
+      }));
+      daemonWs.emit('message', JSON.stringify({
+        type: 'subsession.sync', id: 'kid2', parentSession: 'deck_repo_brain', sessionType: 'claude-code', cwd: '/home/k/work/other',
+        contextNamespace: { projectId: 'github-org/other' },
+      }));
+      await flushAsync();
+      // Without its own namespace a sub-session shares its parent's project.
+      expect(bridge.resolveSessionIdentityProjectKey('deck_sub_kid1')).toBe('github-org/repo');
+      expect(bridge.resolveSessionIdentityProjectKey('deck_sub_kid2')).toBe('github-org/other');
+    });
+
     it('does not let an error from a replaced socket reject current-generation requests', async () => {
       const bridge = WsBridge.get(serverId);
       const staleWs = new MockWs();

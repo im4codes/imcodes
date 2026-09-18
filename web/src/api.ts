@@ -449,13 +449,22 @@ export async function closeLocalWebPreview(serverId: string, previewId: string):
 
 export interface SessionIdentityAccessContext {
   serverId: string;
-  sessionName: string;
+  /** Omitted before the session exists (new-session dialog). */
+  sessionName?: string;
 }
 
+/**
+ * Identity profiles belong to the machine OWNER. Server/session-bound routes
+ * resolve that owner server-side, so a participant edits the profiles the
+ * owner's daemon actually applies; the bare account route is only for the
+ * caller's own profiles.
+ */
 function sessionIdentityApiPath(context?: SessionIdentityAccessContext): string {
-  return context
-    ? `/api/server/${encodeURIComponent(context.serverId)}/sessions/${encodeURIComponent(context.sessionName)}/identity`
-    : SESSION_IDENTITY_API_PATH;
+  if (!context) return SESSION_IDENTITY_API_PATH;
+  const server = `/api/server/${encodeURIComponent(context.serverId)}`;
+  return context.sessionName
+    ? `${server}/sessions/${encodeURIComponent(context.sessionName)}/identity`
+    : `${server}/identity`;
 }
 
 function sessionIdentityQuery(
