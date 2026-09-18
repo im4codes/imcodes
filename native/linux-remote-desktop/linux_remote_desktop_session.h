@@ -115,6 +115,35 @@ class LinuxNoopEncoderAdapter final : public common::EncoderAdapter {
   void Stop() noexcept override {}
 };
 
+// The capture adapter this session's SessionCore sees. SessionCore stops its
+// capture adapter whenever the session ends (StopPlatformResources, also run
+// by its destructor), but on Linux the real X11 capture is one process-wide
+// instance shared by every session through the SharedCaptureMultiplexer in
+// linux_native_video_source.cc, which alone may stop it -- once its last
+// lease is gone. Handed the shared adapter itself, the first session to end
+// stopped capture for all the others while the multiplexer still counted it
+// as running: every session started after that connected, opened its data
+// channels, and never sent a single video byte (mediaStarted stayed false,
+// so the Server killed each attempt at its negotiation deadline) until the
+// last older session was gone -- up to the five-minute grace a reloaded
+// page's old route is held for. Readiness still comes from the real adapter;
+// starting and stopping belong to the leases.
+class LinuxSessionCaptureView final : public common::CaptureAdapter {
+ public:
+  explicit LinuxSessionCaptureView(common::CaptureAdapter& shared) noexcept
+      : shared_(shared) {}
+  common::ReadinessState ProbeReadiness() override {
+    return shared_.ProbeReadiness();
+  }
+  bool Start(const common::DisplayTopology&, common::CapturedFrameSink) override {
+    return false;
+  }
+  void Stop() noexcept override {}
+
+ private:
+  common::CaptureAdapter& shared_;
+};
+
 class LinuxRemoteDesktopSession final
     : public webrtc::PeerConnectionObserver,
       private common::TransportSessionAdapter,
@@ -369,6 +398,7 @@ class LinuxRemoteDesktopSession final
   // anyway) so SessionCore's own StopPlatformResources() runs before
   // anything it depends on is torn down.
   LinuxNoopEncoderAdapter noop_encoder_;
+  LinuxSessionCaptureView capture_view_;
   common::SessionCore core_;
   bool core_started_ = false;
   bool closed_ = false;

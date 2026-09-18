@@ -186,8 +186,9 @@ LinuxRemoteDesktopSession::LinuxRemoteDesktopSession(
       signaling_thread_(signaling_thread),
       emit_ice_candidate_(std::move(emit_ice_candidate)),
       transport_core_(*this, quality_ladder_),
+      capture_view_(adapters.capture()),
       core_(common::PlatformAdapters{
-          adapters.capture(), noop_encoder_, adapters.input(),
+          capture_view_, noop_encoder_, adapters.input(),
           adapters.clipboard(), adapters.display(), adapters.disclosure(),
           adapters.session_monitor()}) {}
 
