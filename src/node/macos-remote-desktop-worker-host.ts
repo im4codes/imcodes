@@ -658,8 +658,12 @@ export class MacosRemoteDesktopWorkerHost {
 
   async handle(message: unknown): Promise<boolean> {
     const parsed = validateRemoteDesktopDaemonCommand(message);
-    if (!parsed.ok || !this.available()) return false;
+    if (!parsed.ok) return false;
     const command = parsed.value;
+    if (!this.available()) {
+      if (command.type === REMOTE_DESKTOP_MSG.PREPARE) this.reportPrepareRefusal('unavailable');
+      return false;
+    }
     if (command.type === REMOTE_DESKTOP_MSG.PREPARE) {
       // Marked BEFORE the readiness re-check. That check launches a native
       // process and takes seconds, and the browser sends its OFFER the moment it
@@ -670,11 +674,13 @@ export class MacosRemoteDesktopWorkerHost {
       // A route arriving while the replacement generation is still launching
       // waits for it rather than being refused (see REPLACEMENT_WORKER_WAIT_MS).
       if (!this.authenticated && !await this.waitForReplacementWorker()) {
+        this.reportPrepareRefusal('replacement_not_ready');
         finishPreparing();
         return false;
       }
       const generation = this.lifecycleGeneration;
       if (!await this.revalidateReadinessForPrepare(command.mode, generation)) {
+        this.reportPrepareRefusal('readiness', generation);
         finishPreparing();
         return false;
       }
@@ -730,6 +736,29 @@ export class MacosRemoteDesktopWorkerHost {
       this.stoppingSessions.add(command.sessionId);
     }
     return sent;
+  }
+
+  /**
+   * A refused PREPARE surfaces to the browser only as worker_failed. Say which
+   * step refused it and what this host believed at that moment -- a Mac that
+   * refused every reconnect for twenty seconds after a stop could not be
+   * diagnosed from the terminal reason alone.
+   */
+  private reportPrepareRefusal(step: string, generation = this.lifecycleGeneration): void {
+    const state = [
+      `authenticated=${String(this.authenticated)}`,
+      `available=${String(this.available())}`,
+      `current=${String(this.isCurrent(generation))}`,
+      `lifecycle=${this.lifecycleGeneration}`,
+      `worker=${this.activeWorkerGeneration}`,
+      `profile=${this.profile.mode}`,
+      `artifact=${String(this.activeArtifact !== null)}`,
+      `retained=${String(this.preserveProfileForNextStart || this.retainedProfileStartGeneration !== null)}`,
+      `starting=${String(this.startPromise !== null)}`,
+    ].join(',');
+    this.options.onBackgroundError?.(
+      new Error(`macos_remote_desktop_prepare_refused:${step}:${state}`),
+    );
   }
 
   /**
