@@ -34,6 +34,7 @@ const LOCALES = ['en', 'es', 'ja', 'ko', 'ru', 'zh-CN', 'zh-TW'] as const;
 /** Files that render or return `controlled_nodes.*` translation keys. */
 const SOURCES = [
   'src/components/ControlledNodesPanel.tsx',
+  'src/components/DaemonRemoteDesktopSetup.tsx',
   'src/api.ts',
 ];
 

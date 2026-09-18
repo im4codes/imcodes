@@ -28,7 +28,11 @@ import {
   type ControlledNodeOs,
   type ControlledNodeTicketDelivery,
 } from '@shared/controlled-node-artifacts.js';
-import { MACHINE_API_PATH, MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
+import {
+  MACHINE_API_PATH,
+  MACHINE_HOST_LINK_ROUTE,
+  MACHINE_IDENTITY_UNAVAILABLE,
+} from '@shared/machine-reference.js';
 import { isControlledNodeId } from '@shared/controlled-node-identity.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
 import { isMachineAccessRole, type MachineAccessRole } from '@shared/remote-exec.js';
@@ -459,6 +463,22 @@ export async function setMachineGroupMembership(
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ teamId, member }),
+  });
+}
+
+/**
+ * Declare which daemon this controlled node shares a computer with, or clear it
+ * with `null`. Owner-only. That daemon's remote-desktop button then opens this
+ * node instead of offering to install one.
+ */
+export async function setMachineHostServer(
+  serverId: string,
+  hostServerId: string | null,
+): Promise<void> {
+  await apiFetch(`${MACHINE_API_PATH}${MACHINE_HOST_LINK_ROUTE}?serverId=${encodeURIComponent(serverId)}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ hostServerId }),
   });
 }
 

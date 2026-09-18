@@ -6355,6 +6355,7 @@ export function App() {
                   serverName={selectedServerInfo?.name}
                   daemonOnline={daemonOnline}
                   onOpen={openRemoteDesktop}
+                  canSetUp={!selectedShareTarget}
                 />
                 {activeSession && (
                   <button
@@ -6463,6 +6464,7 @@ export function App() {
                   serverName={selectedServerInfo?.name}
                   daemonOnline={daemonOnline}
                   onOpen={openRemoteDesktop}
+                  canSetUp={!selectedShareTarget}
                 />
               </div>
             )}
@@ -6479,6 +6481,7 @@ export function App() {
                   serverName={selectedServerInfo?.name}
                   daemonOnline={daemonOnline}
                   onOpen={openRemoteDesktop}
+                  canSetUp={!selectedShareTarget}
                 />
                 <button
                   class="view-toggle"
@@ -6984,6 +6987,7 @@ export function App() {
                     serverName={selectedServerInfo?.name}
                     daemonOnline={daemonOnline}
                     onOpen={openRemoteDesktop}
+                    canSetUp={!selectedShareTarget}
                   />
                   <button
                     style={{ fontSize: 10, color: '#38bdf8', background: 'none', border: '1px solid #334155', borderRadius: 4, padding: '1px 5px', cursor: 'pointer' }}
@@ -7467,6 +7471,7 @@ export function App() {
               connected={connected}
               daemonOnline={daemonOnline}
               onOpenRemoteDesktop={openRemoteDesktop}
+              remoteDesktopCanSetUp={!selectedShareTarget}
               active={windowVisible && (isMobile || focusedSubId === sub.id)}
               visible={windowVisible}
               onPendingQuestion={surfaceAskQuestionFromHistory}

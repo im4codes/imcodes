@@ -17,7 +17,12 @@ import { EXPECTED_USER_ID_HEADER } from '../../../shared/http-header-names.js';
 import { ENROLLMENT_OWNER_NAME_MAX_CHARS, NODE_ROLE, encodeEnrollmentTrailer, isEnrollmentNodeTokenHash } from '../../../shared/remote-exec.js';
 import { REMOTE_DESKTOP_PROTOCOL_VERSION } from '../../../shared/remote-desktop.js';
 import { buildWindowsAuthenticodeEnrollmentPlan } from '../../../shared/windows-authenticode-enrollment.js';
-import { classifyMachineTarget, deriveDisplayName } from '../../../shared/machine-reference.js';
+import {
+  MACHINE_HOST_LINK_ERROR,
+  classifyMachineTarget,
+  deriveDisplayName,
+} from '../../../shared/machine-reference.js';
+import { isOwnedHostDaemon } from '../services/controlled-node-host-link.js';
 import {
   isCanonicalControlledNodePair,
   CONTROLLED_NODE_ARTIFACT_COMPRESSION_ENCODING,
@@ -216,12 +221,9 @@ enrollRoutes.post('/v2/ticket', requireAuth(), async (c) => {
     // Only over a daemon this same user owns: the host link decides which entry
     // a browser will steer remote control to, so it must not be assignable to
     // someone else's machine.
-    const host = await (c.env.DB as Database).queryOne<{ id: string }>(
-      `SELECT id FROM servers
-        WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL AND node_role IS DISTINCT FROM $3`,
-      [hostServerId, userId, NODE_ROLE.CONTROLLED],
-    );
-    if (!host) return c.json({ error: 'invalid_host_server' }, 403);
+    if (!await isOwnedHostDaemon(c.env.DB as Database, userId, hostServerId)) {
+      return c.json({ error: MACHINE_HOST_LINK_ERROR.INVALID_HOST_SERVER }, 403);
+    }
   }
 
   const dir = process.env.IMCODES_NODE_EXE_DIR;

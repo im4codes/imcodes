@@ -1,0 +1,109 @@
+/* Above the toolbar it is opened from, like the other app dialogs. */
+.daemon-rd-setup-overlay {
+  z-index: 10030;
+}
+
+.daemon-rd-setup {
+  width: min(520px, calc(100vw - 24px));
+}
+
+.daemon-rd-setup .dialog-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  color: #cbd5e1;
+  font-size: 13px;
+}
+
+.daemon-rd-setup-intro {
+  margin: 0;
+  color: #94a3b8;
+  line-height: 1.5;
+}
+
+.daemon-rd-setup-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  background: rgb(15 23 42 / 60%);
+}
+
+.daemon-rd-setup-section h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: #f1f5f9;
+}
+
+.daemon-rd-setup-note {
+  margin: 0;
+  color: #94a3b8;
+  line-height: 1.5;
+}
+
+.daemon-rd-setup-usage {
+  color: #a5f3fc;
+}
+
+.daemon-rd-setup-machine {
+  font-weight: 600;
+  color: #e2e8f0;
+}
+
+.daemon-rd-setup-target,
+.daemon-rd-setup-link-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.daemon-rd-setup-link-row select {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid #334155;
+  border-radius: 6px;
+  background: #0f172a;
+  color: #e2e8f0;
+}
+
+.daemon-rd-setup-primary,
+.daemon-rd-setup-secondary {
+  flex-shrink: 0;
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.daemon-rd-setup-primary {
+  align-self: flex-start;
+  border: 1px solid #0e7490;
+  background: #155e75;
+  color: #ecfeff;
+}
+
+.daemon-rd-setup-secondary {
+  border: 1px solid #334155;
+  background: transparent;
+  color: #cbd5e1;
+}
+
+.daemon-rd-setup-section > .daemon-rd-setup-secondary {
+  align-self: flex-start;
+}
+
+.daemon-rd-setup-primary:disabled,
+.daemon-rd-setup-secondary:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.daemon-rd-setup-error {
+  margin: 0;
+  color: #f87171;
+}

@@ -10,9 +10,14 @@
  */
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { h } from 'preact';
-import { render, cleanup, act, fireEvent } from '@testing-library/preact';
+import { render, cleanup, act, fireEvent, screen, waitFor } from '@testing-library/preact';
 
 const mintTicket = vi.fn(async () => ({ ticket: 'ticket_minted_value' }));
+const setHostServer = vi.fn(async () => undefined);
+const requestPermissions = vi.fn(async () => undefined);
+const listAvailable = vi.fn(async () => ({ available: [], artifacts: [] as unknown[] }));
+const createInstallCommand = vi.fn(async () => ({ command: 'curl … | sudo sh', expiresAt: 1, ticketId: 't' }));
+const refetch = vi.fn(async () => null);
 /**
  * One mintable Desk, auto-selected. Before R5 this call passed `serverId` where
  * the Desk now sits; both are strings, so TypeScript could not catch it. The
@@ -23,10 +28,24 @@ const listMintableDesks = vi.fn(async () => [TEST_DESK]);
 vi.mock('../../src/api.js', async (importOriginal) => ({
   ...(await importOriginal() as Record<string, unknown>),
   listMintableDesks: () => listMintableDesks(),
+  createControlledNodeInstallCommand: (...args: unknown[]) => createInstallCommand(...args as []),
 }));
 vi.mock('../../src/api/machines.js', async (importOriginal) => ({
   ...(await importOriginal() as Record<string, unknown>),
   mintControlledNodeExecutableTicket: (...args: unknown[]) => mintTicket(...args as []),
+  setMachineHostServer: (...args: unknown[]) => setHostServer(...args as []),
+  requestMachineRemoteDesktopPermissions: (...args: unknown[]) => requestPermissions(...args as []),
+  listAvailableExecutables: () => listAvailable(),
+}));
+// Every test supplies `machines`, so the shared list is only the refetch seam.
+vi.mock('../../src/hooks/useMachines.js', () => ({
+  useMachines: () => ({ machines: [], refetch }),
+}));
+// jsdom has no clipboard; the component's contract is only that it asks.
+vi.mock('../../src/util/clipboard.js', () => ({
+  copyToClipboardWhenReady: (pending: Promise<string>, onSuccess: () => void) => {
+    void pending.then(() => onSuccess());
+  },
 }));
 
 vi.mock('react-i18next', () => ({
@@ -50,6 +69,12 @@ const {
   REMOTE_DESKTOP_LOGIN_SCREEN_STATE,
   REMOTE_DESKTOP_LOGIN_SCREEN_ERROR,
 } = await import('@shared/remote-desktop-login-screen.js');
+const {
+  REMOTE_DESKTOP_ENCODER_CAPABILITY,
+  REMOTE_DESKTOP_PLATFORM_CAPABILITY,
+  REMOTE_DESKTOP_SESSION_CAPABILITY,
+} = await import('@shared/remote-desktop-platform.js');
+const { REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY } = await import('@shared/remote-desktop-access.js');
 const { DaemonRemoteDesktopControl } = await import('../../src/components/DaemonRemoteDesktopControl.js');
 
 type MessageHandler = (message: Record<string, unknown>) => void;
@@ -99,12 +124,107 @@ beforeEach(() => {
 afterEach(() => {
   confirmSpy.mockRestore();
   cleanup();
+  vi.clearAllMocks();
 });
 
 describe('DaemonRemoteDesktopControl', () => {
-  it('renders nothing for a daemon that cannot serve remote control', () => {
-    const { view } = mount([]);
-    expect(view.container.querySelector('button')).toBeNull();
+  describe('a daemon with no remote desktop of its own (Linux, macOS)', () => {
+    // Its remote desktop is the controlled node on the same computer.
+    const node = {
+      serverId: 'controlled_linux',
+      nodeId: '9535523706',
+      refName: 'node-211',
+      displayName: '211',
+      os: 'linux',
+      online: true,
+      execEnabled: true,
+      accessRole: 'owner',
+      capabilities: [REMOTE_DESKTOP_CAPABILITY],
+    };
+
+    it('still offers the button, and a click asks for what is missing instead of failing', () => {
+      const { view } = mount([]);
+      const button = view.container.querySelector('button')!;
+      expect(button.getAttribute('title')).toBe('remote_desktop.setup_button_hint');
+      fireEvent.click(button);
+      expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+      expect(document.querySelector('[data-testid="daemon-rd-setup-install"]')).not.toBeNull();
+      expect(document.querySelector('[data-testid="daemon-rd-setup-link"]')).not.toBeNull();
+    });
+
+    it('opens the controlled node linked to this daemon directly', () => {
+      const { view, onOpen } = mount([], { machines: [{ ...node, hostServerId: 'server_1' }] });
+      const button = view.container.querySelector('button')!;
+      expect(button.getAttribute('title')).toBe('remote_desktop.daemon_control_linked');
+      fireEvent.click(button);
+      expect(onOpen).toHaveBeenCalledWith(expect.objectContaining({ serverId: 'controlled_linux' }));
+      expect(document.querySelector('[role="dialog"]')).toBeNull();
+    });
+
+    it('asks a linked Mac that is one permission away for the grant instead of opening it', async () => {
+      const mac = {
+        ...node,
+        serverId: 'controlled_mac',
+        os: 'mac',
+        hostServerId: 'server_1',
+        // Everything but the capture adapter: Screen Recording not granted yet.
+        capabilities: [
+          REMOTE_DESKTOP_SESSION_CAPABILITY,
+          REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS,
+          REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+          REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+        ],
+      };
+      const { view, onOpen } = mount([], { machines: [mac] });
+      fireEvent.click(view.container.querySelector('button')!);
+      expect(onOpen).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByText('remote_desktop.request_permission'));
+      await waitFor(() => expect(requestPermissions).toHaveBeenCalledWith('controlled_mac'));
+    });
+
+    it('links an already-installed node to this daemon, once, and re-reads the list', async () => {
+      const { view } = mount([], { machines: [node] });
+      fireEvent.click(view.container.querySelector('button')!);
+      const select = document.querySelector('[data-testid="daemon-rd-setup-link"] select') as HTMLSelectElement;
+      // A native change, as a browser sends it: testing-library's synthesized
+      // change does not reach a listener inside a portal under preact/compat.
+      act(() => {
+        select.value = 'controlled_linux';
+        select.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      const linkButton = screen.getByText('remote_desktop.setup_link_action') as HTMLButtonElement;
+      expect(linkButton.disabled).toBe(false);
+      fireEvent.click(linkButton);
+      await waitFor(() => expect(setHostServer).toHaveBeenCalledWith('controlled_linux', 'server_1'));
+      await waitFor(() => expect(refetch).toHaveBeenCalled());
+    });
+
+    it('mints the install command for this daemon, so the new node links itself', async () => {
+      listAvailable.mockResolvedValueOnce({
+        available: ['linux'],
+        artifacts: [{ os: 'linux', arch: 'x64', filename: 'imcodes-node', sizeBytes: 1, sha256: 'a'.repeat(64) }],
+      });
+      const { view } = mount([]);
+      fireEvent.click(view.container.querySelector('button')!);
+      fireEvent.click(await screen.findByText('controlled_nodes.copy_install_command'));
+      await waitFor(() => expect(createInstallCommand).toHaveBeenCalledWith({ os: 'linux', arch: 'x64' }, 'server_1'));
+      // Then says how to run it on that system.
+      await screen.findByText('controlled_nodes.usage_linux_command');
+    });
+
+    it('lets a right-click reopen setup to change a link that would otherwise just open', () => {
+      const { view, onOpen } = mount([], { machines: [{ ...node, hostServerId: 'server_1' }] });
+      fireEvent.contextMenu(view.container.querySelector('button')!);
+      expect(onOpen).not.toHaveBeenCalled();
+      expect(document.querySelector('[data-testid="daemon-rd-setup-linked"]')).not.toBeNull();
+      fireEvent.click(screen.getByText('remote_desktop.setup_unlink'));
+      return waitFor(() => expect(setHostServer).toHaveBeenCalledWith('controlled_linux', null));
+    });
+
+    it('renders nothing on a daemon shared with this user when nothing openable is linked', () => {
+      const { view } = mount([], { canSetUp: false });
+      expect(view.container.querySelector('button')).toBeNull();
+    });
   });
 
   it('renders nothing while the daemon is offline, however it is capable', () => {

@@ -3914,6 +3914,27 @@
     "request_permission": "申请权限",
     "requesting_permission": "正在请求该 Mac…",
     "request_permission_failed": "无法在该 Mac 上弹出授权窗口。",
-    "request_permission_hint": "会在那台 Mac 上弹出授权窗口，需要有人在机器前点击允许。"
+    "request_permission_hint": "会在那台 Mac 上弹出授权窗口，需要有人在机器前点击允许。",
+    "setup_title": "{{server}} 的远程桌面",
+    "setup_intro": "这台电脑的远程桌面由它上面运行的 IM.codes 受控节点提供。",
+    "setup_button_hint": "为这台电脑设置远程桌面",
+    "daemon_control_linked": "远程控制 · {{machine}}",
+    "setup_linked_heading": "这台电脑上的受控节点",
+    "setup_node_offline": "它当前离线。请在这台电脑上启动它后再试。",
+    "setup_node_unavailable": "它上面的远程桌面暂不可用。",
+    "setup_unlink": "不是这台电脑？解除关联",
+    "setup_unlink_failed": "解除关联失败，请重试。",
+    "setup_install_heading": "在这台电脑上安装",
+    "setup_install_hint": "复制对应这台电脑系统的命令，在这台电脑的终端里运行。上线后，这个按钮会直接打开它的远程桌面。",
+    "setup_link_heading": "这台电脑已经装好了？",
+    "setup_link_hint": "选择就是这台电脑的受控机器。只需设置一次。",
+    "setup_link_placeholder": "选择机器…",
+    "setup_link_action": "关联",
+    "setup_link_none": "没有未关联的受控机器。",
+    "setup_link_failed": "关联失败，请重试。",
+    "setup_link_conflict": "这台机器已属于另一个远程桌面身份。",
+    "platform_linux": "Linux",
+    "platform_mac": "macOS",
+    "platform_win": "Windows"
   }
 }

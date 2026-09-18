@@ -24,6 +24,11 @@ import { issueSharedMachineAuthorityForSession } from '../share/shared-machine-a
 import { SHARED_MACHINE_AUTHORITY_FIELD } from '../../../shared/shared-machine-authority.js';
 import { resolveServerRole } from '../security/authorization.js';
 import { DAEMON_MSG } from '../../../shared/daemon-events.js';
+import {
+  CONTROLLED_NODE_HOST_AUTO_LINK_OUTCOME,
+  validateControlledNodeLocalDaemonsMessage,
+} from '../../../shared/controlled-node-host-link.js';
+import { autoLinkControlledNodeHost } from '../services/controlled-node-host-link.js';
 import type {
   CapabilityFinding,
   CapabilityInstallState,
@@ -4813,6 +4818,29 @@ export class WsBridge {
             || !resolvePendingAutoUnlock(this.serverId, this.daemonGeneration, result)) {
             WsBridge.controlledInboundDropped++;
           }
+          return;
+        }
+        if (msg.type === DAEMON_MSG.CONTROLLED_NODE_LOCAL_DAEMONS) {
+          // The daemons bound on this node's computer. Only their ids arrive,
+          // and the link is decided against the DB: a node can only ever be
+          // joined to a daemon of its own owner, so a forged report can at most
+          // mislink that owner's own button.
+          const report = validateControlledNodeLocalDaemonsMessage(msg);
+          const db = this.db;
+          if (!report || !db) {
+            WsBridge.controlledInboundDropped++;
+            return;
+          }
+          void autoLinkControlledNodeHost(db, {
+            nodeServerId: this.serverId,
+            reportedServerIds: report.serverIds,
+          }).then((outcome) => {
+            if (outcome === CONTROLLED_NODE_HOST_AUTO_LINK_OUTCOME.LINKED) {
+              logger.info({ serverId: this.serverId }, 'controlled node linked to the daemon on its computer');
+            }
+          }).catch((err) => {
+            logger.warn({ err, serverId: this.serverId }, 'controlled node host auto-link failed');
+          });
           return;
         }
         if (msg.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE || msg.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.ERROR) {

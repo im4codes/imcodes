@@ -3913,6 +3913,27 @@
     "request_permission": "アクセスを許可",
     "requesting_permission": "その Mac に要求中…",
     "request_permission_failed": "その Mac でダイアログを表示できませんでした。",
-    "request_permission_hint": "その Mac で許可ダイアログを開きます。実機の前にいる人が応答する必要があります。"
+    "request_permission_hint": "その Mac で許可ダイアログを開きます。実機の前にいる人が応答する必要があります。",
+    "setup_title": "{{server}} のリモートデスクトップ",
+    "setup_intro": "このコンピューターのリモートデスクトップは、そこで動作している IM.codes 管理対象ノードが提供します。",
+    "setup_button_hint": "このコンピューターのリモートデスクトップを設定",
+    "daemon_control_linked": "リモート操作 · {{machine}}",
+    "setup_linked_heading": "このコンピューターの管理対象ノード",
+    "setup_node_offline": "オフラインです。このコンピューターで起動してから、もう一度お試しください。",
+    "setup_node_unavailable": "このノードではまだリモートデスクトップを利用できません。",
+    "setup_unlink": "このコンピューターではない？関連付けを解除",
+    "setup_unlink_failed": "関連付けを解除できませんでした。もう一度お試しください。",
+    "setup_install_heading": "このコンピューターにインストール",
+    "setup_install_hint": "このコンピューターの OS 用のコマンドをコピーし、このコンピューターのターミナルで実行してください。オンラインになると、このボタンでリモートデスクトップが直接開きます。",
+    "setup_link_heading": "このコンピューターにはインストール済みですか？",
+    "setup_link_hint": "このコンピューターにあたる管理対象マシンを選んでください。設定は一度だけです。",
+    "setup_link_placeholder": "マシンを選択…",
+    "setup_link_action": "関連付け",
+    "setup_link_none": "関連付けられていない管理対象マシンはありません。",
+    "setup_link_failed": "そのマシンを関連付けできませんでした。もう一度お試しください。",
+    "setup_link_conflict": "そのマシンはすでに別のリモートデスクトップ ID に属しています。",
+    "platform_linux": "Linux",
+    "platform_mac": "macOS",
+    "platform_win": "Windows"
   }
 }

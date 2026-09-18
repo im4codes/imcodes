@@ -3913,6 +3913,27 @@
     "request_permission": "권한 요청",
     "requesting_permission": "해당 Mac에 요청 중…",
     "request_permission_failed": "해당 Mac에서 대화상자를 표시하지 못했습니다.",
-    "request_permission_hint": "해당 Mac에서 권한 대화상자를 엽니다. 그 앞에 있는 사람이 응답해야 합니다."
+    "request_permission_hint": "해당 Mac에서 권한 대화상자를 엽니다. 그 앞에 있는 사람이 응답해야 합니다.",
+    "setup_title": "{{server}}의 원격 데스크톱",
+    "setup_intro": "이 컴퓨터의 원격 데스크톱은 이 컴퓨터에서 실행 중인 IM.codes 제어 노드가 제공합니다.",
+    "setup_button_hint": "이 컴퓨터의 원격 데스크톱 설정",
+    "daemon_control_linked": "원격 제어 · {{machine}}",
+    "setup_linked_heading": "이 컴퓨터의 제어 노드",
+    "setup_node_offline": "오프라인 상태입니다. 이 컴퓨터에서 시작한 뒤 다시 시도하세요.",
+    "setup_node_unavailable": "아직 이 노드에서 원격 데스크톱을 사용할 수 없습니다.",
+    "setup_unlink": "이 컴퓨터가 아닌가요? 연결 해제",
+    "setup_unlink_failed": "연결을 해제하지 못했습니다. 다시 시도하세요.",
+    "setup_install_heading": "이 컴퓨터에 설치",
+    "setup_install_hint": "이 컴퓨터의 운영체제용 명령을 복사해 이 컴퓨터의 터미널에서 실행하세요. 온라인이 되면 이 버튼이 원격 데스크톱을 바로 엽니다.",
+    "setup_link_heading": "이 컴퓨터에 이미 설치되어 있나요?",
+    "setup_link_hint": "이 컴퓨터에 해당하는 제어 대상 머신을 선택하세요. 한 번만 설정하면 됩니다.",
+    "setup_link_placeholder": "머신 선택…",
+    "setup_link_action": "연결",
+    "setup_link_none": "연결되지 않은 제어 대상 머신이 없습니다.",
+    "setup_link_failed": "해당 머신을 연결하지 못했습니다. 다시 시도하세요.",
+    "setup_link_conflict": "해당 머신은 이미 다른 원격 데스크톱 ID에 속해 있습니다.",
+    "platform_linux": "Linux",
+    "platform_mac": "macOS",
+    "platform_win": "Windows"
   }
 }

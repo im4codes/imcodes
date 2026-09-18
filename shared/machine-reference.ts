@@ -38,6 +38,21 @@ export function isLocalComputerUseAlias(value: unknown): boolean {
 /** Owner-scoped controllable-machine list endpoint (DB-backed presence, F1). */
 export const MACHINE_API_PATH = '/api/machines';
 
+/**
+ * Owner-only: declare which daemon a controlled node shares a computer with
+ * (`?serverId=<node>`, body `{ hostServerId: string | null }`). Mounted under
+ * MACHINE_API_PATH. That daemon's remote-desktop button then opens this node.
+ */
+export const MACHINE_HOST_LINK_ROUTE = '/host-link';
+
+/** Refusals of a host link, shared by enrollment and MACHINE_HOST_LINK_ROUTE. */
+export const MACHINE_HOST_LINK_ERROR = {
+  /** Not a live daemon owned by the caller. */
+  INVALID_HOST_SERVER: 'invalid_host_server',
+  /** Both endpoints already belong to different remote-desktop host identities. */
+  HOST_CONFLICT: 'host_conflict',
+} as const;
+
 /** Reason codes for machine reference resolution + exec targeting. */
 export const MACHINE_REASONS = {
   INVALID_NAME: 'machine_invalid_name',

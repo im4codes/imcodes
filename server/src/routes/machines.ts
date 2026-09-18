@@ -16,6 +16,8 @@ import {
   pickDaemonMachineListItem,
 } from '../../../shared/remote-exec.js';
 import {
+  MACHINE_HOST_LINK_ERROR,
+  MACHINE_HOST_LINK_ROUTE,
   MACHINE_REASONS,
   normalizeMachineDisplayName,
 } from '../../../shared/machine-reference.js';
@@ -46,6 +48,12 @@ import {
 } from '../ws/auto-unlock-registry.js';
 import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY, REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY } from '../../../shared/remote-desktop-install.js';
 import { backfillCanonicalHosts } from '../services/remote-desktop-host-identity.js';
+import {
+  MACHINE_HOST_LINK_AUDIT,
+  hostIdentitiesConflict,
+  isOwnedHostDaemon,
+  setControlledNodeHost,
+} from '../services/controlled-node-host-link.js';
 import { isControlledNodeId } from '../../../shared/controlled-node-identity.js';
 import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../../shared/shared-machine-authority.js';
 import { resolveMachineOperationalUser } from '../share/shared-machine-authority.js';
@@ -315,6 +323,58 @@ machinesRoutes.post('/desk-binding', requireAuth(), async (c) => {
     details: { serverId, teamId },
   }, c.env.DB).catch(() => {});
   return c.json({ ok: true, teamId, member });
+});
+
+// POST /api/machines/host-link?serverId=... — owner declares which daemon this
+// controlled node shares a computer with (`{ hostServerId }`), or clears it
+// (`{ hostServerId: null }`).
+//
+// The same link enrollment records when a node is installed from a daemon's own
+// remote-desktop button, for nodes that were installed some other way: that
+// daemon's button then opens this node instead of offering an install. Like
+// desk-binding, it chooses a relationship rather than acting on the device, so
+// it lives outside the `/:serverId/` operator namespace and admits only the
+// owner of both rows.
+machinesRoutes.post(MACHINE_HOST_LINK_ROUTE, requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.query('serverId')?.trim();
+  if (!serverId) return c.json({ error: 'invalid_body' }, 400);
+  const body = await c.req.json().catch(() => null);
+  // Required, not optional: clearing a link is `null`, never an omitted key.
+  const parsed = z.object({
+    hostServerId: z.string().trim().min(1).max(128).nullable(),
+  }).safeParse(body);
+  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+  const { hostServerId } = parsed.data;
+
+  const node = await c.env.DB.queryOne<{ id: string; host_server_id: string | null }>(
+    `SELECT id, host_server_id FROM servers
+      WHERE id = $1 AND user_id = $2 AND node_role = $3 AND revoked_at IS NULL`,
+    [serverId, userId, NODE_ROLE.CONTROLLED],
+  );
+  if (!node) return c.json({ error: 'not_found' }, 404);
+
+  if (hostServerId !== null) {
+    // Same rule enrollment applies to its hostServerId: a live daemon of this
+    // same user, never a controlled node and never someone else's machine.
+    if (!await isOwnedHostDaemon(c.env.DB, userId, hostServerId)) {
+      return c.json({ error: MACHINE_HOST_LINK_ERROR.INVALID_HOST_SERVER }, 403);
+    }
+    if (await hostIdentitiesConflict(c.env.DB, serverId, hostServerId)) {
+      return c.json({ error: MACHINE_HOST_LINK_ERROR.HOST_CONFLICT }, 409);
+    }
+  }
+
+  await setControlledNodeHost(c.env.DB, { userId, nodeServerId: serverId, hostServerId });
+
+  const ip = (c.get('clientIp' as never) as string) ?? 'unknown';
+  logAudit({
+    userId,
+    action: hostServerId !== null ? MACHINE_HOST_LINK_AUDIT.LINK : MACHINE_HOST_LINK_AUDIT.UNLINK,
+    ip,
+    details: { serverId, hostServerId, previousHostServerId: node.host_server_id },
+  }, c.env.DB).catch(() => {});
+  return c.json({ ok: true, hostServerId });
 });
 
 // POST /api/machines/:serverId/revoke — operator kill-switch (10.3).

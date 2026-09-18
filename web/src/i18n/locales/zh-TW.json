@@ -3914,6 +3914,27 @@
     "request_permission": "申請權限",
     "requesting_permission": "正在請求該 Mac…",
     "request_permission_failed": "無法在該 Mac 上跳出授權視窗。",
-    "request_permission_hint": "會在那台 Mac 上跳出授權視窗，需要有人在機器前點擊允許。"
+    "request_permission_hint": "會在那台 Mac 上跳出授權視窗，需要有人在機器前點擊允許。",
+    "setup_title": "{{server}} 的遠端桌面",
+    "setup_intro": "這台電腦的遠端桌面由它上面執行的 IM.codes 受控節點提供。",
+    "setup_button_hint": "為這台電腦設定遠端桌面",
+    "daemon_control_linked": "遠端控制 · {{machine}}",
+    "setup_linked_heading": "這台電腦上的受控節點",
+    "setup_node_offline": "它目前離線。請在這台電腦上啟動它後再試。",
+    "setup_node_unavailable": "它上面的遠端桌面暫時無法使用。",
+    "setup_unlink": "不是這台電腦？解除關聯",
+    "setup_unlink_failed": "解除關聯失敗，請重試。",
+    "setup_install_heading": "在這台電腦上安裝",
+    "setup_install_hint": "複製對應這台電腦系統的指令，在這台電腦的終端機中執行。上線後，這個按鈕會直接開啟它的遠端桌面。",
+    "setup_link_heading": "這台電腦已經裝好了？",
+    "setup_link_hint": "選擇就是這台電腦的受控機器。只需設定一次。",
+    "setup_link_placeholder": "選擇機器…",
+    "setup_link_action": "關聯",
+    "setup_link_none": "沒有未關聯的受控機器。",
+    "setup_link_failed": "關聯失敗，請重試。",
+    "setup_link_conflict": "這台機器已屬於另一個遠端桌面身分。",
+    "platform_linux": "Linux",
+    "platform_mac": "macOS",
+    "platform_win": "Windows"
   }
 }

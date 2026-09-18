@@ -3914,6 +3914,27 @@
     "request_permission": "Conceder acceso",
     "requesting_permission": "Solicitando a ese Mac…",
     "request_permission_failed": "No se pudo mostrar el diálogo en ese Mac.",
-    "request_permission_hint": "Abre el diálogo de permisos en ese Mac. Alguien debe responderlo desde el equipo."
+    "request_permission_hint": "Abre el diálogo de permisos en ese Mac. Alguien debe responderlo desde el equipo.",
+    "setup_title": "Escritorio remoto en {{server}}",
+    "setup_intro": "El escritorio remoto de este equipo lo proporciona el nodo controlado de IM.codes que se ejecuta en él.",
+    "setup_button_hint": "Configurar el escritorio remoto para este equipo",
+    "daemon_control_linked": "Control remoto · {{machine}}",
+    "setup_linked_heading": "Nodo controlado en este equipo",
+    "setup_node_offline": "Está desconectado. Inícialo en este equipo y vuelve a intentarlo.",
+    "setup_node_unavailable": "El escritorio remoto aún no está disponible en él.",
+    "setup_unlink": "¿No es este equipo? Desvincular",
+    "setup_unlink_failed": "No se pudo desvincular. Inténtalo de nuevo.",
+    "setup_install_heading": "Instalar en este equipo",
+    "setup_install_hint": "Copia el comando para el sistema de este equipo y ejecútalo en una terminal de este equipo. Cuando esté en línea, este botón abrirá directamente su escritorio remoto.",
+    "setup_link_heading": "¿Ya está instalado en este equipo?",
+    "setup_link_hint": "Elige la máquina controlada que corresponde a este equipo. Solo hace falta hacerlo una vez.",
+    "setup_link_placeholder": "Elige una máquina…",
+    "setup_link_action": "Vincular",
+    "setup_link_none": "No hay máquinas controladas sin vincular.",
+    "setup_link_failed": "No se pudo vincular esa máquina. Inténtalo de nuevo.",
+    "setup_link_conflict": "Esa máquina ya pertenece a otra identidad de escritorio remoto.",
+    "platform_linux": "Linux",
+    "platform_mac": "macOS",
+    "platform_win": "Windows"
   }
 }

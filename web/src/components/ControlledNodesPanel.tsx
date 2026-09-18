@@ -24,12 +24,11 @@ import {
 } from '../api/machines.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from '@shared/controlled-node-auto-unlock.js';
 import { CONTROLLED_NODE_OS_MAC } from '@shared/controlled-node-artifacts.js';
-import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY, REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY } from '@shared/remote-desktop-install.js';
 import {
-  REMOTE_DESKTOP_WEB_READINESS,
-  resolveRemoteDesktopWebReadiness,
-} from '../remote-desktop-profile.js';
-import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
+  canInstallRemoteDesktopWorker,
+  machineAccessRole,
+  needsRemoteDesktopPermission,
+} from '../controlled-node-remote-desktop.js';
 import { MACHINE_IDENTITY_UNAVAILABLE, normalizeMachineDisplayName } from '@shared/machine-reference.js';
 import { formatByteSize } from '../util/byte-size.js';
 import { copyToClipboardWhenReady } from '../util/clipboard.js';
@@ -57,32 +56,6 @@ import { VerificationMachinesSection } from './VerificationMachinesSection.js';
 function canConfigureAutoUnlock(machine: MachineListItem): boolean {
   return (machine.accessRole ?? 'owner') === 'owner'
     && Boolean(machine.capabilities?.includes(CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY));
-}
-
-/**
- * The machine has its components and is waiting on the one grant only a person
- * at it can give. Distinct from "cannot do remote desktop": the two need
- * opposite things from the operator.
- */
-function needsRemoteDesktopPermission(machine: MachineListItem): boolean {
-  return machine.online
-    && machine.execEnabled
-    && machineAccessRole(machine) === 'owner'
-    && resolveRemoteDesktopWebReadiness(machine.capabilities).kind
-      === REMOTE_DESKTOP_WEB_READINESS.SCREEN_RECORDING_REQUIRED;
-}
-
-function canInstallRemoteDesktopWorker(machine: MachineListItem): boolean {
-  return machineAccessRole(machine) === 'owner'
-    && machine.online
-    && !machine.updateAvailable
-    // Either platform's "needs one download first" signal. They are separate
-    // wire values because the Windows one says `windows` in its name and the
-    // two installs are different operations, but to this button they mean the
-    // same thing.
-    && (Boolean(machine.capabilities?.includes(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY))
-      || Boolean(machine.capabilities?.includes(REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY)))
-    && !machine.capabilities?.includes(REMOTE_DESKTOP_CAPABILITY);
 }
 
 /**
@@ -130,11 +103,6 @@ function findArtifactForTarget(
   return artifacts.find((a) => a.os === target.os && a.arch === target.arch);
 }
 
-function machineAccessRole(machine: MachineListItem): 'owner' | 'viewer' | 'participant' {
-  // The field is optional on the wire so a newly upgraded Web remains usable
-  // with an older Server, whose machine list was owner-only.
-  return machine.accessRole ?? 'owner';
-}
 
 const PLATFORM_PRESENTATION: Record<ControlledNodeOs, { glyph: string; name: string }> = {
   win: { glyph: '⊞', name: 'Windows' },

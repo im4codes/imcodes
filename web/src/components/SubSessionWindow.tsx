@@ -144,6 +144,8 @@ interface Props {
   daemonOnline?: boolean;
   /** Opens the remote-desktop workspace for a machine. Same callback the main-session toolbar passes to its own DaemonRemoteDesktopControl. */
   onOpenRemoteDesktop?: (machine: MachineListItem) => void;
+  /** This user owns the daemon: its remote-desktop button may offer setup. */
+  remoteDesktopCanSetUp?: boolean;
 }
 
 type ViewMode = 'terminal' | 'chat';
@@ -274,7 +276,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, visible = true, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onPreviewFile, onOpenLocalWebPreview, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, daemonOnline, onOpenRemoteDesktop,
+  sub, ws, connected, active, visible = true, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onPreviewFile, onOpenLocalWebPreview, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, daemonOnline, onOpenRemoteDesktop, remoteDesktopCanSetUp = true,
 }: Props) {
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
@@ -943,6 +945,7 @@ export function SubSessionWindow({
             serverId={serverId ?? null}
             daemonOnline={daemonOnline ?? false}
             onOpen={(machine) => onOpenRemoteDesktop?.(machine)}
+            canSetUp={remoteDesktopCanSetUp}
           />
           {/* File browser — placed to the LEFT of the pin button in the
               sub-session window header. Each sub-session owns its own

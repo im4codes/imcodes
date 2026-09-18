@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import { CONTROLLED_NODE_LOCAL_DAEMONS_RESCAN_MS } from '../../shared/controlled-node-host-link.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
 import {
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
@@ -190,6 +191,60 @@ describe('controlled node enrollment and runtime', () => {
       && frame.reason === DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS
     ))).toHaveLength(0);
     runtime.stop();
+  });
+
+  it('tells the server which daemons share its computer: after authenticating, and again only when that changes', async () => {
+    const socket = new MockSocket();
+    let bound = ['daemon-a'];
+    const discoverLocalDaemons = vi.fn(async () => bound);
+    let now = 1_000_000;
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, { discoverLocalDaemons, cleanupLegacyUpgradeRescue: async () => {} });
+    const reports = () => socket.sent
+      .map((frame) => JSON.parse(frame) as Record<string, unknown>)
+      .filter((frame) => frame.type === DAEMON_MSG.CONTROLLED_NODE_LOCAL_DAEMONS);
+    try {
+      runtime.start();
+      socket.open();
+      // Nothing before the server has acknowledged the connection.
+      expect(discoverLocalDaemons).not.toHaveBeenCalled();
+
+      socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+      await vi.waitFor(() => expect(reports()).toEqual([
+        { type: DAEMON_MSG.CONTROLLED_NODE_LOCAL_DAEMONS, serverIds: ['daemon-a'] },
+      ]));
+      expect(discoverLocalDaemons).toHaveBeenCalledWith('https://im.example');
+
+      // Every 5 s heartbeat is not a rescan.
+      socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+      expect(discoverLocalDaemons).toHaveBeenCalledTimes(1);
+
+      // A later rescan that finds the same daemons sends nothing new.
+      now += CONTROLLED_NODE_LOCAL_DAEMONS_RESCAN_MS;
+      socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+      await vi.waitFor(() => expect(discoverLocalDaemons).toHaveBeenCalledTimes(2));
+      // Let that scan settle completely (its result handling is a promise chain).
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(reports()).toHaveLength(1);
+
+      // A daemon installed after the node is reported on the next rescan.
+      bound = ['daemon-a', 'daemon-b'];
+      now += CONTROLLED_NODE_LOCAL_DAEMONS_RESCAN_MS;
+      socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+      await vi.waitFor(() => expect(reports()).toHaveLength(2));
+      expect(reports()[1]).toEqual({
+        type: DAEMON_MSG.CONTROLLED_NODE_LOCAL_DAEMONS,
+        serverIds: ['daemon-a', 'daemon-b'],
+      });
+    } finally {
+      runtime.stop();
+      clock.mockRestore();
+    }
   });
 
   it('round-trips an enrollment blob appended to arbitrary executable bytes', () => {

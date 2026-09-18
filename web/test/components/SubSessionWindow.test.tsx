@@ -1812,16 +1812,19 @@ describe('SubSessionWindow remote-desktop quick-open', () => {
     expect(onOpenRemoteDesktop.mock.calls[0][0]).toMatchObject({ serverId: 'srv-1' });
   });
 
-  it('renders no remote-desktop button when the daemon advertises neither capability, but keeps the file-browser toggle', () => {
+  function renderWithoutDaemonRemoteDesktop(remoteDesktopCanSetUp: boolean) {
+    // A Linux/macOS daemon: it advertises no remote-desktop capability of its
+    // own, because the controlled node on that computer serves it.
     const ws = wsWithCapabilities([]);
     const sub = makeSubSession();
-    const { container } = render(
+    return render(
       <SubSessionWindow
         sub={sub}
         ws={ws}
         connected={true}
         daemonOnline={true}
         onOpenRemoteDesktop={vi.fn()}
+        remoteDesktopCanSetUp={remoteDesktopCanSetUp}
         active={true}
         onDiff={vi.fn()}
         onHistory={vi.fn()}
@@ -1834,6 +1837,20 @@ describe('SubSessionWindow remote-desktop quick-open', () => {
         serverId="srv-1"
       />,
     );
+  }
+
+  it('still offers remote desktop on a daemon without its own (Linux/macOS), left of the file-browser toggle', () => {
+    const { container } = renderWithoutDaemonRemoteDesktop(true);
+    const buttons = [...container.querySelectorAll('button')];
+    const rd = container.querySelector('.daemon-remote-desktop-btn');
+    const files = container.querySelector('button[title="picker.files"]');
+    expect(rd?.getAttribute('title')).toBe('remote_desktop.setup_button_hint');
+    expect(files).toBeTruthy();
+    expect(buttons.indexOf(rd as HTMLButtonElement)).toBeLessThan(buttons.indexOf(files as HTMLButtonElement));
+  });
+
+  it('renders no setup button on a daemon shared with this user, but keeps the file-browser toggle', () => {
+    const { container } = renderWithoutDaemonRemoteDesktop(false);
     expect(container.querySelector('.daemon-remote-desktop-btn')).toBeNull();
     expect(container.querySelector('button[title="picker.files"]')).toBeTruthy();
   });

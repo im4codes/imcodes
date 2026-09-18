@@ -3,6 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CONTROLLED_NODE_OS_MAC } from '../../shared/controlled-node-artifacts.js';
+import { CONTROLLED_NODE_LOCAL_DAEMONS_RESCAN_MS } from '../../shared/controlled-node-host-link.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import { DAEMON_UPGRADE_BLOCK_REASON } from '../../shared/daemon-upgrade.js';
@@ -12,6 +13,7 @@ import {
   type AuthenticatedWebSocketFactory,
   type AuthenticatedWebSocketOptions,
 } from '../transport/authenticated-websocket.js';
+import { discoverLocalDaemonServerIds } from './local-daemon-discovery.js';
 import { MachineExecWorker } from './machine-exec-worker.js';
 import { ComputerUseWorker } from './computer-use-worker.js';
 import {
@@ -292,6 +294,11 @@ export interface ControlledNodeRuntimeOptions {
   onAuthenticationError?: (error: unknown) => void;
   /** Called for every authenticated server heartbeat acknowledgement. */
   onHeartbeatAck?: () => void | Promise<void>;
+  /**
+   * Test seam: the daemons bound on this computer (serverIds only). Defaults to
+   * reading each user's `.imcodes/server.json`; see local-daemon-discovery.ts.
+   */
+  discoverLocalDaemons?: (serverUrl: string) => Promise<string[]>;
   remoteDesktopWorker?: ControlledNodeRemoteDesktopWorker;
   /**
    * Native macOS production dependencies. Omission is deliberately unavailable:
@@ -1032,6 +1039,32 @@ export function createControlledNodeRuntime(
     // else happened to reconnect.
     republishCapabilitiesIfChanged();
   };
+  // Tell the server which daemons are bound on this computer, so the daemon's
+  // remote-desktop button can open this node. Rescanned on a slow clock to catch
+  // a daemon installed after this node; sent only when the answer changes, and
+  // always once more after a reconnect (the server may have restarted).
+  let localDaemonsReported: string | null = null;
+  let localDaemonsScannedAt = Number.NEGATIVE_INFINITY;
+  let localDaemonsScanInFlight = false;
+  const reportLocalDaemonsIfDue = (): void => {
+    const now = Date.now();
+    if (localDaemonsScanInFlight
+      || now - localDaemonsScannedAt < CONTROLLED_NODE_LOCAL_DAEMONS_RESCAN_MS) return;
+    localDaemonsScannedAt = now;
+    localDaemonsScanInFlight = true;
+    const discover = options.discoverLocalDaemons
+      ?? ((serverUrl: string) => discoverLocalDaemonServerIds({ serverUrl }));
+    void discover(credential.serverUrl)
+      .then((serverIds) => {
+        const key = JSON.stringify(serverIds);
+        if (serverIds.length === 0 || key === localDaemonsReported) return;
+        if (client.send({ type: DAEMON_MSG.CONTROLLED_NODE_LOCAL_DAEMONS, serverIds })) {
+          localDaemonsReported = key;
+        }
+      })
+      .catch(() => {})
+      .finally(() => { localDaemonsScanInFlight = false; });
+  };
   refreshAuthCapabilities();
   const clientOptions: AuthenticatedWebSocketOptions = {
     url: controlledNodeWebSocketUrl(credential.serverUrl, credential.serverId),
@@ -1054,6 +1087,8 @@ export function createControlledNodeRuntime(
     },
     onOpen: () => {
       client.send({ type: 'heartbeat', daemonVersion: DAEMON_VERSION, [CLOCK_SYNC_FIELD.SENT_AT]: Date.now() });
+      localDaemonsReported = null;
+      localDaemonsScannedAt = Number.NEGATIVE_INFINITY;
     },
     onClose: () => {
       worker.abortAll();
@@ -1090,6 +1125,7 @@ export function createControlledNodeRuntime(
         serverClock.addSample(message[CLOCK_SYNC_FIELD.SENT_AT], message[CLOCK_SYNC_FIELD.SERVER_TIME], Date.now());
         reportStalledUpgradeHandoff();
         persistAuthentication();
+        reportLocalDaemonsIfDue();
         if (remoteDesktopWorkerRepairEligibleAt === null) {
           remoteDesktopWorkerRepairEligibleAt = (options.now?.() ?? Date.now())
             + REMOTE_DESKTOP_WORKER_REPAIR_AUTH_GRACE_MS;

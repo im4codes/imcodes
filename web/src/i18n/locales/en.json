@@ -3914,6 +3914,27 @@
     "request_permission": "Grant access",
     "requesting_permission": "Asking that Mac…",
     "request_permission_failed": "Could not raise the prompt on that Mac.",
-    "request_permission_hint": "Opens the permission dialog on that Mac. Someone at the machine has to answer it."
+    "request_permission_hint": "Opens the permission dialog on that Mac. Someone at the machine has to answer it.",
+    "setup_title": "Remote desktop on {{server}}",
+    "setup_intro": "Remote desktop for this computer is served by the IM.codes controlled node running on it.",
+    "setup_button_hint": "Set up remote desktop for this computer",
+    "daemon_control_linked": "Remote control · {{machine}}",
+    "setup_linked_heading": "Controlled node on this computer",
+    "setup_node_offline": "It is offline. Start it on this computer, then try again.",
+    "setup_node_unavailable": "Remote desktop is not available on it yet.",
+    "setup_unlink": "Not this computer? Unlink",
+    "setup_unlink_failed": "Could not unlink. Please try again.",
+    "setup_install_heading": "Install on this computer",
+    "setup_install_hint": "Copy the command for this computer's system and run it in a terminal on this computer. Once it is online, this button opens its remote desktop directly.",
+    "setup_link_heading": "Already installed on this computer?",
+    "setup_link_hint": "Choose the controlled machine that is this computer. You only need to do this once.",
+    "setup_link_placeholder": "Choose a machine…",
+    "setup_link_action": "Link",
+    "setup_link_none": "No unlinked controlled machines found.",
+    "setup_link_failed": "Could not link that machine. Please try again.",
+    "setup_link_conflict": "That machine already belongs to a different remote desktop identity.",
+    "platform_linux": "Linux",
+    "platform_mac": "macOS",
+    "platform_win": "Windows"
   }
 }
