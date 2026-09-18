@@ -10512,13 +10512,15 @@ button.quick-agent-delegation-preset.active {
   display: inline-flex;
   align-items: stretch;
   flex: 0 0 auto;
-  border: 1px solid rgb(94 165 214 / 22%);
+  /* Neutral frosted slate: the toolbar is the level BELOW the window tabs,
+     so it stays light and quiet and leaves the cyan accent to the tabs. */
+  border: 1px solid rgb(203 213 225 / 13%);
   border-radius: 10px;
   background:
-    linear-gradient(180deg, rgb(20 41 62 / 92%), rgb(12 27 44 / 92%));
+    linear-gradient(180deg, rgb(148 163 184 / 11%), rgb(148 163 184 / 5%));
   box-shadow:
-    inset 0 1px 0 rgb(214 240 255 / 6%),
-    0 1px 2px rgb(2 10 20 / 45%);
+    inset 0 1px 0 rgb(255 255 255 / 6%),
+    0 1px 2px rgb(0 0 0 / 35%);
   overflow: hidden;
 }
 
@@ -10571,7 +10573,7 @@ button.quick-agent-delegation-preset.active {
   justify-content: center;
   min-height: 34px;
   padding: 6px 12px;
-  color: #b9d8ef;
+  color: #b8c4d1;
   background: transparent;
   border: 0;
   border-radius: 0;
@@ -10592,24 +10594,24 @@ button.quick-agent-delegation-preset.active {
   .remote-desktop-clipboard-switch,
   .remote-desktop-mobile-input-switch
 ) button + button {
-  border-left: 1px solid rgb(94 165 214 / 18%);
+  border-left: 1px solid rgb(203 213 225 / 10%);
 }
 
 .remote-desktop-toolbar button:hover:not(:disabled) {
-  color: #eaf7ff;
-  background: rgb(56 132 186 / 16%);
+  color: #f1f5f9;
+  background: rgb(203 213 225 / 9%);
 }
 
-/* Selected state as a lit segment rather than a filled chip: the toolbar keeps
-   one visual weight, and what is active reads as illuminated. */
+/* Selected state as a raised light chip, deliberately NOT cyan: cyan marks
+   the active window tab above, and the two levels must not look alike. */
 .remote-desktop-toolbar button[aria-pressed="true"],
 .remote-desktop-display-tabs button[aria-selected="true"] {
-  color: #e8fbff;
+  color: #ffffff;
   background:
-    linear-gradient(180deg, rgb(34 211 238 / 22%), rgb(34 211 238 / 9%));
+    linear-gradient(180deg, rgb(241 245 249 / 18%), rgb(241 245 249 / 8%));
   box-shadow:
-    inset 0 -2px 0 rgb(34 211 238 / 70%),
-    inset 0 0 22px rgb(34 211 238 / 12%);
+    inset 0 1px 0 rgb(255 255 255 / 14%),
+    inset 0 -1px 0 rgb(0 0 0 / 22%);
 }
 
 .remote-desktop-toolbar button:focus-visible {
@@ -10637,13 +10639,13 @@ button.quick-agent-delegation-preset.active {
 .remote-desktop-files-trigger,
 .remote-desktop-unlock-trigger,
 .remote-desktop-quick-input {
-  border: 1px solid rgb(94 165 214 / 22%) !important;
+  border: 1px solid rgb(203 213 225 / 13%) !important;
   border-radius: 10px !important;
   background:
-    linear-gradient(180deg, rgb(20 41 62 / 92%), rgb(12 27 44 / 92%)) !important;
+    linear-gradient(180deg, rgb(148 163 184 / 11%), rgb(148 163 184 / 5%)) !important;
   box-shadow:
-    inset 0 1px 0 rgb(214 240 255 / 6%),
-    0 1px 2px rgb(2 10 20 / 45%);
+    inset 0 1px 0 rgb(255 255 255 / 6%),
+    0 1px 2px rgb(0 0 0 / 35%);
 }
 
 .remote-desktop-quick-input {
