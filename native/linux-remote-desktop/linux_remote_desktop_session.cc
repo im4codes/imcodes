@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
+#include <iterator>
 #include <limits>
 #include <utility>
 
@@ -884,7 +885,29 @@ void LinuxRemoteDesktopSession::OnConnectionChange(
       mapped = PeerConnectionState::kClosed;
       break;
   }
-  transport_core_.OnPeerConnectionState(CallbackStamp(), mapped, SampleNow());
+  const common::TransportDiagnostics before = transport_core_.diagnostics();
+  const RouteAuthority* authority = transport_core_.authority();
+  const std::string session_id =
+      authority != nullptr ? authority->identity.session_id : std::string();
+  if (!transport_core_.OnPeerConnectionState(CallbackStamp(), mapped,
+                                             SampleNow()) &&
+      before.terminal_reason == common::TransportTerminalReason::kNone &&
+      transport_core_.diagnostics().terminal_reason ==
+          common::TransportTerminalReason::kProtocolViolation) {
+    // Error path only: the core refused a libwebrtc state transition and
+    // ended the session as protocol_error; name the transition.
+    static constexpr const char* kNames[] = {"new",          "connecting",
+                                             "connected",    "disconnected",
+                                             "failed",       "closed"};
+    const auto name = [](PeerConnectionState value) {
+      const auto index = static_cast<std::size_t>(value);
+      return index < std::size(kNames) ? kNames[index] : "unknown";
+    };
+    std::fprintf(stderr,
+                 "linux worker: session %.8s peer state %s -> %s refused\n",
+                 session_id.c_str(), name(before.peer_state),
+                 name(mapped));
+  }
 }
 
 // --- real input dispatch through common::SessionCore -----------------------

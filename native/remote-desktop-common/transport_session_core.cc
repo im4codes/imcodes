@@ -62,8 +62,13 @@ bool PeerTransitionAllowed(PeerConnectionState previous,
     case PeerConnectionState::kFailed:
       // libwebrtc permits an in-place ICE restart after failure. The route is
       // still bounded by its renewable lease and the server's restart budget;
-      // only an explicit close is terminal here.
+      // only an explicit close is terminal here. With continual gathering, a
+      // host network change after failure forms new candidate pairs on a
+      // transport that was writable before, which libwebrtc reports as
+      // disconnected (not connecting) -- refusing that ended the route as a
+      // protocol violation the moment the host's interfaces changed.
       return next == PeerConnectionState::kConnecting ||
+             next == PeerConnectionState::kDisconnected ||
              next == PeerConnectionState::kConnected ||
              next == PeerConnectionState::kClosed;
     case PeerConnectionState::kClosed:

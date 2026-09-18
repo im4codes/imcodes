@@ -341,6 +341,48 @@ int main() {
   }
 
   {
+    // libwebrtc's own sequence when a host network change forms new
+    // candidate pairs on a failed, previously-writable transport under
+    // continual gathering (observed live on a Docker host).
+    FakeTransportAdapter adapter;
+    common::TransportSessionCore core(adapter, ladder, Limits());
+    Require(core.Start(Authority(), At(0, 0)) &&
+                core.OnPeerConnectionState(
+                    Stamp(), common::PeerConnectionState::kConnected,
+                    At(1, 1)) &&
+                core.OnPeerConnectionState(
+                    Stamp(), common::PeerConnectionState::kFailed, At(2, 2)),
+            "network-change transport reaches failed");
+    Require(core.OnPeerConnectionState(
+                Stamp(), common::PeerConnectionState::kDisconnected,
+                At(3, 3)) &&
+                !core.terminal() && adapter.close_transport_count == 0,
+            "failed peer that re-forms candidate pairs reports disconnected "
+            "without ending the route");
+    Require(core.OnPeerConnectionState(
+                Stamp(), common::PeerConnectionState::kConnected, At(4, 4)) &&
+                !core.terminal(),
+            "disconnected-after-failure peer can still recover in place");
+  }
+
+  {
+    FakeTransportAdapter adapter;
+    common::TransportSessionCore core(adapter, ladder, Limits());
+    Require(core.Start(Authority(), At(0, 0)) &&
+                core.OnPeerConnectionState(
+                    Stamp(), common::PeerConnectionState::kConnected,
+                    At(1, 1)) &&
+                core.OnPeerConnectionState(
+                    Stamp(), common::PeerConnectionState::kFailed, At(2, 2)),
+            "failed-regression transport reaches failed");
+    Require(!core.OnPeerConnectionState(
+                Stamp(), common::PeerConnectionState::kNew, At(3, 3)) &&
+                core.terminal_reason() ==
+                    common::TransportTerminalReason::kProtocolViolation,
+            "a failed peer still cannot regress to new");
+  }
+
+  {
     FakeTransportAdapter adapter;
     common::TransportSessionCore core(adapter, ladder, Limits());
     Require(core.Start(Authority(), At(0, 0)), "ICE test transport starts");
