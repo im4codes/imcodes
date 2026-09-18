@@ -139,7 +139,7 @@ import { publishRuntimeMemoryCacheInvalidation } from '../context/runtime-memory
 import { getMemoryFeatureConfigStoreDiagnostics, getPersistedMemoryFeatureFlagValues, getRuntimeMemoryFeatureFlagValues } from '../store/memory-feature-config-store.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { listSessions as listStoredSessions, loadStore, type SessionRecord } from '../store/session-store.js';
-import { dispatchDestroyExecutionClone, dispatchSendMessage, dispatchSendStop, listSendTargets, resolveProjectAuthoritativeSupervisionSnapshot, type SendMessageAgentIdentity, type SendMessageCloneRequest, type SendToolDeps } from './send-tool.js';
+import { dispatchDestroyExecutionClone, dispatchSendMessage, dispatchSendStop, isUniqueAuthoritativeProjectBrainCaller, listSendTargets, resolveProjectAuthoritativeSupervisionSnapshot, type SendMessageAgentIdentity, type SendMessageCloneRequest, type SendToolDeps } from './send-tool.js';
 import {
   getSupervisionTaskRegistry,
   type PersistedSupervisionTaskAssignmentIdentity,
@@ -181,7 +181,7 @@ import { GitOriginRepositoryIdentityService } from '../agent/repository-identity
 import { ALIAS_DESCRIPTION_MAX, ALIAS_MCP_TOOLS, toAliasMetadata, type AliasMcpToolName } from '../../shared/alias-types.js';
 import { mapLegacySupervisionUpdate, mapLegacySupervisionFinish } from './supervision-compat-shims.js';
 import { resolveSupervisionIntent } from './supervision-intent-ops.js';
-import { supervisionCallerParticipates } from './supervision-mcp-tools.js';
+import { supervisionTaskCallerAuthority } from './supervision-mcp-tools.js';
 import {
   aliasMcpList,
   aliasMcpResolve,
@@ -2354,7 +2354,8 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       // in the Brain's own window (or by its provider-native agents), which is
       // exactly the participation IM.codes delegation exists to route to a
       // separate, visible sub-session. Refuse before any task row is created.
-      const callerRecord = (await sendSessions()).find((session) => session.name === caller.sessionName);
+      const sessions = await sendSessions();
+      const callerRecord = sessions.find((session) => session.name === caller.sessionName);
       if (callerRecord?.role === 'brain' && !callerRecord.parentSession
         && (requestedRole === 'implementer' || requestedRole === 'auditor')) {
         return error(
@@ -2364,15 +2365,40 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       }
       const requestedTaskId = stringArg(args, 'taskId')?.trim();
       const existing = requestedTaskId ? registry.get(requestedTaskId) : undefined;
-      // taskId is a reference, never a create hint. Missing, cross-project and
-      // non-participant tasks share one refusal so this tool cannot probe the
-      // registry or silently mint a replacement task.
-      if (requestedTaskId && (
-        !existing
-        || existing.projectName !== projectName
-        || !supervisionCallerParticipates(existing, identity, projectName)
-      )) {
+      // taskId is a reference, never a create hint. Missing and cross-project
+      // tasks share one refusal so this tool cannot probe the registry or
+      // silently mint a replacement task.
+      if (requestedTaskId && (!existing || existing.projectName !== projectName)) {
         return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'task is not visible to this caller');
+      }
+      // A non-participant is ALSO refused -- with one legacy exception,
+      // mirroring send_tool's own task-continuation gate exactly
+      // (supervisionTaskCallerAuthority + isUniqueAuthoritativeProjectBrainCaller,
+      // same coordinatorMayAct/legacyBrainMayCoordinate semantics, not
+      // reimplemented here): the project's own unique, live, authoritative
+      // Brain may always attach a coordinator assignment to a task that has
+      // no coordinator row yet, even one it never participated in -- e.g. one
+      // an implementer self-initiated via this very tool with no coordinator
+      // ever bound. This does not widen supervisionCallerParticipates itself
+      // (still used verbatim inside participantMayRead below), so a bare
+      // project match still never grants any OTHER role read/attach on a
+      // task the caller has no real claim to.
+      if (requestedTaskId && existing) {
+        const liveProjectBrain = isUniqueAuthoritativeProjectBrainCaller(callerRecord, projectName, sessions);
+        const authority = supervisionTaskCallerAuthority({
+          item: existing,
+          callerSessionName: caller.sessionName ?? '',
+          callerProjectName: projectName,
+          liveIdentity: { ...identity, projectName },
+          liveProjectBrain,
+        });
+        const legacyBrainMayCoordinate = Boolean(
+          liveProjectBrain
+          && !existing.assignments?.some((assignment) => assignment.role === 'coordinator'),
+        );
+        if (!legacyBrainMayCoordinate && !authority.participantMayRead && !authority.coordinatorMayAct) {
+          return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'task is not visible to this caller');
+        }
       }
       const classification = typeof args.classification === 'string'
         ? args.classification as never

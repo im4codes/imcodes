@@ -571,7 +571,14 @@ function uniqueAuthoritativeProjectBrain(
   return brains.length === 1 ? brains[0] : undefined;
 }
 
-function isUniqueAuthoritativeProjectBrainCaller(
+/**
+ * Exported so supervision_task_start (memory-mcp-tools.ts) can grant the
+ * project's own Brain the same coordinator-attach carve-out this module's own
+ * task-continuation gate already grants it -- see that gate's
+ * legacyBrainMayCoordinate for the exact semantics being shared, not
+ * reimplemented a second time.
+ */
+export function isUniqueAuthoritativeProjectBrainCaller(
   caller: SessionRecord | undefined,
   projectName: string,
   sessions: readonly SessionRecord[],
