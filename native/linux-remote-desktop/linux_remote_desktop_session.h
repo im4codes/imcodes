@@ -279,6 +279,12 @@ class LinuxRemoteDesktopSession final
   // were. Sent once, right when the control channel opens (same trigger
   // macOS uses).
   bool SendTopology();
+  // Mirrors macOS's WorkerTransportSink::SendInputAck / Windows'
+  // PeerSession::SendInputAck. The browser arms a 3 s timer on every
+  // reliable input transition and fails the session as peer_failed when no
+  // ack arrives, so without this every keypress or click on Linux tore the
+  // session down three seconds later.
+  bool SendInputAck(std::uint64_t acknowledged_sequence);
   // Called from LinuxDataChannelObserver::OnStateChange() once a channel's
   // own DataChannelInterface::state() actually reaches kOpen.
   void OnChannelReady(common::DataChannelKind kind);

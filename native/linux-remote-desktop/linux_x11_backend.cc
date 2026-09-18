@@ -75,7 +75,12 @@ class XImageStorage final : public common::FrameStorage {
  * consulted -- included anyway so this is a complete, directly auditable
  * port of the macOS list, not a subset that silently drifts from it.
  *
- * A linear scan over 42 entries on a human keypress is not a hot path; kept
+ * ScrollLock is the one entry beyond the macOS list: the browser's key
+ * allowlist (isRemoteDesktopKeyAllowed, web/src/remote-desktop-client.ts)
+ * sends it, X11 names it Scroll_Lock, and an unresolved key is an adapter
+ * failure that ends the whole session, not a dropped keystroke.
+ *
+ * A linear scan over 43 entries on a human keypress is not a hot path; kept
  * as plain data rather than a sorted/binary-searched table (or a
  * function-local static std::map, which macOS's own comment explains is an
  * exit-time-destructor hazard) purely to keep this diff small and obviously
@@ -119,6 +124,7 @@ const char* NamedCodeKeysymName(std::string_view code) noexcept {
       {"PageUp", "Prior"},
       {"Period", "period"},
       {"Quote", "apostrophe"},
+      {"ScrollLock", "Scroll_Lock"},
       {"Semicolon", "semicolon"},
       {"ShiftLeft", "Shift_L"},
       {"ShiftRight", "Shift_R"},

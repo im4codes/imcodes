@@ -627,6 +627,29 @@ bool LinuxRemoteDesktopSession::SendTopology() {
   return it->second->Send(webrtc::DataBuffer(payload));
 }
 
+bool LinuxRemoteDesktopSession::SendInputAck(
+    std::uint64_t acknowledged_sequence) {
+  const common::DesktopTopology* topology = core_.topology();
+  const common::RouteAuthority* authority = transport_core_.authority();
+  auto it = channels_.find(ChannelLabel(DataChannelKind::kControl));
+  if (topology == nullptr || authority == nullptr || it == channels_.end() ||
+      !it->second ||
+      it->second->state() != webrtc::DataChannelInterface::kOpen) {
+    return false;
+  }
+  Json::Value root(Json::objectValue);
+  root["type"] = imcodes::rd::kControlType;
+  root["protocolVersion"] = imcodes::rd::kProtocolVersion;
+  root["sessionId"] = authority->identity.session_id;
+  root["sequence"] = Json::UInt64(outbound_sequence_++);
+  root["layoutRevision"] = Json::UInt64(topology->revision);
+  root["inputEpoch"] = Json::UInt64(authority->input_epoch);
+  root["kind"] = imcodes::rd::kInputAckKind;
+  root["acknowledgedSequence"] = Json::UInt64(acknowledged_sequence);
+  const std::string payload = imcodes::rd::WriteJson(root);
+  return it->second->Send(webrtc::DataBuffer(payload));
+}
+
 LinuxRemoteDesktopSession::LinuxDataChannelObserver::LinuxDataChannelObserver(
     std::weak_ptr<LinuxRemoteDesktopSession> session, DataChannelKind channel)
     : session_(std::move(session)), channel_(channel) {}
@@ -688,6 +711,11 @@ void LinuxRemoteDesktopSession::HandleDataChannelMessage(
                                          !current_topology->displays.empty()
                                      ? current_topology->displays.front().display_id
                                      : std::string();
+  // Same bookkeeping as macOS's WorkerTransportSink::HandleDataChannelMessage
+  // and Windows' PeerSession input handlers: every accepted message counts as
+  // route activity, and every reliable input transition is acknowledged.
+  bool accepted = false;
+  bool acknowledge = false;
 
   if (message.kind == imcodes::rd::DataChannelMessageKind::kPointer &&
       (channel == DataChannelKind::kPointer ||
@@ -712,12 +740,12 @@ void LinuxRemoteDesktopSession::HandleDataChannelMessage(
     switch (message.pointer.kind) {
       case imcodes::rd::PointerKind::kMove:
         if (!message.pointer.x.has_value() || !message.pointer.y.has_value()) return;
-        ApplyPointerMove({
+        accepted = applied(ApplyPointerMove({
             InputStampFor(message, channel, true),
             display_id,
             *message.pointer.x,
             *message.pointer.y,
-        });
+        }));
         break;
       case imcodes::rd::PointerKind::kButtonDown:
       case imcodes::rd::PointerKind::kButtonUp:
@@ -733,11 +761,11 @@ void LinuxRemoteDesktopSession::HandleDataChannelMessage(
             kButtons[index],
             message.pointer.kind == imcodes::rd::PointerKind::kButtonDown,
         };
-        if (message.pointer.kind == imcodes::rd::PointerKind::kButtonClick) {
-          ClickButton(transition);
-        } else {
-          ApplyButton(transition);
-        }
+        accepted = applied(
+            message.pointer.kind == imcodes::rd::PointerKind::kButtonClick
+                ? ClickButton(transition)
+                : ApplyButton(transition));
+        acknowledge = channel == DataChannelKind::kControl;
         break;
       }
       case imcodes::rd::PointerKind::kWheel:
@@ -745,26 +773,28 @@ void LinuxRemoteDesktopSession::HandleDataChannelMessage(
             !message.pointer.delta_y.has_value()) {
           return;
         }
-        ApplyWheel({
+        accepted = applied(ApplyWheel({
             InputStampFor(message, channel),
             *message.pointer.delta_x,
             *message.pointer.delta_y,
-        });
+        }));
         break;
     }
   } else if (message.kind == imcodes::rd::DataChannelMessageKind::kKeyboard &&
              channel == DataChannelKind::kKeyboard) {
     if (message.keyboard.kind == imcodes::rd::KeyboardKind::kText) {
       if (!message.keyboard.text.has_value()) return;
-      ApplyText({InputStampFor(message, channel), *message.keyboard.text});
+      accepted = applied(
+          ApplyText({InputStampFor(message, channel), *message.keyboard.text}));
     } else {
       if (!message.keyboard.code.has_value()) return;
-      ApplyKey({
+      accepted = applied(ApplyKey({
           InputStampFor(message, channel),
           *message.keyboard.code,
           message.keyboard.kind == imcodes::rd::KeyboardKind::kKeyDown,
-      });
+      }));
     }
+    acknowledge = true;
   } else if (message.kind == imcodes::rd::DataChannelMessageKind::kReleaseAll &&
              channel == DataChannelKind::kControl) {
     ReleaseController("control");
@@ -772,6 +802,15 @@ void LinuxRemoteDesktopSession::HandleDataChannelMessage(
     ReleaseController("keyboard");
     ReleaseController("pointer");
     ReleaseController("pointer:position");
+    accepted = true;
+    acknowledge = true;
+  } else if (message.kind == imcodes::rd::DataChannelMessageKind::kControl &&
+             channel == DataChannelKind::kControl &&
+             (message.control.kind == imcodes::rd::kHelloKind ||
+              message.control.kind == imcodes::rd::kKeepaliveKind)) {
+    // The browser's 30 s data keepalive is what keeps an open-but-idle
+    // session inside the core's idle timeout, as on macOS/Windows.
+    accepted = true;
   } else if (message.kind == imcodes::rd::DataChannelMessageKind::kControl &&
              channel == DataChannelKind::kControl &&
              message.control.kind == "frame_presented") {
@@ -801,13 +840,18 @@ void LinuxRemoteDesktopSession::HandleDataChannelMessage(
       return;
     }
     presented_layout_revision_ = topology->revision;
+    accepted = true;
   }
-  // "control" messages other than release_all/frame_presented ("hello",
-  // "keepalive", and anything display/clipboard/unlock-shaped) are parsed
-  // but not acted on -- see this file's header comment for why those have
+  // Other "control" kinds (display/clipboard/unlock-shaped) are parsed but
+  // not acted on -- see this file's header comment for why those have
   // nothing to route to yet on Linux. Silently accepting rather than closing
   // the channel: an unimplemented-but-well-formed control kind is not a
   // protocol violation.
+  if (!accepted ||
+      !transport_core_.RecordActivity(authority->identity, SampleNow())) {
+    return;
+  }
+  if (acknowledge) (void)SendInputAck(message.correlation.sequence);
 }
 
 void LinuxRemoteDesktopSession::OnIceCandidate(

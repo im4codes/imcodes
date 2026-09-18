@@ -15,6 +15,7 @@ import {
 import { MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_ENVIRONMENT } from '../../src/node/macos-remote-desktop-launch-agent.js';
 import {
   REMOTE_DESKTOP_CHANNEL,
+  REMOTE_DESKTOP_CONTROL_KIND,
   REMOTE_DESKTOP_DATA_MSG,
   REMOTE_DESKTOP_LIMITS,
   REMOTE_DESKTOP_MSG,
@@ -155,6 +156,9 @@ describe('macOS remote-desktop cross-layer token agreement', () => {
       kControlType: REMOTE_DESKTOP_DATA_MSG.CONTROL,
       kReleaseAllType: REMOTE_DESKTOP_DATA_MSG.RELEASE_ALL,
       kControlRejectedType: REMOTE_DESKTOP_DATA_MSG.CONTROL_REJECTED,
+      kInputAckKind: REMOTE_DESKTOP_CONTROL_KIND.INPUT_ACK,
+      kHelloKind: REMOTE_DESKTOP_CONTROL_KIND.HELLO,
+      kKeepaliveKind: REMOTE_DESKTOP_CONTROL_KIND.KEEPALIVE,
     };
     for (const [nativeName, value] of Object.entries(expected)) {
       expect(dataTokens.get(nativeName), nativeName).toBe(value);

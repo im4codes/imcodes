@@ -173,6 +173,24 @@ const char* WireTerminalReason(common::TransportTerminalReason reason) noexcept 
   return "peer_failed";
 }
 
+/** Diagnostic name for stderr only; the wire uses WireTerminalReason. */
+const char* TerminalReasonName(common::TransportTerminalReason reason) noexcept {
+  switch (reason) {
+    case common::TransportTerminalReason::kNone: return "none";
+    case common::TransportTerminalReason::kStopped: return "stopped";
+    case common::TransportTerminalReason::kRouteExpired: return "route_expired";
+    case common::TransportTerminalReason::kLeaseExpired: return "lease_expired";
+    case common::TransportTerminalReason::kIdleTimeout: return "idle_timeout";
+    case common::TransportTerminalReason::kMediaStalled: return "media_stalled";
+    case common::TransportTerminalReason::kPeerFailed: return "peer_failed";
+    case common::TransportTerminalReason::kChannelFailed: return "channel_failed";
+    case common::TransportTerminalReason::kCandidateOverflow: return "candidate_overflow";
+    case common::TransportTerminalReason::kAdapterFailure: return "adapter_failure";
+    case common::TransportTerminalReason::kProtocolViolation: return "protocol_violation";
+  }
+  return "unknown";
+}
+
 /** REMOTE_DESKTOP_STATE (shared/remote-desktop.ts) -- only the subset a
  * Linux session can actually be in during this first slice; SWITCHING_DISPLAY
  * and RECONNECTING describe worker-replacement/display-change behavior this
@@ -395,6 +413,21 @@ class Worker {
         // never something to keep silently running past. (A session the core
         // already ended is reported by PublishStatus below instead.)
         if (!accepted && !it->second->closed()) {
+          // One stderr line per refusal (error path only; lands in the node
+          // service journal): which envelope, and what it asked for against
+          // what the session holds, is the whole diagnosis.
+          const imcodes::rd::Authority& held = it->second->authority();
+          std::fprintf(stderr,
+                       "linux worker: session %.8s refused %s: mode=%s epoch=%d "
+                       "lease=%lld (held mode=%s epoch=%d lease=%lld, now=%lld)\n",
+                       it->first.c_str(),
+                       signal.kind == imcodes::rd::Signal::Kind::kLease ? "LEASE"
+                                                                       : "MODE_STATE",
+                       signal.authority.mode.c_str(), signal.authority.input_epoch,
+                       static_cast<long long>(signal.authority.lease_expires_at_ms),
+                       held.mode.c_str(), held.input_epoch,
+                       static_cast<long long>(held.lease_expires_at_ms),
+                       static_cast<long long>(NowUnixMs()));
           it->second->Stop();
           WriteLine(imcodes::rd::TerminalEnvelope(it->second->authority(),
                                                   "protocol_error"));
@@ -416,8 +449,13 @@ class Worker {
         // left the Server renewing a route nothing served anymore until the
         // browser's 5-minute reconnect grace expired, and hid the real
         // reason (e.g. lease_expired) behind a generic browser disconnect.
-        if (const char* reason =
-                WireTerminalReason(it->second->diagnostics().terminal_reason)) {
+        const common::TransportDiagnostics ended = it->second->diagnostics();
+        std::fprintf(stderr,
+                     "linux worker: session %.8s ended by transport core: %s "
+                     "(local ice %zu, remote ice %zu)\n",
+                     it->first.c_str(), TerminalReasonName(ended.terminal_reason),
+                     ended.accepted_local_ice, ended.accepted_remote_ice);
+        if (const char* reason = WireTerminalReason(ended.terminal_reason)) {
           WriteLine(imcodes::rd::TerminalEnvelope(it->second->authority(), reason));
         }
         it = sessions_.erase(it);

@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include <X11/Xlib.h>
 #include <X11/extensions/XTest.h>
@@ -355,6 +356,55 @@ int main() {
       return 79;
     }
     std::printf("EmitKey: no held state leaked\n");
+
+    // Every code the browser can send (isRemoteDesktopKeyAllowed in
+    // web/src/remote-desktop-client.ts) must resolve: an unresolved key is an
+    // adapter failure that ends the whole session, so a single unmapped entry
+    // (ScrollLock was one) turns one keypress into a black screen.
+    std::vector<std::string> allowed_codes;
+    for (char letter = 'A'; letter <= 'Z'; ++letter) {
+      allowed_codes.push_back(std::string("Key") + letter);
+    }
+    for (char digit = '0'; digit <= '9'; ++digit) {
+      allowed_codes.push_back(std::string("Digit") + digit);
+      allowed_codes.push_back(std::string("Numpad") + digit);
+    }
+    for (int function = 1; function <= 12; ++function) {
+      allowed_codes.push_back("F" + std::to_string(function));
+    }
+    for (const char* code :
+         {"NumpadAdd", "NumpadSubtract", "NumpadMultiply", "NumpadDivide",
+          "NumpadDecimal", "NumpadEnter", "ArrowUp", "ArrowDown", "ArrowLeft",
+          "ArrowRight", "Backspace", "Tab", "Enter", "Escape", "Space",
+          "Delete", "Insert", "Home", "End", "PageUp", "PageDown",
+          "ShiftLeft", "ShiftRight", "ControlLeft", "ControlRight", "AltLeft",
+          "AltRight", "MetaLeft", "MetaRight", "CapsLock", "NumLock",
+          "ScrollLock", "Semicolon", "Equal", "Comma", "Minus", "Period",
+          "Slash", "Backquote", "BracketLeft", "Backslash", "BracketRight",
+          "Quote"}) {
+      allowed_codes.emplace_back(code);
+    }
+    for (const std::string& code : allowed_codes) {
+      // Lock keys toggle; a second tap restores the display's lock state.
+      const int taps =
+          code == "CapsLock" || code == "NumLock" || code == "ScrollLock" ? 2 : 1;
+      for (int tap = 0; tap < taps; ++tap) {
+        if (!input.EmitKey(code, true) || !input.EmitKey(code, false)) {
+          std::fprintf(stderr, "EmitKey(\"%s\", ...) returned false\n",
+                       code.c_str());
+          XCloseDisplay(display);
+          return 80;
+        }
+      }
+    }
+    if (input.held_count() != 0) {
+      std::fprintf(stderr, "allowlist sweep left %zu key(s) held\n",
+                   input.held_count());
+      XCloseDisplay(display);
+      return 81;
+    }
+    std::printf("EmitKey: all %zu browser-allowed codes resolved\n",
+                allowed_codes.size());
   }
 
   XCloseDisplay(display);

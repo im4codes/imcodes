@@ -28,6 +28,14 @@ inline constexpr char kReleaseAllType[] = "remote_desktop.data.release_all";
 inline constexpr char kControlRejectedType[] =
     "remote_desktop.data.control_rejected";
 
+// `kind` of a kControlType message, pinned to REMOTE_DESKTOP_CONTROL_KIND in
+// shared/remote-desktop.ts by the same cross-layer test. The browser keeps a
+// 3 s timer after every reliable input transition (key/text, release_all,
+// control-channel button) and treats a missing input_ack as a dead peer.
+inline constexpr char kInputAckKind[] = "input_ack";
+inline constexpr char kHelloKind[] = "hello";
+inline constexpr char kKeepaliveKind[] = "keepalive";
+
 }  // namespace imcodes::rd
 
 #endif  // IMCODES_REMOTE_DESKTOP_COMMON_DATA_CHANNEL_CONSTANTS_H_
