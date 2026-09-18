@@ -349,6 +349,65 @@ describe('WsBridge share-scoped sockets', () => {
     expect(project({ kind: 'main', serverId, sessionName: 'deck_proj_brain' }, 'viewer')).toBeNull();
   });
 
+  it('lets a whole-server participant browse, create folders and list presets/models before any session exists', async () => {
+    // The new-session dialog's directory picker, folder creation, preset and
+    // model lists carry no session: the owner may send them, and a whole-server
+    // participant has the owner's authority over every (future) session.
+    const bridge = WsBridge.get(serverId);
+    const target: ShareTarget = { kind: 'server', serverId };
+    const serverCoverage = { ...coverage(target, 'participant', now), serverParticipantAuthority: true };
+    bridge.setShareCoverageResolverForTests(async () => serverCoverage);
+    const db = makeDb();
+    const daemon = new MockWs();
+    bridge.handleDaemonConnection(daemon as never, db, { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    daemon.sent.length = 0;
+
+    const shared = new MockWs();
+    bridge.handleShareBrowserConnection(shared as never, 'shared-user', db, {
+      ticketId: 'server-picker-ticket',
+      target,
+      snapshot: serverCoverage,
+    });
+    shared.emit('message', JSON.stringify({ type: 'fs.ls', requestId: 'pick-ls', path: '~', includeFiles: false }));
+    shared.emit('message', JSON.stringify({ type: 'fs.mkdir', requestId: 'pick-mkdir', path: '~/new-project' }));
+    shared.emit('message', JSON.stringify({ type: CC_PRESET_MSG.LIST }));
+    shared.emit('message', JSON.stringify({ type: TRANSPORT_MSG.LIST_MODELS, requestId: 'pick-models', agentType: 'codex-sdk' }));
+    await flushAsync();
+
+    expect(daemon.sentJson).toContainEqual(expect.objectContaining({ type: 'fs.ls', requestId: 'pick-ls', path: '~' }));
+    expect(daemon.sentJson).toContainEqual(expect.objectContaining({ type: 'fs.mkdir', requestId: 'pick-mkdir' }));
+    expect(daemon.sentJson).toContainEqual(expect.objectContaining({ type: CC_PRESET_MSG.LIST }));
+    expect(daemon.sentJson).toContainEqual(expect.objectContaining({
+      type: TRANSPORT_MSG.LIST_MODELS, requestId: 'pick-models', agentType: 'codex-sdk',
+    }));
+  });
+
+  it('still requires a covered session for a tab-share participant\'s file browsing', async () => {
+    const bridge = WsBridge.get(serverId);
+    const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
+    const tabCoverage = coverage(target, 'participant', now);
+    bridge.setShareCoverageResolverForTests(async () => tabCoverage);
+    const db = makeDb();
+    const daemon = new MockWs();
+    bridge.handleDaemonConnection(daemon as never, db, { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    daemon.sent.length = 0;
+
+    const shared = new MockWs();
+    bridge.handleShareBrowserConnection(shared as never, 'shared-user', db, {
+      ticketId: 'tab-picker-ticket',
+      target,
+      snapshot: tabCoverage,
+    });
+    shared.emit('message', JSON.stringify({ type: 'fs.ls', requestId: 'tab-ls', path: '~', includeFiles: false }));
+    await flushAsync();
+
+    expect(daemon.sentJson.some((msg: Record<string, unknown>) => msg.type === 'fs.ls')).toBe(false);
+  });
+
   it('forwards whole-server lifecycle control even when its ticket requested one session', async () => {
     const bridge = WsBridge.get(serverId);
     const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };

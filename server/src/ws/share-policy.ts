@@ -496,9 +496,15 @@ export function evaluateShareCommand(input: {
   }
 
   const sessionName = commandSessionName(input.msg);
+  // A whole-server participant covers every session on the server, including
+  // ones that do not exist yet. Commands that carry no session at all -- the
+  // new-session dialog's directory picker (fs.ls), its preset and model lists,
+  // creating a folder there -- are therefore covered for them exactly as for
+  // the owner. Tab-share participants and viewers still need a covered target.
+  const targetlessCoveredForServerParticipant = serverParticipant && !sessionName;
   if (policy.kind === 'allow-covered-read') {
     if (!sessionName) {
-      return policy.requireTarget
+      return policy.requireTarget && !targetlessCoveredForServerParticipant
         ? { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED }
         : { allowed: true };
     }
@@ -533,7 +539,8 @@ export function evaluateShareCommand(input: {
     if (direction !== DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD && direction !== DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD) {
       return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
     }
-    if (!sessionName || !shareStateCoversSession(input.state, sessionName)) {
+    if (!targetlessCoveredForServerParticipant
+      && (!sessionName || !shareStateCoversSession(input.state, sessionName))) {
       return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
     }
     // Preview download is FILE_READ: viewers with covered scope may use it.
@@ -556,7 +563,7 @@ export function evaluateShareCommand(input: {
   }
 
   if (policy.kind === 'participant-covered-action') {
-    return sessionName && shareStateCoversSession(input.state, sessionName)
+    return targetlessCoveredForServerParticipant || (sessionName && shareStateCoversSession(input.state, sessionName))
       ? { allowed: true }
       : { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
   }
@@ -577,7 +584,8 @@ export function evaluateShareCommand(input: {
   }
 
   if (policy.kind === 'participant-model-list') {
-    if (!sessionName || !shareStateCoversSession(input.state, sessionName)) {
+    if (!targetlessCoveredForServerParticipant
+      && (!sessionName || !shareStateCoversSession(input.state, sessionName))) {
       return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
     }
     const agentType = typeof input.msg.agentType === 'string' ? input.msg.agentType.trim() : '';
@@ -593,7 +601,7 @@ export function evaluateShareCommand(input: {
       allowed: true,
       stampedMessage: {
         type: TRANSPORT_MSG.LIST_MODELS,
-        sessionName,
+        ...(sessionName ? { sessionName } : {}),
         agentType,
         requestId,
         ...(ccPreset ? { ccPreset } : {}),
@@ -603,10 +611,19 @@ export function evaluateShareCommand(input: {
   }
 
   if (policy.kind === 'participant-preset-list') {
+    const requestId = typeof input.msg.requestId === 'string' ? input.msg.requestId.trim() : '';
+    if (targetlessCoveredForServerParticipant) {
+      // The owner's own sessionless form (new-session dialog): the account's
+      // preset list, optionally correlated by requestId.
+      if (requestId.length > 256) return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+      return {
+        allowed: true,
+        stampedMessage: { type: CC_PRESET_MSG.LIST, ...(requestId ? { requestId } : {}) },
+      };
+    }
     if (!sessionName || !shareStateCoversSession(input.state, sessionName)) {
       return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
     }
-    const requestId = typeof input.msg.requestId === 'string' ? input.msg.requestId.trim() : '';
     if (!requestId || requestId.length > 256) {
       return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
     }
