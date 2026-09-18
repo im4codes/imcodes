@@ -226,6 +226,10 @@ export function mapRemoteDesktopKeyboardEvent(
   targetPlatform: RemoteDesktopTargetPlatform = null,
 ): RemoteDesktopMappedKey | null {
   const bridge = remoteDesktopCommandBridge(platform, targetPlatform);
+  // The mirror image of the command bridge: a Windows/Linux controller's
+  // Control is its primary shortcut modifier, and a Mac target spells that
+  // Command -- Control+C/V/Z/A/S/... are not bound to anything there.
+  const controlAsCommand = !bridge.appleController && targetPlatform === 'macos';
   let code = event.code;
   let key = event.key;
   if (code === 'MetaLeft' || code === 'MetaRight') {
@@ -235,12 +239,15 @@ export function mapRemoteDesktopKeyboardEvent(
       key = 'Control';
     }
     // else: the target is also a Mac, so Command is forwarded as itself.
+  } else if (controlAsCommand && (code === 'ControlLeft' || code === 'ControlRight')) {
+    code = code === 'ControlLeft' ? 'MetaLeft' : 'MetaRight';
+    key = 'Meta';
   }
   return {
     code,
     key,
     modifiers: {
-      control: event.ctrlKey || (bridge.translateToControl && event.metaKey),
+      control: (event.ctrlKey && !controlAsCommand) || (bridge.translateToControl && event.metaKey),
       alt: event.altKey,
     },
     commandAsControl: bridge.translateToControl,
@@ -250,6 +257,7 @@ export function mapRemoteDesktopKeyboardEvent(
 
 export const REMOTE_DESKTOP_CLIPBOARD_SHORTCUT = {
   COPY: 'copy',
+  CUT: 'cut',
   PASTE: 'paste',
 } as const;
 
@@ -258,28 +266,209 @@ export type RemoteDesktopClipboardShortcut = typeof REMOTE_DESKTOP_CLIPBOARD_SHO
 ];
 
 /**
- * The copy/paste the operator actually meant, in their own platform's terms:
- * Command on an Apple controller, Control everywhere else.
+ * The copy/cut/paste the operator actually meant, in their own platform's
+ * terms: Command on an Apple controller, Control everywhere else (plus the
+ * older Control+Insert / Shift+Insert pair PC keyboards still use).
  *
- * These two are special among shortcuts because the clipboards are not shared.
+ * These are special among shortcuts because the clipboards are not shared.
  * Forwarding the keystroke alone copies into the remote machine's clipboard,
  * which the operator cannot reach, and pastes from it, which is never what they
- * just copied locally — so the intent has to be recognised here and answered by
- * the clipboard bridge instead.
+ * just copied locally -- so the intent has to be recognised here and answered
+ * by the clipboard bridge instead. Cut belongs here too: a cut forwarded blind
+ * lands only in the remote clipboard, so the next paste would bring back
+ * whatever was copied locally before it.
  *
  * Shift or Alt held means something else entirely (paste-special, column copy),
- * so those keep going to the remote untouched.
+ * so those keep going to the remote untouched -- except in a Linux terminal,
+ * which copies and pastes with Control+Shift+C/V (Control+C is SIGINT there).
  */
 export function detectRemoteDesktopClipboardShortcut(
   event: RemoteDesktopKeyboardEventLike & { shiftKey?: boolean },
   platform = readControllerPlatform(),
+  targetPlatform: RemoteDesktopTargetPlatform = null,
 ): RemoteDesktopClipboardShortcut | null {
-  const primaryHeld = isAppleControllerPlatform(platform)
+  const apple = isAppleControllerPlatform(platform);
+  const shift = event.shiftKey === true;
+  if (event.altKey) return null;
+  if (!apple && !event.metaKey && event.code === 'Insert') {
+    if (event.ctrlKey && !shift) return REMOTE_DESKTOP_CLIPBOARD_SHORTCUT.COPY;
+    if (shift && !event.ctrlKey) return REMOTE_DESKTOP_CLIPBOARD_SHORTCUT.PASTE;
+    return null;
+  }
+  const primaryHeld = apple
     ? event.metaKey && !event.ctrlKey
     : event.ctrlKey && !event.metaKey;
-  if (!primaryHeld || event.altKey || event.shiftKey === true) return null;
+  if (!primaryHeld) return null;
+  if (shift && (apple || targetPlatform !== 'linux')) return null;
   if (event.code === 'KeyC') return REMOTE_DESKTOP_CLIPBOARD_SHORTCUT.COPY;
   if (event.code === 'KeyV') return REMOTE_DESKTOP_CLIPBOARD_SHORTCUT.PASTE;
+  if (event.code === 'KeyX' && !shift) return REMOTE_DESKTOP_CLIPBOARD_SHORTCUT.CUT;
+  return null;
+}
+
+/**
+ * Whether a recognised copy keystroke should still reach the remote as well.
+ *
+ * Only a PC operator's plain Control+C on a Linux target: there the worker
+ * reads the selection without pressing anything, and Control+C itself still
+ * has to arrive -- it is how a remote terminal is interrupted, and how a
+ * remote app copies into its own clipboard. A Mac operator's Command+C would
+ * arrive as Control+C, i.e. as that interrupt, so it never travels (their
+ * physical Control+C still does); Windows and Mac workers press their own copy
+ * shortcut when asked for the selection.
+ */
+export function shouldForwardRemoteDesktopCopyKeystroke(
+  event: RemoteDesktopKeyboardEventLike & { shiftKey?: boolean },
+  platform = readControllerPlatform(),
+  targetPlatform: RemoteDesktopTargetPlatform = null,
+): boolean {
+  return targetPlatform === 'linux'
+    && !isAppleControllerPlatform(platform)
+    && event.code === 'KeyC'
+    && event.shiftKey !== true
+    && detectRemoteDesktopClipboardShortcut(event, platform, targetPlatform)
+      === REMOTE_DESKTOP_CLIPBOARD_SHORTCUT.COPY;
+}
+
+export type RemoteDesktopModifierKind = 'control' | 'alt' | 'shift' | 'meta';
+
+const MODIFIER_KIND_BY_CODE: Readonly<Record<string, RemoteDesktopModifierKind>> = {
+  ControlLeft: 'control',
+  ControlRight: 'control',
+  AltLeft: 'alt',
+  AltRight: 'alt',
+  ShiftLeft: 'shift',
+  ShiftRight: 'shift',
+  MetaLeft: 'meta',
+  MetaRight: 'meta',
+};
+
+/** The `KeyboardEvent.key` a modifier of each kind reports. */
+export const REMOTE_DESKTOP_MODIFIER_KEY: Readonly<Record<RemoteDesktopModifierKind, string>> = {
+  control: 'Control',
+  alt: 'Alt',
+  shift: 'Shift',
+  meta: 'Meta',
+};
+
+/** Which modifier a physical key code is, or null for every other key. */
+export function remoteDesktopModifierKind(code: string): RemoteDesktopModifierKind | null {
+  return MODIFIER_KIND_BY_CODE[code] ?? null;
+}
+
+/**
+ * Keyboard conventions come in two families: Mac (Command-centric) and PC
+ * (Windows and Linux share Control-based shortcuts). A shortcut typed in the
+ * controller's family means the same thing spelled the target family's way.
+ */
+export type RemoteDesktopKeyboardFamily = 'apple' | 'pc';
+
+export function remoteDesktopControllerFamily(platform = readControllerPlatform()): RemoteDesktopKeyboardFamily {
+  return isAppleControllerPlatform(platform) ? 'apple' : 'pc';
+}
+
+export function remoteDesktopTargetFamily(targetPlatform: RemoteDesktopTargetPlatform): RemoteDesktopKeyboardFamily {
+  return targetPlatform === 'macos' ? 'apple' : 'pc';
+}
+
+export interface RemoteDesktopShortcutEventLike extends RemoteDesktopKeyboardEventLike {
+  shiftKey: boolean;
+}
+
+/** One chord of a translated shortcut: modifiers first, then the key they apply to. */
+export type RemoteDesktopTranslatedChord = readonly RemoteDesktopChordKey[];
+
+const CHORD_CONTROL: RemoteDesktopChordKey = { code: 'ControlLeft', key: 'Control' };
+const CHORD_COMMAND: RemoteDesktopChordKey = { code: 'MetaLeft', key: 'Meta' };
+const CHORD_ALT: RemoteDesktopChordKey = { code: 'AltLeft', key: 'Alt' };
+const CHORD_SHIFT: RemoteDesktopChordKey = { code: 'ShiftLeft', key: 'Shift' };
+const chordKey = (code: string, key: string): RemoteDesktopChordKey => ({ code, key });
+
+const ARROW_CODES = new Set(['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown']);
+
+/**
+ * Shortcuts that one family spells differently from the other -- the ones a
+ * straight modifier swap (Command <-> Control, done by
+ * mapRemoteDesktopKeyboardEvent) gets wrong. Returns the chords to tap on the
+ * target, or null when the event should travel as itself.
+ *
+ * Mac controller -> Windows/Linux target:
+ *   Command+Left/Right -> Home/End, Command+Up/Down -> Control+Home/End,
+ *   Option+arrows -> Control+arrows (by word/paragraph), Option+Backspace/
+ *   Delete -> Control+Backspace/Delete, Command+Backspace/Delete -> delete to
+ *   the start/end of the line, Command+Shift+[/] and Command+Option+Left/Right
+ *   -> Control+PageUp/PageDown (previous/next tab), and Command+Shift+Z ->
+ *   Control+Y on Windows (Linux apps take Control+Shift+Z themselves).
+ * Windows/Linux controller -> Mac target: the reverse -- Home/End,
+ *   Control+Home/End, Control+arrows, Control+Backspace/Delete, Control+Y and
+ *   Control+PageUp/PageDown -- while Control+Tab, Control+Space, Control+H and
+ *   Control+M stay Control: as Command they would switch apps, open
+ *   Spotlight, hide the app or minimize the window.
+ * Shift is carried over wherever it extends a selection.
+ *
+ * Deliberately NOT translated, because the same keys mean different things in
+ * different apps: Command+[/] (browser back/forward, but outdent/indent in
+ * editors) and Alt+Left/Right.
+ */
+export function translateRemoteDesktopShortcut(
+  event: RemoteDesktopShortcutEventLike,
+  platform = readControllerPlatform(),
+  targetPlatform: RemoteDesktopTargetPlatform = null,
+): readonly RemoteDesktopTranslatedChord[] | null {
+  const controller = remoteDesktopControllerFamily(platform);
+  const target = remoteDesktopTargetFamily(targetPlatform);
+  if (controller === target) return null;
+  const { code, ctrlKey: ctrl, altKey: alt, metaKey: meta, shiftKey: shift } = event;
+  const selecting = (chord: RemoteDesktopChordKey[]): RemoteDesktopTranslatedChord => (
+    shift ? [CHORD_SHIFT, ...chord] : chord
+  );
+  const arrow = ARROW_CODES.has(code);
+
+  if (controller === 'apple') {
+    const commandOnly = meta && !ctrl && !alt;
+    const optionOnly = alt && !ctrl && !meta;
+    const commandOption = meta && alt && !ctrl;
+    if (commandOnly && code === 'ArrowLeft') return [selecting([chordKey('Home', 'Home')])];
+    if (commandOnly && code === 'ArrowRight') return [selecting([chordKey('End', 'End')])];
+    if (commandOnly && code === 'ArrowUp') return [selecting([CHORD_CONTROL, chordKey('Home', 'Home')])];
+    if (commandOnly && code === 'ArrowDown') return [selecting([CHORD_CONTROL, chordKey('End', 'End')])];
+    if (optionOnly && arrow) return [selecting([CHORD_CONTROL, chordKey(code, code)])];
+    if (optionOnly && !shift && code === 'Backspace') return [[CHORD_CONTROL, chordKey('Backspace', 'Backspace')]];
+    if (optionOnly && !shift && code === 'Delete') return [[CHORD_CONTROL, chordKey('Delete', 'Delete')]];
+    if (commandOnly && !shift && code === 'Backspace') {
+      return [[CHORD_SHIFT, chordKey('Home', 'Home')], [chordKey('Backspace', 'Backspace')]];
+    }
+    if (commandOnly && !shift && code === 'Delete') {
+      return [[CHORD_SHIFT, chordKey('End', 'End')], [chordKey('Delete', 'Delete')]];
+    }
+    if ((commandOnly && shift && code === 'BracketLeft') || (commandOption && !shift && code === 'ArrowLeft')) {
+      return [[CHORD_CONTROL, chordKey('PageUp', 'PageUp')]];
+    }
+    if ((commandOnly && shift && code === 'BracketRight') || (commandOption && !shift && code === 'ArrowRight')) {
+      return [[CHORD_CONTROL, chordKey('PageDown', 'PageDown')]];
+    }
+    if (commandOnly && shift && code === 'KeyZ' && targetPlatform === 'windows') {
+      return [[CHORD_CONTROL, chordKey('KeyY', 'y')]];
+    }
+    return null;
+  }
+
+  const plain = !ctrl && !alt && !meta;
+  const controlOnly = ctrl && !alt && !meta;
+  if (plain && code === 'Home') return [selecting([CHORD_COMMAND, chordKey('ArrowLeft', 'ArrowLeft')])];
+  if (plain && code === 'End') return [selecting([CHORD_COMMAND, chordKey('ArrowRight', 'ArrowRight')])];
+  if (controlOnly && code === 'Home') return [selecting([CHORD_COMMAND, chordKey('ArrowUp', 'ArrowUp')])];
+  if (controlOnly && code === 'End') return [selecting([CHORD_COMMAND, chordKey('ArrowDown', 'ArrowDown')])];
+  if (controlOnly && arrow) return [selecting([CHORD_ALT, chordKey(code, code)])];
+  if (controlOnly && !shift && code === 'Backspace') return [[CHORD_ALT, chordKey('Backspace', 'Backspace')]];
+  if (controlOnly && !shift && code === 'Delete') return [[CHORD_ALT, chordKey('Delete', 'Delete')]];
+  if (controlOnly && !shift && code === 'KeyY') return [[CHORD_COMMAND, CHORD_SHIFT, chordKey('KeyZ', 'z')]];
+  if (controlOnly && !shift && code === 'PageUp') return [[CHORD_COMMAND, CHORD_SHIFT, chordKey('BracketLeft', '[')]];
+  if (controlOnly && !shift && code === 'PageDown') return [[CHORD_COMMAND, CHORD_SHIFT, chordKey('BracketRight', ']')]];
+  if (controlOnly && code === 'Tab') return [selecting([CHORD_CONTROL, chordKey('Tab', 'Tab')])];
+  if (controlOnly && !shift && code === 'Space') return [[CHORD_CONTROL, chordKey('Space', ' ')]];
+  if (controlOnly && !shift && code === 'KeyH') return [[CHORD_CONTROL, chordKey('KeyH', 'h')]];
+  if (controlOnly && !shift && code === 'KeyM') return [[CHORD_CONTROL, chordKey('KeyM', 'm')]];
   return null;
 }
 

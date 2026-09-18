@@ -3,6 +3,9 @@ import {
   detectRemoteDesktopClipboardShortcut,
   focusRemoteDesktopMobileInput,
   mapRemoteDesktopKeyboardEvent,
+  remoteDesktopModifierKind,
+  shouldForwardRemoteDesktopCopyKeystroke,
+  translateRemoteDesktopShortcut,
   REMOTE_DESKTOP_CLIPBOARD_SHORTCUT,
   REMOTE_DESKTOP_MOBILE_INPUT_ACCESSORY_SUPPRESS_MS,
   REMOTE_DESKTOP_MOBILE_SHORTCUT_IDS,
@@ -61,8 +64,8 @@ describe('remote desktop keyboard mapping', () => {
     });
   });
 
-  it('keeps Windows Control and does not forward the local Windows key from a non-Apple controller, on any target', () => {
-    for (const targetPlatform of [null, 'windows', 'linux', 'macos'] as const) {
+  it('keeps Windows Control and does not forward the local Windows key from a non-Apple controller to a PC target', () => {
+    for (const targetPlatform of [null, 'windows', 'linux'] as const) {
       expect(mapRemoteDesktopKeyboardEvent({
         code: 'KeyA', key: 'a', ctrlKey: true, altKey: false, metaKey: false,
       }, 'Win32', targetPlatform)).toMatchObject({
@@ -75,6 +78,30 @@ describe('remote desktop keyboard mapping', () => {
         code: 'MetaLeft', key: 'Meta', ctrlKey: false, altKey: false, metaKey: true,
       }, 'Win32', targetPlatform)).toBeNull();
     }
+  });
+
+  it('sends a Windows/Linux operator\'s Control to a macOS target as Command', () => {
+    // Control+C/V/Z/A/S... are not bound to anything on a Mac; the same
+    // shortcuts are spelled with Command there.
+    expect(mapRemoteDesktopKeyboardEvent({
+      code: 'ControlLeft', key: 'Control', ctrlKey: true, altKey: false, metaKey: false,
+    }, 'Win32', 'macos')).toEqual({
+      code: 'MetaLeft',
+      key: 'Meta',
+      modifiers: { control: false, alt: false },
+      commandAsControl: false,
+      usesCommandBridge: false,
+    });
+    expect(mapRemoteDesktopKeyboardEvent({
+      code: 'ControlRight', key: 'Control', ctrlKey: true, altKey: false, metaKey: false,
+    }, 'Linux x86_64', 'macos')?.code).toBe('MetaRight');
+    expect(mapRemoteDesktopKeyboardEvent({
+      code: 'KeyA', key: 'a', ctrlKey: true, altKey: false, metaKey: false,
+    }, 'Win32', 'macos')).toMatchObject({ code: 'KeyA', modifiers: { control: false, alt: false } });
+    // The local Windows key still never travels.
+    expect(mapRemoteDesktopKeyboardEvent({
+      code: 'MetaLeft', key: 'Meta', ctrlKey: false, altKey: false, metaKey: true,
+    }, 'Win32', 'macos')).toBeNull();
   });
 
   it('resolves the command bridge for every controller/target pairing', () => {
@@ -237,8 +264,141 @@ describe('clipboard shortcuts', () => {
     // copy); those keep going to the remote untouched.
     expect(detectRemoteDesktopClipboardShortcut(key({ ctrlKey: true, shiftKey: true }), 'Win32')).toBeNull();
     expect(detectRemoteDesktopClipboardShortcut(key({ ctrlKey: true, altKey: true }), 'Win32')).toBeNull();
-    expect(detectRemoteDesktopClipboardShortcut(key({ code: 'KeyX', ctrlKey: true }), 'Win32')).toBeNull();
+    expect(detectRemoteDesktopClipboardShortcut(key({ code: 'KeyZ', ctrlKey: true }), 'Win32')).toBeNull();
     expect(detectRemoteDesktopClipboardShortcut(key({}), 'Win32')).toBeNull();
+  });
+
+  it('treats cut as a clipboard shortcut too, on every platform pairing', () => {
+    // A cut forwarded blind lands only in the remote clipboard, so the next
+    // paste would bring back whatever was copied locally before it.
+    expect(detectRemoteDesktopClipboardShortcut(key({ code: 'KeyX', ctrlKey: true }), 'Win32'))
+      .toBe(REMOTE_DESKTOP_CLIPBOARD_SHORTCUT.CUT);
+    expect(detectRemoteDesktopClipboardShortcut(key({ code: 'KeyX', metaKey: true }), 'MacIntel', 'linux'))
+      .toBe(REMOTE_DESKTOP_CLIPBOARD_SHORTCUT.CUT);
+    expect(detectRemoteDesktopClipboardShortcut(key({ code: 'KeyX', ctrlKey: true, shiftKey: true }), 'Win32', 'linux'))
+      .toBeNull();
+  });
+
+  it('reads the older Control+Insert / Shift+Insert pair on PC keyboards', () => {
+    expect(detectRemoteDesktopClipboardShortcut(key({ code: 'Insert', ctrlKey: true }), 'Win32'))
+      .toBe(REMOTE_DESKTOP_CLIPBOARD_SHORTCUT.COPY);
+    expect(detectRemoteDesktopClipboardShortcut(key({ code: 'Insert', shiftKey: true }), 'Linux x86_64', 'linux'))
+      .toBe(REMOTE_DESKTOP_CLIPBOARD_SHORTCUT.PASTE);
+    expect(detectRemoteDesktopClipboardShortcut(key({ code: 'Insert' }), 'Win32')).toBeNull();
+    expect(detectRemoteDesktopClipboardShortcut(key({ code: 'Insert', ctrlKey: true, shiftKey: true }), 'Win32'))
+      .toBeNull();
+  });
+
+  it('reads a Linux terminal\'s Control+Shift+C/V only for a PC operator on a Linux target', () => {
+    expect(detectRemoteDesktopClipboardShortcut(key({ ctrlKey: true, shiftKey: true }), 'Win32', 'linux'))
+      .toBe(REMOTE_DESKTOP_CLIPBOARD_SHORTCUT.COPY);
+    expect(detectRemoteDesktopClipboardShortcut(key({ code: 'KeyV', ctrlKey: true, shiftKey: true }), 'Win32', 'linux'))
+      .toBe(REMOTE_DESKTOP_CLIPBOARD_SHORTCUT.PASTE);
+    expect(detectRemoteDesktopClipboardShortcut(key({ ctrlKey: true, shiftKey: true }), 'Win32', 'windows'))
+      .toBeNull();
+    expect(detectRemoteDesktopClipboardShortcut(key({ metaKey: true, shiftKey: true }), 'MacIntel', 'linux'))
+      .toBeNull();
+  });
+
+  it('still delivers only a PC operator\'s plain Control+C to a Linux target', () => {
+    // The Linux worker reads the selection without pressing anything, so the
+    // keystroke has to arrive for itself: it interrupts a remote terminal.
+    expect(shouldForwardRemoteDesktopCopyKeystroke(key({ ctrlKey: true }), 'Win32', 'linux')).toBe(true);
+    expect(shouldForwardRemoteDesktopCopyKeystroke(key({ ctrlKey: true }), 'Linux x86_64', 'linux')).toBe(true);
+    // A Mac operator's Command+C would arrive as that interrupt.
+    expect(shouldForwardRemoteDesktopCopyKeystroke(key({ metaKey: true }), 'MacIntel', 'linux')).toBe(false);
+    expect(shouldForwardRemoteDesktopCopyKeystroke(key({ ctrlKey: true, shiftKey: true }), 'Win32', 'linux')).toBe(false);
+    expect(shouldForwardRemoteDesktopCopyKeystroke(key({ code: 'Insert', ctrlKey: true }), 'Win32', 'linux')).toBe(false);
+    expect(shouldForwardRemoteDesktopCopyKeystroke(key({ ctrlKey: true }), 'Win32', 'windows')).toBe(false);
+    expect(shouldForwardRemoteDesktopCopyKeystroke(key({ metaKey: true }), 'MacIntel', 'macos')).toBe(false);
+  });
+});
+
+describe('shortcut translation between Mac and PC keyboards', () => {
+  const press = (code: string, held: Partial<{ ctrlKey: boolean; metaKey: boolean; altKey: boolean; shiftKey: boolean }> = {}) => ({
+    code, key: code, ctrlKey: false, altKey: false, metaKey: false, shiftKey: false, ...held,
+  });
+  const chords = (value: ReturnType<typeof translateRemoteDesktopShortcut>) => (
+    value?.map((chord) => chord.map((entry) => entry.code).join('+')) ?? null
+  );
+
+  it('spells a Mac operator\'s editing shortcuts the PC way on Windows and Linux', () => {
+    for (const target of ['windows', 'linux', null] as const) {
+      const mac = (code: string, held: Parameters<typeof press>[1]) => (
+        chords(translateRemoteDesktopShortcut(press(code, held), 'MacIntel', target))
+      );
+      expect(mac('ArrowLeft', { metaKey: true })).toEqual(['Home']);
+      expect(mac('ArrowRight', { metaKey: true })).toEqual(['End']);
+      expect(mac('ArrowUp', { metaKey: true })).toEqual(['ControlLeft+Home']);
+      expect(mac('ArrowDown', { metaKey: true })).toEqual(['ControlLeft+End']);
+      expect(mac('ArrowLeft', { metaKey: true, shiftKey: true })).toEqual(['ShiftLeft+Home']);
+      expect(mac('ArrowRight', { altKey: true })).toEqual(['ControlLeft+ArrowRight']);
+      expect(mac('ArrowUp', { altKey: true, shiftKey: true })).toEqual(['ShiftLeft+ControlLeft+ArrowUp']);
+      expect(mac('Backspace', { altKey: true })).toEqual(['ControlLeft+Backspace']);
+      expect(mac('Delete', { altKey: true })).toEqual(['ControlLeft+Delete']);
+      expect(mac('Backspace', { metaKey: true })).toEqual(['ShiftLeft+Home', 'Backspace']);
+      expect(mac('Delete', { metaKey: true })).toEqual(['ShiftLeft+End', 'Delete']);
+      expect(mac('BracketLeft', { metaKey: true, shiftKey: true })).toEqual(['ControlLeft+PageUp']);
+      expect(mac('BracketRight', { metaKey: true, shiftKey: true })).toEqual(['ControlLeft+PageDown']);
+      expect(mac('ArrowLeft', { metaKey: true, altKey: true })).toEqual(['ControlLeft+PageUp']);
+      expect(mac('ArrowRight', { metaKey: true, altKey: true })).toEqual(['ControlLeft+PageDown']);
+      // Everything else is a straight Command -> Control swap.
+      expect(mac('KeyA', { metaKey: true })).toBeNull();
+      expect(mac('KeyZ', { metaKey: true })).toBeNull();
+      // Ambiguous between apps (browser back vs. outdent): left alone.
+      expect(mac('BracketLeft', { metaKey: true })).toBeNull();
+      expect(mac('ArrowLeft', {})).toBeNull();
+    }
+    // Redo: Windows apps take Control+Y, Linux apps Control+Shift+Z.
+    expect(chords(translateRemoteDesktopShortcut(press('KeyZ', { metaKey: true, shiftKey: true }), 'MacIntel', 'windows')))
+      .toEqual(['ControlLeft+KeyY']);
+    expect(translateRemoteDesktopShortcut(press('KeyZ', { metaKey: true, shiftKey: true }), 'MacIntel', 'linux'))
+      .toBeNull();
+  });
+
+  it('spells a Windows or Linux operator\'s shortcuts the Mac way on a Mac', () => {
+    for (const controller of ['Win32', 'Linux x86_64']) {
+      const pc = (code: string, held: Parameters<typeof press>[1] = {}) => (
+        chords(translateRemoteDesktopShortcut(press(code, held), controller, 'macos'))
+      );
+      expect(pc('Home')).toEqual(['MetaLeft+ArrowLeft']);
+      expect(pc('End', { shiftKey: true })).toEqual(['ShiftLeft+MetaLeft+ArrowRight']);
+      expect(pc('Home', { ctrlKey: true })).toEqual(['MetaLeft+ArrowUp']);
+      expect(pc('End', { ctrlKey: true })).toEqual(['MetaLeft+ArrowDown']);
+      expect(pc('ArrowLeft', { ctrlKey: true })).toEqual(['AltLeft+ArrowLeft']);
+      expect(pc('ArrowRight', { ctrlKey: true, shiftKey: true })).toEqual(['ShiftLeft+AltLeft+ArrowRight']);
+      expect(pc('Backspace', { ctrlKey: true })).toEqual(['AltLeft+Backspace']);
+      expect(pc('Delete', { ctrlKey: true })).toEqual(['AltLeft+Delete']);
+      expect(pc('KeyY', { ctrlKey: true })).toEqual(['MetaLeft+ShiftLeft+KeyZ']);
+      expect(pc('PageUp', { ctrlKey: true })).toEqual(['MetaLeft+ShiftLeft+BracketLeft']);
+      expect(pc('PageDown', { ctrlKey: true })).toEqual(['MetaLeft+ShiftLeft+BracketRight']);
+      // As Command these would switch apps, open Spotlight, hide or minimize.
+      expect(pc('Tab', { ctrlKey: true })).toEqual(['ControlLeft+Tab']);
+      expect(pc('Tab', { ctrlKey: true, shiftKey: true })).toEqual(['ShiftLeft+ControlLeft+Tab']);
+      expect(pc('Space', { ctrlKey: true })).toEqual(['ControlLeft+Space']);
+      expect(pc('KeyH', { ctrlKey: true })).toEqual(['ControlLeft+KeyH']);
+      expect(pc('KeyM', { ctrlKey: true })).toEqual(['ControlLeft+KeyM']);
+      // Everything else is a straight Control -> Command swap.
+      expect(pc('KeyC', { ctrlKey: true })).toBeNull();
+      expect(pc('KeyS', { ctrlKey: true })).toBeNull();
+      expect(pc('ArrowLeft', { altKey: true })).toBeNull();
+      expect(pc('ArrowLeft')).toBeNull();
+    }
+  });
+
+  it('translates nothing between machines of the same family', () => {
+    expect(translateRemoteDesktopShortcut(press('ArrowLeft', { metaKey: true }), 'MacIntel', 'macos')).toBeNull();
+    expect(translateRemoteDesktopShortcut(press('Home'), 'Win32', 'linux')).toBeNull();
+    expect(translateRemoteDesktopShortcut(press('Home'), 'Linux x86_64', 'windows')).toBeNull();
+    expect(translateRemoteDesktopShortcut(press('ArrowLeft', { ctrlKey: true }), 'Win32', 'windows')).toBeNull();
+  });
+
+  it('knows which physical keys are modifiers', () => {
+    expect(remoteDesktopModifierKind('ControlRight')).toBe('control');
+    expect(remoteDesktopModifierKind('AltLeft')).toBe('alt');
+    expect(remoteDesktopModifierKind('ShiftRight')).toBe('shift');
+    expect(remoteDesktopModifierKind('MetaLeft')).toBe('meta');
+    expect(remoteDesktopModifierKind('KeyA')).toBeNull();
   });
 });
 

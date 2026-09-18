@@ -37,6 +37,13 @@ const MAC_TARGET_CAPABILITIES = [
   REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
   REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
 ] as const;
+const LINUX_TARGET_CAPABILITIES = [
+  REMOTE_DESKTOP_SESSION_CAPABILITY,
+  REMOTE_DESKTOP_PLATFORM_CAPABILITY.LINUX,
+  REMOTE_DESKTOP_CAPTURE_CAPABILITY.LINUX_X11,
+  REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+  REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+] as const;
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string) => key }),
@@ -53,6 +60,7 @@ const setDisplayMode = vi.fn(() => true);
 const setDisplayScale = vi.fn(() => true);
 const setMode = vi.fn(() => true);
 const key = vi.fn(() => true);
+const tapChords = vi.fn(() => true);
 const text = vi.fn(() => true);
 const textByServer = vi.fn<(serverId: string, value: string) => boolean>(() => true);
 const requestRemoteClipboard = vi.fn(async () => 'selected remotely');
@@ -123,6 +131,7 @@ vi.mock('../src/remote-desktop-client.js', () => ({
     pointerMove = pointerMove;
     wheel = wheel;
     key = key;
+    tapChords = tapChords;
     text = (value: string) => {
       text(value);
       return textByServer(this.serverId, value);
@@ -2167,6 +2176,121 @@ describe('RemoteDesktopPanel mobile gestures', () => {
         value: originalPlatform,
       });
     }
+  });
+
+  describe('shortcuts between Mac and PC keyboards', () => {
+    async function withControllerPlatform(platform: string, run: () => Promise<void>): Promise<void> {
+      const originalPlatform = navigator.platform;
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: platform });
+      try {
+        await run();
+      } finally {
+        Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+      }
+    }
+    const press = (stage: HTMLElement, type: 'keydown' | 'keyup', init: KeyboardEventInit): KeyboardEvent => {
+      const event = new KeyboardEvent(type, { bubbles: true, cancelable: true, ...init });
+      act(() => { stage.dispatchEvent(event); });
+      return event;
+    };
+
+    it('taps a Mac operator\'s Command+Left on a Linux target as one Home', async () => {
+      await withControllerPlatform('MacIntel', async () => {
+        const { stage } = await renderPanel(undefined, [...LINUX_TARGET_CAPABILITIES]);
+        press(stage, 'keydown', { code: 'MetaLeft', key: 'Meta', metaKey: true });
+        const left = press(stage, 'keydown', { code: 'ArrowLeft', key: 'ArrowLeft', metaKey: true });
+        press(stage, 'keyup', { code: 'ArrowLeft', key: 'ArrowLeft', metaKey: true });
+        press(stage, 'keyup', { code: 'MetaLeft', key: 'Meta' });
+
+        expect(left.defaultPrevented).toBe(true);
+        expect(tapChords).toHaveBeenCalledTimes(1);
+        expect(tapChords).toHaveBeenCalledWith([[{ code: 'Home', key: 'Home' }]]);
+        expect(key.mock.calls).toEqual([
+          ['ControlLeft', 'Control', true, false, { control: true, alt: false }],
+          ['ControlLeft', 'Control', false, false, { control: false, alt: false }],
+        ]);
+      });
+    });
+
+    it('sends a Windows operator\'s Control to a Mac target as Command, and Home as Command+Left', async () => {
+      await withControllerPlatform('Win32', async () => {
+        const { stage } = await renderPanel(undefined, [...MAC_TARGET_CAPABILITIES]);
+        press(stage, 'keydown', { code: 'ControlLeft', key: 'Control', ctrlKey: true });
+        press(stage, 'keydown', { code: 'KeyS', key: 's', ctrlKey: true });
+        press(stage, 'keyup', { code: 'KeyS', key: 's', ctrlKey: true });
+        press(stage, 'keyup', { code: 'ControlLeft', key: 'Control' });
+        expect(key.mock.calls).toEqual([
+          ['MetaLeft', 'Meta', true, false, { control: false, alt: false }],
+          ['KeyS', 's', true, false, { control: false, alt: false }],
+          ['KeyS', 's', false, false, { control: false, alt: false }],
+          ['MetaLeft', 'Meta', false, false, { control: false, alt: false }],
+        ]);
+
+        key.mockClear();
+        press(stage, 'keydown', { code: 'Home', key: 'Home' });
+        press(stage, 'keyup', { code: 'Home', key: 'Home' });
+        expect(tapChords).toHaveBeenCalledWith([[{ code: 'MetaLeft', key: 'Meta' }, { code: 'ArrowLeft', key: 'ArrowLeft' }]]);
+        expect(key).not.toHaveBeenCalled();
+      });
+    });
+
+    it('takes the selection on a PC operator\'s Control+C to Linux and still delivers the interrupt', async () => {
+      const readText = vi.fn(async () => 'from local clipboard');
+      Object.defineProperty(navigator, 'clipboard', {
+        configurable: true,
+        value: { readText, writeText: vi.fn(async () => {}) },
+      });
+      await withControllerPlatform('Win32', async () => {
+        const { stage } = await renderPanel(undefined, [...LINUX_TARGET_CAPABILITIES]);
+        await act(async () => {
+          stage.dispatchEvent(new KeyboardEvent('keydown', {
+            bubbles: true, cancelable: true, code: 'KeyC', key: 'c', ctrlKey: true,
+          }));
+          await Promise.resolve();
+        });
+        expect(requestRemoteClipboard).toHaveBeenCalledTimes(1);
+        expect(key).toHaveBeenCalledWith('KeyC', 'c', true, false, { control: true, alt: false });
+        press(stage, 'keyup', { code: 'KeyC', key: 'c', ctrlKey: true });
+        expect(key).toHaveBeenCalledWith('KeyC', 'c', false, false, { control: true, alt: false });
+        expect(requestRemoteClipboard).toHaveBeenCalledTimes(1);
+
+        // A Linux terminal's own paste chord brings in the LOCAL clipboard.
+        key.mockClear();
+        await act(async () => {
+          stage.dispatchEvent(new KeyboardEvent('keydown', {
+            bubbles: true, cancelable: true, code: 'KeyV', key: 'V', ctrlKey: true, shiftKey: true,
+          }));
+          await Promise.resolve();
+        });
+        expect(readText).toHaveBeenCalledTimes(1);
+        expect(text).toHaveBeenCalledWith('from local clipboard');
+        expect(key).not.toHaveBeenCalled();
+      });
+    });
+
+    it('cuts by copying the selection first, then tapping the target\'s own cut', async () => {
+      Object.defineProperty(navigator, 'clipboard', {
+        configurable: true,
+        value: { readText: vi.fn(async () => ''), writeText: vi.fn(async () => {}) },
+      });
+      let answer!: (value: string) => void;
+      requestRemoteClipboard.mockImplementationOnce(() => new Promise<string>((resolve) => { answer = resolve; }));
+      await withControllerPlatform('Win32', async () => {
+        const { stage } = await renderPanel(undefined, [...MAC_TARGET_CAPABILITIES]);
+        const cut = press(stage, 'keydown', { code: 'KeyX', key: 'x', ctrlKey: true });
+        expect(cut.defaultPrevented).toBe(true);
+        expect(requestRemoteClipboard).toHaveBeenCalledTimes(1);
+        // Nothing is removed on the remote until the selection is in hand.
+        expect(tapChords).not.toHaveBeenCalled();
+        await act(async () => {
+          answer('cut remotely');
+          for (let i = 0; i < 5; i += 1) await Promise.resolve();
+        });
+        expect(navigator.clipboard.writeText).toHaveBeenCalledWith('cut remotely');
+        expect(tapChords).toHaveBeenCalledWith([[{ code: 'MetaLeft', key: 'Meta' }, { code: 'KeyX', key: 'x' }]]);
+        expect(key).not.toHaveBeenCalledWith('KeyX', expect.anything(), expect.anything(), expect.anything(), expect.anything());
+      });
+    });
   });
 
   it('suppresses Command, not Control, during a middle-drag on a macOS target', async () => {

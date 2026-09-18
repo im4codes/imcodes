@@ -58,8 +58,11 @@ import {
   remoteDesktopComputerKeyLabel,
   REMOTE_DESKTOP_CLIPBOARD_SHORTCUT,
   remoteDesktopMobileDeletionKey,
+  remoteDesktopMobileShortcutKeys,
   sendRemoteDesktopChord,
+  shouldForwardRemoteDesktopCopyKeystroke,
   splitRemoteDesktopMobileTextEnter,
+  translateRemoteDesktopShortcut,
   type RemoteDesktopChordKey,
   type RemoteDesktopComputerKeySpec,
 } from '../remote-desktop-keyboard.js';
@@ -581,6 +584,9 @@ export function RemoteDesktopPanel({
   const syntheticCommandControlRef = useRef(false);
   const commandMiddleDragPointerRef = useRef<number | null>(null);
   const forwardedPasteShortcutAtRef = useRef(0);
+  // Keys whose press was tapped on the remote as a translated shortcut; their
+  // release has nothing left to deliver.
+  const translatedKeyCodesRef = useRef(new Set<string>());
 
   const recordVideoDiagnostic = useCallback((
     type: RemoteDesktopBrowserDiagnosticEvent,
@@ -2059,7 +2065,7 @@ export function RemoteDesktopPanel({
     // copies where the operator cannot reach and pastes what they never copied.
     // Copy still reaches the remote — the bridge sends it there to make the
     // selection — so an interrupt in a remote console keeps working.
-    const clipboardShortcut = detectRemoteDesktopClipboardShortcut(event);
+    const clipboardShortcut = detectRemoteDesktopClipboardShortcut(event, undefined, targetPlatform);
     if (clipboardShortcut === REMOTE_DESKTOP_CLIPBOARD_SHORTCUT.PASTE
       && (!navigator.clipboard?.readText || isAppleControllerPlatform(readControllerPlatform()))) {
       // No clipboard read here: leave the key alone so the browser raises its
@@ -2077,14 +2083,33 @@ export function RemoteDesktopPanel({
       // pasting its own clipboard on top once this one lands.
       return;
     }
-    if (clipboardShortcut) {
+    if (clipboardShortcut && shouldForwardRemoteDesktopCopyKeystroke(event, undefined, targetPlatform)) {
+      // A PC operator's Control+C on Linux: take the selection AND let the
+      // keystroke through below -- it interrupts a remote terminal.
+      if (down) void copyRemoteSelection();
+    } else if (clipboardShortcut) {
       event.preventDefault();
       if (!down) return;
       if (clipboardShortcut === REMOTE_DESKTOP_CLIPBOARD_SHORTCUT.COPY) {
         void copyRemoteSelection();
+      } else if (clipboardShortcut === REMOTE_DESKTOP_CLIPBOARD_SHORTCUT.CUT) {
+        void cutRemoteSelection();
       } else {
         void pasteLocalClipboard();
       }
+      return;
+    }
+    // Shortcuts the target spells differently (Command+Left is Home on a PC,
+    // Home is Command+Left on a Mac, ...) are tapped whole on the remote.
+    const translated = down ? translateRemoteDesktopShortcut(event, undefined, targetPlatform) : null;
+    if (translated) {
+      event.preventDefault();
+      translatedKeyCodesRef.current.add(event.code);
+      client.tapChords(translated);
+      return;
+    }
+    if (translatedKeyCodesRef.current.delete(event.code) && !down) {
+      event.preventDefault();
       return;
     }
     const commandEvent = event.code === 'MetaLeft' || event.code === 'MetaRight';
@@ -2129,6 +2154,7 @@ export function RemoteDesktopPanel({
   };
 
   const releaseCapturedInput = () => {
+    translatedKeyCodesRef.current.clear();
     forwardedCommandCodesRef.current.clear();
     suppressedCommandCodesRef.current.clear();
     syntheticCommandControlRef.current = false;
@@ -2228,6 +2254,14 @@ export function RemoteDesktopPanel({
       return;
     }
     setClipboardStatus(await copied ? 'copied' : 'failed');
+  };
+
+  // The selection leaves the remote only once it is safely in the local
+  // clipboard: the Windows and Mac workers copy by pressing their own copy
+  // shortcut, which finds nothing left to copy after a cut.
+  const cutRemoteSelection = async () => {
+    await copyRemoteSelection();
+    clientRef.current?.tapChords([remoteDesktopMobileShortcutKeys('cut', targetPlatform)]);
   };
 
   const stopAndClose = () => {

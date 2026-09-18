@@ -78,6 +78,10 @@ class FakeConnectionClient {
     _repeat: boolean,
     _modifiers: { control: boolean; alt: boolean },
   ): boolean { this.input.push('key'); return true; }
+  tapChords(_chords: readonly (readonly { code: string; key: string }[])[]): boolean {
+    this.input.push('tap_chords');
+    return true;
+  }
   text(_value: string): boolean { this.input.push('text'); return true; }
   releaseAll(): void { this.lifecycle.push('release_all'); }
   releasePointerButtons(): void {}
@@ -368,8 +372,10 @@ describe('RemoteDesktopConnectionManager', () => {
 
     first.pointerMove(0.3, 0.4);
     expect(first.text('hidden')).toBe(false);
+    expect(first.tapChords([[{ code: 'Home', key: 'Home' }]])).toBe(false);
     expect(second.text('active')).toBe(true);
-    expect(clients[0].input).toEqual(['pointer_move', 'text']);
+    expect(second.tapChords([[{ code: 'Home', key: 'Home' }]])).toBe(true);
+    expect(clients[0].input).toEqual(['pointer_move', 'text', 'tap_chords']);
     expect(clients[0].lifecycle).toEqual(['release_all']);
 
     detachFirst();

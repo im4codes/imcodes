@@ -43,6 +43,12 @@ import {
   recordRemoteDesktopBrowserDiagnostic,
   type RemoteDesktopBrowserDiagnosticInput,
 } from './remote-desktop-browser-diagnostics.js';
+import {
+  REMOTE_DESKTOP_MODIFIER_KEY,
+  remoteDesktopModifierKind,
+  type RemoteDesktopChordKey,
+  type RemoteDesktopModifierKind,
+} from './remote-desktop-keyboard.js';
 
 const DATA_BUFFER_HIGH_WATER_BYTES = 256 * 1024;
 /**
@@ -483,6 +489,15 @@ export class RemoteDesktopClient {
   private pointerMoveBackpressureDrops = 0;
   private pointerMoveSendFailures = 0;
   private pressedCodes = new Set<string>();
+  /**
+   * Modifiers the operator is still holding that a translated shortcut or a
+   * paste lifted on the remote (see tapChords and text). One goes back down
+   * just before the next ordinary key or button press needs it, and its
+   * physical release has nothing left to do. Never restored eagerly: an Alt
+   * pressed and released with nothing in between opens the menu bar on
+   * Windows.
+   */
+  private liftedModifiers = new Set<string>();
   private pressedButtons = new Set<string>();
   private pendingClipboardRequests = new Map<string, {
     resolve(value: string | null): void;
@@ -753,6 +768,7 @@ export class RemoteDesktopClient {
 
   pointerButton(button: 'left' | 'middle' | 'right' | 'back' | 'forward', down: boolean, x?: number, y?: number): boolean {
     if (!this.canSendInput()) return false;
+    if (down && !this.restoreLiftedModifiers()) return false;
     const sent = this.sendControl({
       type: REMOTE_DESKTOP_DATA_MSG.POINTER,
       ...this.inputBase(),
@@ -771,7 +787,7 @@ export class RemoteDesktopClient {
   /** Complete a click atomically on the worker so Windows can recognize the
    * second half of a double-click even when data-channel scheduling is busy. */
   pointerClick(button: 'left' | 'middle' | 'right' | 'back' | 'forward', x?: number, y?: number): boolean {
-    if (!this.canSendInput()) return false;
+    if (!this.canSendInput() || !this.restoreLiftedModifiers()) return false;
     return this.sendControl({
       type: REMOTE_DESKTOP_DATA_MSG.POINTER,
       ...this.inputBase(),
@@ -797,25 +813,64 @@ export class RemoteDesktopClient {
 
   key(code: string, key: string, down: boolean, repeat: boolean, modifiers: { control: boolean; alt: boolean }): boolean {
     if (!this.canSendInput() || !isRemoteDesktopKeyAllowed(code, modifiers)) return false;
-    const sent = this.sendKeyboard({
-      type: REMOTE_DESKTOP_DATA_MSG.KEYBOARD,
-      ...this.inputBase(),
-      kind: down ? REMOTE_DESKTOP_KEYBOARD_KIND.KEY_DOWN : REMOTE_DESKTOP_KEYBOARD_KIND.KEY_UP,
-      code,
-      key: key.slice(0, REMOTE_DESKTOP_LIMITS.KEY_VALUE_BYTES),
-      repeat,
-    });
-    if (sent) {
-      if (down) this.pressedCodes.add(code);
-      else this.pressedCodes.delete(code);
+    if (this.liftedModifiers.delete(code)) {
+      // Already up on the remote: releasing it is done, pressing it again is
+      // an ordinary press.
+      if (!down) return true;
+    } else if (down && !remoteDesktopModifierKind(code) && !this.restoreLiftedModifiers()) {
+      return false;
     }
-    return sent;
+    return this.sendKeyTransition(code, key, down, repeat);
+  }
+
+  /**
+   * Tap shortcut chords on the remote as self-contained gestures, whatever the
+   * operator is physically holding -- used for shortcuts the target spells
+   * differently from the controller (see translateRemoteDesktopShortcut), so
+   * Command+Left can arrive as a bare Home although Command is still held.
+   *
+   * Each chord presses its own missing modifiers first, then lifts any held
+   * modifier it does not want (in that order, so a held Alt is never released
+   * on its own), taps its keys, and releases what it pressed. Lifted modifiers
+   * stay up until the next ordinary key needs them.
+   */
+  tapChords(chords: readonly (readonly RemoteDesktopChordKey[])[]): boolean {
+    if (!this.canSendInput()) return false;
+    for (const chord of chords) {
+      const modifiers = chord.filter((entry) => remoteDesktopModifierKind(entry.code));
+      const keys = chord.filter((entry) => !remoteDesktopModifierKind(entry.code));
+      const wanted = new Set(modifiers.map((entry) => remoteDesktopModifierKind(entry.code)));
+      const pressedHere: RemoteDesktopChordKey[] = [];
+      for (const modifier of modifiers) {
+        if (this.heldModifierKinds().has(remoteDesktopModifierKind(modifier.code)!)) continue;
+        if (!this.sendKeyTransition(modifier.code, modifier.key, true, false)) return this.abandonTap();
+        pressedHere.push(modifier);
+      }
+      if (!this.liftHeldModifiers((kind) => wanted.has(kind))) return this.abandonTap();
+      const held = this.heldModifierKinds();
+      const flags = { control: held.has('control'), alt: held.has('alt') };
+      for (const entry of keys) {
+        if (!isRemoteDesktopKeyAllowed(entry.code, flags)
+          || !this.sendKeyTransition(entry.code, entry.key, true, false)) return this.abandonTap();
+      }
+      for (const entry of [...keys].reverse()) {
+        if (!this.sendKeyTransition(entry.code, entry.key, false, false)) return this.abandonTap();
+      }
+      for (const modifier of [...pressedHere].reverse()) {
+        if (!this.sendKeyTransition(modifier.code, modifier.key, false, false)) return this.abandonTap();
+      }
+    }
+    return true;
   }
 
   text(value: string): boolean {
     if (!this.canSendInput()) return false;
     const chunks = chunkRemoteDesktopText(value);
     if (!chunks) return false;
+    // A paste shortcut leaves its Control or Command held. Typed underneath
+    // it, the text turns into a string of shortcuts on the target (on a Mac,
+    // Command+H, Command+W, Command+Q...).
+    if (!this.liftHeldModifiers((kind) => kind !== 'control' && kind !== 'meta')) return false;
     for (const text of chunks) {
       if (!this.sendKeyboard({
         type: REMOTE_DESKTOP_DATA_MSG.KEYBOARD,
@@ -828,6 +883,7 @@ export class RemoteDesktopClient {
   }
 
   releaseAll(): void {
+    this.liftedModifiers.clear();
     this.pendingPointerMove = null;
     this.lastReliablePointerSyncAt = Number.NEGATIVE_INFINITY;
     if (this.pointerFrame !== null) {
@@ -1751,6 +1807,57 @@ export class RemoteDesktopClient {
 
   private sendControl(message: object): boolean {
     return this.sendData(this.controlChannel, message, true);
+  }
+
+  private sendKeyTransition(code: string, key: string, down: boolean, repeat: boolean): boolean {
+    const sent = this.sendKeyboard({
+      type: REMOTE_DESKTOP_DATA_MSG.KEYBOARD,
+      ...this.inputBase(),
+      kind: down ? REMOTE_DESKTOP_KEYBOARD_KIND.KEY_DOWN : REMOTE_DESKTOP_KEYBOARD_KIND.KEY_UP,
+      code,
+      key: key.slice(0, REMOTE_DESKTOP_LIMITS.KEY_VALUE_BYTES),
+      repeat,
+    });
+    if (sent) {
+      if (down) this.pressedCodes.add(code);
+      else this.pressedCodes.delete(code);
+    }
+    return sent;
+  }
+
+  private heldModifierKinds(): Set<RemoteDesktopModifierKind> {
+    const kinds = new Set<RemoteDesktopModifierKind>();
+    for (const code of this.pressedCodes) {
+      const kind = remoteDesktopModifierKind(code);
+      if (kind) kinds.add(kind);
+    }
+    return kinds;
+  }
+
+  /** Release every held modifier `keep` refuses, remembering it as lifted. */
+  private liftHeldModifiers(keep: (kind: RemoteDesktopModifierKind) => boolean): boolean {
+    for (const code of [...this.pressedCodes]) {
+      const kind = remoteDesktopModifierKind(code);
+      if (!kind || keep(kind)) continue;
+      if (!this.sendKeyTransition(code, REMOTE_DESKTOP_MODIFIER_KEY[kind], false, false)) return false;
+      this.liftedModifiers.add(code);
+    }
+    return true;
+  }
+
+  private restoreLiftedModifiers(): boolean {
+    for (const code of [...this.liftedModifiers]) {
+      const kind = remoteDesktopModifierKind(code);
+      if (kind && !this.sendKeyTransition(code, REMOTE_DESKTOP_MODIFIER_KEY[kind], true, false)) return false;
+      this.liftedModifiers.delete(code);
+    }
+    return true;
+  }
+
+  /** A chord that could not be delivered whole must not leave anything held. */
+  private abandonTap(): false {
+    this.releaseAll();
+    return false;
   }
 
   private sendKeyboard(message: object): boolean {

@@ -2352,3 +2352,184 @@ describe('RemoteDesktopClient', () => {
     intervalSpy.mockRestore();
   });
 ;
+
+describe('RemoteDesktopClient translated shortcuts and paste', () => {
+  async function inputReadyClient() {
+    const intervalSpy = vi.spyOn(globalThis, 'setInterval');
+    let socket!: FakeSocket;
+    let peer!: FakePeer;
+    const client = new RemoteDesktopClient('controlled-linux', { onSnapshot: () => {} }, {
+      fetchTicket: async () => 'ticket-1',
+      createSocket: () => {
+        socket = new FakeSocket();
+        queueMicrotask(() => socket.open());
+        return socket as unknown as WebSocket;
+      },
+      createPeer: () => {
+        peer = new FakePeer();
+        return peer as unknown as RTCPeerConnection;
+      },
+      requestAnimationFrame: () => 1,
+      cancelAnimationFrame: vi.fn(),
+      now: () => 0,
+    });
+    await client.start();
+    const start = JSON.parse(socket.sent[0]!) as { requestId: string };
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      requestId: start.requestId,
+      sessionId: 'session_12345678',
+      capability: 'a'.repeat(43),
+      expiresAt: Date.now() + 60_000,
+      leaseExpiresAt: Date.now() + 15_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      iceServers: ['stun:stun.example.test:3478'],
+    });
+    await vi.waitFor(() => expect(socket.sent.map((raw) => JSON.parse(raw).type)).toContain(REMOTE_DESKTOP_MSG.OFFER));
+    const control = peer.channels.get(REMOTE_DESKTOP_CHANNEL.CONTROL)!;
+    const keyboard = peer.channels.get(REMOTE_DESKTOP_CHANNEL.KEYBOARD)!;
+    control.open();
+    keyboard.open();
+    peer.channels.get(REMOTE_DESKTOP_CHANNEL.POINTER)!.open();
+    const keepalive = intervalSpy.mock.calls.find((call) => (
+      call[1] === REMOTE_DESKTOP_LIMITS.DATA_KEEPALIVE_INTERVAL_MS
+    ))![0] as () => void;
+    intervalSpy.mockRestore();
+    keepalive();
+    control.receive({
+      type: REMOTE_DESKTOP_DATA_MSG.DISPLAY_TOPOLOGY,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      sessionId: 'session_12345678',
+      sequence: 1,
+      layoutRevision: 1,
+      displays: [{
+        id: 'display_initial1', label: 'DISPLAY1', primary: true, available: true,
+        width: 1920, height: 1080, dpiScale: 1, rotation: 0,
+      }],
+      selectedDisplayId: 'display_initial1',
+    });
+    const status = {
+      type: REMOTE_DESKTOP_MSG.STATUS,
+      requestId: start.requestId,
+      sessionId: 'session_12345678',
+      capability: 'a'.repeat(43),
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      state: REMOTE_DESKTOP_STATE.DIRECT,
+      route: 'direct',
+      selectedDisplayId: 'display_initial1',
+      layoutRevision: 1,
+      inputEnabled: true,
+      viewerCount: 1,
+      controllerCount: 1,
+    } as const;
+    socket.receive(status);
+    keepalive();
+    socket.receive(status);
+    client.acknowledgePresentedFrame(1920, 1080);
+    socket.receive(status);
+    await vi.waitFor(() => expect(client.current().inputEnabled).toBe(true));
+    keyboard.sent.length = 0;
+    control.sent.length = 0;
+    // What reached the remote keyboard, as `down Code` / `up Code` / `text ...`.
+    const typed = () => keyboard.sent.splice(0).map((raw) => {
+      const message = JSON.parse(raw) as { kind: string; code?: string; text?: string };
+      if (message.kind === 'text') return `text ${message.text}`;
+      return `${message.kind === 'key_down' ? 'down' : 'up'} ${message.code}`;
+    });
+    return { client, control, keyboard, typed };
+  }
+
+  const released = { control: false, alt: false };
+
+  it('taps a translated chord with only its own modifiers, then puts the held one back for the next key', async () => {
+    const { client, typed } = await inputReadyClient();
+    // A Mac operator's Command, forwarded to a PC target as Control.
+    expect(client.key('ControlLeft', 'Control', true, false, { control: true, alt: false })).toBe(true);
+    // Command+Left means Home on a PC -- not Control+Home.
+    expect(client.tapChords([[{ code: 'Home', key: 'Home' }]])).toBe(true);
+    expect(typed()).toEqual(['down ControlLeft', 'up ControlLeft', 'down Home', 'up Home']);
+    // Still holding Command, the operator presses A: Control goes back down first.
+    expect(client.key('KeyA', 'a', true, false, { control: true, alt: false })).toBe(true);
+    expect(typed()).toEqual(['down ControlLeft', 'down KeyA']);
+    client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+  });
+
+  it('never releases a held Alt on its own, and has nothing left to send when it is let go', async () => {
+    const { client, typed } = await inputReadyClient();
+    // A Mac operator's Option, which is Alt on a PC target.
+    client.key('AltLeft', 'Alt', true, false, { control: false, alt: true });
+    typed();
+    // Option+Left is Control+Left there. Control goes down BEFORE Alt comes up:
+    // an Alt pressed and released with nothing in between opens the menu bar.
+    expect(client.tapChords([[{ code: 'ControlLeft', key: 'Control' }, { code: 'ArrowLeft', key: 'ArrowLeft' }]]))
+      .toBe(true);
+    expect(typed()).toEqual([
+      'down ControlLeft', 'up AltLeft', 'down ArrowLeft', 'up ArrowLeft', 'up ControlLeft',
+    ]);
+    // Releasing Option afterwards must not send a lone Alt release.
+    expect(client.key('AltLeft', 'Alt', false, false, released)).toBe(true);
+    expect(typed()).toEqual([]);
+    client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+  });
+
+  it('keeps a held modifier the chord wants, and taps multi-chord sequences in order', async () => {
+    const { client, typed } = await inputReadyClient();
+    client.key('ControlLeft', 'Control', true, false, { control: true, alt: false });
+    client.key('ShiftLeft', 'Shift', true, false, { control: true, alt: false });
+    typed();
+    // Command+Shift+Left: select to the line start, keeping the held Shift.
+    client.tapChords([[{ code: 'ShiftLeft', key: 'Shift' }, { code: 'Home', key: 'Home' }]]);
+    expect(typed()).toEqual(['up ControlLeft', 'down Home', 'up Home']);
+    client.key('ShiftLeft', 'Shift', false, false, released);
+    typed();
+    // Command+Backspace: delete to the line start as two chords.
+    client.tapChords([
+      [{ code: 'ShiftLeft', key: 'Shift' }, { code: 'Home', key: 'Home' }],
+      [{ code: 'Backspace', key: 'Backspace' }],
+    ]);
+    expect(typed()).toEqual([
+      'down ShiftLeft', 'down Home', 'up Home', 'up ShiftLeft', 'down Backspace', 'up Backspace',
+    ]);
+    client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+  });
+
+  it('types pasted text with the paste shortcut\'s Control or Command lifted', async () => {
+    const { client, typed } = await inputReadyClient();
+    // Command on a Mac target stays Command; typed underneath it, "hello"
+    // would be Command+H (hide) and friends.
+    client.key('MetaLeft', 'Meta', true, false, released);
+    client.key('ShiftLeft', 'Shift', true, false, released);
+    typed();
+    expect(client.text('hello')).toBe(true);
+    expect(typed()).toEqual(['up MetaLeft', 'text hello']);
+    client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+  });
+
+  it('puts a lifted modifier back down before a click', async () => {
+    const { client, control, typed } = await inputReadyClient();
+    client.key('ControlLeft', 'Control', true, false, { control: true, alt: false });
+    client.tapChords([[{ code: 'End', key: 'End' }]]);
+    typed();
+    // Still holding Command: the click is a Control+click on the PC.
+    expect(client.pointerButton('left', true, 0.5, 0.5)).toBe(true);
+    expect(typed()).toEqual(['down ControlLeft']);
+    expect(JSON.parse(control.sent.at(-1)!)).toMatchObject({
+      type: REMOTE_DESKTOP_DATA_MSG.POINTER,
+      kind: REMOTE_DESKTOP_POINTER_KIND.BUTTON_DOWN,
+    });
+    client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+  });
+
+  it('releases everything when a chord cannot be delivered whole', async () => {
+    const { client, control, keyboard, typed } = await inputReadyClient();
+    client.key('ControlLeft', 'Control', true, false, { control: true, alt: false });
+    typed();
+    keyboard.failNextSend = true;
+    expect(client.tapChords([[{ code: 'Home', key: 'Home' }]])).toBe(false);
+    expect(control.sent.map((raw) => JSON.parse(raw).type)).toContain(REMOTE_DESKTOP_DATA_MSG.RELEASE_ALL);
+    client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+  });
+});

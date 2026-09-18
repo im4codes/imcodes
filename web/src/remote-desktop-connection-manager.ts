@@ -12,6 +12,7 @@ import {
   type RemoteDesktopClientHooks,
   type RemoteDesktopSnapshot,
 } from './remote-desktop-client.js';
+import type { RemoteDesktopChordKey } from './remote-desktop-keyboard.js';
 
 export interface RemoteDesktopHostTarget {
   serverId: string;
@@ -52,6 +53,7 @@ interface RemoteDesktopConnectionClient {
     repeat: boolean,
     modifiers: { control: boolean; alt: boolean },
   ): boolean;
+  tapChords(chords: readonly (readonly RemoteDesktopChordKey[])[]): boolean;
   text(value: string): boolean;
   releaseAll(): void;
   releasePointerButtons(): void;
@@ -278,6 +280,7 @@ export class RemoteDesktopConnectionManager {
       key: (code, key, down, repeat, modifiers) => (
         canControl() && entry.client.key(code, key, down, repeat, modifiers)
       ),
+      tapChords: (chords) => canControl() && entry.client.tapChords(chords),
       text: (value) => canControl() && entry.client.text(value),
       releaseAll: () => entry.client.releaseAll(),
       releasePointerButtons: () => entry.client.releasePointerButtons(),
