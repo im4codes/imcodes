@@ -138,6 +138,20 @@ class LinuxRemoteDesktopSession final
     ice_servers_ = std::move(ice_servers);
   }
   bool Tick(common::TransportTime now);
+  // LEASE: push the renewable deadline forward. Thin pass-through to
+  // common::TransportSessionCore::RenewLease, which owns every deadline and
+  // identity rule. Without this the session only ever held PREPARE's
+  // original lease (authorize + LEASE_DURATION_MS, 60s), and the core's own
+  // AuthorityAlive() check ended every session exactly then.
+  bool RenewLease(const common::RouteAuthority& renewal,
+                  common::TransportTime now);
+  // MODE_STATE: a view<->control switch, or a same-mode input-epoch advance
+  // (the Server's signaling-resume fence). Applies it to the transport core,
+  // then mirrors the resulting mode into SessionCore -- the input gate
+  // (EnsureControlAvailable) every Apply* call below goes through -- exactly
+  // as macOS's ApplyModeAuthority does.
+  bool UpdateMode(const common::RouteAuthority& update,
+                  common::TransportTime now);
   // Real outbound video RTP bytes, from the peer connection's OWN stats --
   // not merely "a frame was pushed into the local WebRTC pipeline" (see
   // linux_native_video_source.cc's SharedCaptureMultiplexer/Lease, which

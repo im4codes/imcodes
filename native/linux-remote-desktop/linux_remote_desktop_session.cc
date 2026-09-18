@@ -201,6 +201,26 @@ bool LinuxRemoteDesktopSession::Tick(common::TransportTime now) {
   return transport_core_.Tick(now);
 }
 
+bool LinuxRemoteDesktopSession::RenewLease(const common::RouteAuthority& renewal,
+                                           common::TransportTime now) {
+  if (closed_) return false;
+  return transport_core_.RenewLease(renewal, now);
+}
+
+bool LinuxRemoteDesktopSession::UpdateMode(const common::RouteAuthority& update,
+                                           common::TransportTime now) {
+  if (closed_ || !transport_core_.UpdateMode(update, now)) return false;
+  // The transport core has already released every physically held key/
+  // button on a control->view switch or a control epoch advance (its
+  // ReleaseControlAuthority -> this class's adapter seam). SessionCore keeps
+  // its own ledger/state, so it is told too: SetControlActive(false) clears
+  // the ledger and drops to kViewing; SetControlActive(true) is idempotent
+  // when already controlling.
+  if (!core_started_) return true;
+  return core_.SetControlActive(update.mode ==
+                                common::TransportSessionMode::kControl);
+}
+
 namespace {
 // Real outbound video RTP bytes, from the peer connection's OWN stats --
 // mirrors Windows' PeerMediaStatsObserver (peer_session.cc) and macOS' own

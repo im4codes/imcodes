@@ -8,11 +8,17 @@
 // LinuxRemoteDesktopWorkerHost (src/node/linux-remote-desktop-worker-host.ts)
 // spawns.
 //
-// Scope of this first slice, stated plainly rather than silently: PREPARE,
-// OFFER/ANSWER, ICE (both directions), STOP, and a best-effort STATUS poll
-// are handled. LEASE renewal and MODE_STATE (view/control switching mid-
-// session) are accepted and parsed but not yet acted on -- a session starts
-// in whatever mode PREPARE requested and stays there. The data-channel wire
+// Scope, stated plainly rather than silently: PREPARE, OFFER/ANSWER, ICE
+// (both directions), LEASE renewal, MODE_STATE (view/control switching and
+// the Server's same-mode input-epoch resume fence), STOP, and a STATUS poll
+// are handled. LEASE/MODE_STATE mirror Windows' PeerSession::Renew/SetMode
+// (peer_session.cc) and its worker_main.cc dispatch. Until they did, this
+// worker parsed every LEASE and dropped it, so each session only ever held
+// PREPARE's original 60s lease and TransportSessionCore::AuthorityAlive()
+// ended it exactly then -- every Linux session died at ~60s, deterministic,
+// regardless of input or network. A session the transport core ends on its
+// own (lease/route expiry, media stall, peer failure, ...) is now reported
+// to the Server as a TERMINAL instead of being silently forgotten. The data-channel wire
 // protocol's pointer/keyboard messages ARE wired to the input adapters now
 // (linux_remote_desktop_session.cc's own DataChannelObserver); clipboard,
 // display selection/mode/scale, and auto-unlock are not, exactly as
@@ -136,6 +142,37 @@ common::RouteAuthority ToRouteAuthority(const imcodes::rd::Authority& authority)
   return route;
 }
 
+/**
+ * The REMOTE_DESKTOP_TERMINAL_REASON (shared/remote-desktop.ts) wire value
+ * for a session the transport core ended on its own -- the same mapping
+ * macOS's WorkerTransportSink::OnTerminal uses. nullptr for kStopped: an
+ * explicit STOP (or a PREPARE replacing a session) is already answered by
+ * its own handler, and a second TERMINAL for it would be a duplicate.
+ */
+const char* WireTerminalReason(common::TransportTerminalReason reason) noexcept {
+  switch (reason) {
+    case common::TransportTerminalReason::kStopped:
+      return nullptr;
+    case common::TransportTerminalReason::kRouteExpired:
+      return "authority_expired";
+    case common::TransportTerminalReason::kLeaseExpired:
+      return "lease_expired";
+    case common::TransportTerminalReason::kIdleTimeout:
+      return "idle_timeout";
+    case common::TransportTerminalReason::kProtocolViolation:
+    case common::TransportTerminalReason::kCandidateOverflow:
+      return "protocol_error";
+    case common::TransportTerminalReason::kMediaStalled:
+      return "media_unavailable";
+    case common::TransportTerminalReason::kNone:
+    case common::TransportTerminalReason::kPeerFailed:
+    case common::TransportTerminalReason::kChannelFailed:
+    case common::TransportTerminalReason::kAdapterFailure:
+      return "peer_failed";
+  }
+  return "peer_failed";
+}
+
 /** REMOTE_DESKTOP_STATE (shared/remote-desktop.ts) -- only the subset a
  * Linux session can actually be in during this first slice; SWITCHING_DISPLAY
  * and RECONNECTING describe worker-replacement/display-change behavior this
@@ -201,6 +238,59 @@ class WorkerSession {
 
   void AddRemoteIce(const std::string& mid, const std::string& candidate) {
     session_->AddRemoteIce(mid, candidate);
+  }
+
+  // Same identity triple Windows' PeerSession::Matches checks.
+  [[nodiscard]] bool Matches(const imcodes::rd::Authority& other) const noexcept {
+    return other.request_id == authority_.request_id &&
+           other.session_id == authority_.session_id &&
+           other.capability == authority_.capability;
+  }
+
+  // LEASE -- mirrors Windows' PeerSession::Renew exactly: bind the fields an
+  // incremental envelope omits (expiresAt, and daemon/route generation when
+  // absent) to the PREPARE-admitted route, require the same daemon and route
+  // generation, then let TransportSessionCore::RenewLease enforce every
+  // deadline/identity/mode/epoch rule.
+  [[nodiscard]] bool Renew(const imcodes::rd::Authority& renewal) {
+    const imcodes::rd::Authority bound =
+        imcodes::rd::BindOmittedAuthorityFields(authority_, renewal);
+    if (!Matches(bound) ||
+        bound.daemon_generation != authority_.daemon_generation ||
+        bound.route_generation != authority_.route_generation ||
+        !session_->RenewLease(ToRouteAuthority(bound), SampleTransportTime())) {
+      return false;
+    }
+    authority_.lease_expires_at_ms = bound.lease_expires_at_ms;
+    return true;
+  }
+
+  // MODE_STATE -- mirrors Windows' PeerSession::SetMode: apply, record the
+  // new mode/epoch (STATUS reports authority_.input_epoch, so a stale value
+  // here would make every later STATUS look like it belonged to the old
+  // epoch), and acknowledge with a MODE_STATE of our own.
+  [[nodiscard]] bool SetMode(const imcodes::rd::Authority& update,
+                             const std::string& reason) {
+    const imcodes::rd::Authority bound =
+        imcodes::rd::BindOmittedAuthorityFields(authority_, update);
+    if (!Matches(bound) ||
+        (bound.mode != imcodes::rd::kViewMode &&
+         bound.mode != imcodes::rd::kControlMode) ||
+        !session_->UpdateMode(ToRouteAuthority(bound), SampleTransportTime())) {
+      return false;
+    }
+    authority_.mode = bound.mode;
+    authority_.input_epoch = bound.input_epoch;
+    authority_.lease_expires_at_ms = bound.lease_expires_at_ms;
+    Json::Value response =
+        imcodes::rd::BaseEnvelope(imcodes::rd::kModeStateType, authority_);
+    response["mode"] = authority_.mode;
+    response["inputEpoch"] = authority_.input_epoch;
+    response["reason"] = reason == imcodes::rd::kModeReasonInitial
+        ? imcodes::rd::kModeReasonInitial
+        : imcodes::rd::kModeReasonUserSelected;
+    WriteLine(response);
+    return true;
   }
 
   [[nodiscard]] common::TransportDiagnostics diagnostics() const {
@@ -290,12 +380,28 @@ class Worker {
         return;
       }
       case imcodes::rd::Signal::Kind::kLease:
-      case imcodes::rd::Signal::Kind::kMode:
-        // Parsed and accepted, not yet acted on -- see this file's own
-        // header comment. Silently ignoring rather than tearing the
-        // session down: an unhandled renewal/mode-switch request is not a
-        // protocol violation this slice is equipped to reject.
+      case imcodes::rd::Signal::Kind::kMode: {
+        auto it = sessions_.find(signal.authority.session_id);
+        // Not ours (or already gone): ignored, exactly like Windows'
+        // worker_main.cc, which only acts on an identity-matching session.
+        if (it == sessions_.end() || !it->second->Matches(signal.authority)) {
+          return;
+        }
+        const bool accepted = signal.kind == imcodes::rd::Signal::Kind::kLease
+            ? it->second->Renew(signal.authority)
+            : it->second->SetMode(signal.authority, signal.reason);
+        // Also mirrors Windows: a LEASE/MODE_STATE the transport core refuses
+        // for a still-live, identity-matching session is a protocol error,
+        // never something to keep silently running past. (A session the core
+        // already ended is reported by PublishStatus below instead.)
+        if (!accepted && !it->second->closed()) {
+          it->second->Stop();
+          WriteLine(imcodes::rd::TerminalEnvelope(it->second->authority(),
+                                                  "protocol_error"));
+          sessions_.erase(it);
+        }
         return;
+      }
     }
   }
 
@@ -303,6 +409,17 @@ class Worker {
   void PublishStatus() {
     for (auto it = sessions_.begin(); it != sessions_.end();) {
       if (it->second->closed()) {
+        // Every path that closes a session explicitly (STOP, PREPARE
+        // replacement, a refused LEASE/MODE_STATE) erases it on the spot, so
+        // one found closed here was ended by the transport core itself. Tell
+        // the Server why, like macOS and Windows do. Silently forgetting it
+        // left the Server renewing a route nothing served anymore until the
+        // browser's 5-minute reconnect grace expired, and hid the real
+        // reason (e.g. lease_expired) behind a generic browser disconnect.
+        if (const char* reason =
+                WireTerminalReason(it->second->diagnostics().terminal_reason)) {
+          WriteLine(imcodes::rd::TerminalEnvelope(it->second->authority(), reason));
+        }
         it = sessions_.erase(it);
         continue;
       }
