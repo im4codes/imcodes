@@ -204,6 +204,37 @@ describe('macOS remote-desktop install wiring', () => {
     await vi.waitFor(() => expect(install).toHaveBeenCalledOnce());
   });
 
+  it('still checks for a newer release once a worker is already installed', async () => {
+    // A Mac that received its first release ever previously could not
+    // receive a second one: `remoteDesktopWorkerAvailable` stays true for as
+    // long as ANY release works, so gating the background/heartbeat check on
+    // "no worker yet" meant every later release -- including one carrying a
+    // real bug fix for this exact adapter -- went undelivered, silently, on
+    // every reconnect. `installMacosRemoteDesktopComponents` already makes
+    // its own safe, version-aware decision (`macosRemoteDesktopComponentsInstalled`
+    // below reports this release is NOT what is installed); it must be asked.
+    const socket = new MockSocket();
+    const install = vi.fn(async () => true);
+    const installed = vi.fn(async () => false);
+    const worker = {
+      available: () => true,
+      sessionCapabilities: () => [REMOTE_DESKTOP_CAPABILITY],
+      handleServerMessage: () => false,
+      close: () => undefined,
+    };
+    createControlledNodeRuntime(CREDENTIAL, () => socket, {
+      platform: 'darwin',
+      arch: 'arm64',
+      remoteDesktopWorker: worker as never,
+      installMacosRemoteDesktopComponents: install,
+      macosRemoteDesktopComponentsInstalled: installed,
+    }).start();
+    socket.open();
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(installed).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(install).toHaveBeenCalledOnce());
+  });
+
   it('does not re-download on every reconnect after a failure', async () => {
     // A server that cannot serve the set would otherwise turn a flapping link
     // into a request loop.

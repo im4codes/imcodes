@@ -606,6 +606,23 @@ export function createControlledNodeRuntime(
     && (arch === 'arm64' || arch === 'x64')
     && remoteDesktopFeatureEnabled
     && !remoteDesktopWorkerAvailable;
+  // What `installMacosRemoteDesktopComponents` itself gates on, which is
+  // deliberately wider than `macosRemoteDesktopComponentsInstallable` above:
+  // that function ALSO drives the browser's "Install" affordance and the
+  // manual-request fallback to Windows-style repair, so it stops once a
+  // worker exists. But `installMacosRemoteDesktopComponents` already makes
+  // its own safe, idempotent, version-aware decision of whether anything
+  // needs to change -- `isInstalledForThisRelease` below no-ops when the
+  // installed release's workerVersion already matches this daemon's. Reusing
+  // the narrower check as this function's OWN entry gate meant a Mac that
+  // received its first release ever could not receive a second one: once any
+  // worker was installed, `remoteDesktopWorkerAvailable` stayed true forever,
+  // this function returned false before it ever asked the store a question,
+  // and every later daemon version -- including one carrying a real fix for
+  // this exact adapter -- went undelivered, silently, on every reconnect.
+  const macosRemoteDesktopUpdateCheckEligible = (): boolean => platform === 'darwin'
+    && (arch === 'arm64' || arch === 'x64')
+    && remoteDesktopFeatureEnabled;
   let macosRemoteDesktopInstallInFlight = false;
   let macosRemoteDesktopInstallNextAttemptAt = 0;
   let macosRemoteDesktopStartNextAttemptAt = 0;
@@ -758,7 +775,7 @@ export function createControlledNodeRuntime(
    * release.
    */
   const installMacosRemoteDesktopComponents = async (force = false): Promise<boolean> => {
-    if (macosRemoteDesktopInstallInFlight || !macosRemoteDesktopComponentsInstallable()) return false;
+    if (macosRemoteDesktopInstallInFlight || !macosRemoteDesktopUpdateCheckEligible()) return false;
     // A failed automatic attempt waits before trying again. Without this every
     // reconnect re-downloads, and a server that cannot serve the set turns a
     // flapping link into a request loop. An explicit click ignores the delay:
