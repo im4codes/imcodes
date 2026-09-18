@@ -1017,6 +1017,74 @@ describe('macOS remote-desktop worker host', () => {
     expect(onProfileChanged).toHaveBeenCalledTimes(1);
   });
 
+  it('holds a route that arrives while the replacement worker is still launching', async () => {
+    // Live evidence on node mini-2: a browser reconnecting 1.5 s after a stop
+    // reached the node 7 ms after the replacement worker's agent launched,
+    // before it authenticated, and was refused as worker_failed on the spot.
+    const value = harness();
+    await startAuthenticated(value);
+    await value.host.handle(prepare());
+    await value.host.handle({
+      type: REMOTE_DESKTOP_MSG.STOP,
+      requestId: REQUEST_ID,
+      sessionId: SESSION_ID,
+      capability: CAPABILITY,
+    });
+    value.workerMessage({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      requestId: REQUEST_ID,
+      sessionId: SESSION_ID,
+      capability: CAPABILITY,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.STOPPED_BY_CONTROLLER,
+    });
+    value.disconnect('peer_disconnected');
+    await vi.waitFor(() => expect(value.serverStarts).toHaveBeenCalledTimes(2));
+
+    const route = {
+      requestId: 'request_session_b_123456789',
+      sessionId: 'session_b_123456789',
+      capability: 'e'.repeat(43),
+    };
+    let prepared: boolean | undefined;
+    const preparing = value.host.handle(prepare(route)).then((ok) => { prepared = ok; });
+    const offering = value.host.handle({ type: REMOTE_DESKTOP_MSG.OFFER, ...route, sdp: 'v=0' });
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(prepared).toBeUndefined();
+
+    expect(value.authenticate()).toBe(true);
+    await preparing;
+    expect(prepared).toBe(true);
+    expect(await offering).toBe(true);
+    expect(value.sent.slice(-2).map((command) => [command.type, command.sessionId])).toEqual([
+      [REMOTE_DESKTOP_MSG.PREPARE, route.sessionId],
+      [REMOTE_DESKTOP_MSG.OFFER, route.sessionId],
+    ]);
+  });
+
+  it('stops holding a route once the host closes', async () => {
+    const value = harness();
+    await startAuthenticated(value);
+    await value.host.handle(prepare());
+    value.workerMessage({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      requestId: REQUEST_ID,
+      sessionId: SESSION_ID,
+      capability: CAPABILITY,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.STOPPED_BY_CONTROLLER,
+    });
+    value.disconnect('peer_disconnected');
+    await vi.waitFor(() => expect(value.serverStarts).toHaveBeenCalledTimes(2));
+
+    const waiting = value.host.handle(prepare({
+      requestId: 'request_session_b_123456789',
+      sessionId: 'session_b_123456789',
+      capability: 'e'.repeat(43),
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    value.host.close();
+    expect(await waiting).toBe(false);
+  });
+
   it('withdraws capability and reports an unproven or faulty worker disconnect', async () => {
     for (const reason of ['peer_disconnected', 'write_failed'] as const) {
       const onProfileChanged = vi.fn();

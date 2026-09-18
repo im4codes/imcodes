@@ -90,6 +90,19 @@ const DEFAULT_AUTHENTICATION_TIMEOUT_MS = 15_000;
 // readiness changes (permission revoked, display unplugged, etc.) visible
 // within a reasonable window while cutting the connection rate by 20x.
 const DEFAULT_READINESS_POLL_MS = 20_000;
+/**
+ * How long a PREPARE waits for a worker generation that is still launching.
+ *
+ * A macOS worker serves its session and then exits; its replacement needs a
+ * few seconds to launch, authenticate and be admitted. Measured on node
+ * mini-2: a reconnect 1.5 s after a stop arrived 7 ms after the replacement's
+ * agent launched. Refused as worker_failed, it was retried five seconds later
+ * and failed again on that same fresh worker (exit EX_PROTOCOL), and only a
+ * third attempt connected -- while reconnects arriving after the replacement
+ * was up connected at once. Well inside the Server's negotiation deadline.
+ */
+const REPLACEMENT_WORKER_WAIT_MS = 15_000;
+const REPLACEMENT_WORKER_POLL_MS = 100;
 const MIN_AUTHENTICATION_TIMEOUT_MS = 10;
 const MAX_AUTHENTICATION_TIMEOUT_MS = 120_000;
 const MIN_READINESS_POLL_MS = 100;
@@ -646,7 +659,6 @@ export class MacosRemoteDesktopWorkerHost {
   async handle(message: unknown): Promise<boolean> {
     const parsed = validateRemoteDesktopDaemonCommand(message);
     if (!parsed.ok || !this.available()) return false;
-    const generation = this.lifecycleGeneration;
     const command = parsed.value;
     if (command.type === REMOTE_DESKTOP_MSG.PREPARE) {
       // Marked BEFORE the readiness re-check. That check launches a native
@@ -655,6 +667,13 @@ export class MacosRemoteDesktopWorkerHost {
       // found no session and was answered worker_failed. The Windows host
       // already marks first.
       const finishPreparing = this.core.beginPreparing(command.sessionId);
+      // A route arriving while the replacement generation is still launching
+      // waits for it rather than being refused (see REPLACEMENT_WORKER_WAIT_MS).
+      if (!this.authenticated && !await this.waitForReplacementWorker()) {
+        finishPreparing();
+        return false;
+      }
+      const generation = this.lifecycleGeneration;
       if (!await this.revalidateReadinessForPrepare(command.mode, generation)) {
         finishPreparing();
         return false;
@@ -691,6 +710,7 @@ export class MacosRemoteDesktopWorkerHost {
       && command.type !== REMOTE_DESKTOP_MSG.CANCEL) {
       await this.core.waitForPreparing(command.sessionId);
     }
+    const generation = this.lifecycleGeneration;
     if (!this.core.has(command.sessionId)) return false;
     if (this.stoppingSessions.has(command.sessionId)
       && command.type !== REMOTE_DESKTOP_MSG.STOP
@@ -710,6 +730,19 @@ export class MacosRemoteDesktopWorkerHost {
       this.stoppingSessions.add(command.sessionId);
     }
     return sent;
+  }
+
+  /**
+   * Resolves true once a worker generation is authenticated, or false when none
+   * is coming: the host closed, withdrew its profile, or the bound elapsed.
+   */
+  private async waitForReplacementWorker(): Promise<boolean> {
+    const deadline = Date.now() + REPLACEMENT_WORKER_WAIT_MS;
+    while (!this.authenticated) {
+      if (this.closed || !this.available() || Date.now() >= deadline) return false;
+      await new Promise((resolve) => setTimeout(resolve, REPLACEMENT_WORKER_POLL_MS));
+    }
+    return !this.closed;
   }
 
   /**
