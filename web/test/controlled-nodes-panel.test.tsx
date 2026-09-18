@@ -146,6 +146,7 @@ import {
   CONTROLLED_NODE_PRESENCE_REFRESH_MS,
   ControlledNodesPanel,
 } from '../src/components/ControlledNodesPanel.js';
+import { MACHINE_GROUP_STORAGE_KEY } from '../src/machine-grouping.js';
 
 /** Set by the clipboard-denied test; `vi.unstubAllGlobals` does not cover
  *  properties defined directly on `document`. */
@@ -167,6 +168,9 @@ function setViewportSize(width: number, height: number): void {
 // implementation. Re-establish it before each test so the panel can always
 // resolve a Desk; individual tests override it to exercise the other shapes.
 beforeEach(() => {
+  // The chosen machine group is remembered in localStorage; start every test
+  // from the default rather than from whatever the previous test clicked.
+  localStorage.clear();
   listMintableDesks.mockResolvedValue([TEST_DESK]);
   createTeam.mockClear();
   listTeams.mockClear();
@@ -1575,6 +1579,32 @@ describe('ControlledNodesPanel machine grouping', () => {
     });
     expect(container.textContent).toContain('Mine');
     expect(container.textContent).toContain('Team box');
+  });
+
+  it('remembers the chosen group across closing and reopening the panel', async () => {
+    const mineGrouped = { ...mine, teamIds: ['team-1'], teamNames: ['Ops'] };
+    machines = [mineGrouped, viaTeam];
+    const first = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(first.container.textContent).toContain('Mine'));
+    await act(async () => {
+      (first.container.querySelector('[data-testid="controlled-nodes-group-team-1"]') as HTMLButtonElement).click();
+    });
+    first.unmount();
+
+    const reopened = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(reopened.container.textContent).toContain('Team box'));
+    expect(reopened.container.querySelector('[data-testid="controlled-nodes-group-team-1"]')?.getAttribute('aria-selected')).toBe('true');
+  });
+
+  it('falls back to the default view when the remembered group is gone, without forgetting it', async () => {
+    localStorage.setItem(MACHINE_GROUP_STORAGE_KEY, JSON.stringify({ version: 1, group: 'team-gone' }));
+    const mineGrouped = { ...mine, teamIds: ['team-1'], teamNames: ['Ops'] };
+    machines = [mineGrouped, viaTeam];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.textContent).toContain('Mine'));
+    expect(container.querySelector('[data-testid="controlled-nodes-group-direct"]')?.getAttribute('aria-selected')).toBe('true');
+    expect(container.textContent).not.toContain('Team box');
+    expect(JSON.parse(localStorage.getItem(MACHINE_GROUP_STORAGE_KEY)!)).toEqual({ version: 1, group: 'team-gone' });
   });
 
   it('puts a count on every group tab, matching what the tab opens', async () => {

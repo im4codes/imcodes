@@ -10,6 +10,8 @@ import {
   machineGroupTabs,
   machineGroupsOf,
   machinesInGroup,
+  resolveMachineGroup,
+  useRememberedMachineGroup,
 } from '../machine-grouping.js';
 import { MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
 
@@ -79,11 +81,12 @@ function MachineMenuBody({
 }: ControlledNodeMachineMenuProps) {
   const { t } = useTranslation();
   const { machines, loaded, error, refetch } = useMachines();
-  const [group, setGroup] = useState<string>(MACHINE_GROUP_DIRECT);
+  const [rememberedGroup, setGroup] = useRememberedMachineGroup();
   const [position, setPosition] = useState<MenuPosition | null>(null);
   const [container, setContainer] = useState<Element>(() => portalTarget(anchorRef.current));
   const menuRef = useRef<HTMLDivElement>(null);
   const groups = machineGroupsOf(machines);
+  const group = resolveMachineGroup(rememberedGroup, machines);
   const visible = machinesInGroup(machines, group);
   const title = label ?? t('controlled_nodes.machines_title');
 

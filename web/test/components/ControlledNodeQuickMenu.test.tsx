@@ -28,11 +28,13 @@ vi.mock('../../src/hooks/useMachines.js', () => ({
 
 import { ControlledNodeQuickMenu } from '../../src/components/ControlledNodeQuickMenu.js';
 import { ControlledNodeMachineMenu } from '../../src/components/ControlledNodeMachineMenu.js';
+import { MACHINE_GROUP_STORAGE_KEY } from '../../src/machine-grouping.js';
 
 afterEach(() => {
   cleanup();
   machines = [];
   vi.clearAllMocks();
+  localStorage.clear();
 });
 
 function node(overrides: Partial<MachineListItem>): MachineListItem {
@@ -382,6 +384,19 @@ describe('ControlledNodeQuickMenu group tabs', () => {
       expect.stringContaining('Own'),
       expect.stringContaining('Theirs'),
     ]);
+  });
+
+  it('opens on the group last chosen anywhere, remembered in this browser', async () => {
+    localStorage.setItem(MACHINE_GROUP_STORAGE_KEY, JSON.stringify({ version: 1, group: 'team-1' }));
+    machines = [
+      node({ serverId: 'their', displayName: 'Theirs', accessRole: 'viewer', teamIds: ['team-1'], teamNames: ['Ops'] }),
+      node({ serverId: 'loose', displayName: 'Loose', accessRole: 'owner' }),
+    ];
+    render(<ControlledNodeQuickMenu />);
+    open();
+    await waitFor(() => expect(document.body.textContent).toContain('Theirs'));
+    expect(document.body.textContent).not.toContain('Loose');
+    expect(document.querySelector('[data-testid="controlled-node-quick-group-team-1"]')?.classList.contains('is-active')).toBe(true);
   });
 
   it('offers no group tabs when nothing is grouped', () => {

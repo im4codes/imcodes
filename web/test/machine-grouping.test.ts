@@ -153,3 +153,24 @@ describe('machineGroupTabs', () => {
       .toEqual([[MACHINE_GROUP_DIRECT, 1], [MACHINE_GROUP_ALL, 1]]);
   });
 });
+
+describe('remembered machine group', () => {
+  it('round-trips the chosen group and ignores corrupt or foreign storage', async () => {
+    const { loadMachineGroup, saveMachineGroup, MACHINE_GROUP_STORAGE_KEY } = await import('../src/machine-grouping.js');
+    const store = new Map<string, string>();
+    const storage = {
+      getItem: (key: string) => store.get(key) ?? null,
+      setItem: (key: string, value: string) => { store.set(key, value); },
+    };
+    expect(loadMachineGroup(storage)).toBeNull();
+    saveMachineGroup('team-7', storage);
+    expect(loadMachineGroup(storage)).toBe('team-7');
+    store.set(MACHINE_GROUP_STORAGE_KEY, '{not json');
+    expect(loadMachineGroup(storage)).toBeNull();
+    store.set(MACHINE_GROUP_STORAGE_KEY, JSON.stringify({ version: 2, group: 'team-7' }));
+    expect(loadMachineGroup(storage)).toBeNull();
+    // Storage that throws (disabled / quota) never breaks the view.
+    expect(() => saveMachineGroup('x', { setItem: () => { throw new Error('quota'); } })).not.toThrow();
+    expect(loadMachineGroup({ getItem: () => { throw new Error('denied'); } })).toBeNull();
+  });
+});

@@ -1,3 +1,4 @@
+import { useCallback, useState } from 'preact/hooks';
 import type { MachineListItem } from './api/machines.js';
 
 /**
@@ -86,4 +87,48 @@ export function machineGroupTabs(machines: readonly MachineListItem[]): MachineG
     })),
     { id: MACHINE_GROUP_ALL, count: machines.length },
   ];
+}
+
+/** Browser-local memory of the last chosen group, shared by the panel and the quick menu. */
+export const MACHINE_GROUP_STORAGE_KEY = 'imcodes.web.machine-group.v1';
+
+export function loadMachineGroup(storage: Pick<Storage, 'getItem'> = localStorage): string | null {
+  try {
+    const raw = storage.getItem(MACHINE_GROUP_STORAGE_KEY);
+    if (raw === null) return null;
+    const value = JSON.parse(raw) as { version?: unknown; group?: unknown } | null;
+    if (value?.version === 1 && typeof value.group === 'string' && value.group) return value.group;
+  } catch {
+    // Local preferences are fail-soft; the default group remains available.
+  }
+  return null;
+}
+
+export function saveMachineGroup(group: string, storage: Pick<Storage, 'setItem'> = localStorage): void {
+  try {
+    storage.setItem(MACHINE_GROUP_STORAGE_KEY, JSON.stringify({ version: 1, group }));
+  } catch {
+    // Storage full or disabled: the choice still applies for this view.
+  }
+}
+
+/**
+ * The group to actually show. A remembered group that is not among these
+ * machines (left, emptied, or not loaded yet) shows the default instead --
+ * without overwriting the remembered choice, so it comes back once the list
+ * holds that group again.
+ */
+export function resolveMachineGroup(group: string, machines: readonly MachineListItem[]): string {
+  if (group === MACHINE_GROUP_DIRECT || group === MACHINE_GROUP_ALL) return group;
+  return machineGroupsOf(machines).some(([id]) => id === group) ? group : MACHINE_GROUP_DIRECT;
+}
+
+/** The chosen group, remembered in this browser across closing and reopening. */
+export function useRememberedMachineGroup(): [string, (group: string) => void] {
+  const [group, setGroupState] = useState<string>(() => loadMachineGroup() ?? MACHINE_GROUP_DIRECT);
+  const setGroup = useCallback((next: string) => {
+    setGroupState(next);
+    saveMachineGroup(next);
+  }, []);
+  return [group, setGroup];
 }

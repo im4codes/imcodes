@@ -44,6 +44,8 @@ import {
   machineGroupTabs,
   machineGroupsOf,
   machinesInGroup,
+  resolveMachineGroup,
+  useRememberedMachineGroup,
 } from '../machine-grouping.js';
 
 import { VerificationMachinesSection } from './VerificationMachinesSection.js';
@@ -140,7 +142,7 @@ export function ControlledNodesPanel({
   // Which slice of the machine list is on screen. Machines shared with you
   // individually and machines reached through a team are different things, so
   // they are not poured into one list you then have to read apart.
-  const [machineGroup, setMachineGroup] = useState<string>(MACHINE_GROUP_DIRECT);
+  const [rememberedMachineGroup, setMachineGroup] = useRememberedMachineGroup();
 
   const [ticketExpiryByKey, setTicketExpiryByKey] = useState<Partial<Record<string, number>>>({});
   const [linkingKey, setLinkingKey] = useState<string | null>(null);
@@ -570,6 +572,7 @@ export function ControlledNodesPanel({
   ];
 
   const machineTeams = machineGroupsOf(machines);
+  const machineGroup = resolveMachineGroup(rememberedMachineGroup, machines);
   const visibleMachines = machinesInGroup(machines, machineGroup);
 
   const showEmptyCatalog = !availLoading && !availError && sortedTargets.length === 0;
