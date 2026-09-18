@@ -3472,6 +3472,115 @@ describe('periodic supervision convergence tick', () => {
     expect(registry.listAuditReceipts(taskId)).toHaveLength(1);
   });
 
+  it('dispatches a FRESH auditor when a legitimate re-audit request lands after a final receipt on the SAME revision (tsk_uh4)', async () => {
+    // Live bug, reproduced 3 times today (tsk_udb, tsk_u7q, tsk_ug1):
+    // automaticAuditAttemptId is deterministic on (taskId, revision) alone, so
+    // a coordinator/implementer who legitimately re-opens audit on the exact
+    // same, unchanged revision (record_validation + open_audit again -- e.g.
+    // after correcting acceptance criteria) produces the SAME attemptId as
+    // the one an OLDER final receipt already decided. Before the fix,
+    // `decidedByFinalReceipt` could not tell that apart from a stale replay
+    // of the SAME already-decided delivery (the R12/tsk_4d0 case the two
+    // tests above protect) and silently reused the stale verdict forever --
+    // no new auditAttemptId, no heartbeat, nothing. The only reliable
+    // workaround was manufacturing a fake new commit just to change the
+    // revision hash.
+    __resetSupervisionConvergenceTickForTests();
+    const { registry, taskId, revision } = makeReadyTask({ auditPolicy: 'auto_strict_cross_vendor' });
+    const attemptId = automaticAttempt(taskId, revision);
+    const implementerId = registry.get(taskId)!.assignments.find((a) => a.role === 'implementer')!.assignmentId;
+
+    // An auditor already ran this EXACT attempt+revision and filed a REWORK
+    // final receipt -- the task's real prior audit round.
+    const auditor = registry.createAssignment({
+      taskId, role: 'auditor', required: false,
+      identity: identity('deck_alpha_auditor', 'claude-code-sdk', 'anthropic'),
+      auditAttemptId: attemptId, auditRevision: revision,
+    });
+    if (!auditor.ok) throw new Error(auditor.reason);
+    expect(registry.updateAssignment({
+      assignmentId: auditor.value.assignmentId, identity: auditor.value.identity,
+      status: 'auditing', auditAttemptId: attemptId, auditRevision: revision,
+    } as never)).toMatchObject({ ok: true });
+    expect(registry.appendMatchingAuditReceipt({
+      taskId, auditorAssignmentId: auditor.value.assignmentId,
+      auditorIdentity: auditor.value.identity,
+      auditorSessionName: auditor.value.identity.sessionName,
+      attemptId, revision, receiptKind: 'final', verdict: 'REWORK',
+      findings: 'first pass: needs rework', validations: [],
+    } as never)).toMatchObject({ ok: true });
+    // Auditor finalized, exactly like a real closed REWORK round.
+    for (const status of ['rework'] as const) {
+      expect(registry.updateAssignment({
+        assignmentId: auditor.value.assignmentId, identity: auditor.value.identity,
+        status, auditAttemptId: attemptId, auditRevision: revision, verdict: 'REWORK',
+      } as never)).toMatchObject({ ok: true });
+    }
+    expect(registry.finishAssignment({
+      assignmentId: auditor.value.assignmentId, identity: auditor.value.identity, revision,
+    })).toMatchObject({ ok: true });
+
+    const sessions = [
+      session('deck_alpha_brain', 'brain'),
+      session('deck_alpha_worker', 'w1'),
+      session('deck_alpha_auditor', 'w2', 'claude-code-sdk', 'anthropic'),
+    ];
+    const dispatched: SendMessageInput[] = [];
+    const dispatch = vi.fn(async (_c: SendRuntimeCaller, input: SendMessageInput) => {
+      dispatched.push(input);
+      const created = registry.createAssignment({
+        taskId, role: 'auditor', required: false,
+        identity: identity('deck_alpha_second_auditor', 'claude-code-sdk', 'anthropic'),
+        auditAttemptId: input.audit!.attemptId,
+        auditRevision: revision,
+        idempotencyKey: `send:${input.idempotencyKey}`,
+      });
+      if (!created.ok) throw new Error(created.reason);
+      return {
+        status: 'accepted' as const,
+        dispatchId: 'send_dispatch_00000000-0000-4000-8000-000000000001' as const,
+        messageId: 'send_message_00000000-0000-5000-a000-000000000001' as SendMessageId,
+        deliveries: [{ target: 'deck_alpha_second_auditor', status: 'queued' as const }],
+        taskId,
+        assignmentId: created.value.assignmentId,
+      };
+    });
+    const deps = {
+      registry, listSessions: () => [...sessions, session('deck_alpha_second_auditor', 'w3', 'claude-code-sdk', 'anthropic')],
+      listTargets: listTargetRecords(sessions[2]!), dispatch,
+      hasDeliveryEvidence: () => dispatched.length > 0,
+    };
+
+    // Finalizing the REWORK auditor derives the task to 'rework', same as a
+    // real closed round -- confirms this is the realistic starting shape,
+    // not a fabricated one.
+    expect(registry.get(taskId)!.status).toBe('rework');
+
+    // The legitimate re-request: record_validation(passed) + open_audit on
+    // the implementer, exactly what a coordinator/implementer calls to ask
+    // for a fresh look -- the revision never changes.
+    expect(registry.applyTaskIntent({
+      expectedRevision: revision, taskId, assignmentId: implementerId,
+      intent: 'record_validation', toStatus: 'validated', validationState: 'passed',
+    })).toMatchObject({ ok: true });
+    expect(registry.applyTaskIntent({
+      expectedRevision: revision, taskId, assignmentId: implementerId,
+      intent: 'open_audit', toStatus: 'ready_for_audit',
+    })).toMatchObject({ ok: true });
+    expect(registry.get(taskId)!.status).toBe('ready_for_audit');
+    expect(registry.getAssignment(implementerId)!.status).toBe('ready_for_audit');
+
+    const after = await dispatchReadyAudit(taskId, deps);
+
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(after).not.toMatchObject({ status: 'ignored', reason: 'final_receipt_recorded' });
+    // A genuinely NEW auditor now exists for this exact (still unchanged)
+    // revision -- the fresh dispatch this whole task exists to guarantee.
+    const auditors = registry.get(taskId)!.assignments.filter((a) => a.role === 'auditor');
+    expect(auditors).toHaveLength(2);
+    expect(auditors.some((a) => a.status !== 'rework' && a.status !== 'finalized')).toBe(true);
+  });
+
   it('dispatches directly to the exact auditor with no live Brain coordinator session', async () => {
     // tsk_4d0 shape. The normal automatic path must not depend on a Brain
     // session being live: the daemon owns selection and delivery, and Brain is

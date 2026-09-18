@@ -132,6 +132,7 @@ import type { SessionRecord } from '../store/session-store.js';
 import {
   getSupervisionTaskRegistry,
   type SupervisionLifecycleConvergenceAction,
+  type PersistedSupervisionAuditReceipt,
   type PersistedSupervisionTaskAssignment,
   type PersistedSupervisionTaskAssignmentIdentity,
   type SupervisionTaskRegistryResult,
@@ -2885,6 +2886,33 @@ function automaticAuditAttemptId(taskId: string, revision: string): string {
   return `auto-audit-${digest.slice(0, 24)}`;
 }
 
+/**
+ * Whether a legitimate audit request has happened for this task SINCE the
+ * given already-decided final receipt was recorded -- the narrow escape
+ * hatch for `dispatchReadyAudit`'s replay-safety check (see its call site's
+ * comment for the bug this fixes).
+ *
+ * The signal is an implementer/integration_owner assignment row written
+ * AFTER the receipt. That is deliberately the only thing checked: those rows
+ * only change via genuine lifecycle intents (record_validation, start,
+ * claim, checkpoint) that require someone to have actually re-engaged the
+ * task -- there is no other path, automated or accidental, that touches
+ * them post-decision. A stale replay of the SAME already-decided delivery
+ * carries no new assignment write, so this stays false and the original
+ * replay-safety property (never re-run an already-FINAL attempt) holds
+ * exactly as before for that case; it only opens the gate when something
+ * real happened after the decision.
+ */
+function supersededByLaterAuditRequest(
+  task: SupervisionTaskSnapshot,
+  receipt: PersistedSupervisionAuditReceipt,
+): boolean {
+  return task.assignments.some((candidate) => (
+    (candidate.role === 'implementer' || candidate.role === 'integration_owner')
+    && candidate.updatedAt > receipt.createdAt
+  ));
+}
+
 function hasDurableDeliveryEvidence(sessionName: string, messageId: SendMessageId): boolean {
   try {
     const store = getTransportQueueStore();
@@ -3631,11 +3659,27 @@ export async function dispatchReadyAudit(
   // peer_audit_reply -- after the artifacts had been read and the tests re-run.
   // Checking the durable receipt FIRST makes that a deterministic no-op, and it
   // must not depend on convergence having already advanced the task.
+  //
+  // `automaticAuditAttemptId` is deterministic on (taskId, revision) ALONE --
+  // by design, so a replayed delivery of an already-decided attempt is a safe
+  // no-op. But that same determinism means a genuinely NEW audit request for
+  // the identical revision (record_validation + open_audit again -- e.g.
+  // after correcting acceptance criteria, or simply re-affirming a decision
+  // that needs a fresh look) produces the EXACT SAME attemptId as the one the
+  // OLD final receipt already decided, so dispatch silently reused the stale
+  // verdict forever with no new auditAttemptId and no heartbeat -- confirmed
+  // live 3 times today (tsk_udb, tsk_u7q, tsk_ug1). `supersededByLaterAuditRequest`
+  // is the fix: it does NOT touch the attemptId derivation (many other call
+  // sites rely on it staying a pure function of taskId+revision for
+  // matching/dedup), it only teaches this ONE check to recognize a
+  // legitimately later request. See its own comment for why comparing
+  // against the receipt's own createdAt is the correct, narrow signal.
   const decidedByFinalReceipt = registry.listAuditReceipts(task.taskId).some((receipt) => (
     receipt.attemptId === attemptId
     && receipt.revision === revision
     && receipt.receiptKind === 'final'
     && (receipt.verdict === 'PASS' || receipt.verdict === 'REWORK')
+    && !supersededByLaterAuditRequest(task, receipt)
   ));
   if (decidedByFinalReceipt) return { status: 'ignored', reason: 'final_receipt_recorded' };
 
