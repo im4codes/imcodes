@@ -12,6 +12,7 @@ import {
 import {
   REMOTE_DESKTOP_CAPTURE_CAPABILITY,
   REMOTE_DESKTOP_ENCODER_CAPABILITY,
+  REMOTE_DESKTOP_EXPLICIT_CLIPBOARD_CAPABILITY,
   REMOTE_DESKTOP_PLATFORM_CAPABILITY,
   REMOTE_DESKTOP_SESSION_CAPABILITY,
 } from '../../shared/remote-desktop-platform.js';
@@ -190,6 +191,9 @@ export class LinuxRemoteDesktopWorkerHost implements ControlledNodeRemoteDesktop
       REMOTE_DESKTOP_PLATFORM_CAPABILITY.LINUX,
       REMOTE_DESKTOP_CAPTURE_CAPABILITY.LINUX_X11,
       REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+      // The worker answers copy_selection from the X11 selection and types
+      // pasted text through its input adapter (linux_x11_backend.cc).
+      REMOTE_DESKTOP_EXPLICIT_CLIPBOARD_CAPABILITY,
     ];
   }
 
@@ -204,11 +208,11 @@ export class LinuxRemoteDesktopWorkerHost implements ControlledNodeRemoteDesktop
    * DataChannelObserver on every channel the browser opens and dispatches
    * pointer/keyboard messages through the same SessionCore/InputLedger the
    * already-qualified X11InputAdapter sits behind -- this worker is no
-   * longer honestly view-only. Display selection/mode/scale, clipboard, and
-   * auto-unlock remain unadvertised: Linux has one fixed display and none
-   * of REMOTE_DESKTOP_CLIPBOARD_CAPABILITY/CONTROLLED_NODE_AUTO_UNLOCK_
-   * CAPABILITY's own adapters, so claiming those would be the exact
-   * dishonest advertisement this file's own header warns against.
+   * longer honestly view-only. Display selection/mode/scale and auto-unlock
+   * remain unadvertised: Linux has one fixed display and no
+   * CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY adapter, so claiming those would
+   * be the exact dishonest advertisement this file's own header warns
+   * against. The explicit clipboard is advertised with the session tokens.
    */
   adapterCapabilities(): readonly RemoteDesktopAdapterCapability[] {
     if (!this.available()) return [];

@@ -127,6 +127,10 @@ class X11InputAdapter final : public common::InputAdapter {
   // internally (Dpy(), .cc-only), so no X11 type needs to cross this header
   // at all.
   [[nodiscard]] unsigned long EnsureScratchKeycodeFor(unsigned long symbol);
+  // Type one keysym as a character: at its own shift level (Shift for an
+  // uppercase letter or "!"), honouring Caps Lock, or on the scratch keycode
+  // when the layout has no key for it. A press and release; never held.
+  [[nodiscard]] bool TapKeysym(unsigned long symbol);
 
   std::shared_ptr<X11Connection> connection_;
   std::set<std::uint32_t> held_keys_;
@@ -152,6 +156,10 @@ class X11ClipboardAdapter final : public common::ClipboardAdapter {
   void PumpSelectionRequests(int max_events);
 
  private:
+  // Read one selection ("PRIMARY" or "CLIPBOARD") as UTF-8, bounded in time.
+  bool ReadSelection(const char* selection_name, std::string* text);
+  bool EnsureWindow();
+
   std::shared_ptr<X11Connection> connection_;
   std::string owned_text_;
   bool owns_clipboard_ = false;

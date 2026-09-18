@@ -6,9 +6,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <utility>
 #include <vector>
 
+#include <X11/XKBlib.h>
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -238,24 +240,14 @@ std::uint32_t DecodeUtf8Codepoint(std::string_view text, std::size_t index,
 }
 
 /**
- * The X11 protocol key NAME for one Unicode codepoint, suitable for
- * KeySymForName above. ASCII (<= 0x7F) reuses the exact same single-byte
- * fast path EmitText already had -- zero behavior change for plain-ASCII
- * text, still resolved through XStringToKeysym first and the raw-cast
- * fallback second, exactly as before. Anything wider is the "U" + hex
- * codepoint form keysymdef.h documents as valid for EVERY Unicode character
- * from U+0100 to U+10FFFF ("every possible Unicode character has already a
- * keysym string defined algorithmically") -- confirmed live against a real
- * X server: XStringToKeysym("U4E2D") for the real 3-byte UTF-8 encoding of U+4E2D returns
- * exactly 0x1004e2d, matching the header's own 0x01000000+codepoint formula
- * bit for bit.
+ * The keysym that types one Unicode codepoint. keysymdef.h: Latin-1 keysyms
+ * equal their codepoint, and every other character "has already a keysym
+ * defined algorithmically" as 0x01000000 + codepoint -- confirmed live against
+ * a real X server: XStringToKeysym("U4E2D") returns exactly 0x1004e2d.
  */
-std::string KeyNameForCodepoint(std::uint32_t codepoint) {
-  if (codepoint == 0) return std::string();
-  if (codepoint <= 0x7F) return std::string(1, static_cast<char>(codepoint));
-  char name[16];
-  std::snprintf(name, sizeof(name), "U%04X", codepoint);
-  return std::string(name);
+KeySym KeysymForCodepoint(std::uint32_t codepoint) noexcept {
+  return codepoint <= 0xFF ? static_cast<KeySym>(codepoint)
+                           : static_cast<KeySym>(0x01000000u | codepoint);
 }
 
 /** Protocol button names to X button numbers. Wheel is emitted separately. */
@@ -478,8 +470,11 @@ unsigned long X11InputAdapter::EnsureScratchKeycodeFor(unsigned long symbol_valu
   // MappingNotify-drained XKeysymToKeycode readback a few lines down is the
   // one signal actually trusted here, matching this file's own established
   // "prove it against real server state" rule.
-  KeySym new_map[1] = {symbol};
-  XChangeKeyboardMapping(display, scratch, 1, new_map, 1);
+  // The same keysym on both shift levels: a single-keysym entry lets Xlib
+  // derive a case pair for it (an uppercase letter mapped alone came back
+  // lowercase), and Shift may be held while this is typed.
+  KeySym new_map[2] = {symbol, symbol};
+  XChangeKeyboardMapping(display, scratch, 2, new_map, 1);
   XSync(display, False);
   // MappingNotify is delivered to every client automatically (no
   // XSelectInput needed); draining and processing it via
@@ -554,26 +549,104 @@ bool X11InputAdapter::EmitWheel(double delta_x, double delta_y) {
   return true;
 }
 
+bool X11InputAdapter::TapKeysym(unsigned long symbol_value) {
+  Display* display = Dpy(connection_);
+  if (display == nullptr) return false;
+  const KeySym symbol = static_cast<KeySym>(symbol_value);
+  KeyCode code = XKeysymToKeycode(display, symbol);
+  bool shift = false;
+  if (code != 0) {
+    // XKeysymToKeycode finds the key but not the level: "A" and "a" share a
+    // key, "!" sits on the "1" key. Pressing the key alone typed the
+    // unshifted character for every uppercase letter and shifted symbol.
+    if (XkbKeycodeToKeysym(display, code, 0, 0) == symbol) {
+      shift = false;
+    } else if (XkbKeycodeToKeysym(display, code, 0, 1) == symbol) {
+      shift = true;
+    } else {
+      code = 0;  // Only on another group/level (AltGr, ...): use the scratch key.
+    }
+  }
+  if (code != 0) {
+    // Caps Lock inverts the level of letters (and only letters).
+    KeySym lower = NoSymbol;
+    KeySym upper = NoSymbol;
+    XConvertCase(symbol, &lower, &upper);
+    XkbStateRec state{};
+    if (lower != upper && XkbGetState(display, XkbUseCoreKbd, &state) == Success &&
+        (state.locked_mods & LockMask) != 0) {
+      shift = !shift;
+    }
+  } else {
+    code = static_cast<KeyCode>(EnsureScratchKeycodeFor(symbol_value));
+    if (code == 0) return false;
+  }
+  const KeyCode shift_code = shift ? XKeysymToKeycode(display, XK_Shift_L) : 0;
+  if (shift && shift_code == 0) return false;
+  if (shift) XTestFakeKeyEvent(display, shift_code, True, 0);
+  const bool typed = XTestFakeKeyEvent(display, code, True, 0) != 0 &&
+                     XTestFakeKeyEvent(display, code, False, 0) != 0;
+  if (shift) XTestFakeKeyEvent(display, shift_code, False, 0);
+  XSync(display, False);
+  return typed;
+}
+
 bool X11InputAdapter::EmitText(std::string_view text) {
-  // Deliberately per-character through the same keysym path as EmitKey, so a
-  // text burst cannot leave a key held that ReleaseAllEmittedState misses.
-  // Iterated by real UTF-8 CODEPOINT, not raw byte: any multi-byte character
-  // (every CJK character is 3 bytes) used to have each individual byte cast
-  // through KeySymForName's single-byte fallback, almost never resolve to a
-  // valid mapped keycode, and abort EmitText on the very first byte --
-  // silently dropping the rest of the string. See KeyNameForCodepoint's own
-  // comment for how a codepoint becomes a real, typeable X11 keysym.
+  Display* display = Dpy(connection_);
+  if (display == nullptr || !connection_->has_xtest()) return false;
+  // Text is characters, not shortcuts. A modifier this adapter is holding --
+  // e.g. the Control a Mac controller's Command maps to, still down while
+  // Command+V pastes -- turned every typed letter into Control+letter. Lift
+  // the held modifier keys for the burst and put them back afterwards, so
+  // the ledger's view of what is held stays true.
+  std::vector<KeyCode> suspended;
+  if (XModifierKeymap* modifiers = XGetModifierMapping(display)) {
+    const int total = 8 * modifiers->max_keypermod;
+    for (const std::uint32_t held : held_keys_) {
+      for (int i = 0; i < total; ++i) {
+        if (modifiers->modifiermap[i] == static_cast<KeyCode>(held)) {
+          XTestFakeKeyEvent(display, static_cast<KeyCode>(held), False, 0);
+          suspended.push_back(static_cast<KeyCode>(held));
+          break;
+        }
+      }
+    }
+    XFreeModifiermap(modifiers);
+  }
+
+  // Iterated by real UTF-8 CODEPOINT, not raw byte: every CJK character is
+  // three bytes, and typing byte by byte dropped all of them.
+  bool ok = true;
   std::size_t index = 0;
   while (index < text.size()) {
     std::size_t consumed = 1;
-    const std::uint32_t codepoint = DecodeUtf8Codepoint(text, index, &consumed);
+    std::uint32_t codepoint = DecodeUtf8Codepoint(text, index, &consumed);
     index += consumed;
-    if (codepoint == 0) continue;  // Malformed byte(s) -- skip, keep going.
-    const std::string name = KeyNameForCodepoint(codepoint);
-    if (!EmitKey(name, true)) return false;
-    if (!EmitKey(name, false)) return false;
+    if (codepoint == '\r') {
+      // One line break, whichever convention the pasted text used.
+      if (index < text.size() && text[index] == '\n') ++index;
+      codepoint = '\n';
+    }
+    KeySym symbol = NoSymbol;
+    if (codepoint == '\n') {
+      symbol = XK_Return;
+    } else if (codepoint == '\t') {
+      symbol = XK_Tab;
+    } else if (codepoint < 0x20 || codepoint == 0x7F ||
+               (codepoint >= 0x80 && codepoint < 0xA0)) {
+      continue;  // Malformed (0) or another control character: nothing to type.
+    } else {
+      symbol = KeysymForCodepoint(codepoint);
+    }
+    if (!TapKeysym(static_cast<unsigned long>(symbol))) {
+      ok = false;
+      break;
+    }
   }
-  return true;
+
+  for (const KeyCode code : suspended) XTestFakeKeyEvent(display, code, True, 0);
+  XSync(display, False);
+  return ok;
 }
 
 void X11InputAdapter::ReleaseAllEmittedState() noexcept {
@@ -613,13 +686,18 @@ ReadinessState X11ClipboardAdapter::ProbeReadiness() {
   return ProbeClipboardReadiness(connection_->MeasureFacts());
 }
 
-bool X11ClipboardAdapter::PasteText(std::string_view text) {
+bool X11ClipboardAdapter::EnsureWindow() {
   Display* display = Dpy(connection_);
   if (display == nullptr) return false;
   if (window_ == 0) {
     window_ = XCreateSimpleWindow(display, DefaultRootWindow(display), 0, 0, 1, 1, 0, 0, 0);
-    if (window_ == 0) return false;
   }
+  return window_ != 0;
+}
+
+bool X11ClipboardAdapter::PasteText(std::string_view text) {
+  Display* display = Dpy(connection_);
+  if (display == nullptr || !EnsureWindow()) return false;
   owned_text_.assign(text);
   const Atom clipboard = XInternAtom(display, "CLIPBOARD", False);
   XSetSelectionOwner(display, clipboard, static_cast<Window>(window_), CurrentTime);
@@ -670,12 +748,79 @@ void X11ClipboardAdapter::PumpSelectionRequests(int max_events) {
   }
 }
 
+bool X11ClipboardAdapter::ReadSelection(const char* selection_name, std::string* text) {
+  Display* display = Dpy(connection_);
+  if (display == nullptr || !EnsureWindow()) return false;
+  const Atom selection = XInternAtom(display, selection_name, False);
+  if (XGetSelectionOwner(display, selection) == None) return false;
+  const Atom utf8 = XInternAtom(display, "UTF8_STRING", False);
+  const Atom incr = XInternAtom(display, "INCR", False);
+  const Atom property = XInternAtom(display, "IMCODES_SELECTION", False);
+  const Window window = static_cast<Window>(window_);
+
+  // UTF-8 first; an old owner that only speaks Latin-1 STRING second.
+  for (const Atom target : {utf8, static_cast<Atom>(XA_STRING)}) {
+    XConvertSelection(display, selection, target, property, window, CurrentTime);
+    XFlush(display);
+    // Take only this window's SelectionNotify. The Display is shared with
+    // the input adapter (MappingNotify) and the disclosure indicator
+    // (Expose); draining the whole queue here used to swallow their events.
+    XEvent event;
+    bool answered = false;
+    for (int waited_ms = 0; waited_ms < 250; waited_ms += 2) {
+      if (XCheckTypedWindowEvent(display, window, SelectionNotify, &event)) {
+        answered = true;
+        break;
+      }
+      struct timespec pause{0, 2'000'000};
+      nanosleep(&pause, nullptr);
+    }
+    if (!answered) return false;
+    if (event.xselection.property == None) continue;  // Refused this target.
+
+    Atom actual_type = None;
+    int actual_format = 0;
+    unsigned long items = 0;
+    unsigned long bytes_after = 0;
+    unsigned char* data = nullptr;
+    if (XGetWindowProperty(display, window, property, 0, (1 << 20), True,
+                           AnyPropertyType, &actual_type, &actual_format, &items,
+                           &bytes_after, &data) != Success) {
+      return false;
+    }
+    // An INCR transfer means more than the server's request size -- far
+    // beyond anything the browser accepts -- so it is simply not offered.
+    const bool usable = data != nullptr && actual_type != incr && actual_format == 8;
+    if (usable) {
+      if (target == utf8) {
+        text->assign(reinterpret_cast<const char*>(data), items);
+      } else {
+        // Latin-1 STRING: every byte is its own codepoint.
+        text->clear();
+        for (unsigned long i = 0; i < items; ++i) {
+          const unsigned char byte = data[i];
+          if (byte < 0x80) {
+            text->push_back(static_cast<char>(byte));
+          } else {
+            text->push_back(static_cast<char>(0xC0 | (byte >> 6)));
+            text->push_back(static_cast<char>(0x80 | (byte & 0x3F)));
+          }
+        }
+      }
+    }
+    if (data != nullptr) XFree(data);
+    return usable;
+  }
+  return false;
+}
+
 bool X11ClipboardAdapter::CopySelection(std::string* text) {
   if (text == nullptr) return false;
+  text->clear();
   Display* display = Dpy(connection_);
   if (display == nullptr) return false;
 
-  // When this adapter owns the selection the authoritative value is local;
+  // When this adapter owns the clipboard the authoritative value is local;
   // round-tripping through the server would only test the server.
   if (owns_clipboard_) {
     const Atom clipboard = XInternAtom(display, "CLIPBOARD", False);
@@ -686,43 +831,16 @@ bool X11ClipboardAdapter::CopySelection(std::string* text) {
     owns_clipboard_ = false;
   }
 
-  if (window_ == 0) {
-    window_ = XCreateSimpleWindow(display, DefaultRootWindow(display), 0, 0, 1, 1, 0, 0, 0);
-    if (window_ == 0) return false;
-  }
-  const Atom clipboard = XInternAtom(display, "CLIPBOARD", False);
-  const Atom utf8 = XInternAtom(display, "UTF8_STRING", False);
-  const Atom property = XInternAtom(display, "IMCODES_CLIPBOARD", False);
-  if (XGetSelectionOwner(display, clipboard) == None) return false;
-
-  XConvertSelection(display, clipboard, utf8, property,
-                    static_cast<Window>(window_), CurrentTime);
-  XFlush(display);
-
-  for (int attempt = 0; attempt < 200; ++attempt) {
-    while (XPending(display) > 0) {
-      XEvent event;
-      XNextEvent(display, &event);
-      if (event.type != SelectionNotify) continue;
-      if (event.xselection.property == None) return false;
-      Atom actual_type = None;
-      int actual_format = 0;
-      unsigned long items = 0;
-      unsigned long bytes_after = 0;
-      unsigned char* data = nullptr;
-      if (XGetWindowProperty(display, static_cast<Window>(window_), property, 0,
-                             (1 << 20), True, AnyPropertyType, &actual_type,
-                             &actual_format, &items, &bytes_after, &data) != Success) {
-        return false;
-      }
-      if (data == nullptr) return false;
-      text->assign(reinterpret_cast<const char*>(data), items);
-      XFree(data);
-      return true;
-    }
-    struct timespec pause{0, 1'000'000};
-    nanosleep(&pause, nullptr);
-  }
+  // X11's own convention: whatever is selected right now IS the PRIMARY
+  // selection -- in every toolkit and every terminal -- with no keystroke.
+  // Reading it rather than pressing Control+C means a copy never interrupts
+  // a remote terminal (where Control+C is SIGINT and copy is
+  // Control+Shift+C), and works the same whatever the focused app binds.
+  if (ReadSelection("PRIMARY", text) && !text->empty()) return true;
+  // Nothing selected: what the remote user last copied explicitly.
+  text->clear();
+  if (ReadSelection("CLIPBOARD", text) && !text->empty()) return true;
+  text->clear();
   return false;
 }
 

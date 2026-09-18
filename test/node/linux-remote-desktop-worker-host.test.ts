@@ -104,6 +104,9 @@ describe('LinuxRemoteDesktopWorkerHost', () => {
     // through SessionCore/InputLedger to the already-qualified
     // X11InputAdapter.
     expect(profile?.input).toBe(true);
+    // Real too: the worker answers copy_selection from the X11 selection and
+    // types pasted text through the same input adapter.
+    expect(profile?.explicitClipboard).toBe(true);
   });
 
   /**

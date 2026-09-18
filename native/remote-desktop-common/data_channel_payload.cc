@@ -635,7 +635,7 @@ void SkipWhitespace(std::string_view text, std::size_t* index) {
         return false;
     }
   }
-  if (out->control.kind == "copy_selection") {
+  if (out->control.kind == kCopySelectionKind) {
     return out->control.request_id.has_value() && absent("displayId") &&
            absent("width") && absent("height") && absent("dpiScalePercent") &&
            absent("frameWidth") && absent("frameHeight") &&

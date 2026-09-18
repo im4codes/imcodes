@@ -17,10 +17,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <string>
+#include <thread>
 #include <vector>
 
+#include <unistd.h>
+
+#include <X11/Xatom.h>
 #include <X11/Xlib.h>
+#include <X11/Xutil.h>
 #include <X11/extensions/XTest.h>
 #include <X11/extensions/Xfixes.h>
 #include <X11/extensions/Xrandr.h>
@@ -48,6 +54,120 @@ bool EnvPresent(const char* name) {
   const char* value = std::getenv(name);
   return value != nullptr && value[0] != '\0';
 }
+
+}  // namespace
+
+namespace {
+
+// A focused, override-redirect window that decodes every key it receives the
+// way an application does (XLookupString with the event's own modifier
+// state). What EmitText must be judged by is what an app would read.
+struct TypingProbe {
+  Display* display = nullptr;
+  Window window = 0;
+  bool Open() {
+    display = XOpenDisplay(nullptr);
+    if (display == nullptr) return false;
+    XSetWindowAttributes attributes{};
+    attributes.override_redirect = True;
+    attributes.event_mask = KeyPressMask;
+    window = XCreateWindow(display, DefaultRootWindow(display), 0, 0, 64, 64, 0,
+                           CopyFromParent, InputOutput, CopyFromParent,
+                           CWOverrideRedirect | CWEventMask, &attributes);
+    XMapRaised(display, window);
+    XSync(display, False);
+    usleep(100'000);
+    XSetInputFocus(display, window, RevertToParent, CurrentTime);
+    XSync(display, False);
+    return true;
+  }
+  // Characters typed since the last call; Return/Tab as \n/\t. Returns false
+  // when any typed character arrived with Control held.
+  bool Read(std::string* typed) {
+    XSync(display, False);
+    usleep(150'000);
+    bool clean = true;
+    XEvent event;
+    while (XCheckWindowEvent(display, window, KeyPressMask, &event)) {
+      char buffer[16] = {0};
+      KeySym symbol = NoSymbol;
+      const int length = XLookupString(&event.xkey, buffer, sizeof(buffer) - 1, &symbol, nullptr);
+      if (symbol == XK_Return) {
+        typed->push_back('\n');
+      } else if (symbol == XK_Tab) {
+        typed->push_back('\t');
+      } else if (length > 0) {
+        if ((event.xkey.state & ControlMask) != 0) clean = false;
+        typed->append(buffer, static_cast<std::size_t>(length));
+      }
+    }
+    return clean;
+  }
+  ~TypingProbe() {
+    if (display != nullptr) {
+      if (window != 0) XDestroyWindow(display, window);
+      XCloseDisplay(display);
+    }
+  }
+};
+
+// Owns one selection on its own connection and answers UTF8_STRING requests
+// from a thread, like any X application holding a text selection.
+struct SelectionOwner {
+  Display* display = nullptr;
+  Window window = 0;
+  std::string text;
+  std::atomic<bool> stop{false};
+  std::thread server;
+  bool Own(const char* selection_name, std::string value) {
+    text = std::move(value);
+    display = XOpenDisplay(nullptr);
+    if (display == nullptr) return false;
+    window = XCreateSimpleWindow(display, DefaultRootWindow(display), 0, 0, 1, 1, 0, 0, 0);
+    const Atom selection = XInternAtom(display, selection_name, False);
+    XSetSelectionOwner(display, selection, window, CurrentTime);
+    XSync(display, False);
+    if (XGetSelectionOwner(display, selection) != window) return false;
+    server = std::thread([this] {
+      const Atom utf8 = XInternAtom(display, "UTF8_STRING", False);
+      while (!stop.load()) {
+        while (XPending(display) > 0) {
+          XEvent event;
+          XNextEvent(display, &event);
+          if (event.type != SelectionRequest) continue;
+          const XSelectionRequestEvent& request = event.xselectionrequest;
+          XSelectionEvent reply{};
+          reply.type = SelectionNotify;
+          reply.display = request.display;
+          reply.requestor = request.requestor;
+          reply.selection = request.selection;
+          reply.target = request.target;
+          reply.time = request.time;
+          reply.property = None;
+          if (request.target == utf8) {
+            XChangeProperty(display, request.requestor, request.property, utf8, 8,
+                            PropModeReplace,
+                            reinterpret_cast<const unsigned char*>(text.data()),
+                            static_cast<int>(text.size()));
+            reply.property = request.property;
+          }
+          XSendEvent(display, request.requestor, False, 0, reinterpret_cast<XEvent*>(&reply));
+          XFlush(display);
+        }
+        usleep(1'000);
+      }
+    });
+    return true;
+  }
+  ~SelectionOwner() {
+    stop.store(true);
+    if (server.joinable()) server.join();
+    if (display != nullptr) {
+      XDestroyWindow(display, window);
+      XCloseDisplay(display);
+    }
+  }
+};
 
 }  // namespace
 
@@ -236,7 +356,13 @@ int main() {
     // convention (verified live against a real X server before this fix was
     // written): codepoints U+0100..U+10FFFF are keysym 0x01000000+codepoint.
     const KeySym target = static_cast<KeySym>(0x01000000u + 0x4E2Du);
-    if (XKeysymToKeycode(display, target) == 0) {
+    // Through a fresh connection: `display` loaded its keymap cache in an
+    // earlier section, before this remap, so it answers from whatever the
+    // scratch keycode held then (left by a previous run) -- not the server.
+    Display* fresh = XOpenDisplay(nullptr);
+    const bool mapped = fresh != nullptr && XKeysymToKeycode(fresh, target) != 0;
+    if (fresh != nullptr) XCloseDisplay(fresh);
+    if (!mapped) {
       std::fprintf(stderr, "EmitText reported success but the server has no keycode for U+4E2D\n");
       XCloseDisplay(display);
       return 63;
@@ -405,6 +531,92 @@ int main() {
     }
     std::printf("EmitKey: all %zu browser-allowed codes resolved\n",
                 allowed_codes.size());
+  }
+
+  // -- Pasted text is typed character for character. Judged by what an
+  //    application receives: an uppercase letter or "!" pressed at the wrong
+  //    shift level arrived as "a" and "1", a line break arrived as Tab, and a
+  //    Control still held from a Command+V turned every letter into a
+  //    shortcut.
+  {
+    auto connection = rd::X11Connection::Open();
+    TypingProbe probe;
+    if (!connection || !probe.Open()) {
+      std::fprintf(stderr, "could not open the typing probe\n");
+      XCloseDisplay(display);
+      return 82;
+    }
+    rd::X11InputAdapter input(connection);
+    const std::string pasted = "Hello World!\r\nA-b_C:1\t@x ~Q\"";
+    const std::string expected = "Hello World!\nA-b_C:1\t@x ~Q\"";
+    std::string typed;
+    if (!input.EmitText(pasted) || !probe.Read(&typed) || typed != expected) {
+      std::fprintf(stderr, "EmitText typed [%s], expected [%s]\n", typed.c_str(), expected.c_str());
+      XCloseDisplay(display);
+      return 83;
+    }
+    std::printf("EmitText: an application received exactly the pasted text\n");
+
+    typed.clear();
+    const bool held = input.EmitKey("ControlLeft", true);
+    const bool emitted = input.EmitText("Hi!");
+    const bool clean = probe.Read(&typed);
+    const bool released = input.EmitKey("ControlLeft", false);
+    if (!held || !emitted || !released || !clean || typed != "Hi!") {
+      std::fprintf(stderr, "text typed under a held Control arrived as [%s] (clean=%d)\n",
+                   typed.c_str(), clean ? 1 : 0);
+      XCloseDisplay(display);
+      return 84;
+    }
+    if (input.held_count() != 0) {
+      std::fprintf(stderr, "EmitText left %zu key(s) held\n", input.held_count());
+      XCloseDisplay(display);
+      return 85;
+    }
+    std::printf("EmitText: a held Control is lifted for the text and restored after\n");
+  }
+
+  // -- Copy reads the remote selection without pressing anything: PRIMARY
+  //    (whatever is selected now), else CLIPBOARD (what was last copied).
+  {
+    auto connection = rd::X11Connection::Open();
+    if (!connection) {
+      XCloseDisplay(display);
+      return 90;
+    }
+    rd::X11ClipboardAdapter clipboard(connection);
+    {
+      SelectionOwner primary;
+      if (!primary.Own("PRIMARY", "selected \xe4\xb8\xad\xe6\x96\x87 text")) {
+        std::fprintf(stderr, "could not take PRIMARY for the copy section\n");
+        XCloseDisplay(display);
+        return 91;
+      }
+      std::string copied;
+      if (!clipboard.CopySelection(&copied) || copied != "selected \xe4\xb8\xad\xe6\x96\x87 text") {
+        std::fprintf(stderr, "CopySelection returned [%s], expected the PRIMARY selection\n", copied.c_str());
+        XCloseDisplay(display);
+        return 92;
+      }
+      std::printf("CopySelection: returned the current PRIMARY selection (UTF-8)\n");
+    }
+    // Nothing selected any more: the explicitly copied CLIPBOARD instead.
+    XSetSelectionOwner(display, XA_PRIMARY, None, CurrentTime);
+    XSync(display, False);
+    {
+      SelectionOwner copied_owner;
+      if (!copied_owner.Own("CLIPBOARD", "copied earlier")) {
+        XCloseDisplay(display);
+        return 93;
+      }
+      std::string copied;
+      if (!clipboard.CopySelection(&copied) || copied != "copied earlier") {
+        std::fprintf(stderr, "CopySelection returned [%s], expected the CLIPBOARD\n", copied.c_str());
+        XCloseDisplay(display);
+        return 94;
+      }
+      std::printf("CopySelection: falls back to CLIPBOARD when nothing is selected\n");
+    }
   }
 
   XCloseDisplay(display);

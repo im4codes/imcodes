@@ -33,6 +33,8 @@ inline constexpr char kControlRejectedType[] =
 // 3 s timer after every reliable input transition (key/text, release_all,
 // control-channel button) and treats a missing input_ack as a dead peer.
 inline constexpr char kInputAckKind[] = "input_ack";
+// Browser to worker: read the remote selection; answered with kClipboardType.
+inline constexpr char kCopySelectionKind[] = "copy_selection";
 inline constexpr char kHelloKind[] = "hello";
 inline constexpr char kKeepaliveKind[] = "keepalive";
 

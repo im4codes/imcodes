@@ -651,6 +651,30 @@ bool LinuxRemoteDesktopSession::SendInputAck(
   return it->second->Send(webrtc::DataBuffer(payload));
 }
 
+bool LinuxRemoteDesktopSession::SendClipboard(
+    const std::string& request_id, const std::optional<std::string>& text) {
+  const common::RouteAuthority* authority = transport_core_.authority();
+  auto it = channels_.find(ChannelLabel(DataChannelKind::kControl));
+  if (authority == nullptr || it == channels_.end() || !it->second ||
+      it->second->state() != webrtc::DataChannelInterface::kOpen) {
+    return false;
+  }
+  Json::Value root(Json::objectValue);
+  root["type"] = imcodes::rd::kClipboardType;
+  root["protocolVersion"] = imcodes::rd::kProtocolVersion;
+  root["sessionId"] = authority->identity.session_id;
+  root["sequence"] = Json::UInt64(outbound_sequence_++);
+  root["requestId"] = request_id;
+  // Same rule as macOS: nothing, or more than the browser accepts, is "not
+  // available" rather than a silently cut-off copy.
+  const bool available = text.has_value() && !text->empty() &&
+                         text->size() <= imcodes::rd::kMaxClipboardTextBytes;
+  root["available"] = available;
+  if (available) root["text"] = *text;
+  const std::string payload = imcodes::rd::WriteJson(root);
+  return it->second->Send(webrtc::DataBuffer(payload));
+}
+
 LinuxRemoteDesktopSession::LinuxDataChannelObserver::LinuxDataChannelObserver(
     std::weak_ptr<LinuxRemoteDesktopSession> session, DataChannelKind channel)
     : session_(std::move(session)), channel_(channel) {}
@@ -807,6 +831,21 @@ void LinuxRemoteDesktopSession::HandleDataChannelMessage(
     acknowledge = true;
   } else if (message.kind == imcodes::rd::DataChannelMessageKind::kControl &&
              channel == DataChannelKind::kControl &&
+             message.control.kind == imcodes::rd::kCopySelectionKind) {
+    // Copy/Cut in the browser: hand back the remote selection. Only a
+    // controller may read the remote machine's clipboard, as on macOS.
+    if (!message.control.request_id.has_value() ||
+        authority->mode != common::TransportSessionMode::kControl) {
+      return;
+    }
+    std::string text;
+    const bool copied = adapters_.clipboard().CopySelection(&text);
+    (void)SendClipboard(*message.control.request_id,
+                        copied ? std::optional<std::string>(std::move(text))
+                               : std::nullopt);
+    accepted = true;
+  } else if (message.kind == imcodes::rd::DataChannelMessageKind::kControl &&
+             channel == DataChannelKind::kControl &&
              (message.control.kind == imcodes::rd::kHelloKind ||
               message.control.kind == imcodes::rd::kKeepaliveKind)) {
     // The browser's 30 s data keepalive is what keeps an open-but-idle
@@ -843,7 +882,7 @@ void LinuxRemoteDesktopSession::HandleDataChannelMessage(
     presented_layout_revision_ = topology->revision;
     accepted = true;
   }
-  // Other "control" kinds (display/clipboard/unlock-shaped) are parsed but
+  // Other "control" kinds (display/unlock-shaped) are parsed but
   // not acted on -- see this file's header comment for why those have
   // nothing to route to yet on Linux. Silently accepting rather than closing
   // the channel: an unimplemented-but-well-formed control kind is not a

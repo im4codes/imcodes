@@ -46,6 +46,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "api/data_channel_interface.h"
@@ -285,6 +286,10 @@ class LinuxRemoteDesktopSession final
   // ack arrives, so without this every keypress or click on Linux tore the
   // session down three seconds later.
   bool SendInputAck(std::uint64_t acknowledged_sequence);
+  // Answer a copy_selection request (macOS's WorkerTransportSink::
+  // SendClipboard shape): the remote selection's text, or not available.
+  bool SendClipboard(const std::string& request_id,
+                     const std::optional<std::string>& text);
   // Called from LinuxDataChannelObserver::OnStateChange() once a channel's
   // own DataChannelInterface::state() actually reaches kOpen.
   void OnChannelReady(common::DataChannelKind kind);
