@@ -1473,6 +1473,47 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(container.querySelector('.remote-desktop-mobile-keyboard')).not.toBeNull();
   });
 
+  it('clears the mobile IME input on a failed send, so a stuck value cannot poison every later keystroke', async () => {
+    const { getByRole } = await renderPanel();
+    act(() => { (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });
+    const input = getByRole('textbox', { name: 'remote_desktop.mobile_text_input' }) as HTMLTextAreaElement;
+
+    // A transient failure (data channel momentarily not open, a
+    // protocol_error fail(), or any other transient client.text() false)
+    // used to leave the DOM value behind -- an uncontrolled <textarea> whose
+    // value survives a failed send keeps re-submitting that SAME stale value
+    // on every later keystroke (onInput reads the accumulated DOM value, not
+    // just what was newly typed), indistinguishable from typing never
+    // reaching the remote session again for the rest of the session.
+    textByServer.mockReturnValueOnce(false);
+    input.value = 'a';
+    act(() => input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 'a' })));
+    expect(text).toHaveBeenCalledWith('a');
+    expect(input.value).toBe('');
+
+    // The next keystroke must be exactly the new character, not the failed
+    // one re-appended to whatever the stale accumulated DOM value would have
+    // been had it not been cleared above.
+    text.mockClear();
+    input.value = 'b';
+    act(() => input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 'b' })));
+    expect(text.mock.calls).toEqual([['b']]);
+    expect(input.value).toBe('');
+
+    // Same guarantee through the IME composition-commit path -- the one a
+    // real CJK character actually takes (compositionend, not plain input).
+    text.mockClear();
+    textByServer.mockReturnValueOnce(false);
+    act(() => input.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true })));
+    input.value = '中';
+    await act(async () => {
+      input.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '中' }));
+      await Promise.resolve();
+    });
+    expect(text.mock.calls).toEqual([['中']]);
+    expect(input.value).toBe('');
+  });
+
   it('docks the mobile keyboard below the stage instead of layering it on top', async () => {
     const { container, getByRole } = await renderPanel();
     act(() => { (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });

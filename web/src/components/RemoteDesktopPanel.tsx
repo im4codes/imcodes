@@ -2537,7 +2537,20 @@ export function RemoteDesktopPanel({
   const submitMobileText = (value: string) => {
     if (!value || !snapshot.inputEnabled) return;
     const input = mobileTextInputRef.current;
-    if ((clientRef.current?.text(value) ?? false) && input) {
+    // The textarea is cleared unconditionally, not only when client.text()
+    // reports success. It used to be gated on that success -- an uncontrolled
+    // <textarea> whose value survives a failed send (data channel
+    // momentarily not open, a protocol_error fail(), or any other transient
+    // client.text() false) keeps re-submitting the SAME stale value on every
+    // later keystroke (onInput reads the accumulated DOM value, not just what
+    // was newly typed), and if every resend keeps failing the same way,
+    // typing never reaches the remote session again for the rest of the
+    // session -- indistinguishable from a full input freeze, recoverable
+    // only by reconnecting. There is no retry queue for a dropped composed
+    // string either way; not clearing on failure does not preserve it for a
+    // retry, it only poisons every subsequent attempt.
+    clientRef.current?.text(value);
+    if (input) {
       input.value = '';
       if (document.activeElement !== input) {
         input.focus({ preventScroll: true });
