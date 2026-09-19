@@ -11118,6 +11118,25 @@ button.quick-agent-delegation-preset.active {
   font-size: 13px;
 }
 
+/* Keys with a shift-layer glyph: drawn small in the top-right corner (absolute,
+   so the cap keeps its height) and reached by swiping up. touch-action:none
+   keeps the browser from turning that vertical drag into a scroll/cancel. */
+.remote-desktop-computer-keyboard-row button.has-upper {
+  position: relative;
+  touch-action: none;
+}
+
+.remote-desktop-computer-key-upper {
+  position: absolute;
+  top: 1px;
+  right: 3px;
+  font-size: 8px;
+  line-height: 1;
+  color: #9fd6ee;
+  opacity: 0.85;
+  pointer-events: none;
+}
+
 .remote-desktop-computer-keyboard-row button:active {
   color: #03131d;
   background: #6bd9ff;

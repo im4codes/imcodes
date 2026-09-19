@@ -1729,6 +1729,58 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(track.style.transform).toContain('translateX(calc(0%');
   });
 
+  it('draws each number key\'s shift-layer glyph in its corner and sends it on an upward swipe', async () => {
+    const { container, getByRole } = await renderPanel();
+    act(() => { (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });
+    act(() => { (getByRole('tab', { name: 'remote_desktop.mobile_keyboard_tab_keys' }) as HTMLButtonElement).click(); });
+    const pageTwo = container.querySelectorAll('.remote-desktop-computer-keyboard-page')[1] as HTMLElement;
+    const digit = (n: string) => [...pageTwo.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.getAttribute('aria-label') === `remote_desktop.computer_key`
+        && button.lastChild?.textContent === n)!;
+    const corner = (button: HTMLButtonElement) => button.querySelector('.remote-desktop-computer-key-upper')?.textContent;
+
+    // The standard-keyboard glyphs sit in the corner of the number keys...
+    const uppers = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'].map((n) => corner(digit(n)));
+    expect(uppers).toEqual(['!', '@', '#', '$', '%', '^', '&', '*', '(', ')']);
+    // ...and on the punctuation keys; letters have none.
+    expect([...pageTwo.querySelectorAll('.remote-desktop-computer-key-upper')].map((el) => el.textContent))
+      .toEqual(expect.arrayContaining(['_', '+', '{', '}', '|', ':', '"', '<', '>', '?']));
+    const q = [...pageTwo.querySelectorAll<HTMLButtonElement>('button')].find((button) => button.textContent === 'q')!;
+    expect(corner(q)).toBeUndefined();
+
+    const calls = () => key.mock.calls.map((call) => {
+      const [code, value, down] = call as unknown as [string, string, boolean];
+      return `${down ? 'down' : 'up'}:${code}:${value}`;
+    });
+
+    // A short tap is still the plain digit.
+    const two = digit('2');
+    key.mockClear();
+    act(() => {
+      pointer(two, 'pointerdown', { pointerId: 21, clientX: 100, clientY: 300 });
+      pointer(two, 'pointerup', { pointerId: 21, clientX: 100, clientY: 298 });
+      two.click();
+    });
+    expect(calls()).toEqual(['down:Digit2:2', 'up:Digit2:2']);
+
+    // Dragging up sends Shift+2 (@) once -- the click the browser then fires is not a second tap.
+    key.mockClear();
+    act(() => {
+      pointer(two, 'pointerdown', { pointerId: 22, clientX: 100, clientY: 300 });
+      pointer(two, 'pointerup', { pointerId: 22, clientX: 101, clientY: 270 });
+      two.click();
+    });
+    expect(calls()).toEqual(['down:ShiftLeft:Shift', 'down:Digit2:@', 'up:Digit2:@', 'up:ShiftLeft:Shift']);
+
+    // A mostly-sideways drag is not an upward swipe.
+    key.mockClear();
+    act(() => {
+      pointer(two, 'pointerdown', { pointerId: 23, clientX: 100, clientY: 300 });
+      pointer(two, 'pointerup', { pointerId: 23, clientX: 160, clientY: 280 });
+    });
+    expect(calls()).toEqual([]);
+  });
+
   it('has a special-characters page whose keys send Shift plus the key, so every printable character is reachable', async () => {
     const { container, getByRole } = await renderPanel();
     act(() => { (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });

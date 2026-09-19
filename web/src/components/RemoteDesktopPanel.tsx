@@ -51,6 +51,7 @@ import {
   REMOTE_DESKTOP_COMPUTER_CASE_KEY,
   REMOTE_DESKTOP_COMPUTER_KEYBOARD_PAGES,
   remoteDesktopComputerKeyChord,
+  remoteDesktopComputerUpperKey,
   detectRemoteDesktopClipboardShortcut,
   focusRemoteDesktopMobileInput,
   isAppleControllerPlatform,
@@ -293,6 +294,12 @@ const TOUCH_TWO_FINGER_SCROLL_GAIN = 8;
 // width it then has to cross to flip pages instead of springing back.
 const COMPUTER_KEYBOARD_SWIPE_JITTER_PX = 8;
 const COMPUTER_KEYBOARD_SWIPE_COMMIT_RATIO = 0.2;
+// An upward drag on a key that carries a shift-layer glyph this far sends the
+// glyph; a tap under it stays the plain key. Clicks that follow the swipe are
+// ignored for this long (the browser still fires one when the finger lifts on
+// the same cap).
+const COMPUTER_KEY_SWIPE_UP_PX = 14;
+const COMPUTER_KEY_SWIPE_CLICK_GUARD_MS = 400;
 const REMOTE_DESKTOP_CONNECTION_STEPS = [
   'authorize',
   'worker',
@@ -490,6 +497,10 @@ export function RemoteDesktopPanel({
     deltaX: number;
   } | null>(null);
   const computerKeyboardPagesViewportRef = useRef<HTMLDivElement | null>(null);
+  // Per-key upward-swipe tracking (number / punctuation keys), and the time
+  // of the last swipe so its trailing click is not also sent as a tap.
+  const computerKeyPressRef = useRef<{ pointerId: number; startX: number; startY: number } | null>(null);
+  const computerKeySwipedAtRef = useRef(0);
   // How far the OS on-screen keyboard currently eats into the layout
   // viewport from the bottom. The docked keyboard panel normally just sits
   // in its own grid row, but a phone's own keyboard resizes only the visual
@@ -2570,6 +2581,31 @@ export function RemoteDesktopPanel({
     );
   };
 
+  const onComputerKeyPointerDown = (event: PointerEvent) => {
+    event.preventDefault();
+    computerKeyPressRef.current = { pointerId: event.pointerId, startX: event.clientX, startY: event.clientY };
+  };
+
+  const onComputerKeyPointerUp = (event: PointerEvent, spec: RemoteDesktopComputerKeySpec) => {
+    const press = computerKeyPressRef.current;
+    computerKeyPressRef.current = null;
+    const upper = remoteDesktopComputerUpperKey(spec);
+    if (!press || press.pointerId !== event.pointerId || !upper) return;
+    const dx = event.clientX - press.startX;
+    const up = press.startY - event.clientY;
+    if (up < COMPUTER_KEY_SWIPE_UP_PX || up <= Math.abs(dx)) return;
+    computerKeySwipedAtRef.current = Date.now();
+    pressComputerKey(upper);
+  };
+
+  const onComputerKeyClick = (spec: RemoteDesktopComputerKeySpec) => {
+    if (Date.now() - computerKeySwipedAtRef.current < COMPUTER_KEY_SWIPE_CLICK_GUARD_MS) {
+      computerKeySwipedAtRef.current = 0;
+      return;
+    }
+    pressComputerKey(spec);
+  };
+
   // Horizontal swipe between computer-keyboard pages. Deliberately its own
   // gesture handling rather than reusing the video stage's touch code above:
   // this operates on the key-grid buttons, not the remote pointer, and a
@@ -3463,15 +3499,20 @@ export function RemoteDesktopPanel({
                                 <button
                                   key={`${spec.code}${spec.shifted ? '+shift' : ''}`}
                                   type="button"
-                                  class={held ? 'is-held' : ''}
+                                  class={`${held ? 'is-held' : ''}${spec.upper ? ' has-upper' : ''}`.trim()}
                                   aria-label={caseKey
                                     ? t('remote_desktop.computer_key_case')
                                     : t('remote_desktop.computer_key', { key: label })}
                                   aria-pressed={spec.modifier || caseKey ? held : undefined}
                                   disabled={!snapshot.inputEnabled}
-                                  onPointerDown={(event) => event.preventDefault()}
-                                  onClick={() => pressComputerKey(spec)}
-                                >{label}</button>
+                                  onPointerDown={onComputerKeyPointerDown}
+                                  onPointerUp={(event) => onComputerKeyPointerUp(event, spec)}
+                                  onPointerCancel={() => { computerKeyPressRef.current = null; }}
+                                  onClick={() => onComputerKeyClick(spec)}
+                                >
+                                  {spec.upper && <span class="remote-desktop-computer-key-upper" aria-hidden="true">{spec.upper}</span>}
+                                  {label}
+                                </button>
                               );
                             })}
                           </div>

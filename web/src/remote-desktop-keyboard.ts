@@ -511,10 +511,39 @@ export interface RemoteDesktopComputerKeySpec {
   shifted?: boolean;
   /** What the cap reads when that differs from what the key is called elsewhere. */
   label?: string;
+  /**
+   * The character this key types with Shift held (`!` over `1`...). The cap
+   * draws it small in its corner, and swiping up on the key sends it -- the
+   * same Shift-plus-key a real keyboard produces -- so the symbols are one
+   * gesture away without a separate page or a taller key.
+   */
+  upper?: string;
+}
+
+/** Shift-layer glyph of each number / punctuation key on a standard US keyboard. */
+const SHIFT_LAYER_GLYPHS: Readonly<Record<string, string>> = {
+  Digit1: '!', Digit2: '@', Digit3: '#', Digit4: '$', Digit5: '%',
+  Digit6: '^', Digit7: '&', Digit8: '*', Digit9: '(', Digit0: ')',
+  Minus: '_', Equal: '+', BracketLeft: '{', BracketRight: '}', Backslash: '|',
+  Semicolon: ':', Quote: '"', Comma: '<', Period: '>', Slash: '?',
+};
+
+/**
+ * The key an upward swipe on `spec` sends: its shift-layer character on the
+ * same physical key, or null when the key has none.
+ */
+export function remoteDesktopComputerUpperKey(
+  spec: RemoteDesktopComputerKeySpec,
+): RemoteDesktopComputerKeySpec | null {
+  if (!spec.upper) return null;
+  return { code: spec.code, key: spec.upper, modifier: false, shifted: true };
 }
 
 const modKey = (code: string, key: string): RemoteDesktopComputerKeySpec => ({ code, key, modifier: true });
-const plainKey = (code: string, key: string): RemoteDesktopComputerKeySpec => ({ code, key, modifier: false });
+const plainKey = (code: string, key: string): RemoteDesktopComputerKeySpec => {
+  const upper = SHIFT_LAYER_GLYPHS[code];
+  return upper === undefined ? { code, key, modifier: false } : { code, key, modifier: false, upper };
+};
 const shiftedKey = (code: string, key: string): RemoteDesktopComputerKeySpec => ({ code, key, modifier: false, shifted: true });
 
 /**

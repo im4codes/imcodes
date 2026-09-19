@@ -21,6 +21,7 @@ import {
   REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS_PAGE3,
   isRemoteDesktopComputerLetterKey,
   remoteDesktopComputerKeyChord,
+  remoteDesktopComputerUpperKey,
   isRemoteDesktopMobileLineBreak,
   remoteDesktopComputerCapitalChord,
   remoteDesktopComputerKeyLabel,
@@ -515,5 +516,30 @@ describe('computer keyboard special-characters page', () => {
       { code: 'ShiftLeft', key: 'Shift' },
       { code: 'KeyQ', key: 'Q' },
     ]);
+  });
+});
+
+describe('computer keyboard upward-swipe glyphs', () => {
+  const all = REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS_PAGE2.flat();
+  const byCode = (code: string) => all.find((spec) => spec.code === code)!;
+
+  it('gives every number key its standard shift-layer character', () => {
+    const digits = ['Digit1', 'Digit2', 'Digit3', 'Digit4', 'Digit5', 'Digit6', 'Digit7', 'Digit8', 'Digit9', 'Digit0'];
+    expect(digits.map((code) => byCode(code).upper)).toEqual(['!', '@', '#', '$', '%', '^', '&', '*', '(', ')']);
+  });
+
+  it('turns the swipe into Shift plus that same physical key', () => {
+    const upper = remoteDesktopComputerUpperKey(byCode('Digit2'))!;
+    expect(upper).toMatchObject({ code: 'Digit2', key: '@', shifted: true, modifier: false });
+    expect(remoteDesktopComputerKeyChord(upper)).toEqual([
+      { code: 'ShiftLeft', key: 'Shift' },
+      { code: 'Digit2', key: '@' },
+    ]);
+  });
+
+  it('has nothing to swipe to on letters and control keys', () => {
+    expect(remoteDesktopComputerUpperKey(byCode('KeyQ'))).toBeNull();
+    expect(remoteDesktopComputerUpperKey(byCode('Enter'))).toBeNull();
+    expect(remoteDesktopComputerUpperKey(byCode('Space'))).toBeNull();
   });
 });
