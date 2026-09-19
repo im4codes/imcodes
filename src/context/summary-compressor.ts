@@ -126,6 +126,12 @@ function getBreaker(backend: string): BreakerStats {
   return b;
 }
 
+/** Would `canCall` let a request through? Read-only: never moves the breaker. */
+function breakerWouldAllow(backend: string, now: number): boolean {
+  const b = getBreaker(backend);
+  return b.state !== 'open' || now - b.openedAt >= b.cooldownMs;
+}
+
 function canCall(backend: string, now: number): boolean {
   const b = getBreaker(backend);
   if (b.state === 'closed') return true;
@@ -322,6 +328,7 @@ export const __testing__ = {
   recordSuccess,
   recordFailure,
   classifyCompressionError,
+  truncateEventText,
 };
 
 // ── Compression provider (shared with the global registry singleton) ─────────
@@ -679,6 +686,29 @@ async function compressWithSdkInner(input: CompressionInput): Promise<Compressio
       outputTokens: countTokens(summary),
       targetTokens: input.targetTokens ?? 0,
       durationMs: Date.now() - startedAt,
+    };
+  }
+
+  // Every tier's breaker open: the answer is the local fallback, which needs
+  // none of the serialization, token counting and prompt building below.
+  // Doing that work anyway -- for every materialization target, while a
+  // backend is down for up to 30 minutes -- was pure main-thread waste.
+  const probeNow = Date.now();
+  const anyTierCallable = breakerWouldAllow(modelConfig.primaryContextBackend, probeNow)
+    || Boolean(modelConfig.backupContextBackend && modelConfig.backupContextModel
+      && breakerWouldAllow(modelConfig.backupContextBackend, probeNow));
+  if (!anyTierCallable) {
+    logger.debug({ backend: modelConfig.primaryContextBackend }, 'All compression backends open — local fallback');
+    const fallbackSummary = ensurePinnedNotesSection(
+      buildLocalFallbackSummary(events, previousSummary),
+      input.pinnedNotes ?? [],
+      extraRedactPatterns,
+    );
+    return {
+      summary: fallbackSummary,
+      model: 'local-fallback', backend: 'none', usedBackup: false, fromSdk: false,
+      inputTokens: 0, outputTokens: 0,
+      targetTokens: input.targetTokens ?? 0, durationMs: Date.now() - startedAt,
     };
   }
 
@@ -1185,20 +1215,27 @@ export function serializeEvents(events: LocalContextEvent[], options: SerializeE
         : undefined;
     const compressed = compressToolEvent(toolName, content, event.id, maxEventChars);
     const redacted = redactSensitiveText(compressed, options.extraRedactPatterns ?? []);
-    const truncated = truncateByTokens(redacted, Math.max(1, countTokens(redacted.slice(0, maxEventChars))));
-    parts.push(`[${event.eventType}] ${truncated}`);
+    parts.push(`[${event.eventType}] ${truncateEventText(redacted, maxEventChars)}`);
   }
   return parts.join('\n\n');
 }
 
-function truncateByTokens(text: string, maxTokens: number): string {
-  if (countTokens(text) <= maxTokens) return text;
-  const headBudget = Math.max(1, Math.floor(maxTokens * 0.9));
-  const tailBudget = Math.max(1, maxTokens - headBudget);
-  const head = trimToTokenBudget(text, headBudget).replace(/\n\n\[\.\.\. earlier summary truncated to bound prompt token budget \.\.\.\]$/, '');
-  const reversedTail = trimToTokenBudget([...text].reverse().join(''), tailBudget).replace(/\n\n\[\.\.\. earlier summary truncated to bound prompt token budget \.\.\.\]$/, '');
-  const tail = [...reversedTail].reverse().join('');
-  return `${head}\n...[truncated]...\n${tail}`;
+/**
+ * Keep an event's first 90% and last 10% of `maxChars`. This used to be done
+ * in tokens -- but the token budget was itself "the tokens in the first
+ * maxChars characters", so it was a character limit computed by running the
+ * exact tokenizer over every event twice, plus a binary search of further
+ * tokenizer runs whenever it cut. Synchronous WASM on the main thread: over a
+ * few hundred events that froze the daemon for 0.5-1.3 s per compression (seen
+ * live on a 87-session node, several times a minute, with the SDK backend
+ * failing so every one of those runs was thrown away).
+ */
+function truncateEventText(text: string, maxChars: number): string {
+  const chars = [...text];
+  if (chars.length <= maxChars) return text;
+  const headChars = Math.max(1, Math.floor(maxChars * 0.9));
+  const tailChars = Math.max(1, maxChars - headChars);
+  return `${chars.slice(0, headChars).join('')}\n...[truncated]...\n${chars.slice(-tailChars).join('')}`;
 }
 
 // ── Local fallback ───────────────────────────────────────────────────────────
