@@ -310,6 +310,7 @@ common::TransportCallbackStamp LinuxRemoteDesktopSession::CallbackStamp()
 
 bool LinuxRemoteDesktopSession::StartTransport(
     const common::RouteAuthority& authority) {
+  relay_bitrate_cap_bps_ = authority.relay_bitrate_cap_bps;
   webrtc::PeerConnectionInterface::RTCConfiguration config;
   config.sdp_semantics = webrtc::SdpSemantics::kUnifiedPlan;
   config.bundle_policy = webrtc::PeerConnectionInterface::kBundlePolicyMaxBundle;
@@ -440,12 +441,31 @@ bool LinuxRemoteDesktopSession::EmitLocalIceCandidate(
 
 bool LinuxRemoteDesktopSession::ApplyViewerBitrateCeiling(
     std::uint32_t ceiling_bps) {
+  viewer_bitrate_ceiling_bps_ = ceiling_bps;
   if (!peer_) return false;
+  // Until ICE proves the route direct it is treated as relayed, as the
+  // transport core does: an unproven route must not exceed the relay ceiling.
+  const imcodes::rd::TransportBitratePolicy policy =
+      imcodes::rd::SelectTransportBitratePolicy(
+          transport_core_.path() == TransportPath::kDirect,
+          relay_bitrate_cap_bps_, viewer_bitrate_ceiling_bps_);
   webrtc::BitrateSettings settings;
-  settings.min_bitrate_bps =
-      static_cast<int>(imcodes::rd::kMinVideoBitrateBps);
-  settings.max_bitrate_bps = static_cast<int>(ceiling_bps);
+  settings.min_bitrate_bps = static_cast<int>(policy.min_bps);
+  settings.max_bitrate_bps = static_cast<int>(policy.max_bps);
   return peer_->SetBitrate(settings).ok();
+}
+
+void LinuxRemoteDesktopSession::OnIceSelectedCandidatePairChanged(
+    const webrtc::CandidatePairChangeEvent& event) {
+  const bool relayed =
+      event.selected_candidate_pair.local_candidate().is_relay() ||
+      event.selected_candidate_pair.remote_candidate().is_relay();
+  if (!transport_core_.OnTransportPath(
+          CallbackStamp(), relayed ? TransportPath::kRelay
+                                   : TransportPath::kDirect)) {
+    return;
+  }
+  (void)ApplyViewerBitrateCeiling(viewer_bitrate_ceiling_bps_);
 }
 
 bool LinuxRemoteDesktopSession::ApplyQuality(

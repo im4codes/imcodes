@@ -263,6 +263,9 @@ class LinuxRemoteDesktopSession final
   void OnIceCandidate(const webrtc::IceCandidate* candidate) override;
   void OnConnectionChange(
       webrtc::PeerConnectionInterface::PeerConnectionState state) override;
+  // Direct or relayed: the relay ceiling binds only while relayed.
+  void OnIceSelectedCandidatePairChanged(
+      const webrtc::CandidatePairChangeEvent& event) override;
 
  private:
   LinuxRemoteDesktopSession(
@@ -279,8 +282,12 @@ class LinuxRemoteDesktopSession final
   bool EmitLocalIceCandidate(const common::IceCandidate& candidate) override;
   bool ApplyQuality(const common::QualitySelection& selection) override;
   // Bounds the bandwidth estimate -- and so the builtin encoder's bitrate --
-  // at the viewer's ceiling, keeping the running estimate.
+  // at the viewer's ceiling, tightened by the operator's relay ceiling while
+  // the route is not proven direct; keeps the running estimate.
   bool ApplyViewerBitrateCeiling(std::uint32_t ceiling_bps);
+  std::uint32_t viewer_bitrate_ceiling_bps_ =
+      imcodes::rd::kPerPeerVideoBitrateBps;
+  std::uint32_t relay_bitrate_cap_bps_ = 0;
   void ReleaseControlAuthority(const common::RouteAuthorityIdentity& identity,
                               std::uint64_t input_epoch) noexcept override;
   void CloseDataChannel(common::DataChannelKind channel) noexcept override;

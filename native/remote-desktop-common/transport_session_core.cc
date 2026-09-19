@@ -453,8 +453,13 @@ bool TransportSessionCore::ApplyQualityTarget(const QualityTarget& target) {
       viewer_preference_.max_bitrate_bps, authority_.relay_bitrate_cap_bps,
       path_ == TransportPath::kDirect);
   QualitySelection selection = quality_ladder_.Select(effective);
+  // The transport's bound: the viewer's ceiling, held to the relay ceiling
+  // until ICE proves the route direct.
   selection.maximum_bitrate_bps =
-      imcodes::rd::ViewerVideoBitrateCeiling(viewer_preference_);
+      imcodes::rd::SelectTransportBitratePolicy(
+          path_ == TransportPath::kDirect, authority_.relay_bitrate_cap_bps,
+          imcodes::rd::ViewerVideoBitrateCeiling(viewer_preference_))
+          .max_bps;
   if (!QualitySelectionIsValid(selection)) {
     Terminate(TransportTerminalReason::kProtocolViolation);
     return false;
