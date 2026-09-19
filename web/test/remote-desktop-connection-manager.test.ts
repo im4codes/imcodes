@@ -221,6 +221,60 @@ describe('RemoteDesktopConnectionManager', () => {
     expect(observed.at(-1)?.state).toBe(REMOTE_DESKTOP_STATE.RELAYED);
   });
 
+  it('honors server retry guidance for transient capability publication without retrying a disabled feature', async () => {
+    vi.useFakeTimers();
+    const { manager, clients } = setupManager();
+    const transient = manager.connection({ serverId: 'server-transient' });
+    await transient.start();
+
+    clients[0].emit({
+      state: REMOTE_DESKTOP_STATE.FAILED,
+      error: REMOTE_DESKTOP_ERROR.CAPABILITY_UNAVAILABLE,
+      retryable: true,
+    });
+    expect(transient.current()).toMatchObject({
+      state: REMOTE_DESKTOP_STATE.RECONNECTING,
+      reconnectCount: 1,
+    });
+    await vi.advanceTimersByTimeAsync(REMOTE_DESKTOP_LIMITS.RECONNECT_BACKOFF_BASE_MS);
+    expect(clients).toHaveLength(2);
+    expect(clients[1].startAttempts).toEqual([1]);
+
+    const disabled = manager.connection({ serverId: 'server-disabled' });
+    await disabled.start();
+    clients[2].emit({
+      state: REMOTE_DESKTOP_STATE.FAILED,
+      error: REMOTE_DESKTOP_ERROR.CAPABILITY_UNAVAILABLE,
+      retryable: false,
+    });
+    await vi.advanceTimersByTimeAsync(REMOTE_DESKTOP_LIMITS.RECONNECT_BACKOFF_BASE_MS);
+    expect(disabled.current()).toMatchObject({
+      state: REMOTE_DESKTOP_STATE.FAILED,
+      retryable: false,
+    });
+    expect(clients).toHaveLength(3);
+  });
+
+  it('recovers a transient worker capability terminal with the bounded reconnect budget', async () => {
+    vi.useFakeTimers();
+    const { manager, clients } = setupManager();
+    const connection = manager.connection({ serverId: 'server-a' });
+    await connection.start();
+
+    clients[0].emit({
+      state: REMOTE_DESKTOP_STATE.FAILED,
+      terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.CAPABILITY_UNAVAILABLE,
+    });
+
+    expect(connection.current()).toMatchObject({
+      state: REMOTE_DESKTOP_STATE.RECONNECTING,
+      reconnectCount: 1,
+    });
+    await vi.advanceTimersByTimeAsync(REMOTE_DESKTOP_LIMITS.RECONNECT_BACKOFF_BASE_MS);
+    expect(clients).toHaveLength(2);
+    expect(clients[1].startAttempts).toEqual([1]);
+  });
+
   it('replaces a failed generation once and keeps the presentation subscription', async () => {
     const { manager, clients } = setupManager();
     const connection = manager.connection({ serverId: 'server-a' });

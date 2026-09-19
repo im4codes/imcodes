@@ -468,12 +468,10 @@ export const REMOTE_DESKTOP_LIMITS = {
   SIGNALING_RECONNECT_MAX_BACKOFF_MS: 5_000,
   SIGNALING_RECONNECT_ATTEMPT_TIMEOUT_MS: 5_000,
   MAX_SIGNALING_RECONNECT_ATTEMPTS: 64,
-  MAX_RECONNECT_ATTEMPTS: 3,
-  // Old Windows hardware MFTs can take roughly three seconds to release their
-  // final queued surfaces after PeerConnection teardown. Keep a bounded
-  // margin before a replacement software encoder is created in the same
-  // worker process.
-  RECONNECT_BACKOFF_BASE_MS: 5_000,
+  MAX_RECONNECT_ATTEMPTS: 4,
+  // Retry transient route failures promptly, then give an old Windows
+  // hardware MFT progressively more time to release its queued surfaces.
+  RECONNECT_BACKOFF_BASE_MS: 1_000,
   // Bound each outage independently. A connection that remains healthy for
   // this window earns a fresh retry budget, so a later transient drop does not
   // permanently strand a long-running remote-control panel.

@@ -124,6 +124,8 @@ export interface RemoteDesktopSnapshot {
   stream: MediaStream | null;
   terminalReason?: string;
   error?: string;
+  /** Server-authoritative retry guidance for an ERROR response. */
+  retryable?: boolean;
   viewerCount?: number;
   controllerCount?: number;
   /** The node is showing the Windows sign-in/lock screen. */
@@ -1189,6 +1191,14 @@ export class RemoteDesktopClient {
       }
       return;
     }
+    // Admission errors are request-bound and intentionally have no session or
+    // capability yet. Handle them before the authority matcher, which rejects
+    // ERROR by design. Otherwise the browser waits for its negotiation timeout
+    // and loses the Server's retryable guidance.
+    if (message.type === REMOTE_DESKTOP_MSG.ERROR) {
+      this.fail(message.error, message.retryable);
+      return;
+    }
     if (!this.matchesAuthority(message)) return;
     if (message.type === REMOTE_DESKTOP_MSG.RENEGOTIATE) {
       await this.renegotiate();
@@ -1275,7 +1285,6 @@ export class RemoteDesktopClient {
       this.teardown(message.reason);
       return;
     }
-    if (message.type === REMOTE_DESKTOP_MSG.ERROR) this.fail(message.error);
   }
 
   /**
@@ -2097,9 +2106,14 @@ export class RemoteDesktopClient {
     this.hooks.onSnapshot(this.snapshot);
   }
 
-  private fail(reason: string): void {
+  private fail(reason: string, retryable?: boolean): void {
     if (this.stopped) return;
-    this.publish({ state: REMOTE_DESKTOP_STATE.FAILED, error: reason, inputEnabled: false });
+    this.publish({
+      state: REMOTE_DESKTOP_STATE.FAILED,
+      error: reason,
+      inputEnabled: false,
+      ...(retryable === undefined ? {} : { retryable }),
+    });
     this.teardown(reason);
   }
 

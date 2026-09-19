@@ -160,14 +160,12 @@ MfH264Encoder::~MfH264Encoder() {
 }
 
 void SetMfH264QualityPreference(const QualityPreference& preference) noexcept {
-  try {
-    g_quality_preference.store(preference);
-    std::lock_guard<std::mutex> active(g_active_encoder_mutex);
-    if (g_active_encoder != nullptr) {
-      g_active_encoder->ApplyQualityPreference(preference);
-    }
-  } catch (...) {
-    // A preference is advisory; the next SetRates applies the stored value.
+  // The pinned libwebrtc toolchain compiles this target with exceptions
+  // disabled. This boundary and the operations it invokes are non-throwing.
+  g_quality_preference.store(preference);
+  std::lock_guard<std::mutex> active(g_active_encoder_mutex);
+  if (g_active_encoder != nullptr) {
+    g_active_encoder->ApplyQualityPreference(preference);
   }
 }
 

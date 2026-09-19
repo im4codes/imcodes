@@ -124,6 +124,7 @@ function documentPageVisibility(): RemoteDesktopPageVisibility {
 
 const RECONNECTABLE_FAILURES = new Set<string>([
   REMOTE_DESKTOP_ERROR.DAEMON_OFFLINE,
+  REMOTE_DESKTOP_ERROR.CAPABILITY_UNAVAILABLE,
   REMOTE_DESKTOP_ERROR.NEGOTIATION_TIMEOUT,
   REMOTE_DESKTOP_TERMINAL_REASON.BROWSER_DISCONNECTED,
   REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED,
@@ -425,7 +426,8 @@ export class RemoteDesktopConnectionManager {
   private isReconnectableFailure(snapshot: RemoteDesktopSnapshot): boolean {
     const reason = snapshot.terminalReason ?? snapshot.error;
     return snapshot.state === REMOTE_DESKTOP_STATE.FAILED
-      && Boolean(reason && RECONNECTABLE_FAILURES.has(reason));
+      && snapshot.retryable !== false
+      && Boolean(snapshot.retryable === true || (reason && RECONNECTABLE_FAILURES.has(reason)));
   }
 
   private retry(entry: ManagedEntry): void {
@@ -440,6 +442,7 @@ export class RemoteDesktopConnectionManager {
       reconnectCount: 0,
       error: undefined,
       terminalReason: undefined,
+      retryable: undefined,
     });
     this.replaceClient(entry, 1);
   }

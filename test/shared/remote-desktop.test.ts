@@ -169,6 +169,10 @@ describe('remote desktop production contract', () => {
   it('strictly validates start and authority envelopes', () => {
     expect(REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_GRACE_MS).toBe(5 * 60_000);
     expect(REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_MAX_BACKOFF_MS).toBe(5_000);
+    expect(Array.from(
+      { length: REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS },
+      (_, attempt) => REMOTE_DESKTOP_LIMITS.RECONNECT_BACKOFF_BASE_MS * (2 ** attempt),
+    )).toEqual([1_000, 2_000, 4_000, 8_000]);
     expect(REMOTE_DESKTOP_LIMITS.MAX_ICE_RESTARTS).toBe(8);
     expect(validateRemoteDesktopBrowserMessage({
       type: REMOTE_DESKTOP_MSG.START,

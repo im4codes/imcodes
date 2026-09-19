@@ -5,6 +5,7 @@ import {
   REMOTE_DESKTOP_CONTROL_KIND,
   REMOTE_DESKTOP_CONTROL_REJECTION,
   REMOTE_DESKTOP_DATA_MSG,
+  REMOTE_DESKTOP_ERROR,
   REMOTE_DESKTOP_INPUT_BLOCKED,
   REMOTE_DESKTOP_LIMITS,
   REMOTE_DESKTOP_MSG,
@@ -200,6 +201,34 @@ beforeEach(() => {
 });
 
 describe('RemoteDesktopClient', () => {
+  it('preserves server retry guidance on an authorization error', async () => {
+    let socket!: FakeSocket;
+    const client = new RemoteDesktopClient('controlled-win', { onSnapshot: vi.fn() }, {
+      fetchTicket: async () => 'ticket-retry-guidance',
+      createSocket: () => {
+        socket = new FakeSocket();
+        queueMicrotask(() => socket.open());
+        return socket as unknown as WebSocket;
+      },
+      createPeer: () => new FakePeer() as unknown as RTCPeerConnection,
+    });
+
+    await client.start();
+    const start = JSON.parse(socket.sent[0]!) as { requestId: string };
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.ERROR,
+      requestId: start.requestId,
+      error: REMOTE_DESKTOP_ERROR.CAPABILITY_UNAVAILABLE,
+      retryable: true,
+    });
+
+    await vi.waitFor(() => expect(client.current()).toMatchObject({
+      state: REMOTE_DESKTOP_STATE.FAILED,
+      error: REMOTE_DESKTOP_ERROR.CAPABILITY_UNAVAILABLE,
+      retryable: true,
+    }));
+  });
+
   it('records track, peer/ICE and decoded-frame evidence in one bounded browser ring', async () => {
     vi.useFakeTimers();
     clearRemoteDesktopBrowserDiagnostics('controlled-win');
