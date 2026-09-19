@@ -18,11 +18,18 @@ import { forgetAttachmentPreview, rememberAttachmentPreview } from '../src/attac
 
 const base = { seq: 1, name: 'image.png', path: '/tmp/up/image.png', removing: false, onRemove: vi.fn() };
 
-function enter(el: Element, pointerType: string) {
-  const event = new Event('pointerenter', { bubbles: false }) as Event & { pointerType?: string };
+// Preact binds `onPointerEnter` to the lowercase event only when the DOM has an
+// `onpointerenter` property; older jsdom builds do not, and it then listens for
+// the literal `PointerEnter`. Real browsers always have it, so dispatch
+// whichever name this environment is listening on.
+function firePointer(el: Element, base: 'enter' | 'leave', pointerType: string) {
+  const name = `pointer${base}`;
+  const eventName = `on${name}` in el ? name : `Pointer${base === 'enter' ? 'Enter' : 'Leave'}`;
+  const event = new Event(eventName, { bubbles: false }) as Event & { pointerType?: string };
   event.pointerType = pointerType;
   act(() => { el.dispatchEvent(event); });
 }
+const enter = (el: Element, pointerType: string) => firePointer(el, 'enter', pointerType);
 
 describe('ComposerAttachmentBadge', () => {
   beforeEach(() => {
@@ -50,7 +57,7 @@ describe('ComposerAttachmentBadge', () => {
     expect(container.querySelector('.attachment-hover-preview-caption')!.textContent).toContain('#1 image.png');
     expect(buildAttachmentDownloadUrl).not.toHaveBeenCalled();
 
-    fireEvent.pointerLeave(badge);
+    firePointer(badge, 'leave', 'mouse');
     expect(container.querySelector('.attachment-hover-preview')).toBeNull();
   });
 
