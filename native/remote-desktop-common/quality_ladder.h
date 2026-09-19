@@ -78,10 +78,11 @@ QualitySelection SelectQuality(uint32_t target_bitrate_bps,
  * encoder pulls itself down a rung even while the network stays perfectly
  * happy with the higher target.
  *
- * `backlog_pressure` of 0 returns `target_bitrate_bps` unchanged. The
- * reduction never lowers the result below `kMinVideoBitrateBps` and never
- * raises it above `target_bitrate_bps` -- this only ever discounts what the
- * caller already decided, never overrides it upward.
+ * `backlog_pressure` of 0 returns `target_bitrate_bps` unchanged, and so
+ * does a target already at or below `kMinVideoBitrateBps`. The reduction
+ * never lowers the result below `kMinVideoBitrateBps` and never raises it
+ * above `target_bitrate_bps` -- this only ever discounts what the caller
+ * already decided, never overrides it upward.
  */
 uint32_t ApplyEncodeBacklogPressure(uint32_t target_bitrate_bps,
                                     uint32_t backlog_pressure);

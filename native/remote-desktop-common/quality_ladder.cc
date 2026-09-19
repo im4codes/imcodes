@@ -91,7 +91,14 @@ QualitySelection SelectQuality(uint32_t target_bitrate_bps,
 
 uint32_t ApplyEncodeBacklogPressure(uint32_t target_bitrate_bps,
                                     uint32_t backlog_pressure) {
-  if (backlog_pressure == 0) return target_bitrate_bps;
+  // A target already at or below the floor has nothing left to discount.
+  // Congestion control does report such targets on a fresh path, and the
+  // clamp below would otherwise be handed a floor above its ceiling -- the
+  // hardened libc++ in the macOS worker aborts on that (node m3: a backlogged
+  // dual-5K encoder crashed on every connect).
+  if (backlog_pressure == 0 || target_bitrate_bps <= kMinVideoBitrateBps) {
+    return target_bitrate_bps;
+  }
   // Beyond this the reduction is already deep enough that kMinVideoBitrateBps
   // clamping dominates; capping keeps the pow() argument small and bounded.
   constexpr uint32_t kMaxBacklogPressure = 12;

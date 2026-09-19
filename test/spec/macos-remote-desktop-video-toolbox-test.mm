@@ -465,6 +465,47 @@ bool TestLowBitrateTargetKeepsEncoderRunning() {
                "the clamped bitrate reaches the new configuration");
 }
 
+bool TestLowBitrateTargetWhileBackloggedKeepsEncoderRunning() {
+  // Node m3 (two 5K displays): the encoder was already dropping frames when
+  // the first quality target of a fresh path arrived, below the ladder floor.
+  // Discounting that target for the backlog aborted the worker on every
+  // connect.
+  auto backend = std::make_unique<FakeBackend>();
+  FakeBackend* fake = backend.get();
+  encoder::VideoToolboxH264Encoder adapter(std::move(backend), {},
+                                           {.max_pending_frames = 1,
+                                            .max_dimension = 8'192,
+                                            .max_input_bytes = 1024,
+                                            .max_copy_bytes_per_frame = 2048,
+                                            .max_access_unit_bytes = 1024});
+  if (!Check(adapter.Configure(Configuration(), [](common::H264AccessUnit) {}),
+             "backlog test should configure") ||
+      !Check(adapter.Encode(Frame(4, 4, 24, 31), false),
+             "the first frame fills the queue") ||
+      !Check(!adapter.Encode(Frame(4, 4, 24, 32), false) &&
+                 adapter.Statistics().dropped_backpressure_frames == 1,
+             "the next frame is dropped as backlog")) {
+    return false;
+  }
+  if (!Check(adapter.ReconfigureFromQualitySelection({.id = "estimate",
+                                                      .width = 4,
+                                                      .height = 4,
+                                                      .fps = 30,
+                                                      .bitrate_bps = 34'167}),
+             "a sub-floor estimate is accepted while backlogged")) {
+    return false;
+  }
+  const auto configuration = adapter.Configuration();
+  if (!Check(configuration.has_value() &&
+                 configuration->bitrate_bps >= 100'000,
+             "the sub-floor estimate is clamped for VideoToolbox")) {
+    return false;
+  }
+  fake->CompleteFirst();
+  return Check(adapter.Encode(Frame(4, 4, 24, 33), false),
+               "the encoder keeps encoding after the estimate");
+}
+
 bool TestQualityReconfigureAndAsyncFailure() {
   auto backend = std::make_unique<FakeBackend>();
   FakeBackend* fake = backend.get();
@@ -537,6 +578,7 @@ int main() {
                    TestSoftwareFallbackRequiresQualification() &&
                    TestSoftwareFallbackDefaultsOnAndQualified() &&
                    TestLowBitrateTargetKeepsEncoderRunning() &&
+                   TestLowBitrateTargetWhileBackloggedKeepsEncoderRunning() &&
                    TestQualityReconfigureAndAsyncFailure() &&
                    TestStopIgnoresLateOutput()
                ? 0

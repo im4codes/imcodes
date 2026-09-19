@@ -168,6 +168,9 @@ describe('macOS VideoToolbox H.264 encoder adapter', () => {
       '-Wunguarded-availability-new',
       '-fsanitize=address,undefined',
       '-fno-omit-frame-pointer',
+      // The shipped worker links a hardened libc++ that aborts on violated
+      // preconditions (for example std::clamp bounds); the harness must too.
+      '-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE',
       '-mmacosx-version-min=12.3',
       '-I', resolve(ROOT, 'native/macos-remote-desktop'),
       '-I', resolve(ROOT, 'native/remote-desktop-common'),

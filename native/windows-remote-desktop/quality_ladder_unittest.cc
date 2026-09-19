@@ -77,6 +77,14 @@ TEST(QualityLadderTest, BacklogPressureNeverDropsBelowTheMinimumFloor) {
   EXPECT_EQ(ApplyEncodeBacklogPressure(400'000, 24), kMinVideoBitrateBps);
 }
 
+TEST(QualityLadderTest, BacklogPressureLeavesATargetBelowTheFloorAlone) {
+  // A fresh path reports targets below the floor; there is nothing left to
+  // discount, and the result must never be raised above the target.
+  EXPECT_EQ(ApplyEncodeBacklogPressure(34'167, 3), 34'167u);
+  EXPECT_EQ(ApplyEncodeBacklogPressure(kMinVideoBitrateBps, 12),
+            kMinVideoBitrateBps);
+}
+
 TEST(QualityLadderTest, BacklogPressureFeedsBackIntoALowerLadderRung) {
   // Sustained local backlog lands on a smaller/slower rung than the network
   // alone would have chosen, entirely independent of congestion control.
