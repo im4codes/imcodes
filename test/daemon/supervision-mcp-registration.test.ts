@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -27,6 +28,11 @@ import { SUPERVISION_CONSOLE_VALIDATION_STATES } from '../../shared/supervision-
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 import { SupervisionTaskRegistry } from '../../src/daemon/supervision-state-store.js';
 import logger from '../../src/util/logger.js';
+import { suppressSqliteExperimentalWarning } from '../../src/util/suppress-sqlite-warning.js';
+
+const nodeRequire = createRequire(import.meta.url);
+suppressSqliteExperimentalWarning();
+const { DatabaseSync } = nodeRequire('node:sqlite') as typeof import('node:sqlite');
 
 vi.mock('../../src/util/logger.js', () => ({
   default: {
@@ -876,6 +882,66 @@ describe('administrative recover', () => {
       idempotencyKey: 'cross-project-rebind-refused',
     })).toMatchObject({ status: 'error', reason: 'forbidden' });
     expect(registry.coordinated).toEqual([]);
+  });
+
+  describe('revision recovery rejection messages', () => {
+    const base = {
+      taskId: 'tsk_a', assignmentId: 'tsk_a-assignment-0', toRevision: 'r2',
+      leaseAction: 'clear', idempotencyKey: 'revision-recovery-msg', reason: 'exercise the rejection wording',
+    } as const;
+    const brainHandlers = () => createSupervisionMcpToolHandlers(CALLER, { registry, isProjectBrain: () => true,
+      resolveSessionIdentity: testResolveSessionIdentity,
+    });
+
+    it.each([
+      ['idempotencyKey'], ['reason'], ['assignmentId'],
+    ] as const)('names the required fields when %s is missing', async (missing) => {
+      const { [missing]: _omitted, ...rest } = base;
+      const out: any = await brainHandlers()[SUPERVISION_MCP_TOOLS.RECOVER](rest);
+      expect(out).toMatchObject({ status: 'error', reason: 'validation_failed' });
+      expect(out.detail).toContain('requires assignmentId, toRevision, leaseAction');
+      expect(out.detail).toContain('preserve/renew/clear');
+      // A missing field must NOT be blamed on the status fields.
+      expect(out.detail).not.toContain("must be omitted or 'rework'");
+      expect(registry.coordinated).toEqual([]);
+    });
+
+    it('names the allowed leaseAction values when leaseAction is not one of them', async () => {
+      const out: any = await brainHandlers()[SUPERVISION_MCP_TOOLS.RECOVER]({ ...base, leaseAction: 'keep' });
+      expect(out).toMatchObject({ status: 'error', reason: 'validation_failed' });
+      expect(out.detail).toContain('leaseAction (one of preserve/renew/clear)');
+      expect(registry.coordinated).toEqual([]);
+    });
+
+    it.each([
+      ['taskStatus', 'implementing'], ['assignmentStatus', 'recovered'], ['toStatus', 'implementing'],
+    ] as const)('blames %s=%s, not the required fields, when every required field is present', async (field, value) => {
+      const out: any = await brainHandlers()[SUPERVISION_MCP_TOOLS.RECOVER]({ ...base, [field]: value });
+      expect(out).toMatchObject({ status: 'error', reason: 'validation_failed' });
+      expect(out.detail).toContain("taskStatus/assignmentStatus/toStatus must be omitted or 'rework' for revision recovery");
+      expect(out.detail).toContain(`incompatible: ${field}`);
+      // The caller supplied every required field; telling them to add those
+      // again is exactly the misleading wording this guards against.
+      expect(out.detail).not.toContain('requires assignmentId');
+      expect(registry.coordinated).toEqual([]);
+    });
+
+    it("accepts the documented 'rework' (or omitted) status values past validation", async () => {
+      for (const extra of [{}, { taskStatus: 'rework', assignmentStatus: 'rework', toStatus: 'rework' }]) {
+        const out: any = await brainHandlers()[SUPERVISION_MCP_TOOLS.RECOVER]({ ...base, ...extra });
+        // It may still be refused further down (fake registry state), but never
+        // by the input-shape validation this test is about.
+        expect(String(out.detail ?? '')).not.toContain("must be omitted or 'rework'");
+        expect(String(out.detail ?? '')).not.toContain('requires assignmentId');
+      }
+    });
+
+    it('rejects rebindSessionName with its own wording', async () => {
+      const out: any = await brainHandlers()[SUPERVISION_MCP_TOOLS.RECOVER]({ ...base, rebindSessionName: 'deck_x' });
+      expect(out).toMatchObject({ status: 'error', reason: 'validation_failed' });
+      expect(out.detail).toContain('does not accept rebindSessionName');
+      expect(out.detail).not.toContain('requires assignmentId');
+    });
   });
 
   it('routes a generic auditor rebind through selected same-object authority without caller-supplied attempt fields', async () => {
@@ -2125,6 +2191,78 @@ describe('durable coordinator authority after daemon state loss', () => {
         .resolves.toMatchObject({ status: 'error', reason: 'forbidden' });
     }
     expect(registry.coordinated).toEqual([]);
+  });
+});
+
+describe('supervision_task_list visibility of a recovered task', () => {
+  // A `recovered` task is non-terminal, but housekeeping archives it after the
+  // grace period. Pins exactly which list mode shows it in each retention
+  // state. `history` is the ARCHIVED-only view, so a live (unarchived)
+  // recovered task is absent from history by design -- it is in the default
+  // view, and supervision_task_get reads it either way. The tool description
+  // documents this; this test keeps the behaviour from drifting silently.
+  function setup() {
+    const database = new DatabaseSync(':memory:');
+    const real = new SupervisionTaskRegistry({ database });
+    const taskId = 'tsk_recovered_visibility';
+    expect(real.createOrGet({
+      taskId, projectName: 'codedeck', classification: 'independent_top_level',
+      objective: 'recovered visibility', currentRevision: 'r1',
+    })).toMatchObject({ ok: true });
+    for (const status of ['delegated', 'implementing', 'retrying_external_ci', 'recovered'] as const) {
+      expect(real.updateTask({ taskId, status })).toMatchObject({ ok: true });
+    }
+    const handlers = createSupervisionMcpToolHandlers(CALLER, {
+      resolveSessionIdentity: testResolveSessionIdentity,
+      isProjectBrain: () => true,
+      registry: {
+        getStatus: (id: string) => real.get(id)?.status,
+        list: (input: any) => real.list(input),
+        get: (id: string) => real.get(id),
+      } as any,
+    });
+    const statusesFor = async (args: Record<string, unknown>) => {
+      const out: any = await handlers[SUPERVISION_MCP_TOOLS.LIST]({ topLevelTaskId: taskId, ...args });
+      return (out.tasks ?? []).map((task: any) => task.status);
+    };
+    const archive = () => {
+      const row = database.prepare('SELECT payload_json AS p FROM supervision_tasks WHERE task_id = ?').get(taskId) as any;
+      database.prepare('UPDATE supervision_tasks SET payload_json = ? WHERE task_id = ?')
+        .run(JSON.stringify({ ...JSON.parse(row.p), archivedAt: Date.now() }), taskId);
+    };
+    return { taskId, real, handlers, statusesFor, archive };
+  }
+
+  it('shows a LIVE recovered task in default/includeArchived but NOT in history (by design); get still reads it', async () => {
+    const { taskId, real, statusesFor } = setup();
+    expect(real.get(taskId)?.status).toBe('recovered');
+    expect(await statusesFor({})).toEqual(['recovered']);
+    expect(await statusesFor({ history: true })).toEqual([]);
+    expect(await statusesFor({ includeArchived: true })).toEqual(['recovered']);
+    // The exact production observation: history + topLevelTaskId, count 0,
+    // while get succeeds.
+    expect(real.get(taskId)).toBeTruthy();
+  });
+
+  it('shows an ARCHIVED recovered task in history/includeArchived but not in the default view', async () => {
+    const { statusesFor, archive } = setup();
+    archive();
+    expect(await statusesFor({})).toEqual([]);
+    expect(await statusesFor({ history: true })).toEqual(['recovered']);
+    expect(await statusesFor({ includeArchived: true })).toEqual(['recovered']);
+  });
+
+  it('an explicit non-terminal status filter is a lifecycle projection: it wins over archivedAt and never appears under history', async () => {
+    const { statusesFor, archive } = setup();
+    expect(await statusesFor({ status: 'recovered' })).toEqual(['recovered']);
+    expect(await statusesFor({ status: 'recovered', history: true })).toEqual([]);
+    archive();
+    expect(await statusesFor({ status: 'recovered' })).toEqual(['recovered']);
+    // Unlike the unfiltered history view above, status=recovered + history is
+    // empty even for an archived task: use includeArchived (or no status) to
+    // find it.
+    expect(await statusesFor({ status: 'recovered', history: true })).toEqual([]);
+    expect(await statusesFor({ status: 'recovered', includeArchived: true })).toEqual(['recovered']);
   });
 });
 

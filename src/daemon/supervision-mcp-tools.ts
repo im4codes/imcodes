@@ -495,9 +495,18 @@ export const SUPERVISION_MCP_TOOL_SHAPES = {
 
 const DESCRIPTIONS: Record<SupervisionMcpToolName, string> = {
   // Kept terse on purpose: every byte here is published to every MCP client and
-  // the shared tool surface is already over its size budget.
+  // the shared tool surface is already over its size budget (the bootstrap
+  // surface has ZERO headroom, so the LIST text below was fitted within the same
+  // byte length). List retention semantics, documented here because the
+  // published text cannot grow: default = unarchived tasks; history = ARCHIVED
+  // tasks only, so a live task (including a non-terminal `recovered` one that
+  // housekeeping has not archived yet) is absent from history while
+  // supervision_task_get still reads it; includeArchived = both. An explicit
+  // non-terminal `status` filter is a lifecycle projection that ignores
+  // archivedAt and is never returned under history. Pinned by the 'recovered
+  // task' visibility tests in supervision-mcp-registration.test.ts.
   [SUPERVISION_MCP_TOOLS.INTENT]: 'Task intent; validation and finish require expectedRevision.',
-  [SUPERVISION_MCP_TOOLS.LIST]: 'List project tasks for its Brain, otherwise tasks you participate in.',
+  [SUPERVISION_MCP_TOOLS.LIST]: 'Tasks (Brain: project, else yours); history=archived only, not live.',
   [SUPERVISION_MCP_TOOLS.GET]: 'Read a project task as its Brain, otherwise a task you participate in.',
   [SUPERVISION_MCP_TOOLS.RECOVER]: 'Restricted task recovery.',
   [SUPERVISION_MCP_TOOLS.HOUSEKEEPING]: 'Bounded task retention census or administrative apply; provenance is retained.',
@@ -1205,14 +1214,21 @@ export function createSupervisionMcpToolHandlers(
         const compatibleProjectionStatus = (value: unknown) => (
           value === undefined || String(value).trim() === 'rework'
         );
-        if (!assignmentId || !toRevision
-          || !reason || !idempotencyKey
-          || !SUPERVISION_RECOVERY_LEASE_ACTIONS.includes(leaseAction as SupervisionRecoveryLeaseAction)
-          || rebindSessionName
-          || !compatibleProjectionStatus(input.taskStatus)
-          || !compatibleProjectionStatus(input.assignmentStatus)
-          || !compatibleProjectionStatus(input.toStatus)) {
-          return err('validation_failed', 'revision recovery requires assignmentId, toRevision, leaseAction, idempotencyKey and reason; fromRevision/ownedFiles/scopeFiles/evidenceManifestSha256 are optional metadata');
+        // Each rejection cause gets its own message. They used to share one
+        // "requires assignmentId, toRevision, ..." text, so a caller that
+        // supplied every required field but also passed an incompatible status
+        // (implementing/recovered/...) was told to add fields it already had.
+        if (!assignmentId || !toRevision || !reason || !idempotencyKey
+          || !SUPERVISION_RECOVERY_LEASE_ACTIONS.includes(leaseAction as SupervisionRecoveryLeaseAction)) {
+          return err('validation_failed', `revision recovery requires assignmentId, toRevision, leaseAction (one of ${SUPERVISION_RECOVERY_LEASE_ACTIONS.join('/')}), idempotencyKey and reason; fromRevision/ownedFiles/scopeFiles/evidenceManifestSha256 are optional metadata`);
+        }
+        if (rebindSessionName) {
+          return err('validation_failed', 'revision recovery does not accept rebindSessionName; rebind the session identity with a separate recovery call');
+        }
+        const incompatibleStatusFields = (['taskStatus', 'assignmentStatus', 'toStatus'] as const)
+          .filter((field) => !compatibleProjectionStatus(input[field]));
+        if (incompatibleStatusFields.length > 0) {
+          return err('validation_failed', `taskStatus/assignmentStatus/toStatus must be omitted or 'rework' for revision recovery (incompatible: ${incompatibleStatusFields.join(', ')})`);
         }
         const task = reg.get(taskId);
         const taskProjectName = typeof task?.projectName === 'string' ? task.projectName : '';
