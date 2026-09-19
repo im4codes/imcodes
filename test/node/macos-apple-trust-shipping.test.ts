@@ -61,10 +61,13 @@ describe('macOS Apple-trust shared implementation ships with the daemon', () => 
     // The node-exe path bundles the thin entry with esbuild rather than copying
     // dist/, so it has its own way to miss the module.
     const { build } = await import('esbuild');
+    // The same `?raw` handling the real node build uses.
+    const { rawTextImportsPlugin } = await import('../../scripts/esbuild-raw-text-plugin.mjs');
     const result = await build({
       entryPoints: [join(ROOT, 'src/node/index.ts')],
       bundle: true, platform: 'node', format: 'esm', metafile: true,
       write: false, logLevel: 'silent', external: ['bufferutil', 'utf8-validate'],
+      plugins: [rawTextImportsPlugin],
     });
     const inputs = Object.keys(result.metafile.inputs);
     expect(inputs.some((path) => path.endsWith('src/node/macos-apple-trust.mjs')),

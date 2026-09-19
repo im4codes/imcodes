@@ -939,6 +939,12 @@ describe('controlled node enrollment and runtime', () => {
       platform: 'linux',
       arch: 'x64',
       remoteDesktopWorker,
+      // A box with an X server running (the test host may have none).
+      linuxDesktop: {
+        displayAvailable: () => true,
+        provisionSupported: () => true,
+        provision: vi.fn(),
+      },
     });
     runtime.start();
     socket.open();
@@ -950,6 +956,65 @@ describe('controlled node enrollment and runtime', () => {
     expect(profile?.platform).toBe('linux');
     expect(profile?.capture).toBe('linux_x11');
     expect(profile?.localDisclosure).toBe(true);
+    runtime.stop();
+  });
+
+  it('offers to set up a basic desktop on a headless Linux box, and advertises remote desktop once it is up', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-linux-headless-'));
+    temporaryDirs.push(dir);
+    const workerPath = join(dir, 'imcodes-linux-remote-desktop-worker');
+    await writeFile(workerPath, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const remoteDesktopWorker = new LinuxRemoteDesktopWorkerHost(() => {}, { workerPath });
+    const sockets: MockSocket[] = [];
+    let displayUp = false;
+    const provision = vi.fn(async () => {
+      displayUp = true;
+      return { ok: true as const, user: 'ai' };
+    });
+    const repairMissingRemoteDesktopWorker = vi.fn();
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => {
+      const next = new MockSocket();
+      sockets.push(next);
+      return next;
+    }, {
+      platform: 'linux',
+      arch: 'x64',
+      remoteDesktopWorker,
+      repairMissingRemoteDesktopWorker,
+      linuxDesktop: {
+        displayAvailable: () => displayUp,
+        provisionSupported: () => true,
+        provision,
+      },
+    });
+    runtime.start();
+    const socket = sockets[0]!;
+    socket.open();
+
+    // No screen to capture: no remote desktop that would only fail at
+    // session start -- the one-click install instead.
+    const before = JSON.parse(socket.sent[0]!) as { capabilities: string[] };
+    expect(resolveRemoteDesktopSessionProfile(before.capabilities)).toBeNull();
+    expect(before.capabilities).toContain(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY);
+
+    socket.emit('message', JSON.stringify({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST }));
+    await vi.waitFor(() => expect(provision).toHaveBeenCalledOnce());
+    // The worker itself is present: this is a desktop install, not a worker repair.
+    expect(repairMissingRemoteDesktopWorker).not.toHaveBeenCalled();
+
+    // Capabilities travel only in the auth frame, so the change reconnects
+    // and the new connection advertises a working remote desktop.
+    await vi.waitFor(() => expect(sockets.length).toBeGreaterThan(1), { timeout: 10_000 });
+    const reconnect = sockets.at(-1)!;
+    reconnect.open();
+    const after = JSON.parse(reconnect.sent[0]!) as { capabilities: string[] };
+    expect(resolveRemoteDesktopSessionProfile(after.capabilities)?.capture).toBe('linux_x11');
+    expect(after.capabilities).not.toContain(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY);
     runtime.stop();
   });
 

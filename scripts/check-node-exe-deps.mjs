@@ -6,6 +6,7 @@
 // Bundle the production entry with esbuild and fail on any reachable native
 // module instead.
 import { build } from 'esbuild';
+import { rawTextImportsPlugin } from './esbuild-raw-text-plugin.mjs';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -33,6 +34,7 @@ const result = await build({
   write: false,
   logLevel: 'silent',
   external: OPTIONAL_NATIVE,
+  plugins: [rawTextImportsPlugin],
 });
 
 const inputs = Object.keys(result.metafile.inputs);
@@ -69,6 +71,7 @@ try {
     entryPoints: [THIN_ENTRY],
     bundle: true, platform: 'node', format: 'cjs', outfile: probePath,
     external: OPTIONAL_NATIVE, logLevel: 'silent',
+    plugins: [rawTextImportsPlugin],
     define: { 'process.env.WS_NO_BUFFER_UTIL': '"1"', 'process.env.WS_NO_UTF_8_VALIDATE': '"1"' },
   });
   const probe = spawnSync(process.execPath, [probePath, '--version'], {

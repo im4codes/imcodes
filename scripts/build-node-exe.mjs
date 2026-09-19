@@ -15,6 +15,7 @@
 // blob into the official arm64 and x64 Node binaries, then combines them into a
 // single Universal 2 executable.
 import { build } from 'esbuild';
+import { rawTextImportsPlugin } from './esbuild-raw-text-plugin.mjs';
 import { execFileSync } from 'node:child_process';
 import { mkdir, rm, copyFile, writeFile, chmod, stat, readFile, rename } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
@@ -186,6 +187,7 @@ async function main() {
     entryPoints: [join(root, 'src/node/index.ts')],
     bundle: true, platform: 'node', format: 'cjs', outfile: bundlePath,
     external: ['bufferutil', 'utf8-validate'],
+    plugins: [rawTextImportsPlugin],
     define: {
       'process.env.IMCODES_BUILD_VERSION': JSON.stringify(buildVersion),
       // `ws` probes these optional native accelerators with a caught

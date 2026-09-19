@@ -129,6 +129,12 @@ import {
 } from './remote-desktop-consent-ipc.js';
 import type { WorkerPrivacyInboundFrame } from './remote-desktop-privacy-ipc.js';
 import {
+  linuxDesktopProvisionSupported,
+  linuxGraphicalDisplayAvailable,
+  provisionLinuxDesktopEnvironment,
+  type LinuxDesktopProvisionResult,
+} from './linux-desktop-environment.js';
+import {
   RemoteDesktopSignedShellController,
   type RemoteDesktopSignedShellLauncher,
 } from './remote-desktop-shell-launch.js';
@@ -322,6 +328,12 @@ export interface ControlledNodeRuntimeOptions {
    * worker beside it even when its main version already matches the Server.
    */
   repairMissingRemoteDesktopWorker?: (targetVersion: string) => ReturnType<typeof startControlledNodeSelfUpgrade>;
+  /** Test seam for a Linux box with no graphical session (see linux-desktop-environment.ts). */
+  linuxDesktop?: {
+    displayAvailable(): boolean;
+    provisionSupported(): boolean;
+    provision(): Promise<LinuxDesktopProvisionResult>;
+  };
   /** Test seam for the normal Server-requested upgrade path. */
   startSelfUpgrade?: typeof startControlledNodeSelfUpgrade;
   platform?: NodeJS.Platform;
@@ -430,6 +442,19 @@ export function createControlledNodeRuntime(
    * left a Mac with a working worker showing no remote-desktop button at all.
    */
   let permissionRequiredCapabilities: readonly string[] = [];
+  /**
+   * Linux: the worker is installed but the box has no X server at all (a
+   * plain server). Advertising remote desktop there only fails at session
+   * start, so the node instead offers the install that sets up a basic
+   * desktop, and runs it when the owner clicks 启用远程控制.
+   */
+  const linuxDesktop = options.linuxDesktop ?? {
+    displayAvailable: () => linuxGraphicalDisplayAvailable(),
+    provisionSupported: () => linuxDesktopProvisionSupported(),
+    provision: () => provisionLinuxDesktopEnvironment(),
+  };
+  let linuxDesktopMissing = false;
+  let linuxDesktopProvisionInFlight = false;
   /**
    * Set once this node's worker has become available at least once.
    *
@@ -554,6 +579,10 @@ export function createControlledNodeRuntime(
     remoteDesktopEnabled = remoteDesktopWorkerAvailable
       && remoteDesktopFeatureEnabled
       && profile !== null;
+    linuxDesktopMissing = platform === 'linux'
+      && remoteDesktopEnabled
+      && !linuxDesktop.displayAvailable();
+    if (linuxDesktopMissing) remoteDesktopEnabled = false;
     const captureCapabilities = Object.values(REMOTE_DESKTOP_CAPTURE_CAPABILITY) as readonly string[];
     permissionRequiredCapabilities = remoteDesktopWorkerAvailable
       && remoteDesktopFeatureEnabled
@@ -922,6 +951,28 @@ export function createControlledNodeRuntime(
       macosRemoteDesktopInstallInFlight = false;
     }
   };
+  const linuxDesktopInstallable = (): boolean => linuxDesktopMissing && linuxDesktop.provisionSupported();
+  const provisionLinuxDesktop = async (): Promise<void> => {
+    if (linuxDesktopProvisionInFlight) return;
+    linuxDesktopProvisionInFlight = true;
+    logger.info('installing a basic desktop environment for remote desktop on this headless Linux box');
+    try {
+      const result = await linuxDesktop.provision();
+      if (result.ok) {
+        logger.info({ user: result.user }, 'basic desktop environment installed');
+      } else {
+        logger.warn({ reason: result.reason, detail: result.detail }, 'basic desktop environment install failed');
+      }
+    } catch (error) {
+      logger.warn({ err: error }, 'basic desktop environment install failed');
+    } finally {
+      linuxDesktopProvisionInFlight = false;
+      // A display that came up turns this into an ordinary enabled remote
+      // desktop; one that did not keeps offering the (idempotent) install.
+      refreshRemoteDesktopCapabilityState();
+      republishCapabilitiesIfChanged();
+    }
+  };
   const repairMissingRemoteDesktopWorker = (force = false) => {
     if (!missingRemoteDesktopWorkerCanRepair || upgradeInFlight) return false;
     const now = options.now?.() ?? Date.now();
@@ -1002,7 +1053,9 @@ export function createControlledNodeRuntime(
           REMOTE_DESKTOP_RELAY_CAP_CAPABILITY,
         ]
         : permissionRequiredCapabilities),
-      ...(missingRemoteDesktopWorkerCanRepair ? [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY] : []),
+      ...(missingRemoteDesktopWorkerCanRepair || linuxDesktopInstallable()
+        ? [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY]
+        : []),
       ...(macosRemoteDesktopComponentsInstallable()
         ? [REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY]
         : []),
@@ -1271,6 +1324,10 @@ export function createControlledNodeRuntime(
         if (Object.keys(message).length !== 1) return;
         if (macosRemoteDesktopComponentsInstallable()) {
           void installMacosRemoteDesktopComponents(true);
+          return;
+        }
+        if (linuxDesktopInstallable()) {
+          void provisionLinuxDesktop();
           return;
         }
         repairMissingRemoteDesktopWorker(true);
