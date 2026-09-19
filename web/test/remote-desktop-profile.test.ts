@@ -30,6 +30,9 @@ const MAC_VIEW = [
   REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
 ] as const;
 
+/** Both macOS permissions granted: Screen Recording and Accessibility. */
+const MAC_CONTROL = [...MAC_VIEW, REMOTE_DESKTOP_INPUT_CAPABILITY] as const;
+
 const WINDOWS_COMMON = [
   REMOTE_DESKTOP_SESSION_CAPABILITY,
   REMOTE_DESKTOP_PLATFORM_CAPABILITY.WINDOWS,
@@ -41,7 +44,7 @@ const WINDOWS_COMMON = [
 
 describe('remote desktop Web session profile', () => {
   it('opens complete Windows and macOS profiles only for an operable role', () => {
-    for (const capabilities of [WINDOWS_COMMON, MAC_VIEW]) {
+    for (const capabilities of [WINDOWS_COMMON, MAC_CONTROL]) {
       expect(canOpenRemoteDesktopMachine({
         online: true,
         execEnabled: true,
@@ -96,6 +99,19 @@ describe('remote desktop Web session profile', () => {
     })).toBe(false);
   });
 
+  it('offers a Mac only once both of its permissions are granted', () => {
+    // Screen Recording without Accessibility could only be watched; what the
+    // owner needs then is the permission request, not a session.
+    const mac = (capabilities: readonly unknown[]) => ({
+      online: true,
+      execEnabled: true,
+      accessRole: 'owner' as const,
+      capabilities,
+    });
+    expect(canOpenRemoteDesktopMachine(mac(MAC_VIEW))).toBe(false);
+    expect(canOpenRemoteDesktopMachine(mac(MAC_CONTROL))).toBe(true);
+  });
+
   it('does not let descriptive OS metadata change launch authority', () => {
     const candidate = (os: string | undefined, capabilities: readonly unknown[]) => ({
       os,
@@ -105,7 +121,7 @@ describe('remote desktop Web session profile', () => {
       capabilities,
     });
     for (const os of [undefined, 'win', 'mac', 'linux', 'future-os']) {
-      expect(canOpenRemoteDesktopMachine(candidate(os, MAC_VIEW))).toBe(true);
+      expect(canOpenRemoteDesktopMachine(candidate(os, MAC_CONTROL))).toBe(true);
       expect(canOpenRemoteDesktopMachine(candidate(os, [REMOTE_DESKTOP_SESSION_CAPABILITY]))).toBe(false);
     }
   });

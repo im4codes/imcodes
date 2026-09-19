@@ -56,7 +56,11 @@ export function canOpenRemoteDesktopMachine(
   return machine.online
     && machine.execEnabled
     && (role === MACHINE_ACCESS_ROLES[0] || role === MACHINE_ACCESS_ROLES[2])
-    && resolveRemoteDesktopWebProfile(machine.capabilities) !== null;
+    && resolveRemoteDesktopWebProfile(machine.capabilities) !== null
+    // A Mac is offered only once both of its permissions are in: with Screen
+    // Recording but not Accessibility it could only be watched, and what it
+    // needs is the permission request, not a session.
+    && resolveRemoteDesktopWebReadiness(machine.capabilities).accessibilityReady !== false;
 }
 
 /**

@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import type { ComponentChildren } from 'preact';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY } from '@shared/remote-desktop-access.js';
+import { REMOTE_DESKTOP_INPUT_CAPABILITY, REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY } from '@shared/remote-desktop-access.js';
 import {
   REMOTE_DESKTOP_CAPABILITY,
   REMOTE_DESKTOP_STOP_ORIGIN,
@@ -79,6 +79,7 @@ function macMachine(id: string, complete: boolean) {
       REMOTE_DESKTOP_CAPTURE_CAPABILITY.MACOS_SCREEN_CAPTURE_KIT,
       REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
       REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+      REMOTE_DESKTOP_INPUT_CAPABILITY,
     ] : [
       REMOTE_DESKTOP_SESSION_CAPABILITY,
       REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS,

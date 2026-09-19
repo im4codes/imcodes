@@ -76,6 +76,7 @@ const {
 } = await import('@shared/remote-desktop-login-screen.js');
 const {
   REMOTE_DESKTOP_ENCODER_CAPABILITY,
+  REMOTE_DESKTOP_CAPTURE_CAPABILITY,
   REMOTE_DESKTOP_PLATFORM_CAPABILITY,
   REMOTE_DESKTOP_SESSION_CAPABILITY,
 } = await import('@shared/remote-desktop-platform.js');
@@ -185,6 +186,29 @@ describe('DaemonRemoteDesktopControl', () => {
       expect(onOpen).not.toHaveBeenCalled();
       fireEvent.click(screen.getByText('remote_desktop.request_permission'));
       await waitFor(() => expect(requestPermissions).toHaveBeenCalledWith('controlled_mac'));
+    });
+
+    it('asks a Mac with Screen Recording but not Accessibility for the grant instead of opening it', async () => {
+      // pro.koca.win: it could only be watched, and it is offered only once
+      // both permissions are in.
+      const mac = {
+        ...node,
+        serverId: 'controlled_mac_view',
+        os: 'mac',
+        hostServerId: 'server_1',
+        capabilities: [
+          REMOTE_DESKTOP_SESSION_CAPABILITY,
+          REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS,
+          REMOTE_DESKTOP_CAPTURE_CAPABILITY.MACOS_SCREEN_CAPTURE_KIT,
+          REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+          REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+        ],
+      };
+      const { view, onOpen } = mount([], { machines: [mac] });
+      fireEvent.click(view.container.querySelector('button')!);
+      expect(onOpen).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByText('remote_desktop.request_permission'));
+      await waitFor(() => expect(requestPermissions).toHaveBeenCalledWith('controlled_mac_view'));
     });
 
     it('links an already-installed node to this daemon, once, and re-reads the list', async () => {

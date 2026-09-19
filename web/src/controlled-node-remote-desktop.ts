@@ -27,11 +27,11 @@ export function machineAccessRole(machine: MachineListItem): 'owner' | 'viewer' 
  * opposite things from the operator.
  */
 export function needsRemoteDesktopPermission(machine: MachineListItem): boolean {
-  return machine.online
-    && machine.execEnabled
-    && machineAccessRole(machine) === 'owner'
-    && resolveRemoteDesktopWebReadiness(machine.capabilities).kind
-      === REMOTE_DESKTOP_WEB_READINESS.SCREEN_RECORDING_REQUIRED;
+  if (!machine.online || !machine.execEnabled || machineAccessRole(machine) !== 'owner') return false;
+  const readiness = resolveRemoteDesktopWebReadiness(machine.capabilities);
+  // Either permission missing: a Mac is not opened until both are granted.
+  return readiness.kind === REMOTE_DESKTOP_WEB_READINESS.SCREEN_RECORDING_REQUIRED
+    || readiness.accessibilityReady === false;
 }
 
 export function canInstallRemoteDesktopWorker(machine: MachineListItem): boolean {
