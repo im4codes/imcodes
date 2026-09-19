@@ -1,7 +1,7 @@
 import pino from 'pino';
 import { join } from 'path';
 import { homedir } from 'os';
-import { mkdirSync, existsSync, statSync, renameSync, unlinkSync } from 'fs';
+import { mkdirSync, existsSync, openSync, statSync, renameSync, unlinkSync } from 'fs';
 
 const LOG_DIR = join(homedir(), '.imcodes', 'logs');
 const LOG_FILE = join(LOG_DIR, 'daemon.log');
@@ -60,7 +60,15 @@ function buildLogger(): pino.Logger {
   // production crash the daemon after disk-full / log-rotation races.
   // Logging is best-effort; swallow the failure so the rest of the daemon
   // keeps running.
-  const fileDest = pino.destination({ dest: LOG_FILE, append: true, sync: false });
+  //
+  // The file is opened synchronously and handed over as a descriptor. Given a
+  // path, SonicBoom opens it asynchronously, and a process that exits at once
+  // -- `imcodes <mistyped command>`, which commander rejects before anything
+  // else runs -- reached pino's exit flush before the open finished:
+  // "sonic boom is not ready yet", printed as a daemon crash.
+  let fd: number | undefined;
+  try { fd = openSync(LOG_FILE, 'a'); } catch { /* fall back to the path */ }
+  const fileDest = pino.destination({ dest: fd ?? LOG_FILE, append: true, sync: false });
   fileDest.on('error', () => { /* best-effort log writes; ignore stream errors */ });
 
   const streams: pino.StreamEntry[] = [
