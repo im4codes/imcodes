@@ -768,6 +768,16 @@ export function createControlledNodeRuntime(
       authenticationPersistenceInFlight = false;
     });
   };
+  const componentArch = arch === 'arm64' ? 'arm64' : 'x64';
+  const storeRoot = defaultMacosRemoteDesktopArtifactStoreRoot(componentArch);
+  /** Whether the store's selected macOS component set is THIS release's. */
+  const isInstalledForThisRelease = options.macosRemoteDesktopComponentsInstalled
+    ?? (options.installMacosRemoteDesktopComponents ? async () => false : async () => {
+      const selected = await selectMacosRemoteDesktopArtifact(storeRoot, 'current', {
+        runtime: { platform, arch: componentArch },
+      }).catch(() => null);
+      return selected?.manifest.workerVersion === DAEMON_VERSION;
+    });
   /**
    * Fetch this release's macOS component set and publish it.
    *
@@ -788,15 +798,6 @@ export function createControlledNodeRuntime(
     // flapping link into a request loop. An explicit click ignores the delay:
     // the person asking has new information the node does not.
     const now = options.now?.() ?? Date.now();
-    const componentArch = arch === 'arm64' ? 'arm64' : 'x64';
-    const storeRoot = defaultMacosRemoteDesktopArtifactStoreRoot(componentArch);
-    const isInstalledForThisRelease = options.macosRemoteDesktopComponentsInstalled
-      ?? (options.installMacosRemoteDesktopComponents ? async () => false : async () => {
-        const selected = await selectMacosRemoteDesktopArtifact(storeRoot, 'current', {
-          runtime: { platform, arch: componentArch },
-        }).catch(() => null);
-        return selected?.manifest.workerVersion === DAEMON_VERSION;
-      });
     // Already installed for THIS release: fetching it again cannot help. The
     // components are present and not running, which is a start-up failure --
     // most often a screen that was locked when the node started. Start-up ran
@@ -1520,10 +1521,17 @@ export function createControlledNodeRuntime(
   };
   if (remoteDesktopWorkerStartup) {
     client = new StartupGatedAuthenticatedWebSocketClient(clientOptions, async () => {
-      try {
-        await remoteDesktopWorkerStartup();
-      } catch (error) {
-        reportAuthenticationError(error);
+      // Only a set installed for THIS release is started here. Right after an
+      // upgrade the store still selects the previous release until this node
+      // installs the new one, and a worker started from it kept serving until
+      // its first session ended -- so every upgrade brought a fixed worker bug
+      // back for one session (node m3). Installing starts the new set itself.
+      if (await isInstalledForThisRelease().catch(() => false)) {
+        try {
+          await remoteDesktopWorkerStartup();
+        } catch (error) {
+          reportAuthenticationError(error);
+        }
       }
       // This gated startup runs exactly once, before the first socket -- the
       // only call site that starts the macOS worker outside

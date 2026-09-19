@@ -194,6 +194,7 @@ describe('macOS controlled-node remote-desktop runtime', () => {
     }, createSocket, {
       platform: 'darwin',
       arch: 'arm64',
+      macosRemoteDesktopComponentsInstalled: async () => true,
       macosRemoteDesktopWorker: macosRuntimeOptions(sent, {
         disclosure: true,
         accessibility: true,
@@ -240,6 +241,56 @@ describe('macOS controlled-node remote-desktop runtime', () => {
     socket.emit('message', JSON.stringify(prepare));
     await vi.waitFor(() => expect(sent).toEqual([prepare]));
     expect(JSON.stringify(sent)).not.toContain('CONTROLLED_NODE_SECRET');
+    runtime.stop();
+  });
+
+  it('never starts the previous release\'s components ahead of installing this one', async () => {
+    // Node m3: right after an upgrade the store still selected the previous
+    // release, the worker started from it before the new set was installed,
+    // and that old worker served the first session -- a fixed crash came back
+    // once per upgrade.
+    const socket = new MockSocket();
+    const createSocket = vi.fn(() => socket);
+    const options = macosRuntimeOptions([], { disclosure: true, accessibility: true });
+    let launchAgentStarts = 0;
+    const createSupervisor = options.createLaunchAgentSupervisor;
+    options.createLaunchAgentSupervisor = (dependencies) => {
+      const supervisor = createSupervisor(dependencies);
+      return {
+        ...supervisor,
+        start: async () => {
+          launchAgentStarts += 1;
+          return supervisor.start();
+        },
+      };
+    };
+    let installedForThisRelease = false;
+    const install = vi.fn(async () => {
+      installedForThisRelease = true;
+      return true;
+    });
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, createSocket, {
+      platform: 'darwin',
+      arch: 'arm64',
+      macosRemoteDesktopComponentsInstalled: async () => installedForThisRelease,
+      installMacosRemoteDesktopComponents: install,
+      macosRemoteDesktopWorker: options,
+    });
+
+    runtime.start();
+    await vi.waitFor(() => expect(createSocket).toHaveBeenCalledOnce());
+    expect(launchAgentStarts).toBe(0);
+
+    socket.open();
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(install).toHaveBeenCalledOnce());
+    // What was just installed is what starts.
+    await vi.waitFor(() => expect(launchAgentStarts).toBe(1));
     runtime.stop();
   });
 
