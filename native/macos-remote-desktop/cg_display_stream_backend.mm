@@ -323,6 +323,7 @@ class CgDisplayStreamBackend final : public ScreenCaptureKitBackend {
       }
       return false;
     }
+    EnsureWindowServerConnection();
     std::vector<CGDirectDisplayID> ids(max_displays);
     std::uint32_t count = 0;
     if (CGGetActiveDisplayList(max_displays, ids.data(), &count) != kCGErrorSuccess) {

@@ -15,6 +15,12 @@
 #include <utility>
 
 namespace imcodes::remote_desktop::macos {
+
+void EnsureWindowServerConnection() {
+  static std::once_flag once;
+  std::call_once(once, [] { (void)CGMainDisplayID(); });
+}
+
 namespace {
 
 // The ScreenCaptureKitLimits bounds moved to screen_capture_kit_limits.cc
@@ -34,6 +40,7 @@ bool IsMainDisplay(const ScreenCaptureKitBackendDisplay& display) {
 }
 
 common::DisplayRotation RotationForDisplay(CGDirectDisplayID display_id) {
+  EnsureWindowServerConnection();
   int degrees = static_cast<int>(std::lround(CGDisplayRotation(display_id)));
   degrees = ((degrees % 360) + 360) % 360;
   switch (degrees) {

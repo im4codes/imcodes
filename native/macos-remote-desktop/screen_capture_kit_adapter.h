@@ -13,6 +13,16 @@
 
 namespace imcodes::remote_desktop::macos {
 
+// Connects this process to the window server, once, before any display query.
+// On macOS 12 a process whose FIRST window-server call is a display-state
+// query (CGDisplayRotation) deadlocks inside SkyLight's lazy initialisation:
+// the query holds the display-state lock while initialising, and the
+// initialisation waits for that same lock. The worker's main thread hung there
+// on every connect to a macOS 12.7 Mac, never read the node's messages, and
+// every session ended worker_failed. CGMainDisplayID() initialises SkyLight
+// without holding that lock.
+void EnsureWindowServerConnection();
+
 enum class CaptureErrorCode : std::uint8_t {
   kNone,
   kPermissionDenied,
