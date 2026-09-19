@@ -155,6 +155,19 @@ function parseVerifiedPeer(
   });
 }
 
+/**
+ * Handing a socket to a child as a stdio descriptor leaves it in blocking mode
+ * -- and O_NONBLOCK belongs to the open file, which the node shares with the
+ * child. The node's next write to a worker that is not reading then blocks the
+ * whole event loop (heartbeats included) until the watchdog kills it; that is
+ * what froze pro.koca.win on every connect. The verifier only asks the kernel
+ * who the peer is, which does not care about the mode, so restore it at once.
+ */
+export function restoreNonBlocking(socket: Socket): void {
+  const handle = (socket as unknown as { _handle?: { setBlocking?: (blocking: boolean) => number } })._handle;
+  handle?.setBlocking?.(false);
+}
+
 async function verifyNativePeer(
   socket: Socket,
   options: MacosRemoteDesktopNativePeerVerifierOptions,
@@ -176,6 +189,7 @@ async function verifyNativePeer(
       env: {},
       stdio: ['ignore', 'pipe', 'pipe', socket],
     });
+    restoreNonBlocking(socket);
     let stdout = Buffer.alloc(0);
     let stderrBytes = 0;
     let settled = false;

@@ -279,9 +279,48 @@ describe.skipIf(process.platform !== 'darwin')('macOS native peer verifier bridg
     }
   });
 
-  it('does not depend on private net.Socket handle fields', async () => {
+  it('hands the socket over as documented child stdio, never by reading its descriptor', async () => {
     const source = await readFile(resolve('src/node/macos-remote-desktop-peer-verifier.ts'), 'utf8');
-    expect(source).not.toContain('_handle');
+    expect(source).not.toMatch(/_handle\??\.fd/);
     expect(source).toContain("stdio: ['ignore', 'pipe', 'pipe', socket]");
   });
+
+  it('leaves the verified socket non-blocking, so a worker that is not reading cannot freeze the node', async () => {
+    // Handing a socket to a child as stdio leaves the shared open file in
+    // blocking mode; the node's next write to a worker that was not reading
+    // then blocked its event loop until the watchdog killed it (pro.koca.win,
+    // on every connect). Run in a child so a regression fails, not hangs.
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-peer-verifier-'));
+    tempRoots.push(root);
+    const helper = await fixtureHelper(root);
+    const probe = join(root, 'probe.mts');
+    await writeFile(probe, `
+import net from 'node:net';
+import { join } from 'node:path';
+import { createMacosRemoteDesktopNativePeerVerificationSeams } from ${JSON.stringify(resolve('src/node/macos-remote-desktop-peer-verifier.ts'))};
+const path = join(${JSON.stringify(root)}, 'probe.sock');
+const server = net.createServer(async (socket) => {
+  const seams = createMacosRemoteDesktopNativePeerVerificationSeams({
+    executablePath: ${JSON.stringify(helper.executable)},
+    expectedUid: process.getuid(),
+    expectedCodeIdentity: ${JSON.stringify(EXPECTED)},
+  });
+  await seams.verifyPeerCodeIdentity(socket, ${JSON.stringify(EXPECTED)});
+  const chunk = 'x'.repeat(64 * 1024);
+  // Far more than any socket buffer holds; the peer never reads.
+  for (let i = 0; i < 200; i += 1) socket.write(chunk);
+  setImmediate(() => { process.stdout.write('alive'); process.exit(0); });
+});
+server.listen(path, () => { net.createConnection({ path }).on('error', () => undefined); });
+`, 'utf8');
+    const { spawn } = await import('node:child_process');
+    const child = spawn(process.execPath, ['--import', 'tsx', probe], { stdio: ['ignore', 'pipe', 'inherit'] });
+    let output = '';
+    child.stdout.on('data', (data: Buffer) => { output += data.toString('utf8'); });
+    const timer = setTimeout(() => child.kill('SIGKILL'), 15_000);
+    const [code] = await once(child, 'exit');
+    clearTimeout(timer);
+    expect(output).toBe('alive');
+    expect(code).toBe(0);
+  }, 30_000);
 });
