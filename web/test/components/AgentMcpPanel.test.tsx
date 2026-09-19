@@ -12,7 +12,10 @@ const SERVERS = [
   { id: 'linux', name: 'vm-211', status: 'online', lastHeartbeatAt: NOW },
 ];
 const LIST = {
-  servers: [{ name: 'github', transport: 'http', url: 'https://api.githubcopilot.com/mcp/', envNames: [], headerNames: ['Authorization'], agents: ['claude-code', 'codex'] }],
+  servers: [
+    { name: 'github', transport: 'http', url: 'https://api.githubcopilot.com/mcp/', envNames: [], headerNames: ['Authorization'], agents: ['claude-code', 'codex'] },
+    { name: 'imcodes-memory', transport: 'stdio', command: 'imcodes', envNames: [], headerNames: [], agents: ['cursor'] },
+  ],
   agents: [{ agent: 'claude-code', displayName: 'Claude Code' }, { agent: 'codex', displayName: 'Codex' }],
 };
 
@@ -144,5 +147,13 @@ describe('AgentMcpPanel', () => {
     await waitFor(() => expect(runAgentMcp).toHaveBeenCalledWith('mac', {
       action: 'add', server: { name: 'local-tool', transport: 'stdio', command: 'npx', args: ['-y', 'some-mcp'] },
     }));
+  });
+
+  it('shows IM.codes\' own server as built in, with nothing to remove', async () => {
+    render(h(AgentMcpPanel, { serverId: 'mac' }));
+    const card = [...(await screen.findByTestId('agent-mcp-inventory')).querySelectorAll('article')]
+      .find((article) => article.textContent?.includes('imcodes-memory'))!;
+    expect(card.textContent).toContain(`${KEY}.builtIn`);
+    expect(card.querySelector('button')).toBeNull();
   });
 });

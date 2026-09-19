@@ -228,7 +228,8 @@ export const AGENT_MCP_REGISTRY = {
   SEARCH_URL: 'https://registry.modelcontextprotocol.io/v0/servers',
   SEARCH_LIMIT: 20,
   QUERY_CHARS: 100,
-  TIMEOUT_MS: 5_000,
+  // Answers from far away (the server may sit in China) take up to ~3 s.
+  TIMEOUT_MS: 10_000,
 } as const;
 
 export const AGENT_MCP_REGISTRY_ERROR = {

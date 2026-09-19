@@ -3124,7 +3124,8 @@
           "forbidden": "マシンの MCP サーバーを管理できるのは所有者だけです。",
           "not_found": "このマシンではエージェントを実行できません。",
           "generic": "問題が発生しました。"
-        }
+        },
+        "builtIn": "IM.codes に組み込み"
       }
     },
     "diagnostics": {

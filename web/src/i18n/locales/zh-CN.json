@@ -3125,7 +3125,8 @@
           "forbidden": "只有机器的所有者才能管理它的 MCP 服务。",
           "not_found": "这台机器不能运行 agent。",
           "generic": "出错了。"
-        }
+        },
+        "builtIn": "IM.codes 内置"
       }
     },
     "diagnostics": {

@@ -5,6 +5,7 @@ import {
   AGENT_MCP_ERROR,
   AGENT_MCP_REGISTRY,
   AGENT_MCP_TRANSPORT,
+  isReservedAgentMcpName,
   readAgentMcpServerSpec,
   type AgentMcpList,
   type AgentMcpRegistryInput,
@@ -244,14 +245,19 @@ export function AgentMcpPanel({ serverId }: Props) {
                   <span class="capability-kind">{t(`sharedContext.management.agentMcp.transports.${server.transport}`)}</span>
                   <h3>{server.name}</h3>
                 </div>
-                <button
-                  class="capability-button capability-button-danger"
-                  type="button"
-                  disabled={busy !== null}
-                  onClick={() => remove(server)}
-                >
-                  {busy === `remove:${server.name}` ? t('capabilities.working') : t('sharedContext.management.agentMcp.remove')}
-                </button>
+                {isReservedAgentMcpName(server.name) ? (
+                  // IM.codes' own server: the daemon writes it and would refuse to remove it.
+                  <span class="capability-muted">{t('sharedContext.management.agentMcp.builtIn')}</span>
+                ) : (
+                  <button
+                    class="capability-button capability-button-danger"
+                    type="button"
+                    disabled={busy !== null}
+                    onClick={() => remove(server)}
+                  >
+                    {busy === `remove:${server.name}` ? t('capabilities.working') : t('sharedContext.management.agentMcp.remove')}
+                  </button>
+                )}
               </header>
               <dl class="capability-facts">
                 {server.url ? <><dt>{t('sharedContext.management.agentMcp.url')}</dt><dd>{server.url}</dd></> : null}

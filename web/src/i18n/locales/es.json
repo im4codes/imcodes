@@ -3125,7 +3125,8 @@
           "forbidden": "Solo el propietario de la máquina puede gestionar sus servidores MCP.",
           "not_found": "Esta máquina no puede ejecutar agentes.",
           "generic": "Algo salió mal."
-        }
+        },
+        "builtIn": "Integrado en IM.codes"
       }
     },
     "diagnostics": {

@@ -3125,7 +3125,8 @@
           "forbidden": "Only the machine's owner can manage its MCP servers.",
           "not_found": "This machine can't run agents.",
           "generic": "Something went wrong."
-        }
+        },
+        "builtIn": "Built into IM.codes"
       }
     },
     "diagnostics": {

@@ -99,7 +99,8 @@ export const AGENT_SKILLS_DIRECTORY = {
   SEARCH_LIMIT: 20,
   QUERY_CHARS: 100,
   AUDIT_SKILLS: 50,
-  TIMEOUT_MS: 5_000,
+  // Answers from far away (the server may sit in China) take up to ~3 s.
+  TIMEOUT_MS: 10_000,
 } as const;
 
 export const AGENT_SKILLS_DIRECTORY_ERROR = {
