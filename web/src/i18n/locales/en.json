@@ -3051,6 +3051,26 @@
           "forbidden": "Only the machine's owner can manage its skills.",
           "not_found": "This machine can't run skills.",
           "generic": "Something went wrong."
+        },
+        "searchLabel": "Search skills.sh",
+        "searchPlaceholder": "Search skills on skills.sh, e.g. pdf",
+        "search": "Search",
+        "searching": "Searching…",
+        "searchEmpty": "No skills found.",
+        "directoryUnavailable": "skills.sh is unavailable right now. You can still install by source below.",
+        "installs": "{{count}} installs",
+        "installSelected": "Install {{name}} on {{count}} machine(s)",
+        "auditTitle": "Security audits on skills.sh",
+        "auditNone": "No audit results for this skill yet.",
+        "missingBins": "Needs a command this machine does not have: {{bins}}",
+        "installBySource": "Install from a source (owner/repo or https://…)",
+        "risk": {
+          "safe": "Safe",
+          "low": "Low risk",
+          "medium": "Medium risk",
+          "high": "High risk",
+          "critical": "Critical",
+          "unknown": "Unknown"
         }
       }
     },

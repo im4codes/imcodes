@@ -3050,6 +3050,26 @@
           "forbidden": "머신 소유자만 스킬을 관리할 수 있습니다.",
           "not_found": "이 머신에서는 스킬을 실행할 수 없습니다.",
           "generic": "문제가 발생했습니다."
+        },
+        "searchLabel": "skills.sh 검색",
+        "searchPlaceholder": "skills.sh에서 스킬 검색 (예: pdf)",
+        "search": "검색",
+        "searching": "검색 중…",
+        "searchEmpty": "스킬을 찾지 못했습니다.",
+        "directoryUnavailable": "지금은 skills.sh를 사용할 수 없습니다. 아래에서 출처로 설치할 수는 있습니다.",
+        "installs": "설치 {{count}}회",
+        "installSelected": "{{name}}을(를) 머신 {{count}}대에 설치",
+        "auditTitle": "skills.sh 보안 감사",
+        "auditNone": "이 스킬의 감사 결과가 아직 없습니다.",
+        "missingBins": "이 머신에 없는 필요한 명령: {{bins}}",
+        "installBySource": "출처로 설치 (owner/repo 또는 https://…)",
+        "risk": {
+          "safe": "안전",
+          "low": "낮은 위험",
+          "medium": "중간 위험",
+          "high": "높은 위험",
+          "critical": "심각",
+          "unknown": "알 수 없음"
         }
       }
     },

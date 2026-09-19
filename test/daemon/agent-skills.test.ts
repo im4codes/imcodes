@@ -13,6 +13,7 @@ import {
   agentSkillsCliArguments,
   createAgentSkillsRunner,
   handleAgentSkillsCommand,
+  hasCommand,
   listAgentSkills,
 } from '../../src/daemon/agent-skills.js';
 
@@ -79,6 +80,35 @@ describe('listAgentSkills', () => {
   });
 });
 
+describe('required commands', () => {
+  it('flags a skill whose declared command is not on this machine', async () => {
+    const root = await home();
+    const bin = join(root, 'bin');
+    await mkdir(bin, { recursive: true });
+    await writeFile(join(bin, 'present-cli'), '#!/bin/sh\n', { mode: 0o755 });
+    await skill(root, 'wecom-like', 'description: needs a cli\nmetadata:\n  requires:\n    bins: ["absent-cli"]');
+    await skill(root, 'claw-like', 'description: claw\nmetadata:\n  openclaw:\n    requires:\n      bins: [present-cli, "also-absent"]');
+    await skill(root, 'satisfied', 'description: ok\nmetadata:\n  requires:\n    bins: ["present-cli"]');
+    const previous = process.env.PATH;
+    process.env.PATH = bin;
+    try {
+      const byName = Object.fromEntries((await listAgentSkills(root)).map((entry) => [entry.name, entry]));
+      expect(byName['wecom-like']?.missingBins).toEqual(['absent-cli']);
+      expect(byName['claw-like']?.missingBins).toEqual(['also-absent']);
+      expect(byName.satisfied?.missingBins).toBeUndefined();
+    } finally {
+      process.env.PATH = previous;
+    }
+  });
+
+  it('finds a Windows command through PATHEXT', async () => {
+    const root = await home();
+    await writeFile(join(root, 'wecom-cli.CMD'), '@echo off\r\n');
+    expect(await hasCommand('wecom-cli', { PATH: root, PATHEXT: '.EXE;.CMD' }, 'win32')).toBe(true);
+    expect(await hasCommand('wecom-cli', { PATH: root, PATHEXT: '.EXE' }, 'win32')).toBe(false);
+  });
+});
+
 describe('agent skill requests', () => {
   it('accepts GitHub shorthand and https sources, and nothing that could be an option or a path', () => {
     for (const ok of ['WeComTeam/wecom-cli', 'vercel-labs/agent-skills/skills/foo', 'owner/repo@v1.2', 'https://github.com/owner/repo']) {
@@ -92,6 +122,11 @@ describe('agent skill requests', () => {
   it('builds the one global, non-interactive CLI call each action needs', () => {
     expect(agentSkillsCliArguments({ action: AGENT_SKILLS_ACTION.ADD, source: 'WeComTeam/wecom-cli' }))
       .toEqual(['add', 'WeComTeam/wecom-cli', '--global', '--yes']);
+    // A directory result names one skill of a repository: install only that.
+    expect(agentSkillsCliArguments({ action: AGENT_SKILLS_ACTION.ADD, source: 'anthropics/skills', names: ['pdf'] }))
+      .toEqual(['add', 'anthropics/skills', '--skill', 'pdf', '--global', '--yes']);
+    expect(readAgentSkillsRunRequest({ action: 'add', source: 'anthropics/skills', names: ['pdf'] }))
+      .toEqual({ action: 'add', source: 'anthropics/skills', names: ['pdf'] });
     expect(agentSkillsCliArguments({ action: AGENT_SKILLS_ACTION.UPDATE }))
       .toEqual(['update', '--global', '--yes']);
     expect(agentSkillsCliArguments({ action: AGENT_SKILLS_ACTION.REMOVE, names: ['wecomcli-doc'] }))

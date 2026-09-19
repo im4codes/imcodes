@@ -71,6 +71,53 @@ export interface AgentSkillEntry {
   sourceUrl?: string;
   installedAt?: string;
   updatedAt?: string;
+  /**
+   * Commands the skill declares it needs (`metadata.requires.bins`, or
+   * OpenClaw's `metadata.openclaw.requires.bins`) that this machine's PATH does
+   * not have: installed, the skill would load but could not work.
+   */
+  missingBins?: string[];
+}
+
+/** A command name a skill may require; anything else is ignored. */
+export function isAgentSkillBinName(value: unknown): value is string {
+  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/u.test(value);
+}
+
+/**
+ * The skills.sh directory, reached through the IM.codes server: search, and
+ * the security audits skills.sh runs on every skill. Both are the endpoints the
+ * `skills` CLI itself calls; they are undocumented, so a failure is reported as
+ * the directory being unavailable and installing by source keeps working.
+ */
+export const AGENT_SKILLS_DIRECTORY = {
+  SEARCH_URL: 'https://skills.sh/api/search',
+  AUDIT_URL: 'https://add-skill.vercel.sh/audit',
+  PAGE_URL: 'https://skills.sh',
+  SEARCH_LIMIT: 20,
+  QUERY_CHARS: 100,
+  AUDIT_SKILLS: 50,
+  TIMEOUT_MS: 5_000,
+} as const;
+
+export const AGENT_SKILLS_DIRECTORY_ERROR = {
+  UNAVAILABLE: 'directory_unavailable',
+} as const;
+
+export interface AgentSkillSearchResult {
+  /** The skill's name inside its repository. */
+  name: string;
+  /** owner/repo -- what `skills add` installs from. */
+  source: string;
+  installs: number;
+}
+
+/** One auditor's verdict on one skill, as skills.sh reports it. */
+export interface AgentSkillAuditVerdict {
+  auditor: string;
+  risk: string;
+  score?: number;
+  analyzedAt?: string;
 }
 
 export interface AgentSkillsListResponse {
@@ -85,7 +132,7 @@ export interface AgentSkillsRunRequest {
   action: AgentSkillsAction;
   /** For add: a GitHub shorthand (owner/repo[/path]) or an https URL. */
   source?: string;
-  /** For remove, and optionally update: skill directory names. */
+  /** For remove; optionally for update, and for add to install only these skills of the source. */
   names?: string[];
 }
 
@@ -130,6 +177,11 @@ export function isAgentSkillSource(value: unknown): value is string {
   }
 }
 
+/** Exactly a GitHub `owner/repo`: what the skills.sh directory names a source by. */
+export function isAgentSkillRepository(value: unknown): value is string {
+  return isAgentSkillSource(value) && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(value);
+}
+
 export function isAgentSkillsAction(value: unknown): value is AgentSkillsAction {
   return Object.values(AGENT_SKILLS_ACTION).includes(value as AgentSkillsAction);
 }
@@ -145,7 +197,10 @@ export function readAgentSkillsRunRequest(value: unknown): Omit<AgentSkillsRunRe
     return null;
   }
   if (record.action === AGENT_SKILLS_ACTION.ADD) {
-    return isAgentSkillSource(record.source) ? { action: record.action, source: record.source } : null;
+    // With names, only those skills of the source; without, all of them.
+    return isAgentSkillSource(record.source)
+      ? { action: record.action, source: record.source, ...(names && names.length > 0 ? { names: names as string[] } : {}) }
+      : null;
   }
   if (record.source !== undefined) return null;
   if (record.action === AGENT_SKILLS_ACTION.REMOVE && (!names || names.length === 0)) return null;

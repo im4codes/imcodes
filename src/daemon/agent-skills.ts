@@ -1,7 +1,8 @@
 import { spawn } from 'node:child_process';
-import { readFile, readdir, stat } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { access, readFile, readdir, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { parseDocument } from 'yaml';
 import {
   AGENT_SKILL_FILE_NAME,
@@ -12,6 +13,7 @@ import {
   AGENT_SKILLS_LIMITS,
   AGENT_SKILLS_LOCK_FILE_SEGMENTS,
   AGENT_SKILLS_MSG,
+  isAgentSkillBinName,
   isAgentSkillName,
   readAgentSkillsRunRequest,
   type AgentSkillEntry,
@@ -28,25 +30,69 @@ function firstString(record: Record<string, unknown>, key: string, max: number):
   return typeof value === 'string' && value.trim() ? value.trim().slice(0, max) : undefined;
 }
 
+function stringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter(isAgentSkillBinName) : [];
+}
+
+/** `requires.bins` under `metadata`, or under OpenClaw's `metadata.openclaw`. */
+function requiredBins(frontMatter: Record<string, unknown>): string[] {
+  const metadata = frontMatter.metadata;
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return [];
+  const record = metadata as Record<string, unknown>;
+  const openclaw = record.openclaw && typeof record.openclaw === 'object' ? record.openclaw as Record<string, unknown> : {};
+  const requires = (candidate: unknown) => (candidate && typeof candidate === 'object'
+    ? stringList((candidate as Record<string, unknown>).bins)
+    : []);
+  return [...new Set([...requires(record.requires), ...requires(openclaw.requires)])];
+}
+
 /**
- * The skill's description from its SKILL.md frontmatter. Third-party skills
- * carry keys of their own, so only `description` is read and nothing else about
- * the file is judged here: the agents that load it decide what it means.
+ * The description and required commands from a SKILL.md frontmatter.
+ * Third-party skills carry keys of their own, so only these are read and
+ * nothing else about the file is judged here: the agents that load it decide
+ * what it means.
  */
-async function readDescription(skillDirectory: string): Promise<string> {
+async function readFrontMatter(skillDirectory: string): Promise<{ description: string; bins: string[] }> {
+  const none = { description: '', bins: [] };
   try {
     const path = join(skillDirectory, AGENT_SKILL_FILE_NAME);
     const facts = await stat(path);
-    if (!facts.isFile() || facts.size > MAX_SKILL_FILE_BYTES) return '';
+    if (!facts.isFile() || facts.size > MAX_SKILL_FILE_BYTES) return none;
     const text = await readFile(path, 'utf8');
     const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/u);
-    if (!match) return '';
+    if (!match) return none;
     const value = parseDocument(match[1], { prettyErrors: false }).toJS({ maxAliasCount: 0 }) as unknown;
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return '';
-    return firstString(value as Record<string, unknown>, 'description', AGENT_SKILLS_LIMITS.DESCRIPTION_CHARS) ?? '';
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return none;
+    const record = value as Record<string, unknown>;
+    return {
+      description: firstString(record, 'description', AGENT_SKILLS_LIMITS.DESCRIPTION_CHARS) ?? '',
+      bins: requiredBins(record),
+    };
   } catch {
-    return '';
+    return none;
   }
+}
+
+/** Whether `name` is a command on this daemon's PATH (PATHEXT on Windows). */
+export async function hasCommand(
+  name: string,
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): Promise<boolean> {
+  const extensions = platform === 'win32'
+    ? ['', ...(env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').filter(Boolean)]
+    : [''];
+  for (const directory of (env.PATH ?? env.Path ?? '').split(delimiter).filter(Boolean)) {
+    for (const extension of extensions) {
+      try {
+        await access(join(directory, `${name}${extension}`), platform === 'win32' ? constants.F_OK : constants.X_OK);
+        return true;
+      } catch {
+        // not here
+      }
+    }
+  }
+  return false;
 }
 
 async function readLock(homeDir: string): Promise<Record<string, Record<string, unknown>>> {
@@ -86,9 +132,15 @@ export async function listAgentSkills(homeDir: string = homedir()): Promise<Agen
       continue;
     }
     const locked = lock[name] ?? {};
+    const frontMatter = await readFrontMatter(directory);
+    const missingBins: string[] = [];
+    for (const bin of frontMatter.bins) {
+      if (!(await hasCommand(bin))) missingBins.push(bin);
+    }
     skills.push({
       name,
-      description: await readDescription(directory),
+      description: frontMatter.description,
+      ...(missingBins.length > 0 ? { missingBins } : {}),
       ...(firstString(locked, 'source', AGENT_SKILLS_LIMITS.SOURCE_CHARS) ? { source: firstString(locked, 'source', AGENT_SKILLS_LIMITS.SOURCE_CHARS) } : {}),
       ...(firstString(locked, 'sourceUrl', AGENT_SKILLS_LIMITS.SOURCE_CHARS) ? { sourceUrl: firstString(locked, 'sourceUrl', AGENT_SKILLS_LIMITS.SOURCE_CHARS) } : {}),
       ...(firstString(locked, 'installedAt', 40) ? { installedAt: firstString(locked, 'installedAt', 40) } : {}),
@@ -105,7 +157,7 @@ export function agentSkillsCliArguments(request: Omit<AgentSkillsRunRequest, 'ty
     case AGENT_SKILLS_ACTION.ADD:
       // Global, every detected agent linked, no prompt: the one install the
       // person asked for, on this machine, for this machine's user.
-      return ['add', request.source!, '--global', '--yes'];
+      return ['add', request.source!, ...names.flatMap((name) => ['--skill', name]), '--global', '--yes'];
     case AGENT_SKILLS_ACTION.UPDATE:
       return ['update', ...names, '--global', '--yes'];
     case AGENT_SKILLS_ACTION.REMOVE:

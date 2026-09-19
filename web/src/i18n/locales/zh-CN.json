@@ -3051,6 +3051,26 @@
           "forbidden": "只有机器的所有者才能管理它的技能。",
           "not_found": "这台机器不能运行技能。",
           "generic": "出错了。"
+        },
+        "searchLabel": "搜索 skills.sh",
+        "searchPlaceholder": "在 skills.sh 搜索技能，比如 pdf",
+        "search": "搜索",
+        "searching": "搜索中…",
+        "searchEmpty": "没找到技能。",
+        "directoryUnavailable": "skills.sh 暂时不可用，仍可在下面按来源安装。",
+        "installs": "{{count}} 次安装",
+        "installSelected": "把 {{name}} 装到 {{count}} 台机器",
+        "auditTitle": "skills.sh 安全审计",
+        "auditNone": "这个技能暂无审计结果。",
+        "missingBins": "这台机器缺少所需命令：{{bins}}",
+        "installBySource": "按来源安装（owner/repo 或 https://…）",
+        "risk": {
+          "safe": "安全",
+          "low": "低风险",
+          "medium": "中风险",
+          "high": "高风险",
+          "critical": "严重",
+          "unknown": "未知"
         }
       }
     },

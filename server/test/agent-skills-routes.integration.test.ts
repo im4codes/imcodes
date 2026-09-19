@@ -4,7 +4,7 @@
  * reaches the daemon.
  */
 import { EventEmitter } from 'node:events';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
 import { buildApp } from '../src/index.js';
@@ -12,7 +12,13 @@ import { hashPassword, randomHex, sha256Hex, signJwt } from '../src/security/cry
 import { WsBridge } from '../src/ws/bridge.js';
 import type { Env } from '../src/env.js';
 import { COOKIE_CSRF, COOKIE_SESSION, HEADER_CSRF } from '../../shared/cookie-names.js';
-import { AGENT_SKILLS_ERROR, AGENT_SKILLS_MESSAGE_PREFIX, AGENT_SKILLS_MSG } from '../../shared/agent-skills.js';
+import {
+  AGENT_SKILLS_DIRECTORY,
+  AGENT_SKILLS_DIRECTORY_ERROR,
+  AGENT_SKILLS_ERROR,
+  AGENT_SKILLS_MESSAGE_PREFIX,
+  AGENT_SKILLS_MSG,
+} from '../../shared/agent-skills.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
 
 let db: Database;
@@ -169,4 +175,33 @@ describe('/api/agent-skills', () => {
     expect(res.status).toBe(409);
     expect(await res.json()).toEqual({ error: AGENT_SKILLS_ERROR.DAEMON_OFFLINE });
   });
+
+  it('searches and audits the skills.sh directory for a signed-in user only', async () => {
+    const app = buildApp(env());
+    expect((await app.request('/api/agent-skills/directory/search?q=wecom')).status).toBe(401);
+    expect((await app.request('/api/agent-skills/directory/search?q=', { headers: headers(stranger) })).status).toBe(400);
+    expect((await app.request('/api/agent-skills/directory/audit?source=--all&skills=x', { headers: headers(stranger) })).status).toBe(400);
+
+    const realFetch = globalThis.fetch;
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.startsWith(AGENT_SKILLS_DIRECTORY.SEARCH_URL)) {
+        return new Response(JSON.stringify({ skills: [{ skillId: 'wecomcli-doc', source: 'wecomteam/wecom-cli', installs: 3 }] }));
+      }
+      if (url.startsWith(AGENT_SKILLS_DIRECTORY.AUDIT_URL)) throw new Error('network down');
+      return realFetch(input, init);
+    }));
+    try {
+      const search = await app.request('/api/agent-skills/directory/search?q=wecom-route-test', { headers: headers(stranger) });
+      expect(search.status).toBe(200);
+      expect(await search.json()).toEqual({ results: [{ name: 'wecomcli-doc', source: 'wecomteam/wecom-cli', installs: 3 }] });
+
+      const audit = await app.request('/api/agent-skills/directory/audit?source=wecomteam/wecom-cli&skills=wecomcli-doc', { headers: headers(stranger) });
+      expect(audit.status).toBe(502);
+      expect(await audit.json()).toEqual({ error: AGENT_SKILLS_DIRECTORY_ERROR.UNAVAILABLE });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });
+

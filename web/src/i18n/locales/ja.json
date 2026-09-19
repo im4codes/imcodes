@@ -3050,6 +3050,26 @@
           "forbidden": "マシンのスキルを管理できるのは所有者だけです。",
           "not_found": "このマシンではスキルを実行できません。",
           "generic": "問題が発生しました。"
+        },
+        "searchLabel": "skills.sh を検索",
+        "searchPlaceholder": "skills.sh でスキルを検索（例: pdf）",
+        "search": "検索",
+        "searching": "検索中…",
+        "searchEmpty": "スキルが見つかりません。",
+        "directoryUnavailable": "skills.sh は現在利用できません。下の入手元からのインストールは引き続き使えます。",
+        "installs": "{{count}} 回インストール",
+        "installSelected": "{{name}} を {{count}} 台にインストール",
+        "auditTitle": "skills.sh のセキュリティ監査",
+        "auditNone": "このスキルの監査結果はまだありません。",
+        "missingBins": "このマシンにない必要なコマンド: {{bins}}",
+        "installBySource": "入手元からインストール（owner/repo または https://…）",
+        "risk": {
+          "safe": "安全",
+          "low": "低リスク",
+          "medium": "中リスク",
+          "high": "高リスク",
+          "critical": "重大",
+          "unknown": "不明"
         }
       }
     },

@@ -13,11 +13,16 @@ import type { Env } from '../env.js';
 import { requireAuth, resolveServerRole } from '../security/authorization.js';
 import { WsBridge } from '../ws/bridge.js';
 import {
+  AGENT_SKILLS_DIRECTORY,
+  AGENT_SKILLS_DIRECTORY_ERROR,
   AGENT_SKILLS_ERROR,
   AGENT_SKILLS_LIMITS,
   AGENT_SKILLS_MSG,
+  isAgentSkillName,
+  isAgentSkillRepository,
   readAgentSkillsRunRequest,
 } from '../../../shared/agent-skills.js';
+import { createAgentSkillsDirectory } from '../services/agent-skills-directory.js';
 import { NODE_ROLE } from '../../../shared/remote-exec.js';
 
 /** Listing reads a directory; a daemon that has not answered by now will not. */
@@ -81,5 +86,38 @@ agentSkillsRoutes.post('/agent-skills/run', requireAuth(), async (c) => {
     return c.json(result);
   } catch (err) {
     return c.json({ ok: false, error: failure(err) }, 409);
+  }
+});
+
+const directory = createAgentSkillsDirectory();
+
+/**
+ * Search the skills.sh directory. Not tied to a machine, so no serverId: any
+ * signed-in user may search; installing still goes through the owner-only run.
+ */
+agentSkillsRoutes.get('/agent-skills/directory/search', requireAuth(), async (c) => {
+  const query = c.req.query('q')?.trim() ?? '';
+  if (!query || query.length > AGENT_SKILLS_DIRECTORY.QUERY_CHARS) {
+    return c.json({ error: AGENT_SKILLS_ERROR.INVALID_REQUEST }, 400);
+  }
+  try {
+    return c.json({ results: await directory.search(query) });
+  } catch {
+    return c.json({ error: AGENT_SKILLS_DIRECTORY_ERROR.UNAVAILABLE }, 502);
+  }
+});
+
+/** skills.sh's security audits for named skills of one owner/repo. */
+agentSkillsRoutes.get('/agent-skills/directory/audit', requireAuth(), async (c) => {
+  const source = c.req.query('source')?.trim() ?? '';
+  const skills = (c.req.query('skills') ?? '').split(',').map((name) => name.trim()).filter(Boolean);
+  if (!isAgentSkillRepository(source)
+    || skills.length === 0 || skills.length > AGENT_SKILLS_DIRECTORY.AUDIT_SKILLS || !skills.every(isAgentSkillName)) {
+    return c.json({ error: AGENT_SKILLS_ERROR.INVALID_REQUEST }, 400);
+  }
+  try {
+    return c.json({ audits: await directory.audit(source, skills) });
+  } catch {
+    return c.json({ error: AGENT_SKILLS_DIRECTORY_ERROR.UNAVAILABLE }, 502);
   }
 });

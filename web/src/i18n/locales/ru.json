@@ -3050,6 +3050,26 @@
           "forbidden": "Управлять навыками машины может только её владелец.",
           "not_found": "Эта машина не может запускать навыки.",
           "generic": "Что-то пошло не так."
+        },
+        "searchLabel": "Поиск в skills.sh",
+        "searchPlaceholder": "Искать навыки в skills.sh, например pdf",
+        "search": "Найти",
+        "searching": "Поиск…",
+        "searchEmpty": "Навыки не найдены.",
+        "directoryUnavailable": "skills.sh сейчас недоступен. Установить по источнику ниже по-прежнему можно.",
+        "installs": "установок: {{count}}",
+        "installSelected": "Установить {{name}} на машин: {{count}}",
+        "auditTitle": "Проверки безопасности skills.sh",
+        "auditNone": "Для этого навыка пока нет проверок.",
+        "missingBins": "Нужна команда, которой нет на этой машине: {{bins}}",
+        "installBySource": "Установить из источника (owner/repo или https://…)",
+        "risk": {
+          "safe": "Безопасно",
+          "low": "Низкий риск",
+          "medium": "Средний риск",
+          "high": "Высокий риск",
+          "critical": "Критично",
+          "unknown": "Неизвестно"
         }
       }
     },

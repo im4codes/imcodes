@@ -3051,6 +3051,26 @@
           "forbidden": "Solo el propietario de la máquina puede gestionar sus skills.",
           "not_found": "Esta máquina no puede ejecutar skills.",
           "generic": "Algo salió mal."
+        },
+        "searchLabel": "Buscar en skills.sh",
+        "searchPlaceholder": "Busca skills en skills.sh, p. ej. pdf",
+        "search": "Buscar",
+        "searching": "Buscando…",
+        "searchEmpty": "No se encontraron skills.",
+        "directoryUnavailable": "skills.sh no está disponible ahora. Aún puedes instalar por origen abajo.",
+        "installs": "{{count}} instalaciones",
+        "installSelected": "Instalar {{name}} en {{count}} máquina(s)",
+        "auditTitle": "Auditorías de seguridad de skills.sh",
+        "auditNone": "Aún no hay auditorías de esta skill.",
+        "missingBins": "Necesita un comando que esta máquina no tiene: {{bins}}",
+        "installBySource": "Instalar desde un origen (owner/repo o https://…)",
+        "risk": {
+          "safe": "Seguro",
+          "low": "Riesgo bajo",
+          "medium": "Riesgo medio",
+          "high": "Riesgo alto",
+          "critical": "Crítico",
+          "unknown": "Desconocido"
         }
       }
     },

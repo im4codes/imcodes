@@ -1,7 +1,9 @@
 import { apiFetch, ApiError } from '../api.js';
 import {
   AGENT_SKILLS_ERROR,
+  type AgentSkillAuditVerdict,
   type AgentSkillEntry,
+  type AgentSkillSearchResult,
   type AgentSkillsAction,
   type AgentSkillsError,
 } from '@shared/agent-skills.js';
@@ -42,4 +44,24 @@ export async function runAgentSkills(
       error: error instanceof ApiError && error.code ? error.code : AGENT_SKILLS_ERROR.DAEMON_OFFLINE,
     };
   }
+}
+
+/** Search the skills.sh directory; throws when it is unavailable. */
+export async function searchAgentSkillsDirectory(query: string): Promise<AgentSkillSearchResult[]> {
+  const response = await apiFetch<{ results?: AgentSkillSearchResult[] }>(
+    `/api/agent-skills/directory/search?q=${encodeURIComponent(query)}`,
+  );
+  return Array.isArray(response.results) ? response.results : [];
+}
+
+/** skills.sh's audits of named skills of one owner/repo; throws when unavailable. */
+export async function auditAgentSkills(
+  source: string,
+  skills: string[],
+): Promise<Record<string, AgentSkillAuditVerdict[]>> {
+  const params = new URLSearchParams({ source, skills: skills.join(',') });
+  const response = await apiFetch<{ audits?: Record<string, AgentSkillAuditVerdict[]> }>(
+    `/api/agent-skills/directory/audit?${params.toString()}`,
+  );
+  return response.audits ?? {};
 }

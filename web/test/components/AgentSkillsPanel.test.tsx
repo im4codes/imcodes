@@ -14,8 +14,18 @@ const SERVERS = [
 ];
 
 const listAgentSkills = vi.fn(async (_serverId: string) => [
-  { name: 'wecomcli-doc', description: 'WeCom docs', source: 'WeComTeam/wecom-cli' },
+  { name: 'wecomcli-doc', description: 'WeCom docs', source: 'WeComTeam/wecom-cli', missingBins: ['wecom-cli'] },
 ]);
+const searchDirectory = vi.fn(async (_query: string) => [
+  { name: 'pdf', source: 'anthropics/skills', installs: 198154 },
+  { name: 'pdf', source: 'openai/skills', installs: 12547 },
+]);
+const auditSkills = vi.fn(async (_source: string, _skills: string[]) => ({
+  pdf: [
+    { auditor: 'socket', risk: 'safe', score: 90 },
+    { auditor: 'snyk', risk: 'medium' },
+  ],
+}));
 const runAgentSkills = vi.fn(async (serverId: string, _request: unknown) => (
   serverId === 'linux'
     ? { ok: false, error: 'cli_failed', output: 'git clone failed' }
@@ -29,6 +39,8 @@ vi.mock('../../src/api.js', async (importOriginal) => ({
 vi.mock('../../src/api/agent-skills.js', () => ({
   listAgentSkills: (serverId: string) => listAgentSkills(serverId),
   runAgentSkills: (serverId: string, request: unknown) => runAgentSkills(serverId, request),
+  searchAgentSkillsDirectory: (query: string) => searchDirectory(query),
+  auditAgentSkills: (source: string, skills: string[]) => auditSkills(source, skills),
 }));
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -41,6 +53,8 @@ const { AgentSkillsPanel } = await import('../../src/components/AgentSkillsPanel
 beforeEach(() => {
   listAgentSkills.mockClear();
   runAgentSkills.mockClear();
+  searchDirectory.mockClear();
+  auditSkills.mockClear();
 });
 afterEach(() => cleanup());
 
@@ -94,5 +108,48 @@ describe('AgentSkillsPanel', () => {
     await waitFor(() => expect(runAgentSkills).toHaveBeenCalledWith('mac', { action: 'remove', names: ['wecomcli-doc'] }));
     expect(confirm).toHaveBeenCalledTimes(1);
     confirm.mockRestore();
+  });
+
+  it('warns when a skill needs a command the machine does not have', async () => {
+    render(h(AgentSkillsPanel, { serverId: 'mac' }));
+    const warning = await screen.findByTestId('agent-skill-missing-wecomcli-doc');
+    expect(warning.textContent).toContain('"bins":"wecom-cli"');
+  });
+
+  it('searches skills.sh, shows the audits, and installs just that skill on the ticked machines', async () => {
+    render(h(AgentSkillsPanel, { serverId: 'mac' }));
+    await screen.findByText('wecomcli-doc');
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'vm-124' }));
+
+    fireEvent.input(screen.getByLabelText('sharedContext.management.agentSkills.searchLabel'), { target: { value: 'pdf' } });
+    fireEvent.click(screen.getByText('sharedContext.management.agentSkills.search'));
+    const found = await screen.findByTestId('agent-skills-search-results');
+    expect(searchDirectory).toHaveBeenCalledWith('pdf');
+    expect(found.textContent).toContain('anthropics/skills');
+
+    fireEvent.click(found.querySelector('button')!);
+    const verdicts = await screen.findByTestId('agent-skills-audit');
+    expect(auditSkills).toHaveBeenCalledWith('anthropics/skills', ['pdf']);
+    expect(verdicts.textContent).toContain('Socket');
+    expect(verdicts.textContent).toContain('sharedContext.management.agentSkills.risk.medium');
+
+    const selected = screen.getByTestId('agent-skills-selected');
+    fireEvent.click(selected.querySelector('button')!);
+    await waitFor(() => expect(runAgentSkills).toHaveBeenCalledTimes(2));
+    for (const machine of ['mac', 'linux']) {
+      expect(runAgentSkills).toHaveBeenCalledWith(machine, { action: 'add', source: 'anthropics/skills', names: ['pdf'] });
+    }
+  });
+
+  it('says skills.sh is unavailable instead of failing, and installing by source still works', async () => {
+    searchDirectory.mockRejectedValueOnce(new Error('502'));
+    render(h(AgentSkillsPanel, { serverId: 'mac' }));
+    await screen.findByText('wecomcli-doc');
+    fireEvent.input(screen.getByLabelText('sharedContext.management.agentSkills.searchLabel'), { target: { value: 'pdf' } });
+    fireEvent.click(screen.getByText('sharedContext.management.agentSkills.search'));
+    expect(await screen.findByText('sharedContext.management.agentSkills.directoryUnavailable')).toBeDefined();
+    fireEvent.input(screen.getByLabelText('sharedContext.management.agentSkills.sourceLabel'), { target: { value: 'owner/repo' } });
+    fireEvent.click(screen.getByText('sharedContext.management.agentSkills.install'));
+    await waitFor(() => expect(runAgentSkills).toHaveBeenCalledWith('mac', { action: 'add', source: 'owner/repo' }));
   });
 });

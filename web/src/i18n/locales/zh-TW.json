@@ -3051,6 +3051,26 @@
           "forbidden": "只有機器的擁有者才能管理它的技能。",
           "not_found": "這台機器不能執行技能。",
           "generic": "出錯了。"
+        },
+        "searchLabel": "搜尋 skills.sh",
+        "searchPlaceholder": "在 skills.sh 搜尋技能，例如 pdf",
+        "search": "搜尋",
+        "searching": "搜尋中…",
+        "searchEmpty": "找不到技能。",
+        "directoryUnavailable": "skills.sh 暫時無法使用，仍可在下面依來源安裝。",
+        "installs": "{{count}} 次安裝",
+        "installSelected": "把 {{name}} 裝到 {{count}} 台機器",
+        "auditTitle": "skills.sh 安全稽核",
+        "auditNone": "這個技能暫無稽核結果。",
+        "missingBins": "這台機器缺少所需指令：{{bins}}",
+        "installBySource": "依來源安裝（owner/repo 或 https://…）",
+        "risk": {
+          "safe": "安全",
+          "low": "低風險",
+          "medium": "中風險",
+          "high": "高風險",
+          "critical": "嚴重",
+          "unknown": "未知"
         }
       }
     },
