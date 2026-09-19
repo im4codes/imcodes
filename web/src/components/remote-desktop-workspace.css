@@ -4,6 +4,26 @@
   overflow: hidden;
 }
 
+.remote-desktop-workspace,
+.remote-desktop-workspace * {
+  /* Remote-desktop chrome is an interaction surface, not document text.
+     Apply this to each concrete control so iOS cannot select a machine name
+     or show its magnifier/Copy/Translate menu while the user is holding a
+     remote-input gesture below it. */
+  -webkit-touch-callout: none !important;
+  -webkit-user-select: none !important;
+  user-select: none !important;
+  -webkit-user-drag: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.remote-desktop-workspace input,
+.remote-desktop-workspace textarea,
+.remote-desktop-workspace select {
+  -webkit-user-select: text !important;
+  user-select: text !important;
+}
+
 .remote-desktop-workspace {
   display: flex;
   min-height: 0;

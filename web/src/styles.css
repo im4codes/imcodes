@@ -10221,6 +10221,19 @@ button.quick-agent-delegation-preset.active {
   min-height: 0;
 }
 
+.remote-desktop-panel,
+.remote-desktop-panel * {
+  /* Apply these properties to the concrete hit target too. iOS WebKit does
+     not reliably inherit the panel-level value through native buttons/video,
+     which allowed a held touch-ring to open the magnifying loupe and the
+     Copy/Translate selection UI despite the parent already saying `none`. */
+  -webkit-touch-callout: none !important;
+  -webkit-user-select: none !important;
+  user-select: none !important;
+  -webkit-user-drag: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
 .remote-desktop-panel {
   position: relative;
   width: 100%;
@@ -10229,9 +10242,6 @@ button.quick-agent-delegation-preset.active {
   /* A remote screen and its controls: the phone's own copy/paste/select
      popups and text-selection handles mean nothing anywhere in it. Fields that
      are typed into keep selection (below). */
-  -webkit-touch-callout: none;
-  -webkit-user-select: none;
-  user-select: none;
   display: grid;
   /* The 3rd row only ever gets a grid item (the docked mobile keyboard) while
      it is open; with no item placed there it collapses to 0 height, so the
@@ -10332,6 +10342,55 @@ button.quick-agent-delegation-preset.active {
   align-items: center;
   gap: 10px;
   margin-left: auto;
+}
+
+.remote-desktop-toolbar-shell {
+  position: relative;
+  min-width: 0;
+}
+
+.remote-desktop-toolbar[hidden] {
+  display: none;
+}
+
+/* With the phone keyboard open, a single shallow strip replaces the toolbar.
+   Expanding keeps the same button pinned at the top-right so the toolbar can
+   be folded again without hunting for a second control. */
+.remote-desktop-toolbar-toggle {
+  position: relative;
+  z-index: 10;
+  width: 100%;
+  min-height: 28px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  color: #9fe7ff;
+  background: rgb(8 25 40 / 96%);
+  border: 0;
+  border-bottom: 1px solid rgb(99 213 255 / 34%);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.remote-desktop-toolbar-shell.is-toolbar-expanded .remote-desktop-toolbar-toggle {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  width: 34px;
+  min-height: 28px;
+  border: 1px solid rgb(99 213 255 / 34%);
+  border-radius: 7px;
+  background: rgb(8 25 40 / 92%);
+}
+
+.remote-desktop-toolbar-shell.is-toolbar-expanded .remote-desktop-toolbar {
+  padding-right: 50px;
+}
+
+.remote-desktop-toolbar-toggle:focus-visible {
+  outline: 2px solid #6ee7ff;
+  outline-offset: -2px;
 }
 
 .remote-desktop-toolbar {
@@ -10758,12 +10817,32 @@ button.quick-agent-delegation-preset.active {
 }
 
 .remote-desktop-keyboard-trigger {
-  width: 44px;
-  padding-inline: 0 !important;
-  display: grid;
+  position: absolute;
+  z-index: 8;
+  right: 12px;
+  bottom: 12px;
+  width: 48px;
+  height: 48px;
+  padding: 0;
+  display: none;
   place-items: center;
-  font-size: 19px;
+  color: #eaffff;
+  background: linear-gradient(145deg, rgb(14 57 78 / 96%), rgb(5 27 42 / 96%));
+  border: 1px solid rgb(95 218 255 / 68%);
+  border-radius: 15px;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 42%), inset 0 1px 0 rgb(255 255 255 / 12%);
+  font-size: 21px;
   line-height: 1;
+  touch-action: manipulation;
+}
+
+.remote-desktop-keyboard-trigger:active {
+  color: #03111a;
+  background: #76dcff;
+}
+
+.remote-desktop-keyboard-trigger:disabled {
+  opacity: .45;
 }
 
 .remote-desktop-display-tabs {
@@ -11117,8 +11196,11 @@ button.quick-agent-delegation-preset.active {
 
 .remote-desktop-panel input,
 .remote-desktop-panel textarea {
-  -webkit-user-select: text;
-  user-select: text;
+  /* Keyboard/file fields still need a caret and range selection. Their
+     native long-press callout remains disabled by the rule above; explicit
+     copy/paste controls continue to own clipboard actions. */
+  -webkit-user-select: text !important;
+  user-select: text !important;
 }
 
 .remote-desktop-mobile-keyboard {
@@ -11548,6 +11630,11 @@ button.quick-agent-delegation-preset.active {
   background: transparent;
   box-shadow: 0 0 0 1px rgb(0 0 0 / 35%), 0 6px 18px rgb(0 0 0 / 40%);
   touch-action: none;
+  -webkit-touch-callout: none !important;
+  -webkit-user-select: none !important;
+  user-select: none !important;
+  -webkit-user-drag: none;
+  -webkit-tap-highlight-color: transparent;
   transition: background 120ms ease-out, border-color 120ms ease-out, scale 120ms ease-out;
 }
 
@@ -11560,28 +11647,6 @@ button.quick-agent-delegation-preset.active {
   background: transparent;
   border-color: #fff;
   box-shadow: 0 0 0 1px rgb(0 0 0 / 35%), 0 0 16px rgb(255 255 255 / 55%);
-}
-
-.remote-desktop-touch-right-button {
-  position: absolute;
-  z-index: 7;
-  right: 12px;
-  bottom: 12px;
-  display: none;
-  min-width: 52px;
-  min-height: 44px;
-  color: #eaffff;
-  background: linear-gradient(145deg, rgb(14 57 78 / 96%), rgb(5 27 42 / 96%));
-  border: 1px solid rgb(95 218 255 / 68%);
-  border-radius: 15px;
-  box-shadow: 0 8px 24px rgb(0 0 0 / 42%), inset 0 1px 0 rgb(255 255 255 / 12%);
-  font-weight: 800;
-  touch-action: none;
-}
-
-.remote-desktop-touch-right-button:active {
-  color: #03111a;
-  background: #76dcff;
 }
 
 .remote-desktop-stage-placeholder {
@@ -12606,8 +12671,7 @@ button.quick-agent-delegation-preset.active {
     margin-left: 0;
   }
 
-  /* The keyboard segment is a glyph, so it must not stretch like a worded one. */
-  .remote-desktop-toolbar .remote-desktop-keyboard-trigger,
+  /* The quality trigger is a compact glyph beside the worded toolbar groups. */
   .remote-desktop-toolbar .remote-desktop-quality-trigger {
     flex: 0 0 auto;
   }
@@ -12620,6 +12684,10 @@ button.quick-agent-delegation-preset.active {
 
   .remote-desktop-mobile-input-switch {
     display: flex;
+  }
+
+  .remote-desktop-keyboard-trigger:not([hidden]) {
+    display: grid;
   }
 
   .remote-desktop-stage {
@@ -12722,11 +12790,11 @@ button.quick-agent-delegation-preset.active {
     display: flex;
   }
 
-  .remote-desktop-touch-hint {
-    display: block;
+  .remote-desktop-keyboard-trigger:not([hidden]) {
+    display: grid;
   }
 
-  .remote-desktop-touch-right-button {
+  .remote-desktop-touch-hint {
     display: block;
   }
 

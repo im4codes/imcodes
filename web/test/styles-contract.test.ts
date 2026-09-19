@@ -479,16 +479,8 @@ describe('styles.css regression contracts', () => {
     expect(listRule).toMatch(/overflow-x:\s*hidden/);
   });
 
-  it('keeps the remote-desktop right-click helper touch-only', () => {
-    const desktopRule = css.match(/\.remote-desktop-touch-right-button\s*\{[^}]*\}/)?.[0];
-    expect(desktopRule).toBeTruthy();
-    expect(desktopRule).toMatch(/display:\s*none/);
-
-    const coarsePointerRule = css.match(
-      /@media\s*\(pointer:\s*coarse\)\s*\{[\s\S]*?\.remote-desktop-touch-right-button\s*\{[^}]*\}/,
-    )?.[0];
-    expect(coarsePointerRule).toBeTruthy();
-    expect(coarsePointerRule).toMatch(/display:\s*block/);
+  it('does not reserve mobile screen space for a redundant right-click helper', () => {
+    expect(css).not.toMatch(/\.remote-desktop-touch-right-button/);
   });
 
   it('keeps the touch-mode ring and its cursor marker touch-only, unlike mouse mode\'s always-shown marker', () => {
@@ -1128,6 +1120,16 @@ describe('styles.css regression contracts', () => {
   // long-press meant to become a right-click showed the system callout
   // instead of ever reaching RemoteDesktopPanel's own gesture timer.
   it('suppresses iOS long-press callout on the remote-desktop touch surfaces', () => {
+    const panelTargetRule = css.match(
+      /\.remote-desktop-panel,\s*\.remote-desktop-panel \*\s*\{[^}]*\}/,
+    )?.[0];
+    expect(panelTargetRule, 'remote-desktop concrete-target suppression rule missing').toBeTruthy();
+    expect(panelTargetRule).toMatch(/-webkit-touch-callout:\s*none\s*!important/);
+    expect(panelTargetRule).toMatch(/-webkit-user-select:\s*none\s*!important/);
+    expect(panelTargetRule).toMatch(/user-select:\s*none\s*!important/);
+    expect(panelTargetRule).toMatch(/-webkit-user-drag:\s*none/);
+    expect(panelTargetRule).toMatch(/-webkit-tap-highlight-color:\s*transparent/);
+
     const stageRule = css.match(/\.remote-desktop-stage\s*\{[^}]*\}/)?.[0];
     expect(stageRule, '.remote-desktop-stage rule missing').toBeTruthy();
     expect(stageRule).toMatch(/-webkit-touch-callout:\s*none/);
@@ -1136,6 +1138,12 @@ describe('styles.css regression contracts', () => {
     expect(surfaceRule, '.remote-desktop-input-surface rule missing').toBeTruthy();
     expect(surfaceRule).toMatch(/-webkit-touch-callout:\s*none/);
     expect(surfaceRule).toMatch(/-webkit-user-select:\s*none/);
+
+    const ringRule = css.match(/\.remote-desktop-touch-ring\s*\{[^}]*\}/)?.[0];
+    expect(ringRule, '.remote-desktop-touch-ring rule missing').toBeTruthy();
+    expect(ringRule).toMatch(/-webkit-touch-callout:\s*none\s*!important/);
+    expect(ringRule).toMatch(/-webkit-user-select:\s*none\s*!important/);
+    expect(ringRule).toMatch(/-webkit-user-drag:\s*none/);
   });
 
   // Transport sessions zero the toolbar's left padding, and they are the only

@@ -544,6 +544,39 @@ describe('RemoteDesktopWorkspace', () => {
     expect(manager.stopAll).not.toHaveBeenCalled();
   });
 
+  it('keeps workspace chrome out of native long-press selection and context menus', () => {
+    let state = createRemoteDesktopWorkspaceState();
+    state = openRemoteDesktopWorkspaceHost(state, machine('a'));
+    const { manager } = setupManager();
+    const result = render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    const workspace = result.container.querySelector('.remote-desktop-workspace') as HTMLElement;
+    const tab = screen.getByRole('tab', { name: 'A' });
+    const contextMenu = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+    expect(tab.dispatchEvent(contextMenu)).toBe(false);
+    expect(contextMenu.defaultPrevented).toBe(true);
+    const dragStart = new Event('dragstart', { bubbles: true, cancelable: true });
+    expect(tab.dispatchEvent(dragStart)).toBe(false);
+    expect(dragStart.defaultPrevented).toBe(true);
+
+    const concreteTargetRule = workspaceCss.match(
+      /\.remote-desktop-workspace,\s*\.remote-desktop-workspace \*\s*\{[^}]*\}/,
+    )?.[0];
+    expect(concreteTargetRule).toBeTruthy();
+    expect(concreteTargetRule).toMatch(/-webkit-touch-callout:\s*none\s*!important/);
+    expect(concreteTargetRule).toMatch(/-webkit-user-select:\s*none\s*!important/);
+    expect(concreteTargetRule).toMatch(/-webkit-user-drag:\s*none/);
+    expect(concreteTargetRule).toMatch(/-webkit-tap-highlight-color:\s*transparent/);
+    expect(workspace).toBeTruthy();
+  });
+
   it('tears the active machine off into its own window, and only then drops the tab', () => {
     // The button had stopped rendering anywhere: it lived behind `!embedded`
     // inside the panel, and the workspace mounts every panel embedded.

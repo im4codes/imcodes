@@ -178,7 +178,16 @@ export function RemoteDesktopWorkspace({
   };
 
   const content = (
-    <div class="remote-desktop-workspace" ref={workspaceRef} data-active-tab={state.activeTabId}>
+    <div
+      class="remote-desktop-workspace"
+      ref={workspaceRef}
+      data-active-tab={state.activeTabId}
+      // Machine names and window chrome are controls, not selectable page
+      // text. This also fences the native Copy/Translate menu if a WebView
+      // emits contextmenu despite the CSS callout suppression.
+      onContextMenu={(event) => event.preventDefault()}
+      onDragStart={(event) => event.preventDefault()}
+    >
       <div class="remote-desktop-workspace-tabbar">
         <div role="tablist" aria-label={t('remote_desktop.workspace_tabs')}>
           {hosts.map(({ hostKey, machine }) => (

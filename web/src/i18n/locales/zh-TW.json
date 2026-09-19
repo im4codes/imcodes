@@ -3775,6 +3775,8 @@
     "capability": "能力版本：{{version}}",
     "mobile_keyboard": "手機鍵盤",
     "close_mobile_keyboard": "關閉手機鍵盤",
+    "expand_toolbar": "展開工具列",
+    "collapse_toolbar": "收起工具列",
     "mobile_text_input": "輸入到遠端電腦",
     "mobile_shortcuts": "常用快速鍵",
     "shortcut_select_all": "全選",

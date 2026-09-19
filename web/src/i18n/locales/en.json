@@ -3775,6 +3775,8 @@
     "capability": "Capability: {{version}}",
     "mobile_keyboard": "Mobile keyboard",
     "close_mobile_keyboard": "Close mobile keyboard",
+    "expand_toolbar": "Expand toolbar",
+    "collapse_toolbar": "Collapse toolbar",
     "mobile_text_input": "Type on the remote computer",
     "mobile_shortcuts": "Common shortcuts",
     "shortcut_select_all": "Select all",

@@ -3775,6 +3775,8 @@
     "capability": "Capacidad: {{version}}",
     "mobile_keyboard": "Teclado móvil",
     "close_mobile_keyboard": "Cerrar teclado móvil",
+    "expand_toolbar": "Expandir barra de herramientas",
+    "collapse_toolbar": "Contraer barra de herramientas",
     "mobile_text_input": "Escribir en el equipo remoto",
     "mobile_shortcuts": "Atajos frecuentes",
     "shortcut_select_all": "Seleccionar todo",

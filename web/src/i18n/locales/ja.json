@@ -3774,6 +3774,8 @@
     "capability": "機能バージョン: {{version}}",
     "mobile_keyboard": "モバイルキーボード",
     "close_mobile_keyboard": "モバイルキーボードを閉じる",
+    "expand_toolbar": "ツールバーを展開",
+    "collapse_toolbar": "ツールバーを折りたたむ",
     "mobile_text_input": "リモート PC に入力",
     "mobile_shortcuts": "よく使うショートカット",
     "shortcut_select_all": "すべて選択",

@@ -499,6 +499,7 @@ export function RemoteDesktopPanel({
   const [legacyFetchPath, setLegacyFetchPath] = useState('');
   const [fileDropActive, setFileDropActive] = useState(false);
   const [mobileTextOpen, setMobileTextOpen] = useState(false);
+  const [mobileToolbarExpanded, setMobileToolbarExpanded] = useState(false);
   const [mobileKeyboardTab, setMobileKeyboardTab] = useState<MobileKeyboardTab>('ime');
   const [comboMode, setComboMode] = useState(false);
   // Modifiers latched down in combo mode, waiting for either a second tap
@@ -1898,23 +1899,6 @@ export function RemoteDesktopPanel({
     }
   };
 
-  const onTouchRightButton = (event: PointerEvent, down: boolean) => {
-    event.preventDefault();
-    event.stopPropagation();
-    const point = lastTouchRemotePointRef.current;
-    if (down) {
-      if (!snapshot.inputEnabled || heldVirtualButtonsRef.current.has(event.pointerId)) return;
-      if (clientRef.current?.pointerButton('right', true, point.x, point.y)) {
-        heldVirtualButtonsRef.current.set(event.pointerId, 'right');
-        (event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId);
-      }
-      return;
-    }
-    if (heldVirtualButtonsRef.current.get(event.pointerId) !== 'right') return;
-    heldVirtualButtonsRef.current.delete(event.pointerId);
-    clientRef.current?.pointerButton('right', false, point.x, point.y);
-  };
-
   const changeZoom = (delta: number) => {
     const geometry = viewportGeometry();
     if (!geometry) return;
@@ -2565,6 +2549,7 @@ export function RemoteDesktopPanel({
 
   const openMobileKeyboard = () => {
     if (!snapshot.inputEnabled) return;
+    setMobileToolbarExpanded(false);
     setMobileKeyboardTab('ime');
     setComputerKeyboardPage(0);
     setMobileTextOpen(true);
@@ -2636,6 +2621,7 @@ export function RemoteDesktopPanel({
 
   const closeMobileKeyboard = () => {
     releaseHeldComboKeys();
+    setMobileToolbarExpanded(false);
     setMobileTextOpen(false);
   };
 
@@ -2919,6 +2905,13 @@ export function RemoteDesktopPanel({
         aria-modal="false"
         aria-label={t('remote_desktop.title', { machine: machine.displayName })}
         hidden={embedded && !active}
+        // Nothing rendered by the remote-desktop chrome is native document
+        // content. Keep WebKit/Chromium from turning a held finger into a
+        // selection, image drag, or Copy/Translate context menu. Custom
+        // display-tab and remote-input gestures stop propagation before this
+        // boundary and therefore keep their own behavior.
+        onContextMenu={(event) => event.preventDefault()}
+        onDragStart={(event) => event.preventDefault()}
         // The phone's keyboard overlays the page rather than resizing it
         // (iOS): end the panel at the keyboard's top edge, so the remote
         // screen is pushed up above it -- re-fitted into what stays visible --
@@ -2933,7 +2926,24 @@ export function RemoteDesktopPanel({
           }
           : undefined}
       >
-        <div class="remote-desktop-toolbar">
+        <div class={`remote-desktop-toolbar-shell${mobileTextOpen ? ' is-keyboard-open' : ''}${mobileToolbarExpanded ? ' is-toolbar-expanded' : ''}`}>
+          {mobileTextOpen && (
+            <button
+              type="button"
+              class="remote-desktop-toolbar-toggle"
+              aria-label={t(mobileToolbarExpanded
+                ? 'remote_desktop.collapse_toolbar'
+                : 'remote_desktop.expand_toolbar')}
+              aria-controls={`remote-desktop-toolbar-${machine.serverId}`}
+              aria-expanded={mobileToolbarExpanded}
+              onClick={() => setMobileToolbarExpanded((expanded) => !expanded)}
+            ><span aria-hidden="true">{mobileToolbarExpanded ? '⌃' : '⌄'}</span></button>
+          )}
+        <div
+          id={`remote-desktop-toolbar-${machine.serverId}`}
+          class="remote-desktop-toolbar"
+          hidden={mobileTextOpen && !mobileToolbarExpanded}
+        >
           <div class="remote-desktop-display-tabs" role="tablist" aria-label={t('remote_desktop.displays')}>
             {snapshot.displays.map((display) => (
               <button
@@ -3149,15 +3159,6 @@ export function RemoteDesktopPanel({
               aria-pressed={mobileInputMode === 'mouse'}
               onClick={() => setMobileInputMode('mouse')}
             >{t('remote_desktop.mouse_mode')}</button>
-            <button
-              type="button"
-              class="remote-desktop-keyboard-trigger"
-              aria-label={t('remote_desktop.mobile_keyboard')}
-              aria-expanded={mobileTextOpen}
-              aria-pressed={mobileTextOpen}
-              disabled={!snapshot.inputEnabled}
-              onClick={openMobileKeyboard}
-            ><span aria-hidden="true">⌨</span></button>
           </div>
           {snapshot.signInScreen && (
             <button
@@ -3241,6 +3242,7 @@ export function RemoteDesktopPanel({
               >×</button>
             </div>
           )}
+        </div>
         </div>
 
         {controlNotice && (
@@ -3478,9 +3480,23 @@ export function RemoteDesktopPanel({
                 type="button"
                 class={`remote-desktop-touch-ring ${touchRingArmed ? 'is-right' : ''}`.trim()}
                 aria-label={t('remote_desktop.touch_ring')}
+                draggable={false}
                 style={{
                   left: `${virtualMouse.x}px`,
                   top: `${virtualMouse.y + TOUCH_RING_OFFSET_Y_PX}px`,
+                }}
+                // iOS can still synthesize its magnifying loupe from a native
+                // TouchEvent even though the PointerEvent was prevented and
+                // touch-action is none. The ring never needs a browser-native
+                // click: its pointer handlers below own tap, drag and hold.
+                onTouchStart={(event) => event.preventDefault()}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                }}
+                onDragStart={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
                 }}
                 onPointerDown={beginTouchRing}
                 onPointerMove={onTouchRingMove}
@@ -3490,17 +3506,25 @@ export function RemoteDesktopPanel({
               />
             </>
           )}
-          {mobileInputMode === 'touch' && snapshot.inputEnabled && (
-            <button
-              type="button"
-              class="remote-desktop-touch-right-button"
-              aria-label={t('remote_desktop.touch_right_click')}
-              onPointerDown={(event) => onTouchRightButton(event, true)}
-              onPointerUp={(event) => onTouchRightButton(event, false)}
-              onPointerCancel={(event) => onTouchRightButton(event, false)}
-              onLostPointerCapture={(event) => onTouchRightButton(event, false)}
-            >{t('remote_desktop.mouse_right_short')}</button>
-          )}
+          <button
+            type="button"
+            class="remote-desktop-keyboard-trigger"
+            aria-label={t('remote_desktop.mobile_keyboard')}
+            aria-expanded={mobileTextOpen}
+            aria-pressed={mobileTextOpen}
+            disabled={!snapshot.inputEnabled}
+            hidden={mobileTextOpen}
+            onPointerDown={(event) => event.stopPropagation()}
+            onPointerMove={(event) => event.stopPropagation()}
+            onPointerUp={(event) => event.stopPropagation()}
+            onPointerCancel={(event) => event.stopPropagation()}
+            onKeyDown={(event) => event.stopPropagation()}
+            onKeyUp={(event) => event.stopPropagation()}
+            onClick={(event) => {
+              event.stopPropagation();
+              openMobileKeyboard();
+            }}
+          ><span aria-hidden="true">⌨</span></button>
           {!currentStreamPresented && (
             <div class="remote-desktop-stage-placeholder" role="status">
               {snapshot.state === REMOTE_DESKTOP_STATE.FAILED ? (

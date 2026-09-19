@@ -1477,8 +1477,22 @@ describe('RemoteDesktopPanel mobile gestures', () => {
   it('keeps the mobile IME focused and commits composed text once', async () => {
     const { container, getByRole } = await renderPanel();
     const keyboardButton = getByRole('button', { name: 'remote_desktop.mobile_keyboard' });
+    const stylesheet = readFileSync(
+      resolve(dirname(fileURLToPath(import.meta.url)), '../src/styles.css'),
+      'utf8',
+    );
     expect(keyboardButton.textContent).toBe('⌨');
+    expect(keyboardButton.closest('.remote-desktop-stage')).not.toBeNull();
+    expect(keyboardButton.closest('.remote-desktop-toolbar')).toBeNull();
+    expect(stylesheet).toMatch(/\.remote-desktop-keyboard-trigger\s*\{[^}]*position:\s*absolute[^}]*right:\s*12px[^}]*bottom:\s*12px[^}]*display:\s*none/);
+    expect(stylesheet).toMatch(/\.remote-desktop-keyboard-trigger:not\(\[hidden\]\)\s*\{[^}]*display:\s*grid/);
+
+    pointerButton.mockClear();
+    fireEvent.pointerDown(keyboardButton, { pointerId: 91, pointerType: 'touch' });
+    fireEvent.pointerUp(keyboardButton, { pointerId: 91, pointerType: 'touch' });
+    expect(pointerButton).not.toHaveBeenCalled();
     act(() => { (keyboardButton as HTMLButtonElement).click(); });
+    expect((keyboardButton as HTMLButtonElement).hidden).toBe(true);
 
     const input = getByRole('textbox', { name: 'remote_desktop.mobile_text_input' }) as HTMLTextAreaElement;
     // Focus/composition target only -- what is typed lands on the remote
@@ -1643,6 +1657,51 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     });
     expect((container.querySelector('.remote-desktop-touch-hint') as HTMLElement).hidden).toBe(false);
     expect((container.querySelector('.remote-desktop-footer') as HTMLElement).hidden).toBe(false);
+  });
+
+  it('auto-collapses the whole toolbar for the mobile keyboard and lets it be expanded and folded again', async () => {
+    const { container, getByRole, queryByRole } = await renderPanel();
+    const stylesheet = readFileSync(
+      resolve(dirname(fileURLToPath(import.meta.url)), '../src/styles.css'),
+      'utf8',
+    );
+    const toolbar = container.querySelector('.remote-desktop-toolbar') as HTMLElement;
+    const keyboardButton = getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement;
+    expect(toolbar.hidden).toBe(false);
+    expect(queryByRole('button', { name: 'remote_desktop.expand_toolbar' })).toBeNull();
+
+    act(() => keyboardButton.click());
+    expect(toolbar.hidden).toBe(true);
+    const expand = getByRole('button', { name: 'remote_desktop.expand_toolbar' });
+    expect(expand.getAttribute('aria-controls')).toBe(toolbar.id);
+    expect(expand.getAttribute('aria-expanded')).toBe('false');
+
+    act(() => (expand as HTMLButtonElement).click());
+    expect(toolbar.hidden).toBe(false);
+    const collapse = getByRole('button', { name: 'remote_desktop.collapse_toolbar' });
+    expect(collapse.getAttribute('aria-expanded')).toBe('true');
+
+    act(() => (collapse as HTMLButtonElement).click());
+    expect(toolbar.hidden).toBe(true);
+    const expandAgain = getByRole('button', { name: 'remote_desktop.expand_toolbar' });
+    act(() => (expandAgain as HTMLButtonElement).click());
+    expect(toolbar.hidden).toBe(false);
+
+    act(() => {
+      (getByRole('button', { name: 'remote_desktop.close_mobile_keyboard' }) as HTMLButtonElement).click();
+    });
+    expect(toolbar.hidden).toBe(false);
+    expect(queryByRole('button', { name: 'remote_desktop.expand_toolbar' })).toBeNull();
+    expect(queryByRole('button', { name: 'remote_desktop.collapse_toolbar' })).toBeNull();
+
+    // Every fresh keyboard opening starts compact, even if the toolbar was
+    // expanded during the previous keyboard session.
+    act(() => keyboardButton.click());
+    expect(toolbar.hidden).toBe(true);
+
+    expect(stylesheet).toMatch(/\.remote-desktop-toolbar\[hidden\]\s*\{[^}]*display:\s*none/);
+    expect(stylesheet).toMatch(/\.remote-desktop-toolbar-toggle\s*\{[^}]*width:\s*100%[^}]*min-height:\s*28px/);
+    expect(stylesheet).toMatch(/\.is-toolbar-expanded \.remote-desktop-toolbar-toggle\s*\{[^}]*position:\s*absolute/);
   });
 
   it('pushes the remote screen up above the OS keyboard instead of letting it cover it', async () => {
@@ -2118,6 +2177,36 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(pointerClick).toHaveBeenCalledWith('right', 0.5, 0.5);
     await act(async () => { await vi.advanceTimersByTimeAsync(500); });
     expect(ring.className).not.toContain('is-right');
+  });
+
+  it('suppresses every native long-press surface on the touch ring without losing its remote right-click', async () => {
+    vi.useFakeTimers();
+    const { stage, getByLabelText } = await renderPanel();
+    act(() => {
+      pointer(stage, 'pointerdown', { pointerId: 81, clientX: 200, clientY: 150 });
+      pointer(stage, 'pointerup', { pointerId: 81, clientX: 200, clientY: 150 });
+    });
+    const ring = getByLabelText('remote_desktop.touch_ring');
+
+    // A native TouchEvent is separate from PointerEvent on iOS. Cancelling it
+    // is what keeps the selection loupe from appearing over the custom ring.
+    const touchStart = new Event('touchstart', { bubbles: true, cancelable: true });
+    expect(ring.dispatchEvent(touchStart)).toBe(false);
+    expect(touchStart.defaultPrevented).toBe(true);
+
+    const contextMenu = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+    expect(ring.dispatchEvent(contextMenu)).toBe(false);
+    expect(contextMenu.defaultPrevented).toBe(true);
+    const dragStart = new Event('dragstart', { bubbles: true, cancelable: true });
+    expect(ring.dispatchEvent(dragStart)).toBe(false);
+    expect(dragStart.defaultPrevented).toBe(true);
+    expect(ring.getAttribute('draggable')).toBe('false');
+
+    pointerClick.mockClear();
+    act(() => { pointer(ring, 'pointerdown', { pointerId: 82, clientX: 200, clientY: 150 }); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(550); });
+    act(() => { pointer(ring, 'pointerup', { pointerId: 82, clientX: 200, clientY: 150 }); });
+    expect(pointerClick).toHaveBeenCalledWith('right', 0.5, 0.5);
   });
 
   it('holds the ring, then drags with the left button down for a remote drag', async () => {
@@ -2851,18 +2940,10 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(pointerButton).not.toHaveBeenCalled();
   });
 
-  it('offers a dedicated touch-mode right-click button at the last touch position', async () => {
-    const { stage, getByRole } = await renderPanel();
-    pointer(stage, 'pointerdown', { pointerId: 43, clientX: 300, clientY: 150 });
-    pointer(stage, 'pointerup', { pointerId: 43, clientX: 300, clientY: 150 });
-    pointerButton.mockClear();
-    const rightClick = getByRole('button', { name: 'remote_desktop.touch_right_click' });
-    pointer(rightClick, 'pointerdown', { pointerId: 44, clientX: 360, clientY: 260 });
-    pointer(rightClick, 'pointerup', { pointerId: 44, clientX: 360, clientY: 260 });
-    expect(pointerButton.mock.calls).toEqual([
-      ['right', true, 0.75, 0.5],
-      ['right', false, 0.75, 0.5],
-    ]);
+  it('does not show a redundant right-click button when the touch ring owns right-click', async () => {
+    const { getByRole, queryByRole } = await renderPanel();
+    expect(getByRole('button', { name: 'remote_desktop.touch_ring' })).toBeDefined();
+    expect(queryByRole('button', { name: 'remote_desktop.touch_right_click' })).toBeNull();
   });
 
   it('provides a readable auto-zoomed virtual mouse with buttons, wheel, and edge pan', async () => {

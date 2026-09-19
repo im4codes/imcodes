@@ -3774,6 +3774,8 @@
     "capability": "기능 버전: {{version}}",
     "mobile_keyboard": "모바일 키보드",
     "close_mobile_keyboard": "모바일 키보드 닫기",
+    "expand_toolbar": "도구 모음 펼치기",
+    "collapse_toolbar": "도구 모음 접기",
     "mobile_text_input": "원격 컴퓨터에 입력",
     "mobile_shortcuts": "자주 쓰는 단축키",
     "shortcut_select_all": "전체 선택",
