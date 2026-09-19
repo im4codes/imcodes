@@ -27,6 +27,12 @@ std::string DisplayId(common::WorkerGeneration generation,
          std::to_string(native_display_id);
 }
 
+// The main display is the origin of the global display space.
+bool IsMainDisplay(const ScreenCaptureKitBackendDisplay& display) {
+  return display.logical_input_bounds.x == 0.0 &&
+         display.logical_input_bounds.y == 0.0;
+}
+
 common::DisplayRotation RotationForDisplay(CGDirectDisplayID display_id) {
   int degrees = static_cast<int>(std::lround(CGDisplayRotation(display_id)));
   degrees = ((degrees % 360) + 360) % 360;
@@ -657,8 +663,15 @@ class ScreenCaptureKitAdapter::Impl {
       return std::nullopt;
     }
 
+    // The main display -- the one with the menu bar -- is the origin of the
+    // global display space. It goes first: a new session shows it, and the
+    // topology reports it as the primary display. Ordering by id alone made
+    // whichever display macOS numbered lowest the "primary" one.
     std::sort(backend_displays.begin(), backend_displays.end(),
               [](const auto& left, const auto& right) {
+                const bool left_main = IsMainDisplay(left);
+                const bool right_main = IsMainDisplay(right);
+                if (left_main != right_main) return left_main;
                 return left.native_display_id < right.native_display_id;
               });
     std::unordered_map<std::string, ScreenCaptureKitBackendDisplay> next;

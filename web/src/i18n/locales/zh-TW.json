@@ -3594,6 +3594,8 @@
     "title": "aiDesk.to 遠端桌面 — {{machine}}",
     "stop": "停止",
     "displays": "顯示器",
+    "display_name": "螢幕 {{number}}",
+    "display_name_main": "螢幕 {{number}} · 主螢幕",
     "resolution_menu": "{{display}} 的解析度",
     "resolution_hint": "按右鍵或長按可切換解析度",
     "dpi_menu": "Windows DPI 縮放",

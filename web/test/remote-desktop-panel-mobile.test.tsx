@@ -1182,7 +1182,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       stream: null,
     }));
 
-    const displayTab = getByRole('tab', { name: 'Display 1' });
+    const displayTab = getByRole('tab', { name: 'remote_desktop.display_name_main' });
     const controlButton = getByRole('button', { name: 'remote_desktop.control_mode' });
     displayTab.focus();
     expect(document.activeElement).toBe(displayTab);
@@ -1193,7 +1193,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
 
   it('opens each display resolution menu by context gesture and switches a fixed 720p-4K mode', async () => {
     const { getByRole, getAllByRole } = await renderPanel();
-    const displayTab = getByRole('tab', { name: 'Display 1' });
+    const displayTab = getByRole('tab', { name: 'remote_desktop.display_name_main' });
     act(() => {
       displayTab.dispatchEvent(new MouseEvent('contextmenu', {
         bubbles: true,
@@ -1226,7 +1226,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     act(() => { (getByRole('menuitemradio', { name: '150% DPI' }) as HTMLButtonElement).click(); });
     expect(setDisplayScale).toHaveBeenCalledWith('display-primary', 150);
 
-    const secondDisplayTab = getByRole('tab', { name: 'Display 2' });
+    const secondDisplayTab = getByRole('tab', { name: 'remote_desktop.display_name' });
     act(() => {
       secondDisplayTab.dispatchEvent(new MouseEvent('contextmenu', {
         bubbles: true,
@@ -1755,7 +1755,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
 
   it('opens the focused display resolution menu from the keyboard context-menu gesture', async () => {
     const { getByRole } = await renderPanel();
-    const displayTab = getByRole('tab', { name: 'Display 1' });
+    const displayTab = getByRole('tab', { name: 'remote_desktop.display_name_main' });
     displayTab.focus();
     act(() => {
       displayTab.dispatchEvent(new KeyboardEvent('keydown', {
@@ -1772,7 +1772,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
   it('opens the same per-display resolution menu on a mobile long press without selecting the tab', async () => {
     vi.useFakeTimers();
     const { getByRole } = await renderPanel();
-    const displayTab = getByRole('tab', { name: 'Display 1' });
+    const displayTab = getByRole('tab', { name: 'remote_desktop.display_name_main' });
     act(() => {
       pointer(displayTab, 'pointerdown', { pointerId: 44, clientX: 80, clientY: 60 });
     });
@@ -1788,7 +1788,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
   it('does not leave a stale click suppression behind when a long press emits no click', async () => {
     vi.useFakeTimers();
     const { getByRole } = await renderPanel();
-    const displayTab = getByRole('tab', { name: 'Display 2' });
+    const displayTab = getByRole('tab', { name: 'remote_desktop.display_name' });
     act(() => {
       pointer(displayTab, 'pointerdown', { pointerId: 45, clientX: 100, clientY: 60 });
     });

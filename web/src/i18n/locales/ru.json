@@ -3593,6 +3593,8 @@
     "title": "Удалённый рабочий стол aiDesk.to — {{machine}}",
     "stop": "Остановить",
     "displays": "Мониторы",
+    "display_name": "Экран {{number}}",
+    "display_name_main": "Экран {{number}} · Основной",
     "resolution_menu": "Разрешение для {{display}}",
     "resolution_hint": "Щёлкните правой кнопкой или удерживайте, чтобы изменить разрешение",
     "dpi_menu": "Масштаб DPI Windows",

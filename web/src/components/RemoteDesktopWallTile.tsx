@@ -5,6 +5,7 @@ import { useTranslation } from 'react-i18next';
 import type { RemoteDesktopWallHost } from '../api/remote-desktop-wall.js';
 import type { RemoteDesktopSnapshot } from '../remote-desktop-client.js';
 import type { RemoteDesktopConnectionManager } from '../remote-desktop-connection-manager.js';
+import { remoteDesktopDisplayName } from '../remote-desktop-display-name.js';
 
 const INITIAL: RemoteDesktopSnapshot = {
   state: REMOTE_DESKTOP_STATE.AUTHORIZING,
@@ -199,7 +200,7 @@ export function RemoteDesktopWallTile({
               }}
             >
               <span aria-hidden="true">{snapshot.selectedDisplayId === display.id ? '●' : '○'}</span>
-              {display.label}
+              {remoteDesktopDisplayName(t, snapshot.displays, display)}
             </button>
           ))}
         </div>

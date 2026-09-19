@@ -143,7 +143,7 @@ describe('RemoteDesktopWallTile', () => {
     await screen.findByRole('menu', { name: 'remote_desktop.wall_manage:A' });
     expect(onRemove).not.toHaveBeenCalled();
     expect(screen.getByRole('menuitem', { name: 'remote_desktop.retry' })).toBeTruthy();
-    fireEvent.click(screen.getByRole('menuitemradio', { name: /Display 2/ }));
+    fireEvent.click(screen.getByRole('menuitemradio', { name: /remote_desktop\.display_name:2/ }));
     expect(selectDisplay).toHaveBeenCalledWith('two');
 
     fireEvent.contextMenu(screen.getByRole('button', { name: 'remote_desktop.wall_open_host:A' }), { clientX: 40, clientY: 50 });

@@ -222,6 +222,22 @@ bool TestReadinessAndTopology() {
                "display addition must advance topology revision");
 }
 
+bool TestMainDisplayIsListedFirst() {
+  // Node m3: two identical monitors. Whichever display macOS numbers lowest is
+  // not necessarily the one with the menu bar; the one at the origin of the
+  // global display space is.
+  auto backend = std::make_unique<FakeBackend>();
+  FakeBackend* fake = backend.get();
+  fake->displays = {Display(2, 960), Display(8, 0), Display(5, -960)};
+  capture::ScreenCaptureKitAdapter adapter(6, std::move(backend));
+  auto topology = adapter.EnumerateTopology();
+  return Check(topology.has_value() && topology->displays.size() == 3 &&
+                   topology->displays[0].display_id == "macos-display:6:8" &&
+                   topology->displays[1].display_id == "macos-display:6:2" &&
+                   topology->displays[2].display_id == "macos-display:6:5",
+               "the main display goes first, the rest stay in id order");
+}
+
 bool TestPermissionAndEnumerationFailures() {
   auto backend = std::make_unique<FakeBackend>();
   FakeBackend* fake = backend.get();
@@ -430,6 +446,7 @@ bool TestFirstFrameDeadlineAlwaysTearsDown() {
 int main() {
   @autoreleasepool {
     return TestReadinessAndTopology() &&
+                   TestMainDisplayIsListedFirst() &&
                    TestPermissionAndEnumerationFailures() &&
                    TestSelectedDisplayBackpressureAndTeardown() &&
                    TestStaleTopologyAndStreamError() &&

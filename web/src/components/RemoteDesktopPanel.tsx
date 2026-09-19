@@ -85,6 +85,7 @@ import {
   QuickInputPanel,
   type UseQuickDataResult,
 } from './QuickInputPanel.js';
+import { remoteDesktopDisplayName } from '../remote-desktop-display-name.js';
 import {
   INITIAL_REMOTE_DESKTOP_VIEWPORT,
   clampRemoteDesktopViewport,
@@ -2726,7 +2727,7 @@ export function RemoteDesktopPanel({
                 role="tab"
                 aria-selected={display.id === snapshot.selectedDisplayId}
                 aria-haspopup="menu"
-                title={t('remote_desktop.resolution_hint')}
+                title={`${display.label}\n${t('remote_desktop.resolution_hint')}`}
                 disabled={!display.available}
                 onClick={() => {
                   if (suppressDisplayTabClickRef.current) {
@@ -2755,7 +2756,7 @@ export function RemoteDesktopPanel({
                 onPointerUp={(event) => clearDisplayTabLongPress(event.pointerId)}
                 onPointerCancel={(event) => clearDisplayTabLongPress(event.pointerId)}
               >
-                {display.label}
+                {remoteDesktopDisplayName(t, snapshot.displays, display)}
               </button>
             ))}
           </div>
@@ -2924,10 +2925,10 @@ export function RemoteDesktopPanel({
               ref={displayModeMenuRef}
               class="remote-desktop-resolution-menu"
               role="menu"
-              aria-label={t('remote_desktop.resolution_menu', { display: display.label })}
+              aria-label={t('remote_desktop.resolution_menu', { display: remoteDesktopDisplayName(t, snapshot.displays, display) })}
               style={{ left: `${displayModeMenu.x}px`, top: `${displayModeMenu.y}px` }}
             >
-              <strong>{t('remote_desktop.resolution_menu', { display: display.label })}</strong>
+              <strong>{t('remote_desktop.resolution_menu', { display: remoteDesktopDisplayName(t, snapshot.displays, display) })}</strong>
               {displayModeOptions(display).map((mode) => (
                 <button
                   key={`${mode.width}x${mode.height}`}

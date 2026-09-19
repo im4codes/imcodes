@@ -3594,6 +3594,8 @@
     "title": "aiDesk.to Remote Desktop — {{machine}}",
     "stop": "Stop",
     "displays": "Displays",
+    "display_name": "Display {{number}}",
+    "display_name_main": "Display {{number}} · Main",
     "resolution_menu": "Resolution for {{display}}",
     "resolution_hint": "Right-click or press and hold to change resolution",
     "dpi_menu": "Windows DPI scale",

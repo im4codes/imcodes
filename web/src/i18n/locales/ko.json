@@ -3593,6 +3593,8 @@
     "title": "aiDesk.to 원격 데스크톱 — {{machine}}",
     "stop": "중지",
     "displays": "디스플레이",
+    "display_name": "디스플레이 {{number}}",
+    "display_name_main": "디스플레이 {{number}} · 기본",
     "resolution_menu": "{{display}} 해상도",
     "resolution_hint": "마우스 오른쪽 버튼을 클릭하거나 길게 눌러 해상도 변경",
     "dpi_menu": "Windows DPI 배율",

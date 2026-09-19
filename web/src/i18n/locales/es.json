@@ -3594,6 +3594,8 @@
     "title": "Escritorio remoto de aiDesk.to — {{machine}}",
     "stop": "Detener",
     "displays": "Pantallas",
+    "display_name": "Pantalla {{number}}",
+    "display_name_main": "Pantalla {{number}} · Principal",
     "resolution_menu": "Resolución de {{display}}",
     "resolution_hint": "Haz clic derecho o mantén pulsado para cambiar la resolución",
     "dpi_menu": "Escala DPI de Windows",
