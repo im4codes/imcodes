@@ -373,6 +373,34 @@ describe('capability daemon bridge', () => {
     }));
   });
 
+  it('applies back-to-back progress frames in the order the daemon sent them', async () => {
+    // A local Skill is acquired and scanned within milliseconds, so the daemon
+    // sends acquiring, scanning and auditing back to back. Each frame is a
+    // revision-checked database write; checking one before the previous one
+    // committed dropped it as stale and left the install stuck in acquiring.
+    const { daemon } = await authenticatedBridge();
+    let current = { state: 'queued', revision: 1 };
+    mocks.update.mockImplementation(async (_db: unknown, params: {
+      expectedRevision: number; state: string; allowedCurrentStates: string[];
+    }) => {
+      // Like PostgreSQL under READ COMMITTED: the UPDATE matches against the
+      // last committed row, and its own change commits a moment later.
+      if (params.expectedRevision !== current.revision || !params.allowedCurrentStates.includes(current.state)) return null;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      current = { state: params.state, revision: current.revision + 1 };
+      return { revision: current.revision };
+    });
+    const steps = ['acquiring', 'scanning', 'auditing'];
+    steps.forEach((state, index) => daemon.emit('message', JSON.stringify({
+      type: CAPABILITY_OPERATION_MSG.PROGRESS,
+      operationId: 'operation-1',
+      expectedRevision: index + 1,
+      state,
+    })));
+    await vi.waitFor(() => expect(mocks.update).toHaveBeenCalledTimes(3));
+    await vi.waitFor(() => expect(current).toEqual({ state: 'auditing', revision: 4 }));
+  });
+
   it('accepts an exact reviewed-candidate progress replay after reconnect', async () => {
     const { daemon } = await authenticatedBridge();
     mocks.update.mockResolvedValue(null);

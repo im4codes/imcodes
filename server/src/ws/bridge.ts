@@ -1547,6 +1547,16 @@ export class WsBridge {
   private directFileTransferTicketSigningKey: string | null = null;
   private capabilityBlobSigningKey: string | null = null;
   private capabilityAuthorizationSigner: CapabilityAuthorizationSigner | null = null;
+  /**
+   * Capability frames from the daemon, handled one at a time in arrival order.
+   * Each progress frame is a revision-checked UPDATE in its own transaction;
+   * run concurrently, a frame could be checked before the previous one
+   * committed, match nothing, and be dropped as stale -- a local Skill sends
+   * acquiring, scanning and auditing within milliseconds, and every install
+   * stuck in acquiring.
+   */
+  private capabilityInbound: Promise<unknown> = Promise.resolve();
+
   private pendingCapabilityManage = new Map<string, {
     ownerUserId: string;
     frame: CapabilityOperationManageFrame;
@@ -4937,7 +4947,11 @@ export class WsBridge {
       // body frames). Only capability frames may cross this async DB boundary;
       // unknown capability frames are default-denied rather than broadcast.
       if (typeof msg.type === 'string' && msg.type.startsWith('capability.')) {
-        await this.handleCapabilityDaemonMessage(msg, db, ws, connectionGeneration);
+        const handled = this.capabilityInbound
+          .catch(() => undefined)
+          .then(() => this.handleCapabilityDaemonMessage(msg, db, ws, connectionGeneration));
+        this.capabilityInbound = handled;
+        await handled;
         return;
       }
 
