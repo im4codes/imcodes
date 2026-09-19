@@ -93,6 +93,8 @@ function fixture(options: {
   routeAuthority?: RemoteDesktopRouteRegistryIdentity['authority'];
   allocateRouteGeneration?: () => Promise<number>;
   autoUnlockSucceeded?: RemoteDesktopRouterHooks['autoUnlockSucceeded'];
+  /** What the node advertises; none by default, like a node with no profile. */
+  nodeCapabilities?: readonly string[];
 } = {}) {
   const browserA = {} as WebSocket;
   const browserB = {} as WebSocket;
@@ -127,6 +129,7 @@ function fixture(options: {
     database: () => ({}) as Database,
     daemonAvailable: () => available,
     daemonSupportsRemoteDesktop: () => supported,
+    daemonRemoteDesktopCapabilities: () => options.nodeCapabilities ?? [],
     featureEnabled: () => featureEnabled,
     daemonGeneration: () => generation,
     allocateRouteGeneration: options.allocateRouteGeneration ?? (async () => generation),
@@ -196,6 +199,42 @@ async function authorize(
 }
 
 describe('RemoteDesktopRouter', () => {
+  it('admits a node that cannot take input to View instead of failing every attempt', async () => {
+    // pro.koca.win: Screen Recording granted, Accessibility not. Its v3
+    // profile has capture but no input, and it refuses a Control PREPARE.
+    const mac = [
+      REMOTE_DESKTOP_SESSION_CAPABILITY,
+      REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS,
+      REMOTE_DESKTOP_CAPTURE_CAPABILITY.MACOS_SCREEN_CAPTURE_KIT,
+      REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+      REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+    ];
+    const f = fixture({ nodeCapabilities: mac });
+    await f.router.handleBrowser(f.browserA, 'owner-user', start);
+    expect(f.messages(f.browserA).at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+    });
+    expect(f.daemonMessages.find((message) => message.type === REMOTE_DESKTOP_MSG.PREPARE))
+      .toMatchObject({ mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW });
+  });
+
+  it('still admits input-capable and legacy Windows nodes to Control', async () => {
+    const withInput = [
+      REMOTE_DESKTOP_SESSION_CAPABILITY,
+      REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS,
+      REMOTE_DESKTOP_CAPTURE_CAPABILITY.MACOS_SCREEN_CAPTURE_KIT,
+      REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+      REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+      REMOTE_DESKTOP_INPUT_CAPABILITY,
+    ];
+    // A Windows daemon advertises only the legacy capability, and controls.
+    for (const nodeCapabilities of [withInput, [REMOTE_DESKTOP_CAPABILITY]]) {
+      const f = fixture({ nodeCapabilities });
+      await authorize(f);
+    }
+  });
+
   it('applies exact durable downgrade/terminal effects and rejects a replacement generation', async () => {
     const downgraded = fixture({
       routeAuthority: {

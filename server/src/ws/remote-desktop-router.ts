@@ -352,6 +352,14 @@ export class RemoteDesktopRouter {
     this.routeRegistry = hooks.routeRegistry ?? postgresRouteRegistry;
   }
 
+  /** Control, unless the node's own v3 profile says it cannot take input. */
+  private admittedMode(): typeof REMOTE_DESKTOP_ACCESS_MODE[keyof typeof REMOTE_DESKTOP_ACCESS_MODE] {
+    const profile = resolveRemoteDesktopSessionProfile(this.hooks.daemonRemoteDesktopCapabilities?.());
+    return profile?.kind === 'common_v3' && !profile.input
+      ? REMOTE_DESKTOP_ACCESS_MODE.VIEW
+      : REMOTE_DESKTOP_ACCESS_MODE.CONTROL;
+  }
+
   handlesType(type: unknown): boolean {
     return typeof type === 'string' && type.startsWith('remote_desktop.');
   }
@@ -1233,7 +1241,11 @@ export class RemoteDesktopRouter {
       // An admitted Owner/Participant session defaults to its own Control
       // authority. The worker still gates injection until all three WebRTC
       // DataChannels are open, and another peer's mode remains independent.
-      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      // A v3 node lists its adapters; one without input -- a Mac whose
+      // Accessibility is not granted -- refuses a Control PREPARE outright, so
+      // admitting it as Control failed every attempt with worker_failed and
+      // the browser retried forever. It is admitted to View instead.
+      mode: this.admittedMode(),
       inputEpoch: 1,
       reconnectAttempt: start.reconnectAttempt ?? 0,
       registryIdentity,
