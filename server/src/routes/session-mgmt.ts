@@ -1,6 +1,6 @@
 import { Hono, type Context } from 'hono';
 import type { Env } from '../env.js';
-import { getServerById, getDbSessionByName, getDbSessionsByServer, getSubSessionById, getSubSessionsByServer, upsertDbSession, deleteDbSession, updateSessionLabel, updateProjectName, updateSession, updateSubSession } from '../db/queries.js';
+import { getServerById, getDbSessionByName, getDbSessionsByServer, getSubSessionById, getSubSessionsByServer, getUserPref, setUserPref, upsertDbSession, deleteDbSession, updateSessionLabel, updateProjectName, updateSession, updateSubSession } from '../db/queries.js';
 import { requireAuth } from '../security/authorization.js';
 import type { ServerRole } from '../security/authorization.js';
 import { randomHex } from '../security/crypto.js';
@@ -17,7 +17,12 @@ import {
   type ShareDenialReason,
   type ShareTarget,
 } from '../db/tab-sharing.js';
-import { resolveHttpShareAccess, resolveHttpShareAccessForCoveredSession, resolveServerMemberAccessOrShareDeny } from './share-http-auth.js';
+import {
+  resolveHttpShareAccess,
+  resolveHttpShareAccessForCoveredSession,
+  resolveServerMemberAccessOrShareDeny,
+  type HttpShareAccess,
+} from './share-http-auth.js';
 import { buildCoversSessionPredicate, resolveCoveredSessionNames } from '../share/covered-sessions.js';
 import { evaluateP2pSendTargetScope } from '../share/p2p-send-scope.js';
 import { IMCODES_POD_HEADER } from '../../../shared/http-header-names.js';
@@ -31,7 +36,21 @@ import {
 } from '../../../shared/worker-session-snapshot.js';
 import { evaluateSharedCommandRateLimit } from '../share/share-rate-limit.js';
 import { getPodIdentity } from '../util/pod-identity.js';
-import { isSessionAgentType } from '../../../shared/agent-types.js';
+import { getSessionRuntimeType, isSessionAgentType } from '../../../shared/agent-types.js';
+import { isDelegationReplyCapableAgentType } from '../../../shared/agent-delegation.js';
+import {
+  PEER_AUDIT_UNKNOWN_IDENTITY,
+  resolvePeerAuditNormalizedModelId,
+  resolvePeerAuditProviderFamily,
+} from '../../../shared/peer-audit.js';
+import {
+  buildSupervisionExecutionCapabilityId,
+  normalizeSupervisionExecutionModel,
+} from '../../../shared/supervision-execution-pool.js';
+import {
+  doesSharedContextBackendSupportPresets,
+  normalizeSharedContextRuntimeBackend,
+} from '../../../shared/shared-context-runtime-config.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
 import { sanitizeProjectName } from '../../../shared/sanitize-project-name.js';
@@ -43,14 +62,30 @@ import {
 } from '../../../shared/session-group-clone.js';
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../../shared/git-remote-url.js';
 import type { SharedActorEnvelope } from '../../../shared/tab-sharing.js';
+import { SHARED_MACHINE_AUTHORITY_FIELD } from '../../../shared/shared-machine-authority.js';
+import { issueSharedMachineAuthorityForSession } from '../share/shared-machine-authority.js';
 import {
   buildTransportConfigWithSupervision,
+  canSessionRoleOwnAutomaticSupervision,
+  embedSessionSupervisionSnapshot,
   extractSessionSupervisionSnapshot,
+  hasInvalidSessionSupervisionSnapshot,
   isSupportedSupervisionTargetSessionType,
+  normalizeSupervisorDefaultConfig,
+  parseSupervisorDefaultConfig,
   parseSessionSupervisionSnapshot,
   SUPERVISION_MODE,
+  SUPERVISION_USER_DEFAULT_PREF_KEY,
   type SessionSupervisionSnapshot,
+  evaluateAutomaticSupervisionEnablement,
 } from '../../../shared/supervision-config.js';
+import {
+  handleSessionIdentityDelete,
+  handleSessionIdentityGet,
+  handleSessionIdentityPut,
+  type SessionIdentityCanonicalScopeKey,
+} from './session-identity-http.js';
+import { SESSION_IDENTITY_SCOPES, sessionIdentitySessionKey } from '../../../shared/session-identity.js';
 
 export const sessionMgmtRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -267,24 +302,17 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/supervision', async (c) => {
     return c.json({ error: 'forbidden', reason: 'not_authorized_for_server' }, 403);
   }
 
-  const now = Date.now();
-  const actionId = actionIdFromBody(body as Record<string, unknown>);
+  // Both participant classes may control supervision for the covered session;
+  // viewers may not. Their configuration authority diverges below: a concrete
+  // session share is mode-only, while a whole-server participant follows the
+  // owner path. The Brain-only rule remains independent.
   if (access.actor.kind === 'share' && access.actor.effectiveActorRole !== 'participant') {
-    await auditHttpShareCommand(c, {
-      userId,
-      target,
-      coverage: access.actor.coverage,
-      actionType: 'session.supervision',
-      decision: 'rejected',
-      reason: 'share-role-denied',
-      actionId,
-      now,
-    });
     return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
   }
 
   let row;
   let agentType: string;
+  let canOwnAutomaticSupervision = false;
   if (target.kind === 'subsession') {
     row = await getSubSessionById(c.env.DB, target.subSessionId, serverId);
     if (!row) return c.json({ error: 'not_found' }, 404);
@@ -293,6 +321,7 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/supervision', async (c) => {
     row = await getDbSessionByName(c.env.DB, serverId, target.sessionName);
     if (!row) return c.json({ error: 'not_found' }, 404);
     agentType = row.agent_type;
+    canOwnAutomaticSupervision = canSessionRoleOwnAutomaticSupervision(row.role);
   }
   if (!isSupportedSupervisionTargetSessionType(agentType)) {
     return c.json({ error: 'unsupported_session_type' }, 400);
@@ -300,60 +329,49 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/supervision', async (c) => {
 
   const existingTransportConfig = parseStoredTransportConfig(row.transport_config);
   const existingSnapshot = extractSessionSupervisionSnapshot(existingTransportConfig);
+  // A concrete-session share may flip an already-configured supervision mode,
+  // but may not author the configuration. A whole-server participant follows
+  // the owner path for server/session operations; provenance is retained in
+  // the daemon command below rather than collapsing both share classes.
+  const isSessionShareParticipant = access.actor.kind === 'share'
+    && !isWholeServerShareAccess(access);
+  if (isSessionShareParticipant && !existingSnapshot) {
+    return c.json({ error: 'forbidden', reason: 'share_supervision_not_configured' }, 403);
+  }
   const nextSnapshot: SessionSupervisionSnapshot = existingSnapshot
-    ? { ...existingSnapshot, mode: proposed.mode }
+    ? (() => {
+        const {
+          auditTargetSessionName: _legacyTarget,
+          auditTargetFingerprint: _legacyFingerprint,
+          peerAuditPromptVersion: _legacyPrompt,
+          ...automaticSnapshot
+        } = existingSnapshot;
+        return { ...automaticSnapshot, mode: proposed.mode };
+      })()
     : proposed;
-  if (nextSnapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT && !nextSnapshot.auditTargetSessionName) {
-    return c.json({ error: 'audit_target_required' }, 409);
+  if (nextSnapshot.mode !== SUPERVISION_MODE.OFF && !canOwnAutomaticSupervision) {
+    return c.json({ error: 'forbidden', reason: 'brain_session_required' }, 403);
   }
-  const nextTransportConfig = buildTransportConfigWithSupervision(existingTransportConfig, nextSnapshot);
-
-  if (access.actor.kind === 'share') {
-    if (nextSnapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT && nextSnapshot.auditTargetSessionName) {
-      const p2pScopeTarget = await httpP2pScopeTarget(c.env.DB, {
-        userId,
-        serverId,
-        requestedTarget: target,
-        coverage: access.actor.coverage,
-        now,
-      });
-      const coveredSessionNames = await resolveCoveredSessionNames(c.env.DB, p2pScopeTarget);
-      if (!buildCoversSessionPredicate(p2pScopeTarget, coveredSessionNames)(nextSnapshot.auditTargetSessionName)) {
-        await auditHttpShareCommand(c, {
-          userId,
-          target,
-          coverage: access.actor.coverage,
-          actionType: 'session.supervision',
-          decision: 'rejected',
-          reason: 'share-direct-surface-denied',
-          actionId,
-          now,
-        });
-        return c.json({ error: 'forbidden', reason: 'share-direct-surface-denied' }, 403);
-      }
-    }
-    const rateLimitReason = evaluateHttpShareRateLimit({
-      bridge: WsBridge.get(serverId),
-      userId,
-      serverId,
-      sessionName,
-      commandType: 'session.send',
-      now,
-    });
-    if (rateLimitReason) {
-      await auditHttpShareCommand(c, {
-        userId,
-        target,
-        coverage: access.actor.coverage,
-        actionType: 'session.supervision',
-        decision: 'rejected',
-        reason: rateLimitReason,
-        actionId,
-        now,
-      });
-      return c.json({ error: 'forbidden', reason: rateLimitReason }, 429);
-    }
+  // Validate the snapshot that will actually be persisted, not `proposed`.
+  // Existing sessions intentionally accept only a scoped mode change here, so
+  // their stored pools remain authoritative and must independently be usable.
+  // This keeps a caller from validating one pool while persisting another.
+  const poolGate = evaluateAutomaticSupervisionEnablement(nextSnapshot);
+  if (!poolGate.ok) {
+    return c.json({
+      error: 'supervision_execution_pool_required',
+      reason: poolGate.reason,
+      guidance: poolGate.guidance,
+    }, 400);
   }
+  // Owners may keep the historical compact representation where `off` removes
+  // the block. A participant, however, is only allowed to toggle an existing
+  // configuration; deleting that configuration would make the first off
+  // transition irreversible. Preserve it with mode=off so the same participant
+  // can later turn it back on without gaining authority to author new fields.
+  const nextTransportConfig = isSessionShareParticipant
+    ? embedSessionSupervisionSnapshot(existingTransportConfig, nextSnapshot)
+    : buildTransportConfigWithSupervision(existingTransportConfig, nextSnapshot);
 
   if (target.kind === 'subsession') {
     await updateSubSession(c.env.DB, target.subSessionId, serverId, { transport_config: nextTransportConfig });
@@ -362,33 +380,262 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/supervision', async (c) => {
   }
 
   try {
+    const now = Date.now();
+    const actionId = typeof body.actionId === 'string' && body.actionId.trim()
+      ? body.actionId.trim()
+      : `supervision-mode-${now}`;
+    const sharedActor = access.actor.kind === 'share'
+      ? await buildHttpSharedActor(c.env.DB, {
+          userId,
+          coverage: access.actor.coverage,
+          actionId,
+          now,
+          origin: isWholeServerShareAccess(access) ? 'shared-server' : 'shared-tab',
+        })
+      : null;
     WsBridge.get(serverId).sendToDaemon(JSON.stringify({
       type: target.kind === 'subsession'
         ? DAEMON_COMMAND_TYPES.SUBSESSION_UPDATE_TRANSPORT_CONFIG
         : DAEMON_COMMAND_TYPES.SESSION_UPDATE_TRANSPORT_CONFIG,
       sessionName,
       transportConfig: nextTransportConfig,
+      ...(sharedActor ? { sharedActor } : {}),
     }));
   } catch (err) {
     logger.error({ serverId, sessionName, err }, 'WsBridge session supervision relay failed');
     return c.json({ error: 'relay_failed' }, 502);
   }
 
-  if (access.actor.kind === 'share') {
-    await auditHttpShareCommand(c, {
-      userId,
-      target,
-      coverage: access.actor.coverage,
-      actionType: 'session.supervision',
-      decision: 'accepted',
-      actionId,
-      now,
-    });
+  return c.json({ ok: true, transportConfig: nextTransportConfig });
+});
+
+async function resolveSupervisorDefaultsOwner(
+  c: Context<{ Bindings: Env; Variables: { userId: string; role: string } }>,
+): Promise<
+  | { ok: true; ownerUserId: string; target: Exclude<ShareTarget, { kind: 'server' }> }
+  | { ok: false; response: Response }
+> {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('id')!;
+  const sessionName = c.req.param('name')!;
+  const target = shareTargetFromSessionName(serverId, sessionName);
+  if (!target || target.kind === 'server') {
+    return { ok: false, response: c.json({ error: 'invalid_session' }, 400) };
   }
-  const responseTransportConfig = access.actor.kind === 'share'
-    ? buildTransportConfigWithSupervision(null, nextSnapshot)
-    : nextTransportConfig;
-  return c.json({ ok: true, transportConfig: responseTransportConfig });
+  const access = await resolveHttpShareAccessForCoveredSession(c.env.DB, { serverId, userId, target });
+  if (access.actor.kind === 'none') {
+    return { ok: false, response: c.json({ error: 'forbidden', reason: 'not_authorized_for_server' }, 403) };
+  }
+  if (access.actor.kind === 'share' && access.actor.effectiveActorRole !== 'participant') {
+    return { ok: false, response: c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403) };
+  }
+  const server = await getServerById(c.env.DB, serverId);
+  if (!server) return { ok: false, response: c.json({ error: 'not_found' }, 404) };
+  return { ok: true, ownerUserId: server.user_id, target };
+}
+
+async function buildOwnerExecutionPoolCatalog(
+  c: Context<{ Bindings: Env; Variables: { userId: string; role: string } }>,
+  target: Exclude<ShareTarget, { kind: 'server' }>,
+) {
+  const parentSession = target.kind === 'main'
+    ? target.sessionName
+    : (await getSubSessionById(c.env.DB, target.subSessionId, target.serverId))?.parent_session;
+  if (!parentSession) return [];
+
+  const rows = await getSubSessionsByServer(c.env.DB, target.serverId, { includeExecutionClones: false });
+  return rows.flatMap((row) => {
+    if (row.parent_session !== parentSession || !isDelegationReplyCapableAgentType(row.type)) return [];
+    const rawModel = row.active_model?.trim() || row.requested_model?.trim();
+    if (!rawModel) return [];
+    const providerFamily = resolvePeerAuditProviderFamily({
+      providerId: row.provider_id,
+      agentType: row.type,
+    });
+    if (providerFamily === PEER_AUDIT_UNKNOWN_IDENTITY) return [];
+    const runtimeType = row.runtime_type === 'process' || row.runtime_type === 'transport'
+      ? row.runtime_type
+      : getSessionRuntimeType(row.type);
+    const observedModel = resolvePeerAuditNormalizedModelId({ activeModel: rawModel });
+    if (observedModel === PEER_AUDIT_UNKNOWN_IDENTITY) return [];
+    const model = normalizeSupervisionExecutionModel(row.type, observedModel);
+    const ccPresetId = row.cc_preset_id == null ? undefined : row.cc_preset_id.trim();
+    const backend = normalizeSharedContextRuntimeBackend(row.type);
+    if (row.cc_preset_id != null
+      && (!ccPresetId || ccPresetId !== row.cc_preset_id
+        || !backend || !doesSharedContextBackendSupportPresets(backend))) return [];
+    const identity = {
+      agentType: row.type,
+      providerFamily,
+      runtimeType,
+      model,
+      ...(ccPresetId ? { ccPresetId } : {}),
+    };
+    return [{
+      sessionName: `deck_sub_${row.id}`,
+      parentSession,
+      type: row.type,
+      runtimeType,
+      label: row.label?.trim() || `deck_sub_${row.id}`,
+      activeModel: model,
+      providerId: providerFamily,
+      ccPresetId: ccPresetId ?? null,
+      capabilityId: buildSupervisionExecutionCapabilityId(identity),
+      ownerCatalog: true as const,
+    }];
+  });
+}
+
+/**
+ * Read/write the machine owner's account-level supervision runtime through a
+ * concrete covered session. A share participant must configure the runtime
+ * that the owner's daemon actually consumes, not a same-key preference under
+ * the participant's own account. The payload contains no provider credentials;
+ * preset secrets remain confined to the daemon-side preset catalogue.
+ */
+sessionMgmtRoutes.get('/:id/sessions/:name/supervision/defaults', async (c) => {
+  const resolved = await resolveSupervisorDefaultsOwner(c);
+  if (!resolved.ok) return resolved.response;
+  const raw = await getUserPref(c.env.DB, resolved.ownerUserId, SUPERVISION_USER_DEFAULT_PREF_KEY);
+  if (!raw) return c.json({ defaults: null });
+  try {
+    return c.json({ defaults: parseSupervisorDefaultConfig(JSON.parse(raw)) });
+  } catch {
+    return c.json({ defaults: null });
+  }
+});
+
+sessionMgmtRoutes.get('/:id/sessions/:name/supervision/execution-pool-catalog', async (c) => {
+  const resolved = await resolveSupervisorDefaultsOwner(c);
+  if (!resolved.ok) return resolved.response;
+  return c.json({ sessions: await buildOwnerExecutionPoolCatalog(c, resolved.target) });
+});
+
+sessionMgmtRoutes.put('/:id/sessions/:name/supervision/defaults', async (c) => {
+  const resolved = await resolveSupervisorDefaultsOwner(c);
+  if (!resolved.ok) return resolved.response;
+  let body: { defaults?: unknown };
+  try {
+    body = await c.req.json() as typeof body;
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400);
+  }
+  const parsed = parseSupervisorDefaultConfig(body.defaults);
+  if (!parsed) return c.json({ error: 'invalid_supervision_defaults' }, 400);
+  const defaults = normalizeSupervisorDefaultConfig(parsed);
+  await setUserPref(
+    c.env.DB,
+    resolved.ownerUserId,
+    SUPERVISION_USER_DEFAULT_PREF_KEY,
+    JSON.stringify(defaults),
+  );
+  // PostgreSQL is the single source of truth; the daemon otherwise only
+  // notices this within its own five-second poll. A Brain that dispatches
+  // manual task{objective,acceptance} work right after a fresh pool save
+  // must not race that window, so push the connected daemon a refresh now.
+  const serverId = c.req.param('id')!;
+  try {
+    WsBridge.get(serverId).sendToDaemon(JSON.stringify({
+      type: DAEMON_COMMAND_TYPES.SUPERVISOR_DEFAULTS_CHANGED,
+    }));
+  } catch (err) {
+    // Best-effort: the daemon's own five-second poll remains the fallback.
+    logger.debug({ serverId, err }, 'supervisor defaults changed push failed');
+  }
+  return c.json({ ok: true, defaults });
+});
+
+/**
+ * A participant edits the covered machine owner's identity profiles. Reading
+ * or writing the participant account's same-named profile would acknowledge a
+ * save that the owner's daemon can never observe.
+ */
+/**
+ * Server-level identity access (the new-session dialog, before a session
+ * exists). The session will run on the machine owner's daemon under the
+ * owner's profiles, so a server participant must edit those -- not the
+ * participant account's own, which that daemon never reads. Only whole-server
+ * participants qualify: a session-scoped share cannot create sessions.
+ */
+async function resolveServerIdentityOwner(
+  c: Context<{ Bindings: Env; Variables: { userId: string; role: string } }>,
+): Promise<{ ok: true; ownerUserId: string } | { ok: false; response: Response }> {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('id')!;
+  const access = await resolveHttpShareAccess(c.env.DB, {
+    serverId,
+    userId,
+    target: { kind: 'server', serverId },
+  });
+  if (access.actor.kind === 'none') {
+    return { ok: false, response: c.json({ error: 'forbidden', reason: 'not_authorized_for_server' }, 403) };
+  }
+  if (access.actor.kind === 'share'
+    && (access.actor.effectiveActorRole !== 'participant' || access.shareProvenance !== 'server')) {
+    return { ok: false, response: c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403) };
+  }
+  const server = await getServerById(c.env.DB, serverId);
+  if (!server) return { ok: false, response: c.json({ error: 'not_found' }, 404) };
+  return { ok: true, ownerUserId: server.user_id };
+}
+
+sessionMgmtRoutes.get('/:id/identity', async (c) => {
+  const resolved = await resolveServerIdentityOwner(c);
+  if (!resolved.ok) return resolved.response;
+  return handleSessionIdentityGet(c, resolved.ownerUserId);
+});
+
+sessionMgmtRoutes.put('/:id/identity', async (c) => {
+  const resolved = await resolveServerIdentityOwner(c);
+  if (!resolved.ok) return resolved.response;
+  return handleSessionIdentityPut(c, resolved.ownerUserId);
+});
+
+sessionMgmtRoutes.delete('/:id/identity', async (c) => {
+  const resolved = await resolveServerIdentityOwner(c);
+  if (!resolved.ok) return resolved.response;
+  return handleSessionIdentityDelete(c, resolved.ownerUserId);
+});
+
+/**
+ * Session-bound identity keys come from the session itself, not the browser.
+ * A share recipient's session list omits `contextNamespace`, so its browser
+ * could only guess the project key (the bare project name) and read/write a
+ * profile the owner's daemon never uses -- participants saw an empty project
+ * identity. The session key is pinned the same way.
+ */
+function canonicalSessionIdentityScopeKey(
+  serverId: string,
+  sessionName: string,
+): SessionIdentityCanonicalScopeKey {
+  return (scope) => {
+    if (scope === SESSION_IDENTITY_SCOPES.SESSION) return sessionIdentitySessionKey(serverId, sessionName);
+    if (scope === SESSION_IDENTITY_SCOPES.PROJECT) {
+      return WsBridge.get(serverId).resolveSessionIdentityProjectKey(sessionName);
+    }
+    return null;
+  };
+}
+
+sessionMgmtRoutes.get('/:id/sessions/:name/identity', async (c) => {
+  const resolved = await resolveSupervisorDefaultsOwner(c);
+  if (!resolved.ok) return resolved.response;
+  return handleSessionIdentityGet(c, resolved.ownerUserId,
+    canonicalSessionIdentityScopeKey(c.req.param('id')!, c.req.param('name')!));
+});
+
+sessionMgmtRoutes.put('/:id/sessions/:name/identity', async (c) => {
+  const resolved = await resolveSupervisorDefaultsOwner(c);
+  if (!resolved.ok) return resolved.response;
+  return handleSessionIdentityPut(c, resolved.ownerUserId,
+    canonicalSessionIdentityScopeKey(c.req.param('id')!, c.req.param('name')!));
+});
+
+sessionMgmtRoutes.delete('/:id/sessions/:name/identity', async (c) => {
+  const resolved = await resolveSupervisorDefaultsOwner(c);
+  if (!resolved.ok) return resolved.response;
+  return handleSessionIdentityDelete(c, resolved.ownerUserId,
+    canonicalSessionIdentityScopeKey(c.req.param('id')!, c.req.param('name')!));
 });
 
 /** PATCH /api/server/:id/sessions/:name — update session settings (label, description, cwd) */
@@ -420,6 +667,17 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
     return c.json({ error: 'invalid_json' }, 400);
   }
 
+  // The dedicated supervision route is not the only way an owner can persist
+  // transportConfig. Keep the generic settings route from becoming a bypass:
+  // concrete-session participants may still edit their authorized presentation
+  // fields, but no transport config (including an apparent `off`) crosses this
+  // generic gate. Whole-server participants intentionally follow the owner path.
+  if (access.actor.kind === 'share'
+    && !isWholeServerShareAccess(access)
+    && Object.prototype.hasOwnProperty.call(body, 'transportConfig')) {
+    return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
+  }
+
   const fields: {
     label?: string | null;
     description?: string | null;
@@ -442,7 +700,29 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
   if ('effort' in body) fields.effort = body.effort ?? null;
   if ('transportConfig' in body) fields.transport_config = body.transportConfig ?? null;
 
+  if (hasInvalidSessionSupervisionSnapshot(body.transportConfig ?? null)) {
+    return c.json({ error: 'invalid_supervision_config' }, 400);
+  }
+  const requestedSupervision = extractSessionSupervisionSnapshot(body.transportConfig ?? null);
+  if (requestedSupervision && requestedSupervision.mode !== SUPERVISION_MODE.OFF) {
+    const current = await getDbSessionByName(c.env.DB, serverId, sessionName);
+    if (!current || !canSessionRoleOwnAutomaticSupervision(current.role)) {
+      return c.json({ error: 'forbidden', reason: 'brain_session_required' }, 403);
+    }
+  }
+
   await updateSession(c.env.DB, serverId, sessionName, fields);
+
+  const sharedActorNow = Date.now();
+  const sharedActor = access.actor.kind === 'share'
+    ? await buildHttpSharedActor(c.env.DB, {
+        userId,
+        coverage: access.actor.coverage,
+        actionId: `session-settings-${sharedActorNow}`,
+        now: sharedActorNow,
+        origin: isWholeServerShareAccess(access) ? 'shared-server' : 'shared-tab',
+      })
+    : null;
 
   if (typeof body.agentType === 'string') {
     try {
@@ -457,6 +737,7 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
         ...(body.activeModel !== undefined ? { activeModel: body.activeModel } : {}),
         ...(body.effort !== undefined ? { effort: body.effort } : {}),
         ...(body.transportConfig !== undefined ? { transportConfig: body.transportConfig } : {}),
+        ...(sharedActor ? { sharedActor } : {}),
       }));
     } catch (err) {
       logger.error({ serverId, sessionName, err }, 'WsBridge session settings relay failed');
@@ -469,6 +750,7 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
         type: 'session.relabel',
         sessionName,
         label: body.label ?? null,
+        ...(sharedActor ? { sharedActor } : {}),
       }));
     } catch (err) {
       logger.error({ serverId, sessionName, err }, 'WsBridge session relabel relay failed');
@@ -481,6 +763,7 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
         type: DAEMON_COMMAND_TYPES.SESSION_UPDATE_TRANSPORT_CONFIG,
         sessionName,
         transportConfig: body.transportConfig ?? null,
+        ...(sharedActor ? { sharedActor } : {}),
       }));
     } catch (err) {
       logger.error({ serverId, sessionName, err }, 'WsBridge session transportConfig relay failed');
@@ -802,6 +1085,7 @@ sessionMgmtRoutes.post('/:id/session/cancel', async (c) => {
           coverage: access.actor.coverage,
           actionId,
           now,
+          origin: isWholeServerShareAccess(access) ? 'shared-server' : 'shared-tab',
         }),
       });
     }
@@ -862,18 +1146,32 @@ sessionMgmtRoutes.post('/:id/session/send', async (c) => {
         return c.json({ error: 'forbidden', reason: rateLimitReason }, 429);
       }
       await auditHttpShareCommand(c, { userId, target, coverage: access.actor.coverage, actionType: 'session.send', decision: 'accepted', actionId, now });
-      const { type: _ignoredType, sharedActor: _ignoredSharedActor, shareScope: _ignoredShareScope, ...rest } = body;
+      const { type: _ignoredType, sharedActor: _ignoredSharedActor, shareScope: _ignoredShareScope,
+        [SHARED_MACHINE_AUTHORITY_FIELD]: _ignoredMachineAuthority, ...rest } = body;
       void _ignoredType;
       void _ignoredSharedActor;
       void _ignoredShareScope;
+      void _ignoredMachineAuthority;
+      const sharedActor = await buildHttpSharedActor(c.env.DB, {
+        userId,
+        coverage: access.actor.coverage,
+        actionId,
+        now,
+        origin: isWholeServerShareAccess(access) ? 'shared-server' : 'shared-tab',
+      });
+      const sharedMachineAuthority = await issueSharedMachineAuthorityForSession(c.env.DB, {
+        actorUserId: userId,
+        sourceServerId: serverId,
+        sessionName: targetSessionName!,
+        shareTarget: access.actor.coverage.target,
+        actionId,
+        signingKey: c.env.JWT_SIGNING_KEY,
+      });
+      if (!sharedMachineAuthority) return c.json({ error: 'forbidden', reason: 'share-target-unavailable' }, 403);
       return relayToDaemon(c, 'session.send', {
         ...rest,
-        sharedActor: await buildHttpSharedActor(c.env.DB, {
-          userId,
-          coverage: access.actor.coverage,
-          actionId,
-          now,
-        }),
+        sharedActor,
+        [SHARED_MACHINE_AUTHORITY_FIELD]: sharedMachineAuthority,
       });
     }
     if (access.actor.kind === 'none') {
@@ -919,10 +1217,12 @@ function actionIdFromBody(body: Record<string, unknown>): string {
 }
 
 function stripBrowserShareFields(body: Record<string, unknown>): Record<string, unknown> {
-  const { type: _ignoredType, sharedActor: _ignoredSharedActor, shareScope: _ignoredShareScope, ...safeBody } = body;
+  const { type: _ignoredType, sharedActor: _ignoredSharedActor, shareScope: _ignoredShareScope,
+    [SHARED_MACHINE_AUTHORITY_FIELD]: _ignoredMachineAuthority, ...safeBody } = body;
   void _ignoredType;
   void _ignoredSharedActor;
   void _ignoredShareScope;
+  void _ignoredMachineAuthority;
   return safeBody;
 }
 
@@ -947,7 +1247,13 @@ function normalizeTrustedRuntimeType(value: string | null): TrustedRuntimeType {
 
 async function buildHttpSharedActor(
   db: Env['DB'],
-  params: { userId: string; coverage: EffectiveCoverage; actionId: string; now: number },
+  params: {
+    userId: string;
+    coverage: EffectiveCoverage;
+    actionId: string;
+    now: number;
+    origin?: SharedActorEnvelope['origin'];
+  },
 ): Promise<SharedActorEnvelope> {
   const user = await db.queryOne<{ display_name: string | null; username: string | null }>(
     'SELECT display_name, username FROM users WHERE id = $1',
@@ -960,10 +1266,19 @@ async function buildHttpSharedActor(
     primaryShareId: params.coverage.primaryShareId,
     effectiveActorRole: params.coverage.effectiveRole,
     actionId: params.actionId,
-    origin: params.coverage.target.kind === 'server' ? 'shared-server' : 'shared-tab',
+    origin: params.origin ?? (params.coverage.target.kind === 'server' ? 'shared-server' : 'shared-tab'),
     authorizedAt: params.coverage.authorizedAt,
     queuedAt: params.now,
   };
+}
+
+function isWholeServerShareAccess(access: HttpShareAccess): boolean {
+  if (access.actor.kind !== 'share') return false;
+  // Production resolvers always set shareProvenance from covering grant ids.
+  // The fallback preserves old internal test fixtures that model a server
+  // grant directly as a server-target coverage snapshot.
+  return access.shareProvenance === 'server'
+    || (access.shareProvenance === undefined && access.actor.coverage.target.kind === 'server');
 }
 
 async function httpP2pScopeTarget(

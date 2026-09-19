@@ -1,3 +1,9 @@
+import {
+  canRevealSavedDownload,
+  revealSavedDownload,
+  type SavedDownloadFileHandle,
+} from './download-file-actions.js';
+
 export const DOWNLOAD_TRANSFER_STATUS = {
   PREPARING: 'preparing',
   CONNECTING: 'connecting',
@@ -40,6 +46,8 @@ type Runtime = {
   controller: AbortController;
   retry: RetryHandler | null;
   save: SaveHandler | null;
+  /** The saved file, once a completed download has one the page can read back. */
+  savedFile: SavedDownloadFileHandle | null;
   saveInFlight: boolean;
   lastSampleAt: number;
   lastSampleBytes: number;
@@ -129,6 +137,7 @@ export function beginDownloadTransfer(name: string, now = Date.now()): { id: str
     controller,
     retry: null,
     save: null,
+    savedFile: null,
     saveInFlight: false,
     lastSampleAt: now,
     lastSampleBytes: 0,
@@ -205,6 +214,7 @@ export async function retryDownloadTransfer(id: string, now = Date.now()): Promi
   const item = snapshot.find((entry) => entry.id === id);
   if (!runtime?.retry || item?.status !== DOWNLOAD_TRANSFER_STATUS.FAILED) return;
   clearRuntimeTimer(runtime);
+  runtime.savedFile = null;
   runtime.controller = new AbortController();
   runtime.lastSampleAt = now;
   runtime.lastSampleBytes = 0;
@@ -269,7 +279,10 @@ function settleDownloadTransfer(id: string, status: DownloadTransferStatus, rout
   const runtime = runtimeById.get(id);
   if (runtime?.pending) applyProgress(id, { ...runtime.pending, now });
   clearRuntimeTimer(runtime);
-  if (runtime) runtime.save = null;
+  if (runtime) {
+    runtime.save = null;
+    if (status !== DOWNLOAD_TRANSFER_STATUS.COMPLETED) runtime.savedFile = null;
+  }
   updateItem(id, (item) => isTerminal(item.status) ? item : ({
     ...item,
     ...(route ? { route } : {}),
@@ -286,6 +299,33 @@ export function completeDownloadTransfer(id: string, handedOff = false, now = Da
     handedOff ? DOWNLOAD_TRANSFER_ROUTE.BROWSER : undefined,
     now,
   );
+}
+
+/**
+ * Attach the file a completed download was saved to, so its row can offer
+ * "Show in folder". Only a handle the page can read back is kept; anything
+ * else leaves the row without the button.
+ */
+export function setDownloadTransferSavedFile(id: string, handle: SavedDownloadFileHandle | null): void {
+  const runtime = runtimeById.get(id);
+  const item = snapshot.find((entry) => entry.id === id);
+  if (!runtime || item?.status !== DOWNLOAD_TRANSFER_STATUS.COMPLETED) return;
+  runtime.savedFile = handle;
+  // Republish so an already-rendered row picks up its new button.
+  publish([...snapshot]);
+}
+
+export function canRevealDownloadTransfer(id: string): boolean {
+  const item = snapshot.find((entry) => entry.id === id);
+  return !!runtimeById.get(id)?.savedFile
+    && item?.status === DOWNLOAD_TRANSFER_STATUS.COMPLETED
+    && canRevealSavedDownload();
+}
+
+/** Call synchronously from the click: the file dialog needs the user's gesture. */
+export function revealDownloadTransfer(id: string): boolean {
+  const handle = runtimeById.get(id)?.savedFile;
+  return canRevealDownloadTransfer(id) && !!handle && revealSavedDownload(handle);
 }
 
 export function failDownloadTransfer(id: string, canceled = false, now = Date.now()): void {

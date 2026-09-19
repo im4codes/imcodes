@@ -24,7 +24,7 @@ export async function resolveProcessingProviderSessionConfig(
     switch (selection.backend) {
       case 'qwen': {
         const { getQwenPresetTransportConfig } = await import('../daemon/cc-presets.js');
-        const presetConfig = await getQwenPresetTransportConfig(preset);
+        const presetConfig = await getQwenPresetTransportConfig(preset, model);
         return {
           cacheKey: JSON.stringify({
             backend: selection.backend,
@@ -43,7 +43,7 @@ export async function resolveProcessingProviderSessionConfig(
         // pinned ANTHROPIC_MODEL env is applied directly (no OpenAI-compat
         // settings shim). resolvePresetEnv already pins ANTHROPIC_MODEL.
         const { resolvePresetEnv } = await import('../daemon/cc-presets.js');
-        const env = await resolvePresetEnv(preset);
+        const env = await resolvePresetEnv(preset, undefined, model);
         const resolvedModel = env['ANTHROPIC_MODEL']?.trim() || model;
         return {
           cacheKey: JSON.stringify({

@@ -1,0 +1,122 @@
+{
+  "assignmentId": "asg_nbp",
+  "baseCommit": "cb210825bbe13e89368ce56409ddaf26482e332a",
+  "evidence": [
+    {
+      "path": "evidence-r2/ACCEPTANCE-TRACE.md",
+      "sha256": "8d5c5e98e3df5d6a4bb3e71acea7f7a189a57626599c801ca88ace337e752dd7"
+    },
+    {
+      "path": "evidence-r2/logs/01-tsc-daemon.txt",
+      "sha256": "418a5c17f33c70e99b0cc0a07fce69191489cfedc94164bfa903785777c5bd4b"
+    },
+    {
+      "path": "evidence-r2/logs/02-tsc-server.txt",
+      "sha256": "418a5c17f33c70e99b0cc0a07fce69191489cfedc94164bfa903785777c5bd4b"
+    },
+    {
+      "path": "evidence-r2/logs/03-tsc-web.txt",
+      "sha256": "418a5c17f33c70e99b0cc0a07fce69191489cfedc94164bfa903785777c5bd4b"
+    },
+    {
+      "path": "evidence-r2/logs/04-build.txt",
+      "sha256": "c9b936e9f3a21b779988d6badb61556371262228fe98a07f39b413ce25df5cce"
+    },
+    {
+      "path": "evidence-r2/logs/05-daemon-suites.txt",
+      "sha256": "90914f200e200e27d21d4cd6d3be79e7834aad5f75a8de0f4661e0f0e97aff70"
+    },
+    {
+      "path": "evidence-r2/logs/06-server-identity-routes.txt",
+      "sha256": "817222eae5473c3b77cc1440e611346be8e78913fef506a9e8f1838045cf6d65"
+    },
+    {
+      "path": "evidence-r2/logs/07-web-identity-and-i18n.txt",
+      "sha256": "e62e17efef5d3c700f0e6d92df66f0826e16c14bc9519ca8d4efc1d7ad001788"
+    },
+    {
+      "path": "evidence-r2/logs/08-red-base-qwen.txt",
+      "sha256": "27f88eb182c29bd356815569d1e59c916b299d3fdf4ce1306b9a28972527ee59"
+    },
+    {
+      "path": "evidence-r2/mutants/r2-mutants-results.txt",
+      "sha256": "35985d66f94dafc1ba75e1e03ffbefb0d2ad8df1ed2511d10059a77ecda9f777"
+    },
+    {
+      "path": "evidence-r2/mutants/r2-mutants.py",
+      "sha256": "cbd669e3fec56108fa2a76c730323c60057832385ebc2096814b1c9ba8068a4e"
+    },
+    {
+      "path": "evidence-r2/revision.diff",
+      "sha256": "d4c85b1801e625163680037b72870df8d524e298288cde1560764ddd46bf3778"
+    }
+  ],
+  "files": [
+    {
+      "path": "server/test/session-identities-routes.test.ts",
+      "sha256": "1c1e6c06458b72e6e7e51f56de13dc6954ed1bd135b919740f14c93b3fdfc7ef"
+    },
+    {
+      "path": "shared/memory-mcp-contracts.ts",
+      "sha256": "8da0a63f84ef46b3679fb9a8b960f14780dda1a53e8afd661b78b5fc8910f4c0"
+    },
+    {
+      "path": "shared/session-identity.ts",
+      "sha256": "facc9c51ca67d76462888985ed3d261c0cb5a8b8aeafbb3ee79eb4711b92ee3d"
+    },
+    {
+      "path": "src/agent/priority-preserving-context-cap.ts",
+      "sha256": "415407290fcacdc0a0c5d63881881696f6a184e4418b5cfdb6d003e185e1143c"
+    },
+    {
+      "path": "src/agent/providers/codex-sdk.ts",
+      "sha256": "70856eee5f6e578c027e6341395be2153e9d0b9bf61080bec7360adaa47457b6"
+    },
+    {
+      "path": "src/agent/providers/qwen.ts",
+      "sha256": "06a3e6b6fdc2127f7fe1b0bcdae6406f4f7ba1f0bb1dc22b13970f377efdebcc"
+    },
+    {
+      "path": "test/agent/codex-sdk-provider.test.ts",
+      "sha256": "8c70df3056d0b541f558dc264fedc0815e0a43cef358bc6b4e1706f149a6d49c"
+    },
+    {
+      "path": "test/agent/priority-preserving-context-cap.test.ts",
+      "sha256": "cb745d2b849c2ccb4f35ff6da63e3bf0b90bf14c443dce85cadc0ca5955cadba"
+    },
+    {
+      "path": "test/agent/qwen-provider.test.ts",
+      "sha256": "d44df9dae932d7e497e2511ab50de5d3d0754a6ad6a5096062233fdb752574d9"
+    },
+    {
+      "path": "test/agent/transport-runtime-assembly.test.ts",
+      "sha256": "1fe1fef5a7123e660fa3589e2ca9102a9967b8fd5bc1dc4de64ee66f85122671"
+    },
+    {
+      "path": "test/daemon/memory-mcp-tools-schema-firewall.test.ts",
+      "sha256": "7fd9680a7e69571d0e9bacb678a45eeb267add405bef13e3d0cb8393268d2e18"
+    },
+    {
+      "path": "test/daemon/send-tool.test.ts",
+      "sha256": "2682c5920b96a1ac1c905ff6f219a6c6a1a9f00572ae4e3a495ec10735969e40"
+    },
+    {
+      "path": "test/shared/session-identity.test.ts",
+      "sha256": "097b6d6217576540455cc619602cb7efc24ba32496cc3cc2d4b96186ae5366c5"
+    },
+    {
+      "path": "test/store/session-store.test.ts",
+      "sha256": "24c8f5a595824f55f693cf0c5891799646cc284689e594d021bba7d97edb36d0"
+    },
+    {
+      "path": "web/test/components/SessionIdentityTabs.limit.test.tsx",
+      "sha256": "77e3b1a99ffcb9030e1c16a99f983e1a403f30a1c48beeaf42105ed8d9b374bc"
+    }
+  ],
+  "patch": {
+    "path": "evidence-r2/revision.diff",
+    "sha256": "d4c85b1801e625163680037b72870df8d524e298288cde1560764ddd46bf3778"
+  },
+  "revision": "identity-limit-expansion-r2-current-dev-cb210825-qwen-safe",
+  "taskId": "tsk_nbm"
+}

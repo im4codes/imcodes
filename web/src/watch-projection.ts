@@ -2,6 +2,8 @@ import { formatLabel } from './format-label.js';
 import { getApiKey } from './api.js';
 import { pushDurableEventToWatch, syncSnapshotToWatch } from './watch-bridge.js';
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
+import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 import { isRunningTimelineEvent, isSdkSubagentTimelineEvent } from './timeline-running.js';
 import {
   createTransportQueueReducerState,
@@ -173,8 +175,11 @@ const BADGE_MAP: Record<string, string> = {
   'gemini-sdk': 'gm',
   'grok-sdk': 'gr',
   'kimi-sdk': 'km',
+  [HERMES_AGENT_PROVIDER_ID]: 'he',
   'deepseek-harness': 'ds',
   pi: 'pi',
+  [CODEBUDDY_PROVIDER_IDS.CHINA]: 'cb',
+  [CODEBUDDY_PROVIDER_IDS.INTERNATIONAL]: 'cb',
   'shell': 'sh',
   'script': 'sc',
 };

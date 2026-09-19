@@ -77,7 +77,7 @@ export async function buildSubSessionSyncPayload(
     return null;
   }
 
-  const freshDisplay: Partial<Pick<SessionRecord, 'modelDisplay' | 'codexAvailableModels' | 'planLabel' | 'quotaLabel' | 'quotaUsageLabel' | 'quotaMeta'>> = isQwenSession(r.agentType)
+  const freshDisplay: Partial<Pick<SessionRecord, 'modelDisplay' | 'codexAvailableModels' | 'planLabel' | 'quotaLabel' | 'quotaUsageLabel' | 'quotaMeta' | 'codexCreditsBalance' | 'codexCreditsHasCredits' | 'codexCreditsUnlimited'>> = isQwenSession(r.agentType)
     ? getQwenDisplayMetadata({
         model: r.qwenModel,
         authType: r.qwenAuthType,
@@ -149,6 +149,9 @@ export async function buildSubSessionSyncPayload(
     quotaLabel: usageQuota?.quotaLabel ?? freshDisplay.quotaLabel ?? r.quotaLabel ?? null,
     quotaUsageLabel: freshDisplay.quotaUsageLabel ?? r.quotaUsageLabel ?? null,
     quotaMeta: usageQuota?.quotaMeta ?? freshDisplay.quotaMeta ?? r.quotaMeta ?? null,
+    codexCreditsBalance: freshDisplay.codexCreditsBalance ?? r.codexCreditsBalance ?? null,
+    codexCreditsHasCredits: freshDisplay.codexCreditsHasCredits ?? r.codexCreditsHasCredits ?? null,
+    codexCreditsUnlimited: freshDisplay.codexCreditsUnlimited ?? r.codexCreditsUnlimited ?? null,
     effort: r.effort ?? null,
     ...(transportQueue ?? {}),
   };

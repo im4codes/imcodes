@@ -1,0 +1,329 @@
+import { describe, it, expect } from 'vitest';
+import {
+  readDelegationDispatchFact,
+  readMachineControlDispatchFact,
+  projectDelegationClaim,
+  readDelegationClaim,
+  isDelegationDispatchTool,
+  DELEGATION_AUTHORITY_MCP_SERVER,
+  DELEGATION_CLAIM_METADATA_FIELD,
+} from '../../shared/delegation-claim.js';
+
+const ACCEPTED_OUTPUT = {
+  status: 'accepted',
+  dispatchId: 'send_dispatch_806104d8',
+  messageId: 'send_message_4772bca6',
+  deliveries: [{ target: 'deck_cd_brain', messageId: 'send_message_4772bca6', status: 'delivered' }],
+};
+const TASK_ARGS = { task: { taskId: 'tsk_5gi', assignmentId: 'asg_5gl' } };
+
+describe('delegation dispatch facts', () => {
+  it('binds a real dispatch to its exact authority ids', () => {
+    const fact = readDelegationDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER, 'send_message', TASK_ARGS, ACCEPTED_OUTPUT,
+    );
+    expect(fact).toEqual({
+      dispatchId: 'send_dispatch_806104d8',
+      taskId: 'tsk_5gi',
+      assignmentId: 'asg_5gl',
+      deliveries: [{ target: 'deck_cd_brain', messageId: 'send_message_4772bca6', status: 'delivered' }],
+    });
+  });
+
+  it('substantiates a new supervised task from the daemon-minted ids on the accepted result', () => {
+    // A new task send names only an objective; the authority ids exist only
+    // on the accepted result the daemon returned.
+    const fact = readDelegationDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER,
+      'send_message',
+      { target: 'deck_sub_worker', message: 'implement it', task: { objective: 'Implement the retry queue' } },
+      { ...ACCEPTED_OUTPUT, taskId: 'tsk_new', assignmentId: 'asg_new' },
+    );
+    expect(fact).toMatchObject({ taskId: 'tsk_new', assignmentId: 'asg_new' });
+  });
+
+  it('refuses requested ids that disagree with the accepted authority ids', () => {
+    expect(readDelegationDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER, 'send_message', TASK_ARGS,
+      { ...ACCEPTED_OUTPUT, taskId: 'tsk_other', assignmentId: 'asg_5gl' },
+    )).toBeNull();
+    expect(readDelegationDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER, 'send_message', TASK_ARGS,
+      { ...ACCEPTED_OUTPUT, taskId: 'tsk_5gi', assignmentId: 'asg_other' },
+    )).toBeNull();
+    // Agreement (continuation of an existing assignment) stays substantiated.
+    expect(readDelegationDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER, 'send_message', TASK_ARGS,
+      { ...ACCEPTED_OUTPUT, taskId: 'tsk_5gi', assignmentId: 'asg_5gl' },
+    )).toMatchObject({ taskId: 'tsk_5gi', assignmentId: 'asg_5gl' });
+  });
+
+  it('refuses a native collaboration send_message that shares the short name', () => {
+    // Codex's own send_message carries no IM.codes authority. Distinguishing by
+    // tool name alone is exactly how a non-durable native call could have been
+    // counted as an authoritative dispatch.
+    expect(isDelegationDispatchTool('codex-native', 'send_message')).toBe(false);
+    expect(readDelegationDispatchFact('codex-native', 'send_message', TASK_ARGS, ACCEPTED_OUTPUT))
+      .toBeNull();
+  });
+
+  it('refuses an accepted dispatch that reached nobody', () => {
+    const fact = readDelegationDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER, 'send_message', TASK_ARGS,
+      { ...ACCEPTED_OUTPUT, deliveries: [] },
+    );
+    expect(fact, 'acceptance is not delivery').toBeNull();
+  });
+
+  it('refuses a dispatch with no dispatchId', () => {
+    const { dispatchId: _omitted, ...noId } = ACCEPTED_OUTPUT;
+    expect(readDelegationDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER, 'send_message', TASK_ARGS, noId,
+    )).toBeNull();
+  });
+
+  it('refuses a non-accepted status', () => {
+    expect(readDelegationDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER, 'send_message', TASK_ARGS,
+      { ...ACCEPTED_OUTPUT, status: 'error' },
+    )).toBeNull();
+  });
+
+  it('drops delivery legs missing a target or status rather than counting them', () => {
+    const fact = readDelegationDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER, 'send_message', TASK_ARGS,
+      { ...ACCEPTED_OUTPUT, deliveries: [{ target: 'deck_cd_brain' }, { status: 'queued' }] },
+    );
+    expect(fact, 'no complete delivery leg means no substantiation').toBeNull();
+  });
+});
+
+describe('controlled-device dispatch facts', () => {
+  const nodeId = '1472527657';
+
+  it('substantiates exec completion and a Computer Use helper timeout only after target dispatch', () => {
+    const execFact = readMachineControlDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER,
+      'exec_remote',
+      { machine: nodeId, command: 'private command that must not reach the timeline' },
+      { status: 'ok', outcome: 'completed', ok: true, exitCode: 0 },
+      'mcp-exec-1',
+    );
+    expect(execFact).toEqual({
+      dispatchId: 'mcp-exec-1', kind: 'machine-control', tool: 'exec_remote', machine: nodeId,
+      deliveries: [{ target: nodeId, status: 'delivered' }],
+    });
+    expect(JSON.stringify(execFact)).not.toContain('private command');
+
+    expect(readMachineControlDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER,
+      'computer_use_call',
+      { machine: nodeId, tool: 'list_apps' },
+      {
+        status: 'ok', outcome: 'tool_error',
+        result: { ok: false, tool: 'list_apps', error: 'computer_use_helper_connect_timeout' },
+      },
+      'mcp-cu-1',
+    )).toMatchObject({
+      dispatchId: 'mcp-cu-1', kind: 'machine-control', tool: 'computer_use_call', machine: nodeId,
+    });
+  });
+
+  it.each(['local', 'localhost', 'self', 'this', ' LOCAL '])(
+    'normalizes an authorized local Computer Use dispatch from %s',
+    (machine) => {
+      expect(readMachineControlDispatchFact(
+        DELEGATION_AUTHORITY_MCP_SERVER,
+        'computer_use_call',
+        { machine, tool: 'list_apps' },
+        { status: 'ok', outcome: 'completed', result: { ok: true, tool: 'list_apps', content: [] } },
+        'mcp-local-1',
+      )).toEqual({
+        dispatchId: 'mcp-local-1',
+        kind: 'machine-control',
+        tool: 'computer_use_call',
+        machine: 'local',
+        deliveries: [{ target: 'local', status: 'delivered' }],
+      });
+    },
+  );
+
+  it('does not treat local as a valid exec_remote target or trust arbitrary machine aliases', () => {
+    const output = { status: 'ok', outcome: 'completed', result: { ok: true } };
+    expect(readMachineControlDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER, 'exec_remote', { machine: 'local' }, output, 'exec-local',
+    )).toBeNull();
+    expect(readMachineControlDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER, 'computer_use_call', { machine: 'workstation' }, output, 'cu-alias',
+    )).toBeNull();
+  });
+
+  it.each([
+    [{ status: 'error', reason: 'scope_forbidden' }, 'authorization refusal'],
+    [{ status: 'error', reason: 'exec_offline' }, 'offline refusal'],
+    [{ status: 'ok', outcome: 'not_dispatched' }, 'pre-dispatch outcome'],
+    [{ status: 'ok', outcome: 'dispatched_no_result' }, 'indeterminate outcome'],
+  ])('does not claim an authorized dispatch for %s (%s)', (output) => {
+    expect(readMachineControlDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER,
+      'computer_use_call',
+      { machine: nodeId, tool: 'list_apps' },
+      output,
+      'mcp-negative',
+    )).toBeNull();
+  });
+
+  it('rejects native/provider-name collisions and missing exact call identity', () => {
+    const output = { status: 'ok', outcome: 'completed', result: { ok: true } };
+    expect(readMachineControlDispatchFact('codex-native', 'computer_use_call', { machine: nodeId }, output, 'call'))
+      .toBeNull();
+    expect(readMachineControlDispatchFact(DELEGATION_AUTHORITY_MCP_SERVER, 'computer_use_call', { machine: nodeId }, output, ''))
+      .toBeNull();
+  });
+});
+
+describe('authority requires exact ids and a real delivery leg (R3)', () => {
+  it('requires BOTH taskId and assignmentId, not just one', () => {
+    // A dispatch that names no task/assignment cannot be checked against the
+    // registry, so it cannot substantiate "assigned/queued/recovered".
+    expect(readDelegationDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER, 'send_message',
+      { task: { assignmentId: 'asg_5gl' } }, ACCEPTED_OUTPUT,
+    ), 'missing taskId').toBeNull();
+    expect(readDelegationDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER, 'send_message',
+      { task: { taskId: 'tsk_5gi' } }, ACCEPTED_OUTPUT,
+    ), 'missing assignmentId').toBeNull();
+    expect(readDelegationDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER, 'send_message', {}, ACCEPTED_OUTPUT,
+    ), 'an ordinary send with no task binding').toBeNull();
+  });
+
+  it('refuses a dispatch whose only delivery legs failed', () => {
+    expect(readDelegationDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER, 'send_message', TASK_ARGS,
+      { ...ACCEPTED_OUTPUT, deliveries: [{ target: 'deck_sub_w1', status: 'failed' }] },
+    ), 'a failed delivery reached nobody').toBeNull();
+  });
+
+  it('refuses unknown or empty delivery statuses rather than trusting non-emptiness', () => {
+    for (const status of ['', '   ', 'pending', 'accepted', 'unknown', 'sent']) {
+      expect(readDelegationDispatchFact(
+        DELEGATION_AUTHORITY_MCP_SERVER, 'send_message', TASK_ARGS,
+        { ...ACCEPTED_OUTPUT, deliveries: [{ target: 'deck_sub_w1', status }] },
+      ), `status ${JSON.stringify(status)} must not substantiate`).toBeNull();
+    }
+  });
+
+  it('keeps a mixed dispatch, but only its genuinely reached legs', () => {
+    const fact = readDelegationDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER, 'send_message', TASK_ARGS,
+      { ...ACCEPTED_OUTPUT, deliveries: [
+        { target: 'deck_sub_dead', status: 'failed' },
+        { target: 'deck_sub_w1', status: 'delivered' },
+      ] },
+    );
+    expect(fact?.deliveries.map((leg) => leg.target)).toEqual(['deck_sub_w1']);
+    expect(fact?.deliveries, 'a failed leg must not be reported as reached')
+      .not.toContainEqual(expect.objectContaining({ target: 'deck_sub_dead' }));
+  });
+
+  it('accepts delivered and queued as real outcomes (controls)', () => {
+    for (const status of ['delivered', 'queued']) {
+      const fact = readDelegationDispatchFact(
+        DELEGATION_AUTHORITY_MCP_SERVER, 'send_message', TASK_ARGS,
+        { ...ACCEPTED_OUTPUT, deliveries: [{ target: 'deck_sub_w1', status }] },
+      );
+      expect(fact, `${status} is a real outcome`).not.toBeNull();
+      expect(fact?.taskId).toBe('tsk_5gi');
+      expect(fact?.assignmentId).toBe('asg_5gl');
+    }
+  });
+});
+
+describe('delegation claim projection', () => {
+  it('is unsubstantiated with an empty dispatch list when nothing was dispatched', () => {
+    const projection = projectDelegationClaim([]);
+    expect(projection.status).toBe('unsubstantiated');
+    expect(
+      projection.dispatches,
+      'a consumer must have no dispatch data it could render as assigned/queued',
+    ).toEqual([]);
+  });
+
+  it('is substantiated and carries the exact ids when a dispatch happened', () => {
+    const fact = readDelegationDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER, 'send_message', TASK_ARGS, ACCEPTED_OUTPUT,
+    )!;
+    const projection = projectDelegationClaim([fact]);
+    expect(projection.status).toBe('substantiated');
+    expect(projection.dispatches).toHaveLength(1);
+    expect(projection.dispatches[0].dispatchId).toBe('send_dispatch_806104d8');
+    expect(projection.dispatches[0].taskId).toBe('tsk_5gi');
+    expect(projection.dispatches[0].assignmentId).toBe('asg_5gl');
+  });
+
+  it('round-trips through message metadata', () => {
+    const projection = projectDelegationClaim([]);
+    const metadata = { [DELEGATION_CLAIM_METADATA_FIELD]: projection };
+    expect(readDelegationClaim(metadata)).toEqual(projection);
+    expect(readDelegationClaim(undefined)).toBeNull();
+    expect(readDelegationClaim({ other: 1 })).toBeNull();
+  });
+});
+
+describe('execution summary on delivery facts', () => {
+  const ARGS = { task: { taskId: 'tsk_1', assignmentId: 'asg_1' } };
+  const dispatchOutput = (execution: unknown) => ({
+    status: 'accepted',
+    dispatchId: 'send_dispatch_1',
+    deliveries: [{ target: 'deck_a_w1', status: 'delivered', execution }],
+  });
+
+  it('carries a well-formed executor through to the projection', () => {
+    // This is the whole point of the field: the id and the executor travel
+    // together, so reading the receipt does not require a second lookup.
+    const fact = readDelegationDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER,
+      'send_message',
+      ARGS,
+      dispatchOutput({
+        sessionName: 'deck_a_w1',
+        label: 'Coder',
+        agentType: 'claude-code-sdk',
+        providerFamily: 'anthropic',
+        model: 'claude-opus-5',
+        pool: 'primary',
+        assignmentStatus: 'delegated',
+        source: 'assignment',
+      }),
+    );
+    expect(fact?.deliveries[0]?.execution).toMatchObject({
+      sessionName: 'deck_a_w1',
+      pool: 'primary',
+      source: 'assignment',
+    });
+  });
+
+  it('drops a relayed executor that cannot name a session or its provenance', () => {
+    // The projection crosses a relay, so junk must not reach the renderer
+    // wearing the same shape as a fact.
+    for (const bad of [
+      { label: 'Coder', source: 'assignment' },
+      { sessionName: 'deck_a_w1' },
+      { sessionName: 'deck_a_w1', source: 'guessed' },
+      'deck_a_w1',
+      null,
+    ]) {
+      const fact = readDelegationDispatchFact(
+        DELEGATION_AUTHORITY_MCP_SERVER,
+        'send_message',
+        ARGS,
+        dispatchOutput(bad),
+      );
+      // The delivery itself still counts; only the unusable executor is dropped.
+      expect(fact?.deliveries[0]).toBeDefined();
+      expect(fact?.deliveries[0]).not.toHaveProperty('execution');
+    }
+  });
+});

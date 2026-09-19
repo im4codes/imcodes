@@ -19,15 +19,19 @@ import {
   type DelegationContextStatus,
 } from '../../shared/agent-delegation.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
+import {
+  MEMORY_MCP_SEND_DELIVERY_MODES,
+  type MemoryMcpSendDeliveryMode,
+} from '../../shared/memory-mcp-contracts.js';
 import { redactSensitiveText } from '../../shared/redact-secrets.js';
 import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
 import { isValidImcodesSessionName, resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { getSession as getStoredSession, type SessionRecord } from '../store/session-store.js';
-import { ensureTransportRuntimeForPendingResend, getTransportRuntime } from '../agent/session-manager.js';
+import { drainTransportResendQueueForDispatch, ensureTransportRuntimeForPendingResend, getTransportRuntime } from '../agent/session-manager.js';
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import { buildTransportQueueSnapshotPayload } from './transport-queue-projection.js';
-import { enqueueResend } from './transport-resend-queue.js';
+import { enqueueResend, recipientFromSessionRecord } from './transport-resend-queue.js';
 import { injectPeerAuditBriefIntoProcessSession, type PeerAuditProcessInjectError } from './peer-audit-process-injector.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import {
@@ -35,6 +39,7 @@ import {
   expireDelegationReplyAuthority,
 } from './delegation-reply-authority.js';
 import type { TimelineEvent } from './timeline-event.js';
+import type { QueueSupervisionReference } from '../../shared/transport-queue-types.js';
 
 export interface SessionDispatchRuntimeCaller {
   userId: string;
@@ -47,6 +52,20 @@ export interface SessionDispatchMessageOptions {
   dispatchId: SendDispatchId;
   messageId: SendMessageId;
   sharedActor?: SharedActorEnvelope;
+  /** Node MCP send_message: prefer provider-native append before FIFO. */
+  deliveryMode?: MemoryMcpSendDeliveryMode;
+  /**
+   * Internal daemon transport binding. The live /send boundary validates this
+   * against the registry and creates/verifies the exact assignment worktree
+   * before acknowledging delivery.
+   */
+  supervision?: { taskId: string; assignmentId: string };
+  /** Durable lifecycle authority; never inferred from the message body. */
+  queueSupervisionReference?: QueueSupervisionReference;
+  /** Persist before delivery. Used by daemon-owned exactly-once control traffic. */
+  durableQueue?: boolean;
+  /** Deliver daemon-owned control traffic to the agent without a duplicate user timeline card. */
+  suppressTimeline?: boolean;
 }
 
 export type SessionDispatchOptions = SessionDispatchMessageOptions;
@@ -163,12 +182,52 @@ export async function dispatchSessionMessage(
 ): Promise<SessionDispatchMessageResult> {
   if ((target.runtimeType ?? getSessionRuntimeType(target.agentType)) === 'transport') {
     const runtime = getTransportRuntime(target.name);
-    if (!runtime?.providerSessionId) {
+    if (options.durableQueue) {
       const queued = enqueueResend(target.name, {
+        // Bind the durable row to the live runtime, not to the reusable name.
+        ...(recipientFromSessionRecord(target) ? { recipient: recipientFromSessionRecord(target) } : {}),
         text: message,
         commandId: options.messageId,
         clientMessageId: options.messageId,
         ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
+        ...(options.queueSupervisionReference ? { supervisionReference: options.queueSupervisionReference } : {}),
+        ...(options.suppressTimeline ? { timelineCommitted: true } : {}),
+        // Daemon-owned supervision traffic is persisted before delivery. Keep
+        // its append policy on that durable row: otherwise the immediate drain
+        // silently converts an automatic Brain wake into an ordinary FIFO item,
+        // which cannot resume a turn currently parked in wait_agent. The resend
+        // handoff owns exactly-once provider admission and falls back to FIFO
+        // only when native append is unavailable.
+        ...(options.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
+          ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND }
+          : {}),
+        queuedAt: Date.now(),
+      });
+      if (!queued.accepted) throw new Error(`transport queue unavailable for session ${target.name}`);
+      timelineEmitter.emit(target.name, 'session.state', {
+        state: 'queued',
+        ...buildTransportQueueSnapshotPayload(target.name, 'session_dispatch_durable'),
+      }, { source: 'daemon', confidence: 'high' });
+      if (runtime?.providerSessionId) {
+        await drainTransportResendQueueForDispatch(target.name);
+      } else {
+        void ensureTransportRuntimeForPendingResend(target.name);
+      }
+      return 'queued';
+    }
+    if (!runtime?.providerSessionId) {
+      const queued = enqueueResend(target.name, {
+        // Bind the durable row to the live runtime, not to the reusable name.
+        ...(recipientFromSessionRecord(target) ? { recipient: recipientFromSessionRecord(target) } : {}),
+        text: message,
+        commandId: options.messageId,
+        clientMessageId: options.messageId,
+        ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
+        ...(options.queueSupervisionReference ? { supervisionReference: options.queueSupervisionReference } : {}),
+        ...(options.suppressTimeline ? { timelineCommitted: true } : {}),
+        ...(options.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
+          ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND }
+          : {}),
         queuedAt: Date.now(),
       });
       if (!queued.accepted) throw new Error(`transport queue unavailable for session ${target.name}`);
@@ -182,10 +241,74 @@ export async function dispatchSessionMessage(
       void ensureTransportRuntimeForPendingResend(target.name);
       return 'queued';
     }
-    const result = options.sharedActor
+    if (options.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND) {
+      const result = options.queueSupervisionReference
+        ? await runtime.appendExternalMessageToActiveTurn(
+            message,
+            options.messageId,
+            options.queueSupervisionReference,
+          )
+        : await runtime.appendExternalMessageToActiveTurn(message, options.messageId);
+      if (result === 'retry') {
+        throw new Error('transport supervision authority temporarily unavailable');
+      }
+      if (result !== 'sent' && result !== 'appended') {
+        // Unsupported providers and active-turn races retain the old durable
+        // delivery guarantee. Prefer append, but never drop a peer message.
+        const fallback = options.suppressTimeline
+          ? runtime.send(message, options.messageId, undefined, undefined, {
+              ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
+              timelineCommitted: true,
+              ...(options.queueSupervisionReference
+                ? { supervisionReference: options.queueSupervisionReference }
+                : {}),
+            })
+          : options.sharedActor
+          ? runtime.send(message, options.messageId, undefined, undefined, {
+              sharedActor: options.sharedActor,
+              ...(options.queueSupervisionReference
+                ? { supervisionReference: options.queueSupervisionReference }
+                : {}),
+            })
+          : options.queueSupervisionReference
+          ? runtime.send(message, options.messageId, undefined, undefined, {
+              supervisionReference: options.queueSupervisionReference,
+            })
+          : runtime.send(message, options.messageId);
+        if (fallback === 'sent' && !options.suppressTimeline) {
+          emitStructuredTransportUserMessage(
+            target.name,
+            message,
+            options.messageId,
+            options.sharedActor,
+          );
+        } else {
+          timelineEmitter.emit(target.name, 'session.state', {
+            state: 'queued',
+            ...buildTransportQueueSnapshotPayload(target.name, 'send_tool_append_fallback'),
+          }, { source: 'daemon', confidence: 'high' });
+        }
+        return fallback;
+      }
+      if (!options.suppressTimeline) {
+        emitStructuredTransportUserMessage(
+          target.name,
+          message,
+          options.messageId,
+          options.sharedActor,
+        );
+      }
+      return 'sent';
+    }
+    const result = options.suppressTimeline
+      ? runtime.send(message, options.messageId, undefined, undefined, {
+          ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
+          timelineCommitted: true,
+        })
+      : options.sharedActor
       ? runtime.send(message, options.messageId, undefined, undefined, { sharedActor: options.sharedActor })
       : runtime.send(message, options.messageId);
-    if (result === 'sent') {
+    if (result === 'sent' && !options.suppressTimeline) {
       emitStructuredTransportUserMessage(target.name, message, options.messageId, options.sharedActor);
     } else if (result === 'queued') {
       const queuePayload = buildTransportQueueSnapshotPayload(target.name, 'send_tool');
@@ -198,7 +321,11 @@ export async function dispatchSessionMessage(
   }
 
   const { sendProcessSessionMessageForAutomation } = await import('./command-handler.js');
-  await sendProcessSessionMessageForAutomation(target.name, message);
+  if (options.suppressTimeline) {
+    await sendProcessSessionMessageForAutomation(target.name, message, { suppressTimeline: true });
+  } else {
+    await sendProcessSessionMessageForAutomation(target.name, message);
+  }
 }
 
 /** Resolve a named session and deliver through the runtime-neutral boundary.

@@ -13,27 +13,46 @@
 
 import { randomBytes, createHash } from 'node:crypto';
 import { writeFile, readFile, mkdir, chmod, unlink } from 'node:fs/promises';
-import { existsSync, writeFileSync, readFileSync } from 'node:fs';
+import { existsSync, writeFileSync, readFileSync, mkdtempSync, rmSync, readdirSync} from 'node:fs';
 import { execSync, execFileSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { join } from 'node:path';
-import { homedir, hostname } from 'node:os';
+import { homedir, hostname, tmpdir } from 'node:os';
 import {
   dockerComposeTemplate,
   caddyfileTemplate,
   envTemplate,
+  turnEntrypointTemplate,
   turnserverConfigTemplate,
   type TurnDeploymentTemplateConfig,
+  NODE_EXE_VERSION_VOLUME,
+  NODE_EXE_VERSION_DIR,
 } from './templates.js';
 import {
+  TURN_RELAY_CAPACITY,
+  TURN_RELAY_NETWORK,
+  TURN_RELAY_NETWORK_MODES,
+  TURN_RELAY_RANGE_REJECTION,
   TURN_SERVICE_DEFAULTS,
   TURN_SERVICE_ENV,
+  parseTurnRelayCapacity,
+  parseTurnRelayRange,
   isTurnServiceHost,
   isTurnServiceIpv4,
   isTurnServicePort,
+  isTurnRelayNetworkMode,
+  turnRelayCapacityForRange,
+  turnRelayCapacityRejectionMessage,
+  turnRelayNetworkMode,
+  turnRelayPortCount,
+  turnRelayRangeForCapacity,
+  type TurnRelayNetworkMode,
+  type TurnRelayRangeOrigin,
 } from '../../shared/turn-service.js';
 import { resolveDaemonLaunchTarget, renderSystemdExecStart } from '../util/launch-target.js';
 import { enableSystemdUserLinger, formatSystemdLingerFailureMessage } from '../util/systemd-linger.js';
+import { renderRecoveryExecStart, renderSystemdStartLimitBlock, renderSystemdTerminalDiagnostics } from '../util/systemd-unit.js';
+import { installRecoveryUnits } from '../util/systemd-recovery-install.js';
 
 const CREDS_DIR = join(homedir(), '.imcodes');
 const CREDS_PATH = join(CREDS_DIR, 'server.json');
@@ -67,6 +86,17 @@ async function confirm(prompt: string): Promise<boolean> {
   });
 }
 
+/** Free-text prompt. An empty line means "use the documented default". */
+async function ask(prompt: string): Promise<string> {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    rl.question(`  ${prompt} `, (answer) => {
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
+}
+
 /** Stop and remove all containers, volumes, and config files for a clean reinstall. */
 function teardown(compose: string, dir: string): void {
   log('Stopping and removing all containers and volumes...');
@@ -79,7 +109,14 @@ function teardown(compose: string, dir: string): void {
     // compose down may fail if services never started — that's fine
   }
   // Remove generated config files
-  for (const file of ['.env', '.setup-secrets.json', 'docker-compose.yml', 'Caddyfile', 'turnserver.conf']) {
+  for (const file of [
+    '.env',
+    '.setup-secrets.json',
+    'docker-compose.yml',
+    'Caddyfile',
+    'turnserver.conf',
+    'turn-entrypoint.sh',
+  ]) {
     const p = join(dir, file);
     if (existsSync(p)) {
       execSync(`rm -f "${p}"`);
@@ -261,6 +298,7 @@ interface SetupFlowOptions {
   turnHost?: string;
   turnPort?: string | number;
   turnExternalIp?: string;
+  turnRelayCapacity?: string | number;
   turnRelayMinPort?: string | number;
   turnRelayMaxPort?: string | number;
   turnDnsOnly?: boolean;
@@ -338,7 +376,7 @@ async function persistSecrets(dir: string, secrets: SetupSecrets): Promise<void>
   await chmod(secretsPath, 0o600);
 }
 
-function parsePortOption(value: string | number | undefined, fallback: number): number | undefined {
+function parsePortOption(value: string | number | undefined, fallback?: number): number | undefined {
   if (value === undefined) return fallback;
   if (typeof value === 'number') return isTurnServicePort(value) ? value : undefined;
   if (!/^\d{1,5}$/.test(value)) return undefined;
@@ -358,18 +396,39 @@ function parseBoundedInteger(
   return Number.isSafeInteger(parsed) && parsed >= min && parsed <= max ? parsed : undefined;
 }
 
-function recoverTurnDeployment(dir: string): Partial<EnabledTurnDeployment> | undefined {
+/**
+ * A recovered deployment, plus whether it published a relay range of its own.
+ * That flag is load-bearing: an existing range must be preserved exactly, so
+ * "absent" and "present but unreadable" cannot be collapsed into a default.
+ */
+type RecoveredTurnDeployment = Partial<EnabledTurnDeployment> & {
+  relayRangeConfigured: boolean;
+  /** Exactly what TURN_RELAY_NETWORK_MODE said, so an unusable value can fail closed. */
+  relayNetworkModeRaw?: string;
+};
+
+function recoverTurnDeployment(dir: string): RecoveredTurnDeployment | undefined {
   const envPath = join(dir, '.env');
   if (!existsSync(envPath)) return undefined;
   const env = parseEnvFile(readFileSync(envPath, 'utf8'));
   if (env[TURN_SERVICE_ENV.ENABLED] !== 'true') return undefined;
+  const relayNetworkModeRaw = env[TURN_SERVICE_ENV.RELAY_NETWORK_MODE];
   return {
     enabled: true,
     host: env[TURN_SERVICE_ENV.HOST],
     port: parsePortOption(env[TURN_SERVICE_ENV.PORT], TURN_SERVICE_DEFAULTS.PORT),
     externalIp: env[TURN_SERVICE_ENV.EXTERNAL_IP],
-    relayMinPort: parsePortOption(env[TURN_SERVICE_ENV.RELAY_MIN_PORT], TURN_SERVICE_DEFAULTS.RELAY_MIN_PORT),
-    relayMaxPort: parsePortOption(env[TURN_SERVICE_ENV.RELAY_MAX_PORT], TURN_SERVICE_DEFAULTS.RELAY_MAX_PORT),
+    // No default fallback here on purpose. Substituting the current default
+    // range for a deployment that already published one is exactly how an
+    // upgrade silently moves — and shrinks — the ports coturn is bound to.
+    relayRangeConfigured: env[TURN_SERVICE_ENV.RELAY_MIN_PORT] !== undefined
+      || env[TURN_SERVICE_ENV.RELAY_MAX_PORT] !== undefined,
+    relayMinPort: parsePortOption(env[TURN_SERVICE_ENV.RELAY_MIN_PORT]),
+    relayMaxPort: parsePortOption(env[TURN_SERVICE_ENV.RELAY_MAX_PORT]),
+    // The deployment's own record of how its container is attached. Absent
+    // means legacy, which is bridge — the only shape older installers built.
+    relayNetworkModeRaw,
+    networkMode: isTurnRelayNetworkMode(relayNetworkModeRaw) ? relayNetworkModeRaw : undefined,
     sharedSecret: env[TURN_SERVICE_ENV.SHARED_SECRET],
     credentialTtlSeconds: parseBoundedInteger(
       env[TURN_SERVICE_ENV.CREDENTIAL_TTL_SECONDS],
@@ -378,6 +437,203 @@ function recoverTurnDeployment(dir: string): Partial<EnabledTurnDeployment> | un
       TURN_SERVICE_DEFAULTS.CREDENTIAL_TTL_MAX_SECONDS,
     ),
   };
+}
+
+function requireTurnRelayCapacity(value: string | number | undefined): number {
+  const parsed = parseTurnRelayCapacity(value);
+  if ('rejection' in parsed) fatal(turnRelayCapacityRejectionMessage(parsed.rejection));
+  return parsed.capacity;
+}
+
+function describeTurnRelayCapacity(relayMinPort: number, relayMaxPort: number): string {
+  const capacity = turnRelayCapacityForRange(relayMinPort, relayMaxPort);
+  return `${capacity} concurrent relay allocation${capacity === 1 ? '' : 's'}`;
+}
+
+function warnIfTurnRelayRangeMoved(
+  recovered: RecoveredTurnDeployment | undefined,
+  next: { relayMinPort: number; relayMaxPort: number },
+): void {
+  const { relayMinPort, relayMaxPort } = recovered ?? {};
+  if (relayMinPort === undefined || relayMaxPort === undefined) return;
+  if (relayMinPort === next.relayMinPort && relayMaxPort === next.relayMaxPort) return;
+  const before = turnRelayCapacityForRange(relayMinPort, relayMaxPort);
+  const after = turnRelayCapacityForRange(next.relayMinPort, next.relayMaxPort);
+  console.warn(`\n  Warning: the TURN relay range changes from ${relayMinPort}-${relayMaxPort} `
+    + `(${before} concurrent allocations) to ${next.relayMinPort}-${next.relayMaxPort} (${after}). `
+    + 'Open the new UDP range in the firewall before relying on it.'
+    + (after < before
+      ? ` This REDUCES capacity: allocations beyond ${after} concurrent relays will be refused.`
+      : '')
+    + '\n');
+}
+
+/**
+ * Decide the relay range, from exactly one authority per run.
+ *
+ * The capacity question is the normal path: "how many concurrent relay
+ * allocations" is answerable, and standard coturn turns it into a port count
+ * 1:1. The derived range is anchored at the top of the port space precisely so
+ * the largest accepted answer still fits — a fixed low start cannot hold 30000
+ * ports.
+ *
+ * An explicit port range stays supported and stays authoritative when given,
+ * because a range already published to coturn, to Docker and to a firewall is
+ * deployment configuration, not something application code gets to second-guess
+ * by width. Only the protocol rule in `parseTurnRelayRange` may refuse it. What
+ * IS refused here is ambiguity: a capacity that disagrees with an explicit
+ * range, or half a range on a fresh install, fails closed instead of quietly
+ * picking a winner.
+ */
+interface ResolvedTurnRelayRange {
+  relayMinPort: number;
+  relayMaxPort: number;
+  rangeOrigin: TurnRelayRangeOrigin;
+}
+
+async function resolveTurnRelayRange(
+  opts: SetupFlowOptions,
+  recovered: RecoveredTurnDeployment | undefined,
+): Promise<ResolvedTurnRelayRange> {
+  const explicitMin = opts.turnRelayMinPort !== undefined;
+  const explicitMax = opts.turnRelayMaxPort !== undefined;
+
+  if (explicitMin || explicitMax) {
+    const relayMinPort = explicitMin
+      ? parsePortOption(opts.turnRelayMinPort)
+      : recovered?.relayMinPort;
+    const relayMaxPort = explicitMax
+      ? parsePortOption(opts.turnRelayMaxPort)
+      : recovered?.relayMaxPort;
+    if (relayMinPort === undefined) {
+      fatal(explicitMin
+        ? 'TURN relay port range is invalid.'
+        : `--turn-relay-max-port was given without --turn-relay-min-port, and no existing `
+          + `${TURN_SERVICE_ENV.RELAY_MIN_PORT} was found to pair it with. Pass both ports, or pass `
+          + '--turn-relay-capacity instead.');
+    }
+    if (relayMaxPort === undefined) {
+      fatal(explicitMax
+        ? 'TURN relay port range is invalid.'
+        : `--turn-relay-min-port was given without --turn-relay-max-port, and no existing `
+          + `${TURN_SERVICE_ENV.RELAY_MAX_PORT} was found to pair it with. Pass both ports, or pass `
+          + '--turn-relay-capacity instead.');
+    }
+    if (opts.turnRelayCapacity !== undefined) {
+      const requested = requireTurnRelayCapacity(opts.turnRelayCapacity);
+      const offered = turnRelayCapacityForRange(relayMinPort, relayMaxPort);
+      if (requested !== offered) {
+        fatal(`--turn-relay-capacity ${requested} conflicts with the explicit relay range `
+          + `${relayMinPort}-${relayMaxPort}, which serves ${offered} concurrent relay allocations. `
+          + 'Pass one or the other, or make the two agree.');
+      }
+    }
+    warnIfTurnRelayRangeMoved(recovered, { relayMinPort, relayMaxPort });
+    // An explicit capacity was stated and agrees with these ports, so setup may
+    // still choose the network strategy for it.
+    return {
+      relayMinPort,
+      relayMaxPort,
+      rangeOrigin: opts.turnRelayCapacity === undefined ? 'configured' : 'capacity',
+    };
+  }
+
+  if (opts.turnRelayCapacity !== undefined) {
+    const range = turnRelayRangeForCapacity(requireTurnRelayCapacity(opts.turnRelayCapacity));
+    warnIfTurnRelayRangeMoved(recovered, range);
+    return { ...range, rangeOrigin: 'capacity' };
+  }
+
+  if (recovered?.relayRangeConfigured) {
+    // The existing deployment's own answer. Preserved verbatim — including
+    // 49201-50200, which is not derivable from any capacity anchor — and never
+    // re-derived from the current default.
+    if (recovered.relayMinPort === undefined || recovered.relayMaxPort === undefined) {
+      fatal(`Existing ${TURN_SERVICE_ENV.RELAY_MIN_PORT}/${TURN_SERVICE_ENV.RELAY_MAX_PORT} in .env is not a `
+        + 'usable UDP port range. Fix those two values, or pass --turn-relay-min-port and --turn-relay-max-port '
+        + 'explicitly; setup will not replace a configured relay range with a default.');
+    }
+    return {
+      relayMinPort: recovered.relayMinPort,
+      relayMaxPort: recovered.relayMaxPort,
+      rangeOrigin: 'configured',
+    };
+  }
+
+  if (!process.stdin.isTTY) {
+    return { ...turnRelayRangeForCapacity(TURN_RELAY_CAPACITY.DEFAULT_ALLOCATIONS), rangeOrigin: 'capacity' };
+  }
+  console.log('\n  TURN relay capacity is the maximum number of CONCURRENT relayed connections, not users.');
+  console.log('  Standard coturn binds one UDP port per relayed connection, so this many ports are published.');
+  const answer = await ask(`Maximum concurrent TURN relay allocations `
+    + `(${TURN_RELAY_CAPACITY.MIN_ALLOCATIONS}-${TURN_RELAY_CAPACITY.MAX_ALLOCATIONS}) `
+    + `[${TURN_RELAY_CAPACITY.DEFAULT_ALLOCATIONS}]:`);
+  return { ...turnRelayRangeForCapacity(requireTurnRelayCapacity(answer)), rangeOrigin: 'capacity' };
+}
+
+/**
+ * Apply the network strategy the shared rule chose, and refuse the one shape it
+ * cannot honestly deliver.
+ *
+ * Nothing here reduces the capacity or edits the range. Host networking is only
+ * ever selected for a capacity the operator asked for, and only where it exists;
+ * a range the deployment already publishes keeps publishing it, with the cost
+ * stated rather than silently changed.
+ */
+function resolveTurnRelayNetworkMode(
+  range: ResolvedTurnRelayRange,
+  recovered: RecoveredTurnDeployment | undefined,
+): TurnRelayNetworkMode {
+  const raw = recovered?.relayNetworkModeRaw;
+  if (raw !== undefined && !isTurnRelayNetworkMode(raw)) {
+    // Fail closed. Both guesses are damaging and neither is recoverable from
+    // the range alone, so setup will not pick one on the operator's behalf.
+    fatal(`${TURN_SERVICE_ENV.RELAY_NETWORK_MODE} in .env is "${raw}", which is not a network mode. `
+      + `Set it to one of ${TURN_RELAY_NETWORK_MODES.join(' or ')} to state how this deployment's TURN `
+      + 'container is attached; setup will not guess, because guessing either republishes every relay port '
+      + 'or moves a running relay off the bridge.');
+  }
+  const mode = turnRelayNetworkMode({ ...range, persistedMode: recovered?.networkMode });
+  if (recovered?.networkMode !== undefined && recovered.networkMode !== mode) {
+    console.warn(`\n  Warning: the TURN container moves from ${recovered.networkMode} to ${mode} networking. `
+      + (mode === 'host'
+        ? 'Docker will no longer publish the relay range; open it in the host firewall.'
+        : 'Docker will publish the relay range again; the host firewall rule for it is no longer required.')
+      + '\n');
+  }
+  return mode;
+}
+
+function applyTurnRelayNetworkStrategy(
+  range: ResolvedTurnRelayRange,
+  networkMode: TurnRelayNetworkMode,
+  platform: NodeJS.Platform = process.platform,
+): void {
+  const ports = turnRelayPortCount(range.relayMinPort, range.relayMaxPort);
+  const oversizedForBridge = ports > TURN_RELAY_NETWORK.BRIDGE_PUBLISH_MAX_PORTS;
+  if (networkMode === 'host') {
+    if (platform !== 'linux') {
+      // Fail closed instead of publishing 30000 bridge mappings, and instead of
+      // quietly serving a smaller relay than the one that was requested.
+      fatal(`${ports} concurrent relay allocations need Docker host networking, which only exists on Linux; `
+        + `this host is ${platform}. Deploy TURN on a Linux host, or choose a capacity of at most `
+        + `${TURN_RELAY_NETWORK.BRIDGE_PUBLISH_MAX_PORTS} allocations, which a bridge deployment publishes `
+        + 'safely. Setup will not reduce the requested capacity for you.');
+    }
+    console.warn(`\n  Note: ${ports} relay ports is past the ${TURN_RELAY_NETWORK.BRIDGE_PUBLISH_MAX_PORTS} `
+      + 'a Docker bridge can publish sanely, so the TURN container uses host networking. Docker will NOT open '
+      + `the UDP range for you: allow ${range.relayMinPort}-${range.relayMaxPort}/udp in the host firewall.\n`);
+    return;
+  }
+  if (oversizedForBridge) {
+    // Reachable only for a range the deployment already configured, which is
+    // preserved exactly — ports and network mode. Say what it costs.
+    console.warn(`\n  Warning: the configured relay range ${range.relayMinPort}-${range.relayMaxPort} publishes `
+      + `${ports} UDP ports through the Docker bridge, and Docker expands that into one mapping, one proxy and `
+      + 'its own DNAT rules per port — a slow start and a very large resolved Compose model. The range and its '
+      + 'network mode are preserved exactly. To have setup pick host networking instead, re-run with '
+      + '--turn-relay-capacity <allocations>.\n');
+  }
 }
 
 async function resolveTurnDeployment(
@@ -390,6 +646,7 @@ async function resolveTurnDeployment(
   const turnConfigRequested = opts.turnHost !== undefined
     || opts.turnPort !== undefined
     || opts.turnExternalIp !== undefined
+    || opts.turnRelayCapacity !== undefined
     || opts.turnRelayMinPort !== undefined
     || opts.turnRelayMaxPort !== undefined;
   let enabled = opts.turn ?? (Boolean(recovered) || turnConfigRequested);
@@ -404,28 +661,32 @@ async function resolveTurnDeployment(
   const defaultHost = domain.toLowerCase().startsWith('turn.') ? domain : `turn.${domain}`;
   const host = (opts.turnHost ?? recovered?.host ?? defaultHost).trim().toLowerCase();
   const port = parsePortOption(opts.turnPort, recovered?.port ?? TURN_SERVICE_DEFAULTS.PORT);
-  const relayMinPort = parsePortOption(
-    opts.turnRelayMinPort,
-    recovered?.relayMinPort ?? TURN_SERVICE_DEFAULTS.RELAY_MIN_PORT,
-  );
-  const relayMaxPort = parsePortOption(
-    opts.turnRelayMaxPort,
-    recovered?.relayMaxPort ?? TURN_SERVICE_DEFAULTS.RELAY_MAX_PORT,
-  );
+  const resolvedRelayRange = await resolveTurnRelayRange(opts, recovered);
+  const { relayMinPort, relayMaxPort, rangeOrigin } = resolvedRelayRange;
   const discoveredExternalIp = opts.turnExternalIp === undefined ? discoverPublicIpv4()?.trim() : undefined;
   let externalIp = (opts.turnExternalIp ?? recovered?.externalIp ?? discoveredExternalIp)?.trim();
 
   if (!isTurnServiceHost(host)) fatal('TURN host must be a valid DNS hostname.');
   if (!port) fatal('TURN listener port must be between 1 and 65535.');
-  if (!relayMinPort || !relayMaxPort || relayMinPort > relayMaxPort) {
+  // The SAME rule the server runtime applies. These were two separate
+  // implementations with different ceilings, so this installer wrote a relay
+  // range into .env, coturn's min-port/max-port and the Docker publish list
+  // that the runtime then refused — serving every client a STUN-only ICE list
+  // against a healthy coturn.
+  const relayRange = parseTurnRelayRange({ port, relayMinPort, relayMaxPort });
+  if ('rejection' in relayRange) {
+    // `fatal` never returns, which is also what narrows `relayRange` below —
+    // no second copy of the rule, and no unchecked non-null assertion either.
+    if (relayRange.rejection === TURN_RELAY_RANGE_REJECTION.LISTENER_INSIDE_RANGE) {
+      fatal('TURN listener port must not be 80, 443, or inside the relay UDP port range.');
+    }
     fatal('TURN relay port range is invalid.');
   }
-  if (relayMaxPort - relayMinPort > 255) {
-    fatal('TURN relay port range may contain at most 256 UDP ports.');
-  }
-  if (port === 80 || port === 443 || (port >= relayMinPort && port <= relayMaxPort)) {
+  if (port === 80 || port === 443) {
     fatal('TURN listener port must not be 80, 443, or inside the relay UDP port range.');
   }
+  const networkMode = resolveTurnRelayNetworkMode(resolvedRelayRange, recovered);
+  applyTurnRelayNetworkStrategy(resolvedRelayRange, networkMode);
   if (!externalIp || !isTurnServiceIpv4(externalIp)) {
     fatal('Could not determine the TURN server public IPv4. Pass --turn-external-ip <ipv4>.');
   }
@@ -502,8 +763,16 @@ async function resolveTurnDeployment(
     host,
     port,
     externalIp,
-    relayMinPort,
-    relayMaxPort,
+    // Narrowed by the shared rule above, not by a second copy of it.
+    relayMinPort: relayRange.relayMinPort,
+    relayMaxPort: relayRange.relayMaxPort,
+    // Carried into the generated Compose file so the installer and the template
+    // ask the SAME shared rule which network strategy this range gets.
+    rangeOrigin,
+    // Persisted into .env, because it cannot be re-derived from the range on
+    // the next run: a wide range is equally consistent with a legacy bridge
+    // deployment and a host one.
+    networkMode,
     sharedSecret: secrets.turnSharedSecret,
     credentialTtlSeconds: recoveredCredentialTtlSeconds === undefined || upgradeLegacyCredentialTtl
       ? TURN_SERVICE_DEFAULTS.CREDENTIAL_TTL_SECONDS
@@ -538,12 +807,269 @@ async function writeConfigs(
   ));
   await writeFile(join(dir, 'Caddyfile'), caddyfileTemplate(domain));
   const turnConfigPath = join(dir, 'turnserver.conf');
-  if (turn) {
+  const turnEntrypointPath = join(dir, 'turn-entrypoint.sh');
+  // The bridge-address entrypoint belongs to bridge mode only. In host mode
+  // there is no bridge address to translate, and the address it would discover
+  // is a HOST address that denied-peer-ip may deliberately be blocking, so the
+  // wrapper is neither mounted nor left lying around.
+  const usesBridgeEntrypoint = turn?.networkMode === 'bridge';
+  if (turn && usesBridgeEntrypoint) {
     await writeFile(turnConfigPath, turnserverConfigTemplate(turn), { encoding: 'utf8', mode: 0o600 });
     await chmod(turnConfigPath, 0o600);
+    await writeFile(turnEntrypointPath, turnEntrypointTemplate(), { encoding: 'utf8', mode: 0o700 });
+    await chmod(turnEntrypointPath, 0o700);
+  } else if (turn) {
+    await writeFile(turnConfigPath, turnserverConfigTemplate(turn), { encoding: 'utf8', mode: 0o600 });
+    await chmod(turnConfigPath, 0o600);
+    if (existsSync(turnEntrypointPath)) await unlink(turnEntrypointPath);
   } else if (existsSync(turnConfigPath)) {
     await unlink(turnConfigPath);
+    if (existsSync(turnEntrypointPath)) await unlink(turnEntrypointPath);
+  } else if (existsSync(turnEntrypointPath)) {
+    await unlink(turnEntrypointPath);
   }
+}
+
+
+// ── Retained-artifact migration ─────────────────────────────────────────────
+
+/**
+ * Where a pre-fix deployment kept superseded controlled-node artifacts.
+ *
+ * Before the named volume existed, tsk_jgt's store resolved to
+ * `<IMCODES_NODE_EXE_DIR>/versions`, and the image sets IMCODES_NODE_EXE_DIR to
+ * /app/controlled-node-executables. Those bytes therefore live in the old
+ * container's writable layer, which `compose up -d` discards when it recreates
+ * the service. Declaring the volume alone does not save them: the new container
+ * starts with an empty volume and every install code minted against a
+ * superseded digest stops resolving on the first upgrade.
+ */
+export const LEGACY_NODE_EXE_VERSION_DIR = '/app/controlled-node-executables/versions';
+
+/**
+ * Printed when the legacy directory does not exist at all.
+ *
+ * A sentinel rather than an empty listing, because "not there" and "there but
+ * unreadable" must not produce the same output. Chosen to be impossible as a
+ * real directory entry produced by `ls -A`.
+ */
+export const LEGACY_ABSENT_SENTINEL = '__imcodes_legacy_versions_absent__';
+
+/**
+ * Copy the pre-fix retained tree OUT of the running container, before anything
+ * replaces it.
+ *
+ * Returns the staging directory, or null when there is nothing to migrate —
+ * a fresh install, an already-migrated deployment (the container already has
+ * the volume mounted at the new path), or an empty legacy tree. Every failure
+ * is non-fatal: an upgrade must not be blocked by a best-effort copy, and the
+ * caller logs rather than throws.
+ */
+/**
+ * Outcome of staging, as three states rather than two.
+ *
+ * `none` and `failed` were previously both `null`, and the caller read that as
+ * "nothing to preserve" and went on to replace the container - destroying the
+ * only copy of bytes it had just failed to read. Absence and failure demand
+ * opposite responses, so they are no longer the same value. (`already` is
+ * folded into `none`: the bytes are already in the durable volume.)
+ */
+export type RetainedArtifactStaging =
+  | { kind: 'none' }
+  | { kind: 'staged'; dir: string }
+  | { kind: 'failed'; step: string; detail: string };
+
+/**
+ * True only for docker's "that path is not in the container" error.
+ *
+ * Used solely on the stopped-container path, where `exec` is unavailable and
+ * `cp` is both the probe and the copy. Recognised absence is benign; anything
+ * unrecognised is treated as a failure, so a new or reworded docker error can
+ * only ever make this stricter, never quieter.
+ */
+function isMissingContainerPathError(error: unknown): boolean {
+  const text = `${error instanceof Error ? error.message : String(error)} `
+    + `${(error as { stderr?: unknown } | null)?.stderr ?? ''}`;
+  return /no such file or directory|could not find the file/i.test(text);
+}
+
+function stagingFailure(step: string, error: unknown): RetainedArtifactStaging {
+  return { kind: 'failed', step, detail: error instanceof Error ? error.message : String(error) };
+}
+
+/**
+ * Copy the pre-fix retained tree OUT of the running container, before anything
+ * replaces it.
+ *
+ * Returns `none` only when there is genuinely nothing to preserve: no server
+ * container, a container that already mounts the durable path, or an empty
+ * legacy tree. Anything that went wrong while trying to find out returns
+ * `failed`, because the caller must not treat an unanswered question as a "no".
+ */
+export function stageRetainedArtifactVersions(
+  compose: string,
+  dir: string,
+  deps: {
+    runQuiet: (cmd: string, cwd: string) => string;
+    mkdtemp: () => string;
+    readdir?: (path: string) => string[];
+  } = {
+    runQuiet,
+    mkdtemp: () => mkdtempSync(join(tmpdir(), 'imcodes-node-exe-versions-')),
+  },
+): RetainedArtifactStaging {
+  let containerIds: string[];
+  try {
+    // `-a`: compose ps omits stopped containers by default, so an ordinary
+    // exited or operator-stopped legacy Server produced no id and was read as a
+    // fresh install -- then recreated, discarding a writable layer that was
+    // still perfectly copyable. Stopped containers are exactly the ones an
+    // operator is most likely to be upgrading from.
+    containerIds = deps.runQuiet(
+      `${compose} -f ${join(dir, 'docker-compose.yml')} --env-file ${join(dir, '.env')} ps -aq server`,
+      dir,
+    ).split('\n').map((line) => line.trim()).filter(Boolean);
+  } catch (err) {
+    return stagingFailure('compose-ps', err);
+  }
+  // No server in any state: a fresh install has nothing to preserve.
+  if (containerIds.length === 0) return { kind: 'none' };
+  // More than one candidate is ambiguous, and guessing which holds the real
+  // retained bytes is exactly the kind of assumption that loses them.
+  if (containerIds.length > 1) {
+    return { kind: 'failed', step: 'compose-ps', detail: `ambiguous server containers: ${containerIds.join(', ')}` };
+  }
+  const containerId = containerIds[0]!;
+
+  try {
+    const mounts = deps.runQuiet(
+      `docker inspect -f '{{range .Mounts}}{{.Destination}}\n{{end}}' ${containerId}`,
+      dir,
+    );
+    // Already migrated: the retained bytes live in the volume and survive on
+    // their own, so there is nothing to stage.
+    if (mounts.split('\n').some((line) => line.trim() === NODE_EXE_VERSION_DIR)) return { kind: 'none' };
+  } catch (err) {
+    return stagingFailure('docker-inspect', err);
+  }
+
+  let running = false;
+  try {
+    running = deps.runQuiet(`docker inspect -f '{{.State.Running}}' ${containerId}`, dir).trim() === 'true';
+  } catch (err) {
+    return stagingFailure('docker-state', err);
+  }
+
+  let staging: string;
+  try {
+    staging = deps.mkdtemp();
+  } catch (err) {
+    return stagingFailure('staging-dir', err);
+  }
+
+  if (running) {
+    // Running container: probe with an explicit exit status. No masking -- a
+    // missing directory answers with a sentinel and anything else lets `ls`
+    // exit non-zero, which becomes a failure rather than an empty listing.
+    let listing: string;
+    try {
+      listing = deps.runQuiet(
+        `docker exec ${containerId} sh -c `
+        + `'if [ ! -d "${LEGACY_NODE_EXE_VERSION_DIR}" ]; then echo ${LEGACY_ABSENT_SENTINEL}; exit 0; fi; `
+        + `ls -A "${LEGACY_NODE_EXE_VERSION_DIR}"'`,
+        dir,
+      );
+    } catch (err) {
+      return stagingFailure('legacy-listing', err);
+    }
+    if (listing.trim() === LEGACY_ABSENT_SENTINEL || !listing.trim()) return { kind: 'none' };
+  }
+
+  try {
+    // `docker cp` works against stopped containers, which is why the stopped
+    // path relies on it rather than on `exec`.
+    deps.runQuiet(`docker cp ${containerId}:${LEGACY_NODE_EXE_VERSION_DIR}/. ${staging}/`, dir);
+  } catch (err) {
+    // A genuinely absent legacy directory is benign and must stay upgradeable.
+    // Everything else fails closed: an unrecognised copy error is exactly the
+    // case where continuing would destroy bytes we could not read.
+    if (!running && isMissingContainerPathError(err)) return { kind: 'none' };
+    return stagingFailure('docker-cp', err);
+  }
+  const listStaged = deps.readdir ?? ((path: string) => readdirSync(path));
+  if (!running && listStaged(staging).length === 0) return { kind: 'none' };
+  return { kind: 'staged', dir: staging };
+}
+
+/**
+ * Refuse to continue when migration was attempted and failed.
+ *
+ * Replacement is irreversible: `compose up -d` discards the old writable layer,
+ * and with it the only copy of bytes we just proved we cannot read. Stopping
+ * here leaves the deployment exactly as it was, which is recoverable; carrying
+ * on is not.
+ */
+export function assertRetainedArtifactStagingSafe(staging: RetainedArtifactStaging): void {
+  if (staging.kind !== 'failed') return;
+  throw new Error(
+    `Refusing to replace the server container: could not preserve retained Windows installers `
+    + `(${staging.step}: ${staging.detail}). The existing deployment is untouched. `
+    + `Resolve the Docker error and re-run setup, or remove `
+    + `${LEGACY_NODE_EXE_VERSION_DIR} in the running container if those installers are expendable.`,
+  );
+}
+
+/**
+ * Restore staged bytes into the recreated server's durable volume.
+ *
+ * Must run AFTER the container has actually been replaced; writing into the old
+ * container would simply be discarded with it. Copying into the container path
+ * lands in the mounted volume, so the bytes outlive every later replacement.
+ */
+export function restoreRetainedArtifactVersions(
+  compose: string,
+  dir: string,
+  staging: string,
+  deps: { runQuiet: (cmd: string, cwd: string) => string } = { runQuiet },
+): boolean {
+  try {
+    const containerId = deps.runQuiet(
+      `${compose} -f ${join(dir, 'docker-compose.yml')} --env-file ${join(dir, '.env')} ps -q server`,
+      dir,
+    ).split('\n')[0]?.trim() ?? '';
+    if (!containerId) return false;
+    deps.runQuiet(`docker exec ${containerId} sh -c 'mkdir -p ${NODE_EXE_VERSION_DIR}'`, dir);
+    deps.runQuiet(`docker cp ${staging}/. ${containerId}:${NODE_EXE_VERSION_DIR}/`, dir);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Restore, then delete the staging copy ONLY if the restore actually succeeded.
+ *
+ * After replacement the staging directory is the sole surviving copy. Deleting
+ * it unconditionally turned an ordinary transient failure - a disk hiccup, a
+ * permission problem, a container not ready yet - into permanent data loss, so
+ * the copy is retained on failure and its path is reported for manual recovery.
+ */
+export function finalizeRetainedArtifactMigration(
+  compose: string,
+  dir: string,
+  staging: string,
+  deps: {
+    restore: (compose: string, dir: string, staging: string) => boolean;
+    remove: (path: string) => void;
+  } = {
+    restore: restoreRetainedArtifactVersions,
+    remove: (path) => rmSync(path, { recursive: true, force: true }),
+  },
+): { restored: boolean; retainedStagingDir?: string } {
+  const restored = deps.restore(compose, dir, staging);
+  if (!restored) return { restored: false, retainedStagingDir: staging };
+  deps.remove(staging);
+  return { restored: true };
 }
 
 // ── Docker lifecycle ────────────────────────────────────────────────────────
@@ -669,13 +1195,17 @@ function installSystemdService(): void {
   const unit = `[Unit]
 Description=IM.codes Daemon
 After=network.target
+${renderSystemdStartLimitBlock()}
 
 [Service]
 Type=simple
 ExecStart=${renderSystemdExecStart(target)}
 Restart=on-failure
 RestartSec=5
-KillMode=process
+KillMode=control-group
+${renderSystemdTerminalDiagnostics()}
+TimeoutStopSec=45s
+SendSIGKILL=yes
 Environment=PATH=${process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin'}
 Environment=HOME=${homedir()}
 Environment=NODE_ENV=production
@@ -704,6 +1234,11 @@ WantedBy=default.target
   } catch {
     console.log('  Could not start systemd service automatically. Run: systemctl --user start imcodes');
   }
+
+  // External recovery trigger, installed as its own timer/oneshot pair so it can
+  // still act when imcodes.service itself is wedged falsely-active. Idempotent:
+  // a re-run rewrites nothing and reloads nothing when the units already match.
+  installRecoveryUnits(renderRecoveryExecStart(process.execPath, process.argv[1]));
 
   const linger = enableSystemdUserLinger();
   if (linger.ok) {
@@ -778,9 +1313,16 @@ export async function setupFlow(domain: string, opts: SetupFlowOptions = {}): Pr
   } else {
     log('Updating configuration files...');
   }
+  // Stage retained artifacts BEFORE anything recreates the server. A pre-fix
+  // container keeps them in its writable layer, which `compose up -d` discards.
+  const stagedVersions = stageRetainedArtifactVersions(compose, dir);
+  // A failed attempt is not the same as nothing to do: stop before anything is
+  // rewritten or recreated, leaving the existing deployment intact.
+  assertRetainedArtifactStagingSafe(stagedVersions);
+  if (stagedVersions.kind === 'staged') log('Preserving retained Windows installers from the previous container...');
   await writeConfigs(dir, domain, secrets, mirrorMode, turn);
   await persistSecrets(dir, secrets);
-  log(`Created .env, docker-compose.yml, Caddyfile${turn ? ', turnserver.conf' : ''}${mirrorMode ? ' (mirror mode)' : ''}`);
+  log(`Created .env, docker-compose.yml, Caddyfile${turn ? ', TURN config' : ''}${mirrorMode ? ' (mirror mode)' : ''}`);
 
   // 4. Start PostgreSQL (skip if already healthy)
   if (isServiceHealthy(compose, dir, 'postgres')) {
@@ -792,7 +1334,17 @@ export async function setupFlow(domain: string, opts: SetupFlowOptions = {}): Pr
     log('PostgreSQL ready.');
   }
 
-  // 5. Start server (skip if already healthy)
+  // 5. Always recreate TURN after rewriting its bind-mounted configuration.
+  // Docker Compose does not otherwise notice file-content or REST-secret
+  // changes, leaving coturn with stale in-memory credentials and ACLs.
+  if (turn) {
+    log('Starting TURN with current configuration...');
+    composeCmd(compose, dir, 'up -d --force-recreate turn');
+    await waitForService(compose, dir, 'turn');
+    log('TURN ready.');
+  }
+
+  // 6. Start server (skip if already healthy)
   if (isServiceHealthy(compose, dir, 'server')) {
     log('Server already running.');
   } else {
@@ -804,23 +1356,33 @@ export async function setupFlow(domain: string, opts: SetupFlowOptions = {}): Pr
     log('Server ready.');
   }
 
-  // 6. Bootstrap database (idempotent — handles duplicates gracefully)
+  // 7. Bootstrap database (idempotent — handles duplicates gracefully)
   log('Bootstrapping database...');
   bootstrapDatabase(compose, dir, secrets);
   log('Database bootstrapped.');
 
-  // 7. Start remaining services
+  // 8. Start remaining services
   log(`Starting Caddy${turn ? ', TURN' : ''} and Watchtower...`);
   composeCmd(compose, dir, 'up -d');
   log('All services running.');
 
-  // 8. Self-bind
+  // Restore only now: the server has actually been replaced, so this lands in
+  // the durable volume rather than in a container about to be discarded.
+  if (stagedVersions.kind === 'staged') {
+    const outcome = finalizeRetainedArtifactMigration(compose, dir, stagedVersions.dir);
+    log(outcome.restored
+      ? 'Retained Windows installers migrated into the durable volume.'
+      : `Could not migrate retained Windows installers. The only copy is preserved at ${outcome.retainedStagingDir}; `
+        + `copy it into the server's ${NODE_EXE_VERSION_DIR} to keep existing install codes resolvable.`);
+  }
+
+  // 9. Self-bind
   log('Binding daemon to local server...');
   await selfBind(secrets);
   installService();
   log('Daemon bound and running.');
 
-  // 9. Print summary
+  // 10. Print summary
   const bindUrl = `https://${domain}/bind/${secrets.apiKeyRaw}`;
   console.log(`
   ┌──────────────────────────────────────────────────────┐
@@ -829,7 +1391,11 @@ export async function setupFlow(domain: string, opts: SetupFlowOptions = {}): Pr
   │  Admin login:    admin / ${secrets.adminPassword}
   │  Bind URL:       ${bindUrl}
 ${turn ? `  │  TURN relay:     turn:${turn.host}:${turn.port} (DNS only)\n` : ''}  │
-${turn ? `  │  Firewall:       TCP/UDP ${turn.port}; UDP ${turn.relayMinPort}-${turn.relayMaxPort}\n  │\n` : ''}  │  This machine is bound and daemon is running.
+${turn ? `  │  TURN capacity:   ${describeTurnRelayCapacity(turn.relayMinPort, turn.relayMaxPort)} (${turn.networkMode} networking)\n` : ''}${turn ? `  │  Firewall:       TCP/UDP ${turn.port}; UDP ${turn.relayMinPort}-${turn.relayMaxPort}${turn.networkMode === 'host' ? ' (host networking: Docker does NOT open these, the host firewall must)' : ''}\n  │\n` : ''}  │  Installer retention: docker volume ${NODE_EXE_VERSION_VOLUME} (keeps superseded
+  │                        Windows installers; do not prune it or existing
+  │                        install codes stop resolving)
+  │
+  │  This machine is bound and daemon is running.
   │
   │  To connect another machine:
   │    npm install -g imcodes

@@ -1,31 +1,59 @@
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { existsSync, lstatSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import net from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
+  REMOTE_DESKTOP_CAPABILITY,
   REMOTE_DESKTOP_MSG,
   REMOTE_DESKTOP_TERMINAL_REASON,
   validateRemoteDesktopDaemonCommand,
-  validateRemoteDesktopDaemonMessage,
   type RemoteDesktopDaemonMessage,
   type RemoteDesktopDaemonCommand,
   type RemoteDesktopPrepare,
 } from '../../shared/remote-desktop.js';
+import {
+  REMOTE_DESKTOP_CANONICAL_BRANDING_CAPABILITY,
+  REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY,
+  REMOTE_DESKTOP_INPUT_CAPABILITY,
+  REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY,
+  REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+  REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY,
+  type RemoteDesktopAdapterCapability,
+} from '../../shared/remote-desktop-access.js';
+import {
+  WORKER_CONSENT_FRAME,
+  type WorkerConsentInboundFrame,
+} from './remote-desktop-consent-ipc.js';
+import {
+  WORKER_PRIVACY_FRAME,
+  type WorkerPrivacyInboundFrame,
+} from './remote-desktop-privacy-ipc.js';
 import {
   REMOTE_DESKTOP_WORKER_FILENAME,
   REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX,
   REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME,
   REMOTE_DESKTOP_VIRTUAL_DISPLAY_MANIFEST_FILENAME,
   validateRemoteDesktopVirtualDisplayPackageManifest,
-  validateRemoteDesktopWorkerCrash,
   validateRemoteDesktopWorkerHello,
   validateRemoteDesktopWorkerManifest,
   upgradeLegacyRemoteDesktopWorkerManifest,
   type RemoteDesktopWorkerCrash,
   type RemoteDesktopWorkerManifest,
 } from '../../shared/remote-desktop-worker.js';
+import {
+  REMOTE_DESKTOP_WORKER_MAX_LINE_BYTES,
+  REMOTE_DESKTOP_WORKER_WATCHDOG_STAGE,
+  RemoteDesktopWorkerHostCore,
+  type RemoteDesktopTrackedAuthority,
+} from './remote-desktop-worker-host-core.js';
+import {
+  REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT,
+  RemoteDesktopWorkerDiagnostics,
+  type RemoteDesktopWorkerDiagnosticEvent,
+  REMOTE_DESKTOP_WORKER_DECLARED_TERMINAL_CLEANUP_REASON,
+} from './remote-desktop-worker-diagnostics.js';
 import { DAEMON_VERSION } from '../util/version.js';
 import {
   allowWindowsNamedPipeClients,
@@ -50,15 +78,32 @@ const HELLO_TIMEOUT_MS = 2_000;
 // "handshaking". Normal first-frame admission is bounded to three seconds per
 // display, so this leaves ample headroom without consuming the browser's
 // 45-second negotiation budget.
-const PREPARE_READY_TIMEOUT_MS = 15_000;
 // Once PREPARE is ready the native signaling thread must consume the browser
 // OFFER and emit an ANSWER. Bound that separate stage as well: otherwise a
 // wedged SetRemoteDescription leaves the UI at the same generic "handshake"
 // step until the Server's much later negotiation deadline.
-const OFFER_ANSWER_TIMEOUT_MS = 15_000;
 const VIRTUAL_DISPLAY_SHUTDOWN_GRACE_MS = 1_000;
-const MAX_LINE_BYTES = 512 * 1024;
 const SHA256_RE = /^[a-f0-9]{64}$/;
+const PIPE_DIAGNOSTIC_ERROR_CODES = new Set([
+  'EACCES',
+  'ECONNABORTED',
+  'ECONNRESET',
+  'ENOENT',
+  'ENOSPC',
+  'EPERM',
+  'EPIPE',
+  'ETIMEDOUT',
+  'ERR_STREAM_DESTROYED',
+  'ERR_STREAM_WRITE_AFTER_END',
+]);
+
+const WORKER_LAUNCH_MODE = {
+  SESSION: 'session',
+  CONSENT_ONLY: 'consent_only',
+  PRIVACY_ONLY: 'privacy_only',
+} as const;
+
+type WorkerLaunchMode = typeof WORKER_LAUNCH_MODE[keyof typeof WORKER_LAUNCH_MODE];
 
 export const REMOTE_DESKTOP_COMPILED_SIGNER_SHA256 = WINDOWS_COMPILED_RELEASE_SIGNER_SHA256;
 
@@ -195,20 +240,15 @@ export function remoteDesktopWorkerPipePath(
     : join(tmpdir(), `imcodes-rd-${suffix}.sock`);
 }
 
-interface TrackedAuthority {
-  requestId: string;
-  sessionId: string;
-  capability: Buffer;
-  prepare: RemoteDesktopPrepare;
+interface WindowsTrackedAuthorityState {
   virtualRetryAttempted: boolean;
   usesVirtualDisplay: boolean;
   secureConsoleRetryAttempted: boolean;
-  /** Guards the write→response race before the readiness watchdog is armed. */
-  prepareReady: boolean;
-  prepareReadyTimer: ReturnType<typeof setTimeout> | null;
-  offerPending: boolean;
-  offerAnswerTimer: ReturnType<typeof setTimeout> | null;
+  correlationId: string;
+  startedAt: number;
 }
+
+type TrackedAuthority = RemoteDesktopTrackedAuthority<WindowsTrackedAuthorityState>;
 
 interface VirtualDisplayControllerProcess {
   readonly exitCode: number | null;
@@ -256,6 +296,9 @@ export interface RemoteDesktopWorkerHostOptions {
   activateVirtualDisplay?: (executable: string) => void;
   wait?: (milliseconds: number) => Promise<void>;
   onWorkerCrash?: (crash: RemoteDesktopWorkerCrash) => void;
+  /** Closed-schema, payload-free lifecycle evidence. */
+  onLifecycleEvent?: (event: RemoteDesktopWorkerDiagnosticEvent) => void;
+  now?: () => number;
   spawnUnlockSecret?: typeof spawn;
 }
 
@@ -270,9 +313,7 @@ export class RemoteDesktopWorkerHost {
   private readonly trustedSignerSha256: string;
   private readonly nonce = randomBytes(32).toString('base64url');
   private readonly pipePath: string;
-  private readonly tracked = new Map<string, TrackedAuthority>();
-  /** PREPARE must reach the worker before its immediately-following OFFER/ICE. */
-  private readonly preparing = new Map<string, Promise<void>>();
+  private readonly core: RemoteDesktopWorkerHostCore<WindowsTrackedAuthorityState>;
   private readonly recoverableSocketLosses = new WeakMap<net.Socket, Set<string>>();
   private server: net.Server | null = null;
   private socket: net.Socket | null = null;
@@ -283,14 +324,26 @@ export class RemoteDesktopWorkerHost {
   private readonly pendingHelloSockets = new Set<net.Socket>();
   /** Which start produced a promoted socket, so its loss retires only its own. */
   private readonly socketStartToken = new WeakMap<net.Socket, object>();
+  /** Launch mode belongs to the authenticated start generation, not the path. */
+  private readonly launchModeByToken = new WeakMap<object, WorkerLaunchMode>();
+  private readonly launchCorrelationByToken = new WeakMap<object, string>();
+  private readonly launchStartedAtByToken = new WeakMap<object, number>();
   /** Authenticated worker pid for the socket; never inferred from its path. */
-  private readonly workerPidBySocket = new WeakMap<net.Socket, number>();
+  private readonly workerConnectionBySocket = new WeakMap<net.Socket, {
+    generation: number;
+    workerPid: number;
+    correlationId: string;
+    startedAt: number;
+  }>();
+  private readonly diagnosedClosedSockets = new WeakSet<net.Socket>();
+  private readonly erroredSockets = new WeakSet<net.Socket>();
+  private readonly lifecycleEvent?: (event: RemoteDesktopWorkerDiagnosticEvent) => void;
   private virtualDisplayController: VirtualDisplayControllerProcess | null = null;
   private virtualDisplayStartPromise: Promise<void> | null = null;
   private virtualDisplayGeneration = 0;
-  private buffer = '';
   private closing = false;
   private workerSecureConsole = false;
+  private workerLaunchMode: WorkerLaunchMode | null = null;
 
   constructor(
     private readonly onMessage: (message: RemoteDesktopDaemonMessage) => void,
@@ -311,11 +364,124 @@ export class RemoteDesktopWorkerHost {
       `${process.pid}-${randomBytes(12).toString('hex')}`,
       this.platform,
     );
+    const diagnostics = process.platform === 'win32'
+      ? new RemoteDesktopWorkerDiagnostics()
+      : null;
+    this.lifecycleEvent = options.onLifecycleEvent
+      ?? (diagnostics ? (event) => diagnostics.write(event) : undefined);
+    this.core = new RemoteDesktopWorkerHostCore({
+      nonce: this.nonce,
+      prepareReadyTimeoutMs: options.prepareReadyTimeoutMs,
+      offerAnswerTimeoutMs: options.offerAnswerTimeoutMs,
+      onPrepareReady: (authority, connectionGeneration) => {
+        this.emitAuthorityLifecycle(
+          REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.PREPARE_READY,
+          authority,
+          connectionGeneration,
+          this.workerPidForGeneration(connectionGeneration),
+        );
+      },
+      onOfferSent: (authority, connectionGeneration) => {
+        this.emitAuthorityLifecycle(
+          REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.OFFER_SENT,
+          authority,
+          connectionGeneration,
+          this.workerPidForGeneration(connectionGeneration),
+        );
+      },
+      onAnswer: (authority, connectionGeneration) => {
+        this.emitAuthorityLifecycle(
+          REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.ANSWER,
+          authority,
+          connectionGeneration,
+          this.workerPidForGeneration(connectionGeneration),
+        );
+      },
+      onAuthorityRemoved: () => this.stopVirtualDisplayIfUnused(),
+      onWatchdogTimeout: (event) => {
+        this.emitAuthorityLifecycle(
+          event.stage === REMOTE_DESKTOP_WORKER_WATCHDOG_STAGE.PREPARE_READY
+            ? REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.PREPARE_TIMEOUT
+            : REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.OFFER_TIMEOUT,
+          event.authority,
+          event.connectionGeneration,
+          event.workerPid,
+        );
+        this.emitAuthorityLifecycle(
+          REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.CLEANUP,
+          event.authority,
+          event.connectionGeneration,
+          event.workerPid,
+          { cleanupReason: 'watchdog_timeout' },
+        );
+        try {
+          if (event.stage === REMOTE_DESKTOP_WORKER_WATCHDOG_STAGE.PREPARE_READY) {
+            this.options.onPrepareTimeout?.();
+          } else {
+            this.options.onOfferTimeout?.();
+          }
+        } catch { /* diagnostics never affect recovery */ }
+        try {
+          if (event.workerPid && event.workerPid > 0) {
+            (this.options.terminateProcess ?? ((pid: number) => process.kill(pid)))(event.workerPid);
+          }
+        } catch {
+          // The authenticated process may already have exited. Destroying its
+          // exact connection still retires the poisoned worker generation.
+        }
+        const socket = this.socket;
+        const connection = socket ? this.workerConnectionBySocket.get(socket) : undefined;
+        if (socket && !socket.destroyed
+          && connection?.generation === event.connectionGeneration) socket.destroy();
+        this.onMessage(event.terminal);
+      },
+    });
+  }
+
+  /** Compatibility inspection seam for existing white-box tests only. */
+  private get tracked(): ReadonlyMap<string, TrackedAuthority> {
+    return this.core.authorities();
   }
 
   available(): boolean {
     return this.platform === 'win32' && this.artifact !== null
       && SHA256_RE.test(this.trustedSignerSha256);
+  }
+
+  /** The shipped Windows host remains on the byte-compatible v2 profile. */
+  sessionCapabilities(): readonly string[] {
+    return [REMOTE_DESKTOP_CAPABILITY];
+  }
+
+  /**
+   * Capabilities implemented by the verified worker artifact in this build.
+   * Keep this declaration independent from `available()`: callers still gate
+   * the returned matrix on artifact verification and the remote-desktop kill
+   * switch. Local consent is independent because this build can launch the
+   * signed worker in prompt-only mode before PREPARE without initializing
+   * capture, input or WebRTC. The signed account shell is a separately signed
+   * sidecar and is therefore advertised by runtime only after its independent
+   * artifact/launcher trust probe; it never belongs to the Worker matrix.
+   */
+  adapterCapabilities(): readonly RemoteDesktopAdapterCapability[] {
+    return [
+      REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY,
+      REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY,
+      REMOTE_DESKTOP_INPUT_CAPABILITY,
+      REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY,
+      REMOTE_DESKTOP_CANONICAL_BRANDING_CAPABILITY,
+      REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+    ];
+  }
+
+  /**
+   * The verified Windows Worker can start in privacy-only mode before PREPARE,
+   * retain the host-wide epoch while it is promoted in place, default-shield
+   * every subsequently created source, and acknowledge only the exact durable
+   * route-id/route-generation snapshot received in BEGIN.
+   */
+  supportsDefaultShieldedRoute(): boolean {
+    return true;
   }
 
   private async verifiedArtifactForLaunch(): Promise<VerifiedRemoteDesktopWorkerArtifact> {
@@ -331,6 +497,9 @@ export class RemoteDesktopWorkerHost {
     args: readonly string[],
     allowSecureDesktopFallback = true,
     forceSecureConsole = false,
+    correlationId = this.newCorrelationId(),
+    launchMode: WorkerLaunchMode = WORKER_LAUNCH_MODE.SESSION,
+    startedAt = this.now(),
   ): Promise<void> {
     const artifact = await this.verifiedArtifactForLaunch();
     const argsLine = args.map(quoteWindowsArgument).join(' ');
@@ -345,6 +514,13 @@ export class RemoteDesktopWorkerHost {
         forceSecureConsole,
       );
     }
+    this.emitLifecycle({
+      event: REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.SPAWN_VERIFIED,
+      correlationId,
+      elapsedMs: this.elapsedSince(startedAt),
+      launchMode,
+      stdio: 'ignored',
+    });
   }
 
   /**
@@ -393,16 +569,11 @@ export class RemoteDesktopWorkerHost {
     if (!parsed.ok || !this.available()) return false;
     const command = parsed.value;
     if (command.type === REMOTE_DESKTOP_MSG.PREPARE) {
-      let finishPreparing!: () => void;
-      const ready = new Promise<void>((resolveReady) => { finishPreparing = resolveReady; });
-      this.preparing.set(command.sessionId, ready);
+      const finishPreparing = this.core.beginPreparing(command.sessionId);
       try {
         return await this.handleValidated(command);
       } finally {
         finishPreparing();
-        if (this.preparing.get(command.sessionId) === ready) {
-          this.preparing.delete(command.sessionId);
-        }
       }
     }
     if (command.type !== REMOTE_DESKTOP_MSG.STOP
@@ -411,7 +582,7 @@ export class RemoteDesktopWorkerHost {
       // Windows cold start can take seconds, and several callers can enter
       // handle() concurrently. Waiting for the PREPARE write (not merely the
       // shared start promise) preserves the worker protocol's required order.
-      await this.preparing.get(command.sessionId);
+      await this.core.waitForPreparing(command.sessionId);
     }
     return this.handleValidated(command);
   }
@@ -419,12 +590,12 @@ export class RemoteDesktopWorkerHost {
   private async handleValidated(command: RemoteDesktopDaemonCommand): Promise<boolean> {
     let recoverIdlePrepare = false;
     if (command.type === REMOTE_DESKTOP_MSG.PREPARE) {
-      recoverIdlePrepare = this.tracked.size === 0;
+      recoverIdlePrepare = this.core.size === 0 && !this.core.isPrivacyEpochArmed;
       // Tracked before the start, not after: the offer that follows this
       // PREPARE arrives while the cold start is still running, and it can only
       // be told to wait for that start if the session it names is already
       // known here.
-      this.track(command);
+      const diagnosticAuthority = this.track(command);
       try {
         if (recoverIdlePrepare) {
           // A completed peer leaves process-local ICE, encoder and DXGI
@@ -434,7 +605,12 @@ export class RemoteDesktopWorkerHost {
           // first so its immediately-following OFFER waits for this recycle.
           await this.recycleWorkerSocket(command.sessionId);
         }
-        await this.ensureStarted();
+        await this.ensureStarted(
+          WORKER_LAUNCH_MODE.SESSION,
+          false,
+          diagnosticAuthority.metadata.correlationId,
+          diagnosticAuthority.metadata.startedAt,
+        );
       } catch (error) {
         this.untrack(command.sessionId);
         throw error;
@@ -446,9 +622,14 @@ export class RemoteDesktopWorkerHost {
         // Returning here would surface that as `worker_failed` on the first
         // connect after any quiet period — the session is already tracked, so
         // cold-start one verified replacement instead.
-        this.untrack(command.sessionId);
-        await this.ensureStarted();
-        this.track(command);
+        this.untrackForInternalRecovery(command.sessionId);
+        await this.ensureStarted(
+          WORKER_LAUNCH_MODE.SESSION,
+          false,
+          diagnosticAuthority.metadata.correlationId,
+          diagnosticAuthority.metadata.startedAt,
+        );
+        this.track(command, diagnosticAuthority.metadata);
         if (!this.socket || this.socket.destroyed) {
           // The replacement did not come up. Drop the authority before giving
           // up: a tracked session nobody will ever stop again would make every
@@ -466,8 +647,14 @@ export class RemoteDesktopWorkerHost {
       // Declining here is reported as `worker_failed`, which ends a session
       // that was about to work and is exactly what made a first connect after
       // any quiet period fail. Wait for the start this session already owns.
-      if (!this.tracked.has(command.sessionId)) return false;
-      await this.ensureStarted();
+      const diagnosticAuthority = this.core.get(command.sessionId);
+      if (!diagnosticAuthority) return false;
+      await this.ensureStarted(
+        WORKER_LAUNCH_MODE.SESSION,
+        false,
+        diagnosticAuthority.metadata.correlationId,
+        diagnosticAuthority.metadata.startedAt,
+      );
       if (!this.socket || this.socket.destroyed) return false;
     }
     const socket = this.socket;
@@ -480,14 +667,20 @@ export class RemoteDesktopWorkerHost {
         : undefined,
     );
     if (!sent && recoverIdlePrepare && command.type === REMOTE_DESKTOP_MSG.PREPARE
-      && this.tracked.has(command.sessionId)) {
+      && this.core.has(command.sessionId)) {
       // A warm idle worker can exit between sessions while the service-side
       // pipe has not observed the close yet. Do not surface that stale-pipe
       // race as worker_failed: no other authority is alive, so cold-start one
       // verified replacement and retry this PREPARE exactly once.
-      this.untrack(command.sessionId);
-      await this.ensureStarted();
-      this.track(command);
+      const diagnosticAuthority = this.core.get(command.sessionId)!;
+      this.untrackForInternalRecovery(command.sessionId);
+      await this.ensureStarted(
+        WORKER_LAUNCH_MODE.SESSION,
+        false,
+        diagnosticAuthority.metadata.correlationId,
+        diagnosticAuthority.metadata.startedAt,
+      );
+      this.track(command, diagnosticAuthority.metadata);
       const replacement = this.socket;
       if (!replacement || replacement.destroyed) {
         this.untrack(command.sessionId);
@@ -501,18 +694,81 @@ export class RemoteDesktopWorkerHost {
     if (command.type === REMOTE_DESKTOP_MSG.PREPARE) {
       this.armPrepareReadyTimer(command.sessionId, this.socket);
     } else if (command.type === REMOTE_DESKTOP_MSG.OFFER) {
-      const tracked = this.tracked.get(command.sessionId);
-      if (tracked) {
-        tracked.offerPending = true;
-        this.clearOfferAnswerTimer(tracked);
-        if (tracked.prepareReady) this.armOfferAnswerTimer(command.sessionId, this.socket);
-      }
+      this.markOfferPending(command.sessionId, this.socket);
     }
     if (sent && (command.type === REMOTE_DESKTOP_MSG.STOP
       || command.type === REMOTE_DESKTOP_MSG.CANCEL)) {
-      this.untrack(command.sessionId);
+      this.untrack(command.sessionId, command.type === REMOTE_DESKTOP_MSG.STOP
+        ? 'controller_stop'
+        : 'controller_cancel');
+    }
+    if (sent && command.type === REMOTE_DESKTOP_MSG.PREPARE) {
+      const authority = this.core.get(command.sessionId);
+      const connection = this.socket
+        ? this.workerConnectionBySocket.get(this.socket)
+        : undefined;
+      if (authority) {
+        this.emitAuthorityLifecycle(
+          REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.PREPARE_SENT,
+          authority,
+          connection?.generation,
+          connection?.workerPid,
+        );
+      }
     }
     return sent;
+  }
+
+  /**
+   * Hand a consent frame to the worker. When no session worker exists, launch
+   * the same verified binary in prompt-only mode. That process never creates
+   * capture/input/media authority and accepts only consent frames natively.
+   */
+  async sendConsentFrame(frame: Record<string, unknown>): Promise<boolean> {
+    if (frame.type === WORKER_CONSENT_FRAME.DISMISS
+      && (!this.socket || this.socket.destroyed)) return false;
+    try {
+      await this.ensureStarted(WORKER_LAUNCH_MODE.CONSENT_ONLY);
+    } catch {
+      return false;
+    }
+    const socket = this.socket;
+    if (!socket || socket.destroyed) return false;
+    return this.writeToWorker(socket, frame);
+  }
+
+  /**
+   * Privacy must never use the consent-only process. A BEGIN cold-starts a
+   * distinct persistent privacy-capable Worker before PREPARE; it has no
+   * session authority until a validated PREPARE arrives, then is promoted in
+   * place so its host-wide epoch survives until the first opaque source.
+   */
+  async sendPrivacyFrame(frame: Record<string, unknown>): Promise<boolean> {
+    if (frame.type !== WORKER_PRIVACY_FRAME.SHIELD
+      && frame.type !== WORKER_PRIVACY_FRAME.RELEASE) return false;
+    if (frame.type === WORKER_PRIVACY_FRAME.RELEASE
+      && (!this.socket || this.socket.destroyed)) return false;
+    try {
+      await this.ensureStarted(WORKER_LAUNCH_MODE.PRIVACY_ONLY);
+    } catch {
+      return false;
+    }
+    const socket = this.socket;
+    if (!socket || socket.destroyed
+      || this.workerLaunchMode === WORKER_LAUNCH_MODE.CONSENT_ONLY) {
+      return false;
+    }
+    const sent = await this.writeToWorker(socket, frame);
+    if (sent && frame.type === WORKER_PRIVACY_FRAME.SHIELD) this.core.markPrivacyShielded();
+    return sent;
+  }
+
+  onPrivacyFrame(handler: (frame: WorkerPrivacyInboundFrame) => void): () => void {
+    return this.core.onPrivacyFrame(handler);
+  }
+
+  onConsentFrame(handler: (frame: WorkerConsentInboundFrame) => void): () => void {
+    return this.core.onConsentFrame(handler);
   }
 
   private async writeToWorker(
@@ -520,6 +776,7 @@ export class RemoteDesktopWorkerHost {
     message: unknown,
     recoverIdleSessionId?: string,
   ): Promise<boolean> {
+    let failureCode: string | null = null;
     if (recoverIdleSessionId) {
       const sessions = this.recoverableSocketLosses.get(socket) ?? new Set<string>();
       sessions.add(recoverIdleSessionId);
@@ -534,12 +791,19 @@ export class RemoteDesktopWorkerHost {
         socket.off('close', onLost);
         resolveSent(success);
       };
-      const onLost = () => finish(false);
+      const onLost = (error?: Error) => {
+        if (error) failureCode = this.safeErrorCode(error);
+        finish(false);
+      };
       socket.once('error', onLost);
       socket.once('close', onLost);
       try {
-        socket.write(`${JSON.stringify(message)}\n`, (error) => finish(!error));
-      } catch {
+        socket.write(this.core.frameOutbound(message), (error) => {
+          if (error) failureCode = this.safeErrorCode(error);
+          finish(!error);
+        });
+      } catch (error) {
+        failureCode = error instanceof Error ? this.safeErrorCode(error) : 'UNKNOWN';
         finish(false);
       }
     });
@@ -553,6 +817,18 @@ export class RemoteDesktopWorkerHost {
     // not leave the resolved start promise and a poisoned socket in place:
     // every later session would otherwise reuse it and immediately return
     // worker_failed until the whole node process was restarted.
+    const connection = this.workerConnectionBySocket.get(socket);
+    if (connection) {
+      this.emitLifecycle({
+        event: REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.PIPE_ERROR,
+        correlationId: connection.correlationId,
+        workerGeneration: connection.generation,
+        workerPid: connection.workerPid,
+        elapsedMs: this.elapsedSince(connection.startedAt),
+        errorCode: failureCode ?? 'WRITE_FAILED',
+      });
+    }
+    this.erroredSockets.add(socket);
     this.onSocketLost(socket);
     socket.destroy();
     this.recoverableSocketLosses.delete(socket);
@@ -563,8 +839,8 @@ export class RemoteDesktopWorkerHost {
     const socket = this.socket;
     if (!socket || socket.destroyed) return;
     if (recoveringSessionId === undefined) {
-      if (this.tracked.size > 0) return;
-    } else if (this.tracked.size !== 1 || !this.tracked.has(recoveringSessionId)) {
+      if (this.core.size > 0) return;
+    } else if (this.core.size !== 1 || !this.core.has(recoveringSessionId)) {
       return;
     }
     // A browser reconnect follows a failed negotiation or receive-progress
@@ -586,31 +862,32 @@ export class RemoteDesktopWorkerHost {
   close(): void {
     this.closing = true;
     this.failTracked(REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED);
-    this.socket?.destroy();
+    const socket = this.socket;
+    socket?.destroy();
     this.socket = null;
+    this.workerLaunchMode = null;
+    // Explicit host teardown is not a socket-generation callback. It must
+    // retire partial framing and the privacy epoch even when no current socket
+    // exists or its generation bookkeeping has already moved on.
+    this.core.resetConnection();
     this.server?.close();
     this.server = null;
     this.startPromise = null;
     this.stopVirtualDisplayController();
-    this.buffer = '';
     this.closing = false;
   }
 
-  private track(prepare: RemoteDesktopPrepare): void {
-    const previous = this.tracked.get(prepare.sessionId);
-    if (previous) this.clearTrackedTimers(previous);
-    this.tracked.set(prepare.sessionId, {
-      requestId: prepare.requestId,
-      sessionId: prepare.sessionId,
-      capability: Buffer.from(prepare.capability, 'utf8'),
-      prepare,
+  private track(
+    prepare: RemoteDesktopPrepare,
+    diagnosticContext?: Pick<WindowsTrackedAuthorityState, 'correlationId' | 'startedAt'>,
+  ): TrackedAuthority {
+    return this.core.track(prepare, {
       virtualRetryAttempted: false,
       usesVirtualDisplay: this.virtualDisplayController !== null,
       secureConsoleRetryAttempted: false,
-      prepareReady: false,
-      prepareReadyTimer: null,
-      offerPending: false,
-      offerAnswerTimer: null,
+      correlationId: diagnosticContext?.correlationId
+        ?? this.correlationIdFor(prepare),
+      startedAt: diagnosticContext?.startedAt ?? this.now(),
     });
   }
 
@@ -622,85 +899,27 @@ export class RemoteDesktopWorkerHost {
    * existing bounded retry starts a fresh worker/pipe generation.
    */
   private armPrepareReadyTimer(sessionId: string, socket: net.Socket | null): void {
-    const tracked = this.tracked.get(sessionId);
-    if (!tracked || !socket || socket.destroyed) return;
-    this.clearPrepareReadyTimer(tracked);
-    // A fast worker can emit MODE_STATE in the same turn as the pipe write.
-    // Never arm a late watchdog after that already-observed acknowledgement.
-    if (tracked.prepareReady) return;
-    const workerPid = this.workerPidBySocket.get(socket);
-    tracked.prepareReadyTimer = setTimeout(() => {
-      if (this.tracked.get(sessionId) !== tracked) return;
-      const terminal = {
-        type: REMOTE_DESKTOP_MSG.TERMINAL,
-        requestId: tracked.requestId,
-        sessionId: tracked.sessionId,
-        capability: tracked.capability.toString('utf8'),
-        reason: REMOTE_DESKTOP_TERMINAL_REASON.WORKER_FAILED,
-      } as const;
-      // Drop the authority before destroying the pipe so onSocketLost cannot
-      // emit this terminal a second time. Other sessions sharing a genuinely
-      // wedged worker are still failed by onSocketLost.
-      this.untrack(sessionId);
-      try { this.options.onPrepareTimeout?.(); } catch { /* diagnostics never affect recovery */ }
-      try {
-        if (workerPid && workerPid > 0) {
-          (this.options.terminateProcess ?? ((pid: number) => process.kill(pid)))(workerPid);
-        }
-      } catch {
-        // The pipe close below still tears down the stale authority. The PID is
-        // authenticated in worker_hello but the process may already have died.
-      }
-      if (this.socket === socket && !socket.destroyed) socket.destroy();
-      this.onMessage(terminal);
-    }, this.options.prepareReadyTimeoutMs ?? PREPARE_READY_TIMEOUT_MS);
-    tracked.prepareReadyTimer.unref?.();
-  }
-
-  private clearPrepareReadyTimer(tracked: TrackedAuthority): void {
-    if (tracked.prepareReadyTimer) clearTimeout(tracked.prepareReadyTimer);
-    tracked.prepareReadyTimer = null;
-  }
-
-  private armOfferAnswerTimer(sessionId: string, socket: net.Socket | null): void {
-    const tracked = this.tracked.get(sessionId);
-    if (!tracked || !tracked.prepareReady || !tracked.offerPending
-      || !socket || socket.destroyed) return;
-    this.clearOfferAnswerTimer(tracked);
-    const workerPid = this.workerPidBySocket.get(socket);
-    tracked.offerAnswerTimer = setTimeout(() => {
-      if (this.tracked.get(sessionId) !== tracked || this.socket !== socket) return;
-      const terminal = {
-        type: REMOTE_DESKTOP_MSG.TERMINAL,
-        requestId: tracked.requestId,
-        sessionId: tracked.sessionId,
-        capability: tracked.capability.toString('utf8'),
-        reason: REMOTE_DESKTOP_TERMINAL_REASON.WORKER_FAILED,
-      } as const;
-      this.untrack(sessionId);
-      try { this.options.onOfferTimeout?.(); } catch { /* diagnostics never affect recovery */ }
-      try {
-        if (workerPid && workerPid > 0) {
-          (this.options.terminateProcess ?? ((pid: number) => process.kill(pid)))(workerPid);
-        }
-      } catch {
-        // The authenticated process may already have exited. Destroying its
-        // exact socket still retires the poisoned worker generation.
-      }
-      if (this.socket === socket && !socket.destroyed) socket.destroy();
-      this.onMessage(terminal);
-    }, this.options.offerAnswerTimeoutMs ?? OFFER_ANSWER_TIMEOUT_MS);
-    tracked.offerAnswerTimer.unref?.();
-  }
-
-  private clearOfferAnswerTimer(tracked: TrackedAuthority): void {
-    if (tracked.offerAnswerTimer) clearTimeout(tracked.offerAnswerTimer);
-    tracked.offerAnswerTimer = null;
+    if (!socket || socket.destroyed) return;
+    const connection = this.workerConnectionBySocket.get(socket);
+    if (!connection) return;
+    this.core.armPrepareReadyTimer(sessionId, {
+      connectionGeneration: connection.generation,
+      workerPid: connection.workerPid,
+    });
   }
 
   private clearTrackedTimers(tracked: TrackedAuthority): void {
-    this.clearPrepareReadyTimer(tracked);
-    this.clearOfferAnswerTimer(tracked);
+    this.core.clearTrackedTimers(tracked);
+  }
+
+  private markOfferPending(sessionId: string, socket: net.Socket | null): void {
+    if (!socket || socket.destroyed) return;
+    const connection = this.workerConnectionBySocket.get(socket);
+    if (!connection) return;
+    this.core.markOfferPending(sessionId, {
+      connectionGeneration: connection.generation,
+      workerPid: connection.workerPid,
+    });
   }
 
   /**
@@ -713,8 +932,16 @@ export class RemoteDesktopWorkerHost {
    * exact attempt, so retiring it can never clobber a fresh start someone else
    * has begun.
    */
-  private async ensureStarted(forceSecureConsole = false): Promise<void> {
-    if (this.socket && !this.socket.destroyed) return;
+  private async ensureStarted(
+    requestedMode: WorkerLaunchMode,
+    forceSecureConsole = false,
+    correlationId = this.newCorrelationId(),
+    startedAt = this.now(),
+  ): Promise<void> {
+    if (this.socket && !this.socket.destroyed) {
+      if (this.canReuseWorker(requestedMode)) return;
+      await this.recycleWorkerSocket();
+    }
     const inFlight = this.startPromise;
     if (inFlight) {
       try {
@@ -727,14 +954,43 @@ export class RemoteDesktopWorkerHost {
           this.startPromise = null;
         }
       }
-      if (this.socket && !this.socket.destroyed) return;
+      if (this.socket && !this.socket.destroyed) {
+        if (this.canReuseWorker(requestedMode)) return;
+        await this.recycleWorkerSocket();
+      }
     }
-    const attempt = this.startPromise ?? this.beginWorkerStart(forceSecureConsole);
+    const attempt = this.startPromise
+      ?? this.beginWorkerStart(
+        requestedMode,
+        forceSecureConsole,
+        correlationId,
+        startedAt,
+      );
     this.startPromise = attempt;
     await attempt;
   }
 
-  private beginWorkerStart(forceSecureConsole: boolean): Promise<void> {
+  private canReuseWorker(requestedMode: WorkerLaunchMode): boolean {
+    if (this.workerLaunchMode === WORKER_LAUNCH_MODE.SESSION) return true;
+    if (requestedMode === WORKER_LAUNCH_MODE.CONSENT_ONLY) return true;
+    if (this.workerLaunchMode === WORKER_LAUNCH_MODE.PRIVACY_ONLY) {
+      if (requestedMode === WORKER_LAUNCH_MODE.SESSION) {
+        // Promotion changes only the host's routing state. Native already has
+        // the session parser, but no capture/input authority exists until the
+        // validated PREPARE that follows this transition.
+        this.workerLaunchMode = WORKER_LAUNCH_MODE.SESSION;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  private beginWorkerStart(
+    launchMode: WorkerLaunchMode,
+    forceSecureConsole: boolean,
+    correlationId: string,
+    startedAt: number,
+  ): Promise<void> {
     if (!this.artifact) {
       return Promise.reject(new Error('remote_desktop_worker_unavailable'));
     }
@@ -761,6 +1017,9 @@ export class RemoteDesktopWorkerHost {
     // never a start that has since replaced it.
     const token = {};
     this.startToken = token;
+    this.launchModeByToken.set(token, launchMode);
+    this.launchCorrelationByToken.set(token, correlationId);
+    this.launchStartedAtByToken.set(token, startedAt);
     return new Promise<void>((resolveStarted, rejectStarted) => {
       let settled = false;
       const finish = (error?: Error) => {
@@ -797,9 +1056,19 @@ export class RemoteDesktopWorkerHost {
                 ?? allowWindowsNamedPipeClients)(this.pipePath);
           }
             await this.launchVerified(
-              ['--pipe', this.pipePath, '--nonce', this.nonce],
-              true,
+              [
+                '--pipe', this.pipePath, '--nonce', this.nonce,
+                ...(launchMode === WORKER_LAUNCH_MODE.CONSENT_ONLY
+                  ? ['--consent-only']
+                  : launchMode === WORKER_LAUNCH_MODE.PRIVACY_ONLY
+                    ? ['--privacy-only']
+                    : []),
+              ],
+              launchMode !== WORKER_LAUNCH_MODE.CONSENT_ONLY,
               forceSecureConsole,
+              correlationId,
+              launchMode,
+              startedAt,
             );
           } catch (error) {
             finish(error instanceof Error ? error : new Error(String(error)));
@@ -828,7 +1097,7 @@ export class RemoteDesktopWorkerHost {
     let helloBuffer = '';
     const onHello = (chunk: string | Buffer) => {
       helloBuffer += String(chunk);
-      if (Buffer.byteLength(helloBuffer, 'utf8') > MAX_LINE_BYTES) {
+      if (Buffer.byteLength(helloBuffer, 'utf8') > REMOTE_DESKTOP_WORKER_MAX_LINE_BYTES) {
         socket.destroy();
         return;
       }
@@ -847,71 +1116,88 @@ export class RemoteDesktopWorkerHost {
       // Which desktop this worker actually owns decides where its replacement
       // has to go if the desktop switches under it.
       this.workerSecureConsole = parsed.secureConsole === true;
-      this.workerPidBySocket.set(socket, parsed.pid);
       const remainder = helloBuffer.slice(newline + 1);
       socket.off('data', onHello);
       socket.setTimeout(0);
       finishHandshake();
       if (this.socket && !this.socket.destroyed) this.socket.destroy();
       this.socket = socket;
-      if (this.startToken) this.socketStartToken.set(socket, this.startToken);
-      this.buffer = '';
-      socket.on('data', (data) => this.onData(String(data)));
-      socket.on('close', () => this.onSocketLost(socket));
-      socket.on('error', () => this.onSocketLost(socket));
-      if (remainder) this.onData(remainder);
+      if (this.startToken) {
+        this.socketStartToken.set(socket, this.startToken);
+        this.workerLaunchMode = this.launchModeByToken.get(this.startToken) ?? null;
+      }
+      const generation = this.core.beginConnection();
+      const correlationId = this.startToken
+        ? this.launchCorrelationByToken.get(this.startToken) ?? this.newCorrelationId()
+        : this.newCorrelationId();
+      const startedAt = this.startToken
+        ? this.launchStartedAtByToken.get(this.startToken) ?? this.now()
+        : this.now();
+      this.workerConnectionBySocket.set(socket, {
+        generation,
+        workerPid: parsed.pid,
+        correlationId,
+        startedAt,
+      });
+      socket.on('data', (data) => this.onData(String(data), socket, generation));
+      socket.on('close', (hadError) => {
+        this.emitPipeClosed(socket, hadError);
+        this.onSocketLost(socket);
+      });
+      socket.on('error', (error) => {
+        this.erroredSockets.add(socket);
+        const connection = this.workerConnectionBySocket.get(socket);
+        if (connection) {
+          this.emitLifecycle({
+            event: REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.PIPE_ERROR,
+            correlationId: connection.correlationId,
+            workerGeneration: connection.generation,
+            workerPid: connection.workerPid,
+            elapsedMs: this.elapsedSince(connection.startedAt),
+            errorCode: this.safeErrorCode(error),
+          });
+        }
+        this.onSocketLost(socket);
+      });
+      if (remainder) this.onData(remainder, socket, generation);
       ready();
     };
     socket.on('data', onHello);
   }
 
-  private onData(chunk: string): void {
-    this.buffer += chunk;
-    if (Buffer.byteLength(this.buffer, 'utf8') > MAX_LINE_BYTES) {
-      this.socket?.destroy();
+  private onData(chunk: string, socket: net.Socket, generation: number): void {
+    const inbound = this.core.pushInbound(chunk, generation);
+    if (inbound.overflow) {
+      socket.destroy();
       return;
     }
-    for (;;) {
-      const newline = this.buffer.indexOf('\n');
-      if (newline < 0) return;
-      const line = this.buffer.slice(0, newline).trim();
-      this.buffer = this.buffer.slice(newline + 1);
-      if (!line) continue;
-      let value: unknown;
-      try { value = JSON.parse(line); } catch { continue; }
-      if (validateRemoteDesktopWorkerCrash(value, this.nonce)) {
+    for (const event of inbound.events) {
+      if (event.kind === 'crash') {
         // The worker faulted and is already gone. Surface it before the socket
         // loss turns into an anonymous `worker_failed`; the frame carries no
         // session, capability, media, or input data.
-        this.options.onWorkerCrash?.(value);
+        const connection = this.workerConnectionBySocket.get(socket);
+        if (connection) {
+          this.emitLifecycle({
+            event: REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.CRASH_FRAME,
+            correlationId: connection.correlationId,
+            workerGeneration: connection.generation,
+            workerPid: connection.workerPid,
+            elapsedMs: this.elapsedSince(connection.startedAt),
+          });
+        }
+        this.options.onWorkerCrash?.(event.value);
         continue;
       }
-      const parsed = validateRemoteDesktopDaemonMessage(value);
-      if (!parsed.ok) continue;
-      const tracked = this.tracked.get(parsed.value.sessionId);
-      const capability = Buffer.from(parsed.value.capability, 'utf8');
-      if (!tracked || capability.length !== tracked.capability.length
-        || !timingSafeEqual(capability, tracked.capability)) continue;
-      // MODE_STATE is the normal first response to PREPARE. Any authenticated
-      // session frame proves the native signaling thread escaped initial
-      // capture setup, so subsequent OFFER/ICE are no longer hostage to it.
-      const wasPrepareReady = tracked.prepareReady;
-      tracked.prepareReady = true;
-      this.clearPrepareReadyTimer(tracked);
-      if (parsed.value.type === REMOTE_DESKTOP_MSG.ANSWER) {
-        tracked.offerPending = false;
-        this.clearOfferAnswerTimer(tracked);
-      } else if (!wasPrepareReady && tracked.offerPending) {
-        this.armOfferAnswerTimer(tracked.sessionId, this.socket);
-      }
-      if (parsed.value.type === REMOTE_DESKTOP_MSG.TERMINAL) {
+      const tracked = event.authority;
+      if (event.value.type === REMOTE_DESKTOP_MSG.TERMINAL) {
         // `media_unavailable` also covers transient DXGI/DWM failures while a
         // physical output is switching. Only the worker's explicit initial
         // no-display result is allowed to add a third, virtual display.
-        if (parsed.value.reason === REMOTE_DESKTOP_TERMINAL_REASON.HEADLESS_DISPLAY
-          && !tracked.virtualRetryAttempted) {
-          tracked.virtualRetryAttempted = true;
-          void this.retryWithVirtualDisplay(parsed.value, tracked);
+        if (event.value.reason === REMOTE_DESKTOP_TERMINAL_REASON.HEADLESS_DISPLAY
+          && !tracked.metadata.virtualRetryAttempted) {
+          tracked.metadata.virtualRetryAttempted = true;
+          void this.retryWithVirtualDisplay(event.value, tracked);
           continue;
         }
         // The worker owns the only authoritative view of the input desktop. A
@@ -919,30 +1205,37 @@ export class RemoteDesktopWorkerHost {
         // onto the wrong one — a session locked, or a lingering LogonUI made a
         // logged-in machine look like the sign-in screen. Replace it once with
         // a worker on the privileged desktop instead of failing the session.
-        if (parsed.value.reason === REMOTE_DESKTOP_TERMINAL_REASON.PROTECTED_DESKTOP
-          && !tracked.secureConsoleRetryAttempted) {
-          tracked.secureConsoleRetryAttempted = true;
-          void this.retryOnOtherDesktop(parsed.value, tracked);
+        if (event.value.reason === REMOTE_DESKTOP_TERMINAL_REASON.PROTECTED_DESKTOP
+          && !tracked.metadata.secureConsoleRetryAttempted) {
+          tracked.metadata.secureConsoleRetryAttempted = true;
+          void this.retryOnOtherDesktop(event.value, tracked);
           continue;
         }
-        this.untrack(parsed.value.sessionId);
+        this.untrack(
+          event.value.sessionId,
+          REMOTE_DESKTOP_WORKER_DECLARED_TERMINAL_CLEANUP_REASON,
+          event.value.reason,
+        );
       }
-      this.onMessage(parsed.value);
+      this.onMessage(event.value);
     }
   }
 
   private onSocketLost(socket: net.Socket): void {
+    this.emitPipeClosed(socket, this.erroredSockets.has(socket));
     const recoverableSessions = this.recoverableSocketLosses.get(socket);
     const recoverable = recoverableSessions?.size === 1
-      && this.tracked.size === 1
-      && this.tracked.has([...recoverableSessions][0]!);
+      && this.core.size === 1
+      && this.core.has([...recoverableSessions][0]!);
     this.recoverableSocketLosses.delete(socket);
     const token = this.socketStartToken.get(socket);
     this.socketStartToken.delete(socket);
-    this.workerPidBySocket.delete(socket);
+    const connection = this.workerConnectionBySocket.get(socket);
+    this.workerConnectionBySocket.delete(socket);
     if (this.socket !== socket) return;
     this.socket = null;
-    this.buffer = '';
+    this.workerLaunchMode = null;
+    if (connection) this.core.endConnection(connection.generation);
     if (token !== undefined && this.startToken !== token) {
       // A newer start already owns the listener and the memo. This loss belongs
       // to the generation before it, so tearing those down here would close a
@@ -958,7 +1251,7 @@ export class RemoteDesktopWorkerHost {
       // If the worker crashed before its normal release-all path, launch the
       // immutable verified binary once in release-only mode on the same active
       // desktop. This command carries no credential, authority, or key history.
-      if (this.tracked.size > 0 && this.artifact) {
+      if (this.core.size > 0 && this.artifact) {
         void this.launchVerified(['--release-all-input'], false).catch(() => {
           // The Server is still notified and the short lease still expires;
           // this best-effort recovery cannot restore a dead worker.
@@ -969,27 +1262,170 @@ export class RemoteDesktopWorkerHost {
   }
 
   private failTracked(reason: typeof REMOTE_DESKTOP_TERMINAL_REASON[keyof typeof REMOTE_DESKTOP_TERMINAL_REASON]): void {
-    for (const authority of this.tracked.values()) {
-      this.clearTrackedTimers(authority);
-      this.onMessage({
-        type: REMOTE_DESKTOP_MSG.TERMINAL,
-        requestId: authority.requestId,
-        sessionId: authority.sessionId,
-        capability: authority.capability.toString('utf8'),
-        reason,
-      });
-      authority.capability.fill(0);
+    for (const authority of this.core.authorities().values()) {
+      const connection = this.socket
+        ? this.workerConnectionBySocket.get(this.socket)
+        : undefined;
+      this.emitAuthorityLifecycle(
+        REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.CLEANUP,
+        authority,
+        connection?.generation,
+        connection?.workerPid,
+        { cleanupReason: reason },
+      );
     }
-    this.tracked.clear();
+    this.core.failAll(reason, this.onMessage);
     this.stopVirtualDisplayController();
   }
 
-  private untrack(sessionId: string): void {
-    const authority = this.tracked.get(sessionId);
-    if (authority) this.clearTrackedTimers(authority);
-    authority?.capability.fill(0);
-    this.tracked.delete(sessionId);
-    this.stopVirtualDisplayIfUnused();
+  private untrack(
+    sessionId: string,
+    cleanupReason = 'authority_removed',
+    terminalReason?: RemoteDesktopWorkerDiagnosticEvent['terminalReason'],
+  ): void {
+    const authority = this.core.get(sessionId);
+    if (authority) {
+      const connection = this.socket
+        ? this.workerConnectionBySocket.get(this.socket)
+        : undefined;
+      this.emitAuthorityLifecycle(
+        REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.CLEANUP,
+        authority,
+        connection?.generation,
+        connection?.workerPid,
+        {
+          cleanupReason,
+          ...(terminalReason === undefined ? {} : { terminalReason }),
+        },
+      );
+      // A worker that DECLARES a terminal is not thereby gone. Observed on a
+      // real Windows node: the host logged cleanupReason="worker_terminal" and
+      // the worker process then held the session for 60.7 minutes, failing
+      // every retry as protocol_error until it happened to exit on its own.
+      //
+      // The watchdog-timeout path already reaps the pid for exactly this
+      // reason. Ending a session must not depend on the worker's goodwill, so
+      // the self-declared terminal is reaped the same way. Other cleanup
+      // reasons keep the existing behaviour: a controller stop lets the worker
+      // exit on its own, and a pipe that already closed proves it is gone.
+      if (cleanupReason === REMOTE_DESKTOP_WORKER_DECLARED_TERMINAL_CLEANUP_REASON) {
+        this.reapWorkerProcess(connection?.workerPid);
+      }
+    }
+    this.core.untrack(sessionId);
+  }
+
+  /**
+   * Terminate a worker pid that has outlived its session. Never throws: the
+   * process may legitimately have exited between the terminal and this call,
+   * and a failed reap must not break session teardown.
+   */
+  private reapWorkerProcess(workerPid: number | undefined): void {
+    if (!workerPid || workerPid <= 0) return;
+    try {
+      (this.options.terminateProcess ?? ((pid: number) => process.kill(pid)))(workerPid);
+    } catch {
+      // Already exited, or not ours to signal. Teardown continues either way.
+    }
+  }
+
+  private untrackForInternalRecovery(sessionId: string): void {
+    // The same admitted authority/correlation continues after a stale pipe is
+    // replaced. Retire and zeroize its old capability copy without recording
+    // a terminal CLEANUP; the replacement attempt will emit the one terminal
+    // cleanup when that authority actually ends.
+    this.core.untrack(sessionId);
+  }
+
+  private now(): number {
+    return this.options.now?.() ?? Date.now();
+  }
+
+  private newCorrelationId(): string {
+    return randomBytes(12).toString('hex');
+  }
+
+  private correlationIdFor(prepare: RemoteDesktopPrepare): string {
+    // Stable for one admitted authority without exposing its request/session
+    // identifiers in the LocalSystem log.
+    return createHash('sha256')
+      .update('remote-desktop-worker-diagnostics-v1\0')
+      .update(prepare.requestId)
+      .update('\0')
+      .update(prepare.sessionId)
+      .digest('hex')
+      .slice(0, 24);
+  }
+
+  private elapsedSince(startedAt: number): number {
+    return Math.max(0, Math.floor(this.now() - startedAt));
+  }
+
+  private emitLifecycle(event: RemoteDesktopWorkerDiagnosticEvent): void {
+    try {
+      this.lifecycleEvent?.(event);
+    } catch {
+      // Diagnostics are evidence only. They must never change worker control.
+    }
+  }
+
+  private emitAuthorityLifecycle(
+    event: RemoteDesktopWorkerDiagnosticEvent['event'],
+    authority: TrackedAuthority,
+    workerGeneration?: number,
+    workerPid?: number | null,
+    extra: Pick<RemoteDesktopWorkerDiagnosticEvent, 'cleanupReason'> = {},
+  ): void {
+    this.emitLifecycle({
+      event,
+      correlationId: authority.metadata.correlationId,
+      elapsedMs: this.elapsedSince(authority.metadata.startedAt),
+      ...(workerGeneration === undefined ? {} : { workerGeneration }),
+      ...(workerPid === undefined ? {} : { workerPid }),
+      ...extra,
+    });
+  }
+
+  private safeErrorCode(error: Error): string {
+    const code = (error as NodeJS.ErrnoException).code;
+    return typeof code === 'string' && PIPE_DIAGNOSTIC_ERROR_CODES.has(code.toUpperCase())
+      ? code.toUpperCase()
+      : 'UNKNOWN';
+  }
+
+  private workerPidForGeneration(generation: number): number | undefined {
+    const connection = this.socket
+      ? this.workerConnectionBySocket.get(this.socket)
+      : undefined;
+    return connection?.generation === generation ? connection.workerPid : undefined;
+  }
+
+  private emitPipeClosed(socket: net.Socket, hadError: boolean): void {
+    if (this.diagnosedClosedSockets.has(socket)) return;
+    this.diagnosedClosedSockets.add(socket);
+    const connection = this.workerConnectionBySocket.get(socket);
+    if (!connection) return;
+    const common = {
+      correlationId: connection.correlationId,
+      workerGeneration: connection.generation,
+      workerPid: connection.workerPid,
+      elapsedMs: this.elapsedSince(connection.startedAt),
+    };
+    this.emitLifecycle({
+      event: REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.PIPE_CLOSE,
+      ...common,
+      hadError,
+    });
+    // The worker is launched through CreateProcessAsUser by an indirect,
+    // detached launcher. The authenticated pipe closing is observable, but a
+    // reliable exit status is not; keep the unknown values explicit.
+    this.emitLifecycle({
+      event: REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT.PROCESS_EXIT,
+      ...common,
+      exitCode: null,
+      signal: null,
+      observedBy: 'pipe_close',
+    });
   }
 
   private async retryOnOtherDesktop(
@@ -1009,10 +1445,16 @@ export class RemoteDesktopWorkerHost {
       this.clearTrackedTimers(tracked);
       tracked.prepareReady = false;
       tracked.offerPending = false;
-      this.tracked.delete(tracked.sessionId);
+      tracked.offerContext = null;
+      this.core.detach(tracked.sessionId);
       await this.recycleWorkerSocket();
-      await this.ensureStarted(forceSecureConsole);
-      this.tracked.set(tracked.sessionId, tracked);
+      await this.ensureStarted(
+        WORKER_LAUNCH_MODE.SESSION,
+        forceSecureConsole,
+        tracked.metadata.correlationId,
+        tracked.metadata.startedAt,
+      );
+      this.core.restore(tracked);
       const socket = this.socket;
       if (!socket || socket.destroyed) throw new Error('desktop_handover_unavailable');
       const sent = await this.writeToWorker(socket, tracked.prepare);
@@ -1028,7 +1470,7 @@ export class RemoteDesktopWorkerHost {
         capability: tracked.prepare.capability,
       });
     } catch {
-      this.tracked.set(tracked.sessionId, tracked);
+      this.core.restore(tracked);
       this.untrack(tracked.sessionId);
       this.onMessage(terminal);
     }
@@ -1040,19 +1482,19 @@ export class RemoteDesktopWorkerHost {
   ): Promise<void> {
     try {
       await this.ensureVirtualDisplayController();
-      if (this.tracked.get(tracked.sessionId) !== tracked
+      if (this.core.get(tracked.sessionId) !== tracked
         || !this.socket || this.socket.destroyed) {
         this.stopVirtualDisplayIfUnused();
         return;
       }
-      tracked.usesVirtualDisplay = true;
+      tracked.metadata.usesVirtualDisplay = true;
       tracked.prepareReady = false;
       this.clearTrackedTimers(tracked);
       const sent = await this.writeToWorker(this.socket, tracked.prepare);
       if (!sent) throw new Error('virtual_display_retry_send_failed');
       this.armPrepareReadyTimer(tracked.sessionId, this.socket);
     } catch {
-      if (this.tracked.get(tracked.sessionId) !== tracked) return;
+      if (this.core.get(tracked.sessionId) !== tracked) return;
       this.untrack(tracked.sessionId);
       this.onMessage(terminal);
     }
@@ -1125,7 +1567,7 @@ export class RemoteDesktopWorkerHost {
   }
 
   private stopVirtualDisplayIfUnused(): void {
-    if ([...this.tracked.values()].some((entry) => entry.usesVirtualDisplay)) return;
+    if ([...this.core.values()].some((entry) => entry.metadata.usesVirtualDisplay)) return;
     this.stopVirtualDisplayController();
   }
 

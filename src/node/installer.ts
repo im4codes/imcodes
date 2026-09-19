@@ -62,11 +62,27 @@ export function isProcessElevated(options: PrivilegeCheckOptions = {}): boolean 
     const runCommand = options.runCommand ?? ((file: string, args: readonly string[]) => (
       execFileSync(file, [...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
     ));
-    try {
-      return String(runCommand('powershell.exe', WINDOWS_ADMIN_CHECK)).trim().toLowerCase() === 'true';
-    } catch {
-      return false;
+    // Absolute path, not a bare name: a downloaded installer can be started
+    // from Explorer with a PATH that does not contain System32, and resolving
+    // `powershell.exe` through PATH would then throw ENOENT. The catch below
+    // reports "not elevated", so a PATH problem would masquerade as the user
+    // having failed to run as administrator — the single most misleading
+    // outcome this check can produce.
+    const candidates = [windowsPowerShellExecutablePath(), 'powershell.exe'];
+    let lastError: unknown = null;
+    for (const candidate of candidates) {
+      try {
+        return String(runCommand(candidate, WINDOWS_ADMIN_CHECK)).trim().toLowerCase() === 'true';
+      } catch (error) {
+        lastError = error;
+      }
     }
+    // Every probe failed to *run*, which is not evidence about privilege. Say
+    // so, rather than silently denying an administrator.
+    throw new Error(
+      'unable to determine Windows privilege level: PowerShell could not be executed '
+      + `(${lastError instanceof Error ? lastError.message : String(lastError)})`,
+    );
   }
   return false;
 }
@@ -92,11 +108,31 @@ const WINDOWS_HEALTH_STALE_SECONDS = 180;
 export const WINDOWS_UPGRADE_MARKER_NAME = 'upgrade-in-progress.json';
 const WINDOWS_UPGRADE_MARKER_MAX_AGE_MS = 15 * 60 * 1000;
 
-export function windowsPowerShellExecutablePath(
-  env: { WINDIR?: string } = process.env,
+function windowsSystemRoot(
+  env: { SystemRoot?: string; WINDIR?: string } = process.env,
 ): string {
-  const windowsDirectory = env.WINDIR?.trim() || 'C:\\Windows';
+  return env.SystemRoot?.trim() || env.WINDIR?.trim() || 'C:\\Windows';
+}
+
+export function windowsPowerShellExecutablePath(
+  env: { SystemRoot?: string; WINDIR?: string } = process.env,
+): string {
+  const windowsDirectory = windowsSystemRoot(env);
   return win32.join(windowsDirectory, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+}
+
+/**
+ * Resolve Task Scheduler from the trusted Windows system directory.
+ *
+ * The controlled-node executable is commonly launched by a downloaded
+ * PowerShell bootstrap whose PATH is not guaranteed to contain System32. A
+ * bare `schtasks` therefore fails during process creation (for example with
+ * spawnSync EPERM/ENOENT) before Task Scheduler can report a useful error.
+ */
+export function windowsSchtasksExecutablePath(
+  env: { SystemRoot?: string; WINDIR?: string } = process.env,
+): string {
+  return win32.join(windowsSystemRoot(env), 'System32', 'schtasks.exe');
 }
 
 function windowsWatchdogStartBoundary(now: Date): string {
@@ -496,8 +532,9 @@ async function installWindowsTaskDefinition(
     await writeWatchdogScript(healthPaths.scriptPath, watchdogScript);
     await writeFile(artifactPath, encodeWindowsScheduledTaskXml(xml), { mode: 0o600 });
     await writeFile(watchdogArtifactPath, encodeWindowsScheduledTaskXml(watchdogXml), { mode: 0o600 });
-    runCommand('schtasks', windowsScheduledTaskArgs(artifactPath));
-    runCommand('schtasks', windowsHealthWatchdogTaskArgs(watchdogArtifactPath));
+    const schtasksPath = windowsSchtasksExecutablePath();
+    runCommand(schtasksPath, windowsScheduledTaskArgs(artifactPath));
+    runCommand(schtasksPath, windowsHealthWatchdogTaskArgs(watchdogArtifactPath));
   } finally {
     await rm(artifactDir, { recursive: true, force: true });
   }
@@ -831,8 +868,9 @@ export async function inspectDefinition(
   const runCommand = runCommandFromOptions(options);
   if (platform === 'win32') {
     // SIDE-EFFECT-FREE: only query, never re-install or run.
-    runCommand('schtasks', ['/Query', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_TASK]);
-    runCommand('schtasks', ['/Query', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_WATCHDOG_TASK]);
+    const schtasksPath = windowsSchtasksExecutablePath();
+    runCommand(schtasksPath, ['/Query', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_TASK]);
+    runCommand(schtasksPath, ['/Query', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_WATCHDOG_TASK]);
     return receipt;
   }
   if (receipt.definitionPath && receipt.definitionSha256) {
@@ -878,9 +916,10 @@ export async function inspectServiceState(
     // with the install-time action.
     let queryOut = '';
     let watchdogQueryOut = '';
+    const schtasksPath = windowsSchtasksExecutablePath();
     try {
       queryOut = String(
-        runCommand('schtasks', ['/Query', '/XML', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_TASK]),
+        runCommand(schtasksPath, ['/Query', '/XML', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_TASK]),
       );
     } catch (err) {
       errors.push(`schtasks_query_failed:${(err as Error).message}`);
@@ -888,7 +927,7 @@ export async function inspectServiceState(
     }
     try {
       watchdogQueryOut = String(
-        runCommand('schtasks', ['/Query', '/XML', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_WATCHDOG_TASK]),
+        runCommand(schtasksPath, ['/Query', '/XML', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_WATCHDOG_TASK]),
       );
     } catch (err) {
       errors.push(`watchdog_task_query_failed:${(err as Error).message}`);
@@ -1097,7 +1136,7 @@ export async function startService(
   const platform = options.platform ?? receipt.platform;
   const runCommand = runCommandFromOptions(options);
   if (platform === 'win32') {
-    runCommand('schtasks', ['/Run', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_TASK]);
+    runCommand(windowsSchtasksExecutablePath(), ['/Run', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_TASK]);
     return;
   }
   if (platform === 'darwin') {

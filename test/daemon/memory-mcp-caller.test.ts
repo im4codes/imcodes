@@ -15,6 +15,7 @@ describe('MCP runtime caller env parsing', () => {
       projectName: null,
       projectRoot: null,
       serverId: null,
+      providerId: null,
       transport: 'stdio',
     });
     expect(Object.isFrozen(caller)).toBe(true);
@@ -41,6 +42,7 @@ describe('MCP runtime caller env parsing', () => {
       [MEMORY_MCP_ENV_KEYS.SESSION_NAME]: 'deck_sub_worker',
       [MEMORY_MCP_ENV_KEYS.PROJECT_NAME]: 'proj',
       [MEMORY_MCP_ENV_KEYS.SERVER_ID]: 'srv-1',
+      [MEMORY_MCP_ENV_KEYS.PROVIDER_ID]: 'codex-sdk',
     });
 
     expect(deriveMemoryToolCaller(caller)).toMatchObject({
@@ -49,6 +51,7 @@ describe('MCP runtime caller env parsing', () => {
       sourceProjectName: 'proj',
       sourceServerId: 'srv-1',
     });
+    expect(caller.providerId).toBe('codex-sdk');
   });
 
   it('fails fast for invalid namespace or unsafe session name', () => {

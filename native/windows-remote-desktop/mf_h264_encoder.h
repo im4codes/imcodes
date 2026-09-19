@@ -48,6 +48,13 @@ struct MfH264PerformanceDiagnostics {
 
 MfH264RuntimeDiagnostics GetMfH264RuntimeDiagnostics();
 void DisqualifyHardwareEncoderForProcess();
+// The viewer's effective quality preference (relay cap already folded in),
+// published by the session's quality ladder. The encoder selects with it on
+// every rate update and re-selects at once when it changes, so its
+// diagnostics keep matching the transport core's own selection (the
+// ApplyQuality consistency check). One peer per worker process, so a
+// process-wide value is this viewer's own.
+void SetMfH264QualityPreference(const QualityPreference& preference) noexcept;
 
 // Media Foundation H.264 encoder integrated behind libwebrtc's encoder API.
 // libwebrtc remains authoritative for RTP/RTCP, PLI, NACK, pacing,
@@ -69,6 +76,8 @@ class MfH264Encoder final : public webrtc::VideoEncoder {
   MfH264PerformanceDiagnostics GetPerformanceDiagnostics() const;
   void SetRates(const RateControlParameters& parameters) override;
   EncoderInfo GetEncoderInfo() const override;
+  // Re-select under a changed preference without waiting for SetRates.
+  void ApplyQualityPreference(const QualityPreference& preference);
 
  private:
   struct PendingFrame {
@@ -101,6 +110,8 @@ class MfH264Encoder final : public webrtc::VideoEncoder {
   void RequestKeyFrame();
   void PublishDiagnostics() const;
 
+  int InitEncodeLocked(const webrtc::VideoCodec* codec_settings,
+                       const Settings& settings);
   mutable std::mutex mutex_;
   Microsoft::WRL::ComPtr<IMFTransform> transform_;
   Microsoft::WRL::ComPtr<IMFTransform> video_processor_;

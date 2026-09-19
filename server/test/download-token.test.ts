@@ -5,6 +5,7 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Hono } from 'hono';
+import { FILE_TRANSFER_DOWNLOAD_RESUME } from '../../shared/transport/file-transfer.js';
 
 // Mock dependencies before importing the routes
 vi.mock('../src/security/authorization.js', () => ({
@@ -113,7 +114,7 @@ describe('download-token', () => {
     );
     const { token } = await tokenRes.json() as { token: string };
 
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < FILE_TRANSFER_DOWNLOAD_RESUME.TOKEN_MAX_USES; i++) {
       const res = await app.request(`/api/server/srv1/uploads/abc123/download?token=${token}`);
       expect(res.status).toBe(200);
     }

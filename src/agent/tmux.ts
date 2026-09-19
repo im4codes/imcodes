@@ -7,6 +7,7 @@ import * as fsp from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
 import type { Readable } from 'stream';
+import { SESSION_RESOURCE_OWNER_ENV } from '../../shared/session-resource-lifecycle.js';
 
 import {
   weztermNewSession,
@@ -640,6 +641,38 @@ export async function getPaneId(session: string): Promise<string> {
   }
   if (BACKEND === 'wezterm') return weztermGetPaneId(session);
   return tmuxRun('display-message', '-p', '-t', session, '#{pane_id}');
+}
+
+export interface TmuxSessionResourceIdentity {
+  paneId: string;
+  sessionInstanceId: string;
+  runtimeEpoch: string;
+}
+
+/**
+ * Read the live tmux pane and the owner tuple injected when that session was
+ * launched. This deliberately bypasses tmuxRun's startup retries: conflict
+ * recovery must be a bounded observation and must never hold the resource
+ * registry lock while an unhealthy tmux server retries indefinitely.
+ */
+export async function getTmuxSessionResourceIdentity(
+  session: string,
+  timeoutMs: number,
+): Promise<TmuxSessionResourceIdentity | undefined> {
+  if (BACKEND !== 'tmux') return undefined;
+  try {
+    const format = `#{pane_id}\t#{${SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID}}\t#{${SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH}}`;
+    const { stdout } = await execFile('tmux', ['display-message', '-p', '-t', session, format], {
+      timeout: timeoutMs,
+      maxBuffer: 4 * 1024,
+    });
+    const [paneId, sessionInstanceId, runtimeEpoch, ...extra] = stdout.trimEnd().split('\t');
+    return paneId && sessionInstanceId && runtimeEpoch && extra.length === 0
+      ? { paneId, sessionInstanceId, runtimeEpoch }
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Get the current working directory of the first pane of a session. */

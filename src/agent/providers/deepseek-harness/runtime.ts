@@ -45,6 +45,20 @@ export const DSH_BASE_PROFILE = 'headless';
 /** One-shot rows the overlay disables so the process stays alive for a session. */
 export const DSH_DISABLED_ROW_IDS = ['headless-runner', 'headless-startup'] as const;
 
+/**
+ * dsh-base rows that start, orchestrate or hand more work to native agents:
+ * spawn and fork sub-agents, the follow-up `send_message` control, workflows
+ * and Ralph iteration. A managed session's overlay disables all of them
+ * (patched by id like the stock headless rows).
+ */
+export const DSH_NATIVE_AGENT_ROW_IDS = [
+  'tool-subagent',
+  'tool-subagent-fork',
+  'tool-subagent-control',
+  'tool-workflow',
+  'tool-ralph',
+] as const;
+
 /** Package that connects one external MCP server and registers its tools. */
 export const DSH_MCP_CLIENT_PACKAGE = '@deepseek-ai/dsh-mcp-client';
 
@@ -110,6 +124,8 @@ export interface DshOverlayOptions {
   memoryMcp?: DshMcpServer;
   /** LLM route registered with dsh's generic provider adapter. */
   llm?: DshLlmConfig;
+  /** Withhold native agent tools (`DSH_NATIVE_AGENT_ROW_IDS`) for a managed session. */
+  nativeAgentsFenced?: boolean;
 }
 
 interface DshPatchRow {
@@ -129,9 +145,12 @@ interface DshPatchRow {
  * its value must never be serialized into this on-disk overlay.
  */
 export function buildDshOverlay(
-  options: Pick<DshOverlayOptions, 'memoryMcp' | 'llm'>,
+  options: Pick<DshOverlayOptions, 'memoryMcp' | 'llm' | 'nativeAgentsFenced'>,
 ): DshPatchRow[] {
-  const rows: DshPatchRow[] = DSH_DISABLED_ROW_IDS.map((id) => ({ id, disabled: true }));
+  const rows: DshPatchRow[] = [
+    ...DSH_DISABLED_ROW_IDS,
+    ...(options.nativeAgentsFenced ? DSH_NATIVE_AGENT_ROW_IDS : []),
+  ].map((id) => ({ id, disabled: true }));
   const insert: DshPatchRow[] = [];
   if (options.memoryMcp) {
     insert.push({

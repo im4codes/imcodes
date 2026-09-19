@@ -8,6 +8,7 @@ import {
   matchQuickPhraseTrigger,
   matchSlashCommandTrigger,
 } from '../src/quick-commands.js';
+import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
 
 describe('slash command suggestions', () => {
   it('opens only for an argument-free slash command at the start of the composer', () => {
@@ -31,12 +32,40 @@ describe('slash command suggestions', () => {
       '/fast status',
     ]));
   });
+
+  it('offers CodeBuddy model, compact, and fresh-conversation controls', () => {
+    for (const agentType of ['codebuddy-cn', 'codebuddy-international']) {
+      expect(getDefaultQuickCommands(agentType)).toEqual(expect.arrayContaining([
+        '/stop',
+        '/compact',
+        '/clear',
+        '/model',
+      ]));
+    }
+  });
+
+  it('offers Hermes native steering and queue controls', () => {
+    expect(getDefaultQuickCommands(HERMES_AGENT_PROVIDER_ID)).toEqual(expect.arrayContaining([
+      '/stop',
+      '/compact',
+      '/clear',
+      '/model',
+      '/steer',
+      '/queue',
+      '/tools',
+      '/context',
+    ]));
+  });
 });
 
 describe('quick phrase suggestions', () => {
   it('opens only when a hash is the first composer character', () => {
     expect(matchQuickPhraseTrigger('#')).toBe('');
     expect(matchQuickPhraseTrigger('#err')).toBe('err');
+    expect(matchQuickPhraseTrigger('#1')).toBe('1');
+    expect(matchQuickPhraseTrigger('#1:')).toBeNull();
+    expect(matchQuickPhraseTrigger('#1:(/tmp/upload.png)')).toBeNull();
+    expect(matchQuickPhraseTrigger('#12:(C:\\Users\\me\\upload.png)')).toBeNull();
     expect(matchQuickPhraseTrigger('please #err')).toBeNull();
     expect(matchQuickPhraseTrigger(' #err')).toBeNull();
     expect(matchQuickPhraseTrigger('#err\nnext')).toBeNull();

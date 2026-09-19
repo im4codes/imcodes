@@ -272,6 +272,13 @@ describe('ChatMarkdown', () => {
     const image = container.querySelector('.chat-local-image-preview-img') as HTMLImageElement;
     expect(image.src).toBe('data:image/png;base64,aW1n');
 
+    // tsk_5rf R2: a resolved URL is no longer treated as a loaded image, so the
+    // preview stays in its loading phase until the real load event. jsdom never
+    // loads images on its own, so fire it here exactly as a browser would
+    // before the thumbnail becomes interactive.
+    fireEvent.load(image);
+    await waitFor(() => expect(container.querySelector('.chat-local-image-preview-loading')).toBeNull());
+
     fireEvent.click(image);
     expect(container.querySelector('.fb-lightbox')).not.toBeNull();
     fireEvent.keyDown(container.querySelector('.fb-lightbox') as HTMLDivElement, { key: 'Escape' });

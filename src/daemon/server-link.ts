@@ -29,12 +29,23 @@ import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import { SESSION_GROUP_CLONE_CAPABILITY_V1 } from '../../shared/session-group-clone.js';
 import { EXECUTION_CLONE_CAPABILITY_V1 } from '../../shared/execution-clone.js';
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../shared/git-remote-url.js';
-import { TIMELINE_MESSAGES, TIMELINE_PROTOCOL_CAPABILITY, TIMELINE_PROTOCOL_REVISION } from '../../shared/timeline-protocol.js';
+import {
+  TIMELINE_HISTORY_CANCEL_CAPABILITY,
+  TIMELINE_MESSAGES,
+  TIMELINE_PROTOCOL_CAPABILITY,
+  TIMELINE_PROTOCOL_REVISION,
+  TIMELINE_RESPONSE_SOURCES,
+  TIMELINE_RESPONSE_STATUS,
+} from '../../shared/timeline-protocol.js';
+import { TIMELINE_REQUEST_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
+import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
+import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 import {
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
 } from '../../shared/transport/file-transfer.js';
 import {
+  DIRECT_FILE_TRANSFER_DIRECTORY_UPLOAD_CAPABILITY,
   DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES,
   type DirectConnectivityRuntimeStatus,
 } from '../../shared/direct-file-transfer.js';
@@ -47,6 +58,7 @@ import {
   stringifyForServerSend,
 } from './latency-tracer.js';
 import { getDaemonBuildInfo } from './build-info.js';
+import { CLOCK_SYNC_FIELD } from '../../shared/clock-sync.js';
 import { daemonRemoteDesktopCapabilities } from './remote-desktop-registry.js';
 import { incrementCounter } from '../util/metrics.js';
 import {
@@ -104,12 +116,39 @@ function collectSystemStats(): SystemStats {
 const HEARTBEAT_MS = 5_000;
 const STATS_MS = 5_000; // daemon.stats update interval (separate from heartbeat)
 const DEFAULT_DATA_PLANE_SEND_QUEUE_SOFT_CAP = 256;
-// Bumped from 512 → 100_000 (regression triage: commit 42dfabec used 512 +
-// shift-oldest, which silently dropped timeline.history responses on weak
-// links and forced users to refresh the page). 100_000 is an emergency
-// ceiling, not an expected steady-state — backpressure telemetry above
-// soft-cap is unchanged so ops can still see if a real backlog forms.
-const DEFAULT_DATA_PLANE_SEND_QUEUE_HARD_CAP = 100_000;
+// Never shift an already-accepted response: that previously forced users to
+// refresh after a weak-link episode. New work above the count/byte ceiling is
+// rejected with a request-scoped recoverable response instead.
+const DEFAULT_DATA_PLANE_SEND_QUEUE_HARD_CAP = 16_384;
+// Count cannot bound retained memory: one timeline response can approach 1 MiB.
+// Keep both the daemon-owned queue and the WebSocket implementation's internal
+// send buffer bounded. Control messages intentionally bypass these watermarks.
+const DEFAULT_DATA_PLANE_SEND_QUEUE_MAX_BYTES = 64 * 1024 * 1024;
+// Keep a bounded slice of the queue available for compact, request-scoped
+// overload replies. Without a reserve, the first payloads can consume the
+// whole byte budget and every later queue_full reply has nowhere safe to go.
+const DEFAULT_DATA_PLANE_OVERLOAD_RESERVE_BYTES = 8 * 1024 * 1024;
+const DEFAULT_DATA_PLANE_OVERLOAD_RESERVE_ITEMS = 1_024;
+const DEFAULT_DATA_PLANE_WS_HIGH_WATER_BYTES = 8 * 1024 * 1024;
+const DEFAULT_DATA_PLANE_WS_LOW_WATER_BYTES = 2 * 1024 * 1024;
+const DATA_PLANE_DRAIN_RECHECK_MS = 25;
+/**
+ * Uplink congestion, measured as the heartbeat round trip (the server echoes
+ * the heartbeat's send time on its ack, so the delay includes every queue in
+ * the path: this daemon's socket buffer, the kernel, the network, the
+ * server). The 8 MiB/2 MiB watermarks above assume a link that drains
+ * megabytes per second; on a congested intercontinental path (observed
+ * ~8 KB/s) they let minutes of bulk data sit in front of every heartbeat,
+ * command.ack and session.state, so the link looks stale and messages look
+ * unanswered. While congested, keep only a small slice of bulk data in the
+ * socket so control frames reach the wire within seconds.
+ */
+const LINK_CONGESTION_ENTER_DELAY_MS = 3_000;
+const LINK_CONGESTION_EXIT_DELAY_MS = 1_000;
+const CONGESTED_DATA_PLANE_WS_HIGH_WATER_BYTES = 64 * 1024;
+const CONGESTED_DATA_PLANE_WS_LOW_WATER_BYTES = 16 * 1024;
+const MAX_TRACKED_UNACKED_HEARTBEATS = 64;
+const DATA_PLANE_BACKPRESSURE_LOG_INTERVAL_MS = 5_000;
 // Bumped from 30s → 24h. 30s was the same regression: a brief WS hiccup
 // (Wi-Fi handoff, mobile background) silently expired the queued history /
 // fs / models responses before the link came back, so the reconnect flush
@@ -120,6 +159,11 @@ const DEFAULT_DATA_PLANE_SEND_STALE_MS = 24 * 60 * 60 * 1000;
 let dataPlaneSendQueueSoftCap = DEFAULT_DATA_PLANE_SEND_QUEUE_SOFT_CAP;
 let dataPlaneSendQueueHardCap = DEFAULT_DATA_PLANE_SEND_QUEUE_HARD_CAP;
 let dataPlaneSendStaleMs = DEFAULT_DATA_PLANE_SEND_STALE_MS;
+let dataPlaneSendQueueMaxBytes = DEFAULT_DATA_PLANE_SEND_QUEUE_MAX_BYTES;
+let dataPlaneOverloadReserveBytes = DEFAULT_DATA_PLANE_OVERLOAD_RESERVE_BYTES;
+let dataPlaneOverloadReserveItems = DEFAULT_DATA_PLANE_OVERLOAD_RESERVE_ITEMS;
+let dataPlaneWsHighWaterBytes = DEFAULT_DATA_PLANE_WS_HIGH_WATER_BYTES;
+let dataPlaneWsLowWaterBytes = DEFAULT_DATA_PLANE_WS_LOW_WATER_BYTES;
 
 type DataPlaneSendQueueItem = {
   msg: unknown;
@@ -127,6 +171,7 @@ type DataPlaneSendQueueItem = {
   requestId?: string;
   enqueuedAt: number;
   deadlineAt: number;
+  estimatedBytes: number;
 };
 /**
  * Audit fix (94b9b837-822 / A6) — reconnect tuning.
@@ -207,6 +252,17 @@ let serverLinkReconnectResyncHandler: (() => void) | null = null;
 export function setServerLinkReconnectResyncHandler(handler: (() => void) | null): void {
   serverLinkReconnectResyncHandler = handler;
 }
+let serverLinkDisconnectSecurityHandler: (() => void) | null = null;
+export function setServerLinkDisconnectSecurityHandler(handler: (() => void) | null): void {
+  serverLinkDisconnectSecurityHandler = handler;
+}
+function clearServerLinkSecurity(reason: string): void {
+  try {
+    serverLinkDisconnectSecurityHandler?.();
+  } catch (err) {
+    logger.warn({ err, reason }, 'ServerLink: disconnect security cleanup failed');
+  }
+}
 const DAEMON_STATIC_CAPABILITIES = [
   SESSION_GROUP_CLONE_CAPABILITY_V1,
   // Distinct from session-group-clone — gates the dedicated execution-clone
@@ -215,13 +271,14 @@ const DAEMON_STATIC_CAPABILITIES = [
   EXECUTION_CLONE_CAPABILITY_V1,
   GIT_REMOTE_CLONE_CAPABILITY_V1,
   TIMELINE_PROTOCOL_CAPABILITY,
+  TIMELINE_HISTORY_CANCEL_CAPABILITY,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
 ] as const;
 
 export function directFileTransferDaemonCapabilities(available: boolean): readonly string[] {
   return available
-    ? [...DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES]
+    ? [...DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES, DIRECT_FILE_TRANSFER_DIRECTORY_UPLOAD_CAPABILITY]
     : [];
 }
 
@@ -268,15 +325,102 @@ function requestIdOf(msg: unknown): string | undefined {
     : undefined;
 }
 
+function dataPlaneMessageBytes(msg: unknown): number {
+  try {
+    return Buffer.byteLength(JSON.stringify(msg), 'utf8');
+  } catch {
+    // Cyclic/unserializable data must never enter a retry queue forever.
+    return Number.POSITIVE_INFINITY;
+  }
+}
+
+function compactDataPlaneBackpressureResponse(msg: unknown): Record<string, unknown> | null {
+  if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return null;
+  const input = msg as Record<string, unknown>;
+  const type = messageTypeOf(input);
+  if (!type) return null;
+  const requestId = requestIdOf(input);
+  const common = {
+    type,
+    ...(requestId ? { requestId } : {}),
+  };
+
+  if (
+    type === TIMELINE_MESSAGES.HISTORY
+    || type === TIMELINE_MESSAGES.REPLAY
+    || type === TIMELINE_MESSAGES.PAGE
+    || type === TIMELINE_MESSAGES.DETAIL
+  ) {
+    return {
+      ...common,
+      ...(typeof input.sessionName === 'string' ? { sessionName: input.sessionName } : {}),
+      ...(type === TIMELINE_MESSAGES.DETAIL && typeof input.detailId === 'string' ? { detailId: input.detailId } : {}),
+      status: TIMELINE_RESPONSE_STATUS.ERROR,
+      source: TIMELINE_RESPONSE_SOURCES.ERROR,
+      errorReason: TIMELINE_REQUEST_ERROR_REASONS.QUEUE_FULL,
+      ...(type === TIMELINE_MESSAGES.DETAIL ? {} : { events: [] }),
+      payloadTruncated: false,
+      hasMore: false,
+      recoverable: true,
+    };
+  }
+
+  if (type.startsWith('fs.') || type === 'file.search_response') {
+    return {
+      ...common,
+      ...(typeof input.path === 'string' ? { path: input.path } : {}),
+      status: 'error',
+      error: FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_QUEUE_FULL,
+      recoverable: true,
+      ...(type === 'fs.git_status_response' ? { files: [] } : {}),
+      ...(type === 'file.search_response' ? { results: [] } : {}),
+    };
+  }
+
+  if (type === TRANSPORT_MSG.MODELS_RESPONSE) {
+    return {
+      ...common,
+      ...(typeof input.agentType === 'string' ? { agentType: input.agentType } : {}),
+      ...(typeof input.sessionName === 'string' ? { sessionName: input.sessionName } : {}),
+      ...(typeof input.ccPreset === 'string' ? { ccPreset: input.ccPreset } : {}),
+      models: [],
+      error: TIMELINE_REQUEST_ERROR_REASONS.QUEUE_FULL,
+      recoverable: true,
+    };
+  }
+
+  if (type === TRANSPORT_MSG.CHAT_HISTORY) {
+    return {
+      ...common,
+      ...(typeof input.sessionId === 'string' ? { sessionId: input.sessionId } : {}),
+      events: [],
+      error: TIMELINE_REQUEST_ERROR_REASONS.QUEUE_FULL,
+      recoverable: true,
+    };
+  }
+
+  return null;
+}
+
 export function __setServerLinkDataPlaneQueueConfigForTests(options: {
   softCap?: number;
   hardCap?: number;
   staleMs?: number;
+  maxBytes?: number;
+  overloadReserveBytes?: number;
+  overloadReserveItems?: number;
+  wsHighWaterBytes?: number;
+  wsLowWaterBytes?: number;
 } | null): void {
   if (!options) {
     dataPlaneSendQueueSoftCap = DEFAULT_DATA_PLANE_SEND_QUEUE_SOFT_CAP;
     dataPlaneSendQueueHardCap = DEFAULT_DATA_PLANE_SEND_QUEUE_HARD_CAP;
     dataPlaneSendStaleMs = DEFAULT_DATA_PLANE_SEND_STALE_MS;
+    dataPlaneSendQueueMaxBytes = DEFAULT_DATA_PLANE_SEND_QUEUE_MAX_BYTES;
+    dataPlaneOverloadReserveBytes = DEFAULT_DATA_PLANE_OVERLOAD_RESERVE_BYTES;
+    dataPlaneOverloadReserveItems = DEFAULT_DATA_PLANE_OVERLOAD_RESERVE_ITEMS;
+    dataPlaneWsHighWaterBytes = DEFAULT_DATA_PLANE_WS_HIGH_WATER_BYTES;
+    dataPlaneWsLowWaterBytes = DEFAULT_DATA_PLANE_WS_LOW_WATER_BYTES;
     return;
   }
   dataPlaneSendQueueSoftCap = Math.max(0, Math.trunc(options.softCap ?? DEFAULT_DATA_PLANE_SEND_QUEUE_SOFT_CAP));
@@ -285,11 +429,28 @@ export function __setServerLinkDataPlaneQueueConfigForTests(options: {
     Math.trunc(options.hardCap ?? DEFAULT_DATA_PLANE_SEND_QUEUE_HARD_CAP),
   );
   dataPlaneSendStaleMs = Math.max(0, Math.trunc(options.staleMs ?? DEFAULT_DATA_PLANE_SEND_STALE_MS));
+  dataPlaneSendQueueMaxBytes = Math.max(1, Math.trunc(options.maxBytes ?? DEFAULT_DATA_PLANE_SEND_QUEUE_MAX_BYTES));
+  dataPlaneOverloadReserveBytes = Math.max(0, Math.min(
+    dataPlaneSendQueueMaxBytes - 1,
+    Math.trunc(options.overloadReserveBytes
+      ?? Math.min(DEFAULT_DATA_PLANE_OVERLOAD_RESERVE_BYTES, Math.floor(dataPlaneSendQueueMaxBytes / 4))),
+  ));
+  dataPlaneOverloadReserveItems = Math.max(0, Math.min(
+    dataPlaneSendQueueHardCap - 1,
+    Math.trunc(options.overloadReserveItems
+      ?? Math.min(DEFAULT_DATA_PLANE_OVERLOAD_RESERVE_ITEMS, Math.floor(dataPlaneSendQueueHardCap / 4))),
+  ));
+  dataPlaneWsHighWaterBytes = Math.max(1, Math.trunc(options.wsHighWaterBytes ?? DEFAULT_DATA_PLANE_WS_HIGH_WATER_BYTES));
+  dataPlaneWsLowWaterBytes = Math.max(
+    0,
+    Math.min(dataPlaneWsHighWaterBytes, Math.trunc(options.wsLowWaterBytes ?? DEFAULT_DATA_PLANE_WS_LOW_WATER_BYTES)),
+  );
 }
 
 export class ServerLink {
   private ws: WebSocket | null = null;
   private handlers: MessageHandler[] = [];
+  private openHandlers: Array<() => void> = [];
   private binaryHandlers: BinaryMessageHandler[] = [];
   private heartbeatTimer?: ReturnType<typeof setInterval>;
   private statsTimer?: ReturnType<typeof setInterval>;
@@ -312,6 +473,10 @@ export class ServerLink {
   private timelineDropsWhileLinkDown = 0;
   private lastTimelineDropLogAt = 0;
   private lastPong = 0;               // timestamp of last received message (any message counts as proof of life)
+  /** Send times (Date.now) of heartbeats not yet acked, oldest first. */
+  private unackedHeartbeatSentAts: number[] = [];
+  private lastHeartbeatRoundTripMs: number | null = null;
+  private uplinkCongested = false;
   private seq = 0;
   private readonly workerUrl: string;
   private readonly serverId: string;
@@ -321,7 +486,13 @@ export class ServerLink {
   private lastHelloSentAt = 0;
   private sendBacklogStartedAt: number | null = null;
   private dataPlaneSendQueue: DataPlaneSendQueueItem[] = [];
+  private dataPlaneSendQueueBytes = 0;
   private dataPlaneSendScheduled = false;
+  private dataPlaneDrainTimer?: ReturnType<typeof setTimeout>;
+  private dataPlaneSocketBackpressured = false;
+  private dataPlaneOverloadReconnectRequested = false;
+  private lastDataPlaneBackpressureLogAt = 0;
+  private suppressedDataPlaneBackpressureLogs = 0;
   private dataPlaneQueueStartedAt: number | null = null;
   private p2pWorkflowCapabilities: readonly string[] = [
     P2P_WORKFLOW_CAPABILITY_V1,
@@ -341,6 +512,9 @@ export class ServerLink {
   }
 
   connect(): void {
+    // A new authentication attempt replaces all authority learned over the
+    // prior socket, even if that socket never delivers a close event.
+    clearServerLinkSecurity('connect_replacement');
     // Clean up previous connection if any
     this.stopHeartbeat();
     this.stopWatchdog();
@@ -397,6 +571,9 @@ export class ServerLink {
       clearConnectTimeout();
       logger.info('ServerLink: connected');
       this.backoffMs = INITIAL_BACKOFF_MS;
+      this.dataPlaneSocketBackpressured = false;
+      this.dataPlaneOverloadReconnectRequested = false;
+      this.resetLinkCongestion();
       this.lastPong = Date.now();
       this.recordRuntimeLinkStatus({
         state: 'connected',
@@ -416,6 +593,9 @@ export class ServerLink {
           DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
       }));
       this.sendDaemonHello();
+      for (const handler of this.openHandlers) {
+        try { handler(); } catch (err) { logger.warn({ err }, 'ServerLink: open handler failed'); }
+      }
       // Wire transport relay so provider callbacks can send events to browsers via this socket.
       setTransportRelaySend((msg) => {
         try {
@@ -503,6 +683,7 @@ export class ServerLink {
       if (this.ws !== ws) return; // stale socket — a newer connection already took over
       clearConnectTimeout();
       const errorMessage = (event as ErrorEvent).message ?? 'unknown';
+      clearServerLinkSecurity('socket_error');
       logger.warn({ error: errorMessage }, 'ServerLink: error');
       this.recordRuntimeLinkStatus({
         state: 'disconnected',
@@ -548,6 +729,7 @@ export class ServerLink {
           return;
         }
         if (msg?.type === 'heartbeat_ack') {
+          this.observeHeartbeatAck(msg[CLOCK_SYNC_FIELD.SENT_AT], this.lastPong);
           // Heartbeat acks are the CLI/status proof-of-life source. They must
           // not be throttled behind a just-written heartbeat-sent record, or
           // the runtime file can report a false stale link while acks are
@@ -572,6 +754,7 @@ export class ServerLink {
       if (this.ws !== ws) return;
       clearConnectTimeout();
       logger.info({ code: event.code, reason: event.reason }, 'ServerLink: closed');
+      clearServerLinkSecurity('socket_close');
       this.recordRuntimeLinkStatus({
         state: 'disconnected',
         lastDisconnectedAt: Date.now(),
@@ -586,8 +769,7 @@ export class ServerLink {
 
   send(msg: unknown): void {
     if (this.shouldDeferDataPlaneSend(msg)) {
-      this.enqueueDataPlaneSend(msg);
-      this.scheduleDataPlaneFlush();
+      if (this.enqueueDataPlaneSend(msg)) this.scheduleDataPlaneFlush();
       return;
     }
     this.trySend(msg);
@@ -595,6 +777,7 @@ export class ServerLink {
 
   trySend(msg: unknown): boolean {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      clearServerLinkSecurity('send_without_open_socket');
       // Best-effort: silently drop messages when the link isn't up. Throwing
       // here would become an unhandled rejection in any fire-and-forget
       // caller (handleP2pConfigSave, repo-handler, command-handler, etc.)
@@ -619,6 +802,7 @@ export class ServerLink {
       const sendStart = performance.now();
       const sendBacklogAgeMs = this.updateSendBacklogAge(bufferedAmountBefore, sendStart);
       const outboundQueueDepth = this.dataPlaneSendQueue.length;
+      const outboundQueueBytes = this.dataPlaneSendQueueBytes;
       const outboundQueueAgeMs = this.dataPlaneQueueStartedAt === null ? 0 : sendStart - this.dataPlaneQueueStartedAt;
       this.ws.send(serialized.payload);
       const bufferedAmountAfter = typeof this.ws.bufferedAmount === 'number' ? this.ws.bufferedAmount : undefined;
@@ -637,12 +821,14 @@ export class ServerLink {
         bufferedAmountAfter,
         sendBacklogAgeMs,
         outboundQueueDepth,
+        outboundQueueBytes,
         outboundQueueAgeMs,
         recipientCount: 1,
         success: true,
       });
       return true;
     } catch (err) {
+      clearServerLinkSecurity('socket_send_error');
       recordServerSend({
         msgType: typeof (msg as { type?: unknown })?.type === 'string' ? (msg as { type: string }).type : undefined,
         commandId: typeof (msg as { commandId?: unknown })?.commandId === 'string' ? (msg as { commandId: string }).commandId : undefined,
@@ -653,6 +839,7 @@ export class ServerLink {
         bufferedAmountAfter: undefined,
         sendBacklogAgeMs: undefined,
         outboundQueueDepth: this.dataPlaneSendQueue.length,
+        outboundQueueBytes: this.dataPlaneSendQueueBytes,
         outboundQueueAgeMs: this.dataPlaneQueueStartedAt === null ? 0 : performance.now() - this.dataPlaneQueueStartedAt,
         recipientCount: 1,
         success: false,
@@ -674,11 +861,59 @@ export class ServerLink {
     return classifyServerSendPlane(msgType) === 'data';
   }
 
-  private enqueueDataPlaneSend(msg: unknown): void {
+  private enqueueDataPlaneSend(msg: unknown): boolean {
     const now = performance.now();
     const msgType = messageTypeOf(msg);
     const requestId = requestIdOf(msg);
+    const estimatedBytes = dataPlaneMessageBytes(msg);
     this.dropExpiredDataPlaneSendItems(now, 'enqueue_stale');
+    const normalCountCap = Math.max(1, dataPlaneSendQueueHardCap - dataPlaneOverloadReserveItems);
+    const normalByteCap = Math.max(1, dataPlaneSendQueueMaxBytes - dataPlaneOverloadReserveBytes);
+    const countLimited = this.dataPlaneSendQueue.length >= normalCountCap;
+    const byteLimited = !Number.isFinite(estimatedBytes)
+      || estimatedBytes > normalByteCap
+      || this.dataPlaneSendQueueBytes + estimatedBytes > normalByteCap;
+    if (countLimited || byteLimited) {
+      const reason = countLimited ? 'hard_count_cap_reject_new' : 'hard_byte_cap_reject_new';
+      const overflowResponse = compactDataPlaneBackpressureResponse(msg);
+      recordServerLinkDataPlaneBackpressure({
+        msgType,
+        requestId,
+        reason,
+        queueDepth: this.dataPlaneSendQueue.length,
+        queueBytes: this.dataPlaneSendQueueBytes,
+        messageBytes: Number.isFinite(estimatedBytes) ? estimatedBytes : -1,
+        maxQueueBytes: dataPlaneSendQueueMaxBytes,
+        wsBufferedAmount: this.ws?.bufferedAmount ?? 0,
+        softCap: dataPlaneSendQueueSoftCap,
+        hardCap: dataPlaneSendQueueHardCap,
+        overflow: 1,
+      });
+      incrementCounter('serverlink_data_plane_overload', { msgType: msgType ?? 'unknown', reason });
+      this.logDataPlaneBackpressure({
+        msgType,
+        requestId,
+        reason,
+        queueDepth: this.dataPlaneSendQueue.length,
+        queueBytes: this.dataPlaneSendQueueBytes,
+        messageBytes: Number.isFinite(estimatedBytes) ? estimatedBytes : undefined,
+        maxQueueBytes: dataPlaneSendQueueMaxBytes,
+        wsBufferedAmount: this.ws?.bufferedAmount ?? 0,
+      }, 'ServerLink: rejected data-plane payload at bounded queue');
+      // Compact failures are data-plane responses too: sending them directly
+      // while bufferedAmount is stuck merely moves an unbounded strong
+      // reference stream into the WebSocket implementation. Queue them inside
+      // the reserved portion of the same hard byte/count budget instead.
+      if (overflowResponse && this.enqueueCompactDataPlaneOverloadResponse(overflowResponse, now)) {
+        return true;
+      }
+      // If even the bounded reply reserve is exhausted, recycle the wedged
+      // socket once. The close is an explicit retry signal and releases its
+      // native send buffer; accepted queue entries remain ordered for the next
+      // connection. Never keep appending to an OPEN-but-undrainable socket.
+      this.requestDataPlaneOverloadReconnect(reason);
+      return false;
+    }
     if (this.dataPlaneSendQueue.length >= dataPlaneSendQueueSoftCap) {
       const overflow = Math.max(0, this.dataPlaneSendQueue.length - dataPlaneSendQueueSoftCap + 1);
       recordServerLinkDataPlaneBackpressure({
@@ -687,21 +922,24 @@ export class ServerLink {
         queueDepth: this.dataPlaneSendQueue.length,
         softCap: dataPlaneSendQueueSoftCap,
         hardCap: dataPlaneSendQueueHardCap,
+        queueBytes: this.dataPlaneSendQueueBytes,
+        messageBytes: estimatedBytes,
+        maxQueueBytes: dataPlaneSendQueueMaxBytes,
+        wsBufferedAmount: this.ws?.bufferedAmount ?? 0,
         overflow,
       });
-      logger.warn({
+      this.logDataPlaneBackpressure({
         msgType,
         requestId,
         overflow,
         queueDepth: this.dataPlaneSendQueue.length,
         softCap: dataPlaneSendQueueSoftCap,
         hardCap: dataPlaneSendQueueHardCap,
+        queueBytes: this.dataPlaneSendQueueBytes,
+        messageBytes: estimatedBytes,
+        maxQueueBytes: dataPlaneSendQueueMaxBytes,
+        wsBufferedAmount: this.ws?.bufferedAmount ?? 0,
       }, 'ServerLink: data-plane queue backpressure');
-    }
-    if (this.dataPlaneSendQueue.length >= dataPlaneSendQueueHardCap) {
-      const dropped = this.dataPlaneSendQueue.shift();
-      this.recordDataPlaneSendItemDropped(dropped, now, 'hard_cap_drop_oldest');
-      this.dataPlaneQueueStartedAt = this.dataPlaneSendQueue[0]?.enqueuedAt ?? null;
     }
     this.dataPlaneSendQueue.push({
       msg,
@@ -709,15 +947,72 @@ export class ServerLink {
       requestId,
       enqueuedAt: now,
       deadlineAt: now + dataPlaneSendStaleMs,
+      estimatedBytes,
     });
+    this.dataPlaneSendQueueBytes += estimatedBytes;
     this.dataPlaneQueueStartedAt ??= now;
+    return true;
+  }
+
+  private enqueueCompactDataPlaneOverloadResponse(msg: Record<string, unknown>, now: number): boolean {
+    const estimatedBytes = dataPlaneMessageBytes(msg);
+    if (!Number.isFinite(estimatedBytes)
+      || this.dataPlaneSendQueue.length >= dataPlaneSendQueueHardCap
+      || this.dataPlaneSendQueueBytes + estimatedBytes > dataPlaneSendQueueMaxBytes) return false;
+    this.dataPlaneSendQueue.push({
+      msg,
+      msgType: messageTypeOf(msg),
+      requestId: requestIdOf(msg),
+      enqueuedAt: now,
+      deadlineAt: now + dataPlaneSendStaleMs,
+      estimatedBytes,
+    });
+    this.dataPlaneSendQueueBytes += estimatedBytes;
+    this.dataPlaneQueueStartedAt ??= now;
+    incrementCounter('serverlink_data_plane_overload_response_queued', {
+      msgType: messageTypeOf(msg) ?? 'unknown',
+    });
+    return true;
+  }
+
+  private requestDataPlaneOverloadReconnect(reason: string): void {
+    if (this.dataPlaneOverloadReconnectRequested) return;
+    this.dataPlaneOverloadReconnectRequested = true;
+    incrementCounter('serverlink_data_plane_overload_reconnect', { reason });
+    this.logDataPlaneBackpressure({
+      reason: 'overload_reply_reserve_exhausted',
+      queueDepth: this.dataPlaneSendQueue.length,
+      queueBytes: this.dataPlaneSendQueueBytes,
+      maxQueueBytes: dataPlaneSendQueueMaxBytes,
+      wsBufferedAmount: this.ws?.bufferedAmount ?? 0,
+    }, 'ServerLink: recycling socket after bounded overload reserve exhausted');
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.close(1013, 'data_plane_backpressure');
+    }
+  }
+
+  private logDataPlaneBackpressure(fields: Record<string, unknown>, message: string): void {
+    const now = Date.now();
+    if (now - this.lastDataPlaneBackpressureLogAt < DATA_PLANE_BACKPRESSURE_LOG_INTERVAL_MS) {
+      this.suppressedDataPlaneBackpressureLogs += 1;
+      return;
+    }
+    logger.warn({
+      ...fields,
+      suppressedSinceLastLog: this.suppressedDataPlaneBackpressureLogs,
+    }, message);
+    this.lastDataPlaneBackpressureLogAt = now;
+    this.suppressedDataPlaneBackpressureLogs = 0;
   }
 
   private dropExpiredDataPlaneSendItems(now: number, reason: string): void {
     if (this.dataPlaneSendQueue.length === 0) return;
     const live: DataPlaneSendQueueItem[] = [];
     for (const item of this.dataPlaneSendQueue) {
-      if (item.deadlineAt <= now) this.recordDataPlaneSendItemDropped(item, now, reason);
+      if (item.deadlineAt <= now) {
+        this.dataPlaneSendQueueBytes = Math.max(0, this.dataPlaneSendQueueBytes - item.estimatedBytes);
+        this.recordDataPlaneSendItemDropped(item, now, reason);
+      }
       else live.push(item);
     }
     if (live.length === this.dataPlaneSendQueue.length) return;
@@ -755,6 +1050,128 @@ export class ServerLink {
     return !!this.ws && this.ws.readyState === WebSocket.OPEN;
   }
 
+  private isDataPlaneSocketBelowWatermark(): boolean {
+    if (!this.isLinkSendable()) return false;
+    const bufferedAmount = typeof this.ws?.bufferedAmount === 'number' ? this.ws.bufferedAmount : 0;
+    const congested = this.isUplinkCongested();
+    const highWater = congested
+      ? Math.min(dataPlaneWsHighWaterBytes, CONGESTED_DATA_PLANE_WS_HIGH_WATER_BYTES)
+      : dataPlaneWsHighWaterBytes;
+    const lowWater = congested
+      ? Math.min(dataPlaneWsLowWaterBytes, CONGESTED_DATA_PLANE_WS_LOW_WATER_BYTES)
+      : dataPlaneWsLowWaterBytes;
+    if (this.dataPlaneSocketBackpressured) {
+      if (bufferedAmount > lowWater) return false;
+      this.dataPlaneSocketBackpressured = false;
+      incrementCounter('serverlink_data_plane_socket_backpressure_recovered');
+      return true;
+    }
+    if (bufferedAmount >= highWater) {
+      this.dataPlaneSocketBackpressured = true;
+      incrementCounter('serverlink_data_plane_socket_backpressure', {
+        reason: congested ? 'congested_high_water' : 'high_water',
+      });
+      return false;
+    }
+    return true;
+  }
+
+  private scheduleDataPlaneWatermarkRecheck(): void {
+    if (this.dataPlaneDrainTimer || this.stopping || this.dataPlaneSendQueue.length === 0) return;
+    this.dataPlaneDrainTimer = setTimeout(() => {
+      this.dataPlaneDrainTimer = undefined;
+      this.scheduleDataPlaneFlush();
+    }, DATA_PLANE_DRAIN_RECHECK_MS);
+    this.dataPlaneDrainTimer.unref?.();
+  }
+
+  private resetLinkCongestion(): void {
+    this.unackedHeartbeatSentAts = [];
+    this.lastHeartbeatRoundTripMs = null;
+    this.uplinkCongested = false;
+  }
+
+  private trackHeartbeatSent(sentAt: number): void {
+    this.unackedHeartbeatSentAts.push(sentAt);
+    if (this.unackedHeartbeatSentAts.length > MAX_TRACKED_UNACKED_HEARTBEATS) {
+      // Keep the OLDEST outstanding send: it is the one that proves how long
+      // the link has been failing to return an ack.
+      this.unackedHeartbeatSentAts.splice(1, 1);
+    }
+  }
+
+  private observeHeartbeatAck(echoedSentAt: unknown, receivedAt: number): void {
+    // Acks from servers that predate the clock echo carry no send time and
+    // cannot be matched; they leave congestion tracking unchanged.
+    if (typeof echoedSentAt !== 'number' || !Number.isFinite(echoedSentAt)) return;
+    this.lastHeartbeatRoundTripMs = Math.max(0, receivedAt - echoedSentAt);
+    this.unackedHeartbeatSentAts = this.unackedHeartbeatSentAts.filter((sentAt) => sentAt > echoedSentAt);
+  }
+
+  /** Current end-to-end link delay: the last measured heartbeat round trip,
+   *  or longer if an outstanding heartbeat has already waited longer. */
+  linkDelayMs(now: number = Date.now()): number {
+    const oldestUnacked = this.unackedHeartbeatSentAts[0];
+    const waiting = oldestUnacked === undefined ? 0 : Math.max(0, now - oldestUnacked);
+    return Math.max(this.lastHeartbeatRoundTripMs ?? 0, waiting);
+  }
+
+  /** True while the uplink is too slow for bulk data to share the socket
+   *  freely with control frames. Hysteresis avoids flapping around one value. */
+  isUplinkCongested(now: number = Date.now()): boolean {
+    const delay = this.linkDelayMs(now);
+    if (this.uplinkCongested) {
+      if (delay <= LINK_CONGESTION_EXIT_DELAY_MS) {
+        this.uplinkCongested = false;
+        incrementCounter('serverlink_uplink_congestion_cleared');
+      }
+    } else if (delay >= LINK_CONGESTION_ENTER_DELAY_MS) {
+      this.uplinkCongested = true;
+      incrementCounter('serverlink_uplink_congestion_entered');
+      logger.warn({ delayMs: delay }, 'ServerLink: uplink congested; limiting bulk data in the socket');
+    }
+    return this.uplinkCongested;
+  }
+
+  /**
+   * Drop queued, not-yet-written data-plane replies for a request the server
+   * has already abandoned (it timed out or its requester went away). Writing
+   * them would spend a congested uplink on bytes the server discards on
+   * arrival. Anything already handed to the socket is past recall.
+   */
+  cancelQueuedDataPlaneRequest(requestId: string): number {
+    if (!requestId || this.dataPlaneSendQueue.length === 0) return 0;
+    const now = performance.now();
+    const live: DataPlaneSendQueueItem[] = [];
+    let cancelled = 0;
+    for (const item of this.dataPlaneSendQueue) {
+      // A fan-out reply (`requestIds`) also serves other requesters; one
+      // requester giving up must not take it away from the rest.
+      const fanout = (item.msg as { requestIds?: unknown } | null)?.requestIds;
+      const servesOthers = Array.isArray(fanout) && fanout.length > 0;
+      if (item.requestId === requestId && !servesOthers) {
+        this.dataPlaneSendQueueBytes = Math.max(0, this.dataPlaneSendQueueBytes - item.estimatedBytes);
+        this.recordDataPlaneSendItemDropped(item, now, 'server_cancelled');
+        cancelled += 1;
+      } else {
+        live.push(item);
+      }
+    }
+    if (cancelled === 0) return 0;
+    this.dataPlaneSendQueue = live;
+    this.dataPlaneQueueStartedAt = this.dataPlaneSendQueue[0]?.enqueuedAt ?? null;
+    incrementCounter('serverlink_data_plane_server_cancelled');
+    return cancelled;
+  }
+
+  dataPlaneQueueStatsForTests(): { depth: number; bytes: number; socketBackpressured: boolean } {
+    return {
+      depth: this.dataPlaneSendQueue.length,
+      bytes: this.dataPlaneSendQueueBytes,
+      socketBackpressured: this.dataPlaneSocketBackpressured,
+    };
+  }
+
   /** Public hook for the WS `open` handler to kick the data-plane drain
    *  after reconnect. Without this, anything that piled up in the queue
    *  during the disconnect window would never be flushed. */
@@ -785,6 +1202,7 @@ export class ServerLink {
       }
       if (item.deadlineAt <= now) {
         this.dataPlaneSendQueue.shift();
+        this.dataPlaneSendQueueBytes = Math.max(0, this.dataPlaneSendQueueBytes - item.estimatedBytes);
         this.recordDataPlaneSendItemDropped(item, now, 'drain_stale');
       } else if (!this.isLinkSendable()) {
         // Stop the drain and wait for reconnect. Telemetry only — no drop.
@@ -794,9 +1212,27 @@ export class ServerLink {
           queueDepth: this.dataPlaneSendQueue.length,
           softCap: dataPlaneSendQueueSoftCap,
           hardCap: dataPlaneSendQueueHardCap,
+          queueBytes: this.dataPlaneSendQueueBytes,
+          maxQueueBytes: dataPlaneSendQueueMaxBytes,
+          wsBufferedAmount: this.ws?.bufferedAmount ?? 0,
           overflow: 0,
         });
         this.dataPlaneQueueStartedAt = this.dataPlaneSendQueue[0]?.enqueuedAt ?? null;
+        return;
+      } else if (!this.isDataPlaneSocketBelowWatermark()) {
+        recordServerLinkDataPlaneBackpressure({
+          msgType: item.msgType,
+          requestId: item.requestId,
+          reason: 'ws_high_water',
+          queueDepth: this.dataPlaneSendQueue.length,
+          queueBytes: this.dataPlaneSendQueueBytes,
+          maxQueueBytes: dataPlaneSendQueueMaxBytes,
+          wsBufferedAmount: this.ws?.bufferedAmount ?? 0,
+          wsHighWaterBytes: dataPlaneWsHighWaterBytes,
+          wsLowWaterBytes: dataPlaneWsLowWaterBytes,
+          overflow: 0,
+        });
+        this.scheduleDataPlaneWatermarkRecheck();
         return;
       } else {
         const ok = this.trySend(item.msg);
@@ -809,6 +1245,7 @@ export class ServerLink {
           return;
         }
         this.dataPlaneSendQueue.shift();
+        this.dataPlaneSendQueueBytes = Math.max(0, this.dataPlaneSendQueueBytes - item.estimatedBytes);
       }
       if (this.dataPlaneSendQueue.length === 0) {
         this.dataPlaneQueueStartedAt = null;
@@ -952,16 +1389,26 @@ export class ServerLink {
     this.handlers.push(handler);
   }
 
+  /** Runs after the auth frame is queued on every initial/replacement socket. */
+  onOpen(handler: () => void): void {
+    this.openHandlers.push(handler);
+  }
+
   onBinaryMessage(handler: BinaryMessageHandler): void {
     this.binaryHandlers.push(handler);
   }
 
   disconnect(): void {
+    clearServerLinkSecurity('explicit_disconnect');
     this.stopping = true;
     this.stopHeartbeat();
     this.stopWatchdog();
     if (this.pongTimer) clearTimeout(this.pongTimer);
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    if (this.dataPlaneDrainTimer) {
+      clearTimeout(this.dataPlaneDrainTimer);
+      this.dataPlaneDrainTimer = undefined;
+    }
     if (this.connectTimeoutTimer) {
       clearTimeout(this.connectTimeoutTimer);
       this.connectTimeoutTimer = undefined;
@@ -982,7 +1429,14 @@ export class ServerLink {
           this.recycleSilentConnection('heartbeat_silent_connection', silenceMs);
           return;
         }
-        const sent = this.trySend({ type: 'heartbeat', daemonVersion: this.daemonVersion, ...collectSystemStats() });
+        const heartbeatSentAt = Date.now();
+        const sent = this.trySend({
+          type: 'heartbeat',
+          daemonVersion: this.daemonVersion,
+          ...collectSystemStats(),
+          [CLOCK_SYNC_FIELD.SENT_AT]: heartbeatSentAt,
+        });
+        if (sent) this.trackHeartbeatSent(heartbeatSentAt);
         this.recordRuntimeLinkStatus({
           state: sent ? 'connected' : 'disconnected',
           lastHeartbeatSentAt: now,
@@ -1086,6 +1540,7 @@ export class ServerLink {
 
   /** Kill current connection and force immediate reconnect */
   private forceReconnect(reason = 'watchdog_forced_reconnect'): void {
+    clearServerLinkSecurity(reason);
     this.stopHeartbeat();
     this.stopWatchdog();
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = undefined; }

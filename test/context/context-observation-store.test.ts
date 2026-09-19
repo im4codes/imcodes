@@ -148,6 +148,52 @@ describe('post-1.1 context namespace and observation store', () => {
     expect(listContextObservations({ namespaceId: namespaceRow.id, class: 'decision' })[0].sourceEventIds).toEqual(['evt-1', 'evt-2']);
   });
 
+  it('filters and limits observations in the store before returning worker payloads', () => {
+    const allowed = ensureContextNamespace(namespace, 100);
+    const denied = ensureContextNamespace({ ...namespace, userId: 'user-2' }, 100);
+    writeContextObservation({
+      namespaceId: allowed.id,
+      scope: 'personal',
+      class: 'note',
+      origin: 'user_note',
+      fingerprint: 'allowed-old',
+      content: { text: 'allowed old' },
+      state: 'active',
+      now: 100,
+    });
+    const newest = writeContextObservation({
+      namespaceId: allowed.id,
+      scope: 'personal',
+      class: 'note',
+      origin: 'user_note',
+      fingerprint: 'allowed-new',
+      content: { text: 'allowed new' },
+      state: 'active',
+      now: 300,
+    });
+    writeContextObservation({
+      namespaceId: denied.id,
+      scope: 'personal',
+      class: 'note',
+      origin: 'user_note',
+      fingerprint: 'denied-newest',
+      content: { text: 'denied newest' },
+      state: 'active',
+      now: 400,
+    });
+
+    expect(listContextObservations({
+      namespaceIds: [allowed.id],
+      scope: 'personal',
+      class: 'note',
+      state: ['active'],
+      limit: 1,
+    })).toEqual([expect.objectContaining({ id: newest.id })]);
+    expect(listContextObservations({ namespaceIds: [] })).toEqual([]);
+    expect(listContextObservations({ state: [] })).toEqual([]);
+    expect(listContextObservations({ limit: 0 })).toEqual([]);
+  });
+
   it('rejects invalid or reserved projection origins before durable writes', () => {
     expect(() => writeProcessedProjection({
       namespace,

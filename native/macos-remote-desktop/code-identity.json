@@ -1,0 +1,33 @@
+{
+  "identityVersion": 1,
+  "minimumMacosVersion": "12.3",
+  "hardenedRuntime": true,
+  "executableTargetsDefined": true,
+  "executableTargetsPendingReason": "",
+  "components": {
+    "worker": {
+      "bundleIdentifier": "cc.imcodes.node.remote-desktop-worker",
+      "fileName": "imcodes-remote-desktop-worker",
+      "entitlements": "entitlements/worker.entitlements",
+      "gnTarget": "//third_party/imcodes_macos_remote_desktop:imcodes_remote_desktop_worker"
+    },
+    "launchAgent": {
+      "bundleIdentifier": "cc.imcodes.node.remote-desktop-agent",
+      "fileName": "imcodes-remote-desktop-launch-agent",
+      "entitlements": "entitlements/launch-agent.entitlements",
+      "gnTarget": "//third_party/imcodes_macos_remote_desktop:imcodes_remote_desktop_launch_agent"
+    },
+    "disclosure": {
+      "bundleIdentifier": "cc.imcodes.node.remote-desktop-disclosure",
+      "fileName": "imcodes-remote-desktop-disclosure",
+      "entitlements": "entitlements/disclosure.entitlements",
+      "gnTarget": "//third_party/imcodes_macos_remote_desktop:imcodes_remote_desktop_disclosure"
+    },
+    "virtualDisplayHelper": {
+      "bundleIdentifier": "cc.imcodes.node.virtual-display-helper",
+      "fileName": "imcodes-virtual-display-helper",
+      "entitlements": "entitlements/virtual-display-helper.entitlements",
+      "gnTarget": "//third_party/imcodes_macos_remote_desktop:imcodes_virtual_display_helper"
+    }
+  }
+}

@@ -55,6 +55,48 @@ function successFor(message: PreviewReadWorkerRequest): PreviewReadWorkerResult 
 }
 
 describe('PreviewReadWorkerPool', () => {
+  it('backs off a worker that keeps crashing, and starts over once one completes a job', async () => {
+    vi.useFakeTimers();
+    try {
+      const workers: ControlledWorker[] = [];
+      const pool = new PreviewReadWorkerPool({
+        workersTarget: 1,
+        restartBackoffMs: 250,
+        createWorker: () => {
+          const worker = new ControlledWorker();
+          workers.push(worker);
+          return worker;
+        },
+      });
+      const first = pool.dispatch({ phase: 'probe' } as never);
+      first.catch(() => undefined);
+      expect(workers).toHaveLength(1);
+      // Each crash doubles the wait before the next spawn: 250, 500, 1000...
+      const expectedDelays = [250, 500, 1000, 2000, 4000];
+      for (const delay of expectedDelays) {
+        workers.at(-1)!.fail();
+        const before = workers.length;
+        await vi.advanceTimersByTimeAsync(delay - 1);
+        expect(workers.length).toBe(before);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(workers.length).toBe(before + 1);
+      }
+      // A worker that completes a job resets the streak.
+      const healthy = workers.at(-1)!;
+      const job = pool.dispatch({ phase: 'probe' } as never);
+      await vi.advanceTimersByTimeAsync(0);
+      healthy.emit(successFor(healthy.posted.at(-1)!));
+      await job;
+      healthy.fail();
+      const before = workers.length;
+      await vi.advanceTimersByTimeAsync(250);
+      expect(workers.length).toBe(before + 1);
+      pool.shutdown?.();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('defaults to two workers and runs two active jobs concurrently', async () => {
     const workers: ControlledWorker[] = [];
     const pool = new PreviewReadWorkerPool({

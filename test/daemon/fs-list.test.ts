@@ -272,7 +272,7 @@ describe('fs.ls handler', () => {
     });
   });
 
-  it('previews one exact file path published by the assistant in the shared session', async () => {
+  it('previews one exact standalone file path published by the assistant in the shared session', async () => {
     const projectDir = path.join(homedir(), 'project');
     const publishedFile = path.join(homedir(), 'worktrees', 'release', 'public', 'templates', '承诺书.pdf');
     vi.spyOn(sessionStore, 'getSession').mockReturnValue({ name: 'deck_project_brain', projectDir } as never);
@@ -285,7 +285,7 @@ describe('fs.ls handler', () => {
       source: 'daemon',
       confidence: 'high',
       type: 'assistant.text',
-      payload: { text: `Word 下载和 PDF 预览：\`${publishedFile}\`` },
+      payload: { text: `文件已生成：\n${publishedFile}` },
     }] as never);
     vi.mocked(fsp.lstat).mockResolvedValue({ isSymbolicLink: () => false, isFile: () => true } as fsp.Stats);
     mockRealpath.mockImplementation(async (target) => String(target));
@@ -304,6 +304,41 @@ describe('fs.ls handler', () => {
       'read-assistant-published-file',
       expect.any(Function),
     );
+  });
+
+  it('never authorizes a sensitive ~/.ssh file even when the assistant publishes its exact path', async () => {
+    const projectDir = path.join(homedir(), 'project');
+    const sensitiveFile = path.join(homedir(), '.ssh', 'id_rsa');
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({ name: 'deck_project_brain', projectDir } as never);
+    vi.spyOn(timelineStore, 'readByTypesPreferred').mockResolvedValue([{
+      eventId: 'assistant-sensitive-file-path',
+      sessionId: 'deck_project_brain',
+      ts: Date.now(),
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: sensitiveFile },
+    }] as never);
+    vi.mocked(fsp.lstat).mockResolvedValue({ isSymbolicLink: () => false, isFile: () => true } as fsp.Stats);
+    mockRealpath.mockImplementation(async (target) => String(target));
+
+    handleWebCommand({
+      type: 'fs.read',
+      path: sensitiveFile,
+      requestId: 'read-assistant-published-sensitive-file',
+      sessionName: 'deck_project_brain',
+    }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockPreviewCoordinator.handle).not.toHaveBeenCalled();
+    expect(sent[0]).toMatchObject({
+      type: 'fs.read_response',
+      requestId: 'read-assistant-published-sensitive-file',
+      status: 'error',
+      error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH,
+    });
   });
 
   it('does not grant neighboring paths or paths written only by a participant', async () => {

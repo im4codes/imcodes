@@ -25,6 +25,7 @@ import { FS_GENERIC_ERROR_CODES } from '@shared/fs-error-codes.js';
 import { FS_WRITE_MAX_BYTES, FS_WRITE_OUTBOUND_WS_MAX_BYTES } from '@shared/fs-write-limits.js';
 import { CLAUDE_QUOTA_MSG } from '@shared/claude-quota.js';
 import { CODEX_RESET_CREDITS_MSG, type CodexResetCredit, type CodexConsumeOutcome } from '@shared/codex-reset-credits.js';
+import { CODEX_CREDIT_HISTORY_MSG, type CodexCreditSnapshot } from '@shared/codex-credit-history.js';
 import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
 import type { ShareTarget } from './tab-sharing-ui.js';
 import {
@@ -131,7 +132,9 @@ export type SessionEventReason =
   | 'socket_open'
   | 'probe_start'
   | 'probe_recovered'
-  | 'socket_closed';
+  | 'socket_closed'
+  /** The bounded terminal-input queue had to discard the oldest keystrokes. */
+  | 'input_buffer_overflow';
 
 export type ServerMessage =
   | ResourceChangedMessage
@@ -182,14 +185,31 @@ export type ServerMessage =
     ts?: number;
   }
   | { type: 'daemon.error'; kind: 'uncaughtException' | 'unhandledRejection' | 'warning'; message: string; stack?: string; ts: number }
-  | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; sessionInstanceId?: string; runtimeEpoch?: string; project: string; role: string; agentType: string; providerId?: string; agentVersion?: string; state: string; error?: string | null; projectDir?: string; runtimeType?: 'process' | 'transport'; label?: string; description?: string; userCreated?: boolean; ccPreset?: string | null; qwenModel?: string; requestedModel?: string; activeModel?: string; qwenAuthType?: string; qwenAuthLimit?: string; qwenAvailableModels?: string[]; copilotAvailableModels?: string[]; cursorAvailableModels?: string[]; codexAvailableModels?: string[]; modelDisplay?: string; planLabel?: string; permissionLabel?: string; quotaLabel?: string; quotaUsageLabel?: string; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace']; contextNamespaceDiagnostics?: string[]; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextRetryExhausted?: boolean; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride; transportConfig?: Record<string, unknown> | null; transportPendingMessages?: string[]; transportPendingMessageEntries?: TransportPendingMessageEntry[]; queueEpoch?: string; queueAuthorityId?: string; failedMessageEntries?: TransportPendingMessageEntry[]; pendingMessageVersion?: number; transportPendingMessageVersion?: number; activeDispatchId?: string | null }> }
+  | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; sessionInstanceId?: string; runtimeEpoch?: string; project: string; role: string; agentType: string; providerId?: string; agentVersion?: string; state: string; error?: string | null; projectDir?: string; runtimeType?: 'process' | 'transport'; label?: string; description?: string; userCreated?: boolean; ccPreset?: string | null; qwenModel?: string; requestedModel?: string; activeModel?: string; qwenAuthType?: string; qwenAuthLimit?: string; qwenAvailableModels?: string[]; copilotAvailableModels?: string[]; cursorAvailableModels?: string[]; codexAvailableModels?: string[]; modelDisplay?: string; planLabel?: string; permissionLabel?: string; quotaLabel?: string; quotaUsageLabel?: string; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; codexCreditsBalance?: string | null; codexCreditsHasCredits?: boolean | null; codexCreditsUnlimited?: boolean | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace']; contextNamespaceDiagnostics?: string[]; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextRetryExhausted?: boolean; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride; transportConfig?: Record<string, unknown> | null; supervisionMode?: import('../../shared/supervision-config.js').SupervisionMode | null; transportPendingMessages?: string[]; transportPendingMessageEntries?: TransportPendingMessageEntry[]; queueEpoch?: string; queueAuthorityId?: string; failedMessageEntries?: TransportPendingMessageEntry[]; pendingMessageVersion?: number; transportPendingMessageVersion?: number; activeDispatchId?: string | null }> }
   | { type: 'outbound'; platform: string; channelId: string; content: string }
   | TimelineEventMessage
   | TimelineReplayResponseMessage
   | TimelineHistoryResponseMessage
   | TimelinePageResponseMessage
   | TimelineDetailResponseMessage
-  | { type: typeof MSG_COMMAND_ACK; commandId: string; status: string; session: string; error?: string; activeDispatchId?: string | null }
+  // command.ack is the only reliable, replayable frame in this closure. A
+  // not-found append answers with the recipient-gated queue authority attached
+  // HERE, not on a best-effort timeline event that may never arrive, so these
+  // fields are part of the ack contract rather than unknown extras.
+  | {
+    type: typeof MSG_COMMAND_ACK;
+    commandId: string;
+    status: string;
+    session: string;
+    error?: string;
+    activeDispatchId?: string | null;
+    queueEpoch?: string;
+    queueAuthorityId?: string;
+    pendingMessageVersion?: number;
+    pendingMessageEntries?: unknown;
+    failedMessageEntries?: unknown;
+    queueReconcilesCommandId?: string;
+  }
   | { type: typeof PEER_AUDIT_MESSAGES.CANDIDATES; commandId: string; ok: boolean; list?: import('../../shared/peer-audit.js').PeerAuditCandidateList; error?: string }
   | { type: typeof PEER_AUDIT_MESSAGES.QUICK_RESULT; commandId: string; ok: boolean; attemptId?: string; resultEventId?: string; error?: string }
   | { type: typeof PEER_AUDIT_MESSAGES.CANCEL_RESULT; commandId: string; ok: boolean; error?: string }
@@ -215,8 +235,8 @@ export type ServerMessage =
   | { type: typeof P2P_WORKFLOW_MSG.RUN_SAVE; run: any }
   | { type: typeof P2P_CONFIG_MSG.SAVE_RESPONSE; requestId: string; scopeSession: string; ok: boolean; error?: string }
   | { type: typeof P2P_WORKFLOW_MSG.CONFLICT; existingRunId: string; initiatorSession: string; commandId: string }
-  | { type: 'subsession.created'; id: string; sessionName: string; sessionInstanceId?: string; runtimeEpoch?: string; sessionType: string; cwd?: string; label?: string; parentSession?: string; state?: string; runtimeType?: 'process' | 'transport' | null; providerId?: string | null; providerSessionId?: string | null; ccPresetId?: string | null; requestedModel?: string | null; activeModel?: string | null; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace'] | null; contextNamespaceDiagnostics?: string[] | null; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextRetryExhausted?: boolean | null; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride | null; transportConfig?: Record<string, unknown> | null; qwenModel?: string | null; qwenAuthType?: string | null; qwenAvailableModels?: string[] | null; codexAvailableModels?: string[] | null; modelDisplay?: string | null; planLabel?: string | null; permissionLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null; transportPendingMessageEntries?: TransportPendingMessageEntry[]; queueEpoch?: string; queueAuthorityId?: string; failedMessageEntries?: TransportPendingMessageEntry[]; pendingMessageVersion?: number; transportPendingMessageVersion?: number }
-  | { type: 'subsession.sync'; id: string; sessionName?: string; sessionInstanceId?: string; runtimeEpoch?: string; state?: string; cwd?: string; label?: string; ccPresetId?: string | null; requestedModel?: string | null; activeModel?: string | null; providerId?: string | null; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace'] | null; contextNamespaceDiagnostics?: string[] | null; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextRetryExhausted?: boolean | null; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride | null; transportConfig?: Record<string, unknown> | null; qwenModel?: string | null; codexAvailableModels?: string[] | null; modelDisplay?: string | null; planLabel?: string | null; permissionLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null; transportPendingMessageEntries?: TransportPendingMessageEntry[]; queueEpoch?: string; queueAuthorityId?: string; failedMessageEntries?: TransportPendingMessageEntry[]; pendingMessageVersion?: number; transportPendingMessageVersion?: number }
+  | { type: 'subsession.created'; id: string; sessionName: string; sessionInstanceId?: string; runtimeEpoch?: string; sessionType: string; cwd?: string; label?: string; parentSession?: string; state?: string; runtimeType?: 'process' | 'transport' | null; providerId?: string | null; providerSessionId?: string | null; ccPresetId?: string | null; requestedModel?: string | null; activeModel?: string | null; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace'] | null; contextNamespaceDiagnostics?: string[] | null; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextRetryExhausted?: boolean | null; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride | null; transportConfig?: Record<string, unknown> | null; supervisionMode?: import('../../shared/supervision-config.js').SupervisionMode | null; qwenModel?: string | null; qwenAuthType?: string | null; qwenAvailableModels?: string[] | null; codexAvailableModels?: string[] | null; modelDisplay?: string | null; planLabel?: string | null; permissionLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; codexCreditsBalance?: string | null; codexCreditsHasCredits?: boolean | null; codexCreditsUnlimited?: boolean | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null; transportPendingMessageEntries?: TransportPendingMessageEntry[]; queueEpoch?: string; queueAuthorityId?: string; failedMessageEntries?: TransportPendingMessageEntry[]; pendingMessageVersion?: number; transportPendingMessageVersion?: number }
+  | { type: 'subsession.sync'; id: string; sessionName?: string; sessionInstanceId?: string; runtimeEpoch?: string; state?: string; cwd?: string; label?: string; ccPresetId?: string | null; requestedModel?: string | null; activeModel?: string | null; providerId?: string | null; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace'] | null; contextNamespaceDiagnostics?: string[] | null; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness | null; contextRetryExhausted?: boolean | null; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride | null; transportConfig?: Record<string, unknown> | null; qwenModel?: string | null; codexAvailableModels?: string[] | null; modelDisplay?: string | null; planLabel?: string | null; permissionLabel?: string | null; quotaLabel?: string | null; quotaUsageLabel?: string | null; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; codexCreditsBalance?: string | null; codexCreditsHasCredits?: boolean | null; codexCreditsUnlimited?: boolean | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null; transportPendingMessageEntries?: TransportPendingMessageEntry[]; queueEpoch?: string; queueAuthorityId?: string; failedMessageEntries?: TransportPendingMessageEntry[]; pendingMessageVersion?: number; transportPendingMessageVersion?: number }
   | { type: 'subsession.removed'; id: string; sessionName: string }
   | { type: typeof P2P_WORKFLOW_MSG.RUN_STARTED; runId: string; session: string }
   | { type: typeof P2P_WORKFLOW_MSG.CANCEL_RESPONSE; runId: string; ok: boolean }
@@ -228,6 +248,7 @@ export type ServerMessage =
   | { type: typeof CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE; requestId?: string; presetName: string; ok: boolean; preset?: CcPreset; models?: CcPresetModelInfo[]; endpoint?: string; error?: string }
   | { type: typeof CODEX_RESET_CREDITS_MSG.LIST_RESPONSE; requestId?: string; ok: boolean; credits?: CodexResetCredit[]; availableCount?: number; error?: string }
   | { type: typeof CODEX_RESET_CREDITS_MSG.CONSUME_RESPONSE; requestId?: string; ok: boolean; outcome?: CodexConsumeOutcome; error?: string }
+  | { type: typeof CODEX_CREDIT_HISTORY_MSG.RESPONSE; requestId?: string; ok: boolean; snapshots?: CodexCreditSnapshot[]; error?: string }
   | SessionGroupCloneEvent
   | FsGitDiffResponse
   | FsWriteResponse
@@ -271,7 +292,7 @@ export type ServerMessage =
   | ({ type: typeof MEMORY_WS.PROJECT_RESOLVE_RESPONSE } & MemoryProjectResolveResponsePayload)
   | { type: typeof MEMORY_WS.FEATURES_RESPONSE; requestId?: string; records: MemoryFeatureAdminRecord[] }
   | ({ type: typeof MEMORY_WS.FEATURES_SET_RESPONSE } & MemoryFeatureSetResponse)
-  | { type: typeof MEMORY_WS.PREF_RESPONSE; requestId?: string; records: MemoryPreferenceAdminRecord[]; featureEnabled?: boolean }
+  | { type: typeof MEMORY_WS.PREF_RESPONSE; requestId?: string; records: MemoryPreferenceAdminRecord[]; featureEnabled?: boolean; localUnavailable?: boolean; error?: string; errorCode?: MemoryManagementErrorCode }
   | { type: typeof MEMORY_WS.PREF_CREATE_RESPONSE; requestId?: string; success: boolean; id?: string; error?: string; errorCode?: MemoryManagementErrorCode }
   | { type: typeof MEMORY_WS.PREF_UPDATE_RESPONSE; requestId?: string; success: boolean; id?: string; error?: string; errorCode?: MemoryManagementErrorCode }
   | { type: typeof MEMORY_WS.PREF_DELETE_RESPONSE; requestId?: string; success: boolean; error?: string; errorCode?: MemoryManagementErrorCode }
@@ -280,7 +301,7 @@ export type ServerMessage =
   | { type: typeof MEMORY_WS.SKILL_READ_RESPONSE; requestId?: string; success: boolean; key?: string; layer?: string; content?: string; error?: string; errorCode?: MemoryManagementErrorCode }
   | { type: typeof MEMORY_WS.SKILL_DELETE_RESPONSE; requestId?: string; success: boolean; error?: string; errorCode?: MemoryManagementErrorCode }
   | { type: typeof MEMORY_WS.MD_INGEST_RUN_RESPONSE; requestId?: string; success: boolean; filesChecked?: number; observationsWritten?: number; error?: string; errorCode?: MemoryManagementErrorCode; featureEnabled?: boolean }
-  | { type: typeof MEMORY_WS.OBSERVATION_RESPONSE; requestId?: string; records: MemoryObservationAdminRecord[]; featureEnabled?: boolean }
+  | { type: typeof MEMORY_WS.OBSERVATION_RESPONSE; requestId?: string; records: MemoryObservationAdminRecord[]; featureEnabled?: boolean; localUnavailable?: boolean; error?: string; errorCode?: MemoryManagementErrorCode }
   | { type: typeof MEMORY_WS.OBSERVATION_UPDATE_RESPONSE; requestId?: string; success: boolean; id?: string; error?: string; errorCode?: MemoryManagementErrorCode }
   | { type: typeof MEMORY_WS.OBSERVATION_DELETE_RESPONSE; requestId?: string; success: boolean; error?: string; errorCode?: MemoryManagementErrorCode }
   | { type: typeof MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE; requestId?: string; success: boolean; audit?: Record<string, unknown>; error?: string; errorCode?: MemoryManagementErrorCode }
@@ -309,6 +330,29 @@ const HEARTBEAT_MS = 10000; // lowered from 25s for faster dead-connection detec
 const TERMINAL_SUBSCRIPTION_DEBOUNCE_MS = 50;
 const TERMINAL_SUBSCRIPTION_STAGGER_MS = 30;
 const TERMINAL_RECONNECT_REPLAY_STAGGER_MS = 90;
+/** Spacing between per-session transport `chat.history` replay requests after a
+ *  reconnect. Each one makes the daemon read and ship that session's whole
+ *  history, and the browser then parses + merges + re-renders it. Firing them
+ *  all in one loop — which is what happened before — put N of those bursts on
+ *  the main thread back to back. `subscribeTransportSession` already documents
+ *  this hazard for the page-open path; the reconnect path bypassed that
+ *  protection entirely. Kept in the same order of magnitude as the terminal
+ *  stagger so a reconnect with both kinds of subscription interleaves. */
+const TRANSPORT_RECONNECT_HISTORY_STAGGER_MS = 120;
+
+/** Minimum spacing between snapshot requests for the SAME session.
+ *  Previously this lived only inside `handleStreamReset`; `sendSnapshotRequest`
+ *  had no governance at all, so component-driven requests bypassed it. */
+const SNAPSHOT_SESSION_MIN_INTERVAL_MS = 500;
+/** Spacing between snapshot requests for DIFFERENT sessions.
+ *
+ *  A per-session limiter has no ceiling once K sessions are open: K terminals
+ *  reconnecting (or K stream_resets arriving) each get their own 500ms budget,
+ *  so the client can emit K requests in one tick. Every one of them makes the
+ *  daemon fork a `capture-pane` AND makes the server broadcast a full frame to
+ *  EVERY browser subscribed to that session, so the cost grows with tabs x
+ *  sessions. This global cursor is the missing brake. */
+const SNAPSHOT_GLOBAL_STAGGER_MS = 60;
 const POST_CONNECT_NON_CRITICAL_WINDOW_MS = 1_000;
 const POST_CONNECT_NON_CRITICAL_BASE_DELAY_MS = 250;
 const POST_CONNECT_NON_CRITICAL_STAGGER_MS = 90;
@@ -343,6 +387,9 @@ const DEFAULT_OUTBOUND_WS_MESSAGE_MAX_BYTES = 60_000;
  *  liveness during normal use; foreground probes only need to fire after a
  *  genuine sleep/background gap. */
 const PROBE_FRESHNESS_MS = 5_000;
+/** Terminal input survives a brief probe/reconnect window, never an unbounded backlog. */
+const MAX_PENDING_INPUT_ENTRIES = 500;
+const MAX_PENDING_INPUT_BYTES = 32 * 1024;
 /** When a user interaction requests fresh data (opening a sub-session,
  *  subscribing to a terminal, asking for timeline history) and the socket has
  *  NOT proven liveness for at least one full heartbeat+pong window, eagerly
@@ -354,6 +401,9 @@ const PROBE_FRESHNESS_MS = 5_000;
  *  every ~10s) is never probed by ordinary interaction — only a genuinely
  *  stalled one is. */
 const INTERACTION_PROBE_STALE_MS = HEARTBEAT_MS + PONG_TIMEOUT_MS;
+const OWNED_DATA_REQUEST_TTL_MS = 20_000;
+const OWNED_DATA_REQUEST_RATE_WINDOW_MS = 10_000;
+const OWNED_DATA_REQUEST_RATE_LIMIT = 64;
 
 function createP2pWorkflowRequestId(): string {
   const requestId = globalThis.crypto?.randomUUID?.()
@@ -427,6 +477,13 @@ export class WsClient {
   private serverId: string;
   private shareTarget: ShareTarget | null;
   private _connected = false;
+  /**
+   * Terminal keystrokes awaiting an OPEN socket. Terminal input is the one
+   * payload with no commandId, ACK or replay, so it must not be discarded by
+   * the probe heuristic. Strictly bounded -- never an unlimited buffer.
+   */
+  private pendingInput: Array<{ sessionName: string; data: string }> = [];
+  private pendingInputBytes = 0;
   private _connecting = false;
   private _destroyed = false;
   private _pingLatency: number | null = null;
@@ -476,6 +533,8 @@ export class WsClient {
   private terminalRawHolds = new Map<string, number>();
   private sentTerminalSubscriptions = new Map<string, boolean>();
   private terminalSubscriptionTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Staggered `forceHistory` upgrades issued after a reconnect (see replayAllSubscriptionsForNewSocket). */
+  private transportHistoryReplayTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private terminalSubscriptionNextFlushAt = 0;
 
   /** Desired transport-chat subscriptions per session. Replayed on browser reconnect. */
@@ -488,6 +547,13 @@ export class WsClient {
   private postConnectNonCriticalUntil = 0;
   private postConnectNonCriticalSlots = 0;
   private nonCriticalSendTimers = new Set<ReturnType<typeof setTimeout>>();
+  /** Browser-owner single-flight for daemon reads that can return large
+   * payloads. Multiple mounted panels asking for the same snapshot share one
+   * requestId/response instead of multiplying daemon work and retained WS
+   * payloads. */
+  private ownedDataRequests = new Map<string, { requestId: string; expiresAt: number }>();
+  private ownedDataRequestKeyById = new Map<string, string>();
+  private ownedDataRequestStarts: number[] = [];
 
   /** Per-session stream reset recovery state.
    *  - lastSnapshotAt: rate-limits snapshot requests to avoid hammering the
@@ -503,6 +569,12 @@ export class WsClient {
     lastSnapshotAt: number;
     pendingSnapshot: ReturnType<typeof setTimeout> | null;
   }>();
+  /** Global (cross-session) cursor for outbound snapshot requests. */
+  private snapshotNextGlobalSlotAt = 0;
+  /** Last dimensions actually sent per session. tmux keeps ONE size per
+   *  session, so a redundant resize still reflows the whole pane and streams
+   *  that reflow to every subscriber as raw PTY bytes. */
+  private lastSentResize = new Map<string, string>();
 
   constructor(baseUrl: string, serverId: string, options: { shareTarget?: ShareTarget | null } = {}) {
     this.baseUrl = baseUrl;
@@ -880,10 +952,47 @@ export class WsClient {
       terminalReplayIndex++;
     }
 
+    // Two-phase, deliberately. Phase 1 re-establishes every LIVE subscription
+    // immediately and with `forceHistory:false`, so no session misses realtime
+    // events while the reconnect settles (the server drops events for sessions
+    // with no subscriber). Phase 2 asks for the expensive `chat.history` replay
+    // one session at a time.
+    //
+    // Doing both in a single synchronous loop meant that after a lock/sleep —
+    // where the socket almost always died and every open session reconnects at
+    // once — the daemon replayed N full histories in parallel and the browser
+    // had to parse, merge and re-render all of them back to back on the main
+    // thread. That is a subscription storm, and it scales with the number of
+    // open sessions, which matches "the more tabs are open, the worse it is".
+    let historyReplayIndex = 0;
     for (const sessionId of this.transportSubscriptions) {
-      const replayHistory = this.transportSubscriptionReplayHistory.get(sessionId) !== false;
-      if (!this.sendTransportSubscribe(sessionId, replayHistory)) break;
+      if (!this.sendTransportSubscribe(sessionId, false)) break;
+      if (this.transportSubscriptionReplayHistory.get(sessionId) === false) continue;
+      this.queueTransportHistoryReplay(sessionId, historyReplayIndex * TRANSPORT_RECONNECT_HISTORY_STAGGER_MS);
+      historyReplayIndex++;
     }
+  }
+
+  /** Ask for one session's transport history replay after `delayMs`. Replaces any
+   *  pending request for the same session and is cancelled on socket teardown, so
+   *  a flapping link cannot accumulate replay requests. */
+  private queueTransportHistoryReplay(sessionId: string, delayMs: number): void {
+    const existing = this.transportHistoryReplayTimers.get(sessionId);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      this.transportHistoryReplayTimers.delete(sessionId);
+      // Still wanted? A session unsubscribed during the stagger window must not
+      // pull a history it no longer displays.
+      if (!this.transportSubscriptions.has(sessionId)) return;
+      if (this.transportSubscriptionReplayHistory.get(sessionId) === false) return;
+      this.sendTransportSubscribe(sessionId, true);
+    }, Math.max(0, delayMs));
+    this.transportHistoryReplayTimers.set(sessionId, timer);
+  }
+
+  private clearTransportHistoryReplayTimers(): void {
+    for (const timer of this.transportHistoryReplayTimers.values()) clearTimeout(timer);
+    this.transportHistoryReplayTimers.clear();
   }
 
   private flushSubscriptionDiffAfterProbeRecovery(): void {
@@ -987,6 +1096,12 @@ export class WsClient {
     this.send({ type: CODEX_RESET_CREDITS_MSG.CONSUME, requestId, idempotencyKey });
   }
 
+  /** Request the codex account's recorded pay-as-you-go credit-balance history. */
+  requestCodexCreditHistory(requestId: string, limit?: number): void {
+    if (!requestId) return;
+    this.send({ type: CODEX_CREDIT_HISTORY_MSG.REQUEST, requestId, ...(limit ? { limit } : {}) });
+  }
+
   /** Respond to a transport approval request. */
   respondTransportApproval(sessionId: string, requestId: string, approved: boolean): void {
     if (!sessionId || !requestId) return;
@@ -1039,12 +1154,62 @@ export class WsClient {
 
   /** Send raw keyboard input (from xterm onData) to a tmux session. */
   sendInput(sessionName: string, data: string): void {
-    this.send({ type: 'session.input', sessionName, data });
+    // The generic send() gate is deliberately left unchanged. Terminal input
+    // alone bypasses the probe heuristic, because `_connected=false` is flipped
+    // on every tab resume while readyState is still OPEN, and a dropped
+    // keystroke has no retry path (unlike session.send). readyState OPEN stays
+    // required -- the same OS-level truth sendUrgent() uses for /stop.
+    // Everything goes through the queue so order is preserved exactly.
+    this.queueInput(sessionName, data);
+    this.flushPendingInput();
+  }
+
+  private queueInput(sessionName: string, data: string): void {
+    this.pendingInput.push({ sessionName, data });
+    this.pendingInputBytes += utf8ByteLength(data);
+    while (
+      this.pendingInput.length > MAX_PENDING_INPUT_ENTRIES
+      || this.pendingInputBytes > MAX_PENDING_INPUT_BYTES
+    ) {
+      const dropped = this.pendingInput.shift();
+      if (!dropped) break;
+      this.pendingInputBytes -= utf8ByteLength(dropped.data);
+      // A bound is required, but a drop is never silent.
+      this.dispatch({
+        type: 'session.event',
+        event: 'warning',
+        session: dropped.sessionName,
+        state: 'warning',
+        reason: 'input_buffer_overflow',
+      });
+    }
+  }
+
+  private flushPendingInput(): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    while (this.pendingInput.length > 0) {
+      const next = this.pendingInput[0]!;
+      try {
+        this.ws.send(JSON.stringify({ type: 'session.input', sessionName: next.sessionName, data: next.data }));
+      } catch {
+        return; // keep the remainder queued, in order
+      }
+      this.pendingInput.shift();
+      this.pendingInputBytes -= utf8ByteLength(next.data);
+    }
   }
 
   /** Notify the daemon that the terminal viewport has been resized. */
   sendResize(sessionName: string, cols: number, rows: number): void {
     if (!this._connected) return;
+    // An unchanged resize is NOT a no-op on the daemon: `handleResize` still
+    // calls `resizeSession`, tmux reflows the entire pane, and that reflow is
+    // streamed to every subscriber as raw PTY bytes. Every terminal re-runs
+    // its resize effect on reconnect, so without this guard one reconnect
+    // replays a full-screen reflow per open terminal.
+    const key = `${cols}x${rows}`;
+    if (this.lastSentResize.get(sessionName) === key) return;
+    this.lastSentResize.set(sessionName, key);
     this.send({ type: 'session.resize', sessionName, cols, rows });
   }
 
@@ -1338,6 +1503,7 @@ export class WsClient {
     }
     if (this._connected) return;
     this._connected = true;
+    this.flushPendingInput();
     this.flushSubscriptionDiffAfterProbeRecovery();
     this.dispatch({
       type: 'session.event',
@@ -1423,23 +1589,125 @@ export class WsClient {
   }
 
   /** Request a terminal snapshot (fullFrame) for a session. */
+  /** Request a fresh full-frame snapshot for a session.
+   *
+   *  Governed, NOT a bare send. Three call sites (`TerminalView`,
+   *  `SessionPane`, `SubSessionWindow`) all fire on the same `connected`
+   *  transition, and `SessionPane`/`SubSessionWindow` each render a
+   *  `TerminalView` for the SAME session — so one reconnect emitted at least
+   *  two requests per session, times every open session, times every browser
+   *  tab. Each request costs a `capture-pane` fork on the daemon and a
+   *  full-frame broadcast to every subscriber of that session. */
   sendSnapshotRequest(sessionName: string): void {
-    this.send({ type: 'terminal.snapshot_request', sessionName });
+    this.requestSnapshotGoverned(sessionName);
+  }
+
+  /** Shared implementation behind `sendSnapshotRequest` and stream-reset
+   *  recovery: at most one request per session per
+   *  SNAPSHOT_SESSION_MIN_INTERVAL_MS, spread across sessions by a global
+   *  cursor. Requests inside the window collapse into a single deferred one,
+   *  so a session can never be starved and can never be frozen. */
+  private requestSnapshotGoverned(session: string): void {
+    if (!this._connected || this._destroyed) return;
+    const now = Date.now();
+    let state = this.resetState.get(session);
+    if (!state) {
+      state = { lastSnapshotAt: 0, pendingSnapshot: null };
+      this.resetState.set(session, state);
+    }
+
+    const sessionReadyAt = state.lastSnapshotAt === 0
+      ? now
+      : state.lastSnapshotAt + SNAPSHOT_SESSION_MIN_INTERVAL_MS;
+    const slotAt = Math.max(sessionReadyAt, this.snapshotNextGlobalSlotAt, now);
+
+    if (slotAt <= now) {
+      state.lastSnapshotAt = now;
+      this.snapshotNextGlobalSlotAt = now + SNAPSHOT_GLOBAL_STAGGER_MS;
+      this.emitSnapshotRequest(session);
+      return;
+    }
+
+    if (state.pendingSnapshot) return;
+    this.snapshotNextGlobalSlotAt = slotAt + SNAPSHOT_GLOBAL_STAGGER_MS;
+    state.pendingSnapshot = setTimeout(() => {
+      const s = this.resetState.get(session);
+      if (!s) return;
+      s.pendingSnapshot = null;
+      if (this._destroyed || !this._connected) return;
+      s.lastSnapshotAt = Date.now();
+      this.emitSnapshotRequest(session);
+    }, Math.max(0, slotAt - now));
+  }
+
+  private emitSnapshotRequest(session: string): void {
+    try {
+      this.send({ type: 'terminal.snapshot_request', sessionName: session });
+    } catch {
+      // ws not open right now; the next reset / reconnect replay recovers.
+    }
+  }
+
+  private settleOwnedDataRequest(msg: ServerMessage): void {
+    const requestId = typeof (msg as { requestId?: unknown }).requestId === 'string'
+      ? (msg as { requestId: string }).requestId
+      : undefined;
+    if (!requestId) return;
+    const key = this.ownedDataRequestKeyById.get(requestId);
+    if (!key) return;
+    this.ownedDataRequestKeyById.delete(requestId);
+    const current = this.ownedDataRequests.get(key);
+    if (current?.requestId === requestId) this.ownedDataRequests.delete(key);
+  }
+
+  private beginOwnedDataRequest(
+    key: string,
+    buildRequest: (requestId: string) => Record<string, unknown>,
+    buildOverloadResponse: (requestId: string) => ServerMessage,
+  ): string {
+    const now = Date.now();
+    for (const [pendingKey, pending] of this.ownedDataRequests) {
+      if (pending.expiresAt > now) continue;
+      this.ownedDataRequests.delete(pendingKey);
+      this.ownedDataRequestKeyById.delete(pending.requestId);
+    }
+    const existing = this.ownedDataRequests.get(key);
+    if (existing) return existing.requestId;
+
+    const requestId = crypto.randomUUID();
+    this.ownedDataRequestStarts = this.ownedDataRequestStarts.filter(
+      (startedAt) => now - startedAt < OWNED_DATA_REQUEST_RATE_WINDOW_MS,
+    );
+    if (this.ownedDataRequestStarts.length >= OWNED_DATA_REQUEST_RATE_LIMIT) {
+      queueMicrotask(() => this.dispatch(buildOverloadResponse(requestId)));
+      return requestId;
+    }
+    this.ownedDataRequestStarts.push(now);
+    this.ownedDataRequests.set(key, { requestId, expiresAt: now + OWNED_DATA_REQUEST_TTL_MS });
+    this.ownedDataRequestKeyById.set(requestId, key);
+    this.send(buildRequest(requestId));
+    return requestId;
   }
 
   /** Request a directory listing from the daemon. Returns the requestId for matching the response. */
   fsListDir(path: string, includeFiles = false, includeMetadata = false, options?: FsListDirOptions): string {
-    const requestId = crypto.randomUUID();
-    this.send({
-      type: 'fs.ls',
-      path,
-      requestId,
-      includeFiles,
-      includeMetadata,
-      ...(options?.includeOpenSpecTaskStats ? { includeOpenSpecTaskStats: true } : {}),
-      ...(options?.sessionName ? { sessionName: options.sessionName } : {}),
-    });
-    return requestId;
+    const key = JSON.stringify(['fs.ls', path, includeFiles, includeMetadata, options?.includeOpenSpecTaskStats === true, options?.sessionName ?? '']);
+    return this.beginOwnedDataRequest(
+      key,
+      (requestId) => ({
+        type: 'fs.ls',
+        path,
+        requestId,
+        includeFiles,
+        includeMetadata,
+        ...(options?.includeOpenSpecTaskStats ? { includeOpenSpecTaskStats: true } : {}),
+        ...(options?.sessionName ? { sessionName: options.sessionName } : {}),
+      }),
+      (requestId) => ({
+        type: 'fs.ls_response', requestId, path, status: 'error',
+        error: FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_QUEUE_FULL, recoverable: true,
+      } as unknown as ServerMessage),
+    );
   }
 
   /** Request a file's content from the daemon. Returns the requestId for matching the response. */
@@ -1494,15 +1762,21 @@ export class WsClient {
 
   /** Request git status for a directory. Returns requestId. */
   fsGitStatus(path: string, opts?: { includeStats?: boolean; sessionName?: string }): string {
-    const requestId = crypto.randomUUID();
-    this.send({
-      type: 'fs.git_status',
-      path,
-      requestId,
-      ...(opts?.includeStats ? { includeStats: true } : {}),
-      ...(opts?.sessionName ? { sessionName: opts.sessionName } : {}),
-    });
-    return requestId;
+    const key = JSON.stringify(['fs.git_status', path, opts?.includeStats === true, opts?.sessionName ?? '']);
+    return this.beginOwnedDataRequest(
+      key,
+      (requestId) => ({
+        type: 'fs.git_status',
+        path,
+        requestId,
+        ...(opts?.includeStats ? { includeStats: true } : {}),
+        ...(opts?.sessionName ? { sessionName: opts.sessionName } : {}),
+      }),
+      (requestId) => ({
+        type: 'fs.git_status_response', requestId, path, status: 'error', files: [],
+        error: FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_QUEUE_FULL, recoverable: true,
+      } as unknown as ServerMessage),
+    );
   }
 
   /** Request git diff for a file. Returns requestId. */
@@ -1601,21 +1875,72 @@ export class WsClient {
    *  afterTs: client's latest known event timestamp — server returns only newer events.
    *  beforeTs: for backward pagination — server returns only older events. */
   sendTimelineHistoryRequest(sessionName: string, limit = 500, afterTs?: number, beforeTs?: number): string {
-    const requestId = crypto.randomUUID();
-    this.send({
-      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
-      sessionName,
-      requestId,
-      limit,
-      ...(afterTs !== undefined ? { afterTs } : {}),
-      ...(beforeTs !== undefined ? { beforeTs } : {}),
-    });
+    const key = JSON.stringify([TIMELINE_MESSAGES.HISTORY_REQUEST, sessionName, limit, afterTs ?? null, beforeTs ?? null]);
+    const requestId = this.beginOwnedDataRequest(
+      key,
+      (nextRequestId) => ({
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        sessionName,
+        requestId: nextRequestId,
+        limit,
+        ...(afterTs !== undefined ? { afterTs } : {}),
+        ...(beforeTs !== undefined ? { beforeTs } : {}),
+      }),
+      (nextRequestId) => ({
+        type: TIMELINE_MESSAGES.HISTORY,
+        sessionName,
+        requestId: nextRequestId,
+        status: 'error',
+        source: 'error',
+        errorReason: 'queue_full',
+        events: [],
+        payloadTruncated: false,
+        hasMore: false,
+        recoverable: true,
+      } as unknown as ServerMessage),
+    );
     // Probe AFTER sending (not before): the send must run while the socket is
     // still logically connected. If the socket turned out to be a zombie, the
     // send is silently lost, but this kicks recovery so the window's foreground
     // auto-sync refetch lands on a healthy socket instead of waiting ~36s.
     this.maybeProbeForInteraction();
     return requestId;
+  }
+
+  requestTransportModels(options: {
+    agentType: string;
+    sessionName?: string;
+    ccPreset?: string;
+    force?: boolean;
+  }): string {
+    const key = JSON.stringify([
+      TRANSPORT_MSG.LIST_MODELS,
+      options.agentType,
+      options.sessionName ?? '',
+      options.ccPreset?.trim().toLowerCase() ?? '',
+      options.force === true,
+    ]);
+    return this.beginOwnedDataRequest(
+      key,
+      (requestId) => ({
+        type: TRANSPORT_MSG.LIST_MODELS,
+        agentType: options.agentType,
+        requestId,
+        ...(options.sessionName ? { sessionName: options.sessionName } : {}),
+        ...(options.ccPreset ? { ccPreset: options.ccPreset } : {}),
+        ...(options.force ? { force: true } : {}),
+      }),
+      (requestId) => ({
+        type: TRANSPORT_MSG.MODELS_RESPONSE,
+        agentType: options.agentType,
+        requestId,
+        ...(options.sessionName ? { sessionName: options.sessionName } : {}),
+        ...(options.ccPreset ? { ccPreset: options.ccPreset } : {}),
+        models: [],
+        error: 'queue_full',
+        recoverable: true,
+      } as unknown as ServerMessage),
+    );
   }
 
   /** Request a bounded explicit timeline page. */
@@ -1734,6 +2059,7 @@ export class WsClient {
       this.clearWsOpenTimer();
       this._connecting = false;
       this._connected = true;
+      this.flushPendingInput();
       this.clearReconnectTimer();
       this.reconnectAttempt = 0;
       this.postConnectNonCriticalUntil = Date.now() + POST_CONNECT_NON_CRITICAL_WINDOW_MS;
@@ -1746,6 +2072,10 @@ export class WsClient {
         if (state.pendingSnapshot) clearTimeout(state.pendingSnapshot);
       }
       this.resetState.clear();
+      this.snapshotNextGlobalSlotAt = 0;
+      // A new socket means the daemon may have restarted or the pane may have
+      // been rebuilt — the remembered size is no longer known-applied.
+      this.lastSentResize.clear();
       this.replayAllSubscriptionsForNewSocket();
       this.dispatch({
         type: 'session.event',
@@ -1859,43 +2189,11 @@ export class WsClient {
    *     this design cannot.
    */
   private handleStreamReset(session: string): void {
-    if (!this._connected) return;
-    const SNAPSHOT_REQUEST_MIN_INTERVAL_MS = 500;
-    const now = Date.now();
-    let state = this.resetState.get(session);
-    if (!state) {
-      state = { lastSnapshotAt: 0, pendingSnapshot: null };
-      this.resetState.set(session, state);
-    }
-
-    const sinceLast = now - state.lastSnapshotAt;
-    if (sinceLast >= SNAPSHOT_REQUEST_MIN_INTERVAL_MS) {
-      // Window open — fire snapshot now.
-      state.lastSnapshotAt = now;
-      try {
-        this.send({ type: 'terminal.snapshot_request', sessionName: session });
-      } catch {
-        // ws not open right now; the next reset (or the reconnect resubscribe
-        // replay) will recover.
-      }
-      return;
-    }
-
-    // Inside the rate-limit window — defer one snapshot to the end of the
-    // window. If a deferred snapshot is already scheduled, leave it alone:
-    // multiple resets in the same window collapse into a single snapshot.
-    if (state.pendingSnapshot) return;
-    const remaining = SNAPSHOT_REQUEST_MIN_INTERVAL_MS - sinceLast;
-    state.pendingSnapshot = setTimeout(() => {
-      const s = this.resetState.get(session);
-      if (!s) return;
-      s.pendingSnapshot = null;
-      if (this._destroyed || !this._connected) return;
-      s.lastSnapshotAt = Date.now();
-      try {
-        this.send({ type: 'terminal.snapshot_request', sessionName: session });
-      } catch { /* covered by next reset / reconnect */ }
-    }, remaining);
+    // Shares ONE window with component-driven requests. Previously this kept a
+    // second, independent per-session limiter, so overflow recovery and a
+    // reconnect-driven request could fire back to back for the same session,
+    // neither knowing about the other.
+    this.requestSnapshotGoverned(session);
   }
 
   private isCurrentSocket(socket: WebSocket, generation: number): boolean {
@@ -1943,6 +2241,7 @@ export class WsClient {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.clearPongWatchdog();
     this.clearTerminalSubscriptionTimers();
+    this.clearTransportHistoryReplayTimers();
     this.clearNonCriticalSendTimers();
     this.clearP2pWorkflowPendingRequests();
     // Capability state belongs to a single daemon WS; on socket teardown
@@ -2143,7 +2442,17 @@ export class WsClient {
   }
 
   private dispatch(msg: ServerMessage): void {
+    this.settleOwnedDataRequest(msg);
     this.settleP2pWorkflowRequest(msg);
+    // Daemon lifecycle generations are independent from the browser↔Server
+    // WebSocket.  During an in-place daemon upgrade that browser socket stays
+    // open, so clear the generation-bound capability snapshot explicitly.  A
+    // fresh daemon.hello follows RECONNECTED after authentication; clearing
+    // first also permits its process-local helloEpoch to restart from one and
+    // invalidates file-transfer lease waiters/peers tied to the old process.
+    if (msg.type === DAEMON_MSG.DISCONNECTED || msg.type === DAEMON_MSG.RECONNECTED) {
+      this.setDaemonCapabilitySnapshot(null);
+    }
     if (msg.type === P2P_WORKFLOW_MSG.DAEMON_HELLO) {
       this.handleDaemonHelloMessage(msg);
     }

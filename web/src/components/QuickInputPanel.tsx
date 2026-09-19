@@ -12,12 +12,21 @@ import {
   validateAliasValue,
   validateAliasDescription,
   validateAliasTags,
+  isAliasId,
   type AliasReason,
 } from '@shared/alias-types.js';
 import type { WsClient } from '../ws-client.js';
 import type { MachineListItem } from '../api/machines.js';
 import type { JSX, RefObject } from 'preact';
 import { DEFAULT_QUICK_PHRASES, getDefaultQuickCommands } from '../quick-commands.js';
+import { MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
+import {
+  VERIFICATION_MACHINE_KINDS,
+  VERIFICATION_MACHINE_SCOPES,
+  type VerificationMachineProfile,
+  type VerificationMachineScope,
+} from '@shared/verification-machine.js';
+import { listVerificationMachines, setVerificationMachine } from '../api/verification-machines.js';
 
 export interface QuickData {
   history: string[];                        // cross-session
@@ -409,16 +418,31 @@ interface Props {
   onInsertAlias?: (name: string) => void;
   /** Controlled nodes shown in the optional machine tab. */
   machines?: readonly MachineListItem[];
-  /** Insert a stable machine marker plus its human-readable display note. */
-  onInsertMachine?: (refName: string, displayName: string) => void;
+  /** Insert a canonical nodeId marker plus its human-readable display note. */
+  onInsertMachine?: (nodeId: string, displayName: string) => void;
+  /** Stable project identity used to include project-scoped verification machines. */
+  projectKey?: string;
+  /** Insert one long-lived verification-machine reference into the composer. */
+  onInsertVerificationMachine?: (machine: VerificationMachineProfile) => void;
   anchorRef?: RefObject<HTMLElement>;
+  /** Restrict the shared picker to text/history surfaces for non-chat inputs. */
+  quickOnly?: boolean;
+  /** Optional portal layer for callers rendered inside higher desktop windows. */
+  portalZIndex?: number;
+  /**
+   * Optional host for the portal. Fullscreen callers must supply the active
+   * fullscreen element because document.body is outside the rendered
+   * fullscreen subtree.
+   */
+  portalContainer?: Element | null;
 }
 
 const HISTORY_PAGE_SIZE = 10;
 const TRUNCATE_THRESHOLD = 40;
 type AddTarget = 'command' | 'phrase' | null;
 type HistoryScope = 'session' | 'global';
-type QpTab = 'quick' | 'files' | 'alias' | 'machines';
+type QpTab = 'quick' | 'files' | 'alias' | 'machines' | 'verification';
+type VerificationSourceTab = 'alias' | 'controlled_node';
 
 /** Truncate long text: "start of text...end of text" */
 function truncateMiddle(text: string, max = TRUNCATE_THRESHOLD): string {
@@ -436,7 +460,9 @@ export function QuickInputPanel({
   data, loaded,
   onAddCommand, onAddPhrase, onRemoveCommand, onRemovePhrase,
   onRemoveHistory, onRemoveSessionHistory, onClearHistory, onClearSessionHistory,
-  ws, sessionCwd, onAppendPaths, onInsertAlias, machines = [], onInsertMachine, anchorRef,
+  ws, sessionCwd, onAppendPaths, onInsertAlias, machines = [], onInsertMachine,
+  projectKey, onInsertVerificationMachine, anchorRef, quickOnly = false, portalZIndex,
+  portalContainer,
 }: Props) {
   const { t } = useTranslation();
   const panelRef = useRef<HTMLDivElement>(null);
@@ -451,6 +477,19 @@ export function QuickInputPanel({
   const [activeTab, setActiveTab] = useState<QpTab>('quick');
   const [insertedPaths, setInsertedPaths] = useState<string[]>([]);
   const [layoutTick, setLayoutTick] = useState(0);
+  const [verificationMachines, setVerificationMachines] = useState<VerificationMachineProfile[]>([]);
+  const [verificationLoading, setVerificationLoading] = useState(false);
+  const [verificationError, setVerificationError] = useState(false);
+  const [verificationBusyTarget, setVerificationBusyTarget] = useState<string | null>(null);
+  const [verificationPickerOpen, setVerificationPickerOpen] = useState(false);
+  const [verificationSourceTab, setVerificationSourceTab] = useState<VerificationSourceTab>('alias');
+  const [verificationScope, setVerificationScope] = useState<VerificationMachineScope>(
+    projectKey ? VERIFICATION_MACHINE_SCOPES.PROJECT : VERIFICATION_MACHINE_SCOPES.USER,
+  );
+  const enabledVerificationMachines = useMemo(
+    () => verificationMachines.filter((profile) => profile.enabled),
+    [verificationMachines],
+  );
 
   // ── Alias tab state ──
   // Server-authoritative alias data (create/remove invalidate the shared
@@ -475,13 +514,67 @@ export function QuickInputPanel({
   // opens on it), so aliases created elsewhere — e.g. by an agent via the
   // save_alias MCP tool, or on another device — show up without a manual reload.
   useEffect(() => {
-    if (open && activeTab === 'alias') refetchAliases();
+    if (open && (activeTab === 'alias' || activeTab === 'verification')) refetchAliases();
   }, [open, activeTab, refetchAliases]);
+
+  useEffect(() => {
+    setVerificationScope(projectKey ? VERIFICATION_MACHINE_SCOPES.PROJECT : VERIFICATION_MACHINE_SCOPES.USER);
+  }, [projectKey]);
+
+  useEffect(() => {
+    if (!open || activeTab !== 'verification') return;
+    let live = true;
+    setVerificationLoading(true);
+    setVerificationError(false);
+    void listVerificationMachines(projectKey).then((profiles) => {
+      if (live) setVerificationMachines(profiles);
+    }).catch(() => {
+      if (live) setVerificationError(true);
+    }).finally(() => {
+      if (live) setVerificationLoading(false);
+    });
+    return () => { live = false; };
+  }, [activeTab, open, projectKey]);
+
+  const authorizeVerificationTarget = async (input: {
+    alias: string;
+    kind: VerificationMachineProfile['kind'];
+    target: string;
+  }) => {
+    const existing = verificationMachines.find((profile) => (
+      profile.scope === verificationScope
+      && profile.kind === input.kind
+      && profile.target === input.target
+    ));
+    setVerificationBusyTarget(`${input.kind}:${input.target}`);
+    setVerificationError(false);
+    try {
+      await setVerificationMachine({
+        ...(existing ? { id: existing.id, expectedRevision: existing.revision } : {}),
+        scope: verificationScope,
+        scopeKey: verificationScope === VERIFICATION_MACHINE_SCOPES.PROJECT ? projectKey ?? '' : '',
+        alias: input.alias,
+        kind: input.kind,
+        target: input.target,
+        enabled: true,
+      });
+      setVerificationMachines(await listVerificationMachines(projectKey));
+      setVerificationPickerOpen(false);
+    } catch {
+      setVerificationError(true);
+    } finally {
+      setVerificationBusyTarget(null);
+    }
+  };
 
   // A removed/revoked last machine must not strand the panel on a hidden tab.
   useEffect(() => {
     if (activeTab === 'machines' && machines.length === 0) setActiveTab('quick');
   }, [activeTab, machines.length]);
+
+  useEffect(() => {
+    if (quickOnly && activeTab !== 'quick') setActiveTab('quick');
+  }, [activeTab, quickOnly]);
 
   useEffect(() => {
     if (!open || typeof window === 'undefined') return;
@@ -510,6 +603,33 @@ export function QuickInputPanel({
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
   }, [open, onClose, anchorRef]);
+
+  // Keep keyboard navigation inside the open picker. In particular, the
+  // trigger remains focused when the portal opens, so the first Tab must enter
+  // the dialog rather than continue through the remote-desktop toolbar.
+  useEffect(() => {
+    if (!open) return;
+    const handler = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        onClose();
+        return;
+      }
+      if (event.key !== 'Tab' || !panelRef.current) return;
+      const focusable = Array.from(panelRef.current.querySelectorAll<HTMLElement>(
+        'button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), [tabindex]:not([tabindex="-1"])',
+      ));
+      if (focusable.length === 0) return;
+      const currentIndex = focusable.indexOf(document.activeElement as HTMLElement);
+      const nextIndex = event.shiftKey
+        ? (currentIndex <= 0 ? focusable.length - 1 : currentIndex - 1)
+        : (currentIndex < 0 || currentIndex === focusable.length - 1 ? 0 : currentIndex + 1);
+      event.preventDefault();
+      focusable[nextIndex]?.focus({ preventScroll: true });
+    };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }, [open, onClose]);
 
   // Focus add/edit input when shown
   useEffect(() => {
@@ -672,11 +792,18 @@ export function QuickInputPanel({
     setAliasSaving(true);
     setAliasError(null);
     try {
-      // Rename = upsert new name + delete the old record (name is the key).
-      await createAlias({ name, value, ...(description ? { description } : {}), ...(tags.length > 0 ? { tags } : {}) });
-      if (aliasForm.original && aliasForm.original !== name) {
-        await removeAlias(aliasForm.original);
-      }
+      const existing = aliasForm.original
+        ? allAliases.find((entry) => entry.name === aliasForm.original)
+        : undefined;
+      // Preserve the server row id on rename so durable verification-machine
+      // associations follow the alias automatically.
+      await createAlias({
+        ...(existing?.id ? { id: existing.id } : {}),
+        name,
+        value,
+        ...(description ? { description } : {}),
+        ...(tags.length > 0 ? { tags } : {}),
+      });
       closeAliasForm();
     } catch (err) {
       setAliasSaving(false);
@@ -706,10 +833,20 @@ export function QuickInputPanel({
 
   const panel = (
     <>
-      <div class="qp-backdrop" onClick={onClose} />
-      <div class="qp" ref={panelRef} style={panelStyle}>
+      <div
+        class="qp-backdrop"
+        style={portalZIndex === undefined ? undefined : { zIndex: portalZIndex - 1 }}
+        onClick={onClose}
+      />
+      <div
+        class="qp"
+        ref={panelRef}
+        style={portalZIndex === undefined ? panelStyle : { ...panelStyle, zIndex: portalZIndex }}
+        role="dialog"
+        aria-label={t('quick_input.title')}
+      >
         {/* Machine tab is present only when the account has controlled nodes. */}
-        <div class="qp-tabs">
+        {!quickOnly && <div class="qp-tabs">
           <button class={`qp-tab${activeTab === 'quick' ? ' active' : ''}`} onClick={() => setActiveTab('quick')}>
             ⚡ {t('quick_input.tab_quick')}
           </button>
@@ -726,10 +863,13 @@ export function QuickInputPanel({
               🖥 {t('quick_input.tab_machines')}
             </button>
           )}
-        </div>
+          <button class={`qp-tab${activeTab === 'verification' ? ' active' : ''}`} onClick={() => setActiveTab('verification')}>
+            🧪 {t('quick_input.tab_verification')}
+          </button>
+        </div>}
 
-        {/* Controlled-node tab — display names are mutable, ref names are
-            stable. Connectivity is informational: an offline node can still
+        {/* Controlled-node tab — display names are mutable, canonical node IDs
+            are stable. Connectivity is informational: an offline node can still
             be referenced in a task and resolve once it reconnects. */}
         {activeTab === 'machines' && machines.length > 0 && (
           <div class="qp-machine-items" role="listbox" aria-label={t('quick_input.tab_machines')}>
@@ -739,22 +879,144 @@ export function QuickInputPanel({
                 key={machine.serverId}
                 type="button"
                 class={`qp-machine-item${machine.online ? '' : ' is-offline'}`}
-                disabled={!onInsertMachine}
+                disabled={!onInsertMachine || !machine.nodeId}
                 title={machine.online ? machine.displayName : t('machine.offline_hint')}
                 onClick={() => {
-                  onInsertMachine?.(machine.refName, machine.displayName);
+                  if (machine.nodeId) onInsertMachine?.(machine.nodeId, machine.displayName);
                   onClose();
                 }}
               >
                 <span class="qp-machine-item-main">
                   <strong>{machine.displayName}</strong>
-                  <code>^^({machine.refName})</code>
+                  <code>^^({machine.nodeId ?? MACHINE_IDENTITY_UNAVAILABLE})</code>
                 </span>
                 <span class={`qp-machine-status ${machine.online ? 'is-online' : 'is-offline'}`}>
                   {machine.online ? t('machine.online') : t('machine.offline')}
                 </span>
               </button>
             ))}
+          </div>
+        )}
+
+        {activeTab === 'verification' && (
+          <div class="qp-machine-items" role="listbox" aria-label={t('quick_input.tab_verification')}>
+            <div class="qp-alias-hint">{t('quick_input.verification_hint')}</div>
+            {verificationLoading && <div class="qp-history-empty">{t('quick_input.loading')}</div>}
+            {verificationError && <div class="qp-alias-error" role="alert">{t('quick_input.verification_error')}</div>}
+            {!verificationLoading && !verificationError && enabledVerificationMachines.length === 0 && (
+              <div class="qp-history-empty">{t('quick_input.verification_empty')}</div>
+            )}
+            {!verificationLoading && enabledVerificationMachines.map((machine) => (
+              <button
+                key={machine.id}
+                type="button"
+                class="qp-machine-item"
+                title={machine.target}
+                disabled={!onInsertVerificationMachine}
+                onClick={() => {
+                  if (!onInsertVerificationMachine) return;
+                  onInsertVerificationMachine(machine);
+                  onClose();
+                }}
+              >
+                <span class="qp-machine-item-main">
+                  <strong>{machine.alias}</strong>
+                  <code>{machine.target}</code>
+                </span>
+                <span class={`qp-machine-status is-${machine.lastVerificationStatus}`}>
+                  {t(`controlled_nodes.verification.status_${machine.lastVerificationStatus}`)}
+                </span>
+              </button>
+            ))}
+            <button
+              type="button"
+              class="qp-toolbar-btn"
+              aria-expanded={verificationPickerOpen}
+              onClick={() => setVerificationPickerOpen((current) => !current)}
+            >
+              ＋ {t('quick_input.verification_add')}
+            </button>
+            {verificationPickerOpen && <div class="qp-verification-authorize">
+              <div class="qp-verification-authorize-header">
+                <strong>{t('quick_input.verification_add')}</strong>
+                <select
+                  aria-label={t('controlled_nodes.verification.scope')}
+                  value={verificationScope}
+                  onChange={(event) => setVerificationScope(
+                    (event.target as HTMLSelectElement).value as VerificationMachineScope,
+                  )}
+                >
+                  {projectKey && (
+                    <option value={VERIFICATION_MACHINE_SCOPES.PROJECT}>
+                      {t('controlled_nodes.verification.project_scope')}
+                    </option>
+                  )}
+                  <option value={VERIFICATION_MACHINE_SCOPES.USER}>
+                    {t('controlled_nodes.verification.user_scope')}
+                  </option>
+                </select>
+              </div>
+              <div class="qp-verification-source-tabs" role="tablist" aria-label={t('quick_input.verification_source')}>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={verificationSourceTab === 'alias'}
+                  class={verificationSourceTab === 'alias' ? 'active' : ''}
+                  onClick={() => setVerificationSourceTab('alias')}
+                >
+                  🔖 {t('alias.tab')}
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={verificationSourceTab === 'controlled_node'}
+                  class={verificationSourceTab === 'controlled_node' ? 'active' : ''}
+                  onClick={() => setVerificationSourceTab('controlled_node')}
+                >
+                  🖥 {t('quick_input.tab_machines')}
+                </button>
+              </div>
+              <div class="qp-verification-source-list">
+                {verificationSourceTab === 'alias' && allAliases.map((entry) => {
+                  if (!isAliasId(entry.id)) return null;
+                  const aliasId = entry.id;
+                  const busyKey = `${VERIFICATION_MACHINE_KINDS.SSH}:${aliasId}`;
+                  return (
+                    <button
+                      type="button"
+                      key={`alias:${aliasId}`}
+                      disabled={verificationBusyTarget !== null}
+                      onClick={() => { void authorizeVerificationTarget({
+                        alias: entry.name,
+                        kind: VERIFICATION_MACHINE_KINDS.SSH,
+                        target: aliasId,
+                      }); }}
+                    >
+                      🔖 {t('quick_input.verification_authorize_alias', { name: entry.name })}
+                      {verificationBusyTarget === busyKey ? '…' : ''}
+                    </button>
+                  );
+                })}
+                {verificationSourceTab === 'controlled_node' && machines.filter((machine) => machine.nodeId).map((machine) => {
+                  const busyKey = `${VERIFICATION_MACHINE_KINDS.CONTROLLED_NODE}:${machine.nodeId}`;
+                  return (
+                    <button
+                      type="button"
+                      key={`node:${machine.nodeId}`}
+                      disabled={verificationBusyTarget !== null}
+                      onClick={() => { void authorizeVerificationTarget({
+                        alias: machine.displayName,
+                        kind: VERIFICATION_MACHINE_KINDS.CONTROLLED_NODE,
+                        target: machine.nodeId!,
+                      }); }}
+                    >
+                      🖥 {t('quick_input.verification_authorize_node', { name: machine.displayName })}
+                      {verificationBusyTarget === busyKey ? '…' : ''}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>}
           </div>
         )}
 
@@ -912,7 +1174,7 @@ export function QuickInputPanel({
                     </span>
                   ) : (
                     <span key={cmd} class="qp-pill qp-pill-custom" title={cmd.length > TRUNCATE_THRESHOLD ? cmd : undefined}>
-                      <span class="qp-pill-text" onClick={() => handleSend(cmd)}>{formatPreviewText(cmd)}</span>
+                      <button type="button" class="qp-pill-text" onClick={() => handleSend(cmd)}>{formatPreviewText(cmd)}</button>
                       <button class="qp-pill-edit" onClick={() => startEdit('command', cmd)}>✎</button>
                       <button class="qp-pill-del" onClick={() => { if (confirm(t('quick_input.confirm_delete'))) onRemoveCommand(cmd); }}>✕</button>
                     </span>
@@ -944,7 +1206,7 @@ export function QuickInputPanel({
                     </span>
                   ) : (
                     <span key={phrase} class="qp-pill qp-pill-custom" title={phrase.length > TRUNCATE_THRESHOLD ? phrase : undefined}>
-                      <span class="qp-pill-text" onClick={() => handleSend(phrase)}>{formatPreviewText(phrase)}</span>
+                      <button type="button" class="qp-pill-text" onClick={() => handleSend(phrase)}>{formatPreviewText(phrase)}</button>
                       <button class="qp-pill-edit" onClick={() => startEdit('phrase', phrase)}>✎</button>
                       <button class="qp-pill-del" onClick={() => { if (confirm(t('quick_input.confirm_delete'))) onRemovePhrase(phrase); }}>✕</button>
                     </span>
@@ -998,5 +1260,5 @@ export function QuickInputPanel({
   );
 
   if (typeof document === 'undefined') return panel;
-  return createPortal(panel, document.body);
+  return createPortal(panel, portalContainer ?? document.body);
 }

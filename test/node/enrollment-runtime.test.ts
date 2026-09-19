@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import { CONTROLLED_NODE_LOCAL_DAEMONS_RESCAN_MS } from '../../shared/controlled-node-host-link.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
 import {
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
@@ -13,9 +14,15 @@ import {
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
 } from '../../shared/transport/file-transfer.js';
 import { markServiceHealthy } from '../../src/node/bootstrap.js';
+import { LinuxRemoteDesktopWorkerHost } from '../../src/node/linux-remote-desktop-worker-host.js';
+import { resolveRemoteDesktopSessionProfile } from '../../shared/remote-desktop-platform.js';
 import { encodeEnrollmentBlob, parseEnrollmentBlob } from '../../src/node/enrollment.js';
 import { loadInstallJournal } from '../../src/node/install-journal.js';
-import { createControlledNodeRuntime, isControlledNodeAuthAck } from '../../src/node/runtime.js';
+import {
+  CONTROLLED_NODE_UPGRADE_HANDOFF_TIMEOUT_MS,
+  createControlledNodeRuntime,
+  isControlledNodeAuthAck,
+} from '../../src/node/runtime.js';
 import type { AuthenticatedWebSocketLike } from '../../src/transport/authenticated-websocket.js';
 import {
   MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
@@ -28,14 +35,54 @@ import {
   REMOTE_DESKTOP_ACCESS_MODE,
   REMOTE_DESKTOP_CAPABILITY,
   REMOTE_DESKTOP_MSG,
+  REMOTE_DESKTOP_TERMINAL_REASON,
 } from '../../shared/remote-desktop.js';
 import { CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY } from '../../shared/controlled-node-service.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from '../../shared/controlled-node-auto-unlock.js';
+import {
+  REMOTE_DESKTOP_ADAPTER_CAPABILITIES,
+  REMOTE_DESKTOP_CANONICAL_BRANDING_CAPABILITY,
+  REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY,
+  REMOTE_DESKTOP_CONSENT_CANCEL_REASON,
+  REMOTE_DESKTOP_CONSENT_DECISION,
+  REMOTE_DESKTOP_CONSENT_MSG,
+  REMOTE_DESKTOP_DEFAULT_SHIELDED_ROUTE_CAPABILITY,
+  REMOTE_DESKTOP_INPUT_CAPABILITY,
+  REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY,
+  REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+  REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY,
+  REMOTE_DESKTOP_NODE_CONTEXT_MSG,
+  REMOTE_DESKTOP_SHELL_MSG,
+  REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY,
+} from '../../shared/remote-desktop-access.js';
+import {
+  REMOTE_DESKTOP_SIGNED_SHELL_BOOTSTRAP_HOST_ARG,
+  REMOTE_DESKTOP_SIGNED_SHELL_CONTEXT_ARG,
+  REMOTE_DESKTOP_SIGNED_SHELL_LAUNCH_ARG,
+  REMOTE_DESKTOP_SIGNED_SHELL_SERVER_ORIGIN_ARG,
+} from '../../src/node/remote-desktop-shell-launch.js';
+import {
+  WORKER_CONSENT_FRAME,
+  WORKER_CONSENT_OUTCOME,
+  type WorkerConsentInboundFrame,
+} from '../../src/node/remote-desktop-consent-ipc.js';
 import {
   REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
   REMOTE_DESKTOP_INSTALL_MSG,
 } from '../../shared/remote-desktop-install.js';
 import { DAEMON_VERSION } from '../../src/util/version.js';
+import { DAEMON_UPGRADE_BLOCK_REASON } from '../../shared/daemon-upgrade.js';
+
+// Runtimes built here with no `linuxDesktop` seam read the real machine. On a
+// Linux CI runner that means "no X server", which (correctly) turns remote
+// desktop off and offers the desktop install instead -- unrelated to what these
+// tests exercise, and different from a developer's Mac. Report a display as
+// present so the suite means the same thing on every host; the headless-Linux
+// behaviour has its own test that injects the seam explicitly.
+vi.mock('../../src/node/linux-desktop-environment.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/node/linux-desktop-environment.js')>()),
+  linuxGraphicalDisplayAvailable: () => true,
+}));
 
 const { receiveMachineDirectUploadMock, sendMachineDirectFetchMock } = vi.hoisted(() => ({
   receiveMachineDirectUploadMock: vi.fn(),
@@ -67,6 +114,150 @@ afterEach(async () => {
 });
 
 describe('controlled node enrollment and runtime', () => {
+  it('reports one bounded blocker when a staged Windows upgrade never hands off', async () => {
+    const socket = new MockSocket();
+    let now = 10_000;
+    const startSelfUpgrade = vi.fn(async () => ({
+      ok: true as const,
+      targetVersion: '2026.9.9999',
+      artifactSha256: 'c'.repeat(64),
+    }));
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, {
+      platform: 'win32',
+      arch: 'x64',
+      now: () => now,
+      startSelfUpgrade,
+    });
+    runtime.start();
+    socket.open();
+
+    socket.emit('message', JSON.stringify({
+      type: DAEMON_COMMAND_TYPES.DAEMON_UPGRADE,
+      targetVersion: '2026.9.9999',
+    }));
+    await vi.waitFor(() => expect(startSelfUpgrade).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(socket.sent.map(JSON.parse)).toContainEqual({
+      type: DAEMON_MSG.UPGRADING,
+      targetVersion: '2026.9.9999',
+      artifactSha256: 'c'.repeat(64),
+    }));
+
+    now += CONTROLLED_NODE_UPGRADE_HANDOFF_TIMEOUT_MS - 1;
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    expect(socket.sent.map(JSON.parse).filter((frame) => (
+      frame.type === DAEMON_MSG.UPGRADE_BLOCKED
+      && frame.reason === DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS
+    ))).toHaveLength(0);
+
+    now += 1;
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(socket.sent.map(JSON.parse)).toContainEqual({
+      type: DAEMON_MSG.UPGRADE_BLOCKED,
+      reason: DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS,
+    }));
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    expect(socket.sent.map(JSON.parse).filter((frame) => (
+      frame.type === DAEMON_MSG.UPGRADE_BLOCKED
+      && frame.reason === DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS
+    ))).toHaveLength(1);
+    runtime.stop();
+  });
+
+  it('does not request the Windows rescue path for a stalled non-Windows upgrade', async () => {
+    const socket = new MockSocket();
+    let now = 10_000;
+    const startSelfUpgrade = vi.fn(async () => ({
+      ok: true as const,
+      targetVersion: '2026.9.9999',
+      artifactSha256: 'c'.repeat(64),
+    }));
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, {
+      platform: 'linux',
+      arch: 'x64',
+      now: () => now,
+      startSelfUpgrade,
+    });
+    runtime.start();
+    socket.open();
+
+    socket.emit('message', JSON.stringify({
+      type: DAEMON_COMMAND_TYPES.DAEMON_UPGRADE,
+      targetVersion: '2026.9.9999',
+    }));
+    await vi.waitFor(() => expect(startSelfUpgrade).toHaveBeenCalledOnce());
+    now += CONTROLLED_NODE_UPGRADE_HANDOFF_TIMEOUT_MS;
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    expect(socket.sent.map(JSON.parse).filter((frame) => (
+      frame.type === DAEMON_MSG.UPGRADE_BLOCKED
+      && frame.reason === DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS
+    ))).toHaveLength(0);
+    runtime.stop();
+  });
+
+  it('tells the server which daemons share its computer: after authenticating, and again only when that changes', async () => {
+    const socket = new MockSocket();
+    let bound = ['daemon-a'];
+    const discoverLocalDaemons = vi.fn(async () => bound);
+    let now = 1_000_000;
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, { discoverLocalDaemons, cleanupLegacyUpgradeRescue: async () => {} });
+    const reports = () => socket.sent
+      .map((frame) => JSON.parse(frame) as Record<string, unknown>)
+      .filter((frame) => frame.type === DAEMON_MSG.CONTROLLED_NODE_LOCAL_DAEMONS);
+    try {
+      runtime.start();
+      socket.open();
+      // Nothing before the server has acknowledged the connection.
+      expect(discoverLocalDaemons).not.toHaveBeenCalled();
+
+      socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+      await vi.waitFor(() => expect(reports()).toEqual([
+        { type: DAEMON_MSG.CONTROLLED_NODE_LOCAL_DAEMONS, serverIds: ['daemon-a'] },
+      ]));
+      expect(discoverLocalDaemons).toHaveBeenCalled();
+
+      // Every 5 s heartbeat is not a rescan.
+      socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+      expect(discoverLocalDaemons).toHaveBeenCalledTimes(1);
+
+      // A later rescan that finds the same daemons sends nothing new.
+      now += CONTROLLED_NODE_LOCAL_DAEMONS_RESCAN_MS;
+      socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+      await vi.waitFor(() => expect(discoverLocalDaemons).toHaveBeenCalledTimes(2));
+      // Let that scan settle completely (its result handling is a promise chain).
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(reports()).toHaveLength(1);
+
+      // A daemon installed after the node is reported on the next rescan.
+      bound = ['daemon-a', 'daemon-b'];
+      now += CONTROLLED_NODE_LOCAL_DAEMONS_RESCAN_MS;
+      socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+      await vi.waitFor(() => expect(reports()).toHaveLength(2));
+      expect(reports()[1]).toEqual({
+        type: DAEMON_MSG.CONTROLLED_NODE_LOCAL_DAEMONS,
+        serverIds: ['daemon-a', 'daemon-b'],
+      });
+    } finally {
+      runtime.stop();
+      clock.mockRestore();
+    }
+  });
+
   it('round-trips an enrollment blob appended to arbitrary executable bytes', () => {
     const encoded = encodeEnrollmentBlob({ serverUrl: 'https://im.example/', enrollToken: 'once-123' });
     expect(parseEnrollmentBlob(Buffer.concat([Buffer.from('binary-prefix'), encoded]))).toEqual({
@@ -157,6 +348,10 @@ describe('controlled node enrollment and runtime', () => {
     expect(advertised).toContain(REMOTE_DESKTOP_CAPABILITY);
     // Auto unlock lives in that same worker, so it is advertised with it.
     expect(advertised).toContain(CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY);
+    expect(advertised).not.toEqual(expect.arrayContaining([...REMOTE_DESKTOP_ADAPTER_CAPABILITIES]));
+    for (const adapterCapability of REMOTE_DESKTOP_ADAPTER_CAPABILITIES) {
+      expect(advertised).not.toContain(adapterCapability);
+    }
 
     const prepare = {
       type: REMOTE_DESKTOP_MSG.PREPARE,
@@ -178,6 +373,436 @@ describe('controlled node enrollment and runtime', () => {
     expect(remoteDesktopWorker.handle).toHaveBeenCalledOnce();
     runtime.stop();
     expect(remoteDesktopWorker.close).toHaveBeenCalled();
+  });
+
+  it('answers consent only after Server binds the canonical host and connection generation', async () => {
+    const socket = new MockSocket();
+    let consentSubscriber: ((frame: WorkerConsentInboundFrame) => void) | undefined;
+    const workerFrames: Record<string, unknown>[] = [];
+    const remoteDesktopWorker = {
+      available: vi.fn(() => true),
+      adapterCapabilities: vi.fn(() => [REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY]),
+      handle: vi.fn(async () => true),
+      applyAutoUnlockSecret: vi.fn(async () => true),
+      autoUnlockConfigured: vi.fn(async () => false),
+      close: vi.fn(),
+      onConsentFrame: vi.fn((handler: (frame: WorkerConsentInboundFrame) => void) => {
+        consentSubscriber = handler;
+        return () => { consentSubscriber = undefined; };
+      }),
+      sendConsentFrame: vi.fn(async (frame: Record<string, unknown>) => {
+        workerFrames.push(frame);
+        if (frame.type === WORKER_CONSENT_FRAME.SURFACE_QUERY) {
+          queueMicrotask(() => consentSubscriber?.({
+            type: WORKER_CONSENT_FRAME.SURFACE_STATE,
+            uiAvailable: true,
+            interactiveSession: true,
+            protectedDesktopActive: false,
+          }));
+        } else if (frame.type === WORKER_CONSENT_FRAME.ASK) {
+          queueMicrotask(() => consentSubscriber?.({
+            type: WORKER_CONSENT_FRAME.ANSWER,
+            approvalId: String(frame.approvalId),
+            outcome: WORKER_CONSENT_OUTCOME.ALLOWED,
+          }));
+        }
+        return true;
+      }),
+    };
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, { remoteDesktopWorker, now: () => 1_000 });
+    runtime.start();
+    socket.open();
+    expect((JSON.parse(socket.sent[0]!).capabilities as string[]))
+      .toContain(REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY);
+
+    const consent = (approvalId: string) => ({
+      type: REMOTE_DESKTOP_CONSENT_MSG.REQUEST,
+      approvalId,
+      hostId: 'host-00000000000000000001',
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      requesterLabel: 'Owner',
+      createdAt: 1_000,
+      deadlineAt: 31_000,
+      daemonGeneration: 7,
+    });
+
+    // Endpoint serverId is not a canonical host and local generation zero is
+    // not the Server bridge generation. No prompt may be shown by guessing.
+    socket.emit('message', JSON.stringify(consent('approval-0000000000000001')));
+    await vi.waitFor(() => expect(socket.sent.map(JSON.parse)).toContainEqual(expect.objectContaining({
+      type: REMOTE_DESKTOP_CONSENT_MSG.CANCEL,
+      approvalId: 'approval-0000000000000001',
+    })));
+    expect(workerFrames).toEqual([]);
+
+    socket.emit('message', JSON.stringify({
+      type: REMOTE_DESKTOP_NODE_CONTEXT_MSG.CURRENT,
+      hostId: 'host-00000000000000000001',
+      daemonGeneration: 7,
+    }));
+    socket.emit('message', JSON.stringify(consent('approval-0000000000000002')));
+    await vi.waitFor(() => expect(socket.sent.map(JSON.parse)).toContainEqual({
+      type: REMOTE_DESKTOP_CONSENT_MSG.RESULT,
+      approvalId: 'approval-0000000000000002',
+      decision: REMOTE_DESKTOP_CONSENT_DECISION.APPROVED,
+      daemonGeneration: 7,
+    }));
+    expect(workerFrames).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: WORKER_CONSENT_FRAME.SURFACE_QUERY }),
+      expect.objectContaining({
+        type: WORKER_CONSENT_FRAME.ASK,
+        approvalId: 'approval-0000000000000002',
+      }),
+    ]));
+
+    const askCount = workerFrames.filter((frame) => frame.type === WORKER_CONSENT_FRAME.ASK).length;
+    socket.emit('message', JSON.stringify({
+      type: REMOTE_DESKTOP_NODE_CONTEXT_MSG.UNAVAILABLE,
+      daemonGeneration: 7,
+    }));
+    socket.emit('message', JSON.stringify(consent('approval-0000000000000003')));
+    await vi.waitFor(() => expect(socket.sent.map(JSON.parse)).toContainEqual(expect.objectContaining({
+      type: REMOTE_DESKTOP_CONSENT_MSG.CANCEL,
+      approvalId: 'approval-0000000000000003',
+    })));
+    expect(workerFrames.filter((frame) => frame.type === WORKER_CONSENT_FRAME.ASK)).toHaveLength(askCount);
+    runtime.stop();
+  });
+
+  it('advertises implemented adapter concerns independently and keeps missing shell/consent closed', () => {
+    const socket = new MockSocket();
+    const implemented = [
+      REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY,
+      REMOTE_DESKTOP_INPUT_CAPABILITY,
+      REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY,
+      REMOTE_DESKTOP_CANONICAL_BRANDING_CAPABILITY,
+      REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+    ] as const;
+    const remoteDesktopWorker = {
+      available: vi.fn(() => true),
+      adapterCapabilities: vi.fn(() => implemented),
+      sendConsentFrame: vi.fn(async () => false),
+      sendPrivacyFrame: vi.fn(async () => false),
+      onPrivacyFrame: vi.fn(() => () => {}),
+      handle: vi.fn(async () => true),
+      applyAutoUnlockSecret: vi.fn(async () => true),
+      autoUnlockConfigured: vi.fn(async () => false),
+      close: vi.fn(),
+    };
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, { remoteDesktopWorker });
+    runtime.start();
+    socket.open();
+
+    const advertised = JSON.parse(socket.sent[0]!).capabilities as string[];
+    expect(advertised).toEqual(expect.arrayContaining([...implemented, REMOTE_DESKTOP_CAPABILITY]));
+    expect(advertised).not.toContain(REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY);
+    expect(advertised).not.toContain(REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY);
+    expect(advertised).not.toContain(REMOTE_DESKTOP_DEFAULT_SHIELDED_ROUTE_CAPABILITY);
+    runtime.stop();
+  });
+
+  it('advertises and consumes shell launch context only with a separately verified sidecar', async () => {
+    const socket = new MockSocket();
+    const launch = vi.fn(async (_command: unknown) => {});
+    const remoteDesktopWorker = {
+      available: vi.fn(() => true),
+      adapterCapabilities: vi.fn(() => [REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY]),
+      sendConsentFrame: vi.fn(async () => true),
+      sendPrivacyFrame: vi.fn(async () => true),
+      onPrivacyFrame: vi.fn(() => () => {}),
+      supportsDefaultShieldedRoute: vi.fn(() => true),
+      handle: vi.fn(async () => true),
+      applyAutoUnlockSecret: vi.fn(async () => true),
+      autoUnlockConfigured: vi.fn(async () => false),
+      close: vi.fn(),
+    };
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example', serverId: 'controlled-1', token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, {
+      remoteDesktopWorker,
+      remoteDesktopSignedShell: {
+        available: () => true,
+        executablePath: 'C:/Program Files/IM.codes/imcodes-remote-desktop-account-shell.exe',
+        launcher: { launch },
+      },
+      now: () => 2_000,
+    });
+    runtime.start();
+    socket.open();
+    const advertised = JSON.parse(socket.sent[0]!).capabilities as string[];
+    expect(advertised).toContain(REMOTE_DESKTOP_DEFAULT_SHIELDED_ROUTE_CAPABILITY);
+    expect(advertised).toContain(REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY);
+    expect(JSON.parse(socket.sent[0]!).capabilities)
+      .toContain(REMOTE_DESKTOP_DEFAULT_SHIELDED_ROUTE_CAPABILITY);
+    socket.emit('message', JSON.stringify({
+      type: REMOTE_DESKTOP_NODE_CONTEXT_MSG.CURRENT,
+      hostId: '../not-a-canonical-host',
+      daemonGeneration: 7,
+    }));
+    await Promise.resolve();
+    expect(launch).not.toHaveBeenCalled();
+    socket.emit('message', JSON.stringify({
+      type: REMOTE_DESKTOP_NODE_CONTEXT_MSG.CURRENT,
+      hostId: 'host-00000000000000000001',
+      daemonGeneration: 7,
+    }));
+    await vi.waitFor(() => expect(launch).toHaveBeenCalledOnce());
+    expect(launch.mock.calls[0]![0]).toMatchObject({
+      context: null,
+      hostId: 'host-00000000000000000001',
+      serverOrigin: 'https://im.example',
+      args: [
+        REMOTE_DESKTOP_SIGNED_SHELL_LAUNCH_ARG,
+        REMOTE_DESKTOP_SIGNED_SHELL_SERVER_ORIGIN_ARG,
+        'https://im.example',
+        REMOTE_DESKTOP_SIGNED_SHELL_BOOTSTRAP_HOST_ARG,
+        'host-00000000000000000001',
+      ],
+    });
+    expect(remoteDesktopWorker.sendPrivacyFrame).not.toHaveBeenCalled();
+    expect(remoteDesktopWorker.handle).not.toHaveBeenCalled();
+    const context = {
+      hostId: 'host-00000000000000000001',
+      launchId: 'launch-000000000000000001',
+      issuedAt: 1_000,
+      expiresAt: 61_000,
+      endpointGeneration: 7,
+    };
+    for (const rejected of [
+      { ...context, launchId: 'launch-000000000000000011', hostId: 'host-00000000000000000002' },
+      { ...context, launchId: 'launch-000000000000000012', endpointGeneration: 8 },
+      { ...context, launchId: 'launch-000000000000000013', expiresAt: 1_500 },
+      { ...context, launchId: 'launch-000000000000000014', authority: 'node' },
+    ]) {
+      socket.emit('message', JSON.stringify({ type: REMOTE_DESKTOP_SHELL_MSG.LAUNCH, context: rejected }));
+    }
+    await Promise.resolve();
+    expect(launch).toHaveBeenCalledOnce();
+    socket.emit('message', JSON.stringify({ type: REMOTE_DESKTOP_SHELL_MSG.LAUNCH, context }));
+    await vi.waitFor(() => expect(launch).toHaveBeenCalledTimes(2));
+    expect(launch.mock.calls[1]![0]).toMatchObject({
+      context,
+      hostId: context.hostId,
+      serverOrigin: 'https://im.example',
+    });
+    const boundArgs = (launch.mock.calls[1]![0] as { args: readonly string[] }).args;
+    expect(boundArgs).toHaveLength(5);
+    expect(boundArgs.slice(0, 4)).toEqual([
+      REMOTE_DESKTOP_SIGNED_SHELL_LAUNCH_ARG,
+      REMOTE_DESKTOP_SIGNED_SHELL_SERVER_ORIGIN_ARG,
+      'https://im.example',
+      REMOTE_DESKTOP_SIGNED_SHELL_CONTEXT_ARG,
+    ]);
+    expect(JSON.parse(Buffer.from(boundArgs[4]!, 'base64url').toString('utf8'))).toEqual(context);
+    socket.emit('message', JSON.stringify({ type: REMOTE_DESKTOP_SHELL_MSG.LAUNCH, context }));
+    socket.emit('message', JSON.stringify({
+      type: REMOTE_DESKTOP_SHELL_MSG.LAUNCH,
+      context: { ...context, launchId: 'launch-000000000000000002', token: 'must-not-cross' },
+    }));
+    await Promise.resolve();
+    expect(launch).toHaveBeenCalledTimes(2);
+    expect(remoteDesktopWorker.sendPrivacyFrame).not.toHaveBeenCalled();
+    expect(remoteDesktopWorker.handle).not.toHaveBeenCalled();
+    runtime.stop();
+  });
+
+  it('keeps signed-shell capability closed when the sidecar trust probe fails', () => {
+    const socket = new MockSocket();
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example', serverId: 'controlled-1', token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, {
+      remoteDesktopWorker: {
+        available: () => true,
+        adapterCapabilities: () => [REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY],
+        sendConsentFrame: async () => true,
+        sendPrivacyFrame: async () => true,
+        onPrivacyFrame: () => () => {},
+        handle: async () => true,
+        applyAutoUnlockSecret: async () => true,
+        autoUnlockConfigured: async () => false,
+        close: () => {},
+      },
+      remoteDesktopSignedShell: {
+        available: () => { throw new Error('signature_invalid'); },
+        executablePath: 'C:/untrusted-shell.exe',
+        launcher: { launch: async () => {} },
+      },
+    });
+    runtime.start();
+    socket.open();
+    expect(JSON.parse(socket.sent[0]!).capabilities)
+      .not.toContain(REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY);
+    runtime.stop();
+  });
+
+  it('fails capture-privacy PREPARE/LEASE closed when routeGeneration is omitted or malformed', async () => {
+    const socket = new MockSocket();
+    const remoteDesktopWorker = {
+      available: vi.fn(() => true),
+      adapterCapabilities: vi.fn(() => [REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY]),
+      sendConsentFrame: vi.fn(async () => true),
+      sendPrivacyFrame: vi.fn(async () => true),
+      onPrivacyFrame: vi.fn(() => () => {}),
+      handle: vi.fn(async () => true),
+      applyAutoUnlockSecret: vi.fn(async () => true),
+      autoUnlockConfigured: vi.fn(async () => false),
+      close: vi.fn(),
+    };
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, { remoteDesktopWorker, now: () => 1_000 });
+    runtime.start();
+    socket.open();
+    socket.emit('message', JSON.stringify({
+      type: REMOTE_DESKTOP_NODE_CONTEXT_MSG.CURRENT,
+      hostId: 'host-00000000000000000001',
+      daemonGeneration: 7,
+    }));
+
+    const base = {
+      requestId: 'request_12345678',
+      sessionId: 'session_12345678',
+      capability: 'a'.repeat(43),
+      leaseExpiresAt: 20_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+    };
+    socket.emit('message', JSON.stringify({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      ...base,
+      expiresAt: 60_000,
+      iceServers: [],
+    }));
+    socket.emit('message', JSON.stringify({
+      type: REMOTE_DESKTOP_MSG.LEASE,
+      ...base,
+    }));
+    socket.emit('message', JSON.stringify({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      ...base,
+      routeGeneration: '7',
+      expiresAt: 60_000,
+      iceServers: [],
+    }));
+    await vi.waitFor(() => expect(socket.sent.map((raw) => JSON.parse(raw))).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: REMOTE_DESKTOP_MSG.TERMINAL, reason: REMOTE_DESKTOP_TERMINAL_REASON.CAPABILITY_UNAVAILABLE }),
+    ])));
+    expect(socket.sent.map((raw) => JSON.parse(raw)).filter((msg) => msg.type === REMOTE_DESKTOP_MSG.TERMINAL)).toHaveLength(3);
+    expect(remoteDesktopWorker.handle).not.toHaveBeenCalled();
+
+    socket.emit('message', JSON.stringify({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      ...base,
+      routeGeneration: 3,
+      expiresAt: 60_000,
+      iceServers: [],
+    }));
+    await vi.waitFor(() => expect(remoteDesktopWorker.handle).toHaveBeenCalledOnce());
+    runtime.stop();
+  });
+
+
+
+  it('keeps legacy authenticated remote desktop usable without capture-privacy advertisement', async () => {
+    const socket = new MockSocket();
+    const remoteDesktopWorker = {
+      available: vi.fn(() => true),
+      adapterCapabilities: vi.fn(() => []),
+      handle: vi.fn(async () => true),
+      applyAutoUnlockSecret: vi.fn(async () => true),
+      autoUnlockConfigured: vi.fn(async () => false),
+      close: vi.fn(),
+    };
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, { remoteDesktopWorker, now: () => 1_000 });
+    runtime.start();
+    socket.open();
+
+    const advertised = JSON.parse(socket.sent[0]!).capabilities as string[];
+    expect(advertised).toContain(REMOTE_DESKTOP_CAPABILITY);
+    expect(advertised).not.toContain(REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY);
+    expect(advertised).not.toContain(REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY);
+
+    socket.emit('message', JSON.stringify({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId: 'request_12345678',
+      sessionId: 'session_12345678',
+      capability: 'a'.repeat(43),
+      leaseExpiresAt: 20_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      expiresAt: 60_000,
+      iceServers: [],
+    }));
+    await vi.waitFor(() => expect(remoteDesktopWorker.handle).toHaveBeenCalledOnce());
+    expect(socket.sent.map((raw) => JSON.parse(raw)).filter((msg) => msg.type === REMOTE_DESKTOP_MSG.TERMINAL)).toHaveLength(0);
+    runtime.stop();
+  });
+
+  it('fails a consent request closed when the declared adapter becomes unavailable', async () => {
+    const socket = new MockSocket();
+    const remoteDesktopWorker = {
+      available: vi.fn(() => true),
+      adapterCapabilities: vi.fn(() => [REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY]),
+      sendConsentFrame: vi.fn(async () => false),
+      onConsentFrame: vi.fn(() => () => {}),
+      handle: vi.fn(async () => true),
+      applyAutoUnlockSecret: vi.fn(async () => true),
+      autoUnlockConfigured: vi.fn(async () => false),
+      close: vi.fn(),
+    };
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, { remoteDesktopWorker, now: () => 1_000 });
+    runtime.start();
+    socket.open();
+    socket.emit('message', JSON.stringify({
+      type: REMOTE_DESKTOP_NODE_CONTEXT_MSG.CURRENT,
+      hostId: 'host-00000000000000000001',
+      daemonGeneration: 7,
+    }));
+    socket.emit('message', JSON.stringify({
+      type: REMOTE_DESKTOP_CONSENT_MSG.REQUEST,
+      approvalId: 'approval-0000000000000009',
+      hostId: 'host-00000000000000000001',
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      requesterLabel: 'Owner',
+      createdAt: 1_000,
+      deadlineAt: 31_000,
+      daemonGeneration: 7,
+    }));
+
+    await vi.waitFor(() => expect(socket.sent.map(JSON.parse)).toContainEqual({
+      type: REMOTE_DESKTOP_CONSENT_MSG.CANCEL,
+      approvalId: 'approval-0000000000000009',
+      reason: REMOTE_DESKTOP_CONSENT_CANCEL_REASON.NON_INTERACTIVE_SESSION,
+    }));
+    expect(remoteDesktopWorker.handle).not.toHaveBeenCalled();
+    runtime.stop();
   });
 
   it('self-repairs a missing Windows worker even when the main version already matches', async () => {
@@ -231,6 +856,176 @@ describe('controlled node enrollment and runtime', () => {
     socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
     await Promise.resolve();
     expect(repairMissingRemoteDesktopWorker).toHaveBeenCalledOnce();
+    runtime.stop();
+  });
+
+  it('self-repairs a missing Linux worker even when the main version already matches', async () => {
+    // A Linux node that upgraded to a version whose own self-upgrade.ts did
+    // not yet know how to fetch the worker sidecar (i.e. it upgraded through
+    // the exact release that added this repair) is stuck at a version that
+    // now CAN fetch the sidecar but never gets asked to, because nothing
+    // else changes on that node again. This mirrors the Windows repair test
+    // above; Linux must get the same self-heal, not just the same download
+    // function.
+    const socket = new MockSocket();
+    let now = 10_000;
+    const repairMissingRemoteDesktopWorker = vi.fn(async () => ({
+      ok: true as const,
+      targetVersion: 'current',
+      artifactSha256: 'c'.repeat(64),
+    }));
+    const remoteDesktopWorker = {
+      available: vi.fn(() => false),
+      handle: vi.fn(async () => false),
+      applyAutoUnlockSecret: vi.fn(async () => false),
+      autoUnlockConfigured: vi.fn(async () => false),
+      close: vi.fn(),
+    };
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, {
+      platform: 'linux',
+      arch: 'x64',
+      remoteDesktopWorker,
+      repairMissingRemoteDesktopWorker,
+      now: () => now,
+    });
+    runtime.start();
+    socket.open();
+
+    expect((JSON.parse(socket.sent[0]!).capabilities as string[])).toContain(
+      REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
+    );
+
+    expect(repairMissingRemoteDesktopWorker).not.toHaveBeenCalled();
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await Promise.resolve();
+    expect(repairMissingRemoteDesktopWorker).not.toHaveBeenCalled();
+    now += 10_000;
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(repairMissingRemoteDesktopWorker).toHaveBeenCalledOnce());
+    expect(repairMissingRemoteDesktopWorker).toHaveBeenCalledWith(DAEMON_VERSION);
+    expect(socket.sent.map((raw) => JSON.parse(raw))).toContainEqual({
+      type: DAEMON_MSG.UPGRADING,
+      targetVersion: DAEMON_VERSION,
+      artifactSha256: 'c'.repeat(64),
+    });
+
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await Promise.resolve();
+    expect(repairMissingRemoteDesktopWorker).toHaveBeenCalledOnce();
+    runtime.stop();
+  });
+
+  it('sends a resolvable v3 remote-desktop profile from a real LinuxRemoteDesktopWorkerHost once its sidecar exists', async () => {
+    // Regression coverage for a production bug: a real worker binary
+    // present on disk, running, with the fix above landed, still produced
+    // an auth frame with ZERO remote-desktop capabilities. Root cause was
+    // one layer up from the LinuxRemoteDesktopWorkerHost unit tests --
+    // runtime.ts's refreshRemoteDesktopCapabilityState() merges
+    // sessionCapabilities() and adapterCapabilities() through two
+    // DIFFERENT filters, and the disclosure token was advertised from the
+    // wrong one, so it was silently dropped before resolveRemoteDesktop
+    // SessionProfile ever saw it -- and without it, the v3 profile refuses
+    // to resolve at all. A host-level test that resolves a profile
+    // straight from sessionCapabilities() alone cannot catch that; only
+    // going through the real runtime merge, with a REAL
+    // LinuxRemoteDesktopWorkerHost (not a hand-built capability list),
+    // exercises the actual code path that broke in production.
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-linux-worker-e2e-'));
+    temporaryDirs.push(dir);
+    const workerPath = join(dir, 'imcodes-linux-remote-desktop-worker');
+    await writeFile(workerPath, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const remoteDesktopWorker = new LinuxRemoteDesktopWorkerHost(() => {}, { workerPath });
+    const socket = new MockSocket();
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, {
+      platform: 'linux',
+      arch: 'x64',
+      remoteDesktopWorker,
+      // A box with an X server running (the test host may have none).
+      linuxDesktop: {
+        displayAvailable: () => true,
+        provisionSupported: () => true,
+        provision: vi.fn(),
+      },
+    });
+    runtime.start();
+    socket.open();
+
+    const authFrame = JSON.parse(socket.sent[0]!) as { capabilities: string[] };
+    const profile = resolveRemoteDesktopSessionProfile(authFrame.capabilities);
+    expect(profile).not.toBeNull();
+    expect(profile?.kind).toBe('common_v3');
+    expect(profile?.platform).toBe('linux');
+    expect(profile?.capture).toBe('linux_x11');
+    expect(profile?.localDisclosure).toBe(true);
+    runtime.stop();
+  });
+
+  it('offers to set up a basic desktop on a headless Linux box, and advertises remote desktop once it is up', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-linux-headless-'));
+    temporaryDirs.push(dir);
+    const workerPath = join(dir, 'imcodes-linux-remote-desktop-worker');
+    await writeFile(workerPath, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const remoteDesktopWorker = new LinuxRemoteDesktopWorkerHost(() => {}, { workerPath });
+    const sockets: MockSocket[] = [];
+    let displayUp = false;
+    const provision = vi.fn(async () => {
+      displayUp = true;
+      return { ok: true as const, user: 'ai' };
+    });
+    const repairMissingRemoteDesktopWorker = vi.fn();
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => {
+      const next = new MockSocket();
+      sockets.push(next);
+      return next;
+    }, {
+      platform: 'linux',
+      arch: 'x64',
+      remoteDesktopWorker,
+      repairMissingRemoteDesktopWorker,
+      linuxDesktop: {
+        displayAvailable: () => displayUp,
+        provisionSupported: () => true,
+        provision,
+      },
+    });
+    runtime.start();
+    const socket = sockets[0]!;
+    socket.open();
+
+    // No screen to capture: no remote desktop that would only fail at
+    // session start -- the one-click install instead.
+    const before = JSON.parse(socket.sent[0]!) as { capabilities: string[] };
+    expect(resolveRemoteDesktopSessionProfile(before.capabilities)).toBeNull();
+    expect(before.capabilities).toContain(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY);
+
+    socket.emit('message', JSON.stringify({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST }));
+    await vi.waitFor(() => expect(provision).toHaveBeenCalledOnce());
+    // The worker itself is present: this is a desktop install, not a worker repair.
+    expect(repairMissingRemoteDesktopWorker).not.toHaveBeenCalled();
+
+    // Capabilities travel only in the auth frame, so the change reconnects
+    // and the new connection advertises a working remote desktop.
+    await vi.waitFor(() => expect(sockets.length).toBeGreaterThan(1), { timeout: 10_000 });
+    const reconnect = sockets.at(-1)!;
+    reconnect.open();
+    const after = JSON.parse(reconnect.sent[0]!) as { capabilities: string[] };
+    expect(resolveRemoteDesktopSessionProfile(after.capabilities)?.capture).toBe('linux_x11');
+    expect(after.capabilities).not.toContain(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY);
     runtime.stop();
   });
 
@@ -566,6 +1361,7 @@ describe('controlled node enrollment and runtime', () => {
       installId: 'install-1',
       nodeTokenHash: 'a'.repeat(64),
       sourceExePath: `${servicePath}.download`,
+      sourceArtifact: { sha256: 'a'.repeat(64), size: 2048 },
       stagedExePath: servicePath,
       serverId: 'controlled-1',
       serviceName: 'imcodes-node',
@@ -641,6 +1437,7 @@ describe('controlled node enrollment and runtime', () => {
       installId: 'install-1',
       nodeTokenHash: 'a'.repeat(64),
       sourceExePath: '/tmp/imcodes-node-download',
+      sourceArtifact: { sha256: 'a'.repeat(64), size: 2048 },
       stagedExePath: '/tmp/imcodes-node',
       serverId: 'controlled-1',
       serviceName: 'imcodes-node',

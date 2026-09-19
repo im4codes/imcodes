@@ -1,0 +1,331 @@
+import { EventEmitter } from 'node:events';
+import { describe, expect, it, vi } from 'vitest';
+
+import { NODE_ROLE } from '../../shared/remote-exec.js';
+import {
+  REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
+  REMOTE_DESKTOP_INSTALL_MSG,
+  REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY,
+  REMOTE_DESKTOP_PERMISSION_MSG,
+} from '../../shared/remote-desktop-install.js';
+import { CONTROLLED_NODE_CAPABILITIES } from '../../shared/controlled-node-capabilities.js';
+import { createControlledNodeRuntime } from '../../src/node/runtime.js';
+import { REMOTE_DESKTOP_CAPABILITY } from '../../shared/remote-desktop.js';
+import type { AuthenticatedWebSocketLike } from '../../src/transport/authenticated-websocket.js';
+
+class MockSocket extends EventEmitter implements AuthenticatedWebSocketLike {
+  readonly sent: string[] = [];
+  readyState = 0;
+  send(data: string): void { this.sent.push(data); }
+  close(): void { this.readyState = 3; }
+  open(): void { this.readyState = 1; this.emit('open'); }
+  terminate(): void { this.readyState = 3; }
+  ping(): void {}
+}
+
+const CREDENTIAL = {
+  serverUrl: 'https://im.example',
+  serverId: 'controlled-1',
+  token: 'secret',
+  nodeRole: NODE_ROLE.CONTROLLED,
+};
+
+function authCapabilities(socket: MockSocket): string[] {
+  const auth = socket.sent.map((frame) => JSON.parse(frame)).find((frame) => frame.type === 'auth');
+  return (auth?.capabilities ?? []) as string[];
+}
+
+/**
+ * The wiring that did not exist. Every other piece of macOS remote desktop was
+ * shipping -- CI signed and notarized the components, the server served them,
+ * the node could verify and promote a set, readiness turned that into a
+ * capability and the UI gated its buttons on it -- but the node never
+ * advertised that it COULD install, and never fetched anything. A macOS
+ * machine therefore showed no remote-desktop button of any kind, and looked
+ * simply unsupported.
+ */
+describe('macOS remote-desktop install wiring', () => {
+  it('offers the install while the components are absent', async () => {
+    const socket = new MockSocket();
+    createControlledNodeRuntime(CREDENTIAL, () => socket, {
+      platform: 'darwin',
+      arch: 'arm64',
+      installMacosRemoteDesktopComponents: async () => true,
+    }).start();
+    socket.open();
+    expect(authCapabilities(socket)).toContain(REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY);
+    // Not the Windows one. Its wire value says `windows`, and a consumer that
+    // reads the string rather than the symbol would be told something false.
+    expect(authCapabilities(socket)).not.toContain(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY);
+  });
+
+  it('installs on request, and stops offering once it has', async () => {
+    const socket = new MockSocket();
+    const install = vi.fn(async () => true);
+    createControlledNodeRuntime(CREDENTIAL, () => socket, {
+      platform: 'darwin',
+      arch: 'arm64',
+      installMacosRemoteDesktopComponents: install,
+    }).start();
+    socket.open();
+
+    socket.emit('message', JSON.stringify({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST }));
+    await vi.waitFor(() => expect(install).toHaveBeenCalledOnce());
+  });
+
+  it('never reinstalls a release that is already installed, and starts it again instead', async () => {
+    // On a real Mac the components were installed and simply not running --
+    // the screen was locked when the node started. The node re-downloaded the
+    // release every retry window and flipped the store's selector back each
+    // time, while nothing ever ran start-up again once the screen was unlocked.
+    const socket = new MockSocket();
+    const install = vi.fn(async () => true);
+    const installed = vi.fn(async () => true);
+    let now = 1_000_000;
+    createControlledNodeRuntime(CREDENTIAL, () => socket, {
+      platform: 'darwin',
+      arch: 'arm64',
+      now: () => now,
+      installMacosRemoteDesktopComponents: install,
+      macosRemoteDesktopComponentsInstalled: installed,
+    }).start();
+    socket.open();
+
+    socket.emit('message', JSON.stringify({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST }));
+    await vi.waitFor(() => expect(installed).toHaveBeenCalledTimes(1));
+    await new Promise((resolve) => { setTimeout(resolve, 20); });
+    // A second press 30 s later is still a start, never a download.
+    now += 31_000;
+    socket.emit('message', JSON.stringify({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST }));
+    await vi.waitFor(() => expect(installed).toHaveBeenCalledTimes(2));
+    await new Promise((resolve) => { setTimeout(resolve, 20); });
+    expect(install).not.toHaveBeenCalled();
+  });
+
+  it('installs when the store holds no set for this release', async () => {
+    const socket = new MockSocket();
+    const install = vi.fn(async () => true);
+    createControlledNodeRuntime(CREDENTIAL, () => socket, {
+      platform: 'darwin',
+      arch: 'arm64',
+      installMacosRemoteDesktopComponents: install,
+      macosRemoteDesktopComponentsInstalled: async () => false,
+    }).start();
+    socket.open();
+    socket.emit('message', JSON.stringify({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST }));
+    await vi.waitFor(() => expect(install).toHaveBeenCalledOnce());
+  });
+
+  it('refuses a request carrying caller-controlled fields', async () => {
+    // The request has no parameters by design. Accepting extra keys would make
+    // this a generic "fetch and run something" endpoint reachable from a
+    // browser session.
+    const socket = new MockSocket();
+    const install = vi.fn(async () => true);
+    createControlledNodeRuntime(CREDENTIAL, () => socket, {
+      platform: 'darwin',
+      arch: 'arm64',
+      installMacosRemoteDesktopComponents: install,
+    }).start();
+    socket.open();
+
+    socket.emit('message', JSON.stringify({
+      type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST,
+      storeRoot: '/tmp/anywhere',
+    }));
+    await new Promise((resolve) => { setTimeout(resolve, 20); });
+    expect(install).not.toHaveBeenCalled();
+  });
+
+  it('never offers a macOS install on another platform or architecture', async () => {
+    for (const runtimeShape of [
+      { platform: 'darwin' as const, arch: 'arm' as never },
+      { platform: 'linux' as const, arch: 'x64' as const },
+      { platform: 'win32' as const, arch: 'x64' as const },
+    ]) {
+      const socket = new MockSocket();
+      createControlledNodeRuntime(CREDENTIAL, () => socket, {
+        ...runtimeShape,
+        installMacosRemoteDesktopComponents: async () => true,
+      }).start();
+      socket.open();
+      expect(authCapabilities(socket)).not.toContain(REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY);
+    }
+  });
+
+  it('asks the machine to raise its own permission prompt', async () => {
+    // The grant cannot be made remotely: macOS shows that dialog only to a
+    // responsible signed application in the console user's session, and only a
+    // person can answer it. All the node can do is ask.
+    const socket = new MockSocket();
+    const requestPermissions = vi.fn(async () => true);
+    createControlledNodeRuntime(CREDENTIAL, () => socket, {
+      platform: 'darwin',
+      arch: 'arm64',
+      requestMacosRemoteDesktopPermissions: requestPermissions,
+    }).start();
+    socket.open();
+
+    socket.emit('message', JSON.stringify({ type: REMOTE_DESKTOP_PERMISSION_MSG.REQUEST }));
+    await vi.waitFor(() => expect(requestPermissions).toHaveBeenCalledOnce());
+  });
+
+  it('refuses a permission request carrying caller-controlled fields', async () => {
+    const socket = new MockSocket();
+    const requestPermissions = vi.fn(async () => true);
+    createControlledNodeRuntime(CREDENTIAL, () => socket, {
+      platform: 'darwin',
+      arch: 'arm64',
+      requestMacosRemoteDesktopPermissions: requestPermissions,
+    }).start();
+    socket.open();
+
+    socket.emit('message', JSON.stringify({
+      type: REMOTE_DESKTOP_PERMISSION_MSG.REQUEST,
+      executable: '/tmp/anything',
+    }));
+    await new Promise((resolve) => { setTimeout(resolve, 20); });
+    expect(requestPermissions).not.toHaveBeenCalled();
+  });
+
+  it('installs without being asked, once connected', async () => {
+    // The node knows it has no components and which release it belongs to.
+    // Making a person click a button to fetch them asks them to do what the
+    // node can do unprompted.
+    const socket = new MockSocket();
+    const install = vi.fn(async () => true);
+    createControlledNodeRuntime(CREDENTIAL, () => socket, {
+      platform: 'darwin',
+      arch: 'arm64',
+      installMacosRemoteDesktopComponents: install,
+    }).start();
+    socket.open();
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(install).toHaveBeenCalledOnce());
+  });
+
+  it('still checks for a newer release once a worker is already installed', async () => {
+    // A Mac that received its first release ever previously could not
+    // receive a second one: `remoteDesktopWorkerAvailable` stays true for as
+    // long as ANY release works, so gating the background/heartbeat check on
+    // "no worker yet" meant every later release -- including one carrying a
+    // real bug fix for this exact adapter -- went undelivered, silently, on
+    // every reconnect. `installMacosRemoteDesktopComponents` already makes
+    // its own safe, version-aware decision (`macosRemoteDesktopComponentsInstalled`
+    // below reports this release is NOT what is installed); it must be asked.
+    const socket = new MockSocket();
+    const install = vi.fn(async () => true);
+    const installed = vi.fn(async () => false);
+    const worker = {
+      available: () => true,
+      sessionCapabilities: () => [REMOTE_DESKTOP_CAPABILITY],
+      handleServerMessage: () => false,
+      close: () => undefined,
+    };
+    createControlledNodeRuntime(CREDENTIAL, () => socket, {
+      platform: 'darwin',
+      arch: 'arm64',
+      remoteDesktopWorker: worker as never,
+      installMacosRemoteDesktopComponents: install,
+      macosRemoteDesktopComponentsInstalled: installed,
+    }).start();
+    socket.open();
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(installed).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(install).toHaveBeenCalledOnce());
+  });
+
+  it('does not re-download on every reconnect after a failure', async () => {
+    // A server that cannot serve the set would otherwise turn a flapping link
+    // into a request loop.
+    let now = 1_000_000;
+    const socket = new MockSocket();
+    const install = vi.fn(async () => false);
+    createControlledNodeRuntime(CREDENTIAL, () => socket, {
+      platform: 'darwin',
+      arch: 'arm64',
+      now: () => now,
+      installMacosRemoteDesktopComponents: install,
+    }).start();
+    socket.open();
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(install).toHaveBeenCalledOnce());
+
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await new Promise((resolve) => { setTimeout(resolve, 20); });
+    expect(install).toHaveBeenCalledOnce();
+
+    // An explicit click ignores the delay: whoever pressed it knows something
+    // the node does not.
+    socket.emit('message', JSON.stringify({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST }));
+    await vi.waitFor(() => expect(install).toHaveBeenCalledTimes(2));
+  });
+
+  it('tells the server once installed components change what the node can do', async () => {
+    // The server reads capabilities from the auth frame and nowhere else. The
+    // install used to succeed, refresh a local copy, and stop -- so the browser
+    // kept showing the install button, the operator pressed it again, and the
+    // node installed the same set again. A new connection is the only way the
+    // new capabilities are ever seen.
+    const sockets: MockSocket[] = [];
+    let available = false;
+    const worker = {
+      available: () => available,
+      sessionCapabilities: () => [REMOTE_DESKTOP_CAPABILITY],
+      handleServerMessage: () => false,
+      close: () => undefined,
+    };
+    createControlledNodeRuntime(CREDENTIAL, () => {
+      const socket = new MockSocket();
+      sockets.push(socket);
+      queueMicrotask(() => socket.open());
+      return socket;
+    }, {
+      platform: 'darwin',
+      arch: 'arm64',
+      remoteDesktopWorker: worker as never,
+      installMacosRemoteDesktopComponents: async () => { available = true; return true; },
+    }).start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    await vi.waitFor(() => expect(authCapabilities(sockets[0]!)).toContain(REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY));
+
+    sockets[0]!.emit('message', JSON.stringify({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST }));
+    await vi.waitFor(() => expect(sockets.length).toBeGreaterThanOrEqual(2), { timeout: 5_000 });
+    await vi.waitFor(() => expect(authCapabilities(sockets.at(-1)!)).toContain(REMOTE_DESKTOP_CAPABILITY));
+    // And it stops offering the install it has just completed.
+    expect(authCapabilities(sockets.at(-1)!)).not.toContain(REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY);
+  });
+
+  it('does not reconnect when nothing it advertises has changed', async () => {
+    // A readiness check that finds the same state must not cost a connection.
+    const sockets: MockSocket[] = [];
+    const worker = {
+      available: () => false,
+      handleServerMessage: () => false,
+      close: () => undefined,
+    };
+    createControlledNodeRuntime(CREDENTIAL, () => {
+      const socket = new MockSocket();
+      sockets.push(socket);
+      queueMicrotask(() => socket.open());
+      return socket;
+    }, {
+      platform: 'darwin',
+      arch: 'arm64',
+      remoteDesktopWorker: worker as never,
+      // Reports success but changes nothing the node advertises.
+      installMacosRemoteDesktopComponents: async () => true,
+    }).start();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    sockets[0]!.emit('message', JSON.stringify({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST }));
+    await new Promise((resolve) => { setTimeout(resolve, 1_500); });
+    expect(sockets).toHaveLength(1);
+  });
+
+  it('is a capability the server will actually relay', async () => {
+    // A capability missing from the shared allowlist is dropped before it
+    // reaches a browser, so advertising it would change nothing at all.
+    expect(CONTROLLED_NODE_CAPABILITIES).toContain(REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY);
+    expect(REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY).not.toBe(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY);
+  });
+});

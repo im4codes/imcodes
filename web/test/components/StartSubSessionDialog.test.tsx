@@ -5,6 +5,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/preact';
 import { DEFAULT_CODEX_SESSION_MODEL } from '../../../src/shared/models/options.js';
+import { HERMES_AGENT_PROVIDER_ID } from '../../../shared/hermes-agent.js';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -35,7 +36,7 @@ describe('StartSubSessionDialog', () => {
     cleanup();
   });
 
-  it('shows Claude, Codex, Qoder, OpenCode, Grok, DeepSeek Harness, and Pi options', () => {
+  it('shows Claude, Codex, Qoder, OpenCode, Grok, Hermes, DeepSeek Harness, and Pi options', () => {
     render(
       <StartSubSessionDialog
         ws={makeWs() as any}
@@ -53,6 +54,7 @@ describe('StartSubSessionDialog', () => {
     expect(screen.getByRole('button', { name: /qoder_sdk/i })).toBeDefined();
     expect(screen.getByRole('button', { name: /opencode_sdk/i })).toBeDefined();
     expect(screen.getByRole('button', { name: /grok_sdk/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /hermes_agent/i })).toBeDefined();
     expect(screen.getByRole('button', { name: /deepseek_harness/i })).toBeDefined();
     expect(screen.getByRole('button', { name: /^pi$/i })).toBeDefined();
   });
@@ -86,6 +88,30 @@ describe('StartSubSessionDialog', () => {
     expect(groups[1].textContent).toMatch(/claude_code_cli/i);
     expect(groups[1].textContent).toMatch(/codex_cli/i);
     expect(screen.getByText('qwen_provider_hint')).toBeDefined();
+  });
+
+  it('can reuse the launcher for a supervision pool without exposing unsupported session types', () => {
+    const { container } = render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        allowedAgentTypes={['claude-code-sdk', 'codex-sdk', 'qwen', 'openclaw']}
+        overlayClassName="session-settings-child-overlay"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(container.querySelector('.session-settings-child-overlay')).toBeTruthy();
+    expect(screen.getByRole('button', { name: /claude_code_sdk/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /codex_sdk/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /^qwen$/i })).toBeDefined();
+    expect(screen.getByRole('button', { name: /^openclaw$/i })).toBeDefined();
+    expect(screen.queryByRole('button', { name: /qoder_sdk/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /codex_cli/i })).toBeNull();
   });
 
   it('defaults level to high for supported transports', () => {
@@ -338,7 +364,14 @@ describe('StartSubSessionDialog', () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
+    // qwen's card is intentionally hidden (display: none) from the default
+    // picker now -- still a real, clickable DOM node. getByRole's `name`
+    // match can't find it even with `hidden: true`: accessible-name
+    // computation excludes text from display:none descendants regardless of
+    // that option, which only bypasses the "is this role excluded" gate, not
+    // name computation. A plain attribute query sidesteps that entirely,
+    // without changing what the test actually verifies.
+    fireEvent.click(document.querySelector('[data-agent-type="qwen"]') as HTMLButtonElement);
 
     await waitFor(() => expect(screen.getByText('qwen_provider_selected_hint')).toBeDefined());
   });
@@ -373,7 +406,14 @@ describe('StartSubSessionDialog', () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
+    // qwen's card is intentionally hidden (display: none) from the default
+    // picker now -- still a real, clickable DOM node. getByRole's `name`
+    // match can't find it even with `hidden: true`: accessible-name
+    // computation excludes text from display:none descendants regardless of
+    // that option, which only bypasses the "is this role excluded" gate, not
+    // name computation. A plain attribute query sidesteps that entirely,
+    // without changing what the test actually verifies.
+    fireEvent.click(document.querySelector('[data-agent-type="qwen"]') as HTMLButtonElement);
     await waitFor(() => expect(screen.getByText('compatible_api_via_qwen')).toBeDefined());
     expect(screen.getByText('qwen_provider_selected_hint')).toBeDefined();
     const presetSelect = (screen.getAllByRole('combobox') as HTMLSelectElement[])
@@ -522,7 +562,14 @@ describe('StartSubSessionDialog', () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
+    // qwen's card is intentionally hidden (display: none) from the default
+    // picker now -- still a real, clickable DOM node. getByRole's `name`
+    // match can't find it even with `hidden: true`: accessible-name
+    // computation excludes text from display:none descendants regardless of
+    // that option, which only bypasses the "is this role excluded" gate, not
+    // name computation. A plain attribute query sidesteps that entirely,
+    // without changing what the test actually verifies.
+    fireEvent.click(document.querySelector('[data-agent-type="qwen"]') as HTMLButtonElement);
     await waitFor(() => expect(screen.getByText('compatible_api_via_qwen')).toBeDefined());
 
     fireEvent.click(screen.getByRole('button', { name: /api_provider_add_edit/i }));
@@ -548,7 +595,14 @@ describe('StartSubSessionDialog', () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
+    // qwen's card is intentionally hidden (display: none) from the default
+    // picker now -- still a real, clickable DOM node. getByRole's `name`
+    // match can't find it even with `hidden: true`: accessible-name
+    // computation excludes text from display:none descendants regardless of
+    // that option, which only bypasses the "is this role excluded" gate, not
+    // name computation. A plain attribute query sidesteps that entirely,
+    // without changing what the test actually verifies.
+    fireEvent.click(document.querySelector('[data-agent-type="qwen"]') as HTMLButtonElement);
     await waitFor(() => expect(screen.getByText('compatible_api_via_qwen')).toBeDefined());
     fireEvent.click(screen.getByRole('button', { name: /api_provider_add_edit/i }));
 
@@ -573,7 +627,14 @@ describe('StartSubSessionDialog', () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: /qwen/i }));
+    // qwen's card is intentionally hidden (display: none) from the default
+    // picker now -- still a real, clickable DOM node. getByRole's `name`
+    // match can't find it even with `hidden: true`: accessible-name
+    // computation excludes text from display:none descendants regardless of
+    // that option, which only bypasses the "is this role excluded" gate, not
+    // name computation. A plain attribute query sidesteps that entirely,
+    // without changing what the test actually verifies.
+    fireEvent.click(document.querySelector('[data-agent-type="qwen"]') as HTMLButtonElement);
     const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
     fireEvent.input(selects[0], { target: { value: 'high' } });
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
@@ -649,6 +710,29 @@ describe('StartSubSessionDialog', () => {
 
     expect(onStart).toHaveBeenCalledWith('kimi-sdk', undefined, '/tmp', undefined, {
       requestedModel: 'moonshot-v1-auto,thinking',
+    });
+  });
+
+  it('passes requestedModel for Hermes ACP sub-sessions', () => {
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /hermes_agent/i }));
+    fireEvent.input(screen.getByPlaceholderText('selectModel'), { target: { value: 'nous-free' } });
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+
+    expect(onStart).toHaveBeenCalledWith(HERMES_AGENT_PROVIDER_ID, undefined, '/tmp', undefined, {
+      requestedModel: 'nous-free',
     });
   });
 

@@ -16,6 +16,7 @@ import {
   PI_PROVIDER_CONFIG_ENV,
   type PiLlmConfig,
 } from '../../../../shared/pi-agent.js';
+import { McpToolCatalog, type McpToolCatalogSnapshot } from '../../mcp-tool-catalog.js';
 
 interface PiExtensionApi {
   registerProvider(name: string, config: Record<string, unknown>): void;
@@ -30,6 +31,8 @@ interface PiExtensionApi {
       signal?: AbortSignal,
     ): Promise<{ content: Array<Record<string, unknown>>; details?: unknown }>;
   }): void;
+  getActiveTools(): string[];
+  setActiveTools(toolNames: string[]): void;
   on(event: string, handler: (...args: unknown[]) => unknown): void;
 }
 
@@ -72,6 +75,78 @@ function normalizeMcpContent(value: unknown): Array<Record<string, unknown>> {
   return result.length > 0 ? result : textContent('MCP tool returned no content.');
 }
 
+function registerPublishedTools(
+  pi: PiExtensionApi,
+  snapshot: McpToolCatalogSnapshot,
+  knownMcpTools: Set<string>,
+  getClient: () => Client | null,
+  getCatalog: () => McpToolCatalog | null,
+  rememberPublicationQuery: (query: string) => void,
+): void {
+  const previouslyKnown = new Set(knownMcpTools);
+  for (const tool of snapshot.tools) {
+    knownMcpTools.add(tool.name);
+    pi.registerTool({
+      name: tool.name,
+      label: tool.title ?? tool.name,
+      description: tool.description ?? tool.name,
+      // Pi/TypeBox accepts JSON Schema-compatible TSchema values. The MCP
+      // contract already provides a standards-compliant object schema.
+      parameters: (tool.inputSchema ?? { type: 'object', properties: {} }) as Record<string, unknown>,
+      async execute(_toolCallId, params, signal) {
+        const activeClient = getClient();
+        const activeTool = getCatalog()?.getTool(tool.name);
+        if (!activeClient || !activeTool) throw new Error(`IM.codes MCP tool ${tool.name} is not callable`);
+        const response = await activeClient.callTool(
+          { name: tool.name, arguments: params },
+          undefined,
+          signal ? { signal } : undefined,
+        );
+        const blocks = normalizeMcpContent(response.content);
+        if (response.isError) {
+          const message = blocks
+            .filter((block) => block.type === 'text')
+            .map((block) => String(block.text ?? ''))
+            .join('\n') || `MCP tool ${tool.name} failed`;
+          throw new Error(message);
+        }
+        if (tool.name === 'mcp_tool_search'
+          && typeof params.query === 'string'
+          && params.activate !== false) {
+          const normalizedQuery = params.query.trim().toLowerCase();
+          const published = response.structuredContent
+            && typeof response.structuredContent === 'object'
+            && Array.isArray((response.structuredContent as Record<string, unknown>).published)
+              ? (response.structuredContent as { published: unknown[] }).published
+              : [];
+          const isExactSelector = normalizedQuery.startsWith('group:')
+            || published.some((name) => typeof name === 'string' && name.toLowerCase() === normalizedQuery);
+          // Reconnect replays only a bounded selector. Never retain a free-text
+          // preview or fallback arguments/execution across authority contexts.
+          if (isExactSelector && params.fallbackCall === undefined) {
+            rememberPublicationQuery(params.query.trim());
+          }
+          // Hosts must not wait for a future turn merely because their
+          // notification delivery races the tool result. Force the same
+          // connection's complete catalog refresh before this search call
+          // returns to Pi's agent loop.
+          await getCatalog()?.refresh('discovery-call');
+        }
+        return { content: blocks, details: response.structuredContent };
+      },
+    });
+  }
+
+  // registerTool refreshes Pi's registry even during an active agent loop.
+  // Replace the active MCP subset only after the complete MCP generation is
+  // registered, so add/update/remove/rename is model-visible atomically. This
+  // is also the permission reset boundary for removed or schema-changed tools.
+  const activeNonMcp = pi.getActiveTools().filter((name) => !previouslyKnown.has(name) && !knownMcpTools.has(name));
+  pi.setActiveTools(snapshot.ready
+    ? [...activeNonMcp, ...snapshot.tools.map((tool) => tool.name)]
+    : activeNonMcp);
+}
+
 export default async function imcodesPiExtension(pi: PiExtensionApi): Promise<void> {
   const provider = parseEnvJson<PiLlmConfig>(PI_PROVIDER_CONFIG_ENV);
   if (provider?.provider && provider.model) {
@@ -96,10 +171,12 @@ export default async function imcodesPiExtension(pi: PiExtensionApi): Promise<vo
   if (!mcp?.command) return;
 
   let client: Client | null = null;
-  let registered = false;
+  let catalog: McpToolCatalog | null = null;
+  const knownMcpTools = new Set<string>();
+  let lastPublicationQuery: string | null = null;
 
   pi.on('session_start', async () => {
-    if (client || registered) return;
+    if (client) return;
     const nextClient = new Client({ name: 'imcodes-pi-mcp', version: '0.1.0' });
     const nextTransport = new StdioClientTransport({
       command: mcp.command,
@@ -109,37 +186,34 @@ export default async function imcodesPiExtension(pi: PiExtensionApi): Promise<vo
     });
     try {
       await nextClient.connect(nextTransport);
-      const catalog = await nextClient.listTools();
       client = nextClient;
-      for (const tool of catalog.tools) {
-        pi.registerTool({
-          name: tool.name,
-          label: tool.title ?? tool.name,
-          description: tool.description ?? tool.name,
-          // Pi/TypeBox accepts JSON Schema-compatible TSchema values. The MCP
-          // contract already provides a standards-compliant object schema.
-          parameters: (tool.inputSchema ?? { type: 'object', properties: {} }) as Record<string, unknown>,
-          async execute(_toolCallId, params, signal) {
-            if (!client) throw new Error('IM.codes MCP connection is unavailable');
-            const response = await client.callTool(
-              { name: tool.name, arguments: params },
-              undefined,
-              signal ? { signal } : undefined,
-            );
-            const blocks = normalizeMcpContent(response.content);
-            if (response.isError) {
-              const message = blocks
-                .filter((block) => block.type === 'text')
-                .map((block) => String(block.text ?? ''))
-                .join('\n') || `MCP tool ${tool.name} failed`;
-              throw new Error(message);
-            }
-            return { content: blocks, details: response.structuredContent };
-          },
+      const nextCatalog = new McpToolCatalog({
+        publish: (snapshot) => registerPublishedTools(
+          pi,
+          snapshot,
+          knownMcpTools,
+          () => client,
+          () => catalog,
+          (query) => { lastPublicationQuery = query; },
+        ),
+      });
+      catalog = nextCatalog;
+      await nextCatalog.connect(nextClient);
+
+      // A new stdio process starts with the bounded bootstrap view. Replay only
+      // the last exact discovery selector (never fallback arguments/execution),
+      // then force a complete refresh so a missed notification cannot strand
+      // the reconnected model on a stale schema generation.
+      if (lastPublicationQuery) {
+        await nextClient.callTool({
+          name: 'mcp_tool_search',
+          arguments: { query: lastPublicationQuery },
         });
+        await nextCatalog.refresh('reconnect-publication');
       }
-      registered = true;
     } catch {
+      catalog?.disconnect();
+      catalog = null;
       await nextClient.close().catch(() => {});
       client = null;
       // MCP is additive. A local MCP startup failure must not prevent Pi from
@@ -150,6 +224,8 @@ export default async function imcodesPiExtension(pi: PiExtensionApi): Promise<vo
   pi.on('session_shutdown', async () => {
     const active = client;
     client = null;
+    catalog?.disconnect();
+    catalog = null;
     if (active) await active.close().catch(() => {});
   });
 }

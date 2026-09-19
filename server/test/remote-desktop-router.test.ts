@@ -1,8 +1,16 @@
 import { describe, expect, it, vi } from 'vitest';
 import type WebSocket from 'ws';
+import { createTurnIceServerAuthority } from '../src/ws/turn-credentials.js';
+import { REMOTE_DESKTOP_RELAY_CAP_CAPABILITY } from '../../shared/remote-desktop-access.js';
 import type { Database } from '../src/db/client.js';
 import type { ControlledMachineAccessRow } from '../src/share/machine-access.js';
-import { RemoteDesktopRouter } from '../src/ws/remote-desktop-router.js';
+import {
+  RemoteDesktopRouter,
+  type RemoteDesktopAutoUnlockEvent,
+  type RemoteDesktopRouterHooks,
+  type RemoteDesktopRouteRegistry,
+  type RemoteDesktopRouteRegistryIdentity,
+} from '../src/ws/remote-desktop-router.js';
 import {
   REMOTE_DESKTOP_ACCESS_MODE,
   REMOTE_DESKTOP_AUDIT_EVENT,
@@ -14,9 +22,25 @@ import {
   REMOTE_DESKTOP_MODE_REASON,
   REMOTE_DESKTOP_PROTOCOL_VERSION,
   REMOTE_DESKTOP_STATE,
+  REMOTE_DESKTOP_STOP_ORIGIN,
   REMOTE_DESKTOP_TERMINAL_REASON,
+  validateRemoteDesktopDaemonMessage,
 } from '../../shared/remote-desktop.js';
+import {
+  REMOTE_DESKTOP_CAPTURE_CAPABILITY,
+  REMOTE_DESKTOP_ENCODER_CAPABILITY,
+  REMOTE_DESKTOP_PLATFORM_CAPABILITY,
+  REMOTE_DESKTOP_SESSION_CAPABILITY,
+  REMOTE_DESKTOP_UNSUPPORTED_PROFILE_CAPABILITY,
+} from '../../shared/remote-desktop-platform.js';
+import { parseAdvertisedControlledNodeCapabilities } from '../../shared/controlled-node-capabilities.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
+import {
+  REMOTE_DESKTOP_ACTOR_SOURCE,
+  REMOTE_DESKTOP_INPUT_CAPABILITY,
+  REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+  type RemoteDesktopOutboxEvent,
+} from '../../shared/remote-desktop-access.js';
 
 const requestId = 'request_12345678';
 const start = {
@@ -62,38 +86,68 @@ function daemonHostAccess(now = Date.now()): ControlledMachineAccessRow {
 }
 
 function fixture(options: {
+  turnEnv?: Record<string, string | undefined>;
   access?: ControlledMachineAccessRow | null;
   resolveAccess?: (userId: string) => Promise<ControlledMachineAccessRow | null>;
   credentialExpiresAt?: number;
+  routeRegistry?: RemoteDesktopRouteRegistry;
+  routeAuthority?: RemoteDesktopRouteRegistryIdentity['authority'];
+  allocateRouteGeneration?: () => Promise<number>;
+  autoUnlockSucceeded?: RemoteDesktopRouterHooks['autoUnlockSucceeded'];
+  /** What the node advertises; none by default, like a node with no profile. */
+  nodeCapabilities?: readonly string[];
 } = {}) {
   const browserA = {} as WebSocket;
   const browserB = {} as WebSocket;
   const browserMessages = new Map<WebSocket, Array<Record<string, unknown>>>();
   const daemonMessages: Array<Record<string, unknown>> = [];
   const audits: Array<{ event: string; fields: Readonly<Record<string, string | number | boolean>> }> = [];
+  const registryEvents: string[] = [];
   let generation = 7;
   let available = true;
   let supported = true;
   let featureEnabled = true;
   let access = options.access === undefined ? validAccess() : options.access;
   let resolver = options.resolveAccess ?? (async () => access);
+  const routeRegistry: RemoteDesktopRouteRegistry = options.routeRegistry ?? {
+    reserve: async (_db, input) => {
+      registryEvents.push(`reserve:${input.routeId}:${input.routeGeneration}`);
+      return {
+        hostId: 'host-00000000000000000001',
+        routeGeneration: input.routeGeneration,
+        authority: options.routeAuthority ?? { actorSource: REMOTE_DESKTOP_ACTOR_SOURCE.ACCOUNT },
+      };
+    },
+    activate: async (_db, input) => {
+      registryEvents.push(`activate:${input.routeId}:${input.routeGeneration}`);
+    },
+    close: async (_db, input) => {
+      registryEvents.push(`close:${input.routeId}:${input.routeGeneration}`);
+    },
+  };
   const router = new RemoteDesktopRouter({
     serverId: () => 'controlled-win',
     database: () => ({}) as Database,
     daemonAvailable: () => available,
     daemonSupportsRemoteDesktop: () => supported,
+    daemonRemoteDesktopCapabilities: () => options.nodeCapabilities ?? [],
     featureEnabled: () => featureEnabled,
     daemonGeneration: () => generation,
-    iceServers: () => ({
-      iceServers: [
-        'stun:stun.example.test:3478',
-        { urls: ['turn:turn.example.test:3478?transport=udp'], username: 'temporary-user', credential: 'temporary-password' },
-      ],
-      ...(options.credentialExpiresAt === undefined ? {} : { credentialExpiresAt: options.credentialExpiresAt }),
-    }),
+    allocateRouteGeneration: options.allocateRouteGeneration ?? (async () => generation),
+    iceServers: (userId: string) => (options.turnEnv
+      // The REAL authority, exactly as bridge.ts wires it.
+      ? createTurnIceServerAuthority(userId, { env: options.turnEnv })
+      : {
+        iceServers: [
+          'stun:stun.example.test:3478',
+          { urls: ['turn:turn.example.test:3478?transport=udp'], username: 'temporary-user', credential: 'temporary-password' },
+        ],
+        ...(options.credentialExpiresAt === undefined ? {} : { credentialExpiresAt: options.credentialExpiresAt }),
+      }),
     sendDaemon: vi.fn((message, expectedGeneration) => {
       if (!available || expectedGeneration !== generation) return false;
       daemonMessages.push(message);
+      registryEvents.push(`daemon:${String(message.type)}`);
       return true;
     }),
     sendBrowser: (socket, message) => {
@@ -102,7 +156,9 @@ function fixture(options: {
       browserMessages.set(socket, messages);
     },
     resolveAccess: async (_db, userId) => resolver(userId),
+    routeRegistry,
     audit: (event, fields) => { audits.push({ event, fields }); },
+    ...(options.autoUnlockSucceeded ? { autoUnlockSucceeded: options.autoUnlockSucceeded } : {}),
   });
   return {
     router,
@@ -110,6 +166,7 @@ function fixture(options: {
     browserB,
     daemonMessages,
     audits,
+    registryEvents,
     messages: (socket: WebSocket) => browserMessages.get(socket) ?? [],
     setAccess: (value: ControlledMachineAccessRow | null) => { access = value; },
     setResolver: (value: (userId: string) => Promise<ControlledMachineAccessRow | null>) => { resolver = value; },
@@ -143,6 +200,255 @@ async function authorize(
 }
 
 describe('RemoteDesktopRouter', () => {
+  it('admits a node that cannot take input to View instead of failing every attempt', async () => {
+    // pro.koca.win: Screen Recording granted, Accessibility not. Its v3
+    // profile has capture but no input, and it refuses a Control PREPARE.
+    const mac = [
+      REMOTE_DESKTOP_SESSION_CAPABILITY,
+      REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS,
+      REMOTE_DESKTOP_CAPTURE_CAPABILITY.MACOS_SCREEN_CAPTURE_KIT,
+      REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+      REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+    ];
+    const f = fixture({ nodeCapabilities: mac });
+    await f.router.handleBrowser(f.browserA, 'owner-user', start);
+    expect(f.messages(f.browserA).at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+    });
+    expect(f.daemonMessages.find((message) => message.type === REMOTE_DESKTOP_MSG.PREPARE))
+      .toMatchObject({ mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW });
+  });
+
+  it('still admits input-capable and legacy Windows nodes to Control', async () => {
+    const withInput = [
+      REMOTE_DESKTOP_SESSION_CAPABILITY,
+      REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS,
+      REMOTE_DESKTOP_CAPTURE_CAPABILITY.MACOS_SCREEN_CAPTURE_KIT,
+      REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+      REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+      REMOTE_DESKTOP_INPUT_CAPABILITY,
+    ];
+    // A Windows daemon advertises only the legacy capability, and controls.
+    for (const nodeCapabilities of [withInput, [REMOTE_DESKTOP_CAPABILITY]]) {
+      const f = fixture({ nodeCapabilities });
+      await authorize(f);
+    }
+  });
+
+  it('applies exact durable downgrade/terminal effects and rejects a replacement generation', async () => {
+    const downgraded = fixture({
+      routeAuthority: {
+        actorSource: REMOTE_DESKTOP_ACTOR_SOURCE.ATTENDED_LINK,
+        actorAuditId: 'audit-link-1',
+        authorityGeneration: 1,
+        expiryRevision: 1,
+        commitRevision: 1,
+      },
+    });
+    const authority = await authorize(downgraded);
+    const event: RemoteDesktopOutboxEvent = {
+      idempotencyKey: 'down:1', sequence: 1, authorityKind: 'link', effect: 'downgrade', scope: 'route',
+      hostId: 'host-00000000000000000001', targetServerId: 'controlled-win',
+      actorAuditId: 'audit-link-1', authorityGeneration: 2, expiryRevision: 1,
+      commitRevision: 2, routeGeneration: 7,
+    };
+    const authorityMatch = {
+      authorityKind: 'link' as const,
+      actorAuditId: event.actorAuditId,
+      authorityGeneration: event.authorityGeneration,
+      expiryRevision: event.expiryRevision,
+      commitRevision: event.commitRevision,
+    };
+    expect(downgraded.router.applyGuestOutboxEffect(event, authority.sessionId, 8, authorityMatch))
+      .toEqual({ status: 'not_owner' });
+    expect(downgraded.router.applyGuestOutboxEffect(event, authority.sessionId, 7, authorityMatch))
+      .toEqual({ status: 'applied' });
+    expect(downgraded.daemonMessages.at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.MODE_STATE,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 2,
+      reason: REMOTE_DESKTOP_MODE_REASON.AUTHORITY_LOST,
+    });
+    expect(downgraded.router.applyGuestOutboxEffect(event, authority.sessionId, 7, authorityMatch))
+      .toEqual({ status: 'duplicate' });
+
+    const terminal = { ...event, idempotencyKey: 'term:2', sequence: 2, effect: 'terminal' } as const;
+    expect(downgraded.router.applyGuestOutboxEffect(terminal, authority.sessionId, 7, authorityMatch))
+      .toEqual({ status: 'applied' });
+    expect(downgraded.daemonMessages.at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.STOP,
+      sessionId: authority.sessionId,
+    });
+    expect(downgraded.messages(downgraded.browserA).at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED,
+    });
+  });
+
+  it('applies deadline updates as a minimum and expires the route at that absolute time', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1_800_000_000_000);
+      const f = fixture({
+        routeAuthority: {
+          actorSource: REMOTE_DESKTOP_ACTOR_SOURCE.ATTENDED_LINK,
+          actorAuditId: 'audit-link-1',
+          authorityGeneration: 1,
+          expiryRevision: 1,
+          commitRevision: 1,
+        },
+      });
+      const authority = await authorize(f);
+      const deadlineAt = Date.now() + 2_000;
+      const event: RemoteDesktopOutboxEvent = {
+        idempotencyKey: 'deadline:1', sequence: 1, authorityKind: 'link', effect: 'deadline_update', scope: 'route',
+        hostId: 'host-00000000000000000001', targetServerId: 'controlled-win',
+        actorAuditId: 'audit-link-1', authorityGeneration: 1, expiryRevision: 2,
+        commitRevision: 2, routeGeneration: 7, deadlineAt,
+      };
+      const authorityMatch = {
+        authorityKind: 'link' as const,
+        actorAuditId: event.actorAuditId,
+        authorityGeneration: event.authorityGeneration,
+        expiryRevision: event.expiryRevision,
+        commitRevision: event.commitRevision,
+      };
+      expect(f.router.applyGuestOutboxEffect(event, authority.sessionId, 7, authorityMatch))
+        .toEqual({ status: 'applied' });
+      expect(f.daemonMessages.at(-1)).toMatchObject({
+        type: REMOTE_DESKTOP_MSG.LEASE,
+        leaseExpiresAt: deadlineAt,
+      });
+      expect(f.router.applyGuestOutboxEffect(
+        { ...event, deadlineAt: deadlineAt + 10_000 },
+        authority.sessionId,
+        7,
+        authorityMatch,
+      )).toEqual({ status: 'duplicate' });
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(f.messages(f.browserA).at(-1)).toMatchObject({
+        type: REMOTE_DESKTOP_MSG.TERMINAL,
+        reason: REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_EXPIRED,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('accepts a password terminal only for the exact older in-memory actor generation', async () => {
+    const f = fixture({
+      routeAuthority: {
+        actorSource: REMOTE_DESKTOP_ACTOR_SOURCE.NODE_PASSWORD,
+        actorAuditId: 'password-audit-1',
+        sessionAuditId: 'password-session-1',
+        passwordGeneration: 4,
+      },
+    });
+    const authority = await authorize(f);
+    const event: RemoteDesktopOutboxEvent = {
+      idempotencyKey: 'password:5',
+      sequence: 1,
+      authorityKind: 'password',
+      effect: 'terminal',
+      scope: 'route',
+      hostId: 'host-00000000000000000001',
+      targetServerId: 'controlled-win',
+      actorAuditId: 'password-audit-1',
+      sessionAuditId: 'password-session-1',
+      passwordGeneration: 5,
+      routeGeneration: 7,
+    };
+    const match = {
+      authorityKind: 'password' as const,
+      actorAuditId: 'password-audit-1',
+      sessionAuditId: 'password-session-1',
+      passwordGeneration: 5,
+    };
+    expect(f.router.applyGuestOutboxEffect(
+      event,
+      authority.sessionId,
+      7,
+      { ...match, passwordGeneration: 6 },
+    )).toEqual({ status: 'not_owner' });
+    expect(f.router.applyGuestOutboxEffect(event, authority.sessionId, 7, match))
+      .toEqual({ status: 'applied' });
+    expect(f.messages(f.browserA).at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED,
+    });
+  });
+
+  it('durably reserves and activates the canonical-host route before PREPARE, then closes it on Stop', async () => {
+    const f = fixture();
+    const authority = await authorize(f);
+    expect(f.registryEvents.slice(0, 3)).toEqual([
+      `reserve:${authority.sessionId}:7`,
+      `activate:${authority.sessionId}:7`,
+      `daemon:${REMOTE_DESKTOP_MSG.PREPARE}`,
+    ]);
+
+    await f.router.handleBrowser(f.browserA, 'owner-user', {
+      type: REMOTE_DESKTOP_MSG.STOP,
+      ...authority,
+      stopOrigin: REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE,
+    });
+    await vi.waitFor(() => expect(f.registryEvents).toContain(`close:${authority.sessionId}:7`));
+    expect(f.registryEvents.filter((event) => event === `close:${authority.sessionId}:7`)).toHaveLength(1);
+  });
+
+  it('uses a route incarnation that is independent from the daemon generation on PREPARE and LEASE', async () => {
+    const f = fixture({ allocateRouteGeneration: async () => 101 });
+    const authority = await authorize(f);
+    expect(f.registryEvents[0]).toMatch(/reserve:.*:101$/);
+    expect(f.daemonMessages[0]).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      daemonGeneration: 7,
+      routeGeneration: 101,
+    });
+    await f.router.revalidateUser('owner-user');
+    expect(f.daemonMessages.at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.LEASE,
+      daemonGeneration: 7,
+      routeGeneration: 101,
+    });
+    await f.router.handleBrowser(f.browserA, 'owner-user', {
+      type: REMOTE_DESKTOP_MSG.STOP,
+      ...authority,
+      stopOrigin: REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE,
+    });
+  });
+
+  it('never dispatches PREPARE when the durable route cannot become active', async () => {
+    const events: string[] = [];
+    const routeRegistry: RemoteDesktopRouteRegistry = {
+      reserve: async (_db, input) => {
+        events.push(`reserve:${input.routeId}`);
+        return {
+          hostId: 'host-00000000000000000001',
+          routeGeneration: input.routeGeneration,
+          authority: { actorSource: REMOTE_DESKTOP_ACTOR_SOURCE.ACCOUNT },
+        };
+      },
+      activate: async (_db, input) => {
+        events.push(`activate:${input.routeId}`);
+        throw new Error('synthetic_gate_closed');
+      },
+      close: async (_db, input) => { events.push(`close:${input.routeId}`); },
+    };
+    const f = fixture({ routeRegistry });
+
+    await f.router.handleBrowser(f.browserA, 'owner-user', start);
+    await vi.waitFor(() => expect(events.some((event) => event.startsWith('close:'))).toBe(true));
+    expect(f.daemonMessages).toHaveLength(0);
+    expect(f.messages(f.browserA).at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.ERROR,
+      error: REMOTE_DESKTOP_ERROR.CAPABILITY_UNAVAILABLE,
+      retryable: true,
+    });
+    expect(f.router.stats().active).toBe(0);
+  });
+
   it('never forwards media or input data envelopes over the application WebSocket', async () => {
     const f = fixture();
     const authority = await authorize(f);
@@ -197,6 +503,43 @@ describe('RemoteDesktopRouter', () => {
     });
   });
 
+  it('notifies built-in auto unlock success once per connection, never on replay or without the fact', async () => {
+    const events: RemoteDesktopAutoUnlockEvent[] = [];
+    const f = fixture({ autoUnlockSucceeded: (event) => { events.push(event); } });
+    const first = await authorize(f);
+    const status = (authority: typeof first, extra: Record<string, unknown> = {}) => f.router.handleDaemon({
+      type: REMOTE_DESKTOP_MSG.STATUS,
+      ...authority,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      state: REMOTE_DESKTOP_STATE.DIRECT,
+      inputEnabled: false,
+      ...extra,
+    }, 7);
+    // Sign-in screen, unlock available, manual/local unlock: no fact, no notification.
+    status(first, { signInScreen: true, unlockAvailable: true });
+    status(first);
+    expect(events).toEqual([]);
+    // The worker reports success and then repeats it on every later status.
+    status(first, { autoUnlockSucceeded: true });
+    status(first, { autoUnlockSucceeded: true });
+    status(first, { autoUnlockSucceeded: true, signInScreen: false });
+    expect(events).toEqual([expect.objectContaining({
+      serverId: 'controlled-win', sessionId: first.sessionId, userId: 'owner-user',
+    })]);
+    // A genuinely new connection notifies once again.
+    const second = await authorize(f, f.browserB, 'owner-user', 'request_auto_unlock_second_000001');
+    expect(second.sessionId).not.toBe(first.sessionId);
+    status(second, { autoUnlockSucceeded: true });
+    status(second, { autoUnlockSucceeded: true });
+    expect(events.map((event) => event.sessionId)).toEqual([first.sessionId, second.sessionId]);
+    // Only `true` is a valid fact.
+    expect(validateRemoteDesktopDaemonMessage({
+      type: REMOTE_DESKTOP_MSG.STATUS, ...first, mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1, state: REMOTE_DESKTOP_STATE.DIRECT, inputEnabled: false, autoUnlockSucceeded: false,
+    }).ok).toBe(false);
+  });
+
   it('caps audit output even when a worker churns bounded status metadata', async () => {
     const f = fixture();
     const authority = await authorize(f);
@@ -208,12 +551,66 @@ describe('RemoteDesktopRouter', () => {
         inputEpoch: 1,
         state: REMOTE_DESKTOP_STATE.DIRECT,
         route: 'direct',
+        peerConnected: true,
+        dataChannelsReady: true,
+        mediaStarted: true,
+        firstFramePresented: true,
         selectedDisplayId: index % 2 === 0 ? 'display_12345678' : 'display_87654321',
         layoutRevision: index + 1,
         inputEnabled: false,
       }, 7);
     }
     expect(f.audits).toHaveLength(REMOTE_DESKTOP_LIMITS.MAX_AUDITS_PER_MACHINE_PER_MINUTE);
+  });
+
+  it('does not treat a selected direct pair as connected before PC, channels, media, and first frame', async () => {
+    const f = fixture();
+    const authority = await authorize(f);
+    const baseStatus = {
+      type: REMOTE_DESKTOP_MSG.STATUS,
+      ...authority,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      state: REMOTE_DESKTOP_STATE.DIRECT,
+      route: 'direct',
+      selectedDisplayId: 'display-primary',
+      layoutRevision: 1,
+      inputEnabled: false,
+    } as const;
+
+    expect(f.router.handleDaemon(baseStatus, 7)).toBe(true);
+    expect(f.messages(f.browserA).at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.STATUS,
+      state: REMOTE_DESKTOP_STATE.CONNECTING,
+      route: 'direct',
+    });
+    expect(f.audits).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ event: REMOTE_DESKTOP_AUDIT_EVENT.CONNECTED }),
+    ]));
+
+    expect(f.router.handleDaemon({
+      ...baseStatus,
+      peerConnected: true,
+      dataChannelsReady: true,
+      mediaStarted: true,
+      firstFramePresented: true,
+    }, 7)).toBe(true);
+    expect(f.messages(f.browserA).at(-1)).toMatchObject({
+      state: REMOTE_DESKTOP_STATE.DIRECT,
+      route: 'direct',
+    });
+    expect(f.audits).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        event: REMOTE_DESKTOP_AUDIT_EVENT.CONNECTED,
+        fields: expect.objectContaining({
+          route: 'direct',
+          peerConnected: true,
+          dataChannelsReady: true,
+          mediaStarted: true,
+          firstFramePresented: true,
+        }),
+      }),
+    ]));
   });
 
   it('forwards bounded reconnect intent only to the worker and audits aggregate bytes', async () => {
@@ -247,6 +644,7 @@ describe('RemoteDesktopRouter', () => {
       requestId: authority.requestId,
       sessionId: authority.sessionId,
       capability: authority.capability,
+      stopOrigin: REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE,
       aggregateBytesReceived: 98_765,
     });
     expect(f.daemonMessages.at(-1)).toEqual({
@@ -259,6 +657,7 @@ describe('RemoteDesktopRouter', () => {
       event: REMOTE_DESKTOP_AUDIT_EVENT.STOPPED,
       fields: expect.objectContaining({
         controllerRequested: true,
+        stopOrigin: REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE,
         aggregateBytesReceived: 98_765,
       }),
     });
@@ -270,7 +669,7 @@ describe('RemoteDesktopRouter', () => {
     expect(serializedAudits).not.toContain('KeyA');
   });
 
-  it('permits one lease-revalidated ICE restart and rejects a second restart', async () => {
+  it('permits eight lease-revalidated ICE restarts and rejects the ninth', async () => {
     const f = fixture();
     const authority = await authorize(f);
     const offer = {
@@ -285,30 +684,38 @@ describe('RemoteDesktopRouter', () => {
       sdp: 'v=0\r\na=ice-ufrag:answer-first',
     }, 7)).toBe(true);
 
-    await f.router.handleBrowser(f.browserA, 'owner-user', {
-      ...offer,
-      sdp: 'v=0\r\na=ice-ufrag:restart-one',
-    });
-    expect(f.daemonMessages.at(-1)).toMatchObject({
-      type: REMOTE_DESKTOP_MSG.OFFER,
-      sdp: expect.stringContaining('restart-one'),
-    });
+    for (let attempt = 1; attempt <= REMOTE_DESKTOP_LIMITS.MAX_ICE_RESTARTS; attempt++) {
+      await f.router.handleBrowser(f.browserA, 'owner-user', {
+        ...offer,
+        sdp: `v=0\r\na=ice-ufrag:restart-${attempt}`,
+      });
+      expect(f.daemonMessages.at(-1)).toMatchObject({
+        type: REMOTE_DESKTOP_MSG.OFFER,
+        sdp: expect.stringContaining(`restart-${attempt}`),
+      });
+      expect(f.daemonMessages.at(-2)).toMatchObject({
+        type: REMOTE_DESKTOP_MSG.MODE_STATE,
+        inputEpoch: 1 + attempt,
+      });
+      expect(f.router.handleDaemon({
+        type: REMOTE_DESKTOP_MSG.ANSWER,
+        ...authority,
+        sdp: `v=0\r\na=ice-ufrag:answer-restart-${attempt}`,
+      }, 7)).toBe(true);
+    }
     expect(f.audits).toEqual(expect.arrayContaining([
       expect.objectContaining({
         event: REMOTE_DESKTOP_AUDIT_EVENT.RECONNECTING,
-        fields: expect.objectContaining({ iceRestartAttempt: 1 }),
+        fields: expect.objectContaining({
+          iceRestartAttempt: REMOTE_DESKTOP_LIMITS.MAX_ICE_RESTARTS,
+        }),
       }),
     ]));
-    expect(f.router.handleDaemon({
-      type: REMOTE_DESKTOP_MSG.ANSWER,
-      ...authority,
-      sdp: 'v=0\r\na=ice-ufrag:answer-restart',
-    }, 7)).toBe(true);
 
     const daemonCount = f.daemonMessages.length;
     await f.router.handleBrowser(f.browserA, 'owner-user', {
       ...offer,
-      sdp: 'v=0\r\na=ice-ufrag:restart-two',
+      sdp: 'v=0\r\na=ice-ufrag:restart-over-budget',
     });
     expect(f.daemonMessages).toHaveLength(daemonCount);
     expect(f.messages(f.browserA).at(-1)).toMatchObject({
@@ -389,6 +796,10 @@ describe('RemoteDesktopRouter', () => {
       inputEpoch: 1,
       state: REMOTE_DESKTOP_STATE.DIRECT,
       route: 'direct',
+      peerConnected: true,
+      dataChannelsReady: true,
+      mediaStarted: true,
+      firstFramePresented: true,
       selectedDisplayId: 'display-primary',
       layoutRevision: 1,
       inputEnabled: false,
@@ -401,6 +812,10 @@ describe('RemoteDesktopRouter', () => {
       inputEpoch: 1,
       state: REMOTE_DESKTOP_STATE.DIRECT,
       route: 'direct',
+      peerConnected: true,
+      dataChannelsReady: true,
+      mediaStarted: true,
+      firstFramePresented: true,
       selectedDisplayId: 'display-primary',
       layoutRevision: 1,
       inputEnabled: false,
@@ -414,6 +829,10 @@ describe('RemoteDesktopRouter', () => {
       inputEpoch: 1,
       state: REMOTE_DESKTOP_STATE.SWITCHING_DISPLAY,
       route: 'direct',
+      peerConnected: true,
+      dataChannelsReady: true,
+      mediaStarted: true,
+      firstFramePresented: true,
       selectedDisplayId: 'display-secondary',
       layoutRevision: 2,
       inputEnabled: false,
@@ -441,14 +860,180 @@ describe('RemoteDesktopRouter', () => {
   it.each([
     ['viewer', { access_role: 'viewer' }, REMOTE_DESKTOP_ERROR.ACCESS_DENIED],
     ['disabled', { exec_enabled: false }, REMOTE_DESKTOP_ERROR.EXECUTION_DISABLED],
-    ['non-Windows', { os: 'linux' }, REMOTE_DESKTOP_ERROR.UNSUPPORTED_PLATFORM],
+    // Enrolled as linux but still advertising the bare legacy Windows token
+    // (validAccess()'s default capabilities) -- a genuine mismatch, not the
+    // old blanket "linux is never supported" rejection. That blanket
+    // rejection is what refused every real Linux node before its own
+    // capabilities were ever read; see the dedicated admission test below
+    // for a Linux node that actually advertises a matching v3 profile.
+    ['enrolled-Linux node still advertising the Windows legacy token', { os: 'linux' }, REMOTE_DESKTOP_ERROR.UNSUPPORTED_PLATFORM],
     ['stale presence', { last_heartbeat_at: 1 }, REMOTE_DESKTOP_ERROR.DAEMON_OFFLINE],
     ['unknown capability', { controlled_capabilities: ['remote.desktop.windows.h264.v3'] }, REMOTE_DESKTOP_ERROR.CAPABILITY_UNAVAILABLE],
+    ['unsupported persisted profile', {
+      controlled_capabilities: [
+        REMOTE_DESKTOP_CAPABILITY,
+        REMOTE_DESKTOP_UNSUPPORTED_PROFILE_CAPABILITY,
+      ],
+    }, REMOTE_DESKTOP_ERROR.CAPABILITY_UNAVAILABLE],
   ] as const)('rejects %s before signaling', async (_label, patch, error) => {
     const f = fixture({ access: { ...validAccess(), ...patch } as ControlledMachineAccessRow });
     await f.router.handleBrowser(f.browserA, 'owner-user', start);
     expect(f.daemonMessages).toHaveLength(0);
     expect(f.messages(f.browserA)[0]).toMatchObject({ type: REMOTE_DESKTOP_MSG.ERROR, error });
+  });
+
+  it('admits a macOS controlled node advertising a complete v3 profile and sends it PREPARE', async () => {
+    // Every check here used to assume Windows: `os !== 'win'` refused the node
+    // as unsupported_platform and the Windows v2 token was required on top of
+    // the profile, so a Mac that advertised everything a session needs never
+    // received PREPARE and the browser sat on "connecting".
+    const macProfile = [
+      REMOTE_DESKTOP_SESSION_CAPABILITY,
+      REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS,
+      REMOTE_DESKTOP_CAPTURE_CAPABILITY.MACOS_SCREEN_CAPTURE_KIT,
+      REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+      REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+      REMOTE_DESKTOP_INPUT_CAPABILITY,
+    ];
+    const f = fixture({
+      access: { ...validAccess(), os: 'mac', controlled_capabilities: macProfile } as ControlledMachineAccessRow,
+    });
+    const authority = await authorize(f);
+    expect(f.daemonMessages[0]).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId,
+      sessionId: authority.sessionId,
+    });
+  });
+
+  it('admits a Linux controlled node advertising a complete v3 profile and sends it PREPARE', async () => {
+    // Same production bug as the macOS case above, on the same early gate:
+    // `os !== 'win' && os !== 'mac'` refused every Linux node as
+    // unsupported_platform before its own capabilities (linux platform,
+    // x11 capture, disclosure) were ever read -- confirmed live on a real
+    // Linux controlled node whose session sat on "connecting" forever with
+    // a `remote_desktop.error: unsupported_platform` frame the browser
+    // never surfaced, and zero activity ever reaching its daemon.
+    const linuxProfile = [
+      REMOTE_DESKTOP_SESSION_CAPABILITY,
+      REMOTE_DESKTOP_PLATFORM_CAPABILITY.LINUX,
+      REMOTE_DESKTOP_CAPTURE_CAPABILITY.LINUX_X11,
+      REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+      REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+    ];
+    const f = fixture({
+      access: { ...validAccess(), os: 'linux', controlled_capabilities: linuxProfile } as ControlledMachineAccessRow,
+    });
+    const authority = await authorize(f);
+    expect(f.daemonMessages[0]).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId,
+      sessionId: authority.sessionId,
+    });
+  });
+
+  it.each([
+    ['a macOS profile on a node enrolled as Windows', 'win', [
+      REMOTE_DESKTOP_SESSION_CAPABILITY,
+      REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS,
+      REMOTE_DESKTOP_CAPTURE_CAPABILITY.MACOS_SCREEN_CAPTURE_KIT,
+      REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+      REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+    ]],
+    ['the Windows token on a node enrolled as macOS', 'mac', [REMOTE_DESKTOP_CAPABILITY]],
+    ['a Linux profile on a node enrolled as Windows', 'win', [
+      REMOTE_DESKTOP_SESSION_CAPABILITY,
+      REMOTE_DESKTOP_PLATFORM_CAPABILITY.LINUX,
+      REMOTE_DESKTOP_CAPTURE_CAPABILITY.LINUX_X11,
+      REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+      REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+    ]],
+    ['the Windows token on a node enrolled as linux', 'linux', [REMOTE_DESKTOP_CAPABILITY]],
+  ] as const)('refuses %s as unsupported_platform', async (_label, os, capabilities) => {
+    // The profile decides the platform, and the enrolled OS must agree with
+    // it. A node whose record and advertisement disagree is not trusted to be
+    // either.
+    const f = fixture({
+      access: { ...validAccess(), os, controlled_capabilities: [...capabilities] } as ControlledMachineAccessRow,
+    });
+    await f.router.handleBrowser(f.browserA, 'owner-user', start);
+    expect(f.daemonMessages).toHaveLength(0);
+    expect(f.messages(f.browserA)[0]).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.ERROR,
+      error: REMOTE_DESKTOP_ERROR.UNSUPPORTED_PLATFORM,
+    });
+  });
+
+  it('keeps an unknown remote-desktop advertisement fail-closed from ingress through admission', async () => {
+    const parsed = parseAdvertisedControlledNodeCapabilities([
+      REMOTE_DESKTOP_CAPABILITY,
+      REMOTE_DESKTOP_SESSION_CAPABILITY,
+      REMOTE_DESKTOP_PLATFORM_CAPABILITY.WINDOWS,
+      REMOTE_DESKTOP_CAPTURE_CAPABILITY.WINDOWS_DXGI,
+      REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+      REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+      'remote.desktop.platform.plan9.v1',
+      'future.unrelated.feature.v1',
+    ]);
+    expect(parsed).toEqual({
+      ok: true,
+      value: [
+        REMOTE_DESKTOP_CAPABILITY,
+        REMOTE_DESKTOP_SESSION_CAPABILITY,
+        REMOTE_DESKTOP_PLATFORM_CAPABILITY.WINDOWS,
+        REMOTE_DESKTOP_CAPTURE_CAPABILITY.WINDOWS_DXGI,
+        REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+        REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+        REMOTE_DESKTOP_UNSUPPORTED_PROFILE_CAPABILITY,
+      ],
+    });
+    if (!parsed.ok) throw new Error('capability fixture did not parse');
+    const f = fixture({
+      access: {
+        ...validAccess(),
+        controlled_capabilities: parsed.value,
+      },
+    });
+    await f.router.handleBrowser(f.browserA, 'owner-user', start);
+    expect(f.daemonMessages).toHaveLength(0);
+    expect(f.messages(f.browserA)[0]).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.ERROR,
+      error: REMOTE_DESKTOP_ERROR.CAPABILITY_UNAVAILABLE,
+    });
+  });
+
+  it('keeps rollback-era unknown extensions inert for a pure legacy Windows profile', async () => {
+    const parsed = parseAdvertisedControlledNodeCapabilities([
+      REMOTE_DESKTOP_CAPABILITY,
+      'remote.desktop.future_adapter.v9',
+    ]);
+    expect(parsed).toEqual({ ok: true, value: [REMOTE_DESKTOP_CAPABILITY] });
+    if (!parsed.ok) throw new Error('legacy capability fixture did not parse');
+    const f = fixture({
+      access: {
+        ...validAccess(),
+        controlled_capabilities: parsed.value,
+      },
+    });
+    await f.router.handleBrowser(f.browserA, 'owner-user', start);
+    expect(f.messages(f.browserA)[0]).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      requestId,
+    });
+    expect(f.daemonMessages).toHaveLength(1);
+  });
+
+  it('stamps authorization with the Server clock so peers can read its deadlines', async () => {
+    const f = fixture({ access: daemonHostAccess() });
+    const before = Date.now();
+    await f.router.handleBrowser(f.browserA, 'owner-user', start);
+    const after = Date.now();
+    const authority = f.messages(f.browserA)[0] as { serverTime?: unknown; expiresAt?: unknown };
+    expect(typeof authority.serverTime).toBe('number');
+    expect(authority.serverTime as number).toBeGreaterThanOrEqual(before);
+    expect(authority.serverTime as number).toBeLessThanOrEqual(after);
+    // The deadline is on the same clock as the stamp, so its distance is exact.
+    expect((authority.expiresAt as number) - (authority.serverTime as number)).toBeGreaterThan(0);
   });
 
   it('admits a normal Windows daemon whose controlled-node columns are unset', async () => {
@@ -603,6 +1188,10 @@ describe('RemoteDesktopRouter', () => {
         inputEpoch: 1,
         state: REMOTE_DESKTOP_STATE.DIRECT,
         route: 'direct',
+        peerConnected: true,
+        dataChannelsReady: true,
+        mediaStarted: true,
+        firstFramePresented: true,
         inputEnabled: true,
       }, 7)).toBe(true);
     }
@@ -805,6 +1394,10 @@ describe('RemoteDesktopRouter', () => {
         inputEpoch: 1,
         state: REMOTE_DESKTOP_STATE.DIRECT,
         route: 'direct',
+        peerConnected: true,
+        dataChannelsReady: true,
+        mediaStarted: true,
+        firstFramePresented: true,
         inputEnabled: false,
       }, 7);
 
@@ -862,21 +1455,26 @@ describe('RemoteDesktopRouter', () => {
     }
   });
 
-  it('tears down on daemon replacement, browser close, and malformed current-generation frames', async () => {
+  it('suspends on daemon replacement and still tears down malformed frames', async () => {
     const replaced = fixture();
     const firstAuthority = await authorize(replaced);
     replaced.setGeneration(8);
+    expect(replaced.router.stats().active).toBe(1);
+    await replaced.router.handleBrowser(replaced.browserA, 'owner-user', {
+      type: REMOTE_DESKTOP_MSG.OFFER,
+      ...firstAuthority,
+      sdp: 'must-not-cross-suspended-generation',
+    });
+    expect(replaced.messages(replaced.browserA).at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.ERROR,
+      error: REMOTE_DESKTOP_ERROR.INVALID_AUTHORITY,
+    });
+    expect(replaced.daemonMessages).toHaveLength(1);
+    await expect(replaced.router.reconcileDaemonReplacement(8)).resolves.toBe(0);
     expect(replaced.messages(replaced.browserA).at(-1)).toMatchObject({
       type: REMOTE_DESKTOP_MSG.TERMINAL,
-      ...firstAuthority,
       reason: REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED,
     });
-
-    const disconnected = fixture();
-    const secondAuthority = await authorize(disconnected);
-    disconnected.router.dropSocket(disconnected.browserA);
-    expect(disconnected.daemonMessages.at(-1)).toMatchObject({ type: REMOTE_DESKTOP_MSG.STOP, ...secondAuthority });
-    expect(disconnected.router.stats().active).toBe(0);
 
     const malformed = fixture();
     const thirdAuthority = await authorize(malformed);
@@ -894,6 +1492,137 @@ describe('RemoteDesktopRouter', () => {
       ...thirdAuthority,
       reason: REMOTE_DESKTOP_TERMINAL_REASON.PROTOCOL_ERROR,
     });
+  });
+
+  it('keeps a dropped browser route inert and resumes it on the exact authority', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1_800_000_000_000);
+      const f = fixture({ access: validAccess(Date.now()) });
+      const authority = await authorize(f);
+      const daemonBeforeDrop = f.daemonMessages.length;
+
+      f.router.dropSocket(f.browserA);
+
+      expect(f.router.stats().active).toBe(1);
+      expect(f.router.stats().controlling).toBe(0);
+      expect(f.daemonMessages).toHaveLength(daemonBeforeDrop + 1);
+      expect(f.daemonMessages.at(-1)).toMatchObject({
+        type: REMOTE_DESKTOP_MSG.MODE_STATE,
+        ...authority,
+        mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+        inputEpoch: 2,
+      });
+      expect(f.daemonMessages.at(-1)?.type).not.toBe(REMOTE_DESKTOP_MSG.STOP);
+
+      await f.router.handleBrowser(f.browserB, 'owner-user', {
+        type: REMOTE_DESKTOP_MSG.RESUME,
+        protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+        ...authority,
+      });
+
+      expect(f.messages(f.browserB).at(-1)).toMatchObject({
+        type: REMOTE_DESKTOP_MSG.RESUMED,
+        ...authority,
+        daemonGeneration: 7,
+        inputEpoch: 2,
+      });
+      expect(f.router.stats().active).toBe(1);
+      expect(f.router.stats().controlling).toBe(1);
+
+      const browserC = {} as WebSocket;
+      await f.router.handleBrowser(browserC, 'owner-user', {
+        type: REMOTE_DESKTOP_MSG.RESUME,
+        protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+        ...authority,
+      });
+      expect(f.messages(browserC).at(-1)).toMatchObject({
+        type: REMOTE_DESKTOP_MSG.ERROR,
+        error: REMOTE_DESKTOP_ERROR.INVALID_AUTHORITY,
+      });
+
+      const daemonBeforeOldSocket = f.daemonMessages.length;
+      await f.router.handleBrowser(f.browserA, 'owner-user', {
+        type: REMOTE_DESKTOP_MSG.OFFER,
+        ...authority,
+        sdp: 'v=0\r\na=stale-old-socket',
+      });
+      expect(f.daemonMessages).toHaveLength(daemonBeforeOldSocket);
+
+      await f.router.handleBrowser(f.browserB, 'owner-user', {
+        type: REMOTE_DESKTOP_MSG.OFFER,
+        ...authority,
+        sdp: 'v=0\r\na=resume-ice-restart',
+      });
+      expect(f.daemonMessages.at(-1)).toMatchObject({
+        type: REMOTE_DESKTOP_MSG.OFFER,
+        sdp: expect.stringContaining('resume-ice-restart'),
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('expires an unresumed browser route after the bounded signaling grace', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1_800_000_000_000);
+      const f = fixture({
+        // Keep presence independently fresh so this test isolates the browser
+        // signaling grace rather than the shorter host-heartbeat policy.
+        access: validAccess(Date.now() + REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_GRACE_MS),
+      });
+      const authority = await authorize(f);
+      expect(REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_GRACE_MS).toBe(5 * 60_000);
+      f.router.handleDaemon({
+        type: REMOTE_DESKTOP_MSG.STATUS,
+        ...authority,
+        mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+        inputEpoch: 1,
+        state: REMOTE_DESKTOP_STATE.DIRECT,
+        route: 'direct',
+        peerConnected: true,
+        dataChannelsReady: true,
+        mediaStarted: true,
+        firstFramePresented: true,
+        inputEnabled: true,
+      }, 7);
+
+      f.router.dropSocket(f.browserA);
+      await vi.advanceTimersByTimeAsync(REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_GRACE_MS - 1);
+      expect(f.router.stats().active).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(f.router.stats().active).toBe(0);
+      expect(f.daemonMessages.at(-1)).toMatchObject({
+        type: REMOTE_DESKTOP_MSG.STOP,
+        ...authority,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('refuses resume when durable account authority was revoked during the outage', async () => {
+    const f = fixture();
+    const authority = await authorize(f);
+    f.router.dropSocket(f.browserA);
+    f.setAccess(null);
+
+    await f.router.handleBrowser(f.browserB, 'owner-user', {
+      type: REMOTE_DESKTOP_MSG.RESUME,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      ...authority,
+    });
+
+    expect(f.router.stats().active).toBe(0);
+    expect(f.daemonMessages.at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.STOP,
+      ...authority,
+    });
+    expect(f.messages(f.browserB).some((message) => (
+      message.type === REMOTE_DESKTOP_MSG.RESUMED
+    ))).toBe(false);
   });
 
   it('enforces bounded ICE candidates and idempotent client Stop', async () => {
@@ -915,6 +1644,7 @@ describe('RemoteDesktopRouter', () => {
     await f.router.handleBrowser(f.browserA, 'owner-user', {
       type: REMOTE_DESKTOP_MSG.STOP,
       ...authority,
+      stopOrigin: REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE,
     });
     expect(f.daemonMessages.filter((message) => message.type === REMOTE_DESKTOP_MSG.STOP)).toHaveLength(stoppedCount);
   });
@@ -936,5 +1666,69 @@ describe('RemoteDesktopRouter', () => {
       reason: REMOTE_DESKTOP_TERMINAL_REASON.PROTOCOL_ERROR,
     });
     expect(f.router.stats().active).toBe(0);
+  });
+});
+
+/**
+ * The same production environment, the other surface. Remote desktop consumes
+ * the identical authority through the identical bridge hook, so the STUN-only
+ * downgrade broke it the same way and at the same stage: prepare_ready and an
+ * SDP answer, then nothing to nominate.
+ */
+const PRODUCTION_TURN_ENV = {
+  TURN_ENABLED: 'true',
+  TURN_HOST: 'im.zhinet.work',
+  TURN_PORT: '3480',
+  TURN_EXTERNAL_IP: '43.248.99.95',
+  TURN_SHARED_SECRET: 'x'.repeat(64),
+  TURN_CREDENTIAL_TTL_SECONDS: '86400',
+  TURN_RELAY_MIN_PORT: '49201',
+  TURN_RELAY_MAX_PORT: '50200',
+} as const;
+
+describe('a relay-required remote desktop receives real relay material', () => {
+  it('carries UDP + TCP TURN from the production relay range to daemon and browser', async () => {
+    const f = fixture({ turnEnv: PRODUCTION_TURN_ENV });
+    await authorize(f);
+
+    const relayUrls = (servers: readonly unknown[]): string[] => servers
+      .filter((entry): entry is { urls: string[] } => typeof entry === 'object' && entry !== null)
+      .flatMap((entry) => entry.urls)
+      .filter((url) => url.startsWith('turn:') || url.startsWith('turns:'));
+
+    const prepare = f.daemonMessages.find((message) => message.type === REMOTE_DESKTOP_MSG.PREPARE)!;
+    expect(relayUrls(prepare.iceServers as unknown[])).toEqual([
+      'turn:im.zhinet.work:3480?transport=udp',
+      'turn:im.zhinet.work:3480?transport=tcp',
+    ]);
+    const authorized = f.messages(f.browserA).find((message) => (
+      message.type === REMOTE_DESKTOP_MSG.AUTHORIZED
+    ))!;
+    expect(relayUrls(authorized.iceServers as unknown[])).toEqual([
+      'turn:im.zhinet.work:3480?transport=udp',
+      'turn:im.zhinet.work:3480?transport=tcp',
+    ]);
+    expect(JSON.stringify(f.daemonMessages)).not.toContain(PRODUCTION_TURN_ENV.TURN_SHARED_SECRET);
+    // No cap configured: nothing about a cap on either leg.
+    expect(prepare).not.toHaveProperty('relayBitrateCapBps');
+    expect(authorized).not.toHaveProperty('relayBitrateCapBps');
+  });
+
+  it('passes an operator relay cap to capable nodes only, and always tells the browser', async () => {
+    const turnEnv = { ...PRODUCTION_TURN_ENV, TURN_BITRATE_CAP_BPS: '500000' };
+    const capable = fixture({ turnEnv, nodeCapabilities: [REMOTE_DESKTOP_RELAY_CAP_CAPABILITY] });
+    await authorize(capable);
+    expect(capable.daemonMessages.find((message) => message.type === REMOTE_DESKTOP_MSG.PREPARE))
+      .toMatchObject({ relayBitrateCapBps: 500_000 });
+    expect(capable.messages(capable.browserA).find((message) => message.type === REMOTE_DESKTOP_MSG.AUTHORIZED))
+      .toMatchObject({ relayBitrateCapBps: 500_000 });
+
+    // An older node rejects unknown PREPARE keys, so it must not see one.
+    const legacy = fixture({ turnEnv });
+    await authorize(legacy);
+    expect(legacy.daemonMessages.find((message) => message.type === REMOTE_DESKTOP_MSG.PREPARE))
+      .not.toHaveProperty('relayBitrateCapBps');
+    expect(legacy.messages(legacy.browserA).find((message) => message.type === REMOTE_DESKTOP_MSG.AUTHORIZED))
+      .toMatchObject({ relayBitrateCapBps: 500_000 });
   });
 });

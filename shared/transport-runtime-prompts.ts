@@ -38,6 +38,28 @@
  * the canonical builders.
  */
 import { IMCODES_SESSION_ENV } from './imcodes-send.js';
+import { ALIAS_MCP_TOOLS } from './alias-types.js';
+import { MEMORY_MCP_TOOL_NAMES } from './memory-mcp-contracts.js';
+import { VERIFICATION_MACHINE_MCP_TOOLS } from './verification-machine.js';
+
+/**
+ * Prefer evidence from an authorized real machine over a purely textual audit.
+ * This is provider-neutral and session-stable, so it belongs in the shared
+ * system prompt rather than in one SDK adapter or a supervision-only preamble.
+ */
+export const REAL_DEVICE_TESTING_SYSTEM_GUIDANCE = [
+  'REAL-DEVICE TESTING PRIORITY: when suitable authorized real-device testing is available, perform it before audit because it can expose actual code defects quickly.',
+  // How to FIND what is authorized. The guidance used to say "use controlled
+  // nodes when applicable" and "otherwise ask the user" -- with no way to learn
+  // which machines this user and project had already authorized. So a model
+  // that was supposed to verify on the machines configured for it asked the
+  // user instead, and the authorization the user had set up went unused.
+  `Before asking for a machine, call ${VERIFICATION_MACHINE_MCP_TOOLS.LIST} to see the verification machines already authorized for this user and project; use ${VERIFICATION_MACHINE_MCP_TOOLS.VERIFY} on one whose availability matters.`,
+  // Both kinds, not only controlled nodes: the list also carries SSH machines,
+  // which the old wording did not mention at all.
+  `For a controlled_node entry, run commands with ${MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE} against its nodeId; for an ssh entry, resolve its alias with ${ALIAS_MCP_TOOLS.RESOLVE} and connect with that value.`,
+  'Only if no authorized machine fits the operating system or device the change needs, ask the user for that specific authorization.',
+].join(' ');
 
 /**
  * Render the IM.codes session identity block. Includes the exact

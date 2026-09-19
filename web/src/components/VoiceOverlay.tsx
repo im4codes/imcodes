@@ -5,7 +5,7 @@ import * as VoiceInput from './VoiceInput.js';
 interface Props {
   open: boolean;
   onClose: () => void;
-  onSend: (text: string) => void;
+  onSend: (text: string) => 'accepted' | 'pending' | 'rejected';
   initialText?: string;
 }
 
@@ -33,7 +33,13 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
   const autoStartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const setListeningState = useCallback((next: boolean) => {
-    if (next && !openRef.current) return;
+    // stopListening() reports `false` synchronously while the effect is being
+    // cleaned up. Never enqueue hook state once the overlay is closed or
+    // unmounting; the next open initializes both values below.
+    if (!openRef.current) {
+      listeningRef.current = false;
+      return;
+    }
     listeningRef.current = next;
     setListening(next);
   }, []);
@@ -93,7 +99,11 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
       vv?.removeEventListener('resize', onResize);
       VoiceInput.onAudioLevel(null);
       VoiceInput.stopListening();
-      setListeningState(false);
+      // Effect cleanup also runs during unmount. Updating hook state here queues
+      // a Preact render after the component has already left the tree, leaving
+      // its after-paint RAF alive past test/page teardown. Keep the synchronous
+      // ref truthful; the next open initializes both ref and rendered state.
+      listeningRef.current = false;
     };
   }, [open, clearAutoStartTimer, setListeningState]);
 
@@ -184,8 +194,7 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
     sessionTokenRef.current++;
     VoiceInput.stopListening();
     setListeningState(false);
-    onSend(text);
-    onClose();
+    if (onSend(text) === 'accepted') onClose();
   }, [onSend, onClose, setListeningState]);
 
   const handleClose = useCallback(() => {

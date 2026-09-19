@@ -190,12 +190,16 @@ export function SessionPane({
     hasOlderHistory: timelineHasOlderHistory,
     addOptimisticUserMessage,
     markOptimisticFailed,
+    removeOptimisticMessage,
     retryOptimisticMessage,
     loadOlderEvents,
     loadMessageContext,
     forceRefresh: timelineForceRefresh,
   } = useTimeline(sessionName, ws, serverId, {
-    isActiveSession: isActive,
+    // A focused sub-session window owns keyboard/recovery focus while it is
+    // open. Keep this main pane mounted and subscribed, but do not let it join
+    // the same global resume broadcast and double the foreground work.
+    isActiveSession: keyboardActive ?? isActive,
     disableHistory: !hasChatTimeline,
     authoritativeSessionState: session.state,
   });
@@ -471,6 +475,8 @@ export function SessionPane({
           quotaLabel={session.quotaLabel}
           quotaUsageLabel={session.quotaUsageLabel}
           quotaMeta={session.quotaMeta}
+          codexCreditsBalance={session.codexCreditsBalance}
+          codexCreditsUnlimited={session.codexCreditsUnlimited}
           showCost={!!lastCostEvent}
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}
@@ -528,12 +534,14 @@ export function SessionPane({
             addOptimisticUserMessage(text, meta?.commandId, {
               ...(meta?.attachments ? { attachments: meta.attachments } : {}),
               ...(meta?.extra ? { resendExtra: meta.extra } : {}),
+              ...(meta?.queueAppend ? { queueAppend: true } : {}),
             });
             if (meta?.commandId && meta.localFailure) {
               markOptimisticFailed(meta.commandId, meta.localFailure);
             }
             scrollToBottom();
           }}
+          onRemoveOptimisticMessage={removeOptimisticMessage}
           onStopProject={onStopProject}
           onRenameSession={onRenameSession}
           onSettings={onSettings}

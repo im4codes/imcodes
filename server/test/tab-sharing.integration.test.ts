@@ -2,7 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import { Hono } from 'hono';
 import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
-import { createServer, createSubSession, createUser, updateSessionLabel, upsertDbSession } from '../src/db/queries.js';
+import { createServer, createSubSession, createUser, updateSession, updateSessionLabel, updateSubSession, upsertDbSession } from '../src/db/queries.js';
 import {
   createOrUpdateShare,
   deriveShareTransitionKey,
@@ -13,7 +13,7 @@ import {
 } from '../src/db/tab-sharing.js';
 import { tabSharingRoutes } from '../src/routes/tab-sharing.js';
 import { resolveHttpShareAccess, resolveHttpShareAccessForCoveredSession } from '../src/routes/share-http-auth.js';
-import { resolveServerRole } from '../src/security/authorization.js';
+import { resolveServerMembershipRole, resolveServerRole } from '../src/security/authorization.js';
 import { signJwt, verifyJwt } from '../src/security/crypto.js';
 import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
 import { WsBridge } from '../src/ws/bridge.js';
@@ -338,6 +338,55 @@ describe('tab sharing persistence helpers', () => {
 });
 
 describe('tab sharing APIs', () => {
+  it('gives only a server-share participant owner-equivalent operations while re-share stays member-only', async () => {
+    const app = makeApp();
+    const { ownerId, recipientId, outsiderId, serverId, sessionName } = await seedShareTarget();
+    await createOrUpdateShare(db, {
+      id: id('server-participant'),
+      target: { kind: 'server', serverId },
+      targetUserId: recipientId,
+      role: 'participant',
+      createdBy: ownerId,
+      now: Date.now(),
+    });
+
+    expect(await resolveServerMembershipRole(db, serverId, recipientId)).toBe('none');
+    expect(await resolveServerRole(db, serverId, recipientId)).toBe('owner');
+    const operationalShareAccess = await resolveHttpShareAccess(db, {
+      serverId,
+      userId: recipientId,
+      target: { kind: 'main', serverId, sessionName },
+    });
+    expect(operationalShareAccess.membership).toBe('none');
+    expect(operationalShareAccess.shareProvenance).toBe('server');
+    expect(operationalShareAccess.actor).toMatchObject({
+      kind: 'share',
+      effectiveActorRole: 'participant',
+      coverage: { target: { kind: 'main', serverId, sessionName } },
+    });
+
+    const reshared = await app.request(`/api/server/${serverId}/shares`, {
+      method: 'POST',
+      headers: authHeaders(recipientId),
+      body: JSON.stringify({
+        target: { kind: 'main', serverId, sessionName },
+        targetUserId: outsiderId,
+        role: 'participant',
+      }),
+    });
+    expect(reshared.status).toBe(403);
+
+    await createOrUpdateShare(db, {
+      id: id('session-participant'),
+      target: { kind: 'main', serverId, sessionName },
+      targetUserId: outsiderId,
+      role: 'participant',
+      createdBy: ownerId,
+      now: Date.now(),
+    });
+    expect(await resolveServerRole(db, serverId, outsiderId)).toBe('none');
+  });
+
   it('enforces manager-only creation, self-share rejection, and sub-session normalization', async () => {
     const app = makeApp();
     const { ownerId, recipientId, outsiderId, serverId, subSessionId } = await seedShareTarget();
@@ -733,6 +782,29 @@ describe('tab sharing APIs', () => {
   it('keeps manager and recipient share metadata minimized and shape-separated', async () => {
     const app = makeApp();
     const { ownerId, recipientId, serverId, sessionName, subSessionId } = await seedShareTarget();
+    await updateSession(db, serverId, sessionName, {
+      transport_config: {
+        provider: { privateToken: 'must-not-leak' },
+        supervision: {
+          mode: 'supervised_audit',
+          backend: 'codex-sdk',
+          model: 'gpt-5.6-sol',
+          timeoutMs: 30_000,
+          promptVersion: 'supervision_decision_v1',
+          maxParseRetries: 1,
+          maxAutoContinueStreak: 2,
+          maxAutoContinueTotal: 0,
+          maxAuditLoops: 2,
+          taskRunPromptVersion: 'task_run_status_v1',
+        },
+      },
+    });
+    await updateSubSession(db, subSessionId, serverId, {
+      transport_config: {
+        provider: { privateToken: 'must-not-leak-sub' },
+        supervision: { mode: 'supervised' },
+      },
+    });
     await db.execute(
       'UPDATE users SET username = $1, display_name = $2, password_hash = $3 WHERE id = $4',
       [`recipient_${recipientId}`, 'Shared Recipient', 'secret-hash', recipientId],
@@ -833,6 +905,7 @@ describe('tab sharing APIs', () => {
           state: 'idle',
           agentType: 'codex',
           activeDispatchId: 'dispatch-main-1',
+          supervisionMode: 'supervised_audit',
         },
       ],
       subSessions: [
@@ -843,9 +916,12 @@ describe('tab sharing APIs', () => {
           type: 'codex',
           parentSessionName: sessionName,
           activeDispatchId: 'dispatch-sub-1',
+          supervisionMode: 'supervised',
         },
       ],
     });
+    expect((openBody.sessions as Array<Record<string, unknown>>)[0]).not.toHaveProperty('transportConfig');
+    expect((openBody.subSessions as Array<Record<string, unknown>>)[0]).not.toHaveProperty('transportConfig');
     expect(openBody).not.toHaveProperty('shares');
     expect(openBody).not.toHaveProperty('targetUser');
     expect(openBody).not.toHaveProperty('createdBy');

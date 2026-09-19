@@ -20,6 +20,19 @@ export interface AttachmentRef {
   downloadable: boolean;
 }
 
+/**
+ * Filesystem identity of a controlled-node download source. This is carried
+ * only on the authenticated machine-transfer control path; it is deliberately
+ * separate from AttachmentRef so ordinary chat attachments do not expose host
+ * filesystem metadata.
+ */
+export interface FileTransferSourceIdentity {
+  size: number;
+  mtimeMs: number;
+  device: number;
+  inode: number;
+}
+
 export type PreviewType = 'text' | 'image' | 'pdf' | 'unsupported';
 export type PreviewReason = 'too_large' | 'binary' | 'unknown_type' | 'render_failed';
 
@@ -73,14 +86,125 @@ export const FILE_TRANSFER_LIMITS = {
 export const FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY = 'file.transfer.upload_fetch.v1' as const;
 export const FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY = 'file.transfer.download_stream.v1' as const;
 export const FILE_TRANSFER_PATH_HANDLE_CAPABILITY = 'file.transfer.path_handle.v1' as const;
+
+/** Headers on the node's relay PUT (node -> server staged download sink). */
+export const FILE_TRANSFER_RELAY_HEADER = {
+  FILENAME: 'x-imcodes-filename',
+  /** Byte the PUT body starts at; absent means the whole file. */
+  OFFSET: 'x-imcodes-offset',
+} as const;
+
+export const FILE_TRANSFER_HTTP_HEADER = {
+  RANGE: 'range',
+  CONTENT_RANGE: 'content-range',
+  ACCEPT_RANGES: 'Accept-Ranges',
+} as const;
+
+/** Browser -> Server resumable upload multipart fields. */
+export const FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD = {
+  FILE: 'file',
+  CLIENT_UPLOAD_ID: 'clientUploadId',
+  DESTINATION_DIRECTORY: 'destinationDirectory',
+  OFFSET: 'uploadOffset',
+  TOTAL_SIZE: 'uploadTotalSize',
+  ORIGINAL_NAME: 'uploadOriginalName',
+  LAST_MODIFIED: 'uploadLastModified',
+} as const;
+
+export const FILE_TRANSFER_RESUMABLE_UPLOAD = {
+  /** Keeps multipart overhead bounded while avoiding hundreds of round trips. */
+  CHUNK_BYTES: 8 * 1024 * 1024,
+  MAX_ATTEMPTS_WITHOUT_PROGRESS: 5,
+  RETRY_BACKOFF_MS: [500, 1_000, 2_000, 4_000, 8_000] as const,
+} as const;
+
+export const FILE_TRANSFER_RESUMABLE_UPLOAD_ERROR = {
+  IDENTITY_MISMATCH: 'upload_identity_mismatch',
+  CONTENT_MISMATCH: 'upload_content_mismatch',
+  EXPIRED: 'upload_expired',
+} as const;
+
+export const FILE_TRANSFER_DOWNLOAD_RESUME = {
+  MAX_ATTEMPTS_WITHOUT_PROGRESS: 4,
+  MAX_RESUMES: 40,
+  BACKOFF_MS: [1_000, 2_000, 4_000, 8_000] as const,
+  /** Native download managers may spend one request per Range retry. */
+  TOKEN_MAX_USES: 42,
+} as const;
+
+/**
+ * HTTP resume of an attachment download. Only the one shape the browser sends
+ * is understood -- an open-ended `bytes=N-`. Anything else is ignored and the
+ * whole file is served, which RFC 9110 allows.
+ */
+export function formatFileTransferRangeRequest(offset: number): string {
+  return `bytes=${offset}-`;
+}
+
+export function parseFileTransferRangeRequest(header: string | null | undefined): number {
+  const match = /^bytes=(\d{1,16})-$/.exec((header ?? '').trim());
+  if (!match) return 0;
+  const offset = Number(match[1]);
+  return Number.isSafeInteger(offset) ? offset : 0;
+}
+
+export function formatFileTransferContentRange(start: number, total: number): string {
+  return `bytes ${start}-${total - 1}/${total}`;
+}
+
+export function parseFileTransferContentRange(
+  header: string | null | undefined,
+): { start: number; end: number; total: number } | null {
+  const match = /^bytes (\d{1,16})-(\d{1,16})\/(\d{1,16})$/.exec((header ?? '').trim());
+  if (!match) return null;
+  const [start, end, total] = [Number(match[1]), Number(match[2]), Number(match[3])];
+  if (![start, end, total].every(Number.isSafeInteger) || start > end || end >= total) return null;
+  return { start, end, total };
+}
 export const FILE_TRANSFER_DIRECTORY_CAPABILITY = 'file.transfer.directory.v1' as const;
 export const FILE_TRANSFER_PATH_MAX_BYTES = 4 * 1024;
 export const FILE_TRANSFER_ERROR_MAX_BYTES = 256;
 export const FILE_TRANSFER_DIRECTORY_MAX_ENTRIES = 512;
+/**
+ * Sentinel paths the daemon resolves on the REMOTE machine's behalf.
+ *
+ * Only the daemon knows where these actually live: `Downloads` may have been
+ * redirected on Windows, and on Linux it is whatever `user-dirs.dirs` says --
+ * possibly localized ("Téléchargements"). So the browser asks by NAME and the
+ * daemon answers with the real path in `resolvedPath`.
+ *
+ * They ride in the existing `path` field on purpose. `validateFileDirectoryListRequest`
+ * enforces `hasOnlyKeys(['type','requestId','path'])` and the server route
+ * re-checks the same key set, so a new request field would be a breaking change
+ * across three layers; a new sentinel value is not. `:drives:` already
+ * established the pattern.
+ */
 export const FILE_TRANSFER_DIRECTORY_PATH = {
   WINDOWS_DRIVES: ':drives:',
   WINDOWS_DRIVES_ROOT: '__imcodes_windows_drives__',
+  HOME: ':home:',
+  DESKTOP: ':desktop:',
+  DOWNLOADS: ':downloads:',
+  DOCUMENTS: ':documents:',
 } as const;
+
+/** The sentinels that resolve to a well-known user directory. */
+export const FILE_TRANSFER_WELL_KNOWN_DIRECTORY_PATHS = [
+  FILE_TRANSFER_DIRECTORY_PATH.HOME,
+  FILE_TRANSFER_DIRECTORY_PATH.DESKTOP,
+  FILE_TRANSFER_DIRECTORY_PATH.DOWNLOADS,
+  FILE_TRANSFER_DIRECTORY_PATH.DOCUMENTS,
+] as const;
+
+export type FileTransferWellKnownDirectoryPath =
+  (typeof FILE_TRANSFER_WELL_KNOWN_DIRECTORY_PATHS)[number];
+
+export function isFileTransferWellKnownDirectoryPath(
+  value: unknown,
+): value is FileTransferWellKnownDirectoryPath {
+  return typeof value === 'string'
+    && (FILE_TRANSFER_WELL_KNOWN_DIRECTORY_PATHS as readonly string[]).includes(value);
+}
 
 /** Machine-readable upload-error codes shared by the daemon (producer), server
  *  (relay) and web (localized display). */
@@ -110,6 +234,11 @@ export const FILE_TRANSFER_MSG = {
   DELETE: 'file.delete_attachment',
   DELETE_DONE: 'file.delete_attachment_done',
   DELETE_ERROR: 'file.delete_attachment_error',
+  /** Server -> controlled node: reveal the native Full Disk Access settings
+   *  pane, macOS only. See `MACOS_OPEN_FULL_DISK_ACCESS_ERROR`. */
+  MACOS_OPEN_FULL_DISK_ACCESS: 'file.macos_open_full_disk_access',
+  MACOS_OPEN_FULL_DISK_ACCESS_DONE: 'file.macos_open_full_disk_access_done',
+  MACOS_OPEN_FULL_DISK_ACCESS_ERROR: 'file.macos_open_full_disk_access_error',
 } as const;
 
 export const FILE_TRANSFER_DELETE_ERROR = {
@@ -129,6 +258,38 @@ export const FILE_PATH_HANDLE_ERROR = {
 } as const;
 
 export type FilePathHandleErrorReason = typeof FILE_PATH_HANDLE_ERROR[keyof typeof FILE_PATH_HANDLE_ERROR];
+
+/**
+ * Machine-readable `file.directory_list_error` codes shared by the daemon
+ * (producer), server (relay) and web (localized display + remediation UI).
+ * Generic failures (not found, forbidden, timeout, ...) ride as free-form
+ * strings already; this is only for reasons the web needs to react to
+ * specifically rather than just display.
+ */
+export const FILE_TRANSFER_DIRECTORY_LIST_ERROR = {
+  /**
+   * macOS denied access to a well-known user folder (Desktop/Downloads/
+   * Documents) because the daemon binary lacks Full Disk Access. The web
+   * client shows a persistent prompt with a button that asks the daemon to
+   * open the native Full Disk Access settings pane, instead of silently
+   * falling back to the home directory.
+   */
+  MACOS_FULL_DISK_ACCESS_REQUIRED: 'macos_full_disk_access_required',
+} as const;
+
+export type FileTransferDirectoryListErrorReason =
+  typeof FILE_TRANSFER_DIRECTORY_LIST_ERROR[keyof typeof FILE_TRANSFER_DIRECTORY_LIST_ERROR];
+
+/** Why the daemon could not reveal the native Full Disk Access settings pane. */
+export const MACOS_OPEN_FULL_DISK_ACCESS_ERROR = {
+  /** The controlled node is not running on macOS. */
+  UNSUPPORTED_PLATFORM: 'unsupported_platform',
+  /** No signed-in Aqua console user to open System Settings in front of. */
+  NO_ACTIVE_GUI_SESSION: 'no_active_gui_session',
+} as const;
+
+export type MacosOpenFullDiskAccessErrorReason =
+  typeof MACOS_OPEN_FULL_DISK_ACCESS_ERROR[keyof typeof MACOS_OPEN_FULL_DISK_ACCESS_ERROR];
 
 export interface FileUploadRequest {
   type: 'file.upload';
@@ -169,6 +330,8 @@ export interface FileDownloadStreamRequest {
   downloadId: string;
   attachmentId: string;
   uploadUrl: string;
+  /** Resume an interrupted HTTP download from this byte. */
+  offset?: number;
 }
 
 /** Server -> controlled node: mint a short-lived handle for one explicit path. */
@@ -187,8 +350,22 @@ export interface FileDirectoryListRequest {
 export interface FileDirectoryEntry {
   name: string;
   path: string;
-  isDir: true;
+  isDir: boolean;
   hidden: boolean;
+  /**
+   * Capacity of the filesystem this entry sits on, when the daemon could
+   * measure it. Only populated for volume roots -- a per-file `statfs` on a
+   * 512-entry listing would be 512 syscalls for a number that is the same for
+   * every one of them.
+   */
+  totalBytes?: number;
+  freeBytes?: number;
+}
+
+/** Non-negative, finite, and small enough to be a real byte count. */
+function isByteCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    && value <= Number.MAX_SAFE_INTEGER;
 }
 
 export interface FileDirectoryListDone {
@@ -209,6 +386,17 @@ export interface FileDeleteRequest {
   type: typeof FILE_TRANSFER_MSG.DELETE;
   requestId: string;
   attachmentId: string;
+}
+
+/**
+ * Server -> controlled node: reveal the native Full Disk Access settings
+ * pane in the signed-in user's own session, macOS only. Issued after a
+ * `file.directory_list_error` carrying
+ * `FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED`.
+ */
+export interface MacosOpenFullDiskAccessRequest {
+  type: typeof FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS;
+  requestId: string;
 }
 
 // ── Daemon → Server messages ──────────────────────────────────────────────────
@@ -248,7 +436,10 @@ export interface FileDownloadStreamReady {
   downloadId: string;
   mime?: string;
   filename?: string;
+  /** Size of the whole file, even when streaming from an offset. */
   size?: number;
+  /** The offset the stream actually starts at; absent means 0. */
+  offset?: number;
 }
 
 export interface FileDownloadError {
@@ -261,6 +452,8 @@ export interface FilePathHandleDone {
   type: typeof FILE_TRANSFER_MSG.PATH_HANDLE_DONE;
   requestId: string;
   attachment: AttachmentRef;
+  /** Required by machine-file callers before reusing a durable partial. */
+  sourceIdentity?: FileTransferSourceIdentity;
 }
 
 export interface FilePathHandleError {
@@ -272,6 +465,18 @@ export interface FilePathHandleError {
 export interface FileDeleteDone {
   type: typeof FILE_TRANSFER_MSG.DELETE_DONE;
   requestId: string;
+}
+
+/** The settings pane was told to open. Not proof the user granted access. */
+export interface MacosOpenFullDiskAccessDone {
+  type: typeof FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS_DONE;
+  requestId: string;
+}
+
+export interface MacosOpenFullDiskAccessError {
+  type: typeof FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS_ERROR;
+  requestId: string;
+  error: MacosOpenFullDiskAccessErrorReason;
 }
 
 export interface FileDeleteError {
@@ -292,7 +497,9 @@ export type FileTransferDaemonMessage =
   | FileDirectoryListDone
   | FileDirectoryListError
   | FileDeleteDone
-  | FileDeleteError;
+  | FileDeleteError
+  | MacosOpenFullDiskAccessDone
+  | MacosOpenFullDiskAccessError;
 
 export type FileTransferServerMessage =
   | FileUploadRequest
@@ -301,7 +508,8 @@ export type FileTransferServerMessage =
   | FileDownloadStreamRequest
   | FilePathHandleRequest
   | FileDirectoryListRequest
-  | FileDeleteRequest;
+  | FileDeleteRequest
+  | MacosOpenFullDiskAccessRequest;
 
 export type ControlledFileTransferResponse =
   | FileUploadDone
@@ -315,7 +523,9 @@ export type ControlledFileTransferResponse =
   | FileDirectoryListDone
   | FileDirectoryListError
   | FileDeleteDone
-  | FileDeleteError;
+  | FileDeleteError
+  | MacosOpenFullDiskAccessDone
+  | MacosOpenFullDiskAccessError;
 
 export type ControlledFileTransferRequest =
   | FileUploadFetchRequest
@@ -323,7 +533,8 @@ export type ControlledFileTransferRequest =
   | FileDownloadStreamRequest
   | FilePathHandleRequest
   | FileDirectoryListRequest
-  | FileDeleteRequest;
+  | FileDeleteRequest
+  | MacosOpenFullDiskAccessRequest;
 
 export type FileTransferValidationResult<T> =
   | { ok: true; value: T }
@@ -342,6 +553,18 @@ function utf8Bytes(value: string): number {
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+export function validateFileTransferSourceIdentity(value: unknown): FileTransferSourceIdentity | null {
+  if (!isObject(value)
+    || !hasOnlyKeys(value, new Set(['size', 'mtimeMs', 'device', 'inode']))
+    || !isSafeSize(value.size)
+    || typeof value.mtimeMs !== 'number' || !Number.isFinite(value.mtimeMs) || value.mtimeMs < 0
+    || typeof value.device !== 'number' || !Number.isSafeInteger(value.device) || value.device < 0
+    || typeof value.inode !== 'number' || !Number.isSafeInteger(value.inode) || value.inode < 0) {
+    return null;
+  }
+  return value as unknown as FileTransferSourceIdentity;
 }
 
 function hasOnlyKeys(value: Record<string, unknown>, allowed: ReadonlySet<string>): boolean {
@@ -411,6 +634,16 @@ export function validateFileDeleteRequest(value: unknown): FileTransferValidatio
   return { ok: true, value: value as unknown as FileDeleteRequest };
 }
 
+export function validateMacosOpenFullDiskAccessRequest(
+  value: unknown,
+): FileTransferValidationResult<MacosOpenFullDiskAccessRequest> {
+  if (!isObject(value)) return { ok: false, error: 'invalid_object' };
+  if (!hasOnlyKeys(value, new Set(['type', 'requestId']))) return { ok: false, error: 'unknown_field' };
+  if (value.type !== FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS) return { ok: false, error: 'invalid_type' };
+  if (!isTransferId(value.requestId)) return { ok: false, error: 'invalid_request_id' };
+  return { ok: true, value: value as unknown as MacosOpenFullDiskAccessRequest };
+}
+
 /** Strict validator for the bounded file controls accepted by the thin node. */
 export function validateControlledFileTransferRequest(
   value: unknown,
@@ -419,6 +652,7 @@ export function validateControlledFileTransferRequest(
   if (value.type === FILE_TRANSFER_MSG.PATH_HANDLE) return validateFilePathHandleRequest(value);
   if (value.type === FILE_TRANSFER_MSG.DIRECTORY_LIST) return validateFileDirectoryListRequest(value);
   if (value.type === FILE_TRANSFER_MSG.DELETE) return validateFileDeleteRequest(value);
+  if (value.type === FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS) return validateMacosOpenFullDiskAccessRequest(value);
   if (value.type === 'file.upload_fetch') {
     if (!hasOnlyKeys(value, new Set(['type', 'uploadId', 'filename', 'originalName', 'mime', 'size', 'downloadUrl', 'clientUploadId', 'destinationDirectory']))
       || !isTransferId(value.uploadId)
@@ -441,9 +675,10 @@ export function validateControlledFileTransferRequest(
     return { ok: true, value: value as unknown as FileDownloadRequest };
   }
   if (value.type === FILE_TRANSFER_MSG.DOWNLOAD_STREAM) {
-    if (!hasOnlyKeys(value, new Set(['type', 'downloadId', 'attachmentId', 'uploadUrl']))
+    if (!hasOnlyKeys(value, new Set(['type', 'downloadId', 'attachmentId', 'uploadUrl', 'offset']))
       || !isTransferId(value.downloadId) || !isTransferId(value.attachmentId)
-      || !isBoundedString(value.uploadUrl, 8192)) {
+      || !isBoundedString(value.uploadUrl, 8192)
+      || (value.offset !== undefined && !isSafeSize(value.offset))) {
       return { ok: false, error: 'invalid_download_stream' };
     }
     return { ok: true, value: value as unknown as FileDownloadStreamRequest };
@@ -489,11 +724,14 @@ export function validateControlledFileTransferResponse(
     return { ok: true, value: v as unknown as FileDownloadDone };
   }
   if (v.type === FILE_TRANSFER_MSG.DOWNLOAD_STREAM_READY) {
-    if (!hasOnlyKeys(v, new Set(['type', 'downloadId', 'mime', 'filename', 'size']))
+    if (!hasOnlyKeys(v, new Set(['type', 'downloadId', 'mime', 'filename', 'size', 'offset']))
       || !isTransferId(v.downloadId)
       || (v.mime !== undefined && !isBoundedString(v.mime, 256))
       || (v.filename !== undefined && !isBoundedString(v.filename, 1024))
-      || (v.size !== undefined && !isSafeSize(v.size))) return { ok: false, error: 'invalid_download_ready' };
+      || (v.size !== undefined && !isSafeSize(v.size))
+      || (v.offset !== undefined && (!isSafeSize(v.offset) || v.size === undefined || v.offset > v.size))) {
+      return { ok: false, error: 'invalid_download_ready' };
+    }
     return { ok: true, value: v as unknown as FileDownloadStreamReady };
   }
   if (v.type === 'file.download_error') {
@@ -504,9 +742,21 @@ export function validateControlledFileTransferResponse(
   }
   if (v.type === FILE_TRANSFER_MSG.PATH_HANDLE_DONE) {
     const attachment = validateAttachmentRef(v.attachment);
-    if (!hasOnlyKeys(v, new Set(['type', 'requestId', 'attachment']))
-      || !isTransferId(v.requestId) || !attachment) return { ok: false, error: 'invalid_path_handle_done' };
-    return { ok: true, value: { type: v.type, requestId: v.requestId, attachment } };
+    const sourceIdentity = v.sourceIdentity === undefined
+      ? undefined
+      : validateFileTransferSourceIdentity(v.sourceIdentity);
+    if (!hasOnlyKeys(v, new Set(['type', 'requestId', 'attachment', 'sourceIdentity']))
+      || !isTransferId(v.requestId) || !attachment
+      || (v.sourceIdentity !== undefined && !sourceIdentity)) return { ok: false, error: 'invalid_path_handle_done' };
+    return {
+      ok: true,
+      value: {
+        type: v.type,
+        requestId: v.requestId,
+        attachment,
+        ...(sourceIdentity ? { sourceIdentity } : {}),
+      },
+    };
   }
   if (v.type === FILE_TRANSFER_MSG.PATH_HANDLE_ERROR) {
     const errors = new Set<string>(Object.values(FILE_PATH_HANDLE_ERROR));
@@ -528,14 +778,25 @@ export function validateControlledFileTransferResponse(
     const entries: FileDirectoryEntry[] = [];
     for (const entry of v.entries) {
       if (!isObject(entry)
-        || !hasOnlyKeys(entry, new Set(['name', 'path', 'isDir', 'hidden']))
+        || !hasOnlyKeys(entry, new Set(['name', 'path', 'isDir', 'hidden', 'totalBytes', 'freeBytes']))
         || !isBoundedString(entry.name, 1024)
         || !isBoundedString(entry.path, FILE_TRANSFER_PATH_MAX_BYTES)
-        || entry.isDir !== true
-        || typeof entry.hidden !== 'boolean') {
+        || typeof entry.isDir !== 'boolean'
+        || typeof entry.hidden !== 'boolean'
+        || (entry.totalBytes !== undefined && !isByteCount(entry.totalBytes))
+        || (entry.freeBytes !== undefined && !isByteCount(entry.freeBytes))) {
         return { ok: false, error: 'invalid_directory_entry' };
       }
-      entries.push(entry as unknown as FileDirectoryEntry);
+      // Rebuilt field by field, so anything not listed here is dropped rather
+      // than forwarded; the capacity fields have to be carried explicitly.
+      entries.push({
+        name: entry.name,
+        path: entry.path,
+        isDir: entry.isDir,
+        hidden: entry.hidden,
+        ...(entry.totalBytes !== undefined ? { totalBytes: entry.totalBytes } : {}),
+        ...(entry.freeBytes !== undefined ? { freeBytes: entry.freeBytes } : {}),
+      } as FileDirectoryEntry);
     }
     return {
       ok: true,
@@ -570,6 +831,20 @@ export function validateControlledFileTransferResponse(
       return { ok: false, error: 'invalid_lifecycle_error' };
     }
     return { ok: true, value: v as unknown as FileDeleteError };
+  }
+  if (v.type === FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS_DONE) {
+    if (!hasOnlyKeys(v, new Set(['type', 'requestId'])) || !isTransferId(v.requestId)) {
+      return { ok: false, error: 'invalid_lifecycle_done' };
+    }
+    return { ok: true, value: v as unknown as MacosOpenFullDiskAccessDone };
+  }
+  if (v.type === FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS_ERROR) {
+    if (!hasOnlyKeys(v, new Set(['type', 'requestId', 'error']))
+      || !isTransferId(v.requestId)
+      || !Object.values(MACOS_OPEN_FULL_DISK_ACCESS_ERROR).includes(v.error as MacosOpenFullDiskAccessErrorReason)) {
+      return { ok: false, error: 'invalid_lifecycle_error' };
+    }
+    return { ok: true, value: v as unknown as MacosOpenFullDiskAccessError };
   }
   return { ok: false, error: 'invalid_type' };
 }

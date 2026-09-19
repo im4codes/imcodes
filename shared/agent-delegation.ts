@@ -1,6 +1,17 @@
+import { AUDIT_CONVERGENCE_ROLES, buildAuditConvergenceContractRef } from './audit-convergence.js';
 import { P2P_ROUTING_FIELDS } from './p2p-routing-fields.js';
 import { isSessionAgentType } from './agent-types.js';
+import { CODEBUDDY_PROVIDER_IDS } from './codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from './hermes-agent.js';
 import { isValidImcodesSessionName } from './session-scope.js';
+import {
+  PEER_AUDIT_ID_MAX_BYTES,
+  PEER_AUDIT_DELEGATED_REPLY_STATUS,
+  PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS,
+  isPeerAuditVerdict,
+  type PeerAuditVerdict,
+} from './peer-audit.js';
+import { SUPERVISION_CONTRACT_IDS } from './supervision-config.js';
 
 export const AGENT_DELEGATION_TARGET_FIELD = 'delegateTarget' as const;
 
@@ -35,11 +46,12 @@ export const AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER = '<imcodes-ag
 export const AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER = '<imcodes-delegation-completed-v1>' as const;
 export const AGENT_DELEGATION_REPLY_TIMELINE_EVENT = 'delegation.reply' as const;
 export const AGENT_DELEGATION_REPLY_VERSION = 'agent_delegation_reply_v1' as const;
+export const AGENT_DELEGATION_SUPERVISION_TASK_PROJECTION_VERSION = 1 as const;
+export const AGENT_DELEGATION_SUPERVISION_TASK_TITLE_MAX_BYTES = 256;
 export const AGENT_DELEGATION_REPLY_TOTAL_BYTES = 64 * 1024;
 export const AGENT_DELEGATION_REPLY_RESULT_BYTES = 48 * 1024;
 export const AGENT_DELEGATION_REPLY_TTL_MS = 24 * 60 * 60_000;
-export const AGENT_DELEGATION_CAPABILITY_MIN_CHARS = 32;
-export const AGENT_DELEGATION_CAPABILITY_MAX_CHARS = 512;
+export const AGENT_DELEGATION_REPLY_MAX_MESSAGES = 64;
 export const AGENT_DELEGATION_ID_MAX_BYTES = 256;
 export const AGENT_DELEGATION_REPLY_ERRORS = {
   OVERSIZE: 'oversize',
@@ -47,7 +59,6 @@ export const AGENT_DELEGATION_REPLY_ERRORS = {
   INVALID_VERSION: 'invalid_version',
   UNKNOWN_FIELD: 'unknown_field',
   INVALID_DELEGATION_ID: 'invalid_delegation_id',
-  INVALID_CAPABILITY: 'invalid_capability',
   INVALID_RESULT: 'invalid_result',
   IDENTITY_MISMATCH: 'identity_mismatch',
   EXPIRED: 'expired',
@@ -62,13 +73,195 @@ export type AgentDelegationReplyError =
 export interface AgentDelegationReplyEnvelope {
   version: typeof AGENT_DELEGATION_REPLY_VERSION;
   delegationId: string;
-  replyCapability: string;
   result: string;
+}
+
+/**
+ * Daemon-authored, browser-safe task identity attached to a delegation reply.
+ *
+ * `title` is optional on purpose. The durable reply record is authoritative for
+ * the ids even when the registry row is unavailable, but task details are only
+ * projected after the daemon has cross-checked the complete binding. Sender
+ * text (including the JSON `result`) is never a title source in the browser.
+ */
+export interface AgentDelegationSupervisionTaskProjection {
+  version: typeof AGENT_DELEGATION_SUPERVISION_TASK_PROJECTION_VERSION;
+  taskId: string;
+  assignmentId: string;
+  attemptId?: string;
+  revision?: string;
+  title?: string;
+}
+
+export interface AgentDelegationPeerAuditCompletionBinding {
+  taskId: string;
+  assignmentId: string;
+  attemptId: string;
+  revision: string;
+  verdict: PeerAuditVerdict;
+}
+
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
+
+function readBoundedId(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.trim();
+  if (!normalized || utf8ByteLength(normalized) > PEER_AUDIT_ID_MAX_BYTES) return undefined;
+  return normalized;
+}
+
+/** Collapse an authoritative registry objective into a concise one-line card title. */
+export function projectAgentDelegationSupervisionTaskTitle(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.replace(/\s+/gu, ' ').trim();
+  if (!normalized) return undefined;
+  if (utf8ByteLength(normalized) <= AGENT_DELEGATION_SUPERVISION_TASK_TITLE_MAX_BYTES) return normalized;
+  let output = '';
+  for (const character of normalized) {
+    const candidate = `${output}${character}`;
+    if (utf8ByteLength(`${candidate}…`) > AGENT_DELEGATION_SUPERVISION_TASK_TITLE_MAX_BYTES) break;
+    output = candidate;
+  }
+  return output ? `${output}…` : undefined;
+}
+
+/** Strictly reads only the daemon-owned top-level timeline projection. */
+export function readAgentDelegationSupervisionTaskProjection(
+  value: unknown,
+): AgentDelegationSupervisionTaskProjection | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (record.version !== AGENT_DELEGATION_SUPERVISION_TASK_PROJECTION_VERSION) return undefined;
+  const taskId = readBoundedId(record.taskId);
+  const assignmentId = readBoundedId(record.assignmentId);
+  if (!taskId || !assignmentId) return undefined;
+  const attemptId = record.attemptId === undefined ? undefined : readBoundedId(record.attemptId);
+  const revision = record.revision === undefined ? undefined : readBoundedId(record.revision);
+  if ((record.attemptId !== undefined && !attemptId) || (record.revision !== undefined && !revision)) {
+    return undefined;
+  }
+  const title = typeof record.title === 'string'
+    && record.title === projectAgentDelegationSupervisionTaskTitle(record.title)
+    ? record.title
+    : undefined;
+  return {
+    version: AGENT_DELEGATION_SUPERVISION_TASK_PROJECTION_VERSION,
+    taskId,
+    assignmentId,
+    ...(attemptId ? { attemptId } : {}),
+    ...(revision ? { revision } : {}),
+    ...(title ? { title } : {}),
+  };
+}
+
+/**
+ * Reads the exact binding from a locally generated peer_audit_completed result.
+ * This never reads a task name/objective: those remain registry-only authority.
+ */
+export function readTrustedAgentDelegationPeerAuditCompletionBinding(
+  value: unknown,
+): AgentDelegationPeerAuditCompletionBinding | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (record.status !== PEER_AUDIT_DELEGATED_REPLY_STATUS || !isPeerAuditVerdict(record.verdict)) return undefined;
+  const taskId = readBoundedId(record.taskId);
+  const assignmentId = readBoundedId(record.assignmentId);
+  const attemptId = readBoundedId(record.attemptId);
+  const revision = readBoundedId(record.revision);
+  if (!taskId || !assignmentId || !attemptId || !revision) return undefined;
+  return { taskId, assignmentId, attemptId, revision, verdict: record.verdict };
+}
+
+/**
+ * Reads only the daemon-decoded, top-level audit verdict projection. Reply
+ * prose and nested metadata are deliberately outside this trust boundary.
+ */
+export function readTrustedAgentDelegationReplyVerdict(value: unknown): PeerAuditVerdict | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (record.status !== PEER_AUDIT_DELEGATED_REPLY_STATUS
+    || !Object.prototype.hasOwnProperty.call(record, 'verdict')
+    || !isPeerAuditVerdict(record.verdict)) return undefined;
+  return record.verdict;
 }
 
 export interface AgentDelegationReplyAuthority {
   delegationId: string;
-  replyCapability: string;
+  /** Present only for a supervision audit; selects the dedicated reply ingress. */
+  audit?: AgentDelegationAuditRequest;
+}
+
+export const AGENT_DELEGATION_BLOCKER_REPORT_FIELDS = [
+  'taskId',
+  'assignmentId',
+  'exactError',
+  'completedSafeWork',
+  'options',
+  'recommendedNextAction',
+] as const;
+
+export const SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS = {
+  WAITING_FOR_BRAIN: 'waiting_for_brain',
+  NEEDS_INPUT: 'needs_input',
+} as const;
+
+export const SUPERVISION_IMPLEMENTATION_NO_PROGRESS_ERROR =
+  'implementation heartbeat completed without durable progress or structured escalation' as const;
+
+/**
+ * A bounded SAME-assignment continuation budget was exhausted without any
+ * daemon-authenticated provider/runtime or lifecycle progress.  This is a
+ * hard failure and may be escalated; a single quiet heartbeat is not.
+ */
+export const SUPERVISION_IMPLEMENTATION_CONTINUATION_EXHAUSTED_ERROR =
+  'implementation continuation budget exhausted without authoritative work activity or structured escalation' as const;
+
+export interface SupervisionBlockerEscalationReport {
+  taskId: string;
+  assignmentId: string;
+  exactError: string;
+  completedSafeWork: string;
+  options: string[];
+  recommendedNextAction: string;
+  blockerFingerprint: string;
+  disposition: (typeof SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS)[keyof typeof SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS];
+  reporter: { label: string; sessionName: string };
+  brain?: { label: string; sessionName: string };
+  missing?: string;
+}
+
+export const AGENT_DELEGATION_CONTRACT_REFS = [SUPERVISION_CONTRACT_IDS.MESSAGING] as const;
+
+export interface AgentDelegationBlockerContext {
+  taskId: string;
+  assignmentId: string;
+}
+
+export const AGENT_DELEGATION_BLOCKER_ESCALATION_PROMPT =
+  JSON.stringify({ contractRefs: AGENT_DELEGATION_CONTRACT_REFS, rule: 'blocker' });
+
+/**
+ * Machine-facing escalation contract for delegated work.
+ *
+ * A child session must not turn a local NEEDS_INPUT/illegal-transition into a
+ * silent wait that is visible only after somebody opens that session. The
+ * daemon-authenticated current-session identity is the return authority to the
+ * coordinating Brain; this instruction pins both durable ids so a report cannot be detached from
+ * the assignment that encountered the blocker.
+ */
+export function buildAgentDelegationBlockerReportInstruction(
+  context: AgentDelegationBlockerContext,
+): string {
+  const taskId = context.taskId.trim();
+  const assignmentId = context.assignmentId.trim();
+  if (!taskId || !assignmentId) return '';
+  return JSON.stringify({
+    contractRefs: AGENT_DELEGATION_CONTRACT_REFS,
+    binding: { taskId, assignmentId },
+    onBlock: 'reply_immediately',
+  });
 }
 
 export const AGENT_DELEGATION_PURPOSES = {
@@ -80,6 +273,51 @@ export type AgentDelegationPurpose =
 export interface AgentDelegationAuditRequest {
   kind: typeof AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT;
   attemptId: string;
+  /** Only an explicit user requirement may disable same-family degradation. */
+  strictCrossVendor?: boolean;
+  /**
+   * The session being audited. REQUIRED for a supervision audit.
+   *
+   * Audited identity is STATED, never inferred. It is not the caller (the
+   * Supervisor Brain dispatches audits it is not the subject of), not the
+   * target (the auditor), not the task owner, and not a candidate ordering.
+   * Every one of those inferences has been wrong in practice, so the field is
+   * required and the daemon fails closed when it is absent.
+   */
+  auditedSessionName: string;
+  /** Durable registry bindings added by the daemon after assignment creation. */
+  taskId?: string;
+  assignmentId?: string;
+  revision?: string;
+}
+
+/**
+ * Build the supervision-audit envelope.
+ *
+ * The ONE place the envelope is constructed, so a required field cannot be
+ * forgotten at one call site and present at another. Callers pass the audited
+ * session explicitly; nothing here defaults or infers it.
+ */
+export function buildAgentDelegationAuditEnvelope(input: {
+  attemptId: string;
+  auditedSessionName: string;
+  strictCrossVendor?: boolean;
+}): AgentDelegationAuditRequest {
+  // Runtime guard, not belt-and-braces. The type alone does NOT make omission
+  // impossible: the root tsconfig excludes `test/`, and vitest strips types
+  // without checking them, so an untypechecked caller can pass undefined here.
+  // JSON.stringify would then silently drop the key and emit an envelope the
+  // parser is guaranteed to reject -- a re-audit loop that dies quietly. Fail
+  // loudly at construction instead of shipping a poisoned prompt.
+  if (typeof input.auditedSessionName !== 'string' || !input.auditedSessionName.trim()) {
+    throw new Error('supervision audit envelope requires a non-empty auditedSessionName');
+  }
+  return {
+    kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+    attemptId: input.attemptId,
+    auditedSessionName: input.auditedSessionName,
+    ...(input.strictCrossVendor === true ? { strictCrossVendor: true } : {}),
+  };
 }
 
 export const AGENT_DELEGATION_REPLY_STATUSES = {
@@ -126,8 +364,11 @@ export const DELEGATION_REPLY_CAPABLE_AGENT_TYPES = [
   'qwen',
   'openclaw',
   'kimi-sdk',
+  HERMES_AGENT_PROVIDER_ID,
   'deepseek-harness',
   'pi',
+  CODEBUDDY_PROVIDER_IDS.CHINA,
+  CODEBUDDY_PROVIDER_IDS.INTERNATIONAL,
 ] as const;
 export type DelegationReplyCapableAgentType = typeof DELEGATION_REPLY_CAPABLE_AGENT_TYPES[number];
 
@@ -254,11 +495,28 @@ export function buildAgentDelegationReplyInstruction(
 ): string {
   if (!isCanonicalAgentDelegationSessionName(replyToSession)) return '';
   if (authority) {
-    if (!isAgentDelegationOpaqueId(authority.delegationId)
-      || !isAgentDelegationReplyCapability(authority.replyCapability)) return '';
+    if (!isAgentDelegationOpaqueId(authority.delegationId)) return '';
+    const marker = `${AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER} ${JSON.stringify({
+      delegationId: authority.delegationId,
+      contractRefs: AGENT_DELEGATION_CONTRACT_REFS,
+    })}`;
+    if (authority.audit?.kind === AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT) {
+      return [
+        marker,
+        JSON.stringify({
+          tool: 'peer_audit_reply',
+          binding: {
+            taskId: authority.audit.taskId ?? '',
+            assignmentId: authority.audit.assignmentId ?? '',
+            attemptId: authority.audit.attemptId,
+            revision: authority.audit.revision ?? '',
+          },
+        }),
+      ].join('\n');
+    }
     return [
-      `${AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER} ${JSON.stringify(authority)}`,
-      `After completing the above task, reply exactly once with the delegation_reply tool using the delegationId and replyCapability above plus result: "<your complete response>". This structured reply is routed directly to ${JSON.stringify(replyToSession)}; do not use send_message or imcodes send for this reply.`,
+      marker,
+      JSON.stringify({ tool: 'delegation_reply', binding: { delegationId: authority.delegationId, target: replyToSession } }),
     ].join('\n');
   }
   return `${AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER}\nAfter completing the above task, send your response using: imcodes send ${JSON.stringify(replyToSession)} ${JSON.stringify('Task: <brief summary of the request>\nResult: <your response>')}`;
@@ -277,13 +535,6 @@ export function isAgentDelegationOpaqueId(value: unknown): value is string {
     && BASE64URL_RE.test(value);
 }
 
-export function isAgentDelegationReplyCapability(value: unknown): value is string {
-  return typeof value === 'string'
-    && value.length >= AGENT_DELEGATION_CAPABILITY_MIN_CHARS
-    && value.length <= AGENT_DELEGATION_CAPABILITY_MAX_CHARS
-    && BASE64URL_RE.test(value);
-}
-
 export function extractAgentDelegationReplyAuthorityFromInstruction(
   text: string,
 ): AgentDelegationReplyAuthority | undefined {
@@ -296,15 +547,16 @@ export function extractAgentDelegationReplyAuthorityFromInstruction(
       const parsed = JSON.parse(raw) as unknown;
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
       const record = parsed as Record<string, unknown>;
-      if (Object.keys(record).length !== 2
+      const keys = Object.keys(record);
+      const allowed = new Set(['delegationId', 'replyCapability', 'contractRefs']);
+      if (keys.some((key) => !allowed.has(key))
         || !Object.prototype.hasOwnProperty.call(record, 'delegationId')
-        || !Object.prototype.hasOwnProperty.call(record, 'replyCapability')
         || !isAgentDelegationOpaqueId(record.delegationId)
-        || !isAgentDelegationReplyCapability(record.replyCapability)) return undefined;
-      return {
-        delegationId: record.delegationId,
-        replyCapability: record.replyCapability,
-      };
+        || (Object.prototype.hasOwnProperty.call(record, 'contractRefs')
+          && JSON.stringify(record.contractRefs) !== JSON.stringify(AGENT_DELEGATION_CONTRACT_REFS))) return undefined;
+      // replyCapability is accepted only as a historical marker field and is
+      // intentionally discarded.
+      return { delegationId: record.delegationId };
     } catch {
       return undefined;
     }
@@ -329,9 +581,6 @@ export function decodeAgentDelegationReplyEnvelope(
   if (!isAgentDelegationOpaqueId(record.delegationId)) {
     return { ok: false, error: AGENT_DELEGATION_REPLY_ERRORS.INVALID_DELEGATION_ID };
   }
-  if (!isAgentDelegationReplyCapability(record.replyCapability)) {
-    return { ok: false, error: AGENT_DELEGATION_REPLY_ERRORS.INVALID_CAPABILITY };
-  }
   if (typeof record.result !== 'string'
     || !record.result.trim()
     || agentDelegationByteLength(record.result) > AGENT_DELEGATION_REPLY_RESULT_BYTES) {
@@ -340,7 +589,6 @@ export function decodeAgentDelegationReplyEnvelope(
   const value: AgentDelegationReplyEnvelope = {
     version: AGENT_DELEGATION_REPLY_VERSION,
     delegationId: record.delegationId,
-    replyCapability: record.replyCapability,
     result: record.result,
   };
   if (agentDelegationByteLength(JSON.stringify(value)) > AGENT_DELEGATION_REPLY_TOTAL_BYTES) {
@@ -353,6 +601,115 @@ export interface AgentDelegationOrchestrationPromptInput {
   targetSession: string;
   targetLabel?: string | null;
   task: string;
+  uiLocale?: string | null;
+  /** Quick Audit only: keep repair -> re-audit -> PASS instructions in the orchestrator turn. */
+  auditCycle?: boolean;
+}
+
+type AgentDelegationUiLocale = 'en' | 'zh-CN' | 'zh-TW' | 'es' | 'ru' | 'ja' | 'ko';
+
+function normalizeAgentDelegationUiLocale(value: string | null | undefined): AgentDelegationUiLocale {
+  const normalized = value?.trim().toLowerCase();
+  if (normalized === 'zh-cn' || normalized?.startsWith('zh-hans')) return 'zh-CN';
+  if (normalized === 'zh-tw' || normalized?.startsWith('zh-hant')) return 'zh-TW';
+  if (normalized?.startsWith('es')) return 'es';
+  if (normalized?.startsWith('ru')) return 'ru';
+  if (normalized?.startsWith('ja')) return 'ja';
+  if (normalized?.startsWith('ko')) return 'ko';
+  return 'en';
+}
+
+const AGENT_DELEGATION_ORCHESTRATION_COPY: Record<AgentDelegationUiLocale, {
+  orchestrator: string;
+  targetLabel: string;
+  targetId: (target: string) => string;
+  task: string;
+  prepare: string;
+  send: (target: string) => string;
+  fallback: string;
+  wait: string;
+  auditCycle: string[];
+}> = {
+  en: {
+    orchestrator: 'You are the current session orchestrator for an agent delegation.', targetLabel: 'Target label',
+    targetId: (target) => `Target ID (pass directly to send_message; do not look it up): ${target}`, task: 'Task',
+    prepare: 'Prepare one concise, self-contained brief from the current context (goal, scope, relevant paths/state, decisions, validation, acceptance criteria, and risks). Do not forward the raw task alone.',
+    send: (target) => `Send it exactly once with send_message(target=${JSON.stringify(target)}, reply=true). Do not call send_list_targets. If send_message is unavailable, use:`,
+    fallback: 'Task: <self-contained brief>\nContext: <relevant current-session facts>\nAcceptance criteria: <how to verify>\nReply: send the result back to this session when done',
+    wait: 'After sending, do not poll session state, logs, or transcripts; wait for reply notifications. Do not perform the delegated work unless needed only to prepare or verify the brief.',
+    auditCycle: ['Quick Audit cycle after each delegated reply:', '- Outcome markers (emit neither before the reply): {PASS} or {REWORK}.', '- PASS: report the evidence, end with {PASS}, then continue any remaining delivery/finalization requested by the task.', '- REWORK is not a stopping response: do not merely output REWORK and wait. The same active orchestration must immediately apply the complete findings, run the relevant validation, prepare the next audit brief itself, and send one fresh reply-enabled audit to the same Target ID; do not wait for another user message or manual kick.', '- Repeat repair -> re-audit autonomously until PASS. Only when an exact blocker or safety limit prevents another cycle, report it and end with the REWORK marker.', '- Never finalize the repository or delivery from a REWORK verdict.'],
+  },
+  'zh-CN': {
+    orchestrator: '你是当前会话的代理委派编排者。', targetLabel: '目标显示名',
+    targetId: (target) => `目标 ID（直接传给 send_message，不要再查询）：${target}`, task: '任务',
+    prepare: '根据当前上下文准备一份简短、自包含的说明，包含目标、范围、相关路径/状态、决策、验证、验收标准和风险；不要只转发原始任务。',
+    send: (target) => `只发送一次：send_message(target=${JSON.stringify(target)}, reply=true)。不要调用 send_list_targets。若 send_message 不可用，则使用：`,
+    fallback: '任务：<自包含说明>\n上下文：<当前会话事实>\n验收标准：<如何验证>\n回执：完成后把结果发回本会话',
+    wait: '发送后不要轮询会话状态、日志或记录；等待回执通知。除准备或核对说明外，不要代替受委派者执行审计。',
+    auditCycle: ['每次委派回执后的快审循环：', '- 回执前不要输出结果标记；回执后只选 {PASS} 或 {REWORK}。', '- PASS：汇报证据，以 {PASS} 结束，再继续任务明确要求的剩余交付。', '- REWORK 不是停止：同一个活动编排必须立即接收完整发现、修复并验证，再自行向同一目标 ID 发送一次新的可回执复审；不得等待下一条用户消息或人工再次触发。', '- 自主循环“修复→复审”直至 PASS；只有明确阻断或安全上限才可用 REWORK 停止。', '- REWORK 时绝不能做仓库或交付收尾。'],
+  },
+  'zh-TW': {
+    orchestrator: '你是目前工作階段的代理委派編排者。', targetLabel: '目標顯示名',
+    targetId: (target) => `目標 ID（直接傳給 send_message，不要再查詢）：${target}`, task: '任務',
+    prepare: '依目前脈絡準備一份簡短、自包含的說明，包含目標、範圍、相關路徑/狀態、決策、驗證、驗收標準與風險；不要只轉發原始任務。',
+    send: (target) => `只傳送一次：send_message(target=${JSON.stringify(target)}, reply=true)。不要呼叫 send_list_targets。若 send_message 不可用，則使用：`,
+    fallback: '任務：<自包含說明>\n脈絡：<目前工作階段事實>\n驗收標準：<如何驗證>\n回覆：完成後把結果傳回本工作階段',
+    wait: '傳送後不要輪詢工作階段狀態、日誌或記錄；等待回覆通知。除準備或核對說明外，不要代替受委派者執行審計。',
+    auditCycle: ['每次委派回覆後的快審循環：', '- 回覆前不要輸出結果標記；回覆後只選 {PASS} 或 {REWORK}。', '- PASS：回報證據，以 {PASS} 結束，再繼續任務明確要求的剩餘交付。', '- REWORK 不是停止：同一個活動編排必須立即接收完整發現、修復並驗證，再自行向同一目標 ID 傳送一次新的可回覆複審；不得等待下一則使用者訊息或人工再次觸發。', '- 自主循環「修復→複審」直到 PASS；只有明確阻斷或安全上限才可用 REWORK 停止。', '- REWORK 時絕不能做儲存庫或交付收尾。'],
+  },
+  es: {
+    orchestrator: 'Eres el orquestador de delegación de la sesión actual.', targetLabel: 'Etiqueta del destino',
+    targetId: (target) => `ID de destino (pásalo directamente a send_message; no lo busques): ${target}`, task: 'Tarea',
+    prepare: 'Prepara un resumen breve y autónomo del contexto actual: objetivo, alcance, rutas/estado, decisiones, validación, criterios de aceptación y riesgos. No reenvíes solo la tarea original.',
+    send: (target) => `Envíalo una sola vez con send_message(target=${JSON.stringify(target)}, reply=true). No llames a send_list_targets. Si send_message no está disponible, usa:`,
+    fallback: 'Tarea: <resumen autónomo>\nContexto: <hechos actuales>\nCriterios de aceptación: <cómo verificar>\nRespuesta: devuelve el resultado a esta sesión',
+    wait: 'Después de enviarlo, no consultes estado, registros ni transcripciones; espera la notificación. No hagas el trabajo delegado salvo para preparar o verificar el resumen.',
+    auditCycle: ['Ciclo de auditoría rápida tras cada respuesta:', '- Antes de la respuesta no emitas marcadores; después usa solo {PASS} o {REWORK}.', '- PASS: informa la evidencia, termina con {PASS} y continúa la entrega restante solicitada.', '- REWORK no detiene el flujo: corrige, valida y envía una nueva auditoría con respuesta al mismo ID.', '- Repite corrección y auditoría hasta PASS; solo un bloqueo exacto o límite de seguridad permite parar con REWORK.', '- Nunca finalices repositorio o entrega desde REWORK.'],
+  },
+  ru: {
+    orchestrator: 'Вы координируете делегирование из текущей сессии.', targetLabel: 'Метка цели',
+    targetId: (target) => `ID цели (передайте прямо в send_message; не ищите его): ${target}`, task: 'Задача',
+    prepare: 'Подготовьте краткое самодостаточное описание текущего контекста: цель, область, пути/состояние, решения, проверки, критерии приёмки и риски. Не пересылайте только исходную задачу.',
+    send: (target) => `Отправьте ровно один раз через send_message(target=${JSON.stringify(target)}, reply=true). Не вызывайте send_list_targets. Если send_message недоступен, используйте:`,
+    fallback: 'Задача: <самодостаточное описание>\nКонтекст: <актуальные факты>\nКритерии: <как проверить>\nОтвет: верните результат в эту сессию',
+    wait: 'После отправки не опрашивайте состояние, журналы или историю; ждите уведомления. Не выполняйте делегированную проверку, кроме подготовки описания.',
+    auditCycle: ['Цикл быстрой проверки после каждого ответа:', '- До ответа не выводите маркеры; после него выберите только {PASS} или {REWORK}.', '- PASS: сообщите доказательства, завершите {PASS} и продолжите явно требуемую доставку.', '- REWORK не останавливает работу: исправьте, проверьте и отправьте новую проверку с ответом тому же ID.', '- Повторяйте исправление и проверку до PASS; остановка с REWORK допустима лишь при точной блокировке или лимите безопасности.', '- При REWORK нельзя завершать репозиторий или доставку.'],
+  },
+  ja: {
+    orchestrator: '現在のセッションから代理委任を編成します。', targetLabel: '対象ラベル',
+    targetId: (target) => `対象 ID（send_message に直接渡し、再検索しない）：${target}`, task: 'タスク',
+    prepare: '現在の文脈から、目標、範囲、関連パス/状態、判断、検証、受入条件、リスクを含む簡潔で自己完結した説明を作成してください。元のタスクだけを転送しないでください。',
+    send: (target) => `send_message(target=${JSON.stringify(target)}, reply=true) で1回だけ送信してください。send_list_targets は呼び出さないでください。send_message が使えない場合：`,
+    fallback: 'タスク：<自己完結した説明>\n文脈：<現在の事実>\n受入条件：<検証方法>\n返信：完了後に結果をこのセッションへ返す',
+    wait: '送信後はセッション状態、ログ、履歴をポーリングせず、返信通知を待ってください。説明の準備・確認以外で委任作業を代行しないでください。',
+    auditCycle: ['各返信後のクイック監査サイクル：', '- 返信前は結果マーカーを出さず、返信後は {PASS} または {REWORK} の一方だけを使います。', '- PASS：証拠を報告し {PASS} で終え、明示された残りの引き渡しを続けます。', '- REWORK は停止ではありません。直ちに修正・検証し、同じ対象 ID へ新しい返信可能な再監査を送ります。', '- PASS まで修正と再監査を繰り返します。明確な障害か安全上限だけが REWORK での停止を許します。', '- REWORK からリポジトリや引き渡しを完了しないでください。'],
+  },
+  ko: {
+    orchestrator: '현재 세션의 에이전트 위임을 조정합니다.', targetLabel: '대상 라벨',
+    targetId: (target) => `대상 ID(send_message에 직접 전달하고 다시 조회하지 않음): ${target}`, task: '작업',
+    prepare: '현재 문맥에서 목표, 범위, 관련 경로/상태, 결정, 검증, 수락 기준, 위험을 포함한 짧고 독립적인 설명을 준비하세요. 원래 작업만 전달하지 마세요.',
+    send: (target) => `send_message(target=${JSON.stringify(target)}, reply=true)로 한 번만 보내세요. send_list_targets를 호출하지 마세요. send_message를 사용할 수 없으면 다음을 사용하세요:`,
+    fallback: '작업: <독립적인 설명>\n문맥: <현재 사실>\n수락 기준: <검증 방법>\n회신: 완료 후 결과를 이 세션으로 반환',
+    wait: '전송 후 세션 상태, 로그, 기록을 폴링하지 말고 회신 알림을 기다리세요. 설명 준비·검증 외에는 위임된 감사를 대신 수행하지 마세요.',
+    auditCycle: ['각 회신 후 빠른 감사 순환:', '- 회신 전에는 결과 마커를 내보내지 말고, 회신 후 {PASS} 또는 {REWORK} 중 하나만 사용하세요.', '- PASS: 증거를 보고하고 {PASS}로 끝낸 뒤 명시된 남은 전달 작업을 계속하세요.', '- REWORK는 중단이 아닙니다. 즉시 수정·검증하고 같은 대상 ID로 새 회신 가능 재감사를 보내세요.', '- PASS까지 수정과 재감사를 반복하세요. 명확한 차단이나 안전 한도만 REWORK로 중단할 수 있습니다.', '- REWORK에서 저장소나 전달을 마무리하지 마세요.'],
+  },
+};
+
+const AGENT_DELEGATION_ORCHESTRATION_TASK_BYTES = 4 * 1024;
+
+function truncateAgentDelegationUtf8(value: string, maxBytes: number): string {
+  if (agentDelegationByteLength(value) <= maxBytes) return value;
+  const suffix = '\n[truncated]';
+  const suffixBytes = agentDelegationByteLength(suffix);
+  let used = 0;
+  let output = '';
+  for (const codePoint of value) {
+    const bytes = agentDelegationByteLength(codePoint);
+    if (used + bytes + suffixBytes > maxBytes) break;
+    output += codePoint;
+    used += bytes;
+  }
+  return output + suffix;
 }
 
 export const QUICK_AGENT_DELEGATION_PRESETS = ['audit', 'discussion', 'brainstorm', 'custom'] as const;
@@ -361,8 +718,43 @@ export type QuickAgentDelegationPreset = typeof QUICK_AGENT_DELEGATION_PRESETS[n
 export function buildQuickAgentDelegationTask(
   preset: QuickAgentDelegationPreset,
   customTask = '',
+  uiLocale?: string | null,
 ): string {
   if (preset === 'custom') return customTask.trim();
+  const locale = normalizeAgentDelegationUiLocale(uiLocale);
+  const localized = {
+    'zh-CN': {
+      discussion: '与所选代理讨论本会话最近的工作。根据当前上下文整理目标、范围、近期决策、变更区域、已有验证、待解决问题和风险；请对方挑战方案、指出权衡或遗漏，并回复具体建议。',
+      brainstorm: '与所选代理一起构思本会话最近工作的改进与下一步。根据当前上下文整理目标、约束、近期决策、当前实现和未解决问题；请对方给出实用替代方案、边界情况和优先级建议并回执。',
+      audit: '请所选代理独立审计本会话最近的工作。根据当前上下文整理目标、范围、近期决策、变更文件或产物、实现状态、已有验证、验收标准和风险；要求检查相关文件并执行适用的非破坏性验证，给出精确证据、不可用检查、按优先级排列的缺陷，以及明确的 PASS 或 REWORK 结论。',
+    },
+    'zh-TW': {
+      discussion: '與所選代理討論本工作階段最近的工作。依目前脈絡整理目標、範圍、近期決策、變更區域、既有驗證、待解問題與風險；請對方挑戰方案、指出權衡或遺漏，並回覆具體建議。',
+      brainstorm: '與所選代理一起構思本工作階段最近工作的改進與下一步。依目前脈絡整理目標、限制、近期決策、目前實作與未解問題；請對方提供實用替代方案、邊界情況與優先順序建議並回覆。',
+      audit: '請所選代理獨立審計本工作階段最近的工作。依目前脈絡整理目標、範圍、近期決策、變更檔案或產物、實作狀態、既有驗證、驗收標準與風險；要求檢查相關檔案並執行適用的非破壞性驗證，提供精確證據、不可用檢查、依優先級排列的缺陷，以及明確的 PASS 或 REWORK 結論。',
+    },
+    es: {
+      discussion: 'Comenta el trabajo más reciente de esta sesión con el agente seleccionado. Resume objetivo, alcance, decisiones, áreas cambiadas, validación, preguntas y riesgos; pide que cuestione el enfoque y devuelva recomendaciones concretas.',
+      brainstorm: 'Genera mejoras y próximos pasos con el agente seleccionado. Resume objetivo, restricciones, decisiones, estado actual y problemas abiertos; pide alternativas prácticas, casos límite e ideas priorizadas.',
+      audit: 'Pide al agente seleccionado una auditoría independiente del trabajo reciente. Resume objetivo, alcance, decisiones, archivos, estado, validación, criterios y riesgos; exige comprobaciones no destructivas, evidencia exacta, verificaciones no disponibles, defectos priorizados y un veredicto PASS o REWORK.',
+    },
+    ru: {
+      discussion: 'Обсудите недавнюю работу с выбранным агентом. Кратко изложите цель, область, решения, изменения, проверки, вопросы и риски; попросите оспорить подход и вернуть конкретные рекомендации.',
+      brainstorm: 'Продумайте улучшения и следующие шаги с выбранным агентом. Кратко изложите цель, ограничения, решения, состояние и открытые проблемы; запросите практичные альтернативы, крайние случаи и приоритетные идеи.',
+      audit: 'Попросите выбранного агента независимо проверить недавнюю работу. Кратко изложите цель, область, решения, файлы, состояние, проверки, критерии и риски; потребуйте неразрушающие проверки, точные доказательства, недоступные проверки, приоритетные дефекты и вердикт PASS или REWORK.',
+    },
+    ja: {
+      discussion: '選択したエージェントとこのセッションの最近の作業を議論します。目標、範囲、判断、変更領域、検証、未解決点、リスクを要約し、方針への反論と具体的な提案を求めてください。',
+      brainstorm: '選択したエージェントと改善案・次の手順を検討します。目標、制約、判断、実装状況、未解決問題を要約し、実用的な代案、境界条件、優先案を求めてください。',
+      audit: '選択したエージェントに最近の作業の独立監査を依頼します。目標、範囲、判断、変更ファイル、実装状況、検証、受入条件、リスクを要約し、非破壊検証、正確な証拠、実施不能な確認、優先度付き欠陥、明確な PASS または REWORK を求めてください。',
+    },
+    ko: {
+      discussion: '선택한 에이전트와 이 세션의 최근 작업을 논의하세요. 목표, 범위, 결정, 변경 영역, 검증, 미해결 질문, 위험을 요약하고 접근법의 허점과 구체적 권고를 요청하세요.',
+      brainstorm: '선택한 에이전트와 개선 및 다음 단계를 구상하세요. 목표, 제약, 결정, 구현 상태, 미해결 문제를 요약하고 실용적 대안, 경계 사례, 우선순위 아이디어를 요청하세요.',
+      audit: '선택한 에이전트에게 최근 작업의 독립 감사를 요청하세요. 목표, 범위, 결정, 변경 파일, 구현 상태, 검증, 수락 기준, 위험을 요약하고 비파괴 검증, 정확한 증거, 수행 불가 검사, 우선순위 결함, 명확한 PASS 또는 REWORK를 요구하세요.',
+    },
+  } as const;
+  if (locale !== 'en') return localized[locale][preset];
   if (preset === 'discussion') {
     return [
       'Discuss this session\'s most recent work with the selected delegate.',
@@ -387,29 +779,27 @@ export function buildQuickAgentDelegationTask(
 export function buildAgentDelegationOrchestrationPrompt(input: AgentDelegationOrchestrationPromptInput): string {
   const targetSession = input.targetSession.trim();
   const targetLabel = input.targetLabel?.trim();
-  const task = input.task.trim();
-  const displayTarget = targetLabel && targetLabel !== targetSession
-    ? `${targetLabel} (${targetSession})`
-    : targetSession;
+  const task = truncateAgentDelegationUtf8(
+    input.task.trim(),
+    AGENT_DELEGATION_ORCHESTRATION_TASK_BYTES,
+  );
+  const copy = AGENT_DELEGATION_ORCHESTRATION_COPY[normalizeAgentDelegationUiLocale(input.uiLocale)];
+  const auditCycle = copy.auditCycle.map((line) => line
+    .split('{PASS}').join(PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS)
+    .split('{REWORK}').join(PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK));
   return [
-    'You are the current session orchestrator for an agent delegation.',
-    '',
-    `Selected delegate: ${displayTarget}`,
-    `Exact delegate target session: ${targetSession}`,
-    '',
-    'User task to delegate:',
-    task,
-    '',
-    'Before contacting the delegate, organize the relevant current-session context yourself: summarize the goal, constraints, repo paths, recent decisions, current state, and acceptance criteria the delegate needs. Do not send the raw user task by itself.',
-    '',
-    'Then dispatch a self-contained delegation brief to the selected delegate using the exact target session above, and require a reply. Prefer the available send_message tool with reply enabled when present; otherwise use:',
-    `imcodes send --reply ${JSON.stringify(targetSession)} ${JSON.stringify('Task: <self-contained brief>\nContext: <relevant current-session facts>\nAcceptance criteria: <how to verify>\nReply: send the result back to this session when done')}`,
-    'A reply-enabled send gives the delegate a one-time structured reply capability and routes that result back through this session provider’s notification path. After dispatch, do not poll the delegate, session status, logs, or transcripts; wait for the reply notification to arrive.',
-    '',
-    'If the user selected or mentioned multiple @ delegates, split the work into separate per-delegate briefs, dispatch each one independently with reply required, and track/report each delegate result separately.',
-    '',
-    'Keep this session responsible for orchestration and final judgment. Do not implement the delegated task yourself unless implementation is needed only to prepare or verify the delegation brief.',
-  ].join('\n');
+    copy.orchestrator,
+    targetLabel && targetLabel !== targetSession ? `${copy.targetLabel}: ${targetLabel}` : null,
+    copy.targetId(targetSession),
+    `${copy.task}: ${task}`,
+    copy.prepare,
+    copy.send(targetSession),
+    `imcodes send --reply ${JSON.stringify(targetSession)} ${JSON.stringify(copy.fallback)}`,
+    copy.wait,
+    ...(input.auditCycle
+      ? [...auditCycle, buildAuditConvergenceContractRef(AUDIT_CONVERGENCE_ROLES.ORCHESTRATOR)]
+      : []),
+  ].filter((line): line is string => line !== null).join('\n');
 }
 
 export function isAgentDelegationForwardedPayloadText(text: string): boolean {

@@ -17,6 +17,7 @@ import {
 } from '../quick-commands.js';
 import { FileBrowser } from './file-browser-lazy.js';
 import { CloneSessionGroupDialog } from './CloneSessionGroupDialog.js';
+import { ConfirmButton } from './ConfirmButton.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import { SessionActionMenuIcon } from './SessionActionMenuIcon.js';
@@ -32,6 +33,7 @@ import { useMachines } from '../hooks/useMachines.js';
 import { insertMachineMarkerAtCaret } from '../util/machine-insert.js';
 import { buildMachineSendExtra } from '../util/machine-send.js';
 import { matchInlineMachineTrigger, stripInlineMachineTrigger } from '../util/machine-trigger.js';
+import { MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
 import { parseAliasMarkers } from '@shared/alias-types.js';
 import { CODEX_FAST_OFF_COMMAND, isCodexFastServiceTier } from '@shared/codex-service-tier.js';
 import { isInsufficientCapacityError } from '../upload-error.js';
@@ -61,9 +63,11 @@ import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
 import { PREF_KEY_P2P_COMBO_CONFIRM_SKIP, PREF_KEY_P2P_DROPDOWN_TAB, p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../constants/prefs.js';
 import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p-config-pref.js';
 import { sendSessionViaHttp, cancelSessionViaHttp, deleteAttachment } from '../api.js';
+import { ComposerAttachmentBadge } from './ComposerAttachmentBadge.js';
+import { forgetAttachmentPreview, rememberAttachmentPreview } from '../attachment-preview-cache.js';
 import { formatTransferBytes, formatTransferDuration } from '../util/transfer-format.js';
-import { DirectFileTransferFailure, FILE_UPLOAD_TRANSPORT_MODE, isFileUploadCanceled, uploadFileWithDirectFallback, type FileUploadTransportMode } from '../direct-file-transfer.js';
-import { patchSession, patchSessionSupervision, patchSubSession } from '../api.js';
+import { DirectFileTransferFailure, FILE_UPLOAD_TRANSPORT_MODE, isFileUploadCanceled, prewarmDirectFileLease, uploadFileWithDirectFallback, type FileUploadTransportMode } from '../direct-file-transfer.js';
+import { patchSessionSupervision } from '../api.js';
 import { isImeComposingKeyEvent } from '../ime-keyboard.js';
 import { deriveSessionLiveStatus, isRunningSessionState } from '../session-live-status.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
@@ -71,6 +75,12 @@ import {
   TRANSPORT_QUEUE_COMMANDS,
   TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE,
 } from '@shared/transport-queue-types.js';
+import {
+  DEFAULT_SESSION_SEND_DELIVERY_MODE,
+  SESSION_SEND_DELIVERY_MODES,
+  SESSION_SEND_DELIVERY_USER_PREF_KEY,
+  type SessionSendDeliveryMode,
+} from '@shared/session-send-delivery.js';
 import { MSG_COMMAND_FAILED } from '@shared/ack-protocol.js';
 import { FS_READ_ERROR_CODES } from '@shared/fs-read-error-codes.js';
 import {
@@ -78,7 +88,7 @@ import {
   hasTransportPendingSyncSnapshot,
   normalizeTransportPendingEntries,
 } from '../transport-queue.js';
-import { formatSharedActorLabel } from '../tab-sharing-ui.js';
+import { canSharedActorControlSession, canSharedActorManageServer, formatSharedActorLabel } from '../tab-sharing-ui.js';
 import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
 import {
   buildP2pConfigSelection,
@@ -102,13 +112,14 @@ import { CUSTOM_PROVIDER_SDK_AGENT_TYPES } from '@shared/cc-presets.js';
 import { useTransportModels, supportsDynamicTransportModels } from '../hooks/useTransportModels.js';
 import { loadCodexModelPreference, loadLegacyCodexModelPreferenceForModelessSession, saveCodexModelPreference } from '../codex-model-preference.js';
 import {
-  buildTransportConfigWithSupervision,
+  canSessionRoleOwnAutomaticSupervision,
   extractSessionSupervisionSnapshot,
   hasInvalidSessionSupervisionSnapshot,
   isSupportedSupervisionTargetSessionType,
   SUPERVISION_MODE,
   type SessionSupervisionSnapshot,
   type SupervisionMode,
+  evaluateAutomaticSupervisionEnablement,
 } from '@shared/supervision-config.js';
 import { FILE_TRANSFER_LIMITS } from '@shared/transport/file-transfer.js';
 import { SESSION_MODEL_COMMAND, shouldHideOptimisticUserMessageForSessionControl } from '@shared/session-control-commands.js';
@@ -116,11 +127,18 @@ import { resizeHandleHoverEvents } from './window-resize.js';
 import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 import {
+  CODEBUDDY_CHINA_MODEL_FALLBACK,
+  CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK,
+  CODEBUDDY_PROVIDER_IDS,
+  isCodeBuddyProviderId,
+} from '@shared/codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
+import {
   buildAgentDelegationOrchestrationPrompt,
   isDelegationUnsupportedControlText,
+  type QuickAgentDelegationPreset,
 } from '@shared/agent-delegation.js';
 import {
-  SESSION_SETTINGS_FOCUS,
   type SessionSettingsOpenIntent,
 } from '../session-settings-open-intent.js';
 
@@ -255,8 +273,12 @@ interface Props {
       attachments?: Array<Record<string, unknown>>;
       extra?: Record<string, unknown>;
       localFailure?: string;
+      /** The user explicitly appended this row to the active turn. */
+      queueAppend?: boolean;
     },
   ) => void;
+  /** Remove an optimistic append row when provider admission is rejected. */
+  onRemoveOptimisticMessage?: (commandId: string) => void;
   /** Sub-session overrides — when set, menu actions use these instead of main session commands. */
   onSubRestart?: () => void;
   onSubNew?: () => void;
@@ -355,6 +377,22 @@ type OpenSpecTaskStatsSummary = {
   unchecked: number;
 };
 
+function ComposerDeliveryModeIcon({ append }: { append: boolean }) {
+  return append ? (
+    <svg class="composer-delivery-mode-icon" viewBox="0 0 20 20" aria-hidden="true">
+      <path d="M3.5 5.25h7.25M3.5 9.75h5.25" />
+      <path d="M8.5 9.75h3.25a3.75 3.75 0 0 1 3.75 3.75v.75" />
+      <path d="m12.75 14.1 1.65 1.65 2.85-3.25" />
+    </svg>
+  ) : (
+    <svg class="composer-delivery-mode-icon" viewBox="0 0 20 20" aria-hidden="true">
+      <path d="M3.25 5.25h7.5M3.25 9.5h6" />
+      <circle cx="13.5" cy="13" r="3.5" />
+      <path d="M13.5 11v2.25l1.5.9" />
+    </svg>
+  );
+}
+
 type OpenSpecChangeListItem = {
   name: string;
   taskStats?: OpenSpecTaskStatsSummary;
@@ -422,7 +460,8 @@ type LocalQueuedTransportEntry = {
 
 type RealtimeTransportQueueOverride = {
   sessionName: string;
-  entries: LocalQueuedTransportEntry[];
+  pendingEntries: LocalQueuedTransportEntry[];
+  failedEntries: LocalQueuedTransportEntry[];
   version?: number;
 };
 
@@ -694,6 +733,11 @@ const DEFAULT_COMPOSER_UPLOAD_STATE: ComposerUploadSnapshot = {
 };
 const composerUploadStore = new Map<string, ComposerUploadEntry>();
 const composerUploadAbortControllers = new Map<string, AbortController>();
+// Keep the user-selected File alive for an explicit retry.  The transport's
+// persisted clientUploadId then resumes the receiver's confirmed prefix rather
+// than forcing the user to pick and resend the whole file after a transient
+// direct+HTTP failure.
+const composerUploadRetryFiles = new Map<string, File>();
 let composerUploadIdCounter = 0;
 
 function createComposerUploadId(): string {
@@ -933,6 +977,7 @@ interface PendingSendPayload {
 }
 
 interface BuildSendPayloadOptions {
+  textOverride?: string;
   modeOverride?: string;
   syntheticAtTargets?: PendingAtTarget[];
   syntheticConfigOverride?: {
@@ -946,6 +991,8 @@ interface PendingComboSendConfirmation {
   payload: PendingSendPayload;
   modeLabel: string;
   clearComposer: boolean;
+  retainOnRejection: boolean;
+  onConfirmedAccepted?: () => void;
 }
 
 type ManualP2pTargetCandidate = {
@@ -1116,8 +1163,15 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, connected: connectedProp, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, transportTimelineEvents, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange }: Props) {
+export function SessionControls({ ws, activeSession, connected: connectedProp, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onRemoveOptimisticMessage, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, transportTimelineEvents, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange }: Props) {
   const { t, i18n } = useTranslation();
+  const deliveryModePref = usePref<SessionSendDeliveryMode>(SESSION_SEND_DELIVERY_USER_PREF_KEY, {
+    parse: (raw) => Object.values(SESSION_SEND_DELIVERY_MODES).includes(raw as SessionSendDeliveryMode)
+      ? raw as SessionSendDeliveryMode
+      : null,
+  });
+  const deliveryMode = deliveryModePref.value ?? DEFAULT_SESSION_SEND_DELIVERY_MODE;
+  const directAppendMode = deliveryMode === SESSION_SEND_DELIVERY_MODES.APPEND;
   const swipeBackRef = useSwipeBack(onMobileFileBrowserClose);
   const [hasText, setHasText] = useState(false);
   const [composerFocused, setComposerFocused] = useState(false);
@@ -1147,9 +1201,18 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   // Set for the input event immediately following a paste so pasted text ending
   // in `^name` never opens the inline machine picker (paste must not trigger).
   const machinePasteSuppressRef = useRef(false);
+  // Quick phrases are user-input affordances. Programmatic composer writes and
+  // paste may contain attachment-like `#...` text, so suppress their one
+  // corresponding input event without disabling later keyboard edits.
+  const quickPhraseInputSuppressRef = useRef(false);
   const [quickSuggestionKind, setQuickSuggestionKind] = useState<'command' | 'phrase' | 'model' | null>(null);
   const [quickSuggestionQuery, setQuickSuggestionQuery] = useState('');
   const [quickSuggestionHighlightIdx, setQuickSuggestionHighlightIdx] = useState(0);
+  const closeQuickSuggestions = useCallback(() => {
+    setQuickSuggestionKind(null);
+    setQuickSuggestionQuery('');
+    setQuickSuggestionHighlightIdx(0);
+  }, []);
   const [modelOpen, setModelOpen] = useState(false);
   const [autoOpen, setAutoOpen] = useState(false);
   const [peerAuditOpen, setPeerAuditOpen] = useState(false);
@@ -1205,11 +1268,33 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   // messages even though the daemon and SQLite deletion had succeeded.
   const [optimisticallyRemovedQueuedIds, setOptimisticallyRemovedQueuedIds] = useState<ReadonlySet<string>>(() => new Set());
   const [realtimeQueueOverride, setRealtimeQueueOverride] = useState<RealtimeTransportQueueOverride | null>(null);
+  const reconciledMissingAppendCommandIdsRef = useRef<Set<string>>(new Set());
+  /**
+   * How many authoritative queue snapshots this session has ACCEPTED.
+   *
+   * Append rollback restores the pre-click queue, which is the right answer only
+   * while the click is still the newest thing that happened. Comparing queue
+   * epoch/authority/version at rollback time cannot express that: an accepted
+   * reset moves to a NEW epoch with version 0, which is not "newer" by any
+   * ordering on versions. A monotonic count of accepted snapshots says exactly
+   * what matters -- "authority has answered since you clicked" -- for an empty
+   * snapshot, a partial one, a version bump and a reset alike.
+   */
+  const acceptedQueueSnapshotSeqRef = useRef(0);
   const lastRealtimeEmptyQueueSnapshotRef = useRef<{ sessionName: string; version?: number; observedAtMs: number } | null>(null);
   const failedQueuedCommandIdsRef = useRef<Set<string>>(new Set());
   const queuedMutationRollbackRef = useRef<Map<string,
     | { type: 'edit' | 'undo'; entry: LocalQueuedTransportEntry }
-    | { type: 'append'; entries: LocalQueuedTransportEntry[]; queue: LocalQueuedTransportEntry[] }
+    // `acceptedSnapshotSeq` is the accepted-snapshot count as it stood when the
+    // click was made. Without it the rollback cannot tell "nothing happened
+    // since" from "authority already answered", and a delayed error ack
+    // restored a pre-click queue on top of newer truth.
+    | {
+      type: 'append';
+      entries: LocalQueuedTransportEntry[];
+      queue: LocalQueuedTransportEntry[];
+      acceptedSnapshotSeq: number;
+    }
   >>(new Map());
   // Command ids that have reached the timeline (a `user.message` event) and are
   // therefore NO LONGER queued — the timeline is the authoritative truth for
@@ -1229,6 +1314,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [confirmLevel, setConfirmLevel] = useState(0); // 0=none, 1=first warning, 2=second warning (sub-session only)
   const [skipComboSendConfirm, setSkipComboSendConfirm] = useState(false);
   const [pendingComboSendConfirm, setPendingComboSendConfirm] = useState<PendingComboSendConfirmation | null>(null);
+  const pendingComboSendConfirmRef = useRef<PendingComboSendConfirmation | null>(null);
   const [rememberComboSendChoice, setRememberComboSendChoice] = useState(false);
   const [pendingTransportApproval, setPendingTransportApproval] = useState<PendingTransportApproval | null>(null);
   const [fileDragActive, setFileDragActive] = useState(false);
@@ -1288,6 +1374,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         },
       )
     : [];
+  const activeSessionFailedEntries: LocalQueuedTransportEntry[] = effectiveRuntimeType === 'transport'
+    ? (activeSession?.failedMessageEntries ?? []).map((entry) => ({ ...entry, status: 'failed' as const }))
+    : [];
   const activeSessionPendingVersion = typeof activeSession?.transportPendingMessageVersion === 'number'
     ? activeSession.transportPendingMessageVersion
     : undefined;
@@ -1298,9 +1387,18 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       || activeSessionPendingVersion === undefined
       || realtimeQueueOverride.version >= activeSessionPendingVersion
     );
-  const incomingQueuedTransportEntries = shouldUseRealtimeQueueOverride
-    ? realtimeQueueOverride.entries
+  const incomingPendingTransportEntries = shouldUseRealtimeQueueOverride
+    ? realtimeQueueOverride.pendingEntries
     : activeSessionPendingEntries;
+  const incomingFailedTransportEntries = shouldUseRealtimeQueueOverride
+    ? realtimeQueueOverride.failedEntries
+    : activeSessionFailedEntries;
+  const incomingQueuedTransportEntries: LocalQueuedTransportEntry[] = [
+    ...incomingPendingTransportEntries,
+    ...incomingFailedTransportEntries.filter((failed) => (
+      !incomingPendingTransportEntries.some((pending) => pending.clientMessageId === failed.clientMessageId)
+    )),
+  ];
   const incomingQueuedTransportVersion = shouldUseRealtimeQueueOverride
     ? realtimeQueueOverride.version
     : activeSessionPendingVersion;
@@ -1331,7 +1429,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     else if (incomingQueuedTransportEntries.length === 0) merged = optimisticQueuedEntries;
     else {
       const byId = new Map<string, LocalQueuedTransportEntry>();
-      for (const entry of incomingQueuedTransportEntries) byId.set(entry.clientMessageId, { ...entry, status: 'queued' });
+      for (const entry of incomingQueuedTransportEntries) byId.set(entry.clientMessageId, entry);
       for (const entry of optimisticQueuedEntries) {
         byId.set(entry.clientMessageId, entry);
       }
@@ -1360,6 +1458,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     setOptimisticallyRemovedQueuedIds(new Set());
     setOptimisticQueuedEntries(null);
     setRealtimeQueueOverride(null);
+    reconciledMissingAppendCommandIdsRef.current.clear();
     lastRealtimeEmptyQueueSnapshotRef.current = null;
     setEditingQueuedMessageId(null);
     queuedMutationRollbackRef.current.clear();
@@ -1383,15 +1482,37 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, [t]);
   const queuedTransportMessages = queuedTransportEntries.map((entry) => entry.text);
   const sharedState = activeSession?.sharedState ?? null;
-  const isShareScopedSession = !!sharedState;
+  // `outgoing` describes grants owned by the current user. Their viewer/
+  // participant role belongs to the recipient and must never turn the owner's
+  // own composer into a share-scoped, read-only surface.
+  const isShareScopedSession = !!sharedState && sharedState.outgoing !== true;
   const canSharedSessionSend = !isShareScopedSession
     || (sharedState?.status === 'active' && sharedState.effectiveRole === 'participant');
+  const canManageSharedServer = canSharedActorManageServer(sharedState);
+  // Session settings mutate the owner session, so shared access is a positive
+  // role grant rather than a consequence of the menu being reachable. Active
+  // participants use the owner's existing settings surface; viewers and stale
+  // shares remain read-only.
+  const canOpenSessionSettings = canSharedSessionSend;
   // A share viewer cannot dispatch anything, so appending is denied at the
   // bridge too. Offering the control would only produce a rollback plus a raw
   // denial code; participants and owners keep it.
   const appendableQueuedTransportEntries = canSharedSessionSend
     ? queuedTransportEntries.filter((entry) => entry.status !== 'failed')
     : [];
+  const appendAllConfirmationScope = JSON.stringify({
+    serverId: serverId ?? '',
+    sessionName: activeSession?.name ?? '',
+    subSessionId: subSessionId ?? '',
+    queueEpoch: activeSession?.queueEpoch ?? '',
+    queueAuthorityId: activeSession?.queueAuthorityId ?? '',
+    version: incomingQueuedTransportVersion ?? null,
+    entries: appendableQueuedTransportEntries.map((entry) => ({
+      clientMessageId: entry.clientMessageId,
+      text: entry.text,
+      status: entry.status ?? 'queued',
+    })),
+  });
   const queuedTransportLatestMessage = queuedTransportMessages[queuedTransportMessages.length - 1] ?? '';
   const editingQueuedEntry = editingQueuedMessageId
     ? queuedTransportEntries.find((entry) => entry.clientMessageId === editingQueuedMessageId) ?? null
@@ -1515,11 +1636,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const uploadError = uploadSnapshot.error;
   const [sendWarning, setSendWarning] = useState<string | null>(null);
   const [appendSuccessNotice, setAppendSuccessNotice] = useState<string | null>(null);
+  const [deliveryModeNotice, setDeliveryModeNotice] = useState<{ append: boolean; message: string } | null>(null);
+  const [supervisionModeNotice, setSupervisionModeNotice] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<ComposerAttachmentRecord[]>([]);
   const [deletingAttachmentKeys, setDeletingAttachmentKeys] = useState<Set<string>>(() => new Set());
   const [pendingDelegateTarget, setPendingDelegateTarget] = useState<PendingDelegateTarget | null>(null);
   const sendWarningTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const appendSuccessTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const deliveryModeNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const supervisionModeNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [localTransportConfig, setLocalTransportConfig] = useState<Record<string, unknown> | null>(activeSession?.transportConfig ?? null);
 
   // Keep external inputRef in sync so parent can call .focus()
@@ -1547,15 +1672,21 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       // pending-prefill effect uses.
       el.dispatchEvent(new Event('input', { bubbles: true }));
     };
+    const handleNativeBlur = () => {
+      setComposerFocused(false);
+      closeQuickSuggestions();
+    };
     el.addEventListener('compositionstart', handleCompositionStart);
     el.addEventListener('compositionupdate', markImeActivity);
     el.addEventListener('compositionend', handleCompositionEnd);
+    el.addEventListener('blur', handleNativeBlur);
     return () => {
       el.removeEventListener('compositionstart', handleCompositionStart);
       el.removeEventListener('compositionupdate', markImeActivity);
       el.removeEventListener('compositionend', handleCompositionEnd);
+      el.removeEventListener('blur', handleNativeBlur);
     };
-  }, []);
+  }, [closeQuickSuggestions]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -1567,6 +1698,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   useEffect(() => {
     if (!pendingPrefillText || !divRef.current) return;
     const nextText = `${readComposerElementText(divRef.current)}${pendingPrefillText}`;
+    quickPhraseInputSuppressRef.current = true;
+    closeQuickSuggestions();
     setComposerElementText(divRef.current, nextText);
     setHasText(!!nextText.trim());
     publishComposerText(nextText);
@@ -1581,7 +1714,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       sel?.addRange(range);
     } catch { /* ignore selection API failures */ }
     onPendingPrefillApplied?.();
-  }, [pendingPrefillText, onPendingPrefillApplied, publishComposerText]);
+  }, [closeQuickSuggestions, pendingPrefillText, onPendingPrefillApplied, publishComposerText]);
 
   const clearSendWarning = useCallback(() => {
     if (sendWarningTimerRef.current) {
@@ -1607,6 +1740,27 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       setAppendSuccessNotice(null);
     }, 3500);
   }, []);
+  const showDeliveryModeNotice = useCallback((append: boolean) => {
+    if (deliveryModeNoticeTimerRef.current) clearTimeout(deliveryModeNoticeTimerRef.current);
+    setDeliveryModeNotice({
+      append,
+      message: t(append ? 'session.delivery_mode_append_toast' : 'session.delivery_mode_queue_toast'),
+    });
+    deliveryModeNoticeTimerRef.current = setTimeout(() => {
+      deliveryModeNoticeTimerRef.current = null;
+      setDeliveryModeNotice(null);
+    }, 2200);
+  }, [t]);
+  const showSupervisionModeNotice = useCallback((mode: SupervisionMode) => {
+    if (supervisionModeNoticeTimerRef.current) clearTimeout(supervisionModeNoticeTimerRef.current);
+    setSupervisionModeNotice(t('session.supervision.modeSaved', {
+      mode: t(`session.supervision.mode.${mode}`),
+    }));
+    supervisionModeNoticeTimerRef.current = setTimeout(() => {
+      supervisionModeNoticeTimerRef.current = null;
+      setSupervisionModeNotice(null);
+    }, 3500);
+  }, [t]);
   const transportQueueAppendFailedLabel = t('session.transport_queue_append_failed');
 
   // Persist input draft across unmount/remount (sub-session minimize/restore)
@@ -1642,6 +1796,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   useEffect(() => {
     attachmentDraftRef.current = attachments;
+    closeQuickSuggestions();
     if (!attachmentDraftKey || hydratedAttachmentDraftKey !== attachmentDraftKey) return;
     try {
       if (attachments.length > 0) sessionStorage.setItem(attachmentDraftKey, JSON.stringify(attachments));
@@ -1649,13 +1804,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     } catch {
       /* ignore */
     }
-  }, [attachmentDraftKey, attachments, hydratedAttachmentDraftKey]);
+  }, [attachmentDraftKey, attachments, closeQuickSuggestions, hydratedAttachmentDraftKey]);
 
   useEffect(() => subscribeComposerUploadSnapshot(composerUploadKey, setUploadSnapshot), [composerUploadKey]);
 
   useEffect(() => () => {
     if (sendWarningTimerRef.current) clearTimeout(sendWarningTimerRef.current);
     if (appendSuccessTimerRef.current) clearTimeout(appendSuccessTimerRef.current);
+    if (deliveryModeNoticeTimerRef.current) clearTimeout(deliveryModeNoticeTimerRef.current);
+    if (supervisionModeNoticeTimerRef.current) clearTimeout(supervisionModeNoticeTimerRef.current);
   }, []);
 
   useEffect(() => {
@@ -1671,6 +1828,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, [activeSession?.name, effectiveRuntimeType]);
 
   const connected = connectedProp ?? !!ws?.connected;
+
+  useEffect(() => {
+    if (!ws
+      || !serverId
+      || !activeSession
+      || !connected
+      || typeof ws.targetsServer !== 'function'
+      || !ws.targetsServer(serverId)) return;
+    return prewarmDirectFileLease(ws, serverId);
+  }, [activeSession?.name, connected, serverId, ws]);
 
   useEffect(() => {
     if (!ws) return;
@@ -1748,19 +1915,27 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const currentTransportConfig = localTransportConfig ?? activeSession?.transportConfig ?? null;
   const hasInvalidSupervisionConfig = hasInvalidSessionSupervisionSnapshot(currentTransportConfig);
   const supervisionSnapshot = extractSessionSupervisionSnapshot(currentTransportConfig);
-  const quickSupervisionMode = supervisionSnapshot?.mode ?? SUPERVISION_MODE.OFF;
+  const quickSupervisionMode = isShareScopedSession
+    ? activeSession?.supervisionMode ?? SUPERVISION_MODE.OFF
+    : supervisionSnapshot?.mode ?? SUPERVISION_MODE.OFF;
   const auditedSessionName = activeSession?.name ?? null;
-  const hasSavedAuditTarget = Boolean(
-    supervisionSnapshot?.auditTargetSessionName
-    && supervisionSnapshot.auditTargetSessionName !== auditedSessionName,
-  );
-  const canQuickControlSupervision = !!(
+  const canQuickPeerAudit = !!(
     activeSession
     && serverId
     && isTransport
     && isSupportedSupervisionTargetSessionType(activeSession.agentType)
   );
-  const supervisorDefaultsPref = useSupervisorDefaults(canQuickControlSupervision);
+  const canQuickViewSupervision = canQuickPeerAudit
+    && canSessionRoleOwnAutomaticSupervision(activeSession?.role)
+    && (!isShareScopedSession || (
+      sharedState?.status === 'active'
+      && sharedState.effectiveRole === 'participant'
+    ));
+  const canQuickControlSupervision = canQuickViewSupervision && canSharedActorControlSession(sharedState);
+  const supervisorDefaultsPref = useSupervisorDefaults(
+    canQuickControlSupervision && !isShareScopedSession,
+    serverId && activeSession?.name ? { serverId, sessionName: activeSession.name } : null,
+  );
   const isCodex = activeSession?.agentType === 'codex' || activeSession?.agentType === 'codex-sdk';
   const isQwen = activeSession?.agentType === 'qwen';
   const isCopilot = activeSession?.agentType === 'copilot-sdk';
@@ -1770,8 +1945,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const isGeminiSdk = activeSession?.agentType === 'gemini-sdk';
   const isGrokSdk = activeSession?.agentType === 'grok-sdk';
   const isKimiSdk = activeSession?.agentType === 'kimi-sdk';
+  const isHermesAgent = activeSession?.agentType === HERMES_AGENT_PROVIDER_ID;
   const isOpenCodeSdk = activeSession?.agentType === 'opencode-sdk';
-  const supportsGenericTransportModelSelect = isCopilot || isCursorHeadless || isDeepseekHarness || isPi || isGeminiSdk || isGrokSdk || isKimiSdk || isOpenCodeSdk;
+  const isCodeBuddy = isCodeBuddyProviderId(activeSession?.agentType);
+  const supportsGenericTransportModelSelect = isCopilot || isCursorHeadless || isDeepseekHarness || isPi || isGeminiSdk || isGrokSdk || isKimiSdk || isHermesAgent || isOpenCodeSdk || isCodeBuddy;
   // Source-of-truth priority for the model picker:
   //   1. `useTransportModels` — live daemon probe via `transport.list_models`
   //      WS round-trip. Works uniformly for main sessions AND sub-sessions
@@ -1812,11 +1989,17 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (isGeminiSdk) {
       return GEMINI_SDK_MODEL_SUGGESTIONS;
     }
-    if (isKimiSdk) {
+    if (isKimiSdk || isHermesAgent) {
       return dynamicTransportModels.models.map((m) => m.id);
     }
     if (isGrokSdk) {
       return dynamicTransportModels.models.map((m) => m.id);
+    }
+    if (activeSession?.agentType === CODEBUDDY_PROVIDER_IDS.CHINA) {
+      return CODEBUDDY_CHINA_MODEL_FALLBACK;
+    }
+    if (activeSession?.agentType === CODEBUDDY_PROVIDER_IDS.INTERNATIONAL) {
+      return CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK;
     }
     return [];
   }, [
@@ -1826,7 +2009,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     isGeminiSdk,
     isGrokSdk,
     isKimiSdk,
+    isHermesAgent,
     isOpenCodeSdk,
+    isCodeBuddy,
+    activeSession?.agentType,
     activeSession?.copilotAvailableModels,
     activeSession?.cursorAvailableModels,
   ]);
@@ -1950,6 +2136,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     quickSuggestionQuery,
   ]);
   const quickSuggestionPickerRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (quickSuggestionKind === 'phrase' && quickSuggestions.length === 0) {
+      closeQuickSuggestions();
+    }
+  }, [closeQuickSuggestions, quickSuggestionKind, quickSuggestions.length]);
   useEffect(() => {
     if (quickSuggestionKind === null || quickSuggestions.length === 0) return;
     const highlighted = quickSuggestionPickerRef.current?.querySelector<HTMLElement>('[data-hl="true"]');
@@ -2142,26 +2333,59 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           failedMessageEntries: currentSession.failedMessageEntries,
         }, payload, snapshotSessionName);
         if (Object.keys(patch).length === 0) return false;
-        const entries = (patch.transportPendingMessageEntries ?? []).map((entry) => ({
+        const pendingEntries = (patch.transportPendingMessageEntries ?? []).map((entry) => ({
           ...entry,
           status: 'queued' as const,
         }));
+        const failedEntries = (patch.failedMessageEntries ?? []).map((entry) => ({
+          ...entry,
+          status: 'failed' as const,
+        }));
+        const queueReconcilesCommandId = typeof payload.queueReconcilesCommandId === 'string'
+          ? payload.queueReconcilesCommandId.trim()
+          : '';
+        if (
+          queueReconcilesCommandId
+          && queuedMutationRollbackRef.current.get(queueReconcilesCommandId)?.type === 'append'
+        ) {
+          reconciledMissingAppendCommandIdsRef.current.add(queueReconcilesCommandId);
+        }
         setRealtimeQueueOverride({
           sessionName: snapshotSessionName,
-          entries,
+          pendingEntries,
+          failedEntries,
           version: patch.transportPendingMessageVersion,
         });
+        // Several authoritative frames can arrive in one websocket burst,
+        // before React commits the state update above. Advance the mutable
+        // reducer baseline synchronously so an older session_list/subsession
+        // frame in that same burst cannot overwrite this snapshot and revive a
+        // retired Retry card.
+        realtimeQueueStateRef.current = {
+          activeSession: {
+            ...currentSession,
+            queueEpoch: patch.queueEpoch,
+            queueAuthorityId: patch.queueAuthorityId,
+            transportPendingMessageVersion: patch.transportPendingMessageVersion,
+            transportPendingMessageEntries: patch.transportPendingMessageEntries,
+            failedMessageEntries: patch.failedMessageEntries,
+          },
+          incomingQueuedTransportEntries: [...pendingEntries, ...failedEntries],
+          incomingQueuedTransportVersion: patch.transportPendingMessageVersion,
+        };
         // Once an authoritative snapshot no longer contains an optimistically
         // removed id, its deletion is fully reconciled and the tombstone can be
         // discarded. Keep tombstones that are still present in a stale/equal
         // snapshot so those cards cannot flash back into the UI.
-        const authoritativeIds = new Set(entries.map((entry) => entry.clientMessageId));
+        const authoritativeIds = new Set(
+          [...pendingEntries, ...failedEntries].map((entry) => entry.clientMessageId),
+        );
         setOptimisticallyRemovedQueuedIds((prev) => {
           if (prev.size === 0) return prev;
           const next = new Set([...prev].filter((id) => authoritativeIds.has(id)));
           return next.size === prev.size ? prev : next;
         });
-        if (entries.length === 0) {
+        if (pendingEntries.length === 0) {
           lastRealtimeEmptyQueueSnapshotRef.current = {
             sessionName: snapshotSessionName,
             version: patch.transportPendingMessageVersion,
@@ -2171,6 +2395,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         } else {
           lastRealtimeEmptyQueueSnapshotRef.current = null;
         }
+        acceptedQueueSnapshotSeqRef.current += 1;
         return true;
       };
       const removeLocalQueuedEntry = (commandId: string, text?: string) => {
@@ -2223,6 +2448,32 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       if (msg.type === 'command.ack') {
         if (msg.session && msg.session !== sessionName) return;
         const rollback = queuedMutationRollbackRef.current.get(msg.commandId);
+        // Authority BEFORE rollback. The daemon also broadcasts this snapshot on
+        // a timeline session.state for other subscribers, but that frame is
+        // best-effort: when it was the only carrier, losing it meant the append
+        // rollback restored a card the canonical queue no longer had, and the
+        // next click answered "Queued message not found" again. The ack is the
+        // reliable, replayable frame, so the snapshot it carries is applied here
+        // first and the rollback then runs against post-reconciliation state.
+        //
+        // `applyRealtimeQueueSnapshot` is the SAME gate the timeline path uses:
+        // it returns false for a foreign session, a payload with no snapshot, or
+        // any epoch/authority/stale-version violation, so a rejected snapshot
+        // can never clear a still-valid card.
+        const ackReconcilesCommandId = typeof msg.queueReconcilesCommandId === 'string'
+          ? msg.queueReconcilesCommandId.trim()
+          : '';
+        if (applyRealtimeQueueSnapshot(msg as unknown as Record<string, unknown>, sessionName)
+          && ackReconcilesCommandId
+          && queuedMutationRollbackRef.current.get(ackReconcilesCommandId)?.type === 'append') {
+          reconciledMissingAppendCommandIdsRef.current.add(ackReconcilesCommandId);
+          // The optimistic post-append array is obsolete the moment the queue
+          // authority answers, and an EMPTY one hard-overrides the snapshot
+          // rather than merging with it, so leaving it in place hid a survivor
+          // the authority still listed. Dropping it lets the snapshot alone
+          // decide: the missing card stays gone, the real one stays visible.
+          setOptimisticQueuedEntries(null);
+        }
         if (msg.status === 'error' || msg.status === 'conflict') {
           if (rollback) {
             if (rollback.type === 'undo') {
@@ -2240,24 +2491,87 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 for (const id of rollbackIds) next.delete(id);
                 return next;
               });
-              const rollbackQueueIds = new Set(rollback.queue.map((entry) => entry.clientMessageId));
-              const restoreAppendQueue = (source: LocalQueuedTransportEntry[]) => [
-                ...rollback.queue,
-                ...source.filter((entry) => !rollbackQueueIds.has(entry.clientMessageId)),
-              ];
-              const currentQueue = realtimeQueueStateRef.current;
-              // Keep the incoming/base order aligned with the optimistic
-              // rollback. Merely returning an ordered optimistic array is not
-              // enough: the merge map preserves the prior authoritative
-              // insertion order for ids that exist in both arrays.
-              setRealtimeQueueOverride({
-                sessionName,
-                entries: restoreAppendQueue(currentQueue.incomingQueuedTransportEntries),
-                version: currentQueue.incomingQueuedTransportVersion,
-              });
-              setOptimisticQueuedEntries((prev) => restoreAppendQueue(
-                prev ?? currentQueue.incomingQueuedTransportEntries,
-              ));
+              // Rollback restores the PRE-CLICK queue, which is only the right
+              // answer while the click is still the newest thing that happened.
+              // Two ways it stops being that:
+              //
+              //  - this ack carried a snapshot that reconciled this exact
+              //    commandId (marked above), or
+              //  - any authoritative snapshot was accepted AFTER the click,
+              //    carrying no queueReconcilesCommandId of its own.
+              //
+              // The second case is how a ghost came back: click at v7, an
+              // ordinary v9 snapshot retires the ghost, then a delayed/replayed
+              // not-found ack arrives at v8. The ack snapshot is correctly
+              // rejected as stale -- so it is NOT reconciliation -- and the
+              // rollback then reinstated the v7 ghost over v9 and stamped it
+              // with v9's version, which made it look authoritative.
+              //
+              // Comparing against the authority captured at click time settles
+              // it without trusting the late ack's own version. A normal
+              // provider error with no newer authority still rolls back.
+              // Supersession is scoped to the ABSENT case, and deliberately so.
+              //
+              // A newer authoritative snapshot may legitimately omit a selected
+              // row merely because this append reserved it. When admission then
+              // fails for a provider reason, that row still exists and rollback
+              // must put it back ahead of whatever arrived meanwhile -- an
+              // existing contract, pinned by the ordering test above. So
+              // "authority answered since the click" cannot supersede on its own.
+              //
+              // `queueReconcilesCommandId` is the discriminator: the daemon
+              // attaches it only on the not_found branch, i.e. only when it has
+              // established the selected rows are ABSENT, never for a provider
+              // error. Combined with an accepted post-click snapshot it says
+              // exactly what is needed -- the rows are gone AND newer truth is
+              // already on screen -- so the pre-click queue must not return.
+              //
+              // Only the DECLARATION is taken from the ack here, never its queue
+              // contents: a delayed or replayed not-found ack can be stale (its
+              // own snapshot rightly rejected), yet it remains truthful about a
+              // commandId this client issued. The displayed queue still comes
+              // from the snapshot that was actually accepted.
+              const appendSuperseded = reconciledMissingAppendCommandIdsRef.current.delete(msg.commandId)
+                || (ackReconcilesCommandId === msg.commandId
+                  && acceptedQueueSnapshotSeqRef.current > rollback.acceptedSnapshotSeq);
+              if (appendSuperseded) {
+                // The optimistic post-append array is obsolete, and an EMPTY one
+                // hard-overrides the authoritative snapshot instead of merging
+                // with it, which would hide a survivor the authority still lists.
+                setOptimisticQueuedEntries(null);
+              }
+              if (!appendSuperseded) {
+                // The queue row was moved into the timeline optimistically when
+                // the user clicked Append. A genuine provider rejection returns
+                // it to the queue, so remove that pending timeline projection in
+                // the same reconciliation turn instead of showing it twice. A
+                // not-found result superseded by newer authority keeps the row:
+                // it may already be delivered and the exact echo/backfill owns
+                // its final reconciliation.
+                for (const entry of rollback.entries) {
+                  onRemoveOptimisticMessage?.(entry.clientMessageId);
+                }
+                const rollbackQueueIds = new Set(rollback.queue.map((entry) => entry.clientMessageId));
+                const restoreAppendQueue = (source: LocalQueuedTransportEntry[]) => [
+                  ...rollback.queue,
+                  ...source.filter((entry) => !rollbackQueueIds.has(entry.clientMessageId)),
+                ];
+                const currentQueue = realtimeQueueStateRef.current;
+                const restored = restoreAppendQueue(currentQueue.incomingQueuedTransportEntries);
+                // Keep the incoming/base order aligned with the optimistic
+                // rollback. Merely returning an ordered optimistic array is not
+                // enough: the merge map preserves the prior authoritative
+                // insertion order for ids that exist in both arrays.
+                setRealtimeQueueOverride({
+                  sessionName,
+                  pendingEntries: restored.filter((entry) => entry.status !== 'failed'),
+                  failedEntries: restored.filter((entry) => entry.status === 'failed'),
+                  version: currentQueue.incomingQueuedTransportVersion,
+                });
+                setOptimisticQueuedEntries((prev) => restoreAppendQueue(
+                  prev ?? currentQueue.incomingQueuedTransportEntries,
+                ));
+              }
             }
             if (rollback.type !== 'append') {
               setOptimisticQueuedEntries((prev) => {
@@ -2279,6 +2593,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             markLocalQueuedEntry(msg.commandId, 'failed');
           }
         } else {
+          reconciledMissingAppendCommandIdsRef.current.delete(msg.commandId);
           failedQueuedCommandIdsRef.current.delete(msg.commandId);
           if (rollback) queuedMutationRollbackRef.current.delete(msg.commandId);
           markLocalQueuedEntry(msg.commandId, 'queued');
@@ -2354,7 +2669,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       }
     };
     return ws.onMessage(handleRealtimeQueueMessage);
-  }, [activeSession?.name, showSendWarning, transportQueueAppendFailedLabel, ws]);
+  }, [activeSession?.name, onRemoveOptimisticMessage, showSendWarning, transportQueueAppendFailedLabel, ws]);
 
   // Reset P2P mode on session change
   useEffect(() => { setP2pMode('solo'); setP2pOpen(false); }, [activeSession?.name]);
@@ -2449,22 +2764,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       ? t('session.supervision.quickAuditLabel')
       : t('session.supervision.quickLabel');
 
-  const persistTransportConfig = useCallback(async (
-    transportConfig: Record<string, unknown> | null,
-    supervision: Partial<SessionSupervisionSnapshot>,
-  ) => {
+  const persistTransportConfig = useCallback(async (supervision: Partial<SessionSupervisionSnapshot>) => {
     if (!serverId || !activeSession) return;
-    let persistedTransportConfig = transportConfig;
-    if (isShareScopedSession) {
-      persistedTransportConfig = await patchSessionSupervision(serverId, activeSession.name, supervision);
-    } else if (subSessionId) {
-      await patchSubSession(serverId, subSessionId, { transportConfig });
-    } else {
-      await patchSession(serverId, activeSession.name, { transportConfig });
-    }
+    const persistedTransportConfig = await patchSessionSupervision(serverId, activeSession.name, supervision);
     setLocalTransportConfig(persistedTransportConfig);
     onTransportConfigSaved?.(persistedTransportConfig);
-  }, [activeSession, isShareScopedSession, onTransportConfigSaved, serverId, subSessionId]);
+  }, [activeSession, onTransportConfigSaved, serverId]);
 
   const handleQuickSupervisionModeSelect = useCallback(async (nextMode: SupervisionMode) => {
     if (!activeSession || !serverId || !canQuickControlSupervision) return;
@@ -2474,24 +2779,44 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       onSettings?.(nextMode === SUPERVISION_MODE.SUPERVISED_AUDIT
         ? {
             supervisionMode: SUPERVISION_MODE.SUPERVISED_AUDIT,
-            focus: SESSION_SETTINGS_FOCUS.PEER_AUDIT_TARGET,
           }
         : undefined);
     };
 
     if (nextMode === SUPERVISION_MODE.OFF) {
       const nextSnapshot = supervisionSnapshot
-        ? { ...supervisionSnapshot, mode: SUPERVISION_MODE.OFF }
+        ? (() => {
+            const {
+              auditTargetSessionName: _legacyTarget,
+              auditTargetFingerprint: _legacyFingerprint,
+              peerAuditPromptVersion: _legacyPrompt,
+              ...automaticSnapshot
+            } = supervisionSnapshot;
+            return { ...automaticSnapshot, mode: SUPERVISION_MODE.OFF };
+          })()
         : { mode: SUPERVISION_MODE.OFF };
-      const nextTransportConfig = buildTransportConfigWithSupervision(
-        currentTransportConfig,
-        nextSnapshot,
-      );
       try {
-        await persistTransportConfig(nextTransportConfig, nextSnapshot);
+        await persistTransportConfig(nextSnapshot);
         setAutoOpen(false);
+        showSupervisionModeNotice(nextMode);
       } catch {
-        showSendWarning(t('upload.upload_failed'));
+        showSendWarning(t('session.supervision.modeSaveFailed'));
+      }
+      return;
+    }
+
+    // Share-scoped rows intentionally expose only the current mode, never the
+    // owner's provider/runtime configuration. Persist a mode-only patch and
+    // let the server merge it into the already-authoritative snapshot. This
+    // keeps both session-share and server-share actors functional without
+    // projecting credentials or making their personal defaults authoritative.
+    if (isShareScopedSession) {
+      try {
+        await persistTransportConfig({ mode: nextMode });
+        setAutoOpen(false);
+        showSupervisionModeNotice(nextMode);
+      } catch {
+        showSendWarning(t('session.supervision.modeSaveFailed'));
       }
       return;
     }
@@ -2501,23 +2826,18 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       return;
     }
 
-    // Settings persist the user's exact auditor choice. Live availability and
-    // delivery remain daemon/ordinary-delegation concerns at audit time.
-    if (nextMode === SUPERVISION_MODE.SUPERVISED_AUDIT && !hasSavedAuditTarget) {
-      openSettingsForMode();
-      return;
-    }
-
     let nextSnapshot: Partial<SessionSupervisionSnapshot> | null = null;
     if (supervisionSnapshot) {
-      nextSnapshot = { ...supervisionSnapshot, mode: nextMode };
+      const {
+        auditTargetSessionName: _legacyTarget,
+        auditTargetFingerprint: _legacyFingerprint,
+        peerAuditPromptVersion: _legacyPrompt,
+        ...automaticSnapshot
+      } = supervisionSnapshot;
+      nextSnapshot = { ...automaticSnapshot, mode: nextMode };
     } else {
       const defaults = supervisorDefaultsPref.value ?? (supervisorDefaultsPref.loaded ? null : await supervisorDefaultsPref.reload());
       if (!defaults) {
-        openSettingsForMode();
-        return;
-      }
-      if (nextMode === SUPERVISION_MODE.SUPERVISED_AUDIT) {
         openSettingsForMode();
         return;
       }
@@ -2529,26 +2849,46 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         promptVersion: defaults.promptVersion,
         maxAutoContinueStreak: defaults.maxAutoContinueStreak,
         maxAutoContinueTotal: defaults.maxAutoContinueTotal,
+        // Carry the configured pools through. Dropping them here would both
+        // lose the operator's choice and make the pool gate below unsatisfiable
+        // for any session enabled straight from defaults.
+        executionPools: defaults.executionPools,
       };
     }
 
-    const nextTransportConfig = buildTransportConfigWithSupervision(currentTransportConfig, nextSnapshot);
+    // Fail closed on execution pools, asking the SAME shared question the
+    // authoritative save entry asks, so the toggle can never enable a mode the
+    // server will refuse. Guidance is already localized in shared/, so it is
+    // not restated here as seven more web-only strings.
+    const poolGate = evaluateAutomaticSupervisionEnablement({
+      mode: nextMode,
+      executionPools: (nextSnapshot as Partial<SessionSupervisionSnapshot>)?.executionPools ?? null,
+      uiLocale: i18n?.resolvedLanguage ?? i18n?.language,
+    });
+    if (!poolGate.ok) {
+      showSendWarning(poolGate.guidance);
+      openSettingsForMode();
+      return;
+    }
+
     try {
-      await persistTransportConfig(nextTransportConfig, nextSnapshot);
+      await persistTransportConfig(nextSnapshot);
       setAutoOpen(false);
+      showSupervisionModeNotice(nextMode);
     } catch {
-      showSendWarning(t('upload.upload_failed'));
+      showSendWarning(t('session.supervision.modeSaveFailed'));
     }
   }, [
     activeSession,
     canQuickControlSupervision,
     currentTransportConfig,
     hasInvalidSupervisionConfig,
+    isShareScopedSession,
     onSettings,
     persistTransportConfig,
-    hasSavedAuditTarget,
     serverId,
     showSendWarning,
+    showSupervisionModeNotice,
     supervisionSnapshot,
     supervisorDefaultsPref.loaded,
     supervisorDefaultsPref.reload,
@@ -2593,7 +2933,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     const lineHeight = Number.parseFloat(computed.lineHeight || '') || 20;
     const verticalPadding = (Number.parseFloat(computed.paddingTop || '') || 0)
       + (Number.parseFloat(computed.paddingBottom || '') || 0);
-    const multilineThreshold = (lineHeight * 2) + verticalPadding + 4;
+    // Treat the composer as multiline as soon as it wraps onto a second line.
+    // This keeps the mobile side controls out of the text area once horizontal
+    // space becomes scarce, instead of waiting until a third line appears.
+    const multilineThreshold = lineHeight + verticalPadding + 4;
     setMobileComposerMultiline(root.scrollHeight > multilineThreshold);
   }, []);
 
@@ -2632,6 +2975,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   const appendToInput = (paths: string[]) => {
     if (!paths.length) return;
+    closeQuickSuggestions();
     const suffix = paths.join(' ');
     let nextText = suffix;
     if (divRef.current) {
@@ -2686,7 +3030,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, [publishComposerText, syncMobileComposerMetrics]);
 
   /**
-   * Insert a `^^(refName)-(displayName)` machine reference at the caret via the
+   * Insert a `^^(nodeId)-(displayName)` machine reference at the caret via the
    * shared helper (stable marker plus render-only note; never resolves or sends),
    * mirroring `insertAliasMarker`.
    * When the inline `^query` fragment is still present at the end of the composer
@@ -2694,7 +3038,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
    * stray `^dep` before the inserted marker. Used by both the inline picker and
    * the `@machine` category.
    */
-  const insertMachineMarker = useCallback((refName: string, displayName: string) => {
+  const insertMachineMarker = useCallback((nodeId: string, displayName: string) => {
     const el = divRef.current;
     if (el) {
       const current = readComposerElementText(el);
@@ -2713,7 +3057,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       } catch { /* jsdom lacks Selection API */ }
       el.focus();
     }
-    insertMachineMarkerAtCaret(refName, displayName);
+    insertMachineMarkerAtCaret(nodeId, displayName);
     const nextText = el ? readComposerElementText(el) : '';
     setHasText(!!nextText.trim());
     publishComposerText(nextText);
@@ -2732,10 +3076,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, [activeSession?.projectDir]);
 
   const openSpecChangesPath = useMemo(() => {
-    const cwd = activeSession?.projectDir;
+    const cwd = activeSession?.projectDir
+      ?? (isShareScopedSession ? FS_SESSION_ROOT_PATH : undefined);
     if (!cwd) return null;
     return `${cwd.replace(/[\\/]+$/, '')}/openspec/changes`;
-  }, [activeSession?.projectDir]);
+  }, [activeSession?.projectDir, isShareScopedSession]);
   const openSpecChangeListCacheKey = useMemo(() => (
     openSpecChangesPath ? buildOpenSpecChangeListCacheKey(serverId, openSpecChangesPath) : null
   ), [openSpecChangesPath, serverId]);
@@ -3462,7 +3807,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const buildSendPayload = useCallback((options?: string | BuildSendPayloadOptions): PendingSendPayload | null => {
     const normalizedOptions: BuildSendPayloadOptions =
       typeof options === 'string' ? { modeOverride: options } : (options ?? {});
-    let text = getText();
+    let text = normalizedOptions.textOverride ?? getText();
     // Capture the user's OWN composed body BEFORE any synthetic @-prefix,
     // delegation/P2P rewrite, quote block, or attachment refs are concatenated.
     // Alias markers (A′) resolve against THIS body only — a `;;(secret)` buried
@@ -3499,6 +3844,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         targetSession: pendingDelegateTarget.session,
         targetLabel: pendingDelegateTarget.label,
         task,
+        uiLocale: i18n.resolvedLanguage ?? i18n.language,
       });
     } else if (pendingTargets.length > 0) {
       // @ picker was used — derive routing from the visible textbox order, then strip matched labels.
@@ -3766,6 +4112,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       sessionName: activeSession.name,
       text,
       ...extra,
+      uiLocale: i18n?.resolvedLanguage ?? i18n?.language,
       commandId,
     };
     const markSendFailed = (err: unknown) => {
@@ -3797,7 +4144,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       requestActiveTimelineRefreshAfterUserAction();
     }
     return commandId;
-  }, [activeSession, cancelActiveTransportTurn, effectiveRuntimeType, makeCommandId, serverId, showStopFeedback, ws]);
+  }, [activeSession, cancelActiveTransportTurn, effectiveRuntimeType, i18n?.language, i18n?.resolvedLanguage, makeCommandId, serverId, showStopFeedback, ws]);
 
   const sendQueuedMessageMutation = useCallback((
     type: 'session.edit_queued_message' | 'session.undo_queued_message' | typeof TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
@@ -3816,7 +4163,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   const finalizeSend = useCallback((
     payload: PendingSendPayload,
-    options?: { clearComposer?: boolean; programmaticDelegation?: boolean },
+    options?: { clearComposer?: boolean; programmaticDelegation?: boolean; retainOnRejection?: boolean },
   ): 'accepted' | 'rejected' => {
     if (!activeSession) return 'rejected';
     if (uploading && !options?.programmaticDelegation) {
@@ -3829,6 +4176,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       || (payload.extra.p2pSessionConfig != null && typeof payload.extra.p2pSessionConfig === 'object')
     );
     const isDelegationSend = Boolean(payload.delegation);
+    const directAppendRequested = effectiveRuntimeType === 'transport'
+      && directAppendMode
+      && !isP2pSend
+      && !isDelegationSend
+      && !payload.text.trim().startsWith('/');
+    const effectiveSendExtra = directAppendRequested
+      ? { ...payload.extra, deliveryMode: SESSION_SEND_DELIVERY_MODES.APPEND }
+      : payload.extra;
     const clearComposerState = () => {
       pendingAtTargetsRef.current = [];
       pendingConfigOverrideRef.current = null;
@@ -3895,13 +4250,19 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     const commandId = makeCommandId();
     let localFailure: string | undefined;
     try {
-      if (!sendSessionMessage(payload.text, payload.extra, commandId)) return 'rejected';
+      if (!sendSessionMessage(payload.text, effectiveSendExtra, commandId)) return 'rejected';
     } catch (err) {
       localFailure = err instanceof Error ? err.message : String(err || 'Send failed');
     }
     if (!localFailure) quickData.recordHistory(payload.delegation?.task ?? payload.text, activeSession.name);
+    // An Append-mode send is headed INTO the running turn, not behind it, so it
+    // belongs in the timeline immediately (optimistic bubble reconciled by the
+    // daemon's user.message for the same id), not in the FIFO card strip.
+    // Parking it as a queue card made it vanish whenever a snapshot/delivery
+    // frame retired the card before the timeline echo arrived.
     const shouldShowAsQueued = effectiveRuntimeType === 'transport'
       && transportSendShouldQueue
+      && !directAppendRequested
       && !isP2pSend
       && !isDelegationSend
       && !payload.text.trim().startsWith('/');
@@ -3933,15 +4294,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       onSend?.(activeSession.name, payload.text, {
         commandId,
         ...(attachmentSnapshot ? { attachments: attachmentSnapshot } : {}),
-        ...(payload.extra && Object.keys(payload.extra).length > 0 ? { extra: payload.extra } : {}),
+        ...(effectiveSendExtra && Object.keys(effectiveSendExtra).length > 0 ? { extra: effectiveSendExtra } : {}),
         ...(localFailure ? { localFailure } : {}),
       });
     }
-    if (options?.clearComposer) {
+    if (options?.clearComposer && (!localFailure || !options.retainOnRejection)) {
       clearComposerState();
     }
     return localFailure ? 'rejected' : 'accepted';
-  }, [activeSession, attachmentDraftKey, cancelActiveTransportTurn, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, incomingQueuedTransportVersion, makeCommandId, onRemoveQuote, onSend, publishComposerText, quickData, queuedTransportEntries, quotes, sendQueuedMessageMutation, sendSessionMessage, showSendWarning, showStopFeedback, t, transportSendShouldQueue, uploading]);
+  }, [activeSession, attachmentDraftKey, cancelActiveTransportTurn, directAppendMode, draftKey, editingQueuedMessageId, effectiveRuntimeType, incomingQueuedTransportEntries, incomingQueuedTransportVersion, makeCommandId, onRemoveQuote, onSend, publishComposerText, quickData, queuedTransportEntries, quotes, sendQueuedMessageMutation, sendSessionMessage, showSendWarning, showStopFeedback, t, transportSendShouldQueue, uploading]);
 
   const handleQueuedMessageEdit = useCallback((entry: { clientMessageId: string; text: string }) => {
     if (!isEditableQueuedEntry(entry)) return;
@@ -3959,11 +4320,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       setMobileComposerMultiline(false);
     }
     if (editingQueuedMessageId === entry.clientMessageId) setEditingQueuedMessageId(null);
-    // Drop the local optimistic copy immediately for responsiveness.
-    setOptimisticQueuedEntries((prev) => {
-      const source = prev ?? incomingQueuedTransportEntries;
-      return source.filter((item) => item.clientMessageId !== entry.clientMessageId);
-    });
     // ALWAYS ask the backend to drop it — even when the entry still looks "local"
     // (present optimistically but not yet echoed in the authoritative snapshot).
     // The WS enqueue for this message is ordered BEFORE this delete, so the daemon
@@ -3981,8 +4337,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     } catch {
       return;
     }
-    if (!mutationCommandId) return; // WS unavailable: the local removal above stands.
+    // Without a mutation command there is no authoritative cancellation. Keep
+    // the row visible rather than pretending a local-only delete succeeded.
+    if (!mutationCommandId) return;
     queuedMutationRollbackRef.current.set(mutationCommandId, { type: 'undo', entry: { ...entry, status: 'queued' } });
+    setOptimisticQueuedEntries((prev) => {
+      const source = prev ?? incomingQueuedTransportEntries;
+      return source.filter((item) => item.clientMessageId !== entry.clientMessageId);
+    });
     setOptimisticallyRemovedQueuedIds((prev) => {
       if (prev.has(entry.clientMessageId)) return prev;
       return new Set([...prev, entry.clientMessageId]);
@@ -3990,6 +4352,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, [editingQueuedMessageId, incomingQueuedTransportEntries, isEditableQueuedEntry, publishComposerText, sendQueuedMessageMutation]);
 
   const handleQueuedMessagesAppend = useCallback((entries: LocalQueuedTransportEntry[]): boolean => {
+    if (!activeSession) return false;
     const appendable = entries.filter((entry) => (
       entry.status !== 'failed' && isEditableQueuedEntry(entry)
     ));
@@ -4010,7 +4373,20 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       type: 'append',
       entries: appendable.map((entry) => ({ ...entry, status: 'queued' })),
       queue: queuedTransportEntries.map((entry) => ({ ...entry })),
+      acceptedSnapshotSeq: acceptedQueueSnapshotSeqRef.current,
     });
+    // Move the selected rows into the visible conversation immediately. The
+    // daemon emits the same clientMessageId after provider admission, so the
+    // normal optimistic reconciliation replaces these rows without duplication.
+    // If admission rejects, the ack path above removes them while restoring the
+    // queue. This keeps correctness authoritative without making the user wait
+    // for the provider round-trip (or a best-effort timeline broadcast).
+    for (const entry of appendable) {
+      onSend?.(activeSession.name, entry.text, {
+        commandId: entry.clientMessageId,
+        queueAppend: true,
+      });
+    }
     const appendIds = new Set(appendable.map((entry) => entry.clientMessageId));
     setOptimisticQueuedEntries((prev) => {
       const source = prev ?? incomingQueuedTransportEntries;
@@ -4018,7 +4394,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     });
     setOptimisticallyRemovedQueuedIds((prev) => new Set([...prev, ...appendIds]));
     return true;
-  }, [incomingQueuedTransportEntries, isEditableQueuedEntry, queuedTransportEntries, sendQueuedMessageMutation, showSendWarning, transportQueueAppendFailedLabel]);
+  }, [activeSession, incomingQueuedTransportEntries, isEditableQueuedEntry, onSend, queuedTransportEntries, sendQueuedMessageMutation, showSendWarning, transportQueueAppendFailedLabel]);
 
   const handleStopButtonPress = useCallback(() => {
     if (appendableQueuedTransportEntries.length > 0) {
@@ -4075,8 +4451,20 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       commandId = null;
     }
     if (!commandId) return;
+    let dismissCommandId: string | false = false;
+    try {
+      dismissCommandId = sendQueuedMessageMutation('session.undo_queued_message', {
+        clientMessageId: entry.clientMessageId,
+      });
+    } catch {
+      dismissCommandId = false;
+    }
+    if (dismissCommandId) {
+      queuedMutationRollbackRef.current.set(dismissCommandId, { type: 'undo', entry });
+      setOptimisticallyRemovedQueuedIds((prev) => new Set([...prev, entry.clientMessageId]));
+    }
     setOptimisticQueuedEntries((prev) => {
-      const source = prev ?? [];
+      const source = prev ?? incomingQueuedTransportEntries;
       const next = source.filter((item) => item.clientMessageId !== entry.clientMessageId);
       next.push({
         clientMessageId: commandId,
@@ -4087,7 +4475,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       });
       return next;
     });
-  }, [aliasAll, incomingQueuedTransportVersion, sendSessionMessage]);
+  }, [aliasAll, incomingQueuedTransportEntries, incomingQueuedTransportVersion, sendQueuedMessageMutation, sendSessionMessage]);
 
   const maybePersistComboSendSkip = useCallback(() => {
     if (!rememberComboSendChoice) return;
@@ -4127,26 +4515,38 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     return null;
   }, [attachments.length, hasConfiguredP2pParticipants, p2pMode, quotes, t]);
 
-  const requestSend = useCallback((payload: PendingSendPayload | null, options?: { clearComposer?: boolean }) => {
-    if (!payload) return;
+  const requestSend = useCallback((
+    payload: PendingSendPayload | null,
+    options?: {
+      clearComposer?: boolean;
+      retainOnRejection?: boolean;
+      onConfirmedAccepted?: () => void;
+    },
+  ): 'accepted' | 'pending' | 'rejected' => {
+    closeQuickSuggestions();
+    if (!payload) return 'rejected';
     const validationError = getSendValidationError(payload);
     if (validationError) {
       showSendWarning(validationError);
-      return;
+      return 'rejected';
     }
     clearSendWarning();
     const comboMode = typeof payload.extra.p2pMode === 'string' ? payload.extra.p2pMode : null;
     if (comboMode && isComboMode(comboMode) && !skipComboSendConfirm) {
       setRememberComboSendChoice(false);
-      setPendingComboSendConfirm({
+      const confirmation: PendingComboSendConfirmation = {
         payload,
         modeLabel: getP2pModeLabel(comboMode, t),
         clearComposer: !!options?.clearComposer,
-      });
-      return;
+        retainOnRejection: !!options?.retainOnRejection,
+        onConfirmedAccepted: options?.onConfirmedAccepted,
+      };
+      pendingComboSendConfirmRef.current = confirmation;
+      setPendingComboSendConfirm(confirmation);
+      return 'pending';
     }
-    finalizeSend(payload, options);
-  }, [clearSendWarning, finalizeSend, getSendValidationError, showSendWarning, skipComboSendConfirm, t]);
+    return finalizeSend(payload, options);
+  }, [clearSendWarning, closeQuickSuggestions, finalizeSend, getSendValidationError, showSendWarning, skipComboSendConfirm, t]);
 
   const handleSend = useCallback(() => {
     requestSend(buildSendPayload(), { clearComposer: true });
@@ -4156,6 +4556,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     sessionName: string;
     label: string;
     task: string;
+    preset: QuickAgentDelegationPreset;
   }) => {
     const task = input.task.trim();
     if (!task) {
@@ -4172,6 +4573,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         targetSession: input.sessionName,
         targetLabel: input.label,
         task,
+        auditCycle: input.preset === 'audit',
+        uiLocale: i18n.resolvedLanguage ?? i18n.language,
       }),
       extra: {},
       delegation: {
@@ -4185,7 +4588,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       return;
     }
     setQuickDelegationError(t('peerAuditQuick.sendFailed'));
-  }, [finalizeSend, t]);
+  }, [finalizeSend, i18n.language, i18n.resolvedLanguage, t]);
 
   const handleDirectComboSelect = useCallback((mode: string, roundsOverride?: number) => {
     setP2pOpen(false);
@@ -4246,27 +4649,41 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   const handleComboSendCancel = useCallback(() => {
     maybePersistComboSendSkip();
+    pendingComboSendConfirmRef.current = null;
     setPendingComboSendConfirm(null);
     setRememberComboSendChoice(false);
   }, [maybePersistComboSendSkip]);
 
   const handleComboSendConfirm = useCallback(() => {
-    const pending = pendingComboSendConfirm;
+    const pending = pendingComboSendConfirmRef.current;
     if (!pending) return;
+    // Consume the authority before sending. A repeated click or stale handler
+    // can therefore never dispatch the same voice transcript twice.
+    pendingComboSendConfirmRef.current = null;
     maybePersistComboSendSkip();
     setPendingComboSendConfirm(null);
     setRememberComboSendChoice(false);
-    finalizeSend(pending.payload, { clearComposer: pending.clearComposer });
-  }, [finalizeSend, maybePersistComboSendSkip, pendingComboSendConfirm]);
+    const outcome = finalizeSend(pending.payload, {
+      clearComposer: pending.clearComposer,
+      retainOnRejection: pending.retainOnRejection,
+    });
+    if (outcome === 'accepted') pending.onConfirmedAccepted?.();
+  }, [finalizeSend, maybePersistComboSendSkip]);
 
   const sendOpenSpecPrompt = useCallback((text: string) => {
     finalizeSend({ text, extra: {} }, { clearComposer: false });
   }, [finalizeSend]);
 
-  // Voice overlay send handler — applies same P2P mode as text send
+  // Voice is an alternate editor for the same composer, not a separate send
+  // lane. Reuse the ordinary payload builder so the current attachment/quote/
+  // routing snapshot is sent and cleared with the same success semantics.
   const handleVoiceSend = useCallback((voiceText: string) => {
-    requestSend(buildModeOnlySendPayload(voiceText));
-  }, [buildModeOnlySendPayload, requestSend]);
+    return requestSend(buildSendPayload({ textOverride: voiceText }), {
+      clearComposer: true,
+      retainOnRejection: true,
+      onConfirmedAccepted: () => setVoiceOpen(false),
+    });
+  }, [buildSendPayload, requestSend]);
 
   const handleKeyDown = (e: KeyboardEvent) => {
     if (imeComposingRef.current || isImeComposingKeyEvent(e)) return;
@@ -4388,7 +4805,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         setMachineQuery('');
         machineJustClosedRef.current = true;
         setTimeout(() => { machineJustClosedRef.current = false; }, 150);
-        if (chosen) insertMachineMarker(chosen.refName, chosen.displayName);
+        if (chosen?.nodeId) insertMachineMarker(chosen.nodeId, chosen.displayName);
         return;
       }
     }
@@ -4481,6 +4898,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   const handleBlur = () => {
     setComposerFocused(false);
+    closeQuickSuggestions();
   };
 
   const uploadAttachmentFiles = useCallback(async (files: readonly File[]): Promise<boolean> => {
@@ -4503,8 +4921,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         updatedAt: now,
       };
     });
+    for (let index = 0; index < uploadItems.length; index += 1) {
+      composerUploadRetryFiles.set(uploadItems[index].id, files[index]);
+    }
     addComposerUploadItems(uploadKey, uploadItems);
 
+    const settledUploadIds: string[] = [];
     const uploadedAttachments = await Promise.all(files.map(async (file, index): Promise<ComposerAttachmentRecord | null> => {
       const uploadItem = uploadItems[index];
       const abortController = new AbortController();
@@ -4525,7 +4947,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         });
         updateComposerUploadProgress(uploadKey, uploadItem.id, 100);
         updateComposerUploadItem(uploadKey, uploadItem.id, { status: 'done' });
+        settledUploadIds.push(uploadItem.id);
         if (result.attachment?.daemonPath) {
+          rememberAttachmentPreview(result.attachment.daemonPath, file);
           return {
             path: result.attachment.daemonPath,
             name: file.name,
@@ -4538,6 +4962,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       } catch (err) {
         if (isFileUploadCanceled(err)) {
           removeComposerUploadItems(uploadKey, [uploadItem.id]);
+          settledUploadIds.push(uploadItem.id);
           return null;
         }
         console.error('[upload] failed:', err);
@@ -4577,7 +5002,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         setAttachments((prev) => renumberAttachments([...prev, ...successfulAttachments]));
       }
     }
-    removeComposerUploadItems(uploadKey, uploadItems.map((item) => item.id));
+    // Successful/canceled rows are transient.  Failed rows deliberately stay
+    // visible with a retry action: removing every row here made a 99%-phase
+    // failure disappear immediately and look like a silent success/failure.
+    removeComposerUploadItems(uploadKey, settledUploadIds);
+    for (const id of settledUploadIds) composerUploadRetryFiles.delete(id);
     return successfulAttachments.length > 0;
   }, [activeSession?.name, attachmentDraftKey, composerUploadKey, isShareScopedSession, serverId, t]);
 
@@ -4586,7 +5015,22 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     composerUploadAbortControllers.get(item.id)?.abort();
   }, [t]);
 
+  const handleRetryUpload = useCallback((item: ComposerUploadItem) => {
+    const file = composerUploadRetryFiles.get(item.id);
+    if (!file) return;
+    composerUploadRetryFiles.delete(item.id);
+    removeComposerUploadItems(composerUploadKey, [item.id]);
+    updateComposerUploadSnapshot(composerUploadKey, { error: null });
+    void uploadAttachmentFiles([file]);
+  }, [composerUploadKey, uploadAttachmentFiles]);
+
+  const handleDismissFailedUpload = useCallback((item: ComposerUploadItem) => {
+    composerUploadRetryFiles.delete(item.id);
+    removeComposerUploadItems(composerUploadKey, [item.id]);
+  }, [composerUploadKey]);
+
   const handleRemoveAttachment = useCallback(async (attachment: ComposerAttachmentRecord) => {
+    closeQuickSuggestions();
     const attachmentKey = attachment.id ?? attachment.path;
     if (deletingAttachmentKeys.has(attachmentKey)) return;
     const inferredId = attachment.id ?? attachment.path.split(/[\\/]/).pop();
@@ -4600,6 +5044,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         }
       }
       setAttachments((current) => renumberAttachments(current.filter((entry) => entry !== attachment)));
+      forgetAttachmentPreview(attachment.path);
     } catch (error) {
       console.error('[upload] delete failed:', error);
       updateComposerUploadSnapshot(composerUploadKey, { error: t('upload.delete_failed') });
@@ -4611,12 +5056,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         return next;
       });
     }
-  }, [activeSession?.name, composerUploadKey, deletingAttachmentKeys, isShareScopedSession, serverId, t]);
+  }, [activeSession?.name, closeQuickSuggestions, composerUploadKey, deletingAttachmentKeys, isShareScopedSession, serverId, t]);
 
   const handleFileUpload = useCallback(async (files: FileList | null) => {
     if (!files || files.length === 0) return;
+    closeQuickSuggestions();
     await uploadAttachmentFiles(Array.from(files));
-  }, [uploadAttachmentFiles]);
+  }, [closeQuickSuggestions, uploadAttachmentFiles]);
 
   const handleFileDragEnter = useCallback((e: DragEvent) => {
     if (inputDisabled || !dataTransferHasFiles(e.dataTransfer)) return;
@@ -4671,6 +5117,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   // Paste: upload files from clipboard, or insert plain text
   const handlePaste = (e: Event) => {
     const ce = e as ClipboardEvent;
+    closeQuickSuggestions();
     const files = ce.clipboardData?.files;
     if (files && files.length > 0) {
       e.preventDefault();
@@ -4701,7 +5148,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     // input (paste must never open either picker).
     aliasPasteSuppressRef.current = true;
     machinePasteSuppressRef.current = true;
+    quickPhraseInputSuppressRef.current = true;
     document.execCommand('insertText', false, text);
+    queueMicrotask(() => { quickPhraseInputSuppressRef.current = false; });
     setHasText(!!(divRef.current ? readComposerElementText(divRef.current).trim() : ''));
   };
 
@@ -4829,7 +5278,33 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   const isMobileLayout = typeof window !== 'undefined' && window.innerWidth <= 640;
   const showEmbeddedVoiceButton = isMobileLayout && VoiceInput.isAvailable() && !hasText;
-  const showCompactMetaControls = !!(openSpecChangesPath || isClaudeCode || isCodex || isQwen || supportsThinking || !isShellLike);
+  const showMobileStackedAttachmentButton = isMobileLayout
+    && isTransport
+    && !!serverId
+    && mobileComposerMultiline
+    && !mobileComposerExpanded;
+  const showEmbeddedAttachmentButton = isMobileLayout
+    && !!serverId
+    && !showMobileStackedAttachmentButton;
+  const embeddedComposerActionCount = Number(showEmbeddedVoiceButton) + Number(showEmbeddedAttachmentButton);
+  const deliveryModeLabel = directAppendMode
+    ? t('session.delivery_mode_append')
+    : t('session.delivery_mode_queue');
+  const deliveryModeDescription = directAppendMode
+    ? t('session.delivery_mode_append_description')
+    : t('session.delivery_mode_queue_description');
+  const handleDeliveryModeToggle = () => {
+    const append = !directAppendMode;
+    const nextMode = append
+      ? SESSION_SEND_DELIVERY_MODES.APPEND
+      : SESSION_SEND_DELIVERY_MODES.QUEUE;
+    void deliveryModePref.save(nextMode).catch(() => {
+      showSendWarning(t('session.delivery_mode_save_failed'));
+    });
+    if (isMobileLayout) showDeliveryModeNotice(append);
+  };
+  const showOpenSpecControl = !!openSpecChangesPath && !isShellLike;
+  const showCompactMetaControls = !!(showOpenSpecControl || isClaudeCode || isCodex || isQwen || supportsThinking || !isShellLike);
   const composerSubSession = subSessionId
     ? subSessions?.find((session) => session.sessionName === activeSession?.name)
     : undefined;
@@ -4896,6 +5371,31 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       <div class="queue-append-success-toast" role="status" aria-live="polite">
         <span class="queue-append-success-toast-icon" aria-hidden="true">↗</span>
         <span>{appendSuccessNotice}</span>
+      </div>,
+      document.body,
+    )}
+    {deliveryModeNotice && typeof document !== 'undefined' && createPortal(
+      <div
+        class={`queue-append-success-toast composer-delivery-mode-toast${deliveryModeNotice.append ? ' is-append' : ' is-queue'}`}
+        role="status"
+        aria-live="polite"
+      >
+        <span class="queue-append-success-toast-icon composer-delivery-mode-toast-icon" aria-hidden="true">
+          <ComposerDeliveryModeIcon append={deliveryModeNotice.append} />
+        </span>
+        <span>{deliveryModeNotice.message}</span>
+      </div>,
+      document.body,
+    )}
+    {supervisionModeNotice && typeof document !== 'undefined' && createPortal(
+      <div
+        class="queue-append-success-toast composer-supervision-mode-toast"
+        data-testid="supervision-mode-toast"
+        role="status"
+        aria-live="polite"
+      >
+        <span class="queue-append-success-toast-icon" aria-hidden="true">✓</span>
+        <span>{supervisionModeNotice}</span>
       </div>,
       document.body,
     )}
@@ -5075,11 +5575,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           )}
         </div>}
 
+        {!isShellLike && (
         <div class={`shortcuts-meta-scroll${autoOpen || modelOpen || thinkingOpen ? ' has-open-menu' : ''}`}>
         {/* Quick peer delegation reuses the ordinary @agent orchestration path.
             It stays separate from automatic supervision state and remains
             visible while Auto is off. */}
-        {canQuickControlSupervision && (
+        {canQuickPeerAudit && (
           <div class="shortcuts-model shortcuts-model-supervision" ref={autoRef}>
             <button
               class="shortcut-btn shortcut-btn-icon shortcut-btn-peer-audit"
@@ -5103,7 +5604,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 <path d="m15.3 15.3 4.2 4.2" />
                 <path d="m7.7 10.6 1.8 1.8 3.8-4" />
               </svg>
+              <span class="shortcut-btn-peer-audit-label">{t('peerAuditQuick.shortLabel')}</span>
             </button>
+            {canQuickViewSupervision && <>
             <button
               class={`shortcut-btn shortcut-btn-auto ${quickAutoModeClass}`}
               onClick={() => setAutoOpen((open) => !open)}
@@ -5120,27 +5623,23 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               <span class="shortcut-btn-auto-label">{quickSupervisionLabel}</span>
               <span class="shortcut-btn-auto-caret" aria-hidden="true">▾</span>
             </button>
-            {autoOpen && (
+            {canQuickViewSupervision && autoOpen && (
               <div class="menu-dropdown menu-dropdown-auto">
                 <button
                   class={`menu-item ${quickSupervisionMode === SUPERVISION_MODE.OFF ? 'menu-item-active' : ''}`}
                   onClick={() => { void handleQuickSupervisionModeSelect(SUPERVISION_MODE.OFF); }}
+                  disabled={!canQuickControlSupervision}
                 >
                   {quickSupervisionMode === SUPERVISION_MODE.OFF ? '● ' : '○ '}{t('session.supervision.mode.off')}
                 </button>
                 <button
-                  class={`menu-item ${quickSupervisionMode === SUPERVISION_MODE.SUPERVISED ? 'menu-item-active' : ''}`}
-                  onClick={() => { void handleQuickSupervisionModeSelect(SUPERVISION_MODE.SUPERVISED); }}
-                >
-                  {quickSupervisionMode === SUPERVISION_MODE.SUPERVISED ? '● ' : '○ '}{t('session.supervision.mode.supervised')}
-                </button>
-                <button
                   class={`menu-item ${quickSupervisionMode === SUPERVISION_MODE.SUPERVISED_AUDIT ? 'menu-item-active' : ''}`}
                   onClick={() => { void handleQuickSupervisionModeSelect(SUPERVISION_MODE.SUPERVISED_AUDIT); }}
+                  disabled={!canQuickControlSupervision}
                 >
                   {quickSupervisionMode === SUPERVISION_MODE.SUPERVISED_AUDIT ? '● ' : '○ '}{t('session.supervision.mode.supervised_audit')}
                 </button>
-                {!!onSettings && !isShareScopedSession && (
+                {!!onSettings && canOpenSessionSettings && (
                   <>
                     <div class="menu-divider" />
                     <button
@@ -5156,6 +5655,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 )}
               </div>
             )}
+            </>}
           </div>
         )}
 
@@ -5193,7 +5693,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         )}
 
         {/* Model selector — outside overflow-x scroll area so dropdown isn't clipped */}
-        {openSpecChangesPath && (
+        {showOpenSpecControl && (
           <div class="shortcuts-model" ref={openSpecRef}>
             <button
               class="shortcut-btn"
@@ -5782,6 +6282,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           )}
         </div>}
         </div>
+        )}
       </div>}
 
       {pendingTransportApproval && effectiveRuntimeType === 'transport' && (
@@ -5904,6 +6405,22 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                     aria-label={t('upload.cancel_named', { name: item.name })}
                   >{t('upload.cancel')}</button>
                 )}
+                {item.status === 'error' && (
+                  <div class="composer-upload-error-actions">
+                    <button
+                      type="button"
+                      class="composer-upload-retry"
+                      onClick={() => handleRetryUpload(item)}
+                      aria-label={`${t('upload.retry')}: ${item.name}`}
+                    >{t('upload.retry')}</button>
+                    <button
+                      type="button"
+                      class="composer-upload-dismiss"
+                      onClick={() => handleDismissFailedUpload(item)}
+                      aria-label={`${t('upload.dismiss_failure')}: ${item.name}`}
+                    >{t('upload.dismiss_failure')}</button>
+                  </div>
+                )}
                 <div
                   role="progressbar"
                   aria-label={t('upload.progress_aria', {
@@ -5974,28 +6491,17 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       {attachments.length > 0 && (
         <div class="attachment-badges">
           {attachments.map((a) => (
-            <span
+            <ComposerAttachmentBadge
               key={a.path}
-              class="attachment-badge"
-              title={`#${a.seq} ${a.path}`}
-              data-attachment-seq={a.seq}
-            >
-              {/*
-                * R3 v2 PR-ρ — Surface the per-composer sequence number
-                * as a `#N` prefix so the user can reference the file in
-                * chat text via the same short tag (`#1`, `#2`, ...). The
-                * counter resets on send (the attachments array is wiped
-                * by `clearComposer`).
-                */}
-              <span class="attachment-badge-icon" data-testid={`attachment-tag-${a.seq}`}>#{a.seq}</span>
-              <span class="attachment-badge-name">{a.name}</span>
-              <button
-                class="attachment-badge-remove"
-                disabled={deletingAttachmentKeys.has(a.id ?? a.path)}
-                onClick={() => { void handleRemoveAttachment(a); }}
-                title={deletingAttachmentKeys.has(a.id ?? a.path) ? t('upload.deleting') : t('common.delete')}
-              >×</button>
-            </span>
+              seq={a.seq}
+              name={a.name}
+              path={a.path}
+              {...(a.id ? { attachmentId: a.id } : {})}
+              {...((a.serverId || serverId) ? { serverId: a.serverId || serverId } : {})}
+              {...(isShareScopedSession && activeSession?.name ? { sessionName: activeSession.name } : {})}
+              removing={deletingAttachmentKeys.has(a.id ?? a.path)}
+              onRemove={() => { void handleRemoveAttachment(a); }}
+            />
           ))}
         </div>
       )}
@@ -6071,9 +6577,32 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             onInsertAlias={insertAliasMarker}
             machines={machineAll}
             onInsertMachine={insertMachineMarker}
+            projectKey={activeSession?.contextNamespace?.projectId || activeSession?.project}
+            onInsertVerificationMachine={(machine) => appendToInput([
+              t('quick_input.verification_reference', {
+                alias: machine.alias,
+                id: machine.id,
+                target: machine.target,
+              }),
+            ])}
             anchorRef={quickWrapRef}
           />
         </div>
+
+        {!isMobileLayout && isTransport && (
+          <button
+            type="button"
+            class={`composer-delivery-mode composer-delivery-mode-desktop${directAppendMode ? ' is-append' : ' is-queue'}`}
+            onClick={handleDeliveryModeToggle}
+            aria-pressed={directAppendMode}
+            aria-label={`${deliveryModeLabel}: ${deliveryModeDescription}`}
+            title={deliveryModeDescription}
+            disabled={inputDisabled}
+          >
+            <ComposerDeliveryModeIcon append={directAppendMode} />
+            <span>{deliveryModeLabel}</span>
+          </button>
+        )}
 
         {/* @ mention picker */}
         {atPickerOpen && ws && activeSession && (
@@ -6266,7 +6795,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           />
         )}
 
-        {quickSuggestionKind !== null && activeSession && (
+        {quickSuggestionKind !== null
+          && activeSession
+          && (quickSuggestionKind !== 'phrase' || quickSuggestions.length > 0) && (
           <div
             ref={quickSuggestionPickerRef}
             class="controls-slash-picker"
@@ -6377,7 +6908,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                     key={m.serverId}
                     role="option"
                     aria-selected={hl ? 'true' : 'false'}
-                    data-machine-ref={m.refName}
+                    data-machine-node-id={m.nodeId}
                     data-machine-online={m.online ? 'true' : 'false'}
                     data-hl={hl ? 'true' : undefined}
                     style={hl ? aliasPickerItemHighlightStyle : aliasPickerItemStyle}
@@ -6386,7 +6917,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                       e.preventDefault();
                       setMachinePickerOpen(false);
                       setMachineQuery('');
-                      insertMachineMarker(m.refName, m.displayName);
+                      if (m.nodeId) insertMachineMarker(m.nodeId, m.displayName);
                     }}
                     onMouseEnter={() => setMachineHighlightIdx(idx)}
                   >
@@ -6401,7 +6932,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                       title={m.online ? undefined : t('machine.offline')}
                     />
                     <span style={{ fontWeight: 500, color: '#e2e8f0' }}>{m.displayName}</span>
-                    <span style={aliasPickerDimStyle}>{m.refName}</span>
+                    <span style={aliasPickerDimStyle}>{m.nodeId ?? MACHINE_IDENTITY_UNAVAILABLE}</span>
                     {!m.online && <span style={aliasPickerDimStyle}>{t('machine.offline_hint')}</span>}
                   </div>
                 );
@@ -6415,7 +6946,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           for contenteditable elements, unlike <input> or <textarea>.
         */}
         {mobileComposerExpanded && <div class="controls-composer-backdrop" onClick={() => setMobileComposerExpanded(false)} />}
-        <div class={`controls-composer${showEmbeddedVoiceButton ? ' controls-composer-with-voice' : ''}${mobileComposerExpanded ? ' controls-composer-mobile-expanded' : ''}`}>
+        <div class={`controls-composer${embeddedComposerActionCount > 0 ? ' controls-composer-with-trailing' : ''}${mobileComposerExpanded ? ' controls-composer-mobile-expanded' : ''}`}>
           {!isMobileLayout && !compact && (
             <>
               <div
@@ -6435,7 +6966,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           )}
           <div
             ref={divRef}
-            class={`controls-input${inputDisabled ? ' controls-input-disabled' : ''}${p2pMode !== 'solo' ? ' controls-input-p2p' : ''}${showEmbeddedVoiceButton ? ' controls-input-with-trailing' : ''}${fileDragActive ? ' controls-input-file-drag-over' : ''}`}
+            class={`controls-input${inputDisabled ? ' controls-input-disabled' : ''}${p2pMode !== 'solo' ? ' controls-input-p2p' : ''}${embeddedComposerActionCount > 0 ? ` controls-input-with-trailing controls-input-with-trailing-${embeddedComposerActionCount}` : ''}${fileDragActive ? ' controls-input-file-drag-over' : ''}`}
             data-onboarding="chat-input"
             contenteditable={inputDisabled ? 'false' : 'true'}
             role="textbox"
@@ -6454,7 +6985,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             }}
             onFocus={handleFocus}
             onBlur={handleBlur}
-            onInput={() => {
+            onInput={(event) => {
               const currentText = divRef.current ? readComposerElementText(divRef.current) : '';
               setHasText(!!currentText.trim());
               publishComposerText(currentText);
@@ -6466,9 +6997,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               }
               // Detect @/@@: use end of text (contentEditable anchorOffset is unreliable)
               const text = currentText;
+              const inputIsComposing = imeComposingRef.current
+                || (event as InputEvent).isComposing === true;
+              const suppressQuickPhrase = quickPhraseInputSuppressRef.current;
+              quickPhraseInputSuppressRef.current = false;
 
-              const modelTrigger = imeComposingRef.current ? null : matchModelCommandTrigger(text);
-              const slashTrigger = imeComposingRef.current ? null : matchSlashCommandTrigger(text);
+              const modelTrigger = inputIsComposing ? null : matchModelCommandTrigger(text);
+              const slashTrigger = inputIsComposing ? null : matchSlashCommandTrigger(text);
               if (modelTrigger !== null) {
                 setQuickSuggestionKind('model');
                 setQuickSuggestionQuery(modelTrigger);
@@ -6478,14 +7013,17 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 setQuickSuggestionQuery(slashTrigger);
                 setQuickSuggestionHighlightIdx(0);
               } else {
-                const phraseTrigger = imeComposingRef.current ? null : matchQuickPhraseTrigger(text);
-                if (phraseTrigger !== null) {
+                const phraseTrigger = inputIsComposing || suppressQuickPhrase
+                  ? null
+                  : matchQuickPhraseTrigger(text);
+                const hasPhraseSuggestions = phraseTrigger !== null
+                  && getQuickPhraseSuggestions(quickData.data.phrases, phraseTrigger).length > 0;
+                if (phraseTrigger !== null && hasPhraseSuggestions) {
                   setQuickSuggestionKind('phrase');
                   setQuickSuggestionQuery(phraseTrigger);
                   setQuickSuggestionHighlightIdx(0);
                 } else if (quickSuggestionKind !== null) {
-                  setQuickSuggestionKind(null);
-                  setQuickSuggestionQuery('');
+                  closeQuickSuggestions();
                 }
               }
 
@@ -6586,25 +7124,66 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             onDragLeave={handleFileDragLeave}
             onDrop={handleFileDrop}
           />
-          {showEmbeddedVoiceButton && (
-            <button
-              class="btn btn-voice btn-voice-embedded"
-              // Open on pointerdown (fires synchronously at touch-start) so the
-              // tap is never lost to the ~300ms click delay or to a re-render
-              // unmounting this conditionally-rendered button mid-gesture (the
-              // timeline re-renders constantly while an agent streams).
-              // preventDefault stops the tap from falling through to focus the
-              // input. onClick is kept as an idempotent fallback.
-              onPointerDown={(e) => { e.preventDefault(); setVoiceOpen(true); }}
-              onClick={() => setVoiceOpen(true)}
-              disabled={inputDisabled}
-              title={t('voice.voice_input')}
-              aria-label={t('voice.voice_input')}
-            >
-              🎙
-            </button>
+          {embeddedComposerActionCount > 0 && (
+            <div class="controls-composer-trailing-actions">
+              {showEmbeddedVoiceButton && (
+                <button
+                  class="btn btn-voice btn-voice-embedded"
+                  // Open on pointerdown (fires synchronously at touch-start) so the
+                  // tap is never lost to the ~300ms click delay or to a re-render
+                  // unmounting this conditionally-rendered button mid-gesture.
+                  onPointerDown={(e) => { e.preventDefault(); setVoiceOpen(true); }}
+                  onClick={() => setVoiceOpen(true)}
+                  disabled={inputDisabled}
+                  title={t('voice.voice_input')}
+                  aria-label={t('voice.voice_input')}
+                >
+                  🎙
+                </button>
+              )}
+              {showEmbeddedAttachmentButton && (
+                <button
+                  class="btn btn-voice btn-attachment-embedded"
+                  onPointerDown={(e) => e.preventDefault()}
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={inputDisabled || uploading}
+                  title={uploading ? t('upload.uploading') : t('upload.upload_file')}
+                  aria-label={uploading ? t('upload.uploading') : t('upload.upload_file')}
+                >
+                  {uploading ? '…' : '\u{1F4CE}'}
+                </button>
+              )}
+            </div>
           )}
         </div>
+        {isMobileLayout && isTransport && (
+          <div class="composer-mobile-side-actions">
+            {showMobileStackedAttachmentButton && (
+              <button
+                type="button"
+                class="btn btn-voice btn-attachment-mobile-stacked"
+                onPointerDown={(e) => e.preventDefault()}
+                onClick={() => fileInputRef.current?.click()}
+                disabled={inputDisabled || uploading}
+                title={uploading ? t('upload.uploading') : t('upload.upload_file')}
+                aria-label={uploading ? t('upload.uploading') : t('upload.upload_file')}
+              >
+                {uploading ? '…' : '\u{1F4CE}'}
+              </button>
+            )}
+            <button
+              type="button"
+              class={`composer-delivery-mode composer-delivery-mode-mobile${directAppendMode ? ' is-append' : ' is-queue'}`}
+              onClick={handleDeliveryModeToggle}
+              aria-pressed={directAppendMode}
+              aria-label={`${deliveryModeLabel}: ${deliveryModeDescription}`}
+              title={deliveryModeDescription}
+              disabled={inputDisabled}
+            >
+              <ComposerDeliveryModeIcon append={directAppendMode} />
+            </button>
+          </div>
+        )}
         {serverId && (
           <>
             <input
@@ -6618,14 +7197,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 input.value = '';
               }}
             />
-            <button
-              class="btn btn-voice"
-              onClick={() => fileInputRef.current?.click()}
-              disabled={inputDisabled || uploading}
-              title={uploading ? t('upload.uploading') : t('upload.upload_file')}
-            >
-              {uploading ? '...' : '\u{1F4CE}'}
-            </button>
+            {!isMobileLayout && (
+              <button
+                class="btn btn-voice"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={inputDisabled || uploading}
+                title={uploading ? t('upload.uploading') : t('upload.upload_file')}
+              >
+                {uploading ? '...' : '\u{1F4CE}'}
+              </button>
+            )}
           </>
         )}
         {!isMobileLayout && VoiceInput.isAvailable() && (
@@ -6717,7 +7298,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 <SessionActionMenuIcon kind="rename" />
                 <span class="session-action-menu-label">{t('session.rename_plain')}</span>
               </button>
-              {onSettings && (
+              {onSettings && canOpenSessionSettings && (
                 <button
                   class="menu-item session-action-menu-item"
                   onClick={() => { onSettings(); setMenuOpen(false); }}
@@ -6752,7 +7333,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                   <span class="session-action-menu-label">{t('share.menu.shareTab')}</span>
                 </button>
               )}
-              {!isShareScopedSession && (
+              {(!isShareScopedSession || canManageSharedServer) && (
                 <>
                   <div class="menu-divider" />
                   <button
@@ -6791,13 +7372,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           <div class="controls-queued-hint" role="status" aria-live="polite">
             <div class="controls-queued-header">
               {appendableQueuedTransportEntries.length > 0 && (
-                <button
-                  type="button"
-                  class="controls-queued-toggle"
-                  onClick={() => handleQueuedMessagesAppend(appendableQueuedTransportEntries)}
-                >
-                  {t('session.transport_queue_append_all')}
-                </button>
+                <ConfirmButton
+                  className="controls-queued-toggle"
+                  confirmClassName="controls-queued-toggle"
+                  label={t('session.transport_queue_append_all')}
+                  confirmLabel={t('session.transport_queue_append_all_confirm')}
+                  onConfirm={() => handleQueuedMessagesAppend(appendableQueuedTransportEntries)}
+                  resetKey={appendAllConfirmationScope}
+                  testId="transport-queue-append-all"
+                />
               )}
               <div>{t('session.transport_send_queued')}</div>
               <button type="button" class="controls-queued-toggle" onClick={toggleQueuedHintExpanded}>

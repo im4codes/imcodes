@@ -1,0 +1,141 @@
+/**
+ * Attaches the supervision console producer to the authenticated server link.
+ *
+ * Capability injection, not a process global: the caller hands in the link and
+ * the database, so the binding is fully constructible in a test without a
+ * daemon, and nothing reaches for an ambient registry.
+ *
+ * Wire path:
+ *   producer (SQLite + outbox) -> session registry -> serverLink.send -> WsBridge -> browser
+ *   browser -> serverLink.onMessage -> session registry -> producer
+ */
+import { randomUUID } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
+import { SupervisionConsoleProducer, type SupervisionProducerOptions } from './supervision-console-producer.js';
+import { SupervisionConsoleSessionRegistry } from './supervision-console-session.js';
+import { migrateSupervisionStore, type SupervisionMigrationDb } from './supervision-store-migrations.js';
+import {
+  SupervisionTaskRegistry,
+  resolveSupervisionTaskRegistryDbPath,
+} from './supervision-state-store.js';
+import { isAuthorizedSupervisionProjectBrain } from './supervision-registry-port.js';
+import type { SupervisionTaskConsoleScope } from '../../shared/supervision-task-console.js';
+import type { SessionRecord } from '../store/session-store.js';
+
+export interface SupervisionConsoleLink {
+  send(message: unknown): void;
+  onMessage(handler: (message: unknown) => void): void;
+}
+
+export interface SupervisionConsoleBindingDeps {
+  serverLink: SupervisionConsoleLink;
+  database: SupervisionMigrationDb;
+  /** Fail-closed authorization. Absent means deny everything. */
+  authorize?: (scope: SupervisionTaskConsoleScope) => boolean;
+  now?: () => number;
+  newEpoch?: () => string;
+  onError?: (error: unknown) => void;
+  resolveSessionPresentation?: SupervisionProducerOptions['resolveSessionPresentation'];
+}
+
+export interface SupervisionConsoleBinding {
+  producer: SupervisionConsoleProducer;
+  sessions: SupervisionConsoleSessionRegistry;
+  projectionEpoch: string;
+}
+
+export interface ProductionSupervisionConsoleBinding extends SupervisionConsoleBinding {
+  databasePath: string;
+  close(): void;
+}
+
+/** Exact live-session authorization for a browser-requested console scope. */
+export function isAuthorizedSupervisionConsoleScope(
+  scope: SupervisionTaskConsoleScope,
+  sessions: readonly SessionRecord[],
+): boolean {
+  return isAuthorizedSupervisionProjectBrain(scope, sessions);
+}
+
+/**
+ * Resolve the projection authority epoch.
+ *
+ * Deliberately STABLE across restarts: it is read back from
+ * supervision_projection_state when any scope already has one. Minting a fresh
+ * epoch on every boot would force every browser into a full resync after every
+ * daemon restart, which is precisely the behaviour the cursor exists to avoid.
+ * A new epoch therefore means only one thing -- the projection store is new or
+ * was rebuilt -- which is exactly when a resync IS correct.
+ */
+export function resolveSupervisionProjectionEpoch(
+  db: SupervisionMigrationDb,
+  newEpoch: () => string = () => randomUUID(),
+): string {
+  const row = db.prepare(
+    'SELECT projection_epoch AS epoch FROM supervision_projection_state WHERE projection_epoch IS NOT NULL LIMIT 1',
+  ).get() as { epoch?: string } | undefined;
+  const existing = typeof row?.epoch === 'string' ? row.epoch.trim() : '';
+  return existing || newEpoch();
+}
+
+export function createSupervisionConsoleBinding(
+  deps: SupervisionConsoleBindingDeps,
+): SupervisionConsoleBinding {
+  migrateSupervisionStore(deps.database);
+  const projectionEpoch = resolveSupervisionProjectionEpoch(deps.database, deps.newEpoch);
+
+  // The two objects are mutually referential: the producer broadcasts through
+  // the session registry, which sends through the link. Declared first so the
+  // producer's callback can close over it.
+  let sessions: SupervisionConsoleSessionRegistry | undefined;
+
+  const producer = new SupervisionConsoleProducer(deps.database, {
+    projectionEpoch,
+    now: deps.now,
+    broadcast: (frame) => { sessions?.broadcast(frame); },
+    resolveSessionPresentation: deps.resolveSessionPresentation,
+  });
+
+  sessions = new SupervisionConsoleSessionRegistry({
+    producer,
+    send: (frame) => { deps.serverLink.send(frame); },
+    authorize: deps.authorize ?? (() => false),
+    now: deps.now,
+    onError: deps.onError,
+  });
+
+  deps.serverLink.onMessage((message) => { sessions?.handleFrame(message); });
+
+  return { producer, sessions, projectionEpoch };
+}
+
+/**
+ * Production composition over the same SQLite file as SupervisionTaskRegistry.
+ *
+ * Constructing the registry against this connection first is load-bearing: it
+ * creates/validates the authoritative core tables before the console migration
+ * adds its projection/outbox tables.  The producer then reads both families on
+ * the same connection and can return an authoritative empty snapshot when the
+ * registry genuinely contains no tasks.
+ */
+export function createProductionSupervisionConsoleBinding(
+  deps: Omit<SupervisionConsoleBindingDeps, 'database'> & { databasePath?: string },
+): ProductionSupervisionConsoleBinding {
+  const databasePath = deps.databasePath ?? resolveSupervisionTaskRegistryDbPath();
+  const database = new DatabaseSync(databasePath);
+  try {
+    // Schema bootstrap only. The process-wide registry may use another
+    // connection to this same WAL database; this object owns neither authority
+    // nor lifecycle state beyond ensuring the core schema exists.
+    new SupervisionTaskRegistry({ database });
+    const binding = createSupervisionConsoleBinding({ ...deps, database });
+    return {
+      ...binding,
+      databasePath,
+      close: () => { database.close(); },
+    };
+  } catch (error) {
+    database.close();
+    throw error;
+  }
+}

@@ -10,12 +10,15 @@ import {
   DIRECT_FILE_TRANSFER_ICE_SERVERS,
   DIRECT_FILE_TRANSFER_LIMITS,
   DIRECT_FILE_TRANSFER_MSG,
+  DIRECT_FILE_TRANSFER_OPERATION_CHANNEL_PREFIX,
   DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
   DIRECT_FILE_TRANSFER_RESUME_TICKET_TYPE,
   DIRECT_FILE_TRANSFER_TERMINAL_STATE,
   isDirectFileTransferMessageType,
   isLegacyDirectFileTransferMessageType,
   validateDirectFileTransferBrowserMessage,
+  isDirectFileTransferOperationDischarged,
+  isDirectFileTransferTerminalShapedOperationMessage,
   validateDirectFileTransferDaemonMessage,
   validateDirectFileTransferResumeTicketClaims,
   type DirectFileTransferAttemptBinding,
@@ -25,6 +28,7 @@ import {
   type DirectFileTransferIceServerConfig,
   type DirectFileTransferLeaseRebind,
   type DirectFileTransferLeasePrepared,
+  type DirectFileTransferLeaseLost,
   type DirectFileTransferOperationInit,
   type DirectFileTransferResumeTicketClaims,
   type DirectFileTransferCancel,
@@ -49,13 +53,15 @@ type OperationDaemonMessage = DirectFileTransferStatus
  * routinely carry paths, filenames, opaque handles, tickets and SDP/ICE.
  */
 type LeaseMetricEvent = 'created' | 'reused' | 'ready' | 'rebind_requested'
-  | 'rebound' | 'prepare_send_failed' | 'rebind_prepare_send_failed';
+  | 'rebound' | 'renew_requested' | 'renewed' | 'prepare_send_failed'
+  | 'rebind_prepare_send_failed' | 'renew_prepare_send_failed';
 type AttemptMetricEvent = 'authorized' | 'prepare_send_failed' | 'canceled'
   | 'succeeded' | 'terminal_failed' | 'failed' | 'retry_exhausted';
 type StatusRecoveryMetricEvent = 'queried' | 'responded' | 'send_failed' | 'timed_out';
 type ControlRelayDirection = 'browser_to_daemon' | 'daemon_to_browser'
   | 'server_to_daemon' | 'server_to_browser';
 type ControlRelayFamily = 'lease_prepare' | 'lease_ready' | 'lease_rebound' | 'lease_signal'
+  | 'lease_lost'
   | 'operation_prepare' | 'operation_authorized' | 'cancel' | 'status'
   | 'terminal' | 'error';
 
@@ -81,6 +87,7 @@ interface DirectFileTransferLeaseRoute {
   needsRebind: boolean;
   prepared: boolean;
   timer?: ReturnType<typeof setTimeout>;
+  renewTimer?: ReturnType<typeof setTimeout>;
 }
 
 interface DirectFileTransferOperationRoute {
@@ -121,7 +128,7 @@ interface DirectFileTransferRecoveryQueryRoute {
 type PendingLeaseRequest = {
   leaseId: string;
   /** Which browser acknowledgement Server emits after daemon peer preparation. */
-  mode: 'init' | 'rebind';
+  mode: 'init' | 'rebind' | 'keepalive';
 };
 
 export interface DirectFileTransferRouterHooks {
@@ -171,6 +178,7 @@ function operationDescriptor(init: DirectFileTransferOperationInit): string {
       size: init.size,
       mime: init.mime,
       sha256: init.sha256,
+      destinationDirectory: init.destinationDirectory,
     });
   }
   return JSON.stringify({
@@ -193,6 +201,7 @@ export class DirectFileTransferRouter {
   private readonly attempts = new Map<string, DirectFileTransferAttemptRoute>();
   private readonly recoveryQueries = new Map<string, DirectFileTransferRecoveryQueryRoute>();
   private readonly leaseRequestIds = new Map<string, PendingLeaseRequest>();
+  private readonly leaseSignalRequestIds = new Map<string, string>();
 
   constructor(private readonly hooks: DirectFileTransferRouterHooks) {}
 
@@ -261,6 +270,11 @@ export class DirectFileTransferRouter {
       return true;
     }
 
+    if (parsed.value.type === DIRECT_FILE_TRANSFER_MSG.LEASE_LOST) {
+      this.handleLeaseLost(parsed.value, daemonGeneration);
+      return true;
+    }
+
     if (parsed.value.type === DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER
       || parsed.value.type === DIRECT_FILE_TRANSFER_MSG.LEASE_ICE) {
       this.handleDaemonLeaseSignal(parsed.value, daemonGeneration);
@@ -271,19 +285,46 @@ export class DirectFileTransferRouter {
       const pending = this.leaseRequestIds.get(parsed.value.requestId);
       const lease = pending ? this.leases.get(pending.leaseId) : undefined;
       if (lease && lease.daemonGeneration === daemonGeneration) {
-        this.sendLeaseError(lease.socket, parsed.value.requestId, parsed.value.error, parsed.value.retryable, parsed.value.detail);
         this.leaseRequestIds.delete(parsed.value.requestId);
+        if (pending?.mode === 'keepalive') {
+          // A failed internal keepalive is not a browser request. Mark the
+          // route stale so its next real use re-prepares instead of sending an
+          // unsolicited error carrying a Server-minted request id.
+          lease.prepared = false;
+          lease.needsRebind = true;
+          this.rescheduleLeaseTimers(lease);
+          return true;
+        }
+        this.sendLeaseError(lease.socket, parsed.value.requestId, parsed.value.error, parsed.value.retryable, parsed.value.detail);
+        return true;
       }
+      const signalLeaseId = this.leaseSignalRequestIds.get(parsed.value.requestId);
+      const signalLease = signalLeaseId ? this.leases.get(signalLeaseId) : undefined;
+      if (signalLease && signalLease.daemonGeneration === daemonGeneration) {
+        this.sendLeaseError(
+          signalLease.socket,
+          parsed.value.requestId,
+          parsed.value.error,
+          parsed.value.retryable,
+          parsed.value.detail,
+        );
+        this.observeControlRelay('daemon_to_browser', 'error');
+      }
+      this.leaseSignalRequestIds.delete(parsed.value.requestId);
       return true;
     }
 
+    // Everything below correlates by requestId. A message that carries none
+    // has already been dispatched above; it must not fall into these lookups
+    // as `undefined`.
+    if (!('requestId' in parsed.value)) return true;
     const recovery = this.recoveryQueries.get(parsed.value.requestId);
     if (recovery && this.daemonMessageMatchesRecovery(parsed.value, recovery, daemonGeneration)) {
       const lease = this.leases.get(recovery.leaseId);
       // A terminal recovery is the first point at which this fresh Server pod
       // knows the browser's old attempt ended. Start and propagate a new idle
       // window before the browser consumes the authoritative outcome.
-      if (lease && this.isTerminalOperationMessage(parsed.value)) this.touchLease(lease);
+      if (lease && this.isTerminalShapedOperationMessage(parsed.value)) this.touchLease(lease);
       if (lease?.socket) this.hooks.sendBrowser(lease.socket, this.withServerAttachment(parsed.value, lease));
       this.observeStatusRecovery('responded');
       this.observeControlRelay('daemon_to_browser', 'status');
@@ -317,9 +358,19 @@ export class DirectFileTransferRouter {
       );
       this.deleteAttempt(attempt);
     } else if (parsed.value.type === DIRECT_FILE_TRANSFER_MSG.STATUS
-      && (parsed.value.state === DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED
-        || parsed.value.state === DIRECT_FILE_TRANSFER_TERMINAL_STATE.CANCELED
-        || parsed.value.state === DIRECT_FILE_TRANSFER_TERMINAL_STATE.FAILED)) {
+      && isDirectFileTransferOperationDischarged(parsed.value)) {
+      // DISCHARGE, not wire shape. This branch releases the attempt route, and
+      // an inline copy of the terminal-SHAPE set was deciding it: `not_found`
+      // ends an operation -- the browser answers it non-retryably -- but is not
+      // terminal-shaped, so its route was retained until the two-hour authority
+      // timer while still counting against MAX_ACTIVE_CHANNELS_PER_LEASE and
+      // suppressing lease expiry. The shape question stays separate below, so
+      // a not_found frame still carries no idleExpiresAt.
+      //
+      // deleteAttempt() extends the lease deadline once the last attempt goes,
+      // and the browser cannot learn that from a not_found frame. That
+      // divergence is one-directional and safe: the Server's deadline is the
+      // LATER one, so the browser expires first and re-initialises.
       operation.terminal = true;
       this.observeAttempt(
         parsed.value.state === DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED ? 'succeeded' : 'terminal_failed',
@@ -391,12 +442,12 @@ export class DirectFileTransferRouter {
       this.sendLeaseError(socket, init.requestId, DIRECT_FILE_TRANSFER_ERROR.CAPABILITY_UNAVAILABLE, true);
       return;
     }
-    const signingKey = this.hooks.resumeTicketSigningKey();
-    if (!signingKey) {
+    // Do not expose or reuse a resumable route while its signing authority is
+    // unavailable. This preserves the fail-closed behavior across key reloads.
+    if (!this.hooks.resumeTicketSigningKey()) {
       this.sendLeaseError(socket, init.requestId, DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, true);
       return;
     }
-
     const now = this.now();
     const existing = [...this.leases.values()].find((lease) => (
       lease.userId === userId && lease.browserTabId === init.browserTabId
@@ -404,40 +455,42 @@ export class DirectFileTransferRouter {
     ));
     if (existing) {
       existing.socket = socket;
+      // Socket activity extends only this Server route. The daemon's
+      // independently armed idle timer may already have removed its peer, so
+      // prove preparation again before exposing the route as reusable.
+      existing.prepared = false;
+      existing.needsRebind = true;
       this.touchLease(existing);
       this.observeLease('reused');
-      this.sendLeaseReady(socket, init.requestId, existing);
+      if (!this.sendLeasePrepare(existing, init.requestId, 'init')) {
+        this.deleteLease(existing);
+        this.sendLeaseError(socket, init.requestId, DIRECT_FILE_TRANSFER_ERROR.DAEMON_OFFLINE, true);
+      }
       return;
     }
 
     const generation = this.hooks.daemonGeneration();
     const resolvedIce = this.resolveIceServers(userId);
-    const ticketExpiresAt = now + DIRECT_FILE_TRANSFER_LIMITS.RESUME_TICKET_TTL_MS;
     const authorityExpiresAt = now + DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS;
     const leaseId = mintOpaque(24);
-    const claims: DirectFileTransferResumeTicketClaims = {
-      type: DIRECT_FILE_TRANSFER_RESUME_TICKET_TYPE,
-      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+    const ticket = this.mintResumeTicket({
       userId,
       browserTabId: init.browserTabId,
-      serverId: this.hooks.serverId(),
       leaseId,
       leaseGeneration: 1,
-      expiresAt: ticketExpiresAt,
-    };
-    const resumeTicket = signJwt(
-      claims as unknown as Record<string, unknown>,
-      signingKey,
-      Math.ceil(DIRECT_FILE_TRANSFER_LIMITS.RESUME_TICKET_TTL_MS / 1000),
-    );
+    }, now);
+    if (!ticket) {
+      this.sendLeaseError(socket, init.requestId, DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, true);
+      return;
+    }
     const lease = this.newLeaseRoute({
       leaseId,
       browserTabId: init.browserTabId,
       userId,
       daemonGeneration: generation,
       leaseGeneration: 1,
-      resumeTicket,
-      ticketExpiresAt,
+      resumeTicket: ticket.resumeTicket,
+      ticketExpiresAt: ticket.ticketExpiresAt,
       authorityExpiresAt,
       iceServers: resolvedIce.iceServers,
       socket,
@@ -448,26 +501,10 @@ export class DirectFileTransferRouter {
     });
     this.leases.set(lease.leaseId, lease);
     this.observeLease('created');
-    this.leaseRequestIds.set(init.requestId, { leaseId: lease.leaseId, mode: 'init' });
-    const prepare = {
-      type: DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARE,
-      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
-      requestId: init.requestId,
-      serverId: this.hooks.serverId(),
-      browserTabId: lease.browserTabId,
-      leaseId: lease.leaseId,
-      leaseGeneration: lease.leaseGeneration,
-      daemonGeneration: lease.daemonGeneration,
-      expiresAt: lease.ticketExpiresAt,
-      iceServers: lease.iceServers,
-    };
-    if (!this.hooks.sendDaemon(prepare, generation)) {
+    if (!this.sendLeasePrepare(lease, init.requestId, 'init')) {
       this.deleteLease(lease);
-      this.observeLease('prepare_send_failed');
       this.sendLeaseError(socket, init.requestId, DIRECT_FILE_TRANSFER_ERROR.DAEMON_OFFLINE, true);
-      return;
     }
-    this.observeControlRelay('server_to_daemon', 'lease_prepare');
     // LEASE_READY is deliberately deferred until the daemon has acknowledged
     // LEASE_PREPARE.  Until then there is no peer to which an inert browser
     // offer could safely be relayed.
@@ -480,10 +517,11 @@ export class DirectFileTransferRouter {
         : DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY, rebind.serverId === this.hooks.serverId());
       return;
     }
+    const now = this.now();
     const claims = this.verifyTicket(rebind.resumeTicket);
     if (!claims || claims.userId !== userId || claims.browserTabId !== rebind.browserTabId
       || claims.serverId !== rebind.serverId || claims.leaseId !== rebind.leaseId
-      || claims.leaseGeneration !== rebind.leaseGeneration || claims.expiresAt <= this.now()) {
+      || claims.leaseGeneration !== rebind.leaseGeneration || claims.expiresAt <= now) {
       this.sendLeaseError(socket, rebind.requestId, DIRECT_FILE_TRANSFER_ERROR.LEASE_REBIND_FAILED, false);
       return;
     }
@@ -495,23 +533,36 @@ export class DirectFileTransferRouter {
       return;
     }
     const generation = this.hooks.daemonGeneration();
+    const ticket = this.mintResumeTicket({
+      userId,
+      browserTabId: claims.browserTabId,
+      leaseId: claims.leaseId,
+      leaseGeneration: claims.leaseGeneration,
+    }, now);
+    if (!ticket) {
+      this.sendLeaseError(socket, rebind.requestId, DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, true);
+      return;
+    }
     const lease = current ?? this.newLeaseRoute({
       leaseId: claims.leaseId,
       browserTabId: claims.browserTabId,
       userId,
       daemonGeneration: generation,
       leaseGeneration: claims.leaseGeneration,
-      resumeTicket: rebind.resumeTicket,
-      ticketExpiresAt: claims.expiresAt,
-      authorityExpiresAt: this.now() + DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS,
+      resumeTicket: ticket.resumeTicket,
+      ticketExpiresAt: ticket.ticketExpiresAt,
+      authorityExpiresAt: now + DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS,
       iceServers: this.resolveIceServers(userId).iceServers,
       socket,
-      lastActivityAt: this.now(),
-      idleExpiresAt: this.now() + DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS,
+      lastActivityAt: now,
+      idleExpiresAt: now + DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS,
       needsRebind: true,
       prepared: false,
     });
     if (!current) this.leases.set(lease.leaseId, lease);
+    lease.resumeTicket = ticket.resumeTicket;
+    lease.ticketExpiresAt = ticket.ticketExpiresAt;
+    lease.authorityExpiresAt = now + DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS;
     lease.socket = socket;
     lease.daemonGeneration = generation;
     // A signed ticket restores only the Server-side route.  Do not accept a
@@ -521,29 +572,51 @@ export class DirectFileTransferRouter {
     lease.prepared = false;
     this.touchLease(lease);
     this.observeLease('rebind_requested');
-    this.leaseRequestIds.set(rebind.requestId, { leaseId: lease.leaseId, mode: 'rebind' });
     // A reconnecting Server has no right to assume the daemon's old peer is
     // still present.  LEASE_PREPARE is daemon-only and idempotently creates or
     // reuses that inert peer; a browser ticket is never forwarded or logged.
+    if (!this.sendLeasePrepare(lease, rebind.requestId, 'rebind')) {
+      this.sendLeaseError(socket, rebind.requestId, DIRECT_FILE_TRANSFER_ERROR.DAEMON_OFFLINE, true);
+    }
+  }
+
+  private sendLeasePrepare(
+    lease: DirectFileTransferLeaseRoute,
+    requestId: string,
+    mode: PendingLeaseRequest['mode'],
+    expiresAt = lease.ticketExpiresAt,
+  ): boolean {
+    if (mode === 'keepalive') {
+      for (const [pendingRequestId, pending] of this.leaseRequestIds) {
+        if (pending.leaseId === lease.leaseId && pending.mode === 'keepalive') {
+          this.leaseRequestIds.delete(pendingRequestId);
+        }
+      }
+    }
+    this.leaseRequestIds.set(requestId, { leaseId: lease.leaseId, mode });
     const prepare = {
       type: DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARE,
       protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
-      requestId: rebind.requestId,
+      requestId,
       serverId: this.hooks.serverId(),
       browserTabId: lease.browserTabId,
       leaseId: lease.leaseId,
       leaseGeneration: lease.leaseGeneration,
       daemonGeneration: lease.daemonGeneration,
-      expiresAt: lease.ticketExpiresAt,
+      expiresAt,
       iceServers: lease.iceServers,
     };
-    if (!this.hooks.sendDaemon(prepare, generation)) {
-      this.leaseRequestIds.delete(rebind.requestId);
-      this.observeLease('rebind_prepare_send_failed');
-      this.sendLeaseError(socket, rebind.requestId, DIRECT_FILE_TRANSFER_ERROR.DAEMON_OFFLINE, true);
-      return;
+    if (!this.hooks.sendDaemon(prepare, lease.daemonGeneration)) {
+      this.leaseRequestIds.delete(requestId);
+      this.observeLease(mode === 'init'
+        ? 'prepare_send_failed'
+        : mode === 'rebind'
+          ? 'rebind_prepare_send_failed'
+          : 'renew_prepare_send_failed');
+      return false;
     }
     this.observeControlRelay('server_to_daemon', 'lease_prepare');
+    return true;
   }
 
   private authorizeOperation(socket: WebSocket, userId: string, init: DirectFileTransferOperationInit): void {
@@ -616,7 +689,7 @@ export class DirectFileTransferRouter {
       daemonGeneration: lease.daemonGeneration,
       authority,
       authorityExpiresAt,
-      channelLabel: `direct-file-${init.attemptId}`,
+      channelLabel: `${DIRECT_FILE_TRANSFER_OPERATION_CHANNEL_PREFIX}${init.attemptId}`,
       iceServers: lease.iceServers,
     };
     const prepare = { ...authorityMessage, type: DIRECT_FILE_TRANSFER_MSG.PREPARE };
@@ -769,7 +842,16 @@ export class DirectFileTransferRouter {
       this.sendLeaseError(socket, message.requestId, DIRECT_FILE_TRANSFER_ERROR.STALE_DAEMON_GENERATION, true);
       return;
     }
+    if (message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER) {
+      for (const [requestId, leaseId] of this.leaseSignalRequestIds) {
+        if (leaseId === lease.leaseId && requestId !== message.requestId) {
+          this.leaseSignalRequestIds.delete(requestId);
+        }
+      }
+    }
+    this.leaseSignalRequestIds.set(message.requestId, lease.leaseId);
     if (!this.hooks.sendDaemon(message as unknown as Record<string, unknown>, lease.daemonGeneration)) {
+      this.leaseSignalRequestIds.delete(message.requestId);
       this.sendLeaseError(socket, message.requestId, DIRECT_FILE_TRANSFER_ERROR.DAEMON_OFFLINE, true);
       return;
     }
@@ -790,6 +872,9 @@ export class DirectFileTransferRouter {
       || message.daemonGeneration !== lease.daemonGeneration) return;
     const socket = lease.socket;
     this.hooks.sendBrowser(socket, message as unknown as Record<string, unknown>);
+    if (message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER) {
+      this.leaseSignalRequestIds.delete(message.requestId);
+    }
     this.observeControlRelay('daemon_to_browser', 'lease_signal');
   }
 
@@ -830,6 +915,32 @@ export class DirectFileTransferRouter {
     }
   }
 
+  /**
+   * The daemon's transfer child died and took this lease's peer with it.
+   *
+   * Alone among daemon messages this one answers no request: an idle lease has
+   * no outstanding requestId, which is precisely why the browser could not be
+   * told before and waited out its own ICE consent check instead. It is
+   * therefore routed by lease identity, and only ever to that lease's own
+   * socket -- delivering it anywhere else would tear down a healthy peer.
+   */
+  private handleLeaseLost(message: DirectFileTransferLeaseLost, daemonGeneration: number): void {
+    const lease = this.leases.get(message.leaseId);
+    if (!lease || lease.daemonGeneration !== daemonGeneration
+      || message.serverId !== this.hooks.serverId()
+      || message.browserTabId !== lease.browserTabId
+      || message.leaseGeneration !== lease.leaseGeneration
+      || message.daemonGeneration !== lease.daemonGeneration) return;
+    // The daemon-side peer is gone, so this route may not be signalled into
+    // again: the next use has to re-prepare against the replacement child.
+    lease.prepared = false;
+    lease.needsRebind = true;
+    this.rescheduleLeaseTimers(lease);
+    if (!lease.socket) return;
+    this.hooks.sendBrowser(lease.socket, message as unknown as Record<string, unknown>);
+    this.observeControlRelay('daemon_to_browser', 'lease_lost');
+  }
+
   private handleLeasePrepared(message: DirectFileTransferLeasePrepared, daemonGeneration: number): void {
     const pending = this.leaseRequestIds.get(message.requestId);
     const lease = pending ? this.leases.get(pending.leaseId) : undefined;
@@ -842,11 +953,13 @@ export class DirectFileTransferRouter {
     lease.prepared = true;
     lease.needsRebind = false;
     this.leaseRequestIds.delete(message.requestId);
+    this.rescheduleLeaseTimers(lease);
     // The idle window is authoritative from accepted LEASE_INIT/REBIND, not
     // from a potentially delayed daemon peer-preparation acknowledgement.
     // Re-arming here would let a wedged PREPARE extend an otherwise expired
     // lease without another browser action.
-    this.observeLease(pending.mode === 'init' ? 'ready' : 'rebound');
+    this.observeLease(pending.mode === 'init' ? 'ready' : pending.mode === 'rebind' ? 'rebound' : 'renewed');
+    if (pending.mode === 'keepalive') return;
     if (!lease.socket) return;
     if (pending.mode === 'init') {
       this.sendLeaseReady(lease.socket, message.requestId, lease);
@@ -977,7 +1090,7 @@ export class DirectFileTransferRouter {
     lease: DirectFileTransferLeaseRoute,
   ): Record<string, unknown> {
     const result: Record<string, unknown> = { ...message };
-    if (this.isTerminalOperationMessage(message)
+    if (this.isTerminalShapedOperationMessage(message)
       || (message.type === DIRECT_FILE_TRANSFER_MSG.ERROR
         && message.scope === DIRECT_FILE_TRANSFER_ERROR_SCOPE.OPERATION)) {
       result.idleExpiresAt = lease.idleExpiresAt;
@@ -988,12 +1101,17 @@ export class DirectFileTransferRouter {
     return result;
   }
 
-  private isTerminalOperationMessage(message: DirectFileTransferDaemonMessage): boolean {
-    return message.type === DIRECT_FILE_TRANSFER_MSG.TERMINAL
-      || (message.type === DIRECT_FILE_TRANSFER_MSG.STATUS
-        && (message.state === DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED
-          || message.state === DIRECT_FILE_TRANSFER_TERMINAL_STATE.CANCELED
-          || message.state === DIRECT_FILE_TRANSFER_TERMINAL_STATE.FAILED));
+  /**
+   * WIRE SHAPE, not obligation discharge.
+   *
+   * Both callers use this to decide whether a frame carries `idleExpiresAt`
+   * (directly, or by propagating a fresh idle window the browser can only read
+   * from that field). `not_found` ends an attempt but its STATUS is not
+   * terminal-shaped, and appending the field to it makes the frame fail
+   * `validateDirectFileTransferServerMessage` and be discarded.
+   */
+  private isTerminalShapedOperationMessage(message: DirectFileTransferDaemonMessage): boolean {
+    return isDirectFileTransferTerminalShapedOperationMessage(message);
   }
 
   private sendLeaseReady(socket: WebSocket, requestId: string, lease: DirectFileTransferLeaseRoute): void {
@@ -1115,10 +1233,35 @@ export class DirectFileTransferRouter {
     return parsed.ok ? parsed.value : null;
   }
 
-  private newLeaseRoute(input: Omit<DirectFileTransferLeaseRoute, 'timer'>): DirectFileTransferLeaseRoute {
+  private mintResumeTicket(
+    binding: Pick<DirectFileTransferResumeTicketClaims,
+      'userId' | 'browserTabId' | 'leaseId' | 'leaseGeneration'>,
+    now: number,
+  ): { resumeTicket: string; ticketExpiresAt: number } | null {
+    const key = this.hooks.resumeTicketSigningKey();
+    if (!key) return null;
+    const ticketExpiresAt = now + DIRECT_FILE_TRANSFER_LIMITS.RESUME_TICKET_TTL_MS;
+    const claims: DirectFileTransferResumeTicketClaims = {
+      type: DIRECT_FILE_TRANSFER_RESUME_TICKET_TYPE,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding,
+      serverId: this.hooks.serverId(),
+      expiresAt: ticketExpiresAt,
+    };
+    return {
+      resumeTicket: signJwt(
+        claims as unknown as Record<string, unknown>,
+        key,
+        Math.ceil(DIRECT_FILE_TRANSFER_LIMITS.RESUME_TICKET_TTL_MS / 1000),
+      ),
+      ticketExpiresAt,
+    };
+  }
+
+  private newLeaseRoute(input: Omit<DirectFileTransferLeaseRoute, 'timer' | 'renewTimer'>): DirectFileTransferLeaseRoute {
     const lease = {} as DirectFileTransferLeaseRoute;
-    Object.assign(lease, input, { timer: undefined });
-    lease.timer = this.scheduleLeaseExpiry(lease);
+    Object.assign(lease, input, { timer: undefined, renewTimer: undefined });
+    this.rescheduleLeaseTimers(lease);
     return lease;
   }
 
@@ -1203,12 +1346,51 @@ export class DirectFileTransferRouter {
     return timer;
   }
 
+  /**
+   * Browser timers are routinely suspended in background tabs while their
+   * WebSocket and WebRTC transports remain alive. Keep an attached, prepared
+   * daemon peer warm from Server so the browser's three-minute REBIND is ticket
+   * rotation/recovery rather than the sole authority preventing eviction.
+   */
+  private scheduleLeaseRenewal(lease: DirectFileTransferLeaseRoute): ReturnType<typeof setTimeout> | undefined {
+    if (!lease.socket || !lease.prepared || lease.needsRebind || this.hasActiveAttempt(lease.leaseId)) return undefined;
+    const now = this.now();
+    const deadline = Math.min(lease.idleExpiresAt, lease.ticketExpiresAt);
+    const timer = setTimeout(() => {
+      const current = this.leases.get(lease.leaseId);
+      if (!current || current !== lease) return;
+      current.renewTimer = undefined;
+      if (!current.socket || !current.prepared || current.needsRebind || this.hasActiveAttempt(current.leaseId)) return;
+      const renewed = this.mintResumeTicket({
+        userId: current.userId,
+        browserTabId: current.browserTabId,
+        leaseId: current.leaseId,
+        leaseGeneration: current.leaseGeneration,
+      }, this.now());
+      if (!renewed) return;
+      const requestId = `server-renew-${mintOpaque(12)}`;
+      if (!this.sendLeasePrepare(current, requestId, 'keepalive', renewed.ticketExpiresAt)) return;
+      current.resumeTicket = renewed.resumeTicket;
+      current.ticketExpiresAt = renewed.ticketExpiresAt;
+      this.touchLease(current);
+      this.observeLease('renew_requested');
+    }, Math.max(0, deadline - DIRECT_FILE_TRANSFER_LIMITS.LEASE_RENEW_LEAD_MS - now));
+    timer.unref?.();
+    return timer;
+  }
+
+  private rescheduleLeaseTimers(lease: DirectFileTransferLeaseRoute): void {
+    if (lease.timer) clearTimeout(lease.timer);
+    if (lease.renewTimer) clearTimeout(lease.renewTimer);
+    lease.timer = this.scheduleLeaseExpiry(lease);
+    lease.renewTimer = this.scheduleLeaseRenewal(lease);
+  }
+
   private touchLease(lease: DirectFileTransferLeaseRoute): void {
     const now = this.now();
     lease.lastActivityAt = now;
     lease.idleExpiresAt = now + DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS;
-    if (lease.timer) clearTimeout(lease.timer);
-    lease.timer = this.scheduleLeaseExpiry(lease);
+    this.rescheduleLeaseTimers(lease);
   }
 
   private deleteAttempt(attempt: DirectFileTransferAttemptRoute): void {
@@ -1232,9 +1414,13 @@ export class DirectFileTransferRouter {
 
   private deleteLease(lease: DirectFileTransferLeaseRoute): void {
     if (lease.timer) clearTimeout(lease.timer);
+    if (lease.renewTimer) clearTimeout(lease.renewTimer);
     if (this.leases.get(lease.leaseId) === lease) this.leases.delete(lease.leaseId);
     for (const [requestId, pending] of this.leaseRequestIds) {
       if (pending.leaseId === lease.leaseId) this.leaseRequestIds.delete(requestId);
+    }
+    for (const [requestId, leaseId] of this.leaseSignalRequestIds) {
+      if (leaseId === lease.leaseId) this.leaseSignalRequestIds.delete(requestId);
     }
     for (const attempt of [...this.attempts.values()]) {
       if (attempt.leaseId === lease.leaseId) this.deleteAttempt(attempt);

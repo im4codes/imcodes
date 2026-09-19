@@ -15,7 +15,8 @@ const {
   storeMock, tmuxListMock, startWatchingMock, startWatchingFileMock,
   isWatchingMock, restartSessionMock, getPaneStartCommandMock, upsertSessionMock, updateSessionStateMock,
   discoverLatestOpenCodeSessionIdMock, opencodeStartWatchingMock, opencodeIsWatchingMock,
-  newSessionMock, timelineEmitMock,
+  newSessionMock, timelineEmitMock, getSessionMock, respawnPaneMock,
+  releaseSessionChildResourcesMock, registerTmuxSessionResourceMock,
 } = vi.hoisted(() => ({
   storeMock: vi.fn(),
   tmuxListMock: vi.fn().mockResolvedValue(['deck_Cd_brain', 'deck_sub_5907196l']),
@@ -31,13 +32,17 @@ const {
   opencodeIsWatchingMock: vi.fn().mockReturnValue(false),
   newSessionMock: vi.fn().mockResolvedValue(undefined),
   timelineEmitMock: vi.fn(),
+  getSessionMock: vi.fn(() => null),
+  respawnPaneMock: vi.fn().mockResolvedValue(undefined),
+  releaseSessionChildResourcesMock: vi.fn().mockResolvedValue({ released: 0, failed: 0 }),
+  registerTmuxSessionResourceMock: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
   listSessions: storeMock,   // session-manager imports `listSessions as storeSessions`
   upsertSession: upsertSessionMock,
   updateSessionState: updateSessionStateMock,
-  getSession: vi.fn(() => null),
+  getSession: getSessionMock,
   removeSession: vi.fn(),
 }));
 
@@ -48,7 +53,7 @@ vi.mock('../../src/agent/tmux.js', () => ({
   killSession: vi.fn().mockResolvedValue(undefined),
   sessionExists: vi.fn().mockResolvedValue(true),
   isPaneAlive: vi.fn().mockResolvedValue(true),
-  respawnPane: vi.fn().mockResolvedValue(undefined),
+  respawnPane: respawnPaneMock,
   capturePane: vi.fn().mockResolvedValue([]),
   sendKey: vi.fn(),
   sendKeys: vi.fn(),
@@ -109,6 +114,17 @@ vi.mock('../../src/agent/brain-dispatcher.js', () => ({
   BrainDispatcher: vi.fn().mockImplementation(() => ({ start: vi.fn(), stop: vi.fn() })),
 }));
 
+vi.mock('../../src/daemon/session-resource-service.js', () => ({
+  initializeSessionResourceLifecycle: vi.fn().mockResolvedValue({ released: 0, failed: 0, preserved: 0 }),
+  registerTmuxSessionResource: registerTmuxSessionResourceMock,
+  releaseSessionChildResources: releaseSessionChildResourcesMock,
+  releaseSessionResources: vi.fn().mockResolvedValue({ released: 0, failed: 0 }),
+  resourceOwnerEnv: (owner: { sessionInstanceId: string; runtimeEpoch: string }) => ({
+    IMCODES_RESOURCE_SESSION_INSTANCE_ID: owner.sessionInstanceId,
+    IMCODES_RESOURCE_RUNTIME_EPOCH: owner.runtimeEpoch,
+  }),
+}));
+
 import { restoreFromStore, restartSession, respawnSession, setSessionEventCallback } from '../../src/agent/session-manager.js';
 import { startWatching, startWatchingFile } from '../../src/daemon/jsonl-watcher.js';
 
@@ -125,6 +141,9 @@ describe('restoreFromStore — sub-session JSONL watcher regression', () => {
     opencodeStartWatchingMock.mockResolvedValue(undefined);
     opencodeIsWatchingMock.mockReturnValue(false);
     newSessionMock.mockResolvedValue(undefined);
+    getSessionMock.mockReturnValue(null);
+    respawnPaneMock.mockResolvedValue(undefined);
+    releaseSessionChildResourcesMock.mockResolvedValue({ released: 0, failed: 0 });
   });
 
   it('does NOT call startWatching for deck_sub_* sessions (prevents JSONL file stealing)', async () => {
@@ -322,6 +341,32 @@ describe('restoreFromStore — sub-session JSONL watcher regression', () => {
     expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
       name: 'deck_respawn_w1',
       state: 'idle',
+    }));
+  });
+
+  it('releases prior child resources and gives a respawned process a successor runtime owner', async () => {
+    const now = Date.now();
+    const record = {
+      name: 'deck_respawn_owner_w1', projectName: 'respawn', role: 'w1', agentType: 'shell',
+      projectDir: '/proj', state: 'running', sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-old',
+      restarts: 0, restartTimestamps: [], createdAt: now, updatedAt: now,
+    } as const;
+    let persisted: typeof record | Record<string, unknown> | null = null;
+    upsertSessionMock.mockImplementation((value) => { persisted = value; });
+    getSessionMock.mockImplementation(() => persisted as never);
+
+    await respawnSession(record);
+
+    expect(releaseSessionChildResourcesMock).toHaveBeenCalledWith(record);
+    expect(respawnPaneMock).toHaveBeenCalledWith(
+      record.name,
+      expect.stringContaining("IMCODES_RESOURCE_SESSION_INSTANCE_ID='instance-1'"),
+    );
+    const update = upsertSessionMock.mock.calls.at(-1)?.[0] as { runtimeEpoch?: string };
+    expect(update.runtimeEpoch).toEqual(expect.any(String));
+    expect(update.runtimeEpoch).not.toBe('epoch-old');
+    expect(registerTmuxSessionResourceMock).toHaveBeenCalledWith(expect.objectContaining({
+      sessionInstanceId: 'instance-1', runtimeEpoch: update.runtimeEpoch,
     }));
   });
 

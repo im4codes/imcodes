@@ -24,7 +24,6 @@ inline constexpr int kEmptyTopologyGraceTicks = 4;
 // Deliberately shorter than the browser's 10-second receive watchdog so the
 // worker can disqualify a wedged hardware encoder before browser teardown wins
 // the race and immediately recreates the same broken encoder.
-inline constexpr int64_t kMediaProgressTimeoutMs = 7'000;
 
 inline constexpr uint32_t kEnvironmentDisplayChanged = 1u << 0;
 inline constexpr uint32_t kEnvironmentSuspend = 1u << 1;
@@ -279,11 +278,6 @@ size_t UpdateHardwareSlowFrameCount(int64_t encode_duration_us,
 bool HardwareEncoderThroughputShouldFallback(size_t consecutive_slow_frames);
 bool ShouldAttemptHardwareEncoder(bool prefer_hardware,
                                   bool hardware_disqualified);
-bool MediaProgressShouldFailover(uint64_t previous_bytes,
-                                 uint64_t current_bytes,
-                                 uint64_t source_frames_at_progress,
-                                 uint64_t current_source_frames,
-                                 int64_t elapsed_ms);
 bool InputSequenceIsFresh(bool has_previous,
                           uint64_t previous_sequence,
                           uint64_t current_sequence);

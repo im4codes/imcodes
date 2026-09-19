@@ -22,18 +22,53 @@ import type {
 } from '../../shared/context-types.js';
 import { buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
 import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
-import { buildFilePathReportingPrompt, buildTransportImcodesIdentityPrompt } from '../../shared/transport-runtime-prompts.js';
+import {
+  buildFilePathReportingPrompt,
+  buildTransportImcodesIdentityPrompt,
+  REAL_DEVICE_TESTING_SYSTEM_GUIDANCE,
+} from '../../shared/transport-runtime-prompts.js';
+import { CAPABILITY_AI_SYSTEM_INSTRUCTIONS } from '../../shared/capability-management.js';
+import { MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS } from '../../shared/mcp-tool-discovery.js';
+import {
+  buildBrainSupervisedWorkDelegationContract,
+  buildBrainManualOnlyDelegationContract,
+  buildBrainWorkDelegationContractRef,
+} from '../daemon/supervision-prompts.js';
+import { buildAuditConvergenceContract } from '../../shared/audit-convergence.js';
+
+/** Stable text: rendered once, registered in every managed session's system prompt. */
+const AUDIT_CONVERGENCE_SYSTEM_CONTRACT = buildAuditConvergenceContract();
+import type { SessionRecord } from '../store/session-store.js';
+import { identitySpanForSegment, joinSpanned } from './priority-preserving-context-cap.js';
 
 export interface TransportRuntimeAssemblyInput {
   userMessage: string;
   /** Stable logical delivery identity retained across recoverable dispatch retries. */
   deliveryId?: string;
   description?: string;
+  /** Resolved deterministic user/project/session Agent identity contract. */
+  identityPrompt?: string;
   systemPrompt?: string;
   suppressMcpMemorySearchGuidance?: boolean;
   suppressAgentProgressGuidance?: boolean;
   suppressFilePathReportingGuidance?: boolean;
   messagePreamble?: string;
+  /**
+   * True once the full Brain work-delegation contract body has already been
+   * registered for this thread. Later turns then re-assert it by reference
+   * instead of resending the body; the body is registered again after a
+   * thread start/resume or a compaction, which is when the prior text is gone.
+   */
+  brainContractRegistered?: boolean;
+  /**
+   * This turn's answer of `isAutomaticSupervisionEnabled` for the session.
+   * Absent is treated exactly like false: a runtime that cannot establish the
+   * mode must never hand a Brain the automatic supervision duties.
+   * `brainContractRegistered` must refer to THIS variant's registration.
+   */
+  automaticSupervisionEnabled?: boolean;
+  /** Full dynamic contracts that are not yet registered on this provider thread. */
+  registeredSystemContractText?: string;
   attachments?: TransportAttachment[];
   namespace?: ContextNamespace;
   namespaceDiagnostics?: string[];
@@ -61,7 +96,12 @@ export interface TransportRuntimeAssemblyInput {
    * `MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE` — outside the user-authored
    * 300-char cap. See p2p audit 37bfbb85-430 N-A.
    */
-  sessionIdentity?: { sessionName: string; label?: string | null };
+  /**
+   * Authoritative session identity. `role` comes from the session record, never
+   * from parsing sessionName/label and never from model or client free text: a
+   * session that could impersonate a Brain would inherit delegation authority.
+   */
+  sessionIdentity?: { sessionName: string; label?: string | null; role?: SessionRecord['role'] };
   /** Runtime-minted lifecycle generation for provider active-work attribution. */
   activityGeneration?: ActivityGeneration;
 }
@@ -76,10 +116,15 @@ export const MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE = [
   'Do not call memory for bare control messages like "continue", "go on", "ok", "yes", "commit", "push", "run tests", or other short commands without searchable context.',
 ].join('\n');
 
+// "Sparse, key boundaries only" with no ceiling on silence let long tasks run
+// for many minutes with nothing the user could see. High-signal stays the rule;
+// silence now has an upper bound.
 const AGENT_PROGRESS_SYSTEM_GUIDANCE = [
-  'Keep work updates sparse and high-signal.',
-  'At key boundaries only (long scans, edits, tests, waits, blockers, commit/push), send one short status; skip routine narration and repeated summaries.',
-  'Do not paste logs or diffs unless asked; continue without confirmation unless blocked or the user requested a plan.',
+  'Keep work updates short and high-signal; never paste logs or diffs unless asked.',
+  'Before any step likely to take more than about 2 minutes (builds, test suites, deploys, restarts, waits, polling, multi-step investigation), say in one line what you are doing and why.',
+  'During long work, give a status at least every 5 minutes or every 15 tool calls, in one or two short sentences: what finished, what is running, what is next. Never work longer than that with no user-visible update; never turn a status into a long report.',
+  'Say at once when a hypothesis is disproven, a plan changes, or you are blocked; skip routine narration and repeated summaries.',
+  'Continue without confirmation unless blocked or the user requested a plan.',
 ].join('\n');
 
 export interface DispatchSharedContextSendOptions {
@@ -240,6 +285,7 @@ export function buildProviderContextPayload(
     ...(input.activityGeneration ? { activityGeneration: input.activityGeneration } : {}),
     sessionSystemText: compiledContext.sessionSystemText,
     turnSystemText: compiledContext.turnSystemText,
+    ...(input.sessionIdentity?.role ? { sessionRole: input.sessionIdentity.role } : {}),
     systemText: compiledContext.systemText,
     messagePreamble: compiledContext.messagePreamble,
     attachments: input.attachments,
@@ -348,8 +394,21 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
   }
   const renderedAuthoredSystemText = renderAuthoredSystemText(authoredContext.required, authoredContext.advisory);
   const memorySearchGuidance = input.suppressMcpMemorySearchGuidance ? undefined : MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE;
+  const capabilityGuidance = input.suppressMcpMemorySearchGuidance ? undefined : CAPABILITY_AI_SYSTEM_INSTRUCTIONS;
+  const mcpToolRefreshGuidance = input.suppressMcpMemorySearchGuidance
+    ? undefined
+    : MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS;
   const agentProgressGuidance = input.suppressAgentProgressGuidance ? undefined : AGENT_PROGRESS_SYSTEM_GUIDANCE;
   const filePathReportingGuidance = input.suppressFilePathReportingGuidance ? undefined : buildFilePathReportingPrompt();
+  const realDeviceTestingGuidance = input.suppressMcpMemorySearchGuidance
+    ? undefined
+    : REAL_DEVICE_TESTING_SYSTEM_GUIDANCE;
+  // Any session can audit, implement or orchestrate an audit, and audit messages
+  // reference this contract by id only -- so its body belongs to the stable
+  // system prompt of every managed session, never to a message.
+  const auditConvergenceContract = input.suppressMcpMemorySearchGuidance
+    ? undefined
+    : AUDIT_CONVERGENCE_SYSTEM_CONTRACT;
   // Daemon-injected, session-stable identity block. NOT subject to
   // `USER_SESSION_TEXT_MAX_CHARS` — encodes IM.codes runtime behaviour
   // the model must always follow. p2p audit 37bfbb85-430 N-A: this used
@@ -368,17 +427,63 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
         input.sessionIdentity.label ?? undefined,
       )
     : undefined;
-  const sessionSystemText = [
+  // The identity span is recorded here, from the lengths of the parts being
+  // joined, so providers with a context budget can shrink exactly the identity
+  // body. It must never be recovered later by searching this string: the
+  // description, system prompt and authored turn context are user-authored and may
+  // contain forged identity delimiters.
+  const identitySegment = input.identityPrompt?.trim();
+  const composedSessionSystemText = joinSpanned([
+    capabilityGuidance,
+    mcpToolRefreshGuidance,
     input.description?.trim(),
     input.systemPrompt?.trim(),
+    identitySegment ? { text: identitySegment, identity: identitySpanForSegment(identitySegment) } : undefined,
     identityPart,
     filePathReportingGuidance,
+    realDeviceTestingGuidance,
+    auditConvergenceContract,
     memorySearchGuidance,
     agentProgressGuidance,
-  ].filter(Boolean).join('\n\n') || undefined;
-  const turnSystemText = renderedAuthoredSystemText;
+  ], '\n\n');
+  const sessionSystemText = composedSessionSystemText?.text;
+  const sessionSystemTextIdentity = composedSessionSystemText?.identity;
+  // Baseline delegation contract for a Brain, re-asserted EVERY turn, in the
+  // variant the session's supervision mode selects.
+  //
+  // It used to be deliberately independent of supervision.mode, on the theory
+  // that with supervision off the Brain would "simply attach no auditPolicy and
+  // run no audit lifecycle". Nothing enforced that: the contract is a set of
+  // duties (delegate instead of implement, mint a task assignment, personally
+  // repair blocked lifecycles), and a supervision-off Brain obeyed them -- on a
+  // daily cron it minted a task, looped on recovery and dispatched its own audit.
+  // Automatic supervision is now decided by the same single authority every
+  // other automatic supervision action already asks. A supervision-off Brain
+  // keeps what the baseline exists for (delegate through IM.codes, never
+  // provider-native) and loses everything automatic; supervised work remains
+  // available when a user explicitly arranges it.
+  //
+  // This rides the existing turnSystemText assembly on purpose. sessionSystemText
+  // becomes baseInstructions, which is sent once per thread/start|resume, so it
+  // cannot survive a compaction -- the exact failure the per-turn baseline fixes.
+  // Re-asserted every turn, but by REFERENCE once registered: repeating the
+  // full body each turn spends the per-turn budget on text the Brain already
+  // holds. The body still returns after a thread start/resume or compaction,
+  // and whenever the mode changes, because the other variant's registration
+  // does not stand in for this one.
+  const automaticSupervision = input.automaticSupervisionEnabled === true;
+  const brainDelegationContract = input.sessionIdentity?.role === 'brain'
+    ? (input.brainContractRegistered
+      ? buildBrainWorkDelegationContractRef(automaticSupervision)
+      : automaticSupervision
+        ? buildBrainSupervisedWorkDelegationContract()
+        : buildBrainManualOnlyDelegationContract())
+    : undefined;
+  const turnSystemText = [brainDelegationContract, input.registeredSystemContractText, renderedAuthoredSystemText]
+    .filter(Boolean).join('\n\n') || undefined;
   return {
     sessionSystemText,
+    ...(sessionSystemTextIdentity ? { sessionSystemTextIdentity } : {}),
     turnSystemText,
     systemText: [sessionSystemText, turnSystemText].filter(Boolean).join('\n\n') || undefined,
     messagePreamble: input.messagePreamble?.trim() || undefined,

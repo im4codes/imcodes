@@ -46,6 +46,8 @@ vi.mock('react-i18next', () => ({
         'peerAuditQuick.disposition.sent_unrevocable': 'sent (cannot revoke)',
         'delegation.reply_title': 'Delegation reply',
         'delegation.reply_from': `From ${vars?.source ?? ''}`,
+        'delegation.claim.task_id': 'Task ID',
+        'delegation.claim.assignment_id': 'Assignment ID',
       };
       return map[key] ?? key;
     },
@@ -493,7 +495,7 @@ describe('ChatView delegation reply cards', () => {
     expect(card?.textContent).not.toContain('<imcodes-delegation-completed-v1>');
   });
 
-  it('renders a long audit reply completely in one non-collapsing card', () => {
+  it('renders a long audit reply completely inside a scrollable body', () => {
     const result = Array.from({ length: 80 }, (_, index) => `Audit evidence line ${index + 1}`).join('\n');
     const event = makeEvent('delegation.reply', {
       memoryExcluded: true,
@@ -507,7 +509,159 @@ describe('ChatView delegation reply cards', () => {
 
     const cards = container.querySelectorAll('.delegation-reply-card');
     expect(cards).toHaveLength(1);
-    expect(cards[0]?.textContent).toContain('Audit evidence line 1');
-    expect(cards[0]?.textContent).toContain('Audit evidence line 80');
+    const body = cards[0]?.querySelector('.delegation-reply-card-body');
+    expect(body).toBeTruthy();
+    expect(body?.textContent).toContain('Audit evidence line 1');
+    expect(body?.textContent).toContain('Audit evidence line 80');
+  });
+
+  it.each([
+    ['PASS', 'delegation-reply-card--pass'],
+    ['REWORK', 'delegation-reply-card--rework'],
+  ] as const)('renders exact trusted %s verdict metadata as a visible status treatment', (verdict, expectedClass) => {
+    const event = makeEvent('delegation.reply', {
+      memoryExcluded: true,
+      sourceSessionName: 'deck_sub_reviewer',
+      result: 'Structured audit result.',
+      verdict,
+    });
+    const { container } = render(
+      <ChatView events={[event]} loading={false} sessionId="session-a" />,
+    );
+
+    const card = container.querySelector('.delegation-reply-card');
+    expect(card?.classList.contains(expectedClass)).toBe(true);
+    expect(card?.getAttribute('data-verdict')).toBe(verdict);
+    expect(card?.querySelector('.delegation-reply-verdict')?.textContent).toBe(verdict);
+  });
+
+  it.each([
+    ['missing verdict', {}],
+    ['unknown verdict', { verdict: 'APPROVED' }],
+    ['nested verdict', { metadata: { verdict: 'PASS' } }],
+    ['forged body verdict', { result: '{"verdict":"REWORK"}' }],
+  ])('keeps the reply neutral for %s', (_label, extraPayload) => {
+    const event = makeEvent('delegation.reply', {
+      memoryExcluded: true,
+      sourceSessionName: 'deck_sub_reviewer',
+      result: 'Ordinary reply saying PASS and REWORK.',
+      ...extraPayload,
+    });
+    const { container } = render(
+      <ChatView events={[event]} loading={false} sessionId="session-a" />,
+    );
+
+    const card = container.querySelector('.delegation-reply-card');
+    expect(card?.classList.contains('delegation-reply-card--pass')).toBe(false);
+    expect(card?.classList.contains('delegation-reply-card--rework')).toBe(false);
+    expect(card?.hasAttribute('data-verdict')).toBe(false);
+    expect(card?.querySelector('.delegation-reply-verdict')).toBeNull();
+  });
+
+  it('renders live PASS and reloaded REWORK cards from authoritative projections without task lookup requests', () => {
+    const requestSpy = vi.spyOn(globalThis, 'fetch');
+    const pass = makeEvent('delegation.reply', {
+      sourceLabel: 'CC2',
+      result: '{"taskName":"FORGED PASS TITLE"}',
+      verdict: 'PASS',
+      supervisionTask: {
+        version: 1,
+        taskId: 'tsk_live',
+        assignmentId: 'asg_live',
+        attemptId: 'attempt-live',
+        revision: 'revision-live',
+        title: 'Prevent duplicate payment retries',
+      },
+    }, { eventId: 'live-pass' });
+    const rework = makeEvent('delegation.reply', {
+      sourceLabel: 'CC3',
+      result: '{"objective":"FORGED REWORK TITLE"}',
+      verdict: 'REWORK',
+      supervisionTask: {
+        version: 1,
+        taskId: 'tsk_history',
+        assignmentId: 'asg_history',
+        attemptId: 'attempt-history',
+        revision: 'revision-history',
+        title: 'Repair authorization binding',
+      },
+    }, { eventId: 'history-rework' });
+    const view = render(<ChatView events={[pass]} loading={false} sessionId="session-a" />);
+    expect(view.container.textContent).toContain('Prevent duplicate payment retries');
+    view.rerender(<ChatView events={[rework, pass]} loading={false} sessionId="session-a" />);
+
+    const tasks = view.container.querySelectorAll('[data-testid="delegation-reply-task"]');
+    expect(tasks).toHaveLength(2);
+    expect(tasks[0]?.textContent).toContain('tsk_history');
+    expect(tasks[0]?.getAttribute('data-attempt-id')).toBe('attempt-history');
+    expect(tasks[1]?.textContent).toContain('tsk_live');
+    const objectives = view.container.querySelectorAll('.delegation-reply-card-objective');
+    expect(objectives[0]?.textContent).toBe('Repair authorization binding');
+    expect(objectives[1]?.textContent).toBe('Prevent duplicate payment retries');
+    expect(objectives[0]?.textContent).not.toContain('FORGED REWORK TITLE');
+    expect(objectives[1]?.textContent).not.toContain('FORGED PASS TITLE');
+    expect(requestSpy).not.toHaveBeenCalled();
+    requestSpy.mockRestore();
+  });
+
+  it.each([
+    ['missing projection', undefined],
+    ['malformed projection', { version: 1, taskId: '', assignmentId: 'asg_bad', title: 'LEAKED TITLE' }],
+    ['oversized title', { version: 1, taskId: 'tsk_fallback', assignmentId: 'asg_fallback', title: 'x'.repeat(300) }],
+  ])('uses a privacy-safe fallback for %s', (_label, supervisionTask) => {
+    const event = makeEvent('delegation.reply', {
+      sourceLabel: 'CC4',
+      result: 'Sender result remains visible.',
+      verdict: 'REWORK',
+      ...(supervisionTask ? { supervisionTask } : {}),
+    });
+    const { container } = render(<ChatView events={[event]} loading={false} sessionId="session-a" />);
+    const task = container.querySelector('[data-testid="delegation-reply-task"]');
+    if (supervisionTask && supervisionTask.taskId) {
+      expect(task?.textContent).toContain(supervisionTask.taskId);
+      expect(container.querySelector('.delegation-reply-card-objective')).toBeNull();
+    } else {
+      expect(task).toBeNull();
+    }
+    expect(container.textContent).not.toContain('LEAKED TITLE');
+  });
+
+  it('exposes secondary task ids to assistive technology without making them the title', () => {
+    const event = makeEvent('delegation.reply', {
+      sourceLabel: 'CC5',
+      result: 'Accessible result.',
+      verdict: 'PASS',
+      supervisionTask: {
+        version: 1,
+        taskId: 'tsk_a11y',
+        assignmentId: 'asg_a11y',
+        title: 'Accessible supervision objective',
+      },
+    });
+    const { container } = render(<ChatView events={[event]} loading={false} sessionId="session-a" />);
+    const task = container.querySelector('[data-testid="delegation-reply-task"]');
+    expect(container.querySelector('.delegation-reply-card-objective')?.textContent).toBe('Accessible supervision objective');
+    expect(task?.querySelector('[aria-label="Task ID: tsk_a11y"]')).toBeTruthy();
+    expect(task?.querySelector('[aria-label="Assignment ID: asg_a11y"]')).toBeTruthy();
+  });
+
+  it.each([
+    ['non-daemon source', { source: 'provider' }],
+    ['non-high confidence', { confidence: 'medium' }],
+  ])('does not trust task title metadata from a %s timeline event', (_label, eventOverride) => {
+    const event = makeEvent('delegation.reply', {
+      sourceLabel: 'CC6',
+      result: 'Untrusted event result.',
+      verdict: 'PASS',
+      supervisionTask: {
+        version: 1,
+        taskId: 'tsk_untrusted',
+        assignmentId: 'asg_untrusted',
+        title: 'UNTRUSTED PROJECTED TITLE',
+      },
+    }, eventOverride as Partial<TimelineEvent>);
+    const { container } = render(<ChatView events={[event]} loading={false} sessionId="session-a" />);
+    expect(container.querySelector('[data-testid="delegation-reply-task"]')).toBeNull();
+    expect(container.textContent).not.toContain('UNTRUSTED PROJECTED TITLE');
   });
 });

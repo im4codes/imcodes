@@ -55,6 +55,60 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     vi.restoreAllMocks();
   });
 
+  it('runs one background backfill at a time per session and backs off after a failed one', async () => {
+    const sessionName = `deck_bg_gate_${Date.now()}`;
+    const serverId = `srv-bg-gate-${Date.now()}`;
+    const firstFetch = deferred<unknown>();
+    fetchSpy.mockImplementationOnce(() => firstFetch.promise);
+    fetchSpy.mockResolvedValue({ events: [] });
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineReplayRequest: vi.fn(() => 'replay-gate'),
+      sendTimelineHistoryRequest: vi.fn(() => 'history-gate'),
+    } as unknown as WsClient;
+    const hook: { current: ReturnType<typeof useTimeline> | null } = { current: null };
+    function Probe() {
+      hook.current = useTimeline(sessionName, ws, serverId);
+      return h('div', null, 'mounted');
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe));
+    // Mount fires the first background backfill; its reply is slow (the
+    // weak-uplink shape): it stays in flight.
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    // Optimistic sends each schedule a background catch-up. With one already
+    // in flight they must not stack another request on the slow link.
+    await act(async () => {
+      hook.current!.addOptimisticUserMessage('first', 'cmd-gate-1');
+      await vi.advanceTimersByTimeAsync(1_500);
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    // The slow request finally fails: background triggers back off.
+    await act(async () => {
+      firstFetch.reject(new Error('timeout'));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await act(async () => {
+      hook.current!.addOptimisticUserMessage('second', 'cmd-gate-2');
+      await vi.advanceTimersByTimeAsync(1_500);
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    // After the backoff window the next background trigger runs again.
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+    await act(async () => {
+      hook.current!.addOptimisticUserMessage('third', 'cmd-gate-3');
+      await vi.advanceTimersByTimeAsync(1_500);
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
   it('manual force refresh pulls the daemon latest window without afterTs so a pushed latest event cannot hide middle history', async () => {
     const sessionName = `deck_manual_middle_gap_${Date.now()}`;
     const serverId = `srv-manual-middle-${Date.now()}`;
@@ -1320,10 +1374,21 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
       sendTimelineHistoryRequest: vi.fn(() => 'history'),
     } as unknown as WsClient;
 
+    function TimelineProbe({ sessionName, active }: { sessionName: string; active: boolean }) {
+      useTimeline(sessionName, ws, serverId, { isActiveSession: active, isVisible: true });
+      return null;
+    }
+
     function Probe() {
-      useTimeline(activeSession, ws, serverId, { isActiveSession: true });
-      useTimeline(inactiveSession, ws, serverId, { isActiveSession: false });
-      return h('div', { 'data-testid': 'probe' }, 'mounted');
+      const visibleSessions = [activeSession, inactiveSession];
+      return h('div', { 'data-testid': 'probe' }, [
+        'mounted',
+        ...visibleSessions.map((sessionName, index) => h(TimelineProbe, {
+          key: sessionName,
+          sessionName,
+          active: index === 0,
+        })),
+      ]);
     }
 
     vi.useFakeTimers({ shouldAdvanceTime: true });
@@ -1348,6 +1413,69 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     });
 
     // ONLY the active session should have fired a backfill.
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledWith(serverId, activeSession, expect.anything());
+
+  });
+
+  it('a many-window resume starts one recovery fetch instead of one per visible timeline', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const sessionNames = Array.from({ length: 16 }, (_, index) => `deck_resume_many_${index}_${Date.now()}`);
+    const activeSession = sessionNames[11]!;
+    const serverId = `srv-resume-many-${Date.now()}`;
+    fetchSpy.mockResolvedValue({ events: [], epoch: 1, hasMore: false, nextCursor: null });
+
+    for (const name of sessionNames) {
+      ingestTimelineEventForCache({
+        eventId: `${name}-seed`,
+        sessionId: name,
+        ts: 1000,
+        epoch: 1,
+        seq: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'assistant.text',
+        payload: { text: 'seed' },
+      }, serverId);
+    }
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineReplayRequest: vi.fn(() => 'replay'),
+      sendTimelineHistoryRequest: vi.fn(() => 'history'),
+    } as unknown as WsClient;
+
+    function TimelineProbe({ sessionName }: { sessionName: string }) {
+      useTimeline(sessionName, ws, serverId, {
+        isActiveSession: sessionName === activeSession,
+        isVisible: true,
+      });
+      return null;
+    }
+
+    render(h('div', { 'data-testid': 'many-probe' }, sessionNames.map((sessionName) => h(TimelineProbe, {
+      key: sessionName,
+      sessionName,
+    }))));
+    await waitFor(() => expect(screen.getByTestId('many-probe')).toBeTruthy());
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    fetchSpy.mockClear();
+    __resetBackfillCooldownsForTests();
+
+    await act(async () => {
+      window.dispatchEvent(new CustomEvent(ACTIVE_TIMELINE_REFRESH_EVENT));
+      await vi.advanceTimersByTimeAsync(50);
+    });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledWith(serverId, activeSession, expect.anything());
+
+    // The periodic foreground watchdog must obey the same sole-owner rule.
+    // Otherwise the resume itself is bounded but the next stale tick starts
+    // sixteen full-window fetches and recreates the freeze a minute later.
+    fetchSpy.mockClear();
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     expect(fetchSpy).toHaveBeenCalledWith(serverId, activeSession, expect.anything());
   });
@@ -1568,6 +1696,112 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
     expect(fetchSpy).toHaveBeenCalledTimes(3);
     expect(screen.getByTestId('probe').textContent).toBe('mounted');
+  });
+
+  it('a backlog bigger than one round automatically chains rounds instead of stopping at cap_hit (real user report: long-offline client loses messages)', async () => {
+    // Live user report: "手机端长时间没开，很多消息会丢掉，同步不过来。电脑也一样"
+    // (mobile/desktop: closed for a long time, many messages get lost, can't
+    // sync back). Root cause: one backfill round is bounded to
+    // CATCHUP_TAIL_MAX_PAGES (5) pages of MAX_MEMORY_EVENTS (300) = 1500
+    // events; a real backlog bigger than that used to stop permanently at
+    // `cap_hit` with nothing to automatically continue it. This constructs a
+    // 2150-event backlog (7 full pages + 1 short) spanning TWO rounds and
+    // asserts the fetch sequence actually crosses the old single-round
+    // boundary, ending caught up rather than silently giving up at page 5.
+    const sessionName = `deck_long_offline_${Date.now()}`;
+    const serverId = `srv-long-offline-${Date.now()}`;
+    const PAGE_SIZE = 300; // MAX_MEMORY_EVENTS in useTimeline.ts
+    const FULL_PAGES = 7; // > CATCHUP_TAIL_MAX_PAGES (5): forces a chained 2nd round
+
+    function makePage(sessionId: string, fromTs: number, toTs: number): TimelineEvent[] {
+      const events: TimelineEvent[] = [];
+      for (let ts = fromTs; ts <= toTs; ts++) {
+        events.push({
+          eventId: `${sessionId}-e${ts}`,
+          sessionId,
+          ts,
+          epoch: 1,
+          seq: ts,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'assistant.text',
+          payload: { text: `msg-${ts}` },
+        });
+      }
+      return events;
+    }
+
+    // Newest-first window pager: page 1 is the NEWEST slice, each subsequent
+    // page descends. Page k covers ts [2150 - k*300 + 1, 2150 - (k-1)*300].
+    for (let page = 1; page <= FULL_PAGES; page++) {
+      const toTs = 2150 - (page - 1) * PAGE_SIZE;
+      const fromTs = toTs - PAGE_SIZE + 1;
+      fetchSpy.mockResolvedValueOnce({
+        events: makePage(sessionName, fromTs, toTs), epoch: 1, hasMore: false, nextCursor: null,
+      });
+    }
+    // Final short page (50 events): proves the window is exhausted, caught_up.
+    fetchSpy.mockResolvedValueOnce({
+      events: makePage(sessionName, 1, 50), epoch: 1, hasMore: false, nextCursor: null,
+    });
+
+    ingestTimelineEventForCache({
+      eventId: `${sessionName}-seed`,
+      sessionId: sessionName,
+      ts: 0,
+      epoch: 1,
+      seq: 0,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'seed' },
+    }, serverId);
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineReplayRequest: vi.fn(() => 'replay'),
+      sendTimelineHistoryRequest: vi.fn(() => 'history'),
+    } as unknown as WsClient;
+
+    function Probe() {
+      useTimeline(sessionName, ws, serverId);
+      return h('div', { 'data-testid': 'probe' }, 'mounted');
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe));
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').textContent).toBe('mounted');
+    });
+
+    // Round 1 (mount-time, 200ms delay) fetches 5 full pages, hits cap_hit,
+    // and chains round 2 after a short (150ms) delay. Round 2 fetches the
+    // remaining 2 full pages + the short page and ends caught_up.
+    await act(async () => { await vi.advanceTimersByTimeAsync(200 + 5 * 0 + 150 + 3 * 0 + 500); });
+
+    // This is the actual regression proof: without automatic chaining the
+    // OLD code stopped at exactly 5 calls and never issued a 6th. Crossing
+    // that boundary (8 total: 5 + 3) is only possible if cap_hit resumed.
+    expect(fetchSpy).toHaveBeenCalledTimes(FULL_PAGES + 1);
+
+    // No further calls once genuinely caught up — chaining is bounded and
+    // self-terminating, not an unconditional poll loop.
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+    expect(fetchSpy).toHaveBeenCalledTimes(FULL_PAGES + 1);
+
+    // Every call actually descended the window (each beforeTs strictly below
+    // the previous, never repeating or skipping) across BOTH rounds, proving
+    // the resume genuinely continued the same descent rather than
+    // restarting from the newest event again.
+    const seenBeforeTs = fetchSpy.mock.calls.map(([, , opts]) => (opts as { beforeTs?: number }).beforeTs);
+    expect(seenBeforeTs[0]).toBeUndefined(); // round 1 page 1: newest
+    for (let i = 1; i < seenBeforeTs.length; i++) {
+      expect(seenBeforeTs[i]).toBeDefined();
+      if (i > 0 && seenBeforeTs[i - 1] !== undefined) {
+        expect(seenBeforeTs[i]!).toBeLessThan(seenBeforeTs[i - 1]!);
+      }
+    }
   });
 
   it('15s cooldown coalesces back-to-back activation events for the same session', async () => {

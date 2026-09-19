@@ -11,20 +11,52 @@ import {
   CRON_MSG,
   CRON_STATUS,
   normalizeCronCompletionPolicy,
+  registerCronControlAction,
   type CronAction,
   type CronDispatchMessage,
 } from '../../../shared/cron-types.js';
 import logger from '../util/logger.js';
 
-/** Immediately dispatch a single cron job (for manual "Run Now" trigger). */
-export async function dispatchJobNow(env: Env, job: DbCronJob): Promise<void> {
+type PreparedCronAction =
+  | { ok: true; action: CronAction }
+  | { ok: false; reason: string };
+
+/** Parse, validate and durably register legacy self-managed actions before use. */
+async function prepareCronAction(env: Env, job: DbCronJob): Promise<PreparedCronAction> {
   let action: CronAction;
   try {
-    action = JSON.parse(job.action);
+    action = JSON.parse(job.action) as CronAction;
   } catch {
-    await logExecution(env, randomHex(12), job.id, 'error', 'Invalid action JSON');
-    throw new Error('invalid_action');
+    return { ok: false, reason: 'invalid_action' };
   }
+  if (action.type !== 'command' || action.selfManaged !== true) return { ok: true, action };
+  if (typeof action.command !== 'string') return { ok: false, reason: 'missing_authoritative_body' };
+  const registered = registerCronControlAction(
+    action,
+    job.id,
+    normalizeCronCompletionPolicy(job.completion_policy),
+  );
+  if (!registered.ok) return registered;
+  if (registered.migrated) {
+    const nextAction = JSON.stringify(registered.action);
+    const result = await env.DB.execute(
+      'UPDATE cron_jobs SET action = $1, updated_at = $2 WHERE id = $3 AND action = $4',
+      [nextAction, Date.now(), job.id, job.action],
+    );
+    if (result.changes !== 1) return { ok: false, reason: 'cron_control_migration_conflict' };
+    job.action = nextAction;
+  }
+  return { ok: true, action: registered.action };
+}
+
+/** Immediately dispatch a single cron job (for manual "Run Now" trigger). */
+export async function dispatchJobNow(env: Env, job: DbCronJob): Promise<void> {
+  const prepared = await prepareCronAction(env, job);
+  if (!prepared.ok) {
+    await logExecution(env, randomHex(12), job.id, 'error', prepared.reason);
+    throw new Error(prepared.reason);
+  }
+  const action = prepared.action;
 
   const bridge = WsBridge.get(job.server_id);
   if (!bridge.isDaemonConnected()) {
@@ -84,16 +116,14 @@ export async function jobDispatchCron(env: Env): Promise<void> {
 
   for (const job of dueJobs) {
     try {
-      // Parse action JSON
-      let action: CronAction;
-      try {
-        action = JSON.parse(job.action);
-      } catch {
-        logger.error({ jobId: job.id }, 'Cron job has invalid action JSON, marking as error');
+      const prepared = await prepareCronAction(env, job);
+      if (!prepared.ok) {
+        logger.error({ jobId: job.id, reason: prepared.reason }, 'Cron job has invalid action/control state, marking as error');
         await env.DB.execute('UPDATE cron_jobs SET status = $1 WHERE id = $2', [CRON_STATUS.ERROR, job.id]);
-        await logExecution(env, randomHex(12), job.id, 'error', 'Invalid action JSON');
+        await logExecution(env, randomHex(12), job.id, 'error', prepared.reason);
         continue;
       }
+      const action = prepared.action;
 
       // Skip if daemon offline (fire-and-forget)
       const bridge = WsBridge.get(job.server_id);

@@ -127,6 +127,8 @@ const ws = {
   unsubscribeTerminal: vi.fn(),
   sendSnapshotRequest: vi.fn(),
   sendResize: vi.fn(),
+  getDaemonCapabilitySnapshot: vi.fn(() => null),
+  onDaemonCapabilitySnapshot: vi.fn(() => () => undefined),
 } as any;
 
 function renderWindow(props: Partial<Parameters<typeof SubSessionWindow>[0]> = {}) {

@@ -101,6 +101,7 @@ import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '..
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
 import { getDefaultAcpMcpServers } from './getDefaultMcpServers.js';
 import { filterAcpJsonLines } from './acp-json-filter.js';
+import { acpPlanEntriesToInput } from './acp-plan.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
   SDK_SUBAGENT_DIAGNOSTIC,
@@ -112,12 +113,14 @@ import {
   isSdkRuntimeSubagentEventName,
   makeGeminiSubagentCanonicalKey,
   parseSdkRuntimeSubagentTag,
+  readSdkSubagentFullRequest,
   readSdkSubagentStartedAtMs,
   startsWithSdkRuntimeSubagentTag,
   type SdkSubagentDetail,
   type SdkSubagentDiagnosticCode,
   type SdkSubagentNormalizedStatus,
 } from '../../../shared/sdk-subagent-status.js';
+import { NATIVE_AGENT_ADMISSION_MODES } from '../../../shared/native-collaboration-policy.js';
 
 const GEMINI_BIN = 'gemini';
 /** ACP mode id we request once per session. Matches the `yolo` mode advertised
@@ -370,6 +373,7 @@ function geminiRuntimeSubagentToolFromPayload(
     input: {
       action: 'gemini-runtime-subagent',
       description: prompt ?? summary,
+      ...(readSdkSubagentFullRequest(record) ? { fullRequest: readSdkSubagentFullRequest(record) } : {}),
     },
     ...(output ? { output } : {}),
     meta: {
@@ -423,6 +427,10 @@ export class GeminiSdkProvider implements TransportProvider {
       cancellation: 'none',
       reason: 'Verified with Gemini CLI 0.39.1: regular CLI registers /compress with /compact and /summarize aliases, but the --acp command registry used by this adapter does not register compress/compact.',
     },
+    // Native sub-agents can be neither refused per call nor withheld per
+    // session (the only disable is process-wide), so this runtime cannot
+    // send or receive supervised work.
+    nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.UNENFORCEABLE,
   };
 
   private config: ProviderConfig | null = null;
@@ -490,7 +498,7 @@ export class GeminiSdkProvider implements TransportProvider {
   }
 
   async disconnect(): Promise<void> {
-    this.teardownChild();
+    await this.teardownChild();
     this.acpToRoute.clear();
     this.sessions.clear();
     this.config = null;
@@ -709,7 +717,7 @@ export class GeminiSdkProvider implements TransportProvider {
   }
 
   private async startAcpServer(config: ProviderConfig): Promise<void> {
-    this.teardownChild();
+    await this.teardownChild();
 
     // Auto-trust: a headless `gemini --acp` has no human to answer folder-trust
     // prompts, so an untrusted session cwd makes Gemini skip project agents and
@@ -720,6 +728,11 @@ export class GeminiSdkProvider implements TransportProvider {
     const resolved = resolveExecutableForSpawn(binaryPath);
     const args = [...resolved.prependArgs, '--acp'];
     const child = spawn(resolved.executable, args, {
+      // Own process group and session on POSIX. A reparented descendant keeps
+      // its PGID but loses its PPID, so after the agent parent dies this is the
+      // only ownership token teardown still has. Without it the eight vitest
+      // workers of the incident were unreachable on PPID=1.
+      detached: process.platform !== 'win32',
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, ...((config.env as Record<string, string> | undefined) ?? {}) },
       windowsHide: true,
@@ -1329,7 +1342,7 @@ export class GeminiSdkProvider implements TransportProvider {
     state: GeminiSdkSessionState,
     update: SessionUpdate,
   ): void {
-    const input = geminiPlanEntriesToInput((update as unknown as { entries?: unknown }).entries);
+    const input = acpPlanEntriesToInput((update as unknown as { entries?: unknown }).entries);
     if (!input) return;
     this.clearStatus(sessionId, state);
     // Stable id so each plan revision overwrites the same timeline event in
@@ -1371,13 +1384,15 @@ export class GeminiSdkProvider implements TransportProvider {
 
   // ── Helpers ─────────────────────────────────────────────────────────────
 
-  private teardownChild(): void {
+  // Async on purpose: teardown must be awaitable, or shutdown resolves while
+  // the SIGTERM->SIGKILL window is still open and the SIGKILL never lands.
+  private async teardownChild(): Promise<void> {
     // Closing the ACP connection is implicit when we close stdin. The SDK's
     // internal readers finish when stdout ends. tree-kill the CLI so its
     // node wrapper doesn't leave grandchildren behind.
     if (this.child && !this.child.killed) {
       try { this.child.stdin.end(); } catch { /* noop */ }
-      void killProcessTree(this.child);
+      await killProcessTree(this.child, { ownsProcessGroup: true });
     }
     this.child = null;
     this.connection = null;
@@ -1459,20 +1474,7 @@ export class GeminiSdkProvider implements TransportProvider {
  * priority, status }; some builds use `title`. Exported for unit testing.
  */
 export function geminiPlanEntriesToInput(entries: unknown): { plan: Array<{ content: string; status: string }> } | null {
-  if (!Array.isArray(entries)) return null;
-  const plan: Array<{ content: string; status: string }> = [];
-  for (const entry of entries) {
-    if (!entry || typeof entry !== 'object') continue;
-    const record = entry as Record<string, unknown>;
-    const rawText = typeof record.content === 'string'
-      ? record.content
-      : typeof record.title === 'string' ? record.title : '';
-    const content = rawText.trim();
-    if (!content) continue;
-    const status = typeof record.status === 'string' ? record.status : 'pending';
-    plan.push({ content, status });
-  }
-  return plan.length > 0 ? { plan } : null;
+  return acpPlanEntriesToInput(entries);
 }
 
 function extractTextFromContent(block: ContentBlock): string {

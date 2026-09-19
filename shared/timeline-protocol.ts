@@ -1,6 +1,10 @@
 export const TIMELINE_MESSAGES = {
   HISTORY_REQUEST: 'timeline.history_request',
   HISTORY: 'timeline.history',
+  /** Server → daemon: the server abandoned this history/page request (timeout
+   *  or requester gone). The daemon drops its reply if still queued unsent.
+   *  Only sent to daemons advertising TIMELINE_HISTORY_CANCEL_CAPABILITY. */
+  HISTORY_CANCEL: 'timeline.history_cancel',
   REPLAY_REQUEST: 'timeline.replay_request',
   REPLAY: 'timeline.replay',
   PAGE_REQUEST: 'timeline.page_request',
@@ -59,6 +63,8 @@ export interface TimelineCursor {
 
 export const TIMELINE_PROTOCOL_REVISION = 1 as const;
 export const TIMELINE_PROTOCOL_CAPABILITY = 'timeline.protocol.v1' as const;
+/** Daemon understands TIMELINE_MESSAGES.HISTORY_CANCEL. */
+export const TIMELINE_HISTORY_CANCEL_CAPABILITY = 'timeline.history_cancel.v1' as const;
 
 export interface TimelineProtocolCapability {
   capability: typeof TIMELINE_PROTOCOL_CAPABILITY;

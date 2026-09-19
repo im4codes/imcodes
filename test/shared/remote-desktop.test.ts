@@ -18,10 +18,15 @@ import {
   REMOTE_DESKTOP_MODE_REASON,
   REMOTE_DESKTOP_POINTER_KIND,
   REMOTE_DESKTOP_PROTOCOL_VERSION,
+  REMOTE_DESKTOP_QUALITY_MODE,
+  REMOTE_DESKTOP_QUALITY_MODE_PREFERENCES,
   REMOTE_DESKTOP_QUALITY_PRESET,
   REMOTE_DESKTOP_STATE,
+  REMOTE_DESKTOP_STOP_ORIGIN,
   REMOTE_DESKTOP_TERMINAL_REASON,
   isRemoteDesktopSequenceAccepted,
+  hasRemoteDesktopIndependentRouteGeneration,
+  isRemoteDesktopQualityPreference,
   isRemoteDesktopDaemonMessageType,
   isRemoteDesktopPresentedFrameCompatible,
   mapRemoteDesktopPointToPhysicalPixels,
@@ -142,7 +147,7 @@ describe('remote desktop production contract', () => {
       KEYBOARD: 'imcodes-rd-keyboard',
       POINTER: 'imcodes-rd-pointer',
     });
-    expect(WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.qualityLadder).toHaveLength(9);
+    expect(WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.qualityLadder).toHaveLength(16);
     expect(WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.qualityLadder[0]).toMatchObject({
       id: '2160p30', width: 3840, height: 2160, fps: 30,
     });
@@ -162,6 +167,13 @@ describe('remote desktop production contract', () => {
   });
 
   it('strictly validates start and authority envelopes', () => {
+    expect(REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_GRACE_MS).toBe(5 * 60_000);
+    expect(REMOTE_DESKTOP_LIMITS.SIGNALING_RECONNECT_MAX_BACKOFF_MS).toBe(5_000);
+    expect(Array.from(
+      { length: REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS },
+      (_, attempt) => REMOTE_DESKTOP_LIMITS.RECONNECT_BACKOFF_BASE_MS * (2 ** attempt),
+    )).toEqual([1_000, 2_000, 4_000, 8_000]);
+    expect(REMOTE_DESKTOP_LIMITS.MAX_ICE_RESTARTS).toBe(8);
     expect(validateRemoteDesktopBrowserMessage({
       type: REMOTE_DESKTOP_MSG.START,
       protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
@@ -175,12 +187,34 @@ describe('remote desktop production contract', () => {
       reconnectAttempt: REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS + 1,
     })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
     expect(validateRemoteDesktopBrowserMessage({
+      type: REMOTE_DESKTOP_MSG.RESUME,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      requestId,
+      sessionId,
+      capability,
+    })).toMatchObject({ ok: true });
+    expect(validateRemoteDesktopBrowserMessage({
+      type: REMOTE_DESKTOP_MSG.RESUME,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      requestId,
+      sessionId,
+      capability,
+      reconnectAttempt: 1,
+    })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+    expect(validateRemoteDesktopBrowserMessage({
       type: REMOTE_DESKTOP_MSG.STOP,
       requestId,
       sessionId,
       capability,
+      stopOrigin: REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE,
       aggregateBytesReceived: 12_345,
     })).toMatchObject({ ok: true });
+    expect(validateRemoteDesktopBrowserMessage({
+      type: REMOTE_DESKTOP_MSG.STOP,
+      requestId,
+      sessionId,
+      capability,
+    })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
     expect(validateRemoteDesktopBrowserMessage({
       type: REMOTE_DESKTOP_MSG.START,
       protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
@@ -188,20 +222,45 @@ describe('remote desktop production contract', () => {
       serverId: 'must-be-query-scoped',
     })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
     expect(validateRemoteDesktopAuthorized({ type: REMOTE_DESKTOP_MSG.AUTHORIZED, ...authority })).toMatchObject({ ok: true });
-    expect(validateRemoteDesktopDaemonCommand({ type: REMOTE_DESKTOP_MSG.PREPARE, ...authority })).toMatchObject({ ok: true });
+    expect(validateRemoteDesktopServerMessage({
+      type: REMOTE_DESKTOP_MSG.RESUMED,
+      ...authority,
+    })).toMatchObject({ ok: true });
+    expect(validateRemoteDesktopAuthorized({
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      ...authority,
+      routeGeneration: 1,
+    })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+    // The v2 base protocol keeps legacy authenticated nodes usable. Such a
+    // route can never qualify for controlled-host privacy management because
+    // it has no independent route-incarnation fence.
     expect(validateRemoteDesktopDaemonCommand({
       type: REMOTE_DESKTOP_MSG.PREPARE,
       ...authority,
+    })).toMatchObject({ ok: true });
+    expect(hasRemoteDesktopIndependentRouteGeneration({})).toBe(false);
+    expect(hasRemoteDesktopIndependentRouteGeneration({ routeGeneration: 0 })).toBe(true);
+    expect(validateRemoteDesktopDaemonCommand({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      ...authority,
+      routeGeneration: 0,
+    })).toMatchObject({ ok: true });
+    expect(validateRemoteDesktopDaemonCommand({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      ...authority,
+      routeGeneration: 1,
       reconnectAttempt: REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS,
     })).toMatchObject({ ok: true });
     expect(validateRemoteDesktopDaemonCommand({
       type: REMOTE_DESKTOP_MSG.PREPARE,
       ...authority,
+      routeGeneration: 1,
       reconnectAttempt: REMOTE_DESKTOP_LIMITS.MAX_RECONNECT_ATTEMPTS + 1,
     })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
     expect(validateRemoteDesktopDaemonCommand({
       type: REMOTE_DESKTOP_MSG.PREPARE,
       ...authority,
+      routeGeneration: 1,
       leaseExpiresAt: authority.expiresAt + 1,
     })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
     expect(validateRemoteDesktopAuthorized({
@@ -259,6 +318,18 @@ describe('remote desktop production contract', () => {
       capability,
       leaseExpiresAt: 90_000,
       daemonGeneration: 0,
+      routeGeneration: 0,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+    })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+    expect(validateRemoteDesktopDaemonCommand({
+      type: REMOTE_DESKTOP_MSG.LEASE,
+      requestId,
+      sessionId,
+      capability,
+      leaseExpiresAt: 90_000,
+      daemonGeneration: 7,
+      routeGeneration: -1,
       mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
       inputEpoch: 0,
     })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
@@ -320,6 +391,39 @@ describe('remote desktop production contract', () => {
       .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
   });
 
+  it('separates encoded pixels from logical input geometry for common profiles', () => {
+    const topology = {
+      type: REMOTE_DESKTOP_DATA_MSG.DISPLAY_TOPOLOGY,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      sessionId,
+      sequence: 1,
+      layoutRevision: 2,
+      displays: [{
+        id: 'mac-display-generation-2-main',
+        label: 'Built-in Retina Display',
+        primary: true,
+        available: true,
+        // ScreenCaptureKit pixels differ from Quartz input points.
+        width: 3024,
+        height: 1964,
+        dpiScale: 2,
+        rotation: REMOTE_DESKTOP_DISPLAY_ROTATION.ROTATE_0,
+        inputBounds: { x: 0, y: 0, width: 1512, height: 982 },
+        operations: { setMode: false, setScale: false },
+      }],
+      selectedDisplayId: 'mac-display-generation-2-main',
+    };
+    expect(validateRemoteDesktopDataMessage(topology)).toMatchObject({ ok: true });
+    expect(validateRemoteDesktopDataMessage({
+      ...topology,
+      displays: [{ ...topology.displays[0], inputBounds: { x: 0, y: 0, width: 0, height: 982 } }],
+    })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+    expect(validateRemoteDesktopDataMessage({
+      ...topology,
+      displays: [{ ...topology.displays[0], operations: { setMode: false, setScale: false, capture: true } }],
+    })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+  });
+
   it('carries the driver-reported resolutions on a display, bounded and unique', () => {
     const base = {
       type: REMOTE_DESKTOP_DATA_MSG.DISPLAY_TOPOLOGY,
@@ -362,6 +466,73 @@ describe('remote desktop production contract', () => {
         { width: 1024 + index, height: 768 }
       )),
     ))).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+  });
+
+  it('accepts a viewer quality preference only as a bounded, bare control command', () => {
+    const request = {
+      type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
+      ...inputBase,
+      sequence: 32,
+      kind: REMOTE_DESKTOP_CONTROL_KIND.SET_QUALITY_PREFERENCE,
+      maxHeight: 1080,
+      maxFps: 60,
+      maxBitrateBps: 0,
+      priority: 'framerate',
+    };
+    expect(validateRemoteDesktopDataMessage(request)).toMatchObject({ ok: true });
+    // Ultra: 4K and a ceiling raised above the default 15 Mbps.
+    expect(validateRemoteDesktopDataMessage({ ...request, maxHeight: 2160, maxBitrateBps: 30_000_000 }))
+      .toMatchObject({ ok: true });
+    for (const bad of [
+      { maxHeight: 900 },
+      { maxFps: 45 },
+      { maxBitrateBps: 100_000 },
+      { maxBitrateBps: 31_000_000 },
+      { maxHeight: 2880 },
+      { priority: 'fastest' },
+      { displayId: 'display-primary' },
+    ]) {
+      expect(validateRemoteDesktopDataMessage({ ...request, ...bad }))
+        .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+    }
+    const { maxFps: _omitted, ...missingFps } = request;
+    expect(validateRemoteDesktopDataMessage(missingFps))
+      .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+    // Quality fields never ride along on another command.
+    expect(validateRemoteDesktopDataMessage({
+      type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
+      ...inputBase,
+      sequence: 33,
+      kind: REMOTE_DESKTOP_CONTROL_KIND.UNLOCK,
+      maxFps: 30,
+    })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+    // Every quick mode is itself a valid preference.
+    for (const mode of Object.values(REMOTE_DESKTOP_QUALITY_MODE)) {
+      if (mode === REMOTE_DESKTOP_QUALITY_MODE.CUSTOM) continue;
+      expect(isRemoteDesktopQualityPreference(REMOTE_DESKTOP_QUALITY_MODE_PREFERENCES[mode])).toBe(true);
+    }
+  });
+
+  it('carries a relay bitrate cap on authority only within the ladder bounds', () => {
+    const authorized = {
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      requestId: '11111111-1111-4111-8111-111111111111',
+      sessionId: 'session_12345678',
+      capability: 'a'.repeat(43),
+      expiresAt: 60_000,
+      leaseExpiresAt: 15_000,
+      daemonGeneration: 1,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      iceServers: ['stun:stun.example.test:3478'],
+    };
+    expect(validateRemoteDesktopAuthorized(authorized)).toMatchObject({ ok: true });
+    expect(validateRemoteDesktopAuthorized({ ...authorized, relayBitrateCapBps: 500_000 }))
+      .toMatchObject({ ok: true });
+    expect(validateRemoteDesktopAuthorized({ ...authorized, relayBitrateCapBps: 100_000 }))
+      .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+    expect(validateRemoteDesktopAuthorized({ ...authorized, relayBitrateCapBps: 1.5 }))
+      .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
   });
 
   it('accepts any bounded resolution request, since the node owns the list', () => {

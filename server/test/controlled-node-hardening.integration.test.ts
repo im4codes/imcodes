@@ -12,13 +12,19 @@ import { runMigrations } from '../src/db/migrate.js';
 import { createUser, createServer } from '../src/db/queries.js';
 import { enrollRoutes } from '../src/routes/enroll.js';
 import { machinesRoutes } from '../src/routes/machines.js';
+import { serverRoutes } from '../src/routes/server.js';
+import { bindRoutes } from '../src/routes/bind.js';
 import { WsBridge } from '../src/ws/bridge.js';
-import { MACHINE_LIST_MAX_ITEMS, NODE_ROLE } from '../../shared/remote-exec.js';
+import { MACHINE_LIST_MAX_ITEMS, NODE_ROLE, NODE_ROLE_REFUSAL } from '../../shared/remote-exec.js';
 import { MACHINE_REASONS } from '../../shared/machine-reference.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '../../shared/remote-desktop.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_ERROR } from '../../shared/controlled-node-auto-unlock.js';
 import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY } from '../../shared/remote-desktop-install.js';
 import { signJwt } from '../src/security/crypto.js';
+import { generateControlledNodeId } from '../src/services/controlled-node-identity.js';
+import { listMachines as decodeMachineList } from '../../src/daemon/machine-exec-client.js';
+import { createDaemonMachineToolDeps } from '../../src/daemon/machine-mcp-deps.js';
+import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 
 let db: Database;
 const JWT_KEY = 'test-signing-key-32chars-padding!!';
@@ -39,17 +45,41 @@ function buildApp() {
   });
   app.route('/api/enroll', enrollRoutes);
   app.route('/api/machines', machinesRoutes);
+  app.route('/api/server', serverRoutes);
+  app.route('/api/bind', bindRoutes);
   return app;
+}
+
+/**
+ * Desk scope: redemption refuses a ticket with no Desk rather than creating an
+ * unbound machine, so a seeded enrollment carries one exactly like a real mint
+ * does. The Desk is derived from the owner id so callers need no extra state.
+ */
+async function seedDesk(userId: string): Promise<string> {
+  const teamId = `desk-${userId}`;
+  const now = Date.now();
+  await db.execute(
+    `INSERT INTO teams (id, name, owner_id, plan, created_at)
+     VALUES ($1, 'AI Desk', $2, 'free', $3) ON CONFLICT DO NOTHING`,
+    [teamId, userId, now],
+  );
+  await db.execute(
+    `INSERT INTO team_members (team_id, user_id, role, joined_at)
+     VALUES ($1, $2, 'owner', $3) ON CONFLICT DO NOTHING`,
+    [teamId, userId, now],
+  );
+  return teamId;
 }
 
 async function seedV2Enrollment(code: string, userId: string): Promise<void> {
   const now = Date.now();
+  const deskTeamId = await seedDesk(userId);
   await db.execute(
     `INSERT INTO controlled_node_enrollments_v2
        (ticket_hash, code_hash, owner_user_id, os, arch, artifact_sha256,
-        encrypted_code, ticket_expires_at, expires_at, created_at)
-     VALUES ($1, $2, $3, 'linux', 'x64', $4, 'test-only', $5, $5, $6)`,
-    [sha256(hex(16)), sha256(code), userId, sha256(hex(32)), now + 60_000, now],
+        encrypted_code, ticket_expires_at, expires_at, created_at, desk_team_id)
+     VALUES ($1, $2, $3, 'linux', 'x64', $4, 'test-only', $5, $5, $6, $7)`,
+    [sha256(hex(16)), sha256(code), userId, sha256(hex(32)), now + 60_000, now, deskTeamId],
   );
 }
 
@@ -73,10 +103,14 @@ describe('D-A transactional / idempotent redeem', () => {
 
     const r1 = await app.request('/api/enroll/v2/redeem', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
     expect(r1.status).toBe(200);
-    const b1 = await r1.json() as { serverId: string; token?: string; refName: string; nodeRole: string };
+    const b1 = await r1.json() as { serverId: string; token?: string; refName?: string; nodeRole: string };
     expect(b1.nodeRole).toBe(NODE_ROLE.CONTROLLED);
     expect(b1.token).toBeUndefined(); // D-A: server does not return an unrecoverable raw token
-    expect(b1.refName).toMatch(/^[\p{L}\p{N}._-]{1,40}$/u);
+    expect(b1.refName).toBeUndefined();
+    expect(await db.queryOne<{ ref_name: string | null }>(
+      'SELECT ref_name FROM servers WHERE id = $1',
+      [b1.serverId],
+    )).toEqual({ ref_name: null });
 
     const r2 = await app.request('/api/enroll/v2/redeem', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
     expect(r2.status).toBe(200);
@@ -142,16 +176,16 @@ describe('revocation kill-switch', () => {
 });
 
 describe('owner-scoped machine rename', () => {
-  it('updates display_name while preserving the stable ref_name', async () => {
+  it('updates display_name while preserving a deprecated legacy ref_name', async () => {
     const app = buildApp();
     const userId = `u_${hex(4)}`;
     await createUser(db, userId);
     const owner = await fullCredential(userId);
     const controlledId = `ctl_${hex(8)}`;
     await db.execute(
-      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, ref_name, display_name, os)
-       VALUES ($1,$2,'controlled',$3,'offline',$4,$5,true,'stable-ref','Old name','linux')`,
-      [controlledId, userId, sha256(hex(16)), Date.now(), NODE_ROLE.CONTROLLED],
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, ref_name, display_name, os, node_id)
+       VALUES ($1,$2,'controlled',$3,'offline',$4,$5,true,'stable-ref','Old name','linux',$6)`,
+      [controlledId, userId, sha256(hex(16)), Date.now(), NODE_ROLE.CONTROLLED, generateControlledNodeId()],
     );
 
     const response = await app.request(`/api/machines/${controlledId}/display-name`, {
@@ -181,9 +215,9 @@ describe('owner-scoped machine rename', () => {
     const otherOwner = await fullCredential(otherUserId);
     const controlledId = `ctl_${hex(8)}`;
     await db.execute(
-      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, ref_name, display_name, os)
-       VALUES ($1,$2,'controlled',$3,'offline',$4,$5,true,'stable-ref','Old name','linux')`,
-      [controlledId, userId, sha256(hex(16)), Date.now(), NODE_ROLE.CONTROLLED],
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, ref_name, display_name, os, node_id)
+       VALUES ($1,$2,'controlled',$3,'offline',$4,$5,true,'stable-ref','Old name','linux',$6)`,
+      [controlledId, userId, sha256(hex(16)), Date.now(), NODE_ROLE.CONTROLLED, generateControlledNodeId()],
     );
     const headers = {
       'X-Server-Id': owner.serverId,
@@ -223,10 +257,10 @@ describe('auto unlock capability gate', () => {
     const controlledId = `ctl_${hex(8)}`;
     // Advertises remote desktop but not auto unlock: an older Windows build.
     await db.execute(
-      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, ref_name, display_name, os, controlled_capabilities)
-       VALUES ($1,$2,'controlled',$3,'online',$4,$5,true,'win-ref','Win box','win',$6)`,
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, ref_name, display_name, os, controlled_capabilities, node_id)
+       VALUES ($1,$2,'controlled',$3,'online',$4,$5,true,'win-ref','Win box','win',$6,$7)`,
       [controlledId, userId, sha256(hex(16)), Date.now(), NODE_ROLE.CONTROLLED,
-        JSON.stringify([REMOTE_DESKTOP_CAPABILITY])],
+        JSON.stringify([REMOTE_DESKTOP_CAPABILITY]), generateControlledNodeId()],
     );
 
     const started = Date.now();
@@ -267,10 +301,10 @@ describe('remote desktop worker quick install', () => {
     await db.execute(
       `INSERT INTO servers
          (id, user_id, name, token_hash, status, last_heartbeat_at, created_at,
-          node_role, exec_enabled, ref_name, display_name, os, daemon_version, controlled_capabilities)
-       VALUES ($1,$2,'controlled',$3,'online',$4,$4,$5,true,'win-ref','Win box','win','2026.8.4000-dev.1',$6)`,
+          node_role, exec_enabled, ref_name, display_name, os, daemon_version, controlled_capabilities, node_id)
+       VALUES ($1,$2,'controlled',$3,'online',$4,$4,$5,true,'win-ref','Win box','win','2026.8.4000-dev.1',$6,$7)`,
       [controlledId, userId, sha256(hex(16)), Date.now(), NODE_ROLE.CONTROLLED,
-        JSON.stringify([REMOTE_DESKTOP_INSTALLABLE_CAPABILITY])],
+        JSON.stringify([REMOTE_DESKTOP_INSTALLABLE_CAPABILITY]), generateControlledNodeId()],
     );
     const bridge = WsBridge.get(controlledId);
     const install = vi.spyOn(bridge, 'tryInstallControlledNodeRemoteDesktopWorker')
@@ -379,6 +413,62 @@ describe('owner-scoped machine listing (DB presence)', () => {
     expect(((await theirs.json() as { machines: unknown[] }).machines).length).toBe(0);
   });
 
+  it('projects and decodes mixed legacy + post-migration aliases while routing only by canonical nodeId or a non-empty legacy alias', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const owner = await fullCredential(userId);
+
+    const redeemNode = async (installId: string, hostname: string): Promise<{ serverId: string; nodeId: string }> => {
+      const code = `tok_${hex(6)}`;
+      await seedV2Enrollment(code, userId);
+      const response = await app.request('/api/enroll/v2/redeem', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          version: 2,
+          enrollToken: code,
+          installId,
+          nodeTokenHash: sha256(hex(16)),
+          hostname,
+          os: 'linux',
+          arch: 'x64',
+        }),
+      });
+      expect(response.status).toBe(200);
+      return await response.json() as { serverId: string; nodeId: string };
+    };
+
+    const postMigration = await redeemNode('post-migration', 'new-hostname');
+    const legacy = await redeemNode('legacy-install', 'old-hostname');
+    await db.execute('UPDATE servers SET ref_name = $2 WHERE id = $1', [legacy.serverId, 'legacy-node']);
+
+    const fetchFromApp = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(typeof input === 'string' || input instanceof URL ? input : input.url);
+      return app.request(`${url.pathname}${url.search}`, init);
+    }) as typeof fetch;
+    const exec = vi.fn(async () => ({ outcome: 'completed' as const }));
+    const deps = createDaemonMachineToolDeps({
+      loadCredential: async () => ({ serverUrl: 'https://control-plane.test', ...owner }),
+      listMachines: (options) => decodeMachineList({ ...options, fetchImpl: fetchFromApp }),
+      execRemote: exec,
+    });
+
+    await expect(deps.listMachines({ includeOffline: true })).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: postMigration.nodeId }),
+      expect.objectContaining({ name: legacy.nodeId }),
+    ]));
+    expect(await deps.execRemote({ machine: postMigration.nodeId, command: 'canonical' }))
+      .toMatchObject({ outcome: 'completed' });
+    expect(exec).toHaveBeenLastCalledWith(expect.objectContaining({ targetServerId: postMigration.serverId }));
+    expect(await deps.execRemote({ machine: 'legacy-node', command: 'legacy' }))
+      .toMatchObject({ outcome: 'completed' });
+    expect(exec).toHaveBeenLastCalledWith(expect.objectContaining({ targetServerId: legacy.serverId }));
+    expect(await deps.execRemote({ machine: '', command: 'must-not-dispatch' }))
+      .toMatchObject({ outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.MACHINE_NOT_FOUND });
+    expect(exec).toHaveBeenCalledTimes(2);
+  });
+
   it('returns exactly max owner machines with canonical OS and role', async () => {
     const app = buildApp();
     const userId = `u_${hex(4)}`;
@@ -388,9 +478,9 @@ describe('owner-scoped machine listing (DB presence)', () => {
     for (let i = 0; i < MACHINE_LIST_MAX_ITEMS; i++) {
       const id = `ctl_${hex(8)}_${i}`;
       await db.execute(
-        `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, ref_name, display_name, os)
-         VALUES ($1,$2,$3,$4,'offline',$5,$6,true,$3,$3,$7)`,
-        [id, userId, `ctl-${String(i).padStart(3, '0')}`, sha256(hex(16)), now, NODE_ROLE.CONTROLLED, i === 0 ? 'plan9' : 'mac'],
+        `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, ref_name, display_name, os, node_id)
+         VALUES ($1,$2,$3,$4,'offline',$5,$6,true,$3,$3,$7,$8)`,
+        [id, userId, `ctl-${String(i).padStart(3, '0')}`, sha256(hex(16)), now, NODE_ROLE.CONTROLLED, i === 0 ? 'plan9' : 'mac', generateControlledNodeId()],
       );
     }
     const response = await app.request('/api/machines', { headers: { 'X-Server-Id': owner.serverId, authorization: `Bearer ${owner.token}` } });
@@ -411,13 +501,264 @@ describe('owner-scoped machine listing (DB presence)', () => {
     for (let i = 0; i < MACHINE_LIST_MAX_ITEMS + 1; i++) {
       const id = `ctl_${hex(8)}_${i}`;
       await db.execute(
-        `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, ref_name, display_name, os)
-         VALUES ($1,$2,$3,$4,'offline',$5,$6,true,$3,$3,$7)`,
-        [id, userId, `ctl-over-${String(i).padStart(3, '0')}`, sha256(hex(16)), now, NODE_ROLE.CONTROLLED, 'linux'],
+        `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, ref_name, display_name, os, node_id)
+         VALUES ($1,$2,$3,$4,'offline',$5,$6,true,$3,$3,$7,$8)`,
+        [id, userId, `ctl-over-${String(i).padStart(3, '0')}`, sha256(hex(16)), now, NODE_ROLE.CONTROLLED, 'linux', generateControlledNodeId()],
       );
     }
     const response = await app.request('/api/machines', { headers: { 'X-Server-Id': owner.serverId, authorization: `Bearer ${owner.token}` } });
     expect(response.status).toBe(413);
     expect(await response.json()).toEqual({ error: 'machine_list_over_limit', maxItems: MACHINE_LIST_MAX_ITEMS });
+  });
+});
+
+
+/**
+ * Daemon-token routes must not answer a controlled node.
+ *
+ * These routes cannot use `requireAuth()`, because their caller holds a server
+ * token rather than a browser session. Each therefore used to resolve the token
+ * itself, and in doing so skipped the two checks `requireAuth()` performs: the
+ * node's role, and whether the credential was revoked.
+ *
+ * The consequence was concrete. A controlled node — a machine whose entire
+ * contract is that it can be controlled and controls nothing — could read and
+ * write its OWNER'S account-scoped memory, because those handlers scope their
+ * queries by `user_id`, not by server. Revoking the machine did not stop it.
+ */
+describe('daemon-token routes reject controlled nodes', () => {
+  /** Enrol a real controlled node and return the credential it would hold. */
+  async function controlledCredential(userId: string): Promise<{ serverId: string; token: string }> {
+    const app = buildApp();
+    const code = `tok_${hex(6)}`;
+    await seedV2Enrollment(code, userId);
+    const nodeToken = hex(16);
+    const r = await app.request('/api/enroll/v2/redeem', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        version: 2, enrollToken: code, installId: `i_${hex(4)}`,
+        nodeTokenHash: sha256(nodeToken), hostname: 'h', os: 'linux', arch: 'x64',
+      }),
+    });
+    expect(r.status).toBe(200);
+    const { serverId } = await r.json() as { serverId: string };
+    return { serverId, token: nodeToken };
+  }
+
+  /** Every daemon-token route, with a body valid enough to reach the guard. */
+  function daemonRoutes(serverId: string): { name: string; path: string; method: string; body?: unknown }[] {
+    return [
+      { name: 'owner-private search (read account memory)', method: 'POST', path: `/api/server/${serverId}/shared-context/owner-private/search`, body: { query: '', limit: 100 } },
+      { name: 'owner-private write (poison account memory)', method: 'POST', path: `/api/server/${serverId}/shared-context/owner-private`, body: { records: [] } },
+      { name: 'processed projections', method: 'POST', path: `/api/server/${serverId}/shared-context/processed`, body: { projections: [] } },
+      { name: 'runtime config', method: 'GET', path: `/api/server/${serverId}/shared-context/runtime-config/daemon` },
+      { name: 'supervision defaults', method: 'GET', path: `/api/server/${serverId}/supervision/user-defaults/daemon` },
+      { name: 'create channel binding', method: 'POST', path: `/api/server/${serverId}/bindings`, body: {} },
+      { name: 'delete channel binding', method: 'DELETE', path: `/api/server/${serverId}/bindings`, body: {} },
+      { name: 'authored bindings', method: 'POST', path: `/api/server/${serverId}/shared-context/authored-bindings`, body: {} },
+      { name: 'resolve namespace', method: 'POST', path: `/api/server/${serverId}/shared-context/resolve-namespace`, body: {} },
+    ];
+  }
+
+  function call(app: ReturnType<typeof buildApp>, route: { path: string; method: string; body?: unknown }, token: string): Promise<Response> {
+    return app.request(route.path, {
+      method: route.method,
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      ...(route.body === undefined ? {} : { body: JSON.stringify(route.body) }),
+    });
+  }
+
+  it('refuses every account-scoped daemon route with controlled_node', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const node = await controlledCredential(userId);
+
+    for (const route of daemonRoutes(node.serverId)) {
+      const res = await call(app, route, node.token);
+      expect(res.status, `${route.name} must be forbidden`).toBe(403);
+      const body = await res.json() as { reason?: string };
+      expect(body.reason, `${route.name} must say why`).toBe(NODE_ROLE_REFUSAL.CONTROLLED_NODE);
+    }
+  });
+
+  it('does not leak owner memory to a controlled node through an empty query', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const secret = `SECRET-${hex(8)}`;
+    await db.execute(
+      `INSERT INTO owner_private_memories (id, owner_user_id, kind, origin, text, fingerprint, created_at, updated_at)
+       VALUES ($1, $2, 'note', 'agent', $3, $4, $5, $5)`,
+      [hex(8), userId, secret, hex(16), Date.now()],
+    ).catch(() => { /* column set varies by migration; the assertion below is what matters */ });
+
+    const node = await controlledCredential(userId);
+    // An empty query skipped the ILIKE and enumerated the whole store.
+    const res = await app.request(`/api/server/${node.serverId}/shared-context/owner-private/search`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${node.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ query: '', limit: 100 }),
+    });
+    expect(res.status).toBe(403);
+    expect(await res.text()).not.toContain(secret);
+  });
+
+  it('still serves a full daemon on the same routes', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const full = await fullCredential(userId);
+
+    for (const route of daemonRoutes(full.serverId)) {
+      const res = await call(app, route, full.token);
+      // Payload validation may still reject a stub body; the guard must not.
+      expect(res.status, `${route.name} must not be role-forbidden for a full daemon`).not.toBe(403);
+      expect(res.status, `${route.name} must authenticate a full daemon`).not.toBe(401);
+    }
+  });
+
+  it('lets a controlled node heartbeat, because that touches only its own row', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const node = await controlledCredential(userId);
+    const res = await app.request(`/api/server/${node.serverId}/heartbeat`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${node.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ daemonVersion: '1.2.3' }),
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it('rejects a revoked full daemon, which these routes never used to check', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const full = await fullCredential(userId);
+    await db.execute('UPDATE servers SET revoked_at = $1 WHERE id = $2', [Date.now(), full.serverId]);
+
+    for (const route of daemonRoutes(full.serverId)) {
+      const res = await call(app, route, full.token);
+      expect(res.status, `${route.name} must reject a revoked credential`).toBe(401);
+    }
+    const beat = await app.request(`/api/server/${full.serverId}/heartbeat`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${full.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    expect(beat.status).toBe(401);
+  });
+
+  it('rejects a token that addresses a server it does not own', async () => {
+    const app = buildApp();
+    const userA = `u_${hex(4)}`;
+    const userB = `u_${hex(4)}`;
+    await createUser(db, userA);
+    await createUser(db, userB);
+    const a = await fullCredential(userA);
+    const b = await fullCredential(userB);
+
+    const res = await app.request(`/api/server/${b.serverId}/shared-context/owner-private/search`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${a.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ query: '', limit: 10 }),
+    });
+    expect(res.status).toBe(401);
+  });
+});
+
+
+/**
+ * `POST /api/bind/verify` — found by audit, not by the original inventory.
+ *
+ * This route was missed because it does not contain a raw
+ * `FROM servers WHERE token_hash`: it loads the row with `getServerById()` and
+ * compares the hash in TypeScript, so a grep for the SQL shape cannot see it.
+ * It accepted a controlled node's token, accepted a revoked credential, and
+ * returned the owner's `user_id` to anyone holding a machine token.
+ *
+ * The lesson the tests encode: authorization coverage must be driven by "which
+ * routes accept a daemon token", not by "which routes contain a known query".
+ */
+describe('POST /api/bind/verify enforces role and revocation', () => {
+  async function controlledCredential(userId: string): Promise<{ serverId: string; token: string }> {
+    const app = buildApp();
+    const code = `tok_${hex(6)}`;
+    await seedV2Enrollment(code, userId);
+    const nodeToken = hex(16);
+    const r = await app.request('/api/enroll/v2/redeem', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        version: 2, enrollToken: code, installId: `i_${hex(4)}`,
+        nodeTokenHash: sha256(nodeToken), hostname: 'h', os: 'linux', arch: 'x64',
+      }),
+    });
+    const { serverId } = await r.json() as { serverId: string };
+    return { serverId, token: nodeToken };
+  }
+
+  const verify = (app: ReturnType<typeof buildApp>, serverId: string, token: string) =>
+    app.request('/api/bind/verify', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ serverId, token }),
+    });
+
+  it('refuses a controlled node and never discloses the owner account', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const node = await controlledCredential(userId);
+
+    const res = await verify(app, node.serverId, node.token);
+    expect(res.status).toBe(403);
+    const body = await res.json() as { reason?: string };
+    expect(body.reason).toBe(NODE_ROLE_REFUSAL.CONTROLLED_NODE);
+    expect(JSON.stringify(body)).not.toContain(userId);
+  });
+
+  it('still verifies a full daemon, and answers without the owner id', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const full = await fullCredential(userId);
+
+    const res = await verify(app, full.serverId, full.token);
+    expect(res.status).toBe(200);
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.ok).toBe(true);
+    // The only caller checks `response.ok`; the account id must not ride along.
+    expect(body.userId).toBeUndefined();
+    expect(JSON.stringify(body)).not.toContain(userId);
+  });
+
+  it('answers revoked, unknown and wrong-token identically', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+
+    const revokedFull = await fullCredential(userId);
+    await db.execute('UPDATE servers SET revoked_at = $1 WHERE id = $2', [Date.now(), revokedFull.serverId]);
+    const revokedNode = await controlledCredential(userId);
+    await db.execute('UPDATE servers SET revoked_at = $1 WHERE id = $2', [Date.now(), revokedNode.serverId]);
+    const good = await fullCredential(userId);
+
+    const cases: [string, string, string][] = [
+      ['revoked full daemon', revokedFull.serverId, revokedFull.token],
+      ['revoked controlled node', revokedNode.serverId, revokedNode.token],
+      ['unknown server id', hex(8), good.token],
+      ['wrong token', good.serverId, hex(16)],
+    ];
+    const seen = new Set<string>();
+    for (const [label, serverId, token] of cases) {
+      const res = await verify(app, serverId, token);
+      expect(res.status, `${label} must be 401`).toBe(401);
+      seen.add(`${res.status}:${await res.text()}`);
+    }
+    // One indistinguishable answer: any variation is an existence oracle.
+    expect(seen.size).toBe(1);
   });
 });

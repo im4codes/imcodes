@@ -27,6 +27,9 @@ export type TimelineProjectionStatus = 'missing' | 'building' | 'ready' | 'stale
 // the main thread (not because SQLite itself is slow), so 500ms produced
 // spurious timeouts that used to degrade to the synchronous JSONL fallback. 2s
 // tolerates transient contention while still bounding a genuinely stuck worker.
+/** Matches only the timeout errors this module itself raises. */
+const TIMELINE_PROJECTION_TIMEOUT = /^timeline_projection_timeout:/;
+
 const DEFAULT_QUERY_TIMEOUT_MS = 2_000;
 const DEFAULT_WRITE_TIMEOUT_MS = 2_000;
 // Self-heal backoff for respawning a crashed projection worker (exponential,
@@ -43,6 +46,20 @@ function getWorkerModuleUrl(): URL {
   const selfPath = fileURLToPath(import.meta.url);
   const ext = extname(selfPath);
   return new URL(ext === '.ts' ? './timeline-projection-worker.ts' : './timeline-projection-worker.js', import.meta.url);
+}
+
+/**
+ * The projection exists but did not answer in time. Never durable absence.
+ *
+ * Both outcomes used to be flattened to `null`, and callers read `null` as "no
+ * projection" -- which is the one state that licenses the heavy main-thread
+ * path. A saturated worker therefore produced exactly the wrong reaction.
+ */
+export class TimelineProjectionBusyError extends Error {
+  constructor() {
+    super('timeline_projection_busy');
+    this.name = 'TimelineProjectionBusyError';
+  }
 }
 
 class TimelineProjectionClient {
@@ -135,6 +152,11 @@ class TimelineProjectionClient {
     }
   }
 
+  /** True only for the timeout errors raised by `request` itself. */
+  private isTransientRequestFailure(err: unknown): boolean {
+    return err instanceof Error && TIMELINE_PROJECTION_TIMEOUT.test(err.message);
+  }
+
   private request<T, TOp extends ProjectionWorkerRequestType>(type: TOp, payload: ProjectionWorkerRequestMap[TOp], timeoutMs: number): Promise<T> {
     const worker = this.ensureWorker();
     if (!worker) return Promise.reject(new Error('timeline_projection_unavailable'));
@@ -161,6 +183,11 @@ class TimelineProjectionClient {
       const result = await this.request<{ source: 'sqlite'; events: TimelineEvent[] }, 'queryHistory'>('queryHistory', query, DEFAULT_QUERY_TIMEOUT_MS);
       return result.events;
     } catch (err) {
+      if (this.isTransientRequestFailure(err)) {
+        // Surface saturation as itself: returning null would be read as "no
+        // projection", and the caller answers that with main-thread work.
+        throw new TimelineProjectionBusyError();
+      }
       logger.debug({ err, sessionId: query.sessionId }, 'TimelineProjection: queryHistory unavailable');
       return null;
     }
@@ -194,6 +221,11 @@ class TimelineProjectionClient {
       const result = await this.request<{ source: 'sqlite'; events: TimelineEvent[] }, 'queryByTypes'>('queryByTypes', query, DEFAULT_QUERY_TIMEOUT_MS);
       return result.events;
     } catch (err) {
+      if (this.isTransientRequestFailure(err)) {
+        // Surface saturation as itself: returning null would be read as "no
+        // projection", and the caller answers that with main-thread work.
+        throw new TimelineProjectionBusyError();
+      }
       logger.debug({ err, sessionId: query.sessionId, types: query.types }, 'TimelineProjection: queryByTypes unavailable');
       return null;
     }

@@ -4,7 +4,11 @@ import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { promisify } from 'node:util';
 import logger from '../util/logger.js';
-import { IMCODES_MEMORY_MCP_ARGS, IMCODES_MEMORY_MCP_COMMAND } from '../agent/providers/getDefaultMcpServers.js';
+import {
+  IMCODES_MEMORY_MCP_LAUNCH_ARGS,
+  IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
+  isImcodesMemoryMcpLaunch,
+} from '../agent/providers/getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
 import { MEMORY_MCP_PROVIDER_STATUS_REASON } from '../../shared/memory-ws.js';
 
@@ -65,10 +69,7 @@ function execOutput(result: { stdout: string; stderr: string } | string): string
 }
 
 function isSameDaemonServer(server: QwenMcpListedServer | undefined): boolean {
-  return server?.command === IMCODES_MEMORY_MCP_COMMAND
-    && Array.isArray(server.args)
-    && server.args.length === IMCODES_MEMORY_MCP_ARGS.length
-    && server.args.every((arg, index) => arg === IMCODES_MEMORY_MCP_ARGS[index]);
+  return isImcodesMemoryMcpLaunch(server?.command, server?.args);
 }
 
 function parseQwenMcpList(output: string): Map<string, QwenMcpListedServer> | null {
@@ -198,8 +199,8 @@ export async function ensureQwenMcpHasImcodesEntry(options: QwenMcpEnsureOptions
         'mcp',
         'add',
         serverName,
-        IMCODES_MEMORY_MCP_COMMAND,
-        ...IMCODES_MEMORY_MCP_ARGS,
+        IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
+        ...IMCODES_MEMORY_MCP_LAUNCH_ARGS,
       ], { windowsHide: true, timeout: 10_000 });
       const message = [
         `Added Qwen MCP server "${serverName}".`,

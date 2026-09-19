@@ -1,0 +1,16 @@
+{
+  "manifestVersion": 2,
+  "repository": "im4codes/imcodes",
+  "releaseTag": "libwebrtc-sdk-linux-x64-bf828ff395505025-e11a38fad3ddd9fd",
+  "assetName": "imcodes-libwebrtc-sdk-linux-x64.tar.gz",
+  "sha256": "e11a38fad3ddd9fd978bf18f0cf6a22833f609ef24a4c672bbd9aeb8458b709f",
+  "sourceSha256": "bf828ff395505025289fb48a53652f8ce989fc918057f22aaacfb077b77ecfe6",
+  "sourceCommit": "d556a80f6212833ae253b5080a26e131fd8da775",
+  "libwebrtcRevision": "f20ebb8adbf4fa781830e4384c61f732bd28a217",
+  "depotToolsRevision": "a1bda5b6167435ad0666191f0353f242104f5845",
+  "sdkManifestSha256": "fce81237c7e31f780065d3e481892943231e407f82706c1e6479693c9734f050",
+  "toolchain": {
+    "clang": "llvmorg-23-init-19482-g53d18800-1",
+    "sysroot": "20250129T203412Z-2"
+  }
+}

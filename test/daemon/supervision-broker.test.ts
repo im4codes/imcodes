@@ -120,6 +120,87 @@ describe('parseSupervisionDecision', () => {
 });
 
 describe('SupervisionBroker', () => {
+  it('uses a UUID session key accepted by Claude Code for ephemeral supervisor runs', async () => {
+    const provider = new FakeProvider([
+      '{"decision":"complete","reason":"uuid accepted","confidence":0.9}',
+    ]);
+    const broker = new SupervisionBroker({ resolveProvider: async () => provider });
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'claude-code-sdk',
+      model: 'MiniMax-M2.7',
+      preset: 'minimax2.7',
+    });
+
+    const result = await broker.decide({
+      snapshot,
+      taskRequest: 'Verify the completed task.',
+      assistantResponse: 'Done.',
+    });
+
+    expect(result).toMatchObject({ decision: 'complete', reason: 'uuid accepted' });
+    const sessionKey = provider.createSession.mock.calls[0]?.[0]?.sessionKey;
+    expect(sessionKey).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+  });
+
+  it('falls back to the configured backup runtime when the primary provider fails', async () => {
+    const primary = new FakeProvider([]);
+    const backup = new FakeProvider([
+      '{"decision":"complete","reason":"backup ok","confidence":0.8}',
+    ]);
+    const resolveProvider = vi.fn(async (backend: string) => (
+      backend === 'codex-sdk' ? primary : backup
+    ));
+    const broker = new SupervisionBroker({ resolveProvider });
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'codex-sdk',
+      model: 'gpt-5.3-codex-spark',
+      backupBackend: 'qwen',
+      backupModel: 'MiniMax-M2.7',
+      backupPreset: 'minimax2.7',
+    });
+
+    const result = await broker.decide({
+      snapshot,
+      taskRequest: 'Implement the task',
+      assistantResponse: 'Done',
+    });
+
+    expect(result).toMatchObject({ decision: 'complete', reason: 'backup ok' });
+    expect(resolveProvider).toHaveBeenNthCalledWith(1, 'codex-sdk');
+    expect(resolveProvider).toHaveBeenNthCalledWith(2, 'qwen');
+    expect(resolverMock).toHaveBeenLastCalledWith({
+      backend: 'qwen',
+      model: 'MiniMax-M2.7',
+      preset: 'minimax2.7',
+    });
+  });
+
+  it('falls back when the primary runtime exhausts structured-output repair', async () => {
+    const primary = new FakeProvider(['not json', 'still not json']);
+    const backup = new FakeProvider([
+      '{"decision":"complete","reason":"backup parsed","confidence":0.8}',
+    ]);
+    const broker = new SupervisionBroker({
+      resolveProvider: async (backend) => backend === 'codex-sdk' ? primary : backup,
+    });
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'codex-sdk',
+      model: 'gpt-5.3-codex-spark',
+      backupBackend: 'qwen',
+      backupModel: 'qwen3-coder-plus',
+      maxParseRetries: 1,
+    });
+
+    const result = await broker.decide({ snapshot, taskRequest: 'Task', assistantResponse: 'Done' });
+
+    expect(result).toMatchObject({ decision: 'complete', reason: 'backup parsed' });
+    expect(primary.createSession).toHaveBeenCalledTimes(1);
+    expect(backup.createSession).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
     ['claude-code-sdk', 'sonnet'],
     ['codex-sdk', 'gpt-5.3-codex-spark'],
@@ -211,10 +292,13 @@ describe('SupervisionBroker', () => {
     });
 
     const prompt = String(provider.send.mock.calls[0]?.[1] ?? '');
-    // New action-oriented contract: nextAction is required for continue,
-    // and vague fillers are explicitly rejected. Prefer ask_human over a
-    // fuzzy continue — the whole point of this redesign.
-    expect(prompt).toContain('REQUIRED when decision is continue — imperative instruction for the agent\'s next turn.');
+    // The broker selects a standardized execution mode and supplies only an
+    // advisory direction. The executing session owns detailed progress and
+    // implementation choices; unsupported commands must not be invented.
+    expect(prompt).toContain('decision is the standardized execution-mode enum');
+    expect(prompt).toContain('REQUIRED when decision is continue — a short advisory hint about the safest concrete direction.');
+    expect(prompt).toContain('It is not execution authority');
+    expect(prompt).toContain('Do not invent commands or implementation details you cannot support from evidence.');
     expect(prompt).toContain('DO NOT write vague fillers like "keep going", "continue", "finish the task"');
     expect(prompt).toContain('Prefer ask_human over a vague continue');
     expect(prompt).toContain('When the assistant itself says remaining implementation work (tests, fixes, commit/push) is still pending, choose continue AND spell out what to do in nextAction.');
@@ -387,7 +471,7 @@ describe('SupervisionBroker', () => {
     });
   });
 
-  it('creates a fresh provider session for each supervision decision', async () => {
+  it('keeps transient broker callers isolated in fresh provider sessions', async () => {
     const provider = new FakeProvider([
       '{"decision":"complete","reason":"first","confidence":0.8}',
       '{"decision":"complete","reason":"second","confidence":0.9}',
@@ -414,6 +498,115 @@ describe('SupervisionBroker', () => {
     const firstSessionKey = provider.createSession.mock.calls[0]?.[0]?.sessionKey;
     const secondSessionKey = provider.createSession.mock.calls[1]?.[0]?.sessionKey;
     expect(firstSessionKey).not.toEqual(secondSessionKey);
+    expect(provider.endSession).toHaveBeenCalledTimes(2);
+  });
+
+  it('reuses one random supervisor UUID and provider conversation for the same session instance', async () => {
+    const provider = new FakeProvider([
+      '{"decision":"complete","reason":"first","confidence":0.8}',
+      '{"decision":"complete","reason":"second","confidence":0.9}',
+    ]);
+    const broker = new SupervisionBroker({ resolveProvider: async () => provider });
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'claude-code-sdk',
+      model: 'MiniMax-M2.7',
+      timeoutMs: 2_000,
+    });
+
+    await broker.decide({
+      snapshot,
+      targetSessionId: 'session-instance-a',
+      taskRequest: 'first',
+      assistantResponse: 'first reply',
+    });
+    await broker.decide({
+      snapshot,
+      targetSessionId: 'session-instance-a',
+      taskRequest: 'second',
+      assistantResponse: 'second reply',
+    });
+
+    expect(provider.createSession).toHaveBeenCalledTimes(1);
+    expect(provider.send).toHaveBeenCalledTimes(2);
+    expect(provider.endSession).not.toHaveBeenCalled();
+    expect(provider.createSession.mock.calls[0]?.[0]).toMatchObject({
+      fresh: false,
+      sessionKey: expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i),
+    });
+    expect(provider.send.mock.calls[0]?.[0]).toBe(provider.send.mock.calls[1]?.[0]);
+  });
+
+  it('never shares a supervisor UUID between different session instances', async () => {
+    const provider = new FakeProvider([
+      '{"decision":"complete","reason":"first","confidence":0.8}',
+      '{"decision":"complete","reason":"second","confidence":0.9}',
+    ]);
+    const broker = new SupervisionBroker({ resolveProvider: async () => provider });
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'claude-code-sdk',
+      model: 'MiniMax-M2.7',
+      timeoutMs: 2_000,
+    });
+
+    await broker.decide({
+      snapshot,
+      targetSessionId: 'session-instance-a',
+      taskRequest: 'first',
+      assistantResponse: 'first reply',
+    });
+    await broker.decide({
+      snapshot,
+      targetSessionId: 'session-instance-b',
+      taskRequest: 'second',
+      assistantResponse: 'second reply',
+    });
+
+    expect(provider.createSession).toHaveBeenCalledTimes(2);
+    const firstSessionKey = provider.createSession.mock.calls[0]?.[0]?.sessionKey;
+    const secondSessionKey = provider.createSession.mock.calls[1]?.[0]?.sessionKey;
+    expect(firstSessionKey).not.toBe(secondSessionKey);
+    expect(provider.endSession).not.toHaveBeenCalled();
+  });
+
+  it('rotates the supervisor UUID after 48 idle hours and ends the retained conversation', async () => {
+    let now = 1_000;
+    const provider = new FakeProvider([
+      '{"decision":"complete","reason":"first","confidence":0.8}',
+      '{"decision":"complete","reason":"second","confidence":0.9}',
+    ]);
+    const broker = new SupervisionBroker({
+      resolveProvider: async () => provider,
+      now: () => now,
+    });
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'claude-code-sdk',
+      model: 'MiniMax-M2.7',
+      timeoutMs: 2_000,
+    });
+
+    await broker.decide({
+      snapshot,
+      targetSessionId: 'session-instance-a',
+      taskRequest: 'first',
+      assistantResponse: 'first reply',
+    });
+    now += 48 * 60 * 60 * 1_000;
+    await broker.decide({
+      snapshot,
+      targetSessionId: 'session-instance-a',
+      taskRequest: 'second',
+      assistantResponse: 'second reply',
+    });
+
+    expect(provider.createSession).toHaveBeenCalledTimes(2);
+    const firstSessionKey = provider.createSession.mock.calls[0]?.[0]?.sessionKey;
+    const secondSessionKey = provider.createSession.mock.calls[1]?.[0]?.sessionKey;
+    expect(firstSessionKey).not.toBe(secondSessionKey);
+    expect(provider.endSession).toHaveBeenCalledTimes(1);
+    expect(provider.endSession).toHaveBeenCalledWith(firstSessionKey);
   });
 
   it('fails closed when both replies are invalid', async () => {
@@ -947,6 +1140,7 @@ describe('SupervisionBroker', () => {
     const broker = new SupervisionBroker({
       resolveProvider: async () => provider,
       waitForRetry,
+      random: () => 1,
     });
     const snapshot = normalizeSessionSupervisionSnapshot({
       mode: SUPERVISION_MODE.SUPERVISED,
@@ -970,6 +1164,46 @@ describe('SupervisionBroker', () => {
     expect(provider.createSession.mock.calls[0]?.[0].sessionKey)
       .not.toBe(provider.createSession.mock.calls[1]?.[0].sessionKey);
     expect(provider.endSession).toHaveBeenCalledTimes(2);
+  });
+
+  it('uses bounded exponential full jitter, respects retry-after, and stops after the retry limit', async () => {
+    class RateLimitedProvider extends FakeProvider {
+      override send = vi.fn(async (sessionId: string): Promise<void> => {
+        queueMicrotask(() => {
+          for (const cb of this.errorHandlers) cb(sessionId, {
+            code: PROVIDER_ERROR_CODES.RATE_LIMITED,
+            message: 'API Error: 529 Overloaded',
+            recoverable: true,
+            details: { retryAfterMs: 400 },
+          });
+        });
+      });
+    }
+    const provider = new RateLimitedProvider([]);
+    const waitForRetry = vi.fn(async () => {});
+    const broker = new SupervisionBroker({
+      resolveProvider: async () => provider,
+      waitForRetry,
+      random: () => 0.5,
+    });
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'codex-sdk', model: 'gpt-5.6', timeoutMs: 5_000,
+      promptVersion: 'supervision_decision_v1', maxParseRetries: 1,
+      auditMode: 'audit', maxAuditLoops: 2, taskRunPromptVersion: 'task_run_status_v1',
+    });
+
+    await expect(broker.decide({
+      snapshot, taskRequest: 'continue exact task', assistantResponse: 'unfinished',
+    })).resolves.toMatchObject({
+      decision: 'ask_human',
+      unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
+      providerFailure: { code: PROVIDER_ERROR_CODES.RATE_LIMITED, attempts: 3 },
+    });
+    // Full-jitter ceilings are 250 then 500. Retry-After=400 is a floor, so
+    // both waits are 400; a third retry is never scheduled.
+    expect(waitForRetry.mock.calls.map(([delay]) => delay)).toEqual([400, 400]);
+    expect(provider.createSession).toHaveBeenCalledTimes(3);
   });
 
   it('does not retry permanent supervisor authentication failures', async () => {
@@ -1028,6 +1262,7 @@ describe('SupervisionBroker', () => {
     const broker = new SupervisionBroker({
       resolveProvider: async () => provider,
       now: () => now,
+      random: () => 1,
       waitForRetry: async () => { now += 29_750; },
     });
     const snapshot = normalizeSessionSupervisionSnapshot({

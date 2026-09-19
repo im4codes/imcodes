@@ -23,11 +23,23 @@
  */
 
 import type { TimelineEvent } from './ws-client.js';
-import { preferTimelineEvent } from '../../src/shared/timeline/merge.js';
+import { preferLastValueSignal, preferTimelineEvent } from '../../src/shared/timeline/merge.js';
+import { isLastValueTimelineEventType } from '../../src/shared/timeline/types.js';
 
 const DB_NAME = 'imcodes-timeline';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE_NAME = 'events';
+/**
+ * Last-value signals live in their own store, keyed by `[sessionId, type]`.
+ *
+ * That key is the whole point: a session's state line, token counter and agent
+ * status only ever display "now", so writing one overwrites the previous row
+ * instead of appending. The store cannot grow, so there is nothing to prune and
+ * no type index to maintain -- the partition IS the filter. Conversation reads
+ * touch only `events`, in their own transaction, so state bookkeeping can never
+ * queue in front of a chat opening.
+ */
+const SIGNAL_STORE_NAME = 'signals';
 
 /**
  * How long to stay in transient memory-only mode after an open failure before
@@ -38,6 +50,23 @@ const STORE_NAME = 'events';
 const OPEN_RETRY_BACKOFF_MS = 3_000;
 /** Reject a permanently-`blocked` open after this long so callers can retry. */
 const OPEN_BLOCKED_TIMEOUT_MS = 1_500;
+/** Rows deleted per drain pass when the caller does not specify a budget. */
+const DRAIN_DEFAULT_DELETION_BUDGET = 500;
+/**
+ * How many rows one drain pass may examine per row it is allowed to delete.
+ * Bounds the pass on a store whose newest rows are mostly conversation, where
+ * scanning for signals could otherwise walk the entire session.
+ */
+const DRAIN_SCAN_MULTIPLIER = 4;
+
+/**
+ * A position inside the `session_ts` index. The primary key is required because
+ * that index is NOT unique — many events can share one millisecond.
+ */
+export interface DrainCursor {
+  ts: number;
+  eventId: string;
+}
 
 export class TimelineDB {
   private db: IDBDatabase | null = null;
@@ -147,6 +176,13 @@ export class TimelineDB {
           store.createIndex('session_epoch_seq', ['sessionId', 'epoch', 'seq'], { unique: false });
           store.createIndex('session_ts', ['sessionId', 'ts'], { unique: false });
         }
+        // v2. Additive only: no existing row is read, rewritten or deleted, so
+        // the upgrade is O(1) rather than a full-store migration on a phone.
+        // Signals already sitting in `events` are drained later, in the
+        // background, by drainLegacySignals().
+        if (!db.objectStoreNames.contains(SIGNAL_STORE_NAME)) {
+          db.createObjectStore(SIGNAL_STORE_NAME, { keyPath: ['sessionId', 'type'] });
+        }
       };
 
       // Single settle point so a late onsuccess after a blocked-timeout reject
@@ -176,11 +212,19 @@ export class TimelineDB {
         const db = req.result;
         // If another tab upgrades the schema later we want to drop our
         // connection so the upgrade isn't blocked indefinitely. Going back
-        // to memory until the next ensureOpen() is the safest fallback;
-        // production has DB_VERSION=1 today so this is dormant defense.
+        // to memory until the next ensureOpen() is the safest fallback.
+        //
+        // `openPromise` MUST be cleared alongside `db`: ensureOpen() returns the
+        // cached promise when `db` is null, so leaving it set handed every later
+        // caller the CLOSED connection. Each transaction then threw
+        // InvalidStateError, every read silently fell back to an empty
+        // in-memory store, and because `_memoryOnly` was never set the
+        // resetAndReopen() recovery hook stayed disabled — a permanently blank
+        // pane until a full page reload.
         db.onversionchange = () => {
           try { db.close(); } catch { /* ignore */ }
           this.db = null;
+          this.openPromise = null;
         };
         finishSuccess(db);
       };
@@ -226,8 +270,16 @@ export class TimelineDB {
       return;
     }
 
+    // Route by kind. Conversation is append-only history; signals collapse onto
+    // one row per (session, type) so their store never grows and never needs a
+    // sweep. Anything unclassified is treated as conversation and kept.
+    const conversation = events.filter((event) => !isLastValueTimelineEventType(event.type));
+    const signals = events.filter((event) => isLastValueTimelineEventType(event.type));
     try {
-      await txPutEventsPreservingCompleteness(db, events);
+      // Separate transactions on separate stores: a signal write must never be
+      // able to hold up a conversation write, or a read of the other store.
+      if (conversation.length > 0) await txPutEventsPreservingCompleteness(db, conversation);
+      if (signals.length > 0) await txPutSignals(db, signals);
     } catch {
       for (const e of events) this.memPut(e);
     }
@@ -257,12 +309,12 @@ export class TimelineDB {
         const upper = [sessionId, epoch, Infinity];
         const range = IDBKeyRange.bound(lower, upper);
 
-        // getAll is a single IDB round-trip — much faster than cursor iteration
-        const req = index.getAll(range);
-        req.onsuccess = () => {
-          const all = req.result as TimelineEvent[];
-          resolve(limit < all.length ? all.slice(0, limit) : all);
-        };
+        // `getAll(range, count)` stops the clone at `count` records. Passing
+        // the limit to IDB rather than slicing afterwards matters because
+        // getAll structured-clones every record it returns: slicing after the
+        // fact still paid the full deserialization cost for rows we discard.
+        const req = Number.isFinite(limit) ? index.getAll(range, limit) : index.getAll(range);
+        req.onsuccess = () => resolve(req.result as TimelineEvent[]);
         req.onerror = () => reject(req.error);
       });
     } catch {
@@ -284,7 +336,15 @@ export class TimelineDB {
       return this.memGetByTime(sessionId, opts);
     }
     try {
-      return await this.getRecentEventsTx(db, sessionId, opts);
+      // Conversation first, on its own transaction: this is the read the first
+      // paint is waiting on, and the whole reason signals were moved out is so
+      // nothing else shares its budget.
+      const conversation = await this.getRecentEventsTx(db, sessionId, opts);
+      // Then the signals, which are at most one row per type. A failure here
+      // must not cost the caller the conversation it already has.
+      const signals = await txReadSignals(db, sessionId).catch(() => [] as TimelineEvent[]);
+      if (signals.length === 0) return conversation;
+      return mergeStoredByTimestamp(conversation, signals);
     } catch {
       return this.memGetByTime(sessionId, opts);
     }
@@ -305,11 +365,37 @@ export class TimelineDB {
       const upper = [sessionId, Infinity];
       const range = IDBKeyRange.bound(lower, upper);
 
-      // getAll is a single IDB round-trip — much faster than cursor iteration
-      const req = index.getAll(range);
+      // An unbounded read still wants the single-round-trip getAll.
+      if (!Number.isFinite(limit)) {
+        const req = index.getAll(range);
+        req.onsuccess = () => resolve(req.result as TimelineEvent[]);
+        req.onerror = () => reject(req.error);
+        return;
+      }
+
+      // Bounded read: walk newest-first and stop at `limit`.
+      //
+      // This used to be `getAll(range)` followed by `slice(-limit)`. getAll
+      // structured-clones EVERY record in the range, so restoring the last 300
+      // events deserialized the session's entire stored history — and nothing
+      // ever prunes that store, so opening a chat got monotonically slower the
+      // longer the session had been used. Every mounted useTimeline (the open
+      // pane, every SubSessionCard preview, pinned panels) paid it against one
+      // shared connection. A 'prev' cursor clones only the records we keep, so
+      // the cost is O(limit) instead of O(total stored events).
+      //
+      // `getAll(range, count)` is not usable here: count takes from the START
+      // of the range and we need the END.
+      const out: TimelineEvent[] = [];
+      const req = index.openCursor(range, 'prev');
       req.onsuccess = () => {
-        const all = req.result as TimelineEvent[];
-        resolve(limit < all.length ? all.slice(-limit) : all);
+        const cursor = req.result;
+        if (!cursor) { out.reverse(); resolve(out); return; }
+        out.push(cursor.value as TimelineEvent);
+        // Ascending order is the contract callers merge against, so undo the
+        // newest-first walk before handing the page back.
+        if (out.length >= limit) { out.reverse(); resolve(out); return; }
+        cursor.continue();
       };
       req.onerror = () => reject(req.error);
     });
@@ -427,38 +513,189 @@ export class TimelineDB {
     }
   }
 
-  async pruneOldEvents(sessionId: string, keepCount: number): Promise<void> {
+  /**
+   * Drain last-value signals that v1 wrote into the conversation store.
+   *
+   * The v2 upgrade is deliberately additive — it creates the `signals` store and
+   * touches no existing row — so every signal an install recorded before the
+   * upgrade stays in `events` forever. That matters because the first paint
+   * reads a BOUNDED newest-first window out of `events`, and by this repo's own
+   * measurement `session.state` alone is ~67% of recorded events and the whole
+   * last-value group ~84%. On a busy session those rows fill the entire window
+   * and the pane renders with no messages in it.
+   *
+   * Nothing is lost: the newest value of each type is copied into `signals`
+   * first (newest-wins), which is exactly where `getRecentEvents` now reads it
+   * back from, and only then are the `events` copies deleted.
+   *
+   * Bounded per call for the same reason as `pruneOldEvents`: every timeline
+   * shares one connection, so an unbounded delete parks every other session's
+   * read behind it.
+   */
+  async drainLegacySignals(
+    sessionId: string,
+    opts?: { maxDeletions?: number; maxScan?: number; before?: DrainCursor },
+  ): Promise<{ deleted: number; done: boolean; nextBefore?: DrainCursor; deletedIds?: string[] } | null> {
+    const db = await this.ensureOpen();
+    if (!db) return null;
+
+    const budget = Math.max(1, opts?.maxDeletions ?? DRAIN_DEFAULT_DELETION_BUDGET);
+    const scanBudget = Math.max(budget, opts?.maxScan ?? budget * DRAIN_SCAN_MULTIPLIER);
+
+    try {
+      // Walk NEWEST-first and stop at a budget.
+      //
+      // Two properties this has to have, both learned the hard way:
+      //
+      //  - Bounded MATERIALISATION, not just a bounded delete. A full-range
+      //    `getAll` structured-clones every remaining row on every chunk, so a
+      //    capped sweep over a large store re-read the whole session up to 40
+      //    times — the exact unbounded cost the bounded read path exists to
+      //    avoid, on the one connection every timeline shares.
+      //  - Newest-first. The first paint reads the NEWEST window, so that is
+      //    the window that has to be unblocked. Draining oldest-first can spend
+      //    an entire page session's budget without freeing a single row the
+      //    user would have seen.
+      const { batch, scannedToEnd, resumeFrom } = await new Promise<{
+        batch: TimelineEvent[];
+        scannedToEnd: boolean;
+        resumeFrom: DrainCursor | undefined;
+      }>((resolve, reject) => {
+        const tx = db.transaction(STORE_NAME, 'readonly');
+        const store = tx.objectStore(STORE_NAME);
+        const index = store.index('session_ts');
+        const resume = opts?.before;
+        // Upper bound is INCLUSIVE of the boundary timestamp: `session_ts` is
+        // not unique, so an exclusive ts bound would skip every unvisited
+        // sibling in that millisecond and then report `done`, silently
+        // abandoning them. The already-consumed part of that bucket is skipped
+        // by primary key below instead.
+        //
+        // `continuePrimaryKey` would express this directly but cannot be used:
+        // the row a token points at is usually one this pass just DELETED, and
+        // resuming onto a deleted primary key never fires another cursor event
+        // — the pass hangs forever.
+        const range = resume === undefined
+          ? IDBKeyRange.bound([sessionId, 0], [sessionId, Infinity])
+          : IDBKeyRange.bound([sessionId, 0], [sessionId, resume.ts]);
+        const req = index.openCursor(range, 'prev');
+        const collected: TimelineEvent[] = [];
+        let scanned = 0;
+        let last: DrainCursor | undefined;
+        req.onsuccess = () => {
+          const cursor = req.result;
+          if (!cursor) { resolve({ batch: collected, scannedToEnd: true, resumeFrom: last }); return; }
+          const pending = cursor.value as TimelineEvent;
+          // Within one timestamp a 'prev' cursor descends by primary key, so
+          // everything already consumed compares >= the token. Skipping by
+          // value rather than by cursor position is what makes the resume
+          // survive the deletion of the token row itself.
+          if (resume !== undefined && pending.ts === resume.ts && pending.eventId >= resume.eventId) {
+            cursor.continue();
+            return;
+          }
+          scanned += 1;
+          const event = pending;
+          last = { ts: event.ts, eventId: event.eventId };
+          if (isLastValueTimelineEventType(event.type)) collected.push(event);
+          if (collected.length >= budget || scanned >= scanBudget) {
+            resolve({ batch: collected, scannedToEnd: false, resumeFrom: last });
+            return;
+          }
+          cursor.continue();
+        };
+        req.onerror = () => reject(req.error);
+      });
+
+      if (batch.length === 0) {
+        return {
+          deleted: 0,
+          done: scannedToEnd,
+          deletedIds: [],
+          ...(resumeFrom !== undefined ? { nextBefore: resumeFrom } : {}),
+        };
+      }
+
+      // Preserve the newest value per type BEFORE deleting anything, so a crash
+      // between the two steps can only leave a duplicate, never a hole.
+      //
+      // Ordering is `preferTimelineEvent`, not a bare `ts` comparison: signals
+      // recorded in the same millisecond are distinguished only by epoch/seq,
+      // and comparing `ts` alone let a stale epoch=1 legacy row overwrite the
+      // live epoch=2 value in `signals` — after which the `events` copy was
+      // deleted and the newer value was gone for good.
+      const newestByType = new Map<string, TimelineEvent>();
+      for (const event of batch) {
+        const existing = newestByType.get(event.type);
+        newestByType.set(event.type, existing ? preferLastValueSignal(existing, event) : event);
+      }
+      await txPutSignals(db, [...newestByType.values()]);
+
+      await txWrite(db, STORE_NAME, (store) => {
+        for (const event of batch) store.delete(event.eventId);
+      });
+
+      return {
+        deleted: batch.length,
+        done: scannedToEnd,
+        // The caller evicts exactly these from its cache. Inferring "absent from
+        // the refreshed window means deleted" is not safe: the signals sub-read
+        // can fail independently and return an empty signal set, and a live
+        // signal can land between the read and the merge.
+        deletedIds: batch.map((event) => event.eventId),
+        ...(resumeFrom !== undefined ? { nextBefore: resumeFrom } : {}),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  async pruneOldEvents(
+    sessionId: string,
+    keepCount: number,
+    opts?: { maxDeletions?: number },
+  ): Promise<{ deleted: number; done: boolean } | null> {
     const db = await this.ensureOpen();
     if (!db) {
       const events = this.memoryFallback.get(sessionId);
       if (events && events.length > keepCount) {
         this.memoryFallback.set(sessionId, events.slice(-keepCount));
       }
-      return;
+      return null;
     }
 
     try {
-      // Get all events for session, ordered by ts
-      const all = await new Promise<TimelineEvent[]>((resolve, reject) => {
+      // Primary keys only, ordered by ts. Deleting needs the key and nothing
+      // else, so `getAllKeys` avoids structured-cloning payloads we are about
+      // to throw away — the old `getAll` made pruning cost as much as the
+      // unbounded read it exists to prevent.
+      const keys = await new Promise<IDBValidKey[]>((resolve, reject) => {
         const tx = db.transaction(STORE_NAME, 'readonly');
         const store = tx.objectStore(STORE_NAME);
         const index = store.index('session_ts');
         const lower = [sessionId, 0];
         const upper = [sessionId, Infinity];
         const range = IDBKeyRange.bound(lower, upper);
-        const req = index.getAll(range);
-        req.onsuccess = () => resolve(req.result as TimelineEvent[]);
+        const req = index.getAllKeys(range);
+        req.onsuccess = () => resolve(req.result as IDBValidKey[]);
         req.onerror = () => reject(req.error);
       });
 
-      if (all.length <= keepCount) return;
+      if (keys.length <= keepCount) return { deleted: 0, done: true };
 
-      const toDelete = all.slice(0, all.length - keepCount);
+      // Oldest first, capped. Every timeline shares one connection, so a single
+      // unbounded delete transaction over a large store parks every other
+      // session's read behind it -- which is exactly how an earlier version of
+      // this made chats open blank and hang on "local cache".
+      const overflow = keys.slice(0, keys.length - keepCount);
+      const budget = Math.max(1, opts?.maxDeletions ?? overflow.length);
+      const toDelete = overflow.slice(0, budget);
       await txWrite(db, STORE_NAME, (store) => {
-        for (const e of toDelete) store.delete(e.eventId);
+        for (const key of toDelete) store.delete(key);
       });
+      return { deleted: toDelete.length, done: toDelete.length === overflow.length };
     } catch {
-      // best-effort
+      return null;
     }
   }
 
@@ -536,6 +773,70 @@ function txPutEventsPreservingCompleteness(
     tx.onerror = () => reject(tx.error);
     tx.onabort = () => reject(tx.error);
   });
+}
+
+/**
+ * Upsert last-value signals, newest wins.
+ *
+ * The key is `[sessionId, type]`, so a plain put would let a late or replayed
+ * older event clobber a newer state.
+ *
+ * Ordering is the shared `preferTimelineEvent`, NOT a bare `ts` comparison.
+ * Signals recorded in the same millisecond are distinguished only by
+ * epoch/seq, and `ts`-only with a `>=` tiebreak accepted the incoming row on
+ * every tie — so replaying a stale legacy row overwrote the live value. The
+ * drain deletes the row it just replayed, which made that loss permanent.
+ */
+function txPutSignals(db: IDBDatabase, events: TimelineEvent[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(SIGNAL_STORE_NAME, 'readwrite');
+    const store = tx.objectStore(SIGNAL_STORE_NAME);
+    for (const event of events) {
+      const getReq = store.get([event.sessionId, event.type]);
+      getReq.onsuccess = () => {
+        const existing = getReq.result as TimelineEvent | undefined;
+        const winner = existing ? preferLastValueSignal(existing, event) : event;
+        if (!existing || winner !== existing) store.put(winner);
+      };
+      getReq.onerror = () => reject(getReq.error);
+    }
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+
+/** Every stored signal for one session. Bounded by the number of signal types. */
+function txReadSignals(db: IDBDatabase, sessionId: string): Promise<TimelineEvent[]> {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(SIGNAL_STORE_NAME, 'readonly');
+    const store = tx.objectStore(SIGNAL_STORE_NAME);
+    // Primary-key range over `[sessionId, type]`; no index needed because the
+    // key itself is already scoped by session.
+    const req = store.getAll(IDBKeyRange.bound([sessionId, ''], [sessionId, '\uffff']));
+    req.onsuccess = () => resolve((req.result as TimelineEvent[]) ?? []);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+/**
+ * Interleave the two stores back into one ascending stream.
+ *
+ * Deduplicates by `eventId` because a legacy signal can still exist in `events`
+ * while its successor already lives in `signals`; the drain removes the old copy
+ * later, and until then the newer row must win rather than render twice.
+ */
+function mergeStoredByTimestamp(
+  conversation: TimelineEvent[],
+  signals: TimelineEvent[],
+): TimelineEvent[] {
+  const byId = new Map<string, TimelineEvent>();
+  for (const event of conversation) byId.set(event.eventId, event);
+  for (const event of signals) {
+    const existing = byId.get(event.eventId);
+    if (!existing || (event.ts ?? 0) >= (existing.ts ?? 0)) byId.set(event.eventId, event);
+  }
+  return [...byId.values()].sort((a, b) => (a.ts - b.ts) || (a.seq - b.seq));
 }
 
 // ── IDB transaction helper ─────────────────────────────────────────────────

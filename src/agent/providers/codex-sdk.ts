@@ -1,4 +1,12 @@
 import { createHash } from 'node:crypto';
+import { capContextPreservingPriority, joinSpanned, type PriorityPreservingCapMarkers, type SpannedText } from '../priority-preserving-context-cap.js';
+import {
+  readDelegationDispatchFact,
+  readMachineControlDispatchFact,
+  projectDelegationClaim,
+  DELEGATION_CLAIM_METADATA_FIELD,
+  type DelegationDispatchFact,
+} from '../../../shared/delegation-claim.js';
 import { access, copyFile, open, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { constants as fsConstants, watch, type FSWatcher } from 'node:fs';
 import { homedir } from 'node:os';
@@ -60,10 +68,23 @@ import { CODEX_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../sha
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
 import { getCodexBaseInstructions } from '../codex-runtime-config.js';
 import { buildGeneratedImageReportingPrompt } from '../../../shared/transport-runtime-prompts.js';
-import { composeProviderSystemText, getProviderSystemTextParts } from '../provider-context-routing.js';
-import { getDefaultCodexMcpArgs } from './getDefaultCodexMcpArgs.js';
+import { composeProviderSystemText, getProviderSystemTextParts, composeProviderSystemTextSpanned, getProviderSessionSystemTextSpanned } from '../provider-context-routing.js';
+import { getCodexAppServerArgs } from './getDefaultCodexMcpArgs.js';
+import {
+  NativeAgentFenceSlot,
+  fenceOf,
+  readCodexThreadNativeAgentFence,
+  withCodexNativeAgentFence,
+} from '../native-agent-fence.js';
+import {
+  NATIVE_AGENT_ADMISSION_MODES,
+  NATIVE_AGENT_FENCES,
+  type NativeAgentFence,
+} from '../../../shared/native-collaboration-policy.js';
+import type { NativeAgentFenceResolver } from '../transport-provider.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
+import { IMCODES_DELEGATION_UNAVAILABLE_MESSAGE } from '../../../shared/delegation-availability.js';
 import {
   AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
   AGENT_DELEGATION_NOTIFICATION_RESULTS,
@@ -82,6 +103,7 @@ import {
   buildSdkSubagentSafeDetail,
   isBackgroundedSdkSubagentTool,
   makeCodexSubagentCanonicalKey,
+  readSdkSubagentFullRequest,
   readSdkSubagentStartedAtMs,
   sanitizeSdkSubagentText,
   type SdkSubagentDetail,
@@ -131,11 +153,26 @@ const CODEX_TURN_HEARTBEAT_START_GRACE_MS = 15_000;
 const CODEX_TURN_HEARTBEAT_PROVIDER_CAP = 2;
 const CODEX_TURN_HEARTBEAT_MAX_TURNS = 100;
 const CODEX_AUTH_RECOVERY_RETRY_LIMIT = 1;
+const CODEX_IM_DELEGATION_RECOVERY_RETRY_LIMIT = 1;
+const CODEX_IM_MCP_RECOVERY_BACKOFF_MS = [0, 50, 100, 250, 500, 1_000, 2_000] as const;
+const CODEX_ACTIVE_WRITER_RECOVERY_LIMIT = 1;
+const CODEX_MISSING_ROLLOUT_RECOVERY_LIMIT = 1;
 const CODEX_AUTH_RECOVERY_GUIDANCE = 'Codex authentication recovery failed after one automatic retry. Re-authenticate with the Codex CLI, then retry.';
 const CODEX_AUTH_REPLAY_SKIPPED_GUIDANCE = 'Codex authentication was refreshed, but this turn was not replayed because provider output or tool activity had already started. Review the timeline before retrying to avoid duplicate side effects.';
-const DEFAULT_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 32_000;
 const MIN_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 4_000;
-const MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 128_000;
+/**
+ * Exported so the truncation test follows this number instead of restating it.
+ * A test that hardcodes the cap stops testing truncation the moment the cap is
+ * raised past its fixture: the input is no longer over the limit, nothing is
+ * cut, and the assertion quietly becomes about nothing.
+ */
+export const MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = 250_000;
+// Filled user + project + session identity contracts (SESSION_IDENTITY_COMBINED_MAX_CHARS)
+// deliberately exceed this ceiling, so reaching it is expected rather than
+// exceptional. The default stays at the ceiling, and capCodexSdkContextInjection
+// spends any overflow on the user-authored identity block first so that stable
+// IM.codes runtime rules, supervision contracts and image reporting survive.
+const DEFAULT_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS = MAX_CODEX_SDK_CONTEXT_INJECTION_MAX_CHARS;
 const IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER = '# IM.codes runtime instructions';
 const GENERATED_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp']);
 const CODEX_COLLAB_MAX_RECEIVERS = 100;
@@ -174,6 +211,68 @@ const CODEX_RUNTIME_SUBAGENT_ITEM_TYPES = new Set([
   'runtimesubagentnotification',
 ]);
 const CODEX_RAW_SPAWN_AGENT_FUNCTION_NAMES = new Set(['spawn_agent', 'spawnAgent']);
+
+/**
+ * Native collaboration calls other than spawn. The adapter sees an item only
+ * after the tool already ran, so these are projected for observability. The
+ * enforcing boundary is the per-thread fence (`startNewThread`): a managed
+ * session's thread has no multi-agent tools at all. What the relay still
+ * observes in a managed session is evidence of an unproven fence, recorded and
+ * turn-stopped by src/daemon/native-collaboration-guard.ts.
+ *
+ * They were previously dropped on the floor, which is how a Brain could really
+ * call list_agents + followup_task and leave no tool.call in the timeline at
+ * all; the resulting blank window was then mistaken for a fabricated claim.
+ */
+const CODEX_NATIVE_COLLAB_FUNCTION_NAMES = new Set([
+  'list_agents', 'listAgents',
+  'followup_task', 'followupTask',
+  'send_message', 'sendMessage',
+  'wait_agent', 'waitAgent',
+  'interrupt_agent', 'interruptAgent',
+]);
+
+/** Native collaboration carries no IM.codes task authority. */
+const CODEX_NATIVE_COLLAB_DURABILITY = 'non_durable';
+
+/** Exact IM MCP server and the tools a Brain needs to delegate authoritatively. */
+const IMCODES_DELEGATION_MCP_SERVER = IMCODES_MEMORY_MCP_SERVER_NAME;
+const IMCODES_DELEGATION_REQUIRED_TOOLS = ['send_list_targets', 'send_message'] as const;
+
+/**
+ * Whether one `mcpServerStatus/list` entry proves the IM.codes server connected.
+ *
+ * An explicit `runtimeStatus` is authoritative in both directions: only
+ * `connected` passes, and `starting`, `failed` or anything else fails closed
+ * however healthy the other fields look. codex-cli 0.144.1 -- the version this
+ * repository's lockfile pins -- omits `runtimeStatus` entirely for
+ * `detail: toolsAndAuthOnly`; there the completed MCP initialize handshake
+ * (`serverInfo`) is the proof. Requiring the field unconditionally refused every
+ * restored Brain turn on that version while the server was up with both tools.
+ * The exact-tools rule is applied separately, whichever proof was used.
+ */
+function imcodesDelegationServerConnected(server: Record<string, unknown>): boolean {
+  if (server.runtimeStatus !== undefined) {
+    return meaningfulString(server.runtimeStatus) === 'connected';
+  }
+  return isRecord(server.serverInfo);
+}
+/** Bounded pagination: this is one authoritative snapshot per turn, not polling. */
+const MCP_STATUS_PAGE_LIMIT = 20;
+const CODEX_MCP_RPC_METHOD = {
+  RELOAD: 'config/mcpServer/reload',
+  STATUS_LIST: 'mcpServerStatus/list',
+  STATUS_UPDATED: 'mcpServer/startupStatus/updated',
+} as const;
+const CODEX_MCP_TERMINAL_STARTUP_STATUS = new Set(['failed', 'cancelled']);
+
+export class ImcodesDelegationUnavailableError extends Error {
+  constructor() {
+    // Deliberately opaque: never leak server errors or private MCP config.
+    super(IMCODES_DELEGATION_UNAVAILABLE_MESSAGE);
+    this.name = 'ImcodesDelegationUnavailableError';
+  }
+}
 const CODEX_RAW_CHECKLIST_FUNCTION_NAMES = new Set([
   'todowrite',
   'todo_write',
@@ -356,54 +455,221 @@ function childSubagentIdFromRolloutPath(path: string): string | undefined {
   return match?.[1];
 }
 
+/**
+ * The fields one rollout scan accumulates.
+ *
+ * Every one of them folds over a PREFIX of the file: `cwd`, `prompt`, `model`,
+ * `imcodesSessionName` and `startedAtMs` keep their first value, `spawn` and
+ * `usageTotalTokens` keep their last, and `completed`/`output` latch once
+ * `task_complete` appears. Because no field can be un-set by a later line,
+ * folding bytes [0, n) then bytes [n, m) gives the same answer as folding
+ * [0, m) in one go -- which is what makes resuming from a byte offset sound.
+ */
+interface CodexRolloutFold {
+  spawn: ReturnType<typeof readCodexChildSubagentSpawn>;
+  prompt?: string;
+  model?: string;
+  cwd?: string;
+  imcodesSessionName?: string;
+  completed: boolean;
+  output?: string;
+  usageTotalTokens?: number;
+  startedAtMs?: number;
+}
+
+interface CodexRolloutScan {
+  /** File size the fold was last advanced to. */
+  size: number;
+  mtimeMs: number;
+  /** Bytes already consumed, including the carried `partial` below. */
+  offset: number;
+  /**
+   * Trailing bytes after the last newline, not yet folded.
+   *
+   * Kept as bytes rather than a string on purpose: a read can stop in the
+   * middle of a multi-byte character, and decoding that eagerly would bake a
+   * replacement character into the carried line.
+   */
+  partial: Buffer;
+  fold: CodexRolloutFold;
+}
+
+/**
+ * Resumable rollout scans, keyed by path.
+ *
+ * Before this, every poll re-read and re-`JSON.parse`d each admitted rollout
+ * from byte zero, and discovery ran twice per tick, so each file was folded
+ * twice. Replayed against one developer's real `~/.codex/sessions` (5.8 GB,
+ * ~4500 files), a poll admitting 6 files totalling 417 MB cost ~4630 ms of
+ * synchronous parsing per tick -- against a 2000 ms interval, per Codex
+ * session, on the daemon's main thread. The same replay with this cache costs
+ * ~1210 ms once to warm and ~9.5 ms per tick thereafter.
+ *
+ * The cost also grew without bound: it scales with rollout size, and rollouts
+ * only ever get longer.
+ *
+ * `codex-watcher.ts` already advances a `fileOffset` over these same files and
+ * `gemini-watcher.ts` already short-circuits on unchanged size/mtime; this
+ * brings the subagent snapshot in line with both.
+ */
+const codexRolloutScans = new Map<string, CodexRolloutScan>();
+const CODEX_ROLLOUT_SCAN_CACHE_MAX = 512;
+const CODEX_ROLLOUT_SCAN_CHUNK_BYTES = 1024 * 1024;
+
+function emptyCodexRolloutFold(): CodexRolloutFold {
+  return { spawn: null, completed: false };
+}
+
+function foldCodexRolloutLine(fold: CodexRolloutFold, line: string): void {
+  const record = parseCodexRolloutJsonLine(line);
+  if (!record) return;
+  if (fold.startedAtMs === undefined) {
+    const timestamp = meaningfulString(record.timestamp);
+    const parsedTimestamp = timestamp ? Date.parse(timestamp) : NaN;
+    if (Number.isFinite(parsedTimestamp)) fold.startedAtMs = parsedTimestamp;
+  }
+  const payload = codexRolloutPayload(record);
+  const nextSpawn = readCodexChildSubagentSpawn(payload);
+  if (nextSpawn) fold.spawn = nextSpawn;
+  if (!fold.cwd) fold.cwd = meaningfulString(payload.cwd);
+  if (!fold.imcodesSessionName) {
+    fold.imcodesSessionName = readImcodesSessionNameFromBaseInstructions(
+      readCodexRolloutBaseInstructionsText(payload),
+    );
+  }
+  if (!fold.prompt) fold.prompt = readCodexRolloutUserMessage(payload);
+  if (!fold.model) fold.model = meaningfulString(payload.model);
+  const totalTokens = readCodexRolloutUsageTotalTokens(payload);
+  if (totalTokens !== undefined) fold.usageTotalTokens = totalTokens;
+  if (payload.type === 'task_complete') {
+    fold.completed = true;
+    fold.output = meaningfulString(payload.last_agent_message)
+      ?? meaningfulString(payload.result)
+      ?? meaningfulString(payload.message)
+      ?? 'completed';
+  }
+}
+
+function rememberCodexRolloutScan(rolloutPath: string, scan: CodexRolloutScan): void {
+  // Re-insert to refresh recency, then evict oldest-first. Thousands of rollout
+  // files accumulate on a working machine, so this must not grow with the
+  // archive -- only with the rollouts actually being polled.
+  codexRolloutScans.delete(rolloutPath);
+  codexRolloutScans.set(rolloutPath, scan);
+  while (codexRolloutScans.size > CODEX_ROLLOUT_SCAN_CACHE_MAX) {
+    const oldest = codexRolloutScans.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    codexRolloutScans.delete(oldest);
+  }
+}
+
+/**
+ * Advance (or reuse) the fold for one rollout file.
+ *
+ * Unchanged size AND mtime means the previous fold is still exact and nothing
+ * is read at all. Growth reads only the appended bytes. Anything else -- a
+ * shrink, a replacement, a rewrite in place -- restarts from zero, because
+ * only append-only growth is safely resumable and rollouts are append-only.
+ *
+ * Reads are chunked, so peak allocation stays bounded by the chunk size plus
+ * one line no matter how large the rollout has grown. A first scan is still
+ * O(file); what disappears is paying that cost again on every tick.
+ */
+async function advanceCodexRolloutScan(rolloutPath: string): Promise<CodexRolloutFold | null> {
+  let size: number;
+  let mtimeMs: number;
+  try {
+    const info = await stat(rolloutPath);
+    size = info.size;
+    mtimeMs = info.mtimeMs;
+  } catch {
+    codexRolloutScans.delete(rolloutPath);
+    return null;
+  }
+
+  const cached = codexRolloutScans.get(rolloutPath);
+  if (cached && cached.size === size && cached.mtimeMs === mtimeMs) {
+    rememberCodexRolloutScan(rolloutPath, cached);
+    return finishCodexRolloutFold(cached);
+  }
+
+  // Copy the fold rather than aliasing the cached one: two sessions can poll
+  // the same rollout concurrently, and each in-flight scan must own its
+  // accumulator instead of advancing a shared object at a different offset.
+  const scan: CodexRolloutScan = cached && size >= cached.size
+    ? { ...cached, size, mtimeMs, fold: { ...cached.fold } }
+    : { size, mtimeMs, offset: 0, partial: Buffer.alloc(0), fold: emptyCodexRolloutFold() };
+
+  let handle;
+  try {
+    handle = await open(rolloutPath, 'r');
+  } catch {
+    codexRolloutScans.delete(rolloutPath);
+    return null;
+  }
+  try {
+    const buffer = Buffer.allocUnsafe(CODEX_ROLLOUT_SCAN_CHUNK_BYTES);
+    while (scan.offset < size) {
+      const want = Math.min(CODEX_ROLLOUT_SCAN_CHUNK_BYTES, size - scan.offset);
+      const { bytesRead } = await handle.read(buffer, 0, want, scan.offset);
+      if (bytesRead <= 0) break;
+      scan.offset += bytesRead;
+      const pending = Buffer.concat([scan.partial, buffer.subarray(0, bytesRead)]);
+      const lastNewline = pending.lastIndexOf(0x0a);
+      if (lastNewline < 0) {
+        scan.partial = pending;
+        continue;
+      }
+      // Decode only up to the last newline: whatever follows may be half a
+      // character as well as half a line, and both must wait for more bytes.
+      const complete = pending.subarray(0, lastNewline).toString('utf8');
+      scan.partial = Buffer.from(pending.subarray(lastNewline + 1));
+      for (const line of complete.split('\n')) foldCodexRolloutLine(scan.fold, line);
+    }
+  } catch {
+    codexRolloutScans.delete(rolloutPath);
+    return null;
+  } finally {
+    await handle.close().catch(() => {});
+  }
+
+  rememberCodexRolloutScan(rolloutPath, scan);
+  return finishCodexRolloutFold(scan);
+}
+
+/**
+ * The fold as of end-of-file, including any last line that has no newline yet.
+ *
+ * Codex appends a record and its newline separately, so the final line is
+ * routinely readable before it is terminated -- the previous whole-file read
+ * saw it, and dropping it would delay `task_complete` by a tick. It is folded
+ * into a copy so the persisted fold stays exactly "all complete lines", which
+ * is what the byte offset promises and what makes resuming safe.
+ */
+function finishCodexRolloutFold(scan: CodexRolloutScan): CodexRolloutFold {
+  if (scan.partial.length === 0) return scan.fold;
+  const withPartial: CodexRolloutFold = { ...scan.fold };
+  foldCodexRolloutLine(withPartial, scan.partial.toString('utf8'));
+  return withPartial;
+}
+
 async function readCodexChildSubagentRolloutSnapshot(
   rolloutPath: string,
   parentThreadId?: string,
 ): Promise<CodexChildSubagentRolloutSnapshot | null> {
-  let text: string;
-  try {
-    text = await readFile(rolloutPath, 'utf8');
-  } catch {
-    return null;
-  }
-  let spawn: ReturnType<typeof readCodexChildSubagentSpawn> = null;
-  let prompt: string | undefined;
-  let model: string | undefined;
-  let cwd: string | undefined;
-  let imcodesSessionName: string | undefined;
-  let completed = false;
-  let output: string | undefined;
-  let usageTotalTokens: number | undefined;
-  let startedAtMs: number | undefined;
-  for (const line of text.split('\n')) {
-    const record = parseCodexRolloutJsonLine(line);
-    if (!record) continue;
-    if (startedAtMs === undefined) {
-      const timestamp = meaningfulString(record.timestamp);
-      const parsedTimestamp = timestamp ? Date.parse(timestamp) : NaN;
-      if (Number.isFinite(parsedTimestamp)) startedAtMs = parsedTimestamp;
-    }
-    const payload = codexRolloutPayload(record);
-    const nextSpawn = readCodexChildSubagentSpawn(payload);
-    if (nextSpawn) spawn = nextSpawn;
-    if (!cwd) cwd = meaningfulString(payload.cwd);
-    if (!imcodesSessionName) {
-      imcodesSessionName = readImcodesSessionNameFromBaseInstructions(
-        readCodexRolloutBaseInstructionsText(payload),
-      );
-    }
-    if (!prompt) prompt = readCodexRolloutUserMessage(payload);
-    if (!model) model = meaningfulString(payload.model);
-    const totalTokens = readCodexRolloutUsageTotalTokens(payload);
-    if (totalTokens !== undefined) usageTotalTokens = totalTokens;
-    if (payload.type === 'task_complete') {
-      completed = true;
-      output = meaningfulString(payload.last_agent_message)
-        ?? meaningfulString(payload.result)
-        ?? meaningfulString(payload.message)
-        ?? 'completed';
-    }
-  }
+  const fold = await advanceCodexRolloutScan(rolloutPath);
+  if (!fold) return null;
+  const {
+    spawn,
+    prompt,
+    model,
+    cwd,
+    imcodesSessionName,
+    completed,
+    output,
+    usageTotalTokens,
+    startedAtMs,
+  } = fold;
   if (!spawn) return null;
   if (parentThreadId && spawn.parentThreadId !== parentThreadId) return null;
   const agentId = spawn.agentId ?? childSubagentIdFromRolloutPath(rolloutPath);
@@ -425,39 +691,18 @@ async function readCodexChildSubagentRolloutSnapshot(
   };
 }
 
-async function discoverCodexChildSubagentRollouts(
-  env: Record<string, string | undefined>,
-  parentThreadId: string,
-  minMtimeMs: number,
-): Promise<CodexChildSubagentRolloutSnapshot[]> {
-  return discoverCodexChildSubagentRolloutsByPredicate(env, minMtimeMs, async (rolloutPath) => (
-    readCodexChildSubagentRolloutSnapshot(rolloutPath, parentThreadId)
-  ));
-}
-
-async function discoverCodexChildSubagentRolloutsBySession(
-  env: Record<string, string | undefined>,
-  sessionId: string,
-  cwd: string,
-  minMtimeMs: number,
-): Promise<CodexChildSubagentRolloutSnapshot[]> {
-  const normalizedCwd = normalizeTransportCwd(cwd) ?? cwd;
-  return discoverCodexChildSubagentRolloutsByPredicate(env, minMtimeMs, async (rolloutPath) => {
-    const snapshot = await readCodexChildSubagentRolloutSnapshot(rolloutPath);
-    if (!snapshot) return null;
-    if (snapshot.imcodesSessionName !== sessionId) return null;
-    if (snapshot.cwd) {
-      const snapshotCwd = normalizeTransportCwd(snapshot.cwd) ?? snapshot.cwd;
-      if (snapshotCwd !== normalizedCwd) return null;
-    }
-    return snapshot;
-  });
-}
-
-async function discoverCodexChildSubagentRolloutsByPredicate(
+/**
+ * Every child-subagent rollout touched since `minMtimeMs`, read once.
+ *
+ * This used to run twice per tick behind two predicates -- once matching the
+ * parent thread and once matching the session -- so every candidate file was
+ * walked, stat'd and folded twice to answer two questions about the same
+ * bytes. The predicates are pure functions of the snapshot, so they belong
+ * after the traversal, not around it.
+ */
+async function discoverCodexChildSubagentRolloutSnapshots(
   env: Record<string, string | undefined>,
   minMtimeMs: number,
-  readSnapshot: (rolloutPath: string) => Promise<CodexChildSubagentRolloutSnapshot | null>,
 ): Promise<CodexChildSubagentRolloutSnapshot[]> {
   const codexHome = getCodexHome(env);
   const snapshots: CodexChildSubagentRolloutSnapshot[] = [];
@@ -478,11 +723,23 @@ async function discoverCodexChildSubagentRolloutsByPredicate(
       } catch {
         continue;
       }
-      const snapshot = await readSnapshot(rolloutPath);
+      const snapshot = await readCodexChildSubagentRolloutSnapshot(rolloutPath);
       if (snapshot) snapshots.push(snapshot);
     }
   }
   return snapshots;
+}
+
+function codexChildSubagentRolloutMatchesSession(
+  snapshot: CodexChildSubagentRolloutSnapshot,
+  sessionId: string,
+  cwd: string,
+): boolean {
+  if (snapshot.imcodesSessionName !== sessionId) return false;
+  if (!snapshot.cwd) return true;
+  const normalizedCwd = normalizeTransportCwd(cwd) ?? cwd;
+  const snapshotCwd = normalizeTransportCwd(snapshot.cwd) ?? snapshot.cwd;
+  return snapshotCwd === normalizedCwd;
 }
 
 function isCodexAuthFailureMessage(message: string): boolean {
@@ -521,6 +778,27 @@ class CodexMalformedRpcResponseError extends Error {
     super(`Codex app-server returned malformed JSON for request ${method} (id ${requestId})`);
     this.name = 'CodexMalformedRpcResponseError';
   }
+}
+
+/**
+ * Codex's `thread/resume` answer for a thread that was started but never ran a
+ * turn: the rollout is written lazily on the first turn, so no history exists.
+ *
+ * A thread id is recorded as soon as `thread/start` returns, so any failure
+ * before the first `turn/start` leaves exactly this behind. Field incident: an
+ * interrupted restore started a fresh thread whose first turn was refused
+ * before turn/start; every later resume then failed with this message and the
+ * session could not run again until its record was edited by hand. Replacing
+ * such a thread loses nothing -- there is no history to lose.
+ *
+ * Deliberately exact: a rollout that EXISTS but cannot be opened is a different
+ * failure, and replacing that thread would silently abandon real history.
+ */
+function isCodexThreadNeverMaterializedError(err: unknown): boolean {
+  const message = isRecord(err) && typeof err.message === 'string'
+    ? err.message
+    : errorMessage(err);
+  return /\bno rollout found for thread id\b/i.test(message);
 }
 
 function isCodexThreadHistoryUnreadableError(err: unknown): boolean {
@@ -594,46 +872,51 @@ function getCodexSdkContextInjectionMaxChars(): number {
   return parsed;
 }
 
-function capCodexSdkContextInjection(text: string, maxChars = getCodexSdkContextInjectionMaxChars()): string {
-  if (text.length <= maxChars) return text;
-  const marker = `\n\n[IM.codes: injected context truncated from ${text.length} to ${maxChars} chars to prevent SDK auto-compaction.]`;
-  if (maxChars <= marker.length + 16) return text.slice(0, maxChars);
-  return `${text.slice(0, maxChars - marker.length).trimEnd()}${marker}`;
+const CODEX_CONTEXT_CAP_MARKERS: PriorityPreservingCapMarkers = {
+  identityTruncated: (bodyLength, maxChars) => `\n[IM.codes: agent identity truncated from ${bodyLength} to fit the ${maxChars}-char Codex context budget; IM.codes system and supervision instructions were preserved.]\n`,
+  contextTruncated: (length, maxChars) => `\n\n[IM.codes: injected context truncated from ${length} to ${maxChars} chars to prevent SDK auto-compaction.]`,
+};
+
+function capCodexSdkContextInjection(text: SpannedText | string, maxChars = getCodexSdkContextInjectionMaxChars()): string {
+  // Codex measures its budget in UTF-16 units, matching the string length it receives.
+  return capContextPreservingPriority(text, maxChars, 'utf16', CODEX_CONTEXT_CAP_MARKERS);
 }
 
-function buildCodexTurnInput(payload: ProviderContextPayload, sessionSystemTextUpdate?: string): string {
-  const contextParts: string[] = [];
+function buildCodexTurnInput(payload: ProviderContextPayload, sessionSystemTextUpdate?: SpannedText): string {
   const split = getProviderSystemTextParts(payload);
-  const systemText = split.hasSplitSystemText
-    ? composeProviderSystemText(payload, { includeSession: false, includeTurn: true })
-    : payload.systemText?.trim();
+  // Turn text never carries the identity span: authored turn context is exactly
+  // the kind of content a forged identity delimiter would hide in. In the legacy
+  // combined view the span is honoured only after hash verification.
+  const systemText: SpannedText | undefined = split.hasSplitSystemText
+    ? joinSpanned([composeProviderSystemText(payload, { includeSession: false, includeTurn: true })], '')
+    : composeProviderSystemTextSpanned(payload);
   const messagePreamble = payload.messagePreamble?.trim();
-  const stableUpdate = sessionSystemTextUpdate?.trim();
-  if (stableUpdate) {
-    contextParts.push(`${IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER} updated:\n${stableUpdate}`);
-  }
-  if (systemText) contextParts.push(`Context instructions:\n${systemText}`);
-  if (messagePreamble) contextParts.push(messagePreamble);
-  if (contextParts.length === 0) return payload.assembledMessage;
+  const stableUpdate = sessionSystemTextUpdate?.text.trim() ? sessionSystemTextUpdate : undefined;
+  const contextText = joinSpanned([
+    stableUpdate ? joinSpanned([`${IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER} updated:\n`, stableUpdate], '') : undefined,
+    systemText ? joinSpanned(['Context instructions:\n', systemText], '') : undefined,
+    messagePreamble,
+  ], '\n\n');
+  if (!contextText) return payload.assembledMessage;
 
-  const contextText = capCodexSdkContextInjection(contextParts.join('\n\n'));
+  const cappedContextText = capCodexSdkContextInjection(contextText);
   const userMessage = messagePreamble ? payload.userMessage : payload.assembledMessage;
   const trimmedUserMessage = userMessage.trim();
-  return trimmedUserMessage ? `${contextText}\n\n${trimmedUserMessage}` : contextText;
+  return trimmedUserMessage ? `${cappedContextText}\n\n${trimmedUserMessage}` : cappedContextText;
 }
 
 function appendImcodesBaseInstructions(baseInstructions: string, payload: ProviderContextPayload): string {
-  const sessionSystemText = getProviderSystemTextParts(payload).sessionSystemText;
+  const sessionSystemText = getProviderSessionSystemTextSpanned(payload);
   // Generated Image Reporting belongs in Codex's baseInstructions tail
   // (Codex is currently the only transport agent with native image-gen
   // tools). Living here means: sent once per thread/start|resume, picked
   // up by Codex prefix cache, NOT re-rendered every turn, and zero cost
   // for non-Codex providers. See p2p audit 37bfbb85-430 N-A follow-up.
   const imageReporting = buildGeneratedImageReportingPrompt();
-  const tailParts = [sessionSystemText, imageReporting].filter((s): s is string => Boolean(s));
-  if (tailParts.length === 0) return baseInstructions;
+  const tail = joinSpanned([sessionSystemText, imageReporting], '\n\n');
+  if (!tail) return baseInstructions;
   if (baseInstructions.includes(IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER)) return baseInstructions;
-  return `${baseInstructions.trimEnd()}\n\n${IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER}\n\n${capCodexSdkContextInjection(tailParts.join('\n\n'))}`;
+  return `${baseInstructions.trimEnd()}\n\n${IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER}\n\n${capCodexSdkContextInjection(tail)}`;
 }
 
 function appendDetectedGeneratedImagePaths(content: string, paths: string[]): string {
@@ -800,10 +1083,19 @@ export interface CodexDiscoveredModel {
 
 interface CodexSdkSessionState {
   routeId: string;
+  /**
+   * Authorized IM.codes dispatch facts observed in the CURRENT turn. This is
+   * the only evidence a delegation claim is ever built from; it is reset at
+   * turn start so a prior turn's dispatch can never substantiate a later one.
+   */
+  turnDelegationDispatches?: DelegationDispatchFact[];
   imcodesSessionName?: string;
   cwd: string;
   env?: Record<string, string>;
   mcpConfig?: Record<string, unknown>;
+  /** Exact thread-scoped MCP generation observed closed and not yet rehydrated. */
+  imcodesMcpRecoveryRequired: boolean;
+  imcodesMcpRecoveryPromise?: Promise<void>;
   model?: string;
   effort?: TransportEffortLevel;
   /**
@@ -813,6 +1105,14 @@ interface CodexSdkSessionState {
    */
   serviceTier?: string;
   threadId?: string;
+  /**
+   * The native-agent fence of `threadId`, as this provider started it or as
+   * the thread's own rollout proves it. Codex fixes the fence when a thread is
+   * created, so the record is valid exactly for that thread id.
+   */
+  nativeAgentFence?: { threadId: string; fence: NativeAgentFence };
+  /** The fence of a `thread/start` in flight (no thread id yet). */
+  pendingThreadFence?: NativeAgentFence;
   loaded: boolean;
   runningTurnId?: string;
   runtimeActivityGeneration?: ActivityGeneration;
@@ -1125,6 +1425,15 @@ function meaningfulString(value: unknown): string | undefined {
   const trimmed = value.trim();
   if (!trimmed) return undefined;
   return trimmed.length <= CODEX_COLLAB_MAX_ID_CHARS ? trimmed : trimmed.slice(0, CODEX_COLLAB_MAX_ID_CHARS);
+}
+
+function isImcodesMcpTransportClosedItem(item: Record<string, any>): boolean {
+  if (item.type !== 'mcpToolCall'
+    || meaningfulString(item.server) !== IMCODES_DELEGATION_MCP_SERVER
+    || meaningfulString(item.status) !== 'failed') return false;
+  const message = meaningfulString(item.error?.message) ?? meaningfulString(item.error) ?? '';
+  return /(?:^|\b)(?:transport|connection|stdio) (?:is )?closed(?:\b|$)/i.test(message)
+    || /MCP client is not connected/i.test(message);
 }
 
 function meaningfulStringArray(value: unknown): { values: string[]; malformed: boolean } {
@@ -1554,12 +1863,14 @@ function runtimeSubagentToolFromPayload(
   const startedAtMs = readSdkSubagentStartedAtMs(record) ?? readSdkSubagentStartedAtMs(payload);
   const summary = agentName ? `Codex sub-agent ${agentName}` : rawAgentPath ? `Codex sub-agent ${rawAgentPath}` : 'Codex sub-agent';
   const output = statusMapping.terminal ? (statusInfo.message ?? rawStatus ?? 'unknown') : undefined;
+  const fullRequest = readSdkSubagentFullRequest(record);
   const detail = buildSdkSubagentSafeDetail({
     kind: SDK_SUBAGENT_DETAIL_KIND,
     summary,
     input: {
       action: 'codex-runtime-subagent',
       description: prompt ?? summary,
+      ...(fullRequest ? { fullRequest } : {}),
     },
     ...(output ? { output } : {}),
     meta: {
@@ -1958,6 +2269,12 @@ function buildRawSpawnAgentRuntimePayload(
   const prompt = meaningfulString(call.args.message)
     ?? meaningfulString(call.args.prompt)
     ?? meaningfulString(call.args.instructions);
+  // The display prompt above is capped; classification needs the whole request.
+  const fullRequest = readSdkSubagentFullRequest({
+    message: call.args.message,
+    prompt: call.args.prompt,
+    instructions: call.args.instructions,
+  });
   const model = meaningfulString(call.args.model)
     ?? meaningfulString(call.args.agentId)
     ?? meaningfulString(call.args.agent_id);
@@ -1967,6 +2284,7 @@ function buildRawSpawnAgentRuntimePayload(
     status: 'running',
     ...(agentName ? { nickname: agentName } : {}),
     ...(prompt ? { prompt } : {}),
+    ...(fullRequest ? { full_request: fullRequest } : {}),
     ...(model ? { model } : {}),
     backgrounded: true,
     startedAtMs: call.startedAtMs,
@@ -2006,6 +2324,7 @@ function collabAgentToolFromItem(
     : statusMapping.toolStatus === 'error'
       ? (statusMapping.diagnosticCode ? 'diagnostic' : 'failed')
       : undefined;
+  const fullRequest = readSdkSubagentFullRequest(item);
   const detail = buildSdkSubagentSafeDetail({
     kind: SDK_SUBAGENT_DETAIL_KIND,
     summary,
@@ -2013,6 +2332,7 @@ function collabAgentToolFromItem(
       action: 'codex-collaboration',
       receiverCount,
       description: prompt ?? summary,
+      ...(fullRequest ? { fullRequest } : {}),
     },
     ...(output ? { output } : {}),
     meta: {
@@ -2316,6 +2636,9 @@ export class CodexSdkProvider implements TransportProvider {
     contextSupport: 'degraded-message-side-context-mapping',
     backgroundSubagentWake: BACKGROUND_SUBAGENT_WAKE_MODES.RUNTIME,
     activeDelegationNotification: AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE,
+    // Native multi-agent is withheld per THREAD at creation for managed
+    // sessions (config.features); Codex keeps it for the thread's lifetime.
+    nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.SESSION_FENCE,
     compact: {
       execution: 'sdk-rpc',
       verified: true,
@@ -2326,6 +2649,7 @@ export class CodexSdkProvider implements TransportProvider {
 
   private config: ProviderConfig | null = null;
   private sessions = new Map<string, CodexSdkSessionState>();
+  private readonly nativeAgentFence = new NativeAgentFenceSlot('codex-sdk');
   private threadToSession = new Map<string, string>();
   private deltaCallbacks: Array<(sessionId: string, delta: MessageDelta) => void> = [];
   private completeCallbacks: Array<(sessionId: string, message: AgentMessage) => void> = [];
@@ -2340,7 +2664,9 @@ export class CodexSdkProvider implements TransportProvider {
   private pendingRequests = new Map<number, PendingRequest>();
   private appServerAuthFingerprint: string | null = null;
   private appServerRestart: Promise<void> | null = null;
+  private imcodesMcpReload: Promise<void> | null = null;
   private rawSpawnAgentCalls = new Map<string, CodexRawSpawnAgentCall>();
+  private rawNativeCollabCalls = new Map<string, { sessionId: string; name: string }>();
   private trackedSubagentThreads = new Map<string, CodexTrackedSubagentThread>();
   private nextActiveTurnLeaseId = 1;
   private heartbeatInFlightCount = 0;
@@ -2484,9 +2810,12 @@ export class CodexSdkProvider implements TransportProvider {
       cwd: normalizeTransportCwd(config.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
       env: { ...(existing?.env ?? {}), ...((config.env as Record<string, string> | undefined) ?? {}) },
       mcpConfig: buildCodexMcpThreadConfig(config) ?? existing?.mcpConfig,
+      imcodesMcpRecoveryRequired: false,
+      imcodesMcpRecoveryPromise: undefined,
       model: typeof config.agentId === 'string' ? config.agentId : existing?.model,
       effort: config.effort ?? existing?.effort,
       threadId: config.resumeId ?? existing?.threadId,
+      ...(existing?.nativeAgentFence ? { nativeAgentFence: existing.nativeAgentFence } : {}),
       loaded: false,
       runningTurnId: undefined,
       turnDispatchGeneration: 0,
@@ -2624,6 +2953,17 @@ export class CodexSdkProvider implements TransportProvider {
     this.emitSessionInfo(sessionId, { effort });
   }
 
+  refreshSessionSystemText(sessionId: string): void {
+    const state = this.sessions.get(sessionId);
+    if (!state) return;
+    // Preserve the exact durable thread id/history. The next turn crosses
+    // ensureThreadLoaded and issues thread/resume with freshly assembled
+    // baseInstructions, restoring prefix-cacheable identity immediately.
+    state.loaded = false;
+    state.lastInjectedSessionSystemText = undefined;
+    this.clearPendingSessionSystemTextUpdate(state);
+  }
+
   async send(sessionId: string, payloadOrMessage: string | ProviderContextPayload, attachments?: TransportAttachment[], extraSystemPrompt?: string): Promise<void> {
     if (!this.config || !this.child) {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Codex app-server not connected', false);
@@ -2667,13 +3007,37 @@ export class CodexSdkProvider implements TransportProvider {
     state.authRecoveryPending = false;
     state.authRecoveryRetriesRemaining = CODEX_AUTH_RECOVERY_RETRY_LIMIT;
     state.authRecoveryReplayUnsafe = false;
-    await this.startTurn(
-      sessionId,
-      state,
-      payload,
-      turnDispatchGeneration,
-      CODEX_AUTH_RECOVERY_RETRY_LIMIT,
-    );
+    let delegationRecoveryRetriesRemaining = CODEX_IM_DELEGATION_RECOVERY_RETRY_LIMIT;
+    if (state.imcodesMcpRecoveryPromise) await state.imcodesMcpRecoveryPromise;
+    if (state.imcodesMcpRecoveryRequired && state.threadId) {
+      await this.recoverImcodesMcpAfterObservedClosure(sessionId, state, 'pre-turn-observed-closure');
+    }
+    for (;;) {
+      try {
+        await this.startTurn(
+          sessionId,
+          state,
+          payload,
+          turnDispatchGeneration,
+          CODEX_AUTH_RECOVERY_RETRY_LIMIT,
+        );
+        state.imcodesMcpRecoveryRequired = false;
+        break;
+      } catch (error) {
+        if (!(error instanceof ImcodesDelegationUnavailableError)
+          || delegationRecoveryRetriesRemaining <= 0
+          || state.cancelled
+          || this.sessions.get(sessionId) !== state
+          || state.turnDispatchGeneration !== turnDispatchGeneration) throw error;
+        delegationRecoveryRetriesRemaining -= 1;
+        // The readiness failure happens before turn/start, provider output, or
+        // any tool side effect. Restarting is therefore replay-safe. Preserve
+        // the SAME durable session/thread identity, reload only the stale MCP
+        // client/catalog, and retry exactly once; no model turn or MCP tool call
+        // has started, so this boundary is replay-safe.
+        await this.reloadImcodesMcpClient('im-delegation-unavailable');
+      }
+    }
   }
 
   async notifyActiveDelegation(
@@ -2905,16 +3269,118 @@ export class CodexSdkProvider implements TransportProvider {
     // codex binary it spawned lives on and leaks ~60MB per abandoned pair.
     // Walk the descendant tree and tree-kill instead.
     if (child && !child.killed) {
-      void killProcessTree(child);
+      await killProcessTree(child, { ownsProcessGroup: true });
     }
     this.threadToSession.clear();
     this.rawSpawnAgentCalls.clear();
+    this.rawNativeCollabCalls.clear();
     this.trackedSubagentThreads.clear();
     this.appServerAuthFingerprint = null;
     if (options.clearSessions) {
       this.sessions.clear();
       this.config = null;
     }
+  }
+
+  /**
+   * Authoritative, thread-scoped proof that IM delegation is actually usable.
+   *
+   * The `mcpServer/startupStatus/updated` notification is NOT sufficient: a
+   * stale `ready` can survive a restart, a config change, or a tools-list
+   * invalidation. Only a COMPLETE `mcpServerStatus/list` snapshot is authority,
+   * so this re-verifies on every Brain turn.
+   *
+   * Anything short of "exact server connected with the exact delegation tools"
+   * fails closed. Native multi-agent is never a fallback for delegated task
+   * work: a managed Brain's thread is created without it.
+   */
+  private async assertImcodesDelegationReady(threadId: string): Promise<void> {
+    const servers: Array<Record<string, unknown>> = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | undefined;
+    let completed = false;
+    for (let page = 0; page < MCP_STATUS_PAGE_LIMIT; page++) {
+      let result: Record<string, unknown> | undefined;
+      try {
+        result = await this.request(CODEX_MCP_RPC_METHOD.STATUS_LIST, {
+          threadId,
+          detail: 'toolsAndAuthOnly',
+          ...(cursor ? { cursor } : {}),
+        }) as Record<string, unknown> | undefined;
+      } catch {
+        throw new ImcodesDelegationUnavailableError();
+      }
+      const data = Array.isArray(result?.data) ? result.data : undefined;
+      if (!data) throw new ImcodesDelegationUnavailableError();
+      for (const entry of data) if (isRecord(entry)) servers.push(entry);
+      const next = meaningfulString(result?.nextCursor);
+      if (!next) { completed = true; break; }
+      // A repeated cursor means the inventory never terminates: fail closed
+      // rather than accept a partial view as if it were complete.
+      if (seenCursors.has(next)) throw new ImcodesDelegationUnavailableError();
+      seenCursors.add(next);
+      cursor = next;
+    }
+    if (!completed) throw new ImcodesDelegationUnavailableError();
+
+    const server = servers.find((entry) => meaningfulString(entry.name) === IMCODES_DELEGATION_MCP_SERVER);
+    if (!server || !imcodesDelegationServerConnected(server)) {
+      throw new ImcodesDelegationUnavailableError();
+    }
+    const tools = isRecord(server.tools) ? server.tools : undefined;
+    if (!tools) throw new ImcodesDelegationUnavailableError();
+    for (const tool of IMCODES_DELEGATION_REQUIRED_TOOLS) {
+      if (!(tool in tools)) throw new ImcodesDelegationUnavailableError();
+    }
+  }
+
+  private async reloadImcodesMcpClient(reason: string): Promise<void> {
+    if (this.imcodesMcpReload) return this.imcodesMcpReload;
+    const child = this.child;
+    if (!child) throw new ImcodesDelegationUnavailableError();
+    this.imcodesMcpReload = this.request(CODEX_MCP_RPC_METHOD.RELOAD, {})
+      .then(() => {
+        if (this.child !== child) throw new ImcodesDelegationUnavailableError();
+        logger.info({ provider: this.id, reason }, 'Codex IM.codes MCP client/catalog reloaded');
+      })
+      .finally(() => { this.imcodesMcpReload = null; });
+    return this.imcodesMcpReload;
+  }
+
+  private async waitForImcodesMcpHydration(threadId: string): Promise<void> {
+    let lastError: unknown = new ImcodesDelegationUnavailableError();
+    for (const delayMs of CODEX_IM_MCP_RECOVERY_BACKOFF_MS) {
+      if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
+      try {
+        await this.assertImcodesDelegationReady(threadId);
+        return;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError;
+  }
+
+  private recoverImcodesMcpAfterObservedClosure(
+    sessionId: string,
+    state: CodexSdkSessionState,
+    reason: string,
+  ): Promise<void> {
+    state.imcodesMcpRecoveryRequired = true;
+    if (state.imcodesMcpRecoveryPromise) return state.imcodesMcpRecoveryPromise;
+    const threadId = state.threadId;
+    if (!threadId) return Promise.reject(new ImcodesDelegationUnavailableError());
+    const recovery = (async () => {
+      await this.reloadImcodesMcpClient(reason);
+      await this.waitForImcodesMcpHydration(threadId);
+      if (this.sessions.get(sessionId) === state && state.threadId === threadId) {
+        state.imcodesMcpRecoveryRequired = false;
+      }
+    })().finally(() => {
+      if (state.imcodesMcpRecoveryPromise === recovery) state.imcodesMcpRecoveryPromise = undefined;
+    });
+    state.imcodesMcpRecoveryPromise = recovery;
+    return recovery;
   }
 
   private async startAppServer(
@@ -2926,17 +3392,22 @@ export class CodexSdkProvider implements TransportProvider {
     // Resolve npm .cmd shims into (node.exe, [scriptPath]) so spawn works
     // without shell:true (which has its own quoting issues on Windows).
     const resolved = resolveExecutableForSpawn(binaryPath);
-    const args = [...resolved.prependArgs, ...getDefaultCodexMcpArgs(), 'app-server'];
+    const args = [...resolved.prependArgs, ...getCodexAppServerArgs()];
     const spawnEnv = this.buildSpawnEnv(config);
     const authFingerprint = await readCodexAuthFingerprint(spawnEnv);
     const child = spawn(resolved.executable, args, {
+      // Own process group and session on POSIX. A reparented descendant keeps
+      // its PGID but loses its PPID, so after the agent parent dies this is the
+      // only ownership token teardown still has. Without it the eight vitest
+      // workers of the incident were unreachable on PPID=1.
+      detached: process.platform !== 'win32',
       stdio: ['pipe', 'pipe', 'pipe'],
       env: spawnEnv,
       windowsHide: true,
     });
     this.child = child;
     this.rl = readline.createInterface({ input: child.stdout });
-    this.rl.on('line', (line) => this.handleLine(line));
+    this.rl.on('line', (line) => this.handleLine(child, line));
     this.rl.on('close', () => {
       if (this.child !== child) return;
       this.handleAppServerDisconnect(child, 'unexpected_eof', new Error('Codex app-server stdout closed'));
@@ -3148,7 +3619,18 @@ export class CodexSdkProvider implements TransportProvider {
     payload: ProviderContextPayload,
     turnDispatchGeneration: number,
     authRecoveryRetriesRemaining: number,
+    activeWriterRecoveryRetriesRemaining = CODEX_ACTIVE_WRITER_RECOVERY_LIMIT,
+    missingRolloutRecoveryRetriesRemaining = CODEX_MISSING_ROLLOUT_RECOVERY_LIMIT,
   ): Promise<void> {
+    // Unconditionally establish an empty delegation scope for the new turn.
+    //
+    // Unconditional on purpose: no branch, no "only if absent". However the
+    // previous turn ended -- completed, cancelled, timed out, disconnected, or
+    // failed before it ever reached a terminal handler -- this turn begins with
+    // no inherited evidence. This is the load-bearing half of the invariant for
+    // currently observable behaviour, and it is what the cancel/error-A then
+    // zero-dispatch-B regressions actually hold.
+    state.turnDelegationDispatches = [];
     try {
       const desiredSessionSystemText = getProviderSystemTextParts(payload).sessionSystemText;
       const shouldInjectStableUpdate = !!(
@@ -3158,8 +3640,16 @@ export class CodexSdkProvider implements TransportProvider {
         && state.lastInjectedSessionSystemText !== desiredSessionSystemText
       );
       await this.ensureThreadLoaded(sessionId, state, payload);
+      // A Brain must not begin a turn unless IM delegation is authoritatively
+      // usable: with native multi-agent removed at process start there is no
+      // fallback, so starting anyway would strand the user's delegation. The
+      // snapshot is re-verified per Brain turn -- a cached `ready` can outlive a
+      // restart, config change or tools-list invalidation.
+      if (payload.sessionRole === 'brain' && state.threadId) {
+        await this.assertImcodesDelegationReady(state.threadId);
+      }
       await this.prepareGeneratedImageTracking(sessionId, state);
-      const inputText = buildCodexTurnInput(payload, shouldInjectStableUpdate ? desiredSessionSystemText : undefined);
+      const inputText = buildCodexTurnInput(payload, shouldInjectStableUpdate ? getProviderSessionSystemTextSpanned(payload) : undefined);
       if (shouldInjectStableUpdate) {
         state.pendingSessionSystemTextUpdate = desiredSessionSystemText;
         state.pendingSessionSystemTextUpdateTurnId = undefined;
@@ -3208,6 +3698,13 @@ export class CodexSdkProvider implements TransportProvider {
       }
       if (state.runningTurnId) this.armRawChecklistPolling(sessionId, state);
     } catch (err) {
+      // Delegation readiness is a PRECONDITION, not a turn failure: it must not
+      // be absorbed into turn-recovery status, or the caller would see a normal
+      // resolved send while the user's delegation silently never happened.
+      if (err instanceof ImcodesDelegationUnavailableError) {
+        state.turnStartInFlight = false;
+        throw err;
+      }
       const authReplaySafe = this.isCodexAuthReplaySafe(state);
       this.rememberTerminatedTurn(state, state.runningTurnId);
       this.clearActiveTurnLease(state);
@@ -3221,6 +3718,61 @@ export class CodexSdkProvider implements TransportProvider {
       if (state.cancelled) {
         this.clearCodexAuthRecoveryState(state);
         this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Codex turn cancelled', true));
+        return;
+      }
+      if (
+        missingRolloutRecoveryRetriesRemaining > 0
+        && authReplaySafe
+        && isCodexThreadNeverMaterializedError(error)
+        && this.sessions.get(sessionId) === state
+        && state.turnDispatchGeneration === turnDispatchGeneration
+      ) {
+        // `thread/start` may return before codex-core's rollout is visible to
+        // the app-server. A JSON-RPC rejection proves turn/start was not
+        // accepted, so retrying the same payload is safe. Force one exact
+        // thread/resume first: if the rollout appeared, the durable identity is
+        // retained; if it is genuinely absent, ensureThreadLoaded replaces the
+        // broken thread. Never loop or replay after provider/tool output.
+        state.loaded = false;
+        logger.warn(
+          { provider: this.id, sessionId, threadId: state.threadId },
+          'Codex turn start raced a missing rollout; rehydrating once before retry',
+        );
+        await this.startTurn(
+          sessionId,
+          state,
+          payload,
+          turnDispatchGeneration,
+          authRecoveryRetriesRemaining,
+          activeWriterRecoveryRetriesRemaining,
+          missingRolloutRecoveryRetriesRemaining - 1,
+        );
+        return;
+      }
+      if (
+        activeWriterRecoveryRetriesRemaining > 0
+        && authReplaySafe
+        && /already has an active writer/i.test(error.message)
+      ) {
+        const conflictedThreadId = state.threadId;
+        if (conflictedThreadId) this.threadToSession.delete(conflictedThreadId);
+        state.threadId = undefined;
+        state.loaded = false;
+        state.currentText = '';
+        state.currentMessageId = null;
+        logger.warn(
+          { provider: this.id, sessionId, conflictedThreadId },
+          'Codex thread rejected a pre-accept turn because another writer is active; retrying once on a replacement thread',
+        );
+        await this.startTurn(
+          sessionId,
+          state,
+          payload,
+          turnDispatchGeneration,
+          authRecoveryRetriesRemaining,
+          activeWriterRecoveryRetriesRemaining - 1,
+          missingRolloutRecoveryRetriesRemaining,
+        );
         return;
       }
       if (this.isCodexAuthError(error)) {
@@ -3340,9 +3892,12 @@ export class CodexSdkProvider implements TransportProvider {
         state.lastInjectedSessionSystemText = sessionSystemText;
         return;
       } catch (err) {
-        if (!isCodexThreadHistoryUnreadableError(err)) throw err;
+        if (!isCodexThreadNeverMaterializedError(err) && !isCodexThreadHistoryUnreadableError(err)) throw err;
 
-        const repaired = await this.repairUnreadableThreadHistory(err).catch((repairErr) => {
+        // A never-materialized thread names no rollout file, so there is no
+        // history to repair; replace it without probing unrelated files.
+        const repaired = !isCodexThreadNeverMaterializedError(err)
+          && await this.repairUnreadableThreadHistory(err).catch((repairErr) => {
           logger.warn({ provider: this.id, sessionId, threadId: state.threadId, err: repairErr }, 'Codex SDK failed to repair unreadable thread history');
           return false;
         });
@@ -3357,7 +3912,12 @@ export class CodexSdkProvider implements TransportProvider {
         }
 
         const oldThreadId = state.threadId;
-        logger.warn({ provider: this.id, sessionId, threadId: oldThreadId, err }, 'Codex SDK stored thread history is unreadable; starting replacement thread');
+        logger.warn(
+          { provider: this.id, sessionId, threadId: oldThreadId, err },
+          isCodexThreadNeverMaterializedError(err)
+            ? 'Codex SDK stored thread has no rollout; starting replacement thread'
+            : 'Codex SDK stored thread history is unreadable; starting replacement thread',
+        );
         if (oldThreadId) this.threadToSession.delete(oldThreadId);
         state.threadId = undefined;
         state.loaded = false;
@@ -3390,24 +3950,64 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private async startNewThread(sessionId: string, state: CodexSdkSessionState, baseInstructions: string): Promise<void> {
-    const result = await this.request('thread/start', {
-      cwd: state.cwd,
-      ...this.sessionEnvironmentParams(state),
-      ...this.sessionMcpConfigParams(state),
-      approvalPolicy: 'never',
-      sandbox: 'danger-full-access',
-      personality: 'none',
-      ...(state.model ? { model: state.model } : {}),
-      baseInstructions,
-    });
-    const threadId = result?.thread?.id;
-    if (!threadId) {
-      throw new Error('Codex app-server did not return a thread id');
+    // The fence is decided HERE, on the send path, before any user or task
+    // bytes reach the thread: a managed session's thread is created without
+    // native multi-agent tools, and Codex keeps that for every later resume.
+    const fenced = this.nativeAgentFence.required(sessionId, state.imcodesSessionName);
+    const fence = fenceOf(fenced);
+    state.pendingThreadFence = fence;
+    try {
+      const result = await this.request('thread/start', {
+        cwd: state.cwd,
+        ...this.sessionEnvironmentParams(state),
+        ...(fenced ? { config: withCodexNativeAgentFence(state.mcpConfig) } : this.sessionMcpConfigParams(state)),
+        approvalPolicy: 'never',
+        sandbox: 'danger-full-access',
+        personality: 'none',
+        ...(state.model ? { model: state.model } : {}),
+        baseInstructions,
+      });
+      const threadId = result?.thread?.id;
+      if (!threadId) {
+        throw new Error('Codex app-server did not return a thread id');
+      }
+      state.threadId = threadId;
+      state.nativeAgentFence = { threadId, fence };
+      state.loaded = true;
+      this.threadToSession.set(threadId, sessionId);
+      this.emitSessionInfo(sessionId, { resumeId: threadId, ...(state.model ? { model: state.model } : {}) });
+    } finally {
+      state.pendingThreadFence = undefined;
     }
-    state.threadId = threadId;
-    state.loaded = true;
-    this.threadToSession.set(threadId, sessionId);
-    this.emitSessionInfo(sessionId, { resumeId: threadId, ...(state.model ? { model: state.model } : {}) });
+  }
+
+  setNativeAgentFenceResolver(resolver: NativeAgentFenceResolver): void {
+    this.nativeAgentFence.install(resolver);
+  }
+
+  /**
+   * The native-agent fence of the thread serving this route. A thread's fence
+   * is what it was created with: recorded when this provider started it, or
+   * proven by the thread's own rollout (`turn_context.multi_agent_version`).
+   * With no thread yet, the send path's `thread/start` decides it.
+   */
+  async getNativeAgentFence(providerSessionId: string): Promise<NativeAgentFence> {
+    const state = this.sessions.get(providerSessionId);
+    if (!state) return NATIVE_AGENT_FENCES.PROVIDER_DEFAULT;
+    const threadId = state.threadId;
+    if (!threadId) {
+      return state.pendingThreadFence
+        ?? this.nativeAgentFence.nextLaunchFence(providerSessionId, state.imcodesSessionName);
+    }
+    if (state.nativeAgentFence?.threadId === threadId) return state.nativeAgentFence.fence;
+    const fence = await readCodexThreadNativeAgentFence(threadId, { env: state.env });
+    // Cache only a proven fence, and only for the thread that was read.
+    if (fence === NATIVE_AGENT_FENCES.DISABLED
+      && this.sessions.get(providerSessionId) === state
+      && state.threadId === threadId) {
+      state.nativeAgentFence = { threadId, fence };
+    }
+    return fence;
   }
 
   private async repairUnreadableThreadHistory(err: unknown): Promise<boolean> {
@@ -3495,7 +4095,11 @@ export class CodexSdkProvider implements TransportProvider {
     return freshPaths;
   }
 
-  private handleLine(line: string): void {
+  private handleLine(child: ChildProcessWithoutNullStreams, line: string): void {
+    // A prior app-server generation can still have already-buffered stdout
+    // callbacks after restart. Thread ids are deliberately preserved across
+    // restart, so threadToSession alone cannot distinguish those stale events.
+    if (this.child !== child) return;
     const trimmed = line.trim();
     if (!trimmed) return;
     let msg: JsonRpcResponse;
@@ -3922,11 +4526,11 @@ export class CodexSdkProvider implements TransportProvider {
     if (!state.threadId) return;
     const providerEnv = (this.config?.env as Record<string, string> | undefined) ?? {};
     const env = { ...process.env, ...providerEnv, ...(state.env ?? {}) };
-    const snapshots = await discoverCodexChildSubagentRollouts(
+    const discovered = await discoverCodexChildSubagentRolloutSnapshots(
       env,
-      state.threadId,
       state.childSubagentRolloutStartedAt,
     );
+    const snapshots = discovered.filter((snapshot) => snapshot.parentThreadId === state.threadId);
     const seenRolloutPaths = new Set(snapshots.map((snapshot) => snapshot.rolloutPath));
     const rememberSnapshot = (snapshot: CodexChildSubagentRolloutSnapshot | null | undefined): void => {
       if (!snapshot || seenRolloutPaths.has(snapshot.rolloutPath)) return;
@@ -3943,13 +4547,14 @@ export class CodexSdkProvider implements TransportProvider {
         rememberSnapshot(snapshot);
       }
     }
-    const sessionSnapshots = await discoverCodexChildSubagentRolloutsBySession(
-      env,
-      state.imcodesSessionName ?? sessionId,
-      state.cwd,
-      state.childSubagentRolloutStartedAt,
-    );
-    for (const snapshot of sessionSnapshots) rememberSnapshot(snapshot);
+    // Same traversal, second question: rollouts belonging to this session even
+    // when they do not name this thread as their parent.
+    const sessionName = state.imcodesSessionName ?? sessionId;
+    for (const snapshot of discovered) {
+      if (codexChildSubagentRolloutMatchesSession(snapshot, sessionName, state.cwd)) {
+        rememberSnapshot(snapshot);
+      }
+    }
     for (const snapshot of snapshots) {
       if (state.childSubagentRolloutCompletedIds.has(snapshot.agentId)) continue;
       const existingById = this.trackedSubagentThreads.get(snapshot.agentId);
@@ -4087,6 +4692,23 @@ export class CodexSdkProvider implements TransportProvider {
         for (const cb of this.toolCallCallbacks) cb(sessionId, checklistTool);
         return true;
       }
+      if (name && CODEX_NATIVE_COLLAB_FUNCTION_NAMES.has(name)) {
+        const collabCallId = meaningfulString(item.call_id) ?? meaningfulString(item.callId);
+        if (!collabCallId) return true;
+        this.rawNativeCollabCalls.set(collabCallId, { sessionId, name });
+        this.emitTrackedProviderToolCall(sessionId, state, {
+          id: collabCallId,
+          name,
+          status: 'running',
+          detail: {
+            kind: 'nativeCollaboration',
+            summary: name,
+            meta: { callId: collabCallId, durability: CODEX_NATIVE_COLLAB_DURABILITY },
+            raw: item,
+          },
+        });
+        return true;
+      }
       if (!name || !CODEX_RAW_SPAWN_AGENT_FUNCTION_NAMES.has(name)) return false;
       const callId = meaningfulString(item.call_id) ?? meaningfulString(item.callId);
       if (!callId) return true;
@@ -4102,6 +4724,32 @@ export class CodexSdkProvider implements TransportProvider {
     if (item.type !== 'function_call_output') return false;
     const callId = meaningfulString(item.call_id) ?? meaningfulString(item.callId);
     if (!callId) return false;
+    const collab = this.rawNativeCollabCalls.get(callId);
+    if (collab) {
+      this.rawNativeCollabCalls.delete(callId);
+      const collabState = this.sessions.get(collab.sessionId);
+      if (!collabState) return true;
+      const rawOutput = meaningfulString(item.output);
+      // An empty output proves the call was ACCEPTED, not that anything was
+      // delivered. Reporting success here is what let "已分配/已排队" look
+      // confirmed when nothing durable existed.
+      this.emitTrackedProviderToolCall(collab.sessionId, collabState, {
+        id: callId,
+        name: collab.name,
+        status: 'complete',
+        detail: {
+          kind: 'nativeCollaboration',
+          summary: collab.name,
+          meta: {
+            callId,
+            durability: CODEX_NATIVE_COLLAB_DURABILITY,
+            outcome: rawOutput ? 'accepted' : 'accepted_unknown',
+          },
+          raw: item,
+        },
+      });
+      return true;
+    }
     const call = this.rawSpawnAgentCalls.get(callId);
     if (!call) return false;
     this.rawSpawnAgentCalls.delete(callId);
@@ -4219,6 +4867,23 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   private async handleNotification(method: string, params: Record<string, any>): Promise<void> {
+    if (method === CODEX_MCP_RPC_METHOD.STATUS_UPDATED) {
+      if (meaningfulString(params.name) !== IMCODES_DELEGATION_MCP_SERVER
+        || !CODEX_MCP_TERMINAL_STARTUP_STATUS.has(meaningfulString(params.status) ?? '')) return;
+      const threadId = meaningfulString(params.threadId);
+      const targets = threadId
+        ? [...this.sessions.entries()].filter(([, state]) => state.threadId === threadId)
+        : [...this.sessions.entries()];
+      for (const [, state] of targets) {
+        // Never reload underneath an in-flight model turn. The startup event
+        // only invalidates this thread's MCP generation; the next explicit
+        // send performs the bounded reload + complete catalog hydration before
+        // dispatching any new model/tool work.
+        state.imcodesMcpRecoveryRequired = true;
+      }
+      return;
+    }
+
     if (method === 'thread/started') {
       const threadId = params.thread?.id;
       if (!threadId) return;
@@ -4429,6 +5094,12 @@ export class CodexSdkProvider implements TransportProvider {
 
       const item = params.item as Record<string, any> | undefined;
       if (!item) return;
+      if (method === 'item/completed' && isImcodesMcpTransportClosedItem(item)) {
+        // The failed MCP write has unknown outcome. Mark the generation stale,
+        // but neither replay the call nor reload beneath the current turn. A
+        // later explicit send crosses the pre-turn recovery boundary.
+        state.imcodesMcpRecoveryRequired = true;
+      }
       if (closedTurn && item.type !== 'agentMessage') return;
       // NEVER drop a real provider item. If our turn bookkeeping lags the
       // app-server (turn/start's result carried no turn id, or this event's
@@ -4479,6 +5150,28 @@ export class CodexSdkProvider implements TransportProvider {
       const tool = toolFromItem(sessionId, item, method === 'item/started' ? 'started' : 'completed');
       if (tool) {
         this.emitTrackedProviderToolCall(sessionId, state, tool);
+      }
+
+      // Authoritative delegation evidence. Read from the MCP result itself --
+      // exact server + tool + dispatchId + delivery legs -- never from the
+      // assistant's prose. A native collaboration `send_message` shares the
+      // short name but is not this server, so it cannot substantiate a claim.
+      if (method === 'item/completed') {
+        const dispatchFact = readDelegationDispatchFact(
+          item.server,
+          item.tool,
+          item.arguments,
+          item.result?.structuredContent ?? item.result?.content,
+        ) ?? readMachineControlDispatchFact(
+          item.server,
+          item.tool,
+          item.arguments,
+          item.result?.structuredContent ?? item.result?.content,
+          item.id,
+        );
+        if (dispatchFact) {
+          (state.turnDelegationDispatches ??= []).push(dispatchFact);
+        }
       }
 
       if (item.type === 'agentMessage') {
@@ -4573,6 +5266,13 @@ export class CodexSdkProvider implements TransportProvider {
         this.clearActiveItemEvidence(state);
         this.clearPendingSessionSystemTextUpdate(state);
         const error = this.normalizeError(turn.error?.message ?? 'Codex turn failed', turn.error);
+        if (isCodexThreadNeverMaterializedError(error)) {
+          // The turn may already have executed tools, so never replay it here.
+          // Force only the next explicit user/daemon send through bounded
+          // thread rehydration while preserving the terminal tool evidence
+          // already emitted for this unknown-outcome turn.
+          state.loaded = false;
+        }
         if (this.isCodexAuthError(error)) {
           if (
             authRecoveryPayload
@@ -4689,6 +5389,16 @@ export class CodexSdkProvider implements TransportProvider {
     turnId?: string,
     terminalReason: ToolTerminalReason = 'app_server_completed',
   ): Promise<void> {
+    // Snapshot the turn's authorized dispatches BEFORE any cleanup, and consume
+    // ONLY this snapshot below.
+    //
+    // The lease clear further down is the shared terminal seam and empties
+    // state.turnDelegationDispatches. Reading the live field after it would
+    // report every turn as unsubstantiated. Reading the snapshot is also what
+    // makes the ordering safe in the other direction: this completion reports
+    // exactly the dispatches that belonged to ITS turn, and the clear that runs
+    // in between cannot add to or subtract from what is reported here.
+    const turnDelegationDispatches = state.turnDelegationDispatches ?? [];
     this.clearIdleSettleTimer(state);
     this.clearCompactTimers(state);
     state.runningCompact = false;
@@ -4743,6 +5453,11 @@ export class CodexSdkProvider implements TransportProvider {
         ...(usage ? { usage } : {}),
         ...(model ? { model } : {}),
         ...(resumeId ? { resumeId } : {}),
+        // Every completed turn states its delegation authority explicitly.
+        // With no dispatches this is `unsubstantiated` with an empty list, so a
+        // consumer has no data it could render as assigned/queued/recovered --
+        // the absence of authority is represented, not left for prose to imply.
+        [DELEGATION_CLAIM_METADATA_FIELD]: projectDelegationClaim(turnDelegationDispatches),
       },
     };
     for (const cb of this.completeCallbacks) cb(sessionId, completed);
@@ -4769,6 +5484,26 @@ export class CodexSdkProvider implements TransportProvider {
     this.clearRolloutSettlePoll(state);
     this.disarmRolloutAuthorityWatch(state);
     state.activeTurnLease = undefined;
+    // Terminal-seam clear: explicit defense-in-depth, and prompt release.
+    //
+    // Authorized dispatches are evidence about ONE turn. Every terminal path --
+    // completion, cancel, watchdog, disconnect, turn/start and emit failures --
+    // funnels through here, so residue from a cancelled or failed turn is
+    // dropped at the moment that turn ends rather than lingering in memory until
+    // the next one begins. After cancel/error nothing survives that any public
+    // completion, message metadata or read path could surface.
+    //
+    // KNOWINGLY REDUNDANT TODAY, and recorded as such in the revision gates:
+    // startTurn() already establishes an empty scope unconditionally, so with
+    // both halves present a mutant that removes THIS line changes no observable
+    // behaviour and survives. It is kept deliberately, not for a mutant score.
+    // Should a future completion path ever emit without a preceding startTurn,
+    // this clear is what keeps that path fail-closed instead of letting a stale
+    // dispatch substantiate a claim.
+    //
+    // The completion path snapshots the facts before calling this and reports
+    // only that snapshot, so clearing here never blanks a legitimate turn.
+    state.turnDelegationDispatches = [];
   }
 
   private refreshActiveTurnLease(
@@ -5551,6 +6286,11 @@ export class CodexSdkProvider implements TransportProvider {
     for (const itemId of state.activeCompactionItemIds) state.activeItemIds.delete(itemId);
     state.activeCompactionItemIds.clear();
 
+    // Native compaction may replace the stored prefix with a summary. Force
+    // the next turn through thread/resume on the SAME durable thread so its
+    // cacheable baseInstructions (including merged identity) are reasserted.
+    this.refreshSessionSystemText(sessionId);
+
     // Auto-compaction is an item INSIDE the current model turn, not a transport
     // turn completion. Keep all parent turn identity/text/tool ownership intact
     // and re-arm terminal authority now that the inline compact phase is over.
@@ -5584,6 +6324,7 @@ export class CodexSdkProvider implements TransportProvider {
     this.clearPendingSessionSystemTextUpdate(state);
     state.currentMessageId = null;
     state.currentText = '';
+    this.refreshSessionSystemText(sessionId);
     const completed: AgentMessage = {
       id: turnId ? `${turnId}:context-compaction` : `${sessionId}:context-compaction:${Date.now()}`,
       sessionId,
@@ -6020,7 +6761,7 @@ export class CodexSdkProvider implements TransportProvider {
     if (isCodexAuthFailureMessage(message)) {
       return this.makeError(PROVIDER_ERROR_CODES.AUTH_FAILED, message, false, details ?? err);
     }
-    if (isCodexThreadHistoryUnreadableError(err) || (/resume|thread/i.test(message) && /not found|invalid|unknown/i.test(message))) {
+    if (isCodexThreadHistoryUnreadableError(err) || isCodexThreadNeverMaterializedError(err) || (/resume|thread/i.test(message) && /not found|invalid|unknown/i.test(message))) {
       return this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, message, true, err);
     }
     return this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, message, false, err);

@@ -42,7 +42,9 @@
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { Readable, Writable } from 'node:stream';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import {
   ClientSideConnection,
   ndJsonStream,
@@ -68,6 +70,11 @@ import {
 } from '@agentclientprotocol/sdk';
 import { killProcessTree } from '../../util/kill-process-tree.js';
 import { filterAcpJsonLines } from './acp-json-filter.js';
+import { acpPlanEntriesToInput } from './acp-plan.js';
+import {
+  SESSION_CONTROL_METADATA_COMMAND_FIELD,
+  isSessionControlCommandText,
+} from '../../../shared/session-control-commands.js';
 import type {
   TransportProvider,
   ProviderCapabilities,
@@ -80,6 +87,7 @@ import type {
   ToolCallEvent,
   ApprovalRequest,
   ProviderCompactCapability,
+  ProviderDelegationNotification,
   RemoteSessionInfo,
   RemoteSessionListOptions,
 } from '../transport-provider.js';
@@ -90,6 +98,10 @@ import {
   SESSION_OWNERSHIP,
   PROVIDER_ERROR_CODES,
 } from '../transport-provider.js';
+import {
+  AGENT_DELEGATION_NOTIFICATION_RESULTS,
+  type AgentDelegationNotificationResult,
+} from '../../../shared/agent-delegation.js';
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
@@ -112,10 +124,26 @@ import {
   type SdkSubagentProvider,
   type SdkSubagentProviderKind,
 } from '../../../shared/sdk-subagent-status.js';
+import { NATIVE_AGENT_ADMISSION_MODES } from '../../../shared/native-collaboration-policy.js';
 
 const KIMI_BIN = 'kimi';
 /** Kimi ACP currently advertises one mode named `default`. */
 const KIMI_DEFAULT_MODE = 'default';
+
+function stableAcpMessageId(notificationId: string): string {
+  const hex = createHash('sha256')
+    .update('imcodes-acp-active-prompt\0')
+    .update(notificationId)
+    .digest('hex')
+    .slice(0, 32)
+    .split('');
+  // Canonical deterministic UUIDv5 shape. The input remains private to the
+  // local daemon; only this non-secret correlation id crosses ACP.
+  hex[12] = '5';
+  hex[16] = ((Number.parseInt(hex[16] ?? '0', 16) & 0x3) | 0x8).toString(16);
+  const compact = hex.join('');
+  return `${compact.slice(0, 8)}-${compact.slice(8, 12)}-${compact.slice(12, 16)}-${compact.slice(16, 20)}-${compact.slice(20)}`;
+}
 
 export interface AcpCliProviderProfile {
   id: string;
@@ -128,6 +156,19 @@ export interface AcpCliProviderProfile {
   loadFailure: 'fresh' | 'error';
   probeOnConnect?: boolean;
   privacySafeErrors?: boolean;
+  /** How listModels discovers a catalogue before the first real session.
+   *  Most ACP agents can safely create and close a probe session. Agents such
+   *  as Hermes persist session/new but do not implement session/close, so
+   *  their catalogue must come only from real session metadata. */
+  modelDiscovery?: 'session-probe' | 'session-metadata-only';
+  /** Forward daemon-local attachments as ACP resource links. This is opt-in
+   *  because an ACP agent must explicitly support reading local file URIs. */
+  resourceLinkAttachments?: boolean;
+  /** Prefix applied to verified active-turn ACP prompts. Some agents expose a
+   *  provider-native steering command rather than treating a second prompt as
+   *  an implicit queue entry. Omitted for agents whose busy-prompt contract
+   *  accepts the text directly. */
+  activePromptPrefix?: `/${string} `;
   runtimeSubagent?: {
     provider: SdkSubagentProvider;
     providerKind: SdkSubagentProviderKind;
@@ -171,6 +212,13 @@ interface KimiSdkSessionState {
   modeApplied: boolean;
   /** Set while a `prompt` RPC is in flight. */
   promptInFlight: boolean;
+  /** Generation whose original prompt RPC has actually been submitted. */
+  promptSubmittedGeneration: number | null;
+  /** Stable-id admission authority for verified busy prompts. Pending entries
+   *  survive the original turn settling so a timed-out caller cannot replay a
+   *  write that is still capable of reaching ACP. Delivered entries are kept
+   *  as bounded tombstones for durable retry idempotency. */
+  activePromptAdmissions: Map<string, ActivePromptAdmission>;
   /** Monotonic local turn generation used to suppress duplicate terminals. */
   turnGeneration: number;
   /** Most recent generation that emitted a terminal completion/error. */
@@ -197,6 +245,13 @@ interface KimiSdkSessionState {
    *  daemon's transport-relay. */
   lastTurnUsage?: Record<string, unknown>;
 }
+
+interface ActivePromptAdmission {
+  promise: Promise<AgentDelegationNotificationResult>;
+  status: 'pending' | 'delivered';
+}
+
+const MAX_ACTIVE_PROMPT_ADMISSION_TOMBSTONES = 512;
 
 interface MergedToolCall {
   toolCallId: string;
@@ -256,12 +311,16 @@ export class KimiSdkProvider implements TransportProvider {
       approval: profile.approval === 'bridge',
       sessionRestore: true,
       multiTurn: true,
-      attachments: false,
+      attachments: profile.resourceLinkAttachments === true,
       reasoningEffort: false,
       contextSupport: 'degraded-message-side-context-mapping',
       backgroundSubagentWake: profile.runtimeSubagent
         ? BACKGROUND_SUBAGENT_WAKE_MODES.RUNTIME
         : BACKGROUND_SUBAGENT_WAKE_MODES.UNSUPPORTED,
+      // ACP exposes no per-call veto and no per-session disable for the
+      // agent's native sub-agents (Kimi, Hermes, Grok, CodeBuddy): these
+      // runtimes cannot send or receive supervised work.
+      nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.UNENFORCEABLE,
       compact: profile.compact,
     };
   }
@@ -333,7 +392,7 @@ export class KimiSdkProvider implements TransportProvider {
 
   async disconnect(): Promise<void> {
     this.cancelPendingApprovals();
-    this.teardownChild();
+    await this.teardownChild();
     this.acpToRoute.clear();
     this.acpRouteOrder.clear();
     this.sessions.clear();
@@ -360,6 +419,8 @@ export class KimiSdkProvider implements TransportProvider {
       loaded: false,
       modeApplied: false,
       promptInFlight: false,
+      promptSubmittedGeneration: null,
+      activePromptAdmissions: existing?.activePromptAdmissions ?? new Map(),
       turnGeneration: existing?.turnGeneration ?? 0,
       settledGeneration: existing?.settledGeneration ?? 0,
       replaying: false,
@@ -523,10 +584,20 @@ export class KimiSdkProvider implements TransportProvider {
           sessionId: state.acpSessionId,
           modelId: agentId,
         }).catch((err: unknown) => {
-          logger.debug({ provider: this.id, err, agentId }, 'unstable_setSessionModel failed (non-fatal)');
+          logger.debug({
+            provider: this.id,
+            agentId,
+            ...this.errorLogFields(err, 'err'),
+          }, 'unstable_setSessionModel failed (non-fatal)');
         });
       }
     }
+  }
+
+  refreshSessionSystemText(sessionId: string): void {
+    const state = this.sessions.get(sessionId);
+    if (!state) return;
+    state.sessionSystemTextInjected = undefined;
   }
 
   async send(
@@ -557,13 +628,12 @@ export class KimiSdkProvider implements TransportProvider {
     state.lastStatusSignature = null;
 
     const payload = normalizeProviderPayload(payloadOrMessage, attachments, extraSystemPrompt);
-    // TransportProvider.send is a send-start contract: the runtime owns the
-    // in-flight turn state and waits for onDelta/onComplete/onError callbacks.
-    // ACP `prompt()` is long-lived and resolves only when the turn finishes, so
-    // awaiting it here would make generic send-start watchdogs look like total
-    // turn timeouts for normal long-running Kimi work.
+    // TransportProvider.send is a send-start/admission contract: resolve only
+    // after the original ACP prompt RPC has actually been invoked, but never
+    // wait for that long-lived RPC to finish the whole model turn.  The runtime
+    // uses this boundary to guarantee B/C cannot overtake A.
     const generation = ++state.turnGeneration;
-    void this.startTurn(sessionId, state, payload, generation);
+    await this.startTurn(sessionId, state, payload, generation);
   }
 
   async cancel(sessionId: string): Promise<void> {
@@ -575,19 +645,158 @@ export class KimiSdkProvider implements TransportProvider {
     // then resolve with stopReason='cancelled' (or occasionally the agent
     // settles with the partial turn — we handle both in startTurn).
     await this.connection.cancel({ sessionId: state.acpSessionId }).catch((err: unknown) => {
-      logger.debug({ provider: this.id, sessionId, err }, 'ACP cancel notification failed (non-fatal)');
+      logger.debug({
+        provider: this.id,
+        sessionId,
+        ...this.errorLogFields(err, 'err'),
+      }, 'ACP cancel notification failed (non-fatal)');
     });
+  }
+
+  /**
+   * Queue text through an ACP agent that explicitly supports receiving another
+   * `session/prompt` while its current run is active. Provider profiles may
+   * either accept the text directly through a verified busy-session queue or
+   * translate it to a native steering command. This never calls
+   * `session/cancel` and never starts a competing IM.codes runtime turn.
+   *
+   * Keep this protected and opt-in. Plain Kimi ACP has not advertised the same
+   * contract, so only a provider with verified busy-prompt semantics may expose
+   * it as `activeDelegationNotification: native`.
+   */
+  protected async queueActiveAcpPrompt(
+    sessionId: string,
+    notification: ProviderDelegationNotification,
+  ): Promise<AgentDelegationNotificationResult> {
+    const state = this.sessions.get(sessionId);
+    if (!state) return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+    const existing = state.activePromptAdmissions.get(notification.notificationId);
+    if (existing) return existing.promise;
+    if (!state.promptInFlight
+      || state.promptSubmittedGeneration !== state.turnGeneration
+      || state.cancelled
+      || !state.loaded
+      || !state.acpSessionId
+      || !this.connection) {
+      return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+    }
+
+    const admission = this.deliverActiveAcpPrompt(sessionId, state, notification);
+    const tracked: ActivePromptAdmission = { promise: admission, status: 'pending' };
+    state.activePromptAdmissions.set(notification.notificationId, tracked);
+    try {
+      const result = await admission;
+      if (result === AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED) {
+        tracked.status = 'delivered';
+        this.pruneActivePromptAdmissionTombstones(state);
+      } else if (state.activePromptAdmissions.get(notification.notificationId) === tracked) {
+        state.activePromptAdmissions.delete(notification.notificationId);
+      }
+      return result;
+    } catch (error) {
+      if (state.activePromptAdmissions.get(notification.notificationId) === tracked) {
+        state.activePromptAdmissions.delete(notification.notificationId);
+      }
+      logger.debug({
+        provider: this.id,
+        sessionId,
+        ...this.errorLogFields(error),
+      }, 'ACP active-turn prompt admission failed');
+      return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+    }
+  }
+
+  private pruneActivePromptAdmissionTombstones(state: KimiSdkSessionState): void {
+    if (state.activePromptAdmissions.size <= MAX_ACTIVE_PROMPT_ADMISSION_TOMBSTONES) return;
+    for (const [notificationId, admission] of state.activePromptAdmissions) {
+      if (state.activePromptAdmissions.size <= MAX_ACTIVE_PROMPT_ADMISSION_TOMBSTONES) break;
+      // Never evict an unresolved write: that would allow the same durable
+      // notification to start a second provider admission after a timeout.
+      if (admission.status === 'delivered') state.activePromptAdmissions.delete(notificationId);
+    }
+  }
+
+  private async deliverActiveAcpPrompt(
+    sessionId: string,
+    state: KimiSdkSessionState,
+    notification: ProviderDelegationNotification,
+  ): Promise<AgentDelegationNotificationResult> {
+    const connection = this.connection;
+    if (!connection) return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+    try {
+      // ACP's response is the queued prompt's *turn completion*, not a short
+      // admission ACK.  Calling prompt() submits the request to the live ACP
+      // connection; observe its eventual settlement in the background so the
+      // runtime can enqueue B then C immediately instead of timing out and
+      // replaying already-admitted text through the idle FIFO.
+      const activePromptText = this.profile.activePromptPrefix
+        ? `${this.profile.activePromptPrefix}${notification.text}`
+        : notification.text;
+      const queuedPrompt = connection.prompt({
+        sessionId: state.acpSessionId,
+        prompt: [{ type: 'text', text: activePromptText }],
+        // ACP's canonical unstable messageId is the only provider-visible
+        // correlation key available for a queued prompt. Derive a valid stable
+        // UUID from IM.codes' durable notification id; the generation-scoped
+        // admission map handles local retries, while capable ACP agents may use
+        // this id to correlate a replay across their own history.
+        messageId: stableAcpMessageId(notification.notificationId),
+      });
+      void queuedPrompt.then((result) => {
+        if (result.stopReason === 'cancelled') {
+          logger.debug({ provider: this.id, sessionId }, 'ACP active-turn queued prompt later settled as cancelled');
+        }
+      }).catch((error: unknown) => {
+        logger.warn({
+          provider: this.id,
+          sessionId,
+          ...this.errorLogFields(error),
+        }, 'ACP active-turn queued prompt failed after submission');
+      });
+      // ClientSideConnection.prompt() resolves at the end of the queued turn,
+      // while sendRequest() writes through an internal serialized writeQueue.
+      // Wait for that exact write to flush, not for the model turn, before
+      // committing the durable IM.codes row. If the writable failed, ACP closes
+      // the connection and the abort signal is authoritative.
+      return await this.waitForAcpWrite(connection, true)
+        ? AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED
+        : AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+    } catch (error) {
+      logger.debug({
+        provider: this.id,
+        sessionId,
+        ...this.errorLogFields(error),
+      }, 'ACP active-turn prompt write failed');
+      return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+    }
+  }
+
+  private async waitForAcpWrite(connection: ClientSideConnection, requireTracker: boolean): Promise<boolean> {
+    const tracker = (connection as unknown as {
+      connection?: {
+        writeQueue?: Promise<void>;
+        abortController?: { signal?: AbortSignal };
+      };
+    }).connection;
+    if (!tracker?.writeQueue) return !requireTracker;
+    await tracker.writeQueue;
+    return tracker.abortController?.signal?.aborted !== true;
   }
 
   // ── ACP client-side glue ────────────────────────────────────────────────
 
   private async startAcpServer(config: ProviderConfig): Promise<void> {
-    this.teardownChild();
+    await this.teardownChild();
 
     const binaryPath = this.resolveBinaryPath(config);
     const resolved = resolveExecutableForSpawn(binaryPath);
     const args = [...resolved.prependArgs, ...this.profile.args];
     const child = spawn(resolved.executable, args, {
+      // Own process group and session on POSIX. A reparented descendant keeps
+      // its PGID but loses its PPID, so after the agent parent dies this is the
+      // only ownership token teardown still has. Without it the eight vitest
+      // workers of the incident were unreachable on PPID=1.
+      detached: process.platform !== 'win32',
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, ...((config.env as Record<string, string> | undefined) ?? {}) },
       windowsHide: true,
@@ -700,7 +909,7 @@ export class KimiSdkProvider implements TransportProvider {
     try {
       await Promise.race([this.initPromise, spawnFailure, initTimeout]);
     } catch (error) {
-      this.teardownChild();
+      await this.teardownChild();
       if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
         throw this.makeError(
           PROVIDER_ERROR_CODES.CONFIG_ERROR,
@@ -776,6 +985,7 @@ export class KimiSdkProvider implements TransportProvider {
     generation: number,
   ): Promise<void> {
     state.promptInFlight = true;
+    state.promptSubmittedGeneration = null;
     try {
       await this.ensureSessionReady(sessionId, state);
       // Start the turn's delta buffer clean. (During loadSession the replay
@@ -786,26 +996,64 @@ export class KimiSdkProvider implements TransportProvider {
       state.currentMessageId = null;
       const sessionSystemText = getProviderSystemTextParts(payload).sessionSystemText;
       const includeSessionSystemText = !!sessionSystemText && state.sessionSystemTextInjected !== sessionSystemText;
+      const compactControl = isSessionControlCommandText(payload.userMessage, 'compact');
       const promptBlocks = this.buildPromptContent(payload, includeSessionSystemText);
 
-      // Long-lived call — agent streams sessionUpdate notifications until this
-      // resolves with { stopReason }.
-      const result: PromptResponse = await this.connection!.prompt({
+      // Long-lived call — invoking it submits A; its Promise resolves only
+      // when the turn ends.  Publish the generation-scoped admission boundary
+      // before returning from send(), then settle asynchronously.
+      const connection = this.connection!;
+      const turn = connection.prompt({
         sessionId: state.acpSessionId!,
         prompt: promptBlocks,
+        messageId: randomUUID(),
       });
-      this.settleTurn(sessionId, state, generation, result.stopReason, includeSessionSystemText ? sessionSystemText : undefined);
+      void turn.then((result: PromptResponse) => {
+        this.settleTurn(
+          sessionId,
+          state,
+          generation,
+          result.stopReason,
+          includeSessionSystemText ? sessionSystemText : undefined,
+          compactControl,
+        );
+      }).catch((err: unknown) => {
+        this.failTurn(sessionId, state, generation, err);
+      });
+      if (!await this.waitForAcpWrite(connection, true)) {
+        throw this.makeError(
+          PROVIDER_ERROR_CODES.CONNECTION_LOST,
+          `${this.profile.displayName} ACP prompt write failed`,
+          true,
+        );
+      }
+      if (state.turnGeneration === generation
+        && state.settledGeneration !== generation
+        && state.promptInFlight) {
+        state.promptSubmittedGeneration = generation;
+      }
     } catch (err) {
-      if (state.settledGeneration === generation) return;
-      state.settledGeneration = generation;
-      state.promptInFlight = false;
-      state.cancelled = false;
-      state.toolCalls.clear();
-      state.emittedToolSignatures.clear();
-      this.cancelPendingApprovals(sessionId);
-      this.clearStatus(sessionId, state);
-      this.emitError(sessionId, this.normalizeError(err));
+      this.failTurn(sessionId, state, generation, err);
+      throw this.normalizeError(err);
     }
+  }
+
+  private failTurn(
+    sessionId: string,
+    state: KimiSdkSessionState,
+    generation: number,
+    error: unknown,
+  ): void {
+    if (state.settledGeneration === generation) return;
+    state.settledGeneration = generation;
+    state.promptInFlight = false;
+    state.promptSubmittedGeneration = null;
+    state.cancelled = false;
+    state.toolCalls.clear();
+    state.emittedToolSignatures.clear();
+    this.cancelPendingApprovals(sessionId);
+    this.clearStatus(sessionId, state);
+    this.emitError(sessionId, this.normalizeError(error));
   }
 
   /** Create the session on the agent if it doesn't exist yet, otherwise
@@ -849,7 +1097,12 @@ export class KimiSdkProvider implements TransportProvider {
         } catch (err) {
           if (this.profile.loadFailure === 'error') throw err;
           logger.info(
-            { provider: this.id, sessionId, acpSessionId: state.acpSessionId, err },
+            {
+              provider: this.id,
+              sessionId,
+              acpSessionId: state.acpSessionId,
+              ...this.errorLogFields(err, 'err'),
+            },
             `${this.profile.displayName} ACP loadSession failed; falling back to newSession`,
           );
           this.releaseAcpRoute(state.acpSessionId, state.routeId);
@@ -869,7 +1122,11 @@ export class KimiSdkProvider implements TransportProvider {
           modeId: this.profile.defaultMode,
         }).catch((err: unknown) => {
           // Not fatal — Kimi's server already defaults to this mode.
-          logger.debug({ provider: this.id, sessionId, err }, 'setSessionMode(default) failed (non-fatal)');
+          logger.debug({
+            provider: this.id,
+            sessionId,
+            ...this.errorLogFields(err, 'err'),
+          }, 'setSessionMode(default) failed (non-fatal)');
         });
       }
       state.modeApplied = true;
@@ -884,7 +1141,11 @@ export class KimiSdkProvider implements TransportProvider {
           sessionId: state.acpSessionId,
           modelId: state.model,
         }).catch((err: unknown) => {
-          logger.debug({ provider: this.id, sessionId, err }, 'unstable_setSessionModel pre-turn failed (non-fatal)');
+          logger.debug({
+            provider: this.id,
+            sessionId,
+            ...this.errorLogFields(err, 'err'),
+          }, 'unstable_setSessionModel pre-turn failed (non-fatal)');
         });
       }
     }
@@ -932,12 +1193,19 @@ export class KimiSdkProvider implements TransportProvider {
   }
 
   private cacheModelsFromSessionResponse(result: NewSessionResponse | import('@agentclientprotocol/sdk').LoadSessionResponse | undefined): void {
-    if (this.cachedModels) return; // already cached
+    if (this.cachedModels && this.profile.modelDiscovery !== 'session-metadata-only') return;
     if (!result) return;
     const models = (result as NewSessionResponse).models;
     if (!models) return;
     const available = models.availableModels;
-    if (!Array.isArray(available) || available.length === 0) return;
+    if (!Array.isArray(available)) return;
+    if (available.length === 0) {
+      if (this.profile.modelDiscovery === 'session-metadata-only') {
+        this.cachedModels = [];
+        this.cachedDefaultModel = null;
+      }
+      return;
+    }
     this.cachedModels = available.map((m: Record<string, unknown>) => ({
       id: String(m.modelId ?? m.id ?? ''),
       ...(m.name ? { name: String(m.name) } : {}),
@@ -959,11 +1227,11 @@ export class KimiSdkProvider implements TransportProvider {
   }
 
   async listModels(force?: boolean): Promise<ProviderModelList> {
-    if (force) {
+    if (force && this.profile.modelDiscovery !== 'session-metadata-only') {
       this.cachedModels = null;
       this.cachedDefaultModel = null;
     }
-    if (!this.cachedModels) {
+    if (!this.cachedModels && this.profile.modelDiscovery !== 'session-metadata-only') {
       if (this.connection) {
         await this.initPromise;
         try {
@@ -978,7 +1246,10 @@ export class KimiSdkProvider implements TransportProvider {
             void closer.call(this.connection, { sessionId: result.sessionId }).catch(() => {});
           }
         } catch (err) {
-          logger.debug({ provider: this.id, err }, `${this.profile.displayName} model probe failed (non-fatal)`);
+          logger.debug({
+            provider: this.id,
+            ...this.errorLogFields(err, 'err'),
+          }, `${this.profile.displayName} model probe failed (non-fatal)`);
         }
       }
     }
@@ -1005,7 +1276,27 @@ export class KimiSdkProvider implements TransportProvider {
   private buildPromptContent(payload: ProviderContextPayload, includeSessionSystemText: boolean): ContentBlock[] {
     // ACP has no separate system-prompt slot. Inject stable IM.codes context
     // once per ACP history, then only per-turn authored context thereafter.
-    return [{ type: 'text', text: composeMessageSideProviderPrompt(payload, { includeSessionSystemText }) }];
+    const content: ContentBlock[] = [{
+      type: 'text',
+      text: composeMessageSideProviderPrompt(payload, { includeSessionSystemText }),
+    }];
+    if (!this.profile.resourceLinkAttachments) return content;
+    for (const attachment of payload.attachments ?? []) {
+      const daemonPath = attachment.daemonPath.trim();
+      if (!path.isAbsolute(daemonPath)) continue;
+      const originalName = attachment.originalName?.trim();
+      content.push({
+        type: 'resource_link',
+        name: originalName || path.basename(daemonPath),
+        uri: pathToFileURL(daemonPath).href,
+        ...(originalName ? { title: originalName } : {}),
+        ...(attachment.mime?.trim() ? { mimeType: attachment.mime.trim() } : {}),
+        ...(typeof attachment.size === 'number' && Number.isFinite(attachment.size) && attachment.size >= 0
+          ? { size: attachment.size }
+          : {}),
+      });
+    }
+    return content;
   }
 
   private settleTurn(
@@ -1014,10 +1305,12 @@ export class KimiSdkProvider implements TransportProvider {
     generation: number,
     stopReason: StopReason,
     sessionSystemTextToCommit?: string,
+    compactControl = false,
   ): void {
     if (state.settledGeneration === generation) return;
     state.settledGeneration = generation;
     state.promptInFlight = false;
+    state.promptSubmittedGeneration = null;
     this.clearStatus(sessionId, state);
     const text = state.currentText;
     const messageId = state.currentMessageId ?? `${sessionId}:${randomUUID()}`;
@@ -1073,6 +1366,7 @@ export class KimiSdkProvider implements TransportProvider {
     }
 
     // stopReason === 'end_turn' (happy path).
+    if (compactControl) state.sessionSystemTextInjected = undefined;
     const msg: AgentMessage = {
       id: messageId,
       sessionId,
@@ -1082,6 +1376,7 @@ export class KimiSdkProvider implements TransportProvider {
       timestamp: Date.now(),
       status: 'complete',
       metadata: {
+        ...(compactControl ? { [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact' } : {}),
         ...(state.model ? { model: state.model } : {}),
         ...(state.acpSessionId ? { resumeId: state.acpSessionId } : {}),
         ...(turnUsage ? { usage: turnUsage } : {}),
@@ -1166,9 +1461,11 @@ export class KimiSdkProvider implements TransportProvider {
         });
         return;
       }
+      case 'plan':
+        this.handlePlan(routeId, state, update);
+        return;
       case 'available_commands_update':
       case 'user_message_chunk':
-      case 'plan':
       case 'config_option_update':
       case 'session_info_update':
         // Ignore for now. `user_message_chunk` arrives during history replay
@@ -1287,6 +1584,26 @@ export class KimiSdkProvider implements TransportProvider {
     this.emitMergedToolCall(sessionId, state, merged);
   }
 
+  private handlePlan(
+    sessionId: string,
+    state: KimiSdkSessionState,
+    update: SessionUpdate,
+  ): void {
+    const input = acpPlanEntriesToInput((update as unknown as { entries?: unknown }).entries);
+    if (!input) return;
+    this.clearStatus(sessionId, state);
+    const plan: MergedToolCall = {
+      toolCallId: `${this.id}-plan:${sessionId}`,
+      title: 'plan',
+      kind: 'plan',
+      status: 'in_progress',
+      content: [],
+      rawInput: input,
+    };
+    state.toolCalls.set(plan.toolCallId, plan);
+    this.emitMergedToolCall(sessionId, state, plan);
+  }
+
   private emitMergedToolCall(
     sessionId: string,
     state: KimiSdkSessionState,
@@ -1322,13 +1639,15 @@ export class KimiSdkProvider implements TransportProvider {
 
   // ── Helpers ─────────────────────────────────────────────────────────────
 
-  private teardownChild(): void {
+  // Async on purpose: teardown must be awaitable, or shutdown resolves while
+  // the SIGTERM->SIGKILL window is still open and the SIGKILL never lands.
+  private async teardownChild(): Promise<void> {
     // Closing the ACP connection is implicit when we close stdin. The SDK's
     // internal readers finish when stdout ends. tree-kill the CLI so its
     // node wrapper doesn't leave grandchildren behind.
     if (this.child && !this.child.killed) {
       try { this.child.stdin.end(); } catch { /* noop */ }
-      void killProcessTree(this.child);
+      await killProcessTree(this.child, { ownsProcessGroup: true });
     }
     this.child = null;
     this.connection = null;
@@ -1366,6 +1685,19 @@ export class KimiSdkProvider implements TransportProvider {
 
   private makeError(code: string, message: string, recoverable: boolean, details?: unknown): ProviderError {
     return { code, message, recoverable, ...(details !== undefined ? { details } : {}) };
+  }
+
+  /**
+   * Build the only error-bearing fields permitted in ACP logs. Providers that
+   * opt into privacySafeErrors (Hermes, CodeBuddy, Grok) never persist the
+   * provider's message, stack, paths, environment material, or enumerable
+   * custom fields. Other profiles keep their existing raw diagnostic field.
+   */
+  private errorLogFields(error: unknown, rawField: 'err' | 'error' = 'error'): Record<string, unknown> {
+    if (this.profile.privacySafeErrors) {
+      return { errorCode: getPrivacySafeErrorCode(error) };
+    }
+    return { [rawField]: error };
   }
 
   private normalizeError(err: unknown): ProviderError {
@@ -1462,7 +1794,7 @@ export class KimiSdkProvider implements TransportProvider {
       this.pendingApprovals.set(requestId, { routeId, options: params.options, resolve, timer });
       const request: ApprovalRequest = {
         id: requestId,
-        description: params.toolCall?.title ?? 'Grok requested permission to use a tool',
+        description: params.toolCall?.title ?? `${this.profile.displayName} requested permission to use a tool`,
         ...(params.toolCall?.title ? { tool: params.toolCall.title } : {}),
         provider: this.id,
         ...(params.toolCall?.toolCallId ? { providerToolUseId: params.toolCall.toolCallId } : {}),
@@ -1486,6 +1818,8 @@ export class KimiSdkProvider implements TransportProvider {
     const hadActiveWork = state.promptInFlight || state.replaying || state.toolCalls.size > 0;
     if (hadActiveWork) state.settledGeneration = state.turnGeneration;
     state.promptInFlight = false;
+    state.promptSubmittedGeneration = null;
+    state.activePromptAdmissions.clear();
     state.replaying = false;
     state.cancelled = false;
     state.currentMessageId = null;
@@ -1542,10 +1876,21 @@ function mapToolStatus(status: string): 'running' | 'complete' | 'error' {
   }
 }
 
+const PRIVACY_SAFE_ACP_ERROR_CODES = new Set<string>([
+  ...Object.values(PROVIDER_ERROR_CODES),
+  'ENOENT',
+  'EACCES',
+  'EPIPE',
+  'ETIMEDOUT',
+  'ECONNRESET',
+  'ECONNREFUSED',
+]);
+
 function getPrivacySafeErrorCode(error: unknown): string {
   if (error && typeof error === 'object' && 'code' in error) {
     const code = (error as { code?: unknown }).code;
-    if (typeof code === 'string' || typeof code === 'number') return String(code).slice(0, 64);
+    if (typeof code === 'number' && Number.isFinite(code)) return String(Math.trunc(code));
+    if (typeof code === 'string' && PRIVACY_SAFE_ACP_ERROR_CODES.has(code)) return code;
   }
   return error instanceof RequestError ? 'acp_request_error' : 'unknown';
 }

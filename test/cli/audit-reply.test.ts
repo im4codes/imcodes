@@ -1,8 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { runAuditReplyCommand, type AuditReplyCommandDeps } from '../../src/cli/audit-reply.js';
 
-const CAPABILITY = 'A'.repeat(32);
-
 function deps(patch: Partial<AuditReplyCommandDeps> = {}): AuditReplyCommandDeps {
   return {
     detectSender: vi.fn().mockResolvedValue('deck_sub_a'),
@@ -16,8 +14,11 @@ function deps(patch: Partial<AuditReplyCommandDeps> = {}): AuditReplyCommandDeps
 }
 
 const options = {
+  taskId: 'supervision_task_1',
+  assignmentId: 'supervision_assignment_1',
   attemptId: 'attempt-1',
-  capability: CAPABILITY,
+  revision: 'revision-1',
+  receiptKind: 'final',
   verdict: 'PASS',
   findingsFile: 'findings.txt',
   validationsFile: 'validations.json',
@@ -29,9 +30,14 @@ describe('audit-reply CLI boundary', () => {
     await expect(runAuditReplyCommand(options, d)).resolves.toBeUndefined();
     expect(d.post).toHaveBeenCalledWith(43210, expect.objectContaining({
       version: 'peer_audit_reply_v1',
+      taskId: 'supervision_task_1',
+      assignmentId: 'supervision_assignment_1',
       attemptId: 'attempt-1',
+      revision: 'revision-1',
+      receiptKind: 'final',
       verdict: 'PASS',
     }), 'deck_sub_a');
+    expect(vi.mocked(d.post).mock.calls[0]?.[1]).not.toHaveProperty('replyCapability');
   });
 
   it('fails explicitly when daemon ingress is unavailable and has no fallback dependency', async () => {
@@ -49,10 +55,10 @@ describe('audit-reply CLI boundary', () => {
     }))).rejects.toThrow('insufficient_validation_evidence');
   });
 
-  it('redacts the one-time capability from daemon and network errors', async () => {
-    const rejected = deps({ post: vi.fn().mockResolvedValue({ ok: false, error: 'invalid_capability' }) });
-    await expect(runAuditReplyCommand(options, rejected)).rejects.not.toThrow(CAPABILITY);
+  it('surfaces structured daemon and network errors without a token fallback', async () => {
+    const rejected = deps({ post: vi.fn().mockResolvedValue({ ok: false, error: 'attempt_mismatch' }) });
+    await expect(runAuditReplyCommand(options, rejected)).rejects.toThrow('attempt_mismatch');
     const offline = deps({ post: vi.fn().mockRejectedValue(new Error('peer-audit daemon ingress unavailable')) });
-    await expect(runAuditReplyCommand(options, offline)).rejects.not.toThrow(CAPABILITY);
+    await expect(runAuditReplyCommand(options, offline)).rejects.toThrow('daemon ingress unavailable');
   });
 });

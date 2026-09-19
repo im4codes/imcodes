@@ -4,7 +4,7 @@
  * AtPicker "machine" category (tasks 8.4 + 10.13). Verifies the machine category
  * appears in the chooser, entering it lists the account's controllable machines
  * with online/offline state. Connectivity is informational: either row inserts
- * its annotated `^^(refName)-(displayName)` reference.
+ * its annotated `^^(nodeId)-(displayName)` reference.
  */
 import { render, cleanup, fireEvent, waitFor } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -23,8 +23,8 @@ vi.mock('react-i18next', () => ({
 }));
 
 const machineList: MachineListItem[] = [
-  { serverId: 'srv-on', refName: 'winbox-a1', displayName: 'Win Box', os: 'windows', online: true, execEnabled: true },
-  { serverId: 'srv-off', refName: 'macmini-b2', displayName: 'Mac Mini', os: 'darwin', online: false, execEnabled: true },
+  { serverId: 'srv-on', nodeId: '1000000001', refName: 'winbox-a1', displayName: 'Win Box', os: 'windows', online: true, execEnabled: true },
+  { serverId: 'srv-off', nodeId: '1000000002', refName: 'macmini-b2', displayName: 'Mac Mini', os: 'darwin', online: false, execEnabled: true },
 ];
 
 vi.mock('../src/hooks/useMachines.js', async (importOriginal) => {
@@ -106,7 +106,7 @@ describe('AtPicker — machine category (10.13)', () => {
     openMachineCategory(container);
     const span = await waitFor(() => nameSpan(container, 'Win Box'));
     fireEvent.click(span.parentElement as HTMLElement);
-    expect(onSelectMachine).toHaveBeenCalledWith('winbox-a1', 'Win Box');
+    expect(onSelectMachine).toHaveBeenCalledWith('1000000001', 'Win Box');
   });
 
   it('passes the stable ref and display note when an ONLINE machine is chosen by keyboard', async () => {
@@ -115,7 +115,7 @@ describe('AtPicker — machine category (10.13)', () => {
     openMachineCategory(container);
     await waitFor(() => expect(container.textContent).toContain('Win Box'));
     fireEvent.keyDown(document, { key: 'Enter' });
-    expect(onSelectMachine).toHaveBeenCalledWith('winbox-a1', 'Win Box');
+    expect(onSelectMachine).toHaveBeenCalledWith('1000000001', 'Win Box');
   });
 
   it('selects an OFFLINE machine on click while preserving its offline status', async () => {
@@ -124,7 +124,7 @@ describe('AtPicker — machine category (10.13)', () => {
     openMachineCategory(container);
     const span = await waitFor(() => nameSpan(container, 'Mac Mini'));
     fireEvent.click(span.parentElement as HTMLElement);
-    expect(onSelectMachine).toHaveBeenCalledWith('macmini-b2', 'Mac Mini');
+    expect(onSelectMachine).toHaveBeenCalledWith('1000000002', 'Mac Mini');
   });
 
   it('includes OFFLINE machines in keyboard navigation', async () => {
@@ -134,6 +134,6 @@ describe('AtPicker — machine category (10.13)', () => {
     await waitFor(() => expect(container.textContent).toContain('Mac Mini'));
     fireEvent.keyDown(document, { key: 'ArrowDown' });
     fireEvent.keyDown(document, { key: 'Enter' });
-    expect(onSelectMachine).toHaveBeenCalledWith('macmini-b2', 'Mac Mini');
+    expect(onSelectMachine).toHaveBeenCalledWith('1000000002', 'Mac Mini');
   });
 });

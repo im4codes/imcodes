@@ -115,6 +115,36 @@ function assistantEvent(eventId: string, text: string, ts: number): TimelineEven
   } as unknown as TimelineEvent;
 }
 
+function memoryContextEvent(
+  eventId: string,
+  summary: string,
+  ts: number,
+  relatedToEventId?: string,
+  sourceSessionName?: string,
+): TimelineEvent {
+  return {
+    eventId,
+    type: 'memory.context',
+    ts,
+    epoch: 1,
+    seq: ts,
+    sessionId: 'deck_demo_brain',
+    source: 'daemon',
+    confidence: 'high',
+    payload: {
+      ...(relatedToEventId ? { relatedToEventId } : {}),
+      reason: 'startup',
+      items: [{
+        id: 'summary-1',
+        projectId: 'codedeck',
+        projectionClass: 'recent_summary',
+        ...(sourceSessionName ? { sourceSessionName } : {}),
+        summary,
+      }],
+    },
+  } as unknown as TimelineEvent;
+}
+
 describe('ChatView — pinned last-sent banner', () => {
   beforeEach(() => {
     instances.length = 0;
@@ -173,6 +203,133 @@ describe('ChatView — pinned last-sent banner', () => {
     const banner = container.querySelector('.chat-pinned-last-sent') as HTMLElement | null;
     expect(banner).not.toBeNull();
     expect(banner!.textContent).toContain('investigate the recall latency regression');
+  });
+
+  it('uses the latest recent memory Problem as the pinned preview when available', async () => {
+    const events = [
+      memoryContextEvent('m-startup', '## Problem\nOlder task should not win\n\n## Done\nfinished', 500),
+      userEvent('u1', 'raw user prompt should not be the preview text', 1000),
+      memoryContextEvent(
+        'm-linked',
+        '## Problem\nFix the mobile session return context preview\n\n## Done\nwired from memory',
+        1500,
+        'u1',
+        'deck_demo_brain',
+      ),
+      assistantEvent('a1', 'Working on it...', 2000),
+    ];
+    const { container } = render(
+      <ChatView events={events} loading={false} sessionId="deck_demo_brain" />,
+    );
+
+    await waitFor(() => expect(instances.length).toBeGreaterThan(0));
+    act(() => {
+      instances[instances.length - 1].fire([{
+        isIntersecting: false,
+        boundingClientRect: { bottom: -10, top: -30, height: 20, width: 100, left: 0, right: 100 } as DOMRectReadOnly,
+        rootBounds: { top: 0, bottom: 500, height: 500, width: 500, left: 0, right: 500 } as DOMRectReadOnly,
+      }]);
+    });
+
+    const banner = container.querySelector('.chat-pinned-last-sent') as HTMLElement | null;
+    expect(banner).not.toBeNull();
+    expect(banner!.querySelector('.chat-pinned-last-sent-label')?.textContent).toBe('Recent summary');
+    expect(banner!.querySelector('.chat-pinned-last-sent-text')?.textContent).toBe('Fix the mobile session return context preview');
+    expect(banner!.textContent).not.toContain('raw user prompt should not be the preview text');
+    expect(banner!.textContent).not.toContain('Older task should not win');
+  });
+
+  it('falls back to Last sent for a linked recent summary produced by a different session', async () => {
+    const events = [
+      userEvent('u-main', 'main window prompt', 1000),
+      memoryContextEvent(
+        'm-sub',
+        '## Problem\nSub-session summary must stay in its own window',
+        1500,
+        'u-main',
+        'deck_demo_sub',
+      ),
+      assistantEvent('a1', 'Working on it...', 2000),
+    ];
+    const { container } = render(
+      <ChatView events={events} loading={false} sessionId="deck_demo_brain" />,
+    );
+
+    await waitFor(() => expect(instances.length).toBeGreaterThan(0));
+    act(() => {
+      instances[instances.length - 1].fire([{
+        isIntersecting: false,
+        boundingClientRect: { bottom: -10, top: -30, height: 20, width: 100, left: 0, right: 100 } as DOMRectReadOnly,
+        rootBounds: { top: 0, bottom: 500, height: 500, width: 500, left: 0, right: 500 } as DOMRectReadOnly,
+      }]);
+    });
+
+    const banner = container.querySelector('.chat-pinned-last-sent') as HTMLElement;
+    expect(banner.querySelector('.chat-pinned-last-sent-label')?.textContent).toBe('Last sent');
+    expect(banner.querySelector('.chat-pinned-last-sent-text')?.textContent).toBe('main window prompt');
+    expect(banner.textContent).not.toContain('Sub-session summary must stay in its own window');
+  });
+
+  it('falls back to Last sent for a legacy linked recent summary without source session metadata', async () => {
+    const events = [
+      userEvent('u-current', 'legacy-safe current prompt', 1000),
+      memoryContextEvent(
+        'm-legacy',
+        '## Problem\nLegacy summary without provenance must not win',
+        1500,
+        'u-current',
+      ),
+      assistantEvent('a1', 'Working on it...', 2000),
+    ];
+    const { container } = render(
+      <ChatView events={events} loading={false} sessionId="deck_demo_brain" />,
+    );
+
+    await waitFor(() => expect(instances.length).toBeGreaterThan(0));
+    act(() => {
+      instances[instances.length - 1].fire([{
+        isIntersecting: false,
+        boundingClientRect: { bottom: -10, top: -30, height: 20, width: 100, left: 0, right: 100 } as DOMRectReadOnly,
+        rootBounds: { top: 0, bottom: 500, height: 500, width: 500, left: 0, right: 500 } as DOMRectReadOnly,
+      }]);
+    });
+
+    const banner = container.querySelector('.chat-pinned-last-sent') as HTMLElement;
+    expect(banner.querySelector('.chat-pinned-last-sent-label')?.textContent).toBe('Last sent');
+    expect(banner.querySelector('.chat-pinned-last-sent-text')?.textContent).toBe('legacy-safe current prompt');
+    expect(banner.textContent).not.toContain('Legacy summary without provenance must not win');
+  });
+
+  it('falls back to Last sent when a same-session recent summary targets an older user message', async () => {
+    const events = [
+      userEvent('u-old', 'older prompt', 500),
+      memoryContextEvent(
+        'm-old',
+        '## Problem\nOld prompt summary must not replace the latest prompt',
+        750,
+        'u-old',
+        'deck_demo_brain',
+      ),
+      userEvent('u-current', 'latest prompt', 1000),
+      assistantEvent('a1', 'Working on it...', 2000),
+    ];
+    const { container } = render(
+      <ChatView events={events} loading={false} sessionId="deck_demo_brain" />,
+    );
+
+    await waitFor(() => expect(instances.length).toBeGreaterThan(0));
+    act(() => {
+      instances[instances.length - 1].fire([{
+        isIntersecting: false,
+        boundingClientRect: { bottom: -10, top: -30, height: 20, width: 100, left: 0, right: 100 } as DOMRectReadOnly,
+        rootBounds: { top: 0, bottom: 500, height: 500, width: 500, left: 0, right: 500 } as DOMRectReadOnly,
+      }]);
+    });
+
+    const banner = container.querySelector('.chat-pinned-last-sent') as HTMLElement;
+    expect(banner.querySelector('.chat-pinned-last-sent-label')?.textContent).toBe('Last sent');
+    expect(banner.querySelector('.chat-pinned-last-sent-text')?.textContent).toBe('latest prompt');
+    expect(banner.textContent).not.toContain('Old prompt summary must not replace the latest prompt');
   });
 
   it('hides the pinned banner when the bubble scrolls back INTO view', async () => {

@@ -9,7 +9,20 @@ import {
   MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
 } from './machine-direct-file-transfer-capabilities.js';
 import { REMOTE_DESKTOP_CAPABILITY } from './remote-desktop.js';
-import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY } from './remote-desktop-install.js';
+import {
+  REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
+  REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY,
+} from './remote-desktop-install.js';
+import {
+  REMOTE_DESKTOP_ADAPTER_CAPABILITIES,
+  REMOTE_DESKTOP_DEFAULT_SHIELDED_ROUTE_CAPABILITY,
+  REMOTE_DESKTOP_RELAY_CAP_CAPABILITY,
+} from './remote-desktop-access.js';
+import {
+  REMOTE_DESKTOP_SESSION_CAPABILITY,
+  REMOTE_DESKTOP_SESSION_PROFILE_CAPABILITIES,
+  REMOTE_DESKTOP_UNSUPPORTED_PROFILE_CAPABILITY,
+} from './remote-desktop-platform.js';
 import { CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY } from './controlled-node-service.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from './controlled-node-auto-unlock.js';
 
@@ -22,12 +35,25 @@ export const CONTROLLED_NODE_CAPABILITIES = [
   MACHINE_DIRECT_FILE_FETCH_CAPABILITY,
   REMOTE_DESKTOP_CAPABILITY,
   REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
+  REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY,
+  // Advertised per OS adapter, never inferred from the platform: a host
+  // without local consent cannot serve attended links, and one without the
+  // signed shell / capture privacy pair stays manageable from another device
+  // but must not expose controlled-computer management.
+  ...REMOTE_DESKTOP_ADAPTER_CAPABILITIES,
+  ...REMOTE_DESKTOP_SESSION_PROFILE_CAPABILITIES,
+  REMOTE_DESKTOP_DEFAULT_SHIELDED_ROUTE_CAPABILITY,
+  REMOTE_DESKTOP_RELAY_CAP_CAPABILITY,
   CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY,
   CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY,
 ] as const;
 
 export type ControlledNodeCapability = typeof CONTROLLED_NODE_CAPABILITIES[number];
-export const CONTROLLED_NODE_CAPABILITY_MAX_ITEMS = 16;
+// Remote-desktop adapters advertise consent, signed shell, capture privacy,
+// input, lock-screen, branding and local disclosure independently. Keep the
+// envelope bounded while leaving room for that explicit feature matrix and
+// future non-Windows adapters; 16 would reject the already-specified set.
+export const CONTROLLED_NODE_CAPABILITY_MAX_ITEMS = 32;
 export const CONTROLLED_NODE_CAPABILITY_MAX_LENGTH = 128;
 const CONTROLLED_NODE_CAPABILITY_ADVERTISEMENT_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
 
@@ -61,5 +87,16 @@ export function parseAdvertisedControlledNodeCapabilities(value: unknown): Contr
     && CONTROLLED_NODE_CAPABILITY_ADVERTISEMENT_PATTERN.test(item))) {
     return { ok: false };
   }
-  return { ok: true, value: [...new Set(value.filter(isControlledNodeCapability))] };
+  const known = value.filter(isControlledNodeCapability);
+  // A rollback-era legacy Windows node may retain future adapter tokens that
+  // an older daemon ignores. Preserve that established v2 behavior. Once the
+  // node explicitly advertises session.v3, however, an unknown remote-desktop
+  // token may be a mandatory part of that profile and must remain fail-closed.
+  if (known.includes(REMOTE_DESKTOP_SESSION_CAPABILITY)
+    && value.some((item) => typeof item === 'string'
+      && item.startsWith('remote.desktop.')
+      && !isControlledNodeCapability(item))) {
+    known.push(REMOTE_DESKTOP_UNSUPPORTED_PROFILE_CAPABILITY);
+  }
+  return { ok: true, value: [...new Set(known)] };
 }

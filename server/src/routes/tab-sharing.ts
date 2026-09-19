@@ -2,9 +2,11 @@ import { Hono } from 'hono';
 import type { Context } from 'hono';
 import { z } from 'zod';
 import type { Env } from '../env.js';
+import type { Database } from '../db/client.js';
 import { randomHex, signJwt } from '../security/crypto.js';
-import { requireAuth, resolveServerRole } from '../security/authorization.js';
+import { requireAuth, resolveServerMembershipRole } from '../security/authorization.js';
 import { getDbSessionsByServer, getSubSessionsByServer } from '../db/queries.js';
+import { resolveUserByIdentifier } from '../db/user-lookup.js';
 import { WsBridge } from '../ws/bridge.js';
 import {
   createOrUpdateShare,
@@ -25,6 +27,10 @@ import {
   type ShareTargetInput,
 } from '../db/tab-sharing.js';
 import { NODE_ROLE } from '../../../shared/remote-exec.js';
+import {
+  projectSharedSessionSupervisionMode,
+  SUPERVISION_MODE_PROJECTION_KEY,
+} from '../../../shared/supervision-config.js';
 
 export const tabSharingRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -155,23 +161,23 @@ async function requireShareManager(db: Env['DB'], serverId: string, userId: stri
   // Team admins may manage ordinary Tab shares, but a controlled node is a
   // personal root/SYSTEM-capable credential. Only its direct owner may grant,
   // change or revoke access to it.
-  if (server.node_role === NODE_ROLE.CONTROLLED) return server.user_id === userId;
-  const role = await resolveServerRole(db, serverId, userId);
+  // A controlled node is a personal root/SYSTEM-capable credential, so only its
+  // direct owner manages grants. Sharing management stays OUTSIDE operator
+  // authority: a Participant must never be able to grant further access.
+  //
+  // There is deliberately no additional team test. It used to require the owner
+  // to still hold membership in the machine's team, which made a team admin
+  // able to take someone's machine hostage: remove the owner from the team and
+  // they can no longer grant, revoke, or move the machine out of it. A machine
+  // belongs to whoever installed it, and a team is a group they put it in.
+  if (server.node_role === NODE_ROLE.CONTROLLED) {
+    return server.user_id === userId;
+  }
+  // Re-share is the single deliberate exception to whole-server participant
+  // authority. Resolve durable membership only; an incoming share can never
+  // bootstrap another grant.
+  const role = await resolveServerMembershipRole(db, serverId, userId);
   return role === 'owner' || role === 'admin';
-}
-
-async function resolveTargetUser(db: Env['DB'], input: string): Promise<{ id: string; display_name: string | null; username: string | null } | null> {
-  const identifier = input.trim();
-  if (!identifier) return null;
-  const row = await db.queryOne<{ id: string; display_name: string | null; username: string | null }>(
-    `SELECT id, display_name, username
-       FROM users
-      WHERE id = $1 OR lower(username) = lower($1)
-      ORDER BY CASE WHEN id = $1 THEN 0 ELSE 1 END
-      LIMIT 1`,
-    [identifier],
-  );
-  return row ?? null;
 }
 
 async function auditShareLifecycle(c: Context<{ Bindings: Env; Variables: { userId: string; role: string } }>, params: {
@@ -266,6 +272,7 @@ tabSharingRoutes.post('/shares/open', requireAuth(), async (c) => {
       title: session.label?.trim() || session.project_name,
       state: session.state,
       agentType: session.agent_type,
+      [SUPERVISION_MODE_PROJECTION_KEY]: projectSharedSessionSupervisionMode(session.transport_config),
       ...(includeActiveDispatch
         ? { activeDispatchId: bridge.getActiveDispatchIdForSession(session.name) }
         : {}),
@@ -276,6 +283,7 @@ tabSharingRoutes.post('/shares/open', requireAuth(), async (c) => {
       title: subSession.label?.trim() || subSession.type,
       type: subSession.type,
       parentSessionName: subSession.parent_session,
+      [SUPERVISION_MODE_PROJECTION_KEY]: projectSharedSessionSupervisionMode(subSession.transport_config),
       ...(includeActiveDispatch
         ? { activeDispatchId: bridge.getActiveDispatchIdForSession(`deck_sub_${subSession.id}`) }
         : {}),
@@ -365,10 +373,22 @@ tabSharingRoutes.post('/server/:serverId/shares', requireAuth(), async (c) => {
     });
     return c.json({ error: 'forbidden' }, 403);
   }
-  const targetUser = await resolveTargetUser(c.env.DB, targetUserInput);
+  const targetUser = await resolveUserByIdentifier(c.env.DB as Database, targetUserInput);
   if (!targetUser) return c.json({ error: 'invalid_body', reason: 'target_user_unavailable' }, 400);
   const targetUserId = targetUser.id;
   if (targetUserId === userId) return c.json({ error: 'invalid_body', reason: 'self_share_denied' }, 400);
+
+  // No team is required to share one machine with one person. Sharing a group
+  // of machines with a team is the other mechanism, and the two are
+  // independent: making the first go through the second meant a machine could
+  // not be shared at all until it was put in a team, and then only with people
+  // already in that team.
+  //
+  // The write-time check this replaces reasoned correctly from a premise that
+  // no longer holds. It refused to store a grant admission would not honour, so
+  // that stored state and effective state stayed the same thing. Admission
+  // honours an individual grant on its own now, so that same principle points
+  // the other way.
   const target = await normalizeExistingShareTarget(c.env.DB, parsed.data.target as ShareTargetInput);
   if (!target) return c.json({ error: 'invalid_body', reason: 'share-target-unavailable' }, 400);
 
@@ -422,7 +442,7 @@ tabSharingRoutes.patch('/server/:serverId/shares/:shareId', requireAuth(), async
     createdAt: now,
   });
   void WsBridge.get(serverId).revalidateShareSocketsForUser(share.targetUserId);
-  return c.json({ share: managedShareView(share, await resolveTargetUser(c.env.DB, share.targetUserId)) });
+  return c.json({ share: managedShareView(share, await resolveUserByIdentifier(c.env.DB as Database, share.targetUserId)) });
 });
 
 tabSharingRoutes.delete('/server/:serverId/shares/:shareId', requireAuth(), async (c) => {
@@ -443,7 +463,7 @@ tabSharingRoutes.delete('/server/:serverId/shares/:shareId', requireAuth(), asyn
     createdAt: now,
   });
   void WsBridge.get(serverId).revalidateShareSocketsForUser(share.targetUserId);
-  return c.json({ share: managedShareView(share, await resolveTargetUser(c.env.DB, share.targetUserId)) });
+  return c.json({ share: managedShareView(share, await resolveUserByIdentifier(c.env.DB as Database, share.targetUserId)) });
 });
 
 tabSharingRoutes.get('/server/:serverId/share-audit', requireAuth(), async (c) => {

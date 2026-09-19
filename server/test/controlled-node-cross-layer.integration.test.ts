@@ -30,6 +30,8 @@ import { MachineExecWorker } from '../../src/node/machine-exec-worker.js';
 import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
 import { createServer, createUser } from '../src/db/queries.js';
+import { createOrUpdateShare } from '../src/db/tab-sharing.js';
+import { generateControlledNodeId } from '../src/services/controlled-node-identity.js';
 import {
   __setMachineExecRelayDeadlineBufferMsForTests,
   createMachineExecRoutes,
@@ -44,7 +46,7 @@ const stubCaller = {} as unknown as McpRuntimeCaller;
 
 let db: Database;
 let source: { serverId: string; token: string };
-let target: { serverId: string; token: string };
+let target: { serverId: string; token: string; nodeId: string };
 let app: Hono;
 let bridge: WsBridge;
 let socket: ControlledLoopbackSocket;
@@ -83,7 +85,7 @@ const runControlled = async (
   return { requestId: request.requestId, ok: true, exitCode: 0, stdout: 'ok', stderr: '', durationMs: 1 };
 };
 
-type ResultMode = 'worker' | 'malformed' | 'lost';
+type ResultMode = 'worker' | 'helper-timeout' | 'malformed' | 'lost';
 
 class ControlledLoopbackSocket extends EventEmitter {
   readyState = 1;
@@ -111,6 +113,18 @@ class ControlledLoopbackSocket extends EventEmitter {
           return;
         }
         const request = message as unknown as ComputerUseFrame;
+        if (this.mode === 'helper-timeout') {
+          this.emit('message', Buffer.from(JSON.stringify({
+            type: DAEMON_MSG.COMPUTER_USE_RESULT,
+            correlationId: request.correlationId,
+            ok: false,
+            tool: request.tool,
+            content: [],
+            durationMs: 5,
+            error: 'computer_use_helper_connect_timeout',
+          })), false);
+          return;
+        }
         const result: ComputerUseResult = {
           correlationId: request.correlationId,
           ok: true,
@@ -179,6 +193,7 @@ function machineDeps(overrides: { token?: string; unbound?: boolean; listFailure
       if (overrides.listFailure) throw new MachineControlPlaneError('http_status', 'machines API returned http_503');
       return [{
         serverId: target.serverId,
+        nodeId: target.nodeId,
         name: 'controlled-node',
         refName: 'node-linux',
         displayName: 'Linux Node',
@@ -206,23 +221,51 @@ async function connectMcp(deps: MachineToolDeps): Promise<Client> {
 async function callExec(client: Client, command: string) {
   return client.callTool({
     name: MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,
-    arguments: { machine: 'node-linux', command, timeoutMs: 1_000 },
+    arguments: { machine: target.nodeId, command, timeoutMs: 1_000 },
   });
 }
 
 beforeAll(async () => {
   db = createDatabase(process.env.TEST_DATABASE_URL!);
   await runMigrations(db);
-  const userId = `cross_${hex(5)}`;
-  await createUser(db, userId);
+  const ownerId = `cross_owner_${hex(5)}`;
+  const participantId = `cross_participant_${hex(5)}`;
+  await Promise.all([createUser(db, ownerId), createUser(db, participantId)]);
   source = { serverId: `full_${hex(5)}`, token: hex(16) };
-  target = { serverId: `ctl_${hex(5)}`, token: hex(16) };
-  await createServer(db, source.serverId, userId, 'full', sha256(source.token));
+  target = { serverId: `ctl_${hex(5)}`, token: hex(16), nodeId: generateControlledNodeId() };
+  await createServer(db, source.serverId, participantId, 'full', sha256(source.token));
+  // Desk scope: a controlled node is bound to exactly one Desk, and a share only
+  // grants access to a current member of it. The node is therefore created bound
+  // and the participant joined, so the cross-layer contracts below run on a
+  // realistic machine rather than a legacy unbound one (which admits nobody but
+  // its owner). No assertion below changes.
+  const deskId = `cross_desk_${hex(5)}`;
   await db.execute(
-    `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, revoked_at, ref_name, display_name, os)
-     VALUES ($1,$2,'controlled',$3,'online',$4,$5,true,NULL,'node-linux','Linux Node','linux')`,
-    [target.serverId, userId, sha256(target.token), Date.now(), NODE_ROLE.CONTROLLED],
+    `INSERT INTO teams (id, name, owner_id, plan, created_at) VALUES ($1,'AI Desk',$2,'free',$3)`,
+    [deskId, ownerId, Date.now()],
   );
+  await db.execute(
+    `INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1,$2,'owner',$3)`,
+    [deskId, ownerId, Date.now()],
+  );
+  await db.execute(
+    `INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1,$2,'member',$3)`,
+    [deskId, participantId, Date.now()],
+  );
+  await db.execute(
+    `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, revoked_at, ref_name, display_name, os, node_id, team_id)
+     VALUES ($1,$2,'controlled',$3,'online',$4,$5,true,NULL,'node-linux','Linux Node','linux',$6,$7)`,
+    [target.serverId, ownerId, sha256(target.token), Date.now(), NODE_ROLE.CONTROLLED, target.nodeId, deskId],
+  );
+  await createOrUpdateShare(db, {
+    id: `share_${hex(8)}`,
+    target: { kind: 'server', serverId: target.serverId },
+    targetUserId: participantId,
+    role: 'participant',
+    createdBy: ownerId,
+    expiresAt: null,
+    now: Date.now(),
+  });
 
   app = new Hono();
   app.use('*', async (c, next) => {
@@ -286,7 +329,7 @@ describe('controlled-node cross-layer product path', () => {
     const listed = await client.callTool({ name: MEMORY_MCP_TOOL_NAMES.LIST_MACHINES, arguments: {} });
     expect(listed.structuredContent).toMatchObject({
       status: 'ok',
-      machines: [{ name: 'node-linux', os: 'linux', role: NODE_ROLE.CONTROLLED, online: true, execEnabled: true }],
+      machines: [{ name: target.nodeId, os: 'linux', role: NODE_ROLE.CONTROLLED, online: true, execEnabled: true }],
     });
     const result = await callExec(client, 'nonzero');
     expect(result.isError).toBeFalsy();
@@ -304,7 +347,7 @@ describe('controlled-node cross-layer product path', () => {
     expect(docs.structuredContent).toMatchObject({ status: 'ok', topic: 'workflow' });
     const result = await client.callTool({
       name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
-      arguments: { machine: 'node-linux', tool: 'shell_session1', timeoutMs: 900_000 },
+      arguments: { machine: target.nodeId, tool: 'shell_session1', timeoutMs: 900_000 },
     });
     expect(result.isError).toBeFalsy();
     expect(result.structuredContent).toMatchObject({
@@ -313,6 +356,41 @@ describe('controlled-node cross-layer product path', () => {
       result: { ok: true, tool: 'shell_session1', content: [{ type: 'text', text: 'computer:shell_session1' }] },
     });
     await client.close();
+  });
+
+  it('preserves a target helper timeout as an authorized post-dispatch tool failure', async () => {
+    socket.mode = 'helper-timeout';
+    const client = await connectMcp(machineDeps());
+    const result = await client.callTool({
+      name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
+      arguments: { machine: target.nodeId, tool: 'list_apps' },
+    });
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      status: 'ok', outcome: 'tool_error',
+      result: { ok: false, error: 'computer_use_helper_connect_timeout' },
+    });
+    await client.close();
+  });
+
+  it('maps an offline shared target to the typed pre-dispatch reason', async () => {
+    socket.mode = 'worker';
+    socket.readyState = 3;
+    const client = await connectMcp(machineDeps());
+    try {
+      const exec = await callExec(client, 'nonzero');
+      expect(exec.isError).toBe(true);
+      expect(exec.structuredContent).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.EXEC_OFFLINE });
+      const computer = await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
+        arguments: { machine: target.nodeId, tool: 'list_apps' },
+      });
+      expect(computer.isError).toBe(true);
+      expect(computer.structuredContent).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.EXEC_OFFLINE });
+    } finally {
+      socket.readyState = 1;
+      await client.close();
+    }
   });
 
   it.each([
@@ -369,8 +447,8 @@ describe('controlled-node cross-layer product path', () => {
     socket.mode = 'worker';
     const client = await connectMcp(machineDeps({ token: 'wrong-token' }));
     const result = await callExec(client, 'nonzero');
-    expect(result.isError).toBeFalsy();
-    expect(result.structuredContent).toMatchObject({ status: 'ok', outcome: 'not_dispatched' });
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.IDENTITY_REJECTED });
     await client.close();
   });
 

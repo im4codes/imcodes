@@ -1,5 +1,6 @@
 import type { AgentDriver, LaunchOptions, DeleteBufferFn } from './base.js';
 import { cwdPrefix } from './base.js';
+import { claudeNativeAgentFenceFlag } from '../native-agent-fence.js';
 import type { AgentStatus } from '../detect.js';
 import { detectStatus } from '../detect.js';
 
@@ -42,19 +43,21 @@ export class ClaudeCodeDriver implements AgentDriver {
 
   buildLaunchCommand(_sessionName: string, opts?: LaunchOptions): string {
     const cwd = cwdPrefix(opts?.cwd);
+    const fence = opts?.nativeAgentsFenced ? claudeNativeAgentFenceFlag() : '';
     if (opts?.ccSessionId) {
-      return `${cwd}claude --dangerously-skip-permissions --session-id ${opts.ccSessionId}`;
+      return `${cwd}claude --dangerously-skip-permissions${fence} --session-id ${opts.ccSessionId}`;
     }
     if (opts?.fresh) {
-      return `${cwd}claude --dangerously-skip-permissions`;
+      return `${cwd}claude --dangerously-skip-permissions${fence}`;
     }
-    return `${cwd}claude --dangerously-skip-permissions -c || claude --dangerously-skip-permissions`;
+    return `${cwd}claude --dangerously-skip-permissions${fence} -c || claude --dangerously-skip-permissions${fence}`;
   }
 
   buildResumeCommand(_sessionName: string, opts?: LaunchOptions): string {
     const cwd = cwdPrefix(opts?.cwd);
+    const fence = opts?.nativeAgentsFenced ? claudeNativeAgentFenceFlag() : '';
     if (opts?.ccSessionId) {
-      return `${cwd}claude --dangerously-skip-permissions --resume ${opts.ccSessionId}`;
+      return `${cwd}claude --dangerously-skip-permissions${fence} --resume ${opts.ccSessionId}`;
     }
     return this.buildLaunchCommand(_sessionName, opts);
   }

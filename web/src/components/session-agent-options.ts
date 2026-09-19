@@ -1,4 +1,6 @@
 import type { SessionAgentType } from '@shared/agent-types.js';
+import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 
 export type SessionAgentGroupId = 'transport' | 'process';
 export type SessionAgentSurface = 'new-session' | 'sub-session';
@@ -10,6 +12,17 @@ export interface SessionAgentChoice {
   labelKey?: string;
   group: SessionAgentGroupId;
   surfaces: SessionAgentSurface[];
+  /**
+   * True to hide this choice's card from the picker grid without removing
+   * it from the data model — the data stays intact (existing
+   * `agentType === 'qwen'` sessions, presets, and their tests keep working
+   * unmodified) while a new session/sub-session can no longer pick it.
+   * Consumers must render hidden choices with `display: none` (not simply
+   * omit them from the mapped array), so the card is invisible and
+   * unreachable to real users/assistive tech while remaining a real DOM
+   * node for any test still querying it directly by `data-agent-type`.
+   */
+  hidden?: boolean;
 }
 
 export const SESSION_AGENT_GROUP_LABEL_KEYS: Record<SessionAgentGroupId, string> = {
@@ -91,6 +104,14 @@ const SESSION_AGENT_CHOICES: SessionAgentChoice[] = [
     surfaces: ['new-session', 'sub-session'],
   },
   {
+    id: HERMES_AGENT_PROVIDER_ID,
+    icon: 'H',
+    fallbackLabel: 'Hermes Agent',
+    labelKey: 'session.agentType.hermes_agent',
+    group: 'transport',
+    surfaces: ['new-session', 'sub-session'],
+  },
+  {
     id: 'deepseek-harness',
     icon: '🐳',
     fallbackLabel: 'DeepSeek Harness',
@@ -107,12 +128,29 @@ const SESSION_AGENT_CHOICES: SessionAgentChoice[] = [
     surfaces: ['new-session', 'sub-session'],
   },
   {
+    id: CODEBUDDY_PROVIDER_IDS.CHINA,
+    icon: '云',
+    fallbackLabel: 'CodeBuddy 中国版',
+    labelKey: 'session.agentType.codebuddy_china',
+    group: 'transport',
+    surfaces: ['new-session', 'sub-session'],
+  },
+  {
+    id: CODEBUDDY_PROVIDER_IDS.INTERNATIONAL,
+    icon: 'CB',
+    fallbackLabel: 'CodeBuddy International',
+    labelKey: 'session.agentType.codebuddy_international',
+    group: 'transport',
+    surfaces: ['new-session', 'sub-session'],
+  },
+  {
     id: 'qwen',
     icon: '千',
     fallbackLabel: 'Qwen Code',
     labelKey: 'session.agentType.qwen',
     group: 'transport',
     surfaces: ['new-session', 'sub-session'],
+    hidden: true,
   },
   {
     id: 'openclaw',
@@ -187,3 +225,19 @@ export function getSessionAgentLabel(
 ): string {
   return choice.labelKey ? t(choice.labelKey) : choice.fallbackLabel;
 }
+
+/**
+ * Agent types offered for a project's default coder/auditor role (AddProject,
+ * ProjectSettings) — a narrower, differently-curated list than
+ * `SESSION_AGENT_CHOICES` above (no openclaw/shell/script: those aren't
+ * meaningful "which agent fills this project role" choices). Single source
+ * so AddProject.tsx and ProjectSettings.tsx can't drift out of sync with
+ * each other, the way their previous hand-duplicated copies of this exact
+ * array could.
+ */
+export const PROJECT_ROLE_AGENT_TYPES: string[] = [
+  'claude-code', 'claude-code-sdk', 'codex', 'codex-sdk', 'qoder-sdk', 'copilot-sdk',
+  'cursor-headless', 'opencode-sdk', 'opencode', 'gemini', 'gemini-sdk', 'grok-sdk',
+  'kimi-sdk', HERMES_AGENT_PROVIDER_ID, 'deepseek-harness', 'pi',
+  CODEBUDDY_PROVIDER_IDS.CHINA, CODEBUDDY_PROVIDER_IDS.INTERNATIONAL,
+];

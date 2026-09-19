@@ -1,0 +1,27 @@
+KILLED               Q1 qwen cap call removed (raw argv prompt)  <- []
+KILLED               Q2 identity-first shrink disabled (all providers)  <- []
+KILLED               Q3 utf8 cut may split a code point  <- []
+KILLED               Q4 qwen byte budget raised past MAX_ARG_STRLEN  <- []
+KILLED               Q5 qwen budget measured in UTF-16 units instead of bytes  <- []
+KILLED               Q6 closing tag via indexOf instead of lastIndexOf  <- []
+KILLED               Q7 utf16 surrogate guard removed  <- []
+KILLED               Q8 shrink ignores marker size (overflows budget)  <- []
+KILLED               Q9 shrink drops the kept identity head  <- []
+KILLED               C5 Codex ceiling reverted to 180k  <- []
+SURVIVED             C7 Codex measured in bytes instead of UTF-16
+KILLED               S1 user limit reverted to 20k  <- []
+KILLED               S2 project limit reverted to 60k  <- []
+KILLED               S3 session limit reverted to 100k  <- []
+KILLED               S4 validator counts UTF-16 units  <- []
+KILLED               M1 MCP description back to stale literals  <- []
+KILLED               G1 server route content gate removed  <- []
+KILLED               G2 MCP set content gate removed  <- []
+KILLED               G3 MCP send identity ingress gate removed  <- []
+KILLED               G4 send-tool identity gate removed  <- []
+KILLED               G5 command-handler identity gate removed  <- []
+KILLED               G6 web panel validation gate removed  <- []
+
+KILLED 21/22
+
+C7 re-run after adding "spends the Codex budget in UTF-16 units, so a multibyte identity still fills it": KILLED
+FINAL: KILLED 22/22

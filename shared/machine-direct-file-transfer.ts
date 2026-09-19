@@ -6,7 +6,9 @@ import {
 import {
   FILE_TRANSFER_PATH_MAX_BYTES,
   type AttachmentRef,
+  type FileTransferSourceIdentity,
   type FileTransferValidationResult,
+  validateFileTransferSourceIdentity,
 } from './transport/file-transfer.js';
 
 export {
@@ -41,6 +43,9 @@ export const MACHINE_DIRECT_FRAME_TYPE = {
   START: 3,
 } as const;
 
+/** Daemon-owned durable partials; never project these as committed uploads. */
+export const MACHINE_DIRECT_RESUME_FILE_PREFIX = '.machine-resume-';
+
 export const MACHINE_DIRECT_FILE_TRANSFER_ERROR = {
   CONNECT_FAILED: 'connect_failed',
   AUTH_FAILED: 'auth_failed',
@@ -62,8 +67,12 @@ export const MACHINE_DIRECT_FILE_TRANSFER_LIMITS = {
   MAX_START_METADATA_BYTES: 2 * 1024,
   HANDSHAKE_LINE_MAX_BYTES: 2 * 1024,
   NONCE_BYTES: 18,
-  CONNECT_TIMEOUT_MS: 4_000,
-  HANDSHAKE_TIMEOUT_MS: 4_000,
+  // Cross-region machines can require multiple 200-300 ms network round
+  // trips before TCP establishment and the authenticated hello exchange have
+  // both converged. Keep each phase independently bounded, but do not reject
+  // a healthy international path on the former four-second edge.
+  CONNECT_TIMEOUT_MS: 8_000,
+  HANDSHAKE_TIMEOUT_MS: 8_000,
   TRANSFER_TIMEOUT_MS: 300_000,
   // This is only the window to begin an authenticated direct connection. Each
   // control hop re-mints it from its own clock, so it can be generous without
@@ -102,6 +111,10 @@ export interface MachineDirectFetchRequest {
 export interface MachineDirectFetchStart {
   size: number;
   originalName: string;
+  /** Exact source version that owns every resumable byte in this transfer. */
+  sourceIdentity?: FileTransferSourceIdentity;
+  /** Echo of the authenticated receiver-owned offset. */
+  resumeOffset?: number;
 }
 
 /**
@@ -163,6 +176,8 @@ export interface MachineDirectTargetHello {
   requestId: string;
   nonce: string;
   proof: string;
+  /** Receiver-owned durable byte boundary, authenticated by `proof`. */
+  resumeOffset?: number;
 }
 
 export interface MachineDirectSourceHello {
@@ -247,11 +262,13 @@ function isMachineDirectProof(value: unknown): value is string {
 }
 
 export function validateMachineDirectTargetHello(value: unknown): MachineDirectTargetHello | null {
-  if (!isObject(value) || !hasExactKeys(value, ['type', 'requestId', 'nonce', 'proof'])) return null;
+  if (!isObject(value) || !hasExactKeys(value, ['type', 'requestId', 'nonce', 'proof'], ['resumeOffset'])) return null;
   if (value.type !== MACHINE_DIRECT_HANDSHAKE_MSG.TARGET_HELLO
     || !isMachineDirectId(value.requestId)
     || !isMachineDirectNonce(value.nonce)
-    || !isMachineDirectProof(value.proof)) return null;
+    || !isMachineDirectProof(value.proof)
+    || (value.resumeOffset !== undefined
+      && (typeof value.resumeOffset !== 'number' || !Number.isSafeInteger(value.resumeOffset) || value.resumeOffset < 0))) return null;
   return value as unknown as MachineDirectTargetHello;
 }
 
@@ -314,10 +331,17 @@ export function validateMachineDirectFetchRequest(value: unknown): FileTransferV
 }
 
 export function validateMachineDirectFetchStart(value: unknown): MachineDirectFetchStart | null {
-  if (!isObject(value) || !hasExactKeys(value, ['size', 'originalName'])) return null;
+  if (!isObject(value) || !hasExactKeys(value, ['size', 'originalName'], ['sourceIdentity', 'resumeOffset'])) return null;
   if (typeof value.size !== 'number' || !Number.isSafeInteger(value.size) || value.size < 0) return null;
   if (typeof value.originalName !== 'string' || value.originalName.length < 1 || utf8Bytes(value.originalName) > 1024) return null;
-  return value as unknown as MachineDirectFetchStart;
+  const sourceIdentity = value.sourceIdentity === undefined
+    ? undefined
+    : validateFileTransferSourceIdentity(value.sourceIdentity);
+  if (value.sourceIdentity !== undefined && (!sourceIdentity || sourceIdentity.size !== value.size)) return null;
+  if (value.resumeOffset !== undefined
+    && (typeof value.resumeOffset !== 'number' || !Number.isSafeInteger(value.resumeOffset)
+      || value.resumeOffset < 0 || value.resumeOffset > value.size)) return null;
+  return { ...value, ...(sourceIdentity ? { sourceIdentity } : {}) } as unknown as MachineDirectFetchStart;
 }
 
 export function validateMachineDirectUploadResponse(

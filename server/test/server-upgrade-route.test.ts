@@ -7,6 +7,8 @@ const mockGetFullServersByUserId = vi.fn();
 const mockSendToDaemon = vi.fn();
 const mockRequestDaemonUpgrade = vi.fn();
 const mockDeleteServer = vi.fn();
+const mockResolveServerRole = vi.fn();
+const mockGetServerById = vi.fn();
 
 vi.mock('../src/security/authorization.js', () => ({
   requireAuth: () => async (c: { set: (key: string, value: string) => void }, next: () => Promise<void>) => {
@@ -14,11 +16,13 @@ vi.mock('../src/security/authorization.js', () => ({
     c.set('role', 'member');
     await next();
   },
+  resolveServerRole: (...args: unknown[]) => mockResolveServerRole(...args),
 }));
 
 vi.mock('../src/db/queries.js', () => ({
   getFullServersByUserId: (...args: unknown[]) => mockGetFullServersByUserId(...args),
   getServersByUserId: (...args: unknown[]) => mockGetServersByUserId(...args),
+  getServerById: (...args: unknown[]) => mockGetServerById(...args),
   updateServerHeartbeat: vi.fn(),
   updateServerName: vi.fn(),
   deleteServer: (...args: unknown[]) => mockDeleteServer(...args),
@@ -75,6 +79,8 @@ describe('server routes', () => {
       deliveryStatus: 'sent',
     });
     mockDeleteServer.mockResolvedValue(true);
+    mockResolveServerRole.mockResolvedValue('owner');
+    mockGetServerById.mockResolvedValue({ id: 'srv-1', user_id: 'owner-user', name: 'Alpha' });
     delete process.env.APP_VERSION;
   });
 
@@ -142,6 +148,16 @@ describe('server routes', () => {
     });
   });
 
+  it('rejects a user with neither membership nor a shared-server operator grant', async () => {
+    mockResolveServerRole.mockResolvedValueOnce('none');
+    const app = await buildTestApp();
+
+    const res = await app.request('/api/server/srv-1/upgrade', { method: 'POST' });
+
+    expect(res.status).toBe(404);
+    expect(mockRequestDaemonUpgrade).not.toHaveBeenCalled();
+  });
+
   it('returns 400 when the upgrade target is invalid', async () => {
     process.env.APP_VERSION = '2026.4.905-dev.877;touch /tmp/pwn';
     mockRequestDaemonUpgrade.mockReturnValue({
@@ -193,7 +209,7 @@ describe('server routes', () => {
 
     expect(res.status).toBe(404);
     expect(await res.json()).toEqual({ error: 'not_found' });
-    expect(mockDeleteServer).toHaveBeenCalledWith(expect.anything(), 'srv-1', 'user-1');
+    expect(mockDeleteServer).toHaveBeenCalledWith(expect.anything(), 'srv-1', 'owner-user');
     expect(mockSendToDaemon).not.toHaveBeenCalled();
   });
 
@@ -205,7 +221,7 @@ describe('server routes', () => {
 
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true });
-    expect(mockDeleteServer).toHaveBeenCalledWith(expect.anything(), 'srv-1', 'user-1');
+    expect(mockDeleteServer).toHaveBeenCalledWith(expect.anything(), 'srv-1', 'owner-user');
     expect(mockSendToDaemon).toHaveBeenCalledWith(JSON.stringify({ type: 'server.delete' }));
   });
 });

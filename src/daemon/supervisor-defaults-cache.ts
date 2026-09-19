@@ -1,30 +1,108 @@
 /**
  * Daemon-side cache of the user's global supervision defaults.
  *
- * Why this exists: the web client mirrors `globalCustomInstructions` into the
- * CURRENTLY-edited session's `transportConfig.supervision` when a user saves
- * the Session Settings dialog. Any OTHER session's cached snapshot retains
- * the old (or empty) mirror. When the supervisor fires against those other
- * sessions, `resolveEffectiveCustomInstructions(snapshot)` sees an empty
- * global layer and the user's "Always commit and push if asked!" never
- * reaches the prompt.
+ * Automatic supervision has one account-level runtime selection shared by
+ * every session. Session snapshots retain a compatibility mirror, but cannot
+ * be authoritative because editing a different session would leave them
+ * stale. The daemon therefore refreshes the user's current defaults at
+ * startup, on WS reconnect, and every five seconds.
  *
- * This cache is the fallback layer: the daemon polls the user's current
- * defaults at startup + on each WS reconnect and stores the parsed result
- * in-process. When a snapshot has no `globalCustomInstructions`, callers
- * read `getCachedGlobalCustomInstructions()` and use that instead. No code
- * path silently loses the user's instruction.
+ * PostgreSQL (via the server's `/supervision/user-defaults/daemon` route) is
+ * the single source of truth. This module keeps two local mirrors of it:
+ *
+ *  - An in-memory value (`cachedSupervisorDefaults`), read synchronously by
+ *    every consumer on every call -- this is what `getCachedSupervisorDefaults()`
+ *    and `overlayCachedExecutionPools()` actually use.
+ *  - A one-row SQLite table (`~/.imcodes/supervisor-defaults-cache.sqlite`),
+ *    written every time a fetch actually changes the in-memory value, and
+ *    read back ONCE at module load to seed the in-memory value immediately.
+ *    Without this, a daemon that just restarted or just upgraded has an
+ *    empty in-memory cache until its first successful round trip to the
+ *    server completes -- ordinarily under a second, but a real gap during
+ *    exactly the moments (restart, upgrade) most likely to also have a
+ *    network hiccup. The disk copy closes that gap: it survives the
+ *    process across a restart the way the in-memory value cannot.
  *
  * The cache is best-effort: fetch failures do not throw; the daemon falls
- * through to the (possibly stale) snapshot mirror and continues operating.
- * A non-null cache is always more recent than a session snapshot that
- * predates a global-defaults edit.
+ * through to the session mirror until a successful fetch. Once populated
+ * (from either source), the cache is authoritative for primary/backup
+ * runtime, timeout, prompt version, global instructions, and -- once the
+ * account has actually configured one -- the execution pools.
  */
+import { mkdirSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { homedir } from 'node:os';
+import { dirname, join } from 'node:path';
 import logger from '../util/logger.js';
 import { loadCredentials } from '../bind/bind-flow.js';
+import { suppressSqliteExperimentalWarning } from '../util/suppress-sqlite-warning.js';
+import {
+  normalizeSupervisorDefaultConfig,
+  type SessionSupervisionSnapshot,
+  type SupervisorDefaultConfig,
+} from '../../shared/supervision-config.js';
 
-let cachedGlobalCustomInstructions: string | null = null;
+const require = createRequire(import.meta.url);
+suppressSqliteExperimentalWarning();
+const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
+type DatabaseSyncInstance = InstanceType<typeof DatabaseSync>;
+
+const DEFAULT_DB_PATH = join(homedir(), '.imcodes', 'supervisor-defaults-cache.sqlite');
+
+function resolveDbPath(): string {
+  return process.env.IMCODES_SUPERVISOR_DEFAULTS_CACHE_DB_PATH?.trim()
+    || (process.env.VITEST ? ':memory:' : DEFAULT_DB_PATH);
+}
+
+let db: DatabaseSyncInstance | null = null;
+
+function getDb(): DatabaseSyncInstance {
+  if (db) return db;
+  const dbPath = resolveDbPath();
+  if (dbPath !== ':memory:') mkdirSync(dirname(dbPath), { recursive: true });
+  const opened = new DatabaseSync(dbPath);
+  opened.exec(`
+    PRAGMA journal_mode = WAL;
+    PRAGMA busy_timeout = 5000;
+    CREATE TABLE IF NOT EXISTS supervisor_defaults_cache (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      value TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  `);
+  db = opened;
+  return opened;
+}
+
+/** Best-effort: a locked or corrupt local file must never block startup. */
+function loadCachedSupervisorDefaultsFromDisk(): SupervisorDefaultConfig | null {
+  try {
+    const row = getDb().prepare('SELECT value FROM supervisor_defaults_cache WHERE id = 1').get() as
+      { value?: unknown } | undefined;
+    if (!row || typeof row.value !== 'string') return null;
+    return normalizeSupervisorDefaultConfig(JSON.parse(row.value));
+  } catch (err) {
+    logger.debug({ err }, 'supervisor-defaults-cache: disk read failed — starting cold');
+    return null;
+  }
+}
+
+/** Best-effort: a write failure keeps the in-memory value authoritative for this run. */
+function persistCachedSupervisorDefaultsToDisk(value: SupervisorDefaultConfig): void {
+  try {
+    getDb().prepare(`
+      INSERT INTO supervisor_defaults_cache (id, value, updated_at) VALUES (1, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    `).run(JSON.stringify(value), Date.now());
+  } catch (err) {
+    logger.debug({ err }, 'supervisor-defaults-cache: disk write failed — keeping in-memory value only');
+  }
+}
+
+let cachedSupervisorDefaults: SupervisorDefaultConfig | null = loadCachedSupervisorDefaultsFromDisk();
 let lastFetchedAt = 0;
+let refreshTimer: ReturnType<typeof setInterval> | null = null;
+const SUPERVISOR_DEFAULTS_REFRESH_INTERVAL_MS = 5_000;
 
 /** Exported for tests and for the WS-reconnect hook. */
 export async function refreshSupervisorDefaultsCache(): Promise<void> {
@@ -45,40 +123,102 @@ export async function refreshSupervisorDefaultsCache(): Promise<void> {
       logger.debug({ status: response.status }, 'supervisor-defaults-cache: fetch non-ok — keeping previous value');
       return;
     }
-    const body = await response.json() as { defaults?: Record<string, unknown> | null };
-    const defaults = body?.defaults ?? null;
-    const next = typeof defaults?.customInstructions === 'string'
-      ? defaults.customInstructions.trim() || null
-      : null;
-    if (next !== cachedGlobalCustomInstructions) {
+    const body = await response.json() as { defaults?: Partial<SupervisorDefaultConfig> | null };
+    const next = normalizeSupervisorDefaultConfig(body?.defaults ?? null);
+    if (JSON.stringify(next) !== JSON.stringify(cachedSupervisorDefaults)) {
       logger.info({
-        previousLength: cachedGlobalCustomInstructions?.length ?? 0,
-        nextLength: next?.length ?? 0,
-      }, 'supervisor-defaults-cache: globalCustomInstructions changed');
+        backend: next.backend,
+        model: next.model,
+        backupConfigured: !!next.backupBackend,
+        customInstructionsLength: next.customInstructions?.length ?? 0,
+      }, 'supervisor-defaults-cache: defaults changed');
+      // PostgreSQL remains the source of truth; this just mirrors the new
+      // authoritative value locally so the next restart/upgrade does not
+      // have to wait on a round trip to see it.
+      persistCachedSupervisorDefaultsToDisk(next);
     }
-    cachedGlobalCustomInstructions = next;
+    cachedSupervisorDefaults = next;
     lastFetchedAt = Date.now();
   } catch (err) {
     logger.debug({ err }, 'supervisor-defaults-cache: fetch failed — keeping previous value');
   }
 }
 
-/**
- * Return the cached global custom instructions string. `null` means either
- * not-fetched-yet or the user has no global defaults. Callers use this as a
- * fallback; they should prefer `snapshot.globalCustomInstructions` when set.
- */
-export function getCachedGlobalCustomInstructions(): string | null {
-  return cachedGlobalCustomInstructions;
+/** Full global runtime used authoritatively by every supervised session. */
+export function getCachedSupervisorDefaults(): SupervisorDefaultConfig | null {
+  return cachedSupervisorDefaults;
 }
 
-/** When was the last SUCCESSFUL fetch? 0 means never. */
+/** When was the last SUCCESSFUL fetch? 0 means never (a disk-seeded cold-start value counts as never fetched THIS run). */
 export function getSupervisorDefaultsCacheAgeMs(): number {
   return lastFetchedAt === 0 ? Infinity : Date.now() - lastFetchedAt;
 }
 
-/** Test-only hook. Resets cache state between tests. */
+/** Keep global runtime edits live without requiring a daemon reconnect. */
+export function startSupervisorDefaultsCacheRefresh(): void {
+  if (refreshTimer) return;
+  refreshTimer = setInterval(() => {
+    void refreshSupervisorDefaultsCache();
+  }, SUPERVISOR_DEFAULTS_REFRESH_INTERVAL_MS);
+  refreshTimer.unref?.();
+}
+
+export function stopSupervisorDefaultsCacheRefresh(): void {
+  if (!refreshTimer) return;
+  clearInterval(refreshTimer);
+  refreshTimer = null;
+}
+
+/**
+ * Overlay the cached account-level execution pool onto a snapshot, when the
+ * account has actually configured one.
+ *
+ * The pool is account-level policy keyed by model/agentType capability, not
+ * by which session happens to hold it. Unlike backend/model (which
+ * normalizeSupervisorDefaultConfig always fills with a concrete value), an
+ * account that never configured a pool still reports 'legacy_unconfigured'
+ * here; overlaying that state would regress a session whose own
+ * transportConfig already has a real pool, so it is applied only once the
+ * cache itself is genuinely 'configured'. Kept in this leaf module (no
+ * dependency on the daemon's other supervision files) so both the automation
+ * loop and send-tool's task-dispatch pool-eligibility check can share it
+ * without a static import between those two large, otherwise-decoupled files.
+ */
+export function overlayCachedExecutionPools<T extends Pick<SessionSupervisionSnapshot, 'executionPools'>>(
+  snapshot: T,
+): T {
+  const cached = cachedSupervisorDefaults;
+  if (!cached || cached.executionPools.state !== 'configured') return snapshot;
+  return { ...snapshot, executionPools: cached.executionPools };
+}
+
+/** Test-only hook. Resets cache state (memory and disk) between tests. */
 export function __resetSupervisorDefaultsCacheForTests(): void {
-  cachedGlobalCustomInstructions = null;
+  stopSupervisorDefaultsCacheRefresh();
+  cachedSupervisorDefaults = null;
+  lastFetchedAt = 0;
+  try {
+    db?.prepare('DELETE FROM supervisor_defaults_cache').run();
+  } catch {
+    // A missing/closed db here is fine; nothing to clear.
+  }
+}
+
+/** Test-only hook for exercising consumers without making an HTTP request. */
+export function __setCachedSupervisorDefaultsForTests(
+  defaults: Partial<SupervisorDefaultConfig> | null,
+): void {
+  cachedSupervisorDefaults = defaults ? normalizeSupervisorDefaultConfig(defaults) : null;
+  lastFetchedAt = defaults ? Date.now() : 0;
+}
+
+/**
+ * Test-only hook: reload the in-memory value from disk, exactly as module
+ * load does. Lets tests exercise the cold-start path without re-importing
+ * the module (module state would otherwise be a fresh singleton per file
+ * anyway, but this makes the restart behavior directly assertable).
+ */
+export function __reloadSupervisorDefaultsCacheFromDiskForTests(): void {
+  cachedSupervisorDefaults = loadCachedSupervisorDefaultsFromDisk();
   lastFetchedAt = 0;
 }

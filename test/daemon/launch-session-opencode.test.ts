@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   upsertSession: vi.fn(),
   newSession: vi.fn().mockResolvedValue(undefined),
+  killSession: vi.fn().mockResolvedValue(undefined),
   listOpenCodeSessions: vi.fn().mockResolvedValue([{ id: 'old-session', title: 'old', updated: 1, created: 1, directory: '/proj' }]),
   discoverOpenCodeSessionId: vi.fn().mockResolvedValue('oc-main-uuid'),
   startOpenCodeWatching: vi.fn().mockResolvedValue(undefined),
@@ -21,6 +22,21 @@ vi.mock('../../src/agent/tmux.js', () => ({
   getPaneId: vi.fn().mockResolvedValue('%1'),
   cleanupOrphanFifos: vi.fn(),
   newSession: mocks.newSession,
+  killSession: mocks.killSession,
+}));
+
+// launchSession owns resource-ledger registration, but this unit verifies only
+// OpenCode session-id discovery/persistence. Never let it read or mutate the
+// developer machine's real ~/.imcodes/session-resources ledger: a stale real
+// owner with the same fixture name otherwise turns this deterministic unit into
+// session_resource_owner_conflict (and the cleanup branch then needs tmux
+// killSession despite no real tmux session having been created).
+vi.mock('../../src/daemon/session-resource-service.js', () => ({
+  registerTmuxSessionResource: vi.fn().mockResolvedValue(undefined),
+  initializeSessionResourceLifecycle: vi.fn().mockResolvedValue({ released: 0, failed: 0, preserved: 0 }),
+  releaseSessionChildResources: vi.fn().mockResolvedValue({ released: 0, failed: 0 }),
+  releaseSessionResources: vi.fn().mockResolvedValue({ released: 0, failed: 0 }),
+  resourceOwnerEnv: vi.fn(() => ({})),
 }));
 
 vi.mock('../../src/daemon/jsonl-watcher.js', () => ({

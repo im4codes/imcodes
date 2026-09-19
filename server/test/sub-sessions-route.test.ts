@@ -279,6 +279,76 @@ describe('sub-session routes', () => {
     });
   });
 
+  it('keeps every participant transportConfig shape read-only before DB or daemon mutation', async () => {
+    const { getSubSessionById } = await import('../src/db/queries.js');
+    vi.mocked(getSubSessionById).mockResolvedValue({
+      id: 'sub12345',
+      server_id: 'srv1',
+      type: 'codex-sdk',
+      transport_config: { supervision: { mode: 'supervised_audit' } },
+    } as any);
+    mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({
+      ok: false,
+      reason: 'share-direct-surface-denied',
+    });
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      membership: 'none',
+      actor: { kind: 'share', effectiveActorRole: 'participant' },
+    });
+
+    const attemptedTransportConfigs = [
+      null,
+      {},
+      { provider: { mode: 'partial' } },
+      { supervision: null },
+      ...(['off', 'supervised', 'supervised_audit'] as const).map((mode) => ({
+        supervision: { mode },
+      })),
+    ];
+    for (const transportConfig of attemptedTransportConfigs) {
+      const res = await app.request('/api/server/srv1/sub-sessions/sub12345', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label: 'must-not-mutate-either', transportConfig }),
+      });
+      expect(res.status, JSON.stringify(transportConfig)).toBe(403);
+      await expect(res.json()).resolves.toEqual({ error: 'forbidden', reason: 'share-role-denied' });
+    }
+
+    expect(updateSubSessionMock).not.toHaveBeenCalled();
+    expect(sendToDaemonMock).not.toHaveBeenCalled();
+  });
+
+  it('preserves the owner sub-session transportConfig write path', async () => {
+    const { getSubSessionById } = await import('../src/db/queries.js');
+    vi.mocked(getSubSessionById).mockResolvedValue({
+      id: 'sub12345',
+      server_id: 'srv1',
+      type: 'codex-sdk',
+      transport_config: {},
+    } as any);
+    const transportConfig = {
+      provider: { mode: 'balanced' },
+      supervision: { mode: 'off' },
+    };
+
+    const res = await app.request('/api/server/srv1/sub-sessions/sub12345', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ transportConfig }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(updateSubSessionMock).toHaveBeenCalledWith({}, 'sub12345', 'srv1', {
+      transport_config: transportConfig,
+    });
+    expect(JSON.parse(String(sendToDaemonMock.mock.calls[0]?.[0]))).toEqual({
+      type: DAEMON_COMMAND_TYPES.SUBSESSION_UPDATE_TRANSPORT_CONFIG,
+      sessionName: 'deck_sub_sub12345',
+      transportConfig,
+    });
+  });
+
   it('denies a shared viewer updating a sub-session', async () => {
     const { getSubSessionById } = await import('../src/db/queries.js');
     vi.mocked(getSubSessionById).mockResolvedValue({
@@ -306,7 +376,7 @@ describe('sub-session routes', () => {
     expect(updateSubSessionMock).not.toHaveBeenCalled();
   });
 
-  it('PATCH /sub-sessions/:id relays transport-config updates without a restart', async () => {
+  it('PATCH /sub-sessions/:id refuses targetless automatic-audit enablement even with a live pool', async () => {
     const { getSubSessionById } = await import('../src/db/queries.js');
     vi.mocked(getSubSessionById).mockResolvedValue({
       id: 'sub12345',
@@ -318,23 +388,40 @@ describe('sub-session routes', () => {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        transportConfig: { supervision: { mode: 'supervised' } },
+        transportConfig: {
+          supervision: {
+            mode: 'supervised_audit',
+            backend: 'codex-sdk',
+            model: 'gpt-5.6-sol',
+            timeoutMs: 30_000,
+            promptVersion: 'supervision_decision_v1',
+            maxParseRetries: 1,
+            maxAutoContinueStreak: 2,
+            maxAutoContinueTotal: 0,
+            maxAuditLoops: 2,
+            taskRunPromptVersion: 'task_run_status_v1',
+            executionPools: {
+              state: 'configured',
+              primaryDevelopmentPool: {
+                configs: [{
+                  capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6-sol',
+                  agentType: 'codex-sdk',
+                  providerFamily: 'openai',
+                  runtimeType: 'transport',
+                  model: 'gpt-5.6-sol',
+                }],
+                controls: {},
+              },
+              economyTaskPool: { configs: [], controls: {} },
+            },
+          },
+        },
       }),
     });
 
-    expect(res.status).toBe(200);
-    expect(updateSubSessionMock).toHaveBeenCalledWith(
-      {},
-      'sub12345',
-      'srv1',
-      {
-        transport_config: { supervision: { mode: 'supervised' } },
-      },
-    );
-    expect(JSON.parse(String(sendToDaemonMock.mock.calls[0]?.[0]))).toEqual({
-      type: DAEMON_COMMAND_TYPES.SUBSESSION_UPDATE_TRANSPORT_CONFIG,
-      sessionName: 'deck_sub_sub12345',
-      transportConfig: { supervision: { mode: 'supervised' } },
-    });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: 'forbidden', reason: 'brain_session_required' });
+    expect(updateSubSessionMock).not.toHaveBeenCalled();
+    expect(sendToDaemonMock).not.toHaveBeenCalled();
   });
 });

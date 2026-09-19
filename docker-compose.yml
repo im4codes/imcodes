@@ -31,6 +31,12 @@ services:
       TRUSTED_PROXIES: "127.0.0.1,172.16.0.0/12,10.0.0.0/8,192.168.0.0/16"
       GITHUB_CLIENT_ID: "${GITHUB_CLIENT_ID:-}"
       GITHUB_CLIENT_SECRET: "${GITHUB_CLIENT_SECRET:-}"
+      # Point retention at the named volume below. Unset, the store defaults to
+      # <IMCODES_NODE_EXE_DIR>/versions, which lives in the image and is lost on
+      # every image replacement.
+      IMCODES_NODE_EXE_VERSION_DIR: /var/lib/imcodes/node-exe-versions
+    volumes:
+      - node_exe_versions:/var/lib/imcodes/node-exe-versions
     labels:
       - com.centurylinklabs.watchtower.scope=imcodes
     depends_on:
@@ -68,3 +74,9 @@ volumes:
   pgdata:
   caddy_data:
   caddy_config:
+  # Retained superseded controlled-node artifacts. Declared explicitly so an
+  # upgrade neither renames nor drops it, and kept separate from the image's
+  # /app/controlled-node-executables so a new image cannot overwrite retained
+  # bytes. Without it, replacing the Server image destroys every retained
+  # version and every install code minted against one.
+  node_exe_versions:

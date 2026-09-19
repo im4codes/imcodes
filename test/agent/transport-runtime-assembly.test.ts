@@ -6,6 +6,22 @@ import {
 } from '../../src/agent/transport-runtime-assembly.js';
 import type { TransportProvider } from '../../src/agent/transport-provider.js';
 import type { TransportMemoryRecallArtifact } from '../../shared/context-types.js';
+import { CAPABILITY_AI_SYSTEM_INSTRUCTIONS } from '../../shared/capability-management.js';
+import { MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS } from '../../shared/mcp-tool-discovery.js';
+import { TRANSPORT_SESSION_AGENT_TYPES } from '../../shared/agent-types.js';
+import { SUPERVISION_CONTRACT_IDS } from '../../shared/supervision-config.js';
+import { REAL_DEVICE_TESTING_SYSTEM_GUIDANCE } from '../../shared/transport-runtime-prompts.js';
+import { VERIFICATION_MACHINE_MCP_TOOLS } from '../../shared/verification-machine.js';
+import { ALIAS_MCP_TOOLS } from '../../shared/alias-types.js';
+import { MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
+import { AUDIT_CONVERGENCE_CONTRACT_ID } from '../../shared/audit-convergence.js';
+import {
+  SESSION_IDENTITY_PROJECT_MAX_CHARS as ID_PROJECT_MAX,
+  SESSION_IDENTITY_SESSION_MAX_CHARS as ID_SESSION_MAX,
+  SESSION_IDENTITY_USER_MAX_CHARS as ID_USER_MAX,
+  renderSessionIdentityProfiles as renderIdentityProfilesForAssembly,
+} from '../../shared/session-identity.js';
+import { compileAgentContextArtifact as compileArtifactForIdentity } from '../../src/agent/transport-runtime-assembly.js';
 
 function makeProvider(
   contextSupport: NonNullable<TransportProvider['capabilities']['contextSupport']>,
@@ -55,6 +71,18 @@ function makeRecall(overrides: Partial<TransportMemoryRecallArtifact> = {}): Tra
 }
 
 describe('buildProviderContextPayload', () => {
+  it('places a newly registered cron contract in per-turn system text, not the user message', () => {
+    const body = '{"contractId":"supervision_cron_control_v1","authoritative":{"taskBody":"inspect progress"}}';
+    const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+      userMessage: '<imcodes-cron-control {"contractRef":"supervision_cron_control_v1","scheduleId":"job-1"}></imcodes-cron-control>',
+      registeredSystemContractText: body,
+    });
+
+    expect(payload.turnSystemText).toBe(body);
+    expect(payload.userMessage).not.toContain('inspect progress');
+    expect(payload.systemText).toContain('inspect progress');
+  });
+
   it('assembles normalized system context from description and runtime prompt', () => {
     const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
       userMessage: 'Run tests',
@@ -73,33 +101,243 @@ describe('buildProviderContextPayload', () => {
     expect(payload.systemText).toContain('Be concise');
     expect(payload.systemText).toContain('Never edit generated files');
     expect(payload.systemText).toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
+    expect(payload.systemText).toContain(MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS);
+    expect(payload.systemText).toContain('tools/list_changed');
+    expect(payload.systemText).toContain('fallbackCall');
     expect(payload.systemText).toContain('exact tool identifier shown in the current tool list');
     expect(payload.systemText).toContain('available memory source-expansion tool');
     expect(payload.systemText).not.toMatch(/\bcall (?:search_memory|get_memory_sources)\b/);
     expect(payload.systemText).toContain('sourceLookup object');
-    expect(payload.systemText).toContain('Keep work updates sparse and high-signal.');
-    expect(payload.systemText).toContain('At key boundaries only');
+    expect(payload.systemText).toContain('Keep work updates short and high-signal');
+    expect(payload.systemText).toContain('at least every 5 minutes or every 15 tool calls');
     expect(payload.systemText).toContain('full absolute filesystem path');
     expect(payload.systemText).toContain('not a bare filename or relative path');
   });
 
+  it('keeps the synchronized identity contract intact in stable session system text', () => {
+    const identityPrompt = '<imcodes-agent-identity>\n<user>account rule</user>\n<project>project rule</project>\n<session>session rule</session>\n</imcodes-agent-identity>';
+    const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+      userMessage: 'Run tests',
+      identityPrompt,
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+    });
+
+    expect(payload.sessionSystemText).toContain(identityPrompt);
+    expect(payload.turnSystemText).toBeUndefined();
+    expect(payload.userMessage).not.toContain(identityPrompt);
+  });
+
+  // A Brain's delegation duty does not depend on supervision being enabled, and
+  // it must survive restart/resume and compaction. Field incident: the contract
+  // last appeared far earlier in the rollout, was never re-injected after
+  // compaction, and the session carried no supervision binding at all -- so the
+  // Brain fell back to provider-native collaboration with no IM authority.
+  // turnSystemText is the only per-turn channel (sessionSystemText rides
+  // baseInstructions, sent once per thread/start|resume).
+  // Compact contract re-assertion. Once the full contract body has been
+  // registered for the thread, later turns must re-assert it BY REFERENCE
+  // (contractRefs + binding + delta) rather than resending the ~830-char body.
+  // `contractId` vs `contractRef` is the mechanical distinction the prompt
+  // module already uses: carrying the contract vs referencing it.
+  it('registers the full Brain contract once, then re-asserts it by reference', () => {
+    const build = (brainContractRegistered: boolean) => buildProviderContextPayload(
+      makeProvider('compact-contract-reassertion'),
+      {
+        userMessage: 'assign these to sub-windows',
+        sessionIdentity: { sessionName: 'deck_proj_brain', label: 'Brain', role: 'brain' },
+        namespace: { scope: 'personal', projectId: 'repo-1' },
+        brainContractRegistered,
+      },
+    );
+
+    const first = build(false).turnSystemText ?? '';
+    expect(first, 'the first turn must register the full contract body').toContain('"contractId"');
+    expect(first).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+
+    const later = build(true).turnSystemText ?? '';
+    expect(
+      later,
+      'a registered contract must never be resent as a full body',
+    ).not.toContain('"contractId"');
+    expect(later, 'the later turn must still bind the contract by reference')
+      .toContain('"contractRef"');
+    expect(later).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+    expect(
+      later.length,
+      'the compact re-assertion must be materially smaller than the body',
+    ).toBeLessThan(first.length);
+  });
+
+  it('does not re-assert any contract for a non-Brain session', () => {
+    const payload = buildProviderContextPayload(
+      makeProvider('compact-contract-non-brain'),
+      {
+        userMessage: 'do the work',
+        sessionIdentity: { sessionName: 'deck_proj_w1', label: 'W1', role: 'w1' },
+        namespace: { scope: 'personal', projectId: 'repo-1' },
+        brainContractRegistered: true,
+      },
+    );
+    const text = payload.turnSystemText ?? '';
+    expect(text).not.toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+  });
+
+  // The mode dimension, now REAL. The matrix this replaces iterated a mode
+  // variable it never passed into the assembly (and one of its three values,
+  // 'manual', is not even a supervision mode), so it proved only the role gate
+  // and would have passed for any mode at all.
+  //
+  // `automaticSupervisionEnabled` is the per-turn answer of the single mode
+  // authority, isAutomaticSupervisionEnabled(session supervision snapshot).
+  // Field incident behind the split: a supervision-OFF Brain on a daily cron
+  // received the full supervised-delegation contract every turn, so it minted a
+  // supervision task, drove recovery/rebind loops and dispatched its own audit
+  // for a morning report nobody asked to supervise.
+  const brainTurnText = (input: { automaticSupervisionEnabled?: boolean; brainContractRegistered?: boolean }) => (
+    buildProviderContextPayload(
+      makeProvider('full-normalized-context-injection'),
+      {
+        userMessage: 'assign these to sub-windows',
+        sessionIdentity: { sessionName: 'deck_proj_brain', label: 'Brain', role: 'brain' },
+        namespace: { scope: 'personal', projectId: 'repo-1' },
+        ...input,
+      },
+    ).turnSystemText ?? ''
+  );
+
+  const AUTOMATIC_SUPERVISION_MARKERS = [
+    'task_assignment',
+    'coordinate_not_implement',
+    'blockedRecoveryDuty',
+    'authorityDuty',
+  ] as const;
+
+  // Absent is the fail-closed case: a runtime whose mode cannot be established
+  // must never be told to run supervision automatically.
+  for (const [label, automaticSupervisionEnabled] of [['off', false], ['absent', undefined]] as const) {
+    it(`gives a supervision-${label} Brain the manual-only contract and none of the automatic task route`, () => {
+      for (const turn of [1, 2]) {
+        const text = brainTurnText({ automaticSupervisionEnabled });
+        // The per-turn baseline itself survives: the compaction fix stands.
+        expect(text, `turn ${turn} must still carry the delegation contract`)
+          .toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+        expect(text).toContain('"automaticSupervision":false');
+        // Supervised work is arranged by hand, never on the Brain's own initiative.
+        expect(text).toContain('explicit_user_request');
+        // The routing constraint the baseline exists for is preserved: when a
+        // Brain does delegate task work, it delegates through IM.codes. Native
+        // agents remain available for read-only analysis, never as participants.
+        expect(text).toContain('provider_native_task_participation');
+        expect(text).toContain('ephemeral_read_only_analysis');
+        for (const automatic of AUTOMATIC_SUPERVISION_MARKERS) {
+          expect(text, `${automatic} must not reach a supervision-${label} Brain`).not.toContain(automatic);
+        }
+      }
+    });
+  }
+
+  it('keeps the full supervised-delegation contract for a Brain with automatic supervision enabled', () => {
+    const text = brainTurnText({ automaticSupervisionEnabled: true });
+    expect(text).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+    expect(text).toContain('"automaticSupervision":true');
+    for (const automatic of AUTOMATIC_SUPERVISION_MARKERS) {
+      expect(text, `${automatic} is part of the automatic contract`).toContain(automatic);
+    }
+  });
+
+  it('makes every re-assertion name its variant, so an off reference can never stand in for the on body', () => {
+    const offRef = brainTurnText({ automaticSupervisionEnabled: false, brainContractRegistered: true });
+    const onRef = brainTurnText({ automaticSupervisionEnabled: true, brainContractRegistered: true });
+    for (const ref of [offRef, onRef]) {
+      expect(ref).toContain('"contractRef"');
+      expect(ref).not.toContain('"contractId"');
+    }
+    expect(offRef).toContain('"automaticSupervision":false');
+    expect(offRef, 'an off reference must not name the supervised carrier').not.toContain('"fullText"');
+    expect(onRef).toContain('"fullText":"supervisionDecision"');
+    expect(onRef).not.toContain('"automaticSupervision":false');
+  });
+
+  // Delegation authority never drags the audit lifecycle in with it, in either
+  // variant. The audit lifecycle lives in the supervision broker's decision and
+  // continuation channel, which is already mode-conditional; audit contracts
+  // must NOT be moved into turnSystemText.
+  for (const automaticSupervisionEnabled of [false, true, undefined]) {
+    it(`keeps the baseline layer audit-free (automaticSupervisionEnabled=${String(automaticSupervisionEnabled)})`, () => {
+      const text = brainTurnText({ automaticSupervisionEnabled });
+      expect(text).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+      expect(text).not.toContain(SUPERVISION_CONTRACT_IDS.TASK_FINALIZATION);
+      expect(text).not.toContain(SUPERVISION_CONTRACT_IDS.CONTEXTUAL_AUDIT);
+    });
+  }
+
+  it('never injects Brain delegation authority into a non-Brain session', () => {
+    // Control: proves the assertion above is about the ROLE, not about every
+    // session getting the contract.
+    const payload = buildProviderContextPayload(
+      makeProvider('full-normalized-context-injection'),
+      {
+        userMessage: 'do the work',
+        sessionIdentity: { sessionName: 'deck_proj_w1', label: 'W1', role: 'w1' },
+        namespace: { scope: 'personal', projectId: 'repo-1' },
+      },
+    );
+    expect(payload.turnSystemText ?? '').not.toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+  });
+
+  // Any session can be an auditor, an implementer or an orchestrator, and audit
+  // messages only reference the convergence contract by id. So the body must be
+  // registered in the stable system prompt of every managed session -- once per
+  // thread, never resent through the per-turn channel or the user message.
+  it('registers the audit convergence contract in the stable system prompt of every managed provider', () => {
+    const body = `"contractId":"${AUDIT_CONVERGENCE_CONTRACT_ID}"`;
+    const structuredEvidencePolicy = 'exact-bound implementer or teammate structured test results are valid evidence';
+    const rawArtifactPolicy = 'raw logs, transcripts, hashes, and bundle attachments are never PASS prerequisites';
+    const providerIds = TRANSPORT_SESSION_AGENT_TYPES.filter((providerId) => providerId !== 'openclaw');
+    for (const providerId of providerIds) {
+      const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection', providerId), {
+        userMessage: 'review the change',
+        sessionIdentity: { sessionName: 'deck_proj_w1', label: 'W1', role: 'w1' },
+        namespace: { scope: 'personal', projectId: 'repo-1' },
+      });
+      expect(payload.sessionSystemText, providerId).toContain(body);
+      expect(payload.sessionSystemText, providerId).toContain(structuredEvidencePolicy);
+      expect(payload.sessionSystemText, providerId).toContain(rawArtifactPolicy);
+      expect(payload.sessionSystemText, providerId).not.toContain('"missing":"P1"');
+      expect(payload.turnSystemText ?? '', providerId).not.toContain(body);
+      expect(payload.userMessage, providerId).not.toContain(body);
+    }
+    const slashControl = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+      userMessage: '/compact',
+      suppressMcpMemorySearchGuidance: true,
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+    });
+    expect(slashControl.sessionSystemText ?? '').not.toContain(body);
+  });
+
+  // Field complaint: long tasks ran for many minutes with no user-visible word.
+  // The old guidance only said "sparse, key boundaries only" and set no ceiling.
+  it('bounds how long a session may work without a user-visible progress update', () => {
+    const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+      userMessage: 'run the full regression and deploy',
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+    });
+    const text = payload.sessionSystemText ?? '';
+    expect(text).toContain('at least every 5 minutes or every 15 tool calls');
+    expect(text).toContain('Never work longer than that with no user-visible update');
+    expect(text).toContain('never turn a status into a long report');
+    expect(text).toContain('Before any step likely to take more than about 2 minutes');
+    expect(text).not.toContain('At key boundaries only');
+  });
+
   it('adds shared system guidance for every managed SDK provider id', () => {
-    const providerIds = [
-      'claude-code-sdk',
-      'gemini-sdk',
-      'kimi-sdk',
-      'copilot-sdk',
-      'codex-sdk',
-      'cursor-headless',
-      'opencode-sdk',
-      'qwen',
-      'pi',
-    ];
+    const providerIds = TRANSPORT_SESSION_AGENT_TYPES.filter((providerId) => providerId !== 'openclaw');
 
     for (const providerId of providerIds) {
       const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection', providerId), {
         userMessage: 'What did we decide about memory recall last week?',
         namespace: { scope: 'personal', projectId: 'repo-1' },
+        identityPrompt: '<imcodes-agent-identity>cross-sdk identity sentinel</imcodes-agent-identity>',
       });
 
       expect(payload.systemText).toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
@@ -110,9 +348,10 @@ describe('buildProviderContextPayload', () => {
       expect(payload.systemText).toContain('available memory source-expansion tool with the returned fields');
       expect(payload.systemText).not.toMatch(/\bcall (?:search_memory|get_memory_sources)\b/);
       expect(payload.systemText).toContain('do not invent details from summaries alone');
-      expect(payload.systemText).toContain('Keep work updates sparse and high-signal.');
+      expect(payload.systemText).toContain('Keep work updates short and high-signal');
       expect(payload.systemText).toContain('skip routine narration and repeated summaries');
       expect(payload.systemText).toContain('full absolute filesystem path');
+      expect(payload.sessionSystemText).toContain('cross-sdk identity sentinel');
       expect(payload.assembledMessage).toBe('What did we decide about memory recall last week?');
     }
   });
@@ -138,7 +377,7 @@ describe('buildProviderContextPayload', () => {
     });
 
     expect(payload.systemText).not.toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
-    expect(payload.systemText).toContain('Keep work updates sparse and high-signal.');
+    expect(payload.systemText).toContain('Keep work updates short and high-signal');
   });
 
   it('renders startup memory and message recall into messagePreamble without mutating userMessage', () => {
@@ -571,6 +810,21 @@ describe('buildProviderContextPayload', () => {
       expect(systemText).toContain('Display label: My App Brain');
       expect(systemText).toContain('imcodes send');
       expect(systemText).toContain('full absolute filesystem path');
+      expect(systemText).toContain(REAL_DEVICE_TESTING_SYSTEM_GUIDANCE);
+      expect(systemText).toContain('perform it before audit');
+      // Discovery comes BEFORE asking. The guidance used to go straight from
+      // "use controlled nodes" to "ask the user", with no way to learn which
+      // machines were already authorized for this user and project -- so the
+      // verification machines configured for exactly this went unused.
+      expect(systemText).toContain(`call ${VERIFICATION_MACHINE_MCP_TOOLS.LIST}`);
+      expect(systemText.indexOf(VERIFICATION_MACHINE_MCP_TOOLS.LIST))
+        .toBeLessThan(systemText.indexOf('ask the user for that specific authorization'));
+      // Both kinds the list can return, each with the tool that reaches it.
+      expect(systemText).toContain(MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE);
+      expect(systemText).toContain(ALIAS_MCP_TOOLS.RESOLVE);
+      expect(systemText).toContain(CAPABILITY_AI_SYSTEM_INSTRUCTIONS);
+      expect(systemText).toContain('the user\'s latest explicit instruction is authoritative');
+      expect(systemText).toContain('This does not override platform system/developer instructions');
       expect(systemText).toContain(MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE);
     });
 
@@ -618,7 +872,7 @@ describe('buildProviderContextPayload', () => {
       // Order matters for prefix-cache friendliness: stable session-level
       // blocks should appear in a deterministic order so the model's
       // prompt cache hits across turns. The assembly order is:
-      //   description -> systemPrompt -> identity -> memory-search
+      //   user authority -> capability tools -> description -> systemPrompt -> identity -> memory-search
       //   guidance -> agent progress guidance.
       const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
         userMessage: 'hi',
@@ -631,13 +885,38 @@ describe('buildProviderContextPayload', () => {
       const descIdx = systemText.indexOf('desc-here');
       const spIdx = systemText.indexOf('sp-here');
       const identityIdx = systemText.indexOf('IM.codes session identity:');
+      const userAuthorityIdx = systemText.indexOf('HIGHEST-PRIORITY IM.codes USER-AUTHORITY POLICY');
+      const capabilityIdx = systemText.indexOf('HIGHEST-PRIORITY IM.codes SERVICE ROUTING POLICY');
       const memoryIdx = systemText.indexOf('Use the available memory MCP tools');
-      const progressIdx = systemText.indexOf('Keep work updates sparse and high-signal.');
-      expect(descIdx).toBeGreaterThanOrEqual(0);
+      const realDeviceIdx = systemText.indexOf('REAL-DEVICE TESTING PRIORITY');
+      const progressIdx = systemText.indexOf('Keep work updates short and high-signal');
+      expect(userAuthorityIdx).toBe(0);
+      expect(capabilityIdx).toBeGreaterThan(userAuthorityIdx);
+      expect(systemText).toContain('Never rewrite, replace, narrow, or override any third-party provider or SDK tool definition');
+      expect(descIdx).toBeGreaterThan(capabilityIdx);
       expect(spIdx).toBeGreaterThan(descIdx);
       expect(identityIdx).toBeGreaterThan(spIdx);
-      expect(memoryIdx).toBeGreaterThan(identityIdx);
+      expect(realDeviceIdx).toBeGreaterThan(identityIdx);
+      expect(memoryIdx).toBeGreaterThan(realDeviceIdx);
       expect(progressIdx).toBeGreaterThan(memoryIdx);
     });
+  });
+});
+
+describe('identity through provider-neutral assembly', () => {
+  it('carries a filled three-scope identity into the stable system text without truncation', () => {
+    // Only the Codex adapter owns a context budget; the shared assembly that
+    // every other provider consumes must never shorten the identity.
+    const profile = (scope: 'user' | 'project' | 'session', content: string) => ({
+      scope, scopeKey: scope === 'user' ? '' : `${scope}-key`, content, contentHash: scope, revision: 1, updatedAt: 1, source: 'web' as const,
+    });
+    const identityPrompt = renderIdentityProfilesForAssembly([
+      profile('user', 'U'.repeat(ID_USER_MAX)),
+      profile('project', 'P'.repeat(ID_PROJECT_MAX)),
+      profile('session', 'S'.repeat(ID_SESSION_MAX)),
+    ])!;
+    const artifact = compileArtifactForIdentity({ userMessage: 'continue', identityPrompt });
+    expect(artifact.sessionSystemText).toContain(identityPrompt);
+    expect(artifact.systemText).toContain(identityPrompt);
   });
 });

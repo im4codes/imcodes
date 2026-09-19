@@ -87,6 +87,8 @@ export interface TransportMemoryRecallItem {
   id: string;
   type?: 'raw' | 'processed' | 'observation';
   projectId: string;
+  /** Session whose timeline produced this projection, when provenance is known. */
+  sourceSessionName?: string;
   scope?: string;
   enterpriseId?: string;
   workspaceId?: string;
@@ -122,9 +124,30 @@ export interface TransportMemoryRecallArtifact {
   sourceKind?: MemoryRecallSourceKind;
 }
 
+/**
+ * Where the user-authored identity body sits inside a composed prompt string.
+ *
+ * The span is recorded by the code that composes the string, from the known
+ * lengths of the parts it joined. It is never recovered by searching the text:
+ * the composed string also contains user-authored description and authored turn
+ * context, which may contain forged identity delimiters. `sha256` binds the span to
+ * the exact identity body bytes, so a span that no longer lines up with its text
+ * (for example after any intermediate rewrite) is rejected instead of trusted.
+ */
+export interface IdentitySegmentSpan {
+  /** UTF-16 offset of the first identity-body code unit. */
+  start: number;
+  /** UTF-16 offset just past the identity body. */
+  end: number;
+  /** Lowercase hex SHA-256 of `text.slice(start, end)` as UTF-8. */
+  sha256: string;
+}
+
 export interface CompiledAgentContextArtifact {
   /** Stable instructions that can be attached once per provider session/thread. */
   sessionSystemText?: string;
+  /** Structured position of the identity body inside `sessionSystemText`. */
+  sessionSystemTextIdentity?: IdentitySegmentSpan;
   /** Instructions that may vary per turn, such as authored context selected by file/language. */
   turnSystemText?: string;
   /**
@@ -152,6 +175,11 @@ export interface ProviderContextPayload {
   deliveryId?: string;
   /** Runtime-minted transport activity generation for lifecycle attribution. */
   activityGeneration?: ActivityGeneration;
+  /**
+   * Authoritative session role from the session record. Providers gate
+   * Brain-only behaviour on this; it is never inferred from a session name.
+   */
+  sessionRole?: 'brain' | `w${number}`;
   sessionSystemText?: string;
   turnSystemText?: string;
   /**
@@ -293,6 +321,8 @@ export interface ContextMemoryStatsView {
   stagedEventCount: number;
   dirtyTargetCount: number;
   pendingJobCount: number;
+  /** The isolated local store could not answer this request; retry is safe. */
+  localUnavailable?: boolean;
 }
 
 export interface ContextMemoryProjectView {

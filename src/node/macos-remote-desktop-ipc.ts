@@ -1,0 +1,861 @@
+import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { dirname } from 'node:path';
+import {
+  REMOTE_DESKTOP_LIMITS,
+  REMOTE_DESKTOP_MSG,
+  validateRemoteDesktopDaemonCommand,
+  validateRemoteDesktopDaemonMessage,
+  type RemoteDesktopDaemonCommand,
+  type RemoteDesktopDaemonMessage,
+  type RemoteDesktopPrepare,
+} from '../../shared/remote-desktop.js';
+import { REMOTE_DESKTOP_WORKER_IPC_VERSION } from '../../shared/remote-desktop-worker.js';
+import {
+  hasExactRemoteDesktopKeys,
+  isRemoteDesktopRecord,
+  remoteDesktopUtf8Bytes,
+} from '../../shared/remote-desktop-contract-primitives.js';
+import {
+  MACOS_REMOTE_DESKTOP_GRAPHICAL_RUNTIME_ROOT,
+  MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY,
+  MACOS_REMOTE_DESKTOP_WORKER_IDENTITY,
+  macosRemoteDesktopGraphicalSessionPaths,
+  macosRemoteDesktopUserSessionPaths,
+} from './macos-user-session.js';
+import {
+  assertMacosUserSession,
+  type MacosRemoteDesktopGraphicalSessionAuthority,
+  type MacosUserSession,
+} from './user-session-launcher.js';
+import {
+  validateVirtualDisplayProxyRequest,
+  type MacosVirtualDisplayProxyReply,
+  type MacosVirtualDisplayProxyRequest,
+} from './macos-virtual-display-proxy.js';
+import { appleDesignatedRequirement } from '../../shared/macos-code-requirement.js';
+
+export const MACOS_REMOTE_DESKTOP_IPC_MESSAGE = Object.freeze({
+  HELLO: 'remote_desktop.macos_ipc.hello',
+  AUTHENTICATED: 'remote_desktop.macos_ipc.authenticated',
+  HOST_COMMAND: 'remote_desktop.macos_ipc.host_command',
+  WORKER_MESSAGE: 'remote_desktop.macos_ipc.worker_message',
+  /**
+   * Worker asks the daemon a virtual-display question; the daemon answers.
+   *
+   * A worker never speaks to the resident agent: it asks over this already
+   * authenticated socket, and the daemon forwards a request it AUTHORS itself
+   * onto the one agent lease. Forwarding the worker's own line would let it name
+   * a route generation belonging to another session.
+   */
+  VIRTUAL_DISPLAY_REQUEST: 'remote_desktop.macos_ipc.virtual_display_request',
+  VIRTUAL_DISPLAY_REPLY: 'remote_desktop.macos_ipc.virtual_display_reply',
+  /**
+   * Worker asks whether a sign-in secret is configured, or -- to perform an
+   * unlock the controller asked for -- for the secret itself. The daemon keeps
+   * the secret root-only and answers only this authenticated generation.
+   */
+  UNLOCK_REQUEST: 'remote_desktop.macos_ipc.unlock_request',
+  UNLOCK_REPLY: 'remote_desktop.macos_ipc.unlock_reply',
+  /**
+   * Daemon asks the worker to raise (shield=true) or lift (shield=false) the
+   * management-privacy frame shield. The worker answers once the shield is up
+   * and held input is released, or -- when lifting -- only after a real frame
+   * captured after the lift has been encoded.
+   */
+  PRIVACY_REQUEST: 'remote_desktop.macos_ipc.privacy_request',
+  PRIVACY_REPLY: 'remote_desktop.macos_ipc.privacy_reply',
+} as const);
+
+/** Large enough for the bounded SDP contract, but never an unbounded JSON stream. */
+export const MACOS_REMOTE_DESKTOP_IPC_MAX_FRAME_BYTES = REMOTE_DESKTOP_LIMITS.SDP_BYTES + 16 * 1024;
+export const MACOS_REMOTE_DESKTOP_RUNTIME_DIRECTORY_MODE = 0o700;
+export const MACOS_REMOTE_DESKTOP_SOCKET_MODE = 0o600;
+
+const CHALLENGE_BYTES = 32;
+const CHALLENGE_RE = /^[A-Za-z0-9_-]{43}$/;
+const APPLE_TEAM_ID_RE = /^[A-Z0-9]{10}$/;
+const MAX_DESIGNATED_REQUIREMENT_BYTES = 1024;
+
+export interface MacosRemoteDesktopExpectedCodeIdentity {
+  bundleIdentifier:
+    | typeof MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.bundleIdentifier
+    | typeof MACOS_REMOTE_DESKTOP_WORKER_IDENTITY.bundleIdentifier;
+  teamId: string;
+  designatedRequirement: string;
+}
+
+/**
+ * Evidence produced by the native peer-inspection boundary (getpeereid plus
+ * Security.framework SecCode validation), never by fields read from IPC JSON.
+ */
+export interface MacosRemoteDesktopVerifiedPeerIdentity {
+  uid: number;
+  auditSessionId: number;
+  pidVersion: number;
+  /** Independently observed from the authenticated graphical peer boundary. */
+  kind: MacosRemoteDesktopIpcPrincipalBinding['kind'];
+  sessionType: MacosRemoteDesktopIpcPrincipalBinding['sessionType'];
+  bundleIdentifier: string;
+  teamId: string;
+  designatedRequirement: string;
+}
+
+export interface MacosRemoteDesktopFilesystemEntry {
+  path: string;
+  uid: number;
+  mode: number;
+  kind: 'directory' | 'socket';
+}
+
+export interface MacosRemoteDesktopSocketSecurityEvidence {
+  runtimeDirectory: MacosRemoteDesktopFilesystemEntry;
+  socket: MacosRemoteDesktopFilesystemEntry;
+}
+
+export interface MacosRemoteDesktopIpcLaunch {
+  workerGeneration: number;
+  challenge: string;
+  socketPath: string;
+}
+
+export interface MacosRemoteDesktopIpcHello {
+  type: typeof MACOS_REMOTE_DESKTOP_IPC_MESSAGE.HELLO;
+  ipcVersion: typeof REMOTE_DESKTOP_WORKER_IPC_VERSION;
+  workerGeneration: number;
+  challenge: string;
+}
+
+/** Daemon-authored proof returned only after kernel and code-identity checks. */
+export interface MacosRemoteDesktopIpcAuthenticated {
+  type: typeof MACOS_REMOTE_DESKTOP_IPC_MESSAGE.AUTHENTICATED;
+  ipcVersion: typeof REMOTE_DESKTOP_WORKER_IPC_VERSION;
+  workerGeneration: number;
+  uid: number;
+  auditSessionId: number;
+  pidVersion: number;
+  sessionType: MacosRemoteDesktopIpcPrincipalBinding['sessionType'];
+  launchChallenge: string;
+}
+
+export interface MacosRemoteDesktopIpcHostCommand {
+  type: typeof MACOS_REMOTE_DESKTOP_IPC_MESSAGE.HOST_COMMAND;
+  ipcVersion: typeof REMOTE_DESKTOP_WORKER_IPC_VERSION;
+  workerGeneration: number;
+  command: RemoteDesktopDaemonCommand;
+}
+
+export interface MacosRemoteDesktopIpcWorkerMessage {
+  type: typeof MACOS_REMOTE_DESKTOP_IPC_MESSAGE.WORKER_MESSAGE;
+  ipcVersion: typeof REMOTE_DESKTOP_WORKER_IPC_VERSION;
+  workerGeneration: number;
+  message: RemoteDesktopDaemonMessage;
+}
+
+export interface MacosRemoteDesktopIpcVirtualDisplayRequest {
+  type: typeof MACOS_REMOTE_DESKTOP_IPC_MESSAGE.VIRTUAL_DISPLAY_REQUEST;
+  ipcVersion: typeof REMOTE_DESKTOP_WORKER_IPC_VERSION;
+  workerGeneration: number;
+  /** Correlates one reply to one request on an otherwise async stream. */
+  requestId: number;
+  request: MacosVirtualDisplayProxyRequest;
+}
+
+export interface MacosRemoteDesktopIpcVirtualDisplayReply {
+  type: typeof MACOS_REMOTE_DESKTOP_IPC_MESSAGE.VIRTUAL_DISPLAY_REPLY;
+  ipcVersion: typeof REMOTE_DESKTOP_WORKER_IPC_VERSION;
+  workerGeneration: number;
+  requestId: number;
+  reply: MacosVirtualDisplayProxyReply;
+}
+
+export interface MacosRemoteDesktopIpcUnlockRequest {
+  type: typeof MACOS_REMOTE_DESKTOP_IPC_MESSAGE.UNLOCK_REQUEST;
+  ipcVersion: typeof REMOTE_DESKTOP_WORKER_IPC_VERSION;
+  workerGeneration: number;
+  requestId: number;
+  /** false: only whether one is configured. true: the secret, to type it now. */
+  reveal: boolean;
+}
+
+export interface MacosRemoteDesktopIpcUnlockReply {
+  type: typeof MACOS_REMOTE_DESKTOP_IPC_MESSAGE.UNLOCK_REPLY;
+  ipcVersion: typeof REMOTE_DESKTOP_WORKER_IPC_VERSION;
+  workerGeneration: number;
+  requestId: number;
+  configured: boolean;
+  /**
+   * base64url of the UTF-8 secret, empty unless revealed. Encoded so any
+   * character a password may contain survives the native worker's strict,
+   * escape-free frame parser unchanged.
+   */
+  secret: string;
+}
+
+export interface MacosRemoteDesktopIpcPrivacyRequest {
+  type: typeof MACOS_REMOTE_DESKTOP_IPC_MESSAGE.PRIVACY_REQUEST;
+  ipcVersion: typeof REMOTE_DESKTOP_WORKER_IPC_VERSION;
+  workerGeneration: number;
+  /** Host-assigned, strictly increasing. */
+  requestId: number;
+  shield: boolean;
+}
+
+export interface MacosRemoteDesktopIpcPrivacyReply {
+  type: typeof MACOS_REMOTE_DESKTOP_IPC_MESSAGE.PRIVACY_REPLY;
+  ipcVersion: typeof REMOTE_DESKTOP_WORKER_IPC_VERSION;
+  workerGeneration: number;
+  requestId: number;
+  shielded: boolean;
+  inputReleased: boolean;
+  /** Count of REAL (non-shield) frames this worker process has encoded. */
+  realFrameGeneration: number;
+}
+
+/** The authenticated, generation-checked content of one privacy reply. */
+export type MacosRemoteDesktopAcceptedPrivacyReply = Pick<
+  MacosRemoteDesktopIpcPrivacyReply,
+  'workerGeneration' | 'requestId' | 'shielded' | 'inputReleased' | 'realFrameGeneration'
+>;
+
+export type MacosRemoteDesktopIpcFrame =
+  | MacosRemoteDesktopIpcHello
+  | MacosRemoteDesktopIpcAuthenticated
+  | MacosRemoteDesktopIpcHostCommand
+  | MacosRemoteDesktopIpcWorkerMessage
+  | MacosRemoteDesktopIpcVirtualDisplayRequest
+  | MacosRemoteDesktopIpcVirtualDisplayReply
+  | MacosRemoteDesktopIpcPrivacyRequest
+  | MacosRemoteDesktopIpcPrivacyReply;
+
+/** Opaque by object identity: a JSON value can never forge an accepted session. */
+export interface MacosRemoteDesktopIpcSession {
+  readonly workerGeneration: number;
+  readonly socketPath: string;
+  /** The exact kernel graphical principal admitted for this launch. */
+  readonly principal: MacosRemoteDesktopIpcPrincipalBinding;
+  /** Per-launch challenge, retained so a successor cannot adopt this session. */
+  readonly launchNonce: string;
+}
+
+export interface MacosRemoteDesktopIpcPrincipalBinding {
+  readonly kind: 'aqua_user' | 'loginwindow_bootstrap';
+  readonly sessionType: 'Aqua' | 'LoginWindow';
+  readonly uid: number;
+  readonly auditSessionId: number;
+  readonly pidVersion: number;
+}
+
+interface TrackedRoute {
+  requestId: string;
+  sessionId: string;
+  capability: string;
+  daemonGeneration: number;
+  routeGeneration: number;
+  expiresAt: number;
+  leaseExpiresAt: number;
+}
+
+interface MacosRemoteDesktopIpcHostCommonOptions {
+  expectedCodeIdentity: MacosRemoteDesktopExpectedCodeIdentity;
+  runtimeRoot?: string;
+  randomChallenge?: () => Buffer;
+  /**
+   * The highest worker generation any EARLIER authority for this daemon issued.
+   * Generations are the replay guard the long-lived bootstrap ledger enforces,
+   * so they must keep rising across authorities: each session generation builds
+   * a new authority, and one starting again at 1 had every grant refused as
+   * stale by a listener that correctly outlived it.
+   */
+  workerGenerationFloor?: number;
+}
+
+/**
+ * New global-agent callers provide the explicit graphical principal. The
+ * user-only arm is retained for the existing Aqua launcher until its outer
+ * production caller moves to the global bootstrap; it still pins the native
+ * peer's asid/pidVersion at authentication time.
+ */
+export type MacosRemoteDesktopIpcHostOptions = MacosRemoteDesktopIpcHostCommonOptions & (
+  | { principal: MacosRemoteDesktopGraphicalSessionAuthority; user?: never }
+  | { user: MacosUserSession; principal?: never }
+);
+
+function fail(code: string): never {
+  throw new Error(code);
+}
+
+function isSafePositiveInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+}
+
+function isPositiveUint32(value: unknown): value is number {
+  return isSafePositiveInteger(value) && value <= 0xffff_ffff;
+}
+
+function assertGraphicalPrincipal(
+  principal: MacosRemoteDesktopGraphicalSessionAuthority,
+): void {
+  if (!isPositiveUint32(principal.auditSessionId)
+    || !isPositiveUint32(principal.pidVersion)) {
+    fail('macos_remote_desktop_ipc_invalid_graphical_principal');
+  }
+  if (principal.kind === 'aqua_user') {
+    if (principal.sessionType !== 'Aqua') {
+      fail('macos_remote_desktop_ipc_invalid_graphical_principal');
+    }
+    assertMacosUserSession(principal.user);
+    return;
+  }
+  if (principal.kind !== 'loginwindow_bootstrap'
+    || principal.sessionType !== 'LoginWindow'
+    || !isPositiveUint32(principal.uid)) {
+    fail('macos_remote_desktop_ipc_invalid_graphical_principal');
+  }
+}
+
+export function macosRemoteDesktopIpcPrincipalBinding(
+  principal: MacosRemoteDesktopGraphicalSessionAuthority,
+): MacosRemoteDesktopIpcPrincipalBinding {
+  assertGraphicalPrincipal(principal);
+  return Object.freeze({
+    kind: principal.kind,
+    sessionType: principal.sessionType,
+    uid: principal.kind === 'aqua_user' ? principal.user.uid : principal.uid,
+    auditSessionId: principal.auditSessionId,
+    pidVersion: principal.pidVersion,
+  });
+}
+
+export function macosRemoteDesktopIpcPrincipalPaths(
+  value: MacosRemoteDesktopGraphicalSessionAuthority | MacosUserSession,
+  runtimeRoot?: string,
+): { runtimeDirectory: string; socketPath: string } {
+  if ('kind' in value) {
+    const binding = macosRemoteDesktopIpcPrincipalBinding(value);
+    return macosRemoteDesktopGraphicalSessionPaths(
+      binding,
+      runtimeRoot ?? MACOS_REMOTE_DESKTOP_GRAPHICAL_RUNTIME_ROOT,
+    );
+  }
+  assertMacosUserSession(value);
+  return macosRemoteDesktopUserSessionPaths(value, runtimeRoot);
+}
+
+function equalSecret(left: string, right: string): boolean {
+  const leftBytes = Buffer.from(left, 'utf8');
+  const rightBytes = Buffer.from(right, 'utf8');
+  return leftBytes.length === rightBytes.length && timingSafeEqual(leftBytes, rightBytes);
+}
+
+function validateExpectedCodeIdentity(value: MacosRemoteDesktopExpectedCodeIdentity): void {
+  const canonicalRequirement = appleDesignatedRequirement(
+    value.bundleIdentifier, value.teamId,
+  );
+  if ((value.bundleIdentifier !== MACOS_REMOTE_DESKTOP_LAUNCH_AGENT_IDENTITY.bundleIdentifier
+      && value.bundleIdentifier !== MACOS_REMOTE_DESKTOP_WORKER_IDENTITY.bundleIdentifier)
+    || !APPLE_TEAM_ID_RE.test(value.teamId)
+    || canonicalRequirement.length > MAX_DESIGNATED_REQUIREMENT_BYTES
+    || value.designatedRequirement !== canonicalRequirement) {
+    fail('macos_remote_desktop_ipc_invalid_expected_identity');
+  }
+}
+
+function matchesCodeIdentity(
+  peer: MacosRemoteDesktopVerifiedPeerIdentity,
+  expected: MacosRemoteDesktopExpectedCodeIdentity,
+): boolean {
+  return peer.bundleIdentifier === expected.bundleIdentifier
+    && peer.teamId === expected.teamId
+    && peer.designatedRequirement === expected.designatedRequirement;
+}
+
+function unixMode(mode: number): number {
+  return mode & 0o7777;
+}
+
+export function validateMacosRemoteDesktopSocketSecurity(
+  evidence: MacosRemoteDesktopSocketSecurityEvidence,
+  principal: MacosRemoteDesktopGraphicalSessionAuthority | MacosUserSession,
+  runtimeRoot?: string,
+): boolean {
+  try {
+    const uid = 'kind' in principal
+      ? macosRemoteDesktopIpcPrincipalBinding(principal).uid
+      : principal.uid;
+    const paths = macosRemoteDesktopIpcPrincipalPaths(principal, runtimeRoot);
+    return evidence.runtimeDirectory.kind === 'directory'
+      && evidence.runtimeDirectory.path === paths.runtimeDirectory
+      && evidence.runtimeDirectory.uid === uid
+      && unixMode(evidence.runtimeDirectory.mode) === MACOS_REMOTE_DESKTOP_RUNTIME_DIRECTORY_MODE
+      && evidence.socket.kind === 'socket'
+      && evidence.socket.path === paths.socketPath
+      && dirname(evidence.socket.path) === evidence.runtimeDirectory.path
+      && evidence.socket.uid === uid
+      && unixMode(evidence.socket.mode) === MACOS_REMOTE_DESKTOP_SOCKET_MODE;
+  } catch {
+    return false;
+  }
+}
+
+export function decodeMacosRemoteDesktopIpcFrame(value: string): unknown {
+  if (typeof value !== 'string' || value.length === 0
+    || /[\0\r\n]/.test(value)
+    || remoteDesktopUtf8Bytes(value) > MACOS_REMOTE_DESKTOP_IPC_MAX_FRAME_BYTES) {
+    fail('macos_remote_desktop_ipc_invalid_frame');
+  }
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    return fail('macos_remote_desktop_ipc_invalid_frame');
+  }
+}
+
+/**
+ * The inverse of the decoder, bounded the same way.
+ *
+ * Symmetric on purpose: a frame this process emits must be one it would itself
+ * accept. Encoding without the bound would let the daemon send something the
+ * worker's decoder refuses, which reads on the far side as a corrupt peer.
+ */
+export function encodeMacosRemoteDesktopIpcFrame(frame: unknown): string {
+  const encoded = JSON.stringify(frame);
+  if (typeof encoded !== 'string' || encoded.length === 0
+    || /[\0\r\n]/.test(encoded)
+    || remoteDesktopUtf8Bytes(encoded) > MACOS_REMOTE_DESKTOP_IPC_MAX_FRAME_BYTES) {
+    fail('macos_remote_desktop_ipc_invalid_frame');
+  }
+  return encoded;
+}
+
+function parseHello(value: unknown): MacosRemoteDesktopIpcHello | null {
+  if (!isRemoteDesktopRecord(value)
+    || !hasExactRemoteDesktopKeys(value, [
+      'type', 'ipcVersion', 'workerGeneration', 'challenge',
+    ])
+    || value.type !== MACOS_REMOTE_DESKTOP_IPC_MESSAGE.HELLO
+    || value.ipcVersion !== REMOTE_DESKTOP_WORKER_IPC_VERSION
+    || !isSafePositiveInteger(value.workerGeneration)
+    || typeof value.challenge !== 'string'
+    || !CHALLENGE_RE.test(value.challenge)) return null;
+  return value as unknown as MacosRemoteDesktopIpcHello;
+}
+
+function parseHostCommand(value: unknown): MacosRemoteDesktopIpcHostCommand | null {
+  if (!isRemoteDesktopRecord(value)
+    || !hasExactRemoteDesktopKeys(value, [
+      'type', 'ipcVersion', 'workerGeneration', 'command',
+    ])
+    || value.type !== MACOS_REMOTE_DESKTOP_IPC_MESSAGE.HOST_COMMAND
+    || value.ipcVersion !== REMOTE_DESKTOP_WORKER_IPC_VERSION
+    || !isSafePositiveInteger(value.workerGeneration)) return null;
+  const command = validateRemoteDesktopDaemonCommand(value.command);
+  if (!command.ok) return null;
+  return { ...value, command: command.value } as MacosRemoteDesktopIpcHostCommand;
+}
+
+function parseVirtualDisplayRequest(
+  value: unknown,
+): MacosRemoteDesktopIpcVirtualDisplayRequest | null {
+  if (!isRemoteDesktopRecord(value)
+    || !hasExactRemoteDesktopKeys(value, [
+      'type', 'ipcVersion', 'workerGeneration', 'requestId', 'request',
+    ])
+    || value.type !== MACOS_REMOTE_DESKTOP_IPC_MESSAGE.VIRTUAL_DISPLAY_REQUEST
+    || value.ipcVersion !== REMOTE_DESKTOP_WORKER_IPC_VERSION
+    || !isSafePositiveInteger(value.workerGeneration)
+    || !isSafePositiveInteger(value.requestId)) return null;
+  // The request's own shape is validated where its rules live, so the two
+  // cannot drift into disagreeing about what a readiness question may carry.
+  const request = validateVirtualDisplayProxyRequest(value.request);
+  if (request === null) return null;
+  return { ...value, request } as MacosRemoteDesktopIpcVirtualDisplayRequest;
+}
+
+function parseUnlockRequest(value: unknown): MacosRemoteDesktopIpcUnlockRequest | null {
+  if (!isRemoteDesktopRecord(value)
+    || !hasExactRemoteDesktopKeys(value, [
+      'type', 'ipcVersion', 'workerGeneration', 'requestId', 'reveal',
+    ])
+    || value.type !== MACOS_REMOTE_DESKTOP_IPC_MESSAGE.UNLOCK_REQUEST
+    || value.ipcVersion !== REMOTE_DESKTOP_WORKER_IPC_VERSION
+    || !isSafePositiveInteger(value.workerGeneration)
+    || !isSafePositiveInteger(value.requestId)
+    || typeof value.reveal !== 'boolean') return null;
+  return value as unknown as MacosRemoteDesktopIpcUnlockRequest;
+}
+
+function parsePrivacyReply(value: unknown): MacosRemoteDesktopIpcPrivacyReply | null {
+  if (!isRemoteDesktopRecord(value)
+    || !hasExactRemoteDesktopKeys(value, [
+      'type', 'ipcVersion', 'workerGeneration', 'requestId',
+      'shielded', 'inputReleased', 'realFrameGeneration',
+    ])
+    || value.type !== MACOS_REMOTE_DESKTOP_IPC_MESSAGE.PRIVACY_REPLY
+    || value.ipcVersion !== REMOTE_DESKTOP_WORKER_IPC_VERSION
+    || !isSafePositiveInteger(value.workerGeneration)
+    || !isSafePositiveInteger(value.requestId)
+    || typeof value.shielded !== 'boolean'
+    || typeof value.inputReleased !== 'boolean'
+    || typeof value.realFrameGeneration !== 'number'
+    || !Number.isSafeInteger(value.realFrameGeneration)
+    || value.realFrameGeneration < 0) return null;
+  return value as unknown as MacosRemoteDesktopIpcPrivacyReply;
+}
+
+function parseWorkerMessage(value: unknown): MacosRemoteDesktopIpcWorkerMessage | null {
+  if (!isRemoteDesktopRecord(value)
+    || !hasExactRemoteDesktopKeys(value, [
+      'type', 'ipcVersion', 'workerGeneration', 'message',
+    ])
+    || value.type !== MACOS_REMOTE_DESKTOP_IPC_MESSAGE.WORKER_MESSAGE
+    || value.ipcVersion !== REMOTE_DESKTOP_WORKER_IPC_VERSION
+    || !isSafePositiveInteger(value.workerGeneration)) return null;
+  const message = validateRemoteDesktopDaemonMessage(value.message);
+  if (!message.ok) return null;
+  return { ...value, message: message.value } as MacosRemoteDesktopIpcWorkerMessage;
+}
+
+function routeMatches(
+  value: Pick<RemoteDesktopDaemonCommand | RemoteDesktopDaemonMessage, 'requestId' | 'sessionId' | 'capability'>,
+  route: TrackedRoute,
+): boolean {
+  return value.requestId === route.requestId
+    && value.sessionId === route.sessionId
+    && equalSecret(value.capability, route.capability);
+}
+
+/**
+ * Host-side authorization state for one active GUI user. This class does not
+ * inspect code signatures itself: callers must provide peer evidence obtained
+ * from the native Darwin socket/Security.framework boundary, never wire JSON.
+ */
+export class MacosRemoteDesktopIpcAuthorityHost {
+  private workerGeneration = 0;
+  private activeLaunch: MacosRemoteDesktopIpcLaunch | null = null;
+  private activeSession: MacosRemoteDesktopIpcSession | null = null;
+  private readonly routes = new Map<string, TrackedRoute>();
+  private readonly randomChallenge: () => Buffer;
+  private readonly expectedPrincipal: MacosRemoteDesktopIpcPrincipalBinding | null;
+  private readonly principalSource: MacosRemoteDesktopGraphicalSessionAuthority | MacosUserSession;
+
+  constructor(private readonly options: MacosRemoteDesktopIpcHostOptions) {
+    if (options.principal) {
+      this.expectedPrincipal = macosRemoteDesktopIpcPrincipalBinding(options.principal);
+      this.principalSource = options.principal;
+    } else {
+      assertMacosUserSession(options.user);
+      this.expectedPrincipal = null;
+      this.principalSource = options.user;
+    }
+    validateExpectedCodeIdentity(options.expectedCodeIdentity);
+    if (options.workerGenerationFloor !== undefined) {
+      if (!Number.isSafeInteger(options.workerGenerationFloor) || options.workerGenerationFloor < 0) {
+        fail('macos_remote_desktop_ipc_invalid_generation_floor');
+      }
+      this.workerGeneration = options.workerGenerationFloor;
+    }
+    this.randomChallenge = options.randomChallenge ?? (() => randomBytes(CHALLENGE_BYTES));
+  }
+
+  beginLaunch(): MacosRemoteDesktopIpcLaunch {
+    this.cleanup();
+    const challengeBytes = this.randomChallenge();
+    if (!Buffer.isBuffer(challengeBytes) || challengeBytes.length !== CHALLENGE_BYTES) {
+      fail('macos_remote_desktop_ipc_invalid_challenge_source');
+    }
+    const paths = macosRemoteDesktopIpcPrincipalPaths(
+      this.principalSource,
+      this.options.runtimeRoot,
+    );
+    const launch = Object.freeze({
+      workerGeneration: this.workerGeneration,
+      challenge: challengeBytes.toString('base64url'),
+      socketPath: paths.socketPath,
+    });
+    this.activeLaunch = launch;
+    return launch;
+  }
+
+  authenticate(
+    frame: string,
+    peer: MacosRemoteDesktopVerifiedPeerIdentity,
+    filesystem: MacosRemoteDesktopSocketSecurityEvidence,
+  ): MacosRemoteDesktopIpcSession {
+    const launch = this.activeLaunch;
+    const hello = parseHello(decodeMacosRemoteDesktopIpcFrame(frame));
+    const actualPrincipal: MacosRemoteDesktopIpcPrincipalBinding = Object.freeze({
+      kind: peer.kind,
+      sessionType: peer.sessionType,
+      uid: peer.uid,
+      auditSessionId: peer.auditSessionId,
+      pidVersion: peer.pidVersion,
+    });
+    if (!launch || !hello
+      || this.activeSession !== null
+      || !isPositiveUint32(peer.uid)
+      || !isPositiveUint32(peer.auditSessionId)
+      || !isPositiveUint32(peer.pidVersion)
+      || (peer.kind !== 'aqua_user' && peer.kind !== 'loginwindow_bootstrap')
+      || (peer.sessionType !== 'Aqua' && peer.sessionType !== 'LoginWindow')
+      || (this.expectedPrincipal !== null
+        && (actualPrincipal.uid !== this.expectedPrincipal.uid
+          || actualPrincipal.auditSessionId !== this.expectedPrincipal.auditSessionId
+          // The expected principal is the resident AGENT that was granted the
+          // launch; the peer here is the worker it spawned -- same user, same
+          // audit session, a different process. Pinning the agent's pid
+          // generation rejected every worker. What ties this worker to that
+          // grant is the one-time launch challenge checked below, which only
+          // the granted agent received and handed to its child.
+          || (this.options.expectedCodeIdentity.bundleIdentifier
+            !== MACOS_REMOTE_DESKTOP_WORKER_IDENTITY.bundleIdentifier
+            && actualPrincipal.pidVersion !== this.expectedPrincipal.pidVersion)
+          || actualPrincipal.kind !== this.expectedPrincipal.kind
+          || actualPrincipal.sessionType !== this.expectedPrincipal.sessionType))
+      || (this.expectedPrincipal === null
+        && (peer.uid !== (this.principalSource as MacosUserSession).uid
+          || peer.kind !== 'aqua_user'
+          || peer.sessionType !== 'Aqua'))
+      || !matchesCodeIdentity(peer, this.options.expectedCodeIdentity)
+      || !validateMacosRemoteDesktopSocketSecurity(
+        filesystem,
+        this.principalSource,
+        this.options.runtimeRoot,
+      )
+      || hello.workerGeneration !== launch.workerGeneration
+      || !equalSecret(hello.challenge, launch.challenge)) {
+      fail('macos_remote_desktop_ipc_authentication_failed');
+    }
+    const session = Object.freeze({
+      workerGeneration: launch.workerGeneration,
+      socketPath: launch.socketPath,
+      principal: actualPrincipal,
+      launchNonce: launch.challenge,
+    });
+    this.activeSession = session;
+    return session;
+  }
+
+  acceptHostFrame(
+    session: MacosRemoteDesktopIpcSession,
+    frame: string,
+    now = Date.now(),
+  ): RemoteDesktopDaemonCommand {
+    this.assertActiveSession(session);
+    const envelope = parseHostCommand(decodeMacosRemoteDesktopIpcFrame(frame));
+    if (!envelope || envelope.workerGeneration !== session.workerGeneration) {
+      fail('macos_remote_desktop_ipc_invalid_host_frame');
+    }
+    const command = envelope.command;
+    if (command.type === REMOTE_DESKTOP_MSG.PREPARE) {
+      this.authorizeRoute(command, now);
+      return command;
+    }
+    const route = this.routes.get(command.sessionId);
+    if (!route || !routeMatches(command, route)
+      || route.expiresAt <= now || route.leaseExpiresAt <= now) {
+      fail('macos_remote_desktop_ipc_route_authority_rejected');
+    }
+    if (command.type === REMOTE_DESKTOP_MSG.LEASE) {
+      if (command.daemonGeneration !== route.daemonGeneration
+        || command.routeGeneration !== route.routeGeneration
+        || command.leaseExpiresAt <= now
+        || command.leaseExpiresAt > route.expiresAt
+        || command.leaseExpiresAt - now
+          > REMOTE_DESKTOP_LIMITS.LEASE_DURATION_MS + REMOTE_DESKTOP_LIMITS.CLOCK_SKEW_TOLERANCE_MS) {
+        fail('macos_remote_desktop_ipc_route_authority_rejected');
+      }
+      route.leaseExpiresAt = command.leaseExpiresAt;
+    }
+    // STOP/CANCEL must NOT delete the route here. This runs the instant the
+    // daemon DECIDES to stop the session -- before the worker has even seen
+    // the command, let alone answered it. The worker always acknowledges a
+    // stop with its own TERMINAL message (WorkerTransportSink::SignalTerminal
+    // is unconditional on a stop/cancel), which arrives back through
+    // acceptWorkerFrame and requires this exact route to still exist. Deleting
+    // it here guaranteed that legitimate, correctly-ordered acknowledgment
+    // would find `!route` and be rejected as macos_remote_desktop_ipc_route_authority_rejected
+    // -- tearing down the whole IPC connection over a stop that worked exactly
+    // as asked, live evidence: node mini-2, a real session stopped ~8s into a
+    // normal ICE exchange, rejected 25-31ms after the stop command was sent.
+    // acceptWorkerFrame's own TERMINAL handling (below) is the correct, sole
+    // place the route is retired: it deletes it once the worker's own
+    // acknowledgment proves the session is actually over, not merely intended
+    // to be. A worker that never acknowledges still bounds this: the route's
+    // own expiresAt/leaseExpiresAt naturally lapse, and generation cleanup()
+    // clears everything regardless.
+    return command;
+  }
+
+  /**
+   * Accepts one virtual-display question from the authenticated worker.
+   *
+   * Returns the request together with the generation the daemon AUTHENTICATED,
+   * which is what the control line will be built from. Whatever generation the
+   * frame carried is checked for agreement and then never used again.
+   */
+  acceptVirtualDisplayRequest(
+    session: MacosRemoteDesktopIpcSession,
+    frame: string,
+  ): { requestId: number; request: MacosVirtualDisplayProxyRequest;
+       routeGeneration: number } {
+    this.assertActiveSession(session);
+    const envelope = parseVirtualDisplayRequest(
+      decodeMacosRemoteDesktopIpcFrame(frame),
+    );
+    if (!envelope || envelope.workerGeneration !== session.workerGeneration) {
+      fail('macos_remote_desktop_ipc_invalid_worker_frame');
+    }
+    return {
+      requestId: envelope.requestId,
+      request: envelope.request,
+      routeGeneration: session.workerGeneration,
+    };
+  }
+
+  encodeVirtualDisplayReply(
+    session: MacosRemoteDesktopIpcSession,
+    requestId: number,
+    reply: MacosVirtualDisplayProxyReply,
+  ): string {
+    this.assertActiveSession(session);
+    return encodeMacosRemoteDesktopIpcFrame({
+      type: MACOS_REMOTE_DESKTOP_IPC_MESSAGE.VIRTUAL_DISPLAY_REPLY,
+      ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+      workerGeneration: session.workerGeneration,
+      requestId,
+      reply,
+    });
+  }
+
+  /** Accepts one unlock question from the authenticated worker of this generation. */
+  acceptUnlockRequest(
+    session: MacosRemoteDesktopIpcSession,
+    frame: string,
+  ): { requestId: number; reveal: boolean } {
+    this.assertActiveSession(session);
+    const envelope = parseUnlockRequest(decodeMacosRemoteDesktopIpcFrame(frame));
+    if (!envelope || envelope.workerGeneration !== session.workerGeneration) {
+      fail('macos_remote_desktop_ipc_invalid_worker_frame');
+    }
+    return { requestId: envelope.requestId, reveal: envelope.reveal };
+  }
+
+  encodeUnlockReply(
+    session: MacosRemoteDesktopIpcSession,
+    requestId: number,
+    configured: boolean,
+    secret: string | null,
+  ): string {
+    this.assertActiveSession(session);
+    return encodeMacosRemoteDesktopIpcFrame({
+      type: MACOS_REMOTE_DESKTOP_IPC_MESSAGE.UNLOCK_REPLY,
+      ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+      workerGeneration: session.workerGeneration,
+      requestId,
+      configured,
+      secret: secret === null ? '' : Buffer.from(secret, 'utf8').toString('base64url'),
+    });
+  }
+
+  /**
+   * Host-authored shield request for the authenticated worker of this
+   * generation. Key order is part of the native contract.
+   */
+  encodePrivacyRequest(
+    session: MacosRemoteDesktopIpcSession,
+    requestId: number,
+    shield: boolean,
+  ): string {
+    this.assertActiveSession(session);
+    if (!isSafePositiveInteger(requestId) || typeof shield !== 'boolean') {
+      fail('macos_remote_desktop_ipc_invalid_host_frame');
+    }
+    const request: MacosRemoteDesktopIpcPrivacyRequest = {
+      type: MACOS_REMOTE_DESKTOP_IPC_MESSAGE.PRIVACY_REQUEST,
+      ipcVersion: REMOTE_DESKTOP_WORKER_IPC_VERSION,
+      workerGeneration: session.workerGeneration,
+      requestId,
+      shield,
+    };
+    return encodeMacosRemoteDesktopIpcFrame(request);
+  }
+
+  /** Accepts one privacy reply from the authenticated worker of this generation. */
+  acceptPrivacyReply(
+    session: MacosRemoteDesktopIpcSession,
+    frame: string,
+  ): MacosRemoteDesktopAcceptedPrivacyReply {
+    this.assertActiveSession(session);
+    const envelope = parsePrivacyReply(decodeMacosRemoteDesktopIpcFrame(frame));
+    if (!envelope || envelope.workerGeneration !== session.workerGeneration) {
+      fail('macos_remote_desktop_ipc_invalid_worker_frame');
+    }
+    return {
+      workerGeneration: session.workerGeneration,
+      requestId: envelope.requestId,
+      shielded: envelope.shielded,
+      inputReleased: envelope.inputReleased,
+      realFrameGeneration: envelope.realFrameGeneration,
+    };
+  }
+
+  acceptWorkerFrame(
+    session: MacosRemoteDesktopIpcSession,
+    frame: string,
+    now = Date.now(),
+  ): RemoteDesktopDaemonMessage {
+    this.assertActiveSession(session);
+    const envelope = parseWorkerMessage(decodeMacosRemoteDesktopIpcFrame(frame));
+    if (!envelope || envelope.workerGeneration !== session.workerGeneration) {
+      fail('macos_remote_desktop_ipc_invalid_worker_frame');
+    }
+    const message = envelope.message;
+    const route = this.routes.get(message.sessionId);
+    if (!route || !routeMatches(message, route)
+      || route.expiresAt <= now || route.leaseExpiresAt <= now) {
+      fail('macos_remote_desktop_ipc_route_authority_rejected');
+    }
+    if (message.type === REMOTE_DESKTOP_MSG.TERMINAL) {
+      this.routes.delete(message.sessionId);
+    }
+    return message;
+  }
+
+  cleanup(): void {
+    this.workerGeneration += 1;
+    this.activeLaunch = null;
+    this.activeSession = null;
+    this.routes.clear();
+  }
+
+  private assertActiveSession(session: MacosRemoteDesktopIpcSession): void {
+    if (this.activeSession !== session
+      || session.workerGeneration !== this.workerGeneration) {
+      fail('macos_remote_desktop_ipc_stale_session');
+    }
+  }
+
+  private authorizeRoute(command: RemoteDesktopPrepare, now: number): void {
+    if (command.expiresAt <= now
+      || command.leaseExpiresAt <= now
+      // Server-stamped deadlines against this host's clock: allow it to trail
+      // the Server by up to CLOCK_SKEW_TOLERANCE_MS (see the limit).
+      || command.expiresAt - now
+        > REMOTE_DESKTOP_LIMITS.ABSOLUTE_LIFETIME_MS + REMOTE_DESKTOP_LIMITS.CLOCK_SKEW_TOLERANCE_MS
+      || command.leaseExpiresAt - now
+        > REMOTE_DESKTOP_LIMITS.LEASE_DURATION_MS + REMOTE_DESKTOP_LIMITS.CLOCK_SKEW_TOLERANCE_MS
+      || command.routeGeneration === undefined
+      || this.routes.has(command.sessionId)) {
+      fail('macos_remote_desktop_ipc_route_authority_rejected');
+    }
+    this.routes.set(command.sessionId, {
+      requestId: command.requestId,
+      sessionId: command.sessionId,
+      capability: command.capability,
+      daemonGeneration: command.daemonGeneration,
+      routeGeneration: command.routeGeneration,
+      expiresAt: command.expiresAt,
+      leaseExpiresAt: command.leaseExpiresAt,
+    });
+  }
+}

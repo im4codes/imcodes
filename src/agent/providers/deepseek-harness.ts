@@ -18,6 +18,12 @@
  * instead of a process start.
  */
 import { spawn, type ChildProcess } from 'node:child_process';
+import {
+  agentResourceOwner,
+  bindAgentProcessResource,
+  type AgentProcessResource,
+} from './agent-process-resource.js';
+import type { SessionResourceOwner } from '../../daemon/session-resource-registry.js';
 import { createInterface, type Interface as ReadlineInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
 import type {
@@ -72,6 +78,13 @@ import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-p
 import { killProcessTree } from '../../util/kill-process-tree.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
+import { NativeAgentFenceSlot, fenceOf } from '../native-agent-fence.js';
+import {
+  NATIVE_AGENT_ADMISSION_MODES,
+  NATIVE_AGENT_FENCES,
+  type NativeAgentFence,
+} from '../../../shared/native-collaboration-policy.js';
+import type { NativeAgentFenceResolver } from '../transport-provider.js';
 import {
   MEMORY_MCP_PROVIDER_ID,
   MEMORY_MCP_STATUS,
@@ -108,6 +121,10 @@ interface DeepseekHarnessSessionState {
   /** Durable harness session id, used to resume after a restart. */
   harnessSessionId?: string;
   child: ChildProcess | null;
+  /** Owner identity for the registry lease on the spawned agent CLI. */
+  resourceOwner?: SessionResourceOwner | null;
+  /** Registry lease for `child`; released when the child exits or is reaped. */
+  agentResource?: AgentProcessResource;
   reader: ReadlineInterface | null;
   /** Resolves when the bridge has published its ready frame. */
   readyPromise: Promise<void> | null;
@@ -136,6 +153,10 @@ interface DeepseekHarnessSessionState {
   pendingSessionSystemText?: string;
   lastStatusSignature: string | null;
   disposed: boolean;
+  /** The native-agent fence the live `child` was spawned with. */
+  childNativeAgentFence?: NativeAgentFence;
+  /** The fence of a child spawn in flight (overlay written, no child yet). */
+  pendingChildNativeAgentFence?: NativeAgentFence;
   /** IM.codes memory MCP server mounted into this harness session. */
   memoryMcp?: { command: string; args: readonly string[]; env: Record<string, string> };
 }
@@ -160,10 +181,22 @@ export class DeepseekHarnessProvider implements TransportProvider {
     // context rides in the message body rather than a system slot.
     contextSupport: 'degraded-message-side-context-mapping',
     activeDelegationNotification: AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE,
+    // A managed session's dsh child is spawned with the sub-agent, workflow
+    // and Ralph rows disabled in its overlay.
+    nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.SESSION_FENCE,
   };
 
   private config: ProviderConfig | null = null;
   private sessions = new Map<string, DeepseekHarnessSessionState>();
+  private readonly nativeAgentFence = new NativeAgentFenceSlot(MEMORY_MCP_PROVIDER_ID.DEEPSEEK_HARNESS);
+
+  /**
+   * Teardowns started from `failStartup`, which is synchronous by contract and
+   * therefore cannot await the escalation. Discarding it would let a SIGTERM
+   * land with its SIGKILL never following, so it is retained here and drained
+   * by `disconnect()` — the call daemon shutdown awaits.
+   */
+  private pendingTeardowns = new Set<Promise<void>>();
   private deltaCallbacks: Array<(sessionId: string, delta: MessageDelta) => void> = [];
   private completeCallbacks: Array<(sessionId: string, message: AgentMessage) => void> = [];
   private errorCallbacks: Array<(sessionId: string, error: ProviderError) => void> = [];
@@ -186,6 +219,9 @@ export class DeepseekHarnessProvider implements TransportProvider {
     // Independent waits: serial teardown would multiply the per-child grace
     // period by the number of live sessions on every daemon shutdown.
     await Promise.all([...this.sessions.keys()].map((sessionId) => this.endSession(sessionId)));
+    if (this.pendingTeardowns.size > 0) {
+      await Promise.allSettled([...this.pendingTeardowns]);
+    }
     this.config = null;
     logger.info({ provider: this.id }, 'DeepSeek Harness provider disconnected');
   }
@@ -206,6 +242,7 @@ export class DeepseekHarnessProvider implements TransportProvider {
     this.sessions.set(routeId, {
       routeId,
       sessionName: config.sessionName ?? existing?.sessionName,
+      resourceOwner: agentResourceOwner(config) ?? existing?.resourceOwner ?? null,
       projectName: config.projectName ?? existing?.projectName,
       cwd: normalizeTransportCwd(config.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
       env: config.env ?? existing?.env,
@@ -329,7 +366,10 @@ export class DeepseekHarnessProvider implements TransportProvider {
     state.toolNames.clear();
     // Stale counters would otherwise be stamped onto a turn that reports none.
     state.lastUsage = undefined;
-    this.write(state, { type: DSH_BRIDGE_COMMAND.PROMPT, text });
+    if (!this.write(state, { type: DSH_BRIDGE_COMMAND.PROMPT, text })) {
+      state.turnActive = false;
+      throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'dsh bridge stdin is unavailable', true);
+    }
     // Only claim the session text landed once the turn actually settles: `write`
     // is a silent no-op on a closed stdin, and committing here would leave a
     // retried turn permanently stripped of its session instructions.
@@ -348,8 +388,9 @@ export class DeepseekHarnessProvider implements TransportProvider {
     // steering messages in dsh. `followup()` would defer them until idle and
     // defeat the product's Append/now contract; `steer()` keeps the current
     // tool batch alive and inserts the text before the next model step.
-    this.write(state, { type: DSH_BRIDGE_COMMAND.STEER, text: notification.text });
-    return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
+    return this.write(state, { type: DSH_BRIDGE_COMMAND.STEER, text: notification.text })
+      ? AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED
+      : AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
   }
 
   async cancel(sessionId: string): Promise<void> {
@@ -421,17 +462,33 @@ export class DeepseekHarnessProvider implements TransportProvider {
     }
     if (state.child) this.detachChild(state);
 
-    const overlayPath = await writeDshOverlay({
-      sessionKey: state.routeId,
-      ...(state.memoryMcp ? { memoryMcp: state.memoryMcp } : {}),
-      ...(state.llmConfig ? { llm: state.llmConfig } : {}),
-    });
+    // Decided on the spawn path before the overlay is written; recorded as
+    // pending so an admission check during the write sees this spawn's fence.
+    const nativeAgentsFenced = this.nativeAgentFence.required(state.routeId, state.sessionName);
+    state.pendingChildNativeAgentFence = fenceOf(nativeAgentsFenced);
+    let overlayPath: string;
+    try {
+      overlayPath = await writeDshOverlay({
+        sessionKey: state.routeId,
+        ...(state.memoryMcp ? { memoryMcp: state.memoryMcp } : {}),
+        ...(state.llmConfig ? { llm: state.llmConfig } : {}),
+        nativeAgentsFenced,
+      });
+    } catch (error) {
+      state.pendingChildNativeAgentFence = undefined;
+      throw error;
+    }
     const resumeId = state.harnessSessionId;
     // On Windows `dsh` is an npm .cmd shim, which bare spawn() cannot execute;
     // this resolves it to `node <script>` the same way every other local-SDK
     // provider does.
     const executable = resolveExecutableForSpawn(resolveDshBinary());
     const child = spawn(executable.executable, [...executable.prependArgs, ...buildDshArgs(overlayPath)], {
+      // Own process group and session on POSIX. A reparented descendant keeps
+      // its PGID but loses its PPID, so after the agent parent dies this is the
+      // only ownership token teardown still has. Without it the eight vitest
+      // workers of the incident were unreachable on PPID=1.
+      detached: process.platform !== 'win32',
       cwd: state.cwd,
       env: {
         ...process.env,
@@ -450,6 +507,11 @@ export class DeepseekHarnessProvider implements TransportProvider {
       windowsHide: true,
     });
     state.child = child;
+    state.childNativeAgentFence = fenceOf(nativeAgentsFenced);
+    state.pendingChildNativeAgentFence = undefined;
+    // Crash coverage: if the daemon dies without running teardown, the startup
+    // sweep reaps this group using the registry's process-start fingerprint.
+    state.agentResource = bindAgentProcessResource(state.resourceOwner ?? null, child);
     state.readySettled = false;
     let readyTimer: ReturnType<typeof setTimeout> | null = null;
     const readyPromise = new Promise<void>((resolve, reject) => {
@@ -518,9 +580,27 @@ export class DeepseekHarnessProvider implements TransportProvider {
     await readyPromise;
   }
 
+  setNativeAgentFenceResolver(resolver: NativeAgentFenceResolver): void {
+    this.nativeAgentFence.install(resolver);
+  }
+
+  /**
+   * A live dsh child has exactly the fence it was spawned with, and receives
+   * appended messages, so an unfenced live child proves nothing. With no child
+   * (and none being spawned), the next send's spawn decides the fence.
+   */
+  async getNativeAgentFence(providerSessionId: string): Promise<NativeAgentFence> {
+    const state = this.sessions.get(providerSessionId);
+    if (!state) return NATIVE_AGENT_FENCES.PROVIDER_DEFAULT;
+    if (state.child) return state.childNativeAgentFence ?? NATIVE_AGENT_FENCES.PROVIDER_DEFAULT;
+    if (state.pendingChildNativeAgentFence) return state.pendingChildNativeAgentFence;
+    return this.nativeAgentFence.nextLaunchFence(providerSessionId, state.sessionName);
+  }
+
   /** Drop this session's references to its child without terminating it. */
   private detachChild(state: DeepseekHarnessSessionState): void {
     state.child = null;
+    state.childNativeAgentFence = undefined;
     state.reader?.close();
     state.reader = null;
     state.readyPromise = null;
@@ -539,7 +619,11 @@ export class DeepseekHarnessProvider implements TransportProvider {
     state.resolveReady = null;
     if (state.child === child) this.detachChild(state);
     state.turnActive = false;
-    void killProcessTree(child).catch(() => {});
+    // Retained, not discarded: disconnect() drains this before shutdown
+    // reports the phase complete.
+    const reaped = killProcessTree(child, { ownsProcessGroup: true }).catch(() => {});
+    this.pendingTeardowns.add(reaped);
+    void reaped.finally(() => { this.pendingTeardowns.delete(reaped); });
     if (reject) {
       reject(new Error(message));
       return;
@@ -582,13 +666,21 @@ export class DeepseekHarnessProvider implements TransportProvider {
     // killProcessTree owns the graceful-then-SIGKILL escalation and no-ops when
     // the child already exited; the harness spawns its own tool subprocesses,
     // which a bare kill would orphan (Windows has no process group to signal).
-    await killProcessTree(child, { gracefulMs: SHUTDOWN_GRACE_MS }).catch(() => {});
+    await killProcessTree(child, { gracefulMs: SHUTDOWN_GRACE_MS, ownsProcessGroup: true }).catch(() => {});
   }
 
-  private write(state: DeepseekHarnessSessionState, command: DshBridgeCommand): void {
+  private write(state: DeepseekHarnessSessionState, command: DshBridgeCommand): boolean {
     const stdin = state.child?.stdin;
-    if (!stdin || stdin.destroyed) return;
-    stdin.write(`${JSON.stringify(command)}\n`);
+    if (!stdin || stdin.destroyed) return false;
+    try {
+      // A false Writable.write() result is backpressure, not rejection: the
+      // bytes are already accepted into Node's buffer. Only absence,
+      // destruction, or a synchronous write error means no admission.
+      stdin.write(`${JSON.stringify(command)}\n`);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   // ── Bridge event handling ──────────────────────────────────────────────────

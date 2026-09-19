@@ -119,6 +119,25 @@ describe('windowed view-item derivation', () => {
     expect(tail.items.some((item) => item.type === 'tool-group' || item.type === 'tool-activity')).toBe(true);
   });
 
+  it('still terminates when asked for a non-finite number of items', () => {
+    // Every exit from the widening loop is a numeric comparison, and every
+    // comparison against NaN is false. Before this was guarded, a non-finite
+    // want spun the loop forever on the main thread — which does not merely
+    // make the tab slow, it makes it unrecoverable: a reload cannot run
+    // because the renderer never returns to the event loop.
+    const events = mixedSession(2_000);
+    for (const want of [Number.NaN, Number.POSITIVE_INFINITY, 0, -5]) {
+      const { items, windowStartIndex } = __buildViewItemsTailForTests(events, true, want as number);
+      expect(items.length).toBeGreaterThan(0);
+      // Not merely "it returned": a nonsense want must fall back to the default
+      // and still derive a bounded window. Returning the whole session would
+      // also terminate, which is why asserting termination alone would not
+      // distinguish a guarded input from an unguarded one rescued by the pass
+      // cap.
+      expect(windowStartIndex).toBeGreaterThan(0);
+    }
+  });
+
   it('examines the same number of events no matter how long the conversation is', () => {
     // The property that matters is that derivation reads a bounded window
     // rather than the whole session. Asserting that structurally rather than by

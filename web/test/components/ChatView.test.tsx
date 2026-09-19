@@ -63,6 +63,58 @@ function selectText(node: Text, start: number, end: number) {
   document.dispatchEvent(new Event('selectionchange'));
 }
 
+function installRenderedLineMeasurement(initialLines: number) {
+  let renderedLines = initialLines;
+  const callbacks = new Set<ResizeObserverCallback>();
+  const originalResizeObserver = globalThis.ResizeObserver;
+  const scrollHeightSpy = vi.spyOn(Element.prototype, 'scrollHeight', 'get').mockImplementation(function () {
+    return this.classList.contains('chat-user-message-fold-content') ? renderedLines * 20 : 0;
+  });
+  const originalGetComputedStyle = window.getComputedStyle.bind(window);
+  const computedStyleSpy = vi.spyOn(window, 'getComputedStyle').mockImplementation((element, pseudoElement) => {
+    const style = originalGetComputedStyle(element, pseudoElement);
+    if (!element.classList.contains('chat-user-message-fold-content')) return style;
+    return new Proxy(style, {
+      get(target, property, receiver) {
+        if (property === 'lineHeight') return '20px';
+        if (property === 'fontSize') return '14px';
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+  });
+  class ControlledResizeObserver {
+    constructor(callback: ResizeObserverCallback) {
+      callbacks.add(callback);
+    }
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+  Object.defineProperty(globalThis, 'ResizeObserver', {
+    configurable: true,
+    writable: true,
+    value: ControlledResizeObserver,
+  });
+  return {
+    setRenderedLines(lines: number) {
+      renderedLines = lines;
+      act(() => {
+        for (const callback of callbacks) callback([], {} as ResizeObserver);
+      });
+    },
+    restore() {
+      scrollHeightSpy.mockRestore();
+      computedStyleSpy.mockRestore();
+      Object.defineProperty(globalThis, 'ResizeObserver', {
+        configurable: true,
+        writable: true,
+        value: originalResizeObserver,
+      });
+    },
+  };
+}
+
 describe('formatChatDateTime', () => {
   const now = new Date(2026, 6, 11, 18, 0, 0).getTime();
 
@@ -228,6 +280,47 @@ describe('ChatView', () => {
     expect(screen.getByText('message-0')).toBeTruthy();
   });
 
+  it('keeps cached messages on screen while a background refresh is still loading', () => {
+    const events = [
+      { eventId: 'u1', type: 'user.message', ts: 1_700_000_000_000, payload: { text: 'cached-question' } },
+      { eventId: 'a1', type: 'assistant.text', ts: 1_700_000_000_001, payload: { text: 'cached-answer' } },
+    ];
+
+    render(
+      <ChatView
+        events={events as any}
+        loading
+        hasOlderHistory={false}
+        sessionId="deck_cached_refresh_brain"
+      />,
+    );
+
+    // `loading` means "a refresh is in flight", NOT "there is nothing to show".
+    // History restored from the local cache must paint immediately. The list
+    // used to be gated behind `!loading`, so a pane whose events were already
+    // in state was blanked and replaced by the spinner until the network
+    // answered — the reported "open a chat and it's empty for a while".
+    expect(screen.getByText('cached-question')).toBeTruthy();
+    expect(screen.getByText('cached-answer')).toBeTruthy();
+    expect(screen.queryByText('chat.loading')).toBeNull();
+  });
+
+  it('shows the loading placeholder only when nothing is cached yet', () => {
+    render(
+      <ChatView
+        events={[] as any}
+        loading
+        hasOlderHistory={false}
+        sessionId="deck_cold_open_brain"
+      />,
+    );
+
+    // The spinner still has a job: a genuinely cold pane. And it must not be
+    // mistaken for "no messages" — that placeholder is a different claim.
+    expect(screen.getByText('chat.loading')).toBeTruthy();
+    expect(screen.queryByText('chat.no_events')).toBeNull();
+  });
+
   it('reveals locally cached older messages at the top while preserving the reading position', async () => {
     const events = Array.from({ length: CHAT_INITIAL_RENDER_ITEM_LIMIT + 10 }, (_, index) => ({
       eventId: `user-${index}`,
@@ -350,33 +443,125 @@ describe('ChatView', () => {
     const content = container.querySelector('.chat-user-message-fold-content');
     expect(fold?.classList.contains('is-folded')).toBe(true);
     expect(content?.classList.contains('is-folded')).toBe(true);
+    expect(content?.textContent).toContain('sent-line-11');
+    expect(screen.getByRole('button', { name: 'chat.user_message_expand' }).getAttribute('aria-expanded')).toBe('false');
 
     fireEvent.click(screen.getByRole('button', { name: 'chat.user_message_expand' }));
 
     expect(fold?.classList.contains('is-folded')).toBe(false);
     expect(content?.classList.contains('is-folded')).toBe(false);
-    expect(screen.getByRole('button', { name: 'chat.user_message_collapse' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'chat.user_message_collapse' }).getAttribute('aria-expanded')).toBe('true');
+    fireEvent.click(screen.getByRole('button', { name: 'chat.user_message_collapse' }));
+    expect(content?.classList.contains('is-folded')).toBe(true);
+    expect(content?.textContent).toContain('sent-line-11');
   });
 
-  it('does not collapse sent user messages with ten hard lines', () => {
-    const tenLineText = Array.from({ length: 10 }, (_, index) => `sent-line-${index + 1}`).join('\n');
+  it('folds a long soft-wrapped paragraph from rendered overflow rather than newline count', () => {
+    const layout = installRenderedLineMeasurement(12);
+    const paragraph = 'A single paragraph with enough words to soft-wrap across more than ten visual lines. '.repeat(20);
+    try {
+      const { container } = render(
+        <ChatView
+          events={[{
+            eventId: 'evt-user-soft-wrap',
+            type: 'user.message',
+            ts: 1_700_000_000_000,
+            payload: { text: paragraph },
+          }] as any}
+          loading={false}
+          hasOlderHistory={false}
+          sessionId="deck_soft_wrapped_user_message"
+        />,
+      );
 
+      expect(container.querySelector('.chat-user-message-fold')?.classList.contains('is-foldable')).toBe(true);
+      expect(container.querySelector('.chat-user-message-fold-content')?.classList.contains('is-folded')).toBe(true);
+      expect(screen.getByRole('button', { name: 'chat.user_message_expand' })).toBeTruthy();
+    } finally {
+      layout.restore();
+    }
+  });
+
+  it('keeps unmeasured content capped before layout without dropping its text', () => {
+    const paragraph = 'Content remains capped until the browser can report its rendered height. '.repeat(20);
     const { container } = render(
       <ChatView
         events={[{
-          eventId: 'evt-user-ten-lines',
+          eventId: 'evt-user-awaiting-layout',
           type: 'user.message',
           ts: 1_700_000_000_000,
-          payload: { text: tenLineText },
+          payload: { text: paragraph },
         }] as any}
         loading={false}
         hasOlderHistory={false}
-        sessionId="deck_ten_line_user_message"
+        sessionId="deck_awaiting_layout_user_message"
       />,
     );
+    const content = container.querySelector('.chat-user-message-fold-content');
+    expect(content?.classList.contains('is-measuring')).toBe(true);
+    expect(content?.textContent).toBe(paragraph);
+    expect(screen.queryByRole('button', { name: 'chat.user_message_expand' })).toBeNull();
+  });
 
-    expect(container.querySelector('.chat-user-message-fold')?.classList.contains('is-foldable')).toBe(false);
-    expect(screen.queryByText('chat.user_message_expand')).toBeNull();
+  it('does not expose a fold toggle for content that renders to ten lines', () => {
+    const layout = installRenderedLineMeasurement(10);
+    const tenLineText = 'A paragraph measured at exactly ten rendered lines.';
+
+    try {
+      const { container } = render(
+        <ChatView
+          events={[{
+            eventId: 'evt-user-ten-lines',
+            type: 'user.message',
+            ts: 1_700_000_000_000,
+            payload: { text: tenLineText },
+          }] as any}
+          loading={false}
+          hasOlderHistory={false}
+          sessionId="deck_ten_line_user_message"
+        />,
+      );
+
+      expect(container.querySelector('.chat-user-message-fold')?.classList.contains('is-foldable')).toBe(false);
+      expect(screen.queryByRole('button', { name: 'chat.user_message_expand' })).toBeNull();
+    } finally {
+      layout.restore();
+    }
+  });
+
+  it('re-measures width changes without losing the user\'s expanded intent', () => {
+    const layout = installRenderedLineMeasurement(12);
+    const paragraph = 'Soft wrapping must track the rendered width without losing expansion state. '.repeat(20);
+    try {
+      const { container } = render(
+        <ChatView
+          events={[{
+            eventId: 'evt-user-responsive-wrap',
+            type: 'user.message',
+            ts: 1_700_000_000_000,
+            payload: { text: paragraph },
+          }] as any}
+          loading={false}
+          hasOlderHistory={false}
+          sessionId="deck_responsive_user_message"
+        />,
+      );
+      const content = container.querySelector('.chat-user-message-fold-content');
+      fireEvent.click(screen.getByRole('button', { name: 'chat.user_message_expand' }));
+      expect(content?.classList.contains('is-folded')).toBe(false);
+
+      layout.setRenderedLines(8);
+      expect(screen.queryByRole('button', { name: 'chat.user_message_collapse' })).toBeNull();
+      expect(content?.classList.contains('is-folded')).toBe(false);
+
+      layout.setRenderedLines(12);
+      const collapse = screen.getByRole('button', { name: 'chat.user_message_collapse' });
+      expect(collapse.getAttribute('aria-expanded')).toBe('true');
+      expect(content?.classList.contains('is-folded')).toBe(false);
+      expect(content?.textContent).toContain('Soft wrapping');
+    } finally {
+      layout.restore();
+    }
   });
 
   it('parses escaped newlines for timeline display while preserving code examples', () => {
@@ -660,7 +845,8 @@ describe('ChatView', () => {
     const revokeObjectURL = vi.fn();
     Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectURL });
     Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: revokeObjectURL });
-    const openSpy = vi.spyOn(window, 'open').mockReturnValue({} as Window);
+    const opened = { opener: window } as unknown as Window;
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(opened);
 
     try {
       const wsListeners = new Set<(msg: any) => void>();
@@ -702,7 +888,8 @@ describe('ChatView', () => {
       });
 
       expect(createObjectURL).toHaveBeenCalledWith(expect.any(Blob));
-      expect(openSpy).toHaveBeenCalledWith('blob:html-preview', '_blank', 'noopener,noreferrer');
+      expect(openSpy).toHaveBeenCalledWith('blob:html-preview', '_blank');
+      expect(opened.opener).toBeNull();
       expect(document.body.querySelector('.html-fullscreen-preview')).toBeNull();
 
       vi.runOnlyPendingTimers();

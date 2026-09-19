@@ -51,6 +51,7 @@
     "prepare": "husky",
     "bench:memory": "tsx bench/memory-pipeline.bench.ts",
     "build:node-exe": "node scripts/build-node-exe.mjs",
+    "package:macos-remote-desktop": "node --import tsx scripts/macos-remote-desktop-release-guard.ts package",
     "check:node-exe-deps": "node scripts/check-node-exe-deps.mjs"
   },
   "dependencies": {
@@ -63,7 +64,7 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@openai/codex-sdk": "^0.144.1",
     "@opencode-ai/sdk": "^1.18.4",
-    "@qoder-ai/qoder-agent-sdk": "1.0.11",
+    "add-mcp": "2.4.0",
     "commander": "^12.1.0",
     "croner": "^10.0.1",
     "fzf": "^0.5.2",
@@ -76,6 +77,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@qoder-ai/qoder-agent-sdk": "1.0.11",
     "@types/node": "^24.0.0",
     "@types/ws": "^8.5.13",
     "@typescript-eslint/eslint-plugin": "^8.0.0",
@@ -87,7 +89,7 @@
     "husky": "^9.1.7",
     "jsdom": "^28.1.0",
     "lint-staged": "^16.3.4",
-    "open-computer-use": "0.2.0",
+    "open-computer-use": "0.3.3",
     "postject": "1.0.0-alpha.6",
     "tsx": "^4.19.0",
     "typescript": "npm:@typescript/typescript6@^6.0.2",
@@ -105,5 +107,13 @@
   },
   "bundleDependencies": [
     "@huggingface/transformers"
-  ]
+  ],
+  "peerDependencies": {
+    "@qoder-ai/qoder-agent-sdk": "1.0.11"
+  },
+  "peerDependenciesMeta": {
+    "@qoder-ai/qoder-agent-sdk": {
+      "optional": true
+    }
+  }
 }
