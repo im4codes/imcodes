@@ -94,7 +94,7 @@ describe('macOS remote-desktop executable entry points', () => {
     // The long-lived side must actually serve it.
     expect(worker).toContain('class SessionControlServer');
     expect(worker).toContain('control.Listen(static_cast<std::uint32_t>(::geteuid()))');
-    expect(worker).toContain('control.ServeOnce(session.get(), context.worker_generation)');
+    expect(worker).toContain('control.ServeOnce(routes.sessions(), context.worker_generation)');
     // Peer must be this user; socket mode alone is not the only gate.
     expect(worker).toContain('::getpeereid(peer, &peer_uid, &peer_gid)');
     expect(worker).toContain('macos::kControlSocketMode');
@@ -120,8 +120,8 @@ describe('macOS remote-desktop executable entry points', () => {
     // pipe -- are multiplexed, so disclosure loss is observed while the host
     // socket is idle, and libwebrtc callbacks reach the loop without touching
     // the session from their own threads.
-    expect(worker).toContain('std::array<pollfd, 4> poll_set{}');
-    expect(worker).toContain('poll_set[3] = {sink.wake_descriptor(), POLLIN, 0};');
+    expect(worker).toContain('poll_set.push_back({disclosure_process.descriptor(), POLLIN, 0});');
+    expect(worker).toContain('poll_set.push_back({route->sink->wake_descriptor(), POLLIN, 0});');
     // Disclosure is examined before host frames are acted on.
     const disclosureAt = worker.indexOf('poll_set[2].revents');
     const hostAt = worker.indexOf('poll_set[0].revents');
@@ -214,7 +214,7 @@ describe('macOS remote-desktop executable entry points', () => {
       expect(worker, token).toContain(token);
     }
     // Every loop exit must stop the session before returning.
-    expect(worker).toMatch(/session->Stop\(\);\s*\n\s*::close\(descriptor\);/);
+    expect(worker).toMatch(/routes\.StopAll\(\);\s*\n\s*disclosure_process\.Terminate\(\);\s*\n\s*::close\(descriptor\);/);
   });
 
   it('never receives or persists a controlled-node credential', async () => {
@@ -245,7 +245,8 @@ describe('macOS remote-desktop executable entry points', () => {
     // as the answer to an unlock this worker asked for, is typed only while
     // the Mac is still locked, and is wiped once typed.
     expect(worker).toContain('macos::ParseUnlockReplyFrame(');
-    expect(worker).toContain('sink.OnUnlockReply(reply.configured, std::move(reply.sign_in_base64url));');
+    expect(worker).toContain('route->sink->OnUnlockReply(reply.configured,\n                                       std::move(reply.sign_in_base64url));');
+    expect(worker).toContain('WipeString(&reply.sign_in_base64url);');
     const reply = worker.slice(worker.indexOf('void WorkerTransportSink::OnUnlockReply('));
     const body = reply.slice(0, reply.indexOf('\n}\n'));
     expect(body).toContain('pending && on_lock_screen');
@@ -260,9 +261,10 @@ describe('macOS remote-desktop executable entry points', () => {
     // The worker still owns the live admission object and hands it to the
     // dispatcher, which is where the route is actually refused.
     expect(worker).toContain('DisclosureSeamAdapter');
-    expect(worker).toContain('configuration.disclosure = &disclosure_adapter');
+    expect(worker).toContain('configuration.disclosure = route->disclosure.get()');
     expect(worker).toContain('configuration.begin_disclosure =');
-    expect(worker).toContain('class WorkerDisclosureAdapter');
+    expect(worker).toContain('class DisclosureRoster');
+    expect(worker).toContain('class RouteDisclosure final : public rd::common::DisclosureAdapter');
     expect(worker).toContain('supervisor_->EnsureVisible(');
     expect(dispatch).toContain('disclosure->route_admissible()');
     expect(dispatchHeader).toContain('macos_remote_desktop_worker_disclosure_not_admissible');
@@ -294,8 +296,8 @@ describe('macOS remote-desktop executable entry points', () => {
 
   it('binds the worker composition to the real pinned transport adapter', async () => {
     expect(worker).toContain('CreatePinnedLibwebrtcTransportBackend()');
-    expect(worker).toContain('BindAdapter(adapter.get())');
-    expect(worker).toContain('configuration.transport = adapter.get()');
+    expect(worker).toContain('BindAdapter(route->adapter.get())');
+    expect(worker).toContain('configuration.transport = route->adapter.get()');
     // A missing transport aborts the session rather than degrading to a
     // view-only run the daemon would read as healthy.
     expect(worker).toContain('macos_remote_desktop_worker_transport_absent');
@@ -329,7 +331,7 @@ describe('macOS remote-desktop executable entry points', () => {
     expect(worker).toContain('terminal_.exchange(true)');
     expect(worker).toContain('TerminalEnvelope(');
     expect(worker).toContain('const char* wire_reason = "peer_failed"');
-    expect(worker).toContain('if (sink.terminal())');
+    expect(worker).toContain('if (route->sink->terminal())');
   });
 
   it('starts exactly one native session for each accepted PREPARE', async () => {

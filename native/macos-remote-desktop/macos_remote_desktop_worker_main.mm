@@ -42,6 +42,7 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -476,15 +477,17 @@ class DisclosureSupervisor {
   std::uint32_t controllers_ = 0;
 };
 
-// Bridges the session's common DisclosureAdapter seam to the separately
-// signed disclosure process. Count changes replace the child and synchronously
-// wait for a freshly visible window, so there is one disclosure owner and the
-// displayed viewer/controller state is current before control is admitted.
-class WorkerDisclosureAdapter final : public rd::common::DisclosureAdapter {
+// The one on-screen disclosure, shared by every viewer of this worker. Each
+// route reports its own viewer/controller counts; the separately signed
+// disclosure process shows their total, and goes away with the last route.
+// Count changes replace the child and synchronously wait for a freshly
+// visible window, so the displayed state is current before control is
+// admitted.
+class DisclosureRoster {
  public:
-  WorkerDisclosureAdapter(DisclosureSupervisor* supervisor,
-                          macos::DisclosureAdmission* admission,
-                          std::uint64_t generation) noexcept
+  DisclosureRoster(DisclosureSupervisor* supervisor,
+                   macos::DisclosureAdmission* admission,
+                   std::uint64_t generation) noexcept
       : supervisor_(supervisor),
         admission_(admission),
         generation_(generation) {}
@@ -493,17 +496,25 @@ class WorkerDisclosureAdapter final : public rd::common::DisclosureAdapter {
     return generation == generation_ && admission_ != nullptr &&
            admission_->route_admissible();
   }
-  rd::common::ReadinessState ProbeReadiness() override {
+  rd::common::ReadinessState ProbeReadiness() const noexcept {
     return admission_ != nullptr && admission_->route_admissible()
                ? rd::common::ReadinessState::kReady
                : rd::common::ReadinessState::kUnavailable;
   }
-  bool Show(std::uint32_t viewers, std::uint32_t controllers) override {
-    return supervisor_ != nullptr && admission_ != nullptr &&
-           supervisor_->EnsureVisible(generation_, viewers, controllers,
-                                      admission_);
+  bool Show(const void* route, std::uint32_t viewers,
+            std::uint32_t controllers) {
+    std::lock_guard lock(mutex_);
+    counts_[route] = {viewers, controllers};
+    return PublishLocked();
   }
-  void Hide() noexcept override {
+  void Hide(const void* route) noexcept {
+    std::lock_guard lock(mutex_);
+    if (counts_.erase(route) == 0)
+      return;
+    if (!counts_.empty()) {
+      (void)PublishLocked();
+      return;
+    }
     if (supervisor_ != nullptr)
       supervisor_->Terminate();
     if (admission_ != nullptr) {
@@ -512,9 +523,41 @@ class WorkerDisclosureAdapter final : public rd::common::DisclosureAdapter {
   }
 
  private:
+  bool PublishLocked() {
+    std::uint32_t viewers = 0;
+    std::uint32_t controllers = 0;
+    for (const auto& [route, count] : counts_) {
+      viewers += count.first;
+      controllers += count.second;
+    }
+    return supervisor_ != nullptr && admission_ != nullptr &&
+           supervisor_->EnsureVisible(generation_, viewers, controllers,
+                                      admission_);
+  }
+
   DisclosureSupervisor* supervisor_;
   macos::DisclosureAdmission* admission_;
   std::uint64_t generation_;
+  std::mutex mutex_;
+  std::map<const void*, std::pair<std::uint32_t, std::uint32_t>> counts_;
+};
+
+// One route's view of the shared disclosure.
+class RouteDisclosure final : public rd::common::DisclosureAdapter {
+ public:
+  explicit RouteDisclosure(DisclosureRoster* roster) noexcept
+      : roster_(roster) {}
+  ~RouteDisclosure() override { roster_->Hide(this); }
+  rd::common::ReadinessState ProbeReadiness() override {
+    return roster_->ProbeReadiness();
+  }
+  bool Show(std::uint32_t viewers, std::uint32_t controllers) override {
+    return roster_->Show(this, viewers, controllers);
+  }
+  void Hide() noexcept override { roster_->Hide(this); }
+
+ private:
+  DisclosureRoster* roster_;
 };
 
 // Serves cleanup requests for the generation this process actually owns.
@@ -526,8 +569,9 @@ class SessionControlServer {
 
   // Accepts one request, acts on it, and answers. Every reply is either a
   // generation-stamped OK or a closed-set error reason.
-  void ServeOnce(macos::MacosRemoteDesktopSession* session,
-                 std::uint64_t active_generation) noexcept;
+  void ServeOnce(
+      const std::vector<macos::MacosRemoteDesktopSession*>& sessions,
+      std::uint64_t active_generation) noexcept;
 
  private:
   int listener_ = -1;
@@ -653,6 +697,7 @@ class WorkerTransportSink final : public macos::MacosTransportCallbackSink {
                        rd::common::QualityTarget target) override;
   void OnTerminal(rd::common::TransportTerminalReason reason) override;
   [[nodiscard]] bool terminal() const noexcept { return terminal_.load(); }
+  [[nodiscard]] bool unlock_pending() const noexcept { return unlock_pending_; }
 
  private:
   void Post(std::function<void()> event);
@@ -810,8 +855,9 @@ void SessionControlServer::Close() noexcept {
   }
 }
 
-void SessionControlServer::ServeOnce(macos::MacosRemoteDesktopSession* session,
-                                     std::uint64_t active_generation) noexcept {
+void SessionControlServer::ServeOnce(
+    const std::vector<macos::MacosRemoteDesktopSession*>& sessions,
+    std::uint64_t active_generation) noexcept {
   const int peer = ::accept(listener_, nullptr, nullptr);
   if (peer < 0)
     return;
@@ -845,7 +891,10 @@ void SessionControlServer::ServeOnce(macos::MacosRemoteDesktopSession* session,
         // Not ReleaseController(""): InputLedger looks that id up, misses, and
         // returns kApplied — a generation-stamped success that released
         // nothing while real controllers still hold keys and buttons down.
-        if (!session->ReleaseAllControllers()) {
+        bool released = !sessions.empty();
+        for (macos::MacosRemoteDesktopSession* session : sessions)
+          released = session->ReleaseAllControllers() && released;
+        if (!released) {
           // The session could not act (terminal, or view not ready). Reporting
           // OK here would claim a release that never happened.
           (void)macos::SerializeControlError(
@@ -855,7 +904,8 @@ void SessionControlServer::ServeOnce(macos::MacosRemoteDesktopSession* session,
           return;
         }
       } else {
-        session->Stop();
+        for (macos::MacosRemoteDesktopSession* session : sessions)
+          session->Stop();
       }
       (void)macos::SerializeControlOk(active_generation, &reply);
     }
@@ -1105,8 +1155,13 @@ bool EmitWorkerMessage(int descriptor,
 
 class WorkerSocketEmitter final {
  public:
-  WorkerSocketEmitter(int descriptor, std::uint64_t generation) noexcept
-      : descriptor_(descriptor), generation_(generation) {}
+  // Every route's emitter writes to the same socket; `write_mutex` is shared
+  // by all of them so frames from different viewers never interleave.
+  WorkerSocketEmitter(int descriptor, std::uint64_t generation,
+                      std::mutex* write_mutex) noexcept
+      : descriptor_(descriptor),
+        generation_(generation),
+        write_mutex_(write_mutex) {}
 
   void BindAuthority(const imcodes::rd::Authority& authority) {
     std::lock_guard lock(mutex_);
@@ -1121,31 +1176,31 @@ class WorkerSocketEmitter final {
     return authority_;
   }
   bool Emit(const Json::Value& message) {
-    std::lock_guard lock(mutex_);
+    std::lock_guard lock(*write_mutex_);
     return EmitWorkerMessage(descriptor_, generation_,
                              imcodes::rd::WriteJson(message));
   }
   // A pre-built frame on the same serialized writer, so it can never interleave
   // with a worker message written from another thread.
   bool WriteRaw(const std::string& frame) {
-    std::lock_guard lock(mutex_);
+    std::lock_guard lock(*write_mutex_);
     return WriteFrame(descriptor_, frame);
   }
   bool EmitLocalIce(const rd::common::IceCandidate& candidate) {
-    std::lock_guard lock(mutex_);
-    if (!authority_.has_value())
+    const std::optional<imcodes::rd::Authority> authority = SnapshotAuthority();
+    if (!authority.has_value())
       return false;
     Json::Value message =
-        imcodes::rd::BaseEnvelope(imcodes::rd::kIceType, *authority_);
+        imcodes::rd::BaseEnvelope(imcodes::rd::kIceType, *authority);
     message["candidate"] = candidate.candidate;
     message["mid"] = candidate.media_id;
-    return EmitWorkerMessage(descriptor_, generation_,
-                             imcodes::rd::WriteJson(message));
+    return Emit(message);
   }
 
  private:
   int descriptor_;
   std::uint64_t generation_;
+  std::mutex* write_mutex_;
   std::mutex mutex_;
   std::optional<imcodes::rd::Authority> authority_;
 };
@@ -1196,6 +1251,10 @@ void WorkerTransportSink::SignalTerminal(std::string_view reason) {
     (void)emitter_->Emit(
         imcodes::rd::TerminalEnvelope(*authority, std::string(reason).c_str()));
   }
+  // The route's last frame: the node retires the route on it, and a later
+  // frame for a retired route would end the whole worker -- every other
+  // viewer included.
+  emitter_->ClearAuthority();
 }
 
 void WorkerTransportSink::OnSessionTerminal(
@@ -1988,11 +2047,13 @@ class SessionSeamAdapter final : public macos::HostCommandSessionSeam {
     return true;
   }
 
-  bool ServesOtherRoute(
-      const imcodes::rd::Authority& authority) const override {
-    return active_ && (authority.request_id != authority_.request_id ||
-                       authority.session_id != authority_.session_id);
+  // The route table routes by these; this adapter is one route.
+  bool Serves(const imcodes::rd::Authority& authority) const override {
+    return active_ && authority.request_id == authority_.request_id &&
+           authority.session_id == authority_.session_id;
   }
+  std::size_t live_routes() const override { return active_ ? 1 : 0; }
+  std::size_t max_routes() const override { return 1; }
 
  private:
   bool Matches(const imcodes::rd::Authority& authority) const noexcept {
@@ -2011,6 +2072,173 @@ class SessionSeamAdapter final : public macos::HostCommandSessionSeam {
   ReadinessAttestor readiness_attestor_;
   imcodes::rd::Authority authority_;
   bool active_ = false;
+};
+
+// One viewer's composition. Members are declared in dependency order, so
+// they are destroyed in the order the single-viewer worker always tore down:
+// the command seam and session first, then the transport, then the sink and
+// the socket emitter the transport reports through.
+struct WorkerRoute {
+  std::unique_ptr<WorkerSocketEmitter> emitter;
+  std::unique_ptr<WorkerTransportSink> sink;
+  std::unique_ptr<macos::MacosTransportSessionAdapter> adapter;
+  std::unique_ptr<RouteDisclosure> disclosure;
+  std::unique_ptr<macos::MacosRemoteDesktopSession> session;
+  // Owned by the session; sampled for media progress.
+  const macos::MacosMediaSenderBinder* media_binder = nullptr;
+  std::unique_ptr<SessionSeamAdapter> seam;
+  std::int64_t negotiation_started_ms = 0;
+  std::int64_t last_media_sample_ms = 0;
+  bool media_status_sent = false;
+};
+
+// Every viewer of this worker, each on its own route, up to the cap every
+// worker shares (kMaxSessions). Host commands reach the route their authority
+// names; a PREPARE for a new session opens one.
+class WorkerRouteTable final : public macos::HostCommandSessionSeam {
+ public:
+  using Compose = std::function<std::unique_ptr<WorkerRoute>()>;
+  using Admitted = std::function<void(WorkerRoute&)>;
+
+  WorkerRouteTable(Compose compose, Admitted admitted)
+      : compose_(std::move(compose)), admitted_(std::move(admitted)) {}
+  ~WorkerRouteTable() override { StopAll(); }
+  WorkerRouteTable(const WorkerRouteTable&) = delete;
+  WorkerRouteTable& operator=(const WorkerRouteTable&) = delete;
+
+  // Composes the next route ahead of its PREPARE.
+  bool Warm() {
+    if (spare_ == nullptr)
+      spare_ = compose_();
+    return spare_ != nullptr;
+  }
+
+  bool Prepare(const imcodes::rd::Authority& authority,
+               std::int64_t now_unix_ms,
+               std::int64_t now_monotonic_ms) override {
+    if (Find(authority) != nullptr || routes_.size() >= max_routes())
+      return false;
+    std::unique_ptr<WorkerRoute> route =
+        spare_ != nullptr ? std::move(spare_) : compose_();
+    if (route == nullptr ||
+        !route->seam->Prepare(authority, now_unix_ms, now_monotonic_ms)) {
+      return false;
+    }
+    if (admitted_)
+      admitted_(*route);
+    routes_.push_back(std::move(route));
+    return true;
+  }
+  bool NegotiateOffer(const imcodes::rd::Authority& authority,
+                      std::string_view offer_sdp,
+                      std::string* answer_sdp) override {
+    WorkerRoute* route = Find(authority);
+    return route != nullptr &&
+           route->seam->NegotiateOffer(authority, offer_sdp, answer_sdp);
+  }
+  bool AddRemoteIce(const imcodes::rd::Authority& authority,
+                    std::string_view media_id,
+                    std::string_view candidate) override {
+    WorkerRoute* route = Find(authority);
+    return route != nullptr &&
+           route->seam->AddRemoteIce(authority, media_id, candidate);
+  }
+  bool RenewLease(const imcodes::rd::Authority& authority,
+                  std::int64_t now_unix_ms,
+                  std::int64_t now_monotonic_ms) override {
+    WorkerRoute* route = Find(authority);
+    return route != nullptr &&
+           route->seam->RenewLease(authority, now_unix_ms, now_monotonic_ms);
+  }
+  bool SetMode(const imcodes::rd::Authority& authority,
+               std::string_view reason,
+               std::int64_t now_unix_ms,
+               std::int64_t now_monotonic_ms) override {
+    WorkerRoute* route = Find(authority);
+    return route != nullptr && route->seam->SetMode(authority, reason,
+                                                    now_unix_ms,
+                                                    now_monotonic_ms);
+  }
+  bool Stop(const imcodes::rd::Authority& authority) override {
+    WorkerRoute* route = Find(authority);
+    if (route == nullptr)
+      return false;
+    const bool stopped = route->seam->Stop(authority);
+    Remove(route);
+    return stopped;
+  }
+  bool Serves(const imcodes::rd::Authority& authority) const override {
+    return Find(authority) != nullptr;
+  }
+  std::size_t live_routes() const override { return routes_.size(); }
+  std::size_t max_routes() const override {
+    return imcodes::rd::kMaxSessions;
+  }
+
+  // A route whose transport already ended (and said so) leaves the table.
+  void Retire(WorkerRoute* route) {
+    if (route->session != nullptr)
+      route->session->Stop();
+    Remove(route);
+  }
+  void StopAll() {
+    for (const auto& route : routes_) {
+      if (route->session != nullptr)
+        route->session->Stop();
+    }
+    routes_.clear();
+    spare_.reset();
+  }
+
+  // Snapshots, so a route may be retired while iterating.
+  [[nodiscard]] std::vector<WorkerRoute*> live() const {
+    std::vector<WorkerRoute*> out;
+    for (const auto& route : routes_)
+      out.push_back(route.get());
+    return out;
+  }
+  [[nodiscard]] std::vector<macos::MacosRemoteDesktopSession*> sessions()
+      const {
+    std::vector<macos::MacosRemoteDesktopSession*> out;
+    for (const auto& route : routes_)
+      out.push_back(route->session.get());
+    return out;
+  }
+  [[nodiscard]] std::uint64_t real_frames_encoded() const {
+    std::uint64_t total = 0;
+    for (const auto& route : routes_)
+      total += route->session->real_frames_encoded();
+    return total;
+  }
+  [[nodiscard]] bool media_active() const {
+    for (const auto& route : routes_) {
+      if (route->session->media_active())
+        return true;
+    }
+    return false;
+  }
+
+ private:
+  WorkerRoute* Find(const imcodes::rd::Authority& authority) const {
+    for (const auto& route : routes_) {
+      if (route->seam->Serves(authority))
+        return route.get();
+    }
+    return nullptr;
+  }
+  void Remove(WorkerRoute* route) {
+    for (auto it = routes_.begin(); it != routes_.end(); ++it) {
+      if (it->get() == route) {
+        routes_.erase(it);
+        return;
+      }
+    }
+  }
+
+  Compose compose_;
+  Admitted admitted_;
+  std::unique_ptr<WorkerRoute> spare_;
+  std::vector<std::unique_ptr<WorkerRoute>> routes_;
 };
 
 class DisclosureSeamAdapter final : public macos::HostCommandDisclosureSeam {
@@ -2070,7 +2298,7 @@ class SocketMessageSink final : public macos::HostCommandMessageSink {
 
 // Applies one accepted HOST_COMMAND. Returns false to terminate the loop.
 bool HandleHostCommand(const macos::HostCommandFrame& frame,
-                       SessionSeamAdapter* session,
+                       macos::HostCommandSessionSeam* session,
                        macos::DisclosureAdmission* disclosure,
                        WorkerSocketEmitter* emitter) {
   DisclosureSeamAdapter disclosure_seam(disclosure);
@@ -2354,36 +2582,10 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
     authenticated_peer = std::move(parsed);
   }
 
-  auto backend = macos::CreatePinnedLibwebrtcTransportBackend();
-  if (backend == nullptr) {
-    ::close(descriptor);
-    std::cerr << "macos_remote_desktop_worker_transport_absent\n";
-    return EX_UNAVAILABLE;
-  }
-  WorkerTransportSink sink;
-  WorkerSocketEmitter emitter(descriptor, context.worker_generation);
-  macos::MacosPeerConnectionBackend* backend_view = backend.get();
-  auto adapter = std::make_unique<macos::MacosTransportSessionAdapter>(
-      std::move(backend), sink, std::vector<macos::MacosTransportIceServer>{},
-      [&emitter](const rd::common::IceCandidate& candidate) {
-        return emitter.EmitLocalIce(candidate);
-      });
-  backend_view->BindAdapter(adapter.get());
-
-  // CreateWithPinnedLibwebrtcSender returns nullptr without a sender backend,
-  // so every ordinary launch previously failed composition right here.
-  //
-  // The upstream-backed sender cannot exist yet: the only legitimate
-  // EncodedImageCallback comes from libwebrtc's VideoEncoder::InitEncode, which
-  // upstream calls after the track is added and negotiation settles. The binder
-  // IS the production sender for the session's whole life — fail-closed until
-  // the transport binds that callback into it, a straight delegate afterwards.
-  // It is not a dummy: before binding it refuses frames rather than pretending
-  // to have sent them.
-  auto media_binder = std::make_unique<macos::MacosMediaSenderBinder>();
-  backend_view->BindMediaSender(media_binder.get());
-  // Owned by the session composition below; the loop only samples it.
-  const macos::MacosMediaSenderBinder* media_binder_view = media_binder.get();
+  // Every viewer's frames share this socket.
+  std::mutex socket_write_mutex;
+  WorkerSocketEmitter host_emitter(descriptor, context.worker_generation,
+                                   &socket_write_mutex);
 
   macos::DisclosureAdmission disclosure(context.worker_generation);
   DisclosureSupervisor disclosure_process;
@@ -2393,8 +2595,8 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
     std::cerr << "macos_remote_desktop_worker_disclosure_launch_failed\n";
     return EX_UNAVAILABLE;
   }
-  WorkerDisclosureAdapter disclosure_adapter(&disclosure_process, &disclosure,
-                                             context.worker_generation);
+  DisclosureRoster roster(&disclosure_process, &disclosure,
+                          context.worker_generation);
 
   // Session-type admission, before anything is composed.
   //
@@ -2452,153 +2654,209 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
   // separate supervisor stream would be a second live stream on the same
   // display whose frames reach no encoder, which proves nothing about whether
   // the session can capture.
-  // Wake the display before choosing and starting capture, so the first frames
-  // are of a lit screen rather than a sleeping one.
   DisplayWakeGuard display_wake;
-  std::unique_ptr<macos::ScreenCaptureKitBackend> capture_backend;
-  {
-    macos::LoginWindowCaptureRequest capture_request;
-    capture_request.binding = session_binding;
-    RunningMacosVersion(&capture_request.os_major, &capture_request.os_minor);
-    const macos::LoginWindowCaptureOutcome capture_outcome =
-        macos::ComposeSessionCapture(
-            capture_request, nullptr,
-            [locked = std::string_view(
-                          WorkerReadinessProbe::ProbeConsoleSessionState()) ==
-                      macos::kNativeSessionStateLocked,
-             aqua = session_binding.session_type == macos::kSessionTypeAqua](
-                macos::LoginWindowCaptureBackend selected)
-                -> std::unique_ptr<macos::ScreenCaptureKitBackend> {
-              switch (selected) {
-                case macos::LoginWindowCaptureBackend::kScreenCaptureKit:
-                  // ScreenCaptureKit never delivers the lock screen: the
-                  // shield is excluded from every stream, so a locked Mac is
-                  // a black picture with a cursor. CGDisplayStream composites
-                  // the whole display, shield included -- the path other
-                  // remote-desktop products use to show and unlock it.
-                  if (aqua && locked) {
-                    std::cerr << "macos_remote_desktop_worker_capture_locked_cgdisplaystream\n";
-                    return macos::CreateCgDisplayStreamBackend();
-                  }
-                  return macos::CreateAppleScreenCaptureKitBackend();
-                case macos::LoginWindowCaptureBackend::kCgDisplayStream:
-                  return macos::CreateCgDisplayStreamBackend();
-                case macos::LoginWindowCaptureBackend::kUnavailable:
-                  break;
-              }
-              return nullptr;
-            },
-            &capture_backend);
-    if (capture_outcome.status != macos::LoginWindowCaptureStatus::kOk ||
-        capture_backend == nullptr) {
-      // Fail closed. A login window that cannot be captured must not fall back
-      // to the Aqua composition, which would serve a surface nobody is at.
-      disclosure_process.Terminate();
-      ::close(descriptor);
-      std::cerr << "macos_remote_desktop_worker_capture_backend_unavailable\n";
-      return EX_UNAVAILABLE;
-    }
-  }
-
   // One reader for this descriptor, shared by the loop below and by every
   // display exchange. Declared here so the session outlives neither.
   DaemonDisplayChannel display_channel(descriptor, context.worker_generation,
                                        kDaemonDisplayTimeoutMs);
   std::uint64_t display_nonce = 0;
 
-  macos::MacosRemoteDesktopProductionConfiguration configuration;
-  configuration.worker_generation = context.worker_generation;
-  configuration.session_type = session_binding.session_type;
-  configuration.capture_backend = std::move(capture_backend);
-  if (!session_profile.clipboard) {
-    // Refused through the existing seam rather than by a new flag: the session
-    // asks these callbacks for every copy/paste, so returning false here is the
-    // enforcement, not a hint. There is no logged-in user at the login window,
-    // so a copy would be reading whatever the previous session left behind.
-    configuration.request_copy = [](std::uint64_t) { return false; };
-    configuration.request_paste = [](std::uint64_t) { return false; };
-  }
-  // Display ownership is proxied through the daemon, never constructed here.
-  // This process holds a ROUTE capability, not the helper's; a supervisor
-  // failure makes every display request a refusal rather than a fallback to an
-  // in-process CGVirtualDisplay owner.
-  configuration.virtual_display_backend =
-      std::make_unique<macos::DaemonProxyVirtualDisplayBackend>(
-          [&display_channel](std::string_view request,
-                             macos::VirtualDisplayReplyShape shape,
-                             macos::VirtualDisplayProxyReply* reply) {
-            return display_channel.Exchange(request, shape, reply);
-          },
-          [&display_nonce]() { return ++display_nonce; },
-          context.worker_generation, session_binding.uid);
-  configuration.transport = adapter.get();
-  macos::MacosTransportSessionAdapter* adapter_view = adapter.get();
-  configuration.negotiate_offer = [adapter_view](std::string_view offer_sdp,
-                                                 std::string* answer_sdp) {
-    return adapter_view != nullptr &&
-           adapter_view->NegotiateOffer(offer_sdp, answer_sdp);
+  std::uint64_t unlock_request_id = 0;
+  const auto send_unlock_request = [&](bool reveal) {
+    std::string frame;
+    if (!macos::BuildUnlockRequestFrame(context.worker_generation,
+                                        ++unlock_request_id, reveal, &frame)) {
+      return false;
+    }
+    return host_emitter.WriteRaw(frame);
   };
-  configuration.pinned_libwebrtc_sender_backend = std::move(media_binder);
-  configuration.disclosure = &disclosure_adapter;
-  configuration.begin_disclosure =
-      [&disclosure_adapter](rd::common::WorkerGeneration generation) {
-        return disclosure_adapter.BeginGeneration(generation);
+
+  // One viewer's own composition: its peer connection, capture stream,
+  // encoder binding and status stream. Viewers share the worker, the
+  // disclosure and the display channel, as on Windows and Linux.
+  const auto compose_route = [&]() -> std::unique_ptr<WorkerRoute> {
+    auto route = std::make_unique<WorkerRoute>();
+    route->emitter = std::make_unique<WorkerSocketEmitter>(
+        descriptor, context.worker_generation, &socket_write_mutex);
+    route->sink = std::make_unique<WorkerTransportSink>();
+    auto backend = macos::CreatePinnedLibwebrtcTransportBackend();
+    if (backend == nullptr) {
+      std::cerr << "macos_remote_desktop_worker_transport_absent\n";
+      return nullptr;
+    }
+    WorkerSocketEmitter* emitter = route->emitter.get();
+    macos::MacosPeerConnectionBackend* backend_view = backend.get();
+    route->adapter = std::make_unique<macos::MacosTransportSessionAdapter>(
+        std::move(backend), *route->sink,
+        std::vector<macos::MacosTransportIceServer>{},
+        [emitter](const rd::common::IceCandidate& candidate) {
+          return emitter->EmitLocalIce(candidate);
+        });
+    backend_view->BindAdapter(route->adapter.get());
+    // The binder IS the production sender for the route's whole life --
+    // fail-closed until the transport binds libwebrtc's EncodedImageCallback
+    // into it (after the track is added and negotiation settles), a straight
+    // delegate afterwards.
+    auto media_binder = std::make_unique<macos::MacosMediaSenderBinder>();
+    backend_view->BindMediaSender(media_binder.get());
+    route->media_binder = media_binder.get();
+    route->disclosure = std::make_unique<RouteDisclosure>(&roster);
+
+    // Wake the display before choosing and starting capture, so the first frames
+    // are of a lit screen rather than a sleeping one.
+    std::unique_ptr<macos::ScreenCaptureKitBackend> capture_backend;
+    {
+      macos::LoginWindowCaptureRequest capture_request;
+      capture_request.binding = session_binding;
+      RunningMacosVersion(&capture_request.os_major, &capture_request.os_minor);
+      const macos::LoginWindowCaptureOutcome capture_outcome =
+          macos::ComposeSessionCapture(
+              capture_request, nullptr,
+              [locked = std::string_view(
+                            WorkerReadinessProbe::ProbeConsoleSessionState()) ==
+                        macos::kNativeSessionStateLocked,
+               aqua = session_binding.session_type == macos::kSessionTypeAqua](
+                  macos::LoginWindowCaptureBackend selected)
+                  -> std::unique_ptr<macos::ScreenCaptureKitBackend> {
+                switch (selected) {
+                  case macos::LoginWindowCaptureBackend::kScreenCaptureKit:
+                    // ScreenCaptureKit never delivers the lock screen: the
+                    // shield is excluded from every stream, so a locked Mac is
+                    // a black picture with a cursor. CGDisplayStream composites
+                    // the whole display, shield included -- the path other
+                    // remote-desktop products use to show and unlock it.
+                    if (aqua && locked) {
+                      std::cerr << "macos_remote_desktop_worker_capture_locked_cgdisplaystream\n";
+                      return macos::CreateCgDisplayStreamBackend();
+                    }
+                    return macos::CreateAppleScreenCaptureKitBackend();
+                  case macos::LoginWindowCaptureBackend::kCgDisplayStream:
+                    return macos::CreateCgDisplayStreamBackend();
+                  case macos::LoginWindowCaptureBackend::kUnavailable:
+                    break;
+                }
+                return nullptr;
+              },
+              &capture_backend);
+      if (capture_outcome.status != macos::LoginWindowCaptureStatus::kOk ||
+          capture_backend == nullptr) {
+        // Fail closed. A login window that cannot be captured must not fall back
+        // to the Aqua composition, which would serve a surface nobody is at.
+        std::cerr << "macos_remote_desktop_worker_capture_backend_unavailable\n";
+        return nullptr;
+      }
+    }
+
+
+    macos::MacosRemoteDesktopProductionConfiguration configuration;
+    configuration.worker_generation = context.worker_generation;
+    configuration.session_type = session_binding.session_type;
+    configuration.capture_backend = std::move(capture_backend);
+    if (!session_profile.clipboard) {
+      // Refused through the existing seam rather than by a new flag: the session
+      // asks these callbacks for every copy/paste, so returning false here is the
+      // enforcement, not a hint. There is no logged-in user at the login window,
+      // so a copy would be reading whatever the previous session left behind.
+      configuration.request_copy = [](std::uint64_t) { return false; };
+      configuration.request_paste = [](std::uint64_t) { return false; };
+    }
+    // Display ownership is proxied through the daemon, never constructed here.
+    // This process holds a ROUTE capability, not the helper's; a supervisor
+    // failure makes every display request a refusal rather than a fallback to an
+    // in-process CGVirtualDisplay owner.
+    configuration.virtual_display_backend =
+        std::make_unique<macos::DaemonProxyVirtualDisplayBackend>(
+            [&display_channel](std::string_view request,
+                               macos::VirtualDisplayReplyShape shape,
+                               macos::VirtualDisplayProxyReply* reply) {
+              return display_channel.Exchange(request, shape, reply);
+            },
+            [&display_nonce]() { return ++display_nonce; },
+            context.worker_generation, session_binding.uid);
+    configuration.transport = route->adapter.get();
+    macos::MacosTransportSessionAdapter* adapter_view = route->adapter.get();
+    configuration.negotiate_offer = [adapter_view](std::string_view offer_sdp,
+                                                   std::string* answer_sdp) {
+      return adapter_view != nullptr &&
+             adapter_view->NegotiateOffer(offer_sdp, answer_sdp);
+    };
+    configuration.pinned_libwebrtc_sender_backend = std::move(media_binder);
+    configuration.disclosure = route->disclosure.get();
+    configuration.begin_disclosure =
+        [&roster](rd::common::WorkerGeneration generation) {
+          return roster.BeginGeneration(generation);
+        };
+
+    WorkerTransportSink* sink = route->sink.get();
+    route->session =
+        macos::MacosRemoteDesktopSession::CreateWithPinnedLibwebrtcSender(
+            std::move(configuration),
+            [sink](const macos::MacosRemoteDesktopSessionEvent& event) {
+              if (event.type ==
+                      macos::MacosRemoteDesktopSessionEventType::kTerminal &&
+                  event.terminal_error.code !=
+                      rd::common::TerminalErrorCode::kStopped) {
+                sink->OnSessionTerminal(event.terminal_error);
+              }
+            });
+    if (route->session == nullptr) {
+      std::cerr << "macos_remote_desktop_worker_composition_unavailable\n";
+      return nullptr;
+    }
+    route->sink->Bind(route->session.get(), route->adapter.get(), emitter);
+    route->sink->SetUnlockRequester(send_unlock_request);
+    SessionSeamAdapter::ReadinessAttestor readiness_attestor;
+    if (session_binding.session_type == macos::kSessionTypeLoginWindow) {
+      if (!authenticated_peer.has_value()) {
+        std::cerr << "macos_remote_desktop_worker_readiness_authentication_missing\n";
+        return nullptr;
+      }
+      const macos::AuthenticatedGraphicalPeer peer{
+          .uid = authenticated_peer->uid,
+          .audit_session_id = authenticated_peer->audit_session_id,
+          .pid_version = authenticated_peer->pid_version,
+          .worker_generation = authenticated_peer->worker_generation,
+          .session_type = authenticated_peer->session_type,
+          .launch_challenge = authenticated_peer->launch_challenge,
       };
-  auto session =
-      macos::MacosRemoteDesktopSession::CreateWithPinnedLibwebrtcSender(
-          std::move(configuration),
-          [&sink](const macos::MacosRemoteDesktopSessionEvent& event) {
-            if (event.type ==
-                    macos::MacosRemoteDesktopSessionEventType::kTerminal &&
-                event.terminal_error.code !=
-                    rd::common::TerminalErrorCode::kStopped) {
-              sink.OnSessionTerminal(event.terminal_error);
-            }
-          });
-  if (session == nullptr) {
+      readiness_attestor =
+          [descriptor, binding = session_binding, peer](
+              const rd::common::CapabilityReadiness& observed) {
+            std::string frame;
+            return macos::BuildAuthenticatedGraphicalReadinessFrame(
+                       binding, peer, observed, true, &frame) &&
+                   WriteFrame(descriptor, frame);
+          };
+    }
+
+    route->seam = std::make_unique<SessionSeamAdapter>(
+        route->session.get(), route->adapter.get(), context.worker_generation,
+        emitter, route->sink.get(), std::move(readiness_attestor));
+    return route;
+  };
+
+  bool privacy_shielded = false;
+  WorkerRouteTable routes(compose_route, [&](WorkerRoute& route) {
+    // A viewer joining a shielded desktop is shielded too.
+    route.negotiation_started_ms = SampleNow().monotonic_ms;
+    if (privacy_shielded)
+      route.session->SetPrivacyShield(true);
+  });
+  // The first route is composed now, before anyone asks, exactly as the
+  // single-viewer worker always was: the first viewer waits for nothing.
+  if (!routes.Warm()) {
     disclosure_process.Terminate();
     ::close(descriptor);
-    std::cerr << "macos_remote_desktop_worker_composition_unavailable\n";
     return EX_UNAVAILABLE;
   }
-  sink.Bind(session.get(), adapter.get(), &emitter);
-  SessionSeamAdapter::ReadinessAttestor readiness_attestor;
-  if (session_binding.session_type == macos::kSessionTypeLoginWindow) {
-    if (!authenticated_peer.has_value()) {
-      disclosure_process.Terminate();
-      session->Stop();
-      ::close(descriptor);
-      std::cerr << "macos_remote_desktop_worker_readiness_authentication_missing\n";
-      return EX_NOPERM;
-    }
-    const macos::AuthenticatedGraphicalPeer peer{
-        .uid = authenticated_peer->uid,
-        .audit_session_id = authenticated_peer->audit_session_id,
-        .pid_version = authenticated_peer->pid_version,
-        .worker_generation = authenticated_peer->worker_generation,
-        .session_type = authenticated_peer->session_type,
-        .launch_challenge = authenticated_peer->launch_challenge,
-    };
-    readiness_attestor =
-        [descriptor, binding = session_binding, peer](
-            const rd::common::CapabilityReadiness& observed) {
-          std::string frame;
-          return macos::BuildAuthenticatedGraphicalReadinessFrame(
-                     binding, peer, observed, true, &frame) &&
-                 WriteFrame(descriptor, frame);
-        };
-  }
-  SessionSeamAdapter command_session(
-      session.get(), adapter.get(), context.worker_generation, &emitter, &sink,
-      std::move(readiness_attestor));
 
   // Cleanup commands arrive as fresh sibling processes, so this generation
   // must be reachable over the per-user control socket for as long as it owns
   // the session.
   SessionControlServer control;
   if (!control.Listen(static_cast<std::uint32_t>(::geteuid()))) {
+    routes.StopAll();
     disclosure_process.Terminate();
-    session->Stop();
     ::close(descriptor);
     std::cerr << "macos_remote_desktop_worker_control_listen_failed\n";
     return EX_UNAVAILABLE;
@@ -2633,21 +2891,7 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
   // that DID start but got stuck) while never arming for a worker nothing has
   // ever addressed.
   constexpr std::int64_t kConnectionEstablishTimeoutMs = 60'000;
-  std::int64_t negotiation_started_ms = -1;
-
-  std::int64_t last_media_sample_ms = 0;
-  bool media_status_sent = false;
-  std::uint64_t unlock_request_id = 0;
   std::int64_t last_unlock_query_ms = -60'000;
-  const auto send_unlock_request = [&](bool reveal) {
-    std::string frame;
-    if (!macos::BuildUnlockRequestFrame(context.worker_generation,
-                                        ++unlock_request_id, reveal, &frame)) {
-      return false;
-    }
-    return emitter.WriteRaw(frame);
-  };
-  sink.SetUnlockRequester(send_unlock_request);
   // A lifted shield is proven by a real frame encoded after the lift; the
   // reply waits for it.
   struct PendingPrivacyRelease {
@@ -2660,17 +2904,17 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
     std::string frame;
     return macos::BuildPrivacyReplyFrame(context.worker_generation, request_id,
                                          shielded, true, real_frames, &frame) &&
-           emitter.WriteRaw(frame);
+           host_emitter.WriteRaw(frame);
   };
   while (running) {
-    std::array<pollfd, 4> poll_set{};
-    poll_set[0] = {descriptor, POLLIN, 0};
-    poll_set[1] = {control.descriptor(), POLLIN, 0};
-    poll_set[2] = {disclosure_process.descriptor(), POLLIN, 0};
-    poll_set[3] = {sink.wake_descriptor(), POLLIN, 0};
+    std::vector<pollfd> poll_set;
+    poll_set.push_back({descriptor, POLLIN, 0});
+    poll_set.push_back({control.descriptor(), POLLIN, 0});
+    poll_set.push_back({disclosure_process.descriptor(), POLLIN, 0});
     // A libwebrtc terminal callback can arrive on its own thread. A bounded
-    // poll lets that one-way terminal wake this loop without an indefinitely
-    // live worker after the peer has died.
+    // poll lets that one-way terminal wake this loop.
+    for (WorkerRoute* route : routes.live())
+      poll_set.push_back({route->sink->wake_descriptor(), POLLIN, 0});
     const int ready = ::poll(poll_set.data(), poll_set.size(), 250);
     if (ready < 0) {
       if (errno == EINTR)
@@ -2679,34 +2923,50 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
       status = EX_IOERR;
       break;
     }
-    if (sink.terminal()) {
+
+    // A route whose transport ended leaves; the others keep streaming. The
+    // worker ends with its last route, as the single-viewer worker did.
+    const auto retire_ended_routes = [&]() {
+      bool ended = false;
+      for (WorkerRoute* route : routes.live()) {
+        if (route->sink->terminal()) {
+          routes.Retire(route);
+          ended = true;
+        }
+      }
+      return ended && routes.live_routes() == 0;
+    };
+    if (retire_ended_routes()) {
       std::cerr << "macos_remote_desktop_worker_transport_terminal\n";
       status = EX_UNAVAILABLE;
       break;
     }
-
-    sink.DrainEvents();
-    if (sink.terminal()) {
+    for (WorkerRoute* route : routes.live())
+      route->sink->DrainEvents();
+    if (retire_ended_routes()) {
       std::cerr << "macos_remote_desktop_worker_transport_terminal\n";
       status = EX_UNAVAILABLE;
       break;
     }
-    sink.ObserveTypedUnlock();
-    sink.DrainQualityTarget();
+    for (WorkerRoute* route : routes.live()) {
+      route->sink->ObserveTypedUnlock();
+      route->sink->DrainQualityTarget();
+    }
 
-    // Outbound media progress, once a second -- the Windows worker's stats
-    // cadence. It arms the stall watchdog and is the only source of
-    // `mediaStarted`; without it the Server never considers a macOS route
-    // connected and fails every session at its negotiation deadline.
+    // Outbound media progress, once a second per route -- the Windows
+    // worker's stats cadence. It arms the stall watchdog and is the only
+    // source of `mediaStarted`; without it the Server never considers a macOS
+    // route connected and fails every session at its negotiation deadline.
     {
       const rd::common::TransportTime now = SampleNow();
       display_wake.Refresh(now.monotonic_ms);
       if (pending_privacy_release.has_value()) {
-        const std::uint64_t real = session->real_frames_encoded();
         // No media means no viewer can be shown anything; the lift is then
         // proven by the next generation number rather than a frame that will
         // never be captured.
-        if (real > pending_privacy_release->baseline || !session->media_active()) {
+        const std::uint64_t real = routes.real_frames_encoded();
+        if (real > pending_privacy_release->baseline ||
+            !routes.media_active()) {
           (void)send_privacy_reply(
               pending_privacy_release->request_id, false,
               std::max(real, pending_privacy_release->baseline + 1));
@@ -2719,30 +2979,26 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
         last_unlock_query_ms = now.monotonic_ms;
         (void)send_unlock_request(false);
       }
-      if (now.monotonic_ms - last_media_sample_ms >= 1'000) {
-        last_media_sample_ms = now.monotonic_ms;
-        const std::uint64_t bytes = media_binder_view->accepted_bytes();
-        (void)session->RecordMediaProgress(bytes, now);
-        if (bytes > 0 && !media_status_sent) {
-          media_status_sent = true;
-          (void)sink.RefreshStatus();
-        }
-        // Auto-clean a connection that never established: a real negotiation
-        // started (negotiation_started_ms >= 0, set at the first accepted
-        // host command) but no real media has ever flowed and the grace
-        // window has elapsed since THAT point. Route through the same
-        // transport-terminal path a live peer disconnect uses so the
-        // existing unconditional disclosure/session teardown below still
-        // runs -- no separate cleanup path to keep in sync. A worker with no
-        // negotiation started yet (negotiation_started_ms < 0) is an idle
-        // standby with nobody addressing it -- never arm the clock for it.
-        if (!media_status_sent && negotiation_started_ms >= 0 &&
-            now.monotonic_ms - negotiation_started_ms >= kConnectionEstablishTimeoutMs) {
-          std::cerr << "macos_remote_desktop_worker_connection_never_established\n";
-          sink.SignalTerminal("connection_never_established");
-        }
-        if (sink.terminal())
+      for (WorkerRoute* route : routes.live()) {
+        if (now.monotonic_ms - route->last_media_sample_ms < 1'000)
           continue;
+        route->last_media_sample_ms = now.monotonic_ms;
+        const std::uint64_t bytes = route->media_binder->accepted_bytes();
+        (void)route->session->RecordMediaProgress(bytes, now);
+        if (bytes > 0 && !route->media_status_sent) {
+          route->media_status_sent = true;
+          (void)route->sink->RefreshStatus();
+        }
+        // Auto-clean a route that never established: its negotiation started
+        // (at its PREPARE) but no real media has ever flowed and the grace
+        // window has elapsed. Routed through the same transport-terminal path
+        // a live peer disconnect uses, so its teardown is the ordinary one.
+        if (!route->media_status_sent &&
+            now.monotonic_ms - route->negotiation_started_ms >=
+                kConnectionEstablishTimeoutMs) {
+          std::cerr << "macos_remote_desktop_worker_connection_never_established\n";
+          route->sink->SignalTerminal("connection_never_established");
+        }
       }
     }
 
@@ -2755,9 +3011,11 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
         break;
       }
       if (disclosure.terminated()) {
-        sink.SignalTerminal(disclosure.stop_requested()
-                                ? "stopped_by_local_user"
-                                : "capability_unavailable");
+        for (WorkerRoute* route : routes.live()) {
+          route->sink->SignalTerminal(disclosure.stop_requested()
+                                          ? "stopped_by_local_user"
+                                          : "capability_unavailable");
+        }
         std::cerr << (disclosure.stop_requested()
                           ? "macos_remote_desktop_worker_local_stop\n"
                           : "macos_remote_desktop_worker_disclosure_lost\n");
@@ -2767,12 +3025,11 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
     }
 
     if ((poll_set[1].revents & POLLIN) != 0) {
-      control.ServeOnce(session.get(), context.worker_generation);
+      control.ServeOnce(routes.sessions(), context.worker_generation);
     }
 
     if ((poll_set[0].revents & (POLLIN | POLLHUP | POLLERR)) == 0)
       continue;
-
     // Read through the channel so display replies are correlated by the same
     // reader that framed them; only the remaining frames come back here.
     if (!display_channel.ReadFrames(&frames)) {
@@ -2808,23 +3065,28 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
         }
         if (request.shield) {
           // Shield first, then release every held key and button, then say so.
-          session->SetPrivacyShield(true);
+          privacy_shielded = true;
           pending_privacy_release.reset();
-          for (const char* controller :
-               {"control", "control:position", "keyboard", "pointer",
-                "pointer:position"}) {
-            session->ReleaseController(controller);
+          for (WorkerRoute* route : routes.live()) {
+            route->session->SetPrivacyShield(true);
+            for (const char* controller :
+                 {"control", "control:position", "keyboard", "pointer",
+                  "pointer:position"}) {
+              route->session->ReleaseController(controller);
+            }
           }
           if (!send_privacy_reply(request.request_id, true,
-                                  session->real_frames_encoded())) {
+                                  routes.real_frames_encoded())) {
             status = EX_UNAVAILABLE;
             running = false;
             break;
           }
           std::cerr << "macos_remote_desktop_worker_privacy_shielded\n";
         } else {
-          const std::uint64_t baseline = session->real_frames_encoded();
-          session->SetPrivacyShield(false);
+          const std::uint64_t baseline = routes.real_frames_encoded();
+          privacy_shielded = false;
+          for (WorkerRoute* route : routes.live())
+            route->session->SetPrivacyShield(false);
           pending_privacy_release =
               PendingPrivacyRelease{request.request_id, baseline};
           std::cerr << "macos_remote_desktop_worker_privacy_released\n";
@@ -2841,7 +3103,19 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
           running = false;
           break;
         }
-        sink.OnUnlockReply(reply.configured, std::move(reply.sign_in_base64url));
+        // The stored sign-in goes to the one route that asked for it; the
+        // others learn only whether one is configured.
+        bool delivered = false;
+        for (WorkerRoute* route : routes.live()) {
+          if (!delivered && route->sink->unlock_pending()) {
+            delivered = true;
+            route->sink->OnUnlockReply(reply.configured,
+                                       std::move(reply.sign_in_base64url));
+          } else {
+            route->sink->OnUnlockReply(reply.configured, std::string());
+          }
+        }
+        WipeString(&reply.sign_in_base64url);
         continue;
       }
       macos::HostCommandFrame parsed;
@@ -2862,13 +3136,9 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
         running = false;
         break;
       }
-      // A real, accepted host command (PREPARE/OFFER/ICE/STOP) proves the
-      // daemon has actually begun addressing this worker -- arm the
-      // connection-establish watchdog from here, once, the first time it
-      // happens. See the watchdog's own comment above for why this must not
-      // be the worker's process-start time.
-      if (negotiation_started_ms < 0) negotiation_started_ms = SampleNow().monotonic_ms;
-      if (!HandleHostCommand(parsed, &command_session, &disclosure, &emitter)) {
+      // Each route arms its own connection-establish watchdog at its PREPARE
+      // (see the watchdog's comment above for why never at process start).
+      if (!HandleHostCommand(parsed, &routes, &disclosure, &host_emitter)) {
         status = EX_PROTOCOL;
         running = false;
         break;
@@ -2877,8 +3147,8 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
   }
 
   control.Close();
+  routes.StopAll();
   disclosure_process.Terminate();
-  session->Stop();
   ::close(descriptor);
   return status;
 }

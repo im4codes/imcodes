@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -759,7 +760,9 @@ class FakeSession final : public macos::HostCommandSessionSeam {
                std::int64_t now_monotonic_ms) override {
     ++prepares;
     last = authority;
-    return accept && now_unix_ms == 1000 && now_monotonic_ms == 2000;
+    const bool ok = accept && now_unix_ms == 1000 && now_monotonic_ms == 2000;
+    if (ok) routes.insert(authority.session_id);
+    return ok;
   }
   bool NegotiateOffer(const imcodes::rd::Authority& authority,
                       std::string_view offer_sdp,
@@ -794,13 +797,15 @@ class FakeSession final : public macos::HostCommandSessionSeam {
     return accept && reason == "user_selected" && now_unix_ms == 1000 &&
            now_monotonic_ms == 2000;
   }
-  bool ServesOtherRoute(
-      const imcodes::rd::Authority& authority) const override {
-    return !live_session_id.empty() && authority.session_id != live_session_id;
+  bool Serves(const imcodes::rd::Authority& authority) const override {
+    return routes.count(authority.session_id) != 0;
   }
+  std::size_t live_routes() const override { return routes.size(); }
+  std::size_t max_routes() const override { return cap; }
   bool Stop(const imcodes::rd::Authority& authority) override {
     ++stops;
     last = authority;
+    routes.erase(authority.session_id);
     return accept;
   }
 
@@ -811,8 +816,8 @@ class FakeSession final : public macos::HostCommandSessionSeam {
   int leases = 0;
   int modes = 0;
   int stops = 0;
-  // Non-empty: a route for this session is live.
-  std::string live_session_id;
+  std::set<std::string> routes;
+  std::size_t cap = 4;
   imcodes::rd::Authority last;
 };
 
@@ -895,33 +900,67 @@ void StopTearsDownBeforeTerminal() {
         "stop emits the protocol terminal rather than an invalid status");
 }
 
-void ASecondViewerNeverEndsTheLiveRoute() {
+imcodes::rd::Signal SignalFor(imcodes::rd::Signal::Kind kind,
+                              const char* session_id) {
+  imcodes::rd::Signal signal = Signal(kind);
+  signal.authority.session_id = session_id;
+  return signal;
+}
+
+void SeveralViewersShareTheWorker() {
   FakeSession session;
-  session.live_session_id = "session_live0001";
   FakeDisclosure disclosure(true);
   RecordingSink sink;
-  for (const auto kind :
-       {imcodes::rd::Signal::Kind::kPrepare, imcodes::rd::Signal::Kind::kOffer,
-        imcodes::rd::Signal::Kind::kIce, imcodes::rd::Signal::Kind::kLease,
-        imcodes::rd::Signal::Kind::kStop}) {
-    const auto result = Dispatch(Signal(kind), &session, &disclosure, &sink);
+  using Kind = imcodes::rd::Signal::Kind;
+  for (const char* id : {"session_viewer01", "session_viewer02"}) {
+    const auto result =
+        Dispatch(SignalFor(Kind::kPrepare, id), &session, &disclosure, &sink);
     Check(result.disposition == macos::HostCommandDisposition::kContinue,
-          "another viewer's command keeps the worker running");
+          "each viewer's prepare opens its own route");
   }
-  Check(session.prepares == 0 && session.offers == 0 && session.ice == 0 &&
-            session.leases == 0 && session.stops == 0,
-        "another viewer's commands never reach the live session");
+  Check(session.live_routes() == 2, "two viewers are served at once");
+
+  // One viewer leaving ends only its route.
+  auto stop =
+      Dispatch(SignalFor(Kind::kStop, "session_viewer01"), &session,
+               &disclosure, &sink);
+  Check(stop.disposition == macos::HostCommandDisposition::kContinue &&
+            session.live_routes() == 1,
+        "the other viewer keeps its route");
+  // A late command for the ended route is dropped, never fatal.
+  const auto late =
+      Dispatch(SignalFor(Kind::kIce, "session_viewer01"), &session,
+               &disclosure, &sink);
+  Check(late.disposition == macos::HostCommandDisposition::kContinue &&
+            session.ice == 0,
+        "a late command for an ended route reaches no session");
+  // A failed command ends only its own route.
+  session.accept = false;
+  const auto failed =
+      Dispatch(SignalFor(Kind::kLease, "session_viewer02"), &session,
+               &disclosure, &sink);
+  Check(failed.disposition == macos::HostCommandDisposition::kTerminate,
+        "the worker ends with its last route");
+}
+
+void TheRouteCapIsTheSessionLimit() {
+  FakeSession session;
+  session.cap = 1;
+  FakeDisclosure disclosure(true);
+  RecordingSink sink;
+  using Kind = imcodes::rd::Signal::Kind;
+  (void)Dispatch(SignalFor(Kind::kPrepare, "session_viewer01"), &session,
+                 &disclosure, &sink);
+  sink.emitted.clear();
+  const auto refused =
+      Dispatch(SignalFor(Kind::kPrepare, "session_viewer02"), &session,
+               &disclosure, &sink);
+  Check(refused.disposition == macos::HostCommandDisposition::kContinue &&
+            session.prepares == 1 && session.live_routes() == 1,
+        "a viewer beyond the cap never reaches the session");
   Check(sink.emitted.size() == 1 &&
             sink.emitted[0] == "terminal:session_limit:",
-        "the second viewer alone is told the machine is in use");
-
-  // The live route's own STOP still ends it.
-  session.live_session_id = Authority().session_id;
-  const auto stop = Dispatch(Signal(imcodes::rd::Signal::Kind::kStop),
-                             &session, &disclosure, &sink);
-  Check(session.stops == 1 &&
-            stop.disposition == macos::HostCommandDisposition::kTerminate,
-        "the live route's own stop still ends the worker");
+        "the viewer beyond the cap alone is told the machine is busy");
 }
 
 void RouteCommandsDriveTheSessionAndRemainLive() {
@@ -1036,7 +1075,8 @@ int main() {
 
   StopTearsDownBeforeTerminal();
   RouteCommandsDriveTheSessionAndRemainLive();
-  ASecondViewerNeverEndsTheLiveRoute();
+  SeveralViewersShareTheWorker();
+  TheRouteCapIsTheSessionLimit();
   RouteCommandsRefuseWithoutVisibleDisclosure();
   RejectedOperationsStopAndEmitTruthfulTerminal();
   MessageEmissionFailureTerminates();
