@@ -308,6 +308,10 @@ class FakeMediaSender final : public macos::MacosEncodedMediaSender {
   bool Start(common::WorkerGeneration generation, common::PixelSize pixels,
              common::H264Profile) override {
     ++start_count;
+    // Same contract as the production H264SenderBridge: a generation it has
+    // already started is refused, so every media start needs a fresh one.
+    if (generation == 0 || generation <= last_started_generation) return false;
+    last_started_generation = generation;
     active_generation = generation;
     active_pixels = pixels;
     return start_result;
@@ -320,6 +324,7 @@ class FakeMediaSender final : public macos::MacosEncodedMediaSender {
   void Stop() noexcept override { ++stop_count; }
 
   common::WorkerGeneration active_generation = 0;
+  common::WorkerGeneration last_started_generation = 0;
   common::PixelSize active_pixels;
   common::H264AccessUnit last_unit;
   int start_count = 0;

@@ -1080,9 +1080,15 @@ class MacosRemoteDesktopSession::Impl final
         exposed_topology_.FindDisplay(selected_display_id_);
     if (display == nullptr)
       return false;
+    // Every media start is a fresh sender generation. The sender refuses a
+    // generation it has already started -- so that a late completion from a
+    // stopped stream can never count against its successor -- and this used to
+    // pass the worker generation, which never changes within one worker: the
+    // first start worked and every restart failed. Switching monitors (or any
+    // topology change) therefore ended the session (node m3, two displays).
     const std::uint64_t epoch = ++media_epoch_;
     if (!dependencies_.media_sender.Start(
-            worker_generation_, display->encoded_pixels, video_.profile)) {
+            epoch, display->encoded_pixels, video_.profile)) {
       return false;
     }
     common::EncoderConfiguration encoder_configuration{
@@ -1196,8 +1202,7 @@ class MacosRemoteDesktopSession::Impl final
       return;
     }
     if (!access_unit.IsValid() ||
-        !dependencies_.media_sender.Submit(worker_generation_,
-                                           std::move(access_unit))) {
+        !dependencies_.media_sender.Submit(epoch, std::move(access_unit))) {
       TerminateLocked(Error(TerminalErrorCode::kEncoderUnavailable,
                             "encoded frame sender rejected access unit"),
                       MacosSessionEndReason::kAdapterFailure);
