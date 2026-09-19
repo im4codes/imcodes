@@ -218,7 +218,7 @@ describe('controlled node enrollment and runtime', () => {
       await vi.waitFor(() => expect(reports()).toEqual([
         { type: DAEMON_MSG.CONTROLLED_NODE_LOCAL_DAEMONS, serverIds: ['daemon-a'] },
       ]));
-      expect(discoverLocalDaemons).toHaveBeenCalledWith('https://im.example');
+      expect(discoverLocalDaemons).toHaveBeenCalled();
 
       // Every 5 s heartbeat is not a rescan.
       socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));

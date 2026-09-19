@@ -13,16 +13,20 @@ import {
  * A daemon keeps its binding in `~/.imcodes/server.json` of the user it runs
  * as. The controlled node runs with system rights, so it can look in every
  * user's home. Only the daemon's `serverId` leaves this function -- never its
- * token -- and only for daemons bound to the same server this node is, since
- * an id from another deployment means nothing there.
+ * token.
+ *
+ * Every bound daemon is reported, whichever address it was bound through: one
+ * deployment is often reachable under more than one domain, and comparing
+ * origins here dropped exactly those daemons (vm-124: its daemon bound through
+ * im-proxy.koca.win, its node through im.zhinet.work, so they were never
+ * linked). The server links only an id it knows as one of this node owner's
+ * own daemons, so an id bound to another deployment matches nothing there.
  */
 
 /** Profile folders under the Windows Users directory that are never a person. */
 const WINDOWS_NON_USER_PROFILES = new Set(['public', 'default', 'default user', 'all users']);
 
 export interface LocalDaemonDiscoveryOptions {
-  /** The server this node is bound to. */
-  serverUrl: string;
   platform?: NodeJS.Platform;
   /** Every home directory to look in; defaults to this platform's user homes. */
   homes?: readonly string[];
@@ -60,15 +64,7 @@ export async function localUserHomes(platform: NodeJS.Platform = process.platfor
   return [...homes];
 }
 
-function sameOrigin(a: string, b: string): boolean {
-  try {
-    return new URL(a).origin === new URL(b).origin;
-  } catch {
-    return false;
-  }
-}
-
-async function readBoundServerId(home: string, serverUrl: string): Promise<string | null> {
+async function readBoundServerId(home: string): Promise<string | null> {
   const path = join(home, '.imcodes', 'server.json');
   try {
     const info = await stat(path);
@@ -76,8 +72,7 @@ async function readBoundServerId(home: string, serverUrl: string): Promise<strin
     const parsed = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
     if (!parsed || typeof parsed !== 'object') return null;
     const { serverId, workerUrl } = parsed;
-    if (!isPlausibleServerId(serverId) || typeof workerUrl !== 'string') return null;
-    return sameOrigin(workerUrl, serverUrl) ? serverId : null;
+    return isPlausibleServerId(serverId) && typeof workerUrl === 'string' ? serverId : null;
   } catch {
     return null;
   }
@@ -85,12 +80,12 @@ async function readBoundServerId(home: string, serverUrl: string): Promise<strin
 
 /** Sorted, de-duplicated serverIds of the daemons bound on this computer. */
 export async function discoverLocalDaemonServerIds(
-  options: LocalDaemonDiscoveryOptions,
+  options: LocalDaemonDiscoveryOptions = {},
 ): Promise<string[]> {
   const homes = options.homes ?? await localUserHomes(options.platform);
   const found = new Set<string>();
   for (const home of homes) {
-    const serverId = await readBoundServerId(home, options.serverUrl);
+    const serverId = await readBoundServerId(home);
     if (serverId) found.add(serverId);
     if (found.size >= CONTROLLED_NODE_LOCAL_DAEMONS_MAX) break;
   }

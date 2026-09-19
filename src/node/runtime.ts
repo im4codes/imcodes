@@ -298,7 +298,7 @@ export interface ControlledNodeRuntimeOptions {
    * Test seam: the daemons bound on this computer (serverIds only). Defaults to
    * reading each user's `.imcodes/server.json`; see local-daemon-discovery.ts.
    */
-  discoverLocalDaemons?: (serverUrl: string) => Promise<string[]>;
+  discoverLocalDaemons?: () => Promise<string[]>;
   remoteDesktopWorker?: ControlledNodeRemoteDesktopWorker;
   /**
    * Native macOS production dependencies. Omission is deliberately unavailable:
@@ -1052,9 +1052,8 @@ export function createControlledNodeRuntime(
       || now - localDaemonsScannedAt < CONTROLLED_NODE_LOCAL_DAEMONS_RESCAN_MS) return;
     localDaemonsScannedAt = now;
     localDaemonsScanInFlight = true;
-    const discover = options.discoverLocalDaemons
-      ?? ((serverUrl: string) => discoverLocalDaemonServerIds({ serverUrl }));
-    void discover(credential.serverUrl)
+    const discover = options.discoverLocalDaemons ?? (() => discoverLocalDaemonServerIds());
+    void discover()
       .then((serverIds) => {
         const key = JSON.stringify(serverIds);
         if (serverIds.length === 0 || key === localDaemonsReported) return;
