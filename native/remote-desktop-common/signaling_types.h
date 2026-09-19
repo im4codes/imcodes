@@ -30,6 +30,9 @@ struct Authority {
   std::string mode;
   int input_epoch = 0;
   int reconnect_attempt = 0;
+  // Operator ceiling for relayed video (PREPARE only); 0 = none. Enforced by
+  // the worker only while the route is relayed.
+  std::uint32_t relay_bitrate_cap_bps = 0;
   std::vector<IceServer> ice_servers;
 };
 
@@ -48,6 +51,9 @@ inline Authority BindOmittedAuthorityFields(const Authority& current,
     update.daemon_generation = current.daemon_generation;
   if (!update.route_generation)
     update.route_generation = current.route_generation;
+  // Only PREPARE carries the relay ceiling; later envelopes must not clear it.
+  if (update.relay_bitrate_cap_bps == 0)
+    update.relay_bitrate_cap_bps = current.relay_bitrate_cap_bps;
   return update;
 }
 

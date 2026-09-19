@@ -127,6 +127,13 @@ bool ParseAuthorityFields(const Json::Value& root,
     }
     authority->reconnect_attempt = root["reconnectAttempt"].asInt();
   }
+  if (root.isMember("relayBitrateCapBps")) {
+    // Same bounds as shared/remote-desktop.ts isRelayBitrateCap.
+    if (!root["relayBitrateCapBps"].isInt64()) return false;
+    const int64_t cap = root["relayBitrateCapBps"].asInt64();
+    if (cap < 350'000 || cap > 15'000'000) return false;
+    authority->relay_bitrate_cap_bps = static_cast<uint32_t>(cap);
+  }
   if (root.isMember("expiresAt")) {
     if (!root["expiresAt"].isInt64()) return false;
     authority->expires_at_ms = root["expiresAt"].asInt64();
@@ -193,7 +200,7 @@ std::optional<Signal> ParseServiceSignal(const Json::Value& root,
     if (!ExactKeys(root, {"type", "requestId", "sessionId", "capability",
                           "expiresAt", "leaseExpiresAt", "daemonGeneration",
                           "mode", "inputEpoch", "iceServers"},
-                   {"routeGeneration", "reconnectAttempt"}) ||
+                   {"routeGeneration", "reconnectAttempt", "relayBitrateCapBps"}) ||
         !ParseAuthorityFields(root, now_ms, true, &signal.authority)) {
       return std::nullopt;
     }

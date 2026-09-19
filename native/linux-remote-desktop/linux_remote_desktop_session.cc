@@ -156,7 +156,7 @@ LinuxRemoteDesktopSession::LinuxQualityLadder::Select(
   // and shared; only the encoder that ends up applying it differs.
   const imcodes::rd::QualitySelection selection = imcodes::rd::SelectQuality(
       target.bitrate_bps, target.source_pixels.width,
-      target.source_pixels.height);
+      target.source_pixels.height, target.preference);
   return common::QualitySelection{
       selection.id,
       common::PixelSize{static_cast<std::uint32_t>(selection.width),
@@ -844,6 +844,17 @@ void LinuxRemoteDesktopSession::HandleDataChannelMessage(
     (void)SendClipboard(*message.control.request_id,
                         copied ? std::optional<std::string>(std::move(text))
                                : std::nullopt);
+    accepted = true;
+  } else if (message.kind == imcodes::rd::DataChannelMessageKind::kControl &&
+             channel == DataChannelKind::kControl &&
+             message.control.kind == "set_quality_preference") {
+    // Per viewer; needs no control authority -- it only shapes this viewer's
+    // own encoder.
+    const std::optional<imcodes::rd::QualityPreference> preference =
+        imcodes::rd::QualityPreferenceFromControl(message.control);
+    if (!preference || !transport_core_.SetQualityPreference(*preference)) {
+      return;
+    }
     accepted = true;
   } else if (message.kind == imcodes::rd::DataChannelMessageKind::kControl &&
              channel == DataChannelKind::kControl &&

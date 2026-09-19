@@ -32,11 +32,33 @@ class MacosSessionQualityLadder final : public common::QualityLadder {
  public:
   common::QualitySelection Select(
       const common::QualityTarget& target) const noexcept override {
+    const imcodes::rd::QualityPreference& preference = target.preference;
+    const bool viewer_shaped =
+        preference.max_height > 0 || preference.max_fps != 30 ||
+        preference.max_bitrate_bps > 0 ||
+        preference.priority != imcodes::rd::QualityPriority::kBalanced;
+    if (!viewer_shaped) {
+      // No preference (an older browser) and no relay ceiling: keep the
+      // historical native-resolution passthrough exactly.
+      return common::QualitySelection{
+          "macos-videotoolbox",
+          target.source_pixels,
+          30,
+          target.bitrate_bps,
+      };
+    }
+    // A viewer preference (e.g. "Smooth" capping a 5K Retina display at
+    // 1080p) or a relay ceiling: use the shared ladder like the other
+    // platforms, so capture/encode/transfer all shrink with it.
+    const imcodes::rd::QualitySelection selection = imcodes::rd::SelectQuality(
+        target.bitrate_bps, static_cast<int>(target.source_pixels.width),
+        static_cast<int>(target.source_pixels.height), preference);
     return common::QualitySelection{
-        "macos-videotoolbox",
-        target.source_pixels,
-        30,
-        target.bitrate_bps,
+        selection.id,
+        common::PixelSize{static_cast<std::uint32_t>(selection.width),
+                          static_cast<std::uint32_t>(selection.height)},
+        static_cast<std::uint32_t>(selection.fps),
+        selection.bitrate_bps,
     };
   }
 };
@@ -577,6 +599,15 @@ class MacosRemoteDesktopSession::Impl final
       return false;
     }
     last_transport_time_ = now;
+    return true;
+  }
+
+  bool SetQualityPreference(const imcodes::rd::QualityPreference& preference) {
+    std::lock_guard lock(mutex_);
+    if (!ActiveLocked() || !transport_core_.SetQualityPreference(preference)) {
+      FinalizeIfTransportTerminatedLocked();
+      return false;
+    }
     return true;
   }
 
@@ -1710,6 +1741,11 @@ bool MacosRemoteDesktopSession::ApplyModeAuthority(
     const common::RouteAuthority& authority,
     common::TransportTime now) {
   return impl_->ApplyModeAuthority(authority, now);
+}
+
+bool MacosRemoteDesktopSession::SetQualityPreference(
+    const imcodes::rd::QualityPreference& preference) {
+  return impl_->SetQualityPreference(preference);
 }
 
 bool MacosRemoteDesktopSession::RecordRouteActivity(

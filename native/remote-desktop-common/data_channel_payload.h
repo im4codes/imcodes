@@ -26,6 +26,7 @@
 #include <string_view>
 
 #include "data_channel_constants.h"
+#include "quality_ladder.h"
 
 namespace imcodes::rd {
 
@@ -119,6 +120,11 @@ struct ControlPayload {
   std::optional<std::uint64_t> frame_width;
   std::optional<std::uint64_t> frame_height;
   std::optional<std::uint64_t> acknowledged_sequence;
+  // set_quality_preference only (validated shape; see quality_ladder.h).
+  std::optional<std::uint64_t> max_height;
+  std::optional<std::uint64_t> max_fps;
+  std::optional<std::uint64_t> max_bitrate_bps;
+  std::optional<std::string> priority;
 };
 
 struct DataChannelMessage {
@@ -140,6 +146,12 @@ struct DataChannelMessage {
  */
 [[nodiscard]] bool ParseDataChannelMessage(std::string_view payload,
                                            DataChannelMessage* out);
+
+// The viewer quality preference carried by a parsed `set_quality_preference`
+// control (whose shape ParseDataChannelMessage already validated). nullopt for
+// any other kind.
+std::optional<QualityPreference> QualityPreferenceFromControl(
+    const ControlPayload& control);
 
 }  // namespace imcodes::rd
 

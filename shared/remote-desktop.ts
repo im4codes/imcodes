@@ -205,6 +205,9 @@ export const REMOTE_DESKTOP_CONTROL_KIND = {
   UNLOCK: 'unlock',
   KEEPALIVE: 'keepalive',
   INPUT_ACK: 'input_ack',
+  // Viewer quality preference (resolution/fps/bitrate caps and priority).
+  // Only sent to workers whose status advertises `qualityPreference`.
+  SET_QUALITY_PREFERENCE: 'set_quality_preference',
 } as const;
 
 /**
@@ -299,14 +302,75 @@ export const REMOTE_DESKTOP_DISPLAY_ROTATION = {
 
 export const REMOTE_DESKTOP_QUALITY_PRESET = {
   P2160_30: '2160p30',
+  P1440_60: '1440p60',
   P2160_15: '2160p15',
   P1440_30: '1440p30',
+  P1080_60: '1080p60',
   P1080_30: '1080p30',
+  P720_60: '720p60',
   P900_30: '900p30',
   P720_30: '720p30',
   P720_15: '720p15',
+  P540_30: '540p30',
   P540_15: '540p15',
+  P360_30: '360p30',
+  P720_10: '720p10',
+  P540_10: '540p10',
   P360_5: '360p5',
+} as const;
+
+/**
+ * How a viewer trades resolution against frame rate. Mirrors
+ * the native common quality ladder (QualityPriority).
+ */
+export const REMOTE_DESKTOP_QUALITY_PRIORITY = {
+  FRAMERATE: 'framerate',
+  BALANCED: 'balanced',
+  RESOLUTION: 'resolution',
+} as const;
+export type RemoteDesktopQualityPriority =
+  typeof REMOTE_DESKTOP_QUALITY_PRIORITY[keyof typeof REMOTE_DESKTOP_QUALITY_PRIORITY];
+
+/** Resolution ceilings a viewer may pick; 0 = native. */
+export const REMOTE_DESKTOP_QUALITY_MAX_HEIGHTS = [0, 720, 1080, 1440] as const;
+export const REMOTE_DESKTOP_QUALITY_MAX_FPS = [15, 30, 60] as const;
+
+/** Per-viewer quality preference sent with `set_quality_preference`. */
+export interface RemoteDesktopQualityPreference {
+  maxHeight: typeof REMOTE_DESKTOP_QUALITY_MAX_HEIGHTS[number];
+  maxFps: typeof REMOTE_DESKTOP_QUALITY_MAX_FPS[number];
+  /** 0 = no cap beyond the per-viewer ceiling. */
+  maxBitrateBps: number;
+  priority: RemoteDesktopQualityPriority;
+}
+
+/** The quick modes offered in the viewer toolbar. */
+export const REMOTE_DESKTOP_QUALITY_MODE = {
+  SMOOTH: 'smooth',
+  BALANCED: 'balanced',
+  SHARP: 'sharp',
+  SAVER: 'saver',
+  CUSTOM: 'custom',
+} as const;
+export type RemoteDesktopQualityMode =
+  typeof REMOTE_DESKTOP_QUALITY_MODE[keyof typeof REMOTE_DESKTOP_QUALITY_MODE];
+export const DEFAULT_REMOTE_DESKTOP_QUALITY_MODE: RemoteDesktopQualityMode =
+  REMOTE_DESKTOP_QUALITY_MODE.SMOOTH;
+
+/** What each quick mode means on the wire. Custom supplies its own values. */
+export const REMOTE_DESKTOP_QUALITY_MODE_PREFERENCES: Readonly<Record<
+  Exclude<RemoteDesktopQualityMode, 'custom'>, RemoteDesktopQualityPreference
+>> = Object.freeze({
+  smooth: { maxHeight: 1080, maxFps: 30, maxBitrateBps: 0, priority: 'framerate' },
+  balanced: { maxHeight: 1440, maxFps: 30, maxBitrateBps: 0, priority: 'balanced' },
+  sharp: { maxHeight: 0, maxFps: 30, maxBitrateBps: 0, priority: 'resolution' },
+  saver: { maxHeight: 720, maxFps: 15, maxBitrateBps: 1_800_000, priority: 'balanced' },
+});
+
+/** Bounds for a viewer-chosen bitrate cap (matches the native ladder). */
+export const REMOTE_DESKTOP_QUALITY_BITRATE_CAP = {
+  MIN_BPS: 350_000,
+  MAX_BPS: 15_000_000,
 } as const;
 
 export const REMOTE_DESKTOP_ENCODER_CLASS = {
@@ -429,13 +493,20 @@ export const REMOTE_DESKTOP_LIMITS = {
 
 export const REMOTE_DESKTOP_QUALITY_LADDER = [
   { id: REMOTE_DESKTOP_QUALITY_PRESET.P2160_30, width: 3840, height: 2160, fps: 30, targetBitrateBps: 15_000_000 },
+  { id: REMOTE_DESKTOP_QUALITY_PRESET.P1440_60, width: 2560, height: 1440, fps: 60, targetBitrateBps: 14_000_000 },
   { id: REMOTE_DESKTOP_QUALITY_PRESET.P2160_15, width: 3840, height: 2160, fps: 15, targetBitrateBps: 12_000_000 },
   { id: REMOTE_DESKTOP_QUALITY_PRESET.P1440_30, width: 2560, height: 1440, fps: 30, targetBitrateBps: 10_000_000 },
+  { id: REMOTE_DESKTOP_QUALITY_PRESET.P1080_60, width: 1920, height: 1080, fps: 60, targetBitrateBps: 9_000_000 },
   { id: REMOTE_DESKTOP_QUALITY_PRESET.P1080_30, width: 1920, height: 1080, fps: 30, targetBitrateBps: 6_000_000 },
+  { id: REMOTE_DESKTOP_QUALITY_PRESET.P720_60, width: 1280, height: 720, fps: 60, targetBitrateBps: 4_800_000 },
   { id: REMOTE_DESKTOP_QUALITY_PRESET.P900_30, width: 1600, height: 900, fps: 30, targetBitrateBps: 4_500_000 },
   { id: REMOTE_DESKTOP_QUALITY_PRESET.P720_30, width: 1280, height: 720, fps: 30, targetBitrateBps: 3_000_000 },
   { id: REMOTE_DESKTOP_QUALITY_PRESET.P720_15, width: 1280, height: 720, fps: 15, targetBitrateBps: 1_800_000 },
+  { id: REMOTE_DESKTOP_QUALITY_PRESET.P540_30, width: 960, height: 540, fps: 30, targetBitrateBps: 1_600_000 },
   { id: REMOTE_DESKTOP_QUALITY_PRESET.P540_15, width: 960, height: 540, fps: 15, targetBitrateBps: 1_000_000 },
+  { id: REMOTE_DESKTOP_QUALITY_PRESET.P360_30, width: 640, height: 360, fps: 30, targetBitrateBps: 700_000 },
+  { id: REMOTE_DESKTOP_QUALITY_PRESET.P720_10, width: 1280, height: 720, fps: 10, targetBitrateBps: 450_000 },
+  { id: REMOTE_DESKTOP_QUALITY_PRESET.P540_10, width: 960, height: 540, fps: 10, targetBitrateBps: 380_000 },
   { id: REMOTE_DESKTOP_QUALITY_PRESET.P360_5, width: 640, height: 360, fps: 5, targetBitrateBps: 350_000 },
 ] as const;
 
@@ -480,6 +551,11 @@ export interface RemoteDesktopAuthorized extends RemoteDesktopAuthority {
   type: typeof REMOTE_DESKTOP_MSG.AUTHORIZED;
   /** Server clock at send; lets the browser translate expiresAt onto its clock. */
   serverTime?: number;
+  /**
+   * Operator ceiling for relayed (TURN) video, when enabled. Informational for
+   * the browser (badge, greyed-out options); the worker enforces it.
+   */
+  relayBitrateCapBps?: number;
 }
 
 /** Server acknowledgement for an exact same-route signaling rebind. */
@@ -506,6 +582,13 @@ export interface RemoteDesktopPrepare extends RemoteDesktopAuthority {
    */
   routeGeneration?: number;
   reconnectAttempt?: number;
+  /**
+   * Operator ceiling for relayed (TURN) video, enforced by the worker only
+   * while the route is relayed. Sent only to nodes advertising
+   * REMOTE_DESKTOP_RELAY_CAP_CAPABILITY: older nodes and workers reject
+   * unknown prepare keys.
+   */
+  relayBitrateCapBps?: number;
 }
 
 export interface RemoteDesktopOffer {
@@ -619,6 +702,8 @@ export interface RemoteDesktopStatus {
   firstFramePresented?: boolean;
   /** This worker can atomically inject the second click of a desktop double-click. */
   atomicButtonClick?: boolean;
+  /** This worker honours `set_quality_preference`; never send it otherwise. */
+  qualityPreference?: boolean;
   viewerCount?: number;
   controllerCount?: number;
   /**
@@ -786,6 +871,11 @@ export interface RemoteDesktopControl extends RemoteDesktopInputBase {
   frameWidth?: number;
   frameHeight?: number;
   acknowledgedSequence?: number;
+  /** set_quality_preference only. */
+  maxHeight?: number;
+  maxFps?: number;
+  maxBitrateBps?: number;
+  priority?: RemoteDesktopQualityPriority;
 }
 
 export interface RemoteDesktopReleaseAll extends RemoteDesktopInputBase {
@@ -879,6 +969,13 @@ function isCapability(value: unknown): value is string {
 }
 
 const isSafeNonNegative = isSafeNonNegativeRemoteDesktopInteger;
+
+/** Operator relay cap: 0 is meaningless (absent means "no cap"). */
+function isRelayBitrateCap(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value)
+    && value >= REMOTE_DESKTOP_QUALITY_BITRATE_CAP.MIN_BPS
+    && value <= REMOTE_DESKTOP_QUALITY_BITRATE_CAP.MAX_BPS;
+}
 
 function isSafePositive(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
@@ -974,8 +1071,9 @@ export function validateRemoteDesktopBrowserMessage(value: unknown): RemoteDeskt
 export function validateRemoteDesktopDaemonCommand(value: unknown): RemoteDesktopValidationResult<RemoteDesktopDaemonCommand> {
   if (!isRecord(value) || typeof value.type !== 'string') return invalid();
   if (value.type === REMOTE_DESKTOP_MSG.PREPARE) {
-    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'expiresAt', 'leaseExpiresAt', 'daemonGeneration', 'mode', 'inputEpoch', 'iceServers'], ['routeGeneration', 'reconnectAttempt'])
+    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'expiresAt', 'leaseExpiresAt', 'daemonGeneration', 'mode', 'inputEpoch', 'iceServers'], ['routeGeneration', 'reconnectAttempt', 'relayBitrateCapBps'])
       || !validateAuthority(value)
+      || (value.relayBitrateCapBps !== undefined && !isRelayBitrateCap(value.relayBitrateCapBps))
       || (value.routeGeneration !== undefined && !isSafeNonNegative(value.routeGeneration))
       || (value.reconnectAttempt !== undefined
         && (!isSafeNonNegative(value.reconnectAttempt)
@@ -1035,11 +1133,12 @@ export function validateRemoteDesktopDaemonMessage(value: unknown): RemoteDeskto
       : invalid();
   }
   if (value.type === REMOTE_DESKTOP_MSG.STATUS) {
-    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'mode', 'inputEpoch', 'state', 'inputEnabled'], ['route', 'selectedDisplayId', 'layoutRevision', 'viewerCount', 'controllerCount', 'signInScreen', 'unlockAvailable', 'autoUnlockSucceeded', 'inputBlocked', 'atomicButtonClick', 'peerConnected', 'dataChannelsReady', 'mediaStarted', 'firstFramePresented'])
+    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'mode', 'inputEpoch', 'state', 'inputEnabled'], ['route', 'selectedDisplayId', 'layoutRevision', 'viewerCount', 'controllerCount', 'signInScreen', 'unlockAvailable', 'autoUnlockSucceeded', 'inputBlocked', 'atomicButtonClick', 'qualityPreference', 'peerConnected', 'dataChannelsReady', 'mediaStarted', 'firstFramePresented'])
       || (value.signInScreen !== undefined && typeof value.signInScreen !== 'boolean')
       || (value.autoUnlockSucceeded !== undefined && value.autoUnlockSucceeded !== true)
       || (value.unlockAvailable !== undefined && typeof value.unlockAvailable !== 'boolean')
       || (value.atomicButtonClick !== undefined && typeof value.atomicButtonClick !== 'boolean')
+      || (value.qualityPreference !== undefined && typeof value.qualityPreference !== 'boolean')
       || (value.peerConnected !== undefined && typeof value.peerConnected !== 'boolean')
       || (value.dataChannelsReady !== undefined && typeof value.dataChannelsReady !== 'boolean')
       || (value.mediaStarted !== undefined && typeof value.mediaStarted !== 'boolean')
@@ -1087,10 +1186,11 @@ export function validateRemoteDesktopDaemonMessage(value: unknown): RemoteDeskto
 export function validateRemoteDesktopAuthorized(value: unknown): RemoteDesktopValidationResult<RemoteDesktopAuthorized> {
   if (!isRecord(value)
     || value.type !== REMOTE_DESKTOP_MSG.AUTHORIZED
-    || !hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'expiresAt', 'leaseExpiresAt', 'daemonGeneration', 'mode', 'inputEpoch', 'iceServers'], ['serverTime'])
+    || !hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'expiresAt', 'leaseExpiresAt', 'daemonGeneration', 'mode', 'inputEpoch', 'iceServers'], ['serverTime', 'relayBitrateCapBps'])
     // The Server's clock at send, so the browser can place expiresAt on its own
     // clock (shared/clock-sync.ts). Optional: older Servers omit it.
     || (value.serverTime !== undefined && (!Number.isSafeInteger(value.serverTime) || (value.serverTime as number) <= 0))
+    || (value.relayBitrateCapBps !== undefined && !isRelayBitrateCap(value.relayBitrateCapBps))
     || !validateAuthority(value)) return invalid();
   return { ok: true, value: value as unknown as RemoteDesktopAuthorized };
 }
@@ -1233,6 +1333,19 @@ function validateQuality(value: Record<string, unknown>): boolean {
     && isFiniteRange(value.rttMs, 0, 3_600_000);
 }
 
+/** Wire-shape check for a viewer quality preference (also used by the web). */
+export function isRemoteDesktopQualityPreference(value: unknown): value is RemoteDesktopQualityPreference {
+  if (!isRecord(value)) return false;
+  return (REMOTE_DESKTOP_QUALITY_MAX_HEIGHTS as readonly unknown[]).includes(value.maxHeight)
+    && (REMOTE_DESKTOP_QUALITY_MAX_FPS as readonly unknown[]).includes(value.maxFps)
+    && typeof value.maxBitrateBps === 'number' && Number.isSafeInteger(value.maxBitrateBps)
+    && (value.maxBitrateBps === 0 || (
+      value.maxBitrateBps >= REMOTE_DESKTOP_QUALITY_BITRATE_CAP.MIN_BPS
+      && value.maxBitrateBps <= REMOTE_DESKTOP_QUALITY_BITRATE_CAP.MAX_BPS))
+    && typeof value.priority === 'string'
+    && (Object.values(REMOTE_DESKTOP_QUALITY_PRIORITY) as string[]).includes(value.priority);
+}
+
 function validateClipboard(value: Record<string, unknown>): boolean {
   if (!hasExactKeys(
     value,
@@ -1289,9 +1402,19 @@ function validateKeyboard(value: Record<string, unknown>): boolean {
 }
 
 function validateControl(value: Record<string, unknown>): boolean {
-  if (!hasExactKeys(value, ['type', 'protocolVersion', 'sessionId', 'sequence', 'layoutRevision', 'inputEpoch', 'kind'], ['displayId', 'width', 'height', 'dpiScalePercent', 'requestId', 'frameWidth', 'frameHeight', 'acknowledgedSequence'])
+  if (!hasExactKeys(value, ['type', 'protocolVersion', 'sessionId', 'sequence', 'layoutRevision', 'inputEpoch', 'kind'], ['displayId', 'width', 'height', 'dpiScalePercent', 'requestId', 'frameWidth', 'frameHeight', 'acknowledgedSequence', 'maxHeight', 'maxFps', 'maxBitrateBps', 'priority'])
     || !hasInputCorrelation(value)
     || typeof value.kind !== 'string' || !CONTROL_KINDS.has(value.kind)) return false;
+  const qualityFieldsAbsent = value.maxHeight === undefined && value.maxFps === undefined
+    && value.maxBitrateBps === undefined && value.priority === undefined;
+  if (value.kind === REMOTE_DESKTOP_CONTROL_KIND.SET_QUALITY_PREFERENCE) {
+    return isRemoteDesktopQualityPreference(value)
+      && value.displayId === undefined && value.width === undefined
+      && value.height === undefined && value.dpiScalePercent === undefined
+      && value.requestId === undefined && value.frameWidth === undefined
+      && value.frameHeight === undefined && value.acknowledgedSequence === undefined;
+  }
+  if (!qualityFieldsAbsent) return false;
   if (value.kind === REMOTE_DESKTOP_CONTROL_KIND.SELECT_DISPLAY) {
     return isBoundedString(value.displayId, REMOTE_DESKTOP_LIMITS.DISPLAY_ID_BYTES)
       && value.width === undefined && value.height === undefined

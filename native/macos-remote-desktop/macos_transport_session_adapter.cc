@@ -1,5 +1,6 @@
 #include "macos_transport_session_adapter.h"
 
+#include <algorithm>
 #include <utility>
 
 #include "../remote-desktop-common/quality_ladder.h"
@@ -65,6 +66,7 @@ bool MacosTransportSessionAdapter::StartTransport(
   if (!authority.identity.IsValid())
     return false;
 
+  relay_bitrate_cap_bps_ = authority.relay_bitrate_cap_bps;
   MacosTransportBackendConfiguration configuration;
   configuration.ice_servers = ice_servers_;
   configuration.identity = authority.identity;
@@ -170,8 +172,17 @@ bool MacosTransportSessionAdapter::ApplyQuality(
   // stream starves to a black picture within seconds.
   if (bitrate_policy_applied_)
     return true;
-  if (!backend_->ApplyBitrate(imcodes::rd::kMinVideoBitrateBps,
-                              imcodes::rd::kInitialTransportBitrateBps,
+  // A relay ceiling (the operator's rate-limited TURN tier) bounds only the
+  // opening push: starting above it overshoots a limited relay into seconds
+  // of loss. The encoder target itself is capped by the transport core while
+  // relayed, and the relay enforces the hard limit.
+  const std::uint32_t start_bps =
+      relay_bitrate_cap_bps_ > 0
+          ? std::max(imcodes::rd::kMinVideoBitrateBps,
+                     std::min(imcodes::rd::kInitialTransportBitrateBps,
+                              relay_bitrate_cap_bps_))
+          : imcodes::rd::kInitialTransportBitrateBps;
+  if (!backend_->ApplyBitrate(imcodes::rd::kMinVideoBitrateBps, start_bps,
                               imcodes::rd::kPerPeerVideoBitrateBps)) {
     return false;
   }

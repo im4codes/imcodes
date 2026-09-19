@@ -5,6 +5,7 @@ import {
   REMOTE_DESKTOP_STOP_ORIGIN,
   REMOTE_DESKTOP_TERMINAL_REASON,
   type RemoteDesktopAccessMode,
+  type RemoteDesktopQualityPreference,
   type RemoteDesktopStopOrigin,
 } from '@shared/remote-desktop.js';
 import {
@@ -31,6 +32,11 @@ interface RemoteDesktopConnectionClient {
   setDisplayMode(displayId: string, width: number, height: number): boolean;
   setDisplayScale(displayId: string, dpiScalePercent: number): boolean;
   requestUnlock(): boolean;
+  /** Viewer quality preference; each viewer shapes only their own stream. */
+  setQualityPreference?(
+    preference: RemoteDesktopQualityPreference,
+    options?: { latencyGuard?: boolean },
+  ): boolean;
   requestRemoteClipboard(): Promise<string | null>;
   acknowledgePresentedFrame(frameWidth: number, frameHeight: number): boolean;
   pointerMove(x: number, y: number): void;
@@ -287,6 +293,10 @@ export class RemoteDesktopConnectionManager {
         canControl() && entry.client.setDisplayScale(displayId, dpiScalePercent)
       ),
       requestUnlock: () => canControl() && entry.client.requestUnlock(),
+      // Not gated on control: a viewer chooses their own stream quality.
+      setQualityPreference: (preference, options) => (
+        entry.client.setQualityPreference?.(preference, options) ?? false
+      ),
       requestRemoteClipboard: () => canControl()
         ? entry.client.requestRemoteClipboard()
         : Promise.resolve(null),

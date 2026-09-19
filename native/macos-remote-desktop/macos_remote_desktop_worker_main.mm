@@ -150,6 +150,7 @@ rd::common::RouteAuthority CommonAuthority(
                   ? rd::common::TransportSessionMode::kControl
                   : rd::common::TransportSessionMode::kView,
       .input_epoch = static_cast<std::uint64_t>(authority.input_epoch),
+      .relay_bitrate_cap_bps = authority.relay_bitrate_cap_bps,
   };
 }
 
@@ -1482,6 +1483,8 @@ bool WorkerTransportSink::EmitStatus() {
   root["firstFramePresented"] = frame_ready;
   root["inputEnabled"] = input_enabled;
   root["atomicButtonClick"] = true;
+  // Honours set_quality_preference; the browser sends it only when true.
+  root["qualityPreference"] = true;
   root["viewerCount"] = 1;
   root["controllerCount"] =
       session_->state() == rd::common::SessionState::kControlling ? 1 : 0;
@@ -1758,6 +1761,13 @@ void WorkerTransportSink::HandleDataChannelMessage(
     const std::string& kind = message.control.kind;
     if (kind == "hello" || kind == "keepalive") {
       accepted = true;
+    } else if (kind == "set_quality_preference") {
+      // Per viewer; needs no control authority -- it only shapes this
+      // viewer's own encoder.
+      const std::optional<imcodes::rd::QualityPreference> preference =
+          imcodes::rd::QualityPreferenceFromControl(message.control);
+      accepted = preference.has_value() &&
+                 session_->SetQualityPreference(*preference);
     } else if (kind == "frame_presented") {
       const auto topology = session_->topology();
       const rd::common::DisplayTopology* display =

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import {
   REMOTE_DESKTOP_ACCESS_MODE,
@@ -6,11 +7,18 @@ import {
   REMOTE_DESKTOP_COMMON_DISPLAY_MODES,
   REMOTE_DESKTOP_DPI_SCALE_PERCENTS,
   REMOTE_DESKTOP_ERROR,
+  REMOTE_DESKTOP_QUALITY_MAX_FPS,
+  REMOTE_DESKTOP_QUALITY_MAX_HEIGHTS,
+  REMOTE_DESKTOP_QUALITY_MODE,
+  REMOTE_DESKTOP_QUALITY_PRIORITY,
+  REMOTE_DESKTOP_ROUTE,
   REMOTE_DESKTOP_STATE,
   REMOTE_DESKTOP_STOP_ORIGIN,
   REMOTE_DESKTOP_TERMINAL_REASON,
   mapRemoteDesktopVideoPoint,
   type RemoteDesktopNormalizedPoint,
+  type RemoteDesktopQualityMode,
+  type RemoteDesktopQualityPreference,
 } from '@shared/remote-desktop.js';
 import {
   FILE_TRANSFER_DIRECTORY_CAPABILITY,
@@ -108,6 +116,22 @@ import {
   loadRemoteDesktopZoomPreference,
   saveRemoteDesktopZoomPreference,
 } from '../remote-desktop-zoom-preference.js';
+import {
+  REMOTE_DESKTOP_QUALITY_BITRATE_OPTIONS,
+  loadRemoteDesktopQualityChoice,
+  resolveRemoteDesktopQualityPreference,
+  saveRemoteDesktopQualityChoice,
+  type RemoteDesktopQualityChoice,
+} from '../remote-desktop-quality-preference.js';
+
+/** Toolbar order of the quick quality modes (custom is the ⚙ segment). */
+const QUALITY_QUICK_MODES: readonly RemoteDesktopQualityMode[] = [
+  REMOTE_DESKTOP_QUALITY_MODE.SMOOTH,
+  REMOTE_DESKTOP_QUALITY_MODE.BALANCED,
+  REMOTE_DESKTOP_QUALITY_MODE.SHARP,
+  REMOTE_DESKTOP_QUALITY_MODE.SAVER,
+];
+const QUALITY_PRIORITIES = Object.values(REMOTE_DESKTOP_QUALITY_PRIORITY);
 
 /** A phone-keyboard editing key and its own input event arrive together. */
 const MOBILE_EDITING_KEY_DEDUPE_MS = 150;
@@ -767,6 +791,66 @@ export function RemoteDesktopPanel({
 
   useEffect(() => () => machineDirectoryAdapter.destroy(), [machineDirectoryAdapter]);
 
+  // This viewer's stream quality for this machine. Per viewer: every viewer
+  // has their own encoder on the node, so one person's choice never changes
+  // what anyone else watching the same desktop receives.
+  const [qualityChoice, setQualityChoice] = useState<RemoteDesktopQualityChoice>(
+    () => loadRemoteDesktopQualityChoice(machine.serverId),
+  );
+  const [qualityCustomOpen, setQualityCustomOpen] = useState(false);
+  const qualityCustomRef = useRef<HTMLDivElement | null>(null);
+  const qualityTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const qualityPopoverRef = useRef<HTMLDivElement | null>(null);
+  const [qualityPopoverPosition, setQualityPopoverPosition] = useState<{
+    left: number;
+    top?: number;
+    bottom?: number;
+  } | null>(null);
+  const updateQualityChoice = useCallback((next: RemoteDesktopQualityChoice) => {
+    setQualityChoice(next);
+    saveRemoteDesktopQualityChoice(machine.serverId, next);
+  }, [machine.serverId]);
+  const updateCustomQuality = useCallback((patch: Partial<RemoteDesktopQualityPreference>) => {
+    updateQualityChoice({
+      mode: REMOTE_DESKTOP_QUALITY_MODE.CUSTOM,
+      custom: { ...qualityChoice.custom, ...patch },
+    });
+  }, [qualityChoice.custom, updateQualityChoice]);
+  useEffect(() => {
+    if (!qualityCustomOpen) return;
+    // The toolbar groups clip their contents, so the popover lives in a portal
+    // pinned to the ⚙ segment; above it when the toolbar sits near the bottom.
+    const place = () => {
+      const rect = qualityTriggerRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      const width = 260;
+      const left = Math.max(8, Math.min(rect.right - width, window.innerWidth - width - 8));
+      setQualityPopoverPosition(rect.bottom + 300 < window.innerHeight
+        ? { left, top: rect.bottom + 6 }
+        : { left, bottom: window.innerHeight - rect.top + 6 });
+    };
+    place();
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target as Node;
+      if (qualityCustomRef.current?.contains(target) || qualityPopoverRef.current?.contains(target)) return;
+      setQualityCustomOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setQualityCustomOpen(false);
+    };
+    document.addEventListener('pointerdown', onPointerDown, true);
+    document.addEventListener('keydown', onKeyDown);
+    window.addEventListener('resize', place);
+    window.addEventListener('scroll', place, true);
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown, true);
+      document.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('resize', place);
+      window.removeEventListener('scroll', place, true);
+      setQualityPopoverPosition(null);
+    };
+  }, [qualityCustomOpen]);
+
   useEffect(() => {
     const connection = manager.presentation(machine, presentationRef.current);
     clientRef.current = connection;
@@ -781,6 +865,16 @@ export function RemoteDesktopPanel({
       if (clientRef.current === connection) clientRef.current = null;
     };
   }, [hostKey, inputActive, machine.serverId, manager]);
+
+  // Declared after the connection effect so a fresh connection already sits in
+  // clientRef; the client remembers it and re-sends on every worker session.
+  useEffect(() => {
+    clientRef.current?.setQualityPreference?.(
+      resolveRemoteDesktopQualityPreference(qualityChoice),
+      // Presets get the latency guard; a hand-tuned custom cap is respected as is.
+      { latencyGuard: qualityChoice.mode !== REMOTE_DESKTOP_QUALITY_MODE.CUSTOM },
+    );
+  }, [qualityChoice, hostKey, inputActive, machine.serverId, manager]);
 
   const hasQuickInputAuthority = useCallback((
     connection: RemoteDesktopManagedConnection | null,
@@ -2904,6 +2998,115 @@ export function RemoteDesktopPanel({
                 {t(`remote_desktop.clipboard_${clipboardStatus}`)}
               </span>
             )}
+          </div>
+          <div
+            class="remote-desktop-quality-switch"
+            role="group"
+            aria-label={t('remote_desktop.quality_label')}
+            ref={qualityCustomRef}
+          >
+            {QUALITY_QUICK_MODES.map((mode) => (
+              <button
+                key={mode}
+                type="button"
+                aria-pressed={qualityChoice.mode === mode}
+                disabled={snapshot.qualityPreferenceSupported === false}
+                title={snapshot.qualityPreferenceSupported === false
+                  ? t('remote_desktop.quality_unsupported')
+                  : t(`remote_desktop.quality_hint_${mode}`)}
+                onClick={() => updateQualityChoice({ ...qualityChoice, mode })}
+              >{t(`remote_desktop.quality_mode_${mode}`)}</button>
+            ))}
+            <button
+              ref={qualityTriggerRef}
+              type="button"
+              class="remote-desktop-quality-custom-trigger"
+              aria-haspopup="dialog"
+              aria-expanded={qualityCustomOpen}
+              aria-pressed={qualityChoice.mode === REMOTE_DESKTOP_QUALITY_MODE.CUSTOM}
+              aria-label={t('remote_desktop.quality_mode_custom')}
+              disabled={snapshot.qualityPreferenceSupported === false}
+              title={snapshot.qualityPreferenceSupported === false
+                ? t('remote_desktop.quality_unsupported')
+                : t('remote_desktop.quality_hint_custom')}
+              onClick={() => setQualityCustomOpen((open) => !open)}
+            ><span aria-hidden="true">⚙</span></button>
+            {snapshot.route === REMOTE_DESKTOP_ROUTE.RELAY && !!snapshot.relayBitrateCapBps && (
+              <span class="remote-desktop-quality-relay-cap" title={t('remote_desktop.quality_relay_cap_hint')}>
+                {t('remote_desktop.quality_relay_cap', {
+                  mbps: (snapshot.relayBitrateCapBps / 1_000_000).toFixed(snapshot.relayBitrateCapBps < 1_000_000 ? 1 : 0),
+                })}
+              </span>
+            )}
+            {qualityCustomOpen && qualityPopoverPosition && createPortal((
+              <div
+                ref={qualityPopoverRef}
+                class="remote-desktop-quality-popover"
+                role="dialog"
+                aria-label={t('remote_desktop.quality_custom_title')}
+                style={qualityPopoverPosition}
+              >
+                <div class="remote-desktop-quality-popover-title">{t('remote_desktop.quality_custom_title')}</div>
+                <label>
+                  <span>{t('remote_desktop.quality_resolution')}</span>
+                  <select
+                    value={String(qualityChoice.custom.maxHeight)}
+                    onChange={(event) => updateCustomQuality({
+                      maxHeight: Number((event.target as HTMLSelectElement).value) as RemoteDesktopQualityPreference['maxHeight'],
+                    })}
+                  >
+                    {REMOTE_DESKTOP_QUALITY_MAX_HEIGHTS.map((height) => (
+                      <option key={height} value={String(height)}>
+                        {height === 0 ? t('remote_desktop.quality_resolution_native') : `${height}p`}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  <span>{t('remote_desktop.quality_fps')}</span>
+                  <select
+                    value={String(qualityChoice.custom.maxFps)}
+                    onChange={(event) => updateCustomQuality({
+                      maxFps: Number((event.target as HTMLSelectElement).value) as RemoteDesktopQualityPreference['maxFps'],
+                    })}
+                  >
+                    {REMOTE_DESKTOP_QUALITY_MAX_FPS.map((fps) => (
+                      <option key={fps} value={String(fps)}>{`${fps} fps`}</option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  <span>{t('remote_desktop.quality_bitrate')}</span>
+                  <select
+                    value={String(qualityChoice.custom.maxBitrateBps)}
+                    onChange={(event) => updateCustomQuality({
+                      maxBitrateBps: Number((event.target as HTMLSelectElement).value),
+                    })}
+                  >
+                    {REMOTE_DESKTOP_QUALITY_BITRATE_OPTIONS.map((bps) => (
+                      <option key={bps} value={String(bps)}>
+                        {bps === 0 ? t('remote_desktop.quality_bitrate_unlimited') : `${bps / 1_000_000} Mbps`}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  <span>{t('remote_desktop.quality_priority')}</span>
+                  <select
+                    value={qualityChoice.custom.priority}
+                    onChange={(event) => updateCustomQuality({
+                      priority: (event.target as HTMLSelectElement).value as RemoteDesktopQualityPreference['priority'],
+                    })}
+                  >
+                    {QUALITY_PRIORITIES.map((priority) => (
+                      <option key={priority} value={priority}>{t(`remote_desktop.quality_priority_${priority}`)}</option>
+                    ))}
+                  </select>
+                </label>
+                <p class="remote-desktop-quality-popover-note">{t('remote_desktop.quality_latency_guard_note')}</p>
+              </div>
+            // In fullscreen only the fullscreen element's subtree is painted.
+            ), document.fullscreenElement ?? document.body)}
           </div>
           <div class="remote-desktop-zoom-switch" role="group" aria-label={t('remote_desktop.zoom_label')}>
             <button type="button" aria-label={t('remote_desktop.zoom_out')} disabled={viewport.scale <= 1} onClick={() => changeZoom(-0.5)}>−</button>

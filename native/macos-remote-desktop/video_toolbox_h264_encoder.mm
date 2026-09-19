@@ -1302,9 +1302,14 @@ class VideoToolboxH264Encoder::Impl {
           imcodes::rd::ApplyEncodeBacklogPressure(selection.bitrate_bps,
                                                   backlog_pressure);
       if (pressured_bitrate < selection.bitrate_bps) {
+        // Bounded by the rung already chosen in BOTH dimensions and rate: a
+        // viewer who asked for 15 fps must not be bumped to a 30 fps rung
+        // just because it is smaller.
+        imcodes::rd::QualityPreference bound;
+        bound.max_fps = selection.fps;
         const imcodes::rd::QualitySelection candidate =
             imcodes::rd::SelectQuality(pressured_bitrate, selection.width,
-                                       selection.height);
+                                       selection.height, bound);
         const bool changes_resolution_or_rate =
             candidate.width != selection.width ||
             candidate.height != selection.height ||

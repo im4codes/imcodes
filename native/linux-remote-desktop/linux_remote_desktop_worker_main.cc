@@ -138,6 +138,7 @@ common::RouteAuthority ToRouteAuthority(const imcodes::rd::Authority& authority)
       : common::TransportSessionMode::kView;
   route.input_epoch = static_cast<std::uint64_t>(authority.input_epoch);
   route.expires_at_unix_ms = authority.expires_at_ms;
+  route.relay_bitrate_cap_bps = authority.relay_bitrate_cap_bps;
   route.lease_expires_at_unix_ms = authority.lease_expires_at_ms;
   return route;
 }
@@ -471,6 +472,8 @@ class Worker {
       status["state"] = StateFor(diagnostics);
       status["peerConnected"] = diagnostics.peer_state == common::PeerConnectionState::kConnected;
       status["dataChannelsReady"] = diagnostics.required_channels_ready;
+      // Honours set_quality_preference; the browser sends it only when true.
+      status["qualityPreference"] = true;
       status["mediaStarted"] = diagnostics.last_outbound_video_bytes > 0;
       // The fourth fact the Server requires before it disarms
       // NEGOTIATION_TIMEOUT_MS and calls the session connected -- see

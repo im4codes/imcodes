@@ -8,6 +8,7 @@
 #include <string_view>
 #include <vector>
 
+#include "quality_ladder.h"
 #include "value_types.h"
 
 namespace imcodes::remote_desktop::common {
@@ -45,6 +46,9 @@ class IceCandidateQueue {
 struct QualityTarget {
   std::uint32_t bitrate_bps = 0;
   PixelSize source_pixels;
+  // The viewer's preference with the relay cap already folded in. Filled by
+  // TransportSessionCore; a ladder passes it straight to SelectQuality.
+  imcodes::rd::QualityPreference preference{};
 };
 
 struct QualitySelection {

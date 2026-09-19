@@ -619,6 +619,16 @@ export const REMOTE_DESKTOP_ADAPTER_CAPABILITIES = Object.freeze(
 export const REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY = REMOTE_DESKTOP_ADAPTER_CAPABILITY.LOCAL_CONSENT;
 export const REMOTE_DESKTOP_SIGNED_SHELL_CAPABILITY = REMOTE_DESKTOP_ADAPTER_CAPABILITY.SIGNED_ACCOUNT_SHELL;
 export const REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY = REMOTE_DESKTOP_ADAPTER_CAPABILITY.CAPTURE_PRIVACY;
+/**
+ * Node capability: its remote-desktop worker accepts `relayBitrateCapBps` on
+ * PREPARE and enforces it while relayed. The Server sends the relay cap only
+ * to nodes advertising this -- older nodes and workers reject unknown keys.
+ *
+ * Deliberately NOT under `remote.desktop.`: an older Server treats an unknown
+ * `remote.desktop.*` token from a session.v3 node as a mandatory profile part
+ * and fails remote desktop closed. Outside that namespace it is just ignored.
+ */
+export const REMOTE_DESKTOP_RELAY_CAP_CAPABILITY = 'relay.bitrate-cap.v1' as const;
 export const REMOTE_DESKTOP_INPUT_CAPABILITY = REMOTE_DESKTOP_ADAPTER_CAPABILITY.INPUT;
 export const REMOTE_DESKTOP_LOCK_SCREEN_CAPABILITY = REMOTE_DESKTOP_ADAPTER_CAPABILITY.LOCK_SCREEN;
 export const REMOTE_DESKTOP_CANONICAL_BRANDING_CAPABILITY = REMOTE_DESKTOP_ADAPTER_CAPABILITY.CANONICAL_BRANDING;

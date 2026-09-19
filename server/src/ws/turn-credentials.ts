@@ -1,4 +1,5 @@
 import { createHash, createHmac } from 'node:crypto';
+import { REMOTE_DESKTOP_QUALITY_BITRATE_CAP } from '../../../shared/remote-desktop.js';
 import {
   DIRECT_FILE_TRANSFER_ICE_SERVERS,
   type DirectFileTransferIceServerConfig,
@@ -17,6 +18,23 @@ export interface TurnIceServerAuthority {
   iceServers: DirectFileTransferIceServerConfig[];
   /** Absolute coturn REST username expiry, before the safety margin. */
   credentialExpiresAt?: number;
+  /**
+   * Ceiling the handed-out relay enforces for this user's tier (bps); absent =
+   * unlimited. A hint for remote-desktop workers (start/stay at it) and the
+   * browser (badge); the relay itself is what enforces it.
+   */
+  relayBitrateCapBps?: number;
+}
+
+/** Optional relay ceiling; invalid or out-of-range values mean "unlimited". */
+function readRelayBitrateCap(raw: string | undefined): number | undefined {
+  if (raw === undefined || !/^\d+$/.test(raw.trim())) return undefined;
+  const value = Number(raw.trim());
+  return Number.isSafeInteger(value)
+    && value >= REMOTE_DESKTOP_QUALITY_BITRATE_CAP.MIN_BPS
+    && value <= REMOTE_DESKTOP_QUALITY_BITRATE_CAP.MAX_BPS
+    ? value
+    : undefined;
 }
 
 function boundedCredentialTtl(raw: string | undefined): number | undefined {
@@ -55,6 +73,7 @@ export function readTurnServiceConfig(env: NodeJS.ProcessEnv = process.env): Tur
   // client a STUN-only ICE list against a perfectly healthy coturn.
   const relayRange = parseTurnRelayRange({ port, relayMinPort, relayMaxPort });
   if ('rejection' in relayRange) return undefined;
+  const bitrateCapBps = readRelayBitrateCap(env[TURN_SERVICE_ENV.BITRATE_CAP_BPS]);
   return {
     host,
     port,
@@ -63,6 +82,7 @@ export function readTurnServiceConfig(env: NodeJS.ProcessEnv = process.env): Tur
     credentialTtlSeconds,
     relayMinPort: relayRange.relayMinPort,
     relayMaxPort: relayRange.relayMaxPort,
+    ...(bitrateCapBps !== undefined ? { bitrateCapBps } : {}),
   };
 }
 
@@ -83,6 +103,7 @@ export function createTurnIceServerAuthority(
   const credential = createHmac('sha1', config.sharedSecret).update(username, 'utf8').digest('base64');
   return {
     credentialExpiresAt: expiresAtSeconds * 1000,
+    ...(config.bitrateCapBps !== undefined ? { relayBitrateCapBps: config.bitrateCapBps } : {}),
     iceServers: [
       ...base,
       {

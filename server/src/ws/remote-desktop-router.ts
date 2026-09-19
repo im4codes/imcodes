@@ -45,6 +45,7 @@ import {
   type RemoteDesktopActor,
   type RemoteDesktopBootstrapProof,
   type RemoteDesktopOutboxEvent,
+  REMOTE_DESKTOP_RELAY_CAP_CAPABILITY,
 } from '../../../shared/remote-desktop-access.js';
 import type { RemoteDesktopGuestOutboxAuthorityMatch } from '../services/remote-desktop-guest-outbox-worker.js';
 import type { TurnIceServerAuthority } from './turn-credentials.js';
@@ -768,6 +769,7 @@ export class RemoteDesktopRouter {
             ...authority,
             routeGeneration: route.registryIdentity.routeGeneration,
             reconnectAttempt: route.reconnectAttempt,
+            ...this.relayCapForPrepare(iceAuthority),
           }, daemonGeneration)) {
             throw new Error('replacement_prepare_failed');
           }
@@ -807,9 +809,11 @@ export class RemoteDesktopRouter {
           }
           route.daemonSuspended = false;
           const capability = this.deriveCapability(route.requestId, route.sessionId);
+          const replacementIce = this.hooks.iceServers(route.userId ?? route.actor.auditId);
           this.hooks.sendBrowser(route.socket, {
             type: REMOTE_DESKTOP_MSG.AUTHORIZED,
             serverTime: this.now(),
+            ...this.relayCapForBrowser(replacementIce),
             requestId: route.requestId,
             sessionId: route.sessionId,
             capability,
@@ -818,7 +822,7 @@ export class RemoteDesktopRouter {
             daemonGeneration,
             mode: route.mode,
             inputEpoch: route.inputEpoch,
-            iceServers: this.hooks.iceServers(route.userId ?? route.actor.auditId).iceServers,
+            iceServers: replacementIce.iceServers,
           });
           recovered++;
         }
@@ -1285,11 +1289,17 @@ export class RemoteDesktopRouter {
       ...authority,
       routeGeneration: registryIdentity.routeGeneration,
       ...(route.reconnectAttempt > 0 ? { reconnectAttempt: route.reconnectAttempt } : {}),
+      ...this.relayCapForPrepare(iceAuthority),
     }, generation)) {
       this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED, false);
       return;
     }
-    this.hooks.sendBrowser(socket, { type: REMOTE_DESKTOP_MSG.AUTHORIZED, ...authority, serverTime: this.now() });
+    this.hooks.sendBrowser(socket, {
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      ...authority,
+      serverTime: this.now(),
+      ...this.relayCapForBrowser(iceAuthority),
+    });
     this.counters.admitted++;
     this.audit(REMOTE_DESKTOP_AUDIT_EVENT.ADMITTED, route, {
       reconnectAttempt: route.reconnectAttempt,
@@ -1424,11 +1434,17 @@ export class RemoteDesktopRouter {
       ...authority,
       routeGeneration: pending.registryIdentity.routeGeneration,
       ...(route.reconnectAttempt > 0 ? { reconnectAttempt: route.reconnectAttempt } : {}),
+      ...this.relayCapForPrepare(iceAuthority),
     }, generation)) {
       this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.DAEMON_REPLACED, false);
       return;
     }
-    this.hooks.sendBrowser(socket, { type: REMOTE_DESKTOP_MSG.AUTHORIZED, ...authority, serverTime: this.now() });
+    this.hooks.sendBrowser(socket, {
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      ...authority,
+      serverTime: this.now(),
+      ...this.relayCapForBrowser(iceAuthority),
+    });
     this.counters.admitted++;
     this.audit(REMOTE_DESKTOP_AUDIT_EVENT.ADMITTED, route);
     this.publishCollaborationCounts();
@@ -1877,6 +1893,24 @@ export class RemoteDesktopRouter {
     if (typeof requestId !== 'string') return undefined;
     const resolvedSession = this.sessionByRequest.get(requestId);
     return resolvedSession ? this.routesBySession.get(resolvedSession) : undefined;
+  }
+
+  /**
+   * The relay's ceiling for PREPARE -- only to nodes that advertise they can
+   * accept it: older nodes and workers reject unknown PREPARE keys outright,
+   * which would fail the whole session.
+   */
+  private relayCapForPrepare(ice: TurnIceServerAuthority): { relayBitrateCapBps?: number } {
+    if (ice.relayBitrateCapBps === undefined) return {};
+    const capabilities = this.hooks.daemonRemoteDesktopCapabilities?.() ?? [];
+    return capabilities.includes(REMOTE_DESKTOP_RELAY_CAP_CAPABILITY)
+      ? { relayBitrateCapBps: ice.relayBitrateCapBps }
+      : {};
+  }
+
+  /** The relay's ceiling for the browser (badge / greyed options). */
+  private relayCapForBrowser(ice: TurnIceServerAuthority): { relayBitrateCapBps?: number } {
+    return ice.relayBitrateCapBps === undefined ? {} : { relayBitrateCapBps: ice.relayBitrateCapBps };
   }
 
   private deriveCapability(requestId: string, sessionId: string): string {

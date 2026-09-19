@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type WebSocket from 'ws';
 import { createTurnIceServerAuthority } from '../src/ws/turn-credentials.js';
+import { REMOTE_DESKTOP_RELAY_CAP_CAPABILITY } from '../../shared/remote-desktop-access.js';
 import type { Database } from '../src/db/client.js';
 import type { ControlledMachineAccessRow } from '../src/share/machine-access.js';
 import {
@@ -1708,5 +1709,26 @@ describe('a relay-required remote desktop receives real relay material', () => {
       'turn:im.zhinet.work:3480?transport=tcp',
     ]);
     expect(JSON.stringify(f.daemonMessages)).not.toContain(PRODUCTION_TURN_ENV.TURN_SHARED_SECRET);
+    // No cap configured: nothing about a cap on either leg.
+    expect(prepare).not.toHaveProperty('relayBitrateCapBps');
+    expect(authorized).not.toHaveProperty('relayBitrateCapBps');
+  });
+
+  it('passes an operator relay cap to capable nodes only, and always tells the browser', async () => {
+    const turnEnv = { ...PRODUCTION_TURN_ENV, TURN_BITRATE_CAP_BPS: '500000' };
+    const capable = fixture({ turnEnv, nodeCapabilities: [REMOTE_DESKTOP_RELAY_CAP_CAPABILITY] });
+    await authorize(capable);
+    expect(capable.daemonMessages.find((message) => message.type === REMOTE_DESKTOP_MSG.PREPARE))
+      .toMatchObject({ relayBitrateCapBps: 500_000 });
+    expect(capable.messages(capable.browserA).find((message) => message.type === REMOTE_DESKTOP_MSG.AUTHORIZED))
+      .toMatchObject({ relayBitrateCapBps: 500_000 });
+
+    // An older node rejects unknown PREPARE keys, so it must not see one.
+    const legacy = fixture({ turnEnv });
+    await authorize(legacy);
+    expect(legacy.daemonMessages.find((message) => message.type === REMOTE_DESKTOP_MSG.PREPARE))
+      .not.toHaveProperty('relayBitrateCapBps');
+    expect(legacy.messages(legacy.browserA).find((message) => message.type === REMOTE_DESKTOP_MSG.AUTHORIZED))
+      .toMatchObject({ relayBitrateCapBps: 500_000 });
   });
 });

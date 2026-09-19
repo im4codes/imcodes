@@ -225,6 +225,7 @@ class MacosTransportSessionAdapter final
   bool terminal_notified_ = false;
   bool negotiation_in_flight_ = false;
   bool bitrate_policy_applied_ = false;
+  std::uint32_t relay_bitrate_cap_bps_ = 0;
   std::uint64_t released_input_epoch_ = 0;
   std::uint64_t last_diagnostics_sequence_ = 0;
 };

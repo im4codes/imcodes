@@ -101,6 +101,7 @@ describe('macOS remote-desktop transport session adapter', () => {
       resolve(ROOT, 'native/macos-remote-desktop/macos_transport_session_adapter.cc'),
       resolve(ROOT, 'native/remote-desktop-common/value_types.cc'),
       resolve(ROOT, 'native/remote-desktop-common/transport_session_core.cc'),
+      resolve(ROOT, 'native/remote-desktop-common/quality_ladder.cc'),
       '-o', executable,
     ], { cwd: directory! });
     expect(compile.status, `${compile.stdout}\n${compile.stderr}`).toBe(0);

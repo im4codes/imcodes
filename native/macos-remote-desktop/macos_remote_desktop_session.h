@@ -210,6 +210,8 @@ class MacosRemoteDesktopSession final {
   // lease ordering before physical input state changes.
   bool ApplyModeAuthority(const common::RouteAuthority& authority,
                           common::TransportTime now);
+  // This viewer's quality preference (set_quality_preference).
+  bool SetQualityPreference(const imcodes::rd::QualityPreference& preference);
   bool RecordRouteActivity(const common::RouteAuthorityIdentity& identity,
                            common::TransportTime now);
   bool TickTransport(common::TransportTime now);

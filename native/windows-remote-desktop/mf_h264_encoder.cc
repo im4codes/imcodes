@@ -37,6 +37,12 @@ MfH264RuntimeDiagnostics g_diagnostics;
 std::atomic<bool> g_hardware_encoder_allowed{true};
 std::mutex g_bitrate_budget_mutex;
 uint64_t g_aggregate_reserved_bitrate_bps = 0;
+// Lock order: g_active_encoder_mutex, then the encoder's own mutex_. The
+// preference itself is atomic so SetRates (holding mutex_) never needs the
+// registration lock.
+std::atomic<QualityPreference> g_quality_preference{QualityPreference{}};
+std::mutex g_active_encoder_mutex;
+MfH264Encoder* g_active_encoder = nullptr;
 
 uint32_t ReserveAggregateBitrate(uint32_t requested_bps,
                                  uint32_t previous_reservation_bps) {
@@ -153,9 +159,52 @@ MfH264Encoder::~MfH264Encoder() {
   Release();
 }
 
-int MfH264Encoder::InitEncode(const webrtc::VideoCodec* codec_settings,
-                              const Settings&) {
+void SetMfH264QualityPreference(const QualityPreference& preference) noexcept {
+  try {
+    g_quality_preference.store(preference);
+    std::lock_guard<std::mutex> active(g_active_encoder_mutex);
+    if (g_active_encoder != nullptr) {
+      g_active_encoder->ApplyQualityPreference(preference);
+    }
+  } catch (...) {
+    // A preference is advisory; the next SetRates applies the stored value.
+  }
+}
+
+void MfH264Encoder::ApplyQualityPreference(const QualityPreference& preference) {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (!initialized_) return;
+  const QualitySelection next = SelectQuality(
+      reserved_bitrate_bps_ > 0 ? reserved_bitrate_bps_ : bitrate_bps_,
+      source_width_, source_height_, preference);
+  reconfigure_pending_ = reconfigure_pending_ || next.width != width_ ||
+                         next.height != height_ || next.fps != fps_;
+  quality_ = next;
+  bitrate_bps_ = next.bitrate_bps;
+  VARIANT bitrate = UInt32Variant(bitrate_bps_);
+  SetCodecValue(CODECAPI_AVEncCommonMeanBitRate, bitrate);
+  VariantClear(&bitrate);
+  PublishDiagnostics();
+}
+
+int MfH264Encoder::InitEncode(const webrtc::VideoCodec* codec_settings,
+                              const Settings& settings) {
+  int result;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    result = InitEncodeLocked(codec_settings, settings);
+  }
+  if (result == WEBRTC_VIDEO_CODEC_OK) {
+    // Registered outside mutex_ to keep the g_active_encoder_mutex -> mutex_
+    // lock order; SetMfH264QualityPreference relies on it.
+    std::lock_guard<std::mutex> active(g_active_encoder_mutex);
+    g_active_encoder = this;
+  }
+  return result;
+}
+
+int MfH264Encoder::InitEncodeLocked(const webrtc::VideoCodec* codec_settings,
+                                    const Settings&) {
   if (!codec_settings || codec_settings->codecType != webrtc::kVideoCodecH264 ||
       codec_settings->width < 64 || codec_settings->height < 64 ||
       codec_settings->width > 4096 || codec_settings->height > 4096) {
@@ -182,8 +231,9 @@ int MfH264Encoder::InitEncode(const webrtc::VideoCodec* codec_settings,
   reserved_bitrate_bps_ = ReserveAggregateBitrate(
       codec_settings->startBitrate * 1000u, 0);
   if (reserved_bitrate_bps_ == 0) return WEBRTC_VIDEO_CODEC_MEMORY;
-  bitrate_bps_ = reserved_bitrate_bps_;
-  quality_ = SelectQuality(bitrate_bps_, source_width_, source_height_);
+  quality_ = SelectQuality(reserved_bitrate_bps_, source_width_,
+                           source_height_, g_quality_preference.load());
+  bitrate_bps_ = quality_.bitrate_bps;
   width_ = quality_.width;
   height_ = quality_.height;
   fps_ = quality_.fps;
@@ -224,6 +274,12 @@ int32_t MfH264Encoder::RegisterEncodeCompleteCallback(
 }
 
 int32_t MfH264Encoder::Release() {
+  {
+    // Unregister before tearing down so a concurrent preference update can
+    // never reach an encoder that is going away.
+    std::lock_guard<std::mutex> active(g_active_encoder_mutex);
+    if (g_active_encoder == this) g_active_encoder = nullptr;
+  }
   std::lock_guard<std::mutex> lock(mutex_);
   if (transform_) {
     transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
@@ -422,9 +478,12 @@ void MfH264Encoder::SetRates(const RateControlParameters& parameters) {
       requested_bps, reserved_bitrate_bps_);
   if (granted_bps == 0) return;
   reserved_bitrate_bps_ = granted_bps;
-  bitrate_bps_ = granted_bps;
   const QualitySelection next =
-      SelectQuality(bitrate_bps_, source_width_, source_height_);
+      SelectQuality(granted_bps, source_width_, source_height_,
+                    g_quality_preference.load());
+  // The viewer's cap (and a relayed route's ceiling) bound what is encoded,
+  // not just which rung is picked.
+  bitrate_bps_ = next.bitrate_bps;
   reconfigure_pending_ = reconfigure_pending_ || next.width != width_ ||
                          next.height != height_ || next.fps != fps_;
   quality_ = next;

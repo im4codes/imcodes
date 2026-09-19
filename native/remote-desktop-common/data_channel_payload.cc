@@ -546,7 +546,8 @@ void SkipWhitespace(std::string_view text, std::size_t* index) {
           {"type", "protocolVersion", "sessionId", "sequence", "layoutRevision",
            "inputEpoch", "kind"},
           {"displayId", "width", "height", "dpiScalePercent", "requestId",
-           "frameWidth", "frameHeight", "acknowledgedSequence"})) {
+           "frameWidth", "frameHeight", "acknowledgedSequence", "maxHeight",
+           "maxFps", "maxBitrateBps", "priority"})) {
     return false;
   }
   // Control carries no input epoch requirement beyond correlation: unlike
@@ -581,13 +582,48 @@ void SkipWhitespace(std::string_view text, std::size_t* index) {
       !ReadOptionalUnsigned(members, "frameHeight",
                             &out->control.frame_height) ||
       !ReadOptionalUnsigned(members, "acknowledgedSequence",
-                            &out->control.acknowledged_sequence)) {
+                            &out->control.acknowledged_sequence) ||
+      !ReadOptionalUnsigned(members, "maxHeight", &out->control.max_height) ||
+      !ReadOptionalUnsigned(members, "maxFps", &out->control.max_fps) ||
+      !ReadOptionalUnsigned(members, "maxBitrateBps",
+                            &out->control.max_bitrate_bps)) {
     return false;
+  }
+  const Scalar* priority = Find(members, "priority");
+  if (priority != nullptr) {
+    std::string value;
+    if (!ReadBoundedString(priority, 16, &value)) return false;
+    out->control.priority = std::move(value);
   }
 
   const auto absent = [&members](const char* name) {
     return members.find(name) == members.end();
   };
+  const bool quality_fields_absent = absent("maxHeight") && absent("maxFps") &&
+                                     absent("maxBitrateBps") &&
+                                     absent("priority");
+  if (out->control.kind == "set_quality_preference") {
+    // Same shape as shared/remote-desktop.ts isRemoteDesktopQualityPreference.
+    if (!out->control.max_height || !out->control.max_fps ||
+        !out->control.max_bitrate_bps || !out->control.priority ||
+        !absent("displayId") || !absent("width") || !absent("height") ||
+        !absent("dpiScalePercent") || !absent("requestId") ||
+        !absent("frameWidth") || !absent("frameHeight") ||
+        !absent("acknowledgedSequence")) {
+      return false;
+    }
+    const std::uint64_t height = *out->control.max_height;
+    const std::uint64_t fps = *out->control.max_fps;
+    const std::uint64_t bitrate = *out->control.max_bitrate_bps;
+    const std::string& prio = *out->control.priority;
+    return (height == 0 || height == 720 || height == 1080 ||
+            height == 1440) &&
+           (fps == 15 || fps == 30 || fps == 60) &&
+           (bitrate == 0 || (bitrate >= 350'000 && bitrate <= 15'000'000)) &&
+           (prio == "framerate" || prio == "balanced" ||
+            prio == "resolution");
+  }
+  if (!quality_fields_absent) return false;
   const auto no_optional_fields = [&]() {
     return absent("displayId") && absent("width") && absent("height") &&
            absent("dpiScalePercent") && absent("requestId") &&
@@ -715,6 +751,24 @@ bool ParseDataChannelMessage(std::string_view payload,
 
   *out = std::move(parsed);
   return true;
+}
+
+std::optional<QualityPreference> QualityPreferenceFromControl(
+    const ControlPayload& control) {
+  if (control.kind != "set_quality_preference" || !control.max_height ||
+      !control.max_fps || !control.max_bitrate_bps || !control.priority) {
+    return std::nullopt;
+  }
+  QualityPreference preference;
+  preference.max_height = static_cast<int>(*control.max_height);
+  preference.max_fps = static_cast<int>(*control.max_fps);
+  preference.max_bitrate_bps = static_cast<std::uint32_t>(*control.max_bitrate_bps);
+  preference.priority = *control.priority == "framerate"
+                            ? QualityPriority::kFramerate
+                            : *control.priority == "resolution"
+                                  ? QualityPriority::kResolution
+                                  : QualityPriority::kBalanced;
+  return preference;
 }
 
 }  // namespace imcodes::rd

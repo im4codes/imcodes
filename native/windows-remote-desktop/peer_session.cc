@@ -254,9 +254,12 @@ void PeerDataObserver::OnMessage(const webrtc::DataBuffer& buffer) {
 
 common::QualitySelection PeerSession::WindowsQualityLadder::Select(
     const common::QualityTarget& target) const noexcept {
+  // The encoder selects independently on every rate update and ApplyQuality
+  // checks the two agree, so it must see the exact preference used here.
+  SetMfH264QualityPreference(target.preference);
   const QualitySelection selected = SelectQuality(
       target.bitrate_bps, static_cast<int>(target.source_pixels.width),
-      static_cast<int>(target.source_pixels.height));
+      static_cast<int>(target.source_pixels.height), target.preference);
   return {
       selected.id,
       {static_cast<std::uint32_t>(selected.width),
@@ -353,6 +356,7 @@ common::RouteAuthority PeerSession::CommonAuthority(
       authority.mode == kControlMode ? common::TransportSessionMode::kControl
                                      : common::TransportSessionMode::kView,
       static_cast<std::uint64_t>(authority.input_epoch),
+      authority.relay_bitrate_cap_bps,
   };
 }
 
@@ -505,7 +509,7 @@ bool PeerSession::ApplyTransportBitratePolicy(bool direct) {
     return true;
   }
   const TransportBitratePolicy policy =
-      SelectTransportBitratePolicy(direct);
+      SelectTransportBitratePolicy(direct, authority_.relay_bitrate_cap_bps);
   webrtc::BitrateSettings bitrate_settings;
   bitrate_settings.min_bitrate_bps = static_cast<int>(policy.min_bps);
   bitrate_settings.start_bitrate_bps = static_cast<int>(policy.start_bps);
@@ -1204,9 +1208,50 @@ void PeerSession::HandleControl(const std::string& channel,
                         "layoutRevision", "inputEpoch", "kind"},
                  {"displayId", "width", "height", "dpiScalePercent",
                   "requestId",
-                  "frameWidth", "frameHeight", "acknowledgedSequence"}) ||
+                  "frameWidth", "frameHeight", "acknowledgedSequence",
+                  "maxHeight", "maxFps", "maxBitrateBps", "priority"}) ||
       !root["kind"].isString()) {
     return;
+  }
+  if (root["kind"].asString() == "set_quality_preference") {
+    // Per viewer and needs no control authority: it shapes only this
+    // viewer's own stream. Same wire shape as shared/remote-desktop.ts.
+    if (!root["maxHeight"].isUInt() || !root["maxFps"].isUInt() ||
+        !root["maxBitrateBps"].isUInt() || !root["priority"].isString() ||
+        root.isMember("displayId") || root.isMember("width") ||
+        root.isMember("height") || root.isMember("dpiScalePercent") ||
+        root.isMember("requestId") || root.isMember("frameWidth") ||
+        root.isMember("frameHeight") ||
+        root.isMember("acknowledgedSequence")) {
+      return;
+    }
+    const unsigned height = root["maxHeight"].asUInt();
+    const unsigned fps = root["maxFps"].asUInt();
+    const unsigned bitrate = root["maxBitrateBps"].asUInt();
+    const std::string priority = root["priority"].asString();
+    if (!(height == 0 || height == 720 || height == 1080 || height == 1440) ||
+        !(fps == 15 || fps == 30 || fps == 60) ||
+        !(bitrate == 0 || (bitrate >= 350'000 && bitrate <= 15'000'000)) ||
+        !(priority == "framerate" || priority == "balanced" ||
+          priority == "resolution")) {
+      return;
+    }
+    if (!ConsumeRate("quality", 30, std::chrono::minutes(1))) return;
+    QualityPreference preference;
+    preference.max_height = static_cast<int>(height);
+    preference.max_fps = static_cast<int>(fps);
+    preference.max_bitrate_bps = bitrate;
+    preference.priority = priority == "framerate"
+                              ? QualityPriority::kFramerate
+                              : priority == "resolution"
+                                    ? QualityPriority::kResolution
+                                    : QualityPriority::kBalanced;
+    transport_core_.SetQualityPreference(preference);
+    return;
+  }
+  for (const char* quality_key :
+       {"maxHeight", "maxFps", "maxBitrateBps", "priority"}) {
+    if (root.isMember(quality_key)) return;
   }
   const std::string kind = root["kind"].asString();
   uint64_t sequence = 0;
@@ -1639,6 +1684,8 @@ void PeerSession::SendStatus(const char* state, bool input_enabled) {
   }
   root["inputEnabled"] = input_enabled;
   root["atomicButtonClick"] = true;
+  // Honours set_quality_preference; the browser sends it only when true.
+  root["qualityPreference"] = true;
   if (!input_enabled) {
     // A session that is connected and controlling but cannot type is the most
     // opaque state this protocol has: every control greys out with nothing to

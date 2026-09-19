@@ -48,6 +48,58 @@ TEST(QualityLadderTest, ClampsBitrateAndFps) {
   EXPECT_EQ(high.fps, 30);
 }
 
+TEST(QualityLadderTest, OffersSixtyFpsOnlyWhenTheViewerAllowsIt) {
+  QualityPreference sixty;
+  sixty.max_fps = 60;
+  EXPECT_STREQ(SelectQuality(15'000'000, 2560, 1440).id, "1440p30");
+  EXPECT_STREQ(SelectQuality(15'000'000, 2560, 1440, sixty).id, "1440p60");
+  EXPECT_STREQ(SelectQuality(9'000'000, 1920, 1080, sixty).id, "1080p60");
+}
+
+TEST(QualityLadderTest, SmoothKeepsFrameRateByShedResolution) {
+  QualityPreference smooth;
+  smooth.max_height = 1080;
+  smooth.priority = QualityPriority::kFramerate;
+  EXPECT_STREQ(SelectQuality(15'000'000, 5120, 2880, smooth).id, "1080p30");
+  EXPECT_STREQ(SelectQuality(2'000'000, 5120, 2880, smooth).id, "540p30");
+  EXPECT_STREQ(SelectQuality(800'000, 5120, 2880, smooth).id, "360p30");
+  // Below every 30 fps rung the frame rate finally gives way.
+  EXPECT_STREQ(SelectQuality(500'000, 5120, 2880, smooth).id, "720p10");
+}
+
+TEST(QualityLadderTest, SharpKeepsResolutionByShedFrameRate) {
+  QualityPreference sharp;
+  sharp.priority = QualityPriority::kResolution;
+  EXPECT_STREQ(SelectQuality(12'000'000, 3840, 2160, sharp).id, "2160p15");
+  EXPECT_STREQ(SelectQuality(800'000, 1920, 1080, sharp).id, "720p10");
+}
+
+TEST(QualityLadderTest, SaverCapsResolutionFrameRateAndBitrate) {
+  QualityPreference saver;
+  saver.max_height = 720;
+  saver.max_fps = 15;
+  saver.max_bitrate_bps = 1'800'000;
+  const QualitySelection selected = SelectQuality(15'000'000, 1920, 1080, saver);
+  EXPECT_STREQ(selected.id, "720p15");
+  EXPECT_EQ(selected.bitrate_bps, 1'800'000u);
+}
+
+TEST(QualityLadderTest, RelayCapBindsOnlyRelayedSessions) {
+  const TransportBitratePolicy relayed = SelectTransportBitratePolicy(false, 500'000);
+  EXPECT_EQ(relayed.start_bps, 500'000u);
+  EXPECT_EQ(relayed.max_bps, 500'000u);
+  EXPECT_EQ(relayed.min_bps, 350'000u);
+  EXPECT_EQ(SelectTransportBitratePolicy(true, 500'000).max_bps, 15'000'000u);
+  EXPECT_EQ(EffectiveBitrateCap(0, 500'000, false), 500'000u);
+  EXPECT_EQ(EffectiveBitrateCap(0, 500'000, true), 0u);
+  EXPECT_EQ(EffectiveBitrateCap(2'000'000, 500'000, false), 500'000u);
+  QualityPreference capped;
+  capped.max_bitrate_bps = EffectiveBitrateCap(0, 500'000, false);
+  const QualitySelection selected = SelectQuality(15'000'000, 1920, 1080, capped);
+  EXPECT_STREQ(selected.id, "720p10");
+  EXPECT_EQ(selected.bitrate_bps, 500'000u);
+}
+
 TEST(QualityLadderTest, EnforcesPerPeerAndAggregateBitrateBudgets) {
   EXPECT_EQ(ClampAggregateVideoBitrate(20'000'000, 0, 0), 15'000'000u);
   EXPECT_EQ(ClampAggregateVideoBitrate(15'000'000, 0, 50'000'000),

@@ -8,6 +8,13 @@ export const TURN_SERVICE_ENV = {
   RELAY_MIN_PORT: 'TURN_RELAY_MIN_PORT',
   RELAY_MAX_PORT: 'TURN_RELAY_MAX_PORT',
   /**
+   * Optional: the per-session rate limit this TURN relay enforces (coturn
+   * max-bps), in bits per second. Not a limit by itself -- it tells remote
+   * desktop workers the relay's ceiling so they start and stay at it instead
+   * of overshooting into loss. Unset (the default) = unlimited relay.
+   */
+  BITRATE_CAP_BPS: 'TURN_BITRATE_CAP_BPS',
+  /**
    * The deployment's own record of how its TURN container is attached to the
    * network. Persisted because it CANNOT be re-derived: a wide relay range in
    * .env is equally consistent with a historical bridge deployment and a
@@ -334,6 +341,8 @@ export interface TurnServiceConfig {
   credentialTtlSeconds: number;
   relayMinPort: number;
   relayMaxPort: number;
+  /** Relay's enforced per-session ceiling (bps); absent = unlimited. */
+  bitrateCapBps?: number;
 }
 
 const HOST_RE = /^(?=.{1,253}$)(?!-)(?:[A-Za-z0-9-]{1,63}\.)*[A-Za-z0-9][A-Za-z0-9-]{0,62}$/;

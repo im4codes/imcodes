@@ -284,6 +284,7 @@ describe.skipIf(process.platform === "win32")(
             COMMON,
             resolve(COMMON, "value_types.cc"),
             resolve(COMMON, "transport_session_core.cc"),
+            resolve(COMMON, "quality_ladder.cc"),
             COUNTERFACTUAL,
             "-o",
             executable,

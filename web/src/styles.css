@@ -10611,6 +10611,7 @@ button.quick-agent-delegation-preset.active {
 .remote-desktop-display-tabs,
 .remote-desktop-mode-switch,
 .remote-desktop-view-switch,
+.remote-desktop-quality-switch,
 .remote-desktop-zoom-switch,
 .remote-desktop-clipboard-switch,
 .remote-desktop-mobile-input-switch {
@@ -10631,6 +10632,73 @@ button.quick-agent-delegation-preset.active {
 
 .remote-desktop-mobile-input-switch {
   display: none;
+}
+
+.remote-desktop-quality-custom-trigger {
+  width: 36px;
+  padding-inline: 0 !important;
+  font-size: 15px;
+  line-height: 1;
+}
+
+/* The relay cap is a fact about the route, not a choice: an amber tag at the
+   end of the quality group rather than another button. */
+.remote-desktop-quality-relay-cap {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 10px;
+  color: #ffd79a;
+  font-size: 11.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  border-left: 1px solid rgb(245 179 74 / 30%);
+  background: rgb(245 179 74 / 10%);
+  cursor: help;
+}
+
+.remote-desktop-quality-popover {
+  position: fixed;
+  z-index: 10050;
+  width: 260px;
+  display: grid;
+  gap: 10px;
+  padding: 12px 14px;
+  color: #d7e2ec;
+  background: rgb(12 22 34 / 97%);
+  border: 1px solid rgb(203 213 225 / 16%);
+  border-radius: 12px;
+  box-shadow: 0 14px 34px rgb(0 0 0 / 55%), inset 0 1px 0 rgb(255 255 255 / 6%);
+  font-size: 12.5px;
+}
+
+.remote-desktop-quality-popover-title {
+  color: #f1f5f9;
+  font-weight: 600;
+}
+
+.remote-desktop-quality-popover label {
+  display: grid;
+  grid-template-columns: 1fr 118px;
+  align-items: center;
+  gap: 10px;
+}
+
+.remote-desktop-quality-popover select {
+  min-height: 30px;
+  padding: 4px 8px;
+  color: #f1f5f9;
+  background: rgb(148 163 184 / 10%);
+  border: 1px solid rgb(203 213 225 / 18%);
+  border-radius: 8px;
+  font: inherit;
+}
+
+.remote-desktop-quality-popover-note {
+  margin: 0;
+  color: #8fa1b3;
+  font-size: 11.5px;
+  line-height: 1.45;
 }
 
 .remote-desktop-keyboard-trigger {
@@ -10695,6 +10763,7 @@ button.quick-agent-delegation-preset.active {
   .remote-desktop-display-tabs,
   .remote-desktop-mode-switch,
   .remote-desktop-view-switch,
+  .remote-desktop-quality-switch,
   .remote-desktop-zoom-switch,
   .remote-desktop-clipboard-switch,
   .remote-desktop-mobile-input-switch
@@ -12473,7 +12542,8 @@ button.quick-agent-delegation-preset.active {
   }
 
   /* The keyboard segment is a glyph, so it must not stretch like a worded one. */
-  .remote-desktop-toolbar .remote-desktop-keyboard-trigger {
+  .remote-desktop-toolbar .remote-desktop-keyboard-trigger,
+  .remote-desktop-toolbar .remote-desktop-quality-custom-trigger {
     flex: 0 0 auto;
   }
 

@@ -13,6 +13,28 @@ struct QualitySelection {
   uint32_t bitrate_bps;
 };
 
+// What the viewer asked for (per viewer: every viewer has its own encoder).
+// A default-constructed preference reproduces the automatic selection exactly.
+enum class QualityPriority {
+  // Highest ladder rung the bitrate affords (the historical behaviour).
+  kBalanced,
+  // Keep the frame rate; give up resolution first ("Smooth").
+  kFramerate,
+  // Keep the resolution; give up frame rate first ("Sharp").
+  kResolution,
+};
+
+struct QualityPreference {
+  // Largest rung height to use; 0 = no cap (native).
+  int max_height = 0;
+  // Frame-rate ceiling: 15, 30 or 60. 60 fps rungs are only ever considered
+  // when this allows them.
+  int max_fps = 30;
+  // Encoder bitrate ceiling; 0 = no cap beyond the per-peer ceiling.
+  uint32_t max_bitrate_bps = 0;
+  QualityPriority priority = QualityPriority::kBalanced;
+};
+
 struct TransportBitratePolicy {
   uint32_t min_bps;
   uint32_t start_bps;
@@ -44,7 +66,18 @@ inline constexpr uint32_t kAggregateVideoBitrateBps = 60'000'000;
 // handshake on a shared ordered TURN/TCP path. Once ICE proves the session is
 // direct, reseed libwebrtc with the crisp desktop prior. The minimum remains
 // 350 kbps in both cases, so congestion feedback can always back off.
-TransportBitratePolicy SelectTransportBitratePolicy(bool direct);
+//
+// `relay_cap_bps` (0 = none) is the operator's relayed-traffic ceiling: when
+// the session is NOT direct it bounds both the start and the maximum, so the
+// estimator never pushes a relayed stream past it. Direct sessions ignore it.
+TransportBitratePolicy SelectTransportBitratePolicy(bool direct,
+                                                    uint32_t relay_cap_bps = 0);
+
+// The encoder bitrate ceiling to apply: the viewer's own cap, tightened by the
+// relay cap while the session is relayed. 0 = no cap.
+uint32_t EffectiveBitrateCap(uint32_t viewer_cap_bps,
+                             uint32_t relay_cap_bps,
+                             bool direct);
 
 // Returns this encoder's new reservation after accounting for all other live
 // encoders. A zero result means the aggregate budget cannot fit even the
@@ -58,6 +91,14 @@ uint32_t ClampAggregateVideoBitrate(uint32_t requested_bps,
 QualitySelection SelectQuality(uint32_t target_bitrate_bps,
                                int source_width,
                                int source_height);
+
+// As above, within the viewer's preference: rungs above `max_height` or
+// `max_fps` are never chosen, the target is capped at `max_bitrate_bps`, and
+// `priority` decides which of the affordable rungs wins.
+QualitySelection SelectQuality(uint32_t target_bitrate_bps,
+                               int source_width,
+                               int source_height,
+                               const QualityPreference& preference);
 
 /**
  * Discounts `target_bitrate_bps` in proportion to `backlog_pressure`, a

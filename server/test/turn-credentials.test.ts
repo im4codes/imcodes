@@ -51,6 +51,23 @@ describe('temporary TURN credentials', () => {
     expect(authority.credentialExpiresAt).toBe(nowMs + 24 * 60 * 60 * 1000);
   });
 
+  it('hands out a relay bitrate cap only when the operator set a valid one', () => {
+    const nowMs = Date.UTC(2026, 0, 1);
+    // Default: no limit at all.
+    expect(readTurnServiceConfig(env)?.bitrateCapBps).toBeUndefined();
+    expect(createTurnIceServerAuthority('user-a', { env, nowMs })).not.toHaveProperty('relayBitrateCapBps');
+    const capped = { ...env, TURN_BITRATE_CAP_BPS: '500000' };
+    expect(readTurnServiceConfig(capped)).toMatchObject({ bitrateCapBps: 500_000 });
+    expect(createTurnIceServerAuthority('user-a', { env: capped, nowMs }))
+      .toMatchObject({ relayBitrateCapBps: 500_000 });
+    // A malformed cap is ignored rather than breaking TURN for everyone.
+    for (const bad of ['0', '100000', '99000000', 'fast', '1.5e6x']) {
+      const config = readTurnServiceConfig({ ...env, TURN_BITRATE_CAP_BPS: bad });
+      expect(config).toBeDefined();
+      expect(config?.bitrateCapBps).toBeUndefined();
+    }
+  });
+
   it('fails closed to STUN for incomplete or out-of-bounds configuration', () => {
     expect(readTurnServiceConfig({ ...env, TURN_SHARED_SECRET: 'short' })).toBeUndefined();
     expect(readTurnServiceConfig({ ...env, TURN_EXTERNAL_IP: '' })).toBeUndefined();

@@ -414,7 +414,13 @@ bool TransportSessionCore::OnTransportPath(
     Terminate(TransportTerminalReason::kProtocolViolation);
     return false;
   }
+  const bool changed = path_ != path;
   path_ = path;
+  // The relay ceiling binds only while relayed: a route that turns out direct
+  // (or falls back to TURN) re-selects under the right cap at once.
+  if (changed && last_quality_target_ && authority_.relay_bitrate_cap_bps > 0) {
+    return ApplyQualityTarget(*last_quality_target_);
+  }
   PublishDiagnostics();
   return true;
 }
@@ -434,7 +440,19 @@ bool TransportSessionCore::UpdateQualityTarget(
       target.bitrate_bps > limits_.maximum_quality_target_bps) {
     return false;
   }
-  QualitySelection selection = quality_ladder_.Select(target);
+  last_quality_target_ = target;
+  return ApplyQualityTarget(target);
+}
+
+bool TransportSessionCore::ApplyQualityTarget(const QualityTarget& target) {
+  QualityTarget effective = target;
+  effective.preference = viewer_preference_;
+  // Until ICE proves the route direct, treat it as relayed: the operator's
+  // relay ceiling is exactly what an unproven route must not exceed.
+  effective.preference.max_bitrate_bps = imcodes::rd::EffectiveBitrateCap(
+      viewer_preference_.max_bitrate_bps, authority_.relay_bitrate_cap_bps,
+      path_ == TransportPath::kDirect);
+  QualitySelection selection = quality_ladder_.Select(effective);
   if (!QualitySelectionIsValid(selection)) {
     Terminate(TransportTerminalReason::kProtocolViolation);
     return false;
@@ -446,6 +464,14 @@ bool TransportSessionCore::UpdateQualityTarget(
   quality_ = std::move(selection);
   PublishDiagnostics();
   return true;
+}
+
+bool TransportSessionCore::SetQualityPreference(
+    const imcodes::rd::QualityPreference& preference) {
+  if (!started_ || terminal_) return false;
+  viewer_preference_ = preference;
+  if (!last_quality_target_) return true;
+  return ApplyQualityTarget(*last_quality_target_);
 }
 
 bool TransportSessionCore::RecordActivity(

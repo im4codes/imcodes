@@ -20,6 +20,7 @@ import {
   REMOTE_DESKTOP_STATE,
   REMOTE_DESKTOP_TERMINAL_REASON,
   isRemoteDesktopPresentedFrameCompatible,
+  isRemoteDesktopQualityPreference,
   validateRemoteDesktopAuthorized,
   validateRemoteDesktopDataMessage,
   validateRemoteDesktopServerMessage,
@@ -29,6 +30,7 @@ import {
   type RemoteDesktopDisplay,
   type RemoteDesktopInputBlocked,
   type RemoteDesktopQuality,
+  type RemoteDesktopQualityPreference,
   type RemoteDesktopRoute,
   type RemoteDesktopServerMessage,
   type RemoteDesktopState,
@@ -80,6 +82,20 @@ const INPUT_ACK_TIMEOUT_MS = 3_000;
  * failure and a reconnect.
  */
 const LAYOUT_TRANSITION_TIMEOUT_MS = 20_000;
+/** Latency guard thresholds (see RemoteDesktopClient.observeLatency). */
+const LATENCY_GUARD = {
+  LATE_RTT_MS: 300,
+  LATE_BUFFER_MS: 250,
+  HEALTHY_RTT_MS: 150,
+  HEALTHY_BUFFER_MS: 120,
+  STEP_DOWN_SAMPLES: 3,
+  STEP_UP_SAMPLES: 15,
+  STEP_DOWN_FACTOR: 0.6,
+  STEP_UP_FACTOR: 1.5,
+  MIN_BPS: 350_000,
+  MAX_BPS: 15_000_000,
+} as const;
+
 const CLIPBOARD_REQUEST_TIMEOUT_MS = 2_000;
 
 export interface RemoteDesktopSnapshot {
@@ -89,6 +105,10 @@ export interface RemoteDesktopSnapshot {
   inputEnabled: boolean;
   /** Capability advertised by the current worker; absent on older workers. */
   atomicButtonClick?: boolean;
+  /** The worker honours viewer quality preferences (older workers do not). */
+  qualityPreferenceSupported?: boolean;
+  /** Ceiling of the relay this session was handed (its TURN tier), if any. */
+  relayBitrateCapBps?: number;
   route?: RemoteDesktopRoute;
   displays: RemoteDesktopDisplay[];
   selectedDisplayId?: string;
@@ -434,6 +454,21 @@ export class RemoteDesktopClient {
   private peer: RTCPeerConnection | null = null;
   /** The grant this session was authorized with, replayed on a worker handover. */
   private authorized: Extract<RemoteDesktopServerMessage, { type: typeof REMOTE_DESKTOP_MSG.AUTHORIZED }> | null = null;
+  /** What this viewer wants; re-sent to every (re)connected capable worker. */
+  private desiredQualityPreference: RemoteDesktopQualityPreference | null = null;
+  /** The preference the current worker session already has. */
+  private sentQualityPreferenceKey: string | null = null;
+  /**
+   * Latency guard: an extra, temporary bitrate ceiling the browser applies on
+   * top of the viewer's own choice when the stream shows up late (round trip
+   * or playback buffering), and relaxes once it is healthy again. Covers the
+   * case congestion control misses: bandwidth looks fine, delivery is slow.
+   */
+  private latencyGuardEnabled = false;
+  private latencyGuardCapBps: number | null = null;
+  private latencyBadStreak = 0;
+  private latencyGoodStreak = 0;
+  private previousJitterBuffer: { delay: number; emitted: number } | null = null;
   private renegotiating = false;
   /** Keep the last decoded frame visible while a new Windows session takes over. */
   private seamlessHandover = false;
@@ -664,6 +699,85 @@ export class RemoteDesktopClient {
     });
     if (sent) this.beginLayoutTransition();
     return sent;
+  }
+
+  /**
+   * This viewer's quality preference (resolution / frame-rate / bitrate caps
+   * and priority). Remembered and (re)sent to every capable worker session;
+   * never sent to a worker that did not advertise support.
+   */
+  setQualityPreference(
+    preference: RemoteDesktopQualityPreference,
+    options: { latencyGuard?: boolean } = {},
+  ): boolean {
+    if (!isRemoteDesktopQualityPreference(preference)) return false;
+    this.desiredQualityPreference = { ...preference };
+    this.latencyGuardEnabled = options.latencyGuard !== false;
+    if (!this.latencyGuardEnabled) this.resetLatencyGuard();
+    this.flushQualityPreference();
+    return true;
+  }
+
+  private resetLatencyGuard(): void {
+    this.latencyGuardCapBps = null;
+    this.latencyBadStreak = 0;
+    this.latencyGoodStreak = 0;
+  }
+
+  /** The viewer's preference with the latency guard's ceiling folded in. */
+  private effectiveQualityPreference(): RemoteDesktopQualityPreference | null {
+    const preference = this.desiredQualityPreference;
+    if (!preference) return null;
+    const guard = this.latencyGuardCapBps;
+    if (guard === null) return preference;
+    const own = preference.maxBitrateBps;
+    return { ...preference, maxBitrateBps: own > 0 ? Math.min(own, guard) : guard };
+  }
+
+  /**
+   * One stats sample: step the guard ceiling down after sustained lateness,
+   * back up after a sustained healthy stretch.
+   */
+  private observeLatency(rttMs: number | undefined, jitterBufferMs: number | undefined, bitrateBps: number): void {
+    if (!this.latencyGuardEnabled || !this.desiredQualityPreference) return;
+    const late = (rttMs !== undefined && rttMs >= LATENCY_GUARD.LATE_RTT_MS)
+      || (jitterBufferMs !== undefined && jitterBufferMs >= LATENCY_GUARD.LATE_BUFFER_MS);
+    const healthy = (rttMs === undefined || rttMs < LATENCY_GUARD.HEALTHY_RTT_MS)
+      && (jitterBufferMs === undefined || jitterBufferMs < LATENCY_GUARD.HEALTHY_BUFFER_MS);
+    this.latencyBadStreak = late ? this.latencyBadStreak + 1 : 0;
+    this.latencyGoodStreak = healthy ? this.latencyGoodStreak + 1 : 0;
+    let next = this.latencyGuardCapBps;
+    if (this.latencyBadStreak >= LATENCY_GUARD.STEP_DOWN_SAMPLES && bitrateBps > 0) {
+      const base = next === null ? bitrateBps : Math.min(next, bitrateBps);
+      next = Math.max(LATENCY_GUARD.MIN_BPS, Math.round(base * LATENCY_GUARD.STEP_DOWN_FACTOR));
+      this.latencyBadStreak = 0;
+    } else if (next !== null && this.latencyGoodStreak >= LATENCY_GUARD.STEP_UP_SAMPLES) {
+      const raised = Math.round(next * LATENCY_GUARD.STEP_UP_FACTOR);
+      next = raised >= LATENCY_GUARD.MAX_BPS ? null : raised;
+      this.latencyGoodStreak = 0;
+    }
+    if (next !== this.latencyGuardCapBps) {
+      this.latencyGuardCapBps = next;
+      this.flushQualityPreference();
+    }
+  }
+
+  private flushQualityPreference(): void {
+    const preference = this.effectiveQualityPreference();
+    if (!preference || !this.snapshot.qualityPreferenceSupported || !isOpen(this.controlChannel)) return;
+    const key = JSON.stringify(preference);
+    if (key === this.sentQualityPreferenceKey) return;
+    if (this.sendControl({
+      type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
+      ...this.inputBase(),
+      kind: REMOTE_DESKTOP_CONTROL_KIND.SET_QUALITY_PREFERENCE,
+      maxHeight: preference.maxHeight,
+      maxFps: preference.maxFps,
+      maxBitrateBps: preference.maxBitrateBps,
+      priority: preference.priority,
+    })) {
+      this.sentQualityPreferenceKey = key;
+    }
   }
 
   /**
@@ -971,6 +1085,7 @@ export class RemoteDesktopClient {
       if (this.statsTimer) clearInterval(this.statsTimer);
       this.statsTimer = null;
       this.previousInboundStats = null;
+      this.previousJitterBuffer = null;
       this.lastMediaBytesReceived = null;
       this.lastMediaProgressAt = null;
       this.mediaStarted = false;
@@ -1022,6 +1137,7 @@ export class RemoteDesktopClient {
     if (message.type === REMOTE_DESKTOP_MSG.AUTHORIZED) {
       if (this.sessionId || !validateRemoteDesktopAuthorized(message).ok) return;
       this.authorized = message;
+      this.publish({ relayBitrateCapBps: message.relayBitrateCapBps });
       await this.preparePeer(message);
       return;
     }
@@ -1134,12 +1250,14 @@ export class RemoteDesktopClient {
           && this.workerInputEnabled
           && message.mode === REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
         atomicButtonClick: message.atomicButtonClick === true,
+        qualityPreferenceSupported: message.qualityPreference === true,
         viewerCount: message.viewerCount,
         controllerCount: message.controllerCount,
         signInScreen: message.signInScreen === true,
         unlockAvailable: message.unlockAvailable === true,
         inputBlocked: message.inputBlocked,
       });
+      this.flushQualityPreference();
       if (message.inputBlocked === REMOTE_DESKTOP_INPUT_BLOCKED.AWAITING_FRAME
         && !this.pendingPresentedFrame) {
         // The node is waiting for a frame of the current layout and this client
@@ -1477,6 +1595,9 @@ export class RemoteDesktopClient {
     this.channelsReady = isOpen(this.controlChannel)
       && isOpen(this.keyboardChannel)
       && isOpen(this.pointerChannel);
+    // A reopened channel is a new worker session: it has no preference yet.
+    if (!isOpen(this.controlChannel)) this.sentQualityPreferenceKey = null;
+    else this.flushQualityPreference();
     if (this.channelsReady && !this.dataKeepaliveTimer) {
       this.dataKeepaliveTimer = setInterval(() => {
         if (!this.channelsReady || this.stopped) return;
@@ -1631,6 +1752,19 @@ export class RemoteDesktopClient {
           ));
         }
         this.previousInboundStats = { bytes: inbound.bytesReceived, timestamp: inbound.timestamp };
+        // Average time a frame waited in the playback buffer this interval.
+        let jitterBufferMs: number | undefined;
+        if (typeof inbound.jitterBufferDelay === 'number' && Number.isFinite(inbound.jitterBufferDelay)
+          && typeof inbound.jitterBufferEmittedCount === 'number' && Number.isFinite(inbound.jitterBufferEmittedCount)) {
+          const previousBuffer = this.previousJitterBuffer;
+          if (previousBuffer && inbound.jitterBufferEmittedCount > previousBuffer.emitted
+            && inbound.jitterBufferDelay >= previousBuffer.delay) {
+            jitterBufferMs = ((inbound.jitterBufferDelay - previousBuffer.delay)
+              / (inbound.jitterBufferEmittedCount - previousBuffer.emitted)) * 1_000;
+          }
+          this.previousJitterBuffer = { delay: inbound.jitterBufferDelay, emitted: inbound.jitterBufferEmittedCount };
+        }
+        if (visible && this.mediaStarted) this.observeLatency(rttMs, jitterBufferMs, bitrateBps);
       }
       this.publish({
         pointerMovesSent: this.pointerMovesSent,
@@ -1996,6 +2130,7 @@ export class RemoteDesktopClient {
     this.dataKeepaliveTimer = null;
     this.clearDisconnectTimer();
     this.previousInboundStats = null;
+    this.previousJitterBuffer = null;
     this.lastMediaBytesReceived = null;
     this.lastMediaProgressAt = null;
     this.clearInputAck();

@@ -690,7 +690,7 @@ describe('windows remote-desktop privacy dispatcher', () => {
   it('uses an independent route generation and never daemon generation for privacy ACK', () => {
     expect(protocolHeader).toContain('std::optional<std::int64_t> route_generation;');
     expect(protocol).toContain('root.isMember("routeGeneration")');
-    expect(protocol).toContain('{"routeGeneration", "reconnectAttempt"}');
+    expect(protocol).toContain('{"routeGeneration", "reconnectAttempt", "relayBitrateCapBps"}');
     expect(protocol).toContain('{"routeGeneration"})');
     expect(peerSession).toContain('renewal.route_generation != authority_.route_generation');
     expect(worker).toContain('route.route_generation = *session->authority().route_generation;');

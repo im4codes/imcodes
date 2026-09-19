@@ -97,6 +97,8 @@ struct RouteAuthority {
   std::int64_t lease_expires_at_unix_ms = 0;
   TransportSessionMode mode = TransportSessionMode::kView;
   std::uint64_t input_epoch = 0;
+  // Operator ceiling for relayed video (from PREPARE); 0 = none.
+  std::uint32_t relay_bitrate_cap_bps = 0;
 
   [[nodiscard]] bool IsValid(const TransportTime& now,
                              std::int64_t maximum_future_ms) const noexcept;
@@ -203,6 +205,9 @@ class TransportSessionCore final {
                        TransportPath path);
   bool UpdateQualityTarget(const TransportCallbackStamp& callback_stamp,
                            const QualityTarget& target);
+  // This viewer's quality preference (set_quality_preference). Re-selects at
+  // once against the last target so the change is visible immediately.
+  bool SetQualityPreference(const imcodes::rd::QualityPreference& preference);
   bool RecordActivity(const RouteAuthorityIdentity& identity,
                       TransportTime now);
   bool RecordMediaProgress(const TransportCallbackStamp& callback_stamp,
@@ -250,6 +255,7 @@ class TransportSessionCore final {
   bool CandidateIsValid(const IceCandidate& candidate) const noexcept;
   bool FlushRemoteIce();
   bool FlushLocalIce();
+  bool ApplyQualityTarget(const QualityTarget& target);
   bool QualitySelectionIsValid(
       const QualitySelection& selection) const noexcept;
   bool ObserveTime(TransportTime now) noexcept;
@@ -272,6 +278,8 @@ class TransportSessionCore final {
   std::deque<IceCandidate> pending_remote_ice_;
   std::deque<IceCandidate> pending_local_ice_;
   std::optional<QualitySelection> quality_;
+  imcodes::rd::QualityPreference viewer_preference_{};
+  std::optional<QualityTarget> last_quality_target_;
   PeerConnectionState peer_state_ = PeerConnectionState::kNew;
   TransportPath path_ = TransportPath::kUnknown;
   std::int64_t last_observed_monotonic_ms_ = 0;

@@ -105,6 +105,7 @@ import {
   REMOTE_DESKTOP_ADAPTER_CAPABILITIES,
   REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY,
   REMOTE_DESKTOP_DEFAULT_SHIELDED_ROUTE_CAPABILITY,
+  REMOTE_DESKTOP_RELAY_CAP_CAPABILITY,
   REMOTE_DESKTOP_CONSENT_MSG,
   REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY,
   REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
@@ -997,6 +998,8 @@ export function createControlledNodeRuntime(
         ? [
           ...workerSessionCapabilities,
           ...(remoteDesktopAutoUnlockAvailable ? [CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY] : []),
+          // Workers shipped with this node accept PREPARE's relay ceiling.
+          REMOTE_DESKTOP_RELAY_CAP_CAPABILITY,
         ]
         : permissionRequiredCapabilities),
       ...(missingRemoteDesktopWorkerCanRepair ? [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY] : []),

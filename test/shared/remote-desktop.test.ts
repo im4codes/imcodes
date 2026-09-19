@@ -18,12 +18,15 @@ import {
   REMOTE_DESKTOP_MODE_REASON,
   REMOTE_DESKTOP_POINTER_KIND,
   REMOTE_DESKTOP_PROTOCOL_VERSION,
+  REMOTE_DESKTOP_QUALITY_MODE,
+  REMOTE_DESKTOP_QUALITY_MODE_PREFERENCES,
   REMOTE_DESKTOP_QUALITY_PRESET,
   REMOTE_DESKTOP_STATE,
   REMOTE_DESKTOP_STOP_ORIGIN,
   REMOTE_DESKTOP_TERMINAL_REASON,
   isRemoteDesktopSequenceAccepted,
   hasRemoteDesktopIndependentRouteGeneration,
+  isRemoteDesktopQualityPreference,
   isRemoteDesktopDaemonMessageType,
   isRemoteDesktopPresentedFrameCompatible,
   mapRemoteDesktopPointToPhysicalPixels,
@@ -144,7 +147,7 @@ describe('remote desktop production contract', () => {
       KEYBOARD: 'imcodes-rd-keyboard',
       POINTER: 'imcodes-rd-pointer',
     });
-    expect(WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.qualityLadder).toHaveLength(9);
+    expect(WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.qualityLadder).toHaveLength(16);
     expect(WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.qualityLadder[0]).toMatchObject({
       id: '2160p30', width: 3840, height: 2160, fps: 30,
     });
@@ -459,6 +462,69 @@ describe('remote desktop production contract', () => {
         { width: 1024 + index, height: 768 }
       )),
     ))).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+  });
+
+  it('accepts a viewer quality preference only as a bounded, bare control command', () => {
+    const request = {
+      type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
+      ...inputBase,
+      sequence: 32,
+      kind: REMOTE_DESKTOP_CONTROL_KIND.SET_QUALITY_PREFERENCE,
+      maxHeight: 1080,
+      maxFps: 60,
+      maxBitrateBps: 0,
+      priority: 'framerate',
+    };
+    expect(validateRemoteDesktopDataMessage(request)).toMatchObject({ ok: true });
+    for (const bad of [
+      { maxHeight: 900 },
+      { maxFps: 45 },
+      { maxBitrateBps: 100_000 },
+      { maxBitrateBps: 20_000_000 },
+      { priority: 'fastest' },
+      { displayId: 'display-primary' },
+    ]) {
+      expect(validateRemoteDesktopDataMessage({ ...request, ...bad }))
+        .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+    }
+    const { maxFps: _omitted, ...missingFps } = request;
+    expect(validateRemoteDesktopDataMessage(missingFps))
+      .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+    // Quality fields never ride along on another command.
+    expect(validateRemoteDesktopDataMessage({
+      type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
+      ...inputBase,
+      sequence: 33,
+      kind: REMOTE_DESKTOP_CONTROL_KIND.UNLOCK,
+      maxFps: 30,
+    })).toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+    // Every quick mode is itself a valid preference.
+    for (const mode of Object.values(REMOTE_DESKTOP_QUALITY_MODE)) {
+      if (mode === REMOTE_DESKTOP_QUALITY_MODE.CUSTOM) continue;
+      expect(isRemoteDesktopQualityPreference(REMOTE_DESKTOP_QUALITY_MODE_PREFERENCES[mode])).toBe(true);
+    }
+  });
+
+  it('carries a relay bitrate cap on authority only within the ladder bounds', () => {
+    const authorized = {
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      requestId: '11111111-1111-4111-8111-111111111111',
+      sessionId: 'session_12345678',
+      capability: 'a'.repeat(43),
+      expiresAt: 60_000,
+      leaseExpiresAt: 15_000,
+      daemonGeneration: 1,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      iceServers: ['stun:stun.example.test:3478'],
+    };
+    expect(validateRemoteDesktopAuthorized(authorized)).toMatchObject({ ok: true });
+    expect(validateRemoteDesktopAuthorized({ ...authorized, relayBitrateCapBps: 500_000 }))
+      .toMatchObject({ ok: true });
+    expect(validateRemoteDesktopAuthorized({ ...authorized, relayBitrateCapBps: 100_000 }))
+      .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
+    expect(validateRemoteDesktopAuthorized({ ...authorized, relayBitrateCapBps: 1.5 }))
+      .toEqual({ ok: false, error: REMOTE_DESKTOP_ERROR.INVALID_REQUEST });
   });
 
   it('accepts any bounded resolution request, since the node owns the list', () => {

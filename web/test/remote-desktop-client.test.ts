@@ -1388,6 +1388,109 @@ describe('RemoteDesktopClient', () => {
     client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
   });
 
+  it('sends this viewer\'s quality preference only to a capable worker and eases the bitrate off when the picture lags', async () => {
+    const intervalSpy = vi.spyOn(globalThis, 'setInterval');
+    let socket!: FakeSocket;
+    let peer!: FakePeer;
+    let now = 0;
+    const client = new RemoteDesktopClient('controlled-linux', { onSnapshot: vi.fn() }, {
+      fetchTicket: async () => 'ticket-quality',
+      createSocket: () => {
+        socket = new FakeSocket();
+        queueMicrotask(() => socket.open());
+        return socket as unknown as WebSocket;
+      },
+      createPeer: () => {
+        peer = new FakePeer();
+        return peer as unknown as RTCPeerConnection;
+      },
+      now: () => now,
+      isDocumentVisible: () => true,
+    });
+    const smooth = { maxHeight: 1080, maxFps: 30, maxBitrateBps: 0, priority: 'framerate' } as const;
+    expect(client.setQualityPreference(smooth)).toBe(true);
+    expect(client.setQualityPreference({ ...smooth, maxFps: 45 } as never)).toBe(false);
+
+    await client.start();
+    const start = JSON.parse(socket.sent[0]!) as { requestId: string };
+    const authority = { requestId: start.requestId, sessionId: 'session_quality1', capability: 'q'.repeat(43) };
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      ...authority,
+      expiresAt: 60_000,
+      leaseExpiresAt: 15_000,
+      daemonGeneration: 1,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      iceServers: [],
+      relayBitrateCapBps: 500_000,
+    });
+    await vi.waitFor(() => expect(peer).toBeDefined());
+    expect(client.current().relayBitrateCapBps).toBe(500_000);
+    const control = peer.channels.get(REMOTE_DESKTOP_CHANNEL.CONTROL)!;
+    control.open();
+    const qualityControls = () => control.sent
+      .map((raw) => JSON.parse(raw) as Record<string, unknown>)
+      .filter((message) => message.kind === REMOTE_DESKTOP_CONTROL_KIND.SET_QUALITY_PREFERENCE);
+
+    // An older worker never advertised support: nothing may reach it.
+    const status = {
+      type: REMOTE_DESKTOP_MSG.STATUS,
+      ...authority,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      state: REMOTE_DESKTOP_STATE.RELAYED,
+      route: 'relay',
+      inputEnabled: false,
+    };
+    socket.receive(status);
+    await vi.waitFor(() => expect(client.current().qualityPreferenceSupported).toBe(false));
+    expect(qualityControls()).toHaveLength(0);
+
+    socket.receive({ ...status, qualityPreference: true });
+    await vi.waitFor(() => expect(qualityControls()).toHaveLength(1));
+    expect(qualityControls()[0]).toMatchObject({
+      type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
+      maxHeight: 1080, maxFps: 30, maxBitrateBps: 0, priority: 'framerate',
+    });
+    // Repeated status frames do not resend an unchanged preference.
+    socket.receive({ ...status, qualityPreference: true });
+    expect(qualityControls()).toHaveLength(1);
+
+    peer.connect();
+    const statsTick = intervalSpy.mock.calls.find((call) => call[1] === 1_000)?.[0] as (() => void);
+    expect(statsTick).toBeTypeOf('function');
+    // 2 Mbps arriving, but every frame waits 400 ms in the jitter buffer.
+    const sample = async (i: number, bufferPerFrameS: number) => {
+      now = i * 1_000;
+      peer.stats = [
+        {
+          type: 'inbound-rtp', kind: 'video', bytesReceived: i * 250_000, timestamp: now,
+          frameWidth: 1920, frameHeight: 1080, framesPerSecond: 30,
+          jitterBufferDelay: i * 30 * bufferPerFrameS, jitterBufferEmittedCount: i * 30,
+        },
+        { type: 'candidate-pair', state: 'succeeded', nominated: true, currentRoundTripTime: 0.02 },
+      ];
+      statsTick();
+      // Stats collection is asynchronous; let each sample land in order.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    };
+    for (let i = 1; i <= 6; i += 1) await sample(i, 0.4);
+    await vi.waitFor(() => expect(qualityControls().length).toBeGreaterThanOrEqual(2));
+    const eased = qualityControls()[1]!;
+    expect(eased.maxBitrateBps).toBe(1_200_000);
+    expect(eased).toMatchObject({ maxHeight: 1080, maxFps: 30, priority: 'framerate' });
+
+    // A hand-tuned custom preference is respected as is: no guard ceiling.
+    const custom = { maxHeight: 1440, maxFps: 60, maxBitrateBps: 8_000_000, priority: 'resolution' } as const;
+    expect(client.setQualityPreference(custom, { latencyGuard: false })).toBe(true);
+    expect(qualityControls().at(-1)).toMatchObject(custom);
+    const sentAfterCustom = qualityControls().length;
+    for (let i = 7; i <= 12; i += 1) await sample(i, 0.4);
+    expect(qualityControls()).toHaveLength(sentAfterCustom);
+    client.stop();
+  });
+
   it('measures resolution, FPS, bitrate and round trip in the browser when the worker reports no quality', async () => {
     // macOS and Linux workers send no QUALITY frames; the footer must still show
     // speed, frame rate and latency, measured from the browser's own stats.
