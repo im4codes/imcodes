@@ -2415,6 +2415,31 @@ describe('WsBridge', () => {
       expect(owner.sentStrings.some((s) => s.includes('invalid_request'))).toBe(false);
     });
 
+    it('relays the daemon\'s install progress to its browsers', async () => {
+      // The router dropped these as malformed signalling, so a browser never
+      // learned how an install it asked for went.
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      const db = makeDb('valid-hash', 'full', null, 'owner-user');
+      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      const owner = new MockWs();
+      bridge.handleBrowserConnection(owner as never, 'owner-user', db);
+      const reports = [
+        { type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.STATE, state: 'failed', error: 'admin_required' },
+        { type: REMOTE_DESKTOP_INSTALL_MSG.STATE, state: 'downloading' },
+      ];
+      for (const report of reports) daemonWs.emit('message', JSON.stringify(report));
+      daemonWs.emit('message', JSON.stringify({ type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.STATE, state: 'made_up' }));
+      await flushAsync();
+      const relayed = owner.sentStrings
+        .map((frame) => JSON.parse(frame) as { type?: string })
+        .filter((frame) => frame.type === REMOTE_DESKTOP_LOGIN_SCREEN_MSG.STATE
+          || frame.type === REMOTE_DESKTOP_INSTALL_MSG.STATE);
+      expect(relayed).toEqual(reports);
+    });
+
     it('never queues an install for a daemon that is not connected', async () => {
       const bridge = WsBridge.get(serverId);
       const db = makeDb('valid-hash', 'full', null, 'owner-user');

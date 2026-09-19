@@ -188,8 +188,12 @@ import {
   REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY,
   REMOTE_DESKTOP_INSTALL_MSG,
   REMOTE_DESKTOP_PERMISSION_MSG,
+  validateRemoteDesktopInstallStateMessage,
 } from '../../../shared/remote-desktop-install.js';
-import { REMOTE_DESKTOP_LOGIN_SCREEN_MSG } from '../../../shared/remote-desktop-login-screen.js';
+import {
+  REMOTE_DESKTOP_LOGIN_SCREEN_MSG,
+  validateRemoteDesktopLoginScreenStateMessage,
+} from '../../../shared/remote-desktop-login-screen.js';
 import {
   CONTROLLED_NODE_OS_WIN,
   isControlledNodeArch,
@@ -4797,6 +4801,18 @@ export class WsBridge {
       // admitted through its exact validator/session/generation registry before
       // the legacy allowlist. The router consumes the entire namespace, including
       // malformed frames, so none can fall through to generic browser relay.
+      // A daemon's reports on installs on its own computer share the namespace
+      // with signalling but are not signalling: the router below dropped them,
+      // so an install's progress and outcome never reached the browser that
+      // asked for it. Validated, then relayed to this daemon's browsers.
+      if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED) {
+        const installState = validateRemoteDesktopInstallStateMessage(msg)
+          ?? validateRemoteDesktopLoginScreenStateMessage(msg);
+        if (installState) {
+          this.broadcastToBrowsers(JSON.stringify(installState));
+          return;
+        }
+      }
       if (this.remoteDesktopRouter.handleDaemon(msg, connectionGeneration)) {
         return;
       }
