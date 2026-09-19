@@ -1336,7 +1336,40 @@ describe('useTimeline global cache bounds', () => {
     expect(snapshot.map((event) => event.eventId)).toEqual(conversation.map((event) => event.eventId));
   });
 
-  it('bounds each synchronous snapshot so one window cannot monopolize localStorage', async () => {
+  it('gives recent text priority over newer tool details within the synchronous snapshot budget', async () => {
+    vi.useFakeTimers();
+    const sessionName = `deck_snapshot_text_priority_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    const cacheKey = `${serverId}:${sessionName}`;
+    const snapshotKey = `rcc_timeline_snapshot:${cacheKey}`;
+    const textEvents = makeEvents(sessionName, 8).map((event, index) => ({
+      ...event,
+      payload: { text: `${index}:${'t'.repeat(40_000)}` },
+    }));
+    const toolEvents: TimelineEvent[] = Array.from({ length: 8 }, (_, index) => ({
+      eventId: `${sessionName}-tool-${index}`,
+      sessionId: sessionName,
+      ts: 100 + index,
+      epoch: 1,
+      seq: 100 + index,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'tool.result',
+      payload: { output: `${index}:${'x'.repeat(40_000)}` },
+    }));
+
+    __setTimelineCacheForTests(cacheKey, [...textEvents, ...toolEvents]);
+    await act(async () => { await vi.advanceTimersByTimeAsync(750); });
+
+    const stored = localStorage.getItem(snapshotKey);
+    expect(stored).toBeTruthy();
+    expect(new TextEncoder().encode(stored!).byteLength).toBeLessThanOrEqual(512 * 1024);
+    const snapshot = JSON.parse(stored!) as TimelineEvent[];
+    expect(snapshot.filter((event) => event.type === 'assistant.text')).toHaveLength(textEvents.length);
+    expect(snapshot.filter((event) => event.type === 'tool.result').length).toBeLessThan(toolEvents.length);
+  });
+
+  it('bounds each synchronous snapshot to 512 KiB so one window cannot monopolize localStorage', async () => {
     vi.useFakeTimers();
     const sessionName = `deck_snapshot_budget_${Date.now()}`;
     const serverId = `srv-${Date.now()}`;
@@ -1352,7 +1385,7 @@ describe('useTimeline global cache bounds', () => {
 
     const stored = localStorage.getItem(snapshotKey);
     expect(stored).toBeTruthy();
-    expect(stored!.length).toBeLessThanOrEqual(128 * 1024);
+    expect(new TextEncoder().encode(stored!).byteLength).toBeLessThanOrEqual(512 * 1024);
     const snapshot = JSON.parse(stored!) as TimelineEvent[];
     expect(snapshot.length).toBeGreaterThan(0);
     expect(snapshot.at(-1)?.eventId).toBe(events.at(-1)?.eventId);

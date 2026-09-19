@@ -89,7 +89,7 @@ import {
 } from '../../../src/shared/timeline/merge.js';
 import { TIMELINE_HISTORY_CONTENT_TYPES } from '../../../src/shared/timeline/types.js';
 import { fetchTimelineHistoryHttp, sendSessionViaHttp } from '../api.js';
-import { MESSAGE_PIN_LIMITS } from '@shared/message-pins.js';
+import { MESSAGE_PIN_EVENT_TYPES, MESSAGE_PIN_LIMITS } from '@shared/message-pins.js';
 import { SESSION_SEND_DELIVERY_MODES } from '@shared/session-send-delivery.js';
 import { runNewestWindowBackfill } from '../timeline/catchup/backfill-pager.js';
 import { buildTransportPendingSyncPatch, normalizeTransportPendingEntries } from '../transport-queue.js';
@@ -522,13 +522,14 @@ const TIMELINE_SNAPSHOT_WRITE_DELAY_MS = 750;
 // in IDB, so a later page refresh restores it — not only the localStorage mat.
 const STREAMING_IDLE_PERSIST_MS = 2000;
 const TERMINAL_TAIL_IDLE_RECONCILE_MS = 5000;
-// Keep the same row coverage as the in-memory first window, but bound the
-// serialized size too. A few large tool results can otherwise consume most of
-// the origin's localStorage quota and evict every other window's synchronous
-// seed. IndexedDB remains the full local-history store; this snapshot is only
-// the highest-priority, synchronous first paint while IDB/network catch up.
-const MAX_PERSISTED_SNAPSHOT_EVENTS = 300;
-const MAX_PERSISTED_SNAPSHOT_CHARS = 128 * 1024;
+// Text and tool-detail events have separate row budgets. Tool traffic is often
+// much denser than conversation, so one command with hundreds of calls must not
+// push recent user/assistant text out before byte-budget selection even starts.
+// IndexedDB remains the full local-history store; this 512 KiB snapshot is the
+// highest-priority synchronous first paint while IDB/network catch up.
+const MAX_PERSISTED_SNAPSHOT_EVENTS_PER_CLASS = 300;
+const MAX_PERSISTED_SNAPSHOT_BYTES = 512 * 1024;
+const timelineSnapshotTextEncoder = new TextEncoder();
 
 /**
  * How much history each session keeps in IndexedDB.
@@ -931,32 +932,56 @@ function getPersistableTimelineTail(
     // Keep rows that definitely paint plus tool-detail rows the user may have
     // enabled. Last-value status/usage/terminal signals belong in IndexedDB,
     // not in the scarce synchronous cache: normal idle signals can otherwise
-    // crowd every conversation row out of the 300-event first-paint window.
+    // crowd conversation rows out before the per-class tail is selected.
     return isGuaranteedVisibleTimelineEvent(event)
       || TIMELINE_PREFERENCE_DEPENDENT_TYPES.includes(event.type);
   });
-  return persistable.length > MAX_PERSISTED_SNAPSHOT_EVENTS
-    ? persistable.slice(persistable.length - MAX_PERSISTED_SNAPSHOT_EVENTS)
-    : persistable;
+  const textTail = persistable
+    .filter(isTimelineSnapshotTextEvent)
+    .slice(-MAX_PERSISTED_SNAPSHOT_EVENTS_PER_CLASS);
+  const detailTail = persistable
+    .filter((event) => !isTimelineSnapshotTextEvent(event))
+    .slice(-MAX_PERSISTED_SNAPSHOT_EVENTS_PER_CLASS);
+  const retained = new Set([...textTail, ...detailTail]);
+  return persistable.filter((event) => retained.has(event));
+}
+
+function isTimelineSnapshotTextEvent(event: TimelineEvent): boolean {
+  return event.type === MESSAGE_PIN_EVENT_TYPES.USER
+    || event.type === MESSAGE_PIN_EVENT_TYPES.ASSISTANT;
 }
 
 function serializeTimelineSnapshotTail(tail: TimelineEvent[]): string {
   if (tail.length === 0) return '[]';
 
-  // Select newest-first so a single oversized historical tool payload cannot
-  // displace the current conversation. Oversized individual rows are skipped;
-  // their complete payload is still retained in IndexedDB and daemon history.
-  const selected: string[] = [];
-  let serializedChars = 2; // []
-  for (let index = tail.length - 1; index >= 0; index -= 1) {
-    const serializedEvent = JSON.stringify(tail[index]);
-    const addedChars = serializedEvent.length + (selected.length > 0 ? 1 : 0);
-    if (serializedChars + addedChars > MAX_PERSISTED_SNAPSHOT_CHARS) continue;
-    selected.push(serializedEvent);
-    serializedChars += addedChars;
-  }
-  selected.reverse();
-  return `[${selected.join(',')}]`;
+  const serialized = tail.map((event, index) => ({
+    index,
+    event,
+    value: JSON.stringify(event),
+  }));
+  const selected = new Map<number, string>();
+  let serializedBytes = 2; // []
+  const selectNewest = (candidates: typeof serialized): void => {
+    for (let index = candidates.length - 1; index >= 0; index -= 1) {
+      const candidate = candidates[index]!;
+      const valueBytes = timelineSnapshotTextEncoder.encode(candidate.value).byteLength;
+      const addedBytes = valueBytes + (selected.size > 0 ? 1 : 0);
+      if (serializedBytes + addedBytes > MAX_PERSISTED_SNAPSHOT_BYTES) continue;
+      selected.set(candidate.index, candidate.value);
+      serializedBytes += addedBytes;
+    }
+  };
+
+  // Conversation text gets first claim on the budget, newest first. Tool rows
+  // are already distinct timeline events, so they use only the remaining room
+  // instead of displacing the text the user needs to see immediately.
+  selectNewest(serialized.filter(({ event }) => isTimelineSnapshotTextEvent(event)));
+  selectNewest(serialized.filter(({ event }) => !isTimelineSnapshotTextEvent(event)));
+
+  const ordered = [...selected.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([, value]) => value);
+  return `[${ordered.join(',')}]`;
 }
 
 function areTimelineSnapshotTailsSame(left: TimelineEvent[] | undefined, right: TimelineEvent[]): boolean {
