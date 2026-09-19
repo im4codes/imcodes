@@ -18,6 +18,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { readMacosRemoteDesktopCodeIdentity } from './macos-remote-desktop-build.mjs';
+
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 /** Must match `MACOS_AIDESK_APP_NAME` / `MACOS_AIDESK_BUNDLE_ID` in src/node/macos-computer-use.ts. */
@@ -148,14 +150,43 @@ export function copyComputerUseLicense(outPath) {
   cpSync(source, outPath);
 }
 
+/**
+ * The macOS release the bundle -- its Info.plist and its code -- must run on:
+ * the remote-desktop components' declared floor, so one bundle cannot claim
+ * support the helpers inside it lack, nor lack support they have.
+ */
+export async function resolveAideskMinimumSystemVersion(requested) {
+  const version = requested ?? (await readMacosRemoteDesktopCodeIdentity()).minimumMacosVersion;
+  if (!/^\d+(\.\d+)*$/u.test(String(version ?? ''))) {
+    throw new Error('aiDesk requires a numeric minimum system version');
+  }
+  return String(version);
+}
+
+/**
+ * The minimum OS a Mach-O slice announces, read back from its load commands:
+ * a flag on the command line is not evidence the binary carries it.
+ */
+export function machoMinimumSystemVersion(path) {
+  const match = /^\s*minos\s+(\S+)\s*$/mu.exec(sh('/usr/bin/otool', ['-l', path]));
+  return match ? match[1] : null;
+}
+
 /** Compile the agent for one architecture. */
-function compileAgentSlice(arch, outPath) {
+function compileAgentSlice(arch, outPath, minimumSystemVersion) {
   const source = join(root, 'native', 'macos-remote-desktop');
   sh('clang++', [
     '-std=c++20',
     '-fobjc-arc',
     '-O2',
     '-arch', arch,
+    // Without it clang targets the build machine's SDK: the agent announced
+    // macOS 15 while Info.plist said 12.3, so LaunchServices refused to start
+    // it on every older Mac (kLSIncompatibleSystemVersionErr) and remote
+    // desktop could never become ready there.
+    `-mmacosx-version-min=${minimumSystemVersion}`,
+    // Anything newer than the floor has to sit behind an availability check.
+    '-Werror=unguarded-availability-new',
     `-I${source}`,
     join(source, 'aidesk_agent_main.mm'),
     join(source, 'macos_permission_onboarding.mm'),
@@ -167,15 +198,24 @@ function compileAgentSlice(arch, outPath) {
     '-framework', 'Security',
     '-o', outPath,
   ]);
+  const announced = machoMinimumSystemVersion(outPath);
+  if (announced !== minimumSystemVersion) {
+    throw new Error(
+      `aidesk-agent ${arch} announces minos ${announced}, expected ${minimumSystemVersion}`,
+    );
+  }
 }
 
 /** Build the Universal 2 `aidesk-agent`. */
-export function buildAideskAgent(outPath) {
+export function buildAideskAgent(outPath, minimumSystemVersion) {
+  if (!/^\d+(\.\d+)*$/u.test(String(minimumSystemVersion ?? ''))) {
+    throw new Error('aidesk-agent requires a numeric minimum system version');
+  }
   const work = mkdtempSync(join(tmpdir(), 'imcodes-aidesk-agent-'));
   try {
     const slices = AIDESK_ARCHITECTURES.map((arch) => {
       const slicePath = join(work, `aidesk-agent-${arch}`);
-      compileAgentSlice(arch, slicePath);
+      compileAgentSlice(arch, slicePath, minimumSystemVersion);
       return slicePath;
     });
     mkdirSync(dirname(outPath), { recursive: true });
@@ -323,8 +363,9 @@ export function signAideskDmg(dmgPath, options = {}) {
   sh('/usr/bin/codesign', ['--verify', '--strict', '--verbose=2', dmgPath]);
 }
 
-export function buildAideskApp(input) {
-  const { outDir, computerUseArchive, version, minimumSystemVersion = '12.3' } = input;
+export async function buildAideskApp(input) {
+  const { outDir, computerUseArchive, version } = input;
+  const minimumSystemVersion = await resolveAideskMinimumSystemVersion(input.minimumSystemVersion);
   const bundlePath = join(outDir, AIDESK_APP_NAME);
   rmSync(bundlePath, { recursive: true, force: true });
   const macos = join(bundlePath, 'Contents', 'MacOS');
@@ -335,7 +376,7 @@ export function buildAideskApp(input) {
     join(bundlePath, 'Contents', 'Info.plist'),
     buildAideskInfoPlist({ version, minimumSystemVersion }),
   );
-  buildAideskAgent(join(macos, AIDESK_MAIN_EXECUTABLE));
+  buildAideskAgent(join(macos, AIDESK_MAIN_EXECUTABLE), minimumSystemVersion);
   // Into Helpers, which is where the dispatcher looks.
   extractComputerUseExecutable(computerUseArchive, join(helpers, AIDESK_COMPUTER_USE_EXECUTABLE));
   copyComputerUseLicense(join(bundlePath, 'Contents', 'Resources', AIDESK_THIRD_PARTY_LICENSE));
@@ -369,7 +410,7 @@ if (process.argv[1] && process.argv[1].endsWith('build-aidesk-app.mjs')) {
   } else {
     const archive = args[1]
       ?? join(root, 'dist-node-exe', 'computer-use-helper', 'darwin-universal', 'open-computer-use.app.zip');
-    const built = buildAideskApp({ outDir, computerUseArchive: archive, version });
+    const built = await buildAideskApp({ outDir, computerUseArchive: archive, version });
     process.stdout.write(`${built}\n`);
   }
 }

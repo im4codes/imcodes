@@ -1,4 +1,7 @@
-import { readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -9,7 +12,10 @@ import {
   AIDESK_THIRD_PARTY_LICENSE,
   AIDESK_MAIN_EXECUTABLE,
   aideskSigningOrder,
+  buildAideskAgent,
   buildAideskInfoPlist,
+  machoMinimumSystemVersion,
+  resolveAideskMinimumSystemVersion,
 } from '../../scripts/build-aidesk-app.mjs';
 import { macosArtifactSupportsStapling } from '../../scripts/macos-release-signing.mjs';
 
@@ -87,6 +93,35 @@ describe('aiDesk application bundle', () => {
     // would fail on half the fleet at launch.
     expect([...AIDESK_ARCHITECTURES]).toEqual(['arm64', 'x86_64']);
   });
+
+  it('takes its macOS floor from the remote-desktop components', async () => {
+    const identity = JSON.parse(
+      readFileSync('native/macos-remote-desktop/code-identity.json', 'utf8'),
+    ) as { minimumMacosVersion: string };
+    await expect(resolveAideskMinimumSystemVersion()).resolves.toBe(identity.minimumMacosVersion);
+    await expect(resolveAideskMinimumSystemVersion('13.0')).resolves.toBe('13.0');
+    await expect(resolveAideskMinimumSystemVersion('latest')).rejects.toThrow();
+  });
+
+  it('builds the agent for the macOS floor it declares, on both architectures', async () => {
+    // Node pro.koca.win (macOS 12.7.6): the agent was built without a
+    // deployment target, announced macOS 15 while Info.plist said 12.3, and
+    // LaunchServices refused to start it -- remote desktop never became ready.
+    if (process.platform !== 'darwin') return;
+    const floor = await resolveAideskMinimumSystemVersion();
+    const directory = mkdtempSync(join(tmpdir(), 'imcodes-aidesk-agent-test-'));
+    try {
+      const agent = join(directory, AIDESK_MAIN_EXECUTABLE);
+      buildAideskAgent(agent, floor);
+      for (const arch of AIDESK_ARCHITECTURES) {
+        const slice = join(directory, `slice-${arch}`);
+        execFileSync('lipo', [agent, '-thin', arch, '-output', slice]);
+        expect(machoMinimumSystemVersion(slice), arch).toBe(floor);
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }, 120_000);
 
   it('carries the Computer Use executable, never the upstream bundle', () => {
     const source = readFileSync('scripts/build-aidesk-app.mjs', 'utf8');

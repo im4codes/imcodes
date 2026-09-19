@@ -315,7 +315,7 @@ async function main() {
   if (platform === 'darwin' && process.env.IMCODES_MACOS_SIGNING_IDENTITY?.trim()) {
     const { buildAideskApp, publishAideskHelperSidecar, AIDESK_APP_NAME } =
       await import('./build-aidesk-app.mjs');
-    const appPath = buildAideskApp({
+    const appPath = await buildAideskApp({
       outDir: buildDir,
       computerUseArchive: helperPath,
       version: buildVersion,
