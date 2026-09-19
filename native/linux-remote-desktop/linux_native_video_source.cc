@@ -139,13 +139,13 @@ class SharedCaptureMultiplexer {
  public:
   bool Subscribe(CaptureAdapter& capture, const DisplayTopology& display,
                  std::uint64_t id, common::CapturedFrameSink sink) {
-    bool need_start = false;
+    // Serialises start/stop against each other, never against Fanout().
+    std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
     {
       std::lock_guard<std::mutex> lock(mutex_);
       sinks_[id] = std::move(sink);
-      need_start = !started_;
     }
-    if (!need_start) return true;
+    if (started_) return true;
     // capture.Start() delivers its first frame SYNCHRONOUSLY (X11CaptureAdapter
     // ::Start() calls sink() before returning, deliberately, so a caller learns
     // immediately whether capture actually works) -- and that sink is Fanout(),
@@ -158,9 +158,9 @@ class SharedCaptureMultiplexer {
     const bool started = capture.Start(display, [this](CapturedFrame frame) {
       Fanout(frame);
     });
-    std::lock_guard<std::mutex> lock(mutex_);
     started_ = started;
     if (!started) {
+      std::lock_guard<std::mutex> lock(mutex_);
       sinks_.erase(id);
       return false;
     }
@@ -168,9 +168,18 @@ class SharedCaptureMultiplexer {
   }
 
   void Unsubscribe(CaptureAdapter& capture, std::uint64_t id) noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
-    sinks_.erase(id);
-    if (sinks_.empty() && started_) {
+    std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
+    bool last = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      sinks_.erase(id);
+      last = sinks_.empty();
+    }
+    // capture.Stop() joins the capture thread, and that thread takes mutex_
+    // in Fanout() for every frame. Stopping while holding mutex_ deadlocked
+    // teardown whenever a frame arrived mid-close (seen live: the worker
+    // stuck in ~Lease joining a capture thread parked on this mutex).
+    if (last && started_) {
       capture.Stop();
       started_ = false;
     }
@@ -191,7 +200,8 @@ class SharedCaptureMultiplexer {
     for (auto& sink : targets) sink(frame);
   }
 
-  std::mutex mutex_;
+  std::mutex lifecycle_mutex_;  // Subscribe/Unsubscribe only; guards started_.
+  std::mutex mutex_;            // sinks_ only; Fanout() takes it per frame.
   std::unordered_map<std::uint64_t, common::CapturedFrameSink> sinks_;
   bool started_ = false;
 };
