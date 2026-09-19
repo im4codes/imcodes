@@ -168,7 +168,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   // (message goes straight to the timeline with a spinner, reconciled by the
   // daemon echo).
   const timeline = isShell
-    ? { events: [], refreshing: false, addOptimisticUserMessage: undefined, retryOptimisticMessage: undefined }
+    ? { events: [], refreshing: false, addOptimisticUserMessage: undefined, removeOptimisticMessage: undefined, retryOptimisticMessage: undefined }
     : useTimeline(sub.sessionName, ws, serverId, {
       // Only the focused card owns opportunistic recovery. Open-but-unfocused
       // cards remain visible/subscribed below, and catch up when focused,
@@ -186,6 +186,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   const { events, refreshing } = timeline;
   const addOptimisticUserMessage = 'addOptimisticUserMessage' in timeline ? timeline.addOptimisticUserMessage : undefined;
   const markOptimisticFailed = 'markOptimisticFailed' in timeline ? timeline.markOptimisticFailed : undefined;
+  const removeOptimisticMessage = 'removeOptimisticMessage' in timeline ? timeline.removeOptimisticMessage : undefined;
   const retryOptimisticMessage = 'retryOptimisticMessage' in timeline ? timeline.retryOptimisticMessage : undefined;
   const forceRefresh = 'forceRefresh' in timeline ? timeline.forceRefresh : undefined;
   const termScrollRef = useRef<(() => void) | null>(null);
@@ -548,12 +549,14 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
                   addOptimisticUserMessage?.(text, meta?.commandId, {
                     ...(meta?.attachments ? { attachments: meta.attachments } : {}),
                     ...(meta?.extra ? { resendExtra: meta.extra } : {}),
+                    ...(meta?.queueAppend ? { queueAppend: true } : {}),
                   });
                   if (meta?.commandId && meta.localFailure) {
                     markOptimisticFailed?.(meta.commandId, meta.localFailure);
                   }
                   scrollToBottom();
                 }}
+                onRemoveOptimisticMessage={removeOptimisticMessage}
               />
             ) : (
               <input

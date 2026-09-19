@@ -1870,19 +1870,25 @@ function wireTransportCallbacks(
     // stale pre-drain snapshot can then never resurrect these entries.
     const drainedVersion = observeTransportQueueRevision(sessionName, runtime.pendingVersion);
     for (const entry of messages) {
+      const payload = {
+        text: entry.text,
+        clientMessageId: entry.clientMessageId,
+        allowDuplicate: true,
+        pendingMessageVersion: drainedVersion,
+        ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
+        ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
+      };
       timelineEmitter.emit(
         sessionName,
         'user.message',
-        {
-          text: entry.text,
-          clientMessageId: entry.clientMessageId,
-          allowDuplicate: true,
-          pendingMessageVersion: drainedVersion,
-          ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
-          ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
-        },
+        payload,
         { source: 'daemon', confidence: 'high', eventId: transportUserEventId(entry.clientMessageId) },
       );
+      void appendTransportEvent(sessionName, {
+        type: 'user.message',
+        sessionId: sessionName,
+        ...payload,
+      });
     }
     if (messages.length === 0 && count === 0) {
       timelineEmitter.emit(sessionName, 'user.message', { text: merged, batchedCount: count, allowDuplicate: true, pendingMessageVersion: drainedVersion });
@@ -1917,21 +1923,27 @@ function wireTransportCallbacks(
       void import('../daemon/supervision-automation.js').then(({ supervisionAutomation }) => {
         supervisionAutomation.removeQueuedTaskIntent(sessionName, entry.clientMessageId);
       }).catch(() => {});
+      const payload = {
+        text: entry.text,
+        commandId: entry.clientMessageId,
+        clientMessageId: entry.clientMessageId,
+        allowDuplicate: true,
+        queueAppended: true,
+        pendingMessageVersion,
+        ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
+        ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
+      };
       timelineEmitter.emit(
         sessionName,
         'user.message',
-        {
-          text: entry.text,
-          commandId: entry.clientMessageId,
-          clientMessageId: entry.clientMessageId,
-          allowDuplicate: true,
-          queueAppended: true,
-          pendingMessageVersion,
-          ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
-          ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
-        },
+        payload,
         { source: 'daemon', confidence: 'high', eventId: transportUserEventId(entry.clientMessageId) },
       );
+      void appendTransportEvent(sessionName, {
+        type: 'user.message',
+        sessionId: sessionName,
+        ...payload,
+      });
     }
     persistTransportState('running');
     timelineEmitter.emit(sessionName, 'session.state', {

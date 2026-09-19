@@ -5278,6 +5278,72 @@ afterEach(() => {
     expect(gatherCancelCalls(ws)).toEqual([]);
   });
 
+  it('projects a manually appended queue row into the timeline immediately and removes it on rejection', async () => {
+    const ws = makeWs();
+    const onSend = vi.fn();
+    const onRemoveOptimisticMessage = vi.fn();
+    const view = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          state: 'running',
+          transportPendingMessageEntries: [
+            { clientMessageId: 'manual-append-1', text: 'show me immediately' },
+          ],
+        })}
+        quickData={makeQuickData() as any}
+        onSend={onSend}
+        onRemoveOptimisticMessage={onRemoveOptimisticMessage}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'transport_queue_append' }));
+    const append = ws.send.mock.calls.find(([payload]) => (
+      payload?.type === 'session.append_queued_messages'
+    ))?.[0] as { commandId: string };
+
+    // This callback owns the timeline projection and runs in the click turn,
+    // before any daemon/provider response can arrive.
+    expect(onSend).toHaveBeenCalledWith('qwen-session', 'show me immediately', {
+      commandId: 'manual-append-1',
+      queueAppend: true,
+    });
+    expect(onRemoveOptimisticMessage).not.toHaveBeenCalled();
+
+    view.rerender(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeTransportSession({
+          name: 'qwen-session',
+          state: 'running',
+          // Simulate the lagging parent/session snapshot in the screenshot.
+          transportPendingMessageEntries: [
+            { clientMessageId: 'manual-append-1', text: 'show me immediately' },
+          ],
+          transportPendingMessageVersion: 1,
+        })}
+        quickData={makeQuickData() as any}
+        onSend={onSend}
+        onRemoveOptimisticMessage={onRemoveOptimisticMessage}
+      />,
+    );
+    expect(screen.queryByText('show me immediately')).toBeNull();
+
+    await act(async () => {
+      ws.emit({
+        type: 'command.ack',
+        session: 'qwen-session',
+        commandId: append.commandId,
+        status: 'error',
+        error: 'provider rejected append',
+      });
+    });
+
+    expect(onRemoveOptimisticMessage).toHaveBeenCalledWith('manual-append-1');
+    expect(screen.getByText('show me immediately')).toBeDefined();
+  });
+
   it('keeps Stop in append mode while a local queue row is still synchronizing', () => {
     const ws = makeWs();
     render(

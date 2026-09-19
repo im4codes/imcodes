@@ -1344,7 +1344,12 @@ describe('transport-relay (timeline-emitter based)', () => {
     });
 
     it('caches user.message to JSONL via appendTransportEvent', async () => {
-      emitTransportUserMessage('sess-u', 'cached message');
+      emitTransportUserMessage('sess-u', 'cached message', {
+        commandId: 'queued-1',
+        clientMessageId: 'queued-1',
+        queueAppended: true,
+        pendingMessageVersion: 7,
+      }, 'transport-user:queued-1');
 
       await Promise.resolve();
 
@@ -1354,6 +1359,26 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(event.type).toBe('user.message');
       expect(event.text).toBe('cached message');
       expect(event.sessionId).toBe('sess-u');
+      expect(event.commandId).toBe('queued-1');
+      expect(event.clientMessageId).toBe('queued-1');
+      expect(event.queueAppended).toBe(true);
+      expect(event.pendingMessageVersion).toBe(7);
+
+      expect(emitMock).toHaveBeenCalledWith(
+        'sess-u',
+        'user.message',
+        expect.objectContaining({
+          text: 'cached message',
+          commandId: 'queued-1',
+          clientMessageId: 'queued-1',
+          queueAppended: true,
+        }),
+        expect.objectContaining({
+          source: 'daemon',
+          confidence: 'high',
+          eventId: 'transport-user:queued-1',
+        }),
+      );
     });
 
     it('emits with daemon source and high confidence', () => {

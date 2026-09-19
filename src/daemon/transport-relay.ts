@@ -958,13 +958,41 @@ export function wireProviderToRelay(provider: TransportProvider): void {
   });
 }
 
-/** Emit user.message through timeline when user sends to a transport session. */
-export function emitTransportUserMessage(sessionId: string, text: string): void {
-  timelineEmitter.emit(sessionId, 'user.message', { text, allowDuplicate: true }, { source: 'daemon', confidence: 'high' });
+/**
+ * Emit and persist a transport user.message as one projection.
+ *
+ * `extra` carries the stable client/command identity used by the queue UI. It
+ * must be written to the JSONL fallback as well as the primary timeline;
+ * otherwise a reload can render the already-delivered text from chat.history
+ * while still rendering the same id from a stale queue snapshot.
+ */
+export function emitTransportUserMessage(
+  sessionId: string,
+  text: string,
+  extra: Record<string, unknown> = {},
+  eventId?: string,
+): void {
+  const payload = { text, allowDuplicate: true, ...extra };
+  timelineEmitter.emit(
+    sessionId,
+    'user.message',
+    payload,
+    { source: 'daemon', confidence: 'high', ...(eventId ? { eventId } : {}) },
+  );
+  persistTransportUserMessage(sessionId, text, payload);
+}
+
+/** Persist the fallback copy for a user.message already emitted elsewhere. */
+export function persistTransportUserMessage(
+  sessionId: string,
+  text: string,
+  extra: Record<string, unknown> = {},
+): void {
   void appendTransportEvent(sessionId, {
     type: 'user.message',
     sessionId,
     text,
+    ...extra,
   });
 }
 

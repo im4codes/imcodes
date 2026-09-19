@@ -349,7 +349,7 @@ describe('useTimeline optimistic send flow', () => {
         },
       } as unknown as ServerMessage);
     });
-    act(() => { vi.advanceTimersByTime(20); });
+    act(() => { vi.advanceTimersByTime(90_001); });
     expect(optimisticBubbles()).toHaveLength(1);
 
     // Provider admission finalizes the row (delivery fact) ...
@@ -368,8 +368,7 @@ describe('useTimeline optimistic send flow', () => {
     act(() => { vi.advanceTimersByTime(20); });
     expect(optimisticBubbles()).toHaveLength(1);
 
-    // ... and the daemon's own row for it arrives keyed only by clientMessageId
-    // (command-handler's append path carries no commandId).
+    // ... and the daemon's own row for it arrives with the stable queue id.
     act(() => {
       handlerBox.fn?.({
         type: 'timeline.event',
@@ -396,6 +395,87 @@ describe('useTimeline optimistic send flow', () => {
     const userMessages = ref.current!.events.filter((event) => event.type === 'user.message');
     expect(userMessages).toHaveLength(1);
     expect(userMessages[0]!.eventId).toBe('transport-user:cmd-append');
+  });
+
+  it('keeps a manually selected queue Append visible across stale snapshots until its exact echo arrives', () => {
+    const ref = { current: null as HookRef };
+    const handlerBox = { fn: null as ((msg: ServerMessage) => void) | null };
+    const { Probe } = captureHookRef(ref, handlerBox);
+    render(h(Probe, { sessionId: 'deck_opt_manual_append' }));
+
+    act(() => {
+      ref.current!.addOptimisticUserMessage('append now', 'append-client-1', { queueAppend: true });
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'stale-queue-after-append',
+          sessionId: 'deck_opt_manual_append',
+          ts: Date.now(),
+          epoch: 1,
+          seq: 4,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'session.state',
+          payload: {
+            state: 'queued',
+            queueEpoch: 'epoch-append',
+            queueAuthorityId: 'authority-append',
+            pendingMessageVersion: 1,
+            pendingMessageEntries: [{ clientMessageId: 'append-client-1', text: 'append now' }],
+          },
+        },
+      } as unknown as ServerMessage);
+      vi.advanceTimersByTime(90_001);
+    });
+
+    const stillPending = ref.current!.events.find((event) => event.payload.text === 'append now');
+    expect(stillPending?.payload.pending).toBe(true);
+    expect(stillPending?.payload.failed).not.toBe(true);
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'transport.queue.delivery',
+        sessionName: 'deck_opt_manual_append',
+        clientMessageId: 'append-client-1',
+        queueEpoch: 'epoch-append',
+        queueAuthorityId: 'authority-append',
+        pendingMessageVersion: 2,
+        deliveryFrameId: 'append-frame-1',
+        deliveryFrameVersion: 1,
+      } as unknown as ServerMessage);
+      vi.advanceTimersByTime(20);
+    });
+
+    const delivered = ref.current!.events.find((event) => event.payload.text === 'append now');
+    expect(delivered?.payload.pending).toBe(false);
+    expect(delivered?.payload.acked).toBe(true);
+
+    act(() => {
+      handlerBox.fn?.({
+        type: 'timeline.event',
+        event: {
+          eventId: 'transport-user:append-client-1',
+          sessionId: 'deck_opt_manual_append',
+          ts: Date.now() + 1,
+          epoch: 1,
+          seq: 5,
+          source: 'daemon',
+          confidence: 'high',
+          type: 'user.message',
+          payload: {
+            text: 'append now',
+            commandId: 'append-client-1',
+            clientMessageId: 'append-client-1',
+            queueAppended: true,
+          },
+        },
+      } as unknown as ServerMessage);
+    });
+
+    const matching = ref.current!.events.filter((event) => event.payload.text === 'append now');
+    expect(matching).toHaveLength(1);
+    expect(matching[0]!.eventId).toBe('transport-user:append-client-1');
+    expect(matching[0]!.payload.pending).not.toBe(true);
   });
 
   it('routes structured queue snapshots through the shared reducer and ignores pendingCount as authority', () => {

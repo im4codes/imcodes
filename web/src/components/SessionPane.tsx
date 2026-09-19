@@ -190,6 +190,7 @@ export function SessionPane({
     hasOlderHistory: timelineHasOlderHistory,
     addOptimisticUserMessage,
     markOptimisticFailed,
+    removeOptimisticMessage,
     retryOptimisticMessage,
     loadOlderEvents,
     loadMessageContext,
@@ -533,12 +534,14 @@ export function SessionPane({
             addOptimisticUserMessage(text, meta?.commandId, {
               ...(meta?.attachments ? { attachments: meta.attachments } : {}),
               ...(meta?.extra ? { resendExtra: meta.extra } : {}),
+              ...(meta?.queueAppend ? { queueAppend: true } : {}),
             });
             if (meta?.commandId && meta.localFailure) {
               markOptimisticFailed(meta.commandId, meta.localFailure);
             }
             scrollToBottom();
           }}
+          onRemoveOptimisticMessage={removeOptimisticMessage}
           onStopProject={onStopProject}
           onRenameSession={onRenameSession}
           onSettings={onSettings}

@@ -300,6 +300,7 @@ export function SubSessionWindow({
     historyStatus: timelineHistoryStatus,
     addOptimisticUserMessage,
     markOptimisticFailed,
+    removeOptimisticMessage,
     retryOptimisticMessage,
     forceRefresh: timelineForceRefresh,
     loadingOlder,
@@ -1102,12 +1103,14 @@ export function SubSessionWindow({
           addOptimisticUserMessage(text, meta?.commandId, {
             ...(meta?.attachments ? { attachments: meta.attachments } : {}),
             ...(meta?.extra ? { resendExtra: meta.extra } : {}),
+            ...(meta?.queueAppend ? { queueAppend: true } : {}),
           });
           if (meta?.commandId && meta.localFailure) {
             markOptimisticFailed(meta.commandId, meta.localFailure);
           }
           scrollToBottom();
         }}
+        onRemoveOptimisticMessage={removeOptimisticMessage}
         onSubRestart={onRestart}
         onSubNew={onRestart}
         onSubStop={handleClose}

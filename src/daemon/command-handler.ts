@@ -21,7 +21,10 @@ import { terminalStreamer, type StreamSubscriber } from './terminal-streamer.js'
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { bindProcessSharedMachineAuthority } from './shared-machine-authority-context.js';
-import { emitTransportUserMessage as emitTransportUserMessageEvent } from './transport-relay.js';
+import {
+  emitTransportUserMessage as emitTransportUserMessageEvent,
+  persistTransportUserMessage,
+} from './transport-relay.js';
 import { TimelinePreferredReadError, timelineStore } from './timeline-store.js';
 import { hasAssistantFileReadGrant } from './session-file-read-grants.js';
 import {
@@ -3558,12 +3561,14 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       ...(sharedActor ? { sharedActor } : {}),
       ...(requestedUiLocale ? { uiLocale: requestedUiLocale } : {}),
     };
+    const payload = { ...base, ...(extra ?? {}) };
     timelineEmitter.emit(
       sessionName,
       'user.message',
-      { ...base, ...(extra ?? {}) },
+      payload,
       eventId ? { source: 'daemon', confidence: 'high', eventId } : undefined,
     );
+    persistTransportUserMessage(sessionName, payloadText, payload);
   };
 
   const emitDelegationError = (error: AgentDelegationErrorCode | 'delegation_dispatch_failed', detail?: string, targetSession?: string): void => {
@@ -5461,22 +5466,25 @@ async function handleAppendQueuedTransportMessages(cmd: Record<string, unknown>,
 
     for (const entry of result.entries) {
       supervisionAutomation.removeQueuedTaskIntent(sessionName, entry.clientMessageId);
+      const payload = {
+        text: entry.text,
+        commandId: entry.clientMessageId,
+        clientMessageId: entry.clientMessageId,
+        allowDuplicate: true,
+        // This row records an in-turn queue steer. It extends the currently
+        // supervised task and must not seed a second implicit run at idle.
+        queueAppended: true,
+        pendingMessageVersion: result.queueSnapshot.pendingMessageVersion,
+        ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
+        ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
+      };
       timelineEmitter.emit(
         sessionName,
         'user.message',
-        {
-          text: entry.text,
-          clientMessageId: entry.clientMessageId,
-          allowDuplicate: true,
-          // This row records an in-turn queue steer. It extends the currently
-          // supervised task and must not seed a second implicit run at idle.
-          queueAppended: true,
-          pendingMessageVersion: result.queueSnapshot.pendingMessageVersion,
-          ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
-          ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
-        },
+        payload,
         { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.clientMessageId}` },
       );
+      persistTransportUserMessage(sessionName, entry.text, payload);
     }
     for (const fact of result.deliveryFacts) {
       timelineEmitter.emit(sessionName, 'transport.queue.delivery', { ...fact }, {

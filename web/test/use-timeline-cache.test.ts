@@ -3269,6 +3269,60 @@ describe('useTimeline global cache bounds', () => {
     });
   });
 
+  it('retains queue identity from transport history so a delivered row cannot reappear below the timeline', async () => {
+    const sessionName = `deck_transport_queue_history_${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest: () => 'history-transport-queue-identity',
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, ws, 'srv');
+      const event = events.find((candidate) => candidate.type === 'user.message');
+      return h('div', {
+        'data-testid': 'probe',
+        'data-command-id': String(event?.payload.commandId ?? ''),
+        'data-client-message-id': String(event?.payload.clientMessageId ?? ''),
+        'data-queue-appended': String(event?.payload.queueAppended ?? false),
+        'data-pending-version': String(event?.payload.pendingMessageVersion ?? ''),
+      }, String(event?.payload.text ?? ''));
+    }
+
+    render(h(Probe));
+
+    await act(async () => {
+      handler?.({
+        type: 'chat.history',
+        sessionId: sessionName,
+        events: [{
+          type: 'user.message',
+          sessionId: sessionName,
+          text: 'already appended',
+          commandId: 'append-id-1',
+          clientMessageId: 'append-id-1',
+          queueAppended: true,
+          pendingMessageVersion: 12,
+          _ts: 10,
+        }],
+      } as ServerMessage);
+    });
+
+    await waitFor(() => {
+      const probe = screen.getByTestId('probe');
+      expect(probe.textContent).toBe('already appended');
+      expect(probe.getAttribute('data-command-id')).toBe('append-id-1');
+      expect(probe.getAttribute('data-client-message-id')).toBe('append-id-1');
+      expect(probe.getAttribute('data-queue-appended')).toBe('true');
+      expect(probe.getAttribute('data-pending-version')).toBe('12');
+    });
+  });
+
   it('replaces provisional transport history with authoritative timeline.history instead of duplicating it', async () => {
     const sessionName = `deck_transport_history_replace_${Date.now()}`;
     let handler: ((msg: ServerMessage) => void) | null = null;

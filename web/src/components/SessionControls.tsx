@@ -273,8 +273,12 @@ interface Props {
       attachments?: Array<Record<string, unknown>>;
       extra?: Record<string, unknown>;
       localFailure?: string;
+      /** The user explicitly appended this row to the active turn. */
+      queueAppend?: boolean;
     },
   ) => void;
+  /** Remove an optimistic append row when provider admission is rejected. */
+  onRemoveOptimisticMessage?: (commandId: string) => void;
   /** Sub-session overrides — when set, menu actions use these instead of main session commands. */
   onSubRestart?: () => void;
   onSubNew?: () => void;
@@ -1154,7 +1158,7 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, connected: connectedProp, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, transportTimelineEvents, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange }: Props) {
+export function SessionControls({ ws, activeSession, connected: connectedProp, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onRemoveOptimisticMessage, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, transportTimelineEvents, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange }: Props) {
   const { t, i18n } = useTranslation();
   const deliveryModePref = usePref<SessionSendDeliveryMode>(SESSION_SEND_DELIVERY_USER_PREF_KEY, {
     parse: (raw) => Object.values(SESSION_SEND_DELIVERY_MODES).includes(raw as SessionSendDeliveryMode)
@@ -2532,6 +2536,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 setOptimisticQueuedEntries(null);
               }
               if (!appendSuperseded) {
+                // The queue row was moved into the timeline optimistically when
+                // the user clicked Append. A genuine provider rejection returns
+                // it to the queue, so remove that pending timeline projection in
+                // the same reconciliation turn instead of showing it twice. A
+                // not-found result superseded by newer authority keeps the row:
+                // it may already be delivered and the exact echo/backfill owns
+                // its final reconciliation.
+                for (const entry of rollback.entries) {
+                  onRemoveOptimisticMessage?.(entry.clientMessageId);
+                }
                 const rollbackQueueIds = new Set(rollback.queue.map((entry) => entry.clientMessageId));
                 const restoreAppendQueue = (source: LocalQueuedTransportEntry[]) => [
                   ...rollback.queue,
@@ -2650,7 +2664,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       }
     };
     return ws.onMessage(handleRealtimeQueueMessage);
-  }, [activeSession?.name, showSendWarning, transportQueueAppendFailedLabel, ws]);
+  }, [activeSession?.name, onRemoveOptimisticMessage, showSendWarning, transportQueueAppendFailedLabel, ws]);
 
   // Reset P2P mode on session change
   useEffect(() => { setP2pMode('solo'); setP2pOpen(false); }, [activeSession?.name]);
@@ -4333,6 +4347,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, [editingQueuedMessageId, incomingQueuedTransportEntries, isEditableQueuedEntry, publishComposerText, sendQueuedMessageMutation]);
 
   const handleQueuedMessagesAppend = useCallback((entries: LocalQueuedTransportEntry[]): boolean => {
+    if (!activeSession) return false;
     const appendable = entries.filter((entry) => (
       entry.status !== 'failed' && isEditableQueuedEntry(entry)
     ));
@@ -4355,6 +4370,18 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       queue: queuedTransportEntries.map((entry) => ({ ...entry })),
       acceptedSnapshotSeq: acceptedQueueSnapshotSeqRef.current,
     });
+    // Move the selected rows into the visible conversation immediately. The
+    // daemon emits the same clientMessageId after provider admission, so the
+    // normal optimistic reconciliation replaces these rows without duplication.
+    // If admission rejects, the ack path above removes them while restoring the
+    // queue. This keeps correctness authoritative without making the user wait
+    // for the provider round-trip (or a best-effort timeline broadcast).
+    for (const entry of appendable) {
+      onSend?.(activeSession.name, entry.text, {
+        commandId: entry.clientMessageId,
+        queueAppend: true,
+      });
+    }
     const appendIds = new Set(appendable.map((entry) => entry.clientMessageId));
     setOptimisticQueuedEntries((prev) => {
       const source = prev ?? incomingQueuedTransportEntries;
@@ -4362,7 +4389,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     });
     setOptimisticallyRemovedQueuedIds((prev) => new Set([...prev, ...appendIds]));
     return true;
-  }, [incomingQueuedTransportEntries, isEditableQueuedEntry, queuedTransportEntries, sendQueuedMessageMutation, showSendWarning, transportQueueAppendFailedLabel]);
+  }, [activeSession, incomingQueuedTransportEntries, isEditableQueuedEntry, onSend, queuedTransportEntries, sendQueuedMessageMutation, showSendWarning, transportQueueAppendFailedLabel]);
 
   const handleStopButtonPress = useCallback(() => {
     if (appendableQueuedTransportEntries.length > 0) {

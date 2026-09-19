@@ -1075,6 +1075,7 @@ function isLocalOptimisticUserMessage(event: TimelineEvent): boolean {
  */
 function isOptimisticAppendUserMessage(event: TimelineEvent): boolean {
   if (!isLocalOptimisticUserMessage(event)) return false;
+  if (event.payload.queueAppended === true) return true;
   const extra = event.payload._resendExtra;
   return !!extra
     && typeof extra === 'object'
@@ -1127,10 +1128,20 @@ function convertTransportHistoryRecordToTimelineEvent(
   };
 
   if (rawType === 'user.message' && typeof record.text === 'string') {
+    const payload: Record<string, unknown> = { text: record.text };
+    const commandId = typeof record.commandId === 'string' ? record.commandId.trim() : '';
+    const clientMessageId = typeof record.clientMessageId === 'string' ? record.clientMessageId.trim() : '';
+    if (commandId) payload.commandId = commandId;
+    if (clientMessageId) payload.clientMessageId = clientMessageId;
+    if (record.queueAppended === true) payload.queueAppended = true;
+    if (record.allowDuplicate === true) payload.allowDuplicate = true;
+    if (typeof record.pendingMessageVersion === 'number' && Number.isFinite(record.pendingMessageVersion)) {
+      payload.pendingMessageVersion = record.pendingMessageVersion;
+    }
     return {
       ...base,
       type: 'user.message',
-      payload: { text: record.text },
+      payload,
     };
   }
 
@@ -1488,6 +1499,10 @@ export interface UseTimelineResult {
     opts?: {
       attachments?: Array<Record<string, unknown>>;
       resendExtra?: Record<string, unknown>;
+      /** Keep a manually appended message visible while queue authority still
+       * reports it as pending. The authoritative user.message echo remains the
+       * only success settlement; explicit append rejection removes it. */
+      queueAppend?: boolean;
     },
   ) => void;
   /** Flip a pending optimistic message to failed state (red "!") keyed by commandId. */
@@ -2924,9 +2939,10 @@ export function useTimeline(
       return;
     }
     if (event.type === 'transport.queue.delivery') {
+      markOptimisticAccepted(event.clientMessageId, { clearPending: true });
       reconcileQueuedOptimisticEntries([{ clientMessageId: event.clientMessageId }]);
     }
-  }, [markOptimisticFailed, reconcileQueuedOptimisticEntries, sessionId, settleOptimisticByCommandAck]);
+  }, [markOptimisticAccepted, markOptimisticFailed, reconcileQueuedOptimisticEntries, sessionId, settleOptimisticByCommandAck]);
 
   const applyTimelineTransportQueueEvidence = useCallback((event: TimelineEvent) => {
     const queueEvent = queueEventFromTimelineEvent(event);
@@ -3009,6 +3025,10 @@ export function useTimeline(
       const optimisticEvent = base.find((event) => event.eventId === optimisticId);
       if (!optimisticEvent || optimisticEvent.type !== 'user.message') continue;
       if (!optimisticEvent.payload.pending && !optimisticEvent.payload.failed) continue;
+      // Progress from the already-running turn does not prove that an Append
+      // reached the provider boundary. Only its delivery fact or exact
+      // user.message echo may settle this optimistic row.
+      if (isOptimisticAppendUserMessage(optimisticEvent)) continue;
       if (typeof optimisticEvent.ts === 'number' && progressEvent.ts + 1_000 < optimisticEvent.ts) continue;
       const relatedToEventId = progressEvent.type === 'memory.context' && typeof progressEvent.payload.relatedToEventId === 'string'
         ? progressEvent.payload.relatedToEventId
@@ -3047,23 +3067,33 @@ export function useTimeline(
     opts?: {
       attachments?: Array<Record<string, unknown>>;
       resendExtra?: Record<string, unknown>;
+      queueAppend?: boolean;
     },
   ) => {
     if (!sessionId) return;
     const optimisticId = `${OPTIMISTIC_EVENT_ID_PREFIX}${sessionId}:${commandId ?? Date.now()}`;
+    const isAppend = opts?.queueAppend === true
+      || opts?.resendExtra?.deliveryMode === SESSION_SEND_DELIVERY_MODES.APPEND;
     if (commandId) {
       // Guard against double-send of the same commandId: if already tracked,
       // skip — the existing bubble is still valid.
       if (optimisticIdsByCommandRef.current.has(commandId)) return;
       optimisticIdsByCommandRef.current.set(commandId, optimisticId);
       clearOptimisticTimer(commandId);
-      const timer = setTimeout(() => {
-        markOptimisticFailed(commandId, 'timeout');
-      }, OPTIMISTIC_TIMEOUT_MS);
-      optimisticTimersRef.current.set(commandId, timer);
+      // A manual append is already durably represented by the transport queue.
+      // It can legitimately wait longer than the ordinary optimistic timeout
+      // before the provider accepts the next safe boundary. Do not turn that
+      // valid queued row into a false retryable failure.
+      if (!isAppend) {
+        const timer = setTimeout(() => {
+          markOptimisticFailed(commandId, 'timeout');
+        }, OPTIMISTIC_TIMEOUT_MS);
+        optimisticTimersRef.current.set(commandId, timer);
+      }
     }
     const payload: Record<string, unknown> = { text, pending: true };
     if (commandId) payload.commandId = commandId;
+    if (isAppend) payload.queueAppended = true;
     if (opts?.attachments && opts.attachments.length > 0) payload.attachments = opts.attachments;
     if (opts?.resendExtra && Object.keys(opts.resendExtra).length > 0) {
       // Prefix with _ so server-side consumers reading user.message payloads
