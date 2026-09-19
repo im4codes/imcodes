@@ -253,6 +253,27 @@ describe('TransportQueueStore', () => {
       .toBeUndefined();
   });
 
+  it('does not project a message the provider already received as still queued', () => {
+    resetTransportQueueStoreForTests();
+    try {
+      const queue = getTransportQueueStore();
+      queue.enqueue({ sessionName: 'ghost-projection', clientMessageId: 'delivered-long-ago', text: 'old', now: 100 });
+      queue.enqueue({ sessionName: 'ghost-projection', clientMessageId: 'really-queued', text: 'new', now: 101 });
+      // Ghost as older builds left it: delivery record written, row not removed.
+      (queue as unknown as { db: { prepare(sql: string): { run(...a: unknown[]): unknown } } }).db.prepare(`
+        INSERT INTO queue_delivery_tombstones (session_name, queue_epoch, client_message_id, delivery_frame_id, created_at)
+        VALUES ('ghost-projection', (SELECT queue_epoch FROM queue_meta WHERE session_name = 'ghost-projection'),
+          'delivered-long-ago', 'frame', 150)`).run();
+      const before = queue.readSnapshot('ghost-projection').pendingMessageVersion;
+
+      const projected = buildTransportQueueSnapshot('ghost-projection', 'test');
+      expect(projected.pendingMessageEntries.map((entry) => entry.clientMessageId)).toEqual(['really-queued']);
+      expect(projected.pendingMessageVersion).toBeGreaterThan(before);
+    } finally {
+      resetTransportQueueStoreForTests();
+    }
+  });
+
   it('wires terminal-task retirement through the production snapshot boundary', () => {
     resetTransportQueueStoreForTests();
     resetSupervisionTaskRegistryForTests();
@@ -1410,5 +1431,76 @@ describe('recipient-sensitive store operations are identity-gated', () => {
     // A finalizes its own.
     store.finalizeSentBatch(NAME, ['m-a'], 'frame-A', 40, A);
     expect(store.hasDeliveryTombstone(NAME, 'm-a')).toBe(true);
+  });
+});
+
+describe('delivered-but-still-queued ghost rows', () => {
+  const NAME = 'deck_ghost_brain';
+  const RECIPIENT = { sessionInstanceId: 'inst-ghost', runtimeEpoch: 'epoch-ghost' };
+  let ghostDir: string;
+  let ghostStore: TransportQueueStore;
+
+  beforeEach(() => {
+    ghostDir = mkdtempSync(join(tmpdir(), 'imcodes-transport-queue-ghost-'));
+    ghostStore = new TransportQueueStore({ dbPath: join(ghostDir, 'queue.sqlite') });
+  });
+  afterEach(() => {
+    ghostStore.close();
+    rmSync(ghostDir, { recursive: true, force: true });
+  });
+
+  const queue = (id: string, now: number) => ghostStore.enqueue({
+    sessionName: NAME, clientMessageId: id, text: `text ${id}`, recipient: RECIPIENT, now,
+    privateMaterialJson: JSON.stringify({ clientMessageId: id, text: `text ${id}` }),
+  });
+  const pendingIds = () => ghostStore.readSnapshot(NAME).pendingMessageEntries.map((e) => e.clientMessageId);
+
+  it('a direct dispatch delivery record also removes the queued row it made obsolete', () => {
+    queue('m1', 100);
+    queue('m2', 101);
+    const versionBefore = ghostStore.readSnapshot(NAME).pendingMessageVersion;
+
+    // What the runtime does when it dispatches an entry directly: a delivery record only.
+    expect(ghostStore.recordDirectDelivery(NAME, 'm1', 'frame-1', 200, RECIPIENT)).toBe(true);
+
+    expect(pendingIds()).toEqual(['m2']);
+    expect(ghostStore.hasDeliveryTombstone(NAME, 'm1')).toBe(true);
+    expect(ghostStore.readPrivateDispatchMaterial(NAME, 'm1', RECIPIENT)).toBeUndefined();
+    // The change is announced to viewers, so a stale snapshot cannot resurrect it.
+    expect(ghostStore.readSnapshot(NAME).pendingMessageVersion).toBeGreaterThan(versionBefore);
+  });
+
+  it('a direct delivery record for an id the queue never held changes nothing', () => {
+    queue('m1', 100);
+    const before = ghostStore.readSnapshot(NAME).pendingMessageVersion;
+    ghostStore.recordDirectDelivery(NAME, 'never-queued', 'frame-x', 200, RECIPIENT);
+    expect(pendingIds()).toEqual(['m1']);
+    expect(ghostStore.readSnapshot(NAME).pendingMessageVersion).toBe(before);
+  });
+
+  it('reconcile retires ghosts an older build left behind, and only those', () => {
+    queue('ghost', 100);
+    queue('live', 101);
+    // The old bug: tombstone written, row left in place.
+    const raw = (ghostStore as unknown as { db: { prepare(sql: string): { run(...a: unknown[]): unknown } } }).db;
+    raw.prepare(`INSERT INTO queue_delivery_tombstones
+      (session_name, queue_epoch, client_message_id, delivery_frame_id, created_at)
+      VALUES (?, (SELECT queue_epoch FROM queue_meta WHERE session_name = ?), 'ghost', 'f', 150)`).run(NAME, NAME);
+    expect(pendingIds()).toEqual(['ghost', 'live']);
+
+    expect(ghostStore.reconcileDeliveredQueueRows(NAME, 300)).toEqual(['ghost']);
+    expect(pendingIds()).toEqual(['live']);
+    // Idempotent.
+    expect(ghostStore.reconcileDeliveredQueueRows(NAME, 301)).toEqual([]);
+  });
+
+  it('keeps a row that was legitimately re-queued after its earlier delivery', () => {
+    queue('again', 500);
+    const raw = (ghostStore as unknown as { db: { prepare(sql: string): { run(...a: unknown[]): unknown } } }).db;
+    raw.prepare(`INSERT INTO queue_delivery_tombstones
+      (session_name, queue_epoch, client_message_id, delivery_frame_id, created_at)
+      VALUES (?, (SELECT queue_epoch FROM queue_meta WHERE session_name = ?), 'again', 'f', 100)`).run(NAME, NAME);
+    expect(ghostStore.reconcileDeliveredQueueRows(NAME, 600)).toEqual([]);
+    expect(pendingIds()).toEqual(['again']);
   });
 });

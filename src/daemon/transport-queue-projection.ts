@@ -264,6 +264,13 @@ export function buildTransportQueueSnapshot(
         )
       : store.readSnapshotSafely(sessionName, source)
   );
+  // Retire ghosts (rows the provider already received) before they are
+  // projected; otherwise the browser shows a long-delivered message as queued.
+  try {
+    store.reconcileDeliveredQueueRows(sessionName);
+  } catch {
+    // Best effort: an unavailable store degrades to the ordinary read below.
+  }
   let snapshot = readGated();
   try {
     if (backfillLegacySupervisionQueueReferences(store, snapshot)) {

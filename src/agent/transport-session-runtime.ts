@@ -1456,6 +1456,12 @@ export class TransportSessionRuntime implements SessionRuntime {
     // that lease expires it becomes retryable under the SAME clientMessageId;
     // the store caps attempts and projects `failed` on exhaustion.
     store.restoreExpiredHandoffs(this.sessionKey);
+    // Rows the provider already received must not be replayed or displayed.
+    try {
+      store.reconcileDeliveredQueueRows(this.sessionKey);
+    } catch (err) {
+      logger.warn({ err, sessionKey: this.sessionKey }, 'rehydratePendingFromStore: delivered-row reconcile failed');
+    }
     // Peer-audit capabilities and controller state are intentionally daemon-memory
     // only. After restart no attempt can still own a queued audit brief, so scrub
     // those rows before ordinary queue rehydration while preserving user traffic.

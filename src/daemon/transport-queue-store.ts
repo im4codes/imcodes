@@ -1057,7 +1057,68 @@ export class TransportQueueStore {
       sessionName, queueEpoch, clientMessageId, deliveryFrameId, now, sessionName, sessionName,
       this.deliveryConversationKey(sessionName),
     );
+    // A message that reached the provider is no longer queued. A tombstone with
+    // its queue row left behind is a ghost: the browser keeps showing it as
+    // pending (the projection reads rows), while the runtime never sends it
+    // again (rehydrate skips tombstoned ids), so it sits there forever and
+    // resurfaces after every reconnect/restart.
+    this.reconcileDeliveredQueueRows(sessionName, now);
     return true;
+  }
+
+  /**
+   * Delete still-pending rows (and their private material) for ids the provider
+   * already accepted, bumping the queue version when anything was removed.
+   * Callers own the transaction. Returns the ids removed.
+   */
+  private removeDeliveredQueueRows(sessionName: string, clientMessageIds: string[], now: number): string[] {
+    const removed: string[] = [];
+    const deleteRow = this.db.prepare(`
+      DELETE FROM queue_entries
+      WHERE session_name = ? AND client_message_id = ? AND status IN ('queued', 'handoff_inflight')
+    `);
+    const deleteMaterial = this.db.prepare(
+      'DELETE FROM queue_private_material WHERE session_name = ? AND client_message_id = ?',
+    );
+    for (const id of clientMessageIds) {
+      if (Number(deleteRow.run(sessionName, id).changes ?? 0) === 0) continue;
+      deleteMaterial.run(sessionName, id);
+      removed.push(id);
+    }
+    if (removed.length > 0) this.bumpVersion(sessionName, now);
+    return removed;
+  }
+
+  /**
+   * Repair ghosts: rows still pending although the current epoch already holds a
+   * delivery record for them (left by earlier builds, or by any path that wrote
+   * a delivery record without finalizing the row). Returns the removed ids
+   * (empty when the queue is consistent). Idempotent and cheap.
+   */
+  reconcileDeliveredQueueRows(sessionNameInput: string, now = Date.now()): string[] {
+    const sessionName = normalizeSessionName(sessionNameInput);
+    const ghosts = this.db.prepare(`
+      SELECT e.client_message_id AS clientMessageId
+      FROM queue_entries e
+      JOIN queue_meta m ON m.session_name = e.session_name
+      JOIN queue_delivery_tombstones t
+        ON t.session_name = e.session_name
+       AND t.client_message_id = e.client_message_id
+       AND t.queue_epoch = m.queue_epoch
+      WHERE e.session_name = ? AND e.status IN ('queued', 'handoff_inflight')
+        -- A row created AFTER its id's delivery record is a legitimate re-queue.
+        AND e.created_at <= t.created_at
+    `).all(sessionName) as Array<{ clientMessageId: string }>;
+    if (ghosts.length === 0) return [];
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const removed = this.removeDeliveredQueueRows(sessionName, ghosts.map((row) => row.clientMessageId), now);
+      this.db.exec('COMMIT');
+      return removed;
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
   }
 
   /**
