@@ -278,6 +278,9 @@ class LinuxRemoteDesktopSession final
   bool AddRemoteIceCandidate(const common::IceCandidate& candidate) override;
   bool EmitLocalIceCandidate(const common::IceCandidate& candidate) override;
   bool ApplyQuality(const common::QualitySelection& selection) override;
+  // Bounds the bandwidth estimate -- and so the builtin encoder's bitrate --
+  // at the viewer's ceiling, keeping the running estimate.
+  bool ApplyViewerBitrateCeiling(std::uint32_t ceiling_bps);
   void ReleaseControlAuthority(const common::RouteAuthorityIdentity& identity,
                               std::uint64_t input_epoch) noexcept override;
   void CloseDataChannel(common::DataChannelKind channel) noexcept override;

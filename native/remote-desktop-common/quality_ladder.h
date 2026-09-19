@@ -30,7 +30,9 @@ struct QualityPreference {
   // Frame-rate ceiling: 15, 30 or 60. 60 fps rungs are only ever considered
   // when this allows them.
   int max_fps = 30;
-  // Encoder bitrate ceiling; 0 = no cap beyond the per-peer ceiling.
+  // Encoder bitrate ceiling; 0 = the default per-peer ceiling. Above
+  // kPerPeerVideoBitrateBps it RAISES the ceiling, up to
+  // kMaxViewerVideoBitrateBps (Ultra: 4K text needs more than the default).
   uint32_t max_bitrate_bps = 0;
   QualityPriority priority = QualityPriority::kBalanced;
 };
@@ -60,6 +62,8 @@ inline constexpr uint32_t kInitialVideoBitrateBps = 12'000'000;
  */
 inline constexpr uint32_t kInitialTransportBitrateBps = 1'500'000;
 inline constexpr uint32_t kPerPeerVideoBitrateBps = 15'000'000;
+// The most one viewer may ask its own stream to carry.
+inline constexpr uint32_t kMaxViewerVideoBitrateBps = 30'000'000;
 inline constexpr uint32_t kAggregateVideoBitrateBps = 60'000'000;
 
 // Keep relay startup conservative so video cannot starve the input-channel
@@ -70,8 +74,19 @@ inline constexpr uint32_t kAggregateVideoBitrateBps = 60'000'000;
 // `relay_cap_bps` (0 = none) is the operator's relayed-traffic ceiling: when
 // the session is NOT direct it bounds both the start and the maximum, so the
 // estimator never pushes a relayed stream past it. Direct sessions ignore it.
-TransportBitratePolicy SelectTransportBitratePolicy(bool direct,
-                                                    uint32_t relay_cap_bps = 0);
+//
+// `viewer_ceiling_bps` is ViewerVideoBitrateCeiling() of the viewer's
+// preference: the most the estimator may reach on a direct route.
+TransportBitratePolicy SelectTransportBitratePolicy(
+    bool direct,
+    uint32_t relay_cap_bps = 0,
+    uint32_t viewer_ceiling_bps = kPerPeerVideoBitrateBps);
+
+// The bitrate this viewer's stream may reach: the default per-peer ceiling,
+// or more when the viewer explicitly asked for more (never beyond
+// kMaxViewerVideoBitrateBps). The encoder, the RTP encoding and the
+// bandwidth estimator are all bounded by it.
+uint32_t ViewerVideoBitrateCeiling(const QualityPreference& preference);
 
 // The encoder bitrate ceiling to apply: the viewer's own cap, tightened by the
 // relay cap while the session is relayed. 0 = no cap.

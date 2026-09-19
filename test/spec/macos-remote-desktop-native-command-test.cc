@@ -794,6 +794,10 @@ class FakeSession final : public macos::HostCommandSessionSeam {
     return accept && reason == "user_selected" && now_unix_ms == 1000 &&
            now_monotonic_ms == 2000;
   }
+  bool ServesOtherRoute(
+      const imcodes::rd::Authority& authority) const override {
+    return !live_session_id.empty() && authority.session_id != live_session_id;
+  }
   bool Stop(const imcodes::rd::Authority& authority) override {
     ++stops;
     last = authority;
@@ -807,6 +811,8 @@ class FakeSession final : public macos::HostCommandSessionSeam {
   int leases = 0;
   int modes = 0;
   int stops = 0;
+  // Non-empty: a route for this session is live.
+  std::string live_session_id;
   imcodes::rd::Authority last;
 };
 
@@ -887,6 +893,35 @@ void StopTearsDownBeforeTerminal() {
   Check(sink.emitted.size() == 1 &&
             sink.emitted[0] == "terminal:stopped_by_controller:",
         "stop emits the protocol terminal rather than an invalid status");
+}
+
+void ASecondViewerNeverEndsTheLiveRoute() {
+  FakeSession session;
+  session.live_session_id = "session_live0001";
+  FakeDisclosure disclosure(true);
+  RecordingSink sink;
+  for (const auto kind :
+       {imcodes::rd::Signal::Kind::kPrepare, imcodes::rd::Signal::Kind::kOffer,
+        imcodes::rd::Signal::Kind::kIce, imcodes::rd::Signal::Kind::kLease,
+        imcodes::rd::Signal::Kind::kStop}) {
+    const auto result = Dispatch(Signal(kind), &session, &disclosure, &sink);
+    Check(result.disposition == macos::HostCommandDisposition::kContinue,
+          "another viewer's command keeps the worker running");
+  }
+  Check(session.prepares == 0 && session.offers == 0 && session.ice == 0 &&
+            session.leases == 0 && session.stops == 0,
+        "another viewer's commands never reach the live session");
+  Check(sink.emitted.size() == 1 &&
+            sink.emitted[0] == "terminal:session_limit:",
+        "the second viewer alone is told the machine is in use");
+
+  // The live route's own STOP still ends it.
+  session.live_session_id = Authority().session_id;
+  const auto stop = Dispatch(Signal(imcodes::rd::Signal::Kind::kStop),
+                             &session, &disclosure, &sink);
+  Check(session.stops == 1 &&
+            stop.disposition == macos::HostCommandDisposition::kTerminate,
+        "the live route's own stop still ends the worker");
 }
 
 void RouteCommandsDriveTheSessionAndRemainLive() {
@@ -1001,6 +1036,7 @@ int main() {
 
   StopTearsDownBeforeTerminal();
   RouteCommandsDriveTheSessionAndRemainLive();
+  ASecondViewerNeverEndsTheLiveRoute();
   RouteCommandsRefuseWithoutVisibleDisclosure();
   RejectedOperationsStopAndEmitTruthfulTerminal();
   MessageEmissionFailureTerminates();

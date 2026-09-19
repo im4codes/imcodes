@@ -46,18 +46,26 @@ int EvenAtLeastTwo(int value) {
 }  // namespace
 
 TransportBitratePolicy SelectTransportBitratePolicy(bool direct,
-                                                    uint32_t relay_cap_bps) {
+                                                    uint32_t relay_cap_bps,
+                                                    uint32_t viewer_ceiling_bps) {
   TransportBitratePolicy policy{
       kMinVideoBitrateBps,
       direct ? kInitialVideoBitrateBps : kInitialTransportBitrateBps,
-      kPerPeerVideoBitrateBps,
+      std::clamp(viewer_ceiling_bps, kMinVideoBitrateBps,
+                 kMaxViewerVideoBitrateBps),
   };
+  policy.start_bps = std::min(policy.start_bps, policy.max_bps);
   if (!direct && relay_cap_bps > 0) {
     const uint32_t cap = std::max(relay_cap_bps, kMinVideoBitrateBps);
     policy.max_bps = std::min(policy.max_bps, cap);
     policy.start_bps = std::min(policy.start_bps, cap);
   }
   return policy;
+}
+
+uint32_t ViewerVideoBitrateCeiling(const QualityPreference& preference) {
+  return std::clamp(preference.max_bitrate_bps, kPerPeerVideoBitrateBps,
+                    kMaxViewerVideoBitrateBps);
 }
 
 uint32_t EffectiveBitrateCap(uint32_t viewer_cap_bps,
@@ -81,7 +89,7 @@ uint32_t ClampAggregateVideoBitrate(uint32_t requested_bps,
   if (available < kMinVideoBitrateBps) return 0;
   return static_cast<uint32_t>(std::min<uint64_t>(
       std::clamp(requested_bps, kMinVideoBitrateBps,
-                 kPerPeerVideoBitrateBps),
+                 kMaxViewerVideoBitrateBps),
       available));
 }
 
@@ -99,7 +107,7 @@ QualitySelection SelectQuality(uint32_t target_bitrate_bps,
   uint32_t ceiling = kPerPeerVideoBitrateBps;
   if (preference.max_bitrate_bps > 0) {
     ceiling = std::clamp(preference.max_bitrate_bps, kMinVideoBitrateBps,
-                         kPerPeerVideoBitrateBps);
+                         kMaxViewerVideoBitrateBps);
   }
   const uint32_t bounded_bitrate =
       std::clamp(target_bitrate_bps, kMinVideoBitrateBps, ceiling);

@@ -56,6 +56,10 @@ struct QualitySelection {
   PixelSize encoded_pixels;
   std::uint32_t frame_rate = 0;
   std::uint32_t bitrate_bps = 0;
+  // The viewer's stream ceiling (ViewerVideoBitrateCeiling), which the
+  // transport applies to its RTP encoding and bandwidth estimator. Filled by
+  // TransportSessionCore.
+  std::uint32_t maximum_bitrate_bps = 0;
 };
 
 class QualityLadder {

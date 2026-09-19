@@ -13,6 +13,8 @@
 #include <vector>
 
 #include "../remote-desktop-common/data_channel_constants.h"
+#include "../remote-desktop-common/quality_ladder.h"
+#include "../remote-desktop-common/video_sender_bitrate.h"
 #include "api/audio/audio_device.h"
 #include "api/audio_codecs/builtin_audio_decoder_factory.h"
 #include "api/audio_codecs/builtin_audio_encoder_factory.h"
@@ -632,6 +634,15 @@ class PinnedLibwebrtcTransportBackend final
       CloseLocked();
       return false;
     }
+    // State the stream's bounds before negotiation, as Windows does: left
+    // unset, libwebrtc holds the whole stream to 2.5 Mbps. The viewer's own
+    // ceiling is the estimator bound (ApplyBitrate), never this.
+    if (!imcodes::rd::ApplyVideoSenderBitrateLimits(
+            *peer_, imcodes::rd::kMinVideoBitrateBps,
+            imcodes::rd::kMaxViewerVideoBitrateBps)) {
+      CloseLocked();
+      return false;
+    }
 
     // The browser is the offerer and creates the three negotiated channels.
     // Creating matching local channels here produces duplicates with different
@@ -703,7 +714,9 @@ class PinnedLibwebrtcTransportBackend final
       return false;
     webrtc::BitrateSettings settings;
     settings.min_bitrate_bps = static_cast<int>(min_bps);
-    settings.start_bitrate_bps = static_cast<int>(start_bps);
+    // 0 leaves the running estimate alone (a ceiling change, not a reseed).
+    if (start_bps > 0)
+      settings.start_bitrate_bps = static_cast<int>(start_bps);
     settings.max_bitrate_bps = static_cast<int>(max_bps);
     return peer->SetBitrate(settings).ok();
   }

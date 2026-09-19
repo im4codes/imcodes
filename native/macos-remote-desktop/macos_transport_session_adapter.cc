@@ -166,12 +166,23 @@ bool MacosTransportSessionAdapter::ApplyQuality(
     return false;
   }
   // Upstream congestion control owns the actual send rate; the bounds it runs
-  // between are a fixed policy, set once, exactly as on Windows. Feeding the
-  // current estimate back in as the ceiling is a ratchet: every lower estimate
+  // between are a fixed policy, exactly as on Windows. Feeding the current
+  // estimate back in as the ceiling is a ratchet: every lower estimate
   // becomes the new maximum, the estimate can only fall further, and the
-  // stream starves to a black picture within seconds.
-  if (bitrate_policy_applied_)
+  // stream starves to a black picture within seconds. So the bounds change
+  // only when the viewer's own ceiling does (e.g. it picked Ultra), and then
+  // without reseeding the estimate.
+  const std::uint32_t ceiling = selection.maximum_bitrate_bps > 0
+                                    ? selection.maximum_bitrate_bps
+                                    : imcodes::rd::kPerPeerVideoBitrateBps;
+  if (bitrate_policy_applied_) {
+    if (ceiling == applied_bitrate_ceiling_bps_)
+      return true;
+    if (!backend_->ApplyBitrate(imcodes::rd::kMinVideoBitrateBps, 0, ceiling))
+      return false;
+    applied_bitrate_ceiling_bps_ = ceiling;
     return true;
+  }
   // A relay ceiling (the operator's rate-limited TURN tier) bounds only the
   // opening push: starting above it overshoots a limited relay into seconds
   // of loss. The encoder target itself is capped by the transport core while
@@ -183,10 +194,11 @@ bool MacosTransportSessionAdapter::ApplyQuality(
                               relay_bitrate_cap_bps_))
           : imcodes::rd::kInitialTransportBitrateBps;
   if (!backend_->ApplyBitrate(imcodes::rd::kMinVideoBitrateBps, start_bps,
-                              imcodes::rd::kPerPeerVideoBitrateBps)) {
+                              ceiling)) {
     return false;
   }
   bitrate_policy_applied_ = true;
+  applied_bitrate_ceiling_bps_ = ceiling;
   return true;
 }
 

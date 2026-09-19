@@ -471,7 +471,7 @@ void MfH264Encoder::SetRates(const RateControlParameters& parameters) {
   const int64_t target_bps = parameters.bitrate.get_sum_bps();
   const uint32_t requested_bps = static_cast<uint32_t>(
       std::clamp<int64_t>(target_bps, kMinVideoBitrateBps,
-                          kPerPeerVideoBitrateBps));
+                          kMaxViewerVideoBitrateBps));
   const uint32_t granted_bps = ReserveAggregateBitrate(
       requested_bps, reserved_bitrate_bps_);
   if (granted_bps == 0) return;

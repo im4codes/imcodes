@@ -101,12 +101,50 @@ TEST(QualityLadderTest, RelayCapBindsOnlyRelayedSessions) {
 }
 
 TEST(QualityLadderTest, EnforcesPerPeerAndAggregateBitrateBudgets) {
-  EXPECT_EQ(ClampAggregateVideoBitrate(20'000'000, 0, 0), 15'000'000u);
+  // The per-viewer ceiling is the estimator's bound (15 Mbps unless the
+  // viewer raised it); the budget itself never exceeds the Ultra maximum.
+  EXPECT_EQ(ClampAggregateVideoBitrate(40'000'000, 0, 0), 30'000'000u);
   EXPECT_EQ(ClampAggregateVideoBitrate(15'000'000, 0, 50'000'000),
             10'000'000u);
   EXPECT_EQ(ClampAggregateVideoBitrate(15'000'000, 12'000'000, 57'000'000),
             15'000'000u);
   EXPECT_EQ(ClampAggregateVideoBitrate(1'000'000, 0, 60'000'000), 0u);
+}
+
+TEST(QualityLadderTest, UltraRaisesTheViewerCeilingAndNothingElseDoes) {
+  QualityPreference standard;
+  EXPECT_EQ(ViewerVideoBitrateCeiling(standard), 15'000'000u);
+  standard.max_bitrate_bps = 8'000'000;
+  EXPECT_EQ(ViewerVideoBitrateCeiling(standard), 15'000'000u);
+  EXPECT_EQ(SelectTransportBitratePolicy(true).max_bps, 15'000'000u);
+
+  QualityPreference ultra;
+  ultra.max_height = 2160;
+  ultra.max_bitrate_bps = 30'000'000;
+  ultra.priority = QualityPriority::kResolution;
+  EXPECT_EQ(ViewerVideoBitrateCeiling(ultra), 30'000'000u);
+  ultra.max_bitrate_bps = 90'000'000;
+  EXPECT_EQ(ViewerVideoBitrateCeiling(ultra), 30'000'000u);
+  ultra.max_bitrate_bps = 30'000'000;
+
+  const TransportBitratePolicy direct =
+      SelectTransportBitratePolicy(true, 0, ViewerVideoBitrateCeiling(ultra));
+  EXPECT_EQ(direct.max_bps, 30'000'000u);
+  EXPECT_EQ(direct.start_bps, 12'000'000u);
+  // A relay ceiling still binds a relayed Ultra viewer.
+  EXPECT_EQ(SelectTransportBitratePolicy(false, 2'000'000,
+                                         ViewerVideoBitrateCeiling(ultra))
+                .max_bps,
+            2'000'000u);
+
+  // A 5K display is encoded at 4K with the raised target; the default viewer
+  // stays at its 15 Mbps ceiling on the same estimate.
+  const QualitySelection sharp4k = SelectQuality(30'000'000, 5120, 2880, ultra);
+  EXPECT_STREQ(sharp4k.id, "2160p30");
+  EXPECT_EQ(sharp4k.width, 3840);
+  EXPECT_EQ(sharp4k.height, 2160);
+  EXPECT_EQ(sharp4k.bitrate_bps, 30'000'000u);
+  EXPECT_EQ(SelectQuality(30'000'000, 5120, 2880).bitrate_bps, 15'000'000u);
 }
 
 TEST(QualityLadderTest, BacklogPressureLeavesAnUnstrugglingEncoderAlone) {

@@ -21,6 +21,7 @@ import {
   REMOTE_DESKTOP_TERMINAL_REASON,
   isRemoteDesktopPresentedFrameCompatible,
   isRemoteDesktopQualityPreference,
+  legacyRemoteDesktopQualityPreference,
   validateRemoteDesktopAuthorized,
   validateRemoteDesktopDataMessage,
   validateRemoteDesktopServerMessage,
@@ -107,6 +108,8 @@ export interface RemoteDesktopSnapshot {
   atomicButtonClick?: boolean;
   /** The worker honours viewer quality preferences (older workers do not). */
   qualityPreferenceSupported?: boolean;
+  /** ...including Ultra (2160 and a raised bitrate ceiling). */
+  qualityUltraSupported?: boolean;
   /** Ceiling of the relay this session was handed (its TURN tier), if any. */
   relayBitrateCapBps?: number;
   route?: RemoteDesktopRoute;
@@ -765,8 +768,11 @@ export class RemoteDesktopClient {
   }
 
   private flushQualityPreference(): void {
-    const preference = this.effectiveQualityPreference();
-    if (!preference || !this.snapshot.qualityPreferenceSupported || !isOpen(this.controlChannel)) return;
+    const effective = this.effectiveQualityPreference();
+    if (!effective || !this.snapshot.qualityPreferenceSupported || !isOpen(this.controlChannel)) return;
+    const preference = this.snapshot.qualityUltraSupported
+      ? effective
+      : legacyRemoteDesktopQualityPreference(effective);
     const key = JSON.stringify(preference);
     if (key === this.sentQualityPreferenceKey) return;
     if (this.sendControl({
@@ -1261,6 +1267,7 @@ export class RemoteDesktopClient {
           && message.mode === REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
         atomicButtonClick: message.atomicButtonClick === true,
         qualityPreferenceSupported: message.qualityPreference === true,
+        qualityUltraSupported: message.qualityUltra === true,
         viewerCount: message.viewerCount,
         controllerCount: message.controllerCount,
         signInScreen: message.signInScreen === true,

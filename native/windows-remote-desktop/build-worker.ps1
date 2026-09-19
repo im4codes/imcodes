@@ -67,7 +67,8 @@ $ExpectedCommonSources = @(
   'session_core.cc', 'session_core.h',
   'signaling_types.h',
   'transport_session_core.cc', 'transport_session_core.h',
-  'value_types.cc', 'value_types.h'
+  'value_types.cc', 'value_types.h',
+  'video_sender_bitrate.h'
 )
 
 # Qualification builds can be prepared by the SYSTEM node service and then

@@ -1517,6 +1517,14 @@ describe('RemoteDesktopClient', () => {
     const sentAfterCustom = qualityControls().length;
     for (let i = 7; i <= 12; i += 1) await sample(i, 0.4);
     expect(qualityControls()).toHaveLength(sentAfterCustom);
+
+    // Ultra reaches a worker without `qualityUltra` as what it accepts...
+    const ultra = { maxHeight: 2160, maxFps: 30, maxBitrateBps: 30_000_000, priority: 'resolution' } as const;
+    expect(client.setQualityPreference(ultra, { latencyGuard: false })).toBe(true);
+    expect(qualityControls().at(-1)).toMatchObject({ maxHeight: 0, maxBitrateBps: 0, priority: 'resolution' });
+    // ...and as itself, immediately, once the worker says it takes it.
+    socket.receive({ ...status, qualityPreference: true, qualityUltra: true });
+    await vi.waitFor(() => expect(qualityControls().at(-1)).toMatchObject(ultra));
     client.stop();
   });
 

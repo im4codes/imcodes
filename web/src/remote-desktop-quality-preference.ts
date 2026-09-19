@@ -33,7 +33,7 @@ export const DEFAULT_CUSTOM_QUALITY_PREFERENCE: RemoteDesktopQualityPreference =
  * must be one of these so the select always shows what is in effect.
  */
 export const REMOTE_DESKTOP_QUALITY_BITRATE_OPTIONS = [
-  0, 1_000_000, 2_000_000, 4_000_000, 8_000_000, 12_000_000,
+  0, 1_000_000, 2_000_000, 4_000_000, 8_000_000, 12_000_000, 20_000_000, 30_000_000,
 ] as const;
 
 export function defaultRemoteDesktopQualityChoice(): RemoteDesktopQualityChoice {

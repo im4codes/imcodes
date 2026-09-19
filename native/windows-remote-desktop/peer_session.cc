@@ -483,7 +483,10 @@ bool PeerSession::Initialize() {
   if (parameters.encodings.empty()) return false;
   for (webrtc::RtpEncodingParameters& encoding : parameters.encodings) {
     encoding.min_bitrate_bps = static_cast<int>(kMinVideoBitrateBps);
-    encoding.max_bitrate_bps = static_cast<int>(kPerPeerVideoBitrateBps);
+    // The hard per-viewer maximum, set once: after negotiation a changed
+    // bound reconfigures the encoder. The viewer's own ceiling (15 Mbps, or
+    // Ultra's 30) is the estimator bound, ApplyTransportBitratePolicy.
+    encoding.max_bitrate_bps = static_cast<int>(kMaxViewerVideoBitrateBps);
     encoding.max_framerate = 30.0;
   }
   parameters.degradation_preference =
@@ -504,15 +507,20 @@ bool PeerSession::Initialize() {
 
 bool PeerSession::ApplyTransportBitratePolicy(bool direct) {
   if (!peer_) return false;
-  if (direct_bitrate_policy_.has_value() &&
-      *direct_bitrate_policy_ == direct) {
+  // A route change reseeds the estimate; a viewer ceiling change (Ultra) only
+  // moves the bound and keeps the running estimate.
+  const bool reseed = !direct_bitrate_policy_.has_value() ||
+                      *direct_bitrate_policy_ != direct;
+  if (!reseed && applied_bitrate_ceiling_bps_ == viewer_bitrate_ceiling_bps_) {
     return true;
   }
-  const TransportBitratePolicy policy =
-      SelectTransportBitratePolicy(direct, authority_.relay_bitrate_cap_bps);
+  const TransportBitratePolicy policy = SelectTransportBitratePolicy(
+      direct, authority_.relay_bitrate_cap_bps, viewer_bitrate_ceiling_bps_);
   webrtc::BitrateSettings bitrate_settings;
   bitrate_settings.min_bitrate_bps = static_cast<int>(policy.min_bps);
-  bitrate_settings.start_bitrate_bps = static_cast<int>(policy.start_bps);
+  if (reseed) {
+    bitrate_settings.start_bitrate_bps = static_cast<int>(policy.start_bps);
+  }
   bitrate_settings.max_bitrate_bps = static_cast<int>(policy.max_bps);
   const webrtc::RTCError result = peer_->SetBitrate(bitrate_settings);
   if (!result.ok()) {
@@ -521,6 +529,7 @@ bool PeerSession::ApplyTransportBitratePolicy(bool direct) {
     return false;
   }
   direct_bitrate_policy_ = direct;
+  applied_bitrate_ceiling_bps_ = viewer_bitrate_ceiling_bps_;
   return true;
 }
 
@@ -1229,9 +1238,11 @@ void PeerSession::HandleControl(const std::string& channel,
     const unsigned fps = root["maxFps"].asUInt();
     const unsigned bitrate = root["maxBitrateBps"].asUInt();
     const std::string priority = root["priority"].asString();
-    if (!(height == 0 || height == 720 || height == 1080 || height == 1440) ||
+    if (!(height == 0 || height == 720 || height == 1080 || height == 1440 ||
+          height == 2160) ||
         !(fps == 15 || fps == 30 || fps == 60) ||
-        !(bitrate == 0 || (bitrate >= 350'000 && bitrate <= 15'000'000)) ||
+        !(bitrate == 0 || (bitrate >= kMinVideoBitrateBps &&
+                           bitrate <= kMaxViewerVideoBitrateBps)) ||
         !(priority == "framerate" || priority == "balanced" ||
           priority == "resolution")) {
       return;
@@ -1247,6 +1258,13 @@ void PeerSession::HandleControl(const std::string& channel,
                                     ? QualityPriority::kResolution
                                     : QualityPriority::kBalanced;
     transport_core_.SetQualityPreference(preference);
+    const uint32_t ceiling = ViewerVideoBitrateCeiling(preference);
+    if (ceiling != viewer_bitrate_ceiling_bps_) {
+      viewer_bitrate_ceiling_bps_ = ceiling;
+      if (direct_bitrate_policy_.has_value()) {
+        (void)ApplyTransportBitratePolicy(*direct_bitrate_policy_);
+      }
+    }
     return;
   }
   for (const char* quality_key :
@@ -1686,6 +1704,8 @@ void PeerSession::SendStatus(const char* state, bool input_enabled) {
   root["atomicButtonClick"] = true;
   // Honours set_quality_preference; the browser sends it only when true.
   root["qualityPreference"] = true;
+  // ...including Ultra: maxHeight 2160 and a raised bitrate ceiling.
+  root["qualityUltra"] = true;
   if (!input_enabled) {
     // A session that is connected and controlling but cannot type is the most
     // opaque state this protocol has: every control greys out with nothing to

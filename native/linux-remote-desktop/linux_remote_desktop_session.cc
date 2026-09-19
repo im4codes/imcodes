@@ -24,6 +24,7 @@
 #include "../remote-desktop-common/data_channel_payload.h"
 #include "../remote-desktop-common/json_protocol.h"
 #include "../remote-desktop-common/quality_ladder.h"
+#include "../remote-desktop-common/video_sender_bitrate.h"
 
 namespace imcodes::remote_desktop::linux_platform {
 namespace {
@@ -369,6 +370,18 @@ bool LinuxRemoteDesktopSession::StartTransport(
     peer_ = nullptr;
     return false;
   }
+  // Left unset, libwebrtc holds the whole stream to 2.5 Mbps. The encoding
+  // carries the hard per-viewer maximum; the viewer's own ceiling is the
+  // estimator bound, which moves without resetting the encoder.
+  if (!imcodes::rd::ApplyVideoSenderBitrateLimits(
+          *peer_, imcodes::rd::kMinVideoBitrateBps,
+          imcodes::rd::kMaxViewerVideoBitrateBps) ||
+      !ApplyViewerBitrateCeiling(imcodes::rd::kPerPeerVideoBitrateBps)) {
+    std::fprintf(stderr, "linux session: video bitrate limits refused\n");
+    peer_->Close();
+    peer_ = nullptr;
+    return false;
+  }
 
   // SessionCore owns input-ledger dispatch independently of the transport;
   // starting it here (once capture/display are already known good, same as
@@ -423,6 +436,16 @@ bool LinuxRemoteDesktopSession::EmitLocalIceCandidate(
     const common::IceCandidate& candidate) {
   if (emit_ice_candidate_) emit_ice_candidate_(candidate.media_id, candidate.candidate);
   return true;
+}
+
+bool LinuxRemoteDesktopSession::ApplyViewerBitrateCeiling(
+    std::uint32_t ceiling_bps) {
+  if (!peer_) return false;
+  webrtc::BitrateSettings settings;
+  settings.min_bitrate_bps =
+      static_cast<int>(imcodes::rd::kMinVideoBitrateBps);
+  settings.max_bitrate_bps = static_cast<int>(ceiling_bps);
+  return peer_->SetBitrate(settings).ok();
 }
 
 bool LinuxRemoteDesktopSession::ApplyQuality(
@@ -853,6 +876,12 @@ void LinuxRemoteDesktopSession::HandleDataChannelMessage(
     const std::optional<imcodes::rd::QualityPreference> preference =
         imcodes::rd::QualityPreferenceFromControl(message.control);
     if (!preference || !transport_core_.SetQualityPreference(*preference)) {
+      return;
+    }
+    // The builtin encoder takes its bitrate from libwebrtc's estimate, so the
+    // viewer's ceiling (Ultra raises it) bounds that estimate.
+    if (!ApplyViewerBitrateCeiling(
+            imcodes::rd::ViewerVideoBitrateCeiling(*preference))) {
       return;
     }
     accepted = true;

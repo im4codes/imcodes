@@ -7,6 +7,7 @@ constexpr char kTerminalCapabilityUnavailable[] = "capability_unavailable";
 constexpr char kTerminalPeerFailed[] = "peer_failed";
 constexpr char kTerminalProtocolError[] = "protocol_error";
 constexpr char kTerminalStoppedByController[] = "stopped_by_controller";
+constexpr char kTerminalSessionLimit[] = "session_limit";
 
 HostCommandResult EmissionFailure() {
   return {HostCommandDisposition::kTerminate, kDiagMessageEmissionFailed};
@@ -35,6 +36,18 @@ HostCommandResult DispatchHostCommand(
   if (session == nullptr || sink == nullptr || now_unix_ms < 0 ||
       now_monotonic_ms < 0) {
     return {HostCommandDisposition::kTerminate, kDiagMalformedCommand};
+  }
+
+  // One route per worker. A second viewer's PREPARE is refused for that
+  // viewer alone, and its later OFFER/ICE/LEASE/STOP are dropped: answering
+  // any of them by ending the worker took the live viewer down with it, so
+  // two windows on one Mac both disconnected.
+  if (session->ServesOtherRoute(signal.authority)) {
+    if (signal.kind == rd::Signal::Kind::kPrepare &&
+        !sink->EmitTerminal(signal.authority, kTerminalSessionLimit)) {
+      return EmissionFailure();
+    }
+    return {HostCommandDisposition::kContinue, kDiagCommandRejected};
   }
 
   if (signal.kind == rd::Signal::Kind::kStop) {

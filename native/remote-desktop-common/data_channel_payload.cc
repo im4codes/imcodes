@@ -617,9 +617,11 @@ void SkipWhitespace(std::string_view text, std::size_t* index) {
     const std::uint64_t bitrate = *out->control.max_bitrate_bps;
     const std::string& prio = *out->control.priority;
     return (height == 0 || height == 720 || height == 1080 ||
-            height == 1440) &&
+            height == 1440 || height == 2160) &&
            (fps == 15 || fps == 30 || fps == 60) &&
-           (bitrate == 0 || (bitrate >= 350'000 && bitrate <= 15'000'000)) &&
+           (bitrate == 0 ||
+            (bitrate >= imcodes::rd::kMinVideoBitrateBps &&
+             bitrate <= imcodes::rd::kMaxViewerVideoBitrateBps)) &&
            (prio == "framerate" || prio == "balanced" ||
             prio == "resolution");
   }

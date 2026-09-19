@@ -45,6 +45,11 @@ class HostCommandSessionSeam {
                        std::int64_t now_unix_ms,
                        std::int64_t now_monotonic_ms) = 0;
   virtual bool Stop(const rd::Authority& authority) = 0;
+  // True while this worker serves a live route and `authority` is a
+  // different one. A worker serves one route; another viewer's commands must
+  // not end it.
+  [[nodiscard]] virtual bool ServesOtherRoute(
+      const rd::Authority& authority) const = 0;
 };
 
 /** Route admission owned by the separate signed disclosure component. */
