@@ -52,8 +52,17 @@ function sink(): { written: () => string; write: (data: BufferSource) => Promise
   };
 }
 
+// The request carries a plain-object `headers`. Read it directly: jsdom's own
+// `Headers` (the web-unit environment) drops `Range` from a Headers built out of
+// it, so `new Headers(init.headers).get('Range')` reads null there.
 function rangeOf(call: unknown[]): string | null {
-  return new Headers((call[1] as RequestInit | undefined)?.headers).get('Range');
+  const headers = (call[1] as RequestInit | undefined)?.headers;
+  if (!headers) return null;
+  if (headers instanceof Array) return headers.find(([name]) => name.toLowerCase() === 'range')?.[1] ?? null;
+  if (typeof (headers as Headers).get === 'function') return (headers as Headers).get('Range');
+  const record = headers as Record<string, string>;
+  const key = Object.keys(record).find((name) => name.toLowerCase() === 'range');
+  return key ? record[key]! : null;
 }
 
 describe('HTTP attachment download resume', () => {
@@ -63,6 +72,11 @@ describe('HTTP attachment download resume', () => {
     vi.resetModules();
     fetchMock.mockReset();
     vi.stubGlobal('fetch', fetchMock);
+    // The web-unit environment's jsdom `Headers` silently drops `Range` (it is
+    // not a safelisted request header there), which hides the very header these
+    // tests assert on. api.ts builds its request headers with the global
+    // `Headers`, so give it the platform implementation the way a browser has.
+    vi.stubGlobal('Headers', new Response().headers.constructor);
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
   });
 
