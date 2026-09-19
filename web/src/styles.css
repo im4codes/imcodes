@@ -10376,29 +10376,44 @@ button.quick-agent-delegation-preset.active {
 }
 
 .remote-desktop-minimized-dock {
+  /* Corner fallback; the component pins it under the AI Desk shortcut when
+     that is on screen. Small on purpose -- it is only a way back. */
   position: fixed;
   right: calc(14px + env(safe-area-inset-right, 0px));
   bottom: calc(14px + env(safe-area-inset-bottom, 0px));
   z-index: 10020;
-  width: min(270px, calc(100vw - 28px));
-  min-height: 54px;
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 10px;
-  padding: 9px 11px;
+  max-width: min(220px, calc(100vw - 28px));
+  height: 23px;
+  padding: 0 9px;
+  overflow: hidden;
   color: #dbeafe;
+  font-size: 11px;
+  line-height: 21px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
   text-align: left;
   background: linear-gradient(145deg, rgb(11 24 40 / 98%), rgb(5 14 25 / 98%));
   border: 1px solid rgb(104 196 255 / 42%);
-  border-radius: 10px;
-  box-shadow: 0 14px 40px rgb(0 0 0 / 48%), 0 0 18px rgb(34 211 238 / 10%);
+  border-radius: 7px;
+  box-shadow: 0 4px 14px rgb(0 0 0 / 40%);
   cursor: pointer;
+}
+
+/* Frame of the window that just minimized, flying into the chip. */
+.remote-desktop-minimize-ghost {
+  position: fixed;
+  z-index: 10019;
+  box-sizing: border-box;
+  pointer-events: none;
+  background: linear-gradient(145deg, rgb(11 24 40 / 92%), rgb(5 14 25 / 92%));
+  border: 1px solid rgb(104 196 255 / 55%);
+  border-radius: 10px;
+  box-shadow: 0 10px 30px rgb(0 0 0 / 40%);
 }
 
 .remote-desktop-minimized-dock:hover {
   border-color: rgb(104 196 255 / 72%);
-  box-shadow: 0 16px 44px rgb(0 0 0 / 55%), 0 0 22px rgb(34 211 238 / 18%);
+  box-shadow: 0 4px 14px rgb(0 0 0 / 50%), 0 0 12px rgb(34 211 238 / 18%);
 }
 
 .remote-desktop-minimized-status {

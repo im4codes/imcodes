@@ -15,6 +15,11 @@ import { mutateRemoteDesktopWallWithOneReplay } from '../remote-desktop-wall-sto
 import type { RemoteDesktopWorkspaceMachine } from '../remote-desktop-workspace-state.js';
 import { canOpenRemoteDesktopMachine } from '../remote-desktop-profile.js';
 import { FloatingPanel } from './FloatingPanel.js';
+import {
+  RemoteDesktopMinimizedDock,
+  rememberMinimizeOrigin,
+  type RemoteDesktopMinimizeOrigin,
+} from './RemoteDesktopMinimizedDock.js';
 import { RemoteDesktopWallTile } from './RemoteDesktopWallTile.js';
 import './remote-desktop-workspace.css';
 import { MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
@@ -78,6 +83,7 @@ export function RemoteDesktopWall({
   const [retryGeneration, setRetryGeneration] = useState(0);
   const [mobileColumns, setMobileColumns] = useState<MobileWallColumns>(readMobileWallColumns);
   const addButtonRef = useRef<HTMLButtonElement>(null);
+  const minimizeOriginRef = useRef<RemoteDesktopMinimizeOrigin | null>(null);
 
   const toggleMobileColumns = useCallback(() => {
     setMobileColumns((current) => {
@@ -227,7 +233,7 @@ export function RemoteDesktopWall({
             </button>
           )}
           {onMinimize && (
-            <button class="remote-desktop-workspace-chrome-button" type="button" onClick={onMinimize} aria-label={t('window.minimize')}>
+            <button class="remote-desktop-workspace-chrome-button" type="button" onClick={(event) => { rememberMinimizeOrigin(minimizeOriginRef, event.currentTarget); onMinimize(); }} aria-label={t('window.minimize')}>
               <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 8 5 5 5-5" /></svg>
             </button>
           )}
@@ -316,9 +322,11 @@ export function RemoteDesktopWall({
         >{content}</FloatingPanel>
       </div>
       {minimized && (
-        <button type="button" class="remote-desktop-minimized-dock" onClick={onRestore}>
-          {t('remote_desktop.workspace_wall')} · {snapshot?.hosts.length ?? 0}
-        </button>
+        <RemoteDesktopMinimizedDock
+          originRef={minimizeOriginRef}
+          onRestore={() => onRestore?.()}
+          label={`${t('remote_desktop.workspace_wall')} · ${snapshot?.hosts.length ?? 0}`}
+        />
       )}
     </>
   );

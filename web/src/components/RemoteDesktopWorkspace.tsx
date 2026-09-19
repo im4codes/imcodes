@@ -19,6 +19,11 @@ import { openRemoteDesktopWindow } from '../remote-desktop-window.js';
 import { useFullscreen } from '../hooks/useFullscreen.js';
 import { FloatingPanel } from './FloatingPanel.js';
 import { RemoteDesktopPanel } from './RemoteDesktopPanel.js';
+import {
+  RemoteDesktopMinimizedDock,
+  rememberMinimizeOrigin,
+  type RemoteDesktopMinimizeOrigin,
+} from './RemoteDesktopMinimizedDock.js';
 import type { UseQuickDataResult } from './QuickInputPanel.js';
 import { ControlledNodeMachineMenu } from './ControlledNodeMachineMenu.js';
 import './remote-desktop-workspace.css';
@@ -75,6 +80,7 @@ export function RemoteDesktopWorkspace({
 }: RemoteDesktopWorkspaceProps) {
   const { t } = useTranslation();
   const workspaceRef = useRef<HTMLDivElement | null>(null);
+  const minimizeOriginRef = useRef<RemoteDesktopMinimizeOrigin | null>(null);
   // Fullscreen on the workspace, not on the active panel: the tab bar has to
   // come with it, or fullscreen becomes a one-way door out of every other
   // machine you had open.
@@ -241,7 +247,10 @@ export function RemoteDesktopWorkspace({
             <button
               class="remote-desktop-workspace-chrome-button"
               type="button"
-              onClick={onMinimize}
+              onClick={(event) => {
+                rememberMinimizeOrigin(minimizeOriginRef, event.currentTarget);
+                onMinimize();
+              }}
               aria-label={t('window.minimize')}
               title={t('window.minimize')}
             ><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 13h10" /></svg></button>
@@ -321,15 +330,15 @@ export function RemoteDesktopWorkspace({
         >{content}</FloatingPanel>
       </div>
       {minimized && (
-        <button
-          type="button"
-          class="remote-desktop-minimized-dock"
-          onClick={() => {
+        <RemoteDesktopMinimizedDock
+          originRef={minimizeOriginRef}
+          onRestore={() => {
             onRestore?.();
             onFocus?.();
           }}
-          aria-label={t('remote_desktop.workspace_restore', { count: hosts.length })}
-        >{t('remote_desktop.workspace_title')} · {hosts.length}</button>
+          ariaLabel={t('remote_desktop.workspace_restore', { count: hosts.length })}
+          label={`${t('remote_desktop.workspace_title')} · ${hosts.length}`}
+        />
       )}
     </>
   );
