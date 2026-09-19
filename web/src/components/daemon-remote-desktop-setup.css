@@ -3,8 +3,13 @@
   z-index: 10030;
 }
 
-.daemon-rd-setup {
+/* `.dialog` (styles.css) sets `width: 100%`; at equal specificity whichever
+   stylesheet the bundler emits last wins, and it was that one -- the setup
+   dialog stretched across the whole window. Compound selector so this always
+   wins, and cap it so it stays a normal-sized dialog on any screen. */
+.dialog.daemon-rd-setup {
   width: min(520px, calc(100vw - 24px));
+  max-width: 520px;
 }
 
 .daemon-rd-setup .dialog-body {
