@@ -1388,6 +1388,78 @@ describe('RemoteDesktopClient', () => {
     client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
   });
 
+  it('measures resolution, FPS, bitrate and round trip in the browser when the worker reports no quality', async () => {
+    // macOS and Linux workers send no QUALITY frames; the footer must still show
+    // speed, frame rate and latency, measured from the browser's own stats.
+    const intervalSpy = vi.spyOn(globalThis, 'setInterval');
+    let socket!: FakeSocket;
+    let peer!: FakePeer;
+    let now = 0;
+    const client = new RemoteDesktopClient('controlled-mac', { onSnapshot: vi.fn() }, {
+      fetchTicket: async () => 'ticket-browser-quality',
+      createSocket: () => {
+        socket = new FakeSocket();
+        queueMicrotask(() => socket.open());
+        return socket as unknown as WebSocket;
+      },
+      createPeer: () => {
+        peer = new FakePeer();
+        return peer as unknown as RTCPeerConnection;
+      },
+      now: () => now,
+      isDocumentVisible: () => true,
+    });
+
+    await client.start();
+    const start = JSON.parse(socket.sent[0]!) as { requestId: string };
+    socket.receive({
+      type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+      requestId: start.requestId,
+      sessionId: 'session_browserq1',
+      capability: 'b'.repeat(43),
+      expiresAt: 60_000,
+      leaseExpiresAt: 15_000,
+      daemonGeneration: 1,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      iceServers: [],
+    });
+    await vi.waitFor(() => expect(peer).toBeDefined());
+    // Before the first frame has a size there is nothing to show.
+    peer.stats = [{ type: 'inbound-rtp', kind: 'video', bytesReceived: 0, timestamp: 0 }];
+    peer.connect();
+    const statsTick = intervalSpy.mock.calls.find((call) => call[1] === 1_000)?.[0] as (() => void);
+    expect(statsTick).toBeTypeOf('function');
+    await vi.waitFor(() => expect(client.current().durationMs).toBeDefined());
+    expect(client.current().quality).toBeUndefined();
+
+    now = 1_000;
+    peer.stats = [
+      {
+        type: 'inbound-rtp', kind: 'video', bytesReceived: 500_000, timestamp: 1_000,
+        frameWidth: 2560, frameHeight: 1440, framesPerSecond: 24, framesDropped: 2,
+      },
+      { type: 'candidate-pair', state: 'succeeded', nominated: true, currentRoundTripTime: 0.045 },
+    ];
+    statsTick();
+    now = 2_000;
+    peer.stats = [
+      {
+        type: 'inbound-rtp', kind: 'video', bytesReceived: 900_000, timestamp: 2_000,
+        frameWidth: 2560, frameHeight: 1440, framesPerSecond: 24, framesDropped: 2,
+      },
+      { type: 'candidate-pair', state: 'succeeded', nominated: true, currentRoundTripTime: 0.045 },
+    ];
+    statsTick();
+    await vi.waitFor(() => expect(client.current().quality?.bitrateBps).toBeGreaterThan(0));
+    expect(client.current().quality).toMatchObject({
+      width: 2560, height: 1440, fps: 24, droppedFrames: 2, rttMs: 45,
+    });
+    expect(client.current().quality?.encoderClass).toBeUndefined();
+    expect(client.current().quality?.preset).toBeUndefined();
+    client.stop();
+  });
+
   it('ICE-restarts a foreground media stall but pauses the watchdog while hidden', async () => {
     const intervalSpy = vi.spyOn(globalThis, 'setInterval');
     let socket!: FakeSocket;

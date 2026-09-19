@@ -93,7 +93,14 @@ export interface RemoteDesktopSnapshot {
   displays: RemoteDesktopDisplay[];
   selectedDisplayId?: string;
   layoutRevision: number;
-  quality?: Omit<RemoteDesktopQuality, 'type' | 'protocolVersion' | 'sessionId' | 'sequence'>;
+  /**
+   * Live stream quality. The browser measures resolution, frame rate,
+   * bitrate, round trip and dropped frames itself from its own WebRTC stats,
+   * so these are present on every platform; `preset` / `encoderClass` exist
+   * only when the worker reports them (Windows today).
+   */
+  quality?: Omit<RemoteDesktopQuality, 'type' | 'protocolVersion' | 'sessionId' | 'sequence' | 'preset' | 'encoderClass'>
+    & Partial<Pick<RemoteDesktopQuality, 'preset' | 'encoderClass'>>;
   stream: MediaStream | null;
   terminalReason?: string;
   error?: string;
@@ -1538,9 +1545,13 @@ export class RemoteDesktopClient {
             ?? (typeof document === 'undefined' || document.visibilityState === 'visible'),
         });
       }
-      const quality = this.snapshot.quality;
+      // A worker that reports its own quality (Windows) supplies the baseline
+      // plus encoder/preset; the macOS and Linux workers do not, so the
+      // browser's own measurements are the whole picture there.
+      const quality = this.snapshot.quality
+        ?? { width: 0, height: 0, fps: 0, bitrateBps: 0, droppedFrames: 0, rttMs: 0 };
       const durationMs = Math.max(0, (this.deps.now?.() ?? Date.now()) - this.startedAt);
-      if (!inbound || !quality) {
+      if (!inbound) {
         // The pointer counters are the one diagnostic that matters most before
         // there is a picture to measure -- "is anything being sent at all" --
         // so they must not ride along with the quality publish alone.
@@ -1630,15 +1641,19 @@ export class RemoteDesktopClient {
         pointerMoveBackpressureDrops: this.pointerMoveBackpressureDrops,
         pointerMoveSendFailures: this.pointerMoveSendFailures,
         durationMs,
-        quality: {
-          ...quality,
-          width,
-          height,
-          fps,
-          bitrateBps,
-          droppedFrames,
-          ...(rttMs === undefined ? {} : { rttMs }),
-        },
+        // Browser-only measurements start once the first frame has a size;
+        // before that there is nothing meaningful to show ("0x0 · 0 FPS").
+        ...(this.snapshot.quality || width > 0 ? {
+          quality: {
+            ...quality,
+            width,
+            height,
+            fps,
+            bitrateBps,
+            droppedFrames,
+            ...(rttMs === undefined ? {} : { rttMs }),
+          },
+        } : {}),
       });
     } catch {
       // Stats are diagnostics only and never change media/input authority.

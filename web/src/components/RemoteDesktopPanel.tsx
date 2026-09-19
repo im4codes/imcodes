@@ -3858,8 +3858,12 @@ export function RemoteDesktopPanel({
                 <>
                   <span>{snapshot.quality.width}×{snapshot.quality.height} · {snapshot.quality.fps.toFixed(0)} FPS</span>
                   <span>{(snapshot.quality.bitrateBps / 1_000_000).toFixed(1)} Mbps · {snapshot.quality.rttMs.toFixed(0)} ms</span>
-                  <span>{t('remote_desktop.encoder', { encoder: snapshot.quality.encoderClass })}</span>
-                  <span>{t('remote_desktop.quality', { preset: snapshot.quality.preset })}</span>
+                  {snapshot.quality.encoderClass && (
+                    <span>{t('remote_desktop.encoder', { encoder: snapshot.quality.encoderClass })}</span>
+                  )}
+                  {snapshot.quality.preset && (
+                    <span>{t('remote_desktop.quality', { preset: snapshot.quality.preset })}</span>
+                  )}
                   <span>{t('remote_desktop.dropped_frames', { count: snapshot.quality.droppedFrames })}</span>
                 </>
               )}
