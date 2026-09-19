@@ -3,6 +3,11 @@ import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import { MACHINE_HOST_LINK_ERROR } from '@shared/machine-reference.js';
 import {
+  REMOTE_DESKTOP_LOGIN_SCREEN_ERROR,
+  REMOTE_DESKTOP_LOGIN_SCREEN_STATE,
+  type RemoteDesktopLoginScreenState,
+} from '@shared/remote-desktop-login-screen.js';
+import {
   ApiError,
   controlledNodeDownloadErrorKey,
   createControlledNodeInstallCommand,
@@ -33,6 +38,19 @@ const PLATFORM_KEY: Record<ControlledNodeOs, string> = {
   win: 'remote_desktop.platform_win',
 };
 
+/** Why an automatic install did not happen, in the reader's words. */
+const AUTO_INSTALL_ERROR_KEY: Record<string, string> = {
+  [REMOTE_DESKTOP_LOGIN_SCREEN_ERROR.ADMIN_REQUIRED]: 'remote_desktop.setup_auto_error_admin_required',
+  [REMOTE_DESKTOP_LOGIN_SCREEN_ERROR.ELEVATION_DECLINED]: 'remote_desktop.setup_auto_error_elevation_declined',
+  [REMOTE_DESKTOP_LOGIN_SCREEN_ERROR.INSTALL_FAILED]: 'remote_desktop.setup_auto_error_install_failed',
+  [REMOTE_DESKTOP_LOGIN_SCREEN_ERROR.NOT_BOUND]: 'remote_desktop.setup_auto_error_not_bound',
+  [REMOTE_DESKTOP_LOGIN_SCREEN_ERROR.UNSUPPORTED_PLATFORM]: 'remote_desktop.setup_auto_error_unsupported_platform',
+};
+
+/** How long the dialog keeps looking for the freshly installed node. */
+const FOLLOW_UP_READ_INTERVAL_MS = 3_000;
+const FOLLOW_UP_MAX_READS = 60;
+
 /** How to run the copied command on each system (elevation differs). */
 const USAGE_KEY: Record<ControlledNodeOs, string> = {
   linux: 'controlled_nodes.usage_linux_command',
@@ -49,6 +67,15 @@ export interface DaemonRemoteDesktopSetupProps {
   onOpen(machine: MachineListItem): void;
   /** Re-read the machine list after a link, unlink or install changed it. */
   onChanged(): void | Promise<unknown>;
+  /**
+   * Present when this daemon can install the controlled node on its own
+   * computer and the viewer is its owner: one confirmation instead of a
+   * command to paste into a terminal there.
+   */
+  installHere?: {
+    state: { state: RemoteDesktopLoginScreenState; error?: string } | null;
+    start(): void;
+  };
 }
 
 /**
@@ -69,6 +96,7 @@ export function DaemonRemoteDesktopSetup({
   onClose,
   onOpen,
   onChanged,
+  installHere,
 }: DaemonRemoteDesktopSetupProps) {
   const { t } = useTranslation();
   const linked = machines.find((machine) => machine.hostServerId === serverId) ?? null;
@@ -88,6 +116,13 @@ export function DaemonRemoteDesktopSetup({
   const [targetsFailed, setTargetsFailed] = useState(false);
   const [copyingKey, setCopyingKey] = useState<string | null>(null);
   const [copied, setCopied] = useState<ControlledNodeArtifactSelection | null>(null);
+  const [confirmingInstall, setConfirmingInstall] = useState(false);
+  const [manualRequested, setManualRequested] = useState(false);
+  // Set once this dialog's automatic install finished: from then on, whatever
+  // the new node still needs -- its remote-desktop component, the Mac's
+  // permissions -- is asked for without another click.
+  const [followUp, setFollowUp] = useState(false);
+  const followUpSteps = useRef(new Set<string>());
   const mountedRef = useRef(true);
 
   useEffect(() => () => { mountedRef.current = false; }, []);
@@ -105,6 +140,28 @@ export function DaemonRemoteDesktopSetup({
       .finally(() => { if (!cancelled) setTargetsLoading(false); });
     return () => { cancelled = true; };
   }, [linked === null]);
+
+  const autoState = installHere?.state?.state ?? null;
+  useEffect(() => {
+    if (autoState === REMOTE_DESKTOP_LOGIN_SCREEN_STATE.COMPLETED) setFollowUp(true);
+  }, [autoState]);
+
+  // The node enrols a moment after the installer finishes; keep re-reading the
+  // list (bounded) until it is linked here and ready to open.
+  const linkedReady = linked !== null && canOpenRemoteDesktopMachine(linked);
+  useEffect(() => {
+    if (!followUp || linkedReady) return;
+    let reads = 0;
+    const timer = setInterval(() => {
+      reads += 1;
+      if (reads > FOLLOW_UP_MAX_READS) {
+        clearInterval(timer);
+        return;
+      }
+      void onChanged();
+    }, FOLLOW_UP_READ_INTERVAL_MS);
+    return () => clearInterval(timer);
+  }, [followUp, linkedReady]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -159,6 +216,29 @@ export function DaemonRemoteDesktopSetup({
       if (mountedRef.current) setCopyingKey(null);
     }
   };
+
+  // Each follow-up step at most once, with the same calls the buttons below
+  // (and the controlled-machine list's permission button) make.
+  useEffect(() => {
+    if (!followUp || !linked || busy !== null || canOpenRemoteDesktopMachine(linked)) return;
+    const node = linked;
+    if (canInstallRemoteDesktopWorker(node) && !followUpSteps.current.has('install')) {
+      followUpSteps.current.add('install');
+      void run(
+        'install',
+        () => installMachineRemoteDesktopWorker(node.serverId),
+        () => t('remote_desktop.install_failed'),
+      );
+    } else if (needsRemoteDesktopPermission(node) && !followUpSteps.current.has('permission')) {
+      // Raises the Screen Recording and Accessibility prompts on that Mac.
+      followUpSteps.current.add('permission');
+      void run(
+        'permission',
+        () => requestMachineRemoteDesktopPermissions(node.serverId),
+        () => t('remote_desktop.request_permission_failed'),
+      );
+    }
+  }, [followUp, linked, busy]);
 
   const linkedStatus = (node: MachineListItem) => {
     if (canOpenRemoteDesktopMachine(node)) {
@@ -249,6 +329,72 @@ export function DaemonRemoteDesktopSetup({
             </section>
           ) : (
             <>
+              {installHere && (
+                <section class="daemon-rd-setup-section" data-testid="daemon-rd-setup-auto-install">
+                  <h3>{t('remote_desktop.setup_auto_heading')}</h3>
+                  <p class="daemon-rd-setup-note">{t('remote_desktop.setup_auto_hint')}</p>
+                  {(() => {
+                    const progress = installHere.state?.state;
+                    if (progress === REMOTE_DESKTOP_LOGIN_SCREEN_STATE.DOWNLOADING
+                      || progress === REMOTE_DESKTOP_LOGIN_SCREEN_STATE.ELEVATING
+                      || progress === REMOTE_DESKTOP_LOGIN_SCREEN_STATE.COMPLETED) {
+                      return (
+                        <p class="daemon-rd-setup-note" role="status">
+                          {t(progress === REMOTE_DESKTOP_LOGIN_SCREEN_STATE.DOWNLOADING
+                            ? 'remote_desktop.setup_auto_downloading'
+                            : progress === REMOTE_DESKTOP_LOGIN_SCREEN_STATE.ELEVATING
+                              ? 'remote_desktop.setup_auto_elevating'
+                              : 'remote_desktop.setup_auto_completed')}
+                        </p>
+                      );
+                    }
+                    if (confirmingInstall) {
+                      return (
+                        <div class="daemon-rd-setup-link-row">
+                          <p class="daemon-rd-setup-note">
+                            {t('remote_desktop.setup_auto_confirm', { server: serverName || serverId })}
+                          </p>
+                          <button
+                            type="button"
+                            class="daemon-rd-setup-primary"
+                            onClick={() => {
+                              setConfirmingInstall(false);
+                              installHere.start();
+                            }}
+                          >{t('remote_desktop.setup_auto_confirm_action')}</button>
+                          <button
+                            type="button"
+                            class="daemon-rd-setup-secondary"
+                            onClick={() => setConfirmingInstall(false)}
+                          >{t('common.cancel')}</button>
+                        </div>
+                      );
+                    }
+                    const failure = progress === REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED
+                      ? t(AUTO_INSTALL_ERROR_KEY[installHere.state?.error ?? '']
+                        ?? 'remote_desktop.setup_auto_error_download_failed')
+                      : null;
+                    return (
+                      <>
+                        {failure && <p class="daemon-rd-setup-error" role="alert">{failure}</p>}
+                        <button
+                          type="button"
+                          class="daemon-rd-setup-primary"
+                          onClick={() => setConfirmingInstall(true)}
+                        >{t(failure ? 'remote_desktop.setup_auto_retry' : 'remote_desktop.setup_auto_action')}</button>
+                      </>
+                    );
+                  })()}
+                </section>
+              )}
+              {installHere && !manualRequested && autoState !== REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED && (
+                <button
+                  type="button"
+                  class="daemon-rd-setup-secondary"
+                  onClick={() => setManualRequested(true)}
+                >{t('remote_desktop.setup_auto_manual')}</button>
+              )}
+              {(!installHere || manualRequested || autoState === REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED) && (
               <section class="daemon-rd-setup-section" data-testid="daemon-rd-setup-install">
                 <h3>{t('remote_desktop.setup_install_heading')}</h3>
                 <p class="daemon-rd-setup-note">{t('remote_desktop.setup_install_hint')}</p>
@@ -276,6 +422,7 @@ export function DaemonRemoteDesktopSetup({
                 })}
                 {copied && <p class="daemon-rd-setup-note daemon-rd-setup-usage">{t(USAGE_KEY[copied.os])}</p>}
               </section>
+              )}
 
               <section class="daemon-rd-setup-section" data-testid="daemon-rd-setup-link">
                 <h3>{t('remote_desktop.setup_link_heading')}</h3>

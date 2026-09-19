@@ -17,6 +17,9 @@ const setHostServer = vi.fn(async () => undefined);
 const requestPermissions = vi.fn(async () => undefined);
 const listAvailable = vi.fn(async () => ({ available: [], artifacts: [] as unknown[] }));
 const createInstallCommand = vi.fn(async () => ({ command: 'curl … | sudo sh', expiresAt: 1, ticketId: 't' }));
+const mintInstallCommand = vi.fn(async () => ({
+  command: 'curl … | sudo sh', installCode: 'ABCDEFGHJKMN', expiresAt: 1, ticketId: 't',
+}));
 const refetch = vi.fn(async () => null);
 /**
  * One mintable Desk, auto-selected. Before R5 this call passed `serverId` where
@@ -33,6 +36,7 @@ vi.mock('../../src/api.js', async (importOriginal) => ({
 vi.mock('../../src/api/machines.js', async (importOriginal) => ({
   ...(await importOriginal() as Record<string, unknown>),
   mintControlledNodeExecutableTicket: (...args: unknown[]) => mintTicket(...args as []),
+  mintControlledNodeInstallCommand: (...args: unknown[]) => mintInstallCommand(...args as []),
   setMachineHostServer: (...args: unknown[]) => setHostServer(...args as []),
   requestMachineRemoteDesktopPermissions: (...args: unknown[]) => requestPermissions(...args as []),
   listAvailableExecutables: () => listAvailable(),
@@ -68,6 +72,7 @@ const {
   REMOTE_DESKTOP_LOGIN_SCREEN_MSG,
   REMOTE_DESKTOP_LOGIN_SCREEN_STATE,
   REMOTE_DESKTOP_LOGIN_SCREEN_ERROR,
+  controlledNodeInstallHereCapability,
 } = await import('@shared/remote-desktop-login-screen.js');
 const {
   REMOTE_DESKTOP_ENCODER_CAPABILITY,
@@ -210,6 +215,89 @@ describe('DaemonRemoteDesktopControl', () => {
       await waitFor(() => expect(createInstallCommand).toHaveBeenCalledWith({ os: 'linux', arch: 'x64' }, 'server_1'));
       // Then says how to run it on that system.
       await screen.findByText('controlled_nodes.usage_linux_command');
+    });
+
+    it('installs the controlled node through the daemon after one confirmation', async () => {
+      const { view, sent, emit } = mount([controlledNodeInstallHereCapability({ os: 'linux', arch: 'x64' })]);
+      fireEvent.click(view.container.querySelector('button')!);
+      fireEvent.click(await screen.findByText('remote_desktop.setup_auto_action'));
+      // Nothing happens until the owner confirms.
+      expect(mintInstallCommand).not.toHaveBeenCalled();
+      screen.getByText('remote_desktop.setup_auto_confirm');
+      fireEvent.click(screen.getByText('remote_desktop.setup_auto_confirm_action'));
+
+      // Minted for this daemon's own artifact, so the node links itself.
+      await waitFor(() => expect(mintInstallCommand).toHaveBeenCalledWith({ os: 'linux', arch: 'x64' }, 'server_1'));
+      await waitFor(() => expect(sent).toContainEqual({
+        type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST,
+        installCode: 'ABCDEFGHJKMN',
+      }));
+      await screen.findByText('remote_desktop.setup_auto_downloading');
+
+      act(() => emit({ type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.STATE, state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.ELEVATING }));
+      await screen.findByText('remote_desktop.setup_auto_elevating');
+      act(() => emit({
+        type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.STATE,
+        state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED,
+        error: REMOTE_DESKTOP_LOGIN_SCREEN_ERROR.ADMIN_REQUIRED,
+      }));
+      await screen.findByText('remote_desktop.setup_auto_error_admin_required');
+      // The copyable command stays right there for that case.
+      screen.getByText('remote_desktop.setup_install_heading');
+      screen.getByText('remote_desktop.setup_auto_retry');
+    });
+
+    it('keeps the copyable command as a fallback when the daemon can install by itself', async () => {
+      const { view } = mount([controlledNodeInstallHereCapability({ os: 'linux', arch: 'x64' })]);
+      fireEvent.click(view.container.querySelector('button')!);
+      await screen.findByText('remote_desktop.setup_auto_action');
+      expect(screen.queryByText('remote_desktop.setup_install_heading')).toBeNull();
+      fireEvent.click(screen.getByText('remote_desktop.setup_auto_manual'));
+      screen.getByText('remote_desktop.setup_install_heading');
+    });
+
+    it('after installing a Mac, asks for its permissions without another click', async () => {
+      const capabilities = [controlledNodeInstallHereCapability({ os: 'mac', arch: 'universal' })];
+      const { view, emit, client } = mount(capabilities);
+      fireEvent.click(view.container.querySelector('button')!);
+      fireEvent.click(await screen.findByText('remote_desktop.setup_auto_action'));
+      fireEvent.click(screen.getByText('remote_desktop.setup_auto_confirm_action'));
+      await waitFor(() => expect(mintInstallCommand).toHaveBeenCalledWith({ os: 'mac', arch: 'universal' }, 'server_1'));
+      act(() => emit({ type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.STATE, state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.COMPLETED }));
+      await screen.findByText('remote_desktop.setup_auto_completed');
+
+      // The node enrols linked to this daemon and reports Screen Recording missing.
+      const mac = {
+        ...node,
+        serverId: 'controlled_mac',
+        os: 'mac',
+        hostServerId: 'server_1',
+        capabilities: [
+          REMOTE_DESKTOP_SESSION_CAPABILITY,
+          REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS,
+          REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+          REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+        ],
+      };
+      view.rerender(h(DaemonRemoteDesktopControl as never, {
+        ws: client as never,
+        serverId: 'server_1',
+        serverName: 'winbox',
+        daemonOnline: true,
+        onOpen: vi.fn(),
+        machines: [mac],
+      }));
+      // The same call the controlled-machine list's permission button makes, once.
+      await waitFor(() => expect(requestPermissions).toHaveBeenCalledWith('controlled_mac'));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(requestPermissions).toHaveBeenCalledTimes(1);
+    });
+
+    it('offers no automatic install on a daemon that cannot do it', async () => {
+      const { view } = mount([]);
+      fireEvent.click(view.container.querySelector('button')!);
+      await screen.findByText('remote_desktop.setup_install_heading');
+      expect(screen.queryByText('remote_desktop.setup_auto_action')).toBeNull();
     });
 
     it('lets a right-click reopen setup to change a link that would otherwise just open', () => {

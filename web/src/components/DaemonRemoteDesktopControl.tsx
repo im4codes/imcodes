@@ -10,8 +10,10 @@ import {
   type RemoteDesktopInstallState,
 } from '@shared/remote-desktop-install.js';
 import {
+  REMOTE_DESKTOP_LOGIN_SCREEN_ERROR,
   REMOTE_DESKTOP_LOGIN_SCREEN_MSG,
   REMOTE_DESKTOP_LOGIN_SCREEN_STATE,
+  readControlledNodeInstallHereTarget,
   validateRemoteDesktopLoginScreenStateMessage,
   type RemoteDesktopLoginScreenState,
 } from '@shared/remote-desktop-login-screen.js';
@@ -19,6 +21,7 @@ import type { WsClient } from '../ws-client.js';
 import {
   daemonRemoteDesktopMachine,
   mintControlledNodeExecutableTicket,
+  mintControlledNodeInstallCommand,
   type MachineListItem,
 } from '../api/machines.js';
 import { useMachines } from '../hooks/useMachines.js';
@@ -148,6 +151,25 @@ export function DaemonRemoteDesktopControl({
   // sign-in screen.
   const linkedNode = machineList.find((machine) => machine.hostServerId === serverId) ?? null;
   const linkedOpenable = linkedNode !== null && canOpenRemoteDesktopMachine(linkedNode);
+  // A Linux or macOS daemon that can install the controlled node itself: the
+  // owner confirms once, the daemon runs the same install as the copyable
+  // command, and the node enrols linked to this daemon.
+  const installHereTarget = canSetUp ? readControlledNodeInstallHereTarget(capabilities) : null;
+  const installHere = installHereTarget ? {
+    state: loginScreen,
+    start: () => {
+      setLoginScreen({ state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.DOWNLOADING });
+      void mintControlledNodeInstallCommand(installHereTarget, serverId)
+        .then((minted) => {
+          if (!minted.installCode || !ws) throw new Error('install_code_unavailable');
+          ws.send({ type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST, installCode: minted.installCode });
+        })
+        .catch(() => setLoginScreen({
+          state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED,
+          error: REMOTE_DESKTOP_LOGIN_SCREEN_ERROR.DOWNLOAD_FAILED,
+        }));
+    },
+  } : undefined;
   const setup = setupOpen ? (
     <DaemonRemoteDesktopSetup
       serverId={serverId}
@@ -156,6 +178,7 @@ export function DaemonRemoteDesktopControl({
       onClose={() => setSetupOpen(false)}
       onOpen={onOpen}
       onChanged={() => sharedMachines.refetch()}
+      {...(installHere ? { installHere } : {})}
     />
   ) : null;
   // Where the daemon has no remote desktop of its own, right-click reopens the

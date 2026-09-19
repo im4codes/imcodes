@@ -29,12 +29,15 @@ import {
   REMOTE_DESKTOP_LOGIN_SCREEN_ERROR,
   REMOTE_DESKTOP_LOGIN_SCREEN_MSG,
   REMOTE_DESKTOP_LOGIN_SCREEN_STATE,
+  controlledNodeInstallHereCapability,
+  readRemoteDesktopLoginScreenInstallCode,
   readRemoteDesktopLoginScreenTicket,
   type RemoteDesktopLoginScreenError,
   type RemoteDesktopLoginScreenState,
 } from '../../shared/remote-desktop-login-screen.js';
 import { dispatchRemoteDesktopCommand } from '../node/remote-desktop-dispatch.js';
 import { installLoginScreenControl } from './remote-desktop-login-screen.js';
+import { controlledNodeInstallHereTarget, installControlledNodeHere } from './controlled-node-install-here.js';
 import {
   REMOTE_DESKTOP_COMPILED_SIGNER_SHA256,
   RemoteDesktopWorkerHost,
@@ -99,6 +102,7 @@ export interface DaemonRemoteDesktopDeps {
     onMessage: (message: Record<string, unknown>) => void,
   ) => RemoteDesktopWorkerLike;
   installLoginScreen?: typeof installLoginScreenControl;
+  installHere?: typeof installControlledNodeHere;
 }
 
 /**
@@ -151,10 +155,23 @@ export class DaemonRemoteDesktop {
    * "this machine cannot do it" apart from "this machine needs one download".
    */
   capabilities(): readonly string[] {
+    const installHere = this.installHereTarget();
+    if (installHere) return [controlledNodeInstallHereCapability(installHere)];
     if (!this.supported()) return [];
     return this.available()
       ? [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY, REMOTE_DESKTOP_CAPABILITY]
       : [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY];
+  }
+
+  /**
+   * Linux and macOS: remote desktop there is the controlled node, which this
+   * daemon can install on its own computer when the owner asks.
+   */
+  private installHereTarget() {
+    if (!isRemoteDesktopFeatureEnabled(process.env.IMCODES_REMOTE_DESKTOP_ENABLED, process.env.NODE_ENV)) {
+      return null;
+    }
+    return controlledNodeInstallHereTarget(this.platform, this.arch);
   }
 
   installState(): RemoteDesktopInstallState {
@@ -172,7 +189,11 @@ export class DaemonRemoteDesktop {
       return true;
     }
     if (message.type === REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST) {
-      await this.installLoginScreen(readRemoteDesktopLoginScreenTicket(message));
+      if (this.installHereTarget()) {
+        await this.installNodeHere(readRemoteDesktopLoginScreenInstallCode(message));
+      } else {
+        await this.installLoginScreen(readRemoteDesktopLoginScreenTicket(message));
+      }
       return true;
     }
     if (typeof message.type !== 'string' || !isRemoteDesktopMessageType(message.type)) return false;
@@ -342,34 +363,61 @@ export class DaemonRemoteDesktop {
       );
       return;
     }
-    if (this.installingLoginScreen) return this.installingLoginScreen;
-    this.installingLoginScreen = this.runLoginScreenInstall(ticket)
-      .finally(() => { this.installingLoginScreen = null; });
-    return this.installingLoginScreen;
+    return this.runNodeInstall((onState) => (this.deps.installLoginScreen ?? installLoginScreenControl)({
+      ticket,
+      root: this.root,
+      loadCredential: this.deps.loadCredential ?? loadDaemonCredential,
+      ...(this.deps.fetchImpl ? { fetchImpl: this.deps.fetchImpl } : {}),
+      onState,
+    }));
   }
 
-  private async runLoginScreenInstall(ticket: string): Promise<void> {
-    let failure: RemoteDesktopLoginScreenError | null;
-    try {
-      failure = await (this.deps.installLoginScreen ?? installLoginScreenControl)({
-        ticket,
-        root: this.root,
-        loadCredential: this.deps.loadCredential ?? loadDaemonCredential,
-        ...(this.deps.fetchImpl ? { fetchImpl: this.deps.fetchImpl } : {}),
-        onState: (state) => this.publishLoginScreen(
+  /**
+   * Install the controlled node on this Linux or macOS computer with the install
+   * code the owner minted for this daemon. Joins an attempt already in flight,
+   * like the Windows install, rather than prompting twice.
+   */
+  private async installNodeHere(installCode: string | null): Promise<void> {
+    if (!installCode) {
+      this.publishLoginScreen(
+        REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED,
+        REMOTE_DESKTOP_LOGIN_SCREEN_ERROR.DOWNLOAD_FAILED,
+      );
+      return;
+    }
+    return this.runNodeInstall((onState) => (this.deps.installHere ?? installControlledNodeHere)({
+      installCode,
+      platform: this.platform,
+      root: this.root,
+      loadCredential: this.deps.loadCredential ?? loadDaemonCredential,
+      ...(this.deps.fetchImpl ? { fetchImpl: this.deps.fetchImpl } : {}),
+      onState,
+    }));
+  }
+
+  private runNodeInstall(
+    install: (onState: (state: 'downloading' | 'elevating') => void) => Promise<RemoteDesktopLoginScreenError | null>,
+  ): Promise<void> {
+    if (this.installingLoginScreen) return this.installingLoginScreen;
+    const attempt = async (): Promise<void> => {
+      let failure: RemoteDesktopLoginScreenError | null;
+      try {
+        failure = await install((state) => this.publishLoginScreen(
           state === 'downloading'
             ? REMOTE_DESKTOP_LOGIN_SCREEN_STATE.DOWNLOADING
             : REMOTE_DESKTOP_LOGIN_SCREEN_STATE.ELEVATING,
-        ),
-      });
-    } catch (err) {
-      logger.warn({ err }, 'login screen control install failed');
-      failure = REMOTE_DESKTOP_LOGIN_SCREEN_ERROR.DOWNLOAD_FAILED;
-    }
-    this.publishLoginScreen(
-      failure ? REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED : REMOTE_DESKTOP_LOGIN_SCREEN_STATE.COMPLETED,
-      failure ?? undefined,
-    );
+        ));
+      } catch (err) {
+        logger.warn({ err }, 'controlled node install from the daemon failed');
+        failure = REMOTE_DESKTOP_LOGIN_SCREEN_ERROR.DOWNLOAD_FAILED;
+      }
+      this.publishLoginScreen(
+        failure ? REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED : REMOTE_DESKTOP_LOGIN_SCREEN_STATE.COMPLETED,
+        failure ?? undefined,
+      );
+    };
+    this.installingLoginScreen = attempt().finally(() => { this.installingLoginScreen = null; });
+    return this.installingLoginScreen;
   }
 
   private publishLoginScreen(

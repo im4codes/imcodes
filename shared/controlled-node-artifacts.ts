@@ -306,6 +306,13 @@ export function isControlledNodeInstallCode(value: unknown): value is string {
 }
 
 /**
+ * Where an install code's script is served: the pasted one-line command fetches
+ * `<server>/i/<code>`, and so does a daemon installing the node on its own
+ * computer. Short because it is typed and dictated.
+ */
+export const CONTROLLED_NODE_INSTALL_COMMAND_PATH = '/i';
+
+/**
  * Normalize a hand-typed code.
  *
  * Accepts lowercase and the visually ambiguous characters the alphabet omits,

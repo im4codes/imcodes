@@ -19,6 +19,7 @@ import {
   CONTROLLED_NODE_TICKET_DELIVERY,
   controlledNodeArtifactKey,
   isCanonicalControlledNodePair,
+  isControlledNodeInstallCode,
   isControlledNodeArtifactArch,
   isControlledNodeArtifactSha256,
   isControlledNodeOs,
@@ -145,6 +146,8 @@ export interface ControlledNodeExecutableTicket {
    * `install_command` delivery. Older servers do not send it.
    */
   installCommand?: string;
+  /** The code inside that line, for a daemon to run the same install itself. */
+  installCode?: string;
 }
 
 export async function createMachineFileHandle(
@@ -277,6 +280,7 @@ function normalizeTicket(res: unknown, expectedOwnerUserId: string): ControlledN
   const installCommand = typeof res.installCommand === 'string' && res.installCommand.length > 0
     ? res.installCommand
     : undefined;
+  const installCode = isControlledNodeInstallCode(res.installCode) ? res.installCode : undefined;
   if (ownerUserId && ownerUserId !== expectedOwnerUserId) {
     throw new Error(CONTROLLED_NODE_MINT_ERRORS.AUTH_IDENTITY_CHANGED);
   }
@@ -288,6 +292,7 @@ function normalizeTicket(res: unknown, expectedOwnerUserId: string): ControlledN
     version: 2, ticket, ticketId, os, arch, filename, sizeBytes, sha256,
     expiresAt, delivery, ownerUserId,
     ...(installCommand ? { installCommand } : {}),
+    ...(installCode ? { installCode } : {}),
   };
 }
 
@@ -540,7 +545,7 @@ export function buildControlledNodeBootstrapUrl(ticket: string): string {
 export async function mintControlledNodeInstallCommand(
   selection: ControlledNodeArtifactSelection,
   hostServerId?: string,
-): Promise<{ command: string; expiresAt: number; ticketId: string }> {
+): Promise<{ command: string; installCode?: string; expiresAt: number; ticketId: string }> {
   const minted = await mintControlledNodeExecutableTicket(
     selection, hostServerId, CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND,
   );
@@ -548,6 +553,7 @@ export async function mintControlledNodeInstallCommand(
   if (minted.expiresAt === null) throw new Error('invalid_ticket_response');
   return {
     command: minted.installCommand,
+    ...(minted.installCode ? { installCode: minted.installCode } : {}),
     expiresAt: minted.expiresAt,
     ticketId: minted.ticketId,
   };

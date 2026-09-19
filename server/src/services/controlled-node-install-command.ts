@@ -20,6 +20,7 @@
 import { isCanonicalServerOrigin } from '../security/server-url.js';
 import {
   CONTROLLED_NODE_ARCH_ARM64,
+  CONTROLLED_NODE_INSTALL_COMMAND_PATH,
   isControlledNodeInstallCode,
   type ControlledNodeArtifactArch,
   type ControlledNodeOs,
@@ -28,8 +29,7 @@ import { buildWindowsReleasePublisherTrustScriptForVariable } from '../../../sha
 
 const SHA256_RE = /^[a-f0-9]{64}$/;
 
-/** Path the pasted command hits. Short because it is typed and dictated. */
-export const CONTROLLED_NODE_INSTALL_COMMAND_PATH = '/i';
+export { CONTROLLED_NODE_INSTALL_COMMAND_PATH };
 
 /** Where the script posts the install code to obtain the personalized binary. */
 const DOWNLOAD_PATH = '/api/enroll/v2/download';
