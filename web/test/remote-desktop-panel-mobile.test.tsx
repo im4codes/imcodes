@@ -1623,6 +1623,25 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(getByRole('textbox', { name: 'remote_desktop.mobile_text_input' })).toBeDefined();
   });
 
+  it('keeps the remote screen at its size while the mobile keyboard is open', async () => {
+    const { container, getByRole } = await renderPanel();
+    const stage = container.querySelector('.remote-desktop-stage') as HTMLElement;
+    Object.defineProperty(stage, 'clientWidth', { configurable: true, value: 390 });
+    Object.defineProperty(stage, 'clientHeight', { configurable: true, value: 640 });
+    const video = () => container.querySelector('.remote-desktop-stage video') as HTMLVideoElement;
+    expect(video().style.width).toBe('');
+
+    act(() => { (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });
+    // Fitted into the stage as it was, not into what the keyboard leaves.
+    expect(video().style.width).toBe('390px');
+    expect(video().style.height).toBe('640px');
+    expect(stage.classList.contains('is-keyboard-locked')).toBe(true);
+
+    act(() => { (getByRole('button', { name: 'remote_desktop.close_mobile_keyboard' }) as HTMLButtonElement).click(); });
+    expect(video().style.width).toBe('');
+    expect(stage.classList.contains('is-keyboard-locked')).toBe(false);
+  });
+
   it('gives the remote screen the hint and statistics space while the mobile keyboard is open', async () => {
     const { container, getByRole, queryByRole } = await renderPanel();
     const stylesheet = readFileSync(

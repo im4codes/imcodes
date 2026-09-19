@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  remoteDesktopKeyboardAccessoryInset,
+  IOS_FORM_ACCESSORY_BAR_PX,
   detectRemoteDesktopClipboardShortcut,
   focusRemoteDesktopMobileInput,
   mapRemoteDesktopKeyboardEvent,
@@ -541,5 +543,17 @@ describe('computer keyboard upward-swipe glyphs', () => {
     expect(remoteDesktopComputerUpperKey(byCode('KeyQ'))).toBeNull();
     expect(remoteDesktopComputerUpperKey(byCode('Enter'))).toBeNull();
     expect(remoteDesktopComputerUpperKey(byCode('Space'))).toBeNull();
+  });
+});
+
+describe('iOS form accessory bar', () => {
+  it('clears the bar iOS docks on its keyboard, and nothing elsewhere', () => {
+    const iphone = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148';
+    const ipadOs = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15';
+    const android = 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Mobile Safari/537.36';
+    expect(remoteDesktopKeyboardAccessoryInset(iphone, 5)).toBe(IOS_FORM_ACCESSORY_BAR_PX);
+    expect(remoteDesktopKeyboardAccessoryInset(ipadOs, 5)).toBe(IOS_FORM_ACCESSORY_BAR_PX);
+    expect(remoteDesktopKeyboardAccessoryInset(ipadOs, 0)).toBe(0);
+    expect(remoteDesktopKeyboardAccessoryInset(android, 5)).toBe(0);
   });
 });

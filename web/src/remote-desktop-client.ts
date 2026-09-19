@@ -85,10 +85,23 @@ const INPUT_ACK_TIMEOUT_MS = 3_000;
 const LAYOUT_TRANSITION_TIMEOUT_MS = 20_000;
 /** Latency guard thresholds (see RemoteDesktopClient.observeLatency). */
 const LATENCY_GUARD = {
-  LATE_RTT_MS: 300,
+  /**
+   * Lateness is a RISE over the lowest round trip this path has shown, not an
+   * absolute figure: a phone on 5G across regions sits at ~300 ms all the
+   * time, and an absolute 300 ms threshold held it at the 350 kbps floor
+   * (360p5) forever -- the 150 ms "healthy" mark it needed to recover was
+   * never reachable.
+   */
+  LATE_RTT_RISE_MS: 200,
   LATE_BUFFER_MS: 250,
-  HEALTHY_RTT_MS: 150,
+  HEALTHY_RTT_RISE_MS: 80,
   HEALTHY_BUFFER_MS: 120,
+  /**
+   * A still screen sends a frame or two a second and next to no bytes; it
+   * says nothing about congestion, and stepping down from its near-zero
+   * throughput sent the cap straight to the floor.
+   */
+  MIN_ACTIVE_FPS: 5,
   STEP_DOWN_SAMPLES: 3,
   STEP_UP_SAMPLES: 15,
   STEP_DOWN_FACTOR: 0.6,
@@ -472,6 +485,8 @@ export class RemoteDesktopClient {
   private latencyGuardEnabled = false;
   private latencyGuardCapBps: number | null = null;
   private latencyBadStreak = 0;
+  /** Lowest round trip seen on this path; lateness is measured above it. */
+  private latencyBaselineRttMs: number | null = null;
   private latencyGoodStreak = 0;
   private previousJitterBuffer: { delay: number; emitted: number } | null = null;
   private renegotiating = false;
@@ -725,6 +740,7 @@ export class RemoteDesktopClient {
 
   private resetLatencyGuard(): void {
     this.latencyGuardCapBps = null;
+    this.latencyBaselineRttMs = null;
     this.latencyBadStreak = 0;
     this.latencyGoodStreak = 0;
   }
@@ -743,11 +759,26 @@ export class RemoteDesktopClient {
    * One stats sample: step the guard ceiling down after sustained lateness,
    * back up after a sustained healthy stretch.
    */
-  private observeLatency(rttMs: number | undefined, jitterBufferMs: number | undefined, bitrateBps: number): void {
+  private observeLatency(
+    rttMs: number | undefined,
+    jitterBufferMs: number | undefined,
+    bitrateBps: number,
+    fps: number,
+  ): void {
     if (!this.latencyGuardEnabled || !this.desiredQualityPreference) return;
-    const late = (rttMs !== undefined && rttMs >= LATENCY_GUARD.LATE_RTT_MS)
+    if (rttMs !== undefined) {
+      this.latencyBaselineRttMs = this.latencyBaselineRttMs === null
+        ? rttMs
+        : Math.min(this.latencyBaselineRttMs, rttMs);
+    }
+    // An idle picture is neither late nor healthy evidence.
+    if (fps < LATENCY_GUARD.MIN_ACTIVE_FPS) return;
+    const rise = rttMs !== undefined && this.latencyBaselineRttMs !== null
+      ? rttMs - this.latencyBaselineRttMs
+      : undefined;
+    const late = (rise !== undefined && rise >= LATENCY_GUARD.LATE_RTT_RISE_MS)
       || (jitterBufferMs !== undefined && jitterBufferMs >= LATENCY_GUARD.LATE_BUFFER_MS);
-    const healthy = (rttMs === undefined || rttMs < LATENCY_GUARD.HEALTHY_RTT_MS)
+    const healthy = (rise === undefined || rise < LATENCY_GUARD.HEALTHY_RTT_RISE_MS)
       && (jitterBufferMs === undefined || jitterBufferMs < LATENCY_GUARD.HEALTHY_BUFFER_MS);
     this.latencyBadStreak = late ? this.latencyBadStreak + 1 : 0;
     this.latencyGoodStreak = healthy ? this.latencyGoodStreak + 1 : 0;
@@ -1094,6 +1125,7 @@ export class RemoteDesktopClient {
       this.statsTimer = null;
       this.previousInboundStats = null;
       this.previousJitterBuffer = null;
+      this.latencyBaselineRttMs = null;
       this.lastMediaBytesReceived = null;
       this.lastMediaProgressAt = null;
       this.mediaStarted = false;
@@ -1780,7 +1812,7 @@ export class RemoteDesktopClient {
           }
           this.previousJitterBuffer = { delay: inbound.jitterBufferDelay, emitted: inbound.jitterBufferEmittedCount };
         }
-        if (visible && this.mediaStarted) this.observeLatency(rttMs, jitterBufferMs, bitrateBps);
+        if (visible && this.mediaStarted) this.observeLatency(rttMs, jitterBufferMs, bitrateBps, fps);
       }
       this.publish({
         pointerMovesSent: this.pointerMovesSent,
@@ -2152,6 +2184,7 @@ export class RemoteDesktopClient {
     this.clearDisconnectTimer();
     this.previousInboundStats = null;
     this.previousJitterBuffer = null;
+    this.latencyBaselineRttMs = null;
     this.lastMediaBytesReceived = null;
     this.lastMediaProgressAt = null;
     this.clearInputAck();

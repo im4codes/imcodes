@@ -221,6 +221,21 @@ export function remoteDesktopShortcutLabel(
   return '⌫';
 }
 
+/**
+ * Height (CSS px) of the bar iOS docks on top of its keyboard for any focused
+ * field -- the "^ v ✓" form accessory. The visual viewport's bottom edge
+ * measured in the app sat at the keyboard itself, so that bar covered the
+ * keyboard-tab row docked on it. 0 elsewhere.
+ */
+export const IOS_FORM_ACCESSORY_BAR_PX = 44;
+
+export function remoteDesktopKeyboardAccessoryInset(userAgent: string, maxTouchPoints: number): number {
+  // iPadOS reports a desktop Mac user agent; touch points tell it apart.
+  const ios = /iPhone|iPad|iPod/i.test(userAgent)
+    || (/Macintosh/i.test(userAgent) && maxTouchPoints > 1);
+  return ios ? IOS_FORM_ACCESSORY_BAR_PX : 0;
+}
+
 export function isAppleControllerPlatform(platform: string): boolean {
   return /(?:Mac|iPhone|iPad|iPod)/i.test(platform);
 }

@@ -11398,6 +11398,13 @@ button.quick-agent-delegation-preset.active {
   justify-content: flex-start;
 }
 
+/* The keyboard is open: the picture keeps the size it had before (see
+   keyboardFitSize) and stays centred in what remains, clipped rather than
+   re-fitted -- so the remote screen never rescales under the finger. */
+.remote-desktop-stage.is-keyboard-locked {
+  overflow: hidden;
+}
+
 .remote-desktop-stage video,
 .remote-desktop-last-frame {
   display: block;

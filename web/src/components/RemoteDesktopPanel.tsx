@@ -69,6 +69,7 @@ import {
   remoteDesktopComputerKeyLabel,
   REMOTE_DESKTOP_CLIPBOARD_SHORTCUT,
   isRemoteDesktopMobileLineBreak,
+  remoteDesktopKeyboardAccessoryInset,
   remoteDesktopMobileDeletionKey,
   remoteDesktopMobileEditingKey,
   remoteDesktopMobileShortcutKeys,
@@ -538,6 +539,10 @@ export function RemoteDesktopPanel({
   // itself directly above the OS keyboard instead of riding along with that
   // scroll.
   const [mobileKeyboardViewportInset, setMobileKeyboardViewportInset] = useState(0);
+  // The fitted picture's box when the keyboard opened. Opening the keyboard
+  // shortens the stage; re-fitting into it rescaled the remote screen under
+  // the person's finger. While it is open the picture keeps this size.
+  const [keyboardFitSize, setKeyboardFitSize] = useState<{ width: number; height: number } | null>(null);
   // Pinning the panel (above) takes it out of the grid flow entirely --
   // `position: fixed` items are not grid items at all -- so without this the
   // stage's grid row (minmax(0, 1fr)) would expand to reclaim the vacated
@@ -2550,6 +2555,10 @@ export function RemoteDesktopPanel({
 
   const openMobileKeyboard = () => {
     if (!snapshot.inputEnabled) return;
+    const stage = stageRef.current;
+    if (stage && stage.clientWidth > 0 && stage.clientHeight > 0) {
+      setKeyboardFitSize({ width: stage.clientWidth, height: stage.clientHeight });
+    }
     setMobileToolbarExpanded(false);
     setMobileKeyboardTab('ime');
     setComputerKeyboardPage(0);
@@ -2568,6 +2577,10 @@ export function RemoteDesktopPanel({
   // the container against the visual viewport's bottom edge is right in every
   // case, and comes out as 0 when the page already resized itself.
   useEffect(() => {
+    if (!mobileTextOpen) setKeyboardFitSize(null);
+  }, [mobileTextOpen]);
+
+  useEffect(() => {
     if (!mobileTextOpen || typeof window === 'undefined' || !window.visualViewport) return;
     const viewport = window.visualViewport;
     const recompute = () => {
@@ -2575,9 +2588,13 @@ export function RemoteDesktopPanel({
       // No laid-out container to measure (or nothing rendered yet): fall back
       // to the window, which is what an unmeasurable panel fills anyway.
       const bottomEdge = rect && rect.height > 0 ? rect.bottom : window.innerHeight;
-      setMobileKeyboardViewportInset(Math.max(0, Math.round(
+      const keyboard = Math.max(0, Math.round(
         bottomEdge - (viewport.height + viewport.offsetTop),
-      )));
+      ));
+      // Clear iOS's form accessory bar too, or it covers the keyboard tabs.
+      setMobileKeyboardViewportInset(keyboard > 0
+        ? keyboard + remoteDesktopKeyboardAccessoryInset(navigator.userAgent, navigator.maxTouchPoints ?? 0)
+        : 0);
     };
     recompute();
     viewport.addEventListener('resize', recompute);
@@ -3311,7 +3328,7 @@ export function RemoteDesktopPanel({
 
         <div
           ref={stageRef}
-          class={`remote-desktop-stage is-${viewScale} ${snapshot.inputEnabled ? 'is-controlling' : 'is-viewing'}`}
+          class={`remote-desktop-stage is-${viewScale} ${snapshot.inputEnabled ? 'is-controlling' : 'is-viewing'}${keyboardFitSize && viewScale === 'fit' ? ' is-keyboard-locked' : ''}`}
           aria-busy={mediaRecovering || undefined}
           tabIndex={snapshot.inputEnabled ? 0 : -1}
           onPointerMove={onStagePointerMove}
@@ -3385,7 +3402,9 @@ export function RemoteDesktopPanel({
             style={{
               ...(viewScale === 'actual' && selectedDisplay
                 ? { width: `${selectedDisplay.width}px`, height: `${selectedDisplay.height}px` }
-                : {}),
+                : viewScale === 'fit' && keyboardFitSize
+                  ? { width: `${keyboardFitSize.width}px`, height: `${keyboardFitSize.height}px` }
+                  : {}),
               transform: `translate3d(${viewport.x}px, ${viewport.y}px, 0) scale(${viewport.scale})`,
               transformOrigin: 'center center',
             }}
@@ -3397,7 +3416,9 @@ export function RemoteDesktopPanel({
             style={{
               ...(viewScale === 'actual' && selectedDisplay
                 ? { width: `${selectedDisplay.width}px`, height: `${selectedDisplay.height}px` }
-                : {}),
+                : viewScale === 'fit' && keyboardFitSize
+                  ? { width: `${keyboardFitSize.width}px`, height: `${keyboardFitSize.height}px` }
+                  : {}),
               transform: `translate3d(${viewport.x}px, ${viewport.y}px, 0) scale(${viewport.scale})`,
               transformOrigin: 'center center',
             }}
