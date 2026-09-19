@@ -1,4 +1,6 @@
 import { McpServer, type RegisteredTool } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { AGENT_SKILLS_ACTION, AGENT_SKILLS_DIRECTORY_DISPLAY, AGENT_SKILLS_ERROR, isAgentSkillSource } from '../../shared/agent-skills.js';
+import { runAgentSkillsOnThisMachine } from './agent-skills.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import {
@@ -32,6 +34,8 @@ export interface CapabilityMcpToolDeps {
   nodeRole?: NodeRole;
   /** Resolve caller context for binding-scoped Skill activation only. */
   resolveCapabilityIdentity?: (caller: McpRuntimeCaller) => Promise<CapabilityRuntimeIdentity | null>;
+  /** Installs a Skill into this machine's `~/.agents/skills`; tests replace it. */
+  runAgentSkills?: typeof runAgentSkillsOnThisMachine;
 }
 
 export interface CapabilityRuntimeIdentity {
@@ -107,6 +111,38 @@ function error(reason: CapabilityErrorResult['reason'], message: string, retryab
   return { status: 'error', reason, error: message, ...(retryable ? { retryable: true } : {}) };
 }
 
+/**
+ * Skills are not IM.codes packages: they go into this machine's
+ * `~/.agents/skills` through the pinned `skills` CLI, where every agent here
+ * already reads them. Other machines are installed from the Agent Skills tab.
+ */
+async function installAgentSkill(
+  input: CapabilityInstallRequest,
+  run: typeof runAgentSkillsOnThisMachine,
+): Promise<CallToolResult> {
+  const source = input.source?.value?.trim();
+  if (!isAgentSkillSource(source)) {
+    return toolResult(error(
+      CAPABILITY_ERROR.INVALID_INPUT,
+      'A Skill is installed from a GitHub owner/repo (optionally owner/repo/path) or an https:// URL into ~/.agents/skills. Pass it as source.value.',
+    ));
+  }
+  const result = await run({ action: AGENT_SKILLS_ACTION.ADD, source });
+  const payload = {
+    status: result.ok ? 'ok' : 'error',
+    ...(result.ok ? {} : { reason: result.error ?? AGENT_SKILLS_ERROR.CLI_FAILED }),
+    installedTo: AGENT_SKILLS_DIRECTORY_DISPLAY,
+    skills: result.skills.map((skill) => skill.name),
+    ...(result.output ? { output: result.output } : {}),
+    note: 'Agents on this machine load these Skills directly. To install on other machines, use the Agent Skills tab in IM.codes.',
+  };
+  return {
+    structuredContent: payload,
+    content: [{ type: 'text', text: JSON.stringify(payload) }],
+    isError: !result.ok,
+  };
+}
+
 function toolResult(result: CapabilityToolResult): CallToolResult {
   return {
     structuredContent: result as unknown as Record<string, unknown>,
@@ -135,6 +171,9 @@ export function registerCapabilityMcpTools(
             return toolResult(await service.list(raw as CapabilityListRequest));
           case CAPABILITY_MCP_TOOL.INSTALL: {
             const input = raw as CapabilityInstallRequest;
+            if (input?.kind === CAPABILITY_KIND.SKILL) {
+              return await installAgentSkill(input, deps.runAgentSkills ?? runAgentSkillsOnThisMachine);
+            }
             const issue = validateCapabilityInstallRequest(input);
             return toolResult(issue ? error(CAPABILITY_ERROR.INVALID_INPUT, issue) : await service.install(input));
           }

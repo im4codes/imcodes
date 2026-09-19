@@ -112,7 +112,7 @@ describe('managed Skill resolver and provider projection', () => {
     expect(startup.map((entry) => entry.text).join('\n')).not.toContain('Full managed instructions.');
     expect(startup.map((entry) => entry.text).join('\n')).toContain('capability_status');
     expect(startup.map((entry) => entry.text).join('\n')).toContain('resources: Additional package resources are unavailable');
-    expect(startup.map((entry) => entry.text).join('\n')).toContain('never write or invoke provider-native');
+    expect(startup.map((entry) => entry.text).join('\n')).toContain('~/.agents/skills');
 
     const resolved = resolveSkillByKey({ namespace, homeDir, serverId: 'server-1', key: 'managed/portable' });
     expect(resolved).toMatchObject({ ok: true, layer: 'managed_registry', registryId: 'portable-registry' });

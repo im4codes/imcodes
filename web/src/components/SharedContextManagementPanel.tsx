@@ -98,6 +98,7 @@ import {
   type RuntimeModelPresetEntry,
 } from './RuntimeModelPresetSelector.js';
 import { CapabilityInventoryPanel } from './CapabilityInventoryPanel.js';
+import { AgentSkillsPanel } from './AgentSkillsPanel.js';
 import { CAPABILITY_KIND } from '@shared/capability-management.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
 import type { WsClient } from '../ws-client.js';
@@ -3894,7 +3895,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       )}
 
       {activeTab === 'skills' && (
-        <CapabilityInventoryPanel kind={CAPABILITY_KIND.SKILL} serverId={serverId} />
+        <AgentSkillsPanel serverId={serverId} />
       )}
 
       {activeTab === 'memory' && (

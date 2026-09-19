@@ -3016,7 +3016,39 @@
       "memoryManualAddTextLabel": "手動メモリ本文",
       "memoryManualAddPlaceholder": "このプロジェクトで覚えるべき永続ノート、決定、要約を書く…",
       "memoryManualAddSave": "メモリを保存",
-      "memoryManualAddProjectRequired": "メモリを追加する前に、プロジェクト選択またはフィルターでプロジェクトを選んでください。"
+      "memoryManualAddProjectRequired": "メモリを追加する前に、プロジェクト選択またはフィルターでプロジェクトを選んでください。",
+      "agentSkills": {
+        "title": "Agent Skills",
+        "description": "各マシンの ~/.agents/skills にあるスキルです。そのマシンの Claude Code、Codex、Gemini、Qwen、OpenClaw などのエージェントが直接使います。",
+        "machineLabel": "マシン",
+        "machineOffline": "{{name}}（オフライン）",
+        "updateAll": "すべて更新",
+        "update": "更新",
+        "remove": "削除",
+        "removeConfirm": "{{machine}} から {{name}} を削除しますか？",
+        "empty": "このマシンにはまだスキルがありません。",
+        "loadError": "このマシンのスキルを読み込めませんでした。",
+        "installTitle": "マシンにインストール",
+        "sourceLabel": "スキルの入手元",
+        "sourcePlaceholder": "owner/repo または https://…",
+        "sourceInvalid": "GitHub の owner/repo か https:// のアドレスを入力してください。",
+        "install": "インストール",
+        "installing": "インストール中…",
+        "machinesLabel": "インストール先",
+        "done": "完了",
+        "details": "詳細",
+        "errors": {
+          "invalid_request": "リクエストが無効です。",
+          "daemon_offline": "マシンがオフラインです。",
+          "timeout": "タイムアウトしました。",
+          "busy": "このマシンでは別のスキル操作がまだ実行中です。",
+          "cli_unavailable": "このマシンに npm が見つかりません。",
+          "cli_failed": "skills コマンドが失敗しました。詳細を確認してください。",
+          "forbidden": "マシンのスキルを管理できるのは所有者だけです。",
+          "not_found": "このマシンではスキルを実行できません。",
+          "generic": "問題が発生しました。"
+        }
+      }
     },
     "diagnostics": {
       "title": "Diagnostics",

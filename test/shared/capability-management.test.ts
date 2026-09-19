@@ -38,8 +38,9 @@ describe('capability management shared contract', () => {
       }
     }
     expect(CAPABILITY_MCP_TOOL_CONTRACTS[CAPABILITY_MCP_TOOL.INSTALL].description).toContain('one isolated AI audit');
-    expect(CAPABILITY_CANONICAL_INSTALL_POLICY).toContain('~/.imcodes/skills');
-    expect(CAPABILITY_CANONICAL_INSTALL_POLICY).toContain('Only the user can confirm');
+    expect(CAPABILITY_MCP_TOOL_CONTRACTS[CAPABILITY_MCP_TOOL.INSTALL].description).toContain('~/.agents/skills');
+    expect(CAPABILITY_CANONICAL_INSTALL_POLICY).toContain('~/.agents/skills');
+    expect(CAPABILITY_CANONICAL_INSTALL_POLICY).toContain('Only the user can confirm an MCP installation');
     expect(CAPABILITY_CANONICAL_INSTALL_POLICY).toContain('source.kind=mcp_config');
     expect(CAPABILITY_CANONICAL_INSTALL_POLICY).toContain('do not require an installer URL');
     expect(JSON.stringify(CAPABILITY_MCP_TOOL_CONTRACTS)).not.toMatch(/capability_(?:draft|commit|audit_start|request_approval)/);

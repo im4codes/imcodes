@@ -3017,7 +3017,39 @@
       "memoryManualAddTextLabel": "手動記憶內容",
       "memoryManualAddPlaceholder": "寫入這個專案需要長期記住的筆記、決定或摘要…",
       "memoryManualAddSave": "儲存記憶",
-      "memoryManualAddProjectRequired": "新增記憶前，請先在專案選擇器或瀏覽篩選器中選擇專案。"
+      "memoryManualAddProjectRequired": "新增記憶前，請先在專案選擇器或瀏覽篩選器中選擇專案。",
+      "agentSkills": {
+        "title": "Agent Skills",
+        "description": "每台機器 ~/.agents/skills 裡的技能。那台機器上的 Claude Code、Codex、Gemini、Qwen、OpenClaw 等 agent 都會直接使用它們。",
+        "machineLabel": "機器",
+        "machineOffline": "{{name}}（離線）",
+        "updateAll": "全部更新",
+        "update": "更新",
+        "remove": "刪除",
+        "removeConfirm": "從 {{machine}} 刪除 {{name}}？",
+        "empty": "這台機器還沒有技能。",
+        "loadError": "讀取這台機器的技能失敗。",
+        "installTitle": "安裝到機器",
+        "sourceLabel": "技能來源",
+        "sourcePlaceholder": "owner/repo 或 https://…",
+        "sourceInvalid": "請填寫 GitHub 的 owner/repo 或 https:// 位址。",
+        "install": "安裝",
+        "installing": "安裝中…",
+        "machinesLabel": "安裝到",
+        "done": "完成",
+        "details": "詳情",
+        "errors": {
+          "invalid_request": "請求無效。",
+          "daemon_offline": "機器離線。",
+          "timeout": "逾時。",
+          "busy": "這台機器上還有別的技能操作在進行。",
+          "cli_unavailable": "這台機器上找不到 npm。",
+          "cli_failed": "skills 指令執行失敗，請看詳情。",
+          "forbidden": "只有機器的擁有者才能管理它的技能。",
+          "not_found": "這台機器不能執行技能。",
+          "generic": "出錯了。"
+        }
+      }
     },
     "diagnostics": {
       "title": "診斷",

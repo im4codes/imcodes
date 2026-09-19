@@ -41,6 +41,7 @@ import { watchRoutes } from './routes/watch.js';
 import { messagePinRoutes } from './routes/message-pins.js';
 import { capabilityRoutes } from './routes/capabilities.js';
 import { memoryRoutes } from './routes/memory.js';
+import { agentSkillsRoutes } from './routes/agent-skills.js';
 import { sessionMgmtRoutes } from './routes/session-mgmt.js';
 import { subSessionRoutes } from './routes/sub-sessions.js';
 import { discussionRoutes } from './routes/discussions.js';
@@ -263,6 +264,7 @@ export function buildApp(env: Env, options: BuildAppOptions = {}) {
   // string by the ingress for pod routing; the projection-owner resolver
   // ignores serverId entirely (cloud-only PG lookup).
   app.route('/api', memoryRoutes);
+  app.route('/api', agentSkillsRoutes);
   // fileTransferRoutes MUST be first — its token-auth middleware bypasses requireAuth
   // for iOS downloads (SFSafariViewController has no cookies/Bearer). If mounted after
   // sessionMgmtRoutes (which has blanket requireAuth on /*), the token path is shadowed.

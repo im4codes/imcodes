@@ -3017,7 +3017,39 @@
       "memoryManualAddTextLabel": "Texto de memoria manual",
       "memoryManualAddPlaceholder": "Escribe una nota, decisión o resumen duradero para recordar en este proyecto…",
       "memoryManualAddSave": "Guardar memoria",
-      "memoryManualAddProjectRequired": "Elige un proyecto en el selector o filtro antes de agregar memoria."
+      "memoryManualAddProjectRequired": "Elige un proyecto en el selector o filtro antes de agregar memoria.",
+      "agentSkills": {
+        "title": "Agent Skills",
+        "description": "Las skills de ~/.agents/skills en cada máquina. Claude Code, Codex, Gemini, Qwen, OpenClaw y los demás agentes de esa máquina las usan directamente.",
+        "machineLabel": "Máquina",
+        "machineOffline": "{{name}} (sin conexión)",
+        "updateAll": "Actualizar todo",
+        "update": "Actualizar",
+        "remove": "Quitar",
+        "removeConfirm": "¿Quitar {{name}} de {{machine}}?",
+        "empty": "Esta máquina aún no tiene skills.",
+        "loadError": "No se pudieron leer las skills de esta máquina.",
+        "installTitle": "Instalar en máquinas",
+        "sourceLabel": "Origen de la skill",
+        "sourcePlaceholder": "owner/repo o https://…",
+        "sourceInvalid": "Usa un owner/repo de GitHub o una dirección https://.",
+        "install": "Instalar",
+        "installing": "Instalando…",
+        "machinesLabel": "Instalar en",
+        "done": "Hecho",
+        "details": "Detalles",
+        "errors": {
+          "invalid_request": "La solicitud no es válida.",
+          "daemon_offline": "La máquina está sin conexión.",
+          "timeout": "Se agotó el tiempo.",
+          "busy": "Otra operación de skills sigue en curso en esta máquina.",
+          "cli_unavailable": "No se encontró npm en esta máquina.",
+          "cli_failed": "El comando skills falló. Mira los detalles.",
+          "forbidden": "Solo el propietario de la máquina puede gestionar sus skills.",
+          "not_found": "Esta máquina no puede ejecutar skills.",
+          "generic": "Algo salió mal."
+        }
+      }
     },
     "diagnostics": {
       "title": "Diagnostics",

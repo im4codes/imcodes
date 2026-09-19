@@ -3016,7 +3016,39 @@
       "memoryManualAddTextLabel": "수동 메모리 텍스트",
       "memoryManualAddPlaceholder": "이 프로젝트에서 기억할 지속 노트, 결정 또는 요약을 작성…",
       "memoryManualAddSave": "메모리 저장",
-      "memoryManualAddProjectRequired": "메모리를 추가하기 전에 프로젝트 선택기 또는 필터에서 프로젝트를 선택하세요."
+      "memoryManualAddProjectRequired": "메모리를 추가하기 전에 프로젝트 선택기 또는 필터에서 프로젝트를 선택하세요.",
+      "agentSkills": {
+        "title": "Agent Skills",
+        "description": "각 머신의 ~/.agents/skills 에 있는 스킬입니다. 그 머신의 Claude Code, Codex, Gemini, Qwen, OpenClaw 등 에이전트가 바로 사용합니다.",
+        "machineLabel": "머신",
+        "machineOffline": "{{name}} (오프라인)",
+        "updateAll": "모두 업데이트",
+        "update": "업데이트",
+        "remove": "삭제",
+        "removeConfirm": "{{machine}}에서 {{name}}을(를) 삭제할까요?",
+        "empty": "이 머신에는 아직 스킬이 없습니다.",
+        "loadError": "이 머신의 스킬을 읽지 못했습니다.",
+        "installTitle": "머신에 설치",
+        "sourceLabel": "스킬 출처",
+        "sourcePlaceholder": "owner/repo 또는 https://…",
+        "sourceInvalid": "GitHub owner/repo 또는 https:// 주소를 입력하세요.",
+        "install": "설치",
+        "installing": "설치 중…",
+        "machinesLabel": "설치 대상",
+        "done": "완료",
+        "details": "자세히",
+        "errors": {
+          "invalid_request": "요청이 올바르지 않습니다.",
+          "daemon_offline": "머신이 오프라인입니다.",
+          "timeout": "시간이 초과되었습니다.",
+          "busy": "이 머신에서 다른 스킬 작업이 아직 진행 중입니다.",
+          "cli_unavailable": "이 머신에서 npm을 찾을 수 없습니다.",
+          "cli_failed": "skills 명령이 실패했습니다. 자세히를 확인하세요.",
+          "forbidden": "머신 소유자만 스킬을 관리할 수 있습니다.",
+          "not_found": "이 머신에서는 스킬을 실행할 수 없습니다.",
+          "generic": "문제가 발생했습니다."
+        }
+      }
     },
     "diagnostics": {
       "title": "Diagnostics",

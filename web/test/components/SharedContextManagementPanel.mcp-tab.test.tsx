@@ -168,7 +168,13 @@ vi.mock('../../src/api/capabilities.js', () => ({
   CapabilityRequestError: class CapabilityRequestError extends Error {},
 }));
 
+vi.mock('../../src/api/agent-skills.js', () => ({
+  listAgentSkills: vi.fn(async () => [{ name: 'wecomcli-doc', description: 'WeCom docs' }]),
+  runAgentSkills: vi.fn(async () => ({ ok: true })),
+}));
+
 vi.mock('../../src/api.js', () => ({
+  apiFetch: vi.fn(async () => ({ servers: [] })),
   ApiError: class ApiError extends Error {
     code: string | null;
     constructor(public status: number, public body: string) {
@@ -319,16 +325,15 @@ describe('SharedContextManagementPanel MCP tab', () => {
     expect(consoleError).not.toHaveBeenCalled();
   });
 
-  it('shows installed managed Skills in a dedicated top-level tab', async () => {
+  it('shows the machine\'s ~/.agents/skills in a dedicated top-level tab', async () => {
     render(<SharedContextManagementPanel serverId="srv-1" />);
     await flush();
 
     fireEvent.click(screen.getByText('Skills'));
 
-    expect(await screen.findByText('Installed Skills')).toBeDefined();
-    expect(screen.getByText('Release Skill')).toBeDefined();
+    expect(await screen.findByText('wecomcli-doc')).toBeDefined();
+    expect(screen.getByText('WeCom docs')).toBeDefined();
     expect(screen.queryByText('Docs MCP')).toBeNull();
-    expect(capabilityApiMock.listCapabilities).toHaveBeenCalledWith('srv-1');
   });
 
   it('keeps MCP locale keys resolvable in every supported locale', () => {

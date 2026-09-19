@@ -3017,7 +3017,39 @@
       "memoryManualAddTextLabel": "Manual memory text",
       "memoryManualAddPlaceholder": "Write a durable note, decision, or summary to remember for this project…",
       "memoryManualAddSave": "Save memory",
-      "memoryManualAddProjectRequired": "Choose a project in the project selector or browse filter before adding memory."
+      "memoryManualAddProjectRequired": "Choose a project in the project selector or browse filter before adding memory.",
+      "agentSkills": {
+        "title": "Agent Skills",
+        "description": "Skills in ~/.agents/skills on each machine. Claude Code, Codex, Gemini, Qwen, OpenClaw and the other agents on that machine use them directly.",
+        "machineLabel": "Machine",
+        "machineOffline": "{{name}} (offline)",
+        "updateAll": "Update all",
+        "update": "Update",
+        "remove": "Remove",
+        "removeConfirm": "Remove {{name}} from {{machine}}?",
+        "empty": "No skills on this machine yet.",
+        "loadError": "Couldn't read this machine's skills.",
+        "installTitle": "Install on machines",
+        "sourceLabel": "Skill source",
+        "sourcePlaceholder": "owner/repo or https://…",
+        "sourceInvalid": "Use a GitHub owner/repo or an https:// address.",
+        "install": "Install",
+        "installing": "Installing…",
+        "machinesLabel": "Install on",
+        "done": "Done",
+        "details": "Details",
+        "errors": {
+          "invalid_request": "The request was not valid.",
+          "daemon_offline": "The machine is offline.",
+          "timeout": "Timed out.",
+          "busy": "Another skill operation is still running on this machine.",
+          "cli_unavailable": "npm was not found on this machine.",
+          "cli_failed": "The skills command failed. See details.",
+          "forbidden": "Only the machine's owner can manage its skills.",
+          "not_found": "This machine can't run skills.",
+          "generic": "Something went wrong."
+        }
+      }
     },
     "diagnostics": {
       "title": "Diagnostics",

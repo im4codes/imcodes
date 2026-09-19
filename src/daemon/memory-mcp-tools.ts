@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { CapabilityMcpToolDeps } from './capability-mcp-tools.js';
 import { execFile as execFileCallback } from 'node:child_process';
 import { promisify } from 'node:util';
 import { lstat, readFile, realpath } from 'node:fs/promises';
@@ -315,6 +316,8 @@ export interface MemoryMcpToolDeps {
   capabilityService?: CapabilityService;
   /** Caller context resolver used only when activating binding-scoped Skill instructions. */
   resolveCapabilityIdentity?: (caller: McpRuntimeCaller) => Promise<CapabilityRuntimeIdentity | null>;
+  /** Installs a Skill into this machine's `~/.agents/skills`; tests replace it. */
+  runAgentSkills?: CapabilityMcpToolDeps['runAgentSkills'];
   featureFlags?: MCPFeatureFlagValues;
   isMemoryFeatureEnabled?: (flag: MemoryFeatureFlag) => boolean;
   searchMemory?: MemoryMcpSearch;

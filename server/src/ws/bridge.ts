@@ -12,6 +12,8 @@
  * terminal.stream_reset and unsubscribes the browser from that session.
  */
 
+import { AGENT_SKILLS_MESSAGE_PREFIX, AGENT_SKILLS_MSG } from '../../../shared/agent-skills.js';
+import { DaemonRequestTracker } from './daemon-request-tracker.js';
 import WebSocket, { type RawData } from 'ws';
 import { CLOCK_SYNC_FIELD } from '../../../shared/clock-sync.js';
 import { performance } from 'node:perf_hooks';
@@ -1959,11 +1961,10 @@ export class WsBridge {
    * replies with `MEMORY_WS.GET_SOURCES_RESPONSE`. See
    * openspec/changes/memory-source-server-routing.
    */
-  private pendingMemorySourcesRequests = new Map<string, {
-    resolve: (msg: Record<string, unknown>) => void;
-    reject: (err: Error) => void;
-    timer: ReturnType<typeof setTimeout>;
-  }>();
+  private readonly memorySourcesRequests = new DaemonRequestTracker();
+
+  /** `/api/agent-skills` callers awaiting the daemon's list or run reply. */
+  private readonly agentSkillsRequests = new DaemonRequestTracker();
 
   private pendingPreviewRequests = new Map<string, PendingPreviewRequest>();
 
@@ -7020,6 +7021,14 @@ export class WsBridge {
       return;
     }
 
+    // Agent-skills replies go to the waiting `/api/agent-skills` route only,
+    // never to browsers.
+    if (type === AGENT_SKILLS_MSG.LIST_RESPONSE || type === AGENT_SKILLS_MSG.RUN_RESPONSE) {
+      const requestId = typeof msg.requestId === 'string' ? msg.requestId : undefined;
+      if (requestId) this.agentSkillsRequests.resolve(requestId, msg);
+      return;
+    }
+
     // ── Terminal diff: session-scoped ─────────────────────────────────────────
     if (type === 'terminal_update') {
       const sessionName = (msg.diff as Record<string, unknown> | undefined)?.sessionName as string | undefined;
@@ -9801,7 +9810,11 @@ export class WsBridge {
   }
 
   private isBrowserForbiddenDaemonCommandType(type: string): boolean {
-    return type === DAEMON_COMMAND_TYPES.SERVER_DELETE || type.startsWith('daemon.');
+    // Agent-skills requests run software on the machine; they come only from
+    // the owner-checked `/api/agent-skills` route, never straight from a browser.
+    return type === DAEMON_COMMAND_TYPES.SERVER_DELETE
+      || type.startsWith('daemon.')
+      || type.startsWith(AGENT_SKILLS_MESSAGE_PREFIX);
   }
 
   requestTimelineHistory(params: {
@@ -10201,30 +10214,30 @@ export class WsBridge {
     if (!this.isDaemonConnected()) {
       return Promise.reject(new Error('daemon_offline'));
     }
-    return new Promise<Record<string, unknown>>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pendingMemorySourcesRequests.delete(requestId);
-        reject(new Error('timeout'));
-      }, timeoutMs);
+    return this.memorySourcesRequests.request(requestId, timeoutMs, () => {
+      this.daemonWs!.send(JSON.stringify({
+        type: MEMORY_WS.GET_SOURCES_REQUEST,
+        requestId,
+        projectionId,
+        expectedProjectId,
+        // The daemon stamps its own bound serverId on the reply, but we
+        // also tell it our expected serverId so its log can flag mis-
+        // routing when present.
+        expectedServerId: this.serverId,
+      }));
+    });
+  }
 
-      this.pendingMemorySourcesRequests.set(requestId, { resolve, reject, timer });
-
-      try {
-        this.daemonWs!.send(JSON.stringify({
-          type: MEMORY_WS.GET_SOURCES_REQUEST,
-          requestId,
-          projectionId,
-          expectedProjectId,
-          // The daemon stamps its own bound serverId on the reply, but we
-          // also tell it our expected serverId so its log can flag mis-
-          // routing when present.
-          expectedServerId: this.serverId,
-        }));
-      } catch (err) {
-        this.pendingMemorySourcesRequests.delete(requestId);
-        clearTimeout(timer);
-        reject(err instanceof Error ? err : new Error(String(err)));
-      }
+  /**
+   * Ask the daemon to list its `~/.agents/skills`, or to run the pinned
+   * `skills` CLI once. Rejects with 'daemon_offline' or 'timeout'.
+   */
+  sendAgentSkillsRequest(frame: Record<string, unknown> & { requestId: string }, timeoutMs: number): Promise<Record<string, unknown>> {
+    if (!this.isDaemonConnected()) {
+      return Promise.reject(new Error('daemon_offline'));
+    }
+    return this.agentSkillsRequests.request(frame.requestId, timeoutMs, () => {
+      this.daemonWs!.send(JSON.stringify(frame));
     });
   }
 
@@ -10233,23 +10246,15 @@ export class WsBridge {
    * Returns true if a matching pending request was found and resolved.
    */
   resolveMemorySources(requestId: string, msg: Record<string, unknown>): boolean {
-    const pending = this.pendingMemorySourcesRequests.get(requestId);
-    if (!pending) return false;
-    clearTimeout(pending.timer);
-    this.pendingMemorySourcesRequests.delete(requestId);
-    pending.resolve(msg);
-    return true;
+    return this.memorySourcesRequests.resolve(requestId, msg);
   }
 
   /**
    * Reject all pending memory.get_sources requests (e.g. on daemon disconnect).
    */
   private rejectAllPendingMemorySourcesRequests(reason: string): void {
-    for (const [, pending] of this.pendingMemorySourcesRequests) {
-      clearTimeout(pending.timer);
-      pending.reject(new Error(reason));
-    }
-    this.pendingMemorySourcesRequests.clear();
+    this.memorySourcesRequests.rejectAll(reason);
+    this.agentSkillsRequests.rejectAll(reason);
   }
 
   private resolvePreviewStart(msg: PreviewResponseStartMessage): void {

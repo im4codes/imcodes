@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { AGENT_SKILLS_MESSAGE_PREFIX, AGENT_SKILLS_MSG } from '../../shared/agent-skills.js';
 import { EventEmitter } from 'node:events';
 import { performance } from 'node:perf_hooks';
 import { readFileSync } from 'node:fs';
@@ -2616,6 +2617,18 @@ describe('WsBridge', () => {
 
       expect(daemonWs.sentStrings.some((s) => s.includes('server.delete'))).toBe(false);
       expect(browserWs.sentStrings.some((s) => s.includes('server_only_command') && s.includes('r2'))).toBe(true);
+    });
+
+    it('never lets a browser run the skills CLI on the machine directly', async () => {
+      // Only the owner-checked /api/agent-skills route may send these.
+      const { daemonWs, browserWs } = await setupBridge();
+      for (const type of [AGENT_SKILLS_MSG.RUN_REQUEST, AGENT_SKILLS_MSG.LIST_REQUEST]) {
+        browserWs.emit('message', JSON.stringify({ type, requestId: 'r3', action: 'add', source: 'owner/repo' }));
+      }
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.some((s) => s.includes(AGENT_SKILLS_MESSAGE_PREFIX))).toBe(false);
+      expect(browserWs.sentStrings.some((s) => s.includes('server_only_command') && s.includes('r3'))).toBe(true);
     });
 
     it('drops oversized payload', async () => {

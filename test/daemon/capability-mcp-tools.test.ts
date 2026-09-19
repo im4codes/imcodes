@@ -49,8 +49,9 @@ async function withClient(
   runtimeCaller: McpRuntimeCaller,
   capabilityService: CapabilityService | undefined,
   run: (client: Client) => Promise<void>,
+  runAgentSkills?: NonNullable<Parameters<typeof createMemoryMcpServer>[1]>['runAgentSkills'],
 ): Promise<void> {
-  const server = createMemoryMcpServer(runtimeCaller, { capabilityService });
+  const server = createMemoryMcpServer(runtimeCaller, { capabilityService, runAgentSkills });
   const client = new Client({ name: 'capability-tools-test', version: '1' });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
@@ -240,11 +241,11 @@ describe('capability MCP tools', () => {
       const installed = await client.callTool({
         name: 'capability_install',
         arguments: {
-          kind: 'skill',
-          source: { kind: 'url', value: 'https://example.test/skill.zip' },
+          kind: 'mcp',
+          source: { kind: 'url', value: 'https://mcp.example.test/first' },
           scope: 'account',
           idempotencyKey: 'install-1',
-          userIntent: 'install this Skill',
+          userIntent: 'install this MCP',
         },
       });
       expect(installed.structuredContent).toMatchObject({ status: 'ok', operation: { id: 'op-1', state: 'queued' } });
@@ -288,6 +289,40 @@ describe('capability MCP tools', () => {
     });
   });
 
+  it('installs a Skill into ~/.agents/skills on this machine, never through the managed store', async () => {
+    const capabilityService = service();
+    const runAgentSkills = vi.fn(async () => ({
+      ok: true,
+      output: 'Installed 2 skills',
+      skills: [{ name: 'wecomcli-doc', description: '' }, { name: 'wecomcli-shared', description: '' }],
+    }));
+    await withClient(caller(), capabilityService, async (client) => {
+      const installed = await client.callTool({
+        name: 'capability_install',
+        arguments: {
+          kind: 'skill',
+          source: { kind: 'repository', value: 'WeComTeam/wecom-cli' },
+          scope: 'local',
+          idempotencyKey: 'skill-1',
+        },
+      });
+      expect(installed.structuredContent).toMatchObject({
+        status: 'ok',
+        installedTo: '~/.agents/skills',
+        skills: ['wecomcli-doc', 'wecomcli-shared'],
+      });
+      expect(runAgentSkills).toHaveBeenCalledWith({ action: 'add', source: 'WeComTeam/wecom-cli' });
+      expect(capabilityService.install).not.toHaveBeenCalled();
+
+      const refused = await client.callTool({
+        name: 'capability_install',
+        arguments: { kind: 'skill', source: { kind: 'local_path', value: '/etc' }, scope: 'local', idempotencyKey: 'skill-2' },
+      });
+      expect(refused.structuredContent).toMatchObject({ status: 'error', reason: 'invalid_input' });
+      expect(runAgentSkills).toHaveBeenCalledTimes(1);
+    }, runAgentSkills);
+  });
+
   it('dispatches exact update and binding identities without accepting cross-owner schema drift', async () => {
     const capabilityService = service();
     vi.mocked(capabilityService.install).mockImplementation(async (input) => input.capabilityId === 'missing-capability'
@@ -301,7 +336,7 @@ describe('capability MCP tools', () => {
       });
     await withClient(caller(), capabilityService, async (client) => {
       const exact = {
-        kind: 'skill', source: { kind: 'url', value: 'https://example.test/skill.tgz' },
+        kind: 'mcp', source: { kind: 'url', value: 'https://mcp.example.test/rpc' },
         scope: 'account', idempotencyKey: 'exact-update', capabilityId: 'authority-capability', bindingId: 'authority-binding',
       } as const;
       const updated = await client.callTool({ name: 'capability_install', arguments: exact });

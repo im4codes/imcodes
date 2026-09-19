@@ -3016,7 +3016,39 @@
       "memoryManualAddTextLabel": "Текст ручной памяти",
       "memoryManualAddPlaceholder": "Запишите долговечную заметку, решение или сводку для этого проекта…",
       "memoryManualAddSave": "Сохранить память",
-      "memoryManualAddProjectRequired": "Перед добавлением памяти выберите проект в списке или фильтре."
+      "memoryManualAddProjectRequired": "Перед добавлением памяти выберите проект в списке или фильтре.",
+      "agentSkills": {
+        "title": "Agent Skills",
+        "description": "Навыки из ~/.agents/skills на каждой машине. Claude Code, Codex, Gemini, Qwen, OpenClaw и другие агенты на этой машине используют их напрямую.",
+        "machineLabel": "Машина",
+        "machineOffline": "{{name}} (не в сети)",
+        "updateAll": "Обновить все",
+        "update": "Обновить",
+        "remove": "Удалить",
+        "removeConfirm": "Удалить {{name}} с {{machine}}?",
+        "empty": "На этой машине пока нет навыков.",
+        "loadError": "Не удалось прочитать навыки этой машины.",
+        "installTitle": "Установить на машины",
+        "sourceLabel": "Источник навыка",
+        "sourcePlaceholder": "owner/repo или https://…",
+        "sourceInvalid": "Укажите owner/repo на GitHub или адрес https://.",
+        "install": "Установить",
+        "installing": "Установка…",
+        "machinesLabel": "Установить на",
+        "done": "Готово",
+        "details": "Подробности",
+        "errors": {
+          "invalid_request": "Некорректный запрос.",
+          "daemon_offline": "Машина не в сети.",
+          "timeout": "Время ожидания истекло.",
+          "busy": "На этой машине ещё выполняется другая операция с навыками.",
+          "cli_unavailable": "На этой машине не найден npm.",
+          "cli_failed": "Команда skills завершилась с ошибкой. См. подробности.",
+          "forbidden": "Управлять навыками машины может только её владелец.",
+          "not_found": "Эта машина не может запускать навыки.",
+          "generic": "Что-то пошло не так."
+        }
+      }
     },
     "diagnostics": {
       "title": "Diagnostics",
