@@ -19,6 +19,8 @@ import { isMarkedSessionLaunchIdentity } from '../../shared/session-resource-lif
 import { emitSessionStateProbeCorrection } from './session-state-probe-events.js';
 
 const DEBOUNCE_MS = 500;
+const SESSION_STORE_DISK_VERSION = 2;
+const IDENTITY_PROMPT_REF_PREFIX = 'p';
 
 function storeDir(): string {
   return join(homedir(), '.imcodes');
@@ -226,6 +228,16 @@ export interface SessionStore {
   sessions: Record<string, SessionRecord>;
 }
 
+interface PersistedSessionRecord extends Omit<SessionRecord, 'identityPrompt'> {
+  identityPromptRef?: string;
+}
+
+interface PersistedSessionStoreV2 {
+  version: typeof SESSION_STORE_DISK_VERSION;
+  sessions: Record<string, PersistedSessionRecord>;
+  identityPrompts: Record<string, string>;
+}
+
 export interface LoadStoreOptions {
   /**
    * Probe terminal-backed sessions after loading. Disable for short-lived
@@ -251,10 +263,67 @@ function isPersistableSessionRecord(record: SessionRecord): boolean {
 }
 
 function serializeStore(): string {
-  const persistableSessions = Object.fromEntries(
-    Object.entries(store.sessions).filter(([, record]) => isPersistableSessionRecord(record)),
-  );
-  return JSON.stringify({ sessions: persistableSessions }, null, 2);
+  const identityPrompts: Record<string, string> = {};
+  const promptRefs = new Map<string, string>();
+  const persistableSessions: Record<string, PersistedSessionRecord> = {};
+
+  for (const [name, record] of Object.entries(store.sessions)) {
+    if (!isPersistableSessionRecord(record)) continue;
+    const { identityPrompt, ...persistedRecord } = record;
+    if (typeof identityPrompt === 'string') {
+      let promptRef = promptRefs.get(identityPrompt);
+      if (promptRef === undefined) {
+        promptRef = `${IDENTITY_PROMPT_REF_PREFIX}${promptRefs.size}`;
+        promptRefs.set(identityPrompt, promptRef);
+        identityPrompts[promptRef] = identityPrompt;
+      }
+      persistableSessions[name] = { ...persistedRecord, identityPromptRef: promptRef };
+    } else {
+      persistableSessions[name] = persistedRecord;
+    }
+  }
+
+  const persistedStore: PersistedSessionStoreV2 = {
+    version: SESSION_STORE_DISK_VERSION,
+    sessions: persistableSessions,
+    identityPrompts,
+  };
+  return JSON.stringify(persistedStore, null, 2);
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function hydrateStore(value: unknown): { store: SessionStore; legacy: boolean } | null {
+  if (!isObjectRecord(value) || !isObjectRecord(value.sessions)) return null;
+
+  if (value.version === SESSION_STORE_DISK_VERSION && isObjectRecord(value.identityPrompts)) {
+    const sessions: Record<string, SessionRecord> = {};
+    for (const [name, rawRecord] of Object.entries(value.sessions)) {
+      if (!isObjectRecord(rawRecord)) continue;
+      const { identityPromptRef, identityPrompt: inlineIdentityPrompt, ...record } = rawRecord;
+      const hydratedRecord = { ...record } as unknown as SessionRecord;
+      // Accept an inline value only for a mixed transitional snapshot. A
+      // missing or malformed reference must never become an identity prompt.
+      if (typeof inlineIdentityPrompt === 'string') {
+        hydratedRecord.identityPrompt = inlineIdentityPrompt;
+      } else if (
+        typeof identityPromptRef === 'string'
+        && Object.prototype.hasOwnProperty.call(value.identityPrompts, identityPromptRef)
+        && typeof value.identityPrompts[identityPromptRef] === 'string'
+      ) {
+        hydratedRecord.identityPrompt = value.identityPrompts[identityPromptRef];
+      }
+      sessions[name] = hydratedRecord;
+    }
+    return { store: { sessions }, legacy: false };
+  }
+
+  // Legacy snapshots stored identityPrompt inline on every session. Keep
+  // them readable and rewrite them to the compact schema on the daemon-owned
+  // load path. Read-only consumers (probe:false) remain strictly read-only.
+  return { store: { sessions: value.sessions as Record<string, SessionRecord> }, legacy: true };
 }
 
 function pruneNonPersistableSessions(): boolean {
@@ -273,9 +342,14 @@ export async function loadStore(options: LoadStoreOptions = {}): Promise<Session
   const targetPath = storePath();
   await drainPendingWritesForRead();
   await mkdir(dirname(targetPath), { recursive: true });
+  let loadedLegacySnapshot = false;
   try {
     const raw = await readFile(targetPath, 'utf8');
-    store = JSON.parse(raw) as SessionStore;
+    const hydrated = hydrateStore(JSON.parse(raw));
+    if (hydrated) {
+      store = hydrated.store;
+      loadedLegacySnapshot = hydrated.legacy;
+    }
   } catch (err) {
     // Reset to an empty store ONLY when the file genuinely doesn't exist. A
     // transient read/parse failure (a concurrent writer truncating the file
@@ -295,6 +369,7 @@ export async function loadStore(options: LoadStoreOptions = {}): Promise<Session
   // the daemon's external writes — intermittently dropping a just-added session
   // and failing send_message (flaky CI at the memory-mcp send-refresh path).
   if (options.probe === false) return store;
+  if (loadedLegacySnapshot) scheduleWrite(targetPath);
   if (pruneNonPersistableSessions()) scheduleWrite(targetPath);
   if (reconcilePersistedSessions()) scheduleWrite(targetPath);
   // Probe actual state of each session via terminal detection.

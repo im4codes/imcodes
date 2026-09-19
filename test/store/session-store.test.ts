@@ -265,6 +265,96 @@ describe('session-store', () => {
       await writeFile(join(dir, 'sessions.json'), JSON.stringify(content), 'utf8');
     }
 
+    it('deduplicates repeated identity prompts on disk and hydrates them exactly on reload', async () => {
+      const prompt = `shared identity\n${'provider-safe instructions\n'.repeat(3_000)}`;
+      const store = await importSessionStore();
+      for (let index = 0; index < 60; index += 1) {
+        store.upsertSession({
+          name: `deck_dedup_${index}_brain`,
+          projectName: `dedup_${index}`,
+          role: 'brain',
+          agentType: 'codex-sdk',
+          projectDir: `/tmp/dedup-${index}`,
+          state: 'idle',
+          restarts: 0,
+          restartTimestamps: [],
+          createdAt: index + 1,
+          updatedAt: index + 1,
+          identityPrompt: prompt,
+        });
+      }
+
+      await store.flushStore();
+      const raw = await readFile(join(tempDir, '.imcodes', 'sessions.json'), 'utf8');
+      const persisted = JSON.parse(raw) as {
+        version: number;
+        sessions: Record<string, { identityPrompt?: string; identityPromptRef?: string }>;
+        identityPrompts: Record<string, string>;
+      };
+      expect(persisted.version).toBe(2);
+      expect(Object.values(persisted.identityPrompts)).toEqual([prompt]);
+      expect(new Set(Object.values(persisted.sessions).map((entry) => entry.identityPromptRef))).toEqual(
+        new Set(['p0']),
+      );
+      expect(Object.values(persisted.sessions).every((entry) => entry.identityPrompt === undefined)).toBe(true);
+      expect(raw.length).toBeLessThan(prompt.length * 2);
+
+      vi.resetModules();
+      const reloaded = await importSessionStore();
+      await reloaded.loadStore({ probe: false });
+      expect(reloaded.getSession('deck_dedup_37_brain')?.identityPrompt).toBe(prompt);
+    });
+
+    it('migrates legacy inline identity prompts to references without changing content', async () => {
+      const prompt = 'legacy identity\nwith exact content';
+      await writeSessionsFixture({
+        sessions: {
+          deck_legacy_prompt_brain: {
+            name: 'deck_legacy_prompt_brain', projectName: 'legacy-prompt', role: 'brain',
+            agentType: 'codex-sdk', projectDir: '/tmp/legacy-prompt', identityPrompt: prompt,
+            state: 'idle', restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1,
+          },
+        },
+      });
+
+      const store = await importSessionStore();
+      await store.loadStore();
+      expect(store.getSession('deck_legacy_prompt_brain')?.identityPrompt).toBe(prompt);
+      await store.flushStore();
+
+      const persisted = JSON.parse(
+        await readFile(join(tempDir, '.imcodes', 'sessions.json'), 'utf8'),
+      ) as {
+        version: number;
+        sessions: Record<string, { identityPrompt?: string; identityPromptRef?: string }>;
+        identityPrompts: Record<string, string>;
+      };
+      expect(persisted.version).toBe(2);
+      expect(persisted.sessions.deck_legacy_prompt_brain).toMatchObject({ identityPromptRef: 'p0' });
+      expect(persisted.sessions.deck_legacy_prompt_brain.identityPrompt).toBeUndefined();
+      expect(persisted.identityPrompts.p0).toBe(prompt);
+    });
+
+    it('fails closed when a compact snapshot contains a missing identity prompt reference', async () => {
+      await writeSessionsFixture({
+        version: 2,
+        identityPrompts: {},
+        sessions: {
+          deck_missing_prompt_brain: {
+            name: 'deck_missing_prompt_brain', projectName: 'missing-prompt', role: 'brain',
+            agentType: 'codex-sdk', projectDir: '/tmp/missing-prompt', identityPromptRef: 'p404',
+            state: 'idle', restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1,
+          },
+        },
+      });
+
+      const store = await importSessionStore();
+      await store.loadStore({ probe: false });
+      expect(store.getSession('deck_missing_prompt_brain')).toBeDefined();
+      expect(store.getSession('deck_missing_prompt_brain')?.identityPrompt).toBeUndefined();
+      expect(store.getSession('deck_missing_prompt_brain')).not.toHaveProperty('identityPromptRef');
+    });
+
     it('writes fixtures through the real filesystem when a worker-local fs mock is registered', async () => {
       vi.doMock('node:fs/promises', () => ({
         mkdir: vi.fn().mockResolvedValue(undefined),
