@@ -20,6 +20,7 @@ import {
   DIRECT_FILE_TRANSFER_UPLOAD_RECOVERY_CAPABILITY,
   classifyDirectConnectivityRoute,
   classifyDirectFileTransferFailure,
+  isDirectFileTransferLinkFailure,
   validateDirectFileTransferAuthorized,
   validateDirectFileTransferServerMessage,
   validateDirectFileTransferDataMessage,
@@ -2091,8 +2092,12 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
   }
 }
 
-function retryDelay(attempt: number): number {
-  const base = DIRECT_FILE_TRANSFER_LIMITS.RETRY_BACKOFF_MS[attempt - 1] ?? 0;
+function retryDelay(attempt: number, lastError?: unknown): number {
+  const schedule = lastError instanceof DirectFileTransferFailure
+    && isDirectFileTransferLinkFailure(lastError.code as DirectFileTransferError)
+    ? DIRECT_FILE_TRANSFER_LIMITS.LINK_RECOVERY_BACKOFF_MS
+    : DIRECT_FILE_TRANSFER_LIMITS.RETRY_BACKOFF_MS;
+  const base = schedule[attempt - 1] ?? 0;
   return base + Math.round(base * DIRECT_FILE_TRANSFER_LIMITS.RETRY_MAX_POSITIVE_JITTER_RATIO * Math.random());
 }
 
@@ -2158,7 +2163,7 @@ async function retryDirect<T>(
   // finished attempt confirmed on its own live channel.
   let resumeFromBytes = 0;
   for (let attempt = 1; attempt <= DIRECT_FILE_TRANSFER_LIMITS.MAX_ATTEMPTS; attempt++) {
-    if (attempt > 1) await wait(retryDelay(attempt - 1), signal);
+    if (attempt > 1) await wait(retryDelay(attempt - 1, last), signal);
     const attemptControlEpoch = lease.controlEpoch;
     const operation = await createOperation(attempt);
     if (operation.kind === 'upload' && resumeFromBytes > 0) operation.resumeFromBytes = resumeFromBytes;

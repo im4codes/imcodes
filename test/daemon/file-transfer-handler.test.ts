@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, realpath, rm, stat, symlink, unlink, writeFile } from '
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
-import { FILE_TRANSFER_LIMITS, FILE_TRANSFER_MSG } from '../../shared/transport/file-transfer.js';
+import { FILE_TRANSFER_LIMITS, FILE_TRANSFER_MSG, FILE_TRANSFER_RELAY_HEADER } from '../../shared/transport/file-transfer.js';
 
 async function loadFileTransferHandler(fakeHome: string, options?: { maxFileSize?: number }) {
   vi.resetModules();
@@ -315,6 +315,83 @@ describe('file-transfer local handle hardening', () => {
         duplex: 'half',
       }),
     );
+  });
+
+  it('resumes a relay download from the requested offset', async () => {
+    const filePath = path.join(rootDir, 'project', 'resume.bin');
+    const content = Buffer.alloc(FILE_TRANSFER_LIMITS.DOWNLOAD_INLINE_MAX_BYTES + 4096);
+    for (let i = 0; i < content.length; i += 1) content[i] = i % 251;
+    await mkdir(path.dirname(filePath), { recursive: true });
+    await writeFile(filePath, content);
+
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const handle = transfer.createProjectFileHandle(filePath, 'resume.bin', 'application/octet-stream', content.length);
+    let putBody: Buffer | undefined;
+    const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of init.body as AsyncIterable<Buffer>) chunks.push(Buffer.from(chunk));
+      putBody = Buffer.concat(chunks);
+      return new Response('', { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const streamed = createServerLinkMock();
+    const offset = 1_000_003;
+
+    await transfer.handleFileDownloadStream(
+      {
+        type: FILE_TRANSFER_MSG.DOWNLOAD_STREAM,
+        downloadId: 'download-resume',
+        attachmentId: handle.id,
+        uploadUrl: 'https://relay.example/download-staged/download-resume?token=secret',
+        offset,
+      },
+      streamed.serverLink as never,
+    );
+
+    // READY still describes the whole file, and says where this body starts.
+    expect(streamed.sent).toEqual([
+      expect.objectContaining({
+        type: FILE_TRANSFER_MSG.DOWNLOAD_STREAM_READY,
+        size: content.length,
+        offset,
+      }),
+    ]);
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://relay.example/download-staged/download-resume?token=secret',
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          'content-length': String(content.length - offset),
+          [FILE_TRANSFER_RELAY_HEADER.OFFSET]: String(offset),
+        }),
+      }),
+    );
+    expect(putBody?.equals(content.subarray(offset))).toBe(true);
+  });
+
+  it('refuses an offset past the end of the file', async () => {
+    const filePath = path.join(rootDir, 'project', 'short.bin');
+    const content = Buffer.alloc(FILE_TRANSFER_LIMITS.DOWNLOAD_INLINE_MAX_BYTES + 10, 1);
+    await mkdir(path.dirname(filePath), { recursive: true });
+    await writeFile(filePath, content);
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const handle = transfer.createProjectFileHandle(filePath, 'short.bin', 'application/octet-stream', content.length);
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const failed = createServerLinkMock();
+
+    await transfer.handleFileDownloadStream(
+      {
+        type: FILE_TRANSFER_MSG.DOWNLOAD_STREAM,
+        downloadId: 'download-past-end',
+        attachmentId: handle.id,
+        uploadUrl: 'https://relay.example/download-staged/download-past-end?token=secret',
+        offset: content.length + 1,
+      },
+      failed.serverLink as never,
+    );
+
+    expect(failed.sent).toEqual([expect.objectContaining({ type: 'file.download_error', downloadId: 'download-past-end' })]);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('rejects legacy uploads over the active single-frame cap', async () => {

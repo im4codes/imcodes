@@ -1849,24 +1849,52 @@ describe('direct file transfer v2 browser broker', () => {
   }, 10_000);
 
   it('falls back once after three retryable lease-signal races instead of multiplying lease retries', async () => {
+    // Only the retry clock is faked; the fake peer/socket plumbing keeps its
+    // own real scheduling.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
     const { ws, sent } = createWs(directCapabilities, 'lease_signal_failure');
-    const file = new File(['retry'], 'retry.txt', { type: 'text/plain' });
+    // Large enough to earn the full direct-connect budget: a tiny upload
+    // rightly gives up on P2P sooner than any link recovery could take.
+    const file = new File([new Uint8Array(6 * 1024 * 1024)], 'retry.bin');
     const random = vi.spyOn(Math, 'random').mockReturnValue(0);
+    const offers = () => sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER).length;
     try {
-      await expect(uploadFileWithDirectFallback({ ws, serverId: 'server-1', file })).resolves.toMatchObject({
+      const pending = uploadFileWithDirectFallback({ ws, serverId: 'server-1', file });
+      let settled = false;
+      void pending.finally(() => { settled = true; }).catch(() => undefined);
+      // Step the retry clock, letting the fake socket/peer settle between
+      // steps, and note when each direct offer went out.
+      const offerTimes: number[] = [];
+      let elapsed = 0;
+      while (!settled && elapsed < 30_000) {
+        for (let i = 0; i < 20; i += 1) await new Promise((resolve) => setImmediate(resolve));
+        while (offerTimes.length < offers()) offerTimes.push(elapsed);
+        await vi.advanceTimersByTimeAsync(250);
+        elapsed += 250;
+      }
+      while (offerTimes.length < offers()) offerTimes.push(elapsed);
+      await expect(pending).resolves.toMatchObject({
         attachment: { id: 'relay-attachment' },
       });
+      // A stale node generation means the node's server link was just
+      // replaced: each retry waits out a reconnect instead of burning the
+      // whole budget inside it and dropping to HTTP.
+      const [firstWait, secondWait] = DIRECT_FILE_TRANSFER_LIMITS.LINK_RECOVERY_BACKOFF_MS;
+      expect(offerTimes).toHaveLength(3);
+      expect(offerTimes[1]! - offerTimes[0]!).toBeGreaterThanOrEqual(firstWait);
+      expect(offerTimes[2]! - offerTimes[1]!).toBeGreaterThanOrEqual(secondWait);
       // The first direct attempt initializes the lease. Each of the three
       // bounded transport attempts offers against that same matching lease;
       // after the shared budget the normal HTTP upload is invoked exactly once.
       expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(1);
-      expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toHaveLength(3);
+      expect(offers()).toBe(3);
       expect(apiMocks.uploadFile).toHaveBeenCalledTimes(1);
     } finally {
       random.mockRestore();
+      vi.useRealTimers();
     }
-  }, 10_000);
+  });
 
   it('isolates daemon scopes and disposes released peers at the authoritative idle deadline', async () => {
     vi.useFakeTimers();

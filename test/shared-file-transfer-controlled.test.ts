@@ -6,6 +6,10 @@ import {
   validateControlledFileTransferResponse,
   validateFileDirectoryListRequest,
   validateFilePathHandleRequest,
+  formatFileTransferContentRange,
+  formatFileTransferRangeRequest,
+  parseFileTransferContentRange,
+  parseFileTransferRangeRequest,
 } from '../shared/transport/file-transfer.js';
 
 describe('controlled file-transfer trust boundary', () => {
@@ -135,5 +139,36 @@ describe('controlled file-transfer trust boundary', () => {
       ...base,
       destinationDirectory: 'x'.repeat(FILE_TRANSFER_PATH_MAX_BYTES + 1),
     }).ok).toBe(false);
+  });
+
+  it('carries a bounded resume offset on the download stream and its READY', () => {
+    const request = {
+      type: FILE_TRANSFER_MSG.DOWNLOAD_STREAM,
+      downloadId: 'download-1',
+      attachmentId: 'attachment-1',
+      uploadUrl: 'https://relay.example/download-staged/download-1?token=t',
+    };
+    expect(validateControlledFileTransferRequest({ ...request, offset: 1024 }).ok).toBe(true);
+    expect(validateControlledFileTransferRequest({ ...request, offset: -1 }).ok).toBe(false);
+    expect(validateControlledFileTransferRequest({ ...request, offset: 1.5 }).ok).toBe(false);
+
+    const ready = { type: FILE_TRANSFER_MSG.DOWNLOAD_STREAM_READY, downloadId: 'download-1', size: 2048 };
+    expect(validateControlledFileTransferResponse({ ...ready, offset: 1024 }).ok).toBe(true);
+    // An offset only means something against a known size, and never past it.
+    expect(validateControlledFileTransferResponse({ ...ready, offset: 4096 }).ok).toBe(false);
+    expect(validateControlledFileTransferResponse({
+      type: FILE_TRANSFER_MSG.DOWNLOAD_STREAM_READY, downloadId: 'download-1', offset: 1,
+    }).ok).toBe(false);
+  });
+
+  it('round-trips the one Range shape it speaks and ignores the rest', () => {
+    expect(parseFileTransferRangeRequest(formatFileTransferRangeRequest(7))).toBe(7);
+    for (const other of [undefined, '', 'bytes=0-9', 'bytes=-5', 'bytes=1-,5-', 'items=3-']) {
+      expect(parseFileTransferRangeRequest(other)).toBe(0);
+    }
+    expect(parseFileTransferContentRange(formatFileTransferContentRange(7, 20)))
+      .toEqual({ start: 7, end: 19, total: 20 });
+    expect(parseFileTransferContentRange('bytes */20')).toBeNull();
+    expect(parseFileTransferContentRange('bytes 9-5/20')).toBeNull();
   });
 });

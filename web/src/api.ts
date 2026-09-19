@@ -10,6 +10,10 @@ import { AUTH_IDENTITY_ERRORS } from '@shared/auth-identity.js';
 import { CONTROLLED_NODE_MINT_ERRORS } from '@shared/controlled-node-artifacts.js';
 import { normalizeClientTimezone } from '@shared/client-timezone.js';
 import { PREVIEW_ACCESS_TOKEN_QUERY_PARAM } from '@shared/preview-types.js';
+import {
+  formatFileTransferRangeRequest,
+  parseFileTransferContentRange,
+} from '@shared/transport/file-transfer.js';
 import { getSessionRuntimeType } from '@shared/agent-types.js';
 import type {
   TimelineCursor,
@@ -1830,9 +1834,55 @@ export interface AttachmentDownloadProgress {
 }
 
 /**
+ * An interrupted HTTP download resumes from the last byte written instead of
+ * failing the whole file: the node → server → browser relay crosses networks
+ * that drop long-lived streams (seen live: a 165 MB fallback dying at 6.6 MB).
+ */
+export const ATTACHMENT_DOWNLOAD_RESUME = {
+  /** Consecutive interruptions that made no progress before giving up. */
+  MAX_ATTEMPTS_WITHOUT_PROGRESS: 4,
+  /** Upper bound on resumes for one download, however much each one moved. */
+  MAX_RESUMES: 40,
+  BACKOFF_MS: [1_000, 2_000, 4_000, 8_000] as const,
+} as const;
+const RESUMABLE_DOWNLOAD_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+
+/** A failure on the network side of a download: safe to resume. */
+class AttachmentDownloadInterrupted extends Error {
+  constructor(message: string, readonly cause?: unknown) {
+    super(message);
+    this.name = 'AttachmentDownloadInterrupted';
+  }
+}
+
+function throwIfDownloadAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new DOMException('download_canceled', 'AbortError');
+}
+
+function isResumableDownloadFailure(error: unknown): boolean {
+  if (error instanceof AttachmentDownloadInterrupted) return true;
+  return error instanceof ApiError && RESUMABLE_DOWNLOAD_STATUSES.has(error.status);
+}
+
+function waitBeforeResume(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException('download_canceled', 'AbortError'));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/**
  * Stream an attachment response into a caller-owned writable sink.  This is
  * used by File Browser's direct-download HTTP fallback so multi-GiB files
- * never accumulate in a Blob.
+ * never accumulate in a Blob.  The sink is append-only and is never rewound:
+ * a resumed response continues exactly at the bytes already written.
  */
 export async function streamAttachmentDownloadToWritable(
   serverId: string,
@@ -1842,11 +1892,50 @@ export async function streamAttachmentDownloadToWritable(
   signal?: AbortSignal,
   onProgress?: (progress: AttachmentDownloadProgress) => void,
 ): Promise<void> {
-  if (signal?.aborted) throw new DOMException('download_canceled', 'AbortError');
-  const res = await rawFetch(
-    withSessionName(`/api/server/${encodeURIComponent(serverId)}/uploads/${encodeURIComponent(attachmentId)}/download`, sessionName),
-    { signal },
-  );
+  throwIfDownloadAborted(signal);
+  const path = withSessionName(`/api/server/${encodeURIComponent(serverId)}/uploads/${encodeURIComponent(attachmentId)}/download`, sessionName);
+  const state = { loadedBytes: 0, totalBytes: null as number | null };
+  let resumes = 0;
+  let withoutProgress = 0;
+  for (;;) {
+    const before = state.loadedBytes;
+    try {
+      await streamAttachmentDownloadAttempt(path, writable, state, signal, onProgress);
+      return;
+    } catch (error) {
+      throwIfDownloadAborted(signal);
+      if (!isResumableDownloadFailure(error)) throw error;
+      withoutProgress = state.loadedBytes > before ? 1 : withoutProgress + 1;
+      resumes += 1;
+      if (withoutProgress > ATTACHMENT_DOWNLOAD_RESUME.MAX_ATTEMPTS_WITHOUT_PROGRESS
+        || resumes > ATTACHMENT_DOWNLOAD_RESUME.MAX_RESUMES) {
+        throw error instanceof AttachmentDownloadInterrupted && error.cause !== undefined ? error.cause : error;
+      }
+      const backoff = ATTACHMENT_DOWNLOAD_RESUME.BACKOFF_MS;
+      await waitBeforeResume(backoff[Math.min(withoutProgress, backoff.length) - 1]!, signal);
+    }
+  }
+}
+
+async function streamAttachmentDownloadAttempt(
+  path: string,
+  writable: AttachmentDownloadWritable,
+  state: { loadedBytes: number; totalBytes: number | null },
+  signal: AbortSignal | undefined,
+  onProgress: ((progress: AttachmentDownloadProgress) => void) | undefined,
+): Promise<void> {
+  throwIfDownloadAborted(signal);
+  const resumeFrom = state.loadedBytes;
+  let res: Response;
+  try {
+    res = await rawFetch(path, {
+      signal,
+      ...(resumeFrom > 0 ? { headers: { Range: formatFileTransferRangeRequest(resumeFrom) } } : {}),
+    });
+  } catch (error) {
+    throwIfDownloadAborted(signal);
+    throw new AttachmentDownloadInterrupted('download_request_failed', error);
+  }
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     throw new ApiError(res.status, body);
@@ -1854,26 +1943,52 @@ export async function streamAttachmentDownloadToWritable(
   if (!res.body) throw new ApiError(res.status, 'download_stream_unavailable');
   const contentLength = res.headers.get('content-length');
   const parsedLength = contentLength === null ? Number.NaN : Number(contentLength);
-  const totalBytes = Number.isSafeInteger(parsedLength) && parsedLength >= 0 ? parsedLength : null;
-  let loadedBytes = 0;
-  onProgress?.({ loadedBytes, totalBytes });
+  const bodyLength = Number.isSafeInteger(parsedLength) && parsedLength >= 0 ? parsedLength : null;
+
+  if (resumeFrom === 0) {
+    state.totalBytes = bodyLength;
+  } else {
+    // A resumed response must continue exactly where the file on disk ends,
+    // for the same file.
+    const range = res.status === 206 ? parseFileTransferContentRange(res.headers.get('content-range')) : null;
+    if (!range || range.start !== resumeFrom
+      || (state.totalBytes !== null && range.total !== state.totalBytes)) {
+      throw new ApiError(res.status, 'download_resume_mismatch');
+    }
+    state.totalBytes = range.total;
+  }
+  onProgress?.({ loadedBytes: state.loadedBytes, totalBytes: state.totalBytes });
+
   const reader = res.body.getReader();
   try {
     for (;;) {
-      if (signal?.aborted) throw new DOMException('download_canceled', 'AbortError');
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (value?.byteLength) {
-        await writable.write(value);
-        loadedBytes += value.byteLength;
-        onProgress?.({ loadedBytes, totalBytes });
+      throwIfDownloadAborted(signal);
+      let chunk: Awaited<ReturnType<typeof reader.read>>;
+      try {
+        chunk = await reader.read();
+      } catch (error) {
+        throwIfDownloadAborted(signal);
+        throw new AttachmentDownloadInterrupted('download_stream_interrupted', error);
       }
+      if (chunk.done) break;
+      const value = chunk.value;
+      if (!value?.byteLength) continue;
+      // Write failures (disk full, revoked handle) are not network failures
+      // and are never resumed.
+      await writable.write(value);
+      state.loadedBytes += value.byteLength;
+      onProgress?.({ loadedBytes: state.loadedBytes, totalBytes: state.totalBytes });
     }
   } catch (error) {
     await reader.cancel(error).catch(() => undefined);
     throw error;
   } finally {
     reader.releaseLock();
+  }
+  if (state.totalBytes !== null) {
+    // A relay that dies can end the response cleanly but short.
+    if (state.loadedBytes < state.totalBytes) throw new AttachmentDownloadInterrupted('download_ended_early');
+    if (state.loadedBytes > state.totalBytes) throw new ApiError(res.status, 'download_size_mismatch');
   }
 }
 

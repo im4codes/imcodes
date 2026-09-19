@@ -8,6 +8,8 @@ import {
   FILE_TRANSFER_PATH_MAX_BYTES,
   FILE_TRANSFER_MSG,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
+  FILE_TRANSFER_RELAY_HEADER,
+  formatFileTransferRangeRequest,
 } from '../../shared/transport/file-transfer.js';
 import { DIRECT_FILE_TRANSFER_UPLOAD_RECOVERY_CAPABILITY } from '../../shared/direct-file-transfer.js';
 import {
@@ -1027,6 +1029,61 @@ describe('file-transfer download route', () => {
       FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS,
     );
     expect(hasDaemonCapabilityMock).toHaveBeenCalledWith(FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY);
+  });
+
+  it('resumes an interrupted download from the byte the browser asks for', async () => {
+    const app = makeApp();
+    let stagedPut: Promise<Response> | undefined;
+    sendFileTransferRequestMock.mockImplementationOnce((_requestId, message) => {
+      const downloadMessage = message as { type: string; uploadUrl: string; offset?: number };
+      expect(downloadMessage).toMatchObject({ type: FILE_TRANSFER_MSG.DOWNLOAD_STREAM, offset: 2 });
+      const uploadUrl = new URL(downloadMessage.uploadUrl);
+      // The node streams only the missing tail and says where it starts.
+      stagedPut = app.request(`${uploadUrl.pathname}${uploadUrl.search}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'text/plain',
+          'Content-Length': '3',
+          [FILE_TRANSFER_RELAY_HEADER.FILENAME]: encodeURIComponent('hello.txt'),
+          [FILE_TRANSFER_RELAY_HEADER.OFFSET]: '2',
+        },
+        body: 'llo',
+      });
+      return new Promise(() => {});
+    });
+
+    const res = await app.request('/api/server/srv-1/uploads/abc123/download', {
+      headers: { Authorization: 'Bearer test', Range: formatFileTransferRangeRequest(2) },
+    });
+
+    expect(res.status).toBe(206);
+    expect(res.headers.get('content-range')).toBe('bytes 2-4/5');
+    expect(res.headers.get('content-length')).toBe('3');
+    expect(res.headers.get('accept-ranges')).toBe('bytes');
+    await expect(res.text()).resolves.toBe('llo');
+    await expect(stagedPut).resolves.toMatchObject({ status: 200 });
+  });
+
+  it('serves the missing tail of a small inline download, and 416 past its end', async () => {
+    sendFileTransferRequestMock.mockResolvedValue({
+      type: 'file.download_done',
+      content: Buffer.from('hello').toString('base64'),
+      mime: 'text/plain',
+      filename: 'hello.txt',
+    });
+    const app = makeApp();
+    const tail = await app.request('/api/server/srv-1/uploads/abc123/download', {
+      headers: { Authorization: 'Bearer test', Range: formatFileTransferRangeRequest(3) },
+    });
+    expect(tail.status).toBe(206);
+    expect(tail.headers.get('content-range')).toBe('bytes 3-4/5');
+    await expect(tail.text()).resolves.toBe('lo');
+
+    const past = await app.request('/api/server/srv-1/uploads/abc123/download', {
+      headers: { Authorization: 'Bearer test', Range: formatFileTransferRangeRequest(5) },
+    });
+    expect(past.status).toBe(416);
+    expect(past.headers.get('content-range')).toBe('bytes */5');
   });
 
   it('rejects a staged download sink when controlled access was revoked after minting', async () => {

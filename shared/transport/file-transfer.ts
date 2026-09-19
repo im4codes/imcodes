@@ -73,6 +73,43 @@ export const FILE_TRANSFER_LIMITS = {
 export const FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY = 'file.transfer.upload_fetch.v1' as const;
 export const FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY = 'file.transfer.download_stream.v1' as const;
 export const FILE_TRANSFER_PATH_HANDLE_CAPABILITY = 'file.transfer.path_handle.v1' as const;
+
+/** Headers on the node's relay PUT (node -> server staged download sink). */
+export const FILE_TRANSFER_RELAY_HEADER = {
+  FILENAME: 'x-imcodes-filename',
+  /** Byte the PUT body starts at; absent means the whole file. */
+  OFFSET: 'x-imcodes-offset',
+} as const;
+
+/**
+ * HTTP resume of an attachment download. Only the one shape the browser sends
+ * is understood -- an open-ended `bytes=N-`. Anything else is ignored and the
+ * whole file is served, which RFC 9110 allows.
+ */
+export function formatFileTransferRangeRequest(offset: number): string {
+  return `bytes=${offset}-`;
+}
+
+export function parseFileTransferRangeRequest(header: string | null | undefined): number {
+  const match = /^bytes=(\d{1,16})-$/.exec((header ?? '').trim());
+  if (!match) return 0;
+  const offset = Number(match[1]);
+  return Number.isSafeInteger(offset) ? offset : 0;
+}
+
+export function formatFileTransferContentRange(start: number, total: number): string {
+  return `bytes ${start}-${total - 1}/${total}`;
+}
+
+export function parseFileTransferContentRange(
+  header: string | null | undefined,
+): { start: number; end: number; total: number } | null {
+  const match = /^bytes (\d{1,16})-(\d{1,16})\/(\d{1,16})$/.exec((header ?? '').trim());
+  if (!match) return null;
+  const [start, end, total] = [Number(match[1]), Number(match[2]), Number(match[3])];
+  if (![start, end, total].every(Number.isSafeInteger) || start > end || end >= total) return null;
+  return { start, end, total };
+}
 export const FILE_TRANSFER_DIRECTORY_CAPABILITY = 'file.transfer.directory.v1' as const;
 export const FILE_TRANSFER_PATH_MAX_BYTES = 4 * 1024;
 export const FILE_TRANSFER_ERROR_MAX_BYTES = 256;
@@ -242,6 +279,8 @@ export interface FileDownloadStreamRequest {
   downloadId: string;
   attachmentId: string;
   uploadUrl: string;
+  /** Resume an interrupted HTTP download from this byte. */
+  offset?: number;
 }
 
 /** Server -> controlled node: mint a short-lived handle for one explicit path. */
@@ -346,7 +385,10 @@ export interface FileDownloadStreamReady {
   downloadId: string;
   mime?: string;
   filename?: string;
+  /** Size of the whole file, even when streaming from an offset. */
   size?: number;
+  /** The offset the stream actually starts at; absent means 0. */
+  offset?: number;
 }
 
 export interface FileDownloadError {
@@ -568,9 +610,10 @@ export function validateControlledFileTransferRequest(
     return { ok: true, value: value as unknown as FileDownloadRequest };
   }
   if (value.type === FILE_TRANSFER_MSG.DOWNLOAD_STREAM) {
-    if (!hasOnlyKeys(value, new Set(['type', 'downloadId', 'attachmentId', 'uploadUrl']))
+    if (!hasOnlyKeys(value, new Set(['type', 'downloadId', 'attachmentId', 'uploadUrl', 'offset']))
       || !isTransferId(value.downloadId) || !isTransferId(value.attachmentId)
-      || !isBoundedString(value.uploadUrl, 8192)) {
+      || !isBoundedString(value.uploadUrl, 8192)
+      || (value.offset !== undefined && !isSafeSize(value.offset))) {
       return { ok: false, error: 'invalid_download_stream' };
     }
     return { ok: true, value: value as unknown as FileDownloadStreamRequest };
@@ -616,11 +659,14 @@ export function validateControlledFileTransferResponse(
     return { ok: true, value: v as unknown as FileDownloadDone };
   }
   if (v.type === FILE_TRANSFER_MSG.DOWNLOAD_STREAM_READY) {
-    if (!hasOnlyKeys(v, new Set(['type', 'downloadId', 'mime', 'filename', 'size']))
+    if (!hasOnlyKeys(v, new Set(['type', 'downloadId', 'mime', 'filename', 'size', 'offset']))
       || !isTransferId(v.downloadId)
       || (v.mime !== undefined && !isBoundedString(v.mime, 256))
       || (v.filename !== undefined && !isBoundedString(v.filename, 1024))
-      || (v.size !== undefined && !isSafeSize(v.size))) return { ok: false, error: 'invalid_download_ready' };
+      || (v.size !== undefined && !isSafeSize(v.size))
+      || (v.offset !== undefined && (!isSafeSize(v.offset) || v.size === undefined || v.offset > v.size))) {
+      return { ok: false, error: 'invalid_download_ready' };
+    }
     return { ok: true, value: v as unknown as FileDownloadStreamReady };
   }
   if (v.type === 'file.download_error') {

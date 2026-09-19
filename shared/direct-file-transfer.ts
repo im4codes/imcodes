@@ -157,6 +157,17 @@ export type DirectFileTransferErrorScope = typeof DIRECT_FILE_TRANSFER_ERROR_SCO
  * It deliberately never converts a local/security/integrity failure to HTTP,
  * because a fallback must not mask a denied/changed file or user cancellation.
  */
+const DIRECT_FILE_TRANSFER_LINK_FAILURES = new Set<DirectFileTransferError>([
+  DIRECT_FILE_TRANSFER_ERROR.DAEMON_OFFLINE,
+  DIRECT_FILE_TRANSFER_ERROR.LEASE_REBIND_FAILED,
+  DIRECT_FILE_TRANSFER_ERROR.STALE_DAEMON_GENERATION,
+]);
+
+/** Whether a failure points at the node's server link rather than the P2P path. */
+export function isDirectFileTransferLinkFailure(error: DirectFileTransferError): boolean {
+  return DIRECT_FILE_TRANSFER_LINK_FAILURES.has(error);
+}
+
 export function classifyDirectFileTransferFailure(
   error: DirectFileTransferError,
   attemptsUsed: number,
@@ -214,6 +225,13 @@ export const DIRECT_FILE_TRANSFER_LIMITS = {
   AUTHORITY_TTL_MS: 2 * 60 * 60 * 1000,
   MAX_ATTEMPTS: 3,
   RETRY_BACKOFF_MS: [250, 1_000] as const,
+  /**
+   * Backoff after a failure that means the node's server link is down or was
+   * just replaced (node offline, lease rebind, stale node generation). The
+   * fast schedule burns every attempt inside one reconnect -- a half-dead link
+   * takes seconds to detect -- and drops a working P2P path to HTTP.
+   */
+  LINK_RECOVERY_BACKOFF_MS: [3_000, 8_000] as const,
   RETRY_MAX_POSITIVE_JITTER_RATIO: 0.25,
   NO_PROGRESS_TIMEOUT_MS: 45 * 1000,
   LEASE_IDLE_TTL_MS: 5 * 60 * 1000,

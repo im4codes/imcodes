@@ -14,6 +14,9 @@ import {
   FILE_TRANSFER_UPLOAD_ERROR_CODE,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+  FILE_TRANSFER_RELAY_HEADER,
+  formatFileTransferContentRange,
+  parseFileTransferRangeRequest,
   FILE_TRANSFER_DELETE_ERROR,
   FILE_TRANSFER_PATH_HANDLE_CAPABILITY,
   FILE_TRANSFER_PATH_MAX_BYTES,
@@ -109,6 +112,21 @@ const stagedDownloads = new Map<string, {
   timer: ReturnType<typeof setTimeout>;
   started: boolean;
 }>();
+
+/** Every attachment download advertises resume support. */
+function setAttachmentRangeHeaders(c: Context, offset: number, total: number | undefined): number {
+  c.header('Accept-Ranges', 'bytes');
+  if (offset > 0 && total !== undefined) {
+    c.header('Content-Range', formatFileTransferContentRange(offset, total));
+    return 206;
+  }
+  return 200;
+}
+
+function rangeNotSatisfiable(c: Context, total: number): Response {
+  c.header('Content-Range', `bytes */${total}`);
+  return c.json({ error: 'range_not_satisfiable' }, 416);
+}
 
 async function hasCurrentControlledStageAccess(
   db: Env['DB'],
@@ -226,10 +244,20 @@ function buildStagedDownloadUrl(requestUrl: string, configuredServerUrl: string 
  * legacy (no-stream-capability) path, and the relay-failure fallback — repo
  * rule: never copy code.
  */
-function respondBase64Download(c: Context, result: Record<string, unknown>, attachmentId: string): Response {
-  const content = Buffer.from(result.content as string, 'base64');
+function respondBase64Download(
+  c: Context,
+  result: Record<string, unknown>,
+  attachmentId: string,
+  offset = 0,
+): Response {
+  const whole = Buffer.from(result.content as string, 'base64');
+  // A resumed request against the inline/base64 paths: the whole file is here,
+  // so serve just the missing tail.
+  if (offset > 0 && offset >= whole.length) return rangeNotSatisfiable(c, whole.length);
+  const content = offset > 0 ? whole.subarray(offset) : whole;
   const mime = (result.mime as string) || 'application/octet-stream';
   const filename = (result.filename as string) || attachmentId;
+  const status = setAttachmentRangeHeaders(c, offset, whole.length);
   c.header('Content-Type', mime);
   c.header('Content-Length', String(content.length));
   // RFC 5987: non-ASCII filenames must use filename*=UTF-8'' encoding. Include
@@ -237,7 +265,7 @@ function respondBase64Download(c: Context, result: Record<string, unknown>, atta
   const safeFilename = filename.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '\\"');
   const encodedFilename = encodeURIComponent(filename).replace(/'/g, '%27');
   c.header('Content-Disposition', `attachment; filename="${safeFilename}"; filename*=UTF-8''${encodedFilename}`);
-  return c.body(content);
+  return c.body(content, status as 200 | 206);
 }
 
 /**
@@ -256,6 +284,7 @@ async function attemptStreamedDownload(
   serverId: string,
   attachmentId: string,
   controlledAccessUserId?: string,
+  offset = 0,
 ): Promise<{ kind: 'done'; response: Response } | { kind: 'retry' }> {
   const downloadId = randomHex(16);
   const token = randomHex(32);
@@ -292,6 +321,7 @@ async function attemptStreamedDownload(
     downloadId,
     attachmentId,
     uploadUrl: buildStagedDownloadUrl(c.req.url, c.env.SERVER_URL, serverId, downloadId, token),
+    ...(offset > 0 ? { offset } : {}),
   };
   void bridge.sendFileTransferRequest(
     downloadId,
@@ -328,7 +358,7 @@ async function attemptStreamedDownload(
     if (result.type === 'file.download_done') {
       // Small file returned inline — no relay/PassThrough involved.
       deleteStagedDownload(downloadId);
-      return { kind: 'done', response: respondBase64Download(c, result, attachmentId) };
+      return { kind: 'done', response: respondBase64Download(c, result, attachmentId, offset) };
     }
 
     const mime = (result.mime as string) || 'application/octet-stream';
@@ -336,6 +366,14 @@ async function attemptStreamedDownload(
     const size = typeof result.size === 'number' && Number.isFinite(result.size) && result.size >= 0
       ? Math.trunc(result.size)
       : undefined;
+    // The node says where its body starts (the relay PUT's offset header); it
+    // must be exactly what was asked for.
+    const servedOffset = typeof result.offset === 'number' ? result.offset : 0;
+    if (servedOffset !== offset || (offset > 0 && size === undefined)) {
+      deleteStagedDownload(downloadId, new Error('download_offset_mismatch'));
+      return { kind: 'retry' };
+    }
+    const status = setAttachmentRangeHeaders(c, offset, size === undefined ? undefined : offset + size);
     c.header('Content-Type', mime);
     if (size !== undefined) c.header('Content-Length', String(size));
     const safeFilename = filename.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '\\"');
@@ -344,7 +382,7 @@ async function attemptStreamedDownload(
     c.header('Cache-Control', 'no-store');
     return {
       kind: 'done',
-      response: new Response(Readable.toWeb(stream) as ReadableStream, { status: 200, headers: c.res.headers }),
+      response: new Response(Readable.toWeb(stream) as ReadableStream, { status, headers: c.res.headers }),
     };
   } catch {
     // Did not start delivering in time — retry / fall back.
@@ -579,6 +617,12 @@ fileTransferRoutes.get('/:id/upload-staged/:uploadId', async (c) => {
 // the paired PassThrough, so large files never cross the daemon WS as base64.
 // Controlled-node stages revalidate access before accepting the first byte.
 
+function parseRelayOffset(header: string | undefined): number {
+  if (!header || !/^\d{1,16}$/.test(header)) return 0;
+  const offset = Number(header);
+  return Number.isSafeInteger(offset) ? offset : 0;
+}
+
 fileTransferRoutes.put('/:id/download-staged/:downloadId', async (c) => {
   const serverId = c.req.param('id')!;
   const downloadId = c.req.param('downloadId')!;
@@ -618,8 +662,9 @@ fileTransferRoutes.put('/:id/download-staged/:downloadId', async (c) => {
     type: FILE_TRANSFER_MSG.DOWNLOAD_STREAM_READY,
     downloadId,
     mime: c.req.header('content-type') || 'application/octet-stream',
-    filename: decodeRelayFilename(c.req.header('x-imcodes-filename')),
+    filename: decodeRelayFilename(c.req.header(FILE_TRANSFER_RELAY_HEADER.FILENAME)),
     size: Number.isFinite(contentLength) && contentLength >= 0 ? Math.trunc(contentLength) : undefined,
+    offset: parseRelayOffset(c.req.header(FILE_TRANSFER_RELAY_HEADER.OFFSET)),
   });
   try {
     await pipeline(
@@ -1263,6 +1308,8 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
 
   const downloadId = randomHex(16);
   const supportsStreamDownload = bridge.hasDaemonCapability?.(FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY) === true;
+  // Resume of an interrupted download (`Range: bytes=N-`).
+  const offset = parseFileTransferRangeRequest(c.req.header('range'));
 
   try {
     if (supportsStreamDownload) {
@@ -1280,6 +1327,7 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
           serverId,
           attachmentId,
           controlledGate.controlled ? userId : undefined,
+          offset,
         );
         if (outcome.kind === 'done') return outcome.response;
       }
@@ -1313,7 +1361,7 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
       return c.json({ error: 'download_failed', message: errMsg }, 500);
     }
 
-    return respondBase64Download(c, result, attachmentId);
+    return respondBase64Download(c, result, attachmentId, offset);
   } catch (err) {
     deleteStagedDownload(downloadId, err instanceof Error ? err : new Error(String(err)));
     const msg = err instanceof Error ? err.message : String(err);

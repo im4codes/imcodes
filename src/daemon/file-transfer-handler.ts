@@ -43,6 +43,7 @@ import {
   type MacosOpenFullDiskAccessError,
   validateFileDeleteRequest,
   validateFileDirectoryListRequest,
+  FILE_TRANSFER_RELAY_HEADER,
 } from '../../shared/transport/file-transfer.js';
 import {
   resolveWellKnownDirectoryDetailed,
@@ -863,13 +864,23 @@ export async function handleFileDownloadStream(cmd: Record<string, unknown>, ser
     if (!uploadUrl || typeof uploadUrl !== 'string') {
       throw new Error('missing_upload_url');
     }
+    // Resume point for an interrupted HTTP download. The full-daemon path hands
+    // us the raw command, so it is validated here rather than trusted.
+    const offset = msg.offset === undefined ? 0 : msg.offset;
+    if (typeof offset !== 'number' || !Number.isSafeInteger(offset) || offset < 0) {
+      throw new Error('invalid_offset');
+    }
     target = await resolveDownloadTarget(attachmentId, serverLink, downloadId);
     if (!target) return;
+    if (offset > target.size) {
+      throw new Error('range_not_satisfiable');
+    }
 
     // Small files: skip the relay and reply inline in a single round-trip. The
     // relay's PUT + readiness handshake is pure latency for these (and times out
     // entirely if the relay is unhealthy), so only genuinely large files stream.
-    // The server returns the inline bytes immediately on receiving this.
+    // The server returns the inline bytes immediately on receiving this (and
+    // slices them itself for a resumed request).
     if (typeof target.size === 'number' && target.size >= 0
         && target.size <= FILE_TRANSFER_LIMITS.DOWNLOAD_INLINE_MAX_BYTES) {
       await sendInlineDownload(serverLink, downloadId, target);
@@ -882,18 +893,20 @@ export async function handleFileDownloadStream(cmd: Record<string, unknown>, ser
       mime: target.mime,
       filename: target.filename,
       size: target.size,
+      ...(offset > 0 ? { offset } : {}),
     };
     serverLink.send(ready);
 
     const headers: Record<string, string> = {
       'content-type': target.mime || 'application/octet-stream',
-      'content-length': String(target.size),
-      'x-imcodes-filename': encodeURIComponent(target.filename),
+      'content-length': String(target.size - offset),
+      [FILE_TRANSFER_RELAY_HEADER.FILENAME]: encodeURIComponent(target.filename),
+      ...(offset > 0 ? { [FILE_TRANSFER_RELAY_HEADER.OFFSET]: String(offset) } : {}),
     };
     const response = await fetch(uploadUrl, {
       method: 'PUT',
       headers,
-      body: createReadStream(target.readPath) as never,
+      body: createReadStream(target.readPath, offset > 0 ? { start: offset } : undefined) as never,
       duplex: 'half',
       signal: AbortSignal.timeout(FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS),
     } as RequestInit & { duplex: 'half' });
