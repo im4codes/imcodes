@@ -3559,7 +3559,7 @@ export function RemoteDesktopPanel({
               )}
             </div>
           )}
-          <div class="remote-desktop-touch-hint">
+          <div class="remote-desktop-touch-hint" hidden={mobileTextOpen}>
             {t(mobileInputMode === 'mouse'
               ? 'remote_desktop.mouse_hint'
               : 'remote_desktop.touch_hint')}
@@ -4069,7 +4069,7 @@ export function RemoteDesktopPanel({
           </aside>
         )}
 
-        <footer class="remote-desktop-footer">
+        <footer class="remote-desktop-footer" hidden={mobileTextOpen}>
           {/* Always on: the facts you read while judging whether the session is
               usable -- who is on it, over which link, at what resolution, frame
               rate, bitrate and loss, and for how long. The nerd toggle keeps the

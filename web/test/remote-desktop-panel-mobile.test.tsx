@@ -1609,6 +1609,42 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(getByRole('textbox', { name: 'remote_desktop.mobile_text_input' })).toBeDefined();
   });
 
+  it('gives the remote screen the hint and statistics space while the mobile keyboard is open', async () => {
+    const { container, getByRole, queryByRole } = await renderPanel();
+    const stylesheet = readFileSync(
+      resolve(dirname(fileURLToPath(import.meta.url)), '../src/styles.css'),
+      'utf8',
+    );
+    expect(container.querySelector('.remote-desktop-touch-hint')).not.toBeNull();
+    expect(container.querySelector('.remote-desktop-stats')).not.toBeNull();
+
+    act(() => {
+      (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click();
+    });
+
+    // Neither surface should merely become transparent: hidden removes the
+    // footer grid row from layout and from the accessibility tree while the
+    // phone keyboard is taking up the viewport.
+    expect((container.querySelector('.remote-desktop-touch-hint') as HTMLElement).hidden).toBe(true);
+    expect((container.querySelector('.remote-desktop-footer') as HTMLElement).hidden).toBe(true);
+    expect(stylesheet).toMatch(/\.remote-desktop-touch-hint\[hidden\],[\s\S]*?\.remote-desktop-footer\[hidden\]\s*\{[^}]*display:\s*none/);
+    expect(queryByRole('button', { name: 'remote_desktop.nerd_stats_show' })).toBeNull();
+
+    // The compact computer-keyboard tab consumes screen space too, so the
+    // same space-saving contract stays active when switching keyboard modes.
+    act(() => {
+      (getByRole('tab', { name: 'remote_desktop.mobile_keyboard_tab_keys' }) as HTMLButtonElement).click();
+    });
+    expect((container.querySelector('.remote-desktop-touch-hint') as HTMLElement).hidden).toBe(true);
+    expect((container.querySelector('.remote-desktop-footer') as HTMLElement).hidden).toBe(true);
+
+    act(() => {
+      (getByRole('button', { name: 'remote_desktop.close_mobile_keyboard' }) as HTMLButtonElement).click();
+    });
+    expect((container.querySelector('.remote-desktop-touch-hint') as HTMLElement).hidden).toBe(false);
+    expect((container.querySelector('.remote-desktop-footer') as HTMLElement).hidden).toBe(false);
+  });
+
   it('pushes the remote screen up above the OS keyboard instead of letting it cover it', async () => {
     const visualViewport = Object.assign(new EventTarget(), { height: 700, offsetTop: 0 });
     const originalVisualViewport = Object.getOwnPropertyDescriptor(window, 'visualViewport');

@@ -11713,6 +11713,15 @@ button.quick-agent-delegation-preset.active {
   pointer-events: none;
 }
 
+/* The phone keyboard already takes the lower half of the viewport. Remove
+   secondary guidance and telemetry from layout while it is open so the stage
+   receives every remaining pixel; the native hidden attribute also keeps
+   screen readers from announcing controls that are temporarily unavailable. */
+.remote-desktop-touch-hint[hidden],
+.remote-desktop-footer[hidden] {
+  display: none;
+}
+
 .remote-desktop-footer {
   justify-content: space-between;
   flex-wrap: wrap;
