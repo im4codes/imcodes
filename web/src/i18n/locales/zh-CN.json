@@ -1716,6 +1716,9 @@
     "cancel_confirm": "确定终止上传 {{name}}？当前传输内容将被丢弃。",
     "delete_failed": "无法删除已上传的文件",
     "deleting": "正在删除已上传文件…",
+    "preview_attachment": "预览 #{{seq}} {{name}}",
+    "preview_loading": "正在加载预览…",
+    "preview_unavailable": "无法预览",
     "direct_required_large": "此文件需要直连；服务器中转回退最大为 {{max}}MB",
     "transport": {
       "connecting": "P2P 连接中",

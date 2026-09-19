@@ -1675,6 +1675,14 @@ html.native-ios-mac .chat-dl-btn {
 .attachment-badge { display: inline-flex; align-items: center; gap: 4px; background: rgba(15,23,42,0.72); border: 1px solid rgba(125,211,252,0.16); border-radius: 999px; padding: 2px 8px 2px 6px; font-size: 12px; color: #94a3b8; max-width: 200px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.03); }
 .attachment-badge-icon { font-size: 11px; flex-shrink: 0; }
 .attachment-badge-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attachment-badge-main { display: inline-flex; align-items: center; gap: 4px; min-width: 0; padding: 0; background: none; border: none; color: inherit; font: inherit; cursor: zoom-in; }
+.attachment-badge.is-previewable:hover { border-color: rgba(125,211,252,0.45); color: #cbd5e1; }
+/* Hover preview: fixed so the (overflow-clipped) badge row can't cut it off. */
+.attachment-hover-preview { position: fixed; z-index: 10050; display: grid; gap: 4px; max-width: min(280px, calc(100vw - 16px)); padding: 6px; background: #0b1220; border: 1px solid rgba(125,211,252,0.35); border-radius: 10px; box-shadow: 0 12px 32px rgba(0,0,0,0.55); pointer-events: none; }
+.attachment-hover-preview img { display: block; max-width: 264px; max-height: 240px; width: auto; height: auto; object-fit: contain; border-radius: 6px; background: #020617; }
+.attachment-hover-preview-state { padding: 18px 22px; font-size: 12px; color: #94a3b8; }
+.attachment-hover-preview-caption { font-size: 11px; color: #94a3b8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attachment-lightbox-pending { position: fixed; inset: 0; z-index: 10060; display: flex; align-items: center; justify-content: center; background: rgba(2,6,23,0.8); color: #cbd5e1; font-size: 14px; }
 .attachment-badge-remove { background: none; border: none; color: #64748b; cursor: pointer; font-size: 14px; padding: 0 2px; line-height: 1; }
 .attachment-badge-remove:hover { color: #ef4444; }
 .attachment-badge-remove:disabled { cursor: wait; opacity: 0.45; }

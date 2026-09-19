@@ -1715,6 +1715,9 @@
     "cancel_confirm": "{{name}} のアップロードを中止しますか？現在の転送内容は破棄されます。",
     "delete_failed": "アップロード済みファイルを削除できませんでした",
     "deleting": "アップロード済みファイルを削除中…",
+    "preview_attachment": "#{{seq}} {{name}} をプレビュー",
+    "preview_loading": "プレビューを読み込み中…",
+    "preview_unavailable": "プレビューできません",
     "direct_required_large": "このファイルには直接接続が必要です。サーバー中継は最大 {{max}}MB です",
     "transport": {
       "connecting": "P2P 接続中",

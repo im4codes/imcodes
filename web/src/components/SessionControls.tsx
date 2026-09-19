@@ -63,6 +63,8 @@ import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
 import { PREF_KEY_P2P_COMBO_CONFIRM_SKIP, PREF_KEY_P2P_DROPDOWN_TAB, p2pSessionConfigLegacyPrefKeys, p2pSessionConfigPrefKey } from '../constants/prefs.js';
 import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p-config-pref.js';
 import { sendSessionViaHttp, cancelSessionViaHttp, deleteAttachment } from '../api.js';
+import { ComposerAttachmentBadge } from './ComposerAttachmentBadge.js';
+import { forgetAttachmentPreview, rememberAttachmentPreview } from '../attachment-preview-cache.js';
 import { formatTransferBytes, formatTransferDuration } from '../util/transfer-format.js';
 import { DirectFileTransferFailure, FILE_UPLOAD_TRANSPORT_MODE, isFileUploadCanceled, prewarmDirectFileLease, uploadFileWithDirectFallback, type FileUploadTransportMode } from '../direct-file-transfer.js';
 import { patchSessionSupervision } from '../api.js';
@@ -4910,6 +4912,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         updateComposerUploadProgress(uploadKey, uploadItem.id, 100);
         updateComposerUploadItem(uploadKey, uploadItem.id, { status: 'done' });
         if (result.attachment?.daemonPath) {
+          rememberAttachmentPreview(result.attachment.daemonPath, file);
           return {
             path: result.attachment.daemonPath,
             name: file.name,
@@ -4985,6 +4988,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         }
       }
       setAttachments((current) => renumberAttachments(current.filter((entry) => entry !== attachment)));
+      forgetAttachmentPreview(attachment.path);
     } catch (error) {
       console.error('[upload] delete failed:', error);
       updateComposerUploadSnapshot(composerUploadKey, { error: t('upload.delete_failed') });
@@ -6415,28 +6419,17 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       {attachments.length > 0 && (
         <div class="attachment-badges">
           {attachments.map((a) => (
-            <span
+            <ComposerAttachmentBadge
               key={a.path}
-              class="attachment-badge"
-              title={`#${a.seq} ${a.path}`}
-              data-attachment-seq={a.seq}
-            >
-              {/*
-                * R3 v2 PR-ρ — Surface the per-composer sequence number
-                * as a `#N` prefix so the user can reference the file in
-                * chat text via the same short tag (`#1`, `#2`, ...). The
-                * counter resets on send (the attachments array is wiped
-                * by `clearComposer`).
-                */}
-              <span class="attachment-badge-icon" data-testid={`attachment-tag-${a.seq}`}>#{a.seq}</span>
-              <span class="attachment-badge-name">{a.name}</span>
-              <button
-                class="attachment-badge-remove"
-                disabled={deletingAttachmentKeys.has(a.id ?? a.path)}
-                onClick={() => { void handleRemoveAttachment(a); }}
-                title={deletingAttachmentKeys.has(a.id ?? a.path) ? t('upload.deleting') : t('common.delete')}
-              >×</button>
-            </span>
+              seq={a.seq}
+              name={a.name}
+              path={a.path}
+              {...(a.id ? { attachmentId: a.id } : {})}
+              {...((a.serverId || serverId) ? { serverId: a.serverId || serverId } : {})}
+              {...(isShareScopedSession && activeSession?.name ? { sessionName: activeSession.name } : {})}
+              removing={deletingAttachmentKeys.has(a.id ?? a.path)}
+              onRemove={() => { void handleRemoveAttachment(a); }}
+            />
           ))}
         </div>
       )}

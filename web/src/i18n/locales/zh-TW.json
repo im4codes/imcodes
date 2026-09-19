@@ -1716,6 +1716,9 @@
     "cancel_confirm": "確定終止上傳 {{name}}？目前傳輸內容將被捨棄。",
     "delete_failed": "無法刪除已上傳的檔案",
     "deleting": "正在刪除已上傳檔案…",
+    "preview_attachment": "預覽 #{{seq}} {{name}}",
+    "preview_loading": "正在載入預覽…",
+    "preview_unavailable": "無法預覽",
     "direct_required_large": "此檔案需要直連；伺服器中轉回退上限為 {{max}}MB",
     "transport": {
       "connecting": "P2P 連線中",

@@ -1716,6 +1716,9 @@
     "cancel_confirm": "Stop uploading {{name}}? The current transfer will be discarded.",
     "delete_failed": "Could not delete the uploaded file",
     "deleting": "Deleting uploaded file…",
+    "preview_attachment": "Preview #{{seq}} {{name}}",
+    "preview_loading": "Loading preview…",
+    "preview_unavailable": "Preview unavailable",
     "direct_required_large": "This file requires a direct connection; relay fallback is limited to {{max}}MB",
     "transport": {
       "connecting": "Connecting P2P",
