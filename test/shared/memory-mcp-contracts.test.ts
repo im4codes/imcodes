@@ -168,6 +168,8 @@ describe('memory MCP shared contracts', () => {
     const ocu = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL].description;
     expect(exec).toContain('ipmitool.exe');
     expect(exec).toContain('MUST use exec_remote');
+    expect(exec).toContain('NEVER repeat or summarize its text');
+    expect(exec).toContain('record only the task dispatch and bounded outcome facts');
     expect(ocu).toContain('Do not use GUI OCU for a shell/CLI/executable request');
     expect(ocu).toContain('does not mean the machine is unauthorized or uncontrollable');
   });

@@ -102,15 +102,18 @@ describe('controlled-device dispatch facts', () => {
   const nodeId = '1472527657';
 
   it('substantiates exec completion and a Computer Use helper timeout only after target dispatch', () => {
-    expect(readMachineControlDispatchFact(
+    const execFact = readMachineControlDispatchFact(
       DELEGATION_AUTHORITY_MCP_SERVER,
       'exec_remote',
-      { machine: nodeId, command: 'whoami' },
+      { machine: nodeId, command: 'private command that must not reach the timeline' },
       { status: 'ok', outcome: 'completed', ok: true, exitCode: 0 },
       'mcp-exec-1',
-    )).toMatchObject({
+    );
+    expect(execFact).toEqual({
       dispatchId: 'mcp-exec-1', kind: 'machine-control', tool: 'exec_remote', machine: nodeId,
+      deliveries: [{ target: nodeId, status: 'delivered' }],
     });
+    expect(JSON.stringify(execFact)).not.toContain('private command');
 
     expect(readMachineControlDispatchFact(
       DELEGATION_AUTHORITY_MCP_SERVER,

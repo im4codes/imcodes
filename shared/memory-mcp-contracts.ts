@@ -1000,7 +1000,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   [MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE]: {
     name: MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE,
     description:
-      'Run a shell/CLI command or executable (for example ipmitool.exe) on a controlled node in session 0/SYSTEM; such requests MUST use exec_remote, not GUI OCU. Use shell_session1 only for active-user semantics. Pass a canonical 10-digit nodeId or complete ^^(nodeId) without calling list_machines first; deprecated noncanonical legacy ref_name is migration-only. not_dispatched is retry-safe; dispatched_no_result may have run. FULL nodes only.',
+      'Run a shell/CLI command or executable (for example ipmitool.exe) on a controlled node in session 0/SYSTEM; such requests MUST use exec_remote, not GUI OCU. Use shell_session1 only for active-user semantics. Pass a canonical 10-digit nodeId or complete ^^(nodeId) without calling list_machines first; deprecated noncanonical legacy ref_name is migration-only. The command is private execution input: NEVER repeat or summarize its text in an assistant reply, delegation card, or dispatch claim; record only the task dispatch and bounded outcome facts. not_dispatched is retry-safe; dispatched_no_result may have run. FULL nodes only.',
     inputSchema: objectSchema({
       machine: stringSchema('Canonical nodeId or complete ^^(nodeId) marker; deprecated noncanonical legacy ref_name is also accepted.', { minLength: 1, maxLength: MACHINE_TARGET_MAX, pattern: MACHINE_TARGET_PATTERN.source }),
       command: stringSchema(`Command to run, up to ${REMOTE_EXEC_MAX_COMMAND_BYTES} UTF-8 bytes.`),
