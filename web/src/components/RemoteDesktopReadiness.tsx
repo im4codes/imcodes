@@ -33,12 +33,15 @@ export function RemoteDesktopReadiness({
     ? REMOTE_DESKTOP_WEB_READINESS.VIEW_ONLY
     : readiness.kind;
 
-  // Everything granted: nothing for the operator to do, so it folds to one
-  // line instead of a panel of green badges. The detail stays one click away.
+  // Everything granted: nothing for the operator to do. In the machine list
+  // (compact) a "ready" line only spends room on a row that is already full,
+  // so it shows nothing at all there. Anywhere with room it folds to one line
+  // and keeps the detail one click away.
   const fullyReady = !unsupportedProfile
     && readiness.screenRecordingReady === true
     && accessibilityReady;
   if (fullyReady) {
+    if (compact) return null;
     return (
       <details
         class={`remote-desktop-readiness is-collapsed${compact ? ' is-compact' : ''}`}

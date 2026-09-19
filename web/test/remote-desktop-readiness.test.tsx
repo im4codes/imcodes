@@ -80,6 +80,14 @@ describe('RemoteDesktopReadiness', () => {
     expect(result.container.querySelector('[data-permission]')).toBeNull();
     expect(result.container.textContent).toContain('remote_desktop.macos_control_ready');
 
+    // In the machine list (compact) there is no room to spend on "all good":
+    // nothing renders once everything is granted...
+    result.rerender(<RemoteDesktopReadiness capabilities={control} compact />);
+    expect(result.container.innerHTML).toBe('');
+    // ...but a permission still missing keeps showing, compact or not.
+    result.rerender(<RemoteDesktopReadiness capabilities={MAC_VIEW} compact />);
+    expect(result.container.querySelector('[data-readiness="view_only"]')).not.toBeNull();
+
     result.rerender(<RemoteDesktopReadiness capabilities={MAC_VIEW} />);
     expect(result.container.querySelector('[data-readiness="view_only"]')).not.toBeNull();
     expect(result.container.textContent).toContain('remote_desktop.macos_view_only');
