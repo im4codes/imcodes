@@ -65,6 +65,7 @@ const text = vi.fn(() => true);
 const textByServer = vi.fn<(serverId: string, value: string) => boolean>(() => true);
 const requestRemoteClipboard = vi.fn(async () => 'selected remotely');
 const selectDisplay = vi.fn(() => true);
+const setQualityPreference = vi.fn(() => true);
 const stop = vi.fn();
 const directTransferMocks = vi.hoisted(() => ({
   uploadFileWithDirectFallback: vi.fn(),
@@ -141,6 +142,7 @@ vi.mock('../src/remote-desktop-client.js', () => ({
     setDisplayMode = setDisplayMode;
     setDisplayScale = setDisplayScale;
     requestUnlock = vi.fn(() => true);
+    setQualityPreference = setQualityPreference;
     requestRemoteClipboard = requestRemoteClipboard;
   },
 }));
@@ -222,6 +224,7 @@ import { RemoteDesktopPanel } from '../src/components/RemoteDesktopPanel.js';
 import { RemoteDesktopWorkspace } from '../src/components/RemoteDesktopWorkspace.js';
 import type { UseQuickDataResult } from '../src/components/QuickInputPanel.js';
 import { RemoteDesktopConnectionManager } from '../src/remote-desktop-connection-manager.js';
+import { REMOTE_DESKTOP_QUALITY_STORAGE_KEY } from '../src/remote-desktop-quality-preference.js';
 import {
   createRemoteDesktopWorkspaceState,
   openRemoteDesktopWorkspaceHost,
@@ -248,6 +251,7 @@ afterEach(() => {
   atomicButtonClickAdvertised = true;
   localStorage.removeItem('rcc_float_remote-desktop-server-1');
   localStorage.removeItem('imcodes.web.remote-desktop.zoom.v1.server-1');
+  localStorage.removeItem(REMOTE_DESKTOP_QUALITY_STORAGE_KEY);
   delete (document as Document & { fullscreenElement?: Element | null }).fullscreenElement;
 });
 
@@ -569,6 +573,64 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       terminalReason: REMOTE_DESKTOP_TERMINAL_REASON.AUTHORITY_REVOKED,
     }));
     expect(onAuthorityLost).toHaveBeenCalledTimes(1);
+  });
+
+  it('remembers the stream quality per server and reopens with the same choice', async () => {
+    const machine = (serverId: string) => ({
+      serverId,
+      refName: serverId,
+      displayName: 'Windows',
+      os: 'win',
+      online: true,
+      execEnabled: true,
+      accessRole: 'owner' as const,
+      capabilities: [REMOTE_DESKTOP_CAPABILITY],
+    });
+    const trigger = (result: ReturnType<typeof render>) => result.getByRole('button', {
+      name: /remote_desktop\.quality_label: /,
+    });
+    const first = render(<RemoteDesktopPanel machine={machine('server-1')} onClose={vi.fn()} />);
+    await act(async () => { await Promise.resolve(); });
+    // Nothing saved yet: the default, and it is what the client is told.
+    expect(trigger(first).getAttribute('aria-label')).toContain('quality_short_smooth');
+    expect(setQualityPreference).toHaveBeenLastCalledWith(
+      { maxHeight: 1080, maxFps: 30, maxBitrateBps: 0, priority: 'framerate' },
+      { latencyGuard: true },
+    );
+
+    // One compact dropdown, not a row of buttons.
+    await act(async () => { fireEvent.click(trigger(first)); await Promise.resolve(); });
+    await act(async () => {
+      fireEvent.click(first.getByRole('radio', { name: /quality_short_sharp/ }));
+      await Promise.resolve();
+    });
+    expect(first.queryByRole('radio', { name: /quality_short_sharp/ })).toBeNull();
+    expect(trigger(first).getAttribute('aria-label')).toContain('quality_short_sharp');
+    expect(setQualityPreference).toHaveBeenLastCalledWith(
+      { maxHeight: 0, maxFps: 30, maxBitrateBps: 0, priority: 'resolution' },
+      { latencyGuard: true },
+    );
+    first.unmount();
+
+    // Reopened later: the same server comes back with the same choice and
+    // applies it to the new connection straight away.
+    setQualityPreference.mockClear();
+    const reopened = render(<RemoteDesktopPanel machine={machine('server-1')} onClose={vi.fn()} />);
+    await act(async () => { await Promise.resolve(); });
+    expect(trigger(reopened).getAttribute('aria-label')).toContain('quality_short_sharp');
+    expect(setQualityPreference).toHaveBeenLastCalledWith(
+      { maxHeight: 0, maxFps: 30, maxBitrateBps: 0, priority: 'resolution' },
+      { latencyGuard: true },
+    );
+
+    // Another server keeps its own setting, even in the same panel.
+    reopened.rerender(<RemoteDesktopPanel machine={machine('server-2')} onClose={vi.fn()} />);
+    await act(async () => { await Promise.resolve(); });
+    expect(trigger(reopened).getAttribute('aria-label')).toContain('quality_short_smooth');
+    expect(setQualityPreference).toHaveBeenLastCalledWith(
+      { maxHeight: 1080, maxFps: 30, maxBitrateBps: 0, priority: 'framerate' },
+      { latencyGuard: true },
+    );
   });
 
   it('rebinds the directory picker adapter when a canonical host changes execution endpoint', async () => {
