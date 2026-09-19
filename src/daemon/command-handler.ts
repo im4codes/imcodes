@@ -3,6 +3,8 @@
  * Commands arrive as JSON objects with a `type` field.
  */
 import { AGENT_SKILLS_MSG } from '../../shared/agent-skills.js';
+import { AGENT_MCP_MSG } from '../../shared/agent-mcp.js';
+import { handleAgentMcpCommand } from './agent-mcp.js';
 import { handleAgentSkillsCommand } from './agent-skills.js';
 import { startProject, stopProject, teardownProject, getTransportRuntime, launchTransportSession, isProviderSessionBound, persistSessionRecord, relaunchSessionWithSettings, stopTransportRuntimeSession, type ProjectConfig } from '../agent/session-manager.js';
 import { buildTransportResumeLaunchOpts } from '../agent/transport-resume-opts.js';
@@ -1970,6 +1972,10 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case AGENT_SKILLS_MSG.LIST_REQUEST:
     case AGENT_SKILLS_MSG.RUN_REQUEST:
       void handleAgentSkillsCommand(cmd, (message) => serverLink.send(message));
+      break;
+    case AGENT_MCP_MSG.LIST_REQUEST:
+    case AGENT_MCP_MSG.RUN_REQUEST:
+      void handleAgentMcpCommand(cmd, (message) => serverLink.send(message));
       break;
     case 'fs.ls':
       void traceCommandAsync(cmd, 'web_command.fs_ls', () => handleFsList(cmd, serverLink));

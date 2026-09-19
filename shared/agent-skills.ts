@@ -7,6 +7,8 @@
  * to, as the machine's own user.
  */
 
+import { MACHINE_CONFIG_REQUEST_ERROR } from './machine-config-request.js';
+
 /** The `skills` CLI every daemon runs, pinned so one release behaves one way. */
 export const AGENT_SKILLS_CLI_PACKAGE = 'skills@1.7.0' as const;
 
@@ -40,8 +42,8 @@ export type AgentSkillsAction = typeof AGENT_SKILLS_ACTION[keyof typeof AGENT_SK
 
 export const AGENT_SKILLS_ERROR = {
   INVALID_REQUEST: 'invalid_request',
-  DAEMON_OFFLINE: 'daemon_offline',
-  TIMEOUT: 'timeout',
+  DAEMON_OFFLINE: MACHINE_CONFIG_REQUEST_ERROR.DAEMON_OFFLINE,
+  TIMEOUT: MACHINE_CONFIG_REQUEST_ERROR.TIMEOUT,
   /** Another add, update or remove is still running on that machine. */
   BUSY: 'busy',
   /** npm could not be found beside the daemon's Node.js. */

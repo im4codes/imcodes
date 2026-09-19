@@ -13,6 +13,7 @@
  */
 
 import { AGENT_SKILLS_MESSAGE_PREFIX, AGENT_SKILLS_MSG } from '../../../shared/agent-skills.js';
+import { AGENT_MCP_MESSAGE_PREFIX, AGENT_MCP_MSG } from '../../../shared/agent-mcp.js';
 import { DaemonRequestTracker } from './daemon-request-tracker.js';
 import WebSocket, { type RawData } from 'ws';
 import { CLOCK_SYNC_FIELD } from '../../../shared/clock-sync.js';
@@ -1963,8 +1964,11 @@ export class WsBridge {
    */
   private readonly memorySourcesRequests = new DaemonRequestTracker();
 
-  /** `/api/agent-skills` callers awaiting the daemon's list or run reply. */
-  private readonly agentSkillsRequests = new DaemonRequestTracker();
+  /**
+   * `/api/agent-skills` and `/api/agent-mcp` callers awaiting the daemon's
+   * reply: owner-only reads and changes of the machine's agent configuration.
+   */
+  private readonly machineConfigRequests = new DaemonRequestTracker();
 
   private pendingPreviewRequests = new Map<string, PendingPreviewRequest>();
 
@@ -7021,11 +7025,12 @@ export class WsBridge {
       return;
     }
 
-    // Agent-skills replies go to the waiting `/api/agent-skills` route only,
+    // Agent-configuration replies go to the waiting owner-only route only,
     // never to browsers.
-    if (type === AGENT_SKILLS_MSG.LIST_RESPONSE || type === AGENT_SKILLS_MSG.RUN_RESPONSE) {
+    if (type === AGENT_SKILLS_MSG.LIST_RESPONSE || type === AGENT_SKILLS_MSG.RUN_RESPONSE
+      || type === AGENT_MCP_MSG.LIST_RESPONSE || type === AGENT_MCP_MSG.RUN_RESPONSE) {
       const requestId = typeof msg.requestId === 'string' ? msg.requestId : undefined;
-      if (requestId) this.agentSkillsRequests.resolve(requestId, msg);
+      if (requestId) this.machineConfigRequests.resolve(requestId, msg);
       return;
     }
 
@@ -9810,11 +9815,12 @@ export class WsBridge {
   }
 
   private isBrowserForbiddenDaemonCommandType(type: string): boolean {
-    // Agent-skills requests run software on the machine; they come only from
-    // the owner-checked `/api/agent-skills` route, never straight from a browser.
+    // Agent-skills and agent-MCP requests change what runs on the machine; they
+    // come only from the owner-checked routes, never straight from a browser.
     return type === DAEMON_COMMAND_TYPES.SERVER_DELETE
       || type.startsWith('daemon.')
-      || type.startsWith(AGENT_SKILLS_MESSAGE_PREFIX);
+      || type.startsWith(AGENT_SKILLS_MESSAGE_PREFIX)
+      || type.startsWith(AGENT_MCP_MESSAGE_PREFIX);
   }
 
   requestTimelineHistory(params: {
@@ -10229,14 +10235,14 @@ export class WsBridge {
   }
 
   /**
-   * Ask the daemon to list its `~/.agents/skills`, or to run the pinned
-   * `skills` CLI once. Rejects with 'daemon_offline' or 'timeout'.
+   * Ask the daemon to read or change the machine's agent configuration (Agent
+   * Skills, MCP servers). Rejects with 'daemon_offline' or 'timeout'.
    */
-  sendAgentSkillsRequest(frame: Record<string, unknown> & { requestId: string }, timeoutMs: number): Promise<Record<string, unknown>> {
+  sendMachineConfigRequest(frame: Record<string, unknown> & { requestId: string }, timeoutMs: number): Promise<Record<string, unknown>> {
     if (!this.isDaemonConnected()) {
       return Promise.reject(new Error('daemon_offline'));
     }
-    return this.agentSkillsRequests.request(frame.requestId, timeoutMs, () => {
+    return this.machineConfigRequests.request(frame.requestId, timeoutMs, () => {
       this.daemonWs!.send(JSON.stringify(frame));
     });
   }
@@ -10254,7 +10260,7 @@ export class WsBridge {
    */
   private rejectAllPendingMemorySourcesRequests(reason: string): void {
     this.memorySourcesRequests.rejectAll(reason);
-    this.agentSkillsRequests.rejectAll(reason);
+    this.machineConfigRequests.rejectAll(reason);
   }
 
   private resolvePreviewStart(msg: PreviewResponseStartMessage): void {

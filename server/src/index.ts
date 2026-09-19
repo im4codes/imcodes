@@ -42,6 +42,7 @@ import { messagePinRoutes } from './routes/message-pins.js';
 import { capabilityRoutes } from './routes/capabilities.js';
 import { memoryRoutes } from './routes/memory.js';
 import { agentSkillsRoutes } from './routes/agent-skills.js';
+import { agentMcpRoutes } from './routes/agent-mcp.js';
 import { sessionMgmtRoutes } from './routes/session-mgmt.js';
 import { subSessionRoutes } from './routes/sub-sessions.js';
 import { discussionRoutes } from './routes/discussions.js';
@@ -265,6 +266,7 @@ export function buildApp(env: Env, options: BuildAppOptions = {}) {
   // ignores serverId entirely (cloud-only PG lookup).
   app.route('/api', memoryRoutes);
   app.route('/api', agentSkillsRoutes);
+  app.route('/api', agentMcpRoutes);
   // fileTransferRoutes MUST be first — its token-auth middleware bypasses requireAuth
   // for iOS downloads (SFSafariViewController has no cookies/Bearer). If mounted after
   // sessionMgmtRoutes (which has blanket requireAuth on /*), the token path is shadowed.

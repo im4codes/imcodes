@@ -168,6 +168,18 @@ vi.mock('../../src/api/capabilities.js', () => ({
   CapabilityRequestError: class CapabilityRequestError extends Error {},
 }));
 
+const agentMcpApiMock = vi.hoisted(() => ({
+  listAgentMcp: vi.fn(async () => ({
+    servers: [{ name: 'github', transport: 'http', url: 'https://api.githubcopilot.com/mcp/', envNames: [], headerNames: ['Authorization'], agents: ['codex'] }],
+    agents: [{ agent: 'codex', displayName: 'Codex' }],
+  })),
+}));
+vi.mock('../../src/api/agent-mcp.js', () => ({
+  listAgentMcp: (serverId: string) => agentMcpApiMock.listAgentMcp(serverId),
+  runAgentMcp: vi.fn(async () => ({ ok: true })),
+  searchAgentMcpRegistry: vi.fn(async () => []),
+}));
+
 vi.mock('../../src/api/agent-skills.js', () => ({
   listAgentSkills: vi.fn(async () => [{ name: 'wecomcli-doc', description: 'WeCom docs' }]),
   runAgentSkills: vi.fn(async () => ({ ok: true })),
@@ -269,8 +281,9 @@ describe('SharedContextManagementPanel MCP tab', () => {
     });
 
     expect(await screen.findByText('Model Context Protocol')).toBeDefined();
-    expect(await screen.findByText('Installed MCP services')).toBeDefined();
-    expect(screen.getByText('Docs MCP')).toBeDefined();
+    // The machine's MCP servers, read from its agents' own configs.
+    expect(await screen.findByText('github')).toBeDefined();
+    expect(agentMcpApiMock.listAgentMcp).toHaveBeenCalledWith('srv-1');
     expect(screen.queryByText('Release Skill')).toBeNull();
     expect(screen.queryByText('sharedContext.management.mcpTitle')).toBeNull();
     expect(screen.getByText('CodeBuddy China')).toBeDefined();

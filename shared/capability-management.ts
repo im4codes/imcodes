@@ -934,8 +934,8 @@ export const CAPABILITY_CANONICAL_INSTALL_POLICY = [
   'Manage MCP services and Agent Skills only through IM.codes capability tools.',
   'For MCP services, compose the requested non-secret stdio or Streamable HTTP definition directly as source.kind=mcp_config; do not require an installer URL, package download, Settings form, or separate model. A source.kind=url value is the MCP Streamable HTTP endpoint itself, not an installation package.',
   'Agent Skills live in ~/.agents/skills, which the agents on the machine load themselves: install one with capability_install kind=skill and source.value set to a GitHub owner/repo or https:// URL. It runs the pinned skills CLI on this machine and finishes in that one call; other machines are installed from the Agent Skills tab.',
-  'MCP installation runs automatic deterministic scanning and one isolated AI audit.',
-  'Only the user can confirm an MCP installation; never claim success before authoritative installed/readiness state.',
+  'An MCP server is written to the MCP config of every agent on this machine (Claude Code, Codex, Gemini CLI, OpenCode, ...), which load it themselves; the result of capability_install is final.',
+  'Put an API key or token in env or headers only when the user gave it; otherwise install without it and tell the user to add it in the IM.codes MCP tab.',
   'If capability tools are unavailable, report that limitation instead of using shell, filesystem, or provider-native fallbacks.',
 ].join(' ');
 
@@ -1011,7 +1011,7 @@ export const CAPABILITY_MCP_TOOL_CONTRACTS: Readonly<Record<CapabilityMcpToolNam
   },
   [CAPABILITY_MCP_TOOL.INSTALL]: {
     name: CAPABILITY_MCP_TOOL.INSTALL,
-    description: 'Start one automatic IM.codes install. For MCP, directly compose source.kind=mcp_config with the non-secret stdio definition or Streamable HTTP endpoint; no downloadable installer is required. For a Skill, set kind=skill and source.value to a GitHub owner/repo or https:// URL: it installs into ~/.agents/skills on this machine and the result is final. For MCP, scanning and one isolated AI audit run before user confirmation; verify authoritative status before claiming success.',
+    description: 'Install on this machine. For MCP, compose source.kind=mcp_config with the stdio command/args or the Streamable HTTP/SSE url (source.kind=url also works): it is written to every agent\'s own MCP config here. For a Skill, set kind=skill and source.value to a GitHub owner/repo or https:// URL: it installs into ~/.agents/skills. The result is final.',
     inputSchema: objectSchema('One bounded capability install request.', {
       capabilityId: stringSchema('Optional exact installed capability id when updating; names are never used to guess an update target.'),
       bindingId: stringSchema('Exact installed binding id required with capabilityId; update never guesses among bindings.'),

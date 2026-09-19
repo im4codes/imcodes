@@ -97,9 +97,8 @@ import {
   RuntimeModelPresetSelector,
   type RuntimeModelPresetEntry,
 } from './RuntimeModelPresetSelector.js';
-import { CapabilityInventoryPanel } from './CapabilityInventoryPanel.js';
 import { AgentSkillsPanel } from './AgentSkillsPanel.js';
-import { CAPABILITY_KIND } from '@shared/capability-management.js';
+import { AgentMcpPanel } from './AgentMcpPanel.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
 import type { WsClient } from '../ws-client.js';
 import { useTransportModels } from '../hooks/useTransportModels.js';
@@ -3762,7 +3761,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
 
       {activeTab === 'mcp' && (
         <>
-          <CapabilityInventoryPanel kind={CAPABILITY_KIND.MCP} serverId={serverId} />
+          <AgentMcpPanel serverId={serverId} />
 
           <InfoCard title={t('sharedContext.management.mcpTitle')}>
             <div>{t('sharedContext.management.mcpSummaryLine1')}</div>

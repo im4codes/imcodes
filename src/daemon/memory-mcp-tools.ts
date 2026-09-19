@@ -318,6 +318,8 @@ export interface MemoryMcpToolDeps {
   resolveCapabilityIdentity?: (caller: McpRuntimeCaller) => Promise<CapabilityRuntimeIdentity | null>;
   /** Installs a Skill into this machine's `~/.agents/skills`; tests replace it. */
   runAgentSkills?: CapabilityMcpToolDeps['runAgentSkills'];
+  /** Adds an MCP server to this machine's agent configs; tests replace it. */
+  runAgentMcp?: CapabilityMcpToolDeps['runAgentMcp'];
   featureFlags?: MCPFeatureFlagValues;
   isMemoryFeatureEnabled?: (flag: MemoryFeatureFlag) => boolean;
   searchMemory?: MemoryMcpSearch;

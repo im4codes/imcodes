@@ -64,6 +64,7 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@openai/codex-sdk": "^0.144.1",
     "@opencode-ai/sdk": "^1.18.4",
+    "add-mcp": "2.4.0",
     "commander": "^12.1.0",
     "croner": "^10.0.1",
     "fzf": "^0.5.2",

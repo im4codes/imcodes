@@ -1,5 +1,5 @@
 import { Fragment } from 'preact';
-import { useCallback, useEffect, useMemo, useState } from 'preact/hooks';
+import { useCallback, useEffect, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import {
   AGENT_SKILLS_ACTION,
@@ -10,7 +10,6 @@ import {
   type AgentSkillEntry,
   type AgentSkillSearchResult,
 } from '@shared/agent-skills.js';
-import { apiFetch } from '../api.js';
 import {
   auditAgentSkills,
   listAgentSkills,
@@ -18,15 +17,12 @@ import {
   searchAgentSkillsDirectory,
   type AgentSkillsRunResult,
 } from '../api/agent-skills.js';
-import { isServerOnline, type OnlineServerInfo } from '../server-selection.js';
+import { useDaemonMachines, useMachineTargets } from '../hooks/useDaemonMachines.js';
+import { MachineSelect, MachineTargets } from './MachinePicker.js';
 
 interface Props {
   /** The machine the panel opens on. */
   serverId?: string;
-}
-
-interface Machine extends OnlineServerInfo {
-  name: string;
 }
 
 interface MachineResult extends AgentSkillsRunResult {
@@ -51,13 +47,13 @@ const AUDITOR_NAMES: Record<string, string> = { ath: 'Gen ATH', socket: 'Socket'
  */
 export function AgentSkillsPanel({ serverId }: Props) {
   const { t } = useTranslation();
-  const [machines, setMachines] = useState<Machine[]>([]);
+  const { machines, onlineMachines, machineName } = useDaemonMachines();
+  const { targets, toggle: toggleTarget } = useMachineTargets(serverId);
   const [machineId, setMachineId] = useState<string | undefined>(serverId);
   const [skills, setSkills] = useState<AgentSkillEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState(false);
   const [source, setSource] = useState('');
-  const [targets, setTargets] = useState<Set<string>>(() => new Set(serverId ? [serverId] : []));
   const [busy, setBusy] = useState<string | null>(null);
   const [results, setResults] = useState<MachineResult[]>([]);
   const [query, setQuery] = useState('');
@@ -68,14 +64,7 @@ export function AgentSkillsPanel({ serverId }: Props) {
   const [audit, setAudit] = useState<AuditState | null>(null);
 
   useEffect(() => {
-    void apiFetch<{ servers?: Machine[] }>('/api/server')
-      .then((response) => setMachines(Array.isArray(response.servers) ? response.servers : []))
-      .catch(() => setMachines([]));
-  }, []);
-
-  useEffect(() => {
     setMachineId(serverId);
-    setTargets(new Set(serverId ? [serverId] : []));
   }, [serverId]);
 
   const load = useCallback(async () => {
@@ -99,11 +88,6 @@ export function AgentSkillsPanel({ serverId }: Props) {
     void load();
   }, [load]);
 
-  const machineName = useCallback(
-    (id: string) => machines.find((machine) => machine.id === id)?.name ?? id,
-    [machines],
-  );
-  const onlineMachines = useMemo(() => machines.filter((machine) => isServerOnline(machine)), [machines]);
 
   const errorText = (error?: string) => t(
     `sharedContext.management.agentSkills.errors.${error && KNOWN_ERRORS.has(error) ? error : 'generic'}`,
@@ -177,14 +161,6 @@ export function AgentSkillsPanel({ serverId }: Props) {
     void runOn([machineId], { action: AGENT_SKILLS_ACTION.REMOVE, names: [skill.name] }, `remove:${skill.name}`);
   };
 
-  const toggleTarget = (id: string) => {
-    setTargets((previous) => {
-      const next = new Set(previous);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  };
 
   const riskLabel = (risk: string) => t(`sharedContext.management.agentSkills.risk.${KNOWN_RISKS.has(risk) ? risk : 'unknown'}`);
 
@@ -201,22 +177,12 @@ export function AgentSkillsPanel({ serverId }: Props) {
       </header>
 
       <div class="capability-inventory-toolbar">
-        <label>
-          <span class="capability-muted">{t('sharedContext.management.agentSkills.machineLabel')}</span>{' '}
-          <select
-            value={machineId ?? ''}
-            onChange={(event) => setMachineId((event.target as HTMLSelectElement).value || undefined)}
-            aria-label={t('sharedContext.management.agentSkills.machineLabel')}
-          >
-            {machines.map((machine) => (
-              <option key={machine.id} value={machine.id}>
-                {isServerOnline(machine)
-                  ? machine.name
-                  : t('sharedContext.management.agentSkills.machineOffline', { name: machine.name })}
-              </option>
-            ))}
-          </select>
-        </label>
+        <MachineSelect
+          machines={machines}
+          value={machineId}
+          onChange={setMachineId}
+          label={t('sharedContext.management.agentSkills.machineLabel')}
+        />
         <button
           class="capability-button"
           type="button"
@@ -284,15 +250,12 @@ export function AgentSkillsPanel({ serverId }: Props) {
       <section class="capability-item" aria-labelledby="agent-skills-install-title">
         <header><div><h3 id="agent-skills-install-title">{t('sharedContext.management.agentSkills.installTitle')}</h3></div></header>
 
-        <fieldset class="capability-binding-list">
-          <legend class="capability-muted">{t('sharedContext.management.agentSkills.machinesLabel')}</legend>
-          {onlineMachines.map((machine) => (
-            <label key={machine.id} class="capability-binding-row">
-              <input type="checkbox" checked={targets.has(machine.id)} onChange={() => toggleTarget(machine.id)} />
-              <span>{machine.name}</span>
-            </label>
-          ))}
-        </fieldset>
+        <MachineTargets
+          machines={onlineMachines}
+          targets={targets}
+          onToggle={toggleTarget}
+          legend={t('sharedContext.management.agentSkills.machinesLabel')}
+        />
 
         <div class="capability-inventory-toolbar">
           <input

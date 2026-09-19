@@ -1,4 +1,6 @@
 import { McpServer, type RegisteredTool } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { AGENT_MCP_ACTION, AGENT_MCP_ERROR, AGENT_MCP_TRANSPORT, readAgentMcpServerSpec } from '../../shared/agent-mcp.js';
+import { runAgentMcp } from './agent-mcp.js';
 import { AGENT_SKILLS_ACTION, AGENT_SKILLS_DIRECTORY_DISPLAY, AGENT_SKILLS_ERROR, isAgentSkillSource } from '../../shared/agent-skills.js';
 import { runAgentSkillsOnThisMachine } from './agent-skills.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
@@ -36,6 +38,8 @@ export interface CapabilityMcpToolDeps {
   resolveCapabilityIdentity?: (caller: McpRuntimeCaller) => Promise<CapabilityRuntimeIdentity | null>;
   /** Installs a Skill into this machine's `~/.agents/skills`; tests replace it. */
   runAgentSkills?: typeof runAgentSkillsOnThisMachine;
+  /** Adds an MCP server to this machine's agent configs; tests replace it. */
+  runAgentMcp?: typeof runAgentMcp;
 }
 
 export interface CapabilityRuntimeIdentity {
@@ -143,6 +147,57 @@ async function installAgentSkill(
   };
 }
 
+/** Plain string values only; a credential reference has no value to write. */
+function plainValues(value: unknown): Record<string, string> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const entries = Object.entries(value as Record<string, unknown>).filter((entry): entry is [string, string] => typeof entry[1] === 'string');
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+}
+
+/**
+ * MCP servers go into the configs of the agents on this machine through the
+ * add-mcp SDK, where those agents load them. Values the user gave for keys or
+ * tokens are written with it; the MCP tab adds them otherwise.
+ */
+async function installAgentMcp(
+  input: CapabilityInstallRequest,
+  run: typeof runAgentMcp,
+): Promise<CallToolResult> {
+  const config = (input.source?.mcpConfig ?? {}) as Record<string, unknown>;
+  const remoteUrl = input.source?.kind === CAPABILITY_SOURCE_KIND.URL ? input.source.value : config.url;
+  const transport = typeof config.transport === 'string'
+    ? (config.transport === 'streamable-http' ? AGENT_MCP_TRANSPORT.HTTP : config.transport)
+    : remoteUrl ? AGENT_MCP_TRANSPORT.HTTP : AGENT_MCP_TRANSPORT.STDIO;
+  let fallbackName: string | undefined;
+  try { fallbackName = typeof remoteUrl === 'string' ? new URL(remoteUrl).hostname.split('.')[0] : undefined; } catch { /* no URL */ }
+  const server = readAgentMcpServerSpec({
+    name: config.name ?? input.displayName ?? fallbackName,
+    transport,
+    ...(transport === AGENT_MCP_TRANSPORT.STDIO
+      ? { command: config.command, ...(config.args ? { args: config.args } : {}), ...(plainValues(config.env) ? { env: plainValues(config.env) } : {}) }
+      : { url: remoteUrl, ...(plainValues(config.headers) ? { headers: plainValues(config.headers) } : {}) }),
+  });
+  if (!server) {
+    return toolResult(error(
+      CAPABILITY_ERROR.INVALID_INPUT,
+      'An MCP server needs a name and either a command (stdio, e.g. npx with its package) or an https:// URL (http/sse); names like imcodes-memory are reserved.',
+    ));
+  }
+  const result = await run({ action: AGENT_MCP_ACTION.ADD, server });
+  const payload = {
+    status: result.ok ? 'ok' : 'error',
+    ...(result.ok ? {} : { reason: result.error ?? AGENT_MCP_ERROR.FAILED }),
+    server: server.name,
+    agents: (result.results ?? []).map((entry) => ({ agent: entry.agent, ok: entry.ok, ...(entry.error ? { error: entry.error } : {}) })),
+    note: 'Written to the MCP config of each agent on this machine; sessions started from now on load it. Keys or tokens not given here can be added in the IM.codes MCP tab.',
+  };
+  return {
+    structuredContent: payload,
+    content: [{ type: 'text', text: JSON.stringify(payload) }],
+    isError: !result.ok,
+  };
+}
+
 function toolResult(result: CapabilityToolResult): CallToolResult {
   return {
     structuredContent: result as unknown as Record<string, unknown>,
@@ -173,6 +228,9 @@ export function registerCapabilityMcpTools(
             const input = raw as CapabilityInstallRequest;
             if (input?.kind === CAPABILITY_KIND.SKILL) {
               return await installAgentSkill(input, deps.runAgentSkills ?? runAgentSkillsOnThisMachine);
+            }
+            if (input?.kind === CAPABILITY_KIND.MCP) {
+              return await installAgentMcp(input, deps.runAgentMcp ?? runAgentMcp);
             }
             const issue = validateCapabilityInstallRequest(input);
             return toolResult(issue ? error(CAPABILITY_ERROR.INVALID_INPUT, issue) : await service.install(input));

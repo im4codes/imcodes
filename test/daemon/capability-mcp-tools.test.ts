@@ -49,9 +49,9 @@ async function withClient(
   runtimeCaller: McpRuntimeCaller,
   capabilityService: CapabilityService | undefined,
   run: (client: Client) => Promise<void>,
-  runAgentSkills?: NonNullable<Parameters<typeof createMemoryMcpServer>[1]>['runAgentSkills'],
+  extra: Pick<NonNullable<Parameters<typeof createMemoryMcpServer>[1]>, 'runAgentSkills' | 'runAgentMcp'> = {},
 ): Promise<void> {
-  const server = createMemoryMcpServer(runtimeCaller, { capabilityService, runAgentSkills });
+  const server = createMemoryMcpServer(runtimeCaller, { capabilityService, ...extra });
   const client = new Client({ name: 'capability-tools-test', version: '1' });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
@@ -235,36 +235,43 @@ describe('capability MCP tools', () => {
     }
   });
 
-  it('starts one install operation and requires explicit user intent for uninstall', async () => {
+  it('installs MCP servers into the agents\' own configs and requires explicit user intent for uninstall', async () => {
     const capabilityService = service();
+    const runAgentMcp = vi.fn(async () => ({ ok: true, results: [{ agent: 'claude-code', ok: true }, { agent: 'codex', ok: true }] }));
     await withClient(caller(), capabilityService, async (client) => {
-      const installed = await client.callTool({
-        name: 'capability_install',
-        arguments: {
-          kind: 'mcp',
-          source: { kind: 'url', value: 'https://mcp.example.test/first' },
-          scope: 'account',
-          idempotencyKey: 'install-1',
-          userIntent: 'install this MCP',
-        },
-      });
-      expect(installed.structuredContent).toMatchObject({ status: 'ok', operation: { id: 'op-1', state: 'queued' } });
-      expect(capabilityService.install).toHaveBeenCalledTimes(1);
-
-      await client.callTool({
+      const remote = await client.callTool({
         name: 'capability_install',
         arguments: {
           kind: 'mcp',
           source: { kind: 'url', value: 'https://mcp.example.test/rpc' },
           scope: 'account',
           idempotencyKey: 'add-mcp-1',
+          displayName: 'example',
           userIntent: 'add this MCP',
         },
       });
-      expect(capabilityService.install).toHaveBeenLastCalledWith(expect.objectContaining({
-        kind: 'mcp',
-        userIntent: 'add this MCP',
-      }));
+      expect(remote.structuredContent).toMatchObject({ status: 'ok', server: 'example', agents: [{ agent: 'claude-code', ok: true }, { agent: 'codex', ok: true }] });
+      expect(runAgentMcp).toHaveBeenLastCalledWith({ action: 'add', server: { name: 'example', transport: 'http', url: 'https://mcp.example.test/rpc' } });
+
+      await client.callTool({
+        name: 'capability_install',
+        arguments: {
+          kind: 'mcp',
+          source: { kind: 'mcp_config', mcpConfig: { name: 'dbhub', transport: 'stdio', command: 'npx', args: ['-y', '@bytebase/dbhub'], env: { DSN: 'postgres://x' } } },
+          scope: 'local',
+          idempotencyKey: 'add-mcp-2',
+        },
+      });
+      expect(runAgentMcp).toHaveBeenLastCalledWith({ action: 'add', server: { name: 'dbhub', transport: 'stdio', command: 'npx', args: ['-y', '@bytebase/dbhub'], env: { DSN: 'postgres://x' } } });
+
+      const refused = await client.callTool({
+        name: 'capability_install',
+        arguments: { kind: 'mcp', source: { kind: 'mcp_config', mcpConfig: { name: 'x', transport: 'stdio', command: 'sh -c evil' } }, scope: 'local', idempotencyKey: 'add-mcp-3' },
+      });
+      expect(refused.structuredContent).toMatchObject({ status: 'error', reason: 'invalid_input' });
+      expect(runAgentMcp).toHaveBeenCalledTimes(2);
+      // Installs never go through the old managed store.
+      expect(capabilityService.install).not.toHaveBeenCalled();
 
       const denied = await client.callTool({
         name: 'capability_manage',
@@ -286,7 +293,7 @@ describe('capability MCP tools', () => {
         action: 'uninstall',
         userIntent: 'uninstall X',
       }));
-    });
+    }, { runAgentMcp });
   });
 
   it('installs a Skill into ~/.agents/skills on this machine, never through the managed store', async () => {
@@ -320,37 +327,12 @@ describe('capability MCP tools', () => {
       });
       expect(refused.structuredContent).toMatchObject({ status: 'error', reason: 'invalid_input' });
       expect(runAgentSkills).toHaveBeenCalledTimes(1);
-    }, runAgentSkills);
+    }, { runAgentSkills });
   });
 
-  it('dispatches exact update and binding identities without accepting cross-owner schema drift', async () => {
+  it('dispatches exact binding identities to management without accepting cross-owner schema drift', async () => {
     const capabilityService = service();
-    vi.mocked(capabilityService.install).mockImplementation(async (input) => input.capabilityId === 'missing-capability'
-      ? { status: 'error', reason: CAPABILITY_ERROR.NOT_FOUND, error: 'not found' }
-      : {
-        status: 'ok', operation: {
-          id: 'update-op', kind: input.kind, state: 'queued', revision: 1, scope: input.scope,
-          findings: [], providers: [], machines: [], hasScripts: false, hasExecutables: false,
-          createdAt: 1, updatedAt: 1,
-        },
-      });
     await withClient(caller(), capabilityService, async (client) => {
-      const exact = {
-        kind: 'mcp', source: { kind: 'url', value: 'https://mcp.example.test/rpc' },
-        scope: 'account', idempotencyKey: 'exact-update', capabilityId: 'authority-capability', bindingId: 'authority-binding',
-      } as const;
-      const updated = await client.callTool({ name: 'capability_install', arguments: exact });
-      expect(updated.structuredContent).toMatchObject({ status: 'ok', operation: { id: 'update-op' } });
-      expect(capabilityService.install).toHaveBeenLastCalledWith(expect.objectContaining({
-        capabilityId: 'authority-capability', bindingId: 'authority-binding', idempotencyKey: 'exact-update',
-      }));
-
-      const missing = await client.callTool({
-        name: 'capability_install', arguments: { ...exact, capabilityId: 'missing-capability', idempotencyKey: 'missing-update' },
-      });
-      expect(missing.structuredContent).toMatchObject({ status: 'error', reason: CAPABILITY_ERROR.NOT_FOUND });
-      expect(capabilityService.install).toHaveBeenCalledTimes(2);
-
       await client.callTool({
         name: 'capability_manage',
         arguments: { action: 'disable', capabilityId: 'authority-capability', bindingId: 'project-binding' },
@@ -361,10 +343,13 @@ describe('capability MCP tools', () => {
 
       const crossOwner = await client.callTool({
         name: 'capability_install',
-        arguments: { ...exact, ownerId: 'owner-2', idempotencyKey: 'cross-owner-update' },
+        arguments: {
+          kind: 'mcp', source: { kind: 'url', value: 'https://mcp.example.test/rpc' },
+          scope: 'account', idempotencyKey: 'cross-owner-update', ownerId: 'owner-2',
+        },
       });
       expect(crossOwner).toMatchObject({ isError: true });
-      expect(capabilityService.install).toHaveBeenCalledTimes(2);
+      expect(capabilityService.install).not.toHaveBeenCalled();
     });
   });
 });

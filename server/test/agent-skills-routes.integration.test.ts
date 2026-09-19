@@ -20,6 +20,7 @@ import {
   AGENT_SKILLS_MSG,
 } from '../../shared/agent-skills.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
+import { AGENT_MCP_ERROR, AGENT_MCP_MESSAGE_PREFIX, AGENT_MCP_MSG } from '../../shared/agent-mcp.js';
 
 let db: Database;
 const JWT_KEY = 'test-jwt-key-for-agent-skills-tests-000000';
@@ -80,11 +81,16 @@ class FakeDaemon extends EventEmitter {
   received: Array<Record<string, unknown>> = [];
   send(data: string | Buffer): void {
     const frame = JSON.parse(typeof data === 'string' ? data : data.toString()) as Record<string, unknown>;
-    if (typeof frame.type !== 'string' || !frame.type.startsWith(AGENT_SKILLS_MESSAGE_PREFIX)) return;
+    if (typeof frame.type !== 'string'
+      || !(frame.type.startsWith(AGENT_SKILLS_MESSAGE_PREFIX) || frame.type.startsWith(AGENT_MCP_MESSAGE_PREFIX))) return;
     this.received.push(frame);
-    const reply = frame.type === AGENT_SKILLS_MSG.LIST_REQUEST
-      ? { type: AGENT_SKILLS_MSG.LIST_RESPONSE, requestId: frame.requestId, skills: [{ name: 'wecomcli-doc', description: 'docs' }] }
-      : { type: AGENT_SKILLS_MSG.RUN_RESPONSE, requestId: frame.requestId, ok: true, output: 'done', skills: [] };
+    const replies: Record<string, Record<string, unknown>> = {
+      [AGENT_SKILLS_MSG.LIST_REQUEST]: { type: AGENT_SKILLS_MSG.LIST_RESPONSE, skills: [{ name: 'wecomcli-doc', description: 'docs' }] },
+      [AGENT_SKILLS_MSG.RUN_REQUEST]: { type: AGENT_SKILLS_MSG.RUN_RESPONSE, ok: true, output: 'done', skills: [] },
+      [AGENT_MCP_MSG.LIST_REQUEST]: { type: AGENT_MCP_MSG.LIST_RESPONSE, servers: [{ name: 'github', transport: 'http', envNames: [], headerNames: ['Authorization'], agents: ['codex'] }], agents: [{ agent: 'codex', displayName: 'Codex' }] },
+      [AGENT_MCP_MSG.RUN_REQUEST]: { type: AGENT_MCP_MSG.RUN_RESPONSE, ok: true, results: [{ agent: 'codex', ok: true }] },
+    };
+    const reply = { ...replies[frame.type], requestId: frame.requestId };
     setImmediate(() => this.emit('message', Buffer.from(JSON.stringify(reply)), false));
   }
   close(): void {
@@ -202,6 +208,40 @@ describe('/api/agent-skills', () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+
+  it('lists and edits MCP servers on the owner\'s own daemon, and passes install values through', async () => {
+    const daemon = await connectDaemon(machine, 'daemon-token');
+    const app = buildApp(env());
+    const list = await app.request(`/api/agent-mcp?serverId=${machine}`, { headers: headers(owner) });
+    expect(list.status).toBe(200);
+    expect((await list.json() as { servers: unknown[] }).servers).toHaveLength(1);
+
+    const server = { name: 'github', transport: 'http', url: 'https://api.githubcopilot.com/mcp/', headers: { Authorization: 'Bearer ghp_x' } };
+    const run = await app.request(`/api/agent-mcp/run?serverId=${machine}`, {
+      method: 'POST', headers: headers(owner, true), body: JSON.stringify({ action: 'add', server }),
+    });
+    expect(run.status).toBe(200);
+    expect(await run.json()).toEqual({ ok: true, results: [{ agent: 'codex', ok: true }] });
+    expect(daemon.received.at(-1)).toMatchObject({ type: AGENT_MCP_MSG.RUN_REQUEST, action: 'add', server });
+  });
+
+  it('keeps MCP edits to the owner and refuses unsafe servers before the daemon sees them', async () => {
+    const daemon = await connectDaemon(machine, 'daemon-token');
+    const app = buildApp(env());
+    const stranger403 = await app.request(`/api/agent-mcp/run?serverId=${machine}`, {
+      method: 'POST', headers: headers(stranger, true), body: JSON.stringify({ action: 'remove', name: 'github' }),
+    });
+    expect(stranger403.status).toBe(403);
+    for (const body of [
+      { action: 'add', server: { name: 'x', transport: 'stdio', command: 'npx; curl evil' } },
+      { action: 'remove', name: 'imcodes-memory' },
+    ]) {
+      const res = await app.request(`/api/agent-mcp/run?serverId=${machine}`, { method: 'POST', headers: headers(owner, true), body: JSON.stringify(body) });
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ error: AGENT_MCP_ERROR.INVALID_REQUEST });
+    }
+    expect(daemon.received).toEqual([]);
   });
 });
 

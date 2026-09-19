@@ -12,44 +12,12 @@ import {
   type AgentSkillAuditVerdict,
   type AgentSkillSearchResult,
 } from '../../../shared/agent-skills.js';
+import { getJsonWithin, processFetch, TtlCache, type Fetch } from './cached-json-fetch.js';
 
 const SEARCH_CACHE_MS = 60_000;
 const AUDIT_CACHE_MS = 10 * 60_000;
-const CACHE_ENTRIES = 200;
 
-type Fetch = typeof fetch;
-
-class TtlCache<T> {
-  private readonly entries = new Map<string, { at: number; value: T }>();
-  constructor(private readonly ttlMs: number) {}
-
-  get(key: string, now: number): T | undefined {
-    const entry = this.entries.get(key);
-    if (!entry) return undefined;
-    if (now - entry.at > this.ttlMs) {
-      this.entries.delete(key);
-      return undefined;
-    }
-    return entry.value;
-  }
-
-  set(key: string, value: T, now: number): void {
-    if (this.entries.size >= CACHE_ENTRIES) {
-      const oldest = this.entries.keys().next().value;
-      if (oldest !== undefined) this.entries.delete(oldest);
-    }
-    this.entries.set(key, { at: now, value });
-  }
-}
-
-async function getJson(fetchImpl: Fetch, url: string): Promise<unknown> {
-  const response = await fetchImpl(url, {
-    signal: AbortSignal.timeout(AGENT_SKILLS_DIRECTORY.TIMEOUT_MS),
-    headers: { Accept: 'application/json' },
-  });
-  if (!response.ok) throw new Error(`directory_status_${response.status}`);
-  return await response.json() as unknown;
-}
+const getJson = (fetchImpl: Fetch, url: string) => getJsonWithin(fetchImpl, url, AGENT_SKILLS_DIRECTORY.TIMEOUT_MS);
 
 function readSearch(value: unknown): AgentSkillSearchResult[] {
   const skills = (value as { skills?: unknown } | null)?.skills;
@@ -86,8 +54,7 @@ function readAudit(value: unknown, skills: readonly string[]): Record<string, Ag
 }
 
 export function createAgentSkillsDirectory(options: { fetchImpl?: Fetch; now?: () => number } = {}) {
-  // Resolved per call, not captured, so the process's fetch is the one used.
-  const fetchImpl: Fetch = options.fetchImpl ?? ((input, init) => fetch(input, init));
+  const fetchImpl: Fetch = options.fetchImpl ?? processFetch;
   const now = options.now ?? Date.now;
   const searches = new TtlCache<AgentSkillSearchResult[]>(SEARCH_CACHE_MS);
   const audits = new TtlCache<Record<string, AgentSkillAuditVerdict[]>>(AUDIT_CACHE_MS);
