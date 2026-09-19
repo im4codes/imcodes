@@ -73,6 +73,17 @@ import {
 import { DAEMON_VERSION } from '../../src/util/version.js';
 import { DAEMON_UPGRADE_BLOCK_REASON } from '../../shared/daemon-upgrade.js';
 
+// Runtimes built here with no `linuxDesktop` seam read the real machine. On a
+// Linux CI runner that means "no X server", which (correctly) turns remote
+// desktop off and offers the desktop install instead -- unrelated to what these
+// tests exercise, and different from a developer's Mac. Report a display as
+// present so the suite means the same thing on every host; the headless-Linux
+// behaviour has its own test that injects the seam explicitly.
+vi.mock('../../src/node/linux-desktop-environment.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/node/linux-desktop-environment.js')>()),
+  linuxGraphicalDisplayAvailable: () => true,
+}));
+
 const { receiveMachineDirectUploadMock, sendMachineDirectFetchMock } = vi.hoisted(() => ({
   receiveMachineDirectUploadMock: vi.fn(),
   sendMachineDirectFetchMock: vi.fn(),
