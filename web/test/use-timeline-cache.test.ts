@@ -1310,6 +1310,54 @@ describe('useTimeline global cache bounds', () => {
     ]);
   });
 
+  it('keeps renderable conversation in the synchronous snapshot despite a signal-heavy cache', async () => {
+    vi.useFakeTimers();
+    const sessionName = `deck_snapshot_visible_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    const cacheKey = `${serverId}:${sessionName}`;
+    const snapshotKey = `rcc_timeline_snapshot:${cacheKey}`;
+    const conversation = makeEvents(sessionName, 4);
+    const signals: TimelineEvent[] = Array.from({ length: 300 }, (_, index) => ({
+      eventId: `${sessionName}-signal-${index}`,
+      sessionId: sessionName,
+      ts: 100 + index,
+      epoch: 1,
+      seq: 100 + index,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'session.state',
+      payload: { status: 'idle' },
+    }));
+
+    __setTimelineCacheForTests(cacheKey, [...conversation, ...signals]);
+    await act(async () => { await vi.advanceTimersByTimeAsync(750); });
+
+    const snapshot = JSON.parse(localStorage.getItem(snapshotKey) ?? '[]') as TimelineEvent[];
+    expect(snapshot.map((event) => event.eventId)).toEqual(conversation.map((event) => event.eventId));
+  });
+
+  it('bounds each synchronous snapshot so one window cannot monopolize localStorage', async () => {
+    vi.useFakeTimers();
+    const sessionName = `deck_snapshot_budget_${Date.now()}`;
+    const serverId = `srv-${Date.now()}`;
+    const cacheKey = `${serverId}:${sessionName}`;
+    const snapshotKey = `rcc_timeline_snapshot:${cacheKey}`;
+    const events = makeEvents(sessionName, 40).map((event, index) => ({
+      ...event,
+      payload: { text: `${index}:${'x'.repeat(20_000)}` },
+    }));
+
+    __setTimelineCacheForTests(cacheKey, events);
+    await act(async () => { await vi.advanceTimersByTimeAsync(750); });
+
+    const stored = localStorage.getItem(snapshotKey);
+    expect(stored).toBeTruthy();
+    expect(stored!.length).toBeLessThanOrEqual(128 * 1024);
+    const snapshot = JSON.parse(stored!) as TimelineEvent[];
+    expect(snapshot.length).toBeGreaterThan(0);
+    expect(snapshot.at(-1)?.eventId).toBe(events.at(-1)?.eventId);
+  });
+
   it('preserves latest streaming text in the local pagehide snapshot without writing it to IDB', async () => {
     vi.useFakeTimers();
     const sessionName = `deck_snapshot_streaming_${Date.now()}`;

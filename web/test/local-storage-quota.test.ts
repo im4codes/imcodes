@@ -10,6 +10,7 @@ class FakeStorage implements Storage {
   setCalls = 0;
   alwaysThrow = false;
   throwFirstQuota = false;
+  maxTotalLength = Number.POSITIVE_INFINITY;
 
   get length(): number {
     return this.store.size;
@@ -34,6 +35,11 @@ class FakeStorage implements Storage {
   setItem(key: string, value: string): void {
     this.setCalls += 1;
     if (this.alwaysThrow || (this.throwFirstQuota && this.setCalls === 1)) {
+      throw new DOMException('localStorage quota exceeded', 'QuotaExceededError');
+    }
+    const previousLength = this.store.get(key)?.length ?? 0;
+    const totalLength = Array.from(this.store.values()).reduce((sum, item) => sum + item.length, 0);
+    if (totalLength - previousLength + value.length > this.maxTotalLength) {
       throw new DOMException('localStorage quota exceeded', 'QuotaExceededError');
     }
     this.store.set(key, value);
@@ -62,7 +68,7 @@ describe('safeLocalStorageSetItem', () => {
     });
   }
 
-  it('evicts volatile cache entries and retries quota-limited writes', () => {
+  it('evicts only the minimum lower-priority cache entries needed for a quota-limited write', () => {
     const storage = new FakeStorage();
     storage.setItem(`${TIMELINE_SNAPSHOT_STORAGE_PREFIX}server:session`, 'x'.repeat(100));
     storage.setItem(`${FILE_BROWSER_SNAPSHOT_KEY_PREFIX}:cwd:1:0:server`, 'y'.repeat(50));
@@ -75,8 +81,31 @@ describe('safeLocalStorageSetItem', () => {
 
     expect(storage.getItem('rcc_open_subs_deck_main')).toBe('["sub-1","sub-2"]');
     expect(storage.getItem('rcc_auth')).toBe('keep');
-    expect(storage.getItem(`${TIMELINE_SNAPSHOT_STORAGE_PREFIX}server:session`)).toBeNull();
+    // Timeline is the synchronous chat first-paint source, so the cheaper file
+    // browser snapshot goes first and a successful retry stops immediately.
+    expect(storage.getItem(`${TIMELINE_SNAPSHOT_STORAGE_PREFIX}server:session`)).toBe('x'.repeat(100));
     expect(storage.getItem(`${FILE_BROWSER_SNAPSHOT_KEY_PREFIX}:cwd:1:0:server`)).toBeNull();
+  });
+
+  it('removes oldest timeline snapshots one at a time and preserves newer windows', () => {
+    const storage = new FakeStorage();
+    const snapshot = (ts: number, padding: number): string => JSON.stringify([{ ts, text: 'x'.repeat(padding) }]);
+    const oldestKey = `${TIMELINE_SNAPSHOT_STORAGE_PREFIX}server:oldest`;
+    const middleKey = `${TIMELINE_SNAPSHOT_STORAGE_PREFIX}server:middle`;
+    const newestKey = `${TIMELINE_SNAPSHOT_STORAGE_PREFIX}server:newest`;
+    storage.setItem(oldestKey, snapshot(1, 60));
+    storage.setItem(middleKey, snapshot(2, 60));
+    storage.setItem(newestKey, snapshot(3, 60));
+    const existingLength = [oldestKey, middleKey, newestKey]
+      .reduce((sum, key) => sum + (storage.getItem(key)?.length ?? 0), 0);
+    storage.maxTotalLength = existingLength + 10;
+    installFakeStorage(storage);
+
+    expect(safeLocalStorageSetItem('rcc_session', 'new-session-value')).toBe(true);
+
+    expect(storage.getItem(oldestKey)).toBeNull();
+    expect(storage.getItem(middleKey)).not.toBeNull();
+    expect(storage.getItem(newestKey)).not.toBeNull();
   });
 
   it('returns false without throwing when storage is still unavailable', () => {

@@ -1,4 +1,8 @@
-import { isGuaranteedVisibleTimelineEvent, isLastValueTimelineEventType } from '../../../src/shared/timeline/types.js';
+import {
+  TIMELINE_PREFERENCE_DEPENDENT_TYPES,
+  isGuaranteedVisibleTimelineEvent,
+  isLastValueTimelineEventType,
+} from '../../../src/shared/timeline/types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import {
@@ -518,16 +522,13 @@ const TIMELINE_SNAPSHOT_WRITE_DELAY_MS = 750;
 // in IDB, so a later page refresh restores it — not only the localStorage mat.
 const STREAMING_IDLE_PERSIST_MS = 2000;
 const TERMINAL_TAIL_IDLE_RECONCILE_MS = 5000;
-// Snapshot tail size matches MAX_MEMORY_EVENTS (300) so the synchronous
-// first-paint seed approaches the same coverage as the IDB-restored cache.
-// The previous 50-event cap meant 5/6 of a 300-event session disappeared
-// after refresh until the async IDB load completed — visible on mobile as
-// "本地缓存还是没有立即显示". 300 events of compact payload is on the order
-// of 0.5–1 MB per session in localStorage; the per-origin 5 MB quota holds
-// up to ~5 active sessions before the `try/catch` swallow at the bottom of
-// `persistTimelineSnapshotTail` starts dropping writes. Dynamic LRU eviction
-// is a follow-up (see Round 3 plan PR-5 §quota).
+// Keep the same row coverage as the in-memory first window, but bound the
+// serialized size too. A few large tool results can otherwise consume most of
+// the origin's localStorage quota and evict every other window's synchronous
+// seed. IndexedDB remains the full local-history store; this snapshot is only
+// the highest-priority, synchronous first paint while IDB/network catch up.
 const MAX_PERSISTED_SNAPSHOT_EVENTS = 300;
+const MAX_PERSISTED_SNAPSHOT_CHARS = 128 * 1024;
 
 /**
  * How much history each session keeps in IndexedDB.
@@ -924,10 +925,38 @@ function getPersistableTimelineTail(
   events: TimelineEvent[],
   opts?: { includeStreaming?: boolean },
 ): TimelineEvent[] {
-  const persistable = events.filter((event) => opts?.includeStreaming === true || shouldPersistTimelineEvent(event));
+  const persistable = events.filter((event) => {
+    if (opts?.includeStreaming !== true && !shouldPersistTimelineEvent(event)) return false;
+    if (event.hidden) return false;
+    // Keep rows that definitely paint plus tool-detail rows the user may have
+    // enabled. Last-value status/usage/terminal signals belong in IndexedDB,
+    // not in the scarce synchronous cache: normal idle signals can otherwise
+    // crowd every conversation row out of the 300-event first-paint window.
+    return isGuaranteedVisibleTimelineEvent(event)
+      || TIMELINE_PREFERENCE_DEPENDENT_TYPES.includes(event.type);
+  });
   return persistable.length > MAX_PERSISTED_SNAPSHOT_EVENTS
     ? persistable.slice(persistable.length - MAX_PERSISTED_SNAPSHOT_EVENTS)
     : persistable;
+}
+
+function serializeTimelineSnapshotTail(tail: TimelineEvent[]): string {
+  if (tail.length === 0) return '[]';
+
+  // Select newest-first so a single oversized historical tool payload cannot
+  // displace the current conversation. Oversized individual rows are skipped;
+  // their complete payload is still retained in IndexedDB and daemon history.
+  const selected: string[] = [];
+  let serializedChars = 2; // []
+  for (let index = tail.length - 1; index >= 0; index -= 1) {
+    const serializedEvent = JSON.stringify(tail[index]);
+    const addedChars = serializedEvent.length + (selected.length > 0 ? 1 : 0);
+    if (serializedChars + addedChars > MAX_PERSISTED_SNAPSHOT_CHARS) continue;
+    selected.push(serializedEvent);
+    serializedChars += addedChars;
+  }
+  selected.reverse();
+  return `[${selected.join(',')}]`;
 }
 
 function areTimelineSnapshotTailsSame(left: TimelineEvent[] | undefined, right: TimelineEvent[]): boolean {
@@ -947,16 +976,12 @@ function persistTimelineSnapshotTail(cacheKey: string, tail: TimelineEvent[]): v
       lastWrittenTimelineSnapshotTails.set(cacheKey, tail);
       return;
     }
-    // Quota-aware write. The origin gets ~5 MB and one session's tail runs
-    // 0.5-1 MB, so a raw setItem starts throwing after roughly five sessions
-    // and every session after that silently keeps NO snapshot — which is the
-    // "open a chat and it is blank until the network answers" report, since
-    // the synchronous first-paint seed reads exactly this key.
-    // safeLocalStorageSetItem evicts the largest OTHER volatile entries
-    // (other sessions' tails, file-browser, terminal frames) and retries.
+    // Quota-aware write. The compact, renderable-only value keeps many session
+    // seeds resident, and the writer evicts lower-priority frames one at a time
+    // before sacrificing the oldest timeline snapshot.
     const written = safeLocalStorageSetItem(
       getTimelineSnapshotStorageKey(cacheKey),
-      JSON.stringify(tail),
+      serializeTimelineSnapshotTail(tail),
     );
     // Record ONLY a write that landed: areTimelineSnapshotTailsSame() skips a
     // write whose tail matches the last recorded one, so remembering a failed
