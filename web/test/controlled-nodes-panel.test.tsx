@@ -976,6 +976,56 @@ describe('ControlledNodesPanel (12.3)', () => {
     expect(buttons[1]?.closest('li')?.textContent).toContain('Participant Ready');
   });
 
+  it('splits the Remote Desktop button: the right third opens the machine in its own window, not here', async () => {
+    machines = [
+      machine({ serverId: 'owner-ready', displayName: 'Owner Ready', os: 'win', accessRole: 'owner', execEnabled: true, capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
+    ];
+    const opened = vi.spyOn(window, 'open').mockReturnValue({} as Window);
+    const onOpenRemoteDesktop = vi.fn();
+    const { container } = render(<ControlledNodesPanel onOpenRemoteDesktop={onOpenRemoteDesktop} />);
+    await waitFor(() => expect(container.querySelectorAll('.controlled-nodes-rd-split')).toHaveLength(1));
+
+    const split = container.querySelector('.controlled-nodes-rd-split') as HTMLElement;
+    const main = split.querySelector('.controlled-nodes-rd-main') as HTMLButtonElement;
+    const windowButton = split.querySelector('.controlled-nodes-rd-window') as HTMLButtonElement;
+    expect(main.nextElementSibling).toBe(windowButton);
+    expect(windowButton.getAttribute('aria-label')).toBe('remote_desktop.open_new_window');
+
+    fireEvent.click(windowButton);
+    expect(opened).toHaveBeenCalledTimes(1);
+    expect(String(opened.mock.calls[0]?.[0])).toContain('remoteDesktopServer=owner-ready');
+    expect(onOpenRemoteDesktop).not.toHaveBeenCalled();
+
+    fireEvent.click(main);
+    expect(onOpenRemoteDesktop).toHaveBeenCalledTimes(1);
+    expect(opened).toHaveBeenCalledTimes(1);
+    opened.mockRestore();
+  });
+
+  it('lays an owner\'s actions out as two aligned rows of three, keeping an empty slot for an action a machine lacks', async () => {
+    machines = [
+      // Windows can hold an auto-unlock secret; Linux cannot, and must leave its slot empty rather than shift Revoke.
+      machine({ serverId: 'win-node', displayName: 'Win Node', os: 'win', accessRole: 'owner', execEnabled: true, capabilities: [REMOTE_DESKTOP_CAPABILITY, CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY] }),
+      machine({ serverId: 'linux-node', displayName: 'Linux Node', os: 'linux', accessRole: 'owner', execEnabled: true, capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
+    ];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.querySelectorAll('.controlled-nodes-machine-actions.is-desktop.is-owner')).toHaveLength(2));
+
+    for (const actions of Array.from(container.querySelectorAll('.controlled-nodes-machine-actions.is-desktop.is-owner'))) {
+      const cells = Array.from(actions.children);
+      expect(cells).toHaveLength(6);
+      expect(cells[0]?.classList.contains('controlled-nodes-rd-split')).toBe(true);
+      expect(cells[1]?.classList.contains('controlled-nodes-share')).toBe(true);
+      expect(cells[2]?.classList.contains('controlled-nodes-rename')).toBe(true);
+      expect(cells[3]?.classList.contains('controlled-nodes-exec-toggle')).toBe(true);
+      expect(cells[5]?.classList.contains('controlled-nodes-revoke')).toBe(true);
+    }
+    const linuxCells = Array.from(container.querySelectorAll('.controlled-nodes-machine-actions.is-desktop.is-owner')[1]?.children ?? []);
+    expect(linuxCells[4]?.classList.contains('controlled-nodes-action-slot')).toBe(true);
+    const winCells = Array.from(container.querySelectorAll('.controlled-nodes-machine-actions.is-desktop.is-owner')[0]?.children ?? []);
+    expect(winCells[4]?.classList.contains('controlled-nodes-auto-unlock')).toBe(true);
+  });
+
   it('offers worker installation from explicit capability evidence, never OS metadata', async () => {
     machines = [
       machine({ serverId: 'missing', displayName: 'Missing Worker', os: 'win', accessRole: 'owner', online: true, capabilities: [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY] }),

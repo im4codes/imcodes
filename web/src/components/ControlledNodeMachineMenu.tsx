@@ -28,6 +28,12 @@ export interface ControlledNodeMachineMenuProps {
   isSelectable?(machine: MachineListItem): boolean;
   /** Tooltip for a row that cannot be picked. Defaults to offline / exec-off. */
   disabledReason?(machine: MachineListItem): string | undefined;
+  /**
+   * When given, every selectable row gets a second button on its right that
+   * opens the machine in its own browser window instead. The menu has already
+   * asked to close by the time it is called.
+   */
+  onOpenInWindow?(machine: MachineListItem): void;
   /** Optional primary action centered in the menu title bar. */
   titleAction?: ComponentChildren;
   /** A status line shown above the list (e.g. a host limit). */
@@ -71,6 +77,7 @@ function MachineMenuBody({
   returnFocusRef,
   onClose,
   onSelect,
+  onOpenInWindow,
   isSelectable = canOpenRemoteDesktopMachine,
   disabledReason,
   titleAction,
@@ -211,7 +218,7 @@ function MachineMenuBody({
           {visible.map((machine) => {
             const selectable = isSelectable(machine);
             return (
-              <li key={machine.serverId} role="none">
+              <li key={machine.serverId} role="none" class="controlled-node-quick-item">
                 <button
                   type="button"
                   role="menuitem"
@@ -233,6 +240,21 @@ function MachineMenuBody({
                     <code>{machine.nodeId ?? MACHINE_IDENTITY_UNAVAILABLE}</code>
                   </span>
                 </button>
+                {onOpenInWindow && (
+                  <button
+                    type="button"
+                    role="menuitem"
+                    class={`controlled-node-quick-window${selectable ? '' : ' is-disabled'}`}
+                    aria-disabled={selectable ? undefined : 'true'}
+                    aria-label={t('remote_desktop.open_new_window')}
+                    title={selectable ? t('remote_desktop.open_new_window') : reasonFor(machine)}
+                    onClick={() => {
+                      if (!selectable) return;
+                      onClose();
+                      onOpenInWindow(machine);
+                    }}
+                  >↗</button>
+                )}
               </li>
             );
           })}

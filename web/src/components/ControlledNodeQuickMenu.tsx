@@ -1,6 +1,7 @@
 import { useCallback, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { MachineListItem } from '../api/machines.js';
+import { openRemoteDesktopWindow } from '../remote-desktop-window.js';
 import { ControlledNodeMachineMenu } from './ControlledNodeMachineMenu.js';
 
 interface ControlledNodeQuickMenuProps {
@@ -44,6 +45,7 @@ export function ControlledNodeQuickMenu({ onOpenRemoteDesktop, onOpenRemoteDeskt
         open={open}
         onClose={close}
         onSelect={(machine) => onOpenRemoteDesktop?.(machine)}
+        onOpenInWindow={(machine) => { openRemoteDesktopWindow(machine.serverId); }}
         titleAction={onOpenRemoteDesktopWall && (
           <button
             type="button"

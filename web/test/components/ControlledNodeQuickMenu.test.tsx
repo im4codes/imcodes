@@ -86,9 +86,10 @@ describe('ControlledNodeQuickMenu', () => {
     expect(screen.getByText('Offline Two')).toBeTruthy();
     expect(screen.getByText('Linux Three')).toBeTruthy();
 
-    // The whole row is the control: no separate per-row button any more.
-    expect(screen.queryByRole('menuitem', { name: /remote_desktop\.open/ })).toBeNull();
-    const rows = screen.getAllByRole('menuitem');
+    // The whole row is the control; the only other per-row button is the
+    // "open in a new window" one on its right (checked in its own test).
+    expect(screen.queryByRole('menuitem', { name: /remote_desktop\.open\b(?!_new_window)/ })).toBeNull();
+    const rows = screen.getAllByRole('menuitem').filter((item) => item.classList.contains('controlled-node-quick-row'));
     expect(rows).toHaveLength(3);
     expect(rows[0].getAttribute('aria-disabled')).toBeNull();
     expect(rows[1].getAttribute('aria-disabled')).toBe('true');
@@ -106,6 +107,53 @@ describe('ControlledNodeQuickMenu', () => {
     expect(onOpenRemoteDesktop).toHaveBeenCalledWith(online);
     await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
     expect(trigger.getAttribute('aria-expanded')).toBe('false');
+  });
+
+  it('gives every row an open-in-a-new-window button on its right that opens that machine in its own window', async () => {
+    const online = node({});
+    machines = [online, node({ serverId: 'node-2', refName: 'offline-two', displayName: 'Offline Two', online: false })];
+    const opened = vi.spyOn(window, 'open').mockReturnValue({} as Window);
+    const onOpenRemoteDesktop = vi.fn();
+    render(<ControlledNodeQuickMenu onOpenRemoteDesktop={onOpenRemoteDesktop} />);
+    const trigger = screen.getByRole('button', { name: 'controlled_nodes.machines_title' });
+    fireEvent.click(trigger);
+    await screen.findByText('Desktop One');
+
+    const buttons = screen.getAllByRole('menuitem', { name: 'remote_desktop.open_new_window' });
+    expect(buttons).toHaveLength(2);
+    // The button sits after (to the right of) its own row inside the same list item.
+    expect(buttons[0].previousElementSibling?.classList.contains('controlled-node-quick-row')).toBe(true);
+
+    // An unavailable machine's button does nothing and the menu stays open.
+    expect(buttons[1].getAttribute('aria-disabled')).toBe('true');
+    fireEvent.click(buttons[1]);
+    expect(opened).not.toHaveBeenCalled();
+    expect(screen.getByRole('menu')).toBeTruthy();
+
+    fireEvent.click(buttons[0]);
+    expect(opened).toHaveBeenCalledTimes(1);
+    expect(String(opened.mock.calls[0]?.[0])).toContain('remoteDesktopServer=node-1');
+    // Opening in a window is not opening it here.
+    expect(onOpenRemoteDesktop).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull());
+    opened.mockRestore();
+  });
+
+  it('shows no new-window button when the caller does not offer one', async () => {
+    machines = [node({})];
+    render(
+      <div>
+        <div data-testid="anchor" />
+        <ControlledNodeMachineMenu
+          anchorRef={{ current: document.body }}
+          open
+          onClose={() => {}}
+          onSelect={() => {}}
+        />
+      </div>,
+    );
+    await screen.findByText('Desktop One');
+    expect(screen.queryByRole('menuitem', { name: 'remote_desktop.open_new_window' })).toBeNull();
   });
 
   it('explains an online node with remote exec disabled', async () => {
@@ -380,7 +428,11 @@ describe('ControlledNodeQuickMenu group tabs', () => {
     expect(document.body.textContent).toContain('Own');
     expect(document.body.textContent).not.toContain('Loose');
     // Rows under a group chip are still the click targets.
-    expect(screen.getAllByRole('menuitem').map((row) => row.textContent)).toEqual([
+    expect(
+      screen.getAllByRole('menuitem')
+        .filter((item) => item.classList.contains('controlled-node-quick-row'))
+        .map((row) => row.textContent),
+    ).toEqual([
       expect.stringContaining('Own'),
       expect.stringContaining('Theirs'),
     ]);

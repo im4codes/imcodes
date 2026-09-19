@@ -3683,6 +3683,58 @@ html.native-ios-mac .chat-dl-btn {
   transition: border-color 0.16s, background 0.16s, color 0.16s, box-shadow 0.16s;
 }
 .controlled-nodes-machine-actions button:disabled { cursor: wait; opacity: 0.48; }
+/* Owner actions on desktop: two rows, three equal columns, so every button
+   lines up with the one above/below it across all machines regardless of which
+   optional actions (install, auto-unlock) a given machine has -- the ones it
+   lacks leave an empty slot instead of shifting the rest. */
+.controlled-nodes-machine-actions.is-desktop.is-owner {
+  display: grid;
+  grid-template-columns: repeat(3, 132px);
+  justify-content: end;
+  align-items: stretch;
+  gap: 7px;
+}
+.controlled-nodes-machine-actions.is-desktop.is-owner > * { min-width: 0; }
+.controlled-nodes-machine-actions.is-desktop.is-owner > button,
+.controlled-nodes-machine-actions.is-desktop.is-owner .controlled-nodes-rd-split > button {
+  box-sizing: border-box;
+  min-height: 34px;
+  justify-content: center;
+}
+.controlled-nodes-machine-actions.is-desktop.is-owner > button {
+  width: 100%;
+  white-space: nowrap;
+}
+.controlled-nodes-machine-actions.is-desktop.is-owner > .controlled-nodes-auto-unlock-form {
+  grid-column: 1 / -1;
+}
+.controlled-nodes-action-slot { display: block; min-height: 34px; }
+/* Remote desktop split button: two thirds "open", one third "open in a new
+   window". */
+.controlled-nodes-rd-split {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  min-width: 0;
+}
+.controlled-nodes-rd-split > button { margin: 0; }
+.controlled-nodes-rd-split > .controlled-nodes-rd-main {
+  padding-inline: 8px;
+  border-radius: 9px 0 0 9px;
+}
+.controlled-nodes-rd-split > .controlled-nodes-rd-window {
+  padding: 0;
+  color: #062031;
+  background: #69d1ff;
+  border: 1px solid #a3e5ff;
+  border-left: 1px solid rgb(6 32 49 / 38%);
+  border-radius: 0 9px 9px 0;
+  font-family: var(--imcodes-app-font-family);
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+}
+.controlled-nodes-rd-split > button:hover:not(:disabled) { filter: brightness(1.08); }
 .controlled-nodes-mobile-action-label { display: none; }
 .controlled-nodes-exec-toggle {
   display: inline-flex;
@@ -8218,6 +8270,11 @@ html.native-ios-mac .chat-dl-btn {
 .controlled-node-quick-count { display: inline-flex; min-width: 18px; height: 18px; align-items: center; justify-content: center; border-radius: 9px; background: rgba(34,211,238,0.14); color: #67e8f9; font-variant-numeric: tabular-nums; }
 .controlled-node-quick-menu-head > .controlled-node-quick-count { grid-column: 3; justify-self: end; }
 .controlled-node-quick-list { display: flex; flex-direction: column; gap: 5px; margin: 0; padding: 0; list-style: none; }
+.controlled-node-quick-item { display: flex; align-items: stretch; gap: 5px; }
+.controlled-node-quick-item > .controlled-node-quick-row { flex: 1 1 auto; min-width: 0; width: auto; }
+.controlled-node-quick-window { flex: 0 0 34px; box-sizing: border-box; margin: 0; padding: 0; border: 1px solid rgba(148,163,184,0.13); border-radius: 8px; background: rgba(30,41,59,0.58); color: #cbd5e1; font: inherit; font-size: 15px; line-height: 1; cursor: pointer; transition: border-color 0.15s, background 0.15s, box-shadow 0.15s; }
+.controlled-node-quick-window:hover:not(.is-disabled), .controlled-node-quick-window:focus-visible:not(.is-disabled) { border-color: rgba(103,232,249,0.62); background: rgba(30,58,83,0.72); color: #e0f2fe; box-shadow: 0 0 0 1px rgba(34,211,238,0.22), 0 0 14px rgba(34,211,238,0.22); outline: none; }
+.controlled-node-quick-window.is-disabled { cursor: not-allowed; opacity: 0.5; background: rgba(30,41,59,0.32); }
 .controlled-node-quick-row { display: grid; grid-template-columns: 8px minmax(0,1fr); gap: 8px; align-items: center; width: 100%; box-sizing: border-box; margin: 0; padding: 7px; border: 1px solid rgba(148,163,184,0.13); border-radius: 8px; background: rgba(30,41,59,0.58); color: inherit; font: inherit; text-align: left; cursor: pointer; transition: border-color 0.15s, background 0.15s, box-shadow 0.15s; }
 .controlled-node-quick-row:hover:not(.is-disabled), .controlled-node-quick-row:focus-visible:not(.is-disabled) { border-color: rgba(103,232,249,0.62); background: rgba(30,58,83,0.72); box-shadow: 0 0 0 1px rgba(34,211,238,0.22), 0 0 14px rgba(34,211,238,0.22); outline: none; }
 .controlled-node-quick-row:active:not(.is-disabled) { border-color: #67e8f9; background: rgba(8,47,73,0.86); box-shadow: 0 0 18px rgba(34,211,238,0.32); }

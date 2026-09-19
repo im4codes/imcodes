@@ -37,6 +37,7 @@ import { isNative } from '../native.js';
 import { ShareSessionDialog } from './ShareSessionDialog.js';
 import type { MachineListItem } from '../api/machines.js';
 import { canOpenRemoteDesktopMachine } from '../remote-desktop-profile.js';
+import { openRemoteDesktopWindow } from '../remote-desktop-window.js';
 import { RemoteDesktopReadiness } from './RemoteDesktopReadiness.js';
 import { TeamManagementPanel } from './TeamManagementPanel.js';
 import {
@@ -639,6 +640,8 @@ export function ControlledNodesPanel({
               <span class="controlled-nodes-toggle-track" aria-hidden="true"><i /></span>
               <span>{machine.execEnabled ? t('controlled_nodes.exec_on') : t('controlled_nodes.exec_off')}</span>
             </button>
+            {!inMobileMenu && !canConfigureAutoUnlock(machine)
+              && <span class="controlled-nodes-action-slot" aria-hidden="true" />}
             {canConfigureAutoUnlock(machine) && (autoUnlockServerId === machine.serverId ? (
               <form
                 class="controlled-nodes-auto-unlock-form"
@@ -882,16 +885,38 @@ export function ControlledNodesPanel({
                 </div>
                 <RemoteDesktopReadiness capabilities={m.capabilities} compact />
               </div>
-              <div class={`controlled-nodes-machine-actions ${mobileActions ? `is-mobile is-${machineAccessRole(m)}` : 'is-desktop'}`}>
+              <div class={`controlled-nodes-machine-actions ${mobileActions ? `is-mobile is-${machineAccessRole(m)}` : `is-desktop is-${machineAccessRole(m)}`}`}>
                 {!mobileActions && renderInstallAction(m, false)}
                 {canOpenRemoteDesktopMachine(m) ? (
-                  <button
-                    type="button"
-                    class="controlled-nodes-remote-desktop"
-                    onClick={() => onOpenRemoteDesktop?.(m)}
-                  >
-                    {t('remote_desktop.open')}
-                  </button>
+                  // Split button: the left two thirds open the remote desktop
+                  // here, the right third opens it in its own browser window.
+                  // A popup is useless on a phone, so mobile keeps one button.
+                  mobileActions ? (
+                    <button
+                      type="button"
+                      class="controlled-nodes-remote-desktop"
+                      onClick={() => onOpenRemoteDesktop?.(m)}
+                    >
+                      {t('remote_desktop.open')}
+                    </button>
+                  ) : (
+                    <div class="controlled-nodes-rd-split">
+                      <button
+                        type="button"
+                        class="controlled-nodes-remote-desktop controlled-nodes-rd-main"
+                        onClick={() => onOpenRemoteDesktop?.(m)}
+                      >
+                        {t('remote_desktop.open')}
+                      </button>
+                      <button
+                        type="button"
+                        class="controlled-nodes-rd-window"
+                        aria-label={t('remote_desktop.open_new_window')}
+                        title={t('remote_desktop.open_new_window')}
+                        onClick={() => { openRemoteDesktopWindow(m.serverId); }}
+                      >↗</button>
+                    </div>
+                  )
                 ) : needsRemoteDesktopPermission(m) && (
                   // One grant away, not unsupported. Showing nothing here is
                   // what made a machine that needs a single click look like a
@@ -908,6 +933,11 @@ export function ControlledNodesPanel({
                       : t('remote_desktop.request_permission')}
                   </button>
                 )}
+                {!mobileActions && machineAccessRole(m) === 'owner'
+                  && !canInstallRemoteDesktopWorker(m)
+                  && !canOpenRemoteDesktopMachine(m)
+                  && !needsRemoteDesktopPermission(m)
+                  && <span class="controlled-nodes-action-slot" aria-hidden="true" />}
                 {mobileActions && machineAccessRole(m) === 'owner' ? (
                   <>
                     <button

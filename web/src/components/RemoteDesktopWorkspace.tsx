@@ -270,6 +270,9 @@ export function RemoteDesktopWorkspace({
         open={pickerOpen}
         onClose={closePicker}
         onSelect={selectHost}
+        onOpenInWindow={allowStandaloneWindow
+          ? (machine) => { openRemoteDesktopWindow(machine.serverId); }
+          : undefined}
         isSelectable={isPickable}
         disabledReason={pickDisabledReason}
         label={t('remote_desktop.workspace_picker')}
