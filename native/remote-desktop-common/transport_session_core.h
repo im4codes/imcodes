@@ -118,7 +118,8 @@ inline constexpr std::size_t kTransportMaximumIceCandidateBytes = 16 * 1024;
 inline constexpr std::int64_t kTransportMaximumLeaseFutureMs = 75'000;
 inline constexpr std::int64_t kTransportMaximumIdleTimeoutMs = 15 * 60 * 1000;
 inline constexpr std::int64_t kTransportMaximumMediaStallTimeoutMs = 60'000;
-inline constexpr std::uint32_t kTransportMaximumQualityTargetBps = 15'000'000;
+inline constexpr std::uint32_t kTransportMaximumQualityTargetBps =
+    imcodes::rd::kMaxViewerVideoBitrateBps;
 
 struct TransportSessionLimits {
   std::size_t maximum_remote_ice_candidates = kTransportMaximumIceCandidates;

@@ -453,6 +453,8 @@ bool TransportSessionCore::ApplyQualityTarget(const QualityTarget& target) {
       viewer_preference_.max_bitrate_bps, authority_.relay_bitrate_cap_bps,
       path_ == TransportPath::kDirect);
   QualitySelection selection = quality_ladder_.Select(effective);
+  selection.maximum_bitrate_bps =
+      imcodes::rd::ViewerVideoBitrateCeiling(viewer_preference_);
   if (!QualitySelectionIsValid(selection)) {
     Terminate(TransportTerminalReason::kProtocolViolation);
     return false;

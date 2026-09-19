@@ -93,6 +93,8 @@ class MacosPeerConnectionBackend {
   virtual bool EmitLocalIceCandidate(const common::IceCandidate& candidate) = 0;
   virtual bool SendDataChannel(common::DataChannelKind channel,
                                std::string_view payload) = 0;
+  // Bounds the estimator. `start_bps` 0 keeps the running estimate (only the
+  // viewer's ceiling changed).
   virtual bool ApplyBitrate(std::uint32_t min_bps,
                             std::uint32_t start_bps,
                             std::uint32_t max_bps) = 0;
@@ -225,6 +227,7 @@ class MacosTransportSessionAdapter final
   bool terminal_notified_ = false;
   bool negotiation_in_flight_ = false;
   bool bitrate_policy_applied_ = false;
+  std::uint32_t applied_bitrate_ceiling_bps_ = 0;
   std::uint32_t relay_bitrate_cap_bps_ = 0;
   std::uint64_t released_input_epoch_ = 0;
   std::uint64_t last_diagnostics_sequence_ = 0;

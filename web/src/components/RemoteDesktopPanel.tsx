@@ -129,6 +129,7 @@ const QUALITY_MODES: readonly RemoteDesktopQualityMode[] = [
   REMOTE_DESKTOP_QUALITY_MODE.SMOOTH,
   REMOTE_DESKTOP_QUALITY_MODE.BALANCED,
   REMOTE_DESKTOP_QUALITY_MODE.SHARP,
+  REMOTE_DESKTOP_QUALITY_MODE.ULTRA,
   REMOTE_DESKTOP_QUALITY_MODE.SAVER,
   REMOTE_DESKTOP_QUALITY_MODE.CUSTOM,
 ];
@@ -3085,7 +3086,9 @@ export function RemoteDesktopPanel({
                       >
                         {REMOTE_DESKTOP_QUALITY_MAX_HEIGHTS.map((height) => (
                           <option key={height} value={String(height)}>
-                            {height === 0 ? t('remote_desktop.quality_resolution_native') : `${height}p`}
+                            {height === 0
+                              ? t('remote_desktop.quality_resolution_native')
+                              : height === 2160 ? t('remote_desktop.quality_resolution_4k') : `${height}p`}
                           </option>
                         ))}
                       </select>
@@ -3529,7 +3532,11 @@ export function RemoteDesktopPanel({
             <div class="remote-desktop-stage-placeholder" role="status">
               {snapshot.state === REMOTE_DESKTOP_STATE.FAILED ? (
                 <>
-                  <span>{t('remote_desktop.failed', { reason: snapshot.error ?? snapshot.terminalReason ?? '' })}</span>
+                  <span>
+                    {snapshot.terminalReason === REMOTE_DESKTOP_TERMINAL_REASON.SESSION_LIMIT
+                      ? t('remote_desktop.session_in_use')
+                      : t('remote_desktop.failed', { reason: snapshot.error ?? snapshot.terminalReason ?? '' })}
+                  </span>
                   <button type="button" onClick={retryConnection}>
                     {t('remote_desktop.retry')}
                   </button>

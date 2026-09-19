@@ -474,6 +474,8 @@ class Worker {
       status["dataChannelsReady"] = diagnostics.required_channels_ready;
       // Honours set_quality_preference; the browser sends it only when true.
       status["qualityPreference"] = true;
+      // ...including Ultra: maxHeight 2160 and a raised bitrate ceiling.
+      status["qualityUltra"] = true;
       status["mediaStarted"] = diagnostics.last_outbound_video_bytes > 0;
       // The fourth fact the Server requires before it disarms
       // NEGOTIATION_TIMEOUT_MS and calls the session connected -- see

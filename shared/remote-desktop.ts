@@ -331,15 +331,19 @@ export const REMOTE_DESKTOP_QUALITY_PRIORITY = {
 export type RemoteDesktopQualityPriority =
   typeof REMOTE_DESKTOP_QUALITY_PRIORITY[keyof typeof REMOTE_DESKTOP_QUALITY_PRIORITY];
 
-/** Resolution ceilings a viewer may pick; 0 = native. */
-export const REMOTE_DESKTOP_QUALITY_MAX_HEIGHTS = [0, 720, 1080, 1440] as const;
+/** Resolution ceilings a viewer may pick; 0 = native, 2160 = 4K. */
+export const REMOTE_DESKTOP_QUALITY_MAX_HEIGHTS = [0, 720, 1080, 1440, 2160] as const;
 export const REMOTE_DESKTOP_QUALITY_MAX_FPS = [15, 30, 60] as const;
 
 /** Per-viewer quality preference sent with `set_quality_preference`. */
 export interface RemoteDesktopQualityPreference {
   maxHeight: typeof REMOTE_DESKTOP_QUALITY_MAX_HEIGHTS[number];
   maxFps: typeof REMOTE_DESKTOP_QUALITY_MAX_FPS[number];
-  /** 0 = no cap beyond the per-viewer ceiling. */
+  /**
+   * 0 = the default per-viewer ceiling (BITRATE_CAP.MAX_BPS). Above it the
+   * ceiling is RAISED, up to BITRATE_CAP.MAX_VIEWER_BPS (Ultra); only workers
+   * advertising `qualityUltra` accept that.
+   */
   maxBitrateBps: number;
   priority: RemoteDesktopQualityPriority;
 }
@@ -349,6 +353,8 @@ export const REMOTE_DESKTOP_QUALITY_MODE = {
   SMOOTH: 'smooth',
   BALANCED: 'balanced',
   SHARP: 'sharp',
+  /** 4K: 2160p with a raised bitrate ceiling. */
+  ULTRA: 'ultra',
   SAVER: 'saver',
   CUSTOM: 'custom',
 } as const;
@@ -364,13 +370,17 @@ export const REMOTE_DESKTOP_QUALITY_MODE_PREFERENCES: Readonly<Record<
   smooth: { maxHeight: 1080, maxFps: 30, maxBitrateBps: 0, priority: 'framerate' },
   balanced: { maxHeight: 1440, maxFps: 30, maxBitrateBps: 0, priority: 'balanced' },
   sharp: { maxHeight: 0, maxFps: 30, maxBitrateBps: 0, priority: 'resolution' },
+  ultra: { maxHeight: 2160, maxFps: 30, maxBitrateBps: 30_000_000, priority: 'resolution' },
   saver: { maxHeight: 720, maxFps: 15, maxBitrateBps: 1_800_000, priority: 'balanced' },
 });
 
 /** Bounds for a viewer-chosen bitrate cap (matches the native ladder). */
 export const REMOTE_DESKTOP_QUALITY_BITRATE_CAP = {
   MIN_BPS: 350_000,
+  /** The default per-viewer ceiling (kPerPeerVideoBitrateBps); relay caps stay within it. */
   MAX_BPS: 15_000_000,
+  /** The most a viewer may raise its own stream to (kMaxViewerVideoBitrateBps). */
+  MAX_VIEWER_BPS: 30_000_000,
 } as const;
 
 export const REMOTE_DESKTOP_ENCODER_CLASS = {
@@ -481,7 +491,8 @@ export const REMOTE_DESKTOP_LIMITS = {
   MAX_POINTER_EVENTS_PER_SECOND: 240,
   MAX_KEYBOARD_EVENTS_PER_SECOND: 120,
   MAX_MONITOR_CHANGES_PER_MINUTE: 30,
-  MAX_VIDEO_BITRATE_BPS: 15_000_000,
+  /** One viewer's stream at most (an Ultra viewer's raised ceiling). */
+  MAX_VIDEO_BITRATE_BPS: 30_000_000,
   MAX_AGGREGATE_VIDEO_BITRATE_BPS: 60_000_000,
   MAX_DISTINCT_CAPTURE_SOURCES: 4,
   MAX_GPU_CAPTURE_SURFACES: 4,
@@ -702,6 +713,8 @@ export interface RemoteDesktopStatus {
   atomicButtonClick?: boolean;
   /** This worker honours `set_quality_preference`; never send it otherwise. */
   qualityPreference?: boolean;
+  /** ...including maxHeight 2160 and a raised bitrate ceiling (Ultra). */
+  qualityUltra?: boolean;
   viewerCount?: number;
   controllerCount?: number;
   /**
@@ -1131,12 +1144,13 @@ export function validateRemoteDesktopDaemonMessage(value: unknown): RemoteDeskto
       : invalid();
   }
   if (value.type === REMOTE_DESKTOP_MSG.STATUS) {
-    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'mode', 'inputEpoch', 'state', 'inputEnabled'], ['route', 'selectedDisplayId', 'layoutRevision', 'viewerCount', 'controllerCount', 'signInScreen', 'unlockAvailable', 'autoUnlockSucceeded', 'inputBlocked', 'atomicButtonClick', 'qualityPreference', 'peerConnected', 'dataChannelsReady', 'mediaStarted', 'firstFramePresented'])
+    if (!hasExactKeys(value, ['type', 'requestId', 'sessionId', 'capability', 'mode', 'inputEpoch', 'state', 'inputEnabled'], ['route', 'selectedDisplayId', 'layoutRevision', 'viewerCount', 'controllerCount', 'signInScreen', 'unlockAvailable', 'autoUnlockSucceeded', 'inputBlocked', 'atomicButtonClick', 'qualityPreference', 'qualityUltra', 'peerConnected', 'dataChannelsReady', 'mediaStarted', 'firstFramePresented'])
       || (value.signInScreen !== undefined && typeof value.signInScreen !== 'boolean')
       || (value.autoUnlockSucceeded !== undefined && value.autoUnlockSucceeded !== true)
       || (value.unlockAvailable !== undefined && typeof value.unlockAvailable !== 'boolean')
       || (value.atomicButtonClick !== undefined && typeof value.atomicButtonClick !== 'boolean')
       || (value.qualityPreference !== undefined && typeof value.qualityPreference !== 'boolean')
+      || (value.qualityUltra !== undefined && typeof value.qualityUltra !== 'boolean')
       || (value.peerConnected !== undefined && typeof value.peerConnected !== 'boolean')
       || (value.dataChannelsReady !== undefined && typeof value.dataChannelsReady !== 'boolean')
       || (value.mediaStarted !== undefined && typeof value.mediaStarted !== 'boolean')
@@ -1339,9 +1353,26 @@ export function isRemoteDesktopQualityPreference(value: unknown): value is Remot
     && typeof value.maxBitrateBps === 'number' && Number.isSafeInteger(value.maxBitrateBps)
     && (value.maxBitrateBps === 0 || (
       value.maxBitrateBps >= REMOTE_DESKTOP_QUALITY_BITRATE_CAP.MIN_BPS
-      && value.maxBitrateBps <= REMOTE_DESKTOP_QUALITY_BITRATE_CAP.MAX_BPS))
+      && value.maxBitrateBps <= REMOTE_DESKTOP_QUALITY_BITRATE_CAP.MAX_VIEWER_BPS))
     && typeof value.priority === 'string'
     && (Object.values(REMOTE_DESKTOP_QUALITY_PRIORITY) as string[]).includes(value.priority);
+}
+
+/**
+ * The same preference for a worker that does not advertise `qualityUltra`,
+ * which refuses 2160 and a raised ceiling. Its ladder tops out at 2160, so
+ * native picks the same rungs; the bitrate falls back to its default ceiling.
+ */
+export function legacyRemoteDesktopQualityPreference(
+  preference: RemoteDesktopQualityPreference,
+): RemoteDesktopQualityPreference {
+  return {
+    ...preference,
+    maxHeight: preference.maxHeight === 2160 ? 0 : preference.maxHeight,
+    maxBitrateBps: preference.maxBitrateBps > REMOTE_DESKTOP_QUALITY_BITRATE_CAP.MAX_BPS
+      ? 0
+      : preference.maxBitrateBps,
+  };
 }
 
 function validateClipboard(value: Record<string, unknown>): boolean {

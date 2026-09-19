@@ -18,6 +18,7 @@ source_set("remote_desktop_common") {
     "transport_session_core.h",
     "value_types.cc",
     "value_types.h",
+    "video_sender_bitrate.h",
   ]
 
   public = [
@@ -32,6 +33,7 @@ source_set("remote_desktop_common") {
     "signaling_types.h",
     "transport_session_core.h",
     "value_types.h",
+    "video_sender_bitrate.h",
   ]
 
   # json_protocol.h exposes Json::Value in the preserved Windows v2 API, so

@@ -1485,6 +1485,8 @@ bool WorkerTransportSink::EmitStatus() {
   root["atomicButtonClick"] = true;
   // Honours set_quality_preference; the browser sends it only when true.
   root["qualityPreference"] = true;
+  // ...including Ultra: maxHeight 2160 and a raised bitrate ceiling.
+  root["qualityUltra"] = true;
   root["viewerCount"] = 1;
   root["controllerCount"] =
       session_->state() == rd::common::SessionState::kControlling ? 1 : 0;
@@ -1984,6 +1986,12 @@ class SessionSeamAdapter final : public macos::HostCommandSessionSeam {
     if (emitter_ != nullptr)
       emitter_->ClearAuthority();
     return true;
+  }
+
+  bool ServesOtherRoute(
+      const imcodes::rd::Authority& authority) const override {
+    return active_ && (authority.request_id != authority_.request_id ||
+                       authority.session_id != authority_.session_id);
   }
 
  private:

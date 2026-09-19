@@ -480,11 +480,15 @@ describe('remote desktop production contract', () => {
       priority: 'framerate',
     };
     expect(validateRemoteDesktopDataMessage(request)).toMatchObject({ ok: true });
+    // Ultra: 4K and a ceiling raised above the default 15 Mbps.
+    expect(validateRemoteDesktopDataMessage({ ...request, maxHeight: 2160, maxBitrateBps: 30_000_000 }))
+      .toMatchObject({ ok: true });
     for (const bad of [
       { maxHeight: 900 },
       { maxFps: 45 },
       { maxBitrateBps: 100_000 },
-      { maxBitrateBps: 20_000_000 },
+      { maxBitrateBps: 31_000_000 },
+      { maxHeight: 2880 },
       { priority: 'fastest' },
       { displayId: 'display-primary' },
     ]) {

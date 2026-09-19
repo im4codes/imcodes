@@ -249,6 +249,10 @@ class PeerSession final : public webrtc::PeerConnectionObserver,
   bool layout_acknowledged_ = false;
   std::atomic<bool> closed_{false};
   std::optional<bool> direct_bitrate_policy_;
+  // ViewerVideoBitrateCeiling of this viewer's preference, and what the
+  // estimator was last bounded by.
+  uint32_t viewer_bitrate_ceiling_bps_ = kPerPeerVideoBitrateBps;
+  uint32_t applied_bitrate_ceiling_bps_ = 0;
   class WindowsQualityLadder final : public common::QualityLadder {
    public:
     common::QualitySelection Select(

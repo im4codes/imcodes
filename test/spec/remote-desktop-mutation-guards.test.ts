@@ -5,6 +5,8 @@ import { describe, expect, it } from 'vitest';
 const ROOT = resolve(__dirname, '..', '..');
 
 const SOURCE_PATHS = [
+  'native/macos-remote-desktop/pinned_libwebrtc_transport_backend.cc',
+  'native/linux-remote-desktop/linux_remote_desktop_session.cc',
   'shared/remote-desktop.ts',
   'server/src/ws/remote-desktop-router.ts',
   'server/src/routes/machines.ts',
@@ -697,7 +699,16 @@ const contracts: Contract[] = [
       },
       {
         path: 'native/windows-remote-desktop/peer_session.cc',
-        needle: 'encoding.max_bitrate_bps = static_cast<int>(kPerPeerVideoBitrateBps)',
+        needle: 'encoding.max_bitrate_bps = static_cast<int>(kMaxViewerVideoBitrateBps)',
+      },
+      {
+        // Unset, libwebrtc caps the whole stream at 2.5 Mbps.
+        path: 'native/macos-remote-desktop/pinned_libwebrtc_transport_backend.cc',
+        needle: 'imcodes::rd::ApplyVideoSenderBitrateLimits(',
+      },
+      {
+        path: 'native/linux-remote-desktop/linux_remote_desktop_session.cc',
+        needle: 'imcodes::rd::ApplyVideoSenderBitrateLimits(',
       },
       {
         path: 'native/windows-remote-desktop/peer_session.cc',
@@ -1446,7 +1457,7 @@ const mutations: Mutation[] = [
     name: 'remove upstream desktop bitrate allocation',
     contract: 'upstream WebRTC desktop quality allocation',
     path: 'native/windows-remote-desktop/peer_session.cc',
-    needle: 'encoding.max_bitrate_bps = static_cast<int>(kPerPeerVideoBitrateBps)',
+    needle: 'encoding.max_bitrate_bps = static_cast<int>(kMaxViewerVideoBitrateBps)',
   },
   {
     name: 'remove native video element',
