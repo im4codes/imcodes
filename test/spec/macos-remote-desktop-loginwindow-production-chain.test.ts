@@ -191,7 +191,7 @@ describe('macOS LoginWindow production chain', () => {
     const auth = run.indexOf('ReadAuthenticationFrame');
     const identity = run.indexOf('MacosSessionIdentityMatches');
     const composition = run.indexOf('ComposeSessionCapture');
-    const session = run.indexOf('auto session =');
+    const session = run.indexOf('route->session =');
     const attestor = run.indexOf('ReadinessAttestor readiness_attestor');
     expect(auth).toBeGreaterThanOrEqual(0);
     expect(identity).toBeGreaterThan(auth);

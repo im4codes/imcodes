@@ -13,6 +13,14 @@ HostCommandResult EmissionFailure() {
   return {HostCommandDisposition::kTerminate, kDiagMessageEmissionFailed};
 }
 
+// The worker ends with its last route; while other viewers remain it serves
+// them.
+HostCommandDisposition AfterRouteEnded(const HostCommandSessionSeam* session) {
+  return session != nullptr && session->live_routes() > 0
+             ? HostCommandDisposition::kContinue
+             : HostCommandDisposition::kTerminate;
+}
+
 HostCommandResult Rejected(const rd::Authority& authority,
                            std::string_view terminal_reason,
                            HostCommandSessionSeam* session,
@@ -21,7 +29,7 @@ HostCommandResult Rejected(const rd::Authority& authority,
   if (sink == nullptr || !sink->EmitTerminal(authority, terminal_reason)) {
     return EmissionFailure();
   }
-  return {HostCommandDisposition::kTerminate, kDiagCommandRejected};
+  return {AfterRouteEnded(session), kDiagCommandRejected};
 }
 
 }  // namespace
@@ -38,27 +46,32 @@ HostCommandResult DispatchHostCommand(
     return {HostCommandDisposition::kTerminate, kDiagMalformedCommand};
   }
 
-  // One route per worker. A second viewer's PREPARE is refused for that
-  // viewer alone, and its later OFFER/ICE/LEASE/STOP are dropped: answering
-  // any of them by ending the worker took the live viewer down with it, so
-  // two windows on one Mac both disconnected.
-  if (session->ServesOtherRoute(signal.authority)) {
-    if (signal.kind == rd::Signal::Kind::kPrepare &&
-        !sink->EmitTerminal(signal.authority, kTerminalSessionLimit)) {
-      return EmissionFailure();
+  // Several viewers share this worker. A command for a route it does not
+  // serve -- a late one for a route that already ended -- is dropped while
+  // other routes live: answering it by ending the worker would take every
+  // other viewer down with it. A new viewer's PREPARE opens a route, up to
+  // the cap every worker shares.
+  if (!session->Serves(signal.authority) && session->live_routes() > 0) {
+    if (signal.kind != rd::Signal::Kind::kPrepare) {
+      return {HostCommandDisposition::kContinue, kDiagCommandRejected};
     }
-    return {HostCommandDisposition::kContinue, kDiagCommandRejected};
+    if (session->live_routes() >= session->max_routes()) {
+      if (!sink->EmitTerminal(signal.authority, kTerminalSessionLimit)) {
+        return EmissionFailure();
+      }
+      return {HostCommandDisposition::kContinue, kDiagCommandRejected};
+    }
   }
 
   if (signal.kind == rd::Signal::Kind::kStop) {
     if (!session->Stop(signal.authority)) {
-      return {HostCommandDisposition::kTerminate, kDiagCommandRejected};
+      return {AfterRouteEnded(session), kDiagCommandRejected};
     }
     if (!sink->EmitTerminal(signal.authority,
                             kTerminalStoppedByController)) {
       return EmissionFailure();
     }
-    return {HostCommandDisposition::kTerminate, {}};
+    return {AfterRouteEnded(session), {}};
   }
 
   // Every remaining command either creates or mutates a live route. The

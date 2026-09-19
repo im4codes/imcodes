@@ -151,9 +151,17 @@ class ImcodesVideoTrackSource : public webrtc::VideoTrackSourceInterface {
   explicit ImcodesVideoTrackSource(MacosMediaSenderBinder* binder)
       : binder_(binder), pump_([this] { Pump(); }) {}
 
-  ~ImcodesVideoTrackSource() override {
+  ~ImcodesVideoTrackSource() override { StopPump(); }
+
+  // The pump reads the session's binder. The transport stops it when it
+  // closes -- while the binder still exists -- rather than leaving it to
+  // whenever libwebrtc drops its last reference to this source: a route that
+  // ended while other viewers stayed on the worker had its binder freed under
+  // a still-running pump (SIGABRT in configured_pixels).
+  void StopPump() noexcept {
     stop_.store(true);
-    if (pump_.joinable()) pump_.join();
+    if (pump_.joinable() && pump_.get_id() != std::this_thread::get_id())
+      pump_.join();
   }
 
   void AddOrUpdateSink(webrtc::VideoSinkInterface<webrtc::VideoFrame>* sink,
@@ -624,6 +632,7 @@ class PinnedLibwebrtcTransportBackend final
     // produce the EncodedImageCallback. Without AddTrack the passthrough
     // encoder is never created and the binder never binds.
     auto source = webrtc::make_ref_counted<ImcodesVideoTrackSource>(media_binder_);
+    video_source_ = source;
     video_track_ = factory_->CreateVideoTrack(source, "imcodes-screen");
     if (video_track_ == nullptr) {
       CloseLocked();
@@ -895,6 +904,7 @@ class PinnedLibwebrtcTransportBackend final
   struct ClosedResources {
     std::vector<ChannelEntry> channels;
     webrtc::scoped_refptr<webrtc::VideoTrackInterface> video_track;
+    webrtc::scoped_refptr<ImcodesVideoTrackSource> video_source;
     webrtc::scoped_refptr<webrtc::PeerConnectionInterface> peer;
     webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory;
     std::unique_ptr<webrtc::Thread> signaling_thread;
@@ -908,6 +918,9 @@ class PinnedLibwebrtcTransportBackend final
         entry.handle = nullptr;
       }
       channels.clear();
+      if (video_source != nullptr)
+        video_source->StopPump();
+      video_source = nullptr;
       video_track = nullptr;
       if (peer != nullptr) {
         peer->Close();
@@ -926,6 +939,7 @@ class PinnedLibwebrtcTransportBackend final
     closed.channels = std::move(channels_);
     channels_.clear();
     closed.video_track = std::move(video_track_);
+    closed.video_source = std::move(video_source_);
     closed.peer = std::move(peer_);
     closed.factory = std::move(factory_);
     closed.signaling_thread = std::move(signaling_thread_);
@@ -949,6 +963,9 @@ class PinnedLibwebrtcTransportBackend final
       entry.handle = nullptr;
     }
     channels_.clear();
+    if (video_source_ != nullptr)
+      video_source_->StopPump();
+    video_source_ = nullptr;
     video_track_ = nullptr;
     if (peer_ != nullptr) {
       peer_->Close();
@@ -972,6 +989,7 @@ class PinnedLibwebrtcTransportBackend final
   MacosMediaSenderBinder* media_binder_ = nullptr;
   std::shared_ptr<NegotiationState> negotiation_;
   webrtc::scoped_refptr<webrtc::VideoTrackInterface> video_track_;
+  webrtc::scoped_refptr<ImcodesVideoTrackSource> video_source_;
   std::mutex mutex_;
   std::unique_ptr<webrtc::Thread> signaling_thread_;
   webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory_;

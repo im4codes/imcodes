@@ -1,6 +1,7 @@
 #ifndef IMCODES_MACOS_REMOTE_DESKTOP_HOST_COMMAND_DISPATCH_H_
 #define IMCODES_MACOS_REMOTE_DESKTOP_HOST_COMMAND_DISPATCH_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -45,11 +46,13 @@ class HostCommandSessionSeam {
                        std::int64_t now_unix_ms,
                        std::int64_t now_monotonic_ms) = 0;
   virtual bool Stop(const rd::Authority& authority) = 0;
-  // True while this worker serves a live route and `authority` is a
-  // different one. A worker serves one route; another viewer's commands must
-  // not end it.
-  [[nodiscard]] virtual bool ServesOtherRoute(
-      const rd::Authority& authority) const = 0;
+
+  // A worker serves several routes (one per viewer), as Windows does. Every
+  // command above addresses the route its authority names; a PREPARE for a
+  // session this worker does not serve yet opens a new one.
+  [[nodiscard]] virtual bool Serves(const rd::Authority& authority) const = 0;
+  [[nodiscard]] virtual std::size_t live_routes() const = 0;
+  [[nodiscard]] virtual std::size_t max_routes() const = 0;
 };
 
 /** Route admission owned by the separate signed disclosure component. */
