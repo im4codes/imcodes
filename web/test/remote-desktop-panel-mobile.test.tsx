@@ -1568,6 +1568,9 @@ describe('RemoteDesktopPanel mobile gestures', () => {
         visualViewport.dispatchEvent(new Event('resize'));
       });
       expect(panel().style.height).toBe('calc(100% - 300px)');
+      // The remote-desktop workspace lays the panel out as a `flex: 1` item,
+      // which ignores `height`; only a max-height actually shortens it there.
+      expect(panel().style.maxHeight).toBe('calc(100% - 300px)');
       expect(keyboard().style.position).toBe('');
 
       act(() => {
@@ -1575,6 +1578,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
         visualViewport.dispatchEvent(new Event('resize'));
       });
       expect(panel().style.height).toBe('');
+      expect(panel().style.maxHeight).toBe('');
     } finally {
       if (originalVisualViewport) Object.defineProperty(window, 'visualViewport', originalVisualViewport);
       else delete (window as Window & { visualViewport?: VisualViewport }).visualViewport;
@@ -1709,7 +1713,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       pointer(pages, 'pointermove', { pointerId: 9, clientX: 150, clientY: 200 });
       pointer(pages, 'pointerup', { pointerId: 9, clientX: 150, clientY: 200 });
     });
-    expect(track.style.transform).toContain('translateX(calc(-50%');
+    expect(track.style.transform).toContain('translateX(calc(-33.33');
 
     key.mockClear();
     act(() => { keyButton('q').click(); });
@@ -1720,9 +1724,45 @@ describe('RemoteDesktopPanel mobile gestures', () => {
 
     // A tap on the first dot swipes back to page one.
     const dots = container.querySelectorAll<HTMLButtonElement>('.remote-desktop-computer-keyboard-dots button');
-    expect(dots).toHaveLength(2);
+    expect(dots).toHaveLength(3);
     act(() => { dots[0].click(); });
     expect(track.style.transform).toContain('translateX(calc(0%');
+  });
+
+  it('has a special-characters page whose keys send Shift plus the key, so every printable character is reachable', async () => {
+    const { container, getByRole } = await renderPanel();
+    act(() => { (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });
+    act(() => { (getByRole('tab', { name: 'remote_desktop.mobile_keyboard_tab_keys' }) as HTMLButtonElement).click(); });
+    const dots = container.querySelectorAll<HTMLButtonElement>('.remote-desktop-computer-keyboard-dots button');
+    expect(dots).toHaveLength(3);
+    act(() => { dots[2]!.click(); });
+    const track = container.querySelector('.remote-desktop-computer-keyboard-track') as HTMLElement;
+    expect(track.style.transform).toContain('translateX(calc(-66.66');
+
+    const pageThree = container.querySelectorAll('.remote-desktop-computer-keyboard-page')[2] as HTMLElement;
+    const glyphs = [...pageThree.querySelectorAll('button')].map((button) => button.textContent);
+    for (const glyph of '!@#$%^&*()_+{}|:"<>?~`'.split('')) expect(glyphs).toContain(glyph);
+    const keyButton = (glyph: string) => [...pageThree.querySelectorAll('button')]
+      .find((button) => button.textContent === glyph) as HTMLButtonElement;
+
+    key.mockClear();
+    act(() => keyButton('@').click());
+    expect(key.mock.calls.map((call) => {
+      const [code, value, down] = call as unknown as [string, string, boolean];
+      return `${down ? 'down' : 'up'}:${code}:${value}`;
+    })).toEqual(['down:ShiftLeft:Shift', 'down:Digit2:@', 'up:Digit2:@', 'up:ShiftLeft:Shift']);
+
+    // The backtick on this page is the bare key, not a shifted one.
+    key.mockClear();
+    act(() => keyButton('`').click());
+    expect(key.mock.calls.map((call) => (call as unknown as [string, string, boolean]).slice(0, 3).join(':')))
+      .toEqual(['Backquote:`:true', 'Backquote:`:false']);
+
+    // ...and its shifted neighbour is the tilde on the same physical key.
+    key.mockClear();
+    act(() => keyButton('~').click());
+    expect(key.mock.calls.map((call) => (call as unknown as [string, string, boolean]).slice(0, 3).join(':')))
+      .toEqual(['ShiftLeft:Shift:true', 'Backquote:~:true', 'Backquote:~:false', 'ShiftLeft:Shift:false']);
   });
 
   it('does not flip pages on a drag that never crosses the commit threshold', async () => {

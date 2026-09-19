@@ -16,8 +16,11 @@ import {
   sendRemoteDesktopChord,
   splitRemoteDesktopMobileTextEnter,
   REMOTE_DESKTOP_COMPUTER_CASE_KEY,
+  REMOTE_DESKTOP_COMPUTER_KEYBOARD_PAGES,
   REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS_PAGE2,
+  REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS_PAGE3,
   isRemoteDesktopComputerLetterKey,
+  remoteDesktopComputerKeyChord,
   isRemoteDesktopMobileLineBreak,
   remoteDesktopComputerCapitalChord,
   remoteDesktopComputerKeyLabel,
@@ -478,6 +481,37 @@ describe('computer keyboard case key', () => {
   it('sends a capital as Shift plus the letter', () => {
     const q = REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS_PAGE2.flat().find((spec) => spec.code === 'KeyQ')!;
     expect(remoteDesktopComputerCapitalChord(q)).toEqual([
+      { code: 'ShiftLeft', key: 'Shift' },
+      { code: 'KeyQ', key: 'Q' },
+    ]);
+  });
+});
+
+describe('computer keyboard special-characters page', () => {
+  const symbols = REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS_PAGE3.flat();
+
+  it('is the last page and carries every shifted symbol on the number and punctuation keys', () => {
+    const pages = REMOTE_DESKTOP_COMPUTER_KEYBOARD_PAGES;
+    expect(pages[pages.length - 1]).toBe(REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS_PAGE3);
+    const glyphs = symbols.map((spec) => remoteDesktopComputerKeyLabel(spec, 'windows'));
+    for (const glyph of '!@#$%^&*()_+{}|:"<>?~`'.split('')) expect(glyphs).toContain(glyph);
+    // Every symbol names a distinct physical key + shift state, so none can shadow another.
+    expect(new Set(symbols.map((spec) => `${spec.code}:${spec.shifted ? 1 : 0}`)).size).toBe(symbols.length);
+  });
+
+  it('sends a special character as Shift plus its key, and everything else as before', () => {
+    const at = symbols.find((spec) => spec.key === '@')!;
+    expect(remoteDesktopComputerKeyChord(at)).toEqual([
+      { code: 'ShiftLeft', key: 'Shift' },
+      { code: 'Digit2', key: '@' },
+    ]);
+    // The capitals toggle is about letters only; it never turns a symbol into something else.
+    expect(remoteDesktopComputerKeyChord(at, true)).toEqual(remoteDesktopComputerKeyChord(at));
+    const backtick = symbols.find((spec) => spec.code === 'Backquote' && !spec.shifted)!;
+    expect(remoteDesktopComputerKeyChord(backtick)).toEqual([{ code: 'Backquote', key: '`' }]);
+    const q = REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS_PAGE2.flat().find((spec) => spec.code === 'KeyQ')!;
+    expect(remoteDesktopComputerKeyChord(q)).toEqual([{ code: 'KeyQ', key: 'q' }]);
+    expect(remoteDesktopComputerKeyChord(q, true)).toEqual([
       { code: 'ShiftLeft', key: 'Shift' },
       { code: 'KeyQ', key: 'Q' },
     ]);

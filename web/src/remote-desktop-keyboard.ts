@@ -503,10 +503,19 @@ export interface RemoteDesktopComputerKeySpec {
   code: string;
   key: string;
   modifier: boolean;
+  /**
+   * The key's value needs Shift held: `key` is the shifted glyph (`!`, `@`,
+   * `{`...) and `code` is the physical key it sits on. Tapping it sends Shift
+   * plus that key -- what a real keyboard sends -- rather than the bare key.
+   */
+  shifted?: boolean;
+  /** What the cap reads when that differs from what the key is called elsewhere. */
+  label?: string;
 }
 
 const modKey = (code: string, key: string): RemoteDesktopComputerKeySpec => ({ code, key, modifier: true });
 const plainKey = (code: string, key: string): RemoteDesktopComputerKeySpec => ({ code, key, modifier: false });
+const shiftedKey = (code: string, key: string): RemoteDesktopComputerKeySpec => ({ code, key, modifier: false, shifted: true });
 
 /**
  * Row-major layout for the on-screen computer keyboard: modifiers, then
@@ -555,6 +564,28 @@ export function isRemoteDesktopComputerLetterKey(spec: RemoteDesktopComputerKeyS
   return /^Key[A-Z]$/.test(spec.code);
 }
 
+/** A special-character key: Shift held, and the glyph itself as the value. */
+export function remoteDesktopComputerShiftedChord(
+  spec: RemoteDesktopComputerKeySpec,
+): readonly RemoteDesktopChordKey[] {
+  return [{ code: 'ShiftLeft', key: 'Shift' }, { code: spec.code, key: spec.key }];
+}
+
+/**
+ * What one tap on a computer-keyboard key sends: Shift plus the key for a
+ * special character, Shift plus the capital for a letter while the letters
+ * page is on capitals, otherwise the bare key. The chord is the same whether
+ * it fires alone or as the last step of a combo.
+ */
+export function remoteDesktopComputerKeyChord(
+  spec: RemoteDesktopComputerKeySpec,
+  capital = false,
+): readonly RemoteDesktopChordKey[] {
+  if (spec.shifted) return remoteDesktopComputerShiftedChord(spec);
+  if (capital && isRemoteDesktopComputerLetterKey(spec)) return remoteDesktopComputerCapitalChord(spec);
+  return [{ code: spec.code, key: spec.key }];
+}
+
 /** The letter key as a capital: Shift held, and the capital as its value. */
 export function remoteDesktopComputerCapitalChord(
   spec: RemoteDesktopComputerKeySpec,
@@ -584,10 +615,40 @@ export const REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS_PAGE2: readonly (readonly Rem
   [REMOTE_DESKTOP_COMPUTER_CASE_KEY, ...BOTTOM_ROW_LETTERS.split('').map(letterKey), plainKey('Space', ' '), plainKey('Enter', 'Enter')],
 ];
 
+/**
+ * Third computer-keyboard page: the special characters. Every symbol that
+ * sits on a number or punctuation key behind Shift, plus the backtick, so
+ * nothing printable is out of reach of this keyboard -- the IME tab would
+ * need the operator to hunt through the phone's own symbol pages for them,
+ * and the letters page only carries the unshifted punctuation. Space,
+ * Backspace and Return ride along so a whole string of symbols can be typed
+ * without swiping back.
+ */
+export const REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS_PAGE3: readonly (readonly RemoteDesktopComputerKeySpec[])[] = [
+  [
+    shiftedKey('Digit1', '!'), shiftedKey('Digit2', '@'), shiftedKey('Digit3', '#'),
+    shiftedKey('Digit4', '$'), shiftedKey('Digit5', '%'), shiftedKey('Digit6', '^'),
+    shiftedKey('Digit7', '&'), shiftedKey('Digit8', '*'), shiftedKey('Digit9', '('),
+    shiftedKey('Digit0', ')'),
+  ],
+  [
+    shiftedKey('Minus', '_'), shiftedKey('Equal', '+'),
+    shiftedKey('BracketLeft', '{'), shiftedKey('BracketRight', '}'),
+    shiftedKey('Backslash', '|'),
+    shiftedKey('Semicolon', ':'), shiftedKey('Quote', '"'),
+    shiftedKey('Comma', '<'), shiftedKey('Period', '>'), shiftedKey('Slash', '?'),
+  ],
+  [
+    shiftedKey('Backquote', '~'), { ...plainKey('Backquote', '`'), label: '`' },
+    plainKey('Space', ' '), plainKey('Backspace', 'Backspace'), plainKey('Enter', 'Enter'),
+  ],
+];
+
 /** Every computer-keyboard page, in swipe order. */
 export const REMOTE_DESKTOP_COMPUTER_KEYBOARD_PAGES: readonly (readonly (readonly RemoteDesktopComputerKeySpec[])[])[] = [
   REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS,
   REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS_PAGE2,
+  REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS_PAGE3,
 ];
 
 const LETTER_KEY_LABELS: Record<string, string> = Object.fromEntries(
@@ -631,6 +692,9 @@ export function remoteDesktopComputerKeyLabel(
   capitals = false,
 ): string {
   if (spec.code === REMOTE_DESKTOP_COMPUTER_CASE_KEY.code) return '⇧';
+  // A special character reads as the glyph it types, not the key it sits on.
+  if (spec.label !== undefined) return spec.label;
+  if (spec.shifted) return spec.key;
   if (isRemoteDesktopComputerLetterKey(spec)) return capitals ? spec.key.toUpperCase() : spec.key.toLowerCase();
   const macTarget = targetPlatform === 'macos';
   if (spec.code === 'AltLeft') return macTarget ? 'Option' : 'Alt';

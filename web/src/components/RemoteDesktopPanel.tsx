@@ -50,8 +50,7 @@ import {
 import {
   REMOTE_DESKTOP_COMPUTER_CASE_KEY,
   REMOTE_DESKTOP_COMPUTER_KEYBOARD_PAGES,
-  isRemoteDesktopComputerLetterKey,
-  remoteDesktopComputerCapitalChord,
+  remoteDesktopComputerKeyChord,
   detectRemoteDesktopClipboardShortcut,
   focusRemoteDesktopMobileInput,
   isAppleControllerPlatform,
@@ -2451,20 +2450,33 @@ export function RemoteDesktopPanel({
   // Re-measure whenever the panel is open: the OS keyboard can come and go
   // (switching tabs, or the textarea losing/regaining focus) without the
   // panel itself closing.
+  //
+  // What matters is how far the panel's own container reaches below the part
+  // of the page the person can actually see, not how the window happens to
+  // report its height. iOS and Android leave the layout viewport alone and
+  // shrink only the visual one, while some webviews resize both -- measuring
+  // the container against the visual viewport's bottom edge is right in every
+  // case, and comes out as 0 when the page already resized itself.
   useEffect(() => {
     if (!mobileTextOpen || typeof window === 'undefined' || !window.visualViewport) return;
     const viewport = window.visualViewport;
     const recompute = () => {
+      const rect = panelRef.current?.parentElement?.getBoundingClientRect();
+      // No laid-out container to measure (or nothing rendered yet): fall back
+      // to the window, which is what an unmeasurable panel fills anyway.
+      const bottomEdge = rect && rect.height > 0 ? rect.bottom : window.innerHeight;
       setMobileKeyboardViewportInset(Math.max(0, Math.round(
-        window.innerHeight - (viewport.height + viewport.offsetTop),
+        bottomEdge - (viewport.height + viewport.offsetTop),
       )));
     };
     recompute();
     viewport.addEventListener('resize', recompute);
     viewport.addEventListener('scroll', recompute);
+    window.addEventListener('resize', recompute);
     return () => {
       viewport.removeEventListener('resize', recompute);
       viewport.removeEventListener('scroll', recompute);
+      window.removeEventListener('resize', recompute);
       setMobileKeyboardViewportInset(0);
     };
   }, [mobileTextOpen]);
@@ -2519,8 +2531,9 @@ export function RemoteDesktopPanel({
     }
     const client = clientRef.current;
     if (!client || !snapshot.inputEnabled) return;
-    // A capital is Shift plus the letter, exactly as a real keyboard sends it.
-    const capital = computerKeyboardCapitals && isRemoteDesktopComputerLetterKey(spec);
+    // A capital letter or a special character is Shift plus the key, exactly
+    // as a real keyboard sends it.
+    const chord = remoteDesktopComputerKeyChord(spec, computerKeyboardCapitals);
     if (comboMode && spec.modifier) {
       const isHeld = heldComboKeys.some((k) => k.code === spec.code);
       if (isHeld) {
@@ -2536,12 +2549,12 @@ export function RemoteDesktopPanel({
     }
     if (comboMode && heldComboKeys.length > 0) {
       const flags = comboModifierFlags(heldComboKeys);
-      if (capital) {
-        const [shift, letter] = remoteDesktopComputerCapitalChord(spec);
+      if (chord.length === 2) {
+        const [shift, target] = chord;
         const shifted = { ...flags, shift: true };
         client.key(shift!.code, shift!.key, true, false, shifted);
-        client.key(letter!.code, letter!.key, true, false, shifted);
-        client.key(letter!.code, letter!.key, false, false, shifted);
+        client.key(target!.code, target!.key, true, false, shifted);
+        client.key(target!.code, target!.key, false, false, shifted);
         client.key(shift!.code, shift!.key, false, false, flags);
       } else {
         client.key(spec.code, spec.key, true, false, flags);
@@ -2551,7 +2564,7 @@ export function RemoteDesktopPanel({
       return;
     }
     sendRemoteDesktopChord(
-      capital ? remoteDesktopComputerCapitalChord(spec) : [{ code: spec.code, key: spec.key }],
+      chord,
       (code, keyName, down, repeat, modifiers) => client.key(code, keyName, down, repeat, modifiers),
       () => client.releaseAll(),
     );
@@ -2761,8 +2774,14 @@ export function RemoteDesktopPanel({
         // (iOS): end the panel at the keyboard's top edge, so the remote
         // screen is pushed up above it -- re-fitted into what stays visible --
         // instead of being covered.
+        // `max-height` as well as `height`: inside the remote-desktop workspace
+        // the panel is a `flex: 1` item, whose height is decided by the flex
+        // algorithm and ignores `height` -- only a max-height clamps it.
         style={mobileKeyboardViewportInset > 0
-          ? { height: `calc(100% - ${mobileKeyboardViewportInset}px)` }
+          ? {
+            height: `calc(100% - ${mobileKeyboardViewportInset}px)`,
+            maxHeight: `calc(100% - ${mobileKeyboardViewportInset}px)`,
+          }
           : undefined}
       >
         <div class="remote-desktop-toolbar">
@@ -3442,7 +3461,7 @@ export function RemoteDesktopPanel({
                                 : heldComboKeys.some((k) => k.code === spec.code);
                               return (
                                 <button
-                                  key={spec.code}
+                                  key={`${spec.code}${spec.shifted ? '+shift' : ''}`}
                                   type="button"
                                   class={held ? 'is-held' : ''}
                                   aria-label={caseKey
