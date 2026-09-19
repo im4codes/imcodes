@@ -79,14 +79,18 @@ describe('direct file transfer v2 shared protocol', () => {
   describe('upload direct-connect fallback deadline', () => {
     const { UPLOAD_DIRECT_CONNECT_FALLBACK_MS, UPLOAD_DIRECT_CONNECT_MIN_FALLBACK_MS } = DIRECT_FILE_TRANSFER_LIMITS;
 
-    it('does not make a small upload wait the full direct-connect ceiling', () => {
+    it('gives a small cross-region upload time to finish ICE and DTLS without waiting the full ceiling', () => {
       // Measured on a real device: a 14.7 kB upload spent the whole 20 s
       // ceiling in the connecting state, failed having moved zero bytes, and
       // the HTTP fallback then delivered it in about 300 ms. Waiting twenty
       // seconds to maybe save a fraction of one is not a trade.
       const small = uploadDirectConnectFallbackMs(14_700);
       expect(small).toBe(UPLOAD_DIRECT_CONNECT_MIN_FALLBACK_MS);
-      expect(small).toBeLessThan(UPLOAD_DIRECT_CONNECT_FALLBACK_MS / 4);
+      // 26+ 300 ms RTTs leave room for signalling, TURN allocation, ICE and
+      // DTLS on an international path. Replacing the floor with the old 2.5 s
+      // value kills this causal boundary.
+      expect(Math.floor(small / 300)).toBeGreaterThanOrEqual(26);
+      expect(small).toBeLessThan(UPLOAD_DIRECT_CONNECT_FALLBACK_MS / 3);
     });
 
     it('still spends the full budget when a direct path is actually worth winning', () => {
@@ -96,6 +100,7 @@ describe('direct file transfer v2 shared protocol', () => {
     it('scales between the floor and the ceiling with payload size', () => {
       const oneMb = uploadDirectConnectFallbackMs(1024 * 1024);
       const fourMb = uploadDirectConnectFallbackMs(4 * 1024 * 1024);
+      expect(oneMb).toBe(10_000);
       expect(oneMb).toBeGreaterThan(UPLOAD_DIRECT_CONNECT_MIN_FALLBACK_MS);
       expect(fourMb).toBeGreaterThan(oneMb);
       expect(fourMb).toBeLessThanOrEqual(UPLOAD_DIRECT_CONNECT_FALLBACK_MS);

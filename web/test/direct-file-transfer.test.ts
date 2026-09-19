@@ -589,7 +589,7 @@ describe('direct file transfer v2 browser broker', () => {
     );
   });
 
-  it('falls back quickly for a small upload instead of holding the full connect ceiling', async () => {
+  it('waits out a healthy cross-region setup before falling back a small upload', async () => {
     // Measured on a real device: a 14.7 kB upload sat the entire 20 s ceiling in
     // the connecting state, failed having moved zero bytes, and the HTTP
     // fallback then delivered it in about 300 ms. The ceiling assumed a hung
@@ -608,6 +608,8 @@ describe('direct file transfer v2 browser broker', () => {
     });
 
     const floor = DIRECT_FILE_TRANSFER_LIMITS.UPLOAD_DIRECT_CONNECT_MIN_FALLBACK_MS;
+    expect(floor).toBeGreaterThanOrEqual(8_000);
+    expect(Math.floor(floor / 300)).toBeGreaterThanOrEqual(26);
     await vi.advanceTimersByTimeAsync(floor - 1);
     expect(apiMocks.uploadFile).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
@@ -627,7 +629,10 @@ describe('direct file transfer v2 browser broker', () => {
     // for a large file a direct path is worth waiting tens of seconds for.
     vi.useFakeTimers();
     const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
-    const { ws } = createWs(directCapabilities, 'hold');
+    // Keep one authorized operation alive without accepting the data plane, so
+    // the outer size-aware deadline — rather than three shorter authorization
+    // retries — is the boundary under test.
+    const { ws } = createWs(directCapabilities, 'authorized_hold');
     const file = new File(['big'], 'big.bin', { type: 'application/octet-stream' });
     // Declared size only: the direct path never connects in this test, and the
     // HTTP fallback is mocked, so no real bytes are needed.

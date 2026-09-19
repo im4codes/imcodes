@@ -62,8 +62,12 @@ export const MACHINE_DIRECT_FILE_TRANSFER_LIMITS = {
   MAX_START_METADATA_BYTES: 2 * 1024,
   HANDSHAKE_LINE_MAX_BYTES: 2 * 1024,
   NONCE_BYTES: 18,
-  CONNECT_TIMEOUT_MS: 4_000,
-  HANDSHAKE_TIMEOUT_MS: 4_000,
+  // Cross-region machines can require multiple 200-300 ms network round
+  // trips before TCP establishment and the authenticated hello exchange have
+  // both converged. Keep each phase independently bounded, but do not reject
+  // a healthy international path on the former four-second edge.
+  CONNECT_TIMEOUT_MS: 8_000,
+  HANDSHAKE_TIMEOUT_MS: 8_000,
   TRANSFER_TIMEOUT_MS: 300_000,
   // This is only the window to begin an authenticated direct connection. Each
   // control hop re-mints it from its own clock, so it can be generous without

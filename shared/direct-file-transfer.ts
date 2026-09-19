@@ -253,11 +253,18 @@ export const DIRECT_FILE_TRANSFER_LIMITS = {
    * full budget on a small file is a pure loss, because the HTTP fallback would
    * have finished many times over inside it.
    */
-  UPLOAD_DIRECT_CONNECT_FALLBACK_MS: 20 * 1000,
-  /** Floor: below this, no path can be judged, so never fall back faster. */
-  UPLOAD_DIRECT_CONNECT_MIN_FALLBACK_MS: 2_500,
+  UPLOAD_DIRECT_CONNECT_FALLBACK_MS: 30 * 1000,
+  /**
+   * Floor: a cross-region path can spend several 200-300 ms round trips on
+   * Server signalling, TURN allocation, ICE checks and DTLS before the first
+   * operation channel opens. The old 2.5 s floor routinely expired while
+   * such a path was still making progress. Eight seconds remains bounded and
+   * well below the large-transfer ceiling, while leaving enough room for a
+   * healthy high-RTT path to prove itself.
+   */
+  UPLOAD_DIRECT_CONNECT_MIN_FALLBACK_MS: 8 * 1000,
   /** How much connect time each megabyte of payload is allowed to justify. */
-  UPLOAD_DIRECT_CONNECT_BUDGET_PER_MB_MS: 4_000,
+  UPLOAD_DIRECT_CONNECT_BUDGET_PER_MB_MS: 10_000,
   NEGOTIATION_TIMEOUT_MS: 8 * 1000,
   /**
    * How long a data channel may take to report `open`.
