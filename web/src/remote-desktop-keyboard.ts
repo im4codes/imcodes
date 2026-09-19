@@ -89,6 +89,27 @@ export function remoteDesktopMobileDeletionKey(
   return null;
 }
 
+/**
+ * An editing key the phone keyboard reported as itself on keydown -- iOS does
+ * for Backspace and Return, Gboard does for Backspace in an empty field. With
+ * nothing in the field to delete, such a key never becomes a beforeinput or
+ * input event, so it is sent from keydown or not at all. Keys that belong to
+ * an IME composition report keyCode 229 and are left to that path.
+ */
+export function remoteDesktopMobileEditingKey(
+  key: string,
+  keyCode: number,
+): RemoteDesktopChordKey | null {
+  if (keyCode === 229) return null;
+  if (key === 'Backspace' || key === 'Delete' || key === 'Enter') return { code: key, key };
+  return null;
+}
+
+/** Whether a phone-keyboard input event is Return. */
+export function isRemoteDesktopMobileLineBreak(inputType: string): boolean {
+  return inputType === 'insertLineBreak' || inputType === 'insertParagraph';
+}
+
 export interface RemoteDesktopMobileTextSplit {
   /** Whatever ordinary text preceded the line break, if any. */
   text: string;
@@ -522,6 +543,26 @@ const letterKey = (letter: string): RemoteDesktopComputerKeySpec => plainKey(
 const digitKey = (digit: string): RemoteDesktopComputerKeySpec => plainKey(digit === '0' ? 'Digit0' : `Digit${digit}`, digit);
 
 /**
+ * The letters page's case key. Not a key sent to the remote: it switches the
+ * page between lowercase and capitals, and a capital goes out as Shift plus
+ * the letter -- what a real keyboard sends -- so it never depends on, or
+ * changes, the remote's own Caps Lock.
+ */
+export const REMOTE_DESKTOP_COMPUTER_CASE_KEY = plainKey('CaseToggle', 'CaseToggle');
+
+/** Whether a computer-keyboard key is one of the 26 letters. */
+export function isRemoteDesktopComputerLetterKey(spec: RemoteDesktopComputerKeySpec): boolean {
+  return /^Key[A-Z]$/.test(spec.code);
+}
+
+/** The letter key as a capital: Shift held, and the capital as its value. */
+export function remoteDesktopComputerCapitalChord(
+  spec: RemoteDesktopComputerKeySpec,
+): readonly RemoteDesktopChordKey[] {
+  return [{ code: 'ShiftLeft', key: 'Shift' }, { code: spec.code, key: spec.key.toUpperCase() }];
+}
+
+/**
  * Second computer-keyboard page: the full alphanumeric/punctuation layout a
  * software IME already covers for typing, but as individually addressable
  * keys instead of characters composed through an input method -- useful
@@ -540,7 +581,7 @@ export const REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS_PAGE2: readonly (readonly Rem
   DIGIT_ROW_KEYS.map(digitKey),
   QWERTY_ROW_LETTERS.split('').map(letterKey),
   [...HOME_ROW_LETTERS.split('').map(letterKey), plainKey('Backspace', 'Backspace')],
-  [...BOTTOM_ROW_LETTERS.split('').map(letterKey), plainKey('Space', ' '), plainKey('Enter', 'Enter')],
+  [REMOTE_DESKTOP_COMPUTER_CASE_KEY, ...BOTTOM_ROW_LETTERS.split('').map(letterKey), plainKey('Space', ' '), plainKey('Enter', 'Enter')],
 ];
 
 /** Every computer-keyboard page, in swipe order. */
@@ -587,7 +628,10 @@ const COMPUTER_KEY_LABELS: Record<string, string> = {
 export function remoteDesktopComputerKeyLabel(
   spec: RemoteDesktopComputerKeySpec,
   targetPlatform: RemoteDesktopTargetPlatform,
+  capitals = false,
 ): string {
+  if (spec.code === REMOTE_DESKTOP_COMPUTER_CASE_KEY.code) return '⇧';
+  if (isRemoteDesktopComputerLetterKey(spec)) return capitals ? spec.key.toUpperCase() : spec.key.toLowerCase();
   const macTarget = targetPlatform === 'macos';
   if (spec.code === 'AltLeft') return macTarget ? 'Option' : 'Alt';
   if (spec.code === 'MetaLeft') return macTarget ? '⌘' : 'Win';

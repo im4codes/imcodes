@@ -48,7 +48,10 @@ import {
   type RemoteDesktopManagedConnection,
 } from '../remote-desktop-connection-manager.js';
 import {
+  REMOTE_DESKTOP_COMPUTER_CASE_KEY,
   REMOTE_DESKTOP_COMPUTER_KEYBOARD_PAGES,
+  isRemoteDesktopComputerLetterKey,
+  remoteDesktopComputerCapitalChord,
   detectRemoteDesktopClipboardShortcut,
   focusRemoteDesktopMobileInput,
   isAppleControllerPlatform,
@@ -57,7 +60,9 @@ import {
   remoteDesktopCommandBridge,
   remoteDesktopComputerKeyLabel,
   REMOTE_DESKTOP_CLIPBOARD_SHORTCUT,
+  isRemoteDesktopMobileLineBreak,
   remoteDesktopMobileDeletionKey,
+  remoteDesktopMobileEditingKey,
   remoteDesktopMobileShortcutKeys,
   sendRemoteDesktopChord,
   shouldForwardRemoteDesktopCopyKeystroke,
@@ -103,6 +108,9 @@ import {
   loadRemoteDesktopZoomPreference,
   saveRemoteDesktopZoomPreference,
 } from '../remote-desktop-zoom-preference.js';
+
+/** A phone-keyboard editing key and its own input event arrive together. */
+const MOBILE_EDITING_KEY_DEDUPE_MS = 150;
 
 type ViewScale = 'fit' | 'actual';
 type MobileInputMode = 'touch' | 'mouse';
@@ -182,15 +190,20 @@ type DesktopPointerButton = VirtualMouseButton | 'back' | 'forward';
 
 /**
  * Touch-mode's draggable cursor ring: press-drag moves the remote cursor
- * relatively (like the mouse-mode handle), a plain tap-without-drag left
- * clicks where it sits, and a long-press-without-drag right clicks there --
- * mirrored visually by `is-right` while `longPressFired` is true.
+ * relatively (like the mouse-mode handle) and a plain tap-without-drag left
+ * clicks where it sits. Holding it arms it (`is-right`): dragging from there
+ * holds the left button down for a real remote drag, and lifting without
+ * dragging right clicks.
  */
 interface TouchRingPress {
   pointerId: number;
   start: TouchPoint;
+  /** Where the finger is now; a held ring starts its drag from here. */
+  last: TouchPoint;
   moved: boolean;
   longPressFired: boolean;
+  /** Held, then moved: the left button is down on the remote. */
+  dragging: boolean;
   longPressTimer: ReturnType<typeof setTimeout> | null;
 }
 
@@ -465,6 +478,7 @@ export function RemoteDesktopPanel({
   // swipe between pages on purpose -- holding Control on page one, then
   // swiping to page two to tap a letter, is a real way to build a chord.
   const [computerKeyboardPage, setComputerKeyboardPage] = useState(0);
+  const [computerKeyboardCapitals, setComputerKeyboardCapitals] = useState(false);
   // Live horizontal drag offset (px) while a page swipe is in progress;
   // reset to 0 once the drag commits or cancels, at which point
   // `computerKeyboardPage` alone drives the resting position.
@@ -495,8 +509,6 @@ export function RemoteDesktopPanel({
   // bottom of it. A same-height spacer left behind in the panel's normal
   // grid slot keeps that row's space reserved while the real, pinned panel
   // renders on top of the keyboard.
-  const mobileKeyboardPanelRef = useRef<HTMLDivElement | null>(null);
-  const [mobileKeyboardPanelHeight, setMobileKeyboardPanelHeight] = useState(0);
   const [quickInputOpen, setQuickInputOpen] = useState(false);
   const [quickInputPortalContainer, setQuickInputPortalContainer] = useState<Element | null>(null);
   const [displayModeMenu, setDisplayModeMenu] = useState<DisplayModeMenuState | null>(null);
@@ -528,6 +540,7 @@ export function RemoteDesktopPanel({
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const mobileTextInputRef = useRef<HTMLTextAreaElement | null>(null);
   const mobileTextComposingRef = useRef(false);
+  const mobileEditingKeySentRef = useRef<{ code: string; at: number } | null>(null);
   const mobileTextLastCompositionCommitRef = useRef<string | null>(null);
   const machineDirectoryAdapter = useMemo(
     () => new MachineDirectoryWsAdapter(machine.serverId),
@@ -1477,10 +1490,10 @@ export function RemoteDesktopPanel({
   // Touch mode's draggable cursor ring. A press on the ring always starts a
   // relative move (identical math to the mouse-mode handle, via
   // beginVirtualMouseMove/onVirtualMouseMove/endVirtualMouseDrag) plus a
-  // long-press timer; whichever fires first -- movement past the threshold,
-  // or the timer -- decides whether release does nothing further (drag
-  // already moved the cursor), right-clicks (long-press), or left-clicks
-  // (a plain tap that did neither).
+  // long-press timer. Movement before the timer is a plain cursor move; the
+  // timer arms the ring, after which movement drags with the left button
+  // held and a release without movement right-clicks; a tap that did
+  // neither left-clicks.
   const beginTouchRing = (event: PointerEvent) => {
     if (!snapshot.inputEnabled) return;
     const point = localTouchPoint(event);
@@ -1489,39 +1502,65 @@ export function RemoteDesktopPanel({
     const press: TouchRingPress = {
       pointerId: event.pointerId,
       start: point,
+      last: point,
       moved: false,
       longPressFired: false,
+      dragging: false,
       longPressTimer: null,
     };
     press.longPressTimer = setTimeout(() => {
       if (touchRingPressRef.current !== press || press.moved) return;
       press.longPressFired = true;
-      sendVirtualMouseClick('right');
-      flashTouchRingArmed();
+      // Armed for as long as it is held, not a momentary flash.
+      if (touchRingArmedTimerRef.current) clearTimeout(touchRingArmedTimerRef.current);
+      touchRingArmedTimerRef.current = null;
+      setTouchRingArmed(true);
     }, TOUCH_LONG_PRESS_MS);
     touchRingPressRef.current = press;
   };
 
+  /** Presses or releases the left button where the ring's cursor sits. */
+  const sendTouchRingLeftButton = (down: boolean): boolean => {
+    const clientPoint = virtualMouseClientPoint();
+    const normalized = clientPoint ? normalizedClientPoint(clientPoint.x, clientPoint.y) : null;
+    if (down && !normalized) return false;
+    return Boolean(clientRef.current?.pointerButton('left', down, normalized?.x, normalized?.y));
+  };
+
   const onTouchRingMove = (event: PointerEvent) => {
     const press = touchRingPressRef.current;
-    if (press && press.pointerId === event.pointerId && !press.moved) {
+    if (press && press.pointerId === event.pointerId) {
       const point = localTouchPoint(event);
-      if (point && Math.hypot(point.x - press.start.x, point.y - press.start.y) > 6) {
+      if (point && !press.longPressFired && !press.moved
+        && Math.hypot(point.x - press.start.x, point.y - press.start.y) > 6) {
         press.moved = true;
         if (press.longPressTimer) clearTimeout(press.longPressTimer);
+      } else if (point && press.longPressFired && !press.dragging
+        && Math.hypot(point.x - press.last.x, point.y - press.last.y) > 6) {
+        // Held, then moved: press the left button where the cursor rests
+        // before it moves, so the remote sees a drag from that spot.
+        press.dragging = sendTouchRingLeftButton(true);
       }
+      if (point && !press.longPressFired) press.last = point;
     }
     onVirtualMouseMove(event);
   };
 
   const endTouchRing = (event: PointerEvent) => {
     const press = touchRingPressRef.current;
-    const shouldClick = press?.pointerId === event.pointerId
-      && !press.moved && !press.longPressFired;
     if (press?.longPressTimer) clearTimeout(press.longPressTimer);
     touchRingPressRef.current = null;
     endVirtualMouseDrag(event);
-    if (shouldClick) sendVirtualMouseClick('left');
+    if (!press || press.pointerId !== event.pointerId) return;
+    if (press.longPressFired) setTouchRingArmed(false);
+    if (press.dragging) {
+      sendTouchRingLeftButton(false);
+    } else if (press.longPressFired) {
+      sendVirtualMouseClick('right');
+      flashTouchRingArmed();
+    } else if (!press.moved) {
+      sendVirtualMouseClick('left');
+    }
   };
 
   const cancelTouchRing = (event: PointerEvent) => {
@@ -1529,6 +1568,10 @@ export function RemoteDesktopPanel({
     if (press?.longPressTimer) clearTimeout(press.longPressTimer);
     touchRingPressRef.current = null;
     endVirtualMouseDrag(event);
+    if (!press || press.pointerId !== event.pointerId) return;
+    if (press.longPressFired) setTouchRingArmed(false);
+    // A drag the browser took away still ends: never leave the button down.
+    if (press.dragging) sendTouchRingLeftButton(false);
   };
 
   const beginTwoFingerGesture = () => {
@@ -2426,24 +2469,6 @@ export function RemoteDesktopPanel({
     };
   }, [mobileTextOpen]);
 
-  // Track the pinned panel's own rendered height (it varies by tab -- the
-  // Keys grid is much taller than the Input tab's now-invisible textarea) so
-  // the grid spacer left in its place reserves exactly that much space.
-  useEffect(() => {
-    if (!mobileTextOpen || typeof ResizeObserver === 'undefined') return;
-    const el = mobileKeyboardPanelRef.current;
-    if (!el) return;
-    const observer = new ResizeObserver((entries) => {
-      const height = entries[0]?.contentRect.height;
-      if (height !== undefined) setMobileKeyboardPanelHeight(Math.round(height));
-    });
-    observer.observe(el);
-    return () => {
-      observer.disconnect();
-      setMobileKeyboardPanelHeight(0);
-    };
-  }, [mobileTextOpen]);
-
   const comboModifierFlags = (keys: readonly RemoteDesktopChordKey[]) => ({
     control: keys.some((k) => k.code === 'ControlLeft' || k.code === 'ControlRight'),
     alt: keys.some((k) => k.code === 'AltLeft' || k.code === 'AltRight'),
@@ -2488,8 +2513,14 @@ export function RemoteDesktopPanel({
    * releases the modifiers, ready for the next chord.
    */
   const pressComputerKey = (spec: RemoteDesktopComputerKeySpec) => {
+    if (spec.code === REMOTE_DESKTOP_COMPUTER_CASE_KEY.code) {
+      setComputerKeyboardCapitals((capitals) => !capitals);
+      return;
+    }
     const client = clientRef.current;
     if (!client || !snapshot.inputEnabled) return;
+    // A capital is Shift plus the letter, exactly as a real keyboard sends it.
+    const capital = computerKeyboardCapitals && isRemoteDesktopComputerLetterKey(spec);
     if (comboMode && spec.modifier) {
       const isHeld = heldComboKeys.some((k) => k.code === spec.code);
       if (isHeld) {
@@ -2505,13 +2536,22 @@ export function RemoteDesktopPanel({
     }
     if (comboMode && heldComboKeys.length > 0) {
       const flags = comboModifierFlags(heldComboKeys);
-      client.key(spec.code, spec.key, true, false, flags);
-      client.key(spec.code, spec.key, false, false, flags);
+      if (capital) {
+        const [shift, letter] = remoteDesktopComputerCapitalChord(spec);
+        const shifted = { ...flags, shift: true };
+        client.key(shift!.code, shift!.key, true, false, shifted);
+        client.key(letter!.code, letter!.key, true, false, shifted);
+        client.key(letter!.code, letter!.key, false, false, shifted);
+        client.key(shift!.code, shift!.key, false, false, flags);
+      } else {
+        client.key(spec.code, spec.key, true, false, flags);
+        client.key(spec.code, spec.key, false, false, flags);
+      }
       releaseHeldComboKeys();
       return;
     }
     sendRemoteDesktopChord(
-      [{ code: spec.code, key: spec.key }],
+      capital ? remoteDesktopComputerCapitalChord(spec) : [{ code: spec.code, key: spec.key }],
       (code, keyName, down, repeat, modifiers) => client.key(code, keyName, down, repeat, modifiers),
       () => client.releaseAll(),
     );
@@ -2717,6 +2757,13 @@ export function RemoteDesktopPanel({
         aria-modal="false"
         aria-label={t('remote_desktop.title', { machine: machine.displayName })}
         hidden={embedded && !active}
+        // The phone's keyboard overlays the page rather than resizing it
+        // (iOS): end the panel at the keyboard's top edge, so the remote
+        // screen is pushed up above it -- re-fitted into what stays visible --
+        // instead of being covered.
+        style={mobileKeyboardViewportInset > 0
+          ? { height: `calc(100% - ${mobileKeyboardViewportInset}px)` }
+          : undefined}
       >
         <div class="remote-desktop-toolbar">
           <div class="remote-desktop-display-tabs" role="tablist" aria-label={t('remote_desktop.displays')}>
@@ -3012,7 +3059,9 @@ export function RemoteDesktopPanel({
           onKeyDown={(event) => onKey(event, true)}
           onKeyUp={(event) => onKey(event, false)}
           onBlur={releaseCapturedInput}
-          onContextMenu={(event) => { if (snapshot.inputEnabled) event.preventDefault(); }}
+          // A remote screen: the browser's own menu (copy, save video, select)
+          // is meaningless on it whether or not this session controls it.
+          onContextMenu={(event) => event.preventDefault()}
           onCompositionEnd={(event) => {
             if (snapshot.inputEnabled) clientRef.current?.text((event as CompositionEvent).data);
           }}
@@ -3239,29 +3288,14 @@ export function RemoteDesktopPanel({
             remote screen instead of covering it -- the previous floating panel
             sat on top of the video and, combined with the OS's own on-screen
             keyboard underneath it, could blot out most of a phone screen.
-            While the OS keyboard is actually up, though, staying in normal
-            flow backfires: the layout viewport does not shrink for it, so
-            the browser scrolls the focused textarea into view instead and
-            carries the tab switcher above it off the top of the screen.
-            Pin the panel to the visual viewport's bottom edge (measured
-            above) whenever that is happening, so it rides directly on top
-            of the keyboard instead of being scrolled away from it. Pinning
-            takes the panel out of the grid entirely, though, so a same-height
-            spacer stays behind in its grid slot -- otherwise the stage would
-            reclaim that row and balloon into a mostly-empty black rectangle
-            with the video squeezed into whatever was left. */}
+            While the OS keyboard is up the whole panel ends at its top edge
+            (see the panel's own height above), so this row still sits
+            directly on the keyboard and the stage is re-fitted above it. */}
         {mobileTextOpen && (<>
-          {mobileKeyboardViewportInset > 0 && (
-            <div aria-hidden="true" style={{ height: `${mobileKeyboardPanelHeight}px` }} />
-          )}
           <div
-            ref={mobileKeyboardPanelRef}
-            class={`remote-desktop-mobile-keyboard${mobileKeyboardViewportInset > 0 ? ' is-pinned' : ''}`}
+            class="remote-desktop-mobile-keyboard"
             role="group"
             aria-label={t('remote_desktop.mobile_keyboard')}
-            style={mobileKeyboardViewportInset > 0
-              ? { position: 'fixed', left: 0, right: 0, bottom: `${mobileKeyboardViewportInset}px` }
-              : undefined}
           >
             <div class="remote-desktop-mobile-keyboard-head">
               <div class="remote-desktop-mobile-keyboard-tabs" role="tablist" aria-label={t('remote_desktop.mobile_keyboard')}>
@@ -3323,10 +3357,18 @@ export function RemoteDesktopPanel({
                     event.stopPropagation();
                     const input = event.currentTarget as HTMLTextAreaElement;
                     if (mobileTextComposingRef.current || event.isComposing || input.value) return;
-                    const deletionKey = remoteDesktopMobileDeletionKey(event.inputType);
-                    if (!deletionKey) return;
+                    const editingKey = isRemoteDesktopMobileLineBreak(event.inputType)
+                      ? { code: 'Enter', key: 'Enter' }
+                      : remoteDesktopMobileDeletionKey(event.inputType);
+                    if (!editingKey) return;
                     event.preventDefault();
-                    sendMobileShortcut([deletionKey]);
+                    // Already sent from its keydown, which not every engine
+                    // cancels the input for.
+                    const sent = mobileEditingKeySentRef.current;
+                    mobileEditingKeySentRef.current = null;
+                    if (sent && sent.code === editingKey.code
+                      && Date.now() - sent.at < MOBILE_EDITING_KEY_DEDUPE_MS) return;
+                    sendMobileShortcut([editingKey]);
                   }}
                   onInput={(event) => {
                     event.stopPropagation();
@@ -3341,7 +3383,18 @@ export function RemoteDesktopPanel({
                     mobileTextLastCompositionCommitRef.current = null;
                     submitMobileTextAndEnter(input.value);
                   }}
-                  onKeyDown={(event) => event.stopPropagation()}
+                  onKeyDown={(event) => {
+                    event.stopPropagation();
+                    if (mobileTextComposingRef.current || event.isComposing) return;
+                    // Text still pending goes out through the input path first,
+                    // a trailing Return included.
+                    if ((event.currentTarget as HTMLTextAreaElement).value) return;
+                    const editingKey = remoteDesktopMobileEditingKey(event.key, event.keyCode);
+                    if (!editingKey) return;
+                    event.preventDefault();
+                    mobileEditingKeySentRef.current = { code: editingKey.code, at: Date.now() };
+                    sendMobileShortcut([editingKey]);
+                  }}
                   onKeyUp={(event) => event.stopPropagation()}
                 />
               </>
@@ -3382,15 +3435,20 @@ export function RemoteDesktopPanel({
                             key={rowIndex}
                           >
                             {row.map((spec) => {
-                              const label = remoteDesktopComputerKeyLabel(spec, targetPlatform);
-                              const held = heldComboKeys.some((k) => k.code === spec.code);
+                              const label = remoteDesktopComputerKeyLabel(spec, targetPlatform, computerKeyboardCapitals);
+                              const caseKey = spec.code === REMOTE_DESKTOP_COMPUTER_CASE_KEY.code;
+                              const held = caseKey
+                                ? computerKeyboardCapitals
+                                : heldComboKeys.some((k) => k.code === spec.code);
                               return (
                                 <button
                                   key={spec.code}
                                   type="button"
                                   class={held ? 'is-held' : ''}
-                                  aria-label={t('remote_desktop.computer_key', { key: label })}
-                                  aria-pressed={spec.modifier ? held : undefined}
+                                  aria-label={caseKey
+                                    ? t('remote_desktop.computer_key_case')
+                                    : t('remote_desktop.computer_key', { key: label })}
+                                  aria-pressed={spec.modifier || caseKey ? held : undefined}
                                   disabled={!snapshot.inputEnabled}
                                   onPointerDown={(event) => event.preventDefault()}
                                   onClick={() => pressComputerKey(spec)}

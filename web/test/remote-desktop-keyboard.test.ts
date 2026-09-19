@@ -15,6 +15,13 @@ import {
   remoteDesktopShortcutLabel,
   sendRemoteDesktopChord,
   splitRemoteDesktopMobileTextEnter,
+  REMOTE_DESKTOP_COMPUTER_CASE_KEY,
+  REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS_PAGE2,
+  isRemoteDesktopComputerLetterKey,
+  isRemoteDesktopMobileLineBreak,
+  remoteDesktopComputerCapitalChord,
+  remoteDesktopComputerKeyLabel,
+  remoteDesktopMobileEditingKey,
 } from '../src/remote-desktop-keyboard.js';
 
 describe('remote desktop keyboard mapping', () => {
@@ -432,5 +439,47 @@ describe('focusRemoteDesktopMobileInput', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('phone keyboard editing keys', () => {
+  it('takes Backspace, Delete and Return reported as themselves', () => {
+    expect(remoteDesktopMobileEditingKey('Backspace', 8)).toEqual({ code: 'Backspace', key: 'Backspace' });
+    expect(remoteDesktopMobileEditingKey('Delete', 46)).toEqual({ code: 'Delete', key: 'Delete' });
+    expect(remoteDesktopMobileEditingKey('Enter', 13)).toEqual({ code: 'Enter', key: 'Enter' });
+  });
+
+  it('leaves composition keys and ordinary characters to the text path', () => {
+    expect(remoteDesktopMobileEditingKey('Enter', 229)).toBeNull();
+    expect(remoteDesktopMobileEditingKey('Unidentified', 229)).toBeNull();
+    expect(remoteDesktopMobileEditingKey('a', 65)).toBeNull();
+  });
+
+  it('reads Return from an input event', () => {
+    expect(isRemoteDesktopMobileLineBreak('insertLineBreak')).toBe(true);
+    expect(isRemoteDesktopMobileLineBreak('insertParagraph')).toBe(true);
+    expect(isRemoteDesktopMobileLineBreak('insertText')).toBe(false);
+  });
+});
+
+describe('computer keyboard case key', () => {
+  it('sits on the letters page and switches the letter labels', () => {
+    expect(REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS_PAGE2.flat()).toContain(REMOTE_DESKTOP_COMPUTER_CASE_KEY);
+    const q = REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS_PAGE2.flat().find((spec) => spec.code === 'KeyQ')!;
+    expect(remoteDesktopComputerKeyLabel(q, 'windows')).toBe('q');
+    expect(remoteDesktopComputerKeyLabel(q, 'windows', true)).toBe('Q');
+    expect(remoteDesktopComputerKeyLabel(REMOTE_DESKTOP_COMPUTER_CASE_KEY, 'windows')).toBe('⇧');
+    // Only letters change case.
+    const digit = REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS_PAGE2.flat().find((spec) => spec.code === 'Digit1')!;
+    expect(remoteDesktopComputerKeyLabel(digit, 'windows', true)).toBe('1');
+    expect(isRemoteDesktopComputerLetterKey(digit)).toBe(false);
+  });
+
+  it('sends a capital as Shift plus the letter', () => {
+    const q = REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS_PAGE2.flat().find((spec) => spec.code === 'KeyQ')!;
+    expect(remoteDesktopComputerCapitalChord(q)).toEqual([
+      { code: 'ShiftLeft', key: 'Shift' },
+      { code: 'KeyQ', key: 'Q' },
+    ]);
   });
 });

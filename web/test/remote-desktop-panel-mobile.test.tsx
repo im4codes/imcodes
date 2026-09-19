@@ -1547,71 +1547,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(getByRole('textbox', { name: 'remote_desktop.mobile_text_input' })).toBeDefined();
   });
 
-  it('pins the keyboard panel above the OS keyboard instead of letting it scroll away', async () => {
-    const visualViewport = Object.assign(new EventTarget(), {
-      height: 700,
-      offsetTop: 0,
-    });
-    const originalVisualViewport = Object.getOwnPropertyDescriptor(window, 'visualViewport');
-    const originalInnerHeight = Object.getOwnPropertyDescriptor(window, 'innerHeight');
-    Object.defineProperty(window, 'visualViewport', { configurable: true, value: visualViewport });
-    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 700 });
-    try {
-      const { container, getByRole } = await renderPanel();
-      act(() => { (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });
-
-      const keyboard = () => container.querySelector('.remote-desktop-mobile-keyboard') as HTMLElement;
-      // No OS keyboard yet: normal document flow, same as before.
-      expect(keyboard().style.position).toBe('');
-      expect(keyboard().classList.contains('is-pinned')).toBe(false);
-
-      // The OS keyboard opens and eats 300px from the bottom of the visual
-      // viewport; the browser would otherwise scroll the tab switcher (which
-      // sits above the now-focused textarea) off the top of the screen.
-      act(() => {
-        visualViewport.height = 400;
-        visualViewport.dispatchEvent(new Event('resize'));
-      });
-      expect(keyboard().style.position).toBe('fixed');
-      expect(keyboard().style.bottom).toBe('300px');
-      expect(keyboard().classList.contains('is-pinned')).toBe(true);
-
-      // Dismissing the OS keyboard (e.g. switching to the Keys tab) restores
-      // the visual viewport, and the panel returns to normal flow.
-      act(() => {
-        visualViewport.height = 700;
-        visualViewport.dispatchEvent(new Event('resize'));
-      });
-      expect(keyboard().style.position).toBe('');
-      expect(keyboard().classList.contains('is-pinned')).toBe(false);
-    } finally {
-      if (originalVisualViewport) Object.defineProperty(window, 'visualViewport', originalVisualViewport);
-      else delete (window as Window & { visualViewport?: VisualViewport }).visualViewport;
-      if (originalInnerHeight) Object.defineProperty(window, 'innerHeight', originalInnerHeight);
-      else delete (window as unknown as { innerHeight?: number }).innerHeight;
-    }
-  });
-
-  it('reserves the pinned panel\'s own height in the grid instead of letting the stage swallow it', async () => {
-    // Pinning (position: fixed) takes the panel out of grid layout entirely;
-    // without a same-height spacer left behind, the stage's `1fr` row would
-    // reclaim that space and grow into a mostly-empty black rectangle with
-    // the actual video squeezed into whatever was left over.
-    type ObserverEntry = { contentRect: { height: number } };
-    class FakeResizeObserver {
-      static instances: FakeResizeObserver[] = [];
-      constructor(private readonly cb: (entries: ObserverEntry[]) => void) {
-        FakeResizeObserver.instances.push(this);
-      }
-      observe() {}
-      unobserve() {}
-      disconnect() {}
-      trigger(height: number) { this.cb([{ contentRect: { height } }]); }
-    }
-    const originalResizeObserver = (window as unknown as { ResizeObserver?: unknown }).ResizeObserver;
-    Object.defineProperty(window, 'ResizeObserver', { configurable: true, value: FakeResizeObserver });
-    Object.defineProperty(globalThis, 'ResizeObserver', { configurable: true, value: FakeResizeObserver });
-
+  it('pushes the remote screen up above the OS keyboard instead of letting it cover it', async () => {
     const visualViewport = Object.assign(new EventTarget(), { height: 700, offsetTop: 0 });
     const originalVisualViewport = Object.getOwnPropertyDescriptor(window, 'visualViewport');
     const originalInnerHeight = Object.getOwnPropertyDescriptor(window, 'innerHeight');
@@ -1620,35 +1556,89 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     try {
       const { container, getByRole } = await renderPanel();
       act(() => { (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });
-
+      const panel = () => container.querySelector('.remote-desktop-panel') as HTMLElement;
       const keyboard = () => container.querySelector('.remote-desktop-mobile-keyboard') as HTMLElement;
-      // Not pinned: the panel sits in its own grid row already, no spacer needed.
-      expect(keyboard().previousElementSibling?.getAttribute('aria-hidden')).not.toBe('true');
+      expect(panel().style.height).toBe('');
 
-      act(() => { FakeResizeObserver.instances.at(-1)?.trigger(224); });
+      // The OS keyboard (iOS: overlaying, not resizing, the page) covers the
+      // bottom 300px. The whole panel ends above it, so the stage is re-fitted
+      // into what stays visible and the keyboard row sits directly on top.
       act(() => {
         visualViewport.height = 400;
         visualViewport.dispatchEvent(new Event('resize'));
       });
-      expect(keyboard().classList.contains('is-pinned')).toBe(true);
-      const spacer = keyboard().previousElementSibling as HTMLElement;
-      expect(spacer.getAttribute('aria-hidden')).toBe('true');
-      expect(spacer.style.height).toBe('224px');
+      expect(panel().style.height).toBe('calc(100% - 300px)');
+      expect(keyboard().style.position).toBe('');
+
+      act(() => {
+        visualViewport.height = 700;
+        visualViewport.dispatchEvent(new Event('resize'));
+      });
+      expect(panel().style.height).toBe('');
     } finally {
       if (originalVisualViewport) Object.defineProperty(window, 'visualViewport', originalVisualViewport);
       else delete (window as Window & { visualViewport?: VisualViewport }).visualViewport;
       if (originalInnerHeight) Object.defineProperty(window, 'innerHeight', originalInnerHeight);
       else delete (window as unknown as { innerHeight?: number }).innerHeight;
-      if (originalResizeObserver) {
-        Object.defineProperty(window, 'ResizeObserver', { configurable: true, value: originalResizeObserver });
-        Object.defineProperty(globalThis, 'ResizeObserver', { configurable: true, value: originalResizeObserver });
-      } else {
-        delete (window as unknown as { ResizeObserver?: unknown }).ResizeObserver;
-        delete (globalThis as unknown as { ResizeObserver?: unknown }).ResizeObserver;
-      }
     }
   });
 
+  it('sends Backspace and Return from the phone keyboard even with nothing typed', async () => {
+    const { getByRole } = await renderPanel();
+    act(() => { (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });
+    const input = getByRole('textbox', { name: 'remote_desktop.mobile_text_input' }) as HTMLTextAreaElement;
+    const sentKeys = () => key.mock.calls
+      .filter((call) => (call as unknown[])[2] === true)
+      .map((call) => (call as unknown[])[0]);
+    key.mockClear();
+
+    // iOS, and Gboard in an empty field, report these as real keys and never
+    // follow up with an input event -- there is nothing to delete.
+    act(() => { input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', keyCode: 8, bubbles: true, cancelable: true })); });
+    act(() => { input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true, cancelable: true })); });
+    expect(sentKeys()).toEqual(['Backspace', 'Enter']);
+
+    // A key still inside an IME composition is left to that path.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    key.mockClear();
+    act(() => { input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 229, bubbles: true, cancelable: true })); });
+    expect(sentKeys()).toEqual([]);
+
+    // Return reported only as an input event is Return too, and once.
+    act(() => { input.dispatchEvent(new InputEvent('beforeinput', { inputType: 'insertLineBreak', bubbles: true, cancelable: true })); });
+    expect(sentKeys()).toEqual(['Enter']);
+    key.mockClear();
+    act(() => { input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true, cancelable: true })); });
+    act(() => { input.dispatchEvent(new InputEvent('beforeinput', { inputType: 'insertLineBreak', bubbles: true, cancelable: true })); });
+    expect(sentKeys()).toEqual(['Enter']);
+  });
+
+  it('switches the letter keys between lowercase and capitals, and sends a capital with Shift', async () => {
+    const { container, getByRole } = await renderPanel();
+    act(() => { (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });
+    act(() => { (getByRole('tab', { name: 'remote_desktop.mobile_keyboard_tab_keys' }) as HTMLButtonElement).click(); });
+    const letter = (name: string) => [...container.querySelectorAll('.remote-desktop-computer-keyboard button')]
+      .find((button) => button.textContent === name) as HTMLButtonElement | undefined;
+    expect(letter('a')).toBeDefined();
+    expect(letter('A')).toBeUndefined();
+
+    const caseKey = getByRole('button', { name: 'remote_desktop.computer_key_case' }) as HTMLButtonElement;
+    act(() => caseKey.click());
+    expect(caseKey.getAttribute('aria-pressed')).toBe('true');
+    expect(letter('A')).toBeDefined();
+    expect(letter('a')).toBeUndefined();
+
+    key.mockClear();
+    act(() => letter('A')!.click());
+    const presses = key.mock.calls.map((call) => {
+      const [code, value, down] = call as unknown as [string, string, boolean];
+      return `${down ? 'down' : 'up'}:${code}:${value}`;
+    });
+    expect(presses).toEqual(['down:ShiftLeft:Shift', 'down:KeyA:A', 'up:KeyA:A', 'up:ShiftLeft:Shift']);
+
+    act(() => caseKey.click());
+    expect(letter('a')).toBeDefined();
+  });
   it('sends a standalone computer-keyboard key, then one chord per combo-mode cycle', async () => {
     const { container, getByRole } = await renderPanel();
     act(() => { (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });
@@ -1722,7 +1712,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(track.style.transform).toContain('translateX(calc(-50%');
 
     key.mockClear();
-    act(() => { keyButton('Q').click(); });
+    act(() => { keyButton('q').click(); });
     expect(key.mock.calls).toEqual([
       ['KeyQ', 'q', true, false, { control: false, alt: false }],
       ['KeyQ', 'q', false, false, { control: false, alt: false }],
@@ -1919,7 +1909,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(pointerButton).not.toHaveBeenCalled();
   });
 
-  it('long-presses the ring without moving to right-click and flash the ring hollow', async () => {
+  it('holds the ring without moving and right-clicks on release', async () => {
     vi.useFakeTimers();
     const { stage, getByLabelText } = await renderPanel();
     act(() => {
@@ -1930,14 +1920,44 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     pointerClick.mockClear();
     act(() => { pointer(ring, 'pointerdown', { pointerId: 11, clientX: 200, clientY: 150 }); });
     await act(async () => { await vi.advanceTimersByTimeAsync(550); });
-    expect(pointerClick).toHaveBeenCalledWith('right', 0.5, 0.5);
+    // Held: armed, and still free to become a drag, so nothing clicked yet.
     expect(ring.className).toContain('is-right');
+    expect(pointerClick).not.toHaveBeenCalled();
     act(() => { pointer(ring, 'pointerup', { pointerId: 11, clientX: 200, clientY: 150 }); });
-    // The long-press already fired the click; releasing must not add a
-    // second, left-button one.
     expect(pointerClick).toHaveBeenCalledTimes(1);
+    expect(pointerClick).toHaveBeenCalledWith('right', 0.5, 0.5);
     await act(async () => { await vi.advanceTimersByTimeAsync(500); });
     expect(ring.className).not.toContain('is-right');
+  });
+
+  it('holds the ring, then drags with the left button down for a remote drag', async () => {
+    vi.useFakeTimers();
+    const { stage, getByLabelText } = await renderPanel();
+    act(() => {
+      pointer(stage, 'pointerdown', { pointerId: 8, clientX: 200, clientY: 150 });
+      pointer(stage, 'pointerup', { pointerId: 8, clientX: 200, clientY: 150 });
+    });
+    const ring = getByLabelText('remote_desktop.touch_ring');
+    pointerClick.mockClear();
+    pointerButton.mockClear();
+    pointerMove.mockClear();
+    act(() => { pointer(ring, 'pointerdown', { pointerId: 12, clientX: 200, clientY: 150 }); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(550); });
+    act(() => { pointer(ring, 'pointermove', { pointerId: 12, clientX: 260, clientY: 150 }); });
+    // Pressed where the cursor rested, before it moved: a drag from there.
+    expect(pointerButton).toHaveBeenNthCalledWith(1, 'left', true, 0.5, 0.5);
+    expect(pointerMove).toHaveBeenCalledWith(0.65, 0.5);
+    act(() => { pointer(ring, 'pointerup', { pointerId: 12, clientX: 260, clientY: 150 }); });
+    expect(pointerButton).toHaveBeenLastCalledWith('left', false, 0.65, 0.5);
+    expect(pointerClick).not.toHaveBeenCalled();
+    expect(ring.className).not.toContain('is-right');
+  });
+
+  it('never shows the browser\'s own menu on the remote screen, even when only viewing', async () => {
+    const { stage } = await renderPanel();
+    const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true });
+    act(() => { stage.dispatchEvent(event); });
+    expect(event.defaultPrevented).toBe(true);
   });
 
   it('cancels the ring long-press once a drag moves past the threshold', async () => {
