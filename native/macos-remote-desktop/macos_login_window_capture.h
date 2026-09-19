@@ -41,6 +41,18 @@ inline constexpr char kSessionTypeLoginWindow[] = "LoginWindow";
 inline constexpr std::uint32_t kLoginWindowScreenCaptureKitMajor = 14;
 inline constexpr std::uint32_t kLoginWindowScreenCaptureKitMinor = 4;
 
+/**
+ * First macOS release whose ScreenCaptureKit display stream serves an ordinary
+ * (Aqua) session reliably. On 12.x a display filter that excludes windows is
+ * "selective sharing", and on a 2013 Mac Pro (FirePro D300, 30-bit 5K
+ * framebuffer, macOS 12.7.6) WindowServer answered every frame with "Selective
+ * Sharing Bailing because surface (0x0) was not valid": the stream started,
+ * delivered nothing, and every session ended worker_failed. CGDisplayStream,
+ * the backend already driving the login window and the lock screen, composites
+ * the whole display and is the capture API macOS 12 was built around.
+ */
+inline constexpr std::uint32_t kAquaScreenCaptureKitMajor = 13;
+
 enum class LoginWindowCaptureBackend : std::uint8_t {
   /** No backend may serve this combination. */
   kUnavailable,
@@ -51,8 +63,8 @@ enum class LoginWindowCaptureBackend : std::uint8_t {
 /**
  * Chooses the backend for one session type on one running release.
  *
- * Aqua has had a working ScreenCaptureKit path since the artifact's own 12.3
- * minimum, so only the login window needs the older backend. An unrecognized
+ * Aqua uses ScreenCaptureKit from macOS 13 and CGDisplayStream below it; the
+ * login window needs the older backend until 14.4. An unrecognized
  * session type is `kUnavailable` rather than a default: guessing here would
  * mean capturing a surface nobody asked for.
  */

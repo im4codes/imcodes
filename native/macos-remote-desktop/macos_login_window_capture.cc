@@ -70,8 +70,9 @@ LoginWindowCaptureBackend SelectCaptureBackend(std::string_view session_type,
                                                std::uint32_t os_major,
                                                std::uint32_t os_minor) {
   if (session_type == kSessionTypeAqua) {
-    // Aqua's ScreenCaptureKit path predates the artifact's own 12.3 minimum.
-    return LoginWindowCaptureBackend::kScreenCaptureKit;
+    return os_major >= kAquaScreenCaptureKitMajor
+               ? LoginWindowCaptureBackend::kScreenCaptureKit
+               : LoginWindowCaptureBackend::kCgDisplayStream;
   }
   if (session_type != kSessionTypeLoginWindow) {
     // Not a session type this worker serves. Guessing would mean capturing a

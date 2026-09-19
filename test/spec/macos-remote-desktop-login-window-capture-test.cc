@@ -158,10 +158,20 @@ void SelectionFollowsTheRunningRelease() {
   Check(macos::SelectCaptureBackend(macos::kSessionTypeLoginWindow, 15, 1)
             == LoginWindowCaptureBackend::kScreenCaptureKit,
         "15.1 login window uses ScreenCaptureKit");
-  // Aqua's path predates the artifact minimum.
+  // Aqua uses ScreenCaptureKit from 13; on 12.x its selective-sharing
+  // display stream delivered no frames, so CGDisplayStream serves it.
   Check(macos::SelectCaptureBackend(macos::kSessionTypeAqua, 12, 3)
+            == LoginWindowCaptureBackend::kCgDisplayStream,
+        "12.3 Aqua uses CGDisplayStream");
+  Check(macos::SelectCaptureBackend(macos::kSessionTypeAqua, 12, 7)
+            == LoginWindowCaptureBackend::kCgDisplayStream,
+        "12.7 Aqua uses CGDisplayStream");
+  Check(macos::SelectCaptureBackend(macos::kSessionTypeAqua, 13, 0)
             == LoginWindowCaptureBackend::kScreenCaptureKit,
-        "Aqua always uses ScreenCaptureKit");
+        "13.0 Aqua uses ScreenCaptureKit");
+  Check(macos::SelectCaptureBackend(macos::kSessionTypeAqua, 15, 1)
+            == LoginWindowCaptureBackend::kScreenCaptureKit,
+        "15.1 Aqua uses ScreenCaptureKit");
   // An unknown session type is refused, not defaulted.
   Check(macos::SelectCaptureBackend("Background", 15, 1)
             == LoginWindowCaptureBackend::kUnavailable,
