@@ -189,6 +189,7 @@ import {
   REMOTE_DESKTOP_INSTALL_MSG,
   REMOTE_DESKTOP_PERMISSION_MSG,
 } from '../../../shared/remote-desktop-install.js';
+import { REMOTE_DESKTOP_LOGIN_SCREEN_MSG } from '../../../shared/remote-desktop-login-screen.js';
 import {
   CONTROLLED_NODE_OS_WIN,
   isControlledNodeArch,
@@ -5464,6 +5465,15 @@ export class WsBridge {
       if (this.directFileTransferRouter.handleBrowser(ws, userId, msg)) {
         return;
       }
+      // Installs on the daemon's own computer share the remote_desktop.*
+      // namespace with signalling but are not signalling: the router below
+      // answered them `invalid_request`, so the install buttons never reached
+      // the daemon. Routed first, and only for the daemon's owner.
+      if (browserMessageType === REMOTE_DESKTOP_INSTALL_MSG.REQUEST
+        || browserMessageType === REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST) {
+        this.forwardDaemonInstallRequest(userId, raw);
+        return;
+      }
       // Keep every non-remote browser message on the existing synchronous
       // fast path. Only the remote-desktop namespace can enter DB-backed
       // admission, and the router consumes invalid namespaced frames too.
@@ -9314,6 +9324,28 @@ export class WsBridge {
       // The frame is never logged: it contains the secret.
       logger.error({ serverId: this.serverId, err }, 'Failed to send CONTROLLED_NODE_AUTO_UNLOCK');
       return 'send_failed';
+    }
+  }
+
+  /**
+   * An install on the daemon's own computer: its remote-desktop worker, or the
+   * controlled node, which runs as root there -- silently where its user may
+   * sudo without a password. Only the daemon's owner may ask; someone it is
+   * shared with could otherwise enrol a node on the owner's machine to their
+   * own account. Never queued: an install that starts minutes later, on a
+   * machine nobody is watching, is worse than none.
+   */
+  private forwardDaemonInstallRequest(userId: string, raw: string): void {
+    if (!this.daemonOwnerUserId || userId !== this.daemonOwnerUserId) {
+      logger.warn({ serverId: this.serverId }, 'Refused a remote-desktop install request from a non-owner');
+      return;
+    }
+    if (!this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN
+      || this.daemonNodeRole === NODE_ROLE.CONTROLLED) return;
+    try {
+      this.daemonWs.send(raw);
+    } catch (err) {
+      logger.error({ serverId: this.serverId, err }, 'Failed to forward a remote-desktop install request');
     }
   }
 

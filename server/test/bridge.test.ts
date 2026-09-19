@@ -14,6 +14,7 @@ import {
   resetDaemonUpgradePublicationGateForTest,
 } from '../src/ws/daemon-upgrade-publication-gate.js';
 import * as dbQueries from '../src/db/queries.js';
+import { REMOTE_DESKTOP_LOGIN_SCREEN_MSG } from '../../shared/remote-desktop-login-screen.js';
 import { PUSH_TIMELINE_EVENT_MAX_AGE_MS, TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import { P2P_CONFIG_MSG } from '../../shared/p2p-config-events.js';
@@ -209,6 +210,7 @@ function makeDb(
   tokenHash: string,
   nodeRole: 'full' | 'controlled' = 'full',
   os: ControlledNodeOs | null = nodeRole === 'controlled' ? CONTROLLED_NODE_OS_LINUX : null,
+  ownerUserId?: string,
 ) {
   const db = {
     queryOne: async () => ({
@@ -216,6 +218,7 @@ function makeDb(
       node_role: nodeRole,
       revoked_at: null,
       os,
+      ...(ownerUserId ? { user_id: ownerUserId } : {}),
     }),
     query: async () => [],
     execute: async () => ({ changes: 1 }),
@@ -2377,6 +2380,60 @@ describe('WsBridge', () => {
       browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'x' }));
       await flushAsync(); // terminal.subscribe ownership check is async
       expect(daemonWs.sentStrings.some((s) => s.includes('terminal.subscribe'))).toBe(true);
+    });
+
+    it('forwards installs on the daemon\'s own computer, and only from its owner', async () => {
+      // The remote-desktop router used to answer these `invalid_request`, so the
+      // install buttons never reached the daemon. The controlled-node install
+      // runs as root there; someone the daemon is shared with must not be able
+      // to enrol a node on it to their own account.
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      const db = makeDb('valid-hash', 'full', null, 'owner-user');
+      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      const participant = new MockWs();
+      bridge.handleBrowserConnection(participant as never, 'participant-user', db);
+      const owner = new MockWs();
+      bridge.handleBrowserConnection(owner as never, 'owner-user', db);
+      const requests = [
+        JSON.stringify({ type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST, installCode: 'ABCDEFGHJKMN' }),
+        JSON.stringify({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST }),
+      ];
+      const forwarded = () => daemonWs.sentStrings.filter((s) => (
+        s.includes(REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST) || s.includes(REMOTE_DESKTOP_INSTALL_MSG.REQUEST)
+      ));
+
+      for (const request of requests) participant.emit('message', request);
+      await flushAsync();
+      expect(forwarded()).toEqual([]);
+
+      for (const request of requests) owner.emit('message', request);
+      await flushAsync();
+      expect(forwarded()).toEqual(requests);
+      expect(owner.sentStrings.some((s) => s.includes('invalid_request'))).toBe(false);
+    });
+
+    it('never queues an install for a daemon that is not connected', async () => {
+      const bridge = WsBridge.get(serverId);
+      const db = makeDb('valid-hash', 'full', null, 'owner-user');
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      const owner = new MockWs();
+      bridge.handleBrowserConnection(owner as never, 'owner-user', db);
+      daemonWs.close();
+      await flushAsync();
+
+      owner.emit('message', JSON.stringify({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST }));
+      await flushAsync();
+      const reconnected = new MockWs();
+      bridge.handleDaemonConnection(reconnected as never, db, {} as never);
+      reconnected.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      expect(reconnected.sentStrings.some((s) => s.includes(REMOTE_DESKTOP_INSTALL_MSG.REQUEST))).toBe(false);
     });
 
     it('forwards any valid message type to daemon (no whitelist)', async () => {
