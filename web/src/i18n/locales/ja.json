@@ -1710,6 +1710,8 @@
     "upload_file": "ファイルをアップロード",
     "uploading": "アップロード中...",
     "upload_failed": "アップロード失敗",
+    "retry": "再試行",
+    "dismiss_failure": "閉じる",
     "cancel": "中止",
     "cancel_named": "{{name}} のアップロードを中止",
     "cancel_confirm": "{{name}} のアップロードを中止しますか？現在の転送内容は破棄されます。",

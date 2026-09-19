@@ -239,6 +239,12 @@ export const DIRECT_FILE_TRANSFER_LIMITS = {
   LEASE_RENEW_LEAD_MS: 2 * 60 * 1000,
   RESUME_TICKET_TTL_MS: 10 * 60 * 1000,
   STATUS_RECOVERY_DEADLINE_MS: 15 * 1000,
+  /**
+   * A receiver may still be draining its durable write queue after the browser
+   * has handed the last chunk to SCTP.  Poll the authoritative operation
+   * ledger a small, bounded number of times before retrying/falling back.
+   */
+  MAX_STATUS_RECOVERY_QUERIES: 3,
   OPERATION_LEDGER_TTL_MS: 60 * 60 * 1000,
   OPERATION_LEDGER_CAPACITY: 256,
   MAX_ACTIVE_CHANNELS_PER_LEASE: 4,
@@ -689,7 +695,7 @@ export interface DirectFileTransferDataStart extends DirectFileTransferAttemptBi
   protocolVersion: typeof DIRECT_FILE_TRANSFER_PROTOCOL_VERSION;
   authority: string;
   /**
-   * UPLOAD only: byte offset this attempt wants to continue from.
+   * Byte offset this attempt wants to continue from.
    *
    * A transient DataChannel/ICE replacement used to cost the whole file: the
    * next attempt started at zero, or the operation gave up and re-sent
@@ -1360,12 +1366,7 @@ export function validateDirectFileTransferDataMessage(value: unknown): DirectFil
   if (value.type === DIRECT_FILE_TRANSFER_DATA_MSG.START) {
     if (!hasExactKeys(value, ['type', 'protocolVersion', 'serverId', 'browserTabId', 'leaseId', 'leaseGeneration', 'daemonGeneration', 'requestId', 'attemptId', 'attempt', 'direction', 'operationId', 'authority'], ['resumeOffset'])
       || value.protocolVersion !== DIRECT_FILE_TRANSFER_PROTOCOL_VERSION || !isDataAttemptBinding(value) || !isAuthority(value.authority)) return invalid();
-    if (value.resumeOffset !== undefined) {
-      // Resuming is an upload-only notion, and a non-integer or negative offset
-      // is malformed rather than merely unsatisfiable.
-      if (value.direction !== DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD
-        || !isDirectFileTransferSize(value.resumeOffset)) return invalid();
-    }
+    if (value.resumeOffset !== undefined && !isDirectFileTransferSize(value.resumeOffset)) return invalid();
     return { ok: true, value: value as unknown as DirectFileTransferDataStart };
   }
   if (value.type === DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED) {

@@ -534,6 +534,7 @@ describe('controlled-node shared action admission', () => {
           id: 'f'.repeat(32), source: 'local', serverId: '', daemonPath: 'C:\\Temp\\shared.txt',
           createdAt: new Date().toISOString(), downloadable: true,
         },
+        sourceIdentity: { size: 10, mtimeMs: 1, device: 2, inode: 3 },
       })), false));
     });
     const targetBridge = WsBridge.get(targetId);

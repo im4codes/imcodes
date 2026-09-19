@@ -1711,6 +1711,8 @@
     "upload_file": "Subir archivo",
     "uploading": "Subiendo...",
     "upload_failed": "Error al subir",
+    "retry": "Reintentar",
+    "dismiss_failure": "Descartar",
     "cancel": "Detener",
     "cancel_named": "Detener la subida de {{name}}",
     "cancel_confirm": "¿Detener la subida de {{name}}? La transferencia actual se descartará.",

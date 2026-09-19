@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdir, mkdtemp, realpath, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
@@ -480,6 +480,40 @@ describe('file-transfer local handle hardening', () => {
     }));
   });
 
+  it('resumes a broken relay upload fetch from the bytes already written', async () => {
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const broken = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('he'));
+        setTimeout(() => controller.error(new TypeError('link_lost')), 20);
+      },
+    });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(broken, { status: 200 }))
+      .mockResolvedValueOnce(new Response('llo', {
+        status: 206,
+        headers: { 'Content-Range': 'bytes 2-4/5' },
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+    const done = createServerLinkMock();
+
+    await transfer.handleFileUploadFetch({
+      type: 'file.upload_fetch',
+      uploadId: 'upload-fetch-resume',
+      filename: 'resume.txt',
+      originalName: 'resume.txt',
+      mime: 'text/plain',
+      size: 5,
+      downloadUrl: 'https://relay.example/upload-staged/upload-fetch-resume?token=reusable',
+    }, done.serverLink as never);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(2, expect.any(String), expect.objectContaining({
+      headers: { Range: 'bytes=2-' },
+    }));
+    await expect(readFile(path.join(fakeHome, '.imcodes', 'uploads', 'resume.txt'), 'utf8')).resolves.toBe('hello');
+    expect(done.sent).toContainEqual(expect.objectContaining({ type: 'file.upload_done', uploadId: 'upload-fetch-resume' }));
+  });
+
   it('lists child directories and regular files through the bounded remote file browser', async () => {
     const parent = path.join(rootDir, 'directory-picker');
     await mkdir(path.join(parent, 'visible'), { recursive: true });
@@ -780,6 +814,7 @@ describe('file-transfer local handle hardening', () => {
       type: FILE_TRANSFER_MSG.PATH_HANDLE_DONE,
       requestId: 'path-handle-1',
       attachment: expect.objectContaining({ daemonPath: await realpath(filePath), size: 5, downloadable: true }),
+      sourceIdentity: expect.objectContaining({ size: 5, device: expect.any(Number), inode: expect.any(Number) }),
     })]);
   });
 

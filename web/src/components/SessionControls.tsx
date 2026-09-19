@@ -733,6 +733,11 @@ const DEFAULT_COMPOSER_UPLOAD_STATE: ComposerUploadSnapshot = {
 };
 const composerUploadStore = new Map<string, ComposerUploadEntry>();
 const composerUploadAbortControllers = new Map<string, AbortController>();
+// Keep the user-selected File alive for an explicit retry.  The transport's
+// persisted clientUploadId then resumes the receiver's confirmed prefix rather
+// than forcing the user to pick and resend the whole file after a transient
+// direct+HTTP failure.
+const composerUploadRetryFiles = new Map<string, File>();
 let composerUploadIdCounter = 0;
 
 function createComposerUploadId(): string {
@@ -4916,8 +4921,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         updatedAt: now,
       };
     });
+    for (let index = 0; index < uploadItems.length; index += 1) {
+      composerUploadRetryFiles.set(uploadItems[index].id, files[index]);
+    }
     addComposerUploadItems(uploadKey, uploadItems);
 
+    const settledUploadIds: string[] = [];
     const uploadedAttachments = await Promise.all(files.map(async (file, index): Promise<ComposerAttachmentRecord | null> => {
       const uploadItem = uploadItems[index];
       const abortController = new AbortController();
@@ -4938,6 +4947,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         });
         updateComposerUploadProgress(uploadKey, uploadItem.id, 100);
         updateComposerUploadItem(uploadKey, uploadItem.id, { status: 'done' });
+        settledUploadIds.push(uploadItem.id);
         if (result.attachment?.daemonPath) {
           rememberAttachmentPreview(result.attachment.daemonPath, file);
           return {
@@ -4952,6 +4962,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       } catch (err) {
         if (isFileUploadCanceled(err)) {
           removeComposerUploadItems(uploadKey, [uploadItem.id]);
+          settledUploadIds.push(uploadItem.id);
           return null;
         }
         console.error('[upload] failed:', err);
@@ -4991,7 +5002,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         setAttachments((prev) => renumberAttachments([...prev, ...successfulAttachments]));
       }
     }
-    removeComposerUploadItems(uploadKey, uploadItems.map((item) => item.id));
+    // Successful/canceled rows are transient.  Failed rows deliberately stay
+    // visible with a retry action: removing every row here made a 99%-phase
+    // failure disappear immediately and look like a silent success/failure.
+    removeComposerUploadItems(uploadKey, settledUploadIds);
+    for (const id of settledUploadIds) composerUploadRetryFiles.delete(id);
     return successfulAttachments.length > 0;
   }, [activeSession?.name, attachmentDraftKey, composerUploadKey, isShareScopedSession, serverId, t]);
 
@@ -4999,6 +5014,20 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (!window.confirm(t('upload.cancel_confirm', { name: item.name }))) return;
     composerUploadAbortControllers.get(item.id)?.abort();
   }, [t]);
+
+  const handleRetryUpload = useCallback((item: ComposerUploadItem) => {
+    const file = composerUploadRetryFiles.get(item.id);
+    if (!file) return;
+    composerUploadRetryFiles.delete(item.id);
+    removeComposerUploadItems(composerUploadKey, [item.id]);
+    updateComposerUploadSnapshot(composerUploadKey, { error: null });
+    void uploadAttachmentFiles([file]);
+  }, [composerUploadKey, uploadAttachmentFiles]);
+
+  const handleDismissFailedUpload = useCallback((item: ComposerUploadItem) => {
+    composerUploadRetryFiles.delete(item.id);
+    removeComposerUploadItems(composerUploadKey, [item.id]);
+  }, [composerUploadKey]);
 
   const handleRemoveAttachment = useCallback(async (attachment: ComposerAttachmentRecord) => {
     closeQuickSuggestions();
@@ -6375,6 +6404,22 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                     title={t('upload.cancel')}
                     aria-label={t('upload.cancel_named', { name: item.name })}
                   >{t('upload.cancel')}</button>
+                )}
+                {item.status === 'error' && (
+                  <div class="composer-upload-error-actions">
+                    <button
+                      type="button"
+                      class="composer-upload-retry"
+                      onClick={() => handleRetryUpload(item)}
+                      aria-label={`${t('upload.retry')}: ${item.name}`}
+                    >{t('upload.retry')}</button>
+                    <button
+                      type="button"
+                      class="composer-upload-dismiss"
+                      onClick={() => handleDismissFailedUpload(item)}
+                      aria-label={`${t('upload.dismiss_failure')}: ${item.name}`}
+                    >{t('upload.dismiss_failure')}</button>
+                  </div>
                 )}
                 <div
                   role="progressbar"

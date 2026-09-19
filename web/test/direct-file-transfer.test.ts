@@ -18,6 +18,19 @@ import {
 import type { ServerMessage, WsClient } from '../src/ws-client.js';
 
 const apiMocks = vi.hoisted(() => ({
+  ApiError: class ApiError extends Error {
+    code: string | null;
+
+    constructor(public status: number, public body: string) {
+      super(`API ${status}: ${body}`);
+      try {
+        const parsed = JSON.parse(body) as { error?: unknown };
+        this.code = typeof parsed.error === 'string' ? parsed.error : null;
+      } catch {
+        this.code = null;
+      }
+    }
+  },
   uploadFile: vi.fn(),
   downloadAttachment: vi.fn(),
   streamAttachmentDownloadToWritable: vi.fn(),
@@ -158,7 +171,7 @@ function controlBinding(message: Record<string, unknown>) {
 
 function createWs(
   capabilities: string[],
-  mode: 'success' | 'operation_failure' | 'lease_signal_failure' | 'runtime_recovering_once' | 'hold' | 'authorized_hold' | 'status_committed' | 'commit_ack_lost_status_committed' | 'terminal_committed' | 'ack_then_late_terminal' | 'download_hold_rebind' | 'download_size_mismatch' | 'error_after_expiry' | 'drop_first_lease_ready' | 'drop_first_lease_answer' | 'control_socket_closed' | 'lease_init_recovering_once' = 'success',
+  mode: 'success' | 'operation_failure' | 'lease_signal_failure' | 'runtime_recovering_once' | 'hold' | 'authorized_hold' | 'status_committed' | 'commit_ack_lost_status_committed' | 'commit_ack_lost_status_attempting_then_committed' | 'terminal_committed' | 'ack_then_late_terminal' | 'download_hold_rebind' | 'download_size_mismatch' | 'error_after_expiry' | 'drop_first_lease_ready' | 'drop_first_lease_answer' | 'control_socket_closed' | 'lease_init_recovering_once' = 'success',
   leaseTiming: { readyDelayMs?: number; idleWindowMs?: number; terminalDelayMs?: number; rebindDaemonGeneration?: number; secondLeaseDaemonGeneration?: number; secondOfferAnswerDelayMs?: number } = {},
 ) {
   const handlers = new Set<(message: ServerMessage) => void>();
@@ -170,6 +183,7 @@ function createWs(
   const completedDownloads = new WeakSet<FakeDataChannel>();
   let leaseInitCount = 0;
   let leaseOfferCount = 0;
+  let statusQueryCount = 0;
   const handleData = (channel: FakeDataChannel, value: unknown) => {
     if (typeof value !== 'string') return;
     const payload = JSON.parse(value) as Record<string, unknown>;
@@ -244,8 +258,20 @@ function createWs(
       return;
     }
     if (payload.type === DIRECT_FILE_TRANSFER_DATA_MSG.FINISH && payload.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD) {
-      if (mode === 'commit_ack_lost_status_committed') return;
       const common = controlBinding(payload);
+      if (mode === 'commit_ack_lost_status_committed') return;
+      if (mode === 'commit_ack_lost_status_attempting_then_committed') {
+        queueMicrotask(() => channel.dispatchEvent(new MessageEvent('message', {
+          data: JSON.stringify({
+            type: DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT,
+            protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+            ...common,
+            creditBytes: DIRECT_FILE_TRANSFER_LIMITS.DATA_CREDIT_BYTES,
+            committedBytes: payload.totalBytes,
+          }),
+        })));
+        return;
+      }
       queueMicrotask(() => channel.dispatchEvent(new MessageEvent('message', {
         data: JSON.stringify({
           type: DIRECT_FILE_TRANSFER_DATA_MSG.UPLOAD_COMMITTED,
@@ -364,17 +390,23 @@ function createWs(
           iceServers: [],
         }));
     } else if (message.type === DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY
-      && (mode === 'status_committed' || mode === 'commit_ack_lost_status_committed')) {
+      && (mode === 'status_committed' || mode === 'commit_ack_lost_status_committed'
+        || mode === 'commit_ack_lost_status_attempting_then_committed')) {
+        statusQueryCount += 1;
+        const stillAttempting = mode === 'commit_ack_lost_status_attempting_then_committed'
+          && statusQueryCount === 1;
         queueMicrotask(() => emit({
           type: DIRECT_FILE_TRANSFER_MSG.STATUS,
           protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
           ...controlBinding(message),
-          state: 'committed',
-          idleExpiresAt: Date.now() + DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS,
-          attachment: {
+          state: stillAttempting ? 'attempting' : 'committed',
+          ...(!stillAttempting ? {
+            idleExpiresAt: Date.now() + DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS,
+          } : {}),
+          ...(!stillAttempting ? { attachment: {
             id: 'status-committed', source: 'upload', serverId: 'server-1', daemonPath: '/tmp/status.txt',
             createdAt: '2026-01-01T00:00:00.000Z', downloadable: true,
-          },
+          } } : {}),
         }));
     } else if (message.type === DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT) {
         if (mode === 'operation_failure') {
@@ -496,6 +528,7 @@ describe('direct file transfer v2 browser broker', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     sessionStorage.clear();
+    localStorage.clear();
     FakePeerConnection.instances = [];
     FakePeerConnection.selectedCandidateType = 'host';
     FakePeerConnection.keepConnectingAfterAnswer = false;
@@ -541,6 +574,50 @@ describe('direct file transfer v2 browser broker', () => {
 
     expect(sent).toHaveLength(0);
     expect(apiMocks.uploadFile).toHaveBeenCalledTimes(1);
+  });
+
+  it('reuses a durable upload identity after page-level retry and clears it only after success', async () => {
+    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const file = new File(['resume'], 'resume.txt', { type: 'text/plain', lastModified: 1234 });
+    apiMocks.uploadFile
+      .mockRejectedValueOnce(new Error('network_down'))
+      .mockResolvedValue({
+        ok: true,
+        attachment: { id: 'relay-attachment', serverId: 'server-1', daemonPath: '/tmp/relay.txt' },
+      });
+
+    await expect(uploadFileWithDirectFallback({ serverId: 'server-1', file })).rejects.toThrow('network_down');
+    await expect(uploadFileWithDirectFallback({ serverId: 'server-1', file })).resolves.toMatchObject({
+      attachment: { id: 'relay-attachment' },
+    });
+    const firstId = apiMocks.uploadFile.mock.calls[0]?.[3];
+    const retryId = apiMocks.uploadFile.mock.calls[1]?.[3];
+    expect(retryId).toBe(firstId);
+
+    await uploadFileWithDirectFallback({ serverId: 'server-1', file });
+    expect(apiMocks.uploadFile.mock.calls[2]?.[3]).not.toBe(firstId);
+  });
+
+  it('bounds and expires abandoned browser resume records without evicting unrelated storage', async () => {
+    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const now = Date.now();
+    localStorage.setItem('unrelated.setting', 'keep');
+    for (let index = 0; index < 70; index += 1) {
+      localStorage.setItem(`imcodes.file_upload.resume.v1:stale-${index}`, JSON.stringify({
+        clientUploadId: `stale-${index}`,
+        updatedAt: now - (25 * 60 * 60 * 1000),
+      }));
+    }
+
+    await uploadFileWithDirectFallback({
+      serverId: 'server-1',
+      file: new File(['fresh'], 'fresh.txt', { lastModified: 2345 }),
+    });
+
+    const resumeKeys = Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index))
+      .filter((key): key is string => Boolean(key?.startsWith('imcodes.file_upload.resume.v1:')));
+    expect(resumeKeys.length).toBeLessThanOrEqual(64);
+    expect(localStorage.getItem('unrelated.setting')).toBe('keep');
   });
 
   it('sends a selected destination directory over direct transport only when the daemon advertises it', async () => {
@@ -1542,6 +1619,255 @@ describe('direct file transfer v2 browser broker', () => {
     expect(apiMocks.streamAttachmentDownloadToWritable).not.toHaveBeenCalled();
   });
 
+  it('resumes a direct preview at the locally committed byte after a channel loss', async () => {
+    const { downloadPreviewWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { ws } = createWs(directCapabilities);
+    const starts: Array<number | undefined> = [];
+    const served = new WeakSet<FakeDataChannel>();
+    const inner = FakePeerConnection.onDataChannel;
+    FakePeerConnection.onDataChannel = (channel, value) => {
+      if (typeof value === 'string') {
+        const payload = JSON.parse(value) as Record<string, unknown>;
+        if (payload.type === DIRECT_FILE_TRANSFER_DATA_MSG.START
+          && payload.direction === DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD) {
+          starts.push(payload.resumeOffset as number | undefined);
+        }
+        if (payload.type === DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT
+          && payload.direction === DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD) {
+          if (served.has(channel)) return;
+          served.add(channel);
+          const common = controlBinding(payload);
+          if (starts.length === 1) {
+            queueMicrotask(() => channel.dispatchEvent(new MessageEvent('message', { data: new Uint8Array([1]) })));
+            setTimeout(() => channel.close(), 0);
+          } else {
+            queueMicrotask(() => channel.dispatchEvent(new MessageEvent('message', { data: new Uint8Array([2, 3]) })));
+            setTimeout(() => channel.dispatchEvent(new MessageEvent('message', {
+              data: JSON.stringify({
+                type: DIRECT_FILE_TRANSFER_DATA_MSG.FINISH,
+                protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+                ...common,
+                totalBytes: 3,
+              }),
+            })), 0);
+          }
+          return;
+        }
+      }
+      inner?.(channel, value);
+    };
+
+    let committed = new Uint8Array(0);
+    const createWritable = vi.fn(async (options?: { keepExistingData?: boolean }) => {
+      let working = options?.keepExistingData ? committed.slice() : new Uint8Array(0);
+      let position = 0;
+      return {
+        async seek(next: number) { position = next; },
+        async write(data: BufferSource) {
+          const bytes = data instanceof ArrayBuffer
+            ? new Uint8Array(data)
+            : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+          const expanded = new Uint8Array(Math.max(working.length, position + bytes.length));
+          expanded.set(working);
+          expanded.set(bytes, position);
+          working = expanded;
+          position += bytes.length;
+        },
+        async close() { committed = working; },
+        async abort() { working = new Uint8Array(0); },
+      };
+    });
+    const destination = {
+      handle: {
+        createWritable,
+        getFile: async () => new File([committed], 'preview.bin'),
+      },
+    };
+
+    await downloadPreviewWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      previewHandle: 'preview-handle-1',
+      destination,
+    });
+
+    expect(starts).toEqual([undefined, 1]);
+    expect([...committed]).toEqual([1, 2, 3]);
+    expect(createWritable).toHaveBeenNthCalledWith(1, { keepExistingData: false });
+    expect(createWritable).toHaveBeenNthCalledWith(2, { keepExistingData: true });
+    expect(apiMocks.streamAttachmentDownloadToWritable).not.toHaveBeenCalled();
+  });
+
+  it('recovers a reselected download after a page-level retry from its durable local byte boundary', async () => {
+    const { downloadPreviewWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const starts: number[] = [];
+    let secondInvocation = false;
+    const served = new WeakSet<FakeDataChannel>();
+    let committed = new Uint8Array(0);
+    const destination = {
+      handle: {
+        async getFile() { return new File([committed], 'preview.bin'); },
+        async createWritable(options?: { keepExistingData?: boolean }) {
+          let working = options?.keepExistingData ? committed.slice() : new Uint8Array(0);
+          let position = 0;
+          return {
+            async seek(next: number) { position = next; },
+            async write(data: BufferSource) {
+              const bytes = data instanceof ArrayBuffer
+                ? new Uint8Array(data)
+                : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+              const expanded = new Uint8Array(Math.max(working.length, position + bytes.length));
+              expanded.set(working);
+              expanded.set(bytes, position);
+              working = expanded;
+              position += bytes.length;
+            },
+            async close() { committed = working; },
+            async abort() {},
+          };
+        },
+      },
+    };
+    const firstWs = createWs(directCapabilities).ws;
+    const inner = FakePeerConnection.onDataChannel;
+    FakePeerConnection.onDataChannel = (channel, value) => {
+      if (typeof value === 'string') {
+        const payload = JSON.parse(value) as Record<string, unknown>;
+        if (payload.type === DIRECT_FILE_TRANSFER_DATA_MSG.START
+          && payload.direction === DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD) {
+          starts.push((payload.resumeOffset as number | undefined) ?? 0);
+        }
+        if (payload.type === DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT
+          && payload.direction === DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD) {
+          if (served.has(channel)) return;
+          served.add(channel);
+          const common = controlBinding(payload);
+          if (!secondInvocation) {
+            if (committed.length === 0) {
+              queueMicrotask(() => channel.dispatchEvent(new MessageEvent('message', { data: new Uint8Array([1]) })));
+            }
+            setTimeout(() => channel.close(), 0);
+          } else {
+            queueMicrotask(() => channel.dispatchEvent(new MessageEvent('message', { data: new Uint8Array([2, 3]) })));
+            setTimeout(() => channel.dispatchEvent(new MessageEvent('message', {
+              data: JSON.stringify({
+                type: DIRECT_FILE_TRANSFER_DATA_MSG.FINISH,
+                protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+                ...common,
+                totalBytes: 3,
+              }),
+            })), 0);
+          }
+          return;
+        }
+      }
+      inner?.(channel, value);
+    };
+    apiMocks.streamAttachmentDownloadToWritable.mockRejectedValueOnce(new Error('relay_offline'));
+
+    await expect(downloadPreviewWithDirectFallback({
+      ws: firstWs,
+      serverId: 'server-1',
+      previewHandle: 'page-retry-preview',
+      destination,
+    })).rejects.toThrow('relay_offline');
+    expect([...committed]).toEqual([1]);
+
+    secondInvocation = true;
+    const secondWs = createWs(directCapabilities).ws;
+    // createWs installs its own data handler; restore the page-retry handler.
+    const secondInner = FakePeerConnection.onDataChannel;
+    FakePeerConnection.onDataChannel = (channel, value) => {
+      if (typeof value === 'string') {
+        const payload = JSON.parse(value) as Record<string, unknown>;
+        if (payload.type === DIRECT_FILE_TRANSFER_DATA_MSG.START
+          && payload.direction === DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD) {
+          starts.push((payload.resumeOffset as number | undefined) ?? 0);
+        }
+        if (payload.type === DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT
+          && payload.direction === DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD) {
+          if (served.has(channel)) return;
+          served.add(channel);
+          const common = controlBinding(payload);
+          queueMicrotask(() => channel.dispatchEvent(new MessageEvent('message', { data: new Uint8Array([2, 3]) })));
+          setTimeout(() => channel.dispatchEvent(new MessageEvent('message', {
+            data: JSON.stringify({
+              type: DIRECT_FILE_TRANSFER_DATA_MSG.FINISH,
+              protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+              ...common,
+              totalBytes: 3,
+            }),
+          })), 0);
+          return;
+        }
+      }
+      secondInner?.(channel, value);
+    };
+    await downloadPreviewWithDirectFallback({
+      ws: secondWs,
+      serverId: 'server-1',
+      previewHandle: 'page-retry-preview',
+      destination,
+    });
+    expect(starts.at(-1)).toBe(1);
+    expect([...committed]).toEqual([1, 2, 3]);
+  });
+
+  it('persists an interrupted HTTP-only prefix and resumes it after page-level retry', async () => {
+    const { downloadPreviewWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    let committed = new Uint8Array(0);
+    const destination = {
+      handle: {
+        async getFile() { return new File([committed], 'preview.bin'); },
+        async createWritable(options?: { keepExistingData?: boolean }) {
+          let working = options?.keepExistingData ? committed.slice() : new Uint8Array(0);
+          let position = 0;
+          return {
+            async seek(next: number) { position = next; },
+            async write(data: BufferSource) {
+              const bytes = data instanceof ArrayBuffer
+                ? new Uint8Array(data)
+                : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+              const expanded = new Uint8Array(Math.max(working.length, position + bytes.length));
+              expanded.set(working);
+              expanded.set(bytes, position);
+              working = expanded;
+              position += bytes.length;
+            },
+            async close() { committed = working; },
+            async abort() {},
+          };
+        },
+      },
+    };
+    apiMocks.streamAttachmentDownloadToWritable
+      .mockImplementationOnce(async (...args: unknown[]) => {
+        const writer = args[2] as { write(data: BufferSource): Promise<void> };
+        const progress = args[5] as (value: { loadedBytes: number; totalBytes: number | null }) => void;
+        progress({ loadedBytes: 0, totalBytes: 3 });
+        await writer.write(new Uint8Array([1]));
+        progress({ loadedBytes: 1, totalBytes: 3 });
+        throw new TypeError('network_down');
+      })
+      .mockImplementationOnce(async (...args: unknown[]) => {
+        const writer = args[2] as { write(data: BufferSource): Promise<void> };
+        const progress = args[5] as (value: { loadedBytes: number; totalBytes: number | null }) => void;
+        expect(args[6]).toBe(1);
+        await writer.write(new Uint8Array([2, 3]));
+        progress({ loadedBytes: 3, totalBytes: 3 });
+      });
+
+    await expect(downloadPreviewWithDirectFallback({
+      ws: createWs([]).ws, serverId: 'server-1', previewHandle: 'http-page-retry', destination,
+    })).rejects.toThrow('network_down');
+    expect([...committed]).toEqual([1]);
+
+    await downloadPreviewWithDirectFallback({
+      ws: createWs([]).ws, serverId: 'server-1', previewHandle: 'http-page-retry', destination,
+    });
+    expect([...committed]).toEqual([1, 2, 3]);
+  });
+
   it('waits for a slow writer before replenishing credit or committing a finished download', async () => {
     const { downloadPreviewWithDirectFallback } = await import('../src/direct-file-transfer.js');
     let resolveWrite!: () => void;
@@ -1958,7 +2284,10 @@ describe('direct file transfer v2 browser broker', () => {
       onProgress: (value) => progress.push(value),
     });
     await vi.advanceTimersByTimeAsync(0);
-    await vi.waitFor(() => expect(progress).toContain(99));
+    // Filling the browser SCTP queue is not receiver progress.  Without a
+    // durable CREDIT this must not jump to the misleading 99% reported by the
+    // old implementation.
+    expect(progress).not.toContain(99);
     expect(progress).not.toContain(100);
     expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY)).toHaveLength(0);
 
@@ -1967,6 +2296,37 @@ describe('direct file transfer v2 browser broker', () => {
 
     expect(progress.at(-1)).toBe(100);
     expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY)).toHaveLength(1);
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT)).toHaveLength(1);
+    expect(apiMocks.uploadFile).not.toHaveBeenCalled();
+  });
+
+  it('keeps a 99%-phase upload alive while durable status remains attempting, then commits', async () => {
+    vi.useFakeTimers();
+    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities, 'commit_ack_lost_status_attempting_then_committed');
+    const progress: number[] = [];
+
+    const pending = uploadFileWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      file: createUploadFile('slow-commit.txt', 'durably transferred'),
+      onProgress: (value) => progress.push(value),
+    });
+    for (let index = 0; index < 10 && !progress.includes(99); index += 1) {
+      await vi.advanceTimersByTimeAsync(0);
+      await Promise.resolve();
+    }
+    expect(progress).toContain(99);
+
+    await vi.runOnlyPendingTimersAsync();
+    await Promise.resolve();
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY)).toHaveLength(1);
+    expect(progress).not.toContain(100);
+
+    await vi.runOnlyPendingTimersAsync();
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY)).toHaveLength(2);
+    expect(progress.at(-1)).toBe(100);
+    await expect(pending).resolves.toMatchObject({ attachment: { id: 'status-committed' } });
     expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT)).toHaveLength(1);
     expect(apiMocks.uploadFile).not.toHaveBeenCalled();
   });

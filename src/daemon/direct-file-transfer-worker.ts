@@ -1567,7 +1567,7 @@ async function startUpload(transfer: ActiveDirectTransfer, requestedResumeOffset
   }));
 }
 
-async function startDownload(transfer: ActiveDirectTransfer): Promise<void> {
+async function startDownload(transfer: ActiveDirectTransfer, requestedResumeOffset = 0): Promise<void> {
   const authority = transfer.authority;
   if (authority.direction !== DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD || transfer.started) return;
   let source: DirectFileDownloadSource;
@@ -1588,7 +1588,14 @@ async function startDownload(transfer: ActiveDirectTransfer): Promise<void> {
     return;
   }
   transfer.downloadSource = source;
+  if (!Number.isSafeInteger(requestedResumeOffset)
+    || requestedResumeOffset < 0
+    || requestedResumeOffset > source.size) {
+    await failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.SIZE_MISMATCH, false);
+    return;
+  }
   transfer.downloadFileHandle = await open(source.readPath, 'r');
+  transfer.received = requestedResumeOffset;
   transfer.started = true;
   resetTransferIdleTimer(transfer);
   transfer.channel?.sendMessage(JSON.stringify({
@@ -1843,7 +1850,8 @@ function attachChannel(transfer: ActiveDirectTransfer, channel: DataChannel, ear
         void startUpload(transfer, parsed.value.resumeOffset ?? 0)
           .catch((error) => void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED, true, errorDetail(error)));
       } else {
-        void startDownload(transfer).catch((error) => void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.PREVIEW_POLICY_DENIED, false, errorDetail(error)));
+        void startDownload(transfer, parsed.value.resumeOffset ?? 0)
+          .catch((error) => void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.PREVIEW_POLICY_DENIED, false, errorDetail(error)));
       }
       return;
     }

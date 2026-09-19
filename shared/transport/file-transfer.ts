@@ -20,6 +20,19 @@ export interface AttachmentRef {
   downloadable: boolean;
 }
 
+/**
+ * Filesystem identity of a controlled-node download source. This is carried
+ * only on the authenticated machine-transfer control path; it is deliberately
+ * separate from AttachmentRef so ordinary chat attachments do not expose host
+ * filesystem metadata.
+ */
+export interface FileTransferSourceIdentity {
+  size: number;
+  mtimeMs: number;
+  device: number;
+  inode: number;
+}
+
 export type PreviewType = 'text' | 'image' | 'pdf' | 'unsupported';
 export type PreviewReason = 'too_large' | 'binary' | 'unknown_type' | 'render_failed';
 
@@ -79,6 +92,44 @@ export const FILE_TRANSFER_RELAY_HEADER = {
   FILENAME: 'x-imcodes-filename',
   /** Byte the PUT body starts at; absent means the whole file. */
   OFFSET: 'x-imcodes-offset',
+} as const;
+
+export const FILE_TRANSFER_HTTP_HEADER = {
+  RANGE: 'range',
+  CONTENT_RANGE: 'content-range',
+  ACCEPT_RANGES: 'Accept-Ranges',
+} as const;
+
+/** Browser -> Server resumable upload multipart fields. */
+export const FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD = {
+  FILE: 'file',
+  CLIENT_UPLOAD_ID: 'clientUploadId',
+  DESTINATION_DIRECTORY: 'destinationDirectory',
+  OFFSET: 'uploadOffset',
+  TOTAL_SIZE: 'uploadTotalSize',
+  ORIGINAL_NAME: 'uploadOriginalName',
+  LAST_MODIFIED: 'uploadLastModified',
+} as const;
+
+export const FILE_TRANSFER_RESUMABLE_UPLOAD = {
+  /** Keeps multipart overhead bounded while avoiding hundreds of round trips. */
+  CHUNK_BYTES: 8 * 1024 * 1024,
+  MAX_ATTEMPTS_WITHOUT_PROGRESS: 5,
+  RETRY_BACKOFF_MS: [500, 1_000, 2_000, 4_000, 8_000] as const,
+} as const;
+
+export const FILE_TRANSFER_RESUMABLE_UPLOAD_ERROR = {
+  IDENTITY_MISMATCH: 'upload_identity_mismatch',
+  CONTENT_MISMATCH: 'upload_content_mismatch',
+  EXPIRED: 'upload_expired',
+} as const;
+
+export const FILE_TRANSFER_DOWNLOAD_RESUME = {
+  MAX_ATTEMPTS_WITHOUT_PROGRESS: 4,
+  MAX_RESUMES: 40,
+  BACKOFF_MS: [1_000, 2_000, 4_000, 8_000] as const,
+  /** Native download managers may spend one request per Range retry. */
+  TOKEN_MAX_USES: 42,
 } as const;
 
 /**
@@ -401,6 +452,8 @@ export interface FilePathHandleDone {
   type: typeof FILE_TRANSFER_MSG.PATH_HANDLE_DONE;
   requestId: string;
   attachment: AttachmentRef;
+  /** Required by machine-file callers before reusing a durable partial. */
+  sourceIdentity?: FileTransferSourceIdentity;
 }
 
 export interface FilePathHandleError {
@@ -500,6 +553,18 @@ function utf8Bytes(value: string): number {
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+export function validateFileTransferSourceIdentity(value: unknown): FileTransferSourceIdentity | null {
+  if (!isObject(value)
+    || !hasOnlyKeys(value, new Set(['size', 'mtimeMs', 'device', 'inode']))
+    || !isSafeSize(value.size)
+    || typeof value.mtimeMs !== 'number' || !Number.isFinite(value.mtimeMs) || value.mtimeMs < 0
+    || typeof value.device !== 'number' || !Number.isSafeInteger(value.device) || value.device < 0
+    || typeof value.inode !== 'number' || !Number.isSafeInteger(value.inode) || value.inode < 0) {
+    return null;
+  }
+  return value as unknown as FileTransferSourceIdentity;
 }
 
 function hasOnlyKeys(value: Record<string, unknown>, allowed: ReadonlySet<string>): boolean {
@@ -677,9 +742,21 @@ export function validateControlledFileTransferResponse(
   }
   if (v.type === FILE_TRANSFER_MSG.PATH_HANDLE_DONE) {
     const attachment = validateAttachmentRef(v.attachment);
-    if (!hasOnlyKeys(v, new Set(['type', 'requestId', 'attachment']))
-      || !isTransferId(v.requestId) || !attachment) return { ok: false, error: 'invalid_path_handle_done' };
-    return { ok: true, value: { type: v.type, requestId: v.requestId, attachment } };
+    const sourceIdentity = v.sourceIdentity === undefined
+      ? undefined
+      : validateFileTransferSourceIdentity(v.sourceIdentity);
+    if (!hasOnlyKeys(v, new Set(['type', 'requestId', 'attachment', 'sourceIdentity']))
+      || !isTransferId(v.requestId) || !attachment
+      || (v.sourceIdentity !== undefined && !sourceIdentity)) return { ok: false, error: 'invalid_path_handle_done' };
+    return {
+      ok: true,
+      value: {
+        type: v.type,
+        requestId: v.requestId,
+        attachment,
+        ...(sourceIdentity ? { sourceIdentity } : {}),
+      },
+    };
   }
   if (v.type === FILE_TRANSFER_MSG.PATH_HANDLE_ERROR) {
     const errors = new Set<string>(Object.values(FILE_PATH_HANDLE_ERROR));

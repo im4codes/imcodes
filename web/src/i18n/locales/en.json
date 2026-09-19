@@ -1711,6 +1711,8 @@
     "upload_file": "Upload file",
     "uploading": "Uploading...",
     "upload_failed": "Upload failed",
+    "retry": "Retry",
+    "dismiss_failure": "Dismiss",
     "cancel": "Stop",
     "cancel_named": "Stop uploading {{name}}",
     "cancel_confirm": "Stop uploading {{name}}? The current transfer will be discarded.",

@@ -11,6 +11,10 @@ import { CONTROLLED_NODE_MINT_ERRORS } from '@shared/controlled-node-artifacts.j
 import { normalizeClientTimezone } from '@shared/client-timezone.js';
 import { PREVIEW_ACCESS_TOKEN_QUERY_PARAM } from '@shared/preview-types.js';
 import {
+  FILE_TRANSFER_RESUMABLE_UPLOAD,
+  FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD,
+  FILE_TRANSFER_HTTP_HEADER,
+  FILE_TRANSFER_DOWNLOAD_RESUME,
   formatFileTransferRangeRequest,
   parseFileTransferContentRange,
 } from '@shared/transport/file-transfer.js';
@@ -1686,17 +1690,106 @@ export async function uploadFile(
   sessionName?: string,
   destinationDirectory?: string,
 ): Promise<{ ok: boolean; attachment: AttachmentRefResponse }> {
+  let highestProgress = 0;
+  const emitProgress = (pct: number) => {
+    highestProgress = Math.max(highestProgress, Math.min(100, Math.round(pct)));
+    onProgress?.(highestProgress);
+  };
+  if (!clientUploadId) {
+    const result = await uploadFileRequest({
+      serverId, file, wholeFile: file, offset: 0, emitProgress, signal, sessionName, destinationDirectory,
+    });
+    if (!('attachment' in result)) throw new ApiError(500, 'upload_incomplete');
+    return result;
+  }
+
+  let offset = 0;
+  let failuresWithoutProgress = 0;
+  while (offset < file.size || (file.size === 0 && offset === 0)) {
+    const end = Math.min(file.size, offset + FILE_TRANSFER_RESUMABLE_UPLOAD.CHUNK_BYTES);
+    const chunk = file.slice(offset, end, file.type);
+    try {
+      const result = await uploadFileRequest({
+        serverId,
+        file: chunk,
+        wholeFile: file,
+        offset,
+        clientUploadId,
+        emitProgress,
+        signal,
+        sessionName,
+        destinationDirectory,
+      });
+      if ('attachment' in result) return result;
+      if (!Number.isSafeInteger(result.committedBytes)
+        || result.committedBytes <= offset
+        || result.committedBytes > file.size) {
+        throw new ApiError(409, 'upload_offset_mismatch');
+      }
+      offset = result.committedBytes;
+      failuresWithoutProgress = 0;
+      if (file.size === 0) throw new ApiError(500, 'upload_incomplete');
+    } catch (error) {
+      if (signal?.aborted || (error instanceof Error && error.name === 'AbortError')) throw error;
+      const receiverOffset = error instanceof ResumableUploadOffsetError ? error.committedBytes : -1;
+      if (Number.isSafeInteger(receiverOffset)
+        && receiverOffset >= 0 && receiverOffset <= file.size && receiverOffset !== offset) {
+        offset = receiverOffset;
+        failuresWithoutProgress = 0;
+        continue;
+      }
+      const retryable = error instanceof ApiError
+        && (error.status === 0 || RESUMABLE_DOWNLOAD_STATUSES.has(error.status)
+          || (error instanceof ResumableUploadOffsetError && error.committedBytes === offset));
+      if (!retryable || ++failuresWithoutProgress > FILE_TRANSFER_RESUMABLE_UPLOAD.MAX_ATTEMPTS_WITHOUT_PROGRESS) throw error;
+      const backoff = FILE_TRANSFER_RESUMABLE_UPLOAD.RETRY_BACKOFF_MS;
+      await waitBeforeResume(backoff[Math.min(failuresWithoutProgress, backoff.length) - 1]!, signal);
+    }
+  }
+  throw new ApiError(500, 'upload_incomplete');
+}
+
+type UploadFileRequestResult =
+  | { ok: boolean; attachment: AttachmentRefResponse }
+  | { ok: true; complete: false; committedBytes: number };
+
+class ResumableUploadOffsetError extends ApiError {
+  constructor(status: number, body: string, readonly committedBytes: number) {
+    super(status, body);
+    this.name = 'ResumableUploadOffsetError';
+  }
+}
+
+async function uploadFileRequest(options: {
+  serverId: string;
+  file: Blob;
+  wholeFile: File;
+  offset: number;
+  clientUploadId?: string;
+  emitProgress: (pct: number) => void;
+  signal?: AbortSignal;
+  sessionName?: string;
+  destinationDirectory?: string;
+}): Promise<UploadFileRequestResult> {
   const form = new FormData();
-  form.append('file', file);
-  if (clientUploadId) form.append('clientUploadId', clientUploadId);
-  if (destinationDirectory) form.append('destinationDirectory', destinationDirectory);
+  form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.FILE, options.file, options.wholeFile.name);
+  if (options.clientUploadId) {
+    form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.CLIENT_UPLOAD_ID, options.clientUploadId);
+    form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.OFFSET, String(options.offset));
+    form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.TOTAL_SIZE, String(options.wholeFile.size));
+    form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.ORIGINAL_NAME, options.wholeFile.name || 'file');
+    form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.LAST_MODIFIED, String(options.wholeFile.lastModified));
+  }
+  if (options.destinationDirectory) {
+    form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.DESTINATION_DIRECTORY, options.destinationDirectory);
+  }
   const browserUploadWeight = 50;
   const daemonDownloadWeight = 50;
 
   // Use XHR for upload progress reporting
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', withSessionName(`${_baseUrl}/api/server/${serverId}/upload`, sessionName));
+    xhr.open('POST', withSessionName(`${_baseUrl}/api/server/${options.serverId}/upload`, options.sessionName));
     xhr.setRequestHeader('Accept', 'application/x-ndjson, application/json');
 
     // Auth headers (same as rawFetch)
@@ -1709,29 +1802,24 @@ export async function uploadFile(
     }
 
     xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable && onProgress) {
-        const transportPct = Math.round((e.loaded / e.total) * 100);
-        onProgress(Math.min(Math.round((transportPct / 100) * browserUploadWeight), browserUploadWeight));
+      if (e.lengthComputable) {
+        const chunkRatio = e.total > 0 ? Math.min(1, e.loaded / e.total) : 0;
+        const browserLoaded = options.offset + chunkRatio * options.file.size;
+        const wholeRatio = options.wholeFile.size > 0 ? browserLoaded / options.wholeFile.size : 1;
+        options.emitProgress(wholeRatio * browserUploadWeight);
       }
     };
 
     let processedResponseLength = 0;
-    let finalPayload: { ok: boolean; attachment: AttachmentRefResponse } | null = null;
+    let finalPayload: UploadFileRequestResult | null = null;
     let streamError: ApiError | null = null;
-    let highestProgress = 0;
     const abortError = () => {
       const error = new Error('upload_canceled');
       error.name = 'AbortError';
       return error;
     };
     const onSignalAbort = () => xhr.abort();
-    const cleanupAbortListener = () => signal?.removeEventListener('abort', onSignalAbort);
-
-    const emitProgress = (pct: number) => {
-      const next = Math.max(highestProgress, Math.min(100, Math.round(pct)));
-      highestProgress = next;
-      onProgress?.(next);
-    };
+    const cleanupAbortListener = () => options.signal?.removeEventListener('abort', onSignalAbort);
 
     const consumeProgressLines = (flush = false) => {
       const response = xhr.responseText ?? '';
@@ -1755,14 +1843,14 @@ export async function uploadFile(
         }
         if (msg.type === 'file.upload_progress') {
           const loaded = typeof msg.loaded === 'number' ? msg.loaded : 0;
-          const total = typeof msg.total === 'number' && msg.total > 0 ? msg.total : file.size;
+          const total = typeof msg.total === 'number' && msg.total > 0 ? msg.total : options.wholeFile.size;
           const daemonPct = total > 0 ? Math.min(1, loaded / total) : 0;
-          emitProgress(browserUploadWeight + daemonPct * daemonDownloadWeight);
+          options.emitProgress(browserUploadWeight + daemonPct * daemonDownloadWeight);
           continue;
         }
         if (msg.type === 'file.upload_done' && msg.attachment) {
           finalPayload = { ok: true, attachment: msg.attachment as AttachmentRefResponse };
-          emitProgress(100);
+          options.emitProgress(100);
           continue;
         }
         if (msg.type === 'file.upload_error') {
@@ -1791,13 +1879,22 @@ export async function uploadFile(
             resolve(finalPayload);
             return;
           }
-          const parsed = JSON.parse(xhr.responseText);
-          onProgress?.(100);
+          const parsed = JSON.parse(xhr.responseText) as UploadFileRequestResult;
+          if ('attachment' in parsed) options.emitProgress(100);
           resolve(parsed);
         }
         catch { reject(new ApiError(xhr.status, 'Invalid JSON response')); }
       } else {
-        reject(new ApiError(xhr.status, xhr.responseText));
+        let committedBytes = -1;
+        try {
+          const parsed = JSON.parse(xhr.responseText) as { committedBytes?: unknown };
+          if (typeof parsed.committedBytes === 'number' && Number.isSafeInteger(parsed.committedBytes)) {
+            committedBytes = parsed.committedBytes;
+          }
+        } catch { /* ApiError retains the raw response below */ }
+        reject(xhr.status === 409 && committedBytes >= 0
+          ? new ResumableUploadOffsetError(xhr.status, xhr.responseText, committedBytes)
+          : new ApiError(xhr.status, xhr.responseText));
       }
     };
 
@@ -1809,11 +1906,11 @@ export async function uploadFile(
       cleanupAbortListener();
       reject(abortError());
     };
-    if (signal?.aborted) {
+    if (options.signal?.aborted) {
       reject(abortError());
       return;
     }
-    signal?.addEventListener('abort', onSignalAbort, { once: true });
+    options.signal?.addEventListener('abort', onSignalAbort, { once: true });
     xhr.send(form);
   });
 }
@@ -1838,13 +1935,7 @@ export interface AttachmentDownloadProgress {
  * failing the whole file: the node → server → browser relay crosses networks
  * that drop long-lived streams (seen live: a 165 MB fallback dying at 6.6 MB).
  */
-export const ATTACHMENT_DOWNLOAD_RESUME = {
-  /** Consecutive interruptions that made no progress before giving up. */
-  MAX_ATTEMPTS_WITHOUT_PROGRESS: 4,
-  /** Upper bound on resumes for one download, however much each one moved. */
-  MAX_RESUMES: 40,
-  BACKOFF_MS: [1_000, 2_000, 4_000, 8_000] as const,
-} as const;
+export const ATTACHMENT_DOWNLOAD_RESUME = FILE_TRANSFER_DOWNLOAD_RESUME;
 const RESUMABLE_DOWNLOAD_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
 
 /** A failure on the network side of a download: safe to resume. */
@@ -1891,10 +1982,14 @@ export async function streamAttachmentDownloadToWritable(
   sessionName?: string,
   signal?: AbortSignal,
   onProgress?: (progress: AttachmentDownloadProgress) => void,
+  resumeFromBytes = 0,
 ): Promise<void> {
   throwIfDownloadAborted(signal);
   const path = withSessionName(`/api/server/${encodeURIComponent(serverId)}/uploads/${encodeURIComponent(attachmentId)}/download`, sessionName);
-  const state = { loadedBytes: 0, totalBytes: null as number | null };
+  if (!Number.isSafeInteger(resumeFromBytes) || resumeFromBytes < 0) {
+    throw new ApiError(400, 'download_resume_offset_invalid');
+  }
+  const state = { loadedBytes: resumeFromBytes, totalBytes: null as number | null };
   let resumes = 0;
   let withoutProgress = 0;
   for (;;) {
@@ -1950,7 +2045,7 @@ async function streamAttachmentDownloadAttempt(
   } else {
     // A resumed response must continue exactly where the file on disk ends,
     // for the same file.
-    const range = res.status === 206 ? parseFileTransferContentRange(res.headers.get('content-range')) : null;
+    const range = res.status === 206 ? parseFileTransferContentRange(res.headers.get(FILE_TRANSFER_HTTP_HEADER.CONTENT_RANGE)) : null;
     if (!range || range.start !== resumeFrom
       || (state.totalBytes !== null && range.total !== state.totalBytes)) {
       throw new ApiError(res.status, 'download_resume_mismatch');

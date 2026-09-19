@@ -44,6 +44,9 @@ import {
   validateFileDeleteRequest,
   validateFileDirectoryListRequest,
   FILE_TRANSFER_RELAY_HEADER,
+  FILE_TRANSFER_HTTP_HEADER,
+  formatFileTransferRangeRequest,
+  parseFileTransferContentRange,
 } from '../../shared/transport/file-transfer.js';
 import {
   resolveWellKnownDirectoryDetailed,
@@ -54,6 +57,7 @@ import {
 import { resolveMacosUserSession, launchMacosUserSessionCommand } from '../node/user-session-launcher.js';
 import { DIRECT_FILE_TRANSFER_COMMIT_INTENT_SUFFIX } from '../../shared/direct-file-transfer.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
+import { MACHINE_DIRECT_RESUME_FILE_PREFIX } from '../../shared/machine-direct-file-transfer.js';
 import { resolveCanonical, validateCanonicalRealPath } from './file-preview-path-policy.js';
 import type { ValidatedRealPath } from './file-preview-path-policy.js';
 export type { ValidatedRealPath } from './file-preview-path-policy.js';
@@ -100,6 +104,7 @@ interface AttachmentEntry {
   /** Local-handle identity prevents path replacement between mint and read. */
   device?: number;
   inode?: number;
+  mtimeMs?: number;
 }
 
 interface DownloadTarget {
@@ -230,7 +235,8 @@ export async function resolveDirectFileDownloadSource(attachmentId: string): Pro
       // Overlay/container filesystems can immediately reuse an inode when a
       // path is unlinked and recreated. Preserve the minted size as an
       // additional identity component so that replacement still fails closed.
-      || (entry.size !== undefined && current.size !== entry.size)) {
+      || (entry.size !== undefined && current.size !== entry.size)
+      || (entry.mtimeMs !== undefined && current.mtimeMs !== entry.mtimeMs)) {
       throw new Error('download_failed');
     }
   }
@@ -552,16 +558,34 @@ async function fetchRelayUpload(
   let lastErr: unknown;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
+      let loaded = await stat(resolved).then((entry) => entry.size).catch(() => 0);
+      if (loaded > expectedSize) {
+        await unlink(resolved).catch(() => {});
+        loaded = 0;
+      }
       const response = await fetch(downloadUrl, {
+        ...(loaded > 0 ? { headers: { Range: formatFileTransferRangeRequest(loaded) } } : {}),
         signal: AbortSignal.timeout(FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS),
       });
+      if (response.status === 416 && loaded === expectedSize) return loaded;
       if (!response.ok) {
         throw new Error(`relay_fetch_${response.status}`);
       }
       if (!response.body) {
         throw new Error('relay_fetch_empty_body');
       }
-      let loaded = 0;
+      if (loaded > 0) {
+        const range = response.status === 206
+          ? parseFileTransferContentRange(response.headers.get(FILE_TRANSFER_HTTP_HEADER.CONTENT_RANGE))
+          : null;
+        if (range) {
+          if (range.start !== loaded || range.total !== expectedSize) throw new Error('relay_resume_mismatch');
+        } else {
+          // Rolling compatibility with an older Server that ignored Range:
+          // restart explicitly rather than appending a second whole file.
+          loaded = 0;
+        }
+      }
       let lastPct = -1;
       let lastSentAt = 0;
       const reportProgress = (force = false) => {
@@ -585,7 +609,7 @@ async function fetchRelayUpload(
       await pipeline(
         Readable.fromWeb(response.body as never),
         progress,
-        createWriteStream(resolved),
+        createWriteStream(resolved, loaded > 0 ? { flags: 'a' } : undefined),
       );
       const fileStat = await stat(resolved);
       if (fileStat.size !== expectedSize) {
@@ -596,7 +620,6 @@ async function fetchRelayUpload(
       return fileStat.size;
     } catch (err) {
       lastErr = err;
-      await unlink(resolved).catch(() => {});
       if (attempt < 3) {
         await new Promise((resolve) => setTimeout(resolve, attempt * 250));
       }
@@ -637,6 +660,7 @@ async function recoverRegistry(): Promise<void> {
     const now = Date.now();
     for (const file of files) {
       if (file.endsWith('.meta.json')) continue; // skip sidecar files
+      if (file.startsWith(MACHINE_DIRECT_RESUME_FILE_PREFIX)) continue;
       // A commit intent describes an upload mid-publish; it is bookkeeping, not
       // an uploaded file, and must never surface as a downloadable attachment.
       if (file.endsWith(DIRECT_FILE_TRANSFER_COMMIT_INTENT_SUFFIX)) continue;
@@ -948,7 +972,7 @@ export function createProjectFileHandleFromValidatedPath(
   originalName: string,
   mime?: string,
   size?: number,
-  identity?: { device: number; inode: number },
+  identity?: { device: number; inode: number; mtimeMs?: number },
   clientUploadId?: string,
 ): AttachmentRef {
   const daemonPath = String(validatedRealPath);
@@ -967,7 +991,11 @@ export function createProjectFileHandleFromValidatedPath(
     size,
     createdAt: now,
     expiresAt: now + FILE_TRANSFER_LIMITS.HANDLE_TTL_MS,
-    ...(identity ? { device: identity.device, inode: identity.inode } : {}),
+    ...(identity ? {
+      device: identity.device,
+      inode: identity.inode,
+      ...(identity.mtimeMs !== undefined ? { mtimeMs: identity.mtimeMs } : {}),
+    } : {}),
     ...(clientUploadId ? { clientUploadId } : {}),
   });
 
@@ -1227,9 +1255,19 @@ export async function handleFilePathHandle(cmd: Record<string, unknown>, sender:
       path.basename(requested),
       undefined,
       requestedStat.size,
-      { device: requestedStat.dev, inode: requestedStat.ino },
+      { device: requestedStat.dev, inode: requestedStat.ino, mtimeMs: requestedStat.mtimeMs },
     );
-    sender.send({ type: FILE_TRANSFER_MSG.PATH_HANDLE_DONE, requestId: parsed.value.requestId, attachment });
+    sender.send({
+      type: FILE_TRANSFER_MSG.PATH_HANDLE_DONE,
+      requestId: parsed.value.requestId,
+      attachment,
+      sourceIdentity: {
+        size: requestedStat.size,
+        mtimeMs: requestedStat.mtimeMs,
+        device: requestedStat.dev,
+        inode: requestedStat.ino,
+      },
+    });
   } catch (err) {
     sender.send({
       type: FILE_TRANSFER_MSG.PATH_HANDLE_ERROR,

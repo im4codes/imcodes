@@ -14,7 +14,11 @@ import {
   FILE_TRANSFER_UPLOAD_ERROR_CODE,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+  FILE_TRANSFER_HTTP_HEADER,
   FILE_TRANSFER_RELAY_HEADER,
+  FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD,
+  FILE_TRANSFER_RESUMABLE_UPLOAD_ERROR,
+  FILE_TRANSFER_DOWNLOAD_RESUME,
   formatFileTransferContentRange,
   parseFileTransferRangeRequest,
   FILE_TRANSFER_DELETE_ERROR,
@@ -25,6 +29,7 @@ import {
   validateFileDeleteRequest,
   validateFileDirectoryListRequest,
   validateFilePathHandleRequest,
+  validateFileTransferSourceIdentity,
   validateMacosOpenFullDiskAccessRequest,
 } from '../../../shared/transport/file-transfer.js';
 import {
@@ -59,7 +64,8 @@ import type {
 } from '../../../shared/transport/file-transfer.js';
 import logger from '../util/logger.js';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, open, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { PassThrough, Readable } from 'node:stream';
@@ -72,7 +78,7 @@ export const fileTransferRoutes = new Hono<{ Bindings: Env; Variables: { userId:
 // without needing auth cookies. Android download handoff may request the same
 // URL more than once, so tokens are resource-bound and short-lived with a small
 // use budget instead of being consumed on the first GET.
-const DOWNLOAD_TOKEN_MAX_USES = 5;
+const DOWNLOAD_TOKEN_MAX_USES = FILE_TRANSFER_DOWNLOAD_RESUME.TOKEN_MAX_USES;
 const MULTIPART_UPLOAD_OVERHEAD_BYTES = 1024 * 1024;
 const STAGED_UPLOAD_PREFIX = 'imcodes-staged-upload-';
 const STAGED_UPLOAD_FETCH_CLEANUP_GRACE_MS = 30_000;
@@ -98,6 +104,7 @@ const stagedUploads = new Map<string, {
   expiresAt: number;
   timer: ReturnType<typeof setTimeout>;
   deleteAfterFetchTimer?: ReturnType<typeof setTimeout>;
+  preserveUntilExpires?: boolean;
 }>();
 const stagedDownloads = new Map<string, {
   serverId: string;
@@ -115,16 +122,16 @@ const stagedDownloads = new Map<string, {
 
 /** Every attachment download advertises resume support. */
 function setAttachmentRangeHeaders(c: Context, offset: number, total: number | undefined): number {
-  c.header('Accept-Ranges', 'bytes');
+  c.header(FILE_TRANSFER_HTTP_HEADER.ACCEPT_RANGES, 'bytes');
   if (offset > 0 && total !== undefined) {
-    c.header('Content-Range', formatFileTransferContentRange(offset, total));
+    c.header(FILE_TRANSFER_HTTP_HEADER.CONTENT_RANGE, formatFileTransferContentRange(offset, total));
     return 206;
   }
   return 200;
 }
 
 function rangeNotSatisfiable(c: Context, total: number): Response {
-  c.header('Content-Range', `bytes */${total}`);
+  c.header(FILE_TRANSFER_HTTP_HEADER.CONTENT_RANGE, `bytes */${total}`);
   return c.json({ error: 'range_not_satisfiable' }, 416);
 }
 
@@ -204,6 +211,7 @@ function deleteStagedUpload(uploadId: string): void {
 function scheduleStagedUploadFetchCleanup(uploadId: string): void {
   const entry = stagedUploads.get(uploadId);
   if (!entry || entry.deleteAfterFetchTimer) return;
+  if (entry.preserveUntilExpires) return;
   entry.deleteAfterFetchTimer = setTimeout(
     () => deleteStagedUpload(uploadId),
     STAGED_UPLOAD_FETCH_CLEANUP_GRACE_MS,
@@ -218,6 +226,194 @@ async function persistStagedUpload(file: File, filePath: string): Promise<number
   );
   const fileStat = await stat(filePath);
   return fileStat.size;
+}
+
+type ResumableBrowserUploadMeta = {
+  version: 1;
+  serverId: string;
+  userId: string;
+  clientUploadId: string;
+  filename: string;
+  originalName: string;
+  mime?: string;
+  destinationDirectory?: string;
+  totalSize: number;
+  lastModified: number;
+  expiresAt: number;
+  chunkSha256: Record<string, string>;
+};
+
+const resumableUploadLocks = new Map<string, Promise<void>>();
+let lastResumableUploadSweepAt = 0;
+
+async function sweepExpiredResumableUploads(now = Date.now()): Promise<void> {
+  if (now - lastResumableUploadSweepAt < 60 * 60 * 1000) return;
+  lastResumableUploadSweepAt = now;
+  const names = await readdir(tmpdir()).catch(() => []);
+  const prefix = `${STAGED_UPLOAD_PREFIX}resume-`;
+  await Promise.all(names.filter((name) => name.startsWith(prefix)).slice(0, 64).map(async (name) => {
+    const dir = path.join(tmpdir(), name);
+    const metaPath = path.join(dir, 'upload.json');
+    const expiresAt = await readFile(metaPath, 'utf8')
+      .then((raw) => (JSON.parse(raw) as { expiresAt?: unknown }).expiresAt)
+      .catch(() => undefined);
+    const fallbackExpiry = await stat(dir).then((entry) => entry.mtimeMs + FILE_TRANSFER_LIMITS.STAGED_UPLOAD_TTL_MS).catch(() => 0);
+    if ((typeof expiresAt === 'number' ? expiresAt : fallbackExpiry) < now) {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }));
+}
+
+async function withResumableUploadLock<T>(key: string, action: () => Promise<T>): Promise<T> {
+  const prior = resumableUploadLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  const queued = prior.then(() => current);
+  resumableUploadLocks.set(key, queued);
+  await prior;
+  try {
+    return await action();
+  } finally {
+    release();
+    if (resumableUploadLocks.get(key) === queued) resumableUploadLocks.delete(key);
+  }
+}
+
+function resumableUploadPaths(serverId: string, userId: string, clientUploadId: string): {
+  key: string;
+  dir: string;
+  filePath: string;
+  metaPath: string;
+} {
+  const key = createHash('sha256').update(`${serverId}\0${userId}\0${clientUploadId}`).digest('hex');
+  const dir = path.join(tmpdir(), `${STAGED_UPLOAD_PREFIX}resume-${key}`);
+  return { key, dir, filePath: path.join(dir, 'upload.part'), metaPath: path.join(dir, 'upload.json') };
+}
+
+async function writeResumableUploadMeta(metaPath: string, meta: ResumableBrowserUploadMeta): Promise<void> {
+  const temporary = `${metaPath}.${randomHex(8)}.tmp`;
+  await writeFile(temporary, JSON.stringify(meta), { mode: 0o600 });
+  await rename(temporary, metaPath);
+}
+
+async function hashExistingRange(filePath: string, offset: number, length: number): Promise<string> {
+  const handle = await open(filePath, 'r');
+  try {
+    const bytes = Buffer.allocUnsafe(length);
+    let read = 0;
+    while (read < length) {
+      const result = await handle.read(bytes, read, length - read, offset + read);
+      if (result.bytesRead <= 0) throw new Error('upload_state_short_read');
+      read += result.bytesRead;
+    }
+    return createHash('sha256').update(bytes).digest('hex');
+  } finally {
+    await handle.close();
+  }
+}
+
+async function acceptResumableBrowserChunk(params: {
+  serverId: string;
+  userId: string;
+  clientUploadId: string;
+  chunk: File;
+  offset: number;
+  totalSize: number;
+  originalName: string;
+  lastModified: number;
+  destinationDirectory?: string;
+}): Promise<{
+  complete: boolean;
+  committedBytes: number;
+  dir: string;
+  filePath: string;
+  filename: string;
+  mime?: string;
+}> {
+  const paths = resumableUploadPaths(params.serverId, params.userId, params.clientUploadId);
+  await sweepExpiredResumableUploads();
+  return withResumableUploadLock(paths.key, async () => {
+    await mkdir(paths.dir, { recursive: true, mode: 0o700 });
+    let meta: ResumableBrowserUploadMeta | null = null;
+    try {
+      meta = JSON.parse(await readFile(paths.metaPath, 'utf8')) as ResumableBrowserUploadMeta;
+    } catch { /* first chunk */ }
+    if (!meta) {
+      if (params.offset !== 0) throw Object.assign(new Error('upload_offset_mismatch'), { committedBytes: 0 });
+      const ext = path.extname(params.originalName).replace(/[^a-zA-Z0-9.]/g, '').slice(0, 20);
+      meta = {
+        version: 1,
+        serverId: params.serverId,
+        userId: params.userId,
+        clientUploadId: params.clientUploadId,
+        filename: `${randomHex(16)}${ext}`,
+        originalName: params.originalName,
+        ...(params.chunk.type ? { mime: params.chunk.type } : {}),
+        ...(params.destinationDirectory ? { destinationDirectory: params.destinationDirectory } : {}),
+        totalSize: params.totalSize,
+        lastModified: params.lastModified,
+        expiresAt: Date.now() + FILE_TRANSFER_LIMITS.STAGED_UPLOAD_TTL_MS,
+        chunkSha256: {},
+      };
+      await writeFile(paths.filePath, new Uint8Array(0), { flag: 'wx', mode: 0o600 }).catch(async (error) => {
+        const existing = await stat(paths.filePath).catch(() => null);
+        if (!existing) throw error;
+      });
+      await writeResumableUploadMeta(paths.metaPath, meta);
+    }
+    if (meta.version !== 1
+      || meta.serverId !== params.serverId
+      || meta.userId !== params.userId
+      || meta.clientUploadId !== params.clientUploadId
+      || meta.originalName !== params.originalName
+      || meta.totalSize !== params.totalSize
+      || meta.lastModified !== params.lastModified
+      || (meta.mime ?? '') !== (params.chunk.type || '')
+      || (meta.destinationDirectory ?? '') !== (params.destinationDirectory ?? '')) {
+      throw new Error(FILE_TRANSFER_RESUMABLE_UPLOAD_ERROR.IDENTITY_MISMATCH);
+    }
+    if (Date.now() > meta.expiresAt) {
+      await rm(paths.dir, { recursive: true, force: true });
+      throw new Error(FILE_TRANSFER_RESUMABLE_UPLOAD_ERROR.EXPIRED);
+    }
+    const committedBytes = await stat(paths.filePath).then((entry) => entry.size);
+    if (committedBytes > meta.totalSize) throw new Error('upload_state_invalid');
+    if (params.offset > committedBytes) {
+      throw Object.assign(new Error('upload_offset_mismatch'), { committedBytes });
+    }
+    const chunkBytes = Buffer.from(await params.chunk.arrayBuffer());
+    const chunkHash = createHash('sha256').update(chunkBytes).digest('hex');
+    if (params.offset < committedBytes) {
+      if (params.offset + chunkBytes.length > committedBytes) {
+        throw Object.assign(new Error('upload_offset_mismatch'), { committedBytes });
+      }
+      const knownHash = meta.chunkSha256[String(params.offset)]
+        ?? await hashExistingRange(paths.filePath, params.offset, chunkBytes.length);
+      if (knownHash !== chunkHash) throw new Error(FILE_TRANSFER_RESUMABLE_UPLOAD_ERROR.CONTENT_MISMATCH);
+      return {
+        complete: committedBytes === meta.totalSize,
+        committedBytes,
+        dir: paths.dir,
+        filePath: paths.filePath,
+        filename: meta.filename,
+        ...(meta.mime ? { mime: meta.mime } : {}),
+      };
+    }
+    if (committedBytes + chunkBytes.length > meta.totalSize) throw new Error('upload_size_mismatch');
+    await appendFile(paths.filePath, chunkBytes);
+    const nextCommitted = committedBytes + chunkBytes.length;
+    meta.chunkSha256[String(params.offset)] = chunkHash;
+    meta.expiresAt = Date.now() + FILE_TRANSFER_LIMITS.STAGED_UPLOAD_TTL_MS;
+    await writeResumableUploadMeta(paths.metaPath, meta);
+    return {
+      complete: nextCommitted === meta.totalSize,
+      committedBytes: nextCommitted,
+      dir: paths.dir,
+      filePath: paths.filePath,
+      filename: meta.filename,
+      ...(meta.mime ? { mime: meta.mime } : {}),
+    };
+  });
 }
 
 function buildRelayUrl(requestUrl: string, configuredServerUrl: string | undefined): URL {
@@ -595,18 +791,22 @@ fileTransferRoutes.get('/:id/upload-staged/:uploadId', async (c) => {
     return c.json({ error: 'expired' }, 410);
   }
 
-  const fileStream = createReadStream(entry.filePath);
+  const offset = parseFileTransferRangeRequest(c.req.header(FILE_TRANSFER_HTTP_HEADER.RANGE)) ?? 0;
+  if (offset >= entry.size && entry.size > 0) return rangeNotSatisfiable(c, entry.size);
+  const fileStream = createReadStream(entry.filePath, offset > 0 ? { start: offset } : undefined);
   fileStream.once('end', () => scheduleStagedUploadFetchCleanup(uploadId));
   fileStream.once('error', (err) => {
     logger.warn({ uploadId, err }, 'Staged upload stream failed');
   });
 
+  const status = setAttachmentRangeHeaders(c, offset, entry.size);
+  c.header('Content-Type', entry.mime || 'application/octet-stream');
+  c.header('Content-Length', String(entry.size - offset));
+  c.header('Cache-Control', 'no-store');
   return new Response(Readable.toWeb(fileStream) as ReadableStream, {
-    status: 200,
+    status,
     headers: {
-      'Content-Type': entry.mime || 'application/octet-stream',
-      'Content-Length': String(entry.size),
-      'Cache-Control': 'no-store',
+      ...Object.fromEntries(c.res.headers.entries()),
     },
   });
 });
@@ -727,12 +927,13 @@ fileTransferRoutes.post('/:id/machine-file-handle', async (c) => {
       if (reason === 'not_found') return c.json({ error: reason }, 404);
       return c.json({ error: reason }, 400);
     }
-    if (result.type !== FILE_TRANSFER_MSG.PATH_HANDLE_DONE || !result.attachment) {
+    const sourceIdentity = validateFileTransferSourceIdentity(result.sourceIdentity);
+    if (result.type !== FILE_TRANSFER_MSG.PATH_HANDLE_DONE || !result.attachment || !sourceIdentity) {
       return c.json({ error: 'invalid_daemon_response' }, 502);
     }
     const attachment = result.attachment as AttachmentRef;
     attachment.serverId = serverId;
-    return c.json({ ok: true, attachment });
+    return c.json({ ok: true, attachment, sourceIdentity });
   } catch (err) {
     const reason = err instanceof Error ? err.message : 'path_handle_failed';
     if (reason === 'daemon_offline' || reason === 'daemon_disconnected' || reason === 'daemon_generation_changed') {
@@ -953,13 +1154,13 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   const formData = await c.req.formData().catch(() => null);
   if (!formData) return c.json({ error: 'invalid_body' }, 400);
 
-  const file = formData.get('file');
+  const file = formData.get(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.FILE);
   if (!file || !(file instanceof File)) return c.json({ error: 'missing_file' }, 400);
-  const rawClientUploadId = formData.get('clientUploadId');
+  const rawClientUploadId = formData.get(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.CLIENT_UPLOAD_ID);
   const clientUploadId = typeof rawClientUploadId === 'string' && isDirectFileTransferClientUploadId(rawClientUploadId)
     ? rawClientUploadId
     : undefined;
-  const rawDestinationDirectory = formData.get('destinationDirectory');
+  const rawDestinationDirectory = formData.get(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.DESTINATION_DIRECTORY);
   const destinationDirectory = typeof rawDestinationDirectory === 'string' && rawDestinationDirectory.trim()
     ? rawDestinationDirectory.trim()
     : undefined;
@@ -970,6 +1171,29 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
     if (!controlledGate.controlled || !controlledGate.bridge.hasDaemonCapability(FILE_TRANSFER_DIRECTORY_CAPABILITY)) {
       return c.json({ error: 'capability_unavailable' }, 409);
     }
+  }
+
+  const rawUploadOffset = formData.get(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.OFFSET);
+  const rawUploadTotalSize = formData.get(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.TOTAL_SIZE);
+  const rawUploadOriginalName = formData.get(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.ORIGINAL_NAME);
+  const rawUploadLastModified = formData.get(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.LAST_MODIFIED);
+  const resumableRequested = rawUploadOffset !== null
+    || rawUploadTotalSize !== null
+    || rawUploadOriginalName !== null
+    || rawUploadLastModified !== null;
+  const uploadOffset = typeof rawUploadOffset === 'string' ? Number(rawUploadOffset) : Number.NaN;
+  const uploadTotalSize = typeof rawUploadTotalSize === 'string' ? Number(rawUploadTotalSize) : Number.NaN;
+  const uploadOriginalName = typeof rawUploadOriginalName === 'string' ? rawUploadOriginalName : '';
+  const uploadLastModified = typeof rawUploadLastModified === 'string' ? Number(rawUploadLastModified) : Number.NaN;
+  if (resumableRequested && (
+    !clientUploadId
+    || !Number.isSafeInteger(uploadOffset) || uploadOffset < 0
+    || !Number.isSafeInteger(uploadTotalSize) || uploadTotalSize < 0 || uploadTotalSize > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE
+    || uploadOffset + file.size > uploadTotalSize
+    || !uploadOriginalName || Buffer.byteLength(uploadOriginalName, 'utf8') > 1024
+    || !Number.isSafeInteger(uploadLastModified) || uploadLastModified < 0
+  )) {
+    return c.json({ error: 'invalid_resumable_upload' }, 400);
   }
 
   // Size check
@@ -996,15 +1220,52 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
 
   // Generate upload ID and sanitized filename
   const uploadId = randomHex(16);
-  const ext = path.extname(file.name || '').replace(/[^a-zA-Z0-9.]/g, '').slice(0, 20);
-  const filename = `${randomHex(16)}${ext}`;
-  const stagedDir = await mkdtemp(path.join(tmpdir(), STAGED_UPLOAD_PREFIX));
-  const stagedPath = path.join(stagedDir, filename);
-  const stagedSize = await persistStagedUpload(file, stagedPath).catch(async (err) => {
-    await rm(stagedDir, { recursive: true, force: true }).catch(() => {});
-    throw err;
-  });
-  if (stagedSize !== file.size) {
+  let filename: string;
+  let stagedDir: string;
+  let stagedPath: string;
+  let stagedSize: number;
+  let stagedMime = file.type || undefined;
+  if (resumableRequested) {
+    let accepted;
+    try {
+      accepted = await acceptResumableBrowserChunk({
+        serverId,
+        userId,
+        clientUploadId: clientUploadId!,
+        chunk: file,
+        offset: uploadOffset,
+        totalSize: uploadTotalSize,
+        originalName: uploadOriginalName,
+        lastModified: uploadLastModified,
+        ...(destinationDirectory ? { destinationDirectory } : {}),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'upload_failed';
+      const committedBytes = (error as { committedBytes?: unknown } | null)?.committedBytes;
+      return c.json({
+        error: message,
+        ...(typeof committedBytes === 'number' ? { committedBytes } : {}),
+      }, message === 'upload_offset_mismatch' ? 409 : 400);
+    }
+    if (!accepted.complete) {
+      return c.json({ ok: true, complete: false, committedBytes: accepted.committedBytes });
+    }
+    filename = accepted.filename;
+    stagedDir = accepted.dir;
+    stagedPath = accepted.filePath;
+    stagedSize = accepted.committedBytes;
+    stagedMime = accepted.mime;
+  } else {
+    const ext = path.extname(file.name || '').replace(/[^a-zA-Z0-9.]/g, '').slice(0, 20);
+    filename = `${randomHex(16)}${ext}`;
+    stagedDir = await mkdtemp(path.join(tmpdir(), STAGED_UPLOAD_PREFIX));
+    stagedPath = path.join(stagedDir, filename);
+    stagedSize = await persistStagedUpload(file, stagedPath).catch(async (err) => {
+      await rm(stagedDir, { recursive: true, force: true }).catch(() => {});
+      throw err;
+    });
+  }
+  if (stagedSize !== (resumableRequested ? uploadTotalSize : file.size)) {
     await rm(stagedDir, { recursive: true, force: true }).catch(() => {});
     return c.json({ error: 'upload_failed', message: 'size_mismatch' }, 400);
   }
@@ -1013,6 +1274,7 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   let legacyStageDeleted = false;
   const cleanupUploadStage = () => {
     if (relayStaged) {
+      if (resumableRequested) return;
       deleteStagedUpload(uploadId);
       return;
     }
@@ -1036,9 +1298,10 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
       dir: stagedDir,
       filePath: stagedPath,
       size: stagedSize,
-      mime: file.type || undefined,
+      mime: stagedMime,
       expiresAt,
       timer,
+      ...(resumableRequested ? { preserveUntilExpires: true } : {}),
     });
     relayStaged = true;
 
@@ -1046,9 +1309,9 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
       type: 'file.upload_fetch',
       uploadId,
       filename,
-      originalName: file.name || undefined,
-      mime: file.type || undefined,
-      size: file.size,
+      originalName: (resumableRequested ? uploadOriginalName : file.name) || undefined,
+      mime: stagedMime,
+      size: stagedSize,
       downloadUrl: buildStagedUploadUrl(c.req.url, c.env.SERVER_URL, serverId, uploadId, token),
       ...(negotiatedClientUploadId ? { clientUploadId: negotiatedClientUploadId } : {}),
       ...(destinationDirectory ? { destinationDirectory } : {}),
@@ -1058,9 +1321,9 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
       type: 'file.upload',
       uploadId,
       filename,
-      originalName: file.name || undefined,
-      mime: file.type || undefined,
-      size: file.size,
+      originalName: (resumableRequested ? uploadOriginalName : file.name) || undefined,
+      mime: stagedMime,
+      size: stagedSize,
       content: (await readFile(stagedPath)).toString('base64'),
       ...(negotiatedClientUploadId ? { clientUploadId: negotiatedClientUploadId } : {}),
       ...(destinationDirectory ? { destinationDirectory } : {}),
@@ -1309,7 +1572,7 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
   const downloadId = randomHex(16);
   const supportsStreamDownload = bridge.hasDaemonCapability?.(FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY) === true;
   // Resume of an interrupted download (`Range: bytes=N-`).
-  const offset = parseFileTransferRangeRequest(c.req.header('range'));
+  const offset = parseFileTransferRangeRequest(c.req.header(FILE_TRANSFER_HTTP_HEADER.RANGE));
 
   try {
     if (supportsStreamDownload) {

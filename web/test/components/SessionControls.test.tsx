@@ -306,6 +306,11 @@ const onUserPrefChangedMock = vi.fn((cb: (key: string, value: unknown) => void) 
   return () => window.removeEventListener('imcodes:user-pref-changed', handler as EventListener);
 });
 vi.mock('../../src/api.js', () => ({
+  ApiError: class ApiError extends Error {
+    constructor(public status: number, public code: string) {
+      super(code);
+    }
+  },
   uploadFile: (...args: unknown[]) => uploadFileMock(...args),
   deleteAttachment: (...args: unknown[]) => deleteAttachmentMock(...args),
   getUserPref: async (key: string) => {
@@ -9035,6 +9040,43 @@ afterEach(() => {
     await waitFor(() => expect(document.querySelector('[data-testid="composer-upload-row"]')).toBeNull());
     expect(observedSignal?.aborted).toBe(true);
     expect(screen.queryByText('Upload failed')).toBeNull();
+  });
+
+  it('keeps a failed 99%-phase upload visible and retries the same File instead of failing silently', async () => {
+    const file = new File(['resume me'], 'failed-at-99.txt', { type: 'text/plain', lastModified: 123 });
+    uploadFileMock
+      .mockImplementationOnce((_serverId: string, _file: File, onProgress?: (pct: number) => void) => {
+        onProgress?.(99);
+        return Promise.reject(new Error('transient network failure'));
+      })
+      .mockResolvedValueOnce({ attachment: { daemonPath: '/tmp/failed-at-99.txt' } });
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession({ name: 'my-session' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    fireEvent.paste(screen.getByRole('textbox'), {
+      clipboardData: { files: [file], getData: () => '' },
+    });
+
+    const retry = await screen.findByRole('button', { name: 'retry: failed-at-99.txt' });
+    const failedRow = screen.getByText('failed-at-99.txt').closest('[data-testid="composer-upload-row"]') as HTMLElement;
+    expect(within(failedRow).getByText('failed-at-99.txt')).toBeTruthy();
+    expect(within(failedRow).getByTestId('composer-upload-progress').textContent).toBe('99%');
+    expect(uploadFileMock).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(retry);
+    await waitFor(() => expect(uploadFileMock).toHaveBeenCalledTimes(2));
+    expect(uploadFileMock.mock.calls[0]?.[1]).toBe(file);
+    expect(uploadFileMock.mock.calls[1]?.[1]).toBe(file);
+    await waitFor(() => {
+      expect(screen.queryByTestId('composer-upload-row')).toBeNull();
+      expect(document.querySelector('.attachment-badge-name')?.textContent).toBe('failed-at-99.txt');
+    });
   });
 
   it('deletes the daemon upload when the existing attachment x is clicked without confirmation', async () => {

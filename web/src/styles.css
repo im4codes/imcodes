@@ -1642,6 +1642,40 @@ html.native-ios-mac .chat-dl-btn {
   background: rgba(153, 27, 27, 0.32);
   color: #fecaca;
 }
+.composer-upload-error-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.composer-upload-retry,
+.composer-upload-dismiss {
+  appearance: none;
+  min-height: 20px;
+  padding: 1px 7px;
+  border: 1px solid rgba(96, 165, 250, 0.42);
+  border-radius: 999px;
+  background: rgba(30, 64, 175, 0.2);
+  color: #bfdbfe;
+  cursor: pointer;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 700;
+}
+.composer-upload-dismiss {
+  border-color: rgba(148, 163, 184, 0.32);
+  background: rgba(51, 65, 85, 0.2);
+  color: #cbd5e1;
+}
+.composer-upload-retry:hover,
+.composer-upload-retry:focus-visible {
+  border-color: rgba(96, 165, 250, 0.78);
+  background: rgba(30, 64, 175, 0.38);
+}
+.composer-upload-dismiss:hover,
+.composer-upload-dismiss:focus-visible {
+  border-color: rgba(148, 163, 184, 0.64);
+  background: rgba(51, 65, 85, 0.4);
+}
 .composer-upload-stats {
   display: flex;
   grid-column: 1 / -1;

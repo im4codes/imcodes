@@ -1680,6 +1680,48 @@ describe('daemon direct file transfer v2 lease broker', () => {
     await direct.shutdownDirectFileTransfers();
   });
 
+  it('serves only the missing download tail from the receiver-authoritative resume offset', async () => {
+    const { direct, sender } = await readyLease();
+    const authority = downloadPrepare({
+      ...binding({
+        direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD,
+        operationId: 'download-resume-op',
+        attemptId: 'download-resume-att',
+        requestId: 'download-resume-req',
+      }),
+      clientDownloadId: 'download-resume-op',
+      channelLabel: 'imcodes-file-download-resume',
+    });
+    await direct.handleDirectFileTransferCommand(authority, sender);
+    const channel = new FakeDataChannel(authority.channelLabel as string);
+    FakePeerConnection.latest!.emitDataChannel(channel);
+    const downloadBinding = binding({
+      direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD,
+      operationId: 'download-resume-op',
+      attemptId: 'download-resume-att',
+      requestId: 'download-resume-req',
+    });
+    channel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...downloadBinding,
+      authority: authority.authority,
+      resumeOffset: 3,
+    }));
+    await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    channel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...downloadBinding,
+      creditBytes: 8,
+    }));
+    await vi.waitFor(() => expect(channel.sent.some(
+      (message) => message instanceof Uint8Array && Buffer.from(message).toString() === 'nload',
+    )).toBe(true));
+    await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining('"totalBytes":8')));
+    await direct.shutdownDirectFileTransfers();
+  });
+
   it('withholds download bytes while the data-channel buffer is above the shared high-water mark', async () => {
     const { direct, sender } = await readyLease();
     const authority = downloadPrepare({

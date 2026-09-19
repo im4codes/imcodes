@@ -44,11 +44,15 @@ import {
   readWebRtcCandidateType,
   toWebRtcIceServers,
 } from '@shared/webrtc-connectivity.js';
-import { FILE_TRANSFER_LIMITS } from '@shared/transport/file-transfer.js';
+import {
+  FILE_TRANSFER_LIMITS,
+  FILE_TRANSFER_RESUMABLE_UPLOAD_ERROR,
+} from '@shared/transport/file-transfer.js';
 import {
   downloadAttachment,
   streamAttachmentDownloadToWritable,
   uploadFile,
+  ApiError,
   type AttachmentRefResponse,
 } from './api.js';
 import { canUseNativeFileShare, shareBlobOrDownload } from './browser-download.js';
@@ -171,12 +175,15 @@ export class DirectFileTransferFailure extends Error {
 
 export interface FileSystemWritableFileStreamLike {
   write(data: BufferSource): Promise<void>;
+  seek?(position: number): Promise<void>;
+  truncate?(size: number): Promise<void>;
   close(): Promise<void>;
   abort(reason?: unknown): Promise<void>;
 }
 
 export interface FileSystemFileHandleLike {
   createWritable(options?: { keepExistingData?: boolean }): Promise<FileSystemWritableFileStreamLike>;
+  getFile?(): Promise<File>;
 }
 
 export interface DirectPreviewDownloadDestination {
@@ -320,6 +327,11 @@ type DirectDownloadAttempt = {
   operationId: string;
   sessionName?: string;
   writer: FileSystemWritableFileStreamLike;
+  /** Bytes durably committed in the caller-owned destination. */
+  resumeFromBytes?: number;
+  /** A retry must never splice bytes from a replacement source file. */
+  expectedTotalBytes?: number;
+  onDurableProgress?: (committedBytes: number, totalBytes: number) => void;
   onProgress?: (progress: FileDownloadProgress) => void;
   onConnected?: () => void;
   signal?: AbortSignal;
@@ -331,6 +343,193 @@ type OperationSuccess = { kind: 'upload'; attachment: AttachmentRefResponse } | 
 
 const brokers = new WeakMap<WsClient, Map<string, Lease>>();
 const TAB_ID_STORAGE_KEY = 'imcodes.direct_file.browser_tab.v2';
+const UPLOAD_RESUME_ID_STORAGE_PREFIX = 'imcodes.file_upload.resume.v1:';
+const DOWNLOAD_RESUME_STATE_STORAGE_PREFIX = 'imcodes.file_download.resume.v1:';
+const DOWNLOAD_RESUME_STATE_TTL_MS = 24 * 60 * 60 * 1000;
+const TRANSFER_RESUME_STORAGE_MAX_ENTRIES = 64;
+const TRANSFER_RESUME_STORAGE_SCAN_LIMIT = 256;
+
+type UploadResumeState = { clientUploadId: string; updatedAt: number };
+
+function transferResumeStateUpdatedAt(key: string, value: string): number | null {
+  try {
+    const parsed = JSON.parse(value) as { updatedAt?: unknown } | null;
+    return parsed && Number.isSafeInteger(parsed.updatedAt) ? parsed.updatedAt as number : null;
+  } catch {
+    // Upload identities written by the first resumable release were raw UUIDs.
+    // They cannot prove freshness, so bounded cleanup may safely restart them.
+    return key.startsWith(UPLOAD_RESUME_ID_STORAGE_PREFIX) ? 0 : null;
+  }
+}
+
+/** Keep restart state useful but bounded even when many transfers are abandoned. */
+function sweepTransferResumeStorage(preserveKey?: string): void {
+  try {
+    const entries: Array<{ key: string; updatedAt: number }> = [];
+    const expired: string[] = [];
+    const count = Math.min(localStorage.length, TRANSFER_RESUME_STORAGE_SCAN_LIMIT);
+    for (let index = 0; index < count; index += 1) {
+      const key = localStorage.key(index);
+      if (!key || (!key.startsWith(UPLOAD_RESUME_ID_STORAGE_PREFIX)
+        && !key.startsWith(DOWNLOAD_RESUME_STATE_STORAGE_PREFIX))) continue;
+      const value = localStorage.getItem(key);
+      if (value === null) continue;
+      const updatedAt = transferResumeStateUpdatedAt(key, value);
+      if (updatedAt === null || Date.now() - updatedAt > DOWNLOAD_RESUME_STATE_TTL_MS) {
+        if (key !== preserveKey) expired.push(key);
+        continue;
+      }
+      entries.push({ key, updatedAt });
+    }
+    for (const key of expired) localStorage.removeItem(key);
+    entries.sort((left, right) => right.updatedAt - left.updatedAt);
+    for (const entry of entries.slice(TRANSFER_RESUME_STORAGE_MAX_ENTRIES)) {
+      if (entry.key !== preserveKey) localStorage.removeItem(entry.key);
+    }
+  } catch { /* restricted storage */ }
+}
+
+function stableTransferFingerprint(parts: unknown[]): string {
+  const metadata = JSON.stringify(parts);
+  let left = 0x811c9dc5;
+  let right = 0x9e3779b9;
+  for (let index = 0; index < metadata.length; index += 1) {
+    const code = metadata.charCodeAt(index);
+    left = Math.imul(left ^ code, 0x01000193) >>> 0;
+    right = Math.imul(right ^ code, 0x85ebca6b) >>> 0;
+  }
+  return `${left.toString(16).padStart(8, '0')}${right.toString(16).padStart(8, '0')}`;
+}
+
+function resumableUploadIdentity(options: {
+  serverId: string;
+  sessionName?: string;
+  destinationDirectory?: string;
+  file: File;
+}): { clientUploadId: string; storageKey: string | null } {
+  // File metadata is available synchronously during the user gesture, so
+  // deriving this lookup key never delays direct-channel setup or consumes
+  // file slices that belong to the transfer pump. The receiving Server still
+  // hashes every accepted chunk and rejects content changes fail-closed.
+  const fingerprint = stableTransferFingerprint([
+    options.serverId,
+    options.sessionName ?? '',
+    options.destinationDirectory ?? '',
+    options.file.name,
+    options.file.size,
+    options.file.lastModified,
+    options.file.type,
+  ]);
+  const storageKey = `${UPLOAD_RESUME_ID_STORAGE_PREFIX}${fingerprint}`;
+  try {
+    sweepTransferResumeStorage(storageKey);
+    const existing = localStorage.getItem(storageKey);
+    if (existing) {
+      try {
+        const parsed = JSON.parse(existing) as Partial<UploadResumeState> | null;
+        if (parsed && typeof parsed.clientUploadId === 'string' && parsed.clientUploadId) {
+          localStorage.setItem(storageKey, JSON.stringify({
+            clientUploadId: parsed.clientUploadId,
+            updatedAt: Date.now(),
+          } satisfies UploadResumeState));
+          return { clientUploadId: parsed.clientUploadId, storageKey };
+        }
+      } catch {
+        // Migrate the original raw-UUID representation in place.
+        localStorage.setItem(storageKey, JSON.stringify({
+          clientUploadId: existing,
+          updatedAt: Date.now(),
+        } satisfies UploadResumeState));
+        return { clientUploadId: existing, storageKey };
+      }
+      localStorage.removeItem(storageKey);
+    }
+    const created = crypto.randomUUID();
+    localStorage.setItem(storageKey, JSON.stringify({
+      clientUploadId: created,
+      updatedAt: Date.now(),
+    } satisfies UploadResumeState));
+    sweepTransferResumeStorage(storageKey);
+    return { clientUploadId: created, storageKey };
+  } catch {
+    return { clientUploadId: crypto.randomUUID(), storageKey: null };
+  }
+}
+
+type DownloadResumeState = { committedBytes: number; totalBytes: number; updatedAt: number };
+
+function downloadResumeStorageKey(options: {
+  serverId: string;
+  sessionName?: string;
+  previewHandle: string;
+}): string {
+  return `${DOWNLOAD_RESUME_STATE_STORAGE_PREFIX}${stableTransferFingerprint([
+    options.serverId,
+    options.sessionName ?? '',
+    options.previewHandle,
+  ])}`;
+}
+
+function readDownloadResumeState(key: string): DownloadResumeState | null {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(key) ?? 'null') as Partial<DownloadResumeState> | null;
+    if (!parsed
+      || !Number.isSafeInteger(parsed.committedBytes) || parsed.committedBytes! < 0
+      || !Number.isSafeInteger(parsed.totalBytes) || parsed.totalBytes! < parsed.committedBytes!
+      || !Number.isSafeInteger(parsed.updatedAt)
+      || Date.now() - parsed.updatedAt! > DOWNLOAD_RESUME_STATE_TTL_MS) {
+      localStorage.removeItem(key);
+      return null;
+    }
+    return parsed as DownloadResumeState;
+  } catch {
+    return null;
+  }
+}
+
+function writeDownloadResumeState(key: string, committedBytes: number, totalBytes: number): void {
+  if (!Number.isSafeInteger(committedBytes) || committedBytes < 0
+    || !Number.isSafeInteger(totalBytes) || totalBytes < committedBytes) return;
+  try {
+    localStorage.setItem(key, JSON.stringify({ committedBytes, totalBytes, updatedAt: Date.now() }));
+    sweepTransferResumeStorage(key);
+  } catch { /* restricted or full storage */ }
+}
+
+function clearDownloadResumeState(key: string): void {
+  try { localStorage.removeItem(key); } catch { /* restricted storage */ }
+}
+
+function clearResumableUploadIdentity(storageKey: string | null, clientUploadId: string): void {
+  if (!storageKey) return;
+  try {
+    const stored = localStorage.getItem(storageKey);
+    if (!stored) return;
+    let storedId = stored;
+    try {
+      const parsed = JSON.parse(stored) as Partial<UploadResumeState> | null;
+      if (parsed && typeof parsed.clientUploadId === 'string') storedId = parsed.clientUploadId;
+    } catch { /* legacy raw UUID */ }
+    if (storedId === clientUploadId) localStorage.removeItem(storageKey);
+  } catch { /* restricted storage */ }
+}
+
+function shouldCommitInterruptedHttpPrefix(
+  error: unknown,
+  signal: AbortSignal | undefined,
+  progress: FileDownloadProgress | null,
+  initialBytes: number,
+): boolean {
+  if (signal?.aborted || (error instanceof Error && error.name === 'AbortError')) return false;
+  // ApiError covers authorization, range/integrity and explicit HTTP terminal
+  // responses. The streaming helper unwraps exhausted network interruptions to
+  // their transport cause, so only that non-ApiError path may retain bytes.
+  if (error instanceof ApiError) return false;
+  return progress !== null
+    && progress.totalBytes !== null
+    && progress.loadedBytes > initialBytes
+    && progress.loadedBytes <= progress.totalBytes;
+}
 
 function browserTabId(): string {
   try {
@@ -1631,7 +1830,6 @@ async function pumpUpload(
   lease: Lease,
   active: ActiveAttempt,
   file: File,
-  onProgress?: (pct: number) => void,
 ): Promise<void> {
   const commit = active.uploadCommit;
   const pumpStartedAt = Date.now();
@@ -1670,10 +1868,12 @@ async function pumpUpload(
       });
     }
     offset = end;
-    // 100% means the daemon has durably committed the attachment, not merely
-    // that the browser filled the SCTP send queue. Keeping the byte phase at
-    // 99 avoids a false-complete row while FINISH is being fsynced/renamed.
-    onProgress?.(file.size ? Math.min(99, Math.round((offset / file.size) * 100)) : 99);
+    // Do not report bytes merely handed to the browser's SCTP queue as bytes
+    // transferred.  In particular, a file smaller than the 8 MiB high-water
+    // mark can be queued immediately while a TURN/cross-region route still
+    // needs many seconds to deliver it.  That made the UI jump to 99% and look
+    // frozen for the whole real transfer.  Receiver CREDIT frames below are
+    // the authoritative, durable progress signal.
   }
   recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.BYTES, {
     direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD,
@@ -1742,10 +1942,21 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
     } catch { /* best effort */ }
   };
   let downloadWriterAborted = false;
-  const abortDownloadWriter = async (error: unknown) => {
+  let downloadCommittedBytes = op.kind === 'download' ? (op.resumeFromBytes ?? 0) : 0;
+  let downloadWriteChain: Promise<void> = Promise.resolve();
+  const settleDownloadWriter = async (error: unknown, preserve: boolean) => {
     if (op.kind !== 'download' || downloadWriterAborted) return;
     downloadWriterAborted = true;
-    await op.writer.abort(error).catch(() => undefined);
+    if (preserve) {
+      await downloadWriteChain.catch(() => undefined);
+      await op.writer.close().catch(() => undefined);
+      op.resumeFromBytes = downloadCommittedBytes;
+      if (op.expectedTotalBytes !== undefined) {
+        op.onDurableProgress?.(downloadCommittedBytes, op.expectedTotalBytes);
+      }
+    } else {
+      await op.writer.abort(error).catch(() => undefined);
+    }
   };
   try {
     const init = makeOperationInit(lease, active, op);
@@ -1800,19 +2011,27 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
       stage: DIRECT_FILE_TRANSFER_STAGE.CHANNEL_OPEN,
       elapsedMs: Date.now() - channelStartedAt,
     });
+    const resumeOffset = op.resumeFromBytes ?? 0;
+    if (op.kind === 'download' && resumeOffset > 0) {
+      if (!op.writer.seek) throw directError(DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED, false, 'download_resume_seek_unavailable');
+      await op.writer.seek(resumeOffset);
+    }
 
     const result = await new Promise<OperationSuccess>((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout> | null = null;
       let settled = false;
       let started = false;
       let uploadSourceFinished = false;
-      let uploadStatusRecoveryRequested = false;
+      let uploadStatusRecoveryOutstanding = false;
+      let uploadStatusRecoveryQueries = 0;
       let received = 0;
       let expected = -1;
       let writeChain: Promise<void> = Promise.resolve();
       const requestUploadStatusRecovery = () => {
-        if (op.kind !== 'upload' || uploadStatusRecoveryRequested) return false;
-        uploadStatusRecoveryRequested = true;
+        if (op.kind !== 'upload' || uploadStatusRecoveryOutstanding
+          || uploadStatusRecoveryQueries >= DIRECT_FILE_TRANSFER_LIMITS.MAX_STATUS_RECOVERY_QUERIES) return false;
+        uploadStatusRecoveryOutstanding = true;
+        uploadStatusRecoveryQueries += 1;
         try {
           sendControl(lease, {
             type: DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY,
@@ -1850,7 +2069,8 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
       };
       const fail = (error: unknown) => {
         if (op.kind === 'download') {
-          void abortDownloadWriter(error).finally(() => finish(error));
+          const preserve = failureDisposition(error, attempt) !== DIRECT_FILE_TRANSFER_FAILURE_DISPOSITION.TERMINAL;
+          void settleDownloadWriter(error, preserve).finally(() => finish(error));
         } else finish(error);
       };
       const onAbort = () => fail(directError(DIRECT_FILE_TRANSFER_ERROR.CANCELED, false));
@@ -1868,6 +2088,7 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
         } catch (error) {
           throw directError(DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED, false, error instanceof Error ? error.message : undefined);
         }
+        downloadOp.onDurableProgress?.(received, expected);
         recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.BYTES, {
           direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD,
           bytes: received,
@@ -1897,7 +2118,7 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
             fail(directError(DIRECT_FILE_TRANSFER_ERROR.SIZE_MISMATCH, false));
             return;
           }
-          writeChain = writeChain.then(async () => {
+          writeChain = downloadWriteChain = writeChain.then(async () => {
             try {
               // Copy into an ordinary ArrayBuffer.  DOM WebRTC can surface a
               // SharedArrayBuffer-backed view, while File System Access only
@@ -1909,6 +2130,7 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
               throw directError(DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED, false, error instanceof Error ? error.message : undefined);
             }
             received += bytes.byteLength;
+            downloadCommittedBytes = received;
             op.onProgress?.({ loadedBytes: received, totalBytes: expected });
             arm();
             sendData(channel, {
@@ -1941,7 +2163,7 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
           if (data.type === DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED && !started) {
             started = true;
             op.onConnected?.();
-            void pumpUpload(channel, lease, active, op.file, op.onProgress).then(() => {
+            void pumpUpload(channel, lease, active, op.file).then(() => {
               if (settled) return;
               uploadSourceFinished = true;
               arm(DIRECT_FILE_TRANSFER_LIMITS.STATUS_RECOVERY_DEADLINE_MS);
@@ -1970,6 +2192,11 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
             }
             tracker.committedBytes = committed;
             tracker.advances += 1;
+            // Receiver CREDIT is emitted only after its write() resolves.
+            // Keep 100 reserved for the attachment registry/rename commit.
+            op.onProgress?.(tracker.totalBytes
+              ? Math.min(99, Math.round((committed / tracker.totalBytes) * 100))
+              : 99);
             return;
           }
           if (data.type === DIRECT_FILE_TRANSFER_DATA_MSG.UPLOAD_COMMITTED) {
@@ -1982,8 +2209,19 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
         if (data.type === DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED && !started && data.direction === DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD) {
           started = true;
           expected = data.size;
+          if (op.expectedTotalBytes !== undefined && op.expectedTotalBytes !== expected) {
+            fail(directError(DIRECT_FILE_TRANSFER_ERROR.SIZE_MISMATCH, false));
+            return;
+          }
+          op.expectedTotalBytes = expected;
+          received = op.resumeFromBytes ?? 0;
+          downloadCommittedBytes = received;
+          if (received > expected) {
+            fail(directError(DIRECT_FILE_TRANSFER_ERROR.SIZE_MISMATCH, false));
+            return;
+          }
           op.onConnected?.();
-          op.onProgress?.({ loadedBytes: 0, totalBytes: expected });
+          op.onProgress?.({ loadedBytes: received, totalBytes: expected });
           sendData(channel, {
             type: DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT,
             protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
@@ -2016,6 +2254,7 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
           return;
         }
         if (message.type !== DIRECT_FILE_TRANSFER_MSG.STATUS) return;
+        uploadStatusRecoveryOutstanding = false;
         recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.STATUS_RECOVERED, {
           direction: active.direction,
           attempt: active.attempt,
@@ -2052,7 +2291,6 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
       channel.addEventListener('close', onClose, { once: true });
       channel.addEventListener('error', onError, { once: true });
       op.signal?.addEventListener('abort', onAbort, { once: true });
-      const resumeOffset = op.kind === 'upload' ? (op.resumeFromBytes ?? 0) : 0;
       sendData(channel, {
         type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
         protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
@@ -2075,7 +2313,10 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
       if (active.authority) retainTerminalGrace(lease, active);
     }
     cancel();
-    await abortDownloadWriter(error);
+    await settleDownloadWriter(
+      error,
+      failureDisposition(error, attempt) !== DIRECT_FILE_TRANSFER_FAILURE_DISPOSITION.TERMINAL,
+    );
     throw error;
   } finally {
     // Hand this attempt's OWN confirmed offset to the next one. Each attempt
@@ -2087,6 +2328,8 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
       if (confirmed > (op.resumeFromBytes ?? 0) && confirmed <= op.file.size) {
         op.resumeFromBytes = confirmed;
       }
+    } else if (downloadCommittedBytes > (op.resumeFromBytes ?? 0)) {
+      op.resumeFromBytes = downloadCommittedBytes;
     }
     cleanup();
   }
@@ -2156,22 +2399,30 @@ async function retryDirect<T>(
   lease: Lease,
   createOperation: (attempt: number) => Promise<DirectAttempt> | DirectAttempt,
   signal?: AbortSignal,
+  initial?: { resumeFromBytes: number; expectedDownloadBytes: number },
 ): Promise<T> {
   let last: unknown = directError(DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR);
   // Carried between attempts of the SAME operation: how far the receiver was
   // last seen to have durably committed. Only ever written from an offset the
   // finished attempt confirmed on its own live channel.
-  let resumeFromBytes = 0;
+  let resumeFromBytes = initial?.resumeFromBytes ?? 0;
+  let expectedDownloadBytes: number | undefined = initial?.expectedDownloadBytes;
   for (let attempt = 1; attempt <= DIRECT_FILE_TRANSFER_LIMITS.MAX_ATTEMPTS; attempt++) {
     if (attempt > 1) await wait(retryDelay(attempt - 1, last), signal);
     const attemptControlEpoch = lease.controlEpoch;
     const operation = await createOperation(attempt);
-    if (operation.kind === 'upload' && resumeFromBytes > 0) operation.resumeFromBytes = resumeFromBytes;
+    if (resumeFromBytes > 0) operation.resumeFromBytes = resumeFromBytes;
+    if (operation.kind === 'download' && expectedDownloadBytes !== undefined) {
+      operation.expectedTotalBytes = expectedDownloadBytes;
+    }
     try {
       return await runAttempt(lease, operation, attempt) as T;
     } catch (error) {
-      if (operation.kind === 'upload' && (operation.resumeFromBytes ?? 0) > resumeFromBytes) {
+      if ((operation.resumeFromBytes ?? 0) > resumeFromBytes) {
         resumeFromBytes = operation.resumeFromBytes ?? 0;
+      }
+      if (operation.kind === 'download' && operation.expectedTotalBytes !== undefined) {
+        expectedDownloadBytes = operation.expectedTotalBytes;
       }
       last = error;
       const disposition = failureDisposition(error, attempt);
@@ -2238,7 +2489,7 @@ export async function uploadFileWithDirectFallback(options: {
   signal?: AbortSignal;
   destinationDirectory?: string;
 }): Promise<{ ok: boolean; attachment: AttachmentRefResponse }> {
-  const clientUploadId = crypto.randomUUID();
+  const { clientUploadId, storageKey } = resumableUploadIdentity(options);
   const broker = options.ws ? getBroker(options.ws, options.serverId) : null;
   if (options.ws && supportsUpload(options.ws)
     && (!options.destinationDirectory || supportsDirectoryUpload(options.ws))) {
@@ -2270,6 +2521,7 @@ export async function uploadFileWithDirectFallback(options: {
         options.serverId,
         options.destinationDirectory,
       );
+      clearResumableUploadIdentity(storageKey, clientUploadId);
       return direct;
     } catch (error) {
       // User cancellation is terminal. The internal 20-second deadline uses
@@ -2277,7 +2529,12 @@ export async function uploadFileWithDirectFallback(options: {
       const forcedFallbackCancellation = directConnectTimedOut && isFileUploadCanceled(error);
       if (options.signal?.aborted
         || (!forcedFallbackCancellation
-          && (isFileUploadCanceled(error) || isTerminalDirectFailure(error)))) throw error;
+          && (isFileUploadCanceled(error) || isTerminalDirectFailure(error)))) {
+        if (isFileUploadCanceled(error) || options.signal?.aborted) {
+          clearResumableUploadIdentity(storageKey, clientUploadId);
+        }
+        throw error;
+      }
       if (options.file.size > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
         throw directError(DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, false, 'relay_size_limit');
       }
@@ -2294,12 +2551,25 @@ export async function uploadFileWithDirectFallback(options: {
     setConnectionStatus(broker, DIRECT_FILE_CONNECTION_STATUS.RELAY);
   }
   options.onMode?.(FILE_UPLOAD_TRANSPORT_MODE.RELAY);
-  if (options.destinationDirectory !== undefined) {
-    return uploadFile(options.serverId, options.file, options.onProgress, clientUploadId, options.signal, options.sessionName, options.destinationDirectory);
-  }
-  return options.sessionName
+  const result = options.destinationDirectory !== undefined
+    ? await uploadFile(options.serverId, options.file, options.onProgress, clientUploadId, options.signal, options.sessionName, options.destinationDirectory)
+    : options.sessionName
     ? uploadFile(options.serverId, options.file, options.onProgress, clientUploadId, options.signal, options.sessionName)
     : uploadFile(options.serverId, options.file, options.onProgress, clientUploadId, options.signal);
+  try {
+    const settled = await result;
+    clearResumableUploadIdentity(storageKey, clientUploadId);
+    return settled;
+  } catch (error) {
+    if (error instanceof ApiError && (
+      error.code === FILE_TRANSFER_RESUMABLE_UPLOAD_ERROR.IDENTITY_MISMATCH
+      || error.code === FILE_TRANSFER_RESUMABLE_UPLOAD_ERROR.CONTENT_MISMATCH
+      || error.code === FILE_TRANSFER_RESUMABLE_UPLOAD_ERROR.EXPIRED
+    )) {
+      clearResumableUploadIdentity(storageKey, clientUploadId);
+    }
+    throw error;
+  }
 }
 
 export async function selectPreviewDownloadDestination(suggestedName?: string): Promise<DirectPreviewDownloadDestination | null> {
@@ -2329,11 +2599,16 @@ type NativeBlobDownloadSink = {
 
 function createNativeBlobDownloadSink(): NativeBlobDownloadSink {
   let completedBlob: Blob | null = null;
+  let committed = new Uint8Array(0);
   return {
     destination: {
       handle: {
-        async createWritable() {
-          const chunks: ArrayBuffer[] = [];
+        async getFile() {
+          return new File([committed], 'download');
+        },
+        async createWritable(options) {
+          let working = options?.keepExistingData ? committed.slice() : new Uint8Array(0);
+          let position = 0;
           let settled = false;
           completedBlob = null;
           return {
@@ -2342,19 +2617,37 @@ function createNativeBlobDownloadSink(): NativeBlobDownloadSink {
               const bytes = data instanceof ArrayBuffer
                 ? new Uint8Array(data)
                 : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-              const copy = new Uint8Array(bytes.byteLength);
-              copy.set(bytes);
-              chunks.push(copy.buffer);
+              const required = position + bytes.byteLength;
+              if (required > working.byteLength) {
+                const expanded = new Uint8Array(required);
+                expanded.set(working);
+                working = expanded;
+              }
+              working.set(bytes, position);
+              position = required;
+            },
+            async seek(nextPosition) {
+              if (settled || !Number.isSafeInteger(nextPosition) || nextPosition < 0 || nextPosition > working.byteLength) {
+                throw new Error('download_seek_invalid');
+              }
+              position = nextPosition;
+            },
+            async truncate(size) {
+              if (settled || !Number.isSafeInteger(size) || size < 0) throw new Error('download_truncate_invalid');
+              const resized = new Uint8Array(size);
+              resized.set(working.subarray(0, Math.min(size, working.byteLength)));
+              working = resized;
+              position = Math.min(position, size);
             },
             async close() {
               if (settled) throw new Error('download_writer_closed');
               settled = true;
-              completedBlob = new Blob(chunks);
-              chunks.length = 0;
+              committed = working;
+              completedBlob = new Blob([committed]);
             },
             async abort() {
               settled = true;
-              chunks.length = 0;
+              working = new Uint8Array(0);
             },
           };
         },
@@ -2387,11 +2680,29 @@ async function presentNativeDownloadedBlob(options: {
   }
 }
 
-async function createPreviewWriter(destination: DirectPreviewDownloadDestination): Promise<FileSystemWritableFileStreamLike> {
+async function createPreviewWriter(
+  destination: DirectPreviewDownloadDestination,
+  resumeFromBytes = 0,
+): Promise<FileSystemWritableFileStreamLike> {
   try {
-    return await destination.handle.createWritable();
+    const writer = await destination.handle.createWritable({ keepExistingData: resumeFromBytes > 0 });
+    if (resumeFromBytes > 0) {
+      if (!writer.seek) throw new Error('download_resume_seek_unavailable');
+      await writer.seek(resumeFromBytes);
+    }
+    return writer;
   } catch (error) {
     throw directError(DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED, false, error instanceof Error ? error.message : undefined);
+  }
+}
+
+async function committedDestinationBytes(destination: DirectPreviewDownloadDestination): Promise<number> {
+  if (!destination.handle.getFile) return 0;
+  try {
+    const file = await destination.handle.getFile();
+    return Number.isSafeInteger(file.size) && file.size >= 0 ? file.size : 0;
+  } catch {
+    return 0;
   }
 }
 
@@ -2428,31 +2739,53 @@ export async function downloadPreviewWithDirectFallback(options: {
     await (options.httpFallback ?? (() => downloadAttachment(options.serverId, options.previewHandle, options.sessionName, options.signal)))();
     return;
   }
+  const resumeStorageKey = downloadResumeStorageKey(options);
+  const storedResume = readDownloadResumeState(resumeStorageKey);
+  const destinationBytes = await committedDestinationBytes(destination);
+  const initialResume = storedResume && destinationBytes === storedResume.committedBytes
+    ? storedResume
+    : null;
+  if (storedResume && !initialResume) clearDownloadResumeState(resumeStorageKey);
   if (supportsPreviewDownload(options.ws)) {
     options.onMode?.(FILE_DOWNLOAD_TRANSPORT_MODE.CONNECTING);
     const { lease, release } = acquireLease(options.ws, options.serverId);
     try {
       const operationId = crypto.randomUUID();
-      await retryDirect<OperationSuccess>(lease, async () => ({
+      await retryDirect<OperationSuccess>(lease, async (attempt) => ({
         kind: 'download',
         previewHandle: options.previewHandle,
         operationId,
         sessionName: options.sessionName,
-        writer: await createPreviewWriter(destination),
+        writer: await createPreviewWriter(
+          destination,
+          attempt > 1 ? await committedDestinationBytes(destination) : (initialResume?.committedBytes ?? 0),
+        ),
+        onDurableProgress: (committedBytes, totalBytes) => {
+          writeDownloadResumeState(resumeStorageKey, committedBytes, totalBytes);
+        },
         onProgress: options.onProgress,
         onConnected: () => options.onMode?.(FILE_DOWNLOAD_TRANSPORT_MODE.DIRECT),
         signal: options.signal,
-      }), options.signal);
+      }), options.signal, initialResume ? {
+        resumeFromBytes: initialResume.committedBytes,
+        expectedDownloadBytes: initialResume.totalBytes,
+      } : undefined);
+      clearDownloadResumeState(resumeStorageKey);
       recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.DIRECT_SUCCESS, {
         direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD,
         route: await selectedPeerRoute(lease.peer),
       });
     } catch (error) {
-      if (isTerminalDirectFailure(error)) throw error;
+      if (isTerminalDirectFailure(error)) {
+        clearDownloadResumeState(resumeStorageKey);
+        throw error;
+      }
       // Exactly one HTTP fallback after the full direct budget. It reuses the
       // same destination: desktop keeps streaming to its approved file handle,
       // while mobile rebuilds only the completed fallback payload for sharing.
-      const writer = await createPreviewWriter(destination);
+      const resumeFromBytes = await committedDestinationBytes(destination);
+      const writer = await createPreviewWriter(destination, resumeFromBytes);
+      let httpProgress: FileDownloadProgress | null = null;
       try {
         options.onMode?.(FILE_DOWNLOAD_TRANSPORT_MODE.FALLING_BACK);
         let httpStarted = false;
@@ -2463,16 +2796,29 @@ export async function downloadPreviewWithDirectFallback(options: {
           options.sessionName,
           options.signal,
           (progress) => {
+            httpProgress = progress;
             if (!httpStarted) {
               httpStarted = true;
               options.onMode?.(FILE_DOWNLOAD_TRANSPORT_MODE.HTTP);
             }
             options.onProgress?.(progress);
           },
+          resumeFromBytes,
         );
         await writer.close();
+        clearDownloadResumeState(resumeStorageKey);
       } catch (fallbackError) {
-        await writer.abort(fallbackError).catch(() => undefined);
+        const durableProgress = httpProgress as FileDownloadProgress | null;
+        if (shouldCommitInterruptedHttpPrefix(fallbackError, options.signal, durableProgress, resumeFromBytes)) {
+          try {
+            await writer.close();
+            writeDownloadResumeState(resumeStorageKey, durableProgress!.loadedBytes, durableProgress!.totalBytes!);
+          } catch {
+            await writer.abort(fallbackError).catch(() => undefined);
+          }
+        } else {
+          await writer.abort(fallbackError).catch(() => undefined);
+        }
         throw fallbackError;
       }
       if (nativeBlobSink) {
@@ -2495,13 +2841,37 @@ export async function downloadPreviewWithDirectFallback(options: {
     }
     return;
   }
-  const writer = await createPreviewWriter(destination);
+  const resumeFromBytes = initialResume?.committedBytes ?? 0;
+  const writer = await createPreviewWriter(destination, resumeFromBytes);
+  let httpProgress: FileDownloadProgress | null = null;
   try {
     options.onMode?.(FILE_DOWNLOAD_TRANSPORT_MODE.HTTP);
-    await streamAttachmentDownloadToWritable(options.serverId, options.previewHandle, writer, options.sessionName, options.signal, options.onProgress);
+    await streamAttachmentDownloadToWritable(
+      options.serverId,
+      options.previewHandle,
+      writer,
+      options.sessionName,
+      options.signal,
+      (progress) => {
+        httpProgress = progress;
+        options.onProgress?.(progress);
+      },
+      resumeFromBytes,
+    );
     await writer.close();
+    clearDownloadResumeState(resumeStorageKey);
   } catch (error) {
-    await writer.abort(error).catch(() => undefined);
+    const durableProgress = httpProgress as FileDownloadProgress | null;
+    if (shouldCommitInterruptedHttpPrefix(error, options.signal, durableProgress, resumeFromBytes)) {
+      try {
+        await writer.close();
+        writeDownloadResumeState(resumeStorageKey, durableProgress!.loadedBytes, durableProgress!.totalBytes!);
+      } catch {
+        await writer.abort(error).catch(() => undefined);
+      }
+    } else {
+      await writer.abort(error).catch(() => undefined);
+    }
     throw error;
   }
   if (nativeBlobSink) {

@@ -121,6 +121,7 @@ describe('file-transfer upload route', () => {
         daemonPath: '/tmp/upload.txt',
         downloadable: true,
       },
+      sourceIdentity: { size: 10, mtimeMs: 1, device: 2, inode: 3 },
     });
   });
 
@@ -152,6 +153,7 @@ describe('file-transfer upload route', () => {
         createdAt: new Date().toISOString(),
         downloadable: true,
       },
+      sourceIdentity: { size: 10, mtimeMs: 1, device: 2, inode: 3 },
     });
 
     const res = await makeApp().request('/api/server/controlled-1/machine-file-handle', {
@@ -191,6 +193,7 @@ describe('file-transfer upload route', () => {
         createdAt: new Date().toISOString(),
         downloadable: true,
       },
+      sourceIdentity: { size: 10, mtimeMs: 1, device: 2, inode: 3 },
     });
     const request = () => makeApp().request('/api/server/controlled-1/machine-file-handle', {
       method: 'POST',
@@ -632,8 +635,12 @@ describe('file-transfer upload route', () => {
 
       const first = await app.request(`${fetchUrl.pathname}${fetchUrl.search}`);
       await expect(first.text()).resolves.toBe('hello');
-      const retry = await app.request(`${fetchUrl.pathname}${fetchUrl.search}`);
-      await expect(retry.text()).resolves.toBe('hello');
+      const retry = await app.request(`${fetchUrl.pathname}${fetchUrl.search}`, {
+        headers: { Range: 'bytes=2-' },
+      });
+      expect(retry.status).toBe(206);
+      expect(retry.headers.get('content-range')).toBe('bytes 2-4/5');
+      await expect(retry.text()).resolves.toBe('llo');
 
       return {
         type: 'file.upload_done',
@@ -676,6 +683,67 @@ describe('file-transfer upload route', () => {
     expect(sendFileTransferRequestMock.mock.calls[0]?.[2]).toBe(FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS);
     expect(hasDaemonCapabilityMock).toHaveBeenCalledWith(FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY);
     expect(sendFileTransferRequestMock.mock.calls[0]?.[1]).not.toHaveProperty('content');
+  });
+
+  it('accepts resumable browser chunks idempotently and dispatches only the assembled file', async () => {
+    const app = makeApp();
+    sendFileTransferRequestMock.mockImplementationOnce(async (_requestId, message) => {
+      const uploadUrl = new URL((message as { downloadUrl: string }).downloadUrl);
+      const staged = await app.request(`${uploadUrl.pathname}${uploadUrl.search}`);
+      await expect(staged.text()).resolves.toBe('hello');
+      return {
+        type: 'file.upload_done',
+        attachment: {
+          id: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.txt',
+          source: 'upload',
+          daemonPath: '/tmp/resume.txt',
+          downloadable: true,
+        },
+      };
+    });
+    const fields = {
+      clientUploadId: `resumable_${crypto.randomUUID().replaceAll('-', '')}`,
+      uploadTotalSize: '5',
+      uploadOriginalName: 'hello.txt',
+      uploadLastModified: '1234',
+    };
+    const request = (body: string, offset: number) => {
+      const form = new FormData();
+      form.append('file', new File([body], 'hello.txt', { type: 'text/plain' }));
+      form.append('clientUploadId', fields.clientUploadId);
+      form.append('uploadOffset', String(offset));
+      form.append('uploadTotalSize', fields.uploadTotalSize);
+      form.append('uploadOriginalName', fields.uploadOriginalName);
+      form.append('uploadLastModified', fields.uploadLastModified);
+      return app.request('/api/server/srv-1/upload', {
+        method: 'POST', headers: { Authorization: 'Bearer test' }, body: form,
+      });
+    };
+
+    const first = await request('hel', 0);
+    expect(first.status).toBe(200);
+    await expect(first.json()).resolves.toEqual({ ok: true, complete: false, committedBytes: 3 });
+    expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
+
+    // Lost-response replay: the exact chunk is accepted without appending it.
+    const duplicate = await request('hel', 0);
+    await expect(duplicate.json()).resolves.toEqual({ ok: true, complete: false, committedBytes: 3 });
+    expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
+
+    const changed = await request('HEX', 0);
+    expect(changed.status).toBe(400);
+    await expect(changed.json()).resolves.toMatchObject({ error: 'upload_content_mismatch' });
+
+    const finished = await request('lo', 3);
+    expect(finished.status).toBe(200);
+    await expect(finished.json()).resolves.toMatchObject({ ok: true, attachment: { daemonPath: '/tmp/resume.txt' } });
+    expect(sendFileTransferRequestMock).toHaveBeenCalledOnce();
+    expect(sendFileTransferRequestMock.mock.calls[0]?.[1]).toEqual(expect.objectContaining({
+      type: 'file.upload_fetch',
+      clientUploadId: fields.clientUploadId,
+      originalName: fields.uploadOriginalName,
+      size: 5,
+    }));
   });
 
   it('omits clientUploadId when relaying to an older daemon without direct-transfer capability', async () => {
