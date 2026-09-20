@@ -220,6 +220,18 @@ describe('restart reconstruction from SQLite alone', () => {
 });
 
 describe('assignment, pool and validation projections', () => {
+  it('projects the shared concise task title while retaining the full objective', () => {
+    seedTask('implementing');
+    const objective = 'Repair the supervision task console title. Preserve this complete objective for task details and tooltips.';
+    db.prepare("UPDATE supervision_tasks SET payload_json=? WHERE task_id='tsk_console'")
+      .run(JSON.stringify({ objective }));
+
+    expect(producer().readTaskRow('tsk_console', SCOPE.projectName)).toMatchObject({
+      title: 'Repair the supervision task console title.…',
+      objective,
+    });
+  });
+
   it('projects assignments with pool kind, observed provider and validation state', () => {
     seedTask('implementing');
     db.prepare("UPDATE supervision_task_assignments SET payload_json=? WHERE assignment_id='asg_console'")

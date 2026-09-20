@@ -289,7 +289,9 @@ function TaskCard(props: {
           aria-controls={`task-console-details-${props.task.taskId}`}
           onClick={props.onToggle}
         >
-          <span class="supervision-task-console-task-title"><strong>{props.task.title}</strong></span>
+          <span class="supervision-task-console-task-title" title={props.task.objective ?? props.task.title}>
+            <strong>{props.task.title}</strong>
+          </span>
           <span class={`supervision-task-console-status status-${props.task.status}`}>{t(displayStatusKey(props.task.status))}</span>
           <span aria-hidden="true" class="supervision-task-console-chevron">{props.expanded ? '⌃' : '⌄'}</span>
         </button>

@@ -39,6 +39,7 @@ import {
   SUPERVISION_TASK_STATUS_CONTRACT_VERSION,
   type SupervisionTaskLifecycleStatus,
 } from '../../shared/supervision-config.js';
+import { deriveSupervisionTaskTitle } from '../../shared/supervision-task-identity.js';
 import {
   decideSupervisionAuditHandoff,
   type SupervisionAuditReceipt,
@@ -271,7 +272,8 @@ export class SupervisionConsoleProducer {
       taskId: String(row.task_id),
       topLevelTaskId: row.top_level_task_id ? String(row.top_level_task_id) : undefined,
       semanticKey: row.semantic_key ? String(row.semantic_key) : undefined,
-      title: objective ?? String(row.task_id),
+      title: deriveSupervisionTaskTitle(objective) ?? String(row.task_id),
+      ...(objective ? { objective } : {}),
       status,
       currentRevision: row.current_revision ? String(row.current_revision) : undefined,
       phase: supervisionConsoleStatusGroup(status),

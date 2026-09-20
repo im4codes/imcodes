@@ -247,6 +247,31 @@ describe('SupervisionTaskConsole', () => {
     expect(document.querySelector('[data-awaiting-external-ci="true"]')).not.toBeNull();
   });
 
+  it('uses the full task objective only as a tooltip on the concise console title', () => {
+    const fullObjective = 'Repair the supervision task console title. Preserve this complete objective for task details and tooltips.';
+    const base = state();
+    render(<SupervisionTaskConsoleView
+      state={{
+        ...base,
+        tasks: {
+          ...base.tasks,
+          'task-1': {
+            ...base.tasks['task-1']!,
+            title: 'Repair the supervision task console title.…',
+            objective: fullObjective,
+          },
+        },
+      }}
+      mobile={false}
+      onClose={() => {}}
+      onNavigateSession={() => {}}
+    />);
+
+    const title = screen.getByText('Repair the supervision task console title.…').closest('.supervision-task-console-task-title');
+    expect(title?.getAttribute('title')).toBe(fullObjective);
+    expect(title?.textContent).not.toContain(fullObjective);
+  });
+
   it('still never reads a raw heartbeat in the component source', () => {
     // Liveness stays server-derived: adding executionHealth must not smuggle
     // client-side heartbeat inference back in.

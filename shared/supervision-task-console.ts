@@ -431,6 +431,8 @@ export interface SupervisionTaskConsoleTaskRow {
   semanticKey?: string;
   topLevelTaskId?: string;
   title: string;
+  /** Full authoritative objective for details/tooltips; never use as a list title. */
+  objective?: string;
   /** Fixed enum id. Never free text, never model-authored. */
   status: SupervisionTaskLifecycleStatus;
   /** Exact registry revision that owns this aggregate lifecycle. */
