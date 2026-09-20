@@ -160,6 +160,105 @@ describe('TimelineDB — real IndexedDB (fake-indexeddb)', () => {
     expect(probe.stats.cursorRecords).toBeLessThanOrEqual(limit);
   });
 
+  it('reserves recent user/assistant text when newer tool traffic fills the page', async () => {
+    const db = new TimelineDB();
+    const text = Array.from({ length: 10 }, (_, i) => ev(`text-${i + 1}`, 's', i + 1));
+    const tools = Array.from({ length: 400 }, (_, i) => ({
+      ...ev(`tool-${i + 1}`, 's', text.length + i + 1),
+      type: i % 2 === 0 ? 'tool.call' : 'tool.result',
+      payload: i % 2 === 0
+        ? { toolCallId: `tc-${i}`, name: 'read' }
+        : { toolCallId: `tc-${i}`, output: 'ok' },
+    } as TimelineEvent));
+    await db.putEvents([...text, ...tools]);
+
+    const got = await db.getRecentEvents('s', { limit: 300 });
+    expect(got).toHaveLength(300);
+    expect(got.filter((event) => event.type === 'assistant.text').map((event) => event.eventId))
+      .toEqual(text.map((event) => event.eventId));
+    expect(got.at(-1)?.eventId).toBe('tool-400');
+  });
+
+  it('invalidates and reopens a connection that throws InvalidStateError once', async () => {
+    const writer = new TimelineDB();
+    await writer.putEvents([ev('durable', 's', 1)]);
+
+    const transaction = IDBDatabase.prototype.transaction;
+    let failed = false;
+    IDBDatabase.prototype.transaction = function transientClosedConnection(
+      this: IDBDatabase,
+      ...args: Parameters<IDBDatabase['transaction']>
+    ) {
+      if (!failed) {
+        failed = true;
+        throw new DOMException('connection closed by the browser', 'InvalidStateError');
+      }
+      return transaction.apply(this, args);
+    } as IDBDatabase['transaction'];
+
+    try {
+      const got = await writer.getRecentEvents('s', { limit: 10 });
+      expect(got.map((event) => event.eventId)).toEqual(['durable']);
+    } finally {
+      IDBDatabase.prototype.transaction = transaction;
+    }
+  });
+
+  it('reopens and durably retries a write after the browser closes the connection', async () => {
+    const writer = new TimelineDB();
+    await writer.open();
+    const transaction = IDBDatabase.prototype.transaction;
+    let failed = false;
+    IDBDatabase.prototype.transaction = function transientClosedConnection(
+      this: IDBDatabase,
+      ...args: Parameters<IDBDatabase['transaction']>
+    ) {
+      if (!failed) {
+        failed = true;
+        throw new DOMException('connection closed by the browser', 'InvalidStateError');
+      }
+      return transaction.apply(this, args);
+    } as IDBDatabase['transaction'];
+
+    try {
+      await writer.putEvents([ev('survives-close', 's', 1)]);
+    } finally {
+      IDBDatabase.prototype.transaction = transaction;
+    }
+
+    const observer = new TimelineDB();
+    expect((await observer.getRecentEvents('s', { limit: 10 })).map((event) => event.eventId))
+      .toEqual(['survives-close']);
+  });
+
+  it('keeps recovered last-value writes in the collapsing signal partition', async () => {
+    const writer = new TimelineDB();
+    await writer.open();
+    const transaction = IDBDatabase.prototype.transaction;
+    let failed = false;
+    IDBDatabase.prototype.transaction = function transientClosedConnection(
+      this: IDBDatabase,
+      ...args: Parameters<IDBDatabase['transaction']>
+    ) {
+      if (!failed) {
+        failed = true;
+        throw new DOMException('connection closed by the browser', 'InvalidStateError');
+      }
+      return transaction.apply(this, args);
+    } as IDBDatabase['transaction'];
+
+    try {
+      await writer.putEvents([{ ...ev('state-before-reopen', 's', 1), type: 'session.state' } as TimelineEvent]);
+    } finally {
+      IDBDatabase.prototype.transaction = transaction;
+    }
+    await writer.putEvents([{ ...ev('state-after-reopen', 's', 2), type: 'session.state' } as TimelineEvent]);
+
+    const got = await new TimelineDB().getRecentEvents('s', { limit: 10 });
+    expect(got.filter((event) => event.type === 'session.state').map((event) => event.eventId))
+      .toEqual(['state-after-reopen']);
+  });
+
   it('caps an epoch page read at the requested limit', async () => {
     const db = new TimelineDB();
     await db.putEvents(Array.from({ length: 400 }, (_, i) => ev(`e${i + 1}`, 's', i + 1)));

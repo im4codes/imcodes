@@ -190,7 +190,6 @@ sharedDb.open().catch(() => {});
 // session (e.g. SubSessionWindow opening while SubSessionCard is running) can
 // render immediately from in-memory state without waiting for IDB or network.
 const eventsCache = new Map<string, TimelineEvent[]>();
-const eventsCacheAccess = new Map<string, number>();
 const cacheListeners = new Map<string, Set<(events: TimelineEvent[]) => void>>();
 // Per-cacheKey wall-clock of the last *successful* HTTP backfill (response
 // received, not a timeout/null). Two consumers:
@@ -477,6 +476,12 @@ function retainedTimelineMergeLimit(...eventSets: readonly TimelineEvent[][]): n
     : MAX_MEMORY_EVENTS;
 }
 /**
+ * Every chat window owns this bounded in-memory budget. There is deliberately
+ * no cross-window LRU: a busy peer may fill its own window, but can never make
+ * an unrelated visible/minimized chat lose its instant seed.
+ */
+const MAX_WINDOW_CACHED_EVENTS = MAX_HISTORY_EVENTS + MAX_PIN_CONTEXT_EVENTS;
+/**
  * How long a cold timeline may report the daemon fetch as still coming while
  * the socket is down.
  *
@@ -487,8 +492,6 @@ function retainedTimelineMergeLimit(...eventSets: readonly TimelineEvent[][]): n
  * forever, which is worse than the blank pane this whole change is fixing.
  */
 const DAEMON_CONNECT_WAIT_MS = 15_000;
-
-const MAX_CACHED_SESSIONS = 12;
 
 // A first-paint seed (localStorage tail snapshot, WS-replay tail, or a
 // partially-persisted IDB read) can be a LOW-COMPLETENESS tail: it shows a few
@@ -504,7 +507,6 @@ function isLowCompletenessSeed(events: readonly TimelineEvent[] | undefined): bo
   if (!events || events.length === 0) return true;
   return events.length < LOW_COMPLETENESS_SEED_THRESHOLD;
 }
-const MAX_TOTAL_CACHED_EVENTS = 12_000;
 const ECHO_WINDOW_MS = 500;
 const TIMELINE_HISTORY_AFTER_TS_OVERLAP_MS = 1;
 // Dedup window for user.message from JSONL vs web-UI-sent: JSONL watcher polls every 2s,
@@ -790,25 +792,20 @@ function normalizeForEcho(text: string): string {
     .replace(/\s+/g, ' ');
 }
 
-function markCacheAccess(cacheKey: string): void {
-  eventsCacheAccess.set(cacheKey, Date.now());
-}
-
 function getCachedEvents(cacheKey: string): TimelineEvent[] | undefined {
-  const cached = eventsCache.get(cacheKey);
-  if (cached) markCacheAccess(cacheKey);
-  return cached;
+  return eventsCache.get(cacheKey);
 }
 
 function setCachedEvents(cacheKey: string, events: TimelineEvent[]): void {
-  eventsCache.set(cacheKey, events);
-  markCacheAccess(cacheKey);
-  scheduleTimelineSnapshotPersist(cacheKey, events);
+  const bounded = events.length > MAX_WINDOW_CACHED_EVENTS
+    ? events.slice(events.length - MAX_WINDOW_CACHED_EVENTS)
+    : events;
+  eventsCache.set(cacheKey, bounded);
+  scheduleTimelineSnapshotPersist(cacheKey, bounded);
   const listeners = cacheListeners.get(cacheKey);
   if (listeners) {
-    for (const listener of listeners) listener(events);
+    for (const listener of listeners) listener(bounded);
   }
-  pruneTimelineCache();
 }
 
 function scheduleBrowserFrame(callback: () => void): () => void {
@@ -835,34 +832,6 @@ function subscribeCache(cacheKey: string, listener: (events: TimelineEvent[]) =>
   };
 }
 
-function pruneTimelineCache(): void {
-  let totalEvents = 0;
-  for (const events of eventsCache.values()) totalEvents += events.length;
-  if (eventsCache.size <= MAX_CACHED_SESSIONS && totalEvents <= MAX_TOTAL_CACHED_EVENTS) return;
-
-  const evictionOrder = [...eventsCache.keys()]
-    .filter((key) => (cacheListeners.get(key)?.size ?? 0) === 0)
-    .map((key) => ({ key, at: eventsCacheAccess.get(key) ?? 0, size: eventsCache.get(key)?.length ?? 0 }))
-    .sort((a, b) => a.at - b.at);
-
-  for (const entry of evictionOrder) {
-    if (eventsCache.size <= MAX_CACHED_SESSIONS && totalEvents <= MAX_TOTAL_CACHED_EVENTS) break;
-    if (eventsCache.delete(entry.key)) {
-      eventsCacheAccess.delete(entry.key);
-      // The snapshot bookkeeping is keyed by cacheKey but was never pruned with
-      // the cache, so every session the tab ever opened kept its last written
-      // tail — up to MAX_PERSISTED_SNAPSHOT_EVENTS events — reachable forever.
-      // Those are precisely the events this eviction exists to release, so
-      // dropping the entry without them frees almost nothing. Flush a queued
-      // write first: eviction should release memory, not silently lose a
-      // snapshot that was already scheduled.
-      flushTimelineSnapshotPersist(entry.key);
-      lastWrittenTimelineSnapshotTails.delete(entry.key);
-      totalEvents -= entry.size;
-    }
-  }
-}
-
 function scopeCacheKey(serverId: string | null | undefined, sessionId: string): string {
   return serverId ? `${serverId}:${sessionId}` : sessionId;
 }
@@ -871,9 +840,9 @@ function getTimelineSnapshotStorageKey(cacheKey: string): string {
   return `${TIMELINE_SNAPSHOT_STORAGE_PREFIX}${cacheKey}`;
 }
 
-function loadPersistedTimelineSnapshot(cacheKey: string): TimelineEvent[] {
+function loadTimelineSnapshotFromStorage(storage: Storage, cacheKey: string): TimelineEvent[] {
   try {
-    const raw = localStorage.getItem(getTimelineSnapshotStorageKey(cacheKey));
+    const raw = storage.getItem(getTimelineSnapshotStorageKey(cacheKey));
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
@@ -901,30 +870,29 @@ function loadPersistedTimelineSnapshotWithFallback(
   cacheKey: string,
   rawSessionId: string | undefined,
 ): TimelineEvent[] {
-  const scoped = loadPersistedTimelineSnapshot(cacheKey);
-  if (scoped.length > 0) return scoped;
-  if (!rawSessionId || rawSessionId === cacheKey) return scoped;
-  const raw = loadPersistedTimelineSnapshot(rawSessionId);
-  if (raw.length === 0) return scoped;
-  // Best-effort migration: re-persist under the scoped key and clear the
-  // raw entry. localStorage.setItem can throw on quota; if it does we
-  // still return the raw events so the user sees them.
-  try {
-    // Deliberately a PLAIN setItem, not the quota-aware writer used for the
-    // tail below. On quota that writer calls evictVolatileLocalStorageEntries,
-    // which deletes every volatile key except the one being written — and the
-    // raw key we are migrating FROM matches the snapshot prefix, so the
-    // eviction would destroy this session's only stored copy while the move is
-    // still in flight. Here a failed write must simply leave both keys alone:
-    // the raw entry stays readable and the fallback read above already
-    // surfaced the events to the user.
-    localStorage.setItem(getTimelineSnapshotStorageKey(cacheKey), JSON.stringify(raw));
-    // Only reached when the write above did not throw.
-    localStorage.removeItem(getTimelineSnapshotStorageKey(rawSessionId));
-  } catch {
-    /* ignore — fallback read still surfaced the events */
+  // Search one storage tier at a time. This ordering is load-bearing: the
+  // current window may have written under the raw session key before serverId
+  // resolved, while localStorage already contains a scoped snapshot produced
+  // by another tab. Looking up all scoped tiers before raw would let that peer
+  // replace this window's own cache.
+  const storages: Storage[] = [];
+  try { storages.push(sessionStorage); } catch { /* unavailable */ }
+  try { storages.push(localStorage); } catch { /* unavailable */ }
+  for (const storage of storages) {
+    const scoped = loadTimelineSnapshotFromStorage(storage, cacheKey);
+    if (scoped.length > 0) return scoped;
+    if (!rawSessionId || rawSessionId === cacheKey) continue;
+    const raw = loadTimelineSnapshotFromStorage(storage, rawSessionId);
+    if (raw.length === 0) continue;
+    // Best-effort same-tier migration. Only remove the source after the target
+    // write succeeds; quota/private-mode failure keeps the sole readable copy.
+    try {
+      storage.setItem(getTimelineSnapshotStorageKey(cacheKey), JSON.stringify(raw));
+      storage.removeItem(getTimelineSnapshotStorageKey(rawSessionId));
+    } catch { /* raw remains readable */ }
+    return raw;
   }
-  return raw;
+  return [];
 }
 
 function loadSynchronousTimelineSeed(
@@ -965,6 +933,29 @@ function isTimelineSnapshotTextEvent(event: TimelineEvent): boolean {
     || event.type === MESSAGE_PIN_EVENT_TYPES.ASSISTANT;
 }
 
+function serializeCompactTimelineTextPreview(event: TimelineEvent): string {
+  const rawText = typeof event.payload.text === 'string' ? event.payload.text : '';
+  // Code-point slicing avoids cutting a surrogate pair. 1,024 code points fit
+  // comfortably inside the smallest 8 KiB self-budget even for CJK/emoji, so
+  // one oversized answer can never turn the synchronous cache into tool-only
+  // rows. The authoritative full payload remains in IndexedDB/daemon history.
+  const chars = Array.from(rawText);
+  const text = chars.length > 1_024
+    ? `${chars.slice(0, 1_024).join('')}…`
+    : rawText;
+  const payload: TimelineEvent['payload'] = {
+    text,
+    historyPayloadTruncated: true,
+    completeness: 'preview',
+  };
+  // Preserve the small rendering/reconciliation fields that affect bubble
+  // state, but intentionally do not copy arbitrary large payload members.
+  for (const key of ['streaming', 'pending', 'failed', 'commandId', 'clientMessageId', 'allowDuplicate'] as const) {
+    if (Object.prototype.hasOwnProperty.call(event.payload, key)) payload[key] = event.payload[key];
+  }
+  return JSON.stringify({ ...event, payload });
+}
+
 function serializeTimelineSnapshotTail(tail: TimelineEvent[], maxBytes = MAX_PERSISTED_SNAPSHOT_BYTES): string {
   if (tail.length === 0) return '[]';
 
@@ -972,16 +963,25 @@ function serializeTimelineSnapshotTail(tail: TimelineEvent[], maxBytes = MAX_PER
     index,
     event,
     value: JSON.stringify(event),
+    compactValue: isTimelineSnapshotTextEvent(event)
+      ? serializeCompactTimelineTextPreview(event)
+      : undefined,
   }));
   const selected = new Map<number, string>();
   let serializedBytes = 2; // []
   const selectNewest = (candidates: typeof serialized): void => {
     for (let index = candidates.length - 1; index >= 0; index -= 1) {
       const candidate = candidates[index]!;
-      const valueBytes = timelineSnapshotTextEncoder.encode(candidate.value).byteLength;
-      const addedBytes = valueBytes + (selected.size > 0 ? 1 : 0);
+      const commaBytes = selected.size > 0 ? 1 : 0;
+      const fullBytes = timelineSnapshotTextEncoder.encode(candidate.value).byteLength;
+      const value = serializedBytes + fullBytes + commaBytes <= maxBytes
+        ? candidate.value
+        : candidate.compactValue;
+      if (value === undefined) continue;
+      const valueBytes = timelineSnapshotTextEncoder.encode(value).byteLength;
+      const addedBytes = valueBytes + commaBytes;
       if (serializedBytes + addedBytes > maxBytes) continue;
-      selected.set(candidate.index, candidate.value);
+      selected.set(candidate.index, value);
       serializedBytes += addedBytes;
     }
   };
@@ -1012,6 +1012,7 @@ function persistTimelineSnapshotTail(cacheKey: string, tail: TimelineEvent[]): v
   try {
     if (tail.length === 0) {
       safeLocalStorageRemoveItem(getTimelineSnapshotStorageKey(cacheKey));
+      try { sessionStorage.removeItem(getTimelineSnapshotStorageKey(cacheKey)); } catch { /* ignore */ }
       lastWrittenTimelineSnapshotTails.set(cacheKey, tail);
       return;
     }
@@ -1019,21 +1020,21 @@ function persistTimelineSnapshotTail(cacheKey: string, tail: TimelineEvent[]): v
     // seeds resident. Each retry spends only this window's smaller budget; the
     // storage helper never evicts another window's timeline/file/terminal cache.
     const storageKey = getTimelineSnapshotStorageKey(cacheKey);
-    let written = false;
+    let durableWritten = false;
+    let windowWritten = false;
     for (let index = 0; index < PERSISTED_SNAPSHOT_SELF_BUDGETS.length; index += 1) {
       const value = serializeTimelineSnapshotTail(tail, PERSISTED_SNAPSHOT_SELF_BUDGETS[index]);
-      written = safeLocalStorageSetItem(storageKey, value, {
-        // Exhausted every smaller self-budget: only this window's old cache may
-        // be cleared. Other timeline keys are never eviction candidates.
-        clearOwnTimelineSnapshotOnFailure: index === PERSISTED_SNAPSHOT_SELF_BUDGETS.length - 1,
-      });
-      if (written) break;
+      if (!windowWritten) {
+        try { sessionStorage.setItem(storageKey, value); windowWritten = true; } catch { /* self-shrink */ }
+      }
+      if (!durableWritten) durableWritten = safeLocalStorageSetItem(storageKey, value);
+      if (windowWritten && durableWritten) break;
     }
     // Record ONLY a write that landed: areTimelineSnapshotTailsSame() skips a
     // write whose tail matches the last recorded one, so remembering a failed
     // write would strand this session without a snapshot until its tail
     // changed again.
-    if (written) lastWrittenTimelineSnapshotTails.set(cacheKey, tail);
+    if (windowWritten && durableWritten) lastWrittenTimelineSnapshotTails.set(cacheKey, tail);
   } catch {
     // JSON encode failure only — storage quota is handled above.
   }
@@ -1461,7 +1462,6 @@ export function __resetTimelineCacheForTests(): void {
   cancelPendingTimelineCacheIngests();
   flushPendingTimelineSnapshotWrites();
   eventsCache.clear();
-  eventsCacheAccess.clear();
   cacheListeners.clear();
   lastHttpBackfillResponseAt.clear();
   watchdogStateByCacheKey.clear();
@@ -1481,6 +1481,12 @@ export function __clearPersistedTimelineSnapshotsForTests(): void {
       if (key?.startsWith(TIMELINE_SNAPSHOT_STORAGE_PREFIX)) keys.push(key);
     }
     for (const key of keys) localStorage.removeItem(key);
+    const windowKeys: string[] = [];
+    for (let i = 0; i < sessionStorage.length; i++) {
+      const key = sessionStorage.key(i);
+      if (key?.startsWith(TIMELINE_SNAPSHOT_STORAGE_PREFIX)) windowKeys.push(key);
+    }
+    for (const key of windowKeys) sessionStorage.removeItem(key);
   } catch {
     // ignore
   }

@@ -85,13 +85,16 @@ describe('legacy signals must not consume the bounded first-paint window', () =>
     globalThis.indexedDB = new IDBFactory();
   });
 
-  it('buries the conversation until the legacy signals are drained', async () => {
+  it('reserves conversation immediately and keeps it while legacy signals are drained', async () => {
     await seedV1(buriedConversation());
     const db = new TimelineDB();
 
-    // Before the drain the whole window is signals — this is the blank pane.
+    // The class-aware first-paint read must surface the retained text even
+    // before the background legacy drain has had a chance to run.
     const before = await db.getRecentEvents('s', { limit: 300 });
-    expect(before.filter((e) => CONVERSATION_TYPES.has(e.type))).toHaveLength(0);
+    expect(before.filter((e) => CONVERSATION_TYPES.has(e.type)).map((e) => e.eventId)).toEqual([
+      'msg-0', 'msg-1', 'msg-2', 'msg-3', 'msg-4',
+    ]);
 
     let guard = 0;
     for (;;) {

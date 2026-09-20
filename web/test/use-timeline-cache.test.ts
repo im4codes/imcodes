@@ -86,7 +86,7 @@ function createRawPreactHarness(): RawPreactHarness {
   };
 }
 
-describe('useTimeline global cache bounds', () => {
+describe('useTimeline window-isolated cache bounds', () => {
   beforeEach(() => {
     __resetTimelineCacheForTests();
     __clearPersistedTimelineSnapshotsForTests();
@@ -102,45 +102,89 @@ describe('useTimeline global cache bounds', () => {
     vi.restoreAllMocks();
   });
 
-  it('evicts least recently used sessions when session-count cap is exceeded', () => {
+  it('never evicts one chat window when many peer windows become active', () => {
     for (let i = 0; i < 13; i++) {
       __setTimelineCacheForTests(`server:s${i}`, makeEvents(`s${i}`, 100));
     }
 
     const keys = __getTimelineCacheKeysForTests();
-    expect(keys).toHaveLength(12);
-    expect(keys).not.toContain('server:s0');
+    expect(keys).toHaveLength(13);
+    expect(keys).toContain('server:s0');
     expect(keys).toContain('server:s12');
   });
 
-  it('evicts older sessions when total cached events exceed the global cap', () => {
+  it('never spends one chat window cache budget on another window', () => {
     __setTimelineCacheForTests('server:a', makeEvents('a', 4000));
     __setTimelineCacheForTests('server:b', makeEvents('b', 4000));
     __setTimelineCacheForTests('server:c', makeEvents('c', 4000));
     __setTimelineCacheForTests('server:d', makeEvents('d', 4000));
 
     const keys = __getTimelineCacheKeysForTests();
-    expect(keys).toHaveLength(3);
-    expect(keys).not.toContain('server:a');
+    expect(keys).toHaveLength(4);
+    expect(keys).toContain('server:a');
     expect(keys).toContain('server:b');
     expect(keys).toContain('server:c');
     expect(keys).toContain('server:d');
+    expect(__getTimelineCacheForTests('server:a')?.length).toBeLessThanOrEqual(2_061);
+    expect(__getTimelineCacheForTests('server:d')?.length).toBeLessThanOrEqual(2_061);
   });
 
-  it('releases snapshot bookkeeping for an evicted session', () => {
-    // Eviction used to drop only the events map. The snapshot bookkeeping is
-    // keyed the same way and holds the last written tail, a pending tail and a
-    // live timer, so an evicted session stayed reachable — and its timer still
-    // fired, writing a snapshot for a session no longer cached. Evicting then
-    // freed almost nothing, which is the opposite of the point.
+  it('keeps snapshot bookkeeping independent when peer-window count exceeds the old cap', () => {
     for (let i = 0; i < 13; i++) {
       __setTimelineCacheForTests(`server:s${i}`, makeEvents(`s${i}`, 100));
     }
 
-    expect(__getTimelineCacheKeysForTests()).not.toContain('server:s0');
-    expect(__getTimelineSnapshotBookkeepingKeysForTests()).not.toContain('server:s0');
-    // Non-vacuous: a session that survived eviction still has its bookkeeping.
+    expect(__getTimelineCacheKeysForTests()).toContain('server:s0');
+    expect(__getTimelineSnapshotBookkeepingKeysForTests()).toContain('server:s0');
     expect(__getTimelineSnapshotBookkeepingKeysForTests()).toContain('server:s12');
+  });
+
+  it('uses this tab/webview session cache before a conflicting durable snapshot', () => {
+    const sessionName = `deck_window_local_${Date.now()}`;
+    const cacheKey = `srv:${sessionName}`;
+    const durable = makeEvents(sessionName, 1).map((event) => ({
+      ...event,
+      payload: { text: 'other tab durable snapshot' },
+    }));
+    const thisWindow = makeEvents(sessionName, 1).map((event) => ({
+      ...event,
+      payload: { text: 'this window snapshot' },
+    }));
+    localStorage.setItem(`rcc_timeline_snapshot:${cacheKey}`, JSON.stringify(durable));
+    sessionStorage.setItem(`rcc_timeline_snapshot:${cacheKey}`, JSON.stringify(thisWindow));
+
+    function Probe() {
+      const timeline = useTimeline(sessionName, null, 'srv');
+      return h('div', { 'data-testid': 'window-local-seed' },
+        timeline.events.map((event) => String(event.payload.text ?? '')).join('|'));
+    }
+
+    render(h(Probe));
+    expect(screen.getByTestId('window-local-seed').textContent).toBe('this window snapshot');
+  });
+
+  it('prefers this window raw-key seed over another window durable scoped seed', () => {
+    const sessionName = `deck_window_scope_${Date.now()}`;
+    const cacheKey = `srv:${sessionName}`;
+    const peerScoped = makeEvents(sessionName, 1).map((event) => ({
+      ...event,
+      payload: { text: 'peer scoped cache' },
+    }));
+    const ownRaw = makeEvents(sessionName, 1).map((event) => ({
+      ...event,
+      payload: { text: 'own raw cache' },
+    }));
+    localStorage.setItem(`rcc_timeline_snapshot:${cacheKey}`, JSON.stringify(peerScoped));
+    sessionStorage.setItem(`rcc_timeline_snapshot:${sessionName}`, JSON.stringify(ownRaw));
+
+    function Probe() {
+      const timeline = useTimeline(sessionName, null, 'srv');
+      return h('div', { 'data-testid': 'window-local-raw-seed' },
+        timeline.events.map((event) => String(event.payload.text ?? '')).join('|'));
+    }
+
+    render(h(Probe));
+    expect(screen.getByTestId('window-local-raw-seed').textContent).toBe('own raw cache');
   });
 
   it('does not collapse paged history back to the initial window on a realtime event', () => {
@@ -1436,6 +1480,36 @@ describe('useTimeline global cache bounds', () => {
     expect(snapshot.filter((event) => event.type === 'tool.result')).toHaveLength(0);
   });
 
+  it('keeps a renderable preview when one recent text row exceeds the whole snapshot budget', async () => {
+    vi.useFakeTimers();
+    const sessionName = `deck_snapshot_large_text_${Date.now()}`;
+    const cacheKey = `srv:${sessionName}`;
+    const hugeText = makeEvents(sessionName, 1).map((event) => ({
+      ...event,
+      payload: { text: `answer:${'中'.repeat(300_000)}` },
+    }));
+    const tool: TimelineEvent = {
+      eventId: `${sessionName}-tool`,
+      sessionId: sessionName,
+      ts: 2,
+      epoch: 1,
+      seq: 2,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'tool.result',
+      payload: { output: 'small tool row' },
+    };
+
+    __setTimelineCacheForTests(cacheKey, [...hugeText, tool]);
+    await act(async () => { await vi.advanceTimersByTimeAsync(750); });
+
+    const snapshot = JSON.parse(sessionStorage.getItem(`rcc_timeline_snapshot:${cacheKey}`) ?? '[]') as TimelineEvent[];
+    const text = snapshot.find((event) => event.type === 'assistant.text');
+    expect(text, 'oversized conversation text was replaced by a tool-only first paint').toBeTruthy();
+    expect(String(text?.payload.text ?? '')).toContain('answer:');
+    expect(text?.payload.historyPayloadTruncated).toBe(true);
+  });
+
   it('bounds each independent synchronous snapshot to 256 KiB without borrowing from peer windows', async () => {
     vi.useFakeTimers();
     const sessionName = `deck_snapshot_budget_${Date.now()}`;
@@ -2168,6 +2242,73 @@ describe('useTimeline global cache bounds', () => {
       expect(screen.getByTestId('older').getAttribute('data-loading')).toBe('false');
       expect(screen.getByTestId('older').getAttribute('data-older')).toBe('false');
     });
+  });
+
+  it('never lets a late load-earlier response rewrite the window switched in afterward', async () => {
+    const serverId = `srv-window-switch-${Date.now()}`;
+    const sessionA = `deck_window_a_${Date.now()}`;
+    const sessionB = `deck_window_b_${Date.now()}`;
+    __setTimelineCacheForTests(`${serverId}:${sessionA}`, makeEvents(sessionA, 2));
+    __setTimelineCacheForTests(`${serverId}:${sessionB}`, makeEvents(sessionB, 2));
+
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    const sendTimelinePageRequest = vi.fn(() => 'older-window-a');
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { if (handler === next) handler = null; };
+      },
+      sendTimelineHistoryRequest: vi.fn(() => 'history-window'),
+      sendTimelinePageRequest,
+      supportsTimelineProtocolRevision: vi.fn(() => true),
+    } as unknown as WsClient;
+
+    function Probe({ sessionName }: { sessionName: string }) {
+      const timeline = useTimeline(sessionName, ws, serverId);
+      return h('button', {
+        type: 'button',
+        'data-testid': 'window-switch-older',
+        'data-text': timeline.events.map((event) => String(event.payload.text ?? '')).join('|'),
+        onClick: timeline.loadOlderEvents,
+      }, sessionName);
+    }
+
+    const view = render(h(Probe, { sessionName: sessionA }));
+    await act(async () => { screen.getByTestId('window-switch-older').click(); });
+    expect(sendTimelinePageRequest).toHaveBeenCalledWith(
+      sessionA,
+      expect.objectContaining({ direction: TIMELINE_CURSOR_DIRECTIONS.OLDER }),
+      300,
+    );
+
+    view.rerender(h(Probe, { sessionName: sessionB }));
+    await act(async () => { await flushMicrotasks(); });
+    const before = screen.getByTestId('window-switch-older').getAttribute('data-text');
+    await act(async () => {
+      handler?.({
+        type: TIMELINE_MESSAGES.PAGE,
+        sessionName: sessionA,
+        requestId: 'older-window-a',
+        epoch: 1,
+        events: [{
+          ...makeEvents(sessionA, 1)[0]!,
+          eventId: `${sessionA}-late-older`,
+          ts: -1,
+          seq: -1,
+          payload: { text: 'must stay in window A' },
+        }],
+        status: TIMELINE_RESPONSE_STATUS.OK,
+        hasMore: false,
+      } as ServerMessage);
+      await flushMicrotasks();
+    });
+
+    expect(screen.getByTestId('window-switch-older').textContent).toBe(sessionB);
+    expect(screen.getByTestId('window-switch-older').getAttribute('data-text')).toBe(before);
+    expect(__getTimelineCacheForTests(`${serverId}:${sessionB}`)?.some(
+      (event) => event.eventId === `${sessionA}-late-older`,
+    )).toBe(false);
   });
 
   it('bootstrap self-heals a memory-only IndexedDB on open (no manual force-refresh needed)', async () => {

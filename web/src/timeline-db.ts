@@ -25,6 +25,7 @@
 import type { TimelineEvent } from './ws-client.js';
 import { preferLastValueSignal, preferTimelineEvent } from '../../src/shared/timeline/merge.js';
 import { isLastValueTimelineEventType } from '../../src/shared/timeline/types.js';
+import { MESSAGE_PIN_EVENT_TYPES } from '../../shared/message-pins.js';
 
 const DB_NAME = 'imcodes-timeline';
 const DB_VERSION = 2;
@@ -58,6 +59,26 @@ const DRAIN_DEFAULT_DELETION_BUDGET = 500;
  * scanning for signals could otherwise walk the entire session.
  */
 const DRAIN_SCAN_MULTIPLIER = 4;
+/**
+ * Reserve part of a bounded first-paint page for actual conversation text.
+ * Tool-heavy turns can otherwise fill all 300 newest rows and make a healthy
+ * cache look like the screenshot's single tool card + "load earlier" pane.
+ */
+const RECENT_TEXT_FLOOR = 24;
+/**
+ * One foreground read examines at most one drain-sized page. This covers the
+ * tool-heavy first-paint failure without turning 1,000 serial cursor callbacks
+ * into a multi-second UI gate on slower WebKit/fake-IDB implementations. A
+ * legacy signal backlog larger than this page is handled by the existing
+ * chunked background drain, which refreshes the visible window after every
+ * productive pass.
+ */
+const RECENT_TEXT_SCAN_LIMIT = 500;
+
+function isTimelineTextEvent(event: TimelineEvent): boolean {
+  return event.type === MESSAGE_PIN_EVENT_TYPES.USER
+    || event.type === MESSAGE_PIN_EVENT_TYPES.ASSISTANT;
+}
 
 /**
  * A position inside the `session_ts` index. The primary key is required because
@@ -223,9 +244,22 @@ export class TimelineDB {
         // pane until a full page reload.
         db.onversionchange = () => {
           try { db.close(); } catch { /* ignore */ }
-          this.db = null;
-          this.openPromise = null;
+          if (this.db === db) {
+            this.db = null;
+            this.openPromise = null;
+          }
         };
+        // Safari may close an IndexedDB connection under storage pressure
+        // without a schema versionchange. Do not retain that dead connection:
+        // the next read must reopen instead of returning an empty memory map
+        // forever. `close` is supported by WebKit; addEventListener keeps this
+        // harmless on implementations that never emit it.
+        db.addEventListener('close', () => {
+          if (this.db === db) {
+            this.db = null;
+            this.openPromise = null;
+          }
+        });
         finishSuccess(db);
       };
       req.onerror = () => finishError(req.error);
@@ -247,7 +281,14 @@ export class TimelineDB {
     }
     if (all.length === 0) return;
     try {
-      await txPutEventsPreservingCompleteness(db, all);
+      // Preserve the same partitioning contract as putEvents(). Flushing every
+      // fallback row into `events` resurrected the exact legacy shape that can
+      // crowd conversation out: a recovered session.state row became
+      // append-only instead of being overwritten in the bounded signal store.
+      const conversation = all.filter((event) => !isLastValueTimelineEventType(event.type));
+      const signals = all.filter((event) => isLastValueTimelineEventType(event.type));
+      if (conversation.length > 0) await txPutEventsPreservingCompleteness(db, conversation);
+      if (signals.length > 0) await txPutSignals(db, signals);
       // Successful flush — drop the in-memory mirror. If a later write
       // fails it will repopulate the fallback for the next open cycle.
       this.memoryFallback.clear();
@@ -280,8 +321,17 @@ export class TimelineDB {
       // able to hold up a conversation write, or a read of the other store.
       if (conversation.length > 0) await txPutEventsPreservingCompleteness(db, conversation);
       if (signals.length > 0) await txPutSignals(db, signals);
-    } catch {
+    } catch (error) {
       for (const e of events) this.memPut(e);
+      if (this.isClosedConnectionError(error)) {
+        // The browser closed this handle between ensureOpen() and transaction
+        // creation. Keep the just-written rows in the fallback, drop the dead
+        // handle, and reopen now: ensureOpen() flushes the fallback before it
+        // resolves, so a page reload cannot lose the live events that arrived
+        // during the connection transition.
+        this.invalidateConnection(db);
+        await this.ensureOpen();
+      }
     }
   }
 
@@ -336,18 +386,45 @@ export class TimelineDB {
       return this.memGetByTime(sessionId, opts);
     }
     try {
-      // Conversation first, on its own transaction: this is the read the first
-      // paint is waiting on, and the whole reason signals were moved out is so
-      // nothing else shares its budget.
-      const conversation = await this.getRecentEventsTx(db, sessionId, opts);
-      // Then the signals, which are at most one row per type. A failure here
-      // must not cost the caller the conversation it already has.
-      const signals = await txReadSignals(db, sessionId).catch(() => [] as TimelineEvent[]);
-      if (signals.length === 0) return conversation;
-      return mergeStoredByTimestamp(conversation, signals);
-    } catch {
-      return this.memGetByTime(sessionId, opts);
+      return await this.readRecentEventsFromDb(db, sessionId, opts);
+    } catch (error) {
+      if (!this.isClosedConnectionError(error)) return this.memGetByTime(sessionId, opts);
+      this.invalidateConnection(db);
+      const reopened = await this.ensureOpen();
+      if (!reopened) return this.memGetByTime(sessionId, opts);
+      try {
+        return await this.readRecentEventsFromDb(reopened, sessionId, opts);
+      } catch {
+        return this.memGetByTime(sessionId, opts);
+      }
     }
+  }
+
+  private async readRecentEventsFromDb(
+    db: IDBDatabase,
+    sessionId: string,
+    opts?: { limit?: number },
+  ): Promise<TimelineEvent[]> {
+    // Conversation first, on its own transaction: this is the read the first
+    // paint is waiting on, and the whole reason signals were moved out is so
+    // nothing else shares its budget.
+    const conversation = await this.getRecentEventsTx(db, sessionId, opts);
+    // Then the signals, which are at most one row per type. A failure here
+    // must not cost the caller the conversation it already has.
+    const signals = await txReadSignals(db, sessionId).catch(() => [] as TimelineEvent[]);
+    if (signals.length === 0) return conversation;
+    return mergeStoredByTimestamp(conversation, signals);
+  }
+
+  private isClosedConnectionError(error: unknown): boolean {
+    return error instanceof DOMException && error.name === 'InvalidStateError';
+  }
+
+  private invalidateConnection(db: IDBDatabase): void {
+    if (this.db !== db) return;
+    try { db.close(); } catch { /* ignore */ }
+    this.db = null;
+    this.openPromise = null;
   }
 
   private getRecentEventsTx(
@@ -387,14 +464,41 @@ export class TimelineDB {
       // `getAll(range, count)` is not usable here: count takes from the START
       // of the range and we need the END.
       const out: TimelineEvent[] = [];
+      const requestedLimit = Math.max(1, Math.floor(limit));
+      const textTarget = Math.min(RECENT_TEXT_FLOOR, requestedLimit);
+      const scanLimit = Math.max(requestedLimit, RECENT_TEXT_SCAN_LIMIT);
+      let textCount = 0;
+      const finish = (): void => {
+        // `out` is newest-first. Text gets a reserved floor; the rest of the
+        // page is then filled with the newest remaining rows. Filtering the
+        // original cursor order and reversing preserves the index's stable
+        // ascending order (including same-millisecond primary-key order).
+        const selectedIds = new Set<string>();
+        for (const event of out) {
+          if (selectedIds.size >= textTarget) break;
+          if (isTimelineTextEvent(event)) selectedIds.add(event.eventId);
+        }
+        for (const event of out) {
+          if (selectedIds.size >= requestedLimit) break;
+          selectedIds.add(event.eventId);
+        }
+        resolve(out.filter((event) => selectedIds.has(event.eventId)).reverse());
+      };
       const req = index.openCursor(range, 'prev');
       req.onsuccess = () => {
         const cursor = req.result;
-        if (!cursor) { out.reverse(); resolve(out); return; }
-        out.push(cursor.value as TimelineEvent);
-        // Ascending order is the contract callers merge against, so undo the
-        // newest-first walk before handing the page back.
-        if (out.length >= limit) { out.reverse(); resolve(out); return; }
+        if (!cursor) { finish(); return; }
+        const event = cursor.value as TimelineEvent;
+        out.push(event);
+        if (isTimelineTextEvent(event)) textCount += 1;
+        // The common case still materialises exactly `limit` rows. Only a
+        // tool-dominated newest page scans farther, and never past the retained
+        // local window bound.
+        if ((out.length >= requestedLimit && textCount >= textTarget)
+          || out.length >= scanLimit) {
+          finish();
+          return;
+        }
         cursor.continue();
       };
       req.onerror = () => reject(req.error);
@@ -713,6 +817,13 @@ export class TimelineDB {
     if (!events) {
       events = [];
       this.memoryFallback.set(key, events);
+    }
+    if (isLastValueTimelineEventType(event.type)) {
+      const signalIndex = events.findIndex((candidate) => candidate.type === event.type);
+      if (signalIndex >= 0) {
+        events[signalIndex] = preferLastValueSignal(events[signalIndex]!, event);
+        return;
+      }
     }
     // Idempotent overwrite by eventId (matches IndexedDB put semantics)
     const idx = events.findIndex((e) => e.eventId === event.eventId);
