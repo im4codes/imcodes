@@ -1363,13 +1363,17 @@ describe('useTimeline global cache bounds', () => {
 
     const stored = localStorage.getItem(snapshotKey);
     expect(stored).toBeTruthy();
-    expect(new TextEncoder().encode(stored!).byteLength).toBeLessThanOrEqual(512 * 1024);
+    const storedBytes = new TextEncoder().encode(stored!).byteLength;
+    expect(storedBytes).toBeGreaterThan(64 * 1024);
+    expect(storedBytes).toBeLessThanOrEqual(256 * 1024);
     const snapshot = JSON.parse(stored!) as TimelineEvent[];
-    expect(snapshot.filter((event) => event.type === 'assistant.text')).toHaveLength(textEvents.length);
-    expect(snapshot.filter((event) => event.type === 'tool.result').length).toBeLessThan(toolEvents.length);
+    const retainedText = snapshot.filter((event) => event.type === 'assistant.text');
+    expect(retainedText.length).toBeGreaterThan(0);
+    expect(retainedText.at(-1)?.eventId).toBe(textEvents.at(-1)?.eventId);
+    expect(snapshot.filter((event) => event.type === 'tool.result')).toHaveLength(0);
   });
 
-  it('bounds each synchronous snapshot to 512 KiB so one window cannot monopolize localStorage', async () => {
+  it('bounds each independent synchronous snapshot to 256 KiB without borrowing from peer windows', async () => {
     vi.useFakeTimers();
     const sessionName = `deck_snapshot_budget_${Date.now()}`;
     const serverId = `srv-${Date.now()}`;
@@ -1385,7 +1389,7 @@ describe('useTimeline global cache bounds', () => {
 
     const stored = localStorage.getItem(snapshotKey);
     expect(stored).toBeTruthy();
-    expect(new TextEncoder().encode(stored!).byteLength).toBeLessThanOrEqual(512 * 1024);
+    expect(new TextEncoder().encode(stored!).byteLength).toBeLessThanOrEqual(256 * 1024);
     const snapshot = JSON.parse(stored!) as TimelineEvent[];
     expect(snapshot.length).toBeGreaterThan(0);
     expect(snapshot.at(-1)?.eventId).toBe(events.at(-1)?.eventId);
@@ -4041,6 +4045,63 @@ describe('useTimeline global cache bounds', () => {
       await vi.waitFor(() => expect(read()).toBe('pending'), { timeout: 3_000 });
       await act(async () => { await new Promise((r) => setTimeout(r, 250)); });
       expect(read()).toBe('pending');
+    });
+
+    it('starts daemon history before a cold IndexedDB read resolves', async () => {
+      const sessionName = `deck_cold_idb_stall_${Date.now()}`;
+      vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockImplementation(() => new Promise(() => {}));
+      const sendTimelineHistoryRequest = vi.fn(() => 'h-idb-stall');
+      const ws: WsClient = {
+        connected: true,
+        onMessage: () => () => {},
+        sendTimelineHistoryRequest,
+      } as unknown as WsClient;
+
+      function Probe() {
+        const timeline = useTimeline(sessionName, ws, 'srv', { isActiveSession: true });
+        return h('div', {
+          'data-testid': 'probe-idb-stall',
+          'data-cache': timeline.historyStatus?.steps.cache ?? '',
+          'data-daemon': timeline.historyStatus?.steps.daemon ?? '',
+        });
+      }
+      render(h(Probe));
+
+      await waitFor(() => expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName));
+      expect(screen.getByTestId('probe-idb-stall').getAttribute('data-cache')).toBe('running');
+      expect(screen.getByTestId('probe-idb-stall').getAttribute('data-daemon')).toBe('running');
+    });
+
+    it('ends the cache-only spinner and starts HTTP recovery when IndexedDB never settles', async () => {
+      vi.useFakeTimers();
+      const sessionName = `deck_cold_idb_deadline_${Date.now()}`;
+      vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockImplementation(() => new Promise(() => {}));
+      const ws: WsClient = {
+        connected: true,
+        onMessage: () => () => {},
+        sendTimelineHistoryRequest: vi.fn(() => 'h-idb-deadline'),
+      } as unknown as WsClient;
+
+      function Probe() {
+        const timeline = useTimeline(sessionName, ws, 'srv', { isActiveSession: true });
+        return h('div', {
+          'data-testid': 'probe-idb-deadline',
+          'data-loading': String(timeline.loading),
+          'data-cache': timeline.historyStatus?.steps.cache ?? '',
+        });
+      }
+      render(h(Probe));
+      await act(async () => { await flushMicrotasks(); });
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_200);
+        await vi.advanceTimersByTimeAsync(1);
+        await flushMicrotasks();
+      });
+
+      expect(screen.getByTestId('probe-idb-deadline').getAttribute('data-loading')).toBe('false');
+      expect(screen.getByTestId('probe-idb-deadline').getAttribute('data-cache')).toBe('offline');
+      expect(fetchHistorySpy).toHaveBeenCalled();
     });
 
     it('marks the daemon step offline when an inactive timeline will never request', async () => {

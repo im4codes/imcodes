@@ -87,7 +87,7 @@ describe('safeLocalStorageSetItem', () => {
     expect(storage.getItem(`${FILE_BROWSER_SNAPSHOT_KEY_PREFIX}:cwd:1:0:server`)).toBeNull();
   });
 
-  it('removes oldest timeline snapshots one at a time and preserves newer windows', () => {
+  it('never evicts another chat window snapshot to satisfy an unrelated write', () => {
     const storage = new FakeStorage();
     const snapshot = (ts: number, padding: number): string => JSON.stringify([{ ts, text: 'x'.repeat(padding) }]);
     const oldestKey = `${TIMELINE_SNAPSHOT_STORAGE_PREFIX}server:oldest`;
@@ -101,11 +101,43 @@ describe('safeLocalStorageSetItem', () => {
     storage.maxTotalLength = existingLength + 10;
     installFakeStorage(storage);
 
-    expect(safeLocalStorageSetItem('rcc_session', 'new-session-value')).toBe(true);
+    expect(safeLocalStorageSetItem('rcc_session', 'new-session-value')).toBe(false);
 
-    expect(storage.getItem(oldestKey)).toBeNull();
+    expect(storage.getItem(oldestKey)).not.toBeNull();
     expect(storage.getItem(middleKey)).not.toBeNull();
     expect(storage.getItem(newestKey)).not.toBeNull();
+    expect(storage.getItem('rcc_session')).toBeNull();
+  });
+
+  it('preserves the current and peer window snapshots when refreshing the current one exceeds quota', () => {
+    const storage = new FakeStorage();
+    const currentKey = `${TIMELINE_SNAPSHOT_STORAGE_PREFIX}server:current`;
+    const peerKey = `${TIMELINE_SNAPSHOT_STORAGE_PREFIX}server:peer`;
+    storage.setItem(currentKey, 'current-old');
+    storage.setItem(peerKey, 'peer-history');
+    storage.maxTotalLength = 'current-old'.length + 'peer-history'.length;
+    installFakeStorage(storage);
+
+    expect(safeLocalStorageSetItem(currentKey, 'current-new-and-larger', {
+      clearOwnTimelineSnapshotOnFailure: true,
+    })).toBe(false);
+    expect(storage.getItem(currentKey)).toBeNull();
+    expect(storage.getItem(peerKey)).toBe('peer-history');
+  });
+
+  it('does not evict another window file cache for a timeline write', () => {
+    const storage = new FakeStorage();
+    const timelineKey = `${TIMELINE_SNAPSHOT_STORAGE_PREFIX}server:current`;
+    const fileKey = `${FILE_BROWSER_SNAPSHOT_KEY_PREFIX}:cwd:1:0:server`;
+    storage.setItem(fileKey, 'peer-file-window');
+    storage.maxTotalLength = 'peer-file-window'.length;
+    installFakeStorage(storage);
+
+    expect(safeLocalStorageSetItem(timelineKey, 'timeline', {
+      clearOwnTimelineSnapshotOnFailure: true,
+    })).toBe(false);
+    expect(storage.getItem(timelineKey)).toBeNull();
+    expect(storage.getItem(fileKey)).toBe('peer-file-window');
   });
 
   it('returns false without throwing when storage is still unavailable', () => {

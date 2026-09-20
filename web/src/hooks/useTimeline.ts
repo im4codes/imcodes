@@ -525,11 +525,25 @@ const TERMINAL_TAIL_IDLE_RECONCILE_MS = 5000;
 // Text and tool-detail events have separate row budgets. Tool traffic is often
 // much denser than conversation, so one command with hundreds of calls must not
 // push recent user/assistant text out before byte-budget selection even starts.
-// IndexedDB remains the full local-history store; this 512 KiB snapshot is the
-// highest-priority synchronous first paint while IDB/network catch up.
+// IndexedDB remains the full local-history store. This intentionally small
+// snapshot is only the highest-priority synchronous first paint while
+// IDB/network catch up. Keeping 512 KiB *per session* meant a workspace with a
+// few dozen chat windows exhausted Safari's localStorage budget; each new write
+// then evicted another window's only synchronous seed and switching back painted
+// a blank chat. Each window owns an independent 256 KiB ceiling and, when the
+// browser quota is tight, shrinks only its own snapshot instead of evicting a
+// peer window's recent chat.
 const MAX_PERSISTED_SNAPSHOT_EVENTS_PER_CLASS = 300;
-const MAX_PERSISTED_SNAPSHOT_BYTES = 512 * 1024;
+const MAX_PERSISTED_SNAPSHOT_BYTES = 256 * 1024;
+const PERSISTED_SNAPSHOT_SELF_BUDGETS = [256, 128, 64, 32, 16, 8].map((kib) => kib * 1024);
 const timelineSnapshotTextEncoder = new TextEncoder();
+// A local IndexedDB read is an optimization, never a gate in front of the
+// authoritative history sources. Safari can leave an IDB request pending after
+// a page freeze/version transition without producing success/error/blocked.
+// Bound how long an empty pane may call that read "loading"; the late read is
+// still merged if it eventually completes.
+const LOCAL_HISTORY_READ_DEADLINE_MS = 1_200;
+const LOCAL_HISTORY_DAEMON_HEDGE_MS = 100;
 
 /**
  * How much history each session keeps in IndexedDB.
@@ -951,7 +965,7 @@ function isTimelineSnapshotTextEvent(event: TimelineEvent): boolean {
     || event.type === MESSAGE_PIN_EVENT_TYPES.ASSISTANT;
 }
 
-function serializeTimelineSnapshotTail(tail: TimelineEvent[]): string {
+function serializeTimelineSnapshotTail(tail: TimelineEvent[], maxBytes = MAX_PERSISTED_SNAPSHOT_BYTES): string {
   if (tail.length === 0) return '[]';
 
   const serialized = tail.map((event, index) => ({
@@ -966,7 +980,7 @@ function serializeTimelineSnapshotTail(tail: TimelineEvent[]): string {
       const candidate = candidates[index]!;
       const valueBytes = timelineSnapshotTextEncoder.encode(candidate.value).byteLength;
       const addedBytes = valueBytes + (selected.size > 0 ? 1 : 0);
-      if (serializedBytes + addedBytes > MAX_PERSISTED_SNAPSHOT_BYTES) continue;
+      if (serializedBytes + addedBytes > maxBytes) continue;
       selected.set(candidate.index, candidate.value);
       serializedBytes += addedBytes;
     }
@@ -1002,12 +1016,19 @@ function persistTimelineSnapshotTail(cacheKey: string, tail: TimelineEvent[]): v
       return;
     }
     // Quota-aware write. The compact, renderable-only value keeps many session
-    // seeds resident, and the writer evicts lower-priority frames one at a time
-    // before sacrificing the oldest timeline snapshot.
-    const written = safeLocalStorageSetItem(
-      getTimelineSnapshotStorageKey(cacheKey),
-      serializeTimelineSnapshotTail(tail),
-    );
+    // seeds resident. Each retry spends only this window's smaller budget; the
+    // storage helper never evicts another window's timeline/file/terminal cache.
+    const storageKey = getTimelineSnapshotStorageKey(cacheKey);
+    let written = false;
+    for (let index = 0; index < PERSISTED_SNAPSHOT_SELF_BUDGETS.length; index += 1) {
+      const value = serializeTimelineSnapshotTail(tail, PERSISTED_SNAPSHOT_SELF_BUDGETS[index]);
+      written = safeLocalStorageSetItem(storageKey, value, {
+        // Exhausted every smaller self-budget: only this window's old cache may
+        // be cleared. Other timeline keys are never eviction candidates.
+        clearOwnTimelineSnapshotOnFailure: index === PERSISTED_SNAPSHOT_SELF_BUDGETS.length - 1,
+      });
+      if (written) break;
+    }
     // Record ONLY a write that landed: areTimelineSnapshotTailsSame() skips a
     // write whose tail matches the last recorded one, so remembering a failed
     // write would strand this session without a snapshot until its tail
@@ -2418,8 +2439,28 @@ export function useTimeline(
       return () => { cancelled = true; };
     }
 
-    // 3. IndexedDB cache → daemon history (first load for this session in this page session)
-    if (localSnapshot.length === 0) setLoading(true);
+    // 3. IndexedDB cache + authoritative history (first load for this session
+    // in this page session). A cold ACTIVE pane starts daemon history in
+    // parallel with IDB. Previously the daemon request lived only after the
+    // awaited local read; one pending Safari IDB transaction therefore left the
+    // exact UI seen in production forever: "本地缓存 …  daemon ○" and no rows.
+    let coldDaemonRequested = false;
+    let coldDaemonTimer: ReturnType<typeof setTimeout> | null = null;
+    if (localSnapshot.length === 0) {
+      setLoading(true);
+      if (isActiveSession && wsConnected) {
+        // Give a healthy local read one short head start, then hedge with the
+        // daemon instead of awaiting IDB indefinitely. This preserves the cheap
+        // local-first path while bounding the screenshot's cache-only stall.
+        coldDaemonTimer = setTimeout(() => {
+          coldDaemonTimer = null;
+          if (cancelled || coldDaemonRequested) return;
+          requestDaemonHistory(true);
+          coldDaemonRequested = true;
+        }, LOCAL_HISTORY_DAEMON_HEDGE_MS);
+        coldDaemonTimer.unref?.();
+      }
+    }
     // Active session ("the open window") loads IDB immediately. Inactive
     // useTimeline instances (SubSessionCard previews in the bar, hidden
     // SubSessionWindow tabs, etc.) stagger by ~80ms so the active session
@@ -2450,9 +2491,37 @@ export function useTimeline(
       // never mistaken for "no history". `ensureOpen` is awaited inside the
       // read methods. See run 016f9b5b-c8f (split-key + fail-safe).
       const rawSessionIdForFallback = sessionId && sessionId !== cacheKey ? sessionId : undefined;
-      let { stored, cursor, rawAlreadyRead } = await readLocalTimelineMerged(
+      const localRead = readLocalTimelineMerged(
         db, cacheKey!, rawSessionIdForFallback, MAX_MEMORY_EVENTS,
       );
+      let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+      const first = await Promise.race([
+        localRead.then((result) => ({ kind: 'result' as const, result })),
+        new Promise<{ kind: 'deadline' }>((resolve) => {
+          deadlineTimer = setTimeout(() => resolve({ kind: 'deadline' }), LOCAL_HISTORY_READ_DEADLINE_MS);
+          deadlineTimer.unref?.();
+        }),
+      ]);
+      if (first.kind === 'deadline') {
+        if (cancelled) return;
+        // Let daemon/HTTP continue and let ChatView leave its cache-only
+        // spinner. Do not cancel the IDB request: a late success is valuable and
+        // is merged below under the same cache-key/cancellation fences.
+        updateHistoryStep('cache', 'offline', 'bootstrap');
+        setLoading(false);
+        if (isActiveSession) {
+          fireHttpBackfillRef.current(0, { cooldownMs: 0, phase: 'bootstrap', mode: 'manualLatestWindow' });
+        }
+      } else if (deadlineTimer) {
+        clearTimeout(deadlineTimer);
+      }
+      if (first.kind === 'result' && coldDaemonTimer) {
+        clearTimeout(coldDaemonTimer);
+        coldDaemonTimer = null;
+      }
+      let { stored, cursor, rawAlreadyRead } = first.kind === 'result'
+        ? first.result
+        : await localRead;
       if (cancelled) return;
       // Race-proof local recovery: `getRecentEvents` returns [] BOTH for a
       // genuine cold start AND when IndexedDB failed to open (blocked by another
@@ -2556,7 +2625,14 @@ export function useTimeline(
         // `historyLoadedRef` unset so a dep-churn re-run / ↻ / the IDB-open
         // backoff retry can re-read the local store if data appears.
         if (isActiveSession && wsConnected) {
-          requestDaemonHistory(true);
+          if (!coldDaemonRequested) {
+            requestDaemonHistory(true);
+            coldDaemonRequested = true;
+          }
+          // The local read has settled empty; the already-running daemon step
+          // now owns visible progress, so local loading must not keep the pane
+          // in an IDB-only spinner.
+          setLoading(false);
         } else {
           setLoading(false);
           // Nothing was fetched. Say WHICH it is instead of letting the status
@@ -2608,7 +2684,10 @@ export function useTimeline(
       // would let dep churn starve background sessions forever.
       setTimeout(() => { if (!cancelled) load().catch(() => {}); }, 80);
     }
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      if (coldDaemonTimer) clearTimeout(coldDaemonTimer);
+    };
   }, [buildForwardHistoryArgs, cacheKey, clearForwardHistoryTimeout, clearHttpBackfillTimer, disableHistory, isActiveSession, sendForwardHistoryRequest, sessionId, ws, wsConnected]);
 
   // Map of commandId → optimistic eventId for O(1) lookup on command.ack / dedup.

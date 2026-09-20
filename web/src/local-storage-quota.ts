@@ -10,68 +10,46 @@ function isQuotaExceededError(error: unknown): boolean {
     || error.code === 1014;
 }
 
-function isVolatileStorageKey(key: string): boolean {
-  return key.startsWith(TIMELINE_SNAPSHOT_STORAGE_PREFIX)
-    || key.startsWith(FILE_BROWSER_SNAPSHOT_KEY_PREFIX)
+function isReclaimableStorageKey(key: string): boolean {
+  return key.startsWith(FILE_BROWSER_SNAPSHOT_KEY_PREFIX)
     || key.startsWith(TERMINAL_FRAME_STORAGE_PREFIX);
 }
 
 /**
  * Lower values are reclaimed first.
  *
- * Timeline snapshots are the only synchronous first-paint source after a page
- * reload. IndexedDB can refill them later, but that asynchronous gap is visible
- * as a blank chat when the user switches windows. Terminal/file-browser frames
- * are therefore cheaper to lose and must never evict every timeline snapshot
- * merely because one unrelated preference write encountered quota pressure.
+ * Timeline snapshots are deliberately absent from this eviction list. They are
+ * the only synchronous first-paint source after a page reload and belong to
+ * independent chat windows: a write for one window (or an unrelated setting)
+ * must never make another window blank. Terminal/file-browser frames are the
+ * only caches cheap enough to reclaim automatically.
  */
 function evictionPriority(key: string): number {
   if (key.startsWith(TERMINAL_FRAME_STORAGE_PREFIX)) return 0;
-  if (key.startsWith(FILE_BROWSER_SNAPSHOT_KEY_PREFIX)) return 1;
-  return 2;
+  return 1;
 }
 
-function timelineSnapshotNewestTimestamp(storage: Storage, key: string): number {
-  if (!key.startsWith(TIMELINE_SNAPSHOT_STORAGE_PREFIX)) return 0;
-  try {
-    const parsed = JSON.parse(storage.getItem(key) ?? '[]') as unknown;
-    if (!Array.isArray(parsed)) return 0;
-    let newest = 0;
-    for (const candidate of parsed) {
-      if (!candidate || typeof candidate !== 'object') continue;
-      const ts = (candidate as { ts?: unknown }).ts;
-      if (typeof ts === 'number' && Number.isFinite(ts)) newest = Math.max(newest, ts);
-    }
-    return newest;
-  } catch {
-    // Corrupt/unreadable snapshots have no first-paint value and are the oldest.
-    return 0;
-  }
-}
-
-function collectVolatileStorageKeys(storage: Storage, retainKey: string): string[] {
+function collectReclaimableStorageKeys(storage: Storage, retainKey: string): string[] {
   const keys: string[] = [];
   for (let i = 0; i < storage.length; i += 1) {
     const key = storage.key(i);
-    if (!key || key === retainKey || !isVolatileStorageKey(key)) continue;
+    if (!key || key === retainKey || !isReclaimableStorageKey(key)) continue;
     keys.push(key);
   }
   return keys.sort((left, right) => {
     const priorityDelta = evictionPriority(left) - evictionPriority(right);
     if (priorityDelta !== 0) return priorityDelta;
-    if (left.startsWith(TIMELINE_SNAPSHOT_STORAGE_PREFIX)
-      && right.startsWith(TIMELINE_SNAPSHOT_STORAGE_PREFIX)) {
-      const ageDelta = timelineSnapshotNewestTimestamp(storage, left)
-        - timelineSnapshotNewestTimestamp(storage, right);
-      if (ageDelta !== 0) return ageDelta;
-    }
     const leftSize = storage.getItem(left)?.length ?? 0;
     const rightSize = storage.getItem(right)?.length ?? 0;
     return rightSize - leftSize;
   });
 }
 
-export function safeLocalStorageSetItem(key: string, value: string): boolean {
+export function safeLocalStorageSetItem(
+  key: string,
+  value: string,
+  options?: { clearOwnTimelineSnapshotOnFailure?: boolean },
+): boolean {
   const storage = window.localStorage;
   try {
     storage.setItem(key, value);
@@ -84,7 +62,14 @@ export function safeLocalStorageSetItem(key: string, value: string): boolean {
   // every volatile entry before a single retry, so one full-store write erased
   // all other sessions' synchronous timeline seeds. Switching back to any of
   // those sessions then had to wait for IndexedDB and painted a blank pane.
-  for (const candidate of collectVolatileStorageKeys(storage, key)) {
+  // A timeline write belongs to one chat window. It may self-shrink/self-clear
+  // below, but it must not reclaim terminal or file snapshots that may belong
+  // to another window. Non-timeline settings may still reclaim those cheaper
+  // caches, while timeline snapshots remain protected in every case.
+  const reclaimable = key.startsWith(TIMELINE_SNAPSHOT_STORAGE_PREFIX)
+    ? []
+    : collectReclaimableStorageKeys(storage, key);
+  for (const candidate of reclaimable) {
     try {
       storage.removeItem(candidate);
       storage.setItem(key, value);
@@ -92,6 +77,13 @@ export function safeLocalStorageSetItem(key: string, value: string): boolean {
     } catch (error) {
       if (!isQuotaExceededError(error)) return false;
     }
+  }
+  // Timeline windows own only their own bounded cache. If even the smallest
+  // self-budgeted tail cannot be stored, the caller may discard THIS key — but
+  // never another window's snapshot — before falling back to IDB/daemon.
+  if (options?.clearOwnTimelineSnapshotOnFailure
+    && key.startsWith(TIMELINE_SNAPSHOT_STORAGE_PREFIX)) {
+    try { storage.removeItem(key); } catch { /* ignore */ }
   }
   return false;
 }
