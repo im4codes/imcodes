@@ -59,6 +59,8 @@ export const SUPERVISION_CONTRACT_IDS = {
 } as const;
 
 export const SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND = 'supervision-audit-target-recovery' as const;
+export const SUPERVISION_ORPHANED_AUTOMATIC_AUDITOR_REBIND_SOURCE =
+  'orphaned_automatic_auditor_rebind' as const;
 export const SUPERVISION_AUDIT_MARKER_CORRECTION_AUTOMATION_KIND = 'supervision-audit-marker-correction' as const;
 export const SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND = 'supervision-waiting-heartbeat' as const;
 export const SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND = 'supervision-audit-heartbeat' as const;

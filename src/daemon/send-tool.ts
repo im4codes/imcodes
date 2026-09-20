@@ -66,6 +66,7 @@ import {
 import {
   SUPERVISION_MODE,
   SUPERVISION_CONTRACT_IDS,
+  SUPERVISION_ORPHANED_AUTOMATIC_AUDITOR_REBIND_SOURCE,
   isAuditableSupervisionTaskClassification,
   isAutomaticSupervisionEnabled,
   isTerminalSupervisionTaskStatus,
@@ -2869,6 +2870,7 @@ export interface ReadyAuditDispatchDeps {
       assignmentId: string;
       messageId: SendMessageId;
       supersededMessageIds: readonly SendMessageId[];
+      supersededDeliveries?: readonly { messageId: string; targetSessionName: string }[];
       origins: readonly DelegationReplyRecord['origin'][];
       target: DelegationReplyRecord['target'];
     };
@@ -3033,6 +3035,25 @@ function adoptExactDurableAuditDelivery(input: {
     ).concat(deterministicSendMessageId(
       `auto-audit-redelivery:${input.existingAssignment.assignmentId}:${input.attemptId}`,
     )),
+    supersededDeliveries: input.registry.listEvents(input.task.taskId).flatMap((event) => {
+      if (event.assignmentId !== input.existingAssignment!.assignmentId
+        || event.eventType !== 'recovered'
+        || event.payload?.source !== SUPERVISION_ORPHANED_AUTOMATIC_AUDITOR_REBIND_SOURCE
+        || event.payload?.attemptId !== input.attemptId
+        || event.payload?.revision !== input.revision
+        || event.payload?.deliveryMessageId !== deterministicAutomaticAuditDeliveryMessageId(
+          input.existingAssignment!.assignmentId,
+          input.attemptId,
+          input.existingAssignment!.generation,
+        )) return [];
+      const messageId = typeof event.payload?.supersededDeliveryMessageId === 'string'
+        ? event.payload.supersededDeliveryMessageId.trim()
+        : '';
+      const targetSessionName = typeof event.payload?.supersededSessionName === 'string'
+        ? event.payload.supersededSessionName.trim()
+        : '';
+      return messageId && targetSessionName ? [{ messageId, targetSessionName }] : [];
+    }),
     origins: input.task.assignments
       .filter((assignment) => assignment.role === 'coordinator'
         || assignment.role === 'implementer'
@@ -3046,6 +3067,7 @@ function adoptExactDurableAuditDelivery(input: {
       assignmentAuthority?: {
         assignmentId: string; messageId: SendMessageId;
         supersededMessageIds: readonly SendMessageId[];
+        supersededDeliveries?: readonly { messageId: string; targetSessionName: string }[];
         origins: readonly DelegationReplyRecord['origin'][];
         target: DelegationReplyRecord['target'];
       };

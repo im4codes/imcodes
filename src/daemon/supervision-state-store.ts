@@ -32,6 +32,7 @@ import {
   SUPERVISION_TASK_HOUSEKEEPING_MAX_BATCH_SIZE,
   SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES,
   SUPERVISION_RECOVERY_LEASE_ACTIONS,
+  SUPERVISION_ORPHANED_AUTOMATIC_AUDITOR_REBIND_SOURCE,
   SUPERVISION_COMPLETION_EVIDENCE_DECISIONS,
   SUPERVISION_MODE,
   type SupervisionTaskArchiveReason,
@@ -7374,7 +7375,7 @@ export class SupervisionTaskRegistry {
       const priorEvents = this.listEvents(taskId).filter((event) => (
         event.eventType === 'recovered'
         && event.assignmentId === assignmentId
-        && event.payload?.source === 'orphaned_automatic_auditor_rebind'
+        && event.payload?.source === SUPERVISION_ORPHANED_AUTOMATIC_AUDITOR_REBIND_SOURCE
         && event.payload?.idempotencyKey === idempotencyKey
       ));
       const exactReplay = priorEvents.some((event) => (
@@ -7508,7 +7509,7 @@ export class SupervisionTaskRegistry {
         updatedAt: now,
       };
       this.#writeAssignment(rebound, 'recovered', {
-        source: 'orphaned_automatic_auditor_rebind',
+        source: SUPERVISION_ORPHANED_AUTOMATIC_AUDITOR_REBIND_SOURCE,
         idempotencyKey,
         reason,
         auditPolicy: task.auditPolicy,
@@ -7531,14 +7532,14 @@ export class SupervisionTaskRegistry {
         && Boolean(task.blocker && evidenceSource?.blocker === task.blocker);
       if (clearsRoutingBlocker && evidenceSource) {
         this.#writeAssignment({ ...evidenceSource, blocker: undefined, updatedAt: now }, 'recovered', {
-          source: 'orphaned_automatic_auditor_rebind',
+          source: SUPERVISION_ORPHANED_AUTOMATIC_AUDITOR_REBIND_SOURCE,
           auditorAssignmentId: assignmentId,
           revision: expectedRevision,
           attemptId: auditAttemptId,
           clearedObsoleteBlocker: true,
         });
         this.#writeTask({ ...task, blocker: undefined, updatedAt: now }, 'recovered', {
-          source: 'orphaned_automatic_auditor_rebind',
+          source: SUPERVISION_ORPHANED_AUTOMATIC_AUDITOR_REBIND_SOURCE,
           assignmentId,
           revision: expectedRevision,
           attemptId: auditAttemptId,

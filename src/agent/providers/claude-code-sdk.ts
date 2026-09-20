@@ -1017,6 +1017,15 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       mcpServers: getClaudeMcpServers({
         sessionKey: state.routeId,
         sessionName: state.sessionName,
+        // `startQuery` rebuilds the MCP configuration on every turn (including
+        // resume and credential-refresh retries). Keep the resource owner in
+        // that rebuild. Omitting these two fields made the managed MCP inherit
+        // similarly named variables from the daemon/SDK child environment;
+        // when the daemon itself had been started from another managed
+        // session, one session's MCP process could therefore present another
+        // session's instance/epoch while retaining the correct session name.
+        sessionInstanceId: state.resourceOwner?.sessionInstanceId,
+        runtimeEpoch: state.resourceOwner?.runtimeEpoch,
         projectName: state.projectName,
         serverId: state.serverId,
         cwd: state.cwd,

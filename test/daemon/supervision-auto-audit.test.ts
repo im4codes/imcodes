@@ -11,7 +11,10 @@ import {
   AGENT_DELEGATION_REPLY_STATUSES,
 } from '../../shared/agent-delegation.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
-import { normalizeSessionSupervisionSnapshot } from '../../shared/supervision-config.js';
+import {
+  normalizeSessionSupervisionSnapshot,
+  SUPERVISION_ORPHANED_AUTOMATIC_AUDITOR_REBIND_SOURCE,
+} from '../../shared/supervision-config.js';
 import { AUDIT_SEVERITY_DEFINITIONS, AUDIT_SEVERITY_LEVELS } from '../../shared/audit-convergence.js';
 import { buildSupervisionExecutionCapabilityId } from '../../shared/supervision-execution-pool.js';
 import {
@@ -3805,6 +3808,7 @@ describe('periodic supervision convergence tick', () => {
     const revision = 'post-pass-successor-owner-retirement-cx1-r1-eb2b2965f045';
     const attemptId = 'auto-audit-30656902ee6c14fbdcb2751b';
     const { registry } = makeReadyTask({ taskId, revision, auditPolicy: 'auto_strict_cross_vendor' });
+    const brain = session('deck_alpha_brain', 'brain');
     const oldIdentity = identity('deck_alpha_live_cc9', 'claude-code-sdk', 'anthropic');
     const staleRequested = {
       agentType: 'cursor-headless', providerFamily: 'cursor', runtimeType: 'transport' as const, model: 'Auto',
@@ -3824,7 +3828,7 @@ describe('periodic supervision convergence tick', () => {
       taskId, auditorAssignmentId: auditor.value.assignmentId, callerProjectName: 'alpha',
       reason: 'undelivered split Cursor binding cannot reach selected CC', now: 150,
     })).toMatchObject({ ok: true, value: { status: 'cancelled' } });
-    const replacement = identity('deck_alpha_live_cc9', 'claude-code-sdk', 'anthropic');
+    const replacement = identity('deck_alpha_live_cc10', 'claude-code-sdk', 'anthropic');
     const selected = {
       agentType: 'claude-code-sdk', providerFamily: 'anthropic', runtimeType: 'transport' as const,
       model: 'claude-sonnet-4-6',
@@ -3839,6 +3843,19 @@ describe('periodic supervision convergence tick', () => {
     const replacementMessageId = deterministicAutomaticAuditDeliveryMessageId(
       auditor.value.assignmentId, attemptId, auditor.value.generation + 1,
     );
+    const supersededDelivery = getDelegationReplyStore().create({
+      taskId,
+      assignmentId: auditor.value.assignmentId,
+      purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+      auditAttemptId: attemptId,
+      auditRevision: revision,
+      auditedSessionName: 'deck_alpha_worker',
+      messageId,
+      dispatchId: 'dispatch-old-auditor-target-before-registry-rebind',
+      origin: identity(brain.name),
+      target: oldIdentity,
+      now: 175,
+    });
 
     expect(registry.recoverOrphanedDelegatedAuditor({
       taskId,
@@ -3881,7 +3898,6 @@ describe('periodic supervision convergence tick', () => {
       now: 300,
     })).toMatchObject({ ok: true, replay: true });
 
-    const brain = session('deck_alpha_brain', 'brain');
     const worker = session('deck_alpha_worker', 'w1');
     const liveAuditor = session(replacement.sessionName, 'w2', 'claude-code-sdk', 'anthropic');
     let replacementEvidence = false;
@@ -3931,6 +3947,8 @@ describe('periodic supervision convergence tick', () => {
       messageId: replacementMessageId,
     });
     expect(dispatch).toHaveBeenCalledOnce();
+    expect(getDelegationReplyStore().get(supersededDelivery.record.delegationId)?.status)
+      .toBe(AGENT_DELEGATION_REPLY_STATUSES.EXPIRED);
     expect(registry.listAssignments(taskId).filter((item) => item.role === 'auditor')).toEqual([
       expect.objectContaining({
         assignmentId: auditor.value.assignmentId,
@@ -3943,7 +3961,7 @@ describe('periodic supervision convergence tick', () => {
     expect(registry.listEvents(taskId).filter((event) => event.assignmentId === auditor.value.assignmentId)
       .map((event) => event.payload?.source)).toEqual(expect.arrayContaining([
         'brain_authorized_stale_auditor_cancel',
-        'orphaned_automatic_auditor_rebind',
+        SUPERVISION_ORPHANED_AUTOMATIC_AUDITOR_REBIND_SOURCE,
       ]));
 
     const genericTaskId = `${taskId}-generic-cancel`;

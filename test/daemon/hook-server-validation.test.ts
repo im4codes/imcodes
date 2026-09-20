@@ -299,7 +299,11 @@ describe('Hook server — session validation', () => {
     });
     await expect(postMemoryMcpDaemonTool(port, 'deck_current_brain', {
       sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-old', tool: 'search_memory', input: {},
-    })).resolves.toMatchObject({ status: 409 });
+    })).resolves.toEqual({
+      status: 409,
+      body: { ok: false, error: 'daemon_memory_worker_stale_runtime' },
+    });
+    expect(timelineEmitMock).not.toHaveBeenCalled();
     await expect(postMemoryMcpDaemonTool(port, 'deck_current_brain', {
       sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-current', tool: 'list_machines', input: {},
     })).resolves.toMatchObject({ status: 400 });

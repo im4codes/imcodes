@@ -312,6 +312,91 @@ describe('DelegationReplyStore', () => {
     database.close();
   });
 
+  it('retires an explicitly superseded audit target without treating the registry rebind as ambiguity', () => {
+    const database = new DatabaseSync(':memory:');
+    const store = new DelegationReplyStore({ database });
+    const oldTarget = {
+      sessionName: 'deck_sub_old_auditor',
+      sessionInstanceId: 'old-auditor-instance',
+      runtimeEpoch: 'old-auditor-epoch',
+    };
+    const newTarget = {
+      sessionName: 'deck_sub_new_auditor',
+      sessionInstanceId: 'new-auditor-instance',
+      runtimeEpoch: 'new-auditor-epoch',
+    };
+    const stale = store.create({
+      origin,
+      target: oldTarget,
+      purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+      auditAttemptId: 'attempt-target-rebind',
+      auditRevision: 'revision-target-rebind',
+      auditedSessionName: 'deck_project_worker',
+      taskId: 'task-target-rebind',
+      assignmentId: 'assignment-target-rebind',
+      dispatchId: 'dispatch-generation-1',
+      messageId: 'message-generation-1',
+      now: 100,
+    });
+
+    expect(store.findPendingAuditDelivery({
+      taskId: 'task-target-rebind',
+      auditAttemptId: 'attempt-target-rebind',
+      auditRevision: 'revision-target-rebind',
+      auditedSessionName: 'deck_project_worker',
+      assignmentAuthority: {
+        assignmentId: 'assignment-target-rebind',
+        messageId: 'message-generation-2',
+        supersededMessageIds: ['message-generation-1'],
+        supersededDeliveries: [{
+          messageId: 'message-generation-1',
+          targetSessionName: oldTarget.sessionName,
+        }],
+        origins: [origin],
+        target: newTarget,
+      },
+      now: 200,
+    })).toEqual({ status: 'none' });
+    expect(store.get(stale.record.delegationId)?.status)
+      .toBe(AGENT_DELEGATION_REPLY_STATUSES.EXPIRED);
+
+    const unproven = store.create({
+      origin,
+      target: { ...oldTarget, sessionName: 'deck_sub_unproven' },
+      purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+      auditAttemptId: 'attempt-target-rebind',
+      auditRevision: 'revision-target-rebind',
+      auditedSessionName: 'deck_project_worker',
+      taskId: 'task-target-rebind',
+      assignmentId: 'assignment-target-rebind',
+      dispatchId: 'dispatch-unproven',
+      messageId: 'message-unproven',
+      now: 201,
+    });
+    expect(store.findPendingAuditDelivery({
+      taskId: 'task-target-rebind',
+      auditAttemptId: 'attempt-target-rebind',
+      auditRevision: 'revision-target-rebind',
+      auditedSessionName: 'deck_project_worker',
+      assignmentAuthority: {
+        assignmentId: 'assignment-target-rebind',
+        messageId: 'message-generation-2',
+        supersededMessageIds: ['message-generation-1'],
+        supersededDeliveries: [{
+          messageId: 'message-generation-1',
+          targetSessionName: oldTarget.sessionName,
+        }],
+        origins: [origin],
+        target: newTarget,
+      },
+      now: 202,
+    })).toEqual({ status: 'ambiguous' });
+    expect(store.get(unproven.record.delegationId)?.status)
+      .toBe(AGENT_DELEGATION_REPLY_STATUSES.PENDING);
+    store.close();
+    database.close();
+  });
+
   it('converges duplicate audit-delivery metadata onto the one canonical assignment authority', () => {
     const database = new DatabaseSync(':memory:');
     const store = new DelegationReplyStore({ database });

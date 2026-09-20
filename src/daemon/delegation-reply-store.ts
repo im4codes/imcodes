@@ -89,6 +89,15 @@ export interface PendingAuditDeliveryAssignmentAuthority {
   assignmentId: string;
   messageId: string;
   supersededMessageIds: readonly string[];
+  /**
+   * Registry-proven target-generation replacements. A message id alone is not
+   * enough to retire a different verdict principal: the durable recovery event
+   * must also name the session that owned that superseded delivery.
+   */
+  supersededDeliveries?: readonly {
+    messageId: string;
+    targetSessionName: string;
+  }[];
   origins: readonly DelegationReplyBoundIdentity[];
   target: DelegationReplyBoundIdentity;
 }
@@ -727,6 +736,9 @@ export class DelegationReplyStore {
       authority.messageId,
       ...authority.supersededMessageIds,
     ]);
+    const supersededDeliveries = new Set((authority.supersededDeliveries ?? []).map((delivery) => (
+      `${delivery.messageId}\0${delivery.targetSessionName}`
+    )));
     this.#db.exec('BEGIN IMMEDIATE');
     try {
       const rows = queryRows();
@@ -735,6 +747,9 @@ export class DelegationReplyStore {
         return { status: 'none' };
       }
       const records = resolveRecords(rows);
+      const isExplicitlySupersededTarget = (record: DelegationReplyRecord) => (
+        supersededDeliveries.has(`${record.messageId}\0${record.target.sessionName}`)
+      );
       if (records.length !== rows.length
         || records.some((record) => (
           record.assignmentId !== authority.assignmentId
@@ -745,6 +760,7 @@ export class DelegationReplyStore {
           // delivery. An unknown row from another same-name runtime remains a
           // competing verdict principal and must fail closed.
           || (!identityMatches(record.target, authority.target)
+            && !isExplicitlySupersededTarget(record)
             && (record.target.sessionName !== authority.target.sessionName
               || !authoritativeMessageIds.has(record.messageId)))
         ))) {
@@ -760,7 +776,8 @@ export class DelegationReplyStore {
       // The canonical row is still selected by the current deterministic id
       // and exact runtime identities, so an unbound/non-canonical row can never
       // become authority by itself.
-      let current = records.filter((record) => (
+      const activeRecords = records.filter((record) => !isExplicitlySupersededTarget(record));
+      let current = activeRecords.filter((record) => (
         record.messageId === authority.messageId
         && identityMatches(record.target, authority.target)
         && authority.origins.some((origin) => identityMatches(record.origin, origin))
@@ -779,7 +796,7 @@ export class DelegationReplyStore {
       // row as multiple competing deliveries. A stale target remains closed:
       // it is the principal allowed to return the verdict.
       if (!current) {
-        const staleOriginCandidates = records.filter((record) => (
+        const staleOriginCandidates = activeRecords.filter((record) => (
           record.messageId === authority.messageId
           && identityMatches(record.target, authority.target)
           && authority.origins.filter((origin) => origin.sessionName === record.origin.sessionName).length === 1
@@ -806,6 +823,22 @@ export class DelegationReplyStore {
       // Without one exact current target/canonical-delivery claim there is no
       // proof a resend or adoption is safe, so leave every row untouched.
       if (!current) {
+        if (activeRecords.length === 0 && records.length > 0) {
+          const now = input.now ?? Date.now();
+          for (const superseded of records) {
+            this.#db.prepare(`
+              UPDATE delegation_replies SET status = ?, updated_at = ?
+              WHERE delegation_id = ? AND status = ?
+            `).run(
+              AGENT_DELEGATION_REPLY_STATUSES.EXPIRED,
+              now,
+              superseded.delegationId,
+              AGENT_DELEGATION_REPLY_STATUSES.PENDING,
+            );
+          }
+          this.#db.exec('COMMIT');
+          return { status: 'none' };
+        }
         this.#db.exec('ROLLBACK');
         return { status: 'ambiguous' };
       }

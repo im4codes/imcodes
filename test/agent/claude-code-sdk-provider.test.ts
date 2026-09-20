@@ -128,6 +128,8 @@ import {
   SDK_SUBAGENT_STATUS,
   makeClaudeSubagentCanonicalKey,
 } from '../../shared/sdk-subagent-status.js';
+import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
+import { SESSION_RESOURCE_OWNER_ENV } from '../../shared/session-resource-lifecycle.js';
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 const waitFor = async (predicate: () => boolean, timeoutMs = 1_000): Promise<void> => {
@@ -280,6 +282,86 @@ describe('ClaudeCodeSdkProvider', () => {
       status: MEMORY_MCP_STATUS.READY,
       connected: true,
       degradedReasons: [],
+    });
+  });
+
+  it('keeps concurrent session MCP resource identities isolated from a poisoned parent environment', async () => {
+    const priorInstance = process.env[SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID];
+    const priorEpoch = process.env[SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH];
+    process.env[SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID] = 'foreign-instance';
+    process.env[SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH] = 'foreign-epoch';
+    try {
+      const provider = new ClaudeCodeSdkProvider();
+      await provider.connect({ binaryPath: 'claude' });
+      await Promise.all([
+        provider.createSession({
+          sessionKey: 'route-resource-a', sessionName: 'deck_alpha_brain', cwd: '/tmp/a',
+          sessionInstanceId: 'instance-a', runtimeEpoch: 'epoch-a',
+        }),
+        provider.createSession({
+          sessionKey: 'route-resource-b', sessionName: 'deck_beta_brain', cwd: '/tmp/b',
+          sessionInstanceId: 'instance-b', runtimeEpoch: 'epoch-b',
+        }),
+      ]);
+
+      await Promise.all([
+        provider.send('route-resource-a', 'turn a'),
+        provider.send('route-resource-b', 'turn b'),
+      ]);
+      await flush();
+
+      const envFor = (prompt: string) => {
+        const run = sdkMock.runs.find((candidate) => candidate.prompt === prompt)!;
+        const servers = run.options.mcpServers as Record<string, { env: Record<string, string> }>;
+        return servers[IMCODES_MEMORY_MCP_SERVER_NAME]!.env;
+      };
+      expect(envFor('turn a')).toMatchObject({
+        [SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID]: 'instance-a',
+        [SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH]: 'epoch-a',
+      });
+      expect(envFor('turn b')).toMatchObject({
+        [SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID]: 'instance-b',
+        [SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH]: 'epoch-b',
+      });
+      expect(JSON.stringify(sdkMock.runs.map((run) => run.options.mcpServers))).not.toContain('foreign-instance');
+      expect(JSON.stringify(sdkMock.runs.map((run) => run.options.mcpServers))).not.toContain('foreign-epoch');
+    } finally {
+      if (priorInstance === undefined) delete process.env[SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID];
+      else process.env[SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID] = priorInstance;
+      if (priorEpoch === undefined) delete process.env[SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH];
+      else process.env[SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH] = priorEpoch;
+    }
+  });
+
+  it('refreshes MCP resource identity on restart/resume instead of retaining the previous epoch', async () => {
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-resource-refresh', sessionName: 'deck_alpha_brain', cwd: '/tmp/a',
+      sessionInstanceId: 'instance-stable', runtimeEpoch: 'epoch-before', resumeId: 'claude-thread',
+    });
+    await provider.send('route-resource-refresh', 'before refresh');
+    await flush();
+
+    await provider.createSession({
+      sessionKey: 'route-resource-refresh', sessionName: 'deck_alpha_brain', cwd: '/tmp/a',
+      sessionInstanceId: 'instance-stable', runtimeEpoch: 'epoch-after',
+      resumeId: 'claude-thread', skipCreate: true,
+    });
+    await provider.send('route-resource-refresh', 'after refresh');
+    await flush();
+
+    const envs = sdkMock.runs.map((run) => {
+      const servers = run.options.mcpServers as Record<string, { env: Record<string, string> }>;
+      return servers[IMCODES_MEMORY_MCP_SERVER_NAME]!.env;
+    });
+    expect(envs[0]).toMatchObject({
+      [SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID]: 'instance-stable',
+      [SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH]: 'epoch-before',
+    });
+    expect(envs[1]).toMatchObject({
+      [SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID]: 'instance-stable',
+      [SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH]: 'epoch-after',
     });
   });
 
