@@ -918,7 +918,9 @@
       "default": "預設",
       "apply": "套用模型",
       "applying": "正在套用…",
-      "applied": "模型切換命令已傳送。",
+      "applied": "模型切換已確認。",
+      "confirmationTimeout": "守護程序未在 15 秒內確認生效模型。",
+      "disconnected": "守護程序連線已離線。",
       "failed": "無法切換模型：{{error}}",
       "loading": "正在載入可用模型…",
       "unsupported": "此工作階段類型不支援切換模型。"

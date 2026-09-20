@@ -9701,6 +9701,58 @@ afterEach(() => {
     });
   });
 
+  it('uses the main-session model command for a worker-role process Codex session', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'deck_project_worker',
+          role: 'w1',
+          agentType: 'codex',
+          runtimeType: 'process',
+          activeModel: 'gpt-5.4',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /^gpt-5.4$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^○ gpt-5\.6$/i }));
+
+    expectSendPayload(ws, {
+      sessionName: 'deck_project_worker',
+      text: '/model gpt-5.6 medium',
+    });
+    expect(ws.subSessionSetModel).not.toHaveBeenCalled();
+  });
+
+  it('uses the structured restart command only for a real process Codex sub-session', () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'deck_sub_process_worker',
+          role: 'w1',
+          agentType: 'codex',
+          runtimeType: 'process',
+          activeModel: 'gpt-5.4',
+          projectDir: '/repo',
+        })}
+        subSessionId="process-worker"
+        onSubStop={vi.fn()}
+        quickData={makeQuickData() as any}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /^gpt-5.4$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /^○ gpt-5\.6$/i }));
+
+    expect(ws.subSessionSetModel).toHaveBeenCalledWith('deck_sub_process_worker', 'gpt-5.6', '/repo');
+    expect(gatherSendCalls(ws)).toEqual([]);
+  });
+
   it('uses saved codex model preference as a legacy fallback for model-less codex-sdk sessions', () => {
     localStorage.setItem('imcodes-codex-model', 'gpt-5.5');
 

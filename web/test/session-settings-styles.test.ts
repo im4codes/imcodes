@@ -11,4 +11,11 @@ describe('session settings responsive styles', () => {
     expect(css).toMatch(/@media \(max-width:\s*640px\)[\s\S]*?\.session-settings-model-actions\s*\{[^}]*flex-direction:\s*column/s);
     expect(css).toMatch(/\.session-settings-success\s*\{[^}]*color:/s);
   });
+
+  it('requires every production settings caller to choose one independent surface', () => {
+    const source = readFileSync(join(WEB_ROOT, 'src/components/SessionSettingsDialog.tsx'), 'utf8');
+    expect(source).toContain("surface: 'session' | 'supervision'");
+    expect(source).not.toContain("'combined'");
+    expect(source).not.toMatch(/surface\s*=\s*['"][^'"]+['"]\s*,/);
+  });
 });

@@ -38,6 +38,7 @@ const {
   openSharedEntryMock,
   wsInstances,
   useSubSessionsState,
+  updateSubLocalMock,
   authExpiredState,
   loginAttemptState,
   loginState,
@@ -94,6 +95,7 @@ const {
     visibleSubSessions: [] as any[],
     loadedServerId: null as string | null,
   },
+  updateSubLocalMock: vi.fn(),
   authExpiredState: {
     handler: null as ((reason?: string) => void) | null,
   },
@@ -268,7 +270,7 @@ vi.mock('../src/hooks/useSubSessions.js', () => ({
     hydrateShared: vi.fn(),
     restart: vi.fn(),
     rename: vi.fn(),
-    updateLocal: vi.fn(),
+    updateLocal: updateSubLocalMock,
   }),
 }));
 
@@ -686,7 +688,7 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
   ),
 }));
 vi.mock('../src/components/SubSessionWindow.js', () => ({
-  SubSessionWindow: ({ sub, ws, active, visible, zIndex, onFocus, onViewRepo, onShareSession, sharedState }: any) => {
+  SubSessionWindow: ({ sub, ws, active, visible, zIndex, onFocus, onViewRepo, onShareSession, onSettings, sharedState }: any) => {
     const incomingViewer = !!sharedState
       && sharedState.outgoing !== true
       && sharedState.effectiveRole !== 'participant';
@@ -702,6 +704,7 @@ vi.mock('../src/components/SubSessionWindow.js', () => ({
     >
       sub-session-window
       <button onClick={onViewRepo}>sub-window-repo-{sub?.id}</button>
+      <button onClick={() => onSettings?.({ surface: 'session' })}>sub-window-settings-{sub?.id}</button>
       <input aria-label={`sub-window-composer-${sub?.id}`} disabled={incomingViewer} />
       <button
         disabled={incomingViewer}
@@ -751,16 +754,20 @@ vi.mock('../src/components/StartSubSessionDialog.js', () => ({
   ),
 }));
 vi.mock('../src/components/SessionSettingsDialog.js', () => ({
-  SessionSettingsDialog: ({ onClose, onSaved, onAddPoolSession, poolSessionDialogOpen, supervisionMode, canControlAutomaticSupervision }: any) => (
+  SessionSettingsDialog: ({ onClose, onSaved, onAddPoolSession, poolSessionDialogOpen, supervisionMode, canControlAutomaticSupervision, requestedModel, activeModel, modelDisplay }: any) => (
     <div
       data-testid="session-settings-dialog"
       data-child-dialog-open={String(Boolean(poolSessionDialogOpen))}
       data-supervision-mode={supervisionMode ?? ''}
       data-can-control-supervision={String(Boolean(canControlAutomaticSupervision))}
+      data-requested-model={requestedModel ?? ''}
+      data-active-model={activeModel ?? ''}
+      data-model-display={modelDisplay ?? ''}
     >
       session-settings-dialog
       <button onClick={() => onAddPoolSession?.('economy')}>settings-pool-add</button>
       <button onClick={() => onSaved?.({ label: 'Saved', type: 'codex-sdk', cwd: '/work/saved', transportConfig: {} })}>settings-save</button>
+      <button onClick={() => onSaved?.({ requestedModel: 'gpt-5.6', activeModel: 'gpt-5.6', modelDisplay: 'gpt-5.6' })}>settings-model-confirmed</button>
       <button onClick={onClose}>settings-close</button>
     </div>
   ),
@@ -1037,6 +1044,7 @@ beforeEach(() => {
   useSubSessionsState.subSessions = [];
   useSubSessionsState.visibleSubSessions = [];
   useSubSessionsState.loadedServerId = 'srv-1';
+  updateSubLocalMock.mockReset();
   authExpiredState.handler = null;
   loginAttemptState.pending = null;
   loginAttemptState.mode = 'native';
@@ -2175,6 +2183,43 @@ describe('App shell', () => {
     }));
 
     expect(await screen.findByTestId('sub-session-window-sub-1')).toBeTruthy();
+  }, 20_000);
+
+  it('writes a confirmed model projection into sub-session local state', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    useSubSessionsState.subSessions = [{
+      id: 'sub-model',
+      sessionName: 'deck_sub_model_worker',
+      parentSession: 'deck_alpha_brain',
+      label: 'Model Worker',
+      description: '',
+      cwd: '/work/alpha',
+      type: 'codex-sdk',
+      runtimeType: 'transport',
+      requestedModel: 'gpt-5.4',
+      activeModel: 'gpt-5.4',
+      modelDisplay: 'gpt-5.4',
+      state: 'idle',
+      serverId: 'srv-1',
+    }];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const { App } = await importApp();
+    render(<App />);
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+    fireEvent.click(screen.getByText('subbar-open-sub-model'));
+    fireEvent.click(await screen.findByText('sub-window-settings-sub-model'));
+    const dialog = await screen.findByTestId('session-settings-dialog');
+    expect(dialog.getAttribute('data-requested-model')).toBe('gpt-5.4');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'settings-model-confirmed' }));
+
+    expect(updateSubLocalMock).toHaveBeenCalledWith('sub-model', expect.objectContaining({
+      requestedModel: 'gpt-5.6',
+      activeModel: 'gpt-5.6',
+      modelDisplay: 'gpt-5.6',
+    }));
   }, 20_000);
 
   it('fronts an already-open sub-session selected from another window pin list', async () => {

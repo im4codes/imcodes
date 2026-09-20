@@ -918,7 +918,9 @@
       "default": "Default",
       "apply": "Apply model",
       "applying": "Applying…",
-      "applied": "Model change sent.",
+      "applied": "Model change confirmed.",
+      "confirmationTimeout": "The daemon did not confirm the active model within 15 seconds.",
+      "disconnected": "The daemon connection is offline.",
       "failed": "Could not change model: {{error}}",
       "loading": "Loading available models…",
       "unsupported": "This session type does not support model switching."

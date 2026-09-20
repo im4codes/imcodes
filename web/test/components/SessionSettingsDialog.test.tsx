@@ -66,6 +66,7 @@ vi.mock('../../src/components/file-browser-lazy.js', () => ({
 }));
 
 import {
+  SESSION_MODEL_CONFIRMATION_TIMEOUT_MS,
   SessionSettingsDialog,
   SupervisionSettingsDialog,
   buildSupervisionExecutionPoolCandidates,
@@ -214,19 +215,26 @@ describe('SessionSettingsDialog supervision', () => {
   it('switches the model through the shared session command and reports success', async () => {
     const ws = makeIdentityAckWs();
     const onSaved = vi.fn();
-    render(
-      <SessionSettingsDialog
-        serverId="srv-1" sessionName="deck_proj_brain" label="Brain" description="" cwd="/proj"
-        type="codex-sdk" activeModel="gpt-5.4" requestedModel="gpt-5.4" transportConfig={null}
-        surface="session" ws={ws as any} onClose={vi.fn()} onSaved={onSaved}
-      />,
-    );
+    const props = {
+      serverId: 'srv-1', sessionName: 'deck_proj_brain', label: 'Brain', description: '', cwd: '/proj',
+      type: 'codex-sdk', requestedModel: 'gpt-5.4', transportConfig: null, surface: 'session' as const,
+      ws: ws as any, onClose: vi.fn(), onSaved,
+    };
+    const view = render(<SessionSettingsDialog
+        surface="supervision" {...props} activeModel="gpt-5.4" />);
     changeSelect(screen.getByLabelText('label'), 'gpt-5.6');
     await waitFor(() => expect((screen.getByRole('button', { name: 'apply' }) as HTMLButtonElement).disabled).toBe(false));
     fireEvent.click(screen.getByRole('button', { name: 'apply' }));
     expect(screen.getByRole('button', { name: 'applying' })).toBeTruthy();
     await waitFor(() => expect(ws.sendSessionMessage).toHaveBeenCalledWith('deck_proj_brain', '/model gpt-5.6'));
-    expect(onSaved).toHaveBeenCalledWith({ requestedModel: 'gpt-5.6' });
+    expect(onSaved).not.toHaveBeenCalled();
+    expect(screen.queryByRole('status')).toBeNull();
+
+    view.rerender(<SessionSettingsDialog
+        surface="supervision" {...props} requestedModel="gpt-5.6" activeModel="gpt-5.6" modelDisplay="gpt-5.6" />);
+    await waitFor(() => expect(onSaved).toHaveBeenCalledWith({
+      requestedModel: 'gpt-5.6', activeModel: 'gpt-5.6', modelDisplay: 'gpt-5.6',
+    }));
     expect(screen.getByRole('status').textContent).toBe('applied');
   });
 
@@ -237,13 +245,18 @@ describe('SessionSettingsDialog supervision', () => {
       description: '', cwd: '/proj', activeModel: 'gpt-5.4', requestedModel: 'gpt-5.4',
       transportConfig: null, surface: 'session' as const, ws: ws as any, onClose: vi.fn(), onSaved: vi.fn(),
     };
-    const { unmount } = render(<SessionSettingsDialog {...common} type="codex" />);
+    const view = render(<SessionSettingsDialog {...common} type="codex" />);
     changeSelect(screen.getByLabelText('label'), 'gpt-5.6');
     await waitFor(() => expect((screen.getByRole('button', { name: 'apply' }) as HTMLButtonElement).disabled).toBe(false));
     fireEvent.click(screen.getByRole('button', { name: 'apply' }));
     await waitFor(() => expect(ws.subSessionSetModel).toHaveBeenCalledWith('deck_proj_worker', 'gpt-5.6', '/proj'));
     expect(ws.sendSessionMessage).not.toHaveBeenCalled();
-    unmount();
+    expect(common.onSaved).not.toHaveBeenCalled();
+    view.rerender(<SessionSettingsDialog {...common} type="codex" requestedModel="gpt-5.6" activeModel="gpt-5.6" />);
+    await waitFor(() => expect(common.onSaved).toHaveBeenCalledWith({
+      requestedModel: 'gpt-5.6', activeModel: 'gpt-5.6', modelDisplay: 'gpt-5.6',
+    }));
+    view.unmount();
 
     render(<SessionSettingsDialog {...common} type="shell" activeModel={null} requestedModel={null} />);
     expect(screen.getByText('unsupported')).toBeTruthy();
@@ -267,10 +280,33 @@ describe('SessionSettingsDialog supervision', () => {
     expect(onClose).not.toHaveBeenCalled();
   });
 
+  it('fails visibly when the daemon never confirms the active model', async () => {
+    vi.useFakeTimers();
+    try {
+      const ws = makeIdentityAckWs();
+      render(
+        <SessionSettingsDialog
+          serverId="srv-1" sessionName="deck_proj_brain" label="Brain" description="" cwd="/proj"
+          type="codex-sdk" activeModel="gpt-5.4" requestedModel="gpt-5.4" transportConfig={null}
+          surface="session" ws={ws as any} onClose={vi.fn()} onSaved={vi.fn()}
+        />,
+      );
+      changeSelect(screen.getByLabelText('label'), 'gpt-5.6');
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'apply' })); });
+      expect(screen.getByRole('button', { name: 'applying' })).toBeTruthy();
+      await act(async () => { vi.advanceTimersByTime(SESSION_MODEL_CONFIRMATION_TIMEOUT_MS); });
+      expect(screen.getByRole('alert').textContent).toBe('failed');
+      expect(screen.queryByRole('status')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('saves a manually entered exact-session identity online and requests an immediate runtime refresh', async () => {
     const ws = makeIdentityAckWs();
     render(
       <SessionSettingsDialog
+        surface="session"
         serverId="srv-1"
         sessionName="deck_proj_brain"
         label="Brain"
@@ -314,6 +350,7 @@ describe('SessionSettingsDialog supervision', () => {
 
     render(
       <SessionSettingsDialog
+        surface="session"
         serverId="srv-1" sessionName="deck_proj_brain" label="Brain" description="" cwd="/proj"
         type="codex-sdk" transportConfig={null} ws={makeIdentityAckWs() as any}
         onClose={vi.fn()} onSaved={vi.fn()}
@@ -334,6 +371,7 @@ describe('SessionSettingsDialog supervision', () => {
   it('reuses the host file browser, uploads its content, and records the selected source path', async () => {
     render(
       <SessionSettingsDialog
+        surface="session"
         serverId="srv-1"
         sessionName="deck_proj_brain"
         label="Brain"
@@ -367,6 +405,7 @@ describe('SessionSettingsDialog supervision', () => {
   it('edits synchronized user and project identities from the three-tab settings surface', async () => {
     render(
       <SessionSettingsDialog
+        surface="session"
         serverId="srv-1"
         sessionName="deck_proj_brain"
         projectKey="repo-stable-id"
@@ -404,6 +443,7 @@ describe('SessionSettingsDialog supervision', () => {
   it('renders authoritative supervision read-only without forcing it off', () => {
     render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision={false}
         serverId="srv-1"
         sessionName="deck_proj_worker"
@@ -436,6 +476,7 @@ describe('SessionSettingsDialog supervision', () => {
   it('uses the minimal shared projection and never writes supervision from a read-only dialog', async () => {
     const view = render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision={false}
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -456,6 +497,7 @@ describe('SessionSettingsDialog supervision', () => {
 
     view.rerender(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision={false}
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -471,15 +513,17 @@ describe('SessionSettingsDialog supervision', () => {
     );
     await waitFor(() => expect(mode.value).toBe('supervised'));
 
-    fireEvent.input(inputForLabel('label'), { target: { value: 'Shared Brain renamed' } });
-    fireEvent.click(screen.getByRole('button', { name: /save/i }));
-    await waitFor(() => expect(patchSessionMock).toHaveBeenCalled());
-    expect(patchSessionMock.mock.calls.at(-1)?.[2]).not.toHaveProperty('transportConfig');
+    expect(screen.queryByTestId('session-model-settings')).toBeNull();
+    const save = screen.getByRole('button', { name: /save/i }) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    fireEvent.click(save);
+    expect(patchSessionMock).not.toHaveBeenCalled();
   });
 
   it('shows the working directory as read-only and omits cwd when saving a main session', async () => {
     render(
       <SessionSettingsDialog
+        surface="session"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -519,6 +563,7 @@ describe('SessionSettingsDialog supervision', () => {
   it('shows the working directory as read-only and omits cwd when saving a sub-session', async () => {
     render(
       <SessionSettingsDialog
+        surface="session"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_sub_abcd1234"
@@ -553,6 +598,7 @@ describe('SessionSettingsDialog supervision', () => {
     const onSaved = vi.fn();
     render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -597,6 +643,7 @@ describe('SessionSettingsDialog supervision', () => {
   it('defaults Auto and audit settings to Codex 5.3 Spark while keeping GPT-5.6 selectable', async () => {
     render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -626,6 +673,7 @@ describe('SessionSettingsDialog supervision', () => {
     // supervised_audit and Save must be reachable with no auditor chosen.
     render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision serverId="srv-1" sessionName="deck_proj_brain"
         label="Brain" description="desc" cwd="/proj" type="codex-sdk"
         activeModel={CODEX_MODEL_IDS[0]}
@@ -654,6 +702,7 @@ describe('SessionSettingsDialog supervision', () => {
       // suite, which is the control for "non-supervision delegation preserved".
       render(
         <SessionSettingsDialog
+        surface="supervision"
           canControlAutomaticSupervision serverId="srv-1" sessionName="deck_proj_brain"
           label="Brain" description="desc" cwd="/proj" type="codex-sdk"
           activeModel={CODEX_MODEL_IDS[0]}
@@ -684,6 +733,7 @@ describe('SessionSettingsDialog supervision', () => {
     // the saved payload.
     render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -739,6 +789,7 @@ describe('SessionSettingsDialog supervision', () => {
 
   const renderAuditDialog = (supervisionOverrides: Record<string, unknown> = {}) => render(
     <SessionSettingsDialog
+        surface="supervision"
       canControlAutomaticSupervision
       serverId="srv-1"
       sessionName="deck_proj_brain"
@@ -813,6 +864,7 @@ describe('SessionSettingsDialog supervision', () => {
   it('persists the default Brain model to account defaults without another pool interaction', async () => {
     render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -852,6 +904,7 @@ describe('SessionSettingsDialog supervision', () => {
   it('allows adding a low-tier model to the economy pool', async () => {
     render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -984,6 +1037,7 @@ describe('SessionSettingsDialog supervision', () => {
   it('shows session, SDK, and model and keeps primary/economy selection mutually exclusive', () => {
     render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -1026,6 +1080,7 @@ describe('SessionSettingsDialog supervision', () => {
   it('persists a CC preset constraint without binding it to a live session', async () => {
     render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -1097,6 +1152,7 @@ describe('SessionSettingsDialog supervision', () => {
     ]);
     render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -1149,6 +1205,7 @@ describe('SessionSettingsDialog supervision', () => {
       .mockRejectedValueOnce(new Error('new owner denied'));
     const view = render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -1166,6 +1223,7 @@ describe('SessionSettingsDialog supervision', () => {
 
     view.rerender(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-2"
         sessionName="deck_other_brain"
@@ -1188,6 +1246,7 @@ describe('SessionSettingsDialog supervision', () => {
     const onAddPoolSession = vi.fn();
     const view = render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -1210,6 +1269,7 @@ describe('SessionSettingsDialog supervision', () => {
 
     view.rerender(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -1240,6 +1300,7 @@ describe('SessionSettingsDialog supervision', () => {
     const onClose = vi.fn();
     render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -1263,6 +1324,7 @@ describe('SessionSettingsDialog supervision', () => {
   it('uses the responsive themed settings shell instead of native dialog chrome', () => {
     render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -1301,6 +1363,7 @@ describe('SessionSettingsDialog supervision', () => {
 
     render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -1341,6 +1404,7 @@ describe('SessionSettingsDialog supervision', () => {
   it('renders persisted supervision snapshot in the summary', () => {
     render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -1397,6 +1461,7 @@ describe('SessionSettingsDialog supervision', () => {
 
     render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -1461,6 +1526,7 @@ describe('SessionSettingsDialog supervision', () => {
 
     render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -1561,6 +1627,7 @@ describe('SessionSettingsDialog supervision', () => {
 
     render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -1630,6 +1697,7 @@ describe('SessionSettingsDialog supervision', () => {
 
     render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -1737,6 +1805,7 @@ describe('SessionSettingsDialog supervision', () => {
 
     render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -1807,6 +1876,7 @@ describe('SessionSettingsDialog supervision', () => {
   it('persists custom supervision instructions in the session snapshot', async () => {
     render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -1847,6 +1917,7 @@ describe('SessionSettingsDialog supervision', () => {
 
     render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -1879,6 +1950,7 @@ describe('SessionSettingsDialog supervision', () => {
 
     const { unmount } = render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -1900,6 +1972,7 @@ describe('SessionSettingsDialog supervision', () => {
     // Remount: state is read from localStorage so the detail body is visible immediately.
     render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -1918,6 +1991,7 @@ describe('SessionSettingsDialog supervision', () => {
   it('shows unsupported copy for process sessions', () => {
     render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -1937,6 +2011,7 @@ describe('SessionSettingsDialog supervision', () => {
   it('shows an invalid stored config warning when the persisted supervision snapshot is corrupt', () => {
     render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -1966,6 +2041,7 @@ describe('SessionSettingsDialog supervision', () => {
     const onSaved = vi.fn();
     render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_sub_abcd1234"
@@ -2015,6 +2091,7 @@ describe('SessionSettingsDialog supervision', () => {
     // account preference.
     render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -2077,6 +2154,7 @@ describe('SessionSettingsDialog supervision', () => {
     // about a GENUINELY configured pool, not every unrelated defaults edit.
     render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -2125,6 +2203,7 @@ describe('SessionSettingsDialog supervision', () => {
     });
     render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"
@@ -2177,6 +2256,7 @@ describe('SessionSettingsDialog supervision', () => {
   it('persists an optional global backup runtime from the shared dropdown selector', async () => {
     render(
       <SessionSettingsDialog
+        surface="supervision"
         canControlAutomaticSupervision
         serverId="srv-1"
         sessionName="deck_proj_brain"

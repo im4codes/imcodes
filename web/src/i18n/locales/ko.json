@@ -918,7 +918,9 @@
       "default": "기본값",
       "apply": "모델 적용",
       "applying": "적용 중…",
-      "applied": "모델 변경 명령을 보냈습니다.",
+      "applied": "모델 변경이 확인되었습니다.",
+      "confirmationTimeout": "데몬이 15초 안에 활성 모델을 확인하지 않았습니다.",
+      "disconnected": "데몬 연결이 오프라인입니다.",
       "failed": "모델을 변경할 수 없습니다: {{error}}",
       "loading": "사용 가능한 모델을 불러오는 중…",
       "unsupported": "이 세션 유형은 모델 전환을 지원하지 않습니다."

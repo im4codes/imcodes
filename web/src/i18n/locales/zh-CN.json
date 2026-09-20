@@ -918,7 +918,9 @@
       "default": "默认",
       "apply": "应用模型",
       "applying": "正在应用…",
-      "applied": "模型切换指令已发送。",
+      "applied": "模型切换已确认。",
+      "confirmationTimeout": "守护进程未在 15 秒内确认生效模型。",
+      "disconnected": "守护进程连接已离线。",
       "failed": "无法切换模型：{{error}}",
       "loading": "正在加载可用模型…",
       "unsupported": "此会话类型不支持切换模型。"

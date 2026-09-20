@@ -95,6 +95,7 @@ interface Props {
   runtimeEpoch?: string;
   activeModel?: string | null;
   requestedModel?: string | null;
+  modelDisplay?: string | null;
   providerId?: string | null;
   projectKey?: string;
   /**
@@ -108,8 +109,8 @@ interface Props {
   /** Lowers this overlay only while the reused child launcher is open. */
   poolSessionDialogOpen?: boolean;
   openIntent?: SessionSettingsOpenIntent;
-  /** Production callers always select one independent settings surface. */
-  surface?: 'session' | 'supervision' | 'combined';
+  /** Production callers must select one independent settings surface. */
+  surface: 'session' | 'supervision';
   /**
    * Optional WebSocket client. When supplied, the supervision dialog subscribes
    * to `cc.presets.list_response` and adds compatible third-party presets to
@@ -118,8 +119,10 @@ interface Props {
    */
   ws?: WsClient | null;
   onClose: () => void;
-  onSaved: (fields: { label?: string; description?: string; cwd?: string; type?: string; transportConfig?: Record<string, unknown> | null; requestedModel?: string }) => void;
+  onSaved: (fields: { label?: string; description?: string; cwd?: string; type?: string; transportConfig?: Record<string, unknown> | null; requestedModel?: string; activeModel?: string; modelDisplay?: string }) => void;
 }
+
+export const SESSION_MODEL_CONFIRMATION_TIMEOUT_MS = 15_000;
 
 export interface PeerAuditSettingsSession {
   sessionName: string;
@@ -721,6 +724,7 @@ export function SessionSettingsDialog({
   supervisionMode,
   activeModel,
   requestedModel,
+  modelDisplay,
   projectKey,
   peerAuditSessions = [],
   onAddPoolSession,
@@ -728,7 +732,7 @@ export function SessionSettingsDialog({
   parentSession,
   canControlAutomaticSupervision = false,
   openIntent,
-  surface = 'combined',
+  surface,
   ws,
   onClose,
   onSaved,
@@ -766,11 +770,12 @@ export function SessionSettingsDialog({
   const [agentType, setAgentType] = useState(type);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
-  const initialSessionModel = requestedModel?.trim() || activeModel?.trim() || '';
+  const initialSessionModel = activeModel?.trim() || modelDisplay?.trim() || requestedModel?.trim() || '';
   const [sessionModel, setSessionModel] = useState(initialSessionModel);
   const [appliedSessionModel, setAppliedSessionModel] = useState(initialSessionModel);
   const [modelApplyState, setModelApplyState] = useState<'idle' | 'applying' | 'applied' | 'error'>('idle');
   const [modelApplyError, setModelApplyError] = useState('');
+  const [pendingSessionModel, setPendingSessionModel] = useState<string | null>(null);
   const [supervision, setSupervision] = useState<SupervisionDraft>(initialSupervision);
   const ccPresetListRequestIdRef = useRef<string | null>(null);
   const [supervisorDefaults, setSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
@@ -792,11 +797,54 @@ export function SessionSettingsDialog({
     setDescription(initDesc);
     setAgentType(type);
     setSupervision(initialSupervision);
-    setSessionModel(requestedModel?.trim() || activeModel?.trim() || '');
-    setAppliedSessionModel(requestedModel?.trim() || activeModel?.trim() || '');
+  }, [initLabel, initDesc, initCwd, type, initialSupervision, sessionName, subSessionId]);
+
+  useEffect(() => {
+    const observedModel = activeModel?.trim() || modelDisplay?.trim() || requestedModel?.trim() || '';
+    setSessionModel(observedModel);
+    setAppliedSessionModel(observedModel);
     setModelApplyState('idle');
     setModelApplyError('');
-  }, [activeModel, initLabel, initDesc, initCwd, type, initialSupervision, requestedModel, sessionName, subSessionId]);
+    setPendingSessionModel(null);
+  }, [sessionName, subSessionId, type]);
+
+  useEffect(() => {
+    const activeEffectiveModel = activeModel?.trim() || modelDisplay?.trim() || '';
+    const observedModel = activeEffectiveModel || requestedModel?.trim() || '';
+    if (pendingSessionModel) {
+      // requestedModel is only intent. The daemon's active/effective projection
+      // is the confirmation that the provider actually accepted the switch.
+      if (activeEffectiveModel !== pendingSessionModel) return;
+      setAppliedSessionModel(activeEffectiveModel);
+      setSessionModel(activeEffectiveModel);
+      setModelApplyState('applied');
+      setModelApplyError('');
+      setPendingSessionModel(null);
+      onSaved({
+        requestedModel: pendingSessionModel,
+        activeModel: activeEffectiveModel,
+        modelDisplay: activeEffectiveModel,
+      });
+      return;
+    }
+    setAppliedSessionModel((previous) => {
+      setSessionModel((selected) => selected === previous ? observedModel : selected);
+      return observedModel;
+    });
+  }, [activeModel, modelDisplay, onSaved, pendingSessionModel, requestedModel]);
+
+  useEffect(() => {
+    if (!pendingSessionModel) return;
+    const timer = window.setTimeout(() => {
+      setPendingSessionModel((current) => {
+        if (current !== pendingSessionModel) return current;
+        setModelApplyError(t('session.modelSettings.confirmationTimeout'));
+        setModelApplyState('error');
+        return null;
+      });
+    }, SESSION_MODEL_CONFIRMATION_TIMEOUT_MS);
+    return () => window.clearTimeout(timer);
+  }, [pendingSessionModel, t]);
 
   const sessionDynamicModels = useTransportModels(
     ws ?? null,
@@ -824,26 +872,29 @@ export function SessionSettingsDialog({
 
   const handleApplySessionModel = async (): Promise<void> => {
     if (!ws || !sessionModelSwitchSupported || !sessionModel.trim()) return;
+    const nextModel = sessionModel.trim();
     setModelApplyState('applying');
     setModelApplyError('');
+    setPendingSessionModel(nextModel);
     try {
       // Commit the applying state before the existing fire-and-forget runtime
       // command is dispatched, so slow mobile taps get deterministic feedback.
       await Promise.resolve();
+      if (ws.connected === false) {
+        throw new Error(t('session.modelSettings.disconnected'));
+      }
       dispatchSessionModelSwitch({
         sendMessage: (text) => ws.sendSessionMessage(sessionName, text),
         setSubSessionModel: (targetSessionName, modelId, cwd) => ws.subSessionSetModel(targetSessionName, modelId, cwd),
       }, {
         sessionName,
         agentType: type,
-        model: sessionModel,
+        model: nextModel,
         cwd: initCwd,
         subSession: !!subSessionId,
       });
-      onSaved({ requestedModel: sessionModel.trim() });
-      setAppliedSessionModel(sessionModel.trim());
-      setModelApplyState('applied');
     } catch (err) {
+      setPendingSessionModel(null);
       setModelApplyError(err instanceof Error ? err.message : String(err));
       setModelApplyState('error');
     }
@@ -1998,6 +2049,8 @@ export function SessionSettingsDialog({
   return typeof document === 'undefined' ? dialog : createPortal(dialog, document.body);
 }
 
-export function SupervisionSettingsDialog(props: Props) {
+type SupervisionSettingsDialogProps = Omit<Props, 'surface'> & { surface?: 'supervision' };
+
+export function SupervisionSettingsDialog({ surface: _surface, ...props }: SupervisionSettingsDialogProps) {
   return <SessionSettingsDialog {...props} surface="supervision" />;
 }

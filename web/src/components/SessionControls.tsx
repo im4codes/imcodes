@@ -5229,6 +5229,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       agentType: activeSession.agentType,
       model: nextModel,
       cwd: activeSession.projectDir,
+      // Role labels do not define topology: a worker-role session may still be
+      // a main process session. Only the real sub-session surface owns the
+      // structured stop/restart model switch.
       subSession: !!onSubStop,
     });
     return true;

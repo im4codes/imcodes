@@ -918,7 +918,9 @@
       "default": "Predeterminado",
       "apply": "Aplicar modelo",
       "applying": "Aplicando…",
-      "applied": "Se envió el cambio de modelo.",
+      "applied": "Se confirmó el cambio de modelo.",
+      "confirmationTimeout": "El daemon no confirmó el modelo activo en 15 segundos.",
+      "disconnected": "La conexión con el daemon está desconectada.",
       "failed": "No se pudo cambiar el modelo: {{error}}",
       "loading": "Cargando modelos disponibles…",
       "unsupported": "Este tipo de sesión no permite cambiar el modelo."
