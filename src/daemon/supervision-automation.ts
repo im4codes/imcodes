@@ -344,6 +344,8 @@ interface ActiveTaskRunState {
   lastAssistantCompletionKey?: string;
   /** Latest timeline sequence that can identify a newer provider turn. */
   lastTurnActivitySequence: number;
+  /** Latest non-state timeline sequence that proves a newer turn boundary. */
+  lastTurnContentSequence: number;
   terminalState?: TaskRunTerminalState;
   auditAttemptId?: string;
   auditDelegationId?: string;
@@ -420,6 +422,7 @@ interface RecoveredImplicitCompletion {
 
 interface WaitingTurnSettleGuard {
   activitySequence: number;
+  contentSequence: number;
   completionKey?: string;
 }
 
@@ -2405,6 +2408,7 @@ class SupervisionAutomation {
   private captureWaitingTurnSettleGuard(run: ActiveTaskRunState): WaitingTurnSettleGuard {
     return {
       activitySequence: run.lastTurnActivitySequence,
+      contentSequence: run.lastTurnContentSequence,
       ...(run.lastAssistantCompletionKey
         ? { completionKey: run.lastAssistantCompletionKey }
         : {}),
@@ -2414,16 +2418,25 @@ class SupervisionAutomation {
   private waitingTurnSettleGuardMatches(
     run: ActiveTaskRunState,
     guard: WaitingTurnSettleGuard,
+    options: { acceptReorderedStateAfterTerminalCompletion?: boolean } = {},
   ): boolean {
-    return run.lastTurnActivitySequence === guard.activitySequence
-      && run.lastAssistantCompletionKey === guard.completionKey;
+    if (run.lastAssistantCompletionKey !== guard.completionKey) return false;
+    if (run.lastTurnActivitySequence === guard.activitySequence) return true;
+    // A terminal WAITING marker is assistant-authored completion authority.
+    // Providers may project its adjacent `running` edge after the final row;
+    // that state-only reordering does not create a new turn. A user/tool row
+    // does, and advances contentSequence, so the older WAITING evaluation can
+    // never settle or cancel that newer dispatch.
+    return options.acceptReorderedStateAfterTerminalCompletion === true
+      && run.lastTurnContentSequence === guard.contentSequence;
   }
 
   private resumeAfterSupersededWaitingEvaluation(
     run: ActiveTaskRunState,
     guard: WaitingTurnSettleGuard,
+    options: { acceptReorderedStateAfterTerminalCompletion?: boolean } = {},
   ): boolean {
-    if (this.waitingTurnSettleGuardMatches(run, guard)) return false;
+    if (this.waitingTurnSettleGuardMatches(run, guard, options)) return false;
 
     // The broker/registry await belongs to an older completed turn. Never let
     // its WAITING result park, clear, or externally settle a notification-
@@ -2519,6 +2532,7 @@ class SupervisionAutomation {
     run.lastAssistantText = latestAssistant.text;
     run.lastAssistantCompletionKey = latestAssistant.completionKey;
     run.lastTurnActivitySequence = latestAssistant.sequence;
+    run.lastTurnContentSequence = latestAssistant.sequence;
     run.sawAssistantOutput = true;
     run.evaluating = true;
     this.rememberRecoveredImplicitCompletionKey(latestAssistant.completionKey);
@@ -2606,6 +2620,7 @@ class SupervisionAutomation {
       evaluating: false,
       sawAssistantOutput: false,
       lastTurnActivitySequence: 0,
+      lastTurnContentSequence: 0,
       reworkDispatches: 0,
       auditReplyObserved: false,
       auditVerdictCorrectionAttempts: 0,
@@ -2768,6 +2783,7 @@ class SupervisionAutomation {
         evaluating: false,
         sawAssistantOutput: persisted.pendingAssistantText !== undefined,
         lastTurnActivitySequence: 0,
+        lastTurnContentSequence: 0,
         ...(persisted.pendingAssistantText !== undefined
           ? { lastAssistantText: persisted.pendingAssistantText }
           : {}),
@@ -3749,6 +3765,7 @@ class SupervisionAutomation {
       || event.type === 'tool.result'
     )) {
       activityRun.lastTurnActivitySequence = sequence;
+      activityRun.lastTurnContentSequence = sequence;
     }
 
     if (event.type === 'user.message') {
@@ -3841,6 +3858,7 @@ class SupervisionAutomation {
       this.clearCompletionGrace(run);
       if (run.lastAssistantCompletionKey !== completionKey) {
         run.lastTurnActivitySequence = sequence;
+        run.lastTurnContentSequence = sequence;
       }
       run.ignoreIdleUntilPostAuditTurnActivity = false;
       run.lastAssistantText = text;
@@ -4468,7 +4486,9 @@ class SupervisionAutomation {
         return;
       case 'waiting':
         if (await this.refuseUnsubstantiatedWaiting(current)) return;
-        if (this.resumeAfterSupersededWaitingEvaluation(current, waitingSettleGuard)) return;
+        if (this.resumeAfterSupersededWaitingEvaluation(current, waitingSettleGuard, {
+          acceptReorderedStateAfterTerminalCompletion: true,
+        })) return;
         this.emitStatus(current.sessionName, 'supervision_parked', SUPERVISION_PARKED_LABEL);
         this.emitAutomationNote(current.sessionName, 'Auto: parked on the executing session\'s reported external reply.', 'supervision-parked');
         this.clearCompletionGrace(current);

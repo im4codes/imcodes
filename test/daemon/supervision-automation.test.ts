@@ -223,6 +223,7 @@ const { EXECUTION_CLONE_KIND } = await import('../../shared/execution-clone.js')
 const { createDelegationReplyAuthority } = await import('../../src/daemon/delegation-reply-authority.js');
 const { emitDelegationReplyDelivered } = await import('../../src/daemon/delegation-reply-events.js');
 const {
+  getSupervisionStateStore,
   getSupervisionTaskRegistry,
   resetSupervisionTaskRegistryForTests,
   setSupervisionLiveParticipantsResolver,
@@ -2220,6 +2221,77 @@ describe('SupervisionAutomation', () => {
           && event.payload.text === '⚠️ Automation stopped because no completed assistant response was available for that turn. Manual continuation is required.',
       );
       expect(warnings).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('credits a WAITING completion after an internal notification despite a delayed running edge', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const snapshot = await seedSession('supervised');
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent(
+        'deck_supervision_brain',
+        'cmd-waiting-notification-completion',
+        'wait for the delegated result',
+        snapshot,
+      );
+      beginRun('cmd-waiting-notification-completion', 'wait for the delegated result');
+      completeTurn(`The delegated result is still pending.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      // The first heartbeat starts a daemon-authored foreground turn.
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+      mockTransportRuntimeWorking = true;
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+      completeTurn(`Heartbeat checked; delegated work is still pending.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      const originalDueAt = supervisionAutomation.getActiveRun('deck_supervision_brain')?.waitingNextHeartbeatAt;
+      expect(originalDueAt).toBe(Date.now() + 10 * 60_000);
+
+      // Production can project a retained notification completion before the
+      // provider's delayed running edge for that SAME turn. The terminal
+      // WAITING row is authoritative; the reordered state edge must not erase
+      // it and arm the "missing completion" watchdog.
+      await vi.advanceTimersByTimeAsync(60_000);
+      timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+        text: `${AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER}\nDelegation ID: completed-during-wait`,
+        clientMessageId: 'delegation-completed-during-wait',
+        allowDuplicate: true,
+      });
+      timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+        text: `The audit is now running; no local action is required.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`,
+        streaming: false,
+      });
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')?.waitingNextHeartbeatAt)
+        .toBe(originalDueAt);
+      expect(getSupervisionStateStore().get('deck_supervision_brain')).toMatchObject({
+        phase: 'waiting',
+        waitingNextHeartbeatAt: originalDueAt,
+      });
+      await vi.advanceTimersByTimeAsync(2.5 * 60_000);
+
+      const missingCompletionWarnings = timelineEmitter.replay('deck_supervision_brain', 0).events.filter(
+        (event) => event.type === 'assistant.text'
+          && event.payload.text === '⚠️ Automation stopped because no completed assistant response was available for that turn. Manual continuation is required.',
+      );
+      expect(missingCompletionWarnings).toHaveLength(0);
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+        phase: 'execution',
+        waitingNextHeartbeatAt: originalDueAt,
+      });
+
+      // The internal notification does not slide the existing ten-minute
+      // schedule. Exactly one new heartbeat fires at the original deadline.
+      await vi.advanceTimersByTimeAsync(6.5 * 60_000);
+      expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
     } finally {
       vi.useRealTimers();
     }
