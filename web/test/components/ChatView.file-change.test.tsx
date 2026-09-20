@@ -703,8 +703,33 @@ describe('ChatView delegation reply cards', () => {
       },
     });
     const { container } = render(<ChatView events={[event]} loading={false} sessionId="session-a" />);
-    expect(container.querySelector('.delegation-reply-card-objective')?.textContent).toBe(objective);
+    const title = container.querySelector('.delegation-reply-card-objective');
+    expect(title?.textContent).toBe(objective);
+    expect(title?.classList.contains('is-multiline')).toBe(true);
     expect(container.querySelector('.expandable-task-objective-toggle')).toBeNull();
+  });
+
+  it('renders the registry-refreshed full objective for a reloaded legacy concise-title card', () => {
+    installObjectiveGeometry();
+    const storedTitle = 'Delegation-reply card title is now cut far too short.…';
+    const objective = `Delegation-reply card title is now cut far too short. ${'Keep the authoritative history objective visible. '.repeat(9)}`.trim();
+    expect(objective.length).toBeGreaterThan(400);
+    const event = makeEvent('delegation.reply', {
+      sourceLabel: 'CC11', result: 'PASS',
+      supervisionTask: {
+        version: 1,
+        taskId: 'tsk_legacy_history',
+        assignmentId: 'asg_legacy_history',
+        title: storedTitle,
+        objective,
+      },
+    });
+
+    const { container } = render(<ChatView events={[event]} loading={false} sessionId="session-a" />);
+
+    expectExpandableObjective(container, '.delegation-reply-card-objective', objective);
+    expect(container.textContent).not.toContain(storedTitle);
+    expect(container.textContent?.split(objective)).toHaveLength(2);
   });
 
   it('shows a 1000-character objective once in the expandable card title', () => {

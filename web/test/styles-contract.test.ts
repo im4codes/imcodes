@@ -176,6 +176,8 @@ describe('styles.css regression contracts', () => {
     expect(objectiveBaseRule).toMatch(/overflow-wrap:\s*break-word/);
     const objectiveRule = cssWithoutComments.match(/\.expandable-task-objective-text\.is-clamped,[\s\S]*?\{[^}]*\}/)?.[0];
     expect(objectiveRule).toMatch(/-webkit-line-clamp:\s*3/);
+    const multilineRule = cssWithoutComments.match(/\.expandable-task-objective-text\.is-clamped\.is-multiline\s*\{[^}]*\}/)?.[0];
+    expect(multilineRule).toMatch(/min-height:\s*2\.7em/);
     const metaRule = cssWithoutComments.match(/\.delegation-reply-card-meta\s*\{[^}]*\}/)?.[0];
     expect(metaRule).toMatch(/flex-wrap:\s*wrap/);
     const verdictRule = cssWithoutComments.match(/\.delegation-reply-card-head\s+\.delegation-reply-verdict\s*\{[^}]*\}/)?.[0];

@@ -2534,6 +2534,36 @@ export class SupervisionTaskRegistry {
     };
   }
 
+  /**
+   * Resolve the current public task objective for an already-authoritative
+   * task/assignment pair carried by a daemon timeline event. This is used when
+   * old persisted reply cards only contain the former concise title. The ids,
+   * never the stored display text, select the registry row.
+   */
+  getSupervisionTaskProjection(
+    taskIdInput: string,
+    assignmentIdInput: string,
+  ): AgentDelegationSupervisionTaskProjection | undefined {
+    if (this.#closed) return undefined;
+    const taskId = normalizeTaskString(taskIdInput);
+    const assignmentId = normalizeTaskString(assignmentIdInput);
+    if (!taskId || !assignmentId) return undefined;
+    const task = this.getTaskRecord(taskId);
+    const assignment = this.getAssignment(assignmentId);
+    const objective = projectSupervisionTaskObjective(task?.objective);
+    const title = deriveSupervisionTaskTitle(objective);
+    if (!task || !assignment || assignment.taskId !== task.taskId || !objective || !title) return undefined;
+    return {
+      version: AGENT_DELEGATION_SUPERVISION_TASK_PROJECTION_VERSION,
+      taskId: task.taskId,
+      assignmentId: assignment.assignmentId,
+      ...(assignment.auditAttemptId ? { attemptId: assignment.auditAttemptId } : {}),
+      ...(assignment.auditRevision ? { revision: assignment.auditRevision } : {}),
+      title,
+      ...(objective !== title ? { objective } : {}),
+    };
+  }
+
   list(filter: {
     status?: import('../../shared/supervision-config.js').SupervisionTaskLifecycleStatus;
     topLevelTaskId?: string;

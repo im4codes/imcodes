@@ -41,6 +41,7 @@ import { scanFsListSnapshot } from './fs-list-worker.js';
 import { FsGitStatusPoolError, getDefaultFsGitStatusWorkerPool, shouldUseFsGitStatusWorkerPool, __resetFsGitStatusWorkerPoolForTests } from './fs-git-status-pool.js';
 import { scanFsGitStatusSnapshot } from './fs-git-status-worker.js';
 import { shapeTimelineDetailValueForTransport, shapeTimelineEventsForTransport } from './timeline-response-shaper.js';
+import { getSupervisionTaskRegistry } from './supervision-state-store.js';
 import { getDefaultTimelineDetailStore } from './timeline-detail-store.js';
 import { TIMELINE_HISTORY_CONTENT_TYPES, TIMELINE_HISTORY_STATE_TYPES, type MemoryContextTimelinePayload, type TimelineEvent } from '../shared/timeline/types.js';
 import { emitSessionInlineError } from './session-error.js';
@@ -6018,6 +6019,9 @@ interface TimelineReplayBuildResult {
 
 const timelineReplayInflight = new Map<string, Promise<TimelineReplayBuildResult>>();
 
+const resolveTimelineSupervisionTaskProjection = (taskId: string, assignmentId: string) =>
+  getSupervisionTaskRegistry().getSupervisionTaskProjection(taskId, assignmentId);
+
 function timelineReplayInflightKey(params: TimelineReplayRequestParams): string {
   return JSON.stringify({
     sessionName: params.sessionName,
@@ -6041,7 +6045,7 @@ async function buildTimelineReplay(params: TimelineReplayRequestParams): Promise
     const events = await timelineStore.readPreferred(params.sessionName, { limit: replayEpochResetLimit });
     const shaped = shapeTimelineEventsForTransport(events, {
       detailSink: getDefaultTimelineDetailStore(),
-    });
+    }, resolveTimelineSupervisionTaskProjection);
     const payloadTruncated = shaped.droppedEvents > 0 || shaped.truncatedEvents > 0;
     return {
       events: shaped.events,
@@ -6063,7 +6067,7 @@ async function buildTimelineReplay(params: TimelineReplayRequestParams): Promise
   const { events, truncated, source = TIMELINE_RESPONSE_SOURCES.RING_BUFFER } = timelineEmitter.replay(params.sessionName, params.afterSeq);
   const shaped = shapeTimelineEventsForTransport(events, {
     detailSink: getDefaultTimelineDetailStore(),
-  });
+  }, resolveTimelineSupervisionTaskProjection);
   const payloadTruncated = shaped.droppedEvents > 0 || shaped.truncatedEvents > 0;
   return {
     events: shaped.events,
@@ -6494,7 +6498,7 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
   const sanitized = shapeTimelineEventsForTransport(trimmed, {
     maxResponseBytes: params.maxResponseBytes,
     detailSink: getDefaultTimelineDetailStore(),
-  });
+  }, resolveTimelineSupervisionTaskProjection);
   const status = timelineStatusFromPayload(sanitized.droppedEvents, sanitized.truncatedEvents);
   return {
     events: sanitized.events,
@@ -6527,19 +6531,29 @@ async function buildTimelineHistoryWithWorker(params: TimelineHistoryRequestPara
   const detailRefs = (result.detailCandidates ?? [])
     .map((candidate) => getDefaultTimelineDetailStore().put(candidate))
     .filter((ref): ref is NonNullable<typeof ref> => ref !== undefined);
+  // The worker intentionally owns no supervision registry connection. Refresh
+  // the small set of returned task cards on the main thread, then re-apply the
+  // response budget because a legacy concise title may gain a bounded 4 KiB
+  // objective here.
+  const refreshed = shapeTimelineEventsForTransport(result.events, {
+    maxResponseBytes: params.maxResponseBytes,
+    detailSink: getDefaultTimelineDetailStore(),
+  }, resolveTimelineSupervisionTaskProjection);
+  const droppedEvents = result.droppedEvents + refreshed.droppedEvents;
+  const truncatedEvents = result.truncatedEvents + refreshed.truncatedEvents;
   return {
-    events: result.events,
+    events: refreshed.events,
     eventsRead: result.eventsRead,
-    payloadBytes: result.payloadBytes,
-    droppedEvents: result.droppedEvents,
-    truncatedEvents: result.truncatedEvents,
-    hasMore: result.hasMore === true || result.droppedEvents > 0,
+    payloadBytes: refreshed.payloadBytes,
+    droppedEvents,
+    truncatedEvents,
+    hasMore: result.hasMore === true || droppedEvents > 0,
     readMs: result.readMs,
     synthesizeMs: 0,
     sanitizeMs: result.sanitizeMs,
     source: result.source ?? TIMELINE_RESPONSE_SOURCES.WORKER_SQLITE,
-    status: timelineStatusFromPayload(result.droppedEvents, result.truncatedEvents),
-    detailRefs,
+    status: timelineStatusFromPayload(droppedEvents, truncatedEvents),
+    detailRefs: [...detailRefs, ...refreshed.detailRefs],
   };
 }
 

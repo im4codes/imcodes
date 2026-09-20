@@ -47,6 +47,13 @@ describe('peer audit result timeline projection', () => {
       revision: 'formal-r1',
       objective,
     });
+    expect(registry.getSupervisionTaskProjection('tsk_formal', 'asg_formal_auditor')).toMatchObject({
+      taskId: 'tsk_formal',
+      assignmentId: 'asg_formal_auditor',
+      objective,
+    });
+    expect(registry.getSupervisionTaskProjection('tsk_other', 'asg_formal_auditor')).toBeUndefined();
+    expect(registry.getSupervisionTaskProjection('tsk_formal', 'asg_other')).toBeUndefined();
     expect(JSON.stringify(events[0])).not.toContain(attemptId);
   });
 

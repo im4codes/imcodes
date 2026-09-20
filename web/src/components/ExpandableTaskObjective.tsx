@@ -2,10 +2,19 @@ import { useCallback, useId, useLayoutEffect, useRef, useState } from 'preact/ho
 import { useTranslation } from 'react-i18next';
 
 export type TaskObjectiveOverflowMeasure = (element: HTMLElement) => boolean;
+export type TaskObjectiveMultilineMeasure = (element: HTMLElement) => boolean;
 
 /** Public seam used by jsdom tests and the browser measurement path alike. */
 export const taskObjectiveOverflows = (element: HTMLElement): boolean =>
   element.scrollHeight > element.clientHeight + 1;
+
+export const taskObjectiveIsMultiline = (element: HTMLElement): boolean => {
+  if (element.textContent?.includes('\n')) return true;
+  const lineHeight = Number.parseFloat(getComputedStyle(element).lineHeight);
+  return Number.isFinite(lineHeight) && lineHeight > 0
+    ? element.scrollHeight > lineHeight + 1
+    : false;
+};
 
 export function ExpandableTaskObjective(props: {
   text: string;
@@ -13,6 +22,7 @@ export function ExpandableTaskObjective(props: {
   textClassName?: string;
   id?: string;
   measureOverflow?: TaskObjectiveOverflowMeasure;
+  measureMultiline?: TaskObjectiveMultilineMeasure;
   onActivate?: () => void;
   activateExpanded?: boolean;
   activateControls?: string;
@@ -24,7 +34,9 @@ export function ExpandableTaskObjective(props: {
   const textRef = useRef<HTMLElement>(null);
   const [expanded, setExpanded] = useState(false);
   const [overflowing, setOverflowing] = useState(false);
+  const [multiline, setMultiline] = useState(false);
   const measureOverflow = props.measureOverflow ?? taskObjectiveOverflows;
+  const measureMultiline = props.measureMultiline ?? taskObjectiveIsMultiline;
 
   const measure = useCallback(() => {
     const element = textRef.current;
@@ -34,10 +46,12 @@ export function ExpandableTaskObjective(props: {
     // collapse control is needed, without duplicating the objective offscreen.
     element.classList.add('is-measuring-clamped');
     const next = measureOverflow(element);
+    const nextMultiline = next || measureMultiline(element);
     element.classList.remove('is-measuring-clamped');
     setOverflowing(next);
+    setMultiline(nextMultiline);
     if (!next) setExpanded(false);
-  }, [measureOverflow]);
+  }, [measureMultiline, measureOverflow]);
 
   useLayoutEffect(() => {
     setExpanded(false);
@@ -68,7 +82,7 @@ export function ExpandableTaskObjective(props: {
     <strong
       ref={textRef}
       id={textId}
-      class={`expandable-task-objective-text ${props.textClassName ?? ''}${!expanded ? ' is-clamped' : ' is-expanded'}`.trim()}
+      class={`expandable-task-objective-text ${props.textClassName ?? ''}${!expanded ? ' is-clamped' : ' is-expanded'}${!expanded && multiline ? ' is-multiline' : ''}`.trim()}
       data-testid="expandable-task-objective-text"
     >
       {props.text}

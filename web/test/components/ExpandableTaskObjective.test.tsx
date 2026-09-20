@@ -45,8 +45,10 @@ describe('ExpandableTaskObjective', () => {
 
   it('leaves a two-line objective untouched and offers no toggle', () => {
     render(<ExpandableTaskObjective text={'Short first line\nShort second line'} measureOverflow={() => false} />);
-    expect(screen.getByTestId('expandable-task-objective-text').textContent)
-      .toBe('Short first line\nShort second line');
+    const text = screen.getByTestId('expandable-task-objective-text');
+    expect(text.textContent).toBe('Short first line\nShort second line');
+    expect(text.classList.contains('is-multiline')).toBe(true);
+    expect(text.classList.contains('is-clamped')).toBe(true);
     expect(screen.queryByRole('button')).toBeNull();
   });
 

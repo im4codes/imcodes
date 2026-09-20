@@ -5890,6 +5890,7 @@ html.native-ios-mac .chat-dl-btn {
 }
 .expandable-task-objective-text.is-clamped,
 .expandable-task-objective-text.is-measuring-clamped { -webkit-line-clamp: 3; }
+.expandable-task-objective-text.is-clamped.is-multiline { min-height: 2.7em; }
 .expandable-task-objective-text.is-expanded {
   display: block;
   max-height: min(16rem, 45vh);
