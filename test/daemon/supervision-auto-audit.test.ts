@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { SUPERVISION_UNBOUND_REVISION } from '../../shared/supervision-mcp-tools.js';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -78,7 +79,10 @@ import {
   __resetAuditTargetReservationsForTests,
   AUDIT_TARGET_RESERVATION_TTL_MS,
 } from '../../src/daemon/supervision-audit-target-reservations.js';
-import { freezeSupervisionIntegrationBundle } from '../../src/daemon/supervision-integration-bundle.js';
+import {
+  applySupervisionIntegrationBundle,
+  freezeSupervisionIntegrationBundle,
+} from '../../src/daemon/supervision-integration-bundle.js';
 
 const require = createRequire(import.meta.url);
 suppressSqliteExperimentalWarning();
@@ -319,6 +323,127 @@ describe('automatic supervision audit materialization', () => {
     return { ...shape, attemptId, auditor: auditor.value };
   }
 
+  function settleReadyTaskWithUnchangedBundle(taskId: string) {
+    const root = mkdtempSync(join(tmpdir(), 'integration-unchanged-real-path-'));
+    bundleRoots.push(root);
+    const repository = join(root, 'repository');
+    const implementer = join(root, 'implementer');
+    const integration = join(root, 'integration');
+    mkdirSync(join(repository, 'src'), { recursive: true });
+    execFileSync('git', ['init', '-q', repository]);
+    execFileSync('git', ['-C', repository, 'config', 'user.email', 'test@example.com']);
+    execFileSync('git', ['-C', repository, 'config', 'user.name', 'Test']);
+    writeFileSync(join(repository, 'src/changed.ts'), 'before\n');
+    writeFileSync(join(repository, 'src/unchanged.ts'), 'already desired\n');
+    execFileSync('git', ['-C', repository, 'add', '--', 'src/changed.ts', 'src/unchanged.ts']);
+    execFileSync('git', ['-C', repository, 'commit', '-qm', 'base']);
+    const headSha = execFileSync('git', ['-C', repository, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    execFileSync('git', ['-C', repository, 'worktree', 'add', '--detach', implementer, headSha]);
+    execFileSync('git', ['-C', repository, 'worktree', 'add', '--detach', integration, headSha]);
+    writeFileSync(join(implementer, 'src/changed.ts'), 'after\n');
+
+    const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+    const revision = `${taskId}-r1`;
+    expect(registry.createOrGet({
+      taskId,
+      projectName: 'alpha',
+      classification: 'integration_task',
+      objective: 'dispatch the exact PASS integration bundle',
+      acceptance: ['include unchanged scoped paths'],
+      baseRevision: headSha,
+      currentRevision: revision,
+      auditPolicy: 'auto_strict_cross_vendor',
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      taskId,
+      role: 'coordinator',
+      identity: identity('deck_alpha_brain'),
+      required: false,
+    })).toMatchObject({ ok: true });
+    const worker = registry.createAssignment({
+      taskId,
+      role: 'implementer',
+      identity: identity('deck_alpha_worker'),
+      auditRevision: revision,
+      scopeFiles: ['src/changed.ts', 'src/unchanged.ts'],
+    });
+    if (!worker.ok) throw new Error(worker.reason);
+    for (const [intent, toStatus, validationState] of [
+      ['start', 'implementing', undefined],
+      ['record_validation', 'validated', 'passed'],
+      ['open_audit', 'ready_for_audit', undefined],
+    ] as const) {
+      expect(registry.applyTaskIntent({
+        expectedRevision: revision,
+        taskId,
+        assignmentId: worker.value.assignmentId,
+        intent,
+        toStatus,
+        ...(validationState ? { validationState } : {}),
+      })).toMatchObject({ ok: true });
+    }
+    const files = [
+      { path: 'src/changed.ts', sha256: createHash('sha256').update('after\n').digest('hex'), mode: 0o644 as const },
+      { path: 'src/unchanged.ts', sha256: createHash('sha256').update('already desired\n').digest('hex'), mode: 0o644 as const },
+    ];
+    const frozen = freezeSupervisionIntegrationBundle({
+      taskId,
+      assignmentId: worker.value.assignmentId,
+      revision,
+      scopeFiles: files.map((file) => file.path),
+      bundleRoot: join(root, 'bundles'),
+      snapshot: {
+        worktreePath: implementer,
+        headSha,
+        files,
+        stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
+      },
+    });
+    if (!frozen.ok) throw new Error(frozen.reason);
+    expect(registry.bindIntegrationBundle({
+      taskId,
+      assignmentId: worker.value.assignmentId,
+      identity: worker.value.identity,
+      revision,
+      bundle: frozen.bundle,
+    })).toMatchObject({ ok: true });
+    const attemptId = automaticAttempt(taskId, revision);
+    const auditor = registry.createAssignment({
+      taskId,
+      role: 'auditor',
+      required: false,
+      identity: identity('deck_alpha_pass_auditor', 'claude-code-sdk', 'anthropic'),
+      auditAttemptId: attemptId,
+      auditRevision: revision,
+    });
+    if (!auditor.ok) throw new Error(auditor.reason);
+    expect(registry.updateAssignment({
+      assignmentId: auditor.value.assignmentId,
+      identity: auditor.value.identity,
+      status: 'auditing',
+      auditAttemptId: attemptId,
+      auditRevision: revision,
+    })).toMatchObject({ ok: true });
+    expect(registry.appendMatchingAuditReceipt({
+      taskId,
+      auditorAssignmentId: auditor.value.assignmentId,
+      auditorIdentity: auditor.value.identity,
+      auditorSessionName: auditor.value.identity.sessionName,
+      attemptId,
+      revision,
+      receiptKind: 'final',
+      verdict: 'PASS',
+      findings: 'exact bytes pass',
+      validations: [],
+    })).toMatchObject({ ok: true });
+    expect(registry.finishAssignment({
+      assignmentId: auditor.value.assignmentId,
+      identity: auditor.value.identity,
+      revision,
+    })).toMatchObject({ ok: true });
+    return { registry, taskId, revision, attemptId, worker: worker.value, integration, frozen: frozen.bundle };
+  }
+
   async function passAuthorizedReplayShape(taskId: string) {
     const database = new DatabaseSync(':memory:');
     const registry = new SupervisionTaskRegistry({ database });
@@ -502,6 +627,134 @@ describe('automatic supervision audit materialization', () => {
       status: 'ready_for_integration', auditAttemptId: shape.attemptId,
       auditRevision: shape.revision, verdict: 'PASS', crossVendorAuditPassed: true,
     });
+  });
+
+  it('prepares an unchanged-scope bundle and queues one hidden exact integration message to a busy Brain', async () => {
+    __resetSupervisionConvergenceTickForTests();
+    const shape = settleReadyTaskWithUnchangedBundle('integration-unchanged-real-path');
+    const brain = { ...session('deck_alpha_brain', 'brain'), state: 'running' as const };
+    const worker = session('deck_alpha_worker', 'w1');
+    let delivered = false;
+    const dispatch = vi.fn().mockResolvedValue({
+      status: 'accepted',
+      dispatchId: 'send_dispatch_00000000-0000-4000-8000-000000000034',
+      messageId: 'send_message_00000000-0000-5000-a000-000000000034',
+      deliveries: [{ target: brain.name, status: 'queued' }],
+    });
+    const deps = {
+      registry: shape.registry,
+      listSessions: () => [brain, worker],
+      dispatch,
+      hasDeliveryEvidence: () => delivered,
+      ensureIntegrationWorktree: vi.fn(async () => ({
+        ok: true as const,
+        worktreePath: shape.integration,
+        baseRevision: shape.frozen.headSha,
+        created: false,
+      })),
+      runScheduledWorktreeGcBatch: vi.fn(async () => undefined),
+    };
+
+    await expect(runSupervisionConvergenceTick(deps)).resolves.toMatchObject({
+      integrations: [expect.objectContaining({ status: 'dispatched' })],
+    });
+    const owner = shape.registry.get(shape.taskId)!.assignments.find(
+      (assignment) => assignment.role === 'integration_owner',
+    )!;
+    expect(owner.status).toBe('ready_for_integration');
+    expect(owner.blocker).toBeUndefined();
+    const expectedMessageId = deterministicSendMessageId(
+      `auto-integration:${owner.assignmentId}:${shape.revision}:${shape.attemptId}`,
+    );
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(dispatch.mock.calls[0]![1]).toMatchObject({
+      internalMessageId: expectedMessageId,
+      internalDurableQueue: true,
+      internalSuppressTimeline: true,
+    });
+    const pathspec = dispatch.mock.calls[0]![1].message.split('\n')
+      .slice(dispatch.mock.calls[0]![1].message.split('\n').indexOf('Exact pathspec:') + 1)
+      .filter((line: string) => line.startsWith('- '))
+      .map((line: string) => line.slice(2));
+    expect(pathspec).toEqual(shape.frozen.files.map((file) => file.path));
+    expect(pathspec).toContain('src/unchanged.ts');
+
+    delivered = true;
+    await expect(runSupervisionConvergenceTick(deps)).resolves.toMatchObject({
+      integrations: [expect.objectContaining({ status: 'replayed', messageId: expectedMessageId })],
+    });
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(shape.registry.get(shape.taskId)!.assignments.filter(
+      (assignment) => assignment.role === 'integration_owner',
+    )).toHaveLength(1);
+  });
+
+  it('records one bounded durable owner blocker when integration preparation is rejected', async () => {
+    const shape = settleReadyTaskWithUnchangedBundle('integration-visible-prepare-blocker');
+    const brain = session('deck_alpha_brain', 'brain');
+    const worker = session('deck_alpha_worker', 'w1');
+    const dispatch = vi.fn().mockResolvedValue({
+      status: 'accepted',
+      dispatchId: 'send_dispatch_00000000-0000-4000-8000-000000000035',
+      messageId: 'send_message_00000000-0000-5000-a000-000000000035',
+      deliveries: [{ target: brain.name, status: 'queued' }],
+    });
+    let reject = true;
+    const deps = {
+      registry: shape.registry,
+      listSessions: () => [brain, worker],
+      dispatch,
+      hasDeliveryEvidence: () => false,
+      ensureIntegrationWorktree: vi.fn(async () => ({
+        ok: true as const,
+        worktreePath: shape.integration,
+        baseRevision: shape.frozen.headSha,
+        created: false,
+      })),
+      applyIntegrationBundle: vi.fn((_input: Parameters<typeof applySupervisionIntegrationBundle>[0]) => (
+        reject
+          ? { ok: false as const, reason: 'target_conflict' as const, path: 'src/unchanged.ts' }
+          : { ok: true as const, replay: false }
+      )),
+    };
+
+    await expect(dispatchReadyIntegration(shape.taskId, deps)).resolves.toEqual({
+      status: 'blocked',
+      reason: 'integration bundle apply rejected: target_conflict:src/unchanged.ts',
+      reported: true,
+    });
+    const owner = shape.registry.get(shape.taskId)!.assignments.find(
+      (assignment) => assignment.role === 'integration_owner',
+    )!;
+    expect(JSON.parse(shape.registry.getAssignment(owner.assignmentId)!.blocker!)).toMatchObject({
+      kind: 'automatic_integration_dispatch',
+      taskId: shape.taskId,
+      assignmentId: owner.assignmentId,
+      revision: shape.revision,
+      reason: 'integration bundle apply rejected: target_conflict:src/unchanged.ts',
+    });
+    const blockedEvents = () => shape.registry.listEvents(shape.taskId).filter((event) => (
+      event.assignmentId === owner.assignmentId
+      && event.eventType === 'blocked'
+      && event.payload?.source === 'automatic_integration_dispatch_blocked'
+    ));
+    expect(blockedEvents()).toHaveLength(1);
+    await expect(dispatchReadyIntegration(shape.taskId, deps)).resolves.toMatchObject({
+      status: 'blocked', reported: true,
+    });
+    expect(blockedEvents()).toHaveLength(1);
+    expect(dispatch).not.toHaveBeenCalled();
+
+    reject = false;
+    await expect(dispatchReadyIntegration(shape.taskId, deps)).resolves.toMatchObject({ status: 'dispatched' });
+    expect(shape.registry.getAssignment(owner.assignmentId)?.status).toBe('ready_for_integration');
+    expect(shape.registry.getAssignment(owner.assignmentId)?.blocker).toBeUndefined();
+    expect(shape.registry.listEvents(shape.taskId)).toContainEqual(expect.objectContaining({
+      assignmentId: owner.assignmentId,
+      eventType: 'recovered',
+      payload: expect.objectContaining({ source: 'automatic_integration_dispatch_recovered' }),
+    }));
+    expect(dispatch).toHaveBeenCalledTimes(1);
   });
 
   it('re-arms the same cancelled stale owner for the current PASS and provisions from bundle head', async () => {

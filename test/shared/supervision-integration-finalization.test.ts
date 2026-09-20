@@ -506,14 +506,25 @@ describe('supervision integration finalization pure policy', () => {
     })).toMatchObject({ ok: true });
   });
 
-  it('rejects caller ownedFiles that omit an exact bundle path', () => {
-    const result = resolveSupervisionIntegrationPolicy({
-      operation: 'preflight', evidence: evidence({ ownedFiles: [] }), snapshot: snapshot(),
-    });
-    expect(result).toMatchObject({
+  it.each([
+    ['subset', []],
+    ['superset', ['src/exact.ts', 'src/reported-only.ts']],
+    ['omitted', undefined],
+  ] as const)('treats %s ownedFiles as record-only provenance', (_label, ownedFiles) => {
+    expect(resolveSupervisionIntegrationPolicy({
+      operation: 'preflight', evidence: evidence({ ownedFiles }), snapshot: snapshot(),
+    })).toMatchObject({ ok: true, evidence: { ownedFiles: ownedFiles ?? [] } });
+  });
+
+  it('still rejects a wrong integrationManifest sha as bundle_mismatch', () => {
+    expect(resolveSupervisionIntegrationPolicy({
+      operation: 'preflight',
+      evidence: evidence({ integrationManifest: [{ path: 'src/exact.ts', sha256: 'd'.repeat(64) }] }),
+      snapshot: snapshot(),
+    })).toMatchObject({
       ok: false,
       refusals: expect.arrayContaining([
-        expect.objectContaining({ code: 'bundle_mismatch', field: 'ownedFiles' }),
+        expect.objectContaining({ code: 'bundle_mismatch', field: 'bundle' }),
       ]),
     });
   });

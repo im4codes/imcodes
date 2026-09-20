@@ -19,7 +19,10 @@ import { SUPERVISION_TASK_AUDIT_POLICIES } from '../../shared/supervision-config
 import { createMemoryMcpServer } from '../../src/daemon/memory-mcp-server.js';
 import { CRON_COMPLETION_POLICY } from '../../shared/cron-types.js';
 import { MEMORY_MCP_DEGRADED_REASON } from '../../shared/memory-ws.js';
-import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
+import {
+  createMemoryMcpToolHandlers,
+  resolveIntegrationCallerProvenance,
+} from '../../src/daemon/memory-mcp-tools.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 vi.mock('../../src/util/rate-limited-warn.js', () => ({ warnOncePerHour: vi.fn() }));
 
@@ -108,6 +111,33 @@ describe('memory MCP tool schema firewall', () => {
     const contract = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START];
     expect(contract.inputSchema.properties?.scopeFiles?.description).toContain('never an implementation ACL');
     expect(contract.inputSchema.properties).not.toHaveProperty('claimMode');
+  });
+
+  it.each([
+    ['subset', ['src/one.ts']],
+    ['superset', ['src/one.ts', 'src/two.ts', 'src/reported-only.ts']],
+    ['omitted', undefined],
+  ] as const)('keeps %s ownedFiles as record-only provenance while enforcing manifest bytes', (_label, ownedFiles) => {
+    const manifest = [
+      { path: 'src/one.ts', sha256: '1'.repeat(64) },
+      { path: 'src/two.ts', sha256: '2'.repeat(64) },
+    ];
+    expect(resolveIntegrationCallerProvenance({
+      rawInput: { ownedFiles, integrationManifest: manifest },
+      ownedFiles,
+      authoritativeManifest: manifest,
+    })).toEqual({ refusals: [], ownedFiles: ownedFiles ?? [], integrationManifest: manifest });
+
+    expect(resolveIntegrationCallerProvenance({
+      rawInput: {
+        ownedFiles,
+        integrationManifest: [{ path: 'src/one.ts', sha256: 'f'.repeat(64) }],
+      },
+      ownedFiles,
+      authoritativeManifest: manifest,
+    })).toMatchObject({
+      refusals: [expect.objectContaining({ code: 'bundle_mismatch', field: 'integrationManifest' })],
+    });
   });
 
   it('rejects partial structured integration finalization instead of falling back to legacy prose finish', async () => {

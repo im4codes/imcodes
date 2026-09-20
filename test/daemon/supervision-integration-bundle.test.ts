@@ -49,6 +49,7 @@ async function productionShape() {
   writeFileSync(join(sourceRoot, 'test/a.test.ts'), 'before-a\n');
   writeFileSync(join(sourceRoot, 'test/b.test.ts'), 'before-b\n');
   writeFileSync(join(sourceRoot, 'test/deleted.test.ts'), 'before-delete\n');
+  writeFileSync(join(sourceRoot, 'test/unchanged.test.ts'), 'already-desired\n');
   git(sourceRoot, 'add', '.');
   git(sourceRoot, 'commit', '-m', 'base');
   const base = git(sourceRoot, 'rev-parse', 'HEAD');
@@ -69,6 +70,28 @@ async function productionShape() {
 }
 
 describe('immutable supervision integration bundle', () => {
+  it('applies a bundle that includes an unchanged scope file without stranding its integration owner', async () => {
+    const shape = await productionShape();
+    const unchanged = { path: 'test/unchanged.test.ts', sha256: sha('already-desired\n') };
+    const snapshot = { ...shape.snapshot, files: [...shape.snapshot.files, unchanged] };
+    const frozen = freezeSupervisionIntegrationBundle({
+      taskId: 'tsk_partial_diff', assignmentId: 'asg_partial_diff', revision: 'partial-diff-r1',
+      snapshot, scopeFiles: snapshot.files.map((file) => file.path),
+      bundleRoot: shape.bundleRoot,
+    });
+    expect(frozen).toMatchObject({ ok: true });
+    if (!frozen.ok) throw new Error(frozen.reason);
+
+    // Production incident shape: every bundle byte is authoritative, but one
+    // manifest path already equals HEAD and therefore is absent from git diff.
+    expect(applySupervisionIntegrationBundle({
+      bundle: frozen.bundle, worktreePath: shape.integration,
+    })).toEqual({ ok: true, replay: false });
+    expect(git(shape.integration, 'diff', '--name-only', 'HEAD', '--').split('\n'))
+      .not.toContain(unchanged.path);
+    expect(readFileSync(join(shape.integration, unchanged.path), 'utf8')).toBe('already-desired\n');
+  });
+
   it('preserves the exact tsk_f1x after bytes after the implementer worktree returns to base', async () => {
     const shape = await productionShape();
     const frozen = freezeSupervisionIntegrationBundle({
@@ -110,6 +133,113 @@ describe('immutable supervision integration bundle', () => {
       bundle: frozen.bundle, worktreePath: shape.integration,
       commitSha: git(shape.integration, 'rev-parse', 'HEAD'),
     })).toEqual({ ok: false, reason: 'hash_mismatch', path: 'test/a.test.ts' });
+  });
+
+  it('accepts only the deterministic merge of bundle bytes with a newer first parent', async () => {
+    const shape = await productionShape();
+    const paths = Array.from({ length: 20 }, (_, index) => `test/merge-${index}.ts`);
+    for (const [index, path] of paths.entries()) {
+      const base = index < 2
+        ? `bundle-${index}: base\nshared: base\nupstream-${index}: base\n`
+        : `file-${index}: base\n`;
+      writeFileSync(join(shape.sourceRoot, path), base);
+    }
+    git(shape.sourceRoot, 'add', '.');
+    git(shape.sourceRoot, 'commit', '-m', 'merge fixture base');
+    const base = git(shape.sourceRoot, 'rev-parse', 'HEAD');
+    git(shape.sourceRoot, 'worktree', 'remove', '--force', shape.implementer);
+    git(shape.sourceRoot, 'worktree', 'remove', '--force', shape.integration);
+    git(shape.sourceRoot, 'worktree', 'add', '--detach', shape.implementer, base);
+    git(shape.sourceRoot, 'worktree', 'add', '--detach', shape.integration, base);
+
+    for (const [index, path] of paths.entries()) {
+      writeFileSync(join(shape.implementer, path), index < 2
+        ? `bundle-${index}: changed\nshared: base\nupstream-${index}: base\n`
+        : `file-${index}: bundle\n`);
+    }
+    const inspected = await inspectSupervisionAssignmentWorktree({
+      sessionName: 'deck_alpha_worker', assignmentId: 'asg_merge', worktreePath: shape.implementer,
+    });
+    if (!inspected.ok) throw new Error(inspected.reason);
+    const frozen = freezeSupervisionIntegrationBundle({
+      taskId: 'tsk_merge', assignmentId: 'asg_merge', revision: 'merge-r1',
+      snapshot: inspected.snapshot, scopeFiles: paths, bundleRoot: shape.bundleRoot,
+    });
+    expect(frozen).toMatchObject({ ok: true });
+    if (!frozen.ok) throw new Error(frozen.reason);
+
+    for (let index = 0; index < 2; index += 1) {
+      writeFileSync(join(shape.integration, paths[index]!),
+        `bundle-${index}: base\nshared: base\nupstream-${index}: changed\n`);
+    }
+    git(shape.integration, 'add', '.');
+    git(shape.integration, 'commit', '-m', 'newer destination changes');
+    const parentSha = git(shape.integration, 'rev-parse', 'HEAD');
+
+    for (const [index, path] of paths.entries()) {
+      writeFileSync(join(shape.integration, path), index < 2
+        ? `bundle-${index}: changed\nshared: base\nupstream-${index}: changed\n`
+        : `file-${index}: bundle\n`);
+    }
+    git(shape.integration, 'add', '.');
+    git(shape.integration, 'commit', '-m', 'deterministic integration merge');
+    const mergedCommit = git(shape.integration, 'rev-parse', 'HEAD');
+    expect(verifySupervisionIntegrationCommit({
+      bundle: frozen.bundle, worktreePath: shape.integration, commitSha: mergedCommit,
+    })).toEqual({
+      ok: true,
+      mergedWithNewerBase: [
+        { path: paths[0], parentSha },
+        { path: paths[1], parentSha },
+      ],
+    });
+
+    git(shape.integration, 'checkout', '--detach', parentSha);
+    for (const path of paths) {
+      const source = join(frozen.bundle.bundlePath, 'files', path);
+      writeFileSync(join(shape.integration, path), readFileSync(source));
+    }
+    git(shape.integration, 'add', '.');
+    git(shape.integration, 'commit', '-m', 'incorrectly revert newer destination bytes');
+    expect(verifySupervisionIntegrationCommit({
+      bundle: frozen.bundle, worktreePath: shape.integration,
+      commitSha: git(shape.integration, 'rev-parse', 'HEAD'),
+    })).toEqual({ ok: false, reason: 'hash_mismatch', path: paths[0] });
+
+    git(shape.integration, 'checkout', '--detach', parentSha);
+    for (const [index, path] of paths.entries()) {
+      writeFileSync(join(shape.integration, path), index < 2
+        ? `bundle-${index}: changed\nshared: tampered\nupstream-${index}: changed\n`
+        : `file-${index}: bundle\n`);
+    }
+    git(shape.integration, 'add', '.');
+    git(shape.integration, 'commit', '-m', 'tampered integration merge');
+    expect(verifySupervisionIntegrationCommit({
+      bundle: frozen.bundle, worktreePath: shape.integration,
+      commitSha: git(shape.integration, 'rev-parse', 'HEAD'),
+    })).toEqual({ ok: false, reason: 'hash_mismatch', path: paths[0] });
+
+    git(shape.integration, 'checkout', '--orphan', 'unrelated-parent');
+    git(shape.integration, 'rm', '-qrf', '.');
+    execFileSync('mkdir', ['-p', join(shape.integration, 'test')]);
+    for (const [index, path] of paths.entries()) {
+      writeFileSync(join(shape.integration, path), index < 2
+        ? `bundle-${index}: base\nshared: base\nupstream-${index}: changed\n`
+        : `file-${index}: base\n`);
+    }
+    git(shape.integration, 'add', '.');
+    git(shape.integration, 'commit', '-m', 'unrelated lookalike destination parent');
+    for (const [index, path] of paths.entries()) {
+      writeFileSync(join(shape.integration, path), index < 2
+        ? `bundle-${index}: changed\nshared: base\nupstream-${index}: changed\n`
+        : `file-${index}: bundle\n`);
+    }
+    git(shape.integration, 'add', '.');
+    git(shape.integration, 'commit', '-m', 'merge on unrelated history');
+    expect(verifySupervisionIntegrationCommit({
+      bundle: frozen.bundle, worktreePath: shape.integration,
+      commitSha: git(shape.integration, 'rev-parse', 'HEAD'),
+    })).toEqual({ ok: false, reason: 'target_conflict' });
   });
 
   it('is content addressed, replay-safe, and fails closed on bundle or target conflicts', async () => {

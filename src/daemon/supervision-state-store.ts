@@ -612,6 +612,8 @@ export interface PersistedSupervisionIntegrationFinalization {
   pushResult: 'pushed' | 'already_present';
   pushRemoteRef: string;
   stagedPaths: string[];
+  /** Daemon-verified deterministic merges against a newer destination parent. */
+  mergedWithNewerBase?: Array<{ path: string; parentSha: string }>;
   externalRunId?: string;
   externalHeadSha?: string;
   externalTaskId?: string;
@@ -1118,6 +1120,8 @@ export interface SupervisionIntegrationFinalizationInput {
   stagedPaths: readonly string[];
   conflictedPaths: readonly string[];
   untrackedOtherOwnerPaths: readonly string[];
+  /** Daemon-derived commit verification provenance; never accepted from MCP input. */
+  mergedWithNewerBase?: readonly { path: string; parentSha: string }[];
   externalRunId?: string;
   externalHeadSha?: string;
   externalTaskId?: string;
@@ -2674,6 +2678,114 @@ export class SupervisionTaskRegistry {
       this.#writeTask(updatedTask, 'blocked', { source: 'automatic_audit_routing_blocked' });
       this.#db.exec('COMMIT');
       return { ok: true, value: updatedTask };
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  /**
+   * Persist one exact integration-dispatch refusal on the materialized owner.
+   *
+   * Integration automation retries on every bounded convergence tick. Without
+   * a durable, de-duplicated event, a failure while preparing the integration
+   * worktree is visible only in that tick's transient return value and can be
+   * silently retried forever. The blocker is assignment-scoped so it cannot
+   * overwrite unrelated task authority, and the full JSON value is its CAS
+   * token for the matching recovery below.
+   */
+  recordIntegrationDispatchBlocker(input: {
+    taskId: string;
+    assignmentId: string;
+    revision: string;
+    reason: string;
+    now?: number;
+  }): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {
+    const revision = normalizeTaskString(input.revision);
+    const reason = normalizeTaskString(input.reason)?.slice(0, 1_024);
+    if (!revision || !reason) return { ok: false, reason: 'invalid' };
+    const blocker = JSON.stringify({
+      kind: 'automatic_integration_dispatch',
+      taskId: input.taskId,
+      assignmentId: input.assignmentId,
+      revision,
+      reason,
+    });
+    const now = input.now ?? Date.now();
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const task = this.getTaskRecord(input.taskId);
+      const assignment = this.getAssignment(input.assignmentId);
+      if (!task || !assignment || assignment.taskId !== task.taskId) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'not_found' };
+      }
+      if (task.status !== 'ready_for_integration'
+        || task.currentRevision !== revision
+        || assignment.role !== 'integration_owner'
+        || isTerminalSupervisionTaskStatus(assignment.status)
+        || (assignment.auditRevision && assignment.auditRevision !== revision)) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'invalid_transition' };
+      }
+      if (assignment.blocker === blocker) {
+        this.#db.exec('COMMIT');
+        return { ok: true, value: assignment, replay: true };
+      }
+      const updated = { ...assignment, blocker, updatedAt: now };
+      this.#writeAssignment(updated, 'blocked', {
+        source: 'automatic_integration_dispatch_blocked',
+        revision,
+        reason,
+      });
+      this.#db.exec('COMMIT');
+      return { ok: true, value: updated };
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  /** Clear only this automation's exact-revision blocker before retrying. */
+  clearIntegrationDispatchBlocker(input: {
+    taskId: string;
+    assignmentId: string;
+    revision: string;
+    now?: number;
+  }): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {
+    const revision = normalizeTaskString(input.revision);
+    if (!revision) return { ok: false, reason: 'invalid' };
+    const now = input.now ?? Date.now();
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const task = this.getTaskRecord(input.taskId);
+      const assignment = this.getAssignment(input.assignmentId);
+      if (!task || !assignment || assignment.taskId !== task.taskId) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'not_found' };
+      }
+      let blocker: { kind?: unknown; taskId?: unknown; assignmentId?: unknown; revision?: unknown } | undefined;
+      try {
+        blocker = assignment.blocker ? JSON.parse(assignment.blocker) as typeof blocker : undefined;
+      } catch {
+        blocker = undefined;
+      }
+      const owned = blocker?.kind === 'automatic_integration_dispatch'
+        && blocker.taskId === task.taskId
+        && blocker.assignmentId === assignment.assignmentId
+        && blocker.revision === revision;
+      if (!owned) {
+        this.#db.exec('COMMIT');
+        return { ok: true, value: assignment, replay: true };
+      }
+      const { blocker: _obsolete, ...rest } = assignment;
+      const updated = { ...rest, updatedAt: now };
+      this.#writeAssignment(updated, 'recovered', {
+        source: 'automatic_integration_dispatch_recovered',
+        revision,
+      });
+      this.#db.exec('COMMIT');
+      return { ok: true, value: updated };
     } catch (error) {
       this.#db.exec('ROLLBACK');
       throw error;
@@ -6434,7 +6546,6 @@ export class SupervisionTaskRegistry {
     // exact field rather than a generic bundle mismatch.
     if (task.integrationBundle && !policyLane) {
       const bundle = task.integrationBundle;
-      const bundlePaths = bundle.files.map((file) => file.path).sort();
       const bundleManifest = bundle.files
         .filter((file): file is { path: string; sha256: string } => file.deleted !== true && Boolean(file.sha256))
         .map((file) => ({ path: file.path, sha256: file.sha256 }))
@@ -6443,7 +6554,6 @@ export class SupervisionTaskRegistry {
         || bundle.taskId !== task.taskId
         || bundle.revision !== revision
         || !this.#bundleMatchesPersistedSourceScope(bundle)
-        || JSON.stringify(ownedFiles) !== JSON.stringify(bundlePaths)
         || JSON.stringify(manifest) !== JSON.stringify(bundleManifest)) {
         return { ok: false, reason: 'manifest_mismatch' };
       }
@@ -6462,6 +6572,11 @@ export class SupervisionTaskRegistry {
       pushResult: input.pushResult,
       pushRemoteRef: pushRemoteRef!,
       stagedPaths,
+      ...(input.mergedWithNewerBase && input.mergedWithNewerBase.length > 0 ? {
+        mergedWithNewerBase: [...input.mergedWithNewerBase]
+          .map((entry) => ({ path: entry.path, parentSha: entry.parentSha.toLowerCase() }))
+          .sort((left, right) => left.path.localeCompare(right.path)),
+      } : {}),
       ...(externalRunId ? { externalRunId } : {}),
       ...(externalHeadSha ? { externalHeadSha } : {}),
       ...(externalTaskId ? { externalTaskId } : {}),

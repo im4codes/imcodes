@@ -694,19 +694,11 @@ function equivalentIntegrationRemoteRef(left: string | undefined, right: string)
 }
 
 function integrationAttributionRefusals(input: unknown, expected: {
-  ownedFiles: readonly string[];
   integrationManifest: readonly { path: string; sha256: string }[];
 }): Record<string, unknown>[] {
   if (!input || typeof input !== 'object') return [];
   const record = input as Record<string, unknown>;
   const refusals: Record<string, unknown>[] = [];
-  if (Object.prototype.hasOwnProperty.call(record, 'ownedFiles') && Array.isArray(record.ownedFiles)) {
-    const actual = [...new Set(record.ownedFiles.filter((item): item is string => typeof item === 'string')
-      .map((item) => item.trim()).filter(Boolean))].sort();
-    if (JSON.stringify(actual) !== JSON.stringify([...expected.ownedFiles].sort())) {
-      refusals.push({ code: 'bundle_mismatch', field: 'ownedFiles', expected: 'exact bundle path set', actual: actual.join(',') });
-    }
-  }
   if (Object.prototype.hasOwnProperty.call(record, 'integrationManifest')
     && Array.isArray(record.integrationManifest)) {
     const actual = record.integrationManifest.flatMap((item) => {
@@ -723,6 +715,25 @@ function integrationAttributionRefusals(input: unknown, expected: {
     }
   }
   return refusals;
+}
+
+/** Resolve record-only caller provenance separately from bundle authority. */
+export function resolveIntegrationCallerProvenance(input: {
+  rawInput: unknown;
+  ownedFiles?: readonly string[];
+  authoritativeManifest: readonly { path: string; sha256: string }[];
+}): {
+  refusals: Record<string, unknown>[];
+  ownedFiles: readonly string[];
+  integrationManifest: readonly { path: string; sha256: string }[];
+} {
+  return {
+    refusals: integrationAttributionRefusals(input.rawInput, {
+      integrationManifest: input.authoritativeManifest,
+    }),
+    ownedFiles: input.ownedFiles ?? [],
+    integrationManifest: input.authoritativeManifest,
+  };
 }
 
 export type SupervisionIntegrationGitExec = (
@@ -2621,21 +2632,21 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
           actual: `${inspected.snapshot.headSha}:${mismatch?.path ?? 'head mismatch'}`,
         }]);
       }
-      const authoritativeOwnedFiles = task.integrationBundle.files.map((file) => file.path);
       const authoritativeManifest = task.integrationBundle.files.flatMap((file) => (
         file.deleted === true || !file.sha256 ? [] : [{ path: file.path, sha256: file.sha256 }]
       ));
-      const attributionRefusals = integrationAttributionRefusals(input, {
-        ownedFiles: authoritativeOwnedFiles,
-        integrationManifest: authoritativeManifest,
+      const attribution = resolveIntegrationCallerProvenance({
+        rawInput: input,
+        ownedFiles: parsed.data.ownedFiles,
+        authoritativeManifest,
       });
-      if (attributionRefusals.length > 0) {
-        return integrationRefusal('integration_preflight', attributionRefusals);
+      if (attribution.refusals.length > 0) {
+        return integrationRefusal('integration_preflight', attribution.refusals);
       }
       const authoritativeEvidence = {
         ...parsed.data,
-        ownedFiles: authoritativeOwnedFiles,
-        integrationManifest: authoritativeManifest,
+        ownedFiles: attribution.ownedFiles,
+        integrationManifest: attribution.integrationManifest,
         stagedPaths: inspected.snapshot.stagedPaths,
         conflictedPaths: inspected.snapshot.conflictedPaths,
         untrackedOtherOwnerPaths: parsed.data.untrackedOtherOwnerPaths ?? [],
@@ -2708,16 +2719,16 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         owner, identity, integrationOwner: parsed.data.integrationOwner,
       });
       if (finalizeAuthority.length > 0) return integrationRefusal('integration_finalize', finalizeAuthority);
-      const authoritativeOwnedFiles = task.integrationBundle.files.map((file) => file.path);
       const authoritativeManifest = task.integrationBundle.files.flatMap((file) => (
         file.deleted === true || !file.sha256 ? [] : [{ path: file.path, sha256: file.sha256 }]
       ));
-      const attributionRefusals = integrationAttributionRefusals(input, {
-        ownedFiles: authoritativeOwnedFiles,
-        integrationManifest: authoritativeManifest,
+      const attribution = resolveIntegrationCallerProvenance({
+        rawInput: input,
+        ownedFiles: parsed.data.ownedFiles,
+        authoritativeManifest,
       });
-      if (attributionRefusals.length > 0) {
-        return integrationRefusal('integration_finalize', attributionRefusals);
+      if (attribution.refusals.length > 0) {
+        return integrationRefusal('integration_finalize', attribution.refusals);
       }
       // An exact replay is decided solely from the committed durable ledger.
       // Do not make it depend on a worktree or remote that may legitimately be
@@ -2726,8 +2737,8 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (task.status === 'finalized' && task.finalization) {
         const replayed = registry.finalizeIntegration({
           ...parsed.data,
-          ownedFiles: authoritativeOwnedFiles,
-          integrationManifest: authoritativeManifest,
+          ownedFiles: attribution.ownedFiles,
+          integrationManifest: attribution.integrationManifest,
           stagedPaths: parsed.data.stagedPaths ?? [],
           conflictedPaths: parsed.data.conflictedPaths ?? [],
           untrackedOtherOwnerPaths: parsed.data.untrackedOtherOwnerPaths ?? [],
@@ -2741,6 +2752,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
             : integrationRegistryRefusal('integration_finalize', replayed.reason);
       }
       let inspected: Awaited<ReturnType<typeof inspectSupervisionAssignmentWorktree>> | undefined;
+      let mergedWithNewerBase: readonly { path: string; parentSha: string }[] | undefined;
       if (task.integrationBundle) {
         const verified = verifySupervisionIntegrationCommit({
           bundle: task.integrationBundle,
@@ -2756,6 +2768,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
             actual: `${verified.reason}${verified.path ? `:${verified.path}` : ''}`,
           }]);
         }
+        mergedWithNewerBase = verified.mergedWithNewerBase;
         inspected = await inspectSupervisionAssignmentWorktree({
           sessionName: owner!.identity.sessionName,
           assignmentId: owner!.assignmentId,
@@ -2789,13 +2802,14 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const observedRemoteRef = explicitRemote?.ref;
       const finalized = registry.finalizeIntegration({
         ...parsed.data,
-        // Keep the persisted record shape stable. Invalid caller metadata was
-        // reduced to an empty record above and never supplies authorization.
-        ownedFiles: authoritativeOwnedFiles,
-        integrationManifest: authoritativeManifest,
+        // Preserve normalized caller provenance. It is recorded but never
+        // supplies bundle or edit authority.
+        ownedFiles: attribution.ownedFiles,
+        integrationManifest: attribution.integrationManifest,
         stagedPaths: inspected?.ok ? inspected.snapshot.stagedPaths : parsed.data.stagedPaths ?? [],
         conflictedPaths: inspected?.ok ? inspected.snapshot.conflictedPaths : parsed.data.conflictedPaths ?? [],
         untrackedOtherOwnerPaths: parsed.data.untrackedOtherOwnerPaths ?? [],
+        mergedWithNewerBase,
         inspectedHeadSha: task?.integrationBundle?.headSha,
         observedRemoteRef,
         observedRemoteCommitSha,

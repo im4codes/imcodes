@@ -106,7 +106,8 @@ function createRepo() {
   git(repo, 'init', '-q');
   git(repo, 'config', 'user.name', 'IM.codes E2E');
   git(repo, 'config', 'user.email', 'e2e@im.codes');
-  writeFileSync(join(repo, 'README.md'), '# E2E fixture\n');
+  writeFileSync(join(repo, 'README.md'),
+    '# E2E fixture\nbundle-slot: base\nshared-slot: unchanged\nupstream-slot: base\n');
   git(repo, 'add', '--', 'README.md');
   git(repo, 'commit', '-qm', 'initial');
   git(repo, 'branch', '-M', 'dev');
@@ -211,7 +212,8 @@ describe('E2E: automatic supervision progression lifecycle', () => {
     const worktree = resolveSupervisionAssignmentWorktree({
       sessionName: worker.name, assignmentId: created.assignmentId,
     });
-    writeFileSync(join(worktree, 'README.md'), '# E2E fixture\n\nAutomatic supervision progresses exact validated work.\n');
+    writeFileSync(join(worktree, 'README.md'),
+      '# E2E fixture\nbundle-slot: Automatic supervision progresses exact validated work.\nshared-slot: unchanged\nupstream-slot: base\n');
     const revision = `readme-e2e-r1-${createHash('sha256').update(readFileSync(join(worktree, 'README.md'))).digest('hex').slice(0, 12)}`;
 
     const workerMemory = createMemoryMcpToolHandlers(caller(worker), {
@@ -342,6 +344,18 @@ describe('E2E: automatic supervision progression lifecycle', () => {
 
     git(integrationWorktree, 'config', 'user.name', 'IM.codes E2E');
     git(integrationWorktree, 'config', 'user.email', 'e2e@im.codes');
+    // A different, already-integrated task advanced the same file after this
+    // bundle's base. The integration commit must retain both independent
+    // changes, and the daemon must derive that merge rather than trusting the
+    // caller's claimed bytes.
+    git(integrationWorktree, 'reset', '--hard', bundle.headSha);
+    writeFileSync(join(integrationWorktree, 'README.md'),
+      '# E2E fixture\nbundle-slot: base\nshared-slot: unchanged\nupstream-slot: newer destination change\n');
+    git(integrationWorktree, 'add', '--', 'README.md');
+    git(integrationWorktree, 'commit', '-qm', 'test: advance same destination file');
+    const mergeParentSha = git(integrationWorktree, 'rev-parse', 'HEAD');
+    writeFileSync(join(integrationWorktree, 'README.md'),
+      '# E2E fixture\nbundle-slot: Automatic supervision progresses exact validated work.\nshared-slot: unchanged\nupstream-slot: newer destination change\n');
     git(integrationWorktree, 'add', '--', 'README.md');
     git(integrationWorktree, 'commit', '-qm', 'docs: e2e automatic supervision');
     const commitSha = git(integrationWorktree, 'rev-parse', 'HEAD');
@@ -445,7 +459,13 @@ describe('E2E: automatic supervision progression lifecycle', () => {
 
     const firstFinalization = await brainMemory[MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE](finalization);
     await expect(Promise.resolve(firstFinalization))
-      .resolves.toMatchObject({ status: 'ok', idempotentReplay: false, item: { status: 'finalized', commitSha } });
+      .resolves.toMatchObject({
+        status: 'ok', idempotentReplay: false,
+        item: {
+          status: 'finalized', commitSha,
+          finalization: { mergedWithNewerBase: [{ path: 'README.md', parentSha: mergeParentSha }] },
+        },
+      });
     const backfillEvents = registry.listEvents(created.taskId).slice(beforeBackfillEvents);
     expect(backfillEvents.some((event) => (
       event.assignmentId === owner.assignmentId && event.status === 'ready_for_integration'

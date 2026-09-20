@@ -1642,6 +1642,44 @@ describe('SupervisionTaskRegistry', () => {
     registry.close();
   });
 
+  it.each([
+    ['subset', ['src/final-a.ts']],
+    ['superset', ['src/final-a.ts', 'src/final-b.ts', 'src/reported-only.ts']],
+    ['omitted', undefined],
+  ] as const)('persists %s caller ownedFiles without treating it as bundle authority', (_label, ownedFiles) => {
+    const registry = makeRegistry();
+    const shape = prepareStructuredFinalizationShape(registry, `structured-owned-files-${_label}`);
+    const request = { ...shape.finalization, identity: shape.owner.identity } as typeof shape.finalization & {
+      identity: typeof shape.owner.identity;
+      ownedFiles?: readonly string[];
+    };
+    if (ownedFiles === undefined) delete request.ownedFiles;
+    else request.ownedFiles = [...ownedFiles];
+    expect(registry.finalizeIntegration(request)).toMatchObject({
+      ok: true,
+      value: { finalization: { ownedFiles: ownedFiles ?? [] } },
+    });
+    registry.close();
+  });
+
+  it('persists daemon-verified newer-base merge provenance in the finalization record', () => {
+    const registry = makeRegistry();
+    const shape = prepareStructuredFinalizationShape(registry, 'structured-merge-provenance');
+    const mergedWithNewerBase = [
+      { path: 'src/final-a.ts', parentSha: 'a'.repeat(40) },
+      { path: 'src/final-b.ts', parentSha: 'a'.repeat(40) },
+    ];
+    expect(registry.finalizeIntegration({
+      ...shape.finalization,
+      identity: shape.owner.identity,
+      mergedWithNewerBase,
+    })).toMatchObject({
+      ok: true,
+      value: { finalization: { mergedWithNewerBase } },
+    });
+    registry.close();
+  });
+
   it('preflights the tsk_hnh implementing owner, binds PASS without hidden finish, and CAS-finalizes once', () => {
     const dir = mkdtempSync(join(tmpdir(), 'imcodes-integration-preflight-restart-'));
     const dbPath = join(dir, 'supervision-state.sqlite');

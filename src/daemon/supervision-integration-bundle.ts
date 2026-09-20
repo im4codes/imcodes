@@ -5,6 +5,7 @@ import {
   copyFileSync,
   existsSync,
   lstatSync,
+  mkdtempSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -14,7 +15,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 
@@ -308,6 +309,77 @@ function gitShowState(
   return { sha256: sha256(shown.stdout), mode: mode === '100755' ? 0o755 : 0o644 };
 }
 
+interface GitFileState {
+  bytes: Buffer;
+  sha256: string;
+  mode: 0o644 | 0o755;
+}
+
+function gitShowFileState(
+  worktreePath: string,
+  headSha: string,
+  path: string,
+): GitFileState | undefined {
+  const shown = spawnSync('git', ['-C', worktreePath, 'show', `${headSha}:${path}`], {
+    stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024,
+  });
+  if (shown.error || shown.status !== 0 || !Buffer.isBuffer(shown.stdout)) return undefined;
+  const state = gitShowState(worktreePath, headSha, path);
+  return state ? { ...state, bytes: shown.stdout } : undefined;
+}
+
+function sameGitFileState(left: GitFileState | undefined, right: GitFileState | undefined): boolean {
+  return left?.sha256 === right?.sha256 && left?.mode === right?.mode;
+}
+
+function mergeFileMode(
+  base: GitFileState | undefined,
+  ours: GitFileState | undefined,
+  theirs: GitFileState | undefined,
+): 0o644 | 0o755 | undefined | null {
+  const baseMode = base?.mode;
+  const oursMode = ours?.mode;
+  const theirsMode = theirs?.mode;
+  if (oursMode === theirsMode) return oursMode;
+  if (oursMode === baseMode) return theirsMode;
+  if (theirsMode === baseMode) return oursMode;
+  return null;
+}
+
+/**
+ * Compute the exact merge result for one bundle path without trusting caller
+ * bytes. `undefined` is a legitimate deleted result; `null` is a conflict or
+ * unsupported/binary merge and therefore fails closed.
+ */
+function mergeGitFileStates(
+  base: GitFileState | undefined,
+  ours: GitFileState | undefined,
+  theirs: GitFileState | undefined,
+): GitFileState | undefined | null {
+  if (sameGitFileState(ours, theirs)) return ours;
+  if (sameGitFileState(ours, base)) return theirs;
+  if (sameGitFileState(theirs, base)) return ours;
+  if (!base || !ours || !theirs) return null;
+  const mode = mergeFileMode(base, ours, theirs);
+  if (mode === null || mode === undefined) return null;
+  const root = mkdtempSync(join(tmpdir(), 'imcodes-integration-merge-'));
+  try {
+    const oursPath = join(root, 'ours');
+    const basePath = join(root, 'base');
+    const theirsPath = join(root, 'theirs');
+    writeFileSync(oursPath, ours.bytes);
+    writeFileSync(basePath, base.bytes);
+    writeFileSync(theirsPath, theirs.bytes);
+    const merged = spawnSync('git', ['merge-file', '--stdout', oursPath, basePath, theirsPath], {
+      stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024,
+    });
+    if (merged.error || merged.status !== 0 || !Buffer.isBuffer(merged.stdout)) return null;
+    return { bytes: merged.stdout, sha256: sha256(merged.stdout), mode };
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
 function targetFileState(path: string): { kind: 'absent' } | {
   kind: 'file'; sha256: string; mode: 0o644 | 0o755;
 } | { kind: 'unsafe' } {
@@ -409,7 +481,13 @@ export function applySupervisionIntegrationBundle(input: {
       }
     }
     const changed = gitChangedPaths(worktreePath);
-    if (changed.length !== expectedPaths.size || changed.some((path) => !expectedPaths.has(path))) {
+    // A frozen bundle may include scope-authorized files whose desired bytes
+    // already equal HEAD.  The per-file verification above proves every
+    // desired byte (including deletions and modes); requiring every manifest
+    // path to also appear in `git diff` incorrectly rejects that valid shape
+    // after the bundle has already been applied.  Only paths outside the
+    // immutable bundle are conflicts.
+    if (changed.some((path) => !expectedPaths.has(path))) {
       return { ok: false, reason: 'target_conflict', path: changed.find((path) => !expectedPaths.has(path)) };
     }
     return { ok: true, replay: false };
@@ -423,12 +501,15 @@ export function verifySupervisionIntegrationCommit(input: {
   bundle: SupervisionIntegrationBundle;
   worktreePath: string;
   commitSha: string;
-}): SupervisionIntegrationBundleResult<Record<never, never>> {
+}): SupervisionIntegrationBundleResult<{
+  mergedWithNewerBase?: readonly { path: string; parentSha: string }[];
+}> {
   const verified = verifySupervisionIntegrationBundle(input.bundle);
   if (!verified.ok) return verified;
   const commitSha = input.commitSha.trim().toLowerCase();
   if (!COMMIT_RE.test(commitSha)) return { ok: false, reason: 'invalid' };
   let worktreePath: string;
+  let parentSha: string;
   try {
     worktreePath = realpathSync(resolve(input.worktreePath));
     const root = realpathSync(execFileSync('git', ['-C', worktreePath, 'rev-parse', '--show-toplevel'], {
@@ -437,15 +518,45 @@ export function verifySupervisionIntegrationCommit(input: {
     const resolvedCommit = execFileSync('git', ['-C', worktreePath, 'rev-parse', `${commitSha}^{commit}`], {
       encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
     }).trim().toLowerCase();
+    parentSha = execFileSync('git', ['-C', worktreePath, 'rev-parse', `${commitSha}^1`], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim().toLowerCase();
     if (root !== worktreePath || resolvedCommit !== commitSha) return { ok: false, reason: 'target_conflict' };
+    const ancestry = spawnSync('git', [
+      '-C', worktreePath, 'merge-base', '--is-ancestor', input.bundle.headSha, parentSha,
+    ], { stdio: ['ignore', 'ignore', 'ignore'] });
+    if (ancestry.error || ancestry.status !== 0) return { ok: false, reason: 'target_conflict' };
   } catch { return { ok: false, reason: 'unavailable' }; }
+  const mergedWithNewerBase: Array<{ path: string; parentSha: string }> = [];
   for (const file of input.bundle.files) {
-    const actual = gitShowState(worktreePath, commitSha, file.path);
-    if (file.deleted === true) {
-      if (actual !== undefined) return { ok: false, reason: 'hash_mismatch', path: file.path };
-    } else if (actual?.sha256 !== file.sha256 || actual?.mode !== file.mode) {
+    const actual = gitShowFileState(worktreePath, commitSha, file.path);
+    const base = gitShowFileState(worktreePath, input.bundle.headSha, file.path);
+    const ours = gitShowFileState(worktreePath, parentSha, file.path);
+    const exactBundleState = file.deleted === true
+      ? actual === undefined
+      : actual?.sha256 === file.sha256 && actual?.mode === file.mode;
+    // A divergent result is admissible only when the destination actually
+    // moved this exact path after the frozen base. Otherwise the immutable
+    // bundle byte remains the sole authority.
+    if (sameGitFileState(base, ours)) {
+      if (exactBundleState) continue;
       return { ok: false, reason: 'hash_mismatch', path: file.path };
     }
+    const theirs = file.deleted === true ? undefined : (() => {
+      try {
+        const bytes = readFileSync(resolve(input.bundle.bundlePath, 'files', file.path));
+        return { bytes, sha256: sha256(bytes), mode: file.mode! };
+      } catch { return null; }
+    })();
+    if (theirs === null) return { ok: false, reason: 'hash_mismatch', path: file.path };
+    const expected = mergeGitFileStates(base, ours, theirs);
+    if (expected === null || !sameGitFileState(actual, expected)) {
+      return { ok: false, reason: 'hash_mismatch', path: file.path };
+    }
+    mergedWithNewerBase.push({ path: file.path, parentSha });
   }
-  return { ok: true };
+  return {
+    ok: true,
+    ...(mergedWithNewerBase.length > 0 ? { mergedWithNewerBase } : {}),
+  };
 }

@@ -4587,6 +4587,16 @@ export async function dispatchReadyIntegration(
     if (!created.ok) return { status: 'blocked', reason: `integration owner materialization rejected: ${created.reason}`, reported: false };
     owner = created.value;
   }
+  const blockedAfterOwner = (reason: string): DeterministicContinuationDispatchResult => {
+    const recorded = registry.recordIntegrationDispatchBlocker({
+      taskId: task.taskId,
+      assignmentId: owner!.assignmentId,
+      revision,
+      reason,
+      now: (deps.now ?? Date.now)(),
+    });
+    return { status: 'blocked', reason, reported: recorded.ok };
+  };
   let integrationWorktree: string | undefined;
   if (integrationArtifact.bundle) {
     const ensured = await (deps.ensureIntegrationWorktree ?? defaultEnsureSupervisionAssignmentWorktree)({
@@ -4596,24 +4606,27 @@ export async function dispatchReadyIntegration(
       baseRevision: integrationArtifact.bundle.headSha,
     });
     if (!ensured.ok) {
-      return {
-        status: 'blocked',
-        reason: `integration bundle worktree provisioning rejected: ${ensured.reason}`,
-        reported: false,
-      };
+      return blockedAfterOwner(`integration bundle worktree provisioning rejected: ${ensured.reason}`);
     }
     const applied = (deps.applyIntegrationBundle ?? applySupervisionIntegrationBundle)({
       bundle: integrationArtifact.bundle,
       worktreePath: ensured.worktreePath,
     });
     if (!applied.ok) {
-      return {
-        status: 'blocked',
-        reason: `integration bundle apply rejected: ${applied.reason}${applied.path ? `:${applied.path}` : ''}`,
-        reported: false,
-      };
+      return blockedAfterOwner(
+        `integration bundle apply rejected: ${applied.reason}${applied.path ? `:${applied.path}` : ''}`,
+      );
     }
     integrationWorktree = ensured.worktreePath;
+  }
+  const clearedDispatchBlocker = registry.clearIntegrationDispatchBlocker({
+    taskId: task.taskId,
+    assignmentId: owner.assignmentId,
+    revision,
+    now: (deps.now ?? Date.now)(),
+  });
+  if (!clearedDispatchBlocker.ok) {
+    return blockedAfterOwner(`integration dispatch blocker recovery rejected: ${clearedDispatchBlocker.reason}`);
   }
   // Reuse the registry's receipt-authenticated, atomic finish path rather than
   // copying PASS fields onto a delegated row. That path binds the exact final
@@ -4626,7 +4639,7 @@ export async function dispatchReadyIntegration(
     revision,
   });
   if (!readyOwner.ok) {
-    return { status: 'blocked', reason: `integration owner PASS bind rejected: ${readyOwner.reason}`, reported: false };
+    return blockedAfterOwner(`integration owner PASS bind rejected: ${readyOwner.reason}`);
   }
   owner = readyOwner.value;
   if (owner.status !== 'ready_for_integration'
@@ -4634,7 +4647,7 @@ export async function dispatchReadyIntegration(
     || owner.auditRevision !== revision
     || owner.verdict?.trim().toUpperCase() !== 'PASS'
     || owner.crossVendorAuditPassed !== true) {
-    return { status: 'blocked', reason: 'integration owner PASS bind did not converge', reported: false };
+    return blockedAfterOwner('integration owner PASS bind did not converge');
   }
   const messageId = deterministicSendMessageId(`auto-integration:${owner.assignmentId}:${revision}:${implementer.auditAttemptId}`);
   const queueReference: QueueSupervisionReference = {
@@ -4672,7 +4685,7 @@ export async function dispatchReadyIntegration(
     internalQueueSupervisionReference: queueReference,
   });
   if (result.status !== 'accepted') {
-    return { status: 'blocked', reason: result.status === 'error' ? result.error : `integration dispatch ${result.status}`, reported: false };
+    return blockedAfterOwner(result.status === 'error' ? result.error : `integration dispatch ${result.status}`);
   }
   return { status: 'dispatched', assignmentId: owner.assignmentId, messageId };
 }

@@ -349,7 +349,6 @@ const REPLAY_ATTRIBUTION_FIELDS = [
   ['externalRunId', 'conflicting_replay'],
   ['externalHeadSha', 'conflicting_replay'],
   ['externalTaskId', 'conflicting_replay'],
-  ['ownedFiles', 'conflicting_replay'],
   ['integrationManifest', 'conflicting_replay'],
 ] as const satisfies readonly (readonly [SupervisionIntegrationField, SupervisionIntegrationRefusalCode])[];
 
@@ -393,7 +392,9 @@ export function validateSupervisionIntegrationEvidence(input: {
     if (!parsedRef.ok) issue(refusals, 'invalid_format', 'pushRemoteRef', parsedRef.expected, pushRemoteRef);
   }
 
-  const ownedFiles = stringArray(evidence.ownedFiles);
+  // `ownedFiles` is caller-reported provenance only.  Omission is the empty
+  // report; it is never an authority/path-set assertion.
+  const ownedFiles = evidence.ownedFiles === undefined ? [] : stringArray(evidence.ownedFiles);
   const integrationManifest = manifestValue(evidence.integrationManifest);
   const stagedPaths = stringArray(evidence.stagedPaths);
   const conflictedPaths = stringArray(evidence.conflictedPaths);
@@ -493,7 +494,6 @@ export function resolveSupervisionIntegrationPolicy(input: {
     auditAttemptId: evidence.auditAttemptId,
     auditRevision: evidence.auditRevision,
     verdict: evidence.verdict,
-    ownedFiles: evidence.ownedFiles,
     integrationManifest: evidence.integrationManifest,
     integrationOwner: evidence.integrationOwner,
     commitSha: evidence.commitSha,
@@ -607,12 +607,6 @@ export function resolveSupervisionIntegrationPolicy(input: {
     || JSON.stringify(snapshot.bundle.files) !== JSON.stringify(evidence.integrationManifest)) {
     issue(refusals, 'bundle_mismatch', 'bundle', 'exact task/revision/manifest');
   }
-  const bundlePaths = [...(snapshot.bundle?.ownedFiles
-    ?? snapshot.bundle?.files.map((entry) => entry.path)
-    ?? [])].sort();
-  if (bundlePaths && JSON.stringify(bundlePaths) !== JSON.stringify(evidence.ownedFiles)) {
-    issue(refusals, 'bundle_mismatch', 'ownedFiles', 'exact bundle path set');
-  }
   if (snapshot.expectedPushRemoteRef !== evidence.pushRemoteRef) {
     issue(refusals, 'remote_drift', 'remoteRef', snapshot.expectedPushRemoteRef, evidence.pushRemoteRef);
   }
@@ -692,7 +686,6 @@ export function resolveSupervisionIntegrationPolicy(input: {
       auditAttemptId: evidence.auditAttemptId,
       auditRevision: evidence.auditRevision,
       integrationOwner: evidence.integrationOwner,
-      ownedFiles: evidence.ownedFiles,
       integrationManifest: evidence.integrationManifest,
       pushRemoteRef: evidence.pushRemoteRef,
       // CI run metadata is deliberately NOT part of the pre-Git authority
