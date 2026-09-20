@@ -4,7 +4,7 @@
  * Tests for sub-session metadata propagation via subsession.created and subsession.sync.
  * Verifies that provider display metadata (model, plan, quota) survives the WS → hook → state pipeline.
  */
-import { render, cleanup, waitFor, act } from '@testing-library/preact';
+import { render, cleanup, waitFor, act, screen } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   SUPERVISION_MODE,
@@ -12,11 +12,18 @@ import {
 } from '@shared/supervision-config.js';
 import { useSubSessions, type SubSession } from '../src/hooks/useSubSessions.js';
 import { createSubSession, listSubSessions, patchSubSession } from '../src/api.js';
+import { SupervisionHeartbeatBadge } from '../src/components/SupervisionHeartbeatBadge.js';
 
 vi.mock('../src/api.js', () => ({
   listSubSessions: vi.fn().mockResolvedValue([]),
   createSubSession: vi.fn(),
   patchSubSession: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string) => key,
+  }),
 }));
 
 type MsgHandler = (msg: any) => void;
@@ -267,7 +274,7 @@ describe('sub-session metadata via subsession.sync', () => {
     expect(captured[0].effort).toBe('high');
   });
 
-  it('applies, preserves, and clears a typed heartbeat schedule on subsession sync', async () => {
+  it('applies and preserves a typed heartbeat schedule through subsession sync into the badge, then clears it', async () => {
     const { ws, send } = createMockWs();
     render(<Harness ws={ws} connected={true} />);
     await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
@@ -284,6 +291,12 @@ describe('sub-session metadata via subsession.sync', () => {
 
     act(() => send({ type: 'subsession.sync', id: 'heartbeat', modelDisplay: 'gpt-5.6-sol' }));
     expect(captured[0].supervisionHeartbeat?.state).toBe('armed');
+    render(<SupervisionHeartbeatBadge
+      mode={SUPERVISION_MODE.SUPERVISED_AUDIT}
+      heartbeat={captured[0].supervisionHeartbeat}
+    />);
+    expect(screen.getByRole('timer').textContent).toContain('❤️00:10');
+    expect(screen.queryByText('⏸️')).toBeNull();
     act(() => send({ type: 'subsession.sync', id: 'heartbeat', supervisionHeartbeat: null }));
     expect(captured[0].supervisionHeartbeat).toBeNull();
   });

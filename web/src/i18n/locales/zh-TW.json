@@ -759,7 +759,7 @@
       "title": "工作階段監督",
       "help": "設定一套供所有 Auto 會話共用的全域監督執行環境。",
       "heartbeat": {
-        "paused": "監督已開啟；目前未安排心跳",
+        "idle": "監督已開啟；目前未安排心跳",
         "needsInput": "監督需要你輸入；心跳已暫停",
         "sending": "傳送中…",
         "armedLabel": "{{kind}}心跳將在 {{countdown}} 後觸發；預定時間 {{time}}",

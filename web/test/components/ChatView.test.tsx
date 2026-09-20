@@ -222,7 +222,7 @@ describe('assistant execution status chips', () => {
 
   it.each([
     [SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING, 'Waiting', 'waiting', '⏳'],
-    [SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT, 'Needs input', 'needs-input', '❗'],
+    [SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT, 'Needs input', 'needs-input', '⏸️'],
   ])('renders a completed %s marker as an accessible chip while hiding the marker', (marker, label, stateClass, glyph) => {
     const { container } = render(
       <ChatView

@@ -759,7 +759,7 @@
       "title": "Session supervision",
       "help": "Set one global supervisor runtime shared by every Auto-enabled session.",
       "heartbeat": {
-        "paused": "Supervision is on; no heartbeat is scheduled",
+        "idle": "Supervision is on; no heartbeat is scheduled",
         "needsInput": "Supervision needs your input; heartbeat paused",
         "sending": "sending…",
         "armedLabel": "{{kind}} heartbeat in {{countdown}}; scheduled for {{time}}",

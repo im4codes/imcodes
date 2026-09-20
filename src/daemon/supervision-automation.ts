@@ -2737,7 +2737,7 @@ class SupervisionAutomation {
 
   private clearWaitingTimers(
     run: ActiveTaskRunState,
-    options: { preserveWindow?: boolean } = {},
+    options: { preserveWindow?: boolean; publish?: boolean } = {},
   ): void {
     if (run.waitingTimeoutTimer) clearTimeout(run.waitingTimeoutTimer);
     if (run.waitingHeartbeatTimer) clearTimeout(run.waitingHeartbeatTimer);
@@ -2752,7 +2752,7 @@ class SupervisionAutomation {
       run.waitingDeadlineAt = undefined;
       run.waitingNextHeartbeatAt = undefined;
     }
-    this.publishHeartbeatProjection(run.sessionName, run.snapshot);
+    if (options.publish !== false) this.publishHeartbeatProjection(run.sessionName, run.snapshot);
   }
 
   private deletePersistedWaitState(sessionName: string): void {
@@ -2942,8 +2942,8 @@ class SupervisionAutomation {
   /** Simulates process-memory loss while retaining SQLite authority. */
   __simulateProcessRestartForTests(): void {
     for (const run of this.activeRuns.values()) {
-      this.clearWaitingTimers(run, { preserveWindow: true });
-      this.clearAuditDeadline(run);
+      this.clearWaitingTimers(run, { preserveWindow: true, publish: false });
+      this.clearAuditDeadline(run, { publish: false });
       this.clearAuditTargetRecoveryTimer(run);
       this.clearCompletionGrace(run);
     }
@@ -3535,7 +3535,11 @@ class SupervisionAutomation {
     run: ActiveTaskRunState,
     options: { preserveSchedule?: boolean } = {},
   ): void {
-    this.clearWaitingTimers(run, { preserveWindow: true });
+    // Timer replacement is one atomic schedule transition to clients. Do not
+    // publish a synthetic IDLE between clearing the old timer and arming the
+    // next deadline; a coalesced session_list refresh can otherwise render a
+    // false no-heartbeat badge while the run remains durably parked.
+    this.clearWaitingTimers(run, { preserveWindow: true, publish: false });
     if (!isAutomaticSupervisionEnabled(run.snapshot)) return;
     const now = Date.now();
     run.waitingStartedAt ??= now;
@@ -4274,7 +4278,10 @@ class SupervisionAutomation {
     // produced this turn, so the run is no longer parked; leaving the timer
     // armed across the await lets it fire mid-decision, finish the run, and
     // silently discard the very verdict it was waiting for.
-    this.clearWaitingTimers(current, { preserveWindow: true });
+    // Keep the last armed projection authoritative while the asynchronous
+    // WAITING evidence check runs. Its outcome publishes the real successor
+    // (re-armed, needs-input, continue, or terminal) without an IDLE flicker.
+    this.clearWaitingTimers(current, { preserveWindow: true, publish: false });
 
     // Normal execution turns carry one exact, prefixed status marker. The
     // parser accepts the last active marker for compatibility/liveness when a
@@ -4319,7 +4326,7 @@ class SupervisionAutomation {
     latest.evaluating = false;
     // A new evaluation means the park (if any) is over; the branch below
     // re-arms it when the decision is still `waiting`.
-    this.clearWaitingTimers(latest, { preserveWindow: true });
+    this.clearWaitingTimers(latest, { preserveWindow: true, publish: false });
     // This compatibility seam exists only for the retired in-process audit
     // harness and cannot be enabled outside NODE_ENV=test. Production never
     // treats standalone assistant prose as an authenticated audit receipt.
@@ -4722,14 +4729,14 @@ class SupervisionAutomation {
   ): void {
     const run = this.activeRuns.get(sessionName);
     if (!run) return;
-    this.clearAuditDeadline(run);
+    if (state === 'needs_input') this.heartbeatPausedForNeedsInput.add(sessionName);
+    this.clearAuditDeadline(run, { publish: false });
     this.clearAuditTargetRecovery(run);
-    this.clearWaitingTimers(run);
+    this.clearWaitingTimers(run, { publish: false });
     this.clearCompletionGrace(run);
     this.resetImplicitCompletionWait(sessionName);
     this.deletePersistedWaitState(sessionName);
     run.terminalState = state;
-    if (state === 'needs_input') this.heartbeatPausedForNeedsInput.add(sessionName);
     this.activeRuns.delete(sessionName);
     if (!options.preserveStatus) this.clearStatus(sessionName);
     this.publishHeartbeatProjection(sessionName, run.snapshot);

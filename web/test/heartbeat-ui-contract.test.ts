@@ -37,7 +37,7 @@ describe('heartbeat UI wiring and accessibility contract', () => {
     for (const locale of locales) {
       const json = JSON.parse(readFileSync(resolve(WEB_ROOT, `src/i18n/locales/${locale}.json`), 'utf8'));
       expect(json.session.supervision.heartbeat).toMatchObject({
-        paused: expect.any(String),
+        idle: expect.any(String),
         needsInput: expect.any(String),
         sending: expect.any(String),
         armedLabel: expect.stringContaining('{{countdown}}'),

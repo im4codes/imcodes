@@ -30,19 +30,21 @@ export function SupervisionHeartbeatBadge({
   heartbeat?: SupervisionHeartbeatSnapshot | null;
 }) {
   const { t } = useTranslation();
-  if (mode === SUPERVISION_MODE.OFF || heartbeat?.state === SUPERVISION_HEARTBEAT_STATE.OFF) return null;
+  if (mode === SUPERVISION_MODE.OFF
+    || !heartbeat
+    || heartbeat.state === SUPERVISION_HEARTBEAT_STATE.OFF) return null;
 
-  const state = heartbeat?.state ?? SUPERVISION_HEARTBEAT_STATE.IDLE;
+  const state = heartbeat.state;
   if (state === SUPERVISION_HEARTBEAT_STATE.PAUSED_NEEDS_INPUT) {
     const label = t('session.supervision.heartbeat.needsInput');
     return <span class="supervision-heartbeat-badge is-needs-input" role="status" aria-label={label} title={label}>{SUPERVISION_HEARTBEAT_GLYPH.NEEDS_INPUT}</span>;
   }
-  if (!heartbeat
-    || state !== SUPERVISION_HEARTBEAT_STATE.ARMED
-    || heartbeat.nextHeartbeatAt === undefined) {
-    const label = t('session.supervision.heartbeat.paused');
-    return <span class="supervision-heartbeat-badge is-paused" role="status" aria-label={label} title={label}>{SUPERVISION_HEARTBEAT_GLYPH.IDLE}</span>;
+  if (state === SUPERVISION_HEARTBEAT_STATE.IDLE) {
+    const label = t('session.supervision.heartbeat.idle');
+    return <span class="supervision-heartbeat-badge is-idle" role="status" aria-label={label} title={label}>{SUPERVISION_HEARTBEAT_GLYPH.IDLE}</span>;
   }
+  if (state !== SUPERVISION_HEARTBEAT_STATE.ARMED
+    || heartbeat.nextHeartbeatAt === undefined) return null;
 
   return (
     <ArmedSupervisionHeartbeatBadge

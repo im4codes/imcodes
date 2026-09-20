@@ -36,6 +36,8 @@ import { getTransportQueueStore } from '../../src/daemon/transport-queue-store.j
 import {
   clearSupervisionHeartbeatProjectionsForTests,
   getSupervisionHeartbeatProjection,
+  getSupervisionHeartbeatProjectionForWire,
+  setSupervisionHeartbeatProjectionListener,
 } from '../../src/daemon/supervision-heartbeat-projection.js';
 
 const mockStartP2pRun = vi.fn();
@@ -5744,6 +5746,8 @@ describe('SupervisionAutomation', () => {
         kind: 'waiting',
         nextHeartbeatAt: Date.now() + 10 * 60_000,
       });
+      const projectionListener = vi.fn();
+      setSupervisionHeartbeatProjectionListener(projectionListener);
 
       await vi.advanceTimersByTimeAsync(10 * 60_000 - 1);
       expect(mockTransportRuntime.send).not.toHaveBeenCalled();
@@ -5762,6 +5766,16 @@ describe('SupervisionAutomation', () => {
         state: 'armed',
         kind: 'waiting',
         nextHeartbeatAt: Date.now() + 10 * 60_000,
+      });
+
+      projectionListener.mockClear();
+      completeTurn(`仍在等待同一外部回执。\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(projectionListener.mock.calls.map((call) => call[1]?.state)).not.toContain('idle');
+      expect(getSupervisionHeartbeatProjection('deck_supervision_brain')).toMatchObject({
+        state: 'armed',
+        kind: 'waiting',
       });
     } finally {
       vi.useRealTimers();
@@ -5807,6 +5821,12 @@ describe('SupervisionAutomation', () => {
         state: 'armed',
         kind: 'waiting',
         nextHeartbeatAt: expect.any(Number),
+      });
+      expect(getSupervisionHeartbeatProjectionForWire('deck_supervision_brain')).toMatchObject({
+        state: 'armed',
+        kind: 'waiting',
+        nextHeartbeatAt: expect.any(Number),
+        updatedAt: Date.now(),
       });
 
       await vi.advanceTimersByTimeAsync(10 * 60_000);
@@ -6104,6 +6124,12 @@ describe('SupervisionAutomation', () => {
         waitingStartedAt: expect.any(Number),
       });
       expect(getSession('deck_supervision_brain')?.sessionInstanceId).toBe(mainIdentity);
+      expect(getSupervisionHeartbeatProjectionForWire('deck_supervision_brain')).toMatchObject({
+        state: 'armed',
+        kind: 'waiting',
+        nextHeartbeatAt: Date.now() + 4 * 60_000,
+        updatedAt: Date.now(),
+      });
 
       await vi.advanceTimersByTimeAsync(4 * 60_000);
       expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);

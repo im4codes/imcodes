@@ -759,7 +759,7 @@
       "title": "会话监督",
       "help": "设置一套供所有 Auto 会话共用的全局监督运行时。",
       "heartbeat": {
-        "paused": "监督已开启；当前未安排心跳",
+        "idle": "监督已开启；当前未安排心跳",
         "needsInput": "监督需要你输入；心跳已暂停",
         "sending": "发送中…",
         "armedLabel": "{{kind}}心跳将在 {{countdown}} 后触发；计划时间 {{time}}",

@@ -759,7 +759,7 @@
       "title": "Supervisión de sesión",
       "help": "Configura un runtime global de supervisión compartido por todas las sesiones con Auto.",
       "heartbeat": {
-        "paused": "La supervisión está activa; no hay ningún latido programado",
+        "idle": "La supervisión está activa; no hay ningún latido programado",
         "needsInput": "La supervisión necesita tu intervención; latido en pausa",
         "sending": "enviando…",
         "armedLabel": "Latido de {{kind}} en {{countdown}}; programado para las {{time}}",

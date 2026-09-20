@@ -28,8 +28,8 @@ export type SupervisionHeartbeatKind =
 /** One source for every heartbeat/wait glyph used by the toolbar and chat. */
 export const SUPERVISION_HEARTBEAT_GLYPH = {
   ARMED: '❤️',
-  IDLE: '⏸️',
-  NEEDS_INPUT: '❗',
+  IDLE: '•',
+  NEEDS_INPUT: '⏸️',
   WAITING: '⏳',
 } as const;
 
