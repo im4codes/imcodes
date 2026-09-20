@@ -47,7 +47,13 @@ export const AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER = '<imcodes-delegat
 export const AGENT_DELEGATION_REPLY_TIMELINE_EVENT = 'delegation.reply' as const;
 export const AGENT_DELEGATION_REPLY_VERSION = 'agent_delegation_reply_v1' as const;
 export const AGENT_DELEGATION_SUPERVISION_TASK_PROJECTION_VERSION = 1 as const;
-export const AGENT_DELEGATION_SUPERVISION_TASK_TITLE_MAX_BYTES = 256;
+/**
+ * A safety bound on the timeline payload, not a display cut: the card wraps the
+ * whole task objective, and a real objective is a few hundred characters.
+ * Readers accept any title that equals its own projection, so titles stored
+ * under the earlier 256-byte bound still validate.
+ */
+export const AGENT_DELEGATION_SUPERVISION_TASK_TITLE_MAX_BYTES = 4096;
 export const AGENT_DELEGATION_REPLY_TOTAL_BYTES = 64 * 1024;
 export const AGENT_DELEGATION_REPLY_RESULT_BYTES = 48 * 1024;
 export const AGENT_DELEGATION_REPLY_TTL_MS = 24 * 60 * 60_000;

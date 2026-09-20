@@ -6,6 +6,7 @@ import { h } from 'preact';
 import { cleanup, fireEvent, render } from '@testing-library/preact';
 import type { TimelineEvent } from '../../src/ws-client.js';
 import { isUserVisible } from '../../src/util/isUserVisible.js';
+import { AGENT_DELEGATION_SUPERVISION_TASK_TITLE_MAX_BYTES } from '@shared/agent-delegation.js';
 
 const fileBrowserProps: any[] = [];
 
@@ -607,7 +608,7 @@ describe('ChatView delegation reply cards', () => {
   it.each([
     ['missing projection', undefined],
     ['malformed projection', { version: 1, taskId: '', assignmentId: 'asg_bad', title: 'LEAKED TITLE' }],
-    ['oversized title', { version: 1, taskId: 'tsk_fallback', assignmentId: 'asg_fallback', title: 'x'.repeat(300) }],
+    ['oversized title', { version: 1, taskId: 'tsk_fallback', assignmentId: 'asg_fallback', title: 'x'.repeat(AGENT_DELEGATION_SUPERVISION_TASK_TITLE_MAX_BYTES + 1) }],
   ])('uses a privacy-safe fallback for %s', (_label, supervisionTask) => {
     const event = makeEvent('delegation.reply', {
       sourceLabel: 'CC4',

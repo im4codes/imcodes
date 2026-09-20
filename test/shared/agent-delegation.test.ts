@@ -8,6 +8,10 @@ import {
   AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER,
   AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER,
   AGENT_DELEGATION_REPLY_VERSION,
+  AGENT_DELEGATION_SUPERVISION_TASK_PROJECTION_VERSION,
+  AGENT_DELEGATION_SUPERVISION_TASK_TITLE_MAX_BYTES,
+  projectAgentDelegationSupervisionTaskTitle,
+  readAgentDelegationSupervisionTaskProjection,
   AGENT_DELEGATION_TARGET_FIELD,
   SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS,
   DELEGATION_REPLY_CAPABLE_AGENT_TYPES,
@@ -465,5 +469,33 @@ describe('Quick Audit orchestration references the audit convergence contract', 
       task: 'discuss the recent work',
     });
     expect(prompt).not.toContain(ref);
+  });
+});
+
+describe('delegation card task title', () => {
+  const objective = "Fix automatic audit routing being rejected with 'task execution pool rejected target: unselected_config' for eligible cross-vendor auditors (route and pool check must use the same identity/config matching for the exact target), and make peer_audit_reply / audit-metadata send rejections report an explicit identity_rejected reason with the mismatched fields instead of internal_error: assignment_mismatch.";
+
+  it('carries a real multi-hundred-character objective whole, without an ellipsis', () => {
+    expect(objective.length).toBeGreaterThan(256);
+    const title = projectAgentDelegationSupervisionTaskTitle(objective);
+    expect(title).toBe(objective);
+    expect(title).not.toContain('…');
+  });
+
+  it('collapses whitespace but still bounds an oversized objective with an ellipsis', () => {
+    expect(projectAgentDelegationSupervisionTaskTitle('a\n  b \t c')).toBe('a b c');
+    const huge = projectAgentDelegationSupervisionTaskTitle('x'.repeat(AGENT_DELEGATION_SUPERVISION_TASK_TITLE_MAX_BYTES * 2));
+    expect(huge?.endsWith('…')).toBe(true);
+    expect(new TextEncoder().encode(huge!).byteLength).toBeLessThanOrEqual(AGENT_DELEGATION_SUPERVISION_TASK_TITLE_MAX_BYTES);
+  });
+
+  it('accepts the full title in the timeline projection and still rejects a non-canonical one', () => {
+    const base = {
+      version: AGENT_DELEGATION_SUPERVISION_TASK_PROJECTION_VERSION,
+      taskId: 'tsk_title',
+      assignmentId: 'asg_title',
+    };
+    expect(readAgentDelegationSupervisionTaskProjection({ ...base, title: objective })?.title).toBe(objective);
+    expect(readAgentDelegationSupervisionTaskProjection({ ...base, title: `${objective}\nsecond line` })?.title).toBeUndefined();
   });
 });

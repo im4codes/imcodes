@@ -6,6 +6,7 @@ import {
   AGENT_DELEGATION_REPLY_ERRORS,
   AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
   AGENT_DELEGATION_REPLY_VERSION,
+  AGENT_DELEGATION_SUPERVISION_TASK_TITLE_MAX_BYTES,
 } from '../../shared/agent-delegation.js';
 import {
   PEER_AUDIT_DELEGATED_REPLY_STATUS,
@@ -1156,7 +1157,52 @@ describe('delegation reply ingress', () => {
     );
   });
 
-  it('bounds a long registry objective to one concise UTF-8 title', async () => {
+  it('carries a normal multi-hundred-character registry objective whole on one line', async () => {
+    const taskRecord = {
+      ...record,
+      taskId: 'tsk_whole_title_1',
+      assignmentId: 'asg_whole_title_1',
+      coordinatorAssignmentId: 'asg_whole_title_coordinator_1',
+      result: 'Done.',
+    };
+    mocks.store.receive.mockReturnValue({ ok: true, record: taskRecord, replay: false });
+    mocks.getTaskRecord.mockReturnValue({
+      taskId: taskRecord.taskId,
+      objective: `  ${'界'.repeat(120)} ${'x'.repeat(120)}  `,
+      currentRevision: 'revision-whole_title-1',
+    });
+    mocks.getAssignment.mockImplementation((assignmentId: string) => assignmentId === taskRecord.assignmentId
+      ? {
+          assignmentId,
+          taskId: taskRecord.taskId,
+          role: 'implementer',
+          identity: { ...target, agentType: 'codex-sdk', providerFamily: 'openai' },
+        }
+      : assignmentId === taskRecord.coordinatorAssignmentId
+        ? {
+            assignmentId,
+            taskId: taskRecord.taskId,
+            role: 'coordinator',
+            identity: { ...origin, agentType: 'codex-sdk', providerFamily: 'openai' },
+          }
+        : undefined);
+
+    await expect(submitDelegationReply({
+      rawBody: { ...envelope, result: taskRecord.result },
+      senderSessionName: target.sessionName,
+    })).resolves.toEqual(expect.objectContaining({ ok: true }));
+
+    const payload = mocks.timelineEmit.mock.calls[0]![2] as {
+      supervisionTask?: { title?: string };
+    };
+    const title = payload.supervisionTask?.title ?? '';
+    expect(title).toBe(`${'界'.repeat(120)} ${'x'.repeat(120)}`);
+    expect(title).not.toContain('…');
+    expect(title).not.toContain('\n');
+  });
+
+
+  it('bounds an oversized registry objective to one UTF-8-safe title', async () => {
     const taskRecord = {
       ...record,
       taskId: 'tsk_long_title_1',
@@ -1167,8 +1213,8 @@ describe('delegation reply ingress', () => {
     mocks.store.receive.mockReturnValue({ ok: true, record: taskRecord, replay: false });
     mocks.getTaskRecord.mockReturnValue({
       taskId: taskRecord.taskId,
-      objective: `  ${'界'.repeat(120)}\n${'x'.repeat(120)}  `,
-      currentRevision: 'revision-long-title-1',
+      objective: `  ${'界'.repeat(2000)}\n${'x'.repeat(120)}  `,
+      currentRevision: 'revision-long_title-1',
     });
     mocks.getAssignment.mockImplementation((assignmentId: string) => assignmentId === taskRecord.assignmentId
       ? {
@@ -1197,7 +1243,7 @@ describe('delegation reply ingress', () => {
     const title = payload.supervisionTask?.title ?? '';
     expect(title).toMatch(/…$/u);
     expect(title).not.toContain('\n');
-    expect(new TextEncoder().encode(title).byteLength).toBeLessThanOrEqual(256);
+    expect(new TextEncoder().encode(title).byteLength).toBeLessThanOrEqual(AGENT_DELEGATION_SUPERVISION_TASK_TITLE_MAX_BYTES);
   });
 
 
