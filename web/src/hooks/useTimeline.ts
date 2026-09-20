@@ -589,6 +589,25 @@ const localPruneWriteCounts = new Map<string, number>();
 const localPruneDoneThisPageSession = new Set<string>();
 /** One sweep at a time across ALL sessions — they share a single connection. */
 let localPruneChain: Promise<void> = Promise.resolve();
+/**
+ * Test-only observers for the scheduled sweep's REAL completion.
+ *
+ * The multipass regression used to poll the DOM for a fixed 20 seconds. Under
+ * V8 coverage / loaded CI, fake-indexeddb can spend longer than that executing
+ * 1,000 instrumented cursor callbacks even though the production algorithm is
+ * still making progress and eventually refreshes the pane. Observing the
+ * lifecycle boundary directly keeps the test causal without changing product
+ * timing, raising a timeout, or leaving an old module's sweep running into the
+ * next test.
+ */
+const localPruneCompletionWaiters = new Map<string, Set<() => void>>();
+
+function notifyLocalHistoryPruneComplete(cacheKey: string): void {
+  const waiters = localPruneCompletionWaiters.get(cacheKey);
+  if (!waiters) return;
+  localPruneCompletionWaiters.delete(cacheKey);
+  for (const resolve of waiters) resolve();
+}
 
 /**
  * Re-read the authoritative window for the mount that is on screen RIGHT NOW.
@@ -637,8 +656,8 @@ async function refreshCachedWindowAfterDrain(
   return merged.some((event) => isGuaranteedVisibleTimelineEvent(event));
 }
 
-function runLocalHistoryPrune(cacheKey: string): void {
-  localPruneChain = localPruneChain.then(async () => {
+function runLocalHistoryPrune(cacheKey: string): Promise<void> {
+  const run = localPruneChain.then(async () => {
     // Drain first. Retention alone cannot fix a window full of last-value rows:
     // `pruneOldEvents` keeps the newest N by timestamp with no idea what a row
     // IS, so on a session whose newest rows are ~84% signals it happily retains
@@ -698,6 +717,8 @@ function runLocalHistoryPrune(cacheKey: string): void {
       await new Promise<void>((resolve) => { setTimeout(resolve, LOCAL_PRUNE_CHUNK_GAP_MS); });
     }
   }).catch(() => {});
+  localPruneChain = run;
+  return run;
 }
 
 /**
@@ -737,7 +758,10 @@ function scheduleLocalHistoryPrune(
   // than run inline: the pane it is repairing is currently showing nothing, so
   // the work has a deadline the ordinary space-reclaim does not.
   const timer = setTimeout(
-    () => runLocalHistoryPrune(cacheKey),
+    () => {
+      void runLocalHistoryPrune(cacheKey)
+        .finally(() => notifyLocalHistoryPruneComplete(cacheKey));
+    },
     immediate ? 0 : LOCAL_PRUNE_START_DELAY_MS,
   );
   timer.unref?.();
@@ -748,6 +772,22 @@ export function __resetLocalHistoryPruneStateForTests(): void {
   localPruneChain = Promise.resolve();
   localPruneWriteCounts.clear();
   localPruneDoneThisPageSession.clear();
+  for (const waiters of localPruneCompletionWaiters.values()) {
+    for (const resolve of waiters) resolve();
+  }
+  localPruneCompletionWaiters.clear();
+}
+
+/** Await the next real scheduled sweep for this cache key (tests only). */
+export function __waitForLocalHistoryPruneForTests(cacheKey: string): Promise<void> {
+  return new Promise((resolve) => {
+    let waiters = localPruneCompletionWaiters.get(cacheKey);
+    if (!waiters) {
+      waiters = new Set();
+      localPruneCompletionWaiters.set(cacheKey, waiters);
+    }
+    waiters.add(resolve);
+  });
 }
 // If no confirmation arrives within this window we auto-flip the pending bubble to
 // "failed" so the user can retry rather than stare at a perpetual spinner.

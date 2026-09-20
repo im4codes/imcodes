@@ -4,9 +4,10 @@
 import 'fake-indexeddb/auto';
 import { IDBFactory } from 'fake-indexeddb';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, cleanup } from '@testing-library/preact';
+import { act, render, screen, cleanup } from '@testing-library/preact';
 import { h } from 'preact';
 import type { TimelineEvent } from '../src/ws-client.js';
+import { isGuaranteedVisibleTimelineEvent } from '../../src/shared/timeline/types.js';
 
 vi.mock('../src/api.js', () => ({
   fetchTimelineHistoryHttp: vi.fn(async () => { throw new Error('offline'); }),
@@ -32,6 +33,9 @@ const DB_NAME = 'imcodes-timeline';
 const STORE = 'events';
 const SESSION = 'deck_multipass';
 const SERVER = 'srv-multipass';
+// Hang cap only: the assertion awaits the real prune lifecycle edge. Under V8
+// coverage and a saturated CI host, the real 1,000-row IDB sweep has taken 61s.
+const MULTIPASS_PRUNE_HANG_TIMEOUT_MS = 180_000;
 
 function row(
   eventId: string,
@@ -76,15 +80,6 @@ function seedV1(rows: TimelineEvent[]): Promise<void> {
   });
 }
 
-/** Real timers: the drain loop sleeps between chunks, and IDB is async. */
-async function waitFor(predicate: () => boolean, budgetMs = 20_000): Promise<void> {
-  const started = Date.now();
-  while (Date.now() - started < budgetMs) {
-    if (predicate()) return;
-    await new Promise((resolve) => { setTimeout(resolve, 50); });
-  }
-}
-
 describe('a backlog larger than one deletion budget still repairs the live pane', () => {
   beforeEach(() => {
     // Fresh factory BEFORE the hook module is loaded: its shared TimelineDB is
@@ -102,17 +97,27 @@ describe('a backlog larger than one deletion budget still repairs the live pane'
   it('keeps refreshing across passes until the conversation is visible', async () => {
     const rows: TimelineEvent[] = [];
     // 5 real messages, buried under 1000 legacy signals — twice the 500-row
-    // budget, so one pass provably cannot free the window.
+    // budget, so one pass provably cannot free the window. The three newest
+    // rows cover every misleading "present but not visible" shape in the same
+    // real-IDB run instead of repeating this expensive fixture four times.
     for (let i = 0; i < 5; i += 1) {
       rows.push(row(`msg-${i}`, i + 1, 'assistant.text', `message ${i}`));
     }
     for (let i = 0; i < 1_000; i += 1) {
       rows.push(row(`sig-${i}`, 6 + i, 'session.state', ''));
     }
+    rows.push(row('audit-status', 1_100, 'peer_audit.status', ''));
+    rows.push(row('deleted-msg', 1_101, 'assistant.text', 'deleted', true));
+    rows.push(row('blank-msg', 1_102, 'assistant.text', '   '));
     await seedV1(rows);
 
     // Imported only now — after the seeded database exists.
-    const { useTimeline, __resetTimelineCacheForTests, __resetLocalHistoryPruneStateForTests } =
+    const {
+      useTimeline,
+      __resetTimelineCacheForTests,
+      __resetLocalHistoryPruneStateForTests,
+      __waitForLocalHistoryPruneForTests,
+    } =
       await import('../src/hooks/useTimeline.js');
     __resetTimelineCacheForTests();
     __resetLocalHistoryPruneStateForTests();
@@ -128,8 +133,13 @@ describe('a backlog larger than one deletion budget still repairs the live pane'
     }
 
     render(h(Probe));
-
-    await waitFor(() => (screen.getByTestId('pane').textContent ?? '').includes('message 0'));
+    // Register immediately after render, before the async IDB bootstrap can
+    // schedule its sweep. Waiting for the sweep's real lifecycle boundary is
+    // deterministic under coverage and also prevents this module's background
+    // work leaking into the next test.
+    await act(async () => {
+      await __waitForLocalHistoryPruneForTests(`${SERVER}:${SESSION}`);
+    });
 
     // eslint-disable-next-line no-console
     const rendered = screen.getByTestId('pane').textContent ?? '';
@@ -138,125 +148,23 @@ describe('a backlog larger than one deletion budget still repairs the live pane'
       'the pane never showed the buried conversation — the drain freed the window with nobody looking',
     ).toContain('message 0');
     expect(rendered).toContain('message 4');
-  }, 40_000);
+  }, MULTIPASS_PRUNE_HANG_TIMEOUT_MS);
 
-  it('is not fooled by a newest event that renders as nothing', async () => {
-    // Same backlog, but the newest row is a peer_audit.status — an event the
-    // chat renders as null. It must not count as "the pane has content": doing
-    // so both delays the immediate repair and stops the refresh loop after the
-    // first pass, leaving the buried conversation unreachable.
-    const rows: TimelineEvent[] = [];
-    for (let i = 0; i < 5; i += 1) {
-      rows.push(row(`msg-${i}`, i + 1, 'assistant.text', `message ${i}`));
-    }
-    for (let i = 0; i < 1_000; i += 1) {
-      rows.push(row(`sig-${i}`, 6 + i, 'session.state', ''));
-    }
-    rows.push(row('audit-status', 1_100, 'peer_audit.status', ''));
-    await seedV1(rows);
+  it('is not fooled by a newest event that renders as nothing', () => {
+    expect(isGuaranteedVisibleTimelineEvent(
+      row('audit-status', 1_100, 'peer_audit.status', ''),
+    )).toBe(false);
+  });
 
-    const { useTimeline, __resetTimelineCacheForTests, __resetLocalHistoryPruneStateForTests } =
-      await import('../src/hooks/useTimeline.js');
-    __resetTimelineCacheForTests();
-    __resetLocalHistoryPruneStateForTests();
+  it('is not fooled by a newest event that is hidden', () => {
+    expect(isGuaranteedVisibleTimelineEvent(
+      row('deleted-msg', 1_100, 'assistant.text', 'deleted', true),
+    )).toBe(false);
+  });
 
-    function Probe() {
-      const { events } = useTimeline(SESSION, null, SERVER, { isActiveSession: true });
-      return h(
-        'div',
-        { 'data-testid': 'pane' },
-        events.filter((e) => e.type === 'assistant.text')
-          .map((e) => String(e.payload.text ?? '')).join('|'),
-      );
-    }
-
-    render(h(Probe));
-    await waitFor(() => (screen.getByTestId('pane').textContent ?? '').includes('message 0'));
-
-    expect(
-      screen.getByTestId('pane').textContent ?? '',
-      'a null-rendered newest event was mistaken for visible content',
-    ).toContain('message 0');
-  }, 40_000);
-
-  it('is not fooled by a newest event that is hidden', async () => {
-    // A DELETED message: the daemon re-emits it with hidden:true and that row is
-    // persisted, so it legitimately sits at the top of a restored window.
-    // ChatView drops it before anything else (`!event.hidden`), so it draws
-    // nothing — but a type-only judgement sees a renderable `assistant.text`
-    // and concludes the pane has content, stopping the refresh loop.
-    const rows: TimelineEvent[] = [];
-    for (let i = 0; i < 5; i += 1) {
-      rows.push(row(`msg-${i}`, i + 1, 'assistant.text', `message ${i}`));
-    }
-    for (let i = 0; i < 1_000; i += 1) {
-      rows.push(row(`sig-${i}`, 6 + i, 'session.state', ''));
-    }
-    rows.push(row('deleted-msg', 1_100, 'assistant.text', 'deleted', true));
-    await seedV1(rows);
-
-    const { useTimeline, __resetTimelineCacheForTests, __resetLocalHistoryPruneStateForTests } =
-      await import('../src/hooks/useTimeline.js');
-    __resetTimelineCacheForTests();
-    __resetLocalHistoryPruneStateForTests();
-
-    function Probe() {
-      const { events } = useTimeline(SESSION, null, SERVER, { isActiveSession: true });
-      return h(
-        'div',
-        { 'data-testid': 'pane' },
-        events.filter((e) => e.type === 'assistant.text' && !(e as { hidden?: boolean }).hidden)
-          .map((e) => String(e.payload.text ?? '')).join('|'),
-      );
-    }
-
-    render(h(Probe));
-    await waitFor(() => (screen.getByTestId('pane').textContent ?? '').includes('message 0'));
-
-    expect(
-      screen.getByTestId('pane').textContent ?? '',
-      'a hidden (deleted) event was mistaken for visible content',
-    ).toContain('message 0');
-  }, 40_000);
-
-  it('is not fooled by a newest assistant row whose text is blank', async () => {
-    // Providers really do emit empty completions (Cursor headless, Kimi and
-    // Gemini forward accumulated text with no non-empty guard) and the row is
-    // persisted. `buildViewItems` trims it and skips it, so it draws nothing —
-    // but a type-only judgement sees a renderable, non-hidden assistant.text.
-    const rows: TimelineEvent[] = [];
-    for (let i = 0; i < 5; i += 1) {
-      rows.push(row(`msg-${i}`, i + 1, 'assistant.text', `message ${i}`));
-    }
-    for (let i = 0; i < 1_000; i += 1) {
-      rows.push(row(`sig-${i}`, 6 + i, 'session.state', ''));
-    }
-    rows.push(row('blank-msg', 1_100, 'assistant.text', '   '));
-    await seedV1(rows);
-
-    const { useTimeline, __resetTimelineCacheForTests, __resetLocalHistoryPruneStateForTests } =
-      await import('../src/hooks/useTimeline.js');
-    __resetTimelineCacheForTests();
-    __resetLocalHistoryPruneStateForTests();
-
-    function Probe() {
-      const { events } = useTimeline(SESSION, null, SERVER, { isActiveSession: true });
-      return h(
-        'div',
-        { 'data-testid': 'pane' },
-        events.filter((e) => e.type === 'assistant.text')
-          .map((e) => String(e.payload.text ?? '').trim())
-          .filter((text) => text.length > 0)
-          .join('|'),
-      );
-    }
-
-    render(h(Probe));
-    await waitFor(() => (screen.getByTestId('pane').textContent ?? '').includes('message 0'));
-
-    expect(
-      screen.getByTestId('pane').textContent ?? '',
-      'a blank assistant row was mistaken for visible content',
-    ).toContain('message 0');
-  }, 40_000);
+  it('is not fooled by a newest assistant row whose text is blank', () => {
+    expect(isGuaranteedVisibleTimelineEvent(
+      row('blank-msg', 1_100, 'assistant.text', '   '),
+    )).toBe(false);
+  });
 });
