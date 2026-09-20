@@ -200,6 +200,41 @@ public:
                                 : common::ReadinessState::kUnavailable;
   }
 
+  // The window server's own view of the modifier keys, including whatever a
+  // dead worker left behind. The device-dependent bits name the side; a
+  // modifier reported without one is released on the left key, which is what
+  // the OS reports for a synthetic press that named neither.
+  std::vector<std::string> LatchedModifierKeys() override {
+    if (!AXIsProcessTrusted())
+      return {};
+    const CGEventFlags flags =
+        CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState);
+    std::vector<std::string> latched;
+    const auto collect = [&](CGEventFlags mask, std::uint64_t left_bit,
+                             std::uint64_t right_bit, const char *left,
+                             const char *right) {
+      if ((flags & mask) == 0)
+        return;
+      const bool right_held = (flags & right_bit) != 0;
+      const bool left_held = (flags & left_bit) != 0;
+      if (left_held || !right_held)
+        latched.emplace_back(left);
+      if (right_held)
+        latched.emplace_back(right);
+    };
+    // NX_DEVICE*KEYMASK, the side bits CGEvent carries alongside each
+    // modifier mask.
+    collect(kCGEventFlagMaskControl, 0x00000001, 0x00002000, "ControlLeft",
+            "ControlRight");
+    collect(kCGEventFlagMaskShift, 0x00000002, 0x00000004, "ShiftLeft",
+            "ShiftRight");
+    collect(kCGEventFlagMaskAlternate, 0x00000020, 0x00000040, "AltLeft",
+            "AltRight");
+    collect(kCGEventFlagMaskCommand, 0x00000008, 0x00000010, "MetaLeft",
+            "MetaRight");
+    return latched;
+  }
+
   bool MovePointer(const common::LogicalPoint &point) override {
     if (!AXIsProcessTrusted())
       return false;
@@ -408,6 +443,14 @@ public:
       }
       return true;
     }
+    // A session begins on a clean keyboard. Whatever the window server still
+    // holds down that this adapter never emitted was left by something it no
+    // longer tracks -- a worker killed mid-press, a route lost between a
+    // modifier's down and its up -- and on macOS a latched Control makes
+    // every click a right-click for as long as it lasts (which, without
+    // this, is until the Mac restarts). Before the release below, so this
+    // adapter's own held keys stay with the path that tracks them.
+    ReleaseLatchedModifiersLocked();
     if (!ReleaseAllLocked()) {
       SetError(CGEventInputErrorCode::kEmissionFailed,
                "held input could not be released before topology change");
@@ -619,6 +662,18 @@ private:
       return false;
     }
     return true;
+  }
+
+  // Releases modifiers held by nobody this adapter knows of. Its own emitted
+  // keys are left to ReleaseAllLocked, which also keeps its bookkeeping
+  // straight; a failure here is not fatal to the session that is starting.
+  void ReleaseLatchedModifiersLocked() noexcept {
+    for (const std::string &key : backend_->LatchedModifierKeys()) {
+      if (emitted_keys_.contains(key))
+        continue;
+      if (backend_->EmitKey(key, false))
+        ++statistics_.released_latched_modifiers;
+    }
   }
 
   bool ReleaseAllLocked() noexcept {

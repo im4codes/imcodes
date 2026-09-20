@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 #include <string_view>
 
 #include "../remote-desktop-common/platform_interfaces.h"
@@ -55,6 +56,9 @@ struct CGEventInputStatistics {
   std::uint64_t rejected_topology_events = 0;
   std::uint64_t release_attempts = 0;
   std::uint64_t release_failures = 0;
+  // Modifiers found latched by something other than this session and
+  // released before it began.
+  std::uint64_t released_latched_modifiers = 0;
   std::size_t emitted_keys = 0;
   std::size_t emitted_buttons = 0;
 };
@@ -73,6 +77,13 @@ public:
   virtual bool EmitButton(std::string_view button, bool pressed) = 0;
   virtual bool EmitWheel(double delta_x, double delta_y) = 0;
   virtual bool EmitText(std::string_view text) = 0;
+  // Modifier keys the window server still reports as held, whoever pressed
+  // them. A key-up that never arrived -- a worker killed mid-press, a route
+  // lost between a modifier's down and its up -- latches one until something
+  // releases it or the Mac restarts, and on macOS a latched Control turns
+  // every later click into a right-click. Named in this adapter's own key
+  // vocabulary ("ControlLeft", ...).
+  [[nodiscard]] virtual std::vector<std::string> LatchedModifierKeys() = 0;
 };
 
 // Input ownership, epochs, sequence fencing and controller reference counts

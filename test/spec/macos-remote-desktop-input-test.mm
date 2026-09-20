@@ -39,8 +39,15 @@ public:
   std::string fail_button_release_once;
   bool fail_next_emit = false;
 
+  // What the window server reports as held when the session starts.
+  std::vector<std::string> latched_modifiers;
+
   common::ReadinessState ProbeAccessibility() noexcept override {
     return readiness;
+  }
+
+  std::vector<std::string> LatchedModifierKeys() override {
+    return latched_modifiers;
   }
 
   bool MovePointer(const common::LogicalPoint &point) override {
@@ -138,6 +145,53 @@ std::size_t Count(const std::vector<Transition> &transitions,
       ++count;
   }
   return count;
+}
+
+// A modifier left down by something this adapter never emitted -- a worker
+// killed mid-press -- makes every click a right-click on macOS until it is
+// released. Observed live on a Mac with no keyboard attached: the window
+// server reported ControlRight held, and only a restart cleared it.
+bool TestASessionStartsOnACleanKeyboard() {
+  auto backend = std::make_unique<FakeBackend>();
+  FakeBackend *fake = backend.get();
+  fake->latched_modifiers = {"ControlRight", "ShiftLeft"};
+  input::CGEventInputAdapter adapter(42, std::move(backend));
+  const auto topology = Topology();
+  if (!Check(adapter.BindTopology(topology, topology.displays[0].display_id),
+             "current topology must bind")) {
+    return false;
+  }
+  const bool released =
+      Check(fake->key_events.size() == 2 &&
+                Count(fake->key_events, "ControlRight", false) == 1 &&
+                Count(fake->key_events, "ShiftLeft", false) == 1,
+            "every latched modifier is released before the session starts") &&
+      Check(Count(fake->key_events, "ControlRight", true) == 0 &&
+                Count(fake->key_events, "ShiftLeft", true) == 0,
+            "and none of them is pressed on the way") &&
+      Check(adapter.Statistics().released_latched_modifiers == 2,
+            "the sweep is counted");
+  if (!released)
+    return false;
+
+  // This session's own keys stay this session's business: the sweep leaves
+  // them to the ordinary release path, which keeps its bookkeeping straight.
+  common::InputLedger ledger(adapter);
+  if (!Check(ledger.ApplyKey(Stamp("controller-a", 2), 7, "ControlLeft", true) ==
+                 common::InputResult::kApplied,
+             "a held modifier is applied")) {
+    return false;
+  }
+  fake->latched_modifiers = {"ControlLeft"};
+  fake->key_events.clear();
+  const auto next = Topology(8, 42);
+  return Check(adapter.BindTopology(next, next.displays[0].display_id),
+               "a later topology binds") &&
+         Check(Count(fake->key_events, "ControlLeft", false) == 1,
+               "the session's own held key is released once, by the release "
+               "path rather than twice by the sweep") &&
+         Check(adapter.Statistics().released_latched_modifiers == 2,
+               "and the sweep does not count it");
 }
 
 bool TestLedgerOnlyOperationsAndLogicalGeometry() {
@@ -429,7 +483,8 @@ bool TestBoundedTextCounterfactual() {
 
 int main() {
   @autoreleasepool {
-    return TestLedgerOnlyOperationsAndLogicalGeometry() &&
+    return TestASessionStartsOnACleanKeyboard() &&
+                   TestLedgerOnlyOperationsAndLogicalGeometry() &&
                    TestClipboardShortcutsUseRealBoundInputAndReleaseEveryKey() &&
                    TestTopologyAndSequenceFences() &&
                    TestMultiControllerAndLifecycleRelease() &&
