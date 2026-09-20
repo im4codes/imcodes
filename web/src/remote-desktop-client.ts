@@ -1401,7 +1401,11 @@ export class RemoteDesktopClient {
       this.publish({ stream });
     });
     peer.addEventListener('icecandidate', (event) => {
-      if (!event.candidate || !this.authorityReady()) return;
+      // Gathering ends with a candidate carrying an EMPTY candidate line, and
+      // then with a null one. Firefox emits both (measured on Firefox 156);
+      // Chromium emits only the null one. The empty marker names no address
+      // and nothing can be done with it, so it is not sent.
+      if (!event.candidate?.candidate || !this.authorityReady()) return;
       this.localIceCandidates++;
       if (this.localIceCandidates > REMOTE_DESKTOP_LIMITS.MAX_ICE_CANDIDATES) {
         this.fail(REMOTE_DESKTOP_TERMINAL_REASON.PROTOCOL_ERROR);

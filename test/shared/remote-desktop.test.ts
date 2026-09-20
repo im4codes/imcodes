@@ -73,6 +73,33 @@ const inputBase = {
 };
 
 describe('remote desktop production contract', () => {
+  it('accepts the end-of-candidates marker but still bounds a real candidate', () => {
+    // JSEP ends gathering with an EMPTY candidate line; Firefox sends that
+    // event, Chromium does not. Refusing it made the server stop every
+    // Firefox session with invalid_request.
+    const correlation = {
+      requestId: 'a'.repeat(32),
+      sessionId: 's'.repeat(43),
+      capability: 'c'.repeat(43),
+    };
+    expect(validateRemoteDesktopBrowserMessage({
+      type: REMOTE_DESKTOP_MSG.ICE, ...correlation, candidate: '', mid: '0',
+    }).ok).toBe(true);
+    expect(validateRemoteDesktopBrowserMessage({
+      type: REMOTE_DESKTOP_MSG.ICE, ...correlation, candidate: 'candidate:1 1 UDP 1 10.0.0.1 1 typ host', mid: '0',
+    }).ok).toBe(true);
+    // An empty mid is still malformed, and so is an oversized candidate.
+    expect(validateRemoteDesktopBrowserMessage({
+      type: REMOTE_DESKTOP_MSG.ICE, ...correlation, candidate: '', mid: '',
+    }).ok).toBe(false);
+    expect(validateRemoteDesktopBrowserMessage({
+      type: REMOTE_DESKTOP_MSG.ICE,
+      ...correlation,
+      candidate: 'c'.repeat(REMOTE_DESKTOP_LIMITS.ICE_CANDIDATE_BYTES + 1),
+      mid: '0',
+    }).ok).toBe(false);
+  });
+
   it('keeps the cold Windows negotiation bound above observed startup latency', () => {
     expect(REMOTE_DESKTOP_LIMITS.NEGOTIATION_TIMEOUT_MS).toBe(45_000);
   });

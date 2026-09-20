@@ -26,6 +26,7 @@ import {
   REMOTE_DESKTOP_MODE_REASON,
   REMOTE_DESKTOP_STATE,
   REMOTE_DESKTOP_TERMINAL_REASON,
+  isRemoteDesktopEndOfCandidates,
   validateRemoteDesktopBrowserMessage,
   validateRemoteDesktopDaemonMessage,
   type RemoteDesktopBrowserMessage,
@@ -523,6 +524,11 @@ export class RemoteDesktopRouter {
       }
       route.answerCount++;
     } else if (parsed.value.type === REMOTE_DESKTOP_MSG.ICE) {
+      if (isRemoteDesktopEndOfCandidates(parsed.value.candidate)) {
+        // Same marker, same reasoning, in the other direction.
+        this.counters.dropped++;
+        return true;
+      }
       route.daemonIceCandidates++;
       if (route.daemonIceCandidates > REMOTE_DESKTOP_LIMITS.MAX_ICE_CANDIDATES) {
         this.failRoute(route, REMOTE_DESKTOP_TERMINAL_REASON.PROTOCOL_ERROR, true);
@@ -1636,6 +1642,15 @@ export class RemoteDesktopRouter {
         });
       }
       route.state = REMOTE_DESKTOP_STATE.CONNECTING;
+    } else if (message.type === REMOTE_DESKTOP_MSG.ICE
+      && isRemoteDesktopEndOfCandidates(message.candidate)) {
+      // JSEP's end-of-candidates marker: a candidate event carrying an empty
+      // candidate line, which Firefox emits and Chromium does not. It names
+      // no address, so there is nothing to forward and nothing to count --
+      // and it is emphatically not a malformed message worth ending the
+      // session over, which is what it used to be treated as.
+      this.counters.dropped++;
+      return;
     } else {
       route.browserIceCandidates++;
       if (route.browserIceCandidates > REMOTE_DESKTOP_LIMITS.MAX_ICE_CANDIDATES) {

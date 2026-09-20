@@ -1625,6 +1625,55 @@ describe('RemoteDesktopRouter', () => {
     ))).toBe(false);
   });
 
+  // Firefox ends gathering with a candidate event carrying an EMPTY candidate
+  // line (measured on Firefox 156), then the null one; Chromium emits only
+  // the null one. Refusing the empty one as a malformed message killed every
+  // Firefox session with `invalid_request` the moment gathering finished.
+  it('drops the end-of-candidates marker instead of ending the session', async () => {
+    const f = fixture();
+    const authority = await authorize(f);
+    const daemonBefore = f.daemonMessages.length;
+
+    await f.router.handleBrowser(f.browserA, 'owner-user', {
+      type: REMOTE_DESKTOP_MSG.ICE,
+      ...authority,
+      candidate: '',
+      mid: '0',
+    });
+
+    expect(f.daemonMessages.length).toBe(daemonBefore);
+    expect(f.messages(f.browserA).some((message) => (
+      message.type === REMOTE_DESKTOP_MSG.ERROR || message.type === REMOTE_DESKTOP_MSG.TERMINAL
+    ))).toBe(false);
+
+    // The session is untouched: a real candidate still reaches the daemon.
+    await f.router.handleBrowser(f.browserA, 'owner-user', {
+      type: REMOTE_DESKTOP_MSG.ICE,
+      ...authority,
+      candidate: 'candidate:real 1 UDP 1 10.0.0.1 1 typ host',
+      mid: '0',
+    });
+    expect(f.daemonMessages.at(-1)).toMatchObject({
+      type: REMOTE_DESKTOP_MSG.ICE,
+      candidate: 'candidate:real 1 UDP 1 10.0.0.1 1 typ host',
+    });
+  });
+
+  it('drops a daemon end-of-candidates marker without forwarding it', async () => {
+    const f = fixture();
+    const authority = await authorize(f);
+    const browserBefore = f.messages(f.browserA).length;
+
+    expect(f.router.handleDaemon({
+      type: REMOTE_DESKTOP_MSG.ICE,
+      ...authority,
+      candidate: '',
+      mid: '0',
+    }, 7)).toBe(true);
+
+    expect(f.messages(f.browserA).length).toBe(browserBefore);
+  });
+
   it('enforces bounded ICE candidates and idempotent client Stop', async () => {
     const f = fixture();
     const authority = await authorize(f);

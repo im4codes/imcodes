@@ -9,6 +9,7 @@ import {
   isRemoteDesktopId,
   isRemoteDesktopRecord,
   isSafeNonNegativeRemoteDesktopInteger,
+  remoteDesktopUtf8Bytes,
 } from './remote-desktop-contract-primitives.js';
 
 export const REMOTE_DESKTOP_CAPABILITY = 'remote.desktop.windows.h264.v2' as const;
@@ -1026,9 +1027,29 @@ function validateSdp(value: Record<string, unknown>): boolean {
   return hasSessionCorrelation(value) && isBoundedString(value.sdp, REMOTE_DESKTOP_LIMITS.SDP_BYTES);
 }
 
+/**
+ * An ICE candidate line, or the empty string.
+ *
+ * JSEP spells "I have no more candidates for this m-line" as a candidate
+ * event carrying an EMPTY candidate string, and Firefox emits exactly that
+ * (measured on Firefox 156: one empty-string event, then the null one) where
+ * Chromium emits only the null one. Refusing it as a malformed message
+ * terminated the whole session with `invalid_request` the moment gathering
+ * finished -- every Firefox session, on every host. It carries no address, so
+ * it is accepted here and dropped rather than forwarded.
+ */
+function isIceCandidateLine(value: unknown): value is string {
+  return typeof value === 'string'
+    && remoteDesktopUtf8Bytes(value) <= REMOTE_DESKTOP_LIMITS.ICE_CANDIDATE_BYTES;
+}
+
+export function isRemoteDesktopEndOfCandidates(candidate: unknown): boolean {
+  return candidate === '';
+}
+
 function validateIce(value: Record<string, unknown>): boolean {
   return hasSessionCorrelation(value)
-    && isBoundedString(value.candidate, REMOTE_DESKTOP_LIMITS.ICE_CANDIDATE_BYTES)
+    && isIceCandidateLine(value.candidate)
     && isBoundedString(value.mid, REMOTE_DESKTOP_LIMITS.ICE_MID_BYTES);
 }
 

@@ -2850,3 +2850,57 @@ describe('RemoteDesktopClient translated shortcuts and paste', () => {
     client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
   });
 });
+
+
+// Gathering ends with an EMPTY candidate line and then a null event. Firefox
+// emits both (measured on Firefox 156), Chromium only the null one, and the
+// empty one is not a candidate: the server refused it as a malformed message
+// and stopped the session with `invalid_request` -- every Firefox session,
+// on every host, the moment gathering finished.
+it('never sends the end-of-candidates marker as a candidate', async () => {
+  let socket!: FakeSocket;
+  let peer!: FakePeer;
+  const client = new RemoteDesktopClient('controlled-win', { onSnapshot: vi.fn() }, {
+    fetchTicket: async () => 'ticket-end-of-candidates',
+    createSocket: () => {
+      socket = new FakeSocket();
+      queueMicrotask(() => socket.open());
+      return socket as unknown as WebSocket;
+    },
+    createPeer: () => {
+      peer = new FakePeer();
+      return peer as unknown as RTCPeerConnection;
+    },
+    isDocumentVisible: () => true,
+  });
+
+  await client.start();
+  const start = JSON.parse(socket.sent[0]!) as { requestId: string };
+  const authority = {
+    requestId: start.requestId,
+    sessionId: 'session_endofcands',
+    capability: 'f'.repeat(43),
+  };
+  socket.receive({
+    type: REMOTE_DESKTOP_MSG.AUTHORIZED,
+    ...authority,
+    expiresAt: 3_600_000,
+    leaseExpiresAt: 3_600_000,
+    daemonGeneration: 1,
+    mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+    inputEpoch: 1,
+    iceServers: ['stun:stun.example.test:3478'],
+  });
+  await vi.waitFor(() => expect(peer).toBeDefined());
+
+  const iceMessages = () => socket.sent
+    .map((raw) => JSON.parse(raw) as { type: string; candidate?: string })
+    .filter((message) => message.type === REMOTE_DESKTOP_MSG.ICE);
+
+  peer.emitLocalCandidate('');
+  expect(iceMessages()).toHaveLength(0);
+
+  peer.emitLocalCandidate('candidate:real 1 UDP 1 10.0.0.1 1 typ host');
+  expect(iceMessages().map((message) => message.candidate))
+    .toEqual(['candidate:real 1 UDP 1 10.0.0.1 1 typ host']);
+});
