@@ -30,6 +30,7 @@ import {
   buildAgentDelegationReplyInstruction,
 } from '../../shared/agent-delegation.js';
 import { createSendDispatchId, createSendMessageId } from '../../shared/send-message-id.js';
+import { DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
 import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
 import { getCounter, resetMetricsForTests } from '../../src/util/metrics.js';
 import { getTransportQueueStore } from '../../src/daemon/transport-queue-store.js';
@@ -705,6 +706,16 @@ describe('SupervisionAutomation', () => {
     await vi.waitFor(() => expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined());
     expect(mockSupervisionDecide).not.toHaveBeenCalled();
     expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+    expect(timelineEmitter.replay('deck_supervision_brain', 0).events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'assistant.text',
+        payload: expect.objectContaining({
+          text: '⚠️ Automation returned control because the executing session reported a human-input blocker.',
+          noticeCode: DAEMON_USER_NOTICE_CODE.SUPERVISION_HUMAN_INPUT_BLOCKER,
+          noticeParams: {},
+        }),
+      }),
+    ]));
 
     const waitingSnapshot = await seedSession('supervised');
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-marker-waiting', 'wait for the delegated result', waitingSnapshot);
@@ -3453,6 +3464,8 @@ describe('SupervisionAutomation', () => {
         payload: expect.objectContaining({
           automationKind: 'supervision-warning',
           text: '⚠️ Automation reached the repeated auto-continue limit (2) for test_verify; handing control back to the human.',
+          noticeCode: DAEMON_USER_NOTICE_CODE.SUPERVISION_REPEAT_CONTINUE_LIMIT,
+          noticeParams: { limit: 2, bucket: 'test_verify' },
         }),
       }),
     ]));
@@ -3487,6 +3500,8 @@ describe('SupervisionAutomation', () => {
         payload: expect.objectContaining({
           automationKind: 'supervision-warning',
           text: '⚠️ Automation reached the auto-continue hard limit (2); handing control back to the human.',
+          noticeCode: DAEMON_USER_NOTICE_CODE.SUPERVISION_CONTINUE_HARD_LIMIT,
+          noticeParams: { limit: 2 },
         }),
       }),
     ]));
@@ -3931,6 +3946,15 @@ describe('SupervisionAutomation', () => {
     expect(mockTransportRuntime.send).not.toHaveBeenCalled();
     expect(mockStartP2pRun).not.toHaveBeenCalled();
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    expect(timelineEmitter.replay('deck_supervision_brain', 0).events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'assistant.text',
+        payload: expect.objectContaining({
+          noticeCode: DAEMON_USER_NOTICE_CODE.SUPERVISION_RETURNED_CONTROL,
+          noticeParams: { detail: 'needs clarification' },
+        }),
+      }),
+    ]));
   });
 
   it('reports the supervisor provider failure category and exhausted attempt count without stopping', async () => {
@@ -4175,6 +4199,8 @@ describe('SupervisionAutomation', () => {
             automation: true,
             automationKind: 'supervision-warning',
             text: '⚠️ Automation stopped because no completed assistant response was available for that turn. Manual continuation is required.',
+            noticeCode: DAEMON_USER_NOTICE_CODE.SUPERVISION_MISSING_COMPLETION,
+            noticeParams: {},
           }),
         }),
         expect.objectContaining({
@@ -4560,6 +4586,15 @@ describe('SupervisionAutomation', () => {
     expect(run?.auditDeadlineAt).toBeUndefined();
     expect(mockTransportRuntime.send).not.toHaveBeenCalled();
     expect(lastStatusPayload()).toMatchObject({ status: 'supervision_needs_input' });
+    expect(timelineEmitter.replay('deck_supervision_brain', 0).events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'assistant.text',
+        payload: expect.objectContaining({
+          noticeCode: DAEMON_USER_NOTICE_CODE.SUPERVISION_AUDIT_UNUSABLE,
+          noticeParams: { detail: expect.stringContaining('busy_state') },
+        }),
+      }),
+    ]));
   });
 
   it('refuses an observed legacy delegation to an EXECUTION-CLONE auditor', async () => {
@@ -4602,6 +4637,15 @@ describe('SupervisionAutomation', () => {
     expect(mockTransportRuntime.send).not.toHaveBeenCalled();
     expect(lastStatusPayload()).toMatchObject({ status: 'supervision_needs_input' });
     expect(lastStatusPayload()?.status).not.toBeNull();
+    expect(timelineEmitter.replay('deck_supervision_brain', 0).events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'assistant.text',
+        payload: expect.objectContaining({
+          noticeCode: DAEMON_USER_NOTICE_CODE.SUPERVISION_AUDIT_ROUTE_REFUSED,
+          noticeParams: { detail: expect.stringContaining('busy_state') },
+        }),
+      }),
+    ]));
   });
 
   it('refuses an execution-clone audit target instead of arming a deadline against it', async () => {
@@ -8503,6 +8547,15 @@ describe('SupervisionAutomation', () => {
     timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'error' });
     await vi.waitFor(() => expect(mockEnsureTransportRuntimeAvailable).toHaveBeenCalledTimes(1), { timeout: 2_000 });
     expect(getSession('deck_supervision_brain')!.restartTimestamps).toHaveLength(1);
+    expect(timelineEmitter.replay('deck_supervision_brain', 0).events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'assistant.text',
+        payload: expect.objectContaining({
+          noticeCode: DAEMON_USER_NOTICE_CODE.SUPERVISION_AUTHORITY_REHYDRATED,
+          noticeParams: { detail: 'no runtime to resume into' },
+        }),
+      }),
+    ]));
 
     // The SAME outage edge again. Because the first attempt could not deliver,
     // this must be a real retry against the durable budget -- not silence.

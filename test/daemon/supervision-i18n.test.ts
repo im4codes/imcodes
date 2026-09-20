@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 
-import { SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND } from '../../shared/supervision-config.js';
+import {
+  SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND,
+  SUPERVISION_WAITING_REFUSED_AUTOMATION_KIND,
+} from '../../shared/supervision-config.js';
 import {
   localizeSupervisionAutomationNote,
   localizeSupervisionStatusLabel,
@@ -35,5 +38,26 @@ describe('supervision display i18n', () => {
       'zh-CN',
     )).toBe('自动：等待 10 分钟后已请求状态更新；原截止时间不变。');
     expect(localizeSupervisionAutomationNote('unknown-kind', 'raw fallback', 'zh-CN')).toBe('raw fallback');
+  });
+
+  it.each([
+    ['en', 'authority catalog', 'WAITING was refused'],
+    ['zh-CN', '权限目录', 'WAITING 已被拒绝'],
+    ['zh-TW', '權限目錄', 'WAITING 已遭拒'],
+    ['es', 'catálogo de autoridad', 'WAITING fue rechazado'],
+    ['ru', 'каталог полномочий', 'WAITING отклонён'],
+    ['ja', '権限カタログ', 'WAITING を拒否'],
+    ['ko', '권한 카탈로그', 'WAITING을 거부'],
+  ] as const)('localizes every previously bare automation kind for %s', (locale, authorityText, refusedText) => {
+    expect(localizeSupervisionAutomationNote(
+      'supervision-authority-recovery',
+      'English fallback',
+      locale,
+    )).toContain(authorityText);
+    expect(localizeSupervisionAutomationNote(
+      SUPERVISION_WAITING_REFUSED_AUTOMATION_KIND,
+      'English fallback',
+      locale,
+    )).toContain(refusedText);
   });
 });

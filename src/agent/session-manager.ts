@@ -73,6 +73,7 @@ import { resolveTransportContextBootstrap } from './runtime-context-bootstrap.js
 import { QWEN_AUTH_TYPES } from '../../shared/qwen-auth.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 import { IMCODES_SESSION_ENV, IMCODES_SESSION_LABEL_ENV } from '../../shared/imcodes-send.js';
+import { attachDaemonUserNotice, DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
 import { SESSION_STATE_DECISION_REASON_SERVER_LINK_RESYNC, buildCodexLifecycleTerminalMetadata, isWorkingSessionState, type ActivityGenerationLike } from '../../shared/session-activity-types.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
@@ -1353,7 +1354,11 @@ async function recoverTransportRuntimeAfterError(
     if (recentRecoveries.length >= MAX_RESTARTS) {
       logger.error({ sessionName, ...preservation }, 'Transport error recovery loop detected — refusing auto-restart');
       timelineEmitter.emit(sessionName, 'assistant.text', {
-        text: `⚠️ Transport recovery stopped after ${MAX_RESTARTS} automatic restart attempts in 5 minutes.`,
+        ...attachDaemonUserNotice(
+          DAEMON_USER_NOTICE_CODE.TRANSPORT_RECOVERY_STOPPED,
+          `⚠️ Transport recovery stopped after ${MAX_RESTARTS} automatic restart attempts in 5 minutes.`,
+          { limit: MAX_RESTARTS, minutes: RESTART_WINDOW_MS / 60_000 },
+        ),
         streaming: false,
         memoryExcluded: true,
       }, { source: 'daemon', confidence: 'high' });
@@ -1374,7 +1379,11 @@ async function recoverTransportRuntimeAfterError(
         ? 'Provider connection lost'
         : 'Provider became stuck busy';
       timelineEmitter.emit(sessionName, 'assistant.text', {
-        text: `⏳ ${recoveryReason} — auto-resending ${pendingCount} queued message${pendingCount === 1 ? '' : 's'} after recovery.`,
+        ...attachDaemonUserNotice(
+          DAEMON_USER_NOTICE_CODE.TRANSPORT_RECOVERING,
+          `⏳ ${recoveryReason} — auto-resending ${pendingCount} queued message${pendingCount === 1 ? '' : 's'} after recovery.`,
+          { count: pendingCount, detail: recoveryReason },
+        ),
         streaming: false,
         memoryExcluded: true,
       }, { source: 'daemon', confidence: 'high' });
@@ -1420,7 +1429,11 @@ async function recoverTransportRuntimeAfterError(
   })().catch((err) => {
     logger.error({ err, sessionName }, 'Transport auto-restart after error failed');
     timelineEmitter.emit(sessionName, 'assistant.text', {
-      text: `⚠️ Auto-restart failed: ${err instanceof Error ? err.message : String(err)}`,
+      ...attachDaemonUserNotice(
+        DAEMON_USER_NOTICE_CODE.TRANSPORT_AUTO_RESTART_FAILED,
+        `⚠️ Auto-restart failed: ${err instanceof Error ? err.message : String(err)}`,
+        { detail: err instanceof Error ? err.message : String(err) },
+      ),
       streaming: false,
       memoryExcluded: true,
     }, { source: 'daemon', confidence: 'high' });
@@ -1576,7 +1589,11 @@ async function drainTransportResendQueueIntoRuntime(
           sessionName,
           'assistant.text',
           {
-            text: `⚠️ ${expiredCount} 条排队消息超过 ${minutes} 分钟未送达，已丢弃。请重新发送。`,
+            ...attachDaemonUserNotice(
+              DAEMON_USER_NOTICE_CODE.QUEUED_MESSAGES_EXPIRED,
+              `⚠️ ${expiredCount} 条排队消息超过 ${minutes} 分钟未送达，已丢弃。请重新发送。`,
+              { count: expiredCount, minutes },
+            ),
             streaming: false,
             memoryExcluded: true,
           },
@@ -1588,7 +1605,11 @@ async function drainTransportResendQueueIntoRuntime(
           sessionName,
           'assistant.text',
           {
-            text: `⚠️ ${failedCount} 条排队消息重连后仍未能送达，已停止自动重发。请重新发送。`,
+            ...attachDaemonUserNotice(
+              DAEMON_USER_NOTICE_CODE.QUEUED_MESSAGES_FAILED,
+              `⚠️ ${failedCount} 条排队消息重连后仍未能送达，已停止自动重发。请重新发送。`,
+              { count: failedCount },
+            ),
             streaming: false,
             memoryExcluded: true,
           },

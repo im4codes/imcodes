@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID } from '../../shared/ack-protocol.js';
+import { DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
 import { TRANSPORT_SESSION_AGENT_TYPES } from '../../shared/agent-types.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import {
@@ -1631,6 +1632,8 @@ describe('handleWebCommand transport queue behavior', () => {
     );
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'assistant.text', {
       text: 'Started a fresh conversation',
+      noticeCode: DAEMON_USER_NOTICE_CODE.CONVERSATION_STARTED,
+      noticeParams: {},
       streaming: false,
       memoryExcluded: true,
     }, expect.objectContaining({ source: 'daemon' }));
@@ -3741,7 +3744,13 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'assistant.text',
-      { text: '⚠️ Compact failed: provider does not support compact', streaming: false, memoryExcluded: true },
+      {
+        text: '⚠️ Compact failed: provider does not support compact',
+        noticeCode: DAEMON_USER_NOTICE_CODE.COMPACT_FAILED,
+        noticeParams: { detail: 'provider does not support compact' },
+        streaming: false,
+        memoryExcluded: true,
+      },
       { source: 'daemon', confidence: 'high' },
     );
     const compactUserMessages = emitMock.mock.calls.filter((call) =>

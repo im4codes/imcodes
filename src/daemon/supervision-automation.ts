@@ -146,6 +146,12 @@ import { deriveSupervisionTaskTitle } from '../../shared/supervision-task-identi
 import { isNativeCollaborationTimelineEvent } from './native-collaboration-guard.js';
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import {
+  DAEMON_USER_NOTICE_CODE,
+  createDaemonUserNoticePayload,
+  type DaemonUserNoticeCode,
+  type DaemonUserNoticeParams,
+} from '../../shared/daemon-user-notices.js';
+import {
   localizeSupervisionAutomationNote,
   localizeSupervisionStatusLabel,
 } from './supervision-i18n.js';
@@ -1176,7 +1182,7 @@ class SupervisionAutomation {
       sessionName,
       'assistant.text',
       {
-        text: `⚠️ ${guidance}`,
+        ...createDaemonUserNoticePayload(DAEMON_USER_NOTICE_CODE.EXECUTION_POOL_UNCONFIGURED, { detail: guidance }, guidance),
         streaming: false,
         automation: true,
         automationKind: 'supervision-warning',
@@ -1186,11 +1192,23 @@ class SupervisionAutomation {
     );
   }
 
-  private emitWarning(sessionName: string, text: string, eventId?: string): void {
+  private emitWarning(
+    sessionName: string,
+    code: DaemonUserNoticeCode,
+    params: DaemonUserNoticeParams = {},
+    eventId?: string,
+    englishFallback?: string,
+  ): void {
     timelineEmitter.emit(
       sessionName,
       'assistant.text',
-      { text: `⚠️ ${text}`, streaming: false, automation: true, automationKind: 'supervision-warning', memoryExcluded: true },
+      {
+        ...createDaemonUserNoticePayload(code, params, englishFallback),
+        streaming: false,
+        automation: true,
+        automationKind: 'supervision-warning',
+        memoryExcluded: true,
+      },
       { source: 'daemon', confidence: 'high', eventId: eventId ?? `supervision-warning:${randomUUID()}` },
     );
   }
@@ -2104,6 +2122,9 @@ class SupervisionAutomation {
       if (this.automaticPeerAuditCompatibilityForTests) {
         this.emitWarning(
           run.sessionName,
+          DAEMON_USER_NOTICE_CODE.SUPERVISION_AUDIT_STOPPED_BY_USER,
+          {},
+          undefined,
           `Supervision stopped: ${sessionName} was stopped by the user, so its audit cannot complete.`,
         );
       }
@@ -2476,7 +2497,8 @@ class SupervisionAutomation {
     this.emitTerminalStatus(sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
     this.emitWarning(
       sessionName,
-      'Automation stopped because no completed assistant response was available for that turn. Manual continuation is required.',
+      DAEMON_USER_NOTICE_CODE.SUPERVISION_MISSING_COMPLETION,
+      {},
       `supervision-warning:missing-completion:${createHash('sha256').update(terminalKey).digest('hex')}`,
     );
   }
@@ -2490,7 +2512,7 @@ class SupervisionAutomation {
    */
   private failClosedUnconfirmedActivity(sessionName: string): void {
     this.emitTerminalStatus(sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
-    this.emitWarning(sessionName, 'Automation stopped because the assistant result arrived but this session\'s activity could not be confirmed before the deadline. Check the provider/runtime state; manual continuation is required.');
+    this.emitWarning(sessionName, DAEMON_USER_NOTICE_CODE.SUPERVISION_UNCONFIRMED_ACTIVITY);
   }
 
   private settleAcceptedWaitingTurn(
@@ -2581,7 +2603,7 @@ class SupervisionAutomation {
       if (!current || current.generation !== implicitRun.generation) return;
       logger.warn({ session: sessionName, err: error }, 'Supervision implicit execution evaluation failed on snapshot update');
       this.clearStatus(sessionName);
-      this.emitWarning(sessionName, 'Automation could not determine whether the task is complete. Manual continuation is required.');
+      this.emitWarning(sessionName, DAEMON_USER_NOTICE_CODE.SUPERVISION_COMPLETION_UNKNOWN);
       this.finishRun(sessionName, 'needs_input');
     });
     return true;
@@ -2637,7 +2659,7 @@ class SupervisionAutomation {
       if (!current || current.generation !== run.generation) return;
       logger.warn({ session: sessionName, err: error }, 'Supervision notification WAITING adoption failed');
       this.emitTerminalStatus(sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
-      this.emitWarning(sessionName, 'Automation could not validate the reported wait. Manual continuation is required.');
+      this.emitWarning(sessionName, DAEMON_USER_NOTICE_CODE.SUPERVISION_WAIT_VALIDATION_FAILED);
       this.finishRun(sessionName, 'needs_input', { preserveStatus: true });
     });
     return true;
@@ -2857,7 +2879,7 @@ class SupervisionAutomation {
           || !persistedIdentityMatches(persisted.auditTarget, targetRecord)) {
           this.deletePersistedWaitState(persisted.owner.sessionName);
           this.emitTerminalStatus(persisted.owner.sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
-          this.emitWarning(persisted.owner.sessionName, 'Supervision could not restore the exact peer-audit session identity after restart. Manual review is required.');
+          this.emitWarning(persisted.owner.sessionName, DAEMON_USER_NOTICE_CODE.SUPERVISION_AUDIT_IDENTITY_RESTORE_FAILED);
           continue;
         }
       }
@@ -2991,7 +3013,7 @@ class SupervisionAutomation {
       if (!current || current.generation !== run.generation) return;
       logger.warn({ session: run.sessionName, err: error }, 'Supervision execution evaluation failed');
       this.clearStatus(run.sessionName);
-      this.emitWarning(run.sessionName, 'Automation could not determine whether the task is complete. Manual continuation is required.');
+      this.emitWarning(run.sessionName, DAEMON_USER_NOTICE_CODE.SUPERVISION_COMPLETION_UNKNOWN);
       this.finishRun(run.sessionName, 'needs_input');
     });
   }
@@ -3221,6 +3243,8 @@ class SupervisionAutomation {
       }, 'Observed peer audit refused the adopted route');
       this.failUnroutableAudit(
         run,
+        DAEMON_USER_NOTICE_CODE.SUPERVISION_AUDIT_UNUSABLE,
+        { detail: route.detail },
         `Automation observed a peer audit delegated to an unusable auditor: ${route.detail}. Manual review is required.`,
       );
       return;
@@ -3503,7 +3527,7 @@ class SupervisionAutomation {
         && !run.auditTargetRecoveryLimitNotified
       ) {
         run.auditTargetRecoveryLimitNotified = true;
-        this.emitWarning(run.sessionName, 'The configured audit session stopped again after the automatic recovery limit. The audit remains pending for manual intervention.');
+        this.emitWarning(run.sessionName, DAEMON_USER_NOTICE_CODE.SUPERVISION_AUDIT_RECOVERY_LIMIT);
       }
       return;
     }
@@ -3617,7 +3641,7 @@ class SupervisionAutomation {
     );
     const runtime = getTransportRuntime(current.sessionName);
     if (!runtime) {
-      this.emitWarning(current.sessionName, 'The waiting-status heartbeat could not reach the execution session; the original wait deadline remains active.');
+      this.emitWarning(current.sessionName, DAEMON_USER_NOTICE_CODE.SUPERVISION_HEARTBEAT_UNREACHABLE);
       return;
     }
     try {
@@ -3645,7 +3669,7 @@ class SupervisionAutomation {
       // failed heartbeat as a missing assistant completion.
       current.ignoreIdleUntilPostAuditTurnActivity = true;
       logger.warn({ session: current.sessionName, err: error }, 'Supervision waiting heartbeat dispatch failed');
-      this.emitWarning(current.sessionName, 'The waiting-status heartbeat failed; the original wait deadline remains active.');
+      this.emitWarning(current.sessionName, DAEMON_USER_NOTICE_CODE.SUPERVISION_HEARTBEAT_FAILED);
     }
   }
 
@@ -3659,7 +3683,7 @@ class SupervisionAutomation {
       || !target
       || target.sessionInstanceId !== run.auditTargetSessionInstanceId
     ) {
-      this.emitWarning(run.sessionName, 'The configured audit session changed identity while recovery was pending. No continue prompt was sent.');
+      this.emitWarning(run.sessionName, DAEMON_USER_NOTICE_CODE.SUPERVISION_AUDIT_IDENTITY_CHANGED);
       return;
     }
     if (this.auditTargetRuntimeIsWorking(targetName)) {
@@ -3668,7 +3692,7 @@ class SupervisionAutomation {
     }
     const runtime = getTransportRuntime(targetName);
     if (!runtime) {
-      this.emitWarning(run.sessionName, 'The configured audit session stopped and has no live runtime, so its audit turn could not be continued automatically.');
+      this.emitWarning(run.sessionName, DAEMON_USER_NOTICE_CODE.SUPERVISION_AUDIT_RUNTIME_MISSING);
       return;
     }
     if (run.auditTargetRecoveryAttempts >= AUDIT_TARGET_MAX_RECOVERY_CONTINUES) return;
@@ -3707,7 +3731,7 @@ class SupervisionAutomation {
       this.armAuditDeadline(run);
     } catch (error) {
       logger.warn({ session: run.sessionName, auditorSession: targetName, err: error }, 'Automatic audit-target continue dispatch failed');
-      this.emitWarning(run.sessionName, 'The configured audit session stopped, but its automatic continue prompt could not be delivered.');
+      this.emitWarning(run.sessionName, DAEMON_USER_NOTICE_CODE.SUPERVISION_AUDIT_CONTINUE_FAILED);
     }
   }
 
@@ -4097,7 +4121,7 @@ class SupervisionAutomation {
         // A precisely-typed, transient authority outage is not a blocked task.
         if (this.tryRecoverAuthorityOutage(run)) return;
         this.emitTerminalStatus(run.sessionName, 'supervision_blocked', SUPERVISION_BLOCKED_LABEL);
-        this.emitWarning(run.sessionName, 'Supervision stopped because the session entered a blocked state.');
+        this.emitWarning(run.sessionName, DAEMON_USER_NOTICE_CODE.SUPERVISION_SESSION_BLOCKED);
         this.finishRun(run.sessionName, 'blocked', { preserveStatus: true });
       }
       if (state === 'idle' && run.phase === 'auditing' && run.auditReplyObserved && run.sawAssistantOutput) {
@@ -4220,6 +4244,9 @@ class SupervisionAutomation {
     run.recoveredAuthorityOutage = undefined;
     this.emitWarning(
       run.sessionName,
+      DAEMON_USER_NOTICE_CODE.SUPERVISION_AUTHORITY_REHYDRATED,
+      { detail: reason },
+      undefined,
       `The session was rehydrated after an authority outage, but ${reason}; supervision will retry within its restart budget.`,
     );
     this.scheduleAuthorityOutageRetry(run);
@@ -4261,7 +4288,7 @@ class SupervisionAutomation {
       const spent = (record?.restartTimestamps ?? []).filter((at) => at > now - RESTART_WINDOW_MS);
       if (spent.length < MAX_RESTARTS) return;
       this.emitTerminalStatus(current.sessionName, 'supervision_blocked', SUPERVISION_BLOCKED_LABEL);
-      this.emitWarning(current.sessionName, 'Supervision stopped after the authority outage could not be recovered within its restart budget.');
+      this.emitWarning(current.sessionName, DAEMON_USER_NOTICE_CODE.SUPERVISION_AUTHORITY_RECOVERY_EXHAUSTED);
       this.finishRun(current.sessionName, 'blocked', { preserveStatus: true });
     }, AUTHORITY_RECOVERY_RETRY_MS);
     timer.unref?.();
@@ -4569,7 +4596,13 @@ class SupervisionAutomation {
           { backend: run.snapshot.backend, model: run.snapshot.model },
         );
         this.emitTerminalStatus(run.sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
-        this.emitWarning(run.sessionName, unavailableText ?? `Automation returned control to the human: ${decision.reason}`);
+        this.emitWarning(
+          run.sessionName,
+          DAEMON_USER_NOTICE_CODE.SUPERVISION_RETURNED_CONTROL,
+          { detail: unavailableText ?? decision.reason },
+          undefined,
+          unavailableText ?? `Automation returned control to the human: ${decision.reason}`,
+        );
         this.finishRun(run.sessionName, 'needs_input', { preserveStatus: true });
       }
     }
@@ -4586,7 +4619,7 @@ class SupervisionAutomation {
     switch (state) {
       case 'needs_input':
         this.emitTerminalStatus(current.sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
-        this.emitWarning(current.sessionName, 'Automation returned control because the executing session reported a human-input blocker.');
+        this.emitWarning(current.sessionName, DAEMON_USER_NOTICE_CODE.SUPERVISION_HUMAN_INPUT_BLOCKER);
         this.finishRun(current.sessionName, 'needs_input', { preserveStatus: true });
         return;
       case 'waiting':
@@ -4671,12 +4704,17 @@ class SupervisionAutomation {
     const maxAutoContinueTotal = current.snapshot.maxAutoContinueTotal ?? SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_TOTAL;
 
     if (maxAutoContinueStreak > 0 && nextStreakCount > maxAutoContinueStreak) {
-      this.emitWarning(current.sessionName, `Automation reached the repeated auto-continue limit (${maxAutoContinueStreak}) for ${continueBucket}; handing control back to the human.`);
+      this.emitWarning(current.sessionName, DAEMON_USER_NOTICE_CODE.SUPERVISION_REPEAT_CONTINUE_LIMIT, {
+        limit: maxAutoContinueStreak,
+        bucket: continueBucket,
+      });
       this.finishRun(current.sessionName, 'needs_input');
       return;
     }
     if (maxAutoContinueTotal > 0 && current.continueLoops >= maxAutoContinueTotal) {
-      this.emitWarning(current.sessionName, `Automation reached the auto-continue hard limit (${maxAutoContinueTotal}); handing control back to the human.`);
+      this.emitWarning(current.sessionName, DAEMON_USER_NOTICE_CODE.SUPERVISION_CONTINUE_HARD_LIMIT, {
+        limit: maxAutoContinueTotal,
+      });
       this.finishRun(current.sessionName, 'needs_input');
       return;
     }
@@ -4715,9 +4753,14 @@ class SupervisionAutomation {
    * look indistinguishable from a clean finish. The diagnostic differs; the
    * terminal semantics must not.
    */
-  private failUnroutableAudit(current: ActiveTaskRunState, warning: string): void {
+  private failUnroutableAudit(
+    current: ActiveTaskRunState,
+    warning: DaemonUserNoticeCode,
+    params: DaemonUserNoticeParams = {},
+    englishFallback?: string,
+  ): void {
     this.emitOrchestratedAuditResult(current, 'invalid_configuration', 'invalid_configuration');
-    this.emitWarning(current.sessionName, warning);
+    this.emitWarning(current.sessionName, warning, params, undefined, englishFallback);
     this.emitTerminalStatus(current.sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
     this.finishRun(current.sessionName, 'needs_input', { preserveStatus: true });
   }
@@ -4817,7 +4860,7 @@ class SupervisionAutomation {
         hasTarget: Boolean(target),
         hasTransportRuntime: Boolean(transportRuntime),
       }, 'Automatic audit preflight could not resolve the selected session');
-      this.failUnroutableAudit(current, 'Automation peer audit could not resolve the current session or configured auditor. Manual review is required.');
+      this.failUnroutableAudit(current, DAEMON_USER_NOTICE_CODE.SUPERVISION_AUDIT_ROUTE_MISSING);
       return;
     }
 
@@ -4842,6 +4885,8 @@ class SupervisionAutomation {
       }, 'Automatic audit preflight refused the configured route');
       this.failUnroutableAudit(
         current,
+        DAEMON_USER_NOTICE_CODE.SUPERVISION_AUDIT_ROUTE_REFUSED,
+        { detail: route.detail },
         `Automation peer audit cannot use the configured auditor: ${route.detail}. Manual review is required.`,
       );
       return;
@@ -4882,7 +4927,7 @@ class SupervisionAutomation {
     } catch (error) {
       logger.warn({ session: current.sessionName, err: error }, 'Automatic audit orchestration dispatch failed');
       this.emitOrchestratedAuditResult(current, 'target_unavailable', 'dispatch_failed');
-      this.emitWarning(current.sessionName, 'Automation could not ask the current session to prepare the peer audit. Manual review is required.');
+      this.emitWarning(current.sessionName, DAEMON_USER_NOTICE_CODE.SUPERVISION_AUDIT_PREPARE_FAILED);
       this.finishRun(current.sessionName, 'needs_input');
       return;
     }
@@ -4961,7 +5006,7 @@ class SupervisionAutomation {
       if (this.requestAuditVerdictCorrection(current)) return;
       if (!current.auditMarkerWarningEmitted) {
         current.auditMarkerWarningEmitted = true;
-        this.emitWarning(current.sessionName, 'The delegated audit reply arrived, but the current session still did not report exactly one PASS/REWORK audit marker after an automatic correction attempt. Waiting until the audit deadline.');
+        this.emitWarning(current.sessionName, DAEMON_USER_NOTICE_CODE.SUPERVISION_AUDIT_MARKER_MISSING);
       }
       return;
     }
@@ -5174,7 +5219,7 @@ class SupervisionAutomation {
       }
     } catch (error) {
       logger.warn({ session: run.sessionName, err: error }, 'Supervision continue dispatch failed');
-      this.emitWarning(run.sessionName, 'Automation could not continue the task. Manual continuation is required.');
+      this.emitWarning(run.sessionName, DAEMON_USER_NOTICE_CODE.SUPERVISION_CONTINUE_FAILED);
       this.finishRun(run.sessionName, 'blocked');
     }
   }

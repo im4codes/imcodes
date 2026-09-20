@@ -1,5 +1,6 @@
 import path from 'path';
 import { buildAuditSeverityPolicyLines, type AuditSeverity } from '../../shared/audit-convergence.js';
+import { attachDaemonUserNotice, DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
 import logger from '../util/logger.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { existsSync } from 'node:fs';
@@ -3547,7 +3548,11 @@ function recordAutomaticAuditProvisioningTelemetry(input: {
     input.brainSessionName,
     'assistant.text',
     {
-      text: `Automatic audit worker provisioning was refused (${reason}); using the bounded busy-session FIFO fallback.`,
+      ...attachDaemonUserNotice(
+        DAEMON_USER_NOTICE_CODE.AUDIT_WORKER_PROVISION_REFUSED,
+        `Automatic audit worker provisioning was refused (${reason}); using the bounded busy-session FIFO fallback.`,
+        { detail: reason },
+      ),
       streaming: false,
       automation: true,
       automationKind: 'supervision-provisioning',

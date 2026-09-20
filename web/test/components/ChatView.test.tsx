@@ -5,6 +5,7 @@ import { h } from 'preact';
 import { act, render, waitFor, cleanup, fireEvent, screen } from '@testing-library/preact';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { ChatView, __clearChatLocalImagePreviewCacheForTests, formatChatDateTime } from '../../src/components/ChatView.js';
+import { DAEMON_USER_NOTICE_CODE } from '../../../shared/daemon-user-notices.js';
 import {
   SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
   SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
@@ -201,6 +202,7 @@ vi.mock('react-i18next', () => ({
         'chat.supervision_prompt.generic': 'Supervision automation',
         'chat.supervision_prompt.show_details': 'Show supervision prompt details',
         'chat.supervision_prompt.hide_details': 'Hide supervision prompt details',
+        'chat.daemon_notice.supervision_human_input_blocker': '⚠️ Localized human-input blocker warning.',
       };
       const template = translations[key] ?? key;
       return template.replace(/\{\{(\w+)\}\}/g, (_, name) => String(options?.[name] ?? ''));
@@ -219,6 +221,60 @@ describe('assistant execution status chips', () => {
     ts: 1_700_000_000_001,
     payload: { text, ...payload },
   }) as any;
+
+  it('renders a trusted structured daemon warning through i18n instead of its English fallback', () => {
+    const event = {
+      ...assistant('⚠️ Automation returned control because the executing session reported a human-input blocker.', {
+        streaming: false,
+        automation: true,
+        automationKind: 'supervision-warning',
+        noticeCode: DAEMON_USER_NOTICE_CODE.SUPERVISION_HUMAN_INPUT_BLOCKER,
+        noticeParams: {},
+      }),
+      source: 'daemon',
+      confidence: 'high',
+    };
+    const { container } = render(
+      <ChatView events={[event]} loading={false} sessionId="deck_main_brain" />,
+    );
+    expect(container.textContent).toContain('Localized human-input blocker warning');
+    expect(container.textContent).not.toContain('Automation returned control because');
+  });
+
+  it('keeps legacy and unknown notice text as the readable fallback', () => {
+    const legacy = assistant('Legacy daemon warning', { streaming: false }, 'legacy-warning');
+    const unknown = {
+      ...assistant('Future daemon warning', {
+        streaming: false,
+        noticeCode: 'future_notice_code',
+        noticeParams: {},
+      }, 'future-warning'),
+      source: 'daemon',
+      confidence: 'high',
+    };
+    const { container } = render(
+      <ChatView events={[legacy, unknown]} loading={false} sessionId="deck_main_brain" />,
+    );
+    expect(container.textContent).toContain('Legacy daemon warning');
+    expect(container.textContent).toContain('Future daemon warning');
+  });
+
+  it('does not let an agent-authored payload spoof a trusted daemon notice', () => {
+    const event = {
+      ...assistant('Agent-authored text remains intact', {
+        streaming: false,
+        noticeCode: DAEMON_USER_NOTICE_CODE.SUPERVISION_HUMAN_INPUT_BLOCKER,
+        noticeParams: {},
+      }),
+      source: 'provider',
+      confidence: 'high',
+    };
+    const { container } = render(
+      <ChatView events={[event]} loading={false} sessionId="deck_main_brain" />,
+    );
+    expect(container.textContent).toContain('Agent-authored text remains intact');
+    expect(container.textContent).not.toContain('Localized human-input blocker warning');
+  });
 
   it.each([
     [SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING, 'Waiting', 'waiting', '⏳'],

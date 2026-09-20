@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { createSendDispatchId, createSendMessageId, type SendDispatchId, type SendMessageId } from '../../shared/send-message-id.js';
+import { attachDaemonUserNotice, DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
 import {
   PEER_AUDIT_CONTRACT_VERSION,
   PEER_AUDIT_PREFLIGHT_ERRORS,
@@ -597,7 +598,10 @@ export async function dispatchDelegatedSessionSend(input: {
     });
     if (context.status === 'omitted' && input.caller.sessionName) {
       timelineEmitter.emit(input.caller.sessionName, 'assistant.text', {
-        text: `${AGENT_DELEGATION_CONTEXT_OMITTED_MARKER} Delegation context was unavailable; forwarded clean task only.`,
+        ...attachDaemonUserNotice(
+          DAEMON_USER_NOTICE_CODE.DELEGATION_CONTEXT_OMITTED,
+          `${AGENT_DELEGATION_CONTEXT_OMITTED_MARKER} Delegation context was unavailable; forwarded clean task only.`,
+        ),
         streaming: false,
         memoryExcluded: true,
       }, { source: 'daemon', confidence: 'medium' });

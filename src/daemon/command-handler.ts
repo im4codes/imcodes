@@ -45,6 +45,7 @@ import { getSupervisionTaskRegistry } from './supervision-state-store.js';
 import { getDefaultTimelineDetailStore } from './timeline-detail-store.js';
 import { TIMELINE_HISTORY_CONTENT_TYPES, TIMELINE_HISTORY_STATE_TYPES, type MemoryContextTimelinePayload, type TimelineEvent } from '../shared/timeline/types.js';
 import { emitSessionInlineError } from './session-error.js';
+import { attachDaemonUserNotice, DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
 import { enqueueResend, getResendEntries, clearResend, recipientFromSessionRecord } from './transport-resend-queue.js';
 import { preserveTransportRuntimeQueuesToResend } from './transport-resend-preservation.js';
 import { buildTransportQueueSnapshotPayload, transportQueueSnapshotToPayload } from './transport-queue-projection.js';
@@ -2735,7 +2736,7 @@ function cancelTransportTurnNow(
     } catch (err) {
       const errMsg = describeTransportSendError(err);
       logger.error({ sessionName, err }, 'session.cancel (transport) failed');
-      timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Stop failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'assistant.text', { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.SESSION_STOP_FAILED, `⚠️ Stop failed: ${errMsg}`, { detail: errMsg }), streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
       markTransportCancelIdle(sessionName, errMsg);
     }
   })();
@@ -4105,7 +4106,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       sessionName,
       'assistant.text',
       {
-        text: `⚠️ Message not delivered: unresolved alias marker${aliasExpansion.unresolved.length === 1 ? '' : 's'} ${markerList} (${aliasExpansion.reason ?? ALIAS_REASONS.UNRESOLVED_FAILCLOSED}). Define the alias or remove the marker, then resend.`,
+        ...attachDaemonUserNotice(
+          DAEMON_USER_NOTICE_CODE.ALIAS_UNRESOLVED,
+          `⚠️ Message not delivered: unresolved alias marker${aliasExpansion.unresolved.length === 1 ? '' : 's'} ${markerList} (${aliasExpansion.reason ?? ALIAS_REASONS.UNRESOLVED_FAILCLOSED}). Define the alias or remove the marker, then resend.`,
+          { count: aliasExpansion.unresolved.length, detail: `${markerList} (${aliasExpansion.reason ?? ALIAS_REASONS.UNRESOLVED_FAILCLOSED})` },
+        ),
         streaming: false,
         memoryExcluded: true,
       },
@@ -4246,7 +4251,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         sessionName,
         'assistant.text',
         {
-          text: '⚠️ 排队消息已满（上限 10 条），最旧消息已被丢弃。请稍后重新发送。',
+          ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.QUEUE_OVERFLOW, '⚠️ 排队消息已满（上限 10 条），最旧消息已被丢弃。请稍后重新发送。', { limit: 10 }),
           streaming: false,
           memoryExcluded: true,
         },
@@ -4261,7 +4266,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     timelineEmitter.emit(
       sessionName,
       'assistant.text',
-      { text: infoMsg, streaming: false, memoryExcluded: true },
+      {
+        ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.TRANSPORT_RECOVERING, infoMsg, { count: queued.length, detail: `Agent ${providerLabel} is restoring` }),
+        streaming: false,
+        memoryExcluded: true,
+      },
       { source: 'daemon', confidence: 'high' },
     );
     timelineEmitter.emit(
@@ -4284,7 +4293,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         timelineEmitter.emit(
           sessionName,
           'assistant.text',
-          { text: `⚠️ Auto-resume failed: ${resumeErr}. Restart the session manually to recover.`, streaming: false, memoryExcluded: true },
+          { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.SESSION_AUTO_RESUME_FAILED, `⚠️ Auto-resume failed: ${resumeErr}. Restart the session manually to recover.`, { detail: resumeErr }), streaming: false, memoryExcluded: true },
           { source: 'daemon', confidence: 'high' },
         );
       }
@@ -4334,7 +4343,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         sessionName,
         'assistant.text',
         {
-          text: '⚠️ 排队消息已满（上限 10 条），最旧消息已被丢弃。请稍后重新发送。',
+          ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.QUEUE_OVERFLOW, '⚠️ 排队消息已满（上限 10 条），最旧消息已被丢弃。请稍后重新发送。', { limit: 10 }),
           streaming: false,
           memoryExcluded: true,
         },
@@ -4349,7 +4358,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     timelineEmitter.emit(
       sessionName,
       'assistant.text',
-      { text: infoMsg, streaming: false, memoryExcluded: true },
+      {
+        ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.TRANSPORT_RECOVERING, infoMsg, { count: queued.length, detail: `Provider ${providerLabel} runtime is recovering` }),
+        streaming: false,
+        memoryExcluded: true,
+      },
       { source: 'daemon', confidence: 'high' },
     );
     timelineEmitter.emit(
@@ -4373,7 +4386,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           timelineEmitter.emit(
             sessionName,
             'assistant.text',
-            { text: `⚠️ Auto-resume failed: ${resumeErr}. Restart the session manually to recover.`, streaming: false, memoryExcluded: true },
+            { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.SESSION_AUTO_RESUME_FAILED, `⚠️ Auto-resume failed: ${resumeErr}. Restart the session manually to recover.`, { detail: resumeErr }), streaming: false, memoryExcluded: true },
             { source: 'daemon', confidence: 'high' },
           );
         }
@@ -4398,7 +4411,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         await handleGetSessions(serverLink);
         await syncSubSessionIfNeeded(sessionName, serverLink);
         timelineEmitter.emit(sessionName, 'assistant.text', {
-          text: 'Started a fresh conversation',
+          ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_STARTED, 'Started a fresh conversation'),
           streaming: false,
           memoryExcluded: true,
         }, { source: 'daemon', confidence: 'high' });
@@ -4408,7 +4421,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       } catch (err) {
         const errMsg = describeTransportSendError(err);
         logger.error({ sessionName, err }, 'session.clear (transport) failed');
-        timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Clear failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(sessionName, 'assistant.text', { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_CLEAR_FAILED, `⚠️ Clear failed: ${errMsg}`, { detail: errMsg }), streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
         emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
       }
@@ -4433,7 +4446,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           const reason = err instanceof Error ? err.message : 'service_tier_failed';
           emitTransportUserMessage(text);
           timelineEmitter.emit(sessionName, 'assistant.text', {
-            text: `⚠️ Could not change the service tier: ${reason}`,
+            ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.SERVICE_TIER_CHANGE_FAILED, `⚠️ Could not change the service tier: ${reason}`, { detail: reason }),
             streaming: false,
             memoryExcluded: true,
           }, { source: 'daemon', confidence: 'high' });
@@ -4448,9 +4461,14 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         syncSubSessionIfNeeded(sessionName, serverLink);
         emitTransportUserMessage(text);
         timelineEmitter.emit(sessionName, 'assistant.text', {
-          text: isCodexFastServiceTier(requestedServiceTier)
-            ? 'Fast mode is on for this session (1.5x speed, increased plan usage).'
-            : 'Fast mode is off for this session.',
+          ...attachDaemonUserNotice(
+            isCodexFastServiceTier(requestedServiceTier)
+              ? DAEMON_USER_NOTICE_CODE.FAST_MODE_ON
+              : DAEMON_USER_NOTICE_CODE.FAST_MODE_OFF,
+            isCodexFastServiceTier(requestedServiceTier)
+              ? 'Fast mode is on for this session (1.5x speed, increased plan usage).'
+              : 'Fast mode is off for this session.',
+          ),
           streaming: false,
           automation: true,
           memoryExcluded: true,
@@ -4478,7 +4496,10 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
               : '';
             emitTransportUserMessage(text);
             timelineEmitter.emit(sessionName, 'assistant.text', {
-              text: `⚠️ Unknown Qwen model: ${nextModel}${authHint}`,
+              ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.UNKNOWN_MODEL, `⚠️ Unknown Qwen model: ${nextModel}${authHint}`, {
+                model: nextModel,
+                ...(authHint ? { detail: authHint.trim().replace(/^\(|\)$/g, '') } : {}),
+              }),
               streaming: false,
               memoryExcluded: true,
             }, { source: 'daemon', confidence: 'high' });
@@ -4518,7 +4539,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
             contextWindow: resolveContextWindow(undefined, nextModel),
           }, { source: 'daemon', confidence: 'high' });
           timelineEmitter.emit(sessionName, 'assistant.text', {
-            text: `Switched model to ${nextModel}`,
+            ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.MODEL_SWITCHED, `Switched model to ${nextModel}`, { model: nextModel }),
             streaming: false,
             automation: true,
             memoryExcluded: true,
@@ -4546,7 +4567,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         }
         if (!selectedModel) {
           emitTransportUserMessage(text);
-          timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Unknown Claude model: ${requestedModel}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
+          timelineEmitter.emit(sessionName, 'assistant.text', { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.UNKNOWN_MODEL, `⚠️ Unknown Claude model: ${requestedModel}`, { model: requestedModel }), streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
           timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Claude model: ${requestedModel}` });
           emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: `Unknown Claude model: ${requestedModel}` });
           return;
@@ -4571,7 +4592,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           contextWindow: resolveContextWindow(presetContextWindow, selectedModel),
         }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'assistant.text', {
-          text: `Switched model to ${selectedModel}`,
+          ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.MODEL_SWITCHED, `Switched model to ${selectedModel}`, { model: selectedModel }),
           streaming: false,
           automation: true,
           memoryExcluded: true,
@@ -4591,7 +4612,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
             : [...CODEX_MODEL_IDS];
         if (!availableModels.includes(nextModel)) {
           emitTransportUserMessage(text);
-          timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Unknown Codex model: ${nextModel}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
+          timelineEmitter.emit(sessionName, 'assistant.text', { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.UNKNOWN_MODEL, `⚠️ Unknown Codex model: ${nextModel}`, { model: nextModel }), streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
           timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Codex model: ${nextModel}` });
           emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: `Unknown Codex model: ${nextModel}` });
           return;
@@ -4613,7 +4634,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         emitTransportUserMessage(text);
         timelineEmitter.emit(sessionName, 'usage.update', { model: nextModel, contextWindow: resolveContextWindow(undefined, nextModel) }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'assistant.text', {
-          text: `Switched model to ${nextModel}`,
+          ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.MODEL_SWITCHED, `Switched model to ${nextModel}`, { model: nextModel }),
           streaming: false,
           automation: true,
           memoryExcluded: true,
@@ -4627,7 +4648,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         const errMsg = `Qoder model switching is proof-gated in IM.codes v1: ${nextModel}`;
         emitTransportUserMessage(text);
         timelineEmitter.emit(sessionName, 'assistant.text', {
-          text: `⚠️ ${errMsg}`,
+          ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PROOF_GATED, `⚠️ ${errMsg}`, { model: nextModel }),
           streaming: false,
           memoryExcluded: true,
         }, { source: 'daemon', confidence: 'high' });
@@ -4642,7 +4663,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         if (!availableModels.includes(nextModel)) {
           const error = `Unknown Grok model: ${nextModel}`;
           emitTransportUserMessage(text);
-          timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ ${error}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
+          timelineEmitter.emit(sessionName, 'assistant.text', { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.UNKNOWN_MODEL, `⚠️ ${error}`, { model: nextModel }), streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
           timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error });
           emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error });
           return;
@@ -4665,7 +4686,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         emitTransportUserMessage(text);
         timelineEmitter.emit(sessionName, 'usage.update', { model: nextModel, contextWindow: resolveContextWindow(undefined, nextModel) }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'assistant.text', {
-          text: `Switched model to ${nextModel}`,
+          ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.MODEL_SWITCHED, `Switched model to ${nextModel}`, { model: nextModel }),
           streaming: false,
           automation: true,
           memoryExcluded: true,
@@ -4679,7 +4700,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         const errMsg = `Qoder thinking/effort controls are proof-gated in IM.codes v1: ${nextEffort}`;
         emitTransportUserMessage(text);
         timelineEmitter.emit(sessionName, 'assistant.text', {
-          text: `⚠️ ${errMsg}`,
+          ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.THINKING_LEVEL_UNSUPPORTED, `⚠️ ${errMsg}`, { level: nextEffort }),
           streaming: false,
           memoryExcluded: true,
         }, { source: 'daemon', confidence: 'high' });
@@ -4694,7 +4715,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           const supported = allowed.join(', ');
           emitTransportUserMessage(text);
           timelineEmitter.emit(sessionName, 'assistant.text', {
-            text: `⚠️ Unsupported thinking level: ${nextEffort}. Supported: ${supported}`,
+            ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.THINKING_LEVEL_UNSUPPORTED, `⚠️ Unsupported thinking level: ${nextEffort}. Supported: ${supported}`, {
+              level: nextEffort,
+              supported,
+              detail: `Supported: ${supported}`,
+            }),
             streaming: false,
             memoryExcluded: true,
           }, { source: 'daemon', confidence: 'high' });
@@ -4714,7 +4739,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         syncSubSessionIfNeeded(sessionName, serverLink);
         emitTransportUserMessage(text);
         timelineEmitter.emit(sessionName, 'assistant.text', {
-          text: `Switched thinking level to ${nextEffort}`,
+          ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.THINKING_LEVEL_SWITCHED, `Switched thinking level to ${nextEffort}`, { level: nextEffort }),
           streaming: false,
           automation: true,
           memoryExcluded: true,
@@ -4812,7 +4837,17 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       const errMsg = describeTransportSendError(err);
       logger.error({ sessionName, err }, 'session.send (transport) failed');
       const failureLabel = isSessionControlCommandText(displayText, 'compact') ? 'Compact failed' : 'Send failed';
-      timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ ${failureLabel}: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'assistant.text', {
+        ...attachDaemonUserNotice(
+          isSessionControlCommandText(displayText, 'compact')
+            ? DAEMON_USER_NOTICE_CODE.COMPACT_FAILED
+            : DAEMON_USER_NOTICE_CODE.MESSAGE_SEND_FAILED,
+          `⚠️ ${failureLabel}: ${errMsg}`,
+          { detail: errMsg },
+        ),
+        streaming: false,
+        memoryExcluded: true,
+      }, { source: 'daemon', confidence: 'high' });
       timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
       if (!receiptAcked) {
         emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
@@ -4853,7 +4888,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       await handleGetSessions(serverLink);
       await syncSubSessionIfNeeded(sessionName, serverLink);
       timelineEmitter.emit(sessionName, 'assistant.text', {
-        text: 'Started a fresh conversation',
+        ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_STARTED, 'Started a fresh conversation'),
         streaming: false,
         memoryExcluded: true,
       }, { source: 'daemon', confidence: 'high' });
@@ -4863,7 +4898,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       logger.error({ sessionName, err }, 'session.clear failed');
-      timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Clear failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'assistant.text', { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_CLEAR_FAILED, `⚠️ Clear failed: ${errMsg}`, { detail: errMsg }), streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
       timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
       emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
     }

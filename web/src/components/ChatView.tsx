@@ -12,6 +12,7 @@ import {
   type SupervisionExecutionState,
 } from '@shared/supervision-config.js';
 import { SUPERVISION_HEARTBEAT_GLYPH } from '@shared/supervision-heartbeat.js';
+import { localizeDaemonUserNoticeEvent } from '../daemon-user-notice-i18n.js';
 /**
  * ChatView — renders TimelineEvent[] as a chat-style view.
  * Merges consecutive streaming assistant.text events into single blocks.
@@ -2437,11 +2438,15 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   // session pane / sub-session window) keeps the full list so "load older"
   // and infinite scroll-back continue to work — only the rendered slice is
   // capped further down (`renderedViewItems`).
-  const sourceEvents = useMemo(
+  const rawSourceEvents = useMemo(
     () => (preview && events.length > PREVIEW_EVENT_TAIL_LIMIT
       ? events.slice(-PREVIEW_EVENT_TAIL_LIMIT)
       : events),
     [preview, events],
+  );
+  const sourceEvents = useMemo(
+    () => rawSourceEvents.map((event) => localizeDaemonUserNoticeEvent(event, t)),
+    [rawSourceEvents, t, i18n?.resolvedLanguage],
   );
   const effectiveRenderLimit = preview ? PREVIEW_RENDER_ITEM_LIMIT : renderItemLimit;
   // Derived from a window of recent events, not the whole session: the renderer

@@ -17,6 +17,7 @@ import { isP2pParticipantMemoryNoise } from './p2p-memory-filter.js';
 import { handlePreviewBinaryFrame } from './preview-relay.js';
 import { buildSessionList, resolveAuthoritativeSessionListState } from './session-list.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import { attachDaemonUserNotice, DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
 import { isExecutionClone, sweepExecutionClones, destroyExecutionClone, resolveExecutionCloneRetentionMs } from './execution-clone.js';
 import { EXECUTION_CLONE_TIMELINE } from '../../shared/execution-clone.js';
 import { startLatencyTracer } from './latency-tracer.js';
@@ -2163,7 +2164,11 @@ export async function recoverCodexStalledSession(
     s.name,
     'assistant.text',
     {
-      text: '⚠️ Codex watchdog stopped a stale turn after 12 minutes with no activity and sent `continue`.',
+      ...attachDaemonUserNotice(
+        DAEMON_USER_NOTICE_CODE.CODEX_WATCHDOG_RECOVERED,
+        '⚠️ Codex watchdog stopped a stale turn after 12 minutes with no activity and sent `continue`.',
+        { minutes: CODEX_STALE_ACTIVE_TURN_AUTO_CONTINUE_AFTER_MS / 60_000 },
+      ),
       streaming: false,
       automation: true,
       memoryExcluded: true,
@@ -2227,7 +2232,11 @@ export async function recoverMemoryCompressionStalledSession(
     sessionName,
     'assistant.text',
     {
-      text: '⚠️ Memory compression watchdog stopped a stale turn after 6 minutes and sent `continue`.',
+      ...attachDaemonUserNotice(
+        DAEMON_USER_NOTICE_CODE.MEMORY_WATCHDOG_RECOVERED,
+        '⚠️ Memory compression watchdog stopped a stale turn after 6 minutes and sent `continue`.',
+        { minutes: MEMORY_COMPRESSION_AUTO_CONTINUE_AFTER_MS / 60_000 },
+      ),
       streaming: false,
       automation: true,
       memoryExcluded: true,
