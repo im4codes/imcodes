@@ -221,9 +221,9 @@ describe('assistant execution status chips', () => {
   }) as any;
 
   it.each([
-    [SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING, 'Waiting', 'waiting'],
-    [SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT, 'Needs input', 'needs-input'],
-  ])('renders a completed %s marker as an accessible chip while hiding the marker', (marker, label, stateClass) => {
+    [SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING, 'Waiting', 'waiting', '⏳'],
+    [SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT, 'Needs input', 'needs-input', '❗'],
+  ])('renders a completed %s marker as an accessible chip while hiding the marker', (marker, label, stateClass, glyph) => {
     const { container } = render(
       <ChatView
         events={[assistant(`Visible answer\n${marker}`, { streaming: false })]}
@@ -234,7 +234,7 @@ describe('assistant execution status chips', () => {
 
     const chip = container.querySelector(`.chat-execution-status-chip.${stateClass}`);
     expect(chip).not.toBeNull();
-    expect(chip?.textContent).toBe(label);
+    expect(chip?.textContent).toBe(`${glyph}${label}`);
     expect(chip?.getAttribute('aria-label')).toBe(label);
     expect(chip?.getAttribute('title')).toBe(label);
     expect(container.textContent).toContain('Visible answer');
@@ -350,7 +350,13 @@ describe('supervision automation prompt labels', () => {
       );
 
       const disclosure = container.querySelector('.chat-supervision-prompt-toggle');
-      expect(disclosure?.textContent).toBe(expectedLabelByKey[labelKey]);
+      const heartbeat = [
+        SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND,
+        SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND,
+        SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND,
+      ].includes(automationKind as never);
+      expect(disclosure?.textContent).toBe(`${heartbeat ? '❤️' : ''}${expectedLabelByKey[labelKey]}`);
+      expect(container.querySelector('.chat-supervision-prompt')?.classList.contains('is-heartbeat')).toBe(heartbeat);
       expect(disclosure?.getAttribute('aria-expanded')).toBe('false');
       expect(container.querySelector('.chat-supervision-prompt-details')).toBeNull();
       expect(container.textContent).not.toContain('contractRefs');

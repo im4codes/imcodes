@@ -587,3 +587,36 @@ describe('mergeSessionListEntry — structured transport queue sync', () => {
     expect(merged.transportPendingMessageVersion).toBe(3);
   });
 });
+
+describe('mergeSessionListEntry — supervision heartbeat projection', () => {
+  it('accepts a valid schedule, preserves it across sparse rows, and applies explicit clear', () => {
+    const armed = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      supervisionHeartbeat: {
+        state: 'armed', kind: 'waiting', nextHeartbeatAt: 20_000, updatedAt: 10_000,
+      },
+    }, undefined);
+    expect(armed.supervisionHeartbeat).toEqual({
+      state: 'armed', kind: 'waiting', nextHeartbeatAt: 20_000, updatedAt: 10_000,
+    });
+
+    expect(mergeSessionListEntry(BASE_INCOMING, armed).supervisionHeartbeat)
+      .toEqual(armed.supervisionHeartbeat);
+    expect(mergeSessionListEntry({
+      ...BASE_INCOMING,
+      supervisionHeartbeat: null,
+    }, armed).supervisionHeartbeat).toBeNull();
+  });
+
+  it('fails closed instead of exposing malformed daemon schedule data', () => {
+    const merged = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      supervisionHeartbeat: {
+        state: 'armed', kind: 'waiting', updatedAt: 10_000,
+      },
+    }, makeExisting({
+      supervisionHeartbeat: { state: 'idle', updatedAt: 9_000 },
+    }));
+    expect(merged.supervisionHeartbeat).toBeNull();
+  });
+});

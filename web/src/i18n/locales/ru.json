@@ -758,6 +758,18 @@
     "supervision": {
       "title": "Контроль сессии",
       "help": "Настройте единый глобальный runtime надзора для всех Auto-сессий.",
+      "heartbeat": {
+        "paused": "Надзор включён; проверка связи не запланирована",
+        "needsInput": "Для надзора нужен ваш ввод; проверка связи приостановлена",
+        "sending": "отправка…",
+        "armedLabel": "Проверка «{{kind}}» через {{countdown}}; время: {{time}}",
+        "sendingLabel": "Проверка «{{kind}}» отправляется; время: {{time}}",
+        "kind": {
+          "waiting": "надзор",
+          "audit": "аудит",
+          "implementation": "реализация"
+        }
+      },
       "globalDefaultsTitle": "Глобальные значения по умолчанию",
       "globalDefaultsHelp": "Все сессии используют этот основной runtime, timeout и необязательный резервный runtime.",
       "globalPrimaryRuntime": "Основной runtime",

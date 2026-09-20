@@ -15,6 +15,16 @@ html { position: fixed; }
   --chrome-accent-2: #34d399;
   --chrome-accent-3: #a78bfa;
   --chrome-warm: #f59e0b;
+  --supervision-heartbeat-bg: #401523;
+  --supervision-heartbeat-border: rgba(251, 113, 133, 0.58);
+  --supervision-heartbeat-text: #fecdd3;
+  --supervision-heartbeat-glow: rgba(251, 113, 133, 0.72);
+  --supervision-waiting-bg: rgba(3, 105, 161, 0.23);
+  --supervision-waiting-border: rgba(56, 189, 248, 0.48);
+  --supervision-waiting-text: #bae6fd;
+  --supervision-needs-input-bg: rgba(120, 53, 15, 0.32);
+  --supervision-needs-input-border: rgba(251, 191, 36, 0.56);
+  --supervision-needs-input-text: #fde68a;
   /* The desktop vertical rail is one compact bottom sub-session card wide. */
   --subsession-compact-card-width: 54px;
   /* Team progress needs readable topics/status while remaining much narrower
@@ -699,7 +709,48 @@ html.native-ios-mac .chat-dl-btn {
 .shortcuts::-webkit-scrollbar { display: none; }
 .shortcuts-meta-scroll { display: contents; }
 .shortcuts-model { padding: 4px 8px 4px 0; flex-shrink: 0; position: relative; }
-.shortcuts-model-supervision { display: inline-flex; align-items: center; gap: 4px; }
+.shortcuts-model-supervision { position: relative; display: inline-flex; align-items: center; gap: 4px; }
+.supervision-heartbeat-badge {
+  position: absolute;
+  z-index: 8;
+  top: -5px;
+  right: -5px;
+  display: inline-flex;
+  min-width: 19px;
+  height: 14px;
+  box-sizing: border-box;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  padding: 0 3px;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  border-radius: 999px;
+  background: #182131;
+  color: #cbd5e1;
+  font-size: 8px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  line-height: 12px;
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
+}
+.supervision-heartbeat-badge.is-armed {
+  border-color: var(--supervision-heartbeat-border);
+  background: var(--supervision-heartbeat-bg);
+  color: var(--supervision-heartbeat-text);
+}
+.supervision-heartbeat-badge.is-needs-input {
+  border-color: var(--supervision-needs-input-border);
+  background: var(--supervision-needs-input-bg);
+  color: var(--supervision-needs-input-text);
+}
+.supervision-heartbeat-badge.is-sending { animation: supervision-heartbeat-pulse 0.72s ease-in-out infinite alternate; }
+.supervision-heartbeat-glyph { display: inline-block; line-height: 1; }
+@keyframes supervision-heartbeat-pulse {
+  from { transform: scale(1); box-shadow: 0 0 3px rgba(251, 113, 133, 0.3); }
+  to { transform: scale(1.08); box-shadow: 0 0 9px var(--supervision-heartbeat-glow); }
+}
 .session-ctx-wrap { display: flex; align-items: center; gap: 4px; padding: 4px 8px 4px 0; flex-shrink: 0; cursor: default; }
 .session-ctx-label { font-size: 10px; color: #7b8797; white-space: nowrap; }
 .session-ctx-bar { position: relative; width: 60px; height: 5px; background: rgba(15,23,42,0.92); border: 1px solid rgba(125,211,252,0.14); border-radius: 999px; overflow: hidden; box-shadow: inset 0 0 8px rgba(0,0,0,0.42), 0 0 10px rgba(34,211,238,0.06); }
@@ -5026,12 +5077,23 @@ html.native-ios-mac .chat-dl-btn {
   line-height: 1.5;
   text-overflow: ellipsis;
   white-space: nowrap;
+  gap: 4px;
+  font-weight: 650;
 }
 .chat-assistant-status-only .chat-execution-status-chip { margin-top: 0; }
+.chat-execution-status-chip.waiting {
+  border-color: var(--supervision-waiting-border);
+  background: var(--supervision-waiting-bg);
+  color: var(--supervision-waiting-text);
+}
+.chat-execution-status-chip.waiting .chat-execution-status-glyph {
+  display: inline-block;
+  animation: chat-waiting-sway 1.15s ease-in-out infinite alternate;
+}
 .chat-execution-status-chip.needs-input {
-  border-color: rgba(251, 191, 36, 0.32);
-  background: rgba(120, 53, 15, 0.18);
-  color: #fcd34d;
+  border-color: var(--supervision-needs-input-border);
+  background: var(--supervision-needs-input-bg);
+  color: var(--supervision-needs-input-text);
 }
 .chat-user-supervision-prompt {
   align-self: flex-start;
@@ -5058,6 +5120,34 @@ html.native-ios-mac .chat-dl-btn {
   text-overflow: ellipsis;
   white-space: nowrap;
   cursor: pointer;
+}
+.chat-supervision-prompt.is-heartbeat .chat-supervision-prompt-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border-color: var(--supervision-heartbeat-border);
+  background: var(--supervision-heartbeat-bg);
+  color: var(--supervision-heartbeat-text);
+  font-weight: 650;
+}
+.chat-supervision-heartbeat-glyph {
+  display: inline-block;
+  line-height: 1;
+  animation: chat-heartbeat-beat 1.1s ease-in-out infinite;
+}
+@keyframes chat-heartbeat-beat {
+  0%, 42%, 100% { transform: scale(1); }
+  15% { transform: scale(1.22); }
+  28% { transform: scale(1.07); }
+}
+@keyframes chat-waiting-sway {
+  from { transform: translateY(-1px) rotate(-7deg); opacity: 0.78; }
+  to { transform: translateY(1px) rotate(7deg); opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .supervision-heartbeat-badge.is-sending,
+  .chat-execution-status-chip.waiting .chat-execution-status-glyph,
+  .chat-supervision-heartbeat-glyph { animation: none; }
 }
 .chat-supervision-prompt-toggle:hover,
 .chat-supervision-prompt-toggle:focus-visible {

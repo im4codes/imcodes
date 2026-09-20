@@ -758,6 +758,18 @@
     "supervision": {
       "title": "セッション監督",
       "help": "すべての Auto セッションで共有するグローバル監督ランタイムを設定します。",
+      "heartbeat": {
+        "paused": "監督は有効ですが、ハートビートは予定されていません",
+        "needsInput": "監督に入力が必要なため、ハートビートは一時停止中です",
+        "sending": "送信中…",
+        "armedLabel": "{{kind}}ハートビートまで {{countdown}}（予定時刻 {{time}}）",
+        "sendingLabel": "{{kind}}ハートビートを送信中（予定時刻 {{time}}）",
+        "kind": {
+          "waiting": "監督",
+          "audit": "監査",
+          "implementation": "実装"
+        }
+      },
       "globalDefaultsTitle": "グローバル既定値",
       "globalDefaultsHelp": "すべてのセッションがこの主ランタイム、タイムアウト、任意の予備ランタイムを使用します。",
       "globalPrimaryRuntime": "主ランタイム",

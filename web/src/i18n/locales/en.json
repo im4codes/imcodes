@@ -758,6 +758,18 @@
     "supervision": {
       "title": "Session supervision",
       "help": "Set one global supervisor runtime shared by every Auto-enabled session.",
+      "heartbeat": {
+        "paused": "Supervision is on; no heartbeat is scheduled",
+        "needsInput": "Supervision needs your input; heartbeat paused",
+        "sending": "sending…",
+        "armedLabel": "{{kind}} heartbeat in {{countdown}}; scheduled for {{time}}",
+        "sendingLabel": "{{kind}} heartbeat is sending; scheduled for {{time}}",
+        "kind": {
+          "waiting": "Supervision",
+          "audit": "Audit",
+          "implementation": "Implementation"
+        }
+      },
       "globalDefaultsTitle": "Global defaults",
       "globalDefaultsHelp": "All sessions use this primary runtime, timeout, and optional backup runtime.",
       "globalPrimaryRuntime": "Primary runtime",

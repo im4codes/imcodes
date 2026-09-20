@@ -10,6 +10,7 @@ import { EXECUTION_CLONE_KIND, type ExecutionCloneMetadata } from '../../shared/
 import logger from '../util/logger.js';
 import type { QueueSnapshot } from '../../shared/transport-queue-types.js';
 import { buildTransportQueueSnapshotPayload, type TransportQueueSnapshotPayload } from './transport-queue-projection.js';
+import { getSupervisionHeartbeatProjectionForWire } from './supervision-heartbeat-projection.js';
 
 /**
  * Runtime-identity fields that MUST NOT replicate to Postgres for an execution
@@ -139,6 +140,7 @@ export async function buildSubSessionSyncPayload(
     contextRetryExhausted: r.contextRetryExhausted ?? null,
     contextSharedPolicyOverride: r.contextSharedPolicyOverride ?? null,
     transportConfig: r.transportConfig ?? null,
+    supervisionHeartbeat: getSupervisionHeartbeatProjectionForWire(sessionName) ?? null,
     qwenModel: r.qwenModel ?? null,
     qwenAuthType: r.qwenAuthType ?? null,
     qwenAuthLimit: r.qwenAuthLimit ?? null,

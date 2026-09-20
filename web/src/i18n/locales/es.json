@@ -758,6 +758,18 @@
     "supervision": {
       "title": "Supervisión de sesión",
       "help": "Configura un runtime global de supervisión compartido por todas las sesiones con Auto.",
+      "heartbeat": {
+        "paused": "La supervisión está activa; no hay ningún latido programado",
+        "needsInput": "La supervisión necesita tu intervención; latido en pausa",
+        "sending": "enviando…",
+        "armedLabel": "Latido de {{kind}} en {{countdown}}; programado para las {{time}}",
+        "sendingLabel": "El latido de {{kind}} se está enviando; programado para las {{time}}",
+        "kind": {
+          "waiting": "supervisión",
+          "audit": "auditoría",
+          "implementation": "implementación"
+        }
+      },
       "globalDefaultsTitle": "Valores globales por defecto",
       "globalDefaultsHelp": "Todas las sesiones usan este runtime principal, timeout y runtime de respaldo opcional.",
       "globalPrimaryRuntime": "Runtime principal",

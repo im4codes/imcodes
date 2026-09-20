@@ -1095,6 +1095,7 @@ const SHARE_VISIBLE_SESSION_FIELDS = new Set([
   'error',
   'activeModel',
   'modelDisplay',
+  'supervisionHeartbeat',
 ]);
 
 function redactSessionRow(row: Record<string, unknown>, includeActiveDispatch: boolean): Record<string, unknown> {
@@ -1124,6 +1125,7 @@ const SHARE_VISIBLE_SUBSESSION_FIELDS = new Set([
   'state',
   'activeModel',
   'modelDisplay',
+  'supervisionHeartbeat',
 ]);
 
 function redactSubsessionCreated(

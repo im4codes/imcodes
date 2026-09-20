@@ -21,6 +21,7 @@ import { ConfirmButton } from './ConfirmButton.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import { SessionActionMenuIcon } from './SessionActionMenuIcon.js';
+import { SupervisionHeartbeatBadge } from './SupervisionHeartbeatBadge.js';
 import * as VoiceInput from './VoiceInput.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
 import { AtPicker } from './AtPicker.js';
@@ -5623,6 +5624,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               <span class="shortcut-btn-auto-label">{quickSupervisionLabel}</span>
               <span class="shortcut-btn-auto-caret" aria-hidden="true">▾</span>
             </button>
+            <SupervisionHeartbeatBadge
+              mode={quickSupervisionMode}
+              heartbeat={activeSession?.supervisionHeartbeat}
+            />
             {canQuickViewSupervision && autoOpen && (
               <div class="menu-dropdown menu-dropdown-auto">
                 <button

@@ -23,6 +23,7 @@
 import { mergeTransportConfigPreservingSupervision } from '@shared/supervision-config.js';
 import type { SessionInfo } from './types.js';
 import { resolveRuntimeType } from './runtime-type.js';
+import { parseSupervisionHeartbeatSnapshot } from '@shared/supervision-heartbeat.js';
 import {
   buildTransportPendingSyncPatch,
   hasTransportPendingSyncSnapshot,
@@ -71,6 +72,7 @@ export interface IncomingSessionListEntry {
   contextNamespaceDiagnostics?: string[];
   transportConfig?: Record<string, unknown> | null;
   supervisionMode?: SessionInfo['supervisionMode'];
+  supervisionHeartbeat?: unknown;
   transportPendingMessages?: unknown;
   transportPendingMessageEntries?: unknown;
   pendingMessageEntries?: unknown;
@@ -189,6 +191,9 @@ export function mergeSessionListEntry(
       incoming.transportConfig,
       existing?.transportConfig,
     ),
+    supervisionHeartbeat: incoming.supervisionHeartbeat === undefined
+      ? existing?.supervisionHeartbeat
+      : parseSupervisionHeartbeatSnapshot(incoming.supervisionHeartbeat),
     supervisionMode: incoming.supervisionMode !== undefined
       ? incoming.supervisionMode
       : existing?.supervisionMode,

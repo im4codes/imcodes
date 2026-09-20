@@ -18,6 +18,8 @@ import { buildTransportQueueSnapshotPayload } from './transport-queue-projection
 import { expireResendEntries } from './transport-resend-queue.js';
 import { validateExecutionTemplateCandidate } from './execution-clone.js';
 import { isWorkingSessionState } from '../../shared/session-activity-types.js';
+import type { SupervisionHeartbeatSnapshot } from '../../shared/supervision-heartbeat.js';
+import { getSupervisionHeartbeatProjectionForWire } from './supervision-heartbeat-projection.js';
 
 export interface SessionListItem extends SessionContextBootstrapState {
   name: string;
@@ -75,6 +77,7 @@ export interface SessionListItem extends SessionContextBootstrapState {
   /** Ineligibility reason code (an `EXECUTION_CLONE_ERROR_CODES` value) set ONLY
    *  when `executionTemplateEligible` is false. Absent when eligible. */
   executionTemplateIneligibleReason?: string;
+  supervisionHeartbeat?: SupervisionHeartbeatSnapshot;
 }
 
 /**
@@ -191,6 +194,7 @@ function baseItem(s: SessionRecord): SessionListItem {
     label: s.label,
     userCreated: s.userCreated,
     transportConfig: s.transportConfig,
+    supervisionHeartbeat: getSupervisionHeartbeatProjectionForWire(s.name),
     ...(queuePayload ?? {}),
     executionTemplateEligible: eligibility.eligible,
     ...(eligibility.eligible

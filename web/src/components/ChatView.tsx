@@ -4,10 +4,14 @@ import {
 } from '../../../src/shared/timeline/types.js';
 import {
   SUPERVISION_AUTOMATION_KIND_PREFIX,
+  SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND,
   SUPERVISION_EXECUTION_STATES,
+  SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND,
   SUPERVISION_USER_PROMPT_LABEL_KEYS,
+  SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND,
   type SupervisionExecutionState,
 } from '@shared/supervision-config.js';
+import { SUPERVISION_HEARTBEAT_GLYPH } from '@shared/supervision-heartbeat.js';
 /**
  * ChatView — renders TimelineEvent[] as a chat-style view.
  * Merges consecutive streaming assistant.text events into single blocks.
@@ -4526,9 +4530,9 @@ const AssistantBlock = memo(function AssistantBlock({
 }: AssistantBlockProps) {
   const { t } = useTranslation();
   const status = executionState === SUPERVISION_EXECUTION_STATES.WAITING
-    ? { className: 'waiting', label: t('chat.execution_status.waiting') }
+    ? { className: 'waiting', glyph: SUPERVISION_HEARTBEAT_GLYPH.WAITING, label: t('chat.execution_status.waiting') }
     : executionState === SUPERVISION_EXECUTION_STATES.NEEDS_INPUT
-      ? { className: 'needs-input', label: t('chat.execution_status.needs_input') }
+      ? { className: 'needs-input', glyph: SUPERVISION_HEARTBEAT_GLYPH.NEEDS_INPUT, label: t('chat.execution_status.needs_input') }
       : null;
   const statusOnly = text.length === 0 && status !== null;
   return (
@@ -4544,6 +4548,7 @@ const AssistantBlock = memo(function AssistantBlock({
           aria-label={status.label}
           title={status.label}
         >
+          <span class="chat-execution-status-glyph" aria-hidden="true">{status.glyph}</span>
           {status.label}
         </span>
       )}
@@ -4654,18 +4659,23 @@ function supervisionUserPromptLabelKey(payload: Record<string, unknown>): string
 function SupervisionAutomationPrompt({
   text,
   label,
+  automationKind,
   showDetailsLabel,
   hideDetailsLabel,
 }: {
   text: string;
   label: string;
+  automationKind: string;
   showDetailsLabel: string;
   hideDetailsLabel: string;
 }) {
   const [expanded, setExpanded] = useState(false);
   const actionLabel = expanded ? hideDetailsLabel : showDetailsLabel;
+  const heartbeat = automationKind === SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND
+    || automationKind === SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND
+    || automationKind === SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND;
   return (
-    <div class="chat-supervision-prompt">
+    <div class={`chat-supervision-prompt${heartbeat ? ' is-heartbeat' : ''}`}>
       <button
         type="button"
         class="chat-supervision-prompt-toggle"
@@ -4674,6 +4684,7 @@ function SupervisionAutomationPrompt({
         title={actionLabel}
         onClick={() => setExpanded((value) => !value)}
       >
+        {heartbeat && <span class="chat-supervision-heartbeat-glyph" aria-hidden="true">{SUPERVISION_HEARTBEAT_GLYPH.ARMED}</span>}
         {label}
       </button>
       {expanded && (
@@ -4722,6 +4733,7 @@ const ChatEvent = memo(function ChatEvent({
             <SupervisionAutomationPrompt
               text={rawUserText}
               label={t(supervisionPromptLabelKey)}
+              automationKind={String(event.payload.automationKind)}
               showDetailsLabel={t('chat.supervision_prompt.show_details')}
               hideDetailsLabel={t('chat.supervision_prompt.hide_details')}
             />

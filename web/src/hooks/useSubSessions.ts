@@ -22,6 +22,10 @@ import {
 import { getSessionRuntimeType, isTransportSessionAgentType } from '@shared/agent-types.js';
 import { getAutoSessionLabelPrefix } from '../agent-display.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
+import {
+  parseSupervisionHeartbeatSnapshot,
+  type SupervisionHeartbeatSnapshot,
+} from '@shared/supervision-heartbeat.js';
 import { TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE, type QueueEvent } from '@shared/transport-queue-types.js';
 import { isValidTransportQueueWireEvent } from '@shared/transport-queue-wire.js';
 
@@ -36,6 +40,7 @@ export interface SubSession extends SubSessionData {
   failedMessageEntries?: import('../transport-queue.js').TransportPendingMessageEntry[] | null;
   /** Newest pending-queue version applied. Drops stale snapshots. */
   transportPendingMessageVersion?: number | null;
+  supervisionHeartbeat?: SupervisionHeartbeatSnapshot | null;
 }
 
 /**
@@ -77,6 +82,9 @@ function mergeLoadedSubSession(s: SubSessionData, existing?: SubSession): SubSes
     queueAuthorityId: existing.queueAuthorityId ?? base.queueAuthorityId,
     failedMessageEntries: existing.failedMessageEntries ?? base.failedMessageEntries,
     transportPendingMessageVersion: existing.transportPendingMessageVersion ?? base.transportPendingMessageVersion,
+    supervisionHeartbeat: existing.supervisionHeartbeat !== undefined
+      ? existing.supervisionHeartbeat
+      : base.supervisionHeartbeat,
     ...(preserveCodexDisplay ? {
       codexAvailableModels: base.codexAvailableModels ?? existing.codexAvailableModels ?? null,
       requestedModel: base.requestedModel ?? existing.requestedModel ?? null,
@@ -375,6 +383,7 @@ export function useSubSessions(
               parentRunId: m.parentRunId ?? null,
               transportConfig: m.transportConfig ?? null,
               supervisionMode: m.supervisionMode ?? null,
+              supervisionHeartbeat: parseSupervisionHeartbeatSnapshot(m.supervisionHeartbeat),
               ...transportPendingPatch,
             }];
           });
@@ -427,6 +436,9 @@ export function useSubSessions(
                 ),
               } : {}),
               ...(m.supervisionMode !== undefined ? { supervisionMode: m.supervisionMode } : {}),
+              ...(m.supervisionHeartbeat !== undefined ? {
+                supervisionHeartbeat: parseSupervisionHeartbeatSnapshot(m.supervisionHeartbeat),
+              } : {}),
               ...transportPendingPatch,
             };
           }));

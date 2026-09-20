@@ -540,6 +540,9 @@ describe('WsBridge share-scoped sockets', () => {
               taskRunPromptVersion: 'task_run_status_v1',
             },
           },
+          supervisionHeartbeat: {
+            state: 'armed', kind: 'audit', nextHeartbeatAt: 2_000, updatedAt: 1_000,
+          },
         },
         { name: 'deck_other_brain', runtimeType: 'transport' },
       ],
@@ -554,6 +557,9 @@ describe('WsBridge share-scoped sockets', () => {
       runtimeType: 'transport',
       projectDir: '/owner/project',
       supervisionMode: 'supervised_audit',
+      supervisionHeartbeat: {
+        state: 'armed', kind: 'audit', nextHeartbeatAt: 2_000, updatedAt: 1_000,
+      },
     }]);
     expect((sharedList?.sessions as Array<Record<string, unknown>>)[0]).not.toHaveProperty('transportConfig');
   });
@@ -581,6 +587,9 @@ describe('WsBridge share-scoped sockets', () => {
       },
       providerId: 'private-provider',
       requestedModel: 'private-model',
+      supervisionHeartbeat: {
+        state: 'paused_needs_input', updatedAt: 1_000,
+      },
     }, state);
 
     expect(filtered).toMatchObject({
@@ -588,6 +597,9 @@ describe('WsBridge share-scoped sockets', () => {
       id: 'child',
       sessionName: 'deck_sub_child',
       supervisionMode: 'supervised',
+      supervisionHeartbeat: {
+        state: 'paused_needs_input', updatedAt: 1_000,
+      },
     });
     expect(filtered).not.toHaveProperty('transportConfig');
     expect(filtered).not.toHaveProperty('providerId');

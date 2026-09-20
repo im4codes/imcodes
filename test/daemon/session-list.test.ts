@@ -505,4 +505,40 @@ describe('buildSessionList', () => {
       }),
     });
   });
+
+  it('replays the daemon-owned heartbeat deadline in a fresh session_list snapshot', async () => {
+    const store = await import('../../src/store/session-store.js');
+    store.upsertSession({
+      name: 'deck_heartbeat_brain',
+      projectName: 'heartbeat',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    const projection = await import('../../src/daemon/supervision-heartbeat-projection.js');
+    projection.setSupervisionHeartbeatProjection('deck_heartbeat_brain', {
+      state: 'armed',
+      kind: 'waiting',
+      nextHeartbeatAt: 20_000,
+      updatedAt: 10_000,
+    });
+
+    const { buildSessionList } = await import('../../src/daemon/session-list.js');
+    expect(await buildSessionList()).toEqual([
+      expect.objectContaining({
+        name: 'deck_heartbeat_brain',
+        supervisionHeartbeat: {
+          state: 'armed',
+          kind: 'waiting',
+          nextHeartbeatAt: 20_000,
+          updatedAt: expect.any(Number),
+        },
+      }),
+    ]);
+  });
 });

@@ -41,6 +41,7 @@ import {
 import logger from '../util/logger.js';
 import {
   PEER_AUDIT_REWORK_AUTOMATION_KIND,
+  SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND,
   SUPERVISION_AUDIT_ENABLED_STATUS,
   SUPERVISION_AUDIT_DELEGATION_AUTOMATION_KIND,
   SUPERVISION_CONTRACT_IDS,
@@ -113,6 +114,15 @@ import {
   type PeerAuditTerminalOutcome,
 } from '../../shared/peer-audit.js';
 import { TIMELINE_EVENT_FILE_CHANGE, type FileChangePatch } from '../../shared/file-change.js';
+import {
+  SUPERVISION_HEARTBEAT_KIND,
+  SUPERVISION_HEARTBEAT_STATE,
+  type SupervisionHeartbeatSnapshot,
+} from '../../shared/supervision-heartbeat.js';
+import {
+  SUPERVISION_HEARTBEAT_PROJECTION_SOURCE,
+  setSupervisionHeartbeatProjection,
+} from './supervision-heartbeat-projection.js';
 import { peerAuditService } from './peer-audit-service.js';
 import type { SupervisionAuditDepth } from './supervision-broker.js';
 import { emitPeerAuditResult } from './peer-audit-result.js';
@@ -1094,6 +1104,7 @@ class SupervisionAutomation {
   private eventSequence = 0;
   /** Test-only compatibility seam for the retired daemon-owned audit driver. */
   private automaticPeerAuditCompatibilityForTests = false;
+  private assignmentHeartbeatProjectionSessions = new Set<string>();
 
   __setAutomaticPeerAuditCompatibilityForTests(enabled: boolean): void {
     if (process.env.NODE_ENV !== 'test') return;
@@ -1104,6 +1115,43 @@ class SupervisionAutomation {
   /** Presentation seam for the console; this is authoritative run state. */
   isWaitingForUserInput(sessionName: string): boolean {
     return this.heartbeatPausedForNeedsInput.has(sessionName);
+  }
+
+  /** Project the current daemon-owned deadline; browsers own the 1s tick. */
+  private publishHeartbeatProjection(
+    sessionName: string,
+    snapshotOverride?: SessionSupervisionSnapshot | null,
+  ): void {
+    const configured = snapshotOverride === undefined
+      ? extractSessionSupervisionSnapshot(getSession(sessionName)?.transportConfig ?? null)
+      : snapshotOverride;
+    const now = Date.now();
+    let projection: SupervisionHeartbeatSnapshot;
+    if (!isBrainOwnedAutomaticSupervision(sessionName, configured)) {
+      projection = { state: SUPERVISION_HEARTBEAT_STATE.OFF, updatedAt: now };
+    } else if (this.heartbeatPausedForNeedsInput.has(sessionName)) {
+      projection = { state: SUPERVISION_HEARTBEAT_STATE.PAUSED_NEEDS_INPUT, updatedAt: now };
+    } else {
+      const run = this.activeRuns.get(sessionName);
+      if (run?.waitingHeartbeatTimer && run.waitingNextHeartbeatAt !== undefined) {
+        projection = {
+          state: SUPERVISION_HEARTBEAT_STATE.ARMED,
+          kind: SUPERVISION_HEARTBEAT_KIND.WAITING,
+          nextHeartbeatAt: run.waitingNextHeartbeatAt,
+          updatedAt: now,
+        };
+      } else if (run?.auditDeadlineTimer && run.auditDeadlineAt !== undefined) {
+        projection = {
+          state: SUPERVISION_HEARTBEAT_STATE.ARMED,
+          kind: SUPERVISION_HEARTBEAT_KIND.AUDIT,
+          nextHeartbeatAt: run.auditDeadlineAt,
+          updatedAt: now,
+        };
+      } else {
+        projection = { state: SUPERVISION_HEARTBEAT_STATE.IDLE, updatedAt: now };
+      }
+    }
+    setSupervisionHeartbeatProjection(sessionName, projection);
   }
 
   private readonly executionPoolWarned = new Set<string>();
@@ -1213,7 +1261,7 @@ class SupervisionAutomation {
       if (!canSessionRoleOwnAutomaticSupervision(session.role)) continue;
       this.applyPersistedSnapshot(session.name);
     }
-    this.implementationWatchdogTimer = setInterval(() => {
+    const runImplementationWatchdogTick = () => {
       // The tick is asynchronous now, so it can outlive its interval. Guard
       // re-entry: overlapping watchdog passes would re-create exactly the
       // pile-up of concurrent worktree inspections this change removes.
@@ -1222,8 +1270,12 @@ class SupervisionAutomation {
       void this.checkImplementationAssignments(Date.now())
         .catch((error) => { logger.warn({ err: error }, 'Supervision implementation watchdog failed'); })
         .finally(() => { this.implementationWatchdogRunning = false; });
-    }, IMPLEMENTATION_WATCHDOG_TICK_MS);
+    };
+    this.implementationWatchdogTimer = setInterval(runImplementationWatchdogTick, IMPLEMENTATION_WATCHDOG_TICK_MS);
     this.implementationWatchdogTimer.unref?.();
+    // Populate replayable implementation/audit deadlines immediately. A
+    // freshly connected browser must not wait for the first minute tick.
+    queueMicrotask(runImplementationWatchdogTick);
     // A runtime may already be live when lifecycle wiring finishes. The normal
     // session.state running/idle path below covers later restores/reconnects.
     queueMicrotask(() => this.flushAllProjectBrainModeStates());
@@ -1566,6 +1618,10 @@ class SupervisionAutomation {
 
   private async checkImplementationAssignments(now: number): Promise<void> {
     const registry = getSupervisionTaskRegistry();
+    const assignmentSchedules = new Map<string, {
+      kind: typeof SUPERVISION_HEARTBEAT_KIND.AUDIT | typeof SUPERVISION_HEARTBEAT_KIND.IMPLEMENTATION;
+      dueAt: number;
+    }>();
     // Production housekeeping is inert until an administrator has reviewed a
     // dry-run and explicitly called apply. Once authorized, this advances one
     // bounded cursor page per cooldown tick and remains restart-idempotent.
@@ -1697,6 +1753,14 @@ class SupervisionAutomation {
         const dueAt = latestAttempt
           ? latestAttempt.createdAt + cooldown
           : progressAt + IMPLEMENTATION_IDLE_REMINDER_MS;
+        const sessionName = assignment.identity.sessionName;
+        const scheduleKind = watchdogKind === 'audit'
+          ? SUPERVISION_HEARTBEAT_KIND.AUDIT
+          : SUPERVISION_HEARTBEAT_KIND.IMPLEMENTATION;
+        const priorSchedule = assignmentSchedules.get(sessionName);
+        if (!priorSchedule || dueAt < priorSchedule.dueAt) {
+          assignmentSchedules.set(sessionName, { kind: scheduleKind, dueAt });
+        }
         if (now < dueAt) continue;
 
         // A reusable session name is not delivery authority. Resolve the exact
@@ -1925,7 +1989,9 @@ class SupervisionAutomation {
             taskId: task.taskId,
             assignmentId: assignment.assignmentId,
             automation: true,
-            automationKind: SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND,
+            automationKind: watchdogKind === 'audit'
+              ? SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND
+              : SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND,
             memoryExcluded: true,
           },
           { source: 'daemon', confidence: 'high', eventId: clientMessageId },
@@ -1945,6 +2011,27 @@ class SupervisionAutomation {
         }
       }
     }
+    const projectedSessions = new Set([
+      ...this.assignmentHeartbeatProjectionSessions,
+      ...assignmentSchedules.keys(),
+    ]);
+    for (const sessionName of projectedSessions) {
+      const schedule = assignmentSchedules.get(sessionName);
+      if (schedule) {
+        setSupervisionHeartbeatProjection(sessionName, {
+          state: SUPERVISION_HEARTBEAT_STATE.ARMED,
+          kind: schedule.kind,
+          nextHeartbeatAt: schedule.dueAt,
+          updatedAt: now,
+        }, SUPERVISION_HEARTBEAT_PROJECTION_SOURCE.ASSIGNMENT);
+      } else {
+        setSupervisionHeartbeatProjection(sessionName, {
+          state: SUPERVISION_HEARTBEAT_STATE.OFF,
+          updatedAt: now,
+        }, SUPERVISION_HEARTBEAT_PROJECTION_SOURCE.ASSIGNMENT);
+      }
+    }
+    this.assignmentHeartbeatProjectionSessions = new Set(assignmentSchedules.keys());
   }
 
   setServerLink(_serverLink: ServerLink | null): void {
@@ -1977,6 +2064,7 @@ class SupervisionAutomation {
     this.appliedSnapshotFingerprints.delete(sessionName);
     this.forgetRecoveredImplicitCompletionKeys(sessionName);
     this.clearStatus(sessionName);
+    this.publishHeartbeatProjection(sessionName);
   }
 
   /** Re-apply the store's authoritative snapshot after a runtime restore. */
@@ -2047,6 +2135,7 @@ class SupervisionAutomation {
     if (!isBrainOwnedAutomaticSupervision(sessionName, normalizedSnapshot)) {
       this.heartbeatPausedForNeedsInput.delete(sessionName);
       this.cancelSession(sessionName);
+      this.publishHeartbeatProjection(sessionName, normalizedSnapshot);
       this.appliedSnapshotFingerprints.set(sessionName, snapshotFingerprint);
       return;
     }
@@ -2086,6 +2175,7 @@ class SupervisionAutomation {
         if (candidate) this.armImplicitCompletionGrace(sessionName, normalizedSnapshot, candidate);
       }
     }
+    this.publishHeartbeatProjection(sessionName, normalizedSnapshot);
     this.appliedSnapshotFingerprints.set(sessionName, snapshotFingerprint);
   }
 
@@ -2637,6 +2727,7 @@ class SupervisionAutomation {
     };
     this.recentTaskCandidates.delete(sessionName);
     this.activeRuns.set(sessionName, next);
+    this.publishHeartbeatProjection(sessionName, snapshot);
     return next;
   }
 
@@ -2661,6 +2752,7 @@ class SupervisionAutomation {
       run.waitingDeadlineAt = undefined;
       run.waitingNextHeartbeatAt = undefined;
     }
+    this.publishHeartbeatProjection(run.sessionName, run.snapshot);
   }
 
   private deletePersistedWaitState(sessionName: string): void {
@@ -3477,6 +3569,7 @@ class SupervisionAutomation {
     }, Math.max(0, run.waitingNextHeartbeatAt - Date.now()));
     heartbeatTimer.unref?.();
     run.waitingHeartbeatTimer = heartbeatTimer;
+    this.publishHeartbeatProjection(run.sessionName, run.snapshot);
   }
 
   private dispatchWaitingHeartbeat(run: ActiveTaskRunState): void {
@@ -4639,6 +4732,7 @@ class SupervisionAutomation {
     if (state === 'needs_input') this.heartbeatPausedForNeedsInput.add(sessionName);
     this.activeRuns.delete(sessionName);
     if (!options.preserveStatus) this.clearStatus(sessionName);
+    this.publishHeartbeatProjection(sessionName, run.snapshot);
   }
 
   private async startAudit(run: ActiveTaskRunState): Promise<void> {
@@ -4791,7 +4885,7 @@ class SupervisionAutomation {
     run: ActiveTaskRunState,
     options: { preserveDeadline?: boolean } = {},
   ): void {
-    this.clearAuditDeadline(run);
+    this.clearAuditDeadline(run, { publish: false });
     const now = Date.now();
     run.auditStartedAt ??= now;
     if (!options.preserveDeadline || run.auditDeadlineAt === undefined) {
@@ -4814,11 +4908,16 @@ class SupervisionAutomation {
     timer.unref?.();
     run.auditDeadlineTimer = timer;
     this.persistWaitState(run, 'auditing');
+    this.publishHeartbeatProjection(run.sessionName, run.snapshot);
   }
 
-  private clearAuditDeadline(run: ActiveTaskRunState): void {
+  private clearAuditDeadline(
+    run: ActiveTaskRunState,
+    options: { publish?: boolean } = {},
+  ): void {
     if (run.auditDeadlineTimer) clearTimeout(run.auditDeadlineTimer);
     run.auditDeadlineTimer = undefined;
+    if (options.publish !== false) this.publishHeartbeatProjection(run.sessionName, run.snapshot);
   }
 
   private emitOrchestratedAuditResult(

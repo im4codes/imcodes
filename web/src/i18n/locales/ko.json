@@ -758,6 +758,18 @@
     "supervision": {
       "title": "세션 감독",
       "help": "모든 Auto 세션이 공유하는 하나의 전역 감독 런타임을 설정합니다.",
+      "heartbeat": {
+        "paused": "감독이 켜져 있지만 예약된 하트비트가 없습니다",
+        "needsInput": "감독에 입력이 필요하여 하트비트가 일시 중지되었습니다",
+        "sending": "전송 중…",
+        "armedLabel": "{{kind}} 하트비트까지 {{countdown}} · 예정 시각 {{time}}",
+        "sendingLabel": "{{kind}} 하트비트 전송 중 · 예정 시각 {{time}}",
+        "kind": {
+          "waiting": "감독",
+          "audit": "감사",
+          "implementation": "구현"
+        }
+      },
       "globalDefaultsTitle": "전역 기본값",
       "globalDefaultsHelp": "모든 세션이 이 기본 런타임, 타임아웃 및 선택적 백업 런타임을 사용합니다.",
       "globalPrimaryRuntime": "기본 런타임",

@@ -267,6 +267,27 @@ describe('sub-session metadata via subsession.sync', () => {
     expect(captured[0].effort).toBe('high');
   });
 
+  it('applies, preserves, and clears a typed heartbeat schedule on subsession sync', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+    act(() => send({
+      type: 'subsession.created', id: 'heartbeat', sessionName: 'deck_sub_heartbeat',
+      sessionType: 'codex-sdk', state: 'idle',
+      supervisionHeartbeat: {
+        state: 'armed', kind: 'implementation', nextHeartbeatAt: 20_000, updatedAt: 10_000,
+      },
+    }));
+    expect(captured[0].supervisionHeartbeat).toMatchObject({
+      state: 'armed', kind: 'implementation', nextHeartbeatAt: 20_000,
+    });
+
+    act(() => send({ type: 'subsession.sync', id: 'heartbeat', modelDisplay: 'gpt-5.6-sol' }));
+    expect(captured[0].supervisionHeartbeat?.state).toBe('armed');
+    act(() => send({ type: 'subsession.sync', id: 'heartbeat', supervisionHeartbeat: null }));
+    expect(captured[0].supervisionHeartbeat).toBeNull();
+  });
+
   it('ignores sync for unknown id', async () => {
     const { ws, send } = createMockWs();
     render(<Harness ws={ws} connected={true} />);

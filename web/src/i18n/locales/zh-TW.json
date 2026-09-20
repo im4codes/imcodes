@@ -758,6 +758,18 @@
     "supervision": {
       "title": "工作階段監督",
       "help": "設定一套供所有 Auto 會話共用的全域監督執行環境。",
+      "heartbeat": {
+        "paused": "監督已開啟；目前未安排心跳",
+        "needsInput": "監督需要你輸入；心跳已暫停",
+        "sending": "傳送中…",
+        "armedLabel": "{{kind}}心跳將在 {{countdown}} 後觸發；預定時間 {{time}}",
+        "sendingLabel": "{{kind}}心跳正在傳送；預定時間 {{time}}",
+        "kind": {
+          "waiting": "監督",
+          "audit": "稽核",
+          "implementation": "實作"
+        }
+      },
       "globalDefaultsTitle": "全域預設配置",
       "globalDefaultsHelp": "所有會話共用這裡的主要執行環境、逾時和可選備援執行環境。",
       "globalPrimaryRuntime": "主要執行環境",

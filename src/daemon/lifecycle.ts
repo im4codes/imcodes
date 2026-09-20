@@ -21,6 +21,11 @@ import { isExecutionClone, sweepExecutionClones, destroyExecutionClone, resolveE
 import { EXECUTION_CLONE_TIMELINE } from '../../shared/execution-clone.js';
 import { startLatencyTracer } from './latency-tracer.js';
 import { supervisionAutomation } from './supervision-automation.js';
+import {
+  getSupervisionHeartbeatProjectionForWire,
+  setSupervisionHeartbeatProjectionListener,
+} from './supervision-heartbeat-projection.js';
+import { sendSubSessionSync } from './subsession-sync.js';
 import { peerAuditService } from './peer-audit-service.js';
 import { timelineStore } from './timeline-store.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
@@ -977,6 +982,7 @@ export async function startup(): Promise<DaemonContext> {
               codexCreditsUnlimited: session.codexCreditsUnlimited ?? null,
               effort: session.effort ?? null,
               transportConfig: session.transportConfig ?? null,
+              supervisionHeartbeat: getSupervisionHeartbeatProjectionForWire(session.name) ?? null,
               ...(transportRuntime ? buildTransportQueueSnapshotPayload(session.name, 'lifecycle') : {}),
             });
           } catch { /* ignore */ }
@@ -1340,6 +1346,34 @@ export async function startup(): Promise<DaemonContext> {
 
   setTransportSessionRestoredCallback((sessionName) => {
     supervisionAutomation.applyPersistedSnapshot(sessionName);
+  });
+  // Coalesce schedule transitions into the existing session snapshot channels.
+  // The browser ticks locally; only a new deadline/state causes daemon traffic.
+  const pendingHeartbeatProjectionSync = new Set<string>();
+  let heartbeatProjectionSyncTimer: ReturnType<typeof setTimeout> | null = null;
+  setSupervisionHeartbeatProjectionListener((sessionName) => {
+    pendingHeartbeatProjectionSync.add(sessionName);
+    if (heartbeatProjectionSyncTimer) return;
+    heartbeatProjectionSyncTimer = setTimeout(() => {
+      heartbeatProjectionSyncTimer = null;
+      const names = [...pendingHeartbeatProjectionSync];
+      pendingHeartbeatProjectionSync.clear();
+      const link = serverLink;
+      if (!link) return;
+      void (async () => {
+        if (names.some((name) => !name.startsWith('deck_sub_'))) {
+          const sessions = await buildSessionList();
+          link.send({ type: 'session_list', daemonVersion: link.daemonVersion, sessions });
+        }
+        for (const name of names) {
+          if (!name.startsWith('deck_sub_')) continue;
+          await sendSubSessionSync(link, name.slice('deck_sub_'.length));
+        }
+      })().catch((error) => {
+        logger.warn({ err: error, sessions: names }, 'Supervision heartbeat projection sync failed');
+      });
+    }, 0);
+    heartbeatProjectionSyncTimer.unref?.();
   });
   supervisionAutomation.init();
   supervisionAutomation.setServerLink(serverLink);

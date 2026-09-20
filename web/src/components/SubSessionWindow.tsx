@@ -487,6 +487,7 @@ export function SubSessionWindow({
     providerId: sub.providerId ?? undefined,
     transportConfig: sub.transportConfig ?? undefined,
     supervisionMode: sub.supervisionMode ?? undefined,
+    supervisionHeartbeat: sub.supervisionHeartbeat ?? undefined,
     transportPendingMessages: sub.transportPendingMessages ?? undefined,
     transportPendingMessageEntries: sub.transportPendingMessageEntries ?? undefined,
     transportPendingMessageVersion: sub.transportPendingMessageVersion ?? undefined,

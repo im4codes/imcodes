@@ -5,6 +5,7 @@ import os from 'node:os';
 import {
   normalizeSessionSupervisionSnapshot,
   SUPERVISION_AUDIT_ENABLED_STATUS,
+  SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND,
   SUPERVISION_AUDIT_MARKER_CORRECTION_AUTOMATION_KIND,
   SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND,
   SUPERVISION_AUTO_AUDIT_MODE_CONTROL_AUTOMATION_KIND,
@@ -32,6 +33,10 @@ import { createSendDispatchId, createSendMessageId } from '../../shared/send-mes
 import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
 import { getCounter, resetMetricsForTests } from '../../src/util/metrics.js';
 import { getTransportQueueStore } from '../../src/daemon/transport-queue-store.js';
+import {
+  clearSupervisionHeartbeatProjectionsForTests,
+  getSupervisionHeartbeatProjection,
+} from '../../src/daemon/supervision-heartbeat-projection.js';
 
 const mockStartP2pRun = vi.fn();
 const mockCancelP2pRun = vi.fn();
@@ -314,6 +319,7 @@ beforeEach(async () => {
   vi.clearAllMocks();
   resetMetricsForTests();
   resetSupervisionTaskRegistryForTests();
+  clearSupervisionHeartbeatProjectionsForTests();
   vi.useRealTimers();
   mockSupervisionDecide.mockReset();
   mockSupervisionDecide.mockResolvedValue({ decision: 'complete', reason: 'done', confidence: 0.9 });
@@ -1086,9 +1092,13 @@ describe('SupervisionAutomation', () => {
       phase: 'auditing',
       requiresAudit: false,
     });
+    expect(getSupervisionHeartbeatProjection('deck_supervision_brain')).toMatchObject({
+      state: 'armed', kind: 'audit', nextHeartbeatAt: expect.any(Number),
+    });
     completeDelegatedAudit('PASS', 'Forced audit cleanup passed.');
     await waitForRunEnd();
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+    expect(getSupervisionHeartbeatProjection('deck_supervision_brain')).toMatchObject({ state: 'idle' });
   });
 
   it('adopts an existing reply-enabled audit delegation and sends no second request before its receipt', async () => {
@@ -5729,6 +5739,11 @@ describe('SupervisionAutomation', () => {
       expect(parkedEvents.some((event) => event.type === 'agent.status'
         && event.payload.status === 'supervision_parked'
         && event.payload.label === '监督：等待外部回执。')).toBe(true);
+      expect(getSupervisionHeartbeatProjection('deck_supervision_brain')).toMatchObject({
+        state: 'armed',
+        kind: 'waiting',
+        nextHeartbeatAt: Date.now() + 10 * 60_000,
+      });
 
       await vi.advanceTimersByTimeAsync(10 * 60_000 - 1);
       expect(mockTransportRuntime.send).not.toHaveBeenCalled();
@@ -5742,6 +5757,11 @@ describe('SupervisionAutomation', () => {
         commandId: 'cmd-heartbeat-zh',
         continueLoops: 0,
         phase: 'execution',
+      });
+      expect(getSupervisionHeartbeatProjection('deck_supervision_brain')).toMatchObject({
+        state: 'armed',
+        kind: 'waiting',
+        nextHeartbeatAt: Date.now() + 10 * 60_000,
       });
     } finally {
       vi.useRealTimers();
@@ -5782,6 +5802,11 @@ describe('SupervisionAutomation', () => {
       expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
         phase: 'execution',
         waitingStartedAt: expect.any(Number),
+      });
+      expect(getSupervisionHeartbeatProjection('deck_supervision_brain')).toMatchObject({
+        state: 'armed',
+        kind: 'waiting',
+        nextHeartbeatAt: expect.any(Number),
       });
 
       await vi.advanceTimersByTimeAsync(10 * 60_000);
@@ -5995,6 +6020,9 @@ describe('SupervisionAutomation', () => {
       completeTurn(`A human decision is required.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT}`);
       await new Promise<void>((resolve) => setImmediate(resolve));
       expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+      expect(getSupervisionHeartbeatProjection('deck_supervision_brain')).toMatchObject({
+        state: 'paused_needs_input',
+      });
 
       // Daemon/assistant/automation rows and reconnect edges are not user input.
       timelineEmitter.emit('deck_supervision_brain', 'assistant.text', { text: 'daemon note', streaming: false, automation: true });
@@ -6015,6 +6043,9 @@ describe('SupervisionAutomation', () => {
 
       completeTurn(`Waiting for the receipt.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`);
       await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(getSupervisionHeartbeatProjection('deck_supervision_brain')).toMatchObject({
+        state: 'armed', kind: 'waiting',
+      });
       await vi.advanceTimersByTimeAsync(10 * 60_000);
       expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
       expect(String(mockTransportRuntime.send.mock.calls[0]?.[0]))
@@ -6023,6 +6054,9 @@ describe('SupervisionAutomation', () => {
       completeTurn(`A second human decision is required.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT}`);
       await new Promise<void>((resolve) => setImmediate(resolve));
       expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+      expect(getSupervisionHeartbeatProjection('deck_supervision_brain')).toMatchObject({
+        state: 'paused_needs_input',
+      });
 
       const disabled = { ...snapshot, mode: SUPERVISION_MODE.OFF };
       upsertSession({
@@ -6031,6 +6065,7 @@ describe('SupervisionAutomation', () => {
         updatedAt: Date.now(),
       });
       supervisionAutomation.applySnapshotUpdate('deck_supervision_brain', disabled);
+      expect(getSupervisionHeartbeatProjection('deck_supervision_brain')).toMatchObject({ state: 'off' });
       expect(supervisionAutomation.registerTaskIntent(
         'deck_supervision_brain', 'cmd-disabled', 'ordinary user work', disabled,
       )).toBeNull();
@@ -6972,6 +7007,28 @@ describe('SupervisionAutomation', () => {
       mockTransportRuntime.pendingEntries.length = 0;
     });
 
+    it('projects the next formal implementation heartbeat for a sub-session and clears it on a durable hold', async () => {
+      const taskId = 'watchdog-projection-task';
+      const assignmentId = 'watchdog-projection-assignment';
+      const { registry, identity } = activeWorker({ taskId, assignmentId });
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(100_000);
+      expect(getSupervisionHeartbeatProjection(identity.sessionName)).toEqual({
+        state: 'armed',
+        kind: 'implementation',
+        nextHeartbeatAt: 3_000 + 10 * 60_000,
+        updatedAt: 100_000,
+      });
+
+      expect(registry.updateAssignment({
+        assignmentId,
+        identity,
+        blocker: JSON.stringify({ kind: 'dependency_wait', condition: 'upstream PASS' }),
+        now: 101_000,
+      })).toMatchObject({ ok: true });
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(102_000);
+      expect(getSupervisionHeartbeatProjection(identity.sessionName)).toMatchObject({ state: 'off' });
+    });
+
     it.each([
       'missing_current_revision',
       'missing_audit_policy',
@@ -7718,6 +7775,9 @@ describe('SupervisionAutomation', () => {
       const due = 3_000 + 10 * 60_000;
       await supervisionAutomation.__checkImplementationAssignmentsForTests(due - 1);
       expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+      expect(getSupervisionHeartbeatProjection(identity.sessionName)).toEqual({
+        state: 'armed', kind: 'audit', nextHeartbeatAt: due, updatedAt: due - 1,
+      });
       await supervisionAutomation.__checkImplementationAssignmentsForTests(due);
 
       expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
@@ -7729,6 +7789,10 @@ describe('SupervisionAutomation', () => {
         expect.objectContaining({ timelineCommitted: true, deliveryMode: 'append' }),
       );
       expect(mockTransportRuntime.send.mock.calls[0]?.[0]).toContain(`\"auditRevision\":\"${revision}\"`);
+      expect(timelineEmitter.replay(identity.sessionName, 0).events.some((event) => (
+        event.type === 'user.message'
+        && event.payload.automationKind === SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND
+      ))).toBe(true);
       expect(registry.getAssignment(assignmentId)).toMatchObject({
         status: 'auditing', auditAttemptId: attemptId, auditRevision: revision,
       });
