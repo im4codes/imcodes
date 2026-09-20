@@ -69,8 +69,10 @@ import {
   RuntimeModelPresetSelector,
   type RuntimeModelPresetEntry,
 } from './RuntimeModelPresetSelector.js';
-import { mergeModelSuggestions } from '../../../src/shared/models/options.js';
+import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, mergeModelSuggestions } from '../../../src/shared/models/options.js';
+import { getKnownQwenModelOptions } from '@shared/qwen-models.js';
 import { SessionIdentityTabs } from './SessionIdentityTabs.js';
+import { dispatchSessionModelSwitch } from '../session-model-switch.js';
 
 interface Props {
   serverId: string;
@@ -106,6 +108,8 @@ interface Props {
   /** Lowers this overlay only while the reused child launcher is open. */
   poolSessionDialogOpen?: boolean;
   openIntent?: SessionSettingsOpenIntent;
+  /** Production callers always select one independent settings surface. */
+  surface?: 'session' | 'supervision' | 'combined';
   /**
    * Optional WebSocket client. When supplied, the supervision dialog subscribes
    * to `cc.presets.list_response` and adds compatible third-party presets to
@@ -114,7 +118,7 @@ interface Props {
    */
   ws?: WsClient | null;
   onClose: () => void;
-  onSaved: (fields: { label?: string; description?: string; cwd?: string; type?: string; transportConfig?: Record<string, unknown> | null }) => void;
+  onSaved: (fields: { label?: string; description?: string; cwd?: string; type?: string; transportConfig?: Record<string, unknown> | null; requestedModel?: string }) => void;
 }
 
 export interface PeerAuditSettingsSession {
@@ -724,6 +728,7 @@ export function SessionSettingsDialog({
   parentSession,
   canControlAutomaticSupervision = false,
   openIntent,
+  surface = 'combined',
   ws,
   onClose,
   onSaved,
@@ -761,6 +766,11 @@ export function SessionSettingsDialog({
   const [agentType, setAgentType] = useState(type);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+  const initialSessionModel = requestedModel?.trim() || activeModel?.trim() || '';
+  const [sessionModel, setSessionModel] = useState(initialSessionModel);
+  const [appliedSessionModel, setAppliedSessionModel] = useState(initialSessionModel);
+  const [modelApplyState, setModelApplyState] = useState<'idle' | 'applying' | 'applied' | 'error'>('idle');
+  const [modelApplyError, setModelApplyError] = useState('');
   const [supervision, setSupervision] = useState<SupervisionDraft>(initialSupervision);
   const ccPresetListRequestIdRef = useRef<string | null>(null);
   const [supervisorDefaults, setSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
@@ -782,7 +792,62 @@ export function SessionSettingsDialog({
     setDescription(initDesc);
     setAgentType(type);
     setSupervision(initialSupervision);
-  }, [initLabel, initDesc, initCwd, type, initialSupervision, sessionName, subSessionId]);
+    setSessionModel(requestedModel?.trim() || activeModel?.trim() || '');
+    setAppliedSessionModel(requestedModel?.trim() || activeModel?.trim() || '');
+    setModelApplyState('idle');
+    setModelApplyError('');
+  }, [activeModel, initLabel, initDesc, initCwd, type, initialSupervision, requestedModel, sessionName, subSessionId]);
+
+  const sessionDynamicModels = useTransportModels(
+    ws ?? null,
+    surface !== 'supervision' && supportsDynamicTransportModels(type) ? type : null,
+    undefined,
+    sessionName,
+  );
+  const sessionModelOptions = useMemo(() => {
+    const staticOptions = type === 'claude-code' || type === 'claude-code-sdk'
+      ? [...CLAUDE_CODE_MODEL_IDS]
+      : type === 'codex' || type === 'codex-sdk'
+        ? [...CODEX_MODEL_IDS]
+        : type === 'qwen'
+          ? getKnownQwenModelOptions().map((entry) => entry.id)
+          : [];
+    return mergeModelSuggestions(
+      [sessionModel, initialSessionModel, sessionDynamicModels.defaultModel, ...staticOptions].filter((value): value is string => !!value),
+      sessionDynamicModels.models.map((entry) => entry.id),
+    );
+  }, [initialSessionModel, sessionDynamicModels.defaultModel, sessionDynamicModels.models, sessionModel, type]);
+  const sessionModelSwitchSupported = type === 'claude-code'
+    || type === 'codex'
+    || supportsDynamicTransportModels(type);
+  const sessionModelDirty = sessionModel.trim() !== appliedSessionModel;
+
+  const handleApplySessionModel = async (): Promise<void> => {
+    if (!ws || !sessionModelSwitchSupported || !sessionModel.trim()) return;
+    setModelApplyState('applying');
+    setModelApplyError('');
+    try {
+      // Commit the applying state before the existing fire-and-forget runtime
+      // command is dispatched, so slow mobile taps get deterministic feedback.
+      await Promise.resolve();
+      dispatchSessionModelSwitch({
+        sendMessage: (text) => ws.sendSessionMessage(sessionName, text),
+        setSubSessionModel: (targetSessionName, modelId, cwd) => ws.subSessionSetModel(targetSessionName, modelId, cwd),
+      }, {
+        sessionName,
+        agentType: type,
+        model: sessionModel,
+        cwd: initCwd,
+        subSession: !!subSessionId,
+      });
+      onSaved({ requestedModel: sessionModel.trim() });
+      setAppliedSessionModel(sessionModel.trim());
+      setModelApplyState('applied');
+    } catch (err) {
+      setModelApplyError(err instanceof Error ? err.message : String(err));
+      setModelApplyState('error');
+    }
+  };
 
   const hasSupervision = supervision.mode !== 'off';
   const isSupportedTransport = TRANSPORT_SESSION_AGENT_TYPES.includes(agentType as typeof TRANSPORT_SESSION_AGENT_TYPES[number]);
@@ -1102,10 +1167,13 @@ export function SessionSettingsDialog({
   ]);
 
   const hasSessionChanges = useMemo(() => (
-    label !== initLabel
-    || description !== initDesc
-    || agentType !== type
-    || JSON.stringify(nextTransportConfig ?? null) !== JSON.stringify(transportConfig ?? null)
+    (surface !== 'supervision' && (
+      label !== initLabel
+      || description !== initDesc
+      || agentType !== type
+    ))
+    || (surface !== 'session'
+      && JSON.stringify(nextTransportConfig ?? null) !== JSON.stringify(transportConfig ?? null))
   ), [
     agentType,
     description,
@@ -1113,6 +1181,7 @@ export function SessionSettingsDialog({
     initLabel,
     label,
     nextTransportConfig,
+    surface,
     transportConfig,
     type,
   ]);
@@ -1126,7 +1195,7 @@ export function SessionSettingsDialog({
     supervisorDefaultsExecutionPools,
   ]);
 
-  const hasChanges = hasSessionChanges || hasGlobalDefaultsChanges;
+  const hasChanges = hasSessionChanges || (surface !== 'session' && hasGlobalDefaultsChanges);
 
   const renderTypeLabel = (value: string): string => {
     switch (value) {
@@ -1232,7 +1301,7 @@ export function SessionSettingsDialog({
     setSaving(true);
     setError('');
     try {
-      if (hasGlobalDefaultsChanges) {
+      if (surface !== 'session' && hasGlobalDefaultsChanges) {
         await supervisorDefaultsPref.save({
           backend: supervisorDefaultsBackend || undefined,
           model: supervisorDefaultsModel.trim(),
@@ -1268,13 +1337,15 @@ export function SessionSettingsDialog({
         type?: string | null;
         transportConfig?: Record<string, unknown> | null;
       } = {};
-      if (label !== initLabel) fields.label = label || null;
-      if (description !== initDesc) fields.description = description || null;
-      if (agentType !== type) {
-        if (subSessionId) fields.type = agentType;
-        else fields.agentType = agentType;
+      if (surface !== 'supervision') {
+        if (label !== initLabel) fields.label = label || null;
+        if (description !== initDesc) fields.description = description || null;
+        if (agentType !== type) {
+          if (subSessionId) fields.type = agentType;
+          else fields.agentType = agentType;
+        }
       }
-      if (JSON.stringify(nextTransportConfig ?? null) !== JSON.stringify(transportConfig ?? null)) {
+      if (surface !== 'session' && JSON.stringify(nextTransportConfig ?? null) !== JSON.stringify(transportConfig ?? null)) {
         fields.transportConfig = nextTransportConfig;
       }
 
@@ -1289,10 +1360,12 @@ export function SessionSettingsDialog({
         await patchSession(serverId, sessionName, fields);
       }
       onSaved({
-        label: label || undefined,
-        description: description || undefined,
-        type: agentType || undefined,
-        transportConfig: nextTransportConfig,
+        ...(surface !== 'supervision' ? {
+          label: label || undefined,
+          description: description || undefined,
+          type: agentType || undefined,
+        } : {}),
+        ...(surface !== 'session' ? { transportConfig: nextTransportConfig } : {}),
       });
       onClose();
     } catch (err) {
@@ -1761,7 +1834,9 @@ export function SessionSettingsDialog({
     <div class={`dialog-overlay session-settings-overlay${poolSessionDialogOpen ? ' has-child-dialog' : ''}`} onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
       <div class="dialog session-settings-dialog">
         <div class="dialog-header session-settings-header">
-          <span class="session-settings-title">{t('session.settings')}</span>
+          <span class="session-settings-title">
+            {surface === 'supervision' ? t('session.supervision.settingsTitle') : t('session.settings')}
+          </span>
           <button
             type="button"
             class="dialog-close session-settings-close"
@@ -1774,6 +1849,7 @@ export function SessionSettingsDialog({
         </div>
 
         <div class="dialog-body session-settings-body">
+          {surface !== 'supervision' && <>
           {/* Type */}
           <div class="session-settings-field">
             <div class="session-settings-label">{t('session.type')}</div>
@@ -1832,6 +1908,62 @@ export function SessionSettingsDialog({
             disabled={saving}
           />
 
+          <div class="session-settings-field" data-testid="session-model-settings">
+            <div class="session-settings-label">{t('session.modelSettings.label')}</div>
+            <div class="session-settings-help">{t('session.modelSettings.help')}</div>
+            {sessionModelSwitchSupported ? (
+              <>
+                <select
+                  class="input"
+                  aria-label={t('session.modelSettings.label')}
+                  value={sessionModel}
+                  disabled={saving || modelApplyState === 'applying'}
+                  onInput={(event) => {
+                    setSessionModel((event.target as HTMLSelectElement).value);
+                    setModelApplyState('idle');
+                    setModelApplyError('');
+                  }}
+                  style={{ width: '100%' }}
+                >
+                  {!sessionModel && <option value="">{t('session.modelSettings.default')}</option>}
+                  {sessionModelOptions.map((modelId) => (
+                    <option key={modelId} value={modelId}>{modelId}</option>
+                  ))}
+                </select>
+                <div class="session-settings-model-actions">
+                  <span class="session-settings-field-help">
+                    {t('session.modelSettings.current', {
+                      model: appliedSessionModel || t('session.modelSettings.default'),
+                    })}
+                  </span>
+                  <button
+                    type="button"
+                    class="btn btn-secondary"
+                    onClick={() => { void handleApplySessionModel(); }}
+                    disabled={!ws || !sessionModelDirty || !sessionModel.trim() || modelApplyState === 'applying'}
+                  >
+                    {modelApplyState === 'applying'
+                      ? t('session.modelSettings.applying')
+                      : t('session.modelSettings.apply')}
+                  </button>
+                </div>
+                {sessionDynamicModels.loading && (
+                  <div class="session-settings-field-help">{t('session.modelSettings.loading')}</div>
+                )}
+                {modelApplyState === 'applied' && (
+                  <div class="session-settings-success" role="status">{t('session.modelSettings.applied')}</div>
+                )}
+                {modelApplyState === 'error' && (
+                  <div class="session-settings-error" role="alert">
+                    {t('session.modelSettings.failed', { error: modelApplyError })}
+                  </div>
+                )}
+              </>
+            ) : (
+              <div class="session-settings-notice">{t('session.modelSettings.unsupported')}</div>
+            )}
+          </div>
+
           {/* Working directory */}
           <div class="session-settings-field">
             <div class="session-settings-label">{t('session.workingDir')}</div>
@@ -1844,18 +1976,19 @@ export function SessionSettingsDialog({
               placeholder={t('session.workingDirPlaceholder')}
             />
           </div>
+          </>}
 
-          <div class="session-settings-section">
+          {surface !== 'session' && <div class="session-settings-section">
             <div class="session-settings-section-title">{t('session.supervision.title')}</div>
             {supervisionPanel}
-          </div>
+          </div>}
 
           {error && <div class="session-settings-error">{error}</div>}
         </div>
 
         <div class="dialog-footer session-settings-footer">
           <button type="button" class="btn btn-secondary" onClick={onClose} disabled={saving}>{t('common.cancel')}</button>
-          <button type="button" class="btn btn-primary" onClick={handleSave} disabled={saving || !hasChanges || !supervisionValid || !globalDefaultsValid}>
+          <button type="button" class="btn btn-primary" onClick={handleSave} disabled={saving || !hasChanges || (surface !== 'session' && (!supervisionValid || !globalDefaultsValid))}>
             {saving ? t('common.loading') : t('common.save')}
           </button>
         </div>
@@ -1863,4 +1996,8 @@ export function SessionSettingsDialog({
     </div>
   );
   return typeof document === 'undefined' ? dialog : createPortal(dialog, document.body);
+}
+
+export function SupervisionSettingsDialog(props: Props) {
+  return <SessionSettingsDialog {...props} surface="supervision" />;
 }

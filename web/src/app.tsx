@@ -91,7 +91,7 @@ import {
 } from './file-preview-state.js';
 import { StartSubSessionDialog } from './components/StartSubSessionDialog.js';
 import { CloneSessionGroupDialog } from './components/CloneSessionGroupDialog.js';
-import { SessionSettingsDialog, type PeerAuditSettingsSession } from './components/SessionSettingsDialog.js';
+import { SessionSettingsDialog, SupervisionSettingsDialog, type PeerAuditSettingsSession } from './components/SessionSettingsDialog.js';
 import type { SessionSettingsOpenIntent } from './session-settings-open-intent.js';
 import { StartDiscussionDialog, type DiscussionPrefs, type SubSessionOption } from './components/StartDiscussionDialog.js';
 import { AskQuestionDialog, type PendingQuestion } from './components/AskQuestionDialog.js';
@@ -7639,8 +7639,13 @@ export function App() {
         />
       )}
 
-      {settingsTarget && selectedServerId && (
-        <SessionSettingsDialog
+      {settingsTarget && selectedServerId && (() => {
+        const SettingsDialog = settingsTarget.openIntent?.surface === 'supervision'
+          ? SupervisionSettingsDialog
+          : SessionSettingsDialog;
+        return (
+        <SettingsDialog
+          surface={settingsTarget.openIntent?.surface === 'supervision' ? 'supervision' : 'session'}
           serverId={selectedServerId}
           sessionName={settingsTarget.sessionName}
           subSessionId={settingsTarget.subId}
@@ -7691,12 +7696,14 @@ export function App() {
                 if (fields.description !== undefined) updated.description = fields.description ?? null;
                 if (fields.cwd !== undefined) updated.projectDir = fields.cwd ?? updated.projectDir;
                 if (fields.transportConfig !== undefined) updated.transportConfig = fields.transportConfig;
+                if (fields.requestedModel !== undefined) updated.requestedModel = fields.requestedModel;
                 return updated;
               }));
             }
           }}
         />
-      )}
+        );
+      })()}
 
       {cloneSessionTarget && selectedServerId && (
         <CloneSessionGroupDialog

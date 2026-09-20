@@ -16,6 +16,7 @@ vi.mock('react-i18next', () => ({
       if (key === 'session.supervision.quickLabel') return 'Auto';
       if (key === 'session.supervision.quickTitle') return 'Auto mode';
       if (key === 'session.settings') return 'Settings';
+      if (key === 'session.supervision.settingsTitle') return 'Supervision settings';
       if (key === 'session.actions') return 'Actions';
       return key.split('.').at(-1) ?? key;
     },
@@ -90,7 +91,7 @@ function sharedSession(
   } as SessionInfo;
 }
 
-function renderControls(role: 'participant' | 'viewer', onSettings: () => void) {
+function renderControls(role: 'participant' | 'viewer', onSettings: (intent?: { surface?: string }) => void) {
   return render(
     <SessionControls
       ws={makeWs() as never}
@@ -118,10 +119,10 @@ describe('SessionControls shared participant settings entry points', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Auto' }));
     const autoMenu = document.querySelector('.menu-dropdown-auto') as HTMLElement;
-    const settings = within(autoMenu).getByRole('button', { name: 'Settings' });
+    const settings = within(autoMenu).getByRole('button', { name: 'Supervision settings' });
     fireEvent.click(settings);
 
-    expect(onSettings).toHaveBeenCalledTimes(1);
+    expect(onSettings).toHaveBeenCalledWith({ surface: 'supervision' });
   });
 
   it('lets an active participant change the mode, because a participant drives the session', async () => {
@@ -132,7 +133,7 @@ describe('SessionControls shared participant settings entry points', () => {
     fireEvent.click(auto);
 
     const menu = document.querySelector('.menu-dropdown-auto') as HTMLElement;
-    const options = within(menu).getAllByRole('button').filter((button) => button.textContent !== 'Settings');
+    const options = within(menu).getAllByRole('button').filter((button) => button.textContent !== 'Supervision settings');
     expect(options).toHaveLength(2);
     for (const option of options) {
       expect((option as HTMLButtonElement).disabled).toBe(false);
@@ -201,7 +202,7 @@ describe('SessionControls shared participant settings entry points', () => {
     serverView.unmount();
   });
 
-  it('opens the same settings surface from the session action menu for an active participant', () => {
+  it('offers independent session and supervision settings from the session action menu', () => {
     const onSettings = vi.fn();
     renderControls('participant', onSettings);
 
@@ -209,8 +210,53 @@ describe('SessionControls shared participant settings entry points', () => {
     const actionMenu = document.querySelector('.session-actions-menu') as HTMLElement;
     const settings = within(actionMenu).getByRole('button', { name: 'Settings' });
     fireEvent.click(settings);
+    expect(onSettings).toHaveBeenLastCalledWith({ surface: 'session' });
 
-    expect(onSettings).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByTitle('Actions'));
+    const reopenedMenu = document.querySelector('.session-actions-menu') as HTMLElement;
+    fireEvent.click(within(reopenedMenu).getByRole('button', { name: 'Supervision settings' }));
+
+    expect(onSettings).toHaveBeenLastCalledWith({ surface: 'supervision' });
+    expect(onSettings).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps both independent settings entries available in the mobile action menu', () => {
+    const previousWidth = window.innerWidth;
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+    try {
+      const onSettings = vi.fn();
+      renderControls('participant', onSettings);
+      fireEvent.click(screen.getByTitle('Actions'));
+      const actionMenu = document.querySelector('.session-actions-menu') as HTMLElement;
+      fireEvent.click(within(actionMenu).getByRole('button', { name: 'Supervision settings' }));
+      expect(onSettings).toHaveBeenCalledWith({ surface: 'supervision' });
+    } finally {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: previousWidth });
+    }
+  });
+
+  it('opens the independent supervision surface from a sub-session action menu', () => {
+    const onSettings = vi.fn();
+    render(
+      <SessionControls
+        ws={makeWs() as never}
+        connected
+        serverId="server-shared"
+        activeSession={{
+          ...sharedSession('participant'),
+          name: 'deck_sub_worker',
+          role: 'worker',
+        } as SessionInfo}
+        subSessionId="sub-1"
+        onSubStop={vi.fn()}
+        quickData={quickData}
+        onSettings={onSettings}
+      />,
+    );
+    fireEvent.click(screen.getByTitle('Actions'));
+    const actionMenu = document.querySelector('.session-actions-menu') as HTMLElement;
+    fireEvent.click(within(actionMenu).getByRole('button', { name: 'Supervision settings' }));
+    expect(onSettings).toHaveBeenCalledWith({ surface: 'supervision' });
   });
 
   it('removes both settings entries when an open participant surface is downgraded to viewer', () => {
@@ -219,7 +265,7 @@ describe('SessionControls shared participant settings entry points', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Auto' }));
     expect(within(document.querySelector('.menu-dropdown-auto') as HTMLElement)
-      .getByRole('button', { name: 'Settings' })).toBeDefined();
+      .getByRole('button', { name: 'Supervision settings' })).toBeDefined();
     view.rerender(
       <SessionControls
         ws={makeWs() as never}
@@ -246,6 +292,8 @@ describe('SessionControls shared participant settings entry points', () => {
     fireEvent.click(screen.getByTitle('Actions'));
     expect(within(document.querySelector('.session-actions-menu') as HTMLElement)
       .getByRole('button', { name: 'Settings' })).toBeDefined();
+    expect(within(document.querySelector('.session-actions-menu') as HTMLElement)
+      .getByRole('button', { name: 'Supervision settings' })).toBeDefined();
 
     view.rerender(
       <SessionControls

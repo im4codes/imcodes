@@ -869,7 +869,8 @@
       "modeSaved": "自動監督已切換為{{mode}}。",
       "modeSaveFailed": "自動監督同步失敗，請重試。",
       "brainOnly": "只有 Brain 工作階段可以開啟自動監督或自動稽核。",
-      "quickTitle": "自動模式"
+      "quickTitle": "自動模式",
+      "settingsTitle": "監督與審計設定"
     },
     "approval": {
       "pending": "需要核准",
@@ -909,7 +910,19 @@
     "identityTooLargeScoped": "身份內容必須是有效文字，不超過 {{limit}} 個 Unicode 字元。",
     "identityCreateSaveFailed": "會話已啟動，但會話身份儲存失敗。",
     "identityCreateApplyFailed": "會話已啟動且身份已線上儲存，但 daemon 未確認已套用。請先在會話設定中重試，再傳送訊息。",
-    "identityApply": "套用身份"
+    "identityApply": "套用身份",
+    "modelSettings": {
+      "label": "工作階段模型",
+      "help": "使用與模型捷徑相同的執行階段命令切換此工作階段的模型。",
+      "current": "目前：{{model}}",
+      "default": "預設",
+      "apply": "套用模型",
+      "applying": "正在套用…",
+      "applied": "模型切換命令已傳送。",
+      "failed": "無法切換模型：{{error}}",
+      "loading": "正在載入可用模型…",
+      "unsupported": "此工作階段類型不支援切換模型。"
+    }
   },
   "server": {
     "upgrade_daemon": "↑ 升級 Daemon",

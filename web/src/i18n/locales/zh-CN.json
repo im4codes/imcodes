@@ -869,7 +869,8 @@
       "modeSaved": "自动监督已切换为{{mode}}。",
       "modeSaveFailed": "自动监督同步失败，请重试。",
       "brainOnly": "只有 Brain 会话可以开启自动监督或自动审计。",
-      "quickTitle": "自动模式"
+      "quickTitle": "自动模式",
+      "settingsTitle": "监督与审计设置"
     },
     "approval": {
       "pending": "需要审批",
@@ -909,7 +910,19 @@
     "identityTooLargeScoped": "身份内容必须是有效文本，不超过 {{limit}} 个 Unicode 字符。",
     "identityCreateSaveFailed": "会话已启动，但会话身份保存失败。",
     "identityCreateApplyFailed": "会话已启动且身份已在线保存，但 daemon 未确认已应用。请先在会话设置中重试，再发送消息。",
-    "identityApply": "应用身份"
+    "identityApply": "应用身份",
+    "modelSettings": {
+      "label": "会话模型",
+      "help": "使用与模型快捷入口相同的运行时命令切换此会话的模型。",
+      "current": "当前：{{model}}",
+      "default": "默认",
+      "apply": "应用模型",
+      "applying": "正在应用…",
+      "applied": "模型切换指令已发送。",
+      "failed": "无法切换模型：{{error}}",
+      "loading": "正在加载可用模型…",
+      "unsupported": "此会话类型不支持切换模型。"
+    }
   },
   "server": {
     "upgrade_daemon": "↑ 升级 Daemon",

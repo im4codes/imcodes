@@ -869,7 +869,8 @@
       "modeSaved": "자동 감독이 {{mode}} 모드로 전환되었습니다.",
       "modeSaveFailed": "자동 감독을 동기화하지 못했습니다. 다시 시도하세요.",
       "brainOnly": "Brain 세션만 자동 감독 또는 자동 감사를 활성화할 수 있습니다.",
-      "quickTitle": "자동 모드"
+      "quickTitle": "자동 모드",
+      "settingsTitle": "감독 및 감사 설정"
     },
     "approval": {
       "pending": "승인이 필요합니다",
@@ -909,7 +910,19 @@
     "identityTooLargeScoped": "ID는 {{limit}}자(유니코드 코드 포인트) 이내의 유효한 텍스트여야 합니다.",
     "identityCreateSaveFailed": "세션은 시작되었지만 세션 ID를 저장하지 못했습니다.",
     "identityCreateApplyFailed": "세션이 시작되고 ID가 온라인에 저장되었지만 daemon이 적용을 확인하지 않았습니다. 메시지를 보내기 전에 세션 설정에서 다시 시도하세요.",
-    "identityApply": "ID 적용"
+    "identityApply": "ID 적용",
+    "modelSettings": {
+      "label": "세션 모델",
+      "help": "모델 바로가기와 동일한 런타임 명령으로 이 세션의 모델을 전환합니다.",
+      "current": "현재: {{model}}",
+      "default": "기본값",
+      "apply": "모델 적용",
+      "applying": "적용 중…",
+      "applied": "모델 변경 명령을 보냈습니다.",
+      "failed": "모델을 변경할 수 없습니다: {{error}}",
+      "loading": "사용 가능한 모델을 불러오는 중…",
+      "unsupported": "이 세션 유형은 모델 전환을 지원하지 않습니다."
+    }
   },
   "server": {
     "upgrade_daemon": "↑ Daemon 업그레이드",

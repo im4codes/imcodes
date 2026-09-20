@@ -869,7 +869,8 @@
       "modeSaved": "Automatic supervision is now {{mode}}.",
       "modeSaveFailed": "Automatic supervision could not be synchronized. Please retry.",
       "brainOnly": "Only the Brain session can enable automatic supervision or automatic audit.",
-      "quickTitle": "Auto mode"
+      "quickTitle": "Auto mode",
+      "settingsTitle": "Supervision & Audit Settings"
     },
     "approval": {
       "pending": "Approval required",
@@ -909,7 +910,19 @@
     "identityTooLargeScoped": "Identity must be valid text within {{limit}} Unicode characters.",
     "identityCreateSaveFailed": "The session started, but its session identity could not be saved.",
     "identityCreateApplyFailed": "The session started and its identity was saved online, but the daemon did not confirm applying it. Retry in session settings before sending a message.",
-    "identityApply": "Apply identity"
+    "identityApply": "Apply identity",
+    "modelSettings": {
+      "label": "Session model",
+      "help": "Switch the model for this session using the same runtime command as the model shortcut.",
+      "current": "Current: {{model}}",
+      "default": "Default",
+      "apply": "Apply model",
+      "applying": "Applying…",
+      "applied": "Model change sent.",
+      "failed": "Could not change model: {{error}}",
+      "loading": "Loading available models…",
+      "unsupported": "This session type does not support model switching."
+    }
   },
   "server": {
     "upgrade_daemon": "↑ Upgrade Daemon",

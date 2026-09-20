@@ -112,6 +112,7 @@ import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { CUSTOM_PROVIDER_SDK_AGENT_TYPES } from '@shared/cc-presets.js';
 import { useTransportModels, supportsDynamicTransportModels } from '../hooks/useTransportModels.js';
 import { loadCodexModelPreference, loadLegacyCodexModelPreferenceForModelessSession, saveCodexModelPreference } from '../codex-model-preference.js';
+import { dispatchSessionModelSwitch } from '../session-model-switch.js';
 import {
   canSessionRoleOwnAutomaticSupervision,
   extractSessionSupervisionSnapshot,
@@ -2777,11 +2778,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
     const openSettingsForMode = () => {
       setAutoOpen(false);
-      onSettings?.(nextMode === SUPERVISION_MODE.SUPERVISED_AUDIT
-        ? {
-            supervisionMode: SUPERVISION_MODE.SUPERVISED_AUDIT,
-          }
-        : undefined);
+      onSettings?.({
+        surface: 'supervision',
+        ...(nextMode === SUPERVISION_MODE.SUPERVISED_AUDIT
+          ? { supervisionMode: SUPERVISION_MODE.SUPERVISED_AUDIT }
+          : {}),
+      });
     };
 
     if (nextMode === SUPERVISION_MODE.OFF) {
@@ -5217,45 +5219,47 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     setMenuOpen(false); resetConfirm(); onAfterAction?.();
   };
 
+  const dispatchModelSwitch = (nextModel: string): boolean => {
+    if (!ws || !activeSession) return false;
+    dispatchSessionModelSwitch({
+      sendMessage: (text) => sendSessionMessage(text),
+      setSubSessionModel: (sessionName, modelId, cwd) => ws.subSessionSetModel(sessionName, modelId, cwd),
+    }, {
+      sessionName: activeSession.name,
+      agentType: activeSession.agentType,
+      model: nextModel,
+      cwd: activeSession.projectDir,
+      subSession: !!onSubStop,
+    });
+    return true;
+  };
+
   const handleModelSelect = (m: ModelChoice) => {
-    if (!activeSession) return;
+    if (!dispatchModelSwitch(m)) return;
     setModel(m);
     try { localStorage.setItem(MODEL_STORAGE_KEY, m); } catch { /* ignore */ }
-    sendSessionMessage(`/model ${m}`);
     setModelOpen(false);
     onAfterAction?.();
   };
 
   const handleCodexModelSelect = (m: CodexModelChoice) => {
-    if (!ws || !activeSession) return;
+    if (!activeSession || !dispatchModelSwitch(m)) return;
     setCodexModel(m);
     saveCodexModelPreference(m, activeSession.name);
-    if (activeSession.agentType === 'codex-sdk') {
-      sendSessionMessage(`/model ${m}`);
-    } else {
-      const isBrain = activeSession.role === 'brain';
-      if (isBrain) {
-        sendSessionMessage(`/model ${m} medium`);
-      } else {
-        ws.subSessionSetModel(activeSession.name, m, activeSession.projectDir);
-      }
-    }
     setModelOpen(false);
     onAfterAction?.();
   };
 
   const handleQwenModelSelect = (m: QwenModelChoice) => {
-    if (!activeSession) return;
+    if (!dispatchModelSwitch(m)) return;
     setQwenModel(m);
     try { localStorage.setItem(QWEN_MODEL_STORAGE_KEY, m); } catch { /* ignore */ }
-    sendSessionMessage(`/model ${m}`);
     setModelOpen(false);
     onAfterAction?.();
   };
 
   const handleGenericTransportModelSelect = (m: string) => {
-    if (!activeSession) return;
-    sendSessionMessage(`/model ${m}`);
+    if (!dispatchModelSwitch(m)) return;
     setModelOpen(false);
     onAfterAction?.();
   };
@@ -5651,10 +5655,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                       class="menu-item"
                       onClick={() => {
                         setAutoOpen(false);
-                        onSettings?.();
+                        onSettings?.({ surface: 'supervision' });
                       }}
                     >
-                      {t('session.settings')}
+                      {t('session.supervision.settingsTitle')}
                     </button>
                   </>
                 )}
@@ -7304,13 +7308,24 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 <span class="session-action-menu-label">{t('session.rename_plain')}</span>
               </button>
               {onSettings && canOpenSessionSettings && (
-                <button
-                  class="menu-item session-action-menu-item"
-                  onClick={() => { onSettings(); setMenuOpen(false); }}
-                >
-                  <SessionActionMenuIcon kind="settings" />
-                  <span class="session-action-menu-label">{t('session.settings')}</span>
-                </button>
+                <>
+                  <button
+                    class="menu-item session-action-menu-item"
+                    onClick={() => { onSettings({ surface: 'session' }); setMenuOpen(false); }}
+                  >
+                    <SessionActionMenuIcon kind="settings" />
+                    <span class="session-action-menu-label">{t('session.settings')}</span>
+                  </button>
+                  {canQuickPeerAudit && (
+                    <button
+                      class="menu-item session-action-menu-item"
+                      onClick={() => { onSettings({ surface: 'supervision' }); setMenuOpen(false); }}
+                    >
+                      <SessionActionMenuIcon kind="settings" />
+                      <span class="session-action-menu-label">{t('session.supervision.settingsTitle')}</span>
+                    </button>
+                  )}
+                </>
               )}
               {canShowCloneGroupAction && (
                 <button

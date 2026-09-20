@@ -869,7 +869,8 @@
       "modeSaved": "自動監督を{{mode}}に切り替えました。",
       "modeSaveFailed": "自動監督を同期できませんでした。もう一度お試しください。",
       "brainOnly": "自動監督または自動監査を有効にできるのは Brain セッションだけです。",
-      "quickTitle": "自動モード"
+      "quickTitle": "自動モード",
+      "settingsTitle": "監督・監査設定"
     },
     "approval": {
       "pending": "承認が必要",
@@ -909,7 +910,19 @@
     "identityTooLargeScoped": "ID は有効なテキストで、{{limit}} Unicode 文字以内にしてください。",
     "identityCreateSaveFailed": "セッションは開始しましたが、ID を保存できませんでした。",
     "identityCreateApplyFailed": "セッションは開始され ID はオンラインに保存されましたが、daemon が適用を確認しませんでした。メッセージ送信前にセッション設定で再試行してください。",
-    "identityApply": "ID を適用"
+    "identityApply": "ID を適用",
+    "modelSettings": {
+      "label": "セッションモデル",
+      "help": "モデルショートカットと同じランタイムコマンドで、このセッションのモデルを切り替えます。",
+      "current": "現在：{{model}}",
+      "default": "デフォルト",
+      "apply": "モデルを適用",
+      "applying": "適用中…",
+      "applied": "モデル変更コマンドを送信しました。",
+      "failed": "モデルを変更できませんでした：{{error}}",
+      "loading": "利用可能なモデルを読み込み中…",
+      "unsupported": "このセッション種別はモデル切り替えに対応していません。"
+    }
   },
   "server": {
     "upgrade_daemon": "↑ Daemonをアップグレード",

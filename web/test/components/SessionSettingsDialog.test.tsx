@@ -67,6 +67,7 @@ vi.mock('../../src/components/file-browser-lazy.js', () => ({
 
 import {
   SessionSettingsDialog,
+  SupervisionSettingsDialog,
   buildSupervisionExecutionPoolCandidates,
 } from '../../src/components/SessionSettingsDialog.js';
 
@@ -136,6 +137,8 @@ function makeIdentityAckWs() {
       handlers.add(handler);
       return () => handlers.delete(handler);
     }),
+    sendSessionMessage: vi.fn(),
+    subSessionSetModel: vi.fn(),
   };
   return ws;
 }
@@ -159,6 +162,109 @@ describe('SessionSettingsDialog supervision', () => {
 
   afterEach(() => {
     cleanup();
+  });
+
+  it('keeps session and supervision fields on independent production surfaces', () => {
+    const common = {
+      serverId: 'srv-1', sessionName: 'deck_proj_brain', label: 'Brain', description: '',
+      cwd: '/proj', type: 'codex-sdk', transportConfig: { supervision: { mode: 'off' } },
+      ws: makeIdentityAckWs() as any, onClose: vi.fn(), onSaved: vi.fn(),
+    };
+    const { unmount } = render(<SessionSettingsDialog {...common} surface="session" />);
+    expect(screen.getByTestId('session-model-settings')).toBeTruthy();
+    expect(screen.queryByLabelText('supervision-session:mode')).toBeNull();
+    unmount();
+
+    render(<SupervisionSettingsDialog {...common} />);
+    expect(screen.getByLabelText('supervision-session:mode')).toBeTruthy();
+    expect(screen.queryByTestId('session-model-settings')).toBeNull();
+    expect(screen.queryByLabelText('session-identity-content')).toBeNull();
+  });
+
+  it('saves each settings surface without leaking fields owned by the other dialog', async () => {
+    const common = {
+      serverId: 'srv-1', sessionName: 'deck_proj_brain', label: 'Brain', description: '', cwd: '/proj',
+      type: 'codex-sdk', transportConfig: { supervision: { mode: 'off' } }, ws: makeIdentityAckWs() as any,
+      onClose: vi.fn(), onSaved: vi.fn(),
+    };
+    const { unmount } = render(<SessionSettingsDialog {...common} surface="session" />);
+    fireEvent.input(screen.getByDisplayValue('Brain'), { target: { value: 'Renamed' } });
+    fireEvent.click(screen.getByRole('button', { name: 'save' }));
+    await waitFor(() => expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', { label: 'Renamed' }));
+    expect(patchSessionMock.mock.calls[0]?.[2]).not.toHaveProperty('transportConfig');
+    unmount();
+
+    vi.clearAllMocks();
+    fetchSupervisorDefaultsMock.mockResolvedValue({
+      backend: 'codex-sdk', model: CODEX_MODEL_IDS[0], timeoutMs: 18_000,
+      executionPools: DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS,
+    });
+    render(<SupervisionSettingsDialog {...common} canControlAutomaticSupervision />);
+    changeSupervisionMode('supervised_audit');
+    await waitFor(() => expect((screen.getByRole('button', { name: 'save' }) as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(screen.getByRole('button', { name: 'save' }));
+    await waitFor(() => expect(patchSessionMock).toHaveBeenCalled());
+    const fields = patchSessionMock.mock.calls[0]?.[2] as Record<string, unknown>;
+    expect(fields).toHaveProperty('transportConfig');
+    expect(fields).not.toHaveProperty('label');
+    expect(fields).not.toHaveProperty('description');
+    expect(fields).not.toHaveProperty('agentType');
+  });
+
+  it('switches the model through the shared session command and reports success', async () => {
+    const ws = makeIdentityAckWs();
+    const onSaved = vi.fn();
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1" sessionName="deck_proj_brain" label="Brain" description="" cwd="/proj"
+        type="codex-sdk" activeModel="gpt-5.4" requestedModel="gpt-5.4" transportConfig={null}
+        surface="session" ws={ws as any} onClose={vi.fn()} onSaved={onSaved}
+      />,
+    );
+    changeSelect(screen.getByLabelText('label'), 'gpt-5.6');
+    await waitFor(() => expect((screen.getByRole('button', { name: 'apply' }) as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(screen.getByRole('button', { name: 'apply' }));
+    expect(screen.getByRole('button', { name: 'applying' })).toBeTruthy();
+    await waitFor(() => expect(ws.sendSessionMessage).toHaveBeenCalledWith('deck_proj_brain', '/model gpt-5.6'));
+    expect(onSaved).toHaveBeenCalledWith({ requestedModel: 'gpt-5.6' });
+    expect(screen.getByRole('status').textContent).toBe('applied');
+  });
+
+  it('uses the structured model command for process sub-sessions and explains unsupported types', async () => {
+    const ws = makeIdentityAckWs();
+    const common = {
+      serverId: 'srv-1', sessionName: 'deck_proj_worker', subSessionId: 'sub-1', label: 'Worker',
+      description: '', cwd: '/proj', activeModel: 'gpt-5.4', requestedModel: 'gpt-5.4',
+      transportConfig: null, surface: 'session' as const, ws: ws as any, onClose: vi.fn(), onSaved: vi.fn(),
+    };
+    const { unmount } = render(<SessionSettingsDialog {...common} type="codex" />);
+    changeSelect(screen.getByLabelText('label'), 'gpt-5.6');
+    await waitFor(() => expect((screen.getByRole('button', { name: 'apply' }) as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(screen.getByRole('button', { name: 'apply' }));
+    await waitFor(() => expect(ws.subSessionSetModel).toHaveBeenCalledWith('deck_proj_worker', 'gpt-5.6', '/proj'));
+    expect(ws.sendSessionMessage).not.toHaveBeenCalled();
+    unmount();
+
+    render(<SessionSettingsDialog {...common} type="shell" activeModel={null} requestedModel={null} />);
+    expect(screen.getByText('unsupported')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'apply' })).toBeNull();
+  });
+
+  it('reports a model command dispatch failure without closing the settings dialog', async () => {
+    const ws = makeIdentityAckWs();
+    ws.sendSessionMessage.mockImplementation(() => { throw new Error('offline'); });
+    const onClose = vi.fn();
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1" sessionName="deck_proj_brain" label="Brain" description="" cwd="/proj"
+        type="codex-sdk" activeModel="gpt-5.4" requestedModel="gpt-5.4" transportConfig={null}
+        surface="session" ws={ws as any} onClose={onClose} onSaved={vi.fn()}
+      />,
+    );
+    changeSelect(screen.getByLabelText('label'), 'gpt-5.6');
+    fireEvent.click(await screen.findByRole('button', { name: 'apply' }));
+    expect((await screen.findByRole('alert')).textContent).toBe('failed');
+    expect(onClose).not.toHaveBeenCalled();
   });
 
   it('saves a manually entered exact-session identity online and requests an immediate runtime refresh', async () => {

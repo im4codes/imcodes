@@ -869,7 +869,8 @@
       "modeSaved": "La supervisión automática ahora está en {{mode}}.",
       "modeSaveFailed": "No se pudo sincronizar la supervisión automática. Inténtalo de nuevo.",
       "brainOnly": "Solo la sesión Brain puede activar la supervisión o auditoría automáticas.",
-      "quickTitle": "Modo automático"
+      "quickTitle": "Modo automático",
+      "settingsTitle": "Configuración de supervisión y auditoría"
     },
     "approval": {
       "pending": "Se requiere aprobación",
@@ -909,7 +910,19 @@
     "identityTooLargeScoped": "La identidad debe ser texto válido de hasta {{limit}} caracteres Unicode.",
     "identityCreateSaveFailed": "La sesión comenzó, pero no se pudo guardar su identidad.",
     "identityCreateApplyFailed": "La sesión comenzó y la identidad se guardó en línea, pero el daemon no confirmó su aplicación. Reinténtalo en los ajustes antes de enviar un mensaje.",
-    "identityApply": "Aplicar identidad"
+    "identityApply": "Aplicar identidad",
+    "modelSettings": {
+      "label": "Modelo de la sesión",
+      "help": "Cambia el modelo de esta sesión con el mismo comando de ejecución que el acceso rápido.",
+      "current": "Actual: {{model}}",
+      "default": "Predeterminado",
+      "apply": "Aplicar modelo",
+      "applying": "Aplicando…",
+      "applied": "Se envió el cambio de modelo.",
+      "failed": "No se pudo cambiar el modelo: {{error}}",
+      "loading": "Cargando modelos disponibles…",
+      "unsupported": "Este tipo de sesión no permite cambiar el modelo."
+    }
   },
   "server": {
     "upgrade_daemon": "↑ Actualizar Daemon",

@@ -14103,3 +14103,24 @@ button.quick-agent-delegation-preset.active {
 .supervision-task-console-retry { padding: 2px 7px; border: 1px solid rgba(34,211,238,.3); border-radius: 999px; color: #a5f3fc; background: rgba(8,47,73,.45); font: inherit; cursor: pointer; }
 .supervision-task-console-retry:hover,
 .supervision-task-console-retry:focus-visible { border-color: #67e8f9; color: #ecfeff; outline: none; }
+
+.session-settings-model-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.session-settings-success {
+  margin-top: 6px;
+  color: #34d399;
+  font-size: 12px;
+}
+
+@media (max-width: 640px) {
+  .session-settings-model-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}

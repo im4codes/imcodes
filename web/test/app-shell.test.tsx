@@ -764,6 +764,19 @@ vi.mock('../src/components/SessionSettingsDialog.js', () => ({
       <button onClick={onClose}>settings-close</button>
     </div>
   ),
+  SupervisionSettingsDialog: ({ onClose, onSaved, onAddPoolSession, poolSessionDialogOpen, supervisionMode, canControlAutomaticSupervision }: any) => (
+    <div
+      data-testid="session-settings-dialog"
+      data-child-dialog-open={String(Boolean(poolSessionDialogOpen))}
+      data-supervision-mode={supervisionMode ?? ''}
+      data-can-control-supervision={String(Boolean(canControlAutomaticSupervision))}
+    >
+      session-settings-dialog
+      <button onClick={() => onAddPoolSession?.('economy')}>settings-pool-add</button>
+      <button onClick={() => onSaved?.({ transportConfig: {} })}>settings-save</button>
+      <button onClick={onClose}>settings-close</button>
+    </div>
+  ),
 }));
 vi.mock('../src/components/CloneSessionGroupDialog.js', () => ({
   CloneSessionGroupDialog: ({ onClose }: any) => (
