@@ -46,6 +46,8 @@ import { SUPERVISION_ASSIGNMENT_START_EVIDENCE } from '../../shared/supervision-
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import { resolveEffectiveSessionModel } from '../../shared/session-model.js';
 import logger from '../util/logger.js';
+import { runSupervisionRetentionGc } from './supervision-retention-gc.js';
+import { SUPERVISION_RETENTION_SCAN_LIMIT } from '../../shared/supervision-retention.js';
 
 const SUPERVISION_WORKTREE_BYTES_WARNING = 20 * 1024 * 1024 * 1024;
 const execFileAsync = promisify(execFile);
@@ -314,6 +316,7 @@ function resolveWorktreeRegistryReference(assignmentId: string, expectedTaskId?:
         status: assignment.status,
         leaseId: assignment.leaseId,
         role: assignment.role,
+        updatedAt: assignment.updatedAt,
         ...(assignment.auditAttemptId ? { auditAttemptId: assignment.auditAttemptId } : {}),
         ...(assignment.auditRevision ? { auditRevision: assignment.auditRevision } : {}),
         ...(assignment.verdict ? { verdict: assignment.verdict } : {}),
@@ -331,6 +334,7 @@ function resolveWorktreeRegistryReference(assignmentId: string, expectedTaskId?:
           status: candidate.status,
           leaseId: candidate.leaseId,
           role: candidate.role,
+          updatedAt: candidate.updatedAt,
           ...(candidate.auditAttemptId ? { auditAttemptId: candidate.auditAttemptId } : {}),
           ...(candidate.auditRevision ? { auditRevision: candidate.auditRevision } : {}),
           ...(candidate.verdict ? { verdict: candidate.verdict } : {}),
@@ -361,6 +365,7 @@ function resolveWorktreeRegistryReference(assignmentId: string, expectedTaskId?:
 }
 
 export function createSupervisionWorktreeGcDeps(): SupervisionWorktreeGcDeps {
+  const sessions = listSessions();
   return {
     resolveRegistryReference: (metadata) => (
       resolveWorktreeRegistryReference(metadata.assignmentId, metadata.taskId)
@@ -368,10 +373,55 @@ export function createSupervisionWorktreeGcDeps(): SupervisionWorktreeGcDeps {
     resolveRegistryReferenceByAssignment: ({ assignmentId }) => (
       resolveWorktreeRegistryReference(assignmentId)
     ),
-    protectedPaths: [process.cwd(), ...listSessions().map((session) => session.projectDir)],
+    // Protect only paths that are actually in use as a session workspace.
+    // Persistent sessions are normally `idle`; protecting every assignment
+    // directory below their name would make terminal worktrees immortal.
+    protectedPaths: [process.cwd(), ...sessions.map((session) => session.projectDir)],
     preserveTerminalChanges: true,
     reclaimOrphans: true,
     listExternalOrphanWorktrees: listExternalIntegrationWorktrees,
+    sweepRetainedArtifacts: async (mode, limit) => {
+      const registry = getSupervisionTaskRegistry();
+      const retentionTask = (task: ReturnType<typeof registry.get>) => task ? ({
+        taskId: task.taskId,
+        status: task.status,
+        updatedAt: task.updatedAt,
+        ...(task.archivedAt === undefined ? {} : { archivedAt: task.archivedAt }),
+        ...(task.integrationBundle?.bundlePath
+          ? { integrationBundlePath: task.integrationBundle.bundlePath }
+          : {}),
+        assignments: task.assignments.map((assignment) => ({
+          assignmentId: assignment.assignmentId,
+          status: assignment.status,
+          leaseId: assignment.leaseId,
+        })),
+      }) : undefined;
+      const tasks = [] as ReturnType<typeof registry.list>;
+      let cursor: string | undefined;
+      while (tasks.length < SUPERVISION_RETENTION_SCAN_LIMIT) {
+        const page = registry.list({
+          includeArchived: true,
+          ...(cursor ? { cursor } : {}),
+          limit: Math.min(100, SUPERVISION_RETENTION_SCAN_LIMIT - tasks.length),
+        });
+        tasks.push(...page);
+        if (page.length < 100) break;
+        cursor = page.at(-1)?.taskId;
+        if (!cursor) break;
+      }
+      return runSupervisionRetentionGc({
+        mode,
+        limit,
+        tasks: tasks.map((task) => retentionTask(task)!),
+        resolveTask: (taskId) => retentionTask(registry.get(taskId)),
+        resolveAssignment: (assignmentId) => {
+          const assignment = registry.getAssignment(assignmentId);
+          const task = assignment ? retentionTask(registry.get(assignment.taskId)) : undefined;
+          const retainedAssignment = task?.assignments.find((candidate) => candidate.assignmentId === assignmentId);
+          return task && retainedAssignment ? { task, assignment: retainedAssignment } : undefined;
+        },
+      });
+    },
   };
 }
 
@@ -418,6 +468,13 @@ export async function runScheduledSupervisionWorktreeGcBatch(
       worktreesDeleted: result.deleted,
       reclaimedBytes: result.releasedBytes,
     }, 'Supervision worktree GC reclaimed terminal worktrees');
+  }
+  if (result.artifactRetention && result.artifactRetention.deleted > 0) {
+    logger.info({
+      projectName: state.projectName,
+      artifactsDeleted: result.artifactRetention.deleted,
+      reclaimedBytes: result.artifactRetention.releasedBytes,
+    }, 'Supervision artifact retention reclaimed terminal scratch/bundles');
   }
   const totalBytes = await measureWorktreesRootBytes(result.root);
   if (totalBytes !== undefined && totalBytes >= SUPERVISION_WORKTREE_BYTES_WARNING) {

@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { promisify } from 'node:util';
@@ -14,7 +14,10 @@ import {
   type SupervisionWorktreeRegistryReference,
 } from '../../src/daemon/supervision-worktree-gc.js';
 import { SupervisionTaskRegistry } from '../../src/daemon/supervision-state-store.js';
-import { runScheduledSupervisionWorktreeGcBatch } from '../../src/daemon/supervision-registry-port.js';
+import {
+  createSupervisionWorktreeGcDeps,
+  runScheduledSupervisionWorktreeGcBatch,
+} from '../../src/daemon/supervision-registry-port.js';
 
 const execFileAsync = promisify(execFile);
 const roots: string[] = [];
@@ -32,15 +35,22 @@ async function makeRoot(prefix = 'supervision-worktree-gc-'): Promise<string> {
 async function createCandidate(
   root: string,
   assignmentId: string,
-  options: { evidence?: boolean; unknownContent?: boolean; taskId?: string; metadata?: boolean } = {},
+  options: {
+    evidence?: boolean;
+    unknownContent?: boolean;
+    taskId?: string;
+    metadata?: boolean;
+    sessionName?: string;
+  } = {},
 ): Promise<{ path: string; repoPath: string; metadata: SupervisionWorktreeMetadata; metadataText: string }> {
-  const path = join(root, 'imcodes', 'deck_gc_brain', assignmentId);
+  const sessionName = options.sessionName ?? 'deck_gc_brain';
+  const path = join(root, 'imcodes', sessionName, assignmentId);
   const repoPath = join(path, 'repo');
   await mkdir(repoPath, { recursive: true });
   const metadata: SupervisionWorktreeMetadata = {
     taskId: options.taskId ?? `task_${assignmentId}`,
     assignmentId,
-    sessionName: 'deck_gc_brain',
+    sessionName,
     baseRevision: 'a'.repeat(40),
     repoPath,
     createdAt: '2026-08-30T00:00:00Z',
@@ -59,7 +69,7 @@ function registryReference(
   metadata: SupervisionWorktreeMetadata,
   input: {
     status?: string; leaseId?: string; claims?: boolean; archivedAt?: number;
-    completeAuthority?: boolean;
+    completeAuthority?: boolean; updatedAt?: number; taskStatus?: string;
   } = {},
 ): SupervisionWorktreeRegistryReference {
   const status = input.status ?? 'finalized';
@@ -73,14 +83,18 @@ function registryReference(
       taskId: metadata.taskId,
       status,
       leaseId: input.leaseId ?? '',
+      updatedAt: input.updatedAt ?? Date.now(),
       ...(completeAuthority ? { auditAttemptId: attemptId, auditRevision: revision, verdict: 'PASS' } : {}),
     },
     task: {
       taskId: metadata.taskId,
       projectName: 'cd',
-      status: status === 'finalized' ? 'finalized' : 'implementing',
+      status: input.taskStatus ?? (status === 'finalized' ? 'finalized' : 'implementing'),
       ...(input.archivedAt === undefined ? {} : { archivedAt: input.archivedAt }),
-      assignments: [{ assignmentId: metadata.assignmentId, status, leaseId: input.leaseId ?? '' }],
+      assignments: [{
+        assignmentId: metadata.assignmentId, status, leaseId: input.leaseId ?? '',
+        updatedAt: input.updatedAt ?? Date.now(),
+      }],
       ...(completeAuthority ? {
         commitSha: 'a'.repeat(40),
         pushRemoteRef: 'refs/heads/dev',
@@ -115,6 +129,10 @@ const eligibleGit = (commonDir = '/tmp/git-common'): SupervisionWorktreeGitInspe
 });
 
 describe('bounded supervision worktree GC', () => {
+  it('does not turn persistent session names into blanket worktree protection', () => {
+    expect(createSupervisionWorktreeGcDeps()).not.toHaveProperty('protectedSessionNames');
+  });
+
   function consumedFinalizationReference(
     metadata: SupervisionWorktreeMetadata,
     options: {
@@ -131,6 +149,7 @@ describe('bounded supervision worktree GC', () => {
       taskId: metadata.taskId,
       status: options.adoptedCompletionEvidence ? 'cancelled' : 'finalized',
       leaseId: '',
+      updatedAt: Date.now(),
       ...(options.adoptedCompletionEvidence ? {} : {
         auditAttemptId: attemptId,
         auditRevision: revision,
@@ -184,7 +203,7 @@ describe('bounded supervision worktree GC', () => {
     } as SupervisionWorktreeRegistryReference;
   }
 
-  it('requires consumed PASS, manifest, commit and push authority before deleting a terminal worktree', async () => {
+  it('uses terminal assignment authority instead of requiring task evidence owned by a different role', async () => {
     const root = await makeRoot();
     await createCandidate(root, 'supervision_assignment_missing-authority');
     const result = await runSupervisionWorktreeGc({ projectName: 'cd', worktreesRoot: root }, {
@@ -192,9 +211,7 @@ describe('bounded supervision worktree GC', () => {
       inspectGit: async () => eligibleGit(),
       protectedPaths: [],
     });
-    expect(result.entries[0]).toMatchObject({
-      action: 'retain', reason: (SUPERVISION_WORKTREE_GC_REASONS as any).INCOMPLETE_AUTHORITY,
-    });
+    expect(result.entries[0]).toMatchObject({ action: 'delete', reason: SUPERVISION_WORKTREE_GC_REASONS.ELIGIBLE });
   });
 
   it('automatically removes only a fully consumed pushed worktree and reports released bytes', async () => {
@@ -208,7 +225,6 @@ describe('bounded supervision worktree GC', () => {
       projectName: 'cd', mode: 'apply', worktreesRoot: root,
     }, {
       resolveRegistryReference: (metadata) => consumedFinalizationReference(metadata),
-      verifyFinalization: async () => true,
       measureDirectoryBytes: async () => 4096,
       inspectGit: async () => eligibleGit(),
       removeRegisteredWorktree,
@@ -230,7 +246,6 @@ describe('bounded supervision worktree GC', () => {
       projectName: 'cd', mode: 'apply', worktreesRoot: root,
     }, {
       resolveRegistryReference: (metadata) => consumedFinalizationReference(metadata, { withCi: false }),
-      verifyFinalization: async () => true,
       inspectGit: async () => eligibleGit(),
       removeRegisteredWorktree,
       removeDirectory: (path) => rm(path, { recursive: true, force: false }),
@@ -318,7 +333,6 @@ describe('bounded supervision worktree GC', () => {
       resolveRegistryReference: (metadata) => consumedFinalizationReference(metadata, {
         pendingCompletionEvidence: true,
       }),
-      verifyFinalization: async () => true,
       inspectGit: async () => eligibleGit(),
       protectedPaths: [],
     } as any);
@@ -332,19 +346,18 @@ describe('bounded supervision worktree GC', () => {
     await createCandidate(root, 'supervision_assignment_consumed-predecessor');
     const result = await runSupervisionWorktreeGc({ projectName: 'cd', worktreesRoot: root }, {
       resolveRegistryReference: (metadata) => consumedFinalizationReference(metadata, { successor: true }),
-      verifyFinalization: async () => true,
       inspectGit: async () => eligibleGit(),
       protectedPaths: [],
     } as any);
     expect(result.entries[0]).toMatchObject({ action: 'delete', reason: SUPERVISION_WORKTREE_GC_REASONS.ELIGIBLE });
   });
 
-  it('collects a cancelled predecessor only after its adopted bytes are consumed by successor finalization', async () => {
+  it('collects a cancelled predecessor after its completion evidence is no longer pending', async () => {
     const root = await makeRoot();
     await createCandidate(root, 'supervision_assignment_adopted-predecessor');
     const result = await runSupervisionWorktreeGc({ projectName: 'cd', worktreesRoot: root }, {
       resolveRegistryReference: (metadata) => consumedFinalizationReference(metadata, {
-        adoptedCompletionEvidence: true,
+        adoptedCompletionEvidence: true, successor: true,
       }),
       inspectGit: async () => eligibleGit(),
       protectedPaths: [],
@@ -687,7 +700,7 @@ describe('bounded supervision worktree GC', () => {
     expect(removeRegisteredWorktree).not.toHaveBeenCalled();
   });
 
-  it('retains a terminal owner while the same task still has another active assignment', async () => {
+  it('reclaims a terminal owner while preserving another active assignment worktree independently', async () => {
     const root = await makeRoot();
     await createCandidate(root, 'supervision_assignment_terminal-with-auditor');
     const result = await runSupervisionWorktreeGc({ projectName: 'cd', worktreesRoot: root }, {
@@ -702,9 +715,144 @@ describe('bounded supervision worktree GC', () => {
       inspectGit: async () => eligibleGit(),
       protectedPaths: [],
     });
+    expect(result.entries[0]).toMatchObject({ action: 'delete', reason: SUPERVISION_WORKTREE_GC_REASONS.ELIGIBLE });
+  });
+
+  it('retains a recently cancelled owner while an active successor can still receive its late completion', async () => {
+    const root = await makeRoot();
+    await createCandidate(root, 'supervision_assignment_cancelled-handoff');
+    const now = Date.now();
+    const result = await runSupervisionWorktreeGc({ projectName: 'cd', worktreesRoot: root }, {
+      now: () => now,
+      resolveRegistryReference: (metadata) => {
+        const reference = registryReference(metadata, { status: 'cancelled', updatedAt: now });
+        reference.task!.assignments.push({
+          assignmentId: 'supervision_assignment_successor', status: 'implementing', leaseId: 'successor-lease',
+        });
+        return reference;
+      },
+      inspectGit: async () => eligibleGit(),
+      protectedPaths: [],
+    });
     expect(result.entries[0]).toMatchObject({
       action: 'retain', reason: SUPERVISION_WORKTREE_GC_REASONS.ACTIVE_REFERENCE,
     });
+  });
+
+  it.each(['terminal_task', 'grace_elapsed'])('reclaims a cancelled handoff after %s', async (condition) => {
+    const root = await makeRoot();
+    await createCandidate(root, 'supervision_assignment_cancelled-safe');
+    const now = Date.now();
+    const result = await runSupervisionWorktreeGc({ projectName: 'cd', worktreesRoot: root }, {
+      now: () => now,
+      handoffGraceMs: 60_000,
+      resolveRegistryReference: (metadata) => {
+        const reference = registryReference(metadata, {
+          status: 'cancelled',
+          taskStatus: condition === 'terminal_task' ? 'cancelled' : 'implementing',
+          updatedAt: condition === 'grace_elapsed' ? now - 61_000 : now,
+        });
+        reference.task!.assignments.push({
+          assignmentId: 'supervision_assignment_successor', status: 'implementing', leaseId: 'successor-lease',
+        });
+        return reference;
+      },
+      inspectGit: async () => eligibleGit(),
+      protectedPaths: [],
+    });
+    expect(result.entries[0]).toMatchObject({ action: 'delete', reason: SUPERVISION_WORKTREE_GC_REASONS.ELIGIBLE });
+  });
+
+  it('uses exact session workspaces, not persistent idle/running names, while lifecycle guards active work', async () => {
+    const root = await makeRoot();
+    const ids = {
+      finalized: 'supervision_assignment_idle-finalized',
+      cancelled: 'supervision_assignment_idle-cancelled',
+      auditor: 'supervision_assignment_idle-auditor',
+      integration: 'supervision_assignment_idle-integration',
+      leased: 'supervision_assignment_idle-leased',
+      nonterminal: 'supervision_assignment_idle-active',
+      handoff: 'supervision_assignment_idle-handoff',
+      cwd: 'supervision_assignment_idle-cwd',
+    } as const;
+    const created = new Map<string, Awaited<ReturnType<typeof createCandidate>>>();
+    for (const assignmentId of Object.values(ids)) {
+      created.set(assignmentId, await createCandidate(root, assignmentId, { sessionName: 'deck_gc_idle' }));
+    }
+    const currentWorkspace = created.get(ids.cwd)!;
+    const sessionsJsonFixture = [
+      { name: 'deck_gc_idle', state: 'idle', projectDir: currentWorkspace.repoPath },
+      { name: 'deck_gc_running', state: 'running', projectDir: join(root, 'running-base') },
+      { name: 'deck_gc_error', state: 'error', projectDir: join(root, 'error-base') },
+    ];
+    const now = Date.now();
+    const result = await runSupervisionWorktreeGc({ projectName: 'cd', worktreesRoot: root }, {
+      now: () => now,
+      handoffGraceMs: 60_000,
+      resolveRegistryReference: (metadata) => {
+        const assignmentId = metadata.assignmentId;
+        const input = assignmentId === ids.cancelled
+          ? { status: 'cancelled', taskStatus: 'implementing', updatedAt: now - 61_000 }
+          : assignmentId === ids.leased
+            ? { status: 'finalized', leaseId: 'live-lease' }
+            : assignmentId === ids.nonterminal
+              ? { status: 'implementing', taskStatus: 'implementing' }
+              : assignmentId === ids.handoff
+                ? { status: 'cancelled', taskStatus: 'implementing', updatedAt: now }
+                : { status: 'finalized' };
+        const reference = registryReference(metadata, input);
+        if (assignmentId === ids.auditor) reference.assignment!.role = 'auditor';
+        if (assignmentId === ids.integration) reference.assignment!.role = 'integration_owner';
+        if (assignmentId === ids.cancelled || assignmentId === ids.handoff) {
+          reference.task!.assignments.push({
+            assignmentId: `${assignmentId}-successor`, status: 'implementing', leaseId: 'successor-lease',
+          });
+        }
+        return reference;
+      },
+      inspectGit: async () => eligibleGit(),
+      protectedPaths: sessionsJsonFixture.map((session) => session.projectDir),
+    });
+    const byId = new Map(result.entries.map((entry) => [entry.assignmentId, entry]));
+    for (const assignmentId of [ids.finalized, ids.cancelled, ids.auditor, ids.integration]) {
+      expect(byId.get(assignmentId)).toMatchObject({
+        action: 'delete', reason: SUPERVISION_WORKTREE_GC_REASONS.ELIGIBLE,
+      });
+    }
+    expect(byId.get(ids.leased)).toMatchObject({
+      action: 'retain', reason: SUPERVISION_WORKTREE_GC_REASONS.ACTIVE_LEASE,
+    });
+    expect(byId.get(ids.nonterminal)).toMatchObject({
+      action: 'retain', reason: SUPERVISION_WORKTREE_GC_REASONS.ACTIVE_REFERENCE,
+    });
+    expect(byId.get(ids.handoff)).toMatchObject({
+      action: 'retain', reason: SUPERVISION_WORKTREE_GC_REASONS.ACTIVE_REFERENCE,
+    });
+    expect(byId.get(ids.cwd)).toMatchObject({
+      action: 'retain', reason: SUPERVISION_WORKTREE_GC_REASONS.PROTECTED_PATH,
+    });
+  });
+
+  it.each([
+    ['implementer', 'finalized'],
+    ['auditor', 'finalized'],
+    ['integration_owner', 'finalized'],
+    ['implementer', 'cancelled'],
+    ['integration_owner', 'recovered'],
+  ])('reclaims terminal %s assignments in %s without role-local PASS evidence', async (role, status) => {
+    const root = await makeRoot();
+    await createCandidate(root, 'supervision_assignment_terminal-role');
+    const result = await runSupervisionWorktreeGc({ projectName: 'cd', worktreesRoot: root }, {
+      resolveRegistryReference: (metadata) => {
+        const reference = registryReference(metadata, { status, completeAuthority: false });
+        reference.assignment!.role = role;
+        reference.task!.assignments[0] = { ...reference.assignment! };
+        return reference;
+      },
+      inspectGit: async () => eligibleGit(),
+      protectedPaths: [],
+    });
+    expect(result.entries[0]).toMatchObject({ action: 'delete', reason: SUPERVISION_WORKTREE_GC_REASONS.ELIGIBLE });
   });
 
   it('keeps a recovery journal when Git removal reports a partial/unknown failure', async () => {
@@ -756,6 +904,31 @@ describe('bounded supervision worktree GC', () => {
     expect(result.entries[0]?.reason).toBe(SUPERVISION_WORKTREE_GC_REASONS.RECOVERY_BLOCKED);
     expect(removeDirectory).not.toHaveBeenCalled();
     expect(await readdir(quarantinePath)).toContain('metadata.json');
+  });
+
+  it('rediscovers and reclaims an age-gated quarantine left after a failed directory removal', async () => {
+    const root = await makeRoot();
+    const created = await createCandidate(root, 'asg_quarantine1');
+    await rm(created.repoPath, { recursive: true, force: false });
+    const quarantinePath = `${created.path}.gc-stale-run`;
+    await rename(created.path, quarantinePath);
+    await utimes(quarantinePath, new Date(1), new Date(1));
+    const now = Date.now();
+    const deps = {
+      now: () => now,
+      quarantineGraceMs: 60_000,
+      resolveRegistryReference: (metadata: SupervisionWorktreeMetadata) => registryReference(metadata),
+      resolveRegistryReferenceByAssignment: () => registryReference(created.metadata),
+      protectedPaths: [],
+      removeDirectory: (path: string) => rm(path, { recursive: true, force: false }),
+    };
+    const dry = await runSupervisionWorktreeGc({ projectName: 'cd', worktreesRoot: root }, deps);
+    expect(dry.entries[0]).toMatchObject({
+      assignmentId: 'asg_quarantine1', action: 'delete', reason: SUPERVISION_WORKTREE_GC_REASONS.ELIGIBLE,
+    });
+    const applied = await runSupervisionWorktreeGc({ projectName: 'cd', mode: 'apply', worktreesRoot: root }, deps);
+    expect(applied.deleted).toBe(1);
+    await expect(realpath(quarantinePath)).rejects.toThrow();
   });
 
   it('hard-bounds a crowded assignment root before registry or Git work', async () => {
@@ -931,7 +1104,6 @@ describe('bounded supervision worktree GC', () => {
       projectName: 'cd', mode: 'apply', worktreesRoot: root,
     }, {
       resolveRegistryReference: (metadata) => registryReference(metadata),
-      verifyFinalization: async () => true,
       removeRegisteredWorktree,
       protectedPaths: [], preserveTerminalChanges: true, maxBackupPatchBytes: 1024,
     });

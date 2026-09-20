@@ -11,11 +11,19 @@ import {
   rm,
   stat,
   unlink,
+  utimes,
   writeFile,
 } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
+import type { SupervisionRetentionGcResult } from './supervision-retention-gc.js';
+import {
+  SUPERVISION_QUARANTINE_GRACE_MS,
+  SUPERVISION_WORKTREE_HANDOFF_GRACE_MS,
+  isTerminalSupervisionWorktreeAssignmentStatus,
+  isTerminalSupervisionWorktreeTaskStatus,
+} from '../../shared/supervision-retention.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -34,11 +42,7 @@ const SESSION_NAME = /^deck_[0-9a-z_-]+$/i;
 const EVIDENCE_NAME = /^evidence(?:-[0-9a-z_.-]+)?$/i;
 const METADATA_MAX_BYTES = 16 * 1024;
 const JOURNAL_VERSION = 1 as const;
-const TERMINAL_ASSIGNMENT = new Set(['finalized', 'cancelled']);
-const ACTIVE_ASSIGNMENT = new Set([
-  'planned', 'delegated', 'implementing', 'retrying_external_ci', 'recovered',
-  'validated', 'ready_for_audit', 'auditing', 'rework', 'ready_for_integration',
-]);
+const QUARANTINED_ASSIGNMENT_NAME = /^((?:supervision_assignment_[0-9a-z-]+|asg_[0-9a-z]+))\.gc-[0-9a-z-]+$/;
 
 export const SUPERVISION_WORKTREE_GC_REASONS = Object.freeze({
   ELIGIBLE: 'eligible',
@@ -92,6 +96,7 @@ export interface SupervisionWorktreeRegistryReference {
     auditAttemptId?: string;
     auditRevision?: string;
     verdict?: string;
+    updatedAt?: number;
   };
   task?: {
     taskId: string;
@@ -119,6 +124,7 @@ export interface SupervisionWorktreeRegistryReference {
       auditAttemptId?: string;
       auditRevision?: string;
       verdict?: string;
+      updatedAt?: number;
     }>;
   };
   claims?: ReadonlyArray<{ assignmentId: string; path: string }>;
@@ -179,6 +185,8 @@ export interface SupervisionWorktreeGcResult {
   entries: SupervisionWorktreeGcEntry[];
   staleRegistrations: string[];
   diagnostics: Array<{ code: string; assignmentId?: string }>;
+  /** Bounded scratch/bundle retention page, exposed by the housekeeping tool. */
+  artifactRetention?: SupervisionRetentionGcResult;
 }
 
 export interface SupervisionWorktreeGcInput {
@@ -207,6 +215,8 @@ export interface SupervisionWorktreeGcDeps {
   reclaimOrphans?: boolean;
   backupsRoot?: string;
   orphanGraceMs?: number;
+  handoffGraceMs?: number;
+  quarantineGraceMs?: number;
   maxBackupPatchBytes?: number;
   listExternalOrphanWorktrees?: (projectName: string) => Promise<readonly string[]> | readonly string[];
   now?: () => number;
@@ -217,12 +227,12 @@ export interface SupervisionWorktreeGcDeps {
   removeRegisteredWorktree?: (inspection: SupervisionWorktreeGitInspection, repoPath: string) => Promise<boolean>;
   pruneRegistrations?: (commonDir: string, apply: boolean) => Promise<string[]>;
   removeDirectory?: (path: string) => Promise<void>;
-  verifyFinalization?: (
-    repoPath: string,
-    finalization: NonNullable<NonNullable<SupervisionWorktreeRegistryReference['task']>['finalization']>,
-  ) => Promise<boolean>;
   measureDirectoryBytes?: (path: string) => Promise<number>;
   onScanOperation?: (operation: 'project' | 'session' | 'assignment' | 'registry' | 'git') => void;
+  sweepRetainedArtifacts?: (
+    mode: SupervisionWorktreeGcMode,
+    limit: number,
+  ) => Promise<SupervisionRetentionGcResult>;
 }
 
 interface CandidatePath {
@@ -232,6 +242,7 @@ interface CandidatePath {
   repoPath: string;
   sessionName: string;
   external?: boolean;
+  quarantine?: boolean;
 }
 
 interface GcJournal {
@@ -392,31 +403,6 @@ async function preserveCandidateState(
   return { ok: true, detail: artifacts.join(',') || 'no_local_only_bytes' };
 }
 
-async function verifyCommittedFinalization(
-  repoPath: string,
-  finalization: NonNullable<NonNullable<SupervisionWorktreeRegistryReference['task']>['finalization']>,
-): Promise<boolean> {
-  if (!/^[0-9a-f]{40}$/.test(finalization.commitSha)
-    || finalization.integrationManifest.length === 0) return false;
-  for (const entry of finalization.integrationManifest) {
-    if (!entry.path || entry.path.startsWith('/') || entry.path.split('/').includes('..')
-      || !/^[0-9a-f]{64}$/.test(entry.sha256)) return false;
-    try {
-      const result = await execFileAsync('git', ['show', `${finalization.commitSha}:${entry.path}`], {
-        cwd: repoPath,
-        timeout: 10_000,
-        maxBuffer: 16 * 1024 * 1024,
-        encoding: 'buffer',
-      });
-      const stdout = Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout);
-      const digest = createHash('sha256').update(stdout).digest('hex');
-      if (digest !== entry.sha256) return false;
-    } catch { return false; }
-  }
-  const pushed = await runGit(repoPath, ['for-each-ref', '--format=%(refname)', '--contains', finalization.commitSha, 'refs/remotes']);
-  return pushed.ok && pushed.stdout.trim().length > 0;
-}
-
 async function directoryBytes(path: string): Promise<number> {
   const info = await lstat(path);
   if (info.isSymbolicLink()) return info.size;
@@ -431,62 +417,44 @@ async function directoryBytes(path: string): Promise<number> {
   return total;
 }
 
-function registryAuthorityReason(
+function terminalAssignmentReason(
   reference: SupervisionWorktreeRegistryReference,
   assignmentId: string,
+  now: number,
+  handoffGraceMs: number,
 ): SupervisionWorktreeGcReason | undefined {
   const assignment = reference.assignment;
   const task = reference.task;
-  const finalization = task?.finalization;
-  if (!assignment || !task || !finalization) return SUPERVISION_WORKTREE_GC_REASONS.INCOMPLETE_AUTHORITY;
-  const sourceEvidence = (reference.completionEvidence ?? []).filter((record) => (
-    record.sourceAssignmentId === assignmentId
-  ));
-  if (sourceEvidence.some((record) => (
+  if (!assignment || !task || assignment.assignmentId !== assignmentId) {
+    return SUPERVISION_WORKTREE_GC_REASONS.INCOMPLETE_AUTHORITY;
+  }
+  if (assignment.leaseId) return SUPERVISION_WORKTREE_GC_REASONS.ACTIVE_LEASE;
+  if (!isTerminalSupervisionWorktreeAssignmentStatus(assignment.status)) {
+    return SUPERVISION_WORKTREE_GC_REASONS.ACTIVE_REFERENCE;
+  }
+  if ((reference.claims ?? []).some((claim) => claim.assignmentId === assignmentId)) {
+    return SUPERVISION_WORKTREE_GC_REASONS.ACTIVE_CLAIMS;
+  }
+  if ((reference.completionEvidence ?? []).some((record) => (
     record.sourceAssignmentId === assignmentId && record.status === 'pending'
   ))) return SUPERVISION_WORKTREE_GC_REASONS.PENDING_COMPLETION_EVIDENCE;
-  if (finalization.verdict !== 'PASS'
-    || !['pushed', 'already_present'].includes(finalization.pushResult)
-    || finalization.revision !== finalization.auditRevision
-    || task.commitSha !== finalization.commitSha
-    || task.pushRemoteRef !== finalization.pushRemoteRef
-    || finalization.integrationManifest.length === 0) {
-    return SUPERVISION_WORKTREE_GC_REASONS.INCOMPLETE_AUTHORITY;
-  }
-  const directConsumed = assignment.auditRevision === finalization.revision
-    && assignment.auditAttemptId === finalization.auditAttemptId
-    && assignment.verdict === 'PASS';
-  const resolvedEvidenceConsumed = sourceEvidence.some((record) => {
-    if ((record.status !== 'adopted' && record.status !== 'discarded')
-      || !record.adoptedByAssignmentId) return false;
-    const target = task.assignments.find((candidate) => (
-      candidate.assignmentId === record.adoptedByAssignmentId
+  if (assignment.status === 'cancelled' || assignment.status === 'recovered') {
+    const completionResolved = (reference.completionEvidence ?? []).some((record) => (
+      record.sourceAssignmentId === assignmentId
+      && (record.status === 'adopted' || record.status === 'discarded')
     ));
-    if (!target || target.auditRevision !== finalization.revision
-      || target.auditAttemptId !== finalization.auditAttemptId || target.verdict !== 'PASS') return false;
-    if (record.status === 'discarded') return true;
-    const manifest = new Map(finalization.integrationManifest.map((entry) => [entry.path, entry.sha256]));
-    return Boolean(record.files?.length) && record.files!.every((file) => (
-      file.deleted !== true && Boolean(file.sha256) && manifest.get(file.path) === file.sha256
-    ));
-  });
-  if (!directConsumed && !resolvedEvidenceConsumed) {
-    return SUPERVISION_WORKTREE_GC_REASONS.INCOMPLETE_AUTHORITY;
+    if (!completionResolved && !isTerminalSupervisionWorktreeTaskStatus(task.status)) {
+      const activeSibling = task.assignments.some((candidate) => (
+        candidate.assignmentId !== assignmentId
+        && !isTerminalSupervisionWorktreeAssignmentStatus(candidate.status)
+      ));
+      const age = typeof assignment.updatedAt === 'number' ? now - assignment.updatedAt : 0;
+      if (activeSibling && age < handoffGraceMs) {
+        return SUPERVISION_WORKTREE_GC_REASONS.ACTIVE_REFERENCE;
+      }
+    }
   }
-  const exactPass = (reference.auditReceipts ?? []).filter((receipt) => (
-    receipt.attemptId === finalization.auditAttemptId
-    && receipt.revision === finalization.revision
-    && receipt.receiptKind === 'final'
-    && receipt.verdict === 'PASS'
-  ));
-  if (exactPass.length !== 1) return SUPERVISION_WORKTREE_GC_REASONS.INCOMPLETE_AUTHORITY;
-  const activeSameEvidence = task.assignments.some((candidate) => (
-    candidate.assignmentId !== assignmentId
-    && ACTIVE_ASSIGNMENT.has(candidate.status)
-    && (candidate.role === 'auditor' || !candidate.auditRevision
-      || candidate.auditRevision === finalization.revision)
-  ));
-  return activeSameEvidence ? SUPERVISION_WORKTREE_GC_REASONS.ACTIVE_REFERENCE : undefined;
+  return undefined;
 }
 
 async function worktreeBlock(porcelain: string, repoPath: string): Promise<string | undefined> {
@@ -685,15 +653,17 @@ async function scanCandidatePaths(
               observed += 1;
               deps.onScanOperation?.('assignment');
               if (observed % 32 === 0) await (deps.yieldControl ?? nextTurn)();
-              if (!ASSIGNMENT_NAME.test(assignmentEntry.name)) continue;
+              const quarantineMatch = QUARANTINED_ASSIGNMENT_NAME.exec(assignmentEntry.name);
+              if (!ASSIGNMENT_NAME.test(assignmentEntry.name) && !quarantineMatch) continue;
               const candidatePath = join(sessionPath, assignmentEntry.name);
               const candidateStat = await lstat(candidatePath).catch(() => undefined);
               if (!candidateStat?.isDirectory() || candidateStat.isSymbolicLink()) continue;
               const repoPath = join(candidatePath, 'repo');
               const key = [projectEntry.name, sessionEntry.name, assignmentEntry.name].join('/');
               candidates.push({
-                key, assignmentId: assignmentEntry.name, candidatePath, repoPath,
+                key, assignmentId: quarantineMatch?.[1] ?? assignmentEntry.name, candidatePath, repoPath,
                 sessionName: sessionEntry.name,
+                ...(quarantineMatch ? { quarantine: true } : {}),
               });
             }
           } finally {
@@ -754,15 +724,21 @@ async function evaluateCandidate(
   const metadataRepoPath = parsed
     ? await realpath(parsed.metadata.repoPath).catch(() => undefined)
     : candidateRepoPath;
-  const missingRepoMetadataMatches = parsed
-    && !candidateRepoPath
-    && resolve(parsed.metadata.repoPath) === resolve(candidate.repoPath);
+  const originalCandidatePath = parsed ? dirname(resolve(parsed.metadata.repoPath)) : undefined;
+  const quarantineMetadataMatches = Boolean(parsed && candidate.quarantine && !candidateRepoPath
+    && originalCandidatePath
+    && basename(originalCandidatePath) === candidate.assignmentId
+    && basename(candidate.candidatePath).startsWith(`${basename(originalCandidatePath)}.gc-`)
+    && basename(resolve(parsed.metadata.repoPath)) === 'repo');
+  const missingRepoMetadataMatches = Boolean(parsed && !candidateRepoPath
+    && resolve(parsed.metadata.repoPath) === resolve(candidate.repoPath));
   if (parsed && (
     parsed.metadata.assignmentId !== candidate.assignmentId
-    || ((!metadataRepoPath || metadataRepoPath !== candidateRepoPath) && !missingRepoMetadataMatches)
+    || ((!metadataRepoPath || metadataRepoPath !== candidateRepoPath)
+      && !missingRepoMetadataMatches && !quarantineMetadataMatches)
     || parsed.metadata.sessionName !== candidate.sessionName
   )) {
-    return retain(SUPERVISION_WORKTREE_GC_REASONS.INVALID_LAYOUT);
+    return retain(SUPERVISION_WORKTREE_GC_REASONS.INVALID_LAYOUT, undefined, 'metadata_layout');
   }
   let reference: SupervisionWorktreeRegistryReference;
   try {
@@ -780,6 +756,13 @@ async function evaluateCandidate(
   }
   const taskId = parsed?.metadata.taskId ?? reference.assignment?.taskId;
   if (!reference.available) return retain(SUPERVISION_WORKTREE_GC_REASONS.REGISTRY_UNAVAILABLE, taskId);
+  if (candidate.quarantine) {
+    const candidateStat = await lstat(candidate.candidatePath).catch(() => undefined);
+    const graceMs = Math.max(60_000, deps.quarantineGraceMs ?? SUPERVISION_QUARANTINE_GRACE_MS);
+    if (!candidateStat || (deps.now?.() ?? Date.now()) - candidateStat.mtimeMs < graceMs) {
+      return retain(SUPERVISION_WORKTREE_GC_REASONS.RECOVERY_BLOCKED, taskId, 'quarantine_grace');
+    }
+  }
   if (!reference.assignment && !reference.task && deps.reclaimOrphans) {
     const candidateStat = await lstat(candidate.candidatePath).catch(() => undefined);
     const createdAt = parsed ? Date.parse(parsed.metadata.createdAt) : Number.NaN;
@@ -835,26 +818,16 @@ async function evaluateCandidate(
   if (reference.task.projectName !== projectName) {
     return retain(SUPERVISION_WORKTREE_GC_REASONS.PROJECT_MISMATCH, taskId);
   }
-  if (reference.assignment.leaseId) return retain(SUPERVISION_WORKTREE_GC_REASONS.ACTIVE_LEASE, taskId);
-  if ((reference.claims ?? []).some((claim) => claim.assignmentId === candidate.assignmentId)) {
-    return retain(SUPERVISION_WORKTREE_GC_REASONS.ACTIVE_CLAIMS, taskId);
-  }
-  if (ACTIVE_ASSIGNMENT.has(reference.assignment.status)
-    || !TERMINAL_ASSIGNMENT.has(reference.assignment.status)) {
-    return retain(SUPERVISION_WORKTREE_GC_REASONS.ACTIVE_REFERENCE, taskId);
-  }
-  if (reference.assignment.status === 'cancelled') {
-    const activeSibling = reference.task.assignments.some((assignment) => (
-      assignment.assignmentId !== candidate.assignmentId && ACTIVE_ASSIGNMENT.has(assignment.status)
-    ));
-    if (activeSibling) return retain(SUPERVISION_WORKTREE_GC_REASONS.ACTIVE_REFERENCE, taskId);
-  } else {
-    const authorityReason = registryAuthorityReason(reference, candidate.assignmentId);
-    if (authorityReason) return retain(authorityReason, taskId);
-  }
+  const terminalReason = terminalAssignmentReason(
+    reference,
+    candidate.assignmentId,
+    deps.now?.() ?? Date.now(),
+    Math.max(60_000, deps.handoffGraceMs ?? SUPERVISION_WORKTREE_HANDOFF_GRACE_MS),
+  );
+  if (terminalReason) return retain(terminalReason, taskId);
   let contentReason: SupervisionWorktreeGcReason | undefined;
   try { contentReason = await inspectCandidateContents(candidate.candidatePath, Boolean(candidateRepoPath)); } catch {
-    return retain(SUPERVISION_WORKTREE_GC_REASONS.INVALID_LAYOUT, taskId);
+    return retain(SUPERVISION_WORKTREE_GC_REASONS.INVALID_LAYOUT, taskId, 'content_inspection');
   }
   if (contentReason) return retain(contentReason, taskId);
   // Legacy/partially-completed GC layouts can retain only the assignment shell
@@ -894,13 +867,11 @@ async function evaluateCandidate(
     if (inspection.branchOnly) return retain(SUPERVISION_WORKTREE_GC_REASONS.BRANCH_ONLY, taskId);
     if (inspection.unpushed) return retain(SUPERVISION_WORKTREE_GC_REASONS.UNPUSHED_BRANCH, taskId);
   }
-  if (reference.assignment.status !== 'cancelled') {
-    const finalization = reference.task.finalization!;
-    if (inspection.finalizationVerified !== true
-      && !await (deps.verifyFinalization ?? verifyCommittedFinalization)(candidate.repoPath, finalization)) {
-      return retain(SUPERVISION_WORKTREE_GC_REASONS.MANIFEST_MISMATCH, taskId);
-    }
-  }
+  // Terminal assignment state is the durable lifecycle authority for its
+  // disposable worktree. Audit/finalization evidence belongs to the task and
+  // is often held by a different assignment; requiring it here permanently
+  // retained auditors, integration owners, and cancelled predecessors. Local
+  // dirty/unpushed bytes are preserved above before any removal.
   return {
     entry: {
       key: candidate.key,
@@ -995,7 +966,9 @@ async function postGitRemoveCandidate(
   const root = await realpath(worktreesRoot).catch(() => resolve(worktreesRoot));
   if (journal.external) {
     if (!await safeExternalIntegrationPath(candidatePath)) return false;
-  } else if (relative(root, candidatePath).startsWith('..') || basename(candidatePath) !== journal.assignmentId) {
+  } else if (relative(root, candidatePath).startsWith('..')
+    || (basename(candidatePath) !== journal.assignmentId
+      && !basename(candidatePath).startsWith(`${journal.assignmentId}.gc-`))) {
     return false;
   }
   if (await protectedCandidate(candidatePath, deps.protectedPaths ?? [process.cwd()])) return false;
@@ -1024,14 +997,12 @@ async function postGitRemoveCandidate(
     && reference.task!.taskId === journal.taskId
     && reference.task!.projectName === projectName
     && reference.task!.assignments.some((assignment) => assignment.assignmentId === journal.assignmentId)
-    && !reference.assignment!.leaseId
-    && !ACTIVE_ASSIGNMENT.has(reference.assignment!.status)
-    && TERMINAL_ASSIGNMENT.has(reference.assignment!.status)
-    && (reference.assignment!.status === 'cancelled'
-      ? !reference.task!.assignments.some((assignment) => assignment.assignmentId !== journal.assignmentId
-        && ACTIVE_ASSIGNMENT.has(assignment.status))
-      : !registryAuthorityReason(reference, journal.assignmentId))
-    && !(reference.claims ?? []).some((claim) => claim.assignmentId === journal.assignmentId);
+    && !terminalAssignmentReason(
+      reference,
+      journal.assignmentId,
+      deps.now?.() ?? Date.now(),
+      Math.max(60_000, deps.handoffGraceMs ?? SUPERVISION_WORKTREE_HANDOFF_GRACE_MS),
+    );
   if (!orphanStillUnknown && !terminalStillAuthorized) return false;
   if (await lstat(journal.repoPath).then(() => true, () => false)) return false;
   const contentReason = await inspectCandidateContents(candidatePath, false).catch(
@@ -1040,6 +1011,7 @@ async function postGitRemoveCandidate(
   if (contentReason) return false;
   const quarantinePath = `${candidatePath}.gc-${journal.runId}`;
   await rename(candidatePath, quarantinePath);
+  await utimes(quarantinePath, new Date(), new Date());
   await writeJsonAtomic(journalPath, {
     ...journal,
     state: 'quarantined',
@@ -1118,14 +1090,12 @@ async function recoverInterruptedApply(
       && reference!.task!.taskId === journal.taskId
       && reference!.task!.projectName === projectName
       && reference!.task!.assignments.some((assignment) => assignment.assignmentId === journal.assignmentId)
-      && !reference!.assignment!.leaseId
-      && !ACTIVE_ASSIGNMENT.has(reference!.assignment!.status)
-      && TERMINAL_ASSIGNMENT.has(reference!.assignment!.status)
-      && (reference!.assignment!.status === 'cancelled'
-        ? !reference!.task!.assignments.some((assignment) => assignment.assignmentId !== journal.assignmentId
-          && ACTIVE_ASSIGNMENT.has(assignment.status))
-        : !registryAuthorityReason(reference!, journal.assignmentId))
-      && !(reference!.claims ?? []).some((claim) => claim.assignmentId === journal.assignmentId);
+      && !terminalAssignmentReason(
+        reference!,
+        journal.assignmentId,
+        deps.now?.() ?? Date.now(),
+        Math.max(60_000, deps.handoffGraceMs ?? SUPERVISION_WORKTREE_HANDOFF_GRACE_MS),
+      );
     if (!quarantineStat.isDirectory() || quarantineStat.isSymbolicLink()
       || !metadataMatches
       || (parsed && (parsed.metadata.assignmentId !== journal.assignmentId || parsed.metadata.taskId !== journal.taskId))
@@ -1392,6 +1362,10 @@ export async function runSupervisionWorktreeGc(
       await (deps.yieldControl ?? nextTurn)();
     }
     const hasMore = scannedPaths.truncated || afterCursor.length > batch.length;
+    const artifactRetention = await deps.sweepRetainedArtifacts?.(mode, limit).catch((error) => {
+      diagnostics.push({ code: safeErrorCode(error) });
+      return undefined;
+    });
     return {
       mode,
       runId,
@@ -1408,6 +1382,7 @@ export async function runSupervisionWorktreeGc(
       entries,
       staleRegistrations,
       diagnostics,
+      ...(artifactRetention ? { artifactRetention } : {}),
     };
   } finally {
     if (lockAcquired) await releaseRunLock(lockPath, runId);
