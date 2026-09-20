@@ -865,6 +865,14 @@ class WorkerRuntime {
         return true;
       }
       FollowDesktopsOnSignaling();
+      // A session begins on a clean keyboard. A modifier Windows still holds
+      // that this worker never pressed was left behind by something it no
+      // longer tracks -- a worker killed mid-press, a route lost between a
+      // modifier's down and its up -- and until something releases it, it
+      // silently rewrites every click and keystroke that follows. Sessions
+      // already running keep everything they are holding; only the keys
+      // nobody owns are released. See common/latched_modifiers.h.
+      input_.ReleaseLatchedModifiers();
       std::vector<DisplayInfo> displays = EnumerateDisplays();
       if (displays.empty()) {
         writer_->Emit(TerminalEnvelope(signal.authority,

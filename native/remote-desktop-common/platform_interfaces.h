@@ -2,6 +2,7 @@
 #define IMCODES_REMOTE_DESKTOP_COMMON_PLATFORM_INTERFACES_H_
 
 #include <chrono>
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <string>
@@ -103,6 +104,12 @@ class InputAdapter {
   virtual bool EmitWheel(double delta_x, double delta_y) = 0;
   virtual bool EmitText(std::string_view text) = 0;
   virtual void ReleaseAllEmittedState() noexcept = 0;
+  // Run when a session is about to start: release the modifier keys the
+  // platform still reports as held that this adapter never emitted, and
+  // return how many were released. See latched_modifiers.h for why a session
+  // has to start on a clean keyboard. An adapter that cannot read the
+  // platform's keyboard state releases nothing.
+  virtual std::size_t ReleaseLatchedModifiers() noexcept { return 0; }
 };
 
 class ClipboardAdapter {

@@ -8,6 +8,7 @@
 #include <vector>
 #include <string_view>
 
+#include "../remote-desktop-common/latched_modifiers.h"
 #include "../remote-desktop-common/platform_interfaces.h"
 
 namespace imcodes::remote_desktop::macos {

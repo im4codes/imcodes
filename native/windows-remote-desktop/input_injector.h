@@ -10,8 +10,10 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "third_party/imcodes_remote_desktop/common/input_ledger.h"
+#include "third_party/imcodes_remote_desktop/common/latched_modifiers.h"
 #include "third_party/imcodes_remote_desktop/common/platform_interfaces.h"
 #include "third_party/imcodes_remote_desktop/display_capture.h"
 
@@ -22,6 +24,10 @@ namespace common = imcodes::remote_desktop::common;
 using WindowsSendInputFn = std::function<UINT(UINT, LPINPUT, int)>;
 using WindowsInputAvailableFn = std::function<bool()>;
 using WindowsMovePointerFn = std::function<bool(int, int)>;
+// Whether Windows currently reports that virtual key as physically down.
+// Injected so the qualification tests can present a keyboard state without
+// touching the machine they run on.
+using WindowsKeyHeldFn = std::function<bool(int)>;
 
 // Windows owns only native token mapping and the state that SendInput actually
 // accepted. Controller identity, epochs, sequences, topology fencing and
@@ -31,7 +37,8 @@ class WindowsSendInputBackend final : public common::InputAdapter {
   explicit WindowsSendInputBackend(
       WindowsSendInputFn send_input = {},
       WindowsInputAvailableFn input_available = {},
-      WindowsMovePointerFn move_pointer = {});
+      WindowsMovePointerFn move_pointer = {},
+      WindowsKeyHeldFn key_held = {});
   ~WindowsSendInputBackend() override;
 
   WindowsSendInputBackend(const WindowsSendInputBackend&) = delete;
@@ -44,6 +51,7 @@ class WindowsSendInputBackend final : public common::InputAdapter {
   bool EmitWheel(double delta_x, double delta_y) override;
   bool EmitText(std::string_view text) override;
   void ReleaseAllEmittedState() noexcept override;
+  std::size_t ReleaseLatchedModifiers() noexcept override;
 
   // Legacy Windows v2 compatibility helpers. They never own controller state;
   // they only preserve native batching/repeat and retry semantics around the
@@ -65,10 +73,14 @@ class WindowsSendInputBackend final : public common::InputAdapter {
   bool SendButtonLocked(std::string_view button, bool pressed);
   bool ReleaseKeyLocked(const std::string& key) noexcept;
   bool ReleaseButtonLocked(const std::string& button) noexcept;
+  // The modifiers Windows itself reports as held, whoever pressed them, in
+  // this backend's own key vocabulary ("ControlLeft", ...).
+  [[nodiscard]] std::vector<std::string> LatchedModifierKeys() const;
 
   const WindowsSendInputFn send_input_;
   const WindowsInputAvailableFn input_available_;
   const WindowsMovePointerFn move_pointer_;
+  const WindowsKeyHeldFn key_held_;
   mutable std::mutex mutex_;
   std::set<std::string> emitted_keys_;
   std::set<std::string> emitted_buttons_;
@@ -84,10 +96,12 @@ class InputArbiter {
   using SendInputFn = WindowsSendInputFn;
   using InputAvailableFn = WindowsInputAvailableFn;
   using MovePointerFn = WindowsMovePointerFn;
+  using KeyHeldFn = WindowsKeyHeldFn;
 
   explicit InputArbiter(SendInputFn send_input = {},
                         InputAvailableFn input_available = {},
-                        MovePointerFn move_pointer = {});
+                        MovePointerFn move_pointer = {},
+                        KeyHeldFn key_held = {});
   ~InputArbiter();
 
   InputArbiter(const InputArbiter&) = delete;
@@ -106,6 +120,11 @@ class InputArbiter {
   bool ReleaseOwner(const std::string& owner);
   bool RetryPendingReleases();
   void ReleaseAll() noexcept;
+  // Run when a session is about to start: releases the modifiers Windows
+  // still holds that this arbiter never pressed. See
+  // common/latched_modifiers.h for why a session has to start on a clean
+  // keyboard. Other live sessions keep everything they are holding.
+  std::size_t ReleaseLatchedModifiers() noexcept;
 
   // Stamped seam used by the cross-platform session core and native tests. It
   // proves the Windows backend consumes the common replay/topology authority

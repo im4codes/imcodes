@@ -62,6 +62,7 @@ $ExpectedCommonSources = @(
   'data_channel_payload.cc', 'data_channel_payload.h',
   'input_ledger.cc', 'input_ledger.h',
   'json_protocol.cc', 'json_protocol.h',
+  'latched_modifiers.h',
   'platform_interfaces.h', 'protocol_contracts.h',
   'quality_ladder.cc', 'quality_ladder.h',
   'session_core.cc', 'session_core.h',

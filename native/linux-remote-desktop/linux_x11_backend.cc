@@ -667,6 +667,59 @@ void X11InputAdapter::ReleaseAllEmittedState() noexcept {
   held_buttons_.clear();
 }
 
+std::vector<std::string> X11InputAdapter::LatchedModifierKeys() const {
+  Display* display = Dpy(connection_);
+  if (display == nullptr) return {};
+  // XQueryKeymap is the X server's own per-keycode view of what is down right
+  // now, so it names the exact side that is held -- a modifier state mask
+  // (XkbGetState, XQueryPointer) cannot tell Control_L from Control_R.
+  char keys[32] = {};
+  XQueryKeymap(display, keys);
+  // The keysym pairs, parallel to common::kLatchableModifiers.
+  static const KeySym kSides[common::kLatchableModifierCount][2] = {
+      {XK_Control_L, XK_Control_R},
+      {XK_Shift_L, XK_Shift_R},
+      {XK_Alt_L, XK_Alt_R},
+      {XK_Super_L, XK_Super_R},
+  };
+  const auto held = [&](KeySym symbol) {
+    const KeyCode code = XKeysymToKeycode(display, symbol);
+    if (code == 0) return false;
+    return (keys[code / 8] & (1 << (code % 8))) != 0;
+  };
+  return common::CollectLatchedModifiers(
+      [&](const common::LatchableModifier&, std::size_t index) {
+        const bool left = held(kSides[index][0]);
+        const bool right = held(kSides[index][1]);
+        return common::ModifierHeldSides{left || right, left, right};
+      });
+}
+
+std::size_t X11InputAdapter::ReleaseLatchedModifiers() noexcept {
+  Display* display = Dpy(connection_);
+  if (display == nullptr || !connection_->has_xtest()) return 0;
+  return common::ReleaseLatchedModifiers(
+      LatchedModifierKeys(),
+      [&](const std::string& key) {
+        // held_keys_ carries keycodes; compare in that vocabulary so a key
+        // this adapter is holding stays with ReleaseAllEmittedState, which
+        // also keeps its bookkeeping straight.
+        const KeySym symbol = KeySymForName(key);
+        if (symbol == NoSymbol) return false;
+        const KeyCode code = XKeysymToKeycode(display, symbol);
+        return code != 0 && held_keys_.count(static_cast<std::uint32_t>(code)) > 0;
+      },
+      [&](const std::string& key) {
+        const KeySym symbol = KeySymForName(key);
+        if (symbol == NoSymbol) return false;
+        const KeyCode code = XKeysymToKeycode(display, symbol);
+        if (code == 0) return false;
+        if (XTestFakeKeyEvent(display, code, False, 0) == 0) return false;
+        XSync(display, False);
+        return true;
+      });
+}
+
 // ── X11ClipboardAdapter ────────────────────────────────────────────────────
 
 X11ClipboardAdapter::X11ClipboardAdapter(std::shared_ptr<X11Connection> connection) noexcept

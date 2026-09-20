@@ -19,7 +19,9 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
+#include "../remote-desktop-common/latched_modifiers.h"
 #include "../remote-desktop-common/platform_interfaces.h"
 #include "../remote-desktop-common/value_types.h"
 #include "linux_capability_probe.h"
@@ -108,6 +110,7 @@ class X11InputAdapter final : public common::InputAdapter {
   bool EmitWheel(double delta_x, double delta_y) override;
   bool EmitText(std::string_view text) override;
   void ReleaseAllEmittedState() noexcept override;
+  std::size_t ReleaseLatchedModifiers() noexcept override;
 
   /** Count of keys and buttons this adapter currently holds down. */
   [[nodiscard]] std::size_t held_count() const noexcept {
@@ -131,6 +134,9 @@ class X11InputAdapter final : public common::InputAdapter {
   // uppercase letter or "!"), honouring Caps Lock, or on the scratch keycode
   // when the layout has no key for it. A press and release; never held.
   [[nodiscard]] bool TapKeysym(unsigned long symbol);
+  // The modifier keys the X server still reports as held, whoever pressed
+  // them, in this adapter's own key-name vocabulary ("ControlLeft", ...).
+  [[nodiscard]] std::vector<std::string> LatchedModifierKeys() const;
 
   std::shared_ptr<X11Connection> connection_;
   std::set<std::uint32_t> held_keys_;

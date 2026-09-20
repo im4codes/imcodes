@@ -533,6 +533,83 @@ int main() {
                 allowed_codes.size());
   }
 
+  // -- A session starts on a clean keyboard. A modifier whose key-up never
+  //    arrived -- a worker killed mid-press, a route lost between a
+  //    modifier's down and its up -- stays held at the X server itself, and
+  //    an adapter that only releases what it emitted knows nothing about it.
+  //    Every click and keystroke that follows is silently rewritten by it
+  //    (on macOS, where the same fix landed first, a latched Control turned
+  //    every click into a right-click until the machine restarted). Proved
+  //    against the server's own keyboard state: a modifier pressed OUTSIDE
+  //    the adapter is gone once a new session's adapter sweeps, while a key
+  //    the adapter itself is holding is left to the path that tracks it.
+  {
+    auto connection = rd::X11Connection::Open();
+    if (!connection) {
+      std::fprintf(stderr, "X11Connection::Open failed for the latched-modifier section\n");
+      XCloseDisplay(display);
+      return 110;
+    }
+    const auto key_down_at_server = [&](KeyCode code) {
+      char keymap[32];
+      XQueryKeymap(display, keymap);
+      return (keymap[code / 8] & (1 << (code % 8))) != 0;
+    };
+    const KeyCode control_left = XKeysymToKeycode(display, XK_Control_L);
+    const KeyCode shift_right = XKeysymToKeycode(display, XK_Shift_R);
+    if (control_left == 0 || shift_right == 0) {
+      XCloseDisplay(display);
+      return 111;
+    }
+    // Whatever a dead worker left behind: pressed straight through XTEST, so
+    // no adapter has it in its own held state.
+    XTestFakeKeyEvent(display, control_left, True, 0);
+    XSync(display, False);
+    if (!key_down_at_server(control_left)) {
+      std::fprintf(stderr, "could not latch Control_L for the sweep\n");
+      XCloseDisplay(display);
+      return 112;
+    }
+
+    rd::X11InputAdapter input(connection);
+    if (!input.EmitKey("ShiftRight", true)) {
+      std::fprintf(stderr, "EmitKey(\"ShiftRight\", down) returned false\n");
+      XTestFakeKeyEvent(display, control_left, False, 0);
+      XCloseDisplay(display);
+      return 113;
+    }
+    const std::size_t released = input.ReleaseLatchedModifiers();
+    XSync(display, False);
+    if (released != 1 || key_down_at_server(control_left)) {
+      std::fprintf(stderr, "sweep released %zu key(s); Control_L still down: %d\n",
+                   released, key_down_at_server(control_left) ? 1 : 0);
+      XTestFakeKeyEvent(display, control_left, False, 0);
+      input.ReleaseAllEmittedState();
+      XCloseDisplay(display);
+      return 114;
+    }
+    if (!key_down_at_server(shift_right) || input.held_count() != 1) {
+      std::fprintf(stderr, "the adapter's own held ShiftRight did not survive the sweep\n");
+      input.ReleaseAllEmittedState();
+      XCloseDisplay(display);
+      return 115;
+    }
+    input.ReleaseAllEmittedState();
+    XSync(display, False);
+    if (key_down_at_server(shift_right)) {
+      std::fprintf(stderr, "ShiftRight stuck down after ReleaseAllEmittedState\n");
+      XCloseDisplay(display);
+      return 116;
+    }
+    // A clean keyboard has nothing to sweep.
+    if (input.ReleaseLatchedModifiers() != 0) {
+      std::fprintf(stderr, "sweep released a key on a clean keyboard\n");
+      XCloseDisplay(display);
+      return 117;
+    }
+    std::printf("ReleaseLatchedModifiers: a stray Control_L is cleared, a held key is not\n");
+  }
+
   // -- Pasted text is typed character for character. Judged by what an
   //    application receives: an uppercase letter or "!" pressed at the wrong
   //    shift level arrived as "a" and "1", a line break arrived as Tab, and a

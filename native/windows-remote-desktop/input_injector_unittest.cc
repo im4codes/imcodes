@@ -54,6 +54,54 @@ common::InputStamp Stamp(std::string controller,
   return common::InputStamp{std::move(controller), epoch, sequence, revision};
 }
 
+// A session starts on a clean keyboard: a modifier whose key-up never
+// arrived -- a worker killed mid-press, a route lost between a modifier's
+// down and its up -- is held by Windows itself, and an arbiter that only
+// releases what it emitted knows nothing about it. Every click and keystroke
+// that follows is silently rewritten by it.
+TEST(InputArbiterTest, SessionStartReleasesModifiersLatchedByNobody) {
+  RecordingInput recording;
+  // Windows reports ControlRight and ShiftLeft held; only ShiftLeft is this
+  // arbiter's own.
+  InputArbiter input(
+      [&](UINT count, LPINPUT values, int size) {
+        return recording.Send(count, values, size);
+      },
+      {}, {},
+      [](int virtual_key) {
+        return virtual_key == VK_RCONTROL || virtual_key == VK_LSHIFT;
+      });
+
+  EXPECT_EQ(input.ApplyKeyStamped(Stamp("peer-a", 1), 7, "ShiftLeft", true),
+            common::InputResult::kApplied);
+  ASSERT_EQ(recording.events.size(), 1u);
+
+  EXPECT_EQ(input.ReleaseLatchedModifiers(), 1u);
+  ASSERT_EQ(recording.events.size(), 2u);
+  const INPUT& released = recording.events.back();
+  EXPECT_EQ(released.type, static_cast<DWORD>(INPUT_KEYBOARD));
+  EXPECT_NE(released.ki.dwFlags & KEYEVENTF_KEYUP, 0u);
+  EXPECT_EQ(released.ki.wScan,
+            static_cast<WORD>(MapVirtualKeyW(VK_RCONTROL, MAPVK_VK_TO_VSC_EX)));
+
+  // The key the arbiter is holding stays with the path that tracks it.
+  EXPECT_EQ(input.ApplyKeyStamped(Stamp("peer-a", 2), 7, "ShiftLeft", false),
+            common::InputResult::kApplied);
+  ASSERT_EQ(recording.events.size(), 3u);
+}
+
+TEST(InputArbiterTest, SessionStartReleasesNothingOnACleanKeyboard) {
+  RecordingInput recording;
+  InputArbiter input(
+      [&](UINT count, LPINPUT values, int size) {
+        return recording.Send(count, values, size);
+      },
+      {}, {}, [](int) { return false; });
+
+  EXPECT_EQ(input.ReleaseLatchedModifiers(), 0u);
+  EXPECT_TRUE(recording.events.empty());
+}
+
 TEST(InputArbiterTest, CommonLedgerOwnsSharedControllersAndTargetedRelease) {
   RecordingInput recording;
   InputArbiter input([&](UINT count, LPINPUT values, int size) {

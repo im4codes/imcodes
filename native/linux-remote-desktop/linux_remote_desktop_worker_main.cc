@@ -360,6 +360,14 @@ class Worker {
           existing->second->Stop();
           sessions_.erase(existing);
         }
+        // A session begins on a clean keyboard. A modifier the X server
+        // still holds that this worker never pressed was left behind by
+        // something it no longer tracks -- a worker killed mid-press, a
+        // route lost between a modifier's down and its up -- and until
+        // something releases it, it silently rewrites every click and
+        // keystroke that follows. Sessions already running keep everything
+        // they are holding. See common/latched_modifiers.h.
+        adapters_.input().ReleaseLatchedModifiers();
         auto session = std::make_shared<WorkerSession>(
             factory_, adapters_, signaling_thread_, signal.authority);
         if (!session->Start(signal.authority)) {

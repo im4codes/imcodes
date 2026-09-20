@@ -209,30 +209,28 @@ public:
       return {};
     const CGEventFlags flags =
         CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState);
-    std::vector<std::string> latched;
-    const auto collect = [&](CGEventFlags mask, std::uint64_t left_bit,
-                             std::uint64_t right_bit, const char *left,
-                             const char *right) {
-      if ((flags & mask) == 0)
-        return;
-      const bool right_held = (flags & right_bit) != 0;
-      const bool left_held = (flags & left_bit) != 0;
-      if (left_held || !right_held)
-        latched.emplace_back(left);
-      if (right_held)
-        latched.emplace_back(right);
+    // The mask plus NX_DEVICE*KEYMASK side bits CGEvent carries for each
+    // modifier, parallel to common::kLatchableModifiers. A modifier reported
+    // with no side bit is released on the left key, which is what the OS
+    // reports for a synthetic press that named neither.
+    struct ModifierBits {
+      CGEventFlags mask;
+      std::uint64_t left;
+      std::uint64_t right;
     };
-    // NX_DEVICE*KEYMASK, the side bits CGEvent carries alongside each
-    // modifier mask.
-    collect(kCGEventFlagMaskControl, 0x00000001, 0x00002000, "ControlLeft",
-            "ControlRight");
-    collect(kCGEventFlagMaskShift, 0x00000002, 0x00000004, "ShiftLeft",
-            "ShiftRight");
-    collect(kCGEventFlagMaskAlternate, 0x00000020, 0x00000040, "AltLeft",
-            "AltRight");
-    collect(kCGEventFlagMaskCommand, 0x00000008, 0x00000010, "MetaLeft",
-            "MetaRight");
-    return latched;
+    static constexpr ModifierBits kBits[common::kLatchableModifierCount] = {
+        {kCGEventFlagMaskControl, 0x00000001, 0x00002000},
+        {kCGEventFlagMaskShift, 0x00000002, 0x00000004},
+        {kCGEventFlagMaskAlternate, 0x00000020, 0x00000040},
+        {kCGEventFlagMaskCommand, 0x00000008, 0x00000010},
+    };
+    return common::CollectLatchedModifiers(
+        [flags](const common::LatchableModifier &, std::size_t index) {
+          const ModifierBits &bits = kBits[index];
+          return common::ModifierHeldSides{(flags & bits.mask) != 0,
+                                           (flags & bits.left) != 0,
+                                           (flags & bits.right) != 0};
+        });
   }
 
   bool MovePointer(const common::LogicalPoint &point) override {
@@ -668,12 +666,12 @@ private:
   // keys are left to ReleaseAllLocked, which also keeps its bookkeeping
   // straight; a failure here is not fatal to the session that is starting.
   void ReleaseLatchedModifiersLocked() noexcept {
-    for (const std::string &key : backend_->LatchedModifierKeys()) {
-      if (emitted_keys_.contains(key))
-        continue;
-      if (backend_->EmitKey(key, false))
-        ++statistics_.released_latched_modifiers;
-    }
+    statistics_.released_latched_modifiers += common::ReleaseLatchedModifiers(
+        backend_->LatchedModifierKeys(),
+        [this](const std::string &key) { return emitted_keys_.contains(key); },
+        [this](const std::string &key) {
+          return backend_->EmitKey(key, false);
+        });
   }
 
   bool ReleaseAllLocked() noexcept {

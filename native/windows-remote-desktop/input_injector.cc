@@ -139,7 +139,7 @@ std::optional<std::u16string> Utf8ToUtf16(std::string_view value) {
 
 WindowsSendInputBackend::WindowsSendInputBackend(
     WindowsSendInputFn send_input, WindowsInputAvailableFn input_available,
-    WindowsMovePointerFn move_pointer)
+    WindowsMovePointerFn move_pointer, WindowsKeyHeldFn key_held)
     : send_input_(send_input ? std::move(send_input)
                              : WindowsSendInputFn([](UINT count,
                                                      LPINPUT inputs, int size) {
@@ -148,7 +148,12 @@ WindowsSendInputBackend::WindowsSendInputBackend(
       input_available_(input_available
                            ? std::move(input_available)
                            : WindowsInputAvailableFn([] { return true; })),
-      move_pointer_(std::move(move_pointer)) {}
+      move_pointer_(std::move(move_pointer)),
+      key_held_(key_held ? std::move(key_held)
+                         : WindowsKeyHeldFn([](int virtual_key) {
+                             return (::GetAsyncKeyState(virtual_key) &
+                                     0x8000) != 0;
+                           })) {}
 
 WindowsSendInputBackend::~WindowsSendInputBackend() {
   ReleaseAllEmittedState();
@@ -430,6 +435,40 @@ void WindowsSendInputBackend::ReleaseAllEmittedState() noexcept {
   }
 }
 
+std::vector<std::string> WindowsSendInputBackend::LatchedModifierKeys()
+    const {
+  // The side-specific virtual keys, parallel to common::kLatchableModifiers.
+  // Windows names both sides of every modifier it reports, so the "held with
+  // no side named" fallback never fires here. Meta is deliberately reported
+  // as free: the remote-input allowlist carries no Windows key, so a Windows
+  // key this backend can neither press nor name is not its to release.
+  static constexpr int kSides[common::kLatchableModifierCount][2] = {
+      {VK_LCONTROL, VK_RCONTROL},
+      {VK_LSHIFT, VK_RSHIFT},
+      {VK_LMENU, VK_RMENU},
+      {0, 0},
+  };
+  return common::CollectLatchedModifiers(
+      [this](const common::LatchableModifier&, std::size_t index) {
+        const int left_key = kSides[index][0];
+        const int right_key = kSides[index][1];
+        const bool left = left_key != 0 && key_held_(left_key);
+        const bool right = right_key != 0 && key_held_(right_key);
+        return common::ModifierHeldSides{left || right, left, right};
+      });
+}
+
+std::size_t WindowsSendInputBackend::ReleaseLatchedModifiers() noexcept {
+  const std::vector<std::string> latched = LatchedModifierKeys();
+  std::lock_guard<std::mutex> lock(mutex_);
+  return common::ReleaseLatchedModifiers(
+      latched,
+      [this](const std::string& key) {
+        return emitted_keys_.find(key) != emitted_keys_.end();
+      },
+      [this](const std::string& key) { return SendKeyLocked(key, false); });
+}
+
 bool WindowsSendInputBackend::RetryPendingReleases() noexcept {
   std::lock_guard<std::mutex> lock(mutex_);
   for (const std::string& key : std::vector<std::string>(
@@ -465,9 +504,9 @@ bool WindowsSendInputBackend::IsButtonEmitted(
 
 InputArbiter::InputArbiter(SendInputFn send_input,
                            InputAvailableFn input_available,
-                           MovePointerFn move_pointer)
+                           MovePointerFn move_pointer, KeyHeldFn key_held)
     : backend_(std::move(send_input), std::move(input_available),
-               std::move(move_pointer)),
+               std::move(move_pointer), std::move(key_held)),
       ledger_(backend_) {}
 
 InputArbiter::~InputArbiter() { ReleaseAll(); }
@@ -701,6 +740,11 @@ void InputArbiter::ReleaseAll() noexcept {
   std::lock_guard<std::mutex> lock(mutex_);
   ledger_.ReleaseAll();
   legacy_stamps_.clear();
+}
+
+std::size_t InputArbiter::ReleaseLatchedModifiers() noexcept {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return backend_.ReleaseLatchedModifiers();
 }
 
 bool ReleaseAllSupportedInput(InputArbiter::SendInputFn send_input) {
