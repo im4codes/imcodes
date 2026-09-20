@@ -54,6 +54,8 @@ interface AttemptContext {
   baselineId: string;
   targetConfigRevision: string;
   candidateRevision: string;
+  /** Passed report rows supplied by the daemon for this exact attempt. */
+  acceptedImplementerValidation: boolean;
   baselineValid: () => boolean;
   onAutomaticTerminal?: (terminal: PeerAuditTerminalRecord) => void;
 }
@@ -438,6 +440,7 @@ export class PeerAuditService {
       baselineId: baseline.baselineId,
       targetConfigRevision: configRevision,
       candidateRevision: command.candidateRevision,
+      acceptedImplementerValidation: false,
       baselineValid: () => this.baseline.getCompletedBaseline({
         sessionName: nextRecord.name,
         auditedSessionInstanceId: nextRecord.sessionInstanceId!,
@@ -523,6 +526,7 @@ export class PeerAuditService {
       baselineId: baseline.baselineId,
       targetConfigRevision: configRevision,
       candidateRevision: candidateList.list.revision,
+      acceptedImplementerValidation: input.validations?.some((item) => item.outcome === 'passed') ?? false,
       baselineValid: input.isStillValid,
       onAutomaticTerminal: input.onTerminal,
     };
@@ -646,6 +650,7 @@ export class PeerAuditService {
         configRevision: pending.targetConfigRevision,
         controllerRevision: pending.revision,
         deadlineAt: pending.deadlineAt,
+        acceptedImplementerValidation: context?.acceptedImplementerValidation === true,
       },
       current: {
         sender: sender.sessionInstanceId && sender.runtimeEpoch ? {
@@ -722,7 +727,7 @@ export class PeerAuditService {
       acceptanceCriteria: [
         `Satisfy this exact user request: ${baseline.userText}`,
         'Identify concrete correctness, regression, security, and missing-test risks.',
-        'Use applicable non-destructive executable validation and report exact evidence.',
+        'Use the submitted exact-baseline validation report; run only a contract-allowed small exception check.',
       ],
       projectPath: record.projectDir,
       changePath: context.changePath,

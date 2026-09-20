@@ -487,9 +487,22 @@ async function submitDelegatedPeerAuditReply(input: {
       now: input.receivedAt,
     }) ?? authority;
   }
+  const citesImplementerValidation = input.envelope.validations.some(
+    (item) => item.kind === 'accepted_implementer_validation',
+  );
+  const task = citesImplementerValidation ? registry.getTaskRecord(taskId) : undefined;
+  const sourceAssignmentId = task?.integrationBundle?.sourceAssignmentId;
+  const acceptedImplementerValidation = Boolean(citesImplementerValidation && sourceAssignmentId
+    && registry.hasReadyAuditValidationAuthority({
+      taskId,
+      assignmentId: sourceAssignmentId,
+      revision,
+      allowLegacy: false,
+    }));
   const evidence = validatePeerAuditPassEvidence(
     receiptKind === 'final' ? input.envelope.verdict : undefined,
     input.envelope.validations,
+    { acceptedImplementerValidation },
   );
   if (!evidence.ok) {
     return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INSUFFICIENT_VALIDATION_EVIDENCE };

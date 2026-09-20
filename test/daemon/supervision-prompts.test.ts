@@ -70,7 +70,7 @@ describe('supervision prompts', () => {
       },
       authority: 'actual_worktree+Git_bytes',
       metadata: { mode: 'record_only', editAllowlist: false, gate: false },
-      auditEvidence: { frozenFirst: true, rerun: 'minimal_on_concrete_gap' },
+      auditEvidence: { frozenFirst: true, auditorRuns: 'only_missing_report_or_confident_suspicion_small' },
       implementation_finished: 'handoff_not_PASS_or_Git_finalization',
     });
     expect(finalization.beforePass.forbid).toEqual(expect.arrayContaining(['stage', 'commit', 'push', 'deploy']));
@@ -149,7 +149,7 @@ describe('supervision prompts', () => {
     const prompt = buildSupervisedAuditExecutionPreamble('zh-CN');
     expect(prompt).toContain('"auditMode":true');
     expect(prompt).toContain('"beforePass":"no_delivery_finalization"');
-    expect(prompt).toContain('"rerun":"minimal_on_concrete_gap"');
+    expect(prompt).toContain('"auditorRuns":"only_missing_report_or_confident_suspicion_small"');
     expect(prompt).not.toContain(RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER);
     expect(prompt).toContain('"completion":"registry_intent_only"');
     expect(prompt).toContain('file_output_v1; auto-audit enabled');
@@ -262,7 +262,7 @@ describe('supervision prompts', () => {
     expect(audit).not.toContain('While waiting');
   });
 
-  it('builds a bounded lightweight brief with non-destructive executable validation and structured reply', () => {
+  it('builds a bounded code-and-report brief without asking the auditor to repeat validation', () => {
     const prompt = buildPeerAuditBriefV1({
       taskId: 'supervision_task_1',
       assignmentId: 'supervision_assignment_1',
@@ -275,18 +275,17 @@ describe('supervision prompts', () => {
       changePath: '/repo/openspec/changes/example',
       changedPaths: ['src/example.ts'],
       validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: '3 tests passed' }],
-      supervisorRationale: 'Looks complete, but verify independently.',
+      supervisorRationale: 'Looks complete; review the bound code and report.',
     });
 
     expect(prompt).toContain('[Contract: supervision_peer_audit_v1]');
-    expect(prompt).toContain('focused tests, typecheck, lint, build');
-    expect(prompt).toContain('already-authorized devices/environments');
+    expect(prompt).toContain('Audit from the code and the submitted test report');
+    expect(prompt).toContain('Do not run tests, typechecks, builds, mutants, probes, or reproductions');
     expect(prompt).toContain('MUST NOT modify tracked source, commit, push, deploy, mutate production');
     expect(prompt).toContain('Inspect worktree state before and after');
     expect(prompt).toContain('compare the HEAD blob, raw working-tree bytes, and the attribute-cleaned hash');
     expect(prompt).toContain('do not hide it with reset, clean, or assume-unchanged');
     expect(prompt).toContain('If raw bytes differ from HEAD, keep the normal fail-closed contamination rule');
-    expect(prompt).toContain('For checks you personally run, report exact commands/tools/devices/environments and observed outcomes');
     expect(prompt).toContain('For accepted structured results, preserve the supplied label, outcome, and summary');
     expect(prompt).toContain(SUPERVISION_CONTRACT_IDS.MESSAGING);
     expect(prompt).toContain('imcodes audit-reply --task-id supervision_task_1 --assignment-id supervision_assignment_1 --attempt-id attempt_1 --revision revision_1 --receipt-kind final');
@@ -297,7 +296,7 @@ describe('supervision prompts', () => {
     expect(peerAuditByteLength(prompt)).toBeLessThanOrEqual(PEER_AUDIT_BRIEF_TOTAL_BYTES);
   });
 
-  it('accepts complete bound evidence first and never instructs an unconditional full-suite rerun', () => {
+  it('accepts the exact-bound implementer report and forbids all duplicate auditor execution', () => {
     const prompt = buildPeerAuditBriefV1({
       attemptId: 'attempt_evidence_complete',
       taskRequest: 'Review the frozen revision',
@@ -310,13 +309,20 @@ describe('supervision prompts', () => {
     });
 
     expect(prompt).toContain('EVIDENCE ACCEPTANCE FIRST');
-    expect(prompt).toContain("an implementer or teammate's structured validation result is valid evidence");
-    expect(prompt).toContain('needs no duplicate run');
+    expect(prompt).toContain('DEFAULT-ACCEPT the exact-bound implementer validation report');
+    expect(prompt).toContain('Audit from the code and the submitted test report');
     expect(prompt).toContain('Raw logs, transcripts, hashes, and bundle attachments are not required');
     expect(prompt).toContain('their absence must never cause REWORK');
-    expect(prompt).toContain('Do NOT unconditionally repeat a full test, typecheck, lint, or build suite');
-    expect(prompt).toContain('rerunReason=<specific contradiction or risk>');
+    expect(prompt).toContain('Do not run tests, typechecks, builds, mutants, probes, or reproductions');
+    expect(prompt).toContain('confident, concrete suspicion about one specific behavior');
+    expect(prompt).toContain('one test file or a few named tests, or one mutant');
+    expect(prompt).toContain('--maxWorkers<=2');
+    expect(prompt).toContain('Never run a full test project, full build, coverage, or e2e');
+    expect(prompt).toContain('do not REWORK merely to ask the implementer to run that check');
     expect(prompt).not.toContain('EVIDENCE GAP:');
+    expect(prompt).not.toContain('claims to verify');
+    expect(prompt).not.toContain('refuse to PASS on static reading alone');
+    expect(prompt).not.toContain('verify independently');
     expect(prompt).not.toContain('binding the frozen manifest');
     expect(prompt).not.toMatch(/(?:must|required to|always) (?:re-?run|repeat) (?:the )?full/iu);
   });
@@ -341,12 +347,12 @@ describe('supervision prompts', () => {
       'environment | passed | real Codex transport: transport scenario passed',
       'tool | passed | immutable bundle: five scoped files verified',
     ]) expect(prompt).toContain(row);
-    expect(prompt).toContain("an implementer or teammate's structured validation result is valid evidence");
+    expect(prompt).toContain('DEFAULT-ACCEPT the exact-bound implementer validation report');
     expect(prompt).toContain('Raw logs, transcripts, hashes, and bundle attachments are not required');
     expect(prompt).toContain('their absence must never cause REWORK');
   });
 
-  it('generates only a bounded rerun instruction when executable evidence is missing', () => {
+  it('permits one minimal gap check only when no usable exact-revision report exists', () => {
     const prompt = buildPeerAuditBriefV1({
       attemptId: 'attempt_evidence_gap',
       taskRequest: 'Review the frozen revision',
@@ -356,10 +362,15 @@ describe('supervision prompts', () => {
     });
 
     expect(prompt).toContain('EVIDENCE GAP:');
-    expect(prompt).toContain('smallest bounded check needed to resolve that gap');
-    expect(prompt).toContain('rerunReason=<no-passed-structured-validation|conflicting-result|concrete-high-risk>');
-    expect(prompt).toContain('do not default to the full matrix');
+    expect(prompt).toContain('Only because no usable exact-revision test report exists');
+    expect(prompt).toContain('minimal check needed to fill that report gap');
+    expect(prompt).toContain('A confident, concrete suspicion also permits one small targeted check');
+    expect(prompt).toContain('No accepted implementer report is bound to this attempt');
+    expect(prompt).toContain('Never invent a result or cite `accepted_implementer_validation`');
+    expect(prompt).toContain('"kind": "test"');
+    expect(prompt).toContain('legacy session-audit path only');
     expect(prompt).not.toContain('EVIDENCE ACCEPTANCE FIRST');
+    expect(prompt).not.toContain('"kind": "accepted_implementer_validation"');
   });
 
   it('redacts secrets before UTF-8 truncation and omits provider metadata', () => {
@@ -394,8 +405,9 @@ describe('supervision prompts', () => {
     });
 
     expect(prompt).toContain('Exact acceptance: preserve ordinary send --reply behavior.');
-    expect(prompt).toContain('Explain unavailable checks');
-    expect(prompt).toContain('explicitly isolated fixtures');
+    expect(prompt).toContain('legacy session-audit path only');
+    expect(prompt).toContain('fully explained unavailable-only rows preserve prior behavior');
+    expect(prompt).toContain('minimal check needed to fill that report gap');
     expect(prompt).toContain('Do not run reset/clean');
     expect(prompt).toContain('stop/report if validation creates an unexpected tracked diff');
     expect(prompt).not.toContain('criterion-99-');
@@ -619,8 +631,8 @@ describe('supervision prompts', () => {
     expect(prompt).toContain('Do NOT use REWORK merely because an optional check was unavailable');
     expect(prompt).toContain('raw logs/transcripts/hashes/bundle attachments are absent');
     expect(prompt).toContain('evidence packaging/control-plane/receipt delivery failed');
-    expect(prompt).toContain('an implementer or teammate structured result satisfies this');
-    expect(prompt).toContain('does not need raw artifacts or a duplicate run');
+    expect(prompt).toContain('Use kind `accepted_implementer_validation`');
+    expect(prompt).toContain('daemon authority, not auditor execution');
     expect(prompt).toContain('they do not block PASS');
   });
 
@@ -1062,13 +1074,13 @@ describe('audit convergence contract on every supervision audit surface', () => 
   const body = `"contractId":"${AUDIT_CONVERGENCE_CONTRACT_ID}"`;
   const locales = ['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko'] as const;
   const evidencePolicySentinels: Record<typeof locales[number], readonly [string, string]> = {
-    en: ["implementer or teammate's structured test result is valid evidence", 'Raw logs, transcripts, hashes, or bundle attachments are never PASS prerequisites'],
-    'zh-CN': ['实现者或队友提交的结构化测试结果即为有效证据', '缺少这些原始材料不得导致 REWORK'],
-    'zh-TW': ['實作者或隊友提交的結構化測試結果即為有效證據', '缺少這些原始材料不得導致 REWORK'],
-    es: ['resultado estructurado de una prueba aportado por el implementador o un compañero es evidencia válida', 'su ausencia no debe causar REWORK'],
-    ru: ['структурированный результат теста от исполнителя или коллеги является допустимым доказательством', 'их отсутствие не должно приводить к REWORK'],
-    ja: ['実装者またはチームメイトの構造化テスト結果は有効な証拠', '不在を理由に REWORK にしてはいけません'],
-    ko: ['구현자나 팀 동료가 제출한 구조화된 테스트 결과는 유효한 증거', '없다는 이유로 REWORK하면 안 됩니다'],
+    en: ['audit from code plus the exact-revision implementer test report', 'one test file or a few named tests'],
+    'zh-CN': ['只根据代码和精确版本的实现者测试报告审计', '限单文件/少量用例或一个 mutant'],
+    'zh-TW': ['只依程式碼與精確版本的實作者測試報告審計', '限單檔/少量案例或一個 mutant'],
+    es: ['audita desde el código y el informe de pruebas del implementador', 'un archivo o pocos tests'],
+    ru: ['проверяйте код и отчёт исполнителя', 'один файл/несколько тестов'],
+    ja: ['コードと正確な revision に紐づく実装者テスト報告', '1ファイル/少数テスト'],
+    ko: ['코드와 정확한 revision에 묶인 구현자 테스트 보고서', '한 파일/소수 테스트'],
   };
 
   it('references the contract in the peer auditor brief and drops the wording that made audits drip-feed', () => {
@@ -1088,9 +1100,9 @@ describe('audit convergence contract on every supervision audit surface', () => 
     // A minimal point fix is exactly what introduced the next round's defect.
     expect(prompt).not.toContain('smallest required fix');
     expect(prompt).toContain('whole class');
-    // A time box that limits review coverage is how findings arrive one per round.
+    // Review coverage remains complete even though duplicate execution is forbidden.
     expect(prompt).not.toContain('within 15 minutes');
-    expect(prompt).toContain('not review coverage');
+    expect(prompt).toContain('Review all in-scope code and acceptance criteria');
     expect(peerAuditByteLength(prompt)).toBeLessThanOrEqual(PEER_AUDIT_BRIEF_TOTAL_BYTES);
   });
 

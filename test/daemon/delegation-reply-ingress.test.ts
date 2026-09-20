@@ -53,6 +53,7 @@ const mocks = vi.hoisted(() => ({
   getTaskRecord: vi.fn(),
   listAssignments: vi.fn(() => []),
   listAuditReceipts: vi.fn(() => []),
+  hasReadyAuditValidationAuthority: vi.fn(() => false),
   queueSnapshot: vi.fn(() => ({ pendingMessageEntries: [] })),
   hasDeliveryTombstone: vi.fn(() => false),
 }));
@@ -90,6 +91,7 @@ vi.mock('../../src/daemon/supervision-state-store.js', () => ({
     getTaskRecord: mocks.getTaskRecord,
     listAssignments: mocks.listAssignments,
     listAuditReceipts: mocks.listAuditReceipts,
+    hasReadyAuditValidationAuthority: mocks.hasReadyAuditValidationAuthority,
   }),
 }));
 
@@ -155,6 +157,7 @@ function installRealAuditHarness(suffix: string) {
   const assignmentId = `assignment-real-${suffix}`;
   const attemptId = `attempt-real-${suffix}`;
   const revision = `revision-real-${suffix}`;
+  const sourceAssignmentId = `source-real-${suffix}`;
   const authority = store.create({
     origin,
     target,
@@ -180,6 +183,17 @@ function installRealAuditHarness(suffix: string) {
   };
   const receipts: Array<Record<string, unknown>> = [];
   mocks.getAssignment.mockReturnValue(auditor);
+  mocks.getTaskRecord.mockReturnValue({
+    taskId,
+    currentRevision: revision,
+    integrationBundle: { taskId, sourceAssignmentId, revision },
+  });
+  mocks.hasReadyAuditValidationAuthority.mockImplementation((input) => (
+    input.taskId === taskId
+    && input.assignmentId === sourceAssignmentId
+    && input.revision === revision
+    && input.allowLegacy === false
+  ));
   mocks.listAuditReceipts.mockImplementation(() => receipts);
   mocks.appendMatchingAuditReceipt.mockImplementation((input: Record<string, unknown>) => {
     receipts.push({ ...input, assignmentId: input.auditorAssignmentId });
@@ -202,7 +216,13 @@ function installRealAuditHarness(suffix: string) {
     },
     senderSessionName: target.sessionName,
   });
-  const submitAudit = (receiptKind: 'progress' | 'final', findings: string) => submitPeerAuditReply({
+  const submitAudit = (
+    receiptKind: 'progress' | 'final',
+    findings: string,
+    validations = receiptKind === 'final'
+      ? [{ kind: 'test', label: 'real-store', outcome: 'passed', summary: 'green' }]
+      : [],
+  ) => submitPeerAuditReply({
     rawBody: JSON.stringify({
       version: PEER_AUDIT_REPLY_VERSION,
       taskId,
@@ -212,9 +232,7 @@ function installRealAuditHarness(suffix: string) {
       receiptKind,
       ...(receiptKind === 'final' ? { verdict: 'PASS' } : {}),
       findings,
-      validations: receiptKind === 'final'
-        ? [{ kind: 'test', label: 'real-store', outcome: 'passed', summary: 'green' }]
-        : [],
+      validations,
     }),
     senderSessionName: target.sessionName,
     now: Date.now(),
@@ -272,6 +290,7 @@ describe('delegation reply ingress', () => {
     mocks.getTaskRecord.mockReset();
     mocks.listAssignments.mockReset().mockReturnValue([]);
     mocks.listAuditReceipts.mockReset().mockReturnValue([]);
+    mocks.hasReadyAuditValidationAuthority.mockReset().mockReturnValue(false);
     mocks.queueSnapshot.mockReset().mockReturnValue({ pendingMessageEntries: [] });
     mocks.hasDeliveryTombstone.mockReset().mockReturnValue(false);
     vi.mocked(ensureTransportRuntimeAvailable).mockClear();
@@ -654,6 +673,55 @@ describe('delegation reply ingress', () => {
     } finally {
       receiptFirst.close();
       vi.useRealTimers();
+    }
+  });
+
+  it('accepts a PASS that cites only the exact-bound implementer validation report', async () => {
+    const harness = installRealAuditHarness('accepted-implementer-report');
+    try {
+      await expect(harness.submitAudit('final', 'Code and submitted report satisfy acceptance.', [{
+        kind: 'accepted_implementer_validation',
+        label: 'implementer focused suite',
+        outcome: 'passed',
+        summary: 'exact-revision registry report accepted',
+      }])).resolves.toEqual({ ok: true });
+      expect(mocks.hasReadyAuditValidationAuthority).toHaveBeenCalledWith(expect.objectContaining({
+        allowLegacy: false,
+      }));
+      expect(mocks.appendMatchingAuditReceipt).toHaveBeenCalledOnce();
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('rejects a report-only PASS when exact-revision registry validation authority is absent', async () => {
+    const harness = installRealAuditHarness('unbound-implementer-report');
+    mocks.hasReadyAuditValidationAuthority.mockReturnValue(false);
+    try {
+      await expect(harness.submitAudit('final', 'Unbound report must not authorize PASS.', [{
+        kind: 'accepted_implementer_validation',
+        label: 'unbound report',
+        outcome: 'passed',
+        summary: 'caller claim only',
+      }])).resolves.toEqual({ ok: false, error: 'insufficient_validation_evidence' });
+      expect(mocks.appendMatchingAuditReceipt).not.toHaveBeenCalled();
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('keeps registry-backed supervision strict for unavailable-only PASS', async () => {
+    const harness = installRealAuditHarness('supervised-unavailable-only');
+    try {
+      await expect(harness.submitAudit('final', 'No executable evidence was available.', [{
+        kind: 'environment',
+        label: 'unavailable environment',
+        outcome: 'unavailable',
+        summary: 'no authorized environment',
+      }])).resolves.toEqual({ ok: false, error: 'insufficient_validation_evidence' });
+      expect(mocks.appendMatchingAuditReceipt).not.toHaveBeenCalled();
+    } finally {
+      harness.close();
     }
   });
 

@@ -6566,8 +6566,10 @@ describe('SupervisionAutomation', () => {
     }, { timeout: 4_000 });
     const auditPrompt = String(mockTransportRuntime.send.mock.calls.at(-1)?.[0]);
     expect(auditPrompt).toContain('this change is NARROW');
-    // Proportionate, not lax: evidence is still required.
-    expect(auditPrompt).toContain('executable evidence');
+    // Narrow audits still use the same report-first evidence contract without
+    // re-running validation already covered by the exact-revision report.
+    expect(auditPrompt).toContain('code plus the submitted exact-revision test report');
+    expect(auditPrompt).toContain('Do not repeat validation');
   });
 
   it('does not scope the audit for a standard change', async () => {

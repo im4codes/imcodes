@@ -533,7 +533,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY]: {
     name: MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY,
-    description: 'Append audit progress/final. Daemon authenticates current session and task/assignment/attempt/revision; no token.',
+    description: 'Audit receipt; daemon binds session/task/assignment/attempt/revision.',
     inputSchema: objectSchema({
       taskId: stringSchema('Exact task id supplied by the audit brief.'),
       assignmentId: stringSchema('Exact auditor assignment id supplied by the audit brief.'),

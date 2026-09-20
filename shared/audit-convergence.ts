@@ -97,7 +97,7 @@ export function buildAuditConvergenceContract(): string {
     firstPass: {
       findings: 'all at once, each with severity, violated invariant, location and evidence',
       acceptance: 'trace every criterion to evidence; an unmet explicit criterion is P0 and an untraced criterion blocks PASS',
-      timeBox: 'limits reruns, not coverage',
+      review: 'code plus the exact-revision implementer validation report; no duplicate execution by default',
     },
     rework: {
       fix: 'the whole invariant class at every affected instance',
@@ -106,9 +106,11 @@ export function buildAuditConvergenceContract(): string {
       reaudit: 'repair delta plus closure of every prior blocking class',
     },
     evidence: {
-      structuredResults: 'exact-bound implementer or teammate structured test results are valid evidence after coherence review; no duplicate run required',
+      structuredResults: 'default-accept exact-bound implementer structured test results after binding and coherence review; the auditor does not repeat them',
+      auditorExecution: 'only for no usable exact-revision report or one confident concrete suspicion; one test file/few named tests or one mutant, maxWorkers<=2, seconds-to-a-few-minutes; never full project/build/coverage/e2e',
+      suspicion: 'run the small targeted check directly and state why; do not REWORK merely to request that check',
       rawArtifacts: 'raw logs, transcripts, hashes, and bundle attachments are never PASS prerequisites; their absence never causes REWORK',
-      integrity: 'never fabricate results; a conflicting result or concrete implementation risk may justify a minimal targeted counterexample',
+      integrity: 'never fabricate results; PASS needs an authoritative accepted implementer report or a passed auditor exception check',
       dbMigration: 'production-shaped data: existing ids, soft-deleted rows, retry after partial DDL, concurrent writers',
       deployOrRollback: 'fault injection',
       postDeployGate: 'preflight required secrets and base URLs before running',

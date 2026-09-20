@@ -292,7 +292,7 @@ describe('buildProviderContextPayload', () => {
   // thread, never resent through the per-turn channel or the user message.
   it('registers the audit convergence contract in the stable system prompt of every managed provider', () => {
     const body = `"contractId":"${AUDIT_CONVERGENCE_CONTRACT_ID}"`;
-    const structuredEvidencePolicy = 'exact-bound implementer or teammate structured test results are valid evidence';
+    const structuredEvidencePolicy = 'default-accept exact-bound implementer structured test results';
     const rawArtifactPolicy = 'raw logs, transcripts, hashes, and bundle attachments are never PASS prerequisites';
     const providerIds = TRANSPORT_SESSION_AGENT_TYPES.filter((providerId) => providerId !== 'openclaw');
     for (const providerId of providerIds) {

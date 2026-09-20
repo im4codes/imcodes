@@ -138,6 +138,8 @@ export interface PeerAuditReplyAuthority {
   configRevision: string;
   controllerRevision: number;
   deadlineAt: number;
+  /** Daemon-held report authority captured for this exact attempt/baseline. */
+  acceptedImplementerValidation?: boolean;
 }
 
 /** Current daemon-authoritative bindings checked immediately before reduction. */
@@ -272,7 +274,12 @@ export function processPeerAuditReplyAuthority<T>(
       internalReason: 'deadline_expired',
     };
   }
-  const evidence = validatePeerAuditPassEvidence(input.envelope.verdict, input.envelope.validations);
+  const evidence = validatePeerAuditPassEvidence(input.envelope.verdict, input.envelope.validations, {
+    acceptedImplementerValidation: authority.acceptedImplementerValidation === true,
+    // Preserve the pre-existing task-less session-audit behavior. Registry-
+    // backed supervision receipts use a separate ingress and remain strict.
+    allowUnavailableOnly: true,
+  });
   if (!evidence.ok) return reject('evidence_rejected');
   if (!input.envelope.verdict) return reject('evidence_rejected');
 

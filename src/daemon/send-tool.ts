@@ -3571,6 +3571,8 @@ function boundedAuditBrief(
     scopeFiles: readonly string[];
     /** Blocking severities from the project Brain's current supervision configuration. */
     blockingSeverities: readonly AuditSeverity[];
+    /** Bounded caller-submitted summary on the exact validation event. */
+    validationReport?: string;
   },
 ): string {
   const shorten = (value: string, max = 800) => value.length <= max ? value : `${value.slice(0, max - 1)}…`;
@@ -3587,8 +3589,15 @@ function boundedAuditBrief(
     'Acceptance:',
     ...task.acceptance.slice(0, 20).map((item) => `- ${shorten(item, 500)}`),
     '',
-    'Evidence-first independent audit. Verify the exact revision and return one final PASS/REWORK via peer_audit_reply.',
+    `Exact-revision implementer validation report: ${scope.validationReport
+      ? shorten(scope.validationReport, 2_000)
+      : 'registry validationState=passed for this revision; no separate prose summary was supplied'}`,
+    '',
+    'Audit the exact revision from the frozen code plus the daemon-authorized exact-revision implementer validation report, then return one final PASS/REWORK via peer_audit_reply.',
     'Inspect the manifest and frozen files from the immutable bundle above. Do not inspect the auditor worktree or substitute a mutable implementer worktree.',
+    'DEFAULT: accept the implementer report after binding/coherence review and run no tests, typechecks, builds, mutants, probes, or reproductions. Record accepted rows with kind `accepted_implementer_validation`.',
+    'EXCEPTIONS: if no usable exact-revision report exists, run only the minimal gap-filling check. If you have a confident concrete suspicion about one specific behavior, run one small targeted check instead of REWORK merely to request it.',
+    'HARD LIMIT: one test file or a few named tests, or one mutant; --maxWorkers<=2; seconds-to-a-few-minutes. Never run a full test project, full build, coverage, or e2e. State which small check ran and why.',
     'Do not edit code, stage, commit, push, deploy, install, upgrade, restart, or create a replacement task/audit.',
     'On PASS, integrationOwner is the same-project Brain; on failure report bounded concrete findings.',
     '',
@@ -4156,6 +4165,12 @@ export async function dispatchReadyAudit(
     const selectedBinding = exactTarget
       ? resolveSelectedSupervisionExecutionBinding(task.projectName, sessions, exactTarget, 'primary')
       : undefined;
+    const validationReport = registry.listEvents(task.taskId).filter((event) => {
+      if (event.assignmentId !== implementer.assignmentId || event.eventType !== 'validated') return false;
+      const payload = event.payload;
+      return payload?.validationState === 'passed' && payload.validatedRevision === revision;
+    }).map((event) => typeof event.payload?.note === 'string' ? event.payload.note.trim() : '')
+      .filter(Boolean).at(-1);
     return ({
     ...(target ? { target } : {}),
     message: boundedAuditBrief(task, revision, integrationArtifact.path, integrationArtifact.files, {
@@ -4163,6 +4178,7 @@ export async function dispatchReadyAudit(
       blockingSeverities: resolveSupervisionAuditBlockingSeverities(
         resolveProjectAuthoritativeSupervisionSnapshot(task.projectName, sessions),
       ),
+      ...(validationReport ? { validationReport } : {}),
     }),
     reply: true,
     idempotencyKey: `auto-audit:${task.taskId}:${revision}`,

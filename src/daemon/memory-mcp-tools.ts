@@ -2196,11 +2196,21 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         && closedAudit.identity.sessionName === caller.sessionName) {
         const identity = await supervisionTaskIdentity();
         if (!identity) return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'peer audit correction caller identity is unavailable');
-        const evidence = validatePeerAuditPassEvidence(envelope.verdict, envelope.validations);
-        if (!evidence.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, evidence.error);
         const sourceAssignmentId = closedTask.integrationBundle?.sourceAssignmentId;
         const source = sourceAssignmentId ? registry.getAssignment(sourceAssignmentId) : undefined;
         if (!source) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'peer audit correction rejected: manifest_mismatch');
+        const acceptedImplementerValidation = envelope.validations.some(
+          (item) => item.kind === 'accepted_implementer_validation',
+        ) && registry.hasReadyAuditValidationAuthority({
+          taskId,
+          assignmentId: source.assignmentId,
+          revision,
+          allowLegacy: false,
+        });
+        const evidence = validatePeerAuditPassEvidence(envelope.verdict, envelope.validations, {
+          acceptedImplementerValidation,
+        });
+        if (!evidence.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, evidence.error);
         const inspect = deps.inspectSupervisionWorktree ?? inspectSupervisionAssignmentWorktree;
         const inspected = await inspect({
           sessionName: source.identity.sessionName,

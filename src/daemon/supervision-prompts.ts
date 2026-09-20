@@ -102,7 +102,7 @@ type ExecutionPromptCopy = {
 const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = {
   en: {
     auditPreamble: 'Peer-audit mode: finish implementation and validation, but DO NOT stage, commit, push, merge, release, publish, or deploy before PASS.',
-    auditEvidencePolicy: 'Audit evidence policy: briefs must say EVIDENCE ACCEPTANCE FIRST. After exact binding and coherence review, an implementer or teammate\'s structured test result is valid evidence and needs no duplicate run. Raw logs, transcripts, hashes, or bundle attachments are never PASS prerequisites; their absence must not cause REWORK. Never request an unconditional full test/typecheck/build rerun. Permit a minimal targeted counterexample only when the structured result conflicts with reviewed code/state or a concrete high-risk implementation gap exists; require rerunReason and never invent a result.',
+    auditEvidencePolicy: 'Auditor evidence policy: audit from code plus the exact-revision implementer test report. DEFAULT-ACCEPT that report after binding and coherence review; do not run tests, typechecks, builds, mutants, probes, or reproductions. Only when no usable exact-revision report exists may the auditor run the minimal check needed to fill that gap. A confident concrete suspicion permits one small targeted check; do not REWORK merely to request it. Limit any check to one test file or a few named tests, or one mutant, --maxWorkers<=2, seconds-to-a-few-minutes; never a full project/build/coverage/e2e. Never invent a result.',
     reworkLoop: 'On REWORK, fix the whole defect class the findings describe -- every affected instance and call site, not only the exact reported counterexample -- and validate immediately, then send the instructed reply-enabled re-audit; repeat until PASS or an exact blocker.',
     continueTask: 'Continue the same task.', executionMode: 'Execution mode', actionHint: 'Supervisor hint (verify first)', gapHint: 'Reported gap (advisory)', reasonHint: 'Rationale (advisory)',
     ownContext: 'Use your own context: advance safe unfinished work now; do not stop at a summary or repeat completed work.',
@@ -110,7 +110,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   },
   'zh-CN': {
     auditPreamble: '同伴审计模式：先完成实现与验证；PASS 前不得暂存、提交、推送、合并、发布或部署。',
-    auditEvidencePolicy: '审计证据策略：审计说明必须要求“先验收证据”。精确绑定并核对一致性后，实现者或队友提交的结构化测试结果即为有效证据，无需重复执行。原始日志、transcript、哈希或 bundle 附件绝不是 PASS 前提；缺少这些原始材料不得导致 REWORK。禁止无条件重跑完整测试/typecheck/build。仅当结构化结果与已审代码/状态矛盾，或存在具体高风险实现缺口时，才允许最小定向反例；必须记录 rerunReason，且不得伪造结果。',
+    auditEvidencePolicy: '审计员证据策略：只根据代码和精确版本的实现者测试报告审计。绑定并核对一致性后默认接受该报告；不得运行测试、typecheck、构建、变异、探针或复现。仅当没有可用的精确版本报告时，审计员才可运行填补该缺口所需的最小检查。仅对某个具体行为有确信疑点时，才可自行运行一个小型定向检查确认或排除；不得仅为索要该检查而 REWORK。检查限单文件/少量用例或一个 mutant、--maxWorkers<=2、数秒到数分钟，绝不运行完整项目/build/coverage/e2e；不得伪造结果。',
     reworkLoop: '收到 REWORK 后，修复发现所指的整类缺陷——覆盖每一个受影响的实例和调用点，不能只针对给出的那个具体反例——并立即验证，再按指示发送可回执复审；循环至 PASS 或明确阻断。',
     continueTask: '继续同一任务。', executionMode: '执行模式', actionHint: '监督提示（先核对）', gapHint: '监督报告缺口（仅供参考）', reasonHint: '监督理由（仅供参考）',
     ownContext: '以你自己的上下文为准：本轮立即推进可安全处理的未完成项；不要只做总结或重复已完成工作。',
@@ -118,7 +118,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   },
   'zh-TW': {
     auditPreamble: '同伴審計模式：先完成實作與驗證；PASS 前不得暫存、提交、推送、合併、發佈或部署。',
-    auditEvidencePolicy: '審計證據策略：審計說明必須要求「先驗收證據」。精確綁定並核對一致性後，實作者或隊友提交的結構化測試結果即為有效證據，無需重複執行。原始日誌、transcript、雜湊或 bundle 附件絕不是 PASS 前提；缺少這些原始材料不得導致 REWORK。禁止無條件重跑完整測試/typecheck/build。僅當結構化結果與已審程式碼/狀態矛盾，或存在具體高風險實作缺口時，才允許最小定向反例；必須記錄 rerunReason，且不得捏造結果。',
+    auditEvidencePolicy: '審計員證據策略：只依程式碼與精確版本的實作者測試報告審計。綁定並核對一致性後預設接受該報告；不得執行測試、typecheck、建置、突變、探針或重現。只有沒有可用的精確版本報告時，審計員才可執行填補缺口所需的最小檢查。僅對某個具體行為有確信疑點時，才可自行執行一個小型定向檢查確認或排除；不得只為索取該檢查而 REWORK。檢查限單檔/少量案例或一個 mutant、--maxWorkers<=2、數秒到數分鐘，絕不執行完整專案/build/coverage/e2e；不得捏造結果。',
     reworkLoop: '收到 REWORK 後，修復發現所指的整類缺陷——涵蓋每一個受影響的實例與呼叫點，不能只針對給出的那個具體反例——並立即驗證，再依指示發送可回執複審；循環至 PASS 或明確阻斷。',
     continueTask: '繼續同一任務。', executionMode: '執行模式', actionHint: '監督提示（先核對）', gapHint: '監督回報缺口（僅供參考）', reasonHint: '監督理由（僅供參考）',
     ownContext: '以你自己的上下文為準：本輪立即推進可安全處理的未完成項；不要只做摘要或重複已完成工作。',
@@ -126,7 +126,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   },
   es: {
     auditPreamble: 'Modo de auditoría: termina implementación y validación; antes de PASS no prepares, confirmes, envíes, fusiones, publiques ni despliegues.',
-    auditEvidencePolicy: 'Política de evidencia: el informe debe exigir EVIDENCE ACCEPTANCE FIRST. Tras enlazar exactamente y revisar la coherencia, el resultado estructurado de una prueba aportado por el implementador o un compañero es evidencia válida y no requiere otra ejecución. Los registros sin procesar, transcripciones, hashes o adjuntos de bundle nunca son requisitos para PASS; su ausencia no debe causar REWORK. No ordenes repetir incondicionalmente toda la matriz de tests/typecheck/build. Permite un contraejemplo mínimo y dirigido solo si el resultado estructurado contradice el código/estado revisado o existe un riesgo concreto de implementación; registra rerunReason y nunca inventes un resultado.',
+    auditEvidencePolicy: 'Política del auditor: audita desde el código y el informe de pruebas del implementador ligado a la revisión exacta. Acéptalo por defecto tras revisar vínculo y coherencia; no ejecutes tests, typecheck, builds, mutantes, sondas ni reproducciones. Solo si no existe un informe exacto utilizable puede el auditor ejecutar la comprobación mínima que cubra esa ausencia. Solo una sospecha concreta y segura permite una comprobación pequeña y dirigida; no uses REWORK solo para pedirla. Límite: un archivo o pocos tests, o un mutante, --maxWorkers<=2, segundos a pocos minutos; nunca proyecto completo/build/coverage/e2e. Nunca inventes resultados.',
     reworkLoop: 'Tras REWORK, corrige toda la clase de defecto que describen los hallazgos -- cada instancia y punto de llamada afectado, no solo el contraejemplo exacto reportado -- y valida de inmediato; luego envía la nueva auditoría con respuesta hasta PASS o un bloqueo exacto.',
     continueTask: 'Continúa la misma tarea.', executionMode: 'Modo de ejecución', actionHint: 'Sugerencia del supervisor (verifica primero)', gapHint: 'Falta informada (orientativa)', reasonHint: 'Motivo (orientativo)',
     ownContext: 'Usa tu propio contexto: avanza ahora el trabajo pendiente seguro; no te detengas en un resumen ni repitas lo completado.',
@@ -134,7 +134,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   },
   ru: {
     auditPreamble: 'Режим аудита: завершите реализацию и проверку; до PASS нельзя индексировать, коммитить, отправлять, сливать, публиковать или развёртывать.',
-    auditEvidencePolicy: 'Политика доказательств: brief должен требовать EVIDENCE ACCEPTANCE FIRST. После точной привязки и проверки согласованности структурированный результат теста от исполнителя или коллеги является допустимым доказательством и не требует повторного запуска. Исходные журналы, transcripts, хэши и вложения bundle никогда не являются условиями PASS; их отсутствие не должно приводить к REWORK. Не требуйте безусловного повтора полного набора tests/typecheck/build. Минимальный направленный контрпример допустим только при противоречии структурированного результата проверенному коду/состоянию или при конкретном высоком риске реализации; фиксируйте rerunReason и никогда не выдумывайте результат.',
+    auditEvidencePolicy: 'Политика аудитора: проверяйте код и отчёт исполнителя, точно привязанный к ревизии. По умолчанию принимайте отчёт после проверки привязки и согласованности; не запускайте tests, typecheck, builds, mutants, probes или воспроизведения. Только при отсутствии пригодного отчёта для точной ревизии аудитор может выполнить минимальную проверку, закрывающую этот пробел. Только уверенное конкретное подозрение разрешает одну малую целевую проверку; не используйте REWORK лишь для её запроса. Лимит: один файл/несколько тестов или один mutant, --maxWorkers<=2, секунды–несколько минут; никогда полный проект/build/coverage/e2e. Не выдумывайте результаты.',
     reworkLoop: 'После REWORK исправьте весь класс дефекта, который описывают выводы, -- каждый затронутый экземпляр и место вызова, а не только приведённый контрпример, -- и сразу проверьте, затем отправьте указанную повторную проверку с ответом; повторяйте до PASS или точной блокировки.',
     continueTask: 'Продолжайте ту же задачу.', executionMode: 'Режим выполнения', actionHint: 'Подсказка надзора (сначала проверьте)', gapHint: 'Указанный пробел (справочно)', reasonHint: 'Причина (справочно)',
     ownContext: 'Опирайтесь на свой контекст: сейчас продвигайте безопасную незавершённую работу; не останавливайтесь на отчёте и не повторяйте готовое.',
@@ -142,7 +142,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   },
   ja: {
     auditPreamble: 'ピア監査モード：実装と検証を完了し、PASS 前はステージ、コミット、プッシュ、マージ、公開、デプロイをしないでください。',
-    auditEvidencePolicy: '監査証拠ポリシー：brief は EVIDENCE ACCEPTANCE FIRST を要求します。正確な binding と整合性確認後、実装者またはチームメイトの構造化テスト結果は有効な証拠であり、重複実行は不要です。raw log、transcript、hash、bundle 添付は PASS の前提ではなく、不在を理由に REWORK にしてはいけません。full test/typecheck/build の無条件再実行は禁止します。構造化結果が確認済みのコード/状態と矛盾する場合、または具体的な高リスク実装上の欠陥がある場合に限り、最小の定向反例を許可します。rerunReason を記録し、結果を捏造してはいけません。',
+    auditEvidencePolicy: '監査員ポリシー：コードと正確な revision に紐づく実装者テスト報告から監査します。binding と整合性確認後は報告を既定で受理し、test、typecheck、build、mutant、probe、再現を実行しません。利用可能な正確な報告がない場合だけ、その不足を埋める最小確認を実行できます。特定動作への確信ある具体的疑念だけが小さな対象確認を1回許可します。その確認を依頼するだけの REWORK は禁止です。1ファイル/少数テストまたは1 mutant、--maxWorkers<=2、数秒〜数分に限定し、full project/build/coverage/e2e は禁止します。結果を捏造しないでください。',
     reworkLoop: 'REWORK 後は、所見が示す欠陥のクラス全体——影響を受けるすべてのインスタンスと呼び出し箇所——を修正してください。報告された具体的な反例だけを直すのではありません。直ちに検証し、指示された返信可能な再監査を送信してください。PASS または明確な障害まで繰り返します。',
     continueTask: '同じタスクを続行してください。', executionMode: '実行モード', actionHint: '監督ヒント（先に確認）', gapHint: '報告された不足（参考）', reasonHint: '理由（参考）',
     ownContext: '自分の文脈を優先し、安全に進められる未完了作業を今すぐ進めてください。要約だけで止まらず、完了済み作業を繰り返さないでください。',
@@ -150,7 +150,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   },
   ko: {
     auditPreamble: '동료 감사 모드: 구현과 검증을 완료하고 PASS 전에는 스테이징, 커밋, 푸시, 병합, 게시, 배포하지 마세요.',
-    auditEvidencePolicy: '감사 증거 정책: brief는 EVIDENCE ACCEPTANCE FIRST를 요구해야 합니다. 정확한 binding과 일관성 검토 후 구현자나 팀 동료가 제출한 구조화된 테스트 결과는 유효한 증거이며 중복 실행이 필요하지 않습니다. 원시 로그, transcript, hash 또는 bundle 첨부물은 PASS의 전제 조건이 아니며, 없다는 이유로 REWORK하면 안 됩니다. 전체 test/typecheck/build의 무조건 재실행은 금지합니다. 구조화된 결과가 검토한 코드/상태와 충돌하거나 구체적인 고위험 구현 결함이 있을 때만 최소 정향 반례를 허용합니다. rerunReason을 기록하고 결과를 조작하지 마세요.',
+    auditEvidencePolicy: '감사자 정책: 코드와 정확한 revision에 묶인 구현자 테스트 보고서로 감사합니다. binding과 일관성을 확인한 뒤 보고서를 기본 수용하며 test, typecheck, build, mutant, probe, 재현을 실행하지 않습니다. 사용할 수 있는 정확한 보고서가 없을 때만 그 공백을 메우는 최소 검사를 실행할 수 있습니다. 특정 동작에 대한 확신 있는 구체적 의심만 작은 표적 검사 1회를 허용하며, 그 검사를 요청하려고 REWORK하면 안 됩니다. 한 파일/소수 테스트 또는 mutant 1개, --maxWorkers<=2, 수초~수분으로 제한하고 full project/build/coverage/e2e는 금지합니다. 결과를 조작하지 마세요.',
     reworkLoop: 'REWORK 후에는 발견 사항이 가리키는 결함 전체 클래스—영향을 받는 모든 인스턴스와 호출 지점—를 수정하세요. 보고된 구체적 반례만 고치는 것이 아닙니다. 즉시 검증하고 안내된 회신 가능 재감사를 보내세요. PASS 또는 명확한 차단 사유까지 반복합니다.',
     continueTask: '같은 작업을 계속하세요.', executionMode: '실행 모드', actionHint: '감독 힌트(먼저 확인)', gapHint: '보고된 누락(참고)', reasonHint: '이유(참고)',
     ownContext: '자신의 문맥을 기준으로 지금 안전한 미완료 작업을 진행하세요. 요약만 하고 멈추거나 완료한 작업을 반복하지 마세요.',
@@ -542,7 +542,10 @@ export function buildSupervisionTaskFinalizationContract(_locale?: SupervisionUi
     authority: 'actual_worktree+Git_bytes',
     git: { conflict: 'block', add: 'explicit_non_broad_pathspec', forbidAdd: SUPERVISION_TASK_FINALIZATION_FORBIDDEN_GIT_ADD, forbidStagePrefixes: SUPERVISION_TASK_FINALIZATION_FORBIDDEN_STAGE_PREFIXES },
     metadata: { fields: ['ownedFiles', 'scopeFiles', 'touchedFiles', 'file_event', 'integrationManifest'], mode: 'record_only', editAllowlist: false, gate: false },
-    auditEvidence: { frozenFirst: true, rerun: 'minimal_on_concrete_gap', rerunReason: true },
+    auditEvidence: {
+      frozenFirst: true,
+      auditorRuns: 'only_missing_report_or_confident_suspicion_small',
+    },
     implementation_finished: 'handoff_not_PASS_or_Git_finalization',
   });
 }
@@ -727,7 +730,7 @@ export function buildSupervisedAuditExecutionPreamble(locale?: SupervisionUiLoca
     buildSupervisionDelegationEligibilityPolicy(locale),
     buildSupervisionMessagingContract(),
     `${FILE_OUTPUT_CONTRACT_ID}; auto-audit enabled; Brain coordinates and integrates.`,
-    JSON.stringify({ auditMode: true, beforePass: 'no_delivery_finalization', rework: 'fix_validate_fresh_audit', evidence: 'frozen_first_minimal_rerun' }),
+    JSON.stringify({ auditMode: true, beforePass: 'no_delivery_finalization', rework: 'fix_validate_fresh_audit', evidence: 'code_plus_exact_report_no_duplicate_run' }),
     buildExecutionStatusContract(locale),
     SUPERVISION_CONTRACT_PREAMBLE_END,
   ].join('\n');
@@ -905,7 +908,7 @@ export function buildAutomaticAuditTaskPrompt(options: {
   const copies: Record<SupervisionUiLocale, string[]> = {
     en: [
       'Ask the selected delegate to independently audit this session\'s most recent work and return PASS or REWORK with concrete evidence, prioritized defects, and unavailable checks.',
-      ...(options.narrow ? ['Scope: this change is NARROW; inspect the diff and its direct blast radius, using proportionate executable evidence.'] : []),
+      ...(options.narrow ? ['Scope: this change is NARROW; inspect the diff and its direct blast radius from code plus the submitted exact-revision test report. Do not repeat validation.'] : []),
       'You—not the daemon—must prepare the brief from the real current context.',
       `Automatic audit attempt ID: ${common.attempt}. Include this exact attempt ID in the delegated audit brief; send exactly one reply-enabled audit request to ${common.target}. Do not choose another session or send a second audit while this attempt is pending.`,
       `For send_message use reply=true and audit=${common.metadata}; this metadata is required.`,
@@ -915,7 +918,7 @@ export function buildAutomaticAuditTaskPrompt(options: {
     ],
     'zh-CN': [
       '请所选代理独立审计本会话最近的工作，并以具体证据、按优先级排列的缺陷和不可用检查返回 PASS 或 REWORK。',
-      ...(options.narrow ? ['范围：本次变更较窄；聚焦 diff 及直接影响面，执行与范围相称的可执行验证。'] : []),
+      ...(options.narrow ? ['范围：本次变更较窄；根据代码和精确版本的实现者测试报告审计 diff 及直接影响面，不要重复验证。'] : []),
       '请根据本会话真实上下文自行准备审计说明。',
       `审计 attempt ID：${common.attempt}。说明中必须包含它，并只向 ${common.target} 发送一次可回执审计；不要改选目标或重复发送。`,
       `调用时使用 reply=true 和 audit=${common.metadata}。`,
@@ -925,7 +928,7 @@ export function buildAutomaticAuditTaskPrompt(options: {
     ],
     'zh-TW': [
       '請所選代理獨立審計本工作階段最近的工作，並以具體證據、依優先級排列的缺陷與不可用檢查回覆 PASS 或 REWORK。',
-      ...(options.narrow ? ['範圍：本次變更較窄；聚焦 diff 與直接影響面，執行相稱的可執行驗證。'] : []),
+      ...(options.narrow ? ['範圍：本次變更較窄；依程式碼與精確版本的實作者測試報告審計 diff 及直接影響面，不要重複驗證。'] : []),
       '請依本工作階段真實脈絡自行準備審計說明。',
       `審計 attempt ID：${common.attempt}。說明中必須包含它，並只向 ${common.target} 傳送一次可回覆審計；不要改選目標或重複傳送。`,
       `呼叫時使用 reply=true 與 audit=${common.metadata}。`,
@@ -935,7 +938,7 @@ export function buildAutomaticAuditTaskPrompt(options: {
     ],
     es: [
       'Pide al agente seleccionado una auditoría independiente con evidencia, defectos priorizados, comprobaciones no disponibles y veredicto PASS o REWORK.',
-      ...(options.narrow ? ['Alcance estrecho: revisa el diff y su impacto directo con evidencia ejecutable proporcional.'] : []),
+      ...(options.narrow ? ['Alcance estrecho: audita el diff y su impacto directo desde el código y el informe exacto del implementador; no repitas la validación.'] : []),
       'Prepara tú mismo el resumen desde el contexto real.',
       `ID del intento: ${common.attempt}. Inclúyelo y envía una sola auditoría con respuesta a ${common.target}; no cambies ni dupliques el destino.`,
       `Usa reply=true y audit=${common.metadata}.`, 'Mientras esperas, no modifiques, confirmes, envíes ni despliegues.',
@@ -944,7 +947,7 @@ export function buildAutomaticAuditTaskPrompt(options: {
     ],
     ru: [
       'Попросите выбранного агента провести независимую проверку с доказательствами, приоритетными дефектами, недоступными проверками и вердиктом PASS или REWORK.',
-      ...(options.narrow ? ['Узкая область: проверьте diff и прямое влияние соразмерными исполняемыми проверками.'] : []),
+      ...(options.narrow ? ['Узкая область: проверяйте diff и прямое влияние по коду и точному отчёту исполнителя; не повторяйте проверки.'] : []),
       'Самостоятельно подготовьте описание из фактического контекста.',
       `ID попытки: ${common.attempt}. Включите его и отправьте ровно одну проверку с ответом в ${common.target}; не меняйте цель и не дублируйте запрос.`,
       `Используйте reply=true и audit=${common.metadata}.`, 'Во время ожидания не изменяйте, не коммитьте, не отправляйте и не развёртывайте.',
@@ -953,7 +956,7 @@ export function buildAutomaticAuditTaskPrompt(options: {
     ],
     ja: [
       '選択したエージェントに、証拠、優先度付き欠陥、実施不能な確認、PASS/REWORK 判定を含む独立監査を依頼してください。',
-      ...(options.narrow ? ['範囲は狭いです。diff と直接影響だけを、相応の実行可能な証拠で確認します。'] : []),
+      ...(options.narrow ? ['範囲は狭いです。コードと正確な実装者テスト報告から diff と直接影響を監査し、検証を重複実行しません。'] : []),
       '実際の文脈から自分で監査説明を作成してください。',
       `試行 ID：${common.attempt}。説明に含め、${common.target} へ返信可能な監査を1回だけ送信します。対象変更や重複送信は禁止です。`,
       `reply=true と audit=${common.metadata} を使います。`, '待機中は変更、コミット、プッシュ、デプロイをしないでください。',
@@ -962,7 +965,7 @@ export function buildAutomaticAuditTaskPrompt(options: {
     ],
     ko: [
       '선택한 에이전트에게 증거, 우선순위 결함, 수행 불가 검사, PASS/REWORK 판정을 포함한 독립 감사를 요청하세요.',
-      ...(options.narrow ? ['범위가 좁습니다. diff와 직접 영향만 비례하는 실행 증거로 확인하세요.'] : []),
+      ...(options.narrow ? ['범위가 좁습니다. 코드와 정확한 구현자 테스트 보고서로 diff와 직접 영향을 감사하고 검증을 반복하지 마세요.'] : []),
       '실제 현재 문맥에서 감사 설명을 직접 준비하세요.',
       `시도 ID: ${common.attempt}. 설명에 포함하고 ${common.target}로 회신 가능 감사를 한 번만 보내세요. 대상을 바꾸거나 중복 전송하지 마세요.`,
       `reply=true와 audit=${common.metadata}를 사용하세요.`, '대기 중에는 수정, 커밋, 푸시, 배포하지 마세요.',
@@ -1016,6 +1019,7 @@ export function buildAuditTargetRecoveryPrompt(options: {
     intro,
     ...identityLines,
     action,
+    resolveExecutionPromptCopy(options.uiLocale).auditEvidencePolicy,
     options.replyInstruction,
   ].join('\n');
 }
@@ -1189,14 +1193,15 @@ export function buildPeerAuditBriefV1(input: PeerAuditBriefV1Input): string {
     : '';
   const evidenceComplete = input.evidenceComplete === true
     || (input.validations?.some((item) => item.outcome === 'passed') ?? false);
+  const legacySessionAudit = !input.taskId && !input.assignmentId && !input.revision;
   const evidencePolicy = evidenceComplete
     ? [
-        'EVIDENCE ACCEPTANCE FIRST: the implementer supplied structured executable evidence. After exact revision binding and coherence review, an implementer or teammate\'s structured validation result is valid evidence and needs no duplicate run. Raw logs, transcripts, hashes, and bundle attachments are not required and their absence must never cause REWORK.',
-        'Do NOT unconditionally repeat a full test, typecheck, lint, or build suite. Run only a minimal targeted counterexample when the structured result conflicts with reviewed code/state, validation contamination is concretely observed, or a high-risk implementation finding makes it necessary. If you rerun anything, record `rerunReason=<specific contradiction or risk>` with that validation.',
+        'EVIDENCE ACCEPTANCE FIRST: DEFAULT-ACCEPT the exact-bound implementer validation report after binding and coherence review. Audit from the code and the submitted test report. Raw logs, transcripts, hashes, and bundle attachments are not required and their absence must never cause REWORK.',
+        'Do not run tests, typechecks, builds, mutants, probes, or reproductions when that report is usable. Only a confident, concrete suspicion about one specific behavior permits one small targeted check to confirm or refute it; do not REWORK merely to ask the implementer to run that check.',
       ]
     : [
-        'EVIDENCE GAP: no passed executable validation was supplied in the structured evidence summary. Run only the smallest bounded check needed to resolve that gap; do not default to the full matrix.',
-        'Every rerun must record `rerunReason=<no-passed-structured-validation|conflicting-result|concrete-high-risk>` in its validation summary.',
+        'EVIDENCE GAP: no usable exact-revision test report was supplied. Only because no usable exact-revision test report exists, the auditor may run the minimal check needed to fill that report gap.',
+        'A confident, concrete suspicion also permits one small targeted check; do not REWORK merely to request that check. For any auditor-run check, state why it ran and limit it to one test file or a few named tests, or one mutant, with `--maxWorkers<=2` and seconds-to-a-few-minutes. Never run a full test project, full build, coverage, or e2e.',
       ];
 
   const brief = [
@@ -1205,13 +1210,15 @@ export function buildPeerAuditBriefV1(input: PeerAuditBriefV1Input): string {
     buildSupervisionContractsInForceLine(),
     buildAuditConvergenceContractRef(AUDIT_CONVERGENCE_ROLES.AUDITOR, input.blockingSeverities),
     'This is a single-pass audit: report every finding in this one pass. Do not start Team/P2P rounds, create a discussion, poll another session, or bulk-read OpenSpec artifact bodies.',
-    'Time-box reruns, not review coverage. Separate observed evidence from inference.',
+    'Review all in-scope code and acceptance criteria. Separate observed evidence from inference.',
     ...evidencePolicy,
-    'The normal audit is exact binding, code review, structured result acceptance, and only the necessary minimal directed counterexample. Submitted structured evidence is not invalid merely because the auditor did not personally rerun it or receive its raw transport artifacts.',
-    'When the evidence policy above permits a rerun, you MAY use focused tests, typecheck, lint, build, read-only tools, and explicitly isolated fixtures. You MAY use already-authorized devices/environments only for read-only checks or isolated fixture operations.',
+    'AUDITOR CHECK HARD LIMIT: one test file or a few named tests, or one mutant; `--maxWorkers<=2`; seconds-to-a-few-minutes. Never run a full test project, full build, coverage, or e2e. State which small check ran and why.',
+    'The normal audit is exact binding plus code review plus acceptance of the submitted exact-revision report, with no duplicate execution. Exceptions are only the smallest check for a missing/unusable report or one small targeted check for a confident, concrete suspicion.',
     'You MUST NOT modify tracked source, commit, push, deploy, mutate production, or alter persistent external/product state. Do not run reset/clean. Inspect worktree state before and after, preserve pre-existing changes, and stop/report if validation creates an unexpected tracked diff.',
     'Treat `git status` as a signal, not proof of a content change. Before classifying an unexpected EOL-only path as task contamination, compare the HEAD blob, raw working-tree bytes, and the attribute-cleaned hash (`git hash-object --path`). If raw bytes equal HEAD but the clean hash differs, report one repository-normalization defect; do not include that unrelated path in the candidate diff/archive, and do not hide it with reset, clean, or assume-unchanged. If raw bytes differ from HEAD, keep the normal fail-closed contamination rule. An explicit normalization task may include the path.',
-    'For checks you personally run, report exact commands/tools/devices/environments and observed outcomes. For accepted structured results, preserve the supplied label, outcome, and summary. Explain unavailable checks; never invent a result.',
+    evidenceComplete
+      ? 'For accepted structured results, preserve the supplied label, outcome, and summary and report them with kind `accepted_implementer_validation`. If an exception applies, report the exact small command/tool, why it ran, and the observed outcome. Never invent a result.'
+      : 'No accepted implementer report is bound to this attempt. Report the exact small gap check with its real validation kind, why it ran, and the observed outcome. Never invent a result or cite `accepted_implementer_validation`.',
     `VERDICT BOUNDARY: REWORK if and only if a ${formatAuditBlockingSeverities(input.blockingSeverities)} finding exists, with severities as defined by the referenced audit convergence contract. For each blocking finding name the violated invariant, every affected instance, and the required outcome for the whole class, not a minimal point patch.`,
     'Do NOT use REWORK merely because an optional check was unavailable or not personally rerun, raw logs/transcripts/hashes/bundle attachments are absent, evidence packaging/control-plane/receipt delivery failed, style or future hardening could improve, or a non-blocking observation exists. Record those separately as unavailable checks, infrastructure blockers, or follow-up observations; they do not block PASS when the structured implementation evidence is otherwise sufficient.',
     '',
@@ -1224,12 +1231,11 @@ export function buildPeerAuditBriefV1(input: PeerAuditBriefV1Input): string {
     'Acceptance criteria:',
     ...(acceptance.length ? acceptance.map((item) => `- ${item}`) : ['- Verify the result materially satisfies the task request without regressions.']),
     ...(paths.length ? ['', 'Relevant paths (names only; inspect selectively):', ...paths.map((item) => `- ${item}`)] : []),
-    ...(validationLines.length ? ['', 'Existing validation summary (claims to verify):', ...validationLines.map((item) => `- ${item}`)] : []),
+    ...(validationLines.length ? ['', 'Submitted exact-revision validation report (accept after binding and coherence review):', ...validationLines.map((item) => `- ${item}`)] : []),
     ...(rationale ? ['', 'Non-authoritative broker rationale:', rationale] : []),
     ...(input.narrowScope ? ['',
       'SCOPE: this is a NARROW change — small, self-contained, blast radius visible in the diff.',
-      'Audit the change and what it directly touches. Do not re-review unrelated subsystems or run the full matrix; a proportionate check is the correct outcome here, not a thin version of a full one.',
-      'Still refuse to PASS on static reading alone if a relevant executable check exists — narrow means less surface, not less evidence.'] : []),
+      'Audit the change and what it directly touches from code plus the submitted exact-revision report. Do not re-review unrelated subsystems or repeat validation.'] : []),
     ...(priorFindings ? ['',
       'THIS IS A RE-AUDIT. The previous round returned REWORK with the findings below.',
       'Spend your effort on: (1) whether each of these is now actually closed, and (2) what the new changes introduced.',
@@ -1239,9 +1245,11 @@ export function buildPeerAuditBriefV1(input: PeerAuditBriefV1Input): string {
       'Previous REWORK findings:',
       priorFindings] : []),
     '',
-    'Append structured progress receipts as needed, then one current final receipt. PASS requires at least one accepted, exact-bound passed validation when an executable relevant check exists; an implementer or teammate structured result satisfies this after coherence/binding review and does not need raw artifacts or a duplicate run. Otherwise list each unavailable check specifically. Empty/static-only PASS is rejected.',
+    evidenceComplete
+      ? 'Append structured progress receipts as needed, then one current final receipt. PASS requires evidence. Use kind `accepted_implementer_validation` to cite the daemon-held exact-attempt report; daemon authority, not auditor execution, validates that row. Empty PASS is rejected.'
+      : `Append structured progress receipts as needed, then one current final receipt. No accepted report is bound, so PASS normally requires a passed minimal gap check. Empty PASS is rejected.${legacySessionAudit ? ' For this legacy session-audit path only, fully explained unavailable-only rows preserve prior behavior.' : ' Unavailable-only PASS is rejected.'}`,
     'Prefer the available peer_audit_reply MCP tool with these exact fields:',
-    `{ ${input.taskId ? `"taskId": "${input.taskId}", ` : ''}${input.assignmentId ? `"assignmentId": "${input.assignmentId}", ` : ''}"attemptId": "${input.attemptId}", ${input.revision ? `"revision": "${input.revision}", ` : ''}"receiptKind": "final", "verdict": "PASS|REWORK", "findings": "<bounded findings>", "validations": [{ "kind": "test", "label": "<check>", "outcome": "passed|failed|unavailable", "summary": "<exact result or reason>" }] }`,
+    `{ ${input.taskId ? `"taskId": "${input.taskId}", ` : ''}${input.assignmentId ? `"assignmentId": "${input.assignmentId}", ` : ''}"attemptId": "${input.attemptId}", ${input.revision ? `"revision": "${input.revision}", ` : ''}"receiptKind": "final", "verdict": "PASS|REWORK", "findings": "<bounded findings>", "validations": [{ "kind": "${evidenceComplete ? 'accepted_implementer_validation' : 'test'}", "label": "<${evidenceComplete ? 'submitted' : 'small gap'} check>", "outcome": "passed|failed|unavailable", "summary": "<exact result or reason>" }] }`,
     'Authority is the daemon-authenticated current session plus the bound registry attempt/revision; never create a new auditor assignment to repair a rejected receipt.',
     ...(input.taskId && input.assignmentId && input.revision ? [
       'If that MCP tool is unavailable, write findings and validations JSON to disposable local files, then invoke:',

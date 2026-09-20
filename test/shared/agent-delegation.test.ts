@@ -399,7 +399,9 @@ describe('agent delegation shared contract', () => {
   it('builds quick presets as ordinary delegation tasks and keeps custom text exact', () => {
     const audit = buildQuickAgentDelegationTask('audit');
     expect(audit).toContain('current session context');
-    expect(audit).toContain('non-destructive tests');
+    expect(audit).toContain('audit from the code plus the submitted test report');
+    expect(audit).toContain('must not rerun tests or other validation');
+    expect(audit).toContain('only a missing report permits the minimal gap-filling check');
     expect(audit).toContain('PASS or REWORK');
     expect(audit).not.toContain('replyCapability');
     expect(audit).not.toContain('baseline');

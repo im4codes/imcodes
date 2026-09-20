@@ -149,6 +149,8 @@ describe('PeerAuditService integration', () => {
     const brief = String(dispatchMock.mock.calls[0]?.[0]?.brief);
     expect(brief).not.toContain('--capability');
     expect(brief).not.toContain('replyCapability');
+    expect(brief).toContain('No accepted implementer report is bound to this attempt');
+    expect(brief).not.toContain('"kind": "accepted_implementer_validation"');
     const registry = getSupervisionTaskRegistry();
     expect(registry.createOrGet({
       taskId: 'task-peer-service-receipt', projectName: 'peer-service',
@@ -824,5 +826,35 @@ describe('PeerAuditService integration', () => {
     }, peer, Date.now());
     await flush();
     expect(onTerminal).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'rework', findings: 'Add the missing race test.' }));
+
+    const acceptedTerminal = vi.fn();
+    const accepted = await service.startAutomatic({
+      audited: main,
+      taskCommandId: 'task_3',
+      generationOrEpoch: 3,
+      userText: 'audit from exact report',
+      assistantText: 'done and validated',
+      validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: '42 passed' }],
+      isStillValid: () => true,
+      onTerminal: acceptedTerminal,
+    });
+    if (!accepted.ok) throw new Error(accepted.error);
+    await flush();
+    const acceptedBrief = String(dispatchMock.mock.calls.at(-1)?.[0]?.brief);
+    expect(acceptedBrief).toContain('"kind": "accepted_implementer_validation"');
+    await expect(service.acceptReply({
+      version: PEER_AUDIT_REPLY_VERSION,
+      attemptId: accepted.attemptId,
+      verdict: 'PASS',
+      findings: 'Code and exact-attempt report are coherent.',
+      validations: [{
+        kind: 'accepted_implementer_validation',
+        label: 'focused',
+        outcome: 'passed',
+        summary: '42 passed',
+      }],
+    }, peer, Date.now())).resolves.toEqual({ ok: true });
+    await flush();
+    expect(acceptedTerminal).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'pass' }));
   });
 });

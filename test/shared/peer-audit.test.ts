@@ -80,7 +80,7 @@ describe('peer-audit contract — versions, enums, limits', () => {
     expect([...PEER_AUDIT_SELECTION_INTENTS]).toEqual(['remembered_fast_path', 'explicit_picker']);
     expect([...PEER_AUDIT_RUNTIME_DISPOSITIONS]).toEqual(['sent', 'queued', 'sent_unrevocable']);
     expect([...PEER_AUDIT_VERDICTS]).toEqual(['PASS', 'REWORK']);
-    expect([...PEER_AUDIT_VALIDATION_KINDS]).toEqual(['test', 'typecheck', 'lint', 'build', 'tool', 'device', 'environment']);
+    expect([...PEER_AUDIT_VALIDATION_KINDS]).toEqual(['test', 'typecheck', 'lint', 'build', 'tool', 'device', 'environment', 'accepted_implementer_validation']);
     expect([...PEER_AUDIT_VALIDATION_OUTCOMES]).toEqual(['passed', 'failed', 'unavailable']);
     expect([...PEER_AUDIT_PHASES]).toEqual(['preparing', 'sent', 'queued', 'sent_unrevocable', 'waiting_reply']);
   });
@@ -208,12 +208,45 @@ describe('validation list + PASS evidence policy', () => {
     expect(parsePeerAuditValidationList('not-a-list')).toMatchObject({ ok: false });
     expect(parsePeerAuditValidationList([passedItem])).toMatchObject({ ok: true });
   });
-  it('PASS requires >=1 passed OR all unavailable; empty or static-only PASS is insufficient', () => {
+  it('PASS requires >=1 authoritative passed row; unavailable-only or empty PASS is insufficient', () => {
     expect(validatePeerAuditPassEvidence('PASS', [])).toMatchObject({ ok: false, error: PEER_AUDIT_REPLY_ERRORS.INSUFFICIENT_VALIDATION_EVIDENCE });
     expect(validatePeerAuditPassEvidence('PASS', [{ ...passedItem, outcome: 'failed' }])).toMatchObject({ ok: false, error: PEER_AUDIT_REPLY_ERRORS.INSUFFICIENT_VALIDATION_EVIDENCE });
-    expect(validatePeerAuditPassEvidence('PASS', [{ ...passedItem, outcome: 'unavailable' }])).toMatchObject({ ok: true });
+    expect(validatePeerAuditPassEvidence('PASS', [{ ...passedItem, outcome: 'unavailable' }])).toMatchObject({ ok: false, error: PEER_AUDIT_REPLY_ERRORS.INSUFFICIENT_VALIDATION_EVIDENCE });
     expect(validatePeerAuditPassEvidence('PASS', [passedItem, { ...passedItem, outcome: 'failed' }])).toMatchObject({ ok: true });
     expect(validatePeerAuditPassEvidence('REWORK', [])).toMatchObject({ ok: true });
+  });
+  it('preserves unavailable-only PASS solely for the legacy session-audit gate', () => {
+    const unavailable = [{ ...passedItem, outcome: 'unavailable' as const }];
+    expect(validatePeerAuditPassEvidence('PASS', unavailable, {
+      allowUnavailableOnly: true,
+    })).toMatchObject({ ok: true });
+    expect(validatePeerAuditPassEvidence('PASS', [], {
+      allowUnavailableOnly: true,
+    })).toMatchObject({
+      ok: false,
+      error: PEER_AUDIT_REPLY_ERRORS.INSUFFICIENT_VALIDATION_EVIDENCE,
+    });
+  });
+  it('accepts an implementer report only when daemon exact-revision authority is present', () => {
+    const acceptedReport: PeerAuditValidationItem = {
+      kind: 'accepted_implementer_validation',
+      label: 'exact revision report',
+      outcome: 'passed',
+      summary: 'registry validationState=passed',
+    };
+    expect(validatePeerAuditPassEvidence('PASS', [acceptedReport])).toMatchObject({
+      ok: false,
+      error: PEER_AUDIT_REPLY_ERRORS.INSUFFICIENT_VALIDATION_EVIDENCE,
+    });
+    expect(validatePeerAuditPassEvidence('PASS', [acceptedReport], {
+      acceptedImplementerValidation: true,
+    })).toMatchObject({ ok: true });
+    expect(validatePeerAuditPassEvidence('PASS', [], {
+      acceptedImplementerValidation: true,
+    })).toMatchObject({
+      ok: false,
+      error: PEER_AUDIT_REPLY_ERRORS.INSUFFICIENT_VALIDATION_EVIDENCE,
+    });
   });
   it('decoder rejects a static-only PASS as insufficient_validation_evidence', () => {
     expect(decodePeerAuditReplyEnvelope(validReply({ validations: [] }))).toMatchObject({ ok: false, error: PEER_AUDIT_REPLY_ERRORS.INSUFFICIENT_VALIDATION_EVIDENCE });

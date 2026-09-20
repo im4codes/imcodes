@@ -152,6 +152,37 @@ describe('peer-audit reply authority pipeline', () => {
     expect(reduce.mock.calls[0]?.[0]).not.toHaveProperty('replyCapability');
   });
 
+  it('accepts only a daemon-authorized exact-attempt report and preserves legacy unavailable-only PASS', () => {
+    const acceptedReport = {
+      ...envelope,
+      validations: [{
+        kind: 'accepted_implementer_validation' as const,
+        label: 'daemon-held exact attempt report',
+        outcome: 'passed' as const,
+        summary: 'focused suite passed',
+      }],
+    };
+    expect(evaluate({ envelope: acceptedReport }).result).toEqual({
+      ok: false, error: 'insufficient_validation_evidence', internalReason: 'evidence_rejected',
+    });
+    expect(evaluate({
+      envelope: acceptedReport,
+      authority: { ...authority, acceptedImplementerValidation: true },
+    }).result).toEqual({ ok: true, value: 'reduced', internalReason: 'accepted' });
+
+    expect(evaluate({
+      envelope: {
+        ...envelope,
+        validations: [{
+          kind: 'environment', label: 'device unavailable', outcome: 'unavailable', summary: 'no authorized device',
+        }],
+      },
+    }).result).toEqual({ ok: true, value: 'reduced', internalReason: 'accepted' });
+    expect(evaluate({ envelope: { ...envelope, validations: [] } }).result).toEqual({
+      ok: false, error: 'insufficient_validation_evidence', internalReason: 'evidence_rejected',
+    });
+  });
+
   it('keeps invalid evidence non-terminal so a later valid reply can complete the same attempt', () => {
     const controller = new PeerAuditController('deck_proj_brain');
     const start: PeerAuditStartInput = {

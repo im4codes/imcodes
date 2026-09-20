@@ -245,6 +245,7 @@ function makeReadyTask(options: {
       intent,
       toStatus,
       ...(validationState ? { validationState } : {}),
+      ...(validationState ? { note: 'focused unit: passed; typecheck: passed' } : {}),
     })).toMatchObject({ ok: true });
   }
   const bundleRoot = mkdtempSync(join(tmpdir(), 'imcodes-auto-audit-bundle-'));
@@ -1603,6 +1604,11 @@ describe('automatic supervision audit materialization', () => {
       });
       expect(input.message).toContain('Authoritative immutable integration bundle: /tmp/authoritative-auto-audit/repo');
       expect(input.message).toContain('Do not inspect the auditor worktree');
+      expect(input.message).toContain('Exact-revision implementer validation report:');
+      expect(input.message).toContain('accept the implementer report after binding/coherence review and run no tests');
+      expect(input.message).toContain('one test file or a few named tests, or one mutant');
+      expect(input.message).toContain('--maxWorkers<=2');
+      expect(input.message).toContain('Never run a full test project, full build, coverage, or e2e');
       const created = registry.createAssignment({
         taskId,
         role: 'auditor',

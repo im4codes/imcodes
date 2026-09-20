@@ -94,7 +94,10 @@ export function parsePeerAuditOrchestratedResult(text: string): PeerAuditVerdict
   return matches[0]?.[1] === 'PASS' ? 'PASS' : matches[0]?.[1] === 'REWORK' ? 'REWORK' : null;
 }
 
-export const PEER_AUDIT_VALIDATION_KINDS = ['test', 'typecheck', 'lint', 'build', 'tool', 'device', 'environment'] as const;
+export const PEER_AUDIT_VALIDATION_KINDS = [
+  'test', 'typecheck', 'lint', 'build', 'tool', 'device', 'environment',
+  'accepted_implementer_validation',
+] as const;
 export type PeerAuditValidationKind = (typeof PEER_AUDIT_VALIDATION_KINDS)[number];
 export function isPeerAuditValidationKind(v: unknown): v is PeerAuditValidationKind {
   return typeof v === 'string' && (PEER_AUDIT_VALIDATION_KINDS as readonly string[]).includes(v);
@@ -598,20 +601,33 @@ export function parsePeerAuditValidationList(raw: unknown): PeerAuditParse<PeerA
 }
 
 /**
- * Evidence-shape policy (NOT truthfulness): a PASS verdict must carry evidence —
- * at least one `passed` item, OR (when nothing executable could run) all items
- * `unavailable`. An empty or static-only PASS is `insufficient_validation_evidence`.
- * REWORK has no evidence requirement.
+ * Evidence-shape policy (NOT truthfulness): a PASS verdict must carry evidence.
+ * The daemon may authorize `accepted_implementer_validation` only after it has
+ * bound the report to this exact task/source assignment/revision. This keeps a
+ * caller-supplied claim from manufacturing authority while allowing auditors
+ * to record the normal code + submitted-report path without rerunning tests.
  */
 export function validatePeerAuditPassEvidence(
   verdict: PeerAuditVerdict | undefined,
   validations: readonly PeerAuditValidationItem[],
+  context: {
+    acceptedImplementerValidation?: boolean;
+    /** Legacy task-less session audits historically allow a fully explained unavailable-only PASS. */
+    allowUnavailableOnly?: boolean;
+  } = {},
 ): PeerAuditParse<true> {
   if (verdict !== 'PASS') return { ok: true, value: true };
   if (validations.length === 0) return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INSUFFICIENT_VALIDATION_EVIDENCE };
-  const hasPassed = validations.some((v) => v.outcome === 'passed');
-  const allUnavailable = validations.every((v) => v.outcome === 'unavailable');
-  if (!hasPassed && !allUnavailable) return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INSUFFICIENT_VALIDATION_EVIDENCE };
+  const hasPassed = validations.some((v) => v.outcome === 'passed' && (
+    v.kind !== 'accepted_implementer_validation'
+    || context.acceptedImplementerValidation === true
+  ));
+  const allowedUnavailableOnly = context.allowUnavailableOnly === true
+    && validations.length > 0
+    && validations.every((v) => v.outcome === 'unavailable');
+  if (!hasPassed && !allowedUnavailableOnly) {
+    return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INSUFFICIENT_VALIDATION_EVIDENCE };
+  }
   return { ok: true, value: true };
 }
 
