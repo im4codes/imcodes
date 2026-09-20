@@ -2105,6 +2105,20 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       .toBe('true');
   });
 
+  it('keeps a hand-set zoom when the stage resizes, as the phone keyboard makes it', async () => {
+    const { getByLabelText, getByRole, container } = await renderPanel();
+    act(() => { (getByLabelText('remote_desktop.zoom_in') as HTMLButtonElement).click(); });
+    expect(getByLabelText('remote_desktop.zoom_reset').textContent).toBe('150%');
+
+    // The keyboard shortens the stage, which is a resize like any other.
+    act(() => { (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });
+    act(() => { window.dispatchEvent(new Event('resize')); });
+    act(() => { (getByRole('button', { name: 'remote_desktop.expand_toolbar' }) as HTMLButtonElement).click(); });
+    expect(getByLabelText('remote_desktop.zoom_reset').textContent).toBe('150%');
+    const video = container.querySelector('.remote-desktop-stage video') as HTMLVideoElement;
+    expect(video.style.transform).toContain('scale(1.5)');
+  });
+
   it('remembers a new zoom ratio for this machine once it settles, without saving on every intermediate change', async () => {
     vi.useFakeTimers();
     const { getByLabelText } = await renderPanel();

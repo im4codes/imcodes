@@ -597,6 +597,15 @@ export function RemoteDesktopPanel({
   // (mount-time) run -- only real, later display/mode changes should reset
   // it back to the plain default.
   const hasResetViewportOnMountRef = useRef(false);
+  /**
+   * What a viewport reset is actually FOR: another display, another view mode,
+   * another input mode, a new layout. Re-running on geometry alone (this
+   * effect also watches the stage's size) threw away a hand-set zoom whenever
+   * the stage resized -- opening the phone keyboard, collapsing the toolbar,
+   * rotating -- which is exactly what "the keyboard must not change the zoom"
+   * is about.
+   */
+  const viewportResetKeyRef = useRef<string | null>(null);
   const virtualMouseRef = useRef<TouchPoint>({ x: 0, y: 0 });
   const virtualMouseDragRef = useRef<VirtualMouseDrag | null>(null);
   const virtualMouseEdgePointRef = useRef<TouchPoint | null>(null);
@@ -1210,11 +1219,21 @@ export function RemoteDesktopPanel({
     // real, later display/mode change that should reset to the default.
     const isMountRun = !hasResetViewportOnMountRef.current;
     if (display) hasResetViewportOnMountRef.current = true;
+    const resetKey = [
+      snapshot.selectedDisplayId ?? '',
+      snapshot.layoutRevision,
+      viewScale,
+      mobileInputMode,
+    ].join('|');
+    const resetTrigger = viewportResetKeyRef.current !== null
+      && viewportResetKeyRef.current !== resetKey;
+    viewportResetKeyRef.current = resetKey;
     const nextViewport = mobileInputMode === 'mouse' && geometry && display
       ? remoteDesktopMouseModeViewport(display, geometry)
       // Mount already seeded viewportRef with any remembered scale for this
-      // machine; only a later, real display/mode change resets to default.
-      : isMountRun ? viewportRef.current : INITIAL_REMOTE_DESKTOP_VIEWPORT;
+      // machine; only a later, real display/mode change resets to default --
+      // a resize keeps whatever zoom and pan the person set.
+      : isMountRun || !resetTrigger ? viewportRef.current : INITIAL_REMOTE_DESKTOP_VIEWPORT;
     viewportRef.current = nextViewport;
     setViewport(nextViewport);
     if (stage) {
