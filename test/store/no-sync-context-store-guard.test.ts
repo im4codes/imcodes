@@ -20,8 +20,8 @@ describe('context-store exact-path import guard', () => {
   it('no daemon production module imports memory-search.js outside the centralized facades', () => {
     expect(findSyncMemorySearchViolations()).toEqual([]);
     expect([...MEMORY_SEARCH_IMPORTERS].sort()).toEqual([
+      'cli.ts',
       'context/memory-recall-client.ts',
-      'index.ts',
     ]);
   });
 
@@ -38,11 +38,11 @@ describe('context-store exact-path import guard', () => {
     // (`timeline-emitter` recordTurnUsage), and (c) the CLI. Tests live in
     // `test/` and are not scanned.
     expect([...PERMANENT_IMPORTERS].sort()).toEqual([
+      'cli.ts',
       'context/memory-recall-bounded.ts',
       'context/memory-recall-core.ts',
       'context/memory-search.ts',
       'daemon/timeline-emitter.ts',
-      'index.ts',
       'store/context-store-op-handlers.ts',
       'store/context-store-worker.ts',
     ]);

@@ -2,7 +2,7 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Command } from 'commander';
-import { createProgram } from '../../src/index.js';
+import { createProgram } from '../../src/cli.js';
 import { PROJECT_ROOT } from '../../src/util/project-root.js';
 
 const { setupFlowMock } = vi.hoisted(() => ({ setupFlowMock: vi.fn(async () => {}) }));

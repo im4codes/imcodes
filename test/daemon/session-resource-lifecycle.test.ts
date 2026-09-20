@@ -57,6 +57,35 @@ describe('session resource lifecycle', () => {
     expect(cleanup.mock.calls.map(([record]) => record.resourceId).sort()).toEqual(['browser:old', 'mcp:gone']);
   });
 
+  it('age-gates known stopped owners but fail-safe preserves unknown remote owners', async () => {
+    let now = 1_000;
+    const directory = await mkdtemp(join(tmpdir(), 'imcodes-resource-ledger-'));
+    roots.push(directory);
+    const cleanup = vi.fn<SessionResourceCleanup>(async () => {});
+    const registry = new SessionResourceRegistry({ directory, now: () => now, cleanup });
+    const stoppedOwner = owner('stopped-instance');
+    const remoteOwner = {
+      sessionName: 'deck_remote_live',
+      sessionInstanceId: 'remote-instance',
+      runtimeEpoch: 'remote-epoch',
+    };
+    await registry.register({ resourceId: 'mcp:stopped', kind: 'mcp', owner: stoppedOwner, handle: { type: 'pid', pid: 301 } });
+    await registry.register({ resourceId: 'mcp:remote', kind: 'mcp', owner: remoteOwner, handle: { type: 'pid', pid: 302 } });
+
+    expect(await registry.sweepOrphans([], {
+      eligibleOwners: [stoppedOwner],
+      minimumAgeMs: 60_000,
+    })).toMatchObject({ released: 0, preserved: 2 });
+
+    now += 60_001;
+    expect(await registry.sweepOrphans([], {
+      eligibleOwners: [stoppedOwner],
+      minimumAgeMs: 60_000,
+    })).toMatchObject({ released: 1, preserved: 1, failed: 0 });
+    expect((await registry.list()).map((record) => record.resourceId)).toEqual(['mcp:remote']);
+    expect(cleanup).toHaveBeenCalledWith(expect.objectContaining({ resourceId: 'mcp:stopped' }), 'orphaned');
+  });
+
   it('rebinds the same logical tmux pane to a successor epoch without permitting owner reuse', async () => {
     const { registry } = await fixture();
     const prior = owner();

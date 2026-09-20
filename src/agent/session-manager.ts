@@ -482,7 +482,12 @@ export async function initOnStartup(): Promise<void> {
       if (record.runtimeType === RUNTIME_TYPES.TRANSPORT) continue;
       if (await sessionExists(record.name)) activeProcessOwners.push(record);
     }
-    const swept = await initializeSessionResourceLifecycle(activeProcessOwners);
+    const swept = await initializeSessionResourceLifecycle(activeProcessOwners, {
+      // initOnStartup runs only after loadStore. Passing this provider is an
+      // explicit daemon-only opt-in; controlled-node callers use the shared
+      // default sweep without any local-store orphan authority.
+      listSessionsForOrphanSweep: () => storeSessions(),
+    });
     logger.info({ ...swept }, 'Session resource orphan sweep completed');
   } catch (err) {
     logger.warn({ err }, 'Session resource orphan sweep failed — daemon continues');

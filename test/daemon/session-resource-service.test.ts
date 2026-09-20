@@ -1,5 +1,13 @@
-import { describe, expect, it, vi } from 'vitest';
-import { sweepMemoryMcpCpu } from '../../src/daemon/session-resource-service.js';
+import { spawn } from 'node:child_process';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  activeSessionResourceRecords,
+  registerMcpProcessResource,
+  releaseSessionResource,
+  startSessionResourceExpirySweep,
+  sweepMemoryMcpCpu,
+} from '../../src/daemon/session-resource-service.js';
+import type { SessionRecord } from '../../src/store/session-store.js';
 import type { SessionResourceRecord } from '../../src/daemon/session-resource-registry.js';
 import {
   MEMORY_MCP_WATCHDOG,
@@ -11,6 +19,15 @@ const owner = {
   sessionInstanceId: 'instance-a',
   runtimeEpoch: 'epoch-a',
 };
+
+const children: Array<ReturnType<typeof spawn>> = [];
+
+afterEach(() => {
+  vi.useRealTimers();
+  for (const child of children.splice(0)) {
+    try { child.kill('SIGKILL'); } catch { /* already exited */ }
+  }
+});
 
 function mcpRecord(resourceId: string): SessionResourceRecord {
   return {
@@ -90,5 +107,122 @@ describe('memory MCP watchdog process identity', () => {
     expect(reportSustainedCpu).toHaveBeenCalledWith(record, 1);
     expect(deps.releaseResource).not.toHaveBeenCalled();
     expect('restartOwner' in deps).toBe(false);
+  });
+
+  it('terminates a supervised backend spinner so its stable bootstrap can replace it', async () => {
+    const record = mcpRecord('mcp-backend:epoch-a:42');
+    let cpuMs = 0;
+    const deps = {
+      ...dependencies(record, true),
+      sampleCpuMillis: vi.fn().mockImplementation(async () => {
+        cpuMs += 1_000;
+        return cpuMs;
+      }),
+      reportSustainedCpu: vi.fn(),
+    };
+
+    for (let sample = 0; sample <= MEMORY_MCP_WATCHDOG.CPU_STRIKE_LIMIT; sample += 1) {
+      await sweepMemoryMcpCpu(50_000 + sample * 1_000, deps);
+    }
+
+    expect(deps.releaseResource).toHaveBeenCalledOnce();
+    expect(deps.releaseResource).toHaveBeenCalledWith(
+      record.resourceId,
+      owner,
+      SESSION_RESOURCE_RELEASE_REASON.SUSTAINED_CPU,
+    );
+    expect(deps.reportSustainedCpu).not.toHaveBeenCalled();
+  });
+});
+
+function session(name: string, state: SessionRecord['state']): SessionRecord {
+  return {
+    name,
+    projectName: 'resource-project',
+    role: 'w1',
+    agentType: 'codex-sdk',
+    projectDir: '/tmp/resource-project',
+    state,
+    restarts: 0,
+    restartTimestamps: [],
+    createdAt: 1,
+    updatedAt: 1,
+    sessionInstanceId: `instance-${name}`,
+    runtimeEpoch: `epoch-${name}`,
+  };
+}
+
+describe('periodic session resource orphan sweep', () => {
+  it('keeps every live query state but excludes stopped/error owners', async () => {
+    const records = [
+      session('running', 'running'),
+      session('idle', 'idle'),
+      session('stopped', 'stopped'),
+      session('error', 'error'),
+    ];
+    expect(activeSessionResourceRecords(records).map((record) => record.name)).toEqual(['running', 'idle']);
+
+    vi.useFakeTimers();
+    const dependencies = {
+      sweepExpired: vi.fn().mockResolvedValue(undefined),
+      sweepCpu: vi.fn().mockResolvedValue(undefined),
+      orphanSweep: {
+        listSessions: vi.fn(() => records),
+        sweepOrphans: vi.fn().mockResolvedValue(undefined),
+      },
+    };
+    const stop = startSessionResourceExpirySweep(10, dependencies);
+    try {
+      await vi.advanceTimersByTimeAsync(10);
+      expect(dependencies.orphanSweep.sweepOrphans).toHaveBeenCalledOnce();
+      expect(dependencies.orphanSweep.sweepOrphans.mock.calls[0]?.[0].map((record: SessionRecord) => record.name))
+        .toEqual(['running', 'idle', 'stopped', 'error']);
+    } finally {
+      stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not grant orphan authority to the shared default used by controlled nodes', async () => {
+    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30_000)'], { stdio: 'ignore' });
+    children.push(child);
+    if (!child.pid) throw new Error('child pid unavailable');
+    const resourceId = await registerMcpProcessResource(owner, child.pid, false, 'computer-use-mcp');
+    const stop = startSessionResourceExpirySweep(10);
+    try {
+      // Leave enough time for the old shared default to lazy-import the empty
+      // session store and run its destructive orphan pass. The fixed default
+      // never imports or consults that store at all.
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      expect(() => process.kill(child.pid!, 0)).not.toThrow();
+    } finally {
+      stop();
+      try { child.kill('SIGKILL'); } catch { /* already exited */ }
+      await releaseSessionResource(resourceId, owner).catch(() => {});
+    }
+  });
+
+  it('preserves every owner when the daemon provider throws and still runs the other passes', async () => {
+    vi.useFakeTimers();
+    const reportError = vi.fn();
+    const dependencies = {
+      sweepExpired: vi.fn().mockResolvedValue(undefined),
+      sweepCpu: vi.fn().mockResolvedValue(undefined),
+      orphanSweep: {
+        listSessions: vi.fn().mockRejectedValue(new Error('store unavailable')),
+        sweepOrphans: vi.fn().mockResolvedValue(undefined),
+      },
+      reportError,
+    };
+    const stop = startSessionResourceExpirySweep(10, dependencies);
+    try {
+      await vi.advanceTimersByTimeAsync(10);
+      expect(dependencies.sweepExpired).toHaveBeenCalledOnce();
+      expect(dependencies.orphanSweep.sweepOrphans).not.toHaveBeenCalled();
+      expect(dependencies.sweepCpu).toHaveBeenCalledOnce();
+      expect(reportError).toHaveBeenCalledWith('orphan', expect.any(Error));
+    } finally {
+      stop();
+    }
   });
 });

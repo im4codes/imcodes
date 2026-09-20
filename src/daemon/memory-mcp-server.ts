@@ -1,7 +1,8 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { createIdempotentShutdown, installMcpStdioLifecycle,
-  IMCODES_MCP_PARENT_PID_ENV, MCP_PROCESS_START_PARENT_PID } from './mcp-stdio-lifecycle.js';
+  IMCODES_MCP_PARENT_PID_ENV, IMCODES_MEMORY_MCP_BACKEND_ENV,
+  MCP_PROCESS_START_PARENT_PID } from './mcp-stdio-lifecycle.js';
 import http from 'http';
 import { HookAuthorityUnavailableError, resolveHookAuthority, resolveLiveHookPort } from './hook-port.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
@@ -760,7 +761,12 @@ export async function runMemoryMcpServer(options: MemoryMcpServerOptions = {}): 
     });
     const server = createMemoryMcpServerFromEnv({ ...options, resourceGuard: guard });
     const owner = sessionResourceOwnerFromEnv(env as NodeJS.ProcessEnv);
-    const resourceId = owner ? await registerMcpProcessResource(owner) : null;
+    // Supervised backends are safe for the CPU watchdog to terminate: the
+    // lightweight parent preserves stdio and starts a clean generation. Keep
+    // legacy direct generations distinguishable so rollout never kills a
+    // transport that has no reconnect owner.
+    const resourcePrefix = env[IMCODES_MEMORY_MCP_BACKEND_ENV] === '1' ? 'mcp-backend' : 'mcp';
+    const resourceId = owner ? await registerMcpProcessResource(owner, process.pid, false, resourcePrefix) : null;
     let previousCpu = process.cpuUsage();
     let previousWall = Date.now();
     const cpuTimer = setInterval(() => {

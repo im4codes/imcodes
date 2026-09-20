@@ -54,6 +54,9 @@ export const MCP_PROCESS_START_PARENT_PID = process.ppid;
  */
 export const IMCODES_MCP_PARENT_PID_ENV = 'IMCODES_MCP_PARENT_PID';
 
+/** Private marker used by the lightweight stdio supervisor for its worker. */
+export const IMCODES_MEMORY_MCP_BACKEND_ENV = 'IMCODES_MEMORY_MCP_BACKEND';
+
 /** Minimal surface of the stream this module listens on, so tests can fake it. */
 export interface McpStdioLifecycleStream {
   on(event: 'end' | 'close', listener: () => void): unknown;

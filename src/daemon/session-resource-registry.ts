@@ -68,6 +68,18 @@ export interface OrphanSweepSummary extends ReleaseSummary {
   preserved: number;
 }
 
+export interface OrphanSweepOptions {
+  /**
+   * When supplied, only owners known to this process are eligible for orphan
+   * cleanup. This is what keeps a controlled node from treating a remote
+   * daemon session as a locally-dead owner merely because it is absent from
+   * the node's session store.
+   */
+  eligibleOwners?: readonly SessionResourceOwner[];
+  /** Newly-created resources are never destructive cleanup evidence. */
+  minimumAgeMs?: number;
+}
+
 function boundedString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0 && Buffer.byteLength(value, 'utf8') <= FIELD_LIMIT;
 }
@@ -529,19 +541,39 @@ export class SessionResourceRegistry {
     });
   }
 
-  async sweepOrphans(activeOwners: readonly SessionResourceOwner[]): Promise<OrphanSweepSummary> {
+  async sweepOrphans(
+    activeOwners: readonly SessionResourceOwner[],
+    options: OrphanSweepOptions = {},
+  ): Promise<OrphanSweepSummary> {
     if (!activeOwners.every(validOwner)) throw new Error('invalid_session_resource_owner');
+    if (options.eligibleOwners && !options.eligibleOwners.every(validOwner)) {
+      throw new Error('invalid_session_resource_owner');
+    }
+    const minimumAgeMs = options.minimumAgeMs ?? 0;
+    if (!Number.isSafeInteger(minimumAgeMs) || minimumAgeMs < 0) {
+      throw new Error('invalid_session_resource_orphan_grace');
+    }
     return this.serialized(async () => {
       const active = new Set(activeOwners.map(ownerKey));
+      const eligible = options.eligibleOwners
+        ? new Set(options.eligibleOwners.map(ownerKey))
+        : null;
       const records = await this.listUnlocked();
       const invalidPidResources = new Set((await Promise.all(records.map(async (record) => {
         if (record.handle.type !== SESSION_RESOURCE_HANDLE_TYPE.PID || !record.handle.processStart) return null;
-        const currentStart = await readProcessStart(record.handle.pid);
-        return currentStart === record.handle.processStart ? null : record.resourceId;
+        // A sampler/permission failure while the PID is still visible is
+        // uncertainty, not proof of reuse or exit. Only an exact false result
+        // may authorize destructive orphan cleanup.
+        const current = await sessionResourcePidHandleIsCurrent(record.handle);
+        return current === false ? record.resourceId : null;
       }))).filter((resourceId): resourceId is string => resourceId !== null));
-      const orphans = records.filter((record) => (
-        !active.has(ownerKey(record.owner)) || invalidPidResources.has(record.resourceId)
-      ));
+      const now = this.now();
+      const orphans = records.filter((record) => {
+        const key = ownerKey(record.owner);
+        if (eligible && !eligible.has(key)) return false;
+        if (now - record.createdAt < minimumAgeMs) return false;
+        return !active.has(key) || invalidPidResources.has(record.resourceId);
+      });
       const result = await this.releaseRecords(orphans, SESSION_RESOURCE_RELEASE_REASON.ORPHANED);
       return { ...result, preserved: records.length - orphans.length };
     });

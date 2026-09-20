@@ -48,7 +48,7 @@ export const PERMANENT_IMPORTERS = [
   // limited exception (design Decision 5).
   'daemon/timeline-emitter.ts',
   // ── Non-daemon CLI ──
-  'index.ts', // short-lived memory commands; worker spawn not warranted
+  'cli.ts', // short-lived memory commands; worker spawn not warranted
 ];
 
 // STRICT END STATE REACHED: every daemon CALLER module now reaches the store
@@ -60,7 +60,7 @@ const ALLOWED = new Set([...PERMANENT_IMPORTERS, ...TRANSITION_IMPORTERS]);
 
 export const MEMORY_SEARCH_IMPORTERS = [
   'context/memory-recall-client.ts', // centralized R1/R5 facade owns the cold fallback
-  'index.ts', // short-lived CLI memory commands
+  'cli.ts', // short-lived CLI memory commands
 ];
 const MEMORY_SEARCH_ALLOWED = new Set(MEMORY_SEARCH_IMPORTERS);
 

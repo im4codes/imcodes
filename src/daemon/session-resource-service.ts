@@ -179,8 +179,21 @@ export async function releaseSessionChildResources(record: SessionRecord): Promi
 }
 
 export async function sweepOrphanedSessionResources(records: readonly SessionRecord[]): Promise<OrphanSweepSummary> {
-  const owners = records.map(sessionResourceOwner).filter((owner): owner is SessionResourceOwner => owner !== null);
-  return registry.sweepOrphans(owners);
+  // The durable local session store is the authority boundary for destructive
+  // cleanup. An unknown owner may be a live remote session whose resource was
+  // registered by a controlled-node process, so age alone cannot prove it is
+  // orphaned. Preserve unknown owners; explicit session shutdown/restart owns
+  // their normal cleanup path.
+  const eligibleOwners = records
+    .map(sessionResourceOwner)
+    .filter((owner): owner is SessionResourceOwner => owner !== null);
+  const activeOwners = activeSessionResourceRecords(records)
+    .map(sessionResourceOwner)
+    .filter((owner): owner is SessionResourceOwner => owner !== null);
+  return registry.sweepOrphans(activeOwners, {
+    eligibleOwners,
+    minimumAgeMs: SESSION_RESOURCE_DEFAULTS.ORPHAN_GRACE_MS,
+  });
 }
 
 async function sampleProcessCpuMillis(pid: number): Promise<number | null> {
@@ -273,10 +286,23 @@ export async function sweepMemoryMcpCpu(
       cpuMs, sampledAt: now, strikes, pressureReported,
     });
     if (pressureReported && !previous.pressureReported) {
-      // A live stdio MCP generation is owned by its host. Releasing this PID
-      // resource terminates the child but cannot reconnect the living host,
-      // permanently stranding that thread on a closed transport/catalog.
-      dependencies.reportSustainedCpu?.(record, cpuRatio);
+      if (record.resourceId.startsWith('mcp-backend:')) {
+        // The stable bootstrap owns this generation and will replace it while
+        // keeping the SDK's stdio transport/catalog alive. This is the first
+        // safe point at which the observed CPU spinner can be terminated
+        // rather than logged forever.
+        await dependencies.releaseResource(
+          record.resourceId,
+          record.owner,
+          SESSION_RESOURCE_RELEASE_REASON.SUSTAINED_CPU,
+        );
+        mcpCpuSamples.delete(record.resourceId);
+      } else {
+        // Rollout compatibility: a legacy direct stdio generation has no
+        // supervisor to reconnect its host, so terminating it would strand the
+        // session. Report but preserve only that old shape.
+        dependencies.reportSustainedCpu?.(record, cpuRatio);
+      }
     }
   }
   for (const resourceId of mcpCpuSamples.keys()) {
@@ -284,12 +310,62 @@ export async function sweepMemoryMcpCpu(
   }
 }
 
-export function startSessionResourceExpirySweep(intervalMs = MEMORY_MCP_WATCHDOG.SAMPLE_INTERVAL_MS): () => void {
+interface SessionResourceSweepDependencies {
+  sweepExpired: () => Promise<unknown>;
+  sweepCpu: () => Promise<unknown>;
+  orphanSweep?: {
+    listSessions: () => SessionRecord[] | Promise<SessionRecord[]>;
+    sweepOrphans: (records: readonly SessionRecord[]) => Promise<unknown>;
+  };
+  reportError?: (pass: 'expired' | 'orphan' | 'cpu', error: unknown) => void;
+}
+
+const sessionResourceSweepDependencies: SessionResourceSweepDependencies = {
+  sweepExpired: () => registry.sweepExpired(),
+  sweepCpu: sweepMemoryMcpCpu,
+  reportError: (pass, error) => {
+    process.stderr.write(`[session-resource] ${pass} sweep failed; preserving resources: ${error instanceof Error ? error.message : String(error)}\n`);
+  },
+};
+
+export function activeSessionResourceRecords(records: readonly SessionRecord[]): SessionRecord[] {
+  return records.filter((record) => record.state !== 'stopped' && record.state !== 'error');
+}
+
+export function startSessionResourceExpirySweep(
+  intervalMs = MEMORY_MCP_WATCHDOG.SAMPLE_INTERVAL_MS,
+  dependencies: SessionResourceSweepDependencies = sessionResourceSweepDependencies,
+): () => void {
   let running = false;
   const timer = setInterval(() => {
     if (running) return;
     running = true;
-    void Promise.allSettled([registry.sweepExpired(), sweepMemoryMcpCpu()])
+    // Keep destructive passes ordered. A failure in one pass is fail-soft and
+    // must never suppress the remaining maintenance work.
+    void (async () => {
+      try {
+        await dependencies.sweepExpired();
+      } catch (error) {
+        dependencies.reportError?.('expired', error);
+      }
+      if (dependencies.orphanSweep) {
+        try {
+          // Only a daemon-owned, already-loaded session store is authority for
+          // this pass. Shared/node callers omit orphanSweep entirely.
+          const records = await dependencies.orphanSweep.listSessions();
+          await dependencies.orphanSweep.sweepOrphans(records);
+        } catch (error) {
+          // An unavailable/unloaded store is uncertainty, never evidence that
+          // all owners died. Preserve every resource and continue the tick.
+          dependencies.reportError?.('orphan', error);
+        }
+      }
+      try {
+        await dependencies.sweepCpu();
+      } catch (error) {
+        dependencies.reportError?.('cpu', error);
+      }
+    })()
       .finally(() => { running = false; });
   }, intervalMs);
   timer.unref?.();
@@ -298,8 +374,18 @@ export function startSessionResourceExpirySweep(intervalMs = MEMORY_MCP_WATCHDOG
 
 export async function initializeSessionResourceLifecycle(
   records: readonly SessionRecord[],
+  options: {
+    listSessionsForOrphanSweep?: () => SessionRecord[] | Promise<SessionRecord[]>;
+  } = {},
 ): Promise<OrphanSweepSummary> {
-  const swept = await sweepOrphanedSessionResources(records);
+  let swept: OrphanSweepSummary = { released: 0, preserved: 0, failed: 0 };
+  if (options.listSessionsForOrphanSweep) {
+    try {
+      swept = await sweepOrphanedSessionResources(await options.listSessionsForOrphanSweep());
+    } catch (error) {
+      sessionResourceSweepDependencies.reportError?.('orphan', error);
+    }
+  }
   const registrationErrors: unknown[] = [];
   for (const record of records) {
     if (record.runtimeType === 'transport') continue;
@@ -320,7 +406,18 @@ export async function initializeSessionResourceLifecycle(
     }
   }
   stopExpirySweep?.();
-  stopExpirySweep = startSessionResourceExpirySweep();
+  stopExpirySweep = startSessionResourceExpirySweep(
+    MEMORY_MCP_WATCHDOG.SAMPLE_INTERVAL_MS,
+    options.listSessionsForOrphanSweep
+      ? {
+        ...sessionResourceSweepDependencies,
+        orphanSweep: {
+          listSessions: options.listSessionsForOrphanSweep,
+          sweepOrphans: sweepOrphanedSessionResources,
+        },
+      }
+      : sessionResourceSweepDependencies,
+  );
   if (registrationErrors.length > 0) {
     throw new AggregateError(registrationErrors, 'session_resource_startup_registration_failed');
   }
