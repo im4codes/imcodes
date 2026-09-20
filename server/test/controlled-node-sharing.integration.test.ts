@@ -30,11 +30,6 @@ import {
   SHARED_MACHINE_AUTHORITY_TYPE,
 } from '../../shared/shared-machine-authority.js';
 import { MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
-import {
-  DELEGATION_AUTHORITY_MCP_SERVER,
-  projectDelegationClaim,
-  readMachineControlDispatchFact,
-} from '../../shared/delegation-claim.js';
 import { createDaemonMachineToolDeps } from '../../src/daemon/machine-mcp-deps.js';
 import { listMachines as daemonListMachines } from '../../src/daemon/machine-exec-client.js';
 import { registerMemoryMcpTools } from '../../src/daemon/memory-mcp-tools.js';
@@ -511,20 +506,6 @@ describe('controlled-node shared action admission', () => {
       status: 'ok', outcome: 'completed', result: { ok: true, content: [{ text: 'local-ok' }] },
     });
     expect(localComputerUse).toHaveBeenCalledTimes(1);
-    const dispatchFact = readMachineControlDispatchFact(
-      DELEGATION_AUTHORITY_MCP_SERVER,
-      MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
-      { machine: 'local', tool: 'list_apps' },
-      localResult.structuredContent,
-      'participant-local-call',
-    );
-    expect(projectDelegationClaim(dispatchFact ? [dispatchFact] : [])).toEqual({
-      status: 'substantiated',
-      dispatches: [expect.objectContaining({
-        dispatchId: 'participant-local-call', machine: 'local', tool: 'computer_use_call',
-      })],
-    });
-
     const targetSocket = new CaptureDaemonSocket((message) => {
       if (message.type !== FILE_TRANSFER_MSG.PATH_HANDLE) return;
       queueMicrotask(() => targetSocket.emit('message', Buffer.from(JSON.stringify({

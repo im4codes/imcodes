@@ -7,11 +7,10 @@
  * dispatched work only when the projection carries real dispatch facts, and
  * the rendered summary is bound to the exact authority ids those facts state.
  *
- * Three outcomes, and no fourth:
+ * Two outcomes, and no third:
  *   - no projection            → render nothing at all (older daemons, non-SDK
- *                                runtimes, streaming events)
- *   - zero dispatch facts      → one neutral, factual indicator
- *   - one or more facts        → the count plus each dispatch's own ids
+ *                                runtimes, streaming events, machine control)
+ *   - one or more task facts   → the count plus each dispatch's own ids
  */
 
 import { useTranslation } from 'react-i18next';
@@ -105,22 +104,12 @@ export function DelegationClaimBadge({ metadata, liveAssignmentStatuses, message
   const claim = readDelegationClaim(metadata);
   if (!claim) return null;
 
-  // Authority comes from the facts, not from the label on them. A projection
-  // that claims `substantiated` while carrying zero dispatch facts states
-  // nothing a user could act on, so it is presented as no authority.
+  // Authority comes from task facts, not from the label on them. The shared
+  // reader already rejects empty, malformed and legacy machine-control-only
+  // projections, so there is no neutral or OCU badge to render here.
   const dispatches = Array.isArray(claim.dispatches) ? claim.dispatches : [];
   const substantiated = claim.status === 'substantiated' && dispatches.length > 0;
-
-  if (!substantiated) {
-    return (
-      <div
-        class="delegation-claim delegation-claim-unsubstantiated"
-        data-delegation-claim="unsubstantiated"
-      >
-        {t('delegation.claim.none', 'No authorized dispatch in this turn')}
-      </div>
-    );
-  }
+  if (!substantiated) return null;
 
   return (
     <div
@@ -158,13 +147,6 @@ export function DelegationClaimBadge({ metadata, liveAssignmentStatuses, message
             data-delegation-dispatch={dispatch.dispatchId}
             {...(assignmentStatus ? { 'data-assignment-status': assignmentStatus } : {})}
           >
-            {dispatch.kind === 'machine-control' && dispatch.tool && dispatch.machine ? (
-              <span class="delegation-claim-execution" data-delegation-field="machineControl">
-                {t('delegation.claim.execution', 'Runs on')}
-                {': '}
-                <code>{dispatch.tool} · {dispatch.machine}</code>
-              </span>
-            ) : null}
             {execution ? (
               <span class="delegation-claim-execution" data-delegation-field="execution">
                 {t('delegation.claim.execution', 'Runs on')}

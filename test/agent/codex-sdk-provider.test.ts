@@ -7362,9 +7362,7 @@ describe('CodexSdkProvider', () => {
       const claim = readDelegationClaim(
         completions.find((m) => m.content === '\u5df2\u5206\u914d\u5b8c\u6bd5\u3002')?.metadata,
       );
-      expect(claim?.status, 'a cancelled turn must not substantiate the NEXT turn')
-        .toBe('unsubstantiated');
-      expect(claim?.dispatches).toEqual([]);
+      expect(claim, 'a cancelled turn must not substantiate the NEXT turn').toBeNull();
 
       // No residue on ANY public surface: every completion emitted from the
       // cancel onward must carry an empty dispatch list, not merely the one we
@@ -7399,9 +7397,7 @@ describe('CodexSdkProvider', () => {
       await waitForCondition(() => completions.some((m) => m.content === 'done'));
 
       const claim = readDelegationClaim(completions.find((m) => m.content === 'done')?.metadata);
-      expect(claim?.status, 'a failed/disconnected turn must not substantiate a later turn')
-        .toBe('unsubstantiated');
-      expect(claim?.dispatches).toEqual([]);
+      expect(claim, 'a failed/disconnected turn must not substantiate a later turn').toBeNull();
     });
 
     it('still substantiates the turn that actually dispatched (control)', async () => {
@@ -7448,7 +7444,7 @@ describe('CodexSdkProvider', () => {
       });
     };
 
-    it('marks a turn unsubstantiated when it dispatched nothing, whatever the prose says', async () => {
+    it('attaches no claim when a turn dispatched no formal task, whatever the prose says', async () => {
       // The exact field failure: a healthy catalog, zero authorized IM calls, and
       // a confident success sentence. The projection must carry no dispatch data,
       // so no consumer can render this as assigned/queued/recovered. The text
@@ -7468,9 +7464,7 @@ describe('CodexSdkProvider', () => {
       expect(completed?.content, 'legitimate assistant text must survive unchanged')
         .toBe('已分配 12 个子任务，已排队并已恢复。');
       const claim = readDelegationClaim(completed?.metadata);
-      expect(claim, 'every completed turn must carry an authority projection').not.toBeNull();
-      expect(claim?.status).toBe('unsubstantiated');
-      expect(claim?.dispatches, 'there must be no dispatch a UI could show').toEqual([]);
+      expect(claim, 'prose alone must not create badge metadata').toBeNull();
     });
 
     it('marks a turn substantiated and binds the exact authority ids after a real dispatch', async () => {
@@ -7507,7 +7501,7 @@ describe('CodexSdkProvider', () => {
       });
     });
 
-    it('marks a canonical controlled-device helper timeout as dispatched, not unauthorized', async () => {
+    it('does not project a controlled-device helper timeout into chat', async () => {
       const provider = createCodexProvider();
       const completions: AgentMessage[] = [];
       provider.onComplete((_sid, message) => completions.push(message));
@@ -7539,16 +7533,10 @@ describe('CodexSdkProvider', () => {
       completeTurn(child, 'The device helper timed out.');
       await waitForCondition(() => completions.length > 0);
 
-      expect(readDelegationClaim(completions.at(-1)?.metadata)).toMatchObject({
-        status: 'substantiated',
-        dispatches: [{
-          dispatchId: 'mcp-machine-1', kind: 'machine-control',
-          tool: 'computer_use_call', machine: '1472527657',
-        }],
-      });
+      expect(readDelegationClaim(completions.at(-1)?.metadata)).toBeNull();
     });
 
-    it('projects an authority-validated local Computer Use result into the completed turn', async () => {
+    it('projects only the task dispatch from a mixed task plus local OCU turn', async () => {
       const provider = createCodexProvider();
       const completions: AgentMessage[] = [];
       provider.onComplete((_sid, message) => completions.push(message));
@@ -7577,16 +7565,29 @@ describe('CodexSdkProvider', () => {
           },
         },
       });
+      child.emits({
+        method: 'item/completed',
+        params: {
+          threadId: 'thread-1', turnId: 'turn-1',
+          item: {
+            id: 'mcp-task-1', type: 'mcpToolCall', status: 'completed',
+            server: 'imcodes-memory', tool: 'send_message',
+            arguments: { task: { taskId: 'tsk_mixed', assignmentId: 'asg_mixed' }, message: 'go' },
+            result: { structuredContent: { ...acceptedDispatch, dispatchId: 'send_dispatch_mixed' } },
+          },
+        },
+      });
       completeTurn(child, 'The local device operation completed.');
       await waitForCondition(() => completions.length > 0);
 
-      expect(readDelegationClaim(completions.at(-1)?.metadata)).toMatchObject({
+      const claim = readDelegationClaim(completions.at(-1)?.metadata);
+      expect(claim).toMatchObject({
         status: 'substantiated',
         dispatches: [{
-          dispatchId: 'mcp-local-machine-1', kind: 'machine-control',
-          tool: 'computer_use_call', machine: 'local',
+          dispatchId: 'send_dispatch_mixed', taskId: 'tsk_mixed', assignmentId: 'asg_mixed',
         }],
       });
+      expect(claim?.dispatches).toHaveLength(1);
     });
 
     it('does not let a native collaboration send_message substantiate a claim', async () => {
@@ -7617,9 +7618,7 @@ describe('CodexSdkProvider', () => {
       await waitForCondition(() => completions.length > 0);
 
       const claim = readDelegationClaim(completions.at(-1)?.metadata);
-      expect(claim?.status, 'native collaboration is non-durable, not IM.codes authority')
-        .toBe('unsubstantiated');
-      expect(claim?.dispatches).toEqual([]);
+      expect(claim, 'native collaboration is non-durable, not IM.codes authority').toBeNull();
     });
 
     it('does not carry dispatch facts from a previous turn into the next one', async () => {
@@ -7662,9 +7661,7 @@ describe('CodexSdkProvider', () => {
       await waitForCondition(() => completions.length > 1);
 
       const second = readDelegationClaim(completions.at(-1)?.metadata);
-      expect(second?.status, 'a prior turn dispatch must not substantiate this one')
-        .toBe('unsubstantiated');
-      expect(second?.dispatches).toEqual([]);
+      expect(second, 'a prior turn dispatch must not substantiate this one').toBeNull();
     });
   });
 });

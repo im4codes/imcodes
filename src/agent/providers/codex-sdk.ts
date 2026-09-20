@@ -2,7 +2,6 @@ import { createHash } from 'node:crypto';
 import { capContextPreservingPriority, joinSpanned, type PriorityPreservingCapMarkers, type SpannedText } from '../priority-preserving-context-cap.js';
 import {
   readDelegationDispatchFact,
-  readMachineControlDispatchFact,
   projectDelegationClaim,
   DELEGATION_CLAIM_METADATA_FIELD,
   type DelegationDispatchFact,
@@ -5162,12 +5161,6 @@ export class CodexSdkProvider implements TransportProvider {
           item.tool,
           item.arguments,
           item.result?.structuredContent ?? item.result?.content,
-        ) ?? readMachineControlDispatchFact(
-          item.server,
-          item.tool,
-          item.arguments,
-          item.result?.structuredContent ?? item.result?.content,
-          item.id,
         );
         if (dispatchFact) {
           (state.turnDelegationDispatches ??= []).push(dispatchFact);
@@ -5453,11 +5446,11 @@ export class CodexSdkProvider implements TransportProvider {
         ...(usage ? { usage } : {}),
         ...(model ? { model } : {}),
         ...(resumeId ? { resumeId } : {}),
-        // Every completed turn states its delegation authority explicitly.
-        // With no dispatches this is `unsubstantiated` with an empty list, so a
-        // consumer has no data it could render as assigned/queued/recovered --
-        // the absence of authority is represented, not left for prose to imply.
-        [DELEGATION_CLAIM_METADATA_FIELD]: projectDelegationClaim(turnDelegationDispatches),
+        // Only formal task dispatches get a chat projection. Machine-control
+        // calls and prose-only claims leave no badge metadata at all.
+        ...(turnDelegationDispatches.length > 0
+          ? { [DELEGATION_CLAIM_METADATA_FIELD]: projectDelegationClaim(turnDelegationDispatches) }
+          : {}),
       },
     };
     for (const cb of this.completeCallbacks) cb(sessionId, completed);

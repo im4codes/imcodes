@@ -19,9 +19,7 @@ import {
   readSupervisionExecutionSummary,
   type SupervisionExecutionSummary,
 } from './supervision-execution-summary.js';
-import { isControlledNodeId } from './controlled-node-identity.js';
 import { readSupervisionTaskTitle } from './supervision-task-identity.js';
-import { isLocalComputerUseAlias } from './machine-reference.js';
 
 export const DELEGATION_AUTHORITY_MCP_SERVER = 'imcodes-memory';
 
@@ -32,10 +30,6 @@ export const DELEGATION_AUTHORITY_MCP_SERVER = 'imcodes-memory';
  * alone.
  */
 export const DELEGATION_DISPATCH_TOOLS = ['send_message'] as const;
-export const MACHINE_CONTROL_DISPATCH_TOOLS = [
-  'exec_remote',
-  'computer_use_call',
-] as const;
 
 /** Metadata field carrying the projection on a completed assistant message. */
 export const DELEGATION_CLAIM_METADATA_FIELD = 'delegationClaim';
@@ -64,8 +58,6 @@ export interface DelegationDeliveryFact {
 /** One authorized dispatch, bound to its exact authority ids. */
 export interface DelegationDispatchFact {
   dispatchId: string;
-  /** Absent on legacy supervision receipts. */
-  kind?: 'machine-control';
   /** Required: without both ids the dispatch cannot be checked against the registry. */
   taskId?: string;
   assignmentId?: string;
@@ -75,9 +67,6 @@ export interface DelegationDispatchFact {
    * legacy receipts, which render an explicit untitled placeholder.
    */
   taskTitle?: string;
-  /** Present for an authenticated controlled-device dispatch. */
-  tool?: (typeof MACHINE_CONTROL_DISPATCH_TOOLS)[number];
-  machine?: string;
   deliveries: DelegationDeliveryFact[];
 }
 
@@ -175,50 +164,23 @@ export const readDelegationDispatchFact = (
 };
 
 /**
- * Read a definitively dispatched controlled-device call from one completed MCP
- * item.  Pre-dispatch refusals and indeterminate outcomes are deliberately not
- * counted.  In particular, a `computer_use_helper_connect_timeout` is a
- * `tool_error` returned by the target after dispatch, whereas authorization,
- * expiry, Viewer, offline, and routing failures never reach this function's
- * positive outcome set.
+ * Revalidate persisted facts at the projection boundary. This keeps old
+ * machine-control facts and malformed future payloads out of both live and
+ * reloaded chat without relying on display text.
  */
-export const readMachineControlDispatchFact = (
-  server: unknown,
-  tool: unknown,
-  toolArguments: unknown,
-  structuredOutput: unknown,
-  toolCallId: unknown,
-): DelegationDispatchFact | null => {
-  if (asMeaningfulString(server) !== DELEGATION_AUTHORITY_MCP_SERVER) return null;
-  const toolName = asMeaningfulString(tool);
-  if (!toolName || !(MACHINE_CONTROL_DISPATCH_TOOLS as readonly string[]).includes(toolName)) return null;
-  const callId = asMeaningfulString(toolCallId);
-  const args = asRecord(toolArguments);
-  const machineInput = asMeaningfulString(args?.machine);
-  const markedNodeId = machineInput?.match(/^\^\^\(([1-9][0-9]{9})\)$/)?.[1];
-  const nodeId = isControlledNodeId(machineInput)
-    ? machineInput
-    : isControlledNodeId(markedNodeId) ? markedNodeId : null;
-  const machine = nodeId
-    ?? (toolName === 'computer_use_call' && isLocalComputerUseAlias(machineInput) ? 'local' : null);
-  // Only a canonical controlled-node identity or the shared local-host alias
-  // can substantiate this UI fact. Deprecated arbitrary aliases remain
-  // intentionally untrusted at this projection boundary.
-  if (!callId || !machine) return null;
-  const output = asRecord(structuredOutput);
-  if (!output || asMeaningfulString(output.status) !== 'ok') return null;
-  const outcome = asMeaningfulString(output.outcome);
-  const dispatched = toolName === 'exec_remote'
-    ? outcome === 'completed' || outcome === 'node_timeout' || outcome === 'spawn_error'
-    : (outcome === 'completed' || outcome === 'tool_error') && asRecord(output.result) !== null;
-  if (!dispatched) return null;
-  return {
-    dispatchId: callId,
-    kind: 'machine-control',
-    tool: toolName as (typeof MACHINE_CONTROL_DISPATCH_TOOLS)[number],
-    machine,
-    deliveries: [{ target: machine, status: 'delivered' }],
-  };
+const readPersistedDelegationDispatchFact = (value: unknown): DelegationDispatchFact | null => {
+  const record = asRecord(value);
+  // Formal task dispatch facts have no `kind`. Any tagged legacy/provider fact
+  // is a different fact family and must fail closed even if it happens to carry
+  // task-shaped fields as well.
+  if (!record || Object.prototype.hasOwnProperty.call(record, 'kind')) return null;
+  const dispatchId = asMeaningfulString(record.dispatchId);
+  const taskId = asMeaningfulString(record.taskId);
+  const assignmentId = asMeaningfulString(record.assignmentId);
+  const deliveries = readDeliveries({ deliveries: record.deliveries });
+  if (!dispatchId || !taskId || !assignmentId || deliveries.length === 0) return null;
+  const taskTitle = readSupervisionTaskTitle(record.taskTitle);
+  return { dispatchId, taskId, assignmentId, ...(taskTitle ? { taskTitle } : {}), deliveries };
 };
 
 /**
@@ -231,10 +193,15 @@ export const readMachineControlDispatchFact = (
  */
 export const projectDelegationClaim = (
   dispatches: readonly DelegationDispatchFact[],
-): DelegationClaimProjection => ({
-  status: dispatches.length > 0 ? 'substantiated' : 'unsubstantiated',
-  dispatches: [...dispatches],
-});
+): DelegationClaimProjection => {
+  const taskDispatches = dispatches
+    .map(readPersistedDelegationDispatchFact)
+    .filter((dispatch): dispatch is DelegationDispatchFact => dispatch !== null);
+  return {
+    status: taskDispatches.length > 0 ? 'substantiated' : 'unsubstantiated',
+    dispatches: taskDispatches,
+  };
+};
 
 /** Read a projection back off message metadata, if present and well-formed. */
 export const readDelegationClaim = (
@@ -244,6 +211,9 @@ export const readDelegationClaim = (
   if (!claim) return null;
   const status = asMeaningfulString(claim.status);
   if (status !== 'substantiated' && status !== 'unsubstantiated') return null;
-  const dispatches = Array.isArray(claim.dispatches) ? claim.dispatches : [];
-  return { status, dispatches: dispatches as DelegationDispatchFact[] };
+  if (status !== 'substantiated' || !Array.isArray(claim.dispatches)) return null;
+  const dispatches = claim.dispatches
+    .map(readPersistedDelegationDispatchFact)
+    .filter((dispatch): dispatch is DelegationDispatchFact => dispatch !== null);
+  return dispatches.length > 0 ? { status: 'substantiated', dispatches } : null;
 };

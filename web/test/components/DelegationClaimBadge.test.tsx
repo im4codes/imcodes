@@ -102,29 +102,16 @@ describe('DelegationClaimBadge', () => {
     expect(container.innerHTML).toBe('');
   });
 
-  it('renders a neutral indicator — and no success labelling — for an unsubstantiated turn', () => {
-    const { container } = render(
-      h(DelegationClaimBadge, { metadata: withClaim({ status: 'unsubstantiated', dispatches: [] }) }),
-    );
-
-    const badge = container.querySelector('[data-delegation-claim]');
-    expect(badge).toBeTruthy();
-    expect(badge!.getAttribute('data-delegation-claim')).toBe('unsubstantiated');
-    expect(badge!.textContent ?? '').toMatch(/no authorized dispatch/i);
-    // Structural proof: zero dispatch rows exist, so there is nothing that
-    // could be read as work having been handed to anyone.
-    expect(container.querySelectorAll('[data-delegation-dispatch]').length).toBe(0);
-    expect(container.textContent ?? '').not.toMatch(SUCCESS_LABELLING);
-  });
-
-  it('treats a status of substantiated with zero dispatch facts as no authority', () => {
-    const { container } = render(
-      h(DelegationClaimBadge, { metadata: withClaim({ status: 'substantiated', dispatches: [] }) }),
-    );
-    expect(container.querySelector('[data-delegation-claim]')!.getAttribute('data-delegation-claim'))
-      .toBe('unsubstantiated');
-    expect(container.querySelectorAll('[data-delegation-dispatch]').length).toBe(0);
-  });
+  it.each(['unsubstantiated', 'substantiated'] as const)(
+    'renders nothing for a %s projection with zero task dispatches',
+    (status) => {
+      const { container } = render(
+        h(DelegationClaimBadge, { metadata: withClaim({ status, dispatches: [] }) }),
+      );
+      expect(container.innerHTML).toBe('');
+      expect(container.textContent ?? '').not.toMatch(SUCCESS_LABELLING);
+    },
+  );
 
   it('renders the exact authority ids for a substantiated turn', () => {
     const { container } = render(h(DelegationClaimBadge, {
@@ -154,7 +141,7 @@ describe('DelegationClaimBadge', () => {
     expect(text).toMatch(/1/);
   });
 
-  it('shows the canonical controlled-device call as an authorized dispatch', () => {
+  it('ignores a legacy machine-control-only projection', () => {
     const { container } = render(h(DelegationClaimBadge, {
       metadata: withClaim({
         status: 'substantiated',
@@ -163,35 +150,32 @@ describe('DelegationClaimBadge', () => {
           kind: 'machine-control',
           tool: 'computer_use_call',
           machine: '1472527657',
+          taskId: 'tsk_forged',
+          assignmentId: 'asg_forged',
           deliveries: [{ target: '1472527657', status: 'delivered' }],
-        }],
+        } as never],
       }),
     }));
-
-    expect(container.querySelector('[data-delegation-claim="substantiated"]')).not.toBeNull();
-    expect(container.querySelector('[data-delegation-field="machineControl"]')?.textContent)
-      .toContain('computer_use_call · 1472527657');
-    expect(container.textContent).not.toMatch(/no authorized dispatch/i);
+    expect(container.innerHTML).toBe('');
   });
 
-  it('shows an authority-validated local Computer Use call as an authorized dispatch', () => {
+  it('keeps only the formal task dispatch from a mixed legacy batch', () => {
     const { container } = render(h(DelegationClaimBadge, {
       metadata: withClaim({
         status: 'substantiated',
         dispatches: [{
-          dispatchId: 'mcp-local-1',
-          kind: 'machine-control',
-          tool: 'computer_use_call',
-          machine: 'local',
-          deliveries: [{ target: 'local', status: 'delivered' }],
+          dispatchId: 'mcp-local-1', kind: 'machine-control', tool: 'computer_use_call',
+          machine: 'local', deliveries: [{ target: 'local', status: 'delivered' }],
+        } as never, {
+          dispatchId: 'dsp-task-1', taskId: 'tsk_1', assignmentId: 'asg_1',
+          deliveries: [{ target: 'deck_worker', status: 'delivered' }],
         }],
       }),
     }));
-
-    expect(container.querySelector('[data-delegation-claim="substantiated"]')).not.toBeNull();
-    expect(container.querySelector('[data-delegation-field="machineControl"]')?.textContent)
-      .toContain('computer_use_call · local');
-    expect(container.textContent).not.toMatch(/no authorized dispatch/i);
+    expect(container.querySelectorAll('[data-delegation-dispatch]')).toHaveLength(1);
+    expect(container.textContent).toContain('dsp-task-1');
+    expect(container.textContent).not.toContain('computer_use_call');
+    expect(container.textContent).not.toContain('local');
   });
 
   it('names the executor on one line so an id row is readable without a lookup', () => {
@@ -434,7 +418,7 @@ describe('DelegationClaimBadge', () => {
     expect(container.querySelector('[data-delegation-field="execution"]')).toBeNull();
   });
 
-  it('omits id rows the facts do not carry', () => {
+  it('ignores a malformed dispatch without exact task authority ids', () => {
     const { container } = render(h(DelegationClaimBadge, {
       metadata: withClaim({
         status: 'substantiated',
@@ -442,9 +426,7 @@ describe('DelegationClaimBadge', () => {
       }),
     }));
 
-    expect(container.querySelector('[data-delegation-field="dispatchId"]')).toBeTruthy();
-    expect(container.querySelector('[data-delegation-field="taskId"]')).toBeNull();
-    expect(container.querySelector('[data-delegation-field="assignmentId"]')).toBeNull();
+    expect(container.innerHTML).toBe('');
   });
 
   it('renders every dispatch when a turn made several', () => {
@@ -452,8 +434,8 @@ describe('DelegationClaimBadge', () => {
       metadata: withClaim({
         status: 'substantiated',
         dispatches: [
-          { dispatchId: 'dsp_a', taskId: 'task_a', deliveries: [{ target: 'w1', status: 'delivered' }] },
-          { dispatchId: 'dsp_b', assignmentId: 'asg_b', deliveries: [{ target: 'w2', status: 'queued' }] },
+          { dispatchId: 'dsp_a', taskId: 'task_a', assignmentId: 'asg_a', deliveries: [{ target: 'w1', status: 'delivered' }] },
+          { dispatchId: 'dsp_b', taskId: 'task_b', assignmentId: 'asg_b', deliveries: [{ target: 'w2', status: 'queued' }] },
         ],
       }),
     }));
@@ -465,14 +447,10 @@ describe('DelegationClaimBadge', () => {
 });
 
 describe('readDelegationClaimMetadata', () => {
-  it('reads the projection from a nested metadata record on the event payload', () => {
+  it('does not expose an empty projection from nested or flat payload metadata', () => {
     const metadata = withClaim({ status: 'unsubstantiated', dispatches: [] });
-    expect(readDelegationClaimMetadata({ text: 'hi', metadata })).toBe(metadata);
-  });
-
-  it('reads the projection when it sits directly on the payload', () => {
-    const payload = { text: 'hi', ...withClaim({ status: 'unsubstantiated', dispatches: [] }) };
-    expect(readDelegationClaimMetadata(payload)).toBe(payload);
+    expect(readDelegationClaimMetadata({ text: 'hi', metadata })).toBeUndefined();
+    expect(readDelegationClaimMetadata({ text: 'hi', ...metadata })).toBeUndefined();
   });
 
   it('returns undefined when no projection is present anywhere', () => {
@@ -544,7 +522,7 @@ describe('delegation-claim visual demotion', () => {
 });
 
 describe('ChatView delegation-claim wiring', () => {
-  it('renders the neutral indicator under an assistant turn with no authorized dispatch', () => {
+  it('renders no badge for prose-only delegation claims', () => {
     const { container } = render(
       <ChatView
         events={[assistantEvent({
@@ -556,16 +534,8 @@ describe('ChatView delegation-claim wiring', () => {
         sessionId="deck_claim_brain"
       />,
     );
-
-    const block = container.querySelector('.chat-assistant')!;
-    expect(block).toBeTruthy();
-    const badge = block.querySelector('[data-delegation-claim]');
-    expect(badge).toBeTruthy();
-    expect(badge!.getAttribute('data-delegation-claim')).toBe('unsubstantiated');
-    expect(block.querySelectorAll('[data-delegation-dispatch]').length).toBe(0);
-    // The prose still says whatever the model said — the badge just never
-    // borrows authority from it.
-    expect(badge!.textContent ?? '').not.toMatch(SUCCESS_LABELLING);
+    expect(container.querySelector('.chat-assistant')).toBeTruthy();
+    expect(container.querySelector('[data-delegation-claim]')).toBeNull();
   });
 
   it('renders the authority ids under an assistant turn that really dispatched', () => {

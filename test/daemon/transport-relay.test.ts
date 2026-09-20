@@ -274,7 +274,13 @@ describe('transport-relay (timeline-emitter based)', () => {
       const { provider, fireComplete } = makeMockProvider();
       wireProviderToRelay(provider);
 
-      const claim = { status: 'unsubstantiated', dispatches: [] };
+      const claim = {
+        status: 'substantiated',
+        dispatches: [{
+          dispatchId: 'dsp-1', taskId: 'tsk-1', assignmentId: 'asg-1',
+          deliveries: [{ target: 'deck-worker', status: 'delivered' }],
+        }],
+      };
       fireComplete('sess-claim', {
         id: 'msg-claim', sessionId: 'sess-claim', kind: 'text', role: 'assistant',
         content: 'done', timestamp: Date.now(), status: 'complete',
@@ -290,6 +296,28 @@ describe('transport-relay (timeline-emitter based)', () => {
         finalized[0].delegationClaim,
         'the authority projection must reach the timeline payload',
       ).toEqual(claim);
+    });
+
+    it('drops a legacy machine-control-only claim before timeline persistence', () => {
+      const { provider, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+      fireComplete('sess-ocu', {
+        id: 'msg-ocu', sessionId: 'sess-ocu', kind: 'text', role: 'assistant',
+        content: 'done', timestamp: Date.now(), status: 'complete',
+        metadata: { delegationClaim: {
+          status: 'substantiated',
+          dispatches: [{
+            dispatchId: 'mcp-ocu', kind: 'machine-control', tool: 'computer_use_call', machine: 'local',
+            deliveries: [{ target: 'local', status: 'delivered' }],
+          }],
+        } },
+      } as AgentMessage);
+      const finalized = emitMock.mock.calls
+        .filter((c) => c[1] === 'assistant.text')
+        .map((c) => c[2])
+        .find((payload) => payload.streaming === false);
+      expect(finalized).toBeDefined();
+      expect(Object.keys(finalized)).not.toContain('delegationClaim');
     });
 
     it('omits the delegation-claim key entirely when the turn carried no projection', () => {
