@@ -1085,6 +1085,9 @@ export function SubSessionWindow({
           runExecutionClonesTitle={runExecutionClonesTitle}
           runExecutionClonesCount={executionCloneCount}
           runExecutionClonesFeedback={executionCloneLaunchState}
+          onRefreshHistory={timelineForceRefresh}
+          historyRefreshing={refreshing}
+          historyStatus={timelineHistoryStatus}
         />
       )}
 

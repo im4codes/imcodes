@@ -37,6 +37,10 @@ html { position: fixed; }
   --mobile-server-bar-z: 6500;
   --mobile-fullscreen-window-z: 7000;
   --mobile-fullscreen-preview-z: 7001;
+  /* Toolbar stacking stays local: raised controls must paint above later
+     siblings, and their superscript/status badges sit one layer above them. */
+  --toolbar-raised-control-z: 2;
+  --toolbar-badge-z: 3;
   --imcodes-app-font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
   --imcodes-app-cjk-font-family: 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif;
 }
@@ -710,11 +714,11 @@ html.native-ios-mac .chat-dl-btn {
 .shortcuts::-webkit-scrollbar { display: none; }
 .shortcuts-meta-scroll { display: contents; }
 .shortcuts-model { padding: 4px 8px 4px 0; flex-shrink: 0; position: relative; }
-.shortcuts-model-supervision { position: relative; display: inline-flex; align-items: center; gap: 4px; }
+.shortcuts-model-supervision { position: relative; z-index: var(--toolbar-raised-control-z); display: inline-flex; align-items: center; gap: 4px; overflow: visible; }
 .supervision-heartbeat-badge {
   position: absolute;
-  z-index: 8;
-  top: -5px;
+  z-index: var(--toolbar-badge-z);
+  top: -3px;
   right: -5px;
   display: inline-flex;
   min-width: 19px;
@@ -1068,6 +1072,13 @@ html.native-ios-mac .chat-dl-btn {
 .shortcut-btn-execution-clones-feedback.success { border-color: rgba(52,211,153,0.72); background: #052e24; color: #a7f3d0; }
 .shortcut-btn-execution-clones-feedback.error { border-color: rgba(248,113,113,0.75); background: #450a0a; color: #fecaca; }
 .shortcut-btn-mini-count { position: absolute; right: -5px; bottom: -4px; padding: 0 3px; min-width: 12px; height: 12px; border-radius: 999px; background: rgba(88,28,135,0.95); border: 1px solid rgba(216,180,254,0.72); color: #f5f3ff; font-size: 8px; line-height: 10px; font-weight: 700; }
+.shortcut-btn-history-refresh-wrapper { position: relative; display: inline-flex; align-items: center; }
+.shortcut-btn-history-refresh { position: relative; color: #67e8f9; border-color: rgba(34,211,238,0.30); }
+.shortcut-btn-history-refresh:hover:not(:disabled) { color: #cffafe; border-color: rgba(34,211,238,0.62); background: rgba(8,145,178,0.18); }
+.shortcut-btn-history-refresh-glyph { display: inline-block; font-size: 15px; line-height: 1; }
+.shortcut-btn-history-refresh.is-refreshing .shortcut-btn-history-refresh-glyph { animation: spin 0.8s linear infinite; }
+.shortcut-btn-history-refresh.is-error { color: #fca5a5; border-color: rgba(248,113,113,0.62); background: rgba(127,29,29,0.14); }
+.shortcut-btn-history-refresh-error { position: absolute; z-index: var(--toolbar-badge-z); right: -4px; top: -5px; display: inline-flex; align-items: center; justify-content: center; width: 11px; height: 11px; border: 1px solid rgba(254,202,202,0.85); border-radius: 999px; color: #fff1f2; background: #b91c1c; font-size: 8px; font-weight: 800; line-height: 1; pointer-events: none; }
 @keyframes shortcut-btn-tools-pulse {
   0%, 100% { opacity: 0.6; box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
   50%      { opacity: 1;   box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.25); }
@@ -5148,6 +5159,7 @@ html.native-ios-mac .chat-dl-btn {
 }
 @media (prefers-reduced-motion: reduce) {
   .supervision-heartbeat-badge.is-sending,
+  .shortcut-btn-history-refresh.is-refreshing .shortcut-btn-history-refresh-glyph,
   .chat-execution-status-chip.waiting .chat-execution-status-glyph,
   .chat-supervision-heartbeat-glyph { animation: none; }
 }
@@ -6767,8 +6779,9 @@ html.native-ios-mac .chat-dl-btn {
 .session-ctx-bar::after { content: ''; position: absolute; inset: 0; background: linear-gradient(90deg, transparent, rgba(255,255,255,0.22), transparent); opacity: 0.45; pointer-events: none; }
 .session-repo-branch-summary-chat-titlebar { min-width: 0; max-width: 180px; flex-shrink: 1; }
 .session-usage-codex-row { display: flex; gap: 6px; flex-wrap: nowrap; margin-bottom: 4px; align-items: flex-start; justify-content: flex-end; min-width: 0; }
-.session-usage-codex-quota { display: flex; flex-direction: column; align-items: flex-end; gap: 1px; margin-bottom: 2px; min-width: 0; }
+.session-usage-codex-quota { display: flex; flex-direction: row; align-items: baseline; justify-content: flex-end; flex-wrap: wrap; gap: 1px 5px; margin-bottom: 2px; min-width: 0; max-width: 100%; }
 .session-usage-codex-line { color: #64748b; font-size: 9px; line-height: 1.2; text-align: right; }
+.session-usage-codex-line-compact { min-width: 0; max-width: 100%; white-space: normal; overflow-wrap: normal; word-break: normal; }
 .session-usage-weekly-authorize { background: none; border: none; padding: 0; margin: 0; font: inherit; font-size: 9px; line-height: 1.2; text-align: right; color: var(--chrome-accent, #22d3ee); cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
 .session-usage-weekly-authorize:hover { color: #67e8f9; }
 .codex-credits { position: relative; display: inline-flex; flex: 0 0 auto; }

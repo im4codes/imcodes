@@ -131,6 +131,9 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
           activeToolCall={activeToolCall}
           activeTimelineTurn={activeTimelineTurn}
           now={thinkingNow}
+          onRefreshHistory={forceRefresh}
+          historyRefreshing={refreshing}
+          historyStatus={historyStatus}
         />
       )}
       {(compactQuotaText || liveSub.planLabel) && (
