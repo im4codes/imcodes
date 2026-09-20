@@ -13,6 +13,7 @@ import {
   validateComputerUseResultFrame,
 } from '../shared/computer-use.js';
 import { isLocalComputerUseAlias } from '../shared/machine-reference.js';
+import { REMOTE_EXEC_MAX_TIMEOUT_MS, REMOTE_EXEC_MIN_TIMEOUT_MS } from '../shared/remote-exec.js';
 
 const correlationId = '1234567890abcdef';
 
@@ -40,13 +41,18 @@ describe('computer-use shared protocol', () => {
     expect(computerUseDocs('overview')).toContain('do not probe for or install a separate Playwright runtime');
   });
 
-  it('documents bounded accessibility state and shell-native exec_remote timeouts', () => {
+  it('documents the supported exec_remote timeoutMs while retaining a shell-native command deadline', () => {
     const tools = computerUseDocs('tools');
+    const safety = computerUseDocs('safety');
     expect(tools).toContain('maxNodes');
     expect(tools).toContain('truncated: N nodes omitted');
     expect(tools).toContain('only displayed element indexes');
-    expect(tools).toContain('exec_remote has no timeout argument');
-    expect(computerUseDocs('safety')).toContain('shell-native timeout');
+    expect(tools).toContain(`exec_remote accepts timeoutMs=${REMOTE_EXEC_MIN_TIMEOUT_MS}..${REMOTE_EXEC_MAX_TIMEOUT_MS} ms`);
+    expect(tools).toContain('rejects the unknown timeout field');
+    expect(tools).not.toContain('exec_remote has no timeout argument');
+    expect(safety).toContain('timeoutMs');
+    expect(safety).toContain('rejects timeout');
+    expect(safety).toContain('shell-native timeout');
   });
 
   it('routes CLI intent away from GUI OCU without misreporting helper failure as authorization failure', () => {

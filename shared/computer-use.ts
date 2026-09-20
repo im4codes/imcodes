@@ -4,6 +4,7 @@ import {
   isSessionResourceOwnerIdentity,
   type SessionResourceOwnerIdentity,
 } from './session-resource-lifecycle.js';
+import { REMOTE_EXEC_MAX_TIMEOUT_MS, REMOTE_EXEC_MIN_TIMEOUT_MS } from './remote-exec.js';
 
 export const COMPUTER_USE_TOOLS = [
   'list_apps',
@@ -324,7 +325,7 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
         'Arguments are open-computer-use-compatible. Call get_app_state first to find app ids and element indexes; only displayed element indexes are safe to reuse. If a target was omitted, narrow the app/window or increase maxNodes and refresh state. Pure coordinate click may skip state and uses a Windows fast path when possible.',
         'Action results omit screenshots and full UI state by default for low-latency control. Pass arguments.includeState=true to return state text, or includeImage=true to request a compressed image; optional imageFormat=jpeg|webp|png, imageQuality=1..100, imageMaxWidth=320..3840.',
         'GUI and browser methods keep the 1,000..120,000 ms timeout range; only shell_session1 permits up to 900,000 ms.',
-        'exec_remote has no timeout argument. Bound the command itself inside command with the target shell/platform timeout facility (for example GNU timeout 30s command).',
+        `exec_remote accepts timeoutMs=${REMOTE_EXEC_MIN_TIMEOUT_MS}..${REMOTE_EXEC_MAX_TIMEOUT_MS} ms and rejects the unknown timeout field. Also self-limit the command inside command with the target shell/platform timeout facility (for example GNU timeout 30s command).`,
       ].join('\n');
     case 'browser':
       return [
@@ -352,7 +353,7 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
     case 'safety':
       return [
         'Ask the user before destructive or externally visible actions such as sending messages, deleting data, purchases, or changing account/security settings.',
-        'Shell is intentionally split: exec_remote is session-0/SYSTEM; shell_session1 is active-user/session-1. Both are explicit typed methods with bounded JSON arguments/results. exec_remote rejects an unknown timeout field; put a shell-native timeout in command when a command deadline is needed.',
+        `Shell is intentionally split: exec_remote is session-0/SYSTEM; shell_session1 is active-user/session-1. Both are explicit typed methods with bounded JSON arguments/results. exec_remote accepts timeoutMs=${REMOTE_EXEC_MIN_TIMEOUT_MS}..${REMOTE_EXEC_MAX_TIMEOUT_MS} ms and rejects timeout; also put a shell-native timeout in command so the command self-limits.`,
         'If the UI state is ambiguous, call get_app_state again instead of guessing.',
       ].join('\n');
   }
