@@ -9,11 +9,13 @@ import {
   TIMELINE_HISTORY_CONTENT_TYPES,
   isGuaranteedVisibleTimelineEvent,
   isNeverRenderedTimelineEventType,
+  projectAssistantTextForDisplay,
 } from '../../../src/shared/timeline/types.js';
 import { EXECUTION_CLONE_TIMELINE } from '../../../shared/execution-clone.js';
 import {
   SUPERVISION_EXECUTION_STATES,
   SUPERVISION_EXECUTION_STATUS_MARKERS,
+  parseSupervisionExecutionStateDetailsFromText,
 } from '../../../shared/supervision-config.js';
 
 vi.mock('react-i18next', () => ({
@@ -213,6 +215,31 @@ describe('ChatView render capability contract', () => {
       }),
     ]);
     expect(isGuaranteedVisibleTimelineEvent(markerOnly)).toBe(true);
+  });
+
+  it('keeps daemon execution parsing authoritative while the display projection hides only active markers', () => {
+    for (const [marker, state] of [
+      [SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING, SUPERVISION_EXECUTION_STATES.WAITING],
+      [SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT, SUPERVISION_EXECUTION_STATES.NEEDS_INPUT],
+    ] as const) {
+      const raw = `Visible answer\n${marker}`;
+      expect(parseSupervisionExecutionStateDetailsFromText(raw).state).toBe(state);
+      expect(projectAssistantTextForDisplay(raw)).toEqual({ text: 'Visible answer', executionState: state });
+      expect(projectAssistantTextForDisplay(marker)).toEqual({ text: '', executionState: state });
+    }
+
+    const ordinary = 'Ordinary assistant answer';
+    expect(parseSupervisionExecutionStateDetailsFromText(ordinary).state).toBeNull();
+    expect(projectAssistantTextForDisplay(ordinary)).toEqual({ text: ordinary, executionState: null });
+
+    const examples = [
+      `> ${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`,
+      '```md',
+      SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT,
+      '```',
+    ].join('\n');
+    expect(parseSupervisionExecutionStateDetailsFromText(examples).state).toBeNull();
+    expect(projectAssistantTextForDisplay(examples)).toEqual({ text: examples, executionState: null });
   });
 
   it.each(ALL_CONTENT_TYPES.map((type) => [type]))(
