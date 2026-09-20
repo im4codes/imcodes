@@ -20,6 +20,20 @@ export function fullscreenSupported(): boolean {
 }
 
 /**
+ * The fullscreen element this node sits inside, if any -- the node itself
+ * counts. Anything that has to be re-parented into the fullscreen subtree (a
+ * portal, a popover) is invisible without it, since a fullscreen element is
+ * the only thing the browser paints.
+ */
+export function fullscreenContainerFor(node: Element | null): Element | null {
+  if (typeof document === 'undefined') return null;
+  const fullscreenElement = document.fullscreenElement;
+  return fullscreenElement && node && fullscreenElement.contains(node)
+    ? fullscreenElement
+    : null;
+}
+
+/**
  * Fullscreen for one element.
  *
  * Three things this gets right that an inline `document.fullscreenElement

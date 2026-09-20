@@ -4026,6 +4026,7 @@
       "remote_screen": "Remote desktop screen"
     },
     "exit_fullscreen": "Salir de pantalla completa",
+    "fullscreen_captures_shortcuts": "En pantalla completa también se envían los atajos que el navegador se reserva, como ⌘T y ⌘N",
     "workspace_open_new_window": "Abrir esta máquina en una ventana nueva",
     "workspace_fullscreen": "Pantalla completa",
     "workspace_exit_fullscreen": "Salir de pantalla completa",

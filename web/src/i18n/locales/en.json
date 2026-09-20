@@ -4026,6 +4026,7 @@
       "remote_screen": "Remote desktop screen"
     },
     "exit_fullscreen": "Exit full screen",
+    "fullscreen_captures_shortcuts": "Full screen also sends the shortcuts the browser keeps for itself, such as ⌘T and ⌘N",
     "workspace_open_new_window": "Open this machine in a new window",
     "workspace_fullscreen": "Full screen",
     "workspace_exit_fullscreen": "Exit full screen",

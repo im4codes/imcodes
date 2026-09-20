@@ -86,7 +86,8 @@ import { formatByteRate, formatByteSize } from '../util/byte-size.js';
 import { copyToClipboardWhenReady } from '../util/clipboard.js';
 import type { WsClient } from '../ws-client.js';
 import { openRemoteDesktopWindow } from '../remote-desktop-window.js';
-import { useFullscreen } from '../hooks/useFullscreen.js';
+import { fullscreenContainerFor, useFullscreen } from '../hooks/useFullscreen.js';
+import { keyboardLockSupported, useKeyboardLock } from '../hooks/useKeyboardLock.js';
 import {
   REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT,
   recordRemoteDesktopBrowserDiagnostic,
@@ -588,6 +589,22 @@ export function RemoteDesktopPanel({
   // elsewhere on the page, and a browser that refuses outright all behave the
   // same wherever the button appears.
   const fullscreen = useFullscreen(panelRef);
+  // The shortcuts the browser keeps for itself (Command+T, Command+N,
+  // Control+W, ...) reach this page only while it holds fullscreen AND the
+  // keyboard lock -- see useKeyboardLock for why they are invisible to every
+  // key handler otherwise. The panel is sometimes the fullscreen element and
+  // sometimes sits inside a fullscreen workspace, so this follows the
+  // containing element rather than identity.
+  const [insideFullscreen, setInsideFullscreen] = useState(false);
+  useEffect(() => {
+    const syncFullscreen = () => {
+      setInsideFullscreen(fullscreenContainerFor(panelRef.current) !== null);
+    };
+    syncFullscreen();
+    document.addEventListener('fullscreenchange', syncFullscreen);
+    return () => document.removeEventListener('fullscreenchange', syncFullscreen);
+  }, []);
+  useKeyboardLock(insideFullscreen && snapshot.inputEnabled);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const mobileTextInputRef = useRef<HTMLTextAreaElement | null>(null);
   const mobileTextComposingRef = useRef(false);
@@ -951,12 +968,7 @@ export function RemoteDesktopPanel({
   useEffect(() => {
     if (!quickInputOpen) return;
     const syncPortalContainer = () => {
-      const fullscreenElement = document.fullscreenElement;
-      setQuickInputPortalContainer(
-        fullscreenElement && panelRef.current && fullscreenElement.contains(panelRef.current)
-          ? fullscreenElement
-          : null,
-      );
+      setQuickInputPortalContainer(fullscreenContainerFor(panelRef.current));
     };
     syncPortalContainer();
     document.addEventListener('fullscreenchange', syncPortalContainer);
@@ -2373,12 +2385,7 @@ export function RemoteDesktopPanel({
       inputEpoch: current.inputEpoch,
       client,
     };
-    const fullscreenElement = document.fullscreenElement;
-    setQuickInputPortalContainer(
-      fullscreenElement && panelRef.current && fullscreenElement.contains(panelRef.current)
-        ? fullscreenElement
-        : null,
-    );
+    setQuickInputPortalContainer(fullscreenContainerFor(panelRef.current));
     quickInputSentRef.current = false;
     setQuickInputOpen(true);
   };
@@ -3112,6 +3119,9 @@ export function RemoteDesktopPanel({
               <button
                 type="button"
                 aria-pressed={fullscreen.active}
+                title={keyboardLockSupported() && snapshot.inputEnabled
+                  ? t('remote_desktop.fullscreen_captures_shortcuts')
+                  : undefined}
                 onClick={() => { void fullscreen.toggle(); }}
               >{t(fullscreen.active ? 'remote_desktop.exit_fullscreen' : 'remote_desktop.fullscreen')}</button>
             )}

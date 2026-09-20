@@ -4025,6 +4025,7 @@
       "remote_screen": "Remote desktop screen"
     },
     "exit_fullscreen": "Выйти из полноэкранного режима",
+    "fullscreen_captures_shortcuts": "В полноэкранном режиме передаются и горячие клавиши самого браузера, например ⌘T и ⌘N",
     "workspace_open_new_window": "Открыть эту машину в новом окне",
     "workspace_fullscreen": "Полный экран",
     "workspace_exit_fullscreen": "Выйти из полноэкранного режима",

@@ -4025,6 +4025,7 @@
       "remote_screen": "Remote desktop screen"
     },
     "exit_fullscreen": "全画面を終了",
+    "fullscreen_captures_shortcuts": "フルスクリーンなら、ブラウザが使う ⌘T や ⌘N などのショートカットも送信されます",
     "workspace_open_new_window": "このマシンを新しいウィンドウで開く",
     "workspace_fullscreen": "全画面",
     "workspace_exit_fullscreen": "全画面を終了",
