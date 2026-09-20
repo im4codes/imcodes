@@ -95,6 +95,7 @@ import { deriveSessionLiveStatus } from '../session-live-status.js';
 import { isWorkingSessionState } from '@shared/session-activity-types.js';
 import {
   PEER_AUDIT_VERDICTS,
+  isPeerAuditRound,
   isPeerAuditRuntimeDisposition,
   isPeerAuditVerdict,
 } from '@shared/peer-audit.js';
@@ -4825,6 +4826,11 @@ const ChatEvent = memo(function ChatEvent({
             : outcome === 'cancelled'
               ? 'result_cancelled'
               : 'result_unavailable';
+      const outcomeLabel = t(`peerAuditQuick.${outcomeKey}`);
+      const round = isPeerAuditRound(event.payload.round) ? event.payload.round : undefined;
+      const roundAria = round
+        ? t('peerAuditResult.roundAria', { round, outcome: outcomeLabel })
+        : undefined;
       const auditor = String(event.payload.auditorLabel ?? event.payload.auditorSessionName ?? '—');
       const elapsedMs = typeof event.payload.elapsedMs === 'number' ? event.payload.elapsedMs : 0;
       const findingsPreview = typeof event.payload.findingsPreview === 'string'
@@ -4858,7 +4864,18 @@ const ChatEvent = memo(function ChatEvent({
           )}
           <div>{t('peerAuditResult.attributionAuditor', { auditor })}</div>
           <div>{t('peerAuditResult.elapsedMs', { seconds: Math.round(elapsedMs / 1000) })}</div>
-          <div>{t(`peerAuditQuick.${outcomeKey}`)}</div>
+          <div class="peer-audit-result-verdict-row">
+            <span class={`peer-audit-result-outcome peer-audit-result-outcome--${outcome}`}>{outcomeLabel}</span>
+            {round && (
+              <span
+                class="peer-audit-round-chip"
+                aria-label={roundAria}
+                title={roundAria}
+              >
+                {t('peerAuditResult.roundChip', { round })}
+              </span>
+            )}
+          </div>
           {disposition && (
             <div>{t(`peerAuditQuick.disposition.${disposition}`)}</div>
           )}

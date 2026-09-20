@@ -57,6 +57,46 @@ describe('peer audit result timeline projection', () => {
     expect(JSON.stringify(events[0])).not.toContain(attemptId);
   });
 
+  it('attaches the daemon-authoritative audit round after a final receipt', () => {
+    const registry = getSupervisionTaskRegistry();
+    const taskId = 'tsk_round_projection';
+    const assignmentId = 'asg_round_projection';
+    const attemptId = 'round-projection-attempt';
+    const revision = 'round-projection-r1';
+    const auditorIdentity = {
+      sessionName: 'deck_round_projection_auditor',
+      sessionInstanceId: 'instance-round-projection',
+      runtimeEpoch: 'epoch-round-projection',
+      agentType: 'codex-sdk',
+      providerFamily: 'openai',
+    };
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level',
+      objective: 'Project the audit round', currentRevision: revision,
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      taskId, assignmentId, role: 'auditor', required: true, identity: auditorIdentity,
+      auditAttemptId: attemptId, auditRevision: revision,
+    })).toMatchObject({ ok: true });
+    expect(registry.appendMatchingAuditReceipt({
+      taskId, auditorAssignmentId: assignmentId, attemptId, revision,
+      receiptKind: 'final', verdict: 'PASS', auditorSessionName: auditorIdentity.sessionName,
+      auditorIdentity, findings: 'PASS', validations: [], now: 100,
+    })).toMatchObject({ ok: true });
+
+    const events: any[] = [];
+    const off = timelineEmitter.on((event) => {
+      if (event.sessionId === 'deck_round_projection_brain' && event.type === 'peer_audit.result') events.push(event);
+    });
+    emitPeerAuditResult({
+      auditedSessionName: 'deck_round_projection_brain', attemptId, trigger: 'automatic', outcome: 'pass',
+      auditorSessionName: auditorIdentity.sessionName, elapsedMs: 10,
+    });
+    off();
+    expect(events).toHaveLength(1);
+    expect(events[0].payload.round).toBe(1);
+  });
+
   it('emits a stable reconnect-safe id and excludes opaque/capability/provider material', () => {
     const events: unknown[] = [];
     const off = timelineEmitter.on((event) => {

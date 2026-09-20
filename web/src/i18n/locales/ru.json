@@ -3637,7 +3637,9 @@
     "title": "Результат пир-аудита",
     "attributionAuditor": "Проверил: {{auditor}}",
     "elapsedMs": "Заняло {{seconds}} с",
-    "findingsPreview": "Замечания"
+    "findingsPreview": "Замечания",
+    "roundChip": "R{{round}}",
+    "roundAria": "Раунд аудита {{round}}: {{outcome}}"
   },
   "supervision_task_console": {
     "toggle": "Открыть консоль задач",

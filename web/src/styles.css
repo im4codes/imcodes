@@ -5842,6 +5842,26 @@ html.native-ios-mac .chat-dl-btn {
 }
 .peer-audit-result-heading { margin-bottom: 5px; }
 .peer-audit-result-objective { color: #e2e8f0; font-size: 12px; line-height: 1.35; }
+.peer-audit-result-verdict-row { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; gap: 5px; margin-top: 4px; }
+.peer-audit-result-outcome,
+.peer-audit-round-chip {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  min-height: 18px;
+  padding: 1px 6px;
+  border: 1px solid rgba(148, 163, 184, 0.38);
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.46);
+  color: #cbd5e1;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+.peer-audit-result-outcome--pass { border-color: rgba(52, 211, 153, 0.48); color: #6ee7b7; }
+.peer-audit-result-outcome--rework { border-color: rgba(251, 191, 36, 0.5); color: #fcd34d; }
+.peer-audit-round-chip { border-color: rgba(96, 165, 250, 0.48); color: #93c5fd; }
 .delegation-reply-card-meta { min-width: 0; display: flex; flex: 0 1 auto; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 4px 7px; margin-left: auto; }
 .delegation-reply-card-head .delegation-reply-verdict {
   flex: 0 0 auto;

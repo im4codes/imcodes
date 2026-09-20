@@ -3637,7 +3637,9 @@
     "title": "피어 감사 결과",
     "attributionAuditor": "감사자:{{auditor}}",
     "elapsedMs": "{{seconds}}초 소요",
-    "findingsPreview": "감사 결과"
+    "findingsPreview": "감사 결과",
+    "roundChip": "R{{round}}",
+    "roundAria": "감사 라운드 {{round}}: {{outcome}}"
   },
   "supervision_task_console": {
     "toggle": "작업 콘솔 열기",

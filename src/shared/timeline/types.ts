@@ -324,6 +324,8 @@ export interface PeerAuditResultTimelinePayload {
   disposition?: PeerAuditRuntimeDisposition;
   findingsPreview?: string;
   reason?: string;
+  /** 1-based final audit attempt ordinal; absent on legacy/quick events. */
+  round?: number;
   /** Daemon-authoritative task identity for formal supervision audits. */
   supervisionTask?: import('../../../shared/agent-delegation.js').AgentDelegationSupervisionTaskProjection;
 }
@@ -348,6 +350,8 @@ export interface AgentDelegationReplyTimelinePayload {
   sourceSessionName: string;
   sourceLabel?: string;
   result: string;
+  /** 1-based final audit attempt ordinal; absent on legacy replies. */
+  round?: number;
   /** Daemon-authoritative task identity; objective is bounded and collapsed in UI. */
   supervisionTask?: import('../../../shared/agent-delegation.js').AgentDelegationSupervisionTaskProjection;
   /** Present only when daemon authority decoded a structured audit reply. */

@@ -44,7 +44,11 @@ vi.mock('react-i18next', () => ({
         'peerAuditResult.attributionAuditor': `Reviewed by ${vars?.auditor ?? ''}`,
         'peerAuditResult.elapsedMs': `Took ${vars?.seconds ?? 0}s`,
         'peerAuditResult.findingsPreview': 'Findings',
+        'peerAuditResult.roundChip': `R${vars?.round ?? ''}`,
+        'peerAuditResult.roundAria': `Audit round ${vars?.round ?? ''}: ${vars?.outcome ?? ''}`,
         'peerAuditQuick.result_unavailable': 'Peer auditor unavailable.',
+        'peerAuditQuick.result_pass': 'Peer audit passed.',
+        'peerAuditQuick.result_rework': 'Peer audit requires rework.',
         'peerAuditQuick.disposition.sent_unrevocable': 'sent (cannot revoke)',
         'delegation.reply_title': 'Delegation reply',
         'delegation.reply_from': `From ${vars?.source ?? ''}`,
@@ -483,6 +487,24 @@ describe('isUserVisible', () => {
 });
 
 describe('ChatView peer-audit result cards', () => {
+  it('renders an accessible round chip and leaves legacy results unchanged', () => {
+    const roundEvent = makeEvent('peer_audit.result', {
+      outcome: 'pass', auditorLabel: 'Peer CC', elapsedMs: 500, round: 3,
+    }, { eventId: 'peer-result-round-3' });
+    const legacyEvent = makeEvent('peer_audit.result', {
+      outcome: 'rework', auditorLabel: 'Peer DD', elapsedMs: 700,
+    }, { eventId: 'peer-result-legacy' });
+    const { container } = render(
+      <ChatView events={[roundEvent, legacyEvent]} loading={false} sessionId="session-a" />,
+    );
+    const roundCard = container.querySelector('[data-event-id="peer-result-round-3"]');
+    const roundChip = roundCard?.querySelector('.peer-audit-round-chip');
+    expect(roundChip?.textContent).toBe('R3');
+    expect(roundChip?.getAttribute('aria-label')).toBe('Audit round 3: Peer audit passed.');
+    expect(roundChip?.getAttribute('title')).toBe('Audit round 3: Peer audit passed.');
+    expect(container.querySelector('[data-event-id="peer-result-legacy"] .peer-audit-round-chip')).toBeNull();
+  });
+
   it('renders stable localized outcome/disposition text without exposing wire codes', () => {
     const event = makeEvent('peer_audit.result', {
       outcome: 'target_unavailable',

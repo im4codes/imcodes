@@ -84,10 +84,16 @@ export function emitPeerAuditResult(input: {
   // than trusting findings text or a renderer-side task lookup. Quick/legacy
   // audits have no such row and retain their existing generic card safely.
   let supervisionTask;
+  let round: number | undefined;
   try {
-    supervisionTask = getSupervisionTaskRegistry().getAuditSupervisionTaskProjection(input.attemptId);
+    const registry = getSupervisionTaskRegistry();
+    supervisionTask = registry.getAuditSupervisionTaskProjection(input.attemptId);
+    round = supervisionTask
+      ? registry.getAuditRound(supervisionTask.taskId, input.attemptId)
+      : undefined;
   } catch {
     supervisionTask = undefined;
+    round = undefined;
   }
   timelineEmitter.emit(input.auditedSessionName, 'peer_audit.result', {
     memoryExcluded: true,
@@ -99,6 +105,7 @@ export function emitPeerAuditResult(input: {
     ...(input.disposition ? { disposition: input.disposition } : {}),
     ...(findingsPreview ? { findingsPreview } : {}),
     ...(reason ? { reason } : {}),
+    ...(round ? { round } : {}),
     ...(supervisionTask ? { supervisionTask } : {}),
   }, { source: 'daemon', confidence: 'high', eventId });
   incrementCounter('peer_audit.terminal', {

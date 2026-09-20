@@ -53,6 +53,7 @@ const mocks = vi.hoisted(() => ({
   getTaskRecord: vi.fn(),
   listAssignments: vi.fn(() => []),
   listAuditReceipts: vi.fn(() => []),
+  getAuditRound: vi.fn(() => 1),
   hasReadyAuditValidationAuthority: vi.fn(() => false),
   queueSnapshot: vi.fn(() => ({ pendingMessageEntries: [] })),
   hasDeliveryTombstone: vi.fn(() => false),
@@ -91,6 +92,7 @@ vi.mock('../../src/daemon/supervision-state-store.js', () => ({
     getTaskRecord: mocks.getTaskRecord,
     listAssignments: mocks.listAssignments,
     listAuditReceipts: mocks.listAuditReceipts,
+    getAuditRound: mocks.getAuditRound,
     hasReadyAuditValidationAuthority: mocks.hasReadyAuditValidationAuthority,
   }),
 }));
@@ -290,6 +292,7 @@ describe('delegation reply ingress', () => {
     mocks.getTaskRecord.mockReset();
     mocks.listAssignments.mockReset().mockReturnValue([]);
     mocks.listAuditReceipts.mockReset().mockReturnValue([]);
+    mocks.getAuditRound.mockReset().mockReturnValue(1);
     mocks.hasReadyAuditValidationAuthority.mockReset().mockReturnValue(false);
     mocks.queueSnapshot.mockReset().mockReturnValue({ pendingMessageEntries: [] });
     mocks.hasDeliveryTombstone.mockReset().mockReturnValue(false);
@@ -428,6 +431,7 @@ describe('delegation reply ingress', () => {
       attemptId: auditRecord.auditAttemptId,
       revision: auditRecord.auditRevision,
       verdict: 'PASS',
+      round: 1,
     });
     expect(mocks.appendMatchingAuditReceipt).toHaveBeenCalledWith({
       taskId: auditRecord.taskId,
@@ -456,6 +460,7 @@ describe('delegation reply ingress', () => {
       expect.objectContaining({
         result: 'Exact revision and focused validation pass.',
         verdict: 'PASS',
+        round: 1,
       }),
       expect.any(Object),
     );
@@ -464,6 +469,7 @@ describe('delegation reply ingress', () => {
       expect.any(String), undefined, undefined, expect.any(Object),
     );
     expect(send.mock.calls[0]?.[0]).toContain('Peer audit verdict: PASS');
+    expect(send.mock.calls[0]?.[0]).toContain('Audit round: R1');
     expect(send.mock.calls[0]?.[0]).not.toContain('\\n');
   });
 

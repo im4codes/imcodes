@@ -112,6 +112,7 @@ function identityMatches(left: DelegationReplyBoundIdentity, right: DelegationRe
 function trustedPeerAuditCompletion(record: DelegationReplyRecord): {
   verdict: 'PASS' | 'REWORK';
   findings: string;
+  round?: number;
 } | undefined {
   if (record.messageKind === AGENT_DELEGATION_REPLY_MESSAGE_KINDS.DELEGATION_COMPLETION
     || record.purpose !== AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT) return undefined;
@@ -124,7 +125,11 @@ function trustedPeerAuditCompletion(record: DelegationReplyRecord): {
       || binding.attemptId !== record.auditAttemptId
       || binding.revision !== record.auditRevision
       || typeof parsed.findings !== 'string') return undefined;
-    return { verdict: binding.verdict, findings: parsed.findings };
+    return {
+      verdict: binding.verdict,
+      findings: parsed.findings,
+      ...(binding.round ? { round: binding.round } : {}),
+    };
   } catch {
     return undefined;
   }
@@ -143,6 +148,7 @@ function notificationText(record: DelegationReplyRecord): string {
         `Assignment ID: ${record.assignmentId ?? ''}`,
         `Attempt ID: ${record.auditAttemptId ?? ''}`,
         `Revision: ${record.auditRevision ?? ''}`,
+        ...(audit.round ? [`Audit round: R${audit.round}`] : []),
         '',
         audit.findings,
       ].join('\n')
@@ -273,6 +279,7 @@ function emitDelegationReplyTimeline(record: DelegationReplyRecord): void {
   if (!identityMatches(record.origin, boundIdentity(getSession(record.origin.sessionName)))) return;
   const targetSession = getSession(record.target.sessionName);
   const verdict = trustedStructuredVerdict(record);
+  const round = trustedPeerAuditCompletion(record)?.round;
   const supervisionTask = safeSupervisionTaskProjection(record);
   const exactAuditEventId = isExactAuditRecord(record)
     ? createHash('sha256').update(JSON.stringify([
@@ -291,6 +298,7 @@ function emitDelegationReplyTimeline(record: DelegationReplyRecord): void {
       ...(targetSession?.label ? { sourceLabel: targetSession.label } : {}),
       result: visibleResult(record),
       ...(verdict ? { verdict } : {}),
+      ...(round ? { round } : {}),
       ...(supervisionTask ? { supervisionTask } : {}),
     },
     {
@@ -310,6 +318,7 @@ function emitDelegationReplyTimeline(record: DelegationReplyRecord): void {
 function delegatedPeerAuditResult(
   envelope: PeerAuditReplyEnvelope,
   assignmentHandoff?: { status: 'finished'; replay: boolean } | { status: 'blocked'; exactError: string },
+  round?: number,
 ): string {
   return JSON.stringify({
     status: PEER_AUDIT_DELEGATED_REPLY_STATUS,
@@ -320,6 +329,7 @@ function delegatedPeerAuditResult(
     verdict: envelope.verdict,
     findings: envelope.findings,
     validations: envelope.validations,
+    ...(round ? { round } : {}),
     ...(assignmentHandoff ? { assignmentHandoff } : {}),
   });
 }
@@ -523,6 +533,7 @@ async function submitDelegatedPeerAuditReply(input: {
     return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INSUFFICIENT_VALIDATION_EVIDENCE };
   }
   let assignmentHandoff: { status: 'finished'; replay: boolean } | { status: 'blocked'; exactError: string } | undefined;
+  let auditRound: number | undefined;
   if (authority.auditRevision && authority.auditedSessionName) {
     const persisted = registry.appendMatchingAuditReceipt({
       taskId,
@@ -559,6 +570,7 @@ async function submitDelegatedPeerAuditReply(input: {
     // the exact binding and completion/blocker result.
     if (receiptKind === 'progress') return { ok: true };
     if (persisted.ok) {
+      auditRound = registry.getAuditRound(taskId, input.envelope.attemptId);
       try {
         const runFinish = () => registry.finishAssignment({
           assignmentId,
@@ -592,7 +604,7 @@ async function submitDelegatedPeerAuditReply(input: {
   }
   const received = getDelegationReplyStore().receive({
     delegationId: authority.delegationId,
-    result: delegatedPeerAuditResult(input.envelope, assignmentHandoff),
+    result: delegatedPeerAuditResult(input.envelope, assignmentHandoff, auditRound),
     sender: senderIdentity,
     authorizedSender: {
       sessionName: auditAssignment.identity.sessionName,

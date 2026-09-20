@@ -33,6 +33,7 @@ import {
   findForbiddenAgentDelegationCommandFields,
   findMixedAgentDelegationP2pFields,
   readTrustedAgentDelegationReplyVerdict,
+  readTrustedAgentDelegationPeerAuditCompletionBinding,
   hasAgentDelegationTargetField,
   hasLegacyP2pControlToken,
   isAgentDelegationForwardedPayloadText,
@@ -64,6 +65,31 @@ describe('readTrustedAgentDelegationReplyVerdict', () => {
     { status: 'peer_audit_completed', metadata: { verdict: 'PASS' } },
   ])('rejects missing, unknown, nested, or wrong-shape verdict metadata', (value) => {
     expect(readTrustedAgentDelegationReplyVerdict(value)).toBeUndefined();
+  });
+});
+
+describe('readTrustedAgentDelegationPeerAuditCompletionBinding audit round', () => {
+  const completion = {
+    status: 'peer_audit_completed',
+    taskId: 'tsk_round',
+    assignmentId: 'asg_round',
+    attemptId: 'attempt-round',
+    revision: 'revision-round',
+    verdict: 'PASS',
+  };
+
+  it('preserves a bounded round and keeps legacy completion bindings unchanged', () => {
+    expect(readTrustedAgentDelegationPeerAuditCompletionBinding({ ...completion, round: 3 }))
+      .toMatchObject({ round: 3, verdict: 'PASS' });
+    expect(readTrustedAgentDelegationPeerAuditCompletionBinding(completion))
+      .toEqual({
+        taskId: 'tsk_round', assignmentId: 'asg_round', attemptId: 'attempt-round',
+        revision: 'revision-round', verdict: 'PASS',
+      });
+  });
+
+  it.each([0, -1, 1.5, 10_000, '2'])('rejects invalid round metadata %j', (round) => {
+    expect(readTrustedAgentDelegationPeerAuditCompletionBinding({ ...completion, round })).toBeUndefined();
   });
 });
 

@@ -4,7 +4,12 @@ import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
-import type { PeerAuditReceiptKind, PeerAuditValidationItem, PeerAuditVerdict } from '../../shared/peer-audit.js';
+import {
+  isPeerAuditRound,
+  type PeerAuditReceiptKind,
+  type PeerAuditValidationItem,
+  type PeerAuditVerdict,
+} from '../../shared/peer-audit.js';
 import {
   supervisionIdentityMatches,
   isSupervisionTaskCoordinator,
@@ -1050,6 +1055,40 @@ export interface PersistedSupervisionAuditReceipt {
   supersedesReceiptId?: string;
   senderIdentity: PersistedSupervisionTaskAssignmentIdentity;
   createdAt: number;
+}
+
+/**
+ * Derive the stable 1-based ordinal of one FINAL audit attempt.
+ *
+ * Receipt rows, not auditor assignment rows, are the authority: cancelled or
+ * replacement auditors without a final receipt cannot inflate a round. Multiple
+ * finals for the same attempt (correction history) and idempotent replays count
+ * once. Sorting makes persisted/reloaded projections independent of caller
+ * enumeration order.
+ */
+export function deriveSupervisionAuditRound(
+  receipts: readonly Pick<PersistedSupervisionAuditReceipt,
+    'receiptId' | 'attemptId' | 'receiptKind' | 'createdAt' | 'sequence'>[],
+  attemptId: string,
+): number | undefined {
+  const targetAttemptId = normalizeTaskString(attemptId);
+  if (!targetAttemptId) return undefined;
+  const finals = receipts
+    .filter((receipt) => receipt.receiptKind === 'final' && normalizeTaskString(receipt.attemptId))
+    .slice()
+    .sort((left, right) => left.createdAt - right.createdAt
+      || left.sequence - right.sequence
+      || (left.receiptId < right.receiptId ? -1 : left.receiptId > right.receiptId ? 1 : 0));
+  const seen = new Set<string>();
+  let round = 0;
+  for (const receipt of finals) {
+    const receiptAttemptId = normalizeTaskString(receipt.attemptId);
+    if (!receiptAttemptId || seen.has(receiptAttemptId)) continue;
+    seen.add(receiptAttemptId);
+    round += 1;
+    if (receiptAttemptId === targetAttemptId) return isPeerAuditRound(round) ? round : undefined;
+  }
+  return undefined;
 }
 
 export interface SupervisionTaskUpdateInput {
@@ -3012,6 +3051,13 @@ export class SupervisionTaskRegistry {
       WHERE task_id = ? ORDER BY created_at ASC, sequence ASC
     `).all(taskId) as Array<Record<string, unknown>>;
     return parseAuditReceiptRows(rows);
+  }
+
+  /** Authoritative round for one task-bound final attempt. */
+  getAuditRound(taskId: string, attemptId: string): number | undefined {
+    const normalizedTaskId = normalizeTaskString(taskId);
+    if (!normalizedTaskId) return undefined;
+    return deriveSupervisionAuditRound(this.listAuditReceipts(normalizedTaskId), attemptId);
   }
 
   listCompletionEvidence(taskId: string): PersistedSupervisionCompletionEvidence[] {

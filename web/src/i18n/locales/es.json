@@ -3638,7 +3638,9 @@
     "title": "Resultado de auditoría",
     "attributionAuditor": "Revisado por {{auditor}}",
     "elapsedMs": "Tomó {{seconds}}s",
-    "findingsPreview": "Hallazgos"
+    "findingsPreview": "Hallazgos",
+    "roundChip": "R{{round}}",
+    "roundAria": "Ronda de auditoría {{round}}: {{outcome}}"
   },
   "supervision_task_console": {
     "toggle": "Abrir consola de tareas",

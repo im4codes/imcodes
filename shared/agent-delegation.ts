@@ -8,6 +8,7 @@ import {
   PEER_AUDIT_ID_MAX_BYTES,
   PEER_AUDIT_DELEGATED_REPLY_STATUS,
   PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS,
+  isPeerAuditRound,
   isPeerAuditVerdict,
   type PeerAuditVerdict,
 } from './peer-audit.js';
@@ -111,6 +112,7 @@ export interface AgentDelegationPeerAuditCompletionBinding {
   attemptId: string;
   revision: string;
   verdict: PeerAuditVerdict;
+  round?: number;
 }
 
 function utf8ByteLength(value: string): number {
@@ -198,7 +200,9 @@ export function readTrustedAgentDelegationPeerAuditCompletionBinding(
   const attemptId = readBoundedId(record.attemptId);
   const revision = readBoundedId(record.revision);
   if (!taskId || !assignmentId || !attemptId || !revision) return undefined;
-  return { taskId, assignmentId, attemptId, revision, verdict: record.verdict };
+  const round = record.round === undefined ? undefined : record.round;
+  if (round !== undefined && !isPeerAuditRound(round)) return undefined;
+  return { taskId, assignmentId, attemptId, revision, verdict: record.verdict, ...(round ? { round } : {}) };
 }
 
 /**

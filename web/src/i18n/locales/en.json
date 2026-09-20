@@ -3638,7 +3638,9 @@
     "title": "Peer audit result",
     "attributionAuditor": "Reviewed by {{auditor}}",
     "elapsedMs": "Took {{seconds}}s",
-    "findingsPreview": "Findings"
+    "findingsPreview": "Findings",
+    "roundChip": "R{{round}}",
+    "roundAria": "Audit round {{round}}: {{outcome}}"
   },
   "supervision_task_console": {
     "toggle": "Open task console",

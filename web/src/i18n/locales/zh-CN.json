@@ -3638,7 +3638,9 @@
     "title": "对等审计结果",
     "attributionAuditor": "审核者:{{auditor}}",
     "elapsedMs": "耗时 {{seconds}} 秒",
-    "findingsPreview": "审计发现"
+    "findingsPreview": "审计发现",
+    "roundChip": "R{{round}}",
+    "roundAria": "第 {{round}} 轮审计：{{outcome}}"
   },
   "supervision_task_console": {
     "toggle": "打开任务控制台",

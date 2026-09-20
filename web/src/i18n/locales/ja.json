@@ -3637,7 +3637,9 @@
     "title": "ピア監査結果",
     "attributionAuditor": "監査者:{{auditor}}",
     "elapsedMs": "{{seconds}} 秒",
-    "findingsPreview": "所見"
+    "findingsPreview": "所見",
+    "roundChip": "R{{round}}",
+    "roundAria": "監査ラウンド {{round}}：{{outcome}}"
   },
   "supervision_task_console": {
     "toggle": "タスクコンソールを開く",

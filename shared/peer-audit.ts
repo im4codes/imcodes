@@ -26,6 +26,11 @@ export const PEER_AUDIT_CONTRACT_VERSION = 'peer_audit_v1' as const;
 export const PEER_AUDIT_COMPLETED_TURN_PAYLOAD_FIELD = 'peerAuditCompletedTurn' as const;
 /** Trusted result status delivered to the coordinating session for manual audits. */
 export const PEER_AUDIT_DELEGATED_REPLY_STATUS = 'peer_audit_completed' as const;
+/** Public audit-round projection bound to final registry receipts. */
+export const PEER_AUDIT_ROUND_MAX = 9_999;
+export function isPeerAuditRound(value: unknown): value is number {
+  return Number.isInteger(value) && Number(value) >= 1 && Number(value) <= PEER_AUDIT_ROUND_MAX;
+}
 export const PEER_AUDIT_MESSAGES = {
   CANDIDATES: 'peer_audit.candidates',
   QUICK_RESULT: 'peer_audit.quick_result',
@@ -407,6 +412,8 @@ export interface PeerAuditResultEvent {
   disposition?: PeerAuditRuntimeDisposition;
   findingsPreview?: string;
   reason?: string;
+  /** 1-based final audit attempt ordinal for a formal supervised task. */
+  round?: number;
 }
 
 /** Daemon-internal authority evidence emitted only at a clean transport idle

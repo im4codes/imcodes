@@ -3638,7 +3638,9 @@
     "title": "對等稽核結果",
     "attributionAuditor": "審核者:{{auditor}}",
     "elapsedMs": "耗時 {{seconds}} 秒",
-    "findingsPreview": "稽核發現"
+    "findingsPreview": "稽核發現",
+    "roundChip": "R{{round}}",
+    "roundAria": "第 {{round}} 輪稽核：{{outcome}}"
   },
   "supervision_task_console": {
     "toggle": "開啟任務主控台",
