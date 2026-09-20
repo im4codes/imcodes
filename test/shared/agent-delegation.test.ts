@@ -48,6 +48,7 @@ import {
 import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
 
 import { AUDIT_CONVERGENCE_CONTRACT_ID } from '../../shared/audit-convergence.js';
+import { LOAD_VALIDATION_SAFETY_BY_LOCALE } from '../../shared/load-validation-safety.js';
 
 describe('readTrustedAgentDelegationReplyVerdict', () => {
   it.each(['PASS', 'REWORK'] as const)('accepts the exact top-level %s verdict', (verdict) => {
@@ -429,6 +430,7 @@ describe('agent delegation shared contract', () => {
     expect(audit).toContain('must not rerun tests or other validation');
     expect(audit).toContain('only a missing report permits the minimal gap-filling check');
     expect(audit).toContain('PASS or REWORK');
+    expect(audit).toContain(LOAD_VALIDATION_SAFETY_BY_LOCALE.en);
     expect(audit).not.toContain('replyCapability');
     expect(audit).not.toContain('baseline');
 
@@ -488,6 +490,13 @@ describe('Quick Audit orchestration references the audit convergence contract', 
       expect(prompt).toContain(ref);
       expect(prompt).toContain('"role":"orchestrator"');
       expect(prompt).not.toContain(body);
+    });
+
+    it(`carries the localized capped-load rule in the quick-audit task (${uiLocale})`, () => {
+      const task = buildQuickAgentDelegationTask('audit', '', uiLocale);
+      expect(task).toContain(LOAD_VALIDATION_SAFETY_BY_LOCALE[uiLocale]);
+      expect(task).toMatch(/Docker/);
+      expect(task).toMatch(/(?:25%|25％)/);
     });
   }
 

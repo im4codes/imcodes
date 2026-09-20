@@ -1,4 +1,5 @@
 import { AUDIT_CONVERGENCE_ROLES, buildAuditConvergenceContractRef } from './audit-convergence.js';
+import { LOAD_VALIDATION_SAFETY_BY_LOCALE } from './load-validation-safety.js';
 import { P2P_ROUTING_FIELDS } from './p2p-routing-fields.js';
 import { isSessionAgentType } from './agent-types.js';
 import { CODEBUDDY_PROVIDER_IDS } from './codebuddy.js';
@@ -766,32 +767,32 @@ export function buildQuickAgentDelegationTask(
     'zh-CN': {
       discussion: '与所选代理讨论本会话最近的工作。根据当前上下文整理目标、范围、近期决策、变更区域、已有验证、待解决问题和风险；请对方挑战方案、指出权衡或遗漏，并回复具体建议。',
       brainstorm: '与所选代理一起构思本会话最近工作的改进与下一步。根据当前上下文整理目标、约束、近期决策、当前实现和未解决问题；请对方给出实用替代方案、边界情况和优先级建议并回执。',
-      audit: '请所选代理独立审计本会话最近的工作。根据当前上下文整理目标、范围、近期决策、变更文件或产物、实现状态、已有验证、验收标准和风险；要求根据代码和已有测试报告审计；报告可用时不得重复执行测试，仅无可用报告时做最小补缺检查；对确信的具体疑点可在硬限制内做一个小型定向检查，并给出精确证据、按优先级排列的缺陷及明确的 PASS 或 REWORK 结论。',
+      audit: `请所选代理独立审计本会话最近的工作。根据当前上下文整理目标、范围、近期决策、变更文件或产物、实现状态、已有验证、验收标准和风险；要求根据代码和已有测试报告审计；报告可用时不得重复执行测试，仅无可用报告时做最小补缺检查；对确信的具体疑点可在硬限制内做一个小型定向检查，并给出精确证据、按优先级排列的缺陷及明确的 PASS 或 REWORK 结论。${LOAD_VALIDATION_SAFETY_BY_LOCALE['zh-CN']}`,
     },
     'zh-TW': {
       discussion: '與所選代理討論本工作階段最近的工作。依目前脈絡整理目標、範圍、近期決策、變更區域、既有驗證、待解問題與風險；請對方挑戰方案、指出權衡或遺漏，並回覆具體建議。',
       brainstorm: '與所選代理一起構思本工作階段最近工作的改進與下一步。依目前脈絡整理目標、限制、近期決策、目前實作與未解問題；請對方提供實用替代方案、邊界情況與優先順序建議並回覆。',
-      audit: '請所選代理獨立審計本工作階段最近的工作。依目前脈絡整理目標、範圍、近期決策、變更檔案或產物、實作狀態、既有驗證、驗收標準與風險；要求依程式碼與既有測試報告審計；報告可用時不得重複執行測試，只有無可用報告時才做最小補缺檢查；對確信的具體疑點可在硬限制內做一個小型定向檢查，並提供精確證據、依優先級排列的缺陷及明確的 PASS 或 REWORK 結論。',
+      audit: `請所選代理獨立審計本工作階段最近的工作。依目前脈絡整理目標、範圍、近期決策、變更檔案或產物、實作狀態、既有驗證、驗收標準與風險；要求依程式碼與既有測試報告審計；報告可用時不得重複執行測試，只有無可用報告時才做最小補缺檢查；對確信的具體疑點可在硬限制內做一個小型定向檢查，並提供精確證據、依優先級排列的缺陷及明確的 PASS 或 REWORK 結論。${LOAD_VALIDATION_SAFETY_BY_LOCALE['zh-TW']}`,
     },
     es: {
       discussion: 'Comenta el trabajo más reciente de esta sesión con el agente seleccionado. Resume objetivo, alcance, decisiones, áreas cambiadas, validación, preguntas y riesgos; pide que cuestione el enfoque y devuelva recomendaciones concretas.',
       brainstorm: 'Genera mejoras y próximos pasos con el agente seleccionado. Resume objetivo, restricciones, decisiones, estado actual y problemas abiertos; pide alternativas prácticas, casos límite e ideas priorizadas.',
-      audit: 'Pide al agente seleccionado una auditoría independiente del trabajo reciente. Resume objetivo, alcance, decisiones, archivos, estado, validación, criterios y riesgos; exige auditoría desde el código y el informe existente; no repitas pruebas si el informe es utilizable y ejecuta solo una comprobación mínima si falta; una sospecha concreta y segura permite una pequeña comprobación dirigida dentro de límites estrictos, con evidencia exacta, defectos priorizados y PASS o REWORK.',
+      audit: `Pide al agente seleccionado una auditoría independiente del trabajo reciente. Resume objetivo, alcance, decisiones, archivos, estado, validación, criterios y riesgos; exige auditoría desde el código y el informe existente; no repitas pruebas si el informe es utilizable y ejecuta solo una comprobación mínima si falta; una sospecha concreta y segura permite una pequeña comprobación dirigida dentro de límites estrictos, con evidencia exacta, defectos priorizados y PASS o REWORK. ${LOAD_VALIDATION_SAFETY_BY_LOCALE.es}`,
     },
     ru: {
       discussion: 'Обсудите недавнюю работу с выбранным агентом. Кратко изложите цель, область, решения, изменения, проверки, вопросы и риски; попросите оспорить подход и вернуть конкретные рекомендации.',
       brainstorm: 'Продумайте улучшения и следующие шаги с выбранным агентом. Кратко изложите цель, ограничения, решения, состояние и открытые проблемы; запросите практичные альтернативы, крайние случаи и приоритетные идеи.',
-      audit: 'Попросите выбранного агента независимо проверить недавнюю работу. Кратко изложите цель, область, решения, файлы, состояние, проверки, критерии и риски; требуйте аудита по коду и имеющемуся отчёту; не повторяйте тесты при пригодном отчёте, а при его отсутствии выполните лишь минимальную проверку; уверенное конкретное подозрение допускает одну малую целевую проверку в строгих пределах, затем дайте точные доказательства, приоритетные дефекты и PASS/REWORK.',
+      audit: `Попросите выбранного агента независимо проверить недавнюю работу. Кратко изложите цель, область, решения, файлы, состояние, проверки, критерии и риски; требуйте аудита по коду и имеющемуся отчёту; не повторяйте тесты при пригодном отчёте, а при его отсутствии выполните лишь минимальную проверку; уверенное конкретное подозрение допускает одну малую целевую проверку в строгих пределах, затем дайте точные доказательства, приоритетные дефекты и PASS/REWORK. ${LOAD_VALIDATION_SAFETY_BY_LOCALE.ru}`,
     },
     ja: {
       discussion: '選択したエージェントとこのセッションの最近の作業を議論します。目標、範囲、判断、変更領域、検証、未解決点、リスクを要約し、方針への反論と具体的な提案を求めてください。',
       brainstorm: '選択したエージェントと改善案・次の手順を検討します。目標、制約、判断、実装状況、未解決問題を要約し、実用的な代案、境界条件、優先案を求めてください。',
-      audit: '選択したエージェントに最近の作業の独立監査を依頼します。目標、範囲、判断、変更ファイル、実装状況、検証、受入条件、リスクを要約し、コードと既存テスト報告から監査し、報告が利用可能ならテストを重複実行せず、報告がない場合だけ最小確認を行います。確信ある具体的疑念には厳格な上限内で小さな対象確認を1回だけ行い、正確な証拠、優先度付き欠陥、明確な PASS または REWORK を求めてください。',
+      audit: `選択したエージェントに最近の作業の独立監査を依頼します。目標、範囲、判断、変更ファイル、実装状況、検証、受入条件、リスクを要約し、コードと既存テスト報告から監査し、報告が利用可能ならテストを重複実行せず、報告がない場合だけ最小確認を行います。確信ある具体的疑念には厳格な上限内で小さな対象確認を1回だけ行い、正確な証拠、優先度付き欠陥、明確な PASS または REWORK を求めてください。${LOAD_VALIDATION_SAFETY_BY_LOCALE.ja}`,
     },
     ko: {
       discussion: '선택한 에이전트와 이 세션의 최근 작업을 논의하세요. 목표, 범위, 결정, 변경 영역, 검증, 미해결 질문, 위험을 요약하고 접근법의 허점과 구체적 권고를 요청하세요.',
       brainstorm: '선택한 에이전트와 개선 및 다음 단계를 구상하세요. 목표, 제약, 결정, 구현 상태, 미해결 문제를 요약하고 실용적 대안, 경계 사례, 우선순위 아이디어를 요청하세요.',
-      audit: '선택한 에이전트에게 최근 작업의 독립 감사를 요청하세요. 목표, 범위, 결정, 변경 파일, 구현 상태, 검증, 수락 기준, 위험을 요약하고 코드와 기존 테스트 보고서로 감사하고, 보고서가 사용 가능하면 테스트를 반복하지 않으며 없을 때만 최소 검사를 수행합니다. 확신 있는 구체적 의심에는 엄격한 한도 내 작은 표적 검사 1회만 수행한 뒤 정확한 증거, 우선순위 결함, PASS 또는 REWORK를 요구하세요.',
+      audit: `선택한 에이전트에게 최근 작업의 독립 감사를 요청하세요. 목표, 범위, 결정, 변경 파일, 구현 상태, 검증, 수락 기준, 위험을 요약하고 코드와 기존 테스트 보고서로 감사하고, 보고서가 사용 가능하면 테스트를 반복하지 않으며 없을 때만 최소 검사를 수행합니다. 확신 있는 구체적 의심에는 엄격한 한도 내 작은 표적 검사 1회만 수행한 뒤 정확한 증거, 우선순위 결함, PASS 또는 REWORK를 요구하세요. ${LOAD_VALIDATION_SAFETY_BY_LOCALE.ko}`,
     },
   } as const;
   if (locale !== 'en') return localized[locale][preset];
@@ -813,6 +814,7 @@ export function buildQuickAgentDelegationTask(
     'Ask the selected delegate to independently audit this session\'s most recent work.',
     'Build the delegation brief from the current session context: summarize the goal, requested scope, recent decisions, changed files or artifacts, implementation state, validation already run, acceptance criteria, and known risks.',
     'The delegate must audit from the code plus the submitted test report. When that exact-revision report is usable, it must not rerun tests or other validation; only a missing report permits the minimal gap-filling check, while one confident concrete suspicion permits one small targeted check within the audit hard limits. It should report exact evidence, prioritize concrete defects and regressions, and reply with PASS or REWORK.',
+    LOAD_VALIDATION_SAFETY_BY_LOCALE.en,
   ].join(' ');
 }
 

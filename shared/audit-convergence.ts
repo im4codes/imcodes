@@ -17,6 +17,8 @@
  * (contract id plus the parameters that apply there), never the body.
  */
 
+import { LOAD_VALIDATION_SAFETY_COMPACT } from './load-validation-safety.js';
+
 export const AUDIT_CONVERGENCE_CONTRACT_ID = 'audit_convergence_v1' as const;
 
 export const AUDIT_SEVERITY_LEVELS = ['P0', 'P1', 'P2', 'P3', 'P4'] as const;
@@ -114,6 +116,7 @@ export function buildAuditConvergenceContract(): string {
       dbMigration: 'production-shaped data: existing ids, soft-deleted rows, retry after partial DDL, concurrent writers',
       deployOrRollback: 'fault injection',
       postDeployGate: 'preflight required secrets and base URLs before running',
+      loadSafety: LOAD_VALIDATION_SAFETY_COMPACT,
     },
     slices: 'one combined audit of the integrated result; never audit slices one by one',
     commentOrDocOnly: 'binding check only, no re-audit',

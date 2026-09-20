@@ -33,9 +33,11 @@ import {
   buildSupervisionTaskFinalizationContract,
   buildSupervisionTaskRegistryContract,
   buildSupervisionMessagingContract,
+  appendTaskRunContract,
 } from '../../src/daemon/supervision-prompts.js';
 import { PEER_AUDIT_BRIEF_TOTAL_BYTES, peerAuditByteLength } from '../../shared/peer-audit.js';
 import { AUDIT_CONVERGENCE_CONTRACT_ID } from '../../shared/audit-convergence.js';
+import { LOAD_VALIDATION_SAFETY_BY_LOCALE } from '../../shared/load-validation-safety.js';
 import {
   FILE_OUTPUT_CONTRACT,
   FILE_OUTPUT_CONTRACT_ID,
@@ -70,11 +72,14 @@ describe('supervision prompts', () => {
       },
       authority: 'actual_worktree+Git_bytes',
       metadata: 'task_registry_contract',
-      auditEvidence: { frozenFirst: true, auditorRuns: 'only_missing_report_or_confident_suspicion_small' },
+      auditEvidence: 'frozen_report;run_only:missing|confident_small',
       implementation_finished: 'handoff_not_PASS_or_Git_finalization',
     });
-    expect(finalization.beforePass.forbid).toEqual(expect.arrayContaining(['stage', 'commit', 'push', 'deploy']));
-    expect(finalization.git).toMatchObject({ conflict: 'block', add: 'explicit_non_broad_pathspec' });
+    expect(finalization.beforePass).toContain('stage|commit|push');
+    expect(finalization.git).toMatchObject({ conflict: 'block', add: 'explicit_only;ban_dot/-A' });
+    expect(finalization.loadValidation).toContain('Docker CPU-limited preferred');
+    expect(finalization.loadValidation).toContain('capped host fallback only');
+    expect(finalization.loadValidation).toContain('uncapped/all-core burners forbidden');
 
     const registry = JSON.parse(buildSupervisionTaskRegistryContract('en'));
     expect(registry.metadata).toMatchObject({ mode: 'record_only', authority: false });
@@ -149,12 +154,40 @@ describe('supervision prompts', () => {
     const prompt = buildSupervisedAuditExecutionPreamble('zh-CN');
     expect(prompt).toContain('"auditMode":true');
     expect(prompt).toContain('"beforePass":"no_delivery_finalization"');
-    expect(prompt).toContain('"auditorRuns":"only_missing_report_or_confident_suspicion_small"');
+    expect(prompt).toContain('"auditEvidence":"frozen_report;run_only:missing|confident_small"');
+    expect(prompt).toContain('Docker CPU-limited preferred');
+    expect(prompt).toContain('capped host fallback only');
+    expect(prompt).toContain('uncapped/all-core burners forbidden');
     expect(prompt).not.toContain(RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER);
     expect(prompt).toContain('"completion":"registry_intent_only"');
     expect(prompt).toContain('file_output_v1; auto-audit enabled');
     expect(prompt).toContain('Brain coordinates and integrates');
     expect(prompt).not.toContain('同伴审计模式');
+  });
+
+  it('puts the load-safety contract in task-run, implementer, auditor, rework, and auto-audit paths', () => {
+    const taskRun = appendTaskRunContract('run task');
+    const peer = buildPeerAuditBriefV1({
+      attemptId: 'attempt_load_safety',
+      taskRequest: 'review',
+      completedResult: 'done',
+      acceptanceCriteria: ['safe load validation'],
+      validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: 'passed' }],
+    });
+    const rework = buildReworkBriefPrompt('deck_cd_worker', 'task', undefined, 'finding', undefined, undefined, 'en');
+    const automatic = buildAutomaticAuditTaskPrompt({
+      attemptId: 'attempt_load_safety', targetSession: 'deck_cd_auditor',
+      auditedSessionName: 'deck_cd_worker', narrow: false, uiLocale: 'en',
+    });
+    for (const rendered of [
+      taskRun, buildSupervisionExecutionPreamble('en'), buildSupervisedAuditExecutionPreamble('en'),
+      peer, rework, automatic,
+    ]) {
+      expect(rendered).toMatch(/(?:Docker (?:CPU-limited )?preferred|prefer (?:CPU-limited )?Docker)/);
+      expect(rendered).toMatch(/(?:capped host fallback only|host fallback.*min\(2cpu,25%\)|host load is allowed only when capped)/);
+      expect(rendered).toMatch(/(?:ban|never)/i);
+      expect(rendered).toMatch(/uncapped\/all-core/i);
+    }
   });
 
   it('encodes status-marker priority without prose expansion', () => {
@@ -1113,6 +1146,7 @@ describe('audit convergence contract on every supervision audit surface', () => 
       expect(prompt).toContain(ref);
       expect(prompt).toContain('"role":"orchestrator"');
       for (const sentinel of evidencePolicySentinels[uiLocale]) expect(prompt).toContain(sentinel);
+      expect(prompt).toContain(LOAD_VALIDATION_SAFETY_BY_LOCALE[uiLocale]);
       expect(prompt).not.toContain(body);
     });
 

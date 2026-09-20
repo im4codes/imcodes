@@ -18,7 +18,6 @@ import {
   SUPERVISION_EXECUTION_STATUS_MARKERS,
   SUPERVISION_MODE,
   SUPERVISION_TASK_FINALIZATION_FORBIDDEN_STAGE_PREFIXES,
-  SUPERVISION_TASK_FINALIZATION_FORBIDDEN_GIT_ADD,
   SUPERVISION_TASK_FINALIZATION_CONTRACT,
   SUPERVISION_TASK_REGISTRY_CONTRACT,
   SUPERVISION_TRUSTED_CONTRACT_DELIVERY,
@@ -33,6 +32,12 @@ import {
 } from '../../shared/supervision-config.js';
 import { SUPERVISION_IMCODES_BACKGROUND_DOCS } from './imcodes-workflow-docs.js';
 import { FILE_OUTPUT_CONTRACT_ID } from '../../shared/file-output-contract.js';
+import {
+  LOAD_VALIDATION_SAFETY_BY_LOCALE,
+  LOAD_VALIDATION_SAFETY_CLAUSE,
+  LOAD_VALIDATION_SAFETY_COMPACT,
+  LOAD_VALIDATION_SAFETY_PREAMBLE,
+} from '../../shared/load-validation-safety.js';
 import type { SupervisionBrokerRequest, SupervisionRecentEvidence } from './supervision-broker.js';
 import {
   PEER_AUDIT_BRIEF_REQUEST_BYTES,
@@ -87,6 +92,7 @@ function boundSupervisionRules(text: string): { text: string; truncated: boolean
 type ExecutionPromptCopy = {
   auditPreamble: string;
   auditEvidencePolicy: string;
+  loadSafety: string;
   reworkLoop: string;
   continueTask: string;
   executionMode: string;
@@ -103,6 +109,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   en: {
     auditPreamble: 'Peer-audit mode: finish implementation and validation, but DO NOT stage, commit, push, merge, release, publish, or deploy before PASS.',
     auditEvidencePolicy: 'Auditor evidence policy: audit from code plus the exact-revision implementer test report. DEFAULT-ACCEPT that report after binding and coherence review; do not run tests, typechecks, builds, mutants, probes, or reproductions. Only when no usable exact-revision report exists may the auditor run the minimal check needed to fill that gap. A confident concrete suspicion permits one small targeted check; do not REWORK merely to request it. Limit any check to one test file or a few named tests, or one mutant, --maxWorkers<=2, seconds-to-a-few-minutes; never a full project/build/coverage/e2e. Never invent a result.',
+    loadSafety: LOAD_VALIDATION_SAFETY_BY_LOCALE.en,
     reworkLoop: 'On REWORK, fix the whole defect class the findings describe -- every affected instance and call site, not only the exact reported counterexample -- and validate immediately, then send the instructed reply-enabled re-audit; repeat until PASS or an exact blocker.',
     continueTask: 'Continue the same task.', executionMode: 'Execution mode', actionHint: 'Supervisor hint (verify first)', gapHint: 'Reported gap (advisory)', reasonHint: 'Rationale (advisory)',
     ownContext: 'Use your own context: advance safe unfinished work now; do not stop at a summary or repeat completed work.',
@@ -111,6 +118,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   'zh-CN': {
     auditPreamble: '同伴审计模式：先完成实现与验证；PASS 前不得暂存、提交、推送、合并、发布或部署。',
     auditEvidencePolicy: '审计员证据策略：只根据代码和精确版本的实现者测试报告审计。绑定并核对一致性后默认接受该报告；不得运行测试、typecheck、构建、变异、探针或复现。仅当没有可用的精确版本报告时，审计员才可运行填补该缺口所需的最小检查。仅对某个具体行为有确信疑点时，才可自行运行一个小型定向检查确认或排除；不得仅为索要该检查而 REWORK。检查限单文件/少量用例或一个 mutant、--maxWorkers<=2、数秒到数分钟，绝不运行完整项目/build/coverage/e2e；不得伪造结果。',
+    loadSafety: LOAD_VALIDATION_SAFETY_BY_LOCALE['zh-CN'],
     reworkLoop: '收到 REWORK 后，修复发现所指的整类缺陷——覆盖每一个受影响的实例和调用点，不能只针对给出的那个具体反例——并立即验证，再按指示发送可回执复审；循环至 PASS 或明确阻断。',
     continueTask: '继续同一任务。', executionMode: '执行模式', actionHint: '监督提示（先核对）', gapHint: '监督报告缺口（仅供参考）', reasonHint: '监督理由（仅供参考）',
     ownContext: '以你自己的上下文为准：本轮立即推进可安全处理的未完成项；不要只做总结或重复已完成工作。',
@@ -119,6 +127,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   'zh-TW': {
     auditPreamble: '同伴審計模式：先完成實作與驗證；PASS 前不得暫存、提交、推送、合併、發佈或部署。',
     auditEvidencePolicy: '審計員證據策略：只依程式碼與精確版本的實作者測試報告審計。綁定並核對一致性後預設接受該報告；不得執行測試、typecheck、建置、突變、探針或重現。只有沒有可用的精確版本報告時，審計員才可執行填補缺口所需的最小檢查。僅對某個具體行為有確信疑點時，才可自行執行一個小型定向檢查確認或排除；不得只為索取該檢查而 REWORK。檢查限單檔/少量案例或一個 mutant、--maxWorkers<=2、數秒到數分鐘，絕不執行完整專案/build/coverage/e2e；不得捏造結果。',
+    loadSafety: LOAD_VALIDATION_SAFETY_BY_LOCALE['zh-TW'],
     reworkLoop: '收到 REWORK 後，修復發現所指的整類缺陷——涵蓋每一個受影響的實例與呼叫點，不能只針對給出的那個具體反例——並立即驗證，再依指示發送可回執複審；循環至 PASS 或明確阻斷。',
     continueTask: '繼續同一任務。', executionMode: '執行模式', actionHint: '監督提示（先核對）', gapHint: '監督回報缺口（僅供參考）', reasonHint: '監督理由（僅供參考）',
     ownContext: '以你自己的上下文為準：本輪立即推進可安全處理的未完成項；不要只做摘要或重複已完成工作。',
@@ -127,6 +136,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   es: {
     auditPreamble: 'Modo de auditoría: termina implementación y validación; antes de PASS no prepares, confirmes, envíes, fusiones, publiques ni despliegues.',
     auditEvidencePolicy: 'Política del auditor: audita desde el código y el informe de pruebas del implementador ligado a la revisión exacta. Acéptalo por defecto tras revisar vínculo y coherencia; no ejecutes tests, typecheck, builds, mutantes, sondas ni reproducciones. Solo si no existe un informe exacto utilizable puede el auditor ejecutar la comprobación mínima que cubra esa ausencia. Solo una sospecha concreta y segura permite una comprobación pequeña y dirigida; no uses REWORK solo para pedirla. Límite: un archivo o pocos tests, o un mutante, --maxWorkers<=2, segundos a pocos minutos; nunca proyecto completo/build/coverage/e2e. Nunca inventes resultados.',
+    loadSafety: LOAD_VALIDATION_SAFETY_BY_LOCALE.es,
     reworkLoop: 'Tras REWORK, corrige toda la clase de defecto que describen los hallazgos -- cada instancia y punto de llamada afectado, no solo el contraejemplo exacto reportado -- y valida de inmediato; luego envía la nueva auditoría con respuesta hasta PASS o un bloqueo exacto.',
     continueTask: 'Continúa la misma tarea.', executionMode: 'Modo de ejecución', actionHint: 'Sugerencia del supervisor (verifica primero)', gapHint: 'Falta informada (orientativa)', reasonHint: 'Motivo (orientativo)',
     ownContext: 'Usa tu propio contexto: avanza ahora el trabajo pendiente seguro; no te detengas en un resumen ni repitas lo completado.',
@@ -135,6 +145,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   ru: {
     auditPreamble: 'Режим аудита: завершите реализацию и проверку; до PASS нельзя индексировать, коммитить, отправлять, сливать, публиковать или развёртывать.',
     auditEvidencePolicy: 'Политика аудитора: проверяйте код и отчёт исполнителя, точно привязанный к ревизии. По умолчанию принимайте отчёт после проверки привязки и согласованности; не запускайте tests, typecheck, builds, mutants, probes или воспроизведения. Только при отсутствии пригодного отчёта для точной ревизии аудитор может выполнить минимальную проверку, закрывающую этот пробел. Только уверенное конкретное подозрение разрешает одну малую целевую проверку; не используйте REWORK лишь для её запроса. Лимит: один файл/несколько тестов или один mutant, --maxWorkers<=2, секунды–несколько минут; никогда полный проект/build/coverage/e2e. Не выдумывайте результаты.',
+    loadSafety: LOAD_VALIDATION_SAFETY_BY_LOCALE.ru,
     reworkLoop: 'После REWORK исправьте весь класс дефекта, который описывают выводы, -- каждый затронутый экземпляр и место вызова, а не только приведённый контрпример, -- и сразу проверьте, затем отправьте указанную повторную проверку с ответом; повторяйте до PASS или точной блокировки.',
     continueTask: 'Продолжайте ту же задачу.', executionMode: 'Режим выполнения', actionHint: 'Подсказка надзора (сначала проверьте)', gapHint: 'Указанный пробел (справочно)', reasonHint: 'Причина (справочно)',
     ownContext: 'Опирайтесь на свой контекст: сейчас продвигайте безопасную незавершённую работу; не останавливайтесь на отчёте и не повторяйте готовое.',
@@ -143,6 +154,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   ja: {
     auditPreamble: 'ピア監査モード：実装と検証を完了し、PASS 前はステージ、コミット、プッシュ、マージ、公開、デプロイをしないでください。',
     auditEvidencePolicy: '監査員ポリシー：コードと正確な revision に紐づく実装者テスト報告から監査します。binding と整合性確認後は報告を既定で受理し、test、typecheck、build、mutant、probe、再現を実行しません。利用可能な正確な報告がない場合だけ、その不足を埋める最小確認を実行できます。特定動作への確信ある具体的疑念だけが小さな対象確認を1回許可します。その確認を依頼するだけの REWORK は禁止です。1ファイル/少数テストまたは1 mutant、--maxWorkers<=2、数秒〜数分に限定し、full project/build/coverage/e2e は禁止します。結果を捏造しないでください。',
+    loadSafety: LOAD_VALIDATION_SAFETY_BY_LOCALE.ja,
     reworkLoop: 'REWORK 後は、所見が示す欠陥のクラス全体——影響を受けるすべてのインスタンスと呼び出し箇所——を修正してください。報告された具体的な反例だけを直すのではありません。直ちに検証し、指示された返信可能な再監査を送信してください。PASS または明確な障害まで繰り返します。',
     continueTask: '同じタスクを続行してください。', executionMode: '実行モード', actionHint: '監督ヒント（先に確認）', gapHint: '報告された不足（参考）', reasonHint: '理由（参考）',
     ownContext: '自分の文脈を優先し、安全に進められる未完了作業を今すぐ進めてください。要約だけで止まらず、完了済み作業を繰り返さないでください。',
@@ -151,6 +163,7 @@ const EXECUTION_PROMPT_COPY: Record<SupervisionUiLocale, ExecutionPromptCopy> = 
   ko: {
     auditPreamble: '동료 감사 모드: 구현과 검증을 완료하고 PASS 전에는 스테이징, 커밋, 푸시, 병합, 게시, 배포하지 마세요.',
     auditEvidencePolicy: '감사자 정책: 코드와 정확한 revision에 묶인 구현자 테스트 보고서로 감사합니다. binding과 일관성을 확인한 뒤 보고서를 기본 수용하며 test, typecheck, build, mutant, probe, 재현을 실행하지 않습니다. 사용할 수 있는 정확한 보고서가 없을 때만 그 공백을 메우는 최소 검사를 실행할 수 있습니다. 특정 동작에 대한 확신 있는 구체적 의심만 작은 표적 검사 1회를 허용하며, 그 검사를 요청하려고 REWORK하면 안 됩니다. 한 파일/소수 테스트 또는 mutant 1개, --maxWorkers<=2, 수초~수분으로 제한하고 full project/build/coverage/e2e는 금지합니다. 결과를 조작하지 마세요.',
+    loadSafety: LOAD_VALIDATION_SAFETY_BY_LOCALE.ko,
     reworkLoop: 'REWORK 후에는 발견 사항이 가리키는 결함 전체 클래스—영향을 받는 모든 인스턴스와 호출 지점—를 수정하세요. 보고된 구체적 반례만 고치는 것이 아닙니다. 즉시 검증하고 안내된 회신 가능 재감사를 보내세요. PASS 또는 명확한 차단 사유까지 반복합니다.',
     continueTask: '같은 작업을 계속하세요.', executionMode: '실행 모드', actionHint: '감독 힌트(먼저 확인)', gapHint: '보고된 누락(참고)', reasonHint: '이유(참고)',
     ownContext: '자신의 문맥을 기준으로 지금 안전한 미완료 작업을 진행하세요. 요약만 하고 멈추거나 완료한 작업을 반복하지 마세요.',
@@ -536,17 +549,15 @@ export function buildSupervisionTaskFinalizationContract(_locale?: SupervisionUi
       bind: ['attemptId', 'revision'],
       oldPassReleasesNewRevision: false,
     },
-    beforePass: { forbid: ['stage', 'commit', 'push', 'merge', 'release', 'publish', 'deploy'] },
+    beforePass: 'no_stage|commit|push|merge|release|publish|deploy',
     authority: 'actual_worktree+Git_bytes',
-    git: { conflict: 'block', add: 'explicit_non_broad_pathspec', forbidAdd: SUPERVISION_TASK_FINALIZATION_FORBIDDEN_GIT_ADD, forbidStagePrefixes: SUPERVISION_TASK_FINALIZATION_FORBIDDEN_STAGE_PREFIXES },
+    git: { conflict: 'block', add: 'explicit_only;ban_dot/-A', stageBan: SUPERVISION_TASK_FINALIZATION_FORBIDDEN_STAGE_PREFIXES },
     // The adjacent task-registry contract owns the full metadata schema. A
     // reference here preserves that authority without duplicating 100+ bytes in
     // every execution, audit, decision, and repair preamble.
     metadata: 'task_registry_contract',
-    auditEvidence: {
-      frozenFirst: true,
-      auditorRuns: 'only_missing_report_or_confident_suspicion_small',
-    },
+    auditEvidence: 'frozen_report;run_only:missing|confident_small',
+    loadValidation: LOAD_VALIDATION_SAFETY_PREAMBLE,
     implementation_finished: 'handoff_not_PASS_or_Git_finalization',
   });
 }
@@ -983,6 +994,7 @@ export function buildAutomaticAuditTaskPrompt(options: {
       ? `${options.uiLocale && options.uiLocale !== 'en' ? 'Paths' : 'Observed changed paths'}: ${options.changedPaths.join(', ')}`
       : '',
     evidencePolicy,
+    resolveExecutionPromptCopy(options.uiLocale).loadSafety,
     buildSupervisionContractsInForceLine(),
     buildAuditConvergenceContractRef(AUDIT_CONVERGENCE_ROLES.ORCHESTRATOR, options.blockingSeverities),
   ].filter(Boolean).join('\n');
@@ -1021,6 +1033,7 @@ export function buildAuditTargetRecoveryPrompt(options: {
     ...identityLines,
     action,
     resolveExecutionPromptCopy(options.uiLocale).auditEvidencePolicy,
+    resolveExecutionPromptCopy(options.uiLocale).loadSafety,
     options.replyInstruction,
   ].join('\n');
 }
@@ -1214,6 +1227,7 @@ export function buildPeerAuditBriefV1(input: PeerAuditBriefV1Input): string {
     'Review all in-scope code and acceptance criteria. Separate observed evidence from inference.',
     ...evidencePolicy,
     'AUDITOR CHECK HARD LIMIT: one test file or a few named tests, or one mutant; `--maxWorkers<=2`; seconds-to-a-few-minutes. Never run a full test project, full build, coverage, or e2e. State which small check ran and why.',
+    LOAD_VALIDATION_SAFETY_CLAUSE,
     'Normally: exact binding, code review, and acceptance of the exact-revision report with no duplicate execution. Only a missing/unusable report or one confident, concrete suspicion permits the small check above.',
     'You MUST NOT modify tracked source, commit, push, deploy, mutate production, or alter persistent external/product state. Do not run reset/clean. Inspect worktree state before and after, preserve pre-existing changes, and stop/report if validation creates an unexpected tracked diff.',
     'Treat `git status` as a signal, not proof of a content change. Before classifying an unexpected EOL-only path as task contamination, compare the HEAD blob, raw working-tree bytes, and the attribute-cleaned hash (`git hash-object --path`). If raw bytes equal HEAD but the clean hash differs, report one repository-normalization defect; do not include that unrelated path in the candidate diff/archive, and do not hide it with reset, clean, or assume-unchanged. If raw bytes differ from HEAD, keep the normal fail-closed contamination rule. An explicit normalization task may include the path.',
@@ -1531,6 +1545,7 @@ export function appendTaskRunContract(
         human: TASK_RUN_STATUS_MARKERS.NEEDS_INPUT,
         blocked: TASK_RUN_STATUS_MARKERS.BLOCKED,
       },
+      loadValidation: LOAD_VALIDATION_SAFETY_COMPACT,
     }),
   ].join('\n');
 }
@@ -1641,6 +1656,7 @@ export function buildReworkBriefPrompt(
     text.verdict,
     `${text.fix}:\n${findings}`,
     copy.reworkLoop,
+    copy.loadSafety,
     ...(auditTargetSessionName ? [
       `${text.target}: ${auditTargetSessionName}`,
       text.reaudit(auditTargetSessionName, auditedSessionName),

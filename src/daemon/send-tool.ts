@@ -107,6 +107,7 @@ import type {
   SupervisionProvisioningEvidence,
 } from '../../shared/supervision-execution-pool.js';
 import type { SupervisionAuditorRecoveryCrossVendorAvailability } from '../../shared/supervision-auditor-recovery.js';
+import { LOAD_VALIDATION_SAFETY_CLAUSE } from '../../shared/load-validation-safety.js';
 import type {
   SupervisionAutoProvisionRequest,
   SupervisionAutoProvisionResult,
@@ -3603,6 +3604,7 @@ function boundedAuditBrief(
     'DEFAULT: accept the implementer report after binding/coherence review and run no tests, typechecks, builds, mutants, probes, or reproductions. Record accepted rows with kind `accepted_implementer_validation`.',
     'EXCEPTIONS: if no usable exact-revision report exists, run only the minimal gap-filling check. If you have a confident concrete suspicion about one specific behavior, run one small targeted check instead of REWORK merely to request it.',
     'HARD LIMIT: one test file or a few named tests, or one mutant; --maxWorkers<=2; seconds-to-a-few-minutes. Never run a full test project, full build, coverage, or e2e. State which small check ran and why.',
+    LOAD_VALIDATION_SAFETY_CLAUSE,
     'Do not edit code, stage, commit, push, deploy, install, upgrade, restart, or create a replacement task/audit.',
     'On PASS, integrationOwner is the same-project Brain; on failure report bounded concrete findings.',
     '',

@@ -1609,6 +1609,9 @@ describe('automatic supervision audit materialization', () => {
       expect(input.message).toContain('one test file or a few named tests, or one mutant');
       expect(input.message).toContain('--maxWorkers<=2');
       expect(input.message).toContain('Never run a full test project, full build, coverage, or e2e');
+      expect(input.message).toContain('prefer CPU-limited Docker');
+      expect(input.message).toContain('host load is allowed only when capped');
+      expect(input.message).toContain('Never use uncapped/all-core host burners');
       const created = registry.createAssignment({
         taskId,
         role: 'auditor',

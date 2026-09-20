@@ -132,6 +132,12 @@ describe('audit convergence contract', () => {
     expect(contract.evidence.dbMigration).toMatch(/production-shaped/);
     expect(contract.evidence.deployOrRollback).toMatch(/fault injection/);
     expect(contract.evidence.postDeployGate).toMatch(/secrets/);
+    expect(contract.evidence.loadSafety).toMatch(/Docker preferred/);
+    expect(contract.evidence.loadSafety).toMatch(/host fallback.*min\(2cpu,25%\)/);
+    expect(contract.evidence.loadSafety).toMatch(/ban uncapped\/all-core/);
+    for (const limit of ['--cpus', '--memory', '--pids-limit', 'timeout', '--rm', '<=2 nice19', 'trap burners+cleanup']) {
+      expect(contract.evidence.loadSafety).toContain(limit);
+    }
     expect(contract.evidence).not.toHaveProperty('missing');
     expect(contract.slices).toMatch(/one combined audit/);
     expect(contract.commentOrDocOnly).toMatch(/binding check only/);
