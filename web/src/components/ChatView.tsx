@@ -4898,17 +4898,34 @@ const ChatEvent = memo(function ChatEvent({
             </details>
           )}
           {result && (
-            <div class="delegation-reply-card-body">
-              <ChatMarkdown
-                text={result}
-                onPathClick={onPathClick}
-                onUrlClick={onUrlClick}
-                onDownload={onDownload}
-                onHtmlPreview={onHtmlPreview}
-                onImagePreview={onImagePreview}
-                onOpenLocalWebPreview={onOpenLocalWebPreview}
-              />
-            </div>
+            verdict ? (
+              <details class="delegation-reply-card-findings">
+                <summary>{t('peerAuditResult.findingsPreview')}</summary>
+                <div class="delegation-reply-card-body">
+                  <ChatMarkdown
+                    text={result}
+                    onPathClick={onPathClick}
+                    onUrlClick={onUrlClick}
+                    onDownload={onDownload}
+                    onHtmlPreview={onHtmlPreview}
+                    onImagePreview={onImagePreview}
+                    onOpenLocalWebPreview={onOpenLocalWebPreview}
+                  />
+                </div>
+              </details>
+            ) : (
+              <div class="delegation-reply-card-body">
+                <ChatMarkdown
+                  text={result}
+                  onPathClick={onPathClick}
+                  onUrlClick={onUrlClick}
+                  onDownload={onDownload}
+                  onHtmlPreview={onHtmlPreview}
+                  onImagePreview={onImagePreview}
+                  onOpenLocalWebPreview={onOpenLocalWebPreview}
+                />
+              </div>
+            )
           )}
           <ChatTime ts={event.ts} />
         </section>

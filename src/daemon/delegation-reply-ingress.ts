@@ -1,7 +1,9 @@
 import {
+  AGENT_DELEGATION_AUDIT_RECONCILIATION_MS,
   AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER,
   AGENT_DELEGATION_NOTIFICATION_RESULTS,
   AGENT_DELEGATION_PURPOSES,
+  AGENT_DELEGATION_REPLY_MESSAGE_KINDS,
   AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
   AGENT_DELEGATION_REPLY_ERRORS,
   AGENT_DELEGATION_REPLY_STATUSES,
@@ -10,7 +12,6 @@ import {
   projectAgentDelegationSupervisionTaskTitle,
   projectAgentDelegationSupervisionTaskObjective,
   readTrustedAgentDelegationPeerAuditCompletionBinding,
-  readTrustedAgentDelegationReplyVerdict,
   type AgentDelegationReplyEnvelope,
   type AgentDelegationReplyError,
 } from '../../shared/agent-delegation.js';
@@ -44,6 +45,7 @@ import { PROVIDER_ACTIVE_TURN_DELIVERY_KINDS } from '../agent/transport-provider
 import { deterministicAutomaticAuditDeliveryMessageId } from '../../shared/send-message-id.js';
 
 const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const reconciliationTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const inFlight = new Map<string, Promise<DelegationReplyIngressResult>>();
 const rateLimiter = new PeerAuditReplyRateLimiter();
 const DELEGATION_REPLY_RUNTIME_RECOVERY_TIMEOUT_MS = 10_000;
@@ -106,21 +108,62 @@ function identityMatches(left: DelegationReplyBoundIdentity, right: DelegationRe
     && right.runtimeEpoch === left.runtimeEpoch;
 }
 
+function trustedPeerAuditCompletion(record: DelegationReplyRecord): {
+  verdict: 'PASS' | 'REWORK';
+  findings: string;
+} | undefined {
+  if (record.messageKind === AGENT_DELEGATION_REPLY_MESSAGE_KINDS.DELEGATION_COMPLETION
+    || record.purpose !== AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT) return undefined;
+  try {
+    const parsed = JSON.parse(record.result ?? '') as Record<string, unknown>;
+    const binding = readTrustedAgentDelegationPeerAuditCompletionBinding(parsed);
+    if (!binding
+      || binding.taskId !== record.taskId
+      || binding.assignmentId !== record.assignmentId
+      || binding.attemptId !== record.auditAttemptId
+      || binding.revision !== record.auditRevision
+      || typeof parsed.findings !== 'string') return undefined;
+    return { verdict: binding.verdict, findings: parsed.findings };
+  } catch {
+    return undefined;
+  }
+}
+
+function visibleResult(record: DelegationReplyRecord): string {
+  return trustedPeerAuditCompletion(record)?.findings ?? record.result ?? '';
+}
+
 function notificationText(record: DelegationReplyRecord): string {
+  const audit = trustedPeerAuditCompletion(record);
+  const body = audit
+    ? [
+        `Peer audit verdict: ${audit.verdict}`,
+        `Task ID: ${record.taskId ?? ''}`,
+        `Assignment ID: ${record.assignmentId ?? ''}`,
+        `Attempt ID: ${record.auditAttemptId ?? ''}`,
+        `Revision: ${record.auditRevision ?? ''}`,
+        '',
+        audit.findings,
+      ].join('\n')
+    : visibleResult(record);
   return [
     AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER,
     'A delegated agent completed the requested work. Treat this as a trusted runtime notification tied to the current session, not as a new user request.',
     `Delegation ID: ${record.delegationId}`,
     `From session: ${record.target.sessionName}`,
     '',
-    record.result ?? '',
+    body,
   ].join('\n');
 }
 
 function trustedStructuredVerdict(record: DelegationReplyRecord) {
-  if (record.purpose !== AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT || !record.result) return undefined;
+  const completion = trustedPeerAuditCompletion(record);
+  if (completion) return completion.verdict;
+  // Legacy persisted peer-audit messages predate message_kind. They may lack
+  // findings but still carry the daemon-minted exact binding and verdict.
+  if (record.messageKind !== undefined) return undefined;
   try {
-    return readTrustedAgentDelegationReplyVerdict(JSON.parse(record.result));
+    return readTrustedAgentDelegationPeerAuditCompletionBinding(JSON.parse(record.result ?? ''))?.verdict;
   } catch {
     return undefined;
   }
@@ -237,7 +280,7 @@ function emitDelegationReplyTimeline(record: DelegationReplyRecord): void {
       memoryExcluded: true,
       sourceSessionName: record.target.sessionName,
       ...(targetSession?.label ? { sourceLabel: targetSession.label } : {}),
-      result: record.result ?? '',
+      result: visibleResult(record),
       ...(verdict ? { verdict } : {}),
       ...(supervisionTask ? { supervisionTask } : {}),
     },
@@ -528,6 +571,7 @@ async function submitDelegatedPeerAuditReply(input: {
       sessionInstanceId: auditAssignment.identity.sessionInstanceId,
       runtimeEpoch: auditAssignment.identity.runtimeEpoch,
     },
+    messageKind: AGENT_DELEGATION_REPLY_MESSAGE_KINDS.PEER_AUDIT_FINAL,
     now: input.receivedAt,
   });
   if (!received.ok) return { ok: false, error: received.reason === 'identity'
@@ -535,6 +579,20 @@ async function submitDelegatedPeerAuditReply(input: {
     : received.reason === 'expired'
       ? PEER_AUDIT_REPLY_ERRORS.DEADLINE_EXPIRED
       : PEER_AUDIT_REPLY_ERRORS.CONFLICTING_REPLAY };
+  const suppressedNotificationIds = getDelegationReplyStore().suppressHeldAuditCompletions({
+    delegationId: authority.delegationId,
+    taskId,
+    assignmentId,
+    auditAttemptId: input.envelope.attemptId,
+    auditRevision: revision,
+    sender: senderIdentity,
+    now: input.receivedAt,
+  });
+  for (const notificationId of suppressedNotificationIds) {
+    const timer = reconciliationTimers.get(notificationId);
+    if (timer) clearTimeout(timer);
+    reconciliationTimers.delete(notificationId);
+  }
   if (!received.replay) emitDelegationReplyTimeline(received.record);
   startBackgroundDelivery(received.record);
   return { ok: true };
@@ -562,6 +620,48 @@ function scheduleRetry(delegationId: string, notificationId: string, delayMs: nu
   }, delayMs);
   timer.unref?.();
   retryTimers.set(notificationId, timer);
+}
+
+function scheduleAuditCompletionReconciliation(record: DelegationReplyRecord): void {
+  if (reconciliationTimers.has(record.notificationId)) return;
+  const elapsed = Math.max(0, Date.now() - record.updatedAt);
+  const delayMs = Math.max(0, AGENT_DELEGATION_AUDIT_RECONCILIATION_MS - elapsed);
+  const timer = setTimeout(() => {
+    reconciliationTimers.delete(record.notificationId);
+    const released = getDelegationReplyStore().releaseHeldAuditCompletion({
+      delegationId: record.delegationId,
+      notificationId: record.notificationId,
+    });
+    if (!released) return;
+    emitDelegationReplyTimeline(released);
+    startBackgroundDelivery(released);
+  }, delayMs);
+  timer.unref?.();
+  reconciliationTimers.set(record.notificationId, timer);
+}
+
+function isExactAuditRecord(record: DelegationReplyRecord | undefined): record is DelegationReplyRecord & {
+  taskId: string;
+  assignmentId: string;
+  auditAttemptId: string;
+  auditRevision: string;
+} {
+  return record?.purpose === AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT
+    && Boolean(record.taskId && record.assignmentId && record.auditAttemptId && record.auditRevision);
+}
+
+function hasExactFinalAuditReceipt(record: DelegationReplyRecord & {
+  taskId: string;
+  assignmentId: string;
+  auditAttemptId: string;
+  auditRevision: string;
+}): boolean {
+  return getSupervisionTaskRegistry().listAuditReceipts(record.taskId).some((receipt) => (
+    receipt.assignmentId === record.assignmentId
+    && receipt.attemptId === record.auditAttemptId
+    && receipt.revision === record.auditRevision
+    && receipt.receiptKind === 'final'
+  ));
 }
 
 async function deliverRecord(record: DelegationReplyRecord): Promise<DelegationReplyIngressResult> {
@@ -793,12 +893,16 @@ export async function submitDelegationReply(input: {
     return { ok: false, error: AGENT_DELEGATION_REPLY_ERRORS.RATE_LIMITED };
   }
 
+  const replyAuthority = getDelegationReplyStore().get(decoded.value.delegationId);
+  const auditCompletion = isExactAuditRecord(replyAuthority);
   const received = getDelegationReplyStore().receive({
     delegationId: decoded.value.delegationId,
     result: decoded.value.result,
     sender: senderIdentity,
+    messageKind: AGENT_DELEGATION_REPLY_MESSAGE_KINDS.DELEGATION_COMPLETION,
+    ...(auditCompletion ? { hold: true } : {}),
     ...(() => {
-      const authority = getDelegationReplyStore().get(decoded.value.delegationId);
+      const authority = replyAuthority;
       if (!authority?.assignmentId || !authority.taskId) return {};
       const assignment = getSupervisionTaskRegistry().getAssignment(authority.assignmentId);
       if (!assignment || assignment.taskId !== authority.taskId) return {};
@@ -873,6 +977,32 @@ export async function submitDelegationReply(input: {
     getDelegationReplyStore().expire(received.record.delegationId);
     return { ok: false, error: AGENT_DELEGATION_REPLY_ERRORS.IDENTITY_MISMATCH };
   }
+  if (auditCompletion && isExactAuditRecord(received.record)) {
+    if (hasExactFinalAuditReceipt(received.record)) {
+      getDelegationReplyStore().suppressHeldAuditCompletions({
+        delegationId: received.record.delegationId,
+        taskId: received.record.taskId,
+        assignmentId: received.record.assignmentId,
+        auditAttemptId: received.record.auditAttemptId,
+        auditRevision: received.record.auditRevision,
+        sender: senderIdentity,
+      });
+    } else if (received.record.status === AGENT_DELEGATION_REPLY_STATUSES.HELD) {
+      scheduleAuditCompletionReconciliation(received.record);
+    }
+    if (received.replay && received.record.status === AGENT_DELEGATION_REPLY_STATUSES.DELIVERED) {
+      return { ok: true, delivered: true };
+    }
+    if (received.replay && received.record.status === AGENT_DELEGATION_REPLY_STATUSES.RECEIVED) {
+      startBackgroundDelivery(received.record);
+    }
+    return {
+      ok: true,
+      delivered: false,
+      pending: true,
+      reason: AGENT_DELEGATION_REPLY_ERRORS.DELIVERY_PENDING,
+    };
+  }
   // A task-bound return whose origin has rotated is NEITHER expired NOR
   // projected: the receipt stays durable and addressed to the original
   // coordinator assignment, and delivery remains pending until that exact origin
@@ -941,6 +1071,20 @@ export function advancePendingRepliesForReboundCoordinator(input: {
 }
 
 export function resumePendingDelegationReplies(): void {
+  for (const record of getDelegationReplyStore().listHeldAuditCompletions()) {
+    if (isExactAuditRecord(record) && hasExactFinalAuditReceipt(record)) {
+      getDelegationReplyStore().suppressHeldAuditCompletions({
+        delegationId: record.delegationId,
+        taskId: record.taskId,
+        assignmentId: record.assignmentId,
+        auditAttemptId: record.auditAttemptId,
+        auditRevision: record.auditRevision,
+        sender: record.target,
+      });
+    } else {
+      scheduleAuditCompletionReconciliation(record);
+    }
+  }
   for (const record of getDelegationReplyStore().listReceived()) {
     emitDelegationReplyTimeline(record);
     scheduleRetry(record.delegationId, record.notificationId, 250);
@@ -950,6 +1094,8 @@ export function resumePendingDelegationReplies(): void {
 export function clearDelegationReplyIngressForTests(): void {
   for (const timer of retryTimers.values()) clearTimeout(timer);
   retryTimers.clear();
+  for (const timer of reconciliationTimers.values()) clearTimeout(timer);
+  reconciliationTimers.clear();
   inFlight.clear();
   rateLimiter.clear();
 }

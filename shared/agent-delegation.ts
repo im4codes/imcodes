@@ -60,6 +60,9 @@ export const AGENT_DELEGATION_REPLY_TOTAL_BYTES = 64 * 1024;
 export const AGENT_DELEGATION_REPLY_RESULT_BYTES = 48 * 1024;
 export const AGENT_DELEGATION_REPLY_TTL_MS = 24 * 60 * 60_000;
 export const AGENT_DELEGATION_REPLY_MAX_MESSAGES = 64;
+/** Briefly hold an audit delegation completion so the verdict-channel receipt
+ * from the same turn can win without producing a duplicate notification. */
+export const AGENT_DELEGATION_AUDIT_RECONCILIATION_MS = 2_000;
 export const AGENT_DELEGATION_ID_MAX_BYTES = 256;
 export const AGENT_DELEGATION_REPLY_ERRORS = {
   OVERSIZE: 'oversize',
@@ -364,12 +367,21 @@ export function buildAgentDelegationAuditEnvelope(input: {
 
 export const AGENT_DELEGATION_REPLY_STATUSES = {
   PENDING: 'pending',
+  HELD: 'held',
   RECEIVED: 'received',
   DELIVERED: 'delivered',
+  SUPPRESSED: 'suppressed',
   EXPIRED: 'expired',
 } as const;
 export type AgentDelegationReplyStatus =
   (typeof AGENT_DELEGATION_REPLY_STATUSES)[keyof typeof AGENT_DELEGATION_REPLY_STATUSES];
+
+export const AGENT_DELEGATION_REPLY_MESSAGE_KINDS = {
+  DELEGATION_COMPLETION: 'delegation_completion',
+  PEER_AUDIT_FINAL: 'peer_audit_final',
+} as const;
+export type AgentDelegationReplyMessageKind =
+  (typeof AGENT_DELEGATION_REPLY_MESSAGE_KINDS)[keyof typeof AGENT_DELEGATION_REPLY_MESSAGE_KINDS];
 
 export const AGENT_DELEGATION_NOTIFICATION_RESULTS = {
   DELIVERED: 'delivered',

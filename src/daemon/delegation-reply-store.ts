@@ -6,10 +6,13 @@ import { dirname, join } from 'node:path';
 
 import {
   AGENT_DELEGATION_PURPOSES,
+  AGENT_DELEGATION_REPLY_MESSAGE_KINDS,
   AGENT_DELEGATION_REPLY_STATUSES,
   AGENT_DELEGATION_REPLY_MAX_MESSAGES,
   AGENT_DELEGATION_REPLY_TTL_MS,
+  readTrustedAgentDelegationPeerAuditCompletionBinding,
   type AgentDelegationPurpose,
+  type AgentDelegationReplyMessageKind,
   type AgentDelegationReplyStatus,
 } from '../../shared/agent-delegation.js';
 import { suppressSqliteExperimentalWarning } from '../util/suppress-sqlite-warning.js';
@@ -20,6 +23,16 @@ const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 type DatabaseSyncInstance = InstanceType<typeof DatabaseSync>;
 
 const DEFAULT_DB_PATH = join(homedir(), '.imcodes', 'delegation-replies.sqlite');
+
+function persistedMessageKind(result: string): AgentDelegationReplyMessageKind {
+  try {
+    return readTrustedAgentDelegationPeerAuditCompletionBinding(JSON.parse(result))
+      ? AGENT_DELEGATION_REPLY_MESSAGE_KINDS.PEER_AUDIT_FINAL
+      : AGENT_DELEGATION_REPLY_MESSAGE_KINDS.DELEGATION_COMPLETION;
+  } catch {
+    return AGENT_DELEGATION_REPLY_MESSAGE_KINDS.DELEGATION_COMPLETION;
+  }
+}
 
 export interface DelegationReplyBoundIdentity {
   sessionName: string;
@@ -36,6 +49,7 @@ export interface DelegationReplyRecord {
   dispatchId: string;
   messageId: string;
   notificationId: string;
+  messageKind?: AgentDelegationReplyMessageKind;
   purpose?: AgentDelegationPurpose;
   auditAttemptId?: string;
   auditRevision?: string;
@@ -146,6 +160,9 @@ function parseRow(row: Record<string, unknown>): DelegationReplyRecord {
   const coordinatorAssignmentId = typeof row.coordinatorAssignmentId === 'string' && row.coordinatorAssignmentId
     ? row.coordinatorAssignmentId
     : undefined;
+  const messageKind = typeof row.messageKind === 'string' && row.messageKind
+    ? row.messageKind as AgentDelegationReplyMessageKind
+    : undefined;
   return {
     delegationId: rowString(row, 'delegationId'),
     capabilityHash: rowString(row, 'capabilityHash'),
@@ -162,6 +179,7 @@ function parseRow(row: Record<string, unknown>): DelegationReplyRecord {
     dispatchId: rowString(row, 'dispatchId'),
     messageId: rowString(row, 'messageId'),
     notificationId: rowString(row, 'notificationId'),
+    ...(messageKind ? { messageKind } : {}),
     ...(purpose ? { purpose } : {}),
     ...(auditAttemptId ? { auditAttemptId } : {}),
     ...(auditRevision ? { auditRevision } : {}),
@@ -231,6 +249,7 @@ export class DelegationReplyStore {
         delegation_id TEXT NOT NULL,
         result_key TEXT NOT NULL,
         notification_id TEXT NOT NULL UNIQUE,
+        message_kind TEXT NOT NULL DEFAULT 'delegation_completion',
         result TEXT NOT NULL,
         status TEXT NOT NULL,
         created_at INTEGER NOT NULL,
@@ -264,6 +283,20 @@ export class DelegationReplyStore {
     if (!names.has('coordinator_assignment_id')) {
       this.#db.exec('ALTER TABLE delegation_replies ADD COLUMN coordinator_assignment_id TEXT');
     }
+    const messageColumns = this.#db.prepare('PRAGMA table_info(delegation_reply_messages)').all() as Array<{ name?: unknown }>;
+    if (!new Set(messageColumns.map((column) => String(column.name ?? ''))).has('message_kind')) {
+      this.#db.exec(`ALTER TABLE delegation_reply_messages ADD COLUMN message_kind TEXT NOT NULL DEFAULT '${AGENT_DELEGATION_REPLY_MESSAGE_KINDS.DELEGATION_COMPLETION}'`);
+      // Before message_kind existed, the only daemon-authored verdict payload
+      // had this exact top-level status prefix. Preserve those historical
+      // cards without ever classifying arbitrary PASS/REWORK prose as verdict.
+      this.#db.prepare(`
+        UPDATE delegation_reply_messages SET message_kind = ?
+        WHERE result LIKE ?
+      `).run(
+        AGENT_DELEGATION_REPLY_MESSAGE_KINDS.PEER_AUDIT_FINAL,
+        `{"status":"peer_audit_completed"%`,
+      );
+    }
     // Preserve durable replies created by versions that stored the single
     // message directly on the authority row.
     const legacyRows = this.#db.prepare(`
@@ -277,9 +310,9 @@ export class DelegationReplyStore {
     ) as Array<Record<string, unknown>>;
     const migrateLegacy = this.#db.prepare(`
       INSERT OR IGNORE INTO delegation_reply_messages (
-        delegation_id, result_key, notification_id, result, status,
+        delegation_id, result_key, notification_id, message_kind, result, status,
         created_at, updated_at, delivered_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     for (const row of legacyRows) {
       const result = String(row.result ?? '');
@@ -288,6 +321,7 @@ export class DelegationReplyStore {
         String(row.delegationId ?? ''),
         resultKey(result),
         String(row.notificationId ?? opaqueId()),
+        persistedMessageKind(result),
         result,
         String(row.status ?? AGENT_DELEGATION_REPLY_STATUSES.RECEIVED),
         updatedAt,
@@ -432,6 +466,7 @@ export class DelegationReplyStore {
         authority.dispatch_id AS dispatchId,
         authority.message_id AS messageId,
         message.notification_id AS notificationId,
+        message.message_kind AS messageKind,
         authority.purpose,
         authority.audit_attempt_id AS auditAttemptId,
         authority.audit_revision AS auditRevision,
@@ -883,6 +918,8 @@ export class DelegationReplyStore {
     sender: DelegationReplyBoundIdentity;
     /** Current registry identity after an explicit assignment recovery/rebind. */
     authorizedSender?: DelegationReplyBoundIdentity;
+    messageKind?: AgentDelegationReplyMessageKind;
+    hold?: boolean;
     now?: number;
   }): ReceiveDelegationReplyResult {
     const now = input.now ?? Date.now();
@@ -920,31 +957,40 @@ export class DelegationReplyStore {
         return { ok: false, reason: 'limit' };
       }
       const notificationId = opaqueId();
+      const messageKind = input.messageKind ?? AGENT_DELEGATION_REPLY_MESSAGE_KINDS.DELEGATION_COMPLETION;
+      const messageStatus = input.hold
+        ? AGENT_DELEGATION_REPLY_STATUSES.HELD
+        : AGENT_DELEGATION_REPLY_STATUSES.RECEIVED;
       this.#db.prepare(`
         INSERT INTO delegation_reply_messages (
-          delegation_id, result_key, notification_id, result, status,
+          delegation_id, result_key, notification_id, message_kind, result, status,
           created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         input.delegationId,
         key,
         notificationId,
+        messageKind,
         input.result,
-        AGENT_DELEGATION_REPLY_STATUSES.RECEIVED,
+        messageStatus,
         now,
         now,
       );
-      this.#db.prepare(`
-        UPDATE delegation_replies
-        SET status = ?, result = ?, notification_id = ?, updated_at = ?
-        WHERE delegation_id = ?
-      `).run(
-        AGENT_DELEGATION_REPLY_STATUSES.RECEIVED,
-        input.result,
-        notificationId,
-        now,
-        input.delegationId,
-      );
+      // A held audit completion is evidence/debug text, not the verdict
+      // channel. It must not close the still-pending peer_audit_reply authority.
+      if (!input.hold) {
+        this.#db.prepare(`
+          UPDATE delegation_replies
+          SET status = ?, result = ?, notification_id = ?, updated_at = ?
+          WHERE delegation_id = ?
+        `).run(
+          AGENT_DELEGATION_REPLY_STATUSES.RECEIVED,
+          input.result,
+          notificationId,
+          now,
+          input.delegationId,
+        );
+      }
       const updated = this.getMessage(input.delegationId, notificationId);
       this.#db.exec('COMMIT');
       if (!updated) throw new Error('delegation reply authority disappeared');
@@ -955,7 +1001,95 @@ export class DelegationReplyStore {
     }
   }
 
+  /** Suppress only held completion prose for one exact audit identity tuple. */
+  suppressHeldAuditCompletions(input: {
+    delegationId: string;
+    taskId: string;
+    assignmentId: string;
+    auditAttemptId: string;
+    auditRevision: string;
+    sender: DelegationReplyBoundIdentity;
+    now?: number;
+  }): string[] {
+    const rows = this.#db.prepare(`
+      SELECT message.notification_id AS notificationId
+      FROM delegation_reply_messages message
+      JOIN delegation_replies authority ON authority.delegation_id = message.delegation_id
+      WHERE authority.delegation_id = ? AND authority.purpose = ?
+        AND authority.task_id = ? AND authority.assignment_id = ?
+        AND authority.audit_attempt_id = ? AND authority.audit_revision = ?
+        AND authority.target_session_name = ?
+        AND authority.target_session_instance_id = ?
+        AND authority.target_runtime_epoch = ?
+        AND message.message_kind = ? AND message.status = ?
+    `).all(
+      input.delegationId,
+      AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+      input.taskId,
+      input.assignmentId,
+      input.auditAttemptId,
+      input.auditRevision,
+      input.sender.sessionName,
+      input.sender.sessionInstanceId,
+      input.sender.runtimeEpoch,
+      AGENT_DELEGATION_REPLY_MESSAGE_KINDS.DELEGATION_COMPLETION,
+      AGENT_DELEGATION_REPLY_STATUSES.HELD,
+    ) as Array<{ notificationId?: unknown }>;
+    const ids = rows.map((row) => String(row.notificationId ?? '')).filter(Boolean);
+    if (ids.length === 0) return [];
+    this.#db.prepare(`
+      UPDATE delegation_reply_messages SET status = ?, updated_at = ?
+      WHERE delegation_id = ? AND message_kind = ? AND status = ?
+    `).run(
+      AGENT_DELEGATION_REPLY_STATUSES.SUPPRESSED,
+      input.now ?? Date.now(),
+      input.delegationId,
+      AGENT_DELEGATION_REPLY_MESSAGE_KINDS.DELEGATION_COMPLETION,
+      AGENT_DELEGATION_REPLY_STATUSES.HELD,
+    );
+    return ids;
+  }
+
+  /** Release one held completion after the bounded receipt reconciliation. */
+  releaseHeldAuditCompletion(input: {
+    delegationId: string;
+    notificationId: string;
+    now?: number;
+  }): DelegationReplyRecord | undefined {
+    const held = this.getMessage(input.delegationId, input.notificationId);
+    if (!held || held.status !== AGENT_DELEGATION_REPLY_STATUSES.HELD
+      || held.messageKind !== AGENT_DELEGATION_REPLY_MESSAGE_KINDS.DELEGATION_COMPLETION) return undefined;
+    const now = input.now ?? Date.now();
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const changed = this.#db.prepare(`
+        UPDATE delegation_reply_messages SET status = ?, updated_at = ?
+        WHERE delegation_id = ? AND notification_id = ? AND message_kind = ? AND status = ?
+      `).run(
+        AGENT_DELEGATION_REPLY_STATUSES.RECEIVED,
+        now,
+        input.delegationId,
+        input.notificationId,
+        AGENT_DELEGATION_REPLY_MESSAGE_KINDS.DELEGATION_COMPLETION,
+        AGENT_DELEGATION_REPLY_STATUSES.HELD,
+      );
+      if (Number(changed.changes) !== 1) {
+        this.#db.exec('ROLLBACK');
+        return undefined;
+      }
+      // Delivery of fallback prose does not consume the verdict authority.
+      // A late exact peer_audit_reply must remain acceptable after the bounded
+      // reconciliation window has elapsed.
+      this.#db.exec('COMMIT');
+      return this.getMessage(input.delegationId, input.notificationId);
+    } catch (error) {
+      try { this.#db.exec('ROLLBACK'); } catch { /* transaction already closed */ }
+      throw error;
+    }
+  }
+
   markDelivered(delegationId: string, notificationId: string, now = Date.now()): boolean {
+    const message = this.getMessage(delegationId, notificationId);
     const result = this.#db.prepare(`
       UPDATE delegation_reply_messages
       SET status = ?, delivered_at = ?, updated_at = ?
@@ -969,6 +1103,10 @@ export class DelegationReplyStore {
       AGENT_DELEGATION_REPLY_STATUSES.RECEIVED,
     );
     if (Number(result.changes) !== 1) return false;
+    if (message?.purpose === AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT
+      && message.messageKind === AGENT_DELEGATION_REPLY_MESSAGE_KINDS.DELEGATION_COMPLETION) {
+      return true;
+    }
     const pending = Number((this.#db.prepare(`
       SELECT COUNT(*) AS count FROM delegation_reply_messages
       WHERE delegation_id = ? AND status = ?
@@ -1102,6 +1240,7 @@ export class DelegationReplyStore {
         authority.dispatch_id AS dispatchId,
         authority.message_id AS messageId,
         message.notification_id AS notificationId,
+        message.message_kind AS messageKind,
         authority.purpose,
         authority.audit_attempt_id AS auditAttemptId,
         authority.audit_revision AS auditRevision,
@@ -1121,6 +1260,41 @@ export class DelegationReplyStore {
       ORDER BY message.updated_at ASC
       LIMIT ?
     `).all(AGENT_DELEGATION_REPLY_STATUSES.RECEIVED, Math.max(1, Math.min(1_024, limit))) as Record<string, unknown>[];
+    return rows.map(parseRow);
+  }
+
+  listHeldAuditCompletions(limit = 128): DelegationReplyRecord[] {
+    const rows = this.#db.prepare(`
+      SELECT
+        authority.delegation_id AS delegationId,
+        authority.capability_hash AS capabilityHash,
+        authority.origin_session_name AS originSessionName,
+        authority.origin_session_instance_id AS originSessionInstanceId,
+        authority.origin_runtime_epoch AS originRuntimeEpoch,
+        authority.target_session_name AS targetSessionName,
+        authority.target_session_instance_id AS targetSessionInstanceId,
+        authority.target_runtime_epoch AS targetRuntimeEpoch,
+        authority.dispatch_id AS dispatchId,
+        authority.message_id AS messageId,
+        message.notification_id AS notificationId,
+        message.message_kind AS messageKind,
+        authority.purpose, authority.audit_attempt_id AS auditAttemptId,
+        authority.audit_revision AS auditRevision, authority.audited_session_name AS auditedSessionName,
+        authority.task_id AS taskId, authority.assignment_id AS assignmentId,
+        authority.coordinator_assignment_id AS coordinatorAssignmentId,
+        message.status, message.result, authority.created_at AS createdAt,
+        authority.expires_at AS expiresAt, message.updated_at AS updatedAt,
+        message.delivered_at AS deliveredAt
+      FROM delegation_reply_messages message
+      JOIN delegation_replies authority ON authority.delegation_id = message.delegation_id
+      WHERE authority.purpose = ? AND message.message_kind = ? AND message.status = ?
+      ORDER BY message.updated_at ASC LIMIT ?
+    `).all(
+      AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+      AGENT_DELEGATION_REPLY_MESSAGE_KINDS.DELEGATION_COMPLETION,
+      AGENT_DELEGATION_REPLY_STATUSES.HELD,
+      Math.max(1, Math.min(1_024, limit)),
+    ) as Record<string, unknown>[];
     return rows.map(parseRow);
   }
 }

@@ -1,9 +1,13 @@
+import { createRequire } from 'node:module';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  AGENT_DELEGATION_AUDIT_RECONCILIATION_MS,
   AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER,
   AGENT_DELEGATION_NOTIFICATION_RESULTS,
   AGENT_DELEGATION_PURPOSES,
   AGENT_DELEGATION_REPLY_ERRORS,
+  AGENT_DELEGATION_REPLY_MESSAGE_KINDS,
+  AGENT_DELEGATION_REPLY_STATUSES,
   AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
   AGENT_DELEGATION_REPLY_VERSION,
 } from '../../shared/agent-delegation.js';
@@ -11,6 +15,11 @@ import {
   PEER_AUDIT_DELEGATED_REPLY_STATUS,
   PEER_AUDIT_REPLY_VERSION,
 } from '../../shared/peer-audit.js';
+
+type RealDelegationReplyStore = import('../../src/daemon/delegation-reply-store.js').DelegationReplyStore;
+
+const require = createRequire(import.meta.url);
+const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 
 const mocks = vi.hoisted(() => ({
   sessions: new Map<string, Record<string, unknown>>(),
@@ -22,16 +31,20 @@ const mocks = vi.hoisted(() => ({
   restoredRuntime: undefined as undefined | {
     deliverDelegationNotification: ReturnType<typeof vi.fn>;
   },
+  realStore: undefined as RealDelegationReplyStore | undefined,
   store: {
     create: vi.fn(),
     matchPendingAuditAuthority: vi.fn(),
     rebindAssignmentTarget: vi.fn(),
     receive: vi.fn(),
+    suppressHeldAuditCompletions: vi.fn(() => []),
+    releaseHeldAuditCompletion: vi.fn(),
     markDelivered: vi.fn(),
     expire: vi.fn(),
     get: vi.fn(),
     getMessage: vi.fn(),
     listReceived: vi.fn(() => []),
+    listHeldAuditCompletions: vi.fn(() => []),
   },
   timelineEmit: vi.fn(),
   appendMatchingAuditReceipt: vi.fn(),
@@ -55,7 +68,7 @@ vi.mock('../../src/agent/session-manager.js', () => ({
 
 vi.mock('../../src/daemon/delegation-reply-store.js', async (importOriginal) => ({
   ...await importOriginal<typeof import('../../src/daemon/delegation-reply-store.js')>(),
-  getDelegationReplyStore: () => mocks.store,
+  getDelegationReplyStore: () => mocks.realStore ?? mocks.store,
 }));
 
 vi.mock('../../src/daemon/timeline-emitter.js', () => ({
@@ -134,6 +147,93 @@ function session(identity: typeof origin): Record<string, unknown> {
   };
 }
 
+function installRealAuditHarness(suffix: string) {
+  const database = new DatabaseSync(':memory:');
+  const store = new DelegationReplyStore({ database });
+  mocks.realStore = store;
+  const taskId = `task-real-${suffix}`;
+  const assignmentId = `assignment-real-${suffix}`;
+  const attemptId = `attempt-real-${suffix}`;
+  const revision = `revision-real-${suffix}`;
+  const authority = store.create({
+    origin,
+    target,
+    dispatchId: `dispatch-real-${suffix}`,
+    messageId: `message-real-${suffix}`,
+    purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+    auditAttemptId: attemptId,
+    auditRevision: revision,
+    auditedSessionName: 'deck_sub_implementation',
+    taskId,
+    assignmentId,
+    now: Date.now(),
+  }).record;
+  const auditor = {
+    assignmentId,
+    taskId,
+    role: 'auditor',
+    status: 'auditing',
+    generation: 1,
+    auditAttemptId: attemptId,
+    auditRevision: revision,
+    identity: { ...target, agentType: 'codex-sdk', providerFamily: 'openai' },
+  };
+  const receipts: Array<Record<string, unknown>> = [];
+  mocks.getAssignment.mockReturnValue(auditor);
+  mocks.listAuditReceipts.mockImplementation(() => receipts);
+  mocks.appendMatchingAuditReceipt.mockImplementation((input: Record<string, unknown>) => {
+    receipts.push({ ...input, assignmentId: input.auditorAssignmentId });
+    return { ok: true, value: {} };
+  });
+  const send = vi.fn(() => 'sent');
+  mocks.runtime = {
+    recipientIdentity: {
+      sessionInstanceId: origin.sessionInstanceId,
+      runtimeEpoch: origin.runtimeEpoch,
+    },
+    deliverDelegationNotification: vi.fn(),
+    send,
+  };
+  const submitCompletion = (result: string) => submitDelegationReply({
+    rawBody: {
+      version: AGENT_DELEGATION_REPLY_VERSION,
+      delegationId: authority.delegationId,
+      result,
+    },
+    senderSessionName: target.sessionName,
+  });
+  const submitAudit = (receiptKind: 'progress' | 'final', findings: string) => submitPeerAuditReply({
+    rawBody: JSON.stringify({
+      version: PEER_AUDIT_REPLY_VERSION,
+      taskId,
+      assignmentId,
+      attemptId,
+      revision,
+      receiptKind,
+      ...(receiptKind === 'final' ? { verdict: 'PASS' } : {}),
+      findings,
+      validations: receiptKind === 'final'
+        ? [{ kind: 'test', label: 'real-store', outcome: 'passed', summary: 'green' }]
+        : [],
+    }),
+    senderSessionName: target.sessionName,
+    now: Date.now(),
+  });
+  return {
+    store,
+    database,
+    authority,
+    send,
+    submitCompletion,
+    submitAudit,
+    close: () => {
+      mocks.realStore = undefined;
+      store.close();
+      database.close();
+    },
+  };
+}
+
 describe('delegation reply ingress', () => {
   beforeEach(() => {
     clearDelegationReplyIngressForTests();
@@ -146,7 +246,10 @@ describe('delegation reply ingress', () => {
       deliverDelegationNotification: vi.fn(async () => AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED),
     };
     mocks.restoredRuntime = undefined;
+    mocks.realStore = undefined;
     mocks.store.receive.mockReset().mockReturnValue({ ok: true, record, replay: false });
+    mocks.store.suppressHeldAuditCompletions.mockReset().mockReturnValue([]);
+    mocks.store.releaseHeldAuditCompletion.mockReset();
     mocks.store.create.mockReset();
     mocks.store.matchPendingAuditAuthority.mockReset();
     mocks.store.rebindAssignmentTarget.mockReset();
@@ -161,6 +264,7 @@ describe('delegation reply ingress', () => {
       deliveredAt: Date.now(),
     }));
     mocks.store.listReceived.mockReset().mockReturnValue([]);
+    mocks.store.listHeldAuditCompletions.mockReset().mockReturnValue([]);
     mocks.timelineEmit.mockReset();
     mocks.appendMatchingAuditReceipt.mockReset().mockReturnValue({ ok: true, value: {} });
     mocks.finishAssignment.mockReset().mockReturnValue({ ok: true, value: {}, replay: false });
@@ -175,6 +279,7 @@ describe('delegation reply ingress', () => {
 
   afterEach(() => {
     clearDelegationReplyIngressForTests();
+    mocks.realStore = undefined;
   });
 
   it('binds the sender and delivers one trusted tokenless notification', async () => {
@@ -257,6 +362,12 @@ describe('delegation reply ingress', () => {
       auditRevision: auditRecord.auditRevision,
       identity: { ...target, agentType: 'codex-sdk', providerFamily: 'openai' },
     });
+    const send = vi.fn(() => 'sent');
+    mocks.runtime = {
+      recipientIdentity: { sessionInstanceId: origin.sessionInstanceId, runtimeEpoch: origin.runtimeEpoch },
+      deliverDelegationNotification: vi.fn(),
+      send,
+    };
     registerPeerAuditReplyIngressHandler(() => ({ ok: false, error: 'attempt_mismatch' }));
 
     await expect(submitPeerAuditReply({
@@ -324,11 +435,313 @@ describe('delegation reply ingress', () => {
       origin.sessionName,
       AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
       expect.objectContaining({
-        result: expect.stringContaining('"attemptId":"attempt_manual_audit_1"'),
+        result: 'Exact revision and focused validation pass.',
         verdict: 'PASS',
       }),
       expect.any(Object),
     );
+    expect(send).toHaveBeenCalledWith(
+      expect.stringContaining('Exact revision and focused validation pass.'),
+      expect.any(String), undefined, undefined, expect.any(Object),
+    );
+    expect(send.mock.calls[0]?.[0]).toContain('Peer audit verdict: PASS');
+    expect(send.mock.calls[0]?.[0]).not.toContain('\\n');
+  });
+
+  it('suppresses a later free-text audit completion after the exact final receipt', async () => {
+    const auditRecord = {
+      ...record,
+      purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+      auditAttemptId: 'attempt-dedupe-after',
+      auditRevision: 'revision-dedupe-after',
+      taskId: 'task-dedupe-after',
+      assignmentId: 'assignment-dedupe-after',
+      result: 'Duplicate prose PASS report.',
+    };
+    mocks.store.get.mockReturnValue(auditRecord);
+    mocks.store.receive.mockReturnValue({ ok: true, record: auditRecord, replay: false });
+    mocks.getAssignment.mockReturnValue({
+      assignmentId: auditRecord.assignmentId,
+      taskId: auditRecord.taskId,
+      role: 'auditor',
+      auditAttemptId: auditRecord.auditAttemptId,
+      auditRevision: auditRecord.auditRevision,
+      identity: { ...target, agentType: 'codex-sdk', providerFamily: 'openai' },
+    });
+    mocks.listAuditReceipts.mockReturnValue([{
+      assignmentId: auditRecord.assignmentId,
+      attemptId: auditRecord.auditAttemptId,
+      revision: auditRecord.auditRevision,
+      receiptKind: 'final',
+      verdict: 'PASS',
+    }]);
+
+    await expect(submitDelegationReply({
+      rawBody: { ...envelope, result: auditRecord.result },
+      senderSessionName: target.sessionName,
+    })).resolves.toEqual(expect.objectContaining({ ok: true }));
+
+    expect(mocks.timelineEmit).not.toHaveBeenCalled();
+    expect(mocks.runtime?.deliverDelegationNotification).not.toHaveBeenCalled();
+  });
+
+  it('holds an audit completion briefly so a following exact final receipt replaces it', async () => {
+    vi.useFakeTimers();
+    try {
+      const auditRecord = {
+        ...record,
+        purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+        auditAttemptId: 'attempt-dedupe-before',
+        auditRevision: 'revision-dedupe-before',
+        auditedSessionName: origin.sessionName,
+        taskId: 'task-dedupe-before',
+        assignmentId: 'assignment-dedupe-before',
+        result: 'Early prose PASS report.',
+      };
+      mocks.store.get.mockReturnValue(auditRecord);
+      mocks.store.matchPendingAuditAuthority.mockReturnValue(auditRecord);
+      mocks.store.receive.mockImplementation((input: { result: string }) => ({
+        ok: true, record: { ...auditRecord, result: input.result }, replay: false,
+      }));
+      mocks.getAssignment.mockReturnValue({
+        assignmentId: auditRecord.assignmentId,
+        taskId: auditRecord.taskId,
+        role: 'auditor',
+        auditAttemptId: auditRecord.auditAttemptId,
+        auditRevision: auditRecord.auditRevision,
+        identity: { ...target, agentType: 'codex-sdk', providerFamily: 'openai' },
+      });
+
+      await submitDelegationReply({
+        rawBody: { ...envelope, result: auditRecord.result },
+        senderSessionName: target.sessionName,
+      });
+      expect(mocks.timelineEmit).not.toHaveBeenCalled();
+      expect(mocks.runtime?.deliverDelegationNotification).not.toHaveBeenCalled();
+
+      await submitPeerAuditReply({
+        rawBody: JSON.stringify({
+          version: PEER_AUDIT_REPLY_VERSION,
+          taskId: auditRecord.taskId,
+          assignmentId: auditRecord.assignmentId,
+          attemptId: auditRecord.auditAttemptId,
+          revision: auditRecord.auditRevision,
+          receiptKind: 'final',
+          verdict: 'PASS',
+          findings: 'Authoritative findings only.\n- exact evidence',
+          validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: 'green' }],
+        }),
+        senderSessionName: target.sessionName,
+        now: 100,
+      });
+
+      expect(mocks.timelineEmit).toHaveBeenCalledTimes(1);
+      expect(mocks.timelineEmit).toHaveBeenCalledWith(
+        origin.sessionName,
+        AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+        expect.objectContaining({ result: 'Authoritative findings only.\n- exact evidence', verdict: 'PASS' }),
+        expect.any(Object),
+      );
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(mocks.timelineEmit).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('releases a held audit completion when there is no exact final receipt', async () => {
+    vi.useFakeTimers();
+    try {
+      const auditRecord = {
+        ...record,
+        purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+        auditAttemptId: 'attempt-question',
+        auditRevision: 'revision-question',
+        taskId: 'task-question',
+        assignmentId: 'assignment-question',
+        result: 'Blocked: need the missing fixture.',
+        status: AGENT_DELEGATION_REPLY_STATUSES.HELD,
+        messageKind: AGENT_DELEGATION_REPLY_MESSAGE_KINDS.DELEGATION_COMPLETION,
+      };
+      mocks.store.get.mockReturnValue(auditRecord);
+      mocks.store.receive.mockReturnValue({ ok: true, record: auditRecord, replay: false });
+      mocks.store.releaseHeldAuditCompletion.mockReturnValue(auditRecord);
+      const send = vi.fn(() => 'sent');
+      mocks.runtime = {
+        recipientIdentity: { sessionInstanceId: origin.sessionInstanceId, runtimeEpoch: origin.runtimeEpoch },
+        deliverDelegationNotification: vi.fn(),
+        send,
+      };
+      mocks.getAssignment.mockReturnValue({
+        assignmentId: auditRecord.assignmentId,
+        taskId: auditRecord.taskId,
+        role: 'auditor',
+        identity: { ...target, agentType: 'codex-sdk', providerFamily: 'openai' },
+      });
+      mocks.listAuditReceipts.mockReturnValue([{
+        assignmentId: auditRecord.assignmentId,
+        attemptId: auditRecord.auditAttemptId,
+        revision: auditRecord.auditRevision,
+        receiptKind: 'progress',
+      }]);
+
+      await submitDelegationReply({
+        rawBody: { ...envelope, result: auditRecord.result },
+        senderSessionName: target.sessionName,
+      });
+      expect(mocks.timelineEmit).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(mocks.timelineEmit).toHaveBeenCalledTimes(1);
+      expect(send).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reconciles both audit-result orderings through the real store without a second card or Brain delivery', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-09-20T08:00:00.000Z'));
+    const completionFirst = installRealAuditHarness('completion-first');
+    try {
+      await expect(completionFirst.submitCompletion('duplicate completion text')).resolves.toMatchObject({ ok: true });
+      expect(completionFirst.store.listHeldAuditCompletions()).toHaveLength(1);
+      const heldCompletion = completionFirst.store.listHeldAuditCompletions()[0]!;
+      expect(mocks.timelineEmit).not.toHaveBeenCalled();
+      expect(completionFirst.send).not.toHaveBeenCalled();
+
+      await expect(completionFirst.submitAudit('final', 'Authoritative findings\n- exact evidence')).resolves.toEqual({ ok: true });
+      await vi.advanceTimersByTimeAsync(AGENT_DELEGATION_AUDIT_RECONCILIATION_MS + 1);
+      expect(mocks.timelineEmit).toHaveBeenCalledTimes(1);
+      expect(mocks.timelineEmit).toHaveBeenLastCalledWith(
+        origin.sessionName,
+        AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+        expect.objectContaining({ result: 'Authoritative findings\n- exact evidence', verdict: 'PASS' }),
+        expect.any(Object),
+      );
+      expect(completionFirst.send).toHaveBeenCalledTimes(1);
+      expect(completionFirst.send.mock.calls[0]?.[0]).toContain('Authoritative findings\n- exact evidence');
+      expect(completionFirst.send.mock.calls[0]?.[0]).not.toContain('\\n');
+      expect(completionFirst.store.listHeldAuditCompletions()).toHaveLength(0);
+      expect(completionFirst.store.getMessage(
+        completionFirst.authority.delegationId,
+        heldCompletion.notificationId,
+      )).toMatchObject({
+        result: 'duplicate completion text',
+        status: AGENT_DELEGATION_REPLY_STATUSES.SUPPRESSED,
+      });
+    } finally {
+      completionFirst.close();
+    }
+
+    clearDelegationReplyIngressForTests();
+    mocks.timelineEmit.mockClear();
+    const receiptFirst = installRealAuditHarness('receipt-first');
+    try {
+      await expect(receiptFirst.submitAudit('final', 'Receipt arrived first\n- readable')).resolves.toEqual({ ok: true });
+      expect(mocks.timelineEmit).toHaveBeenCalledTimes(1);
+      expect(receiptFirst.send).toHaveBeenCalledTimes(1);
+      expect(mocks.listAuditReceipts()).toEqual(expect.arrayContaining([
+        expect.objectContaining({ receiptKind: 'final' }),
+      ]));
+
+      await vi.advanceTimersByTimeAsync(22_000);
+      await expect(receiptFirst.submitCompletion('late duplicate completion')).resolves.toMatchObject({ ok: true });
+      expect(receiptFirst.store.listHeldAuditCompletions()).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(AGENT_DELEGATION_AUDIT_RECONCILIATION_MS + 1);
+      expect(mocks.timelineEmit).toHaveBeenCalledTimes(1);
+      expect(receiptFirst.send).toHaveBeenCalledTimes(1);
+      expect(receiptFirst.store.listHeldAuditCompletions()).toHaveLength(0);
+    } finally {
+      receiptFirst.close();
+      vi.useRealTimers();
+    }
+  });
+
+  it('releases no-final and progress-only completions exactly once through the real store', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-09-20T08:10:00.000Z'));
+    const noReceipt = installRealAuditHarness('no-receipt');
+    try {
+      await noReceipt.submitCompletion('Blocked: need a fixture.');
+      expect(mocks.timelineEmit).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(AGENT_DELEGATION_AUDIT_RECONCILIATION_MS + 1);
+      expect(mocks.timelineEmit).toHaveBeenCalledTimes(1);
+      expect(noReceipt.send).toHaveBeenCalledTimes(1);
+      expect(mocks.timelineEmit).toHaveBeenLastCalledWith(
+        origin.sessionName,
+        AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+        expect.objectContaining({ result: 'Blocked: need a fixture.' }),
+        expect.any(Object),
+      );
+    } finally {
+      noReceipt.close();
+    }
+
+    clearDelegationReplyIngressForTests();
+    mocks.timelineEmit.mockClear();
+    const progressOnly = installRealAuditHarness('progress-only');
+    try {
+      await expect(progressOnly.submitAudit('progress', 'still reviewing')).resolves.toEqual({ ok: true });
+      await progressOnly.submitCompletion('Question: confirm the fixture?');
+      await vi.advanceTimersByTimeAsync(AGENT_DELEGATION_AUDIT_RECONCILIATION_MS + 1);
+      expect(mocks.timelineEmit).toHaveBeenCalledTimes(1);
+      expect(progressOnly.send).toHaveBeenCalledTimes(1);
+      expect(mocks.timelineEmit).toHaveBeenLastCalledWith(
+        origin.sessionName,
+        AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+        expect.objectContaining({ result: 'Question: confirm the fixture?' }),
+        expect.any(Object),
+      );
+    } finally {
+      progressOnly.close();
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the real verdict authority open when the final receipt follows released fallback prose', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-09-20T08:20:00.000Z'));
+    const harness = installRealAuditHarness('late-final');
+    try {
+      await harness.submitCompletion('Fallback prose delivered first.');
+      await vi.advanceTimersByTimeAsync(AGENT_DELEGATION_AUDIT_RECONCILIATION_MS + 1);
+      expect(mocks.timelineEmit).toHaveBeenCalledTimes(1);
+      expect(harness.send).toHaveBeenCalledTimes(1);
+
+      await expect(harness.submitAudit('final', 'Late authoritative findings\n- accepted')).resolves.toEqual({ ok: true });
+      expect(mocks.timelineEmit).toHaveBeenCalledTimes(2);
+      expect(harness.send).toHaveBeenCalledTimes(2);
+      expect(mocks.timelineEmit).toHaveBeenLastCalledWith(
+        origin.sessionName,
+        AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+        expect.objectContaining({ result: 'Late authoritative findings\n- accepted', verdict: 'PASS' }),
+        expect.any(Object),
+      );
+    } finally {
+      harness.close();
+      vi.useRealTimers();
+    }
+  });
+
+  it('re-arms a real held completion after ingress restart and delivers it exactly once', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-09-20T08:30:00.000Z'));
+    const harness = installRealAuditHarness('restart-held');
+    try {
+      await harness.submitCompletion('Held across daemon restart.');
+      expect(harness.store.listHeldAuditCompletions()).toHaveLength(1);
+      clearDelegationReplyIngressForTests();
+      resumePendingDelegationReplies();
+      await vi.advanceTimersByTimeAsync(AGENT_DELEGATION_AUDIT_RECONCILIATION_MS + 1);
+      expect(mocks.timelineEmit).toHaveBeenCalledTimes(1);
+      expect(harness.send).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(AGENT_DELEGATION_AUDIT_RECONCILIATION_MS + 1);
+      expect(mocks.timelineEmit).toHaveBeenCalledTimes(1);
+      expect(harness.send).toHaveBeenCalledTimes(1);
+    } finally {
+      harness.close();
+      vi.useRealTimers();
+    }
   });
 
   it('restores a lost reply controller from one exact durable audit authority after restart', async () => {

@@ -478,6 +478,27 @@ describe('ChatView peer-audit result cards', () => {
 });
 
 describe('ChatView delegation reply cards', () => {
+  it('renders authoritative audit findings as markdown in one collapsed card, not JSON escapes', () => {
+    const findings = 'VERDICT: PASS\n\n- exact evidence\n- role="status"';
+    const event = makeEvent('delegation.reply', {
+      memoryExcluded: true,
+      sourceSessionName: 'deck_sub_reviewer',
+      sourceLabel: 'CC10',
+      result: findings,
+      verdict: 'PASS',
+    }, { eventId: 'audit-result-markdown' });
+    const { container } = render(
+      <ChatView events={[event]} loading={false} sessionId="session-a" />,
+    );
+
+    const card = container.querySelector('.delegation-reply-card');
+    expect(card?.querySelector('details')).toBeTruthy();
+    expect(card?.querySelector('.delegation-reply-card-body')?.textContent).toBe(findings);
+    expect(card?.textContent).toContain('role="status"');
+    expect(card?.textContent).not.toContain('\\n');
+    expect(card?.textContent).not.toContain('[history truncated]');
+  });
+
   it('renders the reply source and full result without exposing notification framing', () => {
     const event = makeEvent('delegation.reply', {
       memoryExcluded: true,

@@ -65,6 +65,90 @@ describe('DelegationReplyStore', () => {
     database.close();
   });
 
+  it('keeps held audit prose as bounded evidence and suppresses it only for the exact final-receipt identity', () => {
+    const database = new DatabaseSync(':memory:');
+    const store = new DelegationReplyStore({ database });
+    const created = store.create({
+      origin, target, dispatchId: 'dispatch-dedupe', messageId: 'message-dedupe',
+      purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+      auditAttemptId: 'attempt-dedupe', auditRevision: 'revision-dedupe',
+      taskId: 'task-dedupe', assignmentId: 'assignment-dedupe', now: 100,
+    });
+    const held = store.receive({
+      delegationId: created.record.delegationId,
+      result: 'free-text completion retained for debugging',
+      sender: target,
+      messageKind: 'delegation_completion',
+      hold: true,
+      now: 110,
+    });
+    expect(held).toMatchObject({ ok: true, replay: false, record: { status: 'held' } });
+    if (!held.ok) throw new Error(held.reason);
+    expect(store.get(created.record.delegationId)?.status).toBe(AGENT_DELEGATION_REPLY_STATUSES.PENDING);
+
+    expect(store.suppressHeldAuditCompletions({
+      delegationId: created.record.delegationId,
+      taskId: 'task-dedupe', assignmentId: 'assignment-dedupe',
+      auditAttemptId: 'different-attempt', auditRevision: 'revision-dedupe',
+      sender: target, now: 120,
+    })).toEqual([]);
+    expect(store.suppressHeldAuditCompletions({
+      delegationId: created.record.delegationId,
+      taskId: 'task-dedupe', assignmentId: 'different-assignment',
+      auditAttemptId: 'attempt-dedupe', auditRevision: 'revision-dedupe',
+      sender: target, now: 120,
+    })).toEqual([]);
+    expect(store.getMessage(created.record.delegationId, held.record.notificationId)?.status).toBe('held');
+
+    expect(store.suppressHeldAuditCompletions({
+      delegationId: created.record.delegationId,
+      taskId: 'task-dedupe', assignmentId: 'assignment-dedupe',
+      auditAttemptId: 'attempt-dedupe', auditRevision: 'revision-dedupe',
+      sender: target, now: 121,
+    })).toEqual([held.record.notificationId]);
+    expect(store.getMessage(created.record.delegationId, held.record.notificationId)).toMatchObject({
+      status: 'suppressed',
+      result: 'free-text completion retained for debugging',
+    });
+    expect(store.releaseHeldAuditCompletion({
+      delegationId: created.record.delegationId,
+      notificationId: held.record.notificationId,
+    })).toBeUndefined();
+    store.close();
+    database.close();
+  });
+
+  it('keeps verdict authority open after fallback prose is released and delivered', () => {
+    const database = new DatabaseSync(':memory:');
+    const store = new DelegationReplyStore({ database });
+    const created = store.create({
+      origin, target, dispatchId: 'dispatch-late-final', messageId: 'message-late-final',
+      purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+      auditAttemptId: 'attempt-late-final', auditRevision: 'revision-late-final',
+      taskId: 'task-late-final', assignmentId: 'assignment-late-final', now: 100,
+    });
+    const held = store.receive({
+      delegationId: created.record.delegationId, result: 'question delivered first', sender: target,
+      messageKind: 'delegation_completion', hold: true, now: 110,
+    });
+    if (!held.ok) throw new Error(held.reason);
+    const released = store.releaseHeldAuditCompletion({
+      delegationId: created.record.delegationId,
+      notificationId: held.record.notificationId,
+      now: 2_200,
+    });
+    expect(released?.status).toBe(AGENT_DELEGATION_REPLY_STATUSES.RECEIVED);
+    expect(store.markDelivered(created.record.delegationId, held.record.notificationId, 2_201)).toBe(true);
+    expect(store.get(created.record.delegationId)?.status).toBe(AGENT_DELEGATION_REPLY_STATUSES.PENDING);
+    expect(store.matchPendingAuditAuthority({
+      taskId: 'task-late-final', assignmentId: 'assignment-late-final',
+      auditAttemptId: 'attempt-late-final', auditRevision: 'revision-late-final',
+      sender: target, now: 3_000,
+    })?.delegationId).toBe(created.record.delegationId);
+    store.close();
+    database.close();
+  });
+
   it('resolves a supervision audit by exact unique attempt and supports an explicit assignment rebind', () => {
     const database = new DatabaseSync(':memory:');
     const store = new DelegationReplyStore({ database });

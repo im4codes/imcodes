@@ -5803,6 +5803,8 @@ html.native-ios-mac .chat-dl-btn {
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
+.delegation-reply-card-findings > summary { cursor: pointer; color: #cbd5e1; font-size: 11px; }
+.delegation-reply-card-findings[open] > summary { margin-bottom: 6px; }
 .delegation-reply-card-body {
   font-size: 12px;
   line-height: 1.5;

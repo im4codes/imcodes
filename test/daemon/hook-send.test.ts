@@ -369,8 +369,14 @@ describe('Hook server /send endpoint', () => {
       ]));
       expect(timelineEmitMock).toHaveBeenCalledWith(
         origin.sessionName,
-        expect.any(String),
-        expect.objectContaining({ result: expect.stringContaining('"attemptId":"manual-audit-hook-attempt"') }),
+        'delegation.reply',
+        expect.objectContaining({
+          result: 'Validated.',
+          verdict: 'PASS',
+          supervisionTask: expect.objectContaining({
+            attemptId: 'manual-audit-hook-attempt',
+          }),
+        }),
         expect.any(Object),
       );
       expect(sendKeysMock).not.toHaveBeenCalled();
