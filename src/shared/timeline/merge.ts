@@ -7,6 +7,8 @@ import {
   usageContextWindowSourceRank,
   type UsageContextWindowSource,
 } from '../../../shared/usage-context-window.js';
+import { AGENT_DELEGATION_REPLY_TIMELINE_EVENT } from '../../../shared/agent-delegation.js';
+import { isPeerAuditVerdict } from '../../../shared/peer-audit.js';
 
 export const TIMELINE_DETAIL_FIELD_PATHS = Object.values(SHARED_TIMELINE_DETAIL_FIELD_PATHS) as TimelineDetailFieldPath[];
 export type { TimelineDetailFieldPath };
@@ -54,6 +56,13 @@ function compareNumbers(a: number | undefined, b: number | undefined): number {
   const right = typeof b === 'number' ? b : Number.NEGATIVE_INFINITY;
   if (left === right) return 0;
   return left > right ? 1 : -1;
+}
+
+function isAuthoritativeDelegationAuditVerdict(event: TimelineEvent): boolean {
+  return event.type === AGENT_DELEGATION_REPLY_TIMELINE_EVENT
+    && event.source === 'daemon'
+    && event.confidence === 'high'
+    && isPeerAuditVerdict(event.payload.verdict);
 }
 
 const USAGE_SNAPSHOT_PAYLOAD_KEYS = [
@@ -124,6 +133,18 @@ function choosePreferredTimelineEvent(existing: TimelineEvent, incoming: Timelin
   // snapshot outranked the very event that settled it.
   if (existingStreaming !== incomingStreaming) {
     return incomingStreaming ? existing : incoming;
+  }
+
+  // One exact supervised audit can first project as released free-form prose
+  // and later as its daemon-authenticated PASS/REWORK receipt under the SAME
+  // stable event id. A history preview of the exact receipt may be ranked as
+  // truncated, but its structured verdict/round authority must still replace
+  // the non-authoritative prose card. A later hydrated receipt will then win
+  // normally among two structured verdict generations.
+  const existingAuditVerdict = isAuthoritativeDelegationAuditVerdict(existing);
+  const incomingAuditVerdict = isAuthoritativeDelegationAuditVerdict(incoming);
+  if (existingAuditVerdict !== incomingAuditVerdict) {
+    return incomingAuditVerdict ? incoming : existing;
   }
 
   // Then freshness, but only while the message is still in flight.

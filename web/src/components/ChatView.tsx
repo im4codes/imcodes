@@ -4701,6 +4701,27 @@ function SupervisionAutomationPrompt({
   );
 }
 
+function PeerAuditRoundChip({
+  round,
+  outcomeLabel,
+}: {
+  round: unknown;
+  outcomeLabel: string;
+}) {
+  const { t } = useTranslation();
+  if (!isPeerAuditRound(round)) return null;
+  const roundAria = t('peerAuditResult.roundAria', { round, outcome: outcomeLabel });
+  return (
+    <span
+      class="peer-audit-round-chip"
+      aria-label={roundAria}
+      title={roundAria}
+    >
+      {t('peerAuditResult.roundChip', { round })}
+    </span>
+  );
+}
+
 const ChatEvent = memo(function ChatEvent({
   event,
   sessionName,
@@ -4827,10 +4848,6 @@ const ChatEvent = memo(function ChatEvent({
               ? 'result_cancelled'
               : 'result_unavailable';
       const outcomeLabel = t(`peerAuditQuick.${outcomeKey}`);
-      const round = isPeerAuditRound(event.payload.round) ? event.payload.round : undefined;
-      const roundAria = round
-        ? t('peerAuditResult.roundAria', { round, outcome: outcomeLabel })
-        : undefined;
       const auditor = String(event.payload.auditorLabel ?? event.payload.auditorSessionName ?? '—');
       const elapsedMs = typeof event.payload.elapsedMs === 'number' ? event.payload.elapsedMs : 0;
       const findingsPreview = typeof event.payload.findingsPreview === 'string'
@@ -4866,15 +4883,7 @@ const ChatEvent = memo(function ChatEvent({
           <div>{t('peerAuditResult.elapsedMs', { seconds: Math.round(elapsedMs / 1000) })}</div>
           <div class="peer-audit-result-verdict-row">
             <span class={`peer-audit-result-outcome peer-audit-result-outcome--${outcome}`}>{outcomeLabel}</span>
-            {round && (
-              <span
-                class="peer-audit-round-chip"
-                aria-label={roundAria}
-                title={roundAria}
-              >
-                {t('peerAuditResult.roundChip', { round })}
-              </span>
-            )}
+            <PeerAuditRoundChip round={event.payload.round} outcomeLabel={outcomeLabel} />
           </div>
           {disposition && (
             <div>{t(`peerAuditQuick.disposition.${disposition}`)}</div>
@@ -4929,6 +4938,9 @@ const ChatEvent = memo(function ChatEvent({
             <div class="delegation-reply-card-meta">
               {verdict && (
                 <span class="delegation-reply-verdict" aria-label={verdictLabel}>{verdict}</span>
+              )}
+              {verdict && (
+                <PeerAuditRoundChip round={event.payload.round} outcomeLabel={verdictLabel ?? verdict} />
               )}
               <span>{t('delegation.reply_from', { source })}</span>
             </div>

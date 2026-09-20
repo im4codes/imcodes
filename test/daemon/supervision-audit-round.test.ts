@@ -56,6 +56,7 @@ describe('authoritative supervision audit round', () => {
       auditorIdentity: PersistedSupervisionTaskAssignmentIdentity,
       verdict: 'PASS' | 'REWORK',
       now: number,
+      findings = `${verdict} ${attemptId}`,
     ) => registry.appendMatchingAuditReceipt({
       taskId,
       auditorAssignmentId: assignmentId,
@@ -65,7 +66,7 @@ describe('authoritative supervision audit round', () => {
       verdict,
       auditorSessionName: auditorIdentity.sessionName,
       auditorIdentity,
-      findings: `${verdict} ${attemptId}`,
+      findings,
       validations: [],
       now,
     });
@@ -77,6 +78,13 @@ describe('authoritative supervision audit round', () => {
     expect(registry.getAuditRound('tsk_rounds', 'attempt-r1')).toBe(1);
     expect(appendFinal('tsk_rounds', 'asg_round_r1', 'attempt-r1', r1Identity, 'REWORK', 101))
       .toMatchObject({ ok: true, replay: true });
+    expect(appendFinal(
+      'tsk_rounds', 'asg_round_r1', 'attempt-r1', r1Identity, 'REWORK', 102,
+      'corrected R1 findings',
+    )).toMatchObject({ ok: true, value: { sequence: 2, supersedesReceiptId: expect.any(String) } });
+    expect(registry.listAuditReceipts('tsk_rounds').filter((receipt) => (
+      receipt.receiptKind === 'final' && receipt.attemptId === 'attempt-r1'
+    ))).toHaveLength(2);
     expect(registry.getAuditRound('tsk_rounds', 'attempt-r1')).toBe(1);
     expect(registry.updateAssignment({
       assignmentId: 'asg_round_r1', identity: r1Identity, status: 'cancelled',

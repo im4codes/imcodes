@@ -544,6 +544,49 @@ describe('ChatView peer-audit result cards', () => {
 });
 
 describe('ChatView delegation reply cards', () => {
+  it.each([
+    ['live', true],
+    ['reloaded history', false],
+  ] as const)('renders the authoritative audit round on a %s verdict card', (_label, arrivesLive) => {
+    const event = makeEvent('delegation.reply', {
+      memoryExcluded: true,
+      sourceSessionName: 'deck_sub_reviewer',
+      sourceLabel: 'CC10',
+      result: 'Exact audit findings.',
+      verdict: 'PASS',
+      round: 4,
+    }, { eventId: 'audit-result-round-4' });
+    const view = render(
+      <ChatView events={arrivesLive ? [] : [event]} loading={false} sessionId="session-a" />,
+    );
+    if (arrivesLive) {
+      view.rerender(<ChatView events={[event]} loading={false} sessionId="session-a" />);
+    }
+
+    const roundChip = view.container.querySelector('.delegation-reply-card .peer-audit-round-chip');
+    expect(roundChip?.textContent).toBe('R4');
+    expect(roundChip?.getAttribute('aria-label')).toBe('Audit round 4: Peer audit passed.');
+    expect(roundChip?.getAttribute('title')).toBe('Audit round 4: Peer audit passed.');
+  });
+
+  it.each([
+    ['legacy audit reply', { verdict: 'REWORK' }],
+    ['non-audit delegation reply', { round: 2 }],
+    ['invalid round', { verdict: 'PASS', round: 0 }],
+  ])('leaves a %s without a round chip', (_label, extraPayload) => {
+    const event = makeEvent('delegation.reply', {
+      memoryExcluded: true,
+      sourceSessionName: 'deck_sub_reviewer',
+      result: 'Existing reply rendering.',
+      ...extraPayload,
+    });
+    const { container } = render(
+      <ChatView events={[event]} loading={false} sessionId="session-a" />,
+    );
+
+    expect(container.querySelector('.delegation-reply-card .peer-audit-round-chip')).toBeNull();
+  });
+
   it('renders authoritative audit findings as markdown in one collapsed card, not JSON escapes', () => {
     const findings = 'VERDICT: PASS\n\n- exact evidence\n- role="status"';
     const event = makeEvent('delegation.reply', {

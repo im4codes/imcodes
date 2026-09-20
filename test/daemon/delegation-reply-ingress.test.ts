@@ -593,6 +593,7 @@ describe('delegation reply ingress', () => {
       expect(verdictCall?.[2]).toEqual(expect.objectContaining({
         result: 'Late authoritative PASS findings.',
         verdict: 'PASS',
+        round: 1,
       }));
       expect(verdictCall?.[3]?.eventId).toBe(proseEventId);
       expect(proseEventId).toMatch(/^delegation-reply:audit:/u);

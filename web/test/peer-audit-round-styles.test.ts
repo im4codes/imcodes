@@ -15,5 +15,10 @@ describe('peer audit round chip styles', () => {
     const shared = css.match(/\.peer-audit-result-outcome,\s*\.peer-audit-round-chip\s*\{[^}]*\}/u)?.[0];
     expect(shared).toMatch(/flex:\s*0\s+0\s+auto/u);
     expect(shared).toMatch(/white-space:\s*nowrap/u);
+
+    const delegationMeta = css.match(/\.delegation-reply-card-meta\s*\{[^}]*\}/u)?.[0];
+    expect(delegationMeta).toMatch(/display:\s*flex/u);
+    expect(delegationMeta).toMatch(/flex-wrap:\s*wrap/u);
+    expect(delegationMeta).toMatch(/min-width:\s*0/u);
   });
 });
