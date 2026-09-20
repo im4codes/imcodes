@@ -41,6 +41,7 @@ import { DESKTOP_WINDOW_IDS } from '../window-stack.js';
 import {
   clampGeometryFullyIntoWorkspace,
   clampGeometryToWorkspace,
+  isWindowChromeDoubleClickTarget,
   normalizeWindowGeometry,
   reserveWorkspaceBottom,
   resolveSessionTabsBottom,
@@ -706,6 +707,16 @@ export function SubSessionWindow({
     onToggleMaximized?.();
   }, [onFocus, onToggleMaximized]);
 
+  // Double-click on the header toggles the same in-window maximize as the
+  // header button (not browser/OS fullscreen). Header controls keep their own
+  // behaviour: only the bare chrome (drag icon, title text, empty space) counts.
+  const handleHeaderDoubleClick = useCallback((event: MouseEvent) => {
+    if (!desktopLayoutCapable || !onToggleMaximized) return;
+    if (!isWindowChromeDoubleClickTarget(event.target)) return;
+    event.preventDefault();
+    handleToggleMaximized();
+  }, [desktopLayoutCapable, handleToggleMaximized, onToggleMaximized]);
+
   const restoreBeforeClosing = useCallback(() => {
     if (maximized) onRestoreBeforeClose?.();
   }, [maximized, onRestoreBeforeClose]);
@@ -928,6 +939,7 @@ export function SubSessionWindow({
       <div
         class="subsession-header"
         onMouseDown={onHeaderMouseDown}
+        onDblClick={handleHeaderDoubleClick}
         draggable={!!isPinnable && !isDesktopMaximized}
         onDragStart={handleDragStart}
       >

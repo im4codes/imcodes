@@ -182,6 +182,41 @@ describe('SubSessionWindow maximize integration', () => {
     expect(onToggleMaximized).toHaveBeenCalledTimes(1);
   });
 
+  it('toggles the same in-window maximize on a header double-click, but never from a header control', () => {
+    const onToggleMaximized = vi.fn();
+    const onFocus = vi.fn();
+    const { container } = renderWindow({ onToggleMaximized, onFocus });
+    const header = container.querySelector('.subsession-header') as HTMLElement;
+
+    fireEvent.dblClick(container.querySelector('.subsession-title') as HTMLElement);
+    expect(onToggleMaximized).toHaveBeenCalledTimes(1);
+    expect(onFocus).toHaveBeenCalled();
+    // Second double-click is the restore: same handler, no separate state here.
+    fireEvent.dblClick(header);
+    expect(onToggleMaximized).toHaveBeenCalledTimes(2);
+
+    // Controls keep their own behaviour.
+    fireEvent.dblClick(screen.getByRole('button', { name: 'window.maximize' }));
+    fireEvent.dblClick(screen.getByRole('button', { name: 'window.minimize' }));
+    fireEvent.dblClick(screen.getByRole('button', { name: 'window.hide' }));
+    expect(onToggleMaximized).toHaveBeenCalledTimes(2);
+
+    // The window body is not chrome.
+    fireEvent.dblClick(container.querySelector('.subsession-window') as HTMLElement);
+    expect(onToggleMaximized).toHaveBeenCalledTimes(2);
+  });
+
+  it('ignores a header double-click without desktop layout capability or a toggle handler', () => {
+    const onToggleMaximized = vi.fn();
+    const first = renderWindow({ onToggleMaximized, desktopLayoutCapable: false });
+    fireEvent.dblClick(first.container.querySelector('.subsession-title') as HTMLElement);
+    expect(onToggleMaximized).not.toHaveBeenCalled();
+    first.unmount();
+
+    const second = renderWindow({});
+    expect(() => fireEvent.dblClick(second.container.querySelector('.subsession-title') as HTMLElement)).not.toThrow();
+  });
+
   it('does not expose maximize controls when desktop layout capability is disabled', async () => {
     renderWindow({ desktopLayoutCapable: false, onToggleMaximized: vi.fn() });
 
