@@ -31,7 +31,18 @@
  * Nothing here writes the production file. It is opened read-only and watched.
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, watch, writeFileSync, type FSWatcher } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  watch,
+  writeFileSync,
+  type FSWatcher,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -67,22 +78,73 @@ const SEEDED_PORT = 61888;
 /** What a rogue publisher tries to install. */
 const ROGUE_PORT = 61999;
 
+type RecordSnapshot =
+  | { exists: false }
+  | {
+    exists: true;
+    bytes: string;
+    dev: bigint;
+    ino: bigint;
+    size: bigint;
+    mtimeNs: bigint;
+    ctimeNs: bigint;
+  };
+
+function recordSnapshot(path: string): RecordSnapshot {
+  try {
+    const stat = statSync(path, { bigint: true });
+    return {
+      exists: true,
+      bytes: readFileSync(path, 'utf8'),
+      dev: stat.dev,
+      ino: stat.ino,
+      size: stat.size,
+      mtimeNs: stat.mtimeNs,
+      ctimeNs: stat.ctimeNs,
+    };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { exists: false };
+    throw error;
+  }
+}
+
+function sameRecordSnapshot(left: RecordSnapshot, right: RecordSnapshot): boolean {
+  if (!left.exists || !right.exists) return left.exists === right.exists;
+  return left.bytes === right.bytes
+    && left.dev === right.dev
+    && left.ino === right.ino
+    && left.size === right.size
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs;
+}
+
 /** Continuous observer of the production record: any write, rename-into-place,
  *  or truncation during the test is a containment failure. */
 class MachineRecordGuard {
   private fileWatcher: FSWatcher | null = null;
   private dirWatcher: FSWatcher | null = null;
   private readonly events: string[] = [];
-  private readonly initialBytes: string | null;
+  private readonly initialSnapshot: RecordSnapshot;
 
   constructor(private readonly path: string) {
-    this.initialBytes = existsSync(path) ? readFileSync(path, 'utf8') : null;
+    this.initialSnapshot = recordSnapshot(path);
+  }
+
+  private observe(event: string): void {
+    // `fs.watch` is only a wake-up signal. macOS may deliver the seed write's
+    // FSEvent after the watcher is armed and even after the old 150ms settling
+    // window under a loaded runner. Treating the basename alone as proof made
+    // a no-I/O test fail as though production had been touched. A real write,
+    // truncate, unlink, or atomic rename necessarily changes bytes or file
+    // identity/metadata and is still recorded, including a same-bytes rename.
+    if (sameRecordSnapshot(this.initialSnapshot, recordSnapshot(this.path))) return;
+    this.events.push(event);
   }
 
   start(): void {
-    if (this.initialBytes !== null) {
+    if (this.initialSnapshot.exists) {
       this.fileWatcher = watch(this.path, (eventType) => {
-        this.events.push(`file:${eventType}`);
+        this.observe(`file:${eventType}`);
       });
     }
     // The publisher writes tmp + rename, which surfaces on the DIRECTORY watch
@@ -91,7 +153,7 @@ class MachineRecordGuard {
     if (existsSync(dir)) {
       this.dirWatcher = watch(dir, (eventType, filename) => {
         if (filename && filename.startsWith(HOOK_PORT_FILE_NAME)) {
-          this.events.push(`dir:${eventType}:${filename}`);
+          this.observe(`dir:${eventType}:${filename}`);
         }
       });
     }
@@ -108,13 +170,31 @@ class MachineRecordGuard {
     this.events.length = 0;
   }
 
+  simulateDelayedNotificationForTests(event: string): void {
+    this.observe(event);
+  }
+
+  observedEventsForTests(): string[] {
+    return [...this.events];
+  }
+
+  async waitForMutationForTests(timeoutMs = 2_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.events.length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    if (this.events.length === 0) throw new Error('record guard did not observe a real mutation');
+  }
+
   stop(): { events: string[]; bytesUnchanged: boolean } {
     this.fileWatcher?.close();
     this.dirWatcher?.close();
     this.fileWatcher = null;
     this.dirWatcher = null;
-    const current = existsSync(this.path) ? readFileSync(this.path, 'utf8') : null;
-    return { events: [...this.events], bytesUnchanged: current === this.initialBytes };
+    const current = recordSnapshot(this.path);
+    const initialBytes = this.initialSnapshot.exists ? this.initialSnapshot.bytes : null;
+    const currentBytes = current.exists ? current.bytes : null;
+    return { events: [...this.events], bytesUnchanged: currentBytes === initialBytes };
   }
 }
 
@@ -201,6 +281,29 @@ afterEach(async () => {
 });
 
 describe('machine hook-port containment', () => {
+  it('ignores a delayed macOS seed notification when the record never changed', () => {
+    guard.simulateDelayedNotificationForTests(`dir:rename:${HOOK_PORT_FILE_NAME}`);
+    expect(guard.observedEventsForTests()).toEqual([]);
+  });
+
+  it('detects an actual same-bytes atomic replacement of the machine record', async () => {
+    const staged = join(machineHome, `${HOOK_PORT_FILE_NAME}.positive-control`);
+    writeFileSync(staged, `${SEEDED_PORT}\n`);
+    renameSync(staged, machinePortFile);
+    await guard.waitForMutationForTests();
+    const observed = guard.stop();
+    expect(observed.events.length).toBeGreaterThan(0);
+    // Bytes alone cannot prove containment: atomic replacement can preserve
+    // them exactly while changing the inode, which the guard must still catch.
+    expect(observed.bytesUnchanged).toBe(true);
+
+    // Re-arm the outer invariant from the new stable snapshot so afterEach can
+    // continue proving that this positive control caused no later mutation.
+    guard = new MachineRecordGuard(machinePortFile);
+    guard.start();
+    await guard.settle();
+  });
+
   it('fences a spawned child that has no test-runner environment', () => {
     const home = machineHome;
     // A live daemon lock owned by ANOTHER process - here this very test process,
