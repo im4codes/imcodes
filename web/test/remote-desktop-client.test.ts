@@ -17,6 +17,7 @@ import {
   REMOTE_DESKTOP_TERMINAL_REASON,
 } from '@shared/remote-desktop.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
+import { validateRemoteDesktopBrowserMessage } from '@shared/remote-desktop.js';
 import {
   applyH264ReceiveCodecPreference,
   RemoteDesktopClient,
@@ -192,6 +193,10 @@ class FakePeer extends EventTarget {
     this.dispatchEvent(Object.assign(new Event('icecandidate'), {
       candidate: { candidate, sdpMid },
     }));
+  }
+  /** Gathering's final event, which carries no candidate object at all. */
+  emitEndOfCandidates(): void {
+    this.dispatchEvent(Object.assign(new Event('icecandidate'), { candidate: null }));
   }
   close(): void { this.connectionState = 'closed'; }
 }
@@ -2903,4 +2908,30 @@ it('never sends the end-of-candidates marker as a candidate', async () => {
   peer.emitLocalCandidate('candidate:real 1 UDP 1 10.0.0.1 1 typ host');
   expect(iceMessages().map((message) => message.candidate))
     .toEqual(['candidate:real 1 UDP 1 10.0.0.1 1 typ host']);
+
+  // The null event that follows the marker is not a candidate either.
+  peer.emitEndOfCandidates();
+  expect(iceMessages()).toHaveLength(1);
+
+  // Cross-tier lock: every message this client actually put on the wire has
+  // to pass the SAME contract the server validates with, or the server ends
+  // the session as malformed. Tightening either side alone fails here.
+  for (const message of socket.sent.map((raw) => JSON.parse(raw) as Record<string, unknown>)) {
+    expect(validateRemoteDesktopBrowserMessage(message).ok, JSON.stringify(message)).toBe(true);
+  }
+});
+
+// The other half of the same lock, and the half that protects a browser still
+// running an older bundle: the contract must accept the marker even though
+// this client no longer sends it, so an already-open page cannot terminate
+// its own session by finishing ICE gathering.
+it('keeps the contract open to an end-of-candidates marker from any client', () => {
+  const correlation = {
+    requestId: 'b'.repeat(32),
+    sessionId: 'g'.repeat(43),
+    capability: 'h'.repeat(43),
+  };
+  expect(validateRemoteDesktopBrowserMessage({
+    type: REMOTE_DESKTOP_MSG.ICE, ...correlation, candidate: '', mid: '0',
+  }).ok).toBe(true);
 });
