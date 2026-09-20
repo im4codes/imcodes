@@ -5646,23 +5646,26 @@ html.native-ios-mac .chat-dl-btn {
   70% { opacity: 0.48; }
   88%, 100% { transform: translateX(55%); opacity: 0; }
 }
-.delegation-reply-card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 7px; }
+/* The header must never clip its text: a long task objective or source label
+   wraps (and the meta group drops below the title when the row is too narrow)
+   instead of collapsing to an ellipsis, which used to leave "来…" and a
+   truncated title on desktop widths. */
+.delegation-reply-card-head { display: flex; align-items: flex-start; flex-wrap: wrap; justify-content: space-between; gap: 5px 10px; margin-bottom: 7px; }
 .delegation-reply-card-head strong { color: #67e8f9; font-size: 12px; letter-spacing: 0.02em; }
-.delegation-reply-card-head span { min-width: 0; overflow: hidden; color: #94a3b8; text-overflow: ellipsis; white-space: nowrap; }
-.delegation-reply-card-heading { display: flex; min-width: 0; flex: 1 1 auto; flex-direction: column; gap: 2px; }
+.delegation-reply-card-head span { min-width: 0; color: #94a3b8; overflow-wrap: anywhere; }
+.delegation-reply-card-heading { display: flex; min-width: 0; flex: 1 1 220px; flex-direction: column; gap: 2px; }
 .delegation-reply-card-kicker { font-size: 9px; line-height: 1.2; text-transform: uppercase; }
 .delegation-reply-card-head .delegation-reply-card-objective {
   display: block;
   min-width: 0;
-  overflow: hidden;
   color: #e2e8f0;
   font-size: 12px;
   font-weight: 650;
   line-height: 1.35;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
-.delegation-reply-card-meta { min-width: 0; display: flex; align-items: center; justify-content: flex-end; gap: 7px; }
+.delegation-reply-card-meta { min-width: 0; display: flex; flex: 0 1 auto; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 4px 7px; margin-left: auto; }
 .delegation-reply-card-head .delegation-reply-verdict {
   flex: 0 0 auto;
   padding: 1px 6px;
@@ -5674,6 +5677,7 @@ html.native-ios-mac .chat-dl-btn {
   font-weight: 700;
   line-height: 1.35;
   letter-spacing: 0.08em;
+  white-space: nowrap;
 }
 .delegation-reply-task {
   display: flex;
@@ -5717,9 +5721,7 @@ html.native-ios-mac .chat-dl-btn {
 @media (max-width: 640px) {
   .delegation-reply-card[data-verdict] { padding: 9px 10px; box-shadow: inset 0 0 14px rgba(var(--delegation-verdict-rgb), 0.05); }
   .delegation-reply-card-meta { gap: 5px; }
-  .delegation-reply-card-head { align-items: flex-start; flex-wrap: wrap; gap: 5px 8px; }
   .delegation-reply-task { align-items: stretch; flex-direction: column; gap: 3px; }
-  .delegation-reply-card-head .delegation-reply-card-objective { overflow-wrap: anywhere; white-space: normal; }
   .delegation-reply-task-ids { max-width: 100%; }
 }
 @media (prefers-reduced-motion: reduce) {

@@ -156,9 +156,21 @@ describe('styles.css regression contracts', () => {
     expect(mobileRule).toMatch(/display:\s*none/);
   });
 
-  it('keeps delegation task titles readable and ids secondary on narrow screens', () => {
+  it('never clips the delegation card header and keeps ids secondary on narrow screens', () => {
+    // The title and the "from" label wrap at every width; an ellipsis here hid
+    // most of the task objective on desktop.
+    const headRule = cssWithoutComments.match(/\.delegation-reply-card-head\s*\{[^}]*\}/)?.[0];
+    expect(headRule).toMatch(/flex-wrap:\s*wrap/);
+    const headSpanRule = cssWithoutComments.match(/\.delegation-reply-card-head\s+span\s*\{[^}]*\}/)?.[0];
+    expect(headSpanRule).not.toMatch(/white-space:\s*nowrap|text-overflow:\s*ellipsis|overflow:\s*hidden/);
     const titleRule = cssWithoutComments.match(/\.delegation-reply-card-head\s+\.delegation-reply-card-objective\s*\{[^}]*\}/)?.[0];
-    expect(titleRule).toMatch(/text-overflow:\s*ellipsis/);
+    expect(titleRule).toMatch(/white-space:\s*normal/);
+    expect(titleRule).toMatch(/overflow-wrap:\s*anywhere/);
+    expect(titleRule).not.toMatch(/text-overflow:\s*ellipsis|overflow:\s*hidden/);
+    const metaRule = cssWithoutComments.match(/\.delegation-reply-card-meta\s*\{[^}]*\}/)?.[0];
+    expect(metaRule).toMatch(/flex-wrap:\s*wrap/);
+    const verdictRule = cssWithoutComments.match(/\.delegation-reply-card-head\s+\.delegation-reply-verdict\s*\{[^}]*\}/)?.[0];
+    expect(verdictRule).toMatch(/white-space:\s*nowrap/);
     const idsRule = cssWithoutComments.match(/\.delegation-reply-task-ids\s*\{[^}]*\}/)?.[0];
     expect(idsRule).toMatch(/font-size:\s*9px/);
     const idItemRule = cssWithoutComments.match(/\.delegation-reply-task-ids\s*>\s*span:not\(\[aria-hidden\]\)\s*\{[^}]*\}/)?.[0];
@@ -168,7 +180,6 @@ describe('styles.css regression contracts', () => {
     const mobileBlock = mobileBlocks.find((block) => block.includes('.delegation-reply-task'));
     expect(mobileBlock).toBeTruthy();
     expect(extractDirectStyleRule(mobileBlock!, /\.delegation-reply-task\s*/)).toMatch(/flex-direction:\s*column/);
-    expect(extractDirectStyleRule(mobileBlock!, /\.delegation-reply-card-head\s+\.delegation-reply-card-objective\s*/)).toMatch(/white-space:\s*normal/);
   });
 
   it('keeps remote desktop file window controls compact and horizontal', () => {
