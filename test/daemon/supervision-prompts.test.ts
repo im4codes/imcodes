@@ -36,8 +36,29 @@ import {
 } from '../../src/daemon/supervision-prompts.js';
 import { PEER_AUDIT_BRIEF_TOTAL_BYTES, peerAuditByteLength } from '../../shared/peer-audit.js';
 import { AUDIT_CONVERGENCE_CONTRACT_ID } from '../../shared/audit-convergence.js';
+import {
+  FILE_OUTPUT_CONTRACT,
+  FILE_OUTPUT_CONTRACT_ID,
+  buildFileOutputContract,
+} from '../../shared/file-output-contract.js';
 
 describe('supervision prompts', () => {
+  it('keeps the canonical file-output body in shared system context and only its id in execution preambles', () => {
+    expect(JSON.parse(buildFileOutputContract())).toEqual(FILE_OUTPUT_CONTRACT);
+    expect(SUPERVISION_CONTRACT_IDS.FILE_OUTPUT).toBe(FILE_OUTPUT_CONTRACT_ID);
+    expect(SUPERVISION_TRUSTED_EXECUTION_CONTRACT_IDS).toContain(FILE_OUTPUT_CONTRACT_ID);
+    expect(buildFileOutputContract()).toContain('"repoRelative":"resolve_against_workspace_if_only_known"');
+
+    for (const preamble of [
+      buildSupervisionExecutionPreamble('en'),
+      buildSupervisedAuditExecutionPreamble('en'),
+    ]) {
+      expect(preamble.match(/file_output_v1/g)).toHaveLength(1);
+      expect(preamble).not.toContain('"files":"produced_or_referenced"');
+      expect(preamble).not.toContain('[display name](/absolute/full/path)');
+    }
+  });
+
   it('encodes the critical supervision semantics in compact canonical maps', () => {
     const finalization = JSON.parse(buildSupervisionTaskFinalizationContract('en'));
     expect(finalization).toMatchObject({
@@ -131,7 +152,7 @@ describe('supervision prompts', () => {
     expect(prompt).toContain('"rerun":"minimal_on_concrete_gap"');
     expect(prompt).not.toContain(RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER);
     expect(prompt).toContain('"completion":"registry_intent_only"');
-    expect(prompt).toContain('Authoritative auto-audit mode: enabled');
+    expect(prompt).toContain('file_output_v1; auto-audit enabled');
     expect(prompt).toContain('Brain coordinates and integrates');
     expect(prompt).not.toContain('同伴审计模式');
   });
@@ -146,7 +167,7 @@ describe('supervision prompts', () => {
       expect(prompt).toContain('"waiting":"all_nonterminal"');
       expect(prompt).not.toContain(RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER);
       expect(prompt).toContain(SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING);
-      expect(prompt).toContain('Authoritative auto-audit mode: disabled');
+      expect(prompt).toContain('file_output_v1; auto-audit off');
     }
   });
 

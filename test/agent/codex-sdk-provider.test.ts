@@ -4836,7 +4836,7 @@ describe('CodexSdkProvider', () => {
     // Compressed Generated Image Reporting block lives here now — every
     // semantic point present.
     expect(base).toContain('Generated images:');
-    expect(base).toContain('absolute file path of every image you create/edit/save');
+    expect(base).toContain('apply file_output_v1 to every image you create/edit/save');
     expect(base).toContain('If no path returned, say so');
     expect(base).toContain('app/site/docs');
     codexRuntimeConfigMock.reset();

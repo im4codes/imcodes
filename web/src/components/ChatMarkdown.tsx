@@ -146,6 +146,20 @@ function renderInlineTokens(
   return renderTokens(tokens, ctx, inLink);
 }
 
+/**
+ * Markdown destinations may percent-encode spaces, Unicode, or punctuation.
+ * File actions operate on filesystem paths rather than URLs, so decode the
+ * complete destination once at the Markdown boundary. A malformed percent
+ * sequence remains usable verbatim instead of making the message unrenderable.
+ */
+function decodeMarkdownLocalPath(href: string): string {
+  try {
+    return decodeURIComponent(href);
+  } catch {
+    return href;
+  }
+}
+
 function renderToken(
   token: Token,
   key: number,
@@ -239,10 +253,11 @@ function renderToken(
 
     case 'link': {
       const t = token as Tokens.Link;
-      if (isLocalChatPath(t.href)) {
+      const path = decodeMarkdownLocalPath(t.href);
+      if (isLocalChatPath(path)) {
         return renderChatPathActions({
           key,
-          path: t.href,
+          path,
           content: renderInlineTokens(t.tokens, ctx, true),
           onPathClick: ctx.onPathClick,
           onDownload: ctx.onDownload,
@@ -285,11 +300,12 @@ function renderToken(
 
     case 'image': {
       const t = token as Tokens.Image;
-      if (isLocalChatPath(t.href) && isImagePreviewPath(t.href)) {
+      const path = decodeMarkdownLocalPath(t.href);
+      if (isLocalChatPath(path) && isImagePreviewPath(path)) {
         return renderChatPathActions({
           key,
-          path: t.href,
-          content: t.text || t.href,
+          path,
+          content: t.text || path,
           onPathClick: ctx.onPathClick,
           onDownload: ctx.onDownload,
           onHtmlPreview: ctx.onHtmlPreview,

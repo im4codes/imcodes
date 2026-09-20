@@ -29,8 +29,8 @@
  *
  *   • `buildFilePathReportingPrompt` — appended to `sessionSystemText`
  *     by `compileAgentContextArtifact`. Applies to ALL transport
- *     providers because IM.codes file preview/download needs a concrete
- *     filesystem path, not a bare filename or ambiguous relative path.
+ *     providers because IM.codes file preview/download needs the canonical
+ *     file-output contract.
  *
  * Lives in `shared/` because both builders are pure string composition
  * with no Node-only dependencies — the server (defense-in-depth) and
@@ -41,6 +41,7 @@ import { IMCODES_SESSION_ENV } from './imcodes-send.js';
 import { ALIAS_MCP_TOOLS } from './alias-types.js';
 import { MEMORY_MCP_TOOL_NAMES } from './memory-mcp-contracts.js';
 import { VERIFICATION_MACHINE_MCP_TOOLS } from './verification-machine.js';
+import { FILE_OUTPUT_CONTRACT_ID, buildFileOutputContract } from './file-output-contract.js';
 
 /**
  * Prefer evidence from an authorized real machine over a purely textual audit.
@@ -85,20 +86,14 @@ export function buildTransportImcodesIdentityPrompt(
  * always report the file path of any generated image so the user can
  * find / open / link to it.
  *
- * Compressed into one line while preserving the functional points:
- *   1. report the absolute file path of every image you create/edit/save
- *   2. multiple images each get a path (implicit in "every")
- *   3. if no path is returned, say so explicitly
- *   4. if used in app/site/docs, note where it was added
- * The original's two redundant lines ("do not only say image was
- * generated" and the closing "never finish without …") restated rule 1
- * and were dropped — the positive imperative already covers them.
+ * The generic path/link shape is referenced from file_output_v1 instead of
+ * being restated here; this block adds only image-specific completeness.
  *
  * This block is daemon-injected into Codex baseInstructions, once per
  * thread/start|resume.
  */
 export function buildGeneratedImageReportingPrompt(): string {
-  return 'Generated images: report the absolute file path of every image you create/edit/save. If no path returned, say so. If used in app/site/docs, also note where added.';
+  return `Generated images: apply ${FILE_OUTPUT_CONTRACT_ID} to every image you create/edit/save. If no path returned, say so. If used in app/site/docs, also note where added.`;
 }
 
 /**
@@ -109,5 +104,5 @@ export function buildGeneratedImageReportingPrompt(): string {
  * daemon-injected outside user-authored prompt caps.
  */
 export function buildFilePathReportingPrompt(): string {
-  return 'Files: when sharing, sending, opening, previewing, or linking a local file, provide its full absolute filesystem path (not a bare filename or relative path). If only repo-relative is known, resolve it against the workspace first.';
+  return buildFileOutputContract();
 }

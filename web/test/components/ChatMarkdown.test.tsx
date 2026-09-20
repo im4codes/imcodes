@@ -202,6 +202,100 @@ describe('ChatMarkdown', () => {
   });
 
   it.each([
+    ['absolute POSIX', '[release notes](/Users/k/output/release.pdf)', '/Users/k/output/release.pdf'],
+    ['spaces and parentheses', '[final report](</Users/k/My Files/report (final).pdf>)', '/Users/k/My Files/report (final).pdf'],
+    ['percent encoding', '[季度报告](/Users/k/My%20Files/%E5%AD%A3%E5%BA%A6%E6%8A%A5%E5%91%8A.pdf)', '/Users/k/My Files/季度报告.pdf'],
+    ['non-ASCII', '[设计稿](</Users/k/交付/最终设计稿.pdf>)', '/Users/k/交付/最终设计稿.pdf'],
+    ['Windows drive', String.raw`[Windows report](<C:\Users\K\My Files\report (final).pdf>)`, String.raw`C:\Users\K\My Files\report (final).pdf`],
+  ])('keeps only the display name visible and passes the decoded full path for %s links', (_name, text, expectedPath) => {
+    const onPathClick = vi.fn();
+    const onDownload = vi.fn();
+    const { container } = render(
+      <ChatMarkdown
+        text={text}
+        onPathClick={onPathClick}
+        onDownload={onDownload}
+      />,
+    );
+
+    const link = container.querySelector('.chat-path-link') as HTMLElement | null;
+    expect(link).not.toBeNull();
+    expect(link?.textContent).toBe(text.slice(1, text.indexOf(']')));
+    expect(container.textContent).not.toContain(expectedPath);
+    fireEvent.click(link!);
+    expect(onPathClick).toHaveBeenCalledWith(expectedPath);
+
+    const download = container.querySelector('.chat-dl-btn') as HTMLButtonElement | null;
+    expect(download).not.toBeNull();
+    fireEvent.click(download!);
+    expect(onDownload).toHaveBeenCalledWith(expectedPath);
+  });
+
+  it('preserves decoded full-path actions inside list, table, blockquote, and bold markdown', () => {
+    const onDownload = vi.fn();
+    const paths = [
+      '/Users/k/My Files/list.pdf',
+      '/Users/k/My Files/table.pdf',
+      '/Users/k/My Files/quote.pdf',
+      '/Users/k/My Files/bold.pdf',
+    ];
+    const text = [
+      '- [list](</Users/k/My Files/list.pdf>)',
+      '',
+      '| artifact |',
+      '| --- |',
+      '| [table](/Users/k/My%20Files/table.pdf) |',
+      '',
+      '> [quote](</Users/k/My Files/quote.pdf>)',
+      '',
+      '**[bold](/Users/k/My%20Files/bold.pdf)**',
+    ].join('\n');
+    const { container } = render(
+      <ChatMarkdown text={text} onPathClick={() => {}} onDownload={onDownload} />,
+    );
+
+    expect(Array.from(container.querySelectorAll('.chat-path-link')).map((node) => node.textContent))
+      .toEqual(['list', 'table', 'quote', 'bold']);
+    const buttons = container.querySelectorAll('.chat-dl-btn');
+    expect(buttons).toHaveLength(paths.length);
+    buttons.forEach((button) => fireEvent.click(button));
+    expect(onDownload.mock.calls.map(([path]) => path)).toEqual(paths);
+  });
+
+  it('keeps HTTP markdown links external and bare or backticked paths on their existing path flow', () => {
+    const onUrlClick = vi.fn();
+    const onDownload = vi.fn();
+    const { container } = render(
+      <ChatMarkdown
+        text={'[site](https://example.test/file.pdf)\n\nBare /Users/k/out/bare.pdf and `/Users/k/out/code.pdf`'}
+        onPathClick={() => {}}
+        onUrlClick={onUrlClick}
+        onDownload={onDownload}
+      />,
+    );
+
+    expect(container.querySelector('.chat-external-link')?.textContent).toBe('site');
+    expect(Array.from(container.querySelectorAll('.chat-path-link')).map((node) => node.textContent))
+      .toEqual(['/Users/k/out/bare.pdf', '/Users/k/out/code.pdf']);
+    expect(container.querySelectorAll('.chat-dl-btn')).toHaveLength(2);
+  });
+
+  it('does not turn a percent-encoded HTTP destination into a local file action', () => {
+    const { container } = render(
+      <ChatMarkdown
+        text="[encoded site](%68%74%74%70%73%3A%2F%2Fexample.test%2Ffile.pdf)"
+        onPathClick={() => {}}
+        onUrlClick={() => {}}
+        onDownload={() => {}}
+      />,
+    );
+
+    expect(container.querySelector('.chat-path-link')).toBeNull();
+    expect(container.querySelector('.chat-dl-btn')).toBeNull();
+    expect(container.querySelector('.chat-external-link')?.textContent).toBe('encoded site');
+  });
+
+  it.each([
     ['plain text path', 'Open ./dist/index.html', './dist/index.html'],
     ['markdown link', '[preview](./dist/INDEX.HTML)', './dist/INDEX.HTML'],
     ['code span', 'Open `./dist/index.htm`', './dist/index.htm'],
@@ -305,6 +399,26 @@ describe('ChatMarkdown', () => {
     });
     expect(container.querySelector('.chat-path-link')?.textContent).toBe('rendered preview');
     expect(onImagePreview).toHaveBeenCalledWith('./out/page.webp');
+  });
+
+  it('decodes the full path for a local markdown image preview while keeping its alt text visible', async () => {
+    const onImagePreview = vi.fn().mockResolvedValue('data:image/png;base64,aW1n');
+    const onDownload = vi.fn();
+    const { container } = render(
+      <ChatMarkdown
+        text="![rendered image](</Users/k/My Files/%E6%88%90%E5%93%81 (1).png>)"
+        onPathClick={() => {}}
+        onDownload={onDownload}
+        onImagePreview={onImagePreview}
+      />,
+    );
+
+    await waitFor(() => expect(onImagePreview).toHaveBeenCalled());
+    expect(container.querySelector('.chat-path-link')?.textContent).toBe('rendered image');
+    expect(container.textContent).not.toContain('/Users/k/My Files/成品 (1).png');
+    expect(onImagePreview).toHaveBeenCalledWith('/Users/k/My Files/成品 (1).png');
+    fireEvent.click(container.querySelector('.chat-dl-btn') as HTMLButtonElement);
+    expect(onDownload).toHaveBeenCalledWith('/Users/k/My Files/成品 (1).png');
   });
 
   it('does not detect paths inside URLs', () => {

@@ -15,6 +15,7 @@ import { VERIFICATION_MACHINE_MCP_TOOLS } from '../../shared/verification-machin
 import { ALIAS_MCP_TOOLS } from '../../shared/alias-types.js';
 import { MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
 import { AUDIT_CONVERGENCE_CONTRACT_ID } from '../../shared/audit-convergence.js';
+import { buildFileOutputContract } from '../../shared/file-output-contract.js';
 import {
   SESSION_IDENTITY_PROJECT_MAX_CHARS as ID_PROJECT_MAX,
   SESSION_IDENTITY_SESSION_MAX_CHARS as ID_SESSION_MAX,
@@ -110,8 +111,8 @@ describe('buildProviderContextPayload', () => {
     expect(payload.systemText).toContain('sourceLookup object');
     expect(payload.systemText).toContain('Keep work updates short and high-signal');
     expect(payload.systemText).toContain('at least every 5 minutes or every 15 tool calls');
-    expect(payload.systemText).toContain('full absolute filesystem path');
-    expect(payload.systemText).toContain('not a bare filename or relative path');
+    expect(payload.systemText).toContain('"contractId":"file_output_v1"');
+    expect(payload.systemText).toContain('[display name](/absolute/full/path)');
   });
 
   it('keeps the synchronized identity contract intact in stable session system text', () => {
@@ -350,7 +351,10 @@ describe('buildProviderContextPayload', () => {
       expect(payload.systemText).toContain('do not invent details from summaries alone');
       expect(payload.systemText).toContain('Keep work updates short and high-signal');
       expect(payload.systemText).toContain('skip routine narration and repeated summaries');
-      expect(payload.systemText).toContain('full absolute filesystem path');
+      expect(payload.systemText?.split(buildFileOutputContract())).toHaveLength(2);
+      expect(payload.systemText?.match(/file_output_v1/g)).toHaveLength(1);
+      expect(payload.systemText).toContain('[display name](/absolute/full/path)');
+      expect(payload.systemText).toContain('"repoRelative":"resolve_against_workspace_if_only_known"');
       expect(payload.sessionSystemText).toContain('cross-sdk identity sentinel');
       expect(payload.assembledMessage).toBe('What did we decide about memory recall last week?');
     }
@@ -809,7 +813,7 @@ describe('buildProviderContextPayload', () => {
       expect(systemText).toContain('Exact session name: deck_myapp_brain');
       expect(systemText).toContain('Display label: My App Brain');
       expect(systemText).toContain('imcodes send');
-      expect(systemText).toContain('full absolute filesystem path');
+      expect(systemText).toContain('[display name](/absolute/full/path)');
       expect(systemText).toContain(REAL_DEVICE_TESTING_SYSTEM_GUIDANCE);
       expect(systemText).toContain('perform it before audit');
       // Discovery comes BEFORE asking. The guidance used to go straight from

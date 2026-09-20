@@ -32,6 +32,7 @@ import {
   SUPERVISION_RECOVERABLE_CONTINUATION_CONDITIONS,
 } from '../../shared/supervision-config.js';
 import { SUPERVISION_IMCODES_BACKGROUND_DOCS } from './imcodes-workflow-docs.js';
+import { FILE_OUTPUT_CONTRACT_ID } from '../../shared/file-output-contract.js';
 import type { SupervisionBrokerRequest, SupervisionRecentEvidence } from './supervision-broker.js';
 import {
   PEER_AUDIT_BRIEF_REQUEST_BYTES,
@@ -725,7 +726,7 @@ export function buildSupervisedAuditExecutionPreamble(locale?: SupervisionUiLoca
     buildSupervisionTaskRegistryContract(locale),
     buildSupervisionDelegationEligibilityPolicy(locale),
     buildSupervisionMessagingContract(),
-    'Authoritative auto-audit mode: enabled; Brain coordinates and integrates.',
+    `${FILE_OUTPUT_CONTRACT_ID}; auto-audit enabled; Brain coordinates and integrates.`,
     JSON.stringify({ auditMode: true, beforePass: 'no_delivery_finalization', rework: 'fix_validate_fresh_audit', evidence: 'frozen_first_minimal_rerun' }),
     buildExecutionStatusContract(locale),
     SUPERVISION_CONTRACT_PREAMBLE_END,
@@ -742,7 +743,7 @@ export function buildSupervisionExecutionPreamble(locale?: SupervisionUiLocale):
     buildSupervisionTaskRegistryContract(locale),
     buildSupervisionDelegationEligibilityPolicy(locale),
     buildSupervisionMessagingContract(),
-    'Authoritative auto-audit mode: disabled.',
+    `${FILE_OUTPUT_CONTRACT_ID}; auto-audit off.`,
     buildExecutionStatusContract(locale),
     SUPERVISION_CONTRACT_PREAMBLE_END,
   ].join('');

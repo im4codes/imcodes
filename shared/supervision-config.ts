@@ -16,6 +16,7 @@ import {
 } from './shared-context-runtime-config.js';
 import { PROCESS_SESSION_AGENT_TYPES, TRANSPORT_SESSION_AGENT_TYPES } from './agent-types.js';
 import { PROVIDER_STATUS_REASON } from './provider-status-reasons.js';
+import { FILE_OUTPUT_CONTRACT_ID } from './file-output-contract.js';
 import {
   PEER_AUDIT_PROMPT_VERSION,
   isPeerAuditOpaqueId,
@@ -56,6 +57,7 @@ export const SUPERVISION_CONTRACT_IDS = {
   DELEGATION_ELIGIBILITY: 'supervision_delegation_eligibility_v1',
   TASK_REGISTRY: 'supervision_task_registry_v1',
   MESSAGING: 'supervision_messaging_v1',
+  FILE_OUTPUT: FILE_OUTPUT_CONTRACT_ID,
 } as const;
 
 export const SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND = 'supervision-audit-target-recovery' as const;
@@ -74,6 +76,7 @@ export const SUPERVISION_TRUSTED_EXECUTION_CONTRACT_IDS = [
   SUPERVISION_CONTRACT_IDS.DELEGATION_ELIGIBILITY,
   SUPERVISION_CONTRACT_IDS.TASK_REGISTRY,
   SUPERVISION_CONTRACT_IDS.MESSAGING,
+  SUPERVISION_CONTRACT_IDS.FILE_OUTPUT,
 ] as const;
 
 /**
