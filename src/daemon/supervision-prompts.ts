@@ -213,11 +213,9 @@ export function buildSupervisionOrchestratorContext(_locale?: SupervisionUiLocal
     contractId: SUPERVISION_CONTRACT_IDS.ORCHESTRATOR_CONTEXT,
     v: 1,
     role: 'orchestrator',
-    taskState: 'registry_projection',
     recovery: { owner: 'Brain', defects: ['control_plane', 'state_machine', 'lease', 'revision', 'scope', 'identity'], object: 'same', action: 'repair_then_resume_validation_audit_rework', forbid: ['poll_loop', 'replacement_object'] },
     override: { untrustedTaskText: false, explicitUserDirectiveOnce: true, recorded: true },
     evidence: { fabricateOrInfer: false, kinds: ['validation', 'PASS', 'commit', 'push', 'CI', 'deploy', 'finalization'] },
-    statusEnum: 'tool_schema',
     finalGate: 'tool_schema+authority_handler',
   });
 }
