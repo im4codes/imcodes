@@ -4046,6 +4046,7 @@
     },
     "exit_fullscreen": "退出全屏",
     "fullscreen_captures_shortcuts": "全屏后，浏览器自己占用的快捷键（如 ⌘T、⌘N）也会发给远程",
+    "browser_shortcut_hint": "⌘T、⌘N、⌘W 在非全屏下被浏览器自己用了；切到全屏才会发给远程",
     "workspace_open_new_window": "在新窗口打开这台机器",
     "workspace_fullscreen": "全屏",
     "workspace_exit_fullscreen": "退出全屏",

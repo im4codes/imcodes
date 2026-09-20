@@ -4046,6 +4046,7 @@
     },
     "exit_fullscreen": "退出全螢幕",
     "fullscreen_captures_shortcuts": "全螢幕後，瀏覽器自己佔用的快速鍵（如 ⌘T、⌘N）也會傳給遠端",
+    "browser_shortcut_hint": "⌘T、⌘N、⌘W 在非全螢幕下會被瀏覽器自己使用；切到全螢幕才會傳給遠端",
     "workspace_open_new_window": "在新視窗開啟這台機器",
     "workspace_fullscreen": "全螢幕",
     "workspace_exit_fullscreen": "退出全螢幕",

@@ -670,6 +670,15 @@ export function RemoteDesktopPanel({
   const hasCachedFrameRef = useRef(false);
   const lastCachedFrameAtRef = useRef(Number.NEGATIVE_INFINITY);
   const lastVideoDiagnosticAtRef = useRef(Number.NEGATIVE_INFINITY);
+  // Whether the chord the operator started with Command actually sent
+  // anything. A browser keeps its own shortcuts (Command+T, Command+N,
+  // Command+W): outside fullscreen the page is told Command went down and up
+  // and never sees the letter in between, so the remote holds a modifier and
+  // nothing happens -- indistinguishable, from the operator's chair, from the
+  // shortcut being silently dropped. Counting those says so out loud.
+  const commandChordKeysRef = useRef(0);
+  const swallowedCommandChordsRef = useRef(0);
+  const browserShortcutHintShownRef = useRef(false);
   const forwardedCommandCodesRef = useRef(new Set<string>());
   const suppressedCommandCodesRef = useRef(new Set<string>());
   const syntheticCommandControlRef = useRef(false);
@@ -2115,6 +2124,30 @@ export function RemoteDesktopPanel({
   // uses above -- so a dropped release message cannot leave Control (or, on a
   // macOS target, Command) physically stuck down on the remote host for the
   // rest of the session.
+  /**
+   * A Command chord that sent nothing is the browser keeping its own
+   * shortcut. Outside fullscreen it acts on Command+T/N/W itself and never
+   * tells the page the letter was pressed, so all the remote gets is a
+   * modifier going down and up alone -- measured against a real Mac: the
+   * Command press lands, the letter never does. Said out loud once, after it
+   * has happened twice, rather than leaving "this shortcut does nothing on
+   * the remote" to be guessed at.
+   */
+  const noteCommandChordOutcome = () => {
+    const keysInChord = commandChordKeysRef.current;
+    commandChordKeysRef.current = 0;
+    if (keysInChord > 0 || insideFullscreen || !fullscreen.supported) return;
+    swallowedCommandChordsRef.current += 1;
+    if (swallowedCommandChordsRef.current < 2 || browserShortcutHintShownRef.current) return;
+    browserShortcutHintShownRef.current = true;
+    const id = Date.now();
+    setControlNotice({ id, text: t('remote_desktop.browser_shortcut_hint') });
+    setTimeout(
+      () => setControlNotice((current) => (current?.id === id ? null : current)),
+      CONTROL_NOTICE_MS,
+    );
+  };
+
   const releaseSyntheticCommandControl = (altKey: boolean) => {
     const client = clientRef.current;
     if (!client) return;
@@ -2296,6 +2329,7 @@ export function RemoteDesktopPanel({
       // pasting its own clipboard on top once this one lands.
       return;
     }
+    if (clipboardShortcut) commandChordKeysRef.current += 1;
     if (clipboardShortcut && shouldForwardRemoteDesktopCopyKeystroke(event, undefined, targetPlatform)) {
       // A PC operator's Control+C on Linux: take the selection AND let the
       // keystroke through below -- it interrupts a remote terminal.
@@ -2316,6 +2350,7 @@ export function RemoteDesktopPanel({
     // Home is Command+Left on a Mac, ...) are tapped whole on the remote.
     const translated = down ? translateRemoteDesktopShortcut(event, undefined, targetPlatform) : null;
     if (translated) {
+      commandChordKeysRef.current += 1;
       event.preventDefault();
       translatedKeyCodesRef.current.add(event.code);
       client.tapChords(translated);
@@ -2334,8 +2369,13 @@ export function RemoteDesktopPanel({
       return;
     }
     if (mapped.usesCommandBridge && commandEvent) {
-      if (down) forwardedCommandCodesRef.current.add(mapped.code);
-      else forwardedCommandCodesRef.current.delete(mapped.code);
+      if (down) {
+        forwardedCommandCodesRef.current.add(mapped.code);
+        commandChordKeysRef.current = 0;
+      } else {
+        forwardedCommandCodesRef.current.delete(mapped.code);
+        noteCommandChordOutcome();
+      }
       if (!down && syntheticCommandControlRef.current) {
         releaseSyntheticCommandControl(event.altKey);
       }
@@ -2354,6 +2394,7 @@ export function RemoteDesktopPanel({
       releaseSyntheticCommandControl(event.altKey);
     }
     const sent = client.key(mapped.code, mapped.key, down, event.repeat, mapped.modifiers);
+    if (sent && !commandEvent) commandChordKeysRef.current += 1;
     if (sent) {
       if (down && mapped.code === 'KeyV' && mapped.modifiers.control) {
         forwardedPasteShortcutAtRef.current = Date.now();

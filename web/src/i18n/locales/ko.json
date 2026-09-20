@@ -4045,6 +4045,7 @@
     },
     "exit_fullscreen": "전체 화면 종료",
     "fullscreen_captures_shortcuts": "전체 화면에서는 ⌘T, ⌘N 처럼 브라우저가 가로채는 단축키도 전송됩니다",
+    "browser_shortcut_hint": "⌘T, ⌘N, ⌘W는 브라우저가 가져갑니다. 전체 화면으로 전환하면 원격으로 전송됩니다",
     "workspace_open_new_window": "이 컴퓨터를 새 창에서 열기",
     "workspace_fullscreen": "전체 화면",
     "workspace_exit_fullscreen": "전체 화면 종료",

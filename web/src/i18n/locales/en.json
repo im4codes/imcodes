@@ -4046,6 +4046,7 @@
     },
     "exit_fullscreen": "Exit full screen",
     "fullscreen_captures_shortcuts": "Full screen also sends the shortcuts the browser keeps for itself, such as ⌘T and ⌘N",
+    "browser_shortcut_hint": "Command+T, Command+N and Command+W belong to the browser here — go full screen to send them to the remote machine",
     "workspace_open_new_window": "Open this machine in a new window",
     "workspace_fullscreen": "Full screen",
     "workspace_exit_fullscreen": "Exit full screen",
