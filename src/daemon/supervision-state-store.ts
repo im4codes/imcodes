@@ -57,6 +57,7 @@ import type {
   SupervisionEconomyTaskPolicy,
   SupervisionExecutionBinding,
   SupervisionProvisioningEvidence,
+  SupervisionProvisionPool,
 } from '../../shared/supervision-execution-pool.js';
 import { mayFinalizeEconomyAssignment } from '../../shared/supervision-execution-pool.js';
 import { isSupervisionAuditorRecoveryRoutingConsistent } from '../../shared/supervision-auditor-recovery.js';
@@ -1918,6 +1919,7 @@ export class SupervisionTaskRegistry {
         commit_sha TEXT,
         push_remote_ref TEXT,
         blocker TEXT,
+        heartbeat_at INTEGER,
         payload_json TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
@@ -1948,6 +1950,9 @@ export class SupervisionTaskRegistry {
       );
       CREATE INDEX IF NOT EXISTS supervision_task_assignments_task_idx ON supervision_task_assignments(task_id, role, status);
       CREATE INDEX IF NOT EXISTS supervision_task_assignments_identity_idx ON supervision_task_assignments(session_name, session_instance_id, runtime_epoch);
+      CREATE INDEX IF NOT EXISTS supervision_task_assignments_pool_active_idx
+        ON supervision_task_assignments(json_extract(payload_json, '$.executionBinding.pool'), status, task_id)
+        WHERE lease_id <> '';
       CREATE TABLE IF NOT EXISTS supervision_task_file_claims (
         task_id TEXT NOT NULL,
         assignment_id TEXT NOT NULL,
@@ -2079,6 +2084,9 @@ export class SupervisionTaskRegistry {
       .map((row) => String(row.name ?? '')));
     if (!taskColumns.has('project_name')) {
       this.#db.exec('ALTER TABLE supervision_tasks ADD COLUMN project_name TEXT;');
+    }
+    if (!taskColumns.has('heartbeat_at')) {
+      this.#db.exec('ALTER TABLE supervision_tasks ADD COLUMN heartbeat_at INTEGER;');
     }
     this.#db.exec('CREATE INDEX IF NOT EXISTS supervision_tasks_project_idx ON supervision_tasks(project_name, updated_at);');
     // File claims predate per-assignment worktrees. They are retained as a
@@ -2642,6 +2650,24 @@ export class SupervisionTaskRegistry {
       })
       .slice(0, limit ?? Number.MAX_SAFE_INTEGER);
     return this.#hydrateTaskSnapshots(visible);
+  }
+
+  /** Count active leased owners in one project/pool without hydrating history. */
+  countActiveLeasedAssignmentsByPool(input: {
+    projectName: string;
+    pool: SupervisionProvisionPool;
+  }): number {
+    if (this.#closed) return 0;
+    const row = this.#db.prepare(`
+      SELECT COUNT(DISTINCT a.assignment_id) AS count
+      FROM supervision_task_assignments a
+      JOIN supervision_tasks t ON t.task_id = a.task_id
+      WHERE t.project_name = ?
+        AND a.lease_id <> ''
+        AND a.status NOT IN ('pushed', 'finalized', 'blocked', 'cancelled')
+        AND json_extract(a.payload_json, '$.executionBinding.pool') = ?
+    `).get(input.projectName, input.pool) as { count?: unknown } | undefined;
+    return Math.max(0, Number(row?.count ?? 0));
   }
 
   /**
@@ -3781,11 +3807,6 @@ export class SupervisionTaskRegistry {
   }
 
   /**
-   * Persist one implementation watchdog dispatch without pretending that the
-   * reminder itself is implementation progress. The event is the durable
-   * de-duplication/cooldown receipt used after SQLite reopen.
-   */
-  /**
    * Persist a liveness beat without moving the substantive progress clock.
    *
    * `updated_at` is the progress clock and must not move, but the console
@@ -3800,6 +3821,12 @@ export class SupervisionTaskRegistry {
     this.#db.prepare(
       'UPDATE supervision_task_assignments SET heartbeat_at = ?, payload_json = ? WHERE assignment_id = ?',
     ).run(now, JSON.stringify(next), assignment.assignmentId);
+    this.#db.prepare(
+      `UPDATE supervision_tasks
+       SET heartbeat_at = CASE
+         WHEN heartbeat_at IS NULL OR heartbeat_at < ? THEN ? ELSE heartbeat_at END
+       WHERE task_id = ?`,
+    ).run(now, now, assignment.taskId);
   }
 
   recordImplementationHeartbeat(input: {

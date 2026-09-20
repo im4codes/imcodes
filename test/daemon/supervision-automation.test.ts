@@ -586,6 +586,18 @@ function finishAuditRecoveryTestCleanup() {
 }
 
 describe('SupervisionAutomation', () => {
+  it('runs the implementation watchdog immediately during initialization', async () => {
+    const checkImplementationAssignments = vi
+      .spyOn(supervisionAutomation as never, 'checkImplementationAssignments' as never)
+      .mockResolvedValue(undefined as never);
+
+    supervisionAutomation.init();
+    await vi.waitFor(() => {
+      expect(checkImplementationAssignments).toHaveBeenCalledOnce();
+    });
+    checkImplementationAssignments.mockRestore();
+  });
+
   it('delivers current mode once when an idle Brain runtime restores after automation init', async () => {
     supervisionAutomation.__setAutomaticPeerAuditCompatibilityForTests(false);
     mockBrainRuntimeMissing = true;
@@ -4420,6 +4432,40 @@ describe('SupervisionAutomation', () => {
     expect(mockTransportRuntime.settleActiveDispatchFromExternalCompletion).not.toHaveBeenCalled();
   });
 
+  it('clears a timer re-armed during an awaited broker decision without publishing idle', async () => {
+    const resolveDecision = await beginDeferredBrokerWaitingDecision('cmd-broker-post-await-clear');
+    const run = supervisionAutomation.getActiveRun('deck_supervision_brain');
+    if (!run) throw new Error('missing active run');
+    const clearWaitingTimers = vi.spyOn(
+      supervisionAutomation as never,
+      'clearWaitingTimers' as never,
+    );
+    (supervisionAutomation as unknown as {
+      armWaitingTimers: (activeRun: typeof run) => void;
+    }).armWaitingTimers(run);
+    clearWaitingTimers.mockClear();
+
+    (resolveDecision as unknown as (decision: {
+      decision: 'continue'; reason: string; confidence: number; nextAction: string;
+    }) => void)({
+      decision: 'continue',
+      reason: 'the awaited check found one safe next action',
+      confidence: 0.9,
+      nextAction: 'Continue the same task.',
+    });
+    await vi.waitFor(() => {
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+        evaluating: false,
+      });
+    });
+
+    expect(clearWaitingTimers).toHaveBeenCalledWith(
+      run,
+      { preserveWindow: true, publish: false },
+    );
+    clearWaitingTimers.mockRestore();
+  });
+
   it('does not let a WAITING marker settle a newer turn that starts during delegation-evidence validation', async () => {
     const snapshot = await seedSession('supervised');
     supervisionAutomation.init();
@@ -6074,6 +6120,44 @@ describe('SupervisionAutomation', () => {
     }
   });
 
+  it('clears a parked timer and republishes idle when a new task intent replaces the run', async () => {
+    const snapshot = await seedSession('supervised');
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-old-park', 'wait for reply', snapshot);
+      beginRun('cmd-old-park', 'wait for reply');
+      completeTurn(`External request sent.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(getSupervisionHeartbeatProjection('deck_supervision_brain')).toMatchObject({
+        state: 'armed',
+        kind: 'waiting',
+      });
+      const timersWhileParked = vi.getTimerCount();
+      const projectionListener = vi.fn();
+      setSupervisionHeartbeatProjectionListener(projectionListener);
+
+      supervisionAutomation.registerTaskIntent(
+        'deck_supervision_brain',
+        'cmd-replacement',
+        'continue with the new task',
+        snapshot,
+      );
+
+      expect(vi.getTimerCount()).toBeLessThan(timersWhileParked);
+      expect(getSupervisionHeartbeatProjection('deck_supervision_brain')).toMatchObject({ state: 'idle' });
+      expect(projectionListener).toHaveBeenCalledWith(
+        'deck_supervision_brain',
+        expect.objectContaining({ state: 'idle' }),
+      );
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('pauses only on NEEDS_INPUT and resumes one heartbeat lifecycle on the next real user message', async () => {
     const snapshot = await seedSession('supervised');
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
@@ -6096,8 +6180,18 @@ describe('SupervisionAutomation', () => {
       await vi.advanceTimersByTimeAsync(20 * 60_000);
       expect(mockTransportRuntime.send).not.toHaveBeenCalled();
 
-      // A real new user message resumes the enabled mode. Duplicate projection
-      // and reconnect rows cannot create a second generation or timer.
+      // A plain real user reply has no registered task intent yet, but it still
+      // ends NEEDS_INPUT immediately. The aggregate projection must not keep
+      // showing the stale paused state until another lifecycle edge arrives.
+      beginRun('cmd-user-reply', 'Here is the requested decision.');
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+      expect(getSupervisionHeartbeatProjection('deck_supervision_brain')).toMatchObject({
+        state: 'idle',
+      });
+
+      // Registering the follow-up task then starts one heartbeat lifecycle.
+      // Duplicate projection and reconnect rows cannot create a second
+      // generation or timer.
       supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-user-resume', 'continue after my answer', snapshot);
       beginRun('cmd-user-resume', 'continue after my answer');
       const generation = supervisionAutomation.getActiveRun('deck_supervision_brain')?.generation;

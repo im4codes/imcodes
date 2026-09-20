@@ -15,6 +15,7 @@ import {
   type AgentDelegationReplyEnvelope,
   type AgentDelegationReplyError,
 } from '../../shared/agent-delegation.js';
+import { createHash } from 'node:crypto';
 import { isValidImcodesSessionName } from '../../shared/session-scope.js';
 import { ensureTransportRuntimeAvailable, getTransportRuntime } from '../agent/session-manager.js';
 import { getSession, type SessionRecord } from '../store/session-store.js';
@@ -273,6 +274,14 @@ function emitDelegationReplyTimeline(record: DelegationReplyRecord): void {
   const targetSession = getSession(record.target.sessionName);
   const verdict = trustedStructuredVerdict(record);
   const supervisionTask = safeSupervisionTaskProjection(record);
+  const exactAuditEventId = isExactAuditRecord(record)
+    ? createHash('sha256').update(JSON.stringify([
+        record.taskId,
+        record.assignmentId,
+        record.auditAttemptId,
+        record.auditRevision,
+      ])).digest('hex').slice(0, 32)
+    : undefined;
   timelineEmitter.emit(
     record.origin.sessionName,
     AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
@@ -287,7 +296,13 @@ function emitDelegationReplyTimeline(record: DelegationReplyRecord): void {
     {
       source: 'daemon',
       confidence: 'high',
-      eventId: `delegation-reply:${record.notificationId}`,
+      // Free-form completion prose and the later structured peer_audit receipt
+      // are two durable messages for one exact audit attempt. Project them as
+      // one stable card: the final receipt replaces the prose even when it
+      // arrives after the short reconciliation hold has elapsed.
+      eventId: exactAuditEventId
+        ? `delegation-reply:audit:${exactAuditEventId}`
+        : `delegation-reply:${record.notificationId}`,
     },
   );
 }

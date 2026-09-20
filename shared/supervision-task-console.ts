@@ -555,6 +555,11 @@ export interface SupervisionTaskConsoleDelta extends SupervisionTaskConsoleCurso
   /** Durable SQLite event id that produced this delta. */
   eventId: number;
   op: SupervisionConsoleDeltaOp;
+  /**
+   * Aggregate refresh paired with an assignment event. Assignment heartbeats
+   * can change task-level liveness without a second durable task event, so the
+   * one event/delta carries both rows atomically.
+   */
   task?: SupervisionTaskConsoleTaskRow;
   assignment?: SupervisionTaskConsoleAssignmentRow;
   removedId?: string;
@@ -774,7 +779,10 @@ export function isValidSupervisionTaskConsoleEvent(
         || !(SUPERVISION_CONSOLE_DELTA_OPS as readonly string[]).includes(value.op)) return false;
       switch (value.op as SupervisionConsoleDeltaOp) {
         case 'task_upsert': return isTaskRow(value.task);
-        case 'assignment_upsert': return isAssignmentRow(value.assignment);
+        case 'assignment_upsert': return isAssignmentRow(value.assignment)
+          && (value.task === undefined || (isTaskRow(value.task)
+            && (value.task as SupervisionTaskConsoleTaskRow).taskId
+              === (value.assignment as SupervisionTaskConsoleAssignmentRow).taskId));
         case 'task_remove':
         case 'assignment_remove': return typeof value.removedId === 'string' && value.removedId.length > 0;
         case 'pools_update': return Array.isArray(value.pools) && value.pools.every(isPoolRow);

@@ -108,6 +108,47 @@ import { startSessionIdentitySync, stopSessionIdentitySync } from './session-ide
 
 export { acquireInstanceLock, releaseInstanceLock } from './instance-lock.js';
 
+/**
+ * Coalesce heartbeat projection changes onto the two authoritative session
+ * snapshot channels. Kept as a small injectable unit so lifecycle tests can
+ * prove both main-session and sub-session publication without booting a daemon.
+ */
+export function createSupervisionHeartbeatProjectionSyncHandler(deps: {
+  getServerLink: () => ServerLink | null;
+  buildSessionList?: typeof buildSessionList;
+  sendSubSessionSync?: typeof sendSubSessionSync;
+  onError?: (error: unknown, sessions: string[]) => void;
+}): (sessionName: string) => void {
+  const buildList = deps.buildSessionList ?? buildSessionList;
+  const syncSubSession = deps.sendSubSessionSync ?? sendSubSessionSync;
+  const pending = new Set<string>();
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  return (sessionName) => {
+    pending.add(sessionName);
+    if (timer) return;
+    timer = setTimeout(() => {
+      timer = null;
+      const names = [...pending];
+      pending.clear();
+      const link = deps.getServerLink();
+      if (!link) return;
+      void (async () => {
+        if (names.some((name) => !name.startsWith('deck_sub_'))) {
+          const sessions = await buildList();
+          link.send({ type: 'session_list', daemonVersion: link.daemonVersion, sessions });
+        }
+        for (const name of names) {
+          if (!name.startsWith('deck_sub_')) continue;
+          await syncSubSession(link, name.slice('deck_sub_'.length));
+        }
+      })().catch((error) => {
+        deps.onError?.(error, names);
+      });
+    }, 0);
+    timer.unref?.();
+  };
+}
+
 let supervisionConsole: SupervisionConsoleBinding | undefined;
 
 /** Exposed for diagnostics/tests; undefined until the link is bound. */
@@ -1353,32 +1394,12 @@ export async function startup(): Promise<DaemonContext> {
   });
   // Coalesce schedule transitions into the existing session snapshot channels.
   // The browser ticks locally; only a new deadline/state causes daemon traffic.
-  const pendingHeartbeatProjectionSync = new Set<string>();
-  let heartbeatProjectionSyncTimer: ReturnType<typeof setTimeout> | null = null;
-  setSupervisionHeartbeatProjectionListener((sessionName) => {
-    pendingHeartbeatProjectionSync.add(sessionName);
-    if (heartbeatProjectionSyncTimer) return;
-    heartbeatProjectionSyncTimer = setTimeout(() => {
-      heartbeatProjectionSyncTimer = null;
-      const names = [...pendingHeartbeatProjectionSync];
-      pendingHeartbeatProjectionSync.clear();
-      const link = serverLink;
-      if (!link) return;
-      void (async () => {
-        if (names.some((name) => !name.startsWith('deck_sub_'))) {
-          const sessions = await buildSessionList();
-          link.send({ type: 'session_list', daemonVersion: link.daemonVersion, sessions });
-        }
-        for (const name of names) {
-          if (!name.startsWith('deck_sub_')) continue;
-          await sendSubSessionSync(link, name.slice('deck_sub_'.length));
-        }
-      })().catch((error) => {
-        logger.warn({ err: error, sessions: names }, 'Supervision heartbeat projection sync failed');
-      });
-    }, 0);
-    heartbeatProjectionSyncTimer.unref?.();
-  });
+  setSupervisionHeartbeatProjectionListener(createSupervisionHeartbeatProjectionSyncHandler({
+    getServerLink: () => serverLink,
+    onError: (error, sessions) => {
+      logger.warn({ err: error, sessions }, 'Supervision heartbeat projection sync failed');
+    },
+  }));
   supervisionAutomation.init();
   supervisionAutomation.setServerLink(serverLink);
   // One recovery pass closes the durable ready_for_audit -> dispatch crash

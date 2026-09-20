@@ -645,7 +645,9 @@ describe('supervision auto provisioning', () => {
         leasedTaskIndexes: [98, 99, 100, 101],
         sessionName: 'deck_sub_page_active',
       });
+      const listSpy = vi.spyOn(registry, 'list');
       await expect(defaultCountActiveSupervisionAssignments(brain, 'primary', registry)).resolves.toBe(4);
+      expect(listSpy).not.toHaveBeenCalled();
       const h = harness([brain], {
         countActiveSupervisionAssignments: (candidate, pool) => (
           defaultCountActiveSupervisionAssignments(candidate, pool, registry)

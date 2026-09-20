@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import {
   SUPERVISION_CONSOLE_UNAVAILABLE_REASONS,
@@ -10,6 +10,7 @@ import {
 } from '../../shared/supervision-task-console.js';
 import { SUPERVISION_TASK_STATUS_CONTRACT_VERSION } from '../../shared/supervision-config.js';
 import {
+  SUPERVISION_TASK_CONSOLE_SUBSCRIBE_TIMEOUT_MS,
   SupervisionTaskConsoleController,
   type SupervisionTaskConsoleSocket,
 } from '../src/supervision-task-console-controller.js';
@@ -102,6 +103,70 @@ function taskDelta(
 
 describe('SupervisionTaskConsoleController', () => {
   beforeEach(() => clearAllSupervisionTaskConsoleCaches());
+  afterEach(() => vi.useRealTimers());
+
+  it('ends an unanswered initial subscription in a retryable error instead of connecting forever', () => {
+    vi.useFakeTimers();
+    const socket = new FakeSocket();
+    const controller = new SupervisionTaskConsoleController(socket, SCOPE);
+    controller.start();
+    controller.setConnected(true);
+
+    vi.advanceTimersByTime(SUPERVISION_TASK_CONSOLE_SUBSCRIBE_TIMEOUT_MS);
+
+    expect(controller.getState()).toMatchObject({
+      phase: SUPERVISION_TASK_CONSOLE_PHASE.ERROR,
+      syncState: 'error',
+      syncing: false,
+      error: 'subscription_timeout',
+    });
+
+    controller.retry();
+    expect(controller.getState()).toMatchObject({
+      phase: SUPERVISION_TASK_CONSOLE_PHASE.SUBSCRIBING,
+      syncState: 'connecting',
+      syncing: true,
+    });
+    expect(socket.sent.filter((message) => (
+      (message as { type?: unknown }).type === SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE
+    ))).toHaveLength(2);
+  });
+
+  it('marks cached rows stale on an unanswered refresh and cancels obsolete timers', () => {
+    vi.useFakeTimers();
+    const seedSocket = new FakeSocket();
+    const seed = new SupervisionTaskConsoleController(seedSocket, SCOPE, AUTHORITY);
+    seed.start();
+    seed.setConnected(true);
+    seedSocket.emit(snapshot(latest<{ subscriptionId: string }>(
+      seedSocket, SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE,
+    ).subscriptionId));
+    seed.stop();
+
+    const socket = new FakeSocket();
+    const controller = new SupervisionTaskConsoleController(socket, SCOPE, AUTHORITY);
+    controller.start();
+    controller.setConnected(true);
+    vi.advanceTimersByTime(SUPERVISION_TASK_CONSOLE_SUBSCRIBE_TIMEOUT_MS);
+    expect(controller.getState()).toMatchObject({
+      phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+      syncState: 'stale',
+      syncing: false,
+      error: 'subscription_timeout',
+    });
+    expect(controller.getState().tasks).toHaveProperty('task-1');
+
+    controller.retry();
+    const retry = latest<{ subscriptionId: string }>(socket, SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE);
+    socket.emit(snapshot(retry.subscriptionId));
+    vi.advanceTimersByTime(SUPERVISION_TASK_CONSOLE_SUBSCRIBE_TIMEOUT_MS);
+    expect(controller.getState()).toMatchObject({ syncState: 'synced', error: null });
+
+    controller.retry();
+    controller.stop();
+    vi.advanceTimersByTime(SUPERVISION_TASK_CONSOLE_SUBSCRIBE_TIMEOUT_MS);
+    expect(controller.getState().syncState).toBe('connecting');
+  });
   it('does not leave an initially offline console in IDLE/loading', () => {
     const socket = new FakeSocket();
     const controller = new SupervisionTaskConsoleController(socket, SCOPE);

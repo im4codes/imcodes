@@ -3931,7 +3931,10 @@ class SupervisionAutomation {
       if (!automation && !queueAppended && !delegatedReply && !delegationCompletionNotification && text && !text.startsWith('/')) {
         const liveSnapshot = extractSessionSupervisionSnapshot(getSession(event.sessionId)?.transportConfig ?? null);
         if (isAutomaticSupervisionEnabled(liveSnapshot)) {
-          this.heartbeatPausedForNeedsInput.delete(event.sessionId);
+          const resumedFromNeedsInput = this.heartbeatPausedForNeedsInput.delete(event.sessionId);
+          if (resumedFromNeedsInput) {
+            this.publishHeartbeatProjection(event.sessionId, liveSnapshot);
+          }
         }
         this.resetImplicitCompletionWait(event.sessionId);
         this.recoverySuppressedUntilNextUser.delete(event.sessionId);

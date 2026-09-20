@@ -32,6 +32,13 @@ describe('heartbeat UI wiring and accessibility contract', () => {
     expect(reduced).toMatch(/animation:\s*none/);
   });
 
+  it('gives the neutral idle glyph its own theme-safe presentation', () => {
+    const component = readFileSync(resolve(WEB_ROOT, 'src/components/SupervisionHeartbeatBadge.tsx'), 'utf8');
+    const css = readFileSync(resolve(WEB_ROOT, 'src/styles.css'), 'utf8');
+    expect(component).toContain('supervision-heartbeat-glyph is-idle');
+    expect(css).toMatch(/\.supervision-heartbeat-glyph\.is-idle\s*\{[^}]*color:\s*var\(--[^)]+\)/s);
+  });
+
   it('keeps the heartbeat translation surface complete in every locale', () => {
     const locales = ['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko'];
     for (const locale of locales) {

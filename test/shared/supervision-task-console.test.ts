@@ -210,6 +210,28 @@ describe('supervision console wire validation', () => {
     expect(isValidSupervisionTaskConsoleEvent({ ...base, task: taskRow() })).toBe(true);
   });
 
+  it('accepts an assignment delta with its same-event aggregate task refresh', () => {
+    expect(isValidSupervisionTaskConsoleEvent({
+      ...base,
+      op: 'assignment_upsert',
+      assignment: {
+        assignmentId: 'asg-1', taskId: 'tsk-1', status: 'implementing',
+        phase: 'active', validationState: 'pending', heartbeatAt: 42,
+        updatedAt: 1, lastEventId: 42,
+      },
+      task: taskRow({ taskId: 'tsk-1', heartbeatAt: 42 }),
+    })).toBe(true);
+    expect(isValidSupervisionTaskConsoleEvent({
+      ...base,
+      op: 'assignment_upsert',
+      assignment: {
+        assignmentId: 'asg-1', taskId: 'tsk-1', status: 'implementing',
+        phase: 'active', validationState: 'pending', updatedAt: 1, lastEventId: 42,
+      },
+      task: taskRow({ taskId: 'another-task' }),
+    })).toBe(false);
+  });
+
   it('rejects model-authored / unknown / case-variant status', () => {
     for (const status of ['file_event', 'scope_violation', 'Implementing', ' implementing', 'in_progress', 'done']) {
       expect(isValidSupervisionTaskConsoleEvent({ ...base, task: taskRow({ status: status as never }) }), status).toBe(false);

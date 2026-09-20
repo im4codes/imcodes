@@ -308,33 +308,14 @@ export async function defaultHasActiveSupervisionLease(
 export async function defaultCountActiveSupervisionAssignments(
   parent: SessionRecord,
   pool: SupervisionAutoProvisionRequest['pool'],
-  registryOverride?: Pick<SupervisionTaskRegistry, 'list'>,
+  registryOverride?: Pick<SupervisionTaskRegistry, 'countActiveLeasedAssignmentsByPool'>,
 ): Promise<number> {
   const registry = registryOverride
     ?? (await import('./supervision-state-store.js')).getSupervisionTaskRegistry();
-  const assignmentIds = new Set<string>();
-  let cursor: string | undefined;
-  do {
-    const page = registry.list({
-      projectName: parent.projectName,
-      includeArchived: true,
-      cursor,
-      limit: SUPERVISION_AUTO_PROVISION_REGISTRY_PAGE_SIZE,
-    });
-    for (const task of page) {
-      for (const assignment of task.assignments) {
-        if (assignment.executionBinding?.pool === pool
-          && Boolean(assignment.leaseId)
-          && !isTerminalSupervisionTaskStatus(assignment.status)) {
-          assignmentIds.add(assignment.assignmentId);
-        }
-      }
-    }
-    cursor = page.length === SUPERVISION_AUTO_PROVISION_REGISTRY_PAGE_SIZE
-      ? page[page.length - 1]?.taskId
-      : undefined;
-  } while (cursor);
-  return assignmentIds.size;
+  return registry.countActiveLeasedAssignmentsByPool({
+    projectName: parent.projectName,
+    pool,
+  });
 }
 
 async function reapOneIdleAutomaticChild(

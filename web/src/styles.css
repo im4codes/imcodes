@@ -25,6 +25,7 @@ html { position: fixed; }
   --supervision-needs-input-bg: rgba(120, 53, 15, 0.32);
   --supervision-needs-input-border: rgba(251, 191, 36, 0.56);
   --supervision-needs-input-text: #fde68a;
+  --supervision-idle-text: #94a3b8;
   /* The desktop vertical rail is one compact bottom sub-session card wide. */
   --subsession-compact-card-width: 54px;
   /* Team progress needs readable topics/status while remaining much narrower
@@ -747,6 +748,7 @@ html.native-ios-mac .chat-dl-btn {
 }
 .supervision-heartbeat-badge.is-sending { animation: supervision-heartbeat-pulse 0.72s ease-in-out infinite alternate; }
 .supervision-heartbeat-glyph { display: inline-block; line-height: 1; }
+.supervision-heartbeat-glyph.is-idle { color: var(--supervision-idle-text); }
 @keyframes supervision-heartbeat-pulse {
   from { transform: scale(1); box-shadow: 0 0 3px rgba(251, 113, 133, 0.3); }
   to { transform: scale(1.08); box-shadow: 0 0 9px var(--supervision-heartbeat-glow); }

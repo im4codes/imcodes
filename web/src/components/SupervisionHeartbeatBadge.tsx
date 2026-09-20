@@ -41,7 +41,7 @@ export function SupervisionHeartbeatBadge({
   }
   if (state === SUPERVISION_HEARTBEAT_STATE.IDLE) {
     const label = t('session.supervision.heartbeat.idle');
-    return <span class="supervision-heartbeat-badge is-idle" role="status" aria-label={label} title={label}>{SUPERVISION_HEARTBEAT_GLYPH.IDLE}</span>;
+    return <span class="supervision-heartbeat-badge is-idle" role="status" aria-label={label} title={label}><span class="supervision-heartbeat-glyph is-idle" aria-hidden="true">{SUPERVISION_HEARTBEAT_GLYPH.IDLE}</span></span>;
   }
   if (state !== SUPERVISION_HEARTBEAT_STATE.ARMED
     || heartbeat.nextHeartbeatAt === undefined) return null;

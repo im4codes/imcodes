@@ -188,6 +188,23 @@ describe('supervision task console reducer', () => {
     expect(supervisionTaskConsoleReducer(applied, { type: 'delta_received', payload: delta() })).toBe(applied);
   });
 
+  it('refreshes the aggregate task row carried by an assignment-only event', () => {
+    const applied = supervisionTaskConsoleReducer(readyState(), {
+      type: 'delta_received',
+      payload: delta({
+        op: 'assignment_upsert',
+        assignment: {
+          ...snapshot().assignments[0]!, heartbeatAt: 404, lastEventId: 4,
+        },
+        task: {
+          ...snapshot().tasks[0]!, heartbeatAt: 404, lastEventId: 4,
+        },
+      }),
+    });
+    expect(applied.assignments['assignment-1']?.heartbeatAt).toBe(404);
+    expect(applied.tasks['task-1']?.heartbeatAt).toBe(404);
+  });
+
   it('keeps the last authoritative rows visible while requesting a full resync for a version gap', () => {
     const gapped = supervisionTaskConsoleReducer(readyState(), {
       type: 'delta_received',

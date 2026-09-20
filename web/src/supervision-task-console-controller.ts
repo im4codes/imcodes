@@ -33,6 +33,9 @@ export interface SupervisionTaskConsoleSocket {
 
 type StateListener = (state: SupervisionTaskConsoleReducerState) => void;
 
+/** Bound an unanswered subscribe so the console always exposes its Retry control. */
+export const SUPERVISION_TASK_CONSOLE_SUBSCRIBE_TIMEOUT_MS = 15_000;
+
 function sameScope(left: SupervisionTaskConsoleScope, right: SupervisionTaskConsoleScope): boolean {
   return left.projectName === right.projectName
     && left.coordinatorSessionName === right.coordinatorSessionName;
@@ -92,6 +95,7 @@ export class SupervisionTaskConsoleController {
   private readonly listeners = new Set<StateListener>();
   private unsubscribeMessage: (() => void) | null = null;
   private connected = false;
+  private subscribeTimeout: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     private readonly socket: SupervisionTaskConsoleSocket,
@@ -129,6 +133,7 @@ export class SupervisionTaskConsoleController {
       this.socket.send(frame);
     }
     this.connected = false;
+    this.clearSubscribeTimeout();
     this.unsubscribeMessage?.();
     this.unsubscribeMessage = null;
   }
@@ -138,12 +143,14 @@ export class SupervisionTaskConsoleController {
       // The controller starts disconnected. Its first React effect must still
       // leave a terminal, visible state instead of preserving IDLE/loading.
       if (!connected && this.state.phase !== SUPERVISION_TASK_CONSOLE_PHASE.ERROR) {
+        this.clearSubscribeTimeout();
         this.apply({ type: 'transport_disconnected' });
       }
       return;
     }
     this.connected = connected;
     if (!connected) {
+      this.clearSubscribeTimeout();
       this.apply({ type: 'transport_disconnected' });
       return;
     }
@@ -161,6 +168,23 @@ export class SupervisionTaskConsoleController {
 
   private emit(): void {
     for (const listener of this.listeners) listener(this.state);
+  }
+
+  private clearSubscribeTimeout(): void {
+    if (!this.subscribeTimeout) return;
+    clearTimeout(this.subscribeTimeout);
+    this.subscribeTimeout = null;
+  }
+
+  private armSubscribeTimeout(subscriptionId: string): void {
+    this.clearSubscribeTimeout();
+    this.subscribeTimeout = setTimeout(() => {
+      this.subscribeTimeout = null;
+      if (!this.connected
+        || !this.state.syncing
+        || this.state.subscriptionId !== subscriptionId) return;
+      this.apply({ type: 'transport_error', error: 'subscription_timeout' });
+    }, SUPERVISION_TASK_CONSOLE_SUBSCRIBE_TIMEOUT_MS);
   }
 
   private apply(action: SupervisionTaskConsoleReducerAction): void {
@@ -223,12 +247,14 @@ export class SupervisionTaskConsoleController {
     };
     this.apply({ type: 'subscribe_started', subscriptionId });
     this.socket.send(frame);
+    this.armSubscribeTimeout(subscriptionId);
   }
 
   private handleMessage(message: unknown): void {
     if (!this.connected) return;
     if (!isRecord(message)) return;
     if (message.type === DAEMON_MSG.DISCONNECTED) {
+      this.clearSubscribeTimeout();
       this.apply({ type: 'transport_error', error: 'daemon_disconnected' });
       return;
     }
@@ -240,6 +266,7 @@ export class SupervisionTaskConsoleController {
       const control = parseResyncRequired(message);
       if (!control) return;
       if (!this.state.subscriptionId || control.subscriptionId !== this.state.subscriptionId) return;
+      this.clearSubscribeTimeout();
       if (!sameScope(control.scope, this.scope)) {
         this.apply({ type: 'server_resync_required', reason: 'scope_mismatch' });
         return;
@@ -252,15 +279,18 @@ export class SupervisionTaskConsoleController {
       if (!unavailable || !this.state.subscriptionId
         || unavailable.subscriptionId !== this.state.subscriptionId
         || !sameScope(unavailable.scope, this.scope)) return;
+      this.clearSubscribeTimeout();
       if (this.authority) clearSupervisionTaskConsoleCache(this.authority);
       this.apply({ type: 'authority_invalidated', error: unavailable.reason });
       return;
     }
     if (message.type === SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT) {
+      if (message.subscriptionId === this.state.subscriptionId) this.clearSubscribeTimeout();
       this.apply({ type: 'snapshot_received', payload: message, receivedAt: Date.now() });
       return;
     }
     if (message.type === SUPERVISION_TASK_CONSOLE_MSG.DELTA) {
+      if (message.subscriptionId === this.state.subscriptionId) this.clearSubscribeTimeout();
       this.apply({ type: 'delta_received', payload: message, receivedAt: Date.now() });
     }
   }

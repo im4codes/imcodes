@@ -270,6 +270,12 @@ function applyDelta(
     case 'assignment_upsert':
       if (!delta.assignment) return requestResync(state, 'cursor_unknown');
       assignments[delta.assignment.assignmentId] = delta.assignment;
+      if (delta.task) {
+        if (delta.task.taskId !== delta.assignment.taskId) {
+          return requestResync(state, 'cursor_unknown');
+        }
+        tasks[delta.task.taskId] = delta.task;
+      }
       eventTaskId = delta.assignment.taskId;
       break;
     case 'assignment_remove':

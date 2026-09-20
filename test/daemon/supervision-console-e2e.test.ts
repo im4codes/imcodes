@@ -166,6 +166,57 @@ describe('producer -> link -> browser E2E', () => {
     }
   });
 
+  it('refreshes both assignment and aggregate task heartbeat projection from one real registry event', async () => {
+    const registry = new SupervisionTaskRegistry({ database: db });
+    const unsubscribe = registry.subscribeDurableEvents(() => {
+      binding.sessions.refreshActiveSubscriptions();
+    });
+    const identity = {
+      sessionName: 'deck_sub_console_heartbeat',
+      sessionInstanceId: 'instance-console-heartbeat',
+      runtimeEpoch: 'epoch-console-heartbeat',
+      agentType: 'codex-sdk',
+      providerFamily: 'openai',
+    } as const;
+    try {
+      expect(registry.createOrGet({
+        taskId: 'task-heartbeat-projection', projectName: SCOPE.projectName,
+        objective: 'project assignment heartbeat into the aggregate task row',
+      })).toMatchObject({ ok: true });
+      const created = registry.createAssignment({
+        assignmentId: 'assignment-heartbeat-projection', taskId: 'task-heartbeat-projection',
+        role: 'implementer', identity, scopeFiles: [],
+      });
+      expect(created).toMatchObject({ ok: true });
+      await new Promise<void>((resolve) => queueMicrotask(resolve));
+      toDaemon(browser.subscribeFrame(null));
+
+      expect(registry.recordImplementationHeartbeat({
+        assignmentId: 'assignment-heartbeat-projection', now: 404,
+        reminderNumber: 1, clientMessageId: 'heartbeat-projection-1',
+      })).toMatchObject({ ok: true });
+      await new Promise<void>((resolve) => queueMicrotask(resolve));
+
+      const heartbeat = binding.producer.pendingFrames(SCOPE)
+        .map((row) => row.frame)
+        .find((frame) => frame.eventId === frame.lastDurableEventId
+          && frame.assignment?.assignmentId === 'assignment-heartbeat-projection'
+          && frame.assignment.heartbeatAt === 404);
+      expect(heartbeat).toMatchObject({
+        op: 'assignment_upsert',
+        assignment: { heartbeatAt: 404 },
+        task: { taskId: 'task-heartbeat-projection', heartbeatAt: 404 },
+      });
+      expect(heartbeat && isValidSupervisionTaskConsoleEvent({
+        ...heartbeat, subscriptionId: browser.activeSubscriptionId,
+      })).toBe(true);
+      expect(browser.rejected).toBe(0);
+    } finally {
+      unsubscribe();
+      registry.close();
+    }
+  });
+
   it('hydrates a snapshot the browser validator accepts, then applies live deltas', () => {
     toDaemon(browser.subscribeFrame(null));
     expect(browser.rejected).toBe(0);

@@ -568,6 +568,34 @@ describe('delegation reply ingress', () => {
     }
   });
 
+  it('replaces released audit prose with a late exact verdict on one stable card', async () => {
+    vi.useFakeTimers();
+    const harness = installRealAuditHarness('late-verdict-card');
+    try {
+      await harness.submitCompletion('Early prose completion without verdict authority.');
+      await vi.advanceTimersByTimeAsync(AGENT_DELEGATION_AUDIT_RECONCILIATION_MS + 1);
+      expect(mocks.timelineEmit).toHaveBeenCalledTimes(1);
+      const proseEventId = mocks.timelineEmit.mock.calls[0]?.[3]?.eventId;
+
+      await expect(harness.submitAudit(
+        'final',
+        'Late authoritative PASS findings.',
+      )).resolves.toEqual({ ok: true });
+
+      expect(mocks.timelineEmit).toHaveBeenCalledTimes(2);
+      const verdictCall = mocks.timelineEmit.mock.calls[1];
+      expect(verdictCall?.[2]).toEqual(expect.objectContaining({
+        result: 'Late authoritative PASS findings.',
+        verdict: 'PASS',
+      }));
+      expect(verdictCall?.[3]?.eventId).toBe(proseEventId);
+      expect(proseEventId).toMatch(/^delegation-reply:audit:/u);
+    } finally {
+      harness.close();
+      vi.useRealTimers();
+    }
+  });
+
   it('releases a held audit completion when there is no exact final receipt', async () => {
     vi.useFakeTimers();
     try {

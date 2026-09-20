@@ -263,6 +263,10 @@ export class SupervisionConsoleProducer {
       if (assignment) {
         base.op = 'assignment_upsert';
         base.assignment = assignment;
+        // Assignment liveness is also an aggregate task fact. Keep both rows
+        // on the same durable event/version rather than inventing a second
+        // event or waiting for an unrelated task transition.
+        base.task = this.readTaskRow(event.taskId, scope.projectName, event.id);
         // Pool occupancy changes on assignment transitions. Shipping the
         // current pool rows with the same durable event keeps both views atomic.
         base.pools = this.readPools(scope.projectName);

@@ -8480,6 +8480,19 @@ describe('SupervisionTaskRegistry', () => {
       identity: { sessionName: worker.name },
       provisioning: evidence,
     });
+
+    const continuation = await dispatchSendMessage(
+      { userId: 'u', sessionName: brain.name, projectName: 'alpha', projectRoot: '/work/alpha' },
+      {
+        target: worker.name,
+        message: 'continue the same durable task',
+        idempotencyKey: 'busy-fallback-existing-task',
+        task: { taskId: sent.taskId!, objective: 'busy explicit target remains exact' },
+      },
+      { listSessions: () => sessions, dispatchMessage, exactTargetOnly: true, ensureSupervisionAssignmentWorktree },
+    );
+    expect(continuation).toMatchObject({ status: 'accepted' });
+    expect(continuation).not.toHaveProperty('autoProvisionRecommended');
   });
 
   it('does not dispatch a missing-worktree assignment and retries the same object after recovery', async () => {
