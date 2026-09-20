@@ -40,11 +40,16 @@ import {
 } from './supervisor-defaults-cache.js';
 import logger from '../util/logger.js';
 import {
+  PEER_AUDIT_REWORK_AUTOMATION_KIND,
   SUPERVISION_AUDIT_ENABLED_STATUS,
+  SUPERVISION_AUDIT_DELEGATION_AUTOMATION_KIND,
   SUPERVISION_CONTRACT_IDS,
   SUPERVISION_AUDIT_MARKER_CORRECTION_AUTOMATION_KIND,
   SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND,
   SUPERVISION_AUTO_AUDIT_MODE_CONTROL_AUTOMATION_KIND,
+  SUPERVISION_CONTINUE_AUTOMATION_KIND,
+  SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND,
+  SUPERVISION_POST_AUDIT_FINALIZATION_AUTOMATION_KIND,
   SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND,
   SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_STREAK,
   SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_TOTAL,
@@ -1920,7 +1925,7 @@ class SupervisionAutomation {
             taskId: task.taskId,
             assignmentId: assignment.assignmentId,
             automation: true,
-            automationKind: 'supervision-implementation-heartbeat',
+            automationKind: SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND,
             memoryExcluded: true,
           },
           { source: 'daemon', confidence: 'high', eventId: clientMessageId },
@@ -4768,11 +4773,11 @@ class SupervisionAutomation {
     timelineEmitter.emit(
       current.sessionName,
       'user.message',
-      { text: orchestrationPrompt, allowDuplicate: true, automation: true, automationKind: 'supervision-audit-delegation' },
-      { source: 'daemon', confidence: 'high', eventId: `supervision-audit-delegation:${current.generation}:${current.auditAttemptId}` },
+      { text: orchestrationPrompt, allowDuplicate: true, automation: true, automationKind: SUPERVISION_AUDIT_DELEGATION_AUTOMATION_KIND },
+      { source: 'daemon', confidence: 'high', eventId: `${SUPERVISION_AUDIT_DELEGATION_AUTOMATION_KIND}:${current.generation}:${current.auditAttemptId}` },
     );
     try {
-      transportRuntime.send(orchestrationPrompt, `supervision-audit-delegation-${current.generation}`);
+      transportRuntime.send(orchestrationPrompt, `${SUPERVISION_AUDIT_DELEGATION_AUTOMATION_KIND}-${current.generation}`);
     } catch (error) {
       logger.warn({ session: current.sessionName, err: error }, 'Automatic audit orchestration dispatch failed');
       this.emitOrchestratedAuditResult(current, 'target_unavailable', 'dispatch_failed');
@@ -4922,15 +4927,15 @@ class SupervisionAutomation {
     timelineEmitter.emit(
       current.sessionName,
       'user.message',
-      { text: reworkBrief, allowDuplicate: true, automation: true, automationKind: 'peer-audit-rework' },
-      { source: 'daemon', confidence: 'high', eventId: `peer-audit-rework:${current.generation}:${current.reworkDispatches}:${randomUUID()}` },
+      { text: reworkBrief, allowDuplicate: true, automation: true, automationKind: PEER_AUDIT_REWORK_AUTOMATION_KIND },
+      { source: 'daemon', confidence: 'high', eventId: `${PEER_AUDIT_REWORK_AUTOMATION_KIND}:${current.generation}:${current.reworkDispatches}:${randomUUID()}` },
     );
     try {
       // The rework brief is a new daemon-authored foreground turn. Do this
       // before send so even a synchronous running/idle projection is bounded;
       // the catch path terminates the run if admission itself fails.
       current.ignoreIdleUntilPostAuditTurnActivity = false;
-      transportRuntime.send(reworkBrief, `peer-audit-rework-${current.generation}-${current.reworkDispatches}`);
+      transportRuntime.send(reworkBrief, `${PEER_AUDIT_REWORK_AUTOMATION_KIND}-${current.generation}-${current.reworkDispatches}`);
       this.emitTerminalStatus(current.sessionName, 'supervision_rework_sent', SUPERVISION_REWORK_LABEL);
     } catch (error) {
       logger.warn({ session: current.sessionName, err: error }, 'Peer audit rework dispatch failed');
@@ -5041,13 +5046,15 @@ class SupervisionAutomation {
         text: continuePrompt,
         allowDuplicate: true,
         automation: true,
-        automationKind: postAuditFinalization ? 'supervision-post-audit-finalization' : 'supervision-continue',
+        automationKind: postAuditFinalization
+          ? SUPERVISION_POST_AUDIT_FINALIZATION_AUTOMATION_KIND
+          : SUPERVISION_CONTINUE_AUTOMATION_KIND,
       },
-      { source: 'daemon', confidence: 'high', eventId: `supervision-continue:${run.generation}:${current.continueLoops}:${randomUUID()}` },
+      { source: 'daemon', confidence: 'high', eventId: `${SUPERVISION_CONTINUE_AUTOMATION_KIND}:${run.generation}:${current.continueLoops}:${randomUUID()}` },
     );
 
     try {
-      transportRuntime.send(continuePrompt, `supervision-continue-${run.generation}-${current.continueLoops}`);
+      transportRuntime.send(continuePrompt, `${SUPERVISION_CONTINUE_AUTOMATION_KIND}-${run.generation}-${current.continueLoops}`);
       if (postAuditFinalization) {
         if (this.automaticPeerAuditCompatibilityForTests) {
           this.emitAutomationNote(run.sessionName, '✅ Peer audit passed. Auto is now running the deferred commit/push finalization.', 'supervision-post-audit-finalization-status');

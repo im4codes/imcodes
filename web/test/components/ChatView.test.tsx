@@ -20,6 +20,21 @@ import {
   PREVIEW_EVENT_TAIL_LIMIT,
   PREVIEW_RENDER_ITEM_LIMIT,
 } from '../../src/chat-render-limits.js';
+import {
+  PEER_AUDIT_REWORK_AUTOMATION_KIND,
+  SUPERVISION_AUDIT_DELEGATION_AUTOMATION_KIND,
+  SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND,
+  SUPERVISION_AUDIT_MARKER_CORRECTION_AUTOMATION_KIND,
+  SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND,
+  SUPERVISION_AUTO_AUDIT_MODE_CONTROL_AUTOMATION_KIND,
+  SUPERVISION_AUTOMATION_KIND_PREFIX,
+  SUPERVISION_CONTINUE_AUTOMATION_KIND,
+  SUPERVISION_EXECUTION_STATUS_MARKERS,
+  SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND,
+  SUPERVISION_POST_AUDIT_FINALIZATION_AUTOMATION_KIND,
+  SUPERVISION_USER_PROMPT_LABEL_KEYS,
+  SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND,
+} from '../../../shared/supervision-config.js';
 
 const chatMarkdownRenderSpy = vi.hoisted(() => vi.fn());
 const showToolCallsPref = vi.hoisted(() => ({
@@ -171,12 +186,214 @@ vi.mock('react-i18next', () => ({
         'share.role.serverMember': 'Server member',
         'share.role.serverManager': 'Server manager',
         'share.role.system': 'System',
+        'chat.execution_status.waiting': 'Waiting',
+        'chat.execution_status.needs_input': 'Needs input',
+        'chat.supervision_prompt.supervision_heartbeat': 'Supervision heartbeat',
+        'chat.supervision_prompt.audit_heartbeat': 'Audit heartbeat',
+        'chat.supervision_prompt.implementation_heartbeat': 'Implementation heartbeat',
+        'chat.supervision_prompt.continue': 'Supervision continuation',
+        'chat.supervision_prompt.post_audit_finalization': 'Post-audit finalization',
+        'chat.supervision_prompt.audit_delegation': 'Audit delegation',
+        'chat.supervision_prompt.audit_target_recovery': 'Audit target recovery',
+        'chat.supervision_prompt.audit_marker_correction': 'Audit marker correction',
+        'chat.supervision_prompt.peer_audit_rework': 'Peer audit rework',
+        'chat.supervision_prompt.auto_audit_mode_control': 'Auto-audit mode update',
+        'chat.supervision_prompt.generic': 'Supervision automation',
+        'chat.supervision_prompt.show_details': 'Show supervision prompt details',
+        'chat.supervision_prompt.hide_details': 'Hide supervision prompt details',
       };
       const template = translations[key] ?? key;
       return template.replace(/\{\{(\w+)\}\}/g, (_, name) => String(options?.[name] ?? ''));
     },
   }),
 }));
+
+describe('assistant execution status chips', () => {
+  const assistant = (
+    text: string,
+    payload: Record<string, unknown> = {},
+    eventId = 'assistant-status',
+  ) => ({
+    eventId,
+    type: 'assistant.text',
+    ts: 1_700_000_000_001,
+    payload: { text, ...payload },
+  }) as any;
+
+  it.each([
+    [SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING, 'Waiting', 'waiting'],
+    [SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT, 'Needs input', 'needs-input'],
+  ])('renders a completed %s marker as an accessible chip while hiding the marker', (marker, label, stateClass) => {
+    const { container } = render(
+      <ChatView
+        events={[assistant(`Visible answer\n${marker}`, { streaming: false })]}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    const chip = container.querySelector(`.chat-execution-status-chip.${stateClass}`);
+    expect(chip).not.toBeNull();
+    expect(chip?.textContent).toBe(label);
+    expect(chip?.getAttribute('aria-label')).toBe(label);
+    expect(chip?.getAttribute('title')).toBe(label);
+    expect(container.textContent).toContain('Visible answer');
+    expect(container.textContent).not.toContain(marker);
+  });
+
+  it('uses the shared authored-line parser so quoted, inline and fenced examples stay visible without chips', () => {
+    const waiting = SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING;
+    const needsInput = SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT;
+    const examples = [
+      `> ${waiting}`,
+      `inline ${needsInput}`,
+      ['```md', waiting, '```'].join('\n'),
+    ];
+    const { container } = render(
+      <ChatView
+        events={examples.map((text, index) => assistant(text, { streaming: false }, `example-${index}`))}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    expect(container.querySelector('.chat-execution-status-chip')).toBeNull();
+    for (const marker of [waiting, needsInput]) expect(container.textContent).toContain(marker);
+  });
+
+  it('does not show a chip for an in-progress streaming marker and shows it after the stable event completes', () => {
+    const marker = SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING;
+    const initial = render(
+      <ChatView
+        events={[assistant(`Partial\n${marker}`, { streaming: true })]}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+    expect(initial.container.querySelector('.chat-execution-status-chip')).toBeNull();
+
+    initial.rerender(
+      <ChatView
+        events={[assistant(`Complete\n${marker}`, { streaming: false })]}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+    expect(initial.container.querySelector('.chat-execution-status-chip.waiting')).not.toBeNull();
+  });
+
+  it('renders a marker-only completed message as only the status chip without an empty rich-text bubble', () => {
+    const marker = SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT;
+    const { container } = render(
+      <ChatView
+        events={[assistant(marker, { streaming: false })]}
+        loading={false}
+        sessionId="deck_sub_worker"
+      />,
+    );
+
+    expect(container.querySelector('.chat-execution-status-chip.needs-input')).not.toBeNull();
+    expect(container.querySelector('.chat-rich-text')).toBeNull();
+    expect(container.querySelector('.chat-assistant-status-only')).not.toBeNull();
+    expect(container.querySelector('.chat-assistant-status-only .chat-bubble-time')).toBeNull();
+    expect(container.textContent).not.toContain(marker);
+  });
+});
+
+describe('supervision automation prompt labels', () => {
+  const prompt = '[Contract: supervision_waiting_heartbeat_v1] {"contractRefs":["supervision_messaging_v1"]}';
+  const userMessage = (
+    automationKind: string | undefined,
+    automation = true,
+    eventId = 'automation-prompt',
+  ) => ({
+    eventId,
+    type: 'user.message',
+    ts: 1_700_000_000_002,
+    payload: { text: prompt, automation, ...(automationKind ? { automationKind } : {}) },
+  }) as any;
+  const expectedLabelByKey: Record<string, string> = {
+    'chat.supervision_prompt.supervision_heartbeat': 'Supervision heartbeat',
+    'chat.supervision_prompt.audit_heartbeat': 'Audit heartbeat',
+    'chat.supervision_prompt.implementation_heartbeat': 'Implementation heartbeat',
+    'chat.supervision_prompt.continue': 'Supervision continuation',
+    'chat.supervision_prompt.post_audit_finalization': 'Post-audit finalization',
+    'chat.supervision_prompt.audit_delegation': 'Audit delegation',
+    'chat.supervision_prompt.audit_target_recovery': 'Audit target recovery',
+    'chat.supervision_prompt.audit_marker_correction': 'Audit marker correction',
+    'chat.supervision_prompt.peer_audit_rework': 'Peer audit rework',
+    'chat.supervision_prompt.auto_audit_mode_control': 'Auto-audit mode update',
+  };
+  const knownPromptCases = [
+    [SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND, 'chat.supervision_prompt.supervision_heartbeat'],
+    [SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND, 'chat.supervision_prompt.audit_heartbeat'],
+    [SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND, 'chat.supervision_prompt.implementation_heartbeat'],
+    [SUPERVISION_CONTINUE_AUTOMATION_KIND, 'chat.supervision_prompt.continue'],
+    [SUPERVISION_POST_AUDIT_FINALIZATION_AUTOMATION_KIND, 'chat.supervision_prompt.post_audit_finalization'],
+    [SUPERVISION_AUDIT_DELEGATION_AUTOMATION_KIND, 'chat.supervision_prompt.audit_delegation'],
+    [SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND, 'chat.supervision_prompt.audit_target_recovery'],
+    [SUPERVISION_AUDIT_MARKER_CORRECTION_AUTOMATION_KIND, 'chat.supervision_prompt.audit_marker_correction'],
+    [PEER_AUDIT_REWORK_AUTOMATION_KIND, 'chat.supervision_prompt.peer_audit_rework'],
+    [SUPERVISION_AUTO_AUDIT_MODE_CONTROL_AUTOMATION_KIND, 'chat.supervision_prompt.auto_audit_mode_control'],
+  ] as const;
+
+  it.each(knownPromptCases)(
+    'renders known kind %s as its one-line label without exposing prompt JSON while collapsed',
+    (automationKind, labelKey) => {
+      expect(SUPERVISION_USER_PROMPT_LABEL_KEYS[automationKind]).toBe(labelKey);
+      const { container } = render(
+        <ChatView
+          events={[userMessage(automationKind, true, `known-${automationKind}`)]}
+          loading={false}
+          sessionId={automationKind.includes('audit') ? 'deck_sub_auditor' : 'deck_main_brain'}
+        />,
+      );
+
+      const disclosure = container.querySelector('.chat-supervision-prompt-toggle');
+      expect(disclosure?.textContent).toBe(expectedLabelByKey[labelKey]);
+      expect(disclosure?.getAttribute('aria-expanded')).toBe('false');
+      expect(container.querySelector('.chat-supervision-prompt-details')).toBeNull();
+      expect(container.textContent).not.toContain('contractRefs');
+      expect(container.querySelector('.chat-user-message-fold')).toBeNull();
+    },
+  );
+
+  it('uses a generic label for unknown supervision kinds but leaves other automation and ordinary messages unchanged', () => {
+    const { container } = render(
+      <ChatView
+        events={[
+          userMessage(`${SUPERVISION_AUTOMATION_KIND_PREFIX}future-kind`, true, 'future-supervision'),
+          userMessage('other-automation', true, 'other-automation'),
+          userMessage(SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND, false, 'non-automation-known-kind'),
+          userMessage(undefined, false, 'ordinary-user'),
+        ]}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    expect(container.querySelector('.chat-supervision-prompt-toggle')?.textContent).toBe('Supervision automation');
+    expect(container.querySelectorAll('.chat-user-message-fold')).toHaveLength(3);
+    expect(container.textContent?.match(/contractRefs/g)).toHaveLength(3);
+  });
+
+  it('reveals the complete original prompt on demand inside a bounded debug panel', () => {
+    const firstKind = SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND;
+    const { container } = render(
+      <ChatView
+        events={[userMessage(firstKind)]}
+        loading={false}
+        sessionId="deck_sub_worker"
+      />,
+    );
+    const disclosure = container.querySelector('.chat-supervision-prompt-toggle') as HTMLButtonElement;
+    fireEvent.click(disclosure);
+
+    expect(disclosure.getAttribute('aria-expanded')).toBe('true');
+    expect(container.querySelector('.chat-supervision-prompt-details')?.textContent).toBe(prompt);
+    expect(disclosure.getAttribute('title')).toBe('Hide supervision prompt details');
+  });
+});
 
 vi.mock('../../src/components/ChatMarkdown.js', () => ({
   ChatMarkdown: ({ text, onUrlClick }: { text: string; onUrlClick?: (url: string) => void }) => {

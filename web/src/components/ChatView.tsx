@@ -1,4 +1,13 @@
-import { isNeverRenderedTimelineEventType, normalizeAssistantTextForDisplay } from '../../../src/shared/timeline/types.js';
+import {
+  isNeverRenderedTimelineEventType,
+  projectAssistantTextForDisplay,
+} from '../../../src/shared/timeline/types.js';
+import {
+  SUPERVISION_AUTOMATION_KIND_PREFIX,
+  SUPERVISION_EXECUTION_STATES,
+  SUPERVISION_USER_PROMPT_LABEL_KEYS,
+  type SupervisionExecutionState,
+} from '@shared/supervision-config.js';
 /**
  * ChatView — renders TimelineEvent[] as a chat-style view.
  * Merges consecutive streaming assistant.text events into single blocks.
@@ -181,6 +190,8 @@ interface ViewItem {
   /** Source event ids represented by an assistant block (for old-pin locate). */
   eventIds?: string[];
   assistantAutomation?: boolean;
+  /** Active final execution marker from a completed source event. */
+  executionState?: SupervisionExecutionState;
   /** Metadata record of the block's completed assistant message, when it
    *  carries the structured delegation-claim projection. Passed through by
    *  reference so the memoized AssistantBlock keeps a stable prop identity. */
@@ -200,6 +211,7 @@ type ChatHtmlFullscreenPreviewState =
 interface AssistantBlockProps {
   text: string;
   automation?: boolean;
+  executionState?: SupervisionExecutionState;
   ts: number;
   /** Completed assistant message metadata carrying the delegation-claim
    *  projection, when the runtime attached one. */
@@ -1245,18 +1257,20 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
   let pendingKey = '';
   let pendingEventIds: string[] = [];
   let pendingAssistantAutomation = false;
+  let pendingExecutionState: SupervisionExecutionState | undefined;
   let pendingDelegationMetadata: Record<string, unknown> | undefined;
   let pendingTools: TimelineEvent[] = [];
   let deferredEvents: TimelineEvent[] = [];
 
   const flushPending = () => {
-    if (pendingText.length > 0) {
+    if (pendingEventIds.length > 0) {
       items.push({
         key: pendingKey,
         type: 'assistant-block',
         text: pendingText.join('\n'),
         eventIds: [...pendingEventIds],
         assistantAutomation: pendingAssistantAutomation,
+        ...(pendingExecutionState ? { executionState: pendingExecutionState } : {}),
         ...(pendingDelegationMetadata ? { delegationMetadata: pendingDelegationMetadata } : {}),
         ts: pendingFirstTs,
         lastTs: pendingLastTs,
@@ -1264,6 +1278,7 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
       pendingText = [];
       pendingEventIds = [];
       pendingAssistantAutomation = false;
+      pendingExecutionState = undefined;
       pendingDelegationMetadata = undefined;
     }
   };
@@ -1302,13 +1317,17 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
       // single live activity rail instead of many tiny rows.
       if (showToolCalls) flushTools();
       // Trim and collapse 3+ consecutive blank lines to 1 (CC output often has many trailing newlines)
-      const text = normalizeAssistantTextForDisplay(event.payload.text);
-      if (!text) continue;
+      const projection = projectAssistantTextForDisplay(event.payload.text);
+      const text = projection.text;
+      const executionState = event.payload.streaming === true || event.payload.pending === true
+        ? null
+        : projection.executionState;
+      if (!text && !executionState) continue;
       const assistantAutomation = event.payload.automation === true;
-      if (pendingText.length > 0 && pendingAssistantAutomation !== assistantAutomation) {
+      if (pendingEventIds.length > 0 && pendingAssistantAutomation !== assistantAutomation) {
         flushPending();
       }
-      if (pendingText.length === 0) {
+      if (pendingEventIds.length === 0) {
         pendingKey = event.eventId;
         pendingFirstTs = event.ts;
         pendingAssistantAutomation = assistantAutomation;
@@ -1317,8 +1336,9 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
       // projection, so the newest event that has one wins for the block.
       const delegationMetadata = readDelegationClaimMetadata(event.payload);
       if (delegationMetadata) pendingDelegationMetadata = delegationMetadata;
+      if (executionState) pendingExecutionState = executionState;
       pendingLastTs = event.ts;
-      pendingText.push(text);
+      if (text) pendingText.push(text);
       pendingEventIds.push(event.eventId);
     } else if (event.type === 'tool.call' || event.type === 'tool.result') {
       flushPending();
@@ -1400,6 +1420,7 @@ function viewItemRevision(item: ViewItem): string {
       item.ts ?? 0,
       item.lastTs ?? 0,
       item.assistantAutomation === true ? 'automation' : '',
+      item.executionState ?? '',
       textRevision(item.text),
     ].join(':');
   }
@@ -3697,6 +3718,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
                   eventId={item.key}
                   text={item.text!}
                   automation={item.assistantAutomation === true}
+                  executionState={item.executionState}
                   delegationMetadata={item.delegationMetadata}
                   liveAssignmentStatuses={item.delegationMetadata ? liveAssignmentStatuses : undefined}
                   ts={item.lastTs ?? item.ts ?? 0}
@@ -4490,6 +4512,7 @@ function ToolCallGroup({
 const AssistantBlock = memo(function AssistantBlock({
   text,
   automation,
+  executionState,
   ts,
   eventId,
   delegationMetadata,
@@ -4501,14 +4524,35 @@ const AssistantBlock = memo(function AssistantBlock({
   onImagePreview,
   onOpenLocalWebPreview,
 }: AssistantBlockProps) {
+  const { t } = useTranslation();
+  const status = executionState === SUPERVISION_EXECUTION_STATES.WAITING
+    ? { className: 'waiting', label: t('chat.execution_status.waiting') }
+    : executionState === SUPERVISION_EXECUTION_STATES.NEEDS_INPUT
+      ? { className: 'needs-input', label: t('chat.execution_status.needs_input') }
+      : null;
+  const statusOnly = text.length === 0 && status !== null;
   return (
     <div
-      class={`chat-event chat-assistant${automation ? ' chat-assistant-automation' : ''}`}
+      class={`chat-event chat-assistant${automation ? ' chat-assistant-automation' : ''}${statusOnly ? ' chat-assistant-status-only' : ''}`}
       data-event-id={eventId}
     >
-      <ChatMarkdown text={parseTimelineDisplayText(text)} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} />
-      <DelegationClaimBadge metadata={delegationMetadata} liveAssignmentStatuses={liveAssignmentStatuses} messageTs={ts} />
-      <ChatTime ts={ts} />
+      {text && <ChatMarkdown text={parseTimelineDisplayText(text)} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} />}
+      {status && (
+        <span
+          class={`chat-execution-status-chip ${status.className}`}
+          role="status"
+          aria-label={status.label}
+          title={status.label}
+        >
+          {status.label}
+        </span>
+      )}
+      {!statusOnly && (
+        <>
+          <DelegationClaimBadge metadata={delegationMetadata} liveAssignmentStatuses={liveAssignmentStatuses} messageTs={ts} />
+          <ChatTime ts={ts} />
+        </>
+      )}
     </div>
   );
 });
@@ -4597,6 +4641,48 @@ function AttachmentDownloadButton({
   );
 }
 
+function supervisionUserPromptLabelKey(payload: Record<string, unknown>): string | null {
+  if (payload.automation !== true || typeof payload.automationKind !== 'string') return null;
+  const kind = payload.automationKind;
+  const known = (SUPERVISION_USER_PROMPT_LABEL_KEYS as Readonly<Record<string, string>>)[kind];
+  if (known) return known;
+  return kind.startsWith(SUPERVISION_AUTOMATION_KIND_PREFIX)
+    ? 'chat.supervision_prompt.generic'
+    : null;
+}
+
+function SupervisionAutomationPrompt({
+  text,
+  label,
+  showDetailsLabel,
+  hideDetailsLabel,
+}: {
+  text: string;
+  label: string;
+  showDetailsLabel: string;
+  hideDetailsLabel: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const actionLabel = expanded ? hideDetailsLabel : showDetailsLabel;
+  return (
+    <div class="chat-supervision-prompt">
+      <button
+        type="button"
+        class="chat-supervision-prompt-toggle"
+        aria-expanded={expanded}
+        aria-label={`${label}: ${actionLabel}`}
+        title={actionLabel}
+        onClick={() => setExpanded((value) => !value)}
+      >
+        {label}
+      </button>
+      {expanded && (
+        <pre class="chat-supervision-prompt-details">{text}</pre>
+      )}
+    </div>
+  );
+}
+
 const ChatEvent = memo(function ChatEvent({
   event,
   sessionName,
@@ -4629,6 +4715,19 @@ const ChatEvent = memo(function ChatEvent({
   switch (event.type) {
     case 'user.message': {
       const rawUserText = String(event.payload.text ?? '');
+      const supervisionPromptLabelKey = supervisionUserPromptLabelKey(event.payload);
+      if (supervisionPromptLabelKey) {
+        return (
+          <div class="chat-event chat-user chat-user-supervision-prompt" data-event-id={event.eventId}>
+            <SupervisionAutomationPrompt
+              text={rawUserText}
+              label={t(supervisionPromptLabelKey)}
+              showDetailsLabel={t('chat.supervision_prompt.show_details')}
+              hideDetailsLabel={t('chat.supervision_prompt.hide_details')}
+            />
+          </div>
+        );
+      }
       let userText = parseTimelineDisplayText(rawUserText);
       const attachments = event.payload.attachments as Array<{ id: string; originalName?: string; mime?: string; size?: number; daemonPath?: string }> | undefined;
       // Strip @path references from text when they're shown as attachment badges

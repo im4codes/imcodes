@@ -241,6 +241,25 @@
     "interrupt": "この回答で割り込む"
   },
   "chat": {
+    "execution_status": {
+      "waiting": "待機中",
+      "needs_input": "入力が必要"
+    },
+    "supervision_prompt": {
+      "supervision_heartbeat": "監督ハートビート",
+      "audit_heartbeat": "監査ハートビート",
+      "implementation_heartbeat": "実装ハートビート",
+      "continue": "監督の続行",
+      "post_audit_finalization": "監査後の最終処理",
+      "audit_delegation": "監査の委任",
+      "audit_target_recovery": "監査対象の復旧",
+      "audit_marker_correction": "監査マーカーの修正",
+      "peer_audit_rework": "ピア監査の手直し",
+      "auto_audit_mode_control": "自動監査モードの更新",
+      "generic": "監督自動メッセージ",
+      "show_details": "監督プロンプトの詳細を表示",
+      "hide_details": "監督プロンプトの詳細を非表示"
+    },
     "delete_message": "メッセージを削除",
     "delete_message_confirm": "このメッセージを全員から削除しますか?この操作は取り消せません。",
     "dpad": {

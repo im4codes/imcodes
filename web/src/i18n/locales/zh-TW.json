@@ -241,6 +241,25 @@
     "interrupt": "用此回答打斷"
   },
   "chat": {
+    "execution_status": {
+      "waiting": "等待中",
+      "needs_input": "需要你輸入"
+    },
+    "supervision_prompt": {
+      "supervision_heartbeat": "監督心跳",
+      "audit_heartbeat": "稽核心跳",
+      "implementation_heartbeat": "實作心跳",
+      "continue": "監督繼續",
+      "post_audit_finalization": "稽核後收尾",
+      "audit_delegation": "稽核派發",
+      "audit_target_recovery": "稽核目標恢復",
+      "audit_marker_correction": "稽核標記修正",
+      "peer_audit_rework": "對等稽核返工",
+      "auto_audit_mode_control": "自動稽核模式更新",
+      "generic": "監督自動訊息",
+      "show_details": "展開監督提示詳情",
+      "hide_details": "收合監督提示詳情"
+    },
     "delete_message": "刪除訊息",
     "delete_message_confirm": "為所有人刪除此訊息?此操作無法復原。",
     "dpad": {

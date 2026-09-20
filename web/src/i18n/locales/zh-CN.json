@@ -241,6 +241,25 @@
     "interrupt": "用此回答打断"
   },
   "chat": {
+    "execution_status": {
+      "waiting": "等待中",
+      "needs_input": "需要你输入"
+    },
+    "supervision_prompt": {
+      "supervision_heartbeat": "监督心跳",
+      "audit_heartbeat": "审计心跳",
+      "implementation_heartbeat": "实现心跳",
+      "continue": "监督继续",
+      "post_audit_finalization": "审计后收尾",
+      "audit_delegation": "审计派发",
+      "audit_target_recovery": "审计目标恢复",
+      "audit_marker_correction": "审计标记纠正",
+      "peer_audit_rework": "对等审计返工",
+      "auto_audit_mode_control": "自动审计模式更新",
+      "generic": "监督自动消息",
+      "show_details": "展开监督提示详情",
+      "hide_details": "收起监督提示详情"
+    },
     "delete_message": "删除消息",
     "delete_message_confirm": "为所有人删除此消息?此操作无法撤销。",
     "dpad": {

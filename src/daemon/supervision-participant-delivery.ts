@@ -1,5 +1,7 @@
 import {
+  SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND,
   SUPERVISION_CONTRACT_IDS,
+  SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND,
   isTerminalSupervisionTaskStatus,
 } from '../../shared/supervision-config.js';
 import {
@@ -19,8 +21,8 @@ import {
   type PersistedSupervisionTaskAssignmentIdentity,
 } from './supervision-state-store.js';
 
-export const IMPLEMENTATION_HEARTBEAT_MESSAGE_ID_PREFIX = 'supervision-implementation-heartbeat:';
-export const AUDIT_HEARTBEAT_MESSAGE_ID_PREFIX = 'supervision-audit-heartbeat:';
+export const IMPLEMENTATION_HEARTBEAT_MESSAGE_ID_PREFIX = `${SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND}:`;
+export const AUDIT_HEARTBEAT_MESSAGE_ID_PREFIX = `${SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND}:`;
 export const IMPLEMENTATION_HEARTBEAT_RUNTIME_RETRY_LIMIT = 6;
 export type ImplementationHeartbeatAuthorityResult =
   | { status: 'authorized' }

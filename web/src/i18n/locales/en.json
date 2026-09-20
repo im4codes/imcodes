@@ -241,6 +241,25 @@
     "interrupt": "Interrupt with this"
   },
   "chat": {
+    "execution_status": {
+      "waiting": "Waiting",
+      "needs_input": "Needs input"
+    },
+    "supervision_prompt": {
+      "supervision_heartbeat": "Supervision heartbeat",
+      "audit_heartbeat": "Audit heartbeat",
+      "implementation_heartbeat": "Implementation heartbeat",
+      "continue": "Supervision continuation",
+      "post_audit_finalization": "Post-audit finalization",
+      "audit_delegation": "Audit delegation",
+      "audit_target_recovery": "Audit target recovery",
+      "audit_marker_correction": "Audit marker correction",
+      "peer_audit_rework": "Peer audit rework",
+      "auto_audit_mode_control": "Auto-audit mode update",
+      "generic": "Supervision automation",
+      "show_details": "Show supervision prompt details",
+      "hide_details": "Hide supervision prompt details"
+    },
     "delete_message": "Delete message",
     "delete_message_confirm": "Delete this message for everyone? This can't be undone.",
     "dpad": {

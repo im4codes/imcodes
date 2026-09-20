@@ -241,6 +241,25 @@
     "interrupt": "Прервать этим ответом"
   },
   "chat": {
+    "execution_status": {
+      "waiting": "Ожидание",
+      "needs_input": "Нужен ввод"
+    },
+    "supervision_prompt": {
+      "supervision_heartbeat": "Сигнал супервизии",
+      "audit_heartbeat": "Сигнал аудита",
+      "implementation_heartbeat": "Сигнал реализации",
+      "continue": "Продолжение супервизии",
+      "post_audit_finalization": "Завершение после аудита",
+      "audit_delegation": "Делегирование аудита",
+      "audit_target_recovery": "Восстановление цели аудита",
+      "audit_marker_correction": "Исправление маркера аудита",
+      "peer_audit_rework": "Доработка по коллегиальному аудиту",
+      "auto_audit_mode_control": "Обновление режима автоаудита",
+      "generic": "Автоматизация супервизии",
+      "show_details": "Показать детали запроса супервизии",
+      "hide_details": "Скрыть детали запроса супервизии"
+    },
     "delete_message": "Удалить сообщение",
     "delete_message_confirm": "Удалить это сообщение для всех? Это действие нельзя отменить.",
     "dpad": {

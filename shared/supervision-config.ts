@@ -67,6 +67,31 @@ export const SUPERVISION_AUDIT_MARKER_CORRECTION_AUTOMATION_KIND = 'supervision-
 export const SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND = 'supervision-waiting-heartbeat' as const;
 export const SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND = 'supervision-audit-heartbeat' as const;
 export const SUPERVISION_AUTO_AUDIT_MODE_CONTROL_AUTOMATION_KIND = 'supervision-auto-audit-mode-control' as const;
+export const SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND = 'supervision-implementation-heartbeat' as const;
+export const SUPERVISION_AUDIT_DELEGATION_AUTOMATION_KIND = 'supervision-audit-delegation' as const;
+export const PEER_AUDIT_REWORK_AUTOMATION_KIND = 'peer-audit-rework' as const;
+export const SUPERVISION_POST_AUDIT_FINALIZATION_AUTOMATION_KIND = 'supervision-post-audit-finalization' as const;
+export const SUPERVISION_CONTINUE_AUTOMATION_KIND = 'supervision-continue' as const;
+export const SUPERVISION_AUTOMATION_KIND_PREFIX = 'supervision-' as const;
+
+/**
+ * Canonical presentation keys for daemon-authored user-message prompts. The
+ * web renderer consumes this map directly rather than duplicating protocol
+ * kind literals or inferring labels from implementation details.
+ */
+export const SUPERVISION_USER_PROMPT_LABEL_KEYS = {
+  [SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND]: 'chat.supervision_prompt.supervision_heartbeat',
+  [SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND]: 'chat.supervision_prompt.audit_heartbeat',
+  [SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND]: 'chat.supervision_prompt.implementation_heartbeat',
+  [SUPERVISION_CONTINUE_AUTOMATION_KIND]: 'chat.supervision_prompt.continue',
+  [SUPERVISION_POST_AUDIT_FINALIZATION_AUTOMATION_KIND]: 'chat.supervision_prompt.post_audit_finalization',
+  [SUPERVISION_AUDIT_DELEGATION_AUTOMATION_KIND]: 'chat.supervision_prompt.audit_delegation',
+  [SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND]: 'chat.supervision_prompt.audit_target_recovery',
+  [SUPERVISION_AUDIT_MARKER_CORRECTION_AUTOMATION_KIND]: 'chat.supervision_prompt.audit_marker_correction',
+  [PEER_AUDIT_REWORK_AUTOMATION_KIND]: 'chat.supervision_prompt.peer_audit_rework',
+  [SUPERVISION_AUTO_AUDIT_MODE_CONTROL_AUTOMATION_KIND]: 'chat.supervision_prompt.auto_audit_mode_control',
+} as const;
+export type SupervisionUserPromptAutomationKind = keyof typeof SUPERVISION_USER_PROMPT_LABEL_KEYS;
 
 export const SUPERVISION_TRUSTED_EXECUTION_CONTRACT_IDS = [
   SUPERVISION_CONTRACT_IDS.ORCHESTRATOR_CONTEXT,
@@ -994,9 +1019,12 @@ export function evaluateAutomaticSupervisionEnablement(
 export type SupervisionAuditMode = 'audit' | 'review' | 'audit>plan' | 'review>plan' | 'audit>review>plan';
 export type TaskRunStatusMarker = keyof typeof TASK_RUN_STATUS_MARKERS;
 export type TaskRunTerminalState = 'complete' | 'needs_input' | 'blocked';
+export const SUPERVISION_EXECUTION_STATES = {
+  NEEDS_INPUT: 'needs_input',
+  WAITING: 'waiting',
+} as const;
 export type SupervisionExecutionState =
-  | 'needs_input'
-  | 'waiting';
+  (typeof SUPERVISION_EXECUTION_STATES)[keyof typeof SUPERVISION_EXECUTION_STATES];
 export type SessionSupervisionSnapshotIssue =
   | 'invalid_shape'
   | 'invalid_mode'
@@ -1743,9 +1771,9 @@ export function parseSupervisionExecutionStateDetailsFromText(text: string): Par
   const state = matches[matches.length - 1]?.marker;
   switch (state) {
     case 'NEEDS_INPUT':
-      return { state: 'needs_input', markerCount: matches.length };
+      return { state: SUPERVISION_EXECUTION_STATES.NEEDS_INPUT, markerCount: matches.length };
     case 'WAITING':
-      return { state: 'waiting', markerCount: matches.length };
+      return { state: SUPERVISION_EXECUTION_STATES.WAITING, markerCount: matches.length };
     default:
       return { state: null, markerCount: matches.length };
   }

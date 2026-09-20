@@ -241,6 +241,25 @@
     "interrupt": "이 답변으로 중단"
   },
   "chat": {
+    "execution_status": {
+      "waiting": "대기 중",
+      "needs_input": "입력 필요"
+    },
+    "supervision_prompt": {
+      "supervision_heartbeat": "감독 하트비트",
+      "audit_heartbeat": "감사 하트비트",
+      "implementation_heartbeat": "구현 하트비트",
+      "continue": "감독 계속",
+      "post_audit_finalization": "감사 후 마무리",
+      "audit_delegation": "감사 위임",
+      "audit_target_recovery": "감사 대상 복구",
+      "audit_marker_correction": "감사 마커 수정",
+      "peer_audit_rework": "동료 감사 재작업",
+      "auto_audit_mode_control": "자동 감사 모드 업데이트",
+      "generic": "감독 자동 메시지",
+      "show_details": "감독 프롬프트 세부 정보 표시",
+      "hide_details": "감독 프롬프트 세부 정보 숨기기"
+    },
     "delete_message": "메시지 삭제",
     "delete_message_confirm": "이 메시지를 모두에게서 삭제하시겠습니까? 이 작업은 되돌릴 수 없습니다.",
     "dpad": {

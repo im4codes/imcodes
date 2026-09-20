@@ -241,6 +241,25 @@
     "interrupt": "Interrumpir con esto"
   },
   "chat": {
+    "execution_status": {
+      "waiting": "En espera",
+      "needs_input": "Necesita tu intervención"
+    },
+    "supervision_prompt": {
+      "supervision_heartbeat": "Pulso de supervisión",
+      "audit_heartbeat": "Pulso de auditoría",
+      "implementation_heartbeat": "Pulso de implementación",
+      "continue": "Continuación de supervisión",
+      "post_audit_finalization": "Finalización posterior a la auditoría",
+      "audit_delegation": "Delegación de auditoría",
+      "audit_target_recovery": "Recuperación del destino de auditoría",
+      "audit_marker_correction": "Corrección del marcador de auditoría",
+      "peer_audit_rework": "Revisión de auditoría entre pares",
+      "auto_audit_mode_control": "Actualización del modo de auditoría automática",
+      "generic": "Automatización de supervisión",
+      "show_details": "Mostrar detalles del mensaje de supervisión",
+      "hide_details": "Ocultar detalles del mensaje de supervisión"
+    },
     "delete_message": "Eliminar mensaje",
     "delete_message_confirm": "¿Eliminar este mensaje para todos? Esta acción no se puede deshacer.",
     "dpad": {

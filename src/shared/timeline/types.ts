@@ -16,7 +16,11 @@ import { EXECUTION_CLONE_TIMELINE } from '../../../shared/execution-clone.js';
 import { AGENT_DELEGATION_REPLY_TIMELINE_EVENT } from '../../../shared/agent-delegation.js';
 import { NATIVE_COLLABORATION_POLICY_TIMELINE_EVENT } from '../../../shared/native-collaboration-policy.js';
 import { SUPERVISION_ASSIGNMENT_STATUS_TIMELINE_EVENT } from '../../../shared/supervision-assignment-start.js';
-import { stripSupervisionExecutionMarkersForDisplay } from '../../../shared/supervision-config.js';
+import {
+  parseSupervisionExecutionStateDetailsFromText,
+  stripSupervisionExecutionMarkersForDisplay,
+  type SupervisionExecutionState,
+} from '../../../shared/supervision-config.js';
 import type { TimelineDetailRef, TimelineEventCompleteness } from '../../../shared/timeline-protocol.js';
 import type {
   PeerAuditRuntimeDisposition,
@@ -171,10 +175,29 @@ export const TIMELINE_PREFERENCE_DEPENDENT_TYPES: readonly string[] = [
  * Defined once here so the view and the cache cannot disagree about what
  * "blank" means.
  */
-export function normalizeAssistantTextForDisplay(text: unknown): string {
-  return stripSupervisionExecutionMarkersForDisplay(String(text ?? ''))
+export interface AssistantTextDisplayProjection {
+  text: string;
+  executionState: SupervisionExecutionState | null;
+}
+
+/**
+ * Project one raw assistant completion into user-visible text and its active
+ * execution status. Both values intentionally come from the supervision
+ * parser's shared authored-line scanner, so presentation cannot accidentally
+ * grant authority to quoted, inline, or fenced marker examples.
+ */
+export function projectAssistantTextForDisplay(text: unknown): AssistantTextDisplayProjection {
+  const raw = String(text ?? '');
+  return {
+    text: stripSupervisionExecutionMarkersForDisplay(raw)
     .trim()
-    .replace(/\n{3,}/g, '\n\n');
+      .replace(/\n{3,}/g, '\n\n'),
+    executionState: parseSupervisionExecutionStateDetailsFromText(raw).state,
+  };
+}
+
+export function normalizeAssistantTextForDisplay(text: unknown): string {
+  return projectAssistantTextForDisplay(text).text;
 }
 
 export function isGuaranteedVisibleTimelineEvent(
@@ -188,7 +211,12 @@ export function isGuaranteedVisibleTimelineEvent(
   // dropped by buildViewItems, so counting it as content stops the repair loop
   // while the pane shows nothing.
   if (event.type === 'assistant.text') {
-    return normalizeAssistantTextForDisplay(event.payload?.text).length > 0;
+    const projection = projectAssistantTextForDisplay(event.payload?.text);
+    return projection.text.length > 0 || (
+      projection.executionState !== null
+      && event.payload?.streaming !== true
+      && event.payload?.pending !== true
+    );
   }
   return true;
 }

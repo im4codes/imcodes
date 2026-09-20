@@ -11,7 +11,10 @@ import {
   isNeverRenderedTimelineEventType,
 } from '../../../src/shared/timeline/types.js';
 import { EXECUTION_CLONE_TIMELINE } from '../../../shared/execution-clone.js';
-import { SUPERVISION_EXECUTION_STATUS_MARKERS } from '../../../shared/supervision-config.js';
+import {
+  SUPERVISION_EXECUTION_STATES,
+  SUPERVISION_EXECUTION_STATUS_MARKERS,
+} from '../../../shared/supervision-config.js';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string) => key }),
@@ -202,8 +205,14 @@ describe('ChatView render capability contract', () => {
       eventId: 'marker-only',
       payload: { text: SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT },
     } as unknown as TimelineEvent;
-    expect(__buildViewItemsForTests([markerOnly], false)).toHaveLength(0);
-    expect(isGuaranteedVisibleTimelineEvent(markerOnly)).toBe(false);
+    expect(__buildViewItemsForTests([markerOnly], false)).toEqual([
+      expect.objectContaining({
+        type: 'assistant-block',
+        text: '',
+        executionState: SUPERVISION_EXECUTION_STATES.NEEDS_INPUT,
+      }),
+    ]);
+    expect(isGuaranteedVisibleTimelineEvent(markerOnly)).toBe(true);
   });
 
   it.each(ALL_CONTENT_TYPES.map((type) => [type]))(

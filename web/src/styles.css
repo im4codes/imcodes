@@ -4800,7 +4800,12 @@ html.native-ios-mac .chat-dl-btn {
    line of context, never the full message. Tap-again jumps to the
    message in chat history for the full content. */
 .chat-pinned-last-sent.chat-pinned-expanded .chat-pinned-last-sent-text { -webkit-line-clamp: 3; line-clamp: 3; }
-.chat-view { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 8px 12px; display: flex; flex-direction: column; gap: 2px; scrollbar-width: thin; scrollbar-color: #6366f1 #1e293b; overflow-anchor: none; }
+.chat-view {
+  --chat-machine-chip-border: rgba(148, 163, 184, 0.24);
+  --chat-machine-chip-bg: rgba(71, 85, 105, 0.18);
+  --chat-machine-chip-color: #94a3b8;
+  flex: 1; overflow-y: auto; overflow-x: hidden; padding: 8px 12px; display: flex; flex-direction: column; gap: 2px; scrollbar-width: thin; scrollbar-color: #6366f1 #1e293b; overflow-anchor: none;
+}
 /* In sub-session cards `.subcard-preview` (parent) owns the scrollbar. If
    `.chat-view` ALSO scrolls (default rule above), every new event triggers
    two independent scrollTop writes — one from ChatView's preview-mode auto-
@@ -4994,6 +4999,82 @@ html.native-ios-mac .chat-dl-btn {
   border-top-right-radius: 0;
 }
 .chat-assistant-automation { background: #101a19; box-shadow: inset 2px 0 #10b981; }
+.chat-assistant-status-only {
+  width: fit-content;
+  max-width: 100%;
+  padding: 0;
+  background: transparent;
+}
+.chat-execution-status-chip {
+  display: inline-flex;
+  max-width: 100%;
+  align-items: center;
+  box-sizing: border-box;
+  margin-top: 5px;
+  padding: 1px 7px;
+  overflow: hidden;
+  border: 1px solid var(--chat-machine-chip-border);
+  border-radius: 999px;
+  background: var(--chat-machine-chip-bg);
+  color: var(--chat-machine-chip-color);
+  font-size: 10px;
+  line-height: 1.5;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-assistant-status-only .chat-execution-status-chip { margin-top: 0; }
+.chat-execution-status-chip.needs-input {
+  border-color: rgba(251, 191, 36, 0.32);
+  background: rgba(120, 53, 15, 0.18);
+  color: #fcd34d;
+}
+.chat-user-supervision-prompt {
+  align-self: flex-start;
+  width: fit-content;
+  max-width: 100%;
+  padding: 0;
+  background: transparent;
+}
+.chat-supervision-prompt { min-width: 0; max-width: 100%; }
+.chat-supervision-prompt-toggle {
+  display: block;
+  max-width: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
+  padding: 1px 7px;
+  border: 1px solid var(--chat-machine-chip-border);
+  border-radius: 999px;
+  background: var(--chat-machine-chip-bg);
+  color: var(--chat-machine-chip-color);
+  font: inherit;
+  font-size: 10px;
+  line-height: 1.5;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.chat-supervision-prompt-toggle:hover,
+.chat-supervision-prompt-toggle:focus-visible {
+  border-color: rgba(148, 163, 184, 0.42);
+  color: #cbd5e1;
+}
+.chat-supervision-prompt-details {
+  width: min(720px, calc(100vw - 40px));
+  max-width: 100%;
+  max-height: 180px;
+  box-sizing: border-box;
+  margin: 5px 0 0;
+  padding: 7px 9px;
+  overflow: auto;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.82);
+  color: #94a3b8;
+  font: 10px/1.45 'Cascadia Code', 'Fira Code', 'SF Mono', monospace;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
 
 /* Delegation authority badge — rendered only from the structured
    delegation-claim projection, never from assistant prose. Deliberately quiet:
