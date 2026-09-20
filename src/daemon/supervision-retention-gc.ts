@@ -1,9 +1,11 @@
-import { lstat, opendir, readFile, realpath, rename, rm, utimes } from 'node:fs/promises';
+import { lstat, opendir, readFile, realpath, rename, rm, unlink, utimes } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import {
   SUPERVISION_ARTIFACT_ORPHAN_GRACE_MS,
   SUPERVISION_BUNDLE_TERMINAL_RETENTION_MS,
+  SUPERVISION_FINALIZED_BUNDLE_RETENTION_MS,
+  SUPERVISION_FINALIZED_SCRATCH_RETENTION_MS,
   SUPERVISION_QUARANTINE_GRACE_MS,
   SUPERVISION_RETENTION_ENV,
   SUPERVISION_RETENTION_MAX_CANDIDATES_PER_ROOT,
@@ -11,6 +13,7 @@ import {
   SUPERVISION_RETENTION_ROTATION_MS,
   SUPERVISION_RETENTION_SCAN_LIMIT,
   SUPERVISION_SCRATCH_TERMINAL_RETENTION_MS,
+  SUPERVISION_WORKTREE_BACKUP_RETENTION_MS,
   isTerminalSupervisionWorktreeAssignmentStatus,
   isTerminalSupervisionWorktreeTaskStatus,
 } from '../../shared/supervision-retention.js';
@@ -18,6 +21,7 @@ import {
 export type SupervisionRetentionMode = 'dryRun' | 'apply';
 export type SupervisionRetentionReason =
   | 'terminal_retention_elapsed'
+  | 'backup_retention_elapsed'
   | 'orphan_grace_elapsed'
   | 'active_owner'
   | 'retention_window'
@@ -39,7 +43,7 @@ export interface SupervisionRetentionTask {
 }
 
 export interface SupervisionRetentionEntry {
-  kind: 'scratch' | 'bundle';
+  kind: 'scratch' | 'bundle' | 'backup';
   key: string;
   path: string;
   action: 'retain' | 'delete';
@@ -62,11 +66,15 @@ export interface SupervisionRetentionGcInput {
   tasks: readonly SupervisionRetentionTask[];
   scratchRoot?: string;
   bundlesRoot?: string;
+  backupsRoot?: string;
   limit?: number;
   now?: number;
   /** Override defaults for deployments with different retention requirements. */
   scratchRetentionMs?: number;
   bundleRetentionMs?: number;
+  finalizedScratchRetentionMs?: number;
+  finalizedBundleRetentionMs?: number;
+  backupRetentionMs?: number;
   orphanGraceMs?: number;
   quarantineGraceMs?: number;
   resolveTask?: (taskId: string) => SupervisionRetentionTask | undefined;
@@ -82,6 +90,7 @@ const BUNDLE_BUCKET = /^[0-9a-f]{2}$/;
 const BUNDLE_DIGEST = /^[0-9a-f]{64}$/;
 const MANIFEST_MAX_BYTES = 1024 * 1024;
 const ARTIFACT_QUARANTINE = /^(.+)\.gc-[0-9]+-[0-9]+$/;
+const BACKUP_PATCH = /^[0-9a-z._-]+\.patch$/i;
 
 interface RetentionCandidate { path: string; key: string; quarantine: boolean }
 
@@ -205,6 +214,41 @@ async function listBundleCandidates(root: string): Promise<{ candidates: Retenti
   return { candidates: candidates.sort((left, right) => left.path.localeCompare(right.path)), truncated };
 }
 
+async function listBackupCandidates(root: string): Promise<{ candidates: RetentionCandidate[]; truncated: boolean }> {
+  const candidates: RetentionCandidate[] = [];
+  const rootInfo = await lstat(root).catch(() => undefined);
+  if (!rootInfo?.isDirectory() || rootInfo.isSymbolicLink()) return { candidates, truncated: false };
+  const pending = [{ path: root, depth: 0 }];
+  let truncated = false;
+  let visited = 0;
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    const dir = await opendir(current.path);
+    try {
+      for await (const entry of dir) {
+        visited += 1;
+        if (visited > SUPERVISION_RETENTION_MAX_CANDIDATES_PER_ROOT
+          || candidates.length >= SUPERVISION_RETENTION_MAX_CANDIDATES_PER_ROOT) {
+          truncated = true;
+          break;
+        }
+        const path = join(current.path, entry.name);
+        const info = await lstat(path).catch(() => undefined);
+        if (!info || info.isSymbolicLink()) continue;
+        if (info.isDirectory()) {
+          if (current.depth < SUPERVISION_RETENTION_MAX_DESCENT_DEPTH) {
+            pending.push({ path, depth: current.depth + 1 });
+          } else truncated = true;
+        } else if (info.isFile() && BACKUP_PATCH.test(entry.name)) {
+          candidates.push({ path, key: relative(root, path), quarantine: false });
+        }
+      }
+    } finally { await dir.close().catch(() => {}); }
+    if (truncated) break;
+  }
+  return { candidates: candidates.sort((left, right) => left.path.localeCompare(right.path)), truncated };
+}
+
 function rotatingPage<T>(items: readonly T[], limit: number, now: number): T[] {
   if (items.length <= limit) return [...items];
   const offset = (Math.floor(now / SUPERVISION_RETENTION_ROTATION_MS) * limit) % items.length;
@@ -219,6 +263,15 @@ function runtimeRetentionMs(explicit: number | undefined, envName: string, fallb
   const environment = Number.parseInt(process.env[envName] ?? '', 10);
   const configured = explicit ?? (Number.isFinite(environment) ? environment : fallback);
   return Math.max(60_000, configured);
+}
+
+async function removeManagedFile(root: string, path: string): Promise<void> {
+  const rootReal = await realpath(root);
+  const pathReal = await realpath(path);
+  if (!within(rootReal, pathReal)) throw new Error('retention_path_outside_root');
+  const info = await lstat(pathReal);
+  if (!info.isFile() || info.isSymbolicLink()) throw new Error('retention_path_invalid');
+  await unlink(pathReal);
 }
 
 /** Plan and optionally apply one bounded page. Unknown/recent bytes fail safe. */
@@ -236,11 +289,27 @@ export async function runSupervisionRetentionGc(
     SUPERVISION_RETENTION_ENV.bundleMs,
     SUPERVISION_BUNDLE_TERMINAL_RETENTION_MS,
   );
+  const finalizedScratchRetentionMs = runtimeRetentionMs(
+    input.finalizedScratchRetentionMs,
+    SUPERVISION_RETENTION_ENV.finalizedScratchMs,
+    SUPERVISION_FINALIZED_SCRATCH_RETENTION_MS,
+  );
+  const finalizedBundleRetentionMs = runtimeRetentionMs(
+    input.finalizedBundleRetentionMs,
+    SUPERVISION_RETENTION_ENV.finalizedBundleMs,
+    SUPERVISION_FINALIZED_BUNDLE_RETENTION_MS,
+  );
+  const backupRetentionMs = runtimeRetentionMs(
+    input.backupRetentionMs,
+    SUPERVISION_RETENTION_ENV.worktreeBackupMs,
+    SUPERVISION_WORKTREE_BACKUP_RETENTION_MS,
+  );
   const orphanGraceMs = Math.max(60_000, input.orphanGraceMs ?? SUPERVISION_ARTIFACT_ORPHAN_GRACE_MS);
   const quarantineGraceMs = Math.max(60_000, input.quarantineGraceMs ?? SUPERVISION_QUARANTINE_GRACE_MS);
   const limit = Math.max(1, Math.min(SUPERVISION_RETENTION_SCAN_LIMIT, Math.floor(input.limit ?? SUPERVISION_RETENTION_SCAN_LIMIT)));
   const scratchRoot = resolve(input.scratchRoot ?? join(imcodesHome(), 'scratch'));
   const bundlesRoot = resolve(input.bundlesRoot ?? join(imcodesHome(), 'supervision-integration-bundles'));
+  const backupsRoot = resolve(input.backupsRoot ?? join(imcodesHome(), 'worktree-backups'));
   const tasks = new Map(input.tasks.map((task) => [task.taskId, task]));
   const assignments = new Map(input.tasks.flatMap((task) => (
     task.assignments.map((assignment) => [assignment.assignmentId, { task, assignment }] as const)
@@ -252,8 +321,10 @@ export async function runSupervisionRetentionGc(
   // Each independently managed root gets one bounded page. A crowded scratch
   // root must never starve immutable-bundle retention indefinitely.
   const bundles = await listBundleCandidates(bundlesRoot);
+  const backups = await listBackupCandidates(backupsRoot);
   const scratchCandidates = rotatingPage(scratch.candidates, limit, now);
   const bundleCandidates = rotatingPage(bundles.candidates, limit, now);
+  const backupCandidates = rotatingPage(backups.candidates, limit, now);
   const entries: SupervisionRetentionEntry[] = [];
 
   for (const candidate of scratchCandidates) {
@@ -275,6 +346,8 @@ export async function runSupervisionRetentionGc(
       ? await latestTreeActivity(path).catch((): TreeActivity => ({ mtimeMs: info.mtimeMs, truncated: true }))
       : { mtimeMs: info.mtimeMs, truncated: false };
     const age = ownerAge(taskOwner, treeActivity.mtimeMs, now);
+    const candidateScratchRetentionMs = taskOwner?.status === 'finalized'
+      ? finalizedScratchRetentionMs : scratchRetentionMs;
     const reason: SupervisionRetentionReason = candidate.quarantine
       ? age < quarantineGraceMs ? 'quarantine_grace'
         : terminal ? 'terminal_retention_elapsed'
@@ -282,7 +355,7 @@ export async function runSupervisionRetentionGc(
             : treeActivity.truncated ? 'unknown_owner'
             : age >= orphanGraceMs ? 'orphan_grace_elapsed' : 'unknown_owner'
       : terminal
-      ? age >= scratchRetentionMs ? 'terminal_retention_elapsed' : 'retention_window'
+      ? age >= candidateScratchRetentionMs ? 'terminal_retention_elapsed' : 'retention_window'
       : taskOwner || assignmentOwner ? 'active_owner'
         : treeActivity.truncated ? 'unknown_owner'
         : age >= orphanGraceMs ? 'orphan_grace_elapsed' : 'unknown_owner';
@@ -308,6 +381,8 @@ export async function runSupervisionRetentionGc(
     const terminal = Boolean(task && isTerminalSupervisionWorktreeTaskStatus(task.status)
       && task.assignments.every((item) => !item.leaseId));
     const age = ownerAge(task, info.mtimeMs, now);
+    const candidateBundleRetentionMs = task?.status === 'finalized'
+      ? finalizedBundleRetentionMs : bundleRetentionMs;
     const reason: SupervisionRetentionReason = candidate.quarantine
       ? age < quarantineGraceMs ? 'quarantine_grace'
         : terminal ? 'terminal_retention_elapsed'
@@ -315,7 +390,7 @@ export async function runSupervisionRetentionGc(
             : age >= orphanGraceMs ? 'orphan_grace_elapsed'
               : manifestTaskId ? 'unknown_owner' : 'invalid_layout'
       : terminal
-      ? age >= bundleRetentionMs ? 'terminal_retention_elapsed' : 'retention_window'
+      ? age >= candidateBundleRetentionMs ? 'terminal_retention_elapsed' : 'retention_window'
       : task ? 'active_owner'
         : age >= orphanGraceMs ? 'orphan_grace_elapsed'
             : manifestTaskId ? 'unknown_owner' : 'invalid_layout';
@@ -325,15 +400,26 @@ export async function runSupervisionRetentionGc(
     entries.push({ kind: 'bundle', key, path, action, reason, bytes });
   }
 
+  for (const candidate of backupCandidates) {
+    const info = await lstat(candidate.path);
+    const expired = now - info.mtimeMs >= backupRetentionMs;
+    const action = expired ? 'delete' : 'retain';
+    const reason: SupervisionRetentionReason = expired ? 'backup_retention_elapsed' : 'retention_window';
+    const bytes = action === 'delete' ? info.size : 0;
+    if (input.mode === 'apply' && action === 'delete') await removeManagedFile(backupsRoot, candidate.path);
+    entries.push({ kind: 'backup', key: candidate.key, path: candidate.path, action, reason, bytes });
+  }
+
   return {
     mode: input.mode,
     scanned: entries.length,
     deleted: entries.filter((entry) => entry.action === 'delete').length,
     releasedBytes: entries.filter((entry) => entry.action === 'delete').reduce((sum, entry) => sum + entry.bytes, 0),
     retained: entries.filter((entry) => entry.action === 'retain').length,
-    hasMore: scratch.truncated || bundles.truncated
+    hasMore: scratch.truncated || bundles.truncated || backups.truncated
       || scratch.candidates.length > scratchCandidates.length
-      || bundles.candidates.length > bundleCandidates.length,
+      || bundles.candidates.length > bundleCandidates.length
+      || backups.candidates.length > backupCandidates.length,
     entries,
   };
 }

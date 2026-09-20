@@ -133,6 +133,22 @@ describe('bounded supervision worktree GC', () => {
     expect(createSupervisionWorktreeGcDeps()).not.toHaveProperty('protectedSessionNames');
   });
 
+  it('surfaces retained-artifact cleanup counts and bytes in the housekeeping result', async () => {
+    const root = await makeRoot();
+    const result = await runSupervisionWorktreeGc({ projectName: 'cd', worktreesRoot: root }, {
+      resolveRegistryReference: () => ({ available: true }),
+      protectedPaths: [],
+      sweepRetainedArtifacts: async () => ({
+        mode: 'dryRun', scanned: 2, deleted: 1, releasedBytes: 4096, retained: 1, hasMore: false,
+        entries: [{
+          kind: 'backup', key: 'cd/deck/asg.patch', path: '/managed/asg.patch',
+          action: 'delete', reason: 'backup_retention_elapsed', bytes: 4096,
+        }],
+      }),
+    });
+    expect(result.artifactRetention).toMatchObject({ deleted: 1, releasedBytes: 4096, retained: 1 });
+  });
+
   function consumedFinalizationReference(
     metadata: SupervisionWorktreeMetadata,
     options: {
@@ -442,6 +458,9 @@ describe('bounded supervision worktree GC', () => {
         if (candidate.assignmentId.endsWith('active')) return registryReference(candidate, { status: 'implementing' });
         if (candidate.assignmentId.endsWith('lease')) return registryReference(candidate, { leaseId: 'lease-1' });
         if (candidate.assignmentId.endsWith('claim')) return registryReference(candidate, { claims: true });
+        if (['dirty', 'untracked', 'branch', 'unpushed'].some((suffix) => candidate.assignmentId.endsWith(suffix))) {
+          return registryReference(candidate, { completeAuthority: false });
+        }
         return registryReference(candidate);
       },
       inspectGit: async (repoPath) => {
@@ -1057,6 +1076,35 @@ describe('bounded supervision worktree GC', () => {
     expect(patch).toContain('untracked bytes');
   });
 
+  it('directly reclaims a dirty merged worktree without creating a backup', async () => {
+    const root = await makeRoot('supervision-worktree-gc-merged-');
+    const backupsRoot = await makeRoot('supervision-worktree-gc-merged-backups-');
+    const created = await createCandidate(root, 'asg_merged1');
+    await execFileAsync('git', ['init'], { cwd: created.repoPath });
+    await execFileAsync('git', ['config', 'user.email', 'gc@example.test'], { cwd: created.repoPath });
+    await execFileAsync('git', ['config', 'user.name', 'GC Test'], { cwd: created.repoPath });
+    await writeFile(join(created.repoPath, 'tracked.txt'), 'merged bytes\n');
+    await execFileAsync('git', ['add', 'tracked.txt'], { cwd: created.repoPath });
+    await execFileAsync('git', ['commit', '-m', 'merged'], { cwd: created.repoPath });
+    await writeFile(join(created.repoPath, 'tracked.txt'), 'irrelevant local dirt\n');
+    await writeFile(join(created.repoPath, 'untracked.txt'), 'also irrelevant\n');
+    const removeRegisteredWorktree = vi.fn(async (_inspection, repoPath: string) => {
+      await rm(repoPath, { recursive: true, force: false });
+      return true;
+    });
+    const result = await runSupervisionWorktreeGc({
+      projectName: 'cd', mode: 'apply', worktreesRoot: root,
+    }, {
+      resolveRegistryReference: (metadata) => registryReference(metadata),
+      protectedPaths: [], preserveTerminalChanges: true, backupsRoot,
+      removeRegisteredWorktree,
+      removeDirectory: (path) => rm(path, { recursive: true, force: false }),
+    });
+    expect(result).toMatchObject({ deleted: 1, mutations: 1 });
+    expect(removeRegisteredWorktree).toHaveBeenCalledOnce();
+    expect(await readdir(backupsRoot)).toEqual([]);
+  });
+
   it('reclaims an old unregistered orphan but never a path containing a live session cwd', async () => {
     const root = await makeRoot('supervision-worktree-gc-orphans-');
     const removable = await createCandidate(root, 'asg_orphan1');
@@ -1089,7 +1137,7 @@ describe('bounded supervision worktree GC', () => {
     await expect(realpath(live.path)).resolves.toBeTruthy();
   });
 
-  it('fails closed when a dirty backup exceeds its size cap', async () => {
+  it('falls back to backup for uncertain merge authority and fails closed when the patch exceeds its cap', async () => {
     const root = await makeRoot('supervision-worktree-gc-backup-cap-');
     const created = await createCandidate(root, 'asg_backupcap');
     await execFileAsync('git', ['init'], { cwd: created.repoPath });
@@ -1103,7 +1151,9 @@ describe('bounded supervision worktree GC', () => {
     const result = await runSupervisionWorktreeGc({
       projectName: 'cd', mode: 'apply', worktreesRoot: root,
     }, {
-      resolveRegistryReference: (metadata) => registryReference(metadata),
+      resolveRegistryReference: (metadata) => registryReference(metadata, {
+        status: 'finalized', completeAuthority: false,
+      }),
       removeRegisteredWorktree,
       protectedPaths: [], preserveTerminalChanges: true, maxBackupPatchBytes: 1024,
     });

@@ -457,6 +457,15 @@ function terminalAssignmentReason(
   return undefined;
 }
 
+function taskHasMergedAuthority(reference: SupervisionWorktreeRegistryReference): boolean {
+  const task = reference.task;
+  const finalization = task?.finalization;
+  if (task?.status !== 'finalized' || !finalization) return false;
+  if (!/^[0-9a-f]{40}$/.test(task.commitSha ?? '')
+    || finalization.commitSha !== task.commitSha) return false;
+  return finalization.pushResult === 'pushed' || finalization.pushResult === 'already_present';
+}
+
 async function worktreeBlock(porcelain: string, repoPath: string): Promise<string | undefined> {
   const canonical = await realpath(repoPath);
   for (const block of porcelain.split(/\n\n+/)) {
@@ -857,11 +866,12 @@ async function evaluateCandidate(
   deps.onScanOperation?.('git');
   const inspection = await (deps.inspectGit ?? inspectSupervisionGitWorktree)(candidate.repoPath);
   if (!inspection.ok) return retain(inspection.reason ?? SUPERVISION_WORKTREE_GC_REASONS.GIT_UNAVAILABLE, taskId);
+  const merged = taskHasMergedAuthority(reference);
   if (!inspection.registered && !deps.preserveTerminalChanges) {
     return retain(SUPERVISION_WORKTREE_GC_REASONS.GIT_UNREGISTERED, taskId);
   }
   if (inspection.locked) return retain(SUPERVISION_WORKTREE_GC_REASONS.GIT_LOCKED, taskId);
-  if (!deps.preserveTerminalChanges) {
+  if (!deps.preserveTerminalChanges && !merged) {
     if (inspection.untracked) return retain(SUPERVISION_WORKTREE_GC_REASONS.UNTRACKED, taskId);
     if (inspection.dirty) return retain(SUPERVISION_WORKTREE_GC_REASONS.DIRTY, taskId);
     if (inspection.branchOnly) return retain(SUPERVISION_WORKTREE_GC_REASONS.BRANCH_ONLY, taskId);
@@ -884,7 +894,12 @@ async function evaluateCandidate(
     },
     metadataText: parsed?.text ?? '',
     inspection,
-    backupRequired: Boolean(inspection.dirty || inspection.untracked || inspection.branchOnly || inspection.unpushed),
+    // Once the registry proves the task finalized with a pushed/already-present
+    // commit, repository bytes are authoritative. Local dirt no longer merits
+    // a duplicate patch. Uncertain or unmerged owners keep the fail-safe backup.
+    backupRequired: !merged && Boolean(
+      inspection.dirty || inspection.untracked || inspection.branchOnly || inspection.unpushed
+    ),
   };
 }
 

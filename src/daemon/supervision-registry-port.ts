@@ -474,7 +474,7 @@ export async function runScheduledSupervisionWorktreeGcBatch(
       projectName: state.projectName,
       artifactsDeleted: result.artifactRetention.deleted,
       reclaimedBytes: result.artifactRetention.releasedBytes,
-    }, 'Supervision artifact retention reclaimed terminal scratch/bundles');
+    }, 'Supervision artifact retention reclaimed scratch/bundles/worktree backups');
   }
   const totalBytes = await measureWorktreesRootBytes(result.root);
   if (totalBytes !== undefined && totalBytes >= SUPERVISION_WORKTREE_BYTES_WARNING) {
