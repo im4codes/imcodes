@@ -86,6 +86,33 @@ describe('session resource lifecycle', () => {
     expect(cleanup).toHaveBeenCalledWith(expect.objectContaining({ resourceId: 'mcp:stopped' }), 'orphaned');
   });
 
+  it('preserves an active PID resource when process-identity sampling is uncertain', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'imcodes-resource-ledger-'));
+    roots.push(directory);
+    const cleanup = vi.fn<SessionResourceCleanup>(async () => {});
+    const pidHandleIsCurrent = vi.fn().mockResolvedValue(null);
+    const registry = new SessionResourceRegistry({
+      directory,
+      now: () => 10_000,
+      cleanup,
+      pidHandleIsCurrent,
+    });
+    await registry.register({
+      resourceId: 'mcp:uncertain',
+      kind: 'mcp',
+      owner: owner('live-instance'),
+      handle: { type: 'pid', pid: 404, processStart: 'registered-start' },
+    });
+
+    expect(await registry.sweepOrphans([owner('live-instance')])).toMatchObject({
+      released: 0,
+      preserved: 1,
+      failed: 0,
+    });
+    expect(pidHandleIsCurrent).toHaveBeenCalledOnce();
+    expect(cleanup).not.toHaveBeenCalled();
+  });
+
   it('rebinds the same logical tmux pane to a successor epoch without permitting owner reuse', async () => {
     const { registry } = await fixture();
     const prior = owner();

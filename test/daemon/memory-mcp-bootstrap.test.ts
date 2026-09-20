@@ -1,14 +1,20 @@
+import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { mkdtemp, readFile, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { createInterface } from 'node:readline';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { afterEach, describe, expect, it } from 'vitest';
 
 const openClients: Client[] = [];
+const openProcesses: ChildProcessWithoutNullStreams[] = [];
 
 afterEach(async () => {
   await Promise.allSettled(openClients.splice(0).map((client) => client.close()));
+  for (const child of openProcesses.splice(0)) {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  }
 });
 
 function connect(env: Record<string, string>): { client: Client; transport: StdioClientTransport; stderr: string[] } {
@@ -51,6 +57,40 @@ async function waitForStarts(path: string, count: number, timeoutMs = 10_000): P
     await new Promise((resolveWait) => setTimeout(resolveWait, 25));
   } while (Date.now() < deadline);
   throw new Error(`backend started fewer than ${count} times`);
+}
+
+async function waitFor<T>(read: () => T | undefined | Promise<T | undefined>, timeoutMs = 8_000): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    const value = await read();
+    if (value !== undefined) return value;
+    await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+  } while (Date.now() < deadline);
+  throw new Error('condition was not reached');
+}
+
+function rawBootstrap(env: Record<string, string>): {
+  child: ChildProcessWithoutNullStreams;
+  messages: Array<Record<string, unknown>>;
+} {
+  const child = spawn(process.execPath, ['--import', 'tsx', 'src/index.ts', 'memory', 'mcp'], {
+    cwd: process.cwd(),
+    env: {
+      PATH: process.env.PATH ?? '',
+      HOME: process.env.HOME ?? '',
+      NODE_ENV: 'test',
+      IMCODES_MCP_TOOL_CATALOG_MODE: 'static_full',
+      IMCODES_MEMORY_MCP_TEST_BACKEND_ENTRY: resolve('test/fixtures/memory-mcp-test-backend.mjs'),
+      ...env,
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  openProcesses.push(child);
+  const messages: Array<Record<string, unknown>> = [];
+  createInterface({ input: child.stdout, crlfDelay: Infinity }).on('line', (line) => {
+    messages.push(JSON.parse(line) as Record<string, unknown>);
+  });
+  return { child, messages };
 }
 
 describe('memory MCP lightweight bootstrap', () => {
@@ -118,6 +158,33 @@ describe('memory MCP lightweight bootstrap', () => {
     });
   });
 
+  it('registers the real supervised backend under the watchdog-safe mcp-backend prefix', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'memory-mcp-backend-owner-'));
+    const { client, transport } = connect({
+      HOME: home,
+      IMCODES_HOME: home,
+      IMCODES_MEMORY_MCP_TEST_BACKEND_ENTRY: '',
+      IMCODES_DAEMON_SESSION_NAME: 'deck_sub_backend_owned',
+      IMCODES_RESOURCE_SESSION_INSTANCE_ID: 'instance-backend-owned',
+      IMCODES_RESOURCE_RUNTIME_EPOCH: 'epoch-backend-owned',
+    });
+    await client.connect(transport);
+    const registryDir = join(home, 'session-resources');
+    const record = await waitFor(async () => {
+      const names = await readdir(registryDir).catch(() => []);
+      for (const name of names.filter((candidate) => candidate.endsWith('.json'))) {
+        const candidate = JSON.parse(await readFile(join(registryDir, name), 'utf8')) as {
+          resourceId?: string;
+          handle?: { pid?: number };
+        };
+        if (candidate.resourceId?.startsWith('mcp-backend:epoch-backend-owned:')) return candidate;
+      }
+      return undefined;
+    });
+    expect(record.resourceId).toMatch(/^mcp-backend:epoch-backend-owned:/);
+    expect(record.handle?.pid).not.toBe(transport.pid);
+  }, 15_000);
+
   it('keeps increasing reconnect backoff while a ready backend flaps before the stable window', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'memory-mcp-flap-'));
     const startLog = join(dir, 'starts.log');
@@ -151,6 +218,51 @@ describe('memory MCP lightweight bootstrap', () => {
       .resolves.toMatchObject({ structuredContent: { echoed: 'after-timeout' } });
   }, 12_000);
 
+  it('fails every in-flight request with backend-restarted when that generation exits', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'memory-mcp-exit-call-'));
+    const startLog = join(dir, 'starts.log');
+    const { client, transport } = connect({
+      IMCODES_MEMORY_MCP_TEST_EXIT_CALL_VALUE: 'exit-now',
+      IMCODES_MEMORY_MCP_TEST_START_LOG: startLog,
+    });
+    await client.connect(transport);
+    await waitForFixtureCatalog(client);
+
+    await expect(client.callTool({ name: 'fixture_echo', arguments: { value: 'exit-now' } }))
+      .rejects.toMatchObject({
+        code: -32003,
+        message: expect.stringMatching(/memory_mcp_backend_restarted/),
+      });
+    await waitForStarts(startLog, 2);
+  }, 12_000);
+
+  it('drops a backend reply that arrives after the proxy already timed out that request', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'memory-mcp-late-reply-'));
+    const replyLog = join(dir, 'replies.log');
+    const { child, messages } = rawBootstrap({
+      IMCODES_MEMORY_MCP_TEST_TOOL_CALL_TIMEOUT_MS: '100',
+      IMCODES_MEMORY_MCP_TEST_IGNORE_SIGTERM: '1',
+      IMCODES_MEMORY_MCP_TEST_REPLY_LOG: replyLog,
+    });
+    child.stdin.write(`${JSON.stringify({
+      jsonrpc: '2.0', id: 1, method: 'initialize',
+      params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'raw-test', version: '1' } },
+    })}\n`);
+    await waitFor(() => messages.find((message) => message.id === 1));
+    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`);
+    await waitFor(() => messages.find((message) => message.method === 'notifications/tools/list_changed'));
+
+    child.stdin.write(`${JSON.stringify({
+      jsonrpc: '2.0', id: 77, method: 'tools/call',
+      params: { name: 'fixture_echo', arguments: { value: 'late', delayMs: 350 } },
+    })}\n`);
+    const timeout = await waitFor(() => messages.find((message) => message.id === 77));
+    expect(timeout).toMatchObject({ error: { code: -32002, message: 'memory_mcp_backend_request_timeout' } });
+    await waitFor(async () => (await readFile(replyLog, 'utf8').catch(() => '')).includes('77') || undefined);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+    expect(messages.filter((message) => message.id === 77)).toHaveLength(1);
+  }, 12_000);
+
   it('honors a tool-declared timeout instead of the generic RPC deadline', async () => {
     const { client, transport } = connect({
       IMCODES_MEMORY_MCP_TEST_REQUEST_TIMEOUT_MS: '150',
@@ -161,6 +273,19 @@ describe('memory MCP lightweight bootstrap', () => {
       name: 'fixture_echo',
       arguments: { value: 'declared-timeout', delayMs: 300, timeoutMs: 120_000 },
     })).resolves.toMatchObject({ structuredContent: { echoed: 'declared-timeout' } });
+  }, 10_000);
+
+  it('honors a tool-declared timeout that is shorter than the 15-minute default', async () => {
+    const { client, transport } = connect({
+      IMCODES_MEMORY_MCP_TEST_TOOL_CALL_TIMEOUT_MS: '5000',
+      IMCODES_MEMORY_MCP_TEST_TOOL_TIMEOUT_HEADROOM_MS: '50',
+    });
+    await client.connect(transport);
+    await waitForFixtureCatalog(client);
+    await expect(client.callTool({
+      name: 'fixture_echo',
+      arguments: { value: 'short-declared-timeout', delayMs: 500, timeoutMs: 100 },
+    })).rejects.toThrow(/memory_mcp_backend_request_timeout/);
   }, 10_000);
 
   it('lets a healthy long-running tool call finish without delaying or failing concurrent work', async () => {

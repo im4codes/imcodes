@@ -194,6 +194,44 @@ describe('a pane whose window is all signals recovers on the SAME mount', () => 
     expect(rendered.split(',').includes('sig-0')).toBe(false);
   });
 
+  it('keeps the cached window when a productive drain cannot identify deleted row ids', async () => {
+    const sessionName = 'deck_unknown_drain_ids';
+    const serverId = 'srv-unknown-drain-ids';
+    const scopedKey = `${serverId}:${sessionName}`;
+    const live = signal(9_998);
+    let windowFreed = false;
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents')
+      .mockImplementation(async (key: string) => {
+        if (key !== scopedKey) return [];
+        return windowFreed ? [message('conversation returned')] : [live];
+      });
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue({ seq: 1, epoch: 1 });
+    vi.spyOn(TimelineDB.prototype, 'memoryOnly', 'get').mockReturnValue(false);
+    vi.spyOn(TimelineDB.prototype, 'pruneOldEvents').mockResolvedValue({ deleted: 0, done: true });
+    vi.spyOn(TimelineDB.prototype, 'drainLegacySignals').mockImplementation(async () => {
+      windowFreed = true;
+      // Legacy implementations can report a productive pass without the
+      // optional id list. That is not authority to evict any cached row.
+      return { deleted: 1, done: true };
+    });
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, null, serverId, { isActiveSession: false });
+      return h('div', { 'data-testid': 'unknown-id-pane' }, events.map((event) => event.eventId).join(','));
+    }
+
+    render(h(Probe));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+      await Promise.resolve();
+    });
+
+    const rendered = screen.getByTestId('unknown-id-pane').textContent ?? '';
+    expect(rendered).toContain('msg-conversation returned');
+    expect(rendered, 'missing drain ids evicted a live cached signal').toContain('sig-9998');
+  });
+
   it('still evicts drained rows when the refreshed read comes back empty', async () => {
     // A read can legitimately return nothing (transient IDB failure). Bailing
     // out early on that would leave rows we KNOW were deleted sitting in the

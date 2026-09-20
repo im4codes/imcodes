@@ -133,6 +133,10 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
     'IMCODES_MEMORY_MCP_TEST_TOOL_CALL_TIMEOUT_MS',
     TOOL_CALL_DEFAULT_TIMEOUT_MS,
   );
+  const toolCallTimeoutHeadroomMs = testOnlyDuration(
+    'IMCODES_MEMORY_MCP_TEST_TOOL_TIMEOUT_HEADROOM_MS',
+    TOOL_CALL_TIMEOUT_HEADROOM_MS,
+  );
   const stableBackendUptimeMs = testOnlyDuration(
     'IMCODES_MEMORY_MCP_TEST_STABLE_UPTIME_MS',
     BACKEND_STABLE_UPTIME_MS,
@@ -198,7 +202,7 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
     const timeoutMs = message.method === 'tools/call'
       ? (declaredToolTimeoutMs === null
           ? toolCallDefaultTimeoutMs
-          : declaredToolTimeoutMs + TOOL_CALL_TIMEOUT_HEADROOM_MS)
+          : declaredToolTimeoutMs + toolCallTimeoutHeadroomMs)
       : inFlightRequestTimeoutMs;
     const timer = setTimeout(() => {
       const request = inFlight.get(key);

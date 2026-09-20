@@ -137,11 +137,12 @@ describe('a backlog larger than one deletion budget still repairs the live pane'
     // schedule its sweep. Waiting for the sweep's real lifecycle boundary is
     // deterministic under coverage and also prevents this module's background
     // work leaking into the next test.
+    const firstCompletionObserver = __waitForLocalHistoryPruneForTests(`${SERVER}:${SESSION}`);
+    const secondCompletionObserver = __waitForLocalHistoryPruneForTests(`${SERVER}:${SESSION}`);
     await act(async () => {
-      await __waitForLocalHistoryPruneForTests(`${SERVER}:${SESSION}`);
+      await Promise.all([firstCompletionObserver, secondCompletionObserver]);
     });
 
-    // eslint-disable-next-line no-console
     const rendered = screen.getByTestId('pane').textContent ?? '';
     expect(
       rendered,

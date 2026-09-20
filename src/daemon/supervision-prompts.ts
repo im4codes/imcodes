@@ -539,7 +539,10 @@ export function buildSupervisionTaskFinalizationContract(_locale?: SupervisionUi
     beforePass: { forbid: ['stage', 'commit', 'push', 'merge', 'release', 'publish', 'deploy'] },
     authority: 'actual_worktree+Git_bytes',
     git: { conflict: 'block', add: 'explicit_non_broad_pathspec', forbidAdd: SUPERVISION_TASK_FINALIZATION_FORBIDDEN_GIT_ADD, forbidStagePrefixes: SUPERVISION_TASK_FINALIZATION_FORBIDDEN_STAGE_PREFIXES },
-    metadata: { fields: ['ownedFiles', 'scopeFiles', 'touchedFiles', 'file_event', 'integrationManifest'], mode: 'record_only', editAllowlist: false, gate: false },
+    // The adjacent task-registry contract owns the full metadata schema. A
+    // reference here preserves that authority without duplicating 100+ bytes in
+    // every execution, audit, decision, and repair preamble.
+    metadata: 'task_registry_contract',
     auditEvidence: {
       frozenFirst: true,
       auditorRuns: 'only_missing_report_or_confident_suspicion_small',
@@ -1194,12 +1197,12 @@ export function buildPeerAuditBriefV1(input: PeerAuditBriefV1Input): string {
   const legacySessionAudit = !input.taskId && !input.assignmentId && !input.revision;
   const evidencePolicy = evidenceComplete
     ? [
-        'EVIDENCE ACCEPTANCE FIRST: DEFAULT-ACCEPT the exact-bound implementer validation report after binding and coherence review. Audit from the code and the submitted test report. Raw logs, transcripts, hashes, and bundle attachments are not required and their absence must never cause REWORK.',
-        'Do not run tests, typechecks, builds, mutants, probes, or reproductions when that report is usable. Only a confident, concrete suspicion about one specific behavior permits one small targeted check to confirm or refute it; do not REWORK merely to ask the implementer to run that check.',
+        'DEFAULT: audit code plus the exact-bound implementer report. Accept it after binding/coherence review; do not rerun tests, typechecks, builds, mutants, probes, or reproductions. Missing raw logs, transcripts, hashes, or bundle attachments never causes REWORK.',
+        'EXCEPTION: one confident, concrete suspicion permits one small targeted check to confirm or refute it. Do not REWORK merely to request that check.',
       ]
     : [
-        'EVIDENCE GAP: no usable exact-revision test report was supplied. Only because no usable exact-revision test report exists, the auditor may run the minimal check needed to fill that report gap.',
-        'A confident, concrete suspicion also permits one small targeted check; do not REWORK merely to request that check. For any auditor-run check, state why it ran and limit it to one test file or a few named tests, or one mutant, with `--maxWorkers<=2` and seconds-to-a-few-minutes. Never run a full test project, full build, coverage, or e2e.',
+        'REPORT GAP: no usable exact-revision report exists, so run only the smallest check that fills that gap.',
+        'EXCEPTION: one confident, concrete suspicion also permits one small targeted check. Do not REWORK merely to request it.',
       ];
 
   const brief = [
@@ -1211,7 +1214,7 @@ export function buildPeerAuditBriefV1(input: PeerAuditBriefV1Input): string {
     'Review all in-scope code and acceptance criteria. Separate observed evidence from inference.',
     ...evidencePolicy,
     'AUDITOR CHECK HARD LIMIT: one test file or a few named tests, or one mutant; `--maxWorkers<=2`; seconds-to-a-few-minutes. Never run a full test project, full build, coverage, or e2e. State which small check ran and why.',
-    'The normal audit is exact binding plus code review plus acceptance of the submitted exact-revision report, with no duplicate execution. Exceptions are only the smallest check for a missing/unusable report or one small targeted check for a confident, concrete suspicion.',
+    'Normally: exact binding, code review, and acceptance of the exact-revision report with no duplicate execution. Only a missing/unusable report or one confident, concrete suspicion permits the small check above.',
     'You MUST NOT modify tracked source, commit, push, deploy, mutate production, or alter persistent external/product state. Do not run reset/clean. Inspect worktree state before and after, preserve pre-existing changes, and stop/report if validation creates an unexpected tracked diff.',
     'Treat `git status` as a signal, not proof of a content change. Before classifying an unexpected EOL-only path as task contamination, compare the HEAD blob, raw working-tree bytes, and the attribute-cleaned hash (`git hash-object --path`). If raw bytes equal HEAD but the clean hash differs, report one repository-normalization defect; do not include that unrelated path in the candidate diff/archive, and do not hide it with reset, clean, or assume-unchanged. If raw bytes differ from HEAD, keep the normal fail-closed contamination rule. An explicit normalization task may include the path.',
     evidenceComplete

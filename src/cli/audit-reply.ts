@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import {
   PEER_AUDIT_REPLY_VERSION,
-  decodePeerAuditReplyEnvelope,
+  decodePeerAuditReplyEnvelopeStructure,
   type PeerAuditReplyEnvelope,
 } from '../../shared/peer-audit.js';
 import { resolveLiveHookPort } from '../daemon/hook-port.js';
@@ -82,7 +82,11 @@ export async function runAuditReplyCommand(
   } catch {
     throw new Error('invalid validations file');
   }
-  const decoded = decodePeerAuditReplyEnvelope({
+  // Evidence authority belongs to the daemon: only it can bind an accepted
+  // implementer report to the exact task/revision, and only its task-less
+  // session-audit gate may allow unavailable-only PASS. Keep the CLI strict on
+  // shape/size, but never pre-reject an envelope the daemon can authorize.
+  const decoded = decodePeerAuditReplyEnvelopeStructure({
     version: PEER_AUDIT_REPLY_VERSION,
     taskId: options.taskId,
     assignmentId: options.assignmentId,

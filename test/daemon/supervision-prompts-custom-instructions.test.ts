@@ -557,8 +557,8 @@ describe('Brain work-delegation contract placement and budget', () => {
     const audit = buildSupervisedAuditExecutionPreamble('en').length;
     expect(execution).toBeLessThan(5_000);
     expect(audit).toBeLessThan(5_200);
-    expect(5_000 - execution).toBeGreaterThanOrEqual(250);
-    expect(5_200 - audit).toBeGreaterThanOrEqual(250);
+    expect(5_000 - execution).toBeGreaterThanOrEqual(400);
+    expect(5_200 - audit).toBeGreaterThanOrEqual(400);
     // Restating the full contract in the preamble would blow the budget; that
     // is the regression this placement exists to prevent.
     expect(execution + buildBrainSupervisedWorkDelegationContract('en').length)

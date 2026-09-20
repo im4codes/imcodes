@@ -4179,7 +4179,10 @@ export function describeOpenSpecAutoDeliverRunsForTests(): Array<{
   }));
 }
 
-export async function clearOpenSpecAutoDeliverRunsForTests(): Promise<void> {
+export async function clearOpenSpecAutoDeliverRunsForTests(options: {
+  drainTimeoutMs?: number;
+  maxDrainPasses?: number;
+} = {}): Promise<void> {
   // Timeline events intentionally launch async advances without blocking the
   // emitter. Quiesce the tracked acceptance advances before test fixtures tear
   // down their project roots or reset shared transport mocks; otherwise a
@@ -4194,8 +4197,28 @@ export async function clearOpenSpecAutoDeliverRunsForTests(): Promise<void> {
   // successor before its own promise settles. Clearing the fixture first would
   // let that old work write into a removed project root or call freshly-reset
   // mocks in the following test.
+  const drainTimeoutMs = options.drainTimeoutMs ?? 30_000;
+  const maxDrainPasses = options.maxDrainPasses ?? 100;
+  const drainDeadline = Date.now() + drainTimeoutMs;
+  let drainPasses = 0;
   while (implementationAdvancesInFlight.size > 0) {
-    await Promise.allSettled([...implementationAdvancesInFlight]);
+    drainPasses += 1;
+    const remainingMs = drainDeadline - Date.now();
+    if (drainPasses > maxDrainPasses || remainingMs <= 0) {
+      throw new Error('openspec_auto_deliver_test_reset_drain_timeout');
+    }
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      Promise.allSettled([...implementationAdvancesInFlight]),
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error('openspec_auto_deliver_test_reset_drain_timeout')),
+          remainingMs,
+        );
+      }),
+    ]).finally(() => {
+      if (timeout) clearTimeout(timeout);
+    });
   }
   for (const timer of auditPollTimers.values()) clearTimeout(timer);
   auditPollTimers.clear();

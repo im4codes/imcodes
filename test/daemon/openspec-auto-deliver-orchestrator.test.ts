@@ -1587,6 +1587,29 @@ exec "${realGit}" "$@"
     expect(describeOpenSpecAutoDeliverRunsForTests()).toEqual([]);
   });
 
+  it('fails a stuck test-reset drain with a bounded, explicit error', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-bounded-reset-drain',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+    await waitForTransportSend((text) =>
+      text.includes('Implementation completion marker (required):'), SEND_WAIT_MS);
+    expect(await writeLatestImplementationMarker()).toBe(true);
+
+    const gate = blockNextTasksRead();
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await gate.started;
+    await expect(clearOpenSpecAutoDeliverRunsForTests({ drainTimeoutMs: 25 }))
+      .rejects.toThrow('openspec_auto_deliver_test_reset_drain_timeout');
+
+    gate.release();
+    await clearOpenSpecAutoDeliverRunsForTests();
+  });
+
   it('advances implementation from a valid completion marker despite unchecked tasks and without waiting for idle', async () => {
     await makeChange('demo-change', '- [x] first\n- [ ] production deploy requires user authorization\n');
     await handleOpenSpecAutoDeliverCommand({

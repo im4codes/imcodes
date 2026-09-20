@@ -69,7 +69,7 @@ describe('supervision prompts', () => {
         oldPassReleasesNewRevision: false,
       },
       authority: 'actual_worktree+Git_bytes',
-      metadata: { mode: 'record_only', editAllowlist: false, gate: false },
+      metadata: 'task_registry_contract',
       auditEvidence: { frozenFirst: true, auditorRuns: 'only_missing_report_or_confident_suspicion_small' },
       implementation_finished: 'handoff_not_PASS_or_Git_finalization',
     });
@@ -279,8 +279,8 @@ describe('supervision prompts', () => {
     });
 
     expect(prompt).toContain('[Contract: supervision_peer_audit_v1]');
-    expect(prompt).toContain('Audit from the code and the submitted test report');
-    expect(prompt).toContain('Do not run tests, typechecks, builds, mutants, probes, or reproductions');
+    expect(prompt).toContain('audit code plus the exact-bound implementer report');
+    expect(prompt).toContain('do not rerun tests, typechecks, builds, mutants, probes, or reproductions');
     expect(prompt).toContain('MUST NOT modify tracked source, commit, push, deploy, mutate production');
     expect(prompt).toContain('Inspect worktree state before and after');
     expect(prompt).toContain('compare the HEAD blob, raw working-tree bytes, and the attribute-cleaned hash');
@@ -308,18 +308,16 @@ describe('supervision prompts', () => {
       ],
     });
 
-    expect(prompt).toContain('EVIDENCE ACCEPTANCE FIRST');
-    expect(prompt).toContain('DEFAULT-ACCEPT the exact-bound implementer validation report');
-    expect(prompt).toContain('Audit from the code and the submitted test report');
-    expect(prompt).toContain('Raw logs, transcripts, hashes, and bundle attachments are not required');
-    expect(prompt).toContain('their absence must never cause REWORK');
-    expect(prompt).toContain('Do not run tests, typechecks, builds, mutants, probes, or reproductions');
-    expect(prompt).toContain('confident, concrete suspicion about one specific behavior');
+    expect(prompt).toContain('DEFAULT: audit code plus the exact-bound implementer report');
+    expect(prompt).toContain('Accept it after binding/coherence review');
+    expect(prompt).toContain('Missing raw logs, transcripts, hashes, or bundle attachments never causes REWORK');
+    expect(prompt).toContain('do not rerun tests, typechecks, builds, mutants, probes, or reproductions');
+    expect(prompt).toContain('one confident, concrete suspicion permits one small targeted check');
     expect(prompt).toContain('one test file or a few named tests, or one mutant');
     expect(prompt).toContain('--maxWorkers<=2');
     expect(prompt).toContain('Never run a full test project, full build, coverage, or e2e');
-    expect(prompt).toContain('do not REWORK merely to ask the implementer to run that check');
-    expect(prompt).not.toContain('EVIDENCE GAP:');
+    expect(prompt).toContain('Do not REWORK merely to request that check');
+    expect(prompt).not.toContain('REPORT GAP:');
     expect(prompt).not.toContain('claims to verify');
     expect(prompt).not.toContain('refuse to PASS on static reading alone');
     expect(prompt).not.toContain('verify independently');
@@ -347,9 +345,8 @@ describe('supervision prompts', () => {
       'environment | passed | real Codex transport: transport scenario passed',
       'tool | passed | immutable bundle: five scoped files verified',
     ]) expect(prompt).toContain(row);
-    expect(prompt).toContain('DEFAULT-ACCEPT the exact-bound implementer validation report');
-    expect(prompt).toContain('Raw logs, transcripts, hashes, and bundle attachments are not required');
-    expect(prompt).toContain('their absence must never cause REWORK');
+    expect(prompt).toContain('DEFAULT: audit code plus the exact-bound implementer report');
+    expect(prompt).toContain('Missing raw logs, transcripts, hashes, or bundle attachments never causes REWORK');
   });
 
   it('permits one minimal gap check only when no usable exact-revision report exists', () => {
@@ -361,15 +358,14 @@ describe('supervision prompts', () => {
       validations: [{ kind: 'test', label: 'focused', outcome: 'unavailable', summary: 'no receipt supplied' }],
     });
 
-    expect(prompt).toContain('EVIDENCE GAP:');
-    expect(prompt).toContain('Only because no usable exact-revision test report exists');
-    expect(prompt).toContain('minimal check needed to fill that report gap');
-    expect(prompt).toContain('A confident, concrete suspicion also permits one small targeted check');
+    expect(prompt).toContain('REPORT GAP: no usable exact-revision report exists');
+    expect(prompt).toContain('run only the smallest check that fills that gap');
+    expect(prompt).toContain('one confident, concrete suspicion also permits one small targeted check');
     expect(prompt).toContain('No accepted implementer report is bound to this attempt');
     expect(prompt).toContain('Never invent a result or cite `accepted_implementer_validation`');
     expect(prompt).toContain('"kind": "test"');
     expect(prompt).toContain('legacy session-audit path only');
-    expect(prompt).not.toContain('EVIDENCE ACCEPTANCE FIRST');
+    expect(prompt).not.toContain('DEFAULT: audit code plus');
     expect(prompt).not.toContain('"kind": "accepted_implementer_validation"');
   });
 
@@ -407,7 +403,7 @@ describe('supervision prompts', () => {
     expect(prompt).toContain('Exact acceptance: preserve ordinary send --reply behavior.');
     expect(prompt).toContain('legacy session-audit path only');
     expect(prompt).toContain('fully explained unavailable-only rows preserve prior behavior');
-    expect(prompt).toContain('minimal check needed to fill that report gap');
+    expect(prompt).toContain('smallest check that fills that gap');
     expect(prompt).toContain('Do not run reset/clean');
     expect(prompt).toContain('stop/report if validation creates an unexpected tracked diff');
     expect(prompt).not.toContain('criterion-99-');

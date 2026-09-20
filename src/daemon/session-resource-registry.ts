@@ -57,6 +57,7 @@ export interface SessionResourceRegistryOptions {
     runtimeEpoch: string;
   } | undefined>;
   tmuxIdentityTimeoutMs?: number;
+  pidHandleIsCurrent?: typeof sessionResourcePidHandleIsCurrent;
 }
 
 export interface ReleaseSummary {
@@ -269,6 +270,7 @@ export class SessionResourceRegistry {
   private readonly resolveTmuxIdentity: NonNullable<SessionResourceRegistryOptions['resolveTmuxIdentity']>;
   private readonly tmuxIdentityTimeoutMs: number;
   private readonly requiresStrongHandles: boolean;
+  private readonly pidHandleIsCurrent: typeof sessionResourcePidHandleIsCurrent;
   private mutationTail: Promise<void> = Promise.resolve();
 
   constructor(options: SessionResourceRegistryOptions = {}) {
@@ -280,6 +282,7 @@ export class SessionResourceRegistry {
     this.cleanup = options.cleanup ?? cleanupSessionResource;
     this.resolveTmuxIdentity = options.resolveTmuxIdentity ?? resolveLiveTmuxIdentity;
     this.tmuxIdentityTimeoutMs = options.tmuxIdentityTimeoutMs ?? TMUX_IDENTITY_QUERY_TIMEOUT_MS;
+    this.pidHandleIsCurrent = options.pidHandleIsCurrent ?? sessionResourcePidHandleIsCurrent;
     this.requiresStrongHandles = options.cleanup === undefined;
   }
 
@@ -564,7 +567,7 @@ export class SessionResourceRegistry {
         // A sampler/permission failure while the PID is still visible is
         // uncertainty, not proof of reuse or exit. Only an exact false result
         // may authorize destructive orphan cleanup.
-        const current = await sessionResourcePidHandleIsCurrent(record.handle);
+        const current = await this.pidHandleIsCurrent(record.handle);
         return current === false ? record.resourceId : null;
       }))).filter((resourceId): resourceId is string => resourceId !== null));
       const now = this.now();

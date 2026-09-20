@@ -605,6 +605,8 @@ const localPruneCompletionWaiters = new Map<string, Set<() => void>>();
 function notifyLocalHistoryPruneComplete(cacheKey: string): void {
   const waiters = localPruneCompletionWaiters.get(cacheKey);
   if (!waiters) return;
+  // This is a broadcast lifecycle edge, not a queue: every observer awaiting
+  // the same scheduled sweep is released by that sweep's first completion.
   localPruneCompletionWaiters.delete(cacheKey);
   for (const resolve of waiters) resolve();
 }

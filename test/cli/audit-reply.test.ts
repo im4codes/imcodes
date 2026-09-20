@@ -47,12 +47,43 @@ describe('audit-reply CLI boundary', () => {
     expect(Object.keys(d)).not.toContain('sendKeys');
   });
 
-  it('rejects missing sender and malformed/static-only PASS locally', async () => {
+  it('rejects a missing sender before contacting the daemon', async () => {
     await expect(runAuditReplyCommand(options, deps({ detectSender: vi.fn().mockResolvedValue('') })))
       .rejects.toThrow('managed current session');
-    await expect(runAuditReplyCommand(options, deps({
+  });
+
+  it.each([
+    ['an exact-revision implementer report', [{
+      kind: 'accepted_implementer_validation',
+      label: 'exact revision report',
+      outcome: 'passed',
+      summary: 'registry validationState=passed',
+    }]],
+    ['a legacy unavailable-only report', [{
+      kind: 'environment',
+      label: 'authorized device',
+      outcome: 'unavailable',
+      summary: 'device offline',
+    }]],
+  ])('defers authority-sensitive evidence for %s to daemon ingress', async (_label, validations) => {
+    const d = deps({
+      readText: vi.fn((path: string) => path.endsWith('validations.json')
+        ? JSON.stringify(validations)
+        : 'Reviewed.'),
+    });
+
+    await expect(runAuditReplyCommand(options, d)).resolves.toBeUndefined();
+    expect(d.post).toHaveBeenCalledOnce();
+  });
+
+  it('keeps empty/static-only PASS rejected by the authoritative daemon gate', async () => {
+    const d = deps({
       readText: vi.fn((path: string) => path.endsWith('validations.json') ? '[]' : 'Reviewed.'),
-    }))).rejects.toThrow('insufficient_validation_evidence');
+      post: vi.fn().mockResolvedValue({ ok: false, error: 'insufficient_validation_evidence' }),
+    });
+
+    await expect(runAuditReplyCommand(options, d)).rejects.toThrow('insufficient_validation_evidence');
+    expect(d.post).toHaveBeenCalledOnce();
   });
 
   it('surfaces structured daemon and network errors without a token fallback', async () => {

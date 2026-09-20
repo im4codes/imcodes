@@ -9,7 +9,13 @@ const startLog = process.env.IMCODES_MEMORY_MCP_TEST_START_LOG;
 if (startLog) appendFileSync(startLog, `${Date.now()}\n`);
 const crashAfterReadyMs = Number(process.env.IMCODES_MEMORY_MCP_TEST_CRASH_AFTER_READY_MS ?? 0);
 const hangCallMarker = process.env.IMCODES_MEMORY_MCP_TEST_HANG_CALL_MARKER;
+const exitCallValue = process.env.IMCODES_MEMORY_MCP_TEST_EXIT_CALL_VALUE;
+const replyLog = process.env.IMCODES_MEMORY_MCP_TEST_REPLY_LOG;
 let readyCrashScheduled = false;
+
+if (process.env.IMCODES_MEMORY_MCP_TEST_IGNORE_SIGTERM === '1') {
+  process.on('SIGTERM', () => {});
+}
 
 const tools = [{
   name: 'fixture_echo',
@@ -46,18 +52,26 @@ lines.on('line', (line) => {
     return;
   }
   if (message.method === 'tools/call') {
+    const value = message.params?.arguments?.value;
+    if (exitCallValue && value === exitCallValue) {
+      process.exit(23);
+      return;
+    }
     if (hangCallMarker && !existsSync(hangCallMarker)) {
       writeFileSync(hangCallMarker, 'hung-once');
       return;
     }
-    const reply = () => process.stdout.write(`${JSON.stringify({
-      jsonrpc: '2.0',
-      id: message.id,
-      result: {
-        content: [{ type: 'text', text: String(message.params?.arguments?.value ?? '') }],
-        structuredContent: { echoed: message.params?.arguments?.value ?? null },
-      },
-    })}\n`);
+    const reply = () => {
+      if (replyLog) appendFileSync(replyLog, `${String(message.id)}\n`);
+      process.stdout.write(`${JSON.stringify({
+        jsonrpc: '2.0',
+        id: message.id,
+        result: {
+          content: [{ type: 'text', text: String(message.params?.arguments?.value ?? '') }],
+          structuredContent: { echoed: message.params?.arguments?.value ?? null },
+        },
+      })}\n`);
+    };
     const callDelayMs = Number(message.params?.arguments?.delayMs ?? 0);
     if (Number.isSafeInteger(callDelayMs) && callDelayMs > 0) setTimeout(reply, callDelayMs);
     else reply();

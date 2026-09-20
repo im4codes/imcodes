@@ -17,6 +17,7 @@ const {
   discoverLatestOpenCodeSessionIdMock, opencodeStartWatchingMock, opencodeIsWatchingMock,
   newSessionMock, timelineEmitMock, getSessionMock, respawnPaneMock,
   releaseSessionChildResourcesMock, registerTmuxSessionResourceMock,
+  initializeSessionResourceLifecycleMock,
 } = vi.hoisted(() => ({
   storeMock: vi.fn(),
   tmuxListMock: vi.fn().mockResolvedValue(['deck_Cd_brain', 'deck_sub_5907196l']),
@@ -36,6 +37,7 @@ const {
   respawnPaneMock: vi.fn().mockResolvedValue(undefined),
   releaseSessionChildResourcesMock: vi.fn().mockResolvedValue({ released: 0, failed: 0 }),
   registerTmuxSessionResourceMock: vi.fn().mockResolvedValue(undefined),
+  initializeSessionResourceLifecycleMock: vi.fn().mockResolvedValue({ released: 0, failed: 0, preserved: 0 }),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -115,7 +117,7 @@ vi.mock('../../src/agent/brain-dispatcher.js', () => ({
 }));
 
 vi.mock('../../src/daemon/session-resource-service.js', () => ({
-  initializeSessionResourceLifecycle: vi.fn().mockResolvedValue({ released: 0, failed: 0, preserved: 0 }),
+  initializeSessionResourceLifecycle: initializeSessionResourceLifecycleMock,
   registerTmuxSessionResource: registerTmuxSessionResourceMock,
   releaseSessionChildResources: releaseSessionChildResourcesMock,
   releaseSessionResources: vi.fn().mockResolvedValue({ released: 0, failed: 0 }),
@@ -125,7 +127,7 @@ vi.mock('../../src/daemon/session-resource-service.js', () => ({
   }),
 }));
 
-import { restoreFromStore, restartSession, respawnSession, setSessionEventCallback } from '../../src/agent/session-manager.js';
+import { initOnStartup, restoreFromStore, restartSession, respawnSession, setSessionEventCallback } from '../../src/agent/session-manager.js';
 import { startWatching, startWatchingFile } from '../../src/daemon/jsonl-watcher.js';
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -144,6 +146,31 @@ describe('restoreFromStore — sub-session JSONL watcher regression', () => {
     getSessionMock.mockReturnValue(null);
     respawnPaneMock.mockResolvedValue(undefined);
     releaseSessionChildResourcesMock.mockResolvedValue({ released: 0, failed: 0 });
+    initializeSessionResourceLifecycleMock.mockResolvedValue({ released: 0, failed: 0, preserved: 0 });
+  });
+
+  it('gives the daemon startup sweep a live session-store provider for orphan authority', async () => {
+    const initial = [{
+      name: 'deck_resource_brain',
+      agentType: 'shell',
+      runtimeType: 'process',
+      projectName: 'resource',
+      projectDir: '/proj',
+      role: 'brain',
+      state: 'running',
+    }];
+    const refreshed = [{ ...initial[0], state: 'stopped' }];
+    storeMock.mockReturnValue(initial);
+
+    await initOnStartup();
+
+    expect(initializeSessionResourceLifecycleMock).toHaveBeenCalledOnce();
+    const [, options] = initializeSessionResourceLifecycleMock.mock.calls[0]!;
+    expect(options).toEqual(expect.objectContaining({
+      listSessionsForOrphanSweep: expect.any(Function),
+    }));
+    storeMock.mockReturnValue(refreshed);
+    expect(options.listSessionsForOrphanSweep()).toBe(refreshed);
   });
 
   it('does NOT call startWatching for deck_sub_* sessions (prevents JSONL file stealing)', async () => {
