@@ -8442,6 +8442,46 @@ describe('SupervisionTaskRegistry', () => {
     });
   });
 
+  it('keeps failed provisioning evidence on busy FIFO fallback and recommends opt-in auto-provisioning', async () => {
+    const brain = session('deck_alpha_brain');
+    const worker = session('deck_alpha_busy_worker');
+    worker.state = 'running';
+    const sessions = [brain, worker];
+    const evidence = { selectedPool: 'audit' as const, failureReason: 'max_spawned' as const };
+    const dispatchMessage = vi.fn(async () => 'queued' as const);
+    const ensureSupervisionAssignmentWorktree = vi.fn(async (input: { assignmentId: string }) => ({
+      ok: true as const,
+      worktreePath: `/worktrees/${input.assignmentId}/repo`,
+      baseRevision: 'f'.repeat(40),
+      created: true,
+    }));
+
+    const sent = await dispatchSendMessage(
+      { userId: 'u', sessionName: brain.name, projectName: 'alpha', projectRoot: '/work/alpha' },
+      {
+        target: worker.name,
+        message: 'queue only after bounded provisioning refusal',
+        idempotencyKey: 'busy-fallback-evidence',
+        newWorkload: true,
+        internalProvisioningAttempt: evidence,
+        task: { objective: 'busy explicit target remains exact' },
+      },
+      { listSessions: () => sessions, dispatchMessage, exactTargetOnly: true, ensureSupervisionAssignmentWorktree },
+    );
+
+    expect(sent).toMatchObject({
+      status: 'accepted',
+      autoProvisionRecommended: true,
+      provisioning: evidence,
+      deliveries: [{ target: worker.name, status: 'queued' }],
+    });
+    if (sent.status !== 'accepted' || !sent.assignmentId) throw new Error('expected busy fallback assignment');
+    expect(getSupervisionTaskRegistry().getAssignment(sent.assignmentId)).toMatchObject({
+      identity: { sessionName: worker.name },
+      provisioning: evidence,
+    });
+  });
+
   it('does not dispatch a missing-worktree assignment and retries the same object after recovery', async () => {
     const brain = session('deck_alpha_brain');
     const worker = session('deck_alpha_w1');

@@ -1,6 +1,7 @@
 import path from 'path';
 import { buildAuditSeverityPolicyLines, type AuditSeverity } from '../../shared/audit-convergence.js';
 import logger from '../util/logger.js';
+import { timelineEmitter } from './timeline-emitter.js';
 import { existsSync } from 'node:fs';
 import {
   deriveSupervisionTaskTitle,
@@ -357,6 +358,8 @@ export interface SendMessageInput {
    * so authority revoked after dispatch planning mints nothing.
    */
   internalAuditValidationAuthority?: string;
+  /** Daemon-only evidence from an auto-provision refusal before busy-FIFO fallback. */
+  internalProvisioningAttempt?: SupervisionProvisioningEvidence;
 }
 
 export interface SendMessageDelivery {
@@ -397,6 +400,8 @@ export type SendMessageResult =
       auditRoutingReason?: SupervisionAuditRoutingReason;
       auditDegradedReason?: SupervisionAuditDegradedReason;
       provisioning?: SupervisionProvisioningEvidence;
+      /** Explicit busy targets are never redirected; callers can opt into a new worker on retry. */
+      autoProvisionRecommended?: true;
       /**
        * Present ONLY for a control-plane operation that carries task authority
        * without delivering a message. `deliveries` is empty in that case and no
@@ -1395,7 +1400,7 @@ export async function dispatchSendMessage(
   }
 
   let resolvedInput = input;
-  let provisioning: SupervisionProvisioningEvidence | undefined;
+  let provisioning: SupervisionProvisioningEvidence | undefined = input.internalProvisioningAttempt;
   let auditRoutingReason: SupervisionAuditRoutingReason | undefined;
   let auditDegradedReason: SupervisionAuditDegradedReason | undefined;
   if (autoProvision) {
@@ -2732,6 +2737,13 @@ export async function dispatchSendMessage(
     ...(auditRoutingReason ? { auditRoutingReason } : {}),
     ...(auditDegradedReason ? { auditDegradedReason } : {}),
     ...(provisioning ? { provisioning } : {}),
+    ...(!autoProvision
+      && Boolean(input.target)
+      && Boolean(input.task)
+      && !input.task?.taskId
+      && successful.some((delivery) => delivery.status === 'queued')
+      ? { autoProvisionRecommended: true as const }
+      : {}),
     ...(failed > 0 ? { partial: true } : {}),
   };
   if (automaticAuditRoutingRecoveryClear) {
@@ -3027,6 +3039,14 @@ export interface ReadyAuditDispatchDeps {
   ensureIntegrationWorktree?: typeof defaultEnsureSupervisionAssignmentWorktree;
   /** Test seam; production always applies through the verified bundle helper. */
   applyIntegrationBundle?: typeof applySupervisionIntegrationBundle;
+  /** Test seam for one bounded visible note about an auto-provision refusal. */
+  recordProvisioningTelemetry?: (input: {
+    brainSessionName: string;
+    taskId: string;
+    revision: string;
+    attemptId: string;
+    evidence: SupervisionProvisioningEvidence;
+  }) => void | Promise<void>;
 }
 
 function automaticAuditAttemptId(taskId: string, revision: string): string {
@@ -3493,6 +3513,7 @@ function eligibleAutomaticAuditTransportTargets(
 }
 
 const AUTOMATIC_AUDIT_BUSY_FALLBACK_REASONS = new Set<SupervisionProvisionFailureReason>([
+  'max_concurrency',
   'max_spawned',
   'cooldown',
   'launch_failed',
@@ -3503,6 +3524,32 @@ function mayFallbackToBusyAfterProvision(result: SendMessageResult): boolean {
   return result.status === 'error'
     && Boolean(result.provisioning?.failureReason)
     && AUTOMATIC_AUDIT_BUSY_FALLBACK_REASONS.has(result.provisioning!.failureReason!);
+}
+
+function recordAutomaticAuditProvisioningTelemetry(input: {
+  brainSessionName: string;
+  taskId: string;
+  revision: string;
+  attemptId: string;
+  evidence: SupervisionProvisioningEvidence;
+}): void {
+  const reason = input.evidence.failureReason ?? 'unknown';
+  timelineEmitter.emit(
+    input.brainSessionName,
+    'assistant.text',
+    {
+      text: `Automatic audit worker provisioning was refused (${reason}); using the bounded busy-session FIFO fallback.`,
+      streaming: false,
+      automation: true,
+      automationKind: 'supervision-provisioning',
+      memoryExcluded: true,
+    },
+    {
+      source: 'daemon',
+      confidence: 'high',
+      eventId: `supervision-provisioning:${input.taskId}:${input.revision}:${input.attemptId}:${reason}`,
+    },
+  );
 }
 
 function boundedAuditBrief(
@@ -4091,7 +4138,11 @@ export async function dispatchReadyAudit(
     projectName: task.projectName,
     projectRoot: brain.projectDir,
   };
-  const buildInput = (target?: string, autoProvision = false): SendMessageInput => {
+  const buildInput = (
+    target?: string,
+    autoProvision = false,
+    provisioningAttempt?: SupervisionProvisioningEvidence,
+  ): SendMessageInput => {
     const exactTarget = target ? sessions.find((session) => session.name === target) : undefined;
     const selectedBinding = exactTarget
       ? resolveSelectedSupervisionExecutionBinding(task.projectName, sessions, exactTarget, 'primary')
@@ -4110,6 +4161,7 @@ export async function dispatchReadyAudit(
     automaticSupervision: true,
     ...(recoveredExistingMessageId ? { internalMessageId: recoveredExistingMessageId } : {}),
     internalDurableQueue: true,
+    ...(provisioningAttempt ? { internalProvisioningAttempt: provisioningAttempt } : {}),
     internalAuditValidationAuthority: validationAuthority,
     audit: {
       kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
@@ -4151,7 +4203,17 @@ export async function dispatchReadyAudit(
   // concrete capacity/cooldown/launch/readiness refusal from that attempt.
   let result = await dispatch(caller, buildInput(directTarget, !directTarget));
   if (!directTarget && candidates.busy && mayFallbackToBusyAfterProvision(result)) {
-    result = await dispatch(caller, buildInput(candidates.busy));
+    const provisioningAttempt = result.status === 'error' ? result.provisioning : undefined;
+    if (provisioningAttempt) {
+      await (deps.recordProvisioningTelemetry ?? recordAutomaticAuditProvisioningTelemetry)({
+        brainSessionName: brain.name,
+        taskId: task.taskId,
+        revision,
+        attemptId,
+        evidence: provisioningAttempt,
+      });
+    }
+    result = await dispatch(caller, buildInput(candidates.busy, false, provisioningAttempt));
   }
   if (existingAudit && result.status === 'error'
     && result.error.includes('task execution pool rejected target: unselected_config')) {

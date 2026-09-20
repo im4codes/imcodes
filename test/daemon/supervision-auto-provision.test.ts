@@ -10,10 +10,13 @@ import {
 } from '../../shared/delegation-availability.js';
 import {
   clearSupervisionAutoProvisionStateForTests,
+  defaultCountActiveSupervisionAssignments,
+  defaultHasActiveSupervisionLease,
   provisionSupervisionTarget,
   type SupervisionAutoProvisionDeps,
   type SupervisionAutoProvisionRequest,
 } from '../../src/daemon/supervision-auto-provision.js';
+import { SupervisionTaskRegistry } from '../../src/daemon/supervision-state-store.js';
 import type { SubSessionRecord } from '../../src/daemon/subsession-manager.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
 import {
@@ -106,17 +109,26 @@ function harness(initial: SessionRecord[], override: Partial<SupervisionAutoProv
       projectDir: sub.cwd ?? '/repo',
     }));
   });
+  const stop = vi.fn(async (sessionName: string) => {
+    const index = sessions.findIndex((candidate) => candidate.name === sessionName);
+    if (index < 0) return false;
+    sessions.splice(index, 1);
+    return true;
+  });
   const deps: SupervisionAutoProvisionDeps = {
     now: () => NOW,
     listSessions: () => [...sessions],
     getSession: (name) => sessions.find((candidate) => candidate.name === name),
     startSubSession: start,
+    stopSubSession: stop,
+    hasActiveSupervisionLease: () => false,
+    countActiveSupervisionAssignments: () => 0,
     wait: async () => {},
     readyTimeoutMs: 1,
     cooldownMs: 1,
     ...override,
   };
-  return { sessions, start, deps };
+  return { sessions, start, stop, deps };
 }
 
 function request(patch: Partial<SupervisionAutoProvisionRequest> = {}): SupervisionAutoProvisionRequest {
@@ -126,6 +138,64 @@ function request(patch: Partial<SupervisionAutoProvisionRequest> = {}): Supervis
     idempotencyKey: 'task-1',
     ...patch,
   };
+}
+
+function seedPagedRegistry(input: {
+  registry: SupervisionTaskRegistry;
+  taskCount: number;
+  leasedTaskIndexes: readonly number[];
+  cancelledTaskIndexes?: readonly number[];
+  sessionName: string;
+  pool?: 'primary' | 'economy';
+}): void {
+  const pool = input.pool ?? 'primary';
+  for (let index = 0; index < input.taskCount; index += 1) {
+    const suffix = String(index).padStart(4, '0');
+    const taskId = `tsk_page_${suffix}`;
+    expect(input.registry.createOrGet({
+      taskId,
+      projectName: 'proj',
+      classification: 'independent_top_level',
+      objective: `page ${suffix}`,
+      currentRevision: 'rev-page',
+      now: index + 1,
+    })).toMatchObject({ ok: true });
+    if (!input.leasedTaskIndexes.includes(index)) continue;
+    const identity = {
+      sessionName: input.sessionName,
+      sessionInstanceId: `instance-${input.sessionName}`,
+      runtimeEpoch: `epoch-${input.sessionName}`,
+      agentType: OPENAI.agentType,
+      providerFamily: OPENAI.providerFamily,
+    };
+    expect(input.registry.createAssignment({
+      assignmentId: `asg_page_${suffix}`,
+      taskId,
+      role: 'implementer',
+      identity,
+      auditRevision: 'rev-page',
+      executionBinding: {
+        pool,
+        requested: OPENAI,
+        actual: {
+          sessionName: input.sessionName,
+          sessionInstanceId: `instance-${input.sessionName}`,
+          runtimeEpoch: `epoch-${input.sessionName}`,
+          ...OPENAI,
+        },
+        origin: 'reused',
+      },
+      now: index + 1,
+    })).toMatchObject({ ok: true });
+    if (input.cancelledTaskIndexes?.includes(index)) {
+      expect(input.registry.updateAssignment({
+        assignmentId: `asg_page_${suffix}`,
+        identity,
+        status: 'cancelled',
+        now: input.taskCount + index + 1,
+      })).toMatchObject({ ok: true });
+    }
+  }
 }
 
 describe('supervision auto provisioning', () => {
@@ -529,6 +599,215 @@ describe('supervision auto provisioning', () => {
       .resolves.toMatchObject({ ok: false, reason: 'launch_failed' });
     await expect(provisionSupervisionTarget(request({ idempotencyKey: 'cooldown-retry' }), cooled.deps))
       .resolves.toMatchObject({ ok: false, reason: 'cooldown' });
+  });
+
+  it('counts audit-labelled automatic children against the primary pool spawn budget', async () => {
+    const brain = parent([OPENAI]);
+    const supervision = brain.transportConfig?.[SUPERVISION_TRANSPORT_CONFIG_KEY] as {
+      executionPools: { primaryDevelopmentPool: { controls: { maxSpawned: number } } };
+    };
+    supervision.executionPools.primaryDevelopmentPool.controls.maxSpawned = 1;
+    const existingAuditChild = session('deck_sub_sup_auto_audit_child', {
+      parentSession: brain.name,
+      label: 'Auto audit',
+      state: 'running',
+    });
+    const h = harness([brain, existingAuditChild]);
+
+    await expect(provisionSupervisionTarget(request({ idempotencyKey: 'primary-after-audit' }), h.deps))
+      .resolves.toMatchObject({ ok: false, reason: 'max_spawned' });
+    expect(h.start).not.toHaveBeenCalled();
+  });
+
+  it('refuses a new worker when the configured assignment concurrency is already full', async () => {
+    const brain = parent([OPENAI]);
+    const supervision = brain.transportConfig?.[SUPERVISION_TRANSPORT_CONFIG_KEY] as {
+      executionPools: { primaryDevelopmentPool: { controls: { maxConcurrency: number } } };
+    };
+    supervision.executionPools.primaryDevelopmentPool.controls.maxConcurrency = 1;
+    const h = harness([brain], { countActiveSupervisionAssignments: () => 1 });
+
+    await expect(provisionSupervisionTarget(request({ idempotencyKey: 'concurrency-full' }), h.deps))
+      .resolves.toMatchObject({ ok: false, reason: 'max_concurrency' });
+    expect(h.start).not.toHaveBeenCalled();
+  });
+
+  it('uses the default real-registry counter across the clamped 101/102 task page boundary', async () => {
+    const registry = new SupervisionTaskRegistry({ dbPath: ':memory:' });
+    try {
+      const brain = parent([OPENAI]);
+      // Three leases are visible in the first 101-row page. The fourth is on
+      // row 102, so the old `page.length === 200` continuation silently
+      // returned 3 and allowed a fifth concurrent worker.
+      seedPagedRegistry({
+        registry,
+        taskCount: 102,
+        leasedTaskIndexes: [98, 99, 100, 101],
+        sessionName: 'deck_sub_page_active',
+      });
+      await expect(defaultCountActiveSupervisionAssignments(brain, 'primary', registry)).resolves.toBe(4);
+      const h = harness([brain], {
+        countActiveSupervisionAssignments: (candidate, pool) => (
+          defaultCountActiveSupervisionAssignments(candidate, pool, registry)
+        ),
+      });
+
+      await expect(provisionSupervisionTarget(request({ idempotencyKey: 'paged-concurrency-full' }), h.deps))
+        .resolves.toMatchObject({ ok: false, reason: 'max_concurrency' });
+      expect(h.start).not.toHaveBeenCalled();
+    } finally {
+      registry.close();
+    }
+  });
+
+  it('reaps at most one stale idle automatic child, but never one with an active lease', async () => {
+    const brain = parent([OPENAI]);
+    const stale = session('deck_sub_sup_auto_stale', {
+      parentSession: brain.name,
+      label: 'Auto audit',
+      state: 'idle',
+      agentType: 'claude-code-sdk',
+      providerId: 'anthropic',
+      activeModel: 'opus',
+      updatedAt: NOW - 31 * 60_000,
+    });
+    const leased = session('deck_sub_sup_auto_leased', {
+      parentSession: brain.name,
+      label: 'Auto primary',
+      state: 'idle',
+      agentType: 'claude-code-sdk',
+      providerId: 'anthropic',
+      activeModel: 'opus',
+      updatedAt: NOW - 32 * 60_000,
+    });
+    const h = harness([brain, stale, leased], {
+      hasActiveSupervisionLease: (sessionName) => sessionName === leased.name,
+    });
+
+    await expect(provisionSupervisionTarget(request({ idempotencyKey: 'reap-one' }), h.deps))
+      .resolves.toMatchObject({ ok: true });
+    expect(h.stop).toHaveBeenCalledTimes(1);
+    expect(h.stop).toHaveBeenCalledWith(stale.name);
+    expect(h.sessions.some((candidate) => candidate.name === leased.name)).toBe(true);
+  });
+
+  it('reaps at most one stale unleased child per provisioning attempt', async () => {
+    const brain = parent([OPENAI]);
+    const staleA = session('deck_sub_sup_auto_stale_a', {
+      parentSession: brain.name,
+      label: 'Auto audit',
+      state: 'idle',
+      agentType: 'claude-code-sdk',
+      providerId: 'anthropic',
+      activeModel: 'opus',
+      updatedAt: NOW - 32 * 60_000,
+    });
+    const staleB = session('deck_sub_sup_auto_stale_b', {
+      parentSession: brain.name,
+      label: 'Auto primary',
+      state: 'idle',
+      agentType: 'claude-code-sdk',
+      providerId: 'anthropic',
+      activeModel: 'opus',
+      updatedAt: NOW - 31 * 60_000,
+    });
+    const h = harness([brain, staleA, staleB]);
+
+    await expect(provisionSupervisionTarget(request({ idempotencyKey: 'reap-one-of-two' }), h.deps))
+      .resolves.toMatchObject({ ok: true });
+    expect(h.stop).toHaveBeenCalledTimes(1);
+    expect(h.stop).toHaveBeenCalledWith(staleA.name);
+    expect(h.sessions.some((candidate) => candidate.name === staleB.name)).toBe(true);
+  });
+
+  it('never reaps a recently idle automatic child before the idle-age cutoff', async () => {
+    const brain = parent([OPENAI]);
+    const recent = session('deck_sub_sup_auto_recent', {
+      parentSession: brain.name,
+      label: 'Auto audit',
+      state: 'idle',
+      agentType: 'claude-code-sdk',
+      providerId: 'anthropic',
+      activeModel: 'opus',
+      updatedAt: NOW - 29 * 60_000,
+    });
+    const running = session('deck_sub_sup_auto_recent_capacity_peer', {
+      parentSession: brain.name,
+      label: 'Auto primary',
+      state: 'running',
+      agentType: 'claude-code-sdk',
+      providerId: 'anthropic',
+      activeModel: 'opus',
+    });
+    const h = harness([brain, recent, running]);
+
+    await expect(provisionSupervisionTarget(request({ idempotencyKey: 'keep-recent-idle' }), h.deps))
+      .resolves.toMatchObject({ ok: false, reason: 'max_spawned' });
+    expect(h.stop).not.toHaveBeenCalled();
+    expect(h.sessions.some((candidate) => candidate.name === recent.name)).toBe(true);
+  });
+
+  it('uses the default real-registry lease fence beyond the first 101 tasks before reaping', async () => {
+    const registry = new SupervisionTaskRegistry({ dbPath: ':memory:' });
+    try {
+      const brain = parent([OPENAI]);
+      const leased = session('deck_sub_sup_auto_paged_lease', {
+        parentSession: brain.name,
+        label: 'Auto primary',
+        state: 'idle',
+        agentType: 'claude-code-sdk',
+        providerId: 'anthropic',
+        activeModel: 'opus',
+        updatedAt: NOW - 32 * 60_000,
+      });
+      const running = session('deck_sub_sup_auto_capacity_peer', {
+        parentSession: brain.name,
+        label: 'Auto audit',
+        state: 'running',
+        agentType: 'claude-code-sdk',
+        providerId: 'anthropic',
+        activeModel: 'opus',
+      });
+      seedPagedRegistry({
+        registry,
+        taskCount: 102,
+        // The owner filter itself must also cross the registry page boundary:
+        // 101 historical terminal assignments precede the one live lease.
+        leasedTaskIndexes: Array.from({ length: 102 }, (_, index) => index),
+        cancelledTaskIndexes: Array.from({ length: 101 }, (_, index) => index),
+        sessionName: leased.name,
+      });
+      await expect(defaultHasActiveSupervisionLease(leased.name, registry)).resolves.toBe(true);
+      const h = harness([brain, leased, running], {
+        hasActiveSupervisionLease: (sessionName) => defaultHasActiveSupervisionLease(sessionName, registry),
+      });
+
+      await expect(provisionSupervisionTarget(request({ idempotencyKey: 'paged-lease-fence' }), h.deps))
+        .resolves.toMatchObject({ ok: false, reason: 'max_spawned' });
+      expect(h.stop).not.toHaveBeenCalled();
+      expect(h.sessions.some((candidate) => candidate.name === leased.name)).toBe(true);
+    } finally {
+      registry.close();
+    }
+  });
+
+  it('reuses a ready automatic child before considering idle reaping', async () => {
+    const brain = parent([OPENAI]);
+    const ready = session('deck_sub_sup_auto_ready', {
+      parentSession: brain.name,
+      label: 'Auto audit',
+      state: 'idle',
+      updatedAt: NOW - 31 * 60_000,
+    });
+    const h = harness([brain, ready]);
+
+    await expect(provisionSupervisionTarget(request(), h.deps)).resolves.toMatchObject({
+      ok: true,
+      target: { name: ready.name },
+      evidence: { origin: 'reused' },
+    });
+    expect(h.stop).not.toHaveBeenCalled();
+    expect(h.start).not.toHaveBeenCalled();
   });
 
   it('reuses its deterministic session after an in-memory restart instead of spawning twice', async () => {

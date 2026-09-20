@@ -43,6 +43,7 @@ export const SUPERVISION_PROVISION_FAILURE_REASONS = [
   'unsupported_config',
   'provider_limited',
   'provider_offline',
+  'max_concurrency',
   'max_spawned',
   'cooldown',
   'launch_failed',

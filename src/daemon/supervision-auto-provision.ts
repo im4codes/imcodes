@@ -18,25 +18,31 @@ import {
 } from '../../shared/supervision-execution-pool.js';
 import { resolvePeerAuditProviderFamily as resolveSharedPeerAuditProviderFamily } from '../../shared/peer-audit.js';
 import {
+  SUPERVISION_TASK_HOUSEKEEPING_MAX_BATCH_SIZE,
   SUPERVISION_TRANSPORT_CONFIG_KEY,
   extractSessionSupervisionSnapshot,
   isAutomaticSupervisionEnabled,
+  isTerminalSupervisionTaskStatus,
 } from '../../shared/supervision-config.js';
 import type { SessionRecord } from '../store/session-store.js';
 import { getSession, listSessions } from '../store/session-store.js';
 import { resolvePeerAuditProviderFamily } from './peer-audit-candidates.js';
 import { delegationTargetInputs } from './delegation-admission.js';
-import { startSubSession, type SubSessionRecord } from './subsession-manager.js';
+import { startSubSession, stopSubSession, type SubSessionRecord } from './subsession-manager.js';
 import logger from '../util/logger.js';
 import {
   SESSION_IDENTITY_SCOPES,
   renderSessionIdentityProfileSection,
 } from '../../shared/session-identity.js';
+import type { SupervisionTaskRegistry } from './supervision-state-store.js';
 
 const AUTO_SESSION_ID_PREFIX = 'sup_auto_';
 export const SUPERVISION_AUTO_PROVISION_COOLDOWN_MS = 30_000;
 export const SUPERVISION_AUTO_PROVISION_READY_TIMEOUT_MS = 15_000;
+export const SUPERVISION_AUTO_PROVISION_IDLE_REAP_MS = 30 * 60_000;
+export const SUPERVISION_AUTO_PROVISION_MAX_REAPS_PER_ATTEMPT = 1;
 const SUPERVISION_AUTO_PROVISION_POLL_MS = 50;
+const SUPERVISION_AUTO_PROVISION_REGISTRY_PAGE_SIZE = SUPERVISION_TASK_HOUSEKEEPING_MAX_BATCH_SIZE + 1;
 
 export interface SupervisionAutoProvisionRequest {
   parentSessionName: string;
@@ -77,9 +83,16 @@ export interface SupervisionAutoProvisionDeps {
   listSessions?: () => SessionRecord[];
   getSession?: (name: string) => SessionRecord | undefined;
   startSubSession?: (sub: SubSessionRecord) => Promise<void>;
+  stopSubSession?: (sessionName: string) => Promise<boolean>;
+  hasActiveSupervisionLease?: (sessionName: string) => boolean | Promise<boolean>;
+  countActiveSupervisionAssignments?: (
+    parent: SessionRecord,
+    pool: SupervisionAutoProvisionRequest['pool'],
+  ) => number | Promise<number>;
   wait?: (ms: number) => Promise<void>;
   readyTimeoutMs?: number;
   cooldownMs?: number;
+  idleReapMs?: number;
 }
 
 const inFlight = new Map<string, Promise<SupervisionAutoProvisionResult>>();
@@ -248,11 +261,109 @@ function failureEvidence(
   return { selectedPool: pool, ...(config ? { selectedConfig: config } : {}), failureReason: reason, ...extra };
 }
 
+function isAutomaticChildOf(parent: SessionRecord, session: SessionRecord): boolean {
+  return session.parentSession === parent.name
+    && session.name.startsWith(`deck_sub_${AUTO_SESSION_ID_PREFIX}`);
+}
+
+/** Audit workers consume the primary development pool even though their label
+ * is `Auto audit`. Labels are presentation, never capacity authority. */
+function childConsumesPool(
+  parent: SessionRecord,
+  session: SessionRecord,
+  pool: SupervisionAutoProvisionRequest['pool'],
+): boolean {
+  if (!isAutomaticChildOf(parent, session)) return false;
+  return pool === 'economy' ? session.label === 'Auto economy' : session.label !== 'Auto economy';
+}
+
+export async function defaultHasActiveSupervisionLease(
+  sessionName: string,
+  registryOverride?: Pick<SupervisionTaskRegistry, 'list'>,
+): Promise<boolean> {
+  const registry = registryOverride
+    ?? (await import('./supervision-state-store.js')).getSupervisionTaskRegistry();
+  let cursor: string | undefined;
+  do {
+    const page = registry.list({
+      ownerSessionName: sessionName,
+      includeArchived: true,
+      cursor,
+      limit: SUPERVISION_AUTO_PROVISION_REGISTRY_PAGE_SIZE,
+    });
+    for (const task of page) {
+      if (task.assignments.some((assignment) => (
+        assignment.identity.sessionName === sessionName
+        && Boolean(assignment.leaseId)
+        && !isTerminalSupervisionTaskStatus(assignment.status)
+      ))) return true;
+    }
+    cursor = page.length === SUPERVISION_AUTO_PROVISION_REGISTRY_PAGE_SIZE
+      ? page[page.length - 1]?.taskId
+      : undefined;
+  } while (cursor);
+  return false;
+}
+
+export async function defaultCountActiveSupervisionAssignments(
+  parent: SessionRecord,
+  pool: SupervisionAutoProvisionRequest['pool'],
+  registryOverride?: Pick<SupervisionTaskRegistry, 'list'>,
+): Promise<number> {
+  const registry = registryOverride
+    ?? (await import('./supervision-state-store.js')).getSupervisionTaskRegistry();
+  const assignmentIds = new Set<string>();
+  let cursor: string | undefined;
+  do {
+    const page = registry.list({
+      projectName: parent.projectName,
+      includeArchived: true,
+      cursor,
+      limit: SUPERVISION_AUTO_PROVISION_REGISTRY_PAGE_SIZE,
+    });
+    for (const task of page) {
+      for (const assignment of task.assignments) {
+        if (assignment.executionBinding?.pool === pool
+          && Boolean(assignment.leaseId)
+          && !isTerminalSupervisionTaskStatus(assignment.status)) {
+          assignmentIds.add(assignment.assignmentId);
+        }
+      }
+    }
+    cursor = page.length === SUPERVISION_AUTO_PROVISION_REGISTRY_PAGE_SIZE
+      ? page[page.length - 1]?.taskId
+      : undefined;
+  } while (cursor);
+  return assignmentIds.size;
+}
+
+async function reapOneIdleAutomaticChild(
+  parent: SessionRecord,
+  request: SupervisionAutoProvisionRequest,
+  deps: Required<Pick<SupervisionAutoProvisionDeps,
+    'now' | 'listSessions' | 'stopSubSession' | 'hasActiveSupervisionLease' | 'idleReapMs'>>,
+): Promise<void> {
+  const cutoff = deps.now() - deps.idleReapMs;
+  const candidates = deps.listSessions()
+    .filter((session) => childConsumesPool(parent, session, request.pool)
+      && session.state === 'idle'
+      && session.updatedAt <= cutoff)
+    .sort((a, b) => a.updatedAt - b.updatedAt || a.name.localeCompare(b.name));
+  let reaped = 0;
+  for (const candidate of candidates) {
+    if (await deps.hasActiveSupervisionLease(candidate.name)) continue;
+    if (await deps.stopSubSession(candidate.name)) reaped += 1;
+    if (reaped >= SUPERVISION_AUTO_PROVISION_MAX_REAPS_PER_ATTEMPT) break;
+  }
+}
+
 async function provisionConfig(
   parent: SessionRecord,
   request: SupervisionAutoProvisionRequest,
   config: SupervisionExecutionConfig,
-  deps: Required<Pick<SupervisionAutoProvisionDeps, 'now' | 'listSessions' | 'getSession' | 'startSubSession' | 'wait' | 'readyTimeoutMs' | 'cooldownMs'>>,
+  deps: Required<Pick<SupervisionAutoProvisionDeps, 'now' | 'listSessions' | 'getSession' | 'startSubSession'
+    | 'stopSubSession' | 'hasActiveSupervisionLease' | 'countActiveSupervisionAssignments'
+    | 'wait' | 'readyTimeoutMs' | 'cooldownMs' | 'idleReapMs'>>,
   selectedPool: SupervisionProvisionPool,
 ): Promise<SupervisionAutoProvisionResult> {
   const requestedIdentityHash = provisionedIdentityHash(request.identityPrompt) ?? '';
@@ -293,12 +404,19 @@ async function provisionConfig(
       };
     }
 
-    const spawnedCount = deps.listSessions().filter((session) => (
-      session.parentSession === parent.name
-      && session.name.startsWith(`deck_sub_${AUTO_SESSION_ID_PREFIX}`)
-      && session.label === `Auto ${selectedPool}`
+    let spawnedCount = deps.listSessions().filter((session) => (
+      childConsumesPool(parent, session, request.pool)
     )).length;
     const controls = definition?.controls ?? DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS[request.pool];
+    if (await deps.countActiveSupervisionAssignments(parent, request.pool) >= controls.maxConcurrency) {
+      return { ok: false, reason: 'max_concurrency', evidence: failureEvidence(selectedPool, 'max_concurrency', config) };
+    }
+    if (!existing && spawnedCount >= controls.maxSpawned) {
+      await reapOneIdleAutomaticChild(parent, request, deps);
+      spawnedCount = deps.listSessions().filter((session) => (
+        childConsumesPool(parent, session, request.pool)
+      )).length;
+    }
     if (!existing && spawnedCount >= controls.maxSpawned) {
       return { ok: false, reason: 'max_spawned', evidence: failureEvidence(selectedPool, 'max_spawned', config) };
     }
@@ -402,9 +520,16 @@ export async function provisionSupervisionTarget(
     listSessions: injected.listSessions ?? (() => listSessions()),
     getSession: injected.getSession ?? getSession,
     startSubSession: injected.startSubSession ?? startSubSession,
+    stopSubSession: injected.stopSubSession ?? (async (sessionName: string) => (
+      await stopSubSession(sessionName)
+    ).ok),
+    hasActiveSupervisionLease: injected.hasActiveSupervisionLease ?? defaultHasActiveSupervisionLease,
+    countActiveSupervisionAssignments: injected.countActiveSupervisionAssignments
+      ?? defaultCountActiveSupervisionAssignments,
     wait: injected.wait ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))),
     readyTimeoutMs: injected.readyTimeoutMs ?? SUPERVISION_AUTO_PROVISION_READY_TIMEOUT_MS,
     cooldownMs: injected.cooldownMs ?? SUPERVISION_AUTO_PROVISION_COOLDOWN_MS,
+    idleReapMs: injected.idleReapMs ?? SUPERVISION_AUTO_PROVISION_IDLE_REAP_MS,
   };
   const parent = deps.getSession(request.parentSessionName);
   const selectedPool: SupervisionProvisionPool = request.auditedSessionName ? 'audit' : request.pool;

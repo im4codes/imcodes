@@ -58,6 +58,7 @@ import {
   resetSupervisionTaskRegistryForTests,
   type PersistedSupervisionTaskAssignmentIdentity,
 } from '../../src/daemon/supervision-state-store.js';
+import { provisionSupervisionTarget } from '../../src/daemon/supervision-auto-provision.js';
 import {
   getTransportQueueStore,
   resetTransportQueueStoreForTests,
@@ -3024,6 +3025,92 @@ describe('automatic supervision audit materialization', () => {
     expect(dispatch).toHaveBeenCalledOnce();
   });
 
+  it('starts a configured worker through the real audit route when every eligible peer is busy', async () => {
+    const registry = getSupervisionTaskRegistry();
+    const { taskId } = makeReadyTask({ auditPolicy: 'auto_allow_degraded', registry });
+    const selected = {
+      agentType: 'claude-code-sdk', providerFamily: 'anthropic', runtimeType: 'transport' as const,
+      model: 'claude-sonnet-4-6', capabilityId: '',
+    };
+    selected.capabilityId = buildSupervisionExecutionCapabilityId(selected);
+    const brain = session('deck_alpha_brain', 'brain');
+    brain.transportConfig = {
+      supervision: normalizeSessionSupervisionSnapshot({
+        mode: 'supervised_audit',
+        executionPools: {
+          state: 'configured',
+          primaryDevelopmentPool: { configs: [selected], controls: { maxSpawned: 2 } },
+          economyTaskPool: { configs: [], controls: { maxSpawned: 0 } },
+        },
+      }),
+    };
+    const worker = session('deck_alpha_worker', 'w1');
+    const busy = session('deck_alpha_busy_auditor', 'w2', selected.agentType, selected.providerFamily);
+    busy.state = 'running';
+    let sessions = [brain, worker, busy];
+    const startSubSession = vi.fn(async (sub: {
+      id: string; type: string; runtimeType?: 'transport' | 'process'; requestedModel?: string;
+      parentSession?: string | null; label?: string | null; cwd?: string;
+    }) => {
+      const spawned = session(`deck_sub_${sub.id}`, 'w2', sub.type, 'anthropic');
+      spawned.parentSession = sub.parentSession ?? brain.name;
+      spawned.label = sub.label ?? undefined;
+      spawned.runtimeType = sub.runtimeType ?? 'transport';
+      spawned.requestedModel = sub.requestedModel;
+      spawned.activeModel = sub.requestedModel;
+      spawned.projectDir = sub.cwd ?? brain.projectDir;
+      sessions = [...sessions, spawned];
+    });
+    const dispatchMessage = vi.fn(async () => 'queued' as const);
+    const ensureSupervisionAssignmentWorktree = vi.fn(async (input: { assignmentId: string }) => ({
+      ok: true as const,
+      worktreePath: `/worktrees/${input.assignmentId}/repo`,
+      baseRevision: 'a'.repeat(40),
+      created: true,
+    }));
+    const dispatch = (caller: SendRuntimeCaller, input: SendMessageInput) => dispatchSendMessage(caller, input, {
+      listSessions: () => sessions,
+      provisionSupervisionTarget: (request) => provisionSupervisionTarget(request, {
+        now: () => 100,
+        listSessions: () => sessions,
+        getSession: (name) => sessions.find((candidate) => candidate.name === name),
+        startSubSession: startSubSession as never,
+        stopSubSession: async () => false,
+        hasActiveSupervisionLease: () => false,
+        wait: async () => {},
+        readyTimeoutMs: 1,
+        cooldownMs: 1,
+      }),
+      dispatchMessage,
+      ensureSupervisionAssignmentWorktree,
+    });
+
+    await expect(dispatchReadyAudit(taskId, {
+      registry,
+      listSessions: () => sessions,
+      listTargets: () => ({
+        status: 'ok', executionPoolsState: 'configured', appliedExecutionPool: 'primary',
+        items: [{
+          target: busy.name, label: busy.label ?? null, sessionName: busy.name, role: busy.role,
+          agentType: busy.agentType, status: 'busy', lastActiveAt: 2, providerFamily: 'anthropic',
+          availability: 'busy', eligiblePools: ['primary'], dispatchMode: 'queue_only',
+          limitGroup: 'claude', replyCapable: true,
+        }],
+      }),
+      dispatch,
+      hasDeliveryEvidence: () => false,
+    })).resolves.toMatchObject({ status: 'dispatched' });
+    expect(startSubSession).toHaveBeenCalledOnce();
+    expect(dispatchMessage).toHaveBeenCalledOnce();
+    expect(registry.listAssignments(taskId)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        role: 'auditor',
+        identity: expect.objectContaining({ sessionName: expect.stringMatching(/^deck_sub_sup_auto_/) }),
+        provisioning: expect.objectContaining({ origin: 'spawned' }),
+      }),
+    ]));
+  });
+
   it('delegates spawning to the existing exact provider/model/preset pool provisioner', async () => {
     const registry = getSupervisionTaskRegistry();
     const { taskId } = makeReadyTask({ auditPolicy: 'auto_allow_degraded', registry });
@@ -3136,6 +3223,7 @@ describe('automatic supervision audit materialization', () => {
           error: 'supervision target provisioning blocked: max_spawned',
           provisioning: { selectedPool: 'audit' as const, failureReason: 'max_spawned' as const },
         });
+    const recordProvisioningTelemetry = vi.fn();
     await expect(dispatchReadyAudit(taskId, {
       registry,
       listSessions: () => sessions,
@@ -3149,6 +3237,7 @@ describe('automatic supervision audit materialization', () => {
         }],
       }),
       dispatch,
+      recordProvisioningTelemetry,
       hasDeliveryEvidence: () => false,
     })).resolves.toMatchObject({ status: 'dispatched', assignmentId: 'assignment-busy-peer' });
     expect(dispatch).toHaveBeenNthCalledWith(1, expect.anything(), expect.objectContaining({
@@ -3157,7 +3246,13 @@ describe('automatic supervision audit materialization', () => {
     expect(dispatch.mock.calls[0]![1]).not.toHaveProperty('target');
     expect(dispatch).toHaveBeenNthCalledWith(2, expect.anything(), expect.objectContaining({
       target: 'deck_alpha_busy_peer',
+      internalProvisioningAttempt: expect.objectContaining({ failureReason: 'max_spawned' }),
       task: expect.not.objectContaining({ autoProvision: true }),
+    }));
+    expect(recordProvisioningTelemetry).toHaveBeenCalledOnce();
+    expect(recordProvisioningTelemetry).toHaveBeenCalledWith(expect.objectContaining({
+      taskId,
+      evidence: expect.objectContaining({ failureReason: 'max_spawned' }),
     }));
 
     const strict = makeReadyTask({ taskId: 'strict-busy-peer', auditPolicy: 'auto_strict_cross_vendor' });
@@ -3196,6 +3291,62 @@ describe('automatic supervision audit materialization', () => {
     expect(strictDispatch).toHaveBeenCalledTimes(2);
     expect(strictDispatch.mock.calls[1]![1]).toMatchObject({ target: 'deck_alpha_brain' });
     expect(strictDispatch.mock.calls[1]![1]).not.toHaveProperty('audit');
+  });
+
+  it('falls back to the busy FIFO once when auto-provision reaches max concurrency', async () => {
+    const { registry, taskId } = makeReadyTask({ auditPolicy: 'auto_allow_degraded' });
+    const sessions = [
+      session('deck_alpha_brain', 'brain'),
+      session('deck_alpha_worker', 'w1'),
+      session('deck_alpha_busy_peer', 'w2'),
+    ];
+    const evidence = { selectedPool: 'audit' as const, failureReason: 'max_concurrency' as const };
+    const dispatch = vi.fn(async (_caller: SendRuntimeCaller, input: SendMessageInput) => input.target
+      ? {
+          status: 'accepted' as const,
+          dispatchId: 'send_dispatch_00000000-0000-4000-8000-000000000002' as const,
+          messageId: 'send_message_00000000-0000-5000-a000-000000000002' as SendMessageId,
+          deliveries: [{ target: input.target, status: 'queued' as const }],
+          taskId,
+          assignmentId: 'assignment-busy-concurrency-peer',
+          provisioning: input.internalProvisioningAttempt,
+        }
+      : {
+          status: 'error' as const,
+          reason: 'validation_failed' as const,
+          error: 'supervision target provisioning blocked: max_concurrency',
+          provisioning: evidence,
+        });
+    const recordProvisioningTelemetry = vi.fn();
+
+    await expect(dispatchReadyAudit(taskId, {
+      registry,
+      listSessions: () => sessions,
+      listTargets: () => ({
+        status: 'ok', executionPoolsState: 'configured', appliedExecutionPool: 'primary',
+        items: [{
+          target: 'deck_alpha_busy_peer', label: null, sessionName: 'deck_alpha_busy_peer', role: 'w2',
+          agentType: 'codex-sdk', status: 'busy', lastActiveAt: 2, providerFamily: 'openai',
+          availability: 'busy', eligiblePools: ['primary'], dispatchMode: 'queue_only',
+          limitGroup: 'codex', replyCapable: true,
+        }],
+      }),
+      dispatch,
+      recordProvisioningTelemetry,
+      hasDeliveryEvidence: () => false,
+    })).resolves.toMatchObject({ status: 'dispatched', assignmentId: 'assignment-busy-concurrency-peer' });
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    expect(dispatch.mock.calls[0]![1]).toMatchObject({
+      task: expect.objectContaining({ autoProvision: true }),
+    });
+    expect(dispatch.mock.calls[0]![1]).not.toHaveProperty('target');
+    expect(dispatch.mock.calls[1]![1]).toMatchObject({
+      target: 'deck_alpha_busy_peer',
+      internalProvisioningAttempt: evidence,
+      task: expect.not.objectContaining({ autoProvision: true }),
+    });
+    expect(recordProvisioningTelemetry).toHaveBeenCalledOnce();
+    expect(recordProvisioningTelemetry).toHaveBeenCalledWith(expect.objectContaining({ taskId, evidence }));
   });
 
   it('ignores a preferred process candidate and selects the eligible transport target', async () => {
