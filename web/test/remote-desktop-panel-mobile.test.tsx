@@ -594,9 +594,9 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     const first = render(<RemoteDesktopPanel machine={machine('server-1')} onClose={vi.fn()} />);
     await act(async () => { await Promise.resolve(); });
     // Nothing saved yet: the default, and it is what the client is told.
-    expect(trigger(first).getAttribute('aria-label')).toContain('quality_short_smooth');
+    expect(trigger(first).getAttribute('aria-label')).toContain('quality_short_balanced');
     expect(setQualityPreference).toHaveBeenLastCalledWith(
-      { maxHeight: 1080, maxFps: 30, maxBitrateBps: 0, priority: 'framerate' },
+      { maxHeight: 1440, maxFps: 30, maxBitrateBps: 0, priority: 'balanced' },
       { latencyGuard: true },
     );
 
@@ -625,12 +625,13 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       { latencyGuard: true },
     );
 
-    // Another server keeps its own setting, even in the same panel.
+    // Another server keeps its own setting -- here the default -- even in
+    // the same panel.
     reopened.rerender(<RemoteDesktopPanel machine={machine('server-2')} onClose={vi.fn()} />);
     await act(async () => { await Promise.resolve(); });
-    expect(trigger(reopened).getAttribute('aria-label')).toContain('quality_short_smooth');
+    expect(trigger(reopened).getAttribute('aria-label')).toContain('quality_short_balanced');
     expect(setQualityPreference).toHaveBeenLastCalledWith(
-      { maxHeight: 1080, maxFps: 30, maxBitrateBps: 0, priority: 'framerate' },
+      { maxHeight: 1440, maxFps: 30, maxBitrateBps: 0, priority: 'balanced' },
       { latencyGuard: true },
     );
   });

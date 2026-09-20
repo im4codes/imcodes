@@ -361,7 +361,7 @@ export const REMOTE_DESKTOP_QUALITY_MODE = {
 export type RemoteDesktopQualityMode =
   typeof REMOTE_DESKTOP_QUALITY_MODE[keyof typeof REMOTE_DESKTOP_QUALITY_MODE];
 export const DEFAULT_REMOTE_DESKTOP_QUALITY_MODE: RemoteDesktopQualityMode =
-  REMOTE_DESKTOP_QUALITY_MODE.SMOOTH;
+  REMOTE_DESKTOP_QUALITY_MODE.BALANCED;
 
 /** What each quick mode means on the wire. Custom supplies its own values. */
 export const REMOTE_DESKTOP_QUALITY_MODE_PREFERENCES: Readonly<Record<

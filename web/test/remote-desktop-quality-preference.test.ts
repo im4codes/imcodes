@@ -23,10 +23,10 @@ function memoryStorage(): Pick<Storage, 'getItem' | 'setItem'> & { data: Map<str
 }
 
 describe('remote desktop quality choice', () => {
-  it('defaults to Smooth and remembers each machine separately', () => {
+  it('defaults to Balanced and remembers each machine separately', () => {
     const storage = memoryStorage();
     expect(loadRemoteDesktopQualityChoice('mac', storage).mode).toBe(DEFAULT_REMOTE_DESKTOP_QUALITY_MODE);
-    expect(DEFAULT_REMOTE_DESKTOP_QUALITY_MODE).toBe(REMOTE_DESKTOP_QUALITY_MODE.SMOOTH);
+    expect(DEFAULT_REMOTE_DESKTOP_QUALITY_MODE).toBe(REMOTE_DESKTOP_QUALITY_MODE.BALANCED);
 
     const custom = { maxHeight: 1440, maxFps: 60, maxBitrateBps: 8_000_000, priority: 'resolution' } as const;
     saveRemoteDesktopQualityChoice('mac', { mode: REMOTE_DESKTOP_QUALITY_MODE.CUSTOM, custom }, storage);
@@ -44,7 +44,7 @@ describe('remote desktop quality choice', () => {
   it('falls back to defaults for corrupt or foreign stored values', () => {
     const storage = memoryStorage();
     storage.setItem(REMOTE_DESKTOP_QUALITY_STORAGE_KEY, '{not json');
-    expect(loadRemoteDesktopQualityChoice('mac', storage).mode).toBe('smooth');
+    expect(loadRemoteDesktopQualityChoice('mac', storage).mode).toBe('balanced');
     storage.setItem(REMOTE_DESKTOP_QUALITY_STORAGE_KEY, JSON.stringify({
       version: 1,
       machines: {
@@ -52,7 +52,7 @@ describe('remote desktop quality choice', () => {
         pc: { mode: 'custom', custom: { maxHeight: 1080, maxFps: 30, maxBitrateBps: 3_300_000, priority: 'balanced' } },
       },
     }));
-    expect(loadRemoteDesktopQualityChoice('mac', storage).mode).toBe('smooth');
+    expect(loadRemoteDesktopQualityChoice('mac', storage).mode).toBe('balanced');
     // A bitrate the picker cannot show is replaced, so the select never lies.
     expect(loadRemoteDesktopQualityChoice('pc', storage)).toMatchObject({
       mode: 'custom',
