@@ -172,6 +172,9 @@
       "title": "自分に共有",
       "empty": "共有されたタブまたはサーバーはありません",
       "refresh": "共有アクセスを更新",
+      "collapse": "共有リストを折りたたむ",
+      "expand": "共有リストを展開",
+      "count": "共有 {{count}} 件",
       "guideReturn": "{{server}} に戻る",
       "guideDismiss": "了解",
       "kind": {

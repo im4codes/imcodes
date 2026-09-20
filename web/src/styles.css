@@ -249,7 +249,6 @@ html.native-ios-mac .share-error,
 html.native-ios-mac .share-list-title,
 html.native-ios-mac .share-list-empty,
 html.native-ios-mac .share-list-name,
-html.native-ios-mac .mobile-server-menu-shared-title,
 html.native-ios-mac .chat-tool-chooser-title,
 html.native-ios-mac .chat-tool-chooser-btn-label,
 html.native-ios-mac .chat-thinking-bar,
@@ -569,19 +568,25 @@ html.native-ios-mac .chat-dl-btn {
 .share-revoke-btn { padding: 5px 8px; border: 1px solid rgba(248,113,113,0.35); border-radius: 6px; background: rgba(127,29,29,0.22); color: #fecaca; font: inherit; font-size: 11px; cursor: pointer; }
 .share-revoke-btn:disabled, .share-role-select:disabled { opacity: 0.55; cursor: not-allowed; }
 .shared-entries-panel { margin: 10px 12px 4px; padding: 9px; border: 1px solid rgba(125,211,252,0.13); border-radius: 8px; background: rgba(15,23,42,0.38); }
-.shared-entries-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: #e2e8f0; font-size: 12px; font-weight: 800; }
-.shared-entries-refresh { width: 24px; height: 24px; border: 1px solid rgba(125,211,252,0.16); border-radius: 6px; background: rgba(15,23,42,0.72); color: #93c5fd; cursor: pointer; }
+.shared-entries-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; color: #e2e8f0; font-size: 12px; font-weight: 800; }
+.shared-entries-heading { display: inline-flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; }
+.shared-entries-heading-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.shared-entries-count { flex-shrink: 0; padding: 1px 5px; border-radius: 999px; background: rgba(14,116,144,0.24); color: #a5f3fc; font-size: 10px; font-weight: 700; white-space: nowrap; }
+.shared-entries-header-actions { display: inline-flex; align-items: center; gap: 4px; flex-shrink: 0; }
+.shared-entries-toggle, .shared-entries-refresh { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; padding: 0; border: 1px solid rgba(125,211,252,0.16); border-radius: 6px; background: rgba(15,23,42,0.72); color: #93c5fd; cursor: pointer; }
+.shared-entries-toggle:hover, .shared-entries-refresh:hover { background: rgba(8,145,178,0.16); border-color: rgba(34,211,238,0.28); }
 .shared-entries-refresh:disabled { opacity: 0.55; cursor: not-allowed; }
 .shared-entries-error { margin-top: 7px; color: #fecaca; font-size: 11px; line-height: 1.35; }
 .shared-entries-empty { margin-top: 7px; color: #64748b; font-size: 11px; line-height: 1.35; }
-.shared-entries-list { display: flex; flex-direction: column; gap: 5px; margin-top: 8px; }
-.shared-entry-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; padding: 7px 8px; border: 1px solid rgba(34,211,238,0.12); border-radius: 7px; background: rgba(8,47,73,0.22); color: #e0f2fe; font: inherit; text-align: left; cursor: pointer; }
+.shared-entries-list { display: flex; flex-direction: column; gap: 5px; max-height: 235px; margin-top: 8px; padding-inline-end: 2px; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.shared-entry-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex: 0 0 auto; min-width: 0; width: 100%; padding: 7px 8px; border: 1px solid rgba(34,211,238,0.12); border-radius: 7px; background: rgba(8,47,73,0.22); color: #e0f2fe; font: inherit; text-align: start; cursor: pointer; overflow: hidden; }
 .shared-entry-row:hover { background: rgba(8,145,178,0.18); border-color: rgba(34,211,238,0.26); }
 .shared-entry-row:disabled { opacity: 0.58; cursor: wait; }
-.shared-entry-main { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.shared-entry-main { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 2px; overflow: hidden; }
 .shared-entry-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 700; }
 .shared-entry-subtitle { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #94a3b8; font-size: 10px; }
-.shared-entry-meta { display: inline-flex; flex-direction: column; align-items: flex-end; gap: 2px; color: #93c5fd; font-size: 10px; white-space: nowrap; }
+.shared-entry-meta { display: inline-flex; flex: 0 1 auto; flex-direction: column; align-items: flex-end; gap: 2px; min-width: 0; max-width: 42%; color: #93c5fd; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.shared-entry-meta > span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
 .shared-return-guide { position: fixed; top: 56px; left: 54px; z-index: 9800; width: min(270px, calc(100vw - 68px)); padding: 7px; border: 1px solid rgba(34,211,238,0.68); border-radius: 9px; background: linear-gradient(155deg, rgba(8,47,73,0.98), rgba(15,23,42,0.98)); color: #e2e8f0; box-shadow: 0 12px 30px rgba(0,0,0,0.5), 0 0 0 1px rgba(34,211,238,0.1), 0 0 16px rgba(34,211,238,0.12); animation: shared-return-guide-in 0.2s ease-out; }
 .shared-return-guide::before { content: ''; position: absolute; top: 17px; left: -8px; width: 14px; height: 14px; border-left: 1px solid rgba(34,211,238,0.68); border-bottom: 1px solid rgba(34,211,238,0.68); background: #0a3147; transform: rotate(45deg); }
 .shared-return-guide-actions { display: flex; align-items: center; gap: 6px; }
@@ -595,8 +600,8 @@ html.native-ios-mac .chat-dl-btn {
   .shared-return-guide { top: calc(env(safe-area-inset-top, 0px) + 50px); left: 10px; right: auto; width: min(270px, calc(100vw - 20px)); }
   .shared-return-guide::before { top: -8px; left: 24px; transform: rotate(135deg); }
 }
-.mobile-server-menu-shared { border-top: 1px solid #334155; padding: 6px 0; }
-.mobile-server-menu-shared-title { padding: 4px 12px; color: #94a3b8; font-size: 11px; font-weight: 800; }
+.mobile-server-menu-shared { min-width: 0; border-top: 1px solid #334155; padding: 6px 0; overflow: hidden; }
+.mobile-server-menu-shared .shared-entries-panel { min-width: 0; margin: 0; border: 0; border-radius: 0; background: transparent; }
 .chat-shared-actor-label,
 .controls-queued-item-actor { display: inline-flex; align-items: center; max-width: 100%; color: #67e8f9; font-size: 10px; font-weight: 700; line-height: 1.2; letter-spacing: 0; opacity: 0.86; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-shared-actor-label { align-self: flex-end; margin: 0 2px 4px; }

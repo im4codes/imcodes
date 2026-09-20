@@ -172,6 +172,9 @@
       "title": "別人分享給我",
       "empty": "沒有分享的標籤或伺服器",
       "refresh": "重新整理分享存取",
+      "collapse": "收合分享清單",
+      "expand": "展開分享清單",
+      "count": "{{count}} 個分享項目",
       "guideReturn": "返回 {{server}}",
       "guideDismiss": "知道了",
       "kind": {

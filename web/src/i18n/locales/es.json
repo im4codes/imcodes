@@ -172,6 +172,9 @@
       "title": "Compartido conmigo",
       "empty": "No hay pestañas ni servidores compartidos",
       "refresh": "Actualizar acceso compartido",
+      "collapse": "Contraer elementos compartidos",
+      "expand": "Expandir elementos compartidos",
+      "count": "{{count}} elementos compartidos",
       "guideReturn": "Volver a {{server}}",
       "guideDismiss": "Entendido",
       "kind": {

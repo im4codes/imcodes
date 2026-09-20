@@ -172,6 +172,9 @@
       "title": "나에게 공유됨",
       "empty": "공유된 탭 또는 서버가 없습니다",
       "refresh": "공유 액세스 새로고침",
+      "collapse": "공유 목록 접기",
+      "expand": "공유 목록 펼치기",
+      "count": "공유 항목 {{count}}개",
       "guideReturn": "{{server}}로 돌아가기",
       "guideDismiss": "확인",
       "kind": {

@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import { SessionTabs } from '../src/components/SessionTabs.js';
 import { ShareSessionDialog } from '../src/components/ShareSessionDialog.js';
 import { SharedEntriesPanel } from '../src/components/SharedEntriesPanel.js';
+import { MobileSharedEntriesMenu } from '../src/components/MobileSharedEntriesMenu.js';
 import { SessionControls } from '../src/components/SessionControls.js';
 import { discoverSharedEntries, openSharedEntry } from '../src/api.js';
 import {
@@ -18,6 +19,7 @@ import {
   sharedActorRoleLabelKey,
 } from '../src/tab-sharing-ui.js';
 import type { SessionInfo } from '../src/types.js';
+import { SHARED_ENTRIES_PANEL_COLLAPSED_STORAGE_KEY } from '../src/shared-entries-panel-preference.js';
 
 const WEB_ROOT = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
 
@@ -83,6 +85,9 @@ const messages: Record<string, string> = {
   'share.sharedWithMe.title': 'Shared with me',
   'share.sharedWithMe.empty': 'No shared tabs or servers',
   'share.sharedWithMe.refresh': 'Refresh shared access',
+  'share.sharedWithMe.collapse': 'Collapse shared entries',
+  'share.sharedWithMe.expand': 'Expand shared entries',
+  'share.sharedWithMe.count': '{{count}} shared entries',
   'share.sharedWithMe.kind.server': 'Server',
   'share.sharedWithMe.kind.tab': 'Tab',
   'share.sharedWithMe.kind.subsession': 'Sub-session',
@@ -145,6 +150,7 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   vi.unstubAllGlobals();
+  try { localStorage.clear(); } catch { /* throwing-storage tests restore their spies */ }
 });
 
 function makeSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
@@ -657,6 +663,204 @@ describe('collaborative tab sharing UI', () => {
     }));
     fireEvent.click(screen.getByRole('button', { name: 'Refresh shared access' }));
     expect(onRefresh).toHaveBeenCalledTimes(1);
+  });
+
+  function sharedEntries(count: number) {
+    return Array.from({ length: count }, (_, index) => ({
+      id: `share-${index + 1}`,
+      serverId: 'srv-1',
+      serverName: `Workstation ${index + 1}`,
+      role: 'participant' as const,
+      status: 'active' as const,
+      targetLabel: index === 0 ? 'A very long shared entry name that must stay inside the panel' : `Entry ${index + 1}`,
+      target: { kind: 'main' as const, serverId: 'srv-1', sessionName: `deck_${index + 1}_brain` },
+    }));
+  }
+
+  it('caps a long shared-entry list to a scrollable five-row viewport', () => {
+    render(
+      <SharedEntriesPanel entries={sharedEntries(7)} onOpen={() => {}} onRefresh={() => {}} />,
+    );
+
+    const list = document.querySelector('.shared-entries-list');
+    expect(list).not.toBeNull();
+    const css = readFileSync(join(WEB_ROOT, 'src/styles.css'), 'utf8');
+    expect(css).toMatch(/\.shared-entries-list\s*\{[^}]*max-height:/s);
+    expect(css).toMatch(/\.shared-entries-list\s*\{[^}]*overflow-y:\s*auto/s);
+    expect(screen.getAllByRole('button', { name: /Entry|very long/ })).toHaveLength(7);
+  });
+
+  it('collapses the list completely, exposes count and ARIA, then restores the rows', () => {
+    render(
+      <SharedEntriesPanel entries={sharedEntries(6)} onOpen={() => {}} onRefresh={() => {}} />,
+    );
+
+    const collapse = screen.getByRole('button', { name: 'Collapse shared entries' });
+    const list = document.querySelector('.shared-entries-list') as HTMLElement;
+    expect(collapse.getAttribute('aria-expanded')).toBe('true');
+    expect(document.getElementById(collapse.getAttribute('aria-controls') ?? '')).not.toBeNull();
+
+    fireEvent.click(collapse);
+    expect(document.querySelector('.shared-entries-list')).toBeNull();
+    expect(screen.queryByRole('button', { name: /very long/ })).toBeNull();
+    expect(screen.getByText('6 shared entries')).not.toBeNull();
+    const expand = screen.getByRole('button', { name: 'Expand shared entries' });
+    expect(expand.getAttribute('aria-expanded')).toBe('false');
+
+    fireEvent.click(expand);
+    expect(document.querySelector('.shared-entries-list')).not.toBeNull();
+    expect(screen.getByRole('button', { name: /very long/ })).not.toBeNull();
+  });
+
+  it('restores the local collapsed preference on first render and refresh preserves it', () => {
+    localStorage.setItem(SHARED_ENTRIES_PANEL_COLLAPSED_STORAGE_KEY, '1');
+    const onRefresh = vi.fn();
+    const view = render(
+      <SharedEntriesPanel entries={sharedEntries(2)} onOpen={() => {}} onRefresh={onRefresh} />,
+    );
+
+    expect(document.querySelector('.shared-entries-list')).toBeNull();
+    expect(screen.getByText('2 shared entries')).not.toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh shared access' }));
+    expect(onRefresh).toHaveBeenCalledTimes(1);
+
+    view.rerender(
+      <SharedEntriesPanel entries={sharedEntries(4)} onOpen={() => {}} onRefresh={onRefresh} />,
+    );
+    expect(document.querySelector('.shared-entries-list')).toBeNull();
+    expect(screen.getByText('4 shared entries')).not.toBeNull();
+  });
+
+  it('persists both toggle states and restores values written by the previous panel mount', () => {
+    const first = render(
+      <SharedEntriesPanel entries={sharedEntries(2)} onOpen={() => {}} onRefresh={() => {}} />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Collapse shared entries' }));
+    expect(localStorage.getItem(SHARED_ENTRIES_PANEL_COLLAPSED_STORAGE_KEY)).toBe('1');
+    first.unmount();
+
+    const second = render(
+      <SharedEntriesPanel entries={sharedEntries(2)} onOpen={() => {}} onRefresh={() => {}} />,
+    );
+    expect(document.querySelector('.shared-entries-list')).toBeNull();
+    expect(screen.getByText('2 shared entries')).not.toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Expand shared entries' }));
+    expect(localStorage.getItem(SHARED_ENTRIES_PANEL_COLLAPSED_STORAGE_KEY)).toBe('0');
+    second.unmount();
+
+    render(
+      <SharedEntriesPanel entries={sharedEntries(2)} onOpen={() => {}} onRefresh={() => {}} />,
+    );
+    expect(document.querySelector('.shared-entries-list')).not.toBeNull();
+  });
+
+  it('falls back to expanded and remains usable when localStorage throws', () => {
+    const getItem = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => { throw new Error('blocked'); });
+    const setItem = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('blocked'); });
+    try {
+      render(
+        <SharedEntriesPanel entries={sharedEntries(2)} onOpen={() => {}} onRefresh={() => {}} />,
+      );
+      expect(document.querySelector('.shared-entries-list')).not.toBeNull();
+      fireEvent.click(screen.getByRole('button', { name: 'Collapse shared entries' }));
+      expect(document.querySelector('.shared-entries-list')).toBeNull();
+    } finally {
+      getItem.mockRestore();
+      setItem.mockRestore();
+    }
+  });
+
+  it('falls back to expanded when localStorage is unavailable', () => {
+    vi.stubGlobal('localStorage', undefined);
+    render(
+      <SharedEntriesPanel entries={sharedEntries(2)} onOpen={() => {}} onRefresh={() => {}} />,
+    );
+    expect(document.querySelector('.shared-entries-list')).not.toBeNull();
+    expect(() => fireEvent.click(screen.getByRole('button', { name: 'Collapse shared entries' }))).not.toThrow();
+    expect(document.querySelector('.shared-entries-list')).toBeNull();
+  });
+
+  it('does not offer a collapse toggle for empty or loading content', () => {
+    const view = render(
+      <SharedEntriesPanel entries={[]} loading onOpen={() => {}} onRefresh={() => {}} />,
+    );
+    expect(screen.queryByRole('button', { name: /Collapse|Expand shared entries/ })).toBeNull();
+    view.rerender(
+      <SharedEntriesPanel entries={[]} onOpen={() => {}} onRefresh={() => {}} />,
+    );
+    expect(screen.queryByRole('button', { name: /Collapse|Expand shared entries/ })).toBeNull();
+    expect(screen.getByText('No shared tabs or servers')).not.toBeNull();
+  });
+
+  it('ships the shared-entry panel controls in all seven locales', () => {
+    const localeNames = ['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko'];
+    for (const localeName of localeNames) {
+      const locale = JSON.parse(readFileSync(join(WEB_ROOT, `src/i18n/locales/${localeName}.json`), 'utf8')) as {
+        share?: { sharedWithMe?: Record<string, unknown> };
+      };
+      for (const key of ['collapse', 'expand', 'count']) {
+        expect(locale.share?.sharedWithMe?.[key], `${localeName}:${key}`).toEqual(expect.any(String));
+        expect(String(locale.share?.sharedWithMe?.[key]).trim(), `${localeName}:${key}`).not.toBe('');
+      }
+    }
+  });
+
+  it('uses the bounded shared-entry component in the real mobile server-menu host', () => {
+    const appSource = readFileSync(join(WEB_ROOT, 'src/app.tsx'), 'utf8');
+    expect(appSource).toContain('<MobileSharedEntriesMenu');
+    expect(appSource).not.toMatch(/mobile-server-menu-shared[\s\S]{0,500}sharedEntries\.map/);
+
+    render(
+      <MobileSharedEntriesMenu entries={sharedEntries(7)} onOpen={() => {}} onRefresh={() => {}} />,
+    );
+    expect(document.querySelector('.mobile-server-menu-shared .shared-entries-list')).not.toBeNull();
+    const collapse = screen.getByRole('button', { name: 'Collapse shared entries' });
+    expect(collapse.getAttribute('aria-expanded')).toBe('true');
+    expect(document.getElementById(collapse.getAttribute('aria-controls') ?? '')).not.toBeNull();
+    fireEvent.click(collapse);
+    expect(document.querySelector('.mobile-server-menu-shared .shared-entries-list')).toBeNull();
+    expect(screen.getByText('7 shared entries')).not.toBeNull();
+  });
+
+  it('restores and retains collapse/count behavior through the mobile menu host', () => {
+    localStorage.setItem(SHARED_ENTRIES_PANEL_COLLAPSED_STORAGE_KEY, '1');
+    const onRefresh = vi.fn();
+    const view = render(
+      <MobileSharedEntriesMenu entries={sharedEntries(3)} onOpen={() => {}} onRefresh={onRefresh} />,
+    );
+    expect(document.querySelector('.mobile-server-menu-shared .shared-entries-list')).toBeNull();
+    expect(screen.getByText('3 shared entries')).not.toBeNull();
+    const expand = screen.getByRole('button', { name: 'Expand shared entries' });
+    expect(expand.getAttribute('aria-controls')).not.toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh shared access' }));
+    expect(onRefresh).toHaveBeenCalledTimes(1);
+    view.rerender(
+      <MobileSharedEntriesMenu entries={sharedEntries(6)} onOpen={() => {}} onRefresh={onRefresh} />,
+    );
+    expect(screen.getByText('6 shared entries')).not.toBeNull();
+  });
+
+  it('persists and remounts both toggle states through the mobile menu host', () => {
+    const first = render(
+      <MobileSharedEntriesMenu entries={sharedEntries(3)} onOpen={() => {}} onRefresh={() => {}} />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Collapse shared entries' }));
+    expect(localStorage.getItem(SHARED_ENTRIES_PANEL_COLLAPSED_STORAGE_KEY)).toBe('1');
+    first.unmount();
+
+    const second = render(
+      <MobileSharedEntriesMenu entries={sharedEntries(3)} onOpen={() => {}} onRefresh={() => {}} />,
+    );
+    expect(document.querySelector('.mobile-server-menu-shared .shared-entries-list')).toBeNull();
+    expect(screen.getByText('3 shared entries')).not.toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Expand shared entries' }));
+    expect(localStorage.getItem(SHARED_ENTRIES_PANEL_COLLAPSED_STORAGE_KEY)).toBe('0');
+    second.unmount();
+
+    render(
+      <MobileSharedEntriesMenu entries={sharedEntries(3)} onOpen={() => {}} onRefresh={() => {}} />,
+    );
+    expect(document.querySelector('.mobile-server-menu-shared .shared-entries-list')).not.toBeNull();
   });
 
   it('keeps the send-adjacent share menu wired to active sub-session context', () => {

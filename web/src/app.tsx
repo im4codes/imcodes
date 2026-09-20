@@ -54,6 +54,7 @@ import {
 } from './supervision-task-console-cache.js';
 import { ShareSessionDialog } from './components/ShareSessionDialog.js';
 import { SharedEntriesPanel } from './components/SharedEntriesPanel.js';
+import { MobileSharedEntriesMenu } from './components/MobileSharedEntriesMenu.js';
 import { SharedStateIndicator } from './components/SharedStateIndicator.js';
 import { applyGlobalFontPrefs, DEFAULT_CHAT_FONT, useFontPrefs } from './components/FontPrefsDropdown.js';
 import { useQuickData } from './components/QuickInputPanel.js';
@@ -6345,19 +6346,17 @@ export function App() {
                       );
                     })}
                     {sharedEntries.length > 0 && (
-                      <div class="mobile-server-menu-shared">
-                        <div class="mobile-server-menu-shared-title">{trans('share.sharedWithMe.title')}</div>
-                        {sharedEntries.map((entry) => (
-                          <button
-                            key={entry.id}
-                            class="mobile-server-menu-item"
-                            onClick={() => { void handleOpenSharedEntry(entry); setShowMobileServerMenu(false); }}
-                          >
-                            <span>↗</span>
-                            {' '}{entry.targetLabel}
-                          </button>
-                        ))}
-                      </div>
+                      <MobileSharedEntriesMenu
+                        entries={sharedEntries}
+                        loading={sharedEntriesLoading}
+                        error={sharedEntriesError}
+                        openingEntryId={openingSharedEntryId}
+                        onOpen={(entry) => {
+                          void handleOpenSharedEntry(entry);
+                          setShowMobileServerMenu(false);
+                        }}
+                        onRefresh={() => void refreshSharedEntries()}
+                      />
                     )}
                     <div style={{ padding: '6px 12px', borderTop: '1px solid #334155' }}>
                       <LanguageSwitcher />

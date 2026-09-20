@@ -172,6 +172,9 @@
       "title": "Shared with me",
       "empty": "No shared tabs or servers",
       "refresh": "Refresh shared access",
+      "collapse": "Collapse shared entries",
+      "expand": "Expand shared entries",
+      "count": "{{count}} shared entries",
       "guideReturn": "Return to {{server}}",
       "guideDismiss": "Got it",
       "kind": {

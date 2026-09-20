@@ -172,6 +172,9 @@
       "title": "别人共享给我",
       "empty": "没有共享的标签或服务器",
       "refresh": "刷新共享访问",
+      "collapse": "折叠共享列表",
+      "expand": "展开共享列表",
+      "count": "{{count}} 项共享",
       "guideReturn": "返回 {{server}}",
       "guideDismiss": "知道了",
       "kind": {
