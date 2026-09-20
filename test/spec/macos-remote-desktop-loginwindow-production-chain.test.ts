@@ -237,5 +237,8 @@ describe('macOS LoginWindow production chain', () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
-  });
+    // Five translation units compiled under ASan and UBSan: seconds on a
+    // developer's Mac, but past the project-wide 20s default on a loaded CI
+    // runner, which is the only way this has ever failed.
+  }, 90_000);
 });
