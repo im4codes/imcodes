@@ -824,4 +824,155 @@ describe('bounded supervision worktree GC', () => {
     await execFileAsync('git', ['commit', '-m', 'local-only'], { cwd: worktree });
     expect(await inspectSupervisionGitWorktree(worktree)).toMatchObject({ ok: true, unpushed: true });
   });
+
+  it('backs up an unpushed commit plus dirty and untracked bytes before reclaiming a cancelled real worktree', async () => {
+    const root = await makeRoot('supervision-worktree-gc-real-reclaim-');
+    const gitRoot = await makeRoot('supervision-worktree-gc-real-source-');
+    const backupsRoot = await makeRoot('supervision-worktree-gc-backups-');
+    const origin = join(gitRoot, 'origin.git');
+    const seed = join(gitRoot, 'seed');
+    await execFileAsync('git', ['init', '--bare', origin]);
+    await execFileAsync('git', ['clone', origin, seed]);
+    await execFileAsync('git', ['config', 'user.email', 'gc@example.test'], { cwd: seed });
+    await execFileAsync('git', ['config', 'user.name', 'GC Test'], { cwd: seed });
+    await writeFile(join(seed, 'tracked.txt'), 'base\n');
+    await execFileAsync('git', ['add', 'tracked.txt'], { cwd: seed });
+    await execFileAsync('git', ['commit', '-m', 'base'], { cwd: seed });
+    await execFileAsync('git', ['push', '-u', 'origin', 'HEAD'], { cwd: seed });
+
+    const assignmentId = 'asg_reclaim1';
+    const candidatePath = join(root, 'imcodes', 'deck_gc_brain', assignmentId);
+    const repoPath = join(candidatePath, 'repo');
+    await mkdir(candidatePath, { recursive: true });
+    await execFileAsync('git', ['worktree', 'add', '--detach', repoPath, 'HEAD'], { cwd: seed });
+    await execFileAsync('git', ['config', 'user.email', 'gc@example.test'], { cwd: repoPath });
+    await execFileAsync('git', ['config', 'user.name', 'GC Test'], { cwd: repoPath });
+    await writeFile(join(repoPath, 'tracked.txt'), 'local commit\n');
+    await execFileAsync('git', ['add', 'tracked.txt'], { cwd: repoPath });
+    await execFileAsync('git', ['commit', '-m', 'local-only'], { cwd: repoPath });
+    const localHead = (await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: repoPath })).stdout.trim();
+    await writeFile(join(repoPath, 'tracked.txt'), 'dirty after commit\n');
+    await writeFile(join(repoPath, 'new.txt'), 'untracked bytes\n');
+    const metadata: SupervisionWorktreeMetadata = {
+      taskId: 'task_real_reclaim', assignmentId, sessionName: 'deck_gc_brain',
+      baseRevision: 'a'.repeat(40), repoPath, createdAt: '2026-08-30T00:00:00Z',
+    };
+    await writeFile(join(candidatePath, 'metadata.json'), `${JSON.stringify(metadata)}\n`);
+
+    const result = await runSupervisionWorktreeGc({
+      projectName: 'cd', mode: 'apply', worktreesRoot: root,
+    }, {
+      resolveRegistryReference: (candidate) => registryReference(candidate, {
+        status: 'cancelled', completeAuthority: false,
+      }),
+      protectedPaths: [], preserveTerminalChanges: true, backupsRoot,
+      removeDirectory: (path) => rm(path, { recursive: true, force: false }),
+    });
+
+    expect(result).toMatchObject({ deleted: 1, mutations: 1 });
+    await expect(realpath(candidatePath)).rejects.toThrow();
+    const backupRef = (await execFileAsync('git', [
+      'for-each-ref', '--format=%(objectname)', `refs/backup/worktrees/${assignmentId}-*`,
+    ], { cwd: seed })).stdout.trim();
+    expect(backupRef).toBe(localHead);
+    const backupDir = join(backupsRoot, 'cd', 'deck_gc_brain');
+    const patchName = (await readdir(backupDir)).find((name) => name.endsWith('.patch'));
+    expect(patchName).toBeTruthy();
+    const patch = await readFile(join(backupDir, patchName!), 'utf8');
+    expect(patch).toContain('dirty after commit');
+    expect(patch).toContain('new.txt');
+    expect(patch).toContain('untracked bytes');
+  });
+
+  it('reclaims an old unregistered orphan but never a path containing a live session cwd', async () => {
+    const root = await makeRoot('supervision-worktree-gc-orphans-');
+    const removable = await createCandidate(root, 'asg_orphan1');
+    const live = await createCandidate(root, 'asg_orphan2');
+    const liveCwd = join(live.repoPath, 'active-session-cwd');
+    await mkdir(liveCwd);
+    const removeRegisteredWorktree = vi.fn(async (_inspection, repoPath: string) => {
+      await rm(repoPath, { recursive: true, force: false });
+      return true;
+    });
+    const result = await runSupervisionWorktreeGc({
+      projectName: 'cd', mode: 'apply', worktreesRoot: root, limit: 10,
+    }, {
+      now: () => Date.parse('2026-09-20T00:00:00Z'),
+      resolveRegistryReference: () => ({ available: true }),
+      inspectGit: async () => ({ ...eligibleGit(), registered: false }),
+      removeRegisteredWorktree,
+      removeDirectory: (path) => rm(path, { recursive: true, force: false }),
+      protectedPaths: [liveCwd],
+      preserveTerminalChanges: true, reclaimOrphans: true,
+    });
+    expect(result.entries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ assignmentId: removable.metadata.assignmentId, action: 'delete' }),
+      expect.objectContaining({
+        assignmentId: live.metadata.assignmentId,
+        action: 'retain', reason: SUPERVISION_WORKTREE_GC_REASONS.PROTECTED_PATH,
+      }),
+    ]));
+    await expect(realpath(removable.path)).rejects.toThrow();
+    await expect(realpath(live.path)).resolves.toBeTruthy();
+  });
+
+  it('fails closed when a dirty backup exceeds its size cap', async () => {
+    const root = await makeRoot('supervision-worktree-gc-backup-cap-');
+    const created = await createCandidate(root, 'asg_backupcap');
+    await execFileAsync('git', ['init'], { cwd: created.repoPath });
+    await execFileAsync('git', ['config', 'user.email', 'gc@example.test'], { cwd: created.repoPath });
+    await execFileAsync('git', ['config', 'user.name', 'GC Test'], { cwd: created.repoPath });
+    await writeFile(join(created.repoPath, 'large.txt'), 'base\n');
+    await execFileAsync('git', ['add', 'large.txt'], { cwd: created.repoPath });
+    await execFileAsync('git', ['commit', '-m', 'base'], { cwd: created.repoPath });
+    await writeFile(join(created.repoPath, 'large.txt'), 'x'.repeat(4096));
+    const removeRegisteredWorktree = vi.fn(async () => true);
+    const result = await runSupervisionWorktreeGc({
+      projectName: 'cd', mode: 'apply', worktreesRoot: root,
+    }, {
+      resolveRegistryReference: (metadata) => registryReference(metadata),
+      verifyFinalization: async () => true,
+      removeRegisteredWorktree,
+      protectedPaths: [], preserveTerminalChanges: true, maxBackupPatchBytes: 1024,
+    });
+    expect(result.entries[0]).toMatchObject({
+      action: 'retain', reason: SUPERVISION_WORKTREE_GC_REASONS.BACKUP_FAILED,
+    });
+    expect(removeRegisteredWorktree).not.toHaveBeenCalled();
+    await expect(realpath(created.path)).resolves.toBeTruthy();
+  });
+
+  it('sweeps an old registered /tmp integration worktree through the same backup-safe orphan path', async () => {
+    const root = await makeRoot('supervision-worktree-gc-external-root-');
+    const source = await makeRoot('supervision-worktree-gc-external-source-');
+    const external = await makeRoot('imcodes-integration-stale-');
+    await rm(external, { recursive: true, force: false });
+    await execFileAsync('git', ['init'], { cwd: source });
+    await execFileAsync('git', ['config', 'user.email', 'gc@example.test'], { cwd: source });
+    await execFileAsync('git', ['config', 'user.name', 'GC Test'], { cwd: source });
+    await writeFile(join(source, 'tracked.txt'), 'base\n');
+    await execFileAsync('git', ['add', 'tracked.txt'], { cwd: source });
+    await execFileAsync('git', ['commit', '-m', 'base'], { cwd: source });
+    await execFileAsync('git', ['worktree', 'add', '--detach', external, 'HEAD'], { cwd: source });
+    await writeFile(join(external, 'local.txt'), 'preserve me\n');
+
+    const result = await runSupervisionWorktreeGc({
+      projectName: 'cd', mode: 'apply', worktreesRoot: root,
+    }, {
+      now: () => Date.now() + 2 * 60_000,
+      resolveRegistryReference: () => ({ available: true }),
+      resolveRegistryReferenceByAssignment: () => ({ available: true }),
+      protectedPaths: [], preserveTerminalChanges: true, reclaimOrphans: true,
+      orphanGraceMs: 60_000,
+      backupsRoot: await makeRoot('supervision-worktree-gc-external-backups-'),
+      listExternalOrphanWorktrees: () => [external],
+      removeDirectory: (path) => rm(path, { recursive: true, force: false }),
+    });
+    expect(result.entries).toEqual([
+      expect.objectContaining({ action: 'delete', detail: 'orphan_backup_required' }),
+    ]);
+    await expect(realpath(external)).rejects.toThrow();
+    const registrations = (await execFileAsync('git', ['worktree', 'list', '--porcelain'], { cwd: source })).stdout;
+    expect(registrations).not.toContain(external);
+  });
 });

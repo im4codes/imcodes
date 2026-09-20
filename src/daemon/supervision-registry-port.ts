@@ -8,6 +8,8 @@
  * surface, but every call answered `unavailable: supervision registry not
  * bound` -- a feature that looked present and was permanently inert.
  */
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { getSupervisionTaskRegistry, SUPERVISION_REVISION_AUTHORITATIVE_INTENTS } from './supervision-state-store.js';
 import { listSessions, type SessionRecord } from '../store/session-store.js';
 import { resolveEffectiveProjectName } from '../../shared/session-scope.js';
@@ -43,6 +45,39 @@ import { autoStartAssignmentFromAck } from './assignment-auto-start.js';
 import { SUPERVISION_ASSIGNMENT_START_EVIDENCE } from '../../shared/supervision-assignment-start.js';
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import { resolveEffectiveSessionModel } from '../../shared/session-model.js';
+import logger from '../util/logger.js';
+
+const SUPERVISION_WORKTREE_BYTES_WARNING = 20 * 1024 * 1024 * 1024;
+const execFileAsync = promisify(execFile);
+
+async function measureWorktreesRootBytes(root: string): Promise<number | undefined> {
+  try {
+    const { stdout } = await execFileAsync('du', ['-sk', '--', root], {
+      timeout: 5_000, maxBuffer: 64 * 1024, encoding: 'utf8',
+    });
+    const kib = Number.parseInt(stdout.trim().split(/\s+/)[0] ?? '', 10);
+    return Number.isFinite(kib) ? kib * 1024 : undefined;
+  } catch { return undefined; }
+}
+
+async function listExternalIntegrationWorktrees(projectName: string): Promise<string[]> {
+  const sessions = listSessions();
+  const roots = new Set(sessions.filter((session) => (
+    resolveEffectiveProjectName(session, sessions) === projectName
+  )).map((session) => session.projectDir).filter(Boolean));
+  const paths = new Set<string>();
+  for (const root of roots) {
+    try {
+      const { stdout } = await execFileAsync('git', ['-C', root, 'worktree', 'list', '--porcelain'], {
+        timeout: 5_000, maxBuffer: 1024 * 1024, encoding: 'utf8',
+      });
+      for (const line of stdout.split('\n')) {
+        if (line.startsWith('worktree ')) paths.add(line.slice('worktree '.length));
+      }
+    } catch { /* one unavailable checkout must not suppress other project roots */ }
+  }
+  return [...paths];
+}
 
 export function retireExactSupersededAuditDelivery(
   store: Pick<TransportQueueStore, 'cancelQueuedMessage'>,
@@ -334,6 +369,9 @@ export function createSupervisionWorktreeGcDeps(): SupervisionWorktreeGcDeps {
       resolveWorktreeRegistryReference(assignmentId)
     ),
     protectedPaths: [process.cwd(), ...listSessions().map((session) => session.projectDir)],
+    preserveTerminalChanges: true,
+    reclaimOrphans: true,
+    listExternalOrphanWorktrees: listExternalIntegrationWorktrees,
   };
 }
 
@@ -374,6 +412,18 @@ export async function runScheduledSupervisionWorktreeGcBatch(
     },
     now,
   });
+  if (result.deleted > 0) {
+    logger.info({
+      projectName: state.projectName,
+      worktreesDeleted: result.deleted,
+      reclaimedBytes: result.releasedBytes,
+    }, 'Supervision worktree GC reclaimed terminal worktrees');
+  }
+  const totalBytes = await measureWorktreesRootBytes(result.root);
+  if (totalBytes !== undefined && totalBytes >= SUPERVISION_WORKTREE_BYTES_WARNING) {
+    logger.warn({ projectName: state.projectName, worktreeBytes: totalBytes },
+      'Supervision worktree storage exceeds the warning threshold');
+  }
   return result;
 }
 

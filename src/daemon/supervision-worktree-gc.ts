@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   lstat,
+  mkdir,
   open,
   opendir,
   readFile,
@@ -12,7 +13,7 @@ import {
   unlink,
   writeFile,
 } from 'node:fs/promises';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 
@@ -25,6 +26,8 @@ export const SUPERVISION_WORKTREE_GC_MAX_SESSIONS = 128 as const;
 export const SUPERVISION_WORKTREE_GC_MAX_ASSIGNMENTS = 512 as const;
 export const SUPERVISION_WORKTREE_GC_MAX_COMMON_DIRS = 4 as const;
 export const SUPERVISION_WORKTREE_GC_LOCK_STALE_MS = 10 * 60_000;
+export const SUPERVISION_WORKTREE_GC_ORPHAN_GRACE_MS = 24 * 60 * 60_000;
+export const SUPERVISION_WORKTREE_GC_MAX_BACKUP_PATCH_BYTES = 16 * 1024 * 1024;
 
 const ASSIGNMENT_NAME = /^(?:supervision_assignment_[0-9a-z-]+|asg_[0-9a-z]+)$/;
 const SESSION_NAME = /^deck_[0-9a-z_-]+$/i;
@@ -62,6 +65,7 @@ export const SUPERVISION_WORKTREE_GC_REASONS = Object.freeze({
   CONCURRENT_RUN: 'concurrent_run',
   APPLY_FAILED: 'apply_failed',
   RECOVERY_BLOCKED: 'recovery_blocked',
+  BACKUP_FAILED: 'backup_failed',
 } as const);
 
 export type SupervisionWorktreeGcReason =
@@ -197,6 +201,14 @@ export interface SupervisionWorktreeGcDeps {
     repoPath: string;
   }) => Promise<SupervisionWorktreeRegistryReference> | SupervisionWorktreeRegistryReference;
   protectedPaths?: readonly string[];
+  /** Production-only opt-in: preserve local-only bytes, then reclaim terminal owners. */
+  preserveTerminalChanges?: boolean;
+  /** Production-only opt-in: reclaim old paths whose durable owner no longer exists. */
+  reclaimOrphans?: boolean;
+  backupsRoot?: string;
+  orphanGraceMs?: number;
+  maxBackupPatchBytes?: number;
+  listExternalOrphanWorktrees?: (projectName: string) => Promise<readonly string[]> | readonly string[];
   now?: () => number;
   pid?: number;
   isProcessAlive?: (pid: number) => boolean;
@@ -219,6 +231,7 @@ interface CandidatePath {
   candidatePath: string;
   repoPath: string;
   sessionName: string;
+  external?: boolean;
 }
 
 interface GcJournal {
@@ -235,11 +248,25 @@ interface GcJournal {
   quarantinePath?: string;
   updatedAt: number;
   candidateBytes?: number;
+  orphan?: boolean;
+  external?: boolean;
 }
 
 function defaultWorktreesRoot(): string {
   const imcodesHome = process.env.IMCODES_HOME?.trim() || join(homedir(), '.imcodes');
   return resolve(imcodesHome, 'worktrees');
+}
+
+function defaultBackupsRoot(): string {
+  const imcodesHome = process.env.IMCODES_HOME?.trim() || join(homedir(), '.imcodes');
+  return resolve(imcodesHome, 'worktree-backups');
+}
+
+async function safeExternalIntegrationPath(path: string): Promise<boolean> {
+  const candidate = await realpath(path).catch(() => resolve(path));
+  const temporaryRoot = await realpath(tmpdir()).catch(() => resolve(tmpdir()));
+  return relative(temporaryRoot, candidate).split(/[\\/]/)[0] !== '..'
+    && /^imcodes-integration-[0-9a-z._-]+$/i.test(basename(candidate));
 }
 
 function boundedLimit(value: number | undefined): number {
@@ -283,6 +310,86 @@ async function runGit(cwd: string, args: readonly string[]): Promise<GitRunResul
       stderr: typeof candidate.stderr === 'string' ? candidate.stderr : '',
     };
   }
+}
+
+async function runGitWithIndex(
+  repoPath: string,
+  indexPath: string,
+  args: readonly string[],
+  maxBuffer = 1024 * 1024,
+): Promise<{ ok: boolean; stdout: Buffer }> {
+  try {
+    const result = await execFileAsync('git', ['-C', repoPath, ...args], {
+      timeout: 30_000,
+      maxBuffer,
+      encoding: 'buffer',
+      env: { ...process.env, GIT_INDEX_FILE: indexPath },
+    });
+    return {
+      ok: true,
+      stdout: Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout),
+    };
+  } catch {
+    return { ok: false, stdout: Buffer.alloc(0) };
+  }
+}
+
+function safeBackupSegment(value: string): string {
+  const sanitized = value.toLowerCase().replace(/[^0-9a-z._-]+/g, '-').replace(/^-+|-+$/g, '');
+  return sanitized.slice(0, 96) || 'unknown';
+}
+
+async function preserveCandidateState(
+  candidate: CandidatePath,
+  inspection: SupervisionWorktreeGitInspection,
+  projectName: string,
+  deps: SupervisionWorktreeGcDeps,
+): Promise<{ ok: boolean; detail?: string }> {
+  const backupRoot = resolve(deps.backupsRoot ?? defaultBackupsRoot());
+  const assignment = safeBackupSegment(candidate.assignmentId);
+  const targetDir = join(backupRoot, safeBackupSegment(projectName), safeBackupSegment(candidate.sessionName));
+  await mkdir(targetDir, { recursive: true, mode: 0o700 });
+
+  const head = await runGit(candidate.repoPath, ['rev-parse', '--verify', 'HEAD']);
+  if (!head.ok || !/^[0-9a-f]{40}$/.test(head.stdout.trim())) return { ok: false, detail: 'head_unavailable' };
+  const headSha = head.stdout.trim();
+  const artifacts: string[] = [];
+  if (inspection.branchOnly || inspection.unpushed) {
+    const ref = `refs/backup/worktrees/${assignment}-${headSha.slice(0, 12)}`;
+    const saved = await runGit(candidate.repoPath, ['update-ref', ref, headSha]);
+    if (!saved.ok) return { ok: false, detail: 'backup_ref_failed' };
+    artifacts.push(ref);
+  }
+
+  if (inspection.dirty || inspection.untracked) {
+    const maxBytes = Math.max(1024, Math.min(
+      deps.maxBackupPatchBytes ?? SUPERVISION_WORKTREE_GC_MAX_BACKUP_PATCH_BYTES,
+      SUPERVISION_WORKTREE_GC_MAX_BACKUP_PATCH_BYTES,
+    ));
+    const nonce = randomUUID();
+    const indexPath = join(targetDir, `.${assignment}-${nonce}.index`);
+    try {
+      const readTree = await runGitWithIndex(candidate.repoPath, indexPath, ['read-tree', 'HEAD']);
+      if (!readTree.ok) return { ok: false, detail: 'backup_index_failed' };
+      const staged = await runGitWithIndex(candidate.repoPath, indexPath, ['add', '-A', '--', '.']);
+      if (!staged.ok) return { ok: false, detail: 'backup_stage_failed' };
+      const diff = await runGitWithIndex(
+        candidate.repoPath,
+        indexPath,
+        ['diff', '--cached', '--binary', '--full-index', 'HEAD', '--'],
+        maxBytes + 1,
+      );
+      if (!diff.ok || diff.stdout.length > maxBytes) return { ok: false, detail: 'backup_patch_too_large' };
+      if (diff.stdout.length === 0) return { ok: false, detail: 'backup_patch_empty' };
+      const patchPath = join(targetDir, `${assignment}-${headSha.slice(0, 12)}-${nonce}.patch`);
+      await writeFile(patchPath, diff.stdout, { mode: 0o600 });
+      artifacts.push(patchPath);
+    } finally {
+      await unlink(indexPath).catch(() => {});
+      await unlink(`${indexPath}.lock`).catch(() => {});
+    }
+  }
+  return { ok: true, detail: artifacts.join(',') || 'no_local_only_bytes' };
 }
 
 async function verifyCommittedFinalization(
@@ -412,10 +519,7 @@ export async function inspectSupervisionGitWorktree(repoPath: string): Promise<S
   const worktreeResult = await runGit(repoPath, ['worktree', 'list', '--porcelain']);
   if (!worktreeResult.ok) return { ok: false, reason: SUPERVISION_WORKTREE_GC_REASONS.GIT_UNAVAILABLE };
   const block = await worktreeBlock(worktreeResult.stdout, repoPath);
-  if (!block) {
-    return { ok: false, commonDir, registered: false, reason: SUPERVISION_WORKTREE_GC_REASONS.GIT_UNREGISTERED };
-  }
-  const locked = block.split('\n').some((line) => line === 'locked' || line.startsWith('locked '));
+  const locked = block?.split('\n').some((line) => line === 'locked' || line.startsWith('locked ')) ?? false;
 
   let branchOnly = false;
   let unpushed = false;
@@ -436,7 +540,7 @@ export async function inspectSupervisionGitWorktree(repoPath: string): Promise<S
   return {
     ok: true,
     commonDir,
-    registered: true,
+    registered: Boolean(block),
     locked,
     dirty,
     untracked,
@@ -450,10 +554,15 @@ async function removeRegisteredGitWorktree(
   repoPath: string,
 ): Promise<boolean> {
   if (!inspection.commonDir) return false;
+  if (inspection.registered === false) {
+    await rm(repoPath, { recursive: true, force: false });
+    return true;
+  }
   const removed = await runGit(dirname(inspection.commonDir), [
     `--git-dir=${inspection.commonDir}`,
     'worktree',
     'remove',
+    '--force',
     repoPath,
   ]);
   return removed.ok;
@@ -603,11 +712,14 @@ async function scanCandidatePaths(
   return { candidates: candidates.sort((left, right) => left.key.localeCompare(right.key)), truncated };
 }
 
-function protectedCandidate(candidatePath: string, protectedPaths: readonly string[]): boolean {
-  return protectedPaths.some((path) => {
-    const canonical = resolve(path);
-    return canonical === candidatePath || relative(candidatePath, canonical).split(/[\\/]/)[0] !== '..';
-  });
+async function protectedCandidate(candidatePath: string, protectedPaths: readonly string[]): Promise<boolean> {
+  const candidateCanonical = await realpath(candidatePath).catch(() => resolve(candidatePath));
+  for (const path of protectedPaths) {
+    const canonical = await realpath(path).catch(() => resolve(path));
+    if (canonical === candidateCanonical
+      || relative(candidateCanonical, canonical).split(/[\\/]/)[0] !== '..') return true;
+  }
+  return false;
 }
 
 async function evaluateCandidate(
@@ -619,6 +731,8 @@ async function evaluateCandidate(
   metadataText?: string;
   inspection?: SupervisionWorktreeGitInspection;
   repoMissing?: boolean;
+  orphan?: boolean;
+  backupRequired?: boolean;
 }> {
   const retain = (reason: SupervisionWorktreeGcReason, taskId?: string, detail?: string) => ({
     entry: {
@@ -632,7 +746,7 @@ async function evaluateCandidate(
       ...(detail ? { detail } : {}),
     },
   });
-  if (protectedCandidate(candidate.candidatePath, deps.protectedPaths ?? [process.cwd()])) {
+  if (await protectedCandidate(candidate.candidatePath, deps.protectedPaths ?? [process.cwd()])) {
     return retain(SUPERVISION_WORKTREE_GC_REASONS.PROTECTED_PATH);
   }
   const parsed = await readMetadata(candidate.candidatePath).catch(() => undefined);
@@ -666,6 +780,50 @@ async function evaluateCandidate(
   }
   const taskId = parsed?.metadata.taskId ?? reference.assignment?.taskId;
   if (!reference.available) return retain(SUPERVISION_WORKTREE_GC_REASONS.REGISTRY_UNAVAILABLE, taskId);
+  if (!reference.assignment && !reference.task && deps.reclaimOrphans) {
+    const candidateStat = await lstat(candidate.candidatePath).catch(() => undefined);
+    const createdAt = parsed ? Date.parse(parsed.metadata.createdAt) : Number.NaN;
+    const observedAt = Number.isFinite(createdAt) ? createdAt : candidateStat?.mtimeMs;
+    const graceMs = Math.max(60_000, deps.orphanGraceMs ?? SUPERVISION_WORKTREE_GC_ORPHAN_GRACE_MS);
+    if (!observedAt || (deps.now?.() ?? Date.now()) - observedAt < graceMs) {
+      return retain(SUPERVISION_WORKTREE_GC_REASONS.UNKNOWN_OWNER, taskId);
+    }
+    if (!candidate.external) {
+      let contentReason: SupervisionWorktreeGcReason | undefined;
+      try { contentReason = await inspectCandidateContents(candidate.candidatePath, Boolean(candidateRepoPath)); } catch {
+        return retain(SUPERVISION_WORKTREE_GC_REASONS.INVALID_LAYOUT, taskId);
+      }
+      if (contentReason) return retain(contentReason, taskId);
+    }
+    if (!candidateRepoPath) {
+      return {
+        entry: {
+          key: candidate.key, assignmentId: candidate.assignmentId,
+          taskId: taskId ?? `orphan-${candidate.assignmentId}`,
+          path: candidate.candidatePath, repoPath: candidate.repoPath,
+          action: 'delete', reason: SUPERVISION_WORKTREE_GC_REASONS.ELIGIBLE,
+          detail: 'orphan_shell',
+        },
+        metadataText: parsed?.text ?? '', repoMissing: true, orphan: true,
+      };
+    }
+    deps.onScanOperation?.('git');
+    const inspection = await (deps.inspectGit ?? inspectSupervisionGitWorktree)(candidate.repoPath);
+    if (!inspection.ok) return retain(inspection.reason ?? SUPERVISION_WORKTREE_GC_REASONS.GIT_UNAVAILABLE, taskId);
+    if (inspection.locked) return retain(SUPERVISION_WORKTREE_GC_REASONS.GIT_LOCKED, taskId);
+    return {
+      entry: {
+        key: candidate.key, assignmentId: candidate.assignmentId,
+        taskId: taskId ?? `orphan-${candidate.assignmentId}`,
+        path: candidate.candidatePath, repoPath: candidate.repoPath,
+        action: 'delete', reason: SUPERVISION_WORKTREE_GC_REASONS.ELIGIBLE,
+        detail: inspection.dirty || inspection.untracked || inspection.branchOnly || inspection.unpushed
+          ? 'orphan_backup_required' : 'orphan',
+      },
+      metadataText: parsed?.text ?? '', inspection, orphan: true,
+      backupRequired: Boolean(inspection.dirty || inspection.untracked || inspection.branchOnly || inspection.unpushed),
+    };
+  }
   if (!reference.assignment || !reference.task
     || reference.assignment.assignmentId !== candidate.assignmentId
     || reference.assignment.taskId !== taskId
@@ -685,8 +843,15 @@ async function evaluateCandidate(
     || !TERMINAL_ASSIGNMENT.has(reference.assignment.status)) {
     return retain(SUPERVISION_WORKTREE_GC_REASONS.ACTIVE_REFERENCE, taskId);
   }
-  const authorityReason = registryAuthorityReason(reference, candidate.assignmentId);
-  if (authorityReason) return retain(authorityReason, taskId);
+  if (reference.assignment.status === 'cancelled') {
+    const activeSibling = reference.task.assignments.some((assignment) => (
+      assignment.assignmentId !== candidate.assignmentId && ACTIVE_ASSIGNMENT.has(assignment.status)
+    ));
+    if (activeSibling) return retain(SUPERVISION_WORKTREE_GC_REASONS.ACTIVE_REFERENCE, taskId);
+  } else {
+    const authorityReason = registryAuthorityReason(reference, candidate.assignmentId);
+    if (authorityReason) return retain(authorityReason, taskId);
+  }
   let contentReason: SupervisionWorktreeGcReason | undefined;
   try { contentReason = await inspectCandidateContents(candidate.candidatePath, Boolean(candidateRepoPath)); } catch {
     return retain(SUPERVISION_WORKTREE_GC_REASONS.INVALID_LAYOUT, taskId);
@@ -719,16 +884,22 @@ async function evaluateCandidate(
   deps.onScanOperation?.('git');
   const inspection = await (deps.inspectGit ?? inspectSupervisionGitWorktree)(candidate.repoPath);
   if (!inspection.ok) return retain(inspection.reason ?? SUPERVISION_WORKTREE_GC_REASONS.GIT_UNAVAILABLE, taskId);
-  if (!inspection.registered) return retain(SUPERVISION_WORKTREE_GC_REASONS.GIT_UNREGISTERED, taskId);
+  if (!inspection.registered && !deps.preserveTerminalChanges) {
+    return retain(SUPERVISION_WORKTREE_GC_REASONS.GIT_UNREGISTERED, taskId);
+  }
   if (inspection.locked) return retain(SUPERVISION_WORKTREE_GC_REASONS.GIT_LOCKED, taskId);
-  if (inspection.untracked) return retain(SUPERVISION_WORKTREE_GC_REASONS.UNTRACKED, taskId);
-  if (inspection.dirty) return retain(SUPERVISION_WORKTREE_GC_REASONS.DIRTY, taskId);
-  if (inspection.branchOnly) return retain(SUPERVISION_WORKTREE_GC_REASONS.BRANCH_ONLY, taskId);
-  if (inspection.unpushed) return retain(SUPERVISION_WORKTREE_GC_REASONS.UNPUSHED_BRANCH, taskId);
-  const finalization = reference.task.finalization!;
-  if (inspection.finalizationVerified !== true
-    && !await (deps.verifyFinalization ?? verifyCommittedFinalization)(candidate.repoPath, finalization)) {
-    return retain(SUPERVISION_WORKTREE_GC_REASONS.MANIFEST_MISMATCH, taskId);
+  if (!deps.preserveTerminalChanges) {
+    if (inspection.untracked) return retain(SUPERVISION_WORKTREE_GC_REASONS.UNTRACKED, taskId);
+    if (inspection.dirty) return retain(SUPERVISION_WORKTREE_GC_REASONS.DIRTY, taskId);
+    if (inspection.branchOnly) return retain(SUPERVISION_WORKTREE_GC_REASONS.BRANCH_ONLY, taskId);
+    if (inspection.unpushed) return retain(SUPERVISION_WORKTREE_GC_REASONS.UNPUSHED_BRANCH, taskId);
+  }
+  if (reference.assignment.status !== 'cancelled') {
+    const finalization = reference.task.finalization!;
+    if (inspection.finalizationVerified !== true
+      && !await (deps.verifyFinalization ?? verifyCommittedFinalization)(candidate.repoPath, finalization)) {
+      return retain(SUPERVISION_WORKTREE_GC_REASONS.MANIFEST_MISMATCH, taskId);
+    }
   }
   return {
     entry: {
@@ -742,6 +913,7 @@ async function evaluateCandidate(
     },
     metadataText: parsed?.text ?? '',
     inspection,
+    backupRequired: Boolean(inspection.dirty || inspection.untracked || inspection.branchOnly || inspection.unpushed),
   };
 }
 
@@ -821,8 +993,12 @@ async function postGitRemoveCandidate(
 ): Promise<boolean> {
   const candidatePath = resolve(journal.candidatePath);
   const root = await realpath(worktreesRoot).catch(() => resolve(worktreesRoot));
-  if (relative(root, candidatePath).startsWith('..') || basename(candidatePath) !== journal.assignmentId) return false;
-  if (protectedCandidate(candidatePath, deps.protectedPaths ?? [process.cwd()])) return false;
+  if (journal.external) {
+    if (!await safeExternalIntegrationPath(candidatePath)) return false;
+  } else if (relative(root, candidatePath).startsWith('..') || basename(candidatePath) !== journal.assignmentId) {
+    return false;
+  }
+  if (await protectedCandidate(candidatePath, deps.protectedPaths ?? [process.cwd()])) return false;
   const candidateStat = await lstat(candidatePath).catch(() => undefined);
   if (!candidateStat) return true;
   if (!candidateStat.isDirectory() || candidateStat.isSymbolicLink()) return false;
@@ -839,17 +1015,24 @@ async function postGitRemoveCandidate(
       repoPath: journal.repoPath,
     }) ?? { available: false })
     .catch((): SupervisionWorktreeRegistryReference => ({ available: false }));
-  if (!reference.available || !reference.assignment || !reference.task
-    || reference.assignment.assignmentId !== journal.assignmentId
-    || reference.assignment.taskId !== journal.taskId
-    || reference.task.taskId !== journal.taskId
-    || reference.task.projectName !== projectName
-    || !reference.task.assignments.some((assignment) => assignment.assignmentId === journal.assignmentId)
-    || reference.assignment.leaseId
-    || ACTIVE_ASSIGNMENT.has(reference.assignment.status)
-    || !TERMINAL_ASSIGNMENT.has(reference.assignment.status)
-    || registryAuthorityReason(reference, journal.assignmentId)
-    || (reference.claims ?? []).some((claim) => claim.assignmentId === journal.assignmentId)) return false;
+  const orphanStillUnknown = journal.orphan && reference.available
+    && !reference.assignment && !reference.task;
+  const terminalStillAuthorized = !journal.orphan && reference.available
+    && Boolean(reference.assignment) && Boolean(reference.task)
+    && reference.assignment!.assignmentId === journal.assignmentId
+    && reference.assignment!.taskId === journal.taskId
+    && reference.task!.taskId === journal.taskId
+    && reference.task!.projectName === projectName
+    && reference.task!.assignments.some((assignment) => assignment.assignmentId === journal.assignmentId)
+    && !reference.assignment!.leaseId
+    && !ACTIVE_ASSIGNMENT.has(reference.assignment!.status)
+    && TERMINAL_ASSIGNMENT.has(reference.assignment!.status)
+    && (reference.assignment!.status === 'cancelled'
+      ? !reference.task!.assignments.some((assignment) => assignment.assignmentId !== journal.assignmentId
+        && ACTIVE_ASSIGNMENT.has(assignment.status))
+      : !registryAuthorityReason(reference, journal.assignmentId))
+    && !(reference.claims ?? []).some((claim) => claim.assignmentId === journal.assignmentId);
+  if (!orphanStillUnknown && !terminalStillAuthorized) return false;
   if (await lstat(journal.repoPath).then(() => true, () => false)) return false;
   const contentReason = await inspectCandidateContents(candidatePath, false).catch(
     () => SUPERVISION_WORKTREE_GC_REASONS.UNKNOWN_CONTENT,
@@ -887,7 +1070,7 @@ async function recoverInterruptedApply(
     if (repoExists) {
       const inspection = await (deps.inspectGit ?? inspectSupervisionGitWorktree)(journal.repoPath)
         .catch((): SupervisionWorktreeGitInspection => ({ ok: false }));
-      if (!inspection.ok || !inspection.registered) {
+      if (!inspection.ok) {
         return { ok: false, deleted: 0, mutations: 0, releasedBytes: 0, assignmentId: journal.assignmentId };
       }
       await unlink(journalPath).catch(() => {});
@@ -926,19 +1109,27 @@ async function recoverInterruptedApply(
         }) ?? { available: false })
         .catch((): SupervisionWorktreeRegistryReference => ({ available: false }))
       : undefined;
+    const orphanStillUnknown = journal.orphan && reference?.available
+      && !reference.assignment && !reference.task;
+    const terminalStillAuthorized = !journal.orphan && Boolean(reference?.available)
+      && Boolean(reference?.assignment) && Boolean(reference?.task)
+      && reference!.assignment!.assignmentId === journal.assignmentId
+      && reference!.assignment!.taskId === journal.taskId
+      && reference!.task!.taskId === journal.taskId
+      && reference!.task!.projectName === projectName
+      && reference!.task!.assignments.some((assignment) => assignment.assignmentId === journal.assignmentId)
+      && !reference!.assignment!.leaseId
+      && !ACTIVE_ASSIGNMENT.has(reference!.assignment!.status)
+      && TERMINAL_ASSIGNMENT.has(reference!.assignment!.status)
+      && (reference!.assignment!.status === 'cancelled'
+        ? !reference!.task!.assignments.some((assignment) => assignment.assignmentId !== journal.assignmentId
+          && ACTIVE_ASSIGNMENT.has(assignment.status))
+        : !registryAuthorityReason(reference!, journal.assignmentId))
+      && !(reference!.claims ?? []).some((claim) => claim.assignmentId === journal.assignmentId);
     if (!quarantineStat.isDirectory() || quarantineStat.isSymbolicLink()
       || !metadataMatches
       || (parsed && (parsed.metadata.assignmentId !== journal.assignmentId || parsed.metadata.taskId !== journal.taskId))
-      || !reference?.available || !reference.assignment || !reference.task
-      || reference.assignment.assignmentId !== journal.assignmentId
-      || reference.assignment.taskId !== journal.taskId
-      || reference.task.taskId !== journal.taskId || reference.task.projectName !== projectName
-      || !reference.task.assignments.some((assignment) => assignment.assignmentId === journal.assignmentId)
-      || reference.assignment.leaseId
-      || ACTIVE_ASSIGNMENT.has(reference.assignment.status)
-      || !TERMINAL_ASSIGNMENT.has(reference.assignment.status)
-      || registryAuthorityReason(reference, journal.assignmentId)
-      || (reference.claims ?? []).some((claim) => claim.assignmentId === journal.assignmentId)
+      || (!orphanStillUnknown && !terminalStillAuthorized)
       || await inspectCandidateContents(journal.quarantinePath, false).catch(() => SUPERVISION_WORKTREE_GC_REASONS.UNKNOWN_CONTENT)) {
       return { ok: false, deleted: 0, mutations: 0, releasedBytes: 0, assignmentId: journal.assignmentId };
     }
@@ -1041,6 +1232,26 @@ export async function runSupervisionWorktreeGc(
       diagnostics.push({ code: safeErrorCode(error) });
       return { ...empty(SUPERVISION_WORKTREE_GC_REASONS.REGISTRY_UNAVAILABLE, mode === 'apply' ? 'acquired' : 'not_required'), diagnostics };
     }
+    if (deps.reclaimOrphans && deps.listExternalOrphanWorktrees) {
+      const externalPaths = await Promise.resolve(deps.listExternalOrphanWorktrees(input.projectName))
+        .catch((): readonly string[] => []);
+      for (const externalPath of externalPaths.slice(0, SUPERVISION_WORKTREE_GC_MAX_ASSIGNMENTS)) {
+        if (!await safeExternalIntegrationPath(externalPath)) continue;
+        const canonical = await realpath(externalPath).catch(() => undefined);
+        const info = canonical ? await lstat(canonical).catch(() => undefined) : undefined;
+        if (!canonical || !info?.isDirectory() || info.isSymbolicLink()) continue;
+        const digest = createHash('sha256').update(canonical).digest('hex').slice(0, 16);
+        scannedPaths.candidates.push({
+          key: `~external/${digest}`,
+          assignmentId: `asg_external${digest}`,
+          candidatePath: canonical,
+          repoPath: canonical,
+          sessionName: 'deck_external_integration',
+          external: true,
+        });
+      }
+      scannedPaths.candidates.sort((left, right) => left.key.localeCompare(right.key));
+    }
     const afterCursor = scannedPaths.candidates.filter((candidate) => !input.cursor || candidate.key > input.cursor);
     // Crash recovery and fresh candidates share one apply mutation budget.
     // A successful recovery mutation consumes capacity before the page is
@@ -1099,6 +1310,22 @@ export async function runSupervisionWorktreeGc(
         await (deps.yieldControl ?? nextTurn)();
         continue;
       }
+      if (revalidated.inspection && revalidated.backupRequired) {
+        const preserved = await preserveCandidateState(
+          candidate, revalidated.inspection, input.projectName, deps,
+        ).catch(() => ({ ok: false, detail: 'backup_exception' }));
+        if (!preserved.ok) {
+          diagnostics.push({ code: preserved.detail ?? 'backup_failed', assignmentId: candidate.assignmentId });
+          entries.push({
+            ...revalidated.entry,
+            action: 'retain',
+            reason: SUPERVISION_WORKTREE_GC_REASONS.BACKUP_FAILED,
+            detail: preserved.detail,
+          });
+          await (deps.yieldControl ?? nextTurn)();
+          continue;
+        }
+      }
       const journal: GcJournal = {
         version: JOURNAL_VERSION,
         runId,
@@ -1111,6 +1338,8 @@ export async function runSupervisionWorktreeGc(
         metadataText: revalidated.metadataText,
         sessionName: candidate.sessionName,
         candidateBytes: Math.max(0, await (deps.measureDirectoryBytes ?? directoryBytes)(candidate.candidatePath)),
+        ...(revalidated.orphan ? { orphan: true } : {}),
+        ...(candidate.external ? { external: true } : {}),
         updatedAt: deps.now?.() ?? Date.now(),
       };
       mutations += 1;
