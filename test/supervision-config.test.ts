@@ -48,6 +48,7 @@ import {
   normalizeSupervisorDefaultConfig,
   parseSupervisionExecutionStateDetailsFromText,
   parseSupervisionExecutionStateFromText,
+  stripSupervisionExecutionMarkersForDisplay,
   parseTaskRunTerminalStateFromText,
   patchPeerAuditTargetInTransportConfig,
   projectSharedSessionSupervisionMode,
@@ -476,6 +477,30 @@ describe('supervision config helpers', () => {
     expect(parseSupervisionExecutionStateDetailsFromText(
       `still running\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}\n\n`,
     )).toEqual({ state: 'waiting', markerCount: 1 });
+  });
+
+  it('strips only active standalone execution markers from user-visible text', () => {
+    const waiting = SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING;
+    const needsInput = SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT;
+    expect(stripSupervisionExecutionMarkersForDisplay(
+      `等待外部任务完成。\n${waiting}`,
+    )).toBe('等待外部任务完成。');
+    expect(stripSupervisionExecutionMarkersForDisplay(
+      `${needsInput}\n请提供授权。\n${waiting}`,
+    )).toBe('请提供授权。');
+    expect(stripSupervisionExecutionMarkersForDisplay([
+      `> ${waiting}`,
+      '```md',
+      needsInput,
+      '```',
+      `inline ${waiting}`,
+    ].join('\n'))).toBe([
+      `> ${waiting}`,
+      '```md',
+      needsInput,
+      '```',
+      `inline ${waiting}`,
+    ].join('\n'));
   });
 
   it('keeps the retired completion marker inert outside quotes and fences', () => {
@@ -1074,4 +1099,3 @@ describe('supervision audit blocking severities', () => {
     }
   });
 });
-

@@ -16,6 +16,7 @@ import { EXECUTION_CLONE_TIMELINE } from '../../../shared/execution-clone.js';
 import { AGENT_DELEGATION_REPLY_TIMELINE_EVENT } from '../../../shared/agent-delegation.js';
 import { NATIVE_COLLABORATION_POLICY_TIMELINE_EVENT } from '../../../shared/native-collaboration-policy.js';
 import { SUPERVISION_ASSIGNMENT_STATUS_TIMELINE_EVENT } from '../../../shared/supervision-assignment-start.js';
+import { stripSupervisionExecutionMarkersForDisplay } from '../../../shared/supervision-config.js';
 import type { TimelineDetailRef, TimelineEventCompleteness } from '../../../shared/timeline-protocol.js';
 import type {
   PeerAuditRuntimeDisposition,
@@ -171,7 +172,9 @@ export const TIMELINE_PREFERENCE_DEPENDENT_TYPES: readonly string[] = [
  * "blank" means.
  */
 export function normalizeAssistantTextForDisplay(text: unknown): string {
-  return String(text ?? '').trim().replace(/\n{3,}/g, '\n\n');
+  return stripSupervisionExecutionMarkersForDisplay(String(text ?? ''))
+    .trim()
+    .replace(/\n{3,}/g, '\n\n');
 }
 
 export function isGuaranteedVisibleTimelineEvent(

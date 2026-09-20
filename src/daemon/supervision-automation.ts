@@ -2479,6 +2479,61 @@ class SupervisionAutomation {
     return true;
   }
 
+  /**
+   * Adopt a terminal WAITING report even when the turn was woken by trusted
+   * daemon/delegation traffic rather than a user task command.
+   *
+   * Internal notifications are intentionally not task candidates: treating a
+   * receipt as a new user request would make completion/audit decisions about
+   * the notification text. That exclusion also used to discard the terminal
+   * WAITING boundary itself, though. With no active run, nothing persisted a
+   * wait row and the ten-minute heartbeat had no authority to fire.
+   *
+   * This path is deliberately WAITING-only. `handleExecutionStatus` still
+   * requires authoritative IM.codes delegation evidence before it parks, so
+   * arbitrary assistant prose cannot manufacture a durable run. The exact
+   * completion key is consumed before asynchronous evidence lookup, making
+   * repeated in-process idle projections idempotent. Once the wait is
+   * accepted, the persisted wait row is the restart authority.
+   */
+  private tryAdoptUntrackedWaitingCompletion(
+    sessionName: string,
+    snapshot: SessionSupervisionSnapshot,
+  ): boolean {
+    if (!isBrainOwnedAutomaticSupervision(sessionName, snapshot)) return false;
+    const latestAssistant = this.latestAssistantTexts.get(sessionName);
+    if (!latestAssistant?.completionKey
+      || parseSupervisionExecutionStateDetailsFromText(latestAssistant.text).state !== 'waiting'
+      || this.recoveredImplicitCompletionKeySet.has(latestAssistant.completionKey)) return false;
+
+    const commandId = `supervision-waiting:${createHash('sha256')
+      .update(latestAssistant.completionKey)
+      .digest('hex')}`;
+    const run = this.registerTaskIntent(
+      sessionName,
+      commandId,
+      'Resume authoritative supervised work after an internal notification.',
+      snapshot,
+    );
+    if (!run) return false;
+    run.lastAssistantText = latestAssistant.text;
+    run.lastAssistantCompletionKey = latestAssistant.completionKey;
+    run.lastTurnActivitySequence = latestAssistant.sequence;
+    run.sawAssistantOutput = true;
+    run.evaluating = true;
+    this.rememberRecoveredImplicitCompletionKey(latestAssistant.completionKey);
+    this.emitCheckingState(sessionName);
+    void this.evaluateExecutionTurn(run).catch((error) => {
+      const current = this.activeRuns.get(sessionName);
+      if (!current || current.generation !== run.generation) return;
+      logger.warn({ session: sessionName, err: error }, 'Supervision notification WAITING adoption failed');
+      this.emitTerminalStatus(sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
+      this.emitWarning(sessionName, 'Automation could not validate the reported wait. Manual continuation is required.');
+      this.finishRun(sessionName, 'needs_input', { preserveStatus: true });
+    });
+    return true;
+  }
+
   private failClosedImplicitCandidate(
     sessionName: string,
     snapshot: SessionSupervisionSnapshot | null | undefined,
@@ -3775,7 +3830,9 @@ class SupervisionAutomation {
           if (isAutomaticSupervisionEnabled(snapshot)) {
             this.resetImplicitCompletionWait(event.sessionId);
             if (!this.tryStartImplicitRun(event.sessionId, snapshot)) {
-              this.tryRecoverImplicitRunFromTimeline(event.sessionId, snapshot);
+              if (!this.tryRecoverImplicitRunFromTimeline(event.sessionId, snapshot)) {
+                this.tryAdoptUntrackedWaitingCompletion(event.sessionId, snapshot);
+              }
             }
           }
         }
@@ -3865,7 +3922,9 @@ class SupervisionAutomation {
             this.armImplicitCompletionGrace(event.sessionId, snapshot, candidate);
           }
         } else if (isAutomaticSupervisionEnabled(snapshot)) {
-          this.tryRecoverImplicitRunFromTimeline(event.sessionId, snapshot);
+          if (!this.tryRecoverImplicitRunFromTimeline(event.sessionId, snapshot)) {
+            this.tryAdoptUntrackedWaitingCompletion(event.sessionId, snapshot);
+          }
         }
         // Intentionally: do NOT delete the candidate when supervision is OFF
         // at idle. The user may enable Auto afterwards, and

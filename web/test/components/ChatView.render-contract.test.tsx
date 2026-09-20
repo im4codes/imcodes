@@ -11,6 +11,7 @@ import {
   isNeverRenderedTimelineEventType,
 } from '../../../src/shared/timeline/types.js';
 import { EXECUTION_CLONE_TIMELINE } from '../../../shared/execution-clone.js';
+import { SUPERVISION_EXECUTION_STATUS_MARKERS } from '../../../shared/supervision-config.js';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string) => key }),
@@ -184,6 +185,26 @@ describe('ChatView render capability contract', () => {
       }
     },
   );
+
+  it('hides machine-only supervision markers while preserving the assistant message', () => {
+    const event = {
+      ...ev('assistant.text'),
+      payload: {
+        text: `仍在等待已委派任务。\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`,
+      },
+    } as unknown as TimelineEvent;
+    const items = __buildViewItemsForTests([event], false);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ type: 'assistant-block', text: '仍在等待已委派任务。' });
+
+    const markerOnly = {
+      ...event,
+      eventId: 'marker-only',
+      payload: { text: SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT },
+    } as unknown as TimelineEvent;
+    expect(__buildViewItemsForTests([markerOnly], false)).toHaveLength(0);
+    expect(isGuaranteedVisibleTimelineEvent(markerOnly)).toBe(false);
+  });
 
   it.each(ALL_CONTENT_TYPES.map((type) => [type]))(
     'never offers older history for a pane made only of %s unless it drew something',

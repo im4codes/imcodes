@@ -5676,6 +5676,154 @@ describe('SupervisionAutomation', () => {
     }
   });
 
+  it('adopts and persists a Brain WAITING turn that was woken only by an internal delegation notification', async () => {
+    await seedSession('supervised_audit');
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      supervisionAutomation.init();
+      timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+        text: [
+          AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER,
+          'A delegated agent completed the requested work.',
+          'Delegation ID: delegation-heartbeat-recovery',
+          'From session: deck_sub_reviewer',
+        ].join('\n'),
+        clientMessageId: 'delegation-notification-heartbeat-recovery',
+        allowDuplicate: true,
+      });
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+      timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+        text: `The remaining supervised work is still pending.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`,
+        streaming: false,
+      });
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+        phase: 'execution',
+        waitingStartedAt: expect.any(Number),
+        waitingNextHeartbeatAt: expect.any(Number),
+      });
+
+      // The row, not process memory, is the restart authority.
+      supervisionAutomation.__simulateProcessRestartForTests();
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+        phase: 'execution',
+        waitingStartedAt: expect.any(Number),
+      });
+
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      const heartbeats = mockTransportRuntime.send.mock.calls.filter((call) => (
+        String(call[0]).includes(`[Contract: ${SUPERVISION_CONTRACT_IDS.WAITING_HEARTBEAT}]`)
+      ));
+      expect(heartbeats).toHaveLength(1);
+      expectWaitingHeartbeatContract(heartbeats[0]?.[0]);
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+        continueLoops: 0,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not postpone the original waiting heartbeat when more internal notifications arrive', async () => {
+    await seedSession('supervised_audit');
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      supervisionAutomation.init();
+      const completeInternalWaitingTurn = (suffix: string) => {
+        timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+          text: `${AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER}\nDelegation ID: delegation-${suffix}`,
+          clientMessageId: `delegation-notification-${suffix}`,
+          allowDuplicate: true,
+        });
+        timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+        timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+          text: `Still waiting after ${suffix}.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`,
+          streaming: false,
+        });
+        timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+      };
+
+      completeInternalWaitingTurn('first');
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const originalDueAt = supervisionAutomation.getActiveRun('deck_supervision_brain')?.waitingNextHeartbeatAt;
+      expect(originalDueAt).toBe(Date.now() + 10 * 60_000);
+
+      await vi.advanceTimersByTimeAsync(6 * 60_000);
+      completeInternalWaitingTurn('second');
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')?.waitingNextHeartbeatAt)
+        .toBe(originalDueAt);
+
+      await vi.advanceTimersByTimeAsync(4 * 60_000);
+      const heartbeats = mockTransportRuntime.send.mock.calls.filter((call) => (
+        String(call[0]).includes(`[Contract: ${SUPERVISION_CONTRACT_IDS.WAITING_HEARTBEAT}]`)
+      ));
+      expect(heartbeats).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('re-engages an untracked internal WAITING turn when no authoritative delegated work exists', async () => {
+    await seedSession('supervised_audit');
+    delegationEvidenceState.authorized = false;
+    supervisionAutomation.init();
+
+    timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+      text: `${AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER}\nDelegation ID: integration-owner-self-work`,
+      clientMessageId: 'delegation-notification-self-work',
+      allowDuplicate: true,
+    });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+    timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+      text: `No delegated participant remains; local coordination is still pending.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`,
+      streaming: false,
+    });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+
+    await vi.waitFor(() => expect(mockTransportRuntime.send).toHaveBeenCalledOnce());
+    expect(String(mockTransportRuntime.send.mock.calls[0]?.[0])).toContain('WAITING refused');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      phase: 'execution',
+      continueLoops: 1,
+    });
+  });
+
+  it.each(['off', 'unknown'] as const)(
+    'does not adopt an internal WAITING turn when supervision mode is %s',
+    async (mode) => {
+      const snapshot = await seedSession('supervised_audit');
+      const disabled = { ...snapshot, mode: mode === 'off' ? SUPERVISION_MODE.OFF : 'future_unknown_mode' };
+      upsertSession({
+        ...getSession('deck_supervision_brain')!,
+        transportConfig: { supervision: disabled },
+        updatedAt: Date.now(),
+      });
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+      try {
+        supervisionAutomation.init();
+        timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+          text: `${AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER}\nDelegation ID: disabled-${mode}`,
+          clientMessageId: `delegation-disabled-${mode}`,
+          allowDuplicate: true,
+        });
+        timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+          text: `Not an enabled wait.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`,
+          streaming: false,
+        });
+        timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+        await vi.advanceTimersByTimeAsync(20 * 60_000);
+
+        expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+        expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
   it('keeps manually projected heartbeat client ids single across queued reconnect drain', async () => {
     const snapshot = await seedSession('supervised', false, 2, { uiLocale: 'zh-CN' });
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });

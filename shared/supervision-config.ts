@@ -1712,6 +1712,23 @@ function scanAssistantAuthoredExecutionLines(text: string): {
 }
 
 /**
+ * Remove machine-only execution marker lines from user-visible assistant text.
+ *
+ * The parser and renderer intentionally share the exact line scanner. Quoted,
+ * inline, or fenced examples are therefore still visible and can never be
+ * confused with the active protocol boundary; only authoritative standalone
+ * marker lines are omitted from presentation.
+ */
+export function stripSupervisionExecutionMarkersForDisplay(text: string): string {
+  const { matches } = scanAssistantAuthoredExecutionLines(text);
+  if (matches.length === 0) return text;
+  const hiddenLineIndexes = new Set(matches.map((match) => match.lineIndex));
+  return text.split(/\r?\n/u)
+    .filter((_line, lineIndex) => !hiddenLineIndexes.has(lineIndex))
+    .join('\n');
+}
+
+/**
  * Parse only assistant-authored marker lines. Host dispatch metadata is carried
  * beside `assistant.text.payload.text`, never concatenated into this input.
  * Markdown quotations, fenced examples, inline prose and indented code are not
