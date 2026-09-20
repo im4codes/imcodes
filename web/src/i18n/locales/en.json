@@ -3219,6 +3219,7 @@
     "chip_title": "Delegation target: {{target}}",
     "reply_title": "Delegation reply",
     "reply_from": "From {{source}}",
+    "reply_objective_details": "Full task objective",
     "warning_empty_task": "Enter a task before delegating to an agent.",
     "warning_attachments": "Delegation does not support attachments yet. Remove attachments and describe the task in text.",
     "warning_quotes": "Delegation does not support quoted chat excerpts yet. Remove quotes and include the needed context in the task.",

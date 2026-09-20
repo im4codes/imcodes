@@ -6,7 +6,6 @@ import {
   AGENT_DELEGATION_REPLY_ERRORS,
   AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
   AGENT_DELEGATION_REPLY_VERSION,
-  AGENT_DELEGATION_SUPERVISION_TASK_TITLE_MAX_BYTES,
 } from '../../shared/agent-delegation.js';
 import {
   PEER_AUDIT_DELEGATED_REPLY_STATUS,
@@ -586,7 +585,8 @@ describe('delegation reply ingress', () => {
           assignmentId: auditRecord.assignmentId,
           attemptId: auditRecord.auditAttemptId,
           revision: auditRecord.auditRevision,
-          title: 'Verify the payment retry race without duplicate charges.',
+          title: 'Verify the payment retry race…',
+          objective: 'Verify the payment retry race\nwithout duplicate charges.',
         },
       }),
       expect.any(Object),
@@ -1157,7 +1157,7 @@ describe('delegation reply ingress', () => {
     );
   });
 
-  it('carries a normal multi-hundred-character registry objective whole on one line', async () => {
+  it('projects a concise CJK-safe title and keeps the complete registry objective', async () => {
     const taskRecord = {
       ...record,
       taskId: 'tsk_whole_title_1',
@@ -1193,16 +1193,17 @@ describe('delegation reply ingress', () => {
     })).resolves.toEqual(expect.objectContaining({ ok: true }));
 
     const payload = mocks.timelineEmit.mock.calls[0]![2] as {
-      supervisionTask?: { title?: string };
+      supervisionTask?: { title?: string; objective?: string };
     };
     const title = payload.supervisionTask?.title ?? '';
-    expect(title).toBe(`${'界'.repeat(120)} ${'x'.repeat(120)}`);
-    expect(title).not.toContain('…');
+    expect(Array.from(title).length).toBeLessThanOrEqual(120);
+    expect(title).toMatch(/…$/u);
     expect(title).not.toContain('\n');
+    expect(payload.supervisionTask?.objective).toBe(`${'界'.repeat(120)} ${'x'.repeat(120)}`);
   });
 
 
-  it('bounds an oversized registry objective to one UTF-8-safe title', async () => {
+  it('bounds an oversized registry objective and keeps a bounded full-objective detail', async () => {
     const taskRecord = {
       ...record,
       taskId: 'tsk_long_title_1',
@@ -1238,12 +1239,14 @@ describe('delegation reply ingress', () => {
     })).resolves.toEqual(expect.objectContaining({ ok: true }));
 
     const payload = mocks.timelineEmit.mock.calls[0]![2] as {
-      supervisionTask?: { title?: string };
+      supervisionTask?: { title?: string; objective?: string };
     };
     const title = payload.supervisionTask?.title ?? '';
     expect(title).toMatch(/…$/u);
     expect(title).not.toContain('\n');
-    expect(new TextEncoder().encode(title).byteLength).toBeLessThanOrEqual(AGENT_DELEGATION_SUPERVISION_TASK_TITLE_MAX_BYTES);
+    expect(Array.from(title).length).toBeLessThanOrEqual(120);
+    expect(payload.supervisionTask?.objective).toMatch(/…$/u);
+    expect(new TextEncoder().encode(payload.supervisionTask?.objective ?? '').byteLength).toBeLessThanOrEqual(4096);
   });
 
 

@@ -8,6 +8,7 @@ import {
   AGENT_DELEGATION_SUPERVISION_TASK_PROJECTION_VERSION,
   decodeAgentDelegationReplyEnvelope,
   projectAgentDelegationSupervisionTaskTitle,
+  projectAgentDelegationSupervisionTaskObjective,
   readTrustedAgentDelegationPeerAuditCompletionBinding,
   readTrustedAgentDelegationReplyVerdict,
   type AgentDelegationReplyEnvelope,
@@ -181,15 +182,20 @@ function supervisionTaskProjection(record: DelegationReplyRecord) {
     && coordinator.taskId === taskId
     && coordinator.role === 'coordinator'
     && identityMatches(record.origin, coordinator.identity));
-  const title = task
+  const objective = task
     && task.taskId === taskId
     && assignment?.taskId === taskId
     && revisionMatches
     && attemptMatches
     && coordinatorMatches
-    ? projectAgentDelegationSupervisionTaskTitle(task.objective)
+    ? projectAgentDelegationSupervisionTaskObjective(task.objective)
     : undefined;
-  return title ? { ...base, title } : base;
+  const title = objective ? projectAgentDelegationSupervisionTaskTitle(task?.objective) : undefined;
+  return title ? {
+    ...base,
+    title,
+    ...(objective !== title ? { objective } : {}),
+  } : base;
 }
 
 function safeSupervisionTaskProjection(record: DelegationReplyRecord) {

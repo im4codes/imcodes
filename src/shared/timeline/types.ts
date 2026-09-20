@@ -346,6 +346,8 @@ export interface AgentDelegationReplyTimelinePayload {
   sourceSessionName: string;
   sourceLabel?: string;
   result: string;
+  /** Daemon-authoritative task identity; objective is bounded and collapsed in UI. */
+  supervisionTask?: import('../../../shared/agent-delegation.js').AgentDelegationSupervisionTaskProjection;
   /** Present only when daemon authority decoded a structured audit reply. */
   verdict?: PeerAuditVerdict;
 }

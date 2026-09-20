@@ -12,6 +12,10 @@ import {
   type PeerAuditVerdict,
 } from './peer-audit.js';
 import { SUPERVISION_CONTRACT_IDS } from './supervision-config.js';
+import {
+  deriveSupervisionTaskTitle,
+  readSupervisionTaskTitle,
+} from './supervision-task-identity.js';
 
 export const AGENT_DELEGATION_TARGET_FIELD = 'delegateTarget' as const;
 
@@ -48,12 +52,10 @@ export const AGENT_DELEGATION_REPLY_TIMELINE_EVENT = 'delegation.reply' as const
 export const AGENT_DELEGATION_REPLY_VERSION = 'agent_delegation_reply_v1' as const;
 export const AGENT_DELEGATION_SUPERVISION_TASK_PROJECTION_VERSION = 1 as const;
 /**
- * A safety bound on the timeline payload, not a display cut: the card wraps the
- * whole task objective, and a real objective is a few hundred characters.
- * Readers accept any title that equals its own projection, so titles stored
- * under the earlier 256-byte bound still validate.
+ * Safety bound for the full objective carried in collapsed card details.
+ * Visible titles use the shared 120-character supervision title producer.
  */
-export const AGENT_DELEGATION_SUPERVISION_TASK_TITLE_MAX_BYTES = 4096;
+export const AGENT_DELEGATION_SUPERVISION_TASK_OBJECTIVE_MAX_BYTES = 4096;
 export const AGENT_DELEGATION_REPLY_TOTAL_BYTES = 64 * 1024;
 export const AGENT_DELEGATION_REPLY_RESULT_BYTES = 48 * 1024;
 export const AGENT_DELEGATION_REPLY_TTL_MS = 24 * 60 * 60_000;
@@ -97,6 +99,8 @@ export interface AgentDelegationSupervisionTaskProjection {
   attemptId?: string;
   revision?: string;
   title?: string;
+  /** Full bounded registry objective, displayed only inside collapsed details. */
+  objective?: string;
 }
 
 export interface AgentDelegationPeerAuditCompletionBinding {
@@ -118,19 +122,31 @@ function readBoundedId(value: unknown): string | undefined {
   return normalized;
 }
 
-/** Collapse an authoritative registry objective into a concise one-line card title. */
-export function projectAgentDelegationSupervisionTaskTitle(value: unknown): string | undefined {
+/** Normalize and safety-bound the full authoritative objective for details. */
+export function projectAgentDelegationSupervisionTaskObjective(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
-  const normalized = value.replace(/\s+/gu, ' ').trim();
+  const normalized = value
+    .replace(/\r\n?|\u2028|\u2029/gu, '\n')
+    .split('\n')
+    .map((line) => line.replace(/[\u0000-\u0009\u000b\u000c\u000e-\u001f\u007f-\u009f]/gu, ' ')
+      .replace(/[^\S\n]+/gu, ' ').trim())
+    .join('\n')
+    .replace(/\n{3,}/gu, '\n\n')
+    .trim();
   if (!normalized) return undefined;
-  if (utf8ByteLength(normalized) <= AGENT_DELEGATION_SUPERVISION_TASK_TITLE_MAX_BYTES) return normalized;
+  if (utf8ByteLength(normalized) <= AGENT_DELEGATION_SUPERVISION_TASK_OBJECTIVE_MAX_BYTES) return normalized;
   let output = '';
   for (const character of normalized) {
     const candidate = `${output}${character}`;
-    if (utf8ByteLength(`${candidate}…`) > AGENT_DELEGATION_SUPERVISION_TASK_TITLE_MAX_BYTES) break;
+    if (utf8ByteLength(`${candidate}…`) > AGENT_DELEGATION_SUPERVISION_TASK_OBJECTIVE_MAX_BYTES) break;
     output = candidate;
   }
   return output ? `${output}…` : undefined;
+}
+
+/** Compatibility export; the implementation lives only in task identity. */
+export function projectAgentDelegationSupervisionTaskTitle(value: unknown): string | undefined {
+  return deriveSupervisionTaskTitle(value);
 }
 
 /** Strictly reads only the daemon-owned top-level timeline projection. */
@@ -148,9 +164,28 @@ export function readAgentDelegationSupervisionTaskProjection(
   if ((record.attemptId !== undefined && !attemptId) || (record.revision !== undefined && !revision)) {
     return undefined;
   }
-  const title = typeof record.title === 'string'
-    && record.title === projectAgentDelegationSupervisionTaskTitle(record.title)
-    ? record.title
+  const projectedObjective = projectAgentDelegationSupervisionTaskObjective(record.objective);
+  const objectiveIsCanonical = record.objective === undefined
+    || (typeof record.objective === 'string' && projectedObjective === record.objective);
+  const storedTitle = typeof record.title === 'string'
+    ? projectAgentDelegationSupervisionTaskObjective(record.title)
+    : undefined;
+  // New rows bind the concise title to the full objective. Legacy rows stored
+  // the whole (up to 4 KiB) objective in `title`; keep accepting those rows,
+  // but project their concise title and move the remainder into details.
+  const legacyTitleIsCanonical = record.objective === undefined
+    && typeof record.title === 'string'
+    && storedTitle === record.title;
+  const titleSource = objectiveIsCanonical
+    ? projectedObjective ?? (legacyTitleIsCanonical ? storedTitle : undefined)
+    : undefined;
+  const title = readSupervisionTaskTitle(titleSource);
+  const newTitleMatches = record.objective !== undefined
+    && typeof record.title === 'string'
+    && record.title === title;
+  const acceptedTitle = legacyTitleIsCanonical || newTitleMatches ? title : undefined;
+  const detailedObjective = objectiveIsCanonical && titleSource && titleSource !== acceptedTitle
+    ? titleSource
     : undefined;
   return {
     version: AGENT_DELEGATION_SUPERVISION_TASK_PROJECTION_VERSION,
@@ -158,7 +193,8 @@ export function readAgentDelegationSupervisionTaskProjection(
     assignmentId,
     ...(attemptId ? { attemptId } : {}),
     ...(revision ? { revision } : {}),
-    ...(title ? { title } : {}),
+    ...(acceptedTitle ? { title: acceptedTitle } : {}),
+    ...(acceptedTitle && detailedObjective ? { objective: detailedObjective } : {}),
   };
 }
 

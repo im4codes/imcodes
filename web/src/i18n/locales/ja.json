@@ -3218,6 +3218,7 @@
     "chip_title": "委任先: {{target}}",
     "reply_title": "委任の返信",
     "reply_from": "{{source}} から",
+    "reply_objective_details": "タスク目標の全文",
     "warning_empty_task": "エージェントに委任する前にタスクを入力してください。",
     "warning_attachments": "委任はまだ添付ファイルに対応していません。添付を削除し、タスクをテキストで説明してください。",
     "warning_quotes": "委任はまだチャット引用に対応していません。引用を削除し、必要なコンテキストをタスクに含めてください。",

@@ -3218,6 +3218,7 @@
     "chip_title": "위임 대상: {{target}}",
     "reply_title": "위임 응답",
     "reply_from": "{{source}}에서 보냄",
+    "reply_objective_details": "전체 작업 목표",
     "warning_empty_task": "에이전트에게 위임하기 전에 작업을 입력하세요.",
     "warning_attachments": "위임은 아직 첨부 파일을 지원하지 않습니다. 첨부를 제거하고 작업을 텍스트로 설명하세요.",
     "warning_quotes": "위임은 아직 채팅 인용을 지원하지 않습니다. 인용을 제거하고 필요한 맥락을 작업에 포함하세요.",

@@ -3219,6 +3219,7 @@
     "chip_title": "委派目标：{{target}}",
     "reply_title": "委派回复",
     "reply_from": "来自 {{source}}",
+    "reply_objective_details": "完整任务目标",
     "warning_empty_task": "请先输入要委派给智能体的任务。",
     "warning_attachments": "委派暂不支持附件。请移除附件，并用文字描述任务。",
     "warning_quotes": "委派暂不支持引用聊天片段。请移除引用，并把所需上下文写入任务。",

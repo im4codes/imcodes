@@ -5727,10 +5727,9 @@ html.native-ios-mac .chat-dl-btn {
   70% { opacity: 0.48; }
   88%, 100% { transform: translateX(55%); opacity: 0; }
 }
-/* The header must never clip its text: a long task objective or source label
-   wraps (and the meta group drops below the title when the row is too narrow)
-   instead of collapsing to an ellipsis, which used to leave "来…" and a
-   truncated title on desktop widths. */
+/* The header must never clip its concise title or source label: it wraps (and
+   the meta group drops below the title when the row is too narrow) instead of
+   applying a second, renderer-local truncation policy. */
 .delegation-reply-card-head { display: flex; align-items: flex-start; flex-wrap: wrap; justify-content: space-between; gap: 5px 10px; margin-bottom: 7px; }
 .delegation-reply-card-head strong { color: #67e8f9; font-size: 12px; letter-spacing: 0.02em; }
 .delegation-reply-card-head span { min-width: 0; color: #94a3b8; overflow-wrap: anywhere; }
@@ -5784,6 +5783,21 @@ html.native-ios-mac .chat-dl-btn {
   white-space: nowrap;
 }
 .delegation-reply-task.is-fallback .delegation-reply-task-ids { color: #94a3b8; }
+.delegation-reply-objective-details {
+  margin: -2px 0 8px;
+  color: #94a3b8;
+  font-size: 11px;
+}
+.delegation-reply-objective-details > summary { cursor: pointer; user-select: none; }
+.delegation-reply-objective-details > div {
+  margin-top: 5px;
+  max-height: calc(1.45em * 8);
+  overflow-y: auto;
+  color: #cbd5e1;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
 .delegation-reply-card-body {
   font-size: 12px;
   line-height: 1.5;

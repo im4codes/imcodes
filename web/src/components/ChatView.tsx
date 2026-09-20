@@ -4891,6 +4891,12 @@ const ChatEvent = memo(function ChatEvent({
               </span>
             </div>
           )}
+          {supervisionTask?.objective && (
+            <details class="delegation-reply-objective-details">
+              <summary>{t('delegation.reply_objective_details')}</summary>
+              <div>{supervisionTask.objective}</div>
+            </details>
+          )}
           {result && (
             <div class="delegation-reply-card-body">
               <ChatMarkdown

@@ -6,7 +6,7 @@ import { h } from 'preact';
 import { cleanup, fireEvent, render } from '@testing-library/preact';
 import type { TimelineEvent } from '../../src/ws-client.js';
 import { isUserVisible } from '../../src/util/isUserVisible.js';
-import { AGENT_DELEGATION_SUPERVISION_TASK_TITLE_MAX_BYTES } from '@shared/agent-delegation.js';
+import { AGENT_DELEGATION_SUPERVISION_TASK_OBJECTIVE_MAX_BYTES } from '@shared/agent-delegation.js';
 
 const fileBrowserProps: any[] = [];
 
@@ -47,6 +47,7 @@ vi.mock('react-i18next', () => ({
         'peerAuditQuick.disposition.sent_unrevocable': 'sent (cannot revoke)',
         'delegation.reply_title': 'Delegation reply',
         'delegation.reply_from': `From ${vars?.source ?? ''}`,
+        'delegation.reply_objective_details': 'Full task objective',
         'delegation.claim.task_id': 'Task ID',
         'delegation.claim.assignment_id': 'Assignment ID',
       };
@@ -605,10 +606,34 @@ describe('ChatView delegation reply cards', () => {
     requestSpy.mockRestore();
   });
 
+  it('shows a concise title and keeps a 1000-character objective in collapsed details', () => {
+    const objective = `Repair the delegation reply card title. ${'Preserve all authoritative objective context. '.repeat(24)}`.trim();
+    expect(objective.length).toBeGreaterThan(1000);
+    const event = makeEvent('delegation.reply', {
+      sourceLabel: 'CC11',
+      result: 'PASS',
+      supervisionTask: {
+        version: 1,
+        taskId: 'tsk_long',
+        assignmentId: 'asg_long',
+        title: 'Repair the delegation reply card title.…',
+        objective,
+      },
+    });
+    const { container } = render(<ChatView events={[event]} loading={false} sessionId="session-a" />);
+    expect(container.querySelector('.delegation-reply-card-objective')?.textContent)
+      .toBe('Repair the delegation reply card title.…');
+    const details = container.querySelector('.delegation-reply-objective-details');
+    expect(details).not.toBeNull();
+    expect(details?.hasAttribute('open')).toBe(false);
+    expect(details?.querySelector('summary')?.textContent).toBe('Full task objective');
+    expect(details?.textContent).toContain(objective);
+  });
+
   it.each([
     ['missing projection', undefined],
     ['malformed projection', { version: 1, taskId: '', assignmentId: 'asg_bad', title: 'LEAKED TITLE' }],
-    ['oversized title', { version: 1, taskId: 'tsk_fallback', assignmentId: 'asg_fallback', title: 'x'.repeat(AGENT_DELEGATION_SUPERVISION_TASK_TITLE_MAX_BYTES + 1) }],
+    ['oversized title', { version: 1, taskId: 'tsk_fallback', assignmentId: 'asg_fallback', title: 'x'.repeat(AGENT_DELEGATION_SUPERVISION_TASK_OBJECTIVE_MAX_BYTES + 1) }],
   ])('uses a privacy-safe fallback for %s', (_label, supervisionTask) => {
     const event = makeEvent('delegation.reply', {
       sourceLabel: 'CC4',

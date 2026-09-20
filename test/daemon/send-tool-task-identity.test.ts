@@ -80,7 +80,7 @@ describe('formal task identity on supervised dispatch surfaces', () => {
     if (initial.status !== 'accepted' || !initial.taskId || !initial.assignmentId) {
       throw new Error(`expected an accepted supervised dispatch, got ${JSON.stringify(initial)}`);
     }
-    const title = 'Enforce formal IM.codes delegation';
+    const title = 'Enforce formal IM.codes delegation…';
     expect(initial.taskTitle).toBe(title);
     expect(initial.deliveries[0]).toMatchObject({ taskId: initial.taskId, assignmentId: initial.assignmentId, taskTitle: title });
 
@@ -146,7 +146,10 @@ describe('formal task identity on supervised dispatch surfaces', () => {
       taskTitle: `${'x'.repeat(500)}\nhidden`,
       deliveries: [{ target: 'deck_alpha_w1', status: 'delivered' }],
     });
-    expect(Array.from(fact?.taskTitle ?? '').length).toBe(SUPERVISION_TASK_TITLE_MAX_CHARS);
+    // A single oversized token has no honest word boundary inside the display
+    // budget. Never present a chopped identifier as an authoritative title.
+    expect(fact?.taskTitle).toBe('…');
+    expect(Array.from(fact?.taskTitle ?? '').length).toBeLessThanOrEqual(SUPERVISION_TASK_TITLE_MAX_CHARS);
     expect(fact?.taskTitle).not.toContain('hidden');
     expect(readDelegationDispatchFact('imcodes-memory', 'send_message', {}, {
       status: 'accepted', dispatchId: 'dsp_2', taskId: 'tsk_2', assignmentId: 'asg_2',
