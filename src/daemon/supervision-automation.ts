@@ -342,6 +342,8 @@ interface ActiveTaskRunState {
   sawAssistantOutput: boolean;
   lastAssistantText?: string;
   lastAssistantCompletionKey?: string;
+  /** Latest timeline sequence that can identify a newer provider turn. */
+  lastTurnActivitySequence: number;
   terminalState?: TaskRunTerminalState;
   auditAttemptId?: string;
   auditDelegationId?: string;
@@ -374,11 +376,10 @@ interface ActiveTaskRunState {
   completionWaitStartedAt?: number;
   /** How much audit this run's change is worth; scopes the delegated brief. */
   auditDepth?: SupervisionAuditDepth;
-  // When a reply-backed audit settles from the assistant-text fallback (that
-  // is, before the provider emits the trailing idle for the audit turn), the
-  // deferred finalization/rework prompt may already be dispatched by the time
-  // that old idle arrives. Ignore exactly that pre-activity idle so it cannot
-  // terminate or evaluate the newly-started phase with stale audit output.
+  // A completed terminal boundary can precede retained/background provider
+  // activity. Ignore state/tool-only edges until either a new assistant row or
+  // a daemon-authored foreground prompt proves a new completion is owed; this
+  // also covers the pre-activity idle after reply-backed audit settlement.
   ignoreIdleUntilPostAuditTurnActivity?: boolean;
   deferredFinalization?: {
     reason: string;
@@ -415,6 +416,11 @@ interface RecoveredImplicitCompletion {
   candidate: RecentTaskCandidate;
   latestAssistant: LatestAssistantText;
   completionKey: string;
+}
+
+interface WaitingTurnSettleGuard {
+  activitySequence: number;
+  completionKey?: string;
 }
 
 function persistedSessionIdentity(record: SessionRecord): PersistedSupervisionSessionIdentity | undefined {
@@ -1054,6 +1060,9 @@ class SupervisionAutomation {
   private implicitCompletionWaitStartedAt = new Map<string, number>();
   private recoveredImplicitCompletionKeys: string[] = [];
   private recoveredImplicitCompletionKeySet = new Set<string>();
+  /** Exact task turns already failed for a genuinely missing completion. */
+  private missingCompletionTerminalKeys: string[] = [];
+  private missingCompletionTerminalKeySet = new Set<string>();
   private recoverySuppressedUntilNextUser = new Set<string>();
   private heartbeatPausedForNeedsInput = new Set<string>();
   private emittedAuditResultAttemptIds: string[] = [];
@@ -1121,12 +1130,12 @@ class SupervisionAutomation {
     );
   }
 
-  private emitWarning(sessionName: string, text: string): void {
+  private emitWarning(sessionName: string, text: string, eventId?: string): void {
     timelineEmitter.emit(
       sessionName,
       'assistant.text',
       { text: `⚠️ ${text}`, streaming: false, automation: true, automationKind: 'supervision-warning', memoryExcluded: true },
-      { source: 'daemon', confidence: 'high', eventId: `supervision-warning:${randomUUID()}` },
+      { source: 'daemon', confidence: 'high', eventId: eventId ?? `supervision-warning:${randomUUID()}` },
     );
   }
 
@@ -2341,9 +2350,37 @@ class SupervisionAutomation {
     this.emitAutomationNote(sessionName, 'Auto: checking whether the task is complete...', 'supervision-status');
   }
 
-  private failClosedMissingCompletion(sessionName: string): void {
+  private rememberMissingCompletionTerminal(key: string): boolean {
+    if (this.missingCompletionTerminalKeySet.has(key)) return false;
+    this.missingCompletionTerminalKeySet.add(key);
+    this.missingCompletionTerminalKeys.push(key);
+    while (this.missingCompletionTerminalKeys.length > SUPERVISION_RECOVERED_COMPLETION_KEYS_MAX) {
+      const evicted = this.missingCompletionTerminalKeys.shift();
+      if (evicted) this.missingCompletionTerminalKeySet.delete(evicted);
+    }
+    return true;
+  }
+
+  private failClosedMissingCompletion(sessionName: string, commandId: string): void {
+    const terminalKey = `${sessionName}:${commandId}`;
+    // The active-run and implicit-candidate grace paths can both observe the
+    // same user turn. Tear down the matching candidate before emitting, and
+    // make the terminal projection idempotent by exact turn identity. This
+    // prevents a later/replayed idle edge from producing the same warning a
+    // second time, including after the active run has already been removed.
+    const candidate = this.recentTaskCandidates.get(sessionName);
+    if (candidate?.commandId === commandId) {
+      this.recentTaskCandidates.delete(sessionName);
+      this.latestAssistantTexts.delete(sessionName);
+      this.resetImplicitCompletionWait(sessionName);
+    }
+    if (!this.rememberMissingCompletionTerminal(terminalKey)) return;
     this.emitTerminalStatus(sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
-    this.emitWarning(sessionName, 'Automation stopped because no completed assistant response was available for that turn. Manual continuation is required.');
+    this.emitWarning(
+      sessionName,
+      'Automation stopped because no completed assistant response was available for that turn. Manual continuation is required.',
+      `supervision-warning:missing-completion:${createHash('sha256').update(terminalKey).digest('hex')}`,
+    );
   }
 
   /**
@@ -2356,6 +2393,58 @@ class SupervisionAutomation {
   private failClosedUnconfirmedActivity(sessionName: string): void {
     this.emitTerminalStatus(sessionName, 'supervision_needs_input', SUPERVISION_NEEDS_INPUT_LABEL);
     this.emitWarning(sessionName, 'Automation stopped because the assistant result arrived but this session\'s activity could not be confirmed before the deadline. Check the provider/runtime state; manual continuation is required.');
+  }
+
+  private settleAcceptedWaitingTurn(
+    sessionName: string,
+    reason: 'supervision-waiting-terminal-marker' | 'supervision-waiting-decision',
+  ): void {
+    getTransportRuntime(sessionName)?.settleActiveDispatchFromExternalCompletion(reason);
+  }
+
+  private captureWaitingTurnSettleGuard(run: ActiveTaskRunState): WaitingTurnSettleGuard {
+    return {
+      activitySequence: run.lastTurnActivitySequence,
+      ...(run.lastAssistantCompletionKey
+        ? { completionKey: run.lastAssistantCompletionKey }
+        : {}),
+    };
+  }
+
+  private waitingTurnSettleGuardMatches(
+    run: ActiveTaskRunState,
+    guard: WaitingTurnSettleGuard,
+  ): boolean {
+    return run.lastTurnActivitySequence === guard.activitySequence
+      && run.lastAssistantCompletionKey === guard.completionKey;
+  }
+
+  private resumeAfterSupersededWaitingEvaluation(
+    run: ActiveTaskRunState,
+    guard: WaitingTurnSettleGuard,
+  ): boolean {
+    if (this.waitingTurnSettleGuardMatches(run, guard)) return false;
+
+    // The broker/registry await belongs to an older completed turn. Never let
+    // its WAITING result park, clear, or externally settle a notification-
+    // driven turn that started in the meantime. If the new turn already
+    // completed, immediately evaluate its own assistant row; otherwise leave
+    // the ordinary idle/grace path responsible for its bounded completion.
+    const hasNewAssistantCompletion = run.lastAssistantCompletionKey !== guard.completionKey;
+    if (!hasNewAssistantCompletion) {
+      run.sawAssistantOutput = false;
+      run.lastAssistantText = undefined;
+      run.lastAssistantCompletionKey = undefined;
+    }
+    run.evaluating = false;
+    const observedState = this.lastObservedSessionStates.get(run.sessionName);
+    if (run.sawAssistantOutput) {
+      if (observedState === 'idle') this.evaluateIdleRun(run);
+      else this.armCompletionGrace(run);
+    } else if (observedState === 'idle' && !run.ignoreIdleUntilPostAuditTurnActivity) {
+      this.armCompletionGrace(run);
+    }
+    return true;
   }
 
   private tryStartImplicitRun(
@@ -2397,8 +2486,7 @@ class SupervisionAutomation {
     if (!isBrainOwnedAutomaticSupervision(sessionName, snapshot)) return;
     const candidate = this.recentTaskCandidates.get(sessionName);
     if (!candidate) return;
-    this.recentTaskCandidates.delete(sessionName);
-    this.failClosedMissingCompletion(sessionName);
+    this.failClosedMissingCompletion(sessionName, candidate.commandId);
   }
 
   queueTaskIntent(
@@ -2462,6 +2550,7 @@ class SupervisionAutomation {
       continueStreakCount: 0,
       evaluating: false,
       sawAssistantOutput: false,
+      lastTurnActivitySequence: 0,
       reworkDispatches: 0,
       auditReplyObserved: false,
       auditVerdictCorrectionAttempts: 0,
@@ -2623,6 +2712,7 @@ class SupervisionAutomation {
         ...(persisted.lastContinueBucket ? { lastContinueBucket: persisted.lastContinueBucket } : {}),
         evaluating: false,
         sawAssistantOutput: persisted.pendingAssistantText !== undefined,
+        lastTurnActivitySequence: 0,
         ...(persisted.pendingAssistantText !== undefined
           ? { lastAssistantText: persisted.pendingAssistantText }
           : {}),
@@ -2805,7 +2895,7 @@ class SupervisionAutomation {
         return;
       }
       latest.completionWaitStartedAt = undefined;
-      this.failClosedMissingCompletion(latest.sessionName);
+      this.failClosedMissingCompletion(latest.sessionName, latest.commandId);
       this.finishRun(latest.sessionName, 'needs_input', { preserveStatus: true });
     }, SUPERVISION_COMPLETION_GRACE_MS);
     timer.unref?.();
@@ -3358,6 +3448,11 @@ class SupervisionAutomation {
       return;
     }
     try {
+      // This is a daemon-authored turn, unlike provider-retained task
+      // notifications or tool-only wakeups. From this point an idle boundary
+      // without a completed assistant row is again eligible for the bounded
+      // missing-completion watchdog.
+      current.ignoreIdleUntilPostAuditTurnActivity = false;
       runtime.send(heartbeatPrompt, heartbeatId, undefined, undefined, {
         // The automation row above is already the durable, user-visible
         // projection for this logical clientMessageId. If the runtime is busy,
@@ -3372,6 +3467,10 @@ class SupervisionAutomation {
         SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND,
       );
     } catch (error) {
+      // Delivery never began, so keep the already accepted WAITING turn
+      // parked. A later provider state projection must not reinterpret the
+      // failed heartbeat as a missing assistant completion.
+      current.ignoreIdleUntilPostAuditTurnActivity = true;
       logger.warn({ session: current.sessionName, err: error }, 'Supervision waiting heartbeat dispatch failed');
       this.emitWarning(current.sessionName, 'The waiting-status heartbeat failed; the original wait deadline remains active.');
     }
@@ -3588,6 +3687,14 @@ class SupervisionAutomation {
       this.handleAuditTargetTimelineEvent(event);
     }
     const sequence = ++this.eventSequence;
+    const activityRun = this.activeRuns.get(event.sessionId);
+    if (activityRun && (
+      event.type === 'user.message'
+      || event.type === 'tool.call'
+      || event.type === 'tool.result'
+    )) {
+      activityRun.lastTurnActivitySequence = sequence;
+    }
 
     if (event.type === 'user.message') {
       const pending = this.pendingTaskIntents.get(event.sessionId);
@@ -3675,6 +3782,9 @@ class SupervisionAutomation {
         return;
       }
       this.clearCompletionGrace(run);
+      if (run.lastAssistantCompletionKey !== completionKey) {
+        run.lastTurnActivitySequence = sequence;
+      }
       run.ignoreIdleUntilPostAuditTurnActivity = false;
       run.lastAssistantText = text;
       run.lastAssistantCompletionKey = completionKey;
@@ -3734,6 +3844,7 @@ class SupervisionAutomation {
     if (event.type === 'session.state') {
       const run = this.activeRuns.get(event.sessionId);
       const state = trimString(event.payload.state);
+      if (run && state === 'running') run.lastTurnActivitySequence = sequence;
       if (state) this.lastObservedSessionStates.set(event.sessionId, state);
       // Restored transport runtimes normally reconnect directly to idle. Init
       // runs before that delayed restore, so its startup microtask can observe
@@ -3778,9 +3889,6 @@ class SupervisionAutomation {
       // where it exists to rebase the grace onto a newly started turn.
       if (state && state !== 'idle' && !run.sawAssistantOutput) {
         this.clearCompletionGrace(run);
-        run.ignoreIdleUntilPostAuditTurnActivity = false;
-      } else if (state && state !== 'idle') {
-        run.ignoreIdleUntilPostAuditTurnActivity = false;
       }
       // The session is alive again, so the outage that was recovered is over.
       // Forgetting it here is what lets a genuinely NEW outage later recover
@@ -3799,7 +3907,6 @@ class SupervisionAutomation {
       if (state === 'idle' && (run.phase === 'execution' || run.phase === 'finalizing') && !run.evaluating) {
         if (!run.sawAssistantOutput) {
           if (run.ignoreIdleUntilPostAuditTurnActivity) {
-            run.ignoreIdleUntilPostAuditTurnActivity = false;
             return;
           }
           this.armCompletionGrace(run);
@@ -3986,6 +4093,7 @@ class SupervisionAutomation {
     const current = this.activeRuns.get(run.sessionName);
     if (!current || current.generation !== run.generation || (current.phase !== 'execution' && current.phase !== 'finalizing')) return;
     const evaluatedPhase = current.phase;
+    const waitingSettleGuard = this.captureWaitingTurnSettleGuard(current);
 
     // Disarm the park BEFORE awaiting the broker. The awaited reply has already
     // produced this turn, so the run is no longer parked; leaving the timer
@@ -4001,7 +4109,7 @@ class SupervisionAutomation {
     if (executionStatus.state) {
       current.evaluating = false;
       this.clearStatus(run.sessionName);
-      await this.handleExecutionStatus(current, executionStatus.state);
+      await this.handleExecutionStatus(current, executionStatus.state, waitingSettleGuard);
       return;
     }
     if (hasRetiredSupervisionExecutionMarker(current.lastAssistantText ?? '')) {
@@ -4214,6 +4322,7 @@ class SupervisionAutomation {
         // on a provider-native agent (or on nothing) would never be woken by
         // IM.codes, so that WAITING is refused and re-routed instead.
         if (await this.refuseUnsubstantiatedWaiting(latest)) return;
+        if (this.resumeAfterSupersededWaitingEvaluation(latest, waitingSettleGuard)) return;
         this.emitStatus(latest.sessionName, 'supervision_parked', SUPERVISION_PARKED_LABEL);
         this.emitAutomationNote(
           latest.sessionName,
@@ -4227,6 +4336,11 @@ class SupervisionAutomation {
         latest.lastAssistantText = undefined;
         latest.lastAssistantCompletionKey = undefined;
         this.armWaitingTimers(latest, { preserveSchedule: true });
+        // The broker can accept a waiting turn from a final assistant row while
+        // the cached idle edge still belongs to the previous turn. Settle the
+        // retained dispatch here as well as on the explicit WAITING marker so
+        // the web cannot retain a stale running/Stop projection.
+        this.settleAcceptedWaitingTurn(latest.sessionName, 'supervision-waiting-decision');
         return;
       }
       case 'ask_human':
@@ -4282,6 +4396,7 @@ class SupervisionAutomation {
   private async handleExecutionStatus(
     run: ActiveTaskRunState,
     state: SupervisionExecutionState,
+    waitingSettleGuard: WaitingTurnSettleGuard,
   ): Promise<void> {
     const current = this.activeRuns.get(run.sessionName);
     if (!current || current.generation !== run.generation) return;
@@ -4294,6 +4409,7 @@ class SupervisionAutomation {
         return;
       case 'waiting':
         if (await this.refuseUnsubstantiatedWaiting(current)) return;
+        if (this.resumeAfterSupersededWaitingEvaluation(current, waitingSettleGuard)) return;
         this.emitStatus(current.sessionName, 'supervision_parked', SUPERVISION_PARKED_LABEL);
         this.emitAutomationNote(current.sessionName, 'Auto: parked on the executing session\'s reported external reply.', 'supervision-parked');
         this.clearCompletionGrace(current);
@@ -4303,6 +4419,13 @@ class SupervisionAutomation {
         current.lastAssistantText = undefined;
         current.lastAssistantCompletionKey = undefined;
         this.armWaitingTimers(current, { preserveSchedule: true });
+        // WAITING is a task_run_status_v1 terminal boundary for this provider
+        // turn even though the supervision lifecycle remains parked. Settle
+        // the retained dispatch so the authoritative runtime emits idle and
+        // the web no longer renders a stale red Stop control. Provider-native
+        // task notifications may subsequently wake the session, but state or
+        // tool-only edges do not revoke this accepted completion boundary.
+        this.settleAcceptedWaitingTurn(current.sessionName, 'supervision-waiting-terminal-marker');
         return;
     }
   }
@@ -4724,6 +4847,10 @@ class SupervisionAutomation {
       { source: 'daemon', confidence: 'high', eventId: `peer-audit-rework:${current.generation}:${current.reworkDispatches}:${randomUUID()}` },
     );
     try {
+      // The rework brief is a new daemon-authored foreground turn. Do this
+      // before send so even a synchronous running/idle projection is bounded;
+      // the catch path terminates the run if admission itself fails.
+      current.ignoreIdleUntilPostAuditTurnActivity = false;
       transportRuntime.send(reworkBrief, `peer-audit-rework-${current.generation}-${current.reworkDispatches}`);
       this.emitTerminalStatus(current.sessionName, 'supervision_rework_sent', SUPERVISION_REWORK_LABEL);
     } catch (error) {
@@ -4824,6 +4951,9 @@ class SupervisionAutomation {
     current.sawAssistantOutput = false;
     current.lastAssistantText = undefined;
     current.terminalState = undefined;
+    // Unlike retained/background provider activity, this prompt is a new
+    // daemon-authored foreground turn and therefore expects one completion.
+    current.ignoreIdleUntilPostAuditTurnActivity = false;
 
     timelineEmitter.emit(
       run.sessionName,

@@ -73,6 +73,19 @@ const acceptDirectSend = (clientMessageId?: unknown): 'sent' => {
 
 const mockTransportRuntime = {
   send: vi.fn((_message?: unknown, clientMessageId?: unknown) => acceptDirectSend(clientMessageId)),
+  settleActiveDispatchFromExternalCompletion: vi.fn((_reason?: string) => {
+    if (!mockTransportRuntimeWorking) return false;
+    mockTransportRuntimeWorking = false;
+    const record = getSession('deck_supervision_brain');
+    if (record) {
+      upsertSession({ ...record, state: 'idle', updatedAt: Date.now() });
+    }
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', {
+      state: 'idle',
+      reason: 'external_completion',
+    });
+    return true;
+  }),
   pendingCount: 0,
   pendingMessages: [],
   // Real, mutable, and typed: what the runtime is holding in memory is the
@@ -484,6 +497,36 @@ function beginRun(commandId: string, text: string) {
     clientMessageId: commandId,
     allowDuplicate: true,
   });
+}
+
+async function beginDeferredBrokerWaitingDecision(commandId: string) {
+  const snapshot = await seedSession('supervised');
+  let resolveDecision!: (decision: {
+    decision: 'waiting';
+    reason: string;
+    confidence: number;
+  }) => void;
+  mockSupervisionDecide.mockImplementationOnce(() => new Promise((resolve) => {
+    resolveDecision = resolve;
+  }));
+  supervisionAutomation.init();
+  timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+  supervisionAutomation.registerTaskIntent(
+    'deck_supervision_brain',
+    commandId,
+    'wait for the delegated result',
+    snapshot,
+  );
+  beginRun(commandId, 'wait for the delegated result');
+  mockTransportRuntimeWorking = true;
+  timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+    text: 'The authoritative delegated work is still pending.',
+    streaming: false,
+  });
+  await vi.waitFor(() => {
+    expect(mockSupervisionDecide).toHaveBeenCalledOnce();
+  });
+  return resolveDecision;
 }
 
 function completeDelegatedAudit(verdict: 'PASS' | 'REWORK', findings = 'Independent audit evidence.') {
@@ -2080,6 +2123,160 @@ describe('SupervisionAutomation', () => {
     const results = timelineEmitter.replay('deck_supervision_brain', 0).events.filter((event) =>
       event.type === 'peer_audit.result');
     expect(results.filter((event) => event.payload.outcome === 'pass')).toHaveLength(priorPassCount + 1);
+  });
+
+  it('bounds a fallback-settled REWORK turn that ends without assistant output', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const snapshot = await seedSession('supervised_audit');
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent(
+        'deck_supervision_brain',
+        'cmd-rework-no-output',
+        'implement and audit the feature',
+        snapshot,
+      );
+      beginRun('cmd-rework-no-output', 'implement and audit the feature');
+      completeTurn('Implementation and validation are ready for audit.');
+      await waitForRunPhase('auditing');
+      expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+
+      timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+        text: 'Task: independent audit\nResult: REWORK with evidence.',
+        allowDuplicate: true,
+      });
+      timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+        text: `Concrete blocking finding.\n${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.REWORK}`,
+        streaming: false,
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+        phase: 'execution',
+        reworkDispatches: 1,
+        sawAssistantOutput: false,
+      });
+      expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+
+      // The first idle can be the late terminal edge for the audit turn. The
+      // following running/idle pair belongs to the daemon-authored REWORK
+      // brief. If that foreground turn produces no assistant row, it still
+      // has the ordinary bounded missing-completion outcome rather than an
+      // immortal execution run.
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+      await vi.advanceTimersByTimeAsync(65_000);
+
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+      const warnings = timelineEmitter.replay('deck_supervision_brain', 0).events.filter(
+        (event) => event.type === 'assistant.text'
+          && event.payload.text === '⚠️ Automation stopped because no completed assistant response was available for that turn. Manual continuation is required.',
+      );
+      expect(warnings).toHaveLength(1);
+      expect(timelineEmitter.replay('deck_supervision_brain', 0).events).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          type: 'agent.status',
+          payload: expect.objectContaining({ status: 'supervision_needs_input' }),
+        }),
+      ]));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('bounds a WAITING heartbeat turn that ends idle without assistant output', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const snapshot = await seedSession('supervised');
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent(
+        'deck_supervision_brain',
+        'cmd-waiting-heartbeat-no-output',
+        'wait for the delegated result',
+        snapshot,
+      );
+      beginRun('cmd-waiting-heartbeat-no-output', 'wait for the delegated result');
+      completeTurn(`Delegated work is still pending.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`);
+      await Promise.resolve();
+      await Promise.resolve();
+
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
+      expect(String(mockTransportRuntime.send.mock.calls[0]?.[0]))
+        .toContain('[Contract: supervision_waiting_heartbeat_v1]');
+
+      // The heartbeat is a new daemon-authored foreground turn. State-only
+      // completion with no assistant row must regain the ordinary bounded
+      // fail-closed behavior instead of inheriting the prior WAITING park.
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+      await vi.advanceTimersByTimeAsync(65_000);
+
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+      const warnings = timelineEmitter.replay('deck_supervision_brain', 0).events.filter(
+        (event) => event.type === 'assistant.text'
+          && event.payload.text === '⚠️ Automation stopped because no completed assistant response was available for that turn. Manual continuation is required.',
+      );
+      expect(warnings).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('bounds a fallback-settled post-audit continue that ends idle without assistant output', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const snapshot = await seedSession('supervised_audit');
+    try {
+      mockSupervisionDecide.mockResolvedValueOnce({
+        decision: 'continue',
+        reason: 'implementation is complete but repository finalization remains',
+        confidence: 0.9,
+        nextAction: 'Commit and push the audited changes.',
+      });
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent(
+        'deck_supervision_brain',
+        'cmd-post-audit-continue-no-output',
+        'implement the feature',
+        snapshot,
+      );
+      beginRun('cmd-post-audit-continue-no-output', 'implement the feature');
+      completeTurn('Implementation is complete; commit and push remain.');
+      await waitForRunPhase('auditing');
+
+      timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+        text: 'Task: independent audit\nResult: PASS with evidence.',
+        allowDuplicate: true,
+      });
+      timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+        text: `PASS with evidence.\n${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS}`,
+        streaming: false,
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+        phase: 'finalizing',
+        sawAssistantOutput: false,
+      });
+      expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
+
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+      await vi.advanceTimersByTimeAsync(65_000);
+
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+      const warnings = timelineEmitter.replay('deck_supervision_brain', 0).events.filter(
+        (event) => event.type === 'assistant.text'
+          && event.payload.text === '⚠️ Automation stopped because no completed assistant response was available for that turn. Manual continuation is required.',
+      );
+      expect(warnings).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('cancels an in-flight orchestrated audit exactly once when supervision is stopped', async () => {
@@ -3907,6 +4104,232 @@ describe('SupervisionAutomation', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('emits one missing-completion terminal warning for one exact turn and clears its implicit candidate', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const snapshot = await seedSession('supervised');
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent(
+        'deck_supervision_brain',
+        'cmd-one-terminal-warning',
+        'implement the feature',
+        snapshot,
+      );
+      // The ordinary user row is also observed as an implicit candidate. If
+      // the active-run terminal path leaves that candidate behind, a later
+      // idle projection starts the sibling implicit grace path and emits the
+      // same terminal warning for the same turn a second time.
+      beginRun('cmd-one-terminal-warning', 'implement the feature');
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+      await vi.advanceTimersByTimeAsync(65_000);
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+      await vi.advanceTimersByTimeAsync(65_000);
+
+      const warnings = timelineEmitter.replay('deck_supervision_brain', 0).events.filter(
+        (event) => event.type === 'assistant.text'
+          && event.payload.text === '⚠️ Automation stopped because no completed assistant response was available for that turn. Manual continuation is required.',
+      );
+      expect(warnings).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('settles an accepted WAITING turn to idle and ignores background state/tool-only edges until a new assistant reply', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const snapshot = await seedSession('supervised');
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent(
+        'deck_supervision_brain',
+        'cmd-waiting-terminal-boundary',
+        'wait for the delegated result',
+        snapshot,
+      );
+      beginRun('cmd-waiting-terminal-boundary', 'wait for the delegated result');
+      mockTransportRuntimeWorking = true;
+      completeTurn(`The delegated result is still pending.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(mockTransportRuntime.settleActiveDispatchFromExternalCompletion).toHaveBeenCalledOnce();
+      expect(mockTransportRuntime.settleActiveDispatchFromExternalCompletion)
+        .toHaveBeenCalledWith('supervision-waiting-terminal-marker');
+      expect(getSession('deck_supervision_brain')?.state).toBe('idle');
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+        commandId: 'cmd-waiting-terminal-boundary',
+        phase: 'execution',
+      });
+
+      // A retained task-notification can wake the provider and perform tools
+      // without a new foreground assistant completion. Those state-only edges
+      // belong to the already compliant WAITING lifecycle, not to a missing
+      // assistant response, even when projected more than once.
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+      timelineEmitter.emit('deck_supervision_brain', 'tool.call', { tool: 'background_task_result' });
+      timelineEmitter.emit('deck_supervision_brain', 'tool.result', { tool: 'background_task_result', result: 'ok' });
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+      await vi.advanceTimersByTimeAsync(65_000);
+
+      const warnings = timelineEmitter.replay('deck_supervision_brain', 0).events.filter(
+        (event) => event.type === 'assistant.text'
+          && event.payload.text === '⚠️ Automation stopped because no completed assistant response was available for that turn. Manual continuation is required.',
+      );
+      expect(warnings).toHaveLength(0);
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+        commandId: 'cmd-waiting-terminal-boundary',
+        phase: 'execution',
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('settles a broker-accepted waiting decision when the cached idle edge is stale', async () => {
+    const snapshot = await seedSession('supervised');
+    mockSupervisionDecide.mockResolvedValue({
+      decision: 'waiting',
+      reason: 'the authoritative delegated result is still pending',
+      confidence: 0.9,
+    });
+    supervisionAutomation.init();
+    // A retained runtime can carry an idle projection from the previous turn
+    // while the new provider turn is active. The final assistant row then
+    // enters evaluation through that cached edge, so a broker WAITING decision
+    // must settle the exact turn just like an explicit WAITING marker.
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-broker-waiting-stale-idle',
+      'wait for the delegated result',
+      snapshot,
+    );
+    beginRun('cmd-broker-waiting-stale-idle', 'wait for the delegated result');
+    mockTransportRuntimeWorking = true;
+    timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+      text: 'The authoritative delegated work is still pending.',
+      streaming: false,
+    });
+
+    await vi.waitFor(() => {
+      expect(mockTransportRuntime.settleActiveDispatchFromExternalCompletion).toHaveBeenCalledOnce();
+    });
+    expect(mockTransportRuntime.settleActiveDispatchFromExternalCompletion)
+      .toHaveBeenCalledWith('supervision-waiting-decision');
+    expect(getSession('deck_supervision_brain')?.state).toBe('idle');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+      commandId: 'cmd-broker-waiting-stale-idle',
+      phase: 'execution',
+    });
+  });
+
+  it('does not let a delayed broker WAITING decision settle a newer notification-driven turn', async () => {
+    const resolveDecision = await beginDeferredBrokerWaitingDecision('cmd-broker-waiting-new-turn');
+
+    // While the supervisor model is still deciding, the awaited delegation
+    // completion wakes the provider and starts a new tool-using turn. The old
+    // turn's eventual WAITING decision is no longer authorized to settle (and
+    // therefore cancel) the runtime's current active dispatch.
+    timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+      text: `${AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER}\nDelegated work completed.`,
+      allowDuplicate: true,
+    });
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+    timelineEmitter.emit('deck_supervision_brain', 'tool.call', { tool: 'delegation_reply' });
+    mockTransportRuntimeWorking = true;
+
+    resolveDecision({
+      decision: 'waiting',
+      reason: 'the authoritative delegated result was pending when evaluation started',
+      confidence: 0.9,
+    });
+    await vi.waitFor(() => {
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+        commandId: 'cmd-broker-waiting-new-turn',
+        phase: 'execution',
+        evaluating: false,
+      });
+    });
+
+    expect(mockTransportRuntime.settleActiveDispatchFromExternalCompletion).not.toHaveBeenCalled();
+    expect(mockTransportRuntimeWorking).toBe(true);
+  });
+
+  it.each([
+    ['user-message activity', () => timelineEmitter.emit('deck_supervision_brain', 'user.message', {
+      text: `${AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER}\nDelegated work completed.`,
+      allowDuplicate: true,
+    })],
+    ['running activity', () => timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' })],
+    ['tool activity', () => timelineEmitter.emit('deck_supervision_brain', 'tool.call', { tool: 'delegation_reply' })],
+  ])('independently fences a delayed broker WAITING settle after %s', async (_label, emitActivity) => {
+    const resolveDecision = await beginDeferredBrokerWaitingDecision(`cmd-broker-waiting-${_label}`);
+    emitActivity();
+    mockTransportRuntimeWorking = true;
+
+    resolveDecision({
+      decision: 'waiting',
+      reason: 'the authoritative delegated result was pending when evaluation started',
+      confidence: 0.9,
+    });
+    await vi.waitFor(() => {
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({
+        evaluating: false,
+      });
+    });
+
+    expect(mockTransportRuntime.settleActiveDispatchFromExternalCompletion).not.toHaveBeenCalled();
+    expect(mockTransportRuntimeWorking).toBe(true);
+  });
+
+  it('preserves and evaluates a newer assistant completion instead of applying an older WAITING decision', async () => {
+    const resolveDecision = await beginDeferredBrokerWaitingDecision('cmd-broker-waiting-new-completion');
+    const newCompletion = 'The delegated result has arrived; continue with the authoritative task state.';
+    timelineEmitter.emit('deck_supervision_brain', 'assistant.text', {
+      text: newCompletion,
+      streaming: false,
+    });
+
+    resolveDecision({
+      decision: 'waiting',
+      reason: 'the authoritative delegated result was pending when evaluation started',
+      confidence: 0.9,
+    });
+    await vi.waitFor(() => {
+      expect(mockSupervisionDecide).toHaveBeenCalledTimes(2);
+    });
+
+    expect(mockSupervisionDecide.mock.calls[1]?.[0]).toMatchObject({
+      assistantResponse: newCompletion,
+    });
+    expect(mockTransportRuntime.settleActiveDispatchFromExternalCompletion).not.toHaveBeenCalled();
+  });
+
+  it('does not let a WAITING marker settle a newer turn that starts during delegation-evidence validation', async () => {
+    const snapshot = await seedSession('supervised');
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent(
+      'deck_supervision_brain',
+      'cmd-marker-waiting-new-turn',
+      'wait for the delegated result',
+      snapshot,
+    );
+    beginRun('cmd-marker-waiting-new-turn', 'wait for the delegated result');
+    mockTransportRuntimeWorking = true;
+    completeTurn(`The delegated result is still pending.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`);
+
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
+    timelineEmitter.emit('deck_supervision_brain', 'tool.call', { tool: 'delegation_reply' });
+    mockTransportRuntimeWorking = true;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(mockTransportRuntime.settleActiveDispatchFromExternalCompletion).not.toHaveBeenCalled();
+    expect(mockTransportRuntimeWorking).toBe(true);
   });
 
   it('gives an implicit (no-active-run) task candidate the same 60s no-evidence budget instead of failing closed after 2s', async () => {
