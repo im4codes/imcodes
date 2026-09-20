@@ -84,6 +84,7 @@ import {
   buildSupervisionExecutionCapabilityId,
   evaluateSupervisionExecutionBinding,
   evaluateSupervisionObservedIdentity,
+  normalizeSupervisionExecutionModel,
   supervisionSelectedExecutionBindingMatches,
   type SupervisionExecutionBinding,
   type SupervisionExecutionPoolKind,
@@ -585,7 +586,36 @@ export function isUniqueAuthoritativeProjectBrainCaller(
   sessions: readonly SessionRecord[],
 ): boolean {
   const brain = uniqueAuthoritativeProjectBrain(projectName, sessions);
-  return Boolean(brain && caller?.name === brain.name);
+  return Boolean(brain && caller?.name === brain.name
+    && caller.sessionInstanceId?.trim()
+    && caller.runtimeEpoch?.trim()
+    && brain.sessionInstanceId?.trim()
+    && brain.runtimeEpoch?.trim()
+    && caller.sessionInstanceId === brain.sessionInstanceId
+    && caller.runtimeEpoch === brain.runtimeEpoch);
+}
+
+export function exactManualSupervisionExecutionBinding(
+  actual: SupervisionObservedExecutionIdentity,
+  pool: SupervisionExecutionPoolKind,
+): SupervisionExecutionBinding {
+  const model = normalizeSupervisionExecutionModel(actual.agentType, actual.model);
+  const requested = {
+    agentType: actual.agentType,
+    providerFamily: actual.providerFamily,
+    runtimeType: actual.runtimeType,
+    model,
+    ...(actual.ccPresetId ? { ccPresetId: actual.ccPresetId } : {}),
+  };
+  return {
+    pool,
+    requested: {
+      ...requested,
+      capabilityId: buildSupervisionExecutionCapabilityId(requested),
+    },
+    actual,
+    origin: 'manual',
+  };
 }
 
 /** Request passed to the injectable {@link SendToolDeps.createExecutionClone} hook. */
@@ -1461,12 +1491,12 @@ export async function dispatchSendMessage(
       assignment.role === 'coordinator'
       && supervisionIdentityMatches(assignment.identity, callerIdentity)
     ));
-    const coordinatorRows = task.assignments.filter((assignment) => assignment.role === 'coordinator');
-    const legacyUniqueBrainMayCoordinate = coordinatorRows.length === 0
-      && isUniqueAuthoritativeProjectBrainCaller(callerRecord, callerProjectName, allSessions);
+    const authoritativeBrainMayCoordinate = isUniqueAuthoritativeProjectBrainCaller(
+      callerRecord, callerProjectName, allSessions,
+    );
     if (callerRecord?.role !== 'brain' || callerRecord.parentSession
       || task.projectName !== callerProjectName
-      || (!exactCoordinator && !legacyUniqueBrainMayCoordinate)) {
+      || (!exactCoordinator && !authoritativeBrainMayCoordinate)) {
       return reject(
         'task auditPolicy requires the exact authoritative project Brain coordinator',
         MCP_ERROR_REASONS.IDENTITY_REJECTED,
@@ -1685,6 +1715,13 @@ export async function dispatchSendMessage(
     const targetRecord = dispatchable[0]!;
     const targetIdentity = supervisionTaskIdentityForTarget(targetRecord);
     if (!targetIdentity) return { status: 'error', reason: MCP_ERROR_REASONS.IDENTITY_REJECTED, error: 'task target identity is unavailable' };
+    if (targetRecord.role === 'brain' && !targetRecord.parentSession) {
+      return {
+        status: 'error',
+        reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN,
+        error: 'the project Brain may coordinate supervised work but cannot be an implementer or auditor',
+      };
+    }
     // Task metadata turns both implementation AND audit sends into supervised
     // execution. Validate the exact target against the project's authoritative pool
     // before touching the registry, claims, reply authority or transport.
@@ -1705,6 +1742,17 @@ export async function dispatchSendMessage(
       requestedCapabilityId: input.task.requestedExecutionType?.capabilityId,
       economyPolicy: input.task.economyPolicy ?? undefined,
     });
+    const authoritativeBrainManualSelection = Boolean(
+      !input.automaticSupervision
+      && !autoProvision
+      && isUniqueAuthoritativeProjectBrainCaller(callerRecord, callerProjectName, allSessions)
+      && resolveEffectiveProjectName(targetRecord, allSessions) === callerProjectName
+      && targetRecord.name !== callerRecord?.name
+      && targetRecord.state !== 'stopped'
+      && (targetRecord.runtimeType ?? getSessionRuntimeType(targetRecord.agentType)) === 'transport'
+      && targetRecord.sessionInstanceId?.trim()
+      && targetRecord.runtimeEpoch?.trim(),
+    );
     const explicitManualSelection = Boolean(
       autoProvision
       && !input.automaticSupervision
@@ -1783,14 +1831,17 @@ export async function dispatchSendMessage(
     }
     const poolSelected = targetMatchesConfiguredSupervisionPool(pools, pool, targetRecord, actual)
       && checked.ok;
-    if (!poolSelected && !explicitManualSelection && !exactUnconfiguredAuditRecovery) {
+    if (!poolSelected && !explicitManualSelection && !exactUnconfiguredAuditRecovery
+      && !authoritativeBrainManualSelection) {
       return {
         status: 'error',
         reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
         error: `task execution pool rejected target: ${checked.ok ? 'unselected_config' : checked.reason}`,
       };
     }
-    const executionBinding: SupervisionExecutionBinding = poolSelected && checked.ok
+    const executionBinding: SupervisionExecutionBinding = authoritativeBrainManualSelection && !poolSelected
+      ? exactManualSupervisionExecutionBinding(actual as SupervisionObservedExecutionIdentity, pool)
+      : poolSelected && checked.ok
       ? {
           pool,
           requested: checked.requested,
@@ -1817,7 +1868,7 @@ export async function dispatchSendMessage(
               ...(exactActual.ccPresetId ? { ccPresetId: exactActual.ccPresetId } : {}),
             },
             actual: exactActual,
-            origin: 'reused',
+            origin: 'manual',
           };
         })();
     supervisedExecutionBinding = executionBinding;
@@ -1900,7 +1951,8 @@ export async function dispatchSendMessage(
           assignment.role === 'coordinator'
           && supervisionIdentityMatches(assignment.identity, callerIdentity)
         ));
-        if (callerRecord?.role !== 'brain' || callerRecord.parentSession || !exactCoordinator) {
+        if (callerRecord?.role !== 'brain' || callerRecord.parentSession
+          || (!exactCoordinator && !authoritativeBrainManualSelection)) {
           return {
             status: 'error',
             reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
@@ -1986,6 +2038,14 @@ export async function dispatchSendMessage(
             && targetRecord.sessionInstanceId?.trim()
             && targetRecord.runtimeEpoch?.trim()
           );
+          const authoritativeBrainSameObjectRecovery = Boolean(
+            authoritativeBrainManualSelection
+            && candidate.role === 'auditor'
+            && !AUDITOR_TERMINAL_STATUSES.has(candidate.status)
+            && candidate.auditAttemptId === recoveryAttempt
+            && candidate.auditRevision === recoveryRevision
+            && existing.currentRevision === recoveryRevision,
+          );
           const identityDrifted = candidate.identity.sessionName !== targetIdentity.sessionName
             || candidate.identity.sessionInstanceId !== targetIdentity.sessionInstanceId
             || candidate.identity.runtimeEpoch !== targetIdentity.runtimeEpoch
@@ -1994,7 +2054,7 @@ export async function dispatchSendMessage(
             || (candidate.executionBinding !== undefined
               && !supervisionSelectedExecutionBindingMatches(candidate.executionBinding, executionBinding));
           if (identityDrifted) {
-            if (!exactStrictSameObjectRecovery) {
+            if (!exactStrictSameObjectRecovery && !authoritativeBrainSameObjectRecovery) {
               return {
                 status: 'error',
                 reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
@@ -2006,12 +2066,17 @@ export async function dispatchSendMessage(
               assignmentId: candidate.assignmentId,
               identity: targetIdentity,
               callerProjectName,
-              reason: 'exact selected strict cross-vendor SAME-auditor recovery',
+              reason: authoritativeBrainSameObjectRecovery
+                ? 'authoritative Brain manual SAME-assignment auditor rebind'
+                : 'exact selected strict cross-vendor SAME-auditor recovery',
               expectedGeneration: candidate.generation,
               expectedAttemptId: recoveryAttempt,
               expectedRevision: recoveryRevision,
-              strictCrossVendor: true,
-              executionBinding,
+              strictCrossVendor: input.audit.strictCrossVendor === true,
+              executionBinding: authoritativeBrainSameObjectRecovery
+                ? { ...executionBinding, origin: 'manual' }
+                : executionBinding,
+              ...(authoritativeBrainSameObjectRecovery ? { authoritativeBrainOverride: true } : {}),
               now,
             });
             if (!rebound.ok) {
@@ -2036,6 +2101,61 @@ export async function dispatchSendMessage(
           // continuation was unreachable through the public tool even though
           // the hook layer accepted it.
           const exact = existing.assignments.find((assignment) => assignment.assignmentId === requestedExactId);
+          if (exact?.role === 'implementer' && authoritativeBrainManualSelection) {
+            const identityOrBindingChanged = !supervisionIdentityMatches(exact.identity, targetIdentity)
+              || !supervisionSelectedExecutionBindingMatches(exact.executionBinding, executionBinding);
+            if (identityOrBindingChanged) {
+              const rebound = registry.rebindAuditAssignment({
+                taskId: existing.taskId,
+                assignmentId: exact.assignmentId,
+                identity: targetIdentity,
+                callerProjectName,
+                reason: 'authoritative Brain manual SAME-assignment implementer rebind',
+                expectedGeneration: exact.generation,
+                ...(exact.auditRevision ? { expectedRevision: exact.auditRevision } : {}),
+                executionBinding: { ...executionBinding, origin: 'manual' },
+                authoritativeBrainOverride: true,
+                now,
+              });
+              if (!rebound.ok) {
+                return {
+                  status: 'error',
+                  reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
+                  error: `Brain implementer SAME-object rebind rejected: ${rebound.reason}`,
+                };
+              }
+              reusedContinuationAssignment = rebound.value;
+            } else {
+              reusedContinuationAssignment = exact;
+            }
+            if (reusedContinuationAssignment
+              && ['blocked', 'cancelled'].includes(reusedContinuationAssignment.status)) {
+              const reopened = registry.coordinateTaskAssignment({
+                taskId: existing.taskId,
+                assignmentId: reusedContinuationAssignment.assignmentId,
+                ...(['blocked', 'cancelled'].includes(existing.status)
+                  ? { taskStatus: 'recovered' as const } : {}),
+                assignmentStatus: 'recovered',
+                leaseAction: 'renew',
+                idempotencyKey: input.idempotencyKey?.trim()
+                  ? `brain-send-reopen:${input.idempotencyKey.trim()}`
+                  : `brain-send-reopen:${existing.taskId}:${reusedContinuationAssignment.assignmentId}:${targetIdentity.sessionInstanceId}:${targetIdentity.runtimeEpoch}`,
+                reason: 'authoritative Brain manual SAME-assignment implementer reopen',
+                authoritativeBrainOverride: true,
+                now,
+              });
+              if (!reopened.ok) {
+                return {
+                  status: 'error',
+                  reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
+                  error: `Brain implementer SAME-object reopen rejected: ${reopened.reason}`,
+                };
+              }
+              reusedContinuationAssignment = registry.getAssignment(
+                reusedContinuationAssignment.assignmentId,
+              );
+            }
+          }
           if (exact && exact.role !== 'implementer') {
             if (!isExactContinuationEligible({
               taskProjectName: existing.projectName,
@@ -2055,7 +2175,8 @@ export async function dispatchSendMessage(
               };
             }
             // Same stale-revision guard the implementer path applies.
-            if (input.task.currentRevision && existing.currentRevision
+            if (!authoritativeBrainManualSelection
+              && input.task.currentRevision && existing.currentRevision
               && input.task.currentRevision !== existing.currentRevision) {
               return {
                 status: 'error',
@@ -2103,7 +2224,8 @@ export async function dispatchSendMessage(
           // ownedFiles/sharedFiles are append-only attribution hints, not an
           // edit ACL. The assignment worktree is the implementation boundary;
           // stale or incomplete metadata must not deadlock a continuation.
-          if (input.task.currentRevision && existing.currentRevision
+          if (!authoritativeBrainManualSelection
+            && input.task.currentRevision && existing.currentRevision
             && input.task.currentRevision !== existing.currentRevision) {
             return {
               status: 'error',
@@ -2334,10 +2456,27 @@ export async function dispatchSendMessage(
         || authoritativeTask?.currentRevision !== requestedRevision
         || !sameTarget
         || finalReceipt) {
+        const mismatches = [
+          ...(assignment.value.role !== 'auditor'
+            ? [`role expected="auditor" actual=${JSON.stringify(assignment.value.role)}`] : []),
+          ...(AUDITOR_TERMINAL_STATUSES.has(assignment.value.status)
+            ? [`status expected="non_terminal" actual=${JSON.stringify(assignment.value.status)}`] : []),
+          ...(assignment.value.auditAttemptId !== requestedAttemptId
+            ? [`attemptId expected=${JSON.stringify(assignment.value.auditAttemptId ?? '')} actual=${JSON.stringify(requestedAttemptId)}`] : []),
+          ...(!requestedRevision || assignment.value.auditRevision !== requestedRevision
+            ? [`revision expected=${JSON.stringify(assignment.value.auditRevision ?? '')} actual=${JSON.stringify(requestedRevision)}`] : []),
+          ...(authoritativeTask?.currentRevision !== requestedRevision
+            ? [`currentRevision expected=${JSON.stringify(authoritativeTask?.currentRevision ?? '')} actual=${JSON.stringify(requestedRevision)}`] : []),
+          ...(assignment.value.identity.sessionName !== targetIdentity.sessionName
+            ? [`sessionName expected=${JSON.stringify(assignment.value.identity.sessionName)} actual=${JSON.stringify(targetIdentity.sessionName)}`] : []),
+          ...(authoritativeTask?.projectName !== targetRecord.projectName
+            ? [`projectName expected=${JSON.stringify(authoritativeTask?.projectName ?? '')} actual=${JSON.stringify(targetRecord.projectName ?? '')}`] : []),
+          ...(finalReceipt ? ['finalReceipt expected=false actual=true'] : []),
+        ];
         return {
           status: 'error',
           reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
-          error: 'audit redelivery requires the exact non-terminal assignment, target, attempt, revision and identity, and no final verdict',
+          error: `audit redelivery identity rejected: ${mismatches.join('; ')}`,
         };
       }
       const messageId = input.internalMessageId ?? (input.automaticSupervision
@@ -3922,7 +4061,22 @@ export async function dispatchReadyAudit(
       : false;
     return { status: 'blocked', reason, reported };
   }
-  const candidates: AutomaticAuditTransportTargets = existingAudit
+  const existingAuditTarget = existingAudit
+    ? sessions.find((session) => session.name === existingAudit.identity.sessionName)
+    : undefined;
+  const automaticAuditPools = resolveProjectAuthoritativeSupervisionPools(task.projectName, sessions);
+  const existingAuditStillSelected = Boolean(existingAuditTarget && (
+    automaticAuditPools.state !== 'configured'
+    || resolveSelectedSupervisionExecutionBinding(
+      task.projectName, sessions, existingAuditTarget, 'primary',
+    )
+  ));
+  // A durable auditor assignment is the object to preserve, not a permanent
+  // exemption for the session/config it used on an earlier delivery.  Resolve
+  // a currently selected exact target before dispatch so an obsolete target
+  // never produces a user-visible `unselected_config` detour first.
+  const repairingUnselectedExisting = Boolean(existingAudit && !existingAuditStillSelected);
+  const candidates: AutomaticAuditTransportTargets = existingAuditStillSelected
     ? {}
     : eligibleAutomaticAuditTransportTargets(
       brain,
@@ -3937,8 +4091,12 @@ export async function dispatchReadyAudit(
     projectName: task.projectName,
     projectRoot: brain.projectDir,
   };
-  let repairingUnselectedExisting = false;
-  const buildInput = (target?: string, autoProvision = false): SendMessageInput => ({
+  const buildInput = (target?: string, autoProvision = false): SendMessageInput => {
+    const exactTarget = target ? sessions.find((session) => session.name === target) : undefined;
+    const selectedBinding = exactTarget
+      ? resolveSelectedSupervisionExecutionBinding(task.projectName, sessions, exactTarget, 'primary')
+      : undefined;
+    return ({
     ...(target ? { target } : {}),
     message: boundedAuditBrief(task, revision, integrationArtifact.path, integrationArtifact.files, {
       scopeFiles: implementer.scopeFiles,
@@ -3972,9 +4130,11 @@ export async function dispatchReadyAudit(
       auditRevision: revision,
       auditAttemptId: attemptId,
       executionPool: 'primary',
+      ...(selectedBinding ? { requestedExecutionType: selectedBinding.requested } : {}),
       ...(autoProvision ? { autoProvision: true } : {}),
     },
-  });
+    });
+  };
   const dispatch = deps.dispatch ?? dispatchSendMessage;
   // Last synchronous authority check before anything is delivered; the send
   // path re-verifies the same snapshot under its materialization lock.
@@ -3982,7 +4142,9 @@ export async function dispatchReadyAudit(
     releaseAuditTarget(attemptId);
     return authorityRevoked();
   }
-  const directTarget = existingAudit?.identity.sessionName ?? candidates.ready;
+  const directTarget = existingAuditStillSelected
+    ? existingAudit?.identity.sessionName
+    : candidates.ready ?? (existingAudit ? candidates.busy : undefined);
   // Mandatory routing order: an already-ready authorized transport wins. If
   // none exists, the configured execution pool gets one deterministic spawn
   // attempt. A busy transport is only the final durable-FIFO fallback after a
@@ -4008,7 +4170,6 @@ export async function dispatchReadyAudit(
     const recoveryTarget = recoveryCandidates.ready ?? recoveryCandidates.busy;
     if (recoveryTarget) {
       recoveredExistingMessageId = undefined;
-      repairingUnselectedExisting = true;
       result = await dispatch(caller, buildInput(recoveryTarget));
     }
   }

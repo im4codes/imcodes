@@ -121,12 +121,23 @@ beforeEach(() => {
 describe('scope authorization', () => {
   const coordinator = {
     name: 'deck_cd_brain', projectName: 'codedeck', role: 'brain', agentType: 'codex',
+    sessionInstanceId: 'instance-deck-cd-brain', runtimeEpoch: 'epoch-deck-cd-brain',
     projectDir: '/work/codedeck', state: 'idle', restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1,
   } as never;
   it('requires the exact live brain and its effective project', () => {
     expect(isAuthorizedSupervisionConsoleScope(SCOPE, [coordinator])).toBe(true);
     expect(isAuthorizedSupervisionConsoleScope({ ...SCOPE, projectName: 'other' }, [coordinator])).toBe(false);
     expect(isAuthorizedSupervisionConsoleScope(SCOPE, [{ ...coordinator, role: 'w1' }])).toBe(false);
+    // Brain authority is now project-wide, so uniqueness and complete live
+    // runtime identity replace the old durable-coordinator-row veto.
+    expect(isAuthorizedSupervisionConsoleScope(SCOPE, [
+      coordinator,
+      {
+        ...coordinator, name: 'deck_cd_other_brain',
+        sessionInstanceId: 'instance-deck-cd-other', runtimeEpoch: 'epoch-deck-cd-other',
+      },
+    ])).toBe(false);
+    expect(isAuthorizedSupervisionConsoleScope(SCOPE, [{ ...coordinator, runtimeEpoch: undefined }])).toBe(false);
     expect(isAuthorizedSupervisionConsoleScope(SCOPE, [])).toBe(false);
   });
 });

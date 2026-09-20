@@ -4600,7 +4600,118 @@ describe('SupervisionTaskRegistry', () => {
     }
   });
 
-  it('keeps Brain coordination recovery fail-closed for auditors, success targets, and concrete finalization evidence', () => {
+  it('accepts a manual Brain execution rebind despite stale advisory revision/generation fences', () => {
+    const registry = makeRegistry();
+    const taskId = 'brain-manual-execution-rebind';
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level',
+      objective: 'rebind the exact assignment', currentRevision: 'current-r2',
+    })).toMatchObject({ ok: true });
+    const priorBinding = persistedExecutionBinding('deck_old_worker');
+    const assignment = registry.createAssignment({
+      taskId, role: 'implementer', identity: identity('deck_old_worker'),
+      scopeFiles: ['src/rebind.ts'], executionBinding: priorBinding,
+    });
+    if (!assignment.ok) throw new Error(assignment.reason);
+    const replacementIdentity = identity('deck_new_worker');
+    const manualBinding = {
+      ...priorBinding,
+      actual: {
+        ...priorBinding.actual,
+        sessionName: replacementIdentity.sessionName,
+        sessionInstanceId: replacementIdentity.sessionInstanceId,
+        runtimeEpoch: replacementIdentity.runtimeEpoch,
+      },
+      origin: 'manual' as const,
+    };
+
+    const manualRebind = {
+      taskId,
+      assignmentId: assignment.value.assignmentId,
+      identity: replacementIdentity,
+      executionBinding: manualBinding,
+      provisioning: {
+        selectedPool: 'primary', selectedConfig: manualBinding.requested, origin: 'manual',
+      },
+      expectedRevision: 'stale-r1',
+      expectedGeneration: 999,
+      leaseAction: 'renew',
+      idempotencyKey: 'brain-manual-execution-rebind-1',
+      reason: 'authoritative Brain manual target replacement',
+    } as const;
+    const before = registry.get(taskId);
+    // Without proof from the daemon's unique-live-Brain gate, the original
+    // revision/generation CAS contract remains fail-closed.
+    expect(registry.coordinateTaskAssignment(manualRebind))
+      .toMatchObject({ ok: false, reason: 'old_revision' });
+    expect(registry.get(taskId)).toEqual(before);
+    expect(registry.coordinateTaskAssignment({
+      ...manualRebind,
+      authoritativeBrainOverride: true,
+    })).toMatchObject({ ok: true });
+    expect(registry.getAssignment(assignment.value.assignmentId)).toMatchObject({
+      identity: replacementIdentity,
+      executionBinding: manualBinding,
+      provisioning: { origin: 'manual' },
+      generation: 2,
+    });
+    expect(registry.listEvents(taskId)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        assignmentId: assignment.value.assignmentId,
+        payload: expect.objectContaining({
+          source: 'brain_coordination_override', origin: 'manual',
+          reason: 'authoritative Brain manual target replacement',
+        }),
+      }),
+    ]));
+    registry.close();
+  });
+
+  it('keeps implementer and cancelled-assignment rebind relaxations behind the explicit Brain override', () => {
+    const registry = makeRegistry();
+    const taskId = 'brain-only-exact-rebind-boundaries';
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level',
+      objective: 'prove role and closed-receipt relaxations stay Brain-only', currentRevision: 'r1',
+    })).toMatchObject({ ok: true });
+    const implementer = registry.createAssignment({
+      taskId, role: 'implementer', identity: identity('deck_old_impl'), scopeFiles: [],
+    });
+    const auditor = registry.createAssignment({
+      taskId, role: 'auditor', identity: identity('deck_old_auditor'), required: false,
+      auditAttemptId: 'attempt-r1', auditRevision: 'r1', scopeFiles: [],
+    });
+    if (!implementer.ok || !auditor.ok) throw new Error('Brain-only rebind fixture failed');
+
+    const implementerRebind = {
+      taskId, assignmentId: implementer.value.assignmentId,
+      identity: identity('deck_new_impl'), callerProjectName: 'alpha',
+      reason: 'authoritative Brain manual implementer replacement',
+    } as const;
+    expect(registry.rebindAuditAssignment(implementerRebind))
+      .toEqual({ ok: false, reason: 'role_forbidden' });
+    expect(registry.rebindAuditAssignment({
+      ...implementerRebind, authoritativeBrainOverride: true,
+    })).toMatchObject({ ok: true, value: { identity: identity('deck_new_impl') } });
+
+    expect(registry.applyTaskIntent({
+      taskId, assignmentId: auditor.value.assignmentId, intent: 'cancel', toStatus: 'cancelled',
+    })).toMatchObject({ ok: true });
+    const cancelledAuditorRebind = {
+      taskId, assignmentId: auditor.value.assignmentId,
+      identity: identity('deck_new_auditor'), callerProjectName: 'alpha',
+      reason: 'authoritative Brain revives the same cancelled auditor assignment',
+      expectedAttemptId: 'attempt-r1', expectedRevision: 'r1',
+    } as const;
+    expect(registry.rebindAuditAssignment(cancelledAuditorRebind))
+      .toEqual({ ok: false, reason: 'receipt_closed' });
+    expect(registry.rebindAuditAssignment({
+      ...cancelledAuditorRebind, authoritativeBrainOverride: true,
+    })).toMatchObject({ ok: true, value: { identity: identity('deck_new_auditor'), status: 'cancelled' } });
+    registry.close();
+  });
+
+  it('lets Brain recover auditor control state but keeps fabricated success and finalization evidence fail-closed', () => {
     const registry = makeRegistry();
     const taskId = 'brain-coordination-refusals';
     expect(registry.createOrGet({
@@ -4624,11 +4735,28 @@ describe('SupervisionTaskRegistry', () => {
       expect(registry.get(taskId)).toEqual(before);
       expect(registry.listEvents(taskId)).toHaveLength(events);
     };
-    assertNoMutation(() => registry.coordinateTaskAssignment({
+    const auditorRecovery = {
       taskId, assignmentId: auditor.value.assignmentId, assignmentStatus: 'rework',
       leaseAction: 'preserve',
-      idempotencyKey: 'auditor-status-refused', reason: 'must not rewrite an auditor',
-    }), { ok: false, reason: 'role_forbidden' });
+      idempotencyKey: 'auditor-status-recovered', reason: 'authoritative auditor recovery',
+    } as const;
+    assertNoMutation(
+      () => registry.coordinateTaskAssignment(auditorRecovery),
+      { ok: false, reason: 'role_forbidden' },
+    );
+    expect(registry.coordinateTaskAssignment({
+      ...auditorRecovery,
+      authoritativeBrainOverride: true,
+    })).toMatchObject({ ok: true });
+    expect(registry.getAssignment(auditor.value.assignmentId)).toMatchObject({
+      status: 'rework', blocker: 'authoritative auditor recovery',
+    });
+    expect(registry.listEvents(taskId)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        assignmentId: auditor.value.assignmentId,
+        payload: expect.objectContaining({ source: 'brain_coordination_override' }),
+      }),
+    ]));
     assertNoMutation(() => registry.coordinateTaskAssignment({
       taskId, assignmentId: implementer.value.assignmentId,
       assignmentStatus: 'passed' as never,
@@ -9066,7 +9194,7 @@ describe('SupervisionTaskRegistry', () => {
       .toHaveLength(1);
   });
 
-  it('send_message rejects missing and inaccessible explicit task ids without minting or dispatching', async () => {
+  it('send_message lets the authoritative Brain coordinate an existing task but still rejects a missing task id', async () => {
     const registry = getSupervisionTaskRegistry();
     expect(registry.createOrGet({ projectName: 'alpha', taskId: 'other-owner-task', objective: 'private task' }).ok).toBe(true);
     expect(registry.createAssignment({
@@ -9077,7 +9205,10 @@ describe('SupervisionTaskRegistry', () => {
     }).ok).toBe(true);
     const sessions = [session('deck_alpha_brain'), session('deck_alpha_w1')];
     const dispatchMessage = vi.fn(async () => undefined);
-    const deps = { listSessions: () => sessions, dispatchMessage, exactTargetOnly: true };
+    const deps = {
+      listSessions: () => sessions, dispatchMessage, exactTargetOnly: true,
+      ensureSupervisionAssignmentWorktree: ensureTestAssignmentWorktree,
+    };
     const runtimeCaller = { userId: 'u', sessionName: 'deck_alpha_brain', projectName: 'alpha', projectRoot: '/work/alpha' };
 
     const inaccessible = await dispatchSendMessage(runtimeCaller, {
@@ -9089,11 +9220,11 @@ describe('SupervisionTaskRegistry', () => {
       task: { taskId: 'missing-task', objective: 'must not create' },
     }, deps);
 
-    expect(inaccessible).toEqual({
+    expect(inaccessible).toMatchObject({ status: 'accepted', taskId: 'other-owner-task' });
+    expect(missing).toEqual({
       status: 'error', reason: 'identity_rejected', error: 'task is not visible to this caller',
     });
-    expect(missing).toEqual(inaccessible);
-    expect(dispatchMessage).not.toHaveBeenCalled();
+    expect(dispatchMessage).toHaveBeenCalledOnce();
     expect(registry.list()).toHaveLength(1);
     expect(registry.get('missing-task')).toBeUndefined();
   });
@@ -9178,6 +9309,71 @@ describe('SupervisionTaskRegistry', () => {
     });
     expect(registry.get('missing-start-task')).toBeUndefined();
     expect(registry.list()).toHaveLength(2);
+  });
+
+  it('supervision_task_start lets the unique live Brain take over the existing coordinator assignment in place', async () => {
+    const registry = getSupervisionTaskRegistry();
+    expect(registry.createOrGet({
+      projectName: 'alpha', taskId: 'brain-coordinator-takeover', objective: 'same object',
+    }).ok).toBe(true);
+    const original = registry.createAssignment({
+      taskId: 'brain-coordinator-takeover', role: 'coordinator',
+      identity: identity('deck_alpha_other'), scopeFiles: [],
+    });
+    if (!original.ok) throw new Error(original.reason);
+    const sessions = [session('deck_alpha_brain'), session('deck_alpha_other')];
+    const ambiguousHandlers = createMemoryMcpToolHandlers(
+      { userId: 'u', sessionName: 'deck_alpha_brain', projectName: 'alpha', projectRoot: '/work/alpha' },
+      {
+        sendDeps: {
+          listSessions: () => [
+            ...sessions,
+            session('deck_alpha_second_brain'),
+          ],
+        },
+      },
+    );
+    expect(await ambiguousHandlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START]({
+      taskId: 'brain-coordinator-takeover', role: 'coordinator', objective: 'ambiguous must fail',
+      idempotencyKey: 'ambiguous-brain-coordinator-takeover',
+    })).toMatchObject({ status: 'error', reason: 'identity_rejected' });
+    expect(registry.getAssignment(original.value.assignmentId)?.identity)
+      .toEqual(identity('deck_alpha_other'));
+
+    const handlers = createMemoryMcpToolHandlers(
+      { userId: 'u', sessionName: 'deck_alpha_brain', projectName: 'alpha', projectRoot: '/work/alpha' },
+      { sendDeps: { listSessions: () => sessions } },
+    );
+
+    expect(await handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START]({
+      taskId: 'brain-coordinator-takeover', role: 'implementer', objective: 'must stay coordinator-only',
+      idempotencyKey: 'brain-must-not-implement',
+    })).toMatchObject({
+      status: 'error', reason: 'scope_forbidden',
+      message: expect.stringContaining('cannot be an implementer or auditor'),
+    });
+
+    const result = await handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START]({
+      taskId: 'brain-coordinator-takeover', role: 'coordinator', objective: 'same object',
+      idempotencyKey: 'brain-coordinator-takeover-1',
+    });
+    expect(result).toMatchObject({
+      status: 'ok', taskId: 'brain-coordinator-takeover', assignmentId: original.value.assignmentId,
+      idempotentReplay: false,
+    });
+    expect(registry.get('brain-coordinator-takeover')?.assignments).toHaveLength(1);
+    expect(registry.getAssignment(original.value.assignmentId)).toMatchObject({
+      identity: identity('deck_alpha_brain'),
+      generation: 2,
+    });
+    expect(registry.listEvents('brain-coordinator-takeover')).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          source: 'brain_authorized_audit_identity_rebind',
+          reason: 'authoritative Brain manual coordinator takeover',
+        }),
+      }),
+    ]));
   });
 
   it('atomically cancels unfinished assignments and revokes leases without claim authority after SQLite reopen', async () => {

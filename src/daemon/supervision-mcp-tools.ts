@@ -171,14 +171,15 @@ export function supervisionTaskCallerAuthority(input: {
   const projectMatches = Boolean(input.item?.projectName && projectName
     && input.item.projectName === projectName);
   const stableIdentity = callerSessionName ? { sessionName: callerSessionName } : undefined;
-  const hasCoordinator = Boolean(input.item?.assignments?.some((assignment) => assignment.role === 'coordinator'));
   const durableCoordinator = Boolean(projectMatches && !liveIdentityConflict
     && isSupervisionTaskCoordinator(input.item?.assignments as never, stableIdentity));
-  // Legacy rows can predate coordinator attribution. Preserve their existing
-  // recovery lane only for a daemon-verified live project Brain; once ANY
-  // coordinator row exists, that exact durable assignment owns authority.
+  // A unique live top-level project Brain is the project's coordination
+  // authority even when an older coordinator row exists.  The row remains
+  // durable provenance; it is not a veto held by a stale epoch or a retired
+  // window.  `liveProjectBrain` is daemon-observed and project-scoped, so this
+  // does not widen authority to participants or same-name stale runtimes.
   const coordinatorMayAct = durableCoordinator
-    || Boolean(projectMatches && input.liveProjectBrain && !hasCoordinator);
+    || Boolean(projectMatches && input.liveProjectBrain);
   const participantMayRead = Boolean(projectMatches && usableLiveIdentity && input.liveIdentity
     && supervisionCallerParticipates(input.item, input.liveIdentity, projectName));
   return {
@@ -282,6 +283,8 @@ export interface SupervisionRegistryPort {
     };
     callerProjectName: string;
     reason: string;
+    executionBinding?: SupervisionExecutionBinding;
+    authoritativeBrainOverride?: true;
   }): { ok: true; value?: unknown; replay?: boolean } | { ok: false; reason: string };
   recoverOrphanedDelegatedAuditor?(input: {
     taskId: string;
@@ -348,6 +351,7 @@ export interface SupervisionRegistryPort {
     evidenceManifestSha256?: string;
     idempotencyKey: string;
     reason: string;
+    authoritativeBrainOverride?: true;
   }): { ok: true; value?: unknown; replay?: boolean } | { ok: false; reason: string };
   resolveCompletionEvidence?(input: {
     taskId: string;
@@ -401,7 +405,7 @@ export interface SupervisionMcpToolDeps {
   }) => boolean | Promise<boolean>;
   resolveSessionIdentity?: (sessionName: string) => {
     sessionName: string; sessionInstanceId: string; runtimeEpoch: string;
-    agentType: string; providerFamily: string; projectName: string;
+    agentType: string; providerFamily: string; projectName: string; role?: string;
   } | undefined;
   /** Exact project-pool selection for an auditor recovery target. */
   resolveAuditorRecoveryBinding?: (sessionName: string) => SupervisionExecutionBinding | undefined;
@@ -415,6 +419,8 @@ export interface SupervisionMcpToolDeps {
     auditedSessionName: string;
   }) => SupervisionAuditorRecoveryCrossVendorAvailability | undefined
     | Promise<SupervisionAuditorRecoveryCrossVendorAvailability | undefined>;
+  /** Exact live transport binding selected manually by the authoritative Brain. */
+  resolveManualExecutionBinding?: (sessionName: string) => SupervisionExecutionBinding | undefined;
   /** Physical worktree cleanup shares the already-authorized housekeeping ingress. */
   worktreeGc?: (input: {
     mode: 'dryRun' | 'apply'; projectName: string; cursor?: string; limit?: number;
@@ -563,6 +569,7 @@ export function createSupervisionMcpToolHandlers(
       const requestedAssignmentId = input.assignmentId === undefined ? undefined : String(input.assignmentId);
       const intent = String(input.intent ?? '');
       const exactTaskAuthority = taskAuthority(task);
+      const authoritativeProjectBrainMayAct = exactTaskAuthority.projectBrainMayRead;
       const callerAssignments = (task?.assignments ?? []).filter(
         (assignment) => task?.projectName === exactTaskAuthority.projectName
           && supervisionIdentityMatches(assignment.identity, authority.identity)
@@ -725,7 +732,40 @@ export function createSupervisionMcpToolHandlers(
           ? (startedByAck ? 'implementing' : boundAssignment.status)
           : reg.getStatus(taskId),
       });
-      if (!outcome.ok) return err(outcome.refusal ?? 'refused', outcome.detail);
+      if (!outcome.ok) {
+        const brainOverrideStatus = outcome.refusal === 'illegal_transition'
+          && authoritativeProjectBrainMayAct
+          && boundAssignmentId
+          ? intent === 'start' || intent === 'claim'
+            ? 'implementing'
+            : intent === 'cancel'
+              ? 'cancelled'
+              : undefined
+          : undefined;
+        if (brainOverrideStatus) {
+          const coordinated = reg.coordinateTaskAssignment?.({
+            taskId,
+            assignmentId: boundAssignmentId!,
+            taskStatus: brainOverrideStatus,
+            assignmentStatus: brainOverrideStatus,
+            leaseAction: brainOverrideStatus === 'cancelled' ? 'clear' : 'renew',
+            idempotencyKey: `brain-intent:${taskId}:${boundAssignmentId}:${intent}:${boundAssignment?.status ?? task?.status ?? 'unknown'}:${brainOverrideStatus}`,
+            reason: String(input.note ?? '').trim()
+              || `authoritative Brain manual ${intent} lifecycle override`,
+            authoritativeBrainOverride: true,
+          });
+          if (!coordinated) return err('unavailable', 'Brain lifecycle override is not bound');
+          if (!coordinated.ok) return err(coordinated.reason, `Brain lifecycle override rejected: ${coordinated.reason}`);
+          return ok({
+            intent,
+            fromStatus: boundAssignment?.status ?? task?.status ?? null,
+            toStatus: brainOverrideStatus,
+            item: coordinated.value,
+            idempotentReplay: coordinated.replay === true,
+          });
+        }
+        return err(outcome.refusal ?? 'refused', outcome.detail);
+      }
       // Set only when a post-commit projection could not be completed. It never
       // negates the committed transition; it tells the caller what still needs
       // to converge so they do not have to guess from an error.
@@ -1006,6 +1046,7 @@ export function createSupervisionMcpToolHandlers(
         }
         const identity = deps.resolveSessionIdentity?.(rebindSessionName);
         if (!identity) return err('identity_rejected', 'rebind target has no live daemon-observed identity');
+        if (identity.role === 'brain') return err('scope_forbidden', 'the project Brain cannot become an auditor');
         if (identity.projectName !== taskProjectName
           || getSessionRuntimeType(identity.agentType) !== 'transport'
           || identity.sessionName === implementerSessionName) {
@@ -1173,6 +1214,7 @@ export function createSupervisionMcpToolHandlers(
         }
         const identity = deps.resolveSessionIdentity?.(rebindSessionName);
         if (!identity) return err('identity_rejected', 'rebind target has no live daemon-observed identity');
+        if (identity.role === 'brain') return err('scope_forbidden', 'the project Brain cannot become an implementer');
         const rebound = reg.rebindValidatedImplementerAssignment?.({
           taskId, assignmentId, identity, expectedRevision, ownedFiles,
           evidenceManifestSha256, reason,
@@ -1359,9 +1401,13 @@ export function createSupervisionMcpToolHandlers(
           providerFamily: identity.providerFamily,
         } : undefined;
         const assignment = task.assignments?.find((candidate) => candidate.assignmentId === assignmentId);
+        if (identity?.role === 'brain' && assignment?.role !== 'coordinator') {
+          return err('scope_forbidden', 'the project Brain cannot become an implementer or auditor');
+        }
         const refreshesExecutionAuthority = Boolean(
           reboundIdentity && (assignment?.executionBinding || assignment?.provisioning),
         );
+        const authoritativeBrainOverride = taskAuthority(task).projectBrainMayRead;
         const coordinationExpectedRevision = expectedRevision || (
           expectedGeneration !== undefined
           && !task.currentRevision
@@ -1380,7 +1426,7 @@ export function createSupervisionMcpToolHandlers(
             'coordination recovery requires an exact revision/generation pair',
           );
         }
-        if (refreshesExecutionAuthority && !coordinationCasPresent) {
+        if (refreshesExecutionAuthority && !authoritativeBrainOverride && !coordinationCasPresent) {
           return err(
             'validation_failed',
             'coordination execution-authority rebind requires expectedRevision and expectedGeneration',
@@ -1391,6 +1437,7 @@ export function createSupervisionMcpToolHandlers(
         }
         const reboundExecutionBinding = refreshesExecutionAuthority
           ? deps.resolveAuditorRecoveryBinding?.(rebindSessionName!)
+            ?? deps.resolveManualExecutionBinding?.(rebindSessionName!)
           : undefined;
         if (refreshesExecutionAuthority && !reboundExecutionBinding) {
           return err('identity_rejected', 'coordination identity target has no selected execution binding');
@@ -1398,7 +1445,7 @@ export function createSupervisionMcpToolHandlers(
         const reboundProvisioning: SupervisionProvisioningEvidence | undefined = reboundExecutionBinding ? {
           selectedPool: reboundExecutionBinding.pool,
           selectedConfig: reboundExecutionBinding.requested,
-          origin: 'reused',
+          origin: reboundExecutionBinding.origin,
         } : undefined;
         const coordinated = reg.coordinateTaskAssignment?.({
           taskId,
@@ -1419,6 +1466,9 @@ export function createSupervisionMcpToolHandlers(
           } : {}),
           idempotencyKey,
           reason,
+          ...(authoritativeBrainOverride
+            ? { authoritativeBrainOverride: true as const }
+            : {}),
         });
         if (!coordinated) return err('unavailable', 'coordination override is not bound');
         if (!coordinated.ok) return err(coordinated.reason, `coordination override rejected: ${coordinated.reason}`);
@@ -1483,6 +1533,12 @@ export function createSupervisionMcpToolHandlers(
         if (identity.projectName !== taskProjectName) {
           return err('forbidden', 'audit identity target must belong to the task project');
         }
+        const assignment = task.assignments?.find((candidate) => candidate.assignmentId === assignmentId);
+        if (identity.role === 'brain' && assignment?.role !== 'coordinator') {
+          return err('scope_forbidden', 'the project Brain cannot become an implementer or auditor');
+        }
+        const reboundExecutionBinding = deps.resolveAuditorRecoveryBinding?.(rebindSessionName)
+          ?? deps.resolveManualExecutionBinding?.(rebindSessionName);
         const rebound = reg.rebindAuditAssignment?.({
           taskId,
           assignmentId,
@@ -1495,6 +1551,10 @@ export function createSupervisionMcpToolHandlers(
           },
           callerProjectName: taskProjectName,
           reason,
+          ...(taskAuthority(task).projectBrainMayRead
+            ? { authoritativeBrainOverride: true as const }
+            : {}),
+          ...(reboundExecutionBinding ? { executionBinding: reboundExecutionBinding } : {}),
         });
         if (!rebound) return err('unavailable', 'audit identity rebind is not bound');
         if (!rebound.ok) return err(rebound.reason, `audit identity rebind rejected: ${rebound.reason}`);
@@ -1507,8 +1567,7 @@ export function createSupervisionMcpToolHandlers(
       const current = reg.getStatus(taskId);
       const task = reg.get(taskId);
       const taskProjectName = typeof task?.projectName === 'string' ? task.projectName : '';
-      const evidenceRecovery = current === 'cancelled' && target === 'recovered';
-      const projectBrainMayRecover = evidenceRecovery && coordinatorMayRecover(task);
+      const projectBrainMayRecover = taskAuthority(task).projectBrainMayRead;
       if (!isAdmin(caller) && !projectBrainMayRecover) {
         return err('forbidden', 'administrative recovery is not authorized for this caller');
       }

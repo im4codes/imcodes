@@ -277,6 +277,45 @@ describe('production MCP registration', () => {
     expect(registry.applied).toEqual([]);
   });
 
+  it('keeps illegal-transition lifecycle adjustment exclusive to a verified unique live Brain', async () => {
+    registry.statuses.set('tsk_a', 'cancelled');
+    registry.assignmentStates.set('tsk_a', [
+      {
+        assignmentId: 'coordinator-a', role: 'coordinator', status: 'delegated', leaseId: 'lease-c',
+        identity: testIdentity(CALLER.sessionName!),
+      },
+      {
+        assignmentId: 'worker-a', role: 'implementer', status: 'cancelled', leaseId: '',
+        identity: testIdentity('deck_cd_worker'),
+      },
+    ]);
+    const request = { intent: 'start', taskId: 'tsk_a', assignmentId: 'worker-a' } as const;
+    // A durable coordinator name is not enough when the live daemon cannot
+    // prove that caller is the unique top-level project Brain.
+    const ambiguousOrNonBrain = createSupervisionMcpToolHandlers(CALLER, {
+      resolveSessionIdentity: testResolveSessionIdentity,
+      registry,
+      isProjectBrain: () => false,
+    });
+    expect(await ambiguousOrNonBrain[SUPERVISION_MCP_TOOLS.INTENT](request))
+      .toMatchObject({ status: 'error', reason: 'illegal_transition' });
+    expect(registry.coordinated).toEqual([]);
+
+    const brain = createSupervisionMcpToolHandlers(CALLER, {
+      resolveSessionIdentity: testResolveSessionIdentity,
+      registry,
+      isProjectBrain: () => true,
+    });
+    expect(await brain[SUPERVISION_MCP_TOOLS.INTENT](request)).toMatchObject({
+      status: 'ok', intent: 'start', fromStatus: 'cancelled', toStatus: 'implementing',
+    });
+    expect(registry.coordinated).toEqual([expect.objectContaining({
+      taskId: 'tsk_a', assignmentId: 'worker-a',
+      taskStatus: 'implementing', assignmentStatus: 'implementing',
+      authoritativeBrainOverride: true,
+    })]);
+  });
+
   it('uses assignment lifecycle for assignment-scoped recovery intents when the aggregate is stale', async () => {
     registry.statuses.set('tsk_a', 'ready_for_audit');
     registry.assignmentStates.set('tsk_a', [{
@@ -725,6 +764,39 @@ describe('list/get visibility guards', () => {
       .toMatchObject({ status: 'ok', task: { taskId: 'tsk_other', projectName: 'codedeck' } });
   });
 
+  it('lets only the live project Brain restart an exact cancelled assignment through intent', async () => {
+    registry.statuses.set('tsk_a', 'cancelled');
+    registry.assignmentStates.set('tsk_a', [{
+      assignmentId: 'tsk_a-cancelled-worker', role: 'implementer', status: 'cancelled', leaseId: '',
+      identity: testIdentity(CALLER.sessionName!),
+    }]);
+    const request = {
+      intent: 'start', taskId: 'tsk_a', assignmentId: 'tsk_a-cancelled-worker',
+      note: 'resume this exact assignment',
+    } as const;
+    const participant = createSupervisionMcpToolHandlers(CALLER, {
+      resolveSessionIdentity: testResolveSessionIdentity,
+      registry,
+    });
+    expect(await participant[SUPERVISION_MCP_TOOLS.INTENT](request)).toMatchObject({
+      status: 'error', reason: 'illegal_transition',
+    });
+
+    const brain = createSupervisionMcpToolHandlers(CALLER, {
+      resolveSessionIdentity: testResolveSessionIdentity,
+      registry,
+      isProjectBrain: () => true,
+    });
+    expect(await brain[SUPERVISION_MCP_TOOLS.INTENT](request)).toMatchObject({
+      status: 'ok', intent: 'start', fromStatus: 'cancelled', toStatus: 'implementing',
+    });
+    expect(registry.coordinated.at(-1)).toMatchObject({
+      taskId: 'tsk_a', assignmentId: 'tsk_a-cancelled-worker',
+      taskStatus: 'implementing', assignmentStatus: 'implementing',
+      leaseAction: 'renew', reason: 'resume this exact assignment',
+    });
+  });
+
   it('threads explicit history filters without changing the default list surface', async () => {
     const brain = createSupervisionMcpToolHandlers(CALLER, { resolveSessionIdentity: testResolveSessionIdentity, registry, isProjectBrain: () => true });
     const defaultList: any = await brain[SUPERVISION_MCP_TOOLS.LIST]({});
@@ -859,6 +931,7 @@ describe('administrative recover', () => {
         agentType: liveIdentity.agentType,
         providerFamily: liveIdentity.providerFamily,
       },
+      authoritativeBrainOverride: true,
       idempotencyKey: 'repair-tsk-a-r1', reason: 'repair misprojected REWORK owner',
     }]);
 
@@ -1481,6 +1554,7 @@ describe('administrative recover', () => {
       // reach the registry without going through this MCP entry point.
       callerProjectName: 'codedeck',
       reason: 'authorized device replacement',
+      authoritativeBrainOverride: true,
     }]);
   });
 
@@ -1684,16 +1758,20 @@ describe('administrative recover', () => {
     })]);
     expect(registry.implementerRebound, 'must not route an auditor through implementer recovery').toEqual([]);
 
-    const nonCoordinator = createSupervisionMcpToolHandlers({
+    // The user contract now lets the unique live project Brain repair this
+    // SAME auditor assignment even when its runtime is not the persisted
+    // coordinator row. Keep the former fail-closed assertion for an admin that
+    // is explicitly not that Brain, so the override cannot leak to non-Brains.
+    const nonBrainCoordinator = createSupervisionMcpToolHandlers({
       ...CALLER, sessionName: 'deck_admin_not_task_coordinator',
     }, {
       registry,
       isAdmin: () => true,
-      isProjectBrain: () => true,
+      isProjectBrain: () => false,
       resolveSessionIdentity: (name) => name === replacement.sessionName ? replacement : undefined,
       resolveAuditorRecoveryBinding: () => replacementBinding,
     });
-    await expect(nonCoordinator[SUPERVISION_MCP_TOOLS.RECOVER]({
+    await expect(nonBrainCoordinator[SUPERVISION_MCP_TOOLS.RECOVER]({
       taskId, assignmentId, rebindSessionName: replacement.sessionName,
       expectedRevision: revision, ownedFiles, evidenceManifestSha256,
       reason: 'admin must not replace task coordinator authority',
@@ -2045,6 +2123,27 @@ describe('administrative recover', () => {
     expect(registry.recovered).toEqual([{
       taskId: 'tsk_a', toStatus: 'recovered', reason: 'repair cascade',
     }]);
+  });
+
+  it('lets the live project Brain move a non-terminal task to a recovery state while a non-Brain participant remains forbidden', async () => {
+    registry.statuses.set('tsk_a', 'implementing');
+    const participant = createSupervisionMcpToolHandlers(CALLER, {
+      resolveSessionIdentity: testResolveSessionIdentity,
+      registry,
+    });
+    const request = { taskId: 'tsk_a', toStatus: 'blocked', reason: 'authoritative manual hold' } as const;
+    expect(await participant[SUPERVISION_MCP_TOOLS.RECOVER](request))
+      .toMatchObject({ status: 'error', reason: 'forbidden' });
+
+    const brain = createSupervisionMcpToolHandlers(CALLER, {
+      resolveSessionIdentity: testResolveSessionIdentity,
+      registry,
+      isProjectBrain: () => true,
+    });
+    expect(await brain[SUPERVISION_MCP_TOOLS.RECOVER](request)).toMatchObject({
+      status: 'ok', taskId: 'tsk_a', fromStatus: 'implementing', toStatus: 'blocked',
+    });
+    expect(registry.recovered).toEqual([{ taskId: 'tsk_a', toStatus: 'blocked', reason: request.reason }]);
   });
 
   it('does not let a project Brain use cancelled recovery across project scope', async () => {

@@ -277,12 +277,11 @@ describe('send-tool', () => {
     expect(result.deliveries[0]?.execution).not.toHaveProperty('pool');
   });
 
-  it('lets the persisted binding outrank a same-name live runtime that now reports otherwise', async () => {
-    // The failure this pins is production-only: the pure resolver can rank the
-    // binding first and the wiring can still hand it the live record and never
-    // read the registry at all. A session re-created under the same name on a
-    // different provider must not be able to relabel work already dispatched,
-    // so the receipt has to state what the work was ADMITTED under.
+  it('lets only the unique live Brain replace a drifted persisted binding for an exact target', async () => {
+    // The user's Brain-authority contract deliberately changed the old rule:
+    // an exact manual Brain send is now a SAME-assignment rebind, while an
+    // ordinary participant still observes the persisted admission binding and
+    // cannot mutate it merely because a same-name runtime reports differently.
     resetSupervisionTaskRegistryForTests();
     // Assignment provisioning realpaths the project, so this needs a real dir.
     const projectRoot = await realpath(await mkdtemp(join(tmpdir(), 'imcodes-send-exec-')));
@@ -393,33 +392,64 @@ describe('send-tool', () => {
         },
       },
     }).ok).toBe(true);
+    const participant = session({
+      name: 'deck_alpha_participant', projectName: 'alpha', role: 'w2', label: 'Participant',
+      agentType: 'codex-sdk', runtimeType: 'transport', activeModel: 'gpt-5.6-live', projectDir: projectRoot,
+    } as never);
+    expect(registry.createAssignment({
+      assignmentId: `${assignmentId}-participant`, taskId, role: 'coordinator', required: false, scopeFiles: [],
+      identity: {
+        sessionName: participant.name, sessionInstanceId: participant.sessionInstanceId!,
+        runtimeEpoch: participant.runtimeEpoch!, agentType: participant.agentType, providerFamily: 'openai',
+      },
+    }).ok).toBe(true);
+
+    const participantResult = await dispatchSendMessage({
+      ...caller, sessionName: participant.name, projectRoot,
+    }, {
+      target: target.name,
+      message: 'ordinary participant cannot replace execution authority',
+      task: { taskId, assignmentId, executionPool: 'primary' },
+    }, {
+      listSessions: () => [brain, participant, target],
+      dispatchMessage: vi.fn().mockResolvedValue('delivered'),
+    });
+    expect(participantResult).toMatchObject({ status: 'accepted' });
+    if (participantResult.status !== 'accepted') throw new Error('expected participant delivery');
+    expect(participantResult.deliveries[0]?.execution).toMatchObject({
+      agentType: 'claude-code-sdk', providerFamily: 'anthropic', model: 'claude-opus-5-admitted',
+      source: 'assignment',
+    });
+    expect(registry.getAssignment(assignmentId)?.executionBinding?.origin).toBe('configured');
 
     const result = await dispatchSendMessage({ ...caller, projectRoot }, {
       target: 'Coder',
       message: 'continue',
       task: { taskId, assignmentId, executionPool: 'primary' },
     }, {
-      listSessions: () => [brain, target],
+      listSessions: () => [brain, participant, target],
       dispatchMessage: vi.fn().mockResolvedValue('delivered'),
     });
 
     if (result.status !== 'accepted') throw new Error(`expected accepted, got ${JSON.stringify(result)}`);
     const execution = result.deliveries[0]?.execution;
-    // Every discriminating field comes from the binding, none from the live row.
+    // The exact unique Brain explicitly selected this live target, so the same
+    // assignment now records the current runtime as a manual authority change.
     expect(execution).toMatchObject({
       sessionName: 'deck_alpha_w1',
-      agentType: 'claude-code-sdk',
-      providerFamily: 'anthropic',
-      model: 'claude-opus-5-admitted',
+      agentType: 'codex-sdk',
+      providerFamily: 'openai',
+      model: 'gpt-5.6-live',
       pool: 'primary',
       source: 'assignment',
     });
-    expect(execution?.model).not.toBe('gpt-5.6-live');
-    expect(execution?.agentType).not.toBe('codex-sdk');
+    expect(registry.getAssignment(assignmentId)?.executionBinding).toMatchObject({
+      origin: 'manual', actual: { sessionName: target.name, agentType: 'codex-sdk', providerFamily: 'openai' },
+    });
     resetSupervisionTaskRegistryForTests();
   });
 
-  it('fails closed before dispatch when an exact assignment binding still names another session', async () => {
+  it('lets only the unique live Brain replace an exact assignment binding that names another session', async () => {
     resetSupervisionTaskRegistryForTests();
     const registry = getSupervisionTaskRegistry();
     const target = session({
@@ -478,13 +508,24 @@ describe('send-tool', () => {
         },
       },
     })).toMatchObject({ ok: true });
+    const participant = session({
+      name: 'deck_alpha_participant', projectName: 'alpha', role: 'w2', label: 'Participant',
+      agentType: 'codex-sdk', runtimeType: 'transport', activeModel: 'gpt-5.6',
+    } as never);
+    expect(registry.createAssignment({
+      assignmentId: `${assignmentId}-participant`, taskId, role: 'coordinator', required: false, scopeFiles: [],
+      identity: {
+        sessionName: participant.name, sessionInstanceId: participant.sessionInstanceId!,
+        runtimeEpoch: participant.runtimeEpoch!, agentType: participant.agentType, providerFamily: 'openai',
+      },
+    })).toMatchObject({ ok: true });
     const dispatchMessage = vi.fn();
     try {
-      await expect(dispatchSendMessage(caller, {
+      await expect(dispatchSendMessage({ ...caller, sessionName: participant.name }, {
         target: target.name, message: 'must not follow stale binding',
         task: { taskId, assignmentId, executionPool: 'primary' },
       }, {
-        listSessions: () => [brain, target], dispatchMessage,
+        listSessions: () => [brain, participant, target], dispatchMessage,
         ensureSupervisionAssignmentWorktree: async () => ({
           ok: true, worktreePath: '/work/alpha/asg', baseRevision: 'a'.repeat(40), created: false,
         }),
@@ -493,6 +534,22 @@ describe('send-tool', () => {
         error: 'task assignment execution binding conflicts with exact target; authoritative rebind required',
       });
       expect(dispatchMessage).not.toHaveBeenCalled();
+
+      // The explicit user contract changes this only for the unique live
+      // project Brain: it may rebind the exact assignment in place.
+      await expect(dispatchSendMessage(caller, {
+        target: target.name, message: 'authoritative exact target replacement',
+        task: { taskId, assignmentId, executionPool: 'primary' },
+      }, {
+        listSessions: () => [brain, participant, target], dispatchMessage,
+        ensureSupervisionAssignmentWorktree: async () => ({
+          ok: true, worktreePath: '/work/alpha/asg', baseRevision: 'a'.repeat(40), created: false,
+        }),
+      })).resolves.toMatchObject({ status: 'accepted', taskId, assignmentId });
+      expect(dispatchMessage).toHaveBeenCalledOnce();
+      expect(registry.getAssignment(assignmentId)?.executionBinding).toMatchObject({
+        origin: 'manual', actual: { sessionName: target.name },
+      });
     } finally {
       resetSupervisionTaskRegistryForTests();
     }
@@ -652,6 +709,22 @@ describe('send-tool', () => {
       resolveSessionIdentity: resolveIdentity,
       resolveAuditorRecoveryBinding: (name) => name === worker.name ? replacementBinding : undefined,
     });
+    const nonBrainHandlers = createSupervisionMcpToolHandlers({
+      userId: 'user-1', sessionName: oldWorker.name, projectName: 'alpha', transport: 'stdio',
+    } as McpRuntimeCaller, {
+      registry: registryPort,
+      isProjectBrain: () => false,
+      resolveSessionIdentity: resolveIdentity,
+      resolveAuditorRecoveryBinding: (name) => name === worker.name ? replacementBinding : undefined,
+    });
+    // Models the same-named coordinator when the daemon cannot prove it is the
+    // unique live top-level Brain (for example, two live Brain candidates).
+    const ambiguousBrainHandlers = createSupervisionMcpToolHandlers(brainCaller, {
+      registry: registryPort,
+      isProjectBrain: () => false,
+      resolveSessionIdentity: resolveIdentity,
+      resolveAuditorRecoveryBinding: (name) => name === worker.name ? replacementBinding : undefined,
+    });
     const recoveryRequest = {
       taskId, assignmentId, taskStatus: 'delegated', assignmentStatus: 'delegated',
       leaseAction: 'renew', rebindSessionName: worker.name,
@@ -742,13 +815,22 @@ describe('send-tool', () => {
       })).resolves.toMatchObject({ status: 'error', reason: 'validation_failed' });
       expect(authoritySnapshot()).toBe(beforeFencedCoordinationWithoutRebind);
 
-      const beforeGenerationMismatch = JSON.stringify(registry.get(taskId));
-      await expect(brainHandlers[SUPERVISION_MCP_TOOLS.RECOVER]({
+      const staleFenceRequest = {
         ...recoveryRequest,
         expectedGeneration: expectedGeneration + 1,
-        idempotencyKey: 'reject-stale-r1-generation', reason: 'must bind exact assignment generation',
-      })).resolves.toMatchObject({ status: 'error', reason: 'conflicting_replay' });
+        idempotencyKey: 'brain-overrides-stale-r1-generation',
+        reason: 'authoritative Brain replaces the exact target despite stale advisory CAS',
+      } as const;
+      const beforeGenerationMismatch = JSON.stringify(registry.get(taskId));
+      await expect(nonBrainHandlers[SUPERVISION_MCP_TOOLS.RECOVER](staleFenceRequest))
+        .resolves.toMatchObject({ status: 'error', reason: 'forbidden' });
+      await expect(ambiguousBrainHandlers[SUPERVISION_MCP_TOOLS.RECOVER](staleFenceRequest))
+        .resolves.toMatchObject({ status: 'error', reason: 'conflicting_replay' });
       expect(JSON.stringify(registry.get(taskId))).toBe(beforeGenerationMismatch);
+      // Explicit contract change: only the unique live project Brain may treat
+      // revision/generation as advisory while changing task control authority.
+      await expect(brainHandlers[SUPERVISION_MCP_TOOLS.RECOVER](staleFenceRequest))
+        .resolves.toMatchObject({ status: 'ok', taskId, assignmentId, replay: false });
 
       const beforeEvidenceMismatch = JSON.stringify(registry.get(taskId));
       await expect(brainHandlers[SUPERVISION_MCP_TOOLS.RECOVER]({
@@ -764,9 +846,9 @@ describe('send-tool', () => {
           detail: 'coordination identity target has no selected execution binding',
         });
       expect(registry.getAssignment(assignmentId)).toMatchObject({
-        identity: { sessionName: oldWorker.name },
-        executionBinding: { actual: { sessionName: oldWorker.name } },
-        provisioning: { createdSessionName: oldWorker.name },
+        identity: { sessionName: worker.name },
+        executionBinding: { actual: { sessionName: worker.name } },
+        provisioning: { selectedPool: 'primary', origin: 'reused' },
       });
 
       await expect(brainHandlers[SUPERVISION_MCP_TOOLS.RECOVER](recoveryRequest))
@@ -807,23 +889,31 @@ describe('send-tool', () => {
       })).toMatchObject({ ok: true });
       const beforeDriftedReplay = authoritySnapshot();
       await expect(brainHandlers[SUPERVISION_MCP_TOOLS.RECOVER](recoveryRequest))
-        .resolves.toMatchObject({ status: 'error', reason: 'conflicting_replay' });
+        .resolves.toMatchObject({ status: 'ok', taskId, assignmentId, replay: true });
       expect(authoritySnapshot()).toBe(beforeDriftedReplay);
 
       expect(registry.updateTask({ taskId, currentRevision: 'execution-authority-r2' }))
         .toMatchObject({ ok: true });
       const beforeDelayedR1 = JSON.stringify(registry.get(taskId));
       await expect(brainHandlers[SUPERVISION_MCP_TOOLS.RECOVER](recoveryRequest))
-        .resolves.toMatchObject({ status: 'error', reason: 'old_revision' });
+        .resolves.toMatchObject({ status: 'ok', taskId, assignmentId, replay: true });
       expect(JSON.stringify(registry.get(taskId))).toBe(beforeDelayedR1);
 
       const dispatchMessage = vi.fn().mockResolvedValue('delivered');
+      // Explicit contract change: the unique live Brain may deliberately move
+      // the SAME assignment back to a previously superseded live target; the
+      // daemon records that decision instead of preserving the old veto.
       await expect(dispatchSendMessage(caller, {
-        target: oldWorker.name, message: 'must not return to superseded owner',
+        target: oldWorker.name, message: 'authoritatively return to the former owner',
         task: { taskId, assignmentId, executionPool: 'primary' },
-      }, { listSessions: () => [brain, oldWorker, worker], dispatchMessage }))
-        .resolves.toMatchObject({ status: 'error', reason: 'identity_rejected' });
-      expect(dispatchMessage).not.toHaveBeenCalled();
+      }, {
+        listSessions: () => [brain, oldWorker, worker], dispatchMessage,
+        ensureSupervisionAssignmentWorktree: async () => ({
+          ok: true, worktreePath: '/work/alpha/recovered/repo', baseRevision: 'a'.repeat(40), created: false,
+        }),
+      })).resolves.toMatchObject({ status: 'accepted', taskId, assignmentId });
+      expect(dispatchMessage).toHaveBeenCalledOnce();
+      dispatchMessage.mockClear();
       await expect(dispatchSendMessage(caller, {
         target: worker.name, message: 'resume SAME recovered assignment',
         task: { taskId, assignmentId, executionPool: 'primary' },

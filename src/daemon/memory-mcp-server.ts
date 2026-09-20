@@ -391,6 +391,7 @@ export async function postHookSend(
   hookPath = '/send',
   senderSessionName?: string,
   timeoutMs?: number,
+  acceptStructuredError = false,
 ): Promise<Record<string, unknown>> {
   const data = JSON.stringify(body);
   return new Promise((resolve, reject) => {
@@ -411,7 +412,7 @@ export async function postHookSend(
       res.on('end', () => {
         try {
           const parsed = raw ? JSON.parse(raw) as Record<string, unknown> : {};
-          if ((res.statusCode ?? 500) >= 400 || parsed.ok === false) {
+          if (((res.statusCode ?? 500) >= 400 || parsed.ok === false) && !acceptStructuredError) {
             reject(new Error(typeof parsed.error === 'string' ? parsed.error : `hook send failed with status ${res.statusCode ?? 0}`));
             return;
           }
@@ -512,7 +513,14 @@ export function mergeDefaultToolDeps(
       const port = await resolveHookPort();
       if (!port) throw new Error('daemon peer audit ingress is unavailable');
       if (!caller.sessionName) throw new Error('peer_audit_reply requires a scoped caller');
-      return postHookSend(port, envelope as unknown as Record<string, unknown>, '/audit-reply', caller.sessionName);
+      return postHookSend(
+        port,
+        envelope as unknown as Record<string, unknown>,
+        '/audit-reply',
+        caller.sessionName,
+        undefined,
+        true,
+      );
     }),
     delegationReply: toolDeps.delegationReply ?? (async (envelope) => {
       const port = await resolveHookPort();
@@ -524,6 +532,7 @@ export function mergeDefaultToolDeps(
         '/delegation-reply',
         caller.sessionName,
         DELEGATION_REPLY_HOOK_TIMEOUT_MS,
+        true,
       );
     }),
     restartSession: toolDeps.restartSession ?? (async (target, restartOptions) => {

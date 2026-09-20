@@ -81,6 +81,7 @@ import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import { resolveEffectiveSessionModel } from '../../shared/session-model.js';
 import { DAEMON_VERSION } from '../util/version.js';
 import { resolvePeerAuditNormalizedModelId, resolvePeerAuditProviderFamily } from './peer-audit-candidates.js';
+import { resolveAuthoritativeBrainIdentity } from './supervision-brain-authority.js';
 import {
   MCP_FEATURE_FLAGS_BY_NAME,
   isMcpFeatureEnabled,
@@ -96,6 +97,7 @@ import {
 } from '../../shared/cron-types.js';
 import { EXECUTION_CLONE_KIND, EXECUTION_CLONE_PARENT_STAGES, isExecutionCloneParentStage } from '../../shared/execution-clone.js';
 import {
+  PEER_AUDIT_REPLY_ERRORS,
   PEER_AUDIT_VALIDATION_KINDS,
   PEER_AUDIT_VALIDATION_OUTCOMES,
   validatePeerAuditPassEvidence,
@@ -118,8 +120,10 @@ import {
   normalizeSupervisionExecutionConfig,
   type SupervisionExecutionPoolKind,
 } from '../../shared/supervision-execution-pool.js';
+import { supervisionIdentityMatches } from '../../shared/supervision-participant-authority.js';
 import {
   AGENT_DELEGATION_PURPOSES,
+  AGENT_DELEGATION_REPLY_ERRORS,
   AGENT_DELEGATION_REPLY_VERSION,
   decodeAgentDelegationReplyEnvelope,
   isAgentDelegationOpaqueId,
@@ -140,7 +144,7 @@ import { publishRuntimeMemoryCacheInvalidation } from '../context/runtime-memory
 import { getMemoryFeatureConfigStoreDiagnostics, getPersistedMemoryFeatureFlagValues, getRuntimeMemoryFeatureFlagValues } from '../store/memory-feature-config-store.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { listSessions as listStoredSessions, loadStore, type SessionRecord } from '../store/session-store.js';
-import { dispatchDestroyExecutionClone, dispatchSendMessage, dispatchSendStop, isUniqueAuthoritativeProjectBrainCaller, listSendTargets, resolveProjectAuthoritativeSupervisionSnapshot, type SendMessageAgentIdentity, type SendMessageCloneRequest, type SendToolDeps } from './send-tool.js';
+import { dispatchDestroyExecutionClone, dispatchSendMessage, dispatchSendStop, listSendTargets, resolveProjectAuthoritativeSupervisionSnapshot, type SendMessageAgentIdentity, type SendMessageCloneRequest, type SendToolDeps } from './send-tool.js';
 import {
   getSupervisionTaskRegistry,
   type PersistedSupervisionTaskAssignmentIdentity,
@@ -163,7 +167,6 @@ import {
   type SupervisionIntegrationObservationCause,
   type SupervisionIntegrationRemoteObservation,
 } from '../../shared/supervision-integration-finalization.js';
-import { supervisionIdentityMatches } from '../../shared/supervision-participant-authority.js';
 import { advanceSupervisionTaskAfterFinish } from './supervision-convergence-wire.js';
 import { cronMcpCreate, cronMcpCreateSelf, cronMcpDelete, cronMcpList, cronMcpUpdate, cronMcpUpdateSelf, type CronMcpClientOptions } from './cron-mcp-client.js';
 import {
@@ -182,7 +185,7 @@ import { GitOriginRepositoryIdentityService } from '../agent/repository-identity
 import { ALIAS_DESCRIPTION_MAX, ALIAS_MCP_TOOLS, toAliasMetadata, type AliasMcpToolName } from '../../shared/alias-types.js';
 import { mapLegacySupervisionUpdate, mapLegacySupervisionFinish } from './supervision-compat-shims.js';
 import { resolveSupervisionIntent } from './supervision-intent-ops.js';
-import { supervisionTaskCallerAuthority } from './supervision-mcp-tools.js';
+import { supervisionCallerParticipates } from './supervision-mcp-tools.js';
 import {
   aliasMcpList,
   aliasMcpResolve,
@@ -865,6 +868,22 @@ function integrationCallerAuthorityRefusals(input: {
     });
   }
   return refusals;
+}
+
+function replyIngressErrorReason(value: unknown): MCPErrorReason {
+  if (value === PEER_AUDIT_REPLY_ERRORS.IDENTITY_MISMATCH
+    || value === PEER_AUDIT_REPLY_ERRORS.ASSIGNMENT_MISMATCH
+    || value === PEER_AUDIT_REPLY_ERRORS.ATTEMPT_MISMATCH
+    || value === AGENT_DELEGATION_REPLY_ERRORS.IDENTITY_MISMATCH) {
+    return MCP_ERROR_REASONS.IDENTITY_REJECTED;
+  }
+  if (value === PEER_AUDIT_REPLY_ERRORS.REVISION_MISMATCH) {
+    return MCP_ERROR_REASONS.REVISION_CONFLICT;
+  }
+  if (value === 'ingress_unavailable' || value === 'sender_unavailable') {
+    return MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE;
+  }
+  return MCP_ERROR_REASONS.VALIDATION_FAILED;
 }
 
 function stringArg(args: Record<string, unknown>, key: string): string | undefined {
@@ -2207,7 +2226,10 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       }
       const result = await deps.peerAuditReply(envelope);
       return result.ok === false
-        ? error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, String(result.error ?? 'peer audit reply rejected'))
+        ? error(
+            replyIngressErrorReason(result.error),
+            String(result.message ?? result.error ?? 'peer audit reply rejected'),
+          )
         : { status: 'ok', accepted: true };
     },
     [MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY]: async (input) => {
@@ -2222,7 +2244,10 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (!decoded.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, decoded.error);
       const result = await deps.delegationReply(decoded.value);
       return result.ok === false
-        ? error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, String(result.error ?? 'delegation reply rejected'))
+        ? error(
+            replyIngressErrorReason(result.error),
+            String(result.message ?? result.error ?? 'delegation reply rejected'),
+          )
         : {
             status: 'ok',
             accepted: true,
@@ -2355,64 +2380,36 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const registry = getSupervisionTaskRegistry();
       const projectName = caller.projectName?.trim();
       if (!projectName) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'supervision task caller project is unavailable');
-      const requestedRole = typeof args.role === 'string' ? args.role : 'implementer';
-      // A project Brain coordinates; it never becomes its own implementer or
-      // auditor. Self-assignment minted a real taskId/assignmentId for work done
-      // in the Brain's own window (or by its provider-native agents), which is
-      // exactly the participation IM.codes delegation exists to route to a
-      // separate, visible sub-session. Refuse before any task row is created.
       const sessions = await sendSessions();
-      const callerRecord = sessions.find((session) => session.name === caller.sessionName);
-      if (callerRecord?.role === 'brain' && !callerRecord.parentSession
-        && (requestedRole === 'implementer' || requestedRole === 'auditor')) {
-        return error(
-          MCP_ERROR_REASONS.SCOPE_FORBIDDEN,
-          `a project Brain cannot assign ${requestedRole} work to itself; dispatch it to a non-self IM.codes sub-session with send_message and task`,
-        );
-      }
+      const authoritativeBrain = resolveAuthoritativeBrainIdentity(projectName, sessions);
+      const callerIsAuthoritativeBrain = Boolean(authoritativeBrain
+        && supervisionIdentityMatches(authoritativeBrain, identity));
       const requestedTaskId = stringArg(args, 'taskId')?.trim();
       const existing = requestedTaskId ? registry.get(requestedTaskId) : undefined;
-      // taskId is a reference, never a create hint. Missing and cross-project
-      // tasks share one refusal so this tool cannot probe the registry or
-      // silently mint a replacement task.
-      if (requestedTaskId && (!existing || existing.projectName !== projectName)) {
+      // taskId is a reference, never a create hint. Missing, cross-project and
+      // non-participant tasks share one refusal so this tool cannot probe the
+      // registry or silently mint a replacement task.
+      if (requestedTaskId && (
+        !existing
+        || existing.projectName !== projectName
+        || (!callerIsAuthoritativeBrain
+          && !supervisionCallerParticipates(existing, identity, projectName))
+      )) {
         return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'task is not visible to this caller');
       }
-      // A non-participant is ALSO refused -- with one legacy exception,
-      // mirroring send_tool's own task-continuation gate exactly
-      // (supervisionTaskCallerAuthority + isUniqueAuthoritativeProjectBrainCaller,
-      // same coordinatorMayAct/legacyBrainMayCoordinate semantics, not
-      // reimplemented here): the project's own unique, live, authoritative
-      // Brain may always attach a coordinator assignment to a task that has
-      // no coordinator row yet, even one it never participated in -- e.g. one
-      // an implementer self-initiated via this very tool with no coordinator
-      // ever bound. This does not widen supervisionCallerParticipates itself
-      // (still used verbatim inside participantMayRead below), so a bare
-      // project match still never grants any OTHER role read/attach on a
-      // task the caller has no real claim to.
-      if (requestedTaskId && existing) {
-        const liveProjectBrain = isUniqueAuthoritativeProjectBrainCaller(callerRecord, projectName, sessions);
-        const authority = supervisionTaskCallerAuthority({
-          item: existing,
-          callerSessionName: caller.sessionName ?? '',
-          callerProjectName: projectName,
-          liveIdentity: { ...identity, projectName },
-          liveProjectBrain,
-        });
-        const legacyBrainMayCoordinate = Boolean(
-          liveProjectBrain
-          && !existing.assignments?.some((assignment) => assignment.role === 'coordinator'),
+      const requestedRole = typeof args.role === 'string' ? args.role : 'implementer';
+      if (callerIsAuthoritativeBrain && (requestedRole === 'implementer' || requestedRole === 'auditor')) {
+        return error(
+          MCP_ERROR_REASONS.SCOPE_FORBIDDEN,
+          `a project Brain cannot be an implementer or auditor; cannot assign ${requestedRole} work to itself; dispatch it to a non-self IM.codes sub-session with send_message and task`,
         );
-        if (!legacyBrainMayCoordinate && !authority.participantMayRead && !authority.coordinatorMayAct) {
-          return error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'task is not visible to this caller');
-        }
       }
       const classification = typeof args.classification === 'string'
         ? args.classification as never
         : 'integration_slice';
       const taskAuditPolicy = isAuditableSupervisionTaskClassification(classification)
         ? supervisionTaskAuditPolicyFromSnapshot(
-            resolveProjectAuthoritativeSupervisionSnapshot(projectName, await sendSessions()),
+            resolveProjectAuthoritativeSupervisionSnapshot(projectName, sessions),
           )
         : undefined;
       const task = existing
@@ -2427,6 +2424,30 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
             idempotencyKey: stringArg(args, 'idempotencyKey'),
           });
       if (!task.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `task_start rejected: ${task.reason}`);
+      if (existing && callerIsAuthoritativeBrain && requestedRole === 'coordinator') {
+        const coordinators = existing.assignments.filter((assignment) => assignment.role === 'coordinator');
+        if (coordinators.length === 1) {
+          const coordinator = coordinators[0]!;
+          const alreadyCurrent = supervisionIdentityMatches(coordinator.identity, identity);
+          if (!alreadyCurrent) {
+            const rebound = registry.rebindAuditAssignment({
+              taskId: existing.taskId,
+              assignmentId: coordinator.assignmentId,
+              identity,
+              callerProjectName: projectName,
+              reason: 'authoritative Brain manual coordinator takeover',
+              authoritativeBrainOverride: true,
+            });
+            if (!rebound.ok) {
+              return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `coordinator rebind rejected: ${rebound.reason}`);
+            }
+          }
+          return {
+            status: 'ok', taskId: task.value.taskId,
+            assignmentId: coordinator.assignmentId, idempotentReplay: alreadyCurrent,
+          };
+        }
+      }
       if (existing && requestedRole === 'implementer') {
         const active = existing.assignments.filter((assignment) => (
           assignment.role === 'implementer'

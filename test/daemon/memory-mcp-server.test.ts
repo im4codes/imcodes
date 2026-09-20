@@ -1141,10 +1141,20 @@ describe('memory MCP stdio server', () => {
       req.setEncoding('utf8');
       req.on('data', (chunk) => { raw += chunk; });
       req.on('end', () => {
+        const body = JSON.parse(raw) as Record<string, unknown>;
         received.push({
-          body: JSON.parse(raw) as Record<string, unknown>,
+          body,
           sender: typeof req.headers['x-imcodes-session'] === 'string' ? req.headers['x-imcodes-session'] : undefined,
         });
+        if (body.assignmentId === 'supervision_assignment_rejected_1') {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: false,
+            error: 'assignment_mismatch',
+            message: 'audit assignment binding rejected: assignmentId actual="supervision_assignment_rejected_1"',
+          }));
+          return;
+        }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
       });
@@ -1193,6 +1203,15 @@ describe('memory MCP stdio server', () => {
           receiptKind: 'final',
         }),
       }]);
+      const rejected = await callLazyTool(client, 'peer_audit_reply', {
+        ...validReply,
+        assignmentId: 'supervision_assignment_rejected_1',
+      });
+      expect(rejected.structuredContent).toMatchObject({
+        status: 'error',
+        reason: 'identity_rejected',
+        message: expect.stringContaining('assignmentId actual="supervision_assignment_rejected_1"'),
+      });
     } finally {
       await client.close();
       await new Promise<void>((resolve, reject) => hookServer.close((err) => (err ? reject(err) : resolve())));

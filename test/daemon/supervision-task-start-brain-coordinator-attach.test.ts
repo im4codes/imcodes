@@ -100,13 +100,12 @@ describe('supervision_task_start lets the project Brain attach coordinator to a 
     expect(asCoordinator).toMatchObject({ status: 'error', reason: 'identity_rejected' });
   });
 
-  it('(c) does not let Brain hijack a task whose coordinator row already belongs to someone else', async () => {
+  it('(c) lets only the unique live Brain rebind the SAME stale coordinator assignment', async () => {
     const sessions = [brain, implementer];
     const taskId = await selfInitiateImplementerTask(sessions);
-    // A coordinator row already exists, bound to an identity that is no
-    // longer a live session at all (e.g. a Brain that has since rotated
-    // away) -- exactly the "stale but still real" case a hijack must not
-    // walk through.
+    // The explicit Brain-authority contract supersedes the old coordinator-row
+    // veto: a stale coordinator must be rebound in place, not replaced. Tests
+    // (b)/(d) retain the old fail-closed behavior for non/ambiguous Brains.
     const bound = getSupervisionTaskRegistry().createAssignment({
       taskId, role: 'coordinator',
       identity: {
@@ -120,11 +119,22 @@ describe('supervision_task_start lets the project Brain attach coordinator to a 
     const result = await handlersFor(brain, sessions)[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START]({
       taskId, role: 'coordinator', idempotencyKey: 'brain-hijack-attempt',
     });
-    expect(result).toMatchObject({ status: 'error', reason: 'identity_rejected' });
+    expect(result).toMatchObject({
+      status: 'ok',
+      taskId,
+      assignmentId: (bound as { value?: { assignmentId?: string } }).value?.assignmentId,
+    });
 
     const persisted = getSupervisionTaskRegistry().get(taskId);
     expect(persisted?.assignments.filter((a) => a.role === 'coordinator')).toHaveLength(1);
-    expect(persisted?.assignments.find((a) => a.role === 'coordinator')?.identity?.sessionName).toBe('deck_alpha_old_brain');
+    expect(persisted?.assignments.find((a) => a.role === 'coordinator')).toMatchObject({
+      assignmentId: (bound as { value?: { assignmentId?: string } }).value?.assignmentId,
+      identity: {
+        sessionName: brain.name,
+        sessionInstanceId: brain.sessionInstanceId,
+        runtimeEpoch: brain.runtimeEpoch,
+      },
+    });
   });
 
   it('(d1) refuses a role=brain caller when a second live brain-role session exists in the same project', async () => {

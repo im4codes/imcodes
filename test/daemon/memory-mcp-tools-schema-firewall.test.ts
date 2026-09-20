@@ -205,7 +205,11 @@ describe('memory MCP tool schema firewall', () => {
   });
 
   it('defers peer-audit PASS evidence policy until the sender-bound ingress', async () => {
-    const peerAuditReply = vi.fn(async () => ({ ok: false, error: 'attempt_mismatch' }));
+    const peerAuditReply = vi.fn(async () => ({
+      ok: false,
+      error: 'identity_mismatch',
+      message: 'audit sender identity rejected: runtimeEpoch expected="epoch-a" actual="epoch-b"',
+    }));
     const handlers = createMemoryMcpToolHandlers(caller(), { peerAuditReply });
     const structureOnlyPass = {
       taskId: 'supervision_task_12345678',
@@ -220,7 +224,8 @@ describe('memory MCP tool schema firewall', () => {
 
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY](structureOnlyPass)).resolves.toMatchObject({
       status: 'error',
-      reason: MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE,
+      reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
+      message: expect.stringContaining('runtimeEpoch expected="epoch-a" actual="epoch-b"'),
     });
     expect(peerAuditReply).toHaveBeenCalledWith(expect.objectContaining({
       version: 'peer_audit_reply_v1',

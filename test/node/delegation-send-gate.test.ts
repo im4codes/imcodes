@@ -181,7 +181,7 @@ describe('delegation send gate', () => {
     resetDelegationReplyStoreForTests();
   });
 
-  it('rejects a peer-audit-eligible CC target outside the caller primary pool before every side effect', async () => {
+  it('lets the authoritative Brain manually bind an exact live auditor outside the pool and records manual origin', async () => {
     const brain = supervisedBrain([
       executionConfig('codex-sdk', 'openai', 'gpt-5.6-sol'),
     ]);
@@ -237,16 +237,13 @@ describe('delegation send gate', () => {
       },
     }, deps(sessions, dispatchMessage));
 
-    expect(result).toMatchObject({
-      status: 'error',
-      reason: 'identity_rejected',
-      error: expect.stringContaining('task execution pool rejected target: unselected_config'),
-    });
-    expect(createTask).not.toHaveBeenCalled();
-    expect(createAssignment).not.toHaveBeenCalled();
-    expect(createReplyAuthority).not.toHaveBeenCalled();
-    expect(registry.list()).toEqual([]);
-    expect(dispatchMessage).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ status: 'accepted', assignmentId: expect.any(String) });
+    expect(createTask).toHaveBeenCalledOnce();
+    expect(createAssignment).toHaveBeenCalled();
+    expect(createReplyAuthority).toHaveBeenCalled();
+    expect(dispatchMessage).toHaveBeenCalledOnce();
+    expect(registry.getAssignment(result.status === 'accepted' ? result.assignmentId! : '')?.executionBinding)
+      .toMatchObject({ origin: 'manual', actual: { sessionName: outsideAuditor.name } });
   });
 
   it('keeps default discovery complete and filters only when a configured pool is explicitly requested', () => {
@@ -401,16 +398,14 @@ describe('delegation send gate', () => {
         attemptId: 'preset_mismatch_audit_attempt_1',
         auditedSessionName: audited.name,
       },
-      task: { objective: 'preset mismatch audit', executionPool: 'primary' },
+      task: { classification: 'integration_task', objective: 'preset mismatch audit', executionPool: 'primary' },
     }, deps(sessions, dispatchMessage))).resolves.toMatchObject({
-      status: 'error',
-      reason: 'identity_rejected',
-      error: expect.stringContaining('task execution pool rejected target'),
+      status: 'accepted',
     });
-    expect(createTask).not.toHaveBeenCalled();
-    expect(createAssignment).not.toHaveBeenCalled();
-    expect(createReplyAuthority).not.toHaveBeenCalled();
-    expect(dispatchMessage).not.toHaveBeenCalled();
+    expect(createTask).toHaveBeenCalled();
+    expect(createAssignment).toHaveBeenCalled();
+    expect(createReplyAuthority).toHaveBeenCalled();
+    expect(dispatchMessage).toHaveBeenCalled();
 
     const legacyConfig = executionConfig('claude-code-sdk', 'anthropic', 'opus[1M]');
     const legacyBrain = supervisedBrain([legacyConfig]);
@@ -829,7 +824,8 @@ describe('delegation send gate', () => {
       task: { ...request.task, auditRevision: 'different-revision' },
     }, injected)).resolves.toMatchObject({
       status: 'error',
-      error: expect.stringContaining('exact non-terminal assignment'),
+      reason: 'identity_rejected',
+      error: expect.stringContaining('revision expected='),
     });
     expect(ensured).not.toHaveBeenCalled();
     expect(dispatchMessage).not.toHaveBeenCalled();
@@ -1363,7 +1359,7 @@ describe('delegation send gate', () => {
     expect(dispatchMessage).not.toHaveBeenCalled();
   });
 
-  it('rejects an ordinary supervised task target outside the caller primary pool', async () => {
+  it('accepts a Brain-selected exact worker outside the pool but keeps the bypass closed to non-Brain callers', async () => {
     const brain = supervisedBrain([
       executionConfig('codex-sdk', 'openai', 'gpt-5.6-sol'),
     ]);
@@ -1384,13 +1380,41 @@ describe('delegation send gate', () => {
       },
     }, deps([brain, outsideWorker], dispatchMessage));
 
-    expect(result).toMatchObject({
-      status: 'error',
-      reason: 'identity_rejected',
+    expect(result).toMatchObject({ status: 'accepted', assignmentId: expect.any(String) });
+    expect(getSupervisionTaskRegistry().getAssignment(
+      result.status === 'accepted' ? result.assignmentId! : '',
+    )?.executionBinding).toMatchObject({ origin: 'manual' });
+    expect(dispatchMessage).toHaveBeenCalledOnce();
+
+    const ordinaryCaller = supervisedChild({
+      name: 'deck_alpha_non_brain', role: 'w2', agentType: 'codex-sdk', model: 'gpt-5.6-sol',
+    });
+    ordinaryCaller.transportConfig = brain.transportConfig;
+    const rejected = await dispatchSendMessage({ ...caller, sessionName: ordinaryCaller.name }, {
+      target: outsideWorker.name,
+      message: 'must not borrow Brain authority',
+      task: { objective: 'forbidden pool bypass', executionPool: 'primary' },
+    }, deps([brain, ordinaryCaller, outsideWorker], dispatchMessage));
+    expect(rejected).toMatchObject({
+      status: 'error', reason: 'identity_rejected',
       error: expect.stringContaining('task execution pool rejected target: unselected_config'),
     });
-    expect(getSupervisionTaskRegistry().list()).toEqual([]);
-    expect(dispatchMessage).not.toHaveBeenCalled();
+
+    const secondBrain = {
+      ...brain,
+      name: 'deck_alpha_second_brain',
+      sessionInstanceId: 'instance-deck_alpha_second_brain',
+      runtimeEpoch: 'epoch-deck_alpha_second_brain',
+    } as SessionRecord;
+    const ambiguous = await dispatchSendMessage(caller, {
+      target: outsideWorker.name,
+      message: 'ambiguous Brain must not gain override authority',
+      task: { objective: 'ambiguous Brain pool bypass', executionPool: 'primary' },
+    }, deps([brain, secondBrain, outsideWorker], dispatchMessage));
+    expect(ambiguous).toMatchObject({
+      status: 'error', reason: 'identity_rejected',
+      error: expect.stringContaining('task execution pool rejected target: unselected_config'),
+    });
   });
 
   it('lets only the authoritative same-project Brain continue an auto-provisioned task by returned taskId', async () => {
@@ -1473,7 +1497,7 @@ describe('delegation send gate', () => {
     expect(registry.get(created.taskId)?.assignments).toHaveLength(assignmentCount ?? 0);
   });
 
-  it('does not let a same-project Brain adopt another coordinator task by opaque id', async () => {
+  it('lets the unique same-project Brain coordinate an existing task without replacing it', async () => {
     const selectedConfig = executionConfigFor('codex-sdk', 'gpt-5.6-sol');
     const brain = supervisedBrain([selectedConfig]);
     const worker = supervisedChild({
@@ -1511,13 +1535,11 @@ describe('delegation send gate', () => {
       task: { taskId: 'other-owner-task', objective: 'private task', executionPool: 'primary' },
     }, deps([brain, worker, otherCoordinator], dispatchMessage));
 
-    expect(result).toEqual({
-      status: 'error', reason: 'identity_rejected', error: 'task is not visible to this caller',
-    });
-    expect(createAssignment).not.toHaveBeenCalled();
-    expect(createReplyAuthority).not.toHaveBeenCalled();
-    expect(dispatchMessage).not.toHaveBeenCalled();
-    expect(registry.get('other-owner-task')?.assignments).toHaveLength(1);
+    expect(result).toMatchObject({ status: 'accepted', taskId: 'other-owner-task' });
+    expect(createAssignment).toHaveBeenCalled();
+    expect(createReplyAuthority).toHaveBeenCalled();
+    expect(dispatchMessage).toHaveBeenCalled();
+    expect(registry.list()).toHaveLength(1);
   });
 
   it('does not apply supervision pool membership to an ordinary exact-target message', async () => {
@@ -1543,6 +1565,23 @@ describe('delegation send gate', () => {
     });
     expect(getSupervisionTaskRegistry().list()).toEqual([]);
     expect(dispatchMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('never lets the project Brain become an implementer or auditor', async () => {
+    const brain = supervisedBrain([executionConfig('codex-sdk', 'openai', 'gpt-5.6-sol')]);
+    const worker = supervisedChild({
+      name: 'deck_alpha_worker_caller', role: 'w1', agentType: 'codex-sdk', model: 'gpt-5.6-sol',
+    });
+    const result = await dispatchSendMessage({ ...caller, sessionName: worker.name }, {
+      target: brain.name,
+      message: 'attempt to make Brain execute work',
+      task: { objective: 'forbidden Brain execution', executionPool: 'primary' },
+    }, deps([brain, worker]));
+    expect(result).toMatchObject({
+      status: 'error', reason: 'scope_forbidden',
+      error: expect.stringContaining('cannot be an implementer or auditor'),
+    });
+    expect(getSupervisionTaskRegistry().list()).toEqual([]);
   });
 
   it('refuses unknown pool-member task availability before registry, reply authority, or dispatch', async () => {

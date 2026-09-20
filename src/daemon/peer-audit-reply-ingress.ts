@@ -93,7 +93,12 @@ export class PeerAuditReplyRateLimiter {
 
 export type PeerAuditReplyIngressResult =
   | { ok: true }
-  | { ok: false; error: PeerAuditReplyError | 'sender_unavailable' | 'ingress_unavailable' };
+  | {
+    ok: false;
+    error: PeerAuditReplyError | 'sender_unavailable' | 'ingress_unavailable';
+    /** Bounded operator-facing binding diagnosis; never contains reply text. */
+    message?: string;
+  };
 
 export type PeerAuditReplyInternalReason =
   | 'accepted'
@@ -107,7 +112,7 @@ export type PeerAuditReplyInternalReason =
   | 'reducer_rejected';
 
 type PeerAuditReplyIngressHandlerResult = PeerAuditReplyIngressResult
-  | { ok: false; error: PeerAuditReplyError | 'sender_unavailable' | 'ingress_unavailable'; internalReason: PeerAuditReplyInternalReason };
+  | { ok: false; error: PeerAuditReplyError | 'sender_unavailable' | 'ingress_unavailable'; internalReason: PeerAuditReplyInternalReason; message?: string };
 
 export type PeerAuditReplyIngressHandler = (input: {
   envelope: PeerAuditReplyEnvelope;
@@ -330,9 +335,21 @@ export async function submitPeerAuditReply(input: {
     && delegatedAuditHandler) {
     const delegated = await delegatedAuditHandler(request);
     if (delegated.ok || delegated.error !== PEER_AUDIT_REPLY_ERRORS.ATTEMPT_MISMATCH) {
-      return delegated.ok ? { ok: true } : { ok: false, error: delegated.error };
+      return delegated.ok
+        ? { ok: true }
+        : {
+            ok: false,
+            error: delegated.error,
+            ...(delegated.message ? { message: delegated.message } : {}),
+          };
     }
   }
   // Internal reasons are deliberately not part of the public daemon response.
-  return handled.ok ? { ok: true } : { ok: false, error: handled.error };
+  return handled.ok
+    ? { ok: true }
+    : {
+        ok: false,
+        error: handled.error,
+        ...(handled.message ? { message: handled.message } : {}),
+      };
 }

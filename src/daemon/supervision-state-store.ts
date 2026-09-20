@@ -101,7 +101,9 @@ export const SUPERVISION_STATE_VERSION = 1;
  * they cannot conjure the authoritative task/assignment rows into it.
  */
 /** Exact roles whose identity may be rebound on the same object after a restart. */
-const SUPERVISION_REBINDABLE_EXACT_ROLES = new Set<string>(['auditor', 'coordinator', 'integration_owner']);
+const SUPERVISION_REBINDABLE_EXACT_ROLES = new Set<string>([
+  'auditor', 'coordinator', 'integration_owner',
+]);
 
 export function resolveSupervisionTaskRegistryDbPath(
   env: NodeJS.ProcessEnv = process.env,
@@ -7122,6 +7124,8 @@ export class SupervisionTaskRegistry {
     expectedRevision?: string;
     strictCrossVendor?: boolean;
     executionBinding?: SupervisionExecutionBinding;
+    /** Set only after the daemon proves one exact live top-level project Brain. */
+    authoritativeBrainOverride?: true;
     now?: number;
   }): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {
     const reason = input.reason.trim();
@@ -7143,21 +7147,25 @@ export class SupervisionTaskRegistry {
       // ANY long-lived role, not just auditors. Coordinator and integration_owner
       // are rebindable on the same object; attempt/revision provenance is
       // required for auditors, where it is the audit's identity.
-      if (!SUPERVISION_REBINDABLE_EXACT_ROLES.has(assignment.role) || !reason) {
+      const authoritativeBrainOverride = input.authoritativeBrainOverride === true;
+      const roleIsRebindable = SUPERVISION_REBINDABLE_EXACT_ROLES.has(assignment.role)
+        || (authoritativeBrainOverride && assignment.role === 'implementer');
+      if (!roleIsRebindable || !reason) {
         return reject('role_forbidden');
       }
       if (assignment.role === 'auditor' && (!assignment.auditAttemptId || !assignment.auditRevision)) {
         return reject('role_forbidden');
       }
-      if (input.expectedGeneration !== undefined
+      if (!authoritativeBrainOverride && input.expectedGeneration !== undefined
         && assignment.generation !== input.expectedGeneration) return reject('conflicting_replay');
-      if (input.expectedAttemptId !== undefined
+      if (!authoritativeBrainOverride && input.expectedAttemptId !== undefined
         && assignment.auditAttemptId !== input.expectedAttemptId) return reject('old_audit_attempt');
-      if (input.expectedRevision !== undefined
+      if (!authoritativeBrainOverride && input.expectedRevision !== undefined
         && assignment.auditRevision !== input.expectedRevision) return reject('old_revision');
-      if (assignment.auditRevision && task.currentRevision
+      if (!authoritativeBrainOverride && assignment.auditRevision && task.currentRevision
         && task.currentRevision !== assignment.auditRevision) return reject('old_revision');
-      if (['finalized', 'cancelled', 'committed', 'pushed'].includes(assignment.status)
+      if (['finalized', 'committed', 'pushed'].includes(assignment.status)
+        || (!authoritativeBrainOverride && assignment.status === 'cancelled')
         || ['committed', 'pushed', 'finalized'].includes(task.status)) {
         return reject('receipt_closed');
       }
@@ -7203,6 +7211,9 @@ export class SupervisionTaskRegistry {
       if (input.executionBinding
         && !runtimeIdentityMetadataMatches(input.executionBinding.actual, input.identity)) {
         return reject('invalid');
+      }
+      if (input.executionBinding?.origin === 'manual' && !authoritativeBrainOverride) {
+        return reject('owner_mismatch');
       }
       // A different selected runtime may have a different capability and model.
       // Identity fields alone cannot prove those values, so preserving the old
@@ -7266,6 +7277,7 @@ export class SupervisionTaskRegistry {
       }
       this.#writeAssignment(rebound, 'recovered', {
         source: 'brain_authorized_audit_identity_rebind',
+        origin: 'manual',
         reason,
         priorIdentity: assignment.identity,
         strictCrossVendor,
@@ -8024,6 +8036,7 @@ export class SupervisionTaskRegistry {
         }
         const payload = {
           source: 'brain_authorized_revision_rebind',
+          origin: 'manual',
           idempotencyKey,
           reason,
           fromRevision,
@@ -8308,6 +8321,7 @@ export class SupervisionTaskRegistry {
 
       const payload = {
         source: 'brain_authorized_revision_rebind',
+        origin: 'manual',
         idempotencyKey,
         reason,
         fromRevision: fromRevision ?? null,
@@ -8373,6 +8387,8 @@ export class SupervisionTaskRegistry {
           updatedAt: now,
         }, 'cancelled', {
           source: 'brain_authorized_revision_rebind',
+          origin: 'manual',
+          reason,
           supersededBySuccessorRevision: true,
           successorRevision: toRevision,
         });
@@ -8428,6 +8444,8 @@ export class SupervisionTaskRegistry {
     evidenceManifestSha256?: string;
     idempotencyKey: string;
     reason: string;
+    /** Set only after the daemon proves one exact live top-level project Brain. */
+    authoritativeBrainOverride?: true;
     now?: number;
   }): SupervisionTaskRegistryResult<PersistedSupervisionTaskRecord> {
     const taskId = normalizeTaskString(input.taskId);
@@ -8439,6 +8457,7 @@ export class SupervisionTaskRegistry {
     const expectedRevision = normalizeTaskString(input.expectedRevision);
     const expectedGeneration = input.expectedGeneration;
     const evidenceManifestSha256 = normalizeTaskString(input.evidenceManifestSha256)?.toLowerCase();
+    const authoritativeBrainOverride = input.authoritativeBrainOverride === true;
     const scopeFiles = input.scopeFiles === undefined
       ? undefined
       : normalizeTaskArray(input.scopeFiles).filter(validRepoPath);
@@ -8519,7 +8538,8 @@ export class SupervisionTaskRegistry {
         this.#db.exec('ROLLBACK');
         return { ok: false, reason: 'receipt_closed' };
       }
-      if (assignment.role === 'auditor' && assignmentStatus !== undefined) {
+      if (assignment.role === 'auditor' && assignmentStatus !== undefined
+        && !authoritativeBrainOverride) {
         this.#db.exec('ROLLBACK');
         return { ok: false, reason: 'role_forbidden' };
       }
@@ -8531,7 +8551,8 @@ export class SupervisionTaskRegistry {
         this.#db.exec('ROLLBACK');
         return { ok: false, reason: 'invalid' };
       }
-      if (replacesBoundExecutionAuthority && (!expectedRevision || expectedGeneration === undefined)) {
+      if (replacesBoundExecutionAuthority && !authoritativeBrainOverride
+        && (!expectedRevision || expectedGeneration === undefined)) {
         this.#db.exec('ROLLBACK');
         return { ok: false, reason: 'invalid' };
       }
@@ -8539,7 +8560,7 @@ export class SupervisionTaskRegistry {
         this.#db.exec('ROLLBACK');
         return { ok: false, reason: 'invalid' };
       }
-      if (coordinationCasPresent) {
+      if (coordinationCasPresent && !authoritativeBrainOverride) {
         const revisionRefusal = this.#callerRevisionRefusal(taskId, assignmentId, expectedRevision);
         if (revisionRefusal) {
           this.#db.exec('ROLLBACK');
@@ -8548,10 +8569,15 @@ export class SupervisionTaskRegistry {
       }
       if (replacesBoundExecutionAuthority) {
         const bundle = task.integrationBundle;
-        const exactEvidence = bundle
-          ? bundle.revision === expectedRevision
-            && bundle.manifestSha256 === evidenceManifestSha256
-          : evidenceManifestSha256 === undefined;
+        const exactEvidence = authoritativeBrainOverride
+          ? evidenceManifestSha256 === undefined || (bundle
+            ? (!expectedRevision || bundle.revision === expectedRevision)
+              && bundle.manifestSha256 === evidenceManifestSha256
+            : false)
+          : bundle
+            ? bundle.revision === expectedRevision
+              && bundle.manifestSha256 === evidenceManifestSha256
+            : evidenceManifestSha256 === undefined;
         if (!exactEvidence) {
           this.#db.exec('ROLLBACK');
           return { ok: false, reason: 'manifest_mismatch' };
@@ -8567,10 +8593,11 @@ export class SupervisionTaskRegistry {
           && selected.runtimeType === requested.runtimeType
           && selected.model === requested.model
           && selected.ccPresetId === requested.ccPresetId);
-        const exactRecoveredAuthority = input.executionBinding.origin === 'reused'
+        const exactRecoveredAuthority = (input.executionBinding.origin === 'reused'
+          || (authoritativeBrainOverride && input.executionBinding.origin === 'manual'))
           && runtimeIdentityMetadataMatches(input.executionBinding.actual, input.identity)
           && input.provisioning.selectedPool === input.executionBinding.pool
-          && input.provisioning.origin === 'reused'
+          && input.provisioning.origin === input.executionBinding.origin
           && exactSelectedConfig
           && input.provisioning.provisionAttemptId === undefined
           && input.provisioning.createdSessionName === undefined
@@ -8610,26 +8637,32 @@ export class SupervisionTaskRegistry {
         && event.payload?.expectedGeneration === (expectedGeneration ?? null)
         && event.payload?.evidenceManifestSha256 === (evidenceManifestSha256 ?? null)
       ));
-      const replayStillOwnsExactGeneration = !coordinationCasPresent || Boolean(
-        assignment.generation === expectedGeneration! + 1
-        && (!replacesBoundExecutionAuthority || (
+      const replayStillOwnsExactGeneration = authoritativeBrainOverride
+        ? !replacesBoundExecutionAuthority || Boolean(
           input.identity && input.executionBinding && input.provisioning
           && runtimeIdentityMetadataMatches(assignment.identity, input.identity)
           && supervisionSelectedExecutionBindingMatches(assignment.executionBinding, input.executionBinding)
-          && JSON.stringify(assignment.provisioning) === JSON.stringify(input.provisioning)
-        )),
-      );
+          && JSON.stringify(assignment.provisioning) === JSON.stringify(input.provisioning))
+        : !coordinationCasPresent || Boolean(
+          assignment.generation === expectedGeneration! + 1
+          && (!replacesBoundExecutionAuthority || (
+            input.identity && input.executionBinding && input.provisioning
+            && runtimeIdentityMetadataMatches(assignment.identity, input.identity)
+            && supervisionSelectedExecutionBindingMatches(assignment.executionBinding, input.executionBinding)
+            && JSON.stringify(assignment.provisioning) === JSON.stringify(input.provisioning)
+          )),
+        );
       if (priorEvents.length > 0) {
         this.#db.exec('ROLLBACK');
         return exactReplay && replayStillOwnsExactGeneration
           ? { ok: true, value: task, replay: true }
           : { ok: false, reason: 'conflicting_replay' };
       }
-      if (coordinationCasPresent && assignment.generation !== expectedGeneration) {
+      if (coordinationCasPresent && !authoritativeBrainOverride
+        && assignment.generation !== expectedGeneration) {
         this.#db.exec('ROLLBACK');
         return { ok: false, reason: 'conflicting_replay' };
       }
-
       const nextAssignment: PersistedSupervisionTaskAssignment = {
         ...assignment,
         identity: input.identity ?? assignment.identity,
@@ -8744,6 +8777,7 @@ export class SupervisionTaskRegistry {
       };
       const payload = {
         source: 'brain_coordination_override',
+        origin: 'manual',
         idempotencyKey,
         reason,
         requestedTaskStatus: taskStatus ?? null,
@@ -10041,6 +10075,7 @@ export class SupervisionTaskRegistry {
           updatedAt: now,
         }, 'recovered', {
           source: 'cancelled_task_evidence_recovery',
+          origin: 'manual',
           reason,
           revision,
           auditAttemptId: replacement.auditAttemptId,
@@ -10054,6 +10089,7 @@ export class SupervisionTaskRegistry {
         };
         this.#writeTask(recovered, 'recovered', {
           source: 'cancelled_task_evidence_recovery',
+          origin: 'manual',
           reason,
           replacementIntegrationOwnerAssignmentId: replacement.assignmentId,
           revision,
@@ -10084,7 +10120,7 @@ export class SupervisionTaskRegistry {
       ...(input.toStatus === 'blocked' ? { blocker: reason } : {}),
     };
     this.#writeTask(record, this.#taskEventFor(input.toStatus), {
-      source: 'admin_recovery', reason, status: input.toStatus,
+      source: 'admin_recovery', origin: 'manual', reason, status: input.toStatus,
     });
     return { ok: true, value: record };
   }

@@ -34,11 +34,15 @@ import { setSupervisionLiveParticipantsResolver } from './supervision-state-stor
 import { resolveLiveSupervisionParticipants } from './supervision-brain-authority.js';
 import { getTransportQueueStore, type TransportQueueStore } from './transport-queue-store.js';
 import {
+  exactManualSupervisionExecutionBinding,
+  isUniqueAuthoritativeProjectBrainCaller,
   resolveAutomaticAuditCrossVendorAvailability,
   resolveSelectedSupervisionExecutionBinding,
 } from './send-tool.js';
 import { autoStartAssignmentFromAck } from './assignment-auto-start.js';
 import { SUPERVISION_ASSIGNMENT_START_EVIDENCE } from '../../shared/supervision-assignment-start.js';
+import { getSessionRuntimeType } from '../../shared/agent-types.js';
+import { resolveEffectiveSessionModel } from '../../shared/session-model.js';
 
 export function retireExactSupersededAuditDelivery(
   store: Pick<TransportQueueStore, 'cancelQueuedMessage'>,
@@ -65,11 +69,8 @@ export function isAuthorizedSupervisionProjectBrain(
   scope: { projectName: string; coordinatorSessionName: string },
   sessions: readonly SessionRecord[],
 ): boolean {
-  const coordinator = sessions.find((session) => session.name === scope.coordinatorSessionName);
-  return Boolean(coordinator
-    && coordinator.role === 'brain'
-    && !coordinator.parentSession
-    && resolveEffectiveProjectName(coordinator, sessions) === scope.projectName);
+  const caller = sessions.find((session) => session.name === scope.coordinatorSessionName);
+  return isUniqueAuthoritativeProjectBrainCaller(caller, scope.projectName, sessions);
 }
 
 /**
@@ -427,6 +428,7 @@ export function createSupervisionMcpToolDeps(): SupervisionMcpToolDeps {
         agentType: session.agentType,
         providerFamily: resolvePeerAuditProviderFamily(session),
         projectName,
+        role: session.role,
       };
     },
     resolveAuditorRecoveryBinding: (sessionName) => {
@@ -443,6 +445,25 @@ export function createSupervisionMcpToolDeps(): SupervisionMcpToolDeps {
     resolveAuditorRecoveryCrossVendorAvailability: (input) => (
       resolveAutomaticAuditCrossVendorAvailability(input)
     ),
+    resolveManualExecutionBinding: (sessionName) => {
+      const sessions = listSessions();
+      const session = sessions.find((candidate) => candidate.name === sessionName);
+      const projectName = session ? resolveEffectiveProjectName(session, sessions) : undefined;
+      const model = resolveEffectiveSessionModel(session);
+      if (!session || !projectName || session.state === 'stopped' || !session.sessionInstanceId
+        || !session.runtimeEpoch || !model
+        || (session.runtimeType ?? getSessionRuntimeType(session.agentType)) !== 'transport') return undefined;
+      return exactManualSupervisionExecutionBinding({
+        sessionName: session.name,
+        sessionInstanceId: session.sessionInstanceId,
+        runtimeEpoch: session.runtimeEpoch,
+        agentType: session.agentType,
+        providerFamily: resolvePeerAuditProviderFamily(session),
+        runtimeType: 'transport',
+        model,
+        ...(session.ccPreset ? { ccPresetId: session.ccPreset } : {}),
+      }, 'primary');
+    },
     worktreeGc: async (input) => runSupervisionWorktreeGc(input, createSupervisionWorktreeGcDeps()),
     dispatchReadyAudit: async (taskId) => {
       const { dispatchReadyAudit } = await import('./send-tool.js');

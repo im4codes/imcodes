@@ -2465,6 +2465,9 @@ describe('automatic supervision audit materialization', () => {
       userId: brain.name, sessionName: brain.name, projectName: 'alpha', projectRoot: '/work/alpha',
     }, {
       target: unselectedCc.name, message: 'must remain fail closed', reply: true,
+      // This is the daemon-owned automatic route, not a user's explicit Brain
+      // selection. Automatic sends must never enter the manual Brain override.
+      automaticSupervision: true,
       audit: {
         kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
         attemptId, auditedSessionName: implementer.name, strictCrossVendor: true,
@@ -2520,6 +2523,9 @@ describe('automatic supervision audit materialization', () => {
       reply: true,
       idempotencyKey: `reject-zero-auditor:${variant}`,
       newWorkload: true,
+      // Keep the automatic route distinguishable from a user's explicit exact
+      // target choice: only the latter may use manual Brain authority.
+      automaticSupervision: true,
       audit: {
         kind: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
         attemptId,
@@ -3049,6 +3055,77 @@ describe('automatic supervision audit materialization', () => {
       })]));
     expect(dispatchMessage.mock.calls[0]![1]).toContain('"automaticAudit":true');
     expect(dispatchMessage.mock.calls[0]![1]).toContain('peer_audit_reply');
+  });
+
+  it('carries the exact selected cross-vendor auditor config from routing into pool validation', async () => {
+    const { registry, taskId, revision } = makeReadyTask({
+      taskId: 'exact-cross-vendor-config',
+      revision: 'exact-cross-vendor-config-r1',
+      auditPolicy: 'auto_strict_cross_vendor',
+    });
+    const brain = session('deck_alpha_brain', 'brain');
+    const worker = session('deck_alpha_worker', 'w1');
+    const auditor = session('deck_alpha_cc', 'w2', 'claude-code-sdk', 'anthropic');
+    auditor.activeModel = 'claude-sonnet-5';
+    auditor.requestedModel = 'sonnet';
+    const anthropic = {
+      agentType: 'claude-code-sdk', providerFamily: 'anthropic',
+      runtimeType: 'transport' as const, model: 'sonnet',
+    };
+    const openai = {
+      agentType: 'codex-sdk', providerFamily: 'openai',
+      runtimeType: 'transport' as const, model: 'gpt-5.6-sol',
+    };
+    const configuredWithoutLiveSession = {
+      agentType: 'codex-sdk', providerFamily: 'openai',
+      runtimeType: 'transport' as const, model: 'gpt-5.6-terra',
+    };
+    brain.transportConfig = {
+      supervision: normalizeSessionSupervisionSnapshot({
+        mode: 'supervised_audit',
+        executionPools: {
+          state: 'configured',
+          primaryDevelopmentPool: {
+            configs: [
+              { ...openai, capabilityId: buildSupervisionExecutionCapabilityId(openai) },
+              { ...anthropic, capabilityId: buildSupervisionExecutionCapabilityId(anthropic) },
+              {
+                ...configuredWithoutLiveSession,
+                capabilityId: buildSupervisionExecutionCapabilityId(configuredWithoutLiveSession),
+              },
+            ],
+            controls: { maxSpawned: 2 },
+          },
+          economyTaskPool: { configs: [], controls: { maxSpawned: 0 } },
+        },
+      }),
+    };
+    const calls: SendMessageInput[] = [];
+    const dispatch = vi.fn(async (_caller: SendRuntimeCaller, input: SendMessageInput) => {
+      calls.push(input);
+      return {
+        status: 'accepted' as const,
+        assignmentId: 'asg_exact_cross_vendor',
+        messageId: 'send_message_00000000-0000-5000-a000-00000000c055' as SendMessageId,
+      };
+    });
+
+    await expect(dispatchReadyAudit(taskId, {
+      registry,
+      listSessions: () => [brain, worker, auditor],
+      listTargets: () => listSendTargets({
+        userId: brain.name, sessionName: brain.name, projectName: 'alpha', projectRoot: '/work/alpha',
+      }, { executionPool: 'primary', limit: 100 }, { listSessions: () => [brain, worker, auditor] }),
+      dispatch,
+      hasDeliveryEvidence: () => false,
+    })).resolves.toMatchObject({ status: 'dispatched' });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.target).toBe(auditor.name);
+    expect(calls[0]?.task?.requestedExecutionType).toEqual({
+      ...anthropic,
+      capabilityId: buildSupervisionExecutionCapabilityId(anthropic),
+    });
   });
 
   it('recovers the assignment-before-enqueue crash with the same target and strict policy', async () => {
@@ -6023,11 +6100,7 @@ describe('control-plane auditPolicy bind (tsk_cic)', () => {
     expect(registry.listAssignments(ready.taskId).filter((a) => a.role === 'auditor')).toEqual([]);
   });
 
-  it('refuses a live same-project Brain that is NOT the task coordinator', async () => {
-    // Discriminating on purpose. The earlier non-Brain case asserted only
-    // status:'error', which an unrelated earlier failure satisfies, so a mutant
-    // that deleted the Brain gate survived it. Here every other gate passes and
-    // ONLY the exact-coordinator check can refuse, and the exact error is pinned.
+  it('lets the unique live same-project Brain bind policy despite an older coordinator row', async () => {
     const registry = getSupervisionTaskRegistry();
     const ready = makeReadyTask({ taskId: 'cic-wrong-brain', registry });
     // A DIFFERENT Brain session, not merely a rotated epoch: epoch rotation is
@@ -6050,10 +6123,32 @@ describe('control-plane auditPolicy bind (tsk_cic)', () => {
       dispatchMessage: vi.fn(),
       dispatchReadyAudit,
     });
-    expect(result).toMatchObject({
-      status: 'error',
-      error: 'task auditPolicy requires the exact authoritative project Brain coordinator',
+    expect(result).toMatchObject({ status: 'accepted' });
+    expect(registry.get(ready.taskId)?.auditPolicy).toBe('auto_allow_degraded');
+    expect(dispatchReadyAudit).toHaveBeenCalledOnce();
+  });
+
+  it('keeps the older-coordinator veto removal closed when project Brain authority is ambiguous', async () => {
+    const registry = getSupervisionTaskRegistry();
+    const ready = makeReadyTask({ taskId: 'cic-ambiguous-brain', registry });
+    const callerBrain = brainWith('supervised_audit');
+    callerBrain.name = 'deck_alpha_new_brain';
+    const competingBrain = brainWith('supervised_audit');
+    competingBrain.name = 'deck_alpha_other_live_brain';
+    competingBrain.sessionInstanceId = 'instance-other-live-brain';
+    competingBrain.runtimeEpoch = 'epoch-other-live-brain';
+    const drifted = session('deck_alpha_worker', 'w1');
+    drifted.activeModel = 'retired-model-9';
+    drifted.parentSession = callerBrain.name;
+    const dispatchReadyAudit = vi.fn();
+    const result = await dispatchSendMessage({
+      userId: callerBrain.name, sessionName: callerBrain.name,
+      projectName: 'alpha', projectRoot: '/work/alpha',
+    }, bindInput(ready.taskId, ready.revision), {
+      listSessions: () => [callerBrain, competingBrain, drifted],
+      dispatchMessage: vi.fn(), dispatchReadyAudit,
     });
+    expect(result).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.IDENTITY_REJECTED });
     expect(registry.get(ready.taskId)?.auditPolicy).toBeUndefined();
     expect(dispatchReadyAudit).not.toHaveBeenCalled();
   });
@@ -6839,8 +6934,39 @@ describe('automatic audit fan-out across ready auditors', () => {
   it('rebinds one existing unselected auditor to an exact selected cross-vendor target', async () => {
     const brain = session('deck_alpha_brain', 'brain');
     const worker = session('deck_alpha_worker', 'w1');
-    const stale = session('deck_alpha_cursor', 'w2', 'cursor-headless', 'cursor');
+    worker.activeModel = 'gpt-5.6-sol';
+    const stale = session('deck_alpha_auto_audit', 'w2', 'codex-sdk', 'openai');
+    stale.activeModel = 'gpt-6-astra';
     const selected = session('deck_alpha_cc', 'w2', 'claude-code-sdk', 'anthropic');
+    selected.activeModel = 'claude-sonnet-5';
+    selected.requestedModel = 'sonnet';
+    const sonnet = {
+      agentType: 'claude-code-sdk', providerFamily: 'anthropic',
+      runtimeType: 'transport' as const, model: 'sonnet',
+    };
+    const sol = {
+      agentType: 'codex-sdk', providerFamily: 'openai',
+      runtimeType: 'transport' as const, model: 'gpt-5.6-sol',
+    };
+    const terra = {
+      agentType: 'codex-sdk', providerFamily: 'openai',
+      runtimeType: 'transport' as const, model: 'gpt-5.6-terra',
+    };
+    brain.transportConfig = {
+      supervision: normalizeSessionSupervisionSnapshot({
+        mode: 'supervised_audit',
+        executionPools: {
+          state: 'configured',
+          primaryDevelopmentPool: {
+            configs: [sonnet, sol, terra].map((config) => ({
+              ...config, capabilityId: buildSupervisionExecutionCapabilityId(config),
+            })),
+            controls: { maxSpawned: 2 },
+          },
+          economyTaskPool: { configs: [], controls: { maxSpawned: 0 } },
+        },
+      }),
+    };
     const { registry, revision } = makeReadyTask({
       taskId: 'tsk_unselected_existing_recovery',
       revision: 'unselected-existing-r1',
@@ -6849,20 +6975,13 @@ describe('automatic audit fan-out across ready auditors', () => {
     const attemptId = automaticAttempt('tsk_unselected_existing_recovery', revision);
     const auditor = registry.createAssignment({
       taskId: 'tsk_unselected_existing_recovery', role: 'auditor', required: true,
-      identity: identity(stale.name, 'cursor-headless', 'cursor'),
+      identity: identity(stale.name, 'codex-sdk', 'openai'),
       auditAttemptId: attemptId, auditRevision: revision,
     });
     if (!auditor.ok) throw new Error(auditor.reason);
     const calls: SendMessageInput[] = [];
     const dispatch = vi.fn(async (_caller: unknown, input: SendMessageInput) => {
       calls.push(input);
-      if (input.target === stale.name) {
-        return {
-          status: 'error' as const,
-          reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
-          error: 'task execution pool rejected target: unselected_config',
-        };
-      }
       return {
         status: 'accepted' as const,
         assignmentId: auditor.value.assignmentId,
@@ -6884,14 +7003,18 @@ describe('automatic audit fan-out across ready auditors', () => {
     })).resolves.toMatchObject({
       status: 'dispatched', assignmentId: auditor.value.assignmentId, attemptId,
     });
-    expect(calls.map((input) => input.target)).toEqual([stale.name, selected.name]);
-    expect(calls[1]?.task).toMatchObject({
+    expect(calls.map((input) => input.target)).toEqual([selected.name]);
+    expect(calls[0]?.task).toMatchObject({
       taskId: 'tsk_unselected_existing_recovery',
       assignmentId: auditor.value.assignmentId,
       auditAttemptId: attemptId,
       auditRevision: revision,
+      requestedExecutionType: {
+        ...sonnet,
+        capabilityId: buildSupervisionExecutionCapabilityId(sonnet),
+      },
     });
-    expect(calls[1]?.audit).toMatchObject({ strictCrossVendor: true });
+    expect(calls[0]?.audit).toMatchObject({ strictCrossVendor: true });
     expect(registry.listAssignments('tsk_unselected_existing_recovery').filter((item) => item.role === 'auditor'))
       .toHaveLength(1);
   });

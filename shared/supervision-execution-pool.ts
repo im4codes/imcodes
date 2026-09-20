@@ -12,7 +12,7 @@ export type SupervisionExecutionPoolKind = typeof SUPERVISION_EXECUTION_POOL_KIN
 export const SUPERVISION_EXECUTION_POOL_CONFIG_STATES = ['configured', 'legacy_unconfigured'] as const;
 export type SupervisionExecutionPoolConfigState = typeof SUPERVISION_EXECUTION_POOL_CONFIG_STATES[number];
 
-export const SUPERVISION_EXECUTION_ORIGINS = ['reused', 'spawned'] as const;
+export const SUPERVISION_EXECUTION_ORIGINS = ['reused', 'spawned', 'manual'] as const;
 export type SupervisionExecutionOrigin = typeof SUPERVISION_EXECUTION_ORIGINS[number];
 
 export const SUPERVISION_AUDIT_ROUTING_REASONS = [

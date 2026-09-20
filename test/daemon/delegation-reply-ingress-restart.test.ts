@@ -241,7 +241,11 @@ describe('peer audit reply controller restart recovery', () => {
       rawBody: body,
       senderSessionName: auditorIdentity.sessionName,
       now: 1_000,
-    })).resolves.toEqual({ ok: false, error: 'identity_mismatch' });
+    })).resolves.toEqual({
+      ok: false,
+      error: 'identity_mismatch',
+      message: 'audit sender identity rejected: sessionInstanceId expected="instance-deck_sub_restart_auditor" actual="foreign-auditor-instance"; runtimeEpoch expected="epoch-deck_sub_restart_auditor" actual="foreign-auditor-epoch"',
+    });
     expect(mocks.timelineEmit).not.toHaveBeenCalled();
     expect(getDelegationReplyStore().matchPendingAuditAuthority({
       taskId,

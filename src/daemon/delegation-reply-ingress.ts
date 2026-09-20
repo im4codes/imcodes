@@ -339,7 +339,11 @@ async function submitDelegatedPeerAuditReply(input: {
   envelope: PeerAuditReplyEnvelope;
   sender: SessionRecord;
   receivedAt: number;
-}): Promise<{ ok: true } | { ok: false; error: typeof PEER_AUDIT_REPLY_ERRORS[keyof typeof PEER_AUDIT_REPLY_ERRORS] }> {
+}): Promise<{ ok: true } | {
+  ok: false;
+  error: typeof PEER_AUDIT_REPLY_ERRORS[keyof typeof PEER_AUDIT_REPLY_ERRORS];
+  message?: string;
+}> {
   const senderIdentity = boundIdentity(input.sender);
   if (!senderIdentity) return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.IDENTITY_MISMATCH };
   const taskId = input.envelope.taskId?.trim();
@@ -351,15 +355,38 @@ async function submitDelegatedPeerAuditReply(input: {
   }
   const registry = getSupervisionTaskRegistry();
   const auditAssignment = registry.getAssignment(assignmentId);
-  if (!auditAssignment || auditAssignment.taskId !== taskId || auditAssignment.role !== 'auditor'
-    || auditAssignment.auditAttemptId !== input.envelope.attemptId
-    || auditAssignment.auditRevision !== revision) {
-    return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.ASSIGNMENT_MISMATCH };
+  if (!auditAssignment || auditAssignment.taskId !== taskId || auditAssignment.role !== 'auditor') {
+    return {
+      ok: false,
+      error: PEER_AUDIT_REPLY_ERRORS.ASSIGNMENT_MISMATCH,
+      message: `audit assignment binding rejected: assignmentId actual=${JSON.stringify(assignmentId)}; taskId actual=${JSON.stringify(taskId)}; expected role="auditor"`,
+    };
   }
-  if (auditAssignment.identity.sessionName !== senderIdentity.sessionName
-    || auditAssignment.identity.sessionInstanceId !== senderIdentity.sessionInstanceId
-    || auditAssignment.identity.runtimeEpoch !== senderIdentity.runtimeEpoch) {
-    return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.IDENTITY_MISMATCH };
+  if (auditAssignment.auditAttemptId !== input.envelope.attemptId) {
+    return {
+      ok: false,
+      error: PEER_AUDIT_REPLY_ERRORS.ATTEMPT_MISMATCH,
+      message: `audit attempt binding rejected: attemptId expected=${JSON.stringify(auditAssignment.auditAttemptId ?? '')} actual=${JSON.stringify(input.envelope.attemptId)}`,
+    };
+  }
+  if (auditAssignment.auditRevision !== revision) {
+    return {
+      ok: false,
+      error: PEER_AUDIT_REPLY_ERRORS.REVISION_MISMATCH,
+      message: `audit revision binding rejected: revision expected=${JSON.stringify(auditAssignment.auditRevision ?? '')} actual=${JSON.stringify(revision)}`,
+    };
+  }
+  const identityFields = (['sessionName', 'sessionInstanceId', 'runtimeEpoch'] as const)
+    .filter((field) => auditAssignment.identity[field] !== senderIdentity[field]);
+  if (identityFields.length > 0) {
+    const detail = identityFields.map((field) => (
+      `${field} expected=${JSON.stringify(auditAssignment.identity[field])} actual=${JSON.stringify(senderIdentity[field])}`
+    )).join('; ');
+    return {
+      ok: false,
+      error: PEER_AUDIT_REPLY_ERRORS.IDENTITY_MISMATCH,
+      message: `audit sender identity rejected: ${detail}`,
+    };
   }
   let authority = getDelegationReplyStore().matchPendingAuditAuthority({
     taskId,
@@ -392,7 +419,11 @@ async function submitDelegatedPeerAuditReply(input: {
       now: input.receivedAt,
     });
   }
-  if (!authority) return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.ATTEMPT_MISMATCH };
+  if (!authority) return {
+    ok: false,
+    error: PEER_AUDIT_REPLY_ERRORS.ATTEMPT_MISMATCH,
+    message: `audit reply authority rejected: no pending authority for taskId=${JSON.stringify(taskId)}, assignmentId=${JSON.stringify(assignmentId)}, attemptId=${JSON.stringify(input.envelope.attemptId)}, revision=${JSON.stringify(revision)}`,
+  };
   if ((authority.taskId && authority.taskId !== taskId)
     || (authority.assignmentId && authority.assignmentId !== assignmentId)
     || (authority.auditRevision && authority.auditRevision !== revision)) {

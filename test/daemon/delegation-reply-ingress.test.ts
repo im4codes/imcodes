@@ -1247,6 +1247,54 @@ describe('delegation reply ingress', () => {
   });
 
 
+  it('reports the exact stale auditor identity fields before generic attempt lookup', async () => {
+    const auditRecord = {
+      ...record,
+      purpose: 'supervision_audit' as const,
+      auditAttemptId: 'attempt_manual_audit_identity',
+      auditRevision: 'revision-identity-1',
+      auditedSessionName: origin.sessionName,
+      taskId: 'supervision_task_identity_1',
+      assignmentId: 'supervision_assignment_identity_1',
+    };
+    mocks.getAssignment.mockReturnValue({
+      assignmentId: auditRecord.assignmentId,
+      taskId: auditRecord.taskId,
+      role: 'auditor',
+      auditAttemptId: auditRecord.auditAttemptId,
+      auditRevision: auditRecord.auditRevision,
+      identity: {
+        ...target,
+        sessionInstanceId: 'expected-auditor-instance',
+        runtimeEpoch: 'expected-auditor-epoch',
+        agentType: 'codex-sdk',
+        providerFamily: 'openai',
+      },
+    });
+
+    await expect(submitPeerAuditReply({
+      rawBody: JSON.stringify({
+        version: PEER_AUDIT_REPLY_VERSION,
+        taskId: auditRecord.taskId,
+        assignmentId: auditRecord.assignmentId,
+        attemptId: auditRecord.auditAttemptId,
+        revision: auditRecord.auditRevision,
+        receiptKind: 'final',
+        verdict: 'REWORK',
+        findings: 'Identity should be rejected before receipt handling.',
+        validations: [],
+      }),
+      senderSessionName: target.sessionName,
+      now: 100,
+    })).resolves.toEqual({
+      ok: false,
+      error: 'identity_mismatch',
+      message: 'audit sender identity rejected: sessionInstanceId expected="expected-auditor-instance" actual="target-instance"; runtimeEpoch expected="expected-auditor-epoch" actual="target-epoch"',
+    });
+    expect(mocks.store.matchPendingAuditAuthority).not.toHaveBeenCalled();
+    expect(mocks.appendMatchingAuditReceipt).not.toHaveBeenCalled();
+  });
+
   it('does not promote verdict-looking ordinary reply text into trusted timeline metadata', async () => {
     const forgedResult = JSON.stringify({
       status: PEER_AUDIT_DELEGATED_REPLY_STATUS,
