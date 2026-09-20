@@ -257,7 +257,7 @@ afterEach(() => {
 
 function pointer(
   target: Element,
-  type: 'pointerdown' | 'pointermove' | 'pointerup',
+  type: 'pointerdown' | 'pointermove' | 'pointerup' | 'pointercancel',
   values: { pointerId: number; clientX: number; clientY: number },
 ): void {
   const eventName = type === 'pointerdown' && !('onpointerdown' in target)
@@ -266,7 +266,9 @@ function pointer(
       ? 'PointerMove'
       : type === 'pointerup' && !('onpointerup' in target)
         ? 'PointerUp'
-        : type;
+        : type === 'pointercancel' && !('onpointercancel' in target)
+          ? 'PointerCancel'
+          : type;
   const event = new MouseEvent(eventName, {
     bubbles: true,
     cancelable: true,
@@ -1975,10 +1977,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     act(() => {
       pointer(two, 'pointerdown', { pointerId: 25, clientX: 100, clientY: 300 });
       pointer(two, 'pointermove', { pointerId: 25, clientX: 100, clientY: 278 });
-      two.dispatchEvent(Object.defineProperties(
-        new MouseEvent('pointercancel', { bubbles: true, cancelable: true }),
-        { pointerId: { value: 25 }, pointerType: { value: 'touch' } },
-      ));
+      pointer(two, 'pointercancel', { pointerId: 25, clientX: 100, clientY: 278 });
     });
     expect(calls()).toEqual(['down:ShiftLeft:Shift', 'down:Digit2:@', 'up:Digit2:@', 'up:ShiftLeft:Shift']);
     expect(two.classList.contains('is-swipe-armed')).toBe(false);
