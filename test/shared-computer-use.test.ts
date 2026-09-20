@@ -34,8 +34,19 @@ describe('computer-use shared protocol', () => {
     expect(computerUseDocs('browser')).toContain('127.0.0.1 only');
     expect(computerUseDocs('browser')).toContain("browser_* is IM.codes' built-in CDP path");
     expect(computerUseDocs('browser')).toContain('Search fallback: Bing /search?q=<keywords>; then Google or DuckDuckGo.');
+    expect(computerUseDocs('browser')).toContain('selector falls back to visible-text matching');
+    expect(computerUseDocs('browser')).toContain('invalid_selector');
     expect(computerUseDocs('overview')).toContain('Open Computer Use (OCU) supplies the integrated cross-platform desktop-app control path');
     expect(computerUseDocs('overview')).toContain('do not probe for or install a separate Playwright runtime');
+  });
+
+  it('documents bounded accessibility state and shell-native exec_remote timeouts', () => {
+    const tools = computerUseDocs('tools');
+    expect(tools).toContain('maxNodes');
+    expect(tools).toContain('truncated: N nodes omitted');
+    expect(tools).toContain('only displayed element indexes');
+    expect(tools).toContain('exec_remote has no timeout argument');
+    expect(computerUseDocs('safety')).toContain('shell-native timeout');
   });
 
   it('routes CLI intent away from GUI OCU without misreporting helper failure as authorization failure', () => {

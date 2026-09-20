@@ -318,12 +318,13 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
         `Available tools: ${COMPUTER_USE_TOOLS.join(', ')}.`,
         'shell_session1: run a bounded shell command in the active logged-in user session through the IPC helper; its requested timeout may be 1,000..900,000 ms. For SYSTEM/session-0 shell use exec_remote instead.',
         'list_apps: enumerate controllable GUI apps.',
-        'get_app_state: inspect one app/window accessibility tree.',
+        'get_app_state: inspect one app/window accessibility tree. Output shows at most 200 nodes by default; pass maxNodes=1..1500 to bound returned nodes and maxDepth=1..80 to limit collected depth. When bounded, the text ends with "truncated: N nodes omitted".',
         `click, perform_secondary_action, scroll, drag: pointer/UI actions. On Windows, coordinate drag accepts optional duration_ms=${COMPUTER_USE_DRAG_DURATION_MIN_MS}..${COMPUTER_USE_DRAG_DURATION_MAX_MS} for cursor travel duration; omit it for normal speed.`,
         'type_text, press_key, set_value: keyboard/value actions.',
-        'Arguments are open-computer-use-compatible. Call get_app_state first to find app ids and element indexes; pure coordinate click may skip state and uses a Windows fast path when possible.',
+        'Arguments are open-computer-use-compatible. Call get_app_state first to find app ids and element indexes; only displayed element indexes are safe to reuse. If a target was omitted, narrow the app/window or increase maxNodes and refresh state. Pure coordinate click may skip state and uses a Windows fast path when possible.',
         'Action results omit screenshots and full UI state by default for low-latency control. Pass arguments.includeState=true to return state text, or includeImage=true to request a compressed image; optional imageFormat=jpeg|webp|png, imageQuality=1..100, imageMaxWidth=320..3840.',
         'GUI and browser methods keep the 1,000..120,000 ms timeout range; only shell_session1 permits up to 900,000 ms.',
+        'exec_remote has no timeout argument. Bound the command itself inside command with the target shell/platform timeout facility (for example GNU timeout 30s command).',
       ].join('\n');
     case 'browser':
       return [
@@ -333,7 +334,7 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
         'Then use browser_navigate, browser_snapshot, browser_click, browser_fill, browser_press, browser_evaluate, browser_close.',
         'Every browser snapshot includes automation.cdpEndpoint, cdpHost, and cdpPort. A local Python/Node script may attach to that loopback CDP endpoint (for example Playwright connect_over_cdp) to run complex logic against the same browser instance instead of launching another browser.',
         'The daemon-managed endpoint listens on 127.0.0.1 only. Coordinate MCP browser calls and external scripts so they do not race, and do not terminate the shared browser until the task is finished.',
-        'Selectors are CSS selectors. For click/fill you may pass selector or visible text. Prefer stable CSS selectors over coordinates.',
+        'Selectors are CSS selectors first. For click/fill, the text argument performs visible-text matching; selector falls back to visible-text matching when CSS finds nothing or is invalid, including a text= prefix. Prefer stable CSS selectors. Failures are classified as invalid_selector, element_not_found, or page_exception with a bounded real cause.',
         'Linux without DISPLAY/WAYLAND defaults to headless and uses no-sandbox/dev-shm-safe flags unless noSandbox=false is passed.',
         'browser_open, browser_navigate, and browser_snapshot return url/title, bounded visible text, and common links/buttons/inputs. Pass includeImage=true only when visual evidence is needed; the optional viewport screenshot is delivered as model-visible image content.',
         'Search fallback: Bing /search?q=<keywords>; then Google or DuckDuckGo.',
@@ -351,7 +352,7 @@ export function computerUseDocs(topic: ComputerUseDocTopic): string {
     case 'safety':
       return [
         'Ask the user before destructive or externally visible actions such as sending messages, deleting data, purchases, or changing account/security settings.',
-        'Shell is intentionally split: exec_remote is session-0/SYSTEM; shell_session1 is active-user/session-1. Both are explicit typed methods with bounded JSON arguments/results.',
+        'Shell is intentionally split: exec_remote is session-0/SYSTEM; shell_session1 is active-user/session-1. Both are explicit typed methods with bounded JSON arguments/results. exec_remote rejects an unknown timeout field; put a shell-native timeout in command when a command deadline is needed.',
         'If the UI state is ambiguous, call get_app_state again instead of guessing.',
       ].join('\n');
   }

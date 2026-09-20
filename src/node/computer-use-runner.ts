@@ -44,6 +44,11 @@ export const WINDOWS_DEFAULT_OCU_DIR = 'C:\\ProgramData\\imcodes-node\\computer-
 const WINDOWS_DEFAULT_OCU_EXE = `${WINDOWS_DEFAULT_OCU_DIR}\\open-computer-use.exe`;
 const SHELL_SESSION1_OUTPUT_MAX_BYTES = 96 * 1024;
 const OPEN_COMPUTER_USE_STDOUT_MAX_BYTES = 24 * 1024 * 1024;
+const COMPUTER_USE_STATE_DEFAULT_MAX_NODES = 200;
+const COMPUTER_USE_STATE_MAX_NODES = 1_500;
+const COMPUTER_USE_STATE_DEFAULT_MAX_DEPTH = 64;
+const COMPUTER_USE_STATE_MAX_DEPTH = 80;
+const COMPUTER_USE_STATE_MAX_TEXT_BYTES = 48 * 1024;
 const OPEN_COMPUTER_USE_BINARY = process.platform === 'win32' ? 'open-computer-use.exe' : 'open-computer-use';
 const MACOS_OPEN_COMPUTER_USE_APP_EXECUTABLE = join(
   MACOS_COMPUTER_USE_APP_NAME,
@@ -291,6 +296,8 @@ const COMPUTER_USE_INTERNAL_ARG_KEYS = new Set([
   'imageQuality',
   'imageMaxWidth',
   'duration_ms',
+  'maxNodes',
+  'maxDepth',
 ]);
 
 function stripInternalArgs(args: Record<string, unknown> | null): Record<string, unknown> | null {
@@ -325,8 +332,20 @@ function parseReturnOptions(tool: string, args: Record<string, unknown> | null):
 }
 
 
-function forwardedComputerUseArgs(args: Record<string, unknown> | null): Record<string, unknown> {
-  return stripInternalArgs(args) ?? {};
+function boundedInteger(value: unknown, fallback: number, maximum: number): number {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.min(Math.max(Math.round(value), 1), maximum)
+    : fallback;
+}
+
+function forwardedComputerUseArgs(tool: string, args: Record<string, unknown> | null): Record<string, unknown> {
+  const forwarded = stripInternalArgs(args) ?? {};
+  if (tool !== 'get_app_state') return forwarded;
+  return {
+    ...forwarded,
+    text_limit: forwarded.text_limit ?? 1_000,
+    max_tree_depth: boundedInteger(args?.maxDepth, COMPUTER_USE_STATE_DEFAULT_MAX_DEPTH, COMPUTER_USE_STATE_MAX_DEPTH),
+  };
 }
 
 function openComputerUseMcpToolArgs(tool: string, args: Record<string, unknown>): Record<string, unknown> {
@@ -584,7 +603,7 @@ export function openComputerUseCallArgs(tool: string, argsJson: string): string[
   } catch {
     args = null;
   }
-  const forwardedArgs = forwardedComputerUseArgs(args);
+  const forwardedArgs = forwardedComputerUseArgs(tool, args);
   const forwardedJson = JSON.stringify(forwardedArgs);
   if (isActionTool(tool) && typeof forwardedArgs?.app === 'string' && forwardedArgs.app.trim()) {
     return ['call', '--calls', JSON.stringify([
@@ -984,21 +1003,79 @@ $g.Dispose(); $bmp.Dispose(); $src.Dispose(); $srcStream.Dispose()
   });
 }
 
-async function normalizeContent(raw: unknown, options: ComputerUseReturnOptions): Promise<{ content: ComputerUseContentItem[]; truncated: boolean }> {
+export function boundComputerUseStateTextForTest(
+  text: string,
+  args: Record<string, unknown>,
+): { text: string; truncated: boolean; omittedNodes: number } {
+  const maxNodes = boundedInteger(
+    args.maxNodes,
+    COMPUTER_USE_STATE_DEFAULT_MAX_NODES,
+    COMPUTER_USE_STATE_MAX_NODES,
+  );
+  const lines = text.split(/\r?\n/u);
+  const kept: string[] = [];
+  let keptNodes = 0;
+  let keptBytes = 0;
+  let index = 0;
+  for (; index < lines.length; index += 1) {
+    const line = lines[index]!;
+    const isNode = line.trim().length > 0;
+    if (isNode && keptNodes >= maxNodes) break;
+    const nextBytes = utf8Bytes(line) + (kept.length > 0 ? 1 : 0);
+    // Leave enough room for the explicit truncation marker.
+    if (keptBytes + nextBytes > COMPUTER_USE_STATE_MAX_TEXT_BYTES - 64) break;
+    kept.push(line);
+    keptBytes += nextBytes;
+    if (isNode) keptNodes += 1;
+  }
+  const omittedNodes = lines.slice(index).filter((line) => line.trim().length > 0).length;
+  if (index >= lines.length) return { text, truncated: false, omittedNodes: 0 };
+  const bounded = kept.join('\n');
+  const marker = `truncated: ${Math.max(omittedNodes, 1)} nodes omitted`;
+  return {
+    text: bounded ? `${bounded}\n${marker}` : marker,
+    truncated: true,
+    omittedNodes: Math.max(omittedNodes, 1),
+  };
+}
+
+async function normalizeContent(
+  raw: unknown,
+  options: ComputerUseReturnOptions,
+  stateArgs?: Record<string, unknown>,
+): Promise<{ content: ComputerUseContentItem[]; truncated: boolean }> {
   const contentRaw = raw && typeof raw === 'object' && !Array.isArray(raw)
     ? (raw as { content?: unknown }).content
     : undefined;
   const items = Array.isArray(contentRaw) ? contentRaw : [];
   let truncated = false;
   const content: ComputerUseContentItem[] = [];
+  const stateText = stateArgs
+    ? items.flatMap((item) => item
+      && typeof item === 'object'
+      && !Array.isArray(item)
+      && (item as Record<string, unknown>).type === 'text'
+      && typeof (item as Record<string, unknown>).text === 'string'
+      ? [(item as { text: string }).text]
+      : []).join('\n')
+    : null;
+  let emittedStateText = false;
   for (const item of items) {
     if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
     const record = item as Record<string, unknown>;
     if (record.type === 'text' && typeof record.text === 'string') {
       if (!options.includeState) continue;
-      const cut = truncateUtf8(record.text, COMPUTER_USE_MAX_TEXT_BYTES);
-      truncated ||= cut.truncated;
-      content.push({ type: 'text', text: cut.value });
+      if (stateArgs) {
+        if (emittedStateText) continue;
+        emittedStateText = true;
+        const bounded = boundComputerUseStateTextForTest(stateText ?? '', stateArgs);
+        truncated ||= bounded.truncated;
+        content.push({ type: 'text', text: bounded.text });
+      } else {
+        const cut = truncateUtf8(record.text, COMPUTER_USE_MAX_TEXT_BYTES);
+        truncated ||= cut.truncated;
+        content.push({ type: 'text', text: cut.value });
+      }
       continue;
     }
     if (record.type === 'image' && typeof record.data === 'string') {
@@ -1018,7 +1095,17 @@ export async function normalizeOpenComputerUseParsedResult(
 ): Promise<{ content: ComputerUseContentItem[]; truncated: boolean; isError: boolean }> {
   const returnOptions = parseReturnOptions(tool, args);
   const isError = Boolean(parsed && typeof parsed === 'object' && !Array.isArray(parsed) && (parsed as { isError?: unknown }).isError);
-  const { content, truncated } = await normalizeContent(parsed, { ...returnOptions, includeState: returnOptions.includeState || isError });
+  const stateArgs = !isError && (
+    tool === 'get_app_state'
+    || (isActionTool(tool) && returnOptions.includeState)
+  )
+    ? (args ?? {})
+    : undefined;
+  const { content, truncated } = await normalizeContent(
+    parsed,
+    { ...returnOptions, includeState: returnOptions.includeState || isError },
+    stateArgs,
+  );
   if (!isError && isActionTool(tool) && !returnOptions.includeState) {
     return { content: [{ type: 'text', text: `${tool} completed` }, ...content], truncated, isError };
   }
@@ -1188,6 +1275,99 @@ function truncateJsonText(value: unknown, maxBytes: number = COMPUTER_USE_MAX_TE
 
 interface CdpResponse { id?: number; result?: unknown; error?: { message?: string; data?: string } }
 interface CdpEvent { method?: string; params?: unknown }
+
+interface BrowserCdpExceptionDetails {
+  text?: string;
+  exception?: { className?: string; description?: string };
+}
+
+function browserCdpExceptionMessage(details: BrowserCdpExceptionDetails): string {
+  const description = details.exception?.description?.trim();
+  const marker = description?.match(/(?:^|\b)(invalid_selector|element_not_found):\s*([^\r\n]*)/u);
+  let message: string;
+  if (marker) {
+    message = `${marker[1]}: ${marker[2]}`.trimEnd();
+  } else if (description
+    && /SyntaxError/u.test(description)
+    && /querySelector|invalid selector|valid selector/iu.test(description)) {
+    message = `invalid_selector: ${description.split(/\r?\n/u, 1)[0]}`;
+  } else {
+    const reason = description
+      || details.exception?.className?.trim()
+      || details.text?.trim()
+      || 'browser_evaluate_failed';
+    message = `page_exception: ${reason}`;
+  }
+  return truncateUtf8(message, COMPUTER_USE_MAX_ERROR_BYTES).value;
+}
+
+export function browserCdpExceptionMessageForTest(details: BrowserCdpExceptionDetails): string {
+  return browserCdpExceptionMessage(details);
+}
+
+type BrowserSelectorAction = 'click' | 'fill' | 'focus';
+
+function browserSelectorScript(args: Record<string, unknown>, action: BrowserSelectorAction): string {
+  const selector = optionalStringArg(args, 'selector');
+  const text = optionalStringArg(args, 'text');
+  const value = typeof args.value === 'string' ? args.value : '';
+  const exact = args.exact === true;
+  const selectorJson = JSON.stringify(selector ?? null);
+  const textJson = JSON.stringify(text ?? null);
+  const valueJson = JSON.stringify(value);
+  return `(() => {
+    const selector = ${selectorJson};
+    const explicitText = ${textJson};
+    const exact = ${JSON.stringify(exact)};
+    const value = ${valueJson};
+    function visible(el) { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; }
+    function byVisibleText(wanted) {
+      if (!wanted) return null;
+      const interactive = Array.from(document.querySelectorAll('a,button,input,textarea,select,[role="button"],[role="link"],label,[tabindex]'));
+      const all = interactive.length > 0 ? interactive : Array.from(document.querySelectorAll('*'));
+      const matches = all.map((candidate) => {
+        const t = (candidate.innerText || candidate.textContent || candidate.getAttribute('aria-label') || candidate.getAttribute('placeholder') || '').trim();
+        return { candidate, t };
+      }).filter(({ candidate, t }) => visible(candidate) && (exact ? t === wanted : t.includes(wanted)));
+      const exactMatch = matches.find(({ t }) => t === wanted);
+      if (exactMatch) return exactMatch.candidate;
+      matches.sort((left, right) => left.t.length - right.t.length);
+      return matches[0]?.candidate || null;
+    }
+    let el = null;
+    let selectorError = null;
+    let selectorText = selector;
+    if (selector) {
+      if (selector.startsWith('text=')) {
+        selectorText = selector.slice('text='.length).trim();
+      } else {
+        try { el = document.querySelector(selector); }
+        catch (error) { selectorError = error instanceof Error ? error.message : String(error); }
+      }
+      if (!el) el = byVisibleText(selectorText);
+    }
+    if (!el) el = byVisibleText(explicitText);
+    if (!el && selectorError) throw new Error('invalid_selector: ' + selectorError);
+    if (!el) throw new Error('element_not_found: ' + (selector || explicitText || 'selector_or_text_required'));
+    el.scrollIntoView({ block: 'center', inline: 'center' });
+    el.focus?.();
+    if (${JSON.stringify(action)} === 'click') { el.click(); return true; }
+    if (${JSON.stringify(action)} === 'fill') {
+      el.value = value;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    }
+    return true;
+  })()`;
+}
+
+export function browserSelectorScriptForTest(
+  args: Record<string, unknown>,
+  action: BrowserSelectorAction,
+): string {
+  return browserSelectorScript(args, action);
+}
 
 type CdpPending = {
   resolve: (value: unknown) => void;
@@ -1422,6 +1602,33 @@ interface BrowserCdpCaller {
   call(method: string, params?: Record<string, unknown>, timeoutMs?: number): Promise<unknown>;
 }
 
+async function evaluateBrowserExpression(
+  client: BrowserCdpCaller,
+  expression: string,
+  timeoutMs: number,
+): Promise<unknown> {
+  const boundedTimeout = Math.min(timeoutMs, 30_000);
+  const result = await client.call('Runtime.evaluate', {
+    expression,
+    awaitPromise: true,
+    returnByValue: true,
+    timeout: boundedTimeout,
+  }, boundedTimeout) as {
+    result?: { value?: unknown; description?: string };
+    exceptionDetails?: BrowserCdpExceptionDetails;
+  };
+  if (result.exceptionDetails) throw new Error(browserCdpExceptionMessage(result.exceptionDetails));
+  return result.result?.value ?? result.result?.description ?? null;
+}
+
+export async function evaluateBrowserExpressionForTest(
+  client: BrowserCdpCaller,
+  expression: string,
+  timeoutMs = 30_000,
+): Promise<unknown> {
+  return evaluateBrowserExpression(client, expression, timeoutMs);
+}
+
 interface BrowserViewportScreenshot {
   item?: ComputerUseContentItem;
   truncated: boolean;
@@ -1571,19 +1778,19 @@ class BrowserUseController {
     }
     if (tool === 'browser_snapshot') return this.snapshot(client, args, timeoutMs);
     if (tool === 'browser_click') {
-      await this.evalInPage(client, this.selectorScript(args, 'click'), timeoutMs);
+      await this.evalInPage(client, browserSelectorScript(args, 'click'), timeoutMs);
       return { content: [{ type: 'text', text: 'browser_click completed' }] };
     }
     if (tool === 'browser_fill') {
       if (typeof args.value !== 'string') throw new Error('value_required');
-      await this.evalInPage(client, this.selectorScript(args, 'fill'), timeoutMs);
+      await this.evalInPage(client, browserSelectorScript(args, 'fill'), timeoutMs);
       return { content: [{ type: 'text', text: 'browser_fill completed' }] };
     }
     if (tool === 'browser_press') {
       const key = optionalStringArg(args, 'key');
       if (!key) throw new Error('key_required');
       const selector = optionalStringArg(args, 'selector');
-      if (selector) await this.evalInPage(client, this.selectorScript(args, 'focus'), timeoutMs);
+      if (selector) await this.evalInPage(client, browserSelectorScript(args, 'focus'), timeoutMs);
       await client.call('Input.dispatchKeyEvent', { type: 'keyDown', key }, Math.min(timeoutMs, 30_000));
       await client.call('Input.dispatchKeyEvent', { type: 'keyUp', key }, Math.min(timeoutMs, 30_000));
       return { content: [{ type: 'text', text: 'browser_press completed' }] };
@@ -1751,50 +1958,7 @@ class BrowserUseController {
   }
 
   private async evalInPage(client: CdpClient, expression: string, timeoutMs: number): Promise<unknown> {
-    const result = await client.call('Runtime.evaluate', {
-      expression,
-      awaitPromise: true,
-      returnByValue: true,
-      timeout: Math.min(timeoutMs, 30_000),
-    }, Math.min(timeoutMs, 30_000)) as { result?: { value?: unknown; description?: string }; exceptionDetails?: { text?: string } };
-    if (result.exceptionDetails) throw new Error(result.exceptionDetails.text || 'browser_evaluate_failed');
-    return result.result?.value ?? result.result?.description ?? null;
-  }
-
-  private selectorScript(args: Record<string, unknown>, action: 'click' | 'fill' | 'focus'): string {
-    const selector = optionalStringArg(args, 'selector');
-    const text = optionalStringArg(args, 'text');
-    const value = typeof args.value === 'string' ? args.value : '';
-    const exact = args.exact === true;
-    const selectorJson = JSON.stringify(selector ?? null);
-    const textJson = JSON.stringify(text ?? null);
-    const valueJson = JSON.stringify(value);
-    return `(() => {
-      const selector = ${selectorJson};
-      const text = ${textJson};
-      const exact = ${JSON.stringify(exact)};
-      const value = ${valueJson};
-      function visible(el) { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; }
-      let el = selector ? document.querySelector(selector) : null;
-      if (!el && text) {
-        const all = Array.from(document.querySelectorAll('a,button,input,textarea,select,[role="button"],[role="link"],label,*'));
-        el = all.find((candidate) => {
-          const t = (candidate.innerText || candidate.textContent || candidate.getAttribute('aria-label') || candidate.getAttribute('placeholder') || '').trim();
-          return visible(candidate) && (exact ? t === text : t.includes(text));
-        }) || null;
-      }
-      if (!el) throw new Error('element_not_found');
-      el.scrollIntoView({ block: 'center', inline: 'center' });
-      el.focus?.();
-      if (${JSON.stringify(action)} === 'click') { el.click(); return true; }
-      if (${JSON.stringify(action)} === 'fill') {
-        el.value = value;
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-        return true;
-      }
-      return true;
-    })()`;
+    return evaluateBrowserExpression(client, expression, timeoutMs);
   }
 
   private async snapshot(client: CdpClient, args: Record<string, unknown>, timeoutMs: number): Promise<{ content: ComputerUseContentItem[]; truncated?: boolean }> {
@@ -1972,11 +2136,20 @@ export async function runComputerUseTool(request: ComputerUseRequest): Promise<C
       const returnOptions = parseReturnOptions(request.tool, argsObject);
       if (returnOptions.includeState || returnOptions.includeImage) {
         try {
+          const snapshotArgs = forwardedComputerUseArgs('get_app_state', {
+            app: argsObject.app,
+            ...(argsObject.maxNodes !== undefined ? { maxNodes: argsObject.maxNodes } : {}),
+            ...(argsObject.maxDepth !== undefined ? { maxDepth: argsObject.maxDepth } : {}),
+          });
           const snapshot = await callOpenComputerUseMcpTool(
-            'get_app_state', { app: argsObject.app }, timeoutMs,
+            'get_app_state', snapshotArgs, timeoutMs,
             request.resourceOwner ?? sessionResourceOwnerFromEnv(),
           );
-          const normalized = await normalizeContent(snapshot, returnOptions);
+          const normalized = await normalizeContent(
+            snapshot,
+            returnOptions,
+            returnOptions.includeState ? argsObject : undefined,
+          );
           return {
             correlationId: request.correlationId,
             ok: true,
@@ -2006,7 +2179,7 @@ export async function runComputerUseTool(request: ComputerUseRequest): Promise<C
     try {
       parsed = await callOpenComputerUseMcpTool(
         request.tool,
-        forwardedComputerUseArgs(argsObject),
+        forwardedComputerUseArgs(request.tool, argsObject),
         timeoutMs,
         request.resourceOwner ?? sessionResourceOwnerFromEnv(),
       );
