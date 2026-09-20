@@ -141,6 +141,7 @@ const execFileAsync = promisify(execFile);
 // with it. 45s, still comfortably short of a hung/genuinely-broken send.
 const SEND_WAIT_MS = 45_000;
 const COVERAGE_CONTENDED_SEND_WAIT_MS = 60_000;
+const BLOCKED_TASKS_READ_START_WAIT_MS = 10_000;
 /**
  * Floor on how many times a wait actually looks, independent of the clock.
  *
@@ -301,6 +302,20 @@ function blockNextTasksRead(): { started: Promise<void>; release: () => void } {
   blockedTasksReads.wait = wait;
   blockedTasksReads.release = releaseRead;
   return { started, release: releaseRead };
+}
+
+async function waitForBlockedTasksReadStart(started: Promise<void>): Promise<void> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    started,
+    new Promise<never>((_resolve, reject) => {
+      timeout = setTimeout(() => reject(new Error(
+        `openspec_auto_deliver_test_tasks_read_gate_not_reached${describeOrchestratorActivity()}`,
+      )), BLOCKED_TASKS_READ_START_WAIT_MS);
+    }),
+  ]).finally(() => {
+    if (timeout) clearTimeout(timeout);
+  });
 }
 
 function resetBlockedTasksRead(): void {
@@ -1565,26 +1580,38 @@ exec "${realGit}" "$@"
       && text.includes('write this exact JSON marker to:'),
       SEND_WAIT_MS,
     );
-    expect(await writeLatestImplementationMarker()).toBe(true);
-
+    // Arm the read gate before publishing the marker. The background 20ms
+    // marker poll and the explicit idle edge both consume that marker; arming
+    // after the write lets the poll win under CI contention, after which the
+    // idle edge no longer reads tasks.md and `gate.started` can never settle.
     const gate = blockNextTasksRead();
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
-    await gate.started;
+    let reset: Promise<void> | undefined;
+    try {
+      expect(await writeLatestImplementationMarker()).toBe(true);
+      timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+      await waitForBlockedTasksReadStart(gate.started);
 
-    let resetFinished = false;
-    const reset = clearOpenSpecAutoDeliverRunsForTests().then(() => {
-      resetFinished = true;
-    });
-    // Give an incorrectly untracked reset a full event-loop turn to resolve.
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    const finishedBeforeAdvance = resetFinished;
+      let resetFinished = false;
+      reset = clearOpenSpecAutoDeliverRunsForTests().then(() => {
+        resetFinished = true;
+      });
+      // Give an incorrectly untracked reset a full event-loop turn to resolve.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const finishedBeforeAdvance = resetFinished;
 
-    gate.release();
-    await reset;
-    await waitForP2pStartCount(1);
+      gate.release();
+      await reset;
+      reset = undefined;
+      await waitForP2pStartCount(1);
 
-    expect(finishedBeforeAdvance).toBe(false);
-    expect(describeOpenSpecAutoDeliverRunsForTests()).toEqual([]);
+      expect(finishedBeforeAdvance).toBe(false);
+      expect(describeOpenSpecAutoDeliverRunsForTests()).toEqual([]);
+    } finally {
+      // Never leave a deferred filesystem read parked when an assertion or
+      // diagnostic wait fails; otherwise afterEach would itself deadlock.
+      gate.release();
+      if (reset) await reset;
+    }
   });
 
   it('fails a stuck test-reset drain with a bounded, explicit error', async () => {
@@ -1598,15 +1625,16 @@ exec "${realGit}" "$@"
     }, serverLinkMock as never);
     await waitForTransportSend((text) =>
       text.includes('Implementation completion marker (required):'), SEND_WAIT_MS);
-    expect(await writeLatestImplementationMarker()).toBe(true);
-
     const gate = blockNextTasksRead();
-    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
-    await gate.started;
-    await expect(clearOpenSpecAutoDeliverRunsForTests({ drainTimeoutMs: 25 }))
-      .rejects.toThrow('openspec_auto_deliver_test_reset_drain_timeout');
-
-    gate.release();
+    try {
+      expect(await writeLatestImplementationMarker()).toBe(true);
+      timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+      await waitForBlockedTasksReadStart(gate.started);
+      await expect(clearOpenSpecAutoDeliverRunsForTests({ drainTimeoutMs: 25 }))
+        .rejects.toThrow('openspec_auto_deliver_test_reset_drain_timeout');
+    } finally {
+      gate.release();
+    }
     await clearOpenSpecAutoDeliverRunsForTests();
   });
 
