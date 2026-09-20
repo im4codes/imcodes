@@ -11382,6 +11382,7 @@ button.quick-agent-delegation-preset.active {
   border: 1px solid #326d8f;
   border-radius: 8px;
   font-size: 13px;
+  transition: transform 80ms ease, border-color 80ms ease, box-shadow 80ms ease, background 80ms ease;
 }
 
 /* Keys with a shift-layer glyph: drawn small in the top-right corner (absolute,
@@ -11392,6 +11393,55 @@ button.quick-agent-delegation-preset.active {
   touch-action: none;
 }
 
+/* Swiping up on a key that carries a shift-layer glyph: the cap lifts with
+   the finger, then lights up with the glyph it will send once the swipe is
+   far enough -- without it nothing says whether the gesture took. */
+.remote-desktop-computer-keyboard-row button.has-upper.is-swiping {
+  transform: translateY(-2px);
+  border-color: rgb(125 211 252 / 45%);
+}
+
+.remote-desktop-computer-keyboard-row button.has-upper.is-swipe-armed {
+  transform: translateY(-4px);
+  border-color: rgb(125 211 252 / 90%);
+  background: linear-gradient(180deg, rgb(28 86 140 / 92%), rgb(9 38 66 / 94%));
+  box-shadow: 0 0 0 1px rgb(125 211 252 / 45%), 0 -4px 12px rgb(56 189 248 / 38%);
+}
+
+.remote-desktop-computer-keyboard-row button.has-upper.is-swiping
+  .remote-desktop-computer-key-upper {
+  opacity: 1;
+  color: #d8f4ff;
+}
+
+.remote-desktop-computer-keyboard-row button.has-upper.is-swipe-armed
+  .remote-desktop-computer-key-upper {
+  top: 50%;
+  right: 50%;
+  transform: translate(50%, -50%) scale(2.3);
+  color: #eaf9ff;
+  opacity: 1;
+  text-shadow: 0 0 10px rgb(56 189 248 / 60%);
+}
+
+/* The arrow names the gesture that is about to fire. */
+.remote-desktop-computer-keyboard-row button.has-upper.is-swipe-armed::after {
+  content: '↑';
+  position: absolute;
+  top: 1px;
+  left: 4px;
+  font-size: 10px;
+  line-height: 1;
+  color: #9fe7ff;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .remote-desktop-computer-keyboard-row button.has-upper.is-swiping,
+  .remote-desktop-computer-keyboard-row button.has-upper.is-swipe-armed {
+    transform: none;
+  }
+}
+
 .remote-desktop-computer-key-upper {
   position: absolute;
   top: 1px;
@@ -11400,6 +11450,7 @@ button.quick-agent-delegation-preset.active {
   line-height: 1;
   color: #9fd6ee;
   opacity: 0.85;
+  transition: transform 80ms ease, color 80ms ease, opacity 80ms ease, top 80ms ease, right 80ms ease;
   pointer-events: none;
 }
 

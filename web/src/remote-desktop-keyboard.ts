@@ -654,9 +654,17 @@ export const REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS_PAGE2: readonly (readonly Rem
     plainKey('Comma', ','), plainKey('Period', '.'), plainKey('Slash', '/'),
   ],
   DIGIT_ROW_KEYS.map(digitKey),
+  // The letters in the arrangement a phone keyboard uses, so the cap a
+  // thumb reaches for is where it already expects it: three letter rows,
+  // Shift and Backspace flanking the last one, space and Return under them.
   QWERTY_ROW_LETTERS.split('').map(letterKey),
-  [...HOME_ROW_LETTERS.split('').map(letterKey), plainKey('Backspace', 'Backspace')],
-  [REMOTE_DESKTOP_COMPUTER_CASE_KEY, ...BOTTOM_ROW_LETTERS.split('').map(letterKey), plainKey('Space', ' '), plainKey('Enter', 'Enter')],
+  HOME_ROW_LETTERS.split('').map(letterKey),
+  [
+    REMOTE_DESKTOP_COMPUTER_CASE_KEY,
+    ...BOTTOM_ROW_LETTERS.split('').map(letterKey),
+    plainKey('Backspace', 'Backspace'),
+  ],
+  [plainKey('Space', ' '), plainKey('Enter', 'Enter')],
 ];
 
 /**
@@ -771,6 +779,12 @@ export const REMOTE_DESKTOP_MOBILE_INPUT_ACCESSORY_SUPPRESS_MS = 100;
  */
 export function focusRemoteDesktopMobileInput(input: HTMLTextAreaElement | null | undefined): void {
   if (!input) return;
+  // Already the focused field -- after a Return, a deletion or a shortcut
+  // chord. Making it non-editable again to re-suppress the bar closes the OS
+  // keyboard and reopens it, a visible flicker on every such key. The bar is
+  // only ever drawn when the keyboard is summoned, so there is nothing to
+  // suppress while it is already up.
+  if (typeof document !== 'undefined' && document.activeElement === input) return;
   input.setAttribute('readonly', 'readonly');
   input.setAttribute('disabled', 'true');
   setTimeout(() => {

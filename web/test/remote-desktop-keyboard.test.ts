@@ -446,6 +446,29 @@ describe('focusRemoteDesktopMobileInput', () => {
       vi.useRealTimers();
     }
   });
+
+  it('leaves a field that already has the focus alone, so the OS keyboard does not flicker', () => {
+    vi.useFakeTimers();
+    try {
+      const input = document.createElement('textarea');
+      document.body.appendChild(input);
+      input.focus();
+      expect(document.activeElement).toBe(input);
+
+      // Sending Return, a deletion or a shortcut chord refocuses through here
+      // while the keyboard is up: touching editability again closes and
+      // reopens it.
+      focusRemoteDesktopMobileInput(input);
+      expect(input.hasAttribute('readonly')).toBe(false);
+      expect(input.hasAttribute('disabled')).toBe(false);
+      vi.advanceTimersByTime(REMOTE_DESKTOP_MOBILE_INPUT_ACCESSORY_SUPPRESS_MS);
+      expect(input.hasAttribute('disabled')).toBe(false);
+
+      document.body.removeChild(input);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe('phone keyboard editing keys', () => {

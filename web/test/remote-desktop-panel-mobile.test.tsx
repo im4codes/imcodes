@@ -1955,6 +1955,33 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       pointer(two, 'pointerup', { pointerId: 23, clientX: 160, clientY: 280 });
     });
     expect(calls()).toEqual([]);
+
+    // The swipe says on screen what it is about to do, and clears after.
+    act(() => {
+      pointer(two, 'pointerdown', { pointerId: 24, clientX: 100, clientY: 300 });
+      pointer(two, 'pointermove', { pointerId: 24, clientX: 100, clientY: 294 });
+    });
+    expect(two.classList.contains('is-swiping')).toBe(true);
+    expect(two.classList.contains('is-swipe-armed')).toBe(false);
+    act(() => pointer(two, 'pointermove', { pointerId: 24, clientX: 100, clientY: 280 }));
+    expect(two.classList.contains('is-swipe-armed')).toBe(true);
+    act(() => pointer(two, 'pointerup', { pointerId: 24, clientX: 100, clientY: 280 }));
+    expect(two.classList.contains('is-swiping')).toBe(false);
+    expect(two.classList.contains('is-swipe-armed')).toBe(false);
+
+    // A swipe the browser takes away mid-gesture (it decided the drag was a
+    // scroll) still sends the glyph it had already committed to.
+    key.mockClear();
+    act(() => {
+      pointer(two, 'pointerdown', { pointerId: 25, clientX: 100, clientY: 300 });
+      pointer(two, 'pointermove', { pointerId: 25, clientX: 100, clientY: 278 });
+      two.dispatchEvent(Object.defineProperties(
+        new MouseEvent('pointercancel', { bubbles: true, cancelable: true }),
+        { pointerId: { value: 25 }, pointerType: { value: 'touch' } },
+      ));
+    });
+    expect(calls()).toEqual(['down:ShiftLeft:Shift', 'down:Digit2:@', 'up:Digit2:@', 'up:ShiftLeft:Shift']);
+    expect(two.classList.contains('is-swipe-armed')).toBe(false);
   });
 
   it('has a special-characters page whose keys send Shift plus the key, so every printable character is reachable', async () => {
@@ -2103,6 +2130,27 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     const { getByRole } = await renderPanel();
     expect(getByRole('button', { name: 'remote_desktop.fit' }).getAttribute('aria-pressed'))
       .toBe('true');
+  });
+
+  it('keeps the phone keyboard up while the remote screen is operated', async () => {
+    const { stage, getByRole, getByLabelText } = await renderPanel();
+    act(() => { (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });
+    const input = getByLabelText('remote_desktop.mobile_text_input') as HTMLTextAreaElement;
+    act(() => input.focus());
+    expect(document.activeElement).toBe(input);
+
+    // Touching, dragging and lifting on the picture must not take the focus
+    // off the field -- that is what dismissed the OS keyboard.
+    pointer(stage, 'pointerdown', { pointerId: 71, clientX: 120, clientY: 160 });
+    expect(document.activeElement).toBe(input);
+    pointer(stage, 'pointermove', { pointerId: 71, clientX: 150, clientY: 200 });
+    pointer(stage, 'pointerup', { pointerId: 71, clientX: 150, clientY: 200 });
+    expect(document.activeElement).toBe(input);
+
+    // Closing it hands the stage back for physical keyboard input.
+    act(() => { (getByRole('button', { name: 'remote_desktop.close_mobile_keyboard' }) as HTMLButtonElement).click(); });
+    mousePointer(stage, 'pointerdown', { pointerId: 72, clientX: 120, clientY: 160 });
+    expect(document.activeElement).toBe(stage);
   });
 
   it('keeps a hand-set zoom when the stage resizes, as the phone keyboard makes it', async () => {
