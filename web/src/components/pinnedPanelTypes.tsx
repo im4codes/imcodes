@@ -45,6 +45,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
     // Pinned panel is always visible to the user while mounted; participate
     // in resume broadcast so it catches up even when not the active session.
     isVisible: true,
+    bootstrapWhenVisible: true,
   });
   const liveSub = ctx.subSessions.find(s => s.sessionName === sessionName);
 

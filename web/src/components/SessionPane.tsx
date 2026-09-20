@@ -200,6 +200,8 @@ export function SessionPane({
     // open. Keep this main pane mounted and subscribed, but do not let it join
     // the same global resume broadcast and double the foreground work.
     isActiveSession: keyboardActive ?? isActive,
+    isVisible: true,
+    bootstrapWhenVisible: true,
     disableHistory: !hasChatTimeline,
     authoritativeSessionState: session.state,
   });

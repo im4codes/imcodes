@@ -313,6 +313,7 @@ export function SubSessionWindow({
     // HTTP/IDB work together when the browser resumes after sleep.
     isActiveSession: active,
     isVisible: visible,
+    bootstrapWhenVisible: true,
   });
 
   // Re-surface a still-pending question in the dedicated dialog from history

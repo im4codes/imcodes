@@ -1620,6 +1620,15 @@ export interface UseTimelineOptions {
    */
   isVisible?: boolean;
   /**
+   * This hook backs a real chat surface (main pane, floating window, or pinned
+   * panel), not a passive card preview. A visible surface must bootstrap its
+   * own history even when another window currently owns keyboard focus.
+   *
+   * Kept opt-in so a wall of SubSessionCard previews cannot fan out one daemon
+   * and HTTP history request per card after a reload.
+   */
+  bootstrapWhenVisible?: boolean;
+  /**
    * Shell/script process sessions have no chat timeline. When disabled, the
    * hook stays idle and skips daemon/HTTP/text-tail history work entirely.
    */
@@ -2012,6 +2021,8 @@ export function useTimeline(
   const cacheKey = sessionId ? scopeCacheKey(serverId, sessionId) : sessionId;
   const isActiveSession = options?.isActiveSession ?? true;
   const isVisible = options?.isVisible ?? isActiveSession;
+  const bootstrapWhenVisible = options?.bootstrapWhenVisible ?? false;
+  const shouldBootstrapVisibleHistory = isActiveSession || (bootstrapWhenVisible && isVisible);
   const disableHistory = options?.disableHistory ?? false;
   const authoritativeSessionState = options?.authoritativeSessionState;
   const wsConnected = !!ws?.connected;
@@ -2448,14 +2459,14 @@ export function useTimeline(
     let coldDaemonTimer: ReturnType<typeof setTimeout> | null = null;
     if (localSnapshot.length === 0) {
       setLoading(true);
-      if (isActiveSession && wsConnected) {
+      if (shouldBootstrapVisibleHistory && wsConnected) {
         // Give a healthy local read one short head start, then hedge with the
         // daemon instead of awaiting IDB indefinitely. This preserves the cheap
         // local-first path while bounding the screenshot's cache-only stall.
         coldDaemonTimer = setTimeout(() => {
           coldDaemonTimer = null;
           if (cancelled || coldDaemonRequested) return;
-          requestDaemonHistory(true);
+          requestDaemonHistory(true, undefined, undefined, !isActiveSessionRef.current);
           coldDaemonRequested = true;
         }, LOCAL_HISTORY_DAEMON_HEDGE_MS);
         coldDaemonTimer.unref?.();
@@ -2509,8 +2520,13 @@ export function useTimeline(
         // is merged below under the same cache-key/cancellation fences.
         updateHistoryStep('cache', 'offline', 'bootstrap');
         setLoading(false);
-        if (isActiveSession) {
-          fireHttpBackfillRef.current(0, { cooldownMs: 0, phase: 'bootstrap', mode: 'manualLatestWindow' });
+        if (shouldBootstrapVisibleHistory) {
+          fireHttpBackfillRef.current(0, {
+            cooldownMs: 0,
+            phase: 'bootstrap',
+            mode: 'manualLatestWindow',
+            force: true,
+          });
         }
       } else if (deadlineTimer) {
         clearTimeout(deadlineTimer);
@@ -2624,9 +2640,9 @@ export function useTimeline(
         // in (authoritative history reconciles by eventId), and leave
         // `historyLoadedRef` unset so a dep-churn re-run / ↻ / the IDB-open
         // backoff retry can re-read the local store if data appears.
-        if (isActiveSession && wsConnected) {
+        if (shouldBootstrapVisibleHistory && wsConnected) {
           if (!coldDaemonRequested) {
-            requestDaemonHistory(true);
+            requestDaemonHistory(true, undefined, undefined, !isActiveSessionRef.current);
             coldDaemonRequested = true;
           }
           // The local read has settled empty; the already-running daemon step
@@ -2638,7 +2654,7 @@ export function useTimeline(
           // Nothing was fetched. Say WHICH it is instead of letting the status
           // fall back to a blanket idle, which reads as "history settled" and
           // renders the empty-chat placeholder while the fetch is still coming.
-          if (!isActiveSession) {
+          if (!shouldBootstrapVisibleHistory) {
             // Inactive timelines deliberately never issue the request, so this
             // is terminal now — a spinner here would never resolve.
             updateHistoryStep('daemon', 'offline', 'bootstrap');
@@ -2655,7 +2671,7 @@ export function useTimeline(
             daemonWaitTimerRef.current.unref?.();
           }
         }
-        if (isActiveSession) {
+        if (shouldBootstrapVisibleHistory) {
           // IDB came back EMPTY. If a low-completeness seed (localStorage tail
           // snapshot / WS replay tail) is already painted, a tail-mode backfill
           // would anchor afterTs at the seed's newest ts and never fetch the
@@ -2668,12 +2684,12 @@ export function useTimeline(
           // blank-pane self-heal effect.
           const truncatedSeedShowing = eventsRef.current.length > 0;
           fireHttpBackfillRef.current(200, truncatedSeedShowing
-            ? { cooldownMs: 0, phase: 'bootstrap', mode: 'manualLatestWindow' }
-            : { cooldownMs: 0, phase: 'bootstrap' });
+            ? { cooldownMs: 0, phase: 'bootstrap', mode: 'manualLatestWindow', force: true }
+            : { cooldownMs: 0, phase: 'bootstrap', force: true });
         }
       }
     };
-    if (isActiveSession) {
+    if (shouldBootstrapVisibleHistory) {
       // Active session: race straight to IDB so the open window paints with
       // full local history ASAP.
       load().catch(() => {});
@@ -2688,7 +2704,7 @@ export function useTimeline(
       cancelled = true;
       if (coldDaemonTimer) clearTimeout(coldDaemonTimer);
     };
-  }, [buildForwardHistoryArgs, cacheKey, clearForwardHistoryTimeout, clearHttpBackfillTimer, disableHistory, isActiveSession, sendForwardHistoryRequest, sessionId, ws, wsConnected]);
+  }, [buildForwardHistoryArgs, cacheKey, clearForwardHistoryTimeout, clearHttpBackfillTimer, disableHistory, isActiveSession, sendForwardHistoryRequest, sessionId, shouldBootstrapVisibleHistory, ws, wsConnected]);
 
   // Map of commandId → optimistic eventId for O(1) lookup on command.ack / dedup.
   const optimisticIdsByCommandRef = useRef(new Map<string, string>());
@@ -3642,6 +3658,8 @@ export function useTimeline(
   isActiveSessionRef.current = isActiveSession;
   const isVisibleRef = useRef(isVisible);
   isVisibleRef.current = isVisible;
+  const shouldBootstrapVisibleHistoryRef = useRef(shouldBootstrapVisibleHistory);
+  shouldBootstrapVisibleHistoryRef.current = shouldBootstrapVisibleHistory;
   // Wall-clock of the last inbound live `timeline.event` for THIS session.
   // The foreground watchdog uses it (together with the last verified backfill)
   // to detect a silently-stalled stream — a live event the WS never delivered
@@ -3996,8 +4014,17 @@ export function useTimeline(
     // i.e. when the HTTP path is a no-op), then opportunistically catch up
     // over HTTP.
     void reloadLocalTimeline();
+    // HTTP may be unavailable while the live daemon socket is healthy (for
+    // example before serverId resolution). Force a newest-window daemon read
+    // too; deliberately omit afterTs so one newly-sent/live event cannot hide
+    // the existing history below it.
+    if (ws?.connected && sessionId) {
+      updateHistoryStep('daemon', 'running', 'refresh');
+      setRefreshing(true);
+      sendForwardHistoryRequest('refresh', { limit: MAX_MEMORY_EVENTS });
+    }
     fireHttpBackfillRef.current(0, { phase: 'refresh', visible: true, force: true, mode: 'manualLatestWindow' });
-  }, [reloadLocalTimeline]);
+  }, [reloadLocalTimeline, sendForwardHistoryRequest, sessionId, updateHistoryStep, ws]);
 
   // Self-heal a blank pane. The mount path seeds `events` from local cache, but
   // it can still settle EMPTY even when history exists — e.g. serverId resolved
@@ -4029,9 +4056,9 @@ export function useTimeline(
       return;
     }
     if (loading || refreshing || httpRefreshing) return; // another recovery path is still running
-    if (!isActiveSessionRef.current) return;
+    if (!shouldBootstrapVisibleHistoryRef.current) return;
     if (blankSelfHealRef.current === key) return;  // already self-healed this key
-    fireBlankPaneRecovery(isActiveSessionRef.current);
+    fireBlankPaneRecovery(true);
   }, [
     cacheKey,
     events.length,
@@ -4040,6 +4067,7 @@ export function useTimeline(
     httpRefreshing,
     disableHistory,
     fireBlankPaneRecovery,
+    shouldBootstrapVisibleHistory,
   ]);
 
   // Independent-authority self-heal: if the daemon/session list says the turn

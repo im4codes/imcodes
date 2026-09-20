@@ -151,11 +151,12 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     ingestTimelineEventForCache(latestPush, serverId);
     fetchSpy.mockResolvedValue({ events: [middleRecovered], epoch: 1, hasMore: false, nextCursor: null });
 
+    const sendTimelineHistoryRequest = vi.fn(() => 'history-manual-middle');
     const ws: WsClient = {
       connected: true,
       onMessage: () => () => {},
       sendTimelineReplayRequest: vi.fn(() => 'replay-manual-middle'),
-      sendTimelineHistoryRequest: vi.fn(() => 'history-manual-middle'),
+      sendTimelineHistoryRequest,
     } as unknown as WsClient;
 
     let timeline: ReturnType<typeof useTimeline> | null = null;
@@ -173,11 +174,15 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     await waitFor(() => {
       expect(screen.getByTestId('probe').textContent).toContain('latest-push');
     });
+    sendTimelineHistoryRequest.mockClear();
 
     await act(async () => {
       timeline!.forceRefresh();
       await vi.advanceTimersByTimeAsync(1);
     });
+
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300);
 
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     expect(fetchSpy).toHaveBeenCalledWith(

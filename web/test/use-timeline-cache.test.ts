@@ -777,6 +777,69 @@ describe('useTimeline global cache bounds', () => {
     expect(fetchHistorySpy).toHaveBeenCalled();
   });
 
+  it('bootstraps a cold visible chat window while it is not the focused window', async () => {
+    // Regression: after a browser reload, a visible floating chat could be
+    // unfocused. It was treated like a passive preview card, so both daemon and
+    // HTTP history were skipped. Sending a new message supplied the first live
+    // row, after which Load more finally became usable. Real chat surfaces must
+    // independently fetch their newest window; preview cards retain the
+    // no-fan-out behavior covered above.
+    vi.useFakeTimers();
+    const sessionName = `deck_visible_inactive_${Date.now()}`;
+    const serverId = `srv-visible-${Date.now()}`;
+    const sendTimelineHistoryRequest = vi.fn(() => 'history-visible-inactive');
+    let handler: ((message: ServerMessage) => void) | null = null;
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (message: ServerMessage) => void) => {
+        handler = next;
+        return () => { handler = null; };
+      },
+      sendTimelineHistoryRequest,
+    } as unknown as WsClient;
+
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    fetchHistorySpy.mockResolvedValue({ events: [], epoch: 1, hasMore: false, nextCursor: null });
+
+    function Probe() {
+      const timeline = useTimeline(sessionName, ws, serverId, {
+        isActiveSession: false,
+        isVisible: true,
+        bootstrapWhenVisible: true,
+      });
+      return h('div', { 'data-testid': 'visible-inactive-probe' },
+        timeline.events.map((event) => String(event.payload.text ?? '')).join('|'));
+    }
+
+    render(h(Probe));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300);
+      await flushMicrotasks();
+    });
+
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName);
+    expect(fetchHistorySpy).toHaveBeenCalled();
+
+    await act(async () => {
+      handler?.({
+        type: TIMELINE_MESSAGES.HISTORY,
+        sessionName,
+        requestId: 'history-visible-inactive',
+        epoch: 1,
+        events: makeEvents(sessionName, 1).map((event) => ({
+          ...event,
+          payload: { text: 'restored without sending a message' },
+        })),
+      } as ServerMessage);
+      await flushMicrotasks();
+    });
+
+    expect(screen.getByTestId('visible-inactive-probe').textContent)
+      .toContain('restored without sending a message');
+  });
+
   it('falls back to raw sessionId IDB key when the scoped read is empty (cacheKey scope drift)', async () => {
     // Regression for the scope-drift bug — PR-4 in
     // .imc/discussions/e9dbc48c-dda.md. When the app mounts before
