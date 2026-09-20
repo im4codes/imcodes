@@ -14094,3 +14094,12 @@ button.quick-agent-delegation-preset.active {
 .fb-node-capacity-bar::before {
   transition: width 0.2s ease;
 }
+
+/* Supervision console synchronization health. */
+.supervision-task-console-cursor { flex-wrap: wrap; align-items: center; }
+.supervision-task-console-cursor[data-sync-state="synced"] .supervision-task-console-sync { color: #67e8f9; }
+.supervision-task-console-cursor[data-sync-state="stale"] .supervision-task-console-sync { color: #fbbf24; }
+.supervision-task-console-cursor[data-sync-state="error"] .supervision-task-console-sync { color: #fca5a5; }
+.supervision-task-console-retry { padding: 2px 7px; border: 1px solid rgba(34,211,238,.3); border-radius: 999px; color: #a5f3fc; background: rgba(8,47,73,.45); font: inherit; cursor: pointer; }
+.supervision-task-console-retry:hover,
+.supervision-task-console-retry:focus-visible { border-color: #67e8f9; color: #ecfeff; outline: none; }

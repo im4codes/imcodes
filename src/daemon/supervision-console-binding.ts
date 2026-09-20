@@ -35,6 +35,7 @@ export interface SupervisionConsoleBindingDeps {
   now?: () => number;
   newEpoch?: () => string;
   onError?: (error: unknown) => void;
+  onActiveSubscriptionCountChanged?: (count: number) => void;
   resolveSessionPresentation?: SupervisionProducerOptions['resolveSessionPresentation'];
 }
 
@@ -102,6 +103,7 @@ export function createSupervisionConsoleBinding(
     authorize: deps.authorize ?? (() => false),
     now: deps.now,
     onError: deps.onError,
+    onActiveSubscriptionCountChanged: deps.onActiveSubscriptionCountChanged,
   });
 
   deps.serverLink.onMessage((message) => { sessions?.handleFrame(message); });
@@ -119,23 +121,106 @@ export function createSupervisionConsoleBinding(
  * registry genuinely contains no tasks.
  */
 export function createProductionSupervisionConsoleBinding(
-  deps: Omit<SupervisionConsoleBindingDeps, 'database'> & { databasePath?: string },
+  deps: Omit<SupervisionConsoleBindingDeps, 'database' | 'onActiveSubscriptionCountChanged'> & {
+    databasePath?: string;
+    /** Exact registry writer whose committed events drive live projection. */
+    registry?: SupervisionTaskRegistry;
+    /** Short, bounded foreign-writer probe; production defaults to one second. */
+    externalPollIntervalMs?: number;
+  },
 ): ProductionSupervisionConsoleBinding {
   const databasePath = deps.databasePath ?? resolveSupervisionTaskRegistryDbPath();
   const database = new DatabaseSync(databasePath);
   try {
-    // Schema bootstrap only. The process-wide registry may use another
-    // connection to this same WAL database; this object owns neither authority
-    // nor lifecycle state beyond ensuring the core schema exists.
-    new SupervisionTaskRegistry({ database });
-    const binding = createSupervisionConsoleBinding({ ...deps, database });
+    // Production uses the process-wide writer. Tests with an explicit path may
+    // inject their exact writer; otherwise this local instance is schema-only.
+    const registry = deps.registry ?? new SupervisionTaskRegistry({ database });
+    const {
+      registry: _registry,
+      databasePath: _databasePath,
+      externalPollIntervalMs: configuredPollInterval,
+      ...bindingDeps
+    } = deps;
+    const pollIntervalMs = Number.isFinite(configuredPollInterval) && (configuredPollInterval ?? 0) > 0
+      ? Math.max(1, Math.floor(configuredPollInterval!))
+      : 1_000;
+    let pollTimer: ReturnType<typeof setInterval> | undefined;
+    let pollRunning = false;
+    let busyBackoffTicks = 1;
+    let busyWaitTicks = 0;
+    let observedDataVersion = readSqliteDataVersion(database);
+    let binding: SupervisionConsoleBinding;
+
+    const stopExternalPoll = () => {
+      if (!pollTimer) return;
+      clearInterval(pollTimer);
+      pollTimer = undefined;
+      busyBackoffTicks = 1;
+      busyWaitTicks = 0;
+    };
+    const pollExternalWriters = () => {
+      if (pollRunning || binding.sessions.activeSubscriptionCount === 0) return;
+      if (busyWaitTicks > 0) { busyWaitTicks -= 1; return; }
+      pollRunning = true;
+      try {
+        const currentDataVersion = readSqliteDataVersion(database);
+        if (currentDataVersion === observedDataVersion) {
+          busyBackoffTicks = 1;
+          return;
+        }
+        // The durable cursor, not data_version, decides what is emitted. If an
+        // in-process callback already tailed the same commit this is a no-op,
+        // preserving dense, duplicate-free projection versions.
+        binding.sessions.refreshActiveSubscriptions();
+        observedDataVersion = currentDataVersion;
+        busyBackoffTicks = 1;
+      } catch (error) {
+        if (isSqliteBusy(error)) {
+          busyWaitTicks = busyBackoffTicks;
+          busyBackoffTicks = Math.min(busyBackoffTicks * 2, 16);
+        } else {
+          deps.onError?.(error);
+        }
+      } finally {
+        pollRunning = false;
+      }
+    };
+    const updateExternalPoll = (activeCount: number) => {
+      if (activeCount === 0) { stopExternalPoll(); return; }
+      if (pollTimer) return;
+      pollTimer = setInterval(pollExternalWriters, pollIntervalMs);
+      pollTimer.unref?.();
+    };
+
+    binding = createSupervisionConsoleBinding({
+      ...bindingDeps,
+      database,
+      onActiveSubscriptionCountChanged: updateExternalPoll,
+    });
+    const unsubscribe = registry.subscribeDurableEvents(() => {
+      try { binding.sessions.refreshActiveSubscriptions(); }
+      catch (error) { deps.onError?.(error); }
+    });
     return {
       ...binding,
       databasePath,
-      close: () => { database.close(); },
+      close: () => { stopExternalPoll(); unsubscribe(); database.close(); },
     };
   } catch (error) {
     database.close();
     throw error;
   }
+}
+
+function readSqliteDataVersion(database: DatabaseSync): number {
+  const row = database.prepare('PRAGMA data_version').get() as { data_version?: unknown } | undefined;
+  return typeof row?.data_version === 'number' ? row.data_version : 0;
+}
+
+function isSqliteBusy(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const code = (error as { code?: unknown }).code;
+  if (code === 'SQLITE_BUSY' || code === 'SQLITE_LOCKED') return true;
+  const message = (error as { message?: unknown }).message;
+  return typeof message === 'string' && /database is (?:busy|locked)/i.test(message);
 }

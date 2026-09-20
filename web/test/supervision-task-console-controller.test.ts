@@ -324,6 +324,23 @@ describe('SupervisionTaskConsoleController', () => {
     ))).toBe(false);
   });
 
+  it('retries stale daemon sync with one explicit full-snapshot subscription', () => {
+    const socket = new FakeSocket();
+    const controller = new SupervisionTaskConsoleController(socket, SCOPE);
+    controller.start();
+    controller.setConnected(true);
+    const initial = latest<{ subscriptionId: string }>(socket, SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE);
+    socket.emit(snapshot(initial.subscriptionId));
+    socket.emit({ type: DAEMON_MSG.DISCONNECTED });
+    expect(controller.getState().syncState).toBe('stale');
+
+    controller.retry();
+    const retry = latest<{ subscriptionId: string; afterEventId: number | null }>(socket, SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE);
+    expect(retry.subscriptionId).not.toBe(initial.subscriptionId);
+    expect(retry.afterEventId).toBeNull();
+    expect(controller.getState().syncState).toBe('connecting');
+  });
+
   it('renders the last authoritative snapshot immediately after an unmount and revalidates in background', () => {
     const firstSocket = new FakeSocket();
     const first = new SupervisionTaskConsoleController(firstSocket, SCOPE, AUTHORITY);

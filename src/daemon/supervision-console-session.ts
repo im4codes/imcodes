@@ -28,6 +28,8 @@ export interface SupervisionConsoleSessionDeps {
   authorize: (scope: SupervisionTaskConsoleScope) => boolean;
   now?: () => number;
   onError?: (error: unknown) => void;
+  /** Drives production-only polling while at least one authorized view is open. */
+  onActiveSubscriptionCountChanged?: (count: number) => void;
 }
 
 interface ActiveSubscription {
@@ -70,6 +72,8 @@ export class SupervisionConsoleSessionRegistry {
   /** Subscribes refused for authorization. Exposed so tests can prove silence. */
   get refusedCount(): number { return this.#refused; }
 
+  get activeSubscriptionCount(): number { return this.#subscriptions.size; }
+
   activeSubscriptionId(scope: SupervisionTaskConsoleScope): string | undefined {
     return this.#subscriptions.get(scopeKey(scope))?.subscriptionId;
   }
@@ -103,12 +107,22 @@ export class SupervisionConsoleSessionRegistry {
     }
     // A newer subscribe supersedes the previous one for this scope, which is
     // what makes a late snapshot from the old one droppable at the browser.
+    const countBefore = this.#subscriptions.size;
     this.#subscriptions.set(scopeKey(scope), { subscriptionId, scope });
+    if (this.#subscriptions.size !== countBefore) {
+      this.#deps.onActiveSubscriptionCountChanged?.(this.#subscriptions.size);
+    }
 
     const afterEventId = typeof record.afterEventId === 'number' && Number.isFinite(record.afterEventId)
       ? record.afterEventId
       : null;
     try {
+      // Recover any registry commit whose low-latency notification was missed
+      // before deciding whether this client needs a snapshot or replay.
+      // Do not broadcast during subscribe catch-up: a full-snapshot client is
+      // not ready for deltas yet, while a resume client is replayed below from
+      // the just-written outbox in exact order.
+      this.#deps.producer.synchronizeDurableEvents(scope, { deliver: false });
       if (afterEventId === null) return this.#sendSnapshot(scope, subscriptionId);
 
       const clientVersion = typeof record.projectionVersion === 'number' ? record.projectionVersion : 0;
@@ -177,6 +191,7 @@ export class SupervisionConsoleSessionRegistry {
     const active = this.#subscriptions.get(scopeKey(scope));
     if (active && active.subscriptionId === record.subscriptionId) {
       this.#subscriptions.delete(scopeKey(scope));
+      this.#deps.onActiveSubscriptionCountChanged?.(this.#subscriptions.size);
     }
     return true;
   }
@@ -209,5 +224,12 @@ export class SupervisionConsoleSessionRegistry {
     const active = this.#subscriptions.get(scopeKey(delta.scope));
     if (!active) return;
     this.#deps.send({ ...delta, subscriptionId: active.subscriptionId });
+  }
+
+  /** Project newly committed registry events for every currently viewed scope. */
+  refreshActiveSubscriptions(): void {
+    for (const subscription of this.#subscriptions.values()) {
+      this.#deps.producer.synchronizeDurableEvents(subscription.scope);
+    }
   }
 }

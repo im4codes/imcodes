@@ -27,7 +27,7 @@ export function useSupervisionTaskConsole(input: {
   userId: string;
   serverId: string;
   scope: SupervisionTaskConsoleScope;
-}): SupervisionTaskConsoleReducerState {
+}): { state: SupervisionTaskConsoleReducerState; retry: () => void } {
   const scopeKey = `${input.userId}\u0000${input.serverId}\u0000${input.scope.projectName}\u0000${input.scope.coordinatorSessionName}`;
   const authority = useMemo<SupervisionTaskConsoleAuthority>(() => ({
     userId: input.userId,
@@ -67,5 +67,8 @@ export function useSupervisionTaskConsole(input: {
     controller?.setConnected(input.connected);
   }, [controller, input.connected]);
 
-  return state;
+  return {
+    state,
+    retry: () => { controller?.retry(); },
+  };
 }

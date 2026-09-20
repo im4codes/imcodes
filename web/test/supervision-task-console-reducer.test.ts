@@ -118,8 +118,28 @@ describe('supervision task console reducer', () => {
     });
     expect(disconnected).toMatchObject({
       phase: SUPERVISION_TASK_CONSOLE_PHASE.ERROR,
+      syncState: 'error',
       error: 'transport_disconnected',
     });
+  });
+
+  it('marks cached authoritative rows stale on disconnect and fresh on the next snapshot', () => {
+    const current = readyState();
+    const stale = supervisionTaskConsoleReducer(current, { type: 'transport_disconnected' });
+    expect(stale).toMatchObject({
+      phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+      syncState: 'stale',
+      lastSyncedAt: 30,
+    });
+    expect(stale.tasks).toEqual(current.tasks);
+
+    const reconnecting = supervisionTaskConsoleReducer(stale, {
+      type: 'subscribe_started', subscriptionId: 'subscription-1',
+    });
+    const synced = supervisionTaskConsoleReducer(reconnecting, {
+      type: 'snapshot_received', payload: snapshot(), receivedAt: 99,
+    });
+    expect(synced).toMatchObject({ syncState: 'synced', lastSyncedAt: 99 });
   });
 
   it('hydrates an authoritative snapshot and replaces it after daemon restart', () => {
@@ -232,6 +252,7 @@ describe('supervision task console reducer', () => {
       payload,
     });
     expect(next.phase).toBe(SUPERVISION_TASK_CONSOLE_PHASE.RESYNCING);
+    expect(next.syncState).toBe('connecting');
     expect(next.resyncReason).toBe('status_contract_mismatch');
   });
 

@@ -202,6 +202,14 @@ export interface SupervisionStateStoreOptions {
     => readonly PersistedSupervisionTaskAssignmentIdentity[];
 }
 
+/**
+ * Notification that an authoritative registry event became observable.
+ *
+ * The event row remains the durable authority. Consumers must re-read it from
+ * SQLite; this callback is only the low-latency edge that avoids polling.
+ */
+export type SupervisionDurableEventListener = (eventId: number) => void;
+
 export interface SupervisionWaitStateStore {
   close(): void;
   upsert(state: PersistedSupervisionWaitState): void;
@@ -1881,6 +1889,7 @@ export class SupervisionTaskRegistry {
   readonly #db: DatabaseSyncInstance;
   readonly #ownsDb: boolean;
   readonly #resolveLiveParticipants?: SupervisionStateStoreOptions['resolveLiveParticipants'];
+  readonly #durableEventListeners = new Set<SupervisionDurableEventListener>();
   #closed = false;
 
   constructor(options: SupervisionStateStoreOptions = {}) {
@@ -2175,7 +2184,22 @@ export class SupervisionTaskRegistry {
   }
 
 
-  close(): void { if (this.#ownsDb && !this.#closed) this.#db.close(); this.#closed = true; }
+  close(): void {
+    if (this.#ownsDb && !this.#closed) this.#db.close();
+    this.#closed = true;
+    this.#durableEventListeners.clear();
+  }
+
+  /**
+   * Subscribe to committed registry activity without making the callback an
+   * authority boundary. Delivery is queued until the current synchronous
+   * registry transaction has committed (or rolled back); consumers then tail
+   * the durable table and safely ignore a rolled-back id.
+   */
+  subscribeDurableEvents(listener: SupervisionDurableEventListener): () => void {
+    this.#durableEventListeners.add(listener);
+    return () => { this.#durableEventListeners.delete(listener); };
+  }
 
   /**
    * Reuse the already-durable AUTOINCREMENT sequence of the event that the
@@ -2212,8 +2236,17 @@ export class SupervisionTaskRegistry {
   }
 
   #appendEvent(taskId: string, assignmentId: string | undefined, eventType: import('../../shared/supervision-config.js').SupervisionTaskRegistryEventType, status: import('../../shared/supervision-config.js').SupervisionTaskLifecycleStatus, payload: Record<string, unknown> | undefined, now: number): void {
-    this.#db.prepare(`INSERT INTO supervision_task_events (task_id, assignment_id, event_type, status, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
+    const inserted = this.#db.prepare(`INSERT INTO supervision_task_events (task_id, assignment_id, event_type, status, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
       .run(taskId, assignmentId ?? null, eventType, status, payload ? JSON.stringify(payload) : null, now);
+    const eventId = Number(inserted.lastInsertRowid);
+    if (this.#durableEventListeners.size > 0) {
+      queueMicrotask(() => {
+        if (this.#closed) return;
+        for (const listener of this.#durableEventListeners) {
+          try { listener(eventId); } catch { /* the durable writer cannot be failed by a projection */ }
+        }
+      });
+    }
   }
 
   /**

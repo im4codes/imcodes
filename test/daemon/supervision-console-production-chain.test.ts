@@ -154,7 +154,7 @@ describe('browser -> server bridge -> daemon registry -> browser task-console ch
           expect.objectContaining({
             type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT,
             scope,
-            projectionVersion: 0,
+            projectionVersion: 1,
             tasks: [expect.objectContaining({
               taskId: 'task-chain', status: 'ready_for_integration',
               currentRevision: 'current-r2',

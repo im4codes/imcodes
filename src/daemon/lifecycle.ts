@@ -86,7 +86,10 @@ import {
   isAuthorizedSupervisionConsoleScope,
   type SupervisionConsoleBinding,
 } from './supervision-console-binding.js';
-import { setSupervisionLiveParticipantsResolver } from './supervision-state-store.js';
+import {
+  getSupervisionTaskRegistry,
+  setSupervisionLiveParticipantsResolver,
+} from './supervision-state-store.js';
 import { resolveLiveSupervisionParticipants } from './supervision-brain-authority.js';
 import {
   acquireInstanceLock,
@@ -1398,6 +1401,7 @@ export async function startup(): Promise<DaemonContext> {
     if (!serverLink) throw new Error('no server link');
     supervisionConsole = createProductionSupervisionConsoleBinding({
       serverLink,
+      registry: getSupervisionTaskRegistry(),
       // Only the coordinator that owns a project scope may subscribe to it.
       authorize: (scope) => isAuthorizedSupervisionConsoleScope(scope, listSessions()),
       resolveSessionPresentation: (sessionName, durableObservedAt) => {

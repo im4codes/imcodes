@@ -1,5 +1,6 @@
 import {
   SUPERVISION_TASK_CONSOLE_PHASE,
+  SUPERVISION_TASK_CONSOLE_SYNC_STATE,
   type SupervisionTaskConsoleReducerState,
 } from './supervision-task-console-reducer.js';
 
@@ -34,6 +35,7 @@ function snapshotForCache(state: SupervisionTaskConsoleReducerState): Supervisio
     subscriptionId: null,
     phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
     syncing: false,
+    syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.STALE,
     resyncReason: null,
     error: null,
   };

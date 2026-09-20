@@ -362,6 +362,7 @@ export function SupervisionTaskConsoleView(props: {
   maxWidth?: number;
   onResizeStart?: (event: PointerEvent) => void;
   onResizeKeyDown?: (event: KeyboardEvent) => void;
+  onRetry?: () => void;
   onClose: () => void;
   onNavigateSession: (sessionName: string) => void;
   returnFocusRef?: RefObject<HTMLButtonElement>;
@@ -472,10 +473,16 @@ export function SupervisionTaskConsoleView(props: {
         <button ref={closeRef} type="button" class="supervision-task-console-close" onClick={closeAndReturnFocus} aria-label={t('common.close')}>×</button>
       </header>
       {!props.readOnly && props.mutationControls}
-      <div class="supervision-task-console-cursor" aria-live="polite">
+      <div class="supervision-task-console-cursor" aria-live="polite" data-sync-state={props.state.syncState}>
         <span>{t('supervision_task_console.projection', { version: props.state.projectionVersion })}</span>
         <span>{t('supervision_task_console.event', { id: props.state.lastDurableEventId ?? '—' })}</span>
-        {props.state.syncing && <span class="supervision-task-console-sync" role="status">{t('supervision_task_console.recovering')}</span>}
+        <span class="supervision-task-console-sync" role={props.state.syncState === 'error' ? 'alert' : 'status'}>
+          {props.state.syncState === 'synced' && props.state.lastSyncedAt !== null
+            ? t('supervision_task_console.sync_synced', { time: safeTimestamp(props.state.lastSyncedAt, language) })
+            : t(`supervision_task_console.sync_${props.state.syncState}`)}
+        </span>
+        {(props.state.syncState === 'stale' || props.state.syncState === 'error') && props.onRetry
+          && <button type="button" class="supervision-task-console-retry" onClick={props.onRetry}>{t('supervision_task_console.retry')}</button>}
       </div>
       {bodyState === 'ready' && <div class="supervision-task-console-tabs" role="tablist" aria-label={t('supervision_task_console.tabs_label')}>
         <button ref={activeTabRef} type="button" role="tab" id="task-console-tab-active" aria-selected={activeTab === 'active'} aria-controls="task-console-panel-active" tabIndex={activeTab === 'active' ? 0 : -1} onKeyDown={(event) => onTabKeyDown(event, 'active')} onClick={() => setActiveTab('active')}>{t('supervision_task_console.tab_active')} <span>{activeTasks.length}</span></button>
@@ -526,7 +533,7 @@ export function SupervisionTaskConsole(props: {
 }) {
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
   const [width, setWidth] = useState(() => loadSupervisionTaskConsolePreferences(supervisionTaskConsolePreferenceBounds(window.innerWidth)).width);
-  const state = useSupervisionTaskConsole({
+  const { state, retry } = useSupervisionTaskConsole({
     ws: props.ws,
     connected: props.connected,
     userId: props.userId,
@@ -560,7 +567,7 @@ export function SupervisionTaskConsole(props: {
   return <SupervisionTaskConsoleView
     state={state} mobile={props.mobile} readOnly={props.readOnly} width={width}
     maxWidth={supervisionConsoleMaxWidth(viewportWidth)} onResizeStart={startResize}
-    onResizeKeyDown={resizeWithKeyboard} onClose={props.onClose}
+    onResizeKeyDown={resizeWithKeyboard} onRetry={retry} onClose={props.onClose}
     onNavigateSession={props.onNavigateSession} returnFocusRef={props.returnFocusRef}
   />;
 }

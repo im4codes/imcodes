@@ -449,6 +449,46 @@ describe('SupervisionTaskConsole', () => {
     expect(screen.queryByText('supervision_task_console.loading')).toBeNull();
   });
 
+  it('shows explicit synced/stale/error health and offers an accessible retry', () => {
+    const retry = vi.fn();
+    const view = render(
+      <SupervisionTaskConsoleView
+        state={state({ syncState: 'synced', lastSyncedAt: NOW })}
+        mobile={false}
+        onRetry={retry}
+        onClose={() => {}}
+        onNavigateSession={() => {}}
+      />,
+    );
+    expect(document.querySelector('[data-sync-state="synced"]')).not.toBeNull();
+    expect(screen.queryByRole('button', { name: 'supervision_task_console.retry' })).toBeNull();
+
+    view.rerender(
+      <SupervisionTaskConsoleView
+        state={state({ syncState: 'stale', lastSyncedAt: NOW, error: 'transport_disconnected' })}
+        mobile={false}
+        onRetry={retry}
+        onClose={() => {}}
+        onNavigateSession={() => {}}
+      />,
+    );
+    expect(document.querySelector('[data-sync-state="stale"]')).not.toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'supervision_task_console.retry' }));
+    expect(retry).toHaveBeenCalledTimes(1);
+
+    view.rerender(
+      <SupervisionTaskConsoleView
+        state={state({ phase: SUPERVISION_TASK_CONSOLE_PHASE.ERROR, syncState: 'error', error: 'transport_disconnected' })}
+        mobile={false}
+        onRetry={retry}
+        onClose={() => {}}
+        onNavigateSession={() => {}}
+      />,
+    );
+    expect(screen.getByText('supervision_task_console.error')).toBeTruthy();
+    expect(document.querySelector('[data-sync-state="error"]')).not.toBeNull();
+  });
+
   it('suppresses mutation controls for viewers while retaining them for participants', () => {
     const mutationControl = <button type="button">mutate-task</button>;
     const view = render(
@@ -527,13 +567,13 @@ describe('SupervisionTaskConsole', () => {
   it('sorts pending tasks by task activity rather than a shared session running elsewhere', () => {
     const tasks = [
       {
-        taskId: 'older-pending', title: 'Older pending', status: 'ready_for_audit' as const,
-        phase: 'audit' as const, validationState: 'pending' as const,
+        taskId: 'older-pending', title: 'Older pending', status: 'ready_for_integration' as const,
+        phase: 'integration' as const, validationState: 'pending' as const,
         updatedAt: 10, lastEventId: 1,
       },
       {
-        taskId: 'newer-pending', title: 'Newer pending', status: 'ready_for_audit' as const,
-        phase: 'audit' as const, validationState: 'pending' as const,
+        taskId: 'newer-pending', title: 'Newer pending', status: 'ready_for_integration' as const,
+        phase: 'integration' as const, validationState: 'pending' as const,
         updatedAt: 20, lastEventId: 2,
       },
     ];
@@ -808,7 +848,7 @@ describe('SupervisionTaskConsole', () => {
     expect(screen.queryByText('Still auditing')).toBeNull();
   });
 
-  it('reduces the production-shaped 126 active count to ten and isolates pending runtime appearance', () => {
+  it('classifies the production-shaped projection and isolates pending runtime appearance', () => {
     const statusCounts = [
       ['planned', 48],
       ['delegated', 19],
@@ -857,15 +897,17 @@ describe('SupervisionTaskConsole', () => {
       onNavigateSession={() => {}}
     />);
 
-    expect(screen.getByRole('tab', { name: /supervision_task_console\.tab_active 10/ })).toBeTruthy();
-    expect(screen.getByRole('tab', { name: /supervision_task_console\.tab_pending 118/ })).toBeTruthy();
+    expect(screen.getByRole('tab', { name: /supervision_task_console\.tab_active 32/ })).toBeTruthy();
+    expect(screen.getByRole('tab', { name: /supervision_task_console\.tab_pending 96/ })).toBeTruthy();
     expect(screen.getByRole('tab', { name: /supervision_task_console\.tab_history 0/ })).toBeTruthy();
-    expect(screen.getAllByTestId(/task-card-/)).toHaveLength(10);
-    expect(screen.getAllByTestId(/task-card-/).every((card) => card.getAttribute('data-status') === 'implementing')).toBe(true);
+    expect(screen.getAllByTestId(/task-card-/)).toHaveLength(32);
+    expect(screen.getAllByTestId(/task-card-/).every((card) => (
+      ['implementing', 'ready_for_audit', 'rework'].includes(card.getAttribute('data-status') ?? '')
+    ))).toBe(true);
 
-    fireEvent.click(screen.getByRole('tab', { name: /supervision_task_console\.tab_pending 118/ }));
+    fireEvent.click(screen.getByRole('tab', { name: /supervision_task_console\.tab_pending 96/ }));
     const pendingCards = screen.getAllByTestId(/task-card-/);
-    expect(pendingCards).toHaveLength(118);
+    expect(pendingCards).toHaveLength(96);
     expect(pendingCards.every((card) => !['running', 'audit-running'].includes(card.getAttribute('data-activity-state') ?? ''))).toBe(true);
     expect(pendingCards.every((card) => !card.textContent?.includes('supervision_task_console.session_state.running'))).toBe(true);
     expect(Array.from(document.querySelectorAll('.supervision-task-console-session')).every((row) => (
@@ -1015,7 +1057,7 @@ describe('SupervisionTaskConsole', () => {
       />,
     );
 
-    expect(screen.getByRole('status').textContent).toBe('supervision_task_console.recovering');
+    expect(screen.getByRole('status').textContent).toBe('supervision_task_console.sync_connecting');
     expect(screen.getByText('Build live task console')).toBeTruthy();
     expect(screen.queryByText('supervision_task_console.loading')).toBeNull();
   });
@@ -1040,14 +1082,14 @@ describe('SupervisionTaskConsole', () => {
         onNavigateSession={() => {}}
       />,
     );
-    const activeStatuses = ['implementing', 'retrying_external_ci', 'auditing', 'integrating', 'final_audit', 'finalizing'];
-    const pendingStatuses = ['planned', 'delegated', 'validated', 'ready_for_audit', 'rework', 'passed', 'ready_for_integration', 'blocked'];
+    const activeStatuses = ['implementing', 'retrying_external_ci', 'ready_for_audit', 'auditing', 'rework', 'integrating', 'final_audit', 'finalizing'];
+    const pendingStatuses = ['planned', 'delegated', 'validated', 'passed', 'ready_for_integration', 'blocked'];
     const historyStatuses = ['committed', 'pushed', 'recovered', 'finalized', 'cancelled'];
-    expect(screen.getByRole('tab', { name: /supervision_task_console\.tab_active 6/ })).toBeTruthy();
+    expect(screen.getByRole('tab', { name: /supervision_task_console\.tab_active 8/ })).toBeTruthy();
     for (const status of activeStatuses) {
       expect(screen.getByText(`supervision_task_console.status.${status}`)).toBeTruthy();
     }
-    fireEvent.click(screen.getByRole('tab', { name: /supervision_task_console\.tab_pending 8/ }));
+    fireEvent.click(screen.getByRole('tab', { name: /supervision_task_console\.tab_pending 6/ }));
     for (const status of pendingStatuses) {
       expect(screen.getByText(`supervision_task_console.status.${status}`)).toBeTruthy();
     }

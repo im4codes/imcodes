@@ -30,12 +30,23 @@ export const SUPERVISION_TASK_CONSOLE_PHASE = {
 export type SupervisionTaskConsolePhase =
   typeof SUPERVISION_TASK_CONSOLE_PHASE[keyof typeof SUPERVISION_TASK_CONSOLE_PHASE];
 
+export const SUPERVISION_TASK_CONSOLE_SYNC_STATE = {
+  CONNECTING: 'connecting',
+  SYNCED: 'synced',
+  STALE: 'stale',
+  ERROR: 'error',
+} as const;
+export type SupervisionTaskConsoleSyncState =
+  typeof SUPERVISION_TASK_CONSOLE_SYNC_STATE[keyof typeof SUPERVISION_TASK_CONSOLE_SYNC_STATE];
+
 export interface SupervisionTaskConsoleReducerState {
   scope: SupervisionTaskConsoleScope;
   subscriptionId: string | null;
   phase: SupervisionTaskConsolePhase;
   hasAuthoritativeSnapshot: boolean;
   syncing: boolean;
+  syncState: SupervisionTaskConsoleSyncState;
+  lastSyncedAt: number | null;
   schemaVersion: number;
   statusContractVersion: number;
   projectionVersion: number;
@@ -59,8 +70,8 @@ export interface SupervisionTaskConsoleEventEvidence {
 export type SupervisionTaskConsoleReducerAction =
   | { type: 'scope_changed'; scope: SupervisionTaskConsoleScope }
   | { type: 'subscribe_started'; subscriptionId: string }
-  | { type: 'snapshot_received'; payload: unknown }
-  | { type: 'delta_received'; payload: unknown }
+  | { type: 'snapshot_received'; payload: unknown; receivedAt?: number }
+  | { type: 'delta_received'; payload: unknown; receivedAt?: number }
   | { type: 'server_resync_required'; reason: SupervisionConsoleResyncReason }
   | { type: 'transport_error'; error: string }
   | { type: 'authority_invalidated'; error: string }
@@ -130,6 +141,7 @@ function requestResync(
       ? SUPERVISION_TASK_CONSOLE_PHASE.READY
       : SUPERVISION_TASK_CONSOLE_PHASE.RESYNCING,
     syncing: true,
+    syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.CONNECTING,
     resyncReason: reason,
     resyncGeneration: state.resyncGeneration + 1,
     error: null,
@@ -146,6 +158,8 @@ export function createSupervisionTaskConsoleState(
     phase: SUPERVISION_TASK_CONSOLE_PHASE.IDLE,
     hasAuthoritativeSnapshot: false,
     syncing: false,
+    syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.CONNECTING,
+    lastSyncedAt: null,
     schemaVersion: cursor.schemaVersion,
     statusContractVersion: cursor.statusContractVersion,
     projectionVersion: cursor.projectionVersion,
@@ -164,6 +178,7 @@ export function createSupervisionTaskConsoleState(
 function applySnapshot(
   state: SupervisionTaskConsoleReducerState,
   snapshot: SupervisionTaskConsoleSnapshot,
+  receivedAt: number,
 ): SupervisionTaskConsoleReducerState {
   if (!sameScope(state.scope, snapshot.scope)) {
     return requestResync(state, 'scope_mismatch');
@@ -191,6 +206,8 @@ function applySnapshot(
     phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
     hasAuthoritativeSnapshot: true,
     syncing: false,
+    syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.SYNCED,
+    lastSyncedAt: receivedAt,
     schemaVersion: snapshot.schemaVersion,
     statusContractVersion: snapshot.statusContractVersion,
     projectionVersion: snapshot.projectionVersion,
@@ -208,6 +225,7 @@ function applySnapshot(
 function applyDelta(
   state: SupervisionTaskConsoleReducerState,
   delta: SupervisionTaskConsoleDelta,
+  receivedAt: number,
 ): SupervisionTaskConsoleReducerState {
   if (state.phase !== SUPERVISION_TASK_CONSOLE_PHASE.READY) {
     return requestResync(state, 'cursor_unknown');
@@ -262,7 +280,7 @@ function applyDelta(
     case 'pools_update':
       break;
   }
-  const pools = delta.op === 'pools_update' ? (delta.pools ?? []) : state.pools;
+  const pools = delta.pools ?? state.pools;
   if (!indexUnique(pools, (pool) => pool.poolId) || !assignmentsReferenceKnownTasks(assignments, tasks)) {
     return requestResync(state, 'cursor_unknown');
   }
@@ -279,6 +297,8 @@ function applyDelta(
     projectionEpoch: delta.projectionEpoch,
     hasAuthoritativeSnapshot: true,
     syncing: false,
+    syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.SYNCED,
+    lastSyncedAt: receivedAt,
     tasks,
     assignments,
     eventsByTask,
@@ -303,6 +323,7 @@ export function supervisionTaskConsoleReducer(
           ? SUPERVISION_TASK_CONSOLE_PHASE.READY
           : SUPERVISION_TASK_CONSOLE_PHASE.SUBSCRIBING,
         syncing: true,
+        syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.CONNECTING,
         error: null,
       };
     case 'snapshot_received':
@@ -313,7 +334,7 @@ export function supervisionTaskConsoleReducer(
           ? 'status_contract_mismatch'
           : 'cursor_unknown');
       }
-      return applySnapshot(state, action.payload);
+      return applySnapshot(state, action.payload, action.receivedAt ?? action.payload.generatedAt);
     case 'delta_received':
       if (isStaleProjection(state, action.payload)) return state;
       if (!isValidSupervisionTaskConsoleEvent(action.payload)
@@ -322,7 +343,7 @@ export function supervisionTaskConsoleReducer(
           ? 'status_contract_mismatch'
           : 'cursor_unknown');
       }
-      return applyDelta(state, action.payload);
+      return applyDelta(state, action.payload, action.receivedAt ?? state.lastSyncedAt ?? 0);
     case 'server_resync_required':
       return requestResync(state, action.reason);
     case 'transport_error':
@@ -332,12 +353,16 @@ export function supervisionTaskConsoleReducer(
           ? SUPERVISION_TASK_CONSOLE_PHASE.READY
           : SUPERVISION_TASK_CONSOLE_PHASE.ERROR,
         syncing: false,
+        syncState: state.hasAuthoritativeSnapshot
+          ? SUPERVISION_TASK_CONSOLE_SYNC_STATE.STALE
+          : SUPERVISION_TASK_CONSOLE_SYNC_STATE.ERROR,
         error: action.error,
       };
     case 'authority_invalidated':
       return {
         ...createSupervisionTaskConsoleState(state.scope),
         phase: SUPERVISION_TASK_CONSOLE_PHASE.ERROR,
+        syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.ERROR,
         error: action.error,
       };
     case 'transport_disconnected':
@@ -347,6 +372,9 @@ export function supervisionTaskConsoleReducer(
           ? SUPERVISION_TASK_CONSOLE_PHASE.READY
           : SUPERVISION_TASK_CONSOLE_PHASE.ERROR,
         syncing: false,
+        syncState: state.hasAuthoritativeSnapshot
+          ? SUPERVISION_TASK_CONSOLE_SYNC_STATE.STALE
+          : SUPERVISION_TASK_CONSOLE_SYNC_STATE.ERROR,
         error: 'transport_disconnected',
       };
   }

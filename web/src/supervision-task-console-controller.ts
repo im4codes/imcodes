@@ -150,6 +150,15 @@ export class SupervisionTaskConsoleController {
     this.requestSubscription('initial', false);
   }
 
+  /** Explicit user recovery after stale/error sync state. */
+  retry(): void {
+    if (!this.connected) {
+      this.apply({ type: 'transport_disconnected' });
+      return;
+    }
+    this.requestSubscription('initial', true);
+  }
+
   private emit(): void {
     for (const listener of this.listeners) listener(this.state);
   }
@@ -248,11 +257,11 @@ export class SupervisionTaskConsoleController {
       return;
     }
     if (message.type === SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT) {
-      this.apply({ type: 'snapshot_received', payload: message });
+      this.apply({ type: 'snapshot_received', payload: message, receivedAt: Date.now() });
       return;
     }
     if (message.type === SUPERVISION_TASK_CONSOLE_MSG.DELTA) {
-      this.apply({ type: 'delta_received', payload: message });
+      this.apply({ type: 'delta_received', payload: message, receivedAt: Date.now() });
     }
   }
 }

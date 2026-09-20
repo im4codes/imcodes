@@ -243,9 +243,9 @@ export const SUPERVISION_CONSOLE_TAB_BY_STATUS: Readonly<Record<
   implementing: 'active',
   retrying_external_ci: 'active',
   validated: 'pending',
-  ready_for_audit: 'pending',
+  ready_for_audit: 'active',
   auditing: 'active',
-  rework: 'pending',
+  rework: 'active',
   passed: 'pending',
   ready_for_integration: 'pending',
   integrating: 'active',
@@ -768,6 +768,8 @@ export function isValidSupervisionTaskConsoleEvent(
         && Array.isArray(value.pools) && value.pools.every(isPoolRow);
     case SUPERVISION_TASK_CONSOLE_MSG.DELTA: {
       if (!isFiniteNumber(value.eventId)) return false;
+      if (value.pools !== undefined
+        && (!Array.isArray(value.pools) || !value.pools.every(isPoolRow))) return false;
       if (typeof value.op !== 'string'
         || !(SUPERVISION_CONSOLE_DELTA_OPS as readonly string[]).includes(value.op)) return false;
       switch (value.op as SupervisionConsoleDeltaOp) {

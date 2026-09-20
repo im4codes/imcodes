@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   createProductionSupervisionConsoleBinding, createSupervisionConsoleBinding,
   isAuthorizedSupervisionConsoleScope, resolveSupervisionProjectionEpoch,
@@ -143,6 +143,29 @@ describe('scope authorization', () => {
 });
 
 describe('producer -> link -> browser E2E', () => {
+  it('live-projects a real in-memory registry write without reopening the panel', async () => {
+    const registry = new SupervisionTaskRegistry({ database: db });
+    const unsubscribe = registry.subscribeDurableEvents(() => {
+      binding.sessions.refreshActiveSubscriptions();
+    });
+    try {
+      toDaemon(browser.subscribeFrame(null));
+      expect(registry.createOrGet({
+        taskId: 'task-from-real-registry',
+        projectName: SCOPE.projectName,
+        objective: 'real registry event',
+      }).ok).toBe(true);
+      await new Promise<void>((resolve) => queueMicrotask(resolve));
+      expect(browser.applied).toEqual([1]);
+      expect(browser.rejected).toBe(0);
+      expect(binding.producer.buildSnapshot(SCOPE, 'verify').tasks)
+        .toContainEqual(expect.objectContaining({ taskId: 'task-from-real-registry' }));
+    } finally {
+      unsubscribe();
+      registry.close();
+    }
+  });
+
   it('hydrates a snapshot the browser validator accepts, then applies live deltas', () => {
     toDaemon(browser.subscribeFrame(null));
     expect(browser.rejected).toBe(0);
@@ -343,6 +366,155 @@ describe('production registry database composition', () => {
       });
       production.close();
     } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('bootstraps a nonzero cursor and live-projects subsequent real registry writes', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-console-live-registry-'));
+    const databasePath = join(dir, 'supervision-state.sqlite');
+    const sent: unknown[] = [];
+    const handlers: Array<(message: unknown) => void> = [];
+    const registry = new SupervisionTaskRegistry({ dbPath: databasePath });
+    try {
+      expect(registry.createOrGet({
+        taskId: 'task-existing-write',
+        projectName: SCOPE.projectName,
+        objective: 'bootstraps the durable cursor',
+      }).ok).toBe(true);
+      const production = createProductionSupervisionConsoleBinding({
+        databasePath,
+        registry,
+        serverLink: {
+          send: (message) => { sent.push(message); },
+          onMessage: (handler) => { handlers.push(handler); },
+        },
+        authorize: () => true,
+        now: () => 7,
+        newEpoch: () => 'production-epoch',
+      });
+      handlers[0]?.({
+        type: SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE,
+        subscriptionId: 'sub-live',
+        scope: SCOPE,
+        afterEventId: null,
+        reason: 'initial',
+      });
+      expect(sent[0]).toMatchObject({
+        type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT,
+        projectionVersion: 1,
+      });
+
+      expect(registry.createOrGet({
+        taskId: 'task-live-write',
+        projectName: SCOPE.projectName,
+        objective: 'appears without reopening the panel',
+      }).ok).toBe(true);
+      await new Promise<void>((resolve) => queueMicrotask(resolve));
+
+      expect(sent).toContainEqual(expect.objectContaining({
+        type: SUPERVISION_TASK_CONSOLE_MSG.DELTA,
+        subscriptionId: 'sub-live',
+        projectionVersion: 2,
+        task: expect.objectContaining({
+          taskId: 'task-live-write',
+          title: 'appears without reopening the panel',
+        }),
+      }));
+      production.close();
+    } finally {
+      registry.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('tails a second registry connection exactly once and stops the probe with the last subscriber', async () => {
+    vi.useFakeTimers();
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-console-foreign-writer-'));
+    const databasePath = join(dir, 'supervision-state.sqlite');
+    const sent: unknown[] = [];
+    const handlers: Array<(message: unknown) => void> = [];
+    const daemonRegistry = new SupervisionTaskRegistry({ dbPath: databasePath });
+    const foreignRegistry = new SupervisionTaskRegistry({ dbPath: databasePath });
+    let production: ReturnType<typeof createProductionSupervisionConsoleBinding> | undefined;
+    try {
+      expect(daemonRegistry.createOrGet({
+        taskId: 'task-existing', projectName: SCOPE.projectName, objective: 'baseline',
+      }).ok).toBe(true);
+      production = createProductionSupervisionConsoleBinding({
+        databasePath,
+        registry: daemonRegistry,
+        externalPollIntervalMs: 1_000,
+        serverLink: {
+          send: (message) => { sent.push(message); },
+          onMessage: (handler) => { handlers.push(handler); },
+        },
+        authorize: () => true,
+        now: () => 7,
+        newEpoch: () => 'production-epoch',
+      });
+      const subscribe = (subscriptionId: string) => handlers[0]?.({
+        type: SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE,
+        subscriptionId,
+        scope: SCOPE,
+        afterEventId: null,
+        reason: 'initial',
+      });
+      subscribe('sub-foreign-1');
+      expect(vi.getTimerCount()).toBe(1);
+      // Replacing the same scoped subscription must not leak a second timer.
+      subscribe('sub-foreign-2');
+      expect(vi.getTimerCount()).toBe(1);
+      sent.length = 0;
+
+      expect(foreignRegistry.createOrGet({
+        taskId: 'task-from-mcp-process',
+        projectName: SCOPE.projectName,
+        objective: 'foreign sqlite connection',
+      }).ok).toBe(true);
+      expect(sent.filter((frame: any) => frame?.type === SUPERVISION_TASK_CONSOLE_MSG.DELTA)).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(sent.filter((frame: any) => frame?.task?.taskId === 'task-from-mcp-process')).toHaveLength(1);
+
+      // The daemon listener may win the race and tail both this foreign event
+      // and its own event before the data_version timer fires. The later probe
+      // must remain a no-op rather than duplicating either projection version.
+      sent.length = 0;
+      expect(foreignRegistry.createOrGet({
+        taskId: 'task-foreign-race', projectName: SCOPE.projectName, objective: 'foreign race',
+      }).ok).toBe(true);
+      expect(daemonRegistry.createOrGet({
+        taskId: 'task-daemon-race', projectName: SCOPE.projectName, objective: 'daemon race',
+      }).ok).toBe(true);
+      await Promise.resolve();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(sent.filter((frame: any) => frame?.task?.taskId === 'task-foreign-race')).toHaveLength(1);
+      expect(sent.filter((frame: any) => frame?.task?.taskId === 'task-daemon-race')).toHaveLength(1);
+
+      handlers[0]?.({
+        type: SUPERVISION_TASK_CONSOLE_MSG.UNSUBSCRIBE,
+        subscriptionId: 'sub-foreign-1',
+        scope: SCOPE,
+      });
+      expect(vi.getTimerCount()).toBe(1);
+      handlers[0]?.({
+        type: SUPERVISION_TASK_CONSOLE_MSG.UNSUBSCRIBE,
+        subscriptionId: 'sub-foreign-2',
+        scope: SCOPE,
+      });
+      expect(vi.getTimerCount()).toBe(0);
+      sent.length = 0;
+      expect(foreignRegistry.createOrGet({
+        taskId: 'task-after-unsubscribe', projectName: SCOPE.projectName, objective: 'must remain quiet',
+      }).ok).toBe(true);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(sent).toHaveLength(0);
+    } finally {
+      production?.close();
+      foreignRegistry.close();
+      daemonRegistry.close();
+      vi.useRealTimers();
       rmSync(dir, { recursive: true, force: true });
     }
   });

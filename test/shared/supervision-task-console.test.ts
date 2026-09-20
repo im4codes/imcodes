@@ -74,12 +74,11 @@ describe('supervision task console status grouping', () => {
   it('partitions every task status exactly once into active, pending, or history', () => {
     expect(SUPERVISION_CONSOLE_TABS).toEqual(['active', 'pending', 'history']);
     expect(SUPERVISION_CONSOLE_ACTIVE_STATUSES).toEqual([
-      'implementing', 'retrying_external_ci', 'auditing', 'integrating',
+      'implementing', 'retrying_external_ci', 'ready_for_audit', 'auditing', 'rework', 'integrating',
       'final_audit', 'finalizing',
     ]);
     expect(SUPERVISION_CONSOLE_PENDING_STATUSES).toEqual([
-      'planned', 'delegated', 'validated', 'ready_for_audit', 'rework', 'passed',
-      'ready_for_integration', 'blocked',
+      'planned', 'delegated', 'validated', 'passed', 'ready_for_integration', 'blocked',
     ]);
     expect(SUPERVISION_CONSOLE_HISTORY_STATUSES).toEqual([
       'committed', 'pushed', 'recovered', 'finalized', 'cancelled',
@@ -98,7 +97,9 @@ describe('supervision task console status grouping', () => {
       expect(isSupervisionConsoleHistoryStatus(status), status).toBe(tab === 'history');
     }
     expect(supervisionConsoleTabForStatus('implementing')).toBe('active');
+    expect(supervisionConsoleTabForStatus('ready_for_audit')).toBe('active');
     expect(supervisionConsoleTabForStatus('auditing')).toBe('active');
+    expect(supervisionConsoleTabForStatus('rework')).toBe('active');
     expect(supervisionConsoleTabForStatus('ready_for_integration')).toBe('pending');
     expect(supervisionConsoleTabForStatus('blocked')).toBe('pending');
     expect(supervisionConsoleTabForStatus('cancelled')).toBe('history');

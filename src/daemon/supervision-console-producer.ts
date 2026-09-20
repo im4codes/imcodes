@@ -99,6 +99,12 @@ export interface SupervisionTaskEventInput {
   payload?: Record<string, unknown>;
 }
 
+interface DurableRegistryEventRow {
+  id: number;
+  taskId: string;
+  assignmentId?: string;
+}
+
 function readValidationState(value: unknown): SupervisionConsoleValidationState {
   return typeof value === 'string'
     && (SUPERVISION_CONSOLE_VALIDATION_STATES as readonly string[]).includes(value)
@@ -184,6 +190,130 @@ export class SupervisionConsoleProducer {
          updated_at = excluded.updated_at`,
     ).run(scope.projectName, scope.coordinatorSessionName, next, this.#epoch, eventId, this.#now());
     return next;
+  }
+
+  /**
+   * Establish an authoritative snapshot cursor without replaying years of
+   * historical lifecycle events into a new browser outbox.
+   *
+   * Version zero is reserved for a genuinely event-free registry. A populated
+   * registry starts at version one and pins the newest durable event as its
+   * baseline; every event committed after that point is projected densely.
+   */
+  ensureProjectionBaseline(scope: SupervisionTaskConsoleScope): void {
+    const existing = this.#db.prepare(
+      `SELECT 1 AS found FROM supervision_projection_state
+       WHERE project_name = ? AND coordinator_session_name = ?`,
+    ).get(scope.projectName, scope.coordinatorSessionName) as { found?: number } | undefined;
+    if (existing?.found) return;
+    const latest = this.#db.prepare(
+      `SELECT MAX(e.id) AS event_id
+       FROM supervision_task_events e
+       INNER JOIN supervision_tasks t ON t.task_id = e.task_id
+       WHERE t.project_name = ?`,
+    ).get(scope.projectName) as { event_id?: number | null } | undefined;
+    const eventId = latest?.event_id === null || latest?.event_id === undefined
+      ? null : Number(latest.event_id);
+    this.#db.prepare(
+      `INSERT OR IGNORE INTO supervision_projection_state
+        (project_name, coordinator_session_name, projection_version, projection_epoch,
+         last_durable_event_id, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(scope.projectName, scope.coordinatorSessionName, eventId === null ? 0 : 1,
+      this.#epoch, eventId, this.#now());
+  }
+
+  #readDurableRegistryEvents(
+    scope: SupervisionTaskConsoleScope,
+    afterEventId: number | null,
+  ): DurableRegistryEventRow[] {
+    const rows = this.#db.prepare(
+      `SELECT e.id, e.task_id, e.assignment_id
+       FROM supervision_task_events e
+       INNER JOIN supervision_tasks t ON t.task_id = e.task_id
+       WHERE t.project_name = ? AND e.id > ?
+       ORDER BY e.id ASC`,
+    ).all(scope.projectName, afterEventId ?? 0) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      id: Number(row.id),
+      taskId: String(row.task_id),
+      assignmentId: row.assignment_id ? String(row.assignment_id) : undefined,
+    }));
+  }
+
+  #buildDurableDelta(
+    scope: SupervisionTaskConsoleScope,
+    event: DurableRegistryEventRow,
+    projectionVersion: number,
+  ): SupervisionTaskConsoleDelta {
+    const base = {
+      type: SUPERVISION_TASK_CONSOLE_MSG.DELTA,
+      scope,
+      subscriptionId: '',
+      schemaVersion: SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
+      statusContractVersion: SUPERVISION_TASK_STATUS_CONTRACT_VERSION,
+      projectionVersion,
+      lastDurableEventId: event.id,
+      projectionEpoch: this.#epoch,
+      eventId: event.id,
+    } as SupervisionTaskConsoleDelta;
+    if (event.assignmentId) {
+      const assignment = this.readAssignmentRows(scope.projectName)
+        .find((row) => row.assignmentId === event.assignmentId);
+      if (assignment) {
+        base.op = 'assignment_upsert';
+        base.assignment = assignment;
+        // Pool occupancy changes on assignment transitions. Shipping the
+        // current pool rows with the same durable event keeps both views atomic.
+        base.pools = this.readPools(scope.projectName);
+        return base;
+      }
+      base.op = 'assignment_remove';
+      base.removedId = event.assignmentId;
+      base.pools = this.readPools(scope.projectName);
+      return base;
+    }
+    const task = this.readTaskRow(event.taskId, scope.projectName, event.id);
+    if (task) {
+      base.op = 'task_upsert';
+      base.task = task;
+    } else {
+      base.op = 'task_remove';
+      base.removedId = event.taskId;
+    }
+    return base;
+  }
+
+  /**
+   * Tail already-committed registry events into the dense projection/outbox.
+   * This closes both failure windows: the registry listener gives live pushes,
+   * while every subscribe calls this method to recover a missed callback or a
+   * daemon crash between the registry commit and projection commit.
+   */
+  synchronizeDurableEvents(
+    scope: SupervisionTaskConsoleScope,
+    options: { deliver?: boolean } = {},
+  ): number {
+    this.ensureProjectionBaseline(scope);
+    const cursor = this.restoreCursor(scope);
+    const events = this.#readDurableRegistryEvents(scope, cursor.lastDurableEventId);
+    if (events.length === 0) return 0;
+    const committed = this.#transaction(() => events.map((event) => {
+      const projectionVersion = this.#nextProjectionVersion(scope, event.id);
+      const frame = this.#buildDurableDelta(scope, event, projectionVersion);
+      this.#db.prepare(
+        `INSERT INTO supervision_outbox
+          (project_name, coordinator_session_name, event_id, projection_version, projection_epoch,
+           frame_json, delivery_state, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+      ).run(scope.projectName, scope.coordinatorSessionName, event.id, projectionVersion,
+        this.#epoch, JSON.stringify(frame), this.#now(), this.#now());
+      return { frame, projectionVersion };
+    }));
+    if (options.deliver !== false) {
+      for (const item of committed) this.#deliver(item.frame, item.projectionVersion, scope);
+    }
+    return committed.length;
   }
 
   /**
