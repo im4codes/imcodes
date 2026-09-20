@@ -57,6 +57,7 @@ import {
 } from '../remote-desktop-connection-manager.js';
 import {
   REMOTE_DESKTOP_COMPUTER_CASE_KEY,
+  REMOTE_DESKTOP_COMPUTER_KEYBOARD_DEFAULT_PAGE,
   REMOTE_DESKTOP_COMPUTER_KEYBOARD_PAGES,
   remoteDesktopComputerKeyChord,
   remoteDesktopComputerUpperKey,
@@ -511,7 +512,9 @@ export function RemoteDesktopPanel({
   // alphanumeric layout) is showing. A latched combo modifier survives a
   // swipe between pages on purpose -- holding Control on page one, then
   // swiping to page two to tap a letter, is a real way to build a chord.
-  const [computerKeyboardPage, setComputerKeyboardPage] = useState(0);
+  const [computerKeyboardPage, setComputerKeyboardPage] = useState(
+    REMOTE_DESKTOP_COMPUTER_KEYBOARD_DEFAULT_PAGE,
+  );
   const [computerKeyboardCapitals, setComputerKeyboardCapitals] = useState(false);
   // Live horizontal drag offset (px) while a page swipe is in progress;
   // reset to 0 once the drag commits or cancels, at which point
@@ -2108,19 +2111,25 @@ export function RemoteDesktopPanel({
     if (!released) client.releaseAll();
   };
 
+  /**
+   * The hidden field the phone keyboard is typing into, while it is up. It
+   * keeps the focus for as long as the keyboard is open: every path that
+   * would move the focus elsewhere closes the keyboard.
+   */
+  const mobileKeyboardField = (): HTMLTextAreaElement | null => (
+    mobileTextOpen && mobileKeyboardTab === 'ime' ? mobileTextInputRef.current : null
+  );
+
+  const keepMobileKeyboardFocus = (): boolean => {
+    const field = mobileKeyboardField();
+    if (!field) return false;
+    if (document.activeElement !== field) field.focus({ preventScroll: true });
+    return true;
+  };
+
   const onPointerButton = (event: PointerEvent, down: boolean) => {
-    if (down && snapshot.inputEnabled) {
-      // While the phone keyboard is up, its hidden field keeps the focus.
-      // Moving it to the stage is what closed the OS keyboard on the first
-      // touch on the picture; only the keyboard's own × ends it now.
-      const mobileInput = mobileTextOpen && mobileKeyboardTab === 'ime'
-        ? mobileTextInputRef.current
-        : null;
-      if (mobileInput) {
-        if (document.activeElement !== mobileInput) mobileInput.focus({ preventScroll: true });
-      } else {
-        stageRef.current?.focus({ preventScroll: true });
-      }
+    if (down && snapshot.inputEnabled && !keepMobileKeyboardFocus()) {
+      stageRef.current?.focus({ preventScroll: true });
     }
     if (event.pointerType === 'touch') {
       if (down) onTouchDown(event);
@@ -2596,7 +2605,7 @@ export function RemoteDesktopPanel({
     }
     setMobileToolbarExpanded(false);
     setMobileKeyboardTab('ime');
-    setComputerKeyboardPage(0);
+    setComputerKeyboardPage(REMOTE_DESKTOP_COMPUTER_KEYBOARD_DEFAULT_PAGE);
     setMobileTextOpen(true);
     requestAnimationFrame(() => focusRemoteDesktopMobileInput(mobileTextInputRef.current));
   };
@@ -3416,6 +3425,14 @@ export function RemoteDesktopPanel({
           onMouseEnter={onStageMouseMove}
           onPointerDown={(event) => onPointerButton(event, true)}
           onPointerUp={(event) => onPointerButton(event, false)}
+          // A tap on the picture is not a focus change: WebKit blurs the
+          // focused field for one, which closes the phone keyboard. Dragging
+          // and pinching never did, which is why only taps closed it.
+          onTouchEnd={(event) => {
+            if (!mobileKeyboardField()) return;
+            event.preventDefault();
+            keepMobileKeyboardFocus();
+          }}
           onPointerCancel={(event) => {
             if (event.pointerType === 'touch') onTouchEnd(event, true);
             if (event.pointerType !== 'touch'

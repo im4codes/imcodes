@@ -696,6 +696,13 @@ export const REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS_PAGE3: readonly (readonly Rem
   ],
 ];
 
+/**
+ * The page the computer keyboard opens on: the letters, which is what a
+ * phone keyboard shows and what most typing needs. The modifier/function
+ * page and the symbols page are one swipe away on either side.
+ */
+export const REMOTE_DESKTOP_COMPUTER_KEYBOARD_DEFAULT_PAGE = 1;
+
 /** Every computer-keyboard page, in swipe order. */
 export const REMOTE_DESKTOP_COMPUTER_KEYBOARD_PAGES: readonly (readonly (readonly RemoteDesktopComputerKeySpec[])[])[] = [
   REMOTE_DESKTOP_COMPUTER_KEYBOARD_ROWS,

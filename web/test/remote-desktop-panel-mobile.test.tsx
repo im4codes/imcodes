@@ -1880,11 +1880,21 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       container.querySelectorAll<HTMLButtonElement>('.remote-desktop-computer-keyboard-row button'),
     ).find((button) => button.textContent === label)!;
 
-    // Page one is showing by default.
+    // The letters are showing by default -- what most typing needs.
+    expect(keyButton('q')).toBeDefined();
+    expect(track.style.transform).toContain('translateX(calc(-33.33');
+
+    // A right-swipe well past the 20% commit threshold flips to page one.
+    act(() => {
+      pointer(pages, 'pointerdown', { pointerId: 8, clientX: 150, clientY: 200 });
+      pointer(pages, 'pointermove', { pointerId: 8, clientX: 250, clientY: 200 });
+      pointer(pages, 'pointermove', { pointerId: 8, clientX: 300, clientY: 200 });
+      pointer(pages, 'pointerup', { pointerId: 8, clientX: 300, clientY: 200 });
+    });
     expect(keyButton('F5')).toBeDefined();
     expect(track.style.transform).toContain('translateX(calc(0%');
 
-    // A left-swipe well past the 20% commit threshold flips to page two.
+    // ...and a left-swipe back to the letters.
     act(() => {
       pointer(pages, 'pointerdown', { pointerId: 9, clientX: 300, clientY: 200 });
       pointer(pages, 'pointermove', { pointerId: 9, clientX: 200, clientY: 200 });
@@ -2029,12 +2039,13 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     const pages = container.querySelector('.remote-desktop-computer-keyboard-pages') as HTMLElement;
     Object.defineProperty(pages, 'clientWidth', { value: 400, configurable: true });
 
+    // Starts on the letters page and stays there.
     act(() => {
       pointer(pages, 'pointerdown', { pointerId: 10, clientX: 300, clientY: 200 });
       pointer(pages, 'pointermove', { pointerId: 10, clientX: 280, clientY: 200 });
       pointer(pages, 'pointerup', { pointerId: 10, clientX: 280, clientY: 200 });
     });
-    expect(track.style.transform).toContain('translateX(calc(0%');
+    expect(track.style.transform).toContain('translateX(calc(-33.33');
   });
 
   it('opens the focused display resolution menu from the keyboard context-menu gesture', async () => {
@@ -2146,8 +2157,22 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     pointer(stage, 'pointerup', { pointerId: 71, clientX: 150, clientY: 200 });
     expect(document.activeElement).toBe(input);
 
+    // A tap is not a focus change either: WebKit blurs the focused field for
+    // one, which is what closed the keyboard while dragging never did.
+    const touchEnd = (target: Element) => {
+      const event = new Event('ontouchend' in target ? 'touchend' : 'TouchEnd', {
+        bubbles: true,
+        cancelable: true,
+      });
+      act(() => { target.dispatchEvent(event); });
+      return event;
+    };
+    expect(touchEnd(stage).defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(input);
+
     // Closing it hands the stage back for physical keyboard input.
     act(() => { (getByRole('button', { name: 'remote_desktop.close_mobile_keyboard' }) as HTMLButtonElement).click(); });
+    expect(touchEnd(stage).defaultPrevented).toBe(false);
     mousePointer(stage, 'pointerdown', { pointerId: 72, clientX: 120, clientY: 160 });
     expect(document.activeElement).toBe(stage);
   });
