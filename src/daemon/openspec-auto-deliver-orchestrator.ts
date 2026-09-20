@@ -327,6 +327,14 @@ const implementationAwaitingDispatchIdleTimers = new Map<string, ReturnType<type
 const promptIdleAdvanceTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const acceptanceResultFilePollTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const acceptanceAuditIdleRecheckTimers = new Map<string, ReturnType<typeof setTimeout>>();
+// Implementation advances are launched from timeline/timer callbacks that
+// cannot be awaited by the emitter. Track them so the test-only reset can
+// quiesce the real async lifecycle before fixtures and shared mocks are reset.
+// Without this, an old run can settle before one test's teardown, then finish
+// collecting Git evidence and call startP2pRun after the next test has cleared
+// its spies -- producing both cross-test mock calls and filesystem teardown
+// races under coverage contention.
+const implementationAdvancesInFlight = new Set<Promise<void>>();
 const acceptanceAuditAdvancesInFlight = new Map<string, Promise<void>>();
 let timelineUnsubscribe: (() => void) | null = null;
 const execFileAsync = promisify(execFile);
@@ -659,7 +667,7 @@ function scheduleImplementationMarkerPoll(run: AutoDeliverRun): void {
     implementationMarkerPollTimers.delete(run.runId);
     const current = runsById.get(run.runId);
     if (!current || isOpenSpecAutoDeliverTerminalStage(current.status)) return;
-    void advanceAfterImplementationMarkerPoll(current).catch((error) => {
+    void trackImplementationAdvance(advanceAfterImplementationMarkerPoll(current)).catch((error) => {
       terminalizeAndSend(current, 'failed', error instanceof Error ? error.message : 'implementation_marker_poll_failed');
     });
   }, OPENSPEC_AUTO_DELIVER_IMPLEMENTATION_MARKER_POLL_MS));
@@ -696,10 +704,17 @@ function scheduleImplementationAwaitingDispatchIdleRecheck(run: AutoDeliverRun):
       return;
     }
     current.activeImplementationPromptAwaitingDispatch = false;
-    void advanceAfterImplementationIdle(current).catch((error) => {
+    void trackImplementationAdvance(advanceAfterImplementationIdle(current)).catch((error) => {
       terminalizeAndSend(current, 'failed', error instanceof Error ? error.message : 'implementation_awaiting_dispatch_idle_recheck_failed');
     });
   }, OPENSPEC_AUTO_DELIVER_AWAITING_DISPATCH_IDLE_RECHECK_MS));
+}
+
+function trackImplementationAdvance(advance: Promise<void>): Promise<void> {
+  implementationAdvancesInFlight.add(advance);
+  return advance.finally(() => {
+    implementationAdvancesInFlight.delete(advance);
+  });
 }
 
 function cloneTaskStats(stats: OpenSpecAutoDeliverTaskStats): OpenSpecAutoDeliverTaskStats {
@@ -1733,7 +1748,7 @@ async function dispatchImplementationMarkerReminder(run: AutoDeliverRun, reason:
           implementationReminderTimers.delete(run.runId);
           const current = runsById.get(run.runId);
           if (!current || isOpenSpecAutoDeliverTerminalStage(current.status)) return;
-          void advanceAfterImplementationIdle(current).catch((error) => {
+          void trackImplementationAdvance(advanceAfterImplementationIdle(current)).catch((error) => {
             terminalizeAndSend(current, 'failed', error instanceof Error ? error.message : 'implementation_idle_advance_failed');
           });
         }, waitMs));
@@ -3809,7 +3824,7 @@ function ensureTimelineListener(): void {
       return;
     }
     if (isTransportRuntimeBusyForIdleAdvance(run)) return;
-    void advanceAfterImplementationIdle(run).catch((error) => {
+    void trackImplementationAdvance(advanceAfterImplementationIdle(run)).catch((error) => {
       terminalizeAndSend(run, 'failed', error instanceof Error ? error.message : 'implementation_idle_advance_failed');
     });
   });
@@ -4174,6 +4189,14 @@ export async function clearOpenSpecAutoDeliverRunsForTests(): Promise<void> {
   if (acceptanceAdvances.length > 0) {
     await Promise.allSettled(acceptanceAdvances);
   }
+  // Timer and timeline callbacks also launch implementation advances without
+  // awaiting them. Drain to a fixed point: an advance may schedule or enter a
+  // successor before its own promise settles. Clearing the fixture first would
+  // let that old work write into a removed project root or call freshly-reset
+  // mocks in the following test.
+  while (implementationAdvancesInFlight.size > 0) {
+    await Promise.allSettled([...implementationAdvancesInFlight]);
+  }
   for (const timer of auditPollTimers.values()) clearTimeout(timer);
   auditPollTimers.clear();
   for (const timer of auditFixRetryTimers.values()) clearTimeout(timer);
@@ -4191,6 +4214,7 @@ export async function clearOpenSpecAutoDeliverRunsForTests(): Promise<void> {
   for (const timer of acceptanceAuditIdleRecheckTimers.values()) clearTimeout(timer);
   acceptanceAuditIdleRecheckTimers.clear();
   acceptanceAuditAdvancesInFlight.clear();
+  implementationAdvancesInFlight.clear();
   for (const run of runsById.values()) {
     releaseAutoDeliverP2pLock(run.owningMainSessionName, run.runId);
   }

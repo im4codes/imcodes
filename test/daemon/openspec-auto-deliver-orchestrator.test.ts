@@ -45,7 +45,15 @@ const { getSessionMock, listSessionsMock, getSavedP2pConfigMock, getTransportRun
   }),
 }));
 
-const { truncatedTasksReads } = vi.hoisted(() => ({ truncatedTasksReads: { pending: 0 } }));
+const { truncatedTasksReads, blockedTasksReads } = vi.hoisted(() => ({
+  truncatedTasksReads: { pending: 0 },
+  blockedTasksReads: {
+    pending: 0,
+    started: undefined as (() => void) | undefined,
+    wait: undefined as Promise<void> | undefined,
+    release: undefined as (() => void) | undefined,
+  },
+}));
 
 /**
  * Default pass-through. Armed only by `truncateNextTasksRead()`, so every other
@@ -63,6 +71,11 @@ vi.mock('node:fs/promises', async (importOriginal) => {
       if (typeof path === 'string' && path.endsWith('tasks.md') && truncatedTasksReads.pending > 0) {
         truncatedTasksReads.pending -= 1;
         return '';
+      }
+      if (typeof path === 'string' && path.endsWith('tasks.md') && blockedTasksReads.pending > 0) {
+        blockedTasksReads.pending -= 1;
+        blockedTasksReads.started?.();
+        await blockedTasksReads.wait;
       }
       return (actual.readFile as (...args: unknown[]) => Promise<unknown>)(path, ...rest);
     },
@@ -276,6 +289,26 @@ async function writeLatestImplementationMarker(overrides: Record<string, unknown
 
 function truncateNextTasksRead(count = 1): void {
   truncatedTasksReads.pending = count;
+}
+
+function blockNextTasksRead(): { started: Promise<void>; release: () => void } {
+  let markStarted!: () => void;
+  let releaseRead!: () => void;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  const wait = new Promise<void>((resolve) => { releaseRead = resolve; });
+  blockedTasksReads.pending = 1;
+  blockedTasksReads.started = markStarted;
+  blockedTasksReads.wait = wait;
+  blockedTasksReads.release = releaseRead;
+  return { started, release: releaseRead };
+}
+
+function resetBlockedTasksRead(): void {
+  blockedTasksReads.release?.();
+  blockedTasksReads.pending = 0;
+  blockedTasksReads.started = undefined;
+  blockedTasksReads.wait = undefined;
+  blockedTasksReads.release = undefined;
 }
 
 async function emitDeckDemoIdle(): Promise<void> {
@@ -549,6 +582,7 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     // Disarm the tasks.md read seam. A test that arms more truncations than it
     // consumes would otherwise leak them into every later test in this file.
     truncatedTasksReads.pending = 0;
+    resetBlockedTasksRead();
     projectDir = join(tmpdir(), `imcodes-auto-deliver-${Date.now()}-${Math.random().toString(16).slice(2)}`);
     extraTempDirs = [];
     await makeChange('demo-change');
@@ -608,6 +642,7 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
 
   afterEach(async () => {
     truncatedTasksReads.pending = 0;
+    resetBlockedTasksRead();
     await clearOpenSpecAutoDeliverRunsForTests();
     clearAllResend();
     await rm(projectDir, { recursive: true, force: true });
@@ -1513,6 +1548,43 @@ exec "${realGit}" "$@"
       (msg as { projection?: { lastMessage?: string } }).projection?.lastMessage === 'tasks_missing_checkboxes'
     ), SEND_WAIT_MS);
     expect(startP2pRunMock).not.toHaveBeenCalled();
+  });
+
+  it('quiesces an in-flight implementation advance before resetting test fixtures', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-quiesce-implementation-advance',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    await waitForTransportSend((text) =>
+      text.includes('Implementation completion marker (required):')
+      && text.includes('write this exact JSON marker to:'),
+      SEND_WAIT_MS,
+    );
+    expect(await writeLatestImplementationMarker()).toBe(true);
+
+    const gate = blockNextTasksRead();
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+    await gate.started;
+
+    let resetFinished = false;
+    const reset = clearOpenSpecAutoDeliverRunsForTests().then(() => {
+      resetFinished = true;
+    });
+    // Give an incorrectly untracked reset a full event-loop turn to resolve.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const finishedBeforeAdvance = resetFinished;
+
+    gate.release();
+    await reset;
+    await waitForP2pStartCount(1);
+
+    expect(finishedBeforeAdvance).toBe(false);
+    expect(describeOpenSpecAutoDeliverRunsForTests()).toEqual([]);
   });
 
   it('advances implementation from a valid completion marker despite unchecked tasks and without waiting for idle', async () => {
