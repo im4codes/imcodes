@@ -6995,7 +6995,7 @@ export function App() {
             {/* Footer */}
             <div class="mobile-sidebar-footer">
               {selectedServerId && connected && (daemonStats || daemonVersionForDisplay) && (
-                <div style={{ fontSize: 11, color: '#64748b', marginBottom: 4, display: 'flex', alignItems: 'center', gap: 6 }}>
+                <div class="mobile-sidebar-daemon-status">
                   <span title={daemonVersionForDisplay ? `v${daemonVersionForDisplay}` : undefined}>
                     {daemonVersionForDisplay && <span>v{formatDaemonVersionShort(daemonVersionForDisplay)}{daemonStats ? ' · ' : ''}</span>}
                     {daemonStats && <span>CPU {daemonStats.cpu}% · Load {daemonStats.load1}</span>}
@@ -7006,16 +7006,8 @@ export function App() {
                       {daemonUpgradingLabel(daemonUpgrading, trans, formatDaemonVersionShort)}
                     </span>
                   )}
-                  <DaemonRemoteDesktopControl
-                    ws={wsRef.current}
-                    serverId={selectedServerId}
-                    serverName={selectedServerInfo?.name}
-                    daemonOnline={daemonOnline}
-                    onOpen={openRemoteDesktop}
-                    canSetUp={!selectedShareTarget}
-                  />
                   <button
-                    style={{ fontSize: 10, color: '#38bdf8', background: 'none', border: '1px solid #334155', borderRadius: 4, padding: '1px 5px', cursor: 'pointer' }}
+                    class="mobile-sidebar-watch-sync"
                     onClick={async () => {
                       try {
                         const snapshot = watchProjectionStore.getSnapshot();

@@ -4847,6 +4847,9 @@ html.native-ios-mac .chat-dl-btn {
 .mobile-sidebar-close:active { color: var(--chrome-accent); border-color: rgba(34,211,238,0.5); background: rgba(8,145,178,0.16); }
 .mobile-sidebar-body { flex: 1; overflow-y: auto; min-height: 0; scrollbar-width: thin; scrollbar-color: rgba(34,211,238,0.38) transparent; scroll-behavior: smooth; }
 .mobile-sidebar-footer { flex-shrink: 0; padding: 8px 14px; border-top: 1px solid rgba(34,211,238,0.13); background: rgba(8,13,22,0.42); }
+.mobile-sidebar-daemon-status { display: flex; min-width: 0; align-items: center; gap: 6px; margin-bottom: 4px; color: #64748b; font-size: 11px; }
+.mobile-sidebar-daemon-status > :first-child { min-width: 0; overflow-wrap: anywhere; }
+.mobile-sidebar-watch-sync { flex: 0 0 auto; margin-left: auto; padding: 1px 5px; border: 1px solid #334155; border-radius: 4px; background: none; color: #38bdf8; cursor: pointer; font-size: 10px; }
 .mobile-sidebar-hdr-btn { background: rgba(15,23,42,0.42); border: 1px solid rgba(125,211,252,0.14); color: #7b8797; border-radius: 6px; padding: 2px 6px; font-size: 13px; cursor: pointer; line-height: 1; }
 .mobile-sidebar-hdr-btn.active { color: var(--chrome-accent); border-color: rgba(34,211,238,0.5); background: rgba(8,145,178,0.16); box-shadow: 0 0 12px rgba(34,211,238,0.14); }
 

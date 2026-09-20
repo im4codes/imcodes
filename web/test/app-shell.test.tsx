@@ -2545,7 +2545,7 @@ describe('App shell', () => {
     expect(screen.queryByTestId('floating-panel-controlled-nodes')).toBeNull();
   }, 20_000);
 
-  it('puts remote control in the desktop toolbar, not only on mobile', async () => {
+  it('keeps remote control out of the desktop sidebar while retaining the toolbar entry', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
     localStorage.setItem('rcc_session', 'deck_alpha_brain');
@@ -2575,7 +2575,64 @@ describe('App shell', () => {
     // The desktop layout has no daemon status bar at all, so without this the
     // button existed on mobile only.
     await waitFor(() => expect(toolbar()!.querySelector('.daemon-remote-desktop-btn')).toBeTruthy());
+    expect(screen.getByTestId('sidebar-panel').querySelector('.daemon-remote-desktop-btn')).toBeNull();
   });
+
+  it('keeps remote control out of the mobile sidebar footer while retaining the toolbar entry', async () => {
+    const originalUserAgent = navigator.userAgent;
+    const originalInnerWidth = window.innerWidth;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'Android' });
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 800 });
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      const view = render(<App />);
+      const ws = await getActiveWsClient();
+
+      await act(async () => {
+        // The production socket reports its connection asynchronously. The
+        // test double only flips its own field, while the footer is guarded by
+        // App's connection state.
+        ws.emit({ type: 'session.event', event: 'connected', session: '', state: 'connected' });
+        ws.emit({
+          type: 'daemon.stats',
+          daemonVersion: '2026.9.4508-dev',
+          cpu: 28, memUsed: 1, memTotal: 2, load1: 2.78, load5: 0, load15: 0, uptime: 10,
+        });
+        ws.emitDaemonCapabilities([
+          'remote.desktop.windows.installable.v1',
+          'remote.desktop.windows.h264.v2',
+        ]);
+      });
+
+      await waitFor(() => expect(
+        view.container.querySelector('.mobile-server-actions .daemon-remote-desktop-btn'),
+      ).toBeTruthy());
+      fireEvent.click(view.container.querySelector('.mobile-sidebar-toggle')!);
+      const footer = await waitFor(() => {
+        const openSidebar = view.container.querySelector('.mobile-sidebar-overlay.open');
+        expect(openSidebar).toBeTruthy();
+        const value = openSidebar?.querySelector('.mobile-sidebar-footer');
+        expect(value).toBeTruthy();
+        return value!;
+      });
+
+      expect(footer.querySelector('.daemon-remote-desktop-btn')).toBeNull();
+      // The far-right watch button is the existing Watch Bridge snapshot sync;
+      // it is not the requested remote-control entry and must remain.
+      await waitFor(() => expect(
+        footer.querySelector('.mobile-sidebar-watch-sync')?.textContent,
+      ).toBe('⌚'));
+      expect(footer.querySelector('.mobile-sidebar-daemon-status')?.textContent).toContain('CPU 28% · Load 2.78');
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalInnerWidth });
+    }
+  }, 20_000);
 
   it('keeps the mobile server menu available on wide-viewport Android browsers', async () => {
     const originalUserAgent = navigator.userAgent;
