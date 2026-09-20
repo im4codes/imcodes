@@ -81,8 +81,15 @@ describe('formal task identity on supervised dispatch surfaces', () => {
       throw new Error(`expected an accepted supervised dispatch, got ${JSON.stringify(initial)}`);
     }
     const title = 'Enforce formal IM.codes delegation…';
+    const objective = 'Enforce formal IM.codes delegation\nwith auditable denial';
     expect(initial.taskTitle).toBe(title);
-    expect(initial.deliveries[0]).toMatchObject({ taskId: initial.taskId, assignmentId: initial.assignmentId, taskTitle: title });
+    expect(initial.taskObjective).toBe(objective);
+    expect(initial.deliveries[0]).toMatchObject({
+      taskId: initial.taskId,
+      assignmentId: initial.assignmentId,
+      taskTitle: title,
+      taskObjective: objective,
+    });
 
     const initialBody = String(dispatchMessage.mock.calls[0]?.[1] ?? '');
     expect(initialBody).toContain([
@@ -102,7 +109,12 @@ describe('formal task identity on supervised dispatch surfaces', () => {
       task: { taskId: initial.taskId, assignmentId: initial.assignmentId, executionPool: 'primary' },
     }, deps);
     if (continuation.status !== 'accepted') throw new Error(`expected accepted continuation, got ${JSON.stringify(continuation)}`);
-    expect(continuation).toMatchObject({ taskId: initial.taskId, assignmentId: initial.assignmentId, taskTitle: title });
+    expect(continuation).toMatchObject({
+      taskId: initial.taskId,
+      assignmentId: initial.assignmentId,
+      taskTitle: title,
+      taskObjective: objective,
+    });
     const continuationBody = String(dispatchMessage.mock.calls[1]?.[1] ?? '');
     expect(continuationBody).toContain(`${SUPERVISION_TASK_IDENTITY_HEADER_MARKER} ${title}`);
     expect(continuationBody).toContain(`taskId: ${initial.taskId}`);
@@ -118,7 +130,12 @@ describe('formal task identity on supervised dispatch surfaces', () => {
       { target: 'deck_alpha_w1', message: 'continue', task: { taskId: initial.taskId, assignmentId: initial.assignmentId } },
       continuation,
     );
-    expect(fact).toMatchObject({ taskId: initial.taskId, assignmentId: initial.assignmentId, taskTitle: title });
+    expect(fact).toMatchObject({
+      taskId: initial.taskId,
+      assignmentId: initial.assignmentId,
+      taskTitle: title,
+      taskObjective: objective,
+    });
   });
 
   it('bounds the title from the registry objective, never from the caller message', async () => {

@@ -29,6 +29,7 @@ import {
   canViewSupervisionTaskConsole,
   type SupervisionTaskConsoleVisibilityInput,
 } from '../supervision-task-console-visibility.js';
+import { ExpandableTaskObjective } from './ExpandableTaskObjective.js';
 
 const DESKTOP_MIN_WIDTH = 720;
 const DESKTOP_DEFAULT_WIDTH = 720;
@@ -282,19 +283,25 @@ function TaskCard(props: {
     >
       <span key={props.task.lastEventId} class="supervision-task-console-transition" aria-hidden="true" />
       <div class="supervision-task-console-task-head">
-        <button
-          type="button"
-          class="supervision-task-console-task-summary"
-          aria-expanded={props.expanded}
-          aria-controls={`task-console-details-${props.task.taskId}`}
-          onClick={props.onToggle}
-        >
-          <span class="supervision-task-console-task-title" title={props.task.objective ?? props.task.title}>
-            <strong>{props.task.title}</strong>
-          </span>
+        <div class="supervision-task-console-task-summary">
+          <ExpandableTaskObjective
+            className="supervision-task-console-task-title"
+            text={props.task.objective ?? props.task.title}
+            onActivate={props.onToggle}
+            activateExpanded={props.expanded}
+            activateControls={`task-console-details-${props.task.taskId}`}
+          />
+          <button
+            type="button"
+            class="supervision-task-console-details-toggle"
+            aria-expanded={props.expanded}
+            aria-controls={`task-console-details-${props.task.taskId}`}
+            onClick={props.onToggle}
+          >
           <span class={`supervision-task-console-status status-${props.task.status}`}>{t(displayStatusKey(props.task.status))}</span>
           <span aria-hidden="true" class="supervision-task-console-chevron">{props.expanded ? '⌃' : '⌄'}</span>
-        </button>
+          </button>
+        </div>
         <div class="supervision-task-console-role-tracks">
           {implementer && <SessionButton assignment={implementer} taskStatus={props.task.status} taskTab={taskTab} lane="implementer" onNavigateSession={props.onNavigateSession} />}
           {auditor && <SessionButton assignment={auditor} taskStatus={props.task.status} taskTab={taskTab} lane="auditor" onNavigateSession={props.onNavigateSession} />}

@@ -302,7 +302,8 @@ describe('DelegationClaimBadge', () => {
           dispatchId: 'dsp_9f21',
           taskId: 'task_4410',
           assignmentId: 'asg_5gl',
-          taskTitle: 'Enforce formal IM.codes delegation',
+          taskTitle: 'Enforce formal IM.codes delegation.…',
+          taskObjective: 'Enforce formal IM.codes delegation. Preserve the full authoritative objective on every task surface.',
           deliveries: [{
             target: 'deck_imcodes_w1',
             status: 'delivered',
@@ -323,7 +324,7 @@ describe('DelegationClaimBadge', () => {
     expect(identity).not.toBeNull();
     expect(identity?.closest('details')).toBeNull();
     expect(identity?.querySelector('[data-delegation-field="taskTitle"]')?.textContent)
-      .toContain('Enforce formal IM.codes delegation');
+      .toContain('Enforce formal IM.codes delegation. Preserve the full authoritative objective on every task surface.');
     expect(identity?.querySelector('[data-delegation-field="taskId"] code')?.textContent).toBe('task_4410');
     expect(identity?.querySelector('[data-delegation-field="assignmentId"] code')?.textContent).toBe('asg_5gl');
 

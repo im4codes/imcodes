@@ -9,6 +9,8 @@
 
 /** Longest readable task title any dispatch surface carries. */
 export const SUPERVISION_TASK_TITLE_MAX_CHARS = 120;
+/** Safety bound for full objectives projected onto human-readable UI surfaces. */
+export const SUPERVISION_TASK_OBJECTIVE_MAX_BYTES = 4096;
 
 /** Opens the readable identity header of a supervised dispatch body. */
 export const SUPERVISION_TASK_IDENTITY_HEADER_MARKER = '[IM.codes task]' as const;
@@ -18,6 +20,35 @@ const SENTENCE_END = /[.!?。！？]/u;
 const CJK_SENTENCE_END = /[。！？]/u;
 const CJK_CHARACTER = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]/u;
 const ASCII_WORD_CHARACTER = /[A-Za-z0-9_]/;
+
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
+
+/**
+ * Normalize and byte-bound the authoritative full objective once for every
+ * live/reloaded UI projection. Newlines are preserved as soft visual breaks.
+ */
+export function projectSupervisionTaskObjective(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value
+    .replace(/\r\n?|\u2028|\u2029/gu, '\n')
+    .split('\n')
+    .map((line) => line.replace(/[\u0000-\u0009\u000b\u000c\u000e-\u001f\u007f-\u009f]/gu, ' ')
+      .replace(/[^\S\n]+/gu, ' ').trim())
+    .join('\n')
+    .replace(/\n{3,}/gu, '\n\n')
+    .trim();
+  if (!normalized) return undefined;
+  if (utf8ByteLength(normalized) <= SUPERVISION_TASK_OBJECTIVE_MAX_BYTES) return normalized;
+  let output = '';
+  for (const character of normalized) {
+    const candidate = `${output}${character}`;
+    if (utf8ByteLength(`${candidate}…`) > SUPERVISION_TASK_OBJECTIVE_MAX_BYTES) break;
+    output = candidate;
+  }
+  return output ? `${output}…` : undefined;
+}
 
 /**
  * Bound one candidate title: first meaningful line/sentence, whitespace
@@ -77,9 +108,9 @@ export function deriveSupervisionTaskTitle(objective: unknown): string | undefin
 }
 
 /**
- * Read a title that crossed a trust boundary (MCP receipt, timeline metadata).
- * The same bound applies, so an oversized or multi-line value can never reach
- * a rendered surface intact.
+ * Read a concise title that crossed a trust boundary (MCP receipt, prompt
+ * header metadata). Full human-facing objective surfaces use the separately
+ * bounded `projectSupervisionTaskObjective` value.
  */
 export function readSupervisionTaskTitle(value: unknown): string | undefined {
   return typeof value === 'string' ? boundTitle(value) : undefined;

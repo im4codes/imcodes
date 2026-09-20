@@ -63,6 +63,7 @@ import {
 } from './ChatLoopbackLink.js';
 import { AgentTodoList } from './AgentTodoList.js';
 import { DelegationClaimBadge, readDelegationClaimMetadata } from './DelegationClaimBadge.js';
+import { ExpandableTaskObjective } from './ExpandableTaskObjective.js';
 import {
   CHAT_MOUNT_SETTLE_MS,
   CHAT_MOUNT_SETTLE_TICK_MS,
@@ -4827,9 +4828,29 @@ const ChatEvent = memo(function ChatEvent({
       const disposition = isPeerAuditRuntimeDisposition(event.payload.disposition)
         ? event.payload.disposition
         : null;
+      const supervisionTask = event.source === 'daemon' && event.confidence === 'high'
+        ? readAgentDelegationSupervisionTaskProjection(event.payload.supervisionTask)
+        : undefined;
       return (
-        <section class="chat-event chat-system peer-audit-result-card" data-event-id={event.eventId}>
-          <strong>{t('peerAuditResult.title')}</strong>
+        <section
+          class="chat-event chat-system peer-audit-result-card"
+          data-event-id={event.eventId}
+          {...(supervisionTask ? {
+            'data-task-id': supervisionTask.taskId,
+            'data-assignment-id': supervisionTask.assignmentId,
+          } : {})}
+        >
+          {supervisionTask?.title ? (
+            <div class="delegation-reply-card-heading peer-audit-result-heading">
+              <span class="delegation-reply-card-kicker">{t('peerAuditResult.title')}</span>
+              <ExpandableTaskObjective
+                text={supervisionTask.objective ?? supervisionTask.title}
+                textClassName="peer-audit-result-objective"
+              />
+            </div>
+          ) : (
+            <strong>{t('peerAuditResult.title')}</strong>
+          )}
           <div>{t('peerAuditResult.attributionAuditor', { auditor })}</div>
           <div>{t('peerAuditResult.elapsedMs', { seconds: Math.round(elapsedMs / 1000) })}</div>
           <div>{t(`peerAuditQuick.${outcomeKey}`)}</div>
@@ -4874,7 +4895,10 @@ const ChatEvent = memo(function ChatEvent({
               {supervisionTask?.title ? (
                 <>
                   <span class="delegation-reply-card-kicker">{t('delegation.reply_title')}</span>
-                  <strong class="delegation-reply-card-objective">{supervisionTask.title}</strong>
+                  <ExpandableTaskObjective
+                    text={supervisionTask.objective ?? supervisionTask.title}
+                    textClassName="delegation-reply-card-objective"
+                  />
                 </>
               ) : (
                 <strong>{t('delegation.reply_title')}</strong>
@@ -4902,12 +4926,6 @@ const ChatEvent = memo(function ChatEvent({
                 <span aria-label={`${t('delegation.claim.assignment_id')}: ${supervisionTask.assignmentId}`}>{supervisionTask.assignmentId}</span>
               </span>
             </div>
-          )}
-          {supervisionTask?.objective && (
-            <details class="delegation-reply-objective-details">
-              <summary>{t('delegation.reply_objective_details')}</summary>
-              <div>{supervisionTask.objective}</div>
-            </details>
           )}
           {result && (
             verdict ? (

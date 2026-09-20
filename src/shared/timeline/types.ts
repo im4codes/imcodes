@@ -324,6 +324,8 @@ export interface PeerAuditResultTimelinePayload {
   disposition?: PeerAuditRuntimeDisposition;
   findingsPreview?: string;
   reason?: string;
+  /** Daemon-authoritative task identity for formal supervision audits. */
+  supervisionTask?: import('../../../shared/agent-delegation.js').AgentDelegationSupervisionTaskProjection;
 }
 
 /** Public progress projection for one peer-audit attempt. Correlation uses

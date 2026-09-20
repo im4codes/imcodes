@@ -17,6 +17,7 @@ import { useTranslation } from 'react-i18next';
 import { readDelegationClaim } from '@shared/delegation-claim.js';
 import type { SupervisionExecutionSummary } from '@shared/supervision-execution-summary.js';
 import { readSupervisionTaskTitle } from '@shared/supervision-task-identity.js';
+import { ExpandableTaskObjective } from './ExpandableTaskObjective.js';
 import {
   resolveCardAssignmentStatus,
   type LiveAssignmentStatus,
@@ -163,10 +164,12 @@ export function DelegationClaimBadge({ metadata, liveAssignmentStatuses, message
               */
               <span class="delegation-claim-task" data-delegation-field="taskIdentity">
                 <span class="delegation-claim-task-title" data-delegation-field="taskTitle">
-                  {t('delegation.claim.task_title', 'Task')}
-                  {': '}
-                  {readSupervisionTaskTitle(dispatch.taskTitle)
-                    ?? t('delegation.claim.task_title_unavailable', 'Untitled task')}
+                  <span>{t('delegation.claim.task_title', 'Task')}{': '}</span>
+                  <ExpandableTaskObjective
+                    text={dispatch.taskObjective
+                      ?? readSupervisionTaskTitle(dispatch.taskTitle)
+                      ?? t('delegation.claim.task_title_unavailable', 'Untitled task')}
+                  />
                 </span>
                 {dispatch.taskId ? (
                   <span class="delegation-claim-id" data-delegation-field="taskId">

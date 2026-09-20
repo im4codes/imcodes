@@ -19,7 +19,10 @@ import {
   readSupervisionExecutionSummary,
   type SupervisionExecutionSummary,
 } from './supervision-execution-summary.js';
-import { readSupervisionTaskTitle } from './supervision-task-identity.js';
+import {
+  projectSupervisionTaskObjective,
+  readSupervisionTaskTitle,
+} from './supervision-task-identity.js';
 
 export const DELEGATION_AUTHORITY_MCP_SERVER = 'imcodes-memory';
 
@@ -67,6 +70,8 @@ export interface DelegationDispatchFact {
    * legacy receipts, which render an explicit untitled placeholder.
    */
   taskTitle?: string;
+  /** Full bounded registry objective for three-line/expandable UI surfaces. */
+  taskObjective?: string;
   deliveries: DelegationDeliveryFact[];
 }
 
@@ -160,7 +165,19 @@ export const readDelegationDispatchFact = (
   // must not substantiate an assigned/queued/recovered claim.
   if (!taskId || !assignmentId) return null;
   const taskTitle = readSupervisionTaskTitle(output.taskTitle);
-  return { dispatchId, taskId, assignmentId, ...(taskTitle ? { taskTitle } : {}), deliveries };
+  const taskObjective = projectSupervisionTaskObjective(output.taskObjective);
+  const objectiveMatchesTitle = typeof output.taskObjective === 'string'
+    && taskObjective === output.taskObjective
+    && taskTitle !== undefined
+    && readSupervisionTaskTitle(taskObjective) === taskTitle;
+  return {
+    dispatchId,
+    taskId,
+    assignmentId,
+    ...(taskTitle ? { taskTitle } : {}),
+    ...(objectiveMatchesTitle ? { taskObjective } : {}),
+    deliveries,
+  };
 };
 
 /**
@@ -180,7 +197,19 @@ const readPersistedDelegationDispatchFact = (value: unknown): DelegationDispatch
   const deliveries = readDeliveries({ deliveries: record.deliveries });
   if (!dispatchId || !taskId || !assignmentId || deliveries.length === 0) return null;
   const taskTitle = readSupervisionTaskTitle(record.taskTitle);
-  return { dispatchId, taskId, assignmentId, ...(taskTitle ? { taskTitle } : {}), deliveries };
+  const taskObjective = projectSupervisionTaskObjective(record.taskObjective);
+  const objectiveMatchesTitle = typeof record.taskObjective === 'string'
+    && taskObjective === record.taskObjective
+    && taskTitle !== undefined
+    && readSupervisionTaskTitle(taskObjective) === taskTitle;
+  return {
+    dispatchId,
+    taskId,
+    assignmentId,
+    ...(taskTitle ? { taskTitle } : {}),
+    ...(objectiveMatchesTitle ? { taskObjective } : {}),
+    deliveries,
+  };
 };
 
 /**

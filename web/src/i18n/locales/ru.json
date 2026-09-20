@@ -3233,6 +3233,8 @@
     "chip_title": "Цель делегирования: {{target}}",
     "reply_title": "Ответ делегированного агента",
     "reply_from": "От: {{source}}",
+    "objective_expand": "Развернуть",
+    "objective_collapse": "Свернуть",
     "reply_objective_details": "Полная цель задачи",
     "warning_empty_task": "Введите задачу перед делегированием агенту.",
     "warning_attachments": "Делегирование пока не поддерживает вложения. Удалите вложения и опишите задачу текстом.",

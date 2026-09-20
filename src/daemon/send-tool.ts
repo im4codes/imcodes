@@ -6,6 +6,7 @@ import { existsSync } from 'node:fs';
 import {
   deriveSupervisionTaskTitle,
   formatSupervisionTaskIdentityHeader,
+  projectSupervisionTaskObjective,
 } from '../../shared/supervision-task-identity.js';
 import { createHash } from 'node:crypto';
 import {
@@ -370,6 +371,8 @@ export interface SendMessageDelivery {
   assignmentId?: string;
   /** Registry-derived readable title of the bound task (shared/supervision-task-identity.ts). */
   taskTitle?: string;
+  /** Full bounded registry objective for expandable task identity surfaces. */
+  taskObjective?: string;
   status: 'delivered' | 'queued' | 'failed';
   error?: string;
   /**
@@ -397,6 +400,8 @@ export type SendMessageResult =
       assignmentId?: string;
       /** Registry-derived readable title of the bound task. */
       taskTitle?: string;
+      /** Full bounded registry objective for expandable task identity surfaces. */
+      taskObjective?: string;
       auditRoutingReason?: SupervisionAuditRoutingReason;
       auditDegradedReason?: SupervisionAuditDegradedReason;
       provisioning?: SupervisionProvisioningEvidence;
@@ -1697,6 +1702,7 @@ export async function dispatchSendMessage(
   let supervisedAssignmentId: string | undefined;
   /** Readable title derived from the registry objective at dispatch time. */
   let supervisedTaskTitle: string | undefined;
+  let supervisedTaskObjective: string | undefined;
   /** The dispatch continues an assignment that already existed. */
   let supervisedAssignmentReused = false;
   let supervisedAssignmentGeneration: number | undefined;
@@ -2417,7 +2423,8 @@ export async function dispatchSendMessage(
     supervisedAssignmentId = assignment.value.assignmentId;
     // The registry objective, never the caller's prose, names the task on every
     // surface: the delivered body, the accepted receipt and the dispatch card.
-    supervisedTaskTitle = deriveSupervisionTaskTitle(registry.get(taskId)?.objective);
+    supervisedTaskObjective = projectSupervisionTaskObjective(registry.get(taskId)?.objective);
+    supervisedTaskTitle = deriveSupervisionTaskTitle(supervisedTaskObjective);
     supervisedAssignmentReused = Boolean(reusedAssignment);
     supervisedAssignmentGeneration = assignment.value.generation;
     // Resolve the task's coordinator assignment ONCE, from the registry, and by
@@ -2707,6 +2714,7 @@ export async function dispatchSendMessage(
         ...(supervisedTaskId ? { taskId: supervisedTaskId } : {}),
         ...(supervisedAssignmentId ? { assignmentId: supervisedAssignmentId } : {}),
         ...(supervisedTaskId && supervisedTaskTitle ? { taskTitle: supervisedTaskTitle } : {}),
+        ...(supervisedTaskId && supervisedTaskObjective ? { taskObjective: supervisedTaskObjective } : {}),
         status: dispatchResult === 'queued' ? 'queued' : 'delivered',
         ...(execution ? { execution } : {}),
       });
@@ -2734,6 +2742,7 @@ export async function dispatchSendMessage(
     ...(supervisedTaskId ? { taskId: supervisedTaskId } : {}),
     ...(supervisedAssignmentId ? { assignmentId: supervisedAssignmentId } : {}),
     ...(supervisedTaskId && supervisedTaskTitle ? { taskTitle: supervisedTaskTitle } : {}),
+    ...(supervisedTaskId && supervisedTaskObjective ? { taskObjective: supervisedTaskObjective } : {}),
     ...(auditRoutingReason ? { auditRoutingReason } : {}),
     ...(auditDegradedReason ? { auditDegradedReason } : {}),
     ...(provisioning ? { provisioning } : {}),

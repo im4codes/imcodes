@@ -247,7 +247,7 @@ describe('SupervisionTaskConsole', () => {
     expect(document.querySelector('[data-awaiting-external-ci="true"]')).not.toBeNull();
   });
 
-  it('uses the full task objective only as a tooltip on the concise console title', () => {
+  it('uses the full task objective as the console title instead of the concise prompt title', () => {
     const fullObjective = 'Repair the supervision task console title. Preserve this complete objective for task details and tooltips.';
     const base = state();
     render(<SupervisionTaskConsoleView
@@ -267,9 +267,9 @@ describe('SupervisionTaskConsole', () => {
       onNavigateSession={() => {}}
     />);
 
-    const title = screen.getByText('Repair the supervision task console title.…').closest('.supervision-task-console-task-title');
-    expect(title?.getAttribute('title')).toBe(fullObjective);
-    expect(title?.textContent).not.toContain(fullObjective);
+    const title = screen.getByText(fullObjective).closest('.supervision-task-console-task-title');
+    expect(title).not.toBeNull();
+    expect(title?.textContent).not.toContain('Repair the supervision task console title.…');
   });
 
   it('still never reads a raw heartbeat in the component source', () => {

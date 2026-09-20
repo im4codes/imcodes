@@ -3234,6 +3234,8 @@
     "chip_title": "Destino de delegación: {{target}}",
     "reply_title": "Respuesta de delegación",
     "reply_from": "De {{source}}",
+    "objective_expand": "Expandir",
+    "objective_collapse": "Contraer",
     "reply_objective_details": "Objetivo completo de la tarea",
     "warning_empty_task": "Escribe una tarea antes de delegarla a un agente.",
     "warning_attachments": "La delegación aún no admite adjuntos. Quita los adjuntos y describe la tarea en texto.",

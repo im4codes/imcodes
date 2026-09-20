@@ -39,7 +39,10 @@ import {
   SUPERVISION_TASK_STATUS_CONTRACT_VERSION,
   type SupervisionTaskLifecycleStatus,
 } from '../../shared/supervision-config.js';
-import { deriveSupervisionTaskTitle } from '../../shared/supervision-task-identity.js';
+import {
+  deriveSupervisionTaskTitle,
+  projectSupervisionTaskObjective,
+} from '../../shared/supervision-task-identity.js';
 import {
   decideSupervisionAuditHandoff,
   type SupervisionAuditReceipt,
@@ -265,8 +268,7 @@ export class SupervisionConsoleProducer {
     try {
       const payload = JSON.parse(String(row.payload_json ?? '{}')) as Record<string, unknown>;
       if (!isSupervisionTaskVisibleByDefault(payload)) return undefined;
-      objective = typeof payload.objective === 'string' && payload.objective.trim()
-        ? payload.objective.trim() : undefined;
+      objective = projectSupervisionTaskObjective(payload.objective);
     } catch { /* malformed legacy payload: task id remains the fail-safe title */ }
     return {
       taskId: String(row.task_id),

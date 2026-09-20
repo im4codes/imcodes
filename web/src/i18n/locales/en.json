@@ -3234,6 +3234,8 @@
     "chip_title": "Delegation target: {{target}}",
     "reply_title": "Delegation reply",
     "reply_from": "From {{source}}",
+    "objective_expand": "Expand",
+    "objective_collapse": "Collapse",
     "reply_objective_details": "Full task objective",
     "warning_empty_task": "Enter a task before delegating to an agent.",
     "warning_attachments": "Delegation does not support attachments yet. Remove attachments and describe the task in text.",

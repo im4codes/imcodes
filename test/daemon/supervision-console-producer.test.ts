@@ -232,6 +232,18 @@ describe('assignment, pool and validation projections', () => {
     });
   });
 
+  it('uses the shared 4 KiB CJK-safe bound for the console objective', () => {
+    seedTask('implementing');
+    const objective = '修复委派回复标题。'.repeat(600);
+    db.prepare("UPDATE supervision_tasks SET payload_json=? WHERE task_id='tsk_console'")
+      .run(JSON.stringify({ objective }));
+
+    const projected = producer().readTaskRow('tsk_console', SCOPE.projectName)?.objective ?? '';
+    expect(new TextEncoder().encode(projected).byteLength).toBeLessThanOrEqual(4096);
+    expect(projected).toMatch(/…$/u);
+    expect(projected).not.toContain('�');
+  });
+
   it('projects assignments with pool kind, observed provider and validation state', () => {
     seedTask('implementing');
     db.prepare("UPDATE supervision_task_assignments SET payload_json=? WHERE assignment_id='asg_console'")

@@ -11,7 +11,15 @@ import {
 } from '../../shared/supervision-participant-authority.js';
 import { SUPERVISION_ID_PREFIXES } from '../../shared/supervision-durable-identity.js';
 import { matchesProjectSessionConsumer } from '../../shared/actionable-consumer-scope.js';
-import { SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS } from '../../shared/agent-delegation.js';
+import {
+  AGENT_DELEGATION_SUPERVISION_TASK_PROJECTION_VERSION,
+  SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS,
+  type AgentDelegationSupervisionTaskProjection,
+} from '../../shared/agent-delegation.js';
+import {
+  deriveSupervisionTaskTitle,
+  projectSupervisionTaskObjective,
+} from '../../shared/supervision-task-identity.js';
 import {
   SUPERVISION_ASSIGNMENT_AUTO_START_SOURCE,
   type SupervisionAssignmentDeliveryProof,
@@ -2494,6 +2502,36 @@ export class SupervisionTaskRegistry {
     if (this.#closed) return undefined;
     const row = this.#db.prepare('SELECT payload_json AS payloadJson FROM supervision_task_assignments WHERE assignment_id = ?').get(assignmentId) as Record<string, unknown> | undefined;
     return row ? parseAssignmentRow(row) : undefined;
+  }
+
+  /**
+   * Resolve the public task identity for one daemon-minted audit attempt.
+   * The unique auditor row is the authority boundary; callers never infer an
+   * objective from findings, display text, or an audited session name.
+   */
+  getAuditSupervisionTaskProjection(
+    attemptIdInput: string,
+  ): AgentDelegationSupervisionTaskProjection | undefined {
+    if (this.#closed) return undefined;
+    const attemptId = normalizeTaskString(attemptIdInput);
+    if (!attemptId) return undefined;
+    const rows = this.#db.prepare(
+      'SELECT assignment_id AS assignmentId FROM supervision_task_assignments WHERE audit_attempt_id = ? AND role = \'auditor\'',
+    ).all(attemptId) as Array<{ assignmentId?: unknown }>;
+    if (rows.length !== 1 || typeof rows[0]?.assignmentId !== 'string') return undefined;
+    const auditor = this.getAssignment(rows[0].assignmentId);
+    const task = auditor ? this.getTaskRecord(auditor.taskId) : undefined;
+    const objective = projectSupervisionTaskObjective(task?.objective);
+    const title = deriveSupervisionTaskTitle(objective);
+    if (!auditor || auditor.role !== 'auditor' || !task || !objective || !title) return undefined;
+    return {
+      version: AGENT_DELEGATION_SUPERVISION_TASK_PROJECTION_VERSION,
+      taskId: task.taskId,
+      assignmentId: auditor.assignmentId,
+      ...(auditor.auditRevision ? { revision: auditor.auditRevision } : {}),
+      title,
+      ...(objective !== title ? { objective } : {}),
+    };
   }
 
   list(filter: {

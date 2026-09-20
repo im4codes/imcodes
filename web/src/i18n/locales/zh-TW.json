@@ -3234,6 +3234,8 @@
     "chip_title": "委派目標：{{target}}",
     "reply_title": "委派回覆",
     "reply_from": "來自 {{source}}",
+    "objective_expand": "展開",
+    "objective_collapse": "收起",
     "reply_objective_details": "完整任務目標",
     "warning_empty_task": "請先輸入要委派給智能體的任務。",
     "warning_attachments": "委派暫不支援附件。請移除附件，並用文字描述任務。",

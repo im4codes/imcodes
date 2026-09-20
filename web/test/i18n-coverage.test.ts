@@ -357,7 +357,10 @@ const COMPOSER_TARGET_KEYS = [
   'session.composer_target_label',
   'session.composer_target_aria',
 ] as const;
-const DELEGATION_REPLY_DETAIL_KEYS = ['delegation.reply_objective_details'] as const;
+const DELEGATION_OBJECTIVE_TOGGLE_KEYS = [
+  'delegation.objective_expand',
+  'delegation.objective_collapse',
+] as const;
 
 function readPath(value: unknown, path: string): unknown {
   return path.split('.').reduce<unknown>((current, key) => (
@@ -366,12 +369,12 @@ function readPath(value: unknown, path: string): unknown {
 }
 
 describe('generic i18n coverage guard', () => {
-  it('keeps the collapsed delegation objective label localized in every locale', () => {
+  it('keeps delegation objective expand/collapse controls localized in every locale', () => {
     for (const locale of SUPPORTED_LOCALES) {
       const messages = JSON.parse(
         readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8'),
       ) as unknown;
-      for (const key of DELEGATION_REPLY_DETAIL_KEYS) {
+      for (const key of DELEGATION_OBJECTIVE_TOGGLE_KEYS) {
         const value = readPath(messages, key);
         expect(value, `${locale}:${key}`).toEqual(expect.any(String));
         expect((value as string).trim().length, `${locale}:${key}`).toBeGreaterThan(0);

@@ -157,16 +157,25 @@ describe('styles.css regression contracts', () => {
   });
 
   it('never clips the delegation card header and keeps ids secondary on narrow screens', () => {
-    // The title and the "from" label wrap at every width; an ellipsis here hid
-    // most of the task objective on desktop.
+    // The title and the "from" label wrap at every width. The shared objective
+    // component owns the intentional three-line clamp instead of an ellipsis.
     const headRule = cssWithoutComments.match(/\.delegation-reply-card-head\s*\{[^}]*\}/)?.[0];
     expect(headRule).toMatch(/flex-wrap:\s*wrap/);
     const headSpanRule = cssWithoutComments.match(/\.delegation-reply-card-head\s+span\s*\{[^}]*\}/)?.[0];
     expect(headSpanRule).not.toMatch(/white-space:\s*nowrap|text-overflow:\s*ellipsis|overflow:\s*hidden/);
     const titleRule = cssWithoutComments.match(/\.delegation-reply-card-head\s+\.delegation-reply-card-objective\s*\{[^}]*\}/)?.[0];
-    expect(titleRule).toMatch(/white-space:\s*normal/);
-    expect(titleRule).toMatch(/overflow-wrap:\s*anywhere/);
-    expect(titleRule).not.toMatch(/text-overflow:\s*ellipsis|overflow:\s*hidden/);
+    expect(titleRule).not.toMatch(/display\s*:|white-space\s*:|text-overflow\s*:|max-height\s*:|overflow(?:-[xy])?\s*:/);
+    const peerTitleRule = cssWithoutComments.match(/\.peer-audit-result-objective\s*\{[^}]*\}/)?.[0];
+    expect(peerTitleRule).not.toMatch(/display\s*:|white-space\s*:|text-overflow\s*:|max-height\s*:|overflow(?:-[xy])?\s*:/);
+    for (const rule of cssWithoutComments.matchAll(/\.supervision-task-console-task-title\s+strong\s*\{[^}]*\}/g)) {
+      expect(rule[0]).not.toMatch(/display\s*:|white-space\s*:|text-overflow\s*:|max-height\s*:|overflow(?:-[xy])?\s*:/);
+    }
+    const objectiveBaseRule = cssWithoutComments.match(/\.expandable-task-objective-text\s*\{[^}]*\}/)?.[0];
+    expect(objectiveBaseRule).toMatch(/display:\s*-webkit-box/);
+    expect(objectiveBaseRule).toMatch(/white-space:\s*pre-line/);
+    expect(objectiveBaseRule).toMatch(/overflow-wrap:\s*break-word/);
+    const objectiveRule = cssWithoutComments.match(/\.expandable-task-objective-text\.is-clamped,[\s\S]*?\{[^}]*\}/)?.[0];
+    expect(objectiveRule).toMatch(/-webkit-line-clamp:\s*3/);
     const metaRule = cssWithoutComments.match(/\.delegation-reply-card-meta\s*\{[^}]*\}/)?.[0];
     expect(metaRule).toMatch(/flex-wrap:\s*wrap/);
     const verdictRule = cssWithoutComments.match(/\.delegation-reply-card-head\s+\.delegation-reply-verdict\s*\{[^}]*\}/)?.[0];

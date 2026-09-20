@@ -72,7 +72,7 @@ html { position: fixed; }
 .supervision-task-console-task-summary { width: 100%; padding: 10px; display: grid; grid-template-columns: minmax(0,1fr) auto auto; align-items: center; gap: 8px; color: inherit; background: none; border: 0; font: inherit; text-align: left; cursor: pointer; }
 .supervision-task-console-task-summary:hover { background: rgba(34,211,238,.055); }
 .supervision-task-console-task-title { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
-.supervision-task-console-task-title strong { overflow: hidden; color: #e2e8f0; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.supervision-task-console-task-title strong { color: #e2e8f0; font-size: 12px; }
 .supervision-task-console-task-title small { overflow: hidden; color: #64748b; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .supervision-task-console-status { padding: 3px 6px; border: 1px solid rgba(34,211,238,.24); border-radius: 999px; color: #67e8f9; background: rgba(8,145,178,.1); font-size: 9px; white-space: nowrap; }
 .supervision-task-console-status.status-rework, .supervision-task-console-status.status-blocked { color: #fbbf24; border-color: rgba(245,158,11,.3); background: rgba(245,158,11,.08); }
@@ -5193,7 +5193,8 @@ html.native-ios-mac .chat-dl-btn {
 .delegation-claim-secondary { opacity: 0.7; }
 /* The formal task identity: readable title first, then the exact ids. */
 .delegation-claim-task { display: flex; flex: 1 1 100%; flex-wrap: wrap; gap: 2px 12px; }
-.delegation-claim-task-title { flex: 1 1 100%; color: #e2e8f0; font-weight: 600; overflow-wrap: anywhere; }
+.delegation-claim-task-title { flex: 1 1 100%; display: flex; min-width: 0; align-items: flex-start; gap: 4px; color: #e2e8f0; font-weight: 600; overflow-wrap: anywhere; }
+.delegation-claim-task-title > span:first-child { flex: 0 0 auto; }
 .delegation-claim-diagnostics { flex: 1 1 100%; opacity: 0.6; }
 .delegation-claim-diagnostics > summary {
   cursor: pointer;
@@ -5831,15 +5832,14 @@ html.native-ios-mac .chat-dl-btn {
 .delegation-reply-card-heading { display: flex; min-width: 0; flex: 1 1 220px; flex-direction: column; gap: 2px; }
 .delegation-reply-card-kicker { font-size: 9px; line-height: 1.2; text-transform: uppercase; }
 .delegation-reply-card-head .delegation-reply-card-objective {
-  display: block;
   min-width: 0;
   color: #e2e8f0;
   font-size: 12px;
   font-weight: 650;
   line-height: 1.35;
-  overflow-wrap: anywhere;
-  white-space: normal;
 }
+.peer-audit-result-heading { margin-bottom: 5px; }
+.peer-audit-result-objective { color: #e2e8f0; font-size: 12px; line-height: 1.35; }
 .delegation-reply-card-meta { min-width: 0; display: flex; flex: 0 1 auto; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 4px 7px; margin-left: auto; }
 .delegation-reply-card-head .delegation-reply-verdict {
   flex: 0 0 auto;
@@ -5878,21 +5878,47 @@ html.native-ios-mac .chat-dl-btn {
   white-space: nowrap;
 }
 .delegation-reply-task.is-fallback .delegation-reply-task-ids { color: #94a3b8; }
-.delegation-reply-objective-details {
-  margin: -2px 0 8px;
-  color: #94a3b8;
-  font-size: 11px;
+.expandable-task-objective { min-width: 0; display: flex; flex: 1 1 auto; flex-direction: column; align-items: flex-start; gap: 2px; }
+.expandable-task-objective-text {
+  display: -webkit-box;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  overflow-wrap: break-word;
+  white-space: pre-line;
+  -webkit-box-orient: vertical;
 }
-.delegation-reply-objective-details > summary { cursor: pointer; user-select: none; }
-.delegation-reply-objective-details > div {
-  margin-top: 5px;
-  max-height: calc(1.45em * 8);
+.expandable-task-objective-text.is-clamped,
+.expandable-task-objective-text.is-measuring-clamped { -webkit-line-clamp: 3; }
+.expandable-task-objective-text.is-expanded {
+  display: block;
+  max-height: min(16rem, 45vh);
   overflow-y: auto;
-  color: #cbd5e1;
-  line-height: 1.45;
-  overflow-wrap: anywhere;
-  white-space: pre-wrap;
+  scrollbar-width: thin;
 }
+.expandable-task-objective-text.is-expanded.is-measuring-clamped {
+  display: -webkit-box;
+  max-height: none;
+  overflow: hidden;
+  -webkit-line-clamp: 3;
+}
+.expandable-task-objective-toggle {
+  padding: 1px 3px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: #94a3b8;
+  background: transparent;
+  border: 0;
+  border-radius: 3px;
+  font: inherit;
+  font-size: 9px;
+  line-height: 1.25;
+  cursor: pointer;
+}
+.expandable-task-objective-toggle:hover,
+.expandable-task-objective-toggle:focus-visible { color: #e2e8f0; background: rgba(148,163,184,.1); outline: none; }
+.expandable-task-objective-activate { width: 100%; min-width: 0; padding: 0; color: inherit; background: none; border: 0; font: inherit; text-align: left; cursor: pointer; }
 .delegation-reply-card-findings > summary { cursor: pointer; color: #cbd5e1; font-size: 11px; }
 .delegation-reply-card-findings[open] > summary { margin-bottom: 6px; }
 .delegation-reply-card-body {
@@ -13903,10 +13929,11 @@ button.quick-agent-delegation-preset.active {
 .supervision-task-console-group.group-integration > header { color: #c4b5fd; }
 .supervision-task-console-group.group-final > header { color: #86efac; }
 .supervision-task-console-task { position: relative; margin-bottom: 8px; overflow: hidden; border: 1px solid rgba(148,163,184,.16); border-radius: 9px; background: rgba(15,23,42,.68); box-shadow: inset 0 1px 0 rgba(255,255,255,.025); }
-.supervision-task-console-task-summary { width: 100%; padding: 10px; display: grid; grid-template-columns: minmax(0,1fr) auto auto; align-items: center; gap: 8px; color: inherit; background: none; border: 0; font: inherit; text-align: left; cursor: pointer; }
+.supervision-task-console-task-summary { width: 100%; padding: 10px; display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: start; gap: 8px; color: inherit; background: none; border: 0; font: inherit; text-align: left; }
 .supervision-task-console-task-summary:hover { background: rgba(34,211,238,.055); }
+.supervision-task-console-details-toggle { padding: 0; display: inline-flex; align-items: center; gap: 8px; color: inherit; background: none; border: 0; font: inherit; cursor: pointer; }
 .supervision-task-console-task-title { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
-.supervision-task-console-task-title strong { overflow: hidden; color: #e2e8f0; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.supervision-task-console-task-title strong { color: #e2e8f0; font-size: 12px; }
 .supervision-task-console-task-title small { overflow: hidden; color: #64748b; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .supervision-task-console-status { padding: 3px 6px; border: 1px solid rgba(34,211,238,.24); border-radius: 999px; color: #67e8f9; background: rgba(8,145,178,.1); font-size: 9px; white-space: nowrap; }
 .supervision-task-console-status.status-rework, .supervision-task-console-status.status-blocked { color: #fbbf24; border-color: rgba(245,158,11,.3); background: rgba(245,158,11,.08); }
@@ -13961,7 +13988,7 @@ button.quick-agent-delegation-preset.active {
 .supervision-task-console-task { margin: 0; overflow: visible; border-color: rgba(148,163,184,.13); border-radius: 8px; }
 .supervision-task-console-task-head { display: grid; grid-template-columns: minmax(0,1fr) minmax(210px,.72fr); align-items: start; }
 .supervision-task-console-task-summary { min-height: 54px; padding: 8px 9px; }
-.supervision-task-console-task-title strong { display: -webkit-box; overflow: hidden; font-size: 12px; line-height: 1.35; white-space: normal; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.supervision-task-console-task-title strong { font-size: 12px; line-height: 1.35; }
 .supervision-task-console-role-tracks { padding: 7px 7px 7px 0; display: grid; gap: 4px; }
 .supervision-task-console-session { position: relative; min-width: 0; padding: 5px 6px; display: grid; grid-template-columns: 7px minmax(0,1fr) auto; align-items: center; gap: 5px; color: #94a3b8; background: rgba(2,6,23,.36); border: 1px solid rgba(148,163,184,.12); border-radius: 6px; font: inherit; text-align: left; cursor: pointer; }
 .supervision-task-console-session:hover, .supervision-task-console-session:focus-visible { color: #e2e8f0; border-color: rgba(34,211,238,.38); outline: none; }

@@ -41,6 +41,26 @@ describe('delegation dispatch facts', () => {
     expect(fact).toMatchObject({ taskId: 'tsk_new', assignmentId: 'asg_new' });
   });
 
+  it('carries the full objective only when it matches the authoritative concise title', () => {
+    const objective = 'Repair the delegation reply card title. Preserve the full registry objective on every UI surface.';
+    const fact = readDelegationDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER,
+      'send_message',
+      TASK_ARGS,
+      { ...ACCEPTED_OUTPUT, taskTitle: 'Repair the delegation reply card title.…', taskObjective: objective },
+    );
+    expect(fact?.taskObjective).toBe(objective);
+    expect(projectDelegationClaim([fact!]).dispatches[0]?.taskObjective).toBe(objective);
+
+    const mismatched = readDelegationDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER,
+      'send_message',
+      TASK_ARGS,
+      { ...ACCEPTED_OUTPUT, taskTitle: 'Different authoritative title', taskObjective: objective },
+    );
+    expect(mismatched).not.toHaveProperty('taskObjective');
+  });
+
   it('refuses requested ids that disagree with the accepted authority ids', () => {
     expect(readDelegationDispatchFact(
       DELEGATION_AUTHORITY_MCP_SERVER, 'send_message', TASK_ARGS,

@@ -7,6 +7,7 @@ import { cleanup, fireEvent, render } from '@testing-library/preact';
 import type { TimelineEvent } from '../../src/ws-client.js';
 import { isUserVisible } from '../../src/util/isUserVisible.js';
 import { AGENT_DELEGATION_SUPERVISION_TASK_OBJECTIVE_MAX_BYTES } from '@shared/agent-delegation.js';
+import { deriveSupervisionTaskTitle } from '@shared/supervision-task-identity.js';
 
 const fileBrowserProps: any[] = [];
 
@@ -48,6 +49,8 @@ vi.mock('react-i18next', () => ({
         'delegation.reply_title': 'Delegation reply',
         'delegation.reply_from': `From ${vars?.source ?? ''}`,
         'delegation.reply_objective_details': 'Full task objective',
+        'delegation.objective_expand': 'Expand',
+        'delegation.objective_collapse': 'Collapse',
         'delegation.claim.task_id': 'Task ID',
         'delegation.claim.assignment_id': 'Assignment ID',
       };
@@ -102,9 +105,33 @@ function makeEvent(type: TimelineEvent['type'], payload: Record<string, unknown>
 
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
   localStorage.clear();
   fileBrowserProps.length = 0;
 });
+
+function installObjectiveGeometry(): void {
+  vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(48);
+  vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockImplementation(function (this: HTMLElement) {
+    return (this.textContent?.length ?? 0) > 500 ? 240 : 32;
+  });
+}
+
+function expectExpandableObjective(container: HTMLElement, selector: string, objective: string): void {
+  const text = container.querySelector<HTMLElement>(selector);
+  expect(text?.textContent).toBe(objective);
+  expect(text?.classList.contains('is-clamped')).toBe(true);
+  const expand = container.querySelector<HTMLButtonElement>('.expandable-task-objective-toggle');
+  expect(expand?.getAttribute('aria-expanded')).toBe('false');
+  expect(expand?.getAttribute('aria-controls')).toBe(text?.id);
+  fireEvent.click(expand!);
+  expect(text?.classList.contains('is-expanded')).toBe(true);
+  const collapse = container.querySelector<HTMLButtonElement>('.expandable-task-objective-toggle');
+  expect(collapse?.getAttribute('aria-expanded')).toBe('true');
+  expect(collapse?.textContent).toContain('Collapse');
+  fireEvent.click(collapse!);
+  expect(text?.classList.contains('is-clamped')).toBe(true);
+}
 
 describe('ChatView file-change cards', () => {
   it('routes right-side file panel previews to the shared preview host', () => {
@@ -475,6 +502,23 @@ describe('ChatView peer-audit result cards', () => {
     expect(card?.textContent).toContain('Peer CC');
     expect(card?.textContent).not.toContain('target_unavailable');
   });
+
+  it('renders the authoritative peer-audit objective with the same three-line expandable header', () => {
+    installObjectiveGeometry();
+    const objective = `Repair the peer audit result title. ${'Preserve every authoritative task detail. '.repeat(28)}`.trim();
+    const event = makeEvent('peer_audit.result', {
+      outcome: 'rework', auditorLabel: 'Peer CC', elapsedMs: 2_100,
+      supervisionTask: {
+        version: 1, taskId: 'tsk_peer', assignmentId: 'asg_peer',
+        attemptId: 'attempt-peer', revision: 'revision-peer',
+        title: deriveSupervisionTaskTitle(objective), objective,
+      },
+    });
+    const { container } = render(<ChatView events={[event]} loading={false} sessionId="session-a" />);
+    expect(container.querySelector('.peer-audit-result-card')?.getAttribute('data-task-id')).toBe('tsk_peer');
+    expectExpandableObjective(container, '.peer-audit-result-objective', objective);
+    expect(container.textContent?.split(objective)).toHaveLength(2);
+  });
 });
 
 describe('ChatView delegation reply cards', () => {
@@ -593,7 +637,8 @@ describe('ChatView delegation reply cards', () => {
         assignmentId: 'asg_live',
         attemptId: 'attempt-live',
         revision: 'revision-live',
-        title: 'Prevent duplicate payment retries',
+        title: 'Prevent duplicate payment retries.…',
+        objective: 'Prevent duplicate payment retries. Preserve the full authoritative live objective.',
       },
     }, { eventId: 'live-pass' });
     const rework = makeEvent('delegation.reply', {
@@ -610,7 +655,7 @@ describe('ChatView delegation reply cards', () => {
       },
     }, { eventId: 'history-rework' });
     const view = render(<ChatView events={[pass]} loading={false} sessionId="session-a" />);
-    expect(view.container.textContent).toContain('Prevent duplicate payment retries');
+    expect(view.container.textContent).toContain('Prevent duplicate payment retries. Preserve the full authoritative live objective.');
     view.rerender(<ChatView events={[rework, pass]} loading={false} sessionId="session-a" />);
 
     const tasks = view.container.querySelectorAll('[data-testid="delegation-reply-task"]');
@@ -620,14 +665,49 @@ describe('ChatView delegation reply cards', () => {
     expect(tasks[1]?.textContent).toContain('tsk_live');
     const objectives = view.container.querySelectorAll('.delegation-reply-card-objective');
     expect(objectives[0]?.textContent).toBe('Repair authorization binding');
-    expect(objectives[1]?.textContent).toBe('Prevent duplicate payment retries');
+    expect(objectives[1]?.textContent).toBe('Prevent duplicate payment retries. Preserve the full authoritative live objective.');
     expect(objectives[0]?.textContent).not.toContain('FORGED REWORK TITLE');
     expect(objectives[1]?.textContent).not.toContain('FORGED PASS TITLE');
     expect(requestSpy).not.toHaveBeenCalled();
     requestSpy.mockRestore();
   });
 
-  it('shows a concise title and keeps a 1000-character objective in collapsed details', () => {
+  it.each([
+    ['live', true],
+    ['reloaded history', false],
+  ] as const)('keeps a 1000-character %s reply objective clamped, expandable, and single-copy', (_label, arrivesLive) => {
+    installObjectiveGeometry();
+    const objective = `Repair the delegation reply card title. ${'Preserve all authoritative objective context. '.repeat(28)}`.trim();
+    const event = makeEvent('delegation.reply', {
+      sourceLabel: 'CC11', result: 'PASS',
+      supervisionTask: {
+        version: 1, taskId: 'tsk_long', assignmentId: 'asg_long',
+        title: deriveSupervisionTaskTitle(objective), objective,
+      },
+    });
+    const view = render(<ChatView events={arrivesLive ? [] : [event]} loading={false} sessionId="session-a" />);
+    if (arrivesLive) view.rerender(<ChatView events={[event]} loading={false} sessionId="session-a" />);
+    expectExpandableObjective(view.container, '.delegation-reply-card-objective', objective);
+    expect(view.container.textContent?.split(objective)).toHaveLength(2);
+    expect(view.container.querySelector('.delegation-reply-objective-details')).toBeNull();
+  });
+
+  it('shows a two-line authoritative objective in full without an expand control', () => {
+    installObjectiveGeometry();
+    const objective = 'Short authoritative objective\nSecond visible line';
+    const event = makeEvent('delegation.reply', {
+      sourceLabel: 'CC11', result: 'PASS',
+      supervisionTask: {
+        version: 1, taskId: 'tsk_short', assignmentId: 'asg_short',
+        title: deriveSupervisionTaskTitle(objective), objective,
+      },
+    });
+    const { container } = render(<ChatView events={[event]} loading={false} sessionId="session-a" />);
+    expect(container.querySelector('.delegation-reply-card-objective')?.textContent).toBe(objective);
+    expect(container.querySelector('.expandable-task-objective-toggle')).toBeNull();
+  });
+
+  it('shows a 1000-character objective once in the expandable card title', () => {
     const objective = `Repair the delegation reply card title. ${'Preserve all authoritative objective context. '.repeat(24)}`.trim();
     expect(objective.length).toBeGreaterThan(1000);
     const event = makeEvent('delegation.reply', {
@@ -642,13 +722,9 @@ describe('ChatView delegation reply cards', () => {
       },
     });
     const { container } = render(<ChatView events={[event]} loading={false} sessionId="session-a" />);
-    expect(container.querySelector('.delegation-reply-card-objective')?.textContent)
-      .toBe('Repair the delegation reply card title.…');
-    const details = container.querySelector('.delegation-reply-objective-details');
-    expect(details).not.toBeNull();
-    expect(details?.hasAttribute('open')).toBe(false);
-    expect(details?.querySelector('summary')?.textContent).toBe('Full task objective');
-    expect(details?.textContent).toContain(objective);
+    expect(container.querySelector('.delegation-reply-card-objective')?.textContent).toBe(objective);
+    expect(container.querySelector('.delegation-reply-objective-details')).toBeNull();
+    expect(container.textContent?.split(objective)).toHaveLength(2);
   });
 
   it.each([
