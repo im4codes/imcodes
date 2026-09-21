@@ -1253,6 +1253,7 @@ implements UnattendedPasswordControlBootstrapIssuer {
       const issued = await issueNodePasswordBootstrap(this.db, {
         ...input,
         fullEndpointEligible: this.options.fullEndpointEligible,
+        endpointEligible: this.options.fullEndpointEligible,
       });
       if (!issued) return null;
       // Presence can change while the bootstrap transaction is committing.

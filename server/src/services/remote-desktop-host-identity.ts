@@ -341,7 +341,10 @@ export async function allocateActivePublicNodeId(input: {
 export async function resolveExecutionEndpoint(input: {
   db: Database;
   hostId: string;
+  /** Whether a FULL daemon currently advertises/owns remote-desktop execution. */
   fullEndpointEligible?: FullEndpointEligibility;
+  /** Optional fleet-wide presence gate applied to either endpoint role. */
+  endpointEligible?: FullEndpointEligibility;
 }): Promise<{ serverId: string; role: HostEndpointRole } | null> {
   const rows = await input.db.query<EndpointRow & { controlled_capabilities: unknown }>(
     `SELECT e.server_id, e.host_id, e.endpoint_role, s.controlled_capabilities
@@ -353,15 +356,19 @@ export async function resolveExecutionEndpoint(input: {
   const controlled = rows.find((row) => (
     row.endpoint_role === HOST_ENDPOINT_ROLE.CONTROLLED && isEligibleEndpoint(row)
   ));
-  if (controlled && (!input.fullEndpointEligible
-    || await input.fullEndpointEligible(controlled.server_id))) {
+  if (controlled && (!input.endpointEligible
+    || await input.endpointEligible(controlled.server_id))) {
     return { serverId: controlled.server_id, role: HOST_ENDPOINT_ROLE.CONTROLLED };
   }
 
   if (!input.fullEndpointEligible) return null;
   for (const row of rows) {
-    if (row.endpoint_role === HOST_ENDPOINT_ROLE.FULL
-      && await input.fullEndpointEligible(row.server_id)) {
+    if (row.endpoint_role !== HOST_ENDPOINT_ROLE.FULL) continue;
+    const fullEligible = await input.fullEndpointEligible(row.server_id);
+    const present = !input.endpointEligible
+      || input.endpointEligible === input.fullEndpointEligible
+      || await input.endpointEligible(row.server_id);
+    if (fullEligible && present) {
       return { serverId: row.server_id, role: HOST_ENDPOINT_ROLE.FULL };
     }
   }
@@ -386,6 +393,7 @@ export async function isGuestAdmissionReady(input: {
   db: Database;
   hostId: string;
   fullEndpointEligible?: FullEndpointEligibility;
+  endpointEligible?: FullEndpointEligibility;
 }): Promise<boolean> {
   const host = await input.db.queryOne<{ merge_state: string }>(
     'SELECT merge_state FROM remote_desktop_hosts WHERE id = $1',
@@ -403,6 +411,7 @@ export async function isGuestAdmissionReady(input: {
     db: input.db,
     hostId: input.hostId,
     fullEndpointEligible: input.fullEndpointEligible,
+    endpointEligible: input.endpointEligible,
   })) !== null;
 }
 

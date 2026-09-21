@@ -250,6 +250,21 @@ describe('endpoint selection and admission readiness (3.4)', () => {
     expect(selected).toEqual({ serverId: controlledId, role: HOST_ENDPOINT_ROLE.CONTROLLED });
   });
 
+  it('uses the separate fleet-presence gate to fall back from an offline controlled endpoint', async () => {
+    const userId = await seedUser();
+    const daemonId = await seedEndpoint({ userId, role: 'full' });
+    const controlledId = await seedEndpoint({ userId, role: 'controlled', hostServerId: daemonId });
+    const { hostId } = await ensureCanonicalHostForServer({ db, serverId: daemonId, now: NOW });
+
+    const selected = await resolveExecutionEndpoint({
+      db,
+      hostId,
+      fullEndpointEligible: (serverId) => serverId === daemonId,
+      endpointEligible: (serverId) => serverId !== controlledId,
+    });
+    expect(selected).toEqual({ serverId: daemonId, role: HOST_ENDPOINT_ROLE.FULL });
+  });
+
   it('falls back to the daemon when the controlled endpoint loses eligibility, keeping the identity', async () => {
     const userId = await seedUser();
     const daemonId = await seedEndpoint({ userId, role: 'full' });

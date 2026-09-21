@@ -141,6 +141,8 @@ export interface ResolveLinkProofInput {
   ttlMs?: number;
   /** Injected liveness seam for FULL daemons; absent means only controlled endpoints qualify. */
   fullEndpointEligible?: FullEndpointEligibility;
+  /** Fleet-wide durable presence seam for either endpoint role. */
+  endpointEligible?: FullEndpointEligibility;
   /** Server-local diagnostics only; the public response remains byte-identical. */
   onRefusal?: (reason: RemoteDesktopLinkProofRefusal) => void;
 }
@@ -285,7 +287,12 @@ export async function resolveLinkProof(
     // 3. Only a currently qualified endpoint may be disclosed.  Keep this
     // before the first browser-claim write: a transiently closed privacy gate
     // must consume this one-use challenge without poisoning the durable link.
-    const endpoint = await resolveQualifiedEndpointTx(tx, link.host_id, input.fullEndpointEligible);
+    const endpoint = await resolveQualifiedEndpointTx(
+      tx,
+      link.host_id,
+      input.fullEndpointEligible,
+      input.endpointEligible,
+    );
     if (!endpoint) return refuse(REMOTE_DESKTOP_LINK_PROOF_REFUSAL.TARGET_UNAVAILABLE);
 
     // 4. Bind this browser key under the link's policy. The locked link row
@@ -367,6 +374,7 @@ async function resolveQualifiedEndpointTx(
   tx: Database,
   hostId: string,
   fullEndpointEligible?: FullEndpointEligibility,
+  endpointEligible?: FullEndpointEligibility,
 ): Promise<string | null> {
   const privacy = await tx.queryOne<{ phase: string; admission_open: boolean }>(
     `SELECT phase, admission_open
@@ -375,8 +383,18 @@ async function resolveQualifiedEndpointTx(
     [hostId],
   );
   if (!privacy || privacy.phase !== 'idle' || !privacy.admission_open) return null;
-  if (!await isGuestAdmissionReady({ db: tx, hostId, fullEndpointEligible })) return null;
-  return (await resolveExecutionEndpoint({ db: tx, hostId, fullEndpointEligible }))?.serverId ?? null;
+  if (!await isGuestAdmissionReady({
+    db: tx,
+    hostId,
+    fullEndpointEligible,
+    endpointEligible,
+  })) return null;
+  return (await resolveExecutionEndpoint({
+    db: tx,
+    hostId,
+    fullEndpointEligible,
+    endpointEligible,
+  }))?.serverId ?? null;
 }
 
 async function issueBootstrapTx(tx: Database, input: {
@@ -430,6 +448,7 @@ export async function issueNodePasswordBootstrap(db: Database, input: {
   now: number;
   ttlMs?: number;
   fullEndpointEligible?: FullEndpointEligibility;
+  endpointEligible?: FullEndpointEligibility;
 }): Promise<ProofSuccess | null> {
   if (!isRemoteDesktopBrowserKeyBindingValid(input)
     || !isRemoteDesktopPublicNodeId(Number(input.publicNodeId))) return null;
@@ -451,7 +470,12 @@ export async function issueNodePasswordBootstrap(db: Database, input: {
     );
     if (!credential || credential.disabled_at !== null
       || credential.generation !== input.credentialGeneration) return null;
-    const endpoint = await resolveQualifiedEndpointTx(tx, input.hostId, input.fullEndpointEligible);
+    const endpoint = await resolveQualifiedEndpointTx(
+      tx,
+      input.hostId,
+      input.fullEndpointEligible,
+      input.endpointEligible,
+    );
     if (!endpoint) return null;
     const issued = await issueBootstrapTx(tx, {
       hostId: input.hostId,

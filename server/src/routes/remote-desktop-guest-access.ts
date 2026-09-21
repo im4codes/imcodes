@@ -299,10 +299,12 @@ remoteDesktopGuestAccessRoutes.post('/remote-desktop/guest/resolve', async (c) =
   if (!parsed.ok) return c.json(PUBLIC_UNAVAILABLE);
 
   let refusal: RemoteDesktopLinkProofRefusal | null = null;
+  const endpointEligible = createPostgresRemoteDesktopEndpointEligibility({ db: c.env.DB });
   const result = await resolveLinkProof(c.env.DB, {
     proof: parsed.value,
     now: Date.now(),
-    fullEndpointEligible: createPostgresRemoteDesktopEndpointEligibility({ db: c.env.DB }),
+    fullEndpointEligible: endpointEligible,
+    endpointEligible,
     onRefusal: (reason) => {
       refusal = reason;
       logger.info({ reason }, 'authenticated remote-desktop invitation proof refused');
