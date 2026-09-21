@@ -7296,6 +7296,7 @@ export class WsBridge {
           activeModel: msg.activeModel || msg.modelDisplay || null,
           effort: msg.effort || null,
           transportConfig: msg.transportConfig || null,
+          supervisionHeartbeat: msg.supervisionHeartbeat || null,
           ...queueRelay,
           ...executionCloneProjection,
           qwenModel: msg.qwenModel || null,

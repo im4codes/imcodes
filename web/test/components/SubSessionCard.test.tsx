@@ -137,6 +137,35 @@ describe('SubSessionCard', () => {
     });
   });
 
+  it('passes original quota and heartbeat props into the compact ChatView card', () => {
+    render(
+      <SubSessionCard
+        sub={makeSubSession({
+          type: 'codex-sdk',
+          quotaLabel: '7d 55% 5d05h 9/26 18:39',
+          quotaMeta: { primary: { usedPercent: 55, windowDurationMins: 10_080 } },
+          supervisionMode: 'supervised_audit',
+          supervisionHeartbeat: { state: 'armed', kind: 'audit', nextHeartbeatAt: 12_000, updatedAt: 2_000 },
+        } as any)}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        isFocused={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    expect(chatViewPropsSpy.mock.calls.at(-1)?.[0]).toMatchObject({
+      preview: true,
+      quotaLabel: '7d 55% 5d05h 9/26 18:39',
+      quotaMeta: { primary: { usedPercent: 55, windowDurationMins: 10_080 } },
+      supervisionMode: 'supervised_audit',
+      supervisionHeartbeat: { state: 'armed', kind: 'audit', nextHeartbeatAt: 12_000, updatedAt: 2_000 },
+    });
+  });
+
   it('attaches the live timeline before closed preview hydration', async () => {
     vi.useFakeTimers();
     render(

@@ -38,6 +38,7 @@ import {
 } from '../../../shared/supervision-config.js';
 import { isEmbeddingStatus } from '../../../shared/embedding-status.js';
 import { isDirectConnectivityRuntimeStatus } from '../../../shared/direct-file-transfer.js';
+import type { ProviderQuotaMeta, ProviderQuotaWindow } from '../../../shared/provider-quota.js';
 
 export { shareTargetKey };
 export type { EffectiveCoverage, ShareTarget };
@@ -1075,8 +1076,12 @@ function redactDaemonStatsForParticipant(
  * Deliberately absent: `transportConfig` (provider blob that can carry env and
  * endpoints), `providerId` /
  * `providerSessionId`, every `*AuthType` / `*AuthLimit` / `*AvailableModels`,
- * `planLabel`, `permissionLabel`, `quota*`, `contextNamespace*`, `effort`,
+ * `planLabel`, `permissionLabel`, `contextNamespace*`, `effort`,
  * `ccPreset`, `requestedModel`.
+ *
+ * Participant shares receive only the bounded display projection of `quota*`
+ * below. Quota percentages/reset clocks are already user-facing session
+ * telemetry; provider/account configuration and credit balances remain hidden.
  */
 const SHARE_VISIBLE_SESSION_FIELDS = new Set([
   'name',
@@ -1098,14 +1103,70 @@ const SHARE_VISIBLE_SESSION_FIELDS = new Set([
   'supervisionHeartbeat',
 ]);
 
-function redactSessionRow(row: Record<string, unknown>, includeActiveDispatch: boolean): Record<string, unknown> {
+const SHARE_PROVIDER_QUOTA_TEXT_MAX_CHARS = 1_024;
+
+function projectProviderQuotaWindow(value: unknown): ProviderQuotaWindow | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  const usedPercent = typeof raw.usedPercent === 'number' && Number.isFinite(raw.usedPercent)
+    ? Math.max(0, Math.min(100, raw.usedPercent))
+    : undefined;
+  const windowDurationMins = typeof raw.windowDurationMins === 'number'
+    && Number.isFinite(raw.windowDurationMins)
+    && raw.windowDurationMins > 0
+    ? raw.windowDurationMins
+    : undefined;
+  const resetsAt = typeof raw.resetsAt === 'number' && Number.isFinite(raw.resetsAt) && raw.resetsAt > 0
+    ? raw.resetsAt
+    : undefined;
+  if (usedPercent === undefined && windowDurationMins === undefined && resetsAt === undefined) return undefined;
+  return {
+    ...(usedPercent !== undefined ? { usedPercent } : {}),
+    ...(windowDurationMins !== undefined ? { windowDurationMins } : {}),
+    ...(resetsAt !== undefined ? { resetsAt } : {}),
+  };
+}
+
+function projectProviderQuotaMeta(value: unknown): ProviderQuotaMeta | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  const primary = projectProviderQuotaWindow(raw.primary);
+  const secondary = projectProviderQuotaWindow(raw.secondary);
+  if (!primary && !secondary) return undefined;
+  return {
+    ...(primary ? { primary } : {}),
+    ...(secondary ? { secondary } : {}),
+  };
+}
+
+function projectQuotaText(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.trim();
+  return normalized && normalized.length <= SHARE_PROVIDER_QUOTA_TEXT_MAX_CHARS
+    ? normalized
+    : undefined;
+}
+
+function projectParticipantProviderQuota(row: Record<string, unknown>): Record<string, unknown> {
+  const quotaLabel = projectQuotaText(row.quotaLabel);
+  const quotaUsageLabel = projectQuotaText(row.quotaUsageLabel);
+  const quotaMeta = projectProviderQuotaMeta(row.quotaMeta);
+  return {
+    ...(quotaLabel ? { quotaLabel } : {}),
+    ...(quotaUsageLabel ? { quotaUsageLabel } : {}),
+    ...(quotaMeta ? { quotaMeta } : {}),
+  };
+}
+
+function redactSessionRow(row: Record<string, unknown>, includeParticipantFields: boolean): Record<string, unknown> {
   const redacted: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(row)) {
     if (SHARE_VISIBLE_SESSION_FIELDS.has(key)) redacted[key] = value;
   }
-  if (includeActiveDispatch && Object.prototype.hasOwnProperty.call(row, 'activeDispatchId')) {
+  if (includeParticipantFields && Object.prototype.hasOwnProperty.call(row, 'activeDispatchId')) {
     redacted.activeDispatchId = row.activeDispatchId;
   }
+  if (includeParticipantFields) Object.assign(redacted, projectParticipantProviderQuota(row));
   const supervisionMode = projectSharedSessionSupervisionMode(row.transportConfig);
   if (supervisionMode) redacted[SUPERVISION_MODE_PROJECTION_KEY] = supervisionMode;
   return redacted;
@@ -1130,7 +1191,7 @@ const SHARE_VISIBLE_SUBSESSION_FIELDS = new Set([
 
 function redactSubsessionCreated(
   msg: Record<string, unknown>,
-  _state: ShareScopedSocketState,
+  state: ShareScopedSocketState,
 ): Record<string, unknown> {
   const redacted: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(msg)) {
@@ -1138,6 +1199,9 @@ function redactSubsessionCreated(
   }
   const supervisionMode = projectSharedSessionSupervisionMode(msg.transportConfig);
   if (supervisionMode) redacted[SUPERVISION_MODE_PROJECTION_KEY] = supervisionMode;
+  if (state.snapshot.effectiveRole === 'participant') {
+    Object.assign(redacted, projectParticipantProviderQuota(msg));
+  }
   return redacted;
 }
 

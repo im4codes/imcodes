@@ -672,6 +672,51 @@ describe('UsageFooter', () => {
     expect(container.querySelectorAll('.session-usage-codex-line-compact')).toHaveLength(1);
   });
 
+  it('renders a codex 7d-only quota beside the reset-credit badge', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 190_000,
+          cacheTokens: 0,
+          contextWindow: 258_400,
+          model: 'gpt-5.6-terra',
+        }}
+        sessionName="deck_jdzj_brain"
+        agentType="codex-sdk"
+        quotaLabel="7d 55% 5d05h 9/26 18:39"
+        quotaMeta={{
+          primary: {
+            usedPercent: 55,
+            windowDurationMins: 7 * 24 * 60,
+            resetsAt: 1_790_419_157,
+          },
+        }}
+        now={1_789_979_157_000}
+        wsClient={{} as never}
+      />,
+    );
+
+    expect(container.querySelector('.codex-credits-trigger')).toBeTruthy();
+    expect(screen.getByText(/7d 55%/)).toBeDefined();
+    expect(container.querySelectorAll('.session-usage-codex-line-compact')).toHaveLength(1);
+  });
+
+  it('does not hide a 7d-only quota merely because its reset timestamp has elapsed', () => {
+    render(
+      <UsageFooter
+        usage={{ inputTokens: 190_000, cacheTokens: 0, contextWindow: 258_400 }}
+        sessionName="deck_jdzj_brain"
+        agentType="codex-sdk"
+        quotaMeta={{
+          secondary: { usedPercent: 55, windowDurationMins: 10_080, resetsAt: 1_700_000_000 },
+        }}
+        now={1_800_000_000_000}
+      />,
+    );
+
+    expect(screen.getByText(/7d 55% 0m/)).toBeDefined();
+  });
+
   it('uses provider-sourced context window before model-family inference', () => {
     const { container } = render(
       <UsageFooter

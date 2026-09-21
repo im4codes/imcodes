@@ -116,9 +116,12 @@ describe('session_list row redaction', () => {
     codexAvailableModels: ['o3'],
     planLabel: 'Max 5x',
     permissionLabel: 'all',
-    quotaLabel: '80%',
+    quotaLabel: '7d 55% 5d05h 9/26 18:39',
     quotaUsageLabel: '4/5',
-    quotaMeta: { plan: 'enterprise' },
+    quotaMeta: {
+      primary: { usedPercent: 55, windowDurationMins: 10_080, resetsAt: 1_790_419_157 },
+      plan: 'enterprise',
+    },
     contextNamespace: 'host-namespace',
     contextNamespaceDiagnostics: { note: 'host detail' },
     effort: 'high',
@@ -145,6 +148,25 @@ describe('session_list row redaction', () => {
     for (const key of Object.keys(out)) {
       expect(allowed.has(key), `${key} must not reach a share recipient`).toBe(true);
     }
+  });
+
+  it.each([
+    ['a tab-scoped participant', tabScoped],
+    ['a server-scoped participant', serverScoped],
+  ])('keeps display-only provider quota for %s without exposing account/provider configuration', (_label, target) => {
+    const delivered = filterShareDaemonMessage(
+      { type: 'session_list', serverId, sessions: [row] },
+      socket(target, 'participant'),
+    );
+    const [out] = delivered?.sessions as Array<Record<string, unknown>>;
+    expect(out.quotaLabel).toBe('7d 55% 5d05h 9/26 18:39');
+    expect(out.quotaUsageLabel).toBe('4/5');
+    expect(out.quotaMeta).toEqual({
+      primary: { usedPercent: 55, windowDurationMins: 10_080, resetsAt: 1_790_419_157 },
+    });
+    expect(out).not.toHaveProperty('planLabel');
+    expect(out).not.toHaveProperty('providerId');
+    expect(out).not.toHaveProperty('codexCreditsBalance');
   });
 
   it('exposes the cancel guard token only to participants', () => {
@@ -176,5 +198,40 @@ describe('session_list row redaction', () => {
       status: 'accepted',
       activeDispatchId: 'dispatch-current',
     }, socket(tabScoped, 'participant'))).toMatchObject({ activeDispatchId: 'dispatch-current' });
+  });
+});
+
+describe('original audit-card timeline delivery', () => {
+  it.each([
+    ['main', 'deck_proj_brain'],
+    ['covered sub-session', 'deck_sub_child'],
+  ])('keeps trusted PASS/REWORK events for the %s participant timeline', (_label, sessionId) => {
+    const state = {
+      ...socket(tabScoped, 'participant'),
+      coveredSessionNames: ['deck_proj_brain', 'deck_sub_child'],
+    };
+    for (const event of [
+      {
+        eventId: `delegation-${sessionId}`,
+        sessionId,
+        type: 'delegation.reply',
+        source: 'daemon',
+        confidence: 'high',
+        payload: { verdict: 'PASS', round: 2, result: 'Exact findings.' },
+      },
+      {
+        eventId: `audit-${sessionId}`,
+        sessionId,
+        type: 'peer_audit.result',
+        source: 'daemon',
+        confidence: 'high',
+        payload: { outcome: 'rework', round: 3, findingsPreview: 'Repair required.' },
+      },
+    ]) {
+      expect(filterShareDaemonMessage({ type: 'timeline.event', event }, state)).toEqual({
+        type: 'timeline.event',
+        event,
+      });
+    }
   });
 });

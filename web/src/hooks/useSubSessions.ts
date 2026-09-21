@@ -336,6 +336,9 @@ export function useSubSessions(
                   ),
                 }),
                 ...(m.supervisionMode !== undefined && { supervisionMode: m.supervisionMode }),
+                ...(m.supervisionHeartbeat !== undefined && {
+                  supervisionHeartbeat: parseSupervisionHeartbeatSnapshot(m.supervisionHeartbeat),
+                }),
                 ...transportPendingPatch,
                 ...(m.qwenModel != null && { qwenModel: m.qwenModel }),
                 ...(m.qwenAuthType != null && { qwenAuthType: m.qwenAuthType }),

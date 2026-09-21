@@ -567,6 +567,26 @@ describe('ChatView peer-audit result cards', () => {
 
 describe('ChatView delegation reply cards', () => {
   it.each([
+    ['main/full window', false],
+    ['sub-session preview card', true],
+  ] as const)('renders the original PASS/REWORK card in a %s', (_label, preview) => {
+    const event = makeEvent('delegation.reply', {
+      memoryExcluded: true,
+      sourceSessionName: 'deck_sub_reviewer',
+      result: 'Exact audit findings.',
+      verdict: 'REWORK',
+      round: 3,
+    }, { eventId: `original-verdict-${preview ? 'preview' : 'full'}` });
+    const { container } = render(
+      <ChatView events={[event]} loading={false} sessionId="session-a" preview={preview} />,
+    );
+
+    const card = container.querySelector('.delegation-reply-card--rework');
+    expect(card?.querySelector('.delegation-reply-verdict')?.textContent).toBe('REWORK');
+    expect(card?.querySelector('.peer-audit-round-chip')?.textContent).toBe('R3');
+  });
+
+  it.each([
     ['live', true],
     ['reloaded history', false],
   ] as const)('renders the authoritative audit round on a %s verdict card', (_label, arrivesLive) => {

@@ -518,6 +518,7 @@ describe('WsBridge share-scoped sockets', () => {
 
     member.sent.length = 0;
     shared.sent.length = 0;
+    reconnectedParticipant.sent.length = 0;
     daemon.emit('message', JSON.stringify({
       type: 'session_list',
       sessions: [
@@ -543,6 +544,11 @@ describe('WsBridge share-scoped sockets', () => {
           supervisionHeartbeat: {
             state: 'armed', kind: 'audit', nextHeartbeatAt: 2_000, updatedAt: 1_000,
           },
+          quotaLabel: '7d 55% 5d05h 9/26 18:39',
+          quotaMeta: {
+            primary: { usedPercent: 55, windowDurationMins: 10_080, resetsAt: 1_790_419_157 },
+          },
+          codexCreditsBalance: '99.00',
         },
         { name: 'deck_other_brain', runtimeType: 'transport' },
       ],
@@ -551,6 +557,7 @@ describe('WsBridge share-scoped sockets', () => {
 
     const memberList = member.sentJson.find((msg) => msg.type === 'session_list');
     const sharedList = shared.sentJson.find((msg) => msg.type === 'session_list');
+    const participantList = reconnectedParticipant.sentJson.find((msg) => msg.type === 'session_list');
     expect((memberList?.sessions as unknown[])).toHaveLength(2);
     expect(sharedList?.sessions).toEqual([{
       name: 'deck_proj_brain',
@@ -561,6 +568,21 @@ describe('WsBridge share-scoped sockets', () => {
         state: 'armed', kind: 'audit', nextHeartbeatAt: 2_000, updatedAt: 1_000,
       },
     }]);
+    expect(participantList?.sessions).toEqual([{
+      name: 'deck_proj_brain',
+      runtimeType: 'transport',
+      projectDir: '/owner/project',
+      activeDispatchId: null,
+      supervisionMode: 'supervised_audit',
+      supervisionHeartbeat: {
+        state: 'armed', kind: 'audit', nextHeartbeatAt: 2_000, updatedAt: 1_000,
+      },
+      quotaLabel: '7d 55% 5d05h 9/26 18:39',
+      quotaMeta: {
+        primary: { usedPercent: 55, windowDurationMins: 10_080, resetsAt: 1_790_419_157 },
+      },
+    }]);
+    expect((participantList?.sessions as Array<Record<string, unknown>>)[0]).not.toHaveProperty('codexCreditsBalance');
     expect((sharedList?.sessions as Array<Record<string, unknown>>)[0]).not.toHaveProperty('transportConfig');
   });
 
@@ -587,6 +609,11 @@ describe('WsBridge share-scoped sockets', () => {
       },
       providerId: 'private-provider',
       requestedModel: 'private-model',
+      quotaLabel: '7d 55% 5d05h 9/26 18:39',
+      quotaMeta: {
+        primary: { usedPercent: 55, windowDurationMins: 10_080, resetsAt: 1_790_419_157 },
+      },
+      codexCreditsBalance: '99.00',
       supervisionHeartbeat: {
         state: 'paused_needs_input', updatedAt: 1_000,
       },
@@ -600,10 +627,72 @@ describe('WsBridge share-scoped sockets', () => {
       supervisionHeartbeat: {
         state: 'paused_needs_input', updatedAt: 1_000,
       },
+      quotaLabel: '7d 55% 5d05h 9/26 18:39',
+      quotaMeta: {
+        primary: { usedPercent: 55, windowDurationMins: 10_080, resetsAt: 1_790_419_157 },
+      },
     });
     expect(filtered).not.toHaveProperty('transportConfig');
     expect(filtered).not.toHaveProperty('providerId');
     expect(filtered).not.toHaveProperty('requestedModel');
+    expect(filtered).not.toHaveProperty('codexCreditsBalance');
+
+    const viewer = filterShareDaemonMessage({
+      type: 'subsession.created',
+      id: 'child',
+      sessionName: 'deck_sub_child',
+      parentSession: 'deck_proj_brain',
+      sessionType: 'codex-sdk',
+      quotaLabel: '7d 55% 5d05h 9/26 18:39',
+      quotaMeta: {
+        primary: { usedPercent: 55, windowDurationMins: 10_080, resetsAt: 1_790_419_157 },
+      },
+    }, {
+      ...state,
+      snapshot: coverage(target, 'viewer', now),
+    });
+    expect(viewer).not.toHaveProperty('quotaLabel');
+    expect(viewer).not.toHaveProperty('quotaMeta');
+  });
+
+  it('relays sub-session quota and the original supervision heartbeat badge projection to participants', async () => {
+    const bridge = WsBridge.get(serverId);
+    const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
+    const daemon = new MockWs();
+    bridge.handleDaemonConnection(daemon as never, makeDb(), { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+
+    const participant = new MockWs();
+    bridge.handleShareBrowserConnection(participant as never, 'participant-user', makeDb(), {
+      ticketId: 'subsession-projection-ticket',
+      target,
+      snapshot: coverage(target, 'participant', now),
+    });
+    participant.sent.length = 0;
+
+    daemon.emit('message', JSON.stringify({
+      type: 'subsession.sync',
+      id: 'child',
+      parentSession: 'deck_proj_brain',
+      sessionType: 'codex-sdk',
+      state: 'idle',
+      quotaLabel: '7d 55% 5d05h 9/26 18:39',
+      quotaMeta: {
+        primary: { usedPercent: 55, windowDurationMins: 10_080, resetsAt: 1_790_419_157 },
+      },
+      transportConfig: { supervision: { mode: 'supervised_audit' } },
+      supervisionHeartbeat: { state: 'armed', kind: 'audit', nextHeartbeatAt: 12_000, updatedAt: 2_000 },
+    }));
+    await flushAsync();
+    await flushAsync();
+
+    expect(participant.sentJson.find((msg) => msg.type === 'subsession.created')).toMatchObject({
+      sessionName: 'deck_sub_child',
+      quotaLabel: '7d 55% 5d05h 9/26 18:39',
+      supervisionMode: 'supervised_audit',
+      supervisionHeartbeat: { state: 'armed', kind: 'audit', nextHeartbeatAt: 12_000, updatedAt: 2_000 },
+    });
   });
 
   it('bridges task-console reads only for shared MAIN viewers and participants', async () => {

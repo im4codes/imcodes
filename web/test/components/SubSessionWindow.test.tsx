@@ -334,7 +334,10 @@ describe('SubSessionWindow metadata wiring', () => {
       effort: 'high' as any,
       modelDisplay: 'gpt-5.4',
       quotaLabel: '5h 11% 2h03m 4/6 14:40 · 7d 50% 1d04h 4/8 15:48',
+      quotaMeta: { primary: { usedPercent: 11, windowDurationMins: 300 } },
       planLabel: 'Pro',
+      supervisionMode: 'supervised_audit',
+      supervisionHeartbeat: { state: 'armed', kind: 'audit', nextHeartbeatAt: 12_000, updatedAt: 2_000 },
     } as any);
 
     render(
@@ -361,6 +364,15 @@ describe('SubSessionWindow metadata wiring', () => {
       expect(controls?.dataset.effort).toBe('high');
       expect(controls?.dataset.quota).toContain('5h 11%');
       expect(footer?.dataset.quota).toContain('5h 11%');
+      expect(sessionControlsSpy.mock.calls.at(-1)?.[0].activeSession.supervisionHeartbeat).toMatchObject({
+        state: 'armed', kind: 'audit', nextHeartbeatAt: 12_000,
+      });
+      expect(chatViewPropsSpy.mock.calls.at(-1)?.[0]).toMatchObject({
+        quotaLabel: expect.stringContaining('5h 11%'),
+        quotaMeta: { primary: { usedPercent: 11, windowDurationMins: 300 } },
+        supervisionMode: 'supervised_audit',
+        supervisionHeartbeat: { state: 'armed', kind: 'audit', nextHeartbeatAt: 12_000, updatedAt: 2_000 },
+      });
     });
   });
 

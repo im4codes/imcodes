@@ -527,6 +527,36 @@ describe('sub-session metadata via subsession.sync', () => {
     expect(captured[0].quotaUsageLabel).toBe('today 20/1000');
   });
 
+  it('updates the original heartbeat badge projection on a subsession.created rebroadcast', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'heartbeat-rebroadcast',
+      sessionName: 'deck_sub_heartbeat-rebroadcast',
+      sessionType: 'codex-sdk',
+      state: 'idle',
+      supervisionMode: 'supervised_audit',
+      supervisionHeartbeat: { state: 'idle', updatedAt: 1_000 },
+    }));
+    act(() => send({
+      type: 'subsession.created',
+      id: 'heartbeat-rebroadcast',
+      sessionName: 'deck_sub_heartbeat-rebroadcast',
+      sessionType: 'codex-sdk',
+      state: 'idle',
+      supervisionHeartbeat: {
+        state: 'armed', kind: 'audit', nextHeartbeatAt: 12_000, updatedAt: 2_000,
+      },
+    }));
+
+    expect(captured[0].supervisionHeartbeat).toEqual({
+      state: 'armed', kind: 'audit', nextHeartbeatAt: 12_000, updatedAt: 2_000,
+    });
+  });
+
   it('preserves queued transport messages while the drained send is still running and clears on authoritative idle', async () => {
     const { ws, send } = createMockWs();
     render(<Harness ws={ws} connected={true} />);
