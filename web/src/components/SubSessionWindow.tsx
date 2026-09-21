@@ -1042,10 +1042,6 @@ export function SubSessionWindow({
             serverId={serverId}
             onQuote={addQuote}
             agentType={sessionInfo?.agentType ?? sub.type}
-            quotaLabel={sessionInfo?.quotaLabel}
-            quotaMeta={sessionInfo?.quotaMeta}
-            supervisionMode={sessionInfo?.supervisionMode}
-            supervisionHeartbeat={sessionInfo?.supervisionHeartbeat}
             onResendFailed={handleResendFailed}
             messagePinsEnabled
           />

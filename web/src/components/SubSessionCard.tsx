@@ -482,10 +482,6 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
               onScrollBottomFn={setChatScrollFn}
               preview
               agentType={sub.type}
-              quotaLabel={sub.quotaLabel}
-              quotaMeta={sub.quotaMeta}
-              supervisionMode={sub.supervisionMode}
-              supervisionHeartbeat={sub.supervisionHeartbeat}
               onResendFailed={handleResendFailed}
             />
           )}

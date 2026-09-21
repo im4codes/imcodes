@@ -109,10 +109,6 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
           onOpenLocalWebPreview={ctx.onOpenLocalWebPreview}
           onQuote={ctx.onQuote}
           agentType={liveSub.type}
-          quotaLabel={liveSub.quotaLabel}
-          quotaMeta={liveSub.quotaMeta}
-          supervisionMode={liveSub.supervisionMode}
-          supervisionHeartbeat={liveSub.supervisionHeartbeat}
           messagePinsEnabled={false}
         />
       )}

@@ -8,8 +8,6 @@ import type { TimelineEvent } from '../../src/ws-client.js';
 import { isUserVisible } from '../../src/util/isUserVisible.js';
 import { AGENT_DELEGATION_SUPERVISION_TASK_OBJECTIVE_MAX_BYTES } from '@shared/agent-delegation.js';
 import { deriveSupervisionTaskTitle } from '@shared/supervision-task-identity.js';
-import { SUPERVISION_MODE } from '@shared/supervision-config.js';
-import { SUPERVISION_HEARTBEAT_STATE } from '@shared/supervision-heartbeat.js';
 
 const fileBrowserProps: any[] = [];
 
@@ -492,7 +490,7 @@ describe('ChatView peer-audit result cards', () => {
   it.each([
     ['live append', true],
     ['history reload', false],
-  ] as const)('keeps participant verdict, round, one-line quota and heartbeat visible after %s', (_label, live) => {
+  ] as const)('keeps the audit card but never renders the floating participant bar after %s', (_label, live) => {
     const event = makeEvent('delegation.reply', {
       memoryExcluded: true,
       sourceSessionName: 'deck_sub_reviewer',
@@ -500,43 +498,15 @@ describe('ChatView peer-audit result cards', () => {
       verdict: 'PASS',
       round: 4,
     }, { eventId: 'participant-pass-r4' });
-    const commonProps = {
-      loading: false,
-      sessionId: 'session-a',
-      quotaLabel: '5h 43% 2h03m 4/6 14:40 · 7d 34% 1d04h 4/8 15:48',
-      supervisionMode: SUPERVISION_MODE.SUPERVISED_AUDIT,
-      supervisionHeartbeat: {
-        state: SUPERVISION_HEARTBEAT_STATE.IDLE,
-        updatedAt: 1,
-      },
-    } as const;
+    const commonProps = { loading: false, sessionId: 'session-a' } as const;
     const view = render(<ChatView {...commonProps} events={live ? [] : [event]} />);
     if (live) view.rerender(<ChatView {...commonProps} events={[event]} />);
 
-    const status = view.container.querySelector('[data-testid="chat-participant-status"]');
-    expect(status?.querySelector('.chat-participant-audit-verdict')?.textContent).toBe('PASS');
-    expect(status?.querySelector('.peer-audit-round-chip')?.textContent).toBe('R4');
-    const quotas = status?.querySelectorAll('.chat-participant-quota');
-    expect(quotas).toHaveLength(1);
-    expect(quotas?.[0]?.textContent).toBe(commonProps.quotaLabel);
-    expect(status?.querySelector('.supervision-heartbeat-badge.is-inline.is-idle')).not.toBeNull();
-  });
-
-  it('projects the latest authoritative REWORK round and refuses untrusted or incomplete verdicts', () => {
-    const pass = makeEvent('peer_audit.result', { outcome: 'pass', round: 1 });
-    const untrusted = makeEvent('peer_audit.result', { outcome: 'rework', round: 99 }, {
-      source: 'agent', confidence: 'low',
-    });
-    const incomplete = makeEvent('peer_audit.result', { outcome: 'pass' });
-    const rework = makeEvent('peer_audit.result', { outcome: 'rework', round: 2 });
-    const { container, rerender } = render(
-      <ChatView events={[pass, untrusted, incomplete, rework]} loading={false} sessionId="session-a" />,
-    );
-    expect(container.querySelector('.chat-participant-audit-verdict')?.textContent).toBe('REWORK');
-    expect(container.querySelector('.chat-participant-status .peer-audit-round-chip')?.textContent).toBe('R2');
-
-    rerender(<ChatView events={[untrusted, incomplete]} loading={false} sessionId="session-a" />);
-    expect(container.querySelector('[data-testid="chat-participant-status"]')).toBeNull();
+    expect(view.container.querySelector('[data-testid="chat-participant-status"]')).toBeNull();
+    const card = view.container.querySelector('[data-event-id="participant-pass-r4"]');
+    expect(card?.classList.contains('delegation-reply-card--pass')).toBe(true);
+    expect(card?.querySelector('.delegation-reply-verdict')?.textContent).toBe('PASS');
+    expect(card?.querySelector('.peer-audit-round-chip')?.textContent).toBe('R4');
   });
 
   it('renders an accessible round chip and leaves legacy results unchanged', () => {
