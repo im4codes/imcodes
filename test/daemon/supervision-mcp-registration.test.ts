@@ -20,6 +20,8 @@ import {
 import { SUPERVISION_INTENTS } from '../../src/daemon/supervision-intent-ops.js';
 import {
   SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES,
+  SUPERVISION_BRAIN_RECOVERY_MODES,
+  SUPERVISION_BRAIN_REVISION_RESET_REFUSALS,
   SUPERVISION_RECOVERY_LEASE_ACTIONS,
   SUPERVISION_TASK_LIFECYCLE_STATUSES, SUPERVISION_TASK_RECOVERY_TARGET_STATUSES,
   SUPERVISION_TASK_REGISTRY_EVENT_TYPES,
@@ -85,6 +87,7 @@ class FakeRegistry implements SupervisionRegistryPort {
   orphanedAuditorRebound: any[] = [];
   implementerRebound: any[] = [];
   revisionRebound: any[] = [];
+  revisionReset: any[] = [];
   coordinated: any[] = [];
   finished: any[] = [];
   housekeepingCalls: any[] = [];
@@ -146,6 +149,11 @@ class FakeRegistry implements SupervisionRegistryPort {
         : assignment
     ));
     this.assignmentStates.set(input.taskId, assignments as NonNullable<ReturnType<FakeRegistry['item']>['assignments']> as never);
+    return { ok: true as const, value: { taskId: input.taskId } };
+  }
+  resetTaskToRevisionAsBrain(input: any) {
+    this.revisionReset.push(input);
+    this.currentRevisions.set(input.taskId, input.toRevision);
     return { ok: true as const, value: { taskId: input.taskId } };
   }
   coordinateTaskAssignment(input: any) {
@@ -1014,6 +1022,63 @@ describe('administrative recover', () => {
       expect(out).toMatchObject({ status: 'error', reason: 'validation_failed' });
       expect(out.detail).toContain('does not accept rebindSessionName');
       expect(out.detail).not.toContain('requires assignmentId');
+    });
+  });
+
+  describe('Brain-authoritative reset-to-revision recovery', () => {
+    const request = {
+      taskId: 'tsk_a', assignmentId: 'tsk_a-assignment-0',
+      recoveryMode: SUPERVISION_BRAIN_RECOVERY_MODES[0],
+      toRevision: 'r-reset', taskStatus: 'rework', leaseAction: 'renew',
+      idempotencyKey: 'reset-tsk-a-r2', reason: 'repair daemon-created state divergence',
+    } as const;
+
+    it('routes one exact reset only for the authoritative project Brain/admin', async () => {
+      const handlers = createSupervisionMcpToolHandlers(CALLER, {
+        registry, isAdmin: () => false, isProjectBrain: () => true,
+        resolveSessionIdentity: testResolveSessionIdentity,
+      });
+      expect(await handlers[SUPERVISION_MCP_TOOLS.RECOVER](request)).toMatchObject({
+        status: 'ok', taskId: 'tsk_a', assignmentId: 'tsk_a-assignment-0',
+        toRevision: 'r-reset', taskStatus: 'rework', replay: false,
+      });
+      expect(registry.revisionReset).toEqual([{
+        taskId: 'tsk_a', assignmentId: 'tsk_a-assignment-0',
+        toRevision: 'r-reset', taskStatus: 'rework', leaseAction: 'renew',
+        idempotencyKey: 'reset-tsk-a-r2', reason: 'repair daemon-created state divergence',
+      }]);
+
+      registry.revisionReset = [];
+      const unauthorized = createSupervisionMcpToolHandlers(CALLER, {
+        registry, isAdmin: () => false, isProjectBrain: () => false,
+        resolveSessionIdentity: testResolveSessionIdentity,
+      });
+      expect(await unauthorized[SUPERVISION_MCP_TOOLS.RECOVER](request))
+        .toMatchObject({ status: 'error', reason: 'forbidden' });
+      expect(registry.revisionReset).toEqual([]);
+    });
+
+    it('keeps reset shape separate from ordinary rebind and names the hard closed-task boundary', async () => {
+      const handlers = createSupervisionMcpToolHandlers(CALLER, {
+        registry, isProjectBrain: () => true,
+        resolveSessionIdentity: testResolveSessionIdentity,
+      });
+      expect(await handlers[SUPERVISION_MCP_TOOLS.RECOVER]({
+        ...request, fromRevision: 'r1',
+      })).toMatchObject({ status: 'error', reason: 'validation_failed' });
+      expect(await handlers[SUPERVISION_MCP_TOOLS.RECOVER]({
+        ...request, leaseAction: 'clear',
+      })).toMatchObject({ status: 'error', reason: 'validation_failed' });
+      expect(registry.revisionReset).toEqual([]);
+
+      registry.resetTaskToRevisionAsBrain = () => ({
+        ok: false as const, reason: SUPERVISION_BRAIN_REVISION_RESET_REFUSALS.CLOSED_TASK,
+      });
+      const refused: any = await handlers[SUPERVISION_MCP_TOOLS.RECOVER](request);
+      expect(refused).toMatchObject({
+        status: 'error', reason: SUPERVISION_BRAIN_REVISION_RESET_REFUSALS.CLOSED_TASK,
+      });
+      expect(refused.detail).toContain('committed, pushed, finalized, or archived');
     });
   });
 

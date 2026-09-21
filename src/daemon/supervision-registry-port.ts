@@ -293,6 +293,9 @@ export function createSupervisionRegistryPort(): SupervisionRegistryPort {
       if (!inspected.ok) return { ok: false, reason: inspected.reason };
       return registry.rebindTaskAssignmentRevision({ ...input, worktreeSnapshot: inspected.snapshot });
     },
+    resetTaskToRevisionAsBrain: (input) => (
+      getSupervisionTaskRegistry().resetTaskToRevisionAsBrain(input)
+    ),
     coordinateTaskAssignment: (input) => getSupervisionTaskRegistry().coordinateTaskAssignment(input),
     resolveCompletionEvidence: (input) => (
       getSupervisionTaskRegistry().resolveCancelledCompletionEvidence(input)

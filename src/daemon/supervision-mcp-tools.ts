@@ -26,12 +26,17 @@ import {
 import {
   SUPERVISION_TASK_RECOVERY_TARGET_STATUSES,
   SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES,
+  SUPERVISION_BRAIN_RECOVERY_MODES,
+  SUPERVISION_BRAIN_REVISION_RESET_LEASE_ACTIONS,
+  SUPERVISION_BRAIN_REVISION_RESET_REFUSALS,
+  SUPERVISION_BRAIN_REVISION_RESET_STATUSES,
   SUPERVISION_RECOVERY_LEASE_ACTIONS,
   SUPERVISION_COMPLETION_EVIDENCE_DECISIONS,
   SUPERVISION_TASK_LIFECYCLE_STATUSES,
   isSupervisionTaskLifecycleStatus,
   type SupervisionTaskRecoveryTargetStatus,
   type SupervisionBrainCoordinationRecoveryStatus,
+  type SupervisionBrainRevisionResetStatus,
   type SupervisionRecoveryLeaseAction,
   type SupervisionCompletionEvidenceDecision,
   type SupervisionTaskLifecycleStatus,
@@ -336,6 +341,15 @@ export interface SupervisionRegistryPort {
   }): Promise<{ ok: true; value?: unknown; replay?: boolean } | {
     ok: false; reason: string; detail?: SupervisionTaskRegistryRejectDetail;
   }>;
+  resetTaskToRevisionAsBrain?(input: {
+    taskId: string;
+    assignmentId: string;
+    toRevision: string;
+    taskStatus: SupervisionBrainRevisionResetStatus;
+    leaseAction: SupervisionRecoveryLeaseAction;
+    idempotencyKey: string;
+    reason: string;
+  }): { ok: true; value?: unknown; replay?: boolean } | { ok: false; reason: string };
   coordinateTaskAssignment?(input: {
     taskId: string;
     assignmentId: string;
@@ -475,6 +489,7 @@ export const SUPERVISION_MCP_TOOL_SHAPES = {
   },
   [SUPERVISION_MCP_TOOLS.RECOVER]: {
     taskId: z.string().min(1),
+    recoveryMode: z.enum([...SUPERVISION_BRAIN_RECOVERY_MODES]).optional(),
     toStatus: z.enum([...SUPERVISION_TASK_RECOVERY_TARGET_STATUSES]).optional(),
     assignmentId: z.string().min(1).optional(),
     rebindSessionName: z.string().min(1).optional(),
@@ -937,6 +952,7 @@ export function createSupervisionMcpToolHandlers(
       const input = (args ?? {}) as Record<string, unknown>;
       const reg = need();
       if (!reg) return err('unavailable', 'supervision registry not bound');
+      const recoveryMode = String(input.recoveryMode ?? '').trim();
       const assignmentId = String(input.assignmentId ?? '').trim();
       const rebindSessionName = String(input.rebindSessionName ?? '').trim();
       const expectedRevision = String(input.expectedRevision ?? '').trim();
@@ -966,6 +982,63 @@ export function createSupervisionMcpToolHandlers(
       const recoveryAssignment = recoveryTask?.assignments?.find((candidate) => (
         candidate.assignmentId === assignmentId
       ));
+      if (recoveryMode) {
+        const resetMode = SUPERVISION_BRAIN_RECOVERY_MODES[0];
+        const resetStatus = taskStatus as SupervisionBrainRevisionResetStatus;
+        const unexpectedFields = Boolean(
+          rebindSessionName || expectedRevision || expectedGeneration !== undefined
+          || auditAttemptId || fromRevision || ownedFiles.length > 0
+          || evidenceManifestSha256 || assignmentStatus || scopeFiles.length > 0
+          || input.toStatus !== undefined || input.completionEvidenceDecision !== undefined
+          || input.evidenceId !== undefined || input.targetAssignmentId !== undefined,
+        );
+        if (recoveryMode !== resetMode || !assignmentId || !toRevision
+          || !SUPERVISION_BRAIN_REVISION_RESET_STATUSES.includes(resetStatus)
+          || !SUPERVISION_BRAIN_REVISION_RESET_LEASE_ACTIONS.includes(
+            leaseAction as typeof SUPERVISION_BRAIN_REVISION_RESET_LEASE_ACTIONS[number],
+          )
+          || !idempotencyKey || !reason || unexpectedFields) {
+          return err(
+            'validation_failed',
+            `Brain revision reset requires recoveryMode=${resetMode}, assignmentId, toRevision, taskStatus (${SUPERVISION_BRAIN_REVISION_RESET_STATUSES.join('/')}), leaseAction (${SUPERVISION_BRAIN_REVISION_RESET_LEASE_ACTIONS.join('/')}), idempotencyKey and reason only`,
+          );
+        }
+        const task = reg.get(taskId);
+        const authorized = isAdmin(caller) || taskAuthority(task).projectBrainMayRead;
+        if (!task || !authorized) {
+          return err(
+            'forbidden',
+            'Brain revision reset safety boundary requires the authoritative project Brain or administrator',
+          );
+        }
+        const reset = reg.resetTaskToRevisionAsBrain?.({
+          taskId,
+          assignmentId,
+          toRevision,
+          taskStatus: resetStatus,
+          leaseAction: leaseAction as SupervisionRecoveryLeaseAction,
+          idempotencyKey,
+          reason,
+        });
+        if (!reset) return err('unavailable', 'Brain revision reset is not bound');
+        if (!reset.ok) {
+          const detail = reset.reason === SUPERVISION_BRAIN_REVISION_RESET_REFUSALS.CLOSED_TASK
+            ? 'Brain revision reset rejected by safety boundary: task is committed, pushed, finalized, or archived'
+            : reset.reason === 'not_found'
+              ? 'Brain revision reset target task or assignment does not exist'
+              : reset.reason === 'conflicting_replay'
+                ? 'Brain revision reset idempotency key conflicts with another reset request'
+                : `Brain revision reset rejected: ${reset.reason}`;
+          return err(reset.reason, detail);
+        }
+        return ok({
+          taskId,
+          assignmentId,
+          toRevision,
+          taskStatus: resetStatus,
+          replay: reset.replay === true,
+        });
+      }
       const evidenceBoundAuditorRecoveryRequested = Boolean(
         assignmentId && rebindSessionName && expectedRevision
         && ownedFiles.length > 0 && evidenceManifestSha256

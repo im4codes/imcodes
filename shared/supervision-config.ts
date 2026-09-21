@@ -545,6 +545,31 @@ export const SUPERVISION_RECOVERY_LEASE_ACTIONS = [
 export type SupervisionRecoveryLeaseAction =
   typeof SUPERVISION_RECOVERY_LEASE_ACTIONS[number];
 
+/**
+ * Explicit mode for the project Brain's last-resort mutable-projection repair.
+ * It is deliberately separate from ordinary revision rebind: the latter
+ * proves a narrow predecessor/successor edge, while this action repairs state
+ * that the daemon itself has already made internally inconsistent.
+ */
+export const SUPERVISION_BRAIN_RECOVERY_MODES = ['reset_revision'] as const;
+export type SupervisionBrainRecoveryMode = typeof SUPERVISION_BRAIN_RECOVERY_MODES[number];
+
+/** A reset resumes work but can never project a success/finalization state. */
+export const SUPERVISION_BRAIN_REVISION_RESET_STATUSES = [
+  'implementing', 'rework',
+] as const satisfies readonly SupervisionTaskLifecycleStatus[];
+export type SupervisionBrainRevisionResetStatus =
+  typeof SUPERVISION_BRAIN_REVISION_RESET_STATUSES[number];
+
+/** Active reset owners must retain or receive authority; `clear` cannot resume work. */
+export const SUPERVISION_BRAIN_REVISION_RESET_LEASE_ACTIONS = [
+  'preserve', 'renew',
+] as const satisfies readonly SupervisionRecoveryLeaseAction[];
+
+export const SUPERVISION_BRAIN_REVISION_RESET_REFUSALS = {
+  CLOSED_TASK: 'safety_boundary_closed_task',
+} as const;
+
 /** Explicit Brain decisions for immutable output produced after cancellation. */
 export const SUPERVISION_COMPLETION_EVIDENCE_DECISIONS = ['adopt', 'discard'] as const;
 export type SupervisionCompletionEvidenceDecision =

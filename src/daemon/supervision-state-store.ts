@@ -44,12 +44,16 @@ import {
   SUPERVISION_TASK_HOUSEKEEPING_DEFAULT_BATCH_SIZE,
   SUPERVISION_TASK_HOUSEKEEPING_MAX_BATCH_SIZE,
   SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES,
+  SUPERVISION_BRAIN_REVISION_RESET_LEASE_ACTIONS,
+  SUPERVISION_BRAIN_REVISION_RESET_REFUSALS,
+  SUPERVISION_BRAIN_REVISION_RESET_STATUSES,
   SUPERVISION_RECOVERY_LEASE_ACTIONS,
   SUPERVISION_ORPHANED_AUTOMATIC_AUDITOR_REBIND_SOURCE,
   SUPERVISION_COMPLETION_EVIDENCE_DECISIONS,
   SUPERVISION_MODE,
   type SupervisionTaskArchiveReason,
   type SupervisionBrainCoordinationRecoveryStatus,
+  type SupervisionBrainRevisionResetStatus,
   type SupervisionRecoveryLeaseAction,
   type SupervisionCompletionEvidenceDecision,
   type SupervisionTaskAuditPolicy,
@@ -1355,7 +1359,7 @@ export interface SupervisionTaskRegistryRejectDetail {
 
 export type SupervisionTaskRegistryResult<T> =
   | { ok: true; value: T; replay?: boolean }
-  | { ok: false; reason: 'invalid' | 'duplicate_task' | 'duplicate_assignment' | 'not_found' | 'invalid_transition' | 'owner_mismatch' | 'old_revision' | 'stale_audit_revision' | 'old_audit_attempt' | 'manifest_mismatch' | 'role_forbidden' | 'ambiguous_assignment' | 'economy_requires_primary_review' | 'receipt_closed' | 'conflicting_replay'; detail?: SupervisionTaskRegistryRejectDetail };
+  | { ok: false; reason: 'invalid' | 'duplicate_task' | 'duplicate_assignment' | 'not_found' | 'invalid_transition' | 'owner_mismatch' | 'old_revision' | 'stale_audit_revision' | 'old_audit_attempt' | 'manifest_mismatch' | 'role_forbidden' | 'ambiguous_assignment' | 'economy_requires_primary_review' | 'receipt_closed' | 'conflicting_replay' | typeof SUPERVISION_BRAIN_REVISION_RESET_REFUSALS.CLOSED_TASK; detail?: SupervisionTaskRegistryRejectDetail };
 
 const COMPACT_ID_COLLISION_ATTEMPTS = 8;
 
@@ -8874,6 +8878,205 @@ export class SupervisionTaskRegistry {
       this.#writeTask(reboundTask, 'recovered', { ...payload, assignmentId });
       this.#db.exec('COMMIT');
       return { ok: true, value: reboundTask };
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  /**
+   * Project-Brain last-resort reset for mutable control-plane projections.
+   *
+   * Ordinary successor binding is intentionally proof-heavy. This operation
+   * serves a different purpose: recover when daemon-owned task/assignment
+   * columns already disagree so badly that every ordinary proof gate rejects
+   * the repair. It therefore ignores stale revisions, lifecycle states,
+   * attempts, verdict projections, validation stamps, leases and participant
+   * ambiguity. The hard boundary is immutable delivery: a committed, pushed,
+   * finalized or archived task is never reopened.
+   *
+   * Receipt and attestation tables are append-only and are not touched. The
+   * previous mutable task/assignment records (including any old bundle
+   * binding) are copied into the reset event before live projections are
+   * cleared, so the repair is fully auditable without granting PASS authority.
+   */
+  resetTaskToRevisionAsBrain(input: {
+    taskId: string;
+    assignmentId: string;
+    toRevision: string;
+    taskStatus: SupervisionBrainRevisionResetStatus;
+    leaseAction: SupervisionRecoveryLeaseAction;
+    idempotencyKey: string;
+    reason: string;
+    now?: number;
+  }): SupervisionTaskRegistryResult<PersistedSupervisionTaskRecord> {
+    const taskId = normalizeTaskString(input.taskId);
+    const assignmentId = normalizeTaskString(input.assignmentId);
+    const toRevision = normalizeTaskString(input.toRevision);
+    const idempotencyKey = normalizeTaskString(input.idempotencyKey);
+    const reason = normalizeTaskString(input.reason);
+    if (!taskId || !assignmentId || !toRevision || !idempotencyKey || !reason
+      || !SUPERVISION_BRAIN_REVISION_RESET_STATUSES.includes(input.taskStatus)
+      || !SUPERVISION_BRAIN_REVISION_RESET_LEASE_ACTIONS.includes(
+        input.leaseAction as typeof SUPERVISION_BRAIN_REVISION_RESET_LEASE_ACTIONS[number],
+      )) {
+      return { ok: false, reason: 'invalid' };
+    }
+
+    const now = input.now ?? Date.now();
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const task = this.getTaskRecord(taskId);
+      const requestedAssignment = this.getAssignment(assignmentId);
+      if (!task || !requestedAssignment || requestedAssignment.taskId !== taskId) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'not_found' };
+      }
+
+      // These fields are immutable delivery authority. The reset must never
+      // turn a shipped/finalized object back into work that could integrate a
+      // second time, even if its mutable participant projections are corrupt.
+      if (task.finalization || task.commitSha || task.pushRemoteRef || task.archivedAt
+        || ['committed', 'pushed', 'finalized'].includes(task.status)) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: SUPERVISION_BRAIN_REVISION_RESET_REFUSALS.CLOSED_TASK };
+      }
+
+      const priorResetEvents = this.listEvents(taskId).filter((event) => (
+        !event.assignmentId
+        && event.eventType === 'recovered'
+        && event.payload?.source === 'brain_authoritative_revision_reset'
+        && event.payload?.idempotencyKey === idempotencyKey
+      ));
+      const exactReplay = priorResetEvents.find((event) => (
+        event.payload?.assignmentId === assignmentId
+        && event.payload?.toRevision === toRevision
+        && event.payload?.requestedTaskStatus === input.taskStatus
+        && event.payload?.requestedLeaseAction === input.leaseAction
+        && event.payload?.reason === reason
+      ));
+      if (priorResetEvents.length > 0) {
+        this.#db.exec('ROLLBACK');
+        return exactReplay
+          && task.currentRevision === toRevision
+          && task.status === exactReplay.payload?.effectiveTaskStatus
+          ? { ok: true, value: task, replay: true }
+          : { ok: false, reason: 'conflicting_replay' };
+      }
+
+      const assignments = this.listAssignments(taskId);
+      const mutableAssignments = assignments.filter((candidate) => (
+        !['cancelled', 'finalized'].includes(candidate.status)
+      ));
+      const selectedImplementer = requestedAssignment.role === 'implementer'
+        && !['cancelled', 'finalized'].includes(requestedAssignment.status)
+        ? requestedAssignment
+        : mutableAssignments.filter((candidate) => candidate.role === 'implementer').length === 1
+          ? mutableAssignments.find((candidate) => candidate.role === 'implementer')
+          : undefined;
+      const coordinators = mutableAssignments
+        .filter((candidate) => candidate.role === 'coordinator')
+        .sort((left, right) => (
+          Number(right.assignmentId === requestedAssignment.assignmentId)
+            - Number(left.assignmentId === requestedAssignment.assignmentId)
+          || Number(Boolean(right.leaseId)) - Number(Boolean(left.leaseId))
+          || right.generation - left.generation
+          || right.updatedAt - left.updatedAt
+          || left.assignmentId.localeCompare(right.assignmentId)
+        ));
+      // One deterministic surviving coordinator removes daemon-created
+      // duplicate-owner ambiguity without guessing about work authority. Every
+      // retired coordinator remains in the fromState audit snapshot.
+      const selectedCoordinator = coordinators[0];
+      const effectiveTaskStatus: SupervisionBrainRevisionResetStatus = selectedImplementer
+        ? input.taskStatus
+        : 'rework';
+      const fromState = {
+        task,
+        assignments,
+      };
+      const continuingLease = (assignment: PersistedSupervisionTaskAssignment): string => (
+        input.leaseAction === 'preserve' && assignment.leaseId
+          ? assignment.leaseId
+          : this.#mintLeaseId()
+      );
+      const commonPayload = {
+        source: 'brain_authoritative_revision_reset',
+        origin: 'manual',
+        idempotencyKey,
+        reason,
+        assignmentId,
+        toRevision,
+        requestedTaskStatus: input.taskStatus,
+        effectiveTaskStatus,
+        requestedLeaseAction: input.leaseAction,
+      };
+
+      for (const assignment of mutableAssignments) {
+        const selected = assignment.assignmentId === selectedImplementer?.assignmentId;
+        const continues = selected
+          || assignment.assignmentId === selectedCoordinator?.assignmentId;
+        const nextStatus: PersistedSupervisionTaskAssignment['status'] = selected
+          ? effectiveTaskStatus
+          : assignment.assignmentId === selectedCoordinator?.assignmentId
+            ? 'implementing'
+            : 'cancelled';
+        const nextAssignment: PersistedSupervisionTaskAssignment = {
+          ...assignment,
+          status: nextStatus,
+          leaseId: continues ? continuingLease(assignment) : '',
+          generation: assignment.generation + 1,
+          auditAttemptId: undefined,
+          auditRevision: toRevision,
+          verdict: undefined,
+          blocker: undefined,
+          externalRunId: undefined,
+          externalHeadSha: undefined,
+          externalTaskId: undefined,
+          primaryReviewPassed: undefined,
+          crossVendorAuditPassed: undefined,
+          auditRoutingReason: undefined,
+          auditDegradedReason: undefined,
+          validationState: undefined,
+          validatedRevision: undefined,
+          heartbeatAt: undefined,
+          implementationActivity: undefined,
+          updatedAt: now,
+        };
+        if (!continues) {
+          this.#db.prepare('DELETE FROM supervision_task_file_claims WHERE assignment_id = ?')
+            .run(assignment.assignmentId);
+        }
+        this.#writeAssignment(nextAssignment, 'recovered', {
+          ...commonPayload,
+          resetAssignmentId: assignment.assignmentId,
+          resetRole: assignment.role,
+          priorStatus: assignment.status,
+          nextStatus,
+          continuingAuthority: continues,
+        });
+      }
+
+      const nextTask: PersistedSupervisionTaskRecord = {
+        ...task,
+        currentRevision: toRevision,
+        status: effectiveTaskStatus,
+        integrationOwnerAssignmentId: undefined,
+        // This removes only the live binding. The complete prior bundle stays
+        // in fromState below and its frozen artifact is never deleted.
+        integrationBundle: undefined,
+        blocker: undefined,
+        validationState: undefined,
+        validatedRevision: undefined,
+        updatedAt: now,
+      };
+      this.#writeTask(nextTask, 'recovered', {
+        ...commonPayload,
+        fromState,
+        immutableEvidencePreserved: true,
+      });
+      this.#db.exec('COMMIT');
+      return { ok: true, value: nextTask };
     } catch (error) {
       this.#db.exec('ROLLBACK');
       throw error;

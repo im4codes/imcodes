@@ -7,6 +7,7 @@ import {
 import {
   canTransitionSupervisionTaskStatus,
   SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES,
+  SUPERVISION_BRAIN_RECOVERY_MODES,
   SUPERVISION_RECOVERY_LEASE_ACTIONS,
   SUPERVISION_TASK_LIFECYCLE_STATUSES, SUPERVISION_TASK_RECOVERY_TARGET_STATUSES,
   SUPERVISION_TASK_REGISTRY_EVENT_TYPES,
@@ -150,6 +151,7 @@ describe('published MCP schemas', () => {
     expect(recovery.additionalProperties).toBe(false);
     expect(recovery.properties).toEqual(expect.objectContaining({
       taskId: expect.any(Object),
+      recoveryMode: expect.objectContaining({ enum: [...SUPERVISION_BRAIN_RECOVERY_MODES] }),
       assignmentId: expect.any(Object),
       fromRevision: expect.any(Object),
       toRevision: expect.any(Object),

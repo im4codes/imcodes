@@ -13,6 +13,7 @@ import {
   SUPERVISION_TASK_LIFECYCLE_STATUSES,
   SUPERVISION_TASK_RECOVERY_TARGET_STATUSES,
   SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES,
+  SUPERVISION_BRAIN_RECOVERY_MODES,
   SUPERVISION_RECOVERY_LEASE_ACTIONS,
   type SupervisionTaskLifecycleStatus,
 } from '../../shared/supervision-config.js';
@@ -204,6 +205,7 @@ export const SUPERVISION_MCP_TOOL_SCHEMAS = Object.freeze({
     required: ['taskId', 'reason'],
     properties: {
       taskId: { type: 'string' },
+      recoveryMode: { type: 'string', enum: [...SUPERVISION_BRAIN_RECOVERY_MODES] },
       toStatus: { type: 'string', enum: [...SUPERVISION_TASK_RECOVERY_TARGET_STATUSES] },
       assignmentId: { type: 'string' },
       rebindSessionName: { type: 'string' },
