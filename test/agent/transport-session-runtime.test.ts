@@ -7,6 +7,7 @@ import { resetAllSummarySyncHistories } from '../../src/context/summary-sync-his
 import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
 import { resetContextStoreClientForTests } from '../../src/store/context-store-worker-client.js';
 import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
+import { CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../shared/cron-types.js';
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
 const searchLocalMemorySemanticMock = vi.hoisted(() => vi.fn());
@@ -102,7 +103,8 @@ describe('TransportSessionRuntime memory provenance', () => {
 
     runtime.send('/compact', 'compact-1');
     await waitForProviderSend(provider);
-    expect((provider.send as ReturnType<typeof vi.fn>).mock.calls[0]?.[1]?.sessionSystemText).toBeUndefined();
+    expect((provider.send as ReturnType<typeof vi.fn>).mock.calls[0]?.[1]?.sessionSystemText)
+      .toBe(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
     complete?.('provider-session-1', {
       id: 'compact-done',
       sessionId: 'provider-session-1',

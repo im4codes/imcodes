@@ -164,7 +164,7 @@ describe('executeCronJob', () => {
     );
   });
 
-  it('registers the full process-session contract once, then uses only compact wake-up references', async () => {
+  it('keeps hard rules in the static system contract and sends tagged task data each occurrence', async () => {
     (getSession as ReturnType<typeof vi.fn>).mockReturnValue(makeSession());
     (detectStatusAsync as ReturnType<typeof vi.fn>).mockResolvedValue('idle');
 
@@ -181,13 +181,9 @@ describe('executeCronJob', () => {
 
     const prompts = cronProcessSendMock.mock.calls.map((call) => call[1] as string);
     expect(prompts).toHaveLength(2);
-    expect(prompts[0]).toContain('"contractId":"supervision_cron_control_v2"');
-    expect(prompts[0]).toContain('"taskBody":"Inspect the current progress."');
-    expect(prompts[0]).toContain('"first_non_empty_SILENT_stops_immediately_no_more_tools"');
-    const compactPrompts = prompts.map((prompt) => prompt.slice(prompt.lastIndexOf('<imcodes-cron-control ')));
-    for (const [index, prompt] of compactPrompts.entries()) {
+    for (const [index, prompt] of prompts.entries()) {
       expect(prompt).toMatch(/^<imcodes-cron-control /);
-      expect(prompt).not.toContain('Inspect the current progress.');
+      expect(prompt).toContain('\nInspect the current progress.\n</imcodes-cron-control>');
       expect(prompt).toContain('"contractRef":"supervision_cron_control_v2"');
       expect(prompt).toContain('"scheduleId":"job-progress-1"');
       expect(prompt).toContain('"completionPolicy":"recurring"');
@@ -195,11 +191,10 @@ describe('executeCronJob', () => {
       expect(prompt).not.toContain('Do not add web fetches, curl requests, or other network checks');
       expect(prompt).not.toContain('first non-empty line, stop immediately');
       expect(prompt).not.toContain('Always produce one final response');
-      expect(prompt.length).toBeLessThan(220);
+      expect(prompt).not.toContain('This wrapped run is a user-authorized scheduled execution.');
     }
     expect(prompts[1]).not.toContain('"contractId"');
-    expect(prompts[1]).not.toContain('Inspect the current progress.');
-    expect(compactPrompts.join('\n').match(/supervision_cron_control_v2/g)).toHaveLength(2);
+    expect(prompts.join('\n').match(/supervision_cron_control_v2/g)).toHaveLength(2);
     for (const call of cronProcessSendMock.mock.calls) {
       expect(call[2]).toEqual({
         userMessageMetadata: {
@@ -388,7 +383,7 @@ describe('executeCronJob', () => {
   });
 
   // 10. Transport session — skips busy check, calls runtime.send()
-  it('registers the authoritative task body as transport system metadata while the turn stays compact', async () => {
+  it('sends the authoritative task body as tagged user data without per-turn system metadata', async () => {
     const mockRuntime = {
       providerSessionId: 'connected-provider-session',
       send: vi.fn().mockReturnValue('sent'),
@@ -406,12 +401,11 @@ describe('executeCronJob', () => {
 
     const [prompt, clientMessageId, attachments, preamble, metadata] = mockRuntime.send.mock.calls[0];
     expect(prompt).toContain('"contractRef":"supervision_cron_control_v2"');
-    expect(prompt).not.toContain('Inspect transport progress.');
+    expect(prompt).toContain('\nInspect transport progress.\n</imcodes-cron-control>');
     expect(clientMessageId).toBe('cron:job-registered-transport:run-transport-1:attempt:1');
     expect(attachments).toBeUndefined();
     expect(preamble).toBeUndefined();
-    expect(metadata.registeredSystemContract.body).toContain('"taskBody":"Inspect transport progress."');
-    expect(metadata.registeredSystemContract.body).toContain('"contractId":"supervision_cron_control_v2"');
+    expect(metadata).toEqual({ timelineCommitted: true });
   });
 
   it('sends command to transport session via runtime.send(), skipping busy check', async () => {

@@ -35,6 +35,7 @@ import {
   buildBrainWorkDelegationContractRef,
 } from '../daemon/supervision-prompts.js';
 import { buildAuditConvergenceContract } from '../../shared/audit-convergence.js';
+import { CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../shared/cron-types.js';
 
 /** Stable text: rendered once, registered in every managed session's system prompt. */
 const AUDIT_CONVERGENCE_SYSTEM_CONTRACT = buildAuditConvergenceContract();
@@ -409,6 +410,17 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
   const auditConvergenceContract = input.suppressMcpMemorySearchGuidance
     ? undefined
     : AUDIT_CONVERGENCE_SYSTEM_CONTRACT;
+  // Execution authority is not optional MCP guidance. Keep it in the
+  // provider's system/developer channel even for slash-control turns.
+  const cronControlTrustedSystemClause = CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE;
+  const automaticSupervision = input.automaticSupervisionEnabled === true;
+  const brainDelegationContract = input.sessionIdentity?.role === 'brain'
+    ? (input.brainContractRegistered
+      ? buildBrainWorkDelegationContractRef(automaticSupervision)
+      : automaticSupervision
+        ? buildBrainSupervisedWorkDelegationContract()
+        : buildBrainManualOnlyDelegationContract())
+    : undefined;
   // Daemon-injected, session-stable identity block. NOT subject to
   // `USER_SESSION_TEXT_MAX_CHARS` — encodes IM.codes runtime behaviour
   // the model must always follow. p2p audit 37bfbb85-430 N-A: this used
@@ -436,6 +448,9 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
   const composedSessionSystemText = joinSpanned([
     capabilityGuidance,
     mcpToolRefreshGuidance,
+    cronControlTrustedSystemClause,
+    brainDelegationContract,
+    input.registeredSystemContractText,
     input.description?.trim(),
     input.systemPrompt?.trim(),
     identitySegment ? { text: identitySegment, identity: identitySpanForSegment(identitySegment) } : undefined,
@@ -448,8 +463,8 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
   ], '\n\n');
   const sessionSystemText = composedSessionSystemText?.text;
   const sessionSystemTextIdentity = composedSessionSystemText?.identity;
-  // Baseline delegation contract for a Brain, re-asserted EVERY turn, in the
-  // variant the session's supervision mode selects.
+  // Baseline delegation and registered IM.codes contracts are hard rules.
+  // They belong to the provider system/developer channel, never in user text.
   //
   // It used to be deliberately independent of supervision.mode, on the theory
   // that with supervision off the Brain would "simply attach no auditPolicy and
@@ -463,24 +478,8 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
   // provider-native) and loses everything automatic; supervised work remains
   // available when a user explicitly arranges it.
   //
-  // This rides the existing turnSystemText assembly on purpose. sessionSystemText
-  // becomes baseInstructions, which is sent once per thread/start|resume, so it
-  // cannot survive a compaction -- the exact failure the per-turn baseline fixes.
-  // Re-asserted every turn, but by REFERENCE once registered: repeating the
-  // full body each turn spends the per-turn budget on text the Brain already
-  // holds. The body still returns after a thread start/resume or compaction,
-  // and whenever the mode changes, because the other variant's registration
-  // does not stand in for this one.
-  const automaticSupervision = input.automaticSupervisionEnabled === true;
-  const brainDelegationContract = input.sessionIdentity?.role === 'brain'
-    ? (input.brainContractRegistered
-      ? buildBrainWorkDelegationContractRef(automaticSupervision)
-      : automaticSupervision
-        ? buildBrainSupervisedWorkDelegationContract()
-        : buildBrainManualOnlyDelegationContract())
-    : undefined;
-  const turnSystemText = [brainDelegationContract, input.registeredSystemContractText, renderedAuthoredSystemText]
-    .filter(Boolean).join('\n\n') || undefined;
+  // Authored turn context remains turn-scoped. It is not IM.codes authority.
+  const turnSystemText = renderedAuthoredSystemText || undefined;
   return {
     sessionSystemText,
     ...(sessionSystemTextIdentity ? { sessionSystemTextIdentity } : {}),

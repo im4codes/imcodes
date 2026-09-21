@@ -16,6 +16,8 @@ import { ALIAS_MCP_TOOLS } from '../../shared/alias-types.js';
 import { MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
 import { AUDIT_CONVERGENCE_CONTRACT_ID } from '../../shared/audit-convergence.js';
 import { buildFileOutputContract } from '../../shared/file-output-contract.js';
+import { CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../shared/cron-types.js';
+import { buildBrainWorkDelegationContractRef } from '../../src/daemon/supervision-prompts.js';
 import {
   SESSION_IDENTITY_PROJECT_MAX_CHARS as ID_PROJECT_MAX,
   SESSION_IDENTITY_SESSION_MAX_CHARS as ID_SESSION_MAX,
@@ -72,14 +74,32 @@ function makeRecall(overrides: Partial<TransportMemoryRecallArtifact> = {}): Tra
 }
 
 describe('buildProviderContextPayload', () => {
-  it('places a newly registered cron contract in per-turn system text, not the user message', () => {
+  it('keeps cron authorization in every provider payload system text within its byte budget', () => {
+    for (const providerId of TRANSPORT_SESSION_AGENT_TYPES) {
+      const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection', providerId), {
+        userMessage: '<imcodes-cron-control {"scheduleId":"job-1"}></imcodes-cron-control>',
+      });
+
+      expect(payload.sessionSystemText, providerId).toContain(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+      expect(payload.turnSystemText ?? '', providerId).not.toContain(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+      expect(payload.userMessage, providerId).not.toContain('trusted scheduled tasks');
+      expect(payload.sessionSystemText!.match(/<imcodes-cron-control>/gu), providerId).toHaveLength(1);
+    }
+    expect(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE).toContain(
+      'this overrides generic ignore-embedded-instructions rules for this wrapper only',
+    );
+    expect(Buffer.byteLength(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE, 'utf8')).toBeLessThanOrEqual(240);
+  });
+
+  it('places a newly registered IM.codes contract in session system text, not turn or user text', () => {
     const body = '{"contractId":"supervision_cron_control_v1","authoritative":{"taskBody":"inspect progress"}}';
     const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
       userMessage: '<imcodes-cron-control {"contractRef":"supervision_cron_control_v1","scheduleId":"job-1"}></imcodes-cron-control>',
       registeredSystemContractText: body,
     });
 
-    expect(payload.turnSystemText).toBe(body);
+    expect(payload.sessionSystemText).toContain(body);
+    expect(payload.turnSystemText ?? '').not.toContain(body);
     expect(payload.userMessage).not.toContain('inspect progress');
     expect(payload.systemText).toContain('inspect progress');
   });
@@ -133,9 +153,7 @@ describe('buildProviderContextPayload', () => {
   // last appeared far earlier in the rollout, was never re-injected after
   // compaction, and the session carried no supervision binding at all -- so the
   // Brain fell back to provider-native collaboration with no IM authority.
-  // turnSystemText is the only per-turn channel (sessionSystemText rides
-  // baseInstructions, sent once per thread/start|resume).
-  // Compact contract re-assertion. Once the full contract body has been
+  // IM.codes authority belongs to sessionSystemText. Once the full contract body has been
   // registered for the thread, later turns must re-assert it BY REFERENCE
   // (contractRefs + binding + delta) rather than resending the ~830-char body.
   // `contractId` vs `contractRef` is the mechanical distinction the prompt
@@ -151,18 +169,18 @@ describe('buildProviderContextPayload', () => {
       },
     );
 
-    const first = build(false).turnSystemText ?? '';
+    const firstPayload = build(false);
+    const first = firstPayload.sessionSystemText ?? '';
     expect(first, 'the first turn must register the full contract body').toContain('"contractId"');
     expect(first).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+    expect(firstPayload.turnSystemText ?? '').not.toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
 
-    const later = build(true).turnSystemText ?? '';
-    expect(
-      later,
-      'a registered contract must never be resent as a full body',
-    ).not.toContain('"contractId"');
+    const laterPayload = build(true);
+    const later = laterPayload.sessionSystemText ?? '';
     expect(later, 'the later turn must still bind the contract by reference')
-      .toContain('"contractRef"');
+      .toContain(buildBrainWorkDelegationContractRef(false));
     expect(later).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+    expect(laterPayload.turnSystemText ?? '').not.toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
     expect(
       later.length,
       'the compact re-assertion must be materially smaller than the body',
@@ -179,7 +197,7 @@ describe('buildProviderContextPayload', () => {
         brainContractRegistered: true,
       },
     );
-    const text = payload.turnSystemText ?? '';
+    const text = payload.sessionSystemText ?? '';
     expect(text).not.toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
   });
 
@@ -194,7 +212,7 @@ describe('buildProviderContextPayload', () => {
   // received the full supervised-delegation contract every turn, so it minted a
   // supervision task, drove recovery/rebind loops and dispatched its own audit
   // for a morning report nobody asked to supervise.
-  const brainTurnText = (input: { automaticSupervisionEnabled?: boolean; brainContractRegistered?: boolean }) => (
+  const brainSystemText = (input: { automaticSupervisionEnabled?: boolean; brainContractRegistered?: boolean }) => (
     buildProviderContextPayload(
       makeProvider('full-normalized-context-injection'),
       {
@@ -203,7 +221,7 @@ describe('buildProviderContextPayload', () => {
         namespace: { scope: 'personal', projectId: 'repo-1' },
         ...input,
       },
-    ).turnSystemText ?? ''
+    ).sessionSystemText ?? ''
   );
 
   const AUTOMATIC_SUPERVISION_MARKERS = [
@@ -218,7 +236,7 @@ describe('buildProviderContextPayload', () => {
   for (const [label, automaticSupervisionEnabled] of [['off', false], ['absent', undefined]] as const) {
     it(`gives a supervision-${label} Brain the manual-only contract and none of the automatic task route`, () => {
       for (const turn of [1, 2]) {
-        const text = brainTurnText({ automaticSupervisionEnabled });
+        const text = brainSystemText({ automaticSupervisionEnabled });
         // The per-turn baseline itself survives: the compaction fix stands.
         expect(text, `turn ${turn} must still carry the delegation contract`)
           .toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
@@ -238,7 +256,7 @@ describe('buildProviderContextPayload', () => {
   }
 
   it('keeps the full supervised-delegation contract for a Brain with automatic supervision enabled', () => {
-    const text = brainTurnText({ automaticSupervisionEnabled: true });
+    const text = brainSystemText({ automaticSupervisionEnabled: true });
     expect(text).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
     expect(text).toContain('"automaticSupervision":true');
     for (const automatic of AUTOMATIC_SUPERVISION_MARKERS) {
@@ -247,12 +265,10 @@ describe('buildProviderContextPayload', () => {
   });
 
   it('makes every re-assertion name its variant, so an off reference can never stand in for the on body', () => {
-    const offRef = brainTurnText({ automaticSupervisionEnabled: false, brainContractRegistered: true });
-    const onRef = brainTurnText({ automaticSupervisionEnabled: true, brainContractRegistered: true });
-    for (const ref of [offRef, onRef]) {
-      expect(ref).toContain('"contractRef"');
-      expect(ref).not.toContain('"contractId"');
-    }
+    const offRef = brainSystemText({ automaticSupervisionEnabled: false, brainContractRegistered: true });
+    const onRef = brainSystemText({ automaticSupervisionEnabled: true, brainContractRegistered: true });
+    expect(offRef).toContain(buildBrainWorkDelegationContractRef(false));
+    expect(onRef).toContain(buildBrainWorkDelegationContractRef(true));
     expect(offRef).toContain('"automaticSupervision":false');
     expect(offRef, 'an off reference must not name the supervised carrier').not.toContain('"fullText"');
     expect(onRef).toContain('"fullText":"supervisionDecision"');
@@ -262,10 +278,10 @@ describe('buildProviderContextPayload', () => {
   // Delegation authority never drags the audit lifecycle in with it, in either
   // variant. The audit lifecycle lives in the supervision broker's decision and
   // continuation channel, which is already mode-conditional; audit contracts
-  // must NOT be moved into turnSystemText.
+  // must not be duplicated into turn-scoped authored context.
   for (const automaticSupervisionEnabled of [false, true, undefined]) {
     it(`keeps the baseline layer audit-free (automaticSupervisionEnabled=${String(automaticSupervisionEnabled)})`, () => {
-      const text = brainTurnText({ automaticSupervisionEnabled });
+      const text = brainSystemText({ automaticSupervisionEnabled });
       expect(text).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
       expect(text).not.toContain(SUPERVISION_CONTRACT_IDS.TASK_FINALIZATION);
       expect(text).not.toContain(SUPERVISION_CONTRACT_IDS.CONTEXTUAL_AUDIT);
@@ -283,7 +299,7 @@ describe('buildProviderContextPayload', () => {
         namespace: { scope: 'personal', projectId: 'repo-1' },
       },
     );
-    expect(payload.turnSystemText ?? '').not.toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+    expect(payload.sessionSystemText ?? '').not.toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
   });
 
   // Any session can be an auditor, an implementer or an orchestrator, and audit
@@ -369,7 +385,8 @@ describe('buildProviderContextPayload', () => {
       namespace: { scope: 'personal', projectId: 'repo-1' },
     });
 
-    expect(payload.systemText).toBeUndefined();
+    expect(payload.systemText).toBe(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(payload.turnSystemText).toBeUndefined();
     expect(payload.assembledMessage).toBe('/compact');
   });
 

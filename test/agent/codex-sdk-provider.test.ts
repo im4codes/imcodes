@@ -6,6 +6,7 @@ import { appendFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough, Writable } from 'node:stream';
+import { CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../shared/cron-types.js';
 
 // Keep a native event-loop yield available after individual tests install
 // fake timers. Rollout checks perform real filesystem I/O, which must get a
@@ -4739,18 +4740,19 @@ describe('CodexSdkProvider', () => {
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-split-context', cwd: '/tmp/project', agentId: 'gpt-5.4' });
 
+    const stableSystemText = `Stable IM.codes runtime rules\n\n${CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE}`;
     const payload: ProviderContextPayload = {
       userMessage: 'ship it',
       assembledMessage: 'Relevant context\n\nship it',
-      sessionSystemText: 'Stable IM.codes runtime rules',
+      sessionSystemText: stableSystemText,
       turnSystemText: 'Required shared context:\n- Current file rule',
-      systemText: 'Stable IM.codes runtime rules\n\nRequired shared context:\n- Current file rule',
+      systemText: `${stableSystemText}\n\nRequired shared context:\n- Current file rule`,
       messagePreamble: 'Relevant context',
       attachments: [],
       context: {
-        sessionSystemText: 'Stable IM.codes runtime rules',
+        sessionSystemText: stableSystemText,
         turnSystemText: 'Required shared context:\n- Current file rule',
-        systemText: 'Stable IM.codes runtime rules\n\nRequired shared context:\n- Current file rule',
+        systemText: `${stableSystemText}\n\nRequired shared context:\n- Current file rule`,
         messagePreamble: 'Relevant context',
         requiredAuthoredContext: ['Current file rule'],
         advisoryAuthoredContext: [],
@@ -4778,6 +4780,7 @@ describe('CodexSdkProvider', () => {
     expect(threadStartReq?.params?.baseInstructions).toContain('[catalog-prompt:gpt-5.4]');
     expect(threadStartReq?.params?.baseInstructions).toContain('# IM.codes runtime instructions');
     expect(threadStartReq?.params?.baseInstructions).toContain('Stable IM.codes runtime rules');
+    expect(threadStartReq?.params?.baseInstructions).toContain(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
     expect(threadStartReq?.params?.baseInstructions).not.toContain('Current file rule');
     expect(turnStartReq?.params?.input?.[0]?.text).toBe(
       'Context instructions:\nRequired shared context:\n- Current file rule\n\nRelevant context\n\nship it',

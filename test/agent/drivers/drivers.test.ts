@@ -3,6 +3,7 @@ import { ClaudeCodeDriver } from '../../../src/agent/drivers/claude-code.js';
 import { CodexDriver } from '../../../src/agent/drivers/codex.js';
 import { OpenCodeDriver } from '../../../src/agent/drivers/opencode.js';
 import { ShellDriver } from '../../../src/agent/drivers/shell.js';
+import { CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../../shared/cron-types.js';
 
 // ── Claude Code ───────────────────────────────────────────────────────────────
 
@@ -27,6 +28,13 @@ describe('ClaudeCodeDriver', () => {
     const cmd = driver.buildLaunchCommand('deck_proj_brain', { cwd: '/home/user/proj' });
     expect(cmd).toContain('cd');
     expect(cmd).toContain('/home/user/proj');
+  });
+
+  it('puts permanent cron authorization in the process system prompt on launch and resume', () => {
+    expect(driver.buildLaunchCommand('deck_proj_brain', { fresh: true }))
+      .toContain(`--append-system-prompt ${JSON.stringify(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE)}`);
+    expect(driver.buildResumeCommand('deck_proj_brain', { ccSessionId: 'cc-1' }))
+      .toContain(`--append-system-prompt ${JSON.stringify(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE)}`);
   });
 
   it('buildResumeCommand includes -c flag', () => {
@@ -109,6 +117,12 @@ describe('CodexDriver', () => {
   it('buildResumeCommand returns resume command', () => {
     const cmd = driver.buildResumeCommand('deck_proj_w1');
     expect(cmd).toBeTruthy();
+  });
+
+  it('puts permanent cron authorization in process developer instructions on launch and resume', () => {
+    const expected = JSON.stringify(`developer_instructions=${JSON.stringify(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE)}`);
+    expect(driver.buildLaunchCommand('deck_proj_w1', { fresh: true })).toContain(`-c ${expected}`);
+    expect(driver.buildResumeCommand('deck_proj_w1', { codexSessionId: 'codex-1' })).toContain(`-c ${expected}`);
   });
 
   it('captureLastResponse uses capture-pane (no /copy)', async () => {

@@ -3,6 +3,7 @@ import { cwdPrefix } from './base.js';
 import { claudeNativeAgentFenceFlag } from '../native-agent-fence.js';
 import type { AgentStatus } from '../detect.js';
 import { detectStatus } from '../detect.js';
+import { CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../../shared/cron-types.js';
 
 const OVERLAY_PATTERNS = [
   /Allow|Deny/,
@@ -11,6 +12,9 @@ const OVERLAY_PATTERNS = [
   /Press Enter to/i,
   /─{10,}/, // CC uses box-drawing chars for dialogs
 ];
+
+const CRON_TRUST_SYSTEM_PROMPT_FLAG =
+  ` --append-system-prompt ${JSON.stringify(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE)}`;
 
 // Startup dialogs to auto-dismiss after launch
 const STARTUP_PROMPTS: Array<{
@@ -45,19 +49,19 @@ export class ClaudeCodeDriver implements AgentDriver {
     const cwd = cwdPrefix(opts?.cwd);
     const fence = opts?.nativeAgentsFenced ? claudeNativeAgentFenceFlag() : '';
     if (opts?.ccSessionId) {
-      return `${cwd}claude --dangerously-skip-permissions${fence} --session-id ${opts.ccSessionId}`;
+      return `${cwd}claude --dangerously-skip-permissions${fence}${CRON_TRUST_SYSTEM_PROMPT_FLAG} --session-id ${opts.ccSessionId}`;
     }
     if (opts?.fresh) {
-      return `${cwd}claude --dangerously-skip-permissions${fence}`;
+      return `${cwd}claude --dangerously-skip-permissions${fence}${CRON_TRUST_SYSTEM_PROMPT_FLAG}`;
     }
-    return `${cwd}claude --dangerously-skip-permissions${fence} -c || claude --dangerously-skip-permissions${fence}`;
+    return `${cwd}claude --dangerously-skip-permissions${fence}${CRON_TRUST_SYSTEM_PROMPT_FLAG} -c || claude --dangerously-skip-permissions${fence}${CRON_TRUST_SYSTEM_PROMPT_FLAG}`;
   }
 
   buildResumeCommand(_sessionName: string, opts?: LaunchOptions): string {
     const cwd = cwdPrefix(opts?.cwd);
     const fence = opts?.nativeAgentsFenced ? claudeNativeAgentFenceFlag() : '';
     if (opts?.ccSessionId) {
-      return `${cwd}claude --dangerously-skip-permissions${fence} --resume ${opts.ccSessionId}`;
+      return `${cwd}claude --dangerously-skip-permissions${fence}${CRON_TRUST_SYSTEM_PROMPT_FLAG} --resume ${opts.ccSessionId}`;
     }
     return this.buildLaunchCommand(_sessionName, opts);
   }

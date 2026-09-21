@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../shared/cron-types.js';
 
 const childProcessMock = vi.hoisted(() => ({
   // Accept both (file, args, cb) and (file, args, opts, cb) signatures.
@@ -1682,18 +1683,19 @@ describe('ClaudeCodeSdkProvider', () => {
       resumeId: 'session-split',
     });
 
+    const stableSystemText = `Stable IM.codes runtime rules\n\n${CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE}`;
     const makePayload = (turnSystemText: string): ProviderContextPayload => ({
       userMessage: 'ship it',
       assembledMessage: 'Relevant history\n\nship it',
-      sessionSystemText: 'Stable IM.codes runtime rules',
+      sessionSystemText: stableSystemText,
       turnSystemText,
-      systemText: `Stable IM.codes runtime rules\n\n${turnSystemText}`,
+      systemText: `${stableSystemText}\n\n${turnSystemText}`,
       messagePreamble: 'Relevant history',
       attachments: undefined,
       context: {
-        sessionSystemText: 'Stable IM.codes runtime rules',
+        sessionSystemText: stableSystemText,
         turnSystemText,
-        systemText: `Stable IM.codes runtime rules\n\n${turnSystemText}`,
+        systemText: `${stableSystemText}\n\n${turnSystemText}`,
         messagePreamble: 'Relevant history',
         requiredAuthoredContext: [turnSystemText],
         advisoryAuthoredContext: [],
@@ -1718,13 +1720,14 @@ describe('ClaudeCodeSdkProvider', () => {
     await flush();
 
     const [first, second] = sdkMock.runs.slice(-2);
-    expect(first.options.appendSystemPrompt).toBe('Stable IM.codes runtime rules');
-    expect(second.options.appendSystemPrompt).toBe('Stable IM.codes runtime rules');
+    expect(first.options.appendSystemPrompt).toBe(stableSystemText);
+    expect(second.options.appendSystemPrompt).toBe(stableSystemText);
+    expect(first.options.appendSystemPrompt).toContain(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
     expect(first.prompt).toContain('Required shared context:\n- First file rule');
     expect(first.prompt).not.toContain('Second file rule');
     expect(second.prompt).toContain('Required shared context:\n- Second file rule');
     expect(second.prompt).not.toContain('First file rule');
-    expect(second.prompt).not.toContain('Stable IM.codes runtime rules');
+    expect(second.prompt).not.toContain(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
   });
 
   it('accepts a normalized provider payload', async () => {

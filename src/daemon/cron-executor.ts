@@ -6,7 +6,6 @@ import type { CronCommandResultMessage, CronDispatchMessage, CronParticipant } f
 import {
   buildCompactCronControlRef,
   buildCronRunTimelineProjection,
-  buildRegisteredCronSystemContract,
   CRON_CONTROL_PROTOCOL,
   CRON_MSG,
   normalizeCronCompletionPolicy,
@@ -66,7 +65,6 @@ type CronProcessCommandSender = (
   options?: Parameters<typeof sendProcessSessionMessageForAutomation>[2],
 ) => Promise<void>;
 let cronProcessCommandSenderOverride: CronProcessCommandSender | null = null;
-const processCronContractSignatures = new Map<string, string>();
 
 export function __setCronSendDispatcherForTests(dispatcher: CronSendDispatcher | null): void {
   cronSendDispatcherOverride = dispatcher;
@@ -76,13 +74,13 @@ export function __setCronProcessCommandSenderForTests(
   sender: CronProcessCommandSender | null,
 ): void {
   cronProcessCommandSenderOverride = sender;
-  processCronContractSignatures.clear();
 }
 
 export function buildSelfManagedCronPrompt(msg: CronDispatchMessage): string {
   const completionPolicy = normalizeCronCompletionPolicy(msg.completionPolicy);
   const binding = buildCompactCronControlRef(msg.jobId, completionPolicy, msg.executionId);
-  return `${CRON_CONTROL_PROTOCOL.OPEN_TAG}${binding}>${CRON_CONTROL_PROTOCOL.CLOSE_TAG}`;
+  const taskBody = msg.action.type === 'command' ? msg.action.command : '';
+  return `${CRON_CONTROL_PROTOCOL.OPEN_TAG}${binding}>\n${taskBody}\n${CRON_CONTROL_PROTOCOL.CLOSE_TAG}`;
 }
 
 async function loadCronSendDispatcher(): Promise<CronSendDispatcher> {
@@ -188,9 +186,6 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
     const command = managedAgent
       ? buildSelfManagedCronPrompt(msg)
       : action.command;
-    const registeredSystemContract = managedAgent
-      ? buildRegisteredCronSystemContract(action, jobId)
-      : undefined;
     const cronRun = buildCronRunTimelineProjection(msg);
 
     if (session.runtimeType === 'transport') {
@@ -221,7 +216,6 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
           const clientMessageId = `cron:${jobId}:${executionId ?? 'dispatch'}:attempt:${attempt}`;
           await transportRuntime.send(command, clientMessageId, undefined, undefined, {
             timelineCommitted: true,
-            ...(registeredSystemContract ? { registeredSystemContract } : {}),
           });
           if (!timelineProjected && cronRun) {
             timelineEmitter.emit(name, 'user.message', {
@@ -266,21 +260,13 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
     } else {
       const collector = collectCommandResult(name, jobId, executionId, serverLink);
       try {
-        const processContractKey = `${name}\0${jobId}`;
-        const processCommand = registeredSystemContract
-          && processCronContractSignatures.get(processContractKey) !== registeredSystemContract.signature
-          ? `${registeredSystemContract.body}\n\n${command}`
-          : command;
-        await (cronProcessCommandSenderOverride ?? sendProcessSessionMessageForAutomation)(name, processCommand, {
+        await (cronProcessCommandSenderOverride ?? sendProcessSessionMessageForAutomation)(name, command, {
           userMessageMetadata: {
             allowDuplicate: true,
             memoryExcluded: true,
             ...(cronRun ? { cronRun } : {}),
           },
         });
-        if (registeredSystemContract) {
-          processCronContractSignatures.set(processContractKey, registeredSystemContract.signature);
-        }
       } catch (error) {
         collector.cancel();
         logger.error({ jobId, sessionName: name, error }, 'Cron: process session send failed');
