@@ -175,6 +175,14 @@ if (rtc_include_tests) {
     ]
   }
 
+  rtc_test("local_management_ipc_unittests") {
+    sources = [ "local_management_ipc_unittest.cc" ]
+    deps = [
+      "//test:test_support",
+      "//third_party/imcodes_remote_desktop/common:remote_desktop_common",
+    ]
+  }
+
   rtc_test("windows_platform_adapters_unittests") {
     sources = [
       "display_capture.cc",

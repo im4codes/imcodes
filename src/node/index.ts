@@ -23,6 +23,7 @@ import {
   loadRemoteDesktopAccessPaused,
 } from './remote-desktop-access-state.js';
 import { startRemoteDesktopLocalPanel } from './remote-desktop-local-panel.js';
+import { startAideskLocalIpcServer } from './aidesk-local-ipc-server.js';
 import {
   ensureAideskDesktopEntry,
   openAideskLocalPanel,
@@ -293,6 +294,25 @@ async function main(): Promise<void> {
       return null;
     })
     : null;
+  const localIpc = bootstrap.credential.nodeId
+    ? await startAideskLocalIpcServer({
+      publicNodeId: bootstrap.credential.nodeId,
+      runtimeVersion: DAEMON_VERSION,
+      productVersion: DAEMON_VERSION,
+      status: () => runtime.remoteDesktopAccessStatus(),
+      setPaused: (paused) => applyRemoteDesktopAccessPaused(
+        paused,
+        (next) => runtime.setRemoteDesktopAccessPaused(next),
+      ),
+      stopAll: () => runtime.stopAllRemoteDesktopConnections(),
+      disconnect: (connectionId) => runtime.stopRemoteDesktopConnection(connectionId),
+    }).catch((error) => {
+      // The existing panel, admission gate and worker stay available if the
+      // optional native-UI IPC surface cannot be created.
+      logger.warn({ err: error }, 'local aiDesk IPC service unavailable');
+      return null;
+    })
+    : null;
   void ensureAideskDesktopEntry().then((result) => {
     if (result === 'preserved') {
       logger.warn('existing user-created aiDesk desktop entry was preserved');
@@ -306,6 +326,7 @@ async function main(): Promise<void> {
   });
   runtime.start();
   const stop = () => {
+    void localIpc?.close().catch(() => {});
     void localPanel?.close().catch(() => {});
     runtime.stop();
     process.exit(0);

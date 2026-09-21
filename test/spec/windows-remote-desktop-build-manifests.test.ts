@@ -209,7 +209,7 @@ describe('windows remote-desktop build manifests', () => {
     // Exact set equality in BOTH directions: a target deleted from BUILD.gn
     // and a source deleted from $ExpectedSources each turn this red.
     expect(derived).toEqual([...testTargets].sort());
-    expect(derived.length).toBe(9);
+    expect(derived.length).toBe(10);
     // Named explicitly, because these two are the ones that went unbuilt.
     expect(derived).toContain('windows_platform_adapters_unittests');
     expect(derived).toContain('pipe_ipc_unittests');

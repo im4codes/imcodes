@@ -113,6 +113,7 @@ SOURCES=(
   native/remote-desktop-common/json_protocol.cc
   native/remote-desktop-common/data_channel_payload.cc
   native/remote-desktop-common/input_ledger.cc
+  native/remote-desktop-common/local_management_ipc.cc
   native/remote-desktop-common/quality_ladder.cc
   native/remote-desktop-common/session_core.cc
   native/remote-desktop-common/transport_session_core.cc

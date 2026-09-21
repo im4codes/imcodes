@@ -138,6 +138,7 @@ $ProductionSources = @(
   'common\data_channel_payload.cc',
   'common\input_ledger.cc',
   'common\json_protocol.cc', 'common\value_types.cc',
+  'common\local_management_ipc.cc',
   'common\transport_session_core.cc',
   'consent_ipc.cc', 'privacy_ipc.cc', 'consent_prompt.cc', 'local_indicator.cc', 'mf_h264_encoder.cc', 'peer_session.cc', 'pipe_ipc.cc',
   'common\quality_ladder.cc',
@@ -155,6 +156,10 @@ $Tests = [ordered]@{
     'windows_platform_adapters.cc', 'worker_policy.cc'
   )
   json_protocol_unittests = @('common\json_protocol.cc', 'json_protocol_unittest.cc')
+  local_management_ipc_unittests = @(
+    'common\json_protocol.cc', 'common\local_management_ipc.cc',
+    'local_management_ipc_unittest.cc'
+  )
   windows_platform_adapters_unittests = @(
     'common\input_ledger.cc', 'common\json_protocol.cc', 'common\value_types.cc', 'display_preferences.cc',
     'display_capture.cc', 'input_injector.cc', 'windows_platform_adapters.cc',
