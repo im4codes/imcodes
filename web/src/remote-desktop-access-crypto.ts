@@ -20,6 +20,7 @@ export interface PersistedRemoteDesktopInviteBinding {
 }
 
 export const REMOTE_DESKTOP_INVITE_HISTORY_STATE_KEY = 'remoteDesktopInviteTokenHash';
+export const REMOTE_DESKTOP_PUBLIC_ID_HISTORY_STATE_KEY = 'remoteDesktopPublicNodeId';
 const REMOTE_DESKTOP_INVITE_KEY_DB = 'imcodes-remote-desktop-invite-keys-v1';
 const REMOTE_DESKTOP_INVITE_KEY_STORE = 'invite-keys';
 

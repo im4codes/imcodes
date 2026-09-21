@@ -118,6 +118,22 @@ export type ProofResult = ProofSuccess | ProofFailure;
 
 const FAIL: ProofFailure = { ok: false, body: PUBLIC_UNAVAILABLE };
 
+/** Internal-only diagnostic classes. They must never be serialized pre-proof. */
+export const REMOTE_DESKTOP_LINK_PROOF_REFUSAL = {
+  CHALLENGE_MISSING_OR_REPLAYED: 'challenge_missing_or_replayed',
+  CHALLENGE_EXPIRED: 'challenge_expired',
+  CHALLENGE_MISMATCH: 'challenge_mismatch',
+  BROWSER_PROOF_INVALID: 'browser_proof_invalid',
+  INVITATION_UNAVAILABLE: 'invitation_unavailable',
+  INVITATION_INACTIVE: 'invitation_inactive',
+  INVITATION_EXPIRED: 'invitation_expired',
+  TARGET_UNAVAILABLE: 'target_unavailable',
+  BROWSER_CLAIM_CONFLICT: 'browser_claim_conflict',
+} as const;
+export type RemoteDesktopLinkProofRefusal = typeof REMOTE_DESKTOP_LINK_PROOF_REFUSAL[
+  keyof typeof REMOTE_DESKTOP_LINK_PROOF_REFUSAL
+];
+
 export interface ResolveLinkProofInput {
   /** Signature proof. The browser never sends, or learns, an internal link id. */
   proof: RemoteDesktopClaimProof;
@@ -125,6 +141,8 @@ export interface ResolveLinkProofInput {
   ttlMs?: number;
   /** Injected liveness seam for FULL daemons; absent means only controlled endpoints qualify. */
   fullEndpointEligible?: FullEndpointEligibility;
+  /** Server-local diagnostics only; the public response remains byte-identical. */
+  onRefusal?: (reason: RemoteDesktopLinkProofRefusal) => void;
 }
 
 export interface IssueChallengeInput {
@@ -212,6 +230,10 @@ export async function resolveLinkProof(
   const { proof } = input;
 
   return db.transaction(async (tx) => {
+    const refuse = (reason: RemoteDesktopLinkProofRefusal): ProofFailure => {
+      input.onRefusal?.(reason);
+      return FAIL;
+    };
     // 1. Consume the challenge. Conditional so two concurrent proofs cannot
     //    both spend it, and so a replay finds nothing.
     const consumed = await tx.queryOne<{
@@ -223,23 +245,23 @@ export async function resolveLinkProof(
         RETURNING challenge_hash, link_id, expires_at`,
       [hashChallengeMaterial(CHALLENGE_HASH_DOMAIN.ID, proof.challengeId), input.now],
     );
-    if (!consumed) return FAIL;
-    if (consumed.expires_at <= input.now) return FAIL;
+    if (!consumed) return refuse(REMOTE_DESKTOP_LINK_PROOF_REFUSAL.CHALLENGE_MISSING_OR_REPLAYED);
+    if (consumed.expires_at <= input.now) return refuse(REMOTE_DESKTOP_LINK_PROOF_REFUSAL.CHALLENGE_EXPIRED);
     if (!constantTimeEqualHex(
       consumed.challenge_hash,
       hashChallengeMaterial(CHALLENGE_HASH_DOMAIN.VALUE, proof.challenge),
-    )) return FAIL;
+    )) return refuse(REMOTE_DESKTOP_LINK_PROOF_REFUSAL.CHALLENGE_MISMATCH);
 
     // 2. Prove possession of the private key. A bare thumbprint proves nothing.
     if (!verifyBrowserClaimProof({
       proof,
       expectedChallengeId: proof.challengeId,
       expectedChallenge: proof.challenge,
-    })) return FAIL;
+    })) return refuse(REMOTE_DESKTOP_LINK_PROOF_REFUSAL.BROWSER_PROOF_INVALID);
 
     // The challenge was minted for an unresolved bearer. Everything above still
     // ran, so the cost and shape of this path match a real one.
-    if (consumed.link_id === null) return FAIL;
+    if (consumed.link_id === null) return refuse(REMOTE_DESKTOP_LINK_PROOF_REFUSAL.INVITATION_UNAVAILABLE);
 
     const link = await tx.queryOne<{
       id: string; host_id: string; access_mode: string; attendance: string;
@@ -254,15 +276,17 @@ export async function resolveLinkProof(
         FOR UPDATE`,
       [consumed.link_id],
     );
-    if (!link) return FAIL;
-    if (link.state !== 'active') return FAIL;
-    if (link.expires_at !== null && link.expires_at <= input.now) return FAIL;
+    if (!link) return refuse(REMOTE_DESKTOP_LINK_PROOF_REFUSAL.INVITATION_UNAVAILABLE);
+    if (link.state !== 'active') return refuse(REMOTE_DESKTOP_LINK_PROOF_REFUSAL.INVITATION_INACTIVE);
+    if (link.expires_at !== null && link.expires_at <= input.now) {
+      return refuse(REMOTE_DESKTOP_LINK_PROOF_REFUSAL.INVITATION_EXPIRED);
+    }
 
     // 3. Only a currently qualified endpoint may be disclosed.  Keep this
     // before the first browser-claim write: a transiently closed privacy gate
     // must consume this one-use challenge without poisoning the durable link.
     const endpoint = await resolveQualifiedEndpointTx(tx, link.host_id, input.fullEndpointEligible);
-    if (!endpoint) return FAIL;
+    if (!endpoint) return refuse(REMOTE_DESKTOP_LINK_PROOF_REFUSAL.TARGET_UNAVAILABLE);
 
     // 4. Bind this browser key under the link's policy. The locked link row
     // serializes the single-use first-claim decision; reusable links keep one
@@ -288,7 +312,7 @@ export async function resolveLinkProof(
             WHERE link_id = $1 AND browser_key_hash = $2`,
           [link.id, browserHash],
         );
-        return FAIL;
+        return refuse(REMOTE_DESKTOP_LINK_PROOF_REFUSAL.BROWSER_CLAIM_CONFLICT);
       }
     }
     if (!inserted) {

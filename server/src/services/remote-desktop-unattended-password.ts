@@ -28,7 +28,10 @@ import {
   type RemoteDesktopPasswordMutation,
 } from '../../../shared/remote-desktop-access.js';
 import { REMOTE_DESKTOP_ACCESS_MODE } from '../../../shared/remote-desktop.js';
-import { MACHINE_PRESENCE_STALENESS_MS } from '../../../shared/remote-exec.js';
+import {
+  MACHINE_PRESENCE_STALENESS_MS,
+  MACHINE_PRESENCE_STATUS,
+} from '../../../shared/remote-exec.js';
 import {
   consumeActionBoundStepUpGrant,
   type AccountSession,
@@ -1272,6 +1275,14 @@ export type UnattendedPasswordPublicProofResult = ProofSuccess | ProofFailure | 
   body: typeof UNATTENDED_PASSWORD_PUBLIC_RATE_LIMITED;
 };
 
+export const UNATTENDED_PASSWORD_PROOF_REFUSAL = Object.freeze({
+  INVALID_CREDENTIALS: 'invalid_credentials',
+  TARGET_UNAVAILABLE: 'target_unavailable',
+});
+export type UnattendedPasswordProofRefusal = typeof UNATTENDED_PASSWORD_PROOF_REFUSAL[
+  keyof typeof UNATTENDED_PASSWORD_PROOF_REFUSAL
+];
+
 /**
  * Converts a successful constant-work proof into one Control-only bootstrap.
  * The issuer receives host/generation plus the browser's public SPKI and its
@@ -1291,11 +1302,13 @@ export class RemoteDesktopUnattendedPasswordProofService {
     browserKeyThumbprint: string;
     source: string;
     now: number;
+    onRefusal?: (reason: UnattendedPasswordProofRefusal) => void;
   }): Promise<UnattendedPasswordPublicProofResult> {
     if (!validateRemoteDesktopBrowserPublicKeyBinding({
       browserPublicKeySpki: input.browserPublicKeySpki,
       browserKeyThumbprint: input.browserKeyThumbprint,
     })) {
+      input.onRefusal?.(UNATTENDED_PASSWORD_PROOF_REFUSAL.INVALID_CREDENTIALS);
       return { ok: false, body: REMOTE_DESKTOP_PUBLIC_LOOKUP_UNAVAILABLE };
     }
     const verified = await this.dependencies.verifier.verify({
@@ -1307,6 +1320,7 @@ export class RemoteDesktopUnattendedPasswordProofService {
       return { ok: false, rateLimited: true, body: UNATTENDED_PASSWORD_PUBLIC_RATE_LIMITED };
     }
     if (verified.result !== UNATTENDED_PASSWORD_RESULT.VERIFIED) {
+      input.onRefusal?.(UNATTENDED_PASSWORD_PROOF_REFUSAL.INVALID_CREDENTIALS);
       return { ok: false, body: REMOTE_DESKTOP_PUBLIC_LOOKUP_UNAVAILABLE };
     }
     const issued = await this.dependencies.bootstrapIssuer.issue({
@@ -1322,6 +1336,7 @@ export class RemoteDesktopUnattendedPasswordProofService {
       || issued.source !== REMOTE_DESKTOP_ACTOR_SOURCE.NODE_PASSWORD
       || issued.mode !== REMOTE_DESKTOP_ACCESS_MODE.CONTROL
       || issued.expiresAt <= input.now) {
+      input.onRefusal?.(UNATTENDED_PASSWORD_PROOF_REFUSAL.TARGET_UNAVAILABLE);
       return { ok: false, body: REMOTE_DESKTOP_PUBLIC_LOOKUP_UNAVAILABLE };
     }
     return issued;
@@ -1349,7 +1364,12 @@ export function createPostgresUnattendedPasswordHostAvailability(input: {
       const endpoint = await resolveExecutionEndpoint({
         db: input.db,
         hostId,
-        fullEndpointEligible: input.runtimeAuthorityAvailable,
+        // Resolve structural endpoint support first. Liveness is classified
+        // below so a known endpoint with a stale/missing runtime authority is
+        // OFFLINE rather than being misreported as UNSUPPORTED. A FULL endpoint
+        // is itself the capability-bearing daemon endpoint; its durable
+        // presence and current authority are still required before ONLINE.
+        fullEndpointEligible: async () => true,
       });
       if (!endpoint) return UNATTENDED_PASSWORD_HOST_AVAILABILITY.UNSUPPORTED;
       const presence = await input.db.queryOne<UnattendedPasswordEndpointPresenceRow>(
@@ -1359,7 +1379,7 @@ export function createPostgresUnattendedPasswordHostAvailability(input: {
         [endpoint.serverId],
       );
       const now = (input.now ?? Date.now)();
-      const present = presence?.status === 'online'
+      const present = presence?.status === MACHINE_PRESENCE_STATUS.ONLINE
         && typeof presence.last_heartbeat_at === 'number'
         && now - presence.last_heartbeat_at < MACHINE_PRESENCE_STALENESS_MS;
       if (!present) return UNATTENDED_PASSWORD_HOST_AVAILABILITY.OFFLINE;

@@ -3,6 +3,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { buildApp } from '../src/index.js';
 import type { Database } from '../src/db/client.js';
 import type { Env } from '../src/env.js';
+import { signJwt } from '../src/security/crypto.js';
+import { COOKIE_CSRF, COOKIE_SESSION, HEADER_CSRF } from '../../shared/cookie-names.js';
 import { REMOTE_DESKTOP_ACTOR_SOURCE } from '../../shared/remote-desktop-access.js';
 import { REMOTE_DESKTOP_ACCESS_MODE } from '../../shared/remote-desktop.js';
 
@@ -18,23 +20,34 @@ const requestBody = {
   browserPublicKeySpki,
   browserKeyThumbprint,
 };
+const JWT_KEY = 'production-route-test-jwt-key-at-least-32-bytes';
+const CSRF = 'production-route-test-csrf';
 
 function env(): Env {
   return {
     DATABASE_URL: 'postgres://unused',
-    JWT_SIGNING_KEY: 'production-route-test-jwt-key-at-least-32-bytes',
+    JWT_SIGNING_KEY: JWT_KEY,
     BOT_ENCRYPTION_KEY: 'production-route-test-bot-key-at-least-32-bytes',
     SERVER_URL: 'https://app.example.test',
     ALLOWED_ORIGINS: 'https://app.example.test',
     NODE_ENV: 'test',
-    DB: {} as Database,
+    DB: { queryOne: vi.fn(async () => ({ id: 'guest-user' })) } as unknown as Database,
+  };
+}
+
+function proofHeaders(): Record<string, string> {
+  return {
+    'Content-Type': 'application/json',
+    Cookie: `${COOKIE_SESSION}=${signJwt({ sub: 'guest-user', type: 'web' }, JWT_KEY, 3600)}; ${COOKIE_CSRF}=${CSRF}`,
+    [HEADER_CSRF]: CSRF,
+    Origin: 'https://app.example.test',
   };
 }
 
 function proofRequest(): Request {
   return new Request('https://app.example.test/api/remote-desktop/unattended-password/proof', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: proofHeaders(),
     body: JSON.stringify(requestBody),
   });
 }
@@ -95,7 +108,7 @@ describe('production unattended-password public route mount', () => {
       'https://app.example.test/api/remote-desktop/unattended-password/proof',
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: proofHeaders(),
         body: JSON.stringify({ publicNodeId: requestBody.publicNodeId }),
       },
     );

@@ -116,6 +116,7 @@ import {
   selectUnattendedPasswordServerSecret,
   type RemoteDesktopUnattendedPasswordProofService,
 } from './services/remote-desktop-unattended-password.js';
+import { createPostgresRemoteDesktopEndpointEligibility } from './services/remote-desktop-host-identity.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // Docker: /app/dist/index.js → /app/web/dist
@@ -139,6 +140,7 @@ export interface BuildAppOptions {
 
 export function buildApp(env: Env, options: BuildAppOptions = {}) {
   const app = new Hono<{ Bindings: Env }>();
+  const durableRemoteDesktopEndpointEligible = createPostgresRemoteDesktopEndpointEligibility({ db: env.DB });
   const unattendedPasswordProofService = options.unattendedPasswordProofService
     ?? createLazyPostgresUnattendedPasswordProofService({
       db: env.DB,
@@ -146,11 +148,10 @@ export function buildApp(env: Env, options: BuildAppOptions = {}) {
         botEncryptionKey: env.BOT_ENCRYPTION_KEY,
         jwtSigningKey: env.JWT_SIGNING_KEY,
       }),
-      // Resolve only the already-owned, generation-reconciled daemon runtime.
-      // This observes authority; it never instantiates a bridge or dispatches.
-      runtimeAuthorityAvailable: async (serverId) => (
-        WsBridge.remoteDesktopGuestOutboxTarget(serverId)?.isAvailable() ?? false
-      ),
+      // Public proof occurs before serverId disclosure, so it cannot be
+      // pod-sticky. Use durable fleet-wide presence here; the owning pod
+      // revalidates the exact live generation when redeeming the bootstrap.
+      runtimeAuthorityAvailable: durableRemoteDesktopEndpointEligible,
     });
 
   // Inject env into every request context

@@ -304,9 +304,10 @@ describe('remote desktop browser URL/history/storage/DOM gate', () => {
     expect(forbiddenBrowserSinks.test(bootstrap)).toBe(false);
     expect(forbiddenBrowserSinks.test(accessApi)).toBe(false);
     // Fragment handling is deliberately synchronous and network-free. The
-    // bounded anonymous challenge/proof calls live in the access API module,
+    // bounded authenticated challenge/proof calls live in the access API module,
     // where their fetch policy remains part of this security gate.
-    expect(accessApi).toContain("credentials: 'omit'");
+    expect(accessApi).toContain("credentials: 'include'");
+    expect(accessApi).toContain('apiFetch');
     expect(accessApi).toContain("referrerPolicy: 'no-referrer'");
     expect(accessApi).toContain("cache: 'no-store'");
   });

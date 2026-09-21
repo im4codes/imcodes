@@ -3,6 +3,7 @@ import { Hono } from 'hono';
 import { describe, expect, it, vi } from 'vitest';
 import type { Database } from '../src/db/client.js';
 import type { Env } from '../src/env.js';
+import { signJwt } from '../src/security/crypto.js';
 import { createRemoteDesktopUnattendedPasswordPublicRoutes } from '../src/routes/remote-desktop-unattended-password.js';
 import {
   RemoteDesktopUnattendedPasswordProofService,
@@ -20,6 +21,7 @@ import {
 import { digestStepUpAction, type AccountSession } from '../src/services/remote-desktop-account-auth.js';
 import { REMOTE_DESKTOP_ACTOR_SOURCE } from '../../shared/remote-desktop-access.js';
 import { REMOTE_DESKTOP_ACCESS_MODE } from '../../shared/remote-desktop.js';
+import { COOKIE_SESSION } from '../../shared/cookie-names.js';
 
 const HOST_ID = 'host-password-owner';
 const OWNER_ID = 'owner-password';
@@ -632,22 +634,30 @@ describe('unattended password public proof boundary', () => {
     });
     const app = new Hono<{ Bindings: Env }>();
     app.route('/api', routes);
+    const jwtKey = 'password-public-route-test-key-at-least-32-bytes';
+    const routeEnv = {
+      JWT_SIGNING_KEY: jwtKey,
+      DB: { queryOne: vi.fn(async () => ({ id: OWNER_ID })) } as unknown as Database,
+    } as Env;
     const request = () => app.request('/api/remote-desktop/unattended-password/proof', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        Cookie: `${COOKIE_SESSION}=${signJwt({ sub: OWNER_ID, type: 'web' }, jwtKey, 3600)}`,
+      },
       body: JSON.stringify({
         publicNodeId: 5_837_462_190,
         password: PASSWORD,
         browserPublicKeySpki: BROWSER_PUBLIC_KEY_SPKI,
         browserKeyThumbprint: BROWSER_THUMBPRINT,
       }),
-    });
+    }, routeEnv);
     const first = await request();
     const second = await request();
     expect(first.status).toBe(404);
     expect(second.status).toBe(404);
-    expect(await first.text()).toBe('{"status":"unavailable"}');
-    expect(await second.text()).toBe('{"status":"unavailable"}');
+    expect(await first.text()).toBe('{"status":"password_invalid"}');
+    expect(await second.text()).toBe('{"status":"password_invalid"}');
     expect(first.headers.get('content-length')).toBe(second.headers.get('content-length'));
     const limited = await request();
     expect(limited.status).toBe(429);

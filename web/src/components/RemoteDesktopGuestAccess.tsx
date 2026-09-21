@@ -17,8 +17,10 @@ import {
   type RemoteDesktopGuestSessionState,
 } from '../api/remote-desktop-access.js';
 import type { RemoteDesktopInviteBootstrapResult } from '../remote-desktop-invite-bootstrap.js';
+import { LoginPage } from '../pages/LoginPage.js';
 import {
   REMOTE_DESKTOP_INVITE_HISTORY_STATE_KEY,
+  REMOTE_DESKTOP_PUBLIC_ID_HISTORY_STATE_KEY,
   getOrCreateRemoteDesktopInviteBinding,
   loadRemoteDesktopInviteBinding,
   type PersistedRemoteDesktopInviteBinding,
@@ -37,7 +39,31 @@ type GuestUiState =
   | 'resolving'
   | RemoteDesktopGuestSessionState
   | 'cooldown'
+  | 'auth_required'
+  | 'invitation_invalid'
+  | 'invitation_expired'
+  | 'password_invalid'
+  | 'device_offline'
+  | 'invite_unavailable'
+  | 'password_unavailable'
   | 'unavailable';
+
+function readResumablePublicNodeId(): string {
+  const state = window.history.state;
+  if (!state || typeof state !== 'object') return '';
+  const candidate = (state as Record<string, unknown>)[REMOTE_DESKTOP_PUBLIC_ID_HISTORY_STATE_KEY];
+  return typeof candidate === 'string' && /^[5-9]\d{9}$/.test(candidate) ? candidate : '';
+}
+
+function replacePublicNodeIdHistoryState(publicNodeId: string | null): void {
+  const state = window.history.state && typeof window.history.state === 'object'
+    ? window.history.state as Record<string, unknown>
+    : {};
+  const next = { ...state };
+  if (publicNodeId) next[REMOTE_DESKTOP_PUBLIC_ID_HISTORY_STATE_KEY] = publicNodeId;
+  else delete next[REMOTE_DESKTOP_PUBLIC_ID_HISTORY_STATE_KEY];
+  window.history.replaceState(next, '', '/remote-desktop/access');
+}
 
 export function RemoteDesktopGuestAccess({
   bootstrap = Promise.resolve({ status: 'unavailable' }),
@@ -47,11 +73,12 @@ export function RemoteDesktopGuestAccess({
 }: RemoteDesktopGuestAccessProps) {
   const { t } = useTranslation();
   const [state, setState] = useState<GuestUiState>('idle');
-  const [publicNodeId, setPublicNodeId] = useState('');
+  const [publicNodeId, setPublicNodeId] = useState(readResumablePublicNodeId);
   const [password, setPassword] = useState('');
   const [target, setTarget] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [stream, setStream] = useState<MediaStream | null>(null);
+  const [authMode, setAuthMode] = useState<'login' | 'register' | null>(null);
   const session = useRef<{ stop(origin: RemoteDesktopStopOrigin): void } | null>(null);
   const invite = useRef<PersistedRemoteDesktopInviteBinding | null>(null);
   const video = useRef<HTMLVideoElement | null>(null);
@@ -94,13 +121,18 @@ export function RemoteDesktopGuestAccess({
         browserKey: currentInvite.browserKey,
       });
       if (result.status !== 'ready') {
-        setState(result.status === 'rate_limited' ? 'cooldown' : 'unavailable');
+        setState(result.status === 'auth_required'
+          ? 'auth_required'
+          : result.status === 'rate_limited' ? 'cooldown'
+            : result.status === 'invitation_expired' ? 'invitation_expired'
+              : result.status === 'device_offline' ? 'device_offline'
+                : result.status === 'invitation_invalid' ? 'invitation_invalid' : 'invite_unavailable');
         return;
       }
       await startReady(result, t('remote_desktop.guest.invited_target'));
     } catch (reason) {
       setError(mapRemoteDesktopApiError(reason));
-      setState('unavailable');
+      setState('invite_unavailable');
     }
   };
 
@@ -150,14 +182,20 @@ export function RemoteDesktopGuestAccess({
       });
       setPassword('');
       if (result.status !== 'ready') {
-        setState(result.status === 'rate_limited' ? 'cooldown' : 'unavailable');
+        if (result.status === 'auth_required') replacePublicNodeIdHistoryState(targetLabel);
+        setState(result.status === 'auth_required'
+          ? 'auth_required'
+          : result.status === 'rate_limited' ? 'cooldown'
+            : result.status === 'device_offline' ? 'device_offline'
+              : result.status === 'password_invalid' ? 'password_invalid' : 'password_unavailable');
         return;
       }
+      replacePublicNodeIdHistoryState(null);
       await startReady(result, targetLabel);
     } catch (reason) {
       setPassword('');
       setError(mapRemoteDesktopApiError(reason));
-      setState('unavailable');
+      setState('password_unavailable');
     }
   };
 
@@ -173,6 +211,24 @@ export function RemoteDesktopGuestAccess({
     }
     setState('idle');
   };
+
+  // Authentication stays in this same-origin tab. Successful LoginPage flows
+  // reload this exact scrubbed path; history.state then recovers the token hash
+  // and IndexedDB decrypts the bearer. No caller-controlled redirect is used.
+  if (authMode) {
+    return (
+      <div class="remote-desktop-guest-auth">
+        <button type="button" class="remote-desktop-guest-auth-back" onClick={() => setAuthMode(null)}>
+          <span aria-hidden="true">←</span>
+          <span>{t('remote_desktop.guest.back_to_invitation')}</span>
+        </button>
+        <LoginPage
+          initialMode={authMode === 'register' ? 'register' : 'buttons'}
+          showGithub={false}
+        />
+      </div>
+    );
+  }
 
   return (
     <main class="remote-desktop-guest" aria-labelledby="remote-desktop-guest-title">
@@ -199,7 +255,22 @@ export function RemoteDesktopGuestAccess({
           <strong>{t(`remote_desktop.guest.state_${state}`)}</strong>
           {target && <p>{t('remote_desktop.guest.target', { target })}</p>}
           {state === 'waiting_for_consent' && <p>{t('remote_desktop.guest.waiting_help')}</p>}
-          {(state === 'unavailable' || state === 'cooldown' || state === 'denied' || state === 'timeout' || state === 'cancelled') && <button type="button" onClick={retryOrReset}>{t('remote_desktop.guest.try_again')}</button>}
+          {state === 'auth_required' && <>
+            <p>{t('remote_desktop.guest.auth_required_help')}</p>
+            <div class="remote-desktop-guest-auth-actions">
+              <button type="button" onClick={() => setAuthMode('login')}>
+                {t('remote_desktop.guest.sign_in')}
+              </button>
+              <button type="button" onClick={() => setAuthMode('register')}>
+                {t('remote_desktop.guest.register')}
+              </button>
+            </div>
+          </>}
+          {(state === 'unavailable' || state === 'invite_unavailable' || state === 'password_unavailable'
+            || state === 'invitation_invalid' || state === 'invitation_expired'
+            || state === 'password_invalid' || state === 'device_offline'
+            || state === 'cooldown' || state === 'denied' || state === 'timeout' || state === 'cancelled')
+            && <button type="button" onClick={retryOrReset}>{t('remote_desktop.guest.try_again')}</button>}
         </div>}
         {stream && <video
           ref={video}

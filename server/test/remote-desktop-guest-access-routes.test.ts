@@ -85,6 +85,7 @@ vi.mock('../src/services/remote-desktop-shell-launch-context.js', async (importO
 
 import { remoteDesktopGuestAccessRoutes } from '../src/routes/remote-desktop-guest-access.js';
 import { PUBLIC_UNAVAILABLE } from '../src/services/remote-desktop-guest-bootstrap.js';
+import { REMOTE_DESKTOP_GUEST_REFUSAL_STATUS } from '../../shared/remote-desktop-access.js';
 import { LINK_REFUSAL, LinkAuthorityError } from '../src/services/remote-desktop-guest-links.js';
 import {
   OWNER_HOST_MANAGEMENT_ERROR,
@@ -210,26 +211,28 @@ describe('remote desktop guest access routes', () => {
     expect(mocks.challenge).not.toHaveBeenCalled();
   });
 
-  it('returns one identical body for every pre-proof failure', async () => {
-    // Bad shape, absent link, revoked link and expired link must be
-    // indistinguishable — including by status code, which is why each is
-    // asserted rather than just the JSON.
-    const cases: unknown[] = [
+  it('keeps malformed proofs generic while giving authenticated valid-shape refusals a bounded class', async () => {
+    // Malformed inputs never reach proof resolution and remain generic. Once
+    // authenticated callers submit a valid proof shape, the resolver may
+    // return only a bounded actionable class without any internal identity.
+    const malformedCases: unknown[] = [
       'not json at all',
       {},
       { ...PROOF, signature: '' },
       { ...PROOF, browserKeyThumbprint: '' },
-      PROOF,
     ];
-    const seen = new Set<string>();
-    for (const body of cases) {
+    for (const body of malformedCases) {
       const response = await post(body);
       expect(response.status).toBe(200);
       expect(response.headers.get('cache-control')).toBe('no-store');
-      seen.add(`${response.status}|${JSON.stringify(await response.json())}`);
+      expect(await response.json()).toEqual(PUBLIC_UNAVAILABLE);
     }
-    expect(seen.size).toBe(1);
-    expect([...seen][0]).toBe(`200|${JSON.stringify(PUBLIC_UNAVAILABLE)}`);
+
+    const resolved = await post(PROOF);
+    expect(resolved.status).toBe(200);
+    expect(await resolved.json()).toEqual({
+      status: REMOTE_DESKTOP_GUEST_REFUSAL_STATUS.INVITATION_INVALID,
+    });
   });
 
   it('never leaks a target through a widened failure body', async () => {
@@ -240,7 +243,9 @@ describe('remote desktop guest access routes', () => {
       body: { status: 'unavailable', serverId: 'srv-secret', hostId: 'host-secret' },
     });
     const response = await post(PROOF);
-    expect(await response.json()).toEqual(PUBLIC_UNAVAILABLE);
+    expect(await response.json()).toEqual({
+      status: REMOTE_DESKTOP_GUEST_REFUSAL_STATUS.INVITATION_INVALID,
+    });
     expect(JSON.stringify(await post(PROOF).then(r => r.json())))
       .not.toContain('srv-secret');
   });

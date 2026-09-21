@@ -17,6 +17,9 @@ const requiredGuest = [
   'title', 'subtitle', 'public_id', 'password', 'connect', 'boundary', 'invited_target',
   'state_resolving', 'state_waiting_for_consent', 'state_approved', 'state_denied',
   'state_timeout', 'state_cancelled', 'state_cooldown', 'state_unavailable', 'target',
+  'state_auth_required', 'auth_required_help', 'sign_in', 'register', 'back_to_invitation',
+  'state_invitation_invalid', 'state_invitation_expired', 'state_password_invalid', 'state_device_offline',
+  'state_invite_unavailable', 'state_password_unavailable',
   'waiting_help', 'try_again', 'generic_error',
 ] as const;
 

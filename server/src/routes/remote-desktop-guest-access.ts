@@ -3,6 +3,8 @@ import { Hono } from 'hono';
 import type { Context } from 'hono';
 import type { Env } from '../env.js';
 import {
+  REMOTE_DESKTOP_GUEST_AUTH_ERROR,
+  REMOTE_DESKTOP_GUEST_REFUSAL_STATUS,
   REMOTE_DESKTOP_LINK_LIMITS,
   REMOTE_DESKTOP_LINK_MUTATION,
   REMOTE_DESKTOP_PRESENTATION_SOURCE,
@@ -11,7 +13,6 @@ import {
   REMOTE_DESKTOP_SHELL_MSG,
   isCanonicalRemoteDesktopLinkToken,
   isCanonicalRemoteDesktopCreationRequestId,
-  isRemoteDesktopPreProofResponseSafe,
   validateRemoteDesktopClaimProof,
   validateRemoteDesktopLinkCreateRequest,
   validateRemoteDesktopShellMessage,
@@ -24,8 +25,10 @@ import {
 } from '../../../shared/remote-desktop-contract-primitives.js';
 import {
   PUBLIC_UNAVAILABLE,
+  REMOTE_DESKTOP_LINK_PROOF_REFUSAL,
   issueClaimChallenge,
   resolveLinkProof,
+  type RemoteDesktopLinkProofRefusal,
 } from '../services/remote-desktop-guest-bootstrap.js';
 import {
   LINK_REFUSAL,
@@ -49,7 +52,10 @@ import {
   REMOTE_DESKTOP_GUEST_EFFECT_RETENTION_MS,
   readDatabaseClock,
 } from '../services/remote-desktop-guest-due-worker.js';
-import { resolveExecutionEndpoint } from '../services/remote-desktop-host-identity.js';
+import {
+  createPostgresRemoteDesktopEndpointEligibility,
+  resolveExecutionEndpoint,
+} from '../services/remote-desktop-host-identity.js';
 import {
   PRIVACY_DB_PHASE_IDLE,
   PRIVACY_REFUSAL,
@@ -66,14 +72,15 @@ import {
   getRemoteDesktopShellLaunchContextDispatcher,
   redeemRemoteDesktopShellLaunchContext,
 } from '../services/remote-desktop-shell-launch-context.js';
+import logger from '../util/logger.js';
 
 /**
- * Public guest-access surface plus account-Owner management.
+ * Account-authenticated guest-access surface plus account-Owner management.
  *
- * The public half is flat and unauthenticated on purpose: it is reached with a
- * bearer nobody has an account for. Everything it can refuse refuses with one
- * identical body, and the success path is the only place `serverId` ever
- * appears.
+ * The guest half is flat because no `serverId` is known before proof. It still
+ * requires an IM.codes account. Authentication is checked before parsing the
+ * bearer, so an anonymous caller learns nothing about whether an invitation
+ * exists. Proof failures retain one non-disclosing response shape.
  *
  * Browser claims use a Server challenge and P-256 proof; no public request ever
  * carries or learns an internal link id.
@@ -266,6 +273,10 @@ function mapOwnerError(c: Context<RouteEnv>, error: unknown): Response | null {
  */
 async function issueGuestClaimChallenge(c: Context<RouteEnv>): Promise<Response> {
   c.header('Cache-Control', 'no-store');
+  const accountSession = await resolveRemoteDesktopAccountSession(c);
+  if (!accountSession) {
+    return c.json({ error: REMOTE_DESKTOP_GUEST_AUTH_ERROR.AUTHENTICATION_REQUIRED }, 401);
+  }
   const record = asExactRecord(await readJson(c), ['token']);
   const token = typeof record?.token === 'string' ? record.token : '';
   if (!isCanonicalRemoteDesktopLinkToken(token)) return c.json(PUBLIC_UNAVAILABLE);
@@ -280,16 +291,34 @@ remoteDesktopGuestAccessRoutes.post('/remote-desktop/guest/link/bootstrap', issu
 
 remoteDesktopGuestAccessRoutes.post('/remote-desktop/guest/resolve', async (c) => {
   c.header('Cache-Control', 'no-store');
+  const accountSession = await resolveRemoteDesktopAccountSession(c);
+  if (!accountSession) {
+    return c.json({ error: REMOTE_DESKTOP_GUEST_AUTH_ERROR.AUTHENTICATION_REQUIRED }, 401);
+  }
   const parsed = validateRemoteDesktopClaimProof(await readJson(c));
   if (!parsed.ok) return c.json(PUBLIC_UNAVAILABLE);
 
+  let refusal: RemoteDesktopLinkProofRefusal | null = null;
   const result = await resolveLinkProof(c.env.DB, {
     proof: parsed.value,
     now: Date.now(),
+    fullEndpointEligible: createPostgresRemoteDesktopEndpointEligibility({ db: c.env.DB }),
+    onRefusal: (reason) => {
+      refusal = reason;
+      logger.info({ reason }, 'authenticated remote-desktop invitation proof refused');
+    },
   });
   if (!result.ok) {
-    // Belt and braces: never let a future edit widen the pre-proof body.
-    return c.json(isRemoteDesktopPreProofResponseSafe(result.body) ? result.body : PUBLIC_UNAVAILABLE);
+    // Authentication has already succeeded, so holders may receive a bounded
+    // actionable class. Unknown/revoked/malformed cases remain one class and
+    // no route, host, owner or other internal identifier is serialized.
+    if (refusal === REMOTE_DESKTOP_LINK_PROOF_REFUSAL.INVITATION_EXPIRED) {
+      return c.json({ status: REMOTE_DESKTOP_GUEST_REFUSAL_STATUS.INVITATION_EXPIRED });
+    }
+    if (refusal === REMOTE_DESKTOP_LINK_PROOF_REFUSAL.TARGET_UNAVAILABLE) {
+      return c.json({ status: REMOTE_DESKTOP_GUEST_REFUSAL_STATUS.DEVICE_OFFLINE });
+    }
+    return c.json({ status: REMOTE_DESKTOP_GUEST_REFUSAL_STATUS.INVITATION_INVALID });
   }
   return c.json({
     status: 'ready',

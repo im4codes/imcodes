@@ -43,3 +43,6 @@
 .remote-desktop-guest-state { display:grid; gap:10px; padding:14px; text-align:center; border:1px solid #28506d; border-radius:10px; background:#0a1a2b; }
 .remote-desktop-guest-video { width:100%; min-height:220px; max-height:70dvh; object-fit:contain; border:1px solid #28506d; border-radius:10px; background:#02050a; }
 .remote-desktop-guest-boundary { font-size:12px; }
+.remote-desktop-guest-auth { min-height:100dvh; position:relative; }
+.remote-desktop-guest-auth-back { position:fixed; z-index:2; top:max(16px,var(--sat,0px)); left:16px; display:flex; align-items:center; gap:6px; }
+.remote-desktop-guest-auth-actions { display:flex; flex-wrap:wrap; justify-content:center; gap:10px; }

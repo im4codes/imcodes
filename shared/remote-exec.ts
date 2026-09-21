@@ -63,6 +63,11 @@ export const REMOTE_EXEC_MAX_CHUNK_BYTES = 64 * 1024;
  * WsBridge). Kept > the daemon heartbeat interval so a healthy node never flaps.
  */
 export const MACHINE_PRESENCE_STALENESS_MS = 90_000;
+/** Durable server-presence values shared by DB-backed availability readers. */
+export const MACHINE_PRESENCE_STATUS = {
+  ONLINE: 'online',
+  OFFLINE: 'offline',
+} as const;
 /** Explicit maximum returned by list_machines / GET /api/machines. */
 export const MACHINE_LIST_MAX_ITEMS = 200;
 /**

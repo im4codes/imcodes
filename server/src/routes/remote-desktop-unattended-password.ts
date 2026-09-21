@@ -2,6 +2,8 @@ import { Hono } from 'hono';
 import type { Env } from '../env.js';
 import {
   REMOTE_DESKTOP_ACCESS_LIMITS,
+  REMOTE_DESKTOP_GUEST_AUTH_ERROR,
+  REMOTE_DESKTOP_GUEST_REFUSAL_STATUS,
   REMOTE_DESKTOP_PUBLIC_LOOKUP_UNAVAILABLE,
   isCanonicalRemoteDesktopBrowserKeyThumbprint,
   isCanonicalRemoteDesktopBrowserPublicKeySpki,
@@ -12,6 +14,7 @@ import {
 import { resolveRemoteDesktopAccountSession } from './remote-desktop-account-session.js';
 import {
   RemoteDesktopUnattendedPasswordProofService,
+  UNATTENDED_PASSWORD_PROOF_REFUSAL,
   UNATTENDED_PASSWORD_MUTATION_ERROR,
   UNATTENDED_PASSWORD_PUBLIC_RATE_LIMITED,
   UnattendedPasswordMutationError,
@@ -20,6 +23,7 @@ import {
   selectUnattendedPasswordServerSecret,
   validateRemoteDesktopBrowserPublicKeyBinding,
   type UnattendedPasswordPrivacyEpochRef,
+  type UnattendedPasswordProofRefusal,
 } from '../services/remote-desktop-unattended-password.js';
 
 type RouteEnv = { Bindings: Env };
@@ -77,9 +81,14 @@ export function createRemoteDesktopUnattendedPasswordPublicRoutes(
 ): Hono<RouteEnv> {
   const routes = new Hono<RouteEnv>();
   routes.post('/remote-desktop/unattended-password/proof', async (c) => {
+    const accountSession = await resolveRemoteDesktopAccountSession(c);
+    if (!accountSession) {
+      return c.json({ error: REMOTE_DESKTOP_GUEST_AUTH_ERROR.AUTHENTICATION_REQUIRED }, 401);
+    }
     const body = await c.req.json().catch(() => null);
     const parsed = parsePublicProofRequest(body);
     if (!parsed) return fixedPublicResponse(PUBLIC_UNAVAILABLE_BODY, 404);
+    let refusal: UnattendedPasswordProofRefusal | null = null;
     let result: Awaited<ReturnType<RemoteDesktopUnattendedPasswordProofService['prove']>>;
     try {
       result = await proofService.prove({
@@ -89,6 +98,7 @@ export function createRemoteDesktopUnattendedPasswordPublicRoutes(
         browserKeyThumbprint: parsed.browserKeyThumbprint,
         source: (c.get('clientIp' as never) as string | undefined) ?? 'unknown',
         now: Date.now(),
+        onRefusal: (reason) => { refusal = reason; },
       });
     } catch {
       // Initialization, PostgreSQL and KDF failures share the same pre-proof
@@ -96,9 +106,13 @@ export function createRemoteDesktopUnattendedPasswordPublicRoutes(
       return fixedPublicResponse(PUBLIC_UNAVAILABLE_BODY, 404);
     }
     if (!result.ok) {
-      return result.body.status === UNATTENDED_PASSWORD_PUBLIC_RATE_LIMITED.status
-        ? fixedPublicResponse(PUBLIC_RATE_LIMITED_BODY, 429)
-        : fixedPublicResponse(PUBLIC_UNAVAILABLE_BODY, 404);
+      if (result.body.status === UNATTENDED_PASSWORD_PUBLIC_RATE_LIMITED.status) {
+        return fixedPublicResponse(PUBLIC_RATE_LIMITED_BODY, 429);
+      }
+      const status = refusal === UNATTENDED_PASSWORD_PROOF_REFUSAL.TARGET_UNAVAILABLE
+        ? REMOTE_DESKTOP_GUEST_REFUSAL_STATUS.DEVICE_OFFLINE
+        : REMOTE_DESKTOP_GUEST_REFUSAL_STATUS.PASSWORD_INVALID;
+      return fixedPublicResponse(JSON.stringify({ status }), 404);
     }
     return new Response(JSON.stringify(result), {
       status: 200,

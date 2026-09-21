@@ -37,7 +37,7 @@ const LIFECYCLE_GATES: EvidenceGate[] = [
     id: '14.1.browser.fragment_scrub_before_app',
     status: 'covered',
     file: 'test/security/remote-desktop-secret-gate.test.ts',
-    needles: ['browser URL/history/storage/DOM gate', 'window.history.replaceState', "credentials: 'omit'", "referrerPolicy: 'no-referrer'"],
+    needles: ['browser URL/history/storage/DOM gate', 'window.history.replaceState', "credentials: 'include'", "referrerPolicy: 'no-referrer'"],
   },
   {
     id: '14.1.db_log_audit_secret_scan',

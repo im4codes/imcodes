@@ -13,6 +13,7 @@ import {
   REMOTE_DESKTOP_LINK_USE_POLICY,
   REMOTE_DESKTOP_LINK_MUTATION,
   REMOTE_DESKTOP_LINK_TOKEN,
+  REMOTE_DESKTOP_GUEST_REFUSAL_STATUS,
   type RemoteDesktopActorSource,
   type RemoteDesktopLinkKind,
   type RemoteDesktopLinkUsePolicy,
@@ -187,7 +188,10 @@ export interface RemoteDesktopGuestReady {
   browserKey: RemoteDesktopBrowserKeyPair;
 }
 
-export type RemoteDesktopGuestProofResult = RemoteDesktopGuestReady | { status: 'unavailable' | 'rate_limited' };
+export type RemoteDesktopGuestProofResult = RemoteDesktopGuestReady | {
+  status: 'auth_required' | 'unavailable' | 'rate_limited'
+    | typeof REMOTE_DESKTOP_GUEST_REFUSAL_STATUS[keyof typeof REMOTE_DESKTOP_GUEST_REFUSAL_STATUS];
+};
 
 export type RemoteDesktopGuestSessionState = 'waiting_for_consent' | 'approved' | 'denied' | 'timeout' | 'cancelled';
 
@@ -426,6 +430,9 @@ function decodePrivacyEpoch(value: unknown): RemoteDesktopPrivacyEpochRef {
 function decodeGuestReady(value: unknown, browserKey: RemoteDesktopBrowserKeyPair): RemoteDesktopGuestProofResult {
   if (!isRecord(value)) return { status: 'unavailable' };
   if (value.status === 'rate_limited') return { status: 'rate_limited' };
+  for (const status of Object.values(REMOTE_DESKTOP_GUEST_REFUSAL_STATUS)) {
+    if (value.status === status) return { status };
+  }
   // Link proof normalizes success as status=ready, while the current password
   // proof route returns the underlying ProofSuccess discriminant (ok=true).
   if (value.status !== 'ready' && value.ok !== true) return { status: 'unavailable' };
@@ -445,6 +452,14 @@ function decodeGuestReady(value: unknown, browserKey: RemoteDesktopBrowserKeyPai
     source: value.source as RemoteDesktopActorSource,
     browserKey,
   };
+}
+
+function decodeGuestErrorBody(body: string, browserKey: RemoteDesktopBrowserKeyPair): RemoteDesktopGuestProofResult {
+  try {
+    return decodeGuestReady(JSON.parse(body), browserKey);
+  } catch {
+    return { status: 'unavailable' };
+  }
 }
 
 function stepUpToken(grant: RemoteDesktopStepUpGrant): string {
@@ -622,18 +637,29 @@ export async function resolveRemoteDesktopInviteProof(input: {
   browserKey: RemoteDesktopBrowserKeyPair;
   fetchImpl?: typeof fetch;
 }): Promise<RemoteDesktopGuestProofResult> {
-  const request = input.fetchImpl ?? fetch;
   const requestInit = (body: unknown): RequestInit => ({
     method: 'POST',
-    credentials: 'omit',
+    credentials: 'include',
     cache: 'no-store',
     referrerPolicy: 'no-referrer',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   });
-  const challengeResponse = await request('/api/remote-desktop/guest/challenge', requestInit({ token: input.token })).catch(() => null);
-  if (!challengeResponse?.ok) return { status: 'unavailable' };
-  const challenge = await challengeResponse.json().catch(() => null);
+  const post = async (path: string, body: unknown): Promise<{ status: number; body: unknown } | null> => {
+    if (!input.fetchImpl) {
+      try {
+        return { status: 200, body: await apiFetch(path, requestInit(body)) };
+      } catch (error) {
+        return error instanceof ApiError ? { status: error.status, body: null } : null;
+      }
+    }
+    const response = await input.fetchImpl(path, requestInit(body)).catch(() => null);
+    return response ? { status: response.status, body: await response.json().catch(() => null) } : null;
+  };
+  const challengeResponse = await post('/api/remote-desktop/guest/challenge', { token: input.token });
+  if (challengeResponse?.status === 401) return { status: 'auth_required' };
+  if (challengeResponse?.status !== 200) return { status: 'unavailable' };
+  const challenge = challengeResponse.body;
   if (!isRecord(challenge)
     || challenge.keyAlgorithm !== REMOTE_DESKTOP_BROWSER_CLAIM.KEY_ALGORITHM
     || typeof challenge.challengeId !== 'string'
@@ -644,14 +670,15 @@ export async function resolveRemoteDesktopInviteProof(input: {
     browserKeyThumbprint: input.browserKey.thumbprint,
     privateKey: input.browserKey.privateKey,
   });
-  const resolveResponse = await request('/api/remote-desktop/guest/resolve', requestInit(remoteDesktopClaimProofBody({
+  const resolveResponse = await post('/api/remote-desktop/guest/resolve', remoteDesktopClaimProofBody({
     challengeId: challenge.challengeId,
     challenge: challenge.challenge,
     browserKey: input.browserKey,
     signature,
-  }))).catch(() => null);
-  if (!resolveResponse?.ok) return { status: 'unavailable' };
-  return decodeGuestReady(await resolveResponse.json().catch(() => null), input.browserKey);
+  }));
+  if (resolveResponse?.status === 401) return { status: 'auth_required' };
+  if (resolveResponse?.status !== 200) return { status: 'unavailable' };
+  return decodeGuestReady(resolveResponse.body, input.browserKey);
 }
 
 export async function createRemoteDesktopBootstrapProof(ready: RemoteDesktopGuestReady): Promise<{ ticket: string; browserKeyThumbprint: string; signature: string }> {
@@ -673,10 +700,9 @@ export async function proveRemoteDesktopPublicPassword(input: {
   fetchImpl?: typeof fetch;
 }): Promise<RemoteDesktopGuestProofResult> {
   const browserKey = input.browserKey ?? await generateRemoteDesktopBrowserKeyPair();
-  const request = input.fetchImpl ?? fetch;
-  const response = await request('/api/remote-desktop/unattended-password/proof', {
+  const requestInit: RequestInit = {
     method: 'POST',
-    credentials: 'omit',
+    credentials: 'include',
     cache: 'no-store',
     referrerPolicy: 'no-referrer',
     headers: { 'content-type': 'application/json' },
@@ -686,11 +712,27 @@ export async function proveRemoteDesktopPublicPassword(input: {
       browserPublicKeySpki: browserKey.publicKeySpki,
       browserKeyThumbprint: browserKey.thumbprint,
     }),
-  }).catch(() => null);
+  };
+  if (!input.fetchImpl) {
+    try {
+      return decodeGuestReady(
+        await apiFetch('/api/remote-desktop/unattended-password/proof', requestInit),
+        browserKey,
+      );
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) return { status: 'auth_required' };
+      if (error instanceof ApiError && error.status === 429) return { status: 'rate_limited' };
+      if (error instanceof ApiError) return decodeGuestErrorBody(error.body, browserKey);
+      return { status: 'unavailable' };
+    }
+  }
+  const response = await input.fetchImpl('/api/remote-desktop/unattended-password/proof', requestInit).catch(() => null);
   if (!response) return { status: 'unavailable' };
+  if (response.status === 401) return { status: 'auth_required' };
   if (response.status === 429) return { status: 'rate_limited' };
-  if (!response.ok) return { status: 'unavailable' };
-  return decodeGuestReady(await response.json().catch(() => null), browserKey);
+  const body = await response.json().catch(() => null);
+  if (!response.ok) return decodeGuestReady(body, browserKey);
+  return decodeGuestReady(body, browserKey);
 }
 
 export function remoteDesktopClaimProofBody(input: {

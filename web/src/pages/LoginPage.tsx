@@ -25,7 +25,13 @@ interface Props {
   onLoginSuccess?: (userId: string, serverUrl: string) => void;
   onChangeServer?: () => void | Promise<void>;
   beginAuthAttempt?: () => LoginAuthAttempt;
+  /** Initial surface for a trusted same-origin flow such as invite resumption. */
+  initialMode?: LoginMode;
+  /** Disable external OAuth when a caller must resume exact in-tab state. */
+  showGithub?: boolean;
 }
+
+type LoginMode = 'buttons' | 'register' | 'password' | 'password_register' | 'change_password';
 
 // localStorage keys for the optional "remember password" feature on the
 // password login form. Cleartext storage is opt-in via the checkbox; the
@@ -65,9 +71,17 @@ function persistRememberedCredentials(remember: boolean, username: string, passw
   } catch { /* ignore quota / disabled storage */ }
 }
 
-export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer, beginAuthAttempt }: Props) {
+export function LoginPage({
+  onLogin,
+  serverUrl,
+  onLoginSuccess,
+  onChangeServer,
+  beginAuthAttempt,
+  initialMode = 'buttons',
+  showGithub = true,
+}: Props) {
   const { t } = useTranslation();
-  const [mode, setMode] = useState<'buttons' | 'register' | 'password' | 'password_register' | 'change_password'>('buttons');
+  const [mode, setMode] = useState<LoginMode>(initialMode);
   const [displayName, setDisplayName] = useState('');
   const [deviceName, setDeviceName] = useState('');
   // Hydrate username + password from localStorage when the user previously
@@ -476,7 +490,7 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer, 
               </>
             )}
 
-            {!isNative() && (
+            {!isNative() && showGithub && (
               <button
                 class="btn btn-ghost"
                 style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, marginBottom: 10 }}

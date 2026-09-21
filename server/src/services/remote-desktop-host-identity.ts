@@ -30,6 +30,10 @@ import {
   isProhibitedRemoteDesktopPublicIdPattern,
 } from '../../../shared/remote-desktop-access.js';
 import type { RemoteDesktopActorSource } from '../../../shared/remote-desktop-access.js';
+import {
+  MACHINE_PRESENCE_STALENESS_MS,
+  MACHINE_PRESENCE_STATUS,
+} from '../../../shared/remote-exec.js';
 
 /** Inclusive lower bound of the public node ID range. */
 export const PUBLIC_NODE_ID_MIN = REMOTE_DESKTOP_PUBLIC_ID.MIN;
@@ -71,6 +75,31 @@ export class HostIdentityError extends Error {
  */
 export type PublicNodeIdRandom = (minInclusive: number, maxExclusive: number) => number;
 export type FullEndpointEligibility = (serverId: string) => boolean | Promise<boolean>;
+
+/**
+ * Cross-pod eligibility for the pre-proof guest boundary.
+ *
+ * Invitation/password proof happens before the caller may learn `serverId`, so
+ * ingress cannot yet route that request to the pod holding the daemon socket.
+ * The durable heartbeat is therefore the only correct fleet-wide liveness
+ * source at this boundary. The owning pod rechecks its exact live generation
+ * when the short-lived bootstrap is redeemed.
+ */
+export function createPostgresRemoteDesktopEndpointEligibility(input: {
+  db: Database;
+  now?: () => number;
+}): FullEndpointEligibility {
+  return async (serverId) => {
+    const row = await input.db.queryOne<{ status: string | null; last_heartbeat_at: number | null }>(
+      'SELECT status, last_heartbeat_at FROM servers WHERE id = $1',
+      [serverId],
+    );
+    const now = (input.now ?? Date.now)();
+    return row?.status === MACHINE_PRESENCE_STATUS.ONLINE
+      && typeof row.last_heartbeat_at === 'number'
+      && now - row.last_heartbeat_at < MACHINE_PRESENCE_STALENESS_MS;
+  };
+}
 
 export const PRINCIPAL_GUEST_SESSION_LIMIT = Math.min(
   REMOTE_DESKTOP_LIMITS.MAX_PER_MACHINE,
@@ -324,7 +353,10 @@ export async function resolveExecutionEndpoint(input: {
   const controlled = rows.find((row) => (
     row.endpoint_role === HOST_ENDPOINT_ROLE.CONTROLLED && isEligibleEndpoint(row)
   ));
-  if (controlled) return { serverId: controlled.server_id, role: HOST_ENDPOINT_ROLE.CONTROLLED };
+  if (controlled && (!input.fullEndpointEligible
+    || await input.fullEndpointEligible(controlled.server_id))) {
+    return { serverId: controlled.server_id, role: HOST_ENDPOINT_ROLE.CONTROLLED };
+  }
 
   if (!input.fullEndpointEligible) return null;
   for (const row of rows) {

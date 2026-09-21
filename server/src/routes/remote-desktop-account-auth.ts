@@ -6,6 +6,7 @@ import {
 } from '@simplewebauthn/server';
 import { z } from 'zod';
 import type { Env } from '../env.js';
+import { REMOTE_DESKTOP_GUEST_AUTH_ERROR } from '../../../shared/remote-desktop-access.js';
 import {
   canCompleteStepUpChallenge,
   claimVerifiedNativeStepUpGrant,
@@ -135,7 +136,9 @@ remoteDesktopAccountAuthRoutes.get('/native/authorize', async (c) => {
     return c.json({ error: 'invalid_authorization_request' }, 400);
   }
   const accountSession = await browserSession(c);
-  if (!accountSession) return c.json({ error: 'account_authentication_required' }, 401);
+  if (!accountSession) {
+    return c.json({ error: REMOTE_DESKTOP_GUEST_AUTH_ERROR.AUTHENTICATION_REQUIRED }, 401);
+  }
 
   try {
     const issued = await issueNativeAuthorizationCode(c.env.DB, {

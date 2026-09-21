@@ -8,6 +8,7 @@ import {
 import {
   prepareRemoteDesktopLink,
   proveRemoteDesktopPublicPassword,
+  resolveRemoteDesktopInviteProof,
   remoteDesktopLinkMutationAction,
   remoteDesktopPasswordMutationAction,
   unavailableRemoteDesktopGuestSessionStarter,
@@ -47,7 +48,7 @@ describe('remote desktop access wire contracts', () => {
     });
   });
 
-  it('sends public password proof without account credentials and keeps routing metadata post-proof', async () => {
+  it('sends password proof with same-origin account credentials and keeps routing metadata post-proof', async () => {
     const browserKey = await generateRemoteDesktopBrowserKeyPair();
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
       ok: true, hostId: 'host-1', serverId: 'routing-only', bootstrapTicket: 'A'.repeat(43),
@@ -59,12 +60,48 @@ describe('remote desktop access wire contracts', () => {
     });
     expect(result.status).toBe('ready');
     const [, init] = fetchImpl.mock.calls[0]!;
-    expect(init?.credentials).toBe('omit');
+    expect(init?.credentials).toBe('include');
     expect(JSON.parse(String(init?.body))).toEqual({
       publicNodeId: 5_123_456_789, password: 'a-long-unique-password',
       browserPublicKeySpki: browserKey.publicKeySpki,
       browserKeyThumbprint: browserKey.thumbprint,
     });
+  });
+
+  it('maps unauthenticated invite and password proof to the explicit login state', async () => {
+    const browserKey = await generateRemoteDesktopBrowserKeyPair();
+    const unauthorized = vi.fn(async () => new Response(
+      JSON.stringify({ error: 'account_authentication_required' }),
+      { status: 401, headers: { 'content-type': 'application/json' } },
+    ));
+    await expect(resolveRemoteDesktopInviteProof({
+      token: 'A'.repeat(43),
+      browserKey,
+      fetchImpl: unauthorized as typeof fetch,
+    })).resolves.toEqual({ status: 'auth_required' });
+    await expect(proveRemoteDesktopPublicPassword({
+      publicNodeId: 5_123_456_789,
+      password: 'a-long-unique-password',
+      browserKey,
+      fetchImpl: unauthorized as typeof fetch,
+    })).resolves.toEqual({ status: 'auth_required' });
+    expect(unauthorized.mock.calls.every(([, init]) => init?.credentials === 'include')).toBe(true);
+  });
+
+  it('preserves bounded password and offline refusal classes carried by non-success HTTP responses', async () => {
+    const browserKey = await generateRemoteDesktopBrowserKeyPair();
+    for (const status of ['password_invalid', 'device_offline'] as const) {
+      const fetchImpl = vi.fn(async () => new Response(
+        JSON.stringify({ status }),
+        { status: 404, headers: { 'content-type': 'application/json' } },
+      ));
+      await expect(proveRemoteDesktopPublicPassword({
+        publicNodeId: 5_123_456_789,
+        password: 'a-long-unique-password',
+        browserKey,
+        fetchImpl: fetchImpl as typeof fetch,
+      })).resolves.toEqual({ status });
+    }
   });
 
   it('keeps the in-flight guest signaling seam fail closed', async () => {

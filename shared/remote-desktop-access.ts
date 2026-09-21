@@ -1304,6 +1304,19 @@ export interface RemoteDesktopPublicLookupResult {
 
 export const REMOTE_DESKTOP_PUBLIC_LOOKUP_UNAVAILABLE: RemoteDesktopPublicLookupResult = { status: 'unavailable' };
 
+/** Authentication error shared by the browser join UI and both proof routes. */
+export const REMOTE_DESKTOP_GUEST_AUTH_ERROR = Object.freeze({
+  AUTHENTICATION_REQUIRED: 'account_authentication_required',
+});
+
+/** Bounded authenticated-guest refusal classes. Never include internal ids. */
+export const REMOTE_DESKTOP_GUEST_REFUSAL_STATUS = Object.freeze({
+  INVITATION_INVALID: 'invitation_invalid',
+  INVITATION_EXPIRED: 'invitation_expired',
+  PASSWORD_INVALID: 'password_invalid',
+  DEVICE_OFFLINE: 'device_offline',
+});
+
 /**
  * True when a body destined for a pre-proof response carries anything the
  * boundary forbids, at any depth.

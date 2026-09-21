@@ -19,6 +19,10 @@ import {
 import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
 import { createUser, createServer } from '../src/db/queries.js';
+import { buildApp } from '../src/index.js';
+import type { Env } from '../src/env.js';
+import { signJwt } from '../src/security/crypto.js';
+import { COOKIE_CSRF, COOKIE_SESSION, HEADER_CSRF } from '../../shared/cookie-names.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '../../shared/remote-desktop.js';
 import {
@@ -62,6 +66,11 @@ import {
   resolveLinkProof,
   sweepExpiredBootstraps,
 } from '../src/services/remote-desktop-guest-bootstrap.js';
+import {
+  applyUnattendedPasswordMutationTx,
+  createServerUnattendedPasswordPepperRing,
+  deriveUnattendedPasswordVerifier,
+} from '../src/services/remote-desktop-unattended-password.js';
 
 let db: Database;
 const NOW = 1_700_000_000_000;
@@ -94,7 +103,7 @@ function newRequestId(): string {
   return randomBytes(REMOTE_DESKTOP_LINK_TOKEN.CREATION_REQUEST_ID_BYTES).toString('base64url');
 }
 
-async function seedFixture(options: { openPrivacy?: boolean } = {}): Promise<Fixture> {
+async function seedFixture(options: { openPrivacy?: boolean; endpointRole?: 'controlled' | 'full' } = {}): Promise<Fixture> {
   const ownerUserId = `u_${randomUUID()}`;
   await createUser(db, ownerUserId);
 
@@ -119,7 +128,16 @@ async function seedFixture(options: { openPrivacy?: boolean } = {}): Promise<Fix
   );
 
   const serverId = `s_${randomUUID()}`;
-  await createServer(db, serverId, ownerUserId, 'host', `hash-${serverId}`, undefined, NODE_ROLE.CONTROLLED);
+  const endpointRole = options.endpointRole ?? 'controlled';
+  await createServer(
+    db,
+    serverId,
+    ownerUserId,
+    'host',
+    `hash-${serverId}`,
+    undefined,
+    endpointRole === 'controlled' ? NODE_ROLE.CONTROLLED : NODE_ROLE.FULL,
+  );
   await db.execute(
     'UPDATE servers SET controlled_capabilities = $2::jsonb WHERE id = $1',
     [serverId, JSON.stringify([REMOTE_DESKTOP_CAPABILITY])],
@@ -130,6 +148,12 @@ async function seedFixture(options: { openPrivacy?: boolean } = {}): Promise<Fix
      VALUES ($1, $2, $3, 'controlled', $4)`,
     [serverId, hostId, ownerUserId, NOW],
   );
+  if (endpointRole === 'full') {
+    await db.execute(
+      `UPDATE remote_desktop_host_endpoints SET endpoint_role = 'full' WHERE server_id = $1`,
+      [serverId],
+    );
+  }
 
   const session: AccountSession = { kind: 'web', id: `sess_${randomUUID()}`, userId: ownerUserId };
 
@@ -146,6 +170,18 @@ async function seedFixture(options: { openPrivacy?: boolean } = {}): Promise<Fix
   }
 
   return { ownerUserId, hostId, serverId, session, credentialId, privacy };
+}
+
+async function browserAuthHeaders(jwtKey: string): Promise<Record<string, string>> {
+  const guestUserId = `u_guest_${randomUUID()}`;
+  await createUser(db, guestUserId);
+  const csrf = randomBytes(16).toString('hex');
+  return {
+    'content-type': 'application/json',
+    Cookie: `${COOKIE_SESSION}=${signJwt({ sub: guestUserId, type: 'web' }, jwtKey, 3600)}; ${COOKIE_CSRF}=${csrf}`,
+    [HEADER_CSRF]: csrf,
+    Origin: 'http://localhost',
+  };
 }
 
 /** Mint a real action-bound grant through challenge → finalize. */
@@ -867,6 +903,207 @@ describe('browser claim and session binding (4.9 / 4.10)', () => {
 });
 
 describe('public proof and sticky bootstrap (5.1–5.4)', () => {
+  it('requires login without disclosing the invite, then resolves a valid invitation for an authenticated user', async () => {
+    const fx = await seedFixture({ endpointRole: 'full' });
+    await db.execute(
+      `UPDATE servers
+          SET status = 'online', last_heartbeat_at = $2
+        WHERE id = $1`,
+      [fx.serverId, Date.now()],
+    );
+    const created = await createLink(fx);
+    await endPrivacy(fx);
+
+    const jwtKey = 'authenticated-guest-test-jwt-signing-key-000000';
+    const app = buildApp({
+      DATABASE_URL: process.env.TEST_DATABASE_URL!,
+      JWT_SIGNING_KEY: jwtKey,
+      BOT_ENCRYPTION_KEY: 'authenticated-guest-test-bot-key-00000000',
+      DB: db,
+      NODE_ENV: 'test',
+      ALLOWED_ORIGINS: 'http://localhost',
+    } as Env);
+    const anonymousValid = await app.request('/api/remote-desktop/guest/challenge', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: created.token }),
+    });
+    const anonymousUnknown = await app.request('/api/remote-desktop/guest/challenge', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token: newBearer().token }),
+    });
+    expect(anonymousValid.status).toBe(401);
+    expect(anonymousUnknown.status).toBe(401);
+    const anonymousBodies = await Promise.all([anonymousValid.text(), anonymousUnknown.text()]);
+    expect(anonymousBodies[0]).toBe(anonymousBodies[1]);
+    expect(anonymousBodies.join('')).not.toContain(fx.serverId);
+
+    const authHeaders = await browserAuthHeaders(jwtKey);
+    const challengeResponse = await app.request('/api/remote-desktop/guest/challenge', {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({ token: created.token }),
+    });
+    expect(challengeResponse.status).toBe(200);
+    const challenge = await challengeResponse.json() as {
+      keyAlgorithm: 'ECDSA-P256-SHA256'; challengeId: string; challenge: string;
+    };
+    const key = newBrowserProofKey();
+    const signature = sign(
+      'sha256',
+      remoteDesktopBrowserClaimSignaturePreimage(
+        Buffer.from(challenge.challengeId, 'base64url'),
+        Buffer.from(challenge.challenge, 'base64url'),
+        Buffer.from(key.browserKeyThumbprint, 'base64url'),
+      ),
+      { key: key.privateKey, dsaEncoding: 'ieee-p1363' },
+    ).toString('base64url');
+    const resolved = await app.request('/api/remote-desktop/guest/resolve', {
+      method: 'POST',
+      headers: authHeaders,
+      body: JSON.stringify({
+        keyAlgorithm: challenge.keyAlgorithm,
+        challengeId: challenge.challengeId,
+        challenge: challenge.challenge,
+        browserPublicKeySpki: key.browserPublicKeySpki,
+        browserKeyThumbprint: key.browserKeyThumbprint,
+        signature,
+      }),
+    });
+
+    expect(resolved.status).toBe(200);
+    await expect(resolved.json()).resolves.toMatchObject({
+      status: 'ready',
+      serverId: fx.serverId,
+      hostId: fx.hostId,
+    });
+  });
+
+  it('gives authenticated users bounded invalid, expired and offline invitation hints without internal ids', async () => {
+    const fx = await seedFixture({ endpointRole: 'full' });
+    await db.execute(
+      `UPDATE servers SET status = 'online', last_heartbeat_at = $2 WHERE id = $1`,
+      [fx.serverId, Date.now()],
+    );
+    const expired = await createLink(fx, {
+      kind: REMOTE_DESKTOP_LINK_KIND.UNATTENDED,
+      durationMs: DAY,
+    });
+    const live = await createLink(fx);
+    await endPrivacy(fx);
+    const jwtKey = 'authenticated-refusal-test-jwt-signing-key-0000';
+    const app = buildApp({
+      DATABASE_URL: process.env.TEST_DATABASE_URL!,
+      JWT_SIGNING_KEY: jwtKey,
+      BOT_ENCRYPTION_KEY: 'authenticated-refusal-test-bot-key-000000',
+      DB: db,
+      NODE_ENV: 'test',
+      ALLOWED_ORIGINS: 'http://localhost',
+    } as Env);
+    const authHeaders = await browserAuthHeaders(jwtKey);
+
+    const resolve = async (token: string) => {
+      const challengeResponse = await app.request('/api/remote-desktop/guest/challenge', {
+        method: 'POST', headers: authHeaders,
+        body: JSON.stringify({ token }),
+      });
+      const challenge = await challengeResponse.json() as {
+        keyAlgorithm: 'ECDSA-P256-SHA256'; challengeId: string; challenge: string;
+      };
+      const key = newBrowserProofKey();
+      const signature = sign(
+        'sha256',
+        remoteDesktopBrowserClaimSignaturePreimage(
+          Buffer.from(challenge.challengeId, 'base64url'),
+          Buffer.from(challenge.challenge, 'base64url'),
+          Buffer.from(key.browserKeyThumbprint, 'base64url'),
+        ),
+        { key: key.privateKey, dsaEncoding: 'ieee-p1363' },
+      ).toString('base64url');
+      return app.request('/api/remote-desktop/guest/resolve', {
+        method: 'POST', headers: authHeaders,
+        body: JSON.stringify({
+          keyAlgorithm: challenge.keyAlgorithm,
+          challengeId: challenge.challengeId,
+          challenge: challenge.challenge,
+          browserPublicKeySpki: key.browserPublicKeySpki,
+          browserKeyThumbprint: key.browserKeyThumbprint,
+          signature,
+        }),
+      });
+    };
+
+    const unknown = await resolve(newBearer().token);
+    const expiredResponse = await resolve(expired.token);
+    await db.execute(
+      `UPDATE servers SET status = 'offline', last_heartbeat_at = $2 WHERE id = $1`,
+      [fx.serverId, Date.now()],
+    );
+    const offline = await resolve(live.token);
+    const bodies = await Promise.all([unknown.text(), expiredResponse.text(), offline.text()]);
+    expect(bodies).toEqual([
+      '{"status":"invitation_invalid"}',
+      '{"status":"invitation_expired"}',
+      '{"status":"device_offline"}',
+    ]);
+    expect(bodies.join('')).not.toContain(fx.serverId);
+    expect(bodies.join('')).not.toContain(fx.hostId);
+  });
+
+  it('requires login before password proof and safely rejects a logged-in wrong password', async () => {
+    const fx = await seedFixture({ endpointRole: 'full' });
+    await db.execute(
+      `UPDATE servers SET status = 'online', last_heartbeat_at = $2 WHERE id = $1`,
+      [fx.serverId, Date.now()],
+    );
+    const serverSecret = 'authenticated-password-test-secret-000000000';
+    const material = await deriveUnattendedPasswordVerifier({
+      password: 'correct-horse-battery-42!',
+      peppers: createServerUnattendedPasswordPepperRing(serverSecret),
+    });
+    await db.transaction((tx) => applyUnattendedPasswordMutationTx(tx, {
+      accountSession: fx.session,
+      privacyEpoch: fx.privacy,
+      mutation: { hostId: fx.hostId, action: 'set', requestId: newRequestId() },
+      material,
+      now: NOW,
+    }));
+    await endPrivacy(fx);
+    const app = buildApp({
+      DATABASE_URL: process.env.TEST_DATABASE_URL!,
+      JWT_SIGNING_KEY: serverSecret,
+      BOT_ENCRYPTION_KEY: serverSecret,
+      DB: db,
+      NODE_ENV: 'test',
+      ALLOWED_ORIGINS: 'http://localhost',
+    } as Env);
+    const key = newBrowserProofKey();
+    const publicId = await db.queryOne<{ public_id: string }>(
+      "SELECT public_id FROM remote_desktop_public_ids WHERE host_id = $1 AND status = 'active'",
+      [fx.hostId],
+    );
+    const body = JSON.stringify({
+      publicNodeId: Number(publicId!.public_id),
+      password: 'definitely-the-wrong-password!',
+      browserPublicKeySpki: key.browserPublicKeySpki,
+      browserKeyThumbprint: key.browserKeyThumbprint,
+    });
+    const anonymous = await app.request('/api/remote-desktop/unattended-password/proof', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body,
+    });
+    expect(anonymous.status).toBe(401);
+    const response = await app.request('/api/remote-desktop/unattended-password/proof', {
+      method: 'POST',
+      headers: await browserAuthHeaders(serverSecret),
+      body,
+    });
+    expect(response.status).toBe(404);
+    expect(await response.text()).toBe('{"status":"password_invalid"}');
+  });
+
   it('returns one identical unavailable body for every pre-proof failure', async () => {
     const key = newBrowserProofKey();
     const fx = await seedFixture();
