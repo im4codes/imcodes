@@ -364,15 +364,21 @@ describe('SubSessionWindow metadata wiring', () => {
       expect(controls?.dataset.effort).toBe('high');
       expect(controls?.dataset.quota).toContain('5h 11%');
       expect(footer?.dataset.quota).toContain('5h 11%');
-      expect(sessionControlsSpy.mock.calls.at(-1)?.[0].activeSession.supervisionHeartbeat).toMatchObject({
-        state: 'armed', kind: 'audit', nextHeartbeatAt: 12_000,
-      });
-      expect(chatViewPropsSpy.mock.calls.at(-1)?.[0]).toMatchObject({
+      expect(sessionControlsSpy.mock.calls.at(-1)?.[0].activeSession).toMatchObject({
         quotaLabel: expect.stringContaining('5h 11%'),
         quotaMeta: { primary: { usedPercent: 11, windowDurationMins: 300 } },
         supervisionMode: 'supervised_audit',
         supervisionHeartbeat: { state: 'armed', kind: 'audit', nextHeartbeatAt: 12_000, updatedAt: 2_000 },
       });
+      expect(usageFooterSpy.mock.calls.at(-1)?.[0]).toMatchObject({
+        quotaLabel: expect.stringContaining('5h 11%'),
+        quotaMeta: { primary: { usedPercent: 11, windowDurationMins: 300 } },
+        planLabel: 'Pro',
+      });
+      const chatViewProps = chatViewPropsSpy.mock.calls.at(-1)?.[0];
+      expect(chatViewProps).not.toHaveProperty('quotaLabel');
+      expect(chatViewProps).not.toHaveProperty('quotaMeta');
+      expect(chatViewProps).not.toHaveProperty('supervisionHeartbeat');
     });
   });
 

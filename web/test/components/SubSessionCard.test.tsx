@@ -137,7 +137,7 @@ describe('SubSessionCard', () => {
     });
   });
 
-  it('passes original quota and heartbeat props into the compact ChatView card', () => {
+  it('passes quota and heartbeat metadata into the compact SessionControls without restoring the removed ChatView status props', () => {
     render(
       <SubSessionCard
         sub={makeSubSession({
@@ -149,6 +149,7 @@ describe('SubSessionCard', () => {
         } as any)}
         ws={null}
         connected={true}
+        quickData={{ data: [], recordHistory: vi.fn() } as any}
         isOpen={false}
         isFocused={false}
         onOpen={vi.fn()}
@@ -157,13 +158,17 @@ describe('SubSessionCard', () => {
       />,
     );
 
-    expect(chatViewPropsSpy.mock.calls.at(-1)?.[0]).toMatchObject({
-      preview: true,
+    expect(sessionControlsSpy.mock.calls.at(-1)?.[0].activeSession).toMatchObject({
       quotaLabel: '7d 55% 5d05h 9/26 18:39',
       quotaMeta: { primary: { usedPercent: 55, windowDurationMins: 10_080 } },
       supervisionMode: 'supervised_audit',
       supervisionHeartbeat: { state: 'armed', kind: 'audit', nextHeartbeatAt: 12_000, updatedAt: 2_000 },
     });
+    const chatViewProps = chatViewPropsSpy.mock.calls.at(-1)?.[0];
+    expect(chatViewProps).toMatchObject({ preview: true });
+    expect(chatViewProps).not.toHaveProperty('quotaLabel');
+    expect(chatViewProps).not.toHaveProperty('quotaMeta');
+    expect(chatViewProps).not.toHaveProperty('supervisionHeartbeat');
   });
 
   it('attaches the live timeline before closed preview hydration', async () => {
