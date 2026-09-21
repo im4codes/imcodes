@@ -166,6 +166,21 @@ describe('ClaudeCodeSdkProvider', () => {
     childProcessMock.spawn.mockClear();
   });
 
+  it.skipIf(process.platform === 'win32')(
+    'connects by probing the bundled claude binary, not a bare PATH lookup of `claude`',
+    async () => {
+      // A systemd/nvm daemon's PATH has no `claude`. Probing the bare name made
+      // connect() spawn it and fail with `spawn claude ENOENT`, so no Claude,
+      // MiniMax or GLM session could start even though the SDK's bundled
+      // binary was present and every real spawn uses it.
+      childProcessMock.execFile.mockClear();
+      const provider = new ClaudeCodeSdkProvider();
+      await provider.connect({ binaryPath: 'claude' });
+      expect(childProcessMock.execFile.mock.calls.filter((call) => call[0] === 'claude')).toEqual([]);
+      expect(childProcessMock.execFile).not.toHaveBeenCalled();
+    },
+  );
+
   it('queues a correlated peer notification at Claude\'s next safe boundary without closing the live query', async () => {
     sdkMock.setWaitForClose(true);
     const provider = new ClaudeCodeSdkProvider();

@@ -528,7 +528,18 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
   }
 
   async connect(config: ProviderConfig): Promise<void> {
-    const binaryPath = this.getConfiguredBinaryPath(config);
+    // Probe the binary the SDK will actually spawn. The default name `claude`
+    // is resolved to the native binary bundled with our SDK dependency (then
+    // common per-user installs) -- exactly like every real spawn does. Probing
+    // the bare name instead only asked whether `claude` is on the daemon's
+    // PATH, which a systemd/nvm daemon's usually is not: connect() then failed
+    // with `spawn claude ENOENT` on machines that run Claude fine (every
+    // Claude/MiniMax/GLM session failed to start, and auto-resume failed the
+    // same way). Windows keeps its own shim resolution below.
+    const configuredBinary = this.getConfiguredBinaryPath(config);
+    const binaryPath = process.platform === 'win32'
+      ? configuredBinary
+      : resolveClaudeCodePathForSdk(configuredBinary);
     const resolved = resolveExecutableForSpawn(binaryPath);
     await access(resolved.executable, fsConstants.X_OK).catch(async () => {
       const { execFile } = await import('node:child_process');
