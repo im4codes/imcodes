@@ -353,10 +353,10 @@ function userPayloadOfPrompt(prompt: string): string {
   return separator === -1 ? '' : prompt.slice(separator + 2);
 }
 
-/** True when the turn actually carried the Brain delegation contract. */
-function promptCarriesDelegationContract(prompt: string): boolean {
-  return prompt.startsWith(PROMPT_CONTEXT_PREFIX)
-    && prompt.includes('supervision_brain_work_delegation_v1');
+/** True when the provider's native system channel carried the Brain contract. */
+function systemCarriesDelegationContract(run: { options: Record<string, unknown> }): boolean {
+  return String(run.options.appendSystemPrompt ?? '')
+    .includes('supervision_brain_work_delegation_v1');
 }
 
 function claudeRunForSession(sessionName: string, prompt?: string) {
@@ -1792,14 +1792,14 @@ describe('sdk transport session restore', () => {
       .toBe('offline-msg-2\n\nofflinemsg-3'.replace('offlinemsg', 'offline-msg'));
     // Non-empty control: both turns must actually carry the contract, and the
     // first turn carries the full body while the second re-asserts by reference.
-    expect(mocks.claudeRuns.every((run: { prompt: string }) => promptCarriesDelegationContract(run.prompt))).toBe(true);
-    expect(mocks.claudeRuns[0].prompt).toContain('"contractId":"supervision_brain_work_delegation_v1"');
-    expect(mocks.claudeRuns[1].prompt).toContain('"contractRef":"supervision_brain_work_delegation_v1"');
+    expect(mocks.claudeRuns.every(systemCarriesDelegationContract)).toBe(true);
+    expect(String(mocks.claudeRuns[0].options.appendSystemPrompt)).toContain('"contractId":"supervision_brain_work_delegation_v1"');
+    expect(String(mocks.claudeRuns[1].options.appendSystemPrompt)).toContain('"contractRef":"supervision_brain_work_delegation_v1"');
     // This Brain's record carries no supervision binding, so supervision is off:
     // both the registration and its re-assertion must be the manual-only variant.
-    expect(mocks.claudeRuns[0].prompt).toContain('"automaticSupervision":false');
-    expect(mocks.claudeRuns[1].prompt).toContain('"automaticSupervision":false');
-    expect(mocks.claudeRuns.some((run: { prompt: string }) => run.prompt.includes('task_assignment'))).toBe(false);
+    expect(String(mocks.claudeRuns[0].options.appendSystemPrompt)).toContain('"automaticSupervision":false');
+    expect(String(mocks.claudeRuns[1].options.appendSystemPrompt)).toContain('"automaticSupervision":false');
+    expect(mocks.claudeRuns.some((run) => String(run.options.appendSystemPrompt).includes('task_assignment'))).toBe(false);
     for (const text of ['offline-msg-1', 'offline-msg-2', 'offline-msg-3']) {
       const matchingUserEvents = timelineEmitterEmitMock.mock.calls.filter((call) => (
         call[0] === 'deck_sdk_drain_brain'
@@ -1866,8 +1866,9 @@ describe('sdk transport session restore', () => {
       (run.options.env as Record<string, unknown> | undefined)?.IMCODES_SESSION === 'deck_sdk_mode_brain'
     ));
     await vi.waitFor(() => expect(runsFor()).toHaveLength(1), { timeout: 5_000 });
-    expect(runsFor()[0].prompt).toContain('"automaticSupervision":true');
-    expect(runsFor()[0].prompt).toContain('task_assignment');
+    expect(String(runsFor()[0].options.appendSystemPrompt)).toContain('"automaticSupervision":true');
+    expect(String(runsFor()[0].options.appendSystemPrompt)).toContain('task_assignment');
+    expect(runsFor()[0].prompt).toBe('while-supervised');
 
     // The owner turns supervision OFF after restore. Nothing restarts; the very
     // next turn must already see it.
@@ -1881,11 +1882,12 @@ describe('sdk transport session restore', () => {
     });
     runtime!.send('after-supervision-off', 'cmd-mode-2');
     await vi.waitFor(() => expect(runsFor()).toHaveLength(2), { timeout: 5_000 });
-    const afterOff = runsFor()[1].prompt;
+    const afterOff = String(runsFor()[1].options.appendSystemPrompt);
     expect(afterOff, 'the variant changed, so the manual-only body is registered in full')
       .toContain('"contractId":"supervision_brain_work_delegation_v1"');
     expect(afterOff).toContain('"automaticSupervision":false');
     expect(afterOff).not.toContain('task_assignment');
+    expect(runsFor()[1].prompt).toBe('after-supervision-off');
   });
 
   it('launchTransportSession awaits drainResend — fresh launch with pre-populated queue dispatches in order', async () => {

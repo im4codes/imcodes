@@ -1560,11 +1560,15 @@ describe('ClaudeCodeSdkProvider', () => {
     await provider.send('route-compact', {
       userMessage: '/compact',
       assembledMessage: '/compact',
-      systemText: undefined,
+      sessionSystemText: CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE,
+      turnSystemText: undefined,
+      systemText: CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE,
       messagePreamble: undefined,
       attachments: undefined,
       context: {
-        systemText: undefined,
+        sessionSystemText: CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE,
+        turnSystemText: undefined,
+        systemText: CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE,
         messagePreamble: undefined,
         requiredAuthoredContext: [],
         advisoryAuthoredContext: [],
@@ -1585,7 +1589,8 @@ describe('ClaudeCodeSdkProvider', () => {
 
     const run = sdkMock.runs.at(-1)!;
     expect(run.prompt).toBe('/compact');
-    expect(run.options.appendSystemPrompt).toBeUndefined();
+    expect(run.prompt).not.toContain(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(run.options.appendSystemPrompt).toBe(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
     expect(statuses).toEqual([
       { status: 'compacting', label: 'Compacting conversation...' },
       { status: null, label: null },

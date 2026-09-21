@@ -5,6 +5,7 @@ import { TransportSessionRuntime, type PendingTransportMessage } from '../../src
 import { RUNTIME_TYPES } from '../../src/agent/session-runtime.js';
 import { PROVIDER_ACTIVE_TURN_DELIVERY_KINDS, PROVIDER_CANCEL_ORIGINS, PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_STATUS, type TransportProvider, type ProviderError, type SessionConfig, type ProviderStatusUpdate, type ProviderUsageUpdate, type ToolCallEvent } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
+import { CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../shared/cron-types.js';
 import type { MemorySearchResult, MemorySearchResultItem } from '../../src/context/memory-search.js';
 import { PREFERENCE_CONTEXT_END, PREFERENCE_CONTEXT_START } from '../../shared/preference-ingest.js';
 import {
@@ -3334,7 +3335,7 @@ describe('TransportSessionRuntime', () => {
     );
   });
 
-  it('keeps slash controls raw for every transport by suppressing startup, recall, authored, and preference context', async () => {
+  it('keeps slash-control user bytes raw while retaining only permanent system authority', async () => {
     const localMock = makeMockProvider();
     const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
     r.setContextBootstrapResolver(async () => ({
@@ -3367,13 +3368,27 @@ describe('TransportSessionRuntime', () => {
 
     expect(searchLocalMemorySemanticMock).not.toHaveBeenCalled();
     const compactPayload = localMock.provider.send.mock.calls[0]?.[1] as Record<string, any>;
+    // `/compact` remains an ordinary, byte-exact provider message. The one
+    // surviving context value is permanent system authority, not turn/session
+    // authored context injected into the user message.
     expect(compactPayload.userMessage).toBe('/compact');
     expect(compactPayload.assembledMessage).toBe('/compact');
-    expect(compactPayload.systemText).toBeUndefined();
+    expect(localMock.provider.send).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        userMessage: '/compact',
+        assembledMessage: '/compact',
+      }),
+    );
+    expect(compactPayload.systemText).toBe(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(compactPayload.sessionSystemText).toBe(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(compactPayload.turnSystemText).toBeUndefined();
     expect(compactPayload.messagePreamble).toBeUndefined();
     expect(compactPayload.startupMemory).toBeUndefined();
     expect(compactPayload.memoryRecall).toBeUndefined();
-    expect(compactPayload.context?.systemText).toBeUndefined();
+    expect(compactPayload.context?.systemText).toBe(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(compactPayload.context?.sessionSystemText).toBe(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(compactPayload.context?.turnSystemText).toBeUndefined();
     expect(compactPayload.context?.messagePreamble).toBeUndefined();
     expect(compactPayload.context?.requiredAuthoredContext).toEqual([]);
     expect(compactPayload.context?.advisoryAuthoredContext).toEqual([]);
