@@ -10,7 +10,7 @@ import {
 import type { SessionResourceOwner } from '../../daemon/session-resource-registry.js';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { query, type PermissionMode, type SDKMessage, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
+import { query, type Options as ClaudeSdkOptions, type PermissionMode, type SDKMessage, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { stripLeakedThink } from '../../util/strip-leaked-think.js';
 import { killProcessTree } from '../../util/kill-process-tree.js';
 import type {
@@ -995,6 +995,11 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     state.currentConnectionClosedRetriesRemaining = connectionClosedRetriesRemaining;
     state.currentAuthRefreshRetriesRemaining = authRefreshRetriesRemaining;
     const credentialsMtimeMs = this.readClaudeCredentialsMtimeMs(state);
+    const sdkSystemPrompt: ClaudeSdkOptions['systemPrompt'] = baseSystemPrompt ? {
+      type: 'preset',
+      preset: 'claude_code',
+      append: baseSystemPrompt,
+    } : undefined;
     const options: Record<string, unknown> = {
       cwd: state.cwd,
       ...(state.env ? { env: { ...process.env, ...state.env } } : {}),
@@ -1032,8 +1037,14 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         env: state.env,
         contextNamespace: state.contextNamespace,
       }),
-      ...(baseSystemPrompt ? {
-        appendSystemPrompt: baseSystemPrompt,
+      ...(sdkSystemPrompt ? {
+        // Claude Agent SDK does not accept `appendSystemPrompt` as a top-level
+        // query option. It only serializes the append text from the documented
+        // preset form below into its initialize control request. A top-level
+        // field survives loose mocks/`as any` but is silently ignored by the
+        // real SDK, which left every IM.codes system contract absent on Claude
+        // and Anthropic-compatible custom endpoints.
+        systemPrompt: sdkSystemPrompt,
       } : {}),
     };
     options.spawnClaudeCodeProcess = (req: { command: string; args: string[]; cwd?: string; env?: Record<string, string>; signal?: AbortSignal }) => {

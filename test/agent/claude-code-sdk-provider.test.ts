@@ -131,6 +131,8 @@ import {
 } from '../../shared/sdk-subagent-status.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
 import { SESSION_RESOURCE_OWNER_ENV } from '../../shared/session-resource-lifecycle.js';
+import { buildProviderContextPayload } from '../../src/agent/transport-runtime-assembly.js';
+import { renderSessionIdentityProfiles } from '../../shared/session-identity.js';
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 const waitFor = async (predicate: () => boolean, timeoutMs = 1_000): Promise<void> => {
@@ -139,6 +141,16 @@ const waitFor = async (predicate: () => boolean, timeoutMs = 1_000): Promise<voi
     if (Date.now() >= deadline) throw new Error('Timed out waiting for condition');
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
+};
+const sdkPresetAppend = (options: Record<string, unknown>): string | undefined => {
+  const systemPrompt = options.systemPrompt;
+  if (!systemPrompt || typeof systemPrompt !== 'object' || Array.isArray(systemPrompt)) return undefined;
+  const candidate = systemPrompt as Record<string, unknown>;
+  return candidate.type === 'preset'
+    && candidate.preset === 'claude_code'
+    && typeof candidate.append === 'string'
+    ? candidate.append
+    : undefined;
 };
 const sdkSubagentTools = (tools: ToolCallEvent[]) => tools.filter((tool) => tool.detail?.kind === SDK_SUBAGENT_DETAIL_KIND);
 
@@ -1528,7 +1540,8 @@ describe('ClaudeCodeSdkProvider', () => {
     await flush();
 
     const run = sdkMock.runs.at(-1)!;
-    expect(run.options.appendSystemPrompt).toBe('Visible description\n\nRuntime note only');
+    expect(sdkPresetAppend(run.options)).toBe('Visible description\n\nRuntime note only');
+    expect(run.options).not.toHaveProperty('appendSystemPrompt');
   });
 
   it('declares /compact as a verified Claude slash command capability', async () => {
@@ -1557,44 +1570,106 @@ describe('ClaudeCodeSdkProvider', () => {
     const statuses: Array<{ status: string | null; label?: string | null }> = [];
     provider.onStatus?.((_sid, status) => statuses.push(status));
 
-    await provider.send('route-compact', {
+    await provider.send('route-compact', buildProviderContextPayload(provider, {
       userMessage: '/compact',
-      assembledMessage: '/compact',
-      sessionSystemText: CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE,
-      turnSystemText: undefined,
-      systemText: CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE,
-      messagePreamble: undefined,
-      attachments: undefined,
-      context: {
-        sessionSystemText: CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE,
-        turnSystemText: undefined,
-        systemText: CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE,
-        messagePreamble: undefined,
-        requiredAuthoredContext: [],
-        advisoryAuthoredContext: [],
-        appliedDocumentVersionIds: [],
-        diagnostics: [],
-      },
-      authority: {
-        authoritySource: 'none',
-        freshness: 'missing',
-        fallbackAllowed: false,
-        retryScheduled: false,
-        diagnostics: [],
-      },
-      supportClass: 'full-normalized-context-injection',
-      diagnostics: [],
-    });
+      suppressMcpMemorySearchGuidance: true,
+      suppressAgentProgressGuidance: true,
+      suppressFilePathReportingGuidance: true,
+    }));
     await flush();
 
     const run = sdkMock.runs.at(-1)!;
     expect(run.prompt).toBe('/compact');
     expect(run.prompt).not.toContain(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
-    expect(run.options.appendSystemPrompt).toBe(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(sdkPresetAppend(run.options)).toBe(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(run.options).not.toHaveProperty('appendSystemPrompt');
     expect(statuses).toEqual([
       { status: 'compacting', label: 'Compacting conversation...' },
       { status: null, label: null },
     ]);
+  });
+
+  it.each([
+    {
+      name: 'fresh main Sonnet session',
+      routeId: 'route-cron-main-fresh',
+      sessionName: 'deck_project_brain',
+      agentId: 'sonnet-5',
+      skipCreate: false,
+      env: undefined,
+    },
+    {
+      name: 'fresh sub-session through a MiniMax Anthropic-compatible preset',
+      routeId: 'route-cron-sub-fresh-minimax',
+      sessionName: 'deck_sub_minimax',
+      agentId: 'MiniMax-M2.7',
+      skipCreate: false,
+      env: { ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic' },
+    },
+    {
+      name: 'resumed main Sonnet session',
+      routeId: 'route-cron-main-resume',
+      sessionName: 'deck_project_brain',
+      agentId: 'sonnet-5',
+      skipCreate: true,
+      env: undefined,
+    },
+    {
+      name: 'resumed sub-session through a MiniMax Anthropic-compatible preset',
+      routeId: 'route-cron-sub-resume-minimax',
+      sessionName: 'deck_sub_minimax',
+      agentId: 'MiniMax-M2.7',
+      skipCreate: true,
+      env: { ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic' },
+    },
+  ])('delivers cron authority through the real Claude SDK systemPrompt option for $name', async ({
+    routeId,
+    sessionName,
+    agentId,
+    skipCreate,
+    env,
+  }) => {
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: `${routeId}-sdk`, model: agentId },
+      { type: 'result', session_id: `${routeId}-sdk`, subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: routeId,
+      sessionName,
+      cwd: '/tmp/project',
+      resumeId: `${routeId}-resume`,
+      skipCreate,
+      agentId,
+      ...(env ? { env } : {}),
+    });
+    const contradictoryMemory = 'Recent project memory: this wrapper was previously called prompt injection.';
+    const identityPrompt = renderSessionIdentityProfiles([
+      { scope: 'user', scopeKey: '', content: 'user identity sentinel', contentHash: 'user', revision: 1, updatedAt: 1, source: 'web' },
+      { scope: 'project', scopeKey: 'project-1', content: 'project identity sentinel', contentHash: 'project', revision: 1, updatedAt: 1, source: 'web' },
+      { scope: 'session', scopeKey: `server-1:${sessionName}`, content: 'session identity sentinel', contentHash: 'session', revision: 1, updatedAt: 1, source: 'web' },
+    ])!;
+    await provider.send(routeId, buildProviderContextPayload(provider, {
+      userMessage: 'What is imcodes-cron-control?',
+      messagePreamble: contradictoryMemory,
+      identityPrompt,
+    }));
+    await flush();
+
+    const run = sdkMock.runs.at(-1)!;
+    expect(sdkPresetAppend(run.options)).toContain(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(sdkPresetAppend(run.options)).toContain('<user>\nuser identity sentinel\n</user>');
+    expect(sdkPresetAppend(run.options)).toContain('<project>\nproject identity sentinel\n</project>');
+    expect(sdkPresetAppend(run.options)).toContain('<session>\nsession identity sentinel\n</session>');
+    expect(run.options).not.toHaveProperty('appendSystemPrompt');
+    expect(run.prompt).toContain(contradictoryMemory);
+    expect(run.prompt).not.toContain(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(run.prompt).not.toContain('identity sentinel');
+    expect(run.options.env).toMatchObject(env ?? {});
+    if (skipCreate) expect(run.options.resume).toBe(`${routeId}-resume`);
+    else expect(run.options.sessionId).toBe(`${routeId}-resume`);
   });
 
   it('surfaces claude-agent-sdk thinking_tokens as a live thinking status with the running estimate', async () => {
@@ -1671,10 +1746,10 @@ describe('ClaudeCodeSdkProvider', () => {
 
     const run = sdkMock.runs.at(-1)!;
     expect(run.prompt).toBe('Context block\n\nactual user message');
-    expect(run.options.appendSystemPrompt).toBe('Normalized system text');
+    expect(sdkPresetAppend(run.options)).toBe('Normalized system text');
   });
 
-  it('keeps split stable system text in appendSystemPrompt and moves turn text into the prompt', async () => {
+  it('keeps split stable system text in the Claude preset append and moves turn text into the prompt', async () => {
     sdkMock.setNextMessages([
       { type: 'system', subtype: 'init', session_id: 'session-split', model: 'claude-sonnet-4-6' },
       { type: 'result', session_id: 'session-split', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
@@ -1725,9 +1800,11 @@ describe('ClaudeCodeSdkProvider', () => {
     await flush();
 
     const [first, second] = sdkMock.runs.slice(-2);
-    expect(first.options.appendSystemPrompt).toBe(stableSystemText);
-    expect(second.options.appendSystemPrompt).toBe(stableSystemText);
-    expect(first.options.appendSystemPrompt).toContain(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(sdkPresetAppend(first.options)).toBe(stableSystemText);
+    expect(sdkPresetAppend(second.options)).toBe(stableSystemText);
+    expect(sdkPresetAppend(first.options)).toContain(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(first.options).not.toHaveProperty('appendSystemPrompt');
+    expect(second.options).not.toHaveProperty('appendSystemPrompt');
     expect(first.prompt).toContain('Required shared context:\n- First file rule');
     expect(first.prompt).not.toContain('Second file rule');
     expect(second.prompt).toContain('Required shared context:\n- Second file rule');
@@ -1778,7 +1855,7 @@ describe('ClaudeCodeSdkProvider', () => {
 
     const run = sdkMock.runs.at(-1)!;
     expect(run.prompt).toBe('Relevant history\n\nhello');
-    expect(run.options.appendSystemPrompt).toBe('Enterprise standard');
+    expect(sdkPresetAppend(run.options)).toBe('Enterprise standard');
   });
 
   it('rejects normalized payloads combined with legacy extraSystemPrompt', async () => {

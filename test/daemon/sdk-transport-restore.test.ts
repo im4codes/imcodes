@@ -353,10 +353,21 @@ function userPayloadOfPrompt(prompt: string): string {
   return separator === -1 ? '' : prompt.slice(separator + 2);
 }
 
+/** Text the real Claude Agent SDK serializes as appendSystemPrompt at initialize. */
+function claudePresetAppend(options: Record<string, unknown>): string {
+  const systemPrompt = options.systemPrompt;
+  if (!systemPrompt || typeof systemPrompt !== 'object' || Array.isArray(systemPrompt)) return '';
+  const candidate = systemPrompt as Record<string, unknown>;
+  return candidate.type === 'preset'
+    && candidate.preset === 'claude_code'
+    && typeof candidate.append === 'string'
+    ? candidate.append
+    : '';
+}
+
 /** True when the provider's native system channel carried the Brain contract. */
 function systemCarriesDelegationContract(run: { options: Record<string, unknown> }): boolean {
-  return String(run.options.appendSystemPrompt ?? '')
-    .includes('supervision_brain_work_delegation_v1');
+  return claudePresetAppend(run.options).includes('supervision_brain_work_delegation_v1');
 }
 
 function claudeRunForSession(sessionName: string, prompt?: string) {
@@ -523,7 +534,7 @@ describe('sdk transport session restore', () => {
       IMCODES_SESSION: 'deck_sdk_cc_brain',
       IMCODES_SESSION_LABEL: 'deck_sdk_cc_brain',
     });
-    expect(String(run?.options.appendSystemPrompt ?? '')).toContain('Exact session name: deck_sdk_cc_brain');
+    expect(claudePresetAppend(run?.options ?? {})).toContain('Exact session name: deck_sdk_cc_brain');
     expect(mocks.store.get('deck_sdk_cc_brain')?.state).toBe('idle');
     expect(mocks.store.get('deck_sdk_cc_brain')?.modelDisplay).toBe('claude-sonnet-4-6');
     expect(mocks.store.get('deck_sdk_cc_brain')?.requestedModel).toBe('sonnet');
@@ -1793,13 +1804,13 @@ describe('sdk transport session restore', () => {
     // Non-empty control: both turns must actually carry the contract, and the
     // first turn carries the full body while the second re-asserts by reference.
     expect(mocks.claudeRuns.every(systemCarriesDelegationContract)).toBe(true);
-    expect(String(mocks.claudeRuns[0].options.appendSystemPrompt)).toContain('"contractId":"supervision_brain_work_delegation_v1"');
-    expect(String(mocks.claudeRuns[1].options.appendSystemPrompt)).toContain('"contractRef":"supervision_brain_work_delegation_v1"');
+    expect(claudePresetAppend(mocks.claudeRuns[0].options)).toContain('"contractId":"supervision_brain_work_delegation_v1"');
+    expect(claudePresetAppend(mocks.claudeRuns[1].options)).toContain('"contractRef":"supervision_brain_work_delegation_v1"');
     // This Brain's record carries no supervision binding, so supervision is off:
     // both the registration and its re-assertion must be the manual-only variant.
-    expect(String(mocks.claudeRuns[0].options.appendSystemPrompt)).toContain('"automaticSupervision":false');
-    expect(String(mocks.claudeRuns[1].options.appendSystemPrompt)).toContain('"automaticSupervision":false');
-    expect(mocks.claudeRuns.some((run) => String(run.options.appendSystemPrompt).includes('task_assignment'))).toBe(false);
+    expect(claudePresetAppend(mocks.claudeRuns[0].options)).toContain('"automaticSupervision":false');
+    expect(claudePresetAppend(mocks.claudeRuns[1].options)).toContain('"automaticSupervision":false');
+    expect(mocks.claudeRuns.some((run) => claudePresetAppend(run.options).includes('task_assignment'))).toBe(false);
     for (const text of ['offline-msg-1', 'offline-msg-2', 'offline-msg-3']) {
       const matchingUserEvents = timelineEmitterEmitMock.mock.calls.filter((call) => (
         call[0] === 'deck_sdk_drain_brain'
@@ -1866,8 +1877,8 @@ describe('sdk transport session restore', () => {
       (run.options.env as Record<string, unknown> | undefined)?.IMCODES_SESSION === 'deck_sdk_mode_brain'
     ));
     await vi.waitFor(() => expect(runsFor()).toHaveLength(1), { timeout: 5_000 });
-    expect(String(runsFor()[0].options.appendSystemPrompt)).toContain('"automaticSupervision":true');
-    expect(String(runsFor()[0].options.appendSystemPrompt)).toContain('task_assignment');
+    expect(claudePresetAppend(runsFor()[0].options)).toContain('"automaticSupervision":true');
+    expect(claudePresetAppend(runsFor()[0].options)).toContain('task_assignment');
     expect(runsFor()[0].prompt).toBe('while-supervised');
 
     // The owner turns supervision OFF after restore. Nothing restarts; the very
@@ -1882,7 +1893,7 @@ describe('sdk transport session restore', () => {
     });
     runtime!.send('after-supervision-off', 'cmd-mode-2');
     await vi.waitFor(() => expect(runsFor()).toHaveLength(2), { timeout: 5_000 });
-    const afterOff = String(runsFor()[1].options.appendSystemPrompt);
+    const afterOff = claudePresetAppend(runsFor()[1].options);
     expect(afterOff, 'the variant changed, so the manual-only body is registered in full')
       .toContain('"contractId":"supervision_brain_work_delegation_v1"');
     expect(afterOff).toContain('"automaticSupervision":false');
@@ -2266,7 +2277,7 @@ describe('sdk transport session restore', () => {
       IMCODES_SESSION: 'deck_sdk_new_brain',
       IMCODES_SESSION_LABEL: 'CC1',
     });
-    expect(String(run?.options.appendSystemPrompt ?? '')).toContain('Display label: CC1');
+    expect(claudePresetAppend(run?.options ?? {})).toContain('Display label: CC1');
   });
 
   it('passes a ccPreset route into a newly launched dsh session', async () => {
