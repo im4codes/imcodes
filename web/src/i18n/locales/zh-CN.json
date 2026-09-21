@@ -2432,7 +2432,19 @@
     "go_to_session": "跳转到会话",
     "go_and_quote": "跳转并引用结果",
     "read_only": "只读",
-    "read_only_scope": "这个 cron 任务属于其他 server 或 tab，这里暂时只读。"
+    "read_only_scope": "这个 cron 任务属于其他 server 或 tab，这里暂时只读。",
+    "run_card": {
+      "aria_label": "计划任务执行：{{name}}",
+      "schedule": "执行周期",
+      "status_dispatched": "已派发",
+      "next_run": "下次执行：",
+      "previous_run": "上次执行：",
+      "show_details": "展开计划任务",
+      "hide_details": "收起计划任务",
+      "task_body": "已授权任务",
+      "not_available": "暂无",
+      "contract_summary": "合同 {{id}} v{{version}} · {{count}} 项约束已生效"
+    }
   },
   "fileBrowser": {
     "edit": "编辑",

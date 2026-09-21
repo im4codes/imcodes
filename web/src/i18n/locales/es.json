@@ -2432,7 +2432,19 @@
     "go_to_session": "Ir a sesión",
     "go_and_quote": "Ir y citar resultado",
     "read_only": "Solo lectura",
-    "read_only_scope": "Esta tarea cron pertenece a otro servidor o pestaña y aquí es temporalmente de solo lectura."
+    "read_only_scope": "Esta tarea cron pertenece a otro servidor o pestaña y aquí es temporalmente de solo lectura.",
+    "run_card": {
+      "aria_label": "Ejecución programada: {{name}}",
+      "schedule": "Intervalo de ejecución",
+      "status_dispatched": "Enviada",
+      "next_run": "Próxima ejecución:",
+      "previous_run": "Ejecución anterior:",
+      "show_details": "Mostrar tarea programada",
+      "hide_details": "Ocultar tarea programada",
+      "task_body": "Tarea autorizada",
+      "not_available": "No disponible",
+      "contract_summary": "Contrato {{id}} v{{version}} · {{count}} restricciones activas"
+    }
   },
   "fileBrowser": {
     "edit": "Editar",

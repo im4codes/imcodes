@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   CRON_COMPLETION_POLICY,
+  CRON_CONTROL_CONTRACT,
   CRON_STATUS,
   CRON_MSG,
   buildLegacyCronControlBlock,
@@ -60,12 +61,13 @@ describe('jobDispatchCron', () => {
   });
 
   it('dispatches due jobs via WsBridge', async () => {
+    const previousRunAt = Date.now() - 601_000;
     dbRows.push({
       id: 'j1', server_id: 's1', user_id: 'u1', name: 'Test Job',
       cron_expr: '*/10 * * * *', action: '{"type":"command","command":"hello"}',
       project_name: 'myapp', target_role: 'brain', status: 'active',
       timezone: 'Asia/Shanghai',
-      last_run_at: null, next_run_at: Date.now() - 1000, expires_at: null,
+      last_run_at: Date.now(), previous_run_at: previousRunAt, next_run_at: Date.now() - 1000, expires_at: null,
       created_at: Date.now(), updated_at: null,
     });
 
@@ -82,6 +84,8 @@ describe('jobDispatchCron', () => {
     expect(sent.timezone).toBe('Asia/Shanghai');
     expect(sent.expiresAt).toBeNull();
     expect(sent.completionPolicy).toBe(CRON_COMPLETION_POLICY.RECURRING);
+    expect(sent.previousRunAt).toBe(previousRunAt);
+    expect(sent.nextRunAt).toEqual(expect.any(Number));
     expect(sent.action).toEqual({ type: 'command', command: 'hello' });
   });
 
@@ -111,7 +115,7 @@ describe('jobDispatchCron', () => {
     expect(persisted).toMatchObject({
       type: 'command', command: 'Inspect progress', selfManaged: true,
       cronControl: {
-        contractId: 'supervision_cron_control_v1', version: 1,
+        contractId: CRON_CONTROL_CONTRACT.contractId, version: CRON_CONTROL_CONTRACT.version,
         scheduleId: 'legacy-self',
       },
     });
@@ -144,7 +148,7 @@ describe('jobDispatchCron', () => {
     expect(migration).toBeDefined();
     expect(JSON.parse(String(migration?.params[0]))).toMatchObject({
       command: 'Inspect manually',
-      cronControl: { contractId: 'supervision_cron_control_v1', scheduleId: 'manual-self' },
+      cronControl: { contractId: CRON_CONTROL_CONTRACT.contractId, scheduleId: 'manual-self' },
     });
     expect(JSON.parse(mockSendToDaemon.mock.calls[0][0]).action)
       .toEqual(JSON.parse(String(migration?.params[0])));

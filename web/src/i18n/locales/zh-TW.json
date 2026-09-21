@@ -2432,7 +2432,19 @@
     "go_to_session": "跳轉到會話",
     "go_and_quote": "跳轉並引用結果",
     "read_only": "唯讀",
-    "read_only_scope": "這個 cron 任務屬於其他 server 或 tab，這裡暫時唯讀。"
+    "read_only_scope": "這個 cron 任務屬於其他 server 或 tab，這裡暫時唯讀。",
+    "run_card": {
+      "aria_label": "排程任務執行：{{name}}",
+      "schedule": "執行週期",
+      "status_dispatched": "已派發",
+      "next_run": "下次執行：",
+      "previous_run": "上次執行：",
+      "show_details": "展開排程任務",
+      "hide_details": "收合排程任務",
+      "task_body": "已授權任務",
+      "not_available": "暫無",
+      "contract_summary": "合約 {{id}} v{{version}} · {{count}} 項約束已生效"
+    }
   },
   "fileBrowser": {
     "edit": "編輯",

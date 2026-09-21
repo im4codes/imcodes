@@ -5,6 +5,7 @@
 import type { CronCommandResultMessage, CronDispatchMessage, CronParticipant } from '../../shared/cron-types.js';
 import {
   buildCompactCronControlRef,
+  buildCronRunTimelineProjection,
   buildRegisteredCronSystemContract,
   CRON_CONTROL_PROTOCOL,
   CRON_MSG,
@@ -59,7 +60,12 @@ export interface CronSendDispatchResult {
 type CronSendDispatcher = (input: CronSendDispatchInput) => Promise<CronSendDispatchResult>;
 
 let cronSendDispatcherOverride: CronSendDispatcher | null = null;
-let cronProcessCommandSenderOverride: ((sessionName: string, text: string) => Promise<void>) | null = null;
+type CronProcessCommandSender = (
+  sessionName: string,
+  text: string,
+  options?: Parameters<typeof sendProcessSessionMessageForAutomation>[2],
+) => Promise<void>;
+let cronProcessCommandSenderOverride: CronProcessCommandSender | null = null;
 const processCronContractSignatures = new Map<string, string>();
 
 export function __setCronSendDispatcherForTests(dispatcher: CronSendDispatcher | null): void {
@@ -67,7 +73,7 @@ export function __setCronSendDispatcherForTests(dispatcher: CronSendDispatcher |
 }
 
 export function __setCronProcessCommandSenderForTests(
-  sender: ((sessionName: string, text: string) => Promise<void>) | null,
+  sender: CronProcessCommandSender | null,
 ): void {
   cronProcessCommandSenderOverride = sender;
   processCronContractSignatures.clear();
@@ -185,6 +191,7 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
     const registeredSystemContract = managedAgent
       ? buildRegisteredCronSystemContract(action, jobId)
       : undefined;
+    const cronRun = buildCronRunTimelineProjection(msg);
 
     if (session.runtimeType === 'transport') {
       let runtime = getTransportRuntime(name);
@@ -206,16 +213,23 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
       }
       if (runtime) {
         const transportRuntime = runtime;
+        let timelineProjected = false;
         const dispatchAttempt = async (attempt: number): Promise<void> => {
           if (attempt > 1 && transportRuntime.getStatus() !== 'idle') {
             await transportRuntime.cancel();
           }
           const clientMessageId = `cron:${jobId}:${executionId ?? 'dispatch'}:attempt:${attempt}`;
-          const result = registeredSystemContract
-            ? await transportRuntime.send(command, clientMessageId, undefined, undefined, { registeredSystemContract })
-            : await transportRuntime.send(command, clientMessageId);
-          if (result !== 'queued') {
-            timelineEmitter.emit(name, 'user.message', { text: command, allowDuplicate: true });
+          await transportRuntime.send(command, clientMessageId, undefined, undefined, {
+            timelineCommitted: true,
+            ...(registeredSystemContract ? { registeredSystemContract } : {}),
+          });
+          if (!timelineProjected && cronRun) {
+            timelineEmitter.emit(name, 'user.message', {
+              text: command,
+              allowDuplicate: true,
+              cronRun,
+            }, { source: 'daemon', confidence: 'high' });
+            timelineProjected = true;
           }
         };
         const collector = collectCommandResult(name, jobId, executionId, serverLink, {
@@ -257,7 +271,13 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
           && processCronContractSignatures.get(processContractKey) !== registeredSystemContract.signature
           ? `${registeredSystemContract.body}\n\n${command}`
           : command;
-        await (cronProcessCommandSenderOverride ?? sendProcessSessionMessageForAutomation)(name, processCommand);
+        await (cronProcessCommandSenderOverride ?? sendProcessSessionMessageForAutomation)(name, processCommand, {
+          userMessageMetadata: {
+            allowDuplicate: true,
+            memoryExcluded: true,
+            ...(cronRun ? { cronRun } : {}),
+          },
+        });
         if (registeredSystemContract) {
           processCronContractSignatures.set(processContractKey, registeredSystemContract.signature);
         }

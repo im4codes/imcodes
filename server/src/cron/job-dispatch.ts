@@ -80,6 +80,8 @@ export async function dispatchJobNow(env: Env, job: DbCronJob): Promise<void> {
     timezone: job.timezone,
     expiresAt: job.expires_at,
     completionPolicy: normalizeCronCompletionPolicy(job.completion_policy),
+    previousRunAt: job.last_run_at,
+    nextRunAt: job.next_run_at,
     ...(job.target_session_name ? { targetSessionName: job.target_session_name } : {}),
     action,
   };
@@ -93,9 +95,9 @@ export async function jobDispatchCron(env: Env): Promise<void> {
   const now = Date.now();
 
   // Atomic select + lock — prevents double-dispatch from concurrent ticks
-  const dueJobs = await env.DB.query<DbCronJob>(
+  const dueJobs = await env.DB.query<DbCronJob & { previous_run_at?: number | null }>(
     `WITH due AS (
-       SELECT id FROM cron_jobs
+       SELECT id, last_run_at AS previous_run_at FROM cron_jobs
        WHERE status = $2 AND next_run_at <= $1
          AND (expires_at IS NULL OR expires_at >= $1)
        ORDER BY next_run_at ASC
@@ -104,7 +106,7 @@ export async function jobDispatchCron(env: Env): Promise<void> {
      )
      UPDATE cron_jobs SET last_run_at = $1
      FROM due WHERE cron_jobs.id = due.id
-     RETURNING cron_jobs.*`,
+     RETURNING cron_jobs.*, due.previous_run_at`,
     [now, CRON_STATUS.ACTIVE],
   );
 
@@ -139,6 +141,7 @@ export async function jobDispatchCron(env: Env): Promise<void> {
       if (!job.target_role) {
         logger.warn({ jobId: job.id }, 'Cron: target_role is NULL, defaulting to brain');
       }
+      const nextRun = calculateNextRun(job.cron_expr, now, job.timezone);
       const msg: CronDispatchMessage = {
         type: CRON_MSG.DISPATCH,
         jobId: job.id,
@@ -151,13 +154,16 @@ export async function jobDispatchCron(env: Env): Promise<void> {
         timezone: job.timezone,
         expiresAt: job.expires_at,
         completionPolicy: normalizeCronCompletionPolicy(job.completion_policy),
+        previousRunAt: Object.prototype.hasOwnProperty.call(job, 'previous_run_at')
+          ? job.previous_run_at
+          : job.last_run_at,
+        nextRunAt: nextRun,
         ...(job.target_session_name ? { targetSessionName: job.target_session_name } : {}),
         action,
       };
       bridge.sendToDaemon(JSON.stringify(msg));
 
       // Advance schedule
-      const nextRun = calculateNextRun(job.cron_expr, now, job.timezone);
       await env.DB.execute('UPDATE cron_jobs SET next_run_at = $1 WHERE id = $2', [nextRun, job.id]);
 
       // Auto-expire if next run is past expiration

@@ -2432,7 +2432,19 @@
     "go_to_session": "Go to session",
     "go_and_quote": "Go & quote result",
     "read_only": "Read-only",
-    "read_only_scope": "This cron job belongs to another server or tab and is temporarily read-only here."
+    "read_only_scope": "This cron job belongs to another server or tab and is temporarily read-only here.",
+    "run_card": {
+      "aria_label": "Scheduled run: {{name}}",
+      "schedule": "Execution interval",
+      "status_dispatched": "Dispatched",
+      "next_run": "Next run:",
+      "previous_run": "Previous run:",
+      "show_details": "Show scheduled task",
+      "hide_details": "Hide scheduled task",
+      "task_body": "Authorized task",
+      "not_available": "Not available",
+      "contract_summary": "Contract {{id}} v{{version}} · {{count}} enforced constraints"
+    }
   },
   "fileBrowser": {
     "edit": "Edit",

@@ -13,6 +13,7 @@ import { logAudit } from '../security/audit.js';
 import {
   CRON_COMPLETION_POLICY,
   CRON_CONTROL_CONTRACT,
+  LEGACY_CRON_CONTROL_CONTRACT_V1,
   CRON_STATUS,
   normalizeCronCompletionPolicy,
   normalizeCronExecutionDetail,
@@ -44,11 +45,13 @@ const cronParticipantSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('session'), value: z.string().regex(sessionNamePattern) }),
 ]);
 
-const cronControlRegistrationSchema = z.object({
-  contractId: z.literal(CRON_CONTROL_CONTRACT.contractId),
-  version: z.literal(CRON_CONTROL_CONTRACT.version),
-  scheduleId: z.string().min(1),
+const currentCronControlRegistrationSchema = z.object({
+  contractId: z.literal(CRON_CONTROL_CONTRACT.contractId), version: z.literal(CRON_CONTROL_CONTRACT.version), scheduleId: z.string().min(1),
   constraints: z.object({
+    authorization: z.literal(CRON_CONTROL_CONTRACT.constraints.authorization),
+    executeTaskBody: z.literal(CRON_CONTROL_CONTRACT.constraints.executeTaskBody),
+    scope: z.literal(CRON_CONTROL_CONTRACT.constraints.scope),
+    secrets: z.literal(CRON_CONTROL_CONTRACT.constraints.secrets),
     updateSelf: z.literal(CRON_CONTROL_CONTRACT.constraints.updateSelf),
     cancelRecurring: z.literal(CRON_CONTROL_CONTRACT.constraints.cancelRecurring),
     cancelUntilComplete: z.literal(CRON_CONTROL_CONTRACT.constraints.cancelUntilComplete),
@@ -57,6 +60,23 @@ const cronControlRegistrationSchema = z.object({
     finalResponse: z.literal(CRON_CONTROL_CONTRACT.constraints.finalResponse),
   }).strict(),
 }).strict();
+
+const legacyCronControlRegistrationSchema = z.object({
+  contractId: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.contractId), version: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.version), scheduleId: z.string().min(1),
+  constraints: z.object({
+    updateSelf: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.constraints.updateSelf),
+    cancelRecurring: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.constraints.cancelRecurring),
+    cancelUntilComplete: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.constraints.cancelUntilComplete),
+    silent: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.constraints.silent),
+    network: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.constraints.network),
+    finalResponse: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.constraints.finalResponse),
+  }).strict(),
+}).strict();
+
+const cronControlRegistrationSchema = z.union([
+  currentCronControlRegistrationSchema,
+  legacyCronControlRegistrationSchema,
+]);
 
 const cronActionSchemaRaw = z.discriminatedUnion('type', [
   z.object({

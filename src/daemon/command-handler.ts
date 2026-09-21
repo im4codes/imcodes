@@ -4,6 +4,7 @@
  */
 import { AGENT_SKILLS_MSG } from '../../shared/agent-skills.js';
 import { AGENT_MCP_MSG } from '../../shared/agent-mcp.js';
+import type { CronRunTimelineProjection } from '../../shared/cron-types.js';
 import { handleAgentMcpCommand } from './agent-mcp.js';
 import { handleAgentSkillsCommand } from './agent-skills.js';
 import { startProject, stopProject, teardownProject, getTransportRuntime, launchTransportSession, isProviderSessionBound, persistSessionRecord, relaunchSessionWithSettings, stopTransportRuntimeSession, type ProjectConfig } from '../agent/session-manager.js';
@@ -4994,6 +4995,7 @@ async function sendProcessSessionMessage(
       p2pRunId?: string;
       p2pDiscussionId?: string;
       p2pPhase?: string;
+      cronRun?: CronRunTimelineProjection;
     }>;
   },
 ): Promise<void> {
@@ -5107,6 +5109,7 @@ export async function sendProcessSessionMessageForAutomation(
       p2pRunId?: string;
       p2pDiscussionId?: string;
       p2pPhase?: string;
+      cronRun?: CronRunTimelineProjection;
     }>;
   },
 ): Promise<void> {

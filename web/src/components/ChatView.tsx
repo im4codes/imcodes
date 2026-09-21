@@ -12,6 +12,12 @@ import {
   type SupervisionExecutionState,
 } from '@shared/supervision-config.js';
 import { SUPERVISION_HEARTBEAT_GLYPH } from '@shared/supervision-heartbeat.js';
+import {
+  CRON_COMPLETION_POLICY,
+  CRON_RUN_TIMELINE,
+  readCronRunTimelineProjection,
+  type CronRunTimelineProjection,
+} from '@shared/cron-types.js';
 import { localizeDaemonUserNoticeEvent } from '../daemon-user-notice-i18n.js';
 /**
  * ChatView — renders TimelineEvent[] as a chat-style view.
@@ -4701,6 +4707,61 @@ function SupervisionAutomationPrompt({
   );
 }
 
+function CronRunCard({ run, locale }: { run: CronRunTimelineProjection; locale?: string }) {
+  const { t } = useTranslation();
+  const [expanded, setExpanded] = useState(false);
+  const detailsId = `cron-run-${run.scheduleId}-${run.executionId ?? 'dispatch'}`.replace(/[^a-zA-Z0-9_-]/gu, '-');
+  const formatTime = (value: number | undefined) => value === undefined
+    ? t('cron.run_card.not_available')
+    : new Intl.DateTimeFormat(locale, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value));
+  const completionLabel = run.completionPolicy === CRON_COMPLETION_POLICY.UNTIL_COMPLETE
+    ? t('cron.completion_until_complete')
+    : t('cron.completion_recurring');
+  return (
+    <section class="chat-cron-run" aria-label={t('cron.run_card.aria_label', { name: run.name })}>
+      <div class="chat-cron-run-header">
+        <strong class="chat-cron-run-title">{run.name}</strong>
+        <div class="chat-cron-run-chips">
+          {run.cronExpr && <span class="chat-cron-run-chip" title={t('cron.run_card.schedule')}>{run.cronExpr}</span>}
+          <span class="chat-cron-run-chip">{completionLabel}</span>
+          <span class="chat-cron-run-chip is-status">{t('cron.run_card.status_dispatched')}</span>
+        </div>
+      </div>
+      <div class="chat-cron-run-next">
+        <span>{t('cron.run_card.next_run')}</span>
+        <time>{formatTime(run.nextRunAt)}</time>
+        {run.timezone && <span class="chat-cron-run-timezone">{run.timezone}</span>}
+      </div>
+      <button
+        type="button"
+        class="chat-cron-run-toggle"
+        aria-expanded={expanded}
+        aria-controls={detailsId}
+        onClick={() => setExpanded((value) => !value)}
+      >
+        {expanded ? t('cron.run_card.hide_details') : t('cron.run_card.show_details')}
+      </button>
+      {expanded && (
+        <div id={detailsId} class="chat-cron-run-details">
+          <div class="chat-cron-run-detail-row">
+            <span>{t('cron.run_card.previous_run')}</span>
+            <time>{formatTime(run.previousRunAt)}</time>
+          </div>
+          <div class="chat-cron-run-contract">
+            {t('cron.run_card.contract_summary', {
+              id: run.contractId,
+              version: run.contractVersion,
+              count: Object.keys(run.constraints).length,
+            })}
+          </div>
+          <div class="chat-cron-run-task-label">{t('cron.run_card.task_body')}</div>
+          <pre class="chat-cron-run-task">{run.taskBody}</pre>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function PeerAuditRoundChip({
   round,
   outcomeLabel,
@@ -4754,6 +4815,17 @@ const ChatEvent = memo(function ChatEvent({
   switch (event.type) {
     case 'user.message': {
       const rawUserText = String(event.payload.text ?? '');
+      const cronRun = event.source === 'daemon' && event.confidence === 'high'
+        ? readCronRunTimelineProjection(event.payload[CRON_RUN_TIMELINE.PAYLOAD_KEY])
+        : undefined;
+      if (cronRun) {
+        return (
+          <div class="chat-event chat-user chat-user-cron-run" data-event-id={event.eventId}>
+            <CronRunCard run={cronRun} locale={locale} />
+            <ChatTime ts={event.ts} />
+          </div>
+        );
+      }
       const supervisionPromptLabelKey = supervisionUserPromptLabelKey(event.payload);
       if (supervisionPromptLabelKey) {
         return (

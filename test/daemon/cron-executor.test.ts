@@ -137,6 +137,7 @@ describe('executeCronJob', () => {
     expect(cronProcessSendMock).toHaveBeenCalledWith(
       'deck_myapp_brain',
       'review the codebase',
+      expect.objectContaining({ userMessageMetadata: expect.objectContaining({ cronRun: expect.any(Object) }) }),
     );
     expect(sendKeys).not.toHaveBeenCalled();
   });
@@ -180,14 +181,14 @@ describe('executeCronJob', () => {
 
     const prompts = cronProcessSendMock.mock.calls.map((call) => call[1] as string);
     expect(prompts).toHaveLength(2);
-    expect(prompts[0]).toContain('"contractId":"supervision_cron_control_v1"');
+    expect(prompts[0]).toContain('"contractId":"supervision_cron_control_v2"');
     expect(prompts[0]).toContain('"taskBody":"Inspect the current progress."');
     expect(prompts[0]).toContain('"first_non_empty_SILENT_stops_immediately_no_more_tools"');
     const compactPrompts = prompts.map((prompt) => prompt.slice(prompt.lastIndexOf('<imcodes-cron-control ')));
     for (const [index, prompt] of compactPrompts.entries()) {
       expect(prompt).toMatch(/^<imcodes-cron-control /);
       expect(prompt).not.toContain('Inspect the current progress.');
-      expect(prompt).toContain('"contractRef":"supervision_cron_control_v1"');
+      expect(prompt).toContain('"contractRef":"supervision_cron_control_v2"');
       expect(prompt).toContain('"scheduleId":"job-progress-1"');
       expect(prompt).toContain('"completionPolicy":"recurring"');
       expect(prompt).toContain(`"executionId":"run-${index + 1}"`);
@@ -198,7 +199,23 @@ describe('executeCronJob', () => {
     }
     expect(prompts[1]).not.toContain('"contractId"');
     expect(prompts[1]).not.toContain('Inspect the current progress.');
-    expect(compactPrompts.join('\n').match(/supervision_cron_control_v1/g)).toHaveLength(2);
+    expect(compactPrompts.join('\n').match(/supervision_cron_control_v2/g)).toHaveLength(2);
+    for (const call of cronProcessSendMock.mock.calls) {
+      expect(call[2]).toEqual({
+        userMessageMetadata: {
+          allowDuplicate: true,
+          memoryExcluded: true,
+          cronRun: expect.objectContaining({
+            scheduleId: 'job-progress-1',
+            name: 'Check implementation progress',
+            cronExpr: '*/10 * * * *',
+            timezone: 'Asia/Shanghai',
+            taskBody: 'Inspect the current progress.',
+            status: 'dispatched',
+          }),
+        },
+      });
+    }
   });
 
   it('allows an until-complete schedule to self-cancel only after its overall goal completes', async () => {
@@ -225,7 +242,7 @@ describe('executeCronJob', () => {
     ['missing authoritative contract', { type: 'command', command: 'task', selfManaged: true }, 'missing_authoritative_contract'],
     ['unknown version', {
       type: 'command', command: 'task', selfManaged: true,
-      cronControl: { ...CRON_CONTROL_CONTRACT, scheduleId: 'job-invalid', version: 2 },
+      cronControl: { ...CRON_CONTROL_CONTRACT, scheduleId: 'job-invalid', version: 9 },
     }, 'unknown_contract_version'],
     ['task id mismatch', {
       type: 'command', command: 'task', selfManaged: true,
@@ -265,6 +282,7 @@ describe('executeCronJob', () => {
     expect(cronProcessSendMock).toHaveBeenCalledWith(
       'deck_myapp_brain',
       'printf ready',
+      expect.objectContaining({ userMessageMetadata: expect.objectContaining({ cronRun: expect.any(Object) }) }),
     );
   });
 
@@ -326,6 +344,7 @@ describe('executeCronJob', () => {
     expect(cronProcessSendMock).toHaveBeenCalledWith(
       'deck_myapp_brain',
       'review the codebase',
+      expect.objectContaining({ userMessageMetadata: expect.objectContaining({ cronRun: expect.any(Object) }) }),
     );
   });
 
@@ -339,6 +358,7 @@ describe('executeCronJob', () => {
     expect(cronProcessSendMock).toHaveBeenCalledWith(
       'deck_myapp_brain',
       'review the codebase',
+      expect.objectContaining({ userMessageMetadata: expect.objectContaining({ cronRun: expect.any(Object) }) }),
     );
   });
 
@@ -385,13 +405,13 @@ describe('executeCronJob', () => {
     }), mockServerLink);
 
     const [prompt, clientMessageId, attachments, preamble, metadata] = mockRuntime.send.mock.calls[0];
-    expect(prompt).toContain('"contractRef":"supervision_cron_control_v1"');
+    expect(prompt).toContain('"contractRef":"supervision_cron_control_v2"');
     expect(prompt).not.toContain('Inspect transport progress.');
     expect(clientMessageId).toBe('cron:job-registered-transport:run-transport-1:attempt:1');
     expect(attachments).toBeUndefined();
     expect(preamble).toBeUndefined();
     expect(metadata.registeredSystemContract.body).toContain('"taskBody":"Inspect transport progress."');
-    expect(metadata.registeredSystemContract.body).toContain('"contractId":"supervision_cron_control_v1"');
+    expect(metadata.registeredSystemContract.body).toContain('"contractId":"supervision_cron_control_v2"');
   });
 
   it('sends command to transport session via runtime.send(), skipping busy check', async () => {
@@ -407,17 +427,25 @@ describe('executeCronJob', () => {
     await executeCronJob(makeMsg(), mockServerLink);
 
     expect(detectStatusAsync).not.toHaveBeenCalled();
-    expect(mockRuntime.send).toHaveBeenCalledWith('review the codebase', 'cron:job-1:dispatch:attempt:1');
+    expect(mockRuntime.send).toHaveBeenCalledWith(
+      'review the codebase', 'cron:job-1:dispatch:attempt:1', undefined, undefined,
+      expect.objectContaining({ timelineCommitted: true }),
+    );
     expect(typeof mockRuntime.send.mock.calls[0][0]).toBe('string');
     expect(sendKeys).not.toHaveBeenCalled();
     expect(timelineEmit).toHaveBeenCalledWith(
       'deck_myapp_brain',
       'user.message',
-      { text: 'review the codebase', allowDuplicate: true },
+      expect.objectContaining({
+        text: 'review the codebase',
+        allowDuplicate: true,
+        cronRun: expect.objectContaining({ scheduleId: 'job-1', taskBody: 'review the codebase' }),
+      }),
+      { source: 'daemon', confidence: 'high' },
     );
   });
 
-  it('does not emit a user.message when a transport cron command is only queued', async () => {
+  it('emits one durable cron card when a transport cron command is queued', async () => {
     const mockRuntime = {
       providerSessionId: 'connected-provider-session',
       send: vi.fn().mockReturnValue('queued'),
@@ -429,11 +457,15 @@ describe('executeCronJob', () => {
 
     await executeCronJob(makeMsg(), mockServerLink);
 
-    expect(mockRuntime.send).toHaveBeenCalledWith('review the codebase', 'cron:job-1:dispatch:attempt:1');
-    expect(timelineEmit).not.toHaveBeenCalledWith(
+    expect(mockRuntime.send).toHaveBeenCalledWith(
+      'review the codebase', 'cron:job-1:dispatch:attempt:1', undefined, undefined,
+      expect.objectContaining({ timelineCommitted: true }),
+    );
+    expect(timelineEmit).toHaveBeenCalledWith(
       'deck_myapp_brain',
       'user.message',
-      expect.anything(),
+      expect.objectContaining({ cronRun: expect.objectContaining({ scheduleId: 'job-1' }) }),
+      { source: 'daemon', confidence: 'high' },
     );
   });
 
@@ -475,7 +507,11 @@ describe('executeCronJob', () => {
       2,
       'review the codebase',
       'cron:job-1:exec-retry-safe:attempt:2',
+      undefined,
+      undefined,
+      expect.objectContaining({ timelineCommitted: true }),
     );
+    expect(timelineEmit).toHaveBeenCalledTimes(1);
     expect(mockRuntime.cancel).not.toHaveBeenCalled();
 
     handler?.({ sessionId: 'deck_myapp_brain', type: 'assistant.text', payload: { text: 'done after retry' } });
@@ -612,7 +648,10 @@ describe('executeCronJob', () => {
     expect(ensureTransportRuntimeAvailable).toHaveBeenCalledOnce();
     expect(ensureTransportRuntimeAvailable).toHaveBeenCalledWith('deck_myapp_brain');
     expect(mockRuntime.send).toHaveBeenCalledOnce();
-    expect(mockRuntime.send).toHaveBeenCalledWith('review the codebase', 'cron:job-1:dispatch:attempt:1');
+    expect(mockRuntime.send).toHaveBeenCalledWith(
+      'review the codebase', 'cron:job-1:dispatch:attempt:1', undefined, undefined,
+      expect.objectContaining({ timelineCommitted: true }),
+    );
     expect(sendKeys).not.toHaveBeenCalled();
     expect(mockServerLink.send).not.toHaveBeenCalledWith(expect.objectContaining({
       type: CRON_MSG.COMMAND_RESULT,
@@ -637,7 +676,10 @@ describe('executeCronJob', () => {
     expect(ensureTransportRuntimeAvailable).toHaveBeenCalledWith('deck_myapp_brain');
     expect(unboundRuntime.send).not.toHaveBeenCalled();
     expect(restoredRuntime.send).toHaveBeenCalledOnce();
-    expect(restoredRuntime.send).toHaveBeenCalledWith('review the codebase', 'cron:job-1:dispatch:attempt:1');
+    expect(restoredRuntime.send).toHaveBeenCalledWith(
+      'review the codebase', 'cron:job-1:dispatch:attempt:1', undefined, undefined,
+      expect.objectContaining({ timelineCommitted: true }),
+    );
   });
 
   it('reports an error only after on-demand transport recovery fails', async () => {
@@ -838,6 +880,7 @@ describe('executeCronJob', () => {
     expect(cronProcessSendMock).toHaveBeenCalledWith(
       'deck_sub_abc123',
       'review the codebase',
+      expect.objectContaining({ userMessageMetadata: expect.objectContaining({ cronRun: expect.any(Object) }) }),
     );
   });
 

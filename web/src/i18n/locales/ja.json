@@ -2431,7 +2431,19 @@
     "go_to_session": "セッションへ移動",
     "go_and_quote": "移動して結果を引用",
     "read_only": "読み取り専用",
-    "read_only_scope": "この cron ジョブは別の server または tab に属しているため、ここでは一時的に読み取り専用です。"
+    "read_only_scope": "この cron ジョブは別の server または tab に属しているため、ここでは一時的に読み取り専用です。",
+    "run_card": {
+      "aria_label": "スケジュール実行：{{name}}",
+      "schedule": "実行間隔",
+      "status_dispatched": "送信済み",
+      "next_run": "次回実行：",
+      "previous_run": "前回実行：",
+      "show_details": "予定タスクを表示",
+      "hide_details": "予定タスクを非表示",
+      "task_body": "承認済みタスク",
+      "not_available": "利用不可",
+      "contract_summary": "契約 {{id}} v{{version}}・{{count}} 件の制約を適用"
+    }
   },
   "fileBrowser": {
     "edit": "編集",

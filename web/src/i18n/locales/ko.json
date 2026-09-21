@@ -2431,7 +2431,19 @@
     "go_to_session": "세션으로 이동",
     "go_and_quote": "이동 후 결과 인용",
     "read_only": "읽기 전용",
-    "read_only_scope": "이 cron 작업은 다른 server 또는 tab 소속이라 여기서는 임시로 읽기 전용입니다."
+    "read_only_scope": "이 cron 작업은 다른 server 또는 tab 소속이라 여기서는 임시로 읽기 전용입니다.",
+    "run_card": {
+      "aria_label": "예약 실행: {{name}}",
+      "schedule": "실행 주기",
+      "status_dispatched": "전송됨",
+      "next_run": "다음 실행:",
+      "previous_run": "이전 실행:",
+      "show_details": "예약 작업 표시",
+      "hide_details": "예약 작업 숨기기",
+      "task_body": "승인된 작업",
+      "not_available": "사용할 수 없음",
+      "contract_summary": "계약 {{id}} v{{version}} · 제약 {{count}}개 적용"
+    }
   },
   "fileBrowser": {
     "edit": "편집",

@@ -18,8 +18,8 @@ export const CRON_CONTROL_PROTOCOL = {
   SILENT_RESULT: 'SILENT',
 } as const;
 
-/** Registered immutable contract used by every self-managed cron schedule. */
-export const CRON_CONTROL_CONTRACT = {
+/** Exact v1 registration retained solely for fail-closed, in-place migration. */
+export const LEGACY_CRON_CONTROL_CONTRACT_V1 = {
   contractId: 'supervision_cron_control_v1',
   version: 1,
   constraints: {
@@ -31,6 +31,47 @@ export const CRON_CONTROL_CONTRACT = {
     finalResponse: 'exactly_one',
   },
 } as const;
+
+/** Registered immutable contract used by every self-managed cron schedule. */
+export const CRON_CONTROL_CONTRACT = {
+  contractId: 'supervision_cron_control_v2',
+  version: 2,
+  constraints: {
+    authorization: 'user_authorized_scheduled_execution',
+    executeTaskBody: 'must_execute_authoritative_task_body_now',
+    scope: 'authoritative_task_body_only',
+    secrets: 'never_echo_secrets',
+    updateSelf: 'explicit_user_request_only',
+    cancelRecurring: 'explicit_user_request_only',
+    cancelUntilComplete: 'overall_goal_complete_only',
+    silent: 'first_non_empty_SILENT_stops_immediately_no_more_tools',
+    network: 'explicit_task_request_only',
+    finalResponse: 'exactly_one',
+  },
+} as const;
+
+export const CRON_RUN_TIMELINE = {
+  PAYLOAD_KEY: 'cronRun',
+  STATUS: {
+    DISPATCHED: 'dispatched',
+  },
+} as const;
+
+export interface CronRunTimelineProjection {
+  scheduleId: string;
+  name: string;
+  cronExpr?: string;
+  timezone?: string;
+  completionPolicy: CronCompletionPolicy;
+  executionId?: string;
+  previousRunAt?: number;
+  nextRunAt?: number;
+  taskBody: string;
+  contractId: string;
+  contractVersion: number;
+  constraints: Record<string, string>;
+  status: (typeof CRON_RUN_TIMELINE.STATUS)[keyof typeof CRON_RUN_TIMELINE.STATUS];
+}
 
 export interface CronControlRegistration {
   contractId: string;
@@ -163,6 +204,16 @@ function validateRegistration(
   return undefined;
 }
 
+function isExactLegacyV1Registration(
+  registration: CronControlRegistration,
+  scheduleId: string,
+): boolean {
+  return registration.contractId === LEGACY_CRON_CONTROL_CONTRACT_V1.contractId
+    && registration.version === LEGACY_CRON_CONTROL_CONTRACT_V1.version
+    && registration.scheduleId === scheduleId
+    && JSON.stringify(registration.constraints) === JSON.stringify(LEGACY_CRON_CONTROL_CONTRACT_V1.constraints);
+}
+
 /** Strict daemon-side validation. Missing registrations never degrade to legacy behavior. */
 export function validateRegisteredCronControlAction(
   action: CronCommandAction,
@@ -191,6 +242,13 @@ export function registerCronControlAction(
   }
   if (!command.trim()) return { ok: false, reason: 'missing_authoritative_body' };
   if (action.cronControl) {
+    if (isExactLegacyV1Registration(action.cronControl, scheduleId)) {
+      return {
+        ok: true,
+        action: { ...action, command, cronControl: canonicalCronControlRegistration(scheduleId) },
+        migrated: true,
+      };
+    }
     const reason = validateRegistration(action.cronControl, scheduleId);
     return reason ? { ok: false, reason } : { ok: true, action: { ...action, command }, migrated: command !== action.command };
   }
@@ -224,12 +282,81 @@ export function buildRegisteredCronSystemContract(
     contractId: CRON_CONTROL_CONTRACT.contractId,
     v: CRON_CONTROL_CONTRACT.version,
     binding: { scheduleId },
+    execution: {
+      authority: 'This wrapped run is a user-authorized scheduled execution.',
+      required: 'You MUST execute authoritative.taskBody now within authoritative.constraints.',
+      network: 'Network, SSH, and webhook actions are allowed only when authoritative.taskBody explicitly requests them.',
+      scope: 'Do not expand scope beyond authoritative.taskBody and never echo secrets.',
+    },
     authoritative: {
       taskBody: action.command,
       constraints: CRON_CONTROL_CONTRACT.constraints,
     },
   });
   return { contractId: CRON_CONTROL_CONTRACT.contractId, signature: body, body };
+}
+
+function boundedNonEmptyString(value: unknown, maxLength: number): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.trim();
+  if (!normalized || normalized.length > maxLength) return undefined;
+  return normalized;
+}
+
+function optionalTimestamp(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+export function buildCronRunTimelineProjection(msg: CronDispatchMessage): CronRunTimelineProjection | undefined {
+  if (msg.action.type !== 'command') return undefined;
+  const scheduleId = boundedNonEmptyString(msg.jobId, 256);
+  const name = boundedNonEmptyString(msg.jobName, 256);
+  const taskBody = boundedNonEmptyString(msg.action.command, 256 * 1024);
+  if (!scheduleId || !name || !taskBody) return undefined;
+  return {
+    scheduleId,
+    name,
+    ...(boundedNonEmptyString(msg.cronExpr, 256) ? { cronExpr: msg.cronExpr!.trim() } : {}),
+    ...(boundedNonEmptyString(msg.timezone, 128) ? { timezone: msg.timezone!.trim() } : {}),
+    completionPolicy: normalizeCronCompletionPolicy(msg.completionPolicy),
+    ...(boundedNonEmptyString(msg.executionId, 256) ? { executionId: msg.executionId!.trim() } : {}),
+    ...(optionalTimestamp(msg.previousRunAt) !== undefined ? { previousRunAt: optionalTimestamp(msg.previousRunAt) } : {}),
+    ...(optionalTimestamp(msg.nextRunAt) !== undefined ? { nextRunAt: optionalTimestamp(msg.nextRunAt) } : {}),
+    taskBody,
+    contractId: CRON_CONTROL_CONTRACT.contractId,
+    contractVersion: CRON_CONTROL_CONTRACT.version,
+    constraints: { ...CRON_CONTROL_CONTRACT.constraints },
+    status: CRON_RUN_TIMELINE.STATUS.DISPATCHED,
+  };
+}
+
+/** Fail-closed reader for daemon-authored live and persisted timeline payloads. */
+export function readCronRunTimelineProjection(payload: unknown): CronRunTimelineProjection | undefined {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return undefined;
+  const value = payload as Record<string, unknown>;
+  const scheduleId = boundedNonEmptyString(value.scheduleId, 256);
+  const name = boundedNonEmptyString(value.name, 256);
+  const taskBody = boundedNonEmptyString(value.taskBody, 256 * 1024);
+  if (!scheduleId || !name || !taskBody) return undefined;
+  if (value.contractId !== CRON_CONTROL_CONTRACT.contractId
+    || value.contractVersion !== CRON_CONTROL_CONTRACT.version
+    || value.status !== CRON_RUN_TIMELINE.STATUS.DISPATCHED
+    || JSON.stringify(value.constraints) !== JSON.stringify(CRON_CONTROL_CONTRACT.constraints)) return undefined;
+  return {
+    scheduleId,
+    name,
+    ...(boundedNonEmptyString(value.cronExpr, 256) ? { cronExpr: String(value.cronExpr).trim() } : {}),
+    ...(boundedNonEmptyString(value.timezone, 128) ? { timezone: String(value.timezone).trim() } : {}),
+    completionPolicy: normalizeCronCompletionPolicy(value.completionPolicy),
+    ...(boundedNonEmptyString(value.executionId, 256) ? { executionId: String(value.executionId).trim() } : {}),
+    ...(optionalTimestamp(value.previousRunAt) !== undefined ? { previousRunAt: optionalTimestamp(value.previousRunAt) } : {}),
+    ...(optionalTimestamp(value.nextRunAt) !== undefined ? { nextRunAt: optionalTimestamp(value.nextRunAt) } : {}),
+    taskBody,
+    contractId: CRON_CONTROL_CONTRACT.contractId,
+    contractVersion: CRON_CONTROL_CONTRACT.version,
+    constraints: { ...CRON_CONTROL_CONTRACT.constraints },
+    status: CRON_RUN_TIMELINE.STATUS.DISPATCHED,
+  };
 }
 
 // ── WS message types ─────────────────────────────────────────────────────
@@ -252,6 +379,8 @@ export interface CronDispatchMessage {
   expiresAt?: number | null;
   /** Missing in older server dispatches; daemon treats it as recurring. */
   completionPolicy?: CronCompletionPolicy;
+  previousRunAt?: number | null;
+  nextRunAt?: number | null;
   /** Direct session name for sub-session targeting (e.g. deck_sub_xxx). When set, overrides targetRole. */
   targetSessionName?: string;
   action: CronAction;

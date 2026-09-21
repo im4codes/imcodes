@@ -5188,6 +5188,55 @@ html.native-ios-mac .chat-dl-btn {
   white-space: pre-wrap;
 }
 
+.chat-cron-run {
+  min-width: min(31rem, 78vw);
+  max-width: min(42rem, 86vw);
+  display: grid;
+  gap: 0.55rem;
+  padding: 0.75rem;
+  border: 1px solid var(--chrome-line);
+  border-radius: 0.75rem;
+  background: var(--chrome-panel);
+}
+.chat-cron-run-header { display: grid; gap: 0.4rem; min-width: 0; }
+.chat-cron-run-title { overflow-wrap: anywhere; }
+.chat-cron-run-chips { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+.chat-cron-run-chip {
+  padding: 0.12rem 0.42rem;
+  border-radius: 999px;
+  border: 1px solid var(--chrome-line-soft);
+  font-size: 0.75rem;
+  overflow-wrap: anywhere;
+}
+.chat-cron-run-chip.is-status { color: var(--success, #21a366); }
+.chat-cron-run-next,
+.chat-cron-run-detail-row { display: flex; flex-wrap: wrap; gap: 0.35rem; font-size: 0.78rem; opacity: 0.84; }
+.chat-cron-run-timezone { opacity: 0.72; }
+.chat-cron-run-toggle {
+  justify-self: start;
+  border: 0;
+  padding: 0;
+  color: var(--chrome-accent);
+  background: transparent;
+  cursor: pointer;
+}
+.chat-cron-run-details { display: grid; gap: 0.45rem; min-width: 0; }
+.chat-cron-run-contract { font-size: 0.75rem; opacity: 0.75; overflow-wrap: anywhere; }
+.chat-cron-run-task-label { font-size: 0.78rem; font-weight: 600; }
+.chat-cron-run-task {
+  max-height: 18rem;
+  margin: 0;
+  padding: 0.55rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border-radius: 0.45rem;
+  background: rgba(2, 6, 23, 0.48);
+}
+@media (max-width: 640px) {
+  .chat-cron-run { min-width: 0; max-width: 100%; width: 100%; box-sizing: border-box; }
+}
+
 /* Delegation authority badge — rendered only from the structured
    delegation-claim projection, never from assistant prose. Deliberately quiet:
    it states a fact about the turn, it is not a status banner. */
