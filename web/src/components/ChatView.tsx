@@ -211,7 +211,7 @@ function parseMessagePinPreviewMode(raw: unknown): MessagePinPreviewMode | null 
 /** A merged view item — a single event, assistant text, or a tool presentation. */
 interface ViewItem {
   key: string;
-  type: 'event' | 'assistant-block' | 'tool-group' | 'tool-activity';
+  type: 'event' | 'assistant-block' | 'tool-group' | 'tool-activity' | 'supervision-status-run';
   event?: TimelineEvent;
   /** Merged text for assistant-block */
   text?: string;
@@ -228,6 +228,10 @@ interface ViewItem {
   toolEvents?: TimelineEvent[];
   /** memory.context events linked to this event via relatedToEventId */
   linkedEvents?: TimelineEvent[];
+  /** Original presentation items represented by a repeated supervision-status row. */
+  statusItems?: ViewItem[];
+  heartbeatCount?: number;
+  waitingCount?: number;
   ts?: number;
   lastTs?: number;
 }
@@ -1081,8 +1085,14 @@ function buildViewItemsTail(
   for (let pass = 0; pass < VIEW_TAIL_MAX_WIDENING_PASSES; pass += 1) {
     const startIndex = Math.max(0, events.length - windowSize);
     const items = buildViewItems(startIndex === 0 ? events : events.slice(startIndex), showToolCalls);
+    // A folded run touching the left edge may have started before this window.
+    // Widen until the first visible item is not foldable (or history begins),
+    // otherwise a 700-row restored run would display only the last 200 count.
+    const foldRunTouchesWindowStart = startIndex > 0
+      && items.length > 0
+      && (items[0].type === 'supervision-status-run' || supervisionStatusCandidate(items[0]) !== null);
     // Enough, or there is nothing older to widen into.
-    if (items.length >= target || startIndex === 0) {
+    if ((items.length >= target && !foldRunTouchesWindowStart) || startIndex === 0) {
       return { items, windowStartIndex: startIndex };
     }
     // A tool-heavy stretch can collapse hundreds of events into a handful of
@@ -1397,7 +1407,83 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
   flushPending();
   flushTools();
 
-  return items;
+  return foldSupervisionStatusRuns(items);
+}
+
+type SupervisionStatusCandidate = {
+  kind: 'heartbeat' | 'waiting';
+  count: number;
+};
+
+/**
+ * Identify only the two machine-only rows authorized for compact presentation.
+ * Real assistant text, NEEDS_INPUT, audit/implementation heartbeats and every
+ * other visible row deliberately return null and therefore break the run.
+ */
+function supervisionStatusCandidate(item: ViewItem): SupervisionStatusCandidate | null {
+  if (
+    item.type === 'event'
+    && item.event?.type === 'user.message'
+    && (item.linkedEvents?.length ?? 0) === 0
+    && item.event.payload.automation === true
+    && item.event.payload.automationKind === SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND
+  ) {
+    return { kind: 'heartbeat', count: 1 };
+  }
+  if (
+    item.type === 'assistant-block'
+    && item.executionState === SUPERVISION_EXECUTION_STATES.WAITING
+    && (item.text ?? '').trim().length === 0
+  ) {
+    return { kind: 'waiting', count: Math.max(1, item.eventIds?.length ?? 0) };
+  }
+  return null;
+}
+
+function foldSupervisionStatusRuns(items: ViewItem[]): ViewItem[] {
+  const folded: ViewItem[] = [];
+  let run: ViewItem[] = [];
+  let heartbeatCount = 0;
+  let waitingCount = 0;
+
+  const flush = () => {
+    const sourceCount = heartbeatCount + waitingCount;
+    if (sourceCount < 2) {
+      folded.push(...run);
+    } else {
+      const first = run[0];
+      const last = run[run.length - 1];
+      folded.push({
+        // The first source event owns the run identity. A live append changes
+        // the summary revision/count but not its key, so Preact preserves the
+        // disclosure node, focus and expanded state without a flicker.
+        key: `supervision-status-run:${first.key}`,
+        type: 'supervision-status-run',
+        statusItems: run,
+        heartbeatCount,
+        waitingCount,
+        ts: first.ts ?? first.event?.ts ?? 0,
+        lastTs: last.lastTs ?? last.ts ?? last.event?.ts ?? 0,
+      });
+    }
+    run = [];
+    heartbeatCount = 0;
+    waitingCount = 0;
+  };
+
+  for (const item of items) {
+    const candidate = supervisionStatusCandidate(item);
+    if (!candidate) {
+      flush();
+      folded.push(item);
+      continue;
+    }
+    run.push(item);
+    if (candidate.kind === 'heartbeat') heartbeatCount += candidate.count;
+    else waitingCount += candidate.count;
+  }
+  flush();
+  return folded;
 }
 
 /** Return the source text represented by a pinnable timeline event.
@@ -1441,6 +1527,10 @@ function eventRevision(event: TimelineEvent): string {
 }
 
 function viewItemRevision(item: ViewItem): string {
+  if (item.type === 'supervision-status-run') {
+    return `${item.key}:supervision-status-run:${item.heartbeatCount ?? 0}:${item.waitingCount ?? 0}:`
+      + (item.statusItems ?? []).map(viewItemRevision).join('|');
+  }
   if (item.type === 'assistant-block') {
     return [
       item.key,
@@ -3845,6 +3935,9 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
           )}
           {/* No `loading` guard: whatever is already restored renders now. */}
           {renderedViewItems.map((item) => {
+            if (item.type === 'supervision-status-run') {
+              return <SupervisionStatusRun key={item.key} item={item} />;
+            }
             if (item.type === 'assistant-block') {
               return (
                 <AssistantBlock
@@ -5363,6 +5456,79 @@ const ChatEvent = memo(function ChatEvent({
       return null;
   }
 });
+
+function SupervisionStatusRun({ item }: { item: ViewItem }) {
+  const { t, i18n } = useTranslation();
+  const [expanded, setExpanded] = useState(false);
+  const heartbeatCount = item.heartbeatCount ?? 0;
+  const waitingCount = item.waitingCount ?? 0;
+  const heartbeatLabel = heartbeatCount > 0
+    ? t('chat.supervision_status_run.heartbeats', { count: heartbeatCount })
+    : '';
+  const waitingLabel = waitingCount > 0
+    ? t('chat.supervision_status_run.waiting', { count: waitingCount })
+    : '';
+  const statusLabel = [heartbeatLabel, waitingLabel].filter(Boolean).join(' · ');
+  const locale = resolveI18nLocale(i18n);
+  const now = Date.now();
+  const firstTime = formatChatDateTime(item.ts ?? 0, now, locale);
+  const lastTime = formatChatDateTime(item.lastTs ?? item.ts ?? 0, now, locale);
+  const timeRange = firstTime === lastTime ? firstTime : `${firstTime}–${lastTime}`;
+  const actionLabel = expanded
+    ? t('chat.supervision_status_run.collapse')
+    : t('chat.supervision_status_run.expand');
+  const detailsId = `${item.key}:details`.replace(/[^a-zA-Z0-9_-]/gu, '-');
+
+  return (
+    <div class={`chat-supervision-status-run${expanded ? ' is-expanded' : ''}`}>
+      <button
+        type="button"
+        class="chat-supervision-status-run-toggle"
+        aria-expanded={expanded}
+        aria-controls={detailsId}
+        aria-label={t('chat.supervision_status_run.aria', { status: statusLabel, timeRange, action: actionLabel })}
+        title={actionLabel}
+        onClick={() => setExpanded((value) => !value)}
+      >
+        {heartbeatCount > 0 && (
+          <span class="chat-supervision-status-run-part is-heartbeat">
+            <span aria-hidden="true">{SUPERVISION_HEARTBEAT_GLYPH.ARMED}</span>
+            {heartbeatLabel}
+          </span>
+        )}
+        {heartbeatCount > 0 && waitingCount > 0 && <span aria-hidden="true">·</span>}
+        {waitingCount > 0 && (
+          <span class="chat-supervision-status-run-part is-waiting">
+            <span aria-hidden="true">{SUPERVISION_HEARTBEAT_GLYPH.WAITING}</span>
+            {waitingLabel}
+          </span>
+        )}
+        <span aria-hidden="true">·</span>
+        <span class="chat-supervision-status-run-time">{timeRange}</span>
+        <span class="chat-supervision-status-run-chevron" aria-hidden="true">{expanded ? '▴' : '▾'}</span>
+      </button>
+      {expanded && (
+        <div id={detailsId} class="chat-supervision-status-run-details">
+          {(item.statusItems ?? []).map((source) => {
+            if (source.type === 'assistant-block') {
+              return (
+                <AssistantBlock
+                  key={source.key}
+                  eventId={source.key}
+                  text={source.text ?? ''}
+                  automation={source.assistantAutomation === true}
+                  executionState={source.executionState}
+                  ts={source.lastTs ?? source.ts ?? 0}
+                />
+              );
+            }
+            return <ChatEvent key={source.key} event={source.event!} />;
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function groupFileChangePatches(batch: FileChangeBatch): GroupedFileChange[] {
   const groups = new Map<string, GroupedFileChange>();

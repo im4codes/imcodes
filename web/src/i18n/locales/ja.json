@@ -317,6 +317,15 @@
       "show_details": "監督プロンプトの詳細を表示",
       "hide_details": "監督プロンプトの詳細を非表示"
     },
+    "supervision_status_run": {
+      "heartbeats_one": "ハートビート {{count}} 回",
+      "heartbeats_other": "ハートビート {{count}} 回",
+      "waiting_one": "待機マーカー {{count}} 件",
+      "waiting_other": "待機マーカー {{count}} 件",
+      "expand": "繰り返しの監督状態を表示",
+      "collapse": "繰り返しの監督状態を非表示",
+      "aria": "{{status}}、{{timeRange}}。{{action}}"
+    },
     "delete_message": "メッセージを削除",
     "delete_message_confirm": "このメッセージを全員から削除しますか?この操作は取り消せません。",
     "dpad": {

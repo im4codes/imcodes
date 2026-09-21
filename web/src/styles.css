@@ -5225,6 +5225,59 @@ html.native-ios-mac .chat-dl-btn {
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
+.chat-supervision-status-run {
+  align-self: flex-start;
+  min-width: 0;
+  max-width: 100%;
+}
+.chat-supervision-status-run-toggle {
+  display: inline-flex;
+  max-width: 100%;
+  align-items: center;
+  box-sizing: border-box;
+  gap: 6px;
+  padding: 3px 8px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--supervision-heartbeat-border) 62%, var(--supervision-waiting-border));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--supervision-heartbeat-bg) 54%, var(--supervision-waiting-bg));
+  color: var(--chat-machine-chip-color);
+  font: inherit;
+  font-size: 10px;
+  line-height: 1.5;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.chat-supervision-status-run-toggle:hover,
+.chat-supervision-status-run-toggle:focus-visible {
+  border-color: var(--supervision-heartbeat-border);
+  filter: brightness(1.12);
+}
+.chat-supervision-status-run-part {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 3px;
+  font-weight: 650;
+}
+.chat-supervision-status-run-part.is-heartbeat { color: var(--supervision-heartbeat-text); }
+.chat-supervision-status-run-part.is-waiting { color: var(--supervision-waiting-text); }
+.chat-supervision-status-run-time {
+  overflow: hidden;
+  color: var(--chat-machine-chip-color);
+  opacity: 0.82;
+  text-overflow: ellipsis;
+}
+.chat-supervision-status-run-chevron { flex: none; opacity: 0.75; }
+.chat-supervision-status-run-details {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  margin-top: 5px;
+  padding-left: 8px;
+  border-left: 1px solid var(--chat-machine-chip-border);
+}
 
 .chat-cron-run {
   min-width: min(31rem, 78vw);

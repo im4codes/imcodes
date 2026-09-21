@@ -317,6 +317,15 @@
       "show_details": "Show supervision prompt details",
       "hide_details": "Hide supervision prompt details"
     },
+    "supervision_status_run": {
+      "heartbeats_one": "{{count}} heartbeat",
+      "heartbeats_other": "{{count}} heartbeats",
+      "waiting_one": "{{count}} waiting marker",
+      "waiting_other": "{{count}} waiting markers",
+      "expand": "Show repeated supervision status",
+      "collapse": "Hide repeated supervision status",
+      "aria": "{{status}}, {{timeRange}}. {{action}}"
+    },
     "delete_message": "Delete message",
     "delete_message_confirm": "Delete this message for everyone? This can't be undone.",
     "dpad": {

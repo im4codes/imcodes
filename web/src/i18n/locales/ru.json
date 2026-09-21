@@ -317,6 +317,15 @@
       "show_details": "Показать детали запроса супервизии",
       "hide_details": "Скрыть детали запроса супервизии"
     },
+    "supervision_status_run": {
+      "heartbeats_one": "{{count}} сигнал",
+      "heartbeats_other": "{{count}} сигналов",
+      "waiting_one": "{{count}} отметка ожидания",
+      "waiting_other": "{{count}} отметок ожидания",
+      "expand": "Показать повторяющиеся статусы контроля",
+      "collapse": "Скрыть повторяющиеся статусы контроля",
+      "aria": "{{status}}, {{timeRange}}. {{action}}"
+    },
     "delete_message": "Удалить сообщение",
     "delete_message_confirm": "Удалить это сообщение для всех? Это действие нельзя отменить.",
     "dpad": {

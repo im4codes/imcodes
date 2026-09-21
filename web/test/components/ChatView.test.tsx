@@ -4,7 +4,13 @@
 import { h } from 'preact';
 import { act, render, waitFor, cleanup, fireEvent, screen } from '@testing-library/preact';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
-import { ChatView, __clearChatLocalImagePreviewCacheForTests, formatChatDateTime } from '../../src/components/ChatView.js';
+import {
+  ChatView,
+  __buildViewItemsForTests,
+  __buildViewItemsTailForTests,
+  __clearChatLocalImagePreviewCacheForTests,
+  formatChatDateTime,
+} from '../../src/components/ChatView.js';
 import { DAEMON_USER_NOTICE_CODE } from '../../../shared/daemon-user-notices.js';
 import {
   SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
@@ -202,9 +208,19 @@ vi.mock('react-i18next', () => ({
         'chat.supervision_prompt.generic': 'Supervision automation',
         'chat.supervision_prompt.show_details': 'Show supervision prompt details',
         'chat.supervision_prompt.hide_details': 'Hide supervision prompt details',
+        'chat.supervision_status_run.heartbeats_one': '{{count}} heartbeat',
+        'chat.supervision_status_run.heartbeats_other': '{{count}} heartbeats',
+        'chat.supervision_status_run.waiting_one': '{{count}} waiting marker',
+        'chat.supervision_status_run.waiting_other': '{{count}} waiting markers',
+        'chat.supervision_status_run.expand': 'Show repeated supervision status',
+        'chat.supervision_status_run.collapse': 'Hide repeated supervision status',
+        'chat.supervision_status_run.summary': '{{heartbeats}} · {{waiting}} · {{timeRange}}',
         'chat.daemon_notice.supervision_human_input_blocker': '⚠️ Localized human-input blocker warning.',
       };
-      const template = translations[key] ?? key;
+      const pluralKey = typeof options?.count === 'number'
+        ? `${key}_${options.count === 1 ? 'one' : 'other'}`
+        : key;
+      const template = translations[pluralKey] ?? translations[key] ?? key;
       return template.replace(/\{\{(\w+)\}\}/g, (_, name) => String(options?.[name] ?? ''));
     },
   }),
@@ -454,6 +470,119 @@ describe('supervision automation prompt labels', () => {
     expect(disclosure.getAttribute('aria-expanded')).toBe('true');
     expect(container.querySelector('.chat-supervision-prompt-details')?.textContent).toBe(prompt);
     expect(disclosure.getAttribute('title')).toBe('Hide supervision prompt details');
+  });
+});
+
+describe('repeated supervision heartbeat and WAITING presentation', () => {
+  const heartbeat = (eventId: string, ts: number) => ({
+    eventId,
+    type: 'user.message',
+    ts,
+    payload: {
+      text: '[heartbeat contract]',
+      automation: true,
+      automationKind: SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND,
+    },
+  }) as any;
+  const marker = (eventId: string, ts: number, value = SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING) => ({
+    eventId,
+    type: 'assistant.text',
+    ts,
+    payload: { text: value, streaming: false },
+  }) as any;
+  const content = (eventId: string, ts: number, text = 'Real assistant content') => ({
+    eventId,
+    type: 'assistant.text',
+    ts,
+    payload: { text, streaming: false },
+  }) as any;
+
+  it('folds only consecutive heartbeat/marker-only WAITING rows and expands to the unchanged original chips', () => {
+    const events = [
+      heartbeat('h1', 1_700_000_000_001),
+      marker('w1', 1_700_000_000_002),
+      heartbeat('h2', 1_700_000_000_003),
+      content('answer', 1_700_000_000_004),
+      marker('needs-input', 1_700_000_000_005, SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT),
+      heartbeat('h3', 1_700_000_000_006),
+      marker('w2', 1_700_000_000_007),
+    ];
+    const { container } = render(
+      <ChatView events={events} loading={false} sessionId="deck_main_brain" />,
+    );
+
+    const summaries = container.querySelectorAll('.chat-supervision-status-run-toggle');
+    expect(summaries).toHaveLength(2);
+    expect(summaries[0]?.getAttribute('aria-expanded')).toBe('false');
+    expect(summaries[0]?.textContent).toContain('2 heartbeats');
+    expect(summaries[0]?.textContent).toContain('1 waiting marker');
+    expect(container.textContent).toContain('Real assistant content');
+    expect(container.querySelector('.chat-execution-status-chip.needs-input')).not.toBeNull();
+    expect(container.querySelectorAll('.chat-supervision-prompt-toggle')).toHaveLength(0);
+    expect(container.querySelectorAll('.chat-execution-status-chip.waiting')).toHaveLength(0);
+
+    (summaries[0] as HTMLButtonElement).focus();
+    fireEvent.click(summaries[0]);
+    expect(summaries[0]?.getAttribute('aria-expanded')).toBe('true');
+    expect(document.activeElement).toBe(summaries[0]);
+    expect(container.querySelectorAll('.chat-supervision-prompt-toggle')).toHaveLength(2);
+    expect(container.querySelectorAll('.chat-execution-status-chip.waiting')).toHaveLength(1);
+  });
+
+  it('forms and extends one run on live append without touching a singleton', () => {
+    const first = heartbeat('live-h1', 1_700_000_001_001);
+    const view = render(
+      <ChatView events={[first]} loading={false} sessionId="deck_main_brain" />,
+    );
+    expect(view.container.querySelector('.chat-supervision-status-run-toggle')).toBeNull();
+    expect(view.container.querySelector('.chat-supervision-prompt-toggle')).not.toBeNull();
+
+    view.rerender(
+      <ChatView
+        events={[first, marker('live-w1', 1_700_000_001_002)]}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+    const firstSummary = view.container.querySelector('.chat-supervision-status-run-toggle') as HTMLButtonElement;
+    expect(firstSummary).not.toBeNull();
+    fireEvent.click(firstSummary);
+    expect(firstSummary.getAttribute('aria-expanded')).toBe('true');
+
+    view.rerender(
+      <ChatView
+        events={[first, marker('live-w1', 1_700_000_001_002), heartbeat('live-h2', 1_700_000_001_003)]}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+    const summary = view.container.querySelector('.chat-supervision-status-run-toggle');
+    expect(summary).toBe(firstSummary);
+    expect(summary?.getAttribute('aria-expanded')).toBe('true');
+    expect(summary?.textContent).toContain('2 heartbeats');
+    expect(summary?.textContent).toContain('1 waiting marker');
+  });
+
+  it('keeps a 3000-event restored run as one bounded view item with the full count', () => {
+    const events = Array.from({ length: 3_000 }, (_, index) => (
+      index % 2 === 0
+        ? heartbeat(`bulk-h-${index}`, 1_700_001_000_000 + index)
+        : marker(`bulk-w-${index}`, 1_700_001_000_000 + index)
+    ));
+
+    const allItems = __buildViewItemsForTests(events, true);
+    expect(allItems).toHaveLength(1);
+    expect(allItems[0]).toMatchObject({
+      type: 'supervision-status-run',
+      heartbeatCount: 1_500,
+      waitingCount: 1_500,
+    });
+    expect((allItems[0] as any).statusItems).toHaveLength(3_000);
+
+    const tail = __buildViewItemsTailForTests(events, true, 100);
+    expect(tail.windowStartIndex).toBe(0);
+    expect(tail.items).toHaveLength(1);
+    expect(tail.items[0]).toMatchObject({ heartbeatCount: 1_500, waitingCount: 1_500 });
   });
 });
 

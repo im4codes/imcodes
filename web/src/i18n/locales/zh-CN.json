@@ -317,6 +317,15 @@
       "show_details": "展开监督提示详情",
       "hide_details": "收起监督提示详情"
     },
+    "supervision_status_run": {
+      "heartbeats_one": "{{count}} 次心跳",
+      "heartbeats_other": "{{count}} 次心跳",
+      "waiting_one": "{{count}} 个等待标记",
+      "waiting_other": "{{count}} 个等待标记",
+      "expand": "显示重复监督状态",
+      "collapse": "隐藏重复监督状态",
+      "aria": "{{status}}，{{timeRange}}。{{action}}"
+    },
     "delete_message": "删除消息",
     "delete_message_confirm": "为所有人删除此消息?此操作无法撤销。",
     "dpad": {

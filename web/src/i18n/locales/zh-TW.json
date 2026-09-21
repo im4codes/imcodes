@@ -317,6 +317,15 @@
       "show_details": "展開監督提示詳情",
       "hide_details": "收合監督提示詳情"
     },
+    "supervision_status_run": {
+      "heartbeats_one": "{{count}} 次心跳",
+      "heartbeats_other": "{{count}} 次心跳",
+      "waiting_one": "{{count}} 個等待標記",
+      "waiting_other": "{{count}} 個等待標記",
+      "expand": "顯示重複監督狀態",
+      "collapse": "隱藏重複監督狀態",
+      "aria": "{{status}}，{{timeRange}}。{{action}}"
+    },
     "delete_message": "刪除訊息",
     "delete_message_confirm": "為所有人刪除此訊息?此操作無法復原。",
     "dpad": {

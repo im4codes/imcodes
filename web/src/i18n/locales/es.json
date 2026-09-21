@@ -317,6 +317,15 @@
       "show_details": "Mostrar detalles del mensaje de supervisión",
       "hide_details": "Ocultar detalles del mensaje de supervisión"
     },
+    "supervision_status_run": {
+      "heartbeats_one": "{{count}} latido",
+      "heartbeats_other": "{{count}} latidos",
+      "waiting_one": "{{count}} marcador de espera",
+      "waiting_other": "{{count}} marcadores de espera",
+      "expand": "Mostrar estados de supervisión repetidos",
+      "collapse": "Ocultar estados de supervisión repetidos",
+      "aria": "{{status}}, {{timeRange}}. {{action}}"
+    },
     "delete_message": "Eliminar mensaje",
     "delete_message_confirm": "¿Eliminar este mensaje para todos? Esta acción no se puede deshacer.",
     "dpad": {
