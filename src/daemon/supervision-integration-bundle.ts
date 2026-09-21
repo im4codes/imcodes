@@ -61,7 +61,14 @@ interface BundleManifest {
 
 export type SupervisionIntegrationBundleResult<T> =
   | ({ ok: true } & T)
-  | { ok: false; reason: 'invalid' | 'unsafe_path' | 'source_mismatch' | 'hash_mismatch' | 'target_conflict' | 'unavailable'; path?: string };
+  | {
+    ok: false;
+    reason: 'invalid' | 'unsafe_path' | 'source_mismatch' | 'hash_mismatch' | 'target_conflict' | 'unavailable';
+    path?: string;
+    /** Bounded causal fingerprints for operator-facing conflict diagnostics. */
+    expected?: string;
+    actual?: string;
+  };
 
 function within(root: string, candidate: string): boolean {
   const rel = relative(root, candidate);
@@ -291,11 +298,75 @@ export function freezeSupervisionIntegrationBundle(input: {
   }
 }
 
+interface GitFileFingerprint {
+  sha256: string;
+  byteLength: number;
+  gitBlobOid: string;
+  mode: 0o644 | 0o755;
+}
+
+function fingerprintText(label: string, value: GitFileFingerprint | undefined): string {
+  return value
+    ? `${label}:git_blob=${value.gitBlobOid},sha256=${value.sha256},bytes=${value.byteLength},mode=${value.mode.toString(8)}`
+    : `${label}:absent`;
+}
+
+/**
+ * Ask Git's own attribute/filter machinery for the object identity that these
+ * materialized bytes would have if added at `path`. This is deliberately not
+ * an LF-only rewrite: .gitattributes may select text/eol or a repository
+ * filter, and Git remains the single authority for all of them.
+ */
+function gitFingerprintBytes(
+  worktreePath: string,
+  path: string,
+  bytes: Buffer,
+  mode: 0o644 | 0o755,
+): GitFileFingerprint | undefined {
+  const hashed = spawnSync('git', ['-C', worktreePath, 'hash-object', `--path=${path}`, '--stdin'], {
+    input: bytes, stdio: ['pipe', 'pipe', 'ignore'], encoding: 'utf8', maxBuffer: 1024 * 1024,
+  });
+  const gitBlobOid = typeof hashed.stdout === 'string' ? hashed.stdout.trim().toLowerCase() : '';
+  if (hashed.error || hashed.status !== 0 || !/^[a-f0-9]{40,64}$/.test(gitBlobOid)) return undefined;
+  return { sha256: sha256(bytes), byteLength: bytes.length, gitBlobOid, mode };
+}
+
+/** Return the exact clean-filtered bytes without adding an object to the repo. */
+function gitCleanFileState(
+  worktreePath: string,
+  path: string,
+  bytes: Buffer,
+  mode: 0o644 | 0o755,
+): GitFileState | undefined {
+  const objectDirectory = mkdtempSync(join(tmpdir(), 'imcodes-clean-objects-'));
+  try {
+    const env = { ...process.env, GIT_OBJECT_DIRECTORY: objectDirectory };
+    const hashed = spawnSync('git', [
+      '-C', worktreePath, 'hash-object', '-w', `--path=${path}`, '--stdin',
+    ], { input: bytes, stdio: ['pipe', 'pipe', 'ignore'], encoding: 'utf8', env, maxBuffer: 1024 * 1024 });
+    const gitBlobOid = typeof hashed.stdout === 'string' ? hashed.stdout.trim().toLowerCase() : '';
+    if (hashed.error || hashed.status !== 0 || !/^[a-f0-9]{40,64}$/.test(gitBlobOid)) return undefined;
+    const cleaned = spawnSync('git', ['-C', worktreePath, 'cat-file', 'blob', gitBlobOid], {
+      stdio: ['ignore', 'pipe', 'ignore'], env, maxBuffer: 16 * 1024 * 1024,
+    });
+    if (cleaned.error || cleaned.status !== 0 || !Buffer.isBuffer(cleaned.stdout)) return undefined;
+    return {
+      bytes: cleaned.stdout,
+      sha256: sha256(cleaned.stdout),
+      byteLength: cleaned.stdout.length,
+      gitBlobOid,
+      mode,
+    };
+  } finally {
+    rmSync(objectDirectory, { recursive: true, force: true });
+  }
+}
+
 function gitShowState(
   worktreePath: string,
   headSha: string,
   path: string,
-): { sha256: string; mode: 0o644 | 0o755 } | undefined {
+): GitFileFingerprint | undefined {
   const shown = spawnSync('git', ['-C', worktreePath, 'show', `${headSha}:${path}`], {
     stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024,
   });
@@ -304,15 +375,18 @@ function gitShowState(
     stdio: ['ignore', 'pipe', 'ignore'], encoding: 'utf8', maxBuffer: 1024 * 1024,
   });
   if (tree.error || tree.status !== 0) return undefined;
-  const mode = tree.stdout.trim().split(/\s+/, 1)[0];
-  if (mode !== '100644' && mode !== '100755') return undefined;
-  return { sha256: sha256(shown.stdout), mode: mode === '100755' ? 0o755 : 0o644 };
+  const parsed = /^(100644|100755)\s+blob\s+([a-f0-9]{40,64})(?:\s|\t)/.exec(tree.stdout.trim());
+  if (!parsed) return undefined;
+  return {
+    sha256: sha256(shown.stdout),
+    byteLength: shown.stdout.length,
+    gitBlobOid: parsed[2].toLowerCase(),
+    mode: parsed[1] === '100755' ? 0o755 : 0o644,
+  };
 }
 
-interface GitFileState {
+interface GitFileState extends GitFileFingerprint {
   bytes: Buffer;
-  sha256: string;
-  mode: 0o644 | 0o755;
 }
 
 function gitShowFileState(
@@ -329,7 +403,7 @@ function gitShowFileState(
 }
 
 function sameGitFileState(left: GitFileState | undefined, right: GitFileState | undefined): boolean {
-  return left?.sha256 === right?.sha256 && left?.mode === right?.mode;
+  return left?.gitBlobOid === right?.gitBlobOid && left?.mode === right?.mode;
 }
 
 function mergeFileMode(
@@ -352,6 +426,8 @@ function mergeFileMode(
  * unsupported/binary merge and therefore fails closed.
  */
 function mergeGitFileStates(
+  worktreePath: string,
+  path: string,
   base: GitFileState | undefined,
   ours: GitFileState | undefined,
   theirs: GitFileState | undefined,
@@ -374,21 +450,71 @@ function mergeGitFileStates(
       stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024,
     });
     if (merged.error || merged.status !== 0 || !Buffer.isBuffer(merged.stdout)) return null;
-    return { bytes: merged.stdout, sha256: sha256(merged.stdout), mode };
+    const fingerprint = gitFingerprintBytes(worktreePath, path, merged.stdout, mode);
+    return fingerprint ? { bytes: merged.stdout, ...fingerprint } : null;
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 }
 
-function targetFileState(path: string): { kind: 'absent' } | {
-  kind: 'file'; sha256: string; mode: 0o644 | 0o755;
+function targetFileState(worktreePath: string, path: string, repoPath: string): { kind: 'absent' } | {
+  kind: 'file'; fingerprint: GitFileFingerprint;
 } | { kind: 'unsafe' } {
   try {
     const info = lstatSync(path);
-    return info.isFile() && !info.isSymbolicLink()
-      ? { kind: 'file', sha256: fileSha256(path), mode: (info.mode & 0o111) === 0 ? 0o644 : 0o755 }
-      : { kind: 'unsafe' };
+    if (!info.isFile() || info.isSymbolicLink()) return { kind: 'unsafe' };
+    const mode = (info.mode & 0o111) === 0 ? 0o644 : 0o755;
+    const fingerprint = gitFingerprintBytes(worktreePath, repoPath, readFileSync(path), mode);
+    return fingerprint ? { kind: 'file', fingerprint } : { kind: 'unsafe' };
   } catch { return { kind: 'absent' }; }
+}
+
+function bundleFileFingerprint(
+  bundle: SupervisionIntegrationBundle,
+  worktreePath: string,
+  file: SupervisionIntegrationBundleFile,
+): GitFileFingerprint | undefined | null {
+  if (file.deleted === true) return undefined;
+  try {
+    const bytes = readFileSync(resolve(bundle.bundlePath, 'files', file.path));
+    if (sha256(bytes) !== file.sha256) return null;
+    return gitFingerprintBytes(worktreePath, file.path, bytes, file.mode!) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function sameFingerprint(
+  left: GitFileFingerprint | undefined,
+  right: GitFileFingerprint | undefined,
+): boolean {
+  return left?.gitBlobOid === right?.gitBlobOid && left?.mode === right?.mode;
+}
+
+export function compareSupervisionIntegrationBundleFile(input: {
+  bundle: SupervisionIntegrationBundle;
+  worktreePath: string;
+  file: SupervisionIntegrationBundleFile;
+}): SupervisionIntegrationBundleResult<{
+  matches: boolean;
+  expected: string;
+  actual: string;
+}> {
+  const absolute = resolve(input.worktreePath, input.file.path);
+  if (!within(resolve(input.worktreePath), absolute)) {
+    return { ok: false, reason: 'unsafe_path', path: input.file.path };
+  }
+  const desired = bundleFileFingerprint(input.bundle, input.worktreePath, input.file);
+  if (desired === null) return { ok: false, reason: 'hash_mismatch', path: input.file.path };
+  const state = targetFileState(input.worktreePath, absolute, input.file.path);
+  if (state.kind === 'unsafe') return { ok: false, reason: 'target_conflict', path: input.file.path };
+  const current = state.kind === 'file' ? state.fingerprint : undefined;
+  return {
+    ok: true,
+    matches: sameFingerprint(current, desired),
+    expected: fingerprintText('bundle', desired),
+    actual: fingerprintText('worktree', current),
+  };
 }
 
 function gitChangedPaths(worktreePath: string): string[] {
@@ -429,23 +555,30 @@ export function applySupervisionIntegrationBundle(input: {
   } catch { return { ok: false, reason: 'unavailable' }; }
   const preflight: Array<{
     file: SupervisionIntegrationBundleFile;
-    current?: { sha256: string; mode: 0o644 | 0o755 };
-    baseline?: { sha256: string; mode: 0o644 | 0o755 };
+    desired?: GitFileFingerprint;
+    current?: GitFileFingerprint;
+    baseline?: GitFileFingerprint;
   }> = [];
   for (const file of input.bundle.files) {
     const absolute = resolve(worktreePath, file.path);
     if (!within(worktreePath, absolute)) return { ok: false, reason: 'unsafe_path', path: file.path };
-    const state = targetFileState(absolute);
+    const state = targetFileState(worktreePath, absolute, file.path);
     if (state.kind === 'unsafe') return { ok: false, reason: 'target_conflict', path: file.path };
-    const current = state.kind === 'file' ? { sha256: state.sha256, mode: state.mode } : undefined;
+    const current = state.kind === 'file' ? state.fingerprint : undefined;
     const baseline = gitShowState(worktreePath, input.bundle.headSha, file.path);
-    const desired = file.deleted === true ? undefined : { sha256: file.sha256!, mode: file.mode! };
-    if (JSON.stringify(current) !== JSON.stringify(desired)) replay = false;
-    if (JSON.stringify(current) !== JSON.stringify(desired)
-      && JSON.stringify(current) !== JSON.stringify(baseline)) {
-      return { ok: false, reason: 'target_conflict', path: file.path };
+    const desired = bundleFileFingerprint(input.bundle, worktreePath, file);
+    if (desired === null) return { ok: false, reason: 'hash_mismatch', path: file.path };
+    if (!sameFingerprint(current, desired)) replay = false;
+    if (!sameFingerprint(current, desired) && !sameFingerprint(current, baseline)) {
+      return {
+        ok: false,
+        reason: 'target_conflict',
+        path: file.path,
+        expected: `${fingerprintText('baseline', baseline)};${fingerprintText('bundle', desired)}`,
+        actual: fingerprintText('worktree', current),
+      };
     }
-    preflight.push({ file, current, baseline });
+    preflight.push({ file, desired, current, baseline });
   }
   if (replay) return { ok: true, replay: true };
 
@@ -466,17 +599,18 @@ export function applySupervisionIntegrationBundle(input: {
       }
       chmodSync(temporary, file.mode!);
       renameSync(temporary, absolute);
-      const written = targetFileState(absolute);
-      if (written.kind !== 'file' || written.sha256 !== file.sha256 || written.mode !== file.mode) {
+      const written = targetFileState(worktreePath, absolute, file.path);
+      const desired = bundleFileFingerprint(input.bundle, worktreePath, file);
+      if (desired === null || written.kind !== 'file' || !sameFingerprint(written.fingerprint, desired)) {
         return { ok: false, reason: 'hash_mismatch', path: file.path };
       }
     }
     for (const file of input.bundle.files) {
-      const state = targetFileState(resolve(worktreePath, file.path));
+      const state = targetFileState(worktreePath, resolve(worktreePath, file.path), file.path);
       if (state.kind === 'unsafe') return { ok: false, reason: 'target_conflict', path: file.path };
-      const actual = state.kind === 'file' ? { sha256: state.sha256, mode: state.mode } : undefined;
-      const expected = file.deleted === true ? undefined : { sha256: file.sha256!, mode: file.mode! };
-      if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      const actual = state.kind === 'file' ? state.fingerprint : undefined;
+      const expected = bundleFileFingerprint(input.bundle, worktreePath, file);
+      if (expected === null || !sameFingerprint(actual, expected)) {
         return { ok: false, reason: 'hash_mismatch', path: file.path };
       }
     }
@@ -532,9 +666,17 @@ export function verifySupervisionIntegrationCommit(input: {
     const actual = gitShowFileState(worktreePath, commitSha, file.path);
     const base = gitShowFileState(worktreePath, input.bundle.headSha, file.path);
     const ours = gitShowFileState(worktreePath, parentSha, file.path);
+    const bundleState = file.deleted === true ? undefined : (() => {
+      try {
+        const bytes = readFileSync(resolve(input.bundle.bundlePath, 'files', file.path));
+        if (sha256(bytes) !== file.sha256) return null;
+        return gitCleanFileState(worktreePath, file.path, bytes, file.mode!) ?? null;
+      } catch { return null; }
+    })();
+    if (bundleState === null) return { ok: false, reason: 'hash_mismatch', path: file.path };
     const exactBundleState = file.deleted === true
       ? actual === undefined
-      : actual?.sha256 === file.sha256 && actual?.mode === file.mode;
+      : sameGitFileState(actual, bundleState);
     // A divergent result is admissible only when the destination actually
     // moved this exact path after the frozen base. Otherwise the immutable
     // bundle byte remains the sole authority.
@@ -542,14 +684,7 @@ export function verifySupervisionIntegrationCommit(input: {
       if (exactBundleState) continue;
       return { ok: false, reason: 'hash_mismatch', path: file.path };
     }
-    const theirs = file.deleted === true ? undefined : (() => {
-      try {
-        const bytes = readFileSync(resolve(input.bundle.bundlePath, 'files', file.path));
-        return { bytes, sha256: sha256(bytes), mode: file.mode! };
-      } catch { return null; }
-    })();
-    if (theirs === null) return { ok: false, reason: 'hash_mismatch', path: file.path };
-    const expected = mergeGitFileStates(base, ours, theirs);
+    const expected = mergeGitFileStates(worktreePath, file.path, base, ours, bundleState);
     if (expected === null || !sameGitFileState(actual, expected)) {
       return { ok: false, reason: 'hash_mismatch', path: file.path };
     }

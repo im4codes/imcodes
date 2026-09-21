@@ -160,7 +160,10 @@ import {
   inspectSupervisionAssignmentWorktree,
   resolveSupervisionAssignmentWorktree,
 } from './supervision-worktree-inspector.js';
-import { verifySupervisionIntegrationCommit } from './supervision-integration-bundle.js';
+import {
+  compareSupervisionIntegrationBundleFile,
+  verifySupervisionIntegrationCommit,
+} from './supervision-integration-bundle.js';
 import {
   parseSupervisionIntegrationRemoteRef,
   validateSupervisionIntegrationEvidence,
@@ -2628,18 +2631,43 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
           code: 'bundle_mismatch', field: 'bundle', expected: 'available safe worktree', actual: inspected.reason,
         }]);
       }
-      const files = new Map(inspected.snapshot.files.map((file) => [file.path, file]));
-      const mismatch = task.integrationBundle.files.find((file) => {
-        const actual = files.get(file.path);
-        return file.deleted === true
-          ? actual?.deleted !== true
-          : actual?.sha256 !== file.sha256 || actual?.deleted === true;
+      const ownerWorktreePath = resolveSupervisionAssignmentWorktree({
+        sessionName: owner.identity.sessionName,
+        assignmentId: owner.assignmentId,
       });
+      let mismatch: {
+        path: string;
+        expected: string;
+        actual: string;
+      } | undefined;
+      for (const file of task.integrationBundle.files) {
+        const compared = compareSupervisionIntegrationBundleFile({
+          bundle: task.integrationBundle,
+          worktreePath: ownerWorktreePath,
+          file,
+        });
+        if (!compared.ok) {
+          mismatch = {
+            path: file.path,
+            expected: `bundle:${compared.reason}`,
+            actual: 'worktree:unavailable',
+          };
+          break;
+        }
+        if (!compared.matches) {
+          mismatch = { path: file.path, expected: compared.expected, actual: compared.actual };
+          break;
+        }
+      }
       if (inspected.snapshot.headSha !== task.integrationBundle.headSha || mismatch) {
         return integrationRefusal('integration_preflight', [{
           code: 'bundle_mismatch', field: 'bundle',
-          expected: `${task.integrationBundle.headSha}:${mismatch?.path ?? 'exact manifest'}`,
-          actual: `${inspected.snapshot.headSha}:${mismatch?.path ?? 'head mismatch'}`,
+          expected: mismatch
+            ? `${task.integrationBundle.headSha}:${mismatch.path}:${mismatch.expected}`
+            : `${task.integrationBundle.headSha}:exact manifest`,
+          actual: mismatch
+            ? `${inspected.snapshot.headSha}:${mismatch.path}:${mismatch.actual}`
+            : `${inspected.snapshot.headSha}:head mismatch`,
         }]);
       }
       const authoritativeManifest = task.integrationBundle.files.flatMap((file) => (

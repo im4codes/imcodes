@@ -4707,8 +4707,11 @@ export async function dispatchReadyIntegration(
       worktreePath: ensured.worktreePath,
     });
     if (!applied.ok) {
+      const fingerprints = applied.expected || applied.actual
+        ? ` (${[applied.expected, applied.actual].filter(Boolean).join(' vs ')})`
+        : '';
       return blockedAfterOwner(
-        `integration bundle apply rejected: ${applied.reason}${applied.path ? `:${applied.path}` : ''}`,
+        `integration bundle apply rejected: ${applied.reason}${applied.path ? `:${applied.path}` : ''}${fingerprints}`,
       );
     }
     integrationWorktree = ensured.worktreePath;

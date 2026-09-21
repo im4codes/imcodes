@@ -2,12 +2,13 @@ import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { createRequire } from 'node:module';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
   applySupervisionIntegrationBundle,
+  compareSupervisionIntegrationBundleFile,
   freezeSupervisionIntegrationBundle,
   verifySupervisionIntegrationCommit,
   verifySupervisionIntegrationBundle,
@@ -70,6 +71,81 @@ async function productionShape() {
 }
 
 describe('immutable supervision integration bundle', () => {
+  it('uses Git attribute-normalized identity for CRLF preflight, apply, and finalization', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'imcodes-crlf-integration-'));
+    roots.push(root);
+    const source = join(root, 'source');
+    const implementer = join(root, 'implementer', 'repo');
+    const integration = join(root, 'integration', 'repo');
+    const conflict = join(root, 'conflict', 'repo');
+    const bundleRoot = join(root, 'bundles');
+    execFileSync('mkdir', ['-p', join(source, 'scripts')]);
+    git(source, 'init', '-q');
+    git(source, 'config', 'user.email', 'tests@example.com');
+    git(source, 'config', 'user.name', 'Tests');
+    writeFileSync(join(source, '.gitattributes'), '*.ps1 text eol=crlf\n');
+    writeFileSync(join(source, 'scripts/build.ps1'), 'Write-Output "base"\n');
+    writeFileSync(join(source, 'scripts/read-only.ps1'), 'Write-Output "base-mode"\n');
+    git(source, 'add', '.');
+    git(source, 'commit', '-qm', 'base');
+    const base = git(source, 'rev-parse', 'HEAD');
+    execFileSync('mkdir', ['-p', dirname(implementer), dirname(integration), dirname(conflict)]);
+    git(source, 'worktree', 'add', '--detach', implementer, base);
+    git(source, 'worktree', 'add', '--detach', integration, base);
+    git(source, 'worktree', 'add', '--detach', conflict, base);
+
+    writeFileSync(join(implementer, 'scripts/build.ps1'), 'Write-Output "after"\r\n');
+    writeFileSync(join(implementer, 'scripts/read-only.ps1'), 'Write-Output "after-mode"\r\n');
+    chmodSync(join(implementer, 'scripts/read-only.ps1'), 0o444);
+    writeFileSync(join(implementer, 'scripts/added.ps1'), 'Write-Output "added"\r\n');
+    const inspected = await inspectSupervisionAssignmentWorktree({
+      sessionName: 'deck_crlf_worker', assignmentId: 'asg_crlf', worktreePath: implementer,
+    });
+    if (!inspected.ok) throw new Error(inspected.reason);
+    const frozen = freezeSupervisionIntegrationBundle({
+      taskId: 'tsk_crlf', assignmentId: 'asg_crlf', revision: 'crlf-r1',
+      snapshot: inspected.snapshot,
+      scopeFiles: inspected.snapshot.files.map((file) => file.path),
+      bundleRoot,
+    });
+    if (!frozen.ok) throw new Error(frozen.reason);
+
+    // Frozen objects are read-only, while their manifest keeps the durable Git
+    // 100644/100755 mode independently of host write permission bits.
+    expect(statSync(join(frozen.bundle.bundlePath, 'files/scripts/read-only.ps1')).mode & 0o777).toBe(0o400);
+    expect(frozen.bundle.files.find((file) => file.path === 'scripts/read-only.ps1')?.mode).toBe(0o644);
+
+    expect(applySupervisionIntegrationBundle({
+      bundle: frozen.bundle, worktreePath: integration,
+    })).toEqual({ ok: true, replay: false });
+    for (const file of frozen.bundle.files) {
+      expect(compareSupervisionIntegrationBundleFile({
+        bundle: frozen.bundle, worktreePath: integration, file,
+      })).toMatchObject({ ok: true, matches: true });
+    }
+    expect(readFileSync(join(integration, 'scripts/added.ps1'), 'utf8')).toContain('added');
+
+    git(integration, 'config', 'user.email', 'tests@example.com');
+    git(integration, 'config', 'user.name', 'Tests');
+    git(integration, 'add', '-A');
+    git(integration, 'commit', '-qm', 'integrate normalized bundle');
+    const commitSha = git(integration, 'rev-parse', 'HEAD');
+    expect(verifySupervisionIntegrationCommit({
+      bundle: frozen.bundle, worktreePath: integration, commitSha,
+    })).toEqual({ ok: true });
+
+    writeFileSync(join(conflict, 'scripts/build.ps1'), 'Write-Output "genuine divergence"\r\n');
+    expect(applySupervisionIntegrationBundle({
+      bundle: frozen.bundle, worktreePath: conflict,
+    })).toMatchObject({
+      ok: false,
+      reason: 'target_conflict',
+      path: 'scripts/build.ps1',
+      expected: expect.stringContaining('git_blob='),
+      actual: expect.stringContaining('bytes='),
+    });
+  });
+
   it('applies a bundle that includes an unchanged scope file without stranding its integration owner', async () => {
     const shape = await productionShape();
     const unchanged = { path: 'test/unchanged.test.ts', sha256: sha('already-desired\n') };
@@ -268,7 +344,7 @@ describe('immutable supervision integration bundle', () => {
     writeFileSync(join(shape.integration, 'test/a.test.ts'), 'unrelated-owner-change\n');
     expect(applySupervisionIntegrationBundle({
       bundle: first.bundle, worktreePath: shape.integration,
-    })).toEqual({ ok: false, reason: 'target_conflict', path: 'test/a.test.ts' });
+    })).toMatchObject({ ok: false, reason: 'target_conflict', path: 'test/a.test.ts' });
 
     chmodSync(join(first.bundle.bundlePath, 'files/test/a.test.ts'), 0o600);
     writeFileSync(join(first.bundle.bundlePath, 'files/test/a.test.ts'), 'tampered\n');
