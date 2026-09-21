@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { type ChildProcessByStdio, spawn } from 'node:child_process';
 import type { Readable, Writable } from 'node:stream';
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import {
   REMOTE_DESKTOP_MSG,
@@ -25,6 +25,11 @@ import { REMOTE_DESKTOP_LINUX_WORKER_FILENAME } from '../../shared/remote-deskto
 import { RemoteDesktopWorkerHostCore } from './remote-desktop-worker-host-core.js';
 import type { ControlledNodeRemoteDesktopWorker } from './runtime.js';
 import logger from '../util/logger.js';
+import {
+  X11_SOCKET_DIR,
+  accessibleX11DisplayNumbers,
+  listX11DisplayNumbers,
+} from './linux-x11-display.js';
 
 /**
  * A real, standalone native worker binary (native/linux-remote-desktop/
@@ -50,9 +55,6 @@ export function resolveLinuxRemoteDesktopWorkerPath(execPath: string = process.e
   return join(dirname(execPath), ...WORKER_SIDECAR_RELATIVE_PATH);
 }
 
-/** Matches an X11 abstract/unix socket name in /tmp/.X11-unix, e.g. "X99". */
-const X11_SOCKET_NAME_PATTERN = /^X(\d+)$/;
-const X11_SOCKET_DIR = '/tmp/.X11-unix';
 /**
  * scripts/install-linux-desktop-environment.sh's own default (--display
  * defaults to ":99"), used only when nothing live is found on disk -- this
@@ -82,21 +84,18 @@ const DEFAULT_X11_DISPLAY = ':99';
 export function resolveWorkerDisplayEnv(
   env: NodeJS.ProcessEnv = process.env,
   socketDir: string = X11_SOCKET_DIR,
+  accessible: readonly number[] | undefined = accessibleX11DisplayNumbers(socketDir),
 ): NodeJS.ProcessEnv {
   if (typeof env.DISPLAY === 'string' && env.DISPLAY.length > 0) return env;
-  let entries: string[];
-  try {
-    entries = readdirSync(socketDir);
-  } catch {
-    entries = [];
-  }
-  const numbers = entries
-    .map((name) => X11_SOCKET_NAME_PATTERN.exec(name)?.[1])
-    .filter((value): value is string => value !== undefined)
-    .map(Number)
-    .filter((value) => Number.isSafeInteger(value) && value >= 0)
-    .sort((a, b) => a - b);
-  const display = numbers.length > 0 ? `:${numbers[0]}` : DEFAULT_X11_DISPLAY;
+  const numbers = listX11DisplayNumbers(socketDir);
+  // Prefer a display the worker can really open. The lowest-numbered socket
+  // is often the login greeter's Xwayland, which rejects it; picking that
+  // leaves a session stuck connecting even though a working virtual display
+  // is running. With nothing probed yet, or nothing openable, keep the
+  // previous lowest-socket choice so this is never worse than before.
+  const usable = accessible === undefined ? [] : numbers.filter((number) => accessible.includes(number));
+  const chosen = usable.length > 0 ? usable[0] : numbers[0];
+  const display = chosen !== undefined ? `:${chosen}` : DEFAULT_X11_DISPLAY;
   return { ...env, DISPLAY: display };
 }
 

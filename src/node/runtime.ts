@@ -128,6 +128,7 @@ import {
   type WorkerConsentInboundFrame,
 } from './remote-desktop-consent-ipc.js';
 import type { WorkerPrivacyInboundFrame } from './remote-desktop-privacy-ipc.js';
+import { refreshX11DisplayProbe, x11DisplayProbeIsStale } from './linux-x11-display.js';
 import {
   linuxDesktopProvisionSupported,
   linuxGraphicalDisplayAvailable,
@@ -456,6 +457,23 @@ export function createControlledNodeRuntime(
   let linuxDesktopMissing = false;
   let linuxDesktopProvisionInFlight = false;
   /**
+   * A display socket is not a usable display (a Wayland desktop's or login
+   * greeter's Xwayland rejects the worker), so on Linux the node probes each
+   * socket and re-publishes when the set of openable displays changes. The
+   * injected test seam is hermetic and never probes the real machine.
+   */
+  const linuxDisplayProbeEnabled = platform === 'linux' && !options.linuxDesktop;
+  const refreshLinuxDisplayProbe = (): void => {
+    if (!linuxDisplayProbeEnabled || !x11DisplayProbeIsStale()) return;
+    void refreshX11DisplayProbe().then((changed) => {
+      if (!changed) return;
+      refreshRemoteDesktopCapabilityState();
+      republishCapabilitiesIfChanged();
+    }).catch((error) => {
+      logger.warn({ err: error }, 'linux X11 display probe failed');
+    });
+  };
+  /**
    * Set once this node's worker has become available at least once.
    *
    * The 30s retry below exists to recover a start that FAILED (the usual cause
@@ -504,6 +522,7 @@ export function createControlledNodeRuntime(
   let macosRemoteDesktopProvenAdapterCapabilities: readonly RemoteDesktopAdapterCapability[] = [];
 
   const refreshRemoteDesktopCapabilityState = (): void => {
+    refreshLinuxDisplayProbe();
     let remoteDesktopWorkerAvailableNow = false;
     try {
       remoteDesktopWorkerAvailableNow = remoteDesktopWorker.available();

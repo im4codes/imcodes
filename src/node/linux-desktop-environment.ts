@@ -11,13 +11,17 @@
  * two copies to drift apart.
  */
 import { execFile } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import desktopEnvironmentScript from '../../scripts/install-linux-desktop-environment.sh?raw';
+import {
+  X11_SOCKET_DIR,
+  accessibleX11DisplayNumbers,
+  listX11DisplayNumbers,
+} from './linux-x11-display.js';
 
-const X11_SOCKET_DIR = '/tmp/.X11-unix';
 /** apt, a full XFCE install and the session start can take a while on a slow mirror. */
 const PROVISION_TIMEOUT_MS = 30 * 60 * 1000;
 const OUTPUT_TAIL_BYTES = 4096;
@@ -34,13 +38,19 @@ export type LinuxDesktopProvisionResult =
   | { ok: true; user: string }
   | { ok: false; reason: LinuxDesktopProvisionFailure; detail?: string };
 
-/** Is any X server listening on this box? (The worker looks for the same sockets.) */
+/**
+ * Is there an X server the worker can actually use? A socket alone is not
+ * enough: a Wayland desktop or login greeter only exposes an Xwayland that
+ * rejects the worker, so it must not count as a display (the node would then
+ * advertise a remote desktop that never connects instead of offering the
+ * virtual desktop that works). Until the node has probed the sockets
+ * (refreshX11DisplayProbe), fall back to "a socket exists".
+ */
 export function linuxGraphicalDisplayAvailable(socketDir = X11_SOCKET_DIR): boolean {
-  try {
-    return readdirSync(socketDir).some((name) => /^X\d+$/.test(name));
-  } catch {
-    return false;
-  }
+  const sockets = listX11DisplayNumbers(socketDir);
+  if (sockets.length === 0) return false;
+  const accessible = accessibleX11DisplayNumbers(socketDir);
+  return accessible === undefined || sockets.some((number) => accessible.includes(number));
 }
 
 /** The installer is apt-based (Debian/Ubuntu). */
