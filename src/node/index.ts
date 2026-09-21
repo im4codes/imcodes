@@ -22,7 +22,10 @@ import {
   applyRemoteDesktopAccessPaused,
   loadRemoteDesktopAccessPaused,
 } from './remote-desktop-access-state.js';
-import { startRemoteDesktopLocalPanel } from './remote-desktop-local-panel.js';
+import {
+  remoteDesktopManagementUrl,
+  startRemoteDesktopLocalPanel,
+} from './remote-desktop-local-panel.js';
 import { startAideskLocalIpcServer } from './aidesk-local-ipc-server.js';
 import {
   ensureAideskDesktopEntry,
@@ -297,6 +300,16 @@ async function main(): Promise<void> {
   const localIpc = bootstrap.credential.nodeId
     ? await startAideskLocalIpcServer({
       publicNodeId: bootstrap.credential.nodeId,
+      managementUrl: remoteDesktopManagementUrl(
+        bootstrap.credential.serverUrl,
+        bootstrap.credential.nodeId,
+        'manage',
+      ),
+      shareUrl: remoteDesktopManagementUrl(
+        bootstrap.credential.serverUrl,
+        bootstrap.credential.nodeId,
+        'share',
+      ),
       runtimeVersion: DAEMON_VERSION,
       productVersion: DAEMON_VERSION,
       status: () => runtime.remoteDesktopAccessStatus(),

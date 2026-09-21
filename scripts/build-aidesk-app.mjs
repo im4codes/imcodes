@@ -28,6 +28,7 @@ export const AIDESK_APP_NAME = product.macosAppName;
 export const AIDESK_BUNDLE_ID = product.macosBundleId;
 export const AIDESK_MAIN_EXECUTABLE = 'aidesk-agent';
 export const AIDESK_COMPUTER_USE_EXECUTABLE = 'OpenComputerUse';
+export const AIDESK_LOCAL_UI_EXECUTABLE = product.localUiExecutableName;
 
 /**
  * Where the bundle's helpers live.
@@ -109,6 +110,8 @@ ${body}
 export function aideskSigningOrder(bundlePath) {
   return Object.freeze([
     join(bundlePath, 'Contents', AIDESK_HELPERS_DIR, AIDESK_COMPUTER_USE_EXECUTABLE),
+    ...(existsSync(join(bundlePath, 'Contents', AIDESK_HELPERS_DIR, AIDESK_LOCAL_UI_EXECUTABLE))
+      ? [join(bundlePath, 'Contents', AIDESK_HELPERS_DIR, AIDESK_LOCAL_UI_EXECUTABLE)] : []),
     join(bundlePath, 'Contents', 'MacOS', AIDESK_MAIN_EXECUTABLE),
     bundlePath,
   ]);
@@ -378,6 +381,12 @@ export async function buildAideskApp(input) {
   buildAideskAgent(join(macos, AIDESK_MAIN_EXECUTABLE), minimumSystemVersion);
   // Into Helpers, which is where the dispatcher looks.
   extractComputerUseExecutable(computerUseArchive, join(helpers, AIDESK_COMPUTER_USE_EXECUTABLE));
+  const localUiExecutable = input.localUiExecutable
+    ?? process.env.AIDESK_LOCAL_UI_EXECUTABLE?.trim();
+  if (localUiExecutable) {
+    if (!existsSync(localUiExecutable)) throw new Error(`aiDesk local UI not found: ${localUiExecutable}`);
+    cpSync(localUiExecutable, join(helpers, AIDESK_LOCAL_UI_EXECUTABLE));
+  }
   copyComputerUseLicense(join(bundlePath, 'Contents', 'Resources', AIDESK_THIRD_PARTY_LICENSE));
   copyAideskBrandLogo(bundlePath);
   signAideskApp(bundlePath);

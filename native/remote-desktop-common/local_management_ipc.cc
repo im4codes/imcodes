@@ -14,6 +14,7 @@ namespace {
 
 constexpr std::size_t kMaximumTokenBytes = 256;
 constexpr std::size_t kMaximumLabelBytes = 256;
+constexpr std::size_t kMaximumUrlBytes = 2048;
 constexpr std::size_t kMaximumVersionBytes = 128;
 constexpr std::size_t kMaximumConnections = 256;
 
@@ -124,7 +125,8 @@ bool ParseConnection(const Json::Value& value,
 bool ParseSnapshot(const Json::Value& root, LocalManagementSnapshot* output) {
   if (!HasExactKeys(root, {"type", "protocolVersion", "revision",
                            "publicNodeId", "serviceState", "accessState",
-                           "paused", "connections"}) ||
+                           "paused", "managementUrl", "shareUrl",
+                           "connections"}) ||
       root["type"].asString() != kLocalManagementSnapshotType ||
       !root["protocolVersion"].isUInt() ||
       root["protocolVersion"].asUInt() != kLocalManagementProtocolVersion ||
@@ -132,6 +134,10 @@ bool ParseSnapshot(const Json::Value& root, LocalManagementSnapshot* output) {
       !ReadSafeToken(root, "publicNodeId", &output->public_node_id) ||
       !root["serviceState"].isString() ||
       !root["accessState"].isString() || !root["paused"].isBool() ||
+      !ReadSafeString(root, "managementUrl", kMaximumUrlBytes,
+                      &output->management_url) ||
+      !ReadSafeString(root, "shareUrl", kMaximumUrlBytes,
+                      &output->share_url) ||
       !root["connections"].isArray() ||
       root["connections"].size() > kMaximumConnections) {
     return false;
@@ -165,6 +171,8 @@ bool SameSnapshot(const LocalManagementSnapshot& left,
       left.public_node_id != right.public_node_id ||
       left.service_state != right.service_state ||
       left.access_state != right.access_state || left.paused != right.paused ||
+      left.management_url != right.management_url ||
+      left.share_url != right.share_url ||
       left.connections.size() != right.connections.size()) {
     return false;
   }
@@ -261,6 +269,30 @@ std::optional<std::string> EncodeLocalManagementFrame(std::string_view json) {
   AppendBigEndianLength(static_cast<std::uint32_t>(json.size()), &frame);
   frame.append(json);
   return frame;
+}
+
+std::optional<LocalManagementBootstrap> ParseLocalManagementBootstrap(
+    std::string_view json) {
+  Json::Value root;
+  if (!imcodes::rd::ParseJson(std::string(json), &root) ||
+      !HasExactKeys(root, {"version", "protocolVersion", "endpoint",
+                           "bootstrapSecret", "runtimeVersion",
+                           "productVersion"}) ||
+      !root["version"].isUInt() || root["version"].asUInt() != 1 ||
+      !root["protocolVersion"].isUInt() ||
+      root["protocolVersion"].asUInt() != kLocalManagementProtocolVersion) {
+    return std::nullopt;
+  }
+  LocalManagementBootstrap output;
+  if (!ReadSafeString(root, "endpoint", 4096, &output.endpoint) ||
+      !ReadSafeToken(root, "bootstrapSecret", &output.bootstrap_secret) ||
+      !ReadSafeString(root, "runtimeVersion", kMaximumVersionBytes,
+                      &output.runtime_version) ||
+      !ReadSafeString(root, "productVersion", kMaximumVersionBytes,
+                      &output.product_version)) {
+    return std::nullopt;
+  }
+  return output;
 }
 
 LocalManagementClientCore::LocalManagementClientCore(

@@ -25,11 +25,14 @@ ARTIFACT_ROOT=""
 WORKER_VERSION=""
 JOBS="$(nproc 2>/dev/null || echo 4)"
 RUN_NATIVE_TESTS=0
+FLTK_ROOT=""
+JSONCPP_ROOT=""
 
 usage() {
   cat >&2 <<'USAGE'
 usage: build-worker-from-sdk.sh --sdk-root DIR --artifact-root DIR
                                 --worker-version X.Y.Z [--jobs N] [--run-native-tests]
+                                [--fltk-root DIR --jsoncpp-root DIR]
 
   --sdk-root           Extracted linux-x64 libwebrtc SDK (install-libwebrtc-sdk.mjs --target linux-x64).
   --artifact-root      Directory the worker binary + manifest are written into. Created if missing.
@@ -48,6 +51,8 @@ while [[ $# -gt 0 ]]; do
     --worker-version) WORKER_VERSION="${2:-}"; shift 2 ;;
     --jobs) JOBS="${2:-}"; shift 2 ;;
     --run-native-tests) RUN_NATIVE_TESTS=1; shift ;;
+    --fltk-root) FLTK_ROOT="${2:-}"; shift 2 ;;
+    --jsoncpp-root) JSONCPP_ROOT="${2:-}"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; usage ;;
   esac
 done
@@ -219,3 +224,11 @@ PYEOF
 
 echo "wrote $WORKER_PATH ($SIZE_BYTES bytes, sha256=$SHA256)" >&2
 echo "wrote $MANIFEST_PATH" >&2
+
+if [[ -n "$FLTK_ROOT" || -n "$JSONCPP_ROOT" ]]; then
+  [[ -n "$FLTK_ROOT" && -n "$JSONCPP_ROOT" ]] \
+    || { echo '--fltk-root and --jsoncpp-root must be supplied together' >&2; exit 2; }
+  "$REPOSITORY_ROOT/native/aidesk-ui/build-ui.sh" \
+    --fltk-root "$FLTK_ROOT" --jsoncpp-root "$JSONCPP_ROOT" \
+    --artifact-root "$ARTIFACT_ROOT/aidesk-ui" --jobs "$JOBS"
+fi

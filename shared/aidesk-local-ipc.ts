@@ -83,6 +83,8 @@ export interface AideskLocalIpcSnapshot {
   serviceState: AideskLocalIpcServiceState;
   accessState: AideskLocalIpcAccessState;
   paused: boolean;
+  managementUrl: string;
+  shareUrl: string;
   connections: readonly AideskLocalIpcConnection[];
 }
 

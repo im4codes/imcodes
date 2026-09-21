@@ -8,7 +8,9 @@ param(
   [string]$CodeSigningTimestampUrl = 'http://timestamp.digicert.com',
   [switch]$RequireAuthenticodeSignature,
   [switch]$RunNativeTests,
-  [switch]$CompileAndTestOnly
+  [switch]$CompileAndTestOnly,
+  [string]$FltkRoot = '',
+  [string]$JsoncppRoot = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -356,6 +358,17 @@ try {
     ($Manifest | ConvertTo-Json -Depth 4),
     (New-Object Text.UTF8Encoding($false)))
   Write-Output "worker=$Artifact"
+  if (-not [string]::IsNullOrWhiteSpace($FltkRoot) -or
+      -not [string]::IsNullOrWhiteSpace($JsoncppRoot)) {
+    if ([string]::IsNullOrWhiteSpace($FltkRoot) -or
+        [string]::IsNullOrWhiteSpace($JsoncppRoot)) {
+      throw 'FltkRoot and JsoncppRoot must be supplied together'
+    }
+    & (Join-Path $RepositoryRoot 'native\aidesk-ui\build-ui.ps1') `
+      -FltkRoot $FltkRoot -JsoncppRoot $JsoncppRoot `
+      -ArtifactRoot (Join-Path $ArtifactRoot 'aidesk-ui')
+    if ($LASTEXITCODE -ne 0) { throw 'aiDesk UI build failed' }
+  }
 } finally {
   Remove-Item -Recurse -Force -LiteralPath $BuildRoot -ErrorAction SilentlyContinue
 }

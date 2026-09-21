@@ -19,6 +19,7 @@ import { tmpdir } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
   AIDESK_LINUX_DESKTOP_FILE_NAME,
+  AIDESK_LOCAL_UI_EXECUTABLE_NAME,
   AIDESK_MACOS_APP_NAME,
   AIDESK_PRODUCT_NAME,
   AIDESK_WINDOWS_SHORTCUT_FILE_NAME,
@@ -308,15 +309,19 @@ export async function ensureAideskDesktopEntry(platform = process.platform): Pro
     const user = pickLinuxDesktopUserProfile(passwd);
     if (!user) return 'unavailable';
     const iconPath = resolve(dirname(process.execPath), 'imcodes-robot-avatar.png');
+    const nativeUi = resolveAideskLocalUiExecutable(platform);
     return ensureLinuxAideskDesktopEntry({
       ...user,
-      executablePath: process.execPath,
+      executablePath: existsSync(nativeUi) ? nativeUi : process.execPath,
       iconPath,
       runUpdateDatabase: runUpdateDesktopDatabase,
     });
   }
   if (platform === 'win32') {
-    return ensureWindowsAideskShortcut({ executablePath: process.execPath });
+    const nativeUi = resolveAideskLocalUiExecutable(platform);
+    return ensureWindowsAideskShortcut({
+      executablePath: existsSync(nativeUi) ? nativeUi : process.execPath,
+    });
   }
   return 'unavailable';
 }
@@ -325,7 +330,28 @@ export function localPanelUrl(): string {
   return `http://${REMOTE_DESKTOP_LOCAL_MANAGEMENT.HOST}:${REMOTE_DESKTOP_LOCAL_MANAGEMENT.PORT}/`;
 }
 
+export function resolveAideskLocalUiExecutable(
+  platform: NodeJS.Platform = process.platform,
+  executablePath = process.execPath,
+): string {
+  if (platform === 'win32') {
+    return win32.join(
+      win32.dirname(executablePath),
+      `${AIDESK_LOCAL_UI_EXECUTABLE_NAME}.exe`,
+    );
+  }
+  return resolve(
+    dirname(executablePath),
+    AIDESK_LOCAL_UI_EXECUTABLE_NAME,
+  );
+}
+
 export function openAideskLocalPanel(platform = process.platform): void {
+  const nativeUi = resolveAideskLocalUiExecutable(platform);
+  if (existsSync(nativeUi)) {
+    execFile(nativeUi, [], { windowsHide: false }, () => undefined);
+    return;
+  }
   const url = localPanelUrl();
   if (platform === 'darwin') {
     execFile('/usr/bin/open', [url], { windowsHide: true }, () => undefined);

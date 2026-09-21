@@ -9,6 +9,7 @@ import {
   ensureWindowsAideskShortcut,
   ensureLinuxAideskDesktopEntry,
   ensureMacosAideskApplicationEntry,
+  resolveAideskLocalUiExecutable,
   resolveWindowsPowerShellExecutable,
   removeLinuxAideskDesktopEntry,
   removeMacosAideskApplicationEntry,
@@ -31,6 +32,15 @@ async function root(): Promise<string> {
 }
 
 describe('aiDesk desktop entries', () => {
+  it('resolves the packaged native UI beside the controlled-node executable on each desktop OS', () => {
+    expect(resolveAideskLocalUiExecutable('win32', 'D:\\IM.codes\\node.exe')).toBe(
+      'D:\\IM.codes\\aidesk-local-ui.exe',
+    );
+    expect(resolveAideskLocalUiExecutable('linux', '/opt/imcodes/node')).toBe(
+      '/opt/imcodes/aidesk-local-ui',
+    );
+  });
+
   it('uses the existing signed macOS bundle through an idempotent user Applications link', async () => {
     if (process.platform === 'win32') return;
     const home = await root();

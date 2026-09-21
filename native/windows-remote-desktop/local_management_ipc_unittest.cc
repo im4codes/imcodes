@@ -30,7 +30,10 @@ std::string Welcome(std::uint64_t revision = 1) {
          "\"type\":\"aidesk_local.snapshot\",\"protocolVersion\":1,"
          "\"revision\":" + std::to_string(revision) +
          ",\"publicNodeId\":\"9535523706\",\"serviceState\":\"ready\","
-         "\"accessState\":\"ready\",\"paused\":false,\"connections\":[{"
+         "\"accessState\":\"ready\",\"paused\":false,"
+         "\"managementUrl\":\"https://im.codes/?aideskAction=manage\","
+         "\"shareUrl\":\"https://im.codes/?aideskAction=share\","
+         "\"connections\":[{"
          "\"id\":\"connection_123456\",\"label\":\"Alice\","
          "\"connectedAt\":1700000000000,\"durationMs\":10000,"
          "\"mode\":\"control\"}]}}";
@@ -84,7 +87,8 @@ TEST(LocalManagementIpcTest, RejectsRollbackAndRecoversOnlyAfterReconnect) {
       "{\"type\":\"aidesk_local.snapshot\",\"protocolVersion\":1,"
       "\"revision\":1,\"publicNodeId\":\"9535523706\","
       "\"serviceState\":\"ready\",\"accessState\":\"ready\","
-      "\"paused\":false,\"connections\":[]}";
+      "\"paused\":false,\"managementUrl\":\"https://im.codes/manage\","
+      "\"shareUrl\":\"https://im.codes/share\",\"connections\":[]}";
   const auto stale_frame = EncodeLocalManagementFrame(stale);
   ASSERT_TRUE(stale_frame.has_value());
   EXPECT_FALSE(client.Consume(*stale_frame, &events));
@@ -101,7 +105,8 @@ TEST(LocalManagementIpcTest, RejectsSnapshotBeforeAuthenticatedWelcome) {
       "{\"type\":\"aidesk_local.snapshot\",\"protocolVersion\":1,"
       "\"revision\":1,\"publicNodeId\":\"9535523706\","
       "\"serviceState\":\"ready\",\"accessState\":\"ready\","
-      "\"paused\":false,\"connections\":[]}";
+      "\"paused\":false,\"managementUrl\":\"https://im.codes/manage\","
+      "\"shareUrl\":\"https://im.codes/share\",\"connections\":[]}";
   const auto frame = EncodeLocalManagementFrame(snapshot);
   ASSERT_TRUE(frame.has_value());
   std::vector<LocalManagementEvent> events;

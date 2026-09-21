@@ -8,3 +8,4 @@ export const AIDESK_MACOS_APP_NAME = AIDESK_PRODUCT.macosAppName;
 export const AIDESK_MACOS_BUNDLE_ID = AIDESK_PRODUCT.macosBundleId;
 export const AIDESK_LINUX_DESKTOP_FILE_NAME = AIDESK_PRODUCT.linuxDesktopFileName;
 export const AIDESK_WINDOWS_SHORTCUT_FILE_NAME = AIDESK_PRODUCT.windowsShortcutFileName;
+export const AIDESK_LOCAL_UI_EXECUTABLE_NAME = AIDESK_PRODUCT.localUiExecutableName;

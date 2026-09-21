@@ -51,6 +51,8 @@ async function fixture(overrides: Partial<Parameters<typeof startAideskLocalIpcS
   const calls = { pause: 0, resume: 0, stopAll: 0, disconnect: [] as string[] };
   const server = await startAideskLocalIpcServer({
     publicNodeId: '6321982267',
+    managementUrl: 'https://im.example/?aideskAction=manage',
+    shareUrl: 'https://im.example/?aideskAction=share',
     runtimeVersion: '2026.9.1',
     productVersion: '2026.9.1',
     endpoint,
@@ -141,6 +143,12 @@ async function nextMatching(
 }
 
 describe('aiDesk local IPC server', () => {
+  it('rejects non-web management targets before exposing them to the native UI', async () => {
+    await expect(fixture({ managementUrl: 'javascript:alert(1)' })).rejects.toThrow(
+      'aidesk_local_ipc_options_invalid',
+    );
+  });
+
   it('decodes fragmented/coalesced frames and rejects an oversized frame before allocating it', () => {
     const decoder = new AideskLocalIpcFrameDecoder();
     const first = encodeAideskLocalIpcFrame({ value: 1 });
@@ -167,6 +175,8 @@ describe('aiDesk local IPC server', () => {
       snapshot: {
         revision: 1,
         publicNodeId: '6321982267',
+        managementUrl: 'https://im.example/?aideskAction=manage',
+        shareUrl: 'https://im.example/?aideskAction=share',
         paused: false,
         connections: [{
           id: 'connection_A1',
@@ -425,6 +435,8 @@ describe('aiDesk local IPC server', () => {
     });
     const server = await startAideskLocalIpcServer({
       publicNodeId: '9535523706',
+      managementUrl: 'https://im.example/?aideskAction=manage',
+      shareUrl: 'https://im.example/?aideskAction=share',
       runtimeVersion: '2026.9.1',
       productVersion: '2026.9.1',
       endpoint,

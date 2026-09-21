@@ -39,6 +39,8 @@ const MAX_SAFE_STRING_BYTES = 512;
 
 export interface AideskLocalIpcServerOptions {
   publicNodeId: string;
+  managementUrl: string;
+  shareUrl: string;
   runtimeVersion: string;
   productVersion: string;
   status(): Omit<RemoteDesktopLocalStatus, 'publicNodeId'>;
@@ -87,6 +89,16 @@ function safeString(value: unknown, maximumBytes = MAX_SAFE_STRING_BYTES): value
 
 function safeToken(value: unknown): value is string {
   return safeString(value, 256) && /^[A-Za-z0-9_-]+$/u.test(value);
+}
+
+function safeWebUrl(value: unknown): value is string {
+  if (!safeString(value, 2048)) return false;
+  try {
+    const protocol = new URL(value).protocol;
+    return protocol === 'https:' || protocol === 'http:';
+  } catch {
+    return false;
+  }
 }
 
 function secureEqual(left: string, right: string): boolean {
@@ -245,6 +257,8 @@ export async function startAideskLocalIpcServer(
   options: AideskLocalIpcServerOptions,
 ): Promise<AideskLocalIpcServer> {
   if (!safeToken(options.publicNodeId)
+    || !safeWebUrl(options.managementUrl)
+    || !safeWebUrl(options.shareUrl)
     || !safeString(options.runtimeVersion, 128)
     || !safeString(options.productVersion, 128)) {
     throw new Error('aidesk_local_ipc_options_invalid');
@@ -304,6 +318,8 @@ export async function startAideskLocalIpcServer(
         ? AIDESK_LOCAL_IPC_ACCESS_STATE.PAUSED
         : AIDESK_LOCAL_IPC_ACCESS_STATE.READY,
       paused: status.paused,
+      managementUrl: options.managementUrl,
+      shareUrl: options.shareUrl,
       connections: status.connections.map((connection) => ({
         ...connection,
         durationMs: Math.max(0, now() - connection.connectedAt),

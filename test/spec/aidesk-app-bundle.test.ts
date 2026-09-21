@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -11,6 +11,7 @@ import {
   AIDESK_COMPUTER_USE_EXECUTABLE,
   AIDESK_THIRD_PARTY_LICENSE,
   AIDESK_MAIN_EXECUTABLE,
+  AIDESK_LOCAL_UI_EXECUTABLE,
   aideskSigningOrder,
   buildAideskAgent,
   buildAideskInfoPlist,
@@ -86,6 +87,21 @@ describe('aiDesk application bundle', () => {
     );
     expect(dispatcher).toContain('Contents/Helpers/%s');
     expect(aideskSigningOrder('/x')[0]).toContain('/Contents/Helpers/');
+  });
+
+  it('signs the optional native local UI before sealing the containing app', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'imcodes-aidesk-ui-signing-'));
+    const bundle = join(directory, AIDESK_APP_NAME);
+    const helpers = join(bundle, 'Contents', 'Helpers');
+    try {
+      mkdirSync(helpers, { recursive: true });
+      writeFileSync(join(helpers, AIDESK_LOCAL_UI_EXECUTABLE), 'fixture');
+      const order = aideskSigningOrder(bundle);
+      expect(order.indexOf(join(helpers, AIDESK_LOCAL_UI_EXECUTABLE))).toBeGreaterThan(-1);
+      expect(order.at(-1)).toBe(bundle);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it('ships one binary that runs on both architectures', () => {

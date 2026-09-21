@@ -73,7 +73,11 @@ async function readJson(request: IncomingMessage): Promise<Record<string, unknow
   }
 }
 
-function managementUrl(serverUrl: string, publicNodeId: string, action: 'manage' | 'share'): string {
+export function remoteDesktopManagementUrl(
+  serverUrl: string,
+  publicNodeId: string,
+  action: 'manage' | 'share',
+): string {
   const url = new URL(serverUrl);
   url.searchParams.set(REMOTE_DESKTOP_LOCAL_MANAGEMENT.WEB_NODE_QUERY, publicNodeId);
   url.searchParams.set(REMOTE_DESKTOP_LOCAL_MANAGEMENT.WEB_ACTION_QUERY, action);
@@ -133,8 +137,8 @@ export async function startRemoteDesktopLocalPanel(
       response.setHeader('set-cookie', `${REMOTE_DESKTOP_LOCAL_MANAGEMENT.COOKIE_NAME}=${session}; HttpOnly; SameSite=Strict; Path=/`);
       return reply(response, 200, panelHtml({
         publicNodeId: options.publicNodeId,
-        manageUrl: managementUrl(options.serverUrl, options.publicNodeId, REMOTE_DESKTOP_LOCAL_WEB_ACTION.MANAGE),
-        shareUrl: managementUrl(options.serverUrl, options.publicNodeId, REMOTE_DESKTOP_LOCAL_WEB_ACTION.SHARE),
+        manageUrl: remoteDesktopManagementUrl(options.serverUrl, options.publicNodeId, REMOTE_DESKTOP_LOCAL_WEB_ACTION.MANAGE),
+        shareUrl: remoteDesktopManagementUrl(options.serverUrl, options.publicNodeId, REMOTE_DESKTOP_LOCAL_WEB_ACTION.SHARE),
         csrf,
       }), 'text/html; charset=utf-8');
     }

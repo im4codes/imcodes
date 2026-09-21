@@ -35,6 +35,15 @@ namespace macos = imcodes::remote_desktop::macos;
 
 namespace {
 bool OpenLocalManagementPanel() {
+  NSString *native_ui = [[[NSBundle mainBundle] bundlePath]
+      stringByAppendingPathComponent:@"Contents/Helpers/aidesk-local-ui"];
+  if (![[NSFileManager defaultManager] isExecutableFileAtPath:native_ui]) native_ui = nil;
+  if (native_ui != nil) {
+    NSTask *task = [[NSTask alloc] init];
+    task.executableURL = [NSURL fileURLWithPath:native_ui];
+    NSError *launch_error = nil;
+    if ([task launchAndReturnError:&launch_error]) return true;
+  }
   NSURL *url = [NSURL URLWithString:@(imcodes::remote_desktop::common::kLocalManagementUrl)];
   return url != nil && [[NSWorkspace sharedWorkspace] openURL:url];
 }

@@ -3,5 +3,6 @@
   "macosAppName": "aiDesk.to by IM.codes.app",
   "macosBundleId": "to.aidesk.app",
   "linuxDesktopFileName": "aidesk.desktop",
-  "windowsShortcutFileName": "aiDesk.to by IM.codes.lnk"
+  "windowsShortcutFileName": "aiDesk.to by IM.codes.lnk",
+  "localUiExecutableName": "aidesk-local-ui"
 }

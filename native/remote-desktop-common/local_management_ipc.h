@@ -78,6 +78,8 @@ struct LocalManagementSnapshot {
   LocalManagementAccessState access_state =
       LocalManagementAccessState::kUnavailable;
   bool paused = false;
+  std::string management_url;
+  std::string share_url;
   std::vector<LocalManagementConnection> connections;
 };
 
@@ -96,6 +98,16 @@ struct LocalManagementWelcome {
   std::int64_t capability_expires_at_ms = 0;
   LocalManagementSnapshot snapshot;
 };
+
+struct LocalManagementBootstrap {
+  std::string endpoint;
+  std::string bootstrap_secret;
+  std::string runtime_version;
+  std::string product_version;
+};
+
+[[nodiscard]] std::optional<LocalManagementBootstrap>
+ParseLocalManagementBootstrap(std::string_view json);
 
 struct LocalManagementEvent {
   enum class Kind : std::uint8_t { kWelcome, kSnapshot, kAck, kError };

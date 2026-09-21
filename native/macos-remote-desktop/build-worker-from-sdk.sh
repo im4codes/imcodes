@@ -20,12 +20,15 @@ COMMON_DIR="$REPOSITORY_ROOT/native/remote-desktop-common"
 SDK_ROOT=""
 ARTIFACT_ROOT=""
 TARGET_CPU=""
+FLTK_ROOT=""
+JSONCPP_ROOT=""
 JOBS="$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 
 usage() {
   cat >&2 <<'USAGE'
 usage: build-worker-from-sdk.sh --sdk-root DIR --artifact-root DIR
                                [--target-cpu arm64|x64] [--jobs N]
+                               [--fltk-root DIR --jsoncpp-root DIR]
 
   --sdk-root       An installed immutable libwebrtc SDK.
   --artifact-root  Output directory for the components. Replaced wholesale.
@@ -41,6 +44,8 @@ while [[ $# -gt 0 ]]; do
     --artifact-root) ARTIFACT_ROOT="${2:-}"; shift 2 ;;
     --target-cpu) TARGET_CPU="${2:-}"; shift 2 ;;
     --jobs) JOBS="${2:-}"; shift 2 ;;
+    --fltk-root) FLTK_ROOT="${2:-}"; shift 2 ;;
+    --jsoncpp-root) JSONCPP_ROOT="${2:-}"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; usage ;;
   esac
 done
@@ -330,5 +335,13 @@ link_component macos_remote_desktop_worker_main.mm imcodes-remote-desktop-worker
 link_component macos_launch_agent_main.mm imcodes-remote-desktop-launch-agent
 link_component macos_remote_desktop_disclosure_main.mm imcodes-remote-desktop-disclosure
 link_component macos_virtual_display_helper_main.mm imcodes-virtual-display-helper
+
+if [[ -n "$FLTK_ROOT" || -n "$JSONCPP_ROOT" ]]; then
+  [[ -n "$FLTK_ROOT" && -n "$JSONCPP_ROOT" ]] \
+    || { echo '--fltk-root and --jsoncpp-root must be supplied together' >&2; exit 2; }
+  "$REPOSITORY_ROOT/native/aidesk-ui/build-ui.sh" \
+    --fltk-root "$FLTK_ROOT" --jsoncpp-root "$JSONCPP_ROOT" \
+    --artifact-root "$ARTIFACT_ROOT/aidesk-ui" --jobs "$JOBS"
+fi
 
 echo "built the macOS remote-desktop components for $TARGET_CPU at $ARTIFACT_ROOT"
