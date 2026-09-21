@@ -19,6 +19,10 @@ export const CONTROLLED_NODE_SERVICE = {
 export const CONTROLLED_NODE_WINDOWS_INSTALL_DIR = 'imcodes-node' as const;
 export const CONTROLLED_NODE_WINDOWS_LEGACY_UPGRADE_RESCUE_DIR = 'imcodes-node-upgrade-rescue' as const;
 export const CONTROLLED_NODE_WINDOWS_UPGRADE_TASK_PREFIX = 'imcodes-node-upgrade-' as const;
+/** Durable crash-recovery intent written beside the installed Windows executable. */
+export const CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_FILE = 'upgrade-in-progress.json' as const;
+export const CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_VERSION = 2 as const;
+export const CONTROLLED_NODE_WINDOWS_UPGRADE_PRODUCT = 'imcodes-controlled-node-upgrade' as const;
 export const CONTROLLED_NODE_WINDOWS_UPGRADE_PREFLIGHT_FAILED = 'preflight_failed' as const;
 export const CONTROLLED_NODE_WINDOWS_RELEASE_TRUST_PREFLIGHT_FAILURE =
   'remote desktop worker Authenticode verification failed' as const;

@@ -17,6 +17,9 @@ import type { ServiceReceipt } from './install-journal.js';
 import {
   CONTROLLED_NODE_SERVICE,
   CONTROLLED_NODE_WINDOWS_UPGRADE_TASK_PREFIX,
+  CONTROLLED_NODE_WINDOWS_UPGRADE_PRODUCT,
+  CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_FILE,
+  CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_VERSION,
 } from '../../shared/controlled-node-service.js';
 import {
   CONTROLLED_NODE_HEALTH_LEASE_FILE,
@@ -112,7 +115,7 @@ const WINDOWS_WATCHDOG_INTERVAL = 'PT1M';
 const WINDOWS_WATCHDOG_SCRIPT_NAME = 'imcodes-node-health-watchdog.ps1';
 const WINDOWS_HEALTH_LEASE_NAME = 'health-lease.json';
 const WINDOWS_HEALTH_STALE_SECONDS = 180;
-export const WINDOWS_UPGRADE_MARKER_NAME = 'upgrade-in-progress.json';
+export const WINDOWS_UPGRADE_MARKER_NAME = CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_FILE;
 const WINDOWS_UPGRADE_MARKER_MAX_AGE_MS = 15 * 60 * 1000;
 
 function windowsSystemRoot(
@@ -263,6 +266,13 @@ export function windowsControlledNodeHealthWatchdogScript(exePath: string): stri
     + `  try {\r\n`
     + `    $upgradeMarker = Get-Content -LiteralPath $upgradeMarkerPath -Raw | ConvertFrom-Json\r\n`
     + `    $upgradeAgeMs = $nowMs - [int64]$upgradeMarker.startedAt\r\n`
+    + `    if ([int]$upgradeMarker.version -eq ${CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_VERSION} -and [string]$upgradeMarker.product -ceq ${powershellSingleQuoted(CONTROLLED_NODE_WINDOWS_UPGRADE_PRODUCT)} -and [string]$upgradeMarker.taskName -clike ${powershellSingleQuoted(`${CONTROLLED_NODE_WINDOWS_UPGRADE_TASK_PREFIX}*`)}) {\r\n`
+    + `      $upgradeTask = Get-ScheduledTask -TaskName ([string]$upgradeMarker.taskName) -ErrorAction SilentlyContinue\r\n`
+    + `      if ($upgradeTask) {\r\n`
+    + `        if ([int]$upgradeTask.State -notin @(2,4)) { Start-ScheduledTask -TaskName ([string]$upgradeMarker.taskName) -ErrorAction SilentlyContinue; Write-HealthLog ('upgrade_recovery_requested task={0}' -f [string]$upgradeMarker.taskName) }\r\n`
+    + `        exit 0\r\n`
+    + `      }\r\n`
+    + `    }\r\n`
     + `    if ([int]$upgradeMarker.version -eq 1 -and $upgradeAgeMs -ge -60000 -and $upgradeAgeMs -le $upgradeMarkerMaxAgeMs) { exit 0 }\r\n`
     + `  } catch { }\r\n`
     + `  Remove-Item -Force -LiteralPath $upgradeMarkerPath -ErrorAction SilentlyContinue\r\n`

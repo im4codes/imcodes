@@ -178,6 +178,14 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
     expect(watchdogScript).toContain("$upgradeMarkerPath = 'C:\\ProgramData\\imcodes-node\\upgrade-in-progress.json'");
     expect(watchdogScript).toContain('$upgradeMarkerMaxAgeMs = 900000');
     expect(watchdogScript).toContain('$upgradeAgeMs -le $upgradeMarkerMaxAgeMs');
+    expect(watchdogScript).toContain("$upgradeMarker.product -ceq 'imcodes-controlled-node-upgrade'");
+    expect(watchdogScript).toContain("$upgradeMarker.taskName -clike 'imcodes-node-upgrade-*'");
+    expect(watchdogScript).toContain('if ($upgradeTask) {');
+    expect(watchdogScript.indexOf('exit 0\r\n      }'))
+      .toBeLessThan(watchdogScript.indexOf('Remove-Item -Force -LiteralPath $upgradeMarkerPath'));
+    expect(watchdogScript).toContain('upgrade_recovery_requested');
+    expect(watchdogScript.indexOf('upgrade_recovery_requested'))
+      .toBeLessThan(watchdogScript.indexOf('Remove-Item -Force -LiteralPath $upgradeMarkerPath'));
     expect(watchdogScript).toContain('Remove-Item -Force -LiteralPath $upgradeMarkerPath');
     expect(watchdogScript).toContain('Start-ScheduledTask -TaskName $nodeTask');
     expect(watchdogScript).toContain("-notmatch '--computer-use-helper'");

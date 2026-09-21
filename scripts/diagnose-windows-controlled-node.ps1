@@ -64,6 +64,26 @@ if ($nodeProcess) {
 
 Write-Section 'Health lease and watchdog log'
 if ($installDir) {
+  Write-Output 'Executable and install receipt integrity:'
+  $installedExe = Join-Path $installDir 'imcodes-node.exe'
+  $journalPath = Join-Path $installDir 'install-journal.json'
+  $transactionPath = Join-Path $installDir 'upgrade-in-progress.json'
+  $actualExeSha256 = if (Test-Path -LiteralPath $installedExe -PathType Leaf) {
+    (Get-FileHash -Algorithm SHA256 -LiteralPath $installedExe -ErrorAction Continue).Hash.ToLowerInvariant()
+  } else { $null }
+  $journal = if (Test-Path -LiteralPath $journalPath -PathType Leaf) {
+    try { Get-Content -LiteralPath $journalPath -Raw | ConvertFrom-Json } catch { $null }
+  } else { $null }
+  $receiptSha256 = if ($journal -and $journal.stagedReceipt) { [string]$journal.stagedReceipt.sha256 } else { $null }
+  [pscustomobject]@{
+    ExecutablePath = $installedExe
+    ExecutableSha256 = $actualExeSha256
+    ReceiptSha256 = $receiptSha256
+    ExecutableMatchesReceipt = [bool]($actualExeSha256 -and $receiptSha256 -and $actualExeSha256 -ceq $receiptSha256)
+    UpgradeTransactionPresent = Test-Path -LiteralPath $transactionPath -PathType Leaf
+    BackupExecutablePresent = Test-Path -LiteralPath ($installedExe + '.upgrade-old') -PathType Leaf
+    BackupJournalPresent = Test-Path -LiteralPath ($journalPath + '.upgrade-old') -PathType Leaf
+  } | Format-List
   foreach ($name in @('health-lease.json', 'health-watchdog-state.json')) {
     $path = Join-Path $installDir $name
     if (Test-Path -LiteralPath $path -PathType Leaf) {

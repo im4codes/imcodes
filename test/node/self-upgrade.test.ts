@@ -572,7 +572,7 @@ describe('controlled-node self-upgrade', () => {
     expect(script).toContain("[IO.FileShare]::None");
     expect(script).toContain("throw 'controlled node executable remained locked after stop'");
     expect(script.indexOf('& $waitForNodeExecutableRelease'))
-      .toBeLessThan(script.indexOf('Copy-Item -Force $src $dst'));
+      .toBeLessThan(script.indexOf('& $publishAtomic $src $dst $backupDst'));
     expect(script).toContain("$rollbackExecutableReleased = [bool](& $runRecovery 'stop_new_node' { Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue; & $waitForNodeExecutableRelease; return $true })");
     const rollbackReleaseGuard = script.indexOf('if ($rollbackExecutableReleased) {');
     const rollbackMainRestore = script.indexOf("& $runRecovery 'restore_main'");
@@ -583,15 +583,22 @@ describe('controlled-node self-upgrade', () => {
     expect(script).toContain("$upgradeMarker = Join-Path (Split-Path -Parent $dst) 'upgrade-in-progress.json'");
     expect(script).not.toContain('Disable-ScheduledTask -TaskName $watchdogTask');
     expect(script).not.toContain('Stop-ScheduledTask -TaskName $watchdogTask');
-    expect(script).toContain('Copy-Item -Force $src $dst');
+    expect(script).toContain('[IO.File]::Replace($pending, $destination, $backup, $true)');
+    expect(script).toContain('previousReceipt = $previousJournal.stagedReceipt');
+    expect(script).toContain('targetReceipt = $targetJournal.stagedReceipt');
+    expect(script).toContain("product = 'imcodes-controlled-node-upgrade'");
     expect(script).toContain('computer-use-helper');
-    expect(script.match(/Remove-Item -Force \$backupJournal -ErrorAction SilentlyContinue/g)).toHaveLength(2);
+    expect(script).toContain('[IO.File]::Replace($pendingJournal, $dstJournal, $journalSwapBackup, $true)');
+    expect(script).toContain('[IO.File]::Replace($pendingManifest, $dstManifest, $manifestSwapBackup, $true)');
+    // Windows PowerShell 5.1 rejects a null destinationBackupFileName even
+    // though newer .NET signatures annotate it nullable.
+    expect(script).not.toMatch(/\[IO\.File\]::Replace\([^\r\n]+, \$null, \$true\)/);
     expect(script).toContain('Copy-Item -Recurse -Force -Path (Join-Path $srcHelper');
     expect(script).toContain('install-journal.json');
     expect(script).toContain(`Unregister-ScheduledTask -TaskName '${scheduled[0].taskName}'`);
     const taskXml = (await readFile(scheduled[0].taskXmlPath)).subarray(2).toString('utf16le');
     expect(taskXml).toContain('<UserId>S-1-5-18</UserId>');
-    expect(taskXml).toContain('<Triggers />');
+    expect(taskXml).toContain('<BootTrigger><Enabled>true</Enabled></BootTrigger>');
     expect(taskXml).toContain('powershell.exe');
     expect(taskXml).toContain(result.scriptPath!);
     const helperPath = join(dirname(result.scriptPath!), 'computer-use-helper', 'win32-x64', 'open-computer-use.exe');
@@ -1190,7 +1197,7 @@ describe('controlled-node self-upgrade', () => {
     expect(script).toContain('$driverInstallExitCode -ne 3010');
     expect(script).toContain("& $runRecovery 'restore_main'");
     expect(script).toContain("& $runRecovery 'restore_driver'");
-    expect(script).toContain('controlled node backup hash mismatch');
+    expect(script).toContain('controlled node interrupted upgrade has no trusted publication base');
     expect(script).toContain('& $verifyRemoteDesktopArtifactSet $dstRemoteDesktop $rollbackRemoteDesktopWorkerHash');
     expect(script).toContain("status = $rollbackStatus");
     expect(script).toContain("'rollback_failed'");
@@ -1203,7 +1210,8 @@ describe('controlled-node self-upgrade', () => {
   it('escapes the one-shot upgrade script path in Task Scheduler XML', () => {
     const xml = windowsControlledNodeUpgradeTaskXml('C:\\Windows\\Temp\\a&b<1>\\upgrade.ps1');
     expect(xml).toContain('a&amp;b&lt;1&gt;');
-    expect(xml).toContain('<Triggers />');
+    expect(xml).toContain('<BootTrigger><Enabled>true</Enabled></BootTrigger>');
+    expect(xml).toContain('<StartWhenAvailable>true</StartWhenAvailable>');
     expect(xml).toContain('<AllowHardTerminate>false</AllowHardTerminate>');
     expect(xml).toContain('<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>');
     expect(xml).toContain('<Command>C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe</Command>');

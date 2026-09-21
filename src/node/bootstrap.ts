@@ -2,6 +2,7 @@
 // D-A v2 identity pre-persist, stable trailer-free executable staging, real
 // platform installer wiring, and crash-loop backoff (N5).
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { constants as fsConstants } from 'node:fs';
 import { lstat, open, realpath } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
@@ -30,6 +31,7 @@ import {
   inspectServiceState,
   secureWindowsCredentialDir,
   startService,
+  windowsSchtasksExecutablePath,
 } from './installer.js';
 import {
   InstallJournalCorruptError,
@@ -44,11 +46,28 @@ import {
 import {
   WINDOWS_COMPILED_RELEASE_SIGNER_SHA256,
   installWindowsReleasePublisherTrust,
+  verifyWindowsAuthenticodeSigners,
 } from './windows-artifact-trust.js';
+import {
+  finalizeWindowsUpgradeTransaction,
+  recoverWindowsUpgradeJournalBackup,
+  recoverWindowsUpgradeTransaction,
+} from './upgrade-transaction.js';
 
 /** Install journal lives beside the credential in the protected directory. */
 export function journalPathFor(credentialPath = defaultCredentialPath()): string {
   return join(dirname(credentialPath), 'install-journal.json');
+}
+
+function cleanupWindowsUpgradeTask(taskName: string): void {
+  try {
+    execFileSync(windowsSchtasksExecutablePath(), ['/Delete', '/TN', taskName, '/F'], {
+      windowsHide: true,
+      stdio: 'ignore',
+    });
+  } catch {
+    // A completed one-shot may already have removed itself.
+  }
 }
 
 /**
@@ -104,6 +123,12 @@ export interface ControlledNodeBootstrapDeps {
   sourceExecutablePath: string;
   now: number;
   warn: (message: string) => void;
+  recoverInterruptedUpgrade?: (journal: InstallJournal) => Promise<{
+    journal: InstallJournal;
+    handoff: boolean;
+    outcome: string;
+  }>;
+  recoverCorruptInstallJournal?: () => Promise<InstallJournal | null>;
 }
 
 export type BootstrapDisposition = 'handoff_complete' | 'run_runtime';
@@ -165,6 +190,33 @@ export function defaultBootstrapDeps(now: number): ControlledNodeBootstrapDeps {
     sourceExecutablePath,
     now,
     warn: (message) => process.stderr.write(`imcodes-node: ${message}\n`),
+    recoverInterruptedUpgrade: async (journal) => {
+      if (process.platform !== 'win32' || !journal.stagedReceipt) {
+        return { journal, handoff: false, outcome: 'none' };
+      }
+      const schtasks = windowsSchtasksExecutablePath();
+      return recoverWindowsUpgradeTransaction({
+        journal,
+        journalPath: journalPathFor(credentialPath),
+        // The transaction governs the installed service image. During an
+        // explicit reinstall `process.execPath` is the freshly downloaded
+        // installer, not the image whose receipt may be stale.
+        executablePath: journal.stagedReceipt.path,
+        now,
+        verifyTrustedExecutable: (path) => verifyWindowsAuthenticodeSigners(
+          [path], WINDOWS_COMPILED_RELEASE_SIGNER_SHA256,
+        ),
+        resumeTask: (taskName) => {
+          execFileSync(schtasks, ['/Run', '/TN', taskName], { windowsHide: true, stdio: 'ignore' });
+        },
+        cleanupTask: (taskName) => {
+          cleanupWindowsUpgradeTask(taskName);
+        },
+      });
+    },
+    recoverCorruptInstallJournal: () => process.platform === 'win32'
+      ? recoverWindowsUpgradeJournalBackup(journalPathFor(credentialPath))
+      : Promise.resolve(null),
   };
 }
 
@@ -309,6 +361,11 @@ async function loadJournalOrThrow(deps: ControlledNodeBootstrapDeps): Promise<In
     return await deps.loadInstallJournal(deps.journalPath);
   } catch (err) {
     if (err instanceof InstallJournalCorruptError) {
+      const recovered = await deps.recoverCorruptInstallJournal?.();
+      if (recovered) {
+        deps.warn('controlled node restored a validated install-journal backup after an interrupted upgrade');
+        return recovered;
+      }
       throw new Error('controlled node install journal is corrupt; refusing to continue — manual recovery required');
     }
     throw err;
@@ -655,7 +712,6 @@ async function restageFromInstallerPackage(
       previous: journal,
       stagedExePath: deps.stagedExecutablePath,
       stagedReceipt,
-      sourceExePath: deps.sourceExecutablePath,
     });
   } finally {
     if (source) await source.close().catch(() => {});
@@ -696,6 +752,16 @@ async function ensureServiceStartRequested(
 export async function bootstrapControlledNodeWithDisposition(deps: ControlledNodeBootstrapDeps): Promise<BootstrapResult> {
   const existing = await deps.loadCredential();
   let journal = await loadJournalOrThrow(deps);
+  if (existing && deps.recoverInterruptedUpgrade) {
+    const recovery = await deps.recoverInterruptedUpgrade(journal);
+    journal = recovery.journal;
+    if (recovery.outcome !== 'none') {
+      deps.warn(`controlled node interrupted upgrade recovery: ${recovery.outcome}`);
+    }
+    if (recovery.handoff) {
+      return { credential: existing, disposition: 'handoff_complete', journal };
+    }
+  }
   const stableRuntime = await deps.isStableRuntime(journal);
 
   if (existing && stableRuntime && phaseIndex(journal.phase) >= phaseIndex('service_registered')) {
@@ -803,6 +869,7 @@ export async function markServiceHealthy(
   options: {
     isStableRuntime?: (journal: InstallJournal) => boolean | Promise<boolean>;
     inspectServiceState?: (receipt: ServiceReceipt) => Promise<import('./installer.js').ServiceInspection>;
+    finalizeInterruptedUpgrade?: (journal: InstallJournal) => Promise<void>;
   } = {},
 ): Promise<void> {
   const journal = await loadInstallJournal(journalPath);
@@ -821,7 +888,19 @@ export async function markServiceHealthy(
       `controlled node service_healthy refused: inspection reported installed=${insp.installed} loaded=${insp.loaded} bootEnabled=${insp.bootEnabled} principal=${insp.principal ?? 'unknown'} restartPolicy=${insp.restartPolicy ?? 'unknown'} runState=${insp.runState} definitionMatches=${insp.definitionMatches} loadedActionMatches=${insp.loadedActionMatches} errors=${insp.errors.join(',')}`,
     );
   }
-  if (journal.phase === 'service_healthy') return;
+  const finalize = options.finalizeInterruptedUpgrade ?? (async (healthyJournal: InstallJournal) => {
+    if (process.platform !== 'win32' || !healthyJournal.stagedReceipt) return;
+    await finalizeWindowsUpgradeTransaction({
+      journal: healthyJournal,
+      journalPath,
+      executablePath: healthyJournal.stagedReceipt.path,
+      cleanupTask: cleanupWindowsUpgradeTask,
+    });
+  });
+  if (journal.phase === 'service_healthy') {
+    await finalize(journal);
+    return;
+  }
   let previous = journal;
   if (journal.phase === 'service_registered') {
     previous = await writeInstallPhase(journalPath, 'service_start_requested', {
@@ -832,11 +911,12 @@ export async function markServiceHealthy(
       serviceReceipt: journal.serviceReceipt,
     });
   }
-  await writeInstallPhase(journalPath, 'service_healthy', {
+  const healthyJournal = await writeInstallPhase(journalPath, 'service_healthy', {
     now,
     previous,
     healthyAt: now,
   });
+  await finalize(healthyJournal);
 }
 
 export { InstallJournalCorruptError, type InstallPhase };

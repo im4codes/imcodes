@@ -16,6 +16,11 @@ describe('Windows controlled-node read-only diagnostics', () => {
       'MSPower_DeviceEnable',
       '--version',
       'imcodes-node-upgrade-*',
+      'ExecutableMatchesReceipt',
+      'ExecutableSha256',
+      'ReceiptSha256',
+      'upgrade-in-progress.json',
+      'BackupExecutablePresent',
     ]) expect(script).toContain(required);
 
     expect(script).not.toMatch(/Get-Content[^\n]+credential\.json/i);

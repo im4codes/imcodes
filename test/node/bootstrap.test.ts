@@ -157,6 +157,60 @@ function makeDeps(over: Partial<ControlledNodeBootstrapDeps> = {}): ControlledNo
 }
 
 describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () => {
+  it('reconciles an interrupted Windows upgrade before deciding whether the runtime is stable', async () => {
+    const oldJournal: InstallJournal = {
+      version: 1,
+      phase: 'service_start_requested',
+      updatedAt: 5,
+      installId: 'inst-1',
+      nodeTokenHash: 'a'.repeat(64),
+      sourceExePath: '/tmp/download/imcodes-node',
+      stagedExePath: STAGED_RECEIPT.path,
+      stagedReceipt: STAGED_RECEIPT,
+      serverId: 'srv-1',
+      serviceName: 'imcodes-node',
+      serviceReceipt: SERVICE_RECEIPT,
+      serviceStartRequestedAt: 5,
+    };
+    const repairedJournal = { ...oldJournal, updatedAt: 6, stagedReceipt: { ...STAGED_RECEIPT, sha256: 'f'.repeat(64) } };
+    const deps = makeDeps({
+      loadCredential: vi.fn(async () => CRED),
+      loadInstallJournal: vi.fn(async () => oldJournal),
+      recoverInterruptedUpgrade: vi.fn(async () => ({
+        journal: repairedJournal,
+        handoff: false,
+        outcome: 'target_receipt_completed',
+      })),
+      isStableRuntime: vi.fn(async (journal) => journal === repairedJournal),
+    });
+
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+    expect(result.disposition).toBe('run_runtime');
+    expect(deps.recoverInterruptedUpgrade).toHaveBeenCalledWith(oldJournal);
+    expect(deps.isStableRuntime).toHaveBeenCalledWith(repairedJournal);
+    expect(deps.persistCredential).not.toHaveBeenCalled();
+    expect(deps.redeemEnrollmentV2).not.toHaveBeenCalled();
+  });
+
+  it('hands off to the durable upgrade task when startup recovery needs external replacement', async () => {
+    const journal: InstallJournal = {
+      version: 1, phase: 'service_healthy', updatedAt: 5, installId: 'inst-1',
+      nodeTokenHash: 'a'.repeat(64), sourceExePath: '/tmp/download/imcodes-node',
+      stagedExePath: STAGED_RECEIPT.path, stagedReceipt: STAGED_RECEIPT,
+      serverId: 'srv-1', serviceName: 'imcodes-node', serviceReceipt: SERVICE_RECEIPT,
+      serviceStartRequestedAt: 4, healthyAt: 5,
+    };
+    const deps = makeDeps({
+      loadCredential: vi.fn(async () => CRED),
+      loadInstallJournal: vi.fn(async () => journal),
+      recoverInterruptedUpgrade: vi.fn(async () => ({ journal, handoff: true, outcome: 'rollback_resumed' })),
+    });
+    const result = await bootstrapControlledNodeWithDisposition(deps);
+    expect(result.disposition).toBe('handoff_complete');
+    expect(deps.isStableRuntime).not.toHaveBeenCalled();
+    expect(deps.startService).not.toHaveBeenCalled();
+  });
+
   it('runs runtime only from stable executable after service start was requested', async () => {
     const deps = makeDeps({
       loadCredential: vi.fn(async () => CRED),
@@ -436,6 +490,7 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
     const source = makeSource({ stageTrailerFreeExecutable: vi.fn(async () => restaged) });
     const deps = makeDeps({
       openVerifiedEnrollmentSource: vi.fn(async () => source),
+      sourceExecutablePath: '/tmp/download/imcodes-node (1)',
       loadCredential: vi.fn(async () => CRED),
       isStableRuntime: vi.fn(async () => false),
       loadInstallIdentity: vi.fn(async () => IDENTITY),
@@ -468,6 +523,7 @@ describe('bootstrapControlledNode — journaled first run (10.10 + D-A v2)', () 
     );
     // The journal now describes what is actually on disk, not what used to be.
     expect(result.journal.stagedReceipt).toEqual(restaged);
+    expect(result.journal.sourceExePath).toBe('/tmp/download/imcodes-node');
     expect(result.credential).toEqual(CRED);
   });
 

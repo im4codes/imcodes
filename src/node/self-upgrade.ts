@@ -22,6 +22,8 @@ import {
   CONTROLLED_NODE_WINDOWS_RELEASE_MANIFEST_PREFLIGHT_FAILURE,
   CONTROLLED_NODE_WINDOWS_UPGRADE_PREFLIGHT_FAILED,
   CONTROLLED_NODE_WINDOWS_UPGRADE_TASK_PREFIX,
+  CONTROLLED_NODE_WINDOWS_UPGRADE_PRODUCT,
+  CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_VERSION,
 } from '../../shared/controlled-node-service.js';
 import { REMOTE_DESKTOP_PROTOCOL_VERSION } from '../../shared/remote-desktop.js';
 import {
@@ -72,7 +74,7 @@ const CONTROLLED_NODE_UPGRADE_MAX_LSTAT = 128;
 const CONTROLLED_NODE_UPGRADE_MAX_MARKER_READ = 64;
 const CONTROLLED_NODE_UPGRADE_MAX_DELETE = 32;
 const CONTROLLED_NODE_ARTIFACT_IO_BUFFER_BYTES = 64 * 1024;
-const CONTROLLED_NODE_UPGRADE_PRODUCT = 'imcodes-controlled-node-upgrade';
+const CONTROLLED_NODE_UPGRADE_PRODUCT = CONTROLLED_NODE_WINDOWS_UPGRADE_PRODUCT;
 const CONTROLLED_NODE_UPGRADE_DIR_PATTERN = /^imcodes-node-upgrade-[A-Za-z0-9_-]{6,128}$/;
 const CONTROLLED_NODE_UPGRADE_TOKEN_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const activeControlledNodeUpgradeDirs = new Set<string>();
@@ -1195,9 +1197,8 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
       + `$backupJournal = "$dstJournal.upgrade-old"\r\n`
     : '';
   const journalPublish = input.stagedJournalPath && input.destinationJournalPath
-    ? `Remove-Item -Force $backupJournal -ErrorAction SilentlyContinue\r\n`
-      + `if (Test-Path $dstJournal) { Copy-Item -Force $dstJournal $backupJournal; $journalBackedUp = $true }\r\n`
-      + `if (Test-Path $srcJournal) { Copy-Item -Force $srcJournal $dstJournal; $journalPublished = $true }\r\n`
+    ? `if ((Test-Path $dstJournal) -and -not (Test-Path $backupJournal)) { Copy-Item -Force $dstJournal $backupJournal; $journalBackedUp = $true } elseif (Test-Path $backupJournal) { $journalBackedUp = $true }\r\n`
+      + `if (Test-Path $srcJournal) { $pendingJournal = "$dstJournal.pending-$PID"; $journalSwapBackup = "$dstJournal.swap-old-$PID"; Remove-Item -Force $journalSwapBackup -ErrorAction SilentlyContinue; Copy-Item -Force $srcJournal $pendingJournal; if (Test-Path $dstJournal) { [IO.File]::Replace($pendingJournal, $dstJournal, $journalSwapBackup, $true); Remove-Item -Force $journalSwapBackup -ErrorAction SilentlyContinue } else { Move-Item -LiteralPath $pendingJournal -Destination $dstJournal }; $journalPublished = $true }\r\n`
     : '';
   const journalRollback = input.stagedJournalPath && input.destinationJournalPath
     ? `if ($journalBackedUp -and (Test-Path $backupJournal)) { Copy-Item -Force $backupJournal $dstJournal } elseif ($journalPublished) { Remove-Item -Force $dstJournal -ErrorAction SilentlyContinue }\r\n`
@@ -1205,6 +1206,16 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
   const journalCleanup = input.stagedJournalPath && input.destinationJournalPath
     ? `Remove-Item -Force $backupJournal -ErrorAction SilentlyContinue\r\n`
     : '';
+  const transactionIntent = input.stagedJournalPath && input.destinationJournalPath && input.upgradeTaskName
+    ? `$transactionMarkerTemp = "$upgradeMarker.pending-$PID"\r\n`
+      + `if (-not (Test-Path -LiteralPath $upgradeMarker)) {\r\n`
+      + `  $previousJournal = Get-Content -LiteralPath $dstJournal -Raw | ConvertFrom-Json\r\n`
+      + `  $targetJournal = Get-Content -LiteralPath $srcJournal -Raw | ConvertFrom-Json\r\n`
+      + `  $transaction = [ordered]@{ version = ${CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_VERSION}; product = ${psQuote(CONTROLLED_NODE_WINDOWS_UPGRADE_PRODUCT)}; startedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); targetVersion = ${psQuote(input.targetVersion ?? '')}; taskName = ${psQuote(input.upgradeTaskName)}; executablePath = $dst; backupExecutablePath = $backupDst; journalPath = $dstJournal; backupJournalPath = $backupJournal; previousReceipt = $previousJournal.stagedReceipt; targetReceipt = $targetJournal.stagedReceipt }\r\n`
+      + `  [IO.File]::WriteAllText($transactionMarkerTemp, ($transaction | ConvertTo-Json -Compress -Depth 8), [Text.UTF8Encoding]::new($false))\r\n`
+      + `  Move-Item -Force -LiteralPath $transactionMarkerTemp -Destination $upgradeMarker\r\n`
+      + `}\r\n`
+    : `@{ version = 1; startedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() } | ConvertTo-Json -Compress | Set-Content -LiteralPath $upgradeMarker -Encoding utf8\r\n`;
   return `$ErrorActionPreference = 'Stop'\r\n`
     + `Start-Sleep -Seconds 3\r\n`
     + `$task = ${psQuote(CONTROLLED_NODE_SERVICE.WINDOWS_TASK)}\r\n`
@@ -1258,6 +1269,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     + `$journalBackedUp = $false\r\n`
     + `$journalPublished = $false\r\n`
     + `$healthy = $false\r\n`
+    + `$transactionTerminal = $false\r\n`
     + helperVariables
     + remoteDesktopVariables
     + journalVariables
@@ -1280,16 +1292,24 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     + releasePreflightGuard
     + `$upgradePhase = 'install'\r\n`
     + `try {\r\n`
-    + `@{ version = 1; startedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() } | ConvertTo-Json -Compress | Set-Content -LiteralPath $upgradeMarker -Encoding utf8\r\n`
+    + transactionIntent
+    + `$rollbackMainHash = $currentMainHash\r\n`
+    + `try { $durableTransaction = Get-Content -LiteralPath $upgradeMarker -Raw | ConvertFrom-Json; if ([int]$durableTransaction.version -eq ${CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_VERSION} -and [string]$durableTransaction.previousReceipt.sha256 -cmatch '^[a-f0-9]{64}$') { $rollbackMainHash = [string]$durableTransaction.previousReceipt.sha256 } } catch { }\r\n`
     + `Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue\r\n`
     + `& $waitForNodeExecutableRelease\r\n`
-    + `Remove-Item -Force $backupDst,$backupManifest -ErrorAction SilentlyContinue\r\n`
-    + `if (Test-Path $dst) { Copy-Item -Force $dst $backupDst; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $backupDst).Hash.ToLowerInvariant() -cne $currentMainHash) { throw 'controlled node backup hash mismatch' }; $mainBackedUp = $true }\r\n`
-    + `if (Test-Path $dstManifest) { Copy-Item -Force $dstManifest $backupManifest; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $backupManifest).Hash.ToLowerInvariant() -cne $currentManifestHash) { throw 'controlled node manifest backup hash mismatch' }; $manifestBackedUp = $true }\r\n`
-    + `Copy-Item -Force $src $dst\r\n`
+    + `$publishAtomic = { param([string]$source,[string]$destination,[string]$backup) $pending = "$destination.pending-$PID"; Remove-Item -Force -LiteralPath $pending -ErrorAction SilentlyContinue; Copy-Item -Force -LiteralPath $source -Destination $pending; if (Test-Path -LiteralPath $destination) { [IO.File]::Replace($pending, $destination, $backup, $true) } else { Move-Item -LiteralPath $pending -Destination $destination }; }\r\n`
+    + `$currentPublishedHash = if (Test-Path -LiteralPath $dst) { (Get-FileHash -Algorithm SHA256 -LiteralPath $dst).Hash.ToLowerInvariant() } else { '' }\r\n`
+    + `if ($currentPublishedHash -cne $srcHash) {\r\n`
+    + `  if ($currentPublishedHash -cne $rollbackMainHash -and (Test-Path -LiteralPath $backupDst) -and (Get-FileHash -Algorithm SHA256 -LiteralPath $backupDst).Hash.ToLowerInvariant() -eq $rollbackMainHash) { & $publishAtomic $backupDst $dst "$dst.recovery-discard"; Remove-Item -Force "$dst.recovery-discard" -ErrorAction SilentlyContinue }\r\n`
+    + `  if ((Test-Path -LiteralPath $dst) -and (Get-FileHash -Algorithm SHA256 -LiteralPath $dst).Hash.ToLowerInvariant() -cne $rollbackMainHash) { throw 'controlled node interrupted upgrade has no trusted publication base' }\r\n`
+    + `  Remove-Item -Force $backupDst -ErrorAction SilentlyContinue\r\n`
+    + `  & $publishAtomic $src $dst $backupDst\r\n`
+    + `}\r\n`
+    + `$mainBackedUp = Test-Path -LiteralPath $backupDst\r\n`
     + `$mainPublished = $true\r\n`
     + `& $verifyReleaseArtifact $dst\r\n`
-    + `Copy-Item -Force $srcManifest $dstManifest\r\n`
+    + `if ((Test-Path -LiteralPath $dstManifest) -and -not (Test-Path -LiteralPath $backupManifest)) { Copy-Item -Force -LiteralPath $dstManifest -Destination $backupManifest }\r\n`
+    + `$pendingManifest = "$dstManifest.pending-$PID"; $manifestSwapBackup = "$dstManifest.swap-old-$PID"; Remove-Item -Force $manifestSwapBackup -ErrorAction SilentlyContinue; Copy-Item -Force -LiteralPath $srcManifest -Destination $pendingManifest; if (Test-Path -LiteralPath $dstManifest) { [IO.File]::Replace($pendingManifest, $dstManifest, $manifestSwapBackup, $true); Remove-Item -Force $manifestSwapBackup -ErrorAction SilentlyContinue } else { Move-Item -LiteralPath $pendingManifest -Destination $dstManifest }\r\n`
     + `if ((Get-FileHash -Algorithm SHA256 -LiteralPath $dstManifest).Hash.ToLowerInvariant() -cne $srcManifestHash) { throw 'controlled node published manifest hash mismatch' }\r\n`
     + `$manifestPublished = $true\r\n`
     + helperSwap
@@ -1322,6 +1342,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     + `  } catch { $healthy = $false }\r\n`
     + `}\r\n`
     + `if (-not $healthy) { throw 'controlled node upgrade failed authenticated health verification' }\r\n`
+    + `$transactionTerminal = $true\r\n`
     + `Remove-Item -Force $backupDst,$backupManifest -ErrorAction SilentlyContinue\r\n`
     + helperCleanup
     + remoteDesktopCleanup
@@ -1335,7 +1356,7 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     + `try { $upgradeResultPersisted = [bool](& $writeUpgradeResult @{ status = 'rollback_started'; phase = 'rollback'; failedPhase = $upgradePhase; error = $failureMessage; reason = $failureMessage; recordedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }) } catch { Write-Warning 'IMCODES_UPGRADE_RESULT_PERSIST_FAILED phase=rollback_started' }\r\n`
     + `$rollbackExecutableReleased = [bool](& $runRecovery 'stop_new_node' { Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue; & $waitForNodeExecutableRelease; return $true })\r\n`
     + `if ($rollbackExecutableReleased) {\r\n`
-    + `& $runRecovery 'restore_main' { if ($mainBackedUp -and (Test-Path $backupDst)) { if ((Get-FileHash -Algorithm SHA256 -LiteralPath $backupDst).Hash.ToLowerInvariant() -cne $currentMainHash) { throw 'controlled node rollback source hash mismatch' }; Copy-Item -Force $backupDst $dst; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $dst).Hash.ToLowerInvariant() -cne $currentMainHash) { throw 'controlled node restored hash mismatch' } } elseif ($mainPublished) { Remove-Item -Force $dst -ErrorAction Stop } }\r\n`
+    + `& $runRecovery 'restore_main' { if ($mainBackedUp -and (Test-Path $backupDst)) { if ((Get-FileHash -Algorithm SHA256 -LiteralPath $backupDst).Hash.ToLowerInvariant() -cne $rollbackMainHash) { throw 'controlled node rollback source hash mismatch' }; Copy-Item -Force $backupDst $dst; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $dst).Hash.ToLowerInvariant() -cne $rollbackMainHash) { throw 'controlled node restored hash mismatch' } } elseif ($mainPublished) { Remove-Item -Force $dst -ErrorAction Stop } }\r\n`
     + `& $runRecovery 'restore_manifest' { if ($manifestBackedUp -and (Test-Path $backupManifest)) { if ((Get-FileHash -Algorithm SHA256 -LiteralPath $backupManifest).Hash.ToLowerInvariant() -cne $currentManifestHash) { throw 'controlled node manifest rollback source hash mismatch' }; Copy-Item -Force $backupManifest $dstManifest; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $dstManifest).Hash.ToLowerInvariant() -cne $currentManifestHash) { throw 'controlled node restored manifest hash mismatch' } } elseif ($manifestPublished) { Remove-Item -Force $dstManifest -ErrorAction Stop } }\r\n`
     + (helperRollback ? `& $runRecovery 'restore_helper' { ${helperRollback.replaceAll('\r\n', '; ')} }\r\n` : '')
     + (remoteDesktopRollback ? `& $runRecovery 'restore_remote_desktop' { ${remoteDesktopRollback.replaceAll('\r\n', '; ')} }\r\n` : '')
@@ -1348,14 +1369,17 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     + `[void]$recoveryFailures.Add('restore_artifacts: skipped because the controlled node executable release fence failed')\r\n`
     + `}\r\n`
     + `$rollbackStatus = if ($recoveryFailures.Count -eq 0) { 'rolled_back' } else { 'rollback_failed' }\r\n`
+    + `if ($rollbackStatus -eq 'rolled_back') { $transactionTerminal = $true }\r\n`
     + `$upgradeResultPersisted = $false\r\n`
     + `try { $upgradeResultPersisted = [bool](& $writeUpgradeResult @{ status = $rollbackStatus; phase = 'rollback'; failedPhase = $upgradePhase; error = $failureMessage; reason = $failureMessage; recoveryFailures = @($recoveryFailures); completedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }) } catch { Write-Warning 'IMCODES_UPGRADE_RESULT_PERSIST_FAILED phase=rollback' }\r\n`
     + `throw\r\n`
     + `} finally {\r\n`
-    + `Remove-Item -Force -LiteralPath $upgradeMarker -ErrorAction SilentlyContinue\r\n`
+    + `if ($transactionTerminal) { Remove-Item -Force -LiteralPath $upgradeMarker -ErrorAction SilentlyContinue }\r\n`
     + `Start-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue\r\n`
-    + upgradeTaskCleanup
-    + stagingCleanup
+    + `if ($transactionTerminal) {\r\n`
+    + upgradeTaskCleanup.split('\r\n').filter(Boolean).map((line) => `  ${line}\r\n`).join('')
+    + stagingCleanup.split('\r\n').filter(Boolean).map((line) => `  ${line}\r\n`).join('')
+    + `}\r\n`
     + `}\r\n`;
 }
 
@@ -1374,7 +1398,7 @@ export function windowsControlledNodeUpgradeTaskXml(scriptPath: string): string 
   return `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo><Description>IM.codes controlled node one-shot upgrade</Description></RegistrationInfo>
-  <Triggers />
+  <Triggers><BootTrigger><Enabled>true</Enabled></BootTrigger></Triggers>
   <Principals><Principal id="System"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
   <Settings>
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
@@ -1382,6 +1406,7 @@ export function windowsControlledNodeUpgradeTaskXml(scriptPath: string): string 
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <AllowHardTerminate>false</AllowHardTerminate>
     <AllowStartOnDemand>true</AllowStartOnDemand>
+    <StartWhenAvailable>true</StartWhenAvailable>
     <Enabled>true</Enabled>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
   </Settings>
