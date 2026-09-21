@@ -4,7 +4,7 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { h } from 'preact';
 import { useLayoutEffect } from 'preact/hooks';
-import { render, screen, fireEvent, cleanup, act } from '@testing-library/preact';
+import { render, screen, fireEvent, cleanup, act, waitFor } from '@testing-library/preact';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -206,6 +206,48 @@ describe('AtPicker', () => {
     expect(screen.getByText('worker1')).toBeDefined();
     expect(screen.getByText('worker2')).toBeDefined();
     expect(screen.queryByText('other9')).toBeNull();
+  });
+
+  it('keeps a long @ agent list visible, wraps, and skips the disabled self row', async () => {
+    const wsClient = { connected: true, send: vi.fn(), onMessage: vi.fn(() => () => {}) };
+    render(
+      <AtPicker
+        query=""
+        sessions={[
+          { name: 'deck_proj_brain', agentType: 'claude-code', state: 'idle', parentSession: null, isSelf: true },
+          ...Array.from({ length: 10 }, (_, index) => ({
+            name: `deck_sub_worker${index + 1}`,
+            agentType: 'codex',
+            state: 'idle',
+            parentSession: 'deck_proj_brain',
+          })),
+        ]}
+        rootSession="deck_proj_brain"
+        wsClient={wsClient as any}
+        projectDir="/tmp/proj"
+        onSelectFile={vi.fn()}
+        onSelectAgent={vi.fn()}
+        onSelectDelegateAgent={vi.fn()}
+        onClose={vi.fn()}
+        visible
+      />,
+    );
+    fireEvent.click(screen.getByText('agents'));
+
+    const target = screen.getByText('worker9').closest('div') as HTMLElement;
+    const scrollIntoView = vi.fn();
+    target.scrollIntoView = scrollIntoView;
+    for (let index = 0; index < 8; index += 1) fireEvent.keyDown(document, { key: 'ArrowDown' });
+
+    await waitFor(() => expect(target.getAttribute('data-hl')).toBe('true'));
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' });
+
+    fireEvent.keyDown(document, { key: 'Home' });
+    fireEvent.keyDown(document, { key: 'ArrowUp' });
+    expect(screen.getByText('worker10').closest('div')?.getAttribute('data-hl')).toBe('true');
+    expect(screen.getByText('brain').closest('div')?.getAttribute('data-hl')).toBeNull();
+    fireEvent.keyDown(document, { key: 'ArrowDown' });
+    expect(screen.getByText('worker1').closest('div')?.getAttribute('data-hl')).toBe('true');
   });
 
   it('agents step includes SDK transport agents and keeps shell/script out', () => {

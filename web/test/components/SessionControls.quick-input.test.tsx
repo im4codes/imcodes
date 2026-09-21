@@ -48,6 +48,15 @@ vi.mock('../../src/hooks/useMachines.js', () => ({
   useMachines: (query = '') => {
     const machines = [
       { serverId: 'srv-online', nodeId: CONTROLLED_NODE_ID_MIN, refName: 'online-node', displayName: 'Online Node', os: 'windows', online: true, execEnabled: true },
+      ...Array.from({ length: 10 }, (_, index) => ({
+        serverId: `srv-long-${index + 1}`,
+        nodeId: String(1_000_000_100 + index),
+        refName: `long-node-${index + 1}`,
+        displayName: `Long Node ${index + 1}`,
+        os: 'linux',
+        online: true,
+        execEnabled: true,
+      })),
       { serverId: 'srv-offline', nodeId: CONTROLLED_NODE_ID_MAX, refName: '', displayName: 'Offline Node', os: 'windows', online: false, execEnabled: true },
     ];
     const normalized = query.toLocaleLowerCase();
@@ -440,6 +449,75 @@ describe('SessionControls quick input integration', () => {
     input.textContent = '!err';
     fireEvent.input(input);
     expect(container.querySelector('.controls-slash-picker')).toBeNull();
+  });
+
+  it('keeps a long # phrase list keyboard selection visible and wraps both directions', async () => {
+    const quickData = {
+      ...makeQuickData(),
+      data: {
+        history: [],
+        sessionHistory: {},
+        commands: [],
+        phrases: Array.from({ length: 12 }, (_, index) => `zz phrase ${index + 1}`),
+      },
+    };
+    const { container } = render(
+      <SessionControls
+        ws={{ connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any}
+        activeSession={makeSession()}
+        quickData={quickData}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+    const input = screen.getByRole('textbox');
+    input.textContent = '#zz';
+    fireEvent.input(input);
+
+    const target = container.querySelector<HTMLElement>('[data-quick-phrase="zz phrase 9"]')!;
+    const scrollIntoView = vi.fn();
+    target.scrollIntoView = scrollIntoView;
+    for (let index = 0; index < 8; index += 1) fireEvent.keyDown(input, { key: 'ArrowDown' });
+
+    await waitFor(() => expect(target.getAttribute('aria-selected')).toBe('true'));
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' });
+
+    fireEvent.keyDown(input, { key: 'Home' });
+    fireEvent.keyDown(input, { key: 'ArrowUp' });
+    expect(container.querySelector('[data-quick-phrase="zz phrase 12"]')?.getAttribute('aria-selected')).toBe('true');
+    fireEvent.keyDown(input, { key: 'ArrowDown' });
+    expect(container.querySelector('[data-quick-phrase="zz phrase 1"]')?.getAttribute('aria-selected')).toBe('true');
+  });
+
+  it('keeps a long ^ machine list keyboard selection visible and wraps both directions', async () => {
+    const { container } = render(
+      <SessionControls
+        ws={{ connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+    const input = screen.getByRole('textbox');
+    input.textContent = '^';
+    fireEvent.input(input);
+
+    const target = container.querySelector<HTMLElement>('[data-machine-node-id="1000000107"]')!;
+    const scrollIntoView = vi.fn();
+    target.scrollIntoView = scrollIntoView;
+    for (let index = 0; index < 8; index += 1) fireEvent.keyDown(input, { key: 'ArrowDown' });
+
+    await waitFor(() => expect(target.getAttribute('aria-selected')).toBe('true'));
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' });
+
+    fireEvent.keyDown(input, { key: 'Home' });
+    fireEvent.keyDown(input, { key: 'ArrowUp' });
+    expect(container.querySelector(`[data-machine-node-id="${CONTROLLED_NODE_ID_MAX}"]`)?.getAttribute('aria-selected')).toBe('true');
+    fireEvent.keyDown(input, { key: 'ArrowDown' });
+    expect(container.querySelector(`[data-machine-node-id="${CONTROLLED_NODE_ID_MIN}"]`)?.getAttribute('aria-selected')).toBe('true');
   });
 
   it('does not open command or phrase suggestions when the trigger is not the first character', () => {

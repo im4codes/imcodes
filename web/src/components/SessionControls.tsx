@@ -20,6 +20,7 @@ import { CloneSessionGroupDialog } from './CloneSessionGroupDialog.js';
 import { ConfirmButton } from './ConfirmButton.js';
 import { useSwipeBack } from '../hooks/useSwipeBack.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
+import { useListboxNavigation } from '../hooks/useListboxNavigation.js';
 import { SessionActionMenuIcon } from './SessionActionMenuIcon.js';
 import { SupervisionHeartbeatBadge } from './SupervisionHeartbeatBadge.js';
 import * as VoiceInput from './VoiceInput.js';
@@ -1322,6 +1323,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [fileDragActive, setFileDragActive] = useState(false);
   const controlsWrapperRef = useRef<HTMLDivElement>(null);
   const aliasPickerRef = useRef<HTMLDivElement>(null);
+  const machinePickerRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const modelRef = useRef<HTMLDivElement>(null);
   const autoRef = useRef<HTMLDivElement>(null);
@@ -1597,11 +1599,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     error: aliasError,
     refetch: refetchAliases,
   } = useAliases(aliasQuery);
-  useEffect(() => {
-    if (!aliasPickerOpen || aliasFiltered.length === 0) return;
-    const highlighted = aliasPickerRef.current?.querySelector<HTMLElement>('[data-hl="true"]');
-    highlighted?.scrollIntoView({ block: 'nearest' });
-  }, [aliasFiltered, aliasHighlightIdx, aliasPickerOpen]);
+  const {
+    activeIndex: activeAliasIndex,
+    handleNavigationKey: handleAliasNavigationKey,
+  } = useListboxNavigation({
+    activeIndex: aliasHighlightIdx,
+    containerRef: aliasPickerRef,
+    itemCount: aliasFiltered.length,
+    open: aliasPickerOpen,
+    setActiveIndex: setAliasHighlightIdx,
+  });
   // Shared machine data — feeds compose-time resolution on send (the out-of-band
   // `resolvedMachines` hint) and the inline `^` autocomplete. `machineFiltered`
   // is the refName+displayName filtered view for the current inline query;
@@ -1613,6 +1620,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     machines: machineAll,
     filtered: machineFiltered,
   } = useMachines(machineQuery);
+  const {
+    activeIndex: activeMachineIndex,
+    handleNavigationKey: handleMachineNavigationKey,
+  } = useListboxNavigation({
+    activeIndex: machineHighlightIdx,
+    containerRef: machinePickerRef,
+    itemCount: machineFiltered.length,
+    open: machinePickerOpen,
+    setActiveIndex: setMachineHighlightIdx,
+  });
   const publishComposerText = useCallback((text: string) => {
     onComposerTextChange?.(text);
   }, [onComposerTextChange]);
@@ -2143,13 +2160,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       closeQuickSuggestions();
     }
   }, [closeQuickSuggestions, quickSuggestionKind, quickSuggestions.length]);
-  useEffect(() => {
-    if (quickSuggestionKind === null || quickSuggestions.length === 0) return;
-    const highlighted = quickSuggestionPickerRef.current?.querySelector<HTMLElement>('[data-hl="true"]');
-    if (typeof highlighted?.scrollIntoView === 'function') {
-      highlighted.scrollIntoView({ block: 'nearest' });
-    }
-  }, [quickSuggestionHighlightIdx, quickSuggestionKind, quickSuggestions]);
+  const {
+    activeIndex: activeQuickSuggestionIndex,
+    handleNavigationKey: handleQuickSuggestionNavigationKey,
+  } = useListboxNavigation({
+    activeIndex: quickSuggestionHighlightIdx,
+    containerRef: quickSuggestionPickerRef,
+    itemCount: quickSuggestions.length,
+    open: quickSuggestionKind !== null,
+    setActiveIndex: setQuickSuggestionHighlightIdx,
+  });
   const { allCombos } = useP2pCustomCombos();
   const comboMenuItems = useMemo(
     () => [...allCombos.presets.map((combo) => combo.key), ...allCombos.custom],
@@ -4699,16 +4719,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
 
     if (quickSuggestionKind !== null) {
-      if (e.key === 'ArrowDown') {
-        e.preventDefault();
-        if (quickSuggestions.length > 0) setQuickSuggestionHighlightIdx((idx) => (idx + 1) % quickSuggestions.length);
-        return;
-      }
-      if (e.key === 'ArrowUp') {
-        e.preventDefault();
-        if (quickSuggestions.length > 0) setQuickSuggestionHighlightIdx((idx) => (idx - 1 + quickSuggestions.length) % quickSuggestions.length);
-        return;
-      }
+      if (handleQuickSuggestionNavigationKey(e)) return;
       if (e.key === 'Escape') {
         e.preventDefault();
         e.stopPropagation();
@@ -4737,7 +4748,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       } else if ((e.key === 'Tab' || e.key === 'Enter') && quickSuggestions.length > 0) {
         e.preventDefault();
         e.stopPropagation();
-        const suggestion = quickSuggestions[Math.min(quickSuggestionHighlightIdx, quickSuggestions.length - 1)];
+        const suggestion = quickSuggestions[activeQuickSuggestionIndex];
         if (suggestion) selectQuickSuggestion(suggestion);
         return;
       }
@@ -4749,16 +4760,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     // can accept something). With the picker CLOSED, none of this runs and
     // Enter reaches the normal send path below.
     if (aliasPickerOpen) {
-      if (e.key === 'ArrowDown') {
-        e.preventDefault();
-        if (aliasFiltered.length > 0) setAliasHighlightIdx((h) => (h + 1) % aliasFiltered.length);
-        return;
-      }
-      if (e.key === 'ArrowUp') {
-        e.preventDefault();
-        if (aliasFiltered.length > 0) setAliasHighlightIdx((h) => (h - 1 + aliasFiltered.length) % aliasFiltered.length);
-        return;
-      }
+      if (handleAliasNavigationKey(e)) return;
       if (e.key === 'Escape') {
         e.preventDefault();
         e.stopPropagation();
@@ -4769,7 +4771,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       if ((e.key === 'Tab' || e.key === 'Enter') && aliasFiltered.length > 0) {
         e.preventDefault();
         e.stopPropagation();
-        const chosen = aliasFiltered[Math.min(aliasHighlightIdx, aliasFiltered.length - 1)];
+        const chosen = aliasFiltered[activeAliasIndex];
         setAliasPickerOpen(false);
         setAliasQuery('');
         aliasJustClosedRef.current = true;
@@ -4783,16 +4785,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     // mirroring the alias picker. Online state never changes selectability.
     if (machinePickerOpen) {
       const count = machineFiltered.length;
-      if (e.key === 'ArrowDown') {
-        e.preventDefault();
-        if (count > 0) setMachineHighlightIdx((h) => (h + 1) % count);
-        return;
-      }
-      if (e.key === 'ArrowUp') {
-        e.preventDefault();
-        if (count > 0) setMachineHighlightIdx((h) => (h - 1 + count) % count);
-        return;
-      }
+      if (handleMachineNavigationKey(e)) return;
       if (e.key === 'Escape') {
         e.preventDefault();
         e.stopPropagation();
@@ -4803,7 +4796,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       if ((e.key === 'Tab' || e.key === 'Enter') && count > 0) {
         e.preventDefault();
         e.stopPropagation();
-        const chosen = machineFiltered[Math.min(machineHighlightIdx, count - 1)];
+        const chosen = machineFiltered[activeMachineIndex];
         setMachinePickerOpen(false);
         setMachineQuery('');
         machineJustClosedRef.current = true;
@@ -6838,7 +6831,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               </div>
             )}
             {quickSuggestions.map((suggestion, idx) => {
-              const highlighted = idx === Math.min(quickSuggestionHighlightIdx, quickSuggestions.length - 1);
+              const highlighted = idx === activeQuickSuggestionIndex;
               return (
                 <div
                   key={suggestion}
@@ -6872,7 +6865,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               </div>
             )}
             {aliasFiltered.map((a, idx) => {
-              const hl = idx === Math.min(aliasHighlightIdx, aliasFiltered.length - 1);
+              const hl = idx === activeAliasIndex;
               return (
                 <div
                   key={a.name}
@@ -6902,9 +6895,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             owns Enter/Tab/Arrow/Escape via handleKeyDown while open. Connectivity
             remains visible but does not prevent inserting a stable marker. */}
         {machinePickerOpen && activeSession && (() => {
-          const effHighlight = Math.min(machineHighlightIdx, Math.max(0, machineFiltered.length - 1));
           return (
-            <div class="controls-machine-picker" role="listbox" aria-label={t('machine.category')} style={aliasPickerContainerStyle}>
+            <div ref={machinePickerRef} class="controls-machine-picker" role="listbox" aria-label={t('machine.category')} style={aliasPickerContainerStyle}>
               <div style={aliasPickerGroupLabelStyle}>
                 {t('machine.category')} {machineQuery ? `— "${machineQuery}"` : ''}
               </div>
@@ -6914,7 +6906,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 </div>
               )}
               {machineFiltered.map((m, idx) => {
-                const hl = idx === effHighlight;
+                const hl = idx === activeMachineIndex;
                 return (
                   <div
                     key={m.serverId}
