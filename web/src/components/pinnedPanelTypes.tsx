@@ -267,6 +267,7 @@ registerPanelType('cronmanager', {
         activeSession={ctx.activeSession}
         sharedSessionName={ctx.sharedAccessRole ? ctx.activeSession ?? undefined : undefined}
         readOnly={ctx.sharedAccessRole === 'viewer'}
+        portalSubPanels
         onBack={() => {}}
         onNavigateSession={(sessionName, quote) => {
           window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: sessionName, quote } }));
