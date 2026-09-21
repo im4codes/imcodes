@@ -45,9 +45,9 @@ describe('aiDesk application bundle', () => {
     const plist = buildAideskInfoPlist({ version: '2026.9.1', minimumSystemVersion: '12.3' });
     expect(plist).toContain(`<string>${MACOS_AIDESK_BUNDLE_ID}</string>`);
     expect(plist).toContain(`<string>${AIDESK_MAIN_EXECUTABLE}</string>`);
-    // An agent, not something to alt-tab to: it owns permissions and execs
-    // into helpers, and has no window of its own.
-    expect(plist).toContain('<key>LSUIElement</key>');
+    // The same signed app is now the user's explicit local-management entry;
+    // it must be visible in Dock while running, not hidden as an LSUIElement.
+    expect(plist).not.toContain('<key>LSUIElement</key>');
   });
 
   it('refuses a version or system floor it cannot describe', () => {

@@ -46,6 +46,7 @@
 #include "rtc_base/ssl_adapter.h"
 
 #include "../remote-desktop-common/json_protocol.h"
+#include "../remote-desktop-common/local_management_types.h"
 #include "../remote-desktop-common/signaling_types.h"
 #include "linux_platform_adapters.h"
 #include "linux_remote_desktop_session.h"
@@ -548,6 +549,12 @@ int main() {
   if (!connection) { std::fprintf(stderr, "linux worker: cannot open X display\n"); return 10; }
   auto adapters = rd::LinuxPlatformAdapters::Create(connection);
   if (!adapters) { std::fprintf(stderr, "linux worker: LinuxPlatformAdapters::Create failed\n"); return 11; }
+  // The worker is the local agent. Its corner affordance exists for the whole
+  // worker lifetime, not only after a remote PREPARE arrives.
+  if (!adapters->disclosure().Show(0, 0)) {
+    std::fprintf(stderr, "linux worker: idle disclosure unavailable\n");
+    return 14;
+  }
 
   auto signaling_thread = webrtc::Thread::Create();
   signaling_thread->Start();
@@ -603,6 +610,11 @@ int main() {
     if (line.empty()) continue;
     Json::Value root;
     if (!imcodes::rd::ParseJson(line, &root)) continue;
+    if (root["type"].asString() == common::kLocalAccessStateType &&
+        root["paused"].isBool()) {
+      adapters->disclosure().SetAccessPaused(root["paused"].asBool());
+      continue;
+    }
     auto signal = imcodes::rd::ParseServiceSignal(root, NowUnixMs());
     if (!signal) continue;
     // Posted, not called directly, and posted tasks on one webrtc::Thread

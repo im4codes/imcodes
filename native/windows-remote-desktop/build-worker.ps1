@@ -57,6 +57,9 @@ $ExpectedSources = @(
   'worker_main.cc'
 )
 $ExpectedCommonSources = @(
+  'aidesk_product_name.h',
+  'local_management_types.h',
+  'local_indicator_visuals.h',
   'BUILD.gn',
   'data_channel_constants.h',
   'data_channel_payload.cc', 'data_channel_payload.h',

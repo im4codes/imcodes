@@ -28,6 +28,7 @@ import {
   stopAllLocalRemoteDesktopConnections,
   stopLocalRemoteDesktopConnection,
 } from './remote-desktop-local-worker-control.js';
+import { REMOTE_DESKTOP_LOCAL_WORKER_MSG } from '../../shared/remote-desktop-local-management.js';
 import type { ControlledNodeRemoteDesktopWorker } from './runtime.js';
 import logger from '../util/logger.js';
 import {
@@ -233,6 +234,19 @@ export class LinuxRemoteDesktopWorkerHost implements ControlledNodeRemoteDesktop
 
   async stopAllConnections(): Promise<void> {
     await stopAllLocalRemoteDesktopConnections(this.core, (command) => this.handle(command));
+  }
+
+  /** Keep the X11 local affordance alive even before the first PREPARE. */
+  async start(): Promise<void> {
+    this.ensureSpawned();
+  }
+
+  setAccessPaused(paused: boolean): void {
+    if (!this.child) return;
+    this.child.stdin.write(`${JSON.stringify({
+      type: REMOTE_DESKTOP_LOCAL_WORKER_MSG.ACCESS_STATE,
+      paused,
+    })}\n`);
   }
 
   async handle(message: unknown): Promise<boolean> {

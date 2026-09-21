@@ -329,7 +329,7 @@ describe('windows remote-desktop indicator branding', () => {
   it('shows the product name in text, not only as a mark', () => {
     // A logo alone is unreadable to a screen magnifier user and disappears
     // entirely when the bitmap cannot be composited.
-    expect(indicator).toContain('kProductName[] = L"IM.codes"');
+    expect(indicator).toContain('common::kAiDeskProductNameWide');
     expect(indicator).toContain('kSurfaceName[] = L"Remote Desktop"');
   });
 
@@ -364,7 +364,7 @@ describe('windows remote-desktop indicator branding', () => {
     // atomic counters; a std::wstring built from anything else is a red flag.
     for (const [, argument] of indicator.matchAll(/DrawTextW\(dc,\s*([^,]+),/g)) {
       expect(
-        /^(L"|stopping \?|heading\.c_str\(\)|detail\.c_str\(\))/.test(argument.trim()),
+        /^(L"|stopping \?|heading\.c_str\(\)|detail\.c_str\(\)|value\.c_str\(\))/.test(argument.trim()),
         `DrawTextW renders a constant or a counter-derived string, got: ${argument.trim()}`,
       ).toBe(true);
     }

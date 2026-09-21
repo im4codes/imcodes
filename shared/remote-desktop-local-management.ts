@@ -27,6 +27,11 @@ export const REMOTE_DESKTOP_LOCAL_ACTION = Object.freeze({
   DISCONNECT: 'disconnect',
 } as const);
 
+/** Service-owned host → native worker status; never accepted from the server. */
+export const REMOTE_DESKTOP_LOCAL_WORKER_MSG = Object.freeze({
+  ACCESS_STATE: 'local_access_state',
+} as const);
+
 export type RemoteDesktopLocalAction = typeof REMOTE_DESKTOP_LOCAL_ACTION[
   keyof typeof REMOTE_DESKTOP_LOCAL_ACTION
 ];

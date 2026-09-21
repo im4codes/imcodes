@@ -1,5 +1,7 @@
 #include "third_party/imcodes_remote_desktop/local_indicator.h"
 #include "third_party/imcodes_remote_desktop/common/platform_interfaces.h"
+#include "third_party/imcodes_remote_desktop/common/aidesk_product_name.h"
+#include "third_party/imcodes_remote_desktop/common/local_indicator_visuals.h"
 
 #include <algorithm>
 #include <cstring>
@@ -14,6 +16,7 @@
 #include "third_party/imcodes_remote_desktop/brand_logo_generated.h"
 
 namespace imcodes::rd {
+namespace common = imcodes::remote_desktop::common;
 namespace {
 
 constexpr wchar_t kWindowClass[] = L"IMCodesRemoteDesktopIndicator";
@@ -26,17 +29,18 @@ constexpr UINT kDispatchInputMessage = WM_APP + 3;
 constexpr UINT kProbeInputMessage = WM_APP + 4;
 constexpr UINT kReadClipboardMessage = WM_APP + 5;
 constexpr UINT kMovePointerMessage = WM_APP + 6;
+constexpr UINT_PTR kAutoCollapseTimer = 1;
 // Logical (96-dpi) geometry. Every consumer scales it through Scaled(); the
 // window used to be laid out in raw pixels while only the fonts scaled, so at
 // 200% the text overflowed a window that had stayed 368x148.
 constexpr int kExpandedWidth = 368;
 constexpr int kExpandedHeight = 148;
-constexpr int kCollapsedSize = 38;
+constexpr int kCollapsedWidth = 54;
+constexpr int kCollapsedHeight = 38;
 constexpr int kCornerMargin = 14;
 constexpr int kLogoLogicalSize = 20;
 // The product name is a compile-time constant on purpose. Nothing a remote
 // requester sends may ever reach this window -- see the note on Update().
-constexpr wchar_t kProductName[] = L"IM.codes";
 constexpr wchar_t kSurfaceName[] = L"Remote Desktop";
 
 int Scaled(UINT dpi, int logical) {
@@ -72,15 +76,18 @@ struct Palette {
   COLORREF stop_text;
 };
 
-Palette CurrentPalette(bool stopping) {
+Palette CurrentPalette(bool stopping, bool paused, int viewers, int controllers) {
   if (HighContrastActive()) {
     const COLORREF window = GetSysColor(COLOR_WINDOW);
     const COLORREF text = GetSysColor(COLOR_WINDOWTEXT);
     const COLORREF accent = GetSysColor(stopping ? COLOR_GRAYTEXT : COLOR_HOTLIGHT);
     return Palette{window, text, text, text, window, accent, text};
   }
+  const COLORREF state = paused ? RGB(129, 139, 151)
+      : controllers > 0 ? RGB(244, 80, 112)
+      : viewers > 0 ? RGB(242, 169, 59) : RGB(50, 196, 255);
   return Palette{
-      RGB(5, 16, 29), RGB(50, 196, 255), RGB(227, 247, 255), RGB(137, 177, 205),
+      RGB(5, 16, 29), state, RGB(227, 247, 255), RGB(137, 177, 205),
       stopping ? RGB(52, 63, 74) : RGB(116, 29, 49),
       stopping ? RGB(88, 103, 117) : RGB(244, 80, 112),
       stopping ? RGB(165, 179, 190) : RGB(255, 236, 241)};
@@ -285,6 +292,12 @@ void LocalIndicator::Update(int viewers, int controllers) {
   if (window) SendMessageW(window, kUpdateMessage, 0, 0);
 }
 
+void LocalIndicator::UpdateAccessPaused(bool paused) {
+  access_paused_ = paused;
+  const HWND window = window_.load();
+  if (window) PostMessageW(window, kUpdateMessage, 0, 0);
+}
+
 UINT LocalIndicator::DispatchInput(UINT count, LPINPUT inputs, int size) {
   const HWND window = window_.load();
   if (!window || !inputs || count == 0 || size != sizeof(INPUT)) return 0;
@@ -362,11 +375,11 @@ LRESULT LocalIndicator::HandleMessage(HWND window, UINT message,
       return 1;
     case WM_LBUTTONUP: {
       if (collapsed_) {
-        const std::string_view url =
-            imcodes::remote_desktop::common::kLocalManagementUrl;
-        const std::wstring wide(url.begin(), url.end());
-        ShellExecuteW(nullptr, L"open", wide.c_str(), nullptr, nullptr,
-                      SW_SHOWNORMAL);
+        SetCollapsed(false, true);
+        if (viewers_.load() > 0) {
+          SetTimer(window, kAutoCollapseTimer,
+                   common::kLocalIndicatorAutoCollapseDelayMs, nullptr);
+        }
         return 0;
       }
       RECT client{};
@@ -377,9 +390,23 @@ LRESULT LocalIndicator::HandleMessage(HWND window, UINT message,
         SetCollapsed(true, true);
       } else if (Contains(StopRect(client, WindowDpi(window)), x, y)) {
         RequestStopAll();
+      } else {
+        const std::string_view url = common::kLocalManagementUrl;
+        const std::wstring wide(url.begin(), url.end());
+        ShellExecuteW(nullptr, L"open", wide.c_str(), nullptr, nullptr,
+                      SW_SHOWNORMAL);
       }
       return 0;
     }
+    case WM_TIMER:
+      if (wparam == kAutoCollapseTimer) {
+        KillTimer(window, kAutoCollapseTimer);
+        if (viewers_.load() > 0 && !confirming_stop_.load()) {
+          SetCollapsed(true, false);
+        }
+        return 0;
+      }
+      break;
     case WM_SETCURSOR: {
       POINT cursor{};
       GetCursorPos(&cursor);
@@ -451,9 +478,22 @@ LRESULT LocalIndicator::HandleMessage(HWND window, UINT message,
         }
       }
       return 0;
-    case kUpdateMessage:
+    case kUpdateMessage: {
+      const int viewers = viewers_.load();
+      const int controllers = controllers_.load();
+      if (viewers > 0 &&
+          (viewers != presented_viewers_ || controllers != presented_controllers_)) {
+        SetCollapsed(false, false);
+        SetTimer(window, kAutoCollapseTimer,
+                 common::kLocalIndicatorAutoCollapseDelayMs, nullptr);
+      } else if (viewers == 0) {
+        KillTimer(window, kAutoCollapseTimer);
+      }
+      presented_viewers_ = viewers;
+      presented_controllers_ = controllers;
       RefreshWindow();
       return 0;
+    }
     case kDispatchInputMessage: {
       auto* request = reinterpret_cast<InputDispatchRequest*>(lparam);
       if (!request || !request->inputs || request->count == 0 ||
@@ -578,8 +618,8 @@ void LocalIndicator::ThreadMain() {
   collapsed_ = ReadCollapsedPreference();
   // Creation size is logical only; the window does not exist yet so its DPI is
   // unknown. AnchorToCorner() re-sizes with the real monitor DPI right after.
-  const int width = collapsed_ ? kCollapsedSize : kExpandedWidth;
-  const int height = collapsed_ ? kCollapsedSize : kExpandedHeight;
+  const int width = collapsed_ ? kCollapsedWidth : kExpandedWidth;
+  const int height = collapsed_ ? kCollapsedHeight : kExpandedHeight;
   const HWND window = CreateWindowExW(
       WS_EX_TOPMOST | WS_EX_TOOLWINDOW, kWindowClass, kWindowTitle,
       WS_POPUP, 0, 0, width, height, nullptr, nullptr, instance, this);
@@ -612,17 +652,19 @@ void LocalIndicator::ThreadMain() {
 void LocalIndicator::RefreshWindow() {
   const HWND window = window_.load();
   if (!window) return;
-  if (viewers_.load() > 0) {
-    AnchorToCorner(window);
-    InvalidateRect(window, nullptr, FALSE);
-    ShowWindow(window, SW_SHOWNOACTIVATE);
-    SetWindowPos(window, HWND_TOPMOST, 0, 0, 0, 0,
-                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-  } else {
+  if (viewers_.load() == 0) {
     confirming_stop_ = false;
     stop_requested_ = false;
-    ShowWindow(window, SW_HIDE);
   }
+  // Idle is still a real product state. The controlled-node process is
+  // running and can accept a connection, so hiding its only local affordance
+  // made remote access undiscoverable. Collapse remains available, but at
+  // least its clickable corner is always on-screen.
+  AnchorToCorner(window);
+  InvalidateRect(window, nullptr, FALSE);
+  ShowWindow(window, SW_SHOWNOACTIVATE);
+  SetWindowPos(window, HWND_TOPMOST, 0, 0, 0, 0,
+               SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
 void LocalIndicator::AnchorToCorner(HWND window) {
@@ -631,8 +673,8 @@ void LocalIndicator::AnchorToCorner(HWND window) {
   info.cbSize = sizeof(info);
   if (!GetMonitorInfoW(ActiveMonitor(), &info)) return;
   const UINT dpi = WindowDpi(window);
-  const int width = Scaled(dpi, collapsed_ ? kCollapsedSize : kExpandedWidth);
-  const int height = Scaled(dpi, collapsed_ ? kCollapsedSize : kExpandedHeight);
+  const int width = Scaled(dpi, collapsed_ ? kCollapsedWidth : kExpandedWidth);
+  const int height = Scaled(dpi, collapsed_ ? kCollapsedHeight : kExpandedHeight);
   const int margin = Scaled(dpi, kCornerMargin);
   const int x = std::max(info.rcWork.left, info.rcWork.right - width - margin);
   const int y = std::max(info.rcWork.top, info.rcWork.bottom - height - margin);
@@ -660,27 +702,44 @@ void LocalIndicator::PaintWindow(HWND window) {
   GetClientRect(window, &client);
   const UINT dpi = WindowDpi(window);
   const bool stopping = stop_requested_.load();
-  const Palette palette = CurrentPalette(stopping);
+  const Palette palette = CurrentPalette(
+      stopping, access_paused_.load(), viewers_.load(), controllers_.load());
   SetBkMode(dc, TRANSPARENT);
   DrawRoundedFill(dc, client, Scaled(dpi, collapsed_ ? 12 : 18),
                   palette.surface, palette.border);
 
   if (collapsed_) {
-    // Collapsed is the smallest persistent affordance, so it carries the mark
-    // itself. If the bitmap cannot be composited it falls back to the original
-    // glyph rather than collapsing to an empty chip.
-    const int edge = Scaled(dpi, 18);
-    const int inset = (Scaled(dpi, kCollapsedSize) - edge) / 2;
-    if (!DrawBrandLogo(dc, inset, inset, edge)) {
-      const HBRUSH glow = CreateSolidBrush(palette.border);
-      const HGDIOBJ old = SelectObject(dc, glow);
-      POINT triangle[] = {{Scaled(dpi, 13), Scaled(dpi, 10)},
-                          {Scaled(dpi, 29), Scaled(dpi, 19)},
-                          {Scaled(dpi, 13), Scaled(dpi, 28)}};
-      Polygon(dc, triangle, 3);
-      SelectObject(dc, old);
-      DeleteObject(glow);
+    const HFONT arrow_font = CreateUiFont(window, 13, FW_BOLD);
+    const HGDIOBJ old_font = SelectObject(dc, arrow_font);
+    SetTextColor(dc, palette.border);
+    RECT arrow{Scaled(dpi, 3), Scaled(dpi, 5), Scaled(dpi, 23),
+               Scaled(dpi, 33)};
+    static_assert(common::LocalIndicatorExpandChevron(
+        common::LocalIndicatorEdge::kRight) == '<');
+    DrawTextW(dc, L"<", -1, &arrow,
+              DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX);
+    const std::string badge = common::LocalIndicatorBadgeText(
+        static_cast<std::uint32_t>(std::max(0, viewers_.load())));
+    if (!badge.empty()) {
+      RECT bubble{Scaled(dpi, 26), Scaled(dpi, 7), Scaled(dpi, 51),
+                  Scaled(dpi, 31)};
+      DrawRoundedFill(dc, bubble, Scaled(dpi, 12), palette.border,
+                      palette.border);
+      SetTextColor(dc, palette.surface);
+      const std::wstring value(badge.begin(), badge.end());
+      DrawTextW(dc, value.c_str(), -1, &bubble,
+                DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX);
+    } else if (!DrawBrandLogo(dc, Scaled(dpi, 30), Scaled(dpi, 10),
+                              Scaled(dpi, 18))) {
+      const HBRUSH mark = CreateSolidBrush(palette.border);
+      const HGDIOBJ old_mark = SelectObject(dc, mark);
+      Ellipse(dc, Scaled(dpi, 35), Scaled(dpi, 15), Scaled(dpi, 43),
+              Scaled(dpi, 23));
+      SelectObject(dc, old_mark);
+      DeleteObject(mark);
     }
+    SelectObject(dc, old_font);
+    DeleteObject(arrow_font);
     EndPaint(window, &paint);
     return;
   }
@@ -708,7 +767,7 @@ void LocalIndicator::PaintWindow(HWND window) {
   // The product name is spelled out next to the mark so the disclosure is
   // attributable even when the logo cannot render or the user cannot see it.
   const std::wstring heading =
-      std::wstring(kProductName) + L"  ·  " + kSurfaceName;
+      std::wstring(common::kAiDeskProductNameWide) + L"  ·  " + kSurfaceName;
   RECT title{logo_x + logo_edge + Scaled(dpi, 10), Scaled(dpi, 9),
              client.right - Scaled(dpi, 50), Scaled(dpi, 39)};
   DrawTextW(dc, heading.c_str(), -1, &title,
@@ -717,9 +776,10 @@ void LocalIndicator::PaintWindow(HWND window) {
   SelectObject(dc, detail_font);
   SetTextColor(dc, palette.detail);
   // Counts only. See the isolation note on LocalIndicator::Update().
-  const std::wstring detail = std::to_wstring(viewers_.load()) +
-      L" VIEWING  ·  " + std::to_wstring(controllers_.load()) +
-      L" CONTROLLING";
+  const std::wstring detail = access_paused_.load()
+      ? L"REMOTE ACCESS PAUSED"
+      : std::to_wstring(viewers_.load()) + L" VIEWING  ·  " +
+            std::to_wstring(controllers_.load()) + L" CONTROLLING";
   RECT detail_rect{Scaled(dpi, 18), Scaled(dpi, 42),
                    client.right - Scaled(dpi, 18), Scaled(dpi, 75)};
   DrawTextW(dc, detail.c_str(), -1, &detail_rect,
@@ -729,17 +789,10 @@ void LocalIndicator::PaintWindow(HWND window) {
   DrawRoundedFill(dc, collapse, Scaled(dpi, 10),
                   HighContrastActive() ? palette.surface : RGB(10, 35, 55),
                   HighContrastActive() ? palette.title : RGB(43, 111, 149));
-  const HBRUSH arrow = CreateSolidBrush(
-      HighContrastActive() ? palette.title : RGB(119, 213, 255));
-  const HGDIOBJ old_arrow = SelectObject(dc, arrow);
-  const int cx = (collapse.left + collapse.right) / 2;
-  const int cy = (collapse.top + collapse.bottom) / 2;
-  POINT fold[] = {{cx - Scaled(dpi, 7), cy - Scaled(dpi, 4)},
-                  {cx + Scaled(dpi, 7), cy - Scaled(dpi, 4)},
-                  {cx, cy + Scaled(dpi, 5)}};
-  Polygon(dc, fold, 3);
-  SelectObject(dc, old_arrow);
-  DeleteObject(arrow);
+  SetTextColor(dc, HighContrastActive() ? palette.title : RGB(119, 213, 255));
+  RECT fold_text = collapse;
+  DrawTextW(dc, L">", -1, &fold_text,
+            DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX);
 
   const RECT stop = StopRect(client, dpi);
   DrawRoundedFill(dc, stop, Scaled(dpi, 12), palette.stop_fill,

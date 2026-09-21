@@ -1,5 +1,6 @@
 source_set("remote_desktop_common") {
   sources = [
+    "aidesk_product_name.h",
     "data_channel_payload.cc",
     "data_channel_payload.h",
     "input_ledger.cc",
@@ -7,6 +8,8 @@ source_set("remote_desktop_common") {
     "json_protocol.cc",
     "json_protocol.h",
     "latched_modifiers.h",
+    "local_management_types.h",
+    "local_indicator_visuals.h",
     "data_channel_constants.h",
     "platform_interfaces.h",
     "protocol_contracts.h",
@@ -23,11 +26,14 @@ source_set("remote_desktop_common") {
   ]
 
   public = [
+    "aidesk_product_name.h",
     "data_channel_constants.h",
     "data_channel_payload.h",
     "input_ledger.h",
     "json_protocol.h",
     "latched_modifiers.h",
+    "local_management_types.h",
+    "local_indicator_visuals.h",
     "platform_interfaces.h",
     "protocol_contracts.h",
     "quality_ladder.h",

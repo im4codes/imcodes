@@ -37,6 +37,7 @@
 #include "third_party/imcodes_remote_desktop/display_capture.h"
 #include "third_party/imcodes_remote_desktop/consent_ipc.h"
 #include "third_party/imcodes_remote_desktop/privacy_ipc.h"
+#include "third_party/imcodes_remote_desktop/common/local_management_types.h"
 #include "third_party/imcodes_remote_desktop/input_injector.h"
 #include "third_party/imcodes_remote_desktop/json_protocol.h"
 #include "third_party/imcodes_remote_desktop/local_indicator.h"
@@ -1748,6 +1749,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
       if (line.empty()) continue;
       Json::Value root;
       if (!ParseJson(line, &root)) {
+        continue;
+      }
+      if (root["type"].asString() == common::kLocalAccessStateType &&
+          root["paused"].isBool()) {
+        indicator.UpdateAccessPaused(root["paused"].asBool());
         continue;
       }
       bool handled = consent.Handle(root) || privacy.Handle(root);

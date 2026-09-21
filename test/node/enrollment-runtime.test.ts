@@ -127,6 +127,7 @@ describe('controlled node enrollment and runtime', () => {
       activeConnections: vi.fn(() => []),
       stopConnection: vi.fn(async () => true),
       stopAllConnections: vi.fn(async () => {}),
+      setAccessPaused: vi.fn(async () => {}),
       close: vi.fn(),
     };
     const runtime = createControlledNodeRuntime({
@@ -157,12 +158,14 @@ describe('controlled node enrollment and runtime', () => {
     expect(remoteDesktopWorker.handle).not.toHaveBeenCalled();
 
     await runtime.setRemoteDesktopAccessPaused(false);
+    expect(remoteDesktopWorker.setAccessPaused).toHaveBeenLastCalledWith(false);
     await vi.waitFor(() => expect(sockets).toHaveLength(1));
     second.open();
     expect(JSON.parse(second.sent[0]!).capabilities).toContain(REMOTE_DESKTOP_CAPABILITY);
     expect(JSON.parse(second.sent[0]!).capabilities).not.toContain(REMOTE_DESKTOP_LOCAL_MANAGEMENT.PAUSED_CAPABILITY);
     await runtime.setRemoteDesktopAccessPaused(true);
     expect(remoteDesktopWorker.stopAllConnections).toHaveBeenCalledOnce();
+    expect(remoteDesktopWorker.setAccessPaused).toHaveBeenLastCalledWith(true);
     expect(runtime.remoteDesktopAccessStatus().paused).toBe(true);
     runtime.stop();
   });

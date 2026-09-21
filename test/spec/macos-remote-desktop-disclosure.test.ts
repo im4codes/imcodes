@@ -39,7 +39,7 @@ describe("macOS non-requester-controlled local disclosure", () => {
   });
 
   it("renders only stable aiDesk.to by IM.codes copy plus bounded participant counts", async () => {
-    expect(implementation).toContain('@"aiDesk.to by IM.codes"');
+    expect(implementation).toContain('common::kAiDeskProductName');
     expect(implementation).toContain('@"aiDesk.to remote desktop is active"');
     expect(implementation).toContain('@"%u VIEWING  ·  %u CONTROLLING"');
     expect(implementation).toContain('@"STOP ALL REMOTE SESSIONS"');

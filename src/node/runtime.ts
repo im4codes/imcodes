@@ -187,6 +187,7 @@ export interface ControlledNodeRemoteDesktopWorker {
   activeConnections?(): readonly RemoteDesktopLocalConnection[];
   stopConnection?(publicId: string): Promise<boolean>;
   stopAllConnections?(): Promise<void>;
+  setAccessPaused?(paused: boolean): Promise<void> | void;
   applyAutoUnlockSecret?(secret: string | null): Promise<boolean>;
   /** macOS: whether this host has somewhere to keep a sign-in secret. */
   supportsAutoUnlock?(): boolean;
@@ -227,7 +228,10 @@ export function createPlatformRemoteDesktopWorkerHost(input: {
   macos?: MacosRemoteDesktopWorkerHostOptions;
 }): PlatformRemoteDesktopWorkerSelection {
   if (input.platform === 'win32') {
-    return { worker: new RemoteDesktopWorkerHost(input.onMessage, input.windows) };
+    const worker = new RemoteDesktopWorkerHost(input.onMessage, input.windows);
+    return worker.available()
+      ? { worker, startup: () => worker.start() }
+      : { worker };
   }
   if (input.platform === 'darwin'
     && (input.arch === 'arm64' || input.arch === 'x64')
@@ -239,7 +243,10 @@ export function createPlatformRemoteDesktopWorkerHost(input: {
     return { worker, startup: () => worker.start() };
   }
   if (input.platform === 'linux' && input.arch === 'x64') {
-    return { worker: new LinuxRemoteDesktopWorkerHost(input.onMessage) };
+    const worker = new LinuxRemoteDesktopWorkerHost(input.onMessage);
+    return worker.available()
+      ? { worker, startup: () => worker.start() }
+      : { worker };
   }
   return { worker: new UnavailableRemoteDesktopWorkerHost() };
 }
@@ -1625,9 +1632,10 @@ export function createControlledNodeRuntime(
       // installs the new one, and a worker started from it kept serving until
       // its first session ended -- so every upgrade brought a fixed worker bug
       // back for one session (node m3). Installing starts the new set itself.
-      if (await isInstalledForThisRelease().catch(() => false)) {
+      if (platform !== 'darwin' || await isInstalledForThisRelease().catch(() => false)) {
         try {
           await remoteDesktopWorkerStartup();
+          await remoteDesktopWorker.setAccessPaused?.(remoteDesktopAccessPaused);
         } catch (error) {
           reportAuthenticationError(error);
         }
@@ -1672,6 +1680,7 @@ export function createControlledNodeRuntime(
     if (remoteDesktopAccessPaused === paused) return;
     remoteDesktopAccessPaused = paused;
     if (paused) await remoteDesktopWorker.stopAllConnections?.();
+    await remoteDesktopWorker.setAccessPaused?.(paused);
     republishCapabilitiesIfChanged();
   };
   return runtimeClient;

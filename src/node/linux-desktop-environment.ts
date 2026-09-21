@@ -72,17 +72,34 @@ export function pickLinuxDesktopUser(
     try { return statSync(path).isDirectory(); } catch { return false; }
   },
 ): string | null {
+  return pickLinuxDesktopUserProfile(passwd, isDirectory)?.name ?? null;
+}
+
+export interface LinuxDesktopUserProfile {
+  name: string;
+  uid: number;
+  gid: number;
+  home: string;
+}
+
+/** Same eligibility/order as pickLinuxDesktopUser, retaining safe ownership data. */
+export function pickLinuxDesktopUserProfile(
+  passwd: string,
+  isDirectory: (path: string) => boolean = (path) => {
+    try { return statSync(path).isDirectory(); } catch { return false; }
+  },
+): LinuxDesktopUserProfile | null {
   const candidates = passwd.split('\n').flatMap((line) => {
-    const [name, , uidText, , , home, shell] = line.split(':');
+    const [name, , uidText, gidText, , home, shell] = line.split(':');
     const uid = Number(uidText);
-    if (!name || !home || !shell || !Number.isInteger(uid)) return [];
-    if (uid < 1000 || uid >= 65534) return [];
-    if (/(nologin|false)$/.test(shell)) return [];
-    if (!isDirectory(home)) return [];
-    return [{ name, uid }];
+    const gid = Number(gidText);
+    if (!name || !home || !shell || !Number.isInteger(uid) || !Number.isInteger(gid)) return [];
+    if (uid < 1000 || uid >= 65534 || gid < 1 || gid >= 65534) return [];
+    if (/(nologin|false)$/u.test(shell) || !isDirectory(home)) return [];
+    return [{ name, uid, gid, home }];
   });
   candidates.sort((a, b) => a.uid - b.uid);
-  return candidates[0]?.name ?? null;
+  return candidates[0] ?? null;
 }
 
 type RunScript = (scriptPath: string, args: readonly string[]) => Promise<{ code: number; output: string }>;

@@ -24,6 +24,10 @@ import {
 } from './remote-desktop-access-state.js';
 import { startRemoteDesktopLocalPanel } from './remote-desktop-local-panel.js';
 import {
+  ensureAideskDesktopEntry,
+  openAideskLocalPanel,
+} from './aidesk-desktop-entry.js';
+import {
   CONSOLE_HOLD,
   consoleHoldCountdown,
   consoleHoldMode,
@@ -194,6 +198,10 @@ async function main(): Promise<void> {
     }
     return;
   }
+  if (process.argv[2] === '--open-local-panel') {
+    openAideskLocalPanel();
+    return;
+  }
   // Decided before any other install work, so that a failure raised while
   // building deps is still reported as an install failure rather than a bare
   // stderr line nobody sees.
@@ -285,6 +293,17 @@ async function main(): Promise<void> {
       return null;
     })
     : null;
+  void ensureAideskDesktopEntry().then((result) => {
+    if (result === 'preserved') {
+      logger.warn('existing user-created aiDesk desktop entry was preserved');
+    } else if (result === 'failed' || result === 'unavailable') {
+      logger.warn({ result }, 'aiDesk desktop entry unavailable');
+    } else if (result !== 'unchanged') {
+      logger.info({ result }, 'aiDesk desktop entry updated');
+    }
+  }).catch((error) => {
+    logger.warn({ err: error }, 'aiDesk desktop entry unavailable');
+  });
   runtime.start();
   const stop = () => {
     void localPanel?.close().catch(() => {});

@@ -1,4 +1,6 @@
 #include "macos_local_disclosure.h"
+#include "../remote-desktop-common/aidesk_product_name.h"
+#include "../remote-desktop-common/local_indicator_visuals.h"
 
 #import <AppKit/AppKit.h>
 
@@ -22,7 +24,8 @@ using IMCodesDisclosureEventSink =
 // like the Windows client-area math.
 static const CGFloat kIMCodesIndicatorExpandedWidth = 368.0;
 static const CGFloat kIMCodesIndicatorExpandedHeight = 148.0;
-static const CGFloat kIMCodesIndicatorCollapsedSize = 38.0;
+static const CGFloat kIMCodesIndicatorCollapsedWidth = 54.0;
+static const CGFloat kIMCodesIndicatorCollapsedHeight = 38.0;
 static const CGFloat kIMCodesIndicatorCornerMargin = 14.0;
 static const CGFloat kIMCodesIndicatorLogoSize = 20.0;
 static NSString *const kIMCodesIndicatorCollapsedKey =
@@ -73,6 +76,7 @@ static NSImage *IMCodesIndicatorLogo() {
   NSTextField *_viewerLabel;
   NSTextField *_controllerLabel;
   IMCodesIndicatorView *_indicatorView;
+  NSUInteger _autoCollapseGeneration;
 }
 
 @property(nonatomic, strong) NSWindow *window;
@@ -87,6 +91,7 @@ static NSImage *IMCodesIndicatorLogo() {
 - (void)applyCollapsed:(BOOL)collapsed persist:(BOOL)persist;
 - (void)anchorToCorner;
 - (void)hideWithoutEvent;
+- (void)scheduleAutoCollapse;
 
 @end
 
@@ -136,9 +141,9 @@ static NSImage *IMCodesIndicatorLogo() {
   }
   const BOOL collapsed = _indicatorView.collapsed;
   const CGFloat width =
-      collapsed ? kIMCodesIndicatorCollapsedSize : kIMCodesIndicatorExpandedWidth;
+      collapsed ? kIMCodesIndicatorCollapsedWidth : kIMCodesIndicatorExpandedWidth;
   const CGFloat height =
-      collapsed ? kIMCodesIndicatorCollapsedSize : kIMCodesIndicatorExpandedHeight;
+      collapsed ? kIMCodesIndicatorCollapsedHeight : kIMCodesIndicatorExpandedHeight;
   // The screen the operator is looking at: the one holding the pointer.
   NSScreen *screen = nil;
   const NSPoint mouse = [NSEvent mouseLocation];
@@ -157,6 +162,20 @@ static NSImage *IMCodesIndicatorLogo() {
       NSMaxX(visible) - width - kIMCodesIndicatorCornerMargin,
       NSMinY(visible) + kIMCodesIndicatorCornerMargin, width, height);
   [_window setFrame:frame display:YES];
+}
+
+- (void)scheduleAutoCollapse {
+  if (_indicatorView == nil || _indicatorView.viewers == 0) return;
+  const NSUInteger generation = ++_autoCollapseGeneration;
+  dispatch_after(dispatch_time(
+      DISPATCH_TIME_NOW,
+      imcodes::remote_desktop::common::kLocalIndicatorAutoCollapseDelayMs *
+          NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+    if (generation == self->_autoCollapseGeneration &&
+        self.indicatorView.viewers > 0) {
+      [self applyCollapsed:YES persist:NO];
+    }
+  });
 }
 
 - (void)windowWillClose:(NSNotification *)notification {
@@ -240,7 +259,9 @@ static NSImage *IMCodesIndicatorLogo() {
   (void)dirty;
   const NSRect client = self.bounds;
   NSColor *surface = IMCodesRgb(5, 16, 29);
-  NSColor *border = IMCodesRgb(50, 196, 255);
+  NSColor *border = self.controllers > 0 ? IMCodesRgb(244, 80, 112)
+      : self.viewers > 0 ? IMCodesRgb(242, 169, 59)
+                         : IMCodesRgb(50, 196, 255);
   [[NSColor clearColor] setFill];
   NSRectFill(client);
   [self fillRounded:client
@@ -249,17 +270,31 @@ static NSImage *IMCodesIndicatorLogo() {
              border:border];
 
   if (self.collapsed) {
-    // Collapsed carries the mark itself; failing that, the original glyph.
-    const CGFloat edge = 18.0;
-    const CGFloat inset = (kIMCodesIndicatorCollapsedSize - edge) / 2.0;
-    if (![self drawLogoInRect:NSMakeRect(inset, inset, edge, edge)]) {
-      NSBezierPath *triangle = [NSBezierPath bezierPath];
-      [triangle moveToPoint:NSMakePoint(13, 10)];
-      [triangle lineToPoint:NSMakePoint(29, 19)];
-      [triangle lineToPoint:NSMakePoint(13, 28)];
-      [triangle closePath];
-      [border setFill];
-      [triangle fill];
+    // The window is pinned to the right edge, so '<' always points into the
+    // screen. It is permanently visible beside (never under) the count badge.
+    const char chevron =
+        imcodes::remote_desktop::common::LocalIndicatorExpandChevron(
+            imcodes::remote_desktop::common::LocalIndicatorEdge::kRight);
+    NSString *arrow = [NSString stringWithFormat:@"%c", chevron];
+    [arrow drawInRect:NSMakeRect(4.0, 7.0, 18.0, 24.0)
+        withAttributes:@{
+          NSFontAttributeName : [NSFont boldSystemFontOfSize:18.0],
+          NSForegroundColorAttributeName : border,
+        }];
+    const std::string badge =
+        imcodes::remote_desktop::common::LocalIndicatorBadgeText(self.viewers);
+    if (!badge.empty()) {
+      const NSRect bubble = NSMakeRect(25.0, 7.0, 25.0, 24.0);
+      [self fillRounded:bubble radius:24.0 fill:border border:border];
+      NSMutableParagraphStyle *centered = [[NSMutableParagraphStyle alloc] init];
+      centered.alignment = NSTextAlignmentCenter;
+      NSString *value = [NSString stringWithUTF8String:badge.c_str()];
+      [value drawInRect:NSMakeRect(25.0, 10.0, 25.0, 18.0)
+          withAttributes:@{
+            NSFontAttributeName : [NSFont boldSystemFontOfSize:11.0],
+            NSForegroundColorAttributeName : surface,
+            NSParagraphStyleAttributeName : centered,
+          }];
     }
     return;
   }
@@ -274,7 +309,9 @@ static NSImage *IMCodesIndicatorLogo() {
   NSMutableParagraphStyle *truncating = [[NSMutableParagraphStyle alloc] init];
   truncating.lineBreakMode = NSLineBreakByTruncatingTail;
   // Product name spelled out beside the mark, as on Windows.
-  NSString *heading = @"aiDesk.to by IM.codes  ·  Remote Desktop";
+  NSString *product = [NSString stringWithUTF8String:
+      imcodes::remote_desktop::common::kAiDeskProductName];
+  NSString *heading = [product stringByAppendingString:@"  ·  Remote Desktop"];
   [heading drawInRect:NSMakeRect(NSMaxX(logo) + 10.0, 13.0,
                                  NSWidth(client) - NSMaxX(logo) - 10.0 - 50.0,
                                  20.0)
@@ -301,15 +338,12 @@ static NSImage *IMCodesIndicatorLogo() {
              radius:20.0
                fill:IMCodesRgb(10, 35, 55)
              border:IMCodesRgb(43, 111, 149)];
-  const CGFloat cx = NSMidX(fold);
-  const CGFloat cy = NSMidY(fold);
-  NSBezierPath *chevron = [NSBezierPath bezierPath];
-  [chevron moveToPoint:NSMakePoint(cx - 7.0, cy - 4.0)];
-  [chevron lineToPoint:NSMakePoint(cx + 7.0, cy - 4.0)];
-  [chevron lineToPoint:NSMakePoint(cx, cy + 5.0)];
-  [chevron closePath];
-  [IMCodesRgb(119, 213, 255) setFill];
-  [chevron fill];
+  [@">" drawInRect:NSMakeRect(NSMinX(fold), NSMinY(fold) + 4.0,
+                               NSWidth(fold), NSHeight(fold) - 4.0)
+      withAttributes:@{
+        NSFontAttributeName : [NSFont boldSystemFontOfSize:17.0],
+        NSForegroundColorAttributeName : IMCodesRgb(119, 213, 255),
+      }];
 
   const NSRect stop = [self stopRect];
   const BOOL stopping = self.stopping;
@@ -356,7 +390,8 @@ static NSImage *IMCodesIndicatorLogo() {
     return;
   }
   if (self.collapsed) {
-    [owner openManagement];
+    [owner applyCollapsed:NO persist:YES];
+    [owner scheduleAutoCollapse];
     return;
   }
   const NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
@@ -372,6 +407,8 @@ static NSImage *IMCodesIndicatorLogo() {
     self.confirmingStop = NO;
     [self setNeedsDisplay:YES];
     [owner stopPressed:nil];
+  } else {
+    [owner openManagement];
   }
 }
 
@@ -458,7 +495,7 @@ public:
           if (window == nil || window.contentView == nil) {
             return false;
           }
-          window.title = @"aiDesk.to by IM.codes";
+          window.title = [NSString stringWithUTF8String:common::kAiDeskProductName];
           window.level = NSFloatingWindowLevel;
           window.releasedWhenClosed = NO;
           window.hidesOnDeactivate = NO;
@@ -496,6 +533,9 @@ public:
               boolForKey:kIMCodesIndicatorCollapsedKey];
         }
 
+        const std::uint32_t previousViewers = controller_.indicatorView.viewers;
+        const std::uint32_t previousControllers =
+            controller_.indicatorView.controllers;
         controller_.viewerLabel.stringValue =
             [NSString stringWithFormat:@"Viewers: %u", viewers];
         controller_.controllerLabel.stringValue =
@@ -503,6 +543,11 @@ public:
         controller_.indicatorView.viewers = viewers;
         controller_.indicatorView.controllers = controllers;
         controller_.indicatorView.stopping = NO;
+        if (viewers > 0 && (viewers != previousViewers ||
+                            controllers != previousControllers)) {
+          [controller_ applyCollapsed:NO persist:NO];
+          [controller_ scheduleAutoCollapse];
+        }
         // Re-anchor on every show: the screen layout may have changed since.
         [controller_ anchorToCorner];
         [controller_.indicatorView setNeedsDisplay:YES];

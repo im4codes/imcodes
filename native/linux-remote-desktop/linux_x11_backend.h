@@ -221,10 +221,13 @@ class X11DisclosureAdapter final : public common::DisclosureAdapter {
   [[nodiscard]] common::ReadinessState ProbeReadiness() override;
   bool Show(std::uint32_t viewers, std::uint32_t controllers) override;
   void Hide() noexcept override;
+  void SetAccessPaused(bool paused) noexcept;
 
  private:
+  void DestroyWindow() noexcept;
   void RedrawLoop();
   void Draw();
+  void ResizeDisclosure();
 
   std::shared_ptr<X11Connection> connection_;
   unsigned long window_ = 0;   // X11 Window; kept opaque so Xlib stays out of this header.
@@ -233,6 +236,11 @@ class X11DisclosureAdapter final : public common::DisclosureAdapter {
   std::atomic<bool> running_{false};
   std::mutex text_mutex_;
   std::string text_;
+  std::atomic<std::uint32_t> viewers_{0};
+  std::atomic<std::uint32_t> controllers_{0};
+  std::atomic<bool> access_paused_{false};
+  std::atomic<bool> collapsed_{true};
+  std::atomic<std::int64_t> collapse_deadline_ms_{0};
 };
 
 }  // namespace imcodes::remote_desktop::linux_platform

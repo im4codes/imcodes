@@ -21,6 +21,8 @@ namespace imcodes::remote_desktop::common {
 // Must match shared/remote-desktop-local-management.ts. The local panel is
 // loopback-only; platform indicators only launch it and never carry authority.
 inline constexpr char kLocalManagementUrl[] = "http://127.0.0.1:43751/";
+inline constexpr char kLocalManagementStateUrl[] =
+    "http://127.0.0.1:43751/api/state";
 
 using CapturedFrameSink = std::function<void(CapturedFrame)>;
 using H264AccessUnitSink = std::function<void(H264AccessUnit)>;

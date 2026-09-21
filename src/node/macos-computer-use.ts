@@ -19,16 +19,20 @@ import {
   CONTROLLED_NODE_OS_MAC,
 } from '../../shared/controlled-node-artifacts.js';
 import type { MacosUserSession } from './user-session-launcher.js';
+import {
+  AIDESK_MACOS_APP_NAME,
+  AIDESK_MACOS_BUNDLE_ID,
+} from '../../shared/aidesk-product.js';
 
 export const MACOS_COMPUTER_USE_RUNTIME_ROOT = '/Library/Application Support/imcodes-node-computer-use';
 export const MACOS_COMPUTER_USE_APP_NAME = 'Open Computer Use.app';
-export const MACOS_AIDESK_APP_NAME = 'aiDesk.to by IM.codes.app';
+export const MACOS_AIDESK_APP_NAME = AIDESK_MACOS_APP_NAME;
 
 const MACOS_COMPUTER_USE_EXECUTABLE = 'OpenComputerUse';
 export const MACOS_AIDESK_EXECUTABLE = 'aidesk-agent';
 const MACOS_COMPUTER_USE_BUNDLE_ID = 'com.ifuryst.opencomputeruse';
 const MACOS_COMPUTER_USE_TEAM_ID = 'J9P29FA5BX';
-export const MACOS_AIDESK_BUNDLE_ID = 'to.aidesk.app';
+export const MACOS_AIDESK_BUNDLE_ID = AIDESK_MACOS_BUNDLE_ID;
 export const MACOS_AIDESK_TEAM_ID = 'M675E26Q67';
 const MACOS_COMPUTER_USE_SOURCE_DIGEST = '.open-computer-use-source.sha256';
 

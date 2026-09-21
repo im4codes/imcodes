@@ -19,12 +19,13 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { readMacosRemoteDesktopCodeIdentity } from './macos-remote-desktop-build.mjs';
+import product from '../shared/aidesk-product.json' with { type: 'json' };
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 /** Must match `MACOS_AIDESK_APP_NAME` / `MACOS_AIDESK_BUNDLE_ID` in src/node/macos-computer-use.ts. */
-export const AIDESK_APP_NAME = 'aiDesk.to by IM.codes.app';
-export const AIDESK_BUNDLE_ID = 'to.aidesk.app';
+export const AIDESK_APP_NAME = product.macosAppName;
+export const AIDESK_BUNDLE_ID = product.macosBundleId;
 export const AIDESK_MAIN_EXECUTABLE = 'aidesk-agent';
 export const AIDESK_COMPUTER_USE_EXECUTABLE = 'OpenComputerUse';
 
@@ -60,10 +61,10 @@ function sh(file, args, options = {}) {
 /**
  * The Info.plist for the bundle.
  *
- * `LSUIElement` keeps it out of the Dock and the app switcher: this is a
- * permission-owning container that the daemon drives, not something to alt-tab
- * to. `LSMinimumSystemVersion` matches the remote-desktop components' declared
- * floor so one bundle cannot claim support the helpers inside it lack.
+ * This bundle is also the user's local management entry, so it intentionally
+ * remains a normal Dock application while running. `LSMinimumSystemVersion`
+ * matches the remote-desktop components' declared floor so one bundle cannot
+ * claim support the helpers inside it lack.
  */
 export function buildAideskInfoPlist(input) {
   const { version, minimumSystemVersion } = input;
@@ -76,7 +77,7 @@ export function buildAideskInfoPlist(input) {
   const entries = [
     ['CFBundleIdentifier', AIDESK_BUNDLE_ID],
     ['CFBundleName', 'aiDesk.to'],
-    ['CFBundleDisplayName', 'aiDesk.to by IM.codes'],
+    ['CFBundleDisplayName', product.displayName],
     ['CFBundleExecutable', AIDESK_MAIN_EXECUTABLE],
     ['CFBundlePackageType', 'APPL'],
     ['CFBundleShortVersionString', String(version)],
@@ -91,8 +92,6 @@ export function buildAideskInfoPlist(input) {
 <plist version="1.0">
 <dict>
 ${body}
-  <key>LSUIElement</key>
-  <true/>
 </dict>
 </plist>
 `;
@@ -319,7 +318,7 @@ export function publishAideskHelperSidecar(input) {
 }
 
 export function buildAideskDmg(input) {
-  const { appPath, outPath, volumeName = 'aiDesk.to by IM.codes' } = input;
+  const { appPath, outPath, volumeName = product.displayName } = input;
   if (!existsSync(appPath)) throw new Error(`app bundle not found: ${appPath}`);
   const staging = mkdtempSync(join(tmpdir(), 'imcodes-aidesk-dmg-'));
   try {

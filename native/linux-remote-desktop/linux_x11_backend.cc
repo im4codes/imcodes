@@ -1,4 +1,6 @@
 #include "linux_x11_backend.h"
+#include "../remote-desktop-common/aidesk_product_name.h"
+#include "../remote-desktop-common/local_indicator_visuals.h"
 
 #include <chrono>
 #include <cstddef>
@@ -974,11 +976,14 @@ bool X11DisplayAdapter::SetScale(std::string_view, double) {
 namespace {
 constexpr int kDisclosureWidth = 300;
 constexpr int kDisclosureHeight = 34;
-constexpr int kDisclosureMargin = 12;
+constexpr int kIdleDisclosureWidth = 54;
+constexpr int kDisclosureMargin = 0;
 // A strong, unmistakable color -- the same "this is being watched" register
 // screen-recording indicators everywhere use, not a color that could be
 // mistaken for ordinary desktop chrome.
 constexpr unsigned long kDisclosureBackground = 0xC0392B;  // 0xRRGGBB
+constexpr unsigned long kDisclosureViewingBackground = 0xC27A13;
+constexpr unsigned long kDisclosureIdleBackground = 0x1677A8;
 constexpr unsigned long kDisclosureForeground = 0xFFFFFF;
 }  // namespace
 
@@ -986,7 +991,7 @@ X11DisclosureAdapter::X11DisclosureAdapter(
     std::shared_ptr<X11Connection> connection) noexcept
     : connection_(std::move(connection)) {}
 
-X11DisclosureAdapter::~X11DisclosureAdapter() { Hide(); }
+X11DisclosureAdapter::~X11DisclosureAdapter() { DestroyWindow(); }
 
 ReadinessState X11DisclosureAdapter::ProbeReadiness() {
   return Dpy(connection_) != nullptr ? ReadinessState::kReady
@@ -1002,12 +1007,51 @@ void X11DisclosureAdapter::Draw() {
     text = text_;
   }
   GC gc = reinterpret_cast<GC>(gc_);
-  XSetForeground(display, gc, kDisclosureBackground);
-  XFillRectangle(display, window_, gc, 0, 0, kDisclosureWidth, kDisclosureHeight);
+  const auto viewers = viewers_.load();
+  const auto controllers = controllers_.load();
+  const bool collapsed = collapsed_.load();
+  const int width = collapsed ? kIdleDisclosureWidth : kDisclosureWidth;
+  const unsigned long background = access_paused_.load()
+      ? 0x747E89
+      : controllers > 0
+      ? kDisclosureBackground
+      : viewers > 0 ? kDisclosureViewingBackground : kDisclosureIdleBackground;
+  XSetForeground(display, gc, background);
+  XFillRectangle(display, window_, gc, 0, 0, width, kDisclosureHeight);
   XSetForeground(display, gc, kDisclosureForeground);
-  XDrawString(display, window_, gc, 12, kDisclosureHeight / 2 + 5,
-             text.c_str(), static_cast<int>(text.size()));
+  if (collapsed) {
+    const char arrow[] = {common::LocalIndicatorExpandChevron(
+        common::LocalIndicatorEdge::kRight), '\0'};
+    XDrawString(display, window_, gc, 7, kDisclosureHeight / 2 + 5,
+                arrow, 1);
+    const std::string badge = common::LocalIndicatorBadgeText(viewers);
+    if (!badge.empty()) {
+      XFillArc(display, window_, gc, 26, 5, 24, 24, 0, 360 * 64);
+      XSetForeground(display, gc, background);
+      XDrawString(display, window_, gc, badge.size() > 1 ? 31 : 35,
+                  kDisclosureHeight / 2 + 5, badge.c_str(),
+                  static_cast<int>(badge.size()));
+    }
+  } else {
+    XDrawString(display, window_, gc, 12, kDisclosureHeight / 2 + 5,
+                text.c_str(), static_cast<int>(text.size()));
+    const char collapse[] = {'>', '\0'};
+    XDrawString(display, window_, gc, width - 18,
+                kDisclosureHeight / 2 + 5, collapse, 1);
+  }
   XFlush(display);
+}
+
+void X11DisclosureAdapter::ResizeDisclosure() {
+  Display* display = Dpy(connection_);
+  if (display == nullptr || window_ == 0) return;
+  const int screen = DefaultScreen(display);
+  const int width = collapsed_.load() ? kIdleDisclosureWidth : kDisclosureWidth;
+  XMoveResizeWindow(display, window_,
+                    DisplayWidth(display, screen) - width - kDisclosureMargin,
+                    kDisclosureMargin, width, kDisclosureHeight);
+  XMapRaised(display, window_);
+  Draw();
 }
 
 void X11DisclosureAdapter::RedrawLoop() {
@@ -1026,6 +1070,17 @@ void X11DisclosureAdapter::RedrawLoop() {
                              &event)) {
       if (event.type == Expose) Draw();
       if (event.type == ButtonPress && event.xbutton.button == Button1) {
+        const bool collapsed = collapsed_.load();
+        const int width = collapsed ? kIdleDisclosureWidth : kDisclosureWidth;
+        if (collapsed || event.xbutton.x >= width - 30) {
+          collapsed_ = !collapsed;
+          collapse_deadline_ms_ = !collapsed && viewers_.load() > 0
+              ? NowMicroseconds() / 1000 +
+                    common::kLocalIndicatorAutoCollapseDelayMs
+              : 0;
+          ResizeDisclosure();
+          continue;
+        }
         const pid_t child = fork();
         if (child == 0) {
           const pid_t launcher = fork();
@@ -1039,6 +1094,13 @@ void X11DisclosureAdapter::RedrawLoop() {
         if (child > 0) waitpid(child, nullptr, 0);
       }
     }
+    const std::int64_t deadline = collapse_deadline_ms_.load();
+    if (!collapsed_.load() && deadline > 0 &&
+        NowMicroseconds() / 1000 >= deadline && viewers_.load() > 0) {
+      collapsed_ = true;
+      collapse_deadline_ms_ = 0;
+      ResizeDisclosure();
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
 }
@@ -1050,18 +1112,32 @@ bool X11DisclosureAdapter::Show(std::uint32_t viewers,
 
   {
     std::lock_guard<std::mutex> lock(text_mutex_);
-    text_ = "\xE2\x97\x8F Remote session: " + std::to_string(viewers) +
-            " viewer(s), " + std::to_string(controllers) + " controlling";
+    text_ = viewers == 0
+        ? (access_paused_.load() ? "||" : "ai")
+        : "\xE2\x97\x8F " + std::string(common::kAiDeskProductName) + ": " +
+              std::to_string(viewers) +
+              " viewer(s), " + std::to_string(controllers) + " controlling";
+  }
+  const std::uint32_t previous_viewers = viewers_.exchange(viewers);
+  const std::uint32_t previous_controllers = controllers_.exchange(controllers);
+  if (viewers == 0) {
+    collapsed_ = true;
+    collapse_deadline_ms_ = 0;
+  } else if (viewers != previous_viewers || controllers != previous_controllers) {
+    collapsed_ = false;
+    collapse_deadline_ms_ = NowMicroseconds() / 1000 +
+        common::kLocalIndicatorAutoCollapseDelayMs;
   }
 
   if (window_ != 0) {
-    Draw();
+    ResizeDisclosure();
     return true;
   }
 
   const int screen = DefaultScreen(display);
   const int screen_width = DisplayWidth(display, screen);
-  const int x = screen_width - kDisclosureWidth - kDisclosureMargin;
+  const int width = collapsed_.load() ? kIdleDisclosureWidth : kDisclosureWidth;
+  const int x = screen_width - width - kDisclosureMargin;
   const int y = kDisclosureMargin;
 
   XSetWindowAttributes attributes;
@@ -1076,7 +1152,7 @@ bool X11DisclosureAdapter::Show(std::uint32_t viewers,
   attributes.background_pixel = kDisclosureBackground;
   attributes.event_mask = ExposureMask | ButtonPressMask;
   window_ = XCreateWindow(
-      display, DefaultRootWindow(display), x, y, kDisclosureWidth,
+      display, DefaultRootWindow(display), x, y, width,
       kDisclosureHeight, 0, CopyFromParent, InputOutput, CopyFromParent,
       CWOverrideRedirect | CWBackPixel | CWEventMask, &attributes);
   if (window_ == 0) return false;
@@ -1091,6 +1167,21 @@ bool X11DisclosureAdapter::Show(std::uint32_t viewers,
 }
 
 void X11DisclosureAdapter::Hide() noexcept {
+  // Session end returns to an idle affordance instead of making the agent
+  // disappear. The destructor owns actual teardown.
+  (void)Show(0, 0);
+}
+
+void X11DisclosureAdapter::SetAccessPaused(bool paused) noexcept {
+  access_paused_ = paused;
+  if (viewers_.load() == 0) {
+    std::lock_guard<std::mutex> lock(text_mutex_);
+    text_ = paused ? "||" : "ai";
+  }
+  Draw();
+}
+
+void X11DisclosureAdapter::DestroyWindow() noexcept {
   running_ = false;
   if (redraw_thread_.joinable()) redraw_thread_.join();
   Display* display = Dpy(connection_);

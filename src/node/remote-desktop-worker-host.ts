@@ -70,6 +70,7 @@ import {
   WINDOWS_COMPILED_RELEASE_SIGNER_SHA256,
   verifyWindowsAuthenticodeSigners,
 } from './windows-artifact-trust.js';
+import { REMOTE_DESKTOP_LOCAL_WORKER_MSG } from '../../shared/remote-desktop-local-management.js';
 export { verifyWindowsAuthenticodeSigners } from './windows-artifact-trust.js';
 
 // Cold launch performs a fail-closed Authenticode check before CreateProcess.
@@ -579,6 +580,20 @@ export class RemoteDesktopWorkerHost {
 
   async stopAllConnections(): Promise<void> {
     await stopAllLocalRemoteDesktopConnections(this.core, (command) => this.handle(command));
+  }
+
+  /** Start the signed interactive worker so its local indicator exists at idle. */
+  async start(): Promise<void> {
+    if (!this.available()) return;
+    await this.ensureStarted(WORKER_LAUNCH_MODE.PRIVACY_ONLY);
+  }
+
+  setAccessPaused(paused: boolean): void {
+    if (!this.socket || this.socket.destroyed) return;
+    this.socket.write(`${JSON.stringify({
+      type: REMOTE_DESKTOP_LOCAL_WORKER_MSG.ACCESS_STATE,
+      paused,
+    })}\n`);
   }
 
   async handle(message: unknown): Promise<boolean> {
