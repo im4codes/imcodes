@@ -9,7 +9,7 @@ import { bestModelLabel } from '../model-label.js';
 import { getSessionCost, getWeeklyCost, getMonthlyCost, formatCost } from '../cost-tracker.js';
 import { deriveSessionLiveStatus } from '../session-live-status.js';
 import type { UsageData } from '../usage-data.js';
-import { formatProviderQuotaLabel, type ProviderQuotaMeta } from '@shared/provider-quota.js';
+import type { ProviderQuotaMeta } from '@shared/provider-quota.js';
 import { isAuthoritativeUsageContextWindowSource } from '@shared/usage-context-window.js';
 import { usePref, parseBooleanish } from '../hooks/usePref.js';
 import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
@@ -24,6 +24,11 @@ import {
   ACK_FAILURE_ACK_TIMEOUT,
   ACK_FAILURE_DAEMON_OFFLINE,
 } from '@shared/ack-protocol.js';
+import {
+  isCompactProviderQuotaAgent,
+  ProviderQuotaLine,
+  useProviderQuotaLabel,
+} from './ProviderQuotaLine.js';
 
 interface Props {
   usage: UsageData;
@@ -127,34 +132,11 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     isAgentless,
   });
   const showLiveStatus = !isAgentless;
-  const [quotaNow, setQuotaNow] = useState(() => Date.now());
   const [ctxBurning, setCtxBurning] = useState(false);
   const previousCtxSignatureRef = useRef<string | null>(null);
 
   const displayModel = modelOverride ?? usage.model;
-  // Live-tick the quota label (so "resets in Xm" stays current) for ANY provider
-  // that reports structured quota windows — Codex and claude-code-sdk both feed
-  // `quotaMeta`; the gate is its presence, not the agent family.
-  useEffect(() => {
-    if (!quotaMeta) return;
-    let intervalId: number | undefined;
-    const tick = () => setQuotaNow(Date.now());
-    tick();
-    const delay = Math.max(250, 60_000 - (Date.now() % 60_000));
-    const timeoutId = window.setTimeout(() => {
-      tick();
-      intervalId = window.setInterval(tick, 60_000);
-    }, delay);
-    return () => {
-      window.clearTimeout(timeoutId);
-      if (intervalId !== undefined) window.clearInterval(intervalId);
-    };
-  }, [quotaMeta]);
-
-  const displayQuotaLabel = useMemo(() => {
-    if (!quotaMeta) return quotaLabel;
-    return formatProviderQuotaLabel(quotaMeta, now ?? quotaNow) ?? quotaLabel;
-  }, [now, quotaLabel, quotaMeta, quotaNow]);
+  const displayQuotaLabel = useProviderQuotaLabel({ quotaLabel, quotaMeta, now });
 
   const displayPlanLabel = useMemo(() => {
     const normalized = planLabel?.trim().toLowerCase();
@@ -268,7 +250,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   // render one compact quota row. Keep the provider's existing separator and
   // full reset details intact; normal whitespace around ` · ` provides a safe
   // wrap point on a narrow viewport without turning 5h/7d into two DOM rows.
-  const providerQuotaText = (agentType === 'codex' || agentType === 'codex-sdk' || agentType === 'claude-code-sdk')
+  const providerQuotaText = isCompactProviderQuotaAgent(agentType)
     ? (displayQuotaLabel ?? '').trim()
     : '';
   // Reset credits are a codex-account feature (accrued via ChatGPT auth).
@@ -345,9 +327,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
           {(providerQuotaText || showWeeklyAuthPrompt) && (
             <div class="session-usage-codex-quota">
               {providerQuotaText && (
-                <div class="session-usage-codex-line session-usage-codex-line-compact">
-                  {providerQuotaText}
-                </div>
+                <ProviderQuotaLine text={providerQuotaText} />
               )}
               {showWeeklyAuthPrompt && (
                 <button

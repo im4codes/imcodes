@@ -25,9 +25,11 @@ function heartbeatKindKey(kind: SupervisionHeartbeatKind | undefined): string {
 export function SupervisionHeartbeatBadge({
   mode,
   heartbeat,
+  inline = false,
 }: {
   mode: SupervisionMode;
   heartbeat?: SupervisionHeartbeatSnapshot | null;
+  inline?: boolean;
 }) {
   const { t } = useTranslation();
   if (mode === SUPERVISION_MODE.OFF
@@ -37,11 +39,11 @@ export function SupervisionHeartbeatBadge({
   const state = heartbeat.state;
   if (state === SUPERVISION_HEARTBEAT_STATE.PAUSED_NEEDS_INPUT) {
     const label = t('session.supervision.heartbeat.needsInput');
-    return <span class="supervision-heartbeat-badge is-needs-input" role="status" aria-label={label} title={label}>{SUPERVISION_HEARTBEAT_GLYPH.NEEDS_INPUT}</span>;
+    return <span class={`supervision-heartbeat-badge is-needs-input${inline ? ' is-inline' : ''}`} role="status" aria-label={label} title={label}>{SUPERVISION_HEARTBEAT_GLYPH.NEEDS_INPUT}</span>;
   }
   if (state === SUPERVISION_HEARTBEAT_STATE.IDLE) {
     const label = t('session.supervision.heartbeat.idle');
-    return <span class="supervision-heartbeat-badge is-idle" role="status" aria-label={label} title={label}><span class="supervision-heartbeat-glyph is-idle" aria-hidden="true">{SUPERVISION_HEARTBEAT_GLYPH.IDLE}</span></span>;
+    return <span class={`supervision-heartbeat-badge is-idle${inline ? ' is-inline' : ''}`} role="status" aria-label={label} title={label}><span class="supervision-heartbeat-glyph is-idle" aria-hidden="true">{SUPERVISION_HEARTBEAT_GLYPH.IDLE}</span></span>;
   }
   if (state !== SUPERVISION_HEARTBEAT_STATE.ARMED
     || heartbeat.nextHeartbeatAt === undefined) return null;
@@ -50,13 +52,15 @@ export function SupervisionHeartbeatBadge({
     <ArmedSupervisionHeartbeatBadge
       heartbeat={heartbeat}
       nextHeartbeatAt={heartbeat.nextHeartbeatAt}
+      inline={inline}
     />
   );
 }
 
-function ArmedSupervisionHeartbeatBadge({ heartbeat, nextHeartbeatAt }: {
+function ArmedSupervisionHeartbeatBadge({ heartbeat, nextHeartbeatAt, inline }: {
   heartbeat: SupervisionHeartbeatSnapshot;
   nextHeartbeatAt: number;
+  inline: boolean;
 }) {
   const { t } = useTranslation();
   const schedule = useMemo(() => {
@@ -98,7 +102,7 @@ function ArmedSupervisionHeartbeatBadge({ heartbeat, nextHeartbeatAt }: {
     : t('session.supervision.heartbeat.armedLabel', { kind, countdown, time: exactTime });
   return (
     <span
-      class={`supervision-heartbeat-badge is-armed${sending ? ' is-sending' : ''}`}
+      class={`supervision-heartbeat-badge is-armed${sending ? ' is-sending' : ''}${inline ? ' is-inline' : ''}`}
       role={sending ? 'status' : 'timer'}
       aria-label={label}
       title={label}

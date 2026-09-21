@@ -458,6 +458,10 @@ export function SessionPane({
           readOnlyFiles={!!session.sharedState && session.sharedState.effectiveRole !== 'participant'}
           onQuote={addQuote}
           agentType={session.agentType}
+          quotaLabel={session.quotaLabel}
+          quotaMeta={session.quotaMeta}
+          supervisionMode={session.supervisionMode}
+          supervisionHeartbeat={session.supervisionHeartbeat}
           onResendFailed={handleResendFailed}
           messagePinsEnabled
         />

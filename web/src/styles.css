@@ -751,6 +751,14 @@ html.native-ios-mac .chat-dl-btn {
   color: var(--supervision-needs-input-text);
 }
 .supervision-heartbeat-badge.is-sending { animation: supervision-heartbeat-pulse 0.72s ease-in-out infinite alternate; }
+.supervision-heartbeat-badge.is-inline {
+  position: relative;
+  z-index: auto;
+  top: auto;
+  right: auto;
+  flex: 0 0 auto;
+  pointer-events: auto;
+}
 .supervision-heartbeat-glyph { display: inline-block; line-height: 1; }
 .supervision-heartbeat-glyph.is-idle { color: var(--supervision-idle-text); }
 @keyframes supervision-heartbeat-pulse {
@@ -4878,6 +4886,36 @@ html.native-ios-mac .chat-dl-btn {
   --chat-machine-chip-color: #94a3b8;
   flex: 1; overflow-y: auto; overflow-x: hidden; padding: 8px 12px; display: flex; flex-direction: column; gap: 2px; scrollbar-width: thin; scrollbar-color: #6366f1 #1e293b; overflow-anchor: none;
 }
+.chat-participant-status {
+  position: sticky;
+  top: 0;
+  z-index: 7;
+  display: flex;
+  max-width: 100%;
+  min-width: 0;
+  min-height: 22px;
+  box-sizing: border-box;
+  align-items: center;
+  gap: 6px;
+  margin: 0 110px 5px 0;
+  padding: 3px 6px;
+  overflow-x: auto;
+  overflow-y: visible;
+  border: 1px solid rgba(125, 211, 252, 0.16);
+  border-radius: 7px;
+  background: linear-gradient(90deg, rgba(8, 13, 22, 0.96), rgba(15, 23, 42, 0.90));
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.24);
+  scrollbar-width: none;
+}
+.chat-participant-status::-webkit-scrollbar { display: none; }
+.chat-view-preview .chat-participant-status { position: relative; top: auto; margin-right: 38px; }
+.chat-participant-status + .agent-todos { top: 29px; }
+.chat-participant-audit { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 4px; padding: 1px 5px; border: 1px solid rgba(148, 163, 184, 0.3); border-radius: 999px; font-size: 10px; font-weight: 800; line-height: 15px; }
+.chat-participant-audit.is-pass { border-color: rgba(52, 211, 153, 0.52); background: rgba(6, 78, 59, 0.44); color: #a7f3d0; }
+.chat-participant-audit.is-rework { border-color: rgba(251, 146, 60, 0.58); background: rgba(124, 45, 18, 0.42); color: #fed7aa; }
+.chat-participant-audit .peer-audit-round-chip { margin: 0; }
+.chat-participant-quota { flex: 0 0 auto; max-width: none; margin: 0; padding: 1px 6px; border-radius: 999px; font-size: 10px; line-height: 15px; white-space: nowrap; }
+.chat-participant-heartbeat { display: inline-flex; flex: 0 0 auto; align-items: center; min-height: 16px; }
 /* In sub-session cards `.subcard-preview` (parent) owns the scrollbar. If
    `.chat-view` ALSO scrolls (default rule above), every new event triggers
    two independent scrollTop writes — one from ChatView's preview-mode auto-

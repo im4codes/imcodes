@@ -7,11 +7,16 @@ import {
   SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND,
   SUPERVISION_EXECUTION_STATES,
   SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND,
+  SUPERVISION_MODE,
   SUPERVISION_USER_PROMPT_LABEL_KEYS,
   SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND,
   type SupervisionExecutionState,
+  type SupervisionMode,
 } from '@shared/supervision-config.js';
-import { SUPERVISION_HEARTBEAT_GLYPH } from '@shared/supervision-heartbeat.js';
+import {
+  SUPERVISION_HEARTBEAT_GLYPH,
+  type SupervisionHeartbeatSnapshot,
+} from '@shared/supervision-heartbeat.js';
 import {
   CRON_COMPLETION_POLICY,
   CRON_RUN_TIMELINE,
@@ -105,6 +110,7 @@ import {
   isPeerAuditRuntimeDisposition,
   isPeerAuditVerdict,
 } from '@shared/peer-audit.js';
+import type { ProviderQuotaMeta } from '@shared/provider-quota.js';
 import {
   AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
   readAgentDelegationSupervisionTaskProjection,
@@ -135,6 +141,11 @@ import {
   type LiveAssignmentStatus,
 } from '../timeline/supervision-assignment-status.js';
 import { resizeHandleHoverEvents } from './window-resize.js';
+import { SupervisionHeartbeatBadge } from './SupervisionHeartbeatBadge.js';
+import {
+  ProviderQuotaLine,
+  useProviderQuotaLabel,
+} from './ProviderQuotaLine.js';
 
 interface Props {
   events: TimelineEvent[];
@@ -173,6 +184,10 @@ interface Props {
   /** Called when user quotes selected text. */
   onQuote?: (text: string) => void;
   agentType?: string | null;
+  quotaLabel?: string | null;
+  quotaMeta?: ProviderQuotaMeta | null;
+  supervisionMode?: SupervisionMode | null;
+  supervisionHeartbeat?: SupervisionHeartbeatSnapshot | null;
   /** Server ID for file transfer download API. */
   serverId?: string;
   /** Opens loopback HTTP links in the shared local-web-preview window. */
@@ -1911,7 +1926,102 @@ function SdkAgentsDiagnosticRow({ diagnostic }: { diagnostic: SdkSubagentDiagnos
   );
 }
 
-function ChatViewImpl({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, onQuote, agentType: _agentType, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false }: Props) {
+export interface ParticipantAuditStatus {
+  verdict: typeof PEER_AUDIT_VERDICTS[number];
+  round: number;
+}
+
+/**
+ * Read only daemon-authenticated timeline projections. The same scan works for
+ * a live append and for an IndexedDB/HTTP history replay, so participant chrome
+ * cannot disagree merely because its window was reopened.
+ */
+export function deriveLatestParticipantAuditStatus(
+  events: readonly TimelineEvent[],
+): ParticipantAuditStatus | null {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event.source !== 'daemon' || event.confidence !== 'high') continue;
+    if (event.type === AGENT_DELEGATION_REPLY_TIMELINE_EVENT) {
+      const verdict = isPeerAuditVerdict(event.payload.verdict) ? event.payload.verdict : null;
+      if (verdict && isPeerAuditRound(event.payload.round)) {
+        return { verdict, round: event.payload.round };
+      }
+      continue;
+    }
+    if (event.type === 'peer_audit.result' && isPeerAuditRound(event.payload.round)) {
+      if (event.payload.outcome === 'pass') {
+        return { verdict: PEER_AUDIT_VERDICTS[0], round: event.payload.round };
+      }
+      if (event.payload.outcome === 'rework') {
+        return { verdict: PEER_AUDIT_VERDICTS[1], round: event.payload.round };
+      }
+    }
+  }
+  return null;
+}
+
+function ParticipantStatusBar({
+  events,
+  quotaLabel,
+  quotaMeta,
+  supervisionMode,
+  supervisionHeartbeat,
+}: {
+  events: readonly TimelineEvent[];
+  quotaLabel?: string | null;
+  quotaMeta?: ProviderQuotaMeta | null;
+  supervisionMode?: SupervisionMode | null;
+  supervisionHeartbeat?: SupervisionHeartbeatSnapshot | null;
+}) {
+  const { t } = useTranslation();
+  const audit = useMemo(() => deriveLatestParticipantAuditStatus(events), [events]);
+  const displayQuotaLabel = useProviderQuotaLabel({ quotaLabel, quotaMeta });
+  const quotaText = (displayQuotaLabel ?? '').trim();
+  const heartbeatVisible = supervisionMode !== undefined
+    && supervisionMode !== null
+    && supervisionMode !== SUPERVISION_MODE.OFF
+    && !!supervisionHeartbeat;
+  if (!audit && !quotaText && !heartbeatVisible) return null;
+
+  const verdictLabel = audit
+    ? t(audit.verdict === PEER_AUDIT_VERDICTS[0]
+      ? 'peerAuditQuick.result_pass'
+      : 'peerAuditQuick.result_rework')
+    : '';
+
+  return (
+    <div class="chat-participant-status" role="group" data-testid="chat-participant-status">
+      {audit && (
+        <span
+          class={`chat-participant-audit is-${audit.verdict.toLowerCase()}`}
+          title={`${t('supervision_task_console.audit_verdict')}: ${verdictLabel}`}
+        >
+          <span class="chat-participant-audit-verdict">{audit.verdict}</span>
+          <PeerAuditRoundChip round={audit.round} outcomeLabel={verdictLabel} />
+        </span>
+      )}
+      {quotaText && (
+        <ProviderQuotaLine
+          text={quotaText}
+          className="chat-participant-quota"
+          title={t('session.provider_quota_title', { value: quotaText })}
+        />
+      )}
+      {heartbeatVisible && (
+        <span class="chat-participant-heartbeat">
+          <SupervisionHeartbeatBadge
+            mode={supervisionMode}
+            heartbeat={supervisionHeartbeat}
+            inline
+          />
+        </span>
+      )}
+    </div>
+  );
+}
+
+function ChatViewImpl({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, onQuote, quotaLabel, quotaMeta, supervisionMode, supervisionHeartbeat, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false }: Props) {
   const { t, i18n } = useTranslation();
   const locale = resolveI18nLocale(i18n);
   const fileScopeSessionName = scopeFilesToSession ? (sessionId ?? undefined) : undefined;
@@ -3637,6 +3747,13 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
             setCtxMenu(null);
           } : undefined}
         >
+          <ParticipantStatusBar
+            events={events}
+            quotaLabel={quotaLabel}
+            quotaMeta={quotaMeta}
+            supervisionMode={supervisionMode}
+            supervisionHeartbeat={supervisionHeartbeat}
+          />
           {!preview && <AgentTodoList events={events} sessionState={sessionState} />}
           {/* The spinner is for an EMPTY pane only. It used to be an exclusive
            *  branch on `loading` alone, which — together with the `!loading`

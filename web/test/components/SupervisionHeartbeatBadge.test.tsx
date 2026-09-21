@@ -157,4 +157,13 @@ describe('SupervisionHeartbeatBadge', () => {
     expect(formatSupervisionHeartbeatCountdown(1)).toBe('00:01');
     expect(formatSupervisionHeartbeatCountdown(60_001)).toBe('01:01');
   });
+
+  it('reuses the same badge inline without toolbar positioning semantics', () => {
+    render(<SupervisionHeartbeatBadge
+      mode={SUPERVISION_MODE.SUPERVISED_AUDIT}
+      heartbeat={{ state: SUPERVISION_HEARTBEAT_STATE.IDLE, updatedAt: 1 }}
+      inline
+    />);
+    expect(screen.getByRole('status').classList.contains('is-inline')).toBe(true);
+  });
 });

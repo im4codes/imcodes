@@ -23,9 +23,11 @@ describe('UsageFooter quota and history-refresh integration contract', () => {
 
   it('keeps one compact quota element readable instead of truncating narrow layouts', () => {
     const component = readFileSync(resolve(WEB_ROOT, 'src/components/UsageFooter.tsx'), 'utf8');
+    const sharedLine = readFileSync(resolve(WEB_ROOT, 'src/components/ProviderQuotaLine.tsx'), 'utf8');
     const css = readFileSync(resolve(WEB_ROOT, 'src/styles.css'), 'utf8');
     expect(component).not.toContain(".split(' · ')");
-    expect(component.match(/session-usage-codex-line-compact/g)).toHaveLength(1);
+    expect(component.match(/<ProviderQuotaLine text=\{providerQuotaText\}/g)).toHaveLength(1);
+    expect(sharedLine.match(/session-usage-codex-line-compact/g)).toHaveLength(1);
 
     const compactRule = css.match(/\.session-usage-codex-line-compact\s*\{[^}]*\}/)?.[0];
     expect(compactRule).toMatch(/max-width:\s*100%/);
