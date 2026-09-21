@@ -15,6 +15,7 @@ import {
   createControlledNodeHealthLeasePublisher,
   createSystemdWatchdogNotifier,
   runMacosControlledNodeHealthWatchdog,
+  waitForControlledNodeOnlineLease,
 } from './health-lease.js';
 import { CONTROLLED_NODE_SERVICE } from './installer.js';
 import { defaultStagedExecutablePath, readEnrollmentBlob } from './enrollment.js';
@@ -223,6 +224,13 @@ async function main(): Promise<void> {
     process.stdout.write(`${controlledNodeInstallStatus(installerLocale())}\n`);
   }
   const bootstrap = await bootstrapControlledNodeWithDisposition(deps);
+  if (installerLaunch && bootstrap.disposition === 'handoff_complete'
+    && (process.platform === 'win32' || process.platform === 'darwin')) {
+    // Registration and Task Scheduler/launchd acceptance are not proof that
+    // the staged service started or authenticated. Do not print a green
+    // success block while the web UI still shows the node offline.
+    await waitForControlledNodeOnlineLease(controlledNodeHealthLeasePath(deps.journalPath));
+  }
   if (installerLaunch) {
     // The install is only "done" once a credential exists; report it on every
     // platform, on both the freshly-enrolled and already-enrolled paths.

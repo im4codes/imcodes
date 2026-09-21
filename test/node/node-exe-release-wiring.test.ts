@@ -328,6 +328,9 @@ describe('controlled-node executable release wiring', () => {
     // Neither terminal outcome may be silent.
     expect(entry).toContain('formatInstallSuccess(');
     expect(entry).toContain('formatInstallFailure(');
+    expect(entry).toContain('waitForControlledNodeOnlineLease(');
+    expect(entry.indexOf('waitForControlledNodeOnlineLease('))
+      .toBeLessThan(entry.indexOf('formatInstallSuccess('));
     expect(buildScript).toContain("'process.env.WS_NO_BUFFER_UTIL': JSON.stringify('1')");
     expect(buildScript).toContain("'process.env.WS_NO_UTF_8_VALIDATE': JSON.stringify('1')");
     expect(buildScript).not.toContain("execArgv: ['--no-warnings']");

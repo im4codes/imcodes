@@ -122,8 +122,20 @@ describe('controlled-node install reporting', () => {
       .toBe(INSTALL_FAILURE_CAUSE.SERVER_UNREACHABLE);
     expect(classifyInstallFailure(new Error('controlled node install journal is corrupt; manual recovery required')))
       .toBe(INSTALL_FAILURE_CAUSE.JOURNAL_RECOVERY);
+    expect(classifyInstallFailure(new Error('controlled node service did not authenticate after installation')))
+      .toBe(INSTALL_FAILURE_CAUSE.SERVICE_OFFLINE);
     expect(classifyInstallFailure(new Error('something nobody predicted')))
       .toBe(INSTALL_FAILURE_CAUSE.UNKNOWN);
+  });
+
+  it('does not turn a registered-but-offline reinstall into a silent success', () => {
+    const zh = formatInstallFailure(
+      'zh-CN',
+      'win32',
+      new Error('controlled node service did not authenticate after installation'),
+    );
+    expect(zh).toContain('未能在 45 秒内连接服务器');
+    expect(zh).toContain('只读诊断脚本');
   });
 
   it('gives each platform its own elevation instruction', () => {

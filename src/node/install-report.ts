@@ -28,6 +28,7 @@ export const INSTALL_FAILURE_CAUSE = {
   SERVER_UNREACHABLE: 'server_unreachable',
   JOURNAL_RECOVERY: 'journal_recovery',
   PUBLISHER_TRUST: 'publisher_trust',
+  SERVICE_OFFLINE: 'service_offline',
   UNKNOWN: 'unknown',
 } as const;
 
@@ -278,6 +279,9 @@ export function classifyInstallFailure(error: unknown): InstallFailureCause {
     return INSTALL_FAILURE_CAUSE.JOURNAL_RECOVERY;
   }
   if (message.includes('publisher trust')) return INSTALL_FAILURE_CAUSE.PUBLISHER_TRUST;
+  if (message.includes('did not authenticate after installation')) {
+    return INSTALL_FAILURE_CAUSE.SERVICE_OFFLINE;
+  }
   return INSTALL_FAILURE_CAUSE.UNKNOWN;
 }
 
@@ -317,6 +321,11 @@ function hintFor(cause: InstallFailureCause, platform: NodeJS.Platform, zh: bool
     return zh
       ? '这台机器拒绝安装 IM.codes 的发布者证书。常见原因是组策略锁定了证书存储、杀毒软件拦截了 PowerShell，或这份安装包不是官方签名版本。请把上面这行「原因」连同这台机器的杀毒/组策略情况发给管理员。'
       : 'This machine refused to install the IM.codes publisher certificate. Common causes are group policy locking the certificate stores, antivirus blocking PowerShell, or an installer that is not an officially signed release. Send the Reason line above, plus this machine\'s antivirus/group-policy situation, to your administrator.';
+  }
+  if (cause === INSTALL_FAILURE_CAUSE.SERVICE_OFFLINE) {
+    return zh
+      ? '安装文件和后台任务已写入，但新节点未能在 45 秒内连接服务器。请运行只读诊断脚本，检查任务退出码、网络和认证日志；安装器不会再把这种情况显示为成功。'
+      : 'The files and background task were installed, but the new node did not connect to the server within 45 seconds. Run the read-only diagnostic script and check the task result, network, and authentication log; the installer no longer reports this state as success.';
   }
   if (cause === INSTALL_FAILURE_CAUSE.JOURNAL_RECOVERY) {
     return zh

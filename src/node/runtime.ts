@@ -1204,6 +1204,17 @@ export function createControlledNodeRuntime(
     }),
     heartbeatMs: 5_000,
     silenceTimeoutMs: 30_000,
+    onDiagnostic: (event) => {
+      if (event.type === 'socket_opened') {
+        logger.info({ lifecycle: event.type }, 'controlled-node transport connected');
+      } else if (event.type === 'reconnect_scheduled') {
+        logger.info({ lifecycle: event.type, delayMs: event.delayMs }, 'controlled-node transport reconnect scheduled');
+      } else {
+        // Deliberately exclude URL, auth frames and message bodies. This is
+        // safe to collect from an affected laptop without exposing secrets.
+        logger.warn({ lifecycle: event.type, reason: event.reason }, 'controlled-node transport disconnected');
+      }
+    },
     createSocket: (url) => {
       // Auth is connection-generation scoped. Re-sample immediately before
       // each socket so a readiness downgrade cannot reconnect as stale Control.
