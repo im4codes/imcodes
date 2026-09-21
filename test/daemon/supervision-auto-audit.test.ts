@@ -770,10 +770,14 @@ describe('automatic supervision audit materialization', () => {
     const stale = shape.registry.createAssignment({
       taskId: shape.taskId, role: 'integration_owner', required: true,
       identity: identity(brain.name), scopeFiles: ['src/exact.ts'],
-      auditAttemptId: oldAttempt, auditRevision: oldRevision,
+      auditAttemptId: oldAttempt, auditRevision: shape.revision,
       idempotencyKey: 'historical-r7-owner',
     });
     if (!stale.ok) throw new Error(stale.reason);
+    const staleRow = shape.registry.getAssignment(stale.value.assignmentId)!;
+    database.prepare(
+      'UPDATE supervision_task_assignments SET audit_revision = ?, payload_json = ? WHERE assignment_id = ?',
+    ).run(oldRevision, JSON.stringify({ ...staleRow, auditRevision: oldRevision }), staleRow.assignmentId);
     expect(shape.registry.applyTaskIntent({
       taskId: shape.taskId, assignmentId: stale.value.assignmentId,
       intent: 'cancel', toStatus: 'cancelled', note: 'retire rejected R7 owner',
@@ -1129,7 +1133,7 @@ describe('automatic supervision audit materialization', () => {
     expect(registry.getAssignment(owner.assignmentId)).toMatchObject({ status: 'implementing' });
   });
 
-  it('aligns one validated R1/R2 split before the ordinary finish handoff and keeps stale finish rejected', async () => {
+  it('keeps a validated R1/R2 split inert until an explicit revision rebind', async () => {
     const database = new DatabaseSync(':memory:');
     const registry = new SupervisionTaskRegistry({ database });
     const taskId = 'validated-revision-split';
@@ -1165,22 +1169,28 @@ describe('automatic supervision audit materialization', () => {
       assignmentId: worker.value.assignmentId, identity: worker.value.identity, revision: r2,
     })).toEqual({ ok: false, reason: 'old_revision' });
     expect(await registry.convergeValidatedAssignment(worker.value.assignmentId, splitTask.updatedAt + 1))
-      .toEqual([
-        { taskId, assignmentId: worker.value.assignmentId, action: 'align_validated_revision' },
-        { taskId, assignmentId: worker.value.assignmentId, action: 'project_validated_handoff' },
-      ]);
+      .toEqual([]);
     expect(registry.getTaskRecord(taskId)).toMatchObject({
-      status: 'ready_for_audit', currentRevision: r2, validationState: 'passed',
+      status: 'validated', currentRevision: r1, validationState: 'passed',
     });
     expect(registry.getAssignment(worker.value.assignmentId)).toMatchObject({
-      status: 'ready_for_audit', auditRevision: r2, validationState: 'passed', leaseId: '',
+      status: 'validated', auditRevision: r2, validationState: 'passed',
     });
     expect(registry.finishAssignment({
       assignmentId: worker.value.assignmentId, identity: worker.value.identity, revision: r1,
     })).toEqual({ ok: false, reason: 'old_revision' });
-    const eventCount = registry.listEvents(taskId).length;
-    expect(await registry.convergeValidatedAssignment(worker.value.assignmentId, splitTask.updatedAt + 2)).toEqual([]);
-    expect(registry.listEvents(taskId)).toHaveLength(eventCount);
+    expect(registry.rebindTaskAssignmentRevision({
+      taskId, assignmentId: worker.value.assignmentId,
+      fromRevision: r1, toRevision: r2,
+      worktreeSnapshot: {
+        worktreePath: '/tmp/validated-revision-split', headSha: 'a'.repeat(40),
+        files: [{ path: 'src/exact.ts', sha256: 'b'.repeat(64) }],
+        stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
+      },
+      leaseAction: 'renew', idempotencyKey: 'explicit-validated-split-r2',
+      reason: 'explicitly repair the split before accepting R2 validation',
+    })).toMatchObject({ ok: true, value: { currentRevision: r2, status: 'implementing' } });
+    expect(registry.getAssignment(worker.value.assignmentId)?.validationState).toBeUndefined();
   });
 
   it.each(['ambiguous implementer', 'conflicting external evidence'] as const)(
@@ -1234,7 +1244,7 @@ describe('automatic supervision audit materialization', () => {
     },
   );
 
-  it('repairs the exact validated revision split in the bounded sweep and is replay-idempotent', async () => {
+  it('never repairs a validated revision split in the bounded sweep', async () => {
     const database = new DatabaseSync(':memory:');
     const registry = new SupervisionTaskRegistry({ database });
     const taskId = 'validated-revision-split-sweep';
@@ -1265,17 +1275,17 @@ describe('automatic supervision audit materialization', () => {
       'UPDATE supervision_tasks SET status = ?, current_revision = ?, payload_json = ?, updated_at = ? WHERE task_id = ?',
     ).run(split.status, r1, JSON.stringify(split), split.updatedAt, taskId);
 
-    expect(await registry.convergeLifecycle(split.updatedAt + 1, { limit: 1 })).toEqual([
-      { taskId, assignmentId: worker.value.assignmentId, action: 'align_validated_revision' },
-      { taskId, assignmentId: worker.value.assignmentId, action: 'project_validated_handoff' },
-    ]);
+    expect(await registry.convergeLifecycle(split.updatedAt + 1, { limit: 1 })).toEqual([]);
     const eventCount = registry.listEvents(taskId).length;
     expect(await registry.convergeLifecycle(split.updatedAt + 2, { limit: 1 })).toEqual([]);
     expect(registry.listEvents(taskId)).toHaveLength(eventCount);
+    expect(registry.getTaskRecord(taskId)?.currentRevision).toBe(r1);
+    expect(registry.getAssignment(worker.value.assignmentId)?.auditRevision).toBe(r2);
   });
 
   it('clears external execution evidence with the existing coordination audit reset', () => {
-    const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
     const taskId = 'coordination-reset-external-evidence';
     const revision = 'coordination-reset-r1';
     expect(registry.createOrGet({
@@ -5369,9 +5379,10 @@ describe('legacy explicit-audit recovery (tsk_569 shape)', () => {
    * explicit human-minted attempt, and only an older finalized REWORK auditor.
    * The explicit attempt is a pre-existing audit intent; a missing task-level
    * policy must not strand it forever.
-   */
+  */
   function legacyShape(options: { attemptId?: string | null; implementerRevision?: string } = {}) {
-    const registry = new SupervisionTaskRegistry({ database: new DatabaseSync(':memory:') });
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
     const taskId = 'tsk_569';
     const revision = 'r5.532fc509';
     expect(registry.createOrGet({
@@ -5384,7 +5395,7 @@ describe('legacy explicit-audit recovery (tsk_569 shape)', () => {
     const worker = registry.createAssignment({
       taskId, role: 'implementer', identity: identity('deck_alpha_worker'),
       scopeFiles: ['src/exact.ts'],
-      auditRevision: options.implementerRevision ?? revision,
+      auditRevision: revision,
       ...(options.attemptId === null ? {} : { auditAttemptId: options.attemptId ?? LEGACY_ATTEMPT }),
     } as never);
     if (!worker.ok) throw new Error(worker.reason);
@@ -5397,7 +5408,15 @@ describe('legacy explicit-audit recovery (tsk_569 shape)', () => {
         identity: worker.value.identity, toStatus,
       } as never);
     }
-    return { registry, taskId, revision, worker: worker.value };
+    if (options.implementerRevision && options.implementerRevision !== revision) {
+      const persisted = registry.getAssignment(worker.value.assignmentId)!;
+      database.prepare(
+        'UPDATE supervision_task_assignments SET audit_revision = ?, payload_json = ? WHERE assignment_id = ?',
+      ).run(options.implementerRevision, JSON.stringify({
+        ...persisted, auditRevision: options.implementerRevision,
+      }), persisted.assignmentId);
+    }
+    return { registry, database, taskId, revision, worker: worker.value };
   }
 
   it('recovers the EXISTING explicit attempt rather than minting a canonical one', () => {

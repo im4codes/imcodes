@@ -593,7 +593,7 @@ describe('repair->resume matrix: R3->R4 stale live integration-owner projection'
     expect(isTerminal(r.getAssignment(liveOwner.assignmentId)!.status)).toBe(false);
   });
 
-  it('fails closed when the live owner carries evidence for a different revision', async () => {
+  it('rejects a live owner that would carry evidence for a different revision', async () => {
     const r = registry();
     const built = finalizedAggregateWithSuccessor(r);
     // Inconsistent evidence: this live owner claims a revision the task's
@@ -606,12 +606,14 @@ describe('repair->resume matrix: R3->R4 stale live integration-owner projection'
       auditRevision: 'some-other-revision-deadbeef',
       auditAttemptId: 'auto-audit-someotherattempt',
     } as never);
-    if (!divergent.ok) throw new Error('divergent: ' + divergent.reason);
+    expect(divergent).toMatchObject({ ok: false, reason: 'old_revision' });
 
     await r.convergeLifecycle(Date.now());
 
-    expect(isTerminal(r.getAssignment(divergent.value.assignmentId)!.status)).toBe(false);
-    expect(r.getAssignment(divergent.value.assignmentId)!.auditRevision).toBe('some-other-revision-deadbeef');
+    expect(r.listAssignments(built.taskId).some((assignment) => (
+      assignment.role === 'integration_owner'
+      && assignment.auditRevision === 'some-other-revision-deadbeef'
+    ))).toBe(false);
   });
 });
 

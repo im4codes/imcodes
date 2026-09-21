@@ -1289,6 +1289,46 @@ describe('administrative recover', () => {
     expect(rebindTaskAssignmentRevision).toHaveBeenCalledTimes(1);
   });
 
+  it('reports the exact persisted/requested revision tuple for an invalid equal-revision recovery', async () => {
+    const assignmentId = 'split-diagnostic-assignment';
+    const state = {
+      taskId: 'split-diagnostic-task', projectName: 'codedeck',
+      status: 'recovered', currentRevision: 'revision-r1',
+      assignments: [{
+        assignmentId, role: 'implementer', status: 'recovered', leaseId: '',
+        auditRevision: 'revision-r2', identity: testIdentity('deck_split_diagnostic_worker'),
+      }],
+    };
+    const port = {
+      getStatus: () => state.status, applyIntent: () => undefined,
+      list: () => [state], get: () => state, recover: () => undefined,
+      rebindTaskAssignmentRevision: () => ({
+        ok: false as const,
+        reason: 'invalid',
+        detail: {
+          taskCurrentRevision: 'revision-r1',
+          assignmentAuditRevision: 'revision-r2',
+          requestedFromRevision: 'revision-r3',
+          requestedToRevision: 'revision-r3',
+          mismatchedFields: ['task.currentRevision', 'assignment.auditRevision'],
+        },
+      }),
+    } as unknown as SupervisionRegistryPort;
+    const brain = createSupervisionMcpToolHandlers(CALLER, {
+      registry: port, isProjectBrain: () => true, resolveSessionIdentity: testResolveSessionIdentity,
+    });
+
+    await expect(brain[SUPERVISION_MCP_TOOLS.RECOVER]({
+      taskId: state.taskId, assignmentId,
+      fromRevision: 'revision-r3', toRevision: 'revision-r3',
+      leaseAction: 'renew', idempotencyKey: 'equal-revision-diagnostic',
+      reason: 'show the exact mismatch rather than opaque invalid',
+    })).resolves.toEqual({
+      status: 'error', reason: 'invalid',
+      detail: 'revision recovery rejected: invalid; task.currentRevision=revision-r1, assignment.auditRevision=revision-r2, requested fromRevision=revision-r3, requested toRevision=revision-r3, mismatched fields=task.currentRevision,assignment.auditRevision',
+    });
+  });
+
   it.each([
     ['task revision', 'revision-r1', 'revision-r2', undefined, undefined],
     ['assignment revision', 'revision-r2', 'revision-r1', undefined, undefined],

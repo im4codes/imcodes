@@ -2287,7 +2287,8 @@ describe('SupervisionTaskRegistry', () => {
   });
 
   it('fails closed without mutation when a required lineage assignment carries a stale revision', () => {
-    const registry = makeRegistry();
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
     const shape = prepareStructuredFinalizationShape(registry, 'structured-finalization-stale-lineage');
     const staleIdentity = identity('structured-finalization-stale-lineage-worker');
     const stale = registry.createAssignment({
@@ -2296,17 +2297,19 @@ describe('SupervisionTaskRegistry', () => {
       identity: staleIdentity,
       scopeFiles: ['src/stale-lineage.ts'],
       auditAttemptId: 'stale-lineage-attempt',
-      auditRevision: 'stale-lineage-revision',
+      auditRevision: shape.revision,
     });
     if (!stale.ok) throw new Error(stale.reason);
+    rewritePersistedAssignment(database, {
+      ...registry.getAssignment(stale.value.assignmentId)!,
+      auditRevision: 'stale-lineage-revision',
+    });
     for (const status of ['implementing', 'validated', 'ready_for_audit', 'auditing', 'passed', 'ready_for_integration'] as const) {
       expect(registry.updateAssignment({
         assignmentId: stale.value.assignmentId,
         identity: staleIdentity,
         status,
-        revision: 'stale-lineage-revision',
         auditAttemptId: 'stale-lineage-attempt',
-        auditRevision: 'stale-lineage-revision',
         ...(status === 'passed' || status === 'ready_for_integration'
           ? { verdict: 'PASS', crossVendorAuditPassed: true }
           : {}),
@@ -2321,6 +2324,7 @@ describe('SupervisionTaskRegistry', () => {
     expect(registry.get(shape.taskId)).toEqual(before);
     expect(registry.listEvents(shape.taskId)).toHaveLength(eventCount);
     registry.close();
+    database.close();
   });
 
   it('persists structured finalization across SQLite reopen and makes exact replay idempotent', () => {
@@ -2506,9 +2510,15 @@ describe('SupervisionTaskRegistry', () => {
             identity: secondIdentity,
             scopeFiles: shape.files,
             auditAttemptId: variant === 'multiple' ? shape.attemptId : `${shape.attemptId}-stale`,
-            auditRevision: variant === 'multiple' ? shape.revision : `${shape.revision}-stale`,
+            auditRevision: shape.revision,
           });
           if (!second.ok) throw new Error(second.reason);
+          if (variant === 'stale_owner') {
+            rewritePersistedAssignment(database, {
+              ...registry.getAssignment(second.value.assignmentId)!,
+              auditRevision: `${shape.revision}-stale`,
+            });
+          }
           if (variant === 'multiple') {
             for (const status of ['implementing', 'validated', 'ready_for_audit', 'auditing', 'passed', 'ready_for_integration'] as const) {
               expect(registry.updateAssignment({
@@ -3133,7 +3143,7 @@ describe('SupervisionTaskRegistry', () => {
     database.close();
   });
 
-  it('advances the task revision when the owner already carries the successor auditRevision', () => {
+  it('treats an implementation-owner auditRevision-only update as an atomic task bind', () => {
     // Live shape from tsk_4l8: a semantic rebase produced successor R4, the
     // integration owner already had auditRevision=R4 bound (an auditRevision-only
     // update succeeds), but task.currentRevision was still R3. Re-sending the
@@ -3163,16 +3173,16 @@ describe('SupervisionTaskRegistry', () => {
       assignmentId: owner.value.assignmentId, identity: ownerIdentity, status: 'implementing',
     })).toMatchObject({ ok: true });
 
-    // Exactly the call that already works today: bind the successor on the
-    // assignment alone, leaving the task revision behind.
+    // The old implementation persisted only the assignment here. That
+    // assignment-only escape hatch is the tsk_18tm production split.
     expect(registry.updateAssignment({
       assignmentId: owner.value.assignmentId, identity: ownerIdentity,
       auditRevision: successor,
     })).toMatchObject({ ok: true });
     expect(registry.getAssignment(owner.value.assignmentId)?.auditRevision).toBe(successor);
-    expect(registry.getTaskRecord(taskId)?.currentRevision).toBe(older);
+    expect(registry.getTaskRecord(taskId)?.currentRevision).toBe(successor);
 
-    // Now the same exact successor must be able to move the task revision.
+    // An exact duplicate remains harmless.
     const advanced = registry.updateAssignment({
       assignmentId: owner.value.assignmentId, identity: ownerIdentity,
       revision: successor, auditRevision: successor,
@@ -3293,10 +3303,6 @@ describe('SupervisionTaskRegistry', () => {
     expect(registry.updateAssignment({
       assignmentId: shape.owner.assignmentId, identity: shape.ownerIdentity,
       auditRevision: shape.older,
-    })).toMatchObject({ ok: true });
-    expect(registry.updateAssignment({
-      assignmentId: shape.owner.assignmentId, identity: shape.ownerIdentity,
-      revision: shape.older, auditRevision: shape.older,
     }), 'a downgrade onto an audited revision must be refused')
       .toMatchObject({ ok: false, reason: 'old_revision' });
     expect(
@@ -3320,15 +3326,10 @@ describe('SupervisionTaskRegistry', () => {
     expect(registry.updateAssignment({
       assignmentId: second.value.assignmentId, identity: otherIdentity,
       auditRevision: shape.successor,
-    })).toMatchObject({ ok: true });
+    })).toMatchObject({ ok: false, reason: 'owner_mismatch' });
 
     expect(registry.getTaskRecord(shape.taskId)?.integrationOwnerAssignmentId)
       .toBe(shape.owner.assignmentId);
-    expect(registry.updateAssignment({
-      assignmentId: second.value.assignmentId, identity: otherIdentity,
-      revision: shape.successor, auditRevision: shape.successor,
-    }), 'a non-pointer owner must not drive the catch-up')
-      .toMatchObject({ ok: false, reason: 'owner_mismatch' });
     expect(registry.getTaskRecord(shape.taskId)?.currentRevision).toBe(shape.older);
   });
 
@@ -3367,17 +3368,12 @@ describe('SupervisionTaskRegistry', () => {
     expect(registry.updateAssignment({
       assignmentId: stranger.value.assignmentId, identity: strangerIdentity,
       auditRevision: shape.successor,
-    })).toMatchObject({ ok: true });
+    })).toMatchObject({ ok: false });
 
     // The pointer names the real integration owner, not this assignment.
     expect(registry.getTaskRecord(shape.taskId)?.integrationOwnerAssignmentId)
       .toBe(shape.owner.assignmentId);
 
-    expect(registry.updateAssignment({
-      assignmentId: stranger.value.assignmentId, identity: strangerIdentity,
-      revision: shape.successor, auditRevision: shape.successor,
-    }), 'an optional implementer must not move the task revision past the pointer')
-      .toMatchObject({ ok: false });
     expect(
       registry.getTaskRecord(shape.taskId)?.currentRevision,
       'the task revision must be unchanged',
@@ -3746,14 +3742,11 @@ describe('SupervisionTaskRegistry', () => {
     expect(registry.updateAssignment({
       assignmentId: owner.value.assignmentId, identity: ownerIdentity, status: 'implementing',
     })).toMatchObject({ ok: true });
-    expect(registry.updateAssignment({
-      assignmentId: owner.value.assignmentId, identity: ownerIdentity, auditRevision: 'blk-r2',
-    })).toMatchObject({ ok: true });
     expect(registry.updateTask({ taskId, status: 'blocked' })).toMatchObject({ ok: true });
 
     expect(registry.updateAssignment({
       assignmentId: owner.value.assignmentId, identity: ownerIdentity,
-      revision: 'blk-r2', auditRevision: 'blk-r2',
+      auditRevision: 'blk-r2',
     }), 'a blocked task must refuse the catch-up').toMatchObject({ ok: false });
     expect(registry.getTaskRecord(taskId)?.currentRevision).toBe('blk-r1');
   });
@@ -3765,7 +3758,7 @@ describe('SupervisionTaskRegistry', () => {
     const registry = new SupervisionTaskRegistry({ database });
     const identityOf = (taskId: string) => identity(`deck_${taskId}_owner`);
 
-    const build = (taskId: string, current: string, bound: string) => {
+    const build = (taskId: string, current: string) => {
       const ownerIdentity = identityOf(taskId);
       expect(registry.createOrGet({
         taskId, projectName: 'alpha', classification: 'independent_top_level',
@@ -3781,30 +3774,27 @@ describe('SupervisionTaskRegistry', () => {
       expect(registry.updateAssignment({
         assignmentId: owner.value.assignmentId, identity: ownerIdentity, status: 'implementing',
       })).toMatchObject({ ok: true });
-      expect(registry.updateAssignment({
-        assignmentId: owner.value.assignmentId, identity: ownerIdentity, auditRevision: bound,
-      })).toMatchObject({ ok: true });
       return { owner: owner.value, ownerIdentity };
     };
 
     // Git authority already exists -> the revision must never be rewritten.
-    const git = build('catchup-git-authority', 'rev-r3', 'rev-r4');
+    const git = build('catchup-git-authority', 'rev-r3');
     expect(registry.updateTask({
       taskId: 'catchup-git-authority', commitSha: 'a'.repeat(40),
     })).toMatchObject({ ok: true });
     expect(registry.updateAssignment({
       assignmentId: git.owner.assignmentId, identity: git.ownerIdentity,
-      revision: 'rev-r4', auditRevision: 'rev-r4',
+      auditRevision: 'rev-r4',
     }), 'a task carrying Git authority must fail closed').toMatchObject({
       ok: false, reason: 'invalid_transition',
     });
     expect(registry.getTaskRecord('catchup-git-authority')?.currentRevision).toBe('rev-r3');
 
     // A foreign identity must never drive the catch-up.
-    const foreign = build('catchup-foreign', 'rev-r3', 'rev-r4');
+    const foreign = build('catchup-foreign', 'rev-r3');
     expect(registry.updateAssignment({
       assignmentId: foreign.owner.assignmentId, identity: identity('deck_other_project_owner'),
-      revision: 'rev-r4', auditRevision: 'rev-r4',
+      auditRevision: 'rev-r4',
     }), 'a foreign identity must be refused').toMatchObject({ ok: false });
     expect(registry.getTaskRecord('catchup-foreign')?.currentRevision).toBe('rev-r3');
 
@@ -4015,15 +4005,11 @@ describe('SupervisionTaskRegistry', () => {
       reason: 'atomically converge the exact inspected assignment and stale task projection',
       now: 300,
     };
-    const splitState = registry.get(shape.taskId);
-    const splitEvents = registry.listEvents(shape.taskId).length;
-    expect(registry.rebindTaskAssignmentRevision({
+    const sameTargetRequest = {
       ...request, fromRevision: shape.toRevision,
       idempotencyKey: 'must-not-disguise-split-as-target-replay',
-    })).toEqual({ ok: false, reason: 'invalid' });
-    expect(registry.get(shape.taskId)).toEqual(splitState);
-    expect(registry.listEvents(shape.taskId)).toHaveLength(splitEvents);
-    expect(registry.rebindTaskAssignmentRevision(request)).toMatchObject({
+    };
+    expect(registry.rebindTaskAssignmentRevision(sameTargetRequest)).toMatchObject({
       ok: true, value: { status: 'implementing', currentRevision: shape.toRevision },
     });
     expect(registry.getAssignment(shape.implementer.assignmentId)).toMatchObject({
@@ -4035,12 +4021,12 @@ describe('SupervisionTaskRegistry', () => {
     expect(registry.listAuditReceipts(shape.taskId)).toEqual(receiptsBefore);
 
     const eventCount = registry.listEvents(shape.taskId).length;
-    expect(registry.rebindTaskAssignmentRevision({ ...request, now: 400 })).toMatchObject({
+    expect(registry.rebindTaskAssignmentRevision({ ...sameTargetRequest, now: 400 })).toMatchObject({
       ok: true, replay: true, value: { currentRevision: shape.toRevision },
     });
     expect(registry.listEvents(shape.taskId)).toHaveLength(eventCount);
     expect(registry.rebindTaskAssignmentRevision({
-      ...request,
+      ...sameTargetRequest,
       worktreeSnapshot: {
         ...request.worktreeSnapshot,
         files: request.worktreeSnapshot.files.map((file, index) => (
@@ -4079,6 +4065,9 @@ describe('SupervisionTaskRegistry', () => {
       expect(registry.updateTask({ taskId, status: 'implementing' })).toMatchObject({ ok: true });
       rewritePersistedAssignment(database, {
         ...registry.getAssignment(assignmentId)!, status: 'implementing', updatedAt: 100,
+      });
+      rewritePersistedTask(database, {
+        ...registry.get(taskId)!, currentRevision: undefined, updatedAt: 101,
       });
       expect(registry.getTaskRecord(taskId)).not.toHaveProperty('currentRevision');
       expect(registry.getAssignment(assignmentId)).toMatchObject({
@@ -6398,7 +6387,8 @@ describe('SupervisionTaskRegistry', () => {
   ] as const)('fails closed without mutation on a pending implementer $label', ({
     label, implementerAttemptId, implementerRevision, reason,
   }) => {
-    const registry = makeRegistry();
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
     const suffix = label.replace(' ', '-');
     const taskId = `audit-finish-${suffix}`;
     const revision = 'audit-finish-mismatch-r1';
@@ -6412,7 +6402,7 @@ describe('SupervisionTaskRegistry', () => {
     const implementer = registry.createAssignment({
       assignmentId: `${taskId}-implementer`, taskId, role: 'implementer', identity: implementerIdentity,
       ...(implementerAttemptId ? { auditAttemptId: implementerAttemptId } : {}),
-      auditRevision: implementerRevision,
+      auditRevision: revision,
     });
     const auditor = registry.createAssignment({
       assignmentId: `${taskId}-auditor`, taskId, role: 'auditor', identity: auditorIdentity,
@@ -6423,6 +6413,11 @@ describe('SupervisionTaskRegistry', () => {
       expect(registry.updateAssignment({
         assignmentId: implementer.value.assignmentId, identity: implementerIdentity, status,
       })).toMatchObject({ ok: true });
+    }
+    if (implementerRevision !== revision) {
+      rewritePersistedAssignment(database, {
+        ...registry.getAssignment(implementer.value.assignmentId)!, auditRevision: implementerRevision,
+      });
     }
     expect(registry.appendMatchingAuditReceipt({
       taskId, auditorAssignmentId: auditor.value.assignmentId, attemptId, revision,
@@ -6439,6 +6434,7 @@ describe('SupervisionTaskRegistry', () => {
     expect(registry.listEvents(taskId)).toEqual(beforeEvents);
     expect(registry.listAuditReceipts(taskId)).toEqual(beforeReceipts);
     registry.close();
+    database.close();
   });
 
   it('hands off a validated integration slice without registering or consuming an audit', () => {
@@ -12845,11 +12841,13 @@ describe('tsk_d4d atomic Brain reopen retires the predecessor integration owner'
   });
 
   it('fails closed when the owner is bound to a different revision', () => {
-    const registry = makeRegistry();
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
     const shape = prepareOwnerBackedPassShape(registry, 'd4d-wrong-owner-revision');
     // Move the task forward so the owner no longer matches the source revision.
-    expect(registry.updateTask({ taskId: shape.taskId, currentRevision: 'some-other-revision' }))
-      .toMatchObject({ ok: true });
+    rewritePersistedTask(database, {
+      ...registry.get(shape.taskId)!, currentRevision: 'some-other-revision',
+    });
     expect(
       reopen(registry, shape, 'd4d-wrong-owner-revision-reopen'),
       'a mismatched owner must not be retired by guesswork',
@@ -12858,6 +12856,7 @@ describe('tsk_d4d atomic Brain reopen retires the predecessor integration owner'
       status: 'ready_for_integration', verdict: 'PASS',
     });
     registry.close();
+    database.close();
   });
 });
 

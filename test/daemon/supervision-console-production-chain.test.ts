@@ -89,12 +89,13 @@ describe('browser -> server bridge -> daemon registry -> browser task-console ch
       });
       expect(registry.createAssignment({
         assignmentId: 'old-worker', taskId: 'task-chain', role: 'implementer',
-        identity: identity('deck_alpha_old'), auditRevision: 'old-r1',
+        identity: identity('deck_alpha_old'), auditRevision: 'current-r2',
       }).ok).toBe(true);
       registry.close();
       const authority = new DatabaseSync(databasePath);
       authority.prepare("UPDATE supervision_tasks SET status='ready_for_integration' WHERE task_id='task-chain'").run();
-      authority.prepare("UPDATE supervision_task_assignments SET status='implementing' WHERE assignment_id='old-worker'").run();
+      // Legacy/corrupt fixture: current public writers now reject this split.
+      authority.prepare("UPDATE supervision_task_assignments SET status='implementing', audit_revision='old-r1' WHERE assignment_id='old-worker'").run();
       authority.prepare(`INSERT INTO supervision_task_assignments
         (assignment_id, task_id, role, status, session_name, session_instance_id, runtime_epoch,
          agent_type, provider_family, lease_id, generation, audit_revision, verdict, payload_json, created_at, updated_at)

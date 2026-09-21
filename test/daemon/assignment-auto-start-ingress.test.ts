@@ -287,22 +287,20 @@ describe('assignment auto-start through the unified transport ingress', () => {
     expect(stopSessionNowMock).not.toHaveBeenCalled();
   });
 
-  it('fails closed through the same ingress: refuses, reports, and stops the turn carrying the task', async () => {
+  it('keeps ingress startable when a task-only revision split is refused', async () => {
     const worker = workerSession('deck_sub_alpha_gemini', 'gemini-sdk');
     sessions.set(worker.name, worker);
     const provider = makeProvider('gemini-sdk', {});
     const task = dispatchTask(worker, 'refused');
-    expect(getSupervisionTaskRegistry().updateTask({ taskId: task.taskId, currentRevision: 'rev-moved' })).toMatchObject({ ok: true });
+    expect(getSupervisionTaskRegistry().updateTask({ taskId: task.taskId, currentRevision: 'rev-moved' }))
+      .toMatchObject({ ok: false, reason: 'old_revision' });
     runtimeState.activeDispatch = [task.messageId];
 
     provider.text(worker.name, 'gemini-refused', 'Working on the stale revision.');
-    expect(statusOf(task.assignmentId)).toBe('delegated');
-    await vi.waitFor(() => expect(escalateMock).toHaveBeenCalledOnce());
-    expect(escalateMock.mock.calls[0]![0]).toMatchObject({
-      taskId: task.taskId, assignmentId: task.assignmentId, eligibleStatus: 'delegated',
-      exactError: expect.stringContaining('revision_superseded'),
-    });
-    await vi.waitFor(() => expect(stopSessionNowMock).toHaveBeenCalledExactlyOnceWith(worker.name));
+    expect(statusOf(task.assignmentId)).toBe('implementing');
+    expect(getSupervisionTaskRegistry().getTaskRecord(task.taskId)?.currentRevision).toBe('rev-ingress');
+    expect(escalateMock).not.toHaveBeenCalled();
+    expect(stopSessionNowMock).not.toHaveBeenCalled();
   });
 
   it('ignores activity that predates the dispatch, even when replayed after delivery', () => {

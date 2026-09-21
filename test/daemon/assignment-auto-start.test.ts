@@ -305,20 +305,19 @@ describe('assignment auto-start', () => {
       expect(deps.stopWorker).not.toHaveBeenCalled();
     });
 
-    it('fails closed on a superseded revision and stops the turn that is carrying the task', () => {
+    it('rejects a task-only successor write before it can strand a delegated assignment', () => {
       const seeded = seedDelegated();
       expect(getSupervisionTaskRegistry().updateTask({ taskId: seeded.taskId, currentRevision: 'rev-2', now: 1_800 }))
-        .toMatchObject({ ok: true });
+        .toMatchObject({ ok: false, reason: 'old_revision' });
       const deps = recordingDeps();
 
-      expect(activity(seeded, { active: [seeded.messageId] }, deps)).toEqual([{
-        status: 'refused', taskId: seeded.taskId, assignmentId: seeded.assignmentId,
-        refusal: SUPERVISION_ASSIGNMENT_START_REFUSALS.REVISION_SUPERSEDED, workerStopped: true,
-      }]);
-      expect(getSupervisionTaskRegistry().getAssignment(seeded.assignmentId)?.status).toBe('delegated');
-      expect(deps.stopWorker).toHaveBeenCalledExactlyOnceWith(WORKER);
-      expect(deps.escalate).toHaveBeenCalledOnce();
-      expect(autoStartEvents(seeded.taskId)).toHaveLength(0);
+      expect(activity(seeded, { active: [seeded.messageId] }, deps)[0]).toMatchObject({ status: 'started' });
+      expect(getSupervisionTaskRegistry().getTaskRecord(seeded.taskId)?.currentRevision).toBe(REVISION);
+      expect(getSupervisionTaskRegistry().getAssignment(seeded.assignmentId)).toMatchObject({
+        status: 'implementing', auditRevision: REVISION,
+      });
+      expect(deps.stopWorker).not.toHaveBeenCalled();
+      expect(deps.escalate).not.toHaveBeenCalled();
     });
 
     it('refuses an identity mismatch it cannot attribute, without stopping', () => {
@@ -405,17 +404,17 @@ describe('assignment auto-start', () => {
       });
     });
 
-    it('persists a refusal without delivering it from the recipient process', () => {
+    it('does not manufacture a recipient refusal when a task-only successor write is rejected', () => {
       const seeded = seedDelegated();
       expect(getSupervisionTaskRegistry().updateTask({ taskId: seeded.taskId, currentRevision: 'rev-2', now: 1_800 }))
-        .toMatchObject({ ok: true });
+        .toMatchObject({ ok: false, reason: 'old_revision' });
       const deps = recordingDeps();
       expect(autoStartAssignmentFromAck({
         taskId: seeded.taskId, assignmentId: seeded.assignmentId, projectName: PROJECT,
         callerIdentity: workerIdentity(), evidence: SUPERVISION_ASSIGNMENT_START_EVIDENCE.FILE_EVENT,
         evidenceEventId: 'file:src/a.ts',
-      }, deps)).toMatchObject({ status: 'refused', refusal: SUPERVISION_ASSIGNMENT_START_REFUSALS.REVISION_SUPERSEDED });
-      expect(deps.escalate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ deliver: false }));
+      }, deps)).toMatchObject({ status: 'started' });
+      expect(deps.escalate).not.toHaveBeenCalled();
       expect(deps.stopWorker).not.toHaveBeenCalled();
     });
 
@@ -449,7 +448,7 @@ describe('assignment auto-start', () => {
     it('persists one fingerprinted report and delivers it to the Brain exactly once, redelivering after a lost dispatch', async () => {
       const seeded = seedDelegated();
       expect(getSupervisionTaskRegistry().updateTask({ taskId: seeded.taskId, currentRevision: 'rev-2', now: 1_800 }))
-        .toMatchObject({ ok: true });
+        .toMatchObject({ ok: false, reason: 'old_revision' });
       const exactError = assignmentStartRefusalError(SUPERVISION_ASSIGNMENT_START_REFUSALS.REVISION_SUPERSEDED);
       const sessions = [session(BRAIN, { label: 'Brain' }), session(WORKER, { label: 'Worker' })];
       let delivered = false;
@@ -548,23 +547,13 @@ describe('in-place Brain repair of a refused start', () => {
     expect(getSupervisionTaskRegistry().getAssignment(seeded.assignmentId)?.status).toBe('implementing');
   });
 
-  it('recovers a superseded revision by moving the same assignment onto the current revision', async () => {
+  it('keeps the same assignment startable when a task-only successor write is refused', () => {
     const seeded = seedDelegated();
     expect(getSupervisionTaskRegistry().updateTask({ taskId: seeded.taskId, currentRevision: 'rev-2', now: 1_800 }))
-      .toMatchObject({ ok: true });
-    expect(activity(seeded, { active: [seeded.messageId] })[0]).toMatchObject({
-      refusal: SUPERVISION_ASSIGNMENT_START_REFUSALS.REVISION_SUPERSEDED,
-    });
-    const report = await persistRefusal(seeded, SUPERVISION_ASSIGNMENT_START_REFUSALS.REVISION_SUPERSEDED);
-    expect(report.recommendedNextAction).toMatch(/assignmentStatus=implementing/);
-
-    expect(clearHold(seeded, 'implementing', 'move-to-current-revision')).toMatchObject({ ok: true });
-    const repaired = getSupervisionTaskRegistry().getAssignment(seeded.assignmentId)!;
-    expect(repaired).toMatchObject({ status: 'implementing' });
-    expect(repaired.blocker).toBeUndefined();
-    expect(repaired.auditRevision).toBeUndefined();
-    clearAssignmentAutoStartStateForTests();
-    expect(activity(seeded, { active: [seeded.messageId], eventId: 'evt-after-revision-repair' })[0]!.status).toBe('already_started');
+      .toMatchObject({ ok: false, reason: 'old_revision' });
+    expect(activity(seeded, { active: [seeded.messageId] })[0]).toMatchObject({ status: 'started' });
+    expect(getSupervisionTaskRegistry().getTaskRecord(seeded.taskId)?.currentRevision).toBe(REVISION);
+    expect(getSupervisionTaskRegistry().getAssignment(seeded.assignmentId)?.auditRevision).toBe(REVISION);
   });
 });
 

@@ -893,7 +893,7 @@ describe('send-tool', () => {
       expect(authoritySnapshot()).toBe(beforeDriftedReplay);
 
       expect(registry.updateTask({ taskId, currentRevision: 'execution-authority-r2' }))
-        .toMatchObject({ ok: true });
+        .toMatchObject({ ok: false, reason: 'old_revision' });
       const beforeDelayedR1 = JSON.stringify(registry.get(taskId));
       await expect(brainHandlers[SUPERVISION_MCP_TOOLS.RECOVER](recoveryRequest))
         .resolves.toMatchObject({ status: 'ok', taskId, assignmentId, replay: true });

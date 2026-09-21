@@ -7790,7 +7790,7 @@ describe('SupervisionAutomation', () => {
       removeSession('deck_alpha_brain');
     });
 
-    it('authorizes only the exact queued revision and parks a live revision conflict accurately', async () => {
+    it('authorizes only the exact queued revision and rejects a task-only live revision split', async () => {
       const taskId = 'watchdog-revision-fence';
       const assignmentId = 'watchdog-revision-fence-assignment';
       const { registry, identity, revision } = activeWorker({ taskId, assignmentId });
@@ -7809,17 +7809,10 @@ describe('SupervisionAutomation', () => {
       })).toBe(false);
 
       expect(registry.updateTask({ taskId, currentRevision: 'watchdog-r2', now: due + 1 }))
-        .toMatchObject({ ok: true });
-      mockTransportRuntime.pendingEntries.length = 0;
-      await supervisionAutomation.__checkImplementationAssignmentsForTests(due + 2 * 60 * 60_000);
-      expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
-      expect(JSON.parse(registry.getAssignment(assignmentId)!.blocker!)).toMatchObject({
-        kind: 'implementation_heartbeat_revision_conflict',
-        taskId,
-        assignmentId,
-        taskCurrentRevision: 'watchdog-r2',
-        assignmentRevision: revision,
-        action: 'same_object_revision_reconcile',
+        .toMatchObject({ ok: false, reason: 'old_revision' });
+      expect(registry.getTaskRecord(taskId)?.currentRevision).toBe(revision);
+      expect(registry.getAssignment(assignmentId)).toMatchObject({
+        auditRevision: revision,
       });
     });
 

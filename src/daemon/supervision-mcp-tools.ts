@@ -53,6 +53,7 @@ import { advanceSupervisionTaskAfterFinish } from './supervision-convergence-wir
 import logger from '../util/logger.js';
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import { deterministicAutomaticAuditDeliveryMessageId } from '../../shared/send-message-id.js';
+import type { SupervisionTaskRegistryRejectDetail } from './supervision-state-store.js';
 import {
   type SupervisionAuditDegradedReason,
   type SupervisionAuditRoutingReason,
@@ -332,7 +333,9 @@ export interface SupervisionRegistryPort {
     idempotencyKey: string;
     evidenceManifestSha256?: string;
     reason: string;
-  }): Promise<{ ok: true; value?: unknown; replay?: boolean } | { ok: false; reason: string }>;
+  }): Promise<{ ok: true; value?: unknown; replay?: boolean } | {
+    ok: false; reason: string; detail?: SupervisionTaskRegistryRejectDetail;
+  }>;
   coordinateTaskAssignment?(input: {
     taskId: string;
     assignmentId: string;
@@ -1319,7 +1322,16 @@ export function createSupervisionMcpToolHandlers(
           reason,
         });
         if (!rebound) return err('unavailable', 'revision recovery is not bound');
-        if (!rebound.ok) return err(rebound.reason, `revision recovery rejected: ${rebound.reason}`);
+        if (!rebound.ok) {
+          const detail = rebound.detail;
+          const tuple = detail && (detail.taskCurrentRevision !== undefined
+            || detail.assignmentAuditRevision !== undefined
+            || detail.requestedFromRevision !== undefined
+            || detail.requestedToRevision !== undefined)
+            ? `; task.currentRevision=${detail.taskCurrentRevision ?? '<unset>'}, assignment.auditRevision=${detail.assignmentAuditRevision ?? '<unset>'}, requested fromRevision=${detail.requestedFromRevision ?? '<unset>'}, requested toRevision=${detail.requestedToRevision ?? '<unset>'}${detail.mismatchedFields?.length ? `, mismatched fields=${detail.mismatchedFields.join(',')}` : ''}`
+            : '';
+          return err(rebound.reason, `revision recovery rejected: ${rebound.reason}${tuple}`);
+        }
         const reboundTask = reg.get(taskId);
         const reboundAssignment = reboundTask?.assignments?.find((candidate) => (
           candidate.assignmentId === assignmentId

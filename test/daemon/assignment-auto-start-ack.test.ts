@@ -190,22 +190,16 @@ describe('authenticated ACK starts a delegated assignment', () => {
     });
   });
 
-  it('fails closed on a superseded revision and keeps holding until the Brain repairs it', async () => {
+  it('rejects task-only revision supersession and starts the still-consistent assignment', async () => {
     seed();
-    expect(getSupervisionTaskRegistry().updateTask({ taskId, currentRevision: 'rev-2' })).toMatchObject({ ok: true });
-    const refused = await intent(worker, { intent: 'heartbeat', assignmentId });
-    expect(refused).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.REVISION_CONFLICT });
-    expect(String((refused as { detail?: string }).detail)).toContain(SUPERVISION_ASSIGNMENT_START_REFUSALS.REVISION_SUPERSEDED);
-    expect(getSupervisionTaskRegistry().getAssignment(assignmentId)?.status).toBe('delegated');
-    // The structured report is persisted by the recipient process; the daemon delivers it.
-    await vi.waitFor(() => {
-      expect(readAssignmentStartRefusalError(getSupervisionTaskRegistry().getAssignment(assignmentId)?.blocker))
-        .toContain(SUPERVISION_ASSIGNMENT_START_REFUSALS.REVISION_SUPERSEDED);
+    expect(getSupervisionTaskRegistry().updateTask({ taskId, currentRevision: 'rev-2' }))
+      .toMatchObject({ ok: false, reason: 'old_revision' });
+    await expect(intent(worker, { intent: 'heartbeat', assignmentId })).resolves.toMatchObject({ status: 'ok' });
+    expect(getSupervisionTaskRegistry().getTaskRecord(taskId)?.currentRevision).toBe(REVISION);
+    expect(getSupervisionTaskRegistry().getAssignment(assignmentId)).toMatchObject({
+      status: 'implementing', auditRevision: REVISION,
     });
-    await expect(intent(worker, { intent: 'start', assignmentId })).resolves.toMatchObject({
-      status: 'error', reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN,
-    });
-    expect(autoStartEvents()).toHaveLength(0);
+    expect(autoStartEvents().some((event) => event.assignmentId === assignmentId)).toBe(true);
   });
 
   it('never starts on the coordinator\'s behalf', async () => {
@@ -243,11 +237,12 @@ describe('controlled file event starts a delegated assignment', () => {
     expect(getSupervisionTaskRegistry().listFileEvents(taskId).map((event) => event.path)).toEqual(['src/a.ts']);
   });
 
-  it('refuses to accumulate work on an unstartable assignment', async () => {
+  it('records work after refusing a task-only revision split', async () => {
     seed();
-    expect(getSupervisionTaskRegistry().updateTask({ taskId, currentRevision: 'rev-2' })).toMatchObject({ ok: true });
-    await expect(fileEvent(worker, 'src/a.ts')).resolves.toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.REVISION_CONFLICT });
-    expect(getSupervisionTaskRegistry().listFileEvents(taskId)).toEqual([]);
-    expect(getSupervisionTaskRegistry().getAssignment(assignmentId)?.status).toBe('delegated');
+    expect(getSupervisionTaskRegistry().updateTask({ taskId, currentRevision: 'rev-2' }))
+      .toMatchObject({ ok: false, reason: 'old_revision' });
+    await expect(fileEvent(worker, 'src/a.ts')).resolves.toMatchObject({ status: 'ok' });
+    expect(getSupervisionTaskRegistry().listFileEvents(taskId).map((event) => event.path)).toEqual(['src/a.ts']);
+    expect(getSupervisionTaskRegistry().getAssignment(assignmentId)?.status).toBe('implementing');
   });
 });

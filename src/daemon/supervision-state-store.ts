@@ -912,7 +912,6 @@ export interface SupervisionLifecycleConvergenceAction {
   assignmentId?: string;
   action: 'retire_consumed_slice'
     | 'align_revision_projection'
-    | 'align_validated_revision'
     | 'bind_zero_byte_base_revision'
     | 'restore_exact_rework_implementer'
     | 'project_validated_handoff'
@@ -1344,6 +1343,12 @@ export interface SupervisionTaskRegistryRejectDetail {
   actualRevision?: string;
   expectedAttemptId?: string;
   actualAttemptId?: string;
+  /** Exact persisted/requested revision tuple for actionable split recovery. */
+  taskCurrentRevision?: string;
+  assignmentAuditRevision?: string;
+  requestedFromRevision?: string;
+  requestedToRevision?: string;
+  mismatchedFields?: string[];
   /** Set when the CALLER's revision authority refused, not the object's own state. */
   refusedAuthority?: 'caller_revision';
 }
@@ -4676,6 +4681,30 @@ export class SupervisionTaskRegistry {
     const scopeFiles = normalizeTaskArray(input.scopeFiles).filter(validRepoPath);
     this.#db.exec('BEGIN IMMEDIATE');
     try {
+      const lockedTask = this.getTaskRecord(input.taskId);
+      if (!lockedTask) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'not_found' };
+      }
+      const requestedAssignmentRevision = normalizeTaskString(input.auditRevision);
+      const bindsImplementationRevision = input.required !== false
+        && (input.role === 'implementer' || input.role === 'integration_owner')
+        && Boolean(requestedAssignmentRevision);
+      if (bindsImplementationRevision && lockedTask.currentRevision
+        && lockedTask.currentRevision !== requestedAssignmentRevision) {
+        this.#db.exec('ROLLBACK');
+        return {
+          ok: false,
+          reason: 'old_revision',
+          detail: {
+            taskCurrentRevision: lockedTask.currentRevision,
+            assignmentAuditRevision: requestedAssignmentRevision,
+            expectedRevision: lockedTask.currentRevision,
+            actualRevision: requestedAssignmentRevision,
+            mismatchedFields: ['task.currentRevision', 'assignment.auditRevision'],
+          },
+        };
+      }
       if (input.validationAuthority !== undefined && input.validationAuthority !== null
         && !this.validationAuthoritySnapshotHolds(input.validationAuthority, {
           taskId: input.taskId,
@@ -4732,10 +4761,25 @@ export class SupervisionTaskRegistry {
         updatedAt: now,
       };
       this.#writeAssignment(record, 'delegated', { source: 'assignment_start' });
-      if (record.role === 'integration_owner' && !task.integrationOwnerAssignmentId) {
-        this.#writeTask({ ...task, integrationOwnerAssignmentId: assignmentId, status: task.status === 'planned' ? 'delegated' : task.status, updatedAt: now }, 'delegated', { source: 'integration_owner_assignment' });
-      } else if (task.status === 'planned') {
-        this.#writeTask({ ...task, status: 'delegated', updatedAt: now }, 'delegated', { source: 'assignment_start' });
+      const bindsMissingTaskRevision = bindsImplementationRevision && !lockedTask.currentRevision;
+      const taskRevisionPatch = bindsMissingTaskRevision
+        ? { currentRevision: requestedAssignmentRevision! }
+        : {};
+      if (record.role === 'integration_owner' && !lockedTask.integrationOwnerAssignmentId) {
+        this.#writeTask({
+          ...lockedTask,
+          ...taskRevisionPatch,
+          integrationOwnerAssignmentId: assignmentId,
+          status: lockedTask.status === 'planned' ? 'delegated' : lockedTask.status,
+          updatedAt: now,
+        }, 'delegated', { source: 'integration_owner_assignment' });
+      } else if (lockedTask.status === 'planned' || bindsMissingTaskRevision) {
+        this.#writeTask({
+          ...lockedTask,
+          ...taskRevisionPatch,
+          status: lockedTask.status === 'planned' ? 'delegated' : lockedTask.status,
+          updatedAt: now,
+        }, 'delegated', { source: 'assignment_start' });
       }
       if (idem) this.#db.prepare('INSERT INTO supervision_task_idempotency (idempotency_key, task_id, assignment_id, created_at) VALUES (?, ?, ?, ?)').run(idem, task.taskId, assignmentId, now);
       this.#db.exec('COMMIT');
@@ -4767,20 +4811,84 @@ export class SupervisionTaskRegistry {
     if (requestedBaseRevision && existing.baseRevision && requestedBaseRevision !== existing.baseRevision) {
       return { ok: false, reason: 'conflicting_replay' };
     }
-    const record: PersistedSupervisionTaskRecord = {
-      ...existing,
-      status: nextStatus,
-      ...(requestedAuditPolicy ? { auditPolicy: requestedAuditPolicy } : {}),
-      ...(requestedBaseRevision ? { baseRevision: requestedBaseRevision } : {}),
-      ...(normalizeTaskString(input.currentRevision) ? { currentRevision: normalizeTaskString(input.currentRevision) } : {}),
-      ...(normalizeTaskString(input.commitSha) ? { commitSha: normalizeTaskString(input.commitSha) } : {}),
-      ...(normalizeTaskString(input.pushRemoteRef) ? { pushRemoteRef: normalizeTaskString(input.pushRemoteRef) } : {}),
-      ...(normalizeTaskString(input.blocker) ? { blocker: normalizeTaskString(input.blocker) } : {}),
-      updatedAt: now,
-    };
-    const eventType = nextStatus === 'passed' || nextStatus === 'rework' ? 'audit_replied' : nextStatus;
-    this.#writeTask(record, eventType as import('../../shared/supervision-config.js').SupervisionTaskRegistryEventType, { source: 'task_update' });
-    return { ok: true, value: record };
+    const requestedRevision = normalizeTaskString(input.currentRevision);
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const locked = this.getTaskRecord(input.taskId);
+      if (!locked) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'not_found' };
+      }
+      const lockedNextStatus = input.status ?? locked.status;
+      if (!canTransitionSupervisionTaskStatus(locked.status, lockedNextStatus)) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'invalid_transition' };
+      }
+      if (requestedAuditPolicy && locked.auditPolicy
+        && locked.auditPolicy !== requestedAuditPolicy) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'conflicting_replay' };
+      }
+      if (requestedBaseRevision && locked.baseRevision
+        && locked.baseRevision !== requestedBaseRevision) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'conflicting_replay' };
+      }
+      const revisionOwners = requestedRevision ? this.listAssignments(input.taskId).filter((assignment) => (
+        assignment.required
+        && (assignment.role === 'implementer' || assignment.role === 'integration_owner')
+        && !isTerminalSupervisionTaskStatus(assignment.status)
+        && !this.#assignmentConsumedByFinalization(locked, assignment)
+      )) : [];
+      const conflictingOwner = revisionOwners.find((assignment) => (
+        Boolean(assignment.auditRevision) && assignment.auditRevision !== requestedRevision
+      ));
+      if (conflictingOwner) {
+        this.#db.exec('ROLLBACK');
+        return {
+          ok: false,
+          reason: 'old_revision',
+          detail: {
+            taskCurrentRevision: requestedRevision,
+            assignmentAuditRevision: conflictingOwner.auditRevision,
+            expectedRevision: conflictingOwner.auditRevision,
+            actualRevision: requestedRevision,
+            mismatchedFields: ['task.currentRevision', 'assignment.auditRevision'],
+          },
+        };
+      }
+      if (requestedRevision && revisionOwners.length > 1
+        && revisionOwners.some((assignment) => !assignment.auditRevision)) {
+        this.#db.exec('ROLLBACK');
+        return { ok: false, reason: 'ambiguous_assignment' };
+      }
+      const record: PersistedSupervisionTaskRecord = {
+        ...locked,
+        status: lockedNextStatus,
+        ...(requestedAuditPolicy ? { auditPolicy: requestedAuditPolicy } : {}),
+        ...(requestedBaseRevision ? { baseRevision: requestedBaseRevision } : {}),
+        ...(requestedRevision ? { currentRevision: requestedRevision } : {}),
+        ...(normalizeTaskString(input.commitSha) ? { commitSha: normalizeTaskString(input.commitSha) } : {}),
+        ...(normalizeTaskString(input.pushRemoteRef) ? { pushRemoteRef: normalizeTaskString(input.pushRemoteRef) } : {}),
+        ...(normalizeTaskString(input.blocker) ? { blocker: normalizeTaskString(input.blocker) } : {}),
+        updatedAt: now,
+      };
+      for (const owner of revisionOwners) {
+        if (owner.auditRevision || !requestedRevision) continue;
+        this.#writeAssignment({ ...owner, auditRevision: requestedRevision, updatedAt: now }, this.#taskEventFor(owner.status), {
+          source: 'task_update_revision_binding',
+          revision: requestedRevision,
+        });
+      }
+      const eventType = lockedNextStatus === 'passed' || lockedNextStatus === 'rework'
+        ? 'audit_replied' : lockedNextStatus;
+      this.#writeTask(record, eventType as import('../../shared/supervision-config.js').SupervisionTaskRegistryEventType, { source: 'task_update' });
+      this.#db.exec('COMMIT');
+      return { ok: true, value: record };
+    } catch (error) {
+      this.#db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   updateAssignment(input: SupervisionTaskAssignmentUpdateInput): SupervisionTaskRegistryResult<PersistedSupervisionTaskAssignment> {
@@ -4800,8 +4908,15 @@ export class SupervisionTaskRegistry {
         crossVendorAuditPassed: input.crossVendorAuditPassed ?? existing.crossVendorAuditPassed === true,
       })) return { ok: false, reason: 'economy_requires_primary_review' };
     const isNewAuditAfterRework = existing.status === 'rework' && nextStatus === 'auditing';
-    const requestedRevision = normalizeTaskString(input.revision);
     const requestedAuditRevision = normalizeTaskString(input.auditRevision);
+    const explicitRevision = normalizeTaskString(input.revision);
+    // `auditRevision` is not an assignment-only escape hatch for an active
+    // implementation owner. The production tsk_18tm split was created by
+    // sending only this field: the assignment moved to R2 while the aggregate
+    // stayed on R1. Treat either spelling as the same atomic revision bind.
+    const requestedRevision = explicitRevision
+      ?? ((existing.role === 'implementer' || existing.role === 'integration_owner')
+        ? requestedAuditRevision : undefined);
     const requestedVerdict = normalizeTaskString(input.verdict);
     const isImplementationHandoffVerdict = requestedVerdict
       && requestedVerdict.toUpperCase() !== 'PASS'
@@ -4885,9 +5000,6 @@ export class SupervisionTaskRegistry {
     // the TASK revision onto a successor", so it is defined once here and
     // applied to both.
     //
-    // An integration_task is exempt because it keeps its combined revision with
-    // the integration handoff: an assignment-only lineage bind there does not
-    // move the task revision and needs no pointer authority.
     // A NEWLY AUTHORIZED successor owner is reporting the first revision it has
     // ever carried, so it has no auditRevision and `bindsSuccessorRevision`
     // cannot fire for it. `taskRevisionConflicts` then rejected that first
@@ -4908,7 +5020,6 @@ export class SupervisionTaskRegistry {
       && Boolean(requestedRevision)
       && !existing.auditRevision
       && (existing.status === 'implementing' || existing.status === 'rework')
-      && task.classification !== 'integration_task'
       && Boolean(task.currentRevision)
       && task.currentRevision !== requestedRevision
       && Boolean(task.finalization)
@@ -4943,7 +5054,6 @@ export class SupervisionTaskRegistry {
       && activeFinalizedSuccessors[0]?.assignmentId === existing.assignmentId;
     const historicalFinalizationOnly = this.#historicalFinalizationOnly(task);
     const movesTaskRevisionToSuccessor = (bindsSuccessorRevision || completesSuccessorRevision)
-      && task.classification !== 'integration_task'
       && Boolean(requestedRevision)
       && Boolean(task.currentRevision)
       && task.currentRevision !== requestedRevision;
@@ -5055,10 +5165,11 @@ export class SupervisionTaskRegistry {
       }
     }
     const bindsImplementationRevision = existing.role !== 'auditor' && Boolean(requestedRevision);
-    // A slice/top-level implementer owns the task revision directly. An
-    // integration_task may contain several implementer slice revisions, so its
-    // combined task revision remains owned by the integration handoff.
-    const bindsTaskRevision = bindsImplementationRevision && task.classification !== 'integration_task';
+    // Every live implementation owner binds the aggregate and assignment
+    // revision in one transaction. Integration slices are separate tasks; an
+    // integration_task exemption here was the production path that persisted
+    // assignment R2 while leaving task.currentRevision at R1.
+    const bindsTaskRevision = bindsImplementationRevision;
     // A legal successor bind is EXACTLY the case where task.currentRevision is
     // set and differs, so this gate cannot be evaluated before it. Previously it
     // rejected every real successor as `old_revision` -- the R1/R2 tests only
@@ -6111,6 +6222,7 @@ export class SupervisionTaskRegistry {
       ...existing,
       status: targetStatus,
       leaseId: '',
+      ...(implementationHandoff && resolvedRevision ? { auditRevision: resolvedRevision } : {}),
       ...(matchingAudit ? {
         auditAttemptId: matchingAudit.auditAttemptId,
         auditRevision: matchingAudit.auditRevision,
@@ -8148,7 +8260,8 @@ export class SupervisionTaskRegistry {
   }): SupervisionTaskRegistryResult<PersistedSupervisionTaskRecord> {
     const taskId = normalizeTaskString(input.taskId);
     const assignmentId = normalizeTaskString(input.assignmentId);
-    const fromRevision = normalizeTaskString(input.fromRevision);
+    const requestedFromRevision = normalizeTaskString(input.fromRevision);
+    let fromRevision = requestedFromRevision;
     const toRevision = normalizeTaskString(input.toRevision);
     const evidenceManifestSha256 = normalizeTaskString(input.evidenceManifestSha256)?.toLowerCase();
     const reason = normalizeTaskString(input.reason);
@@ -8156,7 +8269,7 @@ export class SupervisionTaskRegistry {
     const ownedFiles = normalizeTaskArray(input.ownedFiles ?? []).filter(validRepoPath);
     const scopeFiles = input.scopeFiles === undefined
       ? undefined : normalizeTaskArray(input.scopeFiles).filter(validRepoPath);
-    if (!taskId || !assignmentId || !toRevision || fromRevision === toRevision
+    if (!taskId || !assignmentId || !toRevision
       || !reason || !idempotencyKey
       || !SUPERVISION_RECOVERY_LEASE_ACTIONS.includes(input.leaseAction)
       // A successful revision rebind always normalizes the required
@@ -8193,6 +8306,20 @@ export class SupervisionTaskRegistry {
         return { ok: false, reason: 'not_found' };
       }
 
+      // Brain can only see the implementer's R2 after the legacy split has
+      // occurred, so its natural repair request is from=R2,to=R2. Interpret
+      // that equality only for the exact persisted tuple task=R1/assignment=R2;
+      // everywhere else equality remains invalid. The effective source stays
+      // the task's R1 and is what every authority/receipt guard below checks.
+      const catchesUpSplitTarget = Boolean(
+        requestedFromRevision
+        && requestedFromRevision === toRevision
+        && task.currentRevision
+        && task.currentRevision !== toRevision
+        && assignment.auditRevision === toRevision,
+      );
+      if (catchesUpSplitTarget) fromRevision = task.currentRevision;
+
       const targetScopeFiles = scopeFiles ?? assignment.scopeFiles;
       const exactReplay = task.currentRevision === toRevision && assignment.auditRevision === toRevision;
       if (exactReplay) {
@@ -8209,7 +8336,8 @@ export class SupervisionTaskRegistry {
           && event.payload?.idempotencyKey === idempotencyKey
         ));
         const prior = priorEvents.find((event) => (
-          event.payload?.fromRevision === (fromRevision ?? null)
+          (event.payload?.requestedFromRevision ?? event.payload?.fromRevision)
+            === (requestedFromRevision ?? null)
           && event.payload?.toRevision === toRevision
           && event.payload?.leaseAction === input.leaseAction
           && event.payload?.worktreeHeadSha === worktree.headSha
@@ -8226,6 +8354,20 @@ export class SupervisionTaskRegistry {
           return prior && task.baseRevision === worktree.headSha && coordinatorProjectionExact
             ? { ok: true, value: task, replay: true }
             : { ok: false, reason: 'conflicting_replay' };
+        }
+        if (requestedFromRevision === toRevision) {
+          this.#db.exec('ROLLBACK');
+          return {
+            ok: false,
+            reason: 'invalid',
+            detail: {
+              taskCurrentRevision: task.currentRevision,
+              assignmentAuditRevision: assignment.auditRevision,
+              requestedFromRevision,
+              requestedToRevision: toRevision,
+              mismatchedFields: [],
+            },
+          };
         }
 
         // Interrupted SAME-object successor bind. Older writers could commit
@@ -8329,6 +8471,7 @@ export class SupervisionTaskRegistry {
           idempotencyKey,
           reason,
           fromRevision,
+          requestedFromRevision: requestedFromRevision ?? null,
           toRevision,
           ownedFiles,
           scopeFiles: targetScopeFiles,
@@ -8400,6 +8543,22 @@ export class SupervisionTaskRegistry {
         return { ok: true, value: adoptedTask };
       }
 
+      if (requestedFromRevision === toRevision && !catchesUpSplitTarget) {
+        this.#db.exec('ROLLBACK');
+        return {
+          ok: false,
+          reason: 'invalid',
+          detail: {
+            taskCurrentRevision: task.currentRevision,
+            assignmentAuditRevision: assignment.auditRevision,
+            requestedFromRevision,
+            requestedToRevision: toRevision,
+            mismatchedFields: task.currentRevision === assignment.auditRevision
+              ? [] : ['task.currentRevision', 'assignment.auditRevision'],
+          },
+        };
+      }
+
       const assignments = this.listAssignments(taskId);
       const activeCoordinators = assignments.filter((candidate) => (
         candidate.role === 'coordinator'
@@ -8410,17 +8569,21 @@ export class SupervisionTaskRegistry {
         return { ok: false, reason: 'ambiguous_assignment' };
       }
       const coordinator = activeCoordinators[0];
-      if (coordinator?.auditRevision
+      if (!catchesUpSplitTarget && coordinator?.auditRevision
         && coordinator.auditRevision !== fromRevision
         && coordinator.auditRevision !== task.currentRevision
         && coordinator.auditRevision !== toRevision) {
         this.#db.exec('ROLLBACK');
         return { ok: false, reason: 'old_revision' };
       }
+      const recoverableStoppedSplit = catchesUpSplitTarget
+        && ['recovered', 'blocked'].includes(task.status)
+        && ['recovered', 'blocked'].includes(assignment.status);
       const activeImplementers = assignments.filter((candidate) => (
         candidate.required
         && candidate.role === 'implementer'
-        && !['cancelled', 'recovered', 'finalized'].includes(candidate.status)
+        && (!['cancelled', 'recovered', 'finalized'].includes(candidate.status)
+          || (recoverableStoppedSplit && candidate.assignmentId === assignmentId))
         // A ready_for_integration PASS whose exact attempt/revision has already
         // been consumed by immutable finalization is history, not an active
         // competitor to the explicitly selected successor.
@@ -8569,8 +8732,10 @@ export class SupervisionTaskRegistry {
       );
       const exactStaleShape = Boolean(
         (!HOUSEKEEPING_ASSIGNMENT_AGGREGATE_TERMINAL.has(task.status)
-          || carriesConsistentHistoricalFinalization)
-        && !HOUSEKEEPING_ASSIGNMENT_AGGREGATE_TERMINAL.has(assignment.status)
+          || carriesConsistentHistoricalFinalization
+          || recoverableStoppedSplit)
+        && (!HOUSEKEEPING_ASSIGNMENT_AGGREGATE_TERMINAL.has(assignment.status)
+          || recoverableStoppedSplit)
         && sourceBindingMatches(task.currentRevision)
         && assignmentBindingMatches
         && assignment.role === 'implementer'
@@ -8614,6 +8779,7 @@ export class SupervisionTaskRegistry {
         idempotencyKey,
         reason,
         fromRevision: fromRevision ?? null,
+        requestedFromRevision: requestedFromRevision ?? null,
         toRevision,
         // These two fields are retained for attribution only. Replay and
         // authorization intentionally ignore them.
@@ -8646,6 +8812,8 @@ export class SupervisionTaskRegistry {
         crossVendorAuditPassed: undefined,
         auditRoutingReason: undefined,
         auditDegradedReason: undefined,
+        validationState: undefined,
+        validatedRevision: undefined,
         updatedAt: now,
       };
       const reboundTask: PersistedSupervisionTaskRecord = {
@@ -8655,6 +8823,8 @@ export class SupervisionTaskRegistry {
         integrationBundle: undefined,
         status: 'implementing',
         blocker: undefined,
+        validationState: undefined,
+        validatedRevision: undefined,
         updatedAt: now,
       };
       // Atomic with the successor bind: retire each stale auditor in the SAME
@@ -10558,7 +10728,6 @@ export class SupervisionTaskRegistry {
           current, now, options.inspectAssignmentWorktree,
         ),
         (current: PersistedSupervisionTaskRecord) => this.#convergeRevisionProjection(current, now),
-        (current: PersistedSupervisionTaskRecord) => this.#convergeValidatedRevisionSplit(current, now),
         (current: PersistedSupervisionTaskRecord) => this.#convergeValidatedHandoff(current, now),
         (current: PersistedSupervisionTaskRecord) => this.#convergeReadyAuditAggregate(current, now),
         (current: PersistedSupervisionTaskRecord) => this.#convergeRecordedAuditReceipt(current, now),
@@ -10666,11 +10835,10 @@ export class SupervisionTaskRegistry {
     const task = assignment ? this.getTaskRecord(assignment.taskId) : undefined;
     if (!assignment || !task || assignment.validationState !== 'passed') return [];
     const actions: SupervisionLifecycleConvergenceAction[] = [];
-    const aligned = this.#convergeValidatedRevisionSplit(task, now);
-    if (aligned) actions.push(aligned);
-    const alignedTask = this.getTaskRecord(task.taskId);
-    if (!alignedTask) return actions;
-    const zeroByte = await this.#convergeZeroByteBaseRevision(alignedTask, now, inspect);
+    // A task/assignment revision split is never inferred into authority from a
+    // validation row. It must first be repaired through the explicit,
+    // Brain-authorized revision rebind path.
+    const zeroByte = await this.#convergeZeroByteBaseRevision(task, now, inspect);
     if (zeroByte) actions.push(zeroByte);
     const refreshedTask = this.getTaskRecord(task.taskId);
     if (!refreshedTask) return actions;
@@ -11138,99 +11306,6 @@ export class SupervisionTaskRegistry {
       assignmentId: assignment.assignmentId,
       action: 'bind_zero_byte_base_revision',
     };
-  }
-
-  /**
-   * Repair only the observed validated successor split: the aggregate still
-   * names R1 while its sole required, validated implementer already names R2.
-   * The strict finish equality remains untouched; this atomically advances the
-   * aggregate authority first, and ordinary finish then performs the handoff.
-   */
-  #resolveValidatedRevisionSplit(
-    task: PersistedSupervisionTaskRecord,
-  ): { assignmentId: string; fromRevision: string; toRevision: string } | undefined {
-    const fromRevision = normalizeTaskString(task.currentRevision);
-    if (task.status !== 'validated' || task.validationState !== 'passed' || !fromRevision
-      || task.finalization || task.commitSha || task.pushRemoteRef || task.archivedAt
-      || task.integrationOwnerAssignmentId || task.blocker
-      || this.listAuditReceipts(task.taskId).length > 0) return undefined;
-
-    const assignments = this.listAssignments(task.taskId);
-    const implementers = assignments.filter((assignment) => (
-      assignment.role === 'implementer'
-      && assignment.required
-      && !isTerminalSupervisionTaskStatus(assignment.status)
-    ));
-    if (implementers.length !== 1) return undefined;
-    const target = implementers[0]!;
-    const toRevision = normalizeTaskString(target.auditRevision);
-    if (target.status !== 'validated' || target.validationState !== 'passed'
-      || !target.leaseId || target.scopeFiles.length === 0 || !toRevision
-      || toRevision === fromRevision || target.auditAttemptId || target.verdict
-      || target.primaryReviewPassed || target.crossVendorAuditPassed
-      || target.auditRoutingReason || target.auditDegradedReason
-      || target.externalRunId || target.externalHeadSha || target.externalTaskId) return undefined;
-
-    const conflictingAuthority = assignments.some((assignment) => (
-      assignment.assignmentId !== target.assignmentId
-      && ((assignment.role === 'implementer' && assignment.required
-          && !isTerminalSupervisionTaskStatus(assignment.status))
-        || (assignment.role === 'integration_owner'
-          && !isTerminalSupervisionTaskStatus(assignment.status))
-        || (assignment.role === 'auditor'
-          && (Boolean(assignment.auditAttemptId)
-            || !isTerminalSupervisionTaskStatus(assignment.status))))
-    ));
-    if (conflictingAuthority) return undefined;
-    return { assignmentId: target.assignmentId, fromRevision, toRevision };
-  }
-
-  #convergeValidatedRevisionSplit(
-    task: PersistedSupervisionTaskRecord,
-    now: number,
-  ): SupervisionLifecycleConvergenceAction | undefined {
-    const plan = this.#resolveValidatedRevisionSplit(task);
-    if (!plan) return undefined;
-    this.#db.exec('BEGIN IMMEDIATE');
-    try {
-      const lockedTask = this.getTaskRecord(task.taskId);
-      const lockedPlan = lockedTask ? this.#resolveValidatedRevisionSplit(lockedTask) : undefined;
-      if (!lockedTask || !lockedPlan
-        || lockedPlan.assignmentId !== plan.assignmentId
-        || lockedPlan.fromRevision !== plan.fromRevision
-        || lockedPlan.toRevision !== plan.toRevision) {
-        this.#db.exec('ROLLBACK');
-        return undefined;
-      }
-      const lockedTarget = this.getAssignment(plan.assignmentId);
-      if (!lockedTarget || !validationAttestsRevision(lockedTarget, plan.toRevision, true)) {
-        this.#db.exec('ROLLBACK');
-        return undefined;
-      }
-      this.#writeTask({
-        ...lockedTask,
-        currentRevision: plan.toRevision,
-        // The aggregate adopts the implementer's validation for the revision it
-        // now names. Stamped explicitly so the revision-change guard keeps it.
-        validationState: 'passed',
-        validatedRevision: plan.toRevision,
-        updatedAt: now,
-      }, 'validated', {
-        source: 'lifecycle_convergence_validated_revision_split',
-        assignmentId: plan.assignmentId,
-        fromRevision: plan.fromRevision,
-        toRevision: plan.toRevision,
-      });
-      this.#db.exec('COMMIT');
-      return {
-        taskId: task.taskId,
-        assignmentId: plan.assignmentId,
-        action: 'align_validated_revision',
-      };
-    } catch (error) {
-      this.#db.exec('ROLLBACK');
-      throw error;
-    }
   }
 
   /**

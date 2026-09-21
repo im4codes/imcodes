@@ -285,29 +285,30 @@ describe('supervision lifecycle convergence — R2 branches', () => {
     expect(registry.getAssignment(assignmentId)!.auditRevision).toBe('r-authoritative');
   });
 
-  it('aligns a single-sided revision from the only assignment back onto the task', async () => {
+  it('binds a new implementation assignment revision onto the task atomically', async () => {
     const registry = memoryRegistry();
     const { taskId } = simpleTask(registry, { auditRevision: 'r-from-assignment' });
-    expect(registry.getTaskRecord(taskId)!.currentRevision ?? '').toBe('');
+    expect(registry.getTaskRecord(taskId)!.currentRevision).toBe('r-from-assignment');
 
-    await registry.convergeLifecycle(2_000);
+    const actions = await registry.convergeLifecycle(2_000);
 
+    expect(actions.some((action) => action.action === 'align_revision_projection')).toBe(false);
     expect(registry.getTaskRecord(taskId)!.currentRevision).toBe('r-from-assignment');
   });
 
-  it('fails closed when two assignments disagree about the revision', async () => {
+  it('rejects a second implementation assignment that would disagree about the revision', async () => {
     const registry = memoryRegistry();
     const { taskId } = simpleTask(registry, { auditRevision: 'r-one' });
     const second = registry.createAssignment({
       taskId, role: 'implementer', identity: identity('deck_alpha_second'),
       scopeFiles: ['src/other.ts'], auditRevision: 'r-two',
     } as never);
-    if (!second.ok) throw new Error(second.reason);
+    expect(second).toMatchObject({ ok: false, reason: 'old_revision' });
 
     const actions = await registry.convergeLifecycle(2_000);
 
     expect(actions.some((a) => a.action === 'align_revision_projection')).toBe(false);
-    expect(registry.getTaskRecord(taskId)!.currentRevision ?? '').toBe('');
+    expect(registry.getTaskRecord(taskId)!.currentRevision).toBe('r-one');
   });
 
   it('projects a passed validation forward without demanding a repeated record_validation call', async () => {
@@ -449,7 +450,8 @@ describe('supervision lifecycle convergence — R2 branches', () => {
     } as never)).toMatchObject({ ok: false });
 
     // The auditor cannot be moved onto a successor revision either.
-    expect(registry.updateTask({ taskId, currentRevision: 'r-new' } as never)).toMatchObject({ ok: true });
+    expect(registry.updateTask({ taskId, currentRevision: 'r-new' } as never))
+      .toMatchObject({ ok: false, reason: 'old_revision' });
     expect(registry.updateAssignment({
       assignmentId: auditor.value.assignmentId, identity: auditor.value.identity,
       auditAttemptId: 'attempt-new', auditRevision: 'r-new',

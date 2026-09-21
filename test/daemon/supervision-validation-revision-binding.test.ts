@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { SUPERVISION_UNBOUND_REVISION } from '../../shared/supervision-mcp-tools.js';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -212,7 +212,7 @@ describe('validation is bound to the exact revision it attested', () => {
     expect(fixture.registry.getAssignment(fixture.assignmentId)?.status).toBe('ready_for_audit');
   });
 
-  it('aligns a legacy unstamped validated revision split and stamps the aggregate with the new revision', async () => {
+  it('never promotes an assignment-only successor from validation; explicit rebind clears predecessor validation', async () => {
     const fixture = validatedAtR1('tsk_validation_binding_split');
     const assignment = fixture.registry.getAssignment(fixture.assignmentId)!;
     const { validatedRevision: _a, ...legacyAssignment } = assignment;
@@ -226,10 +226,20 @@ describe('validation is bound to the exact revision it attested', () => {
     } as PersistedSupervisionTaskRecord);
 
     const actions = await fixture.registry.convergeLifecycle(Date.now());
-    expect(actions.map((action) => action.action)).toContain('align_validated_revision');
+    expect(actions.map((action) => action.action)).not.toContain('align_validated_revision');
     expect(fixture.registry.getTaskRecord(fixture.taskId)).toMatchObject({
-      currentRevision: R2, validationState: 'passed', validatedRevision: R2,
+      currentRevision: R1, validationState: 'passed',
     });
+    expect(fixture.registry.rebindTaskAssignmentRevision({
+      taskId: fixture.taskId, assignmentId: fixture.assignmentId,
+      fromRevision: R1, toRevision: R2, worktreeSnapshot: snapshot(),
+      leaseAction: 'renew', idempotencyKey: 'explicit-split-repair-r2',
+      reason: 'explicitly repair the persisted revision split',
+    })).toMatchObject({ ok: true, value: { currentRevision: R2, validationState: undefined } });
+    expect(fixture.registry.getAssignment(fixture.assignmentId)).toMatchObject({
+      auditRevision: R2, status: 'implementing',
+    });
+    expect(fixture.registry.getAssignment(fixture.assignmentId)?.validationState).toBeUndefined();
   });
 
   it('keeps a stamped successor validation across a daemon restart and rejects the predecessor stamp', async () => {
@@ -269,6 +279,264 @@ describe('validation is bound to the exact revision it attested', () => {
       status: 'implementing', auditRevision: R2,
     });
     expect(fixture.registry.getAssignment(fixture.assignmentId)?.validationState).toBeUndefined();
+  });
+});
+
+describe('task/implementation revision atomicity', () => {
+  it('binds an integration_task successor to task and implementer in the same update', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    try {
+      const taskId = 'tsk-integration-revision-atomic';
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'integration_task',
+        objective: 'keep the aggregate and implementation owner on one revision',
+        currentRevision: R1,
+      })).toMatchObject({ ok: true });
+      const worker = registry.createAssignment({
+        taskId, role: 'implementer', identity: identity('deck-integration-worker'),
+        auditRevision: R1, scopeFiles: ['src/exact.ts'],
+      });
+      if (!worker.ok) throw new Error(worker.reason);
+      expect(registry.applyTaskIntent({
+        taskId, assignmentId: worker.value.assignmentId, intent: 'start', toStatus: 'implementing',
+      })).toMatchObject({ ok: true });
+
+      expect(registry.updateAssignment({
+        assignmentId: worker.value.assignmentId, identity: worker.value.identity,
+        revision: R2, auditRevision: R2,
+      })).toMatchObject({ ok: true });
+      expect(registry.getTaskRecord(taskId)?.currentRevision).toBe(R2);
+      expect(registry.getAssignment(worker.value.assignmentId)?.auditRevision).toBe(R2);
+    } finally {
+      registry.close();
+      database.close();
+    }
+  });
+
+  it('rejects task-only revision movement when a live implementation owner names another revision', () => {
+    const fixture = validatedAtR1('tsk-task-only-revision-refused');
+    try {
+      expect(fixture.registry.updateTask({ taskId: fixture.taskId, currentRevision: R2 }))
+        .toMatchObject({
+          ok: false,
+          reason: 'old_revision',
+          detail: {
+            taskCurrentRevision: R2,
+            assignmentAuditRevision: R1,
+            mismatchedFields: ['task.currentRevision', 'assignment.auditRevision'],
+          },
+        });
+      expect(fixture.registry.getTaskRecord(fixture.taskId)?.currentRevision).toBe(R1);
+      expect(fixture.registry.getAssignment(fixture.assignmentId)?.auditRevision).toBe(R1);
+    } finally {
+      fixture.registry.close();
+      fixture.database.close();
+    }
+  });
+
+  it('rejects a mismatched implementation assignment at creation instead of persisting a split', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    try {
+      expect(registry.createOrGet({
+        taskId: 'tsk-create-revision-refused', projectName: 'alpha',
+        classification: 'integration_task', objective: 'creation mismatch', currentRevision: R1,
+      })).toMatchObject({ ok: true });
+      expect(registry.createAssignment({
+        taskId: 'tsk-create-revision-refused', role: 'implementer',
+        identity: identity('deck-create-mismatch'), auditRevision: R2,
+      })).toMatchObject({ ok: false, reason: 'old_revision' });
+      expect(registry.listAssignments('tsk-create-revision-refused')).toEqual([]);
+      expect(registry.getTaskRecord('tsk-create-revision-refused')?.currentRevision).toBe(R1);
+    } finally {
+      registry.close();
+      database.close();
+    }
+  });
+
+  it('binds a validated integration-slice finish to task and assignment together', () => {
+    const database = new DatabaseSync(':memory:');
+    const registry = new SupervisionTaskRegistry({ database });
+    try {
+      const taskId = 'tsk-slice-finish-first-revision';
+      expect(registry.createOrGet({
+        taskId, projectName: 'alpha', classification: 'integration_slice',
+        objective: 'bind the first immutable slice revision atomically',
+      })).toMatchObject({ ok: true });
+      const worker = registry.createAssignment({
+        taskId, role: 'implementer', identity: identity('deck-slice-worker'),
+        scopeFiles: ['src/exact.ts'],
+      });
+      if (!worker.ok) throw new Error(worker.reason);
+      expect(registry.applyTaskIntent({
+        taskId, assignmentId: worker.value.assignmentId, intent: 'start', toStatus: 'implementing',
+      })).toMatchObject({ ok: true });
+      expect(registry.applyTaskIntent({
+        taskId, assignmentId: worker.value.assignmentId, intent: 'record_validation',
+        expectedRevision: SUPERVISION_UNBOUND_REVISION,
+        toStatus: 'validated', validationState: 'passed',
+      })).toMatchObject({ ok: true });
+
+      expect(registry.finishAssignment({
+        assignmentId: worker.value.assignmentId, identity: worker.value.identity, revision: R1,
+      })).toMatchObject({ ok: true, value: { status: 'ready_for_integration', auditRevision: R1 } });
+      expect(registry.getTaskRecord(taskId)?.currentRevision).toBe(R1);
+      expect(registry.getAssignment(worker.value.assignmentId)?.auditRevision).toBe(R1);
+    } finally {
+      registry.close();
+      database.close();
+    }
+  });
+
+  for (const stoppedStatus of ['recovered', 'blocked'] as const) {
+    it(`repairs an exact ${stoppedStatus} task=R1/assignment=R2 split from an from=to=R2 request`, () => {
+      const database = new DatabaseSync(':memory:');
+      const registry = new SupervisionTaskRegistry({ database });
+      try {
+        const taskId = `tsk-stopped-split-${stoppedStatus}`;
+        expect(registry.createOrGet({
+          taskId, projectName: 'alpha', classification: 'integration_task',
+          objective: 'repair stopped exact split', currentRevision: R1,
+        })).toMatchObject({ ok: true });
+        const worker = registry.createAssignment({
+          taskId, role: 'implementer', identity: identity(`deck-${stoppedStatus}-worker`),
+          auditRevision: R1, scopeFiles: ['src/exact.ts'],
+        });
+        if (!worker.ok) throw new Error(worker.reason);
+        const persistedWorker = registry.getAssignment(worker.value.assignmentId)!;
+        rewriteAssignment(database, {
+          ...persistedWorker,
+          status: stoppedStatus,
+          leaseId: '',
+          auditRevision: R2,
+          auditAttemptId: 'attempt-r1',
+          verdict: 'READY_FOR_REAUDIT',
+          updatedAt: persistedWorker.updatedAt + 1,
+        });
+        const persistedTask = registry.getTaskRecord(taskId)!;
+        rewriteTask(database, {
+          ...persistedTask,
+          status: stoppedStatus,
+          currentRevision: R1,
+          validationState: 'passed',
+          validatedRevision: R1,
+          updatedAt: persistedTask.updatedAt + 1,
+        });
+
+        expect(registry.rebindTaskAssignmentRevision({
+          taskId, assignmentId: worker.value.assignmentId,
+          fromRevision: R2, toRevision: R2, worktreeSnapshot: snapshot(),
+          leaseAction: 'renew', idempotencyKey: `repair-${stoppedStatus}-split-r2`,
+          reason: 'Brain repairs the exact persisted split without inheriting a verdict',
+        })).toMatchObject({
+          ok: true,
+          value: { status: 'implementing', currentRevision: R2, validationState: undefined },
+        });
+        expect(registry.getAssignment(worker.value.assignmentId)).toMatchObject({
+          status: 'implementing', auditRevision: R2,
+        });
+        const repairedAssignment = registry.getAssignment(worker.value.assignmentId);
+        expect(repairedAssignment?.auditAttemptId).toBeUndefined();
+        expect(repairedAssignment?.verdict).toBeUndefined();
+        expect(repairedAssignment?.validationState).toBeUndefined();
+        expect(registry.getTaskRecord(taskId)).toMatchObject({
+          status: 'implementing', currentRevision: R2,
+        });
+        expect(registry.getTaskRecord(taskId)?.validationState).toBeUndefined();
+      } finally {
+        registry.close();
+        database.close();
+      }
+    });
+  }
+
+  it('explains from=to when there is no persisted split instead of returning opaque invalid', () => {
+    const fixture = validatedAtR1('tsk-equal-revision-diagnostic');
+    try {
+      expect(fixture.registry.rebindTaskAssignmentRevision({
+        taskId: fixture.taskId, assignmentId: fixture.assignmentId,
+        fromRevision: R1, toRevision: R1, worktreeSnapshot: snapshot(),
+        leaseAction: 'renew', idempotencyKey: 'equal-revision-no-split',
+        reason: 'exercise actionable rejection',
+      })).toMatchObject({
+        ok: false,
+        reason: 'invalid',
+        detail: {
+          taskCurrentRevision: R1,
+          assignmentAuditRevision: R1,
+          requestedFromRevision: R1,
+          requestedToRevision: R1,
+          mismatchedFields: [],
+        },
+      });
+    } finally {
+      fixture.registry.close();
+      fixture.database.close();
+    }
+  });
+});
+
+const REAL_215_SNAPSHOT = '/Users/k/.imcodes/scratch/brain/jdzj-tsk18tm/supervision-state-215.sqlite';
+
+describe.runIf(existsSync(REAL_215_SNAPSHOT))('215 tsk_18tm real snapshot regression', () => {
+  it('converges the copied production split without inventing PASS or finalization', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'tsk-18tm-real-snapshot-'));
+    const copied = join(dir, 'state.sqlite');
+    copyFileSync(REAL_215_SNAPSHOT, copied);
+    const registry = new SupervisionTaskRegistry({ dbPath: copied });
+    const R1_REAL = 'c6c1ffeabe514e93ac4e8c3ab659bca62cfadf17125d036974b8eafc625c12cd';
+    const R2_REAL = '0a4e834d0a8f1e4420618b8135bcc1e9f59b837cefe0bcc2eaaff71dba8986de';
+    try {
+      expect(registry.getTaskRecord('tsk_18tm')).toMatchObject({
+        status: 'recovered', currentRevision: R1_REAL,
+        validationState: 'passed', validatedRevision: R1_REAL,
+      });
+      expect(registry.getAssignment('asg_18tu')).toMatchObject({
+        status: 'recovered', auditRevision: R2_REAL,
+        auditAttemptId: 'att_18tm_c6c1_01', verdict: 'READY_FOR_REAUDIT',
+      });
+
+      expect(registry.rebindTaskAssignmentRevision({
+        taskId: 'tsk_18tm', assignmentId: 'asg_18tu',
+        fromRevision: R2_REAL, toRevision: R2_REAL,
+        worktreeSnapshot: {
+          // Fixture only: the database is the captured production evidence;
+          // the old assignment worktree no longer exists locally.
+          worktreePath: '/fixture/tsk-18tm-r2',
+          headSha: '0035b7c017171cd426db1ed8e3d4bc97adbda23f',
+          files: [], stagedPaths: [], conflictedPaths: [], untrackedPaths: [],
+        },
+        leaseAction: 'renew', idempotencyKey: 'tsk-18tm-real-snapshot-r2-repair',
+        reason: 'repair the exact copied production split',
+      })).toMatchObject({
+        ok: true,
+        value: { status: 'implementing', currentRevision: R2_REAL, validationState: undefined },
+      });
+      expect(registry.getTaskRecord('tsk_18tm')).toMatchObject({
+        status: 'implementing', currentRevision: R2_REAL,
+      });
+      const repairedTask = registry.getTaskRecord('tsk_18tm');
+      expect(repairedTask?.validationState).toBeUndefined();
+      expect(repairedTask?.commitSha).toBeUndefined();
+      expect(repairedTask?.pushRemoteRef).toBeUndefined();
+      expect(repairedTask?.finalization).toBeUndefined();
+      expect(registry.getAssignment('asg_18tu')).toMatchObject({
+        status: 'implementing', auditRevision: R2_REAL,
+      });
+      const repairedAssignment = registry.getAssignment('asg_18tu');
+      expect(repairedAssignment?.auditAttemptId).toBeUndefined();
+      expect(repairedAssignment?.verdict).toBeUndefined();
+      expect(repairedAssignment?.validationState).toBeUndefined();
+      expect(registry.listAuditReceipts('tsk_18tm')).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          attemptId: 'att_18tm_c6c1_01', revision: R1_REAL, verdict: 'REWORK',
+        }),
+      ]));
+    } finally {
+      registry.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
