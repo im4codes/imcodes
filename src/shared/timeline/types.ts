@@ -135,11 +135,12 @@ export const TIMELINE_CHAT_RENDERABLE_TYPES: readonly string[] = [
 
 /**
  * Types the chat draws only when the tool-detail preference is on.
- * Mirrors `TOOL_LIKE_EVENT_TYPES` in ChatView.
+ * Mirrors the preference-only subset of `TOOL_LIKE_EVENT_TYPES` in ChatView.
+ * `tool.call` / `tool.result` are intentionally absent: simple mode still
+ * projects them into the compact activity rail, so they always create a
+ * ViewItem even when their detailed cards are disabled.
  */
 export const TIMELINE_PREFERENCE_DEPENDENT_TYPES: readonly string[] = [
-  'tool.call',
-  'tool.result',
   'file.change',
   'memory.context',
   'assistant.thinking',

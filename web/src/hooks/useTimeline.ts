@@ -4074,16 +4074,25 @@ export function useTimeline(
     fireHttpBackfillRef.current(0, { phase: 'refresh', visible: true, force: true, mode: 'manualLatestWindow' });
   }, [reloadLocalTimeline, sendForwardHistoryRequest, sessionId, updateHistoryStep, ws]);
 
-  // Self-heal a blank pane. The mount path seeds `events` from local cache, but
-  // it can still settle EMPTY even when history exists — e.g. serverId resolved
-  // AFTER the first read so the scoped cacheKey changed, a cold/slow IndexedDB
-  // read, or a daemon history response that came back empty. The user shouldn't
-  // have to hit ↻ to get the same recovery path. When the timeline has SETTLED
-  // blank, re-read local IDB and run the same latest-window HTTP catch-up used
-  // by forceRefresh. `manualLatestWindow` also clears any pending tail backfill,
-  // so this does not double-fetch after the mount bootstrap timer.
+  // Self-heal a blank pane. "Blank" means no event is GUARANTEED to create a
+  // ChatView row, not merely `events.length === 0`: an old window can restore a
+  // non-empty tail made entirely of peer_audit.status / last-value / hidden rows.
+  // The ordinary cache-hit catch-up is then anchored after those newer rows, so
+  // it cannot fetch the older conversation below them, while the old length
+  // check incorrectly declared the pane healthy. This is why clicking ↻ fixed
+  // the pane immediately: forceRefresh uses an unanchored latest-window read.
+  //
+  // Re-use that same path automatically after bootstrap settles. The shared
+  // visibility predicate is deliberately the contract mirrored by ChatView;
+  // it also makes a same-length replacement (one invisible row -> one visible
+  // message) clear the one-shot fence, which an `events.length` dependency could
+  // not observe. `manualLatestWindow` clears any pending tail backfill, so this
+  // does not double-fetch after the mount bootstrap timer.
   const blankSelfHealRef = useRef<string | null>(null);
   const staleToolSelfHealRef = useRef<string | null>(null);
+  const hasGuaranteedVisibleTimelineContent = events.some((event) => (
+    isGuaranteedVisibleTimelineEvent(event)
+  ));
   const fireBlankPaneRecovery = useCallback((visible: boolean) => {
     const key = cacheKeyRef.current;
     if (!key) return;
@@ -4099,7 +4108,7 @@ export function useTimeline(
   useEffect(() => {
     const key = cacheKey;
     if (!key || disableHistory) return;
-    if (events.length > 0) {
+    if (hasGuaranteedVisibleTimelineContent) {
       if (blankSelfHealRef.current === key) blankSelfHealRef.current = null;
       return;
     }
@@ -4109,7 +4118,7 @@ export function useTimeline(
     fireBlankPaneRecovery(true);
   }, [
     cacheKey,
-    events.length,
+    hasGuaranteedVisibleTimelineContent,
     loading,
     refreshing,
     httpRefreshing,

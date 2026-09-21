@@ -23,6 +23,7 @@ import { h } from 'preact';
 import type { ServerMessage, TimelineEvent, WsClient } from '../src/ws-client.js';
 import { TimelineDB } from '../src/timeline-db.js';
 import { TIMELINE_MESSAGES } from '../../shared/timeline-protocol.js';
+import { isGuaranteedVisibleTimelineEvent } from '../../src/shared/timeline/types.js';
 import {
   __getTimelineHistoryAfterTsForTests,
   __resetBackfillCooldownsForTests,
@@ -377,6 +378,98 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
       await vi.advanceTimersByTimeAsync(300);
     });
     expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { kind: 'main session', isActiveSession: true, isVisible: true },
+    { kind: 'visible sub-session window', isActiveSession: false, isVisible: true },
+  ])('self-heals an old $kind whose non-renderable memory cache suppresses ordinary tail history', async ({
+    kind,
+    isActiveSession,
+    isVisible,
+  }) => {
+    const sessionName = `deck_old_blank_${kind.replaceAll(' ', '_')}_${Date.now()}`;
+    const serverId = `srv-old-blank-${Date.now()}`;
+    const cachedStatus: TimelineEvent = {
+      eventId: `${sessionName}-cached-status`,
+      sessionId: sessionName,
+      ts: 5_000,
+      epoch: 1,
+      seq: 20,
+      source: 'daemon',
+      confidence: 'high',
+      // This durable status is useful to other projections, but ChatView has no
+      // row for it. It reproduces the old-window state where the cache is
+      // non-empty while the message list renders zero items.
+      type: 'peer_audit.status',
+      payload: { state: 'auditing' },
+    } as TimelineEvent;
+    const recoveredMessage: TimelineEvent = {
+      eventId: `${sessionName}-recovered-message`,
+      sessionId: sessionName,
+      ts: 1_000,
+      epoch: 1,
+      seq: 10,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: `old ${kind} history recovered automatically` },
+    };
+    expect(isGuaranteedVisibleTimelineEvent(cachedStatus)).toBe(false);
+    ingestTimelineEventForCache(cachedStatus, serverId);
+
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([cachedStatus]);
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue({ seq: 20, epoch: 1 });
+
+    // An ordinary tail catch-up is anchored after the newer cached status, so
+    // it cannot see the older conversation. The manual-refresh/latest-window
+    // route omits afterTs and returns the authoritative recent window.
+    fetchSpy.mockImplementation(async (_serverId, _sessionName, options?: { afterTs?: number }) => (
+      typeof options?.afterTs === 'number'
+        ? { events: [], epoch: 1, hasMore: false, nextCursor: null }
+        : { events: [recoveredMessage, cachedStatus], epoch: 1, hasMore: false, nextCursor: null }
+    ));
+
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineReplayRequest: vi.fn(() => `replay-${sessionName}`),
+      sendTimelineHistoryRequest: vi.fn(() => `history-${sessionName}`),
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, ws, serverId, {
+        isActiveSession,
+        isVisible,
+        bootstrapWhenVisible: true,
+      });
+      return h(
+        'div',
+        { 'data-testid': 'old-window-probe' },
+        events
+          .filter((event) => isGuaranteedVisibleTimelineEvent(event))
+          .map((event) => String(event.payload.text ?? ''))
+          .join('|'),
+      );
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe));
+
+    // First paint mirrors the report: cache is non-empty, but the conversation
+    // is blank. It must then take the same no-afterTs path as ↻ automatically.
+    expect(screen.getByTestId('old-window-probe').textContent).toBe('');
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+    await waitFor(() => {
+      expect(screen.getByTestId('old-window-probe').textContent)
+        .toContain(`old ${kind} history recovered automatically`);
+    });
+    expect(fetchSpy).toHaveBeenCalledWith(
+      serverId,
+      sessionName,
+      expect.not.objectContaining({ afterTs: expect.any(Number) }),
+    );
   });
 
   it('recovers a dropped terminal: a stream that idles while still streaming fires a latest-window catch-up', async () => {
