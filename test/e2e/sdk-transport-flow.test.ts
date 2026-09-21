@@ -25,6 +25,18 @@ async function waitForCondition(check: () => boolean, timeoutMs = 3000, interval
   throw new Error('Timed out waiting for condition');
 }
 
+/** Text the real Claude Agent SDK serializes as appendSystemPrompt at initialize. */
+function claudePresetAppend(options: Record<string, unknown> | undefined): string {
+  const systemPrompt = options?.systemPrompt;
+  if (!systemPrompt || typeof systemPrompt !== 'object' || Array.isArray(systemPrompt)) return '';
+  const candidate = systemPrompt as Record<string, unknown>;
+  return candidate.type === 'preset'
+    && candidate.preset === 'claude_code'
+    && typeof candidate.append === 'string'
+    ? candidate.append
+    : '';
+}
+
 const mocks = vi.hoisted(() => {
   const store = new Map<string, Record<string, any>>();
   const emitted: Array<{ session: string; type: string; payload: Record<string, any>; opts?: Record<string, any> }> = [];
@@ -750,7 +762,7 @@ describe('sdk transport flow e2e', () => {
       ANTHROPIC_MODEL: 'MiniMax-M2.7',
     });
     expect(claudeCall?.options.model).toBe('MiniMax-M2.7');
-    expect(String(claudeCall?.options.appendSystemPrompt ?? '')).toContain('Authoritative runtime model: MiniMax-M2.7.');
+    expect(claudePresetAppend(claudeCall?.options)).toContain('Authoritative runtime model: MiniMax-M2.7.');
   });
 
   it('pushes a corrective session_list when settings restart fails', async () => {
@@ -1289,11 +1301,11 @@ describe('sdk transport flow e2e', () => {
     }, serverLink);
     await flushAsync();
     await waitForCondition(() => mocks.claudeCalls.some((call) => (
-      String(call.options.appendSystemPrompt ?? '').includes(identityDocument)
+      claudePresetAppend(call.options).includes(identityDocument)
     )));
 
     expect(mocks.store.get(sessionName)?.identityPrompt).toBe(identityDocument);
-    expect(mocks.claudeCalls.at(-1)?.options.appendSystemPrompt).toContain(identityDocument);
+    expect(claudePresetAppend(mocks.claudeCalls.at(-1)?.options)).toContain(identityDocument);
   });
 
   it('starts a selected compatible model without duplicating the CC preset', async () => {
@@ -1326,7 +1338,7 @@ describe('sdk transport flow e2e', () => {
       ANTHROPIC_DEFAULT_SONNET_MODEL: 'MiniMax-M3',
     });
     expect(claudeCall?.options.model).toBe('MiniMax-M3');
-    expect(String(claudeCall?.options.appendSystemPrompt ?? '')).toContain('Authoritative runtime model: MiniMax-M3.');
+    expect(claudePresetAppend(claudeCall?.options)).toContain('Authoritative runtime model: MiniMax-M3.');
   });
 
   it('switches among discovered models inside one CC preset for later turns', async () => {
@@ -1361,7 +1373,7 @@ describe('sdk transport flow e2e', () => {
     expect(record?.activeModel).toBe('MiniMax-M3');
     expect(usage?.payload.contextWindow).toBe(200000);
     expect(mocks.claudeCalls.at(-1)?.options.model).toBe('MiniMax-M3');
-    expect(String(mocks.claudeCalls.at(-1)?.options.appendSystemPrompt ?? '')).toContain(
+    expect(claudePresetAppend(mocks.claudeCalls.at(-1)?.options)).toContain(
       'Authoritative runtime model: MiniMax-M3.',
     );
     expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({
@@ -1406,7 +1418,7 @@ describe('sdk transport flow e2e', () => {
       ANTHROPIC_MODEL: 'MiniMax-M2.7',
     });
     expect(claudeCall?.options.model).toBe('MiniMax-M2.7');
-    expect(String(claudeCall?.options.appendSystemPrompt ?? '')).toContain('Authoritative runtime model: MiniMax-M2.7.');
+    expect(claudePresetAppend(claudeCall?.options)).toContain('Authoritative runtime model: MiniMax-M2.7.');
     expect(streaming.map((e) => e.payload.text)).toEqual(['Claude']);
     expect(streaming[0]?.opts?.eventId).toBe(stableEventId);
     expect(final?.payload.text).toBe('Claude: hello');
