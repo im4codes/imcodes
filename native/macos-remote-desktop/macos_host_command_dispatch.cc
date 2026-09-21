@@ -74,10 +74,12 @@ HostCommandResult DispatchHostCommand(
     return {AfterRouteEnded(session), {}};
   }
 
-  // Every remaining command either creates or mutates a live route. The
-  // separate signed disclosure must still be visible at the exact dispatch
-  // boundary; a readiness result sampled earlier is not sufficient.
-  if (disclosure == nullptr || !disclosure->route_admissible()) {
+  // PREPARE is the operation that creates a route and synchronously raises its
+  // separate signed disclosure. Requiring a visible disclosure before PREPARE
+  // would force an idle resident worker to invent a viewer. Every mutation of
+  // an existing route still requires the disclosure before dispatch.
+  if (signal.kind != rd::Signal::Kind::kPrepare &&
+      (disclosure == nullptr || !disclosure->route_admissible())) {
     return Rejected(signal.authority, kTerminalCapabilityUnavailable, session,
                     sink);
   }
@@ -86,6 +88,14 @@ HostCommandResult DispatchHostCommand(
     case rd::Signal::Kind::kPrepare:
       if (!session->Prepare(signal.authority, now_unix_ms,
                             now_monotonic_ms)) {
+        return Rejected(signal.authority, kTerminalCapabilityUnavailable,
+                        session, sink);
+      }
+      // Prepare may only succeed after the route-owned Show() has received the
+      // disclosure process's visible-ready acknowledgement. Re-check here so
+      // an implementation that returns success without that proof still fails
+      // closed at the exact admission boundary.
+      if (disclosure == nullptr || !disclosure->route_admissible()) {
         return Rejected(signal.authority, kTerminalCapabilityUnavailable,
                         session, sink);
       }

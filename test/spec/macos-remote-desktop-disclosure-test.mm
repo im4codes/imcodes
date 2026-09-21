@@ -261,6 +261,10 @@ int main() {
   Require(disclosure.BeginSession(41), "first generation starts");
   Require(disclosure.ProbeReadiness() == common::ReadinessState::kUnavailable,
           "route readiness remains unavailable before the window is visible");
+  Require(disclosure.Show(0, 0),
+          "a pending route keeps the safety disclosure visible without inventing a viewer");
+  Require(backend_ptr->viewers == 0 && backend_ptr->controllers == 0,
+          "pending disclosure reports truthful zero counts");
   Require(disclosure.Show(2, 1), "bounded local disclosure becomes visible");
   Require(disclosure.IsVisible() && backend_ptr->visible,
           "successful Show owns a visible disclosure");
@@ -316,7 +320,7 @@ int main() {
           "controller count is bounded before reaching AppKit");
   Require(!disclosure.Show(1, 2),
           "controller count cannot exceed the visible viewer count");
-  Require(backend_ptr->show_count == 4,
+  Require(backend_ptr->show_count == 5,
           "invalid counts never reach the disclosure backend");
   Require(disclosure.Show(macos::kMacosDisclosureMaxViewers,
                           macos::kMacosDisclosureMaxControllers),

@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -761,6 +762,8 @@ class FakeSession final : public macos::HostCommandSessionSeam {
     ++prepares;
     last = authority;
     const bool ok = accept && now_unix_ms == 1000 && now_monotonic_ms == 2000;
+    if (ok && on_prepare)
+      on_prepare();
     if (ok) routes.insert(authority.session_id);
     return ok;
   }
@@ -810,6 +813,7 @@ class FakeSession final : public macos::HostCommandSessionSeam {
   }
 
   bool accept = true;
+  std::function<void()> on_prepare;
   int prepares = 0;
   int offers = 0;
   int ice = 0;
@@ -825,6 +829,7 @@ class FakeDisclosure final : public macos::HostCommandDisclosureSeam {
  public:
   explicit FakeDisclosure(bool admissible) noexcept : admissible_(admissible) {}
   [[nodiscard]] bool route_admissible() const override { return admissible_; }
+  void set_admissible(bool admissible) noexcept { admissible_ = admissible; }
 
  private:
   bool admissible_;
@@ -1008,10 +1013,43 @@ void RouteCommandsDriveTheSessionAndRemainLive() {
 }
 
 void RouteCommandsRefuseWithoutVisibleDisclosure() {
-  for (const auto kind :
-       {imcodes::rd::Signal::Kind::kPrepare, imcodes::rd::Signal::Kind::kOffer,
-        imcodes::rd::Signal::Kind::kLease, imcodes::rd::Signal::Kind::kMode,
-        imcodes::rd::Signal::Kind::kIce}) {
+  // PREPARE is the operation that creates the real route and synchronously
+  // raises its local disclosure. Requiring a disclosure before PREPARE forced
+  // the resident worker to invent a permanent viewer at process startup.
+  {
+    FakeSession session;
+    FakeDisclosure disclosure(false);
+    session.on_prepare = [&disclosure] { disclosure.set_admissible(true); };
+    RecordingSink sink;
+    const auto result = Dispatch(Signal(imcodes::rd::Signal::Kind::kPrepare),
+                                 &session, &disclosure, &sink);
+    Check(result.disposition == macos::HostCommandDisposition::kContinue &&
+              session.prepares == 1 && session.live_routes() == 1 &&
+              sink.emitted.size() == 1 && sink.emitted[0] == "mode:initial",
+          "PREPARE may synchronously establish the first real disclosure");
+  }
+
+  // A lying/broken session seam that returns success without a visible local
+  // disclosure is still rejected at the exact post-PREPARE boundary.
+  {
+    FakeSession session;
+    FakeDisclosure disclosure(false);
+    RecordingSink sink;
+    const auto result = Dispatch(Signal(imcodes::rd::Signal::Kind::kPrepare),
+                                 &session, &disclosure, &sink);
+    Check(result.disposition == macos::HostCommandDisposition::kTerminate &&
+              session.prepares == 1 && session.stops == 1 &&
+              sink.emitted.size() == 1 &&
+              sink.emitted[0] == "terminal:capability_unavailable:",
+          "PREPARE cannot admit a route without a visible disclosure");
+  }
+
+  // Once a route exists, every subsequent mutation keeps the original
+  // pre-dispatch fail-closed check.
+  for (const auto kind : {imcodes::rd::Signal::Kind::kOffer,
+                          imcodes::rd::Signal::Kind::kLease,
+                          imcodes::rd::Signal::Kind::kMode,
+                          imcodes::rd::Signal::Kind::kIce}) {
     FakeSession session;
     FakeDisclosure disclosure(false);
     RecordingSink sink;

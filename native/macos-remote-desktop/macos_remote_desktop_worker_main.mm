@@ -446,9 +446,9 @@ bool SiblingExecutablePresent(const char* file_name) noexcept {
 // Launches and supervises the separate signed disclosure executable, and
 // consumes its bounded control stream.
 //
-// Without this the worker would construct a DisclosureAdmission that nothing
-// ever satisfies, leaving route_admissible() false forever — a session that
-// can never be admitted is just as broken as one admitted without disclosure.
+// The resident worker deliberately starts with no disclosure process: a worker
+// is not a viewer. The first real route launches the signed sibling through
+// DisclosureRoster::Show and waits for its ready event before admission.
 class DisclosureSupervisor {
  public:
   bool Launch(std::uint64_t generation,
@@ -493,8 +493,12 @@ class DisclosureRoster {
         generation_(generation) {}
 
   bool BeginGeneration(std::uint64_t generation) const noexcept {
-    return generation == generation_ && admission_ != nullptr &&
-           admission_->route_admissible();
+    // This initializes a real route before Show(). Readiness cannot be a
+    // prerequisite here: Show is what launches the signed disclosure and
+    // proves it visible. MacosRemoteDesktopSession::Start probes readiness
+    // immediately after Show, and the dispatcher independently re-checks it.
+    return generation == generation_ && supervisor_ != nullptr &&
+           admission_ != nullptr;
   }
   rd::common::ReadinessState ProbeReadiness() const noexcept {
     return admission_ != nullptr && admission_->route_admissible()
@@ -504,7 +508,17 @@ class DisclosureRoster {
   bool Show(const void* route, std::uint32_t viewers,
             std::uint32_t controllers) {
     std::lock_guard lock(mutex_);
-    counts_[route] = {viewers, controllers};
+    RouteCount& count = counts_[route];
+    count.viewers = viewers;
+    count.controllers = controllers;
+    return PublishLocked();
+  }
+  bool SetConnected(const void* route, bool connected) {
+    std::lock_guard lock(mutex_);
+    const auto found = counts_.find(route);
+    if (found == counts_.end())
+      return false;
+    found->second.connected = connected;
     return PublishLocked();
   }
   void Hide(const void* route) noexcept {
@@ -521,14 +535,31 @@ class DisclosureRoster {
       (void)admission_->Apply(macos::DisclosureEvent::kClosed, generation_);
     }
   }
+  void Reset() noexcept {
+    std::lock_guard lock(mutex_);
+    counts_.clear();
+    if (supervisor_ != nullptr)
+      supervisor_->Terminate();
+    if (admission_ != nullptr)
+      (void)admission_->Apply(macos::DisclosureEvent::kClosed, generation_);
+  }
 
  private:
+  struct RouteCount {
+    std::uint32_t viewers = 0;
+    std::uint32_t controllers = 0;
+    bool connected = false;
+  };
+
   bool PublishLocked() {
     std::uint32_t viewers = 0;
     std::uint32_t controllers = 0;
-    for (const auto& [route, count] : counts_) {
-      viewers += count.first;
-      controllers += count.second;
+    for (const auto& entry : counts_) {
+      const RouteCount& count = entry.second;
+      if (!count.connected)
+        continue;
+      viewers += count.viewers;
+      controllers += count.controllers;
     }
     return supervisor_ != nullptr && admission_ != nullptr &&
            supervisor_->EnsureVisible(generation_, viewers, controllers,
@@ -539,7 +570,7 @@ class DisclosureRoster {
   macos::DisclosureAdmission* admission_;
   std::uint64_t generation_;
   std::mutex mutex_;
-  std::map<const void*, std::pair<std::uint32_t, std::uint32_t>> counts_;
+  std::map<const void*, RouteCount> counts_;
 };
 
 // One route's view of the shared disclosure.
@@ -554,6 +585,7 @@ class RouteDisclosure final : public rd::common::DisclosureAdapter {
   bool Show(std::uint32_t viewers, std::uint32_t controllers) override {
     return roster_->Show(this, viewers, controllers);
   }
+  bool SetConnected(bool connected) { return roster_->SetConnected(this, connected); }
   void Hide() noexcept override { roster_->Hide(this); }
 
  private:
@@ -631,7 +663,8 @@ class WorkerTransportSink final : public macos::MacosTransportCallbackSink {
  public:
   void Bind(macos::MacosRemoteDesktopSession* session,
             macos::MacosTransportSessionAdapter* transport,
-            class WorkerSocketEmitter* emitter) noexcept;
+            class WorkerSocketEmitter* emitter,
+            RouteDisclosure* disclosure) noexcept;
 
   WorkerTransportSink();
   ~WorkerTransportSink();
@@ -676,6 +709,7 @@ class WorkerTransportSink final : public macos::MacosTransportCallbackSink {
     });
   }
   [[nodiscard]] bool RefreshStatus() { return EmitStatus(); }
+  void ReconcileDisclosure();
   // Readable when queued transport events are waiting for DrainEvents().
   [[nodiscard]] int wake_descriptor() const noexcept { return wake_[0]; }
   [[nodiscard]] bool wake_ready() const noexcept { return wake_[0] >= 0; }
@@ -731,6 +765,7 @@ class WorkerTransportSink final : public macos::MacosTransportCallbackSink {
   macos::MacosRemoteDesktopSession* session_ = nullptr;
   macos::MacosTransportSessionAdapter* transport_ = nullptr;
   class WorkerSocketEmitter* emitter_ = nullptr;
+  RouteDisclosure* disclosure_ = nullptr;
   rd::common::TopologyRevision presented_layout_revision_ = 0;
   std::uint64_t outbound_sequence_ = 0;
   std::atomic_bool terminal_ = false;
@@ -1045,8 +1080,7 @@ bool DisclosureSupervisor::EnsureVisible(
     std::uint32_t viewers,
     std::uint32_t controllers,
     macos::DisclosureAdmission* admission) noexcept {
-  if (admission == nullptr || generation == 0 || viewers == 0 ||
-      controllers > viewers) {
+  if (admission == nullptr || generation == 0 || controllers > viewers) {
     return false;
   }
   if (child_ > 0 && generation_ == generation && viewers_ == viewers &&
@@ -1331,10 +1365,21 @@ void WorkerTransportSink::DrainEvents() {
 
 void WorkerTransportSink::Bind(macos::MacosRemoteDesktopSession* session,
                                macos::MacosTransportSessionAdapter* transport,
-                               WorkerSocketEmitter* emitter) noexcept {
+                               WorkerSocketEmitter* emitter,
+                               RouteDisclosure* disclosure) noexcept {
   session_ = session;
   transport_ = transport;
   emitter_ = emitter;
+  disclosure_ = disclosure;
+}
+
+void WorkerTransportSink::ReconcileDisclosure() {
+  if (session_ == nullptr || disclosure_ == nullptr)
+    return;
+  const rd::common::TransportDiagnostics diagnostics =
+      session_->transport_diagnostics();
+  (void)disclosure_->SetConnected(
+      diagnostics.peer_state == rd::common::PeerConnectionState::kConnected);
 }
 
 bool WorkerTransportSink::SendControl(Json::Value message) {
@@ -1634,7 +1679,10 @@ void WorkerTransportSink::HandlePeerConnectionState(
     rd::common::PeerConnectionState state) {
   if (session_ != nullptr &&
       session_->OnPeerConnectionState(stamp, state, SampleNow())) {
+    ReconcileDisclosure();
     (void)EmitStatus();
+  } else if (disclosure_ != nullptr) {
+    (void)disclosure_->SetConnected(false);
   }
 }
 
@@ -2589,12 +2637,9 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
 
   macos::DisclosureAdmission disclosure(context.worker_generation);
   DisclosureSupervisor disclosure_process;
-  if (!disclosure_process.EnsureVisible(context.worker_generation, 1, 0,
-                                        &disclosure)) {
-    ::close(descriptor);
-    std::cerr << "macos_remote_desktop_worker_disclosure_launch_failed\n";
-    return EX_UNAVAILABLE;
-  }
+  // Do not pre-seed a fictitious viewer. The first accepted PREPARE creates a
+  // route whose Show(1, controllers) call launches the disclosure. With no
+  // route, there is no on-screen panel and the count is truthfully zero.
   DisclosureRoster roster(&disclosure_process, &disclosure,
                           context.worker_generation);
 
@@ -2803,7 +2848,8 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
       std::cerr << "macos_remote_desktop_worker_composition_unavailable\n";
       return nullptr;
     }
-    route->sink->Bind(route->session.get(), route->adapter.get(), emitter);
+    route->sink->Bind(route->session.get(), route->adapter.get(), emitter,
+                      route->disclosure.get());
     route->sink->SetUnlockRequester(send_unlock_request);
     SessionSeamAdapter::ReadinessAttestor readiness_attestor;
     if (session_binding.session_type == macos::kSessionTypeLoginWindow) {
@@ -2949,6 +2995,10 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
       break;
     }
     for (WorkerRoute* route : routes.live()) {
+      // Transport callbacks are the prompt path; this state-driven pass is the
+      // periodic repair path. It makes the local count converge even if a
+      // callback was coalesced around an ICE restart or route teardown.
+      route->sink->ReconcileDisclosure();
       route->sink->ObserveTypedUnlock();
       route->sink->DrainQualityTarget();
     }
@@ -3148,7 +3198,7 @@ int RunLaunchAgentSession(const macos::WorkerLaunchContext& context) {
 
   control.Close();
   routes.StopAll();
-  disclosure_process.Terminate();
+  roster.Reset();
   ::close(descriptor);
   return status;
 }

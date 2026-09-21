@@ -25,6 +25,7 @@ describe('macOS remote-desktop executable entry points', () => {
     components: Record<string, { gnTarget: string; bundleIdentifier: string }>;
   };
   const worker = read('native/macos-remote-desktop/macos_remote_desktop_worker_main.mm');
+  const session = read('native/macos-remote-desktop/macos_remote_desktop_session.mm');
   const onboarding = read('native/macos-remote-desktop/macos_permission_onboarding.mm');
   const onboardingHeader = read('native/macos-remote-desktop/macos_permission_onboarding.h');
   const disclosure = read('native/macos-remote-desktop/macos_remote_desktop_disclosure_main.mm');
@@ -107,11 +108,37 @@ describe('macOS remote-desktop executable entry points', () => {
     // fed it, so route_admissible() stayed false forever.
     expect(worker).toContain('class DisclosureSupervisor');
     expect(worker).toContain('posix_spawn');
-    expect(worker).toContain('disclosure_process.EnsureVisible(context.worker_generation');
+    // A resident worker is not a viewer. The old process bootstrap called
+    // EnsureVisible(..., 1, 0) here, so every idle Mac permanently claimed
+    // "1 viewing". Only a real route may publish counts through the roster.
+    const idleBootstrap = worker.slice(
+      worker.indexOf('macos::DisclosureAdmission disclosure('),
+      worker.indexOf('DisclosureRoster roster('),
+    );
+    expect(idleBootstrap).not.toContain('EnsureVisible(');
+    expect(worker).toContain('supervisor_->EnsureVisible(generation_, viewers, controllers');
+    const beginGenerationAt = worker.indexOf('bool BeginGeneration(std::uint64_t generation)');
+    const beginGeneration = worker.slice(
+      beginGenerationAt,
+      worker.indexOf('rd::common::ReadinessState ProbeReadiness()', beginGenerationAt),
+    );
+    expect(beginGeneration).toContain('supervisor_ != nullptr');
+    expect(beginGeneration).not.toContain('route_admissible()');
+    expect(worker).not.toMatch(/generation == 0 \|\| viewers == 0/);
+    expect(worker).toContain('if (!count.connected)');
+    expect(worker).toContain('route->sink->ReconcileDisclosure();');
+    expect(worker).toContain('roster.Reset();');
     expect(worker).toContain('disclosure_process.Drain(&disclosure)');
     expect(worker).toContain('macos::ParseDisclosureEvent');
-    // Failing to launch disclosure is fatal, not a degraded run.
-    expect(worker).toContain('macos_remote_desktop_worker_disclosure_launch_failed');
+    // A real route still fails closed if its disclosure cannot launch.
+    expect(session).toContain('local remote-desktop disclosure is unavailable');
+    const prepareAdmission = dispatch.slice(
+      dispatch.indexOf('case rd::Signal::Kind::kPrepare:'),
+      dispatch.indexOf('case rd::Signal::Kind::kOffer:'),
+    );
+    expect(prepareAdmission.indexOf('session->Prepare(')).toBeGreaterThanOrEqual(0);
+    expect(prepareAdmission.indexOf('disclosure->route_admissible()'))
+      .toBeGreaterThan(prepareAdmission.indexOf('session->Prepare('));
     expect(worker).toContain('macos_remote_desktop_worker_disclosure_lost');
     expect(worker).toContain('macos_remote_desktop_worker_local_stop');
     // The child inherits no environment.
