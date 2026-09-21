@@ -487,6 +487,28 @@ describe('isUserVisible', () => {
 });
 
 describe('ChatView peer-audit result cards', () => {
+  it('renders selected-locale task objectives verbatim on both audit-result card surfaces', () => {
+    const objective = '修复前端配额显示，并保留完整任务上下文。';
+    const supervisionTask = {
+      version: 1, taskId: 'tsk_zh', assignmentId: 'asg_zh',
+      title: deriveSupervisionTaskTitle(objective), objective,
+    };
+    const peer = makeEvent('peer_audit.result', {
+      outcome: 'pass', auditorLabel: 'CC11', elapsedMs: 500, supervisionTask,
+    }, { eventId: 'peer-zh' });
+    const reply = makeEvent('delegation.reply', {
+      sourceLabel: 'CC11', result: 'PASS', verdict: 'PASS', supervisionTask,
+    }, { eventId: 'reply-zh' });
+    const { container } = render(
+      <ChatView events={[peer, reply]} loading={false} sessionId="session-a" />,
+    );
+
+    expect(container.querySelector('[data-event-id="peer-zh"] .peer-audit-result-objective')?.textContent)
+      .toBe(objective);
+    expect(container.querySelector('[data-event-id="reply-zh"] .delegation-reply-card-objective')?.textContent)
+      .toBe(objective);
+  });
+
   it.each([
     ['live append', true],
     ['history reload', false],

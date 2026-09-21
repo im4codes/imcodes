@@ -22,6 +22,7 @@ import {
   SUPERVISION_TASK_REGISTRY_CONTRACT,
   SUPERVISION_TRUSTED_CONTRACT_DELIVERY,
   TASK_RUN_STATUS_MARKERS,
+  buildSupervisionTaskDisplayLanguageRule,
   classifySupervisionCustomInstructions,
   isAutomaticSupervisionEnabled,
   resolveSupervisionCustomInstructionsDetail,
@@ -562,16 +563,17 @@ export function buildSupervisionTaskFinalizationContract(_locale?: SupervisionUi
   });
 }
 
-export function buildSupervisionTaskRegistryContract(_locale?: SupervisionUiLocale): string {
+export function buildSupervisionTaskRegistryContract(locale?: SupervisionUiLocale): string {
+  const displayLanguageRule = buildSupervisionTaskDisplayLanguageRule(locale);
   return JSON.stringify({
     contractId: SUPERVISION_CONTRACT_IDS.TASK_REGISTRY,
     v: 1,
     bind: ['topLevelTaskId', 'taskId', 'assignmentId'],
     attribution: 'assignmentId',
-    lifecycle: { source: 'daemon', enums: 'tool_schema' },
-    metadata: { fields: ['ownedFiles', 'scopeFiles', 'touchedFiles', 'file_event', 'integrationManifest'], mode: 'record_only', authority: false },
+    lifecycle: 'daemon|tool_schema',
+    metadata: { fields: 'ownedFiles|scopeFiles|touchedFiles|file_event|integrationManifest', mode: 'record_only', authority: false },
     authority: 'actual_worktree+Git_bytes',
-    proseCompletesTask: false,
+    taskText: ['prose!=completion', displayLanguageRule].filter(Boolean).join(';'),
   });
 }
 

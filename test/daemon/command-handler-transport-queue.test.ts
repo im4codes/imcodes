@@ -4622,6 +4622,7 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(preamble).toContain('"contractId":"supervision_orchestrator_context_v1"');
     expect(preamble).toContain('"fabricateOrInfer":false');
     expect(preamble).toContain('"contractId":"task_run_status_v1"');
+    expect(preamble).toContain('"taskText":"prose!=completion;author:objective|title@zh-CN"');
     expect(preamble).toContain('"completion":"registry_intent_only"');
     expect(preamble).not.toContain(RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER);
     expect(preamble).toContain('"waiting":"all_nonterminal"');

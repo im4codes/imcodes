@@ -850,6 +850,24 @@ export const SUPERVISION_TASK_REGISTRY_CONTRACT = {
   },
 } as const;
 
+/**
+ * Compact permanent-preamble rule for free-form task display text.
+ *
+ * The browser-selected locale is already bound to the supervision snapshot.
+ * Filling this one stable template at task start tells the Brain which
+ * language to author in without translating stored history at render time or
+ * adding turn-by-turn prompt churn. Missing locale intentionally emits no rule
+ * so headless/legacy callers keep their raw-text behaviour.
+ */
+export const SUPERVISION_TASK_DISPLAY_LANGUAGE_RULE = 'author:objective|title@{uiLocale}' as const;
+
+export function buildSupervisionTaskDisplayLanguageRule(value: unknown): string | undefined {
+  const locale = normalizeSupervisionUiLocale(value);
+  return locale
+    ? SUPERVISION_TASK_DISPLAY_LANGUAGE_RULE.replace('{uiLocale}', locale)
+    : undefined;
+}
+
 export function isSupervisionTaskClassification(value: unknown): value is SupervisionTaskClassification {
   return typeof value === 'string' && (SUPERVISION_TASK_CLASSIFICATIONS as readonly string[]).includes(value);
 }

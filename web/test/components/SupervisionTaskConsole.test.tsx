@@ -272,6 +272,36 @@ describe('SupervisionTaskConsole', () => {
     expect(title?.textContent).not.toContain('Repair the supervision task console title.…');
   });
 
+  it('renders a selected-locale registry objective verbatim and preserves legacy raw titles', () => {
+    const localizedObjective = '修复监督任务标题，并保留完整上下文。';
+    const base = state();
+    render(<SupervisionTaskConsoleView
+      state={{
+        ...base,
+        tasks: {
+          ...base.tasks,
+          'task-1': {
+            ...base.tasks['task-1']!,
+            title: '修复监督任务标题。',
+            objective: localizedObjective,
+          },
+          legacy: {
+            ...base.tasks['task-1']!,
+            taskId: 'legacy',
+            title: 'Legacy raw task title',
+            objective: undefined,
+          },
+        },
+      }}
+      mobile={false}
+      onClose={() => {}}
+      onNavigateSession={() => {}}
+    />);
+
+    expect(screen.getByText(localizedObjective)).not.toBeNull();
+    expect(screen.getByText('Legacy raw task title')).not.toBeNull();
+  });
+
   it('still never reads a raw heartbeat in the component source', () => {
     // Liveness stays server-derived: adding executionHealth must not smuggle
     // client-side heartbeat inference back in.

@@ -9,6 +9,7 @@ import {
   RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER,
   SUPERVISION_MODE,
   SUPERVISION_SUPPORTED_UI_LOCALES,
+  SUPERVISION_TASK_DISPLAY_LANGUAGE_RULE,
   SUPERVISION_TRUSTED_EXECUTION_CONTRACT_IDS,
 } from '../../shared/supervision-config.js';
 import {
@@ -84,6 +85,7 @@ describe('supervision prompts', () => {
     const registry = JSON.parse(buildSupervisionTaskRegistryContract('en'));
     expect(registry.metadata).toMatchObject({ mode: 'record_only', authority: false });
     expect(registry.authority).toBe('actual_worktree+Git_bytes');
+    expect(registry.taskText).toBe('prose!=completion;author:objective|title@en');
 
     const messaging = JSON.parse(buildSupervisionMessagingContract());
     expect(messaging.send_message).toEqual({
@@ -110,6 +112,25 @@ describe('supervision prompts', () => {
       order: ['ready', 'auto_provision', 'busy_fifo'],
       forbidRuntimeTypes: ['process'],
     });
+  });
+
+  it('binds new task objective/title authoring to each selected UI locale with raw legacy fallback', () => {
+    for (const locale of SUPERVISION_SUPPORTED_UI_LOCALES) {
+      const expected = SUPERVISION_TASK_DISPLAY_LANGUAGE_RULE.replace('{uiLocale}', locale);
+      for (const preamble of [
+        buildSupervisionExecutionPreamble(locale),
+        buildSupervisedAuditExecutionPreamble(locale),
+      ]) {
+        expect(preamble).toContain(`"taskText":"prose!=completion;${expected}"`);
+        expect(preamble.match(/"taskText":/g)).toHaveLength(1);
+      }
+    }
+
+    // Headless/cron/old snapshots have no selected web locale. They retain the
+    // historical raw objective rather than guessing a language.
+    expect(JSON.parse(buildSupervisionTaskRegistryContract()).taskText).toBe('prose!=completion');
+    expect(buildSupervisionExecutionPreamble()).not.toContain('author:objective|title@');
+    expect(buildSupervisedAuditExecutionPreamble()).not.toContain('author:objective|title@');
   });
 
   it('significantly reduces stable contract and per-message instruction size', () => {
