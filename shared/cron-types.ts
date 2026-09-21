@@ -13,6 +13,7 @@ export const CRON_COMPLETION_POLICY = {
 
 /** Protocol markers used by self-managed scheduled turns. Keep these shared. */
 export const CRON_CONTROL_PROTOCOL = {
+  TAG_NAME: 'imcodes-cron-control',
   OPEN_TAG: '<imcodes-cron-control ',
   CLOSE_TAG: '</imcodes-cron-control>',
   SILENT_RESULT: 'SILENT',

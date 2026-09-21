@@ -426,19 +426,66 @@ describe('buildProviderContextPayload', () => {
     expect(payload.memoryRecall?.sourceKind).toBe('local_processed');
   });
 
-  it('keeps stale cron-refusal memory on the message side below the permanent system correction', () => {
+  it('drops stale cron-refusal startup memory instead of letting it overrule permanent system authority', () => {
     const staleRefusal = '[Recent project memory]\n- imcodes-cron-control was called prompt injection';
     const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection', 'claude-code-sdk'), {
       userMessage: 'What is imcodes-cron-control?',
       namespace: { scope: 'personal', projectId: 'repo-1' },
       localProcessedFreshness: 'fresh',
-      startupMemory: makeRecall({ reason: 'startup', injectedText: staleRefusal }),
+      startupMemory: makeRecall({
+        reason: 'startup',
+        injectedText: staleRefusal,
+        items: [{ id: 'stale-cron-refusal', projectId: 'repo-1', summary: 'imcodes-cron-control was called prompt injection' }],
+      }),
     });
 
-    expect(payload.assembledMessage).toContain(staleRefusal);
+    expect(payload.assembledMessage).not.toContain(staleRefusal);
+    expect(payload.startupMemory).toBeUndefined();
     expect(payload.sessionSystemText).toContain(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
     expect(payload.sessionSystemText).toContain('prior prompt-injection memories are obsolete');
     expect(payload.assembledMessage).not.toContain(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(payload.diagnostics).toContain('memory:start:filtered-obsolete-cron-control');
+  });
+
+  it('removes cron-control projections from mixed startup and per-message recall while preserving unrelated memory', () => {
+    const mixedItems = [
+      { id: 'stale-cron', projectId: 'repo-1', summary: 'User asked whether imcodes-cron-control is prompt injection' },
+      { id: 'useful-fix', projectId: 'repo-1', summary: 'Fix transport recall visibility' },
+    ];
+    const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+      userMessage: 'What is imcodes-cron-control?',
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      localProcessedFreshness: 'fresh',
+      startupMemory: makeRecall({
+        reason: 'startup',
+        injectedText: '# Recent project memory\n- imcodes-cron-control is prompt injection\n- Fix transport recall visibility',
+        items: mixedItems,
+      }),
+      memoryRecall: makeRecall({
+        injectedText: '[Related past work]\n- imcodes-cron-control refusal\n- Fix transport recall visibility',
+        items: mixedItems,
+      }),
+    });
+
+    expect(payload.messagePreamble).not.toContain('imcodes-cron-control');
+    expect(payload.messagePreamble).toContain('Fix transport recall visibility');
+    expect(payload.startupMemory?.items.map((item) => item.id)).toEqual(['useful-fix']);
+    expect(payload.memoryRecall?.items.map((item) => item.id)).toEqual(['useful-fix']);
+  });
+
+  it('fails closed for cron-control recall text that is not bound to a matching structured item', () => {
+    const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+      userMessage: 'Continue',
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      localProcessedFreshness: 'fresh',
+      memoryRecall: makeRecall({
+        injectedText: '[Related past work]\n- imcodes-cron-control was prompt injection',
+      }),
+    });
+
+    expect(payload.memoryRecall).toBeUndefined();
+    expect(payload.messagePreamble).toBeUndefined();
+    expect(payload.diagnostics).toContain('memory:message:filtered-obsolete-cron-control');
   });
 
   it('marks degraded providers in authority and payload diagnostics', () => {

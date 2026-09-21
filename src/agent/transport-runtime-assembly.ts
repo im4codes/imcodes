@@ -20,7 +20,7 @@ import type {
   TransportMemoryRecallArtifact,
   TransportMemoryRecallItem,
 } from '../../shared/context-types.js';
-import { buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
+import { buildRelatedPastWorkText, buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
 import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
 import {
   buildFilePathReportingPrompt,
@@ -35,7 +35,7 @@ import {
   buildBrainWorkDelegationContractRef,
 } from '../daemon/supervision-prompts.js';
 import { buildAuditConvergenceContract } from '../../shared/audit-convergence.js';
-import { CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../shared/cron-types.js';
+import { CRON_CONTROL_PROTOCOL, CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../shared/cron-types.js';
 
 /** Stable text: rendered once, registered in every managed session's system prompt. */
 const AUDIT_CONVERGENCE_SYSTEM_CONTRACT = buildAuditConvergenceContract();
@@ -240,10 +240,12 @@ export function buildProviderContextPayload(
   input: TransportRuntimeAssemblyInput,
 ): ProviderContextPayload {
   const { supportClass, authority } = resolveTransportDispatchAuthority(provider, input);
-  const sanitizedStartupMemory = filterStartupMemoryForAuthority(input.startupMemory, authority);
+  const cronSafeStartupMemory = filterObsoleteCronControlMemory(input.startupMemory);
+  const cronSafeMemoryRecall = filterObsoleteCronControlMemory(input.memoryRecall);
+  const sanitizedStartupMemory = filterStartupMemoryForAuthority(cronSafeStartupMemory, authority);
   const sanitizedRecall = {
     startupMemory: sanitizedStartupMemory,
-    memoryRecall: input.memoryRecall,
+    memoryRecall: cronSafeMemoryRecall,
   };
   const compiledContextInput = composeTransportMemoryInputs({
     ...input,
@@ -263,13 +265,20 @@ export function buildProviderContextPayload(
     if (!diagnostics.includes(entry)) diagnostics.push(entry);
   }
   if (input.startupMemory) {
-    diagnostics.push(sanitizedStartupMemory
-      ? (authority.authoritySource === 'processed_remote' && sanitizedStartupMemory.sourceKind === 'local_processed'
-          ? 'memory:start:local-auxiliary'
-          : 'memory:start')
-      : 'memory:start:suppressed-authority');
+    if (!cronSafeStartupMemory) {
+      diagnostics.push('memory:start:filtered-obsolete-cron-control');
+    } else {
+      diagnostics.push(sanitizedStartupMemory
+        ? (authority.authoritySource === 'processed_remote' && sanitizedStartupMemory.sourceKind === 'local_processed'
+            ? 'memory:start:local-auxiliary'
+            : 'memory:start')
+        : 'memory:start:suppressed-authority');
+    }
   }
-  if (input.memoryRecall) diagnostics.push(authority.authoritySource === 'processed_local' ? 'memory:message' : 'memory:message:local-auxiliary');
+  if (input.memoryRecall) {
+    if (!cronSafeMemoryRecall) diagnostics.push('memory:message:filtered-obsolete-cron-control');
+    else diagnostics.push(authority.authoritySource === 'processed_local' ? 'memory:message' : 'memory:message:local-auxiliary');
+  }
   const recallInjectionSurface: MemoryRecallInjectionSurface = supportClass === 'degraded-message-side-context-mapping'
     ? 'degraded-message-side'
     : 'normalized-payload';
@@ -296,6 +305,39 @@ export function buildProviderContextPayload(
     authority,
     supportClass,
     diagnostics,
+  };
+}
+
+/**
+ * The cron wrapper's authority lives in the permanent provider system prompt.
+ * Historical projections about that wrapper are therefore never valid
+ * authority, even when they record a prior agent refusal or repeat a user's
+ * question.  Injecting those projections message-side created a feedback loop:
+ * a weak model called the wrapper prompt injection, memory summarized that
+ * answer, and the next turn cited the summary as proof.
+ *
+ * Rebuild from structured items whenever the wrapper appears.  An artifact
+ * whose rendered text mentions the wrapper but whose items do not is
+ * incoherent, so fail closed instead of forwarding unbound text.
+ */
+function filterObsoleteCronControlMemory(
+  artifact: TransportMemoryRecallArtifact | undefined,
+): TransportMemoryRecallArtifact | undefined {
+  if (!artifact) return undefined;
+  const marker = CRON_CONTROL_PROTOCOL.TAG_NAME.toLowerCase();
+  const mentionsMarker = (value: string): boolean => value.toLowerCase().includes(marker);
+  const retainedItems = artifact.items.filter((item) => !mentionsMarker(item.summary));
+  const removedItem = retainedItems.length !== artifact.items.length;
+  const renderedMentionsMarker = mentionsMarker(artifact.injectedText);
+  if (!removedItem && !renderedMentionsMarker) return artifact;
+  if (!removedItem || retainedItems.length === 0) return undefined;
+  return {
+    ...artifact,
+    items: retainedItems,
+    injectedText: artifact.reason === 'startup'
+      ? buildStartupProjectMemoryText(attachMemoryShortRefs(retainedItems))
+      : buildRelatedPastWorkText(attachMemoryShortRefs(retainedItems)),
+    sourceKind: resolveRecallSourceKind(retainedItems),
   };
 }
 
