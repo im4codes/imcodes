@@ -3560,7 +3560,9 @@
     "team_error_group_has_machines": "このグループにはまだマシンがあります。先に外してください。",
     "team_error_group_owner_required": "グループを削除できるのはオーナーだけです。",
     "team_error_group_name_required": "名前を入力してください。",
-    "team_error_group_name_too_long": "名前が長すぎます。"
+    "team_error_group_name_too_long": "名前が長すぎます。",
+    "remote_access_paused": "リモートアクセス一時停止中",
+    "remote_access_paused_hint": "この端末はローカルで再開されるまで、新しい閲覧と操作をすべて拒否します。"
   },
   "peerAuditQuick": {
     "iconLabel": "ピア監査",

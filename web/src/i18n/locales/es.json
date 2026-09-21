@@ -3561,7 +3561,9 @@
     "team_error_group_has_machines": "Este grupo todavía tiene máquinas. Sácalas primero.",
     "team_error_group_owner_required": "Solo el propietario del grupo puede eliminarlo.",
     "team_error_group_name_required": "Escribe un nombre.",
-    "team_error_group_name_too_long": "Ese nombre es demasiado largo."
+    "team_error_group_name_too_long": "Ese nombre es demasiado largo.",
+    "remote_access_paused": "Acceso remoto en pausa",
+    "remote_access_paused_hint": "Este dispositivo rechaza nuevas conexiones de visualización y control hasta que se reanude localmente."
   },
   "peerAuditQuick": {
     "iconLabel": "Auditoría de pares",

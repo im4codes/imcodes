@@ -3560,7 +3560,9 @@
     "team_error_group_has_machines": "В группе ещё есть машины. Сначала уберите их.",
     "team_error_group_owner_required": "Удалить группу может только владелец.",
     "team_error_group_name_required": "Введите имя.",
-    "team_error_group_name_too_long": "Слишком длинное имя."
+    "team_error_group_name_too_long": "Слишком длинное имя.",
+    "remote_access_paused": "Удалённый доступ приостановлен",
+    "remote_access_paused_hint": "Устройство отклоняет новые подключения просмотра и управления до локального возобновления доступа."
   },
   "peerAuditQuick": {
     "iconLabel": "Пир-аудит",

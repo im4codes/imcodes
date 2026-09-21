@@ -1,11 +1,13 @@
-import { timingSafeEqual } from 'node:crypto';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import {
   REMOTE_DESKTOP_MSG,
   REMOTE_DESKTOP_TERMINAL_REASON,
   validateRemoteDesktopDaemonMessage,
   type RemoteDesktopDaemonMessage,
   type RemoteDesktopPrepare,
+  type RemoteDesktopStatus,
 } from '../../shared/remote-desktop.js';
+import type { RemoteDesktopLocalConnection } from '../../shared/remote-desktop-local-management.js';
 import {
   parseWorkerConsentFrame,
   type WorkerConsentInboundFrame,
@@ -114,6 +116,13 @@ export class RemoteDesktopWorkerHostCore<Metadata> {
   private activeConnectionGeneration = 0;
   private buffer = '';
   private privacyEpochArmed = false;
+  private readonly connected = new Map<string, {
+    publicId: string;
+    label: string;
+    connectedAt: number;
+    status: RemoteDesktopStatus;
+  }>();
+  private nextAnonymousConnection = 0;
 
   constructor(private readonly options: RemoteDesktopWorkerHostCoreOptions<Metadata>) {}
 
@@ -208,6 +217,7 @@ export class RemoteDesktopWorkerHostCore<Metadata> {
     this.clearTrackedTimers(authority);
     authority.capability.fill(0);
     this.tracked.delete(sessionId);
+    this.connected.delete(sessionId);
     this.options.onAuthorityRemoved?.();
   }
 
@@ -224,6 +234,7 @@ export class RemoteDesktopWorkerHostCore<Metadata> {
       authority.capability.fill(0);
     }
     this.tracked.clear();
+    this.connected.clear();
     this.options.onAuthorityRemoved?.();
   }
 
@@ -332,9 +343,53 @@ export class RemoteDesktopWorkerHostCore<Metadata> {
       } else if (!wasPrepareReady && authority.offerPending && authority.offerContext) {
         this.armOfferAnswerTimer(authority, authority.offerContext);
       }
+      if (parsed.value.type === REMOTE_DESKTOP_MSG.STATUS) {
+        this.observeStatus(parsed.value);
+      } else if (parsed.value.type === REMOTE_DESKTOP_MSG.TERMINAL) {
+        this.connected.delete(parsed.value.sessionId);
+      }
       events.push({ kind: 'message', value: parsed.value, authority });
     }
     return { overflow: false, events };
+  }
+
+  /** Real native peer_state=Connected routes only; no PREPARE-derived counts. */
+  activeConnections(): readonly RemoteDesktopLocalConnection[] {
+    return [...this.connected.values()]
+      .sort((left, right) => left.connectedAt - right.connectedAt)
+      .map((entry) => ({
+        id: entry.publicId,
+        label: entry.label,
+        connectedAt: entry.connectedAt,
+        mode: entry.status.mode,
+      }));
+  }
+
+  /** Resolve a random local-panel handle without exposing a route identifier. */
+  sessionIdForLocalConnection(publicId: string): string | null {
+    for (const [sessionId, connection] of this.connected) {
+      if (connection.publicId === publicId) return sessionId;
+    }
+    return null;
+  }
+
+  private observeStatus(status: RemoteDesktopStatus): void {
+    if (status.peerConnected !== true) {
+      this.connected.delete(status.sessionId);
+      return;
+    }
+    const existing = this.connected.get(status.sessionId);
+    if (existing) {
+      existing.status = status;
+      return;
+    }
+    this.nextAnonymousConnection += 1;
+    this.connected.set(status.sessionId, {
+      publicId: randomBytes(18).toString('base64url'),
+      label: `#${this.nextAnonymousConnection}`,
+      connectedAt: Date.now(),
+      status,
+    });
   }
 
   armPrepareReadyTimer(

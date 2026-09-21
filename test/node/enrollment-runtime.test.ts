@@ -39,6 +39,7 @@ import {
 } from '../../shared/remote-desktop.js';
 import { CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY } from '../../shared/controlled-node-service.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from '../../shared/controlled-node-auto-unlock.js';
+import { REMOTE_DESKTOP_LOCAL_MANAGEMENT } from '../../shared/remote-desktop-local-management.js';
 import {
   REMOTE_DESKTOP_ADAPTER_CAPABILITIES,
   REMOTE_DESKTOP_CANONICAL_BRANDING_CAPABILITY,
@@ -114,6 +115,57 @@ afterEach(async () => {
 });
 
 describe('controlled node enrollment and runtime', () => {
+  it('enforces persisted pause before native admission, stops existing routes, and republishes on resume', async () => {
+    const first = new MockSocket();
+    const second = new MockSocket();
+    const sockets = [first, second, new MockSocket()];
+    const remoteDesktopWorker = {
+      available: vi.fn(() => true),
+      adapterCapabilities: vi.fn(() => []),
+      sessionCapabilities: vi.fn(() => [REMOTE_DESKTOP_CAPABILITY]),
+      handle: vi.fn(async () => true),
+      activeConnections: vi.fn(() => []),
+      stopConnection: vi.fn(async () => true),
+      stopAllConnections: vi.fn(async () => {}),
+      close: vi.fn(),
+    };
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example', serverId: 'controlled-1', token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => sockets.shift()!, {
+      remoteDesktopWorker,
+      remoteDesktopAccessPaused: true,
+      now: () => 1_000,
+    });
+    runtime.start();
+    first.open();
+    const firstAuth = JSON.parse(first.sent[0]!);
+    expect(firstAuth.capabilities).toContain(REMOTE_DESKTOP_LOCAL_MANAGEMENT.PAUSED_CAPABILITY);
+    expect(firstAuth.capabilities).not.toContain(REMOTE_DESKTOP_CAPABILITY);
+
+    first.emit('message', JSON.stringify({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId: 'request_pause_12345678', sessionId: 'session_pause_12345678',
+      capability: 'p'.repeat(43), expiresAt: 60_000, leaseExpiresAt: 20_000,
+      daemonGeneration: 7, mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW, inputEpoch: 0,
+      iceServers: [],
+    }));
+    await vi.waitFor(() => expect(first.sent.map(JSON.parse)).toContainEqual(expect.objectContaining({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.CAPABILITY_UNAVAILABLE,
+    })));
+    expect(remoteDesktopWorker.handle).not.toHaveBeenCalled();
+
+    await runtime.setRemoteDesktopAccessPaused(false);
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    second.open();
+    expect(JSON.parse(second.sent[0]!).capabilities).toContain(REMOTE_DESKTOP_CAPABILITY);
+    expect(JSON.parse(second.sent[0]!).capabilities).not.toContain(REMOTE_DESKTOP_LOCAL_MANAGEMENT.PAUSED_CAPABILITY);
+    await runtime.setRemoteDesktopAccessPaused(true);
+    expect(remoteDesktopWorker.stopAllConnections).toHaveBeenCalledOnce();
+    expect(runtime.remoteDesktopAccessStatus().paused).toBe(true);
+    runtime.stop();
+  });
   it('reports one bounded blocker when a staged Windows upgrade never hands off', async () => {
     const socket = new MockSocket();
     let now = 10_000;

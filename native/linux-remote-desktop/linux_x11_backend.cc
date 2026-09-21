@@ -9,6 +9,8 @@
 #include <ctime>
 #include <utility>
 #include <vector>
+#include <unistd.h>
+#include <sys/wait.h>
 
 #include <X11/XKBlib.h>
 #include <X11/Xatom.h>
@@ -1020,8 +1022,22 @@ void X11DisclosureAdapter::RedrawLoop() {
     // this exact window and mask, leaving everything else in the queue for
     // its own owner to find.
     XEvent event;
-    while (XCheckWindowEvent(display, window_, ExposureMask, &event)) {
+    while (XCheckWindowEvent(display, window_, ExposureMask | ButtonPressMask,
+                             &event)) {
       if (event.type == Expose) Draw();
+      if (event.type == ButtonPress && event.xbutton.button == Button1) {
+        const pid_t child = fork();
+        if (child == 0) {
+          const pid_t launcher = fork();
+          if (launcher == 0) {
+            execlp("xdg-open", "xdg-open", common::kLocalManagementUrl,
+                   static_cast<char*>(nullptr));
+            _exit(127);
+          }
+          _exit(launcher < 0 ? 127 : 0);
+        }
+        if (child > 0) waitpid(child, nullptr, 0);
+      }
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
@@ -1058,7 +1074,7 @@ bool X11DisclosureAdapter::Show(std::uint32_t viewers,
                                         // depending on any particular WM's
                                         // cooperation with "always on top".
   attributes.background_pixel = kDisclosureBackground;
-  attributes.event_mask = ExposureMask;
+  attributes.event_mask = ExposureMask | ButtonPressMask;
   window_ = XCreateWindow(
       display, DefaultRootWindow(display), x, y, kDisclosureWidth,
       kDisclosureHeight, 0, CopyFromParent, InputOutput, CopyFromParent,

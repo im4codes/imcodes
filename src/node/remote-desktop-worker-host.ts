@@ -49,6 +49,11 @@ import {
   type RemoteDesktopTrackedAuthority,
 } from './remote-desktop-worker-host-core.js';
 import {
+  activeLocalRemoteDesktopConnections,
+  stopAllLocalRemoteDesktopConnections,
+  stopLocalRemoteDesktopConnection,
+} from './remote-desktop-local-worker-control.js';
+import {
   REMOTE_DESKTOP_WORKER_DIAGNOSTIC_EVENT,
   RemoteDesktopWorkerDiagnostics,
   type RemoteDesktopWorkerDiagnosticEvent,
@@ -562,6 +567,18 @@ export class RemoteDesktopWorkerHost {
       child.once('exit', (code) => resolveExit(code));
     });
     return exitCode === 0;
+  }
+
+  activeConnections() {
+    return activeLocalRemoteDesktopConnections(this.core);
+  }
+
+  async stopConnection(publicId: string): Promise<boolean> {
+    return stopLocalRemoteDesktopConnection(this.core, (command) => this.handle(command), publicId);
+  }
+
+  async stopAllConnections(): Promise<void> {
+    await stopAllLocalRemoteDesktopConnections(this.core, (command) => this.handle(command));
   }
 
   async handle(message: unknown): Promise<boolean> {

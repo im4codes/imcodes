@@ -3,13 +3,19 @@ import {
   REMOTE_DESKTOP_ACCESS_MODE,
   REMOTE_DESKTOP_MODE_REASON,
   REMOTE_DESKTOP_MSG,
+  REMOTE_DESKTOP_STATE,
   REMOTE_DESKTOP_TERMINAL_REASON,
+  type RemoteDesktopDaemonCommand,
   type RemoteDesktopPrepare,
 } from '../../shared/remote-desktop.js';
 import {
   REMOTE_DESKTOP_WORKER_WATCHDOG_STAGE,
   RemoteDesktopWorkerHostCore,
 } from '../../src/node/remote-desktop-worker-host-core.js';
+import {
+  stopAllLocalRemoteDesktopConnections,
+  stopLocalRemoteDesktopConnection,
+} from '../../src/node/remote-desktop-local-worker-control.js';
 
 const requestId = 'request_core_12345678';
 const sessionId = 'session_core_12345678';
@@ -45,6 +51,103 @@ function modeState(overrides: Record<string, unknown> = {}): Record<string, unkn
 }
 
 describe('RemoteDesktopWorkerHostCore', () => {
+  it('projects only real connected peers through opaque local handles and retires them independently', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_700_000_000_000);
+    const core = new RemoteDesktopWorkerHostCore<null>({
+      nonce: 'nonce-core-12345678',
+      onWatchdogTimeout: () => {},
+    });
+    const generation = core.beginConnection();
+    core.track(prepare, null);
+    const secondPrepare = {
+      ...prepare,
+      requestId: 'request_core_second_1234',
+      sessionId: 'session_core_second_1234',
+      capability: 'z'.repeat(43),
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 2,
+    };
+    core.track(secondPrepare, null);
+
+    const status = (value: RemoteDesktopPrepare, peerConnected: boolean) => ({
+      type: REMOTE_DESKTOP_MSG.STATUS,
+      requestId: value.requestId,
+      sessionId: value.sessionId,
+      capability: value.capability,
+      mode: value.mode,
+      inputEpoch: value.inputEpoch,
+      state: REMOTE_DESKTOP_STATE.DIRECT,
+      inputEnabled: value.mode === REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      peerConnected,
+    });
+    core.pushInbound(`${JSON.stringify(status(prepare, false))}\n`, generation);
+    expect(core.activeConnections()).toEqual([]);
+    core.pushInbound(`${JSON.stringify(status(prepare, true))}\n`, generation);
+    vi.advanceTimersByTime(2_000);
+    core.pushInbound(`${JSON.stringify(status(secondPrepare, true))}\n`, generation);
+
+    const connections = core.activeConnections();
+    expect(connections).toEqual([
+      expect.objectContaining({ label: '#1', connectedAt: 1_700_000_000_000, mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW }),
+      expect.objectContaining({ label: '#2', connectedAt: 1_700_000_002_000, mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL }),
+    ]);
+    expect(connections[0]?.id).not.toContain(sessionId);
+    expect(core.sessionIdForLocalConnection(connections[0]!.id)).toBe(sessionId);
+
+    core.untrack(sessionId);
+    expect(core.activeConnections()).toEqual([expect.objectContaining({ label: '#2' })]);
+  });
+
+  it('maps one opaque handle to one STOP and keeps every other connected route alive', async () => {
+    const core = new RemoteDesktopWorkerHostCore<null>({
+      nonce: 'nonce-core-12345678',
+      onWatchdogTimeout: () => {},
+    });
+    const generation = core.beginConnection();
+    const second = {
+      ...prepare,
+      requestId: 'request_core_second_1234',
+      sessionId: 'session_core_second_1234',
+      capability: 'z'.repeat(43),
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 2,
+    };
+    core.track(prepare, null);
+    core.track(second, null);
+    for (const current of [prepare, second]) {
+      core.pushInbound(`${JSON.stringify({
+        type: REMOTE_DESKTOP_MSG.STATUS,
+        requestId: current.requestId,
+        sessionId: current.sessionId,
+        capability: current.capability,
+        mode: current.mode,
+        inputEpoch: current.inputEpoch,
+        state: REMOTE_DESKTOP_STATE.DIRECT,
+        inputEnabled: current.mode === REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+        peerConnected: true,
+      })}\n`, generation);
+    }
+    const [firstConnection] = core.activeConnections();
+    const commands: RemoteDesktopDaemonCommand[] = [];
+    const handle = vi.fn(async (command: RemoteDesktopDaemonCommand) => {
+      commands.push(command);
+      core.untrack(command.sessionId);
+      return true;
+    });
+
+    expect(await stopLocalRemoteDesktopConnection(core, handle, firstConnection!.id)).toBe(true);
+    expect(commands).toEqual([expect.objectContaining({
+      type: REMOTE_DESKTOP_MSG.STOP,
+      sessionId,
+    })]);
+    expect(core.activeConnections()).toEqual([expect.objectContaining({ label: '#2' })]);
+
+    await stopAllLocalRemoteDesktopConnections(core, handle);
+    expect(commands).toHaveLength(2);
+    expect(commands[1]).toEqual(expect.objectContaining({ sessionId: second.sessionId }));
+    expect(core.activeConnections()).toEqual([]);
+  });
   it('reports PREPARE_READY, OFFER_SENT, and ANSWER from authenticated protocol transitions', () => {
     const stages: string[] = [];
     const core = new RemoteDesktopWorkerHostCore<null>({

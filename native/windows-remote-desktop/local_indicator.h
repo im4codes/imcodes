@@ -80,6 +80,7 @@ class LocalIndicator {
   std::atomic<int> viewers_{0};
   std::atomic<int> controllers_{0};
   std::atomic<bool> stopping_{false};
+  std::atomic<bool> confirming_stop_{false};
   std::atomic<bool> stop_requested_{false};
 };
 

@@ -17,6 +17,10 @@ import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from '@shared/controlled-node-
 import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY } from '@shared/remote-desktop-install.js';
 import { REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY } from '@shared/remote-desktop-access.js';
 import {
+  REMOTE_DESKTOP_LOCAL_MANAGEMENT,
+  REMOTE_DESKTOP_LOCAL_WEB_ACTION,
+} from '@shared/remote-desktop-local-management.js';
+import {
   REMOTE_DESKTOP_ENCODER_CAPABILITY,
   REMOTE_DESKTOP_PLATFORM_CAPABILITY,
   REMOTE_DESKTOP_SESSION_CAPABILITY,
@@ -317,6 +321,31 @@ describe('ControlledNodesPanel (12.3)', () => {
     expect(container.querySelector('.controlled-nodes-machine-row.is-online code')?.textContent).toBe(CONTROLLED_NODE_ID_MIN);
     expect(container.querySelector('.controlled-nodes-machine-row.is-offline code')?.textContent).toBe(CONTROLLED_NODE_ID_MIN);
     expect(container.querySelector('.controlled-nodes-exec-toggle.is-enabled')?.getAttribute('aria-pressed')).toBe('true');
+  });
+
+  it('renders the durable paused state and opens the exact device share surface from a local-panel deep link', async () => {
+    machines = [machine({
+      serverId: 'paused-node',
+      nodeId: CONTROLLED_NODE_ID_MIN,
+      displayName: 'Paused Mac',
+      remoteDesktopHostId: 'host-00000000000000000001',
+      capabilities: [REMOTE_DESKTOP_LOCAL_MANAGEMENT.PAUSED_CAPABILITY],
+      accessRole: 'owner',
+    })];
+    const { container } = render(<ControlledNodesPanel
+      initialNodeId={CONTROLLED_NODE_ID_MIN}
+      initialAction={REMOTE_DESKTOP_LOCAL_WEB_ACTION.SHARE}
+    />);
+    await waitFor(() => expect(container.querySelector('.controlled-nodes-remote-access-paused')).toBeTruthy());
+    expect(container.textContent).toContain('controlled_nodes.remote_access_paused');
+    expect(container.querySelector('.controlled-nodes-remote-desktop')).toBeNull();
+    await waitFor(() => expect(listSharesForTarget).toHaveBeenCalledWith(
+      'paused-node',
+      { kind: 'server', serverId: 'paused-node' },
+    ));
+    fireEvent.click(container.querySelectorAll('.share-dialog-tab')[1]!);
+    await waitFor(() => expect(container.querySelector('[data-testid="remote-desktop-owner-access"]')?.textContent)
+      .toBe('host-00000000000000000001:Paused Mac'));
   });
 
   it('labels each node with its reported version and marks only the stale one', async () => {

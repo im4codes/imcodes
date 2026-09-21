@@ -3561,7 +3561,9 @@
     "team_error_group_has_machines": "This group still has machines in it. Take them out first.",
     "team_error_group_owner_required": "Only the group owner can delete it.",
     "team_error_group_name_required": "Enter a name.",
-    "team_error_group_name_too_long": "That name is too long."
+    "team_error_group_name_too_long": "That name is too long.",
+    "remote_access_paused": "Remote access paused",
+    "remote_access_paused_hint": "This device rejects all new viewing and control until remote access is resumed locally."
   },
   "peerAuditQuick": {
     "iconLabel": "Peer audit",

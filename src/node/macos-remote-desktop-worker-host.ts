@@ -68,6 +68,11 @@ import {
   RemoteDesktopWorkerHostCore,
 } from './remote-desktop-worker-host-core.js';
 import {
+  activeLocalRemoteDesktopConnections,
+  stopAllLocalRemoteDesktopConnections,
+  stopLocalRemoteDesktopConnection,
+} from './remote-desktop-local-worker-control.js';
+import {
   assertMacosUserSession,
   type MacosRemoteDesktopGraphicalSessionAuthority,
   type MacosUserSession,
@@ -654,6 +659,18 @@ export class MacosRemoteDesktopWorkerHost {
 
   adapterCapabilities(): readonly RemoteDesktopAdapterCapability[] {
     return this.available() ? this.profile.adapterCapabilities : Object.freeze([]);
+  }
+
+  activeConnections() {
+    return activeLocalRemoteDesktopConnections(this.core);
+  }
+
+  async stopConnection(publicId: string): Promise<boolean> {
+    return stopLocalRemoteDesktopConnection(this.core, (command) => this.handle(command), publicId);
+  }
+
+  async stopAllConnections(): Promise<void> {
+    await stopAllLocalRemoteDesktopConnections(this.core, (command) => this.handle(command));
   }
 
   async handle(message: unknown): Promise<boolean> {

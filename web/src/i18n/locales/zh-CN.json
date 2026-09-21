@@ -3561,7 +3561,9 @@
     "team_error_group_has_machines": "这个分组里还有机器，请先移出。",
     "team_error_group_owner_required": "只有分组所有者能删除它。",
     "team_error_group_name_required": "请输入名称。",
-    "team_error_group_name_too_long": "名称太长了。"
+    "team_error_group_name_too_long": "名称太长了。",
+    "remote_access_paused": "远程访问已暂停",
+    "remote_access_paused_hint": "此设备会拒绝所有新的查看和控制，直到在本机恢复远程访问。"
   },
   "peerAuditQuick": {
     "iconLabel": "对等审计",

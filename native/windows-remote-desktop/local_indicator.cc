@@ -1,10 +1,13 @@
 #include "third_party/imcodes_remote_desktop/local_indicator.h"
+#include "third_party/imcodes_remote_desktop/common/platform_interfaces.h"
 
 #include <algorithm>
 #include <cstring>
 #include <string>
+#include <string_view>
 
 #include <windowsx.h>
+#include <shellapi.h>
 #include <dwmapi.h>
 #include <wtsapi32.h>
 
@@ -260,6 +263,7 @@ bool LocalIndicator::Start(StopAll stop_all,
   stop_all_ = std::move(stop_all);
   environment_changed_ = std::move(environment_changed);
   stopping_ = false;
+  confirming_stop_ = false;
   stop_requested_ = false;
   {
     std::lock_guard lock(start_mutex_);
@@ -358,7 +362,11 @@ LRESULT LocalIndicator::HandleMessage(HWND window, UINT message,
       return 1;
     case WM_LBUTTONUP: {
       if (collapsed_) {
-        SetCollapsed(false, true);
+        const std::string_view url =
+            imcodes::remote_desktop::common::kLocalManagementUrl;
+        const std::wstring wide(url.begin(), url.end());
+        ShellExecuteW(nullptr, L"open", wide.c_str(), nullptr, nullptr,
+                      SW_SHOWNORMAL);
         return 0;
       }
       RECT client{};
@@ -611,6 +619,7 @@ void LocalIndicator::RefreshWindow() {
     SetWindowPos(window, HWND_TOPMOST, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
   } else {
+    confirming_stop_ = false;
     stop_requested_ = false;
     ShowWindow(window, SW_HIDE);
   }
@@ -738,7 +747,9 @@ void LocalIndicator::PaintWindow(HWND window) {
   SelectObject(dc, button_font);
   SetTextColor(dc, palette.stop_text);
   RECT stop_text = stop;
-  DrawTextW(dc, stopping ? L"STOPPING…" : L"STOP ALL REMOTE SESSIONS", -1,
+  DrawTextW(dc, stopping ? L"STOPPING…"
+                         : confirming_stop_.load() ? L"CONFIRM STOP ALL"
+                                                   : L"STOP ALL REMOTE SESSIONS", -1,
             &stop_text,
             DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS |
                 DT_NOPREFIX);
@@ -751,8 +762,14 @@ void LocalIndicator::PaintWindow(HWND window) {
 }
 
 void LocalIndicator::RequestStopAll() {
-  if (stopping_ || stop_requested_.exchange(true)) return;
+  if (stopping_ || stop_requested_) return;
   const HWND window = window_.load();
+  if (!confirming_stop_.exchange(true)) {
+    if (window) InvalidateRect(window, nullptr, FALSE);
+    return;
+  }
+  confirming_stop_ = false;
+  stop_requested_ = true;
   if (window) InvalidateRect(window, nullptr, FALSE);
   if (stop_all_) stop_all_();
 }

@@ -25,6 +25,7 @@ import {
 } from './remote-desktop-platform.js';
 import { CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY } from './controlled-node-service.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from './controlled-node-auto-unlock.js';
+import { REMOTE_DESKTOP_LOCAL_MANAGEMENT } from './remote-desktop-local-management.js';
 
 export const CONTROLLED_NODE_CAPABILITIES = [
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
@@ -41,14 +42,21 @@ export const CONTROLLED_NODE_CAPABILITIES = [
   // signed shell / capture privacy pair stays manageable from another device
   // but must not expose controlled-computer management.
   ...REMOTE_DESKTOP_ADAPTER_CAPABILITIES,
-  ...REMOTE_DESKTOP_SESSION_PROFILE_CAPABILITIES,
+  // `unsupported` is an ingress-generated sentinel, never an advertised
+  // daemon feature. Keep it recognized below without consuming one of the
+  // protocol's 32 bounded advertisement slots.
+  ...REMOTE_DESKTOP_SESSION_PROFILE_CAPABILITIES.filter(
+    (capability) => capability !== REMOTE_DESKTOP_UNSUPPORTED_PROFILE_CAPABILITY,
+  ),
   REMOTE_DESKTOP_DEFAULT_SHIELDED_ROUTE_CAPABILITY,
   REMOTE_DESKTOP_RELAY_CAP_CAPABILITY,
   CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY,
   CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY,
+  REMOTE_DESKTOP_LOCAL_MANAGEMENT.PAUSED_CAPABILITY,
 ] as const;
 
-export type ControlledNodeCapability = typeof CONTROLLED_NODE_CAPABILITIES[number];
+export type ControlledNodeCapability = typeof CONTROLLED_NODE_CAPABILITIES[number]
+  | typeof REMOTE_DESKTOP_UNSUPPORTED_PROFILE_CAPABILITY;
 // Remote-desktop adapters advertise consent, signed shell, capture privacy,
 // input, lock-screen, branding and local disclosure independently. Keep the
 // envelope bounded while leaving room for that explicit feature matrix and
@@ -59,7 +67,8 @@ const CONTROLLED_NODE_CAPABILITY_ADVERTISEMENT_PATTERN = /^[a-z0-9][a-z0-9._-]*$
 
 export function isControlledNodeCapability(value: unknown): value is ControlledNodeCapability {
   return typeof value === 'string'
-    && (CONTROLLED_NODE_CAPABILITIES as readonly string[]).includes(value);
+    && ((CONTROLLED_NODE_CAPABILITIES as readonly string[]).includes(value)
+      || value === REMOTE_DESKTOP_UNSUPPORTED_PROFILE_CAPABILITY);
 }
 
 export type ControlledNodeCapabilitiesValidation =

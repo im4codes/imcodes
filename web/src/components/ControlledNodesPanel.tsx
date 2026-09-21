@@ -23,6 +23,10 @@ import {
   type ControlledNodeOs,
 } from '../api/machines.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from '@shared/controlled-node-auto-unlock.js';
+import {
+  REMOTE_DESKTOP_LOCAL_MANAGEMENT,
+  REMOTE_DESKTOP_LOCAL_WEB_ACTION,
+} from '@shared/remote-desktop-local-management.js';
 import { CONTROLLED_NODE_OS_MAC } from '@shared/controlled-node-artifacts.js';
 import {
   canInstallRemoteDesktopWorker,
@@ -117,6 +121,10 @@ export interface ControlledNodesPanelProps {
   onOpenRemoteDesktop?(machine: MachineListItem): void;
   onOpenRemoteDesktopWall?(): void;
   projectKey?: string;
+  initialNodeId?: string;
+  initialAction?: typeof REMOTE_DESKTOP_LOCAL_WEB_ACTION[
+    keyof typeof REMOTE_DESKTOP_LOCAL_WEB_ACTION
+  ];
 }
 
 const CONTROLLED_NODES_MOBILE_ACTIONS_MAX_WIDTH = 640;
@@ -125,6 +133,8 @@ export function ControlledNodesPanel({
   onOpenRemoteDesktop,
   onOpenRemoteDesktopWall,
   projectKey,
+  initialNodeId,
+  initialAction = REMOTE_DESKTOP_LOCAL_WEB_ACTION.MANAGE,
 }: ControlledNodesPanelProps) {
   const { t, i18n } = useTranslation();
   const { machines, loaded, loading, error, refetch } = useMachines();
@@ -173,6 +183,16 @@ export function ControlledNodesPanel({
   const mobileActionMenuTriggerRef = useRef<HTMLButtonElement | null>(null);
   const mobileActionMenuPanelRef = useRef<HTMLDivElement | null>(null);
   const presenceMountedRef = useRef(true);
+  const consumedInitialActionRef = useRef(false);
+
+  useEffect(() => {
+    if (consumedInitialActionRef.current || !loaded || !initialNodeId) return;
+    consumedInitialActionRef.current = true;
+    setTab('machines');
+    if (initialAction !== REMOTE_DESKTOP_LOCAL_WEB_ACTION.SHARE) return;
+    const machine = machines.find((candidate) => candidate.nodeId === initialNodeId);
+    if (machine && machineAccessRole(machine) === 'owner') setSharingMachine(machine);
+  }, [initialAction, initialNodeId, loaded, machines]);
 
   const sortedTargets = useMemo(() => downloadTargets, [downloadTargets]);
   const availableOses = useMemo(
@@ -881,6 +901,12 @@ export function ControlledNodesPanel({
                       class="controlled-nodes-auto-unlock-badge"
                       title={t('controlled_nodes.auto_unlock_badge_hint')}
                     >{t('controlled_nodes.auto_unlock_badge')}</span>
+                  )}
+                  {m.capabilities?.includes(REMOTE_DESKTOP_LOCAL_MANAGEMENT.PAUSED_CAPABILITY) && (
+                    <span
+                      class="controlled-nodes-remote-access-paused"
+                      title={t('controlled_nodes.remote_access_paused_hint')}
+                    >{t('controlled_nodes.remote_access_paused')}</span>
                   )}
                 </div>
                 <RemoteDesktopReadiness capabilities={m.capabilities} compact />

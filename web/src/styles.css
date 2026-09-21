@@ -14272,3 +14272,15 @@ button.quick-agent-delegation-preset.active {
     flex-direction: column;
   }
 }
+
+.controlled-nodes-remote-access-paused {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid color-mix(in srgb, #f59e0b 55%, var(--border-color));
+  border-radius: 999px;
+  padding: 2px 8px;
+  color: #fbbf24;
+  background: color-mix(in srgb, #f59e0b 12%, transparent);
+  font-size: 11px;
+  font-weight: 700;
+}

@@ -18,12 +18,15 @@
 // macOS machine; linking the worker's libwebrtc world in here would make the
 // app unbuildable without it, for no gain.
 
+#import <AppKit/AppKit.h>
+
 #include <sysexits.h>
 
 #include <cstdlib>
 #include <iostream>
 
 #include "macos_permission_onboarding.h"
+#include "../remote-desktop-common/platform_interfaces.h"
 
 namespace macos = imcodes::remote_desktop::macos;
 
@@ -41,7 +44,10 @@ int main(int argc, char* argv[]) {
       return EX_SOFTWARE;
     }
     // One prompt per permission, from the app the user just launched.
-    return onboarding->RequestRegistration() ? EXIT_SUCCESS : EXIT_FAILURE;
+    const bool registered = onboarding->RequestRegistration();
+    NSURL *url = [NSURL URLWithString:@(imcodes::remote_desktop::common::kLocalManagementUrl)];
+    const bool opened = url != nil && [[NSWorkspace sharedWorkspace] openURL:url];
+    return registered && opened ? EXIT_SUCCESS : EXIT_FAILURE;
   }
 
   if (!macos::IsAiDeskProductMainExecutable()) {

@@ -23,6 +23,11 @@ import {
 } from '../../shared/remote-desktop-access.js';
 import { REMOTE_DESKTOP_LINUX_WORKER_FILENAME } from '../../shared/remote-desktop-worker.js';
 import { RemoteDesktopWorkerHostCore } from './remote-desktop-worker-host-core.js';
+import {
+  activeLocalRemoteDesktopConnections,
+  stopAllLocalRemoteDesktopConnections,
+  stopLocalRemoteDesktopConnection,
+} from './remote-desktop-local-worker-control.js';
 import type { ControlledNodeRemoteDesktopWorker } from './runtime.js';
 import logger from '../util/logger.js';
 import {
@@ -216,6 +221,18 @@ export class LinuxRemoteDesktopWorkerHost implements ControlledNodeRemoteDesktop
   adapterCapabilities(): readonly RemoteDesktopAdapterCapability[] {
     if (!this.available()) return [];
     return [REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY, REMOTE_DESKTOP_INPUT_CAPABILITY];
+  }
+
+  activeConnections() {
+    return activeLocalRemoteDesktopConnections(this.core);
+  }
+
+  async stopConnection(publicId: string): Promise<boolean> {
+    return stopLocalRemoteDesktopConnection(this.core, (command) => this.handle(command), publicId);
+  }
+
+  async stopAllConnections(): Promise<void> {
+    await stopAllLocalRemoteDesktopConnections(this.core, (command) => this.handle(command));
   }
 
   async handle(message: unknown): Promise<boolean> {

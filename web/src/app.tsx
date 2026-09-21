@@ -266,6 +266,10 @@ import { resumeDirectFileTransfers } from './direct-file-transfer.js';
 import { isImeComposingKeyEvent } from './ime-keyboard.js';
 import { markServerDaemonActivity, markServerOffline, touchServerHeartbeat } from './server-online-state.js';
 import { MSG_DAEMON_ONLINE, MSG_DAEMON_OFFLINE } from '@shared/ack-protocol.js';
+import {
+  REMOTE_DESKTOP_LOCAL_MANAGEMENT,
+  REMOTE_DESKTOP_LOCAL_WEB_ACTION,
+} from '@shared/remote-desktop-local-management.js';
 import { markSessionRunningIfNeeded } from './session-state-updates.js';
 import { CapabilityOperationNotice } from './components/CapabilityOperationNotice.js';
 import {
@@ -322,6 +326,17 @@ function appendContentEditableTextPreservingNewlines(element: HTMLElement, suffi
 const nativeCallback = typeof window !== 'undefined'
   ? new URLSearchParams(window.location.search).get('native_callback')
   : null;
+const aideskManagementQuery = typeof window !== 'undefined'
+  ? new URLSearchParams(window.location.search)
+  : null;
+const aideskManagementNodeId = aideskManagementQuery?.get(
+  REMOTE_DESKTOP_LOCAL_MANAGEMENT.WEB_NODE_QUERY,
+) ?? null;
+const aideskManagementAction = aideskManagementQuery?.get(
+  REMOTE_DESKTOP_LOCAL_MANAGEMENT.WEB_ACTION_QUERY,
+) === REMOTE_DESKTOP_LOCAL_WEB_ACTION.SHARE
+  ? REMOTE_DESKTOP_LOCAL_WEB_ACTION.SHARE
+  : REMOTE_DESKTOP_LOCAL_WEB_ACTION.MANAGE;
 
 type ViewMode = TerminalSubscribeViewMode;
 
@@ -2125,7 +2140,7 @@ export function App() {
   const [showCronManager, setShowCronManager] = useState(false);
   const [showAdminPage, setShowAdminPage] = useState(false);
   const [showSharedContextManagement, setShowSharedContextManagement] = useState(false);
-  const [showControlledNodes, setShowControlledNodes] = useState(false);
+  const [showControlledNodes, setShowControlledNodes] = useState(Boolean(aideskManagementNodeId));
   const [remoteDesktopWorkspace, setRemoteDesktopWorkspace] = useState(
     createRemoteDesktopWorkspaceState,
   );
@@ -7279,6 +7294,8 @@ export function App() {
             onOpenRemoteDesktop={openRemoteDesktop}
             onOpenRemoteDesktopWall={openRemoteDesktopWall}
             projectKey={activeSessionInfo?.contextNamespace?.projectId || activeSessionInfo?.project}
+            initialNodeId={aideskManagementNodeId ?? undefined}
+            initialAction={aideskManagementAction}
           />
         </FloatingPanel>
       )}

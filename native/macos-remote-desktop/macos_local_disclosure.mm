@@ -55,6 +55,7 @@ static NSImage *IMCodesIndicatorLogo() {
 
 @interface IMCodesIndicatorView : NSView
 @property(nonatomic) BOOL collapsed;
+@property(nonatomic) BOOL confirmingStop;
 @property(nonatomic) BOOL stopping;
 @property(nonatomic) std::uint32_t viewers;
 @property(nonatomic) std::uint32_t controllers;
@@ -82,6 +83,7 @@ static NSImage *IMCodesIndicatorLogo() {
 - (void)setEventSink:(IMCodesDisclosureEventSink)sink
           generation:(std::uint64_t)generation;
 - (void)stopPressed:(id)sender;
+- (void)openManagement;
 - (void)applyCollapsed:(BOOL)collapsed persist:(BOOL)persist;
 - (void)anchorToCorner;
 - (void)hideWithoutEvent;
@@ -109,6 +111,11 @@ static NSImage *IMCodesIndicatorLogo() {
     sink(imcodes::remote_desktop::macos::MacosDisclosureEvent::kLocalStop,
          _generation);
   }
+}
+
+- (void)openManagement {
+  NSURL *url = [NSURL URLWithString:@(imcodes::remote_desktop::common::kLocalManagementUrl)];
+  if (url != nil) [[NSWorkspace sharedWorkspace] openURL:url];
 }
 
 
@@ -306,6 +313,7 @@ static NSImage *IMCodesIndicatorLogo() {
 
   const NSRect stop = [self stopRect];
   const BOOL stopping = self.stopping;
+  const BOOL confirming = self.confirmingStop;
   [self fillRounded:stop
              radius:24.0
                fill:(stopping ? IMCodesRgb(52, 63, 74) : IMCodesRgb(116, 29, 49))
@@ -320,7 +328,9 @@ static NSImage *IMCodesIndicatorLogo() {
         (stopping ? IMCodesRgb(165, 179, 190) : IMCodesRgb(255, 236, 241)),
     NSParagraphStyleAttributeName : centered,
   };
-  NSString *label = stopping ? @"STOPPING…" : @"STOP ALL REMOTE SESSIONS";
+  NSString *label = stopping ? @"STOPPING…"
+      : confirming ? @"CONFIRM STOP ALL"
+                   : @"STOP ALL REMOTE SESSIONS";
   const CGFloat textHeight = [label sizeWithAttributes:buttonText].height;
   [label drawInRect:NSMakeRect(NSMinX(stop), NSMidY(stop) - textHeight / 2.0,
                                NSWidth(stop), textHeight)
@@ -346,14 +356,20 @@ static NSImage *IMCodesIndicatorLogo() {
     return;
   }
   if (self.collapsed) {
-    [owner applyCollapsed:NO persist:YES];
+    [owner openManagement];
     return;
   }
   const NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
   if (NSPointInRect(point, [self collapseRect])) {
     [owner applyCollapsed:YES persist:YES];
   } else if (NSPointInRect(point, [self stopRect]) && !self.stopping) {
+    if (!self.confirmingStop) {
+      self.confirmingStop = YES;
+      [self setNeedsDisplay:YES];
+      return;
+    }
     self.stopping = YES;
+    self.confirmingStop = NO;
     [self setNeedsDisplay:YES];
     [owner stopPressed:nil];
   }

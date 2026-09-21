@@ -19,6 +19,11 @@ import {
 import { CONTROLLED_NODE_SERVICE } from './installer.js';
 import { defaultStagedExecutablePath, readEnrollmentBlob } from './enrollment.js';
 import {
+  applyRemoteDesktopAccessPaused,
+  loadRemoteDesktopAccessPaused,
+} from './remote-desktop-access-state.js';
+import { startRemoteDesktopLocalPanel } from './remote-desktop-local-panel.js';
+import {
   CONSOLE_HOLD,
   consoleHoldCountdown,
   consoleHoldMode,
@@ -245,6 +250,7 @@ async function main(): Promise<void> {
       },
     })
     : undefined;
+  const remoteDesktopAccessPaused = await loadRemoteDesktopAccessPaused();
   const runtime = createControlledNodeRuntime(bootstrap.credential, undefined, {
     macosRemoteDesktopWorker,
     remoteDesktopSignedShell: signedShellArtifact ? {
@@ -261,9 +267,27 @@ async function main(): Promise<void> {
       process.stderr.write(`imcodes-node: failed to record service_healthy (${message})\n`);
     },
     onHeartbeatAck: healthLease?.recordAuthenticatedHeartbeat,
+    remoteDesktopAccessPaused,
   });
+  const localPanel = bootstrap.credential.nodeId
+    ? await startRemoteDesktopLocalPanel({
+      publicNodeId: bootstrap.credential.nodeId,
+      serverUrl: bootstrap.credential.serverUrl,
+      status: () => runtime.remoteDesktopAccessStatus(),
+      setPaused: (paused) => applyRemoteDesktopAccessPaused(
+        paused,
+        (next) => runtime.setRemoteDesktopAccessPaused(next),
+      ),
+      stopAll: () => runtime.stopAllRemoteDesktopConnections(),
+      disconnect: (publicId) => runtime.stopRemoteDesktopConnection(publicId),
+    }).catch((error) => {
+      logger.warn({ err: error }, 'local remote-desktop management panel unavailable');
+      return null;
+    })
+    : null;
   runtime.start();
   const stop = () => {
+    void localPanel?.close().catch(() => {});
     runtime.stop();
     process.exit(0);
   };

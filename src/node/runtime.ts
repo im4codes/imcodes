@@ -79,6 +79,7 @@ import {
 } from '../../shared/remote-desktop-platform.js';
 import { dispatchRemoteDesktopCommand } from './remote-desktop-dispatch.js';
 import { isRemoteDesktopFeatureEnabled } from '../../shared/remote-desktop-feature.js';
+import { REMOTE_DESKTOP_LOCAL_MANAGEMENT, type RemoteDesktopLocalConnection } from '../../shared/remote-desktop-local-management.js';
 import { CLOCK_SYNC_FIELD, ServerClockEstimator } from '../../shared/clock-sync.js';
 import {
   REMOTE_DESKTOP_CAPTURE_CAPABILITY,
@@ -183,6 +184,9 @@ export interface ControlledNodeRemoteDesktopWorker {
   onPrivacyFrame?(handler: (frame: WorkerPrivacyInboundFrame) => void): () => void;
   supportsDefaultShieldedRoute?(): boolean;
   handle(message: RemoteDesktopDaemonCommand): Promise<boolean>;
+  activeConnections?(): readonly RemoteDesktopLocalConnection[];
+  stopConnection?(publicId: string): Promise<boolean>;
+  stopAllConnections?(): Promise<void>;
   applyAutoUnlockSecret?(secret: string | null): Promise<boolean>;
   /** macOS: whether this host has somewhere to keep a sign-in secret. */
   supportsAutoUnlock?(): boolean;
@@ -203,6 +207,9 @@ class UnavailableRemoteDesktopWorkerHost implements ControlledNodeRemoteDesktopW
   sessionCapabilities(): readonly string[] { return []; }
   adapterCapabilities(): readonly RemoteDesktopAdapterCapability[] { return []; }
   async handle(): Promise<boolean> { return false; }
+  activeConnections(): readonly RemoteDesktopLocalConnection[] { return []; }
+  async stopConnection(): Promise<boolean> { return false; }
+  async stopAllConnections(): Promise<void> {}
   close(): void {}
 }
 
@@ -340,6 +347,15 @@ export interface ControlledNodeRuntimeOptions {
   platform?: NodeJS.Platform;
   arch?: string;
   now?: () => number;
+  /** Persisted before construction; the runtime owns enforcement, not storage. */
+  remoteDesktopAccessPaused?: boolean;
+}
+
+export interface ControlledNodeRuntimeClient extends AuthenticatedWebSocketClient {
+  remoteDesktopAccessStatus(): { paused: boolean; connections: readonly RemoteDesktopLocalConnection[] };
+  setRemoteDesktopAccessPaused(paused: boolean): Promise<void>;
+  stopAllRemoteDesktopConnections(): Promise<void>;
+  stopRemoteDesktopConnection(publicId: string): Promise<boolean>;
 }
 
 const REMOTE_DESKTOP_WORKER_REPAIR_RETRY_MS = 5 * 60_000;
@@ -361,7 +377,7 @@ export function createControlledNodeRuntime(
   credential: ControlledNodeCredential,
   createSocket: AuthenticatedWebSocketFactory = (url) => new WebSocket(url),
   options: ControlledNodeRuntimeOptions = {},
-): AuthenticatedWebSocketClient {
+): ControlledNodeRuntimeClient {
   const worker = new MachineExecWorker();
   const computerUseWorker = new ComputerUseWorker(credential);
   let client!: AuthenticatedWebSocketClient;
@@ -430,6 +446,7 @@ export function createControlledNodeRuntime(
   let workerAdapterCapabilities: readonly RemoteDesktopAdapterCapability[] = [];
   let workerSessionCapabilities: readonly string[] = [];
   let remoteDesktopEnabled = false;
+  let remoteDesktopAccessPaused = options.remoteDesktopAccessPaused === true;
   let remoteDesktopAutoUnlockAvailable = false;
   let defaultShieldedRouteAvailable = false;
   let signedShellAvailable = false;
@@ -1064,14 +1081,17 @@ export function createControlledNodeRuntime(
       MACHINE_DIRECT_FILE_TRANSFER_CAPABILITY,
       MACHINE_DIRECT_FILE_FETCH_CAPABILITY,
       CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY,
-      ...(remoteDesktopEnabled
+      ...(remoteDesktopEnabled && !remoteDesktopAccessPaused
         ? [
           ...workerSessionCapabilities,
           ...(remoteDesktopAutoUnlockAvailable ? [CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY] : []),
           // Workers shipped with this node accept PREPARE's relay ceiling.
           REMOTE_DESKTOP_RELAY_CAP_CAPABILITY,
         ]
-        : permissionRequiredCapabilities),
+        : remoteDesktopAccessPaused ? [] : permissionRequiredCapabilities),
+      ...(remoteDesktopAccessPaused
+        ? [REMOTE_DESKTOP_LOCAL_MANAGEMENT.PAUSED_CAPABILITY]
+        : []),
       ...(missingRemoteDesktopWorkerCanRepair || linuxDesktopInstallable()
         ? [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY]
         : []),
@@ -1456,7 +1476,7 @@ export function createControlledNodeRuntime(
             }
             await dispatchRemoteDesktopCommand({
               message: command,
-              enabled: remoteDesktopEnabled,
+              enabled: remoteDesktopEnabled && !remoteDesktopAccessPaused,
               target: remoteDesktopWorker,
               send: (reply) => {
                 logger.info({
@@ -1637,5 +1657,22 @@ export function createControlledNodeRuntime(
   } else {
     client = new AuthenticatedWebSocketClient(clientOptions);
   }
-  return client;
+  const runtimeClient = client as ControlledNodeRuntimeClient;
+  runtimeClient.remoteDesktopAccessStatus = () => ({
+    paused: remoteDesktopAccessPaused,
+    connections: remoteDesktopWorker.activeConnections?.() ?? [],
+  });
+  runtimeClient.stopAllRemoteDesktopConnections = async () => {
+    await remoteDesktopWorker.stopAllConnections?.();
+  };
+  runtimeClient.stopRemoteDesktopConnection = async (publicId: string) => (
+    await remoteDesktopWorker.stopConnection?.(publicId) ?? false
+  );
+  runtimeClient.setRemoteDesktopAccessPaused = async (paused: boolean) => {
+    if (remoteDesktopAccessPaused === paused) return;
+    remoteDesktopAccessPaused = paused;
+    if (paused) await remoteDesktopWorker.stopAllConnections?.();
+    republishCapabilitiesIfChanged();
+  };
+  return runtimeClient;
 }
