@@ -1859,6 +1859,13 @@
     "download_expired": "Enlace de descarga expirado",
     "download_timeout": "Tiempo de descarga agotado",
     "download_failed": "Descarga fallida",
+    "download_not_found": "El archivo ya no existe o fue eliminado",
+    "download_forbidden": "No tienes permiso para descargar este archivo",
+    "download_too_large": "El archivo supera el límite de descarga",
+    "download_invalid_file": "La ruta no apunta a un archivo descargable",
+    "download_error_with_attempts": "{{message}} — Intentos: {{locations}}",
+    "download_resolved_to": "Resuelto como {{path}}",
+    "download_resolved_multiple": "Resuelto como {{path}} (el más reciente de {{count}} resultados)",
     "daemon_offline": "Daemon desconectado"
   },
   "settings": {

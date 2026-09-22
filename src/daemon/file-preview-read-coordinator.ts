@@ -599,6 +599,7 @@ function createDirectPreviewReadWorkerDependencies(): PreviewReadWorkerDependenc
       staleRead: FS_READ_ERROR_CODES.STALE_READ,
       invalidRequest: FS_READ_ERROR_CODES.INVALID_REQUEST,
       internalError: FS_READ_ERROR_CODES.INTERNAL_ERROR,
+      parentNotFound: FS_READ_ERROR_CODES.PARENT_NOT_FOUND,
     },
     previewReasons: {
       binary: FS_READ_PREVIEW_REASONS.BINARY,

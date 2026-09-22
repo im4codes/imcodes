@@ -613,7 +613,10 @@ describe('ChatView tool payload formatting', () => {
     // The save dialog opens first (it needs the click), so the handle request
     // follows a tick later rather than synchronously.
     await waitFor(() => expect(fsReadFile).toHaveBeenCalledTimes(readsBeforeClick + 1));
-    expect(fsReadFile).toHaveBeenLastCalledWith('C:\\Users\\admin\\screenshot.png');
+    // The daemon now resolves chat-referenced paths itself (candidate roots,
+    // real stat verification), so the client sends the exact bytes the click
+    // target carried instead of pre-resolving them.
+    expect(fsReadFile).toHaveBeenLastCalledWith('C:\\Users\\admin\\screenshot.png', undefined, { chatFileReference: true });
     for (const [handler] of onMessage.mock.calls) {
       handler({
         type: 'fs.read_response',
@@ -668,7 +671,13 @@ describe('ChatView tool payload formatting', () => {
     // The save dialog opens first (it needs the click), so the handle request
     // follows a tick later rather than synchronously.
     await waitFor(() => expect(fsReadFile).toHaveBeenCalledTimes(readsBeforeClick + 1));
-    expect(fsReadFile).toHaveBeenLastCalledWith('/repo/project/ppt/qisi_antidrug/广西缉毒AI嗅觉方案_政企4K.pptx');
+    // The daemon now resolves the relative reference itself against the
+    // session's candidate roots (cwd/worktree/project/home) instead of the
+    // client pre-joining it with `workdir`, so the raw relative bytes are
+    // what's sent -- matching acceptance item 3 (relative-path resolution).
+    expect(fsReadFile).toHaveBeenLastCalledWith(
+      'ppt/qisi_antidrug/广西缉毒AI嗅觉方案_政企4K.pptx', undefined, { chatFileReference: true },
+    );
     for (const [handler] of onMessage.mock.calls) {
       handler({
         type: 'fs.read_response',

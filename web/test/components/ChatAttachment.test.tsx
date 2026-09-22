@@ -223,7 +223,10 @@ describe('ChatView attachment download', () => {
     expect(onPreviewFile.mock.calls[0][0].previewViewMode).not.toBe('html-render');
 
     fireEvent.click(buttons[2]);
-    expect(ws.fsReadFile).toHaveBeenCalledWith('/repo/./page.HTML');
+    // The daemon now resolves chat-referenced paths itself instead of the
+    // client pre-joining them with `workdir`, so the exact attachment
+    // daemonPath is sent as-is.
+    expect(ws.fsReadFile).toHaveBeenCalledWith('./page.HTML', undefined, { chatFileReference: true });
     expect(onPreviewFile).toHaveBeenCalledTimes(1);
     expect(container.querySelector('.html-fullscreen-preview')).toBeNull();
     expect(document.body.querySelector('.html-fullscreen-preview')).not.toBeNull();

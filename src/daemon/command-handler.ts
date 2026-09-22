@@ -29,6 +29,11 @@ import {
 import { TimelinePreferredReadError, timelineStore } from './timeline-store.js';
 import { hasAssistantFileReadGrant } from './session-file-read-grants.js';
 import {
+  resolveChatFileReference,
+  resolveGitWorktreeRoot,
+  type ChatFileReferenceResolutionResult,
+} from './session-file-reference-resolver.js';
+import {
   recordFsWorkerMetric,
   recordTimelineBudgetShape,
   recordTransportListModelsStaleCompletion,
@@ -9110,28 +9115,41 @@ async function resolveRegisteredUploadReadTarget(rawPath: string): Promise<strin
  * not another root: directory listing/search and every write path continue to
  * use the session project root exclusively.
  */
-async function resolveAssistantPublishedReadTarget(sessionName: string, rawPath: string): Promise<string | null> {
+async function resolveAssistantPublishedReadTarget(sessionName: string, rawPath: string): Promise<
+  | { granted: false }
+  | { granted: true; resolution: ChatFileReferenceResolutionResult }
+> {
   let granted = false;
   try {
     granted = await hasAssistantFileReadGrant(sessionName, rawPath, async () => (
-      await timelineStore.readByTypesPreferred(sessionName, ['assistant.text'], { limit: 500 })
+      await timelineStore.readByTypesPreferred(sessionName, ['assistant.text'], { limit: 5_000 })
     ));
   } catch {
     // Projection/history unavailable must fail closed.
-    return null;
+    return { granted: false };
   }
-  if (!granted) return null;
+  if (!granted) return { granted: false };
 
-  const requestedPath = nodePath.resolve(rawPath);
-  try {
-    const linkStats = await fsLstat(requestedPath);
-    if (linkStats.isSymbolicLink() || !linkStats.isFile()) return null;
-    const realTarget = await fsRealpath(requestedPath);
-    if (realTarget !== requestedPath || !isPathAllowed(realTarget)) return null;
-    return realTarget;
-  } catch {
-    return null;
+  const session = getSession(sessionName);
+  if (!session?.projectDir) {
+    return {
+      granted: true,
+      resolution: { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, attemptedLocations: [] },
+    };
   }
+  const projectRoot = listSessions().find((candidate) => (
+    candidate.projectName === session.projectName && candidate.role === 'brain' && !!candidate.projectDir
+  ))?.projectDir ?? session.projectDir;
+  const worktreeRoot = await resolveGitWorktreeRoot(session.projectDir);
+  return {
+    granted: true,
+    resolution: await resolveChatFileReference({
+      reference: rawPath,
+      cwd: session.projectDir,
+      worktreeRoot,
+      projectRoot,
+    }),
+  };
 }
 
 async function resolveFsSessionRoot(cmd: Record<string, unknown>): Promise<
@@ -10014,19 +10032,89 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
     try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, status: 'error', error: sessionRoot.error }); } catch { /* ignore */ }
     return;
   }
+  if (cmd.chatFileReference === true) {
+    // A file that already resolves inside the session's own project root has
+    // always been downloadable without any assistant grant -- this predates
+    // chatFileReference and must not regress. ChatView marks EVERY download
+    // and preview click chatFileReference:true now, including clicks on
+    // paths that its own tool.call/tool.result renderer (splitPathsAndUrls)
+    // extracted; those never mint a grant by design (session-file-read-grants
+    // only ingests assistant.text), so without this check an in-project file
+    // mentioned only in tool output, or a plain path a user pasted, would be
+    // wrongly refused with forbidden_path where it used to just work.
+    if (sessionRoot.realRoot) {
+      const inProject = await resolveExistingFsMutationTarget(rawPath, sessionRoot.realRoot);
+      if (inProject.ok) {
+        getDefaultPreviewReadCoordinator().handle(inProject.real, requestId, (message) => serverLink.send({
+          ...message,
+          path: rawPath,
+          resolvedPath: inProject.real,
+          resolutionMatchCount: 1,
+        }));
+        return;
+      }
+    }
+    const sessionName = typeof cmd.sessionName === 'string'
+      ? cmd.sessionName
+      : typeof cmd.session === 'string'
+        ? cmd.session
+        : '';
+    if (!sessionName) {
+      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
+      return;
+    }
+    const registeredUpload = await resolveRegisteredUploadReadTarget(rawPath);
+    if (registeredUpload) {
+      getDefaultPreviewReadCoordinator().handle(registeredUpload, requestId, (message) => serverLink.send({
+        ...message,
+        path: rawPath,
+        resolvedPath: registeredUpload,
+        resolutionMatchCount: 1,
+      }));
+      return;
+    }
+    const published = await resolveAssistantPublishedReadTarget(sessionName, rawPath);
+    if (!published.granted) {
+      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
+      return;
+    }
+    if (!published.resolution.ok) {
+      try {
+        serverLink.send({
+          type: 'fs.read_response',
+          requestId,
+          path: rawPath,
+          status: 'error',
+          error: published.resolution.error,
+          attemptedLocations: published.resolution.attemptedLocations,
+        });
+      } catch { /* ignore */ }
+      return;
+    }
+    const { realPath, attemptedLocations, matchCount } = published.resolution;
+    getDefaultPreviewReadCoordinator().handle(realPath, requestId, (message) => serverLink.send({
+      ...message,
+      path: rawPath,
+      resolvedPath: realPath,
+      attemptedLocations,
+      resolutionMatchCount: matchCount,
+    }));
+    return;
+  }
   if (sessionRoot.realRoot) {
     const target = await resolveExistingFsMutationTarget(rawPath, sessionRoot.realRoot);
     if (!target.ok) {
       const registeredUpload = target.error === FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH
         ? await resolveRegisteredUploadReadTarget(rawPath)
         : null;
-      const assistantPublished = !registeredUpload && target.error === FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH
+      const legacyPublished = !registeredUpload && target.error === FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH
         ? await resolveAssistantPublishedReadTarget(
           typeof cmd.sessionName === 'string' ? cmd.sessionName : typeof cmd.session === 'string' ? cmd.session : '',
           rawPath,
         )
         : null;
-      const exactReadTarget = registeredUpload ?? assistantPublished;
+      const exactReadTarget = registeredUpload
+        ?? (legacyPublished?.granted && legacyPublished.resolution.ok ? legacyPublished.resolution.realPath : null);
       if (exactReadTarget) {
         getDefaultPreviewReadCoordinator().handle(exactReadTarget, requestId, (message) => serverLink.send(message));
         return;

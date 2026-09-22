@@ -25,6 +25,7 @@ function deps(overrides: Partial<PreviewReadWorkerDependencies> = {}): PreviewRe
       staleRead: FS_READ_ERROR_CODES.STALE_READ,
       invalidRequest: FS_READ_ERROR_CODES.INVALID_REQUEST,
       internalError: FS_READ_ERROR_CODES.INTERNAL_ERROR,
+      parentNotFound: FS_READ_ERROR_CODES.PARENT_NOT_FOUND,
       isDirectory: FS_READ_ERROR_CODES.IS_DIRECTORY,
     },
     previewReasons: {
@@ -203,5 +204,20 @@ describe('file preview read worker', () => {
       sanitized: true,
     });
     expect(JSON.stringify(result)).not.toContain('/home/user/project');
+  });
+
+  it('returns a stable missing-file reason without exposing the host path', async () => {
+    const request: PreviewReadWorkerRequest = { ...identity, phase: 'preflight', rawPath: 'cleaned.pdf' };
+    const missing = Object.assign(new Error('/home/user/.work/cleaned.pdf does not exist'), { code: 'ENOENT' });
+    const result = await handlePreviewReadWorkerRequest(request, deps({
+      resolveCanonicalStrict: vi.fn(async () => { throw missing; }),
+    }));
+
+    expect(result).toMatchObject({
+      kind: 'error',
+      error: FS_READ_ERROR_CODES.PARENT_NOT_FOUND,
+      sanitized: true,
+    });
+    expect(JSON.stringify(result)).not.toContain('/home/user');
   });
 });

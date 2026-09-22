@@ -19,6 +19,7 @@ import {
   type CronRunTimelineProjection,
 } from '@shared/cron-types.js';
 import { localizeDaemonUserNoticeEvent } from '../daemon-user-notice-i18n.js';
+import { localizeChatDownloadError } from '../chat-download-error.js';
 /**
  * ChatView — renders TimelineEvent[] as a chat-style view.
  * Merges consecutive streaming assistant.text events into single blocks.
@@ -2239,26 +2240,25 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   }, [t]);
 
   const handleHtmlPreview = useCallback((path: string) => {
-    const resolvedPath = resolvePreviewPath(path, workdir);
     if (!ws || typeof ws.fsReadFile !== 'function') {
       setHtmlFullscreenPreview({
         status: 'error',
-        path: resolvedPath,
+        path,
         error: t('file_browser.preview_error'),
       });
       return;
     }
     try {
-      const requestId = fileScopeSessionName ? ws.fsReadFile(resolvedPath, fileScopeSessionName) : ws.fsReadFile(resolvedPath);
-      setHtmlFullscreenPreview({ status: 'loading', path: resolvedPath, requestId });
+      const requestId = ws.fsReadFile(path, fileScopeSessionName, { chatFileReference: true });
+      setHtmlFullscreenPreview({ status: 'loading', path, requestId });
     } catch (err) {
       setHtmlFullscreenPreview({
         status: 'error',
-        path: resolvedPath,
+        path,
         error: mapPreviewDispatchError(err),
       });
     }
-  }, [fileScopeSessionName, mapPreviewDispatchError, t, workdir, ws]);
+  }, [fileScopeSessionName, mapPreviewDispatchError, t, ws]);
 
   const closeHtmlFullscreenPreview = useCallback(() => {
     setHtmlFullscreenPreview(null);
@@ -2276,7 +2276,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
             : t('file_browser.preview_error', 'Preview unavailable');
           return { status: 'error', path: current.path, error };
         }
-        const next = { status: 'ok' as const, path: current.path, content: msg.content ?? '' };
+        const next = { status: 'ok' as const, path: msg.resolvedPath ?? current.path, content: msg.content ?? '' };
         return openHtmlPreviewInNewWindow(next) ? null : next;
       });
     });
@@ -2286,15 +2286,15 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     setPendingUrl(url);
   }, []);
 
-  const mapDownloadError = useCallback((err: unknown): string => {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (msg.includes('daemon_offline') || msg.includes('503')) return t('upload.daemon_offline');
-    if (msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404')) return t('upload.download_expired');
-    if (msg.includes('504') || msg.includes('timeout')) return t('upload.download_timeout');
-    return t('upload.download_failed');
-  }, [t]);
+  const mapDownloadError = useCallback((err: unknown, pathRequest = false): string => (
+    localizeChatDownloadError(err, t, { pathRequest })
+  ), [t]);
 
-  const requestPathDownloadId = useCallback((path: string): Promise<string> => (
+  const requestPathDownloadId = useCallback((path: string): Promise<{
+    downloadId: string;
+    resolvedPath: string;
+    matchCount: number;
+  }> => (
     new Promise((resolve, reject) => {
       if (!ws) {
         reject(new Error(t('upload.daemon_offline')));
@@ -2307,7 +2307,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
         unsub?.();
       };
       try {
-        const reqId = fileScopeSessionName ? ws.fsReadFile(path, fileScopeSessionName) : ws.fsReadFile(path);
+        const reqId = ws.fsReadFile(path, fileScopeSessionName, { chatFileReference: true });
         timer = setTimeout(() => {
           cleanup();
           reject(new Error(t('upload.download_timeout')));
@@ -2316,18 +2316,25 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
           if (msg.type !== 'fs.read_response' || msg.requestId !== reqId) return;
           cleanup();
           if (typeof msg.downloadId === 'string' && msg.downloadId.trim()) {
-            resolve(msg.downloadId);
+            resolve({
+              downloadId: msg.downloadId,
+              resolvedPath: typeof msg.resolvedPath === 'string' ? msg.resolvedPath : path,
+              matchCount: typeof msg.resolutionMatchCount === 'number' ? msg.resolutionMatchCount : 1,
+            });
             return;
           }
           if (msg.status === 'error') {
-            reject(new Error(mapDownloadError(new Error(String(msg.error ?? 'download_failed')))));
+            const cause = Object.assign(new Error(String(msg.error ?? 'download_failed')), {
+              attemptedLocations: msg.attemptedLocations,
+            });
+            reject(new Error(mapDownloadError(cause, true)));
             return;
           }
           reject(new Error(t('upload.download_failed')));
         });
       } catch (err) {
         cleanup();
-        reject(new Error(mapDownloadError(err)));
+        reject(new Error(mapDownloadError(err, true)));
       }
     })
   ), [fileScopeSessionName, mapDownloadError, t, ws]);
@@ -2342,12 +2349,12 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     if (!ws || typeof ws.fsReadFile !== 'function' || typeof ws.onMessage !== 'function') {
       return Promise.reject(new Error(t('file_browser.preview_error')));
     }
-    const resolvedPath = resolvePreviewPath(path, workdir);
     const cacheScope = serverId ? `server:${serverId}` : `session:${sessionId ?? 'unknown'}`;
-    const cacheKey = `${cacheScope}\0${resolvedPath}`;
-    return getCachedChatLocalImagePreview(cacheKey, () => loadFsLocalImagePreview(ws, resolvedPath, {
+    const cacheKey = `${cacheScope}\0${path}`;
+    return getCachedChatLocalImagePreview(cacheKey, () => loadFsLocalImagePreview(ws, path, {
       sessionName: fileScopeSessionName,
       serverId: serverId ?? undefined,
+      chatFileReference: true,
       timeoutMs: 30_000,
       errorMessage: t('file_browser.preview_error'),
       timeoutMessage: t('upload.download_timeout'),
@@ -2357,12 +2364,11 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       // fresh handle instead of replaying a dead URL.
       onLoadFailed: () => invalidateChatLocalImagePreview(cacheKey),
     })));
-  }, [fileScopeSessionName, serverId, sessionId, t, workdir, ws]);
+  }, [fileScopeSessionName, serverId, sessionId, t, ws]);
 
   const handleDownload = useCallback<ChatPathDownloadHandler>(async (path: string) => {
     if (!serverId || !ws) throw new Error(t('upload.daemon_offline'));
-    const resolvedPath = resolvePreviewPath(path, workdir);
-    const fileName = resolvedPath.split(/[/\\]/).pop() || undefined;
+    const fileName = path.replace(/:\d+(?::\d+)?$/, '').split(/[/\\]/).pop() || undefined;
     // The save dialog must open first, inside the click that asked for it; any
     // await in front of it lets the browser refuse the picker. Choosing where
     // the file goes is also what lets the finished row offer "Show in folder"
@@ -2375,7 +2381,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       throw new Error(t('upload.download_failed'));
     }
     const { downloadAttachment } = await import('../api.js');
-    const transfer = beginDownloadTransfer(fileName ?? resolvedPath);
+    const transfer = beginDownloadTransfer(fileName ?? path);
     const attempt = async (downloadId: string) => {
       const wiring = createDownloadTransferWiring(transfer.id);
       await downloadPreviewWithDirectFallback({
@@ -2400,7 +2406,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     const alreadyMapped = new WeakSet<object>();
     const requestDownloadId = async () => {
       try {
-        return await requestPathDownloadId(resolvedPath);
+        return await requestPathDownloadId(path);
       } catch (err) {
         const error = err instanceof Error ? err : new Error(String(err));
         alreadyMapped.add(error);
@@ -2414,12 +2420,30 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     };
     try {
       try {
-        await attempt(await requestDownloadId());
+        const first = await requestDownloadId();
+        await attempt(first.downloadId);
+        if (first.matchCount > 1) {
+          return t('upload.download_resolved_multiple', {
+            path: first.resolvedPath,
+            count: first.matchCount,
+          });
+        }
+        if (first.resolvedPath !== path) {
+          return t('upload.download_resolved_to', { path: first.resolvedPath });
+        }
       } catch (err) {
         // A preview handle can expire between the request and the transfer:
         // fetch a fresh one once, keeping the same chosen destination.
         if (!isStaleHandle(err) || transfer.signal.aborted) throw err;
-        await attempt(await requestDownloadId());
+        const retry = await requestDownloadId();
+        await attempt(retry.downloadId);
+        if (retry.matchCount > 1) {
+          return t('upload.download_resolved_multiple', {
+            path: retry.resolvedPath,
+            count: retry.matchCount,
+          });
+        }
+        if (retry.resolvedPath !== path) return t('upload.download_resolved_to', { path: retry.resolvedPath });
       }
     } catch (err) {
       const canceled = isFileUploadCanceled(err) || transfer.signal.aborted;
@@ -2428,7 +2452,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       if (err instanceof Error && alreadyMapped.has(err)) throw err;
       throw new Error(mapDownloadError(err));
     }
-  }, [fileScopeSessionName, mapDownloadError, requestPathDownloadId, serverId, sessionId, t, workdir, ws]);
+  }, [fileScopeSessionName, mapDownloadError, requestPathDownloadId, serverId, sessionId, t, ws]);
 
   const pathClickHandler = ws && !preview ? handlePathClick : undefined;
   const htmlPreviewHandler = ws && typeof ws.fsReadFile === 'function' && !preview ? handleHtmlPreview : undefined;

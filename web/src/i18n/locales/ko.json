@@ -1858,6 +1858,13 @@
     "download_expired": "다운로드 링크 만료",
     "download_timeout": "다운로드 시간 초과",
     "download_failed": "다운로드 실패",
+    "download_not_found": "파일이 더 이상 존재하지 않거나 정리되었습니다",
+    "download_forbidden": "이 파일을 다운로드할 권한이 없습니다",
+    "download_too_large": "파일이 다운로드 크기 제한을 초과했습니다",
+    "download_invalid_file": "경로가 다운로드 가능한 파일을 가리키지 않습니다",
+    "download_error_with_attempts": "{{message}} — 시도한 위치: {{locations}}",
+    "download_resolved_to": "{{path}}(으)로 확인됨",
+    "download_resolved_multiple": "{{path}}(으)로 확인됨 ({{count}}개 중 최신)",
     "daemon_offline": "데몬 오프라인"
   },
   "settings": {

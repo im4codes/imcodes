@@ -1711,9 +1711,15 @@ export class WsClient {
   }
 
   /** Request a file's content from the daemon. Returns the requestId for matching the response. */
-  fsReadFile(path: string, sessionName?: string): string {
+  fsReadFile(path: string, sessionName?: string, options?: { chatFileReference?: boolean }): string {
     const requestId = crypto.randomUUID();
-    this.send({ type: 'fs.read', path, requestId, ...(sessionName ? { sessionName } : {}) });
+    this.send({
+      type: 'fs.read',
+      path,
+      requestId,
+      ...(sessionName ? { sessionName } : {}),
+      ...(options?.chatFileReference ? { chatFileReference: true } : {}),
+    });
     return requestId;
   }
 

@@ -14,6 +14,8 @@ export interface LoadFsLocalImagePreviewOptions {
    * so the URL has to be built against the pod holding that daemon.
    */
   serverId?: string;
+  /** Resolve an assistant-authored reference daemon-side before reading. */
+  chatFileReference?: boolean;
   /** Injectable for tests; defaults to the authenticated attachment URL builder. */
   buildDownloadUrl?: (serverId: string, downloadId: string, sessionName?: string) => Promise<string>;
 }
@@ -83,7 +85,11 @@ export function loadFsLocalImagePreview(
     }, options.timeoutMs ?? 22_000);
 
     try {
-      requestId = options.sessionName ? ws.fsReadFile(path, options.sessionName) : ws.fsReadFile(path);
+      requestId = options.chatFileReference
+        ? ws.fsReadFile(path, options.sessionName, { chatFileReference: true })
+        : options.sessionName
+          ? ws.fsReadFile(path, options.sessionName)
+          : ws.fsReadFile(path);
     } catch (error) {
       finish(() => reject(error instanceof Error ? error : new Error(String(error))));
     }

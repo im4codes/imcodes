@@ -1858,6 +1858,13 @@
     "download_expired": "Ссылка на скачивание истекла",
     "download_timeout": "Время загрузки истекло",
     "download_failed": "Ошибка загрузки",
+    "download_not_found": "Файл больше не существует или был удалён",
+    "download_forbidden": "Нет разрешения на скачивание этого файла",
+    "download_too_large": "Файл превышает допустимый размер скачивания",
+    "download_invalid_file": "Путь не указывает на доступный для скачивания файл",
+    "download_error_with_attempts": "{{message}} — Проверено: {{locations}}",
+    "download_resolved_to": "Разрешено в {{path}}",
+    "download_resolved_multiple": "Разрешено в {{path}} (самый новый из {{count}} совпадений)",
     "daemon_offline": "Демон недоступен"
   },
   "settings": {

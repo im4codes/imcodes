@@ -21,6 +21,7 @@ export interface PreviewReadWorkerErrorCodes {
   staleRead: FsReadErrorCode;
   invalidRequest: FsReadErrorCode;
   internalError: FsReadErrorCode;
+  parentNotFound: FsReadErrorCode;
   /** Optional: code returned when the path is a directory. Falls back to
    *  internalError when a caller (e.g. an older test deps) doesn't supply it. */
   isDirectory?: FsReadErrorCode;
@@ -261,7 +262,13 @@ export async function handlePreviewReadWorkerRequest(
       case 'snapshot':
         return await handleSnapshot(message, deps);
     }
-  } catch {
+  } catch (error) {
+    const code = error && typeof error === 'object' && 'code' in error
+      ? String((error as { code?: unknown }).code)
+      : '';
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      return workerError(message, deps.errorCodes.parentNotFound);
+    }
     return workerError(message, deps.errorCodes.internalError);
   }
 }
@@ -323,6 +330,7 @@ export async function createDefaultPreviewReadWorkerDependencies(): Promise<Prev
       staleRead: pickString(errorContainer, ['STALE_READ', 'staleRead']) as FsReadErrorCode,
       invalidRequest: pickString(errorContainer, ['INVALID_REQUEST', 'invalidRequest']) as FsReadErrorCode,
       internalError: pickString(errorContainer, ['INTERNAL_ERROR', 'internalError']) as FsReadErrorCode,
+      parentNotFound: pickString(errorContainer, ['PARENT_NOT_FOUND', 'parentNotFound']) as FsReadErrorCode,
       isDirectory: pickString(errorContainer, ['IS_DIRECTORY', 'isDirectory']) as FsReadErrorCode,
     },
     previewReasons: {

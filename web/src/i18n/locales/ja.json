@@ -1858,6 +1858,13 @@
     "download_expired": "ダウンロードリンクの期限切れ",
     "download_timeout": "ダウンロードがタイムアウトしました",
     "download_failed": "ダウンロードに失敗しました",
+    "download_not_found": "ファイルは存在しないか、既に削除されています",
+    "download_forbidden": "このファイルをダウンロードする権限がありません",
+    "download_too_large": "ファイルがダウンロードサイズ上限を超えています",
+    "download_invalid_file": "パスがダウンロード可能なファイルを示していません",
+    "download_error_with_attempts": "{{message}} — 試行した場所: {{locations}}",
+    "download_resolved_to": "{{path}} に解決しました",
+    "download_resolved_multiple": "{{path}} に解決しました（{{count}} 件のうち最新）",
     "daemon_offline": "デーモンがオフラインです"
   },
   "settings": {

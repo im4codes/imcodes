@@ -72,6 +72,10 @@ export interface FsReadResponse extends FsBaseResponse {
   mtime?: number;
   /** File size in bytes when the daemon returns stream/download metadata. */
   size?: number;
+  /** Redacted daemon-side candidate labels for a chat file reference. */
+  attemptedLocations?: string[];
+  /** Number of bounded filename-search matches; newest mtime is selected. */
+  resolutionMatchCount?: number;
 }
 
 export interface FsWriteRequest {

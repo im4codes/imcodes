@@ -1,4 +1,8 @@
-import * as path from 'node:path';
+import {
+  chatPathHasFileExtension,
+  extractChatFileReferences,
+  normalizeChatFileReference,
+} from '../../shared/chat-local-path.js';
 import type { TimelineEvent } from './timeline-event.js';
 
 type GrantLoader = () => Promise<TimelineEvent[]>;
@@ -7,30 +11,21 @@ const grantsBySession = new Map<string, Set<string>>();
 const loadedSessions = new Set<string>();
 const loadInflight = new Map<string, Promise<void>>();
 
-// ChatMarkdown turns inline-code local paths and standalone path lines into
-// file-preview actions. Keep daemon authorization aligned with that trusted
-// presentation contract: an assistant-authored path grants one exact read
-// only when it is backtick-delimited or occupies a whole line. Plain user
-// text, incidental paths embedded in prose, tool arguments/results, prefixes,
-// and parent directories never grant access.
-const INLINE_CODE_RE = /`([^`\r\n]+)`/g;
-
-function normalizedAbsolutePath(value: string): string | null {
-  const trimmed = value.trim();
-  if (!trimmed || !path.isAbsolute(trimmed)) return null;
-  return path.normalize(trimmed);
+// ChatMarkdown turns file_output_v1 Markdown destinations, inline-code local
+// paths, and standalone path lines into file-preview actions. Keep daemon
+// authorization aligned with that trusted presentation contract: an
+// assistant-authored path grants one exact read only in one of those explicit
+// forms. Only assistant.text is ingested; user/tool text, rejected remote/UNC
+// links, extensionless prefixes, and parent directories never grant access.
+function normalizedGrantReference(value: string): string | null {
+  const normalized = normalizeChatFileReference(value);
+  return normalized && chatPathHasFileExtension(normalized) ? normalized : null;
 }
 
 export function extractAssistantFileReadGrants(text: string): string[] {
   const paths = new Set<string>();
-  INLINE_CODE_RE.lastIndex = 0;
-  let match: RegExpExecArray | null;
-  while ((match = INLINE_CODE_RE.exec(text)) !== null) {
-    const normalized = normalizedAbsolutePath(match[1] ?? '');
-    if (normalized) paths.add(normalized);
-  }
-  for (const line of text.split(/\r?\n/)) {
-    const normalized = normalizedAbsolutePath(line);
+  for (const reference of extractChatFileReferences(text)) {
+    const normalized = normalizedGrantReference(reference);
     if (normalized) paths.add(normalized);
   }
   return [...paths];
@@ -77,7 +72,7 @@ export async function hasAssistantFileReadGrant(
   loader: GrantLoader,
 ): Promise<boolean> {
   await ensureLoaded(sessionName, loader);
-  const normalized = normalizedAbsolutePath(candidatePath);
+  const normalized = normalizedGrantReference(candidatePath);
   return !!normalized && grantsBySession.get(sessionName)?.has(normalized) === true;
 }
 

@@ -1859,6 +1859,13 @@
     "download_expired": "下载链接已过期",
     "download_timeout": "下载超时",
     "download_failed": "下载失败",
+    "download_not_found": "文件已不存在或已被清理",
+    "download_forbidden": "没有权限下载此文件",
+    "download_too_large": "文件超过下载大小限制",
+    "download_invalid_file": "该路径不是可下载的文件",
+    "download_error_with_attempts": "{{message}} — 已尝试：{{locations}}",
+    "download_resolved_to": "已解析到 {{path}}",
+    "download_resolved_multiple": "已解析到 {{path}}（{{count}} 个匹配中选择最新文件）",
     "daemon_offline": "守护进程离线"
   },
   "settings": {

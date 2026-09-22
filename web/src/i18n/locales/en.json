@@ -1859,6 +1859,13 @@
     "download_expired": "Download link expired",
     "download_timeout": "Download timed out",
     "download_failed": "Download failed",
+    "download_not_found": "File no longer exists or was cleaned up",
+    "download_forbidden": "You do not have permission to download this file",
+    "download_too_large": "File exceeds the download size limit",
+    "download_invalid_file": "Path does not point to a downloadable file",
+    "download_error_with_attempts": "{{message}} — Tried: {{locations}}",
+    "download_resolved_to": "Resolved to {{path}}",
+    "download_resolved_multiple": "Resolved to {{path}} (newest of {{count}} matches)",
     "daemon_offline": "Daemon is offline"
   },
   "settings": {

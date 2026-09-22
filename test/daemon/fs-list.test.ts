@@ -306,6 +306,119 @@ describe('fs.ls handler', () => {
     );
   });
 
+  it('previews one exact out-of-project file published as a hidden-path Markdown link', async () => {
+    const projectDir = path.join(homedir(), 'project');
+    const publishedFile = path.join(homedir(), '交付包', '企享云外贸财税申报管理系统_代码.pdf');
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({ name: 'deck_project_brain', projectDir } as never);
+    vi.spyOn(timelineStore, 'readByTypesPreferred').mockResolvedValue([{
+      eventId: 'assistant-markdown-file-path',
+      sessionId: 'deck_project_brain',
+      ts: Date.now(),
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: `[企享云外贸财税申报管理系统_代码.pdf](${publishedFile})` },
+    }] as never);
+    vi.mocked(fsp.lstat).mockResolvedValue({ isSymbolicLink: () => false, isFile: () => true } as fsp.Stats);
+    mockRealpath.mockImplementation(async (target) => String(target));
+
+    handleWebCommand({
+      type: 'fs.read',
+      path: publishedFile,
+      requestId: 'read-assistant-markdown-file',
+      sessionName: 'deck_project_brain',
+    }, mockServerLink as any);
+    await flushAsync();
+
+    expect(sent).toEqual([]);
+    expect(mockPreviewCoordinator.handle).toHaveBeenCalledWith(
+      publishedFile,
+      'read-assistant-markdown-file',
+      expect.any(Function),
+    );
+  });
+
+  it('resolves an assistant relative reference daemon-side and returns the actual path metadata', async () => {
+    const projectDir = path.join(homedir(), 'project');
+    const resolvedFile = path.join(projectDir, 'dist', '报告.pdf');
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({
+      name: 'deck_project_brain', projectName: 'project', role: 'brain', projectDir,
+    } as never);
+    vi.spyOn(sessionStore, 'listSessions').mockReturnValue([]);
+    vi.spyOn(timelineStore, 'readByTypesPreferred').mockResolvedValue([{
+      eventId: 'assistant-relative-file-path',
+      sessionId: 'deck_project_brain',
+      ts: Date.now(), seq: 1, epoch: 1, source: 'daemon', confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: '[报告](dist/报告.pdf)' },
+    }] as never);
+    vi.mocked(fsp.lstat).mockResolvedValue({ isSymbolicLink: () => false, isFile: () => true } as fsp.Stats);
+    mockRealpath.mockImplementation(async (target) => String(target));
+    mockPreviewCoordinator.handle.mockImplementation((realPath, requestId, send) => {
+      send({ type: 'fs.read_response', requestId, path: realPath, status: 'ok', downloadId: 'dl-relative' });
+    });
+
+    handleWebCommand({
+      type: 'fs.read', path: 'dist/报告.pdf', requestId: 'read-relative-chat-file',
+      sessionName: 'deck_project_brain', chatFileReference: true,
+    }, mockServerLink as any);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(mockPreviewCoordinator.handle).toHaveBeenCalledWith(
+      resolvedFile,
+      'read-relative-chat-file',
+      expect.any(Function),
+    );
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: 'fs.read_response', requestId: 'read-relative-chat-file', path: 'dist/报告.pdf',
+      resolvedPath: resolvedFile, resolutionMatchCount: 1, downloadId: 'dl-relative',
+    }));
+  });
+
+  it('still downloads an existing in-project file when only tool output mentioned it, not the assistant', async () => {
+    // Pre-existing (pre-chatFileReference) behavior: any real file already
+    // inside the session's own project root was downloadable without any
+    // assistant grant. tool.call/tool.result text and ChatView's own
+    // splitPathsAndUrls plain-text renderer never mint a grant (by design:
+    // session-file-read-grants.ts only ingests assistant.text), yet the web
+    // client now marks EVERY download click chatFileReference:true, including
+    // clicks on paths rendered from tool output. That must not regress an
+    // in-project download into forbidden_path just because it lacks a grant.
+    const projectDir = path.join(homedir(), 'project');
+    const toolOnlyFile = path.join(projectDir, 'dist', 'report.pdf');
+    vi.spyOn(sessionStore, 'getSession').mockReturnValue({
+      name: 'deck_project_brain', projectName: 'project', role: 'brain', projectDir,
+    } as never);
+    vi.spyOn(sessionStore, 'listSessions').mockReturnValue([]);
+    vi.spyOn(timelineStore, 'readByTypesPreferred').mockResolvedValue([{
+      eventId: 'tool-result-only',
+      sessionId: 'deck_project_brain',
+      ts: Date.now(), seq: 1, epoch: 1, source: 'daemon', confidence: 'high',
+      type: 'tool.result',
+      payload: { text: `wrote ${toolOnlyFile}` },
+    }] as never);
+    vi.mocked(fsp.lstat).mockResolvedValue({ isSymbolicLink: () => false, isFile: () => true } as fsp.Stats);
+    mockRealpath.mockImplementation(async (target) => String(target));
+    mockPreviewCoordinator.handle.mockImplementation((realPath, requestId, send) => {
+      send({ type: 'fs.read_response', requestId, path: realPath, status: 'ok', downloadId: 'dl-in-project' });
+    });
+
+    handleWebCommand({
+      type: 'fs.read', path: toolOnlyFile, requestId: 'read-in-project-chat-file',
+      sessionName: 'deck_project_brain', chatFileReference: true,
+    }, mockServerLink as any);
+    await flushAsync();
+
+    expect(mockPreviewCoordinator.handle).toHaveBeenCalledWith(
+      toolOnlyFile,
+      'read-in-project-chat-file',
+      expect.any(Function),
+    );
+    expect(sent).not.toContainEqual(expect.objectContaining({ status: 'error' }));
+  });
+
   it('never authorizes a sensitive ~/.ssh file even when the assistant publishes its exact path', async () => {
     const projectDir = path.join(homedir(), 'project');
     const sensitiveFile = path.join(homedir(), '.ssh', 'id_rsa');

@@ -106,6 +106,17 @@ describe('ChatMarkdown', () => {
     expect(button!.title).toBe('missing download handle');
   });
 
+  it('keeps an ambiguous daemon resolution visible after a successful download', async () => {
+    const onDownload = vi.fn().mockResolvedValue('resolved newest of 2: /repo/new/report.pdf');
+    const { container } = render(
+      <ChatMarkdown text="report.pdf" onPathClick={() => {}} onDownload={onDownload} />,
+    );
+    const button = container.querySelector('.chat-dl-btn') as HTMLButtonElement;
+    fireEvent.click(button);
+    await waitFor(() => expect(button.disabled).toBe(false));
+    expect(button.title).toBe('resolved newest of 2: /repo/new/report.pdf');
+  });
+
   it('renders a download button for backtick file paths and calls onDownload', () => {
     const onDownload = vi.fn();
     const { container } = render(
@@ -229,6 +240,166 @@ describe('ChatMarkdown', () => {
     expect(download).not.toBeNull();
     fireEvent.click(download!);
     expect(onDownload).toHaveBeenCalledWith(expectedPath);
+  });
+
+  it.each([
+    [
+      'a Windows hidden-directory destination',
+      String.raw`[artifact](C:\Users\k\.imcodes\uploads\a.png)`,
+      String.raw`C:\Users\k\.imcodes\uploads\a.png`,
+      'artifact',
+    ],
+    [
+      'an angle-wrapped Windows destination containing spaces',
+      String.raw`[artifact](<C:\Users\k\.imcodes\My Files\a.png>)`,
+      String.raw`C:\Users\k\.imcodes\My Files\a.png`,
+      'artifact',
+    ],
+    [
+      'a POSIX destination containing spaces without angle brackets',
+      '[报告](/Users/k/My Docs/报告.pdf)',
+      '/Users/k/My Docs/报告.pdf',
+      '报告',
+    ],
+    [
+      'a Linux hidden directory and CJK underscore filename',
+      '[企享云外贸财税申报管理系统_代码.pdf](/home/ai/.imcodes/交付包/企享云外贸财税申报管理系统_代码.pdf)',
+      '/home/ai/.imcodes/交付包/企享云外贸财税申报管理系统_代码.pdf',
+      '企享云外贸财税申报管理系统_代码.pdf',
+    ],
+    [
+      'an NFD Linux filename',
+      `[NFD](</home/ai/.work/${'留住彼此'.normalize('NFD')}_代码.pdf>)`,
+      `/home/ai/.work/${'留住彼此'.normalize('NFD')}_代码.pdf`,
+      'NFD',
+    ],
+    [
+      'a literal percent decoded exactly once',
+      '[percent](/home/ai/交付包/完成率100%25_代码.pdf)',
+      '/home/ai/交付包/完成率100%_代码.pdf',
+      'percent',
+    ],
+  ])('preserves the exact local path from %s', (_name, text, expectedPath, expectedLabel) => {
+    const onPathClick = vi.fn();
+    const onDownload = vi.fn();
+    const { container } = render(
+      <ChatMarkdown
+        text={text}
+        onPathClick={onPathClick}
+        onDownload={onDownload}
+      />,
+    );
+
+    const link = container.querySelector('.chat-path-link') as HTMLElement | null;
+    expect(link?.textContent).toBe(expectedLabel);
+    fireEvent.click(link!);
+    expect(onPathClick).toHaveBeenCalledWith(expectedPath);
+    fireEvent.click(container.querySelector('.chat-dl-btn') as HTMLButtonElement);
+    expect(onDownload).toHaveBeenCalledWith(expectedPath);
+  });
+
+  it.each([
+    ['relative Markdown', '[报告](dist/报告.pdf)', 'dist/报告.pdf'],
+    ['relative Markdown image', '![预览](images/结果.png)', 'images/结果.png'],
+    ['local file URL', '[报告](file:///home/ai/%E4%BA%A4%E4%BB%98/report.pdf)', '/home/ai/交付/report.pdf'],
+    ['bare filename', '请下载 report.pdf', 'report.pdf'],
+    ['source line suffix', '源码在 ./src/report.ts:42:7。', './src/report.ts'],
+    ['trailing Chinese punctuation', '文件：../交付/报告.pdf，', '../交付/报告.pdf'],
+    ['full-width parentheses', '文件：./交付/报告（最终）.pdf。', './交付/报告（最终）.pdf'],
+  ])('supports non-contract %s file references', (_label, text, expectedPath) => {
+    const onDownload = vi.fn();
+    const { container } = render(
+      <ChatMarkdown text={text} onPathClick={() => {}} onDownload={onDownload} />,
+    );
+    const button = container.querySelector('.chat-dl-btn') as HTMLButtonElement | null;
+    expect(button).not.toBeNull();
+    fireEvent.click(button!);
+    expect(onDownload).toHaveBeenCalledWith(expectedPath);
+  });
+
+  it('keeps remote file URLs outside local file actions', () => {
+    const { container } = render(
+      <ChatMarkdown
+        text="[remote](file://server/share/a.pdf) and example.com"
+        onPathClick={() => {}}
+        onDownload={() => {}}
+      />,
+    );
+    expect(container.querySelector('.chat-dl-btn')).toBeNull();
+  });
+
+  it('keeps UNC link and image destinations out of local file actions', () => {
+    const { container } = render(
+      <ChatMarkdown
+        text={String.raw`[share](\\server\share\report.pdf) ![image](\\server\share\image.png)`}
+        onPathClick={() => {}}
+        onDownload={() => {}}
+        onImagePreview={() => Promise.resolve('data:image/png;base64,aW1n')}
+      />,
+    );
+
+    expect(container.querySelector('.chat-path-link')).toBeNull();
+    expect(container.querySelector('.chat-dl-btn')).toBeNull();
+    expect(container.querySelector('.chat-local-image-preview')).toBeNull();
+  });
+
+  it.each([
+    ['plain standalone path', '/home/ai/.work/我的 报告_代码.pdf'],
+    ['backticked path', '`/home/ai/.work/我的 报告_代码.pdf`'],
+  ])('keeps the complete Linux CJK path for %s', (_name, text) => {
+    const expectedPath = '/home/ai/.work/我的 报告_代码.pdf';
+    const onDownload = vi.fn();
+    const { container } = render(
+      <ChatMarkdown text={text} onPathClick={() => {}} onDownload={onDownload} />,
+    );
+
+    expect(container.querySelector('.chat-path-link')?.textContent).toBe(expectedPath);
+    fireEvent.click(container.querySelector('.chat-dl-btn') as HTMLButtonElement);
+    expect(onDownload).toHaveBeenCalledWith(expectedPath);
+  });
+
+  it.each([
+    [
+      'Windows hidden directory',
+      String.raw`![preview](C:\Users\k\.hidden\renders\a.png)`,
+      String.raw`C:\Users\k\.hidden\renders\a.png`,
+    ],
+    [
+      'unwrapped POSIX spaces',
+      '![预览](/Users/k/My Renders/成品.png)',
+      '/Users/k/My Renders/成品.png',
+    ],
+  ])('preserves the exact local image path for %s', (_name, text, expectedPath) => {
+    const onDownload = vi.fn();
+    const onImagePreview = vi.fn().mockResolvedValue('data:image/png;base64,aW1n');
+    const { container } = render(
+      <ChatMarkdown
+        text={text}
+        onPathClick={() => {}}
+        onDownload={onDownload}
+        onImagePreview={onImagePreview}
+      />,
+    );
+
+    expect(onImagePreview).toHaveBeenCalledWith(expectedPath);
+    fireEvent.click(container.querySelector('.chat-dl-btn') as HTMLButtonElement);
+    expect(onDownload).toHaveBeenCalledWith(expectedPath);
+  });
+
+  it('does not normalize markdown-looking local links inside inline or fenced code', () => {
+    const markdownLookingPath = '[报告](/Users/k/My Docs/报告.pdf)';
+    const { container } = render(
+      <ChatMarkdown
+        text={`\`${markdownLookingPath}\`\n\n\`\`\`text\n${markdownLookingPath}\n\`\`\``}
+        onPathClick={() => {}}
+        onDownload={() => {}}
+      />,
+    );
+
+    expect(container.querySelector('.chat-inline-code')?.textContent).toContain(markdownLookingPath);
+    const codeBlockText = container.querySelector('.chat-code-block code')?.textContent ?? '';
+    expect(codeBlockText).toContain('[报告](/Users/k/My Docs/报告.pdf');
+    expect(Array.from(container.querySelectorAll('.chat-path-link')).some((node) => node.textContent === '报告')).toBe(false);
   });
 
   it('preserves decoded full-path actions inside list, table, blockquote, and bold markdown', () => {
