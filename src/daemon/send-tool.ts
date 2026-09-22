@@ -3990,18 +3990,21 @@ export async function dispatchReadyAudit(
   };
   if (!validationAuthority) return authorityRevoked();
 
-  const integrationArtifact = await resolveIntegrationArtifact(task, implementer, deps, true, validationAuthority);
+  const resolvedArtifact = await resolveIntegrationArtifact(task, implementer, deps, true, validationAuthority);
   // Authority may have been revoked while the worktree was inspected/frozen.
   if (!registry.validationAuthoritySnapshotHolds(validationAuthority, { taskId: task.taskId, revision })) {
     return authorityRevoked();
   }
-  if (!integrationArtifact) {
-    const exactError = 'authoritative immutable integration bundle unavailable or mismatched';
+  if (!resolvedArtifact.artifact) {
+    const exactError = resolvedArtifact.failureReason
+      ? `authoritative immutable integration bundle unavailable or mismatched (reason: ${resolvedArtifact.failureReason})`
+      : 'authoritative immutable integration bundle unavailable or mismatched';
     const reported = reporter && coordinator
       ? await reportBlocker(implementer, exactError)
       : false;
     return { status: 'blocked', reason: exactError, reported };
   }
+  const integrationArtifact = resolvedArtifact.artifact;
 
   // attemptId and the final-receipt PREFLIGHT are established above, ahead of
   // every lifecycle write.
@@ -4346,6 +4349,33 @@ interface ResolvedIntegrationArtifact {
 }
 
 /**
+ * A short, stable diagnostic code for why {@link resolveIntegrationArtifact}
+ * could not produce an artifact -- surfaced in the blocker message so a Brain
+ * facing "authoritative immutable integration bundle unavailable or
+ * mismatched" can self-diagnose (e.g. `scope_files_missing_from_worktree`
+ * means the bound implementer identity's worktree has none of the assignment's
+ * scope files, almost always because the identity was rebound to a session
+ * whose worktree holds a different/empty diff) instead of treating every
+ * occurrence as an unfixable platform defect.
+ */
+type IntegrationArtifactFailureReason =
+  | 'missing_current_revision'
+  | 'worktree_snapshot_unavailable'
+  | 'worktree_dirty_staged'
+  | 'worktree_dirty_conflicted'
+  | `scope_projection_failed:${string}`
+  | 'persisted_bundle_stale_no_freeze_allowed'
+  | 'refreeze_not_authorized'
+  | `freeze_failed:${string}`
+  | `verify_failed:${string}`
+  | `bundle_bind_rejected:${string}`;
+
+interface ResolveIntegrationArtifactResult {
+  artifact?: ResolvedIntegrationArtifact;
+  failureReason?: IntegrationArtifactFailureReason;
+}
+
+/**
  * Resolve the one immutable artifact shared by audit and integration. An
  * injected worktree inspector is an explicit unit-test seam; production may
  * create a missing bundle only before audit, never after PASS.
@@ -4356,23 +4386,23 @@ async function resolveIntegrationArtifact(
   deps: ReadyAuditDispatchDeps,
   allowFreeze: boolean,
   validationAuthority?: string,
-): Promise<ResolvedIntegrationArtifact | undefined> {
+): Promise<ResolveIntegrationArtifactResult> {
   const revision = task.currentRevision?.trim();
-  if (!revision) return undefined;
+  if (!revision) return { failureReason: 'missing_current_revision' };
   const persisted = task.integrationBundle;
   if (deps.inspectAssignmentWorktree) {
     const snapshot = await inspectAssignmentForConvergence(implementer, deps, task.baseRevision);
+    if (!snapshot) return { failureReason: 'worktree_snapshot_unavailable' };
     const authorityScope = implementer.role === 'integration_owner' && persisted
       ? (persisted.scopeFiles ?? persisted.files.map((file) => file.path))
       : implementer.scopeFiles;
-    const projected = snapshot ? projectSupervisionSnapshotToAssignmentScope({
+    const projected = projectSupervisionSnapshotToAssignmentScope({
       snapshot, scopeFiles: authorityScope,
-    }) : undefined;
-    return projected?.ok
-      && projected.snapshot.stagedPaths.length === 0
-      && projected.snapshot.conflictedPaths.length === 0
-      ? { path: projected.snapshot.worktreePath, files: projected.snapshot.files }
-      : undefined;
+    });
+    if (!projected.ok) return { failureReason: `scope_projection_failed:${projected.reason}` };
+    if (projected.snapshot.stagedPaths.length > 0) return { failureReason: 'worktree_dirty_staged' };
+    if (projected.snapshot.conflictedPaths.length > 0) return { failureReason: 'worktree_dirty_conflicted' };
+    return { artifact: { path: projected.snapshot.worktreePath, files: projected.snapshot.files } };
   }
   if (persisted) {
     const sourceAssignment = task.assignments.find((candidate) => (
@@ -4387,13 +4417,13 @@ async function resolveIntegrationArtifact(
         bundleFiles: persisted.files,
       })
       && verifySupervisionIntegrationBundle(persisted).ok) {
-      return { path: persisted.bundlePath, files: persisted.files, bundle: persisted };
+      return { artifact: { path: persisted.bundlePath, files: persisted.files, bundle: persisted } };
     }
     // Do not let a predecessor REWORK bundle permanently mask a validated
     // successor. bindIntegrationBundle owns the narrow, receipt-backed CAS that
     // decides whether this exact stale binding may be replaced; all unrelated
     // or unaudited mismatches still fail closed there.
-    if (!allowFreeze) return undefined;
+    if (!allowFreeze) return { failureReason: 'persisted_bundle_stale_no_freeze_allowed' };
     const registry = deps.registry ?? getSupervisionTaskRegistry();
     if (!registry.canRefreezeSupersededReworkBundle({
       taskId: task.taskId,
@@ -4405,16 +4435,17 @@ async function resolveIntegrationArtifact(
       assignmentId: implementer.assignmentId,
       identity: implementer.identity,
       revision,
-    })) return undefined;
+    })) return { failureReason: 'refreeze_not_authorized' };
   }
-  if (!allowFreeze) return undefined;
+  if (!allowFreeze) return { failureReason: 'persisted_bundle_stale_no_freeze_allowed' };
   const snapshot = await inspectAssignmentForConvergence(implementer, deps, task.baseRevision);
-  if (!snapshot) return undefined;
+  if (!snapshot) return { failureReason: 'worktree_snapshot_unavailable' };
   const projected = projectSupervisionSnapshotToAssignmentScope({
     snapshot, scopeFiles: implementer.scopeFiles,
   });
-  if (!projected.ok || projected.snapshot.stagedPaths.length > 0
-    || projected.snapshot.conflictedPaths.length > 0) return undefined;
+  if (!projected.ok) return { failureReason: `scope_projection_failed:${projected.reason}` };
+  if (projected.snapshot.stagedPaths.length > 0) return { failureReason: 'worktree_dirty_staged' };
+  if (projected.snapshot.conflictedPaths.length > 0) return { failureReason: 'worktree_dirty_conflicted' };
   const frozen = freezeSupervisionIntegrationBundle({
     taskId: task.taskId,
     assignmentId: implementer.assignmentId,
@@ -4422,7 +4453,9 @@ async function resolveIntegrationArtifact(
     snapshot: projected.snapshot,
     scopeFiles: projected.scopeFiles,
   });
-  if (!frozen.ok || !verifySupervisionIntegrationBundle(frozen.bundle).ok) return undefined;
+  if (!frozen.ok) return { failureReason: `freeze_failed:${frozen.reason}` };
+  const verified = verifySupervisionIntegrationBundle(frozen.bundle);
+  if (!verified.ok) return { failureReason: `verify_failed:${verified.reason}` };
   const bound = (deps.registry ?? getSupervisionTaskRegistry()).bindIntegrationBundle({
     taskId: task.taskId,
     assignmentId: implementer.assignmentId,
@@ -4432,8 +4465,8 @@ async function resolveIntegrationArtifact(
     ...(validationAuthority !== undefined ? { validationAuthority } : {}),
     now: (deps.now ?? Date.now)(),
   });
-  if (!bound.ok) return undefined;
-  return { path: frozen.bundle.bundlePath, files: frozen.bundle.files, bundle: frozen.bundle };
+  if (!bound.ok) return { failureReason: `bundle_bind_rejected:${bound.reason}` };
+  return { artifact: { path: frozen.bundle.bundlePath, files: frozen.bundle.files, bundle: frozen.bundle } };
 }
 
 /** Deliver one exact REWORK receipt back to the same implementation object. */
@@ -4556,10 +4589,14 @@ export async function dispatchReadyIntegration(
     && item.receiptKind === 'final' && item.verdict === 'PASS'
   ));
   if (receipts.length !== 1) return { status: 'blocked', reason: 'exact PASS receipt unavailable', reported: false };
-  const integrationArtifact = await resolveIntegrationArtifact(task, implementer, deps, false);
-  if (!integrationArtifact) {
-    return { status: 'blocked', reason: 'authoritative immutable integration bundle unavailable or mismatched', reported: false };
+  const resolvedArtifact = await resolveIntegrationArtifact(task, implementer, deps, false);
+  if (!resolvedArtifact.artifact) {
+    const exactError = resolvedArtifact.failureReason
+      ? `authoritative immutable integration bundle unavailable or mismatched (reason: ${resolvedArtifact.failureReason})`
+      : 'authoritative immutable integration bundle unavailable or mismatched';
+    return { status: 'blocked', reason: exactError, reported: false };
   }
+  const integrationArtifact = resolvedArtifact.artifact;
   const sessions = (deps.listSessions ?? listSessions)();
   const coordinators = task.assignments.filter((assignment) => assignment.role === 'coordinator');
   const liveCoordinators = coordinators.flatMap((assignment) => {

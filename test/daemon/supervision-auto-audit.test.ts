@@ -6058,11 +6058,37 @@ describe('zero-coordinator legacy integration recovery', () => {
       }),
     });
     expect(result).toMatchObject({
-      status: 'blocked', reason: 'authoritative immutable integration bundle unavailable or mismatched',
+      status: 'blocked',
+      reason: 'authoritative immutable integration bundle unavailable or mismatched (reason: worktree_dirty_staged)',
     });
     expect(
       shape.registry.listAssignments(shape.taskId).filter((a) => a.role === 'coordinator'),
       'a dirty worktree must not mint a coordinator',
+    ).toEqual([]);
+  });
+
+  it('reports WHICH gate failed, not a bare opaque error, when the bound implementer identity worktree has none of the assignment scope files (the tsk_1aiu incident shape: identity rebound to an orphaned worktree with zero diff vs baseRevision)', async () => {
+    const shape = zeroCoordinatorPassShape('byk-legacy-orphaned-identity');
+    const result = await dispatchReadyIntegration(shape.taskId, {
+      registry: shape.registry,
+      listSessions: () => [session('deck_alpha_brain', 'brain'), session('deck_alpha_worker', 'w1')],
+      dispatch: acceptedDispatch(),
+      hasDeliveryEvidence: () => false,
+      // Scope declares src/exact.ts, but the worktree this identity is CURRENTLY
+      // bound to has a completely disjoint diff -- exactly what happens after a
+      // manual identity rebind points the assignment at the wrong sibling's
+      // worktree instead of the one holding the real, committed change.
+      inspectAssignmentWorktree: () => ({
+        ...cleanWorktree(), files: [{ path: 'src/unrelated.ts', sha256: '2'.repeat(64) }],
+      }),
+    });
+    expect(result).toMatchObject({
+      status: 'blocked',
+      reason: 'authoritative immutable integration bundle unavailable or mismatched (reason: scope_projection_failed:empty_manifest)',
+    });
+    expect(
+      shape.registry.listAssignments(shape.taskId).filter((a) => a.role === 'coordinator'),
+      'an orphaned-identity worktree must not mint a coordinator',
     ).toEqual([]);
   });
 
