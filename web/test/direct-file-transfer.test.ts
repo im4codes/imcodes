@@ -2273,15 +2273,17 @@ describe('direct file transfer v2 browser broker', () => {
 
   it('holds upload progress below 100 and recovers a lost commit ACK before HTTP retransmission', async () => {
     vi.useFakeTimers();
-    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { uploadFileWithDirectFallback, FILE_UPLOAD_TRANSPORT_MODE } = await import('../src/direct-file-transfer.js');
     const { ws, sent } = createWs(directCapabilities, 'commit_ack_lost_status_committed');
     const progress: number[] = [];
+    const modes: string[] = [];
 
     const pending = uploadFileWithDirectFallback({
       ws,
       serverId: 'server-1',
       file: createUploadFile('commit-recovery.txt', 'already durable'),
       onProgress: (value) => progress.push(value),
+      onMode: (mode) => modes.push(mode),
     });
     await vi.advanceTimersByTimeAsync(0);
     // Filling the browser SCTP queue is not receiver progress.  Without a
@@ -2298,6 +2300,9 @@ describe('direct file transfer v2 browser broker', () => {
     expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY)).toHaveLength(1);
     expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT)).toHaveLength(1);
     expect(apiMocks.uploadFile).not.toHaveBeenCalled();
+    // A composer row sitting at 100% for the whole recovery window with no
+    // visible state change reads as stuck rather than self-healing.
+    expect(modes).toContain(FILE_UPLOAD_TRANSPORT_MODE.RECOVERING);
   });
 
   it('keeps a 99%-phase upload alive while durable status remains attempting, then commits', async () => {

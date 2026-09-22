@@ -1838,7 +1838,8 @@
       "connecting": "Conectando P2P",
       "direct": "Subida directa P2P",
       "falling_back": "Cambiando a relevo",
-      "relay": "Subida por relevo"
+      "relay": "Subida por relevo",
+      "recovering": "Recuperando conexión"
     },
     "progress_aria": "{{name}}: {{transport}}, {{progress}}% completado",
     "transferred": "{{transferred}} / {{total}}",

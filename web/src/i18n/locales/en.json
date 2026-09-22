@@ -1838,7 +1838,8 @@
       "connecting": "Connecting P2P",
       "direct": "P2P direct upload",
       "falling_back": "Switching to relay",
-      "relay": "Relay upload"
+      "relay": "Relay upload",
+      "recovering": "Recovering connection"
     },
     "progress_aria": "{{name}}: {{transport}}, {{progress}}% complete",
     "transferred": "{{transferred}} / {{total}}",

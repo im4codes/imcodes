@@ -1653,18 +1653,21 @@ html.native-ios-mac .chat-dl-btn {
   color: #86efac;
 }
 .composer-upload-row-falling_back,
-.composer-upload-row-relay {
+.composer-upload-row-relay,
+.composer-upload-row-recovering {
   border-color: rgba(245, 158, 11, 0.2);
   background: linear-gradient(100deg, rgba(120, 53, 15, 0.18), rgba(15, 23, 42, 0.54));
 }
 .composer-upload-transport-falling_back,
-.composer-upload-transport-relay {
+.composer-upload-transport-relay,
+.composer-upload-transport-recovering {
   border-color: rgba(245, 158, 11, 0.38);
   background: rgba(180, 83, 9, 0.14);
   color: #fcd34d;
 }
 .composer-upload-transport-connecting .composer-upload-transport-signal,
-.composer-upload-transport-falling_back .composer-upload-transport-signal {
+.composer-upload-transport-falling_back .composer-upload-transport-signal,
+.composer-upload-transport-recovering .composer-upload-transport-signal {
   animation: composer-upload-signal 1.1s ease-in-out infinite;
 }
 .composer-upload-progress-track {
@@ -1686,7 +1689,8 @@ html.native-ios-mac .chat-dl-btn {
   box-shadow: 0 0 7px rgba(74, 222, 128, 0.42);
 }
 .composer-upload-row-falling_back .composer-upload-progress-fill,
-.composer-upload-row-relay .composer-upload-progress-fill {
+.composer-upload-row-relay .composer-upload-progress-fill,
+.composer-upload-row-recovering .composer-upload-progress-fill {
   background: linear-gradient(90deg, #d97706, #fbbf24);
   box-shadow: 0 0 7px rgba(251, 191, 36, 0.38);
 }

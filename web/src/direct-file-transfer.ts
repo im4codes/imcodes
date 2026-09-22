@@ -68,6 +68,7 @@ export const FILE_UPLOAD_TRANSPORT_MODE = {
   DIRECT: 'direct',
   FALLING_BACK: 'falling_back',
   RELAY: 'relay',
+  RECOVERING: 'recovering',
 } as const;
 
 export type FileUploadTransportMode = typeof FILE_UPLOAD_TRANSPORT_MODE[keyof typeof FILE_UPLOAD_TRANSPORT_MODE];
@@ -318,6 +319,13 @@ type DirectUploadAttempt = {
   destinationDirectory?: string;
   onProgress?: (pct: number) => void;
   onConnected?: () => void;
+  /** Fires when the bytes are already sent and the client is waiting out a
+   *  lost commit acknowledgement (e.g. the daemon's transfer worker recycled
+   *  right as this attempt finished) instead of a live transfer. Without this
+   *  the composer row sits at 100% with no visible activity for up to
+   *  MAX_STATUS_RECOVERY_QUERIES rounds, which reads as stuck rather than
+   *  recovering. */
+  onMode?: (mode: FileUploadTransportMode) => void;
   signal?: AbortSignal;
 };
 
@@ -2032,6 +2040,7 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
           || uploadStatusRecoveryQueries >= DIRECT_FILE_TRANSFER_LIMITS.MAX_STATUS_RECOVERY_QUERIES) return false;
         uploadStatusRecoveryOutstanding = true;
         uploadStatusRecoveryQueries += 1;
+        op.onMode?.(FILE_UPLOAD_TRANSPORT_MODE.RECOVERING);
         try {
           sendControl(lease, {
             type: DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY,
@@ -2454,12 +2463,13 @@ export async function uploadFileDirect(
   sessionName?: string,
   serverId?: string,
   destinationDirectory?: string,
+  onMode?: (mode: FileUploadTransportMode) => void,
 ): Promise<{ ok: true; attachment: AttachmentRefResponse }> {
   if (!serverId || !supportsUpload(ws)) throw directError(DIRECT_FILE_TRANSFER_ERROR.CAPABILITY_UNAVAILABLE, false);
   const { lease, release } = acquireLease(ws, serverId);
   try {
     const result = await retryDirect<OperationSuccess>(lease, () => ({
-      kind: 'upload', file, operationId: clientUploadId, sessionName, destinationDirectory, onProgress, onConnected, signal,
+      kind: 'upload', file, operationId: clientUploadId, sessionName, destinationDirectory, onProgress, onConnected, onMode, signal,
     }), signal);
     if (result.kind !== 'upload') throw directError(DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, false);
     const route = await selectedPeerRoute(lease.peer);
@@ -2520,6 +2530,7 @@ export async function uploadFileWithDirectFallback(options: {
         options.sessionName,
         options.serverId,
         options.destinationDirectory,
+        options.onMode,
       );
       clearResumableUploadIdentity(storageKey, clientUploadId);
       return direct;

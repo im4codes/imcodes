@@ -471,9 +471,9 @@ describe('styles.css regression contracts', () => {
 
   it('visually distinguishes P2P direct uploads from relay uploads', () => {
     const directBadgeRule = css.match(/\.composer-upload-transport-direct\s*\{[^}]*\}/);
-    const relayBadgeRule = css.match(/\.composer-upload-transport-falling_back,\s*\.composer-upload-transport-relay\s*\{[^}]*\}/);
+    const relayBadgeRule = css.match(/\.composer-upload-transport-falling_back,\s*\.composer-upload-transport-relay,\s*\.composer-upload-transport-recovering\s*\{[^}]*\}/);
     const directProgressRule = css.match(/\.composer-upload-row-direct \.composer-upload-progress-fill\s*\{[^}]*\}/);
-    const relayProgressRule = css.match(/\.composer-upload-row-falling_back \.composer-upload-progress-fill,\s*\.composer-upload-row-relay \.composer-upload-progress-fill\s*\{[^}]*\}/);
+    const relayProgressRule = css.match(/\.composer-upload-row-falling_back \.composer-upload-progress-fill,\s*\.composer-upload-row-relay \.composer-upload-progress-fill,\s*\.composer-upload-row-recovering \.composer-upload-progress-fill\s*\{[^}]*\}/);
 
     expect(directBadgeRule?.[0]).toMatch(/color:\s*#86efac/);
     expect(relayBadgeRule?.[0]).toMatch(/color:\s*#fcd34d/);

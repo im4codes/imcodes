@@ -1837,7 +1837,8 @@
       "connecting": "Подключение P2P",
       "direct": "Прямая P2P-загрузка",
       "falling_back": "Переход на ретрансляцию",
-      "relay": "Загрузка через ретранслятор"
+      "relay": "Загрузка через ретранслятор",
+      "recovering": "Восстановление соединения"
     },
     "progress_aria": "{{name}}: {{transport}}, выполнено {{progress}}%",
     "transferred": "{{transferred}} / {{total}}",

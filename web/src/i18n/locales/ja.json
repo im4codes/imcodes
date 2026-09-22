@@ -1837,7 +1837,8 @@
       "connecting": "P2P 接続中",
       "direct": "P2P 直接アップロード中",
       "falling_back": "中継へ切替中",
-      "relay": "中継アップロード中"
+      "relay": "中継アップロード中",
+      "recovering": "接続を復旧中"
     },
     "progress_aria": "{{name}}：{{transport}}、進捗 {{progress}}%",
     "transferred": "{{transferred}} / {{total}}",

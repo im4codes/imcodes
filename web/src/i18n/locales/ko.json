@@ -1837,7 +1837,8 @@
       "connecting": "P2P 연결 중",
       "direct": "P2P 직접 업로드 중",
       "falling_back": "릴레이로 전환 중",
-      "relay": "릴레이 업로드 중"
+      "relay": "릴레이 업로드 중",
+      "recovering": "연결 복구 중"
     },
     "progress_aria": "{{name}}: {{transport}}, 진행률 {{progress}}%",
     "transferred": "{{transferred}} / {{total}}",

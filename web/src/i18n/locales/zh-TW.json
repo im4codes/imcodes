@@ -1838,7 +1838,8 @@
       "connecting": "P2P 連線中",
       "direct": "P2P 直連上傳中",
       "falling_back": "正在切換中轉",
-      "relay": "中轉上傳中"
+      "relay": "中轉上傳中",
+      "recovering": "正在恢復連線"
     },
     "progress_aria": "{{name}}：{{transport}}，進度 {{progress}}%",
     "transferred": "{{transferred}} / {{total}}",
