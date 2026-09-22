@@ -13,8 +13,12 @@ import {
   LEGACY_WINDOWS_UPGRADE_RESCUE_GRACE_MS,
   LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX,
   LEGACY_WINDOWS_UPGRADE_RESTART_READY_PREFIX,
+  LEGACY_WINDOWS_UPGRADE_RESTART_RETRY_BASE_MS,
+  LEGACY_WINDOWS_UPGRADE_RESTART_RETRY_MAX_MS,
   LEGACY_WINDOWS_UPGRADE_TASK_STALE_MINUTES,
+  legacyWindowsUpgradeRestartRetryDelayMs,
   resolveLegacyWindowsUpgradePublisherSignerSha256,
+  resolveLegacyWindowsUpgradeRestartAttempt,
 } from '../src/ws/windows-controlled-node-upgrade-rescue.js';
 
 const RESCUE_ID = '12345678-1234-4abc-8def-1234567890ab';
@@ -246,5 +250,71 @@ describe('legacy Windows controlled-node upgrade rescue', () => {
       .resolves.toBe(SIGNER_SHA256);
     await expect(resolveLegacyWindowsUpgradePublisherSignerSha256(`${version}-wrong`, 'C:\\artifacts', read))
       .rejects.toThrow('windows_release_artifact_signer_manifest_mismatch');
+  });
+});
+
+describe('legacy Windows upgrade restart cross-generation backoff', () => {
+  const TARGET = '2026.9.4547-dev.5203';
+
+  it('grows the retry delay exponentially, capped by the exponent ceiling well under the max', () => {
+    expect(legacyWindowsUpgradeRestartRetryDelayMs(1)).toBe(LEGACY_WINDOWS_UPGRADE_RESTART_RETRY_BASE_MS);
+    expect(legacyWindowsUpgradeRestartRetryDelayMs(2)).toBe(LEGACY_WINDOWS_UPGRADE_RESTART_RETRY_BASE_MS * 2);
+    expect(legacyWindowsUpgradeRestartRetryDelayMs(3)).toBe(LEGACY_WINDOWS_UPGRADE_RESTART_RETRY_BASE_MS * 4);
+    expect(legacyWindowsUpgradeRestartRetryDelayMs(4)).toBe(LEGACY_WINDOWS_UPGRADE_RESTART_RETRY_BASE_MS * 4);
+    expect(legacyWindowsUpgradeRestartRetryDelayMs(50)).toBe(LEGACY_WINDOWS_UPGRADE_RESTART_RETRY_BASE_MS * 4);
+    expect(legacyWindowsUpgradeRestartRetryDelayMs(50)).toBeLessThanOrEqual(LEGACY_WINDOWS_UPGRADE_RESTART_RETRY_MAX_MS);
+  });
+
+  it('dispatches immediately with no prior throttle', () => {
+    expect(resolveLegacyWindowsUpgradeRestartAttempt(null, TARGET, 1_000_000)).toEqual({ attempts: 1, waitMs: 0 });
+  });
+
+  it('does not let a new connection generation bypass an unexpired backoff for the same target', () => {
+    // A restart was just dispatched (attempt 1) and its backoff runs until t=1,060,000.
+    const throttle = { targetVersion: TARGET, attempts: 1, notBeforeMs: 1_060_000 };
+    // The node disconnected (new generation) and reconnected 5s later, well inside the
+    // 60s base backoff window. Before the fix, a fresh per-generation state made this
+    // fire again immediately instead of waiting out the remainder of the window.
+    const resolved = resolveLegacyWindowsUpgradeRestartAttempt(throttle, TARGET, 1_005_000);
+    expect(resolved.waitMs).toBe(55_000);
+    expect(resolved.attempts).toBe(1);
+  });
+
+  it('advances the attempt count only once the backoff window has actually elapsed', () => {
+    const throttle = { targetVersion: TARGET, attempts: 1, notBeforeMs: 1_060_000 };
+    expect(resolveLegacyWindowsUpgradeRestartAttempt(throttle, TARGET, 1_060_000)).toEqual({ attempts: 2, waitMs: 0 });
+    expect(resolveLegacyWindowsUpgradeRestartAttempt(throttle, TARGET, 2_000_000)).toEqual({ attempts: 2, waitMs: 0 });
+  });
+
+  it('does not penalize a genuinely new release with an older target version backoff', () => {
+    const throttle = { targetVersion: '2026.9.4547-dev.5203', attempts: 3, notBeforeMs: 9_999_999_999 };
+    expect(resolveLegacyWindowsUpgradeRestartAttempt(throttle, '2026.9.4550-dev.9001', 1_000_000))
+      .toEqual({ attempts: 1, waitMs: 0 });
+  });
+
+  it('simulates a node that disconnects the instant every restart command runs and still backs off across generations', () => {
+    // Regression test for the exact production symptom: a legacy node whose
+    // restart-nudge itself causes a reconnect (new daemonGeneration) on every
+    // attempt. Each iteration below is one generation: it asks whether a
+    // restart may dispatch "now" (simulated as the same instant the node
+    // reconnected, i.e. no time passes between generations).
+    let throttle: { targetVersion: string; attempts: number; notBeforeMs: number } | null = null;
+    let nowMs = 0;
+    let dispatchCount = 0;
+    for (let generation = 0; generation < 5; generation += 1) {
+      const resolved = resolveLegacyWindowsUpgradeRestartAttempt(throttle, TARGET, nowMs);
+      if (resolved.waitMs === 0) {
+        dispatchCount += 1;
+        throttle = {
+          targetVersion: TARGET,
+          attempts: resolved.attempts,
+          notBeforeMs: nowMs + legacyWindowsUpgradeRestartRetryDelayMs(resolved.attempts),
+        };
+      }
+      // The reconnect that starts the next generation happens instantly.
+    }
+    // Only the very first generation's restart may dispatch; every later
+    // generation lands inside the still-unexpired backoff and must wait.
+    expect(dispatchCount).toBe(1);
   });
 });

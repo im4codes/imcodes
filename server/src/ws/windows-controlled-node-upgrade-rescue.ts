@@ -34,6 +34,46 @@ export const LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX = 'IMCODES_UPGRADE_RESCU
 export const LEGACY_WINDOWS_UPGRADE_RESTART_EXEC_TIMEOUT_MS = 120_000;
 export const LEGACY_WINDOWS_UPGRADE_RESTART_READY_PREFIX = 'IMCODES_UPGRADE_RESTART_READY' as const;
 export const LEGACY_WINDOWS_UPGRADE_TASK_STALE_MINUTES = 15;
+export const LEGACY_WINDOWS_UPGRADE_RESTART_RETRY_BASE_MS = 60_000;
+export const LEGACY_WINDOWS_UPGRADE_RESTART_RETRY_MAX_MS = 5 * 60_000;
+
+export function legacyWindowsUpgradeRestartRetryDelayMs(attempts: number): number {
+  return Math.min(
+    LEGACY_WINDOWS_UPGRADE_RESTART_RETRY_MAX_MS,
+    LEGACY_WINDOWS_UPGRADE_RESTART_RETRY_BASE_MS * (2 ** Math.min(2, attempts - 1)),
+  );
+}
+
+/** A restart attempt count and the earliest time the next one may fire, scoped to one target version. */
+export interface LegacyWindowsUpgradeRestartThrottle {
+  targetVersion: string;
+  attempts: number;
+  notBeforeMs: number;
+}
+
+/**
+ * A flapping legacy Windows node disconnects (a new `daemonGeneration`) every
+ * time the server nudges it with a restart command, and per-generation
+ * restart state cannot carry an exponential backoff across that boundary by
+ * itself — the caller must persist the last {@link LegacyWindowsUpgradeRestartThrottle}
+ * outside the per-generation state and consult it here before dispatching
+ * another restart for the same target version, or the backoff resets to its
+ * base delay (or fires immediately) on every single reconnect.
+ */
+export function resolveLegacyWindowsUpgradeRestartAttempt(
+  throttle: LegacyWindowsUpgradeRestartThrottle | null,
+  targetVersion: string,
+  nowMs: number,
+): { attempts: number; waitMs: number } {
+  if (!throttle || throttle.targetVersion !== targetVersion) {
+    return { attempts: 1, waitMs: 0 };
+  }
+  const waitMs = throttle.notBeforeMs - nowMs;
+  if (waitMs > 0) {
+    return { attempts: throttle.attempts, waitMs };
+  }
+  return { attempts: throttle.attempts + 1, waitMs: 0 };
+}
 
 function psSingleQuote(value: string): string {
   return `'${value.replaceAll("'", "''")}'`;

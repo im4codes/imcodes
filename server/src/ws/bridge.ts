@@ -212,7 +212,10 @@ import {
   buildLegacyWindowsUpgradeRestartCommand,
   LEGACY_WINDOWS_UPGRADE_RESCUE_EXEC_TIMEOUT_MS,
   LEGACY_WINDOWS_UPGRADE_RESTART_EXEC_TIMEOUT_MS,
+  legacyWindowsUpgradeRestartRetryDelayMs,
+  type LegacyWindowsUpgradeRestartThrottle,
   resolveLegacyWindowsUpgradePublisherSignerSha256,
+  resolveLegacyWindowsUpgradeRestartAttempt,
 } from './windows-controlled-node-upgrade-rescue.js';
 import { REPO_MSG, REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
 import { TRANSPORT_RELAY_TYPES, TRANSPORT_MSG } from '../../../shared/transport-events.js';
@@ -449,8 +452,6 @@ const DAEMON_UPGRADE_BLOCKED_FAILURE_DEDUP_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DAEMON_UPGRADE_BLOCKED_FAILURE_DEDUP_MAX = 1_000;
 const LEGACY_UPGRADE_RESCUE_RETRY_BASE_MS = 60_000;
 const LEGACY_UPGRADE_RESCUE_RETRY_MAX_MS = 15 * 60_000;
-const LEGACY_UPGRADE_RESTART_RETRY_BASE_MS = 60_000;
-const LEGACY_UPGRADE_RESTART_RETRY_MAX_MS = 5 * 60_000;
 let resolveLegacyUpgradePublisherSigner = resolveLegacyWindowsUpgradePublisherSignerSha256;
 
 export function __setLegacyUpgradePublisherSignerResolverForTests(
@@ -1656,6 +1657,12 @@ export class WsBridge {
     restartTimer: ReturnType<typeof setTimeout> | null;
     restartCoordinatorPrepared: boolean;
   } | null = null;
+  /** Restart backoff for the legacy Windows restart-nudge, kept outside
+   *  `legacyUpgradeRescuePreparation` so it survives that per-generation
+   *  state being rebuilt on every disconnect/reconnect. Without this, a node
+   *  that disconnects every time the restart command runs never actually
+   *  experiences the exponential backoff — see resolveLegacyWindowsUpgradeRestartAttempt. */
+  private legacyUpgradeRestartThrottle: LegacyWindowsUpgradeRestartThrottle | null = null;
   private daemonUpgradeCoordinator = new DaemonUpgradeCoordinator();
   private browserSockets = new Set<WebSocket>();
   private mobileSockets = new Set<WebSocket>();
@@ -9180,8 +9187,36 @@ export class WsBridge {
       || state.restartTimer
     ) return;
 
+    const targetVersion = process.env.APP_VERSION;
+    if (!targetVersion || targetVersion === '0.0.0') return;
+
+    // A node that disconnects every time the restart command runs starts a
+    // brand new generation on each reconnect; `state` above was just rebuilt
+    // from scratch for that generation, so its own restartAttempts cannot
+    // carry a backoff across the disconnect. `legacyUpgradeRestartThrottle`
+    // is the persistent, cross-generation source of truth for that backoff.
+    const { attempts, waitMs } = resolveLegacyWindowsUpgradeRestartAttempt(
+      this.legacyUpgradeRestartThrottle,
+      targetVersion,
+      Date.now(),
+    );
+    if (waitMs > 0) {
+      state.restartAttempts = attempts;
+      state.restartTimer = setTimeout(() => {
+        state.restartTimer = null;
+        this.ensureLegacyWindowsUpgradeRestart(ws);
+      }, waitMs);
+      state.restartTimer.unref?.();
+      return;
+    }
+
     state.restartInFlight = true;
-    state.restartAttempts += 1;
+    state.restartAttempts = attempts;
+    this.legacyUpgradeRestartThrottle = {
+      targetVersion,
+      attempts,
+      notBeforeMs: Date.now() + legacyWindowsUpgradeRestartRetryDelayMs(attempts),
+    };
     const restartId = randomUUID();
     const correlationId = `upgrade-restart-${restartId}`;
 
@@ -9192,10 +9227,10 @@ export class WsBridge {
         || !this.authenticated
         || this.legacyUpgradeRescuePreparedGeneration !== generation
       ) return;
-      const retryMs = Math.min(
-        LEGACY_UPGRADE_RESTART_RETRY_MAX_MS,
-        LEGACY_UPGRADE_RESTART_RETRY_BASE_MS * (2 ** Math.min(2, state.restartAttempts - 1)),
-      );
+      const retryMs = legacyWindowsUpgradeRestartRetryDelayMs(state.restartAttempts);
+      if (this.legacyUpgradeRestartThrottle?.targetVersion === targetVersion) {
+        this.legacyUpgradeRestartThrottle.notBeforeMs = Date.now() + retryMs;
+      }
       state.restartTimer = setTimeout(() => {
         state.restartTimer = null;
         this.ensureLegacyWindowsUpgradeRestart(ws);
@@ -9204,10 +9239,6 @@ export class WsBridge {
     };
 
     void (async () => {
-      const targetVersion = process.env.APP_VERSION;
-      if (!targetVersion || targetVersion === '0.0.0') {
-        throw new Error('legacy_upgrade_restart_target_version_unavailable');
-      }
       const expectedSignerSha256 = await resolveLegacyUpgradePublisherSigner(targetVersion);
       const prepared = buildLegacyWindowsUpgradeRestartCommand(
         state.preparedRescueId!,
