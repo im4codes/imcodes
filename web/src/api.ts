@@ -1668,6 +1668,22 @@ export async function deletePasskey(credentialId: string): Promise<void> {
 
 // ── File transfer API ─────────────────────────────────────────────────────
 
+/**
+ * How long `uploadFileRequest`'s XHR may go without any observable activity
+ * (bytes sent, bytes received, or a parsed NDJSON line) before it is treated
+ * as stalled. The node -> server -> browser relay can silently die on a live
+ * connection -- an intermediate proxy holding the socket open without ever
+ * delivering the close it saw from the server -- after the daemon has
+ * already finished and the server has already written and closed its side of
+ * the response (observed live: the daemon logs "File upload complete", but
+ * the browser's XHR never fires `load`, so the composer row sits at 100%
+ * forever with no error and nothing to retry). Aborting on inactivity and
+ * rejecting with the same `ApiError(0, ...)` shape `xhr.onerror` already
+ * produces routes this into the existing resumable-upload retry loop instead
+ * of a silent, permanent hang.
+ */
+const UPLOAD_STALL_TIMEOUT_MS = 20_000;
+
 export interface AttachmentRefResponse {
   id: string;
   source: string;
@@ -1802,6 +1818,7 @@ async function uploadFileRequest(options: {
     }
 
     xhr.upload.onprogress = (e) => {
+      armStallTimer();
       if (e.lengthComputable) {
         const chunkRatio = e.total > 0 ? Math.min(1, e.loaded / e.total) : 0;
         const browserLoaded = options.offset + chunkRatio * options.file.size;
@@ -1820,6 +1837,22 @@ async function uploadFileRequest(options: {
     };
     const onSignalAbort = () => xhr.abort();
     const cleanupAbortListener = () => options.signal?.removeEventListener('abort', onSignalAbort);
+
+    let stallTimer: ReturnType<typeof setTimeout> | null = null;
+    const clearStallTimer = () => {
+      if (stallTimer) clearTimeout(stallTimer);
+      stallTimer = null;
+    };
+    const armStallTimer = () => {
+      clearStallTimer();
+      stallTimer = setTimeout(() => {
+        // status 0 matches xhr.onerror's shape below, which the resumable
+        // upload loop in uploadFile() already retries from the last
+        // daemon-committed offset.
+        reject(new ApiError(0, 'upload_stalled'));
+        xhr.abort();
+      }, UPLOAD_STALL_TIMEOUT_MS);
+    };
 
     const consumeProgressLines = (flush = false) => {
       const response = xhr.responseText ?? '';
@@ -1864,10 +1897,14 @@ async function uploadFileRequest(options: {
       }
     };
 
-    xhr.onprogress = () => consumeProgressLines(false);
+    xhr.onprogress = () => {
+      armStallTimer();
+      consumeProgressLines(false);
+    };
 
     xhr.onload = () => {
       cleanupAbortListener();
+      clearStallTimer();
       if (xhr.status >= 200 && xhr.status < 300) {
         try {
           consumeProgressLines(true);
@@ -1900,10 +1937,12 @@ async function uploadFileRequest(options: {
 
     xhr.onerror = () => {
       cleanupAbortListener();
+      clearStallTimer();
       reject(new ApiError(0, 'Network error'));
     };
     xhr.onabort = () => {
       cleanupAbortListener();
+      clearStallTimer();
       reject(abortError());
     };
     if (options.signal?.aborted) {
@@ -1912,6 +1951,7 @@ async function uploadFileRequest(options: {
     }
     options.signal?.addEventListener('abort', onSignalAbort, { once: true });
     xhr.send(form);
+    armStallTimer();
   });
 }
 

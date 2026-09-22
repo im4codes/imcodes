@@ -268,6 +268,44 @@ describe('shared-context and file API contracts', () => {
     expect(MockXmlHttpRequest.instances[0].aborted).toBe(true);
   });
 
+  it('retries an upload whose XHR never fires load after the daemon already finished it', async () => {
+    // Reproduces a live relay hang: the daemon completes the upload and the
+    // server closes its response, but the browser's XHR never observes
+    // `load` (an intermediate proxy held the connection open). Without a
+    // stall timeout this sat at 100% forever with nothing to retry.
+    vi.useFakeTimers();
+    let call = 0;
+    MockXmlHttpRequest.sendHook = (xhr) => {
+      call += 1;
+      if (call === 1) {
+        // Browser finished sending; daemon "completed" server-side, but the
+        // XHR never fires load/error/progress again -- a true hang.
+        xhr.upload.onprogress?.({ lengthComputable: true, loaded: 5, total: 5 } as ProgressEvent);
+        return true;
+      }
+      xhr.responseText = JSON.stringify({
+        ok: true,
+        attachment: {
+          id: 'att-stall-recovered', source: 'upload', serverId: 'srv-1', daemonPath: '/tmp/stalled.txt',
+          createdAt: '2026-05-11T00:00:00Z', downloadable: true,
+        },
+      });
+      queueMicrotask(() => xhr.onload?.());
+      return true;
+    };
+    const { uploadFile } = await import('../src/api.js');
+    const pending = uploadFile('srv-1', new File(['hello'], 'stalled.txt'), undefined, 'client-stall-1234');
+    let settled = false;
+    void pending.finally(() => { settled = true; }).catch(() => undefined);
+    for (let step = 0; step < 10 && !settled; step += 1) {
+      await vi.advanceTimersByTimeAsync(5_000);
+    }
+    await expect(pending).resolves.toMatchObject({ attachment: { id: 'att-stall-recovered' } });
+
+    expect(MockXmlHttpRequest.instances).toHaveLength(2);
+    expect(MockXmlHttpRequest.instances[0]!.aborted).toBe(true);
+  });
+
   it('retries a failed browser upload chunk at the server-confirmed offset', async () => {
     vi.useFakeTimers();
     const { FILE_TRANSFER_RESUMABLE_UPLOAD } = await import('@shared/transport/file-transfer.js');
