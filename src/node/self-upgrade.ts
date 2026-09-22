@@ -17,6 +17,7 @@ import {
   type ControlledNodeOs,
 } from '../../shared/controlled-node-artifacts.js';
 import { DAEMON_UPGRADE_TARGET_LATEST, normalizeDaemonUpgradeTargetVersion } from '../../shared/daemon-upgrade.js';
+import { isTransientRequestFailure } from '../../shared/request-failure.js';
 import {
   CONTROLLED_NODE_WINDOWS_RELEASE_TRUST_PREFLIGHT_FAILURE,
   CONTROLLED_NODE_WINDOWS_RELEASE_MANIFEST_PREFLIGHT_FAILURE,
@@ -130,6 +131,7 @@ export interface ControlledNodeSelfUpgradeDeps {
   onCleanupDiagnostic?: (diagnostic: ControlledNodeUpgradeCleanupDiagnostic) => void;
   onStaleScavengeOperation?: (operation: 'enumerate' | 'lstat' | 'marker_read' | 'delete') => void;
   beforeStaleCandidateRevalidation?: (candidatePath: string) => Promise<void>;
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export interface ControlledNodeSelfUpgradeResult {
@@ -508,6 +510,40 @@ async function sha256File(path: string): Promise<string> {
     await file.close();
   }
   return hash.digest('hex');
+}
+
+const CONTROLLED_NODE_ARTIFACT_DOWNLOAD_RETRY_ATTEMPTS = 4;
+const CONTROLLED_NODE_ARTIFACT_DOWNLOAD_RETRY_BASE_MS = 3_000;
+const CONTROLLED_NODE_ARTIFACT_DOWNLOAD_RETRY_MAX_MS = 20_000;
+
+/**
+ * A transient connection failure partway through an ~80MB artifact download
+ * (the observed real-world failure on a poor office link) must not fail the
+ * whole upgrade attempt outright -- the outer server-driven retry cycle is a
+ * full new handshake, tens of seconds slower per round trip than simply
+ * re-requesting the same download. Only failures `isTransientRequestFailure`
+ * recognizes are retried here; a real integrity, auth or version mismatch
+ * (or the final attempt) still surfaces immediately.
+ */
+export async function withArtifactDownloadRetries<T>(
+  attempt: () => Promise<T>,
+  options: { attempts?: number; baseDelayMs?: number; maxDelayMs?: number; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<T> {
+  const attempts = options.attempts ?? CONTROLLED_NODE_ARTIFACT_DOWNLOAD_RETRY_ATTEMPTS;
+  const baseDelayMs = options.baseDelayMs ?? CONTROLLED_NODE_ARTIFACT_DOWNLOAD_RETRY_BASE_MS;
+  const maxDelayMs = options.maxDelayMs ?? CONTROLLED_NODE_ARTIFACT_DOWNLOAD_RETRY_MAX_MS;
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => { setTimeout(resolve, ms); }));
+  let lastError: unknown;
+  for (let n = 1; n <= attempts; n++) {
+    try {
+      return await attempt();
+    } catch (error) {
+      lastError = error;
+      if (n === attempts || !isTransientRequestFailure(error)) throw error;
+      await sleep(Math.min(maxDelayMs, baseDelayMs * (2 ** (n - 1))));
+    }
+  }
+  throw lastError;
 }
 
 async function downloadArtifact(input: {
@@ -1661,16 +1697,23 @@ export async function startControlledNodeSelfUpgrade(
     };
     await recordProgress('staging_created');
 
-    const downloaded = await downloadArtifact({
+    // Captured as a `const` so the retry closures below see a stable `string`:
+    // TypeScript cannot narrow a closed-over `let` across a generic callback
+    // boundary the way it does at this direct call site.
+    const stagingDir: string = updateDir;
+    const downloaded = await withArtifactDownloadRetries(() => downloadArtifact({
       credential,
       target,
-      dir: updateDir,
+      dir: stagingDir,
       fetchImpl,
       ...(targetVersion === DAEMON_UPGRADE_TARGET_LATEST ? {} : { expectedVersion: targetVersion }),
       onProgress: recordProgress,
-    });
+    }), { sleep: deps.sleep });
     if (!downloaded.version) throw new Error('missing_artifact_version');
-    const helper = await downloadControlledNodeComputerUseHelper({ credential, target, dir: updateDir, fetchImpl });
+    const helper = await withArtifactDownloadRetries(
+      () => downloadControlledNodeComputerUseHelper({ credential, target, dir: stagingDir, fetchImpl }),
+      { sleep: deps.sleep },
+    );
     // A Windows/Linux release is one publication unit. Installing the runtime
     // without its same-version worker bundle strands the node after its
     // runtime version converges, because version-based auto-upgrade will no
@@ -1679,19 +1722,19 @@ export async function startControlledNodeSelfUpgrade(
     // unconditionally (macOS gets neither -- its own bootstrap coordinator
     // fetches its component set independently) is cheap and simpler than
     // branching on platform here too.
-    const remoteDesktopWorker = (await downloadControlledNodeRemoteDesktopWorker({
+    const remoteDesktopWorker = (await withArtifactDownloadRetries(() => downloadControlledNodeRemoteDesktopWorker({
       credential,
       target,
-      dir: updateDir,
+      dir: stagingDir,
       fetchImpl,
       expectedVersion: downloaded.version,
-    })) ?? (await downloadControlledNodeLinuxRemoteDesktopWorker({
+    }), { sleep: deps.sleep })) ?? (await withArtifactDownloadRetries(() => downloadControlledNodeLinuxRemoteDesktopWorker({
       credential,
       target,
-      dir: updateDir,
+      dir: stagingDir,
       fetchImpl,
       expectedVersion: downloaded.version,
-    }));
+    }), { sleep: deps.sleep }));
     const destinationPath = deps.execPath ?? defaultStagedExecutablePath(platform);
     const destinationManifestPath = `${destinationPath}.manifest.json`;
     const destinationJournalPath = deps.journalPath ?? join(dirname(defaultCredentialPath(platform)), 'install-journal.json');

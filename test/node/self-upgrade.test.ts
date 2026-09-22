@@ -33,6 +33,7 @@ import {
   scavengeStaleControlledNodeUpgradeDirs,
   startControlledNodeSelfUpgrade,
   windowsControlledNodeUpgradeTaskXml,
+  withArtifactDownloadRetries,
 } from '../../src/node/self-upgrade.js';
 import {
   REMOTE_DESKTOP_WORKER_FILENAME,
@@ -618,6 +619,168 @@ describe('controlled-node self-upgrade', () => {
       sha256,
     });
     expect(nextJournal.stagedReceipt.stagedIdentity.size).toBe(bytes.length);
+  });
+
+  describe('withArtifactDownloadRetries', () => {
+    it('retries a transient network failure and returns the eventual success', async () => {
+      let calls = 0;
+      const sleeps: number[] = [];
+      const result = await withArtifactDownloadRetries(async () => {
+        calls += 1;
+        if (calls < 3) throw new TypeError('fetch failed');
+        return 'ok';
+      }, { sleep: async (ms) => { sleeps.push(ms); } });
+      expect(result).toBe('ok');
+      expect(calls).toBe(3);
+      // Exponential backoff from the base delay, doubling each retry.
+      expect(sleeps).toEqual([3_000, 6_000]);
+    });
+
+    it('caps the backoff delay and exhausts attempts, throwing the last transient error', async () => {
+      let calls = 0;
+      const sleeps: number[] = [];
+      await expect(withArtifactDownloadRetries(async () => {
+        calls += 1;
+        throw new TypeError('fetch failed');
+      }, { attempts: 5, baseDelayMs: 1_000, maxDelayMs: 3_000, sleep: async (ms) => { sleeps.push(ms); } }))
+        .rejects.toThrow('fetch failed');
+      expect(calls).toBe(5);
+      // 1000, 2000, then capped at 3000 for the remaining retries; the 5th
+      // (final) attempt's failure is not followed by a sleep at all.
+      expect(sleeps).toEqual([1_000, 2_000, 3_000, 3_000]);
+    });
+
+    it('does not retry a non-transient failure, such as a real integrity mismatch', async () => {
+      let calls = 0;
+      const sleep = vi.fn(async () => {});
+      await expect(withArtifactDownloadRetries(async () => {
+        calls += 1;
+        throw new Error('artifact_sha256_mismatch');
+      }, { sleep })).rejects.toThrow('artifact_sha256_mismatch');
+      expect(calls).toBe(1);
+      expect(sleep).not.toHaveBeenCalled();
+    });
+  });
+
+  it('recovers a self-upgrade from a transient artifact-download network failure without failing the whole attempt', async () => {
+    // Reproduces the real fleet incident: an office machine on a poor network
+    // link had its artifact download fail with Node's generic `fetch failed`
+    // partway through, requiring a full ~70s server-driven retry cycle for
+    // every dropped connection. This proves the download itself now retries
+    // in-process instead of failing the whole upgrade attempt outright.
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-self-upgrade-retry-test-'));
+    dirs.push(dir);
+    const bytes = Buffer.from('new controlled node exe');
+    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    const helperBytes = Buffer.from('new open computer use helper');
+    const workerBytes = Buffer.from('same-release remote desktop worker');
+    const virtualDisplayBytes = Buffer.from('same-release virtual display archive');
+    const workerManifest = Buffer.from(JSON.stringify({
+      manifestVersion: 2,
+      workerVersion: '2026.7.1',
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      ipcVersion: 1,
+      os: 'win32',
+      arch: 'x64',
+      fileName: REMOTE_DESKTOP_WORKER_FILENAME,
+      size: workerBytes.length,
+      sha256: createHash('sha256').update(workerBytes).digest('hex'),
+      authenticodeSignerSha256: WINDOWS_SIGNER_SHA256,
+      libwebrtcRevision: WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.mediaStackDecision.libwebrtcRevision,
+      virtualDisplay: {
+        archiveFileName: 'imcodes-virtual-display.zip',
+        packageManifestFileName: 'imcodes-virtual-display.manifest.json',
+        size: virtualDisplayBytes.length,
+        sha256: createHash('sha256').update(virtualDisplayBytes).digest('hex'),
+      },
+      toolchain: {
+        msvc: '14.44',
+        windowsSdk: '10.0.26100.0',
+        cmake: 'not-used-gn',
+        ninja: '1.13.1',
+        depotTools: WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.mediaStackDecision.depotToolsRevision,
+      },
+    }));
+    const journalPath = join(dir, 'install-journal.json');
+    await writeFile(journalPath, JSON.stringify({
+      version: 1,
+      phase: 'service_healthy',
+      updatedAt: 1,
+      installId: 'install-1',
+      nodeTokenHash: 'a'.repeat(64),
+      sourceExePath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe',
+      sourceArtifact: { sha256: 'a'.repeat(64), size: 2048 },
+      stagedExePath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe',
+      stagedReceipt: {
+        path: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe',
+        size: 3,
+        sha256: 'b'.repeat(64),
+        sourceIdentity: { size: 3, mtimeMs: 1, ctimeMs: 1 },
+        stagedIdentity: { size: 3, mtimeMs: 1, ctimeMs: 1 },
+      },
+      serverId: 'srv-1',
+      serviceName: 'imcodes-node',
+      serviceReceipt: { name: 'imcodes-node', platform: 'win32', action: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe' },
+      serviceStartRequestedAt: 1,
+      healthyAt: 1,
+    }), 'utf8');
+    let mainArtifactAttempts = 0;
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.includes('asset=computer-use-helper')) {
+        return new Response(helperBytes, {
+          status: 200,
+          headers: {
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: createHash('sha256').update(helperBytes).digest('hex'),
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(helperBytes.length),
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: 'open-computer-use.exe',
+          },
+        });
+      }
+      const isWorkerManifest = url.includes('asset=remote-desktop-worker-manifest');
+      const isVirtualDisplay = url.includes('asset=remote-desktop-virtual-display');
+      const isWorker = url.includes('asset=remote-desktop-worker');
+      if (isWorkerManifest || isVirtualDisplay || isWorker) {
+        const body = isWorkerManifest ? workerManifest : isVirtualDisplay ? virtualDisplayBytes : workerBytes;
+        return new Response(body, {
+          status: 200,
+          headers: {
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: createHash('sha256').update(body).digest('hex'),
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(body.length),
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: isWorkerManifest
+              ? `${REMOTE_DESKTOP_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`
+              : isVirtualDisplay ? 'imcodes-virtual-display.zip' : REMOTE_DESKTOP_WORKER_FILENAME,
+            [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.7.1',
+          },
+        });
+      }
+      // The main node executable: fail with the exact real-world error twice,
+      // then succeed, matching the observed office-machine incident.
+      mainArtifactAttempts += 1;
+      if (mainArtifactAttempts <= 2) throw new TypeError('fetch failed');
+      return new Response(bytes, {
+        status: 200,
+        headers: {
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: sha256,
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(bytes.length),
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: 'imcodes-node.exe',
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: '2026.7.1',
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.AUTHENTICODE_SIGNER_SHA256]: WINDOWS_SIGNER_SHA256,
+        },
+      });
+    });
+    const result = await startControlledNodeSelfUpgrade(credential, '2026.7.1', {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      platform: 'win32',
+      arch: 'x64',
+      execPath: 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe',
+      journalPath,
+      tmpdir: () => dir,
+      now: () => 9,
+      scheduleWindowsUpgrade: () => {},
+      sleep: async () => {},
+    });
+    expect(result).toMatchObject({ ok: true, targetVersion: '2026.7.1', artifactSha256: sha256 });
+    expect(mainArtifactAttempts).toBe(3);
   });
 
   it('does not schedule the main executable when its Windows worker bundle is unavailable', async () => {
