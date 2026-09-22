@@ -11857,16 +11857,68 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
   const query = typeof cmd.query === 'string' ? cmd.query.trim() : '';
   const limit = Math.max(1, Math.min(100, typeof cmd.limit === 'number' ? cmd.limit : 20));
   const includeArchived = cmd.includeArchived === true;
-  let baseStats: ProcessedProjectionStats;
-  try {
-    baseStats = await getContextStoreClient().run<ProcessedProjectionStats>('getProcessedProjectionStats', [{
+  const pendingArgs = {
+    scope: 'personal' as const,
+    userId: ownerUserId,
+    includeLegacyPersonalOwner: true,
+    projectId: projectId || undefined,
+    query: query || undefined,
+    limit,
+  };
+  const summaryArgs: ProcessedProjectionQuery = {
+    scope: 'personal',
+    userId: ownerUserId,
+    includeLegacyPersonalOwner: true,
+    projectId: projectId || undefined,
+    projectionClass,
+    includeArchived,
+  };
+
+  // These four context-store reads are independent of each other's results —
+  // each only references another's value in its OWN error-fallback response,
+  // never as an input — so fire them concurrently instead of one at a time.
+  // Awaiting them in sequence was turning a request that just fills in two
+  // count badges into up to 4 back-to-back worker RPC round-trips.
+  const statsPromise = getContextStoreClient().run<ProcessedProjectionStats>('getProcessedProjectionStats', [{
+    scope: 'personal',
+    userId: ownerUserId,
+    includeLegacyPersonalOwner: true,
+    projectId: projectId || undefined,
+    projectionClass,
+    includeArchived,
+  }]);
+  const recordsPromise: Promise<unknown> = query
+    ? searchLocalMemorySemanticForManagement({
+      query,
+      scope: 'personal',
+      userId: ownerUserId,
+      includeLegacyPersonalOwner: true,
+      repo: projectId || undefined,
+      // `projectionClass` is already validated to the 3 classes at its declaration.
+      projectionClass: projectionClass as Parameters<typeof searchLocalMemorySemanticForManagement>[0]['projectionClass'],
+      limit,
+      includeArchived,
+    })
+    : getContextStoreClient().run<ProcessedContextProjection[]>('queryProcessedProjections', [{
       scope: 'personal',
       userId: ownerUserId,
       includeLegacyPersonalOwner: true,
       projectId: projectId || undefined,
       projectionClass,
+      limit,
       includeArchived,
-    }]);
+    } satisfies ProcessedProjectionQuery]);
+  const pendingPromise = getContextStoreClient().run<ContextPendingEventView[]>('queryPendingContextEvents', [pendingArgs]);
+  const projectsPromise = getContextStoreClient().run<ContextMemoryProjectView[]>('listMemoryProjectSummaries', [summaryArgs]);
+  // An early return below (e.g. stats fails) must not leave a sibling
+  // rejection unobserved — that crashes the daemon on Node's default
+  // unhandledRejection policy. This does not affect the real `await`s below;
+  // a promise's rejection is delivered to every handler attached to it.
+  for (const settled of [statsPromise, recordsPromise, pendingPromise, projectsPromise]) settled.catch(() => {});
+
+  let baseStats: ProcessedProjectionStats;
+  try {
+    baseStats = await statsPromise;
   } catch (error) {
     logger.warn({ error }, 'personal memory stats unavailable');
     sendPersonalMemoryUnavailable(serverLink, requestId);
@@ -11891,24 +11943,13 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
   let matchedRecords: number;
 
   if (query) {
-    const semanticQuery: Parameters<typeof searchLocalMemorySemanticForManagement>[0] = {
-      query,
-      scope: 'personal',
-      userId: ownerUserId,
-      includeLegacyPersonalOwner: true,
-      repo: projectId || undefined,
-      // `projectionClass` is already validated to the 3 classes at its declaration.
-      projectionClass: projectionClass as Parameters<typeof searchLocalMemorySemanticForManagement>[0]['projectionClass'],
-      limit,
-      includeArchived,
-    };
     // R5 management semantic read goes through the worker (bounded L3 RPC) too,
     // off the daemon main thread. Unlike R1, unavailable/timeout errors are
     // reported explicitly to the management surface instead of becoming a
     // successful empty recall.
     let semantic: Awaited<ReturnType<typeof searchLocalMemorySemanticForManagement>>;
     try {
-      semantic = await searchLocalMemorySemanticForManagement(semanticQuery);
+      semantic = await recordsPromise as Awaited<ReturnType<typeof searchLocalMemorySemanticForManagement>>;
     } catch (error) {
       logger.warn({ error }, 'personal memory semantic query unavailable');
       sendPersonalMemoryUnavailable(serverLink, requestId, { ...baseStats, matchedRecords: 0 });
@@ -11931,17 +11972,8 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
       }));
     matchedRecords = records.length;
   } else {
-    const queryArgs: ProcessedProjectionQuery = {
-      scope: 'personal',
-      userId: ownerUserId,
-      includeLegacyPersonalOwner: true,
-      projectId: projectId || undefined,
-      projectionClass,
-      limit,
-      includeArchived,
-    };
     try {
-      records = (await getContextStoreClient().run<ProcessedContextProjection[]>('queryProcessedProjections', [queryArgs])).map((projection) => ({
+      records = (await recordsPromise as ProcessedContextProjection[]).map((projection) => ({
         id: projection.id,
         scope: projection.namespace.scope as 'personal',
         projectId: projection.namespace.projectId ?? '',
@@ -11971,27 +12003,10 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
     ...baseStats,
     matchedRecords,
   };
-  const pendingArgs = {
-    scope: 'personal' as const,
-    userId: ownerUserId,
-    includeLegacyPersonalOwner: true,
-    projectId: projectId || undefined,
-    query: query || undefined,
-    limit,
-  };
-  const summaryArgs: ProcessedProjectionQuery = {
-    scope: 'personal',
-    userId: ownerUserId,
-    includeLegacyPersonalOwner: true,
-    projectId: projectId || undefined,
-    projectionClass,
-    includeArchived,
-  };
   let pendingRecords: ContextPendingEventView[];
   let projects: ContextMemoryProjectView[];
   try {
-    pendingRecords = await getContextStoreClient().run<ContextPendingEventView[]>('queryPendingContextEvents', [pendingArgs]);
-    projects = await getContextStoreClient().run<ContextMemoryProjectView[]>('listMemoryProjectSummaries', [summaryArgs]);
+    [pendingRecords, projects] = await Promise.all([pendingPromise, projectsPromise]);
   } catch (error) {
     logger.warn({ error }, 'personal memory supplemental views unavailable');
     sendPersonalMemoryUnavailable(serverLink, requestId, stats);

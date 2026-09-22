@@ -1377,8 +1377,13 @@ describe('handleWebCommand memory context timeline', () => {
         localUnavailable: true,
       }),
     }));
-    expect(queryPendingContextEventsMock).not.toHaveBeenCalled();
-    expect(listMemoryProjectSummariesMock).not.toHaveBeenCalled();
+    // The four context-store reads fire concurrently rather than one at a
+    // time (sequential round trips made every load of this "just show two
+    // count badges" panel noticeably slow), so a failure in one no longer
+    // holds the others back -- their results are simply discarded once the
+    // response is already going to report unavailable.
+    expect(queryPendingContextEventsMock).toHaveBeenCalled();
+    expect(listMemoryProjectSummariesMock).toHaveBeenCalled();
   });
 
   it('returns a structured response instead of rejecting when personal memory stats are unavailable', async () => {
@@ -1408,7 +1413,9 @@ describe('handleWebCommand memory context timeline', () => {
       errorCode: MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED,
       stats: expect.objectContaining({ localUnavailable: true }),
     }));
-    expect(queryProcessedProjectionsMock).not.toHaveBeenCalled();
+    // Fired concurrently with the (failing) stats read rather than gated
+    // behind it; its result is simply discarded once stats fails.
+    expect(queryProcessedProjectionsMock).toHaveBeenCalled();
   });
 
   it('bounds observation reads to authorized namespaces inside the context-store worker', async () => {
