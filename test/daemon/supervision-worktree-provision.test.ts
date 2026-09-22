@@ -498,4 +498,39 @@ describe('supervision assignment worktree provisioning', () => {
     await expect(resolveSupervisionWorktreeBase({ projectRoot: shape.source, requestedBaseRevision: 'missing-ref' }))
       .resolves.toMatchObject({ ok: false, reason: 'base_unavailable' });
   });
+
+  it('adopts a project with no prior Git history instead of refusing every task in it forever', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'imcodes-supervision-provision-'));
+    roots.push(root);
+    const nonGitProject = join(root, 'plain-project');
+    mkdirSync(nonGitProject);
+    writeFileSync(join(nonGitProject, 'existing.txt'), 'pre-existing project file\n');
+    expect(existsSync(join(nonGitProject, '.git'))).toBe(false);
+
+    const resolved = await resolveSupervisionWorktreeBase({ projectRoot: nonGitProject });
+    expect(resolved.ok).toBe(true);
+    if (!resolved.ok) throw new Error('unreachable');
+    expect(resolved.baseRevision).toMatch(/^[0-9a-f]{40}$/);
+
+    // A Git repo now exists and the initial commit captured the file that
+    // was already on disk -- not an empty tree, which would make every
+    // pre-existing file look like a brand new addition in the first diff.
+    expect(existsSync(join(nonGitProject, '.git'))).toBe(true);
+    expect(git(nonGitProject, 'show', `${resolved.baseRevision}:existing.txt`)).toBe('pre-existing project file');
+    expect(git(nonGitProject, 'status', '--porcelain')).toBe('');
+
+    // Idempotent: calling it again on the now-adopted repo must not create a
+    // second commit or otherwise disturb history.
+    const second = await resolveSupervisionWorktreeBase({ projectRoot: nonGitProject });
+    expect(second).toEqual(resolved);
+    expect(git(nonGitProject, 'rev-list', '--count', 'HEAD')).toBe('1');
+
+    // The adopted repo is now a genuinely usable worktree source: an
+    // implementer's subsequent edit is a normal, isolated diff against it.
+    const ensured = await ensureSupervisionAssignmentWorktree({
+      projectRoot: nonGitProject, sessionName: 'deck_sub_worker', assignmentId: 'supervision_assignment_adopted',
+      baseRevision: resolved.baseRevision,
+    });
+    expect(ensured).toMatchObject({ ok: true, created: true });
+  });
 });

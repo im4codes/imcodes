@@ -384,14 +384,46 @@ async function acquireProvisionLease(input: {
   };
 }
 
+/**
+ * Adopt a project the supervision worktree/bundle mechanism has never seen as
+ * a Git repo: `git init`, then commit its entire current state as-is. An
+ * empty initial commit would make every pre-existing file look like a brand
+ * new addition in the first diff against it, so this always stages and
+ * commits whatever is actually on disk (nothing, for a genuinely empty
+ * project) rather than starting from a blank tree. Committer identity is
+ * passed explicitly so this does not depend on a global Git config existing
+ * in the daemon's environment. Idempotent: re-running against an
+ * already-initialized repo is a safe no-op (`git init` on an existing repo
+ * does not touch history, and the commit step below is skipped once
+ * `--is-inside-work-tree` already reports true on the next call).
+ */
+async function ensureSupervisionProjectGitRepo(root: string): Promise<void> {
+  await git(root, ['init'], 10_000);
+  await git(root, ['add', '-A'], 60_000);
+  await git(root, [
+    '-c', 'user.email=imcodes-supervision@localhost',
+    '-c', 'user.name=IM.codes',
+    'commit', '--allow-empty', '--no-gpg-sign',
+    '-m', 'imcodes: adopt project for supervision auditing (auto-created, no prior Git history)',
+  ], 30_000);
+}
+
 export async function resolveSupervisionWorktreeBase(input: {
   projectRoot: string;
   requestedBaseRevision?: string | null;
 }): Promise<{ ok: true; baseRevision: string } | { ok: false; reason: SupervisionWorktreeProvisionReason; detail: string }> {
   try {
     const root = await realpath(resolve(input.projectRoot));
-    if ((await git(root, ['rev-parse', '--is-inside-work-tree'], 5_000)).trim() !== 'true') {
-      return { ok: false, reason: SUPERVISION_WORKTREE_PROVISION_REASONS.PROJECT_UNAVAILABLE, detail: 'project root is not a Git worktree' };
+    if ((await git(root, ['rev-parse', '--is-inside-work-tree'], 5_000).catch(() => '')).trim() !== 'true') {
+      // A project the supervision system has never seen as a Git repo (or one
+      // an implementer's edits landed in before anyone ran `git init`) has no
+      // commit to diff, freeze, or audit against -- the whole worktree/bundle
+      // mechanism is Git-only. Rather than refuse every task in that project
+      // forever, adopt it: capture its current on-disk state as the initial
+      // commit so later diffs compare against the implementer's real edits,
+      // not the entire pre-existing tree. Only the caller's own project root
+      // is ever touched, matching every other trust boundary in this module.
+      await ensureSupervisionProjectGitRepo(root);
     }
     const requested = input.requestedBaseRevision?.trim() || 'HEAD';
     const baseRevision = (await git(root, ['rev-parse', '--verify', '--end-of-options', `${requested}^{commit}`], 5_000)).trim().toLowerCase();
