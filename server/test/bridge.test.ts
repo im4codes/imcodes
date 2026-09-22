@@ -1334,6 +1334,24 @@ describe('WsBridge', () => {
       expect(thirdWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(1);
     });
 
+    it('fences an exact rolled-back controlled-node target instead of retrying the destructive upgrade loop', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.9.4544-dev.5197';
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN), {} as never);
+      ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.9.4537-dev.5183', capabilities: [] }));
+      await flushAsync();
+      ws.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+        targetVersion: process.env.APP_VERSION,
+      }));
+      await flushAsync();
+      expect(bridge.requestDaemonUpgrade({ targetVersion: process.env.APP_VERSION, source: 'auto' }))
+        .toMatchObject({ deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.BACKOFF, reason: 'terminal_install_failure' });
+    });
+
     it('retries auto daemon.upgrade after transient daemon upgrade blockers clear without waiting for reconnect', async () => {
       vi.useFakeTimers();
       process.env.APP_VERSION = '2026.4.905-dev.877';

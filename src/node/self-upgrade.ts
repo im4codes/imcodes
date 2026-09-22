@@ -74,6 +74,27 @@ const CONTROLLED_NODE_UPGRADE_MAX_LSTAT = 128;
 const CONTROLLED_NODE_UPGRADE_MAX_MARKER_READ = 64;
 const CONTROLLED_NODE_UPGRADE_MAX_DELETE = 32;
 const CONTROLLED_NODE_ARTIFACT_IO_BUFFER_BYTES = 64 * 1024;
+
+/**
+ * Rollback runs outside the node process, so the old generation reports the
+ * durable result after it reconnects. Only a completed authenticated-health
+ * rollback for a concrete version is terminal; malformed/stale diagnostics
+ * remain inert.
+ */
+export async function readPreviousWindowsUpgradeFailure(journalPath: string): Promise<{ targetVersion: string } | null> {
+  if (process.platform !== 'win32') return null;
+  try {
+    const raw = JSON.parse(await readFile(join(dirname(journalPath), 'last-upgrade-result.json'), 'utf8')) as Record<string, unknown>;
+    if (raw.status !== 'rolled_back' || raw.failedPhase !== 'restart_health' || typeof raw.targetVersion !== 'string') return null;
+    const targetVersion = raw.targetVersion.trim();
+    return /^[0-9]+(?:\.[0-9]+){1,3}(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?$/.test(targetVersion)
+      ? { targetVersion }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 const CONTROLLED_NODE_UPGRADE_PRODUCT = CONTROLLED_NODE_WINDOWS_UPGRADE_PRODUCT;
 const CONTROLLED_NODE_UPGRADE_DIR_PATTERN = /^imcodes-node-upgrade-[A-Za-z0-9_-]{6,128}$/;
 const CONTROLLED_NODE_UPGRADE_TOKEN_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;

@@ -8763,13 +8763,17 @@ export class WsBridge {
       }
     }
 
-    // Controlled nodes intentionally expose only the minimal { type, reason }
-    // blocker envelope. They cannot provide the lifecycle identity and ACK
-    // metadata that make terminal failure handling safe for full daemons, so a
-    // short node-side failure must remain automatically retryable.
-    const retryDelayMs = this.daemonNodeRole === NODE_ROLE.CONTROLLED
-      ? DAEMON_UPGRADE_BLOCKED_RETRY_MS
-      : this.daemonUpgradeBlockedRetryDelayMs(msg);
+    // A rolled-back one-shot is reported by the recovered controlled node.
+    // It names the failed target, so it is safe to fence that exact server
+    // release rather than restarting the same destructive loop every minute.
+    const controlledTerminalFailure = this.daemonNodeRole === NODE_ROLE.CONTROLLED
+      && msg.reason === DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED
+      && failedTargetVersion === serverVersion;
+    const retryDelayMs = controlledTerminalFailure
+      ? null
+      : this.daemonNodeRole === NODE_ROLE.CONTROLLED
+        ? DAEMON_UPGRADE_BLOCKED_RETRY_MS
+        : this.daemonUpgradeBlockedRetryDelayMs(msg);
     if (retryDelayMs == null) {
       const replayBeforeSync = this.upgradeBlockedSyncRequiredGeneration === this.daemonGeneration
         && this.upgradeBlockedSyncCompleteGeneration !== this.daemonGeneration;

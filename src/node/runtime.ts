@@ -316,6 +316,8 @@ export interface ControlledNodeRuntimeOptions {
   onAuthenticationError?: (error: unknown) => void;
   /** Called for every authenticated server heartbeat acknowledgement. */
   onHeartbeatAck?: () => void | Promise<void>;
+  /** Reads one durable failed Windows one-shot upgrade after rollback. */
+  readPreviousUpgradeFailure?: () => Promise<{ targetVersion: string } | null>;
   /**
    * Test seam: the daemons bound on this computer (serverIds only). Defaults to
    * reading each user's `.imcodes/server.json`; see local-daemon-discovery.ts.
@@ -815,6 +817,7 @@ export function createControlledNodeRuntime(
   let authenticationPersisted = false;
   let authenticationPersistenceInFlight = false;
   let legacyUpgradeRescueCleanupStarted = false;
+  let previousUpgradeFailureReported = false;
   const activeMachineDirectTransfers = new Set<string>();
   const reportAuthenticationError = (error: unknown) => {
     try {
@@ -823,6 +826,21 @@ export function createControlledNodeRuntime(
       // Error reporting must not strand the retry gate or create a rejection.
     }
   };
+  const reportPreviousUpgradeFailure = (): void => {
+    if (previousUpgradeFailureReported || platform !== 'win32' || !options.readPreviousUpgradeFailure) return;
+    previousUpgradeFailureReported = true;
+    void options.readPreviousUpgradeFailure().then((failure) => {
+      if (!failure) return;
+      client.send({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+        targetVersion: failure.targetVersion,
+      });
+    }).catch(() => {
+      // The persisted diagnostic is optional: a read failure must never affect a live node.
+    });
+  };
+
   const persistAuthentication = () => {
     if (authenticationPersisted || authenticationPersistenceInFlight) return;
     authenticationPersistenceInFlight = true;
@@ -1263,6 +1281,7 @@ export function createControlledNodeRuntime(
         // Servers send neither field and the offset stays 0 (local clock).
         serverClock.addSample(message[CLOCK_SYNC_FIELD.SENT_AT], message[CLOCK_SYNC_FIELD.SERVER_TIME], Date.now());
         reportStalledUpgradeHandoff();
+        reportPreviousUpgradeFailure();
         persistAuthentication();
         reportLocalDaemonsIfDue();
         if (remoteDesktopWorkerRepairEligibleAt === null) {

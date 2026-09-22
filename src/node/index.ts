@@ -4,6 +4,7 @@ import { bootstrapControlledNodeWithDisposition, defaultBootstrapDeps, journalPa
 import { runComputerUseIpcHelper } from './computer-use-ipc.js';
 import { createMacosRemoteDesktopProductionDependencies } from './macos-remote-desktop-production.js';
 import { createControlledNodeRuntime } from './runtime.js';
+import { readPreviousWindowsUpgradeFailure } from './self-upgrade.js';
 import {
   createRemoteDesktopSignedShellLauncher,
   resolveRemoteDesktopAccountShellArtifact,
@@ -287,6 +288,7 @@ async function main(): Promise<void> {
       process.stderr.write(`imcodes-node: failed to record service_healthy (${message})\n`);
     },
     onHeartbeatAck: healthLease?.recordAuthenticatedHeartbeat,
+    readPreviousUpgradeFailure: () => readPreviousWindowsUpgradeFailure(deps.journalPath),
     remoteDesktopAccessPaused,
   });
   const localPanel = bootstrap.credential.nodeId

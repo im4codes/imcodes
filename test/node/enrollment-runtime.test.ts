@@ -1572,3 +1572,25 @@ describe('controlled node enrollment and runtime', () => {
     runtime.stop();
   });
 });
+
+describe('recovered Windows upgrade failure reporting', () => {
+  it('reports one durable restart-health rollback for its exact target after authentication', async () => {
+    const socket = new MockSocket();
+    const readPreviousUpgradeFailure = vi.fn(async () => ({ targetVersion: '2026.9.4544-dev.5197' }));
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example', serverId: 'controlled-1', token: 'secret', nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, { platform: 'win32', readPreviousUpgradeFailure });
+    runtime.start();
+    socket.open();
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(socket.sent.map(JSON.parse)).toContainEqual({
+      type: DAEMON_MSG.UPGRADE_BLOCKED,
+      reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+      targetVersion: '2026.9.4544-dev.5197',
+    }));
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(readPreviousUpgradeFailure).toHaveBeenCalledTimes(1);
+    runtime.stop();
+  });
+});
