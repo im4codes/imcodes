@@ -17,6 +17,12 @@ import { discoverLocalDaemonServerIds } from './local-daemon-discovery.js';
 import { MachineExecWorker } from './machine-exec-worker.js';
 import { ComputerUseWorker } from './computer-use-worker.js';
 import {
+  getStartupDiagnosticsLog,
+  STARTUP_DIAGNOSTIC_EVENT,
+  STARTUP_DIAGNOSTICS_HEALTH_LEASE_TIMEOUT_MS,
+  type StartupDiagnosticsLog,
+} from './startup-diagnostics.js';
+import {
   downloadControlledNodeMacosRemoteDesktopComponentSet,
   startControlledNodeSelfUpgrade,
 } from './self-upgrade.js';
@@ -319,6 +325,12 @@ export interface ControlledNodeRuntimeOptions {
   /** Reads one durable failed Windows one-shot upgrade after rollback. */
   readPreviousUpgradeFailure?: () => Promise<{ targetVersion: string } | null>;
   /**
+   * Pure observability seam (test injection only in production it always
+   * defaults to the process-wide singleton). Never used for any
+   * upgrade/rollback/fencing decision.
+   */
+  diagnostics?: StartupDiagnosticsLog;
+  /**
    * Test seam: the daemons bound on this computer (serverIds only). Defaults to
    * reading each user's `.imcodes/server.json`; see local-daemon-discovery.ts.
    */
@@ -393,6 +405,17 @@ export function createControlledNodeRuntime(
   let onMacosRemoteDesktopProfileChanged = (): void => undefined;
   const platform = options.platform ?? process.platform;
   const arch = options.arch ?? process.arch;
+  // Pure observability: records what this startup actually observed. See
+  // ./startup-diagnostics.ts. Armed once, for the lifetime of THIS process,
+  // against the same 120s window the Server's restart_health gate enforces —
+  // not re-armed per reconnect, so a process that keeps reconnecting every
+  // few seconds without ever publishing a lease still reports the timeout
+  // instead of resetting it forever.
+  const diagnostics = options.diagnostics ?? getStartupDiagnosticsLog();
+  let authAckObservedOnce = false;
+  let healthLeasePublishObservedOnce = false;
+  diagnostics.record(STARTUP_DIAGNOSTIC_EVENT.PROCESS_START, { platform, arch, pid: process.pid });
+  diagnostics.armHealthLeaseTimeout(STARTUP_DIAGNOSTICS_HEALTH_LEASE_TIMEOUT_MS);
   const platformWorker = options.remoteDesktopWorker
     ? { worker: options.remoteDesktopWorker }
     : createPlatformRemoteDesktopWorkerHost({
@@ -1225,12 +1248,20 @@ export function createControlledNodeRuntime(
     onDiagnostic: (event) => {
       if (event.type === 'socket_opened') {
         logger.info({ lifecycle: event.type }, 'controlled-node transport connected');
+        // The auth frame is sent synchronously by AuthenticatedWebSocketClient
+        // immediately before it emits `socket_opened` (see
+        // src/transport/authenticated-websocket.ts): by the time this fires,
+        // `auth` has already gone out. Never log the frame itself (it carries
+        // `token`) — only the fact and timing of the two events.
+        diagnostics.record(STARTUP_DIAGNOSTIC_EVENT.WS_CONNECT_ESTABLISHED, {});
+        diagnostics.record(STARTUP_DIAGNOSTIC_EVENT.AUTH_SENT, {});
       } else if (event.type === 'reconnect_scheduled') {
         logger.info({ lifecycle: event.type, delayMs: event.delayMs }, 'controlled-node transport reconnect scheduled');
       } else {
         // Deliberately exclude URL, auth frames and message bodies. This is
         // safe to collect from an affected laptop without exposing secrets.
         logger.warn({ lifecycle: event.type, reason: event.reason }, 'controlled-node transport disconnected');
+        diagnostics.record(STARTUP_DIAGNOSTIC_EVENT.WS_CONNECT_FAILED, { reason: event.reason });
       }
     },
     createSocket: (url) => {
@@ -1240,6 +1271,7 @@ export function createControlledNodeRuntime(
       ensureSignedShellController();
       refreshAuthCapabilities();
       authenticatedCapabilities = JSON.stringify(authFrame.capabilities);
+      diagnostics.record(STARTUP_DIAGNOSTIC_EVENT.WS_CONNECT_ATTEMPT, {});
       return createSocket(url);
     },
     onOpen: () => {
@@ -1277,6 +1309,15 @@ export function createControlledNodeRuntime(
         return;
       }
       if (isControlledNodeAuthAck(message)) {
+        // `heartbeat_ack` doubles as the auth-ack signal and repeats every
+        // 5s for the life of the connection. Diagnostics only cares about the
+        // FIRST one (the startup handshake); recording every repeat would
+        // flood and rotate away the actual startup evidence during a long
+        // healthy run.
+        if (!authAckObservedOnce) {
+          authAckObservedOnce = true;
+          diagnostics.record(STARTUP_DIAGNOSTIC_EVENT.AUTH_ACK, {});
+        }
         // Every ack from a clock-aware Server is one round-trip sample. Older
         // Servers send neither field and the offset stays 0 (local clock).
         serverClock.addSample(message[CLOCK_SYNC_FIELD.SENT_AT], message[CLOCK_SYNC_FIELD.SERVER_TIME], Date.now());
@@ -1296,6 +1337,17 @@ export function createControlledNodeRuntime(
         void installMacosRemoteDesktopComponents();
         try {
           void Promise.resolve(options.onHeartbeatAck?.()).then(async () => {
+            // `onHeartbeatAck` is what triggers the health-lease publisher's
+            // (fire-and-forget) durable write — see src/node/health-lease.ts
+            // `recordAuthenticatedHeartbeat`. This process has no visibility
+            // into whether that specific disk write later succeeds or fails;
+            // recording the first callback invocation is the closest signal
+            // available from here, and is exactly the trigger the real
+            // restart_health incident needed evidence of.
+            if (!healthLeasePublishObservedOnce) {
+              healthLeasePublishObservedOnce = true;
+              diagnostics.record(STARTUP_DIAGNOSTIC_EVENT.HEALTH_LEASE_PUBLISHED, {});
+            }
             if (legacyUpgradeRescueCleanupStarted) return;
             legacyUpgradeRescueCleanupStarted = true;
             try {

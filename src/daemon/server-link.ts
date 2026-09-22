@@ -2,6 +2,7 @@ import os from 'node:os';
 import { performance } from 'node:perf_hooks';
 import type { TimelineEvent } from './timeline-event.js';
 import logger from '../util/logger.js';
+import { getStartupDiagnosticsLog, STARTUP_DIAGNOSTIC_EVENT } from '../node/startup-diagnostics.js';
 import { DAEMON_VERSION } from '../util/version.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import {
@@ -449,6 +450,14 @@ export function __setServerLinkDataPlaneQueueConfigForTests(options: {
 
 export class ServerLink {
   private ws: WebSocket | null = null;
+  /**
+   * Pure observability, shared with the controlled-node runtime (see
+   * src/node/startup-diagnostics.ts): the full daemon's connect/auth
+   * lifecycle written to the same startup-diagnostics.log convention.
+   * Unlike a controlled node, the full daemon has no health-lease concept,
+   * so only connect/auth events are recorded here.
+   */
+  private readonly diagnostics = getStartupDiagnosticsLog();
   private handlers: MessageHandler[] = [];
   private openHandlers: Array<() => void> = [];
   private binaryHandlers: BinaryMessageHandler[] = [];
@@ -505,6 +514,10 @@ export class ServerLink {
     this.workerUrl = opts.workerUrl;
     this.serverId = opts.serverId;
     this.token = opts.token;
+    this.diagnostics.record(STARTUP_DIAGNOSTIC_EVENT.PROCESS_START, {
+      platform: process.platform,
+      pid: process.pid,
+    });
   }
 
   getServerId(): string {
@@ -538,6 +551,7 @@ export class ServerLink {
 
     const wsUrl = this.workerUrl.replace(/^http/, 'ws') + `/api/server/${this.serverId}/ws`;
     logger.info({ url: wsUrl }, 'ServerLink: connecting');
+    this.diagnostics.record(STARTUP_DIAGNOSTIC_EVENT.WS_CONNECT_ATTEMPT, {});
     this.recordRuntimeLinkStatus({ state: 'connecting', workerUrl: this.workerUrl, serverId: this.serverId });
     this.reconnecting = false;
     const ws = new WebSocket(wsUrl);
@@ -570,6 +584,12 @@ export class ServerLink {
       if (this.ws !== ws) return; // replaced before open
       clearConnectTimeout();
       logger.info('ServerLink: connected');
+      this.diagnostics.record(STARTUP_DIAGNOSTIC_EVENT.WS_CONNECT_ESTABLISHED, {});
+      // The auth frame is sent a few lines below, synchronously in this same
+      // handler, before anything can yield back to the event loop — safe to
+      // record it as sent right here, without ever logging the frame itself
+      // (it carries `token`).
+      this.diagnostics.record(STARTUP_DIAGNOSTIC_EVENT.AUTH_SENT, {});
       this.backoffMs = INITIAL_BACKOFF_MS;
       this.dataPlaneSocketBackpressured = false;
       this.dataPlaneOverloadReconnectRequested = false;
@@ -685,6 +705,7 @@ export class ServerLink {
       const errorMessage = (event as ErrorEvent).message ?? 'unknown';
       clearServerLinkSecurity('socket_error');
       logger.warn({ error: errorMessage }, 'ServerLink: error');
+      this.diagnostics.record(STARTUP_DIAGNOSTIC_EVENT.WS_CONNECT_FAILED, { reason: errorMessage });
       this.recordRuntimeLinkStatus({
         state: 'disconnected',
         lastDisconnectedAt: Date.now(),
