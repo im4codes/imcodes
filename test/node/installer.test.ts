@@ -214,6 +214,9 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
             expect(args.join(' ')).toContain('[int]$_.State -notin @(2,4)');
             expect(args.join(' ')).toContain('$info.NextRunTime -le $now');
             expect(args.join(' ')).not.toContain('Stop-ScheduledTask -InputObject');
+            expect(args.join(' ')).toContain("$preserved -notcontains $_.TaskName");
+            expect(args.join(' ')).toContain(CONTROLLED_NODE_SERVICE.WINDOWS_LEGACY_UPGRADE_RESCUE_TASK);
+            expect(args.join(' ')).toContain(CONTROLLED_NODE_SERVICE.WINDOWS_LEGACY_UPGRADE_RESTART_TASK);
           } else {
             expect(args).toEqual(windowsStopControlledNodeGenerationArgs(WINDOWS_EXE));
           }
@@ -255,6 +258,20 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
       .toEqual(Buffer.from([0xff, 0xfe]));
     expect(artifactPaths).toHaveLength(2);
     expect(artifactPaths.every((path) => !existsSync(path))).toBe(true);
+  });
+
+  it('the stale-upgrade-task sweep never deletes the legacy rescue/restart infrastructure tasks, even though they share its name prefix and sit idle between triggers just like a real stale task', () => {
+    const script = windowsStaleUpgradeTaskCleanupArgs().join(' ');
+    // Both infra tasks are registered under the same imcodes-node-upgrade-
+    // prefix as the one-shot per-attempt upgrader tasks this sweep targets,
+    // and both are legitimately idle (Ready state, no NextRunTime) between
+    // triggers -- exactly the condition this sweep otherwise deletes on.
+    expect(script).toContain(CONTROLLED_NODE_SERVICE.WINDOWS_LEGACY_UPGRADE_RESCUE_TASK);
+    expect(script).toContain(CONTROLLED_NODE_SERVICE.WINDOWS_LEGACY_UPGRADE_RESTART_TASK);
+    expect(script).toContain('$preserved -notcontains $_.TaskName');
+    // The sweep must still target actual stale one-shot upgrader tasks (UUID-suffixed).
+    expect(script).toContain("Get-ScheduledTask -TaskName 'imcodes-node-upgrade-*'");
+    expect(script).toContain('Unregister-ScheduledTask -InputObject $_');
   });
 
   it('Windows credential dir is ProgramData-scoped (SYSTEM service), honoring %ProgramData% (10.10)', () => {

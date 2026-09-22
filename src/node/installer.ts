@@ -370,11 +370,21 @@ export function windowsHealthWatchdogTaskArgs(taskXmlPath: string): string[] {
 export function windowsStaleUpgradeTaskCleanupArgs(): string[] {
   const pattern = `${CONTROLLED_NODE_WINDOWS_UPGRADE_TASK_PREFIX}*`;
   const prefix = CONTROLLED_NODE_WINDOWS_UPGRADE_TASK_PREFIX;
+  // The legacy-rescue infrastructure (rescue/restart tasks, registered and
+  // lifecycle-managed separately by windows-controlled-node-upgrade-rescue.ts)
+  // shares this same name prefix with the one-shot per-attempt upgrader tasks
+  // this sweep exists to clean up. Both are legitimately idle (no NextRunTime)
+  // between triggers, so without this exclusion a reinstall/upgrade deletes the
+  // rescue infrastructure itself, permanently breaking legacy restart recovery.
+  const preservedNames = [
+    CONTROLLED_NODE_SERVICE.WINDOWS_LEGACY_UPGRADE_RESCUE_TASK,
+    CONTROLLED_NODE_SERVICE.WINDOWS_LEGACY_UPGRADE_RESTART_TASK,
+  ].map((name) => `'${name}'`).join(', ');
   return [
     '-NoProfile',
     '-NonInteractive',
     '-Command',
-    `$ErrorActionPreference = 'Stop'; $now = Get-Date; Get-ScheduledTask -TaskName '${pattern}' -ErrorAction SilentlyContinue | Where-Object { $_.TaskName.StartsWith('${prefix}', [StringComparison]::OrdinalIgnoreCase) -and [int]$_.State -notin @(2,4) } | ForEach-Object { $info = Get-ScheduledTaskInfo -TaskName $_.TaskName -ErrorAction Stop; if (-not $info.NextRunTime -or $info.NextRunTime -le $now) { Unregister-ScheduledTask -InputObject $_ -Confirm:$false -ErrorAction Stop } }`,
+    `$ErrorActionPreference = 'Stop'; $now = Get-Date; $preserved = @(${preservedNames}); Get-ScheduledTask -TaskName '${pattern}' -ErrorAction SilentlyContinue | Where-Object { $_.TaskName.StartsWith('${prefix}', [StringComparison]::OrdinalIgnoreCase) -and [int]$_.State -notin @(2,4) -and $preserved -notcontains $_.TaskName } | ForEach-Object { $info = Get-ScheduledTaskInfo -TaskName $_.TaskName -ErrorAction Stop; if (-not $info.NextRunTime -or $info.NextRunTime -le $now) { Unregister-ScheduledTask -InputObject $_ -Confirm:$false -ErrorAction Stop } }`,
   ];
 }
 
