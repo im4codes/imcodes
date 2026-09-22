@@ -2471,6 +2471,24 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
             idempotencyKey: stringArg(args, 'idempotencyKey'),
           });
       if (!task.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `task_start rejected: ${task.reason}`);
+      if (!existing && authoritativeBrain && requestedRole !== 'coordinator') {
+        // A task minted without ever routing through Brain's own dispatch flow
+        // (a sub-session self-registering directly via task_start) must still
+        // leave the project's own Brain able to coordinate it -- open_audit,
+        // recover, and integration all require a durable coordinator
+        // assignment. A Brain unable to act on a task in its own project is
+        // never acceptable, independent of whether automatic routing
+        // (supervisionMode) is enabled. Best-effort: this must never fail the
+        // caller's own registration, and is idempotent per task so a retried
+        // task_start never mints a second coordinator assignment.
+        registry.createAssignment({
+          taskId: task.value.taskId,
+          role: 'coordinator' as never,
+          identity: authoritativeBrain,
+          scopeFiles: [],
+          idempotencyKey: `auto-coordinator:${task.value.taskId}`,
+        });
+      }
       if (existing && callerIsAuthoritativeBrain && requestedRole === 'coordinator') {
         const coordinators = existing.assignments.filter((assignment) => assignment.role === 'coordinator');
         if (coordinators.length === 1) {

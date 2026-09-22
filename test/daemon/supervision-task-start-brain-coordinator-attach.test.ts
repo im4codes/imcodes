@@ -56,7 +56,10 @@ function handlersFor(caller: SessionRecord, allSessions: SessionRecord[]) {
   );
 }
 
-/** Implementer self-initiates a task the way tsk_v4n really was: no coordinator ever bound. */
+/** Implementer self-initiates a task via task_start: the project's unique live
+ *  Brain (when resolvable) is now auto-attached as coordinator the moment the
+ *  task is created — see the `!existing && authoritativeBrain` branch in
+ *  SUPERVISION_TASK_START. */
 async function selfInitiateImplementerTask(allSessions: SessionRecord[]) {
   const result = await handlersFor(implementer, allSessions)[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START]({
     role: 'implementer', classification: 'independent_top_level',
@@ -66,17 +69,70 @@ async function selfInitiateImplementerTask(allSessions: SessionRecord[]) {
   return (result as { taskId: string }).taskId;
 }
 
+function directIdentityOf(record: SessionRecord) {
+  return {
+    sessionName: record.name,
+    sessionInstanceId: record.sessionInstanceId,
+    runtimeEpoch: record.runtimeEpoch,
+    agentType: record.agentType,
+    providerFamily: 'openai',
+  };
+}
+
+/**
+ * The pre-auto-attach shape (tsk_v4n): a task with an implementer and
+ * deliberately ZERO coordinator rows, built directly against the registry so
+ * task_start's own auto-attach (which only runs inside that MCP handler)
+ * never fires. Used only where a test's whole point is what happens to a
+ * task that genuinely has no coordinator yet.
+ */
+function directlyRegisterImplementerTaskWithNoCoordinator(implementerRecord: SessionRecord): string {
+  const registry = getSupervisionTaskRegistry();
+  const created = registry.createOrGet({
+    projectName: 'alpha', classification: 'independent_top_level', objective: 'fix the thing',
+  });
+  if (!created.ok) throw new Error(`fixture failed: ${created.reason}`);
+  const taskId = created.value.taskId;
+  const assigned = registry.createAssignment({
+    taskId, role: 'implementer', identity: directIdentityOf(implementerRecord), scopeFiles: ['src/a.ts'],
+  });
+  if (!assigned.ok) throw new Error(`fixture failed: ${assigned.reason}`);
+  expect(getSupervisionTaskRegistry().get(taskId)?.assignments.some((a) => a.role === 'coordinator')).toBe(false);
+  return taskId;
+}
+
 describe('supervision_task_start lets the project Brain attach coordinator to a coordinator-less task', () => {
   beforeEach(() => resetSupervisionTaskRegistryForTests());
   afterEach(() => resetSupervisionTaskRegistryForTests());
 
-  it('(a) succeeds for the unique live Brain on a task it never participated in', async () => {
+  it('(a) auto-attaches the unique live Brain as coordinator the moment a self-registered task is created', async () => {
     const sessions = [brain, implementer];
     const taskId = await selfInitiateImplementerTask(sessions);
-    expect(getSupervisionTaskRegistry().get(taskId)?.assignments.some((a) => a.role === 'coordinator')).toBe(false);
 
+    // No separate attach call needed: task_start's own creation path already
+    // bound the project's unique live Brain as coordinator.
+    const created = getSupervisionTaskRegistry().get(taskId);
+    const autoAttached = created?.assignments.find((a) => a.role === 'coordinator');
+    expect(autoAttached).toMatchObject({ identity: { sessionName: brain.name } });
+
+    // Idempotent: an explicit attach call replays the SAME assignment rather
+    // than minting a second coordinator row.
     const result = await handlersFor(brain, sessions)[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START]({
       taskId, role: 'coordinator', idempotencyKey: 'brain-attach',
+    });
+    expect(result).toMatchObject({ status: 'ok', taskId, assignmentId: autoAttached?.assignmentId });
+
+    const persisted = getSupervisionTaskRegistry().get(taskId);
+    expect(persisted?.assignments.filter((a) => a.role === 'coordinator')).toHaveLength(1);
+    expect(persisted?.assignments.some((a) => a.role === 'coordinator' && a.identity?.sessionName === brain.name)).toBe(true);
+  });
+
+  it('(a2) still lets the unique live Brain attach to a task it genuinely never coordinated (legacy/pre-auto-attach shape)', async () => {
+    const sessions = [brain, implementer];
+    const taskId = directlyRegisterImplementerTaskWithNoCoordinator(implementer);
+
+    const result = await handlersFor(brain, sessions)[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START]({
+      taskId, role: 'coordinator', idempotencyKey: 'brain-attach-legacy',
     });
     expect(result).toMatchObject({ status: 'ok', taskId });
 
@@ -102,7 +158,7 @@ describe('supervision_task_start lets the project Brain attach coordinator to a 
 
   it('(c) lets only the unique live Brain rebind the SAME stale coordinator assignment', async () => {
     const sessions = [brain, implementer];
-    const taskId = await selfInitiateImplementerTask(sessions);
+    const taskId = directlyRegisterImplementerTaskWithNoCoordinator(implementer);
     // The explicit Brain-authority contract supersedes the old coordinator-row
     // veto: a stale coordinator must be rebound in place, not replaced. Tests
     // (b)/(d) retain the old fail-closed behavior for non/ambiguous Brains.
