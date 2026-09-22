@@ -597,6 +597,19 @@ serverRoutes.delete('/:id/bindings', async (c) => {
   return c.json({ ok: true });
 });
 
+/**
+ * Postgres text/jsonb columns reject a literal NUL byte outright ("invalid
+ * byte sequence for encoding UTF8: 0x00"), unlike the daemon's local SQLite
+ * store. A single processed summary carrying one — observed from real
+ * production replication traffic — permanently failed every retry of this
+ * whole batch insert, silently starving memory sync for every project behind
+ * that daemon. jsonb fields go through JSON.stringify first, which escapes
+ * NUL as \u0000 and is safe; only the raw `summary` text parameter is at risk.
+ */
+function stripPostgresNulBytes(text: string): string {
+  return text.replace(/\u0000/g, '�');
+}
+
 serverRoutes.post('/:id/shared-context/processed', async (c) => {
   const authed = await authenticateDaemonServer(c, c.req.param('id'));
   if (!authed.ok) return daemonAuthFailure(c, authed);
@@ -621,6 +634,7 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
     const safeEnterpriseId = isPersonal ? null : (serverRow.teamId ?? projection.namespace.enterpriseId ?? null);
     const safeWorkspaceId = isPersonal ? null : (projection.namespace.workspaceId ?? null);
     const safeUserId = isPersonal ? serverRow.userId : (projection.namespace.userId ?? null);
+    const safeSummary = stripPostgresNulBytes(projection.summary);
     const contentHash = computeProjectionContentHash({
       summary: projection.summary,
       content: projection.content,
@@ -656,7 +670,7 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
         projection.namespace.projectId,
         projection.class,
         JSON.stringify(projection.sourceEventIds),
-        projection.summary,
+        safeSummary,
         JSON.stringify(projection.content),
         contentHash,
         projection.origin,
@@ -695,7 +709,7 @@ serverRoutes.post('/:id/shared-context/processed', async (c) => {
           safeUserId,
           projection.namespace.projectId,
           projection.class,
-          projection.summary,
+          safeSummary,
           JSON.stringify(projection.content),
           projection.origin,
           projection.createdAt,

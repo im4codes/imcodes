@@ -290,6 +290,49 @@ describe('personal cloud memory — auth and data isolation', () => {
     expect(body.records[0].summary).toBe('Replicated from daemon');
   });
 
+  it('daemon POST replication with a NUL byte in the summary does not fail against real Postgres', async () => {
+    const app = makeApp();
+
+    // Postgres text/jsonb columns reject a literal NUL byte outright
+    // ("invalid byte sequence for encoding UTF8: 0x00"). Without sanitizing
+    // it first, this exact request 500s against a real database and the
+    // whole replication batch is lost -- observed in production as a daemon
+    // whose personal memory sync got permanently stuck.
+    const postRes = await app.request(`/api/server/${serverA}/shared-context/processed`, {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer daemon-token-a',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        namespace: { scope: 'personal', projectId: 'my-repo' },
+        projections: [{
+          id: randomHex(16),
+          namespace: { scope: 'personal', projectId: 'my-repo' },
+          class: 'durable_memory_candidate',
+          origin: 'chat_compacted',
+          sourceEventIds: ['e1'],
+          summary: 'decision with an embedded\u0000NUL byte',
+          content: { trigger: 'idle' },
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        }],
+      }),
+    });
+    expect(postRes.status).toBe(200);
+    const ack = await postRes.json() as { ok: boolean; projectionCount: number };
+    expect(ack.ok).toBe(true);
+    expect(ack.projectionCount).toBe(1);
+
+    const getRes = await app.request('/api/shared-context/personal-memory', {
+      method: 'GET',
+      headers: csrfHeaders(makeToken(userA)),
+    });
+    expect(getRes.status).toBe(200);
+    const body = await getRes.json() as { records: Array<{ summary: string }> };
+    expect(body.records[0].summary).toBe('decision with an embedded�NUL byte');
+  });
+
   it('daemon POST replication is not visible to a different user', async () => {
     const app = makeApp();
 

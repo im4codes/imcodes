@@ -262,6 +262,13 @@ function makeMockDb() {
       executeSql.push(sql);
       const normalized = sql.toLowerCase().replace(/\s+/g, ' ').trim();
       if (normalized.includes('insert into shared_context_projections')) {
+        // Postgres itself is what rejects a literal NUL byte in a text
+        // parameter (error 22021); a JS mock can't reproduce that, so this
+        // simulates it explicitly to prove the route sanitizes before this
+        // call instead of relying on the real database to catch it.
+        if (typeof params[9] === 'string' && params[9].includes('\u0000')) {
+          throw new Error('invalid byte sequence for encoding "UTF8": 0x00');
+        }
         projectionRows.push({
           id: params[0],
           server_id: params[1],
@@ -271,11 +278,15 @@ function makeMockDb() {
           user_id: params[5],
           project_id: params[6],
           projection_class: params[7],
+          summary: params[9],
           origin: params[12],
         });
         return { changes: 1 };
       }
       if (normalized.includes('insert into shared_context_records')) {
+        if (typeof params[9] === 'string' && params[9].includes('\u0000')) {
+          throw new Error('invalid byte sequence for encoding "UTF8": 0x00');
+        }
         recordRows.push({
           id: params[0],
           projection_id: params[1],
@@ -286,6 +297,7 @@ function makeMockDb() {
           user_id: params[6],
           project_id: params[7],
           record_class: params[8],
+          summary: params[9],
           origin: params[11],
         });
         return { changes: 1 };
@@ -390,6 +402,50 @@ describe('shared-context processed remote route', () => {
     expect(aliasRows).toHaveLength(0);
   });
 
+  it('strips a NUL byte from the summary instead of letting it break the whole replication batch', async () => {
+    const { db, projectionRows, recordRows } = makeMockDb();
+    const app = new Hono<{ Bindings: Env }>();
+    app.route('/api/server', serverRoutes);
+
+    const response = await app.request('/api/server/srv-1/shared-context/processed', {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer daemon-token',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        namespace: {
+          scope: 'project_shared',
+          projectId: 'github.com/acme/repo',
+          enterpriseId: 'ent-1',
+        },
+        projections: [
+          {
+            id: 'proj-nul',
+            namespace: {
+              scope: 'project_shared',
+              projectId: 'github.com/acme/repo',
+              enterpriseId: 'ent-1',
+            },
+            class: 'durable_memory_candidate',
+            origin: 'chat_compacted',
+            sourceEventIds: ['evt-1'],
+            summary: 'decision with an embedded\u0000NUL byte',
+            content: { kind: 'decision' },
+            createdAt: 100,
+            updatedAt: 110,
+          },
+        ],
+      }),
+    }, makeEnv(db));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(expect.objectContaining({ ok: true, projectionCount: 1 }));
+    expect(projectionRows).toHaveLength(1);
+    expect(projectionRows[0].summary).toBe('decision with an embedded�NUL byte');
+    expect(recordRows).toHaveLength(1);
+    expect(recordRows[0].summary).toBe('decision with an embedded�NUL byte');
+  });
 
   it('skips noisy API error projections during remote replication', async () => {
     const { db, projectionRows, recordRows } = makeMockDb();
