@@ -30,7 +30,8 @@ export type WindowsUpgradeRecoveryOutcome =
   | 'target_receipt_completed'
   | 'previous_receipt_restored'
   | 'trusted_executable_adopted'
-  | 'rollback_resumed';
+  | 'rollback_resumed'
+  | 'stale_marker_cleared';
 
 function isReceipt(value: unknown): value is StagedExecutableReceipt {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -172,6 +173,21 @@ export async function recoverWindowsUpgradeTransaction(input: {
       await input.resumeTask?.(transaction.taskName);
       return { journal: input.journal, outcome: 'rollback_resumed', handoff: true };
     }
+  }
+
+  // A marker that failed to parse as a full transaction (the legacy v1 shape
+  // below, or one torn by a hard stop before every field was written) can
+  // still be left sitting next to an executable that already matches this
+  // node's own journal receipt — e.g. two upgrade attempts in a row where the
+  // second attempt's marker never finished settling before this recovery ran.
+  // Matching the journal's own already-recorded receipt requires no fresh
+  // trust decision (unlike the signature-verification adoption below), so a
+  // stale marker here is safe to discard rather than a fatal, permanent
+  // refusal to start.
+  if (!transaction && markerRaw !== null && current && input.journal.stagedReceipt
+    && matches(current, input.journal.stagedReceipt)) {
+    await rm(markerPath, { force: true });
+    return { journal: input.journal, outcome: 'stale_marker_cleared', handoff: false };
   }
 
   // Compatibility recovery for the confirmed field incident: old upgraders

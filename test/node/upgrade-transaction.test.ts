@@ -181,6 +181,32 @@ describe('Windows controlled-node interrupted upgrade recovery', () => {
     expect(repaired.serverId).toBe('srv-1');
   });
 
+  it('clears a stale legacy-shaped marker when the executable already matches the journal receipt', async () => {
+    // Reproduces a real fleet incident: two upgrade attempts to the same
+    // target in a row left an `upgrade-in-progress.json` that never settled
+    // into a full transaction shape, sitting next to an executable that was
+    // already exactly what the journal itself had already verified and
+    // staged. Recovery must not treat that as an unrecoverable image.
+    const state = await setup('target', 'target');
+    await writeFile(join(state.dir, CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_FILE), JSON.stringify({ version: 1, startedAt: 11 }));
+    const result = await recoverWindowsUpgradeTransaction({
+      journal: state.journal, journalPath: state.journalPath, executablePath: state.exePath, now: 20,
+      verifyTrustedExecutable: vi.fn(async () => false),
+    });
+    expect(result).toMatchObject({ outcome: 'stale_marker_cleared', handoff: false });
+    await expect(readFile(join(state.dir, CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_FILE)))
+      .rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('still refuses a stale legacy-shaped marker when the executable does not match the journal receipt', async () => {
+    const state = await setup('other', 'target');
+    await writeFile(join(state.dir, CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_FILE), JSON.stringify({ version: 1, startedAt: 11 }));
+    await expect(recoverWindowsUpgradeTransaction({
+      journal: state.journal, journalPath: state.journalPath, executablePath: state.exePath, now: 20,
+      verifyTrustedExecutable: vi.fn(async () => false),
+    })).rejects.toThrow('neither a trusted current image nor a verified rollback image');
+  });
+
   it('fails visibly instead of silently starting with an unknown image', async () => {
     const state = await setup('other', 'target');
     await rm(state.backupPath);
