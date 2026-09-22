@@ -63,12 +63,25 @@ describe('native collaboration task-participation policy', () => {
     '分析这个功能的实现原理',
     '调研回滚原因并总结',
     '总结上一轮审计结论',
+    '逐页看图，描述每张截图里的内容',
+    '挨个看图并列出发现',
+    '浏览这些页面并总结要点',
   ])('treats %j as analysis', (prompt) => {
     expect(classifyNativeCollaborationRequest(prompt)).toEqual({
       participation: analysis,
       signals: [],
       readOnlyDeclared: false,
     });
+  });
+
+  it('recognizes page-by-page image description as analysis, not an unrecognized instruction', () => {
+    // Regression: a formal participant's read-only "look at each screenshot
+    // and describe it" request was misclassified as unclassified (denied like
+    // task work) because "逐页" opened the clause and was not in the CJK
+    // analysis-opener vocabulary. The task-signal detectors (audit, verdict,
+    // authority, implementation, repository gate) are untouched by this fix.
+    expect(classifyNativeCollaborationRequest('逐页看图，客观描述每一页的内容，不要下结论'))
+      .toMatchObject({ participation: analysis, signals: [] });
   });
 
   it('never lets a read-only declaration exempt negated or interrogative work wording from being analysis', () => {
