@@ -1653,6 +1653,20 @@ export class WsClient {
       ? (msg as { requestId: string }).requestId
       : undefined;
     if (!requestId) return;
+    this.forgetOwnedDataRequest(requestId);
+  }
+
+  /**
+   * Give up locally on a request that went through beginOwnedDataRequest
+   * (fsListDir, fsGitStatus, sendTimelineHistoryRequest, requestTransportModels,
+   * …). Without this, a caller-side timeout leaves the dedup entry parked for
+   * up to OWNED_DATA_REQUEST_TTL_MS: an immediate retry for the same key would
+   * silently reuse the dead requestId and send nothing, guaranteeing the retry
+   * also times out. Callers should invoke this exactly when they stop waiting
+   * for requestId (e.g. their own timeout fires) so the next attempt for the
+   * same key actually goes over the wire.
+   */
+  forgetOwnedDataRequest(requestId: string): void {
     const key = this.ownedDataRequestKeyById.get(requestId);
     if (!key) return;
     this.ownedDataRequestKeyById.delete(requestId);

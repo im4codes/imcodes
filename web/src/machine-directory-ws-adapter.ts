@@ -139,6 +139,9 @@ export class MachineDirectoryWsAdapter {
     return requestId;
   }
 
+  /** No dedup here -- every fsListDir/fsGitStatus call already mints its own requestId. */
+  forgetOwnedDataRequest(_requestId: string): void {}
+
   destroy(): void {
     for (const controller of this.controllers) controller.abort();
     this.controllers.clear();

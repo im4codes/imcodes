@@ -1717,6 +1717,30 @@ describe('WsClient', () => {
       vi.useRealTimers();
     });
 
+    it('forgetOwnedDataRequest lets a caller-side give-up retry actually hit the wire', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      lastWs!.send.mockClear();
+
+      const first = client.fsListDir('/home/user/shared', true, false, { sessionName: 'deck_owner' });
+      // A caller (e.g. FileBrowser) that gives up locally before any response
+      // arrives -- its own timeout fired -- must be able to retry without the
+      // dedup entry silently absorbing the retry into the dead requestId.
+      client.forgetOwnedDataRequest(first);
+      const retry = client.fsListDir('/home/user/shared', true, false, { sessionName: 'deck_owner' });
+      expect(retry).not.toBe(first);
+      await vi.advanceTimersByTimeAsync(400);
+      expect(lastWs!.send.mock.calls
+        .map(([raw]) => JSON.parse(String(raw)))
+        .filter((message) => message.type === 'fs.ls')).toHaveLength(2);
+
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
     it('fs.ls_response is dispatched to onMessage handlers', async () => {
       const client = await connectClient();
       const handler = vi.fn();

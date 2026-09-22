@@ -814,6 +814,11 @@ export function FileBrowser({
       if (pendingRef.current.has(requestId)) {
         pendingRef.current.delete(requestId);
         timersRef.current.delete(requestId);
+        // Without this, ws-client's owned-data-request dedup keeps this
+        // path's requestId parked for up to its own TTL: retrying right
+        // after a timeout would silently reuse the dead requestId and send
+        // nothing over the wire, guaranteeing the retry also times out.
+        ws.forgetOwnedDataRequest(requestId);
         setData((prev) => updateNode(prev, nodePath, { isLoading: false }));
         setError(t('file_browser.timeout_detail', { defaultValue: t('file_browser.timeout') }));
       }
