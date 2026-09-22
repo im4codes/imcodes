@@ -9,6 +9,7 @@ import {
   ensureWindowsAideskShortcut,
   ensureLinuxAideskDesktopEntry,
   ensureMacosAideskApplicationEntry,
+  isMacosAideskAgentRunning,
   resolveAideskLocalUiExecutable,
   resolveWindowsPowerShellExecutable,
   removeLinuxAideskDesktopEntry,
@@ -51,6 +52,25 @@ describe('aiDesk desktop entries', () => {
     await expect(readlink(join(home, 'Applications', AIDESK_MACOS_APP_NAME))).resolves.toBe(source);
     await expect(ensureMacosAideskApplicationEntry(input)).resolves.toBe('unchanged');
     await expect(removeMacosAideskApplicationEntry(input)).resolves.toBe(true);
+  });
+
+  it('treats a pgrep match as the background aiDesk agent already running', async () => {
+    const user = { name: 'ci', uid: 501, gid: 20, home: '/Users/ci', tempDir: '/tmp' };
+    const execFileText = async (file: string, args: readonly string[]) => {
+      expect(file).toBe('/usr/bin/pgrep');
+      expect(args).toEqual(['-u', '501', '-f', expect.stringContaining('aidesk')]);
+      return '4242\n';
+    };
+    await expect(isMacosAideskAgentRunning(user, execFileText)).resolves.toBe(true);
+  });
+
+  it('treats pgrep finding nothing (or failing) as the agent not running, fail-safe', async () => {
+    const user = { name: 'ci', uid: 501, gid: 20, home: '/Users/ci', tempDir: '/tmp' };
+    // pgrep exits non-zero with empty output when nothing matches.
+    const notFound = async () => { throw new Error('exit 1'); };
+    await expect(isMacosAideskAgentRunning(user, notFound)).resolves.toBe(false);
+    const blankOutput = async () => '';
+    await expect(isMacosAideskAgentRunning(user, blankOutput)).resolves.toBe(false);
   });
 
   it('never overwrites or removes a user-created macOS entry with the same name', async () => {

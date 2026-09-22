@@ -30,6 +30,8 @@ import { MACOS_REMOTE_DESKTOP_RESPONSIBLE_APP_PATH } from './macos-remote-deskto
 import {
   launchMacosUserSessionCommand,
   resolveMacosUserSession,
+  type MacosExecFileText,
+  type MacosUserSession,
 } from './user-session-launcher.js';
 import {
   allowWindowsNamedPipeClients,
@@ -41,6 +43,22 @@ const WINDOWS_MANAGED_DESCRIPTION = `${AIDESK_PRODUCT_NAME} — managed by IM.co
 
 export type AideskDesktopEntryResult =
   | 'created' | 'repaired' | 'unchanged' | 'preserved' | 'unavailable' | 'failed';
+
+function defaultMacosExecFileText(
+  file: string,
+  args: readonly string[],
+  timeoutMs = 15_000,
+): Promise<string> {
+  return new Promise((resolveText, reject) => {
+    execFile(file, [...args], { encoding: 'utf8', timeout: timeoutMs }, (error, stdout, stderr) => {
+      if (error) {
+        reject(new Error(String(stderr || error.message).trim()));
+        return;
+      }
+      resolveText(String(stdout).trim());
+    });
+  });
+}
 
 function desktopExecQuote(value: string): string {
   if (!value || /[\0\r\n]/u.test(value)) throw new Error('aidesk_desktop_entry_invalid_path');
@@ -289,18 +307,44 @@ function runUpdateDesktopDatabase(directory: string): Promise<void> {
   });
 }
 
+/**
+ * `open -g <app> --args --aidesk-background` only spawns a fresh process the
+ * first time; once the background agent is already running, macOS instead
+ * delivers a "reopen" Apple Event to it, which the agent (correctly, for a
+ * real Dock click) answers by opening the 127.0.0.1 management panel in the
+ * browser. ensureAideskDesktopEntry runs on every controlled-node startup --
+ * including every post-upgrade restart -- so without this check the daemon
+ * itself became an unwanted source of "reopen" events, popping that panel
+ * open on every upgrade even though nobody asked to see it.
+ */
+export async function isMacosAideskAgentRunning(
+  user: MacosUserSession,
+  execFileText: MacosExecFileText,
+): Promise<boolean> {
+  return execFileText('/usr/bin/pgrep', ['-u', String(user.uid), '-f', MACOS_REMOTE_DESKTOP_RESPONSIBLE_APP_PATH])
+    .then((stdout) => stdout.trim().length > 0)
+    .catch(() => false);
+}
+
 /** Best-effort startup repair. Failure must never take the controlled node down. */
-export async function ensureAideskDesktopEntry(platform = process.platform): Promise<AideskDesktopEntryResult> {
+export async function ensureAideskDesktopEntry(
+  platform = process.platform,
+  options: { execFileText?: MacosExecFileText } = {},
+): Promise<AideskDesktopEntryResult> {
   if (platform === 'darwin') {
     const user = await resolveMacosUserSession().catch(() => null);
     if (!user) return 'unavailable';
     const result = await ensureMacosAideskApplicationEntry(user);
     if (result !== 'unavailable') {
-      launchMacosUserSessionCommand(user, {
-        executable: '/usr/bin/open',
-        args: ['-g', MACOS_REMOTE_DESKTOP_RESPONSIBLE_APP_PATH,
-          '--args', '--aidesk-background'],
-      });
+      const execFileText = options.execFileText ?? defaultMacosExecFileText;
+      const alreadyRunning = await isMacosAideskAgentRunning(user, execFileText);
+      if (!alreadyRunning) {
+        launchMacosUserSessionCommand(user, {
+          executable: '/usr/bin/open',
+          args: ['-g', MACOS_REMOTE_DESKTOP_RESPONSIBLE_APP_PATH,
+            '--args', '--aidesk-background'],
+        });
+      }
     }
     return result;
   }
