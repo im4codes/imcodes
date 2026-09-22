@@ -106,6 +106,100 @@ describe('session identity MCP tools', () => {
     expect(applyEffectiveIdentity).toHaveBeenCalledTimes(1);
   });
 
+  it('fans a project identity change out to every project session concurrently by default', async () => {
+    const sessions = [
+      session(),
+      session({ name: 'deck_proj_cc1', role: 'w1' }),
+      session({ name: 'deck_proj_cc2', role: 'w2' }),
+      session({ name: 'deck_other_brain', role: 'brain', projectName: 'other' }),
+    ];
+    const setIdentityProfile = vi.fn(async (input: {
+      scope: SessionIdentityProfile['scope']; scopeKey: string; content: string;
+    }) => ({ status: 'ok' as const, profile: identity(input.scope, input.scopeKey, input.content) }));
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const applyEffectiveIdentity = vi.fn(async () => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      inFlight -= 1;
+      return { applied: true };
+    });
+    const handlers = createMemoryMcpToolHandlers(caller, {
+      sendDeps: { listSessions: () => sessions },
+      setIdentityProfile: setIdentityProfile as never,
+      getEffectiveIdentityProfiles: async () => ({ status: 'ok', profiles: [] }),
+      applyEffectiveIdentity,
+    });
+
+    const result = await handlers[MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET]({
+      identityScope: 'project',
+      content: 'Project rules.',
+    });
+
+    expect(result).toMatchObject({ status: 'ok', saved: true, all: true });
+    // Every session in the project refreshes, but the sibling project's brain
+    // does not -- and the three refreshes overlap instead of running in
+    // sequence, one after another.
+    expect(applyEffectiveIdentity).toHaveBeenCalledTimes(3);
+    expect(maxInFlight).toBe(3);
+    expect((result as { refreshed: string[] }).refreshed.sort()).toEqual(
+      ['deck_proj_brain', 'deck_proj_cc1', 'deck_proj_cc2'],
+    );
+  });
+
+  it('lets a project identity change opt out of the fan-out with all=false', async () => {
+    const sessions = [session(), session({ name: 'deck_proj_cc1', role: 'w1' })];
+    const setIdentityProfile = vi.fn(async (input: {
+      scope: SessionIdentityProfile['scope']; scopeKey: string; content: string;
+    }) => ({ status: 'ok' as const, profile: identity(input.scope, input.scopeKey, input.content) }));
+    const applyEffectiveIdentity = vi.fn(async () => ({ applied: true }));
+    const handlers = createMemoryMcpToolHandlers(caller, {
+      sendDeps: { listSessions: () => sessions },
+      setIdentityProfile: setIdentityProfile as never,
+      getEffectiveIdentityProfiles: async () => ({ status: 'ok', profiles: [] }),
+      applyEffectiveIdentity,
+    });
+
+    const result = await handlers[MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET]({
+      identityScope: 'project',
+      content: 'Project rules.',
+      all: false,
+    });
+
+    expect(result).toMatchObject({ status: 'ok', saved: true, all: false });
+    expect(applyEffectiveIdentity).toHaveBeenCalledTimes(1);
+    expect(applyEffectiveIdentity.mock.calls[0][0]).toBe('deck_proj_brain');
+  });
+
+  it('fans a session identity change out to its own sub-sessions only when all=true', async () => {
+    const sessions = [
+      session(),
+      session({ name: 'deck_proj_cc1', role: 'w1', parentSession: 'deck_proj_brain' }),
+      session({ name: 'deck_proj_cc2', role: 'w2' }),
+    ];
+    const setIdentityProfile = vi.fn(async (input: {
+      scope: SessionIdentityProfile['scope']; scopeKey: string; content: string;
+    }) => ({ status: 'ok' as const, profile: identity(input.scope, input.scopeKey, input.content) }));
+    const applyEffectiveIdentity = vi.fn(async () => ({ applied: true }));
+    const handlers = createMemoryMcpToolHandlers(caller, {
+      sendDeps: { listSessions: () => sessions },
+      setIdentityProfile: setIdentityProfile as never,
+      getEffectiveIdentityProfiles: async () => ({ status: 'ok', profiles: [] }),
+      applyEffectiveIdentity,
+    });
+
+    const result = await handlers[MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET]({
+      identityScope: 'session',
+      target: 'deck_proj_brain',
+      content: 'Brain-specific note.',
+      all: true,
+    });
+
+    expect(result).toMatchObject({ status: 'ok', saved: true, all: true });
+    expect((result as { refreshed: string[] }).refreshed.sort()).toEqual(['deck_proj_brain', 'deck_proj_cc1']);
+  });
+
   it('exposes the same MCP set path for user, project, and exact-session scopes', async () => {
     const setIdentityProfile = vi.fn(async (input: {
       scope: SessionIdentityProfile['scope']; scopeKey: string; content: string;

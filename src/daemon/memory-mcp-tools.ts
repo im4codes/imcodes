@@ -1642,17 +1642,21 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     return { status: 'ok' as const, target: target.name, profiles: effective.profiles, prompt, applied };
   };
 
-  const refreshAffectedIdentities = async (scope: SessionIdentityScope, target: SessionRecord) => {
+  const refreshAffectedIdentities = async (scope: SessionIdentityScope, target: SessionRecord, all: boolean) => {
+    if (!all) return [await refreshIdentityTarget(target)];
     const sessions = await sendSessions();
     const affected = scope === SESSION_IDENTITY_SCOPES.USER
       ? sessions.filter((session) => session.state !== 'stopped')
       : scope === SESSION_IDENTITY_SCOPES.PROJECT
         ? sessions.filter((session) => session.state !== 'stopped' && session.projectName === target.projectName)
-        : [target];
-    const results = [];
-    for (const session of affected) results.push(await refreshIdentityTarget(session));
-    return results;
+        : [target, ...sessions.filter((session) => session.state !== 'stopped' && session.parentSession === target.name)];
+    return Promise.all(affected.map((session) => refreshIdentityTarget(session)));
   };
+
+  // Project/user identity is meant to reach every affected session by default;
+  // a session-scope override targets one session unless the caller explicitly
+  // asks to fan it out to that session's own sub-sessions too.
+  const defaultIdentityRefreshAll = (scope: SessionIdentityScope): boolean => scope !== SESSION_IDENTITY_SCOPES.SESSION;
 
 
   const supervisionTaskIdentity = async (): Promise<PersistedSupervisionTaskAssignmentIdentity | undefined> => {
@@ -1980,9 +1984,10 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       };
     },
     [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET]: async (input) => {
-      const args = pickAllowedMcpArgs(input, ['identityScope', 'target', 'content', 'filePath', 'expectedRevision']);
+      const args = pickAllowedMcpArgs(input, ['identityScope', 'target', 'content', 'filePath', 'expectedRevision', 'all']);
       const scopeValue = stringArg(args, 'identityScope');
       if (!isSessionIdentityScope(scopeValue)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'scope is invalid');
+      const all = boolArg(args, 'all') ?? defaultIdentityRefreshAll(scopeValue);
       const resolved = await resolveIdentityTarget(stringArg(args, 'target'));
       if (resolved.status === 'error') return resolved.result;
       const { target } = resolved;
@@ -2017,19 +2022,21 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         ...(filePath ? { sourceFile: filePath } : {}),
       }, identityOptions);
       if (saved.status !== 'ok') return saved;
-      const refreshed = await refreshAffectedIdentities(scopeValue, target);
+      const refreshed = await refreshAffectedIdentities(scopeValue, target, all);
       return {
         status: 'ok',
         saved: true,
         target: target.name,
+        all,
         profile: { ...saved.profile, content: undefined },
         refreshed: refreshed.map((item) => item.status === 'ok' ? item.target : null).filter(Boolean),
       };
     },
     [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_CLEAR]: async (input) => {
-      const args = pickAllowedMcpArgs(input, ['identityScope', 'target', 'expectedRevision']);
+      const args = pickAllowedMcpArgs(input, ['identityScope', 'target', 'expectedRevision', 'all']);
       const scopeValue = stringArg(args, 'identityScope');
       if (!isSessionIdentityScope(scopeValue)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'scope is invalid');
+      const all = boolArg(args, 'all') ?? defaultIdentityRefreshAll(scopeValue);
       const resolved = await resolveIdentityTarget(stringArg(args, 'target'));
       if (resolved.status === 'error') return resolved.result;
       const { target } = resolved;
@@ -2045,11 +2052,12 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         identityOptions,
       );
       if (cleared.status !== 'ok') return cleared;
-      const refreshed = await refreshAffectedIdentities(scopeValue, target);
+      const refreshed = await refreshAffectedIdentities(scopeValue, target, all);
       return {
         status: 'ok',
         deleted: cleared.deleted,
         target: target.name,
+        all,
         refreshed: refreshed.map((item) => item.status === 'ok' ? item.target : null).filter(Boolean),
       };
     },
@@ -3462,6 +3470,7 @@ const schemas = {
     content: z.string().optional().describe('Inline identity contract.'),
     filePath: z.string().optional().describe('UTF-8 identity file. User/project scope is project-relative; session scope also accepts an absolute daemon-host path.'),
     expectedRevision: z.number().int().nonnegative().optional(),
+    all: z.boolean().optional().describe('Refresh every affected session at once instead of just target. Defaults to true for user/project scope, false for session scope.'),
   }).strict().superRefine((value, context) => {
     if (Boolean(value.content) === Boolean(value.filePath)) {
       context.addIssue({ code: z.ZodIssueCode.custom, message: 'provide exactly one of content or filePath' });
@@ -3471,6 +3480,7 @@ const schemas = {
     identityScope: z.enum(SESSION_IDENTITY_SCOPE_LIST),
     target: z.string().optional().describe('Exact session name used to resolve project/session scope.'),
     expectedRevision: z.number().int().nonnegative().optional(),
+    all: z.boolean().optional().describe('Refresh every affected session at once instead of just target. Defaults to true for user/project scope, false for session scope.'),
   }).strict(),
   [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_REFRESH]: z.object({
     target: z.string().optional().describe('Exact session name; defaults to the current session.'),
