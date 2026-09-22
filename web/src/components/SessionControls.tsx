@@ -1952,7 +1952,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     ));
   const canQuickControlSupervision = canQuickViewSupervision && canSharedActorControlSession(sharedState);
   const supervisorDefaultsPref = useSupervisorDefaults(
-    canQuickControlSupervision && !isShareScopedSession,
+    canQuickControlSupervision,
     serverId && activeSession?.name ? { serverId, sessionName: activeSession.name } : null,
   );
   const isCodex = activeSession?.agentType === 'codex' || activeSession?.agentType === 'codex-sdk';
@@ -2828,22 +2828,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       return;
     }
 
-    // Share-scoped rows intentionally expose only the current mode, never the
-    // owner's provider/runtime configuration. Persist a mode-only patch and
-    // let the server merge it into the already-authoritative snapshot. This
-    // keeps both session-share and server-share actors functional without
-    // projecting credentials or making their personal defaults authoritative.
-    if (isShareScopedSession) {
-      try {
-        await persistTransportConfig({ mode: nextMode });
-        setAutoOpen(false);
-        showSupervisionModeNotice(nextMode);
-      } catch {
-        showSendWarning(t('session.supervision.modeSaveFailed'));
-      }
-      return;
-    }
-
+    // Share-scoped rows never see the owner's actual stored snapshot (see
+    // `quickSupervisionMode` above), so `supervisionSnapshot` is always empty
+    // here and the branch below falls through to `supervisorDefaultsPref`,
+    // the owner's account-level runtime config exposed read/write to a
+    // participant via the scoped defaults endpoint. The server independently
+    // re-derives its own authoritative existing-snapshot merge (or accepts
+    // this as a fresh config when the session was never configured before),
+    // so a participant can never overwrite fields it cannot see.
     if (hasInvalidSupervisionConfig) {
       openSettingsForMode();
       return;
@@ -2906,7 +2898,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     canQuickControlSupervision,
     currentTransportConfig,
     hasInvalidSupervisionConfig,
-    isShareScopedSession,
     onSettings,
     persistTransportConfig,
     serverId,

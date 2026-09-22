@@ -155,7 +155,55 @@ describe('SessionControls shared participant settings entry points', () => {
     expect(screen.queryByRole('button', { name: 'Auto' })).toBeNull();
   });
 
-  it('enables audit from the safe mode projection without reading owner defaults', async () => {
+  it('opens supervision settings when enabling without any owner defaults configured', async () => {
+    const onSettings = vi.fn();
+    render(
+      <SessionControls
+        ws={makeWs() as never}
+        connected
+        serverId="server-shared"
+        activeSession={sharedSession('participant', 'main', 'off')}
+        quickData={quickData}
+        onSettings={onSettings}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Auto' }));
+    fireEvent.click(within(document.querySelector('.menu-dropdown-auto') as HTMLElement)
+      .getByRole('button', { name: /supervised_audit/i }));
+
+    // A participant may now author a fresh configuration, but only once the
+    // owner's account-level runtime defaults are known. With none configured
+    // yet (mocked null), the toggle sends the caller to Settings instead of
+    // persisting a mode-only patch the server would reject as incomplete.
+    await waitFor(() => expect(fetchSupervisorDefaultsMock).toHaveBeenCalledWith('server-shared', 'deck_shared_brain'));
+    await waitFor(() => expect(onSettings).toHaveBeenCalledWith({ surface: 'supervision', supervisionMode: 'supervised_audit' }));
+    expect(patchSessionSupervisionMock).not.toHaveBeenCalled();
+  });
+
+  it('enables audit for a share participant by authoring the owner account defaults', async () => {
+    fetchSupervisorDefaultsMock.mockResolvedValue({
+      backend: 'codex-sdk',
+      model: 'gpt-5.6-sol',
+      timeoutMs: 30_000,
+      promptVersion: 'supervision_decision_v1',
+      maxAutoContinueStreak: 2,
+      maxAutoContinueTotal: 0,
+      executionPools: {
+        state: 'configured',
+        primaryDevelopmentPool: {
+          configs: [{
+            capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6-sol',
+            agentType: 'codex-sdk',
+            providerFamily: 'openai',
+            runtimeType: 'transport',
+            model: 'gpt-5.6-sol',
+          }],
+          controls: {},
+        },
+        economyTaskPool: { configs: [], controls: {} },
+      },
+    });
     render(
       <SessionControls
         ws={makeWs() as never}
@@ -171,12 +219,18 @@ describe('SessionControls shared participant settings entry points', () => {
     fireEvent.click(within(document.querySelector('.menu-dropdown-auto') as HTMLElement)
       .getByRole('button', { name: /supervised_audit/i }));
 
+    // A participant authoring from scratch sends the full owner-default
+    // runtime config the server needs to validate and persist a new snapshot
+    // -- not just the bare mode the mode-only merge path used to send.
     await waitFor(() => expect(patchSessionSupervisionMock).toHaveBeenCalledWith(
       'server-shared',
       'deck_shared_brain',
-      { mode: 'supervised_audit' },
+      expect.objectContaining({
+        mode: 'supervised_audit',
+        backend: 'codex-sdk',
+        model: 'gpt-5.6-sol',
+      }),
     ));
-    expect(fetchSupervisorDefaultsMock).not.toHaveBeenCalled();
   });
 
   it('keeps stop restricted for a session share but exposes it for a server-share participant', () => {

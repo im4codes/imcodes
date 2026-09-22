@@ -330,14 +330,14 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/supervision', async (c) => {
   const existingTransportConfig = parseStoredTransportConfig(row.transport_config);
   const existingSnapshot = extractSessionSupervisionSnapshot(existingTransportConfig);
   // A concrete-session share may flip an already-configured supervision mode,
-  // but may not author the configuration. A whole-server participant follows
-  // the owner path for server/session operations; provenance is retained in
-  // the daemon command below rather than collapsing both share classes.
+  // or author a fresh one from scratch when none exists yet -- `proposed` was
+  // already validated as a complete snapshot above, so there is nothing left
+  // to inherit from an owner who never configured this session. A
+  // whole-server participant follows the owner path for server/session
+  // operations; provenance is retained in the daemon command below rather
+  // than collapsing both share classes.
   const isSessionShareParticipant = access.actor.kind === 'share'
     && !isWholeServerShareAccess(access);
-  if (isSessionShareParticipant && !existingSnapshot) {
-    return c.json({ error: 'forbidden', reason: 'share_supervision_not_configured' }, 403);
-  }
   const nextSnapshot: SessionSupervisionSnapshot = existingSnapshot
     ? (() => {
         const {
@@ -348,7 +348,23 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/supervision', async (c) => {
         } = existingSnapshot;
         return { ...automaticSnapshot, mode: proposed.mode };
       })()
-    : proposed;
+    // A session-share participant authoring a fresh configuration may only
+    // reach automatic audit through the pool-routed path validated below --
+    // never by naming a manual `auditTargetSessionName`. That field lets the
+    // audited session trust a named peer as its auditor, so a participant
+    // must not be able to plant an arbitrary target session on a
+    // configuration nobody else has reviewed yet.
+    : isSessionShareParticipant
+      ? (() => {
+          const {
+            auditTargetSessionName: _forgedTarget,
+            auditTargetFingerprint: _forgedFingerprint,
+            peerAuditPromptVersion: _forgedPrompt,
+            ...automaticProposed
+          } = proposed;
+          return automaticProposed as SessionSupervisionSnapshot;
+        })()
+      : proposed;
   if (nextSnapshot.mode !== SUPERVISION_MODE.OFF && !canOwnAutomaticSupervision) {
     return c.json({ error: 'forbidden', reason: 'brain_session_required' }, 403);
   }
@@ -365,10 +381,9 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/supervision', async (c) => {
     }, 400);
   }
   // Owners may keep the historical compact representation where `off` removes
-  // the block. A participant, however, is only allowed to toggle an existing
-  // configuration; deleting that configuration would make the first off
-  // transition irreversible. Preserve it with mode=off so the same participant
-  // can later turn it back on without gaining authority to author new fields.
+  // the block. A participant's writes always keep an explicit mode=off block
+  // instead of deleting it, so a participant who just authored (or flipped)
+  // a configuration can always see and toggle it again afterward.
   const nextTransportConfig = isSessionShareParticipant
     ? embedSessionSupervisionSnapshot(existingTransportConfig, nextSnapshot)
     : buildTransportConfigWithSupervision(existingTransportConfig, nextSnapshot);
