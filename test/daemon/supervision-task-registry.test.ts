@@ -9613,6 +9613,61 @@ describe('SupervisionTaskRegistry', () => {
     }
   });
 
+  it('surfaces a non-delivering reactive audit dispatch in the open_audit response instead of a bare no-op', async () => {
+    // Previously the reactive dispatchReadyAudit triggered by open_audit (and
+    // record_validation) was awaited and its outcome only logged server-side
+    // (logNonDeliveringAuditDispatch) -- the caller (often Brain) saw a bare
+    // successful `{status:'ok', toStatus:'ready_for_audit'}` with no
+    // indication that the underlying audit never actually dispatched, and had
+    // to separately call supervision_task_get and inspect the task's blocker
+    // field to discover why. This reproduces the real missing_audit_policy
+    // shape and asserts the reason is now visible directly in the response.
+    const dir = mkdtempSync(join(tmpdir(), 'supervision-audit-dispatch-outcome-'));
+    const dbPath = join(dir, 'registry.sqlite');
+    const registry = new SupervisionTaskRegistry({ dbPath });
+    try {
+      expect(registry.createOrGet({
+        projectName: 'alpha', taskId: 'no-policy-task', classification: 'independent_top_level', objective: 'self-registered, no auditPolicy',
+      }).ok).toBe(true);
+      const owner = identity('deck_alpha_w1');
+      const assignment = registry.createAssignment({
+        taskId: 'no-policy-task', role: 'implementer', identity: owner,
+        scopeFiles: ['src/no-policy.ts'], claimMode: 'exclusive',
+      });
+      if (!assignment.ok) throw new Error(assignment.reason);
+
+      const port = () => ({
+        getStatus: (taskId: string) => registry.get(taskId)?.status,
+        applyIntent: (input: Parameters<SupervisionTaskRegistry['applyTaskIntent']>[0]) => {
+          const applied = registry.applyTaskIntent(input);
+          if (!applied.ok) throw new Error(applied.reason);
+        },
+        list: (filter: never) => registry.list(filter) as never,
+        get: (taskId: string) => registry.get(taskId) as never,
+        recover: () => {},
+      });
+      const dispatchReadyAudit = vi.fn(async () => (
+        { status: 'blocked' as const, reason: 'missing_audit_policy', reported: true }
+      ));
+      const handlers = createSupervisionMcpToolHandlers(
+        { sessionName: owner.sessionName, projectName: 'alpha' } as never,
+        { resolveSessionIdentity: testIdentityResolver, registry: port(), dispatchReadyAudit },
+      );
+      expect(await handlers[SUPERVISION_MCP_TOOLS.INTENT]({ intent: 'start', taskId: 'no-policy-task' }))
+        .toMatchObject({ status: 'ok', toStatus: 'implementing' });
+      const opened = await handlers[SUPERVISION_MCP_TOOLS.INTENT]({ intent: 'open_audit', taskId: 'no-policy-task' });
+      expect(dispatchReadyAudit).toHaveBeenCalledWith('no-policy-task');
+      expect(opened).toMatchObject({
+        status: 'ok',
+        toStatus: 'ready_for_audit',
+        auditDispatchOutcome: 'audit_dispatch_blocked: missing_audit_policy',
+      });
+    } finally {
+      registry.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('persists task-level cancel when every required assignment is already cancelled', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'supervision-task-level-cancel-'));
     const dbPath = join(dir, 'registry.sqlite');

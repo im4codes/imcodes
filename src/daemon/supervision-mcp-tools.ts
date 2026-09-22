@@ -402,6 +402,25 @@ function logNonDeliveringAuditDispatch(taskId: string, intent: string, result: u
   logger.warn({ taskId, intent, result }, 'Reactive audit dispatch did not deliver');
 }
 
+/**
+ * The same "did this actually deliver an auditor" read as
+ * {@link logNonDeliveringAuditDispatch}, but returned for the RESPONSE
+ * instead of only the server log — so the caller (often a Brain that just
+ * committed a validation or opened an audit) can see a real reason like
+ * `missing_audit_policy` immediately, instead of getting a bare successful
+ * transition and having to separately call supervision_task_get and inspect
+ * the task's blocker field to discover the audit never dispatched.
+ */
+function nonDeliveringAuditDispatchSummary(result: unknown): string | undefined {
+  if (!result || typeof result !== 'object' || !('status' in result)) return undefined;
+  const status = (result as { status?: unknown }).status;
+  if (status === 'dispatched' || status === 'replayed') return undefined;
+  const reason = 'reason' in result ? (result as { reason?: unknown }).reason : undefined;
+  return typeof reason === 'string' && reason.trim()
+    ? `audit_dispatch_${String(status)}: ${reason}`
+    : `audit_dispatch_${String(status)}`;
+}
+
 export interface SupervisionMcpToolDeps {
   /** Injected in tests; production supplies the real registry. */
   registry?: SupervisionRegistryPort;
@@ -830,6 +849,14 @@ export function createSupervisionMcpToolHandlers(
       // negates the committed transition; it tells the caller what still needs
       // to converge so they do not have to guess from an error.
       let convergenceOutcome: string | undefined;
+      // Set only when the reactive audit dispatch that record_validation/
+      // open_audit trigger did not actually deliver an auditor (e.g.
+      // missing_audit_policy). Previously this was logged server-side only
+      // (see logNonDeliveringAuditDispatch) and silently dropped from the
+      // response, so the caller saw a bare successful transition with no way
+      // to learn the audit itself never dispatched short of a separate
+      // supervision_task_get call to inspect the task's blocker field.
+      let auditDispatchOutcome: string | undefined;
       const applied = reg.applyIntent({
         taskId,
         ...(intentAssignmentId ? { assignmentId: intentAssignmentId } : {}),
@@ -868,6 +895,7 @@ export function createSupervisionMcpToolHandlers(
         try {
           const auditTrigger = await deps.dispatchReadyAudit?.(taskId);
           logNonDeliveringAuditDispatch(taskId, 'record_validation', auditTrigger);
+          auditDispatchOutcome = nonDeliveringAuditDispatchSummary(auditTrigger);
         } catch (error) {
           // The validation and handoff commits remain authoritative. The
           // deterministic dispatcher records its own blocker and can replay --
@@ -879,12 +907,14 @@ export function createSupervisionMcpToolHandlers(
             { err: error, taskId, intent: 'record_validation' },
             'Reactive post-validation audit dispatch threw',
           );
+          auditDispatchOutcome = error instanceof Error ? error.message : String(error);
         }
       }
       if (outcome.intent === 'open_audit') {
         try {
           const auditTrigger = await deps.dispatchReadyAudit?.(taskId);
           logNonDeliveringAuditDispatch(taskId, 'open_audit', auditTrigger);
+          auditDispatchOutcome = nonDeliveringAuditDispatchSummary(auditTrigger);
         } catch (error) {
           // The ready_for_audit commit is authoritative. The dispatcher owns
           // its durable blocker report and the one-shot boot sweep retries a
@@ -895,6 +925,7 @@ export function createSupervisionMcpToolHandlers(
             { err: error, taskId, intent: 'open_audit' },
             'Reactive post-open audit dispatch threw',
           );
+          auditDispatchOutcome = error instanceof Error ? error.message : String(error);
         }
       }
       return ok({
@@ -904,6 +935,7 @@ export function createSupervisionMcpToolHandlers(
           : outcome.toStatus ?? null,
         validationState: outcome.validationState,
         ...(convergenceOutcome ? { pendingConvergence: convergenceOutcome } : {}),
+        ...(auditDispatchOutcome ? { auditDispatchOutcome } : {}),
       });
     },
 
