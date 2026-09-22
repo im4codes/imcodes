@@ -226,6 +226,41 @@ describe('native collaboration supervision-authority guard', () => {
       expect(policyEvents()).toHaveLength(0);
     });
 
+    it('lets a formal participant delegate small bounded work with no authority/verdict/repository signal', () => {
+      const { gate } = makeProvider(GATED, 'claude-code-sdk');
+      const smallImplementationOnly = 'Implement a small helper that trims trailing whitespace from each line.';
+      const decision = gate()(PARTICIPANT, { provider: 'claude-code-sdk', toolName: 'Agent', requestText: smallImplementationOnly });
+      expect(decision).toEqual({ allow: true });
+      expect(policyEvents()).toHaveLength(0);
+
+      // A Brain-descendant participant (not a top-level Brain) gets the same
+      // carve-out -- it is still a formal participant, not a coordinating Brain.
+      expect(gate()(BRAIN_CHILD, { provider: 'claude-code-sdk', toolName: 'Agent', requestText: smallImplementationOnly }))
+        .toEqual({ allow: true });
+    });
+
+    it('never extends the delegation carve-out to a Brain, even for the same small bounded work', () => {
+      const { gate } = makeProvider(GATED, 'claude-code-sdk');
+      const smallImplementationOnly = 'Implement a small helper that trims trailing whitespace from each line.';
+      const decision = gate()(BRAIN, { provider: 'claude-code-sdk', toolName: 'Agent', requestText: smallImplementationOnly });
+      expect(decision.allow).toBe(false);
+      if (decision.allow) return;
+      expect(noticeOf(decision.reason)).toMatchObject({ outcome: 'native_agent_task_participation_denied', signals: ['implementation'] });
+    });
+
+    it.each([
+      ['carries IM.codes task authority', 'Implement the fix, then call supervision_task_finish on asg_9k2.', ['implementation', 'imcodes_authority']],
+      ['carries a PASS/REWORK verdict', 'Review this small helper and return PASS or REWORK.', ['task_verdict']],
+      ['carries a repository/deploy gate', 'Implement the small helper and git push the branch.', ['implementation', 'repository_gate']],
+    ])('still refuses a participant\'s delegation when the request also %s', (_label, requestText, expectedSignals) => {
+      const { gate } = makeProvider(GATED, 'claude-code-sdk');
+      const decision = gate()(PARTICIPANT, { provider: 'claude-code-sdk', toolName: 'Agent', requestText });
+      expect(decision.allow).toBe(false);
+      if (decision.allow) return;
+      expect(noticeOf(decision.reason)).toMatchObject({ outcome: 'native_agent_task_participation_denied' });
+      for (const signal of expectedSignals) expect(decision.signals).toContain(signal);
+    });
+
     it('denies unclassified requests in a managed session', () => {
       const { gate } = makeProvider(GATED, 'claude-code-sdk');
       const decision = gate()(BRAIN_CHILD, { provider: 'claude-code-sdk', toolName: 'Workflow', requestText: 'agent("x")' });

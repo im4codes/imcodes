@@ -34,6 +34,7 @@ import {
   collectNativeAgentRequestStrings,
   denyNativeCollaborationGateUnavailable,
   formatNativeCollaborationPolicyNotice,
+  isDelegableParticipantWork,
   readNativeCollaborationClassification,
   NATIVE_COLLABORATION_REQUESTERS,
   type NativeAgentAdmissionMode,
@@ -265,6 +266,14 @@ export function evaluateNativeCollaborationPreExecution(
     if (scope === NATIVE_COLLABORATION_SCOPES.UNMANAGED) return { allow: true };
     const classification = classifyNativeCollaborationRequest(request.requestText);
     if (classification.participation === NATIVE_COLLABORATION_PARTICIPATION.ANALYSIS) return { allow: true };
+    // A formal participant (never a Brain) may hand small, bounded pieces of
+    // its OWN assigned work to its own native subagent, as long as nothing in
+    // the request touches IM.codes task authority, a verdict, or a Git/deploy
+    // gate -- see isDelegableParticipantWork. The participant remains the
+    // accountable executor of the task itself.
+    if (scope === NATIVE_COLLABORATION_SCOPES.PARTICIPANT && isDelegableParticipantWork(classification)) {
+      return { allow: true };
+    }
     emitPolicyEvidence(sessionName, {
       key: request.toolUseId ?? deterministicSendMessageId(`native-collaboration-gate:${request.requestText}`),
       provider: request.provider,
