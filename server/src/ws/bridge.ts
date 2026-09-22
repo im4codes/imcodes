@@ -5392,8 +5392,19 @@ export class WsBridge {
      * here gives every newly-connected browser the same starting
      * capability picture as one that was open during the original
      * hello broadcast.
+     *
+     * A participant share connection needs this exactly as much as the
+     * owner: `capabilities` also carries file.transfer.direct.lease.v2,
+     * which a participant's own file upload/download and the "WebRTC
+     * runtime" diagnostic both gate on. Excluding every share connection
+     * here (originally meant to withhold owner-only P2P *workflow launch*
+     * state, not general daemon capability) left a participant who joined
+     * after the original hello permanently without a capability snapshot
+     * — direct transfer never even attempted, and the diagnostic panel
+     * stuck on "unavailable" with nothing left to ever correct it. A
+     * read-only viewer still doesn't need it.
      */
-    if (!shareState && this.daemonP2pWorkflowCapabilities) {
+    if ((!shareState || shareState.snapshot.effectiveRole === 'participant') && this.daemonP2pWorkflowCapabilities) {
       safeSend(ws, JSON.stringify({
         type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
         daemonId: this.daemonP2pWorkflowCapabilities.daemonId,

@@ -29,6 +29,7 @@ import {
   P2P_WORKFLOW_CAPABILITY_V1,
   P2P_WORKFLOW_SCRIPT_ARGV_CAPABILITY_V1,
 } from '../../shared/p2p-workflow-constants.js';
+import { DIRECT_FILE_TRANSFER_LEASE_CAPABILITY } from '../../shared/direct-file-transfer.js';
 import { REPO_MSG } from '../../shared/repo-types.js';
 import { FS_TRANSPORT_MSG } from '../../shared/fs-transport-messages.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
@@ -5180,6 +5181,95 @@ describe('WsBridge', () => {
         helloEpoch: 1,
         sentAt: 555,
       });
+    });
+
+    it('R3 v2 PR-σ — also replays cached daemon.hello to a participant who joins a shared session late', async () => {
+      // Same bug as the owner case above (a browser that opens after the
+      // daemon's hello never receives one), but for a participant share
+      // connection: capabilities carries file.transfer.direct.lease.v2,
+      // which a participant's own upload/download and the client's "WebRTC
+      // runtime" diagnostic both gate on. Excluding every share connection
+      // from the replay (meant to withhold owner-only P2P workflow-launch
+      // state) left a participant permanently without a capability
+      // snapshot, direct transfer never attempted, and the diagnostic
+      // panel stuck on "unavailable" -- reported live: "参与者...卡在100%"
+      // and "WebRTC 运行时不可用 完全不恢复".
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+        daemonId: serverId,
+        capabilities: [P2P_WORKFLOW_CAPABILITY_V1, DIRECT_FILE_TRANSFER_LEASE_CAPABILITY],
+        helloEpoch: 1,
+        sentAt: 555,
+      }));
+      await flushAsync();
+
+      const target = { kind: 'main', serverId, sessionName: 'deck_late_participant_brain' } as const;
+      const coverage = {
+        target,
+        effectiveRole: 'participant',
+        historyCutoffAt: Date.now() - 1_000,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-late-participant'],
+        primaryShareId: 'share-late-participant',
+        authorizedAt: Date.now(),
+      } as const;
+      const participant = new MockWs();
+      bridge.handleShareBrowserConnection(participant as never, 'participant-user', makeDb('valid-hash'), {
+        ticketId: 'share-ticket-late-participant',
+        target,
+        snapshot: coverage,
+      });
+      await flushAsync();
+
+      const helloMessages = participant.sentStrings
+        .map((raw) => JSON.parse(raw))
+        .filter((msg) => msg.type === P2P_WORKFLOW_MSG.DAEMON_HELLO);
+      expect(helloMessages).toHaveLength(1);
+      expect(helloMessages[0]).toMatchObject({
+        capabilities: [P2P_WORKFLOW_CAPABILITY_V1, DIRECT_FILE_TRANSFER_LEASE_CAPABILITY].sort(),
+      });
+    });
+
+    it('still withholds the replay from a read-only viewer of a shared session', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      daemonWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+        daemonId: serverId,
+        capabilities: [P2P_WORKFLOW_CAPABILITY_V1],
+        helloEpoch: 1,
+        sentAt: 555,
+      }));
+      await flushAsync();
+
+      const target = { kind: 'main', serverId, sessionName: 'deck_late_viewer_brain' } as const;
+      const coverage = {
+        target,
+        effectiveRole: 'viewer',
+        historyCutoffAt: Date.now() - 1_000,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-late-viewer'],
+        primaryShareId: 'share-late-viewer',
+        authorizedAt: Date.now(),
+      } as const;
+      const viewer = new MockWs();
+      bridge.handleShareBrowserConnection(viewer as never, 'viewer-user', makeDb('valid-hash'), {
+        ticketId: 'share-ticket-late-viewer',
+        target,
+        snapshot: coverage,
+      });
+      await flushAsync();
+
+      expect(viewer.sentStrings.some((raw) => JSON.parse(raw).type === P2P_WORKFLOW_MSG.DAEMON_HELLO)).toBe(false);
     });
 
     it('accepts a replacement daemon process whose hello epoch restarts while the old socket closes asynchronously', async () => {
