@@ -2005,7 +2005,14 @@ function SdkAgentsDiagnosticRow({ diagnostic }: { diagnostic: SdkSubagentDiagnos
 function ChatViewImpl({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, onQuote, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false }: Props) {
   const { t, i18n } = useTranslation();
   const locale = resolveI18nLocale(i18n);
-  const fileScopeSessionName = scopeFilesToSession ? (sessionId ?? undefined) : undefined;
+  // Sent on every chatFileReference:true request (path click, preview, download).
+  // The daemon needs the viewed session's identity to find its own in-project
+  // root and its own assistant-published grants (session-file-read-grants.ts);
+  // without it every chat file link is refused as forbidden_path, even ones the
+  // session itself just published. This is unrelated to scopeFilesToSession,
+  // which restricts *unscoped* file-browser access for shared/guest viewers --
+  // that stays wired separately into the embedded FileBrowser panel below.
+  const fileScopeSessionName = sessionId ?? undefined;
   const [syncDisabled, setSyncDisabled] = useState(false);
   const handleForceSync = useCallback(() => {
     if (syncDisabled || !onForceSync) return;

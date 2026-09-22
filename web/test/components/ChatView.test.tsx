@@ -1160,7 +1160,7 @@ describe('ChatView', () => {
     const htmlButton = container.querySelector('.chat-html-preview-btn') as HTMLButtonElement | null;
     expect(htmlButton).not.toBeNull();
     fireEvent.click(htmlButton!);
-    expect(ws.fsReadFile).toHaveBeenCalledWith('./dist/index.HTML', undefined, { chatFileReference: true });
+    expect(ws.fsReadFile).toHaveBeenCalledWith('./dist/index.HTML', 'deck_main_brain', { chatFileReference: true });
     expect(onPreviewFile).not.toHaveBeenCalled();
     expect(container.querySelector('.html-fullscreen-preview')).toBeNull();
     expect(document.body.querySelector('.html-fullscreen-preview')).not.toBeNull();
@@ -1239,7 +1239,7 @@ describe('ChatView', () => {
     const htmlButton = container.querySelector('.chat-html-preview-btn') as HTMLButtonElement | null;
     expect(htmlButton).not.toBeNull();
     expect(() => fireEvent.click(htmlButton!)).not.toThrow();
-    expect(ws.fsReadFile).toHaveBeenCalledWith('./dist/offline.HTML', undefined, { chatFileReference: true });
+    expect(ws.fsReadFile).toHaveBeenCalledWith('./dist/offline.HTML', 'deck_main_brain', { chatFileReference: true });
     expect(container.textContent).toContain('Open ./dist/offline.HTML');
     expect(document.body.querySelector('.html-fullscreen-preview')).not.toBeNull();
     expect(document.body.textContent).toContain('upload.daemon_offline');
@@ -1339,7 +1339,7 @@ describe('ChatView', () => {
     );
 
     await waitFor(() => {
-      expect(ws.fsReadFile).toHaveBeenCalledWith('./screenshots/result.png', undefined, { chatFileReference: true });
+      expect(ws.fsReadFile).toHaveBeenCalledWith('./screenshots/result.png', 'deck_image_preview', { chatFileReference: true });
     });
 
     act(() => {
