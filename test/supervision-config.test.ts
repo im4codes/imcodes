@@ -1000,12 +1000,18 @@ describe('supervision continuation repair (repair_then_resume)', () => {
     });
   }
 
-  it('names exactly the five user-specified recoverable conditions', () => {
+  it('names the complete user-specified recoverable control-plane condition set', () => {
     expect([...recoverable].sort()).toEqual([
       'ambiguous_assignment_worktree',
+      'blocked_or_recovered_projection',
       'identity_rejected_after_runtime_change',
+      'invalid_transition',
+      'missing_lease',
+      'old_revision',
       'old_runtime_identity',
+      'revision_split',
       'role_continuation_routing_gap',
+      'stale_coordinator_or_auditor_projection',
       'stale_lease_or_pointer',
     ]);
   });

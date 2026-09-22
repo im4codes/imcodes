@@ -843,7 +843,9 @@ describe('send-tool', () => {
       await expect(withoutBindingResolver[SUPERVISION_MCP_TOOLS.RECOVER](recoveryRequest))
         .resolves.toMatchObject({
           status: 'error', reason: 'identity_rejected',
-          detail: 'coordination identity target has no selected execution binding',
+          detail: expect.stringMatching(
+            /^coordination identity target has no selected execution binding\. Use supervision_task_recover with recoveryMode=reset_revision/,
+          ),
         });
       expect(registry.getAssignment(assignmentId)).toMatchObject({
         identity: { sessionName: worker.name },

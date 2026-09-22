@@ -4,6 +4,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
+  createSupervisionMcpToolHandlers,
+  type SupervisionRegistryPort,
+} from '../../src/daemon/supervision-mcp-tools.js';
+import { SUPERVISION_MCP_TOOLS } from '../../shared/supervision-mcp-tools.js';
+import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
+import {
   SupervisionTaskRegistry,
   type PersistedSupervisionTaskAssignment,
   type PersistedSupervisionTaskAssignmentIdentity,
@@ -273,6 +279,64 @@ describe('Brain-authoritative reset to revision', () => {
 const REAL_215_SNAPSHOT = '/Users/k/.imcodes/scratch/brain/jdzj-tsk18tm/supervision-state-215-0922.sqlite';
 
 describe.runIf(existsSync(REAL_215_SNAPSHOT))('215 jdzj reset-to-revision snapshots', () => {
+  it('turns the real tsk_19g5 old-path refusal into an exact hinted reset that succeeds', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'tsk-19g5-brain-reset-hint-'));
+    const copied = join(dir, 'state.sqlite');
+    copyFileSync(REAL_215_SNAPSHOT, copied);
+    const registry = new SupervisionTaskRegistry({ dbPath: copied });
+    const target = 'e14ed7999901cf5cf4c8e35e9c27f69682808998cb16823b2682bd4ddab5d466';
+    const port = {
+      getStatus: (taskId: string) => registry.get(taskId)?.status,
+      applyIntent: (input: never) => registry.applyTaskIntent(input),
+      list: (filter: never) => registry.list(filter),
+      get: (taskId: string) => registry.get(taskId),
+      recover: (input: never) => registry.recoverTask(input),
+      rebindTaskAssignmentRevision: (input: never) => registry.rebindTaskAssignmentRevision(input),
+      resetTaskToRevisionAsBrain: (input: never) => registry.resetTaskToRevisionAsBrain(input),
+      housekeeping: (input: never) => registry.reconcileHousekeeping(input),
+    } as unknown as SupervisionRegistryPort;
+    const caller = {
+      userId: 'u', sessionName: 'deck_jdzj_brain', projectName: 'jdzj',
+      serverId: 's', transport: 'stdio',
+    } as unknown as McpRuntimeCaller;
+    const handlers = createSupervisionMcpToolHandlers(caller, {
+      registry: port,
+      isProjectBrain: () => true,
+      resolveSessionIdentity: (sessionName) => ({
+        sessionName, sessionInstanceId: 'live-brain-instance', runtimeEpoch: 'live-brain-epoch',
+        agentType: 'codex-sdk', providerFamily: 'openai', projectName: 'jdzj', role: 'brain',
+      }),
+    });
+    try {
+      const rejected: any = await handlers[SUPERVISION_MCP_TOOLS.RECOVER]({
+        taskId: 'tsk_19g5', assignmentId: 'asg_19g9',
+        fromRevision: '0a4e834d0a8f1e4420618b8135bcc1e9f59b837cefe0bcc2eaaff71dba8986de',
+        toRevision: target, leaseAction: 'renew', idempotencyKey: 'legacy-r2-r3',
+        reason: 'try the narrow recovery once',
+      });
+      expect(rejected).toMatchObject({ status: 'error', reason: 'manifest_mismatch' });
+      expect(rejected.detail).toContain('Use supervision_task_recover with recoveryMode=reset_revision');
+      expect(rejected.detail).toContain(`"toRevision":"${target}"`);
+
+      const reset = await handlers[SUPERVISION_MCP_TOOLS.RECOVER]({
+        taskId: 'tsk_19g5', assignmentId: 'asg_19g9', recoveryMode: 'reset_revision',
+        toRevision: target, taskStatus: 'rework', leaseAction: 'renew',
+        idempotencyKey: 'brain-reset-tsk-19g5-r3',
+        reason: 'repair recoverable daemon-created control-plane divergence',
+      });
+      expect(reset).toMatchObject({ status: 'ok', taskId: 'tsk_19g5', toRevision: target });
+      expect(registry.getTaskRecord('tsk_19g5')).toMatchObject({
+        status: 'rework', currentRevision: target,
+      });
+      expect(registry.listAuditReceipts('tsk_19g5').some((receipt) => receipt.verdict === 'PASS'))
+        .toBe(false);
+      expect(registry.getTaskRecord('tsk_19g5')?.finalization).toBeUndefined();
+    } finally {
+      registry.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('repairs tsk_19g5 R2/R3/base triple split and preserves the immutable R2 receipt', () => {
     const dir = mkdtempSync(join(tmpdir(), 'tsk-19g5-brain-reset-'));
     const copied = join(dir, 'state.sqlite');

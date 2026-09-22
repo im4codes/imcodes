@@ -30,6 +30,8 @@ import {
   type SupervisionCustomInstructionsDetail,
   type SupervisionUiLocale,
   SUPERVISION_RECOVERABLE_CONTINUATION_CONDITIONS,
+  SUPERVISION_BRAIN_REVISION_RESET_ACTION,
+  SUPERVISION_BRAIN_REVISION_RESET_FORBID,
 } from '../../shared/supervision-config.js';
 import { SUPERVISION_IMCODES_BACKGROUND_DOCS } from './imcodes-workflow-docs.js';
 import { FILE_OUTPUT_CONTRACT_ID } from '../../shared/file-output-contract.js';
@@ -512,14 +514,23 @@ export function buildSupervisionContinuationRepairContract(_locale?: Supervision
     onRecoverable: {
       sequence: [
         'read_authoritative_same_task_state',
-        'same_object_recovery_rebind_or_cancel',
+        'try_same_object_recovery_rebind_or_cancel_once',
+        'on_first_legacy_repair_refusal_use_final_reset_revision_fallback',
         'resume_or_redeliver',
       ],
+      finalFallback: SUPERVISION_BRAIN_REVISION_RESET_ACTION,
       forbid: [
         'stop_after_reporting_error',
         'create_replacement_task',
         'reinterpret_delegate_remaining_as_main_window_implementation',
+        SUPERVISION_BRAIN_REVISION_RESET_FORBID,
       ],
+      controlPlaneStopOnly: [SUPERVISION_BRAIN_REVISION_RESET_ACTION.safetyBoundary],
+      daemonRecovery: {
+        mode: 'emit_exact_brain_reset_invocation_on_rejection',
+        automaticMutation: false,
+        reason: 'target_revision_and_owner_are_authoritative_brain_choices',
+      },
     },
     stopOnly: [
       'brain_only_unrecoverable_authority',

@@ -109,6 +109,7 @@ import {
   SUPERVISION_TASK_CLASSIFICATIONS,
   SUPERVISION_TASK_FILE_OPERATIONS,
   SUPERVISION_TASK_LIFECYCLE_STATUSES,
+  buildSupervisionBrainRevisionResetGuidance,
   isAuditableSupervisionTaskClassification,
   isSupervisionTaskAuditPolicy,
   supervisionTaskAuditPolicyFromSnapshot,
@@ -1668,6 +1669,28 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     };
   };
 
+  const withProjectBrainResetGuidance = async (
+    task: ReturnType<SupervisionTaskRegistry['get']>,
+    identity: PersistedSupervisionTaskAssignmentIdentity,
+    detail: string,
+    input: { assignmentId?: string; toRevision?: string } = {},
+  ): Promise<string> => {
+    if (!task) return detail;
+    const sessions = await sendSessions();
+    const authoritativeBrain = resolveAuthoritativeBrainIdentity(task.projectName, sessions);
+    if (!authoritativeBrain || !supervisionIdentityMatches(authoritativeBrain, identity)) return detail;
+    const assignment = input.assignmentId
+      ? task.assignments.find((candidate) => candidate.assignmentId === input.assignmentId)
+      : task.assignments.find((candidate) => candidate.role === 'implementer')
+        ?? task.assignments.find((candidate) => candidate.role === 'coordinator')
+        ?? task.assignments[0];
+    return `${detail}. ${buildSupervisionBrainRevisionResetGuidance({
+      taskId: task.taskId,
+      assignmentId: input.assignmentId || assignment?.assignmentId,
+      toRevision: input.toRevision || assignment?.auditRevision || task.currentRevision,
+    })}`;
+  };
+
   const handlers: Record<MemoryMcpToolName, MemoryMcpToolHandler> = {
     [MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]: async (input) => {
       const gate = memoryGate(deps, MEMORY_FEATURE_FLAGS_BY_NAME.quickSearch, MEMORY_MCP_DISABLED_FLAGS.QUICK_SEARCH, { items: [] });
@@ -2463,7 +2486,13 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
               authoritativeBrainOverride: true,
             });
             if (!rebound.ok) {
-              return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `coordinator rebind rejected: ${rebound.reason}`);
+              return error(
+                MCP_ERROR_REASONS.VALIDATION_FAILED,
+                await withProjectBrainResetGuidance(
+                  existing, identity, `coordinator rebind rejected: ${rebound.reason}`,
+                  { assignmentId: coordinator.assignmentId, toRevision: coordinator.auditRevision || existing.currentRevision },
+                ),
+              );
             }
           }
           return {
@@ -2503,7 +2532,13 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         scopeFiles: stringArrayArg(args, 'scopeFiles'),
         idempotencyKey: stringArg(args, 'idempotencyKey'),
       });
-      if (!assignment.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `assignment rejected: ${assignment.reason}`);
+      if (!assignment.ok) return error(
+        MCP_ERROR_REASONS.VALIDATION_FAILED,
+        await withProjectBrainResetGuidance(
+          existing, identity, `assignment rejected: ${assignment.reason}`,
+          { toRevision: existing?.currentRevision },
+        ),
+      );
       return { status: 'ok', taskId: task.value.taskId, assignmentId: assignment.value.assignmentId, idempotentReplay: task.replay === true || assignment.replay === true };
     },
     [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_UPDATE]: async (input) => {
@@ -2516,11 +2551,20 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const registry = getSupervisionTaskRegistry();
       const existing = registry.getAssignment(mapped.assignmentId);
       if (!existing) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'task_update rejected: not_found');
+      const existingTask = registry.get(existing.taskId);
+      const updateFailure = async (detail: string): Promise<ToolResult> => error(
+        MCP_ERROR_REASONS.VALIDATION_FAILED,
+        await withProjectBrainResetGuidance(existingTask, identity, detail, {
+          assignmentId: mapped.assignmentId,
+          toRevision: mapped.metadata.auditRevision || mapped.metadata.revision
+            || existing.auditRevision || existingTask?.currentRevision,
+        }),
+      );
       const outcome = resolveSupervisionIntent({
         request: { intent: mapped.intent, taskId: existing.taskId, assignmentId: mapped.assignmentId },
         currentStatus: existing.status,
       });
-      if (!outcome.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `task_update rejected: ${outcome.refusal}`);
+      if (!outcome.ok) return updateFailure(`task_update rejected: ${outcome.refusal}`);
       const updated = registry.updateAssignment({
         assignmentId: mapped.assignmentId, identity,
         status: (outcome.toStatus ?? existing.status) as never,
@@ -2533,7 +2577,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         externalHeadSha: mapped.metadata.externalHeadSha,
         externalTaskId: mapped.metadata.externalTaskId,
       });
-      return updated.ok ? { status: 'ok', item: updated.value } : error(MCP_ERROR_REASONS.VALIDATION_FAILED, `task_update rejected: ${updated.reason}`);
+      return updated.ok ? { status: 'ok', item: updated.value } : updateFailure(`task_update rejected: ${updated.reason}`);
     },
     [MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH]: async (input) => {
       // Legacy assignment-only finish remains compatible; it can never close
@@ -2545,11 +2589,19 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const registry = getSupervisionTaskRegistry();
       const existing = registry.getAssignment(mapped.assignmentId);
       if (!existing) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'task_finish rejected: not_found');
+      const existingTask = registry.get(existing.taskId);
+      const finishFailure = async (detail: string): Promise<ToolResult> => error(
+        MCP_ERROR_REASONS.VALIDATION_FAILED,
+        await withProjectBrainResetGuidance(existingTask, identity, detail, {
+          assignmentId: mapped.assignmentId,
+          toRevision: mapped.metadata.revision || existing.auditRevision || existingTask?.currentRevision,
+        }),
+      );
       // Caller revision authority is mandatory for every legacy finish shape,
       // including cancelled completion evidence; it is never inferred.
       const expectedRevision = typeof mapped.metadata.revision === 'string' ? mapped.metadata.revision.trim() : '';
       if (!expectedRevision) {
-        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'task_finish rejected: expected_revision_required');
+        return finishFailure('task_finish rejected: expected_revision_required');
       }
       if (existing.status === 'cancelled' && existing.role !== 'auditor' && existing.role !== 'coordinator') {
         const inspected = await inspectSupervisionAssignmentWorktree({
@@ -2560,7 +2612,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
           baseRevision: registry.getTaskRecord(existing.taskId)?.baseRevision,
         });
         if (!inspected.ok || inspected.snapshot.files.length === 0) {
-          return error(MCP_ERROR_REASONS.VALIDATION_FAILED,
+          return finishFailure(
             `task_finish rejected: ${inspected.ok ? 'manifest_mismatch' : inspected.reason}`);
         }
         const evidence = registry.recordCancelledCompletionEvidence({
@@ -2573,7 +2625,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         });
         return evidence.ok
           ? { status: 'ok', item: evidence.value }
-          : error(MCP_ERROR_REASONS.VALIDATION_FAILED, `task_finish rejected: ${evidence.reason}`);
+          : await finishFailure(`task_finish rejected: ${evidence.reason}`);
       }
       const updated = registry.finishAssignment({
         assignmentId: mapped.assignmentId,
@@ -2581,7 +2633,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         expectedRevision,
         evidence: mapped.metadata.evidence,
       });
-      if (!updated.ok) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `task_finish rejected: ${updated.reason}`);
+      if (!updated.ok) return finishFailure(`task_finish rejected: ${updated.reason}`);
       // Same event, same single wire as the intent path: a legacy
       // assignment-only finish must not need a Brain call or the next poll to
       // carry the aggregate to its next automatic step.

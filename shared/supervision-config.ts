@@ -379,6 +379,12 @@ export const SUPERVISION_RECOVERABLE_CONTINUATION_CONDITIONS = {
   ROLE_CONTINUATION_ROUTING_GAP: 'role_continuation_routing_gap',
   STALE_LEASE_OR_POINTER: 'stale_lease_or_pointer',
   OLD_RUNTIME_IDENTITY: 'old_runtime_identity',
+  REVISION_SPLIT: 'revision_split',
+  INVALID_TRANSITION: 'invalid_transition',
+  OLD_REVISION: 'old_revision',
+  BLOCKED_OR_RECOVERED_PROJECTION: 'blocked_or_recovered_projection',
+  MISSING_LEASE: 'missing_lease',
+  STALE_COORDINATOR_OR_AUDITOR_PROJECTION: 'stale_coordinator_or_auditor_projection',
 } as const;
 export type SupervisionRecoverableContinuationCondition =
   typeof SUPERVISION_RECOVERABLE_CONTINUATION_CONDITIONS[
@@ -569,6 +575,65 @@ export const SUPERVISION_BRAIN_REVISION_RESET_LEASE_ACTIONS = [
 export const SUPERVISION_BRAIN_REVISION_RESET_REFUSALS = {
   CLOSED_TASK: 'safety_boundary_closed_task',
 } as const;
+
+/**
+ * One canonical description of the Brain's final mutable-state repair action.
+ * Prompts and refusal responses both consume this object so a model can never
+ * be told that the escape hatch exists without also receiving its exact shape.
+ */
+export const SUPERVISION_BRAIN_REVISION_RESET_ACTION = Object.freeze({
+  tool: 'supervision_task_recover',
+  recoveryMode: SUPERVISION_BRAIN_RECOVERY_MODES[0],
+  requiredFields: Object.freeze([
+    'taskId', 'assignmentId', 'toRevision', 'taskStatus',
+    'leaseAction', 'idempotencyKey', 'reason',
+  ] as const),
+  legacyRepairRefusalLimit: 1,
+  defaultTaskStatus: SUPERVISION_BRAIN_REVISION_RESET_STATUSES[1],
+  defaultLeaseAction: SUPERVISION_BRAIN_REVISION_RESET_LEASE_ACTIONS[1],
+  safetyBoundary: SUPERVISION_BRAIN_REVISION_RESET_REFUSALS.CLOSED_TASK,
+});
+
+export const SUPERVISION_BRAIN_REVISION_RESET_FORBID =
+  'mark_control_plane_blocked_and_return_to_user_before_reset_safety_boundary' as const;
+
+export const SUPERVISION_BRAIN_REVISION_RESET_REASON =
+  'repair recoverable daemon-created control-plane divergence' as const;
+
+/** Brain-only refusal guidance. Never attach it before project-Brain authority is proven. */
+export function buildSupervisionBrainRevisionResetGuidance(input?: {
+  taskId?: string;
+  assignmentId?: string;
+  toRevision?: string;
+}): string {
+  const action = SUPERVISION_BRAIN_REVISION_RESET_ACTION;
+  const required = action.requiredFields.join(', ');
+  const prefix = `Use ${action.tool} with recoveryMode=${action.recoveryMode} and required fields: ${required}.`;
+  const taskId = input?.taskId?.trim();
+  const assignmentId = input?.assignmentId?.trim();
+  const toRevision = input?.toRevision?.trim();
+  if (!taskId || !assignmentId || !toRevision) return prefix;
+  const fingerprintSource = `${taskId}\0${assignmentId}\0${toRevision}`;
+  let fingerprint = 0x811c9dc5;
+  for (let index = 0; index < fingerprintSource.length; index += 1) {
+    fingerprint ^= fingerprintSource.charCodeAt(index);
+    fingerprint = Math.imul(fingerprint, 0x01000193);
+  }
+  const idempotencyKey = [
+    'brain-reset', taskId.slice(0, 32), assignmentId.slice(0, 32),
+    toRevision.slice(0, 24), (fingerprint >>> 0).toString(16).padStart(8, '0'),
+  ].join(':');
+  return `${prefix} Exact fallback: ${JSON.stringify({
+    taskId,
+    assignmentId,
+    recoveryMode: action.recoveryMode,
+    toRevision,
+    taskStatus: action.defaultTaskStatus,
+    leaseAction: action.defaultLeaseAction,
+    idempotencyKey,
+    reason: SUPERVISION_BRAIN_REVISION_RESET_REASON,
+  })}`;
+}
 
 /** Explicit Brain decisions for immutable output produced after cancellation. */
 export const SUPERVISION_COMPLETION_EVIDENCE_DECISIONS = ['adopt', 'discard'] as const;

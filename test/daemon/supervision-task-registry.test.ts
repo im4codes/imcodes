@@ -8706,6 +8706,42 @@ describe('SupervisionTaskRegistry', () => {
     })).toMatchObject({ status: 'ok', item: { status: 'finalized' } });
   });
 
+  it('adds the exact reset fallback to a rejected legacy Brain task_update', async () => {
+    const registry = getSupervisionTaskRegistry();
+    const brain = session('deck_alpha_brain');
+    const sessions = [brain];
+    const taskId = 'legacy-brain-update-reset-guidance';
+    const r1 = 'legacy-brain-update-r1';
+    const r2 = 'legacy-brain-update-r2';
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'integration_task',
+      objective: 'repair a rejected legacy Brain update', currentRevision: r1,
+    })).toMatchObject({ ok: true });
+    const coordinator = registry.createAssignment({
+      taskId, role: 'coordinator', identity: identity(brain.name),
+      auditRevision: r1, required: false,
+    });
+    expect(coordinator).toMatchObject({ ok: true });
+    if (!coordinator.ok) throw new Error(coordinator.reason);
+
+    const handlers = createMemoryMcpToolHandlers(
+      { userId: 'u', sessionName: brain.name, projectName: 'alpha', projectRoot: '/work/alpha' },
+      { sendDeps: { listSessions: () => sessions } },
+    );
+    const refused: any = await handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_UPDATE]({
+      assignmentId: coordinator.value.assignmentId,
+      revision: r2,
+      auditRevision: r2,
+      blocker: 'legacy repair attempt',
+    });
+    expect(refused).toMatchObject({ status: 'error', reason: 'validation_failed' });
+    expect(refused.message).toContain('task_update rejected: old_revision');
+    expect(refused.message).toContain('Use supervision_task_recover with recoveryMode=reset_revision');
+    expect(refused.message).toContain(`"taskId":"${taskId}"`);
+    expect(refused.message).toContain(`"assignmentId":"${coordinator.value.assignmentId}"`);
+    expect(refused.message).toContain(`"toRevision":"${r2}"`);
+  });
+
   it('synchronizes intent lifecycle and closes matching PASS assignments without treating read-only scope as evidence', async () => {
     const registry = getSupervisionTaskRegistry();
     const revision = 'task-worktree-core-r2';

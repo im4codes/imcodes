@@ -324,6 +324,37 @@ describe('production MCP registration', () => {
     })]);
   });
 
+  it('points a rejected Brain start at reset_revision without exposing that authority to a participant', async () => {
+    registry.statuses.set('tsk_a', 'delegated');
+    registry.currentRevisions.set('tsk_a', 'revision-r3');
+    registry.assignmentStates.set('tsk_a', [{
+      assignmentId: 'tsk_a-coordinator', role: 'coordinator', status: 'delegated', leaseId: '',
+      auditRevision: 'revision-r3', identity: testIdentity('deck_cd_brain'),
+    }]);
+    registry.applyIntent = () => ({ ok: false as const, reason: 'old_revision' });
+    const request = {
+      taskId: 'tsk_a', assignmentId: 'tsk_a-coordinator', intent: 'start',
+      note: 'resume a daemon-created blocked projection',
+    };
+
+    const brainHandlers = createSupervisionMcpToolHandlers(CALLER, {
+      registry, isProjectBrain: () => true, resolveSessionIdentity: testResolveSessionIdentity,
+    });
+    const brain: any = await brainHandlers[SUPERVISION_MCP_TOOLS.INTENT](request);
+    expect(brain).toMatchObject({ status: 'error', reason: 'old_revision' });
+    expect(brain.detail).toContain('task intent rejected: old_revision');
+    expect(brain.detail).toContain('recoveryMode=reset_revision');
+    expect(brain.detail).toContain('"toRevision":"revision-r3"');
+
+    const participantHandlers = createSupervisionMcpToolHandlers(CALLER, {
+      registry, isProjectBrain: () => false, resolveSessionIdentity: testResolveSessionIdentity,
+    });
+    const participant: any = await participantHandlers[SUPERVISION_MCP_TOOLS.INTENT](request);
+    expect(participant).toMatchObject({ status: 'error' });
+    expect(participant.detail).not.toContain('reset_revision');
+    expect(participant.detail).not.toContain('supervision_task_recover');
+  });
+
   it('uses assignment lifecycle for assignment-scoped recovery intents when the aggregate is stale', async () => {
     registry.statuses.set('tsk_a', 'ready_for_audit');
     registry.assignmentStates.set('tsk_a', [{
@@ -974,6 +1005,36 @@ describe('administrative recover', () => {
       resolveSessionIdentity: testResolveSessionIdentity,
     });
 
+    it('gives only the authoritative project Brain an exact one-click reset fallback', async () => {
+      registry.currentRevisions.set('tsk_a', 'r1');
+      registry.assignmentStates.set('tsk_a', [{
+        assignmentId: 'tsk_a-assignment-0', role: 'implementer', status: 'blocked', leaseId: '',
+        auditRevision: 'r2', identity: testIdentity('deck_cd_brain'),
+      }]);
+      registry.rebindTaskAssignmentRevision = () => ({ ok: false as const, reason: 'old_revision' });
+      const request = {
+        taskId: 'tsk_a', assignmentId: 'tsk_a-assignment-0',
+        fromRevision: 'r1', toRevision: 'r2', leaseAction: 'renew',
+        idempotencyKey: 'legacy-rebind-r2', reason: 'try the narrow repair once',
+      };
+
+      const brain: any = await brainHandlers()[SUPERVISION_MCP_TOOLS.RECOVER](request);
+      expect(brain).toMatchObject({ status: 'error', reason: 'old_revision' });
+      expect(brain.detail).toContain('Use supervision_task_recover with recoveryMode=reset_revision');
+      expect(brain.detail).toContain('taskId, assignmentId, toRevision, taskStatus, leaseAction, idempotencyKey, reason');
+      expect(brain.detail).toContain('"taskId":"tsk_a"');
+      expect(brain.detail).toContain('"assignmentId":"tsk_a-assignment-0"');
+      expect(brain.detail).toContain('"toRevision":"r2"');
+
+      const participantHandlers = createSupervisionMcpToolHandlers(CALLER, {
+        registry, isProjectBrain: () => false, resolveSessionIdentity: testResolveSessionIdentity,
+      });
+      const participant: any = await participantHandlers[SUPERVISION_MCP_TOOLS.RECOVER](request);
+      expect(participant).toMatchObject({ status: 'error', reason: 'forbidden' });
+      expect(participant.detail).not.toContain('reset_revision');
+      expect(participant.detail).not.toContain('supervision_task_recover');
+    });
+
     it.each([
       ['idempotencyKey'], ['reason'], ['assignmentId'],
     ] as const)('names the required fields when %s is missing', async (missing) => {
@@ -1344,13 +1405,13 @@ describe('administrative recover', () => {
       registry: port, isProjectBrain: () => true, resolveSessionIdentity: testResolveSessionIdentity,
     });
 
-    await expect(brain[SUPERVISION_MCP_TOOLS.RECOVER]({
+    const refused: any = await brain[SUPERVISION_MCP_TOOLS.RECOVER]({
       taskId: state.taskId, assignmentId, fromRevision: 'revision-r1', toRevision: 'revision-r2',
       leaseAction: 'renew', idempotencyKey: 'false-success-r2', reason: 'reject a false successful rebind',
-    })).resolves.toEqual({
-      status: 'error', reason: 'invalid_transition',
-      detail: 'revision recovery postcondition failed: authoritative successor state is not bound',
     });
+    expect(refused).toMatchObject({ status: 'error', reason: 'invalid_transition' });
+    expect(refused.detail).toContain('revision recovery postcondition failed: authoritative successor state is not bound');
+    expect(refused.detail).toContain('recoveryMode=reset_revision');
     expect(rebindTaskAssignmentRevision).toHaveBeenCalledTimes(1);
   });
 
@@ -1383,15 +1444,15 @@ describe('administrative recover', () => {
       registry: port, isProjectBrain: () => true, resolveSessionIdentity: testResolveSessionIdentity,
     });
 
-    await expect(brain[SUPERVISION_MCP_TOOLS.RECOVER]({
+    const refused: any = await brain[SUPERVISION_MCP_TOOLS.RECOVER]({
       taskId: state.taskId, assignmentId,
       fromRevision: 'revision-r3', toRevision: 'revision-r3',
       leaseAction: 'renew', idempotencyKey: 'equal-revision-diagnostic',
       reason: 'show the exact mismatch rather than opaque invalid',
-    })).resolves.toEqual({
-      status: 'error', reason: 'invalid',
-      detail: 'revision recovery rejected: invalid; task.currentRevision=revision-r1, assignment.auditRevision=revision-r2, requested fromRevision=revision-r3, requested toRevision=revision-r3, mismatched fields=task.currentRevision,assignment.auditRevision',
     });
+    expect(refused).toMatchObject({ status: 'error', reason: 'invalid' });
+    expect(refused.detail).toContain('revision recovery rejected: invalid; task.currentRevision=revision-r1, assignment.auditRevision=revision-r2, requested fromRevision=revision-r3, requested toRevision=revision-r3, mismatched fields=task.currentRevision,assignment.auditRevision');
+    expect(refused.detail).toContain('recoveryMode=reset_revision');
   });
 
   it.each([

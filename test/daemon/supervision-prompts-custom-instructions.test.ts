@@ -15,6 +15,8 @@ import {
   SUPERVISION_SUPPORTED_UI_LOCALES,
   normalizeSessionSupervisionSnapshot,
   SUPERVISION_RECOVERABLE_CONTINUATION_CONDITIONS,
+  SUPERVISION_BRAIN_REVISION_RESET_ACTION,
+  SUPERVISION_BRAIN_REVISION_RESET_FORBID,
 } from '../../shared/supervision-config.js';
 import { CODEX_MODEL_IDS } from '../../src/shared/models/options.js';
 import {
@@ -619,6 +621,36 @@ describe('Brain continuation-repair contract placement and budget', () => {
     expect(contract).toContain('stop_after_reporting_error');
     expect(contract).toContain('create_replacement_task');
     expect(contract).toContain('reinterpret_delegate_remaining_as_main_window_implementation');
+  });
+
+  it('mandates the exact Brain reset fallback after one rejected legacy repair', () => {
+    const contract = JSON.parse(buildSupervisionContinuationRepairContract());
+    expect(contract.onRecoverable.sequence).toEqual([
+      'read_authoritative_same_task_state',
+      'try_same_object_recovery_rebind_or_cancel_once',
+      'on_first_legacy_repair_refusal_use_final_reset_revision_fallback',
+      'resume_or_redeliver',
+    ]);
+    expect(contract.onRecoverable.finalFallback).toEqual(
+      JSON.parse(JSON.stringify(SUPERVISION_BRAIN_REVISION_RESET_ACTION)),
+    );
+    expect(contract.onRecoverable.finalFallback).toMatchObject({
+      tool: 'supervision_task_recover',
+      recoveryMode: 'reset_revision',
+      legacyRepairRefusalLimit: 1,
+      requiredFields: [
+        'taskId', 'assignmentId', 'toRevision', 'taskStatus',
+        'leaseAction', 'idempotencyKey', 'reason',
+      ],
+    });
+    expect(contract.onRecoverable.forbid).toContain(SUPERVISION_BRAIN_REVISION_RESET_FORBID);
+    expect(contract.onRecoverable.controlPlaneStopOnly)
+      .toEqual([SUPERVISION_BRAIN_REVISION_RESET_ACTION.safetyBoundary]);
+    expect(contract.onRecoverable.daemonRecovery).toEqual({
+      mode: 'emit_exact_brain_reset_invocation_on_rejection',
+      automaticMutation: false,
+      reason: 'target_revision_and_owner_are_authoritative_brain_choices',
+    });
   });
 
   it('permits stopping only for the five genuine conditions', () => {
