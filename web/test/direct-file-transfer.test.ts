@@ -171,7 +171,7 @@ function controlBinding(message: Record<string, unknown>) {
 
 function createWs(
   capabilities: string[],
-  mode: 'success' | 'operation_failure' | 'lease_signal_failure' | 'runtime_recovering_once' | 'hold' | 'authorized_hold' | 'status_committed' | 'commit_ack_lost_status_committed' | 'commit_ack_lost_status_attempting_then_committed' | 'terminal_committed' | 'ack_then_late_terminal' | 'download_hold_rebind' | 'download_size_mismatch' | 'error_after_expiry' | 'drop_first_lease_ready' | 'drop_first_lease_answer' | 'control_socket_closed' | 'lease_init_recovering_once' = 'success',
+  mode: 'success' | 'operation_failure' | 'lease_signal_failure' | 'runtime_recovering_once' | 'hold' | 'authorized_hold' | 'status_committed' | 'commit_ack_lost_status_committed' | 'commit_ack_lost_status_committed_late_credit' | 'commit_ack_lost_status_attempting_then_committed' | 'terminal_committed' | 'ack_then_late_terminal' | 'download_hold_rebind' | 'download_size_mismatch' | 'error_after_expiry' | 'drop_first_lease_ready' | 'drop_first_lease_answer' | 'control_socket_closed' | 'lease_init_recovering_once' = 'success',
   leaseTiming: { readyDelayMs?: number; idleWindowMs?: number; terminalDelayMs?: number; rebindDaemonGeneration?: number; secondLeaseDaemonGeneration?: number; secondOfferAnswerDelayMs?: number } = {},
 ) {
   const handlers = new Set<(message: ServerMessage) => void>();
@@ -260,6 +260,24 @@ function createWs(
     if (payload.type === DIRECT_FILE_TRANSFER_DATA_MSG.FINISH && payload.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD) {
       const common = controlBinding(payload);
       if (mode === 'commit_ack_lost_status_committed') return;
+      if (mode === 'commit_ack_lost_status_committed_late_credit') {
+        // A duplicate/delayed CREDIT echo for bytes already sent, arriving
+        // well after the upload source finished (a macrotask, unlike the
+        // microtask-timed CREDIT other scenarios use, so it lands strictly
+        // after `uploadSourceFinished` is set) -- distinct from the "commit
+        // ACK lost" case in that something DID arrive, but it is stale
+        // progress, not the missing commit acknowledgement.
+        setTimeout(() => channel.dispatchEvent(new MessageEvent('message', {
+          data: JSON.stringify({
+            type: DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT,
+            protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+            ...common,
+            creditBytes: DIRECT_FILE_TRANSFER_LIMITS.DATA_CREDIT_BYTES,
+            committedBytes: payload.totalBytes,
+          }),
+        })), 5_000);
+        return;
+      }
       if (mode === 'commit_ack_lost_status_attempting_then_committed') {
         queueMicrotask(() => channel.dispatchEvent(new MessageEvent('message', {
           data: JSON.stringify({
@@ -391,6 +409,7 @@ function createWs(
         }));
     } else if (message.type === DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY
       && (mode === 'status_committed' || mode === 'commit_ack_lost_status_committed'
+        || mode === 'commit_ack_lost_status_committed_late_credit'
         || mode === 'commit_ack_lost_status_attempting_then_committed')) {
         statusQueryCount += 1;
         const stillAttempting = mode === 'commit_ack_lost_status_attempting_then_committed'
@@ -2336,6 +2355,38 @@ describe('direct file transfer v2 browser broker', () => {
     expect(apiMocks.uploadFile).not.toHaveBeenCalled();
   });
 
+  it('a late duplicate CREDIT after the source finished does not push the recovery deadline back out to the long default', async () => {
+    vi.useFakeTimers();
+    const { uploadFileWithDirectFallback, FILE_UPLOAD_TRANSPORT_MODE } = await import('../src/direct-file-transfer.js');
+    const { ws, sent } = createWs(directCapabilities, 'commit_ack_lost_status_committed_late_credit');
+    const progress: number[] = [];
+    const modes: string[] = [];
+
+    const pending = uploadFileWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      file: createUploadFile('late-credit.txt', 'already durable'),
+      onProgress: (value) => progress.push(value),
+      onMode: (mode) => modes.push(mode),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY)).toHaveLength(0);
+
+    // The mock's late CREDIT lands 5s after the source finished -- comfortably
+    // inside STATUS_RECOVERY_DEADLINE_MS (15s) but far short of the long
+    // NO_PROGRESS_TIMEOUT_MS (45s) default. If that CREDIT wrongly re-armed
+    // with the long default (the bug), the status query would not appear
+    // until 45s after it, not 15s.
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(progress).toContain(99);
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.STATUS_RECOVERY_DEADLINE_MS);
+    expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY)).toHaveLength(1);
+    expect(modes).toContain(FILE_UPLOAD_TRANSPORT_MODE.RECOVERING);
+
+    await expect(pending).resolves.toMatchObject({ attachment: { id: 'status-committed' } });
+    expect(progress.at(-1)).toBe(100);
+    expect(apiMocks.uploadFile).not.toHaveBeenCalled();
+  });
 
   it('establishes and then reuses an inert v2 lease for explicit diagnostics without file authority', async () => {
     const { probeDirectConnectivity } = await import('../src/direct-file-transfer.js');

@@ -2163,7 +2163,13 @@ async function runAttempt(lease: Lease, op: DirectAttempt, attempt: number): Pro
         const expectedBinding = expectedDataBinding(lease, active);
         if (!expectedBinding
           || !directFileTransferAttemptBindingMatches(expectedBinding, data as unknown as Record<string, unknown>)) return;
-        arm();
+        // Once the upload source is finished, a late/duplicate CREDIT echo for
+        // bytes already sent is not new progress toward the still-missing
+        // commit acknowledgement. Re-arming with the long default deadline
+        // here would silently undo the tighter STATUS_RECOVERY_DEADLINE_MS
+        // armed below, delaying (or entirely masking within one attempt's
+        // budget) the recovery query this exists to trigger promptly.
+        arm(uploadSourceFinished ? DIRECT_FILE_TRANSFER_LIMITS.STATUS_RECOVERY_DEADLINE_MS : undefined);
         if (data.type === DIRECT_FILE_TRANSFER_DATA_MSG.ERROR) {
           fail(directError(data.error));
           return;
