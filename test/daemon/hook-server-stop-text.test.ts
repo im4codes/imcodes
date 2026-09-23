@@ -41,6 +41,7 @@ vi.mock('../../src/util/logger.js', () => ({
 }));
 
 import { clearQueues, startHookServer } from '../../src/daemon/hook-server.js';
+import { buildAgentDelegationSenderLine } from '../../shared/agent-delegation.js';
 
 function makeSession(overrides: Record<string, unknown>) {
   return {
@@ -150,6 +151,9 @@ describe('hook-server /send with "/stop" text', () => {
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ ok: true, delivered: true, target: 'deck_alpha_w1' });
     expect(stopSessionNowMock).not.toHaveBeenCalled();
-    expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith('deck_alpha_w1', '请解释 /stop 命令的作用');
+    expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith(
+      'deck_alpha_w1',
+      `${buildAgentDelegationSenderLine('deck_alpha_brain')}\n\n请解释 /stop 命令的作用`,
+    );
   });
 });

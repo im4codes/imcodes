@@ -363,6 +363,13 @@ export interface SendMessageInput {
   internalAuditValidationAuthority?: string;
   /** Daemon-only evidence from an auto-provision refusal before busy-FIFO fallback. */
   internalProvisioningAttempt?: SupervisionProvisioningEvidence;
+  /**
+   * Daemon-only: `message` is machine-parsed JSON (e.g. a structured blocker
+   * escalation report), not agent-readable prose. Suppresses the prepended
+   * sender-identification line — prepending text would break `JSON.parse` on
+   * the receiving/automation side.
+   */
+  internalStructuredPayload?: true;
 }
 
 export interface SendMessageDelivery {
@@ -2690,6 +2697,7 @@ export async function dispatchSendMessage(
     const message = buildSessionDispatchMessage({
       message: assignmentMessage,
       files: fileRefs.files,
+      ...(input.internalStructuredPayload ? {} : { from: caller.sessionName, fromLabel: callerRecord?.label }),
       replyTo: replyRequired ? caller.sessionName : null,
       ...(replyAuthority ? { replyAuthority: replyAuthority.authority } : {}),
     });
@@ -2945,6 +2953,7 @@ export async function escalateImplementationBlocker(
       internalMessageId: messageId,
       internalDurableQueue: true,
       internalQueueSupervisionReference: queueReference,
+      internalStructuredPayload: true,
     }, deps);
     if (dispatched.status !== 'accepted') {
       const failedReport: SupervisionBlockerEscalationReport = {
@@ -3772,6 +3781,7 @@ async function reportCancelledCompletionEvidenceDecision(
     idempotencyKey: `cancelled-completion-decision:${request.evidenceId}`,
     internalMessageId: messageId,
     internalDurableQueue: true,
+    internalStructuredPayload: true,
   });
   return dispatched.status === 'accepted';
 }
@@ -5206,6 +5216,8 @@ async function dispatchExecutionCloneSend(
   const message = buildSessionDispatchMessage({
     message: input.message!,
     files: fileRefs.files,
+    from: caller.sessionName,
+    fromLabel: callerRecord?.label,
     replyTo: caller.sessionName,
     replyAuthority: replyAuthority.authority,
   });
@@ -5466,6 +5478,8 @@ export async function dispatchHookSend(input: HookSendDispatchInput, deps?: Send
     const message = buildSessionDispatchMessage({
       message: input.message,
       files: fileRefs.files,
+      from: input.from,
+      fromLabel: callerRecord?.label,
       replyTo: input.reply ? input.from : null,
       ...(replyAuthority ? { replyAuthority: replyAuthority.authority } : {}),
     });

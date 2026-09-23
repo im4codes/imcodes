@@ -17,7 +17,7 @@ import {
 } from '../../src/daemon/send-tool.js';
 import { isSendDispatchId, isSendMessageId } from '../../shared/send-message-id.js';
 import { normalizeSessionSupervisionSnapshot } from '../../shared/supervision-config.js';
-import { AGENT_DELEGATION_PURPOSES } from '../../shared/agent-delegation.js';
+import { AGENT_DELEGATION_PURPOSES, buildAgentDelegationSenderLine } from '../../shared/agent-delegation.js';
 import { getDelegationReplyStore } from '../../src/daemon/delegation-reply-store.js';
 import {
   clearAllResend,
@@ -241,7 +241,7 @@ describe('send-tool', () => {
     expect(isSendMessageId(result.messageId)).toBe(true);
     expect(result.deliveries).toHaveLength(1);
     expect(dispatchMessage).toHaveBeenCalledTimes(1);
-    expect(dispatchMessage.mock.calls[0][1]).toBe('hello');
+    expect(dispatchMessage.mock.calls[0][1]).toBe(`${buildAgentDelegationSenderLine('deck_alpha_brain')}\n\nhello`);
     expect(dispatchMessage.mock.calls[0][2]).toMatchObject({ deliveryMode: 'append' });
   });
 
@@ -1309,7 +1309,7 @@ describe('send-tool', () => {
     });
     expect(dispatchMessage).toHaveBeenCalledWith(
       expect.objectContaining({ name: 'deck_alpha_w1' }),
-      'wait your turn',
+      `${buildAgentDelegationSenderLine('deck_alpha_brain')}\n\nwait your turn`,
       expect.objectContaining({ deliveryMode: 'queue' }),
     );
   });

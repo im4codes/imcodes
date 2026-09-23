@@ -154,6 +154,7 @@ import { handleWebCommand } from '../../src/daemon/command-handler.js';
 import { executeCronJob } from '../../src/daemon/cron-executor.js';
 import { clearQueues, startHookServer } from '../../src/daemon/hook-server.js';
 import { CRON_MSG, type CronDispatchMessage } from '../../shared/cron-types.js';
+import { buildAgentDelegationSenderLine } from '../../shared/agent-delegation.js';
 
 function postSend(port: number, body: Record<string, unknown>): Promise<{ status: number; body: Record<string, unknown> }> {
   return new Promise((resolve, reject) => {
@@ -287,11 +288,16 @@ describe('shared-context send-surface parity integration', () => {
 
     expect(runtime.send).toHaveBeenCalledTimes(2);
     expect(runtime.appendExternalMessageToActiveTurn).toHaveBeenCalledTimes(1);
+    // The interactive session.send (a human's own turn) and the self-scheduled
+    // cron continuation both deliver the raw command untouched — neither is a
+    // cross-session send with a sender to identify. The hook /send IS a
+    // cross-session agent-to-agent send (deck_proj_brain -> deck_proj_w1), so it
+    // alone carries the daemon-trusted sender-identification prefix.
     expect([
       runtime.send.mock.calls[0]?.[0],
       runtime.appendExternalMessageToActiveTurn.mock.calls[0]?.[0],
       runtime.send.mock.calls[1]?.[0],
-    ]).toEqual([command, command, command]);
+    ]).toEqual([command, `${buildAgentDelegationSenderLine('deck_proj_brain')}\n\n${command}`, command]);
     expect(runtime.send.mock.calls.every((call: unknown[]) => typeof call[0] === 'string')).toBe(true);
     expect(runtime.appendExternalMessageToActiveTurn.mock.calls.every((call: unknown[]) => typeof call[0] === 'string')).toBe(true);
   });

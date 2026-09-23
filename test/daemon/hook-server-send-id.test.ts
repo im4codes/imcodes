@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
 import { isSendDispatchId, isSendMessageId } from '../../shared/send-message-id.js';
+import { buildAgentDelegationSenderLine } from '../../shared/agent-delegation.js';
 
 const getSessionMock = vi.hoisted(() => vi.fn());
 const upsertSessionMock = vi.hoisted(() => vi.fn());
@@ -117,7 +118,10 @@ describe('hook-server /send ids', () => {
     expect(res.body).toMatchObject({ ok: true, delivered: true, target: 'deck_alpha_w1' });
     expect(isSendDispatchId(res.body.dispatchId)).toBe(true);
     expect(isSendMessageId(res.body.messageId)).toBe(true);
-    expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith('deck_alpha_w1', 'hello');
+    expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith(
+      'deck_alpha_w1',
+      `${buildAgentDelegationSenderLine('deck_alpha_brain')}\n\nhello`,
+    );
   });
 
   it('does not list raw frontend-hidden project workers as send targets', async () => {

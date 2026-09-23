@@ -49,6 +49,7 @@ export const DELEGATION_TARGET_NOT_REPLY_CAPABLE = AGENT_DELEGATION_ERROR_CODES.
 export const DELEGATION_EMPTY_TASK = AGENT_DELEGATION_ERROR_CODES.DELEGATION_EMPTY_TASK;
 export const DELEGATION_UNSUPPORTED_INPUT = AGENT_DELEGATION_ERROR_CODES.DELEGATION_UNSUPPORTED_INPUT;
 
+export const AGENT_DELEGATION_SENDER_MARKER = '<imcodes-agent-delegation-sender-v1>' as const;
 export const AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER = '<imcodes-agent-delegation-reply-instruction-v1>' as const;
 export const AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER = '<imcodes-agent-delegation-reply-instruction-v2>' as const;
 export const AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER = '<imcodes-delegation-completed-v1>' as const;
@@ -59,7 +60,7 @@ export const AGENT_DELEGATION_SUPERVISION_TASK_PROJECTION_VERSION = 1 as const;
 export const AGENT_DELEGATION_SUPERVISION_TASK_OBJECTIVE_MAX_BYTES = SUPERVISION_TASK_OBJECTIVE_MAX_BYTES;
 export const AGENT_DELEGATION_REPLY_TOTAL_BYTES = 64 * 1024;
 export const AGENT_DELEGATION_REPLY_RESULT_BYTES = 48 * 1024;
-export const AGENT_DELEGATION_REPLY_TTL_MS = 24 * 60 * 60_000;
+export const AGENT_DELEGATION_REPLY_TTL_MS = 48 * 60 * 60_000;
 export const AGENT_DELEGATION_REPLY_MAX_MESSAGES = 64;
 /** Briefly hold an audit delegation completion so the verdict-channel receipt
  * from the same turn can win without producing a duplicate notification. */
@@ -528,6 +529,22 @@ export function hasLegacyP2pControlToken(text: string): boolean {
 
 export function isDelegationUnsupportedControlText(text: string): boolean {
   return UNSUPPORTED_CONTROL_TEXT_RE.test(text);
+}
+
+/**
+ * Renders a plain, always-present sender identification line — the exact
+ * IM.codes session name and, when known, its display label. Unlike
+ * {@link buildAgentDelegationReplyInstruction}, this does not depend on
+ * whether a reply was requested: without it, a recipient that got a
+ * fire-and-forget send (no `reply`) had no way to tell who sent it.
+ */
+export function buildAgentDelegationSenderLine(
+  fromSession: string,
+  fromLabel?: string | null,
+): string {
+  if (!isCanonicalAgentDelegationSessionName(fromSession)) return '';
+  const label = fromLabel?.trim();
+  return `${AGENT_DELEGATION_SENDER_MARKER}\nMessage from IM.codes session: ${fromSession}${label ? ` (label: ${label})` : ''}`;
 }
 
 export function buildAgentDelegationReplyInstruction(

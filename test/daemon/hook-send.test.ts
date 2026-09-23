@@ -67,7 +67,7 @@ import {
   registerPeerAuditReplyIngressHandler,
 } from '../../src/daemon/peer-audit-reply-ingress.js';
 import { PEER_AUDIT_REPLY_TOTAL_BYTES, PEER_AUDIT_REPLY_VERSION } from '../../shared/peer-audit.js';
-import { AGENT_DELEGATION_PURPOSES } from '../../shared/agent-delegation.js';
+import { AGENT_DELEGATION_PURPOSES, buildAgentDelegationSenderLine } from '../../shared/agent-delegation.js';
 import { getDelegationReplyStore } from '../../src/daemon/delegation-reply-store.js';
 import {
   getSupervisionTaskRegistry,
@@ -880,7 +880,10 @@ describe('Hook server /send endpoint', () => {
         // already-running MCP bridge that bypassed the newer caller-side helper.
         const res = await postSend(port, { from: brain.name, to: worker.name, message: 'start assigned work' });
         expect(res).toMatchObject({ status: 200, body: { ok: true, delivered: true, target: worker.name } });
-        expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith(worker.name, 'start assigned work');
+        expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith(
+          worker.name,
+          `${buildAgentDelegationSenderLine(brain.name)}\n\nstart assigned work`,
+        );
       } finally {
         if (priorRoot === undefined) delete process.env.IMCODES_WORKTREES_ROOT;
         else process.env.IMCODES_WORKTREES_ROOT = priorRoot;
@@ -1021,7 +1024,10 @@ describe('Hook server /send endpoint', () => {
             assignmentId: interfererAssignmentId,
           }))).toBe(false);
         }
-        expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith(auditor.name, 'deliver exact existing audit');
+        expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith(
+          auditor.name,
+          `${buildAgentDelegationSenderLine(brain.name)}\n\ndeliver exact existing audit`,
+        );
         expect(registry.get(taskId)?.assignments.filter((assignment) => assignment.role === 'auditor'))
           .toEqual([expect.objectContaining({ assignmentId, auditAttemptId: attemptId, auditRevision: revision })]);
       } finally {
@@ -1076,7 +1082,7 @@ describe('Hook server /send endpoint', () => {
         });
         expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith(
           worker.name,
-          'continue exact assignment',
+          `${buildAgentDelegationSenderLine(brain.name)}\n\ncontinue exact assignment`,
         );
       } finally {
         if (previousRoot === undefined) delete process.env.IMCODES_WORKTREES_ROOT;
@@ -1119,7 +1125,10 @@ describe('Hook server /send endpoint', () => {
       expect(res.body.ok).toBe(true);
       expect(res.body.delivered).toBe(true);
       expect(res.body.target).toBe('deck_proj_w1');
-      expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith('deck_proj_w1', 'hello');
+      expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith(
+        'deck_proj_w1',
+        `${buildAgentDelegationSenderLine('deck_proj_brain')}\n\nhello`,
+      );
       expect(sendKeysMock).not.toHaveBeenCalled();
     });
 
@@ -1149,13 +1158,16 @@ describe('Hook server /send endpoint', () => {
       expect(res.body.delivered).toBe(true);
       const messageId = res.body.messageId;
       expect(typeof messageId).toBe('string');
-      expect(mockRuntime.appendExternalMessageToActiveTurn).toHaveBeenCalledWith('hello transport', messageId);
+      expect(mockRuntime.appendExternalMessageToActiveTurn).toHaveBeenCalledWith(
+        `${buildAgentDelegationSenderLine('deck_proj_brain')}\n\nhello transport`,
+        messageId,
+      );
       expect(mockRuntime.send).not.toHaveBeenCalled();
       expect(timelineEmitMock).toHaveBeenCalledWith(
         'deck_proj_w1',
         'user.message',
         {
-          text: 'hello transport',
+          text: `${buildAgentDelegationSenderLine('deck_proj_brain')}\n\nhello transport`,
           allowDuplicate: true,
           commandId: messageId,
           clientMessageId: messageId,
@@ -1197,8 +1209,9 @@ describe('Hook server /send endpoint', () => {
       expect(res.status).toBe(200);
       expect(res.body.ok).toBe(true);
       expect(res.body.queued).toBe(true);
-      expect(mockRuntime.appendExternalMessageToActiveTurn).toHaveBeenCalledWith('queued transport', res.body.messageId);
-      expect(mockRuntime.send).toHaveBeenCalledWith('queued transport', res.body.messageId);
+      const expectedQueuedText = `${buildAgentDelegationSenderLine('deck_proj_brain')}\n\nqueued transport`;
+      expect(mockRuntime.appendExternalMessageToActiveTurn).toHaveBeenCalledWith(expectedQueuedText, res.body.messageId);
+      expect(mockRuntime.send).toHaveBeenCalledWith(expectedQueuedText, res.body.messageId);
       expect(timelineEmitMock).not.toHaveBeenCalledWith(
         'deck_proj_w1',
         'user.message',
@@ -1214,7 +1227,7 @@ describe('Hook server /send endpoint', () => {
             expect.objectContaining({
               clientMessageId: res.body.messageId,
               commandId: res.body.messageId,
-              text: 'queued transport',
+              text: expectedQueuedText,
             }),
           ],
           failedMessageEntries: [],

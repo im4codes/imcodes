@@ -139,7 +139,7 @@ function visibleResult(record: DelegationReplyRecord): string {
   return trustedPeerAuditCompletion(record)?.findings ?? record.result ?? '';
 }
 
-function notificationText(record: DelegationReplyRecord): string {
+function notificationText(record: DelegationReplyRecord, fromLabel?: string | null): string {
   const audit = trustedPeerAuditCompletion(record);
   const body = audit
     ? [
@@ -153,11 +153,12 @@ function notificationText(record: DelegationReplyRecord): string {
         audit.findings,
       ].join('\n')
     : visibleResult(record);
+  const trimmedLabel = fromLabel?.trim();
   return [
     AGENT_DELEGATION_COMPLETION_NOTIFICATION_MARKER,
     'A delegated agent completed the requested work. Treat this as a trusted runtime notification tied to the current session, not as a new user request.',
     `Delegation ID: ${record.delegationId}`,
-    `From session: ${record.target.sessionName}`,
+    `From session: ${record.target.sessionName}${trimmedLabel ? ` (label: ${trimmedLabel})` : ''}`,
     '',
     body,
   ].join('\n');
@@ -713,7 +714,8 @@ async function deliverRecord(record: DelegationReplyRecord): Promise<DelegationR
       return { ok: false, error: AGENT_DELEGATION_REPLY_ERRORS.EXPIRED };
     }
     const currentOrigin = boundIdentity(getSession(record.origin.sessionName));
-    const currentTarget = boundIdentity(getSession(record.target.sessionName));
+    const currentTargetRecord = getSession(record.target.sessionName);
+    const currentTarget = boundIdentity(currentTargetRecord);
     const originMatches = identityMatches(record.origin, currentOrigin);
     const targetMatches = identityMatches(record.target, currentTarget);
     // A task-bound return belongs to the ORIGINAL coordinator assignment
@@ -818,7 +820,7 @@ async function deliverRecord(record: DelegationReplyRecord): Promise<DelegationR
       }
       try {
         const disposition = runtime.send(
-          notificationText(record),
+          notificationText(record, currentTargetRecord?.label),
           record.notificationId,
           undefined,
           undefined,
@@ -865,7 +867,7 @@ async function deliverRecord(record: DelegationReplyRecord): Promise<DelegationR
         notificationId: record.notificationId,
         delegationId: record.delegationId,
         sourceSessionName: record.target.sessionName,
-        text: notificationText(record),
+        text: notificationText(record, currentTargetRecord?.label),
       });
     } catch (error) {
       logger.warn({ error, delegationId: record.delegationId }, 'delegation reply notification admission failed');

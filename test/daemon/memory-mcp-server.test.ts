@@ -33,7 +33,7 @@ import { MESSAGE_PIN_MCP_TOOLS } from '../../shared/message-pins.js';
 import { CAPABILITY_MCP_TOOL_NAMES } from '../../shared/capability-management.js';
 import { SUPERVISION_MCP_REGISTERED_TOOLS } from '../../shared/supervision-mcp-tools.js';
 import { SUPERVISION_MCP_TOOLS } from '../../shared/supervision-mcp-tools.js';
-import { AGENT_DELEGATION_REPLY_ERRORS } from '../../shared/agent-delegation.js';
+import { AGENT_DELEGATION_REPLY_ERRORS, buildAgentDelegationSenderLine } from '../../shared/agent-delegation.js';
 import {
   createMemoryMcpServerFromEnv,
   createMemoryMcpServer,
@@ -1084,7 +1084,7 @@ describe('memory MCP stdio server', () => {
       expect(hookBodies).toEqual([{
         from: 'deck_sub_worker',
         to: 'deck_sub_peer',
-        message: 'hello from stdio mcp',
+        message: `${buildAgentDelegationSenderLine('deck_sub_worker', 'Worker')}\n\nhello from stdio mcp`,
         depth: 0,
         deliveryMode: 'append',
       }]);
@@ -1101,7 +1101,7 @@ describe('memory MCP stdio server', () => {
       expect(hookBodies.at(-1)).toEqual({
         from: 'deck_sub_worker',
         to: 'deck_sub_peer',
-        message: 'queue this from stdio mcp',
+        message: `${buildAgentDelegationSenderLine('deck_sub_worker', 'Worker')}\n\nqueue this from stdio mcp`,
         depth: 0,
         deliveryMode: 'queue',
       });
@@ -1118,7 +1118,7 @@ describe('memory MCP stdio server', () => {
       expect(hookBodies.at(-1)).toMatchObject({
         from: 'deck_sub_worker',
         to: 'deck_sub_late',
-        message: 'hello late peer',
+        message: `${buildAgentDelegationSenderLine('deck_sub_worker', 'Worker')}\n\nhello late peer`,
         depth: 0,
       });
     } finally {
@@ -1378,7 +1378,7 @@ describe('memory MCP stdio server', () => {
       expect(hookBodies).toEqual([{
         from: 'deck_sub_worker',
         to: 'deck_sub_peer',
-        message: 'hello after transient empty store',
+        message: `${buildAgentDelegationSenderLine('deck_sub_worker', 'Worker')}\n\nhello after transient empty store`,
         depth: 0,
         deliveryMode: 'append',
       }]);

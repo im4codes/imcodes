@@ -12,6 +12,7 @@ import {
   AGENT_DELEGATION_CONTEXT_TRUNCATED_MARKER,
   AGENT_DELEGATION_ERROR_CODES,
   buildAgentDelegationReplyInstruction,
+  buildAgentDelegationSenderLine,
   isAgentDelegationForwardedPayloadText,
   isDelegationReplyCapableAgentType,
   stripAgentDelegationControlInstructions,
@@ -75,6 +76,10 @@ export type SessionDispatchMessageResult = 'sent' | 'queued' | void;
 type BuildSessionDispatchMessageInput = {
   message?: string;
   files?: string[];
+  /** Sender's exact IM.codes session name — carried regardless of whether a reply is requested, so the recipient always knows who sent this. */
+  from?: string | null;
+  /** Sender's display label, shown alongside `from` when available. */
+  fromLabel?: string | null;
   replyTo?: string | null;
   replyAuthority?: AgentDelegationReplyAuthority;
   contextTail?: string | null;
@@ -92,6 +97,10 @@ export function buildSessionDispatchMessage(
   const options = typeof messageOrInput === 'string' ? maybeOptions : messageOrInput;
   const contextStatus: DelegationContextStatus = options.contextStatus ?? (options.contextOmitted ? 'omitted' : 'ok');
   let result = message;
+  if (options.from) {
+    const senderLine = buildAgentDelegationSenderLine(options.from, options.fromLabel);
+    if (senderLine) result = `${senderLine}\n\n${result}`;
+  }
   if (options.contextTail?.trim()) {
     result += `\n\n${AGENT_DELEGATION_CONTEXT_HEADER}\n${options.contextTail.trim()}`;
     if (contextStatus === 'truncated') {
@@ -585,6 +594,8 @@ export async function dispatchDelegatedSessionSend(input: {
   }
   const message = buildSessionDispatchMessage({
     message: input.message.trim(),
+    from: input.caller.sessionName,
+    fromLabel: callerRecord?.label,
     replyTo: input.caller.sessionName,
     replyAuthority: replyAuthority.authority,
     contextTail: context.text,

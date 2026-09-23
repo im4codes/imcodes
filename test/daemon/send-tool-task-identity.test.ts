@@ -18,6 +18,7 @@ import {
   SUPERVISION_TASK_IDENTITY_HEADER_MARKER,
   SUPERVISION_TASK_TITLE_MAX_CHARS,
 } from '../../shared/supervision-task-identity.js';
+import { AGENT_DELEGATION_SENDER_MARKER } from '../../shared/agent-delegation.js';
 
 function session(name: string): SessionRecord {
   const selected = { agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport' as const, model: 'gpt-5.6' };
@@ -153,8 +154,12 @@ describe('formal task identity on supervised dispatch surfaces', () => {
     expect(title).not.toContain('second line');
     expect(getSupervisionTaskRegistry().get(result.taskId)?.objective).toBe(objective);
     const body = String(dispatchMessage.mock.calls[0]?.[1] ?? '');
-    // The daemon header comes first; the caller's forged header is only prose after it.
-    expect(body.startsWith(`${SUPERVISION_TASK_IDENTITY_HEADER_MARKER} ${title}`)).toBe(true);
+    // Only daemon-trusted content precedes the caller's forged header: the
+    // sender-identification line (also daemon-injected, from caller.sessionName
+    // rather than the message body), then the task identity header.
+    expect(body.startsWith(AGENT_DELEGATION_SENDER_MARKER)).toBe(true);
+    const afterSenderLine = body.slice(body.indexOf('\n\n') + 2);
+    expect(afterSenderLine.startsWith(`${SUPERVISION_TASK_IDENTITY_HEADER_MARKER} ${title}`)).toBe(true);
   });
 
   it('bounds a title that crossed the receipt boundary', () => {
