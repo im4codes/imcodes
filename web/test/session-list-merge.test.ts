@@ -28,6 +28,7 @@ import {
   isWorkerSessionName,
   mergeSessionListEntry,
   parseMainSessionName,
+  resolveSharedSessionProject,
   type IncomingSessionListEntry,
 } from '../src/session-list-merge.js';
 import type { SessionInfo } from '../src/types.js';
@@ -435,6 +436,20 @@ describe('session navigation visibility', () => {
       project: 'my_proj',
       role: 'w12',
     });
+  });
+
+  it('resolves a shared session\'s real project from its name, not the display title, when the owner labeled the session', () => {
+    // A session-share's `title` is the session's own label when one is set —
+    // it must never be mistaken for the project identifier (e.g. used to scope
+    // cron-task visibility), or a labeled session's tasks silently disappear
+    // for participants while the owner (whose UI never derives project this
+    // way) still sees them fine.
+    expect(resolveSharedSessionProject('deck_soft_dev_rules_brain', 'My Custom Label')).toBe('soft_dev_rules');
+  });
+
+  it('falls back to the title only when the session name does not match the deck_{project}_{role} convention', () => {
+    expect(resolveSharedSessionProject('not-a-deck-session', 'Fallback Title')).toBe('Fallback Title');
+    expect(resolveSharedSessionProject('not-a-deck-session', '')).toBe('not-a-deck-session');
   });
 
   it('identifies sub-sessions and worker main sessions as hidden from top-level navigation', () => {

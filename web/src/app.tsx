@@ -177,6 +177,7 @@ import {
   isSubSessionName,
   mergeSessionListEntry,
   parseMainSessionName,
+  resolveSharedSessionProject,
   type IncomingSessionListEntry,
 } from './session-list-merge.js';
 import { resolveSessionInfoRuntimeType } from './runtime-type.js';
@@ -3080,7 +3081,7 @@ export function App() {
         const parsed = parseMainSessionName(session.sessionName);
         return {
           name: session.sessionName,
-          project: session.title || parsed?.project || session.sessionName,
+          project: resolveSharedSessionProject(session.sessionName, session.title),
           role: parsed?.role ?? 'brain',
           agentType: session.agentType || 'unknown',
           state: session.state as SessionInfo['state'],

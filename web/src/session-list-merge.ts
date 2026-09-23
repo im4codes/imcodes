@@ -104,6 +104,19 @@ export function parseMainSessionName(sessionName: string): { project: string; ro
   };
 }
 
+/**
+ * Resolves a shared-entry session's project identifier. The server's `title`
+ * field is a display label (the session's own label, or its project name if
+ * unlabeled) — it must never be trusted as the project identifier, since a
+ * labeled session's title is the label, not the project. The session name
+ * always encodes the real project per the `deck_{project}_{role}` convention,
+ * so that parse is authoritative; `title` is only a last-resort fallback for
+ * a name that doesn't match the convention.
+ */
+export function resolveSharedSessionProject(sessionName: string, title: string): string {
+  return parseMainSessionName(sessionName)?.project || title || sessionName;
+}
+
 export function isWorkerSessionName(sessionName: string): boolean {
   const parsed = parseMainSessionName(sessionName);
   return Boolean(parsed && parsed.role !== 'brain');
