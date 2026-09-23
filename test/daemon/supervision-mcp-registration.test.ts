@@ -355,6 +355,51 @@ describe('production MCP registration', () => {
     expect(participant.detail).not.toContain('supervision_task_recover');
   });
 
+  it('tells the caller about the unbound-revision sentinel when a first-ever finish is refused as old_revision', async () => {
+    // Neither the task nor the assignment has ever recorded a revision --
+    // registry.currentRevisions has no entry for tsk_a, and the assignment
+    // carries no auditRevision. baseRevision-shaped values look correct to
+    // send here and are silently refused; the caller has no other field to
+    // read the right value from (production incident: tsk_1f41/asg_1f44).
+    registry.assignmentStates.set('tsk_a', [{
+      assignmentId: 'worker-a', role: 'implementer', status: 'implementing', leaseId: '',
+      identity: testIdentity('deck_cd_brain'),
+    }]);
+    registry.finishAssignment = () => ({ ok: false as const, reason: 'old_revision' });
+    const request = {
+      intent: 'finish', taskId: 'tsk_a', assignmentId: 'worker-a',
+      expectedRevision: 'base-revision-looks-right-but-is-refused',
+    };
+
+    for (const isProjectBrain of [true, false]) {
+      const handlers = createSupervisionMcpToolHandlers(CALLER, {
+        registry, isProjectBrain: () => isProjectBrain, resolveSessionIdentity: testResolveSessionIdentity,
+      });
+      const result: any = await handlers[SUPERVISION_MCP_TOOLS.INTENT](request);
+      expect(result, `isProjectBrain=${isProjectBrain}`).toMatchObject({ status: 'error', reason: 'old_revision' });
+      expect(result.detail, `isProjectBrain=${isProjectBrain}`).toContain(
+        `expectedRevision: "${SUPERVISION_UNBOUND_REVISION}"`,
+      );
+    }
+  });
+
+  it('does not attach the unbound-revision hint when the task genuinely has a bound revision', async () => {
+    // Sibling case: a real conflict against an ALREADY-bound revision must
+    // never be misreported as "first report" guidance -- that would point the
+    // caller at the wrong fix.
+    registry.currentRevisions.set('tsk_a', 'revision-r3');
+    registry.assignmentStates.set('tsk_a', [{
+      assignmentId: 'worker-a', role: 'implementer', status: 'implementing', leaseId: '',
+      identity: testIdentity('deck_cd_brain'),
+    }]);
+    registry.finishAssignment = () => ({ ok: false as const, reason: 'old_revision' });
+    const result: any = await call(SUPERVISION_MCP_TOOLS.INTENT, {
+      intent: 'finish', taskId: 'tsk_a', assignmentId: 'worker-a', expectedRevision: 'stale-revision',
+    });
+    expect(result).toMatchObject({ status: 'error', reason: 'old_revision' });
+    expect(result.detail).not.toContain(SUPERVISION_UNBOUND_REVISION);
+  });
+
   it('uses assignment lifecycle for assignment-scoped recovery intents when the aggregate is stale', async () => {
     registry.statuses.set('tsk_a', 'ready_for_audit');
     registry.assignmentStates.set('tsk_a', [{

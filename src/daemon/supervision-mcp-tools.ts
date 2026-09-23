@@ -607,6 +607,23 @@ export function createSupervisionMcpToolHandlers(
     detail?: string,
     hint?: { assignmentId?: string; toRevision?: string },
   ): ToolResult => {
+    // A revision rejection where NOTHING has ever been bound (task.currentRevision
+    // absent, and the named assignment's auditRevision absent too) is not a real
+    // conflict -- it is the first-report shape, and the task's own visible fields
+    // give the caller no way to discover what to send instead: baseRevision looks
+    // like the right value and is silently refused. This is public API guidance
+    // (the SUPERVISION_UNBOUND_REVISION sentinel), not a Brain-only repair
+    // capability, so surface it to every caller, not only a repairing Brain.
+    if (reason === 'old_revision') {
+      const hintedAssignment = hint?.assignmentId
+        ? task?.assignments?.find((candidate) => candidate.assignmentId === hint.assignmentId)
+        : undefined;
+      const taskUnbound = !task?.currentRevision?.trim();
+      const assignmentUnbound = !hintedAssignment || !hintedAssignment.auditRevision?.trim();
+      if (taskUnbound && assignmentUnbound) {
+        detail = `${detail ?? reason}; this task/assignment has never recorded a revision yet -- pass expectedRevision: "${SUPERVISION_UNBOUND_REVISION}" instead of a git hash for the first report`;
+      }
+    }
     if (!taskAuthority(task).projectBrainMayRead) return err(reason, detail);
     const assignment = hint?.assignmentId
       ? task?.assignments?.find((candidate) => candidate.assignmentId === hint.assignmentId)
