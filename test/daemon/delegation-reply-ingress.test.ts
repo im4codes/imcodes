@@ -108,7 +108,10 @@ import {
   submitPeerAuditReply,
 } from '../../src/daemon/peer-audit-reply-ingress.js';
 import { onDelegationReplyDelivered } from '../../src/daemon/delegation-reply-events.js';
-import { advancePendingRepliesForReboundCoordinator } from '../../src/daemon/delegation-reply-ingress.js';
+import {
+  advancePendingRepliesForReboundCoordinator,
+  sweepStaleDeliveryOriginsForAutoRebind,
+} from '../../src/daemon/delegation-reply-ingress.js';
 import { DelegationReplyStore } from '../../src/daemon/delegation-reply-store.js';
 import { ensureTransportRuntimeAvailable } from '../../src/agent/session-manager.js';
 
@@ -2566,5 +2569,78 @@ describe('advancePendingRepliesForReboundCoordinator', () => {
     expect(advancePendingRepliesForReboundCoordinator({
       taskId: 'tsk_5oc', coordinatorAssignmentId: 'asg_coord', origin: rotated,
     })).toBe(0);
+  });
+});
+
+describe('sweepStaleDeliveryOriginsForAutoRebind', () => {
+  // Production incident (172.16.253.158): a coordinator's ordinary restart
+  // (crash, daemon upgrade) mints a fresh runtimeEpoch, so its already-received
+  // task-bound replies stay bound to the retired identity forever -- nothing
+  // previously re-checked unless a human called supervision_task_recover with
+  // an explicit rebind for that exact task. The sweep must find this shape
+  // itself: same session NAME, different live identity, still the task's
+  // coordinator of record -- and rebind through the same authorized path.
+  const stuck = {
+    ...record, taskId: 'tsk_rebind', assignmentId: 'asg_worker', status: 'received' as const,
+  };
+  const restarted = { sessionName: origin.sessionName, sessionInstanceId: 'origin-instance-2', runtimeEpoch: 'origin-epoch-2' };
+
+  it('rebinds a stuck reply once its coordinator comes back under the same session name with a new identity', () => {
+    mocks.store.listReceived = vi.fn(() => [stuck]);
+    mocks.sessions.set(origin.sessionName, session(restarted));
+    mocks.listAssignments.mockReturnValue([{
+      assignmentId: 'asg_coord', taskId: 'tsk_rebind', role: 'coordinator', status: 'delegated', generation: 1,
+      identity: { ...restarted, agentType: 'codex-sdk', providerFamily: 'openai' },
+    }]);
+    mocks.store.listPendingByCoordinator = vi.fn(() => [stuck]);
+    const rebind = vi.fn(() => ({ ...stuck, origin: restarted }));
+    mocks.store.rebindAuthorizedOrigin = rebind;
+
+    sweepStaleDeliveryOriginsForAutoRebind();
+
+    expect(rebind).toHaveBeenCalledWith({
+      delegationId: stuck.delegationId,
+      taskId: 'tsk_rebind',
+      assignmentId: 'asg_worker',
+      coordinatorAssignmentId: 'asg_coord',
+      origin: restarted,
+    });
+  });
+
+  it('does not rebind when the live session under that name is not this task\'s coordinator', () => {
+    mocks.store.listReceived = vi.fn(() => [stuck]);
+    mocks.sessions.set(origin.sessionName, session(restarted));
+    mocks.listAssignments.mockReturnValue([{
+      assignmentId: 'asg_coord', taskId: 'tsk_rebind', role: 'implementer', status: 'implementing', generation: 1,
+      identity: { ...restarted, agentType: 'codex-sdk', providerFamily: 'openai' },
+    }]);
+    const rebind = vi.fn();
+    mocks.store.rebindAuthorizedOrigin = rebind;
+
+    sweepStaleDeliveryOriginsForAutoRebind();
+
+    expect(rebind).not.toHaveBeenCalled();
+  });
+
+  it('does not rebind when the bound origin identity still matches the live session exactly', () => {
+    mocks.store.listReceived = vi.fn(() => [stuck]);
+    mocks.sessions.set(origin.sessionName, session(origin));
+    const rebind = vi.fn();
+    mocks.store.rebindAuthorizedOrigin = rebind;
+
+    sweepStaleDeliveryOriginsForAutoRebind();
+
+    expect(rebind).not.toHaveBeenCalled();
+  });
+
+  it('does not rebind a reply with no live session at all under its origin name', () => {
+    mocks.store.listReceived = vi.fn(() => [stuck]);
+    mocks.sessions.delete(origin.sessionName);
+    const rebind = vi.fn();
+    mocks.store.rebindAuthorizedOrigin = rebind;
+
+    sweepStaleDeliveryOriginsForAutoRebind();
+
+    expect(rebind).not.toHaveBeenCalled();
   });
 });

@@ -1110,6 +1110,50 @@ export function advancePendingRepliesForReboundCoordinator(input: {
   return advanced;
 }
 
+/**
+ * An ordinary session restart (crash, daemon upgrade, routine reconnect)
+ * always mints a fresh runtimeEpoch (see session-manager.ts launch paths).
+ * deliverRecord's strict identity check on a task-bound reply -- deliberately
+ * requiring an exact sessionInstanceId/runtimeEpoch match, to stop a same-name
+ * replacement session from stealing a return addressed to the original -- then
+ * refuses delivery forever against the now-stale bound origin. The ONLY
+ * existing repair path, advancePendingRepliesForReboundCoordinator, is wired
+ * exclusively into an explicit supervision_task_recover rebind call: nothing
+ * runs it just because the coordinator came back under the same session name,
+ * so every restart stranded that coordinator's already-received replies until
+ * someone manually recovered each task one at a time (confirmed live on
+ * 172.16.253.158: replies stuck 4+ days, several reporting the coordinator's
+ * OWN task_finish/old_revision failures, so recovery was never invoked).
+ *
+ * This periodically re-checks: for a stuck reply whose origin session name is
+ * CURRENTLY live under a different identity, is that live session the exact
+ * coordinator of record for the reply's task (verified against the durable
+ * registry, the same authority advancePendingRepliesForReboundCoordinator
+ * itself re-checks)? If so, rebind and redeliver through that same already-
+ * authorized path -- so a coordinator's ordinary restart self-heals instead
+ * of requiring one manual recovery per stranded task.
+ */
+const AUTO_REBIND_SWEEP_INTERVAL_MS = 2 * 60_000;
+let autoRebindSweepTimer: ReturnType<typeof setInterval> | null = null;
+
+export function sweepStaleDeliveryOriginsForAutoRebind(): void {
+  const registry = getSupervisionTaskRegistry();
+  for (const record of getDelegationReplyStore().listReceived()) {
+    if (!record.taskId || !record.assignmentId) continue;
+    const live = boundIdentity(getSession(record.origin.sessionName));
+    if (!live || identityMatches(record.origin, live)) continue;
+    const coordinator = registry.listAssignments(record.taskId).find((assignment) => (
+      assignment.role === 'coordinator' && assignment.identity.sessionName === live.sessionName
+    ));
+    if (!coordinator) continue;
+    advancePendingRepliesForReboundCoordinator({
+      taskId: record.taskId,
+      coordinatorAssignmentId: coordinator.assignmentId,
+      origin: live,
+    });
+  }
+}
+
 export function resumePendingDelegationReplies(): void {
   for (const record of getDelegationReplyStore().listHeldAuditCompletions()) {
     if (isExactAuditRecord(record) && hasExactFinalAuditReceipt(record)) {
@@ -1129,6 +1173,10 @@ export function resumePendingDelegationReplies(): void {
     emitDelegationReplyTimeline(record);
     scheduleRetry(record.delegationId, record.notificationId, 250);
   }
+  if (!autoRebindSweepTimer) {
+    autoRebindSweepTimer = setInterval(sweepStaleDeliveryOriginsForAutoRebind, AUTO_REBIND_SWEEP_INTERVAL_MS);
+    autoRebindSweepTimer.unref?.();
+  }
 }
 
 export function clearDelegationReplyIngressForTests(): void {
@@ -1136,6 +1184,8 @@ export function clearDelegationReplyIngressForTests(): void {
   retryTimers.clear();
   for (const timer of reconciliationTimers.values()) clearTimeout(timer);
   reconciliationTimers.clear();
+  if (autoRebindSweepTimer) clearInterval(autoRebindSweepTimer);
+  autoRebindSweepTimer = null;
   inFlight.clear();
   rateLimiter.clear();
 }
