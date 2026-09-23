@@ -81,6 +81,7 @@ class FakePeerConnection extends EventTarget {
   static hangCreateOffer = false;
   static hangSetLocalDescription = false;
   static hangSetRemoteDescription = false;
+  static hangGetStats = false;
   remoteDescription: RTCSessionDescription | null = null;
   connectionState: RTCPeerConnectionState = 'new';
   /** A stale SCTP association can still leave WebRTC reporting `connected`. */
@@ -138,6 +139,7 @@ class FakePeerConnection extends EventTarget {
     if (candidate) this.addedCandidates.push(candidate);
   }
   async getStats(): Promise<RTCStatsReport> {
+    if (FakePeerConnection.hangGetStats) return new Promise(() => undefined);
     return new Map([
       ['selected-pair', {
         type: 'candidate-pair', selected: true, state: 'succeeded',
@@ -555,6 +557,7 @@ describe('direct file transfer v2 browser broker', () => {
     FakePeerConnection.hangCreateOffer = false;
     FakePeerConnection.hangSetLocalDescription = false;
     FakePeerConnection.hangSetRemoteDescription = false;
+    FakePeerConnection.hangGetStats = false;
     vi.stubGlobal('RTCPeerConnection', FakePeerConnection);
     apiMocks.uploadFile.mockResolvedValue({
       ok: true,
@@ -2157,6 +2160,11 @@ describe('direct file transfer v2 browser broker', () => {
     } as unknown as File;
     try {
       await uploadFileDirect(ws, file, id(), undefined, undefined, undefined, undefined, 'server-1');
+      // The route lookup that produces this metric is deliberately
+      // fire-and-forget (not awaited by uploadFileDirect itself, so a stalled
+      // getStats() can never block an already-finished upload) -- wait for it
+      // instead of asserting on whatever landed synchronously.
+      await vi.waitFor(() => expect(debug.mock.calls.some(([prefix]) => prefix === '[direct-file-transfer]')).toBe(true));
       const metrics = debug.mock.calls
         .filter(([prefix]) => prefix === '[direct-file-transfer]')
         .map(([, fields]) => fields as Record<string, unknown>);
@@ -2386,6 +2394,30 @@ describe('direct file transfer v2 browser broker', () => {
     await expect(pending).resolves.toMatchObject({ attachment: { id: 'status-committed' } });
     expect(progress.at(-1)).toBe(100);
     expect(apiMocks.uploadFile).not.toHaveBeenCalled();
+  });
+
+  it('resolves an upload whose commit already succeeded even when the post-hoc route lookup never settles', async () => {
+    // The file has already reached 100% and the daemon already committed it
+    // (both happen before this point) once retryDirect resolves -- everything
+    // after that is diagnostics-only (a metric plus an advisory connection
+    // status), not part of what the caller or the composer row is waiting on.
+    // A getStats() call that stalls (a real, unbounded browser/WebRTC risk)
+    // must never leave an already-finished upload's row stuck at 100% forever
+    // instead of becoming a sendable attachment.
+    FakePeerConnection.hangGetStats = true;
+    const { uploadFileWithDirectFallback } = await import('../src/direct-file-transfer.js');
+    const { ws } = createWs(directCapabilities);
+    const progress: number[] = [];
+
+    const result = await uploadFileWithDirectFallback({
+      ws,
+      serverId: 'server-1',
+      file: createUploadFile('stalled-stats.txt', 'already committed'),
+      onProgress: (value) => progress.push(value),
+    });
+
+    expect(result).toMatchObject({ ok: true, attachment: { id: 'direct-attachment' } });
+    expect(progress.at(-1)).toBe(100);
   });
 
   it('establishes and then reuses an inert v2 lease for explicit diagnostics without file authority', async () => {

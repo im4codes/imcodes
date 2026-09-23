@@ -2478,17 +2478,23 @@ export async function uploadFileDirect(
       kind: 'upload', file, operationId: clientUploadId, sessionName, destinationDirectory, onProgress, onConnected, onMode, signal,
     }), signal);
     if (result.kind !== 'upload') throw directError(DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, false);
-    const route = await selectedPeerRoute(lease.peer);
-    recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.DIRECT_SUCCESS, {
-      direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD,
-      route,
-    });
-    if (route === DIRECT_CONNECTIVITY_ROUTE.RELAY) {
-      if (lease.active.size === 0) clearLeaseBinding(lease);
-      setConnectionStatus(lease, DIRECT_FILE_CONNECTION_STATUS.RELAY);
-    } else if (route !== 'unknown') {
-      setConnectionStatus(lease, DIRECT_FILE_CONNECTION_STATUS.DIRECT);
-    }
+    // Route classification is diagnostics-only (a metric plus an advisory
+    // connection-status update); getStats() must never be allowed to block
+    // returning bytes the caller -- and the composer row already showing
+    // 100% -- is waiting on. A file that finished transferring must not hang
+    // forever just because this stats lookup stalls or never settles.
+    void selectedPeerRoute(lease.peer).then((route) => {
+      recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.DIRECT_SUCCESS, {
+        direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD,
+        route,
+      });
+      if (route === DIRECT_CONNECTIVITY_ROUTE.RELAY) {
+        if (lease.active.size === 0) clearLeaseBinding(lease);
+        setConnectionStatus(lease, DIRECT_FILE_CONNECTION_STATUS.RELAY);
+      } else if (route !== 'unknown') {
+        setConnectionStatus(lease, DIRECT_FILE_CONNECTION_STATUS.DIRECT);
+      }
+    }).catch(() => {});
     return { ok: true, attachment: result.attachment };
   } finally {
     release();
