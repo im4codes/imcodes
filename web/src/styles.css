@@ -5345,6 +5345,41 @@ html.native-ios-mac .chat-dl-btn {
   .delegation-claim-id { flex: 1 1 100%; }
   .delegation-claim-id code { overflow-wrap: anywhere; }
 }
+
+/* Collapsed-by-default cards for the daemon-injected agent-delegation
+   protocol markers (sender identification, reply instructions) that ride
+   inside plain message text — see shared/agent-delegation-markers.ts. */
+.delegation-protocol-card {
+  margin: 4px 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: #94a3b8;
+}
+.delegation-protocol-card > summary {
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+  color: #64748b;
+}
+.delegation-protocol-card > summary::-webkit-details-marker { display: none; }
+.delegation-protocol-card > summary::before { content: '▸ '; }
+.delegation-protocol-card[open] > summary::before { content: '▾ '; }
+.delegation-protocol-card-body { padding: 4px 0 2px 12px; display: flex; flex-direction: column; gap: 2px; }
+.delegation-protocol-card-field code { font-family: 'Cascadia Code', 'Fira Code', 'SF Mono', monospace; color: #cbd5e1; overflow-wrap: anywhere; }
+.delegation-protocol-card-raw { margin-top: 2px; }
+.delegation-protocol-card-raw > summary { cursor: pointer; list-style: none; user-select: none; }
+.delegation-protocol-card-raw > summary::-webkit-details-marker { display: none; }
+.delegation-protocol-card-raw > summary::before { content: '▸ '; }
+.delegation-protocol-card-raw[open] > summary::before { content: '▾ '; }
+.delegation-protocol-card-raw pre {
+  margin: 2px 0 0;
+  padding: 4px 6px;
+  font-family: 'Cascadia Code', 'Fira Code', 'SF Mono', monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: rgba(148, 163, 184, 0.08);
+  border-radius: 4px;
+}
 .chat-rich-text { white-space: pre-wrap; }
 .chat-code-block { background: #1a1a2e; border-radius: 8px; margin: 8px 0; overflow: hidden; }
 .chat-code-block pre { margin: 0; padding: 12px; overflow-x: auto; -webkit-overflow-scrolling: touch; font-size: 13px; line-height: 1.4; }

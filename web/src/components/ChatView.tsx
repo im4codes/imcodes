@@ -71,6 +71,8 @@ import {
 } from './ChatLoopbackLink.js';
 import { AgentTodoList } from './AgentTodoList.js';
 import { DelegationClaimBadge, readDelegationClaimMetadata } from './DelegationClaimBadge.js';
+import { DelegationReplyInstructionCardView, DelegationSenderCardView } from './DelegationProtocolCard.js';
+import { parseDelegationProtocolMessage } from '@shared/agent-delegation-markers.js';
 import { ExpandableTaskObjective } from './ExpandableTaskObjective.js';
 import {
   CHAT_MOUNT_SETTLE_MS,
@@ -5854,7 +5856,8 @@ function UserMessageText({
 }) {
   const { t } = useTranslation();
   const contentRef = useRef<HTMLDivElement>(null);
-  const hardLineOverflow = countHardLines(text) > USER_MESSAGE_COLLAPSE_LINE_LIMIT;
+  const { prose, leadingSender, trailingReply } = parseDelegationProtocolMessage(text);
+  const hardLineOverflow = countHardLines(prose) > USER_MESSAGE_COLLAPSE_LINE_LIMIT;
   const [renderedOverflow, setRenderedOverflow] = useState<boolean | null>(
     hardLineOverflow ? true : null,
   );
@@ -5892,15 +5895,16 @@ function UserMessageText({
       window.removeEventListener('resize', measure);
       fonts?.removeEventListener?.('loadingdone', measure);
     };
-  }, [hardLineOverflow, text]);
+  }, [hardLineOverflow, prose]);
 
   return (
     <div class={`chat-user-message-fold${shouldFold ? ' is-foldable' : ''}${folded ? ' is-folded' : ''}${measuring ? ' is-measuring' : ''}`}>
+      {leadingSender && <DelegationSenderCardView card={leadingSender} />}
       <div
         ref={contentRef}
         class={`chat-bubble-content chat-user-message-fold-content${folded ? ' is-folded' : ''}${measuring ? ' is-measuring' : ''}`}
       >
-        {splitPathsAndUrls(text, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview)}
+        {splitPathsAndUrls(prose, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview)}
       </div>
       {shouldFold && (
         <button
@@ -5912,6 +5916,7 @@ function UserMessageText({
           {expanded ? t('chat.user_message_collapse') : t('chat.user_message_expand')}
         </button>
       )}
+      {trailingReply && <DelegationReplyInstructionCardView card={trailingReply} />}
     </div>
   );
 }
