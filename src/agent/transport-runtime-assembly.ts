@@ -479,6 +479,7 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
     ? buildTransportImcodesIdentityPrompt(
         input.sessionIdentity.sessionName,
         input.sessionIdentity.label ?? undefined,
+        input.sessionIdentity.role,
       )
     : undefined;
   // The identity span is recorded here, from the lengths of the parts being

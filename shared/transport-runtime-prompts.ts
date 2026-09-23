@@ -67,16 +67,25 @@ export const REAL_DEVICE_TESTING_SYSTEM_GUIDANCE = [
  * session name and the display label so the model knows to prefer
  * `$IMCODES_SESSION` (or the exact name) over the human-friendly label
  * when invoking `imcodes send` — labels can collide across sessions.
+ *
+ * When `role` is `'brain'`, the block also tells the model it IS the
+ * project's main session — the one leading the whole session group
+ * (coordinating sub-sessions/workers) — so it knows its own standing
+ * without having to infer it from the session name suffix.
  */
 export function buildTransportImcodesIdentityPrompt(
   sessionName: string,
   label: string | null | undefined,
+  role?: string | null,
 ): string {
   const displayLabel = label?.trim() || sessionName;
   return [
     'IM.codes session identity:',
     `- Exact session name: ${sessionName}`,
     `- Display label: ${displayLabel}`,
+    ...(role === 'brain'
+      ? ['- Your role: Brain — the main session leading this project\'s whole session group. Sub-sessions and workers report to you.']
+      : []),
     `- When invoking \`imcodes send\`, prefer $${IMCODES_SESSION_ENV}. If a SDK/tool environment lacks it, prefix the command with ${IMCODES_SESSION_ENV}=${sessionName}. Do not use display labels as sender identity unless the exact session name is unavailable, because labels can be duplicated.`,
   ].join('\n');
 }

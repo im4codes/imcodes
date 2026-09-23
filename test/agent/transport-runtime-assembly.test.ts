@@ -941,6 +941,27 @@ describe('buildProviderContextPayload', () => {
       }
     });
 
+    it('tells a brain-role session it leads the whole session group', () => {
+      const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+        userMessage: 'hi',
+        sessionIdentity: { sessionName: 'deck_myapp_brain', label: 'My App Brain', role: 'brain' },
+        namespace: { scope: 'personal', projectId: 'repo-1' },
+      });
+      const systemText = payload.sessionSystemText ?? '';
+      expect(systemText).toContain('Your role: Brain');
+      expect(systemText).toContain('leading this project\'s whole session group');
+    });
+
+    it('does not claim brain leadership for a worker session', () => {
+      const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
+        userMessage: 'hi',
+        sessionIdentity: { sessionName: 'deck_myapp_w1', label: 'W1', role: 'w1' },
+        namespace: { scope: 'personal', projectId: 'repo-1' },
+      });
+      const systemText = payload.sessionSystemText ?? '';
+      expect(systemText).not.toContain('Your role: Brain');
+    });
+
     it('does not inject identity when sessionIdentity is absent (process/tmux agents)', () => {
       const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
         userMessage: 'hi',
