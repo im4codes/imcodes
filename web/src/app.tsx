@@ -250,6 +250,7 @@ import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from './codex-model-preference.js';
 import { resolveQuickAgentDelegationModel } from './quick-agent-delegation-model.js';
 import { updateMainSessionLabel } from './session-label-api.js';
+import { computeAutoLaunchLabels } from './auto-launch-labels.js';
 import { buildDocumentTitle } from './tab-title.js';
 import {
   getDaemonBadgeState,
@@ -7643,12 +7644,13 @@ export function App() {
             const count = typeof launchCount === 'number' && launchCount > 1 ? launchCount : 1;
             const passedExtra = Object.keys(cleanExtra).length > 0 ? cleanExtra : undefined;
             // A single launch keeps the existing auto-generated label exactly as
-            // before. A multi-launch names each session up front instead of
-            // relying on create()'s own duplicate-label suffixing, which reads
-            // subSessions from this closure and would see the SAME stale list
-            // (and mint the SAME suffix) for every iteration in this loop.
-            for (let index = 1; index <= count; index += 1) {
-              const iterationLabel = count > 1 ? `${label || type} ${index}` : label;
+            // before (create() derives it). A multi-launch pre-computes every
+            // label up front instead of relying on create()'s own duplicate-label
+            // suffixing, which reads subSessions from this closure and would see
+            // the SAME stale list (and mint the SAME suffix) for every iteration.
+            const siblings = subSessions.filter((s) => s.parentSession === activeSession);
+            const iterationLabels = computeAutoLaunchLabels(siblings, type, label, count);
+            for (const iterationLabel of iterationLabels) {
               const sub = await createSubSession(type, shellBin, cwd, iterationLabel, passedExtra);
               if (sub) {
                 setOpenSubIds((prev) => new Set([...prev, sub.id]));
