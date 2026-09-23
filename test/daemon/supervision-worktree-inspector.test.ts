@@ -28,6 +28,22 @@ function fixture() {
 }
 
 describe('authoritative supervision worktree inspection', () => {
+  it('reports the underlying realpath failure instead of a bare worktree_unavailable', async () => {
+    // Production incident: an integration preflight refusal said only
+    // "worktree_unavailable" with no way to tell "this worktree was never
+    // created" from a git-level failure mid-inspection. The worktree for
+    // this assignmentId was never created under the fixture's root, so
+    // realpathSync must fail with ENOENT -- confirm that code survives to the
+    // caller instead of being discarded.
+    const shape = fixture();
+    const result = await inspectSupervisionAssignmentWorktree({
+      sessionName: 'deck_worker', assignmentId: 'assignment_never_created',
+      env: { IMCODES_WORKTREES_ROOT: shape.root, IMCODES_PROJECT_WORKTREE_NAMESPACE: 'imcodes' },
+    });
+    expect(result).toMatchObject({ ok: false, reason: 'worktree_unavailable' });
+    expect((result as { detail?: string }).detail).toContain('ENOENT');
+  });
+
   it('accepts an exact clean zero-source worktree without metadata paths', async () => {
     const shape = fixture();
     expect(await inspectSupervisionAssignmentWorktree({

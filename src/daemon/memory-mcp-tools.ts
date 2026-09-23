@@ -2699,8 +2699,9 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
           baseRevision: registry.getTaskRecord(existing.taskId)?.baseRevision,
         });
         if (!inspected.ok || inspected.snapshot.files.length === 0) {
-          return finishFailure(
-            `task_finish rejected: ${inspected.ok ? 'manifest_mismatch' : inspected.reason}`);
+          return finishFailure(`task_finish rejected: ${inspected.ok
+            ? 'manifest_mismatch'
+            : inspected.detail ? `${inspected.reason}:${inspected.detail}` : inspected.reason}`);
         }
         const evidence = registry.recordCancelledCompletionEvidence({
           taskId: existing.taskId,
@@ -2767,7 +2768,8 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       });
       if (!inspected.ok) {
         return integrationRefusal('integration_preflight', [{
-          code: 'bundle_mismatch', field: 'bundle', expected: 'available safe worktree', actual: inspected.reason,
+          code: 'bundle_mismatch', field: 'bundle', expected: 'available safe worktree',
+          actual: inspected.detail ? `${inspected.reason}:${inspected.detail}` : inspected.reason,
         }]);
       }
       const ownerWorktreePath = resolveSupervisionAssignmentWorktree({
@@ -2955,7 +2957,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
           return integrationRefusal('integration_finalize', [{
             code: 'remote_drift', field: 'remoteCommit',
             expected: `${parsed.data.pushRemoteRef}@${parsed.data.commitSha}`,
-            actual: inspected.reason,
+            actual: inspected.detail ? `${inspected.reason}:${inspected.detail}` : inspected.reason,
           }]);
         }
       }

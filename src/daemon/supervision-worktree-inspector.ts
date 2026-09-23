@@ -71,7 +71,20 @@ export interface SupervisionWorktreeSnapshot {
 
 export type SupervisionWorktreeInspectionResult =
   | { ok: true; snapshot: SupervisionWorktreeSnapshot }
-  | { ok: false; reason: 'worktree_unavailable' | 'worktree_unsafe' };
+  | {
+    ok: false;
+    reason: 'worktree_unavailable' | 'worktree_unsafe';
+    /**
+     * The underlying cause, previously discarded entirely. Additive and
+     * optional so every existing caller that reads only `reason` is
+     * unaffected; a caller that wants a diagnosable refusal can start
+     * including it. Distinguishes "the path never resolved" (ENOENT/EACCES on
+     * realpath -- never created, or deleted since) from a git-level failure
+     * mid-inspection (deadline, queue saturation, spawn/exit failure) instead
+     * of collapsing every cause into the same bare `worktree_unavailable`.
+     */
+    detail?: string;
+  };
 
 function within(root: string, candidate: string): boolean {
   const rel = relative(root, candidate);
@@ -687,8 +700,13 @@ export function inspectSupervisionAssignmentWorktree(input: {
   let worktreePath: string;
   try {
     worktreePath = realpathSync(configured);
-  } catch {
-    return Promise.resolve({ ok: false, reason: 'worktree_unavailable' });
+  } catch (realpathError) {
+    const code = (realpathError as NodeJS.ErrnoException | undefined)?.code;
+    return Promise.resolve({
+      ok: false,
+      reason: 'worktree_unavailable',
+      detail: code ? `realpath_failed:${code}` : 'realpath_failed',
+    });
   }
   const requestedBase = input.baseRevision?.trim().toLowerCase();
   const baseRevision = requestedBase && COMMIT_RE.test(requestedBase) ? requestedBase : undefined;
@@ -706,10 +724,20 @@ export function inspectSupervisionAssignmentWorktree(input: {
       const { result, reportedPaths, dirtyPaths } = await inspectUncached(worktreePath, deadlineAt, baseRevision);
       storeResult(worktreePath, cacheKey, reportedPaths, dirtyPaths, result);
       return result;
-    } catch {
+    } catch (inspectionError) {
       // Saturation, deadline expiry, git failure and output overflow all land
       // here: an inspection that could not be completed is never a snapshot.
-      return { ok: false, reason: 'worktree_unavailable' };
+      // The specific cause (e.g. `git_deadline_exceeded`, `git_queue_saturated`,
+      // `unreadable gitdir`, or the underlying git spawn/exit error) is real
+      // diagnostic evidence a caller building a refusal message needs -- losing
+      // it here is exactly what left a production integration_preflight
+      // refusal saying only "worktree_unavailable" with no way to tell a
+      // missing worktree from an overloaded git queue.
+      return {
+        ok: false,
+        reason: 'worktree_unavailable',
+        detail: inspectionError instanceof Error ? inspectionError.message : String(inspectionError),
+      };
     } finally {
       inFlight.delete(cacheKey);
     }
