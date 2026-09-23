@@ -1126,6 +1126,8 @@
     }
   },
   "new_session": {
+    "launch_count": "Количество",
+    "launch_count_hint": "Будет запущено {{count}} одинаковых сессий одновременно.",
     "project_required": "Название проекта обязательно",
     "dir_required": "Рабочий каталог обязателен",
     "not_connected": "Не подключено к daemon",

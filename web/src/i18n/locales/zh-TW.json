@@ -1126,6 +1126,8 @@
     }
   },
   "new_session": {
+    "launch_count": "數量",
+    "launch_count_hint": "將一次啟動 {{count}} 個相同設定的工作階段。",
     "project_required": "專案名稱為必填",
     "dir_required": "工作目錄為必填",
     "not_connected": "未連線至 Daemon",

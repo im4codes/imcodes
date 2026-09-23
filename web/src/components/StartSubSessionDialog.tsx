@@ -39,6 +39,8 @@ import {
 } from '@shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 
+/** Upper bound on how many identical sub-sessions one launch can request at once. */
+const MAX_SUB_SESSION_LAUNCH_COUNT = 20;
 const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
 const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
 const CODEX_SDK_MODEL_SUGGESTIONS = [...CODEX_MODEL_IDS] as const;
@@ -82,6 +84,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
   const [shellBin, setShellBin] = useState<string>('/bin/bash');
   const cwd = defaultCwd ?? '';
   const [label, setLabel] = useState('');
+  const [countInput, setCountInput] = useState('1');
   const [scriptCmd, setScriptCmd] = useState('');
   const [scriptInterval, setScriptInterval] = useState('5');
   const [detectingShells, setDetectingShells] = useState(false);
@@ -270,6 +273,14 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
     if (!ccPreset && ccPresets.length > 0) setCcPreset(ccPresets[0].name);
   }, [ccPreset, ccPresets, customProviderSdk, type]);
 
+  // A bind-mode OpenClaw launch connects to one specific EXISTING external
+  // session, so repeating it does not mean "N sessions" -- it always launches
+  // exactly one, regardless of the quantity field.
+  const canLaunchMultiple = !(type === 'openclaw' && ocMode === 'bind');
+  const launchCount = canLaunchMultiple
+    ? Math.min(MAX_SUB_SESSION_LAUNCH_COUNT, Math.max(1, parseInt(countInput, 10) || 1))
+    : 1;
+
   const handleStart = () => {
     const desc = description.trim() || undefined;
     if (customProviderSdk && !ccPreset) {
@@ -282,14 +293,20 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
       const interval = Math.max(1, parseInt(scriptInterval, 10) || 5);
       const escaped = scriptCmd.trim().replace(/'/g, "'\\''");
       const wrapper = `bash -c 'while true; do clear; ${escaped}; sleep ${interval}; done'`;
-      onStart('script', wrapper, cwd || undefined, label || scriptCmd.trim().slice(0, 30), desc ? { description: desc } : undefined);
+      onStart('script', wrapper, cwd || undefined, label || scriptCmd.trim().slice(0, 30), {
+        ...(desc ? { description: desc } : {}),
+        ...(launchCount > 1 ? { launchCount } : {}),
+      });
       return;
     }
     if (type === 'openclaw') {
       const extra =
         ocMode === 'bind'
           ? { ocMode: 'bind', ocSessionId: ocSelectedSession, description: desc, thinking }
-          : { ocMode: 'new', ocSessionKey: ocSessionKey.trim(), description: desc, thinking };
+          : {
+            ocMode: 'new', ocSessionKey: ocSessionKey.trim(), description: desc, thinking,
+            ...(launchCount > 1 ? { launchCount } : {}),
+          };
       onStart('openclaw', undefined, cwd || undefined, label || undefined, extra);
       return;
     }
@@ -303,6 +320,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
     if (ccInitPrompt.trim() && type === 'claude-code') extra.ccInitPrompt = ccInitPrompt.trim();
     if ((type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === HERMES_AGENT_PROVIDER_ID || type === 'deepseek-harness' || type === 'pi' || isCodeBuddyProviderId(type) || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
     if (type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'pi' || type === 'qwen') extra.thinking = thinking;
+    if (launchCount > 1) extra.launchCount = launchCount;
     onStart(type, selectedShell, cwd || undefined, label || undefined, Object.keys(extra).length > 0 ? extra : undefined);
   };
 
@@ -862,6 +880,28 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
               style={{ width: '100%' }}
             />
           </div>
+
+          {/* Quantity: launch several identical sub-sessions at once */}
+          {canLaunchMultiple && (
+            <div>
+              <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>{t('new_session.launch_count')}</div>
+              <input
+                class="input"
+                type="number"
+                min={1}
+                max={MAX_SUB_SESSION_LAUNCH_COUNT}
+                value={countInput}
+                onInput={(e) => setCountInput((e.target as HTMLInputElement).value)}
+                style={{ width: 120 }}
+                aria-label={t('new_session.launch_count')}
+              />
+              {launchCount > 1 && (
+                <div style={{ color: '#94a3b8', fontSize: 12, marginTop: 4, lineHeight: 1.4 }}>
+                  {t('new_session.launch_count_hint', { count: launchCount })}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Description / persona */}
           <div>

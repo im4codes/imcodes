@@ -1126,6 +1126,8 @@
     }
   },
   "new_session": {
+    "launch_count": "수량",
+    "launch_count_hint": "동일한 설정의 세션을 한 번에 {{count}}개 시작합니다.",
     "project_required": "프로젝트 이름은 필수입니다",
     "dir_required": "작업 디렉토리는 필수입니다",
     "not_connected": "Daemon에 연결되지 않음",

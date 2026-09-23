@@ -1126,6 +1126,8 @@
     }
   },
   "new_session": {
+    "launch_count": "数量",
+    "launch_count_hint": "同じ設定のセッションを一度に {{count}} 個起動します。",
     "project_required": "プロジェクト名は必須です",
     "dir_required": "作業ディレクトリは必須です",
     "not_connected": "Daemonに接続されていません",

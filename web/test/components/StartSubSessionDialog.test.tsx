@@ -642,6 +642,70 @@ describe('StartSubSessionDialog', () => {
     expect(onStart).toHaveBeenCalledWith('qwen', undefined, '/tmp', undefined, { thinking: 'high' });
   });
 
+  it('omits launchCount for the default quantity of one, keeping a single launch unchanged', () => {
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+
+    expect(onStart).toHaveBeenCalledTimes(1);
+    const extra = onStart.mock.calls[0]?.[4] as Record<string, unknown> | undefined;
+    expect(extra).not.toHaveProperty('launchCount');
+  });
+
+  it('passes launchCount when a quantity greater than one is requested', () => {
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.input(screen.getByLabelText('launch_count'), { target: { value: '3' } });
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+
+    expect(onStart).toHaveBeenCalledTimes(1);
+    expect(onStart).toHaveBeenCalledWith('claude-code-sdk', undefined, '/tmp', undefined,
+      expect.objectContaining({ launchCount: 3 }));
+  });
+
+  it('clamps an out-of-range quantity into [1, MAX] instead of trusting raw input', () => {
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.input(screen.getByLabelText('launch_count'), { target: { value: '999' } });
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+
+    expect(onStart).toHaveBeenCalledWith('claude-code-sdk', undefined, '/tmp', undefined,
+      expect.objectContaining({ launchCount: 20 }));
+  });
+
   it('passes requestedModel for copilot-sdk sub-sessions', () => {
     const onStart = vi.fn();
     render(

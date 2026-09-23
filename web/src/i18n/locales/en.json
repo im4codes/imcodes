@@ -1126,6 +1126,8 @@
     }
   },
   "new_session": {
+    "launch_count": "Quantity",
+    "launch_count_hint": "Will launch {{count}} identical sessions at once.",
     "project_required": "Project name is required",
     "dir_required": "Working directory is required",
     "not_connected": "Not connected to daemon",

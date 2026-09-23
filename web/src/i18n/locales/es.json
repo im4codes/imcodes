@@ -1126,6 +1126,8 @@
     }
   },
   "new_session": {
+    "launch_count": "Cantidad",
+    "launch_count_hint": "Se iniciarán {{count}} sesiones idénticas a la vez.",
     "project_required": "El nombre del proyecto es obligatorio",
     "dir_required": "El directorio de trabajo es obligatorio",
     "not_connected": "No conectado al daemon",

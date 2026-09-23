@@ -1126,6 +1126,8 @@
     }
   },
   "new_session": {
+    "launch_count": "数量",
+    "launch_count_hint": "将一次启动 {{count}} 个相同配置的会话。",
     "project_required": "项目名称不能为空",
     "dir_required": "工作目录不能为空",
     "not_connected": "未连接到 daemon",
