@@ -17,6 +17,7 @@ import http from 'http';
 import logger from '../util/logger.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { getSession, upsertSession, listSessions } from '../store/session-store.js';
+import { DAEMON_MEMORY_WORKER_STALE_RUNTIME_ERROR } from './memory-mcp-error-codes.js';
 import type { SessionRecord } from '../store/session-store.js';
 import { refreshSessionWatcher } from './watcher-controls.js';
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../../shared/imcodes-send.js';
@@ -833,7 +834,7 @@ export async function startHookServer(
         if (body.sessionInstanceId !== session.sessionInstanceId
           || body.runtimeEpoch !== session.runtimeEpoch) {
           res.writeHead(409, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, error: 'daemon_memory_worker_stale_runtime' }));
+          res.end(JSON.stringify({ ok: false, error: DAEMON_MEMORY_WORKER_STALE_RUNTIME_ERROR }));
           return;
         }
         if (!isMemoryMcpDaemonToolName(body.tool)) {

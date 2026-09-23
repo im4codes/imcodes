@@ -22,7 +22,8 @@ import { registerSupervisionMcpTools, type SupervisionMcpToolDeps } from './supe
 import { createSupervisionMcpToolDeps } from './supervision-registry-port.js';
 import { createDaemonMachineToolDeps } from './machine-mcp-deps.js';
 import { SHARED_MACHINE_AUTHORITY_HOOK_PATH } from '../../shared/shared-machine-authority.js';
-import { loadStore, type SessionRecord } from '../store/session-store.js';
+import { getSession, loadStore, type SessionRecord } from '../store/session-store.js';
+import { DAEMON_MEMORY_WORKER_STALE_RUNTIME_ERROR } from './memory-mcp-error-codes.js';
 import { isDaemonCapabilityAdvertised } from './server-link.js';
 import { EXECUTION_CLONE_CAPABILITY_V1 } from '../../shared/execution-clone.js';
 import { resolveExecutionCloneLimitsForParentRun } from './execution-clone-limits-resolver.js';
@@ -473,21 +474,50 @@ export function mergeDefaultToolDeps(
     ...toolDeps,
     invokeDaemonMemoryTool: toolDeps.invokeDaemonMemoryTool
       ?? (resourceOwner && caller.sessionName
-        ? async (name: MemoryMcpDaemonToolName, input?: unknown) => {
-            const port = await requireHookPort(MEMORY_MCP_DAEMON_RPC_PATH);
-            const response = await postHookSend(port, {
-              sessionInstanceId: resourceOwner.sessionInstanceId,
-              runtimeEpoch: resourceOwner.runtimeEpoch,
-              serverId: caller.serverId,
-              tool: name,
-              input,
-            }, MEMORY_MCP_DAEMON_RPC_PATH, caller.sessionName!, MEMORY_MCP_DEFAULT_REQUEST_TIMEOUT_MS);
-            const result = response.result;
-            if (!result || typeof result !== 'object' || Array.isArray(result)) {
-              throw new Error('daemon_memory_worker_invalid_response');
-            }
-            return result as Record<string, unknown>;
-          }
+        ? (() => {
+            // `runtimeEpoch` bumps on an ordinary session restart (tmux
+            // pane respawn, restart-counter increment — see
+            // `didRuntimeAuthorityChange` in session-store.ts) even while
+            // THIS stdio MCP child keeps running unchanged as a child of
+            // the same still-live CLI process. `resourceOwner` is captured
+            // once from env vars at process spawn, so without a self-heal
+            // every daemon-proxied call (including send_message) would 409
+            // forever after any such restart. Cache the epoch and, on a
+            // stale-runtime 409, refresh it from the on-disk record for
+            // this EXACT `sessionInstanceId` only — never adopt whichever
+            // session currently owns the name, which would let an orphaned
+            // child from a deleted session impersonate an unrelated session
+            // that later reused that name.
+            let currentRuntimeEpoch = resourceOwner.runtimeEpoch;
+            const sendOnce = (name: MemoryMcpDaemonToolName, input: unknown, runtimeEpoch: string) =>
+              requireHookPort(MEMORY_MCP_DAEMON_RPC_PATH).then((port) => postHookSend(port, {
+                sessionInstanceId: resourceOwner.sessionInstanceId,
+                runtimeEpoch,
+                serverId: caller.serverId,
+                tool: name,
+                input,
+              }, MEMORY_MCP_DAEMON_RPC_PATH, caller.sessionName!, MEMORY_MCP_DEFAULT_REQUEST_TIMEOUT_MS));
+            return async (name: MemoryMcpDaemonToolName, input?: unknown) => {
+              let response: Record<string, unknown>;
+              try {
+                response = await sendOnce(name, input, currentRuntimeEpoch);
+              } catch (err) {
+                if (!(err instanceof Error) || err.message !== DAEMON_MEMORY_WORKER_STALE_RUNTIME_ERROR) throw err;
+                await loadStore();
+                const fresh = getSession(caller.sessionName!);
+                if (!fresh || fresh.sessionInstanceId !== resourceOwner.sessionInstanceId || !fresh.runtimeEpoch) {
+                  throw err;
+                }
+                currentRuntimeEpoch = fresh.runtimeEpoch;
+                response = await sendOnce(name, input, currentRuntimeEpoch);
+              }
+              const result = response.result;
+              if (!result || typeof result !== 'object' || Array.isArray(result)) {
+                throw new Error('daemon_memory_worker_invalid_response');
+              }
+              return result as Record<string, unknown>;
+            };
+          })()
         : undefined),
     // The stdio MCP process is intentionally a thin client of the
     // server-authoritative operation store. Keeping the executor in the main

@@ -46,6 +46,8 @@ import {
   MEMORY_MCP_WATCHDOG,
   SESSION_RESOURCE_OWNER_ENV,
 } from '../../shared/session-resource-lifecycle.js';
+import { MEMORY_MCP_DAEMON_RPC_PATH } from '../../shared/memory-mcp-daemon-rpc.js';
+import { DAEMON_MEMORY_WORKER_STALE_RUNTIME_ERROR } from '../../src/daemon/memory-mcp-error-codes.js';
 import { deterministicSendMessageId, createSendDispatchId } from '../../shared/send-message-id.js';
 import {
   getTransportQueueStore,
@@ -142,6 +144,35 @@ async function writeSessionStore(home: string, options: { includeLatePeer?: bool
   }), 'utf8');
 }
 
+async function writeWorkerSessionIdentity(
+  home: string,
+  identity: { sessionInstanceId: string; runtimeEpoch: string },
+): Promise<void> {
+  const imcodesDir = join(home, '.imcodes');
+  await mkdir(imcodesDir, { recursive: true });
+  const now = Date.now();
+  await writeFile(join(imcodesDir, 'sessions.json'), JSON.stringify({
+    sessions: {
+      deck_sub_worker: {
+        name: 'deck_sub_worker',
+        projectName: 'proj',
+        role: 'w1',
+        agentType: 'codex-sdk',
+        projectDir: join(home, 'proj'),
+        state: 'idle',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: now,
+        updatedAt: now,
+        parentSession: 'deck_proj_brain',
+        runtimeType: 'transport',
+        label: 'Worker',
+        ...identity,
+      },
+    },
+  }), 'utf8');
+}
+
 function mcpEnv(home: string): Record<string, string | undefined> {
   return buildMemoryMcpServerEnv({
     [MEMORY_MCP_ENV_KEYS.USER_ID]: 'user-1',
@@ -154,6 +185,17 @@ function mcpEnv(home: string): Record<string, string | undefined> {
     PATH: process.env.PATH,
     HOME: home,
   });
+}
+
+function mcpEnvWithResourceOwner(
+  home: string,
+  identity: { sessionInstanceId: string; runtimeEpoch: string },
+): Record<string, string | undefined> {
+  return {
+    ...mcpEnv(home),
+    [SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID]: identity.sessionInstanceId,
+    [SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH]: identity.runtimeEpoch,
+  };
 }
 
 async function callLazyTool(client: Client, name: string, args: Record<string, unknown>) {
@@ -1618,6 +1660,110 @@ describe('mergeDefaultToolDeps per-field composition', () => {
       });
     } finally {
       resetTransportQueueStoreForTests();
+    }
+  });
+
+  it('self-heals invokeDaemonMemoryTool after a stale_runtime 409 from an ordinary session restart', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'imcodes-mcp-stale-heal-'));
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    const requests: Array<Record<string, unknown>> = [];
+    const hookServer = createServer((req, res) => {
+      if (req.method !== 'POST' || req.url !== MEMORY_MCP_DAEMON_RPC_PATH) {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
+      let raw = '';
+      req.setEncoding('utf8');
+      req.on('data', (chunk) => { raw += chunk; });
+      req.on('end', () => {
+        void (async () => {
+          const body = JSON.parse(raw) as Record<string, unknown>;
+          requests.push(body);
+          if (body.runtimeEpoch === 'epoch-old') {
+            // Simulate the daemon having restarted this SAME session (a bumped
+            // runtimeEpoch, same sessionInstanceId) in the background, exactly
+            // as `didRuntimeAuthorityChange` would produce, while this stdio
+            // MCP child keeps running with its now-stale env-derived identity.
+            await writeWorkerSessionIdentity(home, { sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-new' });
+            res.writeHead(409, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: DAEMON_MEMORY_WORKER_STALE_RUNTIME_ERROR }));
+            return;
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ result: { status: 'ok' } }));
+        })();
+      });
+    });
+    try {
+      await writeWorkerSessionIdentity(home, { sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-old' });
+      await new Promise<void>((resolve) => hookServer.listen(0, '127.0.0.1', resolve));
+      const address = hookServer.address();
+      if (!address || typeof address === 'string') throw new Error('expected TCP hook server address');
+      const owner = { sessionName: 'deck_sub_worker', sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-old' };
+      const merged = mergeDefaultToolDeps(caller, {}, owner, {
+        resolveHookAuthority: async () => ({ ok: true, port: address.port, owner: null }),
+      });
+
+      const result = await merged.invokeDaemonMemoryTool!(MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION, { content: 'x' });
+
+      expect(result).toEqual({ status: 'ok' });
+      expect(requests).toEqual([
+        expect.objectContaining({ sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-old' }),
+        expect.objectContaining({ sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-new' }),
+      ]);
+    } finally {
+      process.env.HOME = previousHome;
+      await new Promise<void>((resolve, reject) => hookServer.close((err) => (err ? reject(err) : resolve())));
+    }
+  });
+
+  it('never retries a stale_runtime 409 under a different sessionInstanceId, preserving the anti-spoofing check', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'imcodes-mcp-stale-no-heal-'));
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    const requests: Array<Record<string, unknown>> = [];
+    const hookServer = createServer((req, res) => {
+      if (req.method !== 'POST' || req.url !== MEMORY_MCP_DAEMON_RPC_PATH) {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
+      let raw = '';
+      req.setEncoding('utf8');
+      req.on('data', (chunk) => { raw += chunk; });
+      req.on('end', () => {
+        void (async () => {
+          const body = JSON.parse(raw) as Record<string, unknown>;
+          requests.push(body);
+          // The name was reused by an unrelated, genuinely different session
+          // (a different sessionInstanceId) — this must stay blocked, never
+          // silently adopt the new owner's identity.
+          await writeWorkerSessionIdentity(home, { sessionInstanceId: 'instance-2', runtimeEpoch: 'epoch-new' });
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: DAEMON_MEMORY_WORKER_STALE_RUNTIME_ERROR }));
+        })();
+      });
+    });
+    try {
+      await writeWorkerSessionIdentity(home, { sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-old' });
+      await new Promise<void>((resolve) => hookServer.listen(0, '127.0.0.1', resolve));
+      const address = hookServer.address();
+      if (!address || typeof address === 'string') throw new Error('expected TCP hook server address');
+      const owner = { sessionName: 'deck_sub_worker', sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-old' };
+      const merged = mergeDefaultToolDeps(caller, {}, owner, {
+        resolveHookAuthority: async () => ({ ok: true, port: address.port, owner: null }),
+      });
+
+      await expect(merged.invokeDaemonMemoryTool!(MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION, { content: 'x' }))
+        .rejects.toThrow(DAEMON_MEMORY_WORKER_STALE_RUNTIME_ERROR);
+      expect(requests).toEqual([
+        expect.objectContaining({ sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-old' }),
+      ]);
+    } finally {
+      process.env.HOME = previousHome;
+      await new Promise<void>((resolve, reject) => hookServer.close((err) => (err ? reject(err) : resolve())));
     }
   });
 });
