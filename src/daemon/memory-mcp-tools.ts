@@ -142,6 +142,7 @@ import type { MemorySearchQuery } from '../context/memory-search.js';
 import { saveObservation, savePreference } from '../context/memory-write-tools.js';
 import { serializeContextNamespace } from '../context/context-keys.js';
 import { publishRuntimeMemoryCacheInvalidation } from '../context/runtime-memory-cache-bus.js';
+import { isMemoryInjectionEnabled, setMemoryInjectionEnabled } from '../context/memory-injection-toggle.js';
 import { getMemoryFeatureConfigStoreDiagnostics, getPersistedMemoryFeatureFlagValues, getRuntimeMemoryFeatureFlagValues } from '../store/memory-feature-config-store.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { listSessions as listStoredSessions, loadStore, type SessionRecord } from '../store/session-store.js';
@@ -351,6 +352,8 @@ export interface MemoryMcpToolDeps {
   orchestratorDeps?: OrchestratorDeps;
   saveObservation?: typeof saveObservation;
   savePreference?: typeof savePreference;
+  getMemoryInjectionEnabled?: typeof isMemoryInjectionEnabled;
+  setMemoryInjectionEnabled?: typeof setMemoryInjectionEnabled;
   identityClientOptions?: SessionIdentityClientOptions;
   getIdentityProfile?: typeof getSessionIdentityProfile;
   getEffectiveIdentityProfiles?: typeof getEffectiveSessionIdentityProfiles;
@@ -1538,6 +1541,8 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     ));
   const saveObservationTool = deps.saveObservation ?? saveObservation;
   const savePreferenceTool = deps.savePreference ?? savePreference;
+  const getMemoryInjectionEnabledTool = deps.getMemoryInjectionEnabled ?? isMemoryInjectionEnabled;
+  const setMemoryInjectionEnabledTool = deps.setMemoryInjectionEnabled ?? setMemoryInjectionEnabled;
   const contextStoreClient = () => getContextStoreClient();
   const getProcessedProjectionById = deps.getProcessedProjectionById
     ?? ((id: string) => contextStoreClient().run<ProcessedContextProjection | undefined>('getProcessedProjectionById', [id]));
@@ -1987,6 +1992,21 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const gate = memoryGate(deps, MEMORY_FEATURE_FLAGS_BY_NAME.preferences, MEMORY_MCP_DISABLED_FLAGS.PREFERENCES);
       if (gate) return gate;
       return await savePreferenceTool(pickAllowedMcpArgs(input, ['text', 'idempotencyKey']), memoryCaller()) as unknown as ToolResult;
+    },
+    [MEMORY_MCP_TOOL_NAMES.MEMORY_INJECTION_GET]: async () => {
+      const enabled = await getMemoryInjectionEnabledTool(caller.namespace);
+      return { status: 'ok', enabled };
+    },
+    [MEMORY_MCP_TOOL_NAMES.MEMORY_INJECTION_SET]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['enabled']);
+      const enabled = boolArg(args, 'enabled');
+      if (enabled === undefined) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'enabled is required');
+      const callerRecord = (await sendSessions()).find((session) => session.name === caller.sessionName);
+      if (callerRecord?.role !== 'brain') {
+        return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain may change memory-injection settings');
+      }
+      await setMemoryInjectionEnabledTool(caller.namespace, enabled);
+      return { status: 'ok', enabled };
     },
     [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_GET]: async (input) => {
       const args = pickAllowedMcpArgs(input, ['target']);
@@ -3524,6 +3544,10 @@ const schemas = {
     text: z.string().describe('Stable preference text.'),
     idempotencyKey: z.string().optional().describe('Retry key.'),
   }),
+  [MEMORY_MCP_TOOL_NAMES.MEMORY_INJECTION_GET]: z.object({}).strict(),
+  [MEMORY_MCP_TOOL_NAMES.MEMORY_INJECTION_SET]: z.object({
+    enabled: z.boolean().describe('true to enable (the default), false to disable.'),
+  }).strict(),
   [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_GET]: z.object({
     target: z.string().optional().describe('Exact session name; defaults to the current session.'),
   }).strict(),

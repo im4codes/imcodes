@@ -29,13 +29,14 @@ export const MCP_INJECTED_EXECUTION_BLOCK = Object.freeze({ taskSupport: 'forbid
 // rather than silently hiding it from STATIC_FULL hosts or trimming unrelated
 // safety descriptions merely to make the number go down.
 //
-// Measured at 46,199 authored bytes across 63 tools after adding the exact
-// pre-Git authority snapshot contract. The ceiling moves deliberately with
-// roughly the same ~700 bytes of reviewable headroom as before.
-export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 46_900;
-// Raw = authored + the MCP SDK framing, currently 6,108 bytes across 63 tools.
-// Keep a bounded allowance above the measured 52,307-byte wire payload.
-export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 53_100;
+// Measured at 47,777 authored bytes across 65 tools after adding the
+// memory_injection_get/memory_injection_set toggle. The ceiling moves
+// deliberately with roughly the same ~700 bytes of reviewable headroom as
+// before.
+export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 48_500;
+// Raw = authored + the MCP SDK framing, currently 6,292 bytes across 65 tools.
+// Keep a bounded allowance above the measured 54,069-byte wire payload.
+export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 54_800;
 /**
  * Default model-visible surface: one discovery tool plus the stable minimal
  * delegation, supervision-task, basic-memory/source-expansion, scheduling,

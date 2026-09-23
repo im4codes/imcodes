@@ -30,6 +30,11 @@ export const MEMORY_MCP_DAEMON_TOOL_NAMES = [
   MEMORY_MCP_TOOL_NAMES.MEMORY_FEEDBACK,
   MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION,
   MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE,
+  // The toggle is read/written through the daemon's single context-store
+  // worker (see src/context/memory-injection-toggle.ts) — a stdio MCP child
+  // has no access to that worker.
+  MEMORY_MCP_TOOL_NAMES.MEMORY_INJECTION_GET,
+  MEMORY_MCP_TOOL_NAMES.MEMORY_INJECTION_SET,
   // Identity refresh must execute in the daemon process: only it owns the
   // live transport runtime and can invalidate Codex's loaded thread state.
   MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_GET,

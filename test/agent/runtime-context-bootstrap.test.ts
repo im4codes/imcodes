@@ -8,6 +8,7 @@ import { makeMemoryShortRef, resetMemoryShortRefsForTests, resolveMemoryShortRef
 import { ensureContextNamespace, writeContextObservation, writeProcessedProjection } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 import { projectionOwnerCache } from '../../src/daemon/memory-projection-owner-cache.js';
+import { setMemoryInjectionEnabled } from '../../src/context/memory-injection-toggle.js';
 
 const detectRepoMock = vi.hoisted(() => vi.fn());
 
@@ -412,6 +413,35 @@ describe('resolveTransportContextBootstrap', () => {
         }),
       ]),
     }));
+  });
+
+  it('omits durable/recent startup memory once memory_injection_set disables it for the namespace, even when processed memory exists', async () => {
+    const now = Date.now();
+    detectRepoMock.mockResolvedValue({
+      info: {
+        remoteUrl: 'git@github.com:acme/repo.git',
+      },
+    });
+    writeProcessedProjection({
+      namespace: {
+        scope: 'personal',
+        projectId: 'github.com/acme/repo',
+      },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-toggle'],
+      summary: 'Should be hidden once injection is disabled',
+      content: { kind: 'startup' },
+      createdAt: now - 100,
+      updatedAt: now - 50,
+    });
+    await setMemoryInjectionEnabled({ scope: 'personal', projectId: 'github.com/acme/repo' }, false);
+
+    const result = await resolveTransportContextBootstrap({
+      projectDir: '/tmp/project',
+      transportConfig: {},
+    });
+
+    expect(result.startupMemory).toBeUndefined();
   });
 
   it('includes cloud startup memory for the resolved personal project when backend sync is available', async () => {

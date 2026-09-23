@@ -84,6 +84,8 @@ describe('memory MCP shared contracts', () => {
       'memory_feedback',
       'save_observation',
       'save_preference',
+      'memory_injection_get',
+      'memory_injection_set',
       'session_identity_get',
       'session_identity_set',
       'session_identity_clear',

@@ -90,6 +90,8 @@ export const MEMORY_MCP_TOOL_NAMES = {
   MEMORY_FEEDBACK: 'memory_feedback',
   SAVE_OBSERVATION: 'save_observation',
   SAVE_PREFERENCE: 'save_preference',
+  MEMORY_INJECTION_GET: 'memory_injection_get',
+  MEMORY_INJECTION_SET: 'memory_injection_set',
   SESSION_IDENTITY_GET: SESSION_IDENTITY_MCP_TOOLS.GET,
   SESSION_IDENTITY_SET: SESSION_IDENTITY_MCP_TOOLS.SET,
   SESSION_IDENTITY_CLEAR: SESSION_IDENTITY_MCP_TOOLS.CLEAR,
@@ -141,6 +143,8 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.MEMORY_FEEDBACK,
   MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION,
   MEMORY_MCP_TOOL_NAMES.SAVE_PREFERENCE,
+  MEMORY_MCP_TOOL_NAMES.MEMORY_INJECTION_GET,
+  MEMORY_MCP_TOOL_NAMES.MEMORY_INJECTION_SET,
   MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_GET,
   MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET,
   MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_CLEAR,
@@ -455,6 +459,26 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       idempotencyKey: stringSchema('Optional caller-stable key for safe retries of the same preference.'),
     }, ['text']),
     outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.MEMORY_INJECTION_GET]: {
+    name: MEMORY_MCP_TOOL_NAMES.MEMORY_INJECTION_GET,
+    description: 'Read whether automatic startup-memory injection (recent history / related memory recalled into a newly launched session) is enabled for the caller\'s project. Managed Skills are a separate concept and are unaffected by this toggle. Defaults to enabled when never set.',
+    inputSchema: objectSchema({}),
+    outputSchema: objectSchema({
+      status: stringSchema('ok or error.'),
+      enabled: { type: 'boolean', description: 'Whether startup-memory auto-injection is currently enabled for the caller\'s project.' },
+    }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.MEMORY_INJECTION_SET]: {
+    name: MEMORY_MCP_TOOL_NAMES.MEMORY_INJECTION_SET,
+    description: 'Turn automatic startup-memory injection (recent history / related memory recalled into a newly launched session) on or off, project-wide. Brain-only: applies to every session under the project, including the Brain\'s own future restarts and every sub-session\'s bootstrap — there is nothing separate to set per sub-session. Managed Skills are a separate concept and stay injected either way.',
+    inputSchema: objectSchema({
+      enabled: { type: 'boolean', description: 'true to enable (the default), false to disable startup-memory auto-injection for the whole project.' },
+    }, ['enabled']),
+    outputSchema: objectSchema({
+      status: stringSchema('ok or error.'),
+      enabled: { type: 'boolean', description: 'The value now in effect for the project.' },
+    }),
   },
   [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_GET]: {
     name: MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_GET,

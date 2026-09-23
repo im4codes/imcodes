@@ -33,6 +33,7 @@ import { registerMemoryShortRef } from '../context/memory-short-ref.js';
 import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
 import { projectionOwnerCache } from '../daemon/memory-projection-owner-cache.js';
 import { matchesContextConsumerNamespace } from '../../shared/actionable-consumer-scope.js';
+import { isMemoryInjectionEnabled } from '../context/memory-injection-toggle.js';
 
 export interface TransportContextBootstrapInput {
   projectDir?: string;
@@ -140,8 +141,12 @@ async function buildBootstrapResult(
 ): Promise<TransportContextBootstrap> {
   // Provider conversations retain ordinary startup memory across cold restore,
   // but managed Skill authority/generation can change while they are offline.
-  // Rebuild only the bounded managed catalog/policy in that case.
-  const startupMemory = skipStartupMemory
+  // Rebuild only the bounded managed catalog/policy in that case. The same
+  // managedSkillsOnly path also serves a namespace that has auto-injection of
+  // recent history/related memory turned off via `memory_injection_set` —
+  // managed Skills are a different, still-wanted concept and stay injected.
+  const memoryInjectionEnabled = await isMemoryInjectionEnabled(namespace).catch(() => true);
+  const startupMemory = (skipStartupMemory || !memoryInjectionEnabled)
     ? await buildTransportStartupMemory(namespace, {
         projectDir, sessionId, providerId, serverId, trustedOwnerId,
         managedSkillsOnly: true,
