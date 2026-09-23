@@ -1642,14 +1642,38 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     return { status: 'ok' as const, target: target.name, profiles: effective.profiles, prompt, applied };
   };
 
-  const refreshAffectedIdentities = async (scope: SessionIdentityScope, target: SessionRecord, all: boolean) => {
-    if (!all) return [await refreshIdentityTarget(target)];
+  // Session-scope identity is keyed per exact session name (see
+  // sessionIdentitySessionKey), unlike user/project scope where every
+  // affected session already reads the SAME stored key. So "all" sessions
+  // affected by a session-scope write are its live sub-sessions -- each with
+  // their own distinct, currently-unrelated storage slot.
+  const sessionScopeSubSessions = async (target: SessionRecord): Promise<SessionRecord[]> => {
     const sessions = await sendSessions();
-    const affected = scope === SESSION_IDENTITY_SCOPES.USER
-      ? sessions.filter((session) => session.state !== 'stopped')
-      : scope === SESSION_IDENTITY_SCOPES.PROJECT
-        ? sessions.filter((session) => session.state !== 'stopped' && session.projectName === target.projectName)
-        : [target, ...sessions.filter((session) => session.state !== 'stopped' && session.parentSession === target.name)];
+    return sessions.filter((session) => session.state !== 'stopped' && session.parentSession === target.name);
+  };
+
+  const affectedIdentitySessions = async (
+    scope: SessionIdentityScope,
+    target: SessionRecord,
+    all: boolean,
+  ): Promise<SessionRecord[]> => {
+    if (!all) return [target];
+    if (scope === SESSION_IDENTITY_SCOPES.SESSION) return [target, ...(await sessionScopeSubSessions(target))];
+    const sessions = await sendSessions();
+    if (scope === SESSION_IDENTITY_SCOPES.USER) return sessions.filter((session) => session.state !== 'stopped');
+    // `projectName` is a display string; two sessions can share it while
+    // resolving to different stored project keys (sessionIdentityProjectKey
+    // prefers contextNamespace.projectId over it). Match on the same key the
+    // write and the refresh read actually use, or a session with a
+    // differently-keyed project gets listed as "refreshed" while it silently
+    // read (and applied) an empty project layer instead of the new one.
+    const targetProjectKey = identityScopeKey(SESSION_IDENTITY_SCOPES.PROJECT, target);
+    return sessions.filter((session) => session.state !== 'stopped'
+      && identityScopeKey(SESSION_IDENTITY_SCOPES.PROJECT, session) === targetProjectKey);
+  };
+
+  const refreshAffectedIdentities = async (scope: SessionIdentityScope, target: SessionRecord, all: boolean) => {
+    const affected = await affectedIdentitySessions(scope, target, all);
     return Promise.all(affected.map((session) => refreshIdentityTarget(session)));
   };
 
@@ -2022,6 +2046,25 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         ...(filePath ? { sourceFile: filePath } : {}),
       }, identityOptions);
       if (saved.status !== 'ok') return saved;
+      // Session scope is keyed per exact session name, so `all` must also
+      // WRITE this same content into each sub-session's own storage slot --
+      // refreshing them alone would just re-apply whatever they already had.
+      let fanoutWritten: string[] = [];
+      let fanoutFailed: string[] = [];
+      if (scopeValue === SESSION_IDENTITY_SCOPES.SESSION && all) {
+        const subSessions = await sessionScopeSubSessions(target);
+        const results = await Promise.all(subSessions.map(async (session) => ({
+          session,
+          result: await identitySet({
+            scope: scopeValue,
+            scopeKey: identityScopeKey(scopeValue, session),
+            content: normalizeSessionIdentityContent(content),
+            ...(filePath ? { sourceFile: filePath } : {}),
+          }, identityOptions),
+        })));
+        fanoutWritten = results.filter((entry) => entry.result.status === 'ok').map((entry) => entry.session.name);
+        fanoutFailed = results.filter((entry) => entry.result.status !== 'ok').map((entry) => entry.session.name);
+      }
       const refreshed = await refreshAffectedIdentities(scopeValue, target, all);
       return {
         status: 'ok',
@@ -2029,6 +2072,8 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         target: target.name,
         all,
         profile: { ...saved.profile, content: undefined },
+        written: [target.name, ...fanoutWritten],
+        ...(fanoutFailed.length ? { writeFailed: fanoutFailed } : {}),
         refreshed: refreshed.map((item) => item.status === 'ok' ? item.target : null).filter(Boolean),
       };
     },
@@ -2052,12 +2097,28 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         identityOptions,
       );
       if (cleared.status !== 'ok') return cleared;
+      // See the matching note in SESSION_IDENTITY_SET: session scope is keyed
+      // per exact session name, so `all` must also CLEAR each sub-session's
+      // own storage slot, not just re-apply whatever they already had.
+      let fanoutDeleted: string[] = [];
+      let fanoutFailed: string[] = [];
+      if (scopeValue === SESSION_IDENTITY_SCOPES.SESSION && all) {
+        const subSessions = await sessionScopeSubSessions(target);
+        const results = await Promise.all(subSessions.map(async (session) => ({
+          session,
+          result: await identityClear(scopeValue, identityScopeKey(scopeValue, session), undefined, identityOptions),
+        })));
+        fanoutDeleted = results.filter((entry) => entry.result.status === 'ok').map((entry) => entry.session.name);
+        fanoutFailed = results.filter((entry) => entry.result.status !== 'ok').map((entry) => entry.session.name);
+      }
       const refreshed = await refreshAffectedIdentities(scopeValue, target, all);
       return {
         status: 'ok',
         deleted: cleared.deleted,
         target: target.name,
         all,
+        cleared: [target.name, ...fanoutDeleted],
+        ...(fanoutFailed.length ? { clearFailed: fanoutFailed } : {}),
         refreshed: refreshed.map((item) => item.status === 'ok' ? item.target : null).filter(Boolean),
       };
     },

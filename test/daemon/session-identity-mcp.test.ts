@@ -111,7 +111,12 @@ describe('session identity MCP tools', () => {
       session(),
       session({ name: 'deck_proj_cc1', role: 'w1' }),
       session({ name: 'deck_proj_cc2', role: 'w2' }),
-      session({ name: 'deck_other_brain', role: 'brain', projectName: 'other' }),
+      session({
+        name: 'deck_other_brain',
+        role: 'brain',
+        projectName: 'other',
+        contextNamespace: { scope: 'user_private', userId: 'user-1', projectId: 'repo-2' },
+      }),
     ];
     const setIdentityProfile = vi.fn(async (input: {
       scope: SessionIdentityProfile['scope']; scopeKey: string; content: string;
@@ -146,6 +151,42 @@ describe('session identity MCP tools', () => {
     expect((result as { refreshed: string[] }).refreshed.sort()).toEqual(
       ['deck_proj_brain', 'deck_proj_cc1', 'deck_proj_cc2'],
     );
+  });
+
+  it('excludes a session with the same projectName but a different actual project key from the fan-out', async () => {
+    const sessions = [
+      session(),
+      session({ name: 'deck_proj_cc1', role: 'w1' }),
+      // Same displayed projectName ("proj"), but its contextNamespace resolves
+      // to a DIFFERENT stored project key -- sessionIdentityProjectKey prefers
+      // contextNamespace.projectId over the display name. Grouping this
+      // session in with the others by projectName alone would report it as
+      // refreshed while it actually read (and applied) an empty project layer.
+      session({
+        name: 'deck_proj_cc_other_ns',
+        role: 'w2',
+        contextNamespace: { scope: 'user_private', userId: 'user-1', projectId: 'repo-2' },
+      }),
+    ];
+    const setIdentityProfile = vi.fn(async (input: {
+      scope: SessionIdentityProfile['scope']; scopeKey: string; content: string;
+    }) => ({ status: 'ok' as const, profile: identity(input.scope, input.scopeKey, input.content) }));
+    const applyEffectiveIdentity = vi.fn(async () => ({ applied: true }));
+    const handlers = createMemoryMcpToolHandlers(caller, {
+      sendDeps: { listSessions: () => sessions },
+      setIdentityProfile: setIdentityProfile as never,
+      getEffectiveIdentityProfiles: async () => ({ status: 'ok', profiles: [] }),
+      applyEffectiveIdentity,
+    });
+
+    const result = await handlers[MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_SET]({
+      identityScope: 'project',
+      content: 'Project rules.',
+    });
+
+    expect(result).toMatchObject({ status: 'ok', saved: true, all: true });
+    expect((result as { refreshed: string[] }).refreshed.sort()).toEqual(['deck_proj_brain', 'deck_proj_cc1']);
+    expect(applyEffectiveIdentity).not.toHaveBeenCalledWith('deck_proj_cc_other_ns', expect.anything(), expect.anything());
   });
 
   it('lets a project identity change opt out of the fan-out with all=false', async () => {
@@ -198,6 +239,55 @@ describe('session identity MCP tools', () => {
 
     expect(result).toMatchObject({ status: 'ok', saved: true, all: true });
     expect((result as { refreshed: string[] }).refreshed.sort()).toEqual(['deck_proj_brain', 'deck_proj_cc1']);
+    // Session scope is keyed per exact session name (unlike user/project,
+    // which share one key every affected session already reads), so `all`
+    // must WRITE the same content into the sub-session's own storage slot --
+    // not just refresh it, which would silently re-apply its unrelated
+    // pre-existing content and report the sub-session as "updated" for free.
+    expect((result as { written: string[] }).written.sort()).toEqual(['deck_proj_brain', 'deck_proj_cc1']);
+    expect(setIdentityProfile).toHaveBeenCalledWith({
+      scope: 'session',
+      scopeKey: 'srv-1:deck_proj_brain',
+      content: 'Brain-specific note.',
+    }, {});
+    expect(setIdentityProfile).toHaveBeenCalledWith({
+      scope: 'session',
+      scopeKey: 'srv-1:deck_proj_cc1',
+      content: 'Brain-specific note.',
+    }, {});
+    // The unrelated sibling (no parentSession match) never receives the write.
+    expect(setIdentityProfile).not.toHaveBeenCalledWith(
+      expect.objectContaining({ scopeKey: 'srv-1:deck_proj_cc2' }),
+      expect.anything(),
+    );
+  });
+
+  it('fans a session identity clear out to its own sub-sessions only when all=true', async () => {
+    const sessions = [
+      session(),
+      session({ name: 'deck_proj_cc1', role: 'w1', parentSession: 'deck_proj_brain' }),
+      session({ name: 'deck_proj_cc2', role: 'w2' }),
+    ];
+    const clearIdentityProfile = vi.fn(async () => ({ status: 'ok' as const, deleted: true }));
+    const applyEffectiveIdentity = vi.fn(async () => ({ applied: true }));
+    const handlers = createMemoryMcpToolHandlers(caller, {
+      sendDeps: { listSessions: () => sessions },
+      clearIdentityProfile: clearIdentityProfile as never,
+      getEffectiveIdentityProfiles: async () => ({ status: 'ok', profiles: [] }),
+      applyEffectiveIdentity,
+    });
+
+    const result = await handlers[MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_CLEAR]({
+      identityScope: 'session',
+      target: 'deck_proj_brain',
+      all: true,
+    });
+
+    expect(result).toMatchObject({ status: 'ok', all: true });
+    expect((result as { cleared: string[] }).cleared.sort()).toEqual(['deck_proj_brain', 'deck_proj_cc1']);
+    expect(clearIdentityProfile).toHaveBeenCalledWith('session', 'srv-1:deck_proj_brain', undefined, {});
+    expect(clearIdentityProfile).toHaveBeenCalledWith('session', 'srv-1:deck_proj_cc1', undefined, {});
+    expect(clearIdentityProfile).not.toHaveBeenCalledWith('session', 'srv-1:deck_proj_cc2', undefined, {});
   });
 
   it('exposes the same MCP set path for user, project, and exact-session scopes', async () => {
