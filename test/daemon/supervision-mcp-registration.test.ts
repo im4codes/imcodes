@@ -706,6 +706,39 @@ describe('production MCP registration', () => {
     })).toMatchObject({ status: 'error', reason: 'identity_rejected' });
     expect(registry.finished).toHaveLength(before);
   });
+
+  it('finishes a Brain-owned non-auditor assignment (e.g. integration_owner) as an ordinary finish, not a rebind-only Brain override', async () => {
+    // Production incident: the SAME identity (deck_jdzj_brain) held both the
+    // task's coordinator assignment and its integration_owner assignment.
+    // coordinatorMayAct alone cannot tell "acting on my OWN assignment" apart
+    // from "acting on someone else's as coordinator", so it always added
+    // projectBrain: true -- and finishAssignmentAsProjectBrainLocked
+    // unconditionally refuses role_forbidden for any non-auditor role unless
+    // a rebind was requested. A real integration_owner with an already-PASSed
+    // audit could never finish its own assignment, despite owning it
+    // directly and needing no coordinator override at all.
+    registry.statuses.set('tsk_a', 'implementing');
+    registry.assignmentStates.set('tsk_a', [
+      {
+        assignmentId: 'brain-coordinator', role: 'coordinator', status: 'delegated', leaseId: '',
+        identity: testIdentity('deck_cd_brain'),
+      },
+      {
+        assignmentId: 'brain-integration-owner', role: 'integration_owner', status: 'ready_for_integration',
+        leaseId: '', identity: testIdentity('deck_cd_brain'),
+      },
+    ]);
+    const brain = createSupervisionMcpToolHandlers(CALLER, {
+      registry, isProjectBrain: () => true, resolveSessionIdentity: testResolveSessionIdentity,
+    });
+    expect(await brain[SUPERVISION_MCP_TOOLS.INTENT]({
+      expectedRevision: 'fake-rev-a', intent: 'finish', taskId: 'tsk_a', assignmentId: 'brain-integration-owner',
+    })).toMatchObject({ status: 'ok' });
+    expect(registry.finished.at(-1)).toEqual({
+      expectedRevision: 'fake-rev-a',
+      assignmentId: 'brain-integration-owner', callerSessionName: 'deck_cd_brain', callerProjectName: 'codedeck',
+    });
+  });
 });
 
 describe('replacement implementer recovery through the real MCP server', () => {

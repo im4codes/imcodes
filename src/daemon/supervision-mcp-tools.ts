@@ -731,7 +731,18 @@ export function createSupervisionMcpToolHandlers(
           // to the production port made a successful handoff report
           // owner_mismatch when the child MCP omitted IMCODES_PROJECT_NAME.
           ...(authority.projectName ? { callerProjectName: authority.projectName } : {}),
-          ...(coordinatorMayAct ? { projectBrain: true } : {}),
+          // finishAssignmentAsProjectBrain exists for two cases ONLY: the
+          // coordinator closing an assignment it does not itself own (no
+          // callerBoundAssignmentId -- boundAssignmentId came from the
+          // coordinator fallback), or an explicit rebind. Its non-auditor
+          // branch unconditionally refuses role_forbidden unless a rebind was
+          // requested (state-store's #finishAssignmentAsProjectBrainLocked),
+          // so routing a coordinator's ordinary finish of ITS OWN
+          // non-auditor assignment (e.g. integration_owner) through here --
+          // which `coordinatorMayAct` alone cannot distinguish from the
+          // legitimate cases -- always failed even though the plain
+          // finishAssignment path below would have accepted it directly.
+          ...(coordinatorMayAct && (!callerBoundAssignmentId || rebind) ? { projectBrain: true } : {}),
           ...(rebind ? {
             rebindIdentity: {
               sessionName: rebind.sessionName,
