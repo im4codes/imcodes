@@ -490,6 +490,8 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       completion: 'status-only',
       cancellation: 'provider-cancel',
       reason: 'Verified with Claude Agent SDK 0.2.119 supportedCommands(): compact is a provider slash command, not an active RPC.',
+      // The session system text rides in the SDK `systemPrompt` option on every query, never in the compactable history.
+      reassertsSessionSystemText: true,
     },
   };
 

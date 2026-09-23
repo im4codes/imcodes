@@ -191,6 +191,8 @@ const KIMI_PROFILE: AcpCliProviderProfile = {
     completion: 'command-result',
     cancellation: 'provider-cancel',
     reason: 'Verified from MoonshotAI/kimi-cli source: `kimi acp` exposes the soul slash command registry, including /compact.',
+    // Clears its injected-system-text marker on every compaction (refreshSessionSystemText), so the next turn re-sends it.
+    reassertsSessionSystemText: true,
   },
 };
 

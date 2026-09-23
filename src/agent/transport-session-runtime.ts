@@ -20,6 +20,7 @@ import {
   SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
   SESSION_CONTROL_TIMELINE_STATE_COMPACTING,
   SESSION_CONTROL_METADATA_COMMAND_FIELD,
+  SESSION_COMPACT_COMMAND,
   isSessionCompactCommandText,
   shouldResetTransportPreferenceContextForSessionControl,
 } from '../../shared/session-control-commands.js';
@@ -515,6 +516,21 @@ function makeCancelledProviderError(): ProviderError {
  *
  * onStatusChange fires on every transition (deduplicated).
  */
+/**
+ * Automatic compaction threshold: share of the model's context window a
+ * finished turn may use before the runtime compacts. Codex's own auto-compact
+ * fired too late (a session sat degraded at 83% for days).
+ */
+export const TRANSPORT_AUTO_COMPACT_CONTEXT_RATIO = 0.7;
+
+/** `IMCODES_TRANSPORT_AUTO_COMPACT_RATIO` (0.05-0.95) overrides the ratio. */
+export function transportAutoCompactRatio(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number(env.IMCODES_TRANSPORT_AUTO_COMPACT_RATIO);
+  return Number.isFinite(raw) && raw >= 0.05 && raw <= 0.95 ? raw : TRANSPORT_AUTO_COMPACT_CONTEXT_RATIO;
+}
+/** At most one automatic compaction per session in this window. */
+export const TRANSPORT_AUTO_COMPACT_MIN_INTERVAL_MS = 10 * 60 * 1000;
+
 export class TransportSessionRuntime implements SessionRuntime {
   readonly type = RUNTIME_TYPES.TRANSPORT;
 
@@ -658,6 +674,10 @@ export class TransportSessionRuntime implements SessionRuntime {
   // Consecutive recoverable dispatch-failure count for the current run of
   // retries; reset to 0 on any provider activity / successful send.
   private _recoverableDispatchRetries = 0;
+  /** When this runtime last compacted on its own (see maybeAutoCompact). */
+  private _lastAutoCompactAt = 0;
+  /** The provider reported compacting during the current turn. */
+  private _compactionObservedInTurn = false;
   // Pending backoff timer for the next auto-retry drain. While set, the session
   // counts as having active turn work (so new sends queue in order behind the
   // message being retried) and presents an in-progress status, not idle.
@@ -793,21 +813,15 @@ export class TransportSessionRuntime implements SessionRuntime {
         if (!this._activeDispatchCancelled && this.hasActiveTurnWork()) {
           this.markSdkTurnLostRecoveredOnProviderActivity();
         }
-        if (isTransportCompactionCompletion(message)) {
-          this._lastInjectedPreferenceContextSignature = null;
-          this._lastInjectedSupervisionContractSignature = null;
-          // A provider compaction may replace the conversation prefix with a
-          // summary. Invalidate any adapter-side "already injected" marker so
-          // the next ordinary turn re-establishes the complete stable system
-          // text (including the merged user/project/session identity). Codex
-          // handles this by resuming the SAME thread with fresh
-          // baseInstructions; message-side adapters clear their own cache.
-          this.provider.refreshSessionSystemText?.(this._providerSessionId);
-          // Compaction discards the registered contract body, so the next turn
-          // must register it again rather than reference text that is gone.
-          this._brainContractRegisteredVariant = null;
-          this._registeredSystemContractSignatures.clear();
-        }
+        // Compaction is recognized three ways: the provider tagged the
+        // completion; the turn answered a `/compact` the runtime dispatched
+        // (Claude's slash command completes untagged); or the provider
+        // reported compacting during the turn (its own auto-compaction).
+        const compacted = isTransportCompactionCompletion(message)
+          || this.activeDispatchIsCompactCommand()
+          || this._compactionObservedInTurn;
+        this._compactionObservedInTurn = false;
+        if (compacted) this.reinjectAfterCompaction();
         this.clearStalePendingCancelFallbackTimer();
         this._sending = false;
         this._history.push(message);
@@ -843,6 +857,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         // If there are queued messages, merge and send — status stays running.
         if (!this._drainPending()) {
           this.setStatus('idle');
+          if (!compacted) this.maybeAutoCompact(message);
         }
       }),
       this.provider.onError((sid: string, error: ProviderError) => {
@@ -977,9 +992,13 @@ export class TransportSessionRuntime implements SessionRuntime {
         this._lastActivityAt = Date.now();
         this._onSessionInfoChange?.(info);
       })] : []),
-      ...(this.provider.onStatus ? [this.provider.onStatus((sid: string, _status: ProviderStatusUpdate) => {
+      ...(this.provider.onStatus ? [this.provider.onStatus((sid: string, status: ProviderStatusUpdate) => {
         if (sid !== this._providerSessionId) return;
         this._lastActivityAt = Date.now();
+        // Providers also compact on their own mid-turn (Claude's
+        // compact_boundary, Codex's inline auto-compaction). Remember it so the
+        // turn's completion re-injects what compaction may have summarized.
+        if (status?.status === 'compacting') this._compactionObservedInTurn = true;
       })] : []),
       ...(this.provider.onUsage ? [this.provider.onUsage((sid: string, _update: ProviderUsageUpdate) => {
         if (sid !== this._providerSessionId) return;
@@ -4110,6 +4129,70 @@ export class TransportSessionRuntime implements SessionRuntime {
    * Drain all pending messages into a single merged turn.
    * Called after onComplete/onError. Returns true if a new turn was started.
    */
+  private activeDispatchIsCompactCommand(): boolean {
+    return this._activeDispatchEntries.length > 0
+      && this._activeDispatchEntries.every((entry) => isSessionCompactCommandText(entry.text));
+  }
+
+  /**
+   * After any compaction the conversation prefix may be a summary. Everything
+   * IM.codes injects must come back whole on the next turn rather than survive
+   * as a paraphrase: the stable session system text (merged user/project/
+   * session identity, runtime instructions), preference context, and the
+   * bodies of registered system contracts that later messages reference by id.
+   */
+  private reinjectAfterCompaction(): void {
+    this._lastInjectedPreferenceContextSignature = null;
+    this._lastInjectedSupervisionContractSignature = null;
+    // Codex resumes the SAME thread with fresh baseInstructions; message-side
+    // adapters clear their "already injected" marker.
+    if (this._providerSessionId) this.provider.refreshSessionSystemText?.(this._providerSessionId);
+    this._brainContractRegisteredVariant = null;
+    this._registeredSystemContractSignatures.clear();
+  }
+
+  /**
+   * Compact a session whose context is nearly full, before the model degrades.
+   *
+   * Seen live: a Codex session at 214k of a 258k window stopped doing work --
+   * 0-2 tool calls per turn, then a one-line status and the turn ended -- and
+   * the provider's own auto-compaction had not fired. Checked only when a turn
+   * ends with nothing queued (the drain would merge a queued `/compact` into
+   * user text), and only for providers that compact natively AND re-send the
+   * complete session system text afterwards, so identity, runtime instructions
+   * and registered contracts are re-injected in full rather than summarized.
+   * Runs the exact `/compact` path a user would, including the post-compaction
+   * re-injection in the completion handler above.
+   */
+  private maybeAutoCompact(completed: AgentMessage): void {
+    const compact = this.provider.capabilities.compact;
+    if (compact?.execution === 'unsupported' || !compact?.verified || !compact.reassertsSessionSystemText) return;
+    if (this._status !== 'idle' || this._pendingMessages.length > 0) return;
+    const usage = completed.metadata?.usage as {
+      input_tokens?: number;
+      cache_read_input_tokens?: number;
+      cache_creation_input_tokens?: number;
+      model_context_window?: number;
+    } | undefined;
+    const window = usage?.model_context_window;
+    if (!usage || typeof window !== 'number' || !(window > 0)) return;
+    const used = (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0);
+    if (used < window * transportAutoCompactRatio()) return;
+    const now = Date.now();
+    // A compaction that could not bring usage down must not become a loop.
+    if (now - this._lastAutoCompactAt < TRANSPORT_AUTO_COMPACT_MIN_INTERVAL_MS) return;
+    this._lastAutoCompactAt = now;
+    logger.info(
+      { sessionKey: this.sessionKey, usedTokens: used, contextWindow: window },
+      'transport runtime auto-compacting a nearly full context',
+    );
+    try {
+      this.send(SESSION_COMPACT_COMMAND, `auto-compact:${randomUUID()}`, undefined, undefined, { timelineCommitted: true });
+    } catch (err) {
+      logger.warn({ err, sessionKey: this.sessionKey }, 'transport runtime auto-compaction could not start');
+    }
+  }
+
   private _drainPending(): boolean {
     if (this._pendingMessages.length === 0 || !this._providerSessionId) return false;
     // Durable rows can outlive the scheduler decision that created them. Re-run

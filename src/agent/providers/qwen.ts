@@ -636,6 +636,8 @@ export class QwenProvider implements TransportProvider {
       completion: 'command-result',
       cancellation: 'provider-cancel',
       reason: 'Verified with Qwen Code 0.14.5: non-interactive CLI supports /compress, not /compact; adapter translates the IM.codes /compact control command.',
+      // Clears its injected-system-text marker on every compaction (refreshSessionSystemText), so the next turn re-sends it.
+      reassertsSessionSystemText: true,
     },
   };
 
@@ -867,6 +869,13 @@ export class QwenProvider implements TransportProvider {
     if (!state) return;
     state.effort = effort;
     await this.ensureSettingsPath(state);
+  }
+
+  /** After any compaction the next turn carries the session system text again. */
+  refreshSessionSystemText(sessionId: string): void {
+    const state = this.sessions.get(sessionId);
+    if (!state) return;
+    state.sessionSystemTextInjected = undefined;
   }
 
   async send(

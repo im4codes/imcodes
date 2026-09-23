@@ -199,6 +199,13 @@ export interface ProviderCompactCapability {
   cancellation: ProviderCompactCancellation;
   /** Human-readable reason for unsupported or unverified behavior. */
   reason?: string;
+  /**
+   * After a compaction the provider re-sends the complete session system text
+   * (merged user/project/session identity, runtime instructions) outside the
+   * compacted history, so no summary can drop or paraphrase it. Required before
+   * the daemon compacts a session on its own (automatic compaction).
+   */
+  reassertsSessionSystemText?: boolean;
 }
 
 /**

@@ -1,3 +1,4 @@
+import { isSessionControlCommandText } from '../../shared/session-control-commands.js';
 import { createHash } from 'node:crypto';
 import { createSendDispatchId, createSendMessageId, type SendDispatchId, type SendMessageId } from '../../shared/send-message-id.js';
 import { attachDaemonUserNotice, DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
@@ -191,6 +192,19 @@ export async function dispatchSessionMessage(
   options: SessionDispatchMessageOptions,
 ): Promise<SessionDispatchMessageResult> {
   if ((target.runtimeType ?? getSessionRuntimeType(target.agentType)) === 'transport') {
+    // `/clear` is daemon-managed: a fresh provider conversation, exactly as
+    // from the browser. Handing it to runtime.send made it ordinary model text
+    // and left the whole context in place.
+    if (isSessionControlCommandText(message.trim(), 'clear')) {
+      const { clearTransportConversation, supportsTransportClear } = await import('./command-handler.js');
+      if (supportsTransportClear(target.agentType)) {
+        if (!options.suppressTimeline) {
+          emitStructuredTransportUserMessage(target.name, message, options.messageId, options.sharedActor);
+        }
+        await clearTransportConversation(target);
+        return 'sent';
+      }
+    }
     const runtime = getTransportRuntime(target.name);
     if (options.durableQueue) {
       const queued = enqueueResend(target.name, {

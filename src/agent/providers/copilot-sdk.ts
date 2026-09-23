@@ -317,6 +317,8 @@ export class CopilotSdkProvider implements TransportProvider {
       verified: true,
       completion: 'rpc-result-or-provider-event',
       cancellation: 'provider-cancel',
+      // Clears its injected-system-text marker on every compaction (refreshSessionSystemText), so the next turn re-sends it.
+      reassertsSessionSystemText: true,
     },
   };
 
@@ -637,6 +639,14 @@ export class CopilotSdkProvider implements TransportProvider {
     }).catch((error) => {
       logger.warn({ err: error, provider: this.id, sessionId: state.routeId }, 'Failed to update Copilot session effort');
     });
+  }
+
+  /** After any compaction the next turn carries the session system text again. */
+  refreshSessionSystemText(sessionId: string): void {
+    const state = this.getSessionState(sessionId);
+    if (!state) return;
+    state.sessionSystemTextInjected = undefined;
+    state.sessionSystemTextPending = undefined;
   }
 
   async send(sessionId: string, payloadOrMessage: string | ProviderContextPayload, attachments?: TransportAttachment[], extraSystemPrompt?: string): Promise<void> {

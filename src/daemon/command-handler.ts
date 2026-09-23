@@ -1025,7 +1025,8 @@ function supportsEffort(agentType: string | undefined): agentType is 'claude-cod
     || agentType === 'qwen';
 }
 
-function supportsTransportClear(agentType: string | undefined): boolean {
+/** Does this transport agent start a fresh conversation for `/clear`? */
+export function supportsTransportClear(agentType: string | undefined): boolean {
   return agentType === 'claude-code-sdk'
     || agentType === 'codex-sdk'
     || agentType === 'copilot-sdk'
@@ -1050,6 +1051,37 @@ function supportsTransportClear(agentType: string | undefined): boolean {
 
 function supportsProcessClear(agentType: string | undefined): agentType is 'claude-code' | 'codex' | 'opencode' {
   return agentType === 'claude-code' || agentType === 'codex' || agentType === 'opencode';
+}
+
+/**
+ * `/clear` for a transport session: a fresh provider conversation. Shared by the
+ * browser send path and daemon-side delivery (agent sends, cron, supervision),
+ * which used to hand "/clear" to the model as ordinary text -- the context was
+ * never cleared (seen live: a Codex session kept its 214k-token context).
+ * `serverLink` only pushes the refreshed session list to browsers now; without
+ * it the change still persists and reaches them through the normal sync.
+ */
+export async function clearTransportConversation(record: SessionRecord, serverLink?: ServerLink): Promise<void> {
+  const sessionName = record.name;
+  // Fresh conversation must not replay stale queued messages from the prior
+  // offline window — drop anything we had buffered for resend.
+  clearResend(sessionName);
+  await runExclusiveSessionRelaunch(sessionName, async () => {
+    await relaunchFreshTransportConversation(record);
+  });
+  // Reset per-session memory injection history — fresh conversation should be
+  // allowed to re-inject previously-shown memories again.
+  clearRecentInjectionHistory(sessionName);
+  clearSummarySyncHistory(sessionName);
+  if (serverLink) {
+    await handleGetSessions(serverLink);
+    await syncSubSessionIfNeeded(sessionName, serverLink);
+  }
+  timelineEmitter.emit(sessionName, 'assistant.text', {
+    ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_STARTED, 'Started a fresh conversation'),
+    streaming: false,
+    memoryExcluded: true,
+  }, { source: 'daemon', confidence: 'high' });
 }
 
 async function relaunchFreshTransportConversation(record: SessionRecord): Promise<void> {
@@ -4744,24 +4776,8 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   if (transportRuntime) {
     if (isSessionControlCommandText(trimmedText, 'clear') && supportsTransportClear(record?.agentType)) {
       emitTransportUserMessage(text);
-      // Fresh conversation must not replay stale queued messages from the prior
-      // offline window — drop anything we had buffered for resend.
-      clearResend(sessionName);
       try {
-        await runExclusiveSessionRelaunch(sessionName, async () => {
-          await relaunchFreshTransportConversation(record);
-        });
-        // Reset per-session memory injection history — fresh conversation
-        // should be allowed to re-inject previously-shown memories again.
-        clearRecentInjectionHistory(sessionName);
-        clearSummarySyncHistory(sessionName);
-        await handleGetSessions(serverLink);
-        await syncSubSessionIfNeeded(sessionName, serverLink);
-        timelineEmitter.emit(sessionName, 'assistant.text', {
-          ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_STARTED, 'Started a fresh conversation'),
-          streaming: false,
-          memoryExcluded: true,
-        }, { source: 'daemon', confidence: 'high' });
+        await clearTransportConversation(record!, serverLink);
         const clearStatus = isLegacy ? 'accepted_legacy' : 'accepted';
         timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: clearStatus });
         emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: clearStatus });

@@ -2643,6 +2643,10 @@ export class CodexSdkProvider implements TransportProvider {
       verified: true,
       completion: 'provider-event',
       cancellation: 'local-cancel',
+      // Identity lives in baseInstructions (never part of compacted history)
+      // and every compaction completion forces thread/resume with freshly
+      // assembled baseInstructions (refreshSessionSystemText).
+      reassertsSessionSystemText: true,
     },
   };
 
@@ -3942,6 +3946,14 @@ export class CodexSdkProvider implements TransportProvider {
       baseInstructions,
     });
     const resumedId = result?.thread?.id ?? state.threadId;
+    // One line per resume, so "was the identity re-sent after compaction?"
+    // is answerable from the log on any machine.
+    logger.info({
+      sessionId,
+      threadId: resumedId,
+      baseInstructionsChars: baseInstructions.length,
+      imcodesSystemTextIncluded: baseInstructions.includes(IMCODES_CODEX_BASE_INSTRUCTIONS_MARKER),
+    }, 'codex-sdk: thread resumed with baseInstructions');
     state.threadId = resumedId;
     state.loaded = true;
     this.threadToSession.set(resumedId, sessionId);

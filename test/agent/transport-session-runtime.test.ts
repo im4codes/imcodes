@@ -87,6 +87,115 @@ describe('TransportSessionRuntime memory provenance', () => {
     resetContextStoreClientForTests();
   });
 
+  describe('automatic compaction', () => {
+    const turnDone = (id: string, used: number, window = 258_400): AgentMessage => ({
+      id,
+      sessionId: 'provider-session-1',
+      kind: 'text',
+      role: 'assistant',
+      content: 'done',
+      timestamp: Date.now(),
+      status: 'complete',
+      metadata: { usage: { input_tokens: 2_000, cache_read_input_tokens: used - 2_000, output_tokens: 30, model_context_window: window } },
+    });
+    const sentTexts = (provider: TransportProvider): string[] => (provider.send as ReturnType<typeof vi.fn>).mock.calls
+      .map((call) => JSON.stringify(call[1]));
+
+    async function setup(reasserts: boolean | undefined) {
+      let complete: ((sessionId: string, message: AgentMessage) => void) | undefined;
+      const provider = makeProvider();
+      provider.capabilities.compact = {
+        execution: 'sdk-rpc',
+        verified: true,
+        completion: 'provider-event',
+        cancellation: 'local-cancel',
+        ...(reasserts === undefined ? {} : { reassertsSessionSystemText: reasserts }),
+      };
+      provider.refreshSessionSystemText = vi.fn();
+      provider.onComplete = (callback) => {
+        complete = callback;
+        return () => undefined;
+      };
+      provider.onStatus = (callback) => {
+        (provider as unknown as { __status?: typeof callback }).__status = callback;
+        return () => undefined;
+      };
+      const runtime = new TransportSessionRuntime(provider, 'deck_auto_compact');
+      await runtime.initialize({ sessionKey: 'deck_auto_compact', identityPrompt: 'identity survives compaction' });
+      return { provider, runtime, complete: (m: AgentMessage) => complete?.('provider-session-1', m) };
+    }
+
+    it('compacts a nearly full context once the turn ends, through the /compact path', async () => {
+      const { provider, runtime, complete } = await setup(true);
+      runtime.send('keep going', 'work-1');
+      await waitForProviderSend(provider);
+      complete(turnDone('turn-1', 214_355));
+      await vi.waitFor(() => expect(sentTexts(provider)).toHaveLength(2));
+      expect(sentTexts(provider)[1]).toContain('/compact');
+
+      // The compaction completion re-injects the identity on the next turn.
+      complete({
+        id: 'compact-done', sessionId: 'provider-session-1', kind: 'system', role: 'system',
+        content: 'Codex context compacted.', timestamp: Date.now(), status: 'complete',
+        metadata: { [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact' },
+      });
+      expect(provider.refreshSessionSystemText).toHaveBeenCalledWith('provider-session-1');
+
+      // Still high after a compaction that did not help: no loop.
+      runtime.send('next', 'work-2');
+      await vi.waitFor(() => expect(sentTexts(provider)).toHaveLength(3));
+      complete(turnDone('turn-2', 214_000));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(sentTexts(provider)).toHaveLength(3);
+    });
+
+    it('re-injects after an untagged /compact completion, as Claude\'s slash command gives', async () => {
+      const { provider, runtime, complete } = await setup(true);
+      runtime.send('/compact', 'compact-1');
+      await waitForProviderSend(provider);
+      complete({ ...turnDone('compact-1-done', 40_000), metadata: {} });
+      expect(provider.refreshSessionSystemText).toHaveBeenCalledWith('provider-session-1');
+    });
+
+    it('re-injects after a compaction the provider did on its own mid-turn', async () => {
+      const { provider, runtime, complete } = await setup(true);
+      runtime.send('long task', 'work-1');
+      await waitForProviderSend(provider);
+      expect(provider.refreshSessionSystemText).not.toHaveBeenCalled();
+      (provider as unknown as { __status?: (sid: string, update: ProviderStatusUpdate) => void }).__status?.('provider-session-1', { status: 'compacting' });
+      complete(turnDone('turn-1', 60_000));
+      expect(provider.refreshSessionSystemText).toHaveBeenCalledWith('provider-session-1');
+    });
+
+    it('leaves a context below the threshold alone', async () => {
+      const { provider, runtime, complete } = await setup(true);
+      runtime.send('keep going', 'work-1');
+      await waitForProviderSend(provider);
+      complete(turnDone('turn-1', 120_000));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(sentTexts(provider)).toHaveLength(1);
+    });
+
+    it('auto-compacts a slash-command provider that keeps its identity outside the history', async () => {
+      const { provider, runtime, complete } = await setup(true);
+      provider.capabilities.compact = { ...provider.capabilities.compact!, execution: 'slash-command', providerCommand: '/compact' };
+      runtime.send('keep going', 'work-1');
+      await waitForProviderSend(provider);
+      complete(turnDone('turn-1', 190_000, 200_000));
+      await vi.waitFor(() => expect(sentTexts(provider)).toHaveLength(2));
+      expect(sentTexts(provider)[1]).toContain('/compact');
+    });
+
+    it('never compacts on its own a provider that does not re-send the identity afterwards', async () => {
+      const { provider, runtime, complete } = await setup(undefined);
+      runtime.send('keep going', 'work-1');
+      await waitForProviderSend(provider);
+      complete(turnDone('turn-1', 250_000));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(sentTexts(provider)).toHaveLength(1);
+    });
+  });
+
   it('invalidates provider-stable system text after a compact completion', async () => {
     let complete: ((sessionId: string, message: AgentMessage) => void) | undefined;
     const provider = makeProvider();
