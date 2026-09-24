@@ -43,6 +43,8 @@ import type { ContextNamespace } from '../../shared/context-types.js';
 import {
   MEMORY_MCP_SEND_DELIVERY_MODES,
   MEMORY_MCP_SESSION_RESTART_HOOK_PATH,
+  MEMORY_MCP_SESSION_MODEL_LIST_HOOK_PATH,
+  MEMORY_MCP_SESSION_MODEL_SET_HOOK_PATH,
   MEMORY_MCP_TOOL_NAMES,
 } from '../../shared/memory-mcp-contracts.js';
 import { MEMORY_MCP_ENV_KEYS } from '../../shared/memory-mcp-env.js';
@@ -576,6 +578,18 @@ export function mergeDefaultToolDeps(
         reset: restartOptions.reset,
       }, MEMORY_MCP_SESSION_RESTART_HOOK_PATH, caller.sessionName);
       return response.accepted === true;
+    }),
+    listSessionModels: toolDeps.listSessionModels ?? (async (target) => {
+      const port = await resolveHookPort();
+      if (!port) throw new Error('daemon model control is unavailable');
+      if (!caller.sessionName) throw new Error('session_model requires a scoped caller');
+      return postHookSend(port, { from: caller.sessionName, to: target }, MEMORY_MCP_SESSION_MODEL_LIST_HOOK_PATH, caller.sessionName);
+    }),
+    setSessionModel: toolDeps.setSessionModel ?? (async (target, model) => {
+      const port = await resolveHookPort();
+      if (!port) throw new Error('daemon model control is unavailable');
+      if (!caller.sessionName) throw new Error('session_model requires a scoped caller');
+      return postHookSend(port, { from: caller.sessionName, to: target, model }, MEMORY_MCP_SESSION_MODEL_SET_HOOK_PATH, caller.sessionName);
     }),
     // FULL-node machine tools relay through the daemon's own bound credential.
     // An injected override (tests) wins; otherwise the daemon default is used.

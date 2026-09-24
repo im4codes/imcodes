@@ -54,6 +54,8 @@ import { isMemoryScope, validateMemoryScopeIdentity } from '../../shared/memory-
 import type { ContextNamespace } from '../../shared/context-types.js';
 import {
   MEMORY_MCP_SESSION_RESTART_HOOK_PATH,
+  MEMORY_MCP_SESSION_MODEL_LIST_HOOK_PATH,
+  MEMORY_MCP_SESSION_MODEL_SET_HOOK_PATH,
   MEMORY_MCP_SEND_DELIVERY_MODES,
   type MemoryMcpSendDeliveryMode,
 } from '../../shared/memory-mcp-contracts.js';
@@ -772,6 +774,9 @@ export interface HookServerOptions {
   memoryMcpServerId?: string;
   /** Test seam; production schedules the command-handler's exclusive relaunch. */
   restartSession?: (sessionName: string, options: { reset: boolean }) => Promise<boolean> | boolean;
+  /** Test seams for the session model MCP tools. */
+  listSessionModels?: (sessionName: string) => Promise<import('../../shared/session-model-control.js').SessionModelListResult>;
+  switchSessionModel?: (sessionName: string, model: string) => Promise<import('../../shared/session-model-control.js').SessionModelSwitchResult>;
 }
 
 async function invokeDaemonMemoryMcpTool(
@@ -1112,6 +1117,61 @@ export async function startHookServer(
           res.writeHead(400);
           res.end(JSON.stringify({ ok: false, error: 'bad request' }));
         }
+      }
+      return;
+    }
+
+    if (url === MEMORY_MCP_SESSION_MODEL_LIST_HOOK_PATH || url === MEMORY_MCP_SESSION_MODEL_SET_HOOK_PATH) {
+      // Model control by exact session name. By request there is no ownership
+      // or project check: any live session may list or switch any session's
+      // model. The caller must still be an authenticated session (who asked is
+      // logged), and the target must exist on this daemon.
+      const contentType = req.headers['content-type'] ?? '';
+      if (!contentType.includes('application/json')) {
+        res.writeHead(415, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Content-Type must be application/json' }));
+        return;
+      }
+      try {
+        const body = JSON.parse(await readBody(req, 4096)) as Record<string, unknown>;
+        const senderHeader = req.headers['x-imcodes-session'];
+        const authenticatedSender = Array.isArray(senderHeader) ? senderHeader[0] : senderHeader;
+        const from = typeof body.from === 'string' ? body.from.trim() : '';
+        const to = typeof body.to === 'string' ? body.to.trim() : '';
+        const model = typeof body.model === 'string' ? body.model.trim() : '';
+        const isSet = url === MEMORY_MCP_SESSION_MODEL_SET_HOOK_PATH;
+        if (!from || !to || authenticatedSender !== from || (isSet && !model)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'invalid session model request' }));
+          return;
+        }
+        const callerRecord = getSession(from);
+        if (!callerRecord || callerRecord.state === 'stopped') {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'session model caller identity is unavailable' }));
+          return;
+        }
+        if (isSet && !checkRateLimit(from)) {
+          res.writeHead(429, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'rate limit exceeded' }));
+          return;
+        }
+        if (isSet) recordSend(from);
+        const { listSessionModelsNow, switchSessionModelNow } = await import('./command-handler.js');
+        const result = isSet
+          ? await (options.switchSessionModel ?? switchSessionModelNow)(to, model)
+          : await (options.listSessionModels ?? listSessionModelsNow)(to);
+        if (isSet) logger.info({ caller: from, target: to, model, ok: result.ok }, 'MCP session model switch');
+        const { ok, ...rest } = result;
+        const payload = ok
+          ? { status: 'ok', ...rest }
+          : { status: 'error', reason: (rest as { code?: string }).code, ...rest };
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(payload));
+      } catch (err) {
+        const status = (err as Error).message === 'body too large' ? 413 : 400;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: status === 413 ? 'request body too large' : 'bad request' }));
       }
       return;
     }

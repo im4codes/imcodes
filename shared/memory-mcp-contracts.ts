@@ -105,6 +105,7 @@ export const MEMORY_MCP_TOOL_NAMES = {
   SEND_LIST_TARGETS: 'send_list_targets',
   SESSION_RUNTIME_IDENTITY_GET: 'session_runtime_identity_get',
   SESSION_RESTART: 'session_restart',
+  SESSION_MODEL: 'session_model',
   SEND_MESSAGE: 'send_message',
   SUPERVISION_TASK_START: 'supervision_task_start',
   SUPERVISION_TASK_UPDATE: 'supervision_task_update',
@@ -158,6 +159,7 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
   MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET,
   MEMORY_MCP_TOOL_NAMES.SESSION_RESTART,
+  MEMORY_MCP_TOOL_NAMES.SESSION_MODEL,
   MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
   MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START,
   MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_UPDATE,
@@ -246,6 +248,9 @@ export const MEMORY_MCP_CAPS = {
 
 /** Local daemon ingress used by the stdio MCP child for exact-session restart. */
 export const MEMORY_MCP_SESSION_RESTART_HOOK_PATH = '/session/restart' as const;
+/** Local daemon ingress for the model tools (list / switch by exact session name). */
+export const MEMORY_MCP_SESSION_MODEL_LIST_HOOK_PATH = '/session/models' as const;
+export const MEMORY_MCP_SESSION_MODEL_SET_HOOK_PATH = '/session/model' as const;
 
 export const MEMORY_MCP_DISABLED_FLAGS = {
   MEMORY_SURFACE: MCP_FEATURE_FLAGS_BY_NAME.memorySurface,
@@ -673,6 +678,15 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       reset: booleanSchema('True for start-over.'),
       scheduled: booleanSchema('True when accepted.'),
     }, ['status', 'target', 'reset', 'scheduled']),
+  },
+  [MEMORY_MCP_TOOL_NAMES.SESSION_MODEL]: {
+    name: MEMORY_MCP_TOOL_NAMES.SESSION_MODEL,
+    description: 'Exact session model: omit model to list current and switchable models; set model to switch now.',
+    inputSchema: objectSchema({
+      target: stringSchema('Exact session name; default caller.'),
+      model: stringSchema('Model id to switch to.'),
+    }),
+    outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,

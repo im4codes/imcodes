@@ -377,6 +377,9 @@ export interface MemoryMcpToolDeps {
     target: SessionRecord,
     options: { reset: boolean },
   ) => Promise<boolean> | boolean;
+  /** Daemon-owned model control by exact session name (no ownership check). */
+  listSessionModels?: (target: string) => Promise<Record<string, unknown>>;
+  setSessionModel?: (target: string, model: string) => Promise<Record<string, unknown>>;
   peerAuditReply?: (envelope: PeerAuditReplyEnvelope) => Promise<Record<string, unknown>> | Record<string, unknown>;
   inspectSupervisionWorktree?: typeof inspectSupervisionAssignmentWorktree;
   supervisionTaskRegistry?: SupervisionTaskRegistry;
@@ -2175,6 +2178,19 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, sanitizeMcpErrorMessage(restartError));
       }
     },
+    [MEMORY_MCP_TOOL_NAMES.SESSION_MODEL]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['target', 'model']);
+      const target = stringArg(args, 'target')?.trim() || caller.sessionName;
+      const model = stringArg(args, 'model')?.trim();
+      if (!target) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'target is required');
+      const control = model ? deps.setSessionModel : deps.listSessionModels;
+      if (!control) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'daemon model control is unavailable');
+      try {
+        return model ? await deps.setSessionModel!(target, model) : await deps.listSessionModels!(target);
+      } catch (controlError) {
+        return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, sanitizeMcpErrorMessage(controlError));
+      }
+    },
     [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_LIST]: async (input) => {
       const args = pickAllowedMcpArgs(input, ['includeDisabled']);
       const scoped = scopedCallerForDeps(caller, deps);
@@ -3575,6 +3591,10 @@ const schemas = {
   [MEMORY_MCP_TOOL_NAMES.SESSION_RESTART]: z.object({
     target: z.string().trim().min(1).describe('Exact session name.'),
     reset: z.boolean().optional().describe('False/omitted: resume. True: start over.'),
+  }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.SESSION_MODEL]: z.object({
+    target: z.string().trim().min(1).optional().describe('Exact session name; default caller.'),
+    model: z.string().trim().min(1).max(200).optional().describe('Model id to switch to.'),
   }).strict(),
   [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_LIST]: z.object({
     includeDisabled: z.boolean().optional(),

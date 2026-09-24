@@ -7,6 +7,13 @@ import { AGENT_MCP_MSG } from '../../shared/agent-mcp.js';
 import type { CronRunTimelineProjection } from '../../shared/cron-types.js';
 import { handleAgentMcpCommand } from './agent-mcp.js';
 import { handleAgentSkillsCommand } from './agent-skills.js';
+import {
+  SESSION_MODEL_APPLIED,
+  SESSION_MODEL_CONTROL_ERROR,
+  type SessionModelControlError,
+  type SessionModelListResult,
+  type SessionModelSwitchResult,
+} from '../../shared/session-model-control.js';
 import { startProject, stopProject, teardownProject, getTransportRuntime, launchTransportSession, isProviderSessionBound, persistSessionRecord, relaunchSessionWithSettings, stopTransportRuntimeSession, type ProjectConfig } from '../agent/session-manager.js';
 import { buildTransportResumeLaunchOpts } from '../agent/transport-resume-opts.js';
 import { isTransportAgent, type AgentType } from '../agent/detect.js';
@@ -192,6 +199,7 @@ import {
   fingerprintRecentSummary,
 } from '../context/summary-sync.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, normalizeClaudeCodeModelId } from '../shared/models/options.js';
+import type { TransportSessionRuntime } from '../agent/transport-session-runtime.js';
 import { getClaudeSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from '../agent/sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
 import { mergeCodexDisplayMetadata } from '../agent/codex-display.js';
@@ -2596,6 +2604,338 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
  * preserving restart. The exact-name lookup guarantees this can never create
  * a previously unknown main or sub-session.
  */
+/** Agent types whose model switches in place on a live transport runtime. */
+function isGenericModelSwitchAgent(agentType: string | undefined): boolean {
+  return agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'opencode-sdk'
+    || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID
+    || agentType === 'grok-sdk' || agentType === 'deepseek-harness' || agentType === 'pi'
+    || isCodeBuddyProviderId(agentType);
+}
+
+function isModelSwitchAgent(agentType: string | undefined): boolean {
+  return agentType === 'qwen' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk'
+    || agentType === 'qoder-sdk' || isGenericModelSwitchAgent(agentType);
+}
+
+function emitModelSwitchRefusal(sessionName: string, code: typeof DAEMON_USER_NOTICE_CODE[keyof typeof DAEMON_USER_NOTICE_CODE], text: string, model: string, detail?: string): void {
+  timelineEmitter.emit(sessionName, 'assistant.text', {
+    ...attachDaemonUserNotice(code, text, { model, ...(detail ? { detail } : {}) }),
+    streaming: false,
+    memoryExcluded: true,
+  }, { source: 'daemon', confidence: 'high' });
+}
+
+/**
+ * The models `/model` / `session_model` accept for a session whose provider
+ * validates ids -- one source for both the check and the listing, so the list
+ * never offers what the switch refuses. `null` for providers that take any id.
+ */
+async function resolveValidatedModelList(record: SessionRecord): Promise<{ models: string[]; qwenRuntime?: Awaited<ReturnType<typeof getQwenRuntimeConfig>> | null } | null> {
+  switch (record.agentType) {
+    case 'qwen': {
+      const qwenRuntime = await getQwenRuntimeConfig(true).catch(() => null);
+      // Priority: session list (may include preset models) > runtime > built-in.
+      const sessionModels = record.qwenAvailableModels ?? [];
+      const runtimeModels = qwenRuntime?.availableModels ?? [];
+      const models = sessionModels.length ? sessionModels : (runtimeModels.length ? runtimeModels : [...QWEN_MODEL_IDS]);
+      return { models: [...models], qwenRuntime };
+    }
+    case 'claude-code-sdk': {
+      if (!record.ccPreset) return { models: [...CLAUDE_CODE_MODEL_IDS] };
+      const { getPreset, getPresetAvailableModelIds } = await import('./cc-presets.js');
+      const preset = await getPreset(record.ccPreset);
+      return { models: preset ? getPresetAvailableModelIds(preset) : [] };
+    }
+    case 'codex-sdk': {
+      const sdkRuntime = await getCodexRuntimeConfig(true).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig);
+      const models = sdkRuntime.availableModels?.length
+        ? sdkRuntime.availableModels
+        : record.codexAvailableModels?.length ? record.codexAvailableModels : [...CODEX_MODEL_IDS];
+      return { models: [...models] };
+    }
+    case 'grok-sdk': {
+      const grokModels = await getProvider('grok-sdk')?.listModels?.().catch(() => ({ models: [] }));
+      return { models: grokModels?.models.map((model) => model.id) ?? [] };
+    }
+    default:
+      return null;
+  }
+}
+
+/**
+ * Switch a live transport session's model. The single implementation behind
+ * both `/model X` from the browser and the `session_model_set` MCP tool.
+ * Validates against the same per-agent model sources, applies it to the
+ * runtime, persists the record and posts the switched/refused notice into the
+ * session's own timeline. The caller owns the per-session mutex and acks.
+ */
+async function applyTransportModelSwitch(
+  record: SessionRecord,
+  /** Absent for an idle session not loaded yet: the stored model applies at its next start. */
+  transportRuntime: TransportSessionRuntime | undefined,
+  requestedModel: string,
+  serverLink?: ServerLink,
+): Promise<SessionModelSwitchResult> {
+  const sessionName = record.name;
+  const agentType = record.agentType;
+  const previousModel = record.activeModel ?? record.requestedModel;
+  const refuse = (
+    code: SessionModelControlError,
+    error: string,
+    noticeCode: typeof DAEMON_USER_NOTICE_CODE[keyof typeof DAEMON_USER_NOTICE_CODE],
+    availableModels?: readonly string[],
+    detail?: string,
+  ): SessionModelSwitchResult => {
+    emitModelSwitchRefusal(sessionName, noticeCode, `⚠️ ${error}`, requestedModel, detail);
+    return { ok: false, sessionName, code, error, ...(availableModels?.length ? { availableModels: [...availableModels] } : {}) };
+  };
+  let nextRecord: SessionRecord;
+  let contextWindow: number | undefined;
+
+  const validated = await resolveValidatedModelList(record);
+  if (agentType === 'qwen') {
+    const runtimeConfig = validated?.qwenRuntime ?? null;
+    const sessionModels = record.qwenAvailableModels ?? [];
+    const runtimeModels = runtimeConfig?.availableModels ?? [];
+    const allowedModels = validated?.models ?? [];
+    const qwenAuthType = runtimeConfig?.authType ?? record.qwenAuthType;
+    if (!allowedModels.includes(requestedModel)) {
+      const authHint = qwenAuthType === 'qwen-oauth' ? ' (current tier only allows coder-model)' : '';
+      return refuse(
+        SESSION_MODEL_CONTROL_ERROR.UNKNOWN_MODEL,
+        `Unknown Qwen model: ${requestedModel}${authHint}`,
+        DAEMON_USER_NOTICE_CODE.UNKNOWN_MODEL,
+        allowedModels,
+        authHint ? authHint.trim().replace(/^\(|\)$/g, '') : undefined,
+      );
+    }
+    transportRuntime?.setAgentId(requestedModel);
+    // Merge runtime models INTO the session's list (union) so preset models
+    // survive future switches. Never overwrite with only runtime models.
+    const mergedAvailableModels = [...new Set([...sessionModels, ...runtimeModels])];
+    nextRecord = {
+      ...record,
+      requestedModel,
+      activeModel: requestedModel,
+      modelDisplay: requestedModel,
+      qwenModel: requestedModel,
+      ...(qwenAuthType ? { qwenAuthType } : {}),
+      ...(runtimeConfig?.authLimit ? { qwenAuthLimit: runtimeConfig.authLimit } : {}),
+      ...(mergedAvailableModels.length ? { qwenAvailableModels: mergedAvailableModels } : {}),
+      ...getQwenDisplayMetadata({
+        model: requestedModel,
+        authType: qwenAuthType,
+        authLimit: runtimeConfig?.authLimit ?? record.qwenAuthLimit,
+        quotaUsageLabel: qwenAuthType === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined,
+      }),
+      updatedAt: Date.now(),
+    };
+    contextWindow = resolveContextWindow(undefined, requestedModel);
+  } else if (agentType === 'claude-code-sdk') {
+    let presetContextWindow = record.presetContextWindow;
+    let selectedModel: string | undefined;
+    const presetModels = validated?.models ?? [];
+    if (record.ccPreset) {
+      const { getPresetTransportOverrides } = await import('./cc-presets.js');
+      selectedModel = presetModels.find((model) => model === requestedModel);
+      if (selectedModel) {
+        const presetOverrides = await getPresetTransportOverrides(record.ccPreset, selectedModel);
+        presetContextWindow = presetOverrides.contextWindow ?? presetContextWindow;
+        transportRuntime?.setSystemPrompt(presetOverrides.systemPrompt ?? '');
+      }
+    } else {
+      selectedModel = normalizeClaudeCodeModelId(requestedModel);
+    }
+    if (!selectedModel) {
+      return refuse(
+        SESSION_MODEL_CONTROL_ERROR.UNKNOWN_MODEL,
+        `Unknown Claude model: ${requestedModel}`,
+        DAEMON_USER_NOTICE_CODE.UNKNOWN_MODEL,
+        presetModels,
+      );
+    }
+    transportRuntime?.setAgentId(normalizeClaudeSdkModelForProvider(selectedModel));
+    const sdkDisplay = await getClaudeSdkRuntimeConfig(true).catch(() => ({}) as import('../agent/sdk-runtime-config.js').SdkRuntimeConfig);
+    nextRecord = {
+      ...record,
+      requestedModel: selectedModel,
+      activeModel: selectedModel,
+      modelDisplay: selectedModel,
+      ...(sdkDisplay.planLabel ? { planLabel: sdkDisplay.planLabel } : {}),
+      updatedAt: Date.now(),
+    };
+    requestedModel = selectedModel;
+    contextWindow = resolveContextWindow(presetContextWindow, selectedModel);
+  } else if (agentType === 'codex-sdk') {
+    const sdkRuntime = await getCodexRuntimeConfig(true).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig);
+    const sdkDisplay = mergeCodexDisplayMetadata(sdkRuntime, record);
+    const availableModels = validated?.models ?? [];
+    if (!availableModels.includes(requestedModel)) {
+      return refuse(
+        SESSION_MODEL_CONTROL_ERROR.UNKNOWN_MODEL,
+        `Unknown Codex model: ${requestedModel}`,
+        DAEMON_USER_NOTICE_CODE.UNKNOWN_MODEL,
+        availableModels,
+      );
+    }
+    transportRuntime?.setAgentId(requestedModel);
+    nextRecord = {
+      ...record,
+      requestedModel,
+      activeModel: requestedModel,
+      modelDisplay: requestedModel,
+      ...(availableModels.length ? { codexAvailableModels: availableModels } : {}),
+      ...sdkDisplay,
+      updatedAt: Date.now(),
+    };
+    contextWindow = resolveContextWindow(undefined, requestedModel);
+  } else if (agentType === 'qoder-sdk') {
+    return refuse(
+      SESSION_MODEL_CONTROL_ERROR.PROOF_GATED,
+      `Qoder model switching is proof-gated in IM.codes v1: ${requestedModel}`,
+      DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PROOF_GATED,
+    );
+  } else if (isGenericModelSwitchAgent(agentType)) {
+    if (agentType === 'grok-sdk') {
+      const availableModels = validated?.models ?? [];
+      if (!availableModels.includes(requestedModel)) {
+        return refuse(
+          SESSION_MODEL_CONTROL_ERROR.UNKNOWN_MODEL,
+          `Unknown Grok model: ${requestedModel}`,
+          DAEMON_USER_NOTICE_CODE.UNKNOWN_MODEL,
+          availableModels,
+        );
+      }
+    }
+    transportRuntime?.setAgentId(requestedModel);
+    nextRecord = {
+      ...record,
+      requestedModel,
+      activeModel: requestedModel,
+      modelDisplay: requestedModel,
+      updatedAt: Date.now(),
+    };
+    contextWindow = resolveContextWindow(undefined, requestedModel);
+  } else {
+    return {
+      ok: false,
+      sessionName,
+      code: SESSION_MODEL_CONTROL_ERROR.UNSUPPORTED_AGENT,
+      error: `Model switching is not available for ${agentType ?? 'this session'}`,
+    };
+  }
+
+  upsertSession(nextRecord);
+  persistSessionRecord(nextRecord, sessionName);
+  if (serverLink) {
+    await handleGetSessions(serverLink);
+    syncSubSessionIfNeeded(sessionName, serverLink);
+  }
+  timelineEmitter.emit(sessionName, 'usage.update', { model: requestedModel, contextWindow }, { source: 'daemon', confidence: 'high' });
+  timelineEmitter.emit(sessionName, 'assistant.text', {
+    ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.MODEL_SWITCHED, `Switched model to ${requestedModel}`, { model: requestedModel }),
+    streaming: false,
+    automation: true,
+    memoryExcluded: true,
+  }, { source: 'daemon', confidence: 'high' });
+  return {
+    ok: true,
+    sessionName,
+    agentType: agentType ?? '',
+    model: requestedModel,
+    ...(previousModel ? { previousModel } : {}),
+    applied: transportRuntime ? SESSION_MODEL_APPLIED.LIVE : SESSION_MODEL_APPLIED.NEXT_START,
+  };
+}
+
+function resolveModelControlTarget(sessionName: string):
+  | { ok: true; record: SessionRecord; runtime: TransportSessionRuntime | undefined }
+  | { ok: false; code: SessionModelControlError; error: string } {
+  const record = getSession(sessionName);
+  if (!record) return { ok: false, code: SESSION_MODEL_CONTROL_ERROR.SESSION_NOT_FOUND, error: `No session named ${sessionName}` };
+  const isTransport = record.runtimeType === 'transport'
+    || (typeof record.agentType === 'string' && isTransportAgent(record.agentType));
+  if (!isTransport || !isModelSwitchAgent(record.agentType)) {
+    return {
+      ok: false,
+      code: isTransport ? SESSION_MODEL_CONTROL_ERROR.UNSUPPORTED_AGENT : SESSION_MODEL_CONTROL_ERROR.UNSUPPORTED_RUNTIME,
+      error: `Model switching is not available for ${record.agentType ?? 'this session'}${isTransport ? '' : ' (terminal session: use its own /model)'}`,
+    };
+  }
+  // An idle session is often not loaded (restored lazily on its next message):
+  // the switch then updates the stored model, which that start uses.
+  return { ok: true, record, runtime: getTransportRuntime(sessionName) };
+}
+
+/**
+ * `session_model_set`: switch any session's model by exact name, no text
+ * involved -- session-to-session messages are wrapped, so `/model X` sent by
+ * another session never matched. Deliberately no caller/ownership check: the
+ * exact session name is the only requirement.
+ */
+export async function switchSessionModelNow(sessionName: string, model: string): Promise<SessionModelSwitchResult> {
+  const requested = model.trim();
+  const target = resolveModelControlTarget(sessionName);
+  if (!target.ok) return { ok: false, sessionName, code: target.code, error: target.error };
+  if (!requested || /\s/.test(requested)) {
+    return { ok: false, sessionName, code: SESSION_MODEL_CONTROL_ERROR.UNKNOWN_MODEL, error: 'model must be a single model id' };
+  }
+  const release = await getMutex(sessionName).acquire();
+  try {
+    const latest = getSession(sessionName) ?? target.record;
+    return await applyTransportModelSwitch(latest, target.runtime, requested);
+  } finally {
+    release();
+  }
+}
+
+/**
+ * `session_model` without a model: the session's current model and what it can
+ * switch to -- the same live, cached list the browser's model picker shows.
+ */
+export async function listSessionModelsNow(sessionName: string): Promise<SessionModelListResult> {
+  const record = getSession(sessionName);
+  if (!record) return { ok: false, sessionName, code: SESSION_MODEL_CONTROL_ERROR.SESSION_NOT_FOUND, error: `No session named ${sessionName}` };
+  const agentType = record.agentType ?? '';
+  if (!isModelSwitchAgent(agentType)) {
+    return { ok: false, sessionName, code: SESSION_MODEL_CONTROL_ERROR.UNSUPPORTED_AGENT, error: `Model switching is not available for ${agentType || 'this session'}` };
+  }
+  const currentModel = record.activeModel ?? record.requestedModel ?? undefined;
+  const validated = await resolveValidatedModelList(record);
+  if (validated) {
+    return {
+      ok: true,
+      sessionName,
+      agentType,
+      ...(currentModel ? { currentModel } : {}),
+      models: validated.models,
+      acceptsAnyModel: false,
+      ...(record.ccPreset && agentType === 'claude-code-sdk' ? { note: `preset ${record.ccPreset}` } : {}),
+    };
+  }
+  const listed = await getTransportListModels({
+    agentType,
+    sessionName,
+    ...(record.ccPreset ? { ccPreset: record.ccPreset } : {}),
+  }, agentType, false).catch((err: unknown) => ({
+    models: [] as TransportListModelsResult['models'],
+    error: err instanceof Error ? err.message : String(err),
+  }));
+  const note = agentType === 'qoder-sdk'
+    ? 'Qoder model switching is proof-gated in IM.codes v1'
+    : listed.error;
+  return {
+    ok: true,
+    sessionName,
+    agentType,
+    ...(currentModel ? { currentModel } : {}),
+    models: listed.models.map((model) => model.id),
+    // Providers without a validated list take any id; this is their picker list.
+    acceptsAnyModel: isGenericModelSwitchAgent(agentType),
+    ...(note ? { note } : {}),
+  };
+}
+
 export async function restartSessionNow(
   sessionName: string,
   options: { reset: boolean } = { reset: false },
@@ -4484,222 +4824,17 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'accepted' });
         return;
       }
-      if (record?.agentType === 'qwen' && modelMatch) {
-        const nextModel = modelMatch[1];
-          const runtimeConfig = await getQwenRuntimeConfig(true).catch(() => null);
-          // Priority: session qwenAvailableModels (may include preset models) >
-          // runtimeConfig.availableModels (from Qwen CLI, may not know about preset
-          // models) > hardcoded QWEN_MODEL_IDS fallback. Session record is
-          // authoritative because it was populated with preset models at launch.
-          const sessionModels = record.qwenAvailableModels ?? [];
-          const runtimeModels = runtimeConfig?.availableModels ?? [];
-          const allowedModels = sessionModels.length
-            ? sessionModels
-            : (runtimeModels.length ? runtimeModels : QWEN_MODEL_IDS);
-          if (!allowedModels.includes(nextModel)) {
-            const qwenAuthType = runtimeConfig?.authType ?? record.qwenAuthType;
-            const authHint = qwenAuthType === 'qwen-oauth'
-              ? ' (current tier only allows coder-model)'
-              : '';
-            emitTransportUserMessage(text);
-            timelineEmitter.emit(sessionName, 'assistant.text', {
-              ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.UNKNOWN_MODEL, `⚠️ Unknown Qwen model: ${nextModel}${authHint}`, {
-                model: nextModel,
-                ...(authHint ? { detail: authHint.trim().replace(/^\(|\)$/g, '') } : {}),
-              }),
-              streaming: false,
-              memoryExcluded: true,
-            }, { source: 'daemon', confidence: 'high' });
-            timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Qwen model: ${nextModel}${authHint}` });
-            emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: `Unknown Qwen model: ${nextModel}${authHint}` });
-            return;
-          }
-          transportRuntime.setAgentId(nextModel);
-          const qwenAuthType = runtimeConfig?.authType ?? record.qwenAuthType;
-          // Merge runtime models INTO session's existing list (union) so preset
-          // models survive future switches. Never overwrite with only runtime models.
-          const mergedAvailableModels = [...new Set([...sessionModels, ...runtimeModels])];
-          const nextRecord = {
-            ...record,
-            requestedModel: nextModel,
-            activeModel: nextModel,
-            modelDisplay: nextModel,
-            qwenModel: nextModel,
-            ...(qwenAuthType ? { qwenAuthType } : {}),
-            ...(runtimeConfig?.authLimit ? { qwenAuthLimit: runtimeConfig.authLimit } : {}),
-            ...(mergedAvailableModels.length ? { qwenAvailableModels: mergedAvailableModels } : {}),
-            ...getQwenDisplayMetadata({
-              model: nextModel,
-              authType: qwenAuthType,
-              authLimit: runtimeConfig?.authLimit ?? record.qwenAuthLimit,
-              quotaUsageLabel: qwenAuthType === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined,
-            }),
-            updatedAt: Date.now(),
-          };
-          upsertSession(nextRecord);
-          persistSessionRecord(nextRecord, sessionName);
-          await handleGetSessions(serverLink);
-          syncSubSessionIfNeeded(sessionName, serverLink);
-          emitTransportUserMessage(text);
-          timelineEmitter.emit(sessionName, 'usage.update', {
-            model: nextModel,
-            contextWindow: resolveContextWindow(undefined, nextModel),
-          }, { source: 'daemon', confidence: 'high' });
-          timelineEmitter.emit(sessionName, 'assistant.text', {
-            ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.MODEL_SWITCHED, `Switched model to ${nextModel}`, { model: nextModel }),
-            streaming: false,
-            automation: true,
-            memoryExcluded: true,
-          }, { source: 'daemon', confidence: 'high' });
-          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-          return;
-      }
-      if (record?.agentType === 'claude-code-sdk' && modelMatch) {
-        const requestedModel = modelMatch[1];
-        let presetContextWindow = record.presetContextWindow;
-        let selectedModel: string | undefined;
-        if (record.ccPreset) {
-          const { getPreset, getPresetAvailableModelIds, getPresetTransportOverrides } = await import('./cc-presets.js');
-          const preset = await getPreset(record.ccPreset);
-          const presetModels = preset ? getPresetAvailableModelIds(preset) : [];
-          selectedModel = presetModels.find((model) => model === requestedModel);
-          if (selectedModel) {
-            const presetOverrides = await getPresetTransportOverrides(record.ccPreset, selectedModel);
-            presetContextWindow = presetOverrides.contextWindow ?? presetContextWindow;
-            transportRuntime.setSystemPrompt(presetOverrides.systemPrompt ?? '');
-          }
+      if (record && modelMatch && isModelSwitchAgent(record.agentType)) {
+        emitTransportUserMessage(text);
+        const result = await applyTransportModelSwitch(record, transportRuntime, modelMatch[1], serverLink);
+        if (result.ok) {
+          const status = isLegacy ? 'accepted_legacy' : 'accepted';
+          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
+          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status });
         } else {
-          selectedModel = normalizeClaudeCodeModelId(requestedModel);
+          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: result.error });
+          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: result.error });
         }
-        if (!selectedModel) {
-          emitTransportUserMessage(text);
-          timelineEmitter.emit(sessionName, 'assistant.text', { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.UNKNOWN_MODEL, `⚠️ Unknown Claude model: ${requestedModel}`, { model: requestedModel }), streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
-          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Claude model: ${requestedModel}` });
-          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: `Unknown Claude model: ${requestedModel}` });
-          return;
-        }
-        transportRuntime.setAgentId(normalizeClaudeSdkModelForProvider(selectedModel));
-        const sdkDisplay = await getClaudeSdkRuntimeConfig(true).catch(() => ({}) as import('../agent/sdk-runtime-config.js').SdkRuntimeConfig);
-        const nextRecord = {
-          ...record,
-          requestedModel: selectedModel,
-          activeModel: selectedModel,
-          modelDisplay: selectedModel,
-          ...(sdkDisplay.planLabel ? { planLabel: sdkDisplay.planLabel } : {}),
-          updatedAt: Date.now(),
-        };
-        upsertSession(nextRecord);
-        persistSessionRecord(nextRecord, sessionName);
-        await handleGetSessions(serverLink);
-        syncSubSessionIfNeeded(sessionName, serverLink);
-        emitTransportUserMessage(text);
-        timelineEmitter.emit(sessionName, 'usage.update', {
-          model: selectedModel,
-          contextWindow: resolveContextWindow(presetContextWindow, selectedModel),
-        }, { source: 'daemon', confidence: 'high' });
-        timelineEmitter.emit(sessionName, 'assistant.text', {
-          ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.MODEL_SWITCHED, `Switched model to ${selectedModel}`, { model: selectedModel }),
-          streaming: false,
-          automation: true,
-          memoryExcluded: true,
-        }, { source: 'daemon', confidence: 'high' });
-        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-        return;
-      }
-      if (record?.agentType === 'codex-sdk' && modelMatch) {
-        const nextModel = modelMatch[1];
-        const sdkRuntime = await getCodexRuntimeConfig(true).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig);
-        const sdkDisplay = mergeCodexDisplayMetadata(sdkRuntime, record);
-        const availableModels = sdkRuntime.availableModels?.length
-          ? sdkRuntime.availableModels
-          : record.codexAvailableModels?.length
-            ? record.codexAvailableModels
-            : [...CODEX_MODEL_IDS];
-        if (!availableModels.includes(nextModel)) {
-          emitTransportUserMessage(text);
-          timelineEmitter.emit(sessionName, 'assistant.text', { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.UNKNOWN_MODEL, `⚠️ Unknown Codex model: ${nextModel}`, { model: nextModel }), streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
-          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Codex model: ${nextModel}` });
-          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: `Unknown Codex model: ${nextModel}` });
-          return;
-        }
-        transportRuntime.setAgentId(nextModel);
-        const nextRecord = {
-          ...record,
-          requestedModel: nextModel,
-          activeModel: nextModel,
-          modelDisplay: nextModel,
-          ...(availableModels.length ? { codexAvailableModels: availableModels } : {}),
-          ...sdkDisplay,
-          updatedAt: Date.now(),
-        };
-        upsertSession(nextRecord);
-        persistSessionRecord(nextRecord, sessionName);
-        await handleGetSessions(serverLink);
-        syncSubSessionIfNeeded(sessionName, serverLink);
-        emitTransportUserMessage(text);
-        timelineEmitter.emit(sessionName, 'usage.update', { model: nextModel, contextWindow: resolveContextWindow(undefined, nextModel) }, { source: 'daemon', confidence: 'high' });
-        timelineEmitter.emit(sessionName, 'assistant.text', {
-          ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.MODEL_SWITCHED, `Switched model to ${nextModel}`, { model: nextModel }),
-          streaming: false,
-          automation: true,
-          memoryExcluded: true,
-        }, { source: 'daemon', confidence: 'high' });
-        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-        return;
-      }
-      if (record?.agentType === 'qoder-sdk' && modelMatch) {
-        const nextModel = modelMatch[1];
-        const errMsg = `Qoder model switching is proof-gated in IM.codes v1: ${nextModel}`;
-        emitTransportUserMessage(text);
-        timelineEmitter.emit(sessionName, 'assistant.text', {
-          ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PROOF_GATED, `⚠️ ${errMsg}`, { model: nextModel }),
-          streaming: false,
-          memoryExcluded: true,
-        }, { source: 'daemon', confidence: 'high' });
-        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: errMsg });
-        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
-        return;
-      }
-      if (record?.agentType === 'grok-sdk' && modelMatch) {
-        const nextModel = modelMatch[1];
-        const grokModels = await getProvider('grok-sdk')?.listModels?.().catch(() => ({ models: [] }));
-        const availableModels = grokModels?.models.map((model) => model.id) ?? [];
-        if (!availableModels.includes(nextModel)) {
-          const error = `Unknown Grok model: ${nextModel}`;
-          emitTransportUserMessage(text);
-          timelineEmitter.emit(sessionName, 'assistant.text', { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.UNKNOWN_MODEL, `⚠️ ${error}`, { model: nextModel }), streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
-          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error });
-          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error });
-          return;
-        }
-      }
-      if ((record?.agentType === 'copilot-sdk' || record?.agentType === 'cursor-headless' || record?.agentType === 'opencode-sdk' || record?.agentType === 'gemini-sdk' || record?.agentType === 'kimi-sdk' || record?.agentType === HERMES_AGENT_PROVIDER_ID || record?.agentType === 'grok-sdk' || record?.agentType === 'deepseek-harness' || record?.agentType === 'pi' || isCodeBuddyProviderId(record?.agentType)) && modelMatch) {
-        const nextModel = modelMatch[1];
-        transportRuntime.setAgentId(nextModel);
-        const nextRecord = {
-          ...record,
-          requestedModel: nextModel,
-          activeModel: nextModel,
-          modelDisplay: nextModel,
-          updatedAt: Date.now(),
-        };
-        upsertSession(nextRecord);
-        persistSessionRecord(nextRecord, sessionName);
-        await handleGetSessions(serverLink);
-        syncSubSessionIfNeeded(sessionName, serverLink);
-        emitTransportUserMessage(text);
-        timelineEmitter.emit(sessionName, 'usage.update', { model: nextModel, contextWindow: resolveContextWindow(undefined, nextModel) }, { source: 'daemon', confidence: 'high' });
-        timelineEmitter.emit(sessionName, 'assistant.text', {
-          ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.MODEL_SWITCHED, `Switched model to ${nextModel}`, { model: nextModel }),
-          streaming: false,
-          automation: true,
-          memoryExcluded: true,
-        }, { source: 'daemon', confidence: 'high' });
-        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
         return;
       }
       if (record?.agentType === 'qoder-sdk' && effortMatch) {

@@ -372,6 +372,8 @@ vi.mock('../../src/daemon/supervision-automation.js', () => ({
 
 import {
   handleWebCommand,
+  listSessionModelsNow,
+  switchSessionModelNow,
   restartSessionNow,
   __invalidateTransportListModelsCacheForTests,
   __resetTransportListModelsCacheForTests,
@@ -4665,6 +4667,72 @@ describe('handleWebCommand transport queue behavior', () => {
       }),
       expect.any(Object),
     );
+  });
+
+  describe('session_model control (MCP, by exact session name)', () => {
+    it('switches another session\'s model directly, with no message involved', async () => {
+      const setAgentId = vi.fn();
+      const record = {
+        name: 'deck_sub_cc1',
+        projectName: 'other_project',
+        role: 'w1',
+        agentType: 'cursor-headless',
+        runtimeType: 'transport',
+        state: 'running',
+        activeModel: 'auto',
+      };
+      getSessionMock.mockReturnValue(record);
+      getTransportRuntimeMock.mockReturnValue({ providerSessionId: 'route-cc1', setAgentId, pendingCount: 0 });
+
+      const result = await switchSessionModelNow('deck_sub_cc1', ' gpt-6-sol ');
+
+      expect(result).toEqual({ ok: true, sessionName: 'deck_sub_cc1', agentType: 'cursor-headless', model: 'gpt-6-sol', previousModel: 'auto', applied: 'live' });
+      expect(setAgentId).toHaveBeenCalledWith('gpt-6-sol');
+      expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({ name: 'deck_sub_cc1', requestedModel: 'gpt-6-sol', activeModel: 'gpt-6-sol' }));
+      expect(emitMock).toHaveBeenCalledWith('deck_sub_cc1', 'assistant.text', expect.objectContaining({ text: 'Switched model to gpt-6-sol' }), expect.any(Object));
+    });
+
+    it('switches an idle session that is not loaded: its next start uses the new model', async () => {
+      getSessionMock.mockReturnValue({
+        name: 'deck_sub_idle', projectName: 'p', role: 'w1', agentType: 'claude-code-sdk', runtimeType: 'transport', state: 'idle', activeModel: 'opus',
+      });
+      getTransportRuntimeMock.mockReturnValue(undefined);
+
+      const result = await switchSessionModelNow('deck_sub_idle', 'sonnet');
+
+      expect(result).toMatchObject({ ok: true, model: 'sonnet', previousModel: 'opus', applied: 'next_start' });
+      expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({ name: 'deck_sub_idle', requestedModel: 'sonnet' }));
+    });
+
+    it('refuses an unknown model for a validated provider and returns the valid list', async () => {
+      const setAgentId = vi.fn();
+      getSessionMock.mockReturnValue({
+        name: 'deck_sub_cc1', projectName: 'p', role: 'w1', agentType: 'claude-code-sdk', runtimeType: 'transport', state: 'running',
+      });
+      getTransportRuntimeMock.mockReturnValue({ providerSessionId: 'route-cc1', setAgentId, pendingCount: 0 });
+
+      const result = await switchSessionModelNow('deck_sub_cc1', 'gpt-6-sol');
+
+      expect(result).toMatchObject({ ok: false, code: 'unknown_model', error: 'Unknown Claude model: gpt-6-sol' });
+      expect((result as { availableModels?: string[] }).availableModels).toEqual(expect.arrayContaining(['sonnet']));
+      expect(setAgentId).not.toHaveBeenCalled();
+    });
+
+    it('reports a missing session or a terminal session clearly', async () => {
+      getSessionMock.mockReturnValue(undefined);
+      await expect(switchSessionModelNow('deck_sub_nope', 'x')).resolves.toMatchObject({ ok: false, code: 'session_not_found' });
+      getSessionMock.mockReturnValue({ name: 'deck_p_w1', projectName: 'p', role: 'w1', agentType: 'claude-code', runtimeType: 'process', state: 'running' });
+      await expect(switchSessionModelNow('deck_p_w1', 'sonnet')).resolves.toMatchObject({ ok: false, code: 'unsupported_runtime' });
+    });
+
+    it('lists what a Claude session accepts, with its current model', async () => {
+      getSessionMock.mockReturnValue({
+        name: 'deck_sub_cc1', projectName: 'p', role: 'w1', agentType: 'claude-code-sdk', runtimeType: 'transport', state: 'running', activeModel: 'sonnet',
+      });
+      await expect(listSessionModelsNow('deck_sub_cc1')).resolves.toMatchObject({
+        ok: true, agentType: 'claude-code-sdk', currentModel: 'sonnet', acceptsAnyModel: false, models: expect.arrayContaining(['sonnet', 'haiku']),
+      });
+    });
   });
 
   it('updates live supervision state when the browser patches transportConfig', async () => {
