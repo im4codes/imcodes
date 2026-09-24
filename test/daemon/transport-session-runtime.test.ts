@@ -62,6 +62,7 @@ const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
 const searchLocalMemoryMock = vi.hoisted(() => vi.fn());
 const searchLocalMemorySemanticMock = vi.hoisted(() => vi.fn());
 const collectRecentSummarySyncCandidatesMock = vi.hoisted(() => vi.fn());
+const memoryInjectionEnabledMock = vi.hoisted(() => vi.fn(async () => true));
 
 const sharedActorFixture: SharedActorEnvelope = {
   actorUserId: 'user-shared',
@@ -93,6 +94,10 @@ vi.mock('../../src/daemon/timeline-emitter.js', () => ({
 vi.mock('../../src/context/memory-search.js', () => ({
   searchLocalMemory: searchLocalMemoryMock,
   searchLocalMemorySemantic: searchLocalMemorySemanticMock,
+}));
+
+vi.mock('../../src/context/memory-injection-toggle.js', () => ({
+  isMemoryInjectionEnabled: memoryInjectionEnabledMock,
 }));
 
 vi.mock('../../src/context/summary-sync.js', async (importOriginal) => {
@@ -4636,6 +4641,40 @@ ${PREFERENCE_CONTEXT_END}`;
       }),
       expect.objectContaining({ source: 'daemon', confidence: 'high' }),
     );
+  });
+
+  it('injects neither recent project memory nor related past work when the project turned memory injection off', async () => {
+    collectRecentSummarySyncCandidatesMock.mockResolvedValue([
+      makeSummarySyncCandidate('summary-off', 'A recent summary that must stay out'),
+    ]);
+    searchLocalMemorySemanticMock.mockResolvedValue(makeSearchResult([makeSearchItem({
+      projectId: 'repo-1',
+      summary: 'A related past-work item that must stay out',
+      relevanceScore: 0.92,
+    })]));
+    memoryInjectionEnabledMock.mockImplementation(async () => false);
+    try {
+      const localMock = makeMockProvider();
+      const r = new TransportSessionRuntime(localMock.provider, 'deck_injection_off_brain');
+      r.setContextBootstrapResolver(async () => ({
+        namespace: { scope: 'personal', projectId: 'repo-1' },
+        diagnostics: ['namespace:explicit'],
+        localProcessedFreshness: 'fresh',
+      }));
+      await r.initialize({ ...defaultConfig, sessionKey: 'deck_injection_off_brain' });
+
+      r.send('Please recall recent transport memory around recall runtime', 'injection-off-turn');
+      await waitForProviderSendCount(localMock.provider, 1);
+
+      expect(memoryInjectionEnabledMock).toHaveBeenCalledWith({ scope: 'personal', projectId: 'repo-1' });
+      const payload = localMock.provider.send.mock.calls[0]![1] as Record<string, unknown>;
+      expect(payload.memoryRecall).toBeUndefined();
+      expect(String(payload.assembledMessage ?? '')).not.toContain('[Related past work]');
+      expect(String(payload.assembledMessage ?? '')).not.toContain('# Recent project memory');
+      expect(searchLocalMemorySemanticMock).not.toHaveBeenCalled();
+    } finally {
+      memoryInjectionEnabledMock.mockImplementation(async () => true);
+    }
   });
 
   it('injects each newly materialized recent summary once across subsequent transport turns', async () => {

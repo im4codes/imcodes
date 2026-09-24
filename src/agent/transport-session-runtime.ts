@@ -89,6 +89,7 @@ import {
   resolveSummarySyncSourceKind,
 } from '../context/summary-sync.js';
 import { buildRelatedPastWorkText, buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
+import { isMemoryInjectionEnabled } from '../context/memory-injection-toggle.js';
 import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
 import { getContextModelConfig } from '../context/context-model-config.js';
 import { PREFERENCE_CONTEXT_END, PREFERENCE_CONTEXT_START } from '../../shared/preference-ingest.js';
@@ -4536,6 +4537,9 @@ export class TransportSessionRuntime implements SessionRuntime {
           sourceKind: 'local_processed',
         }),
       };
+    }
+    if (this._contextNamespace && !(await isMemoryInjectionEnabled(this._contextNamespace).catch(() => true))) {
+      return { artifact: null };
     }
     let semanticSkipReason: 'skipped_short_prompt' | 'skipped_template_prompt' | 'skipped_control_message' | undefined;
     if (trimmed.length < 10) semanticSkipReason = 'skipped_short_prompt';

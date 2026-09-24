@@ -34,6 +34,7 @@ const {
   listSessionsMock,
   recallClientControl,
   collectRecentSummarySyncCandidatesMock,
+  memoryInjectionEnabledMock,
 } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
   getTransportRuntimeMock: vi.fn(),
@@ -64,6 +65,11 @@ const {
   // bounded-empty path (no in-process recall).
   recallClientControl: { isProductionOwner: false },
   collectRecentSummarySyncCandidatesMock: vi.fn(),
+  memoryInjectionEnabledMock: vi.fn(async () => true),
+}));
+
+vi.mock('../../src/context/memory-injection-toggle.js', () => ({
+  isMemoryInjectionEnabled: memoryInjectionEnabledMock,
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -1560,6 +1566,30 @@ describe('handleWebCommand memory context timeline', () => {
     );
     expect(recordMemoryHitsMock).toHaveBeenCalledWith(['mem-1']);
     expect(recordMemoryHitsMock.mock.invocationCallOrder[0]).toBeGreaterThan(sendKeysDelayedEnterMock.mock.invocationCallOrder[0]);
+  });
+
+  it('injects no related history into a process send when the project turned memory injection off', async () => {
+    memoryInjectionEnabledMock.mockImplementation(async () => false);
+    try {
+      handleWebCommand({
+        type: 'session.send',
+        session: 'deck_process_brain',
+        text: 'Fix reconnect issues in websocket client',
+        commandId: 'cmd-memory-off',
+      }, serverLink as any);
+      await flushAsync();
+
+      expect(memoryInjectionEnabledMock).toHaveBeenCalled();
+      expect(sendKeysDelayedEnterMock).toHaveBeenCalledWith(
+        'deck_process_brain',
+        'Fix reconnect issues in websocket client',
+        undefined,
+      );
+      expect(emitMock).not.toHaveBeenCalledWith('deck_process_brain', 'memory.context', expect.anything(), expect.anything());
+      expect(recordMemoryHitsMock).not.toHaveBeenCalled();
+    } finally {
+      memoryInjectionEnabledMock.mockImplementation(async () => true);
+    }
   });
 
   it('synchronizes a new recent summary once across subsequent process sends', async () => {

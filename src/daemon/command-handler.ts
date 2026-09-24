@@ -1227,6 +1227,7 @@ import { QWEN_MODEL_IDS } from '../../shared/qwen-models.js';
 import { getQwenRuntimeConfig } from '../agent/qwen-runtime-config.js';
 import { getQwenDisplayMetadata } from '../agent/provider-display.js';
 import { buildRelatedPastWorkText, buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
+import { isMemoryInjectionEnabled } from '../context/memory-injection-toggle.js';
 import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
 import { getQwenOAuthQuotaUsageLabel, recordQwenOAuthRequest } from '../agent/provider-quota.js';
 import { listProviderSessions as listProviderSessionsImpl } from './provider-sessions.js';
@@ -13857,6 +13858,9 @@ async function prependLocalMemory(
   if (!semanticSkipReason && isImperativeCommand(prompt)) semanticSkipReason = 'skipped_control_message';
   try {
     const recallContext = await resolveProcessRecallQueryContext(sessionName);
+    if (recallContext.namespace && !(await isMemoryInjectionEnabled(recallContext.namespace).catch(() => true))) {
+      return { text: prompt };
+    }
     // Broaden the candidate pool — the cap rule trims to 3 (or up to 5 for
     // all-strong results). We need enough candidates to survive filtering.
     const recallQuery = {
