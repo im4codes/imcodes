@@ -213,7 +213,12 @@ export async function buildTransportStartupMemory(
       ? { limit: limitOrOptions }
       : limitOrOptions;
     const limit = options.limit ?? STARTUP_MEMORY_TOTAL_LIMIT;
-    const remoteItems = options.managedSkillsOnly ? [] : (options.remoteItems ?? []).filter((item) => (
+    // Every startup-memory caller goes through here, including the first-
+    // dispatch fallback that runs when the bootstrap produced nothing. With
+    // injection turned off for the project only managed Skills may survive.
+    const managedSkillsOnly = options.managedSkillsOnly === true
+      || !(await isMemoryInjectionEnabled(namespace).catch(() => true));
+    const remoteItems = managedSkillsOnly ? [] : (options.remoteItems ?? []).filter((item) => (
       matchesContextConsumerNamespace({
         scope: item.scope as ContextNamespace['scope'],
         projectId: item.projectId,
@@ -232,10 +237,10 @@ export async function buildTransportStartupMemory(
     // Startup memory selection runs in the context-store worker (bounded L3
     // RPC), off the daemon main thread; falls back to the in-process selection
     // when the worker is not warm so startup never blocks the post-ack dispatch.
-    const processedItems = options.managedSkillsOnly
+    const processedItems = managedSkillsOnly
       ? []
       : await selectStartupMemoryForBootstrap(namespace, selectionOptions).catch(() => remoteItems);
-    const observationItems = options.managedSkillsOnly
+    const observationItems = managedSkillsOnly
       ? []
       : await selectStartupObservationItems(namespace).catch(() => []);
     const memoryById = new Map([...processedItems, ...observationItems].map((item) => [item.id, item]));

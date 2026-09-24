@@ -3708,11 +3708,23 @@ export class TransportSessionRuntime implements SessionRuntime {
       // recall: both can contain recent summaries and both emit public
       // memory.context evidence after provider acceptance.
       const suppressMemoryContext = isSlashControl || isPrivateControlDispatch;
-      const startupMemory = suppressMemoryContext ? null : (this._startupMemory ?? (
-        !this._startupMemoryInjected && authority.authoritySource === 'processed_local' && this._contextNamespace
-          ? await buildTransportStartupMemory(this._contextNamespace, { projectDir: this._projectDir })
-          : null
-      ));
+      // The toggle is re-read here, not only at bootstrap: a session whose
+      // first-turn memory was assembled before injection was turned off must
+      // still honor the switch without a restart. Managed Skills stay.
+      const startupInjectionDisabled = !suppressMemoryContext
+        && !this._startupMemoryInjected
+        && !!this._contextNamespace
+        && !(await isMemoryInjectionEnabled(this._contextNamespace).catch(() => true));
+      const startupMemory = suppressMemoryContext ? null : startupInjectionDisabled
+        ? (await buildTransportStartupMemory(this._contextNamespace!, {
+          projectDir: this._projectDir,
+          managedSkillsOnly: true,
+        })) ?? null
+        : (this._startupMemory ?? (
+          !this._startupMemoryInjected && authority.authoritySource === 'processed_local' && this._contextNamespace
+            ? await buildTransportStartupMemory(this._contextNamespace, { projectDir: this._projectDir })
+            : null
+        ));
       const memoryRecallResult = isPrivateControlDispatch
         ? { artifact: null }
         : isSlashControl

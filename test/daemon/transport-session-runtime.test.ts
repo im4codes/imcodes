@@ -3340,6 +3340,39 @@ describe('TransportSessionRuntime', () => {
     );
   });
 
+  it('drops first-turn startup memory built before the project turned injection off, without a restart', async () => {
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_startup_toggle_brain');
+    r.setContextBootstrapResolver(async () => ({
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      diagnostics: ['namespace:explicit'],
+      localProcessedFreshness: 'fresh',
+      // Assembled at bootstrap while injection was still on.
+      startupMemory: {
+        reason: 'startup',
+        runtimeFamily: 'transport',
+        authoritySource: 'processed_local',
+        sourceKind: 'local_processed',
+        injectionSurface: 'normalized-payload',
+        items: [makeSearchItem({ id: 'startup-before-off', summary: 'Startup memory captured before the toggle went off' })],
+        injectedText: '# Recent project memory (reference only)\nStartup memory captured before the toggle went off',
+      } as any,
+    }));
+    await r.initialize({ ...defaultConfig, sessionKey: 'deck_startup_toggle_brain' });
+
+    memoryInjectionEnabledMock.mockImplementation(async () => false);
+    try {
+      r.send('Continue the assigned implementation work now', 'startup-toggle-turn');
+      await waitForProviderSendCount(localMock.provider, 1);
+      const payload = localMock.provider.send.mock.calls[0]![1] as Record<string, unknown>;
+      const rendered = JSON.stringify(payload);
+      expect(rendered).not.toContain('Startup memory captured before the toggle went off');
+      expect(rendered).not.toContain('# Recent project memory');
+    } finally {
+      memoryInjectionEnabledMock.mockImplementation(async () => true);
+    }
+  });
+
   it('keeps slash-control user bytes raw while retaining only permanent system authority', async () => {
     const localMock = makeMockProvider();
     const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');

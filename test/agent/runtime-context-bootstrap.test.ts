@@ -611,6 +611,27 @@ describe('resolveTransportContextBootstrap', () => {
     expect(startup?.items.slice(0, 20).every((item) => item.projectionClass === 'durable_memory_candidate')).toBe(true);
   });
 
+  it('buildTransportStartupMemory returns no project memory for any caller once the project turned injection off', async () => {
+    const now = Date.now();
+    const namespace = { scope: 'personal' as const, projectId: 'github.com/acme/repo' };
+    writeProcessedProjection({
+      namespace,
+      class: 'durable_memory_candidate',
+      sourceEventIds: ['evt-toggle-off'],
+      summary: 'Memory that must not be injected while the toggle is off',
+      content: {},
+      createdAt: now - 100,
+      updatedAt: now - 50,
+    });
+    expect((await buildTransportStartupMemory(namespace))?.items.length).toBeGreaterThan(0);
+
+    // Written the way memory_injection_set writes it: daemon-local owner filled in.
+    await setMemoryInjectionEnabled({ ...namespace, userId: 'daemon-local' }, false);
+    // The first-dispatch fallback calls the builder directly, without managedSkillsOnly.
+    const startup = await buildTransportStartupMemory(namespace, { projectDir: '/tmp/project' });
+    expect(startup?.items.some((item) => item.summary.includes('must not be injected')) ?? false).toBe(false);
+  });
+
   it('buildTransportStartupMemory mixes important and recent startup memories with durable entries first', async () => {
     const now = Date.now();
     const namespace = {
