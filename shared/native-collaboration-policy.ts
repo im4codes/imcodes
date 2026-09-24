@@ -267,37 +267,6 @@ export interface NativeCollaborationClassification {
 }
 
 /**
- * Signals that stay hard-blocking for every requester, Brain or participant:
- * opening/advancing an IM.codes task, recording a PASS/REWORK verdict, or a
- * Git/deploy gate. A native agent is never the one holding IM.codes lifecycle
- * authority or moving the repository, no matter how small the surrounding ask.
- */
-const NEVER_DELEGABLE_TASK_SIGNALS: ReadonlySet<NativeCollaborationTaskSignal> = new Set([
-  NATIVE_COLLABORATION_TASK_SIGNALS.IMCODES_AUTHORITY,
-  NATIVE_COLLABORATION_TASK_SIGNALS.TASK_VERDICT,
-  NATIVE_COLLABORATION_TASK_SIGNALS.REPOSITORY_GATE,
-]);
-
-/**
- * A formal PARTICIPANT (never a Brain) may delegate any of its own assigned
- * work to its own native subagent -- reading and describing files, drafting
- * a helper, checking a condition, implementing or auditing a work-product --
- * as long as the subagent never becomes the one opening or advancing an
- * IM.codes task, recording a verdict, or touching a Git/deploy gate. The
- * participant remains the accountable executor: it still owns the task's
- * actual judgment and integrates the subagent's output itself: this only
- * widens what MAY be handed to a helper, not who is responsible for the
- * result. No classifier-recognized intent is required -- an unclassified or
- * long, narrative request is delegable exactly like a clean one; only the
- * three never-delegable signals refuse it.
- */
-export function isDelegableParticipantWork(
-  classification: Pick<NativeCollaborationClassification, 'participation' | 'signals'>,
-): boolean {
-  return classification.signals.every((signal) => !NEVER_DELEGABLE_TASK_SIGNALS.has(signal));
-}
-
-/**
  * Bound classifier input so a pathological prompt cannot stall a delivery
  * edge. Longer text is read as its head AND its tail (an instruction appended
  * after a long context is still seen), and is never provably analysis.

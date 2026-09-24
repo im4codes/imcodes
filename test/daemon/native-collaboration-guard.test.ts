@@ -178,7 +178,8 @@ describe('native collaboration supervision-authority guard', () => {
     });
 
     it('decides the launch fence from the launch parameters of a session that has no record yet', () => {
-      expect(isNativeAgentFenceRequiredForLaunch({ sessionName: 'deck_sub_new', role: 'w1', parentSession: BRAIN })).toBe(true);
+      // A Brain descendant is a formal participant: unfenced, like any other participant.
+      expect(isNativeAgentFenceRequiredForLaunch({ sessionName: 'deck_sub_new', role: 'w1', parentSession: BRAIN })).toBe(false);
       expect(isNativeAgentFenceRequiredForLaunch({ sessionName: 'deck_new_brain', role: 'brain' })).toBe(true);
       expect(isNativeAgentFenceRequiredForLaunch({ sessionName: 'deck_sub_plain', role: 'w1', parentSession: UNMANAGED })).toBe(false);
     });
@@ -200,19 +201,22 @@ describe('native collaboration supervision-authority guard', () => {
       expect(policyEvents()[0]![3]).toMatchObject({ hidden: true, source: 'daemon' });
     });
 
-    it.each([
-      ['a Brain child sub-session', BRAIN_CHILD, 'participant'],
-      ['a nested brain-role sub-session', NESTED_BRAIN, undefined],
-      ['a live supervision participant', PARTICIPANT, 'participant'],
-      ['a marked session instance', MARKED, 'participant'],
-    ])('denies task work in %s', (_label, sessionId, requester) => {
+    it('denies task work in a nested brain-role sub-session', () => {
       const { gate } = makeProvider(GATED, 'claude-code-sdk');
-      const decision = gate()(sessionId, { provider: 'claude-code-sdk', toolName: 'Agent', requestText: TASK_PROMPT });
+      const decision = gate()(NESTED_BRAIN, { provider: 'claude-code-sdk', toolName: 'Agent', requestText: TASK_PROMPT });
       expect(decision.allow).toBe(false);
       if (decision.allow) return;
-      const notice = noticeOf(decision.reason);
-      if (requester) expect(notice).toMatchObject({ requester });
-      else expect(notice).not.toHaveProperty('requester');
+      expect(noticeOf(decision.reason)).not.toHaveProperty('requester');
+    });
+
+    it.each([
+      ['a Brain child sub-session', BRAIN_CHILD],
+      ['a live supervision participant', PARTICIPANT],
+      ['a marked session instance', MARKED],
+    ])('allows task work (even carrying a repository gate) in %s -- a formal participant delegates without restriction', (_label, sessionId) => {
+      const { gate } = makeProvider(GATED, 'claude-code-sdk');
+      expect(gate()(sessionId, { provider: 'claude-code-sdk', toolName: 'Agent', requestText: TASK_PROMPT })).toEqual({ allow: true });
+      expect(policyEvents()).toHaveLength(0);
     });
 
     it.each([
@@ -249,16 +253,13 @@ describe('native collaboration supervision-authority guard', () => {
     });
 
     it.each([
-      ['carries IM.codes task authority', 'Implement the fix, then call supervision_task_finish on asg_9k2.', ['implementation', 'imcodes_authority']],
-      ['carries a PASS/REWORK verdict', 'Review this small helper and return PASS or REWORK.', ['task_verdict']],
-      ['carries a repository/deploy gate', 'Implement the small helper and git push the branch.', ['implementation', 'repository_gate']],
-    ])('still refuses a participant\'s delegation when the request also %s', (_label, requestText, expectedSignals) => {
+      ['carries IM.codes task authority', 'Implement the fix, then call supervision_task_finish on asg_9k2.'],
+      ['carries a PASS/REWORK verdict', 'Review this small helper and return PASS or REWORK.'],
+      ['carries a repository/deploy gate', 'Implement the small helper and git push the branch.'],
+    ])('allows a participant\'s delegation even when the request also %s -- no restriction survives for a participant', (_label, requestText) => {
       const { gate } = makeProvider(GATED, 'claude-code-sdk');
-      const decision = gate()(PARTICIPANT, { provider: 'claude-code-sdk', toolName: 'Agent', requestText });
-      expect(decision.allow).toBe(false);
-      if (decision.allow) return;
-      expect(noticeOf(decision.reason)).toMatchObject({ outcome: 'native_agent_task_participation_denied' });
-      for (const signal of expectedSignals) expect(decision.signals).toContain(signal);
+      expect(gate()(PARTICIPANT, { provider: 'claude-code-sdk', toolName: 'Agent', requestText })).toEqual({ allow: true });
+      expect(policyEvents()).toHaveLength(0);
     });
 
     it('denies an unclassified request from a Brain, which never gets the participant carve-out', () => {
@@ -285,8 +286,9 @@ describe('native collaboration supervision-authority guard', () => {
       expect(fenceResolver()(BRAIN)).toBe(true);
       expect(fenceResolver()(UNMANAGED)).toBe(false);
       expect(fenceResolver()('ephemeral-compressor')).toBe(false);
-      // A launch before route registration names the session itself.
-      expect(fenceResolver()('route-not-registered-yet', PARTICIPANT)).toBe(true);
+      // A launch before route registration names the session itself. A
+      // formal participant is unfenced, like every other enforcement point.
+      expect(fenceResolver()('route-not-registered-yet', PARTICIPANT)).toBe(false);
     });
   });
 
@@ -321,11 +323,12 @@ describe('native collaboration supervision-authority guard', () => {
       expect(toolProjections().length).toBeGreaterThanOrEqual(2);
     });
 
-    it('stops a participant too, telling it to do the work itself', () => {
+    it('never stops a participant -- it delegates without restriction, so an observed native agent is expected, not evidence of a bypassed fence', () => {
       const { fireTool } = makeProvider({ nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.SESSION_FENCE });
       fireTool(BRAIN_CHILD, runtimeSubagentTool(BRAIN_CHILD, 'agent-worker', TASK_PROMPT));
-      expect(runtimes.get(BRAIN_CHILD)!.cancel).toHaveBeenCalledOnce();
-      expect(String(runtimes.get(BRAIN_CHILD)!.send.mock.calls[0]![0])).toContain('"requester":"participant"');
+      expect(runtimes.get(BRAIN_CHILD)!.cancel).not.toHaveBeenCalled();
+      expect(runtimes.get(BRAIN_CHILD)!.send).not.toHaveBeenCalled();
+      expect(policyEvents()).toHaveLength(0);
     });
 
     it('never stops analysis, unmanaged sessions, or pre-execution providers', () => {

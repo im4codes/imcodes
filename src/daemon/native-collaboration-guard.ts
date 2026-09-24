@@ -9,18 +9,21 @@
  * UNVERIFIABLE and treated as managed; everything else is genuinely unmanaged
  * and keeps provider defaults.
  *
+ * A formal participant (never a Brain) is unrestricted at every enforcement
+ * point below: it may delegate any of its own assigned work to its own
+ * native subagent and remains the accountable executor of the result either
+ * way. Only a Brain (or a scope the registry could not verify) is actually
+ * gated.
+ *
  * - `pre_execution_gate` providers ask `evaluateNativeCollaborationPreExecution`
- *   before a native agent tool runs. A Brain admits proven analysis only. A
- *   formal participant (never a Brain) additionally admits ANY request --
- *   proven analysis, unclassified, or task work -- as long as it carries none
- *   of the three never-delegable signals (`isDelegableParticipantWork`): the
- *   participant remains the accountable executor either way.
- * - `session_fence` providers ask `isNativeAgentFenceRequired` on the path that
- *   launches, loads or sends, and withhold native agent tools for managed
- *   sessions. Supervised dispatch checks the proven fence separately
+ *   before a native agent tool runs; a gated Brain admits proven analysis
+ *   only.
+ * - `session_fence` providers ask `isNativeAgentFenceRequired` on the path
+ *   that launches, loads or sends, and withhold native agent tools for a
+ *   Brain. Supervised dispatch checks the proven fence separately
  *   (src/daemon/native-agent-admission.ts).
- * - For every non-gate provider, a task-bearing native agent still OBSERVED in
- *   a managed session is evidence of an unproven fence or an unenforceable
+ * - For every non-gate provider, a task-bearing native agent still OBSERVED
+ *   for a Brain is evidence of an unproven fence or an unenforceable
  *   runtime: `enforceObservedNativeCollaboration` records it and stops the
  *   turn. Observation is never the enforcing boundary.
  */
@@ -37,7 +40,6 @@ import {
   collectNativeAgentRequestStrings,
   denyNativeCollaborationGateUnavailable,
   formatNativeCollaborationPolicyNotice,
-  isDelegableParticipantWork,
   readNativeCollaborationClassification,
   NATIVE_COLLABORATION_REQUESTERS,
   type NativeAgentAdmissionMode,
@@ -183,17 +185,22 @@ export function isNativeCollaborationManagedSession(sessionName: string | undefi
  * Asked by `session_fence` providers and process launches on the path that
  * launches, loads or sends. A session that cannot be resolved to an IM.codes
  * session (an out-of-band broker or compressor route) keeps provider defaults;
- * a scope that cannot be verified is fenced.
+ * a scope that cannot be verified is fenced. A formal participant (never a
+ * Brain) is never fenced: it may delegate to its own native subagent freely
+ * and remains the accountable executor of its own assigned work regardless.
  */
 export function isNativeAgentFenceRequired(sessionName: string | undefined): boolean {
   if (!sessionName) return false;
-  return resolveNativeCollaborationScope(sessionName) !== NATIVE_COLLABORATION_SCOPES.UNMANAGED;
+  const scope = resolveNativeCollaborationScope(sessionName);
+  return scope !== NATIVE_COLLABORATION_SCOPES.UNMANAGED && scope !== NATIVE_COLLABORATION_SCOPES.PARTICIPANT;
 }
 
 /**
  * The fence decision for a PROCESS launch, whose record may not exist yet (a
  * brand-new sub-session) or may not carry the launch's role and parent: the
- * launch parameters count as authority too. Any failure fences.
+ * launch parameters count as authority too. Any failure fences. A Brain
+ * descendant is a formal participant, so it launches unfenced; only an actual
+ * Brain role always fences.
  */
 export function isNativeAgentFenceRequiredForLaunch(input: {
   sessionName: string;
@@ -202,7 +209,7 @@ export function isNativeAgentFenceRequiredForLaunch(input: {
 }): boolean {
   try {
     if (input.role === 'brain') return true;
-    if (descendsFromBrain(input.sessionName, input.parentSession)) return true;
+    if (descendsFromBrain(input.sessionName, input.parentSession)) return false;
     return isNativeAgentFenceRequired(input.sessionName);
   } catch (error) {
     logger.warn({ error, sessionName: input.sessionName }, 'native agent launch scope unverifiable; fencing');
@@ -254,11 +261,13 @@ const requesterFor = (scope: NativeCollaborationScope): NativeCollaborationReque
 /**
  * Pre-execution decision for a native agent request made inside `sessionName`.
  *
- * An unmanaged session is always allowed. Inside a managed session (any Brain,
- * any formal participant, or a session whose scope cannot be verified) ONLY a
- * request the policy proves to be analysis runs: task work and unclassified
- * requests are both refused before execution. A gate that cannot evaluate
- * fails CLOSED.
+ * An unmanaged session is always allowed. A formal participant (never a
+ * Brain) is always allowed too: it may hand any of its own assigned work to
+ * its own native subagent and remains the accountable executor regardless of
+ * what the subagent does. Inside a Brain, or a session whose scope cannot be
+ * verified, ONLY a request the policy proves to be analysis runs: task work
+ * and unclassified requests are both refused before execution. A gate that
+ * cannot evaluate fails CLOSED.
  */
 export function evaluateNativeCollaborationPreExecution(
   sessionName: string,
@@ -267,17 +276,9 @@ export function evaluateNativeCollaborationPreExecution(
   try {
     const scope = resolveNativeCollaborationScope(sessionName);
     if (scope === NATIVE_COLLABORATION_SCOPES.UNMANAGED) return { allow: true };
+    if (scope === NATIVE_COLLABORATION_SCOPES.PARTICIPANT) return { allow: true };
     const classification = classifyNativeCollaborationRequest(request.requestText);
     if (classification.participation === NATIVE_COLLABORATION_PARTICIPATION.ANALYSIS) return { allow: true };
-    // A formal participant (never a Brain) may hand any of its OWN assigned
-    // work -- including unclassified or long narrative requests -- to its own
-    // native subagent, as long as nothing in the request touches IM.codes
-    // task authority, a verdict, or a Git/deploy gate -- see
-    // isDelegableParticipantWork. The participant remains the accountable
-    // executor of the task itself.
-    if (scope === NATIVE_COLLABORATION_SCOPES.PARTICIPANT && isDelegableParticipantWork(classification)) {
-      return { allow: true };
-    }
     emitPolicyEvidence(sessionName, {
       key: request.toolUseId ?? deterministicSendMessageId(`native-collaboration-gate:${request.requestText}`),
       provider: request.provider,
@@ -406,6 +407,12 @@ export function enforceObservedNativeCollaboration(
   if (!request) return 'ignored';
   const scope = resolveNativeCollaborationScope(sessionName);
   if (scope === NATIVE_COLLABORATION_SCOPES.UNMANAGED) return 'ignored';
+  // A formal participant is never fenced any more (isNativeAgentFenceRequired)
+  // and never gated pre-execution (evaluateNativeCollaborationPreExecution),
+  // so an observed native agent here is neither unproven nor unenforceable --
+  // it is exactly what the policy now allows. Only a Brain (or a scope the
+  // registry could not verify) still gets stopped.
+  if (scope === NATIVE_COLLABORATION_SCOPES.PARTICIPANT) return 'ignored';
   const agentKey = `${sessionName}\0${request.key}`;
   if (request.participation === NATIVE_COLLABORATION_PARTICIPATION.ANALYSIS) {
     // Later progress/completion snapshots of this agent carry no request text;
