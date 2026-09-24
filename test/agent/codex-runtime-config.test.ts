@@ -255,6 +255,26 @@ describe('getCodexRuntimeConfig', () => {
     }
   });
 
+  it('never lets a passive (probe:false) read replace the live catalog a non-forced read returns', async () => {
+    // Fresh module: the catalog cache is module state shared across this file.
+    vi.resetModules();
+    const fresh = await import('../../src/agent/codex-runtime-config.js');
+    const { CODEX_MODEL_IDS } = await import('../../src/shared/models/options.js');
+
+    const passive = await fresh.getCodexRuntimeConfig({ probe: false });
+    expect(passive.availableModels).toEqual([...CODEX_MODEL_IDS]);
+    expect(childProcessMock.spawn).not.toHaveBeenCalled();
+
+    // Session-list/sub-session hydration runs passively all the time; the model
+    // picker's non-forced read right after must still reach the live catalog.
+    const live = await fresh.getCodexRuntimeConfig(false);
+    expect(live.availableModels).toEqual(['gpt-5.5', 'gpt-5.4-mini']);
+
+    // Once a live catalog exists, passive readers see it instead of the fallback.
+    expect((await fresh.getCodexRuntimeConfig({ probe: false })).availableModels)
+      .toEqual(['gpt-5.5', 'gpt-5.4-mini']);
+  });
+
   it('reuses the connected singleton provider when available', async () => {
     providerRegistryMock.getProvider.mockReturnValue({
       readModelList: vi.fn().mockResolvedValue([

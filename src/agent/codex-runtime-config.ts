@@ -521,16 +521,18 @@ export async function getCodexRuntimeConfig(options: CodexRuntimeConfigOptions =
 
   const authPlanType = await readCodexPlanTypeFromAuthFile().catch(() => undefined);
   if (!probe) {
+    // Never store this hardcoded fallback in `cache`: live readers (the model
+    // picker via provider.listModels) trust `cache` within its TTL, and the
+    // frequent passive session-list/sub-session hydration would otherwise keep
+    // replacing the real app-server catalog with this static list.
     const models = fallbackCodexModels();
     const defaultModel = models.find((model) => model.isDefault)?.id ?? models[0]?.id;
-    const value: CodexRuntimeConfig = {
+    return {
       ...(authPlanType ? { planLabel: capitalize(authPlanType) } : {}),
       availableModels: models.map((model) => model.id),
       models,
       ...(defaultModel ? { defaultModel } : {}),
     };
-    cache = { expiresAt: now + CACHE_TTL_MS, value };
-    return value;
   }
 
   let discoveredModels: CodexModelInfo[] | undefined;
