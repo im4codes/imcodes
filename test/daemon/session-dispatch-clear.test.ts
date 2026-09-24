@@ -11,12 +11,14 @@ import type { SessionRecord } from '../../src/store/session-store.js';
 const mocks = vi.hoisted(() => ({
   clearTransportConversation: vi.fn(async () => undefined),
   supportsTransportClear: vi.fn((agentType: string | undefined) => agentType === 'codex-sdk'),
+  switchSessionModelNow: vi.fn(async () => ({ ok: true })),
   runtimeSend: vi.fn(() => 'sent' as const),
 }));
 
 vi.mock('../../src/daemon/command-handler.js', () => ({
   clearTransportConversation: mocks.clearTransportConversation,
   supportsTransportClear: mocks.supportsTransportClear,
+  switchSessionModelNow: mocks.switchSessionModelNow,
   sendProcessSessionMessageForAutomation: vi.fn(),
 }));
 
@@ -63,5 +65,23 @@ describe('daemon-side delivery of /clear', () => {
     await dispatchSessionMessage(transportSession({ agentType: 'some-other-sdk' as never }), '/clear', { messageId: 'send_message_3', suppressTimeline: true } as never);
     expect(mocks.clearTransportConversation).not.toHaveBeenCalled();
     expect(mocks.runtimeSend).toHaveBeenCalledTimes(2);
+  });
+
+  it('switches the model for a /model sent by another session', async () => {
+    const { dispatchSessionMessage } = await import('../../src/daemon/session-dispatch.js');
+    await dispatchSessionMessage(transportSession(), '/model gpt-5.6-sol', { messageId: 'send_message_4', suppressTimeline: true } as never);
+    expect(mocks.switchSessionModelNow).toHaveBeenCalledWith('deck_sub_cx8', 'gpt-5.6-sol');
+    expect(mocks.runtimeSend).not.toHaveBeenCalled();
+  });
+
+  it('delivers control commands verbatim instead of wrapping them in a sender header', async () => {
+    const { buildSessionDispatchMessage } = await import('../../src/daemon/session-dispatch.js');
+    const wrap = { from: 'deck_proj_brain', fromLabel: 'Brain', replyTo: 'deck_proj_brain', contextTail: 'earlier talk' };
+    expect(buildSessionDispatchMessage(' /clear ', wrap)).toBe('/clear');
+    expect(buildSessionDispatchMessage('/compact', wrap)).toBe('/compact');
+    expect(buildSessionDispatchMessage('/model gpt-5.6-sol', wrap)).toBe('/model gpt-5.6-sol');
+    // Ordinary text and /stop keep the envelope (stop has its own priority path).
+    expect(buildSessionDispatchMessage('please /clear the cache', wrap)).toContain('deck_proj_brain');
+    expect(buildSessionDispatchMessage('/stop', wrap)).not.toBe('/stop');
   });
 });

@@ -59,6 +59,7 @@ import type { MemoryContextTimelinePayload, MemoryContextTimelinePreferenceItem 
 import { buildMemoryContextTimelinePayload, buildMemoryContextStatusPayload } from '../daemon/memory-context-timeline.js';
 import { appendTransportEvent } from '../daemon/transport-history.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
+import { resolveSessionContextWindow } from '../daemon/session-context-window.js';
 import {
   buildSdkSubagentWakePrompt,
   isBackgroundedSdkSubagentTool,
@@ -4174,8 +4175,12 @@ export class TransportSessionRuntime implements SessionRuntime {
       cache_creation_input_tokens?: number;
       model_context_window?: number;
     } | undefined;
-    const window = usage?.model_context_window;
-    if (!usage || typeof window !== 'number' || !(window > 0)) return;
+    if (!usage) return;
+    // The same window the usage display shows: provider-reported, else the
+    // session preset's, else the model's (Claude reports none).
+    const model = typeof completed.metadata?.model === 'string' ? completed.metadata.model : undefined;
+    const window = resolveSessionContextWindow(this.sessionKey, usage.model_context_window, model).contextWindow;
+    if (!(window > 0)) return;
     const used = (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0);
     if (used < window * transportAutoCompactRatio()) return;
     const now = Date.now();

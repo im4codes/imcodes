@@ -34,14 +34,11 @@ import { readNativeAgentAdmissionMode } from '../../shared/native-collaboration-
 import { appendTransportEvent } from './transport-history.js';
 import logger from '../util/logger.js';
 import { TrailingThrottle } from '../util/trailing-throttle.js';
-import { resolveContextWindow } from '../util/model-context.js';
 import { getSession } from '../store/session-store.js';
-import { getCachedPresetContextWindow } from './cc-presets.js';
+import { resolveSessionContextWindow } from './session-context-window.js';
 import { TIMELINE_EVENT_FILE_CHANGE } from '../../shared/file-change.js';
 import { ASK_QUESTION_WAIT_MS } from '../../shared/ask-question-timing.js';
 import { normalizeCodexSdkFileChange, normalizeQwenFileChange } from './file-change-normalizer.js';
-import { USAGE_CONTEXT_WINDOW_SOURCES } from '../../shared/usage-context-window.js';
-import { resolveEffectiveSessionModel } from '../../shared/session-model.js';
 import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
 import {
   buildSdkSubagentTimelinePayload,
@@ -318,15 +315,11 @@ function normalizeUsageUpdatePayload(
   model: string | undefined,
 ): Record<string, unknown> | null {
   if (!usage && !model) return null;
-  const session = getSession(sessionName);
-  const effectiveModel = resolveEffectiveSessionModel(session, model);
-  // A preset can be edited while an SDK session remains alive. Prefer the
-  // current preset cache over the launch-time copy stored on that session so a
-  // changed 1M window takes effect on the very next usage frame.
-  const cachedPresetCtx = session?.ccPreset
-    ? getCachedPresetContextWindow(session.ccPreset)
-    : undefined;
-  const presetCtx = cachedPresetCtx ?? session?.presetContextWindow;
+  const { contextWindow, effectiveModel, source: contextWindowSource } = resolveSessionContextWindow(
+    sessionName,
+    usage?.model_context_window,
+    model,
+  );
   const inputTokens = typeof usage?.input_tokens === 'number'
     ? usage.input_tokens + (usage.cache_creation_input_tokens ?? 0)
     : undefined;
@@ -341,20 +334,6 @@ function normalizeUsageUpdatePayload(
     ? usage.cache_read_input_tokens
     : typeof usage?.cached_input_tokens === 'number'
       ? usage.cached_input_tokens
-      : undefined;
-  const explicitContextWindow = typeof usage?.model_context_window === 'number' && Number.isFinite(usage.model_context_window) && usage.model_context_window > 0
-    ? usage.model_context_window
-    : undefined;
-  const contextWindow = resolveContextWindow(
-    explicitContextWindow ?? presetCtx,
-    effectiveModel,
-    1_000_000,
-    { preferExplicit: explicitContextWindow !== undefined || presetCtx !== undefined },
-  );
-  const contextWindowSource = explicitContextWindow !== undefined && contextWindow === explicitContextWindow
-    ? USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER
-    : presetCtx !== undefined && contextWindow === presetCtx
-      ? USAGE_CONTEXT_WINDOW_SOURCES.PRESET
       : undefined;
   const payload: Record<string, unknown> = {
     ...(typeof inputTokens === 'number' ? { inputTokens } : {}),

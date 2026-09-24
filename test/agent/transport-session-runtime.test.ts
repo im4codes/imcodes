@@ -167,6 +167,20 @@ describe('TransportSessionRuntime memory provenance', () => {
       expect(provider.refreshSessionSystemText).toHaveBeenCalledWith('provider-session-1');
     });
 
+    it('uses the model\'s known window when the provider reports none, as Claude does', async () => {
+      const { resolveContextWindow } = await import('../../src/util/model-context.js');
+      const window = resolveContextWindow(undefined, 'claude-sonnet-4-6');
+      const { provider, runtime, complete } = await setup(true);
+      runtime.send('keep going', 'work-1');
+      await waitForProviderSend(provider);
+      const done = turnDone('turn-1', Math.ceil(window * 0.8));
+      const usage = { ...(done.metadata!.usage as Record<string, unknown>) };
+      delete usage.model_context_window;
+      complete({ ...done, metadata: { usage, model: 'claude-sonnet-4-6' } });
+      await vi.waitFor(() => expect(sentTexts(provider)).toHaveLength(2));
+      expect(sentTexts(provider)[1]).toContain('/compact');
+    });
+
     it('leaves a context below the threshold alone', async () => {
       const { provider, runtime, complete } = await setup(true);
       runtime.send('keep going', 'work-1');

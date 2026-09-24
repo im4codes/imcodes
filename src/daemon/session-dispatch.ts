@@ -1,4 +1,9 @@
-import { isSessionControlCommandText } from '../../shared/session-control-commands.js';
+import {
+  SESSION_MODEL_COMMAND,
+  classifySessionControlCommand,
+  isSessionControlCommandText,
+  isSessionModelSwitchCommandText,
+} from '../../shared/session-control-commands.js';
 import { createHash } from 'node:crypto';
 import { createSendDispatchId, createSendMessageId, type SendDispatchId, type SendMessageId } from '../../shared/send-message-id.js';
 import { attachDaemonUserNotice, DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
@@ -88,6 +93,16 @@ type BuildSessionDispatchMessageInput = {
   contextStatus?: DelegationContextStatus;
 };
 
+/**
+ * Text that must be delivered verbatim so the receiving daemon runs it as a
+ * command. `/stop` is excluded: stopping has its own priority path (send_stop)
+ * and must not ride the ordinary send queue.
+ */
+function isSessionControlDispatchText(message: string): boolean {
+  const control = classifySessionControlCommand(message);
+  return (control !== null && control.id !== 'stop') || isSessionModelSwitchCommandText(message);
+}
+
 export function buildSessionDispatchMessage(message: string, options: Omit<BuildSessionDispatchMessageInput, 'message'>): string;
 export function buildSessionDispatchMessage(input: BuildSessionDispatchMessageInput): string;
 export function buildSessionDispatchMessage(
@@ -96,6 +111,10 @@ export function buildSessionDispatchMessage(
 ): string {
   const message = typeof messageOrInput === 'string' ? messageOrInput : messageOrInput.message ?? '';
   const options = typeof messageOrInput === 'string' ? maybeOptions : messageOrInput;
+  // A session control command (/clear, /compact, /stop, /model X) must arrive
+  // as exactly that text. The sender line, context tail or reply instruction
+  // turned it into prose: the command never ran and the model read it instead.
+  if (isSessionControlDispatchText(message)) return message.trim();
   const contextStatus: DelegationContextStatus = options.contextStatus ?? (options.contextOmitted ? 'omitted' : 'ok');
   let result = message;
   if (options.from) {
@@ -204,6 +223,17 @@ export async function dispatchSessionMessage(
         await clearTransportConversation(target);
         return 'sent';
       }
+    }
+    // `/model X` from another session: the same switch the browser and the
+    // session_model MCP tool use (it posts its own switched/refused notice).
+    if (isSessionModelSwitchCommandText(message)) {
+      const { switchSessionModelNow } = await import('./command-handler.js');
+      const requested = message.trim().slice(SESSION_MODEL_COMMAND.length).trim().split(/\s+/)[0] ?? '';
+      if (!options.suppressTimeline) {
+        emitStructuredTransportUserMessage(target.name, message, options.messageId, options.sharedActor);
+      }
+      await switchSessionModelNow(target.name, requested);
+      return 'sent';
     }
     const runtime = getTransportRuntime(target.name);
     if (options.durableQueue) {
