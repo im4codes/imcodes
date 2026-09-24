@@ -47,6 +47,16 @@ describe('memory injection toggle', () => {
     expect(store.get(memoryInjectionMetaKey(NAMESPACE))).toBe('0');
   });
 
+  it('shares one setting between the MCP-normalized namespace and the raw runtime namespace', async () => {
+    // memory_injection_set runs with the daemon-local owner filled in; session
+    // runtimes check the raw owner-less namespace of the same project.
+    await setMemoryInjectionEnabled({ ...NAMESPACE, userId: 'daemon-local' }, false);
+    await expect(isMemoryInjectionEnabled(NAMESPACE)).resolves.toBe(false);
+    expect(memoryInjectionMetaKey(NAMESPACE)).toBe(memoryInjectionMetaKey({ ...NAMESPACE, userId: 'daemon-local' }));
+    // A different real owner is still a different setting.
+    expect(memoryInjectionMetaKey({ ...NAMESPACE, userId: 'user-2' })).not.toBe(memoryInjectionMetaKey(NAMESPACE));
+  });
+
   it('re-enables after being disabled', async () => {
     await setMemoryInjectionEnabled(NAMESPACE, false);
     await setMemoryInjectionEnabled(NAMESPACE, true);

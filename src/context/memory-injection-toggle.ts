@@ -17,11 +17,15 @@
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { serializeContextNamespace } from './context-keys.js';
 import type { ContextNamespace } from '../../shared/context-types.js';
+import { normalizeDaemonLocalMemoryNamespace } from '../../shared/memory-namespace.js';
 
 const MEMORY_INJECTION_META_KEY_PREFIX = 'memory_injection_enabled::';
 
+// The MCP tools see the daemon-local-normalized namespace (owner filled in as
+// `daemon-local`), while session runtimes hold the raw one with no owner. Both
+// must resolve to one key or the toggle is written where nothing reads it.
 export function memoryInjectionMetaKey(namespace: ContextNamespace): string {
-  return `${MEMORY_INJECTION_META_KEY_PREFIX}${serializeContextNamespace(namespace)}`;
+  return `${MEMORY_INJECTION_META_KEY_PREFIX}${serializeContextNamespace(normalizeDaemonLocalMemoryNamespace(namespace))}`;
 }
 
 export async function isMemoryInjectionEnabled(namespace: ContextNamespace): Promise<boolean> {
