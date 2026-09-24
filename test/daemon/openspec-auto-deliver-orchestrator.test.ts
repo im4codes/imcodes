@@ -1526,8 +1526,10 @@ exec "${realGit}" "$@"
       SEND_WAIT_MS,
     );
 
-    expect(await writeLatestImplementationMarker()).toBe(true);
+    // Arm before publishing the marker: the background marker poll can
+    // consume it and read the intact tasks.md before a later arm lands.
     truncateNextTasksRead();
+    expect(await writeLatestImplementationMarker()).toBe(true);
     timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
 
     await waitForP2pStartCount(1);
@@ -1555,8 +1557,10 @@ exec "${realGit}" "$@"
       SEND_WAIT_MS,
     );
 
-    expect(await writeLatestImplementationMarker()).toBe(true);
+    // Arm before publishing the marker: the background marker poll can
+    // consume it and read the intact tasks.md before a later arm lands.
     truncateNextTasksRead(50);
+    expect(await writeLatestImplementationMarker()).toBe(true);
     timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
 
     await waitForSend((msg) => (

@@ -1535,6 +1535,8 @@ describe('SupervisionAutomation', () => {
       text: `Structured audit passed.\n${PEER_AUDIT_ORCHESTRATED_RESULT_MARKERS.PASS}`,
       streaming: false,
     });
+    await vi.waitFor(() => { expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1); }, { timeout: 4_000 });
+
     await sleep(10);
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
@@ -2148,6 +2150,8 @@ describe('SupervisionAutomation', () => {
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'finalizing' });
 
     completeTurn('Committed and pushed the audited changes.');
+    await vi.waitFor(() => { expect(mockSupervisionDecide).toHaveBeenCalledTimes(2); }, { timeout: 4_000 });
+
     await sleep(25);
 
     expect(mockSupervisionDecide).toHaveBeenCalledTimes(2);
@@ -2481,6 +2485,8 @@ describe('SupervisionAutomation', () => {
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-stale-auditor', 'implement the feature', snapshot);
     beginRun('cmd-stale-auditor', 'implement the feature');
     completeTurn('implemented the feature');
+    await vi.waitFor(() => { expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1); }, { timeout: 4_000 });
+
     await sleep(50);
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
@@ -2503,6 +2509,8 @@ describe('SupervisionAutomation', () => {
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-name-only-auditor', 'implement the feature', snapshot);
     beginRun('cmd-name-only-auditor', 'implement the feature');
     completeTurn('implemented the feature');
+    await vi.waitFor(() => { expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1); }, { timeout: 4_000 });
+
     await sleep(50);
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
@@ -2542,6 +2550,8 @@ describe('SupervisionAutomation', () => {
     );
     beginRun('cmd-repaired-auditor', 'implement the feature');
     completeTurn('implemented the feature');
+    await vi.waitFor(() => { expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1); }, { timeout: 4_000 });
+
     await sleep(50);
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
@@ -2634,6 +2644,8 @@ describe('SupervisionAutomation', () => {
     );
     beginRun('cmd-genuine-model-change', 'implement the feature');
     completeTurn('implemented the feature');
+    await vi.waitFor(() => { expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1); }, { timeout: 4_000 });
+
     await sleep(25);
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
@@ -2666,6 +2678,8 @@ describe('SupervisionAutomation', () => {
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-audit-before-commit', 'implement the feature', snapshot);
     beginRun('cmd-audit-before-commit', 'implement the feature');
     completeTurn('Implementation and tests are complete. Changes are not committed yet.');
+    await vi.waitFor(() => { expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1); }, { timeout: 4_000 });
+
     await sleep(25);
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
@@ -2695,6 +2709,8 @@ describe('SupervisionAutomation', () => {
     ]));
 
     completeDelegatedAudit('PASS');
+    await vi.waitFor(() => { expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2); }, { timeout: 4_000 });
+
     await sleep(25);
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
@@ -2702,6 +2718,8 @@ describe('SupervisionAutomation', () => {
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'finalizing' });
 
     completeTurn('Committed the audited changes; push is still pending.');
+    await vi.waitFor(() => { expect(mockTransportRuntime.send).toHaveBeenCalledTimes(3); }, { timeout: 4_000 });
+
     await sleep(25);
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(3);
@@ -2710,6 +2728,8 @@ describe('SupervisionAutomation', () => {
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'finalizing' });
 
     completeTurn('Pushed the audited changes.');
+    await vi.waitFor(() => { expect(mockTransportRuntime.send).toHaveBeenCalledTimes(3); }, { timeout: 4_000 });
+
     await sleep(25);
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(3);
@@ -2773,6 +2793,7 @@ describe('SupervisionAutomation', () => {
     // turn while the first one is still pending.
     timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
     timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    await vi.waitFor(() => { expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2); }, { timeout: 4_000 });
     await sleep(25);
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
 
@@ -2872,6 +2893,8 @@ describe('SupervisionAutomation', () => {
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-audit-qualified-commit', 'implement the feature', snapshot);
     beginRun('cmd-audit-qualified-commit', 'implement the feature');
     completeTurn('实现与测试均已完成，当前改动尚未提交。');
+    await vi.waitFor(() => { expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1); }, { timeout: 4_000 });
+
     await sleep(25);
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
@@ -2927,12 +2950,14 @@ describe('SupervisionAutomation', () => {
     // Acknowledging the one dispatch and going idle must not run the
     // supervisor again or emit a second audit/continue request.
     completeTurn('审计已发送，等待 reply-enabled 回执。');
+    await vi.waitFor(() => { expect(mockSupervisionDecide).toHaveBeenCalledTimes(1); }, { timeout: 4_000 });
     await sleep(25);
     expect(mockSupervisionDecide).toHaveBeenCalledTimes(1);
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'auditing' });
 
     completeDelegatedAudit('PASS', 'The completion-evidenced fix is correct.');
+    await vi.waitFor(() => { expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2); }, { timeout: 4_000 });
     await sleep(25);
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
     const finalizationPrompt = String(mockTransportRuntime.send.mock.calls[1]?.[0]);
@@ -2942,6 +2967,7 @@ describe('SupervisionAutomation', () => {
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toMatchObject({ phase: 'finalizing' });
 
     completeTurn('已提交并推送审计通过的改动。');
+    await vi.waitFor(() => { expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2); }, { timeout: 4_000 });
     await sleep(25);
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
     expect(mockTransportRuntime.send.mock.calls.filter((call) =>
@@ -3022,6 +3048,8 @@ describe('SupervisionAutomation', () => {
     completeTurn('Implementation and tests are complete.');
     await sleep(25);
     completeDelegatedAudit('REWORK', 'needs fixes');
+    await vi.waitFor(() => { expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2); }, { timeout: 4_000 });
+
     await sleep(25);
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
@@ -3354,6 +3382,8 @@ describe('SupervisionAutomation', () => {
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-ordinary-commit', 'implement the feature', snapshot);
     beginRun('cmd-ordinary-commit', 'implement the feature');
     completeTurn('Implementation and tests are complete.');
+    await vi.waitFor(() => { expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1); }, { timeout: 4_000 });
+
     await sleep(25);
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
@@ -3373,6 +3403,8 @@ describe('SupervisionAutomation', () => {
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-tests-before-audit', 'implement the feature', snapshot);
     beginRun('cmd-tests-before-audit', 'implement the feature');
     completeTurn('Implementation is present but validation is still pending.');
+    await vi.waitFor(() => { expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1); }, { timeout: 4_000 });
+
     await sleep(25);
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
@@ -3395,6 +3427,8 @@ describe('SupervisionAutomation', () => {
     supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-chinese-tests-before-audit', 'implement the feature', snapshot);
     beginRun('cmd-chinese-tests-before-audit', 'implement the feature');
     completeTurn('实现存在，但验证仍未完成。');
+    await vi.waitFor(() => { expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1); }, { timeout: 4_000 });
+
     await sleep(25);
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
@@ -3417,6 +3451,8 @@ describe('SupervisionAutomation', () => {
     beginRun('cmd-continue', 'implement the feature');
 
     completeTurn('implemented the code but did not add tests');
+    await vi.waitFor(() => { expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1); }, { timeout: 4_000 });
+
     await sleep(25);
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
@@ -3466,6 +3502,8 @@ describe('SupervisionAutomation', () => {
     completeTurn('added a first batch of tests');
     await sleep(25);
     completeTurn('added another batch of tests');
+    await vi.waitFor(() => { expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2); }, { timeout: 4_000 });
+
     await sleep(25);
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
@@ -3502,6 +3540,8 @@ describe('SupervisionAutomation', () => {
     completeTurn('added tests');
     await sleep(25);
     completeTurn('restarted the daemon');
+    await vi.waitFor(() => { expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2); }, { timeout: 4_000 });
+
     await sleep(25);
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(2);
@@ -3538,6 +3578,8 @@ describe('SupervisionAutomation', () => {
     completeTurn('added a first batch of tests');
     await sleep(25);
     completeTurn('added a second batch of tests');
+    await vi.waitFor(() => { expect(mockTransportRuntime.send).toHaveBeenCalledTimes(3); }, { timeout: 4_000 });
+
     await sleep(25);
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(3);
@@ -3654,6 +3696,8 @@ describe('SupervisionAutomation', () => {
 
     completeTurn('implemented the feature');
     await sleep(25);
+    await vi.waitFor(() => { expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1); }, { timeout: 4_000 });
+
     await sleep(25);
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
@@ -4794,6 +4838,8 @@ describe('SupervisionAutomation', () => {
     completeTurn('implemented the feature');
     await sleep(25);
     completeDelegatedAudit('REWORK', 'needs fixes');
+    await vi.waitFor(() => { expect(mockSupervisionDecide).toHaveBeenCalledTimes(1); }, { timeout: 4_000 });
+
     await sleep(25);
 
     expect(mockSupervisionDecide).toHaveBeenCalledTimes(1);
@@ -4936,12 +4982,15 @@ describe('SupervisionAutomation', () => {
       allowDuplicate: true,
     });
     completeTurn('implemented both requests');
+    await vi.waitFor(() => { expect(mockSupervisionDecide).toHaveBeenCalledTimes(1); }, { timeout: 4_000 });
+
     await sleep(25);
 
     expect(mockSupervisionDecide).toHaveBeenCalledTimes(1);
     expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
 
     timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    await vi.waitFor(() => { expect(mockSupervisionDecide).toHaveBeenCalledTimes(1); }, { timeout: 4_000 });
     await sleep(25);
     expect(mockSupervisionDecide).toHaveBeenCalledTimes(1);
   });
@@ -5113,6 +5162,8 @@ describe('SupervisionAutomation', () => {
     completeTurn('implemented the feature');
     await sleep(25);
     completeDelegatedAudit('REWORK', 'needs fixes');
+    await vi.waitFor(() => { expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1); }, { timeout: 4_000 });
+
     await sleep(25);
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
@@ -5186,6 +5237,8 @@ describe('SupervisionAutomation', () => {
 
     completeTurn('implemented the feature');
     await sleep(25);
+    await vi.waitFor(() => { expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1); }, { timeout: 4_000 });
+
     await sleep(25);
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
@@ -5219,6 +5272,8 @@ describe('SupervisionAutomation', () => {
 
     completeTurn('implemented the feature');
     await sleep(25);
+    await vi.waitFor(() => { expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1); }, { timeout: 4_000 });
+
     await sleep(25);
 
     expect(mockTransportRuntime.send).toHaveBeenCalledTimes(1);
@@ -5705,6 +5760,8 @@ describe('SupervisionAutomation', () => {
     timelineEmitter.forgetSession('deck_supervision_brain');
     timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'running' });
     timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+    await vi.waitFor(() => { expect(mockSupervisionDecide).toHaveBeenCalledTimes(2); }, { timeout: 4_000 });
+
     await sleep(25);
 
     expect(mockSupervisionDecide).toHaveBeenCalledTimes(2);
@@ -8113,6 +8170,7 @@ describe('SupervisionAutomation', () => {
       });
 
       await supervisionAutomation.__checkImplementationAssignmentsForTests(firstDue + 130 * 60_000);
+      await vi.waitFor(() => { expect(mockTransportRuntime.send).toHaveBeenCalledTimes(4); }, { timeout: 4_000 });
       await sleep(25);
       expect(mockTransportRuntime.send).toHaveBeenCalledTimes(4);
       const blocker = JSON.parse(registry.getAssignment(assignmentId)!.blocker!);
@@ -8127,6 +8185,7 @@ describe('SupervisionAutomation', () => {
       const eventsAfterEscalation = registry.listEvents(taskId).length;
       supervisionAutomation.__simulateProcessRestartForTests();
       await supervisionAutomation.__checkImplementationAssignmentsForTests(firstDue + 24 * 60 * 60_000);
+      await vi.waitFor(() => { expect(mockTransportRuntime.send).toHaveBeenCalledTimes(4); }, { timeout: 4_000 });
       await sleep(25);
       expect(mockTransportRuntime.send).toHaveBeenCalledTimes(4);
       expect(registry.listEvents(taskId)).toHaveLength(eventsAfterEscalation);
