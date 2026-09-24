@@ -2,17 +2,28 @@ import { describe, it, expect } from 'vitest';
 import { shortModelLabel, bestModelLabel } from '../src/model-label.js';
 
 describe('shortModelLabel', () => {
-  it('normalizes GPT-5.4 family labels', () => {
+  it('shows the last two parts of any GPT/Codex id, so version and variant both survive', () => {
     expect(shortModelLabel('gpt-5.4')).toBe('gpt-5.4');
-    expect(shortModelLabel('gpt-5.4-mini')).toBe('gpt-5.4-mini');
-    expect(shortModelLabel('gpt-5.4-nano')).toBe('gpt-5.4-nano');
-    expect(shortModelLabel('gpt-5.4-pro')).toBe('gpt-5.4-pro');
+    expect(shortModelLabel('gpt-5.4-mini')).toBe('5.4-mini');
+    expect(shortModelLabel('gpt-5.4-nano')).toBe('5.4-nano');
+    expect(shortModelLabel('gpt-5.4-pro')).toBe('5.4-pro');
+    expect(shortModelLabel('gpt-5.2-codex')).toBe('5.2-codex');
+    expect(shortModelLabel('gpt-5-mini')).toBe('5-mini');
+    expect(shortModelLabel('gpt-5.6-sol')).toBe('5.6-sol');
+    expect(shortModelLabel('gpt-5.6-luna')).toBe('5.6-luna');
   });
 
-  it('keeps older GPT-5/Codex family names stable', () => {
-    expect(shortModelLabel('gpt-5.2-codex')).toBe('gpt-5.2-codex');
-    expect(shortModelLabel('gpt-5.3-codex')).toBe('gpt-5.3-codex');
-    expect(shortModelLabel('gpt-5-mini')).toBe('gpt-5-mini');
+  it('recognizes GPT-6 and later generations instead of dropping the version', () => {
+    expect(shortModelLabel('gpt-6')).toBe('gpt-6');
+    expect(shortModelLabel('gpt-6-luna')).toBe('6-luna');
+    expect(shortModelLabel('gpt-6.1-sol')).toBe('6.1-sol');
+    expect(shortModelLabel('openai/gpt-6-luna')).toBe('6-luna');
+  });
+
+  it('keeps GPT-4 family labels stable', () => {
+    expect(shortModelLabel('gpt-4o')).toBe('gpt-4o');
+    expect(shortModelLabel('gpt-4o-2024-08-06')).toBe('gpt-4o');
+    expect(shortModelLabel('gpt-4.1')).toBe('gpt-4.1');
   });
 
   it('shows the Claude family with its version, preserves Gemini shorthand', () => {

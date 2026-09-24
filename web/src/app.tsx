@@ -3884,7 +3884,7 @@ export function App() {
           stripped.includes('opus') ? 'opus[1M]' :
           stripped.includes('sonnet') ? 'sonnet' :
           stripped.includes('haiku') ? 'haiku' : null;
-        const gptMatch = stripped.match(/\b(gpt-5(?:\.\d+)?(?:-\w+)?)\b/);
+        const gptMatch = stripped.match(/\b(gpt-\d+(?:\.\d+)?(?:-[a-z0-9]+)*)\b/);
         const geminiMatch = stripped.match(/\b(gemini[- ]\d[\w.-]*)\b/);
         const detected = claudeModel ?? (gptMatch ? gptMatch[1] : null) ?? (geminiMatch ? geminiMatch[1] : null);
         if (detected) {
@@ -4048,7 +4048,7 @@ export function App() {
               (modelStr.includes('opus') || modelStr.includes('sonnet') || modelStr.includes('haiku'))
                 ? rawModel
                 : null;
-            const gptM = modelStr.match(/\b(gpt-5(?:\.\d+)?(?:-\w+)?)\b/);
+            const gptM = modelStr.match(/\b(gpt-\d+(?:\.\d+)?(?:-[a-z0-9]+)*)\b/);
             const gemM = modelStr.match(/\b(gemini[- ]\d[\w.-]*)\b/);
             const det = claudeM ?? (gptM ? gptM[1] : null) ?? (gemM ? gemM[1] : null);
             if (det) {
