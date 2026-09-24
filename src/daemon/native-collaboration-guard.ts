@@ -10,8 +10,11 @@
  * and keeps provider defaults.
  *
  * - `pre_execution_gate` providers ask `evaluateNativeCollaborationPreExecution`
- *   before a native agent tool runs; a managed session admits proven analysis
- *   only.
+ *   before a native agent tool runs. A Brain admits proven analysis only. A
+ *   formal participant (never a Brain) additionally admits ANY request --
+ *   proven analysis, unclassified, or task work -- as long as it carries none
+ *   of the three never-delegable signals (`isDelegableParticipantWork`): the
+ *   participant remains the accountable executor either way.
  * - `session_fence` providers ask `isNativeAgentFenceRequired` on the path that
  *   launches, loads or sends, and withhold native agent tools for managed
  *   sessions. Supervised dispatch checks the proven fence separately
@@ -266,11 +269,12 @@ export function evaluateNativeCollaborationPreExecution(
     if (scope === NATIVE_COLLABORATION_SCOPES.UNMANAGED) return { allow: true };
     const classification = classifyNativeCollaborationRequest(request.requestText);
     if (classification.participation === NATIVE_COLLABORATION_PARTICIPATION.ANALYSIS) return { allow: true };
-    // A formal participant (never a Brain) may hand small, bounded pieces of
-    // its OWN assigned work to its own native subagent, as long as nothing in
-    // the request touches IM.codes task authority, a verdict, or a Git/deploy
-    // gate -- see isDelegableParticipantWork. The participant remains the
-    // accountable executor of the task itself.
+    // A formal participant (never a Brain) may hand any of its OWN assigned
+    // work -- including unclassified or long narrative requests -- to its own
+    // native subagent, as long as nothing in the request touches IM.codes
+    // task authority, a verdict, or a Git/deploy gate -- see
+    // isDelegableParticipantWork. The participant remains the accountable
+    // executor of the task itself.
     if (scope === NATIVE_COLLABORATION_SCOPES.PARTICIPANT && isDelegableParticipantWork(classification)) {
       return { allow: true };
     }

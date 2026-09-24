@@ -261,12 +261,23 @@ describe('native collaboration supervision-authority guard', () => {
       for (const signal of expectedSignals) expect(decision.signals).toContain(signal);
     });
 
-    it('denies unclassified requests in a managed session', () => {
+    it('denies an unclassified request from a Brain, which never gets the participant carve-out', () => {
       const { gate } = makeProvider(GATED, 'claude-code-sdk');
-      const decision = gate()(BRAIN_CHILD, { provider: 'claude-code-sdk', toolName: 'Workflow', requestText: 'agent("x")' });
+      const decision = gate()(BRAIN, { provider: 'claude-code-sdk', toolName: 'Workflow', requestText: 'agent("x")' });
       expect(decision.allow).toBe(false);
       if (decision.allow) return;
       expect(noticeOf(decision.reason)).toMatchObject({ outcome: 'native_agent_request_denied_unclassified' });
+    });
+
+    it('lets a formal participant delegate even an unclassified request -- no classifier-recognized intent required', () => {
+      const { gate } = makeProvider(GATED, 'claude-code-sdk');
+      // Neither PARTICIPANT nor a Brain-descendant (BRAIN_CHILD) needs the
+      // request to be classifier-recognized as analysis/implementation/audit
+      // any more: only the three never-delegable signals still refuse it.
+      expect(gate()(PARTICIPANT, { provider: 'claude-code-sdk', toolName: 'Workflow', requestText: 'agent("x")' }))
+        .toEqual({ allow: true });
+      expect(gate()(BRAIN_CHILD, { provider: 'claude-code-sdk', toolName: 'Workflow', requestText: 'agent("x")' }))
+        .toEqual({ allow: true });
     });
 
     it('answers the per-session fence resolver from the same scope', () => {

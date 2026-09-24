@@ -279,24 +279,22 @@ const NEVER_DELEGABLE_TASK_SIGNALS: ReadonlySet<NativeCollaborationTaskSignal> =
 ]);
 
 /**
- * A formal PARTICIPANT (never a Brain) may delegate small, bounded pieces of
- * its own assigned work to its own native subagent -- reading and describing
- * a batch of files, drafting one small helper, checking one specific
- * condition -- as long as the subagent never becomes the one opening or
- * advancing an IM.codes task, recording a verdict, or touching a Git/deploy
- * gate. The participant remains the accountable executor: it still owns the
- * task's actual judgment and integrates the subagent's output itself: this
- * only widens what MAY be handed to a helper, not who is responsible for the
- * result. Signals scoped to a single work-product's implementation/audit
- * content (IMPLEMENTATION, AUDIT) are delegable; any request that ALSO
- * carries a never-delegable signal is refused exactly as before.
+ * A formal PARTICIPANT (never a Brain) may delegate any of its own assigned
+ * work to its own native subagent -- reading and describing files, drafting
+ * a helper, checking a condition, implementing or auditing a work-product --
+ * as long as the subagent never becomes the one opening or advancing an
+ * IM.codes task, recording a verdict, or touching a Git/deploy gate. The
+ * participant remains the accountable executor: it still owns the task's
+ * actual judgment and integrates the subagent's output itself: this only
+ * widens what MAY be handed to a helper, not who is responsible for the
+ * result. No classifier-recognized intent is required -- an unclassified or
+ * long, narrative request is delegable exactly like a clean one; only the
+ * three never-delegable signals refuse it.
  */
 export function isDelegableParticipantWork(
   classification: Pick<NativeCollaborationClassification, 'participation' | 'signals'>,
 ): boolean {
-  return classification.participation === NATIVE_COLLABORATION_PARTICIPATION.TASK
-    && classification.signals.length > 0
-    && classification.signals.every((signal) => !NEVER_DELEGABLE_TASK_SIGNALS.has(signal));
+  return classification.signals.every((signal) => !NEVER_DELEGABLE_TASK_SIGNALS.has(signal));
 }
 
 /**
