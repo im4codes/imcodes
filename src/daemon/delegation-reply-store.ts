@@ -1144,6 +1144,38 @@ export class DelegationReplyStore {
   }
 
   /**
+   * Retire every still-open return of a delegation whose task has ENDED.
+   *
+   * Unlike {@link expire}, this also closes HELD audit completions: those are
+   * re-listed on every startup resume, so leaving them open would re-arm the
+   * same stale delivery after each daemon restart.
+   */
+  retireForEndedTask(delegationId: string, now = Date.now()): number {
+    this.#db.prepare(`
+      UPDATE delegation_replies
+      SET status = ?, updated_at = ?
+      WHERE delegation_id = ? AND status <> ?
+    `).run(
+      AGENT_DELEGATION_REPLY_STATUSES.EXPIRED,
+      now,
+      delegationId,
+      AGENT_DELEGATION_REPLY_STATUSES.DELIVERED,
+    );
+    const result = this.#db.prepare(`
+      UPDATE delegation_reply_messages
+      SET status = ?, updated_at = ?
+      WHERE delegation_id = ? AND status IN (?, ?)
+    `).run(
+      AGENT_DELEGATION_REPLY_STATUSES.EXPIRED,
+      now,
+      delegationId,
+      AGENT_DELEGATION_REPLY_STATUSES.RECEIVED,
+      AGENT_DELEGATION_REPLY_STATUSES.HELD,
+    );
+    return Number(result.changes ?? 0);
+  }
+
+  /**
    * Every still-open return owned by one exact (task, coordinator assignment).
    *
    * This is what connects an authorized coordinator rebind to the pending

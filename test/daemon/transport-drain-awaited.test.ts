@@ -51,9 +51,11 @@ beforeEach(() => {
 describe('drainResend awaited contract (audit cae1de69-826 / R-Drain)', () => {
   it('reuses the supervision authority gate at both resend and runtime FIFO drain edges', () => {
     const manager = readFileSync(new URL('../../src/agent/session-manager.ts', import.meta.url), 'utf8');
-    const resendGate = manager.indexOf('const admission = resolveQueuedSupervisionHeartbeatDelivery({');
+    // Both edges share ONE admission: the supervision heartbeat gate for every
+    // entry, plus the ended-task gate for queued delegation replies.
+    const resendGate = manager.indexOf('const admission = resolveTransportQueueEntryAdmission(sessionName, entry);');
     const resendDispatch = manager.indexOf('deliverTransportResendEntry(runtime, entry, ownership)');
-    const runtimeGate = manager.indexOf('runtime.pendingDrainAdmission = (entry) => resolveQueuedSupervisionHeartbeatDelivery({');
+    const runtimeGate = manager.indexOf('runtime.pendingDrainAdmission = (entry) => resolveTransportQueueEntryAdmission(sessionName, entry);');
 
     expect(resendGate).toBeGreaterThanOrEqual(0);
     expect(resendGate).toBeLessThan(resendDispatch);
@@ -62,14 +64,18 @@ describe('drainResend awaited contract (audit cae1de69-826 / R-Drain)', () => {
 
   it('kills either-edge regression to the stale boolean-authorizer literal', () => {
     const manager = readFileSync(new URL('../../src/agent/session-manager.ts', import.meta.url), 'utf8');
-    const resendResolver = 'const admission = resolveQueuedSupervisionHeartbeatDelivery({';
-    const runtimeResolver = 'runtime.pendingDrainAdmission = (entry) => resolveQueuedSupervisionHeartbeatDelivery({';
+    const admission = readFileSync(new URL('../../src/daemon/delegation-reply-task-liveness.ts', import.meta.url), 'utf8');
+    const resendResolver = 'const admission = resolveTransportQueueEntryAdmission(sessionName, entry);';
+    const runtimeResolver = 'runtime.pendingDrainAdmission = (entry) => resolveTransportQueueEntryAdmission(sessionName, entry);';
     const staleBooleanLiteral = 'authorizeQueuedSupervisionHeartbeatDelivery({';
+    const triStateHeartbeat = 'const supervision = resolveQueuedSupervisionHeartbeatDelivery({';
 
-    const preservesBothTriStateEdges = (source: string): boolean => (
+    const preservesBothTriStateEdges = (source: string, shared = admission): boolean => (
       source.includes(resendResolver)
       && source.includes(runtimeResolver)
       && !source.includes(staleBooleanLiteral)
+      && shared.includes(triStateHeartbeat)
+      && !shared.includes(staleBooleanLiteral)
     );
 
     expect(preservesBothTriStateEdges(manager)).toBe(true);
@@ -81,6 +87,10 @@ describe('drainResend awaited contract (audit cae1de69-826 / R-Drain)', () => {
       runtimeResolver,
       `runtime.pendingDrainAdmission = (entry) => ${staleBooleanLiteral}`,
     )), 'runtime FIFO edge mutant collapses stale/retry into boolean').toBe(false);
+    expect(preservesBothTriStateEdges(manager, admission.replace(
+      triStateHeartbeat,
+      `const supervision = ${staleBooleanLiteral}`,
+    )), 'shared admission mutant collapses stale/retry into boolean').toBe(false);
   });
 
   it('pins the single resend-to-runtime handoff transfer and kills release/reinsert mutants', () => {

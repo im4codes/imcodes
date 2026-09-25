@@ -41,6 +41,7 @@ import logger from '../util/logger.js';
 import { advanceSupervisionTaskAfterAuditReceipt } from './supervision-convergence-wire.js';
 import { inspectSupervisionAssignmentWorktree } from './supervision-worktree-inspector.js';
 import { getTransportQueueStore } from './transport-queue-store.js';
+import { endedTaskOfDelegationReply } from './delegation-reply-task-liveness.js';
 import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../shared/memory-mcp-contracts.js';
 import { PROVIDER_ACTIVE_TURN_DELIVERY_KINDS } from '../agent/transport-provider.js';
 import { deterministicAutomaticAuditDeliveryMessageId } from '../../shared/send-message-id.js';
@@ -641,6 +642,26 @@ async function submitDelegatedPeerAuditReply(input: {
 
 registerDelegatedPeerAuditReplyIngressHandler(submitDelegatedPeerAuditReply);
 
+/**
+ * Retire a task-bound reply whose task has ENDED instead of delivering it.
+ * Checked at every delivery edge (delivery attempt, startup resume, origin
+ * auto-rebind), not only when the reply was received: a reply can wait days
+ * for its origin, and the task can be cancelled or finalized meanwhile.
+ */
+function retireIfTaskEnded(record: DelegationReplyRecord, edge: string): boolean {
+  const ended = endedTaskOfDelegationReply(record);
+  if (!ended) return false;
+  getDelegationReplyStore().retireForEndedTask(record.delegationId);
+  logger.info({
+    delegationId: record.delegationId,
+    notificationId: record.notificationId,
+    assignmentId: record.assignmentId,
+    edge,
+    ...ended,
+  }, 'delegation reply retired without delivery: its task already ended');
+  return true;
+}
+
 function scheduleRetry(delegationId: string, notificationId: string, delayMs: number): void {
   if (retryTimers.has(notificationId)) return;
   const timer = setTimeout(() => {
@@ -711,6 +732,9 @@ async function deliverRecord(record: DelegationReplyRecord): Promise<DelegationR
   const promise = (async (): Promise<DelegationReplyIngressResult> => {
     if (!(record.taskId && record.assignmentId) && Date.now() >= record.expiresAt) {
       getDelegationReplyStore().expire(record.delegationId);
+      return { ok: false, error: AGENT_DELEGATION_REPLY_ERRORS.EXPIRED };
+    }
+    if (retireIfTaskEnded(record, 'delivery')) {
       return { ok: false, error: AGENT_DELEGATION_REPLY_ERRORS.EXPIRED };
     }
     const currentOrigin = boundIdentity(getSession(record.origin.sessionName));
@@ -1142,6 +1166,7 @@ export function sweepStaleDeliveryOriginsForAutoRebind(): void {
   const registry = getSupervisionTaskRegistry();
   for (const record of getDelegationReplyStore().listReceived()) {
     if (!record.taskId || !record.assignmentId) continue;
+    if (retireIfTaskEnded(record, 'auto_rebind')) continue;
     const live = boundIdentity(getSession(record.origin.sessionName));
     if (!live || identityMatches(record.origin, live)) continue;
     const coordinator = registry.listAssignments(record.taskId).find((assignment) => (
@@ -1158,6 +1183,7 @@ export function sweepStaleDeliveryOriginsForAutoRebind(): void {
 
 export function resumePendingDelegationReplies(): void {
   for (const record of getDelegationReplyStore().listHeldAuditCompletions()) {
+    if (retireIfTaskEnded(record, 'startup_resume')) continue;
     if (isExactAuditRecord(record) && hasExactFinalAuditReceipt(record)) {
       getDelegationReplyStore().suppressHeldAuditCompletions({
         delegationId: record.delegationId,
@@ -1172,6 +1198,9 @@ export function resumePendingDelegationReplies(): void {
     }
   }
   for (const record of getDelegationReplyStore().listReceived()) {
+    // Before the timeline card too: an ended task's reply must not resurface
+    // as a fresh completion card after a restart.
+    if (retireIfTaskEnded(record, 'startup_resume')) continue;
     emitDelegationReplyTimeline(record);
     scheduleRetry(record.delegationId, record.notificationId, 250);
   }

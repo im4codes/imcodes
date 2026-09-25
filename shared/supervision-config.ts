@@ -978,6 +978,18 @@ export function isTerminalSupervisionTaskStatus(value: SupervisionTaskLifecycleS
   return value === 'pushed' || value === 'finalized' || value === 'blocked' || value === 'cancelled';
 }
 
+/**
+ * Ended for good: nothing addressed to the task can matter again.
+ *
+ * Narrower than {@link isTerminalSupervisionTaskStatus} on purpose: a `blocked`
+ * task can be recovered and a `pushed` one still finalizes, so work addressed
+ * to them may still be read. Deferred deliveries (a reply held across a daemon
+ * restart) are retired only against this predicate.
+ */
+export function isEndedSupervisionTaskStatus(value: SupervisionTaskLifecycleStatus): boolean {
+  return value === 'finalized' || value === 'cancelled';
+}
+
 export const SUPERVISION_TASK_CLEANUP_VERSION = 1 as const;
 export const SUPERVISION_TASK_HOUSEKEEPING_DEFAULT_BATCH_SIZE = 25 as const;
 export const SUPERVISION_TASK_HOUSEKEEPING_MAX_BATCH_SIZE = 100 as const;

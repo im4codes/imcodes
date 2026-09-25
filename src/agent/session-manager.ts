@@ -92,7 +92,7 @@ import { cleanupKnownTestTerminalSessions } from './startup-test-session-cleanup
 import { clearResend, drainResend, getResendCount, getResendEntries, listFreshResendQueues, recipientFromSessionRecord, RESEND_DISPATCH_CONTROL } from '../daemon/transport-resend-queue.js';
 import { preserveTransportRuntimeQueuesToResend } from '../daemon/transport-resend-preservation.js';
 import { deliverTransportResendEntry } from './transport-resend-delivery.js';
-import { resolveQueuedSupervisionHeartbeatDelivery } from '../daemon/supervision-participant-delivery.js';
+import { resolveTransportQueueEntryAdmission } from '../daemon/delegation-reply-task-liveness.js';
 import { isNativeAgentFenceRequiredForLaunch } from '../daemon/native-collaboration-guard.js';
 import { processLaunchFence } from './native-agent-fence.js';
 import { getTransportQueueRevision, observeTransportQueueRevision } from '../daemon/transport-queue-revision.js';
@@ -1522,12 +1522,7 @@ async function drainTransportResendQueueIntoRuntime(
     await drainResend(
       sessionName,
       async (entry, ownership) => {
-        const admission = resolveQueuedSupervisionHeartbeatDelivery({
-          targetSessionName: sessionName,
-          clientMessageId: entry.clientMessageId ?? entry.commandId ?? '',
-          text: entry.text,
-          supervisionReference: entry.supervisionReference,
-        });
+        const admission = resolveTransportQueueEntryAdmission(sessionName, entry);
         if (admission === 'stale') return RESEND_DISPATCH_CONTROL.STALE;
         if (admission === 'retry') return RESEND_DISPATCH_CONTROL.RETRY;
         const attachments = entry.attachments ?? [];
@@ -1935,12 +1930,7 @@ function wireTransportCallbacks(
       { source: 'daemon', confidence: 'high' },
     );
   };
-  runtime.pendingDrainAdmission = (entry) => resolveQueuedSupervisionHeartbeatDelivery({
-    targetSessionName: sessionName,
-    clientMessageId: entry.clientMessageId,
-    text: entry.text,
-    supervisionReference: entry.supervisionReference,
-  });
+  runtime.pendingDrainAdmission = (entry) => resolveTransportQueueEntryAdmission(sessionName, entry);
   runtime.onActiveAppend = (messages, snapshot) => {
     const pendingMessageVersion = observeTransportQueueRevision(sessionName, snapshot.pendingMessageVersion);
     for (const entry of messages) {
