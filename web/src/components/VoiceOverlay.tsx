@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'preact/hooks';
+import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import * as VoiceInput from './VoiceInput.js';
 
@@ -231,7 +232,10 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
 
   if (!open) return null;
 
-  return (
+  // Portal to <body>: a sub-session window is its own stacking context
+  // (`isolation: isolate`), so rendering in place traps the overlay's z-index
+  // beneath the app chrome and hides the close button.
+  return createPortal((
     <div class="voice-overlay" style={{ height: maxH }}>
       <div class="voice-overlay-grid" />
 
@@ -300,5 +304,5 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
         </button>
       </div>
     </div>
-  );
+  ), document.body);
 }

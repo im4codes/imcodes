@@ -184,7 +184,10 @@ describe('low-coverage page and component surfaces', () => {
     fireEvent.input(screen.getByPlaceholderText('/home/user/projects/my-project'), { target: { value: '/work/alpha' } });
     const issueTrackerSelect = screen.getByText('Issue Tracker').parentElement?.querySelector('select');
     expect(issueTrackerSelect).not.toBeNull();
-    fireEvent.change(issueTrackerSelect!, { target: { value: 'github' } });
+    // Dispatch a real `change`: once preact/compat is loaded, Testing Library's
+    // fireEvent.change is rewritten to `input`, which a <select onChange> never sees.
+    issueTrackerSelect!.value = 'github';
+    fireEvent(issueTrackerSelect!, new Event('change', { bubbles: true }));
     fireEvent.input(await screen.findByPlaceholderText('ghp_...'), { target: { value: 'ghp_token' } });
     fireEvent.input(screen.getByPlaceholderText('myorg/myrepo'), { target: { value: 'imcodes/app' } });
     fireEvent.click(screen.getByRole('button', { name: 'Add Project' }));
@@ -337,6 +340,20 @@ describe('low-coverage page and component surfaces', () => {
     fireEvent.click(screen.getByText('voice.send'));
 
     expect(onSend).toHaveBeenCalledWith('hello world');
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  it('VoiceOverlay renders at <body> so a sub-session window stacking context cannot cover its close button', () => {
+    const onClose = vi.fn();
+    render(
+      <div class="subsession-window" style={{ isolation: 'isolate' }}>
+        <VoiceOverlay open onSend={vi.fn(() => 'accepted' as const)} onClose={onClose} />
+      </div>,
+    );
+    const overlay = document.querySelector('.voice-overlay') as HTMLElement;
+    expect(overlay.parentElement).toBe(document.body);
+    expect(overlay.closest('.subsession-window')).toBeNull();
+    fireEvent.click(overlay.querySelector('.voice-overlay-close') as HTMLElement);
     expect(onClose).toHaveBeenCalled();
   });
 
