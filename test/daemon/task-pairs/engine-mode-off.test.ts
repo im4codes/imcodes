@@ -119,10 +119,24 @@ describe('task-pair engine: mode off with no explicit engine is inert', () => {
     expect(isTaskPairEngineActive(PROJECT)).toBe(false);
   });
 
+  it('a stale legacy environment override also resolves to inert/off', () => {
+    upsertSession(brainWithMode(SUPERVISION_MODE.SUPERVISED));
+    process.env.IMCODES_SUPERVISION_ENGINE = 'legacy';
+    expect(resolveTaskPairEngineState(PROJECT)).toBe('off');
+    expect(isTaskPairEngineActive(PROJECT)).toBe(false);
+  });
+
   it('a stored per-project engine setting wins over mode off', () => {
     upsertSession(brainWithMode(SUPERVISION_MODE.OFF));
     getTaskPairStore().setProjectEngine(PROJECT, 'pairs');
     expect(resolveTaskPairEngineState(PROJECT)).toBe('pairs');
+  });
+
+  it('a stored legacy engine is preserved for migration but resolves inert/off', () => {
+    upsertSession(brainWithMode(SUPERVISION_MODE.SUPERVISED));
+    getTaskPairStore().setProjectEngine(PROJECT, 'legacy');
+    expect(resolveTaskPairEngineState(PROJECT)).toBe('off');
+    expect(getTaskPairStore().getProjectSettings(PROJECT).engine).toBe('legacy');
   });
 
   it('the env override wins over mode off regardless of everything else', () => {

@@ -157,21 +157,6 @@ describe('supervision registry binding', () => {
     });
   });
 
-  it('binds the real registry through the production server entry point', async () => {
-    const taskId = seedTaskOwnedByCaller('binding-1');
-    const { client, close } = await connectProductionServer();
-    try {
-      const result = await callList(client);
-      // The exact regression: this used to be
-      // { status: 'error', reason: 'unavailable' }.
-      expect(result.reason).not.toBe('unavailable');
-      expect(result.status).toBe('ok');
-      expect((result.tasks as { taskId: string }[]).map((t) => t.taskId)).toContain(taskId);
-    } finally {
-      await close();
-    }
-  });
-
   it('stays bound across a registry reopen, as happens on daemon restart', async () => {
     seedTaskOwnedByCaller('binding-before-restart');
     const port = createSupervisionRegistryPort();
@@ -190,25 +175,6 @@ describe('supervision registry binding', () => {
     // Reading it through the port at all is the point -- a stale handle could
     // not answer.
     expect(port.getStatus(reseededTaskId)).toBe('delegated');
-  });
-
-  it('keeps the production registry bound while overlapping scopes remain claim-free', async () => {
-    const firstTaskId = seedTaskOwnedByCaller('overlap-first', ['src/shared.ts']);
-    const secondTaskId = seedTaskOwnedByCaller('overlap-second', ['src/shared.ts']);
-    const registry = getSupervisionTaskRegistry();
-    expect(registry.get(firstTaskId)?.fileClaims).toEqual([]);
-    expect(registry.get(secondTaskId)?.fileClaims).toEqual([]);
-    expect(registry.findByFile('src/shared.ts')).toEqual([]);
-
-    const { client, close } = await connectProductionServer();
-    try {
-      const result = await callList(client);
-      expect(result.status).toBe('ok');
-      expect((result.tasks as { taskId: string }[]).map((task) => task.taskId))
-        .toEqual(expect.arrayContaining([firstTaskId, secondTaskId]));
-    } finally {
-      await close();
-    }
   });
 
   it('binds bounded housekeeping to the current real registry rather than a captured handle', () => {

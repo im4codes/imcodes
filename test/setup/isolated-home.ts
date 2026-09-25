@@ -140,9 +140,9 @@ if (!(globalThis as { __imcodesIsolatedHomeCleanup?: boolean }).__imcodesIsolate
   }
 }
 
-// The shipped default engine is `pairs`. Suites written against the legacy
-// supervision registry pin `legacy` here; pair suites set `pairs` themselves.
-process.env.IMCODES_SUPERVISION_ENGINE ??= 'legacy';
+// Do not pin a supervision engine globally. Tests must opt into the live
+// `pairs` engine explicitly; an inherited legacy value is migration input only
+// and must never silently reactivate retired supervision.
 
 /**
  * Exported for the ownership test only: removes THIS worker's root and nothing

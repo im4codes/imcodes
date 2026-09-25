@@ -56,11 +56,12 @@ describe('task-pair legacy tool hook endpoint', () => {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   });
 
-  it('answers for the authenticated caller in the daemon', async () => {
+  it('returns retired for the authenticated caller instead of invoking legacy supervision', async () => {
     answerMock.mockResolvedValue({ handled: true, result: { status: 'ok', engine: 'pairs' } });
     const response = await post(port, 'deck_sub_exec', { from: 'deck_sub_exec', tool: SUPERVISION_MCP_TOOLS.INTENT, input: { intent: 'open_audit' } });
-    expect(response).toEqual({ status: 200, body: { handled: true, result: { status: 'ok', engine: 'pairs' } } });
-    expect(answerMock).toHaveBeenCalledWith(SUPERVISION_MCP_TOOLS.INTENT, 'deck_sub_exec', { intent: 'open_audit' });
+    expect(response.status).toBe(410);
+    expect(response.body).toMatchObject({ ok: false, reason: 'retired' });
+    expect(answerMock).not.toHaveBeenCalled();
   });
 
   it('refuses a spoofed or unknown caller', async () => {

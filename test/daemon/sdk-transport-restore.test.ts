@@ -1807,15 +1807,11 @@ describe('sdk transport session restore', () => {
     expect(userPayloadOfPrompt(mocks.claudeRuns[0].prompt)).toBe('offline-msg-1');
     expect(userPayloadOfPrompt(mocks.claudeRuns[1].prompt))
       .toBe('offline-msg-2\n\nofflinemsg-3'.replace('offlinemsg', 'offline-msg'));
-    // Non-empty control: both turns must actually carry the contract, and the
-    // first turn carries the full body while the second re-asserts by reference.
-    expect(mocks.claudeRuns.every(systemCarriesDelegationContract)).toBe(true);
-    expect(claudePresetAppend(mocks.claudeRuns[0].options)).toContain('"contractId":"supervision_brain_work_delegation_v1"');
-    expect(claudePresetAppend(mocks.claudeRuns[1].options)).toContain('"contractRef":"supervision_brain_work_delegation_v1"');
-    // This Brain's record carries no supervision binding, so supervision is off:
-    // both the registration and its re-assertion must be the manual-only variant.
-    expect(claudePresetAppend(mocks.claudeRuns[0].options)).toContain('"automaticSupervision":false');
-    expect(claudePresetAppend(mocks.claudeRuns[1].options)).toContain('"automaticSupervision":false');
+    // This Brain's record carries no supervision binding, so the project is
+    // inert: no legacy or delegation supervision contract is injected.
+    expect(mocks.claudeRuns.every((run) => !systemCarriesDelegationContract(run))).toBe(true);
+    expect(claudePresetAppend(mocks.claudeRuns[0].options)).not.toContain('supervision_brain_work_delegation_v1');
+    expect(claudePresetAppend(mocks.claudeRuns[1].options)).not.toContain('supervision_brain_work_delegation_v1');
     expect(mocks.claudeRuns.some((run) => claudePresetAppend(run.options).includes('task_assignment'))).toBe(false);
     for (const text of ['offline-msg-1', 'offline-msg-2', 'offline-msg-3']) {
       const matchingUserEvents = timelineEmitterEmitMock.mock.calls.filter((call) => (
@@ -1884,7 +1880,8 @@ describe('sdk transport session restore', () => {
     ));
     await vi.waitFor(() => expect(runsFor()).toHaveLength(1), { timeout: 5_000 });
     expect(claudePresetAppend(runsFor()[0].options)).toContain('"automaticSupervision":true');
-    expect(claudePresetAppend(runsFor()[0].options)).toContain('task_assignment');
+    expect(claudePresetAppend(runsFor()[0].options)).toContain('IMCODES_TASK');
+    expect(claudePresetAppend(runsFor()[0].options)).not.toContain('task_assignment');
     expect(runsFor()[0].prompt).toBe('while-supervised');
 
     // The owner turns supervision OFF after restore. Nothing restarts; the very
@@ -1900,9 +1897,7 @@ describe('sdk transport session restore', () => {
     runtime!.send('after-supervision-off', 'cmd-mode-2');
     await vi.waitFor(() => expect(runsFor()).toHaveLength(2), { timeout: 5_000 });
     const afterOff = claudePresetAppend(runsFor()[1].options);
-    expect(afterOff, 'the variant changed, so the manual-only body is registered in full')
-      .toContain('"contractId":"supervision_brain_work_delegation_v1"');
-    expect(afterOff).toContain('"automaticSupervision":false');
+    expect(afterOff).not.toContain('"contractId":"supervision_brain_work_delegation_v1"');
     expect(afterOff).not.toContain('task_assignment');
     expect(runsFor()[1].prompt).toBe('after-supervision-off');
   });

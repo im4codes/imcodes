@@ -404,7 +404,7 @@ describe('memory MCP stdio server', () => {
         MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF,
         MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF,
       ]));
-      expect(bootstrapNames).not.toContain(MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY);
+      expect(bootstrapNames).toContain(MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY);
       expect(mcpToolSurfaceBytes(bootstrap.tools)).toBeLessThanOrEqual(MCP_TOOL_SURFACE_BOOTSTRAP_BUDGET_BYTES);
       expect(client.getInstructions()).toBeUndefined();
       const bootstrapDescriptions = bootstrap.tools.map((tool) => tool.description ?? '').join('\n');
@@ -1158,11 +1158,28 @@ describe('memory MCP stdio server', () => {
         expect(rejected).toMatchObject({ isError: true });
       }
       expect(received).toEqual([]);
-      const result = await client.callTool({ name: 'peer_audit_reply', arguments: validReply });
-      expect(result).toMatchObject({ isError: true });
-      expect(JSON.stringify(result)).toMatch(/retired/i);
-      expect(received).toEqual([]);
-      expect(received).toEqual([]);
+      const result = await callLazyTool(client, 'peer_audit_reply', validReply);
+      expect(result.structuredContent).toEqual({ status: 'ok', accepted: true });
+      expect(received).toEqual([{
+        sender: 'deck_sub_worker',
+        body: expect.objectContaining({
+          version: 'peer_audit_reply_v1',
+          taskId: 'supervision_task_12345678',
+          assignmentId: 'supervision_assignment_12345678',
+          attemptId: 'attempt_12345678',
+          revision: 'revision_12345678',
+          receiptKind: 'final',
+        }),
+      }]);
+      const rejected = await callLazyTool(client, 'peer_audit_reply', {
+        ...validReply,
+        assignmentId: 'supervision_assignment_rejected_1',
+      });
+      expect(rejected.structuredContent).toMatchObject({
+        status: 'error',
+        reason: 'identity_rejected',
+        message: expect.stringContaining('assignmentId actual="supervision_assignment_rejected_1"'),
+      });
     } finally {
       await client.close();
       await new Promise<void>((resolve, reject) => hookServer.close((err) => (err ? reject(err) : resolve())));

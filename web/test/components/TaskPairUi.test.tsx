@@ -249,10 +249,7 @@ describe('TaskPairSettingsSection', () => {
     expect(screen.getAllByTestId(/task-pair-allowlist-row-/)).toHaveLength(TASK_PAIR_DEFAULT_ALLOWLIST.length);
 
     const engine = screen.getByTestId('task-pair-engine') as HTMLSelectElement;
-    engine.value = 'legacy';
-    fireEvent.input(engine);
-    fireEvent.change(engine);
-    expect(value.pairEngine).toBe('legacy');
+    expect([...engine.options].map((option) => option.value)).not.toContain('legacy');
     fireEvent.input(screen.getByTestId('task-pair-max-concurrency'), { target: { value: '8' } });
     expect(value.pairMaxConcurrency).toBe(8);
 
@@ -260,6 +257,13 @@ describe('TaskPairSettingsSection', () => {
     fireEvent.click(screen.getByTestId('task-pair-allowlist-add'));
     expect(value.pairAllowlist).toHaveLength(TASK_PAIR_DEFAULT_ALLOWLIST.length + 1);
     expect(value.pairAllowlist?.at(-1)).toEqual({ role: 'both', agentType: '', modelPattern: '' });
+  });
+
+  it('renders a stored legacy value as inert unset without offering it again', () => {
+    render(<TaskPairSettingsSection value={{ pairEngine: 'legacy' }} onChange={vi.fn()} />);
+    const engine = screen.getByTestId('task-pair-engine') as HTMLSelectElement;
+    expect(engine.value).toBe('');
+    expect([...engine.options].map((option) => option.value)).not.toContain('legacy');
   });
 
   it('lets the user opt an unconfigured project into pairs, and back out to not-enabled', () => {
