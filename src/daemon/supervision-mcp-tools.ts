@@ -9,13 +9,11 @@
  * Every schema enum is spread from the SAME constant the state machine uses, so
  * the published tool surface cannot drift from the transition table.
  */
-import { withPairsLegacyTools, type TaskPairLegacyToolForwarder } from './task-pairs/legacy-tools.js';
 import { z } from 'zod';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { McpServer, RegisteredTool } from '@modelcontextprotocol/sdk/server/mcp.js';
 import {
   SUPERVISION_MCP_TOOLS,
-  SUPERVISION_MCP_REGISTERED_TOOLS,
   SUPERVISION_UNBOUND_REVISION,
   type SupervisionMcpToolName,
 } from '../../shared/supervision-mcp-tools.js';
@@ -643,7 +641,7 @@ export function createSupervisionMcpToolHandlers(
     return err(reason, `${detail ?? reason}. ${guidance}`);
   };
 
-  return {
+  const handlers: Record<SupervisionMcpToolName, (args: unknown) => Promise<ToolResult>> = {
     async [SUPERVISION_MCP_TOOLS.INTENT](args) {
       const input = (args ?? {}) as Record<string, unknown>;
       const reg = need();
@@ -1824,6 +1822,7 @@ export function createSupervisionMcpToolHandlers(
       return ok({ result, worktrees });
     },
   };
+  return handlers;
 }
 
 function toolResult(result: ToolResult): CallToolResult {
@@ -1838,16 +1837,14 @@ export function registerSupervisionMcpTools(
   server: McpServer,
   caller: McpRuntimeCaller,
   deps: SupervisionMcpToolDeps = {},
-  /** MCP child only: hand legacy supervision tool calls to the daemon (pairs engine). */
-  legacyToolForwarder?: TaskPairLegacyToolForwarder,
+  /** Retained for source compatibility; legacy forwarding is retired. */
+  _legacyToolForwarder?: unknown,
 ): ReadonlyMap<string, RegisteredTool> {
-  const handlers = withPairsLegacyTools(caller.sessionName, createSupervisionMcpToolHandlers(caller, deps), legacyToolForwarder);
-  const registered = new Map<string, RegisteredTool>();
-  for (const name of SUPERVISION_MCP_REGISTERED_TOOLS) {
-    registered.set(name, server.registerTool(name, {
-      description: DESCRIPTIONS[name],
-      inputSchema: SUPERVISION_MCP_TOOL_SHAPES[name],
-    }, async (args: unknown) => toolResult(await handlers[name](args))));
-  }
-  return registered;
+  // Keep constructing the historical handlers so daemon-side migrations and
+  // direct internal callers retain their decoding seam, but never register
+  // the retired names on an MCP server. The live catalog is therefore clean
+  // before discovery/listing and cannot briefly expose a legacy tool.
+  void server;
+  void createSupervisionMcpToolHandlers(caller, deps);
+  return new Map();
 }

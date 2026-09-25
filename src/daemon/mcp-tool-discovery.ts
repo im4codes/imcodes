@@ -15,6 +15,10 @@ import {
   type McpToolCatalogMode,
   isDefaultActiveMcpTool,
 } from '../../shared/mcp-tool-discovery.js';
+import {
+  RETIRED_SUPERVISION_MCP_MESSAGE,
+  RETIRED_SUPERVISION_MCP_TOOL_SET,
+} from '../../shared/memory-mcp-contracts.js';
 import logger from '../util/logger.js';
 
 export type RegisteredMcpToolCatalog = ReadonlyMap<string, RegisteredTool>;
@@ -161,6 +165,9 @@ export function registerMcpToolDiscovery(
     if (normalizedQuery === '*') {
       return discoveryError('wildcard MCP tool discovery is not supported; query one exact tool or group');
     }
+    if (RETIRED_SUPERVISION_MCP_TOOL_SET.has(normalizedQuery)) {
+      return discoveryError(RETIRED_SUPERVISION_MCP_MESSAGE);
+    }
     const explicitGroupId = normalizedQuery.startsWith(MCP_TOOL_GROUP_QUERY_PREFIX)
       ? normalizedQuery.slice(MCP_TOOL_GROUP_QUERY_PREFIX.length)
       : null;
@@ -242,6 +249,9 @@ export function registerMcpToolDiscovery(
 
     if (fallbackCall) {
       const fallbackName = typeof fallbackCall.name === 'string' ? fallbackCall.name.trim() : '';
+      if (RETIRED_SUPERVISION_MCP_TOOL_SET.has(fallbackName.toLowerCase())) {
+        return discoveryError(RETIRED_SUPERVISION_MCP_MESSAGE);
+      }
       const fallbackArguments = fallbackCall.arguments === undefined
         ? {}
         : fallbackCall.arguments;

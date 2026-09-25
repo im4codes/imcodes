@@ -8,9 +8,8 @@
  * decision (2026-09-26, tsk_cd_pairs_optin): no saved supervision config, or
  * no Brain session at all, resolves to the inert `off` state -- the same as
  * an explicit mode=off snapshot -- so a project is never silently taken over
- * before its owner has touched supervision settings at all. `legacy` exists
- * only as a manual per-project rollback (settings) or a global override
- * (`IMCODES_SUPERVISION_ENGINE=legacy`).
+ * before its owner has touched supervision settings at all. Legacy settings
+ * remain readable for migration, but never reactivate the retired engine.
  */
 import { getSession, listSessions, type SessionRecord } from '../../store/session-store.js';
 import {
@@ -37,13 +36,13 @@ import { getTaskPairStore } from './store.js';
  */
 export function resolveTaskPairEngineState(project: string | undefined, env: NodeJS.ProcessEnv = process.env): TaskPairEngineState {
   const override = env[TASK_PAIR_ENGINE_ENV]?.trim();
-  if (override && (TASK_PAIR_ENGINES as readonly string[]).includes(override)) return override as TaskPairEngine;
+  if (override === 'pairs') return TASK_PAIR_DEFAULT_ENGINE;
   if (!project) return 'off';
   const settings = brainSupervisionSettings(project);
-  if (settings?.pairEngine) return settings.pairEngine;
+  if (settings?.pairEngine === 'pairs') return TASK_PAIR_DEFAULT_ENGINE;
   try {
     const stored = getTaskPairStore().getProjectSettings(project).engine;
-    if (stored) return stored;
+    if (stored === 'pairs') return TASK_PAIR_DEFAULT_ENGINE;
   } catch {
     // fall through to the mode-aware default below
   }

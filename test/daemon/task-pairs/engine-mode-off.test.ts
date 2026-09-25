@@ -113,10 +113,10 @@ describe('task-pair engine: mode off with no explicit engine is inert', () => {
     expect(isPairsEngineProject(PROJECT)).toBe(true);
   });
 
-  it('an explicit legacy pairEngine on the Brain session wins over mode off too (deliberate rollback, not silent inertness)', () => {
+  it('an explicit legacy pairEngine on the Brain session is retired and remains inert', () => {
     upsertSession(brainWithMode(SUPERVISION_MODE.OFF, { pairEngine: 'legacy' }));
-    expect(resolveTaskPairEngineState(PROJECT)).toBe('legacy');
-    expect(isTaskPairEngineActive(PROJECT)).toBe(true);
+    expect(resolveTaskPairEngineState(PROJECT)).toBe('off');
+    expect(isTaskPairEngineActive(PROJECT)).toBe(false);
   });
 
   it('a stored per-project engine setting wins over mode off', () => {

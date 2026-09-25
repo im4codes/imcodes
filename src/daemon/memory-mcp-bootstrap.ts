@@ -2,6 +2,10 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import catalog from './memory-mcp-bootstrap-catalog.json' with { type: 'json' };
 import {
+  RETIRED_SUPERVISION_MCP_MESSAGE,
+  RETIRED_SUPERVISION_MCP_TOOL_SET,
+} from '../../shared/memory-mcp-contracts.js';
+import {
   SESSION_RESOURCE_HANDLE_TYPE,
   SESSION_RESOURCE_KIND,
   SESSION_RESOURCE_OWNER_ENV,
@@ -483,6 +487,25 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
     if (message.method === 'ping' && id !== undefined) {
       writeMessage({ jsonrpc: '2.0', id, result: {} });
       return;
+    }
+    if (message.method === 'tools/call' && id !== undefined) {
+      const params = message.params;
+      const name = params && typeof params === 'object' && typeof (params as { name?: unknown }).name === 'string'
+        ? (params as { name: string }).name.trim().toLowerCase()
+        : '';
+      if (RETIRED_SUPERVISION_MCP_TOOL_SET.has(name)) {
+        const result = {
+          status: 'error',
+          reason: 'retired',
+          error: RETIRED_SUPERVISION_MCP_MESSAGE,
+        };
+        writeMessage({ jsonrpc: '2.0', id, result: {
+          isError: true,
+          structuredContent: result,
+          content: [{ type: 'text', text: JSON.stringify(result) }],
+        } });
+        return;
+      }
     }
     if (message.method === 'tools/list' && id !== undefined) {
       // Before hydration this is the immutable generated catalog and therefore

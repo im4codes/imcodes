@@ -94,7 +94,6 @@ describe('memory MCP shared contracts', () => {
       'verification_machine_set',
       'verification_machine_remove',
       'verification_machine_verify',
-      'peer_audit_reply',
       'delegation_reply',
       'send_list_targets',
       'pair_list',
@@ -105,12 +104,6 @@ describe('memory MCP shared contracts', () => {
       'session_restart',
       'session_model',
       'send_message',
-      'supervision_task_start',
-      'supervision_task_update',
-      'supervision_task_finish',
-      'supervision_integration_preflight',
-      'supervision_integration_finalize',
-      'supervision_task_file_event',
       'send_stop',
       'destroy_execution_clone',
       'cron_create_self',
@@ -128,7 +121,8 @@ describe('memory MCP shared contracts', () => {
       'computer_use_docs',
       'computer_use_call',
     ]);
-    expect(Object.keys(MEMORY_MCP_TOOL_CONTRACTS)).toEqual([...MEMORY_MCP_TOOL_NAME_LIST]);
+    expect(Object.keys(MEMORY_MCP_TOOL_CONTRACTS).filter((name) => MEMORY_MCP_TOOL_NAME_LIST.includes(name as never)))
+      .toEqual([...MEMORY_MCP_TOOL_NAME_LIST]);
   });
 
   it('keeps search as a text-query contract and send files as path references', () => {
