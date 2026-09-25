@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { ProviderError, ProviderStatusUpdate, ProviderUsageUpdate, ToolCallEvent, TransportProvider } from '../../src/agent/transport-provider.js';
-import { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
+import { TRANSPORT_AUTO_COMPACT_CONTEXT_RATIO, TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
 import type { MemorySearchResult } from '../../src/context/memory-search.js';
 import { resetAllSummarySyncHistories } from '../../src/context/summary-sync-history.js';
 import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
@@ -186,6 +186,16 @@ describe('TransportSessionRuntime memory provenance', () => {
       runtime.send('keep going', 'work-1');
       await waitForProviderSend(provider);
       complete(turnDone('turn-1', 120_000));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(sentTexts(provider)).toHaveLength(1);
+    });
+
+    it('waits until 75% of the window before compacting', async () => {
+      expect(TRANSPORT_AUTO_COMPACT_CONTEXT_RATIO).toBe(0.75);
+      const { provider, runtime, complete } = await setup(true);
+      runtime.send('keep going', 'work-1');
+      await waitForProviderSend(provider);
+      complete(turnDone('turn-1', Math.floor(258_400 * 0.72)));
       await new Promise((resolve) => setTimeout(resolve, 20));
       expect(sentTexts(provider)).toHaveLength(1);
     });

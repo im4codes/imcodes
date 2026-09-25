@@ -522,7 +522,7 @@ function makeCancelledProviderError(): ProviderError {
  * finished turn may use before the runtime compacts. Codex's own auto-compact
  * fired too late (a session sat degraded at 83% for days).
  */
-export const TRANSPORT_AUTO_COMPACT_CONTEXT_RATIO = 0.7;
+export const TRANSPORT_AUTO_COMPACT_CONTEXT_RATIO = 0.75;
 
 /** `IMCODES_TRANSPORT_AUTO_COMPACT_RATIO` (0.05-0.95) overrides the ratio. */
 export function transportAutoCompactRatio(env: NodeJS.ProcessEnv = process.env): number {
