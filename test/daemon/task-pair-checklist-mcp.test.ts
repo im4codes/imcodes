@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
-import { TaskPairStore, setTaskPairStoreForTests } from '../../src/daemon/task-pairs/store.js';
+import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
+import { TaskPairStore, setTaskPairStoreForTests, getTaskPairStore } from '../../src/daemon/task-pairs/store.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 import type { TaskPairState } from '../../shared/task-pair.js';
 
@@ -18,5 +19,28 @@ describe('pair checklist MCP tools', () => {
     expect(updated).toMatchObject({ status: 'working', markdown: 'Intro\n- [ ][ ] changed' });
     const checked = await handlers.pair_task_check!({ taskId: state.taskId, items: [1], box: 'audited', checked: true });
     expect(checked).toMatchObject({ status: 'working', markdown: 'Intro\n- [ ][x] changed', audited: 1 });
+  });
+
+  it('refuses a caller from another project: not found, brief untouched', async () => {
+    const otherProjectCaller: McpRuntimeCaller = { ...caller, namespace: { scope: 'user_private', projectId: 'other-project' }, projectName: 'other-project' };
+    const handlers = createMemoryMcpToolHandlers(otherProjectCaller);
+    const got = await handlers.pair_task_get!({ taskId: state.taskId });
+    expect(got).toMatchObject({ reason: MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE });
+    const updated = await handlers.pair_task_update!({ taskId: state.taskId, markdown: 'from another project' });
+    expect(updated).toMatchObject({ reason: MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE });
+    // Never overwritten by the refused write.
+    expect(getTaskPairStore().getPair('p', state.taskId)?.state.brief).toBe(state.brief);
+  });
+
+  it('refuses a same-project session that is not the pair\'s brain, executor or auditor: not found, brief untouched', async () => {
+    const siblingCaller: McpRuntimeCaller = { ...caller, sessionName: 'sibling-not-in-pair' };
+    const handlers = createMemoryMcpToolHandlers(siblingCaller);
+    const got = await handlers.pair_task_get!({ taskId: state.taskId });
+    expect(got).toMatchObject({ reason: MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE });
+    const updated = await handlers.pair_task_update!({ taskId: state.taskId, markdown: 'from a non-participant' });
+    expect(updated).toMatchObject({ reason: MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE });
+    const checked = await handlers.pair_task_check!({ taskId: state.taskId, items: [1], box: 'audited', checked: true });
+    expect(checked).toMatchObject({ reason: MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE });
+    expect(getTaskPairStore().getPair('p', state.taskId)?.state.brief).toBe(state.brief);
   });
 });

@@ -4,6 +4,7 @@ import { emitTaskPairDaemonEvent } from './task-pairs/service.js';
 import { projectOfSession } from './task-pairs/engine.js';
 import { randomUUID } from 'node:crypto';
 import { parseTaskPairChecklist, taskPairChecklistCounts, updateTaskPairChecklist } from '../../shared/task-pair-checklist.js';
+import { taskPairRoleOf } from '../../shared/task-pair.js';
 import { z } from 'zod';
 import type { CapabilityMcpToolDeps } from './capability-mcp-tools.js';
 import { execFile as execFileCallback } from 'node:child_process';
@@ -1522,7 +1523,8 @@ function savePairBrief(pair: NonNullable<ReturnType<typeof pairChecklistTarget>>
   const next = { ...previous, brief: markdown, updatedAt: Date.now() };
   const saved = store.savePair(pair.project, next);
   const eventId = `pair-brief:${pair.state.taskId}:${randomUUID()}`;
-  store.recordEvent({ id: eventId, project: pair.project, taskId: pair.state.taskId, writer, role: 'daemon', verb: 'BRIEF_UPDATED', attrs: {}, effect: 'brief_updated', unusual: false, source: 'mcp', fromStatus: previous.status, toStatus: next.status, at: next.updatedAt });
+  const role = taskPairRoleOf(previous, writer);
+  store.recordEvent({ id: eventId, project: pair.project, taskId: pair.state.taskId, writer, role, verb: 'BRIEF_UPDATED', attrs: {}, effect: 'brief_updated', unusual: false, source: 'mcp', fromStatus: previous.status, toStatus: next.status, at: next.updatedAt });
   emitTaskPairDaemonEvent(next, { eventId, verb: 'BRIEF_UPDATED', effect: 'brief_updated', source: 'mcp', fromStatus: previous.status, toStatus: next.status, unusual: false });
   return saved;
 }

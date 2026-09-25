@@ -31,10 +31,7 @@ import {
   type TaskPairWorkspaceKind,
 } from '../../../shared/task-pair.js';
 import { resolveSupervisionAssignmentWorktree } from '../supervision-worktree-inspector.js';
-import {
-  ensureSupervisionAssignmentWorktree,
-  resolveSupervisionWorktreeBase,
-} from '../supervision-worktree-provision.js';
+import { ensureSupervisionAssignmentWorktree } from '../supervision-worktree-provision.js';
 import {
   countTaskPairUnpushedCommits,
   inspectSupervisionGitWorktree,
@@ -44,12 +41,91 @@ import {
 } from '../supervision-worktree-gc.js';
 
 const GIT_PROBE_TIMEOUT_MS = 5_000;
+const COMMIT_SHA_RE = /^[0-9a-f]{40}$/;
 
 function gitBranch(repoPath: string): Promise<string | undefined> {
   return new Promise((resolve) => execFile('git', ['-C', repoPath, 'symbolic-ref', '--short', '-q', 'HEAD'], { timeout: GIT_PROBE_TIMEOUT_MS }, (error, stdout) => {
     const value = String(stdout ?? '').trim();
     resolve(!error && value ? value : undefined);
   }));
+}
+
+/** Resolve `ref` to a full commit sha inside `repoRoot`, or undefined if it does not exist. */
+function resolveCommit(repoRoot: string, ref: string): Promise<string | undefined> {
+  return new Promise((resolvePromise) => {
+    execFile('git', ['-C', repoRoot, 'rev-parse', '--verify', '--end-of-options', `${ref}^{commit}`], { timeout: GIT_PROBE_TIMEOUT_MS }, (error, stdout) => {
+      const value = String(stdout ?? '').trim().toLowerCase();
+      resolvePromise(!error && COMMIT_SHA_RE.test(value) ? value : undefined);
+    });
+  });
+}
+
+/** Best-effort: attach a freshly-created detached worktree to an existing local branch. */
+function checkoutExistingBranch(worktreePath: string, branch: string): Promise<void> {
+  return new Promise((resolvePromise) => {
+    execFile('git', ['-C', worktreePath, 'checkout', '--ignore-other-worktrees', branch], { timeout: GIT_PROBE_TIMEOUT_MS }, () => resolvePromise());
+  });
+}
+
+/**
+ * Best-effort: drop a stale `git worktree` registration for a path whose
+ * directory is already gone. The generic assignment provisioner refuses to
+ * recreate a registered worktree at a revision other than its last known
+ * HEAD (a legacy-assignment safety rule: an assignment worktree never moves
+ * off its original base) -- but a pair's self-heal rebuild legitimately
+ * targets a DIFFERENT, more current revision (lastHead/material.head) than
+ * whatever the worktree last had. Only ever called against a path already
+ * confirmed missing on disk, so there is no live data this could discard.
+ */
+function pruneStaleWorktreeRegistration(projectRoot: string, worktreePath: string): Promise<void> {
+  return new Promise((resolvePromise) => {
+    execFile('git', ['-C', projectRoot, 'worktree', 'remove', '--force', '--', worktreePath], { timeout: GIT_PROBE_TIMEOUT_MS }, () => resolvePromise());
+  });
+}
+
+export type TaskPairWorkspaceRevisionSource = 'branch' | 'lastHead' | 'materialHead' | 'base' | 'default' | 'directory';
+
+interface ResolvedWorkspaceRevision {
+  revision: string;
+  source: TaskPairWorkspaceRevisionSource;
+  branch?: string;
+}
+
+/**
+ * Where a rebuilt (or freshly provisioned) workspace's worktree starts from,
+ * first that resolves: the pair's own existing branch (re-attached, not
+ * detached, so further commits continue its history), then the most
+ * recently observed head, then the material relay's head, then the
+ * recorded/dispatched base, then the project's default branch (its own
+ * current HEAD). A fresh pair has no `workspace` yet, so branch/lastHead are
+ * simply skipped -- the same order still applies.
+ */
+async function resolveWorkspaceRebuildRevision(
+  projectRoot: string,
+  pair: TaskPairState,
+): Promise<ResolvedWorkspaceRevision | undefined> {
+  const branch = pair.workspace?.branch;
+  if (branch) {
+    const revision = await resolveCommit(projectRoot, `refs/heads/${branch}`);
+    if (revision) return { revision, source: 'branch', branch };
+  }
+  const lastHead = pair.workspace?.lastHead;
+  if (lastHead) {
+    const revision = await resolveCommit(projectRoot, lastHead);
+    if (revision) return { revision, source: 'lastHead' };
+  }
+  const materialHead = pair.material?.head;
+  if (materialHead) {
+    const revision = await resolveCommit(projectRoot, materialHead);
+    if (revision) return { revision, source: 'materialHead' };
+  }
+  const base = pair.workspace?.base ?? pair.material?.base;
+  if (base) {
+    const revision = await resolveCommit(projectRoot, base);
+    if (revision) return { revision, source: 'base' };
+  }
+  const revision = await resolveCommit(projectRoot, 'HEAD');
+  return revision ? { revision, source: 'default' } : undefined;
 }
 
 
@@ -74,7 +150,7 @@ export function resolveTaskPairTaskDir(project: string, taskId: string, env: Nod
 }
 
 export type TaskPairWorkspaceProvision =
-  | { ok: true; kind: TaskPairWorkspaceKind; path: string; base?: string; branch?: string }
+  | { ok: true; kind: TaskPairWorkspaceKind; path: string; base?: string; branch?: string; source: TaskPairWorkspaceRevisionSource }
   | { ok: false; detail: string };
 
 export type TaskPairWorkspaceRelease =
@@ -137,7 +213,7 @@ function isGitWorkTree(root: string): Promise<boolean> {
 async function provisionTaskDir(project: string, pair: TaskPairState, env?: NodeJS.ProcessEnv): Promise<TaskPairWorkspaceProvision> {
   const path = resolveTaskPairTaskDir(project, pair.taskId, env);
   await mkdir(path, { recursive: true });
-  return { ok: true, kind: 'dir', path };
+  return { ok: true, kind: 'dir', path, source: 'directory' };
 }
 
 /**
@@ -156,13 +232,13 @@ export async function provisionTaskPairWorkspace(
   // Only a git checkout gets a worktree; a non-git project is never git-initialised.
   if (pair.workspaceKind === 'dir' || !(await isGitWorkTree(projectRoot))) return provisionTaskDir(project, pair, deps.env);
   const assignmentId = taskPairWorktreeName(pair.taskId);
-  const requestedBase = pair.workspace?.base ?? pair.material?.base ?? pair.material?.head;
-  const base = await resolveSupervisionWorktreeBase({ projectRoot, requestedBaseRevision: requestedBase });
+  const resolved = await resolveWorkspaceRebuildRevision(projectRoot, pair);
   // A git repo without a commit has nothing to branch from: a task directory still works.
-  if (!base.ok) return provisionTaskDir(project, pair, deps.env);
+  if (!resolved) return provisionTaskDir(project, pair, deps.env);
   const repoPath = resolveSupervisionAssignmentWorktree({ sessionName: pair.executor, assignmentId, env: deps.env });
+  if (!(await lstat(repoPath).catch(() => undefined))) await pruneStaleWorktreeRegistration(projectRoot, repoPath);
   const result = await ensureSupervisionAssignmentWorktree({
-    projectRoot, sessionName: pair.executor, assignmentId, baseRevision: base.baseRevision, worktreePath: repoPath, env: deps.env,
+    projectRoot, sessionName: pair.executor, assignmentId, baseRevision: resolved.revision, worktreePath: repoPath, env: deps.env,
   });
   if (!result.ok) return { ok: false, detail: `${result.reason}: ${result.detail}` };
   // Registration with the worktree GC: the same metadata legacy worktrees carry.
@@ -176,8 +252,13 @@ export async function provisionTaskPairWorkspace(
   };
   await mkdir(dirname(result.worktreePath), { recursive: true });
   await writeFile(join(dirname(result.worktreePath), 'metadata.json'), JSON.stringify(metadata));
+  // The generic provisioner always creates a detached worktree. When we
+  // resolved via the pair's own existing branch, re-attach to it (best
+  // effort) so commits the executor makes continue that branch's history
+  // instead of drifting into a detached HEAD no one is tracking.
+  if (resolved.source === 'branch' && resolved.branch) await checkoutExistingBranch(result.worktreePath, resolved.branch);
   const branch = await gitBranch(result.worktreePath);
-  return { ok: true, kind: 'worktree', path: result.worktreePath, base: result.baseRevision, ...(branch ? { branch } : {}) };
+  return { ok: true, kind: 'worktree', path: result.worktreePath, base: result.baseRevision, source: resolved.source, ...(branch ? { branch } : {}) };
 }
 
 /**

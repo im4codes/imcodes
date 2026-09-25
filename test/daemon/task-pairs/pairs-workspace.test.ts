@@ -23,9 +23,10 @@ import type { SessionRecord } from '../../../src/store/session-store.js';
 import { removeSession, upsertSession } from '../../../src/store/session-store.js';
 import { TaskPairStore, getTaskPairStore, setTaskPairStoreForTests } from '../../../src/daemon/task-pairs/store.js';
 import { resetTaskPairFocusForTests, setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
-import { taskPairService } from '../../../src/daemon/task-pairs/service.js';
+import { ensureTaskPairWorkspaceAvailable, taskPairService } from '../../../src/daemon/task-pairs/service.js';
 import {
   releaseTaskPairWorkspace,
+  provisionTaskPairWorkspace,
   resolveTaskPairTaskDir,
   resolveTaskPairWorksRoot,
   setTaskPairWorkspaceDepsForTests,
@@ -398,6 +399,120 @@ describe('pair workspaces', () => {
     // The file from before the cancel is still there: reopening reused the
     // same worktree instead of provisioning a fresh one.
     expect(existsSync(join(path, 'in-progress.txt'))).toBe(true);
+  });
+
+  describe('self-heal: rebuild order, first that resolves', () => {
+    const commitOn = (repo: string, file: string, message: string) => {
+      writeFileSync(join(repo, file), `${message}\n`);
+      git(repo, 'add', '-A');
+      git(repo, '-c', 'user.email=t@e.invalid', '-c', 'user.name=T', 'commit', '-qm', message);
+      return git(repo, 'rev-parse', 'HEAD');
+    };
+
+    it('rebuilds from the existing branch first, preserving its commits and re-attaching (not detached)', async () => {
+      const path = await opened('R1');
+      // Provisioning itself always starts detached; the branch this step
+      // resolves is one the executor created themselves during their work,
+      // a normal git workflow.
+      const branch = 'r1-work';
+      git(path, 'checkout', '-qb', branch);
+      const branchHead = commitOn(path, 'work.txt', 'executor work');
+      const state = pair('R1');
+      getTaskPairStore().savePair(PROJECT, { ...state, workspace: { ...state.workspace!, branch } });
+
+      rmSync(path, { recursive: true, force: true });
+      const provision = await provisionTaskPairWorkspace(PROJECT, pair('R1'));
+      expect(provision).toMatchObject({ ok: true, source: 'branch', path });
+      expect(git(path, 'rev-parse', 'HEAD')).toBe(branchHead);
+      // Re-attached to the branch, not left detached.
+      expect(git(path, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe(branch);
+    });
+
+    it('falls back to lastHead when the recorded branch no longer resolves', async () => {
+      const path = await opened('R2');
+      const midCommit = commitOn(path, 'a.txt', 'a');
+      commitOn(path, 'b.txt', 'b');
+      rmSync(path, { recursive: true, force: true });
+      const state = pair('R2');
+      getTaskPairStore().savePair(PROJECT, { ...state, workspace: { ...state.workspace!, branch: 'no-such-branch-xyz', lastHead: midCommit } });
+
+      const provision = await provisionTaskPairWorkspace(PROJECT, pair('R2'));
+      expect(provision).toMatchObject({ ok: true, source: 'lastHead', path });
+      expect(git(path, 'rev-parse', 'HEAD')).toBe(midCommit);
+      // Detached at that commit, not on the (nonexistent) branch.
+      expect(git(path, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('HEAD');
+    });
+
+    it("falls back to material.head when neither branch nor lastHead resolve", async () => {
+      const path = await opened('R3');
+      const materialHead = commitOn(project, 'later.txt', 'later on project');
+      rmSync(path, { recursive: true, force: true });
+      const state = pair('R3');
+      getTaskPairStore().savePair(PROJECT, {
+        ...state,
+        workspace: { ...state.workspace!, branch: undefined, lastHead: undefined },
+        material: { head: materialHead, at: Date.now() },
+      });
+
+      const provision = await provisionTaskPairWorkspace(PROJECT, pair('R3'));
+      expect(provision).toMatchObject({ ok: true, source: 'materialHead', path });
+      expect(git(path, 'rev-parse', 'HEAD')).toBe(materialHead);
+    });
+
+    it('falls back to the recorded base when no branch, lastHead, or material.head resolve', async () => {
+      const path = await opened('R4');
+      const base = pair('R4').workspace!.base!;
+      rmSync(path, { recursive: true, force: true });
+      const state = pair('R4');
+      getTaskPairStore().savePair(PROJECT, { ...state, workspace: { ...state.workspace!, branch: undefined, lastHead: undefined, base } });
+
+      const provision = await provisionTaskPairWorkspace(PROJECT, pair('R4'));
+      expect(provision).toMatchObject({ ok: true, source: 'base', path });
+      expect(git(path, 'rev-parse', 'HEAD')).toBe(base);
+    });
+
+    it("falls back to the project's default branch (HEAD) as the last resort", async () => {
+      const path = await opened('R5');
+      rmSync(path, { recursive: true, force: true });
+      const state = pair('R5');
+      getTaskPairStore().savePair(PROJECT, { ...state, workspace: { ...state.workspace!, branch: undefined, lastHead: undefined, base: undefined } });
+      const projectHead = git(project, 'rev-parse', 'HEAD');
+
+      const provision = await provisionTaskPairWorkspace(PROJECT, pair('R5'));
+      expect(provision).toMatchObject({ ok: true, source: 'default', path });
+      expect(git(path, 'rev-parse', 'HEAD')).toBe(projectHead);
+    });
+
+    it('the rebuild notice names the source actually used, not the one that merely looked present', async () => {
+      const path = await opened('R6');
+      const lastHead = commitOn(path, 'x.txt', 'x');
+      rmSync(path, { recursive: true, force: true });
+      const state = pair('R6');
+      // A branch name that looks set but no longer resolves -- the pre-fix
+      // notice logic labelled this 'branch' on truthiness alone, even though
+      // provisioning never actually used it.
+      getTaskPairStore().savePair(PROJECT, { ...state, workspace: { ...state.workspace!, branch: 'stale-branch-gone', lastHead } });
+
+      await ensureTaskPairWorkspaceAvailable(PROJECT, 'R6');
+      expect(pair('R6').workspace).toMatchObject({ status: 'active', path });
+      await vi.waitFor(() => expect(sentTo(EXEC, 'workspace-rebuilt')).toHaveLength(1));
+      const notice = sentTo(EXEC, 'workspace-rebuilt')[0]!.text;
+      expect(notice).toContain('the last observed head');
+      expect(notice).not.toContain('its own branch');
+      await vi.waitFor(() => expect(sentTo(AUD, 'workspace-rebuilt')).toHaveLength(1));
+    });
+
+    it('escalates to Brain exactly once, after delivery, when the workspace cannot be rebuilt at all', async () => {
+      const path = await opened('R7');
+      rmSync(path, { recursive: true, force: true });
+      // The project checkout itself is gone -- nothing to provision from at all.
+      rmSync(project, { recursive: true, force: true });
+
+      await ensureTaskPairWorkspaceAvailable(PROJECT, 'R7');
+      await ensureTaskPairWorkspaceAvailable(PROJECT, 'R7');
+      await vi.waitFor(() => expect(sentTo(BRAIN, 'brain-workspace-unrecoverable')).toHaveLength(1));
+      expect(pair('R7').workspaceRecoveryEscalatedAt).toBeTruthy();
+    });
   });
 
   describe('deliverables', () => {

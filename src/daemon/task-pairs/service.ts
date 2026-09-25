@@ -36,7 +36,7 @@ import { getTaskPairStore, type StoredTaskPair, type TaskPairLiveness } from './
 import { isPairsEngineProject, projectBrainSession, projectOfSession } from './engine.js';
 import { noteTaskPairFocus, sendTaskPairMessage, taskPairFocusOf } from './delivery.js';
 import { resolveTaskPairMaterial } from './material.js';
-import { copyTaskPairOutput, provisionTaskPairWorkspace, releaseTaskPairWorkspace } from './workspace.js';
+import { copyTaskPairOutput, provisionTaskPairWorkspace, releaseTaskPairWorkspace, type TaskPairWorkspaceRevisionSource } from './workspace.js';
 import { clearTaskPairProviderError, noteTaskPairProviderError } from './provider-errors.js';
 import { getSession } from '../../store/session-store.js';
 import {
@@ -75,6 +75,15 @@ function mentionsTaskId(text: string, taskId: string): boolean {
   return new RegExp(`(^|[^A-Za-z0-9_-])${escaped}($|[^A-Za-z0-9_-])`, 'u').test(text);
 }
 
+const WORKSPACE_REVISION_SOURCE_LABEL: Record<TaskPairWorkspaceRevisionSource, string> = {
+  branch: 'its own branch',
+  lastHead: 'the last observed head',
+  materialHead: "the material relay's head",
+  base: 'the recorded base',
+  default: "the project's default branch",
+  directory: 'a fresh task directory',
+};
+
 export async function ensureTaskPairWorkspaceAvailable(project: string, taskId: string): Promise<void> {
   const store = getTaskPairStore();
   const stored = store.getPair(project, taskId);
@@ -82,7 +91,6 @@ export async function ensureTaskPairWorkspaceAvailable(project: string, taskId: 
   const workspace = stored.state.workspace;
   const present = await stat(workspace.path).then(() => true).catch(() => false);
   if (present) return;
-  const source = workspace.branch ? 'branch' : workspace.lastHead ? 'lastHead' : stored.state.material?.head ? 'material.head' : workspace.base ? 'workspace.base' : stored.state.material?.base ? 'material.base' : 'default branch';
   const provision = await provisionTaskPairWorkspace(project, stored.state).catch(() => ({ ok: false as const, detail: 'workspace rebuild failed' }));
   if (!provision.ok) {
     if (!stored.state.workspaceRecoveryEscalatedAt) {
@@ -97,7 +105,7 @@ export async function ensureTaskPairWorkspaceAvailable(project: string, taskId: 
   const rebuilt = { kind: provision.kind, path: provision.path, ...(provision.base ? { base: provision.base } : {}), ...(provision.branch ? { branch: provision.branch } : {}), createdAt: now, status: 'active' as const };
   const next = { ...stored.state, workspace: rebuilt, workspaceRecoveryEscalatedAt: undefined, updatedAt: now };
   store.savePair(project, next);
-  const notice = `Workspace for ${taskId} was rebuilt from ${source}: ${provision.path}`;
+  const notice = `Workspace for ${taskId} was rebuilt from ${WORKSPACE_REVISION_SOURCE_LABEL[provision.source]}: ${provision.path}`;
   await sendTaskPairMessage(stored.state.executor, taskId, 'workspace-rebuilt', notice);
   if (stored.state.auditor && stored.state.auditor !== 'none') await sendTaskPairMessage(stored.state.auditor, taskId, 'workspace-rebuilt', notice);
 }
@@ -111,7 +119,15 @@ export async function refreshTaskPairWorkspaceHead(project: string, taskId: stri
   if (!material.head) return;
   const now = Date.now();
   if (workspace.lastHead === material.head && workspace.lastHeadAt) return;
-  store.savePair(project, { ...stored.state, workspace: { ...workspace, lastHead: material.head, lastHeadAt: now }, updatedAt: Math.max(stored.state.updatedAt, now) });
+  // Re-read: resolveTaskPairMaterial was an async gap, and something else
+  // (endWorkspace ending the pair, a self-heal rebuild) may have mutated the
+  // workspace while it ran. Merge lastHead onto FRESH state, never onto the
+  // snapshot captured before the gap -- writing that back would silently
+  // clobber whatever changed (e.g. reopen an 'ended' workspace to 'active').
+  const latest = store.getPair(project, taskId);
+  const latestWorkspace = latest?.state.workspace;
+  if (!latest || !latestWorkspace || latestWorkspace.status === 'removed') return;
+  store.savePair(project, { ...latest.state, workspace: { ...latestWorkspace, lastHead: material.head, lastHeadAt: now }, updatedAt: Math.max(latest.state.updatedAt, now) });
 }
 
 export class TaskPairService {

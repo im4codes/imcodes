@@ -167,6 +167,26 @@ describe('task-pair marker ingestion', () => {
     expect(pair('T8')?.status).toBe('working');
   });
 
+  it('never falls back to the project checkout when material is unresolved: asks the executor, tells the auditor it is pending', async () => {
+    // The executor's project directory (/tmp/pairsproj) does not exist in
+    // this harness, so workspace provisioning fails and READY_FOR_AUDIT
+    // carries no worktree=/head= -- material.source is genuinely 'pending'.
+    // The relay must never substitute the project checkout in that case.
+    await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T10p executor=${EXEC} auditor=${AUD} -->`);
+    await say(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T10p -->');
+    await vi.waitFor(() => expect(sent.filter((entry) => entry.id.includes(':material-pending:'))).toHaveLength(1));
+    const pendingToExecutor = sent.find((entry) => entry.id.includes(':material-pending:'))!;
+    expect(pendingToExecutor.target).toBe(EXEC);
+    expect(pendingToExecutor.text).toContain('resend READY_FOR_AUDIT with worktree=');
+
+    await vi.waitFor(() => expect(sent.filter((entry) => entry.id.includes(':audit-request:'))).toHaveLength(1));
+    const auditRequest = sent.find((entry) => entry.id.includes(':audit-request:'))!;
+    expect(auditRequest.target).toBe(AUD);
+    expect(auditRequest.text).toContain('Material pending');
+    // The one thing this finding was about: never the executor's project checkout.
+    expect(auditRequest.text).not.toContain('/tmp/pairsproj');
+  });
+
   it('sends a verdict correction to the auditor and a rework notice to the executor', async () => {
     await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T9 executor=${EXEC} auditor=${AUD} -->`);
     await say(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T9 -->');
