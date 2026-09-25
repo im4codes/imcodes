@@ -89,6 +89,10 @@ describe('TransportSessionRuntime memory provenance', () => {
   });
 
   describe('automatic compaction', () => {
+    // Off by default (ratio above 1); these cases exercise it re-enabled at 0.75.
+    beforeEach(() => { vi.stubEnv('IMCODES_TRANSPORT_AUTO_COMPACT_RATIO', '0.75'); });
+    afterEach(() => { vi.unstubAllEnvs(); });
+
     const turnDone = (id: string, used: number, window = 258_400): AgentMessage => ({
       id,
       sessionId: 'provider-session-1',
@@ -191,8 +195,18 @@ describe('TransportSessionRuntime memory provenance', () => {
       expect(sentTexts(provider)).toHaveLength(1);
     });
 
-    it('waits until 75% of the window before compacting', async () => {
-      expect(TRANSPORT_AUTO_COMPACT_CONTEXT_RATIO).toBe(0.75);
+    it('is off by default: the default ratio is unreachable and a nearly full window is left alone', async () => {
+      expect(TRANSPORT_AUTO_COMPACT_CONTEXT_RATIO).toBeGreaterThan(1);
+      vi.unstubAllEnvs();
+      const { provider, runtime, complete } = await setup(true);
+      runtime.send('keep going', 'work-1');
+      await waitForProviderSend(provider);
+      complete(turnDone('turn-1', Math.floor(258_400 * 0.98)));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(sentTexts(provider)).toHaveLength(1);
+    });
+
+    it('waits until 75% of the window before compacting when re-enabled at 0.75', async () => {
       const { provider, runtime, complete } = await setup(true);
       runtime.send('keep going', 'work-1');
       await waitForProviderSend(provider);

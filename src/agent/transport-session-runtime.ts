@@ -529,15 +529,17 @@ function makeCancelledProviderError(): ProviderError {
  */
 /**
  * Automatic compaction threshold: share of the model's context window a
- * finished turn may use before the runtime compacts. Codex's own auto-compact
- * fired too late (a session sat degraded at 83% for days).
+ * finished turn may use before the runtime compacts. Above 1 the threshold is
+ * unreachable, so the runtime's own automatic compaction is effectively off;
+ * that is the default until compaction queueing is proven. 0.75 was the
+ * previous default (Codex's own auto-compact fired too late).
  */
-export const TRANSPORT_AUTO_COMPACT_CONTEXT_RATIO = 0.75;
+export const TRANSPORT_AUTO_COMPACT_CONTEXT_RATIO = 1.1;
 
-/** `IMCODES_TRANSPORT_AUTO_COMPACT_RATIO` (0.05-0.95) overrides the ratio. */
+/** `IMCODES_TRANSPORT_AUTO_COMPACT_RATIO` (0.05-1.5) overrides the ratio; e.g. 0.75 re-enables it. */
 export function transportAutoCompactRatio(env: NodeJS.ProcessEnv = process.env): number {
   const raw = Number(env.IMCODES_TRANSPORT_AUTO_COMPACT_RATIO);
-  return Number.isFinite(raw) && raw >= 0.05 && raw <= 0.95 ? raw : TRANSPORT_AUTO_COMPACT_CONTEXT_RATIO;
+  return Number.isFinite(raw) && raw >= 0.05 && raw <= 1.5 ? raw : TRANSPORT_AUTO_COMPACT_CONTEXT_RATIO;
 }
 /** At most one automatic compaction per session in this window. */
 export const TRANSPORT_AUTO_COMPACT_MIN_INTERVAL_MS = 10 * 60 * 1000;
