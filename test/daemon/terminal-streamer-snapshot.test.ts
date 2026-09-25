@@ -532,6 +532,25 @@ describe('TerminalStreamer — snapshot behavior', () => {
     }
     expect(sent.length, 'the capture must have won the race for this to mean anything').toBeGreaterThan(0);
 
+    // `sent.length > 0` is not the same instant as the deadline actually
+    // clearing: `subscriber.send(diff)` runs synchronously inside
+    // `captureAndSendSnapshot`, but `clearTimeout` runs in that call's
+    // `.finally()`, which is a LATER microtask than the `send()` that set
+    // `sent.length`. Draining that continuation is purely a matter of
+    // microtask-queue turns -- it needs NO more fake time to elapse, so drain
+    // it with `advanceTimersByTimeAsync(0)` rather than by widening the loop
+    // above to keep advancing time. Advancing time here would be wrong in the
+    // other direction: BLANK_BOOTSTRAP_STALL_MS is only 1500ms away, and a
+    // genuinely LEAKED deadline (the defect this test exists to catch) would
+    // itself fire and clear out of vi.getTimerCount() by then, making the
+    // assertion below pass on a real leak. Zero-time turns can only observe
+    // the winner's own `.finally()`; they can never let the loser's timer
+    // fire, so a real leak still fails below no matter how many turns this
+    // takes.
+    for (let turn = 0; turn < 20 && vi.getTimerCount() - before !== 0; turn += 1) {
+      await vi.advanceTimersByTimeAsync(0);
+    }
+
     expect(
       vi.getTimerCount() - before,
       'the first-paint deadline must be cleared when the capture wins the race',
