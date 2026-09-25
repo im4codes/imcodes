@@ -1,5 +1,7 @@
 import { isPairsEngineProject } from './task-pairs/engine.js';
 import { taskPairService } from './task-pairs/service.js';
+import { getTaskPairStore } from './task-pairs/store.js';
+import { DELEGATION_REACHED_DELIVERY_STATUSES } from '../../shared/delegation-claim.js';
 import path from 'path';
 import { buildAuditSeverityPolicyLines, type AuditSeverity } from '../../shared/audit-convergence.js';
 import { attachDaemonUserNotice, DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
@@ -1241,6 +1243,10 @@ function hasLegacyTaskMetadata(input: SendMessageInput): boolean {
   return Object.keys(input.task).some((key) => !(PAIRS_POOL_TASK_KEYS as readonly string[]).includes(key));
 }
 
+function isReachedDelivery(status: string): boolean {
+  return (DELEGATION_REACHED_DELIVERY_STATUSES as readonly string[]).includes(status);
+}
+
 function stripToPoolMetadata(input: SendMessageInput): SendMessageInput {
   const { audit: _audit, task, ...rest } = input;
   if (!task) return rest;
@@ -1273,21 +1279,48 @@ export async function dispatchSendMessage(
   // missing pair (implicit DISPATCH) but never binds a legacy assignment,
   // triggers automatic audit dispatch, or rejects on identity. Only the
   // execution-pool provisioning fields keep their meaning.
+  //
+  // The accepted receipt still names the task (taskId, title, objective), as
+  // legacy did: a new objective without a taskId opens a pair under a
+  // daemon-minted id so the Brain can follow it with markers.
   if (!input.automaticSupervision && isPairsEngineProject(callerProjectName) && hasLegacyTaskMetadata(input)) {
-    const taskId = input.task?.taskId?.trim();
+    const objective = projectSupervisionTaskObjective(input.task?.objective);
     const result = await dispatchSendMessage(caller, stripToPoolMetadata(input), deps);
-    if (taskId && result.status === 'accepted') {
-      for (const delivery of result.deliveries) {
-        taskPairService.implicitDispatch({
-          project: callerProjectName,
-          sender: caller.sessionName,
-          target: delivery.target,
-          taskId,
-          eventId: `implicit:${delivery.messageId ?? result.dispatchId}`,
-        });
-      }
+    if (result.status !== 'accepted') return result;
+    // A new objective opens one pair for its one recipient (an explicit target
+    // or an auto-provisioned worker), never for a broadcast or a clone.
+    const reached = result.deliveries.filter((delivery) => isReachedDelivery(delivery.status));
+    const opensNewTask = !input.task?.taskId?.trim() && !!objective
+      && !input.broadcast && !input.clone && result.deliveries.length === 1 && reached.length === 1;
+    const idempotencyKey = input.idempotencyKey?.trim();
+    const taskId = input.task?.taskId?.trim() || (opensNewTask
+      ? taskPairService.mintTaskId(callerProjectName, idempotencyKey ? `${caller.sessionName}\0${idempotencyKey}` : undefined)
+      : undefined);
+    if (!taskId) return result;
+    const title = deriveSupervisionTaskTitle(objective);
+    for (const delivery of reached) {
+      taskPairService.implicitDispatch({
+        project: callerProjectName,
+        sender: caller.sessionName,
+        target: delivery.target,
+        taskId,
+        ...(title ? { title } : {}),
+        eventId: `implicit:${delivery.messageId ?? result.dispatchId}`,
+      });
     }
-    return result;
+    const pairTitle = getTaskPairStore().getPair(callerProjectName, taskId)?.state.title;
+    const taskIdentity = {
+      taskId,
+      ...(pairTitle ? { taskTitle: pairTitle } : {}),
+      ...(objective && pairTitle === title ? { taskObjective: objective } : {}),
+    };
+    return {
+      ...result,
+      ...taskIdentity,
+      deliveries: result.deliveries.map((delivery) => (
+        isReachedDelivery(delivery.status) ? { ...delivery, ...taskIdentity } : delivery
+      )),
+    };
   }
   const autoProvision = input.task?.autoProvision === true;
   if (!input.target && !input.broadcast && !autoProvision) {

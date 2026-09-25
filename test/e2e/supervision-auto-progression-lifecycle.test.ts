@@ -17,6 +17,7 @@ vi.mock('../../src/store/session-store.js', () => ({
 import { MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
 import { normalizeSessionSupervisionSnapshot } from '../../shared/supervision-config.js';
 import { buildSupervisionExecutionCapabilityId } from '../../shared/supervision-execution-pool.js';
+import type { TaskPairEngine } from '../../shared/task-pair.js';
 import { SUPERVISION_MCP_TOOLS } from '../../shared/supervision-mcp-tools.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
@@ -42,6 +43,7 @@ import {
 import { resetDelegationReplyStoreForTests } from '../../src/daemon/delegation-reply-store.js';
 import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
 
+const LEGACY_ENGINE: TaskPairEngine = 'legacy';
 const roots: string[] = [];
 
 function git(cwd: string, ...args: string[]): string {
@@ -130,6 +132,9 @@ function configureSessions(repo: string) {
   brain.transportConfig = {
     supervision: normalizeSessionSupervisionSnapshot({
       mode: 'supervised_audit',
+      // This suite exercises the legacy registry engine end to end; the shipped
+      // default is the marker-driven `pairs` engine (supervision-pairs-lifecycle).
+      pairEngine: LEGACY_ENGINE,
       auditTargetSessionName: auditor.name,
       executionPools: {
         state: 'configured',

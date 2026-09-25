@@ -6,6 +6,8 @@
  * never touches relay, send acknowledgement, queue drain, `/stop` or control
  * responses; a failure here is logged and dropped.
  */
+import { createHash, randomUUID } from 'node:crypto';
+import { SUPERVISION_ID_PREFIXES } from '../../../shared/supervision-durable-identity.js';
 import { timelineEmitter } from '../timeline-emitter.js';
 import type { TimelineEvent } from '../timeline-event.js';
 import logger from '../../util/logger.js';
@@ -160,8 +162,24 @@ export class TaskPairService {
     return transition;
   }
 
+  /**
+   * Id for a pair the Brain opened through send_message without naming one.
+   * With a seed (caller + idempotency key) the id is derived from it, so a
+   * replayed send lands on the same pair instead of opening a second one.
+   */
+  mintTaskId(project: string, seed?: string): string {
+    const store = getTaskPairStore();
+    const idFor = (entropy: string) => `${SUPERVISION_ID_PREFIXES.task}_${
+      createHash('sha256').update(`${project}\0${entropy}`).digest('hex').slice(0, 10)}`;
+    if (seed) return idFor(`seed:${seed}`);
+    for (;;) {
+      const id = idFor(randomUUID());
+      if (!store.getPair(project, id)) return id;
+    }
+  }
+
   /** send_message with task metadata: creates a missing pair, otherwise record only. */
-  implicitDispatch(input: { project?: string; sender: string; target: string; taskId: string; auditor?: string; eventId: string }): TaskPairTransition | undefined {
+  implicitDispatch(input: { project?: string; sender: string; target: string; taskId: string; auditor?: string; title?: string; eventId: string }): TaskPairTransition | undefined {
     const project = input.project ?? projectOfSession(input.sender) ?? projectOfSession(input.target);
     if (!project || !isPairsEngineProject(project)) return undefined;
     const store = getTaskPairStore();
@@ -187,7 +205,11 @@ export class TaskPairService {
       writer: input.sender,
       marker: {
         verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: input.taskId,
-        attrs: { executor: input.target, ...(input.auditor ? { auditor: input.auditor } : {}) },
+        attrs: {
+          executor: input.target,
+          ...(input.auditor ? { auditor: input.auditor } : {}),
+          ...(input.title ? { title: input.title } : {}),
+        },
       },
       source: 'implicit_dispatch',
       eventId: input.eventId,
