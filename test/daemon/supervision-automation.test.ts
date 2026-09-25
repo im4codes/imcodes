@@ -5144,8 +5144,11 @@ describe('SupervisionAutomation', () => {
     beginRun('cmd-ctx', 'implement the feature without naming a change');
 
     completeTurn('implemented the feature');
-    await sleep(25);
-    await sleep(25);
+    // A fixed 50ms (2x sleep(25)) assumed the orchestration send would always
+    // land inside that window; under CI load it sometimes has not, and
+    // `mock.calls[0]` reads as undefined before the call ever happens. Poll
+    // instead, matching the other two tests in this describe block.
+    await waitForTransportSendCount(1);
 
     const orchestrationPrompt = String(mockTransportRuntime.send.mock.calls[0]?.[0]);
     expect(orchestrationPrompt).toContain('independently audit this session\'s most recent work');
