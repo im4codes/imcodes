@@ -1459,9 +1459,13 @@ exec "${realGit}" "$@"
     expect(acceptancePrompt).toContain('cap implementation and risk at 7 and cap tests at 6');
     await completeAcceptanceAuditFromPrompt(acceptancePrompt);
     await emitDeckDemoIdle();
+    // A hardcoded 8000ms budget here (versus the SEND_WAIT_MS used by every
+    // other wait in this file) is exactly the class of flake CI hit: under
+    // full-suite/coverage load the terminal send can land after 8s even
+    // though it is genuinely on its way. Use the same generous budget.
     const terminal = await waitForSend(
       (msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.status === 'passed',
-      8000,
+      SEND_WAIT_MS,
     );
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
@@ -1996,9 +2000,17 @@ exec "${realGit}" "$@"
     await git(['commit', '-m', commitMessage]);
     await git(['push']);
     await emitDeckDemoIdle();
+    // verifyAutoCommitPushCompleted spawns several sequential real `git`
+    // subprocesses (rev-parse, diff, rev-list, log) before the terminal send.
+    // A hardcoded 8000ms budget (below even the file's normal SEND_WAIT_MS)
+    // raced that under full-suite/coverage CI load: the run had already
+    // reached its own conclusion, but the send observed here simply hadn't
+    // landed inside the tight window yet. Use the same generous budget every
+    // other wait in this file relies on, and give the surrounding test (which
+    // also spawns real git processes) matching headroom below.
     const terminal = await waitForSend(
       (msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.status === 'passed',
-      8000,
+      SEND_WAIT_MS,
     );
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.evidence?.map((entry: { summary?: string }) => entry.summary).join('\n')).toContain('Auto commit/push verified by daemon');
@@ -2011,7 +2023,7 @@ exec "${realGit}" "$@"
       maxBuffer: 1024 * 1024,
     });
     expect(remoteLog.stdout?.toString?.() ?? '').toContain(commitMessage);
-  }, 15_000);
+  }, 60_000);
 
   it('runs the Standard preset from spec audit through implementation audit PASS', async () => {
     await handleOpenSpecAutoDeliverCommand({
@@ -3203,8 +3215,10 @@ exec "${realGit}" "$@"
     await completeAcceptanceAuditFromPrompt(acceptancePrompt, { verdict: 'PASS', unchecked_tasks: [], required_changes: [] });
     await emitDeckDemoIdle();
 
+    // Same hardcoded-8000ms-vs-SEND_WAIT_MS class as the other two terminal
+    // waits in this file; align it so this one doesn't flake the same way.
     const terminal = await waitForSend((msg) =>
-      msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.status === 'passed', 8000);
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.status === 'passed', SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   });
@@ -3664,7 +3678,11 @@ exec "${realGit}" "$@"
     await emitDeckDemoIdle();
     terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
-  }, 10_000);
+    // This test chains multiple SEND_WAIT_MS-budgeted waits plus a fixed
+    // settle sleep; a 10_000ms outer test timeout is narrower than a single
+    // one of those internal waits, let alone several in sequence. Match the
+    // generous outer budget used for the other real-verification test below.
+  }, 60_000);
 
   it('rejects authoritative result files that symlink outside .imc/discussions', async () => {
     const acceptancePrompt = await startFinalAcceptanceAuditPrompt('req-result-symlink-escape');
