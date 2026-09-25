@@ -1,5 +1,4 @@
-import { TASK_PAIR_ENGINE_HOOK_PATH, TASK_PAIR_LEGACY_TOOL_HOOK_PATH } from '../../shared/task-pair.js';
-import { TASK_PAIR_LEGACY_TOOL_NAMES } from './task-pairs/legacy-tools.js';
+import { TASK_PAIR_LEGACY_TOOL_HOOK_PATH } from '../../shared/task-pair.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { createIdempotentShutdown, installMcpStdioLifecycle,
@@ -48,6 +47,7 @@ import {
   MEMORY_MCP_SESSION_MODEL_LIST_HOOK_PATH,
   MEMORY_MCP_SESSION_MODEL_SET_HOOK_PATH,
   MEMORY_MCP_TOOL_NAMES,
+  RETIRED_SUPERVISION_MCP_TOOL_NAMES,
 } from '../../shared/memory-mcp-contracts.js';
 import { MEMORY_MCP_ENV_KEYS } from '../../shared/memory-mcp-env.js';
 import { parseMcpToolCatalogMode, type McpToolCatalogMode } from '../../shared/mcp-tool-discovery.js';
@@ -346,7 +346,14 @@ export function createMemoryMcpServer(
   }
   // Withheld tools are gone from this connection: not listed, not discoverable
   // through mcp_tool_search and not callable.
-  for (const name of catalogOptions.withheldTools ?? []) {
+  // Legacy supervision is retired globally.  Keep the optional withheld list
+  // for the old pairs handshake, but never let a stale project/daemon setting
+  // re-publish one of these tools.
+  const withheld = new Set([
+    ...RETIRED_SUPERVISION_MCP_TOOL_NAMES,
+    ...(catalogOptions.withheldTools ?? []),
+  ]);
+  for (const name of withheld) {
     registered.get(name)?.remove();
     registered.delete(name);
   }
@@ -778,7 +785,6 @@ export function createMemoryMcpServerFromEnv(options: MemoryMcpServerOptions = {
   );
 }
 
-const TASK_PAIR_ENGINE_PROBE_TIMEOUT_MS = 2_000;
 
 /**
  * On a `pairs` project the legacy supervision tools (supervision_*,
@@ -791,17 +797,12 @@ export async function resolveTaskPairWithheldMcpTools(
   caller: McpRuntimeCaller,
   deps: { resolveHookPort?: typeof resolveLiveHookPort; postHook?: typeof postHookSend } = {},
 ): Promise<readonly string[]> {
-  if (!caller.sessionName) return [];
-  try {
-    const port = await (deps.resolveHookPort ?? resolveLiveHookPort)();
-    if (!port) return [];
-    const response = await (deps.postHook ?? postHookSend)(
-      port, { from: caller.sessionName }, TASK_PAIR_ENGINE_HOOK_PATH, caller.sessionName, TASK_PAIR_ENGINE_PROBE_TIMEOUT_MS,
-    );
-    return response.pairs === true ? TASK_PAIR_LEGACY_TOOL_NAMES : [];
-  } catch {
-    return [];
-  }
+  // The legacy child/daemon handshake is retired. Keep this exported seam for
+  // callers that still pass withheldTools, but never probe the daemon or return
+  // the old names on any project.
+  void caller;
+  void deps;
+  return [];
 }
 
 export async function runMemoryMcpServer(options: MemoryMcpServerOptions = {}): Promise<void> {

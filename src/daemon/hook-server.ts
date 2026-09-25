@@ -14,6 +14,7 @@
  * All hook scripts and plugins read this value at write time.
  */
 import { TASK_PAIR_ENGINE_HOOK_PATH, TASK_PAIR_LEGACY_TOOL_HOOK_PATH } from '../../shared/task-pair.js';
+import { RETIRED_SUPERVISION_MCP_MESSAGE, RETIRED_SUPERVISION_MCP_TOOL_SET } from '../../shared/memory-mcp-contracts.js';
 import http from 'http';
 import logger from '../util/logger.js';
 import { timelineEmitter } from './timeline-emitter.js';
@@ -1166,6 +1167,15 @@ export async function startHookServer(
         if (!from || !tool || authenticatedSender !== from || !getSession(from)) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: 'invalid task-pair legacy tool request' }));
+          return;
+        }
+        if (RETIRED_SUPERVISION_MCP_TOOL_SET.has(tool.trim().toLowerCase())) {
+          res.writeHead(410, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: false,
+            reason: 'retired',
+            error: RETIRED_SUPERVISION_MCP_MESSAGE,
+          }));
           return;
         }
         const { answerLegacyToolInDaemon } = await import('./task-pairs/legacy-tools.js');

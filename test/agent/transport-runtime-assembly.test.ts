@@ -168,23 +168,22 @@ describe('buildProviderContextPayload', () => {
         sessionIdentity: { sessionName: 'deck_proj_brain', label: 'Brain', role: 'brain' },
         namespace: { scope: 'personal', projectId: 'repo-1' },
         brainContractRegistered,
-        // The legacy contract; a pairs Brain's is covered below.
-        taskPairEngine: 'legacy',
+        taskPairEngine: 'pairs',
       },
     );
 
     const firstPayload = build(false);
     const first = firstPayload.sessionSystemText ?? '';
     expect(first, 'the first turn must register the full contract body').toContain('"contractId"');
-    expect(first).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
-    expect(firstPayload.turnSystemText ?? '').not.toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+    expect(first).toContain(TASK_PAIR_BRAIN_CONTRACT_ID);
+    expect(firstPayload.turnSystemText ?? '').not.toContain(TASK_PAIR_BRAIN_CONTRACT_ID);
 
     const laterPayload = build(true);
     const later = laterPayload.sessionSystemText ?? '';
     expect(later, 'the later turn must still bind the contract by reference')
-      .toContain(buildBrainWorkDelegationContractRef(false, 'legacy'));
-    expect(later).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
-    expect(laterPayload.turnSystemText ?? '').not.toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+      .toContain(buildBrainWorkDelegationContractRef(false, 'pairs'));
+    expect(later).toContain(TASK_PAIR_BRAIN_CONTRACT_ID);
+    expect(laterPayload.turnSystemText ?? '').not.toContain(TASK_PAIR_BRAIN_CONTRACT_ID);
     expect(
       later.length,
       'the compact re-assertion must be materially smaller than the body',
@@ -228,32 +227,24 @@ describe('buildProviderContextPayload', () => {
     ).sessionSystemText ?? ''
   );
 
-  it('a supervision-off Brain on the pairs engine opens pairs for audited work with no own heartbeat; only a legacy-engine Brain keeps its cron', () => {
+  it('a supervision-off Brain on the pairs engine opens pairs for audited work with no own heartbeat', () => {
     const pairs = brainSystemText({ automaticSupervisionEnabled: false });
     expect(pairs).toContain('"auditedWork":{"route":"task_pair"');
     expect(pairs).toContain('"brainCronSelf":"forbidden"');
     expect(pairs).not.toContain('cron_create_self');
-    const legacy = brainSystemText({ automaticSupervisionEnabled: false, taskPairEngine: 'legacy' });
-    expect(legacy).toContain('cron_create_self_every_10_min');
-    expect(legacy).toContain('cron_cancel_self_when_finished');
-    // Registered variants are re-asserted by reference to their own variant.
-    expect(brainSystemText({ automaticSupervisionEnabled: false, taskPairEngine: 'legacy', brainContractRegistered: true }))
-      .toContain('"engine":"legacy"');
-    expect(brainSystemText({ automaticSupervisionEnabled: false, brainContractRegistered: true }))
-      .not.toContain('"engine":"legacy"');
+    expect(brainSystemText({ automaticSupervisionEnabled: false, taskPairEngine: 'legacy' }))
+      .not.toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
   });
 
-  it('a project left in mode off with no explicit engine gets neither pairs nor legacy in the Brain contract, and never the Brain\'s own heartbeat', () => {
+  it('a project left in mode off with no explicit engine gets neither pairs nor legacy in the Brain contract', () => {
     const off = brainSystemText({ automaticSupervisionEnabled: false, taskPairEngine: 'off' });
     expect(off).not.toContain('"route":"task_pair"');
     expect(off).not.toContain('cron_create_self');
-    expect(off).toContain('"heartbeat":"none"');
-    expect(off).toContain('takes precedence');
-    expect(brainSystemText({ automaticSupervisionEnabled: false, taskPairEngine: 'off', brainContractRegistered: true }))
-      .toContain('"engine":"off"');
+    expect(off).not.toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+    expect(off).not.toContain(TASK_PAIR_BRAIN_CONTRACT_ID);
   });
 
-  it('never injects the task-pair marker contract into any session of an off-engine project, but still does for pairs/legacy', () => {
+  it('never injects the task-pair marker contract into any session of an off-engine project', () => {
     const sessionText = (taskPairEngine: 'pairs' | 'legacy' | 'off') => (
       buildProviderContextPayload(
         makeProvider('full-normalized-context-injection'),
@@ -266,7 +257,7 @@ describe('buildProviderContextPayload', () => {
       ).sessionSystemText ?? ''
     );
     expect(sessionText('pairs')).toContain('[Contract: task_pair_markers_v1]');
-    expect(sessionText('legacy')).toContain('[Contract: task_pair_markers_v1]');
+    expect(sessionText('legacy')).not.toContain('[Contract: task_pair_markers_v1]');
     expect(sessionText('off')).not.toContain('task_pair_markers_v1');
     // Not the marker-writing template itself -- audit_convergence_v1's own
     // taskPairs section legitimately mentions "IMCODES_TASK" in prose
@@ -287,10 +278,10 @@ describe('buildProviderContextPayload', () => {
   for (const [label, automaticSupervisionEnabled] of [['off', false], ['absent', undefined]] as const) {
     it(`gives a supervision-${label} Brain the manual-only contract and none of the automatic task route`, () => {
       for (const turn of [1, 2]) {
-        const text = brainSystemText({ automaticSupervisionEnabled, taskPairEngine: 'legacy' });
+        const text = brainSystemText({ automaticSupervisionEnabled, taskPairEngine: 'pairs' });
         // The per-turn baseline itself survives: the compaction fix stands.
         expect(text, `turn ${turn} must still carry the delegation contract`)
-          .toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+          .toContain(TASK_PAIR_BRAIN_CONTRACT_ID);
         expect(text).toContain('"automaticSupervision":false');
         // Supervised work is arranged by hand, never on the Brain's own initiative.
         expect(text).toContain('explicit_user_request');
@@ -306,12 +297,11 @@ describe('buildProviderContextPayload', () => {
     });
   }
 
-  it('keeps the full supervised-delegation contract for a legacy-engine Brain with automatic supervision enabled', () => {
+  it('retires the legacy Brain delegation contract even when a stale legacy engine is requested', () => {
     const text = brainSystemText({ automaticSupervisionEnabled: true, taskPairEngine: 'legacy' });
-    expect(text).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
-    expect(text).toContain('"automaticSupervision":true');
+    expect(text).not.toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
     for (const automatic of AUTOMATIC_SUPERVISION_MARKERS) {
-      expect(text, `${automatic} is part of the automatic contract`).toContain(automatic);
+      expect(text, `${automatic} must not reach a retired legacy Brain`).not.toContain(automatic);
     }
   });
 
@@ -332,7 +322,7 @@ describe('buildProviderContextPayload', () => {
     expect(ref).not.toContain('"fullText"');
   });
 
-  it('hands a pairs-engine Brain no supervision_* contract in any variant; a legacy Brain keeps its own', () => {
+  it('hands a pairs-engine Brain no supervision_* contract in any variant and retires legacy injection', () => {
     for (const automaticSupervisionEnabled of [true, false]) {
       for (const brainContractRegistered of [false, true]) {
         const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection'), {
@@ -346,21 +336,18 @@ describe('buildProviderContextPayload', () => {
         expect(text, `auto=${automaticSupervisionEnabled} registered=${brainContractRegistered}`).toContain(TASK_PAIR_BRAIN_CONTRACT_ID);
         expect(text, `auto=${automaticSupervisionEnabled} registered=${brainContractRegistered}`).not.toMatch(/supervision_[a-z_]+_v\d/);
         const legacy = brainSystemText({ automaticSupervisionEnabled, brainContractRegistered, taskPairEngine: 'legacy' });
-        expect(legacy).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+        expect(legacy).not.toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
         expect(legacy).not.toContain(TASK_PAIR_BRAIN_CONTRACT_ID);
       }
     }
   });
 
   it('makes every re-assertion name its variant, so an off reference can never stand in for the on body', () => {
-    const offRef = brainSystemText({ automaticSupervisionEnabled: false, taskPairEngine: 'legacy', brainContractRegistered: true });
-    const onRef = brainSystemText({ automaticSupervisionEnabled: true, taskPairEngine: 'legacy', brainContractRegistered: true });
-    expect(offRef).toContain(buildBrainWorkDelegationContractRef(false, 'legacy'));
-    expect(onRef).toContain(buildBrainWorkDelegationContractRef(true, 'legacy'));
-    expect(offRef).toContain('"automaticSupervision":false');
-    expect(offRef, 'an off reference must not name the supervised carrier').not.toContain('"fullText"');
-    expect(onRef).toContain('"fullText":"supervisionDecision"');
-    expect(onRef).not.toContain('"automaticSupervision":false');
+    const pairsRef = brainSystemText({ automaticSupervisionEnabled: true, brainContractRegistered: true });
+    expect(pairsRef).toContain(buildBrainWorkDelegationContractRef(true, 'pairs'));
+    expect(pairsRef).not.toContain('"fullText":"supervisionDecision"');
+    expect(brainSystemText({ automaticSupervisionEnabled: true, taskPairEngine: 'legacy', brainContractRegistered: true }))
+      .not.toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
   });
 
   // Delegation authority never drags the audit lifecycle in with it, in either
@@ -369,8 +356,8 @@ describe('buildProviderContextPayload', () => {
   // must not be duplicated into turn-scoped authored context.
   for (const automaticSupervisionEnabled of [false, true, undefined]) {
     it(`keeps the baseline layer audit-free (automaticSupervisionEnabled=${String(automaticSupervisionEnabled)})`, () => {
-      const text = brainSystemText({ automaticSupervisionEnabled, taskPairEngine: 'legacy' });
-      expect(text).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+      const text = brainSystemText({ automaticSupervisionEnabled, taskPairEngine: 'pairs' });
+      expect(text).toContain(TASK_PAIR_BRAIN_CONTRACT_ID);
       expect(text).not.toContain(SUPERVISION_CONTRACT_IDS.TASK_FINALIZATION);
       expect(text).not.toContain(SUPERVISION_CONTRACT_IDS.CONTEXTUAL_AUDIT);
     });

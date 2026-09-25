@@ -171,9 +171,13 @@ function isBrainOwnedAutomaticSupervision(
   sessionName: string,
   snapshot: SessionSupervisionSnapshot | null | undefined,
 ): snapshot is SessionSupervisionSnapshot {
-  return canSessionRoleOwnAutomaticSupervision(getSession(sessionName)?.role)
-    && isAutomaticSupervisionEnabled(snapshot)
-    && !isPairsEngineSession(sessionName);
+  // There is no legacy engine to own an automatic run anymore. Pair projects
+  // are marker-driven and inert projects are intentionally uncovered; keeping
+  // this predicate false also prevents stale supervised snapshots from
+  // re-injecting the retired contract after restart.
+  void sessionName;
+  void snapshot;
+  return false;
 }
 
 /**

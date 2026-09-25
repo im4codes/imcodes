@@ -4542,10 +4542,10 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     : persistedSupervisionSnapshot;
   // No legacy Brain-run on a `pairs` project: the pair engine owns supervision
   // there (see isBrainOwnedAutomaticSupervision in supervision-automation.ts).
-  const supervisionRunRequested = isAutomaticSupervisionEnabled(supervisionSnapshot)
-    && canSessionRoleOwnAutomaticSupervision(record?.role)
-    && !isPairsEngineSession(sessionName)
-    && isEligibleSupervisionTaskText(displayText);
+  // The legacy Brain-run supervision path is retired. Pair projects are
+  // marker-driven, while inert projects deliberately receive no supervision
+  // contract or automatic task run even if an old snapshot survives upgrade.
+  const supervisionRunRequested = false;
   // Fail closed on execution pools at START as well as at save. A session
   // persisted before the save gate existed can still be carrying
   // legacy_unconfigured pools, and starting an automatic run on it would be
@@ -4568,7 +4568,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const agentMessagePreamble = mergeAgentMessagePreambles(
     preferenceMessagePreamble,
     attachmentRetentionPreamble,
-    shouldTrackSupervisionTaskRun
+    shouldTrackSupervisionTaskRun && supervisionSnapshot
       ? supervisionSnapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
         ? buildSupervisedAuditExecutionPreamble(supervisionSnapshot.uiLocale)
         : buildSupervisionExecutionPreamble(supervisionSnapshot.uiLocale)
@@ -4642,7 +4642,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         { source: 'daemon', confidence: 'high' },
       );
     }
-    if (shouldTrackSupervisionTaskRun) {
+    if (shouldTrackSupervisionTaskRun && supervisionSnapshot) {
       supervisionAutomation.queueTaskIntent(sessionName, effectiveId, displayText, supervisionSnapshot);
     }
     const queued = getResendEntries(sessionName);
@@ -4734,7 +4734,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         { source: 'daemon', confidence: 'high' },
       );
     }
-    if (shouldTrackSupervisionTaskRun) {
+    if (shouldTrackSupervisionTaskRun && supervisionSnapshot) {
       supervisionAutomation.queueTaskIntent(sessionName, effectiveId, displayText, supervisionSnapshot);
     }
     const queued = getResendEntries(sessionName);
@@ -4956,7 +4956,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
             : (sendMetadata
                 ? transportRuntime.send(displayText, effectiveId, undefined, undefined, sendMetadata)
                 : transportRuntime.send(displayText, effectiveId)));
-      if (shouldTrackSupervisionTaskRun) {
+      if (shouldTrackSupervisionTaskRun && supervisionSnapshot) {
         // A busy-turn Append is an extension of the task already being
         // supervised, not a queued replacement task. queueTaskIntent() clears
         // the current run before recording the future one; doing that here

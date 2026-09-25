@@ -467,15 +467,17 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
   const cronControlTrustedSystemClause = CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE;
   const automaticSupervision = input.automaticSupervisionEnabled === true;
   const taskPairEngine = input.taskPairEngine ?? 'pairs';
-  // Task-pair markers are the supervision protocol of the `pairs`/`legacy`
-  // engines; like the audit contract, messages reference it by id only. A
-  // session whose project is `off` (no engine active) must never be told to
-  // write IMCODES_TASK markers -- that is exactly the pairs-flow injection
-  // the project's own dispatch/audit workflow must be left undisturbed by.
-  const taskPairContract = input.suppressMcpMemorySearchGuidance || taskPairEngine === 'off'
+  // Task-pair markers are the sole active supervision protocol. A stale legacy
+  // engine value is inert just like `off`: it must not receive pair nudges or
+  // the retired supervision contract.
+  const taskPairContract = input.suppressMcpMemorySearchGuidance || taskPairEngine !== 'pairs'
     ? undefined
     : TASK_PAIR_SYSTEM_CONTRACT;
-  const brainDelegationContract = input.sessionIdentity?.role === 'brain'
+  // Legacy supervision is retired.  Only an explicitly enabled pairs
+  // project receives the marker-driven Brain contract; inert projects must
+  // not inherit the old supervision contract merely because a stale snapshot
+  // still says supervised.
+  const brainDelegationContract = input.sessionIdentity?.role === 'brain' && taskPairEngine === 'pairs'
     ? (input.brainContractRegistered
       ? buildBrainWorkDelegationContractRef(automaticSupervision, taskPairEngine)
       : automaticSupervision

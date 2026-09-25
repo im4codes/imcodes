@@ -20,6 +20,7 @@ import {
   MEMORY_MCP_DISABLED_FLAGS,
   MEMORY_MCP_TOOL_CONTRACTS,
   MEMORY_MCP_TOOL_NAME_LIST,
+  RETIRED_SUPERVISION_MCP_TOOL_NAMES,
   MEMORY_MCP_TOOL_NAMES,
   buildMcpDisabledResult,
   buildMcpErrorResult,
@@ -653,6 +654,7 @@ function disabled(disabledFlag: string, extra: Record<string, unknown> = {}): To
 function error(reason: MCPErrorReason, message?: string): ToolResult {
   return buildMcpErrorResult(reason, message);
 }
+
 
 function integrationRefusal(prefix: string, refusals: readonly object[]): ToolResult {
   return {
@@ -3562,7 +3564,14 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
 
 function wrapHandlers(handlers: Record<MemoryMcpToolName, MemoryMcpToolHandler>): Record<MemoryMcpToolName, MemoryMcpToolHandler> {
   const wrapped = {} as Record<MemoryMcpToolName, MemoryMcpToolHandler>;
-  for (const name of MEMORY_MCP_TOOL_NAME_LIST) {
+  // Keep retired handlers available to the daemon-side direct-call seam so an
+  // old client receives the explicit retirement guidance. They are still
+  // absent from MEMORY_MCP_TOOL_NAME_LIST and therefore never registered.
+  const names = new Set<string>([
+    ...MEMORY_MCP_TOOL_NAME_LIST,
+    ...RETIRED_SUPERVISION_MCP_TOOL_NAMES,
+  ]);
+  for (const name of names as Set<MemoryMcpToolName>) {
     wrapped[name] = async (input?: unknown, context?: MemoryMcpToolContext) => {
       try {
         return await handlers[name](input, context);

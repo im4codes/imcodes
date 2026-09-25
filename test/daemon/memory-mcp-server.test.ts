@@ -25,13 +25,10 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { MEMORY_MCP_ENV_KEYS, buildMemoryMcpServerEnv } from '../../shared/memory-mcp-env.js';
 import {
   MEMORY_MCP_TOOL_NAME_LIST, MEMORY_MCP_TOOL_NAMES,
-  SUPERVISION_INTEGRATION_FINALIZATION_RECORD_ONLY_FIELDS,
-  SUPERVISION_INTEGRATION_FINALIZATION_REQUIRED_FIELDS,
 } from '../../shared/memory-mcp-contracts.js';
 import { ALIAS_MCP_TOOLS } from '../../shared/alias-types.js';
 import { MESSAGE_PIN_MCP_TOOLS } from '../../shared/message-pins.js';
 import { CAPABILITY_MCP_TOOL_NAMES } from '../../shared/capability-management.js';
-import { SUPERVISION_MCP_REGISTERED_TOOLS } from '../../shared/supervision-mcp-tools.js';
 import { SUPERVISION_MCP_TOOLS } from '../../shared/supervision-mcp-tools.js';
 import { AGENT_DELEGATION_REPLY_ERRORS, buildAgentDelegationSenderLine } from '../../shared/agent-delegation.js';
 import {
@@ -246,7 +243,7 @@ describe('memory MCP stdio server', () => {
       const names = (await client.listTools()).tools.map((tool) => tool.name);
       expect(names).toContain(MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL);
       expect(names).toContain(MEMORY_MCP_TOOL_NAMES.LIST_MACHINES);
-      expect(names).toContain(SUPERVISION_MCP_TOOLS.RECOVER);
+      expect(names).not.toContain(SUPERVISION_MCP_TOOLS.RECOVER);
     } finally {
       await client.close();
     }
@@ -295,7 +292,6 @@ describe('memory MCP stdio server', () => {
       await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
       const initialCatalog = (await client.listTools()).tools.map((tool) => tool.name);
       expect(initialCatalog).toEqual(expect.arrayContaining([
-        SUPERVISION_MCP_TOOLS.GET,
         MEMORY_MCP_TOOL_NAMES.LIST_MACHINES,
         MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE,
       ]));
@@ -382,7 +378,7 @@ describe('memory MCP stdio server', () => {
       // shrunken allowlist and a leaked non-core tool both fail here.
       const bootstrapNames = bootstrap.tools.map((tool) => tool.name).sort();
       expect(bootstrapNames).toEqual([MCP_TOOL_DISCOVERY_NAME, ...MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE].sort());
-      expect(bootstrap.tools).toHaveLength(35);
+      expect(bootstrap.tools).toHaveLength(MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE.length + 1);
       expect(new Set(bootstrapNames).size).toBe(bootstrapNames.length);
       expect(bootstrapNames).not.toContain(MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE);
       expect(bootstrapNames).not.toContain(MEMORY_MCP_TOOL_NAMES.LIST_MACHINES);
@@ -408,15 +404,7 @@ describe('memory MCP stdio server', () => {
         MEMORY_MCP_TOOL_NAMES.CRON_UPDATE_SELF,
         MEMORY_MCP_TOOL_NAMES.CRON_CANCEL_SELF,
       ]));
-      expect(bootstrap.tools.find((tool) => tool.name === MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY)?.inputSchema.required).toEqual([
-        'taskId',
-        'assignmentId',
-        'attemptId',
-        'revision',
-        'receiptKind',
-        'findings',
-        'validations',
-      ]);
+      expect(bootstrapNames).not.toContain(MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY);
       expect(mcpToolSurfaceBytes(bootstrap.tools)).toBeLessThanOrEqual(MCP_TOOL_SURFACE_BOOTSTRAP_BUDGET_BYTES);
       expect(client.getInstructions()).toBeUndefined();
       const bootstrapDescriptions = bootstrap.tools.map((tool) => tool.description ?? '').join('\n');
@@ -456,7 +444,6 @@ describe('memory MCP stdio server', () => {
         ...MEMORY_MCP_TOOL_NAME_LIST,
         ...Object.values(ALIAS_MCP_TOOLS),
         ...Object.values(MESSAGE_PIN_MCP_TOOLS),
-        ...SUPERVISION_MCP_REGISTERED_TOOLS,
         ...CAPABILITY_MCP_TOOL_NAMES,
       ]);
       expect(new Set(listedNames)).toEqual(expectedFullNames);
@@ -469,33 +456,10 @@ describe('memory MCP stdio server', () => {
         ALIAS_MCP_TOOLS.SAVE,
         ALIAS_MCP_TOOLS.DELETE,
       ]));
-      const finishSchema = listed.tools.find(
-        (tool) => tool.name === MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE,
-      )?.inputSchema as {
-        required?: string[];
-        additionalProperties?: boolean;
-        properties?: Record<string, unknown>;
-      } | undefined;
-      expect(finishSchema).toMatchObject({
-        required: [...SUPERVISION_INTEGRATION_FINALIZATION_REQUIRED_FIELDS],
-        additionalProperties: false,
-      });
-      expect(Object.keys(finishSchema?.properties ?? {}).sort()).toEqual([
-        ...SUPERVISION_INTEGRATION_FINALIZATION_REQUIRED_FIELDS,
-        ...SUPERVISION_INTEGRATION_FINALIZATION_RECORD_ONLY_FIELDS,
-        'preflightToken',
-        'externalRunId',
-        'externalHeadSha',
-        'externalTaskId',
-        'ciResult',
-        'evidence',
-      ].sort());
-      expect(listed.tools.find(
-        (tool) => tool.name === MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_PREFLIGHT,
-      )?.inputSchema).toMatchObject({
-        required: expect.arrayContaining(['assignmentId', 'revision', 'auditAttemptId', 'pushRemoteRef']),
-        additionalProperties: false,
-      });
+      // Legacy supervision schemas remain available only for historical/internal
+      // decoding; the live MCP surface must not publish them.
+      expect(listedNames).not.toContain(MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE);
+      expect(listedNames).not.toContain(MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_PREFLIGHT);
       const sendSchema = listed.tools.find(
         (tool) => tool.name === MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
       )?.inputSchema as { properties?: { task?: { properties?: Record<string, unknown> } } } | undefined;
@@ -961,7 +925,7 @@ describe('memory MCP stdio server', () => {
     }
   });
 
-  it('refreshes supervision_task_recover on the same connection and fail-safely invokes it without a host relist', async () => {
+  it('retires supervision_task_recover on an existing connection without a host relist', async () => {
     const recover = vi.fn(() => ({ ok: true as const, value: { status: 'recovered' } }));
     const registry = {
       getStatus: vi.fn(() => 'cancelled'),
@@ -971,20 +935,7 @@ describe('memory MCP stdio server', () => {
       recover,
       housekeeping: vi.fn(() => ({})),
     };
-    let resolveChanged: ((names: string[]) => void) | undefined;
-    const changed = new Promise<string[]>((resolve) => { resolveChanged = resolve; });
-    const client = new Client({ name: 'supervision-self-refresh-test', version: '0.1.0' }, {
-      listChanged: {
-        tools: {
-          debounceMs: 0,
-          onChanged: (error, tools) => {
-            if (!error && tools?.some((tool) => tool.name === SUPERVISION_MCP_TOOLS.RECOVER)) {
-              resolveChanged?.(tools.map((tool) => tool.name));
-            }
-          },
-        },
-      },
-    });
+    const client = new Client({ name: 'supervision-self-refresh-test', version: '0.1.0' });
     const server = createMemoryMcpServer({
       transport: 'in_process', userId: 'user-1', namespace,
       sessionName: 'deck_proj_brain', projectName: 'proj', projectRoot: '/tmp/proj',
@@ -993,40 +944,15 @@ describe('memory MCP stdio server', () => {
     try {
       await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
       expect((await client.listTools()).tools.map((tool) => tool.name)).not.toContain(SUPERVISION_MCP_TOOLS.RECOVER);
-      await client.callTool({
+      const search = await client.callTool({
         name: MCP_TOOL_DISCOVERY_NAME,
         arguments: { query: SUPERVISION_MCP_TOOLS.RECOVER },
       });
-      await expect(changed).resolves.toContain(SUPERVISION_MCP_TOOLS.RECOVER);
-
-      const fallback = await client.callTool({
-        name: MCP_TOOL_DISCOVERY_NAME,
-        arguments: {
-          query: SUPERVISION_MCP_TOOLS.RECOVER,
-          fallbackCall: {
-            name: SUPERVISION_MCP_TOOLS.RECOVER,
-            arguments: { taskId: 'task-1', toStatus: 'recovered', reason: 'repair stale projection' },
-          },
-        },
-      });
-      expect(fallback).toMatchObject({
-        isError: false,
-        structuredContent: { status: 'ok', taskId: 'task-1', fromStatus: 'cancelled', toStatus: 'recovered' },
-      });
-      expect(recover).toHaveBeenCalledTimes(1);
-
-      const mismatched = await client.callTool({
-        name: MCP_TOOL_DISCOVERY_NAME,
-        arguments: {
-          query: SUPERVISION_MCP_TOOLS.RECOVER,
-          fallbackCall: { name: 'capability_status', arguments: {} },
-        },
-      });
-      expect(mismatched).toMatchObject({
-        isError: true,
-        structuredContent: { status: 'error', reason: 'validation_failed' },
-      });
-      expect(recover).toHaveBeenCalledTimes(1);
+      expect(search).toMatchObject({ isError: true });
+      expect(JSON.stringify(search)).toMatch(/retired/i);
+      const direct = await client.callTool({ name: SUPERVISION_MCP_TOOLS.RECOVER, arguments: {} });
+      expect(direct).toMatchObject({ isError: true });
+      expect(recover).not.toHaveBeenCalled();
     } finally {
       await client.close();
       await server.close();
@@ -1228,32 +1154,15 @@ describe('memory MCP stdio server', () => {
       for (const missing of ['taskId', 'assignmentId', 'revision'] as const) {
         const incomplete: Record<string, unknown> = { ...validReply };
         delete incomplete[missing];
-        const rejected = await callLazyTool(client, 'peer_audit_reply', incomplete);
+        const rejected = await client.callTool({ name: 'peer_audit_reply', arguments: incomplete });
         expect(rejected).toMatchObject({ isError: true });
       }
       expect(received).toEqual([]);
-      const result = await callLazyTool(client, 'peer_audit_reply', validReply);
-      expect(result.structuredContent).toEqual({ status: 'ok', accepted: true });
-      expect(received).toEqual([{
-        sender: 'deck_sub_worker',
-        body: expect.objectContaining({
-          version: 'peer_audit_reply_v1',
-          taskId: 'supervision_task_12345678',
-          assignmentId: 'supervision_assignment_12345678',
-          attemptId: 'attempt_12345678',
-          revision: 'revision_12345678',
-          receiptKind: 'final',
-        }),
-      }]);
-      const rejected = await callLazyTool(client, 'peer_audit_reply', {
-        ...validReply,
-        assignmentId: 'supervision_assignment_rejected_1',
-      });
-      expect(rejected.structuredContent).toMatchObject({
-        status: 'error',
-        reason: 'identity_rejected',
-        message: expect.stringContaining('assignmentId actual="supervision_assignment_rejected_1"'),
-      });
+      const result = await client.callTool({ name: 'peer_audit_reply', arguments: validReply });
+      expect(result).toMatchObject({ isError: true });
+      expect(JSON.stringify(result)).toMatch(/retired/i);
+      expect(received).toEqual([]);
+      expect(received).toEqual([]);
     } finally {
       await client.close();
       await new Promise<void>((resolve, reject) => hookServer.close((err) => (err ? reject(err) : resolve())));

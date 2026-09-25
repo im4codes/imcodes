@@ -16,6 +16,8 @@ export const SUPERVISION_MCP_TOOLS = Object.freeze({
   /** Bounded retention census/apply; apply is administrative and provenance-preserving. */
   HOUSEKEEPING: 'supervision_task_housekeeping',
 } as const);
+export const SUPERVISION_MCP_RETIRED_MESSAGE =
+  'retired: use IMCODES_TASK pair markers, or plain send_message when pairs are not enabled' as const;
 export type SupervisionMcpToolName = typeof SUPERVISION_MCP_TOOLS[keyof typeof SUPERVISION_MCP_TOOLS];
 
 export const SUPERVISION_MCP_TOOL_NAME_LIST: readonly SupervisionMcpToolName[] = Object.freeze([
@@ -27,11 +29,12 @@ export const SUPERVISION_MCP_TOOL_NAME_LIST: readonly SupervisionMcpToolName[] =
 ]);
 
 /**
- * Tools this module registers onto the live MCP server today.
+ * Historical registration names retained for internal/test decoding. The live
+ * server removes these entries before publishing its callable catalog.
  *
- * INTENT and RECOVER are absent from the legacy supervision family in
- * shared/memory-mcp-contracts.ts, so registering them here is additive and
- * cannot shadow an existing handler.
+ * Keeping this compatibility list separate from the advertised catalog lets
+ * stored task projections and migration tests decode old rows without making
+ * the names model-callable again.
  */
 export const SUPERVISION_MCP_REGISTERED_TOOLS: readonly SupervisionMcpToolName[] = Object.freeze([
   SUPERVISION_MCP_TOOLS.INTENT,
