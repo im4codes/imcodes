@@ -72,10 +72,14 @@ export const TASK_PAIR_WORKSPACE_RULES = [
   'Deliverables: judge from the task type whether the result must outlive the pair (a report, document or asset the user keeps) or is only temporary (scratch work, or code that is committed and pushed). If it must be kept, end with DONE <taskId> output=<path inside the workspace> [dest=<path inside the project directory>]: the daemon copies it into the project directory (by default under the same relative path, never overwriting) and tells the user where. Temporary work: plain DONE.',
 ].join(' ');
 
-export const TASK_PAIR_ENGINES = ['pairs', 'legacy'] as const;
-export type TaskPairEngine = typeof TASK_PAIR_ENGINES[number];
+/** User-selectable engines. The retired `legacy` value is intentionally not
+ * offered by settings, but remains part of the stored-value type so old
+ * snapshots can be read and migrated without data loss. */
+export const TASK_PAIR_ENGINES = ['pairs'] as const;
+export type TaskPairEngine = 'pairs' | 'legacy';
 export const TASK_PAIR_DEFAULT_ENGINE: TaskPairEngine = 'pairs';
-/** Global override for every project, e.g. `IMCODES_SUPERVISION_ENGINE=legacy`. */
+/** Global override for every project; `legacy` is accepted only to resolve old
+ * environments to inert/off during migration. */
 export const TASK_PAIR_ENGINE_ENV = 'IMCODES_SUPERVISION_ENGINE' as const;
 /**
  * The resolved engine state for a project, including the inert `off` state:

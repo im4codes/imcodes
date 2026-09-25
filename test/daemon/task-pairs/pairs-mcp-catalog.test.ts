@@ -1,7 +1,7 @@
 /**
- * A `pairs` project carries no legacy supervision tools: the MCP child asks the
- * daemon at startup and, on pairs, never publishes supervision_* or
- * peer_audit_reply (not listed, not discoverable, not callable).
+ * A `pairs` project carries no retired supervision task tools: the MCP child
+ * never publishes supervision_* task-path names. `peer_audit_reply` remains a
+ * live user-invoked quick-audit channel.
  */
 import { describe, expect, it, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';

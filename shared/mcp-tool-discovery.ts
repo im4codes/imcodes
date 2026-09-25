@@ -154,6 +154,9 @@ export const MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE: readonly string[] = Object.freez
   // the first tools/list generation, including when the target session is too
   // unhealthy to participate in a discovery round-trip.
   MEMORY_MCP_TOOL_NAMES.SESSION_RESTART,
+  // Quick peer audits remain live and must be callable without a discovery
+  // round-trip from an auditor brief.
+  MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY,
   MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY,
   // memory basics + identity
   MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY,

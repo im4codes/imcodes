@@ -37,12 +37,17 @@ import { getTaskPairStore } from './store.js';
 export function resolveTaskPairEngineState(project: string | undefined, env: NodeJS.ProcessEnv = process.env): TaskPairEngineState {
   const override = env[TASK_PAIR_ENGINE_ENV]?.trim();
   if (override === 'pairs') return TASK_PAIR_DEFAULT_ENGINE;
+  // A persisted/global legacy value is migration input only. It resolves to
+  // inert/off rather than silently opting the project into marker supervision.
+  if (override === 'legacy') return 'off';
   if (!project) return 'off';
   const settings = brainSupervisionSettings(project);
   if (settings?.pairEngine === 'pairs') return TASK_PAIR_DEFAULT_ENGINE;
+  if (settings?.pairEngine === 'legacy') return 'off';
   try {
     const stored = getTaskPairStore().getProjectSettings(project).engine;
     if (stored === 'pairs') return TASK_PAIR_DEFAULT_ENGINE;
+    if (stored === 'legacy') return 'off';
   } catch {
     // fall through to the mode-aware default below
   }

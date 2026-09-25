@@ -94,6 +94,7 @@ describe('memory MCP shared contracts', () => {
       'verification_machine_set',
       'verification_machine_remove',
       'verification_machine_verify',
+      'peer_audit_reply',
       'delegation_reply',
       'send_list_targets',
       'pair_list',

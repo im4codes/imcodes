@@ -32,7 +32,9 @@ export function TaskPairSettingsSection({
   onChange: (next: TaskPairSettingsValue) => void;
 }) {
   const { t } = useTranslation();
-  const engine = value.pairEngine ?? ENGINE_UNSET;
+  // Legacy is retained in stored snapshots for migration but is not a
+  // selectable/live engine; render it as the inert unset state.
+  const engine = value.pairEngine === 'legacy' ? ENGINE_UNSET : (value.pairEngine ?? ENGINE_UNSET);
   const allowlist = value.pairAllowlist ?? TASK_PAIR_DEFAULT_ALLOWLIST.map((entry) => ({ ...entry }));
   const max = value.pairMaxConcurrency ?? TASK_PAIR_DEFAULT_MAX_CONCURRENCY;
   const setAllowlist = (next: TaskPairAllowlistEntry[]) => onChange({ ...value, pairAllowlist: next });
