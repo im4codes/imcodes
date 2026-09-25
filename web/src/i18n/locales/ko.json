@@ -4395,6 +4395,9 @@
     "panel_executor": "실행자",
     "panel_auditor": "감사자",
     "panel_untitled": "제목 없는 작업",
-    "panel_model_separator": " · "
+    "panel_model_separator": " · ",
+    "checklist_progress": "구현 {{implemented}}/{{total}} · 감사 {{audited}}/{{total}}",
+    "implemented": "구현",
+    "audited": "감사"
   }
 }

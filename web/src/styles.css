@@ -14481,3 +14481,8 @@ button.quick-agent-delegation-preset.active {
 .task-pair-status-dot { display: inline-block; width: 5px; height: 5px; margin: 0 3px 1px 0; border-radius: 50%; background: var(--supervision-idle-text, #94a3b8); }
 .task-pair-status-dot.is-running { background: var(--status-active-text, #4ade80); box-shadow: 0 0 5px var(--status-active-text, #4ade80); animation: task-pair-status-pulse 1.4s ease-in-out infinite; }
 @keyframes task-pair-status-pulse { 50% { opacity: .45; } }
+
+.supervision-task-console-checklist { display: grid; gap: 3px; margin-top: 4px; }
+.supervision-task-console-checklist-row { display: grid; grid-template-columns: 1.2rem 1.2rem minmax(0, 1fr); align-items: center; gap: 4px; }
+.supervision-task-console-checklist-row span { overflow-wrap: anywhere; }
+.supervision-task-console-checklist-progress { font-size: 0.8em; opacity: 0.8; }

@@ -15,6 +15,7 @@ import {
 } from '@shared/supervision-task-console.js';
 import { isSupervisionTaskLifecycleStatus } from '@shared/supervision-config.js';
 import { AUDIT_SEVERITY_LEVELS } from '@shared/audit-convergence.js';
+import { parseTaskPairChecklist } from '@shared/task-pair-checklist.js';
 import type { WsClient } from '../ws-client.js';
 import { useSupervisionTaskConsole } from '../hooks/useSupervisionTaskConsole.js';
 import {
@@ -104,6 +105,14 @@ function TaskPairConsoleDetails({ pair }: { pair: SupervisionConsolePairInfo }) 
       {pair.flags.map((flag) => (
         <span key={flag} class={`supervision-task-console-pair-flag flag-${flag}`}>{t(`taskPair.flag.${flag}`)}</span>
       ))}
+      {pair.checklist && <span class="supervision-task-console-checklist-progress">{t('taskPair.checklist_progress', { implemented: pair.checklist.implemented, audited: pair.checklist.audited, total: pair.checklist.total })}</span>}
+      {pair.brief && <div class="supervision-task-console-checklist">{parseTaskPairChecklist(pair.brief).map((item) => (
+        <div class="supervision-task-console-checklist-row" key={item.index}>
+          <input type="checkbox" checked={item.implemented} readOnly aria-label={t('taskPair.implemented')} />
+          <input type="checkbox" checked={item.audited} readOnly aria-label={t('taskPair.audited')} />
+          <span>{item.text}</span>
+        </div>
+      ))}</div>}
     </div>
   );
 }

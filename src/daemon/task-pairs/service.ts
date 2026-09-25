@@ -7,6 +7,7 @@
  * responses; a failure here is logged and dropped.
  */
 import { createHash, randomUUID } from 'node:crypto';
+import { stat } from 'node:fs/promises';
 import { SUPERVISION_ID_PREFIXES } from '../../../shared/supervision-durable-identity.js';
 import { timelineEmitter } from '../timeline-emitter.js';
 import type { TimelineEvent } from '../timeline-event.js';
@@ -72,6 +73,45 @@ function mentionsTaskId(text: string, taskId: string): boolean {
   if (!text || !text.includes(taskId)) return false;
   const escaped = taskId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   return new RegExp(`(^|[^A-Za-z0-9_-])${escaped}($|[^A-Za-z0-9_-])`, 'u').test(text);
+}
+
+export async function ensureTaskPairWorkspaceAvailable(project: string, taskId: string): Promise<void> {
+  const store = getTaskPairStore();
+  const stored = store.getPair(project, taskId);
+  if (!stored || !stored.state.executor || !stored.state.workspace) return;
+  const workspace = stored.state.workspace;
+  const present = await stat(workspace.path).then(() => true).catch(() => false);
+  if (present) return;
+  const source = workspace.branch ? 'branch' : workspace.lastHead ? 'lastHead' : stored.state.material?.head ? 'material.head' : workspace.base ? 'workspace.base' : stored.state.material?.base ? 'material.base' : 'default branch';
+  const provision = await provisionTaskPairWorkspace(project, stored.state).catch(() => ({ ok: false as const, detail: 'workspace rebuild failed' }));
+  if (!provision.ok) {
+    if (!stored.state.workspaceRecoveryEscalatedAt) {
+      const result = await sendTaskPairMessage(stored.state.brain, taskId, 'brain-workspace-unrecoverable', `Workspace for ${taskId} is missing and could not be rebuilt. Recovery sources exhausted; inspect the original branch/commit or provide a new workspace.`);
+      if (result === 'sent' || result === 'queued' || result === 'skipped_pending') {
+        store.savePair(project, { ...stored.state, workspaceRecoveryEscalatedAt: Date.now(), updatedAt: Date.now() });
+      }
+    }
+    return;
+  }
+  const now = Date.now();
+  const rebuilt = { kind: provision.kind, path: provision.path, ...(provision.base ? { base: provision.base } : {}), ...(provision.branch ? { branch: provision.branch } : {}), createdAt: now, status: 'active' as const };
+  const next = { ...stored.state, workspace: rebuilt, workspaceRecoveryEscalatedAt: undefined, updatedAt: now };
+  store.savePair(project, next);
+  const notice = `Workspace for ${taskId} was rebuilt from ${source}: ${provision.path}`;
+  await sendTaskPairMessage(stored.state.executor, taskId, 'workspace-rebuilt', notice);
+  if (stored.state.auditor && stored.state.auditor !== 'none') await sendTaskPairMessage(stored.state.auditor, taskId, 'workspace-rebuilt', notice);
+}
+
+export async function refreshTaskPairWorkspaceHead(project: string, taskId: string): Promise<void> {
+  const store = getTaskPairStore();
+  const stored = store.getPair(project, taskId);
+  const workspace = stored?.state.workspace;
+  if (!stored || !workspace || workspace.kind !== 'worktree' || workspace.status === 'removed') return;
+  const material = await resolveTaskPairMaterial(stored.state);
+  if (!material.head) return;
+  const now = Date.now();
+  if (workspace.lastHead === material.head && workspace.lastHeadAt) return;
+  store.savePair(project, { ...stored.state, workspace: { ...workspace, lastHead: material.head, lastHeadAt: now }, updatedAt: Math.max(stored.state.updatedAt, now) });
 }
 
 export class TaskPairService {
@@ -210,6 +250,7 @@ export class TaskPairService {
       stored = store.savePair(input.project, pairToSave, {
         liveness: this.#livenessAfterMarker(existing?.liveness, transition, role, now),
       });
+      void refreshTaskPairWorkspaceHead(input.project, stored.state.taskId);
     }
     this.#emitEvent(input, taskId ?? input.marker.taskId, role, transition, stored?.state ?? existing?.state);
     void this.#executeIntents(input.project, stored?.state, transition.intents);
@@ -423,7 +464,12 @@ export class TaskPairService {
             break;
           case 'audit_request': {
             const material = await resolveTaskPairMaterial(pair);
-            await sendTaskPairMessage(intent.to, pair.taskId, 'audit-request', buildAuditRequestMessage(pair, material));
+            if (material.source === 'pending' || (!material.worktree && !material.path)) {
+              if (pair.executor) await sendTaskPairMessage(pair.executor, pair.taskId, 'material-pending', `Material is pending for ${pair.taskId}; resend READY_FOR_AUDIT with worktree=<absolute path> head=<commit> (or path=<task directory>).`);
+              await sendTaskPairMessage(intent.to, pair.taskId, 'audit-request', `Material pending for ${pair.taskId}; the executor must resend READY_FOR_AUDIT with an explicit workspace path and head.`);
+            } else {
+              await sendTaskPairMessage(intent.to, pair.taskId, 'audit-request', buildAuditRequestMessage(pair, material));
+            }
             break;
           }
           default:
@@ -471,6 +517,7 @@ export class TaskPairService {
         kind: provision.kind,
         path: provision.path,
         ...(provision.base ? { base: provision.base } : {}),
+        ...(provision.branch ? { branch: provision.branch } : {}),
         createdAt: Date.now(),
         status: 'active',
       },

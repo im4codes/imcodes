@@ -34,6 +34,7 @@ export const TASK_PAIR_ENGINE_HOOK_PATH = '/task-pairs/engine' as const;
  * pairs Brain never carries a `supervision_*` contract.
  */
 export const TASK_PAIR_BRAIN_CONTRACT_ID = 'task_pair_brain_v1' as const;
+export const TASK_PAIR_CHECKLIST_RULE = 'Pair brief checklist: keep requirements in Markdown lines "- [ ][ ] item"; first box is implementation, second audit; single-box "- [ ]" is not audited. Use pair_task_get/update/check to edit the whole brief.';
 /** Automation kind stamped on daemon-authored pair messages. */
 export const TASK_PAIR_AUTOMATION_KIND = 'task-pair' as const;
 /** Directory-name prefix of a pair's executor worktree, beside legacy `asg_…` assignment worktrees. */
@@ -69,6 +70,7 @@ export const TASK_PAIR_WORKSPACE_RULES = [
   'A code task in a git project gets a git worktree under ~/.imcodes/worktrees: READY_FOR_AUDIT <taskId> worktree=<absolute path> head=<commit> base=<commit>.',
   `Any other task (the project is not a git repo, or Brain dispatched it with workspace=dir) gets a task directory under ~/.imcodes/${TASK_PAIR_WORKS_DIR}/<project>/<taskId>/: work and write results there; READY_FOR_AUDIT <taskId> path=<the directory or the result files>, no git HEAD needed.`,
   'Never work in the main checkout or /tmp, and never delete the workspace by hand: the daemon removes it 7 days after the pair ends (DONE/CANCEL), and keeps a git worktree that still has uncommitted or unpushed work.',
+  'If your workspace is missing, rebuild it from the original branch (or use the rebuilt path the daemon sends) and continue; do not wait.',
   'Deliverables: judge from the task type whether the result must outlive the pair (a report, document or asset the user keeps) or is only temporary (scratch work, or code that is committed and pushed). If it must be kept, end with DONE <taskId> output=<path inside the workspace> [dest=<path inside the project directory>]: the daemon copies it into the project directory (by default under the same relative path, never overwriting) and tells the user where. Temporary work: plain DONE.',
 ].join(' ');
 
@@ -170,7 +172,7 @@ export type TaskPairFlag = typeof TASK_PAIR_FLAGS[number];
 export const TASK_PAIR_ROLES = ['brain', 'executor', 'auditor', 'other', 'daemon'] as const;
 export type TaskPairRole = typeof TASK_PAIR_ROLES[number];
 
-export const TASK_PAIR_EVENT_SOURCES = ['marker', 'implicit_dispatch', 'legacy_tool', 'legacy_import', 'heartbeat', 'queue'] as const;
+export const TASK_PAIR_EVENT_SOURCES = ['marker', 'implicit_dispatch', 'legacy_tool', 'legacy_import', 'heartbeat', 'queue', 'mcp'] as const;
 export type TaskPairEventSource = typeof TASK_PAIR_EVENT_SOURCES[number];
 
 /** Reasons for marker-triggered daemon messages; each is capped per round. */
@@ -452,6 +454,7 @@ export interface TaskPairState {
   material?: TaskPairMaterial;
   /** The workspace the daemon created for the pair (see task-pairs/workspace.ts). */
   workspace?: TaskPairWorkspace;
+  workspaceRecoveryEscalatedAt?: number;
   /** Workspace Brain asked for on DISPATCH/QUEUE (`workspace=dir`); otherwise chosen by the project. */
   workspaceKind?: TaskPairWorkspaceKind;
   /** Queue priority requested by the Brain; urgent queued work runs before normal FIFO work. */
@@ -479,6 +482,11 @@ export interface TaskPairWorkspace {
   path: string;
   /** Base commit (worktrees only). */
   base?: string;
+  /** Branch name when the workspace has one. */
+  branch?: string;
+  /** Most recently observed commit, refreshed by markers/heartbeats. */
+  lastHead?: string;
+  lastHeadAt?: number;
   createdAt: number;
   /**
    * `ended` from DONE/CANCEL until the retention elapses; then `removed`, or
@@ -1108,5 +1116,6 @@ export function buildTaskPairMarkerContract(): string {
     `Brain: DISPATCH <taskId> executor=<session> auditor=<session>|none [blocking=P0,P1] [pool=primary|economy] [workspace=dir for non-code work in a git project]; queue with QUEUE <taskId> title="..." then the full brief then <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> -->; QUEUE - max=<n> sets your queue limit; REASSIGN <taskId> auditor=<session>; DONE <taskId> force=true completes without audit; CANCEL <taskId>. Naming executor=/auditor=<session> replaces the current holder of that role immediately, ignoring the project's pair allowlist. Naming executormodel=/auditormodel=<model> instead steers the next automatic pick or replacement for that role (also ignoring the allowlist) but does not by itself replace a role that is already filled -- REASSIGN with the session explicitly for that; no matching session or pool config for a named model replies "no session/config for requested model <model>".`,
     TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
     TASK_PAIR_BRAIN_REPORTING_RULE,
+    TASK_PAIR_CHECKLIST_RULE,
   ].join('\n');
 }

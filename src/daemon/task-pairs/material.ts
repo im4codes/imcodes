@@ -11,7 +11,6 @@
  */
 import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { getSession } from '../../store/session-store.js';
 import type { TaskPairState } from '../../../shared/task-pair.js';
 
 const GIT_HEAD_TIMEOUT_MS = 5_000;
@@ -23,11 +22,10 @@ export interface ResolvedTaskPairMaterial {
   /** Task-directory material. */
   path?: string;
   /** Who named the material: the executor's marker, or the daemon's fallback. */
-  source: 'executor' | 'daemon';
+  source: 'executor' | 'workspace' | 'pending';
 }
 
 export interface TaskPairMaterialDeps {
-  projectDirOf?: (sessionName: string) => string | undefined;
   gitHead?: (worktree: string) => Promise<string | undefined>;
 }
 
@@ -52,18 +50,17 @@ export async function resolveTaskPairMaterial(pair: TaskPairState, deps: TaskPai
   const named = pair.material;
   const workspace = pair.workspace && pair.workspace.status !== 'removed' ? pair.workspace : undefined;
   if (workspace?.kind === 'dir' && !named?.worktree && !named?.head) {
-    return { path: named?.path ?? workspace.path, source: named?.path ? 'executor' : 'daemon' };
+    return { path: named?.path ?? workspace.path, source: named?.path ? 'executor' : 'workspace' };
   }
   // The executor's own words first, then the worktree the daemon created for
   // the pair, then the executor session's checkout.
   const worktree = named?.worktree
-    ?? (workspace?.kind === 'worktree' ? workspace.path : undefined)
-    ?? (pair.executor ? (deps.projectDirOf ?? ((name) => getSession(name)?.projectDir))(pair.executor) : undefined);
-  const head = named?.head ?? (worktree ? await (deps.gitHead ?? defaultGitHead)(worktree) : undefined);
+    ?? (workspace?.kind === 'worktree' ? workspace.path : undefined);
+  const head = named?.head ?? (worktree ? await (deps.gitHead ?? defaultGitHead)(worktree) : workspace?.lastHead ?? undefined);
   return {
     ...(worktree ? { worktree } : {}),
     ...(head ? { head } : {}),
     ...(named?.base ? { base: named.base } : workspace?.base ? { base: workspace.base } : {}),
-    source: named?.worktree || named?.head ? 'executor' : 'daemon',
+    source: named?.worktree || named?.head ? 'executor' : workspace ? 'workspace' : 'pending',
   };
 }

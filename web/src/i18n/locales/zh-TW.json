@@ -4396,6 +4396,9 @@
     "panel_executor": "執行者",
     "panel_auditor": "審計者",
     "panel_untitled": "未命名任務",
-    "panel_model_separator": " · "
+    "panel_model_separator": " · ",
+    "checklist_progress": "實作 {{implemented}}/{{total}} · 審計 {{audited}}/{{total}}",
+    "implemented": "實作",
+    "audited": "審計"
   }
 }

@@ -206,7 +206,7 @@ export function buildAuditRequestMessage(pair: TaskPairState, material: Resolved
   return [
     header(pair),
     `Audit request, round ${Math.max(1, pair.round)}, from executor ${pair.executor} (blocking=${pair.blocking.join(',')}).`,
-    `${where}${material.source === 'daemon' ? ' (resolved by the daemon from the executor session)' : ''}`,
+    `${where}${material.source === 'workspace' ? ' (resolved by the daemon from the executor session)' : ''}`,
     `Their validation (full suites for code) comes from them via send_message. Judge by ${AUDIT_CONVERGENCE_CONTRACT_ID}, reply to the executor with every finding tagged [P0]..[P4], then write ${marker('PASS', pair.taskId, `blocking=${pair.blocking.join(',')}`)} or ${marker('REWORK', pair.taskId, `blocking=${pair.blocking.join(',')} p0=<n> ...`)}.`,
     `${NO_LEGACY_ARTIFACTS} If the material cannot be reached (executor limited/offline, workspace unreadable), write ${marker('NEEDS_INPUT', pair.taskId, 'note="..."')} and wait; that is never a P0 or REWORK.`,
     contracts(pair.blocking),

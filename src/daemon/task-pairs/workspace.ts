@@ -45,6 +45,14 @@ import {
 
 const GIT_PROBE_TIMEOUT_MS = 5_000;
 
+function gitBranch(repoPath: string): Promise<string | undefined> {
+  return new Promise((resolve) => execFile('git', ['-C', repoPath, 'symbolic-ref', '--short', '-q', 'HEAD'], { timeout: GIT_PROBE_TIMEOUT_MS }, (error, stdout) => {
+    const value = String(stdout ?? '').trim();
+    resolve(!error && value ? value : undefined);
+  }));
+}
+
+
 /** Path-safe directory name for a pair's worktree (task ids may be Brain-named). */
 export function taskPairWorktreeName(taskId: string): string {
   return `${TASK_PAIR_WORKTREE_PREFIX}${taskId.toLowerCase().replace(/[^0-9a-z_-]/g, '-')}`;
@@ -66,7 +74,7 @@ export function resolveTaskPairTaskDir(project: string, taskId: string, env: Nod
 }
 
 export type TaskPairWorkspaceProvision =
-  | { ok: true; kind: TaskPairWorkspaceKind; path: string; base?: string }
+  | { ok: true; kind: TaskPairWorkspaceKind; path: string; base?: string; branch?: string }
   | { ok: false; detail: string };
 
 export type TaskPairWorkspaceRelease =
@@ -148,7 +156,8 @@ export async function provisionTaskPairWorkspace(
   // Only a git checkout gets a worktree; a non-git project is never git-initialised.
   if (pair.workspaceKind === 'dir' || !(await isGitWorkTree(projectRoot))) return provisionTaskDir(project, pair, deps.env);
   const assignmentId = taskPairWorktreeName(pair.taskId);
-  const base = await resolveSupervisionWorktreeBase({ projectRoot });
+  const requestedBase = pair.workspace?.base ?? pair.material?.base ?? pair.material?.head;
+  const base = await resolveSupervisionWorktreeBase({ projectRoot, requestedBaseRevision: requestedBase });
   // A git repo without a commit has nothing to branch from: a task directory still works.
   if (!base.ok) return provisionTaskDir(project, pair, deps.env);
   const repoPath = resolveSupervisionAssignmentWorktree({ sessionName: pair.executor, assignmentId, env: deps.env });
@@ -167,7 +176,8 @@ export async function provisionTaskPairWorkspace(
   };
   await mkdir(dirname(result.worktreePath), { recursive: true });
   await writeFile(join(dirname(result.worktreePath), 'metadata.json'), JSON.stringify(metadata));
-  return { ok: true, kind: 'worktree', path: result.worktreePath, base: result.baseRevision };
+  const branch = await gitBranch(result.worktreePath);
+  return { ok: true, kind: 'worktree', path: result.worktreePath, base: result.baseRevision, ...(branch ? { branch } : {}) };
 }
 
 /**

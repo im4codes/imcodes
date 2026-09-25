@@ -4396,6 +4396,9 @@
     "panel_executor": "Ejecutor",
     "panel_auditor": "Auditor",
     "panel_untitled": "Tarea sin título",
-    "panel_model_separator": " · "
+    "panel_model_separator": " · ",
+    "checklist_progress": "Implementado {{implemented}}/{{total}} · Auditado {{audited}}/{{total}}",
+    "implemented": "Implementado",
+    "audited": "Auditado"
   }
 }

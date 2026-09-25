@@ -4395,6 +4395,9 @@
     "panel_executor": "実行者",
     "panel_auditor": "監査役",
     "panel_untitled": "無題のタスク",
-    "panel_model_separator": " · "
+    "panel_model_separator": " · ",
+    "checklist_progress": "実装 {{implemented}}/{{total}} · 監査 {{audited}}/{{total}}",
+    "implemented": "実装",
+    "audited": "監査"
   }
 }

@@ -454,6 +454,8 @@ export interface SupervisionConsolePairInfo {
   auditorModel?: string;
   executorState?: SupervisionConsoleSessionState;
   auditorState?: SupervisionConsoleSessionState;
+  brief?: string;
+  checklist?: { total: number; implemented: number; audited: number };
 }
 
 export interface SupervisionTaskConsoleTaskRow {

@@ -4395,6 +4395,9 @@
     "panel_executor": "Исполнитель",
     "panel_auditor": "Аудитор",
     "panel_untitled": "Задача без названия",
-    "panel_model_separator": " · "
+    "panel_model_separator": " · ",
+    "checklist_progress": "Реализовано {{implemented}}/{{total}} · Проверено {{audited}}/{{total}}",
+    "implemented": "Реализовано",
+    "audited": "Проверено"
   }
 }

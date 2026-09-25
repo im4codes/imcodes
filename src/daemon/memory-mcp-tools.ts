@@ -1,4 +1,9 @@
 import { withPairsLegacyTools } from './task-pairs/legacy-tools.js';
+import { getTaskPairStore } from './task-pairs/store.js';
+import { emitTaskPairDaemonEvent } from './task-pairs/service.js';
+import { projectOfSession } from './task-pairs/engine.js';
+import { randomUUID } from 'node:crypto';
+import { parseTaskPairChecklist, taskPairChecklistCounts, updateTaskPairChecklist } from '../../shared/task-pair-checklist.js';
 import { z } from 'zod';
 import type { CapabilityMcpToolDeps } from './capability-mcp-tools.js';
 import { execFile as execFileCallback } from 'node:child_process';
@@ -1495,6 +1500,33 @@ function isToolResultValue(value: ProcessedContextProjection | ToolResult): valu
   return !('namespace' in value);
 }
 
+function pairChecklistTarget(caller: McpRuntimeCaller, taskId?: string) {
+  const store = getTaskPairStore();
+  const project = caller.namespace.projectId?.trim() || projectOfSession(caller.sessionName ?? '') || undefined;
+  if (!project) return undefined;
+  const candidates = taskId?.trim()
+    ? store.listPairs(project).filter((pair) => pair.state.taskId === taskId.trim())
+    : store.listActivePairs(project);
+  return candidates.find((pair) => pair.state.executor === caller.sessionName || pair.state.auditor === caller.sessionName || pair.state.brain === caller.sessionName);
+}
+
+function pairChecklistView(pair: ReturnType<typeof pairChecklistTarget>) {
+  if (!pair) return undefined;
+  const markdown = pair.state.brief ?? '';
+  return { taskId: pair.state.taskId, markdown, status: pair.state.status, executor: pair.state.executor, auditor: pair.state.auditor, brain: pair.state.brain, round: pair.state.round, flags: pair.state.flags, blocking: pair.state.blocking, previousAuditors: pair.state.previousAuditors, capCounts: pair.state.capCounts, workspaceKind: pair.state.workspaceKind, lastVerdict: pair.state.lastVerdict, createdAt: pair.state.createdAt, updatedAt: pair.state.updatedAt, workspace: pair.state.workspace, material: pair.state.material, output: pair.state.output, ...taskPairChecklistCounts(markdown) };
+}
+
+function savePairBrief(pair: NonNullable<ReturnType<typeof pairChecklistTarget>>, markdown: string, writer: string) {
+  const store = getTaskPairStore();
+  const previous = pair.state;
+  const next = { ...previous, brief: markdown, updatedAt: Date.now() };
+  const saved = store.savePair(pair.project, next);
+  const eventId = `pair-brief:${pair.state.taskId}:${randomUUID()}`;
+  store.recordEvent({ id: eventId, project: pair.project, taskId: pair.state.taskId, writer, role: 'daemon', verb: 'BRIEF_UPDATED', attrs: {}, effect: 'brief_updated', unusual: false, source: 'mcp', fromStatus: previous.status, toStatus: next.status, at: next.updatedAt });
+  emitTaskPairDaemonEvent(next, { eventId, verb: 'BRIEF_UPDATED', effect: 'brief_updated', source: 'mcp', fromStatus: previous.status, toStatus: next.status, unusual: false });
+  return saved;
+}
+
 export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: MemoryMcpToolDeps = {}): Record<MemoryMcpToolName, MemoryMcpToolHandler> {
   const searchMemory = deps.searchMemory ?? searchMcpMemoryRecall;
   const listMemorySummaries = deps.listMemorySummaries ?? listMcpMemorySummaries;
@@ -1787,6 +1819,29 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
   };
 
   const handlers: Record<MemoryMcpToolName, MemoryMcpToolHandler> = {
+    [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_GET]: async (input) => {
+      const taskId = typeof input === 'object' && input !== null && typeof (input as Record<string, unknown>).taskId === 'string' ? String((input as Record<string, unknown>).taskId) : undefined;
+      const view = pairChecklistView(pairChecklistTarget(caller, taskId));
+      return view ? view : error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
+    },
+    [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE]: async (input) => {
+      const args = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
+      const markdown = typeof args.markdown === 'string' ? args.markdown : undefined;
+      if (markdown === undefined) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'markdown is required');
+      const pair = pairChecklistTarget(caller, typeof args.taskId === 'string' ? args.taskId : undefined);
+      if (!pair) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
+      return pairChecklistView(savePairBrief(pair, markdown, caller.sessionName ?? 'unknown'))!;
+    },
+    [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK]: async (input) => {
+      const args = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
+      const items = Array.isArray(args.items) && args.items.every((item) => Number.isInteger(item) && Number(item) > 0) ? args.items.map(Number) : undefined;
+      const box = args.box === 'implemented' || args.box === 'audited' ? args.box : undefined;
+      if (!items || !box || typeof args.checked !== 'boolean') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'items, box and checked are required');
+      const pair = pairChecklistTarget(caller, typeof args.taskId === 'string' ? args.taskId : undefined);
+      if (!pair) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
+      const markdown = updateTaskPairChecklist(pair.state.brief ?? '', items, box, args.checked);
+      return pairChecklistView(savePairBrief(pair, markdown, caller.sessionName ?? 'unknown'))!;
+    },
     [MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]: async (input) => {
       const gate = memoryGate(deps, MEMORY_FEATURE_FLAGS_BY_NAME.quickSearch, MEMORY_MCP_DISABLED_FLAGS.QUICK_SEARCH, { items: [] });
       if (gate) return gate;
@@ -3631,6 +3686,9 @@ function toolResult(result: ToolResult, name?: MemoryMcpToolName): CallToolResul
 }
 
 const schemas = {
+  [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_GET]: z.object({ taskId: z.string().optional().describe('Pair task id.') }),
+  [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE]: z.object({ taskId: z.string().optional().describe('Pair task id.'), markdown: z.string().describe('Complete Markdown brief.') }),
+  [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK]: z.object({ taskId: z.string().optional().describe('Pair task id.'), items: z.array(z.number().int().positive()).describe('1-based checklist item numbers.'), box: z.enum(['implemented', 'audited']).describe('Box to update.'), checked: z.boolean().describe('New state.') }),
   [MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]: z.object({
     query: z.string().describe('Text query; hits include sourceLookup for expansion.'),
     limit: z.number().int().min(1).max(100).optional().describe('Maximum hits.'),

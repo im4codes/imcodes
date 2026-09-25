@@ -4396,6 +4396,9 @@
     "panel_executor": "执行者",
     "panel_auditor": "审计者",
     "panel_untitled": "未命名任务",
-    "panel_model_separator": " · "
+    "panel_model_separator": " · ",
+    "checklist_progress": "实现 {{implemented}}/{{total}} · 审计 {{audited}}/{{total}}",
+    "implemented": "实现",
+    "audited": "审计"
   }
 }

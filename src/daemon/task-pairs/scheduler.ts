@@ -34,7 +34,7 @@ import { getTaskPairStore, type StoredTaskPair, type TaskPairLiveness } from './
 import { isPairsEngineProject, resolveTaskPairAllowlist, resolveTaskPairMaxConcurrency } from './engine.js';
 import { sendTaskPairMessage } from './delivery.js';
 import { hasRecentTaskPairProviderError } from './provider-errors.js';
-import { taskPairService, type TaskPairScheduler } from './service.js';
+import { ensureTaskPairWorkspaceAvailable, refreshTaskPairWorkspaceHead, taskPairService, type TaskPairScheduler } from './service.js';
 import {
   allowlistedProvisionConfig,
   describeAuditorAllowlistGap,
@@ -221,6 +221,8 @@ export class TaskPairAutomation implements TaskPairScheduler {
         if (!isPairsEngineProject(stored.project)) continue;
         brains.set(stored.state.brain, stored.project);
         try {
+          await ensureTaskPairWorkspaceAvailable(stored.project, stored.state.taskId);
+          await refreshTaskPairWorkspaceHead(stored.project, stored.state.taskId);
           await this.#tickPair(stored, now);
         } catch (error) {
           logger.warn({ err: error, taskId: stored.state.taskId }, 'task-pair: pair tick failed');
