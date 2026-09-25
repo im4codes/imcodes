@@ -5,17 +5,17 @@ import { machinesRoutes } from '../src/routes/machines.js';
 const source = (relative: string) => readFileSync(new URL(relative, import.meta.url), 'utf8');
 
 /**
- * Every controlled-device capability family must consume the same
- * owner-or-active-Participant authority. This is a contract matrix, not a
- * runtime allowlist: capability implementations remain free to add feature
- * checks after authority, while a new action route makes the route inventory
- * assertion fail until its Participant-parity case is added.
+ * Every controlled-device capability family must consume a centralized
+ * authority. Operational surfaces use owner/active-Participant authority;
+ * management surfaces additionally require owner/admin authority. This is a
+ * contract matrix, not a runtime allowlist: implementations remain free to
+ * add feature checks after the appropriate authority.
  */
 const AUTHORITY_MATRIX = [
   ['command execution', '../src/routes/machine-exec.ts', 'resolveMachineOperationalAccess'],
   ['OCU / Computer Use', '../src/routes/machine-computer-use.ts', 'resolveMachineOperationalAccess'],
   ['file operations and transfers', '../src/routes/file-transfer.ts', 'resolveControlledMachineOperatorAccess'],
-  ['status and device actions', '../src/routes/machines.ts', 'resolveControlledMachineOperatorAccess'],
+  ['status and device actions', '../src/routes/machines.ts', 'resolveControlledMachineManagementAccess'],
   ['controlled-device websocket admission', '../src/security/authorization.ts', 'resolveControlledMachineOperatorAccess'],
   ['remote desktop and control', '../src/ws/remote-desktop-router.ts', 'resolveRemoteDesktopHostOperatorAccess'],
 ] as const;
@@ -29,7 +29,7 @@ const MACHINE_ACTION_PATHS = [
   '/:serverId/revoke',
 ] as const;
 
-describe('controlled-device owner/Participant authority contract', () => {
+describe('controlled-device centralized authority contract', () => {
   it.each(AUTHORITY_MATRIX)('%s consumes the centralized operator authority', (_family, file, helper) => {
     expect(source(file)).toContain(helper);
   });
@@ -62,7 +62,7 @@ describe('controlled-device owner/Participant authority contract', () => {
     const next = routes.indexOf('machinesRoutes.post(', start + 1);
     const handler = routes.slice(start, next < 0 ? undefined : next);
     expect(start).toBeGreaterThanOrEqual(0);
-    expect(handler).toContain('resolveControlledMachineOperatorAccess');
+    expect(handler).toContain('resolveControlledMachineManagementAccess');
     expect(handler).not.toMatch(/servers\.user_id\s*=|\bAND\s+user_id\s*=/);
   });
 

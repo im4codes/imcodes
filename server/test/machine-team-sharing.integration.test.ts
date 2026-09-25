@@ -14,8 +14,12 @@ import {
   canOperateControlledMachine,
   listAccessibleControlledMachines,
   resolveControlledMachineAccess,
+  resolveControlledMachineManagementAccess,
+  resolveRemoteDesktopHostAccess,
 } from '../src/share/machine-access.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
+import { ensureCanonicalHostForServer } from '../src/services/remote-desktop-host-identity.js';
+import { getRemoteDesktopWall } from '../src/services/remote-desktop-wall.js';
 
 let db: Database;
 
@@ -99,11 +103,10 @@ describe('a freshly installed machine', () => {
 });
 
 describe('associating a machine with a team', () => {
-  it('gives the people running the team every machine in it, and members only their own', async () => {
-    // Three roles. An ordinary member manages what they added and nothing else;
-    // the owner and admins manage everything in the team. Putting a machine in
-    // a team therefore hands it to the people running the team -- not to
-    // everyone who happens to be in it.
+  it('gives every team role access to every machine in the team', async () => {
+    // Group membership is the visibility/operation grant. Management actions
+    // still enforce owner/admin separately, but a member must not see a group
+    // tab whose devices they cannot actually open.
     const teamId = await makeTeam(owner);
     const admin = await newUser();
     await db.execute(
@@ -123,8 +126,59 @@ describe('associating a machine with a team', () => {
     expect(await roleFor(admin), 'an admin manages every machine in the team').toBe('participant');
     // Asserted as an exact value, not `not.toBe('none')`: an absent row also
     // satisfies that, so the weaker form would pass whatever this returned.
-    expect(await roleFor(colleague), 'a plain member gets nothing through the team').toBeUndefined();
+    expect(await roleFor(colleague), 'a plain member gets the group grant').toBe('participant');
+    expect(await resolveControlledMachineManagementAccess(db, colleague, serverId, Date.now()))
+      .toBeNull();
+    expect((await resolveControlledMachineManagementAccess(db, admin, serverId, Date.now()))?.access_role)
+      .toBe('participant');
     expect(await roleFor(stranger)).toBeUndefined();
+  });
+
+  it('lists every grouped machine once for a member and none for a non-member', async () => {
+    const teamId = await makeTeam(owner);
+    await db.execute(
+      "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'member', $3)",
+      [teamId, colleague, Date.now()],
+    );
+    const second = await installMachine(owner);
+    await addToGroup(serverId, teamId);
+    await addToGroup(second, teamId);
+
+    const memberRows = await listAccessibleControlledMachines(db, colleague, Date.now(), 50);
+    expect(memberRows.map((row) => row.id).sort()).toEqual([serverId, second].sort());
+    expect(memberRows.every((row) => row.access_role === 'participant')).toBe(true);
+    expect((await resolveRemoteDesktopHostAccess(db, colleague, serverId, Date.now()))?.access_role)
+      .toBe('participant');
+    expect(await listAccessibleControlledMachines(db, stranger, Date.now(), 50)).toEqual([]);
+    expect(await resolveRemoteDesktopHostAccess(db, stranger, serverId, Date.now())).toBeNull();
+  });
+
+  it('uses the same group grant for the Desktop Wall and excludes non-members', async () => {
+    const teamId = await makeTeam(owner);
+    await db.execute(
+      "INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'member', $3)",
+      [teamId, colleague, Date.now()],
+    );
+    await addToGroup(serverId, teamId);
+    const host = await ensureCanonicalHostForServer({ db, serverId, now: Date.now() });
+    await db.execute(
+      `INSERT INTO remote_desktop_walls (user_id, host_ids, layout, revision, updated_at)
+       VALUES ($1, $2::jsonb, 'grid', 0, $3)`,
+      [colleague, JSON.stringify([host.hostId]), Date.now()],
+    );
+
+    const memberWall = await getRemoteDesktopWall(db, colleague, Date.now());
+    expect(memberWall.hostIds).toEqual([host.hostId]);
+    expect(memberWall.hosts[0]?.accessRole).toBe('participant');
+
+    await db.execute(
+      `INSERT INTO remote_desktop_walls (user_id, host_ids, layout, revision, updated_at)
+       VALUES ($1, $2::jsonb, 'grid', 0, $3)`,
+      [stranger, JSON.stringify([host.hostId]), Date.now()],
+    );
+    const strangerWall = await getRemoteDesktopWall(db, stranger, Date.now());
+    expect(strangerWall.hostIds).toEqual([]);
+    expect(strangerWall.hosts).toEqual([]);
   });
 
   it('still lets a member run the machine they added to the team themselves', async () => {

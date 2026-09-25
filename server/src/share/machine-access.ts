@@ -37,25 +37,26 @@ export type ControlledMachineOperatorAccessRow = ControlledMachineAccessRow & {
 };
 
 /**
- * Does this caller run any group this machine is in?
+ * Is this caller a member of any group this machine is in?
  *
  * EXISTS rather than a join: a machine can be in several groups, and joining
  * would return it once per matching membership -- a list that repeats a machine
  * is not a machine list, and the GROUP BY needed to undo that is one more place
  * to get wrong.
  */
-const MANAGES_A_GROUP_OF = `EXISTS (
+export const IS_MEMBER_OF_A_MACHINE_GROUP = `EXISTS (
            SELECT 1 FROM machine_groups mg
              JOIN team_members tm ON tm.team_id = mg.team_id
             WHERE mg.server_id = s.id
               AND tm.user_id = $1
+         )`;
+
+const CAN_MANAGE_A_MACHINE_GROUP = `EXISTS (
+           SELECT 1 FROM machine_groups mg
+             JOIN team_members tm ON tm.team_id = mg.team_id
+            WHERE mg.server_id = s.id
+              AND tm.user_id = $2
               AND tm.role IN ('owner', 'admin')
-              -- A short-circuit, not a guard: the owner is answered by the
-              -- first CASE arm and by the first term of every WHERE that uses
-              -- this, so removing it changes no result. Verified by mutation:
-              -- taking it out leaves all tests green, which is why it is
-              -- described as what it is.
-              AND s.user_id <> $1
          )`;
 
 const CONTROLLED_MACHINE_ACCESS_SELECT = `
@@ -80,7 +81,7 @@ const CONTROLLED_MACHINE_ACCESS_SELECT = `
            -- deliberate downgrade to viewer is not silently undone by the
            -- grantee also being in the team.
            WHEN sh.role IS NOT NULL THEN sh.role
-           WHEN ${MANAGES_A_GROUP_OF} THEN 'participant'
+           WHEN ${IS_MEMBER_OF_A_MACHINE_GROUP} THEN 'participant'
          END AS access_role,
          sh.expires_at AS access_expires_at
     FROM servers s
@@ -101,17 +102,18 @@ const CONTROLLED_MACHINE_ACCESS_SELECT = `
      AND sh.target_user_id = $1
      AND sh.revoked_at IS NULL
      AND (sh.expires_at IS NULL OR sh.expires_at > $2)
-    -- The group path, and only for those who manage the group.
+    -- The group path is available to every current group member. Management
+    -- mutations have their own owner/admin fences; this read/operate grant is
+    -- intentionally role-independent so group membership does not produce a
+    -- device list that cannot actually be opened.
     --
     -- A machine can be in several groups, so this is a join through the
     -- membership table rather than a single column: one matching group is
     -- enough, and being in one group does not remove it from another.
     --
-    -- A group has three roles. An ordinary member manages the machines they
-    -- added themselves and nothing else -- they reach those as the owner, not
-    -- through the group -- while the owner and admins manage every machine in
-    -- it. So putting a machine in a group means the people running that group
-    -- can manage it; it does not hand you everyone else's.
+    -- A group has three roles for management. All three roles can discover and
+    -- operate machines in the group; only the existing owner/admin management
+    -- routes can change membership, shares, or group metadata.
     --
     -- Membership and role are read here rather than copied into a row, so a
     -- demotion, a removal, or taking the machine out all take effect on the
@@ -136,7 +138,7 @@ export async function resolveControlledMachineAccess(
       WHERE s.id = $3
         AND s.node_role = $4
         AND s.revoked_at IS NULL
-        AND (s.user_id = $1 OR sh.id IS NOT NULL OR ${MANAGES_A_GROUP_OF})
+        AND (s.user_id = $1 OR sh.id IS NOT NULL OR ${IS_MEMBER_OF_A_MACHINE_GROUP})
       LIMIT 1`,
     [userId, now, serverId, NODE_ROLE.CONTROLLED],
   );
@@ -165,6 +167,41 @@ export async function resolveControlledMachineOperatorAccess(
 }
 
 /**
+ * Management authority remains narrower than group visibility/operation.
+ * Owners, group owners/admins, and explicitly delegated Participants retain
+ * the existing mutation surface; an ordinary group member can use a device
+ * but cannot rename, revoke, toggle SYSTEM exec, or change its worker.
+ */
+export async function resolveControlledMachineManagementAccess(
+  db: Database,
+  userId: string,
+  serverId: string,
+  now: number,
+): Promise<ControlledMachineOperatorAccessRow | null> {
+  const access = await resolveControlledMachineOperatorAccess(db, userId, serverId, now);
+  if (!access) return null;
+  if (access.access_role === 'owner') return access;
+  const manager = await db.queryOne<{ present: number }>(
+    `SELECT 1 AS present FROM servers s
+      WHERE s.id = $1
+        AND (
+          ${CAN_MANAGE_A_MACHINE_GROUP}
+          OR EXISTS (
+            SELECT 1 FROM server_shares sh
+             WHERE sh.server_id = s.id
+               AND sh.target_user_id = $2
+               AND sh.role = 'participant'
+               AND sh.revoked_at IS NULL
+               AND (sh.expires_at IS NULL OR sh.expires_at > $3)
+          )
+        )
+      LIMIT 1`,
+    [serverId, userId, now],
+  );
+  return manager ? access : null;
+}
+
+/**
  * Resolve current DB-authoritative access to a remote-desktop host, which may
  * be a controlled node OR a normal (FULL) daemon: on Windows a daemon serves
  * remote control with the same native worker. Node role is returned rather than
@@ -181,7 +218,7 @@ export async function resolveRemoteDesktopHostAccess(
     `${CONTROLLED_MACHINE_ACCESS_SELECT}
       WHERE s.id = $3
         AND s.revoked_at IS NULL
-        AND (s.user_id = $1 OR sh.id IS NOT NULL OR ${MANAGES_A_GROUP_OF})
+        AND (s.user_id = $1 OR sh.id IS NOT NULL OR ${IS_MEMBER_OF_A_MACHINE_GROUP})
       LIMIT 1`,
     [userId, now, serverId],
   );
@@ -211,7 +248,7 @@ export async function listAccessibleControlledMachines(
     `${CONTROLLED_MACHINE_ACCESS_SELECT}
       WHERE s.node_role = $3
         AND s.revoked_at IS NULL
-        AND (s.user_id = $1 OR sh.id IS NOT NULL OR ${MANAGES_A_GROUP_OF})
+        AND (s.user_id = $1 OR sh.id IS NOT NULL OR ${IS_MEMBER_OF_A_MACHINE_GROUP})
       ORDER BY s.display_name NULLS LAST, s.id
       LIMIT $4`,
     [userId, now, NODE_ROLE.CONTROLLED, limit],

@@ -9,6 +9,7 @@ import { validateControlledNodeCapabilities, type ControlledNodeCapability } fro
 import type { Database } from '../db/client.js';
 import { isControlledNodeId } from '../../../shared/controlled-node-identity.js';
 import { MACHINE_IDENTITY_UNAVAILABLE } from '../../../shared/machine-reference.js';
+import { IS_MEMBER_OF_A_MACHINE_GROUP } from '../share/machine-access.js';
 
 export interface RemoteDesktopWallHost {
   hostId: string;
@@ -72,7 +73,11 @@ async function resolveHost(
     `SELECT h.id AS host_id, endpoint.server_id, s.node_id, s.ref_name, s.display_name,
             s.status, s.last_heartbeat_at, s.exec_enabled, s.os, s.node_role,
             s.controlled_capabilities,
-            CASE WHEN s.user_id = $1 THEN 'owner' ELSE sh.role END AS access_role
+            CASE
+              WHEN s.user_id = $1 THEN 'owner'
+              WHEN sh.role IS NOT NULL THEN sh.role
+              WHEN ${IS_MEMBER_OF_A_MACHINE_GROUP} THEN 'participant'
+            END AS access_role
        FROM remote_desktop_hosts h
        JOIN remote_desktop_host_endpoints requested ON requested.host_id = h.id
        JOIN remote_desktop_host_endpoints endpoint ON endpoint.host_id = h.id
@@ -86,7 +91,7 @@ async function resolveHost(
       WHERE (h.id = $2 OR requested.server_id = $2)
         AND h.merge_state = 'resolved'
         AND s.revoked_at IS NULL
-        AND (s.user_id = $1 OR sh.id IS NOT NULL)
+        AND (s.user_id = $1 OR sh.id IS NOT NULL OR ${IS_MEMBER_OF_A_MACHINE_GROUP})
       ORDER BY CASE WHEN s.node_role = $4 THEN 0 ELSE 1 END, endpoint.server_id
       LIMIT 1`,
     [userId, identity, now, NODE_ROLE.CONTROLLED],

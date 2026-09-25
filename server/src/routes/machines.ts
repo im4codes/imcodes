@@ -23,7 +23,7 @@ import {
 } from '../../../shared/machine-reference.js';
 import {
   listAccessibleControlledMachines,
-  resolveControlledMachineOperatorAccess,
+  resolveControlledMachineManagementAccess,
 } from '../share/machine-access.js';
 import { validateControlledNodeCapabilities } from '../../../shared/controlled-node-capabilities.js';
 import {
@@ -228,7 +228,7 @@ machinesRoutes.post('/:serverId/display-name', requireAuth(), async (c) => {
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
   const displayName = normalizeMachineDisplayName(parsed.data.displayName);
   if (!displayName) return c.json({ error: MACHINE_REASONS.INVALID_DISPLAY_NAME }, 400);
-  const access = await resolveControlledMachineOperatorAccess(c.env.DB, userId, serverId, Date.now());
+  const access = await resolveControlledMachineManagementAccess(c.env.DB, userId, serverId, Date.now());
   if (!access) return c.json({ error: 'not_found' }, 404);
 
   const row = await c.env.DB.queryOne<{ previous_name: string | null }>(
@@ -383,7 +383,7 @@ machinesRoutes.post('/:serverId/revoke', requireAuth(), async (c) => {
   const serverId = c.req.param('serverId');
   if (!serverId) return c.json({ error: 'invalid_body' }, 400);
   const now = Date.now();
-  const access = await resolveControlledMachineOperatorAccess(c.env.DB, userId, serverId, now);
+  const access = await resolveControlledMachineManagementAccess(c.env.DB, userId, serverId, now);
   if (!access) return c.json({ error: 'not_found' }, 404);
   const row = await c.env.DB.queryOne<{ id: string }>(
     `UPDATE servers SET revoked_at = $2
@@ -416,7 +416,7 @@ machinesRoutes.post('/:serverId/exec-enabled', requireAuth(), async (c) => {
   const body = await c.req.json().catch(() => null);
   const parsed = z.object({ enabled: z.boolean() }).safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
-  const access = await resolveControlledMachineOperatorAccess(c.env.DB, userId, serverId, Date.now());
+  const access = await resolveControlledMachineManagementAccess(c.env.DB, userId, serverId, Date.now());
   if (!access) return c.json({ error: 'not_found' }, 404);
   // Capture the prior value so the audit records from → to (enabling exec is a
   // high-privilege action that gates SYSTEM/root RCE and MUST be attributable).
@@ -466,7 +466,7 @@ machinesRoutes.post('/:serverId/auto-unlock', requireAuth(), async (c) => {
   }).safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
 
-  const owned = await resolveControlledMachineOperatorAccess(c.env.DB, userId, serverId, Date.now());
+  const owned = await resolveControlledMachineManagementAccess(c.env.DB, userId, serverId, Date.now());
   if (!owned) return c.json({ error: 'not_found' }, 404);
   // A node that never advertised auto unlock cannot answer this command; it
   // would simply not reply, and the caller would wait out the whole timeout
@@ -531,7 +531,7 @@ machinesRoutes.post('/:serverId/remote-desktop-permissions', requireAuth(), asyn
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('serverId');
   if (!serverId) return c.json({ error: 'invalid_body' }, 400);
-  const owned = await resolveControlledMachineOperatorAccess(c.env.DB, userId, serverId, Date.now());
+  const owned = await resolveControlledMachineManagementAccess(c.env.DB, userId, serverId, Date.now());
   if (!owned) return c.json({ error: 'not_found' }, 404);
   const now = Date.now();
   // Presence is load-bearing rather than cosmetic: the dialog appears on the
@@ -561,7 +561,7 @@ machinesRoutes.post('/:serverId/remote-desktop-worker', requireAuth(), async (c)
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('serverId');
   if (!serverId) return c.json({ error: 'invalid_body' }, 400);
-  const owned = await resolveControlledMachineOperatorAccess(c.env.DB, userId, serverId, Date.now());
+  const owned = await resolveControlledMachineManagementAccess(c.env.DB, userId, serverId, Date.now());
   if (!owned) return c.json({ error: 'not_found' }, 404);
   const capabilities = validateControlledNodeCapabilities(owned.controlled_capabilities);
   // Whichever platform advertised that it can install. The OS was checked
