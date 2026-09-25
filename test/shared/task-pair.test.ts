@@ -12,6 +12,10 @@ import {
   stripTaskPairMarkersForDisplay,
   taskPairSideToAct,
   TASK_PAIR_DEFAULT_ALLOWLIST,
+  TASK_PAIR_NO_AUDITOR,
+  parseTaskPairBindingId,
+  taskPairBindingId,
+  taskPairBindingOf,
   type TaskPairApplyContext,
   type TaskPairMarker,
   type TaskPairState,
@@ -325,5 +329,29 @@ describe('task-pair allowlist', () => {
     const allowlist = normalizeTaskPairAllowlist([{ role: 'auditor', agentType: 'codex-sdk', modelPattern: 'gpt-5' }]);
     expect(matchesTaskPairAllowlist(allowlist, 'auditor', 'codex-sdk', 'gpt-5.5')).toBe(true);
     expect(matchesTaskPairAllowlist(allowlist, 'executor', 'codex-sdk', 'gpt-5.5')).toBe(false);
+  });
+});
+
+describe('pair binding ids', () => {
+  it('formats and parses the documented pair:<taskId>:<role> shape', () => {
+    expect(taskPairBindingId('tsk_0a1b2c3d4e', 'executor')).toBe('pair:tsk_0a1b2c3d4e:executor');
+    expect(parseTaskPairBindingId('pair:tsk_0a1b2c3d4e:auditor')).toEqual({ taskId: 'tsk_0a1b2c3d4e', role: 'auditor' });
+    // A task id may itself contain ':'; the role is always the last segment.
+    expect(parseTaskPairBindingId(taskPairBindingId('a:b', 'executor'))).toEqual({ taskId: 'a:b', role: 'executor' });
+  });
+
+  it('rejects legacy assignment ids and malformed bindings', () => {
+    for (const value of ['asg_5gl', 'pair:', 'pair:executor', 'pair::executor', 'pair:T1:brain', 'pair:T1', undefined, 7]) {
+      expect(parseTaskPairBindingId(value)).toBeUndefined();
+    }
+  });
+
+  it('binds only the executor and a real auditor of the pair', () => {
+    const pair = { taskId: 'T1', executor: 'exec', auditor: 'aud' } as never;
+    expect(taskPairBindingOf(pair, 'exec')).toBe('pair:T1:executor');
+    expect(taskPairBindingOf(pair, 'aud')).toBe('pair:T1:auditor');
+    expect(taskPairBindingOf(pair, 'brain')).toBeUndefined();
+    expect(taskPairBindingOf({ taskId: 'T1', executor: 'exec', auditor: TASK_PAIR_NO_AUDITOR } as never, TASK_PAIR_NO_AUDITOR)).toBeUndefined();
+    expect(taskPairBindingOf(undefined, 'exec')).toBeUndefined();
   });
 });

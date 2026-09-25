@@ -14,9 +14,13 @@ import { cleanup, render } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { SUPPORTED_LOCALES } from '../../src/i18n/locales/index.js';
 import {
+  DELEGATION_AUTHORITY_MCP_SERVER,
   DELEGATION_CLAIM_METADATA_FIELD,
+  projectDelegationClaim,
+  readDelegationDispatchFact,
   type DelegationClaimProjection,
 } from '../../../shared/delegation-claim.js';
+import { taskPairBindingId } from '../../../shared/task-pair.js';
 
 if (!HTMLElement.prototype.scrollIntoView) {
   HTMLElement.prototype.scrollIntoView = vi.fn();
@@ -565,6 +569,44 @@ describe('ChatView delegation-claim wiring', () => {
     expect(badge.textContent ?? '').toContain('dsp_wired');
     expect(badge.textContent ?? '').toContain('task_wired');
     expect(badge.textContent ?? '').toContain('asg_wired');
+  });
+
+  it('renders the dispatch card for a pairs-engine send receipt', () => {
+    // The exact receipt shape the `pairs` engine returns: a daemon-minted task
+    // id and the executor slot's pair binding id as assignmentId.
+    const taskId = 'tsk_0a1b2c3d4e';
+    const assignmentId = taskPairBindingId(taskId, 'executor');
+    const fact = readDelegationDispatchFact(
+      DELEGATION_AUTHORITY_MCP_SERVER,
+      'send_message',
+      { target: 'deck_sub_pairs_exec', message: 'Add a README sentence.', task: { objective: 'Add one README sentence' } },
+      {
+        status: 'accepted',
+        dispatchId: 'send_dispatch_pairs',
+        taskId,
+        assignmentId,
+        taskTitle: 'Add one README sentence',
+        taskObjective: 'Add one README sentence',
+        deliveries: [{ target: 'deck_sub_pairs_exec', status: 'delivered', taskId, assignmentId }],
+      },
+    );
+    expect(fact).not.toBeNull();
+    const claim = projectDelegationClaim([fact!]);
+    expect(claim.status).toBe('substantiated');
+
+    const { container } = render(
+      <ChatView
+        events={[assistantEvent({ text: 'Dispatched.', metadata: withClaim(claim) })] as TimelineEvent[]}
+        loading={false}
+        hasOlderHistory={false}
+        sessionId="deck_claim_brain"
+      />,
+    );
+    const badge = container.querySelector('.chat-assistant [data-delegation-claim]')!;
+    expect(badge.getAttribute('data-delegation-claim')).toBe('substantiated');
+    expect(badge.querySelector('[data-delegation-field="taskId"] code')?.textContent).toBe(taskId);
+    expect(badge.querySelector('[data-delegation-field="assignmentId"] code')?.textContent).toBe(assignmentId);
+    expect(badge.textContent ?? '').toContain('Add one README sentence');
   });
 
   it('renders no badge for an assistant turn that carries no projection', () => {

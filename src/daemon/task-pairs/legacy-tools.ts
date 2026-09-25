@@ -17,6 +17,7 @@ import {
   TASK_PAIR_CONTRACT_ID,
   TASK_PAIR_INFER_TASK_ID,
   TASK_PAIR_MARKER_TAG,
+  parseTaskPairBindingId,
   taskPairRoleOf,
   type TaskPairState,
   type TaskPairVerb,
@@ -141,7 +142,7 @@ export async function handleLegacyToolOnPairs(tool: string, callerSession: strin
     return { status: 'ok', engine: 'pairs', tasks: own.map((pair) => summarize(pair.state)), hint: hint() };
   }
   if (tool === SUPERVISION_MCP_TOOLS.GET) {
-    const taskId = str(args, 'taskId');
+    const taskId = str(args, 'taskId') ?? parseTaskPairBindingId(str(args, 'assignmentId'))?.taskId;
     const pair = taskId ? store.getPair(project, taskId) : undefined;
     return pair
       ? { status: 'ok', engine: 'pairs', task: summarize(pair.state), events: store.listEvents(project, pair.state.taskId, 20) }
@@ -149,7 +150,8 @@ export async function handleLegacyToolOnPairs(tool: string, callerSession: strin
   }
 
   const { verb, attrs } = legacyVerb(tool, args);
-  const requested = str(args, 'taskId');
+  // A pairs receipt's assignmentId is a pair binding id; it names the task too.
+  const requested = str(args, 'taskId') ?? parseTaskPairBindingId(str(args, 'assignmentId'))?.taskId;
   const taskId = requested && store.getPair(project, requested) ? requested : taskPairService.resolveTaskId(project, callerSession, TASK_PAIR_INFER_TASK_ID);
   if (!verb || !taskId || taskId === TASK_PAIR_INFER_TASK_ID) {
     return { status: 'ok', engine: 'pairs', applied: 'none', ...(taskId ? { taskId } : {}), hint: hint(taskId ?? requested) };

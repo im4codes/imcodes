@@ -388,6 +388,46 @@ export function taskPairRoleOf(pair: TaskPairState | undefined, writer: string):
   return 'other';
 }
 
+/**
+ * Pair binding id: what a `pairs`-engine send_message receipt returns (and
+ * records on each delivery) as `assignmentId`.
+ *
+ * Format: `pair:<taskId>:executor` or `pair:<taskId>:auditor`. It names one
+ * role slot of one pair, so it stays the same across replays and across a
+ * replacement of the session in that slot; the session itself is the
+ * delivery `target`. The `pairs` engine has no registry assignments, so this is
+ * NOT a legacy registry assignment id and is never looked up there. It exists
+ * so every consumer of the `{ taskId, assignmentId }` receipt contract
+ * (delegation claim, dispatch card, legacy tools) works on both engines
+ * without asking which engine produced it.
+ */
+export const TASK_PAIR_BINDING_ID_PREFIX = 'pair' as const;
+export const TASK_PAIR_BINDING_ROLES = ['executor', 'auditor'] as const;
+export type TaskPairBindingRole = typeof TASK_PAIR_BINDING_ROLES[number];
+
+export function taskPairBindingId(taskId: string, role: TaskPairBindingRole): string {
+  return `${TASK_PAIR_BINDING_ID_PREFIX}:${taskId}:${role}`;
+}
+
+export function parseTaskPairBindingId(value: unknown): { taskId: string; role: TaskPairBindingRole } | undefined {
+  if (typeof value !== 'string') return undefined;
+  const prefix = `${TASK_PAIR_BINDING_ID_PREFIX}:`;
+  if (!value.startsWith(prefix)) return undefined;
+  const cut = value.lastIndexOf(':');
+  const taskId = value.slice(prefix.length, cut);
+  const role = value.slice(cut + 1);
+  if (cut < prefix.length || !taskId || !(TASK_PAIR_BINDING_ROLES as readonly string[]).includes(role)) return undefined;
+  return { taskId, role: role as TaskPairBindingRole };
+}
+
+/** The binding a session holds in a pair, if it is the executor or the auditor. */
+export function taskPairBindingOf(pair: TaskPairState | undefined, sessionName: string): string | undefined {
+  if (!pair) return undefined;
+  if (sessionName === pair.executor) return taskPairBindingId(pair.taskId, 'executor');
+  if (sessionName === pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR) return taskPairBindingId(pair.taskId, 'auditor');
+  return undefined;
+}
+
 function hasAudit(pair: TaskPairState): boolean {
   return pair.auditor !== TASK_PAIR_NO_AUDITOR;
 }

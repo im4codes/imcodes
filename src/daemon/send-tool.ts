@@ -1,6 +1,7 @@
 import { isPairsEngineProject } from './task-pairs/engine.js';
 import { taskPairService } from './task-pairs/service.js';
 import { getTaskPairStore } from './task-pairs/store.js';
+import { taskPairBindingOf } from '../../shared/task-pair.js';
 import { DELEGATION_REACHED_DELIVERY_STATUSES } from '../../shared/delegation-claim.js';
 import path from 'path';
 import { buildAuditSeverityPolicyLines, type AuditSeverity } from '../../shared/audit-convergence.js';
@@ -1308,19 +1309,23 @@ export async function dispatchSendMessage(
         eventId: `implicit:${delivery.messageId ?? result.dispatchId}`,
       });
     }
-    const pairTitle = getTaskPairStore().getPair(callerProjectName, taskId)?.state.title;
+    const pairState = getTaskPairStore().getPair(callerProjectName, taskId)?.state;
+    const pairTitle = pairState?.title;
     const taskIdentity = {
       taskId,
       ...(pairTitle ? { taskTitle: pairTitle } : {}),
       ...(objective && pairTitle === title ? { taskObjective: objective } : {}),
     };
-    return {
-      ...result,
-      ...taskIdentity,
-      deliveries: result.deliveries.map((delivery) => (
-        isReachedDelivery(delivery.status) ? { ...delivery, ...taskIdentity } : delivery
-      )),
-    };
+    // Each reached recipient that holds a role slot of the pair gets that
+    // slot's binding id as its assignmentId (shared/task-pair.ts).
+    const deliveries = result.deliveries.map((delivery) => {
+      if (!isReachedDelivery(delivery.status)) return delivery;
+      const assignmentId = taskPairBindingOf(pairState, delivery.target);
+      return { ...delivery, ...taskIdentity, ...(assignmentId ? { assignmentId } : {}) };
+    });
+    const bindings = new Set(deliveries.map((delivery) => delivery.assignmentId).filter(Boolean));
+    const assignmentId = bindings.size === 1 ? [...bindings][0] : undefined;
+    return { ...result, ...taskIdentity, ...(assignmentId ? { assignmentId } : {}), deliveries };
   }
   const autoProvision = input.task?.autoProvision === true;
   if (!input.target && !input.broadcast && !autoProvision) {

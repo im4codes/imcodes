@@ -33,7 +33,17 @@ vi.mock('../../src/store/session-store.js', () => ({
 }));
 
 import type { SessionRecord } from '../../src/store/session-store.js';
-import { TASK_PAIR_ENGINE_ENV, TASK_PAIR_TIMELINE_EVENT, type TaskPairEngine } from '../../shared/task-pair.js';
+import {
+  TASK_PAIR_ENGINE_ENV,
+  TASK_PAIR_TIMELINE_EVENT,
+  taskPairBindingId,
+  type TaskPairEngine,
+} from '../../shared/task-pair.js';
+import {
+  DELEGATION_AUTHORITY_MCP_SERVER,
+  projectDelegationClaim,
+  readDelegationDispatchFact,
+} from '../../shared/delegation-claim.js';
 import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
 import {
   clearSendIdempotencyCacheForTests,
@@ -163,7 +173,7 @@ describe('E2E: marker-driven task pairs (default engine)', () => {
     expect(resolveTaskPairEngine(PROJECT)).toBe(PAIRS_ENGINE);
 
     // 1. The Brain opens the work the legacy way: a new objective, no taskId.
-    const created = await send(caller(BRAIN), {
+    const dispatchInput: SendMessageInput = {
       target: EXEC,
       message: 'Add one meaningful README sentence and validate it.',
       reply: true,
@@ -174,10 +184,20 @@ describe('E2E: marker-driven task pairs (default engine)', () => {
         acceptance: ['one audit PASS'],
         ownedFiles: ['README.md'],
       },
-    });
+    };
+    const created = await send(caller(BRAIN), dispatchInput);
     if (created.status !== 'accepted' || !created.taskId) throw new Error(`dispatch failed: ${JSON.stringify(created)}`);
     const taskId = created.taskId;
-    expect(created).toMatchObject({ taskTitle: 'Add one README sentence', taskObjective: 'Add one README sentence' });
+    expect(created).toMatchObject({
+      taskTitle: 'Add one README sentence',
+      taskObjective: 'Add one README sentence',
+      assignmentId: taskPairBindingId(taskId, 'executor'),
+    });
+    // The Brain turn's delegation claim is substantiated by this receipt.
+    const fact = readDelegationDispatchFact(DELEGATION_AUTHORITY_MCP_SERVER, 'send_message', dispatchInput, created);
+    expect(projectDelegationClaim(fact ? [fact] : [])).toMatchObject({
+      status: 'substantiated', dispatches: [{ taskId, assignmentId: taskPairBindingId(taskId, 'executor') }],
+    });
     expect(dispatchMessage).toHaveBeenCalledTimes(1);
     await settle();
 

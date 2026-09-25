@@ -14,6 +14,7 @@ import { importLegacyTasks, mapLegacyStatus } from '../../../src/daemon/task-pai
 import { dispatchReadyAudit, runSupervisionConvergenceTick } from '../../../src/daemon/send-tool.js';
 import { MEMORY_MCP_TOOL_NAMES } from '../../../shared/memory-mcp-contracts.js';
 import { SUPERVISION_MCP_TOOLS } from '../../../shared/supervision-mcp-tools.js';
+import { taskPairBindingId } from '../../../shared/task-pair.js';
 import type { SupervisionTaskSnapshot } from '../../../src/daemon/supervision-state-store.js';
 
 const PROJECT = 'legacyproj';
@@ -76,6 +77,23 @@ describe('legacy supervision tools and migration on the pairs engine', () => {
       assignmentId: 'asg_unknown', evidence: 'deliverables are gitignored',
     });
     expect(result).toMatchObject({ status: 'ok', taskId: 'L1', pairStatus: 'done' });
+  });
+
+  it('resolves a pairs receipt assignmentId (pair binding id) to its task', async () => {
+    // Two open pairs for the same executor: without the binding id the caller's
+    // task could not be inferred.
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH L2 executor=${EXEC} auditor=${AUD} -->`);
+    marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT L2 -->');
+    marker(AUD, '<!-- IMCODES_TASK PASS L2 blocking=P0 -->');
+    const assignmentId = taskPairBindingId('L2', 'executor');
+    expect(await handleLegacyToolOnPairs(SUPERVISION_MCP_TOOLS.GET, EXEC, { assignmentId })).toMatchObject({
+      status: 'ok', engine: 'pairs', task: { taskId: 'L2', status: 'passed' },
+    });
+    const result = await handleLegacyToolOnPairs(MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH, EXEC, {
+      assignmentId, evidence: 'committed and pushed',
+    });
+    expect(result).toMatchObject({ status: 'ok', taskId: 'L2', pairStatus: 'done' });
+    expect(getTaskPairStore().getPair(PROJECT, 'L1')?.state.status).toBe('working');
   });
 
   it('keeps DONE-without-PASS semantics for a legacy finish', async () => {

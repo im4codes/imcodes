@@ -8,7 +8,14 @@ import { TaskPairService } from '../../../src/daemon/task-pairs/service.js';
 import { resolveTaskPairAllowlist, resolveTaskPairEngine, resolveTaskPairMaxConcurrency } from '../../../src/daemon/task-pairs/engine.js';
 import { normalizeSessionSupervisionSnapshot } from '../../../shared/supervision-config.js';
 import { dispatchSendMessage, clearSendIdempotencyCacheForTests } from '../../../src/daemon/send-tool.js';
-import { TASK_PAIR_TIMELINE_EVENT } from '../../../shared/task-pair.js';
+import { TASK_PAIR_TIMELINE_EVENT, taskPairBindingId } from '../../../shared/task-pair.js';
+import {
+  DELEGATION_AUTHORITY_MCP_SERVER,
+  DELEGATION_CLAIM_METADATA_FIELD,
+  projectDelegationClaim,
+  readDelegationClaim,
+  readDelegationDispatchFact,
+} from '../../../shared/delegation-claim.js';
 import { normalizeAssistantTextForDisplay } from '../../../src/shared/timeline/types.js';
 
 const PROJECT = 'pairsproj';
@@ -219,10 +226,17 @@ describe('task-pair marker ingestion', () => {
     if (created.status !== 'accepted' || !created.taskId) throw new Error(JSON.stringify(created));
     expect(created.taskId).toMatch(/^tsk_[0-9a-f]{10}$/);
     expect(created).toMatchObject({ taskTitle: 'Add one README sentence', taskObjective: 'Add one README sentence' });
-    expect(created.assignmentId).toBeUndefined();
+    // The executor slot's pair binding id is the receipt's assignmentId.
+    expect(created.assignmentId).toBe(taskPairBindingId(created.taskId, 'executor'));
     expect(created.deliveries).toEqual([expect.objectContaining({
-      target: EXEC, taskId: created.taskId, taskTitle: 'Add one README sentence',
+      target: EXEC, taskId: created.taskId, assignmentId: created.assignmentId, taskTitle: 'Add one README sentence',
     })]);
+    // So the Brain turn's delegation claim is substantiated, live and after reload.
+    const fact = readDelegationDispatchFact(DELEGATION_AUTHORITY_MCP_SERVER, 'send_message', input, created);
+    expect(fact).toMatchObject({ taskId: created.taskId, assignmentId: created.assignmentId });
+    const claim = projectDelegationClaim([fact!]);
+    expect(claim).toMatchObject({ status: 'substantiated', dispatches: [{ taskId: created.taskId, assignmentId: created.assignmentId }] });
+    expect(readDelegationClaim({ [DELEGATION_CLAIM_METADATA_FIELD]: JSON.parse(JSON.stringify(claim)) })?.status).toBe('substantiated');
     expect(pair(created.taskId)).toMatchObject({ status: 'working', brain: BRAIN, executor: EXEC, title: 'Add one README sentence' });
 
     // A replay of the same send resolves to the same pair; a new key opens a new one.
@@ -233,6 +247,27 @@ describe('task-pair marker ingestion', () => {
     expect(other.taskId).not.toBe(created.taskId);
     expect(getTaskPairStore().listActivePairs(PROJECT).map((entry) => entry.state.taskId).sort())
       .toEqual([created.taskId, other.taskId].sort());
+  });
+
+  it('gives each recipient the binding of its own slot, and none to a non-participant', async () => {
+    clearSendIdempotencyCacheForTests();
+    const dispatchMessage = vi.fn().mockResolvedValue('sent');
+    const outsider = 'deck_sub_pairsoutsider';
+    const listSessions = () => [session(BRAIN, 'brain'), session(EXEC, 'w2'), session(AUD, 'w3'), session(outsider, 'w4')];
+    await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T21 executor=${EXEC} auditor=${AUD} -->`);
+    const execCaller = { userId: 'u', sessionName: EXEC, projectName: PROJECT, projectRoot: `/tmp/${PROJECT}` };
+    const toAuditor = await dispatchSendMessage(execCaller, {
+      target: AUD, message: 'Materials for T21.', task: { taskId: 'T21' },
+    } as never, { listSessions, dispatchMessage });
+    expect(toAuditor).toMatchObject({ status: 'accepted', taskId: 'T21', assignmentId: taskPairBindingId('T21', 'auditor') });
+    const brainCaller = { userId: 'u', sessionName: BRAIN, projectName: PROJECT, projectRoot: `/tmp/${PROJECT}` };
+    const toOutsider = await dispatchSendMessage(brainCaller, {
+      target: outsider, message: 'FYI about T21.', task: { taskId: 'T21' },
+    } as never, { listSessions, dispatchMessage });
+    if (toOutsider.status !== 'accepted') throw new Error(JSON.stringify(toOutsider));
+    expect(toOutsider.taskId).toBe('T21');
+    expect(toOutsider.assignmentId).toBeUndefined();
+    expect(pair('T21')).toMatchObject({ executor: EXEC, auditor: AUD });
   });
 
   it('binds a named task only to a delivery that reached its target', async () => {
