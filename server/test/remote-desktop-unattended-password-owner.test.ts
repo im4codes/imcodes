@@ -108,6 +108,7 @@ type MemoryState = {
   grants: Map<string, GrantState>;
   routes: RouteState[];
   sessions: Map<string, { state: 'admitting' | 'active' | 'closed'; passwordGeneration: number | null }>;
+  savedDevices: Array<{ id: string; hostId: string }>;
   outbox: Array<Record<string, unknown>>;
   audits: Array<Record<string, unknown>>;
   nextSequence: number;
@@ -155,6 +156,7 @@ class MemoryPasswordDatabase {
       grants: new Map(),
       routes: [],
       sessions: new Map(),
+      savedDevices: [],
       outbox: [],
       audits: [],
       nextSequence: 1,
@@ -301,6 +303,11 @@ class MemoryPasswordDatabase {
       }
       return { changes: this.state.sessions.size };
     }
+    if (normalized === 'delete from remote_desktop_saved_devices where host_id = $1') {
+      const before = this.state.savedDevices.length;
+      this.state.savedDevices = this.state.savedDevices.filter((device) => device.hostId !== String(params[0]));
+      return { changes: before - this.state.savedDevices.length };
+    }
     if (normalized.startsWith('insert into remote_desktop_guest_audit')) {
       this.state.audits.push({
         hostId: params[1],
@@ -358,7 +365,9 @@ async function ownerMutation(input: {
 
 describe('unattended password Owner mutation and generation', () => {
   it('uses a secret-free action-bound step-up and persists only derived material', async () => {
-    const memory = new MemoryPasswordDatabase();
+    const memory = new MemoryPasswordDatabase({
+      savedDevices: [{ id: 'saved-password-host', hostId: HOST_ID }, { id: 'saved-other-host', hostId: 'other-host' }],
+    });
     const token = grantToken('set');
     const idempotencyRequestId = memory.addGrant(token, 'set', 'grant-1');
     const action = unattendedPasswordStepUpAction({
@@ -376,6 +385,7 @@ describe('unattended password Owner mutation and generation', () => {
       result: { hostId: HOST_ID, generation: 1, state: 'enabled', effectsEmitted: 0 },
     });
     expect(memory.state.credential).toMatchObject({ generation: 1, disabledAt: null });
+    expect(memory.state.savedDevices).toEqual([{ id: 'saved-other-host', hostId: 'other-host' }]);
     expect(JSON.stringify(memory.state)).not.toContain(PASSWORD);
     expect(memory.state.outbox).toHaveLength(0);
     expect(memory.state.audits[0]).toMatchObject({
@@ -408,6 +418,7 @@ describe('unattended password Owner mutation and generation', () => {
         auditId: 'password-audit-1', sessionId: 'guest-password-1',
       }],
       sessions: new Map([['guest-password-1', { state: 'active', passwordGeneration: 4 }]]),
+      savedDevices: [{ id: 'saved-route-host', hostId: HOST_ID }],
     });
     const token = grantToken('change-route');
     const idempotencyRequestId = memory.addGrant(token, 'change', 'grant-4');
@@ -416,6 +427,7 @@ describe('unattended password Owner mutation and generation', () => {
     });
     expect(used.ok && used.result).toMatchObject({ generation: 5, effectsEmitted: 1 });
     expect(memory.state.sessions.get('guest-password-1')?.state).toBe('closed');
+    expect(memory.state.savedDevices).toEqual([]);
     expect(memory.state.outbox).toEqual([expect.objectContaining({
       effect: 'terminal',
       scope: 'route',
@@ -443,6 +455,7 @@ describe('unattended password Owner mutation and generation', () => {
         auditId: 'password-audit-disable', sessionId: 'guest-password-disable',
       }],
       sessions: new Map([['guest-password-disable', { state: 'active', passwordGeneration: 2 }]]),
+      savedDevices: [{ id: 'saved-disable-host', hostId: HOST_ID }],
     });
     const token = grantToken('disable');
     const idempotencyRequestId = memory.addGrant(token, 'disable', 'grant-5');
@@ -453,6 +466,7 @@ describe('unattended password Owner mutation and generation', () => {
       hostId: HOST_ID, generation: 3, state: 'disabled', effectsEmitted: 1,
     });
     expect(memory.state.credential).toMatchObject({ generation: 3, disabledAt: NOW });
+    expect(memory.state.savedDevices).toEqual([]);
     expect(memory.state.sessions.get('guest-password-disable')?.state).toBe('closed');
     expect(memory.state.outbox).toEqual([expect.objectContaining({
       authorityKind: 'password',
@@ -495,6 +509,7 @@ describe('unattended password Owner mutation and generation', () => {
         auditId: 'password-audit-fail', sessionId: 'guest-password-fail',
       }],
       sessions: new Map([['guest-password-fail', { state: 'active', passwordGeneration: 8 }]]),
+      savedDevices: [{ id: 'saved-rollback-host', hostId: HOST_ID }],
     });
     memory.failOutbox = true;
     const token = grantToken('rollback');
@@ -504,6 +519,7 @@ describe('unattended password Owner mutation and generation', () => {
     })).rejects.toThrow('synthetic_outbox_failure');
     expect(memory.state.credential).toEqual(original);
     expect(memory.state.sessions.get('guest-password-fail')?.state).toBe('active');
+    expect(memory.state.savedDevices).toEqual([{ id: 'saved-rollback-host', hostId: HOST_ID }]);
     expect(memory.state.outbox).toHaveLength(0);
     expect(memory.state.grants.get(grantHash(token))?.consumedAt).toBeNull();
   });
