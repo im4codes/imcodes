@@ -97,7 +97,8 @@ class InputLedger {
       bool pressed,
       std::unordered_map<std::string, std::unordered_set<std::string>>* owners,
       std::unordered_set<std::string> ControllerState::* owned_values,
-      bool (InputAdapter::*emit)(std::string_view, bool));
+      bool (InputAdapter::*emit)(std::string_view, bool),
+      bool heal_latched_before_press);
   bool ReleaseControllerState(const std::string& controller_id,
                               ControllerState* controller) noexcept;
   InputAdapter& backend_;

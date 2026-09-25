@@ -2850,6 +2850,22 @@ describe('RemoteDesktopClient translated shortcuts and paste', () => {
     client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
   });
 
+  it('does not put a lifted modifier back down once the browser reports it released', async () => {
+    const { client, typed } = await inputReadyClient();
+    // Command held on a Mac target, lifted for pasted text.
+    client.key('MetaLeft', 'Meta', true, false, released);
+    typed();
+    expect(client.text('hello')).toBe(true);
+    typed();
+    // Command's key-up was swallowed (e.g. by a system shortcut), so the
+    // viewer never saw it; the next key event reports Meta up.
+    client.reconcileModifiers({ control: false, alt: false, shift: false, meta: false }, 'KeyA');
+    expect(client.key('KeyA', 'a', true, false, released)).toBe(true);
+    // Plain "a", not Command+A.
+    expect(typed()).toEqual(['down KeyA']);
+    client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+  });
+
   it('puts a lifted modifier back down before a click', async () => {
     const { client, control, typed } = await inputReadyClient();
     client.key('ControlLeft', 'Control', true, false, { control: true, alt: false });

@@ -3,6 +3,7 @@
 #include <cmath>
 #include <utility>
 
+#include "latched_modifiers.h"
 #include "platform_interfaces.h"
 
 namespace imcodes::remote_desktop::common {
@@ -133,7 +134,8 @@ InputResult InputLedger::ApplyOwnedTransition(
     bool pressed,
     std::unordered_map<std::string, std::unordered_set<std::string>>* owners,
     std::unordered_set<std::string> ControllerState::* owned_values,
-    bool (InputAdapter::*emit)(std::string_view, bool)) {
+    bool (InputAdapter::*emit)(std::string_view, bool),
+    bool heal_latched_before_press) {
   if (!IsBoundedToken(value))
     return InputResult::kInvalidInput;
   ControllerState* controller = nullptr;
@@ -161,6 +163,15 @@ InputResult InputLedger::ApplyOwnedTransition(
     }
   }
 
+  if (should_emit && pressed && heal_latched_before_press) {
+    // A modifier the OS still holds that this session never pressed (a
+    // key-up lost to a crashed worker, a swallowed release, a topology
+    // change mid-chord) would silently turn this press into a shortcut or a
+    // right-click, and nothing else ever releases it mid-session. The
+    // adapter skips the modifiers it emitted itself, so a modifier the
+    // operator is really holding still applies.
+    backend_.ReleaseLatchedModifiers();
+  }
   if (should_emit && !(backend_.*emit)(value, pressed)) {
     return InputResult::kAdapterFailure;
   }
@@ -173,7 +184,8 @@ InputResult InputLedger::ApplyKey(const InputStamp& stamp,
                                   bool pressed) {
   return ApplyOwnedTransition(stamp, current_topology_revision, key, pressed,
                               &key_owners_, &ControllerState::keys,
-                              &InputAdapter::EmitKey);
+                              &InputAdapter::EmitKey,
+                              !IsLatchableModifierKey(key));
 }
 
 InputResult InputLedger::ApplyButton(const InputStamp& stamp,
@@ -182,7 +194,8 @@ InputResult InputLedger::ApplyButton(const InputStamp& stamp,
                                      bool pressed) {
   return ApplyOwnedTransition(stamp, current_topology_revision, button, pressed,
                               &button_owners_, &ControllerState::buttons,
-                              &InputAdapter::EmitButton);
+                              &InputAdapter::EmitButton,
+                              /*heal_latched_before_press=*/true);
 }
 
 InputResult InputLedger::ClickButton(const InputStamp& stamp,
@@ -201,6 +214,7 @@ InputResult InputLedger::ClickButton(const InputStamp& stamp,
   if (validation != InputResult::kApplied)
     return validation;
   (void)controller;
+  backend_.ReleaseLatchedModifiers();
   return backend_.EmitButton(button, true) && backend_.EmitButton(button, false)
              ? InputResult::kApplied
              : InputResult::kAdapterFailure;

@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace imcodes::remote_desktop::common {
@@ -37,6 +38,13 @@ inline constexpr LatchableModifier kLatchableModifiers[] = {
 
 inline constexpr std::size_t kLatchableModifierCount =
     sizeof(kLatchableModifiers) / sizeof(kLatchableModifiers[0]);
+
+[[nodiscard]] inline bool IsLatchableModifierKey(std::string_view key) noexcept {
+  for (const LatchableModifier& modifier : kLatchableModifiers) {
+    if (key == modifier.left || key == modifier.right) return true;
+  }
+  return false;
+}
 
 // What a platform reports about one modifier. `any` is the modifier being
 // held at all, which some platforms report without naming a side (macOS

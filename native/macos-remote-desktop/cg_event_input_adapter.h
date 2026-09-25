@@ -87,6 +87,16 @@ public:
   [[nodiscard]] virtual std::vector<std::string> LatchedModifierKeys() = 0;
 };
 
+// The CGEventFlags an injected event must carry: the event's own non-modifier
+// flags (Caps Lock, numeric pad, Fn, ...) with every Control/Shift/Option/
+// Command bit replaced by exactly the modifiers this session holds, named in
+// the adapter's key vocabulary ("ShiftLeft", ...). An event created without a
+// source otherwise copies whatever the window server holds, so one latched
+// modifier would turn every later letter into a shortcut.
+[[nodiscard]] std::uint64_t ComposeInjectedModifierFlags(
+    std::uint64_t event_flags,
+    const std::vector<std::string> &held_modifier_keys) noexcept;
+
 // Input ownership, epochs, sequence fencing and controller reference counts
 // stay in common::InputLedger. This class is only the platform emission seam:
 // it accepts ledger-approved transitions, verifies the active logical topology
@@ -120,6 +130,10 @@ public:
   bool EmitClipboardShortcut(std::string_view key,
                              std::uint64_t deadline_monotonic_ms);
   void ReleaseAllEmittedState() noexcept override;
+  // Releases modifiers the window server holds that this adapter never
+  // emitted. The common ledger calls it before every non-modifier press so a
+  // latched modifier heals mid-session instead of until the next session.
+  std::size_t ReleaseLatchedModifiers() noexcept override;
 
   // Session/authority owners call this on every named terminal boundary. It
   // releases emitted state idempotently and clears topology so later input

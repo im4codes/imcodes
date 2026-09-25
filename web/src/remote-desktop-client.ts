@@ -2058,6 +2058,14 @@ export class RemoteDesktopClient {
       if (!kind || code === exceptCode || modifiers[kind] !== false) continue;
       this.sendKeyTransition(code, REMOTE_DESKTOP_MODIFIER_KEY[kind], false, false);
     }
+    // A modifier a translated chord or a paste lifted on the remote goes back
+    // down before the next key -- but only while the operator still holds it.
+    // If its key-up was swallowed, restoring it would press a modifier nobody
+    // holds and turn the next letter into a shortcut.
+    for (const code of [...this.liftedModifiers]) {
+      const kind = remoteDesktopModifierKind(code);
+      if (kind && code !== exceptCode && modifiers[kind] === false) this.liftedModifiers.delete(code);
+    }
     if (modifiers.meta === false) {
       for (const [code, key] of [...this.pressedWhileMeta]) {
         if (code === exceptCode || !this.pressedCodes.has(code)) {

@@ -182,6 +182,43 @@ std::optional<MouseMapping> MapButton(std::string_view button) {
   return std::nullopt;
 }
 
+// The mask plus NX_DEVICE*KEYMASK side bits CGEvent carries for each
+// modifier, parallel to common::kLatchableModifiers.
+struct ModifierBits {
+  CGEventFlags mask;
+  std::uint64_t left;
+  std::uint64_t right;
+};
+constexpr ModifierBits kModifierBits[common::kLatchableModifierCount] = {
+    {kCGEventFlagMaskControl, 0x00000001, 0x00002000},
+    {kCGEventFlagMaskShift, 0x00000002, 0x00000004},
+    {kCGEventFlagMaskAlternate, 0x00000020, 0x00000040},
+    {kCGEventFlagMaskCommand, 0x00000008, 0x00000010},
+};
+
+} // namespace
+
+std::uint64_t ComposeInjectedModifierFlags(
+    std::uint64_t event_flags,
+    const std::vector<std::string> &held_modifier_keys) noexcept {
+  std::uint64_t flags = event_flags;
+  for (const ModifierBits &bits : kModifierBits)
+    flags &= ~(static_cast<std::uint64_t>(bits.mask) | bits.left | bits.right);
+  for (std::size_t index = 0; index < common::kLatchableModifierCount; ++index) {
+    const common::LatchableModifier &modifier = common::kLatchableModifiers[index];
+    const ModifierBits &bits = kModifierBits[index];
+    for (const std::string &key : held_modifier_keys) {
+      if (key == modifier.left)
+        flags |= static_cast<std::uint64_t>(bits.mask) | bits.left;
+      else if (key == modifier.right)
+        flags |= static_cast<std::uint64_t>(bits.mask) | bits.right;
+    }
+  }
+  return flags;
+}
+
+namespace {
+
 std::optional<CGPoint> CurrentPointerLocation() {
   CGEventRef current = CGEventCreate(nullptr);
   if (current == nullptr)
@@ -209,24 +246,9 @@ public:
       return {};
     const CGEventFlags flags =
         CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState);
-    // The mask plus NX_DEVICE*KEYMASK side bits CGEvent carries for each
-    // modifier, parallel to common::kLatchableModifiers. A modifier reported
-    // with no side bit is released on the left key, which is what the OS
-    // reports for a synthetic press that named neither.
-    struct ModifierBits {
-      CGEventFlags mask;
-      std::uint64_t left;
-      std::uint64_t right;
-    };
-    static constexpr ModifierBits kBits[common::kLatchableModifierCount] = {
-        {kCGEventFlagMaskControl, 0x00000001, 0x00002000},
-        {kCGEventFlagMaskShift, 0x00000002, 0x00000004},
-        {kCGEventFlagMaskAlternate, 0x00000020, 0x00000040},
-        {kCGEventFlagMaskCommand, 0x00000008, 0x00000010},
-    };
     return common::CollectLatchedModifiers(
         [flags](const common::LatchableModifier &, std::size_t index) {
-          const ModifierBits &bits = kBits[index];
+          const ModifierBits &bits = kModifierBits[index];
           return common::ModifierHeldSides{(flags & bits.mask) != 0,
                                            (flags & bits.left) != 0,
                                            (flags & bits.right) != 0};
@@ -263,6 +285,12 @@ public:
     const auto key_code = MapKey(key);
     if (!key_code)
       return false;
+    if (common::IsLatchableModifierKey(key)) {
+      if (pressed)
+        held_modifiers_.insert(std::string(key));
+      else
+        held_modifiers_.erase(std::string(key));
+    }
     CGEventRef event = CGEventCreateKeyboardEvent(nullptr, *key_code, pressed);
     return Post(event);
   }
@@ -357,6 +385,10 @@ public:
       }
       CGEventKeyboardSetUnicodeString(down, code_units.size(),
                                       code_units.data());
+      // Text is never a shortcut: carry no modifier at all, whatever the
+      // window server currently reports as held.
+      CGEventSetFlags(down, ComposeInjectedModifierFlags(CGEventGetFlags(down), {}));
+      CGEventSetFlags(up, ComposeInjectedModifierFlags(CGEventGetFlags(up), {}));
       CGEventSetIntegerValueField(down, kCGEventSourceUserData,
                                   kImcodesSyntheticEventMarker);
       CGEventSetIntegerValueField(up, kCGEventSourceUserData,
@@ -370,9 +402,18 @@ public:
   }
 
 private:
-  static bool Post(CGEventRef event) {
+  bool Post(CGEventRef event) {
     if (event == nullptr)
       return false;
+    // An event created without a source copies the window server's current
+    // modifier flags. Once any modifier is latched there (a key-up that never
+    // arrived), every later letter would be a Command/Control/Option
+    // shortcut and every click a modified click. Stamp the modifiers this
+    // session is actually holding instead of inheriting the global state.
+    CGEventSetFlags(event, ComposeInjectedModifierFlags(
+                               CGEventGetFlags(event),
+                               std::vector<std::string>(held_modifiers_.begin(),
+                                                        held_modifiers_.end())));
     CGEventSetIntegerValueField(event, kCGEventSourceUserData,
                                 kImcodesSyntheticEventMarker);
     CGEventPost(kCGHIDEventTap, event);
@@ -382,6 +423,7 @@ private:
 
   // A human hand never lands two clicks on the exact same point.
   static constexpr double kClickSlopPoints = 4.0;
+  std::set<std::string> held_modifiers_;
   std::set<std::string> held_buttons_;
   std::string last_click_button_;
   std::chrono::steady_clock::time_point last_click_time_{};
@@ -612,6 +654,18 @@ public:
     ReleaseAllLocked();
   }
 
+  std::size_t ReleaseLatchedModifiers() noexcept {
+    std::lock_guard lock(mutex_);
+    // Only while a session is bound: the same readiness that gates every
+    // ordinary emission (topology and Accessibility trust).
+    if (!topology_bound_ ||
+        backend_->ProbeAccessibility() != common::ReadinessState::kReady)
+      return 0;
+    const std::uint64_t before = statistics_.released_latched_modifiers;
+    ReleaseLatchedModifiersLocked();
+    return static_cast<std::size_t>(statistics_.released_latched_modifiers - before);
+  }
+
   void HandleLifecycleBoundary(CGEventInputReleaseReason reason) noexcept {
     std::lock_guard lock(mutex_);
     (void)reason;
@@ -785,6 +839,10 @@ bool CGEventInputAdapter::EmitClipboardShortcut(
 
 void CGEventInputAdapter::ReleaseAllEmittedState() noexcept {
   impl_->ReleaseAllEmittedState();
+}
+
+std::size_t CGEventInputAdapter::ReleaseLatchedModifiers() noexcept {
+  return impl_->ReleaseLatchedModifiers();
 }
 
 void CGEventInputAdapter::HandleLifecycleBoundary(

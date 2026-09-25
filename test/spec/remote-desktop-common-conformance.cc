@@ -91,9 +91,34 @@ class FakeInput final : public common::InputAdapter {
     return !fail_next;
   }
   void ReleaseAllEmittedState() noexcept override { ++release_all_count; }
+  // Models every platform backend: modifiers the OS still holds, minus the
+  // ones this adapter itself emitted (its own held keys stay with the path
+  // that tracks them), are released.
+  std::size_t ReleaseLatchedModifiers() noexcept override {
+    ++heal_calls;
+    std::size_t released = 0;
+    for (auto current = latched.begin(); current != latched.end();) {
+      if (EmittedHeld(*current)) {
+        ++current;
+        continue;
+      }
+      key_events.emplace_back(*current, false);
+      current = latched.erase(current);
+      ++released;
+    }
+    return released;
+  }
+  bool EmittedHeld(const std::string& key) const {
+    for (auto event = key_events.rbegin(); event != key_events.rend(); ++event) {
+      if (event->first == key) return event->second;
+    }
+    return false;
+  }
 
   common::ReadinessState readiness = common::ReadinessState::kUnavailable;
   bool fail_next = false;
+  std::vector<std::string> latched;
+  int heal_calls = 0;
   std::vector<common::LogicalPoint> moves;
   std::vector<std::pair<std::string, bool>> key_events;
   std::vector<std::pair<std::string, bool>> button_events;
@@ -361,6 +386,76 @@ int main() {
       ledger.ReleaseController("ledger-a") == common::InputResult::kApplied &&
           ledger_input.button_events.size() == 5,
       "release-all leaves no duplicated ownership state");
+
+  // A modifier latched in the OS that this session never pressed (its key-up
+  // lost to a crashed worker, a swallowed release, a topology change
+  // mid-chord) must not turn later letters into shortcuts or clicks into
+  // modified clicks, and must heal mid-session rather than at the next
+  // session. Covers every latchable modifier and every press path.
+  {
+    FakeInput healed;
+    common::InputLedger heal_ledger(healed);
+    healed.latched = {"MetaLeft", "ControlLeft", "AltRight", "ShiftLeft"};
+    Require(heal_ledger.ApplyKey(Stamp("heal", 1, 7), 7, "KeyA", true) ==
+                common::InputResult::kApplied &&
+                healed.latched.empty() && healed.key_events.size() == 5 &&
+                healed.key_events.back() ==
+                    std::pair<std::string, bool>{"KeyA", true},
+            "every latched modifier is released before a letter is pressed");
+    for (std::size_t index = 0; index < 4; ++index) {
+      Require(!healed.key_events[index].second,
+              "the heal only ever releases, never presses");
+    }
+
+    // The operator's own held modifier is not a stray: Shift+A stays Shift+A.
+    FakeInput held;
+    common::InputLedger held_ledger(held);
+    Require(held_ledger.ApplyKey(Stamp("held", 1, 7), 7, "ShiftLeft", true) ==
+                common::InputResult::kApplied,
+            "operator presses Shift");
+    held.latched = {"ShiftLeft"};
+    Require(held_ledger.ApplyKey(Stamp("held", 2, 7), 7, "KeyA", true) ==
+                common::InputResult::kApplied &&
+                held.latched.size() == 1 && held.key_events.size() == 2 &&
+                held.key_events.back() == std::pair<std::string, bool>{"KeyA", true},
+            "a modifier this session emitted is never healed away");
+
+    // A modifier press itself is not a heal point (it may be the start of the
+    // operator's own chord), only what the modifier then applies to is.
+    FakeInput chord;
+    common::InputLedger chord_ledger(chord);
+    chord.latched = {"ControlLeft"};
+    Require(chord_ledger.ApplyKey(Stamp("chord", 1, 7), 7, "MetaLeft", true) ==
+                common::InputResult::kApplied &&
+                chord.heal_calls == 0,
+            "pressing a modifier does not trigger a heal");
+    Require(chord_ledger.ApplyKey(Stamp("chord", 2, 7), 7, "KeyC", true) ==
+                common::InputResult::kApplied &&
+                chord.latched.empty() &&
+                chord.key_events ==
+                    std::vector<std::pair<std::string, bool>>{
+                        {"MetaLeft", true}, {"ControlLeft", false}, {"KeyC", true}},
+            "Cmd+C with a stray Control latched arrives as Cmd+C, not Ctrl+Cmd+C");
+    Require(chord_ledger.ApplyKey(Stamp("chord", 3, 7), 7, "KeyC", false) ==
+                common::InputResult::kApplied &&
+                chord.heal_calls == 1,
+            "a release is not a heal point");
+
+    // Clicks: a latched Control turns a left click into a right click on macOS.
+    FakeInput clicks;
+    common::InputLedger click_ledger(clicks);
+    clicks.latched = {"ControlLeft"};
+    Require(click_ledger.ClickButton(Stamp("click", 1, 7), 7, "primary") ==
+                common::InputResult::kApplied &&
+                clicks.latched.empty() && clicks.key_events.size() == 1 &&
+                clicks.button_events.size() == 2,
+            "an atomic click heals a latched modifier first");
+    clicks.latched = {"MetaLeft"};
+    Require(click_ledger.ApplyButton(Stamp("click", 2, 7), 7, "primary", true) ==
+                common::InputResult::kApplied &&
+                clicks.latched.empty(),
+            "a button press heals a latched modifier first");
+  }
 
   // A physically held modifier remains authoritative even when it has been
   // quiet for several seconds; browser/controller release is the only source

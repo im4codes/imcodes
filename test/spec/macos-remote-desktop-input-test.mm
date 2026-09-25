@@ -194,6 +194,70 @@ bool TestASessionStartsOnACleanKeyboard() {
                "and the sweep does not count it");
 }
 
+// The reported bug: mid-session a modifier stays down in the window server
+// (its key-up never became an emitted release), after which every letter the
+// operator types is a Command/Control/Option shortcut. It must heal at the
+// next press, without restarting the session, and a modifier the operator is
+// really holding must survive.
+bool TestALatchedModifierHealsMidSession() {
+  auto backend = std::make_unique<FakeBackend>();
+  FakeBackend *fake = backend.get();
+  input::CGEventInputAdapter adapter(42, std::move(backend));
+  if (!Check(adapter.ReleaseLatchedModifiers() == 0,
+             "no heal happens while no session topology is bound")) {
+    return false;
+  }
+  const auto topology = Topology();
+  if (!Check(adapter.BindTopology(topology, topology.displays[0].display_id),
+             "current topology must bind")) {
+    return false;
+  }
+  common::InputLedger ledger(adapter);
+  fake->latched_modifiers = {"MetaLeft", "ControlLeft"};
+  fake->key_events.clear();
+  if (!Check(ledger.ApplyKey(Stamp("controller-a", 1), 7, "KeyA", true) ==
+                     common::InputResult::kApplied &&
+                 fake->key_events ==
+                     std::vector<Transition>{{"MetaLeft", false},
+                                             {"ControlLeft", false},
+                                             {"KeyA", true}},
+             "latched Command and Control are released before the letter")) {
+    return false;
+  }
+  if (!Check(ledger.ApplyKey(Stamp("controller-a", 2), 7, "KeyA", false) ==
+                     common::InputResult::kApplied &&
+                 ledger.ApplyKey(Stamp("controller-a", 3), 7, "ShiftLeft", true) ==
+                     common::InputResult::kApplied,
+             "the operator presses Shift")) {
+    return false;
+  }
+  fake->latched_modifiers = {"ShiftLeft"};
+  fake->key_events.clear();
+  return Check(ledger.ApplyKey(Stamp("controller-a", 4), 7, "KeyB", true) ==
+                       common::InputResult::kApplied &&
+                   fake->key_events == std::vector<Transition>{{"KeyB", true}},
+               "a modifier this session emitted is kept: Shift+B stays Shift+B");
+}
+
+// Every injected event carries exactly the session's own modifiers. Raw
+// CGEventFlags values: Command 0x100000 (left 0x8, right 0x10), Shift 0x20000
+// (left 0x2), Control 0x40000 (left 0x1), Caps Lock 0x10000, numeric pad
+// 0x200000.
+bool TestInjectedEventsCarryOnlyHeldModifierFlags() {
+  const std::uint64_t stale_command = 0x100000 | 0x8;
+  const std::uint64_t unrelated = 0x10000 | 0x200000;
+  return Check(input::ComposeInjectedModifierFlags(stale_command | unrelated, {}) ==
+                   unrelated,
+               "a latched Command inherited from the window server is dropped, "
+               "Caps Lock and numeric-pad flags are kept") &&
+         Check(input::ComposeInjectedModifierFlags(stale_command, {"ShiftLeft"}) ==
+                   (0x20000u | 0x2u),
+               "a held Shift replaces the stale Command") &&
+         Check(input::ComposeInjectedModifierFlags(0, {"MetaRight", "ControlLeft"}) ==
+                   (0x100000u | 0x10u | 0x40000u | 0x1u),
+               "held modifiers set their mask and side bits");
+}
+
 bool TestLedgerOnlyOperationsAndLogicalGeometry() {
   auto backend = std::make_unique<FakeBackend>();
   FakeBackend *fake = backend.get();
@@ -484,6 +548,8 @@ bool TestBoundedTextCounterfactual() {
 int main() {
   @autoreleasepool {
     return TestASessionStartsOnACleanKeyboard() &&
+                   TestALatchedModifierHealsMidSession() &&
+                   TestInjectedEventsCarryOnlyHeldModifierFlags() &&
                    TestLedgerOnlyOperationsAndLogicalGeometry() &&
                    TestClipboardShortcutsUseRealBoundInputAndReleaseEveryKey() &&
                    TestTopologyAndSequenceFences() &&
