@@ -25,6 +25,15 @@ import { SessionActionMenuIcon } from './SessionActionMenuIcon.js';
 import { SupervisionHeartbeatBadge } from './SupervisionHeartbeatBadge.js';
 import * as VoiceInput from './VoiceInput.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
+import { INLINE_PASTE_TEXT_CHAR_LIMIT } from '../composer-inline-limit.js';
+import {
+  buildNotepadInlineMessage,
+  buildNotepadTranscriptFileName,
+  needsNotepadTranscriptAttachment,
+  readVoiceNotepadDraft,
+  type VoiceNotepadSendOutcome,
+  type VoiceNotepadSendRequest,
+} from '../voice-notepad.js';
 import { AtPicker } from './AtPicker.js';
 import { FS_SESSION_ROOT_PATH } from '../../../src/shared/transport/fs.js';
 import { QuickAgentDelegationDialog, type QuickAgentDelegationCandidate } from './QuickAgentDelegationDialog.js';
@@ -514,8 +523,23 @@ function isTextEntryKeyboardOwner(node: EventTarget | Node | null | undefined): 
 type MenuAction = 'restart' | 'new' | 'stop';
 type ModelChoice = string;
 
-const INLINE_PASTE_TEXT_CHAR_LIMIT = 1200;
 const IME_ESCAPE_CANCEL_GRACE_MS = 800;
+/**
+ * How long a voice-notepad send waits for the composer's attachment list to
+ * catch up (its uploaded transcript present, a stale one gone) before
+ * reporting the send as failed. Uploads and removals have already finished by
+ * then; this only bounds a render.
+ */
+const NOTEPAD_ATTACHMENT_SEND_TIMEOUT_MS = 10_000;
+
+interface PendingNotepadAttachmentSend {
+  /** True once the composer's attachments are what this message needs. */
+  ready: (attachments: readonly ComposerAttachmentRecord[]) => boolean;
+  text: string;
+  onAccepted: () => void;
+  resolve: (outcome: VoiceNotepadSendOutcome) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
 
 /*
  * R3 v2 PR-ρ — Composer attachments now carry a per-composer sequence
@@ -1646,6 +1670,21 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   attachmentDraftKeyRef.current = attachmentDraftKey;
   const mountedRef = useRef(true);
   const composerUploadKey = composerDraftScope ? `composer:${composerDraftScope}` : 'composer:global';
+  // A voice notepad's local draft is kept per session exactly like the
+  // composer's own draft (main sessions and sub-sessions alike), and per
+  // server, so two servers' same-named sessions never share one.
+  const voiceNotepadDraftScope = composerDraftScope
+    ? (serverId ? `${serverId}:${composerDraftScope}` : composerDraftScope)
+    : null;
+  const [hasVoiceNotepadDraft, setHasVoiceNotepadDraft] = useState(false);
+  useEffect(() => {
+    // Re-read when the overlay closes: that is when a notepad is left behind
+    // (closed without sending) or settled (sent or discarded).
+    if (voiceOpen) return;
+    setHasVoiceNotepadDraft(
+      !!voiceNotepadDraftScope && readVoiceNotepadDraft(voiceNotepadDraftScope) !== null,
+    );
+  }, [voiceNotepadDraftScope, voiceOpen]);
   // File upload state
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploadSnapshot, setUploadSnapshot] = useState(() => getComposerUploadSnapshot(composerUploadKey));
@@ -4997,6 +5036,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     return successfulAttachments.length > 0;
   }, [activeSession?.name, attachmentDraftKey, composerUploadKey, isShareScopedSession, serverId, t]);
 
+
   const handleCancelUpload = useCallback((item: ComposerUploadItem) => {
     if (!window.confirm(t('upload.cancel_confirm', { name: item.name }))) return;
     composerUploadAbortControllers.get(item.id)?.abort();
@@ -5044,6 +5084,156 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       });
     }
   }, [activeSession?.name, closeQuickSuggestions, composerUploadKey, deletingAttachmentKeys, isShareScopedSession, serverId, t]);
+
+  // Voice notepad, after review. A short transcript is one ordinary message
+  // through the same send path as dictation. A long one is uploaded as a
+  // Markdown file through the same attachment flow a long paste takes, and
+  // the message carries the instruction plus the file's reference -- exactly
+  // what attaching the file by hand and typing the instruction would send.
+  //
+  // An uploaded transcript is the notepad's, not the composer's: a retry of
+  // the same transcript reuses it, an edited or now-short transcript removes
+  // it first, and closing the overlay without sending removes it -- so it can
+  // never ride along with some later message.
+  const attachmentsRef = useRef(attachments);
+  attachmentsRef.current = attachments;
+  const notepadUploadRef = useRef<{ transcript: string; fileName: string } | null>(null);
+  const abandonedNotepadUploadsRef = useRef(new Set<string>());
+  const pendingNotepadAttachmentSendRef = useRef<PendingNotepadAttachmentSend | null>(null);
+  const [notepadAttachmentSendTick, setNotepadAttachmentSendTick] = useState(0);
+
+  const sendVoiceNotepadMessage = useCallback((text: string, onAccepted: () => void): VoiceNotepadSendOutcome => {
+    const accepted = () => {
+      // The composer, uploaded transcript included, has just been cleared.
+      notepadUploadRef.current = null;
+      onAccepted();
+    };
+    const outcome = requestSend(buildSendPayload({ textOverride: text }), {
+      clearComposer: true,
+      retainOnRejection: true,
+      onConfirmedAccepted: () => {
+        accepted();
+        setVoiceOpen(false);
+      },
+    });
+    if (outcome === 'accepted') accepted();
+    return outcome;
+  }, [buildSendPayload, requestSend]);
+
+  /** Send once the composer's attachments are what the message needs. */
+  const sendVoiceNotepadWhenReady = useCallback((
+    ready: (attachments: readonly ComposerAttachmentRecord[]) => boolean,
+    text: string,
+    onAccepted: () => void,
+  ): Promise<VoiceNotepadSendOutcome> => new Promise((resolve) => {
+    const previous = pendingNotepadAttachmentSendRef.current;
+    if (previous) {
+      clearTimeout(previous.timer);
+      previous.resolve('rejected');
+    }
+    const pending: PendingNotepadAttachmentSend = {
+      ready,
+      text,
+      onAccepted,
+      resolve,
+      timer: setTimeout(() => {
+        if (pendingNotepadAttachmentSendRef.current !== pending) return;
+        pendingNotepadAttachmentSendRef.current = null;
+        resolve('rejected');
+      }, NOTEPAD_ATTACHMENT_SEND_TIMEOUT_MS),
+    };
+    pendingNotepadAttachmentSendRef.current = pending;
+    setNotepadAttachmentSendTick((tick) => tick + 1);
+  }), []);
+
+  const handleVoiceNotepadSend = useCallback(async (
+    request: VoiceNotepadSendRequest,
+  ): Promise<VoiceNotepadSendOutcome> => {
+    const transcript = request.transcript.trim();
+    if (!transcript) return 'rejected';
+    const attachAsFile = needsNotepadTranscriptAttachment(transcript);
+    if (attachAsFile && !serverId) {
+      showSendWarning(t('upload.long_text_requires_attachment'));
+      return 'rejected';
+    }
+    const previous = notepadUploadRef.current;
+    const reuse = !!previous && attachAsFile && previous.transcript === transcript
+      && attachmentsRef.current.some((attachment) => attachment.name === previous.fileName);
+    let staleFileName: string | null = null;
+    if (previous && !reuse) {
+      notepadUploadRef.current = null;
+      staleFileName = previous.fileName;
+      const stale = attachmentsRef.current.find((attachment) => attachment.name === previous.fileName);
+      if (stale) await handleRemoveAttachment(stale);
+      else abandonedNotepadUploadsRef.current.add(previous.fileName);
+    }
+    const withoutStale = (list: readonly ComposerAttachmentRecord[]) => (
+      !staleFileName || !list.some((attachment) => attachment.name === staleFileName)
+    );
+    if (!attachAsFile) {
+      return sendVoiceNotepadWhenReady(
+        withoutStale,
+        buildNotepadInlineMessage(request.instruction, t('voice.notepad_transcript_label'), transcript),
+        request.onAccepted,
+      );
+    }
+    let fileName: string;
+    if (reuse && previous) {
+      fileName = previous.fileName;
+    } else {
+      fileName = buildNotepadTranscriptFileName();
+      const uploaded = await uploadAttachmentFiles([
+        new File([transcript], fileName, { type: 'text/markdown' }),
+      ]);
+      if (!uploaded) return 'rejected';
+      notepadUploadRef.current = { transcript, fileName };
+    }
+    const reference = t('voice.notepad_transcript_attached', { name: fileName });
+    const instruction = request.instruction.trim();
+    return sendVoiceNotepadWhenReady(
+      (list) => withoutStale(list) && list.some((attachment) => attachment.name === fileName),
+      instruction ? `${instruction}\n\n${reference}` : reference,
+      request.onAccepted,
+    );
+  }, [handleRemoveAttachment, sendVoiceNotepadWhenReady, serverId, showSendWarning, t, uploadAttachmentFiles]);
+
+  // Attachment changes land on later renders: send a waiting notepad once
+  // the composer is ready for it, and remove abandoned notepad uploads.
+  useEffect(() => {
+    const pending = pendingNotepadAttachmentSendRef.current;
+    if (pending && pending.ready(attachments)) {
+      pendingNotepadAttachmentSendRef.current = null;
+      clearTimeout(pending.timer);
+      pending.resolve(sendVoiceNotepadMessage(pending.text, pending.onAccepted));
+    }
+    const abandoned = abandonedNotepadUploadsRef.current;
+    if (abandoned.size === 0) return;
+    for (const attachment of attachments) {
+      if (!abandoned.has(attachment.name)) continue;
+      abandoned.delete(attachment.name);
+      void handleRemoveAttachment(attachment);
+    }
+  }, [attachments, handleRemoveAttachment, notepadAttachmentSendTick, sendVoiceNotepadMessage]);
+
+  // Closed without sending: the notepad stays as a local draft, and its
+  // uploaded transcript leaves the composer. A send already under way keeps
+  // its file.
+  useEffect(() => {
+    if (voiceOpen) return;
+    const upload = notepadUploadRef.current;
+    if (!upload || pendingNotepadAttachmentSendRef.current) return;
+    notepadUploadRef.current = null;
+    abandonedNotepadUploadsRef.current.add(upload.fileName);
+    setNotepadAttachmentSendTick((tick) => tick + 1);
+  }, [voiceOpen]);
+
+  useEffect(() => () => {
+    const pending = pendingNotepadAttachmentSendRef.current;
+    if (!pending) return;
+    pendingNotepadAttachmentSendRef.current = null;
+    clearTimeout(pending.timer);
+    pending.resolve('rejected');
+  }, []);
 
   const handleFileUpload = useCallback(async (files: FileList | null) => {
     if (!files || files.length === 0) return;
@@ -7130,7 +7320,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                   onPointerDown={(e) => { e.preventDefault(); setVoiceOpen(true); }}
                   onClick={() => setVoiceOpen(true)}
                   disabled={inputDisabled}
-                  title={t('voice.voice_input')}
+                  data-notepad-draft={hasVoiceNotepadDraft ? 'true' : undefined}
+                  title={hasVoiceNotepadDraft ? t('voice.notepad_draft_indicator') : t('voice.voice_input')}
                   aria-label={t('voice.voice_input')}
                 >
                   🎙
@@ -7209,7 +7400,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             class="btn btn-voice"
             onClick={() => setVoiceOpen(true)}
             disabled={inputDisabled}
-            title={t('voice.voice_input')}
+            data-notepad-draft={hasVoiceNotepadDraft ? 'true' : undefined}
+            title={hasVoiceNotepadDraft ? t('voice.notepad_draft_indicator') : t('voice.voice_input')}
           >
             🎙
           </button>
@@ -7498,7 +7690,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         </div>
       </div>
     )}
-    <VoiceOverlay open={voiceOpen} onClose={() => setVoiceOpen(false)} onSend={handleVoiceSend} initialText={divRef.current ? readComposerElementText(divRef.current) : ''} />
+    <VoiceOverlay
+      open={voiceOpen}
+      onClose={() => setVoiceOpen(false)}
+      onSend={handleVoiceSend}
+      onSendNotepad={handleVoiceNotepadSend}
+      draftScope={voiceNotepadDraftScope}
+      sessionLabel={composerTargetName}
+      initialText={divRef.current ? readComposerElementText(divRef.current) : ''}
+    />
     {p2pConfigOpen && (
       <P2pConfigPanel
         sessions={(sessions ?? []).map(s => ({

@@ -11,10 +11,16 @@ import { FILE_TRANSFER_LIMITS } from '../../../shared/transport/file-transfer.js
 import { HERMES_AGENT_PROVIDER_ID } from '../../../shared/hermes-agent.js';
 
 const DEFAULT_INNER_WIDTH = 1280;
-const { mockI18n, directFileTransferMocks } = vi.hoisted(() => ({
+const { mockI18n, directFileTransferMocks, voiceOverlayMock } = vi.hoisted(() => ({
   mockI18n: { language: undefined as string | undefined, resolvedLanguage: undefined as string | undefined },
   directFileTransferMocks: {
     prewarmDirectFileLease: vi.fn<(...args: unknown[]) => (() => void) | undefined>(() => undefined),
+  },
+  // What the stub overlay last received, and the reviewed notepad it sends.
+  voiceOverlayMock: {
+    props: null as null | { draftScope?: string | null; sessionLabel?: string },
+    notepad: { instruction: 'Summarize it', transcript: '', onAccepted: (() => {}) as () => void },
+    result: null as Promise<'accepted' | 'pending' | 'rejected'> | null,
   },
 }));
 
@@ -127,6 +133,9 @@ vi.mock('react-i18next', () => ({
       if (key === 'session.composer_target_aria') {
         return `Message target: ${String(opts?.name ?? '')}`;
       }
+      if (key === 'voice.notepad_transcript_attached') {
+        return `Transcript attached as ${String(opts?.name ?? '')}`;
+      }
       if (key === 'upload.long_text_attached') {
         return `Large pasted text attached as ${String(opts?.name ?? '')}`;
       }
@@ -201,17 +210,34 @@ vi.mock('../../src/components/QuickInputPanel.js', () => ({
 }));
 
 vi.mock('../../src/components/VoiceOverlay.js', () => ({
-  VoiceOverlay: ({ open, onSend, onClose, initialText }: {
+  VoiceOverlay: (props: {
     open: boolean;
     onSend: (text: string) => 'accepted' | 'pending' | 'rejected';
     onClose: () => void;
     initialText?: string;
-  }) => open ? (
-    <button onClick={() => {
-      const text = `${initialText?.trim() ? `${initialText.trim()} ` : ''}voice combo message`;
-      if (onSend(text) === 'accepted') onClose();
-    }}>voice-overlay-send</button>
-  ) : null,
+    draftScope?: string | null;
+    sessionLabel?: string;
+    onSendNotepad?: (request: {
+      instruction: string;
+      transcript: string;
+      onAccepted: () => void;
+    }) => Promise<'accepted' | 'pending' | 'rejected'>;
+  }) => {
+    voiceOverlayMock.props = props;
+    const { open, onSend, onClose, initialText, onSendNotepad } = props;
+    return open ? (
+      <>
+        <button onClick={() => {
+          const text = `${initialText?.trim() ? `${initialText.trim()} ` : ''}voice combo message`;
+          if (onSend(text) === 'accepted') onClose();
+        }}>voice-overlay-send</button>
+        <button onClick={() => {
+          voiceOverlayMock.result = onSendNotepad?.({ ...voiceOverlayMock.notepad }) ?? null;
+        }}>voice-notepad-send</button>
+        <button onClick={onClose}>voice-overlay-close</button>
+      </>
+    ) : null;
+  },
 }));
 
 vi.mock('../../src/components/VoiceInput.js', () => ({
@@ -342,6 +368,8 @@ import {
 } from '../../src/components/SessionControls.js';
 import { __resetPrefCacheForTests } from '../../src/hooks/usePref.js';
 import type { SessionInfo } from '../../src/types.js';
+import { INLINE_PASTE_TEXT_CHAR_LIMIT } from '../../src/composer-inline-limit.js';
+import { voiceNotepadDraftKey } from '../../src/voice-notepad.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { P2P_CONFIG_MSG } from '@shared/p2p-config-events.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
@@ -8592,6 +8620,246 @@ afterEach(() => {
     expectSendPayload(ws, {
       sessionName: 'my-session',
       text: '#1:(/tmp/pasted-text.txt)',
+    });
+  });
+
+  describe('voice notepad send', () => {
+    // Its own session name: a failed upload deliberately stays in the
+    // composer's module-level upload list, which is keyed by session, and must
+    // not leak into the upload tests that use 'my-session'.
+    const SESSION = 'notepad-session';
+    function renderForNotepad(ws: ReturnType<typeof makeWs>) {
+      render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeSession({ name: SESSION })}
+          quickData={makeQuickData() as any}
+          serverId="srv-1"
+        />,
+      );
+      fireEvent.click(screen.getByTitle('voice_input'));
+    }
+
+    function reviewedNotepad(transcript: string) {
+      const onAccepted = vi.fn();
+      voiceOverlayMock.notepad = { instruction: 'Summarize it', transcript, onAccepted };
+      voiceOverlayMock.result = null;
+      return onAccepted;
+    }
+
+    it('sends a transcript at the inline limit as one ordinary message to its own session', async () => {
+      const ws = makeWs();
+      renderForNotepad(ws);
+      const transcript = 'x'.repeat(INLINE_PASTE_TEXT_CHAR_LIMIT);
+      const onAccepted = reviewedNotepad(transcript);
+
+      fireEvent.click(screen.getByText('voice-notepad-send'));
+      await expect(voiceOverlayMock.result).resolves.toBe('accepted');
+
+      expect(uploadFileMock).not.toHaveBeenCalled();
+      expectSendPayload(ws, {
+        sessionName: SESSION,
+        text: `Summarize it\n\nnotepad_transcript_label\n\n${transcript}`,
+      });
+      expect(onAccepted).toHaveBeenCalledTimes(1);
+    });
+
+    it('uploads a longer transcript as Markdown and sends the instruction referencing that file', async () => {
+      uploadFileMock.mockResolvedValueOnce({ attachment: { daemonPath: '/tmp/voice-notepad.md' } });
+      const ws = makeWs();
+      renderForNotepad(ws);
+      const transcript = 'y'.repeat(INLINE_PASTE_TEXT_CHAR_LIMIT + 1);
+      const onAccepted = reviewedNotepad(transcript);
+
+      fireEvent.click(screen.getByText('voice-notepad-send'));
+      await expect(voiceOverlayMock.result).resolves.toBe('accepted');
+
+      expect(uploadFileMock).toHaveBeenCalledTimes(1);
+      expect(uploadFileMock.mock.calls[0]?.[0]).toBe('srv-1');
+      const uploaded = uploadFileMock.mock.calls[0]?.[1] as File;
+      expect(uploaded.name).toMatch(/^voice-notepad-.*\.md$/);
+      expect(await readBlobText(uploaded)).toBe(transcript);
+      // The transcript itself never rides in the message: only its reference.
+      expectSendPayload(ws, {
+        sessionName: SESSION,
+        text: `#1:(/tmp/voice-notepad.md) Summarize it\n\nTranscript attached as ${uploaded.name}`,
+      });
+      expect(gatherSendCalls(ws).some((call) => String((call as { text?: unknown }).text).includes(transcript)))
+        .toBe(false);
+      expect(onAccepted).toHaveBeenCalledTimes(1);
+    });
+
+    it('sends nothing and reports failure when the transcript upload fails', async () => {
+      uploadFileMock.mockRejectedValueOnce(new Error('network down'));
+      const ws = makeWs();
+      renderForNotepad(ws);
+      const onAccepted = reviewedNotepad('z'.repeat(INLINE_PASTE_TEXT_CHAR_LIMIT + 1));
+
+      fireEvent.click(screen.getByText('voice-notepad-send'));
+      await expect(voiceOverlayMock.result).resolves.toBe('rejected');
+      expect(gatherSendCalls(ws)).toHaveLength(0);
+      expect(onAccepted).not.toHaveBeenCalled();
+    });
+
+    it('binds the notepad draft to the session it was opened from, main and sub-sessions alike', () => {
+      render(
+        <SessionControls
+          ws={makeWs() as any}
+          activeSession={makeSession({ name: SESSION })}
+          quickData={makeQuickData() as any}
+          serverId="srv-1"
+        />,
+      );
+      expect(voiceOverlayMock.props?.draftScope).toBe(`srv-1:session:${SESSION}`);
+      expect(voiceOverlayMock.props?.sessionLabel).toBeTruthy();
+
+      cleanup();
+      render(
+        <SessionControls
+          ws={makeWs() as any}
+          activeSession={makeSession({ name: 'deck_sub_worker' })}
+          subSessionId="worker-1"
+          quickData={makeQuickData() as any}
+          serverId="srv-1"
+        />,
+      );
+      expect(voiceOverlayMock.props?.draftScope).toBe('srv-1:sub:worker-1');
+    });
+
+    // Another file still uploading makes the composer refuse a send, leaving
+    // the notepad's uploaded transcript behind: the realistic way it outlives
+    // the attempt that uploaded it.
+    async function openNotepadWithAnUploadInFlight(ws: ReturnType<typeof makeWs>) {
+      let failSlowUpload!: (error: Error) => void;
+      uploadFileMock.mockImplementationOnce(() => new Promise((_resolve, reject) => {
+        failSlowUpload = reject;
+      }));
+      render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeSession({ name: SESSION })}
+          quickData={makeQuickData() as any}
+          serverId="srv-1"
+        />,
+      );
+      fireEvent.paste(screen.getByRole('textbox'), {
+        clipboardData: {
+          files: [new File(['slow'], 'slow.txt', { type: 'text/plain' })],
+          getData: () => '',
+        },
+      });
+      await waitFor(() => expect(uploadFileMock).toHaveBeenCalledTimes(1));
+      fireEvent.click(screen.getByTitle('voice_input'));
+      // Let the slow upload fail so the next send is no longer blocked.
+      return async () => {
+        await act(async () => {
+          failSlowUpload(new Error('slow upload failed'));
+          await Promise.resolve();
+        });
+      };
+    }
+
+    async function sendNotepad(transcript: string) {
+      reviewedNotepad(transcript);
+      fireEvent.click(screen.getByText('voice-notepad-send'));
+      return voiceOverlayMock.result;
+    }
+
+    function attachedNames(): string[] {
+      return Array.from(document.querySelectorAll('.attachment-badge-name')).map((node) => node.textContent ?? '');
+    }
+
+    function notepadUploads(): File[] {
+      return uploadFileMock.mock.calls
+        .map((call) => call[1] as File)
+        .filter((file) => /^voice-notepad-.*\.md$/.test(file.name));
+    }
+
+    it('reuses the uploaded transcript when the same notepad is sent again', async () => {
+      const ws = makeWs();
+      const unblock = await openNotepadWithAnUploadInFlight(ws);
+      uploadFileMock.mockResolvedValueOnce({ attachment: { daemonPath: '/tmp/notepad-a.md' } });
+      const transcript = 'q'.repeat(INLINE_PASTE_TEXT_CHAR_LIMIT + 1);
+
+      await expect(sendNotepad(transcript)).resolves.toBe('rejected');
+      await unblock();
+      await expect(sendNotepad(transcript)).resolves.toBe('accepted');
+
+      expect(notepadUploads()).toHaveLength(1);
+      expectLastSendPayload(ws, {
+        sessionName: SESSION,
+        text: `#1:(/tmp/notepad-a.md) Summarize it\n\nTranscript attached as ${notepadUploads()[0]!.name}`,
+      });
+    });
+
+    it('replaces the uploaded transcript when the notepad was edited, never sending both', async () => {
+      const ws = makeWs();
+      const unblock = await openNotepadWithAnUploadInFlight(ws);
+      uploadFileMock
+        .mockResolvedValueOnce({ attachment: { daemonPath: '/tmp/notepad-a.md' } })
+        .mockResolvedValueOnce({ attachment: { daemonPath: '/tmp/notepad-b.md' } });
+
+      await expect(sendNotepad('a'.repeat(INLINE_PASTE_TEXT_CHAR_LIMIT + 1))).resolves.toBe('rejected');
+      await unblock();
+      await expect(sendNotepad('b'.repeat(INLINE_PASTE_TEXT_CHAR_LIMIT + 1))).resolves.toBe('accepted');
+
+      expect(notepadUploads()).toHaveLength(2);
+      expect(deleteAttachmentMock).toHaveBeenCalledWith('srv-1', 'notepad-a.md');
+      expectLastSendPayload(ws, {
+        sessionName: SESSION,
+        text: `#1:(/tmp/notepad-b.md) Summarize it\n\nTranscript attached as ${notepadUploads()[1]!.name}`,
+      });
+    });
+
+    it('drops the uploaded transcript when the edited notepad is now short enough to go inline', async () => {
+      const ws = makeWs();
+      const unblock = await openNotepadWithAnUploadInFlight(ws);
+      uploadFileMock.mockResolvedValueOnce({ attachment: { daemonPath: '/tmp/notepad-a.md' } });
+
+      await expect(sendNotepad('a'.repeat(INLINE_PASTE_TEXT_CHAR_LIMIT + 1))).resolves.toBe('rejected');
+      await unblock();
+      await expect(sendNotepad('short now')).resolves.toBe('accepted');
+
+      expect(deleteAttachmentMock).toHaveBeenCalledWith('srv-1', 'notepad-a.md');
+      expectLastSendPayload(ws, {
+        sessionName: SESSION,
+        text: 'Summarize it\n\nnotepad_transcript_label\n\nshort now',
+      });
+    });
+
+    it('removes the uploaded transcript from the composer when the overlay closes without sending', async () => {
+      const ws = makeWs();
+      await openNotepadWithAnUploadInFlight(ws);
+      uploadFileMock.mockResolvedValueOnce({ attachment: { daemonPath: '/tmp/notepad-a.md' } });
+
+      await expect(sendNotepad('a'.repeat(INLINE_PASTE_TEXT_CHAR_LIMIT + 1))).resolves.toBe('rejected');
+      await waitFor(() => expect(attachedNames()).toContain(notepadUploads()[0]!.name));
+      fireEvent.click(screen.getByText('voice-overlay-close'));
+
+      await waitFor(() => expect(attachedNames()).not.toContain(notepadUploads()[0]!.name));
+      expect(deleteAttachmentMock).toHaveBeenCalledWith('srv-1', 'notepad-a.md');
+      expect(gatherSendCalls(ws)).toHaveLength(0);
+    });
+
+    it('marks the voice button while an unfinished notepad is saved for this session', () => {
+      localStorage.setItem(voiceNotepadDraftKey(`srv-1:session:${SESSION}`), JSON.stringify({
+        version: 1,
+        scope: `srv-1:session:${SESSION}`,
+        text: 'left over',
+        segments: [],
+        startedAt: 1,
+        updatedAt: 2,
+      }));
+      render(
+        <SessionControls
+          ws={makeWs() as any}
+          activeSession={makeSession({ name: SESSION })}
+          quickData={makeQuickData() as any}
+          serverId="srv-1"
+        />,
+      );
+      const button = screen.getByTitle('notepad_draft_indicator');
+      expect(button.getAttribute('data-notepad-draft')).toBe('true');
     });
   });
 

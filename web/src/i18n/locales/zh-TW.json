@@ -1283,7 +1283,21 @@
     "notepad": "記事本",
     "notepad_hint": "持續轉錄會議直到你停止，然後傳給目前工作階段總結。請保持 App 在前景，螢幕會保持常亮。",
     "notepad_send": "傳送並總結",
-    "notepad_summary_prompt": "以下是用語音輸入記錄的會議/談話轉錄。請總結：重點、決定、待辦事項（如提到負責人請註明）。轉錄可能有辨識錯誤。\n\n轉錄內容："
+    "notepad_summary_instruction": "以下是用語音輸入記錄的會議/談話轉錄。請總結：重點、決定、待辦事項（如提到負責人請註明）。轉錄可能有辨識錯誤。",
+    "notepad_transcript_label": "轉錄內容：",
+    "notepad_transcript_attached": "完整轉錄見附件 {{name}}。",
+    "notepad_review_title": "檢查記事本",
+    "notepad_review_target": "傳送到：{{session}}",
+    "notepad_review_instruction": "要求",
+    "notepad_review_transcript": "轉錄內容",
+    "notepad_continue": "繼續錄音",
+    "notepad_discard": "捨棄",
+    "notepad_discard_confirm": "捨棄這份記事本？轉錄會從本裝置刪除，不會傳送任何內容。",
+    "notepad_draft_found": "有一份未完成的記事本（{{time}}，{{count}} 字）",
+    "notepad_resume": "繼續",
+    "notepad_sending": "傳送中…",
+    "notepad_send_failed": "傳送失敗。記事本仍保存在本裝置上。",
+    "notepad_draft_indicator": "本裝置上有未完成的語音記事本"
   },
   "p2p": {
     "final_original_request_reminder": "在完成討論綜合後，務必直接落實並完整回應使用者的原始請求，不要只停留在討論總結。\n使用者的原始請求是：「{{request}}」",

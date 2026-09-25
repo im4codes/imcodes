@@ -1283,7 +1283,21 @@
     "notepad": "Notepad",
     "notepad_hint": "Keep transcribing a meeting until you stop, then send it to this session to summarize. Keep the app open; the screen stays on.",
     "notepad_send": "Send & summarize",
-    "notepad_summary_prompt": "Below is a transcript of a meeting or conversation recorded with voice input. Please summarize it: key points, decisions, and action items (with owners if mentioned). The transcript may contain recognition errors.\n\nTranscript:"
+    "notepad_summary_instruction": "Below is a transcript of a meeting or conversation recorded with voice input. Please summarize it: key points, decisions, and action items (with owners if mentioned). The transcript may contain recognition errors.",
+    "notepad_transcript_label": "Transcript:",
+    "notepad_transcript_attached": "The full transcript is in the attached file {{name}}.",
+    "notepad_review_title": "Review notepad",
+    "notepad_review_target": "Send to: {{session}}",
+    "notepad_review_instruction": "Instruction",
+    "notepad_review_transcript": "Transcript",
+    "notepad_continue": "Continue recording",
+    "notepad_discard": "Discard",
+    "notepad_discard_confirm": "Discard this notepad? The transcript will be deleted from this device and nothing is sent.",
+    "notepad_draft_found": "Unfinished notepad from {{time}} ({{count}} characters)",
+    "notepad_resume": "Resume",
+    "notepad_sending": "Sending…",
+    "notepad_send_failed": "Couldn't send. The notepad is still saved on this device.",
+    "notepad_draft_indicator": "Unfinished voice notepad saved on this device"
   },
   "p2p": {
     "final_original_request_reminder": "After synthesizing the discussion, directly address and fulfill the user's original request instead of stopping at a discussion summary.\nThe original user request is: \"{{request}}\"",

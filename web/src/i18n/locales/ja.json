@@ -1283,7 +1283,21 @@
     "notepad": "メモ",
     "notepad_hint": "停止するまで会議を文字起こしし、このセッションに送って要約します。アプリを開いたままにしてください。画面は点灯したままになります。",
     "notepad_send": "送信して要約",
-    "notepad_summary_prompt": "以下は音声入力で記録した会議・会話の文字起こしです。要点、決定事項、アクションアイテム（担当者が言及されていれば併記）を要約してください。認識誤りが含まれる場合があります。\n\n文字起こし："
+    "notepad_summary_instruction": "以下は音声入力で記録した会議・会話の文字起こしです。要点、決定事項、アクションアイテム（担当者が言及されていれば併記）を要約してください。認識誤りが含まれる場合があります。",
+    "notepad_transcript_label": "文字起こし：",
+    "notepad_transcript_attached": "文字起こしの全文は添付ファイル {{name}} にあります。",
+    "notepad_review_title": "メモの確認",
+    "notepad_review_target": "送信先: {{session}}",
+    "notepad_review_instruction": "指示",
+    "notepad_review_transcript": "文字起こし",
+    "notepad_continue": "録音を続ける",
+    "notepad_discard": "破棄",
+    "notepad_discard_confirm": "このメモを破棄しますか？書き起こしはこの端末から削除され、何も送信されません。",
+    "notepad_draft_found": "未完了のメモ（{{time}}、{{count}} 文字）",
+    "notepad_resume": "再開",
+    "notepad_sending": "送信中…",
+    "notepad_send_failed": "送信できませんでした。メモはこの端末に保存されたままです。",
+    "notepad_draft_indicator": "この端末に未完了の音声メモがあります"
   },
   "p2p": {
     "final_original_request_reminder": "議論の要約だけで終わらせず、議論を統合した後は必ず元のユーザー依頼に直接対応してください。\n元のユーザー依頼: \"{{request}}\"",

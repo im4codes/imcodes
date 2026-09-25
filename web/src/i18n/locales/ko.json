@@ -1283,7 +1283,21 @@
     "notepad": "메모장",
     "notepad_hint": "중지할 때까지 회의를 받아쓰고, 이 세션으로 보내 요약합니다. 앱을 열어 두세요. 화면은 켜진 상태로 유지됩니다.",
     "notepad_send": "보내고 요약",
-    "notepad_summary_prompt": "다음은 음성 입력으로 기록한 회의/대화의 받아쓰기입니다. 핵심 내용, 결정 사항, 할 일(담당자가 언급되면 함께)을 요약해 주세요. 인식 오류가 있을 수 있습니다.\n\n받아쓰기:"
+    "notepad_summary_instruction": "다음은 음성 입력으로 기록한 회의/대화의 받아쓰기입니다. 핵심 내용, 결정 사항, 할 일(담당자가 언급되면 함께)을 요약해 주세요. 인식 오류가 있을 수 있습니다.",
+    "notepad_transcript_label": "받아쓰기:",
+    "notepad_transcript_attached": "전체 받아쓰기는 첨부 파일 {{name}}에 있습니다.",
+    "notepad_review_title": "메모 검토",
+    "notepad_review_target": "보낼 곳: {{session}}",
+    "notepad_review_instruction": "요청",
+    "notepad_review_transcript": "받아쓰기",
+    "notepad_continue": "계속 녹음",
+    "notepad_discard": "삭제",
+    "notepad_discard_confirm": "이 메모를 삭제할까요? 녹취록이 이 기기에서 삭제되며 아무것도 전송되지 않습니다.",
+    "notepad_draft_found": "완료되지 않은 메모 ({{time}}, {{count}}자)",
+    "notepad_resume": "이어서 녹음",
+    "notepad_sending": "보내는 중…",
+    "notepad_send_failed": "보내지 못했습니다. 메모는 이 기기에 그대로 저장되어 있습니다.",
+    "notepad_draft_indicator": "이 기기에 완료되지 않은 음성 메모가 있습니다"
   },
   "p2p": {
     "final_original_request_reminder": "토론 요약으로 끝내지 말고, 논의를 종합한 뒤에는 반드시 원래 사용자 요청을 직접 완전히 처리하세요.\n원래 사용자 요청: \"{{request}}\"",

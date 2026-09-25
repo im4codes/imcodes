@@ -1283,7 +1283,21 @@
     "notepad": "记事本",
     "notepad_hint": "持续转录会议直到你停止，然后发给当前会话总结。请保持 App 在前台，屏幕会保持常亮。",
     "notepad_send": "发送并总结",
-    "notepad_summary_prompt": "以下是用语音输入记录的会议/谈话转录。请总结：要点、决定、待办事项（如提到负责人请注明）。转录可能有识别错误。\n\n转录内容："
+    "notepad_summary_instruction": "以下是用语音输入记录的会议/谈话转录。请总结：要点、决定、待办事项（如提到负责人请注明）。转录可能有识别错误。",
+    "notepad_transcript_label": "转录内容：",
+    "notepad_transcript_attached": "完整转录见附件 {{name}}。",
+    "notepad_review_title": "检查记事本",
+    "notepad_review_target": "发送到：{{session}}",
+    "notepad_review_instruction": "要求",
+    "notepad_review_transcript": "转录内容",
+    "notepad_continue": "继续录音",
+    "notepad_discard": "丢弃",
+    "notepad_discard_confirm": "丢弃这份记事本？转录会从本设备删除，不会发送任何内容。",
+    "notepad_draft_found": "有一份未完成的记事本（{{time}}，{{count}} 字）",
+    "notepad_resume": "继续",
+    "notepad_sending": "发送中…",
+    "notepad_send_failed": "发送失败。记事本仍保存在本设备上。",
+    "notepad_draft_indicator": "本设备上有未完成的语音记事本"
   },
   "p2p": {
     "final_original_request_reminder": "在完成讨论综合后，务必直接落实并完整回应用户的原始请求，不要只停留在讨论总结。\n用户的原始请求是：\"{{request}}\"",

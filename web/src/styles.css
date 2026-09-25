@@ -3170,6 +3170,54 @@ html.native-ios-mac .chat-dl-btn {
   background: linear-gradient(135deg, #2563eb, #7c3aed);
 }
 .voice-overlay-send:disabled { background: #334155; color: #64748b; cursor: default; }
+/* Voice notepad: unfinished-draft offer and the review step before sending. */
+.voice-notepad-recovery {
+  width: 100%; max-width: 600px; margin-top: 16px; z-index: 1;
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 12px 14px; border-radius: 14px; box-sizing: border-box;
+  background: rgba(34,211,238,0.08); border: 1px solid rgba(34,211,238,0.35);
+  color: #e2e8f0; font-size: 14px;
+}
+.voice-notepad-recovery-actions,
+.voice-notepad-review-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+.voice-notepad-recovery-actions button,
+.voice-notepad-continue,
+.voice-notepad-discard {
+  background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.14);
+  color: #e2e8f0; font-size: 13px; font-family: inherit; cursor: pointer;
+  padding: 7px 14px; border-radius: 18px;
+}
+.voice-notepad-recovery-actions button:hover,
+.voice-notepad-continue:hover:not(:disabled),
+.voice-notepad-discard:hover:not(:disabled) { background: rgba(255,255,255,0.12); }
+.voice-notepad-discard-draft,
+.voice-notepad-discard { color: #fca5a5; }
+.voice-notepad-review {
+  flex: 1; min-height: 0; width: 100%; max-width: 600px; z-index: 1;
+  display: flex; flex-direction: column; gap: 10px;
+  margin: 16px 0 0; overflow-y: auto;
+}
+.voice-notepad-review-title { color: #e2e8f0; font-size: 15px; font-weight: 600; }
+.voice-notepad-review-target { color: #a5f3fc; font-size: 13px; }
+.voice-notepad-review-label { display: flex; flex-direction: column; gap: 6px; color: #94a3b8; font-size: 12px; }
+.voice-notepad-review-instruction,
+.voice-notepad-review-transcript {
+  width: 100%; box-sizing: border-box; resize: vertical;
+  padding: 10px 12px; border-radius: 12px;
+  border: 1px solid rgba(56,189,248,0.15); background: rgba(15,23,42,0.6);
+  color: #e2e8f0; font-family: inherit; font-size: 15px; line-height: 1.6;
+}
+.voice-notepad-review-instruction { min-height: 72px; }
+.voice-notepad-review-transcript { min-height: 140px; flex: 1; }
+.voice-notepad-review-instruction:focus,
+.voice-notepad-review-transcript:focus { outline: none; border-color: rgba(56,189,248,0.35); }
+.voice-notepad-review-error { color: #fca5a5; font-size: 13px; }
+.btn-voice[data-notepad-draft="true"] { position: relative; }
+.btn-voice[data-notepad-draft="true"]::after {
+  content: ''; position: absolute; top: 3px; right: 3px;
+  width: 7px; height: 7px; border-radius: 50%;
+  background: #22d3ee; box-shadow: 0 0 6px rgba(34,211,238,0.8);
+}
 
 .btn-danger { background: linear-gradient(180deg, rgba(239,68,68,0.9), rgba(153,27,27,0.9)); border-color: rgba(248,113,113,0.42); color: white; }
 .btn-danger:hover:not(:disabled) { background: linear-gradient(180deg, rgba(248,113,113,0.96), rgba(185,28,28,0.96)); border-color: rgba(252,165,165,0.62); box-shadow: 0 0 14px rgba(239,68,68,0.22); }

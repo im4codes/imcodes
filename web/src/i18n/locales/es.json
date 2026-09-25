@@ -1283,7 +1283,21 @@
     "notepad": "Notas",
     "notepad_hint": "Transcribe una reunión hasta que la detengas y luego envíala a esta sesión para resumirla. Mantén la app abierta; la pantalla permanece encendida.",
     "notepad_send": "Enviar y resumir",
-    "notepad_summary_prompt": "A continuación hay una transcripción de una reunión o conversación grabada con entrada de voz. Resúmela: puntos clave, decisiones y tareas pendientes (con responsables si se mencionan). La transcripción puede contener errores de reconocimiento.\n\nTranscripción:"
+    "notepad_summary_instruction": "A continuación hay una transcripción de una reunión o conversación grabada con entrada de voz. Resúmela: puntos clave, decisiones y tareas pendientes (con responsables si se mencionan). La transcripción puede contener errores de reconocimiento.",
+    "notepad_transcript_label": "Transcripción:",
+    "notepad_transcript_attached": "La transcripción completa está en el archivo adjunto {{name}}.",
+    "notepad_review_title": "Revisar notas",
+    "notepad_review_target": "Enviar a: {{session}}",
+    "notepad_review_instruction": "Instrucción",
+    "notepad_review_transcript": "Transcripción",
+    "notepad_continue": "Seguir grabando",
+    "notepad_discard": "Descartar",
+    "notepad_discard_confirm": "¿Descartar estas notas? La transcripción se eliminará de este dispositivo y no se enviará nada.",
+    "notepad_draft_found": "Notas sin terminar de {{time}} ({{count}} caracteres)",
+    "notepad_resume": "Reanudar",
+    "notepad_sending": "Enviando…",
+    "notepad_send_failed": "No se pudo enviar. Las notas siguen guardadas en este dispositivo.",
+    "notepad_draft_indicator": "Notas de voz sin terminar guardadas en este dispositivo"
   },
   "p2p": {
     "final_original_request_reminder": "No te quedes solo en el resumen de la discusión. Después de sintetizarla, asegúrate de responder y ejecutar directamente la solicitud original del usuario.\nLa solicitud original del usuario es: \"{{request}}\"",

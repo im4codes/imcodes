@@ -3,12 +3,42 @@ import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import * as VoiceInput from './VoiceInput.js';
 import { holdScreenAwake } from '../screen-awake.js';
+import {
+  NOTEPAD_DRAFT_SAVE_INTERVAL_MS,
+  buildNotepadInlineMessage,
+  deleteVoiceNotepadDraft,
+  readVoiceNotepadDraft,
+  writeVoiceNotepadDraft,
+  type VoiceNotepadDraft,
+  type VoiceNotepadSegment,
+  type VoiceNotepadSendOutcome,
+  type VoiceNotepadSendRequest,
+} from '../voice-notepad.js';
 
 interface Props {
   open: boolean;
   onClose: () => void;
   onSend: (text: string) => 'accepted' | 'pending' | 'rejected';
   initialText?: string;
+  /**
+   * The session the overlay was opened from. Keys the notepad's local draft,
+   * so an unfinished notepad is only ever offered back in that session.
+   * Without it nothing is persisted.
+   */
+  draftScope?: string | null;
+  /** Shown in the review step as where the notepad will be sent. */
+  sessionLabel?: string;
+  /**
+   * Sends a reviewed notepad (instruction + transcript) through the
+   * composer, which decides inline message vs. Markdown attachment. Without
+   * it the notepad is sent inline through `onSend`.
+   */
+  onSendNotepad?: (request: VoiceNotepadSendRequest) => Promise<VoiceNotepadSendOutcome>;
+}
+
+interface NotepadReview {
+  instruction: string;
+  transcript: string;
 }
 
 const BAR_COUNT = 48;
@@ -29,7 +59,15 @@ function formatElapsed(ms: number): string {
   return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
 }
 
-export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
+export function VoiceOverlay({
+  open,
+  onClose,
+  onSend,
+  initialText,
+  draftScope,
+  sessionLabel,
+  onSendNotepad,
+}: Props) {
   const { t } = useTranslation();
   const [listening, setListening] = useState(false);
   const [hasText, setHasText] = useState(false);
@@ -59,6 +97,89 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
   const shortSegmentsRef = useRef(0);
   // Set when auto-restart gave up; only a user action re-arms it.
   const restartPausedRef = useRef(false);
+  // Crash-safe draft. The scope is read when the overlay opens; a notepad
+  // started (or resumed) in this opening keeps writing to it until it is sent
+  // or discarded -- after which nothing may write it back.
+  const draftScopeRef = useRef<string | null>(draftScope ?? null);
+  draftScopeRef.current = draftScope ?? null;
+  // The composer text this opening started from. A fresh notepad keeps it at
+  // the top of the transcript; an adopted draft must keep it too, or a send
+  // would clear composer text the user never saw in the overlay.
+  const initialTextRef = useRef('');
+  const draftActiveRef = useRef(false);
+  const draftSettledRef = useRef(false);
+  const draftStartedAtRef = useRef(0);
+  const draftSegmentsRef = useRef<VoiceNotepadSegment[]>([]);
+  const draftInstructionRef = useRef<string | undefined>(undefined);
+  const lastSavedDraftRef = useRef('');
+  // An unfinished notepad found for this session when the overlay opened.
+  const [recoverableDraft, setRecoverableDraft] = useState<VoiceNotepadDraft | null>(null);
+  // Review step: shown when a notepad stops or Send is tapped in notepad mode.
+  const [review, setReviewState] = useState<NotepadReview | null>(null);
+  const reviewRef = useRef<NotepadReview | null>(null);
+  const [sendingNotepad, setSendingNotepad] = useState(false);
+  const [notepadSendFailed, setNotepadSendFailed] = useState(false);
+
+  const setReview = useCallback((next: NotepadReview | null) => {
+    reviewRef.current = next;
+    setReviewState(next);
+  }, []);
+
+  /** Write the notepad as it stands now. No-op once sent or discarded. */
+  const saveDraft = useCallback(() => {
+    const scope = draftScopeRef.current;
+    if (!scope || !draftActiveRef.current || draftSettledRef.current) return;
+    const current = reviewRef.current;
+    const text = current ? current.transcript : (taRef.current?.value ?? '');
+    if (!text.trim()) return;
+    const instruction = current ? current.instruction : draftInstructionRef.current;
+    const fingerprint = JSON.stringify([text, instruction ?? null, draftSegmentsRef.current.length]);
+    if (fingerprint === lastSavedDraftRef.current) return;
+    // One unsent notepad per session. Another one already stored under this
+    // key (not yet answered, or written by a second window on the same
+    // session) is the user's data too, and is never overwritten.
+    const stored = readVoiceNotepadDraft(scope);
+    if (stored && stored.startedAt !== draftStartedAtRef.current) return;
+    if (writeVoiceNotepadDraft({
+      version: 1,
+      scope,
+      text,
+      ...(instruction !== undefined ? { instruction } : {}),
+      segments: draftSegmentsRef.current,
+      startedAt: draftStartedAtRef.current,
+      updatedAt: Date.now(),
+    })) {
+      lastSavedDraftRef.current = fingerprint;
+    }
+  }, []);
+
+  /** The notepad was sent or discarded: delete it and never write it again. */
+  const settleDraft = useCallback(() => {
+    draftSettledRef.current = true;
+    const scope = draftScopeRef.current;
+    if (scope) deleteVoiceNotepadDraft(scope);
+  }, []);
+
+  /** Start (or adopt) the draft this opening of the overlay writes to. */
+  const beginDraft = useCallback((from?: VoiceNotepadDraft) => {
+    draftActiveRef.current = true;
+    draftSettledRef.current = false;
+    lastSavedDraftRef.current = '';
+    draftStartedAtRef.current = from?.startedAt ?? Date.now();
+    draftSegmentsRef.current = from ? [...from.segments] : [];
+    draftInstructionRef.current = from?.instruction;
+  }, []);
+
+  /** Record the voice segment being committed, relative to the notepad start. */
+  const recordCommittedSegment = useCallback(() => {
+    if (!notepadRef.current || !draftActiveRef.current) return;
+    const ta = taRef.current;
+    const length = voiceLenRef.current;
+    if (!ta || length <= 0) return;
+    const text = ta.value.slice(insertPosRef.current, insertPosRef.current + length).trim();
+    if (!text) return;
+    draftSegmentsRef.current.push({ atMs: Math.max(0, Date.now() - draftStartedAtRef.current), text });
+  }, []);
 
   const setListeningState = useCallback((next: boolean) => {
     // stopListening() reports `false` synchronously while the effect is being
@@ -88,6 +209,7 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
     if (!open) { openRef.current = false; return; }
     openRef.current = true;
     const init = initialText ?? '';
+    initialTextRef.current = init;
     if (taRef.current) { taRef.current.value = init; taRef.current.focus(); }
     setHasText(!!init.trim());
     setMaxH('66vh');
@@ -98,6 +220,18 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
     setNotepadStartedAt(null);
     shortSegmentsRef.current = 0;
     restartPausedRef.current = false;
+    draftActiveRef.current = false;
+    draftSettledRef.current = false;
+    draftSegmentsRef.current = [];
+    draftInstructionRef.current = undefined;
+    lastSavedDraftRef.current = '';
+    reviewRef.current = null;
+    setReviewState(null);
+    setSendingNotepad(false);
+    setNotepadSendFailed(false);
+    const scope = draftScopeRef.current;
+    const recoverable = scope ? readVoiceNotepadDraft(scope) : null;
+    setRecoverableDraft(recoverable);
     insertPosRef.current = init.length;
     voiceLenRef.current = 0;
     sessionTokenRef.current++;
@@ -126,12 +260,16 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
     };
     vv?.addEventListener('resize', onResize);
 
-    // Start voice session at end of initial text (not 0)
+    // Start voice session at end of initial text (not 0). An unfinished
+    // notepad waits for the user's choice instead: dictation starting on its
+    // own would talk over the offer to resume it.
     clearAutoStartTimer();
-    autoStartTimerRef.current = setTimeout(() => {
-      autoStartTimerRef.current = null;
-      void startSession(init.length);
-    }, 150);
+    if (!recoverable) {
+      autoStartTimerRef.current = setTimeout(() => {
+        autoStartTimerRef.current = null;
+        void startSession(init.length);
+      }, 150);
+    }
     return () => {
       clearAutoStartTimer();
       clearRestartTimer();
@@ -216,8 +354,10 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
       return;
     }
     // Commit the finished segment; the next one appends after it.
+    recordCommittedSegment();
     insertPosRef.current += voiceLenRef.current;
     voiceLenRef.current = 0;
+    saveDraft();
     clearRestartTimer();
     restartTimerRef.current = setTimeout(() => {
       restartTimerRef.current = null;
@@ -238,9 +378,28 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
     await VoiceInput.stopListening();
     setListeningState(false);
     // Commit: advance insertPos past the committed voice text
+    recordCommittedSegment();
     insertPosRef.current += voiceLenRef.current;
     voiceLenRef.current = 0;
-  }, [setListeningState]);
+  }, [recordCommittedSegment, setListeningState]);
+
+  /**
+   * End the notepad and show what will be sent. Nothing leaves the device
+   * here; the draft is written so the review itself survives a crash.
+   */
+  const openReview = useCallback(async () => {
+    clearRestartTimer();
+    await commitAndStop();
+    if (!openRef.current) return;
+    setBars(Array(BAR_COUNT).fill(2));
+    barsRef.current = Array(BAR_COUNT).fill(2);
+    setNotepadSendFailed(false);
+    setReview({
+      instruction: draftInstructionRef.current ?? t('voice.notepad_summary_instruction'),
+      transcript: taRef.current?.value ?? '',
+    });
+    saveDraft();
+  }, [clearRestartTimer, commitAndStop, saveDraft, setReview, t]);
 
   /** Stop, commit, then restart at new cursor position */
   const restartAtCursor = useCallback(async (newPos: number) => {
@@ -249,6 +408,10 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
   }, [commitAndStop, startSession]);
 
   const handleToggle = useCallback(async () => {
+    if ((listeningRef.current || restartTimerRef.current) && notepadRef.current) {
+      await openReview();
+      return;
+    }
     if (listeningRef.current || restartTimerRef.current) {
       clearRestartTimer();
       await commitAndStop();
@@ -262,10 +425,20 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
       const pos = ta ? (ta.selectionStart ?? ta.value.length) : 0;
       void startSession(pos);
     }
-  }, [startSession, commitAndStop, clearAutoStartTimer, clearRestartTimer]);
+  }, [startSession, commitAndStop, clearAutoStartTimer, clearRestartTimer, openReview]);
 
   const handleNotepadToggle = useCallback(() => {
     const next = !notepadRef.current;
+    if (next && !draftActiveRef.current) {
+      // Starting fresh would write over this session's unsent notepad. It has
+      // to be resumed, sent or discarded first, so offer it instead.
+      const scope = draftScopeRef.current;
+      const unsent = scope ? readVoiceNotepadDraft(scope) : null;
+      if (unsent) {
+        setRecoverableDraft(unsent);
+        return;
+      }
+    }
     notepadRef.current = next;
     setNotepad(next);
     shortSegmentsRef.current = 0;
@@ -275,13 +448,14 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
       setNotepadStartedAt(null);
       return;
     }
-    setNotepadStartedAt(Date.now());
+    if (!draftActiveRef.current) beginDraft();
+    setNotepadStartedAt(draftStartedAtRef.current);
     setNow(Date.now());
     if (!listeningRef.current) {
       clearAutoStartTimer();
       void startSession(taRef.current?.value.length ?? 0);
     }
-  }, [clearAutoStartTimer, clearRestartTimer, startSession]);
+  }, [beginDraft, clearAutoStartTimer, clearRestartTimer, startSession]);
 
   // Elapsed-time clock while notepad mode is on.
   useEffect(() => {
@@ -292,30 +466,164 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
 
   // Keep the screen on during a notepad: a locked screen backgrounds the app
   // and the foreground recognizer stops.
+  const reviewing = review !== null;
   useEffect(() => {
-    if (!notepad || !open) return;
+    if (!notepad || !open || reviewing) return;
     return holdScreenAwake();
-  }, [notepad, open]);
+  }, [notepad, open, reviewing]);
+
+  // Crash-safe draft: write every few seconds while a notepad is recording or
+  // under review, and whenever the page is being hidden or torn down.
+  useEffect(() => {
+    if (!open || (!notepad && !reviewing)) return;
+    const id = setInterval(saveDraft, NOTEPAD_DRAFT_SAVE_INTERVAL_MS);
+    const onPageHide = () => saveDraft();
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') saveDraft();
+    };
+    window.addEventListener('pagehide', onPageHide);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      clearInterval(id);
+      window.removeEventListener('pagehide', onPageHide);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [open, notepad, reviewing, saveDraft]);
 
   const handleSend = useCallback(() => {
     const transcript = (taRef.current?.value ?? '').trim();
     if (!transcript) return;
-    const text = notepadRef.current ? `${t('voice.notepad_summary_prompt')}\n\n${transcript}` : transcript;
+    if (notepadRef.current) {
+      void openReview();
+      return;
+    }
     clearRestartTimer();
     sessionTokenRef.current++;
     VoiceInput.stopListening();
     setListeningState(false);
-    if (onSend(text) === 'accepted') onClose();
-  }, [onSend, onClose, setListeningState, clearRestartTimer, t]);
+    if (onSend(transcript) === 'accepted') {
+      // Notepad switched off and its text sent as ordinary dictation: that
+      // transcript has left, so it must not be offered again.
+      if (draftActiveRef.current) settleDraft();
+      onClose();
+    }
+  }, [onSend, onClose, openReview, setListeningState, clearRestartTimer, settleDraft]);
+
+  const handleReviewSend = useCallback(async () => {
+    const current = reviewRef.current;
+    if (!current || sendingNotepad) return;
+    const transcript = current.transcript.trim();
+    if (!transcript) return;
+    saveDraft();
+    setNotepadSendFailed(false);
+    if (!onSendNotepad) {
+      const text = buildNotepadInlineMessage(current.instruction, t('voice.notepad_transcript_label'), transcript);
+      if (onSend(text) === 'accepted') {
+        settleDraft();
+        onClose();
+      }
+      return;
+    }
+    setSendingNotepad(true);
+    let outcome: VoiceNotepadSendOutcome;
+    try {
+      outcome = await onSendNotepad({
+        instruction: current.instruction,
+        transcript,
+        onAccepted: settleDraft,
+      });
+    } catch {
+      outcome = 'rejected';
+    }
+    if (!openRef.current) return;
+    setSendingNotepad(false);
+    if (outcome === 'accepted') onClose();
+    else if (outcome === 'rejected') setNotepadSendFailed(true);
+  }, [onClose, onSend, onSendNotepad, saveDraft, sendingNotepad, settleDraft, t]);
+
+  const handleReviewDiscard = useCallback(() => {
+    if (!window.confirm(t('voice.notepad_discard_confirm'))) return;
+    settleDraft();
+    notepadRef.current = false;
+    onClose();
+  }, [onClose, settleDraft, t]);
+
+  /** Back from review to recording, keeping every edit made there. */
+  const handleReviewContinue = useCallback(() => {
+    const current = reviewRef.current;
+    if (!current) return;
+    draftInstructionRef.current = current.instruction;
+    const ta = taRef.current;
+    if (ta) {
+      ta.value = current.transcript;
+      setHasText(!!current.transcript.trim());
+    }
+    setReview(null);
+    notepadRef.current = true;
+    setNotepad(true);
+    shortSegmentsRef.current = 0;
+    restartPausedRef.current = false;
+    void startSession(ta?.value.length ?? 0);
+  }, [setReview, startSession]);
+
+  /** Adopt the unfinished notepad into this opening of the overlay. */
+  const adoptRecoverableDraft = useCallback((draft: VoiceNotepadDraft): string => {
+    setRecoverableDraft(null);
+    beginDraft(draft);
+    // Whatever the overlay sends clears the composer, so the composer text it
+    // opened with stays on screen above the recovered transcript -- the same
+    // place a fresh notepad keeps it -- unless the draft already starts with it.
+    const composerText = initialTextRef.current.trim();
+    const text = composerText && !draft.text.startsWith(composerText)
+      ? `${composerText}\n${draft.text}`
+      : draft.text;
+    const ta = taRef.current;
+    if (ta) ta.value = text;
+    setHasText(!!text.trim());
+    insertPosRef.current = text.length;
+    voiceLenRef.current = 0;
+    notepadRef.current = true;
+    setNotepad(true);
+    setNotepadStartedAt(draft.startedAt);
+    setNow(Date.now());
+    return text;
+  }, [beginDraft]);
+
+  const handleResumeDraft = useCallback((draft: VoiceNotepadDraft) => {
+    const text = adoptRecoverableDraft(draft);
+    shortSegmentsRef.current = 0;
+    restartPausedRef.current = false;
+    void startSession(text.length);
+  }, [adoptRecoverableDraft, startSession]);
+
+  const handleReviewRecoverableDraft = useCallback((draft: VoiceNotepadDraft) => {
+    const text = adoptRecoverableDraft(draft);
+    setNotepadSendFailed(false);
+    setReview({
+      instruction: draft.instruction ?? t('voice.notepad_summary_instruction'),
+      transcript: text,
+    });
+  }, [adoptRecoverableDraft, setReview, t]);
+
+  const handleDiscardRecoverableDraft = useCallback((draft: VoiceNotepadDraft) => {
+    if (!window.confirm(t('voice.notepad_discard_confirm'))) return;
+    deleteVoiceNotepadDraft(draft.scope);
+    setRecoverableDraft(null);
+    // What the user opened the overlay for: ordinary dictation.
+    void startSession(taRef.current?.value.length ?? 0);
+  }, [startSession, t]);
 
   const handleClose = useCallback(() => {
+    // Closing is neither sending nor discarding: the notepad stays on this
+    // device and is offered again the next time voice input opens here.
+    saveDraft();
     clearRestartTimer();
     notepadRef.current = false;
     sessionTokenRef.current++;
     VoiceInput.stopListening();
     setListeningState(false);
     onClose();
-  }, [onClose, setListeningState, clearRestartTimer]);
+  }, [onClose, saveDraft, setListeningState, clearRestartTimer]);
 
   /** User manually edited the textarea — commit voice zone and stop recognition */
   const handleInput = useCallback(() => {
@@ -366,6 +674,7 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
             class={`voice-notepad-toggle${notepad ? ' voice-notepad-toggle-active' : ''}`}
             aria-pressed={notepad}
             title={t('voice.notepad_hint')}
+            disabled={recoverableDraft !== null && !review}
             onClick={handleNotepadToggle}
           >
             📝 {t('voice.notepad')}
@@ -374,8 +683,85 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
         </div>
       </div>
 
+      {recoverableDraft && !review && (
+        <div class="voice-notepad-recovery" role="status">
+          <span class="voice-notepad-recovery-text">
+            {t('voice.notepad_draft_found', {
+              time: new Date(recoverableDraft.updatedAt).toLocaleString(),
+              count: recoverableDraft.text.length,
+            })}
+          </span>
+          <div class="voice-notepad-recovery-actions">
+            <button type="button" class="voice-notepad-resume" onClick={() => handleResumeDraft(recoverableDraft)}>
+              {t('voice.notepad_resume')}
+            </button>
+            <button type="button" class="voice-notepad-review-draft" onClick={() => handleReviewRecoverableDraft(recoverableDraft)}>
+              {t('voice.notepad_send')}
+            </button>
+            <button type="button" class="voice-notepad-discard-draft" onClick={() => handleDiscardRecoverableDraft(recoverableDraft)}>
+              {t('voice.notepad_discard')}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {review && (
+        <div class="voice-notepad-review">
+          <div class="voice-notepad-review-title">{t('voice.notepad_review_title')}</div>
+          {sessionLabel && (
+            <div class="voice-notepad-review-target">
+              {t('voice.notepad_review_target', { session: sessionLabel })}
+            </div>
+          )}
+          <label class="voice-notepad-review-label">
+            {t('voice.notepad_review_instruction')}
+            <textarea
+              class="voice-notepad-review-instruction"
+              spellcheck={false}
+              value={review.instruction}
+              onInput={(event) => setReview({
+                ...review,
+                instruction: (event.currentTarget as HTMLTextAreaElement).value,
+              })}
+            />
+          </label>
+          <label class="voice-notepad-review-label">
+            {t('voice.notepad_review_transcript')}
+            <textarea
+              class="voice-notepad-review-transcript"
+              spellcheck={false}
+              value={review.transcript}
+              onInput={(event) => setReview({
+                ...review,
+                transcript: (event.currentTarget as HTMLTextAreaElement).value,
+              })}
+            />
+          </label>
+          {notepadSendFailed && (
+            <div class="voice-notepad-review-error" role="alert">{t('voice.notepad_send_failed')}</div>
+          )}
+          <div class="voice-notepad-review-actions">
+            <button type="button" class="voice-notepad-continue" onClick={handleReviewContinue} disabled={sendingNotepad}>
+              {t('voice.notepad_continue')}
+            </button>
+            <button type="button" class="voice-notepad-discard" onClick={handleReviewDiscard} disabled={sendingNotepad}>
+              {t('voice.notepad_discard')}
+            </button>
+            <button
+              type="button"
+              class="voice-overlay-send voice-notepad-review-send"
+              onClick={() => { void handleReviewSend(); }}
+              disabled={sendingNotepad || !review.transcript.trim()}
+            >
+              <span>{sendingNotepad ? t('voice.notepad_sending') : t('voice.notepad_send')}</span>
+            </button>
+          </div>
+        </div>
+      )}
+
       <textarea
         ref={taRef}
+        style={review ? { display: 'none' } : undefined}
         class="voice-overlay-text"
         placeholder={t('voice.speak_now')}
         spellcheck={false}
@@ -386,7 +772,7 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
         onKeyUp={handleCursorChange}
       />
 
-      <div class="voice-overlay-controls">
+      <div class="voice-overlay-controls" style={review ? { display: 'none' } : undefined}>
         <div class="voice-waveform-bg">
           {bars.map((level, i) => {
             const h = 2 + level * 44;
