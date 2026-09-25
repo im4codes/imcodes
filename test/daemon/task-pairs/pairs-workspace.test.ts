@@ -25,6 +25,7 @@ import { TaskPairStore, getTaskPairStore, setTaskPairStoreForTests } from '../..
 import { resetTaskPairFocusForTests, setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
 import { taskPairService } from '../../../src/daemon/task-pairs/service.js';
 import {
+  releaseTaskPairWorkspace,
   resolveTaskPairTaskDir,
   resolveTaskPairWorksRoot,
   setTaskPairWorkspaceDepsForTests,
@@ -256,6 +257,68 @@ describe('pair workspaces', () => {
     expect(pair('D3').workspace?.status).toBe('removed');
   });
 
+  it('resets the retention clock when a terminal pair is reopened and ends again', async () => {
+    const plain = join(base, 'plain-project');
+    mkdirSync(plain);
+    useProject(plain);
+    const dir = await opened('REOPEN', 'auditor=none');
+    marker(BRAIN, '<!-- IMCODES_TASK CANCEL REOPEN -->');
+    const firstEnd = await endedAt('REOPEN');
+    expect(pair('REOPEN').workspace).toMatchObject({ status: 'ended', endedAt: firstEnd });
+
+    // A Brain DISPATCH marker is the supported way to reopen a cancelled pair.
+    // It changes the terminal status directly and does not call ensureWorkspace
+    // (the slot_changed intent only runs the queue), so marker ingestion itself
+    // must clear the old endedAt before the next termination.
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH REOPEN executor=${EXEC} auditor=none -->`);
+    await vi.waitFor(() => expect(pair('REOPEN').workspace?.status).toBe('active'));
+    expect(pair('REOPEN').workspace?.endedAt).toBeUndefined();
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    marker(BRAIN, '<!-- IMCODES_TASK CANCEL REOPEN -->');
+    const secondEnd = await endedAt('REOPEN');
+    expect(secondEnd).toBeGreaterThan(firstEnd);
+    expect(pair('REOPEN').workspace?.endedAt).toBe(secondEnd);
+    expect(existsSync(dir)).toBe(true);
+    await taskPairService.sweepWorkspaces(firstEnd + TASK_PAIR_WORKSPACE_RETENTION_MS, { force: true });
+    expect(pair('REOPEN').workspace?.status).toBe('ended');
+    expect(existsSync(dir)).toBe(true);
+    await taskPairService.sweepWorkspaces(secondEnd + TASK_PAIR_WORKSPACE_RETENTION_MS, { force: true });
+    expect(pair('REOPEN').workspace?.status).toBe('removed');
+  });
+
+  it('does not remove a workspace when its last-moment ownership check observes a reopen', async () => {
+    const plain = join(base, 'plain-project');
+    mkdirSync(plain);
+    useProject(plain);
+    const dir = await opened('RACE', 'auditor=none');
+    marker(BRAIN, '<!-- IMCODES_TASK CANCEL RACE -->');
+    const at = await endedAt('RACE');
+    const state = pair('RACE');
+    const result = await releaseTaskPairWorkspace(state, {
+      beforeRemove: () => {
+        // Model the reopen winning the race immediately before rm().
+        getTaskPairStore().savePair(PROJECT, {
+          ...state,
+          status: 'working',
+          workspace: { ...state.workspace!, status: 'active', endedAt: undefined },
+        });
+        return false;
+      },
+    });
+    expect(result).toEqual({ action: 'skipped' });
+    expect(existsSync(dir)).toBe(true);
+    expect(pair('RACE').workspace?.status).toBe('active');
+    // Keep the fixture's state coherent for teardown and prove a valid old
+    // terminal workspace is still removable after the reopen has ended it.
+    getTaskPairStore().savePair(PROJECT, {
+      ...pair('RACE'),
+      status: 'cancelled',
+      workspace: { ...pair('RACE').workspace!, status: 'ended', endedAt: at },
+    });
+    await taskPairService.sweepWorkspaces(at + TASK_PAIR_WORKSPACE_RETENTION_MS, { force: true });
+    expect(pair('RACE').workspace?.status).toBe('removed');
+  });
+
   it('in a project without a remote, removes a clean worktree at its base and keeps one with an executor commit', async () => {
     git(project, 'remote', 'remove', 'origin');
     const cleanPath = await opened('N1');
@@ -395,6 +458,26 @@ describe('pair workspaces', () => {
       await vi.waitFor(() => expect(sentTo(BRAIN, 'brain-output-failed')).toHaveLength(2), { timeout: 10_000 });
       expect(existsSync(join(base, 'escaped.txt'))).toBe(false);
       expect(workspaceEvents('O4')).toEqual([expect.objectContaining({ attrs: expect.objectContaining({ reason: 'outside_project' }) })]);
+    });
+
+    it('refuses a destination whose existing parent symlink escapes the project', async () => {
+      const outside = join(base, 'outside');
+      mkdirSync(outside);
+      const link = join(plain, 'linked');
+      try {
+        await import('node:fs/promises').then(({ symlink }) => symlink(outside, link, 'dir'));
+      } catch {
+        return;
+      }
+      const dir = await opened('O-SYMLINK', 'auditor=none');
+      writeFileSync(join(dir, 'draft.md'), 'must stay in workspace\n');
+      marker(EXEC, '<!-- IMCODES_TASK DONE O-SYMLINK output=draft.md dest=linked/escaped.md -->');
+      await vi.waitFor(() => expect(sentTo(BRAIN, 'brain-output-failed')).toHaveLength(1), { timeout: 10_000 });
+      expect(existsSync(join(outside, 'escaped.md'))).toBe(false);
+      expect(workspaceEvents('O-SYMLINK')).toEqual([expect.objectContaining({
+        effect: TASK_PAIR_WORKSPACE_EFFECTS.OUTPUT_FAILED,
+        attrs: expect.objectContaining({ reason: 'outside_project' }),
+      })]);
     });
 
     it('copies nothing for temporary work (plain DONE, or CANCEL)', async () => {

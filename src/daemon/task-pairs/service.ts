@@ -191,7 +191,23 @@ export class TaskPairService {
     if (!recorded) return { effect: 'replayed', unusual: false, intents: [] };
     let stored: StoredTaskPair | undefined = existing;
     if (transition.pair) {
-      stored = store.savePair(input.project, transition.pair, {
+      // Any marker that reopens a terminal pair (STARTED/WORKING/QUEUE,
+      // READY_FOR_AUDIT, or a new verdict) must also reopen its retained
+      // workspace. These paths do not pass through ensureWorkspace, so clear
+      // the old retention timestamp here before the next terminal transition.
+      const reopensWorkspace = existing?.state.workspace
+        && existing.state.workspace.status !== 'removed'
+        && isTerminalTaskPairStatus(existing.state.status)
+        && transition.toStatus !== undefined
+        && !isTerminalTaskPairStatus(transition.toStatus);
+      const workspace = transition.pair.workspace;
+      const pairToSave = reopensWorkspace && workspace
+        ? {
+            ...transition.pair,
+            workspace: { ...workspace, status: 'active' as const, endedAt: undefined, keptReason: undefined },
+          }
+        : transition.pair;
+      stored = store.savePair(input.project, pairToSave, {
         liveness: this.#livenessAfterMarker(existing?.liveness, transition, role, now),
       });
     }
@@ -431,7 +447,12 @@ export class TaskPairService {
     if (current.workspace && current.workspace.status !== 'removed') {
       if (current.workspace.status === 'active') return current;
       const { endedAt: _endedAt, keptReason: _keptReason, ...workspace } = current.workspace;
-      const reopened: TaskPairState = { ...current, workspace: { ...workspace, status: 'active' } };
+      // A reopen starts a fresh retention window; the next terminal transition
+      // must not inherit the previous terminal timestamp or keep reason.
+      const reopened: TaskPairState = {
+        ...current,
+        workspace: { ...workspace, status: 'active', endedAt: undefined, keptReason: undefined },
+      };
       store.savePair(project, reopened);
       return reopened;
     }
@@ -466,16 +487,26 @@ export class TaskPairService {
   async endWorkspace(project: string, taskId: string, now: number): Promise<void> {
     const store = getTaskPairStore();
     const pair = store.getPair(project, taskId)?.state;
-    if (!pair) return;
+    // Ending is scheduled after the marker is persisted.  A Brain can reopen
+    // the pair before this asynchronous continuation runs; never apply the
+    // old terminal transition to that new open state.
+    if (!pair || !isTerminalTaskPairStatus(pair.status) || pair.updatedAt !== now) return;
     try {
       let next = pair;
-      if (pair.workspace?.status === 'active') {
+      if (pair.workspace && pair.workspace.status !== 'removed') {
         next = { ...pair, workspace: { ...pair.workspace, status: 'ended', endedAt: now } };
         store.savePair(project, next);
       }
       if (next.status !== 'done' || !next.output) return;
+      const beforeCopy = store.getPair(project, taskId)?.state;
+      if (!beforeCopy || !isTerminalTaskPairStatus(beforeCopy.status)
+        || beforeCopy.updatedAt !== now || beforeCopy.workspace?.endedAt !== now) return;
       const copied = await copyTaskPairOutput(next);
-      const latest = store.getPair(project, taskId)?.state ?? next;
+      // Reopening can happen while the copy is in flight.  Do not publish a
+      // stale workspace event or notify Brain for a newer pair generation.
+      const latest = store.getPair(project, taskId)?.state;
+      if (!latest || !isTerminalTaskPairStatus(latest.status)
+        || latest.updatedAt !== now || latest.workspace?.endedAt !== now) return;
       const effect = copied.ok ? TASK_PAIR_WORKSPACE_EFFECTS.OUTPUT_SAVED : TASK_PAIR_WORKSPACE_EFFECTS.OUTPUT_FAILED;
       this.#recordWorkspaceEvent(project, latest, effect, {
         output: next.output.path,
@@ -504,8 +535,18 @@ export class TaskPairService {
       if (!workspace || !isTerminalTaskPairStatus(pair.status)) continue;
       if (now - (workspace.endedAt ?? pair.updatedAt) < TASK_PAIR_WORKSPACE_RETENTION_MS) continue;
       try {
-        const released = await releaseTaskPairWorkspace(pair);
-        if (released.action === 'absent') continue;
+        const releaseDeps = {
+          beforeRemove: () => {
+            const current = store.getPair(stored.project, pair.taskId)?.state;
+            return Boolean(current?.workspace
+              && (current.workspace.status === 'ended' || current.workspace.status === 'kept')
+              && isTerminalTaskPairStatus(current.status)
+              && current.workspace.endedAt === workspace.endedAt
+              && now - (current.workspace.endedAt ?? current.updatedAt) >= TASK_PAIR_WORKSPACE_RETENTION_MS);
+          },
+        };
+        const released = await releaseTaskPairWorkspace(pair, releaseDeps);
+        if (released.action === 'absent' || released.action === 'skipped') continue;
         const latest = store.getPair(stored.project, pair.taskId)?.state ?? pair;
         if (!latest.workspace || !isTerminalTaskPairStatus(latest.status)) continue;
         const firstKeep = released.action === 'kept' && latest.workspace.status !== 'kept';

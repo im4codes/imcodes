@@ -19,8 +19,9 @@
  */
 import { execFile } from 'node:child_process';
 import { cp, lstat, mkdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { rmSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { getSession } from '../../store/session-store.js';
 import {
   TASK_PAIR_WORKS_DIR,
@@ -71,6 +72,8 @@ export type TaskPairWorkspaceProvision =
 export type TaskPairWorkspaceRelease =
   | { action: 'removed' }
   | { action: 'absent' }
+  /** The pair changed while release was in flight; nothing was removed. */
+  | { action: 'skipped' }
   | { action: 'kept'; reason: 'dirty' | 'untracked' | 'unpushed' | 'locked' | 'unreadable' };
 
 export type TaskPairOutputCopy =
@@ -81,6 +84,23 @@ export interface TaskPairWorkspaceDeps {
   env?: NodeJS.ProcessEnv;
   projectRootOf?: (pair: TaskPairState) => string | undefined;
   inspectGit?: (repoPath: string) => Promise<SupervisionWorktreeGitInspection>;
+  /** Re-check ownership/liveness immediately before deleting the workspace. */
+  beforeRemove?: () => boolean | Promise<boolean>;
+}
+
+function allowWorkspaceRemoval(deps: TaskPairWorkspaceDeps): boolean | Promise<boolean> {
+  if (!deps.beforeRemove) return true;
+  // Keep synchronous checks synchronous: the service's ownership check reads
+  // the same in-process store, and yielding between it and rmSync() would
+  // re-open a window where a marker can win the race after the final check.
+  const result = deps.beforeRemove();
+  if (typeof result === 'boolean') return result;
+  return result;
+}
+
+async function removalAllowed(deps: TaskPairWorkspaceDeps): Promise<boolean> {
+  const result = allowWorkspaceRemoval(deps);
+  return typeof result === 'boolean' ? result : await result;
 }
 
 let testDeps: TaskPairWorkspaceDeps | undefined;
@@ -161,7 +181,12 @@ export async function releaseTaskPairWorkspace(
   const workspace = pair.workspace;
   if (!workspace) return { action: 'absent' };
   if (workspace.kind === 'dir') {
-    await rm(workspace.path, { recursive: true, force: true });
+    const allowed = allowWorkspaceRemoval(deps);
+    if (typeof allowed === 'boolean' ? !allowed : !(await allowed)) return { action: 'skipped' };
+    // A plain task directory has no git bookkeeping to settle.  Delete it
+    // synchronously after the ownership check so a reopen cannot interleave
+    // between the check and the filesystem mutation.
+    rmSync(workspace.path, { recursive: true, force: true });
     return { action: 'removed' };
   }
   const repoPath = workspace.path;
@@ -180,6 +205,7 @@ export async function releaseTaskPairWorkspace(
   // detached worktree; a pushed branch, or an untouched base, would not.
   const unpushed = workspace.base ? await countTaskPairUnpushedCommits(repoPath, workspace.base) : undefined;
   if (unpushed === undefined || unpushed > 0) return { action: 'kept', reason: 'unpushed' };
+  if (!(await removalAllowed(deps))) return { action: 'skipped' };
   if (!(await removeRegisteredGitWorktree(inspection, repoPath))) return { action: 'kept', reason: 'unreadable' };
   await rm(assignmentRoot, { recursive: true, force: true });
   return { action: 'removed' };
@@ -228,7 +254,21 @@ export async function copyTaskPairOutput(
   const destRelative = pair.output.dest ?? relative(workspaceRoot, source);
   const wanted = resolve(projectReal, destRelative);
   if (!isInside(projectReal, wanted)) return { ok: false, reason: 'outside_project' };
-  const dest = await freeDestination(wanted, pair.taskId);
+  // Lexical containment is insufficient when an existing destination parent is
+  // a symlink. Resolve the nearest existing parent and rebuild below its real
+  // path before creating anything.
+  let existingParent = dirname(wanted);
+  while (!(await lstat(existingParent).catch(() => undefined))) {
+    const parent = dirname(existingParent);
+    if (parent === existingParent) return { ok: false, reason: 'outside_project' };
+    existingParent = parent;
+  }
+  const existingParentReal = await realpath(existingParent).catch(() => undefined);
+  if (!existingParentReal || (existingParentReal !== projectReal && !isInside(projectReal, existingParentReal))) return { ok: false, reason: 'outside_project' };
+  const wantedParentRelative = relative(existingParent, dirname(wanted));
+  const safeWanted = resolve(existingParentReal, wantedParentRelative, basename(wanted));
+  if (!isInside(projectReal, safeWanted)) return { ok: false, reason: 'outside_project' };
+  const dest = await freeDestination(safeWanted, pair.taskId);
   if (!dest) return { ok: false, reason: 'exists' };
   try {
     await mkdir(dirname(dest), { recursive: true });
