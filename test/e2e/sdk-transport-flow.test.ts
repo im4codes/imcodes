@@ -378,7 +378,7 @@ vi.mock('../../src/agent/tmux.js', () => ({
   getPaneStartCommand: vi.fn().mockResolvedValue(''),
   cleanupOrphanFifos: vi.fn().mockResolvedValue(undefined), BACKEND: 'tmux',
 }));
-vi.mock('../../src/daemon/jsonl-watcher.js', () => ({ startWatching: vi.fn(), startWatchingFile: vi.fn(), ensureClaudeSessionFile: vi.fn(), preClaimFile: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false), findJsonlPathBySessionId: vi.fn() }));
+vi.mock('../../src/daemon/jsonl-watcher.js', () => ({ startWatching: vi.fn(), startWatchingFile: vi.fn(), ensureClaudeSessionFile: vi.fn(), preClaimFile: vi.fn(), reserveSessionFile: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false), findJsonlPathBySessionId: vi.fn() }));
 vi.mock('../../src/daemon/codex-watcher.js', () => ({ startWatching: vi.fn(), startWatchingSpecificFile: vi.fn(), startWatchingById: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false), isFileClaimedByOther: vi.fn(() => false), findRolloutPathByUuid: vi.fn(async () => null) }));
 vi.mock('../../src/daemon/gemini-watcher.js', () => ({ startWatching: vi.fn(), startWatchingLatest: vi.fn(), startWatchingDiscovered: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false) }));
 vi.mock('../../src/daemon/opencode-watcher.js', () => ({ startWatching: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false) }));

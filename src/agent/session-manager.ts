@@ -54,7 +54,7 @@ import {
   resourceOwnerEnv,
 } from '../daemon/session-resource-service.js';
 import { emitSessionInlineError } from '../daemon/session-error.js';
-import { startWatching, startWatchingFile, stopWatching, isWatching, findJsonlPathBySessionId } from '../daemon/jsonl-watcher.js';
+import { startWatching, startWatchingFile, stopWatching, isWatching, findJsonlPathBySessionId, reserveSessionFile } from '../daemon/jsonl-watcher.js';
 import { startWatching as startCodexWatching, startWatchingSpecificFile as startCodexWatchingFile, startWatchingById as startCodexWatchingById, stopWatching as stopCodexWatching, isWatching as isCodexWatching, findRolloutPathByUuid } from '../daemon/codex-watcher.js';
 import { startWatching as startGeminiWatching, startWatchingLatest as startGeminiWatchingLatest, stopWatching as stopGeminiWatching, isWatching as isGeminiWatching } from '../daemon/gemini-watcher.js';
 import { startWatching as startOpenCodeWatching, stopWatching as stopOpenCodeWatching, isWatching as isOpenCodeWatching } from '../daemon/opencode-watcher.js';
@@ -218,6 +218,14 @@ function startStructuredWatcher(
     startOpenCodeWatching(name, projectDir, ids?.opencodeSessionId).catch((e) =>
       logger.warn({ err: e, session: name }, 'opencode-watcher start failed'),
     );
+  } else if (agentType === 'claude-code-sdk' && ids?.ccSessionId) {
+    // claude-code-sdk sessions get their structured events from the provider
+    // stream, not from tailing a JSONL file — no jsonl-watcher is started for
+    // them. The underlying claude binary still writes a transcript to disk
+    // under this ccSessionId, though, so it must be reserved: otherwise a
+    // DIFFERENT (possibly stopped/misdirected) session's directory-scan or
+    // rotation poll sees an unclaimed file and freely adopts it.
+    reserveSessionFile(name, ids.ccSessionId);
   }
 }
 
@@ -580,6 +588,18 @@ export async function restoreFromStore(): Promise<void> {
   const all = storeSessions();
   const live = await tmuxListSessions();
 
+  // Reserve every known Claude session transcript UUID up front, before any
+  // watcher starts polling. This covers claude-code-sdk (transport) sessions,
+  // which never call startWatching/startWatchingFile themselves but still
+  // have a JSONL transcript on disk — without an explicit reservation here,
+  // another session's directory-scan/rotation logic (e.g. a stopped
+  // sub-session whose watcher gets restarted below) can freely adopt it.
+  for (const s of all) {
+    if ((s.agentType === 'claude-code' || s.agentType === 'claude-code-sdk') && s.ccSessionId) {
+      reserveSessionFile(s.name, s.ccSessionId);
+    }
+  }
+
   // 1. Restart store sessions missing from tmux; start jsonl-watcher for live ones
   logger.debug({ totalSessions: all.length, liveTmux: live.length }, 'restoreFromStore: starting reconciliation');
   for (const s of all) {
@@ -590,6 +610,14 @@ export async function restoreFromStore(): Promise<void> {
     // Sub-sessions (deck_sub_*): skip restart/respawn (managed by rebuildSubSessions),
     // but still restore watchers if the tmux session is alive.
     if (s.name.startsWith('deck_sub_')) {
+      // A sub-session already marked stopped must never get its watcher
+      // restarted just because the tmux artifact (e.g. remain-on-exit)
+      // still exists — tmux liveness alone is not the source of truth once
+      // the session has been explicitly retired.
+      if (s.state === 'stopped') {
+        logger.debug({ session: s.name }, 'restoreFromStore: sub-session already stopped, skipping watcher restart');
+        continue;
+      }
       const isLive = live.includes(s.name);
       logger.info({ session: s.name, agentType: s.agentType, isLive, codexSessionId: s.codexSessionId ?? null }, 'Restoring sub-session watcher');
       if (!isLive) {

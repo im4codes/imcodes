@@ -34,6 +34,8 @@ vi.mock('../../src/util/model-context.js', () => ({
 import {
   startWatching, startWatchingFile, stopWatching, isWatching,
   watcherStatus, claudeProjectDir, preClaimFile, emitRecentHistory,
+  reserveSessionFile, refreshTrackedSession,
+  ownerForTests, excludedFileIdsForTests, activeFileForTests,
 } from '../../src/daemon/jsonl-watcher.js';
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -183,6 +185,9 @@ beforeEach(async () => {
 afterEach(async () => {
   stopWatching('test_session');
   stopWatching('test_session_2');
+  stopWatching('other_session');
+  stopWatching('rogue_session');
+  stopWatching('brain_sdk_session');
   await rm(testDir, { recursive: true, force: true }).catch(() => {});
 });
 
@@ -795,6 +800,116 @@ describe('claim management', () => {
 
     stopWatching('test_session');
     expect(isWatching('test_session')).toBe(false);
+  });
+
+  it('registerOwnership never overwrites an existing different owner', () => {
+    const filePath = join(testDir, 'owner-test.jsonl');
+    preClaimFile('test_session', filePath);
+    expect(ownerForTests(filePath)).toBe('test_session');
+
+    // A second, different session trying to pre-claim the same path must be refused.
+    preClaimFile('test_session_2', filePath);
+    expect(ownerForTests(filePath)).toBe('test_session');
+  });
+});
+
+// ── Stopped-watcher / non-watched session file reservation ─────────────────
+
+describe('reserveSessionFile — protects non-watched (e.g. claude-code-sdk) session files', () => {
+  it('a watcher never adopts a file reserved for another session, even when it looks newest', async () => {
+    const sdkFile = join(testDir, 'sdk-owned.jsonl');
+    await writeFile(sdkFile, assistantText('sdk transcript'));
+    // Simulates session-manager registering a claude-code-sdk session's
+    // transcript before any jsonl-watcher for it ever runs.
+    reserveSessionFile('brain_sdk_session', 'sdk-owned');
+
+    const ownFile = join(testDir, 'rogue-own.jsonl');
+    await writeFile(ownFile, assistantText('rogue'));
+    // No ccSessionId — directory-scan mode, exactly like the reported bug
+    // (a stopped sub-session's watcher with a stale/missing ccSessionId).
+    await startWatchingFile('test_session', ownFile);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(watcherStatus('test_session')).toBe('active');
+    expect(activeFileForTests('test_session')).toBe(ownFile);
+
+    // Make the reserved SDK file look newest, then force a rotation-check poll.
+    await new Promise((r) => setTimeout(r, 10));
+    await appendFile(sdkFile, assistantText('sdk transcript, newer'));
+    await refreshTrackedSession('test_session');
+
+    // Must still be reserved for the SDK session, and never adopted.
+    expect(ownerForTests(sdkFile)).toBe('brain_sdk_session');
+    expect(activeFileForTests('test_session')).toBe(ownFile);
+    expect(excludedFileIdsForTests('test_session')).toContain('sdk-owned');
+  });
+
+  it('reserveSessionFile does not overwrite an existing different reservation', () => {
+    reserveSessionFile('brain_sdk_session', 'shared-uuid');
+    reserveSessionFile('other_session', 'shared-uuid');
+    expect(ownerForTests(join(testDir, 'shared-uuid.jsonl'))).toBe('brain_sdk_session');
+  });
+
+  it('stopWatching releases a reservation even though no watcher was ever started for it', () => {
+    reserveSessionFile('brain_sdk_session', 'released-uuid');
+    expect(ownerForTests(join(testDir, 'released-uuid.jsonl'))).toBe('brain_sdk_session');
+
+    stopWatching('brain_sdk_session');
+    expect(ownerForTests(join(testDir, 'released-uuid.jsonl'))).toBeUndefined();
+  });
+});
+
+// ── Flip-flop protection (permanent per-watcher exclusion) ─────────────────
+
+describe('flip-flop protection', () => {
+  it('permanently excludes a file once proven to belong to another session — no repeated re-adoption attempts', async () => {
+    const ownFile = join(testDir, 'my-own.jsonl');
+    const otherFile = join(testDir, 'owned-by-other.jsonl');
+    await writeFile(ownFile, assistantText('mine'));
+    await writeFile(otherFile, assistantText('theirs'));
+    preClaimFile('other_session', otherFile);
+
+    await startWatchingFile('test_session', ownFile);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(watcherStatus('test_session')).toBe('active');
+
+    // Round 1: make the other session's file look newer — rotation would
+    // normally prefer it. The claim conflict must be detected and recorded.
+    await new Promise((r) => setTimeout(r, 10));
+    await appendFile(otherFile, assistantText('theirs, newer'));
+    await refreshTrackedSession('test_session');
+
+    expect(excludedFileIdsForTests('test_session')).toEqual(['owned-by-other']);
+    expect(activeFileForTests('test_session')).toBe(ownFile);
+
+    // Round 2: touch it again — must not flip back onto it, and the
+    // exclusion set must not grow (still permanently excluded, not re-tested).
+    await new Promise((r) => setTimeout(r, 10));
+    await appendFile(otherFile, assistantText('theirs, newer still'));
+    await refreshTrackedSession('test_session');
+
+    expect(excludedFileIdsForTests('test_session')).toEqual(['owned-by-other']);
+    expect(activeFileForTests('test_session')).toBe(ownFile);
+  });
+
+  it("never permanently excludes a watcher's own ccSessionId file — a transient conflict on it must stay retryable", async () => {
+    // Simulate a race: another session's claim already landed on the exact
+    // path/UUID this session designates as its OWN file before this
+    // session's watcher got to it. preClaimFile/registerOwnership refuse to
+    // steal it, so activateFile sets activeFile but the claim never
+    // actually transfers — the next drain must detect and release it
+    // WITHOUT excluding this watcher's own ccSessionId forever.
+    const ownFile = join(testDir, 'my-uuid.jsonl');
+    await writeFile(ownFile, assistantText('mine'));
+    preClaimFile('rogue_session', ownFile);
+
+    await startWatchingFile('test_session', ownFile, 'my-uuid');
+    await refreshTrackedSession('test_session');
+
+    expect(activeFileForTests('test_session')).toBeNull();
+    expect(excludedFileIdsForTests('test_session')).not.toContain('my-uuid');
+    expect(excludedFileIdsForTests('test_session')).toEqual([]);
+
+    stopWatching('rogue_session');
   });
 });
 

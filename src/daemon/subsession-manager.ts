@@ -639,27 +639,34 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
       await startSubSession({ ...sub, ccPreset: rebuildCcPreset }).catch(() => {});
     } else {
       const stored = existing ?? getSession(sessionName);
+      // A sub-session already marked stopped must never have its watcher
+      // (re)started here just because its tmux artifact still exists on
+      // disk (e.g. remain-on-exit) — rebuildSubSessions is replayed on every
+      // server reconnect, so without this guard a stopped sub-session's
+      // watcher gets restarted repeatedly, free to adopt another live
+      // session's file via directory scan.
+      const isStoppedSubSession = stored?.state === 'stopped';
       const effectiveCcSessionId = sub.ccSessionId ?? stored?.ccSessionId;
-      if (sub.type === 'claude-code' && effectiveCcSessionId && sub.cwd && !isWatching(sessionName)) {
+      if (!isStoppedSubSession && sub.type === 'claude-code' && effectiveCcSessionId && sub.cwd && !isWatching(sessionName)) {
         // Pre-claim before seed creation to prevent main session's watchDir from stealing the file
         preClaimFile(sessionName, findJsonlPathBySessionId(sub.cwd, effectiveCcSessionId));
         await ensureClaudeSessionFile(effectiveCcSessionId, sub.cwd).catch((e) =>
           logger.warn({ err: e, sessionName, ccSessionId: effectiveCcSessionId }, 'Failed to ensure Claude seed session file during sub-session rebuild'),
         );
         startWatchingFile(sessionName, findJsonlPathBySessionId(sub.cwd, effectiveCcSessionId));
-      } else if (sub.type === 'codex' && !isCodexWatching(sessionName)) {
+      } else if (!isStoppedSubSession && sub.type === 'codex' && !isCodexWatching(sessionName)) {
         const effectiveCodexId = sub.codexSessionId ?? stored?.codexSessionId;
         if (effectiveCodexId && !isFileClaimedByOther(sessionName, effectiveCodexId)) {
           startWatchingById(sessionName, effectiveCodexId, sub.codexModel ?? undefined);
         }
-      } else if (sub.type === 'gemini' && !isGeminiWatching(sessionName)) {
+      } else if (!isStoppedSubSession && sub.type === 'gemini' && !isGeminiWatching(sessionName)) {
         const effectiveGeminiId = sub.geminiSessionId ?? stored?.geminiSessionId;
         if (effectiveGeminiId) {
           startGeminiWatching(sessionName, effectiveGeminiId);
         } else if (sub._fileSnapshot) {
           startGeminiWatchingDiscovered(sessionName, sub._fileSnapshot, sub._onGeminiDiscovered);
         }
-      } else if (sub.type === 'opencode') {
+      } else if (!isStoppedSubSession && sub.type === 'opencode') {
         const { startWatching: startOpenCodeWatching, isWatching: isOpenCodeWatching } = await import('./opencode-watcher.js');
         const effectiveOpenCodeId = sub.opencodeSessionId ?? stored?.opencodeSessionId;
         if (sub.cwd && effectiveOpenCodeId && !isOpenCodeWatching(sessionName)) {

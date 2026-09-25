@@ -52,6 +52,7 @@ vi.mock('../../src/store/session-store.js', () => ({
 }));
 
 vi.mock('../../src/daemon/jsonl-watcher.js', () => ({
+  reserveSessionFile: vi.fn(),
   startWatchingFile: startWatchingFileMock,
   startWatching: startWatchingMock,
   stopWatching: jsonlStopWatchingMock,
@@ -1029,5 +1030,87 @@ describe('rebuildSubSessions — geminiSessionId preserved', () => {
       sessionInstanceId: 'logical-stable',
       runtimeEpoch: 'runtime-stable',
     }));
+  });
+});
+
+// ── rebuildSubSessions: never restarts a stopped sub-session's watcher ──────
+// Regression: rebuildSubSessions is replayed on every server reconnect and
+// only checked tmux (sessionExists), never the persisted `state`. A
+// sub-session already marked 'stopped' — whose tmux artifact (remain-on-exit)
+// still exists — got its jsonl-watcher restarted on every reconnect, free to
+// adopt another live session's file via directory scan.
+
+describe('rebuildSubSessions — never restarts a stopped sub-session watcher', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sessionExistsMock.mockResolvedValue(true);
+    isWatchingMock.mockReturnValue(false);
+    codexIsWatchingMock.mockReturnValue(false);
+    geminiIsWatchingMock.mockReturnValue(false);
+  });
+
+  it('does not call startWatchingFile for a claude-code sub-session marked state=stopped', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_sub_5907196l',
+      agentType: 'claude-code',
+      ccSessionId: 'stale-sub-uuid',
+      state: 'stopped',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1000,
+    });
+
+    await rebuildSubSessions([{
+      id: '5907196l',
+      type: 'claude-code',
+      cwd: '/proj',
+      ccSessionId: 'stale-sub-uuid',
+    } as Parameters<typeof rebuildSubSessions>[0][number]]);
+
+    expect(startWatchingFileMock).not.toHaveBeenCalled();
+    // Metadata normalization still runs — this is a watcher-only guard.
+    expect(upsertSessionMock).toHaveBeenCalled();
+  });
+
+  it('does not call codex startWatchingById for a codex sub-session marked state=stopped', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_sub_codexstopped',
+      agentType: 'codex',
+      codexSessionId: 'stale-codex-uuid',
+      state: 'stopped',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1000,
+    });
+
+    await rebuildSubSessions([{
+      id: 'codexstopped',
+      type: 'codex',
+      cwd: '/proj',
+      codexSessionId: 'stale-codex-uuid',
+    } as Parameters<typeof rebuildSubSessions>[0][number]]);
+
+    expect(codexStartWatchingByIdMock).not.toHaveBeenCalled();
+  });
+
+  it('still restarts the watcher for a live (non-stopped) claude-code sub-session', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_sub_5907196l',
+      agentType: 'claude-code',
+      ccSessionId: 'live-sub-uuid',
+      state: 'running',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1000,
+    });
+
+    await rebuildSubSessions([{
+      id: '5907196l',
+      type: 'claude-code',
+      cwd: '/proj',
+      ccSessionId: 'live-sub-uuid',
+    } as Parameters<typeof rebuildSubSessions>[0][number]]);
+
+    expect(startWatchingFileMock).toHaveBeenCalledWith('deck_sub_5907196l', expect.stringContaining('live-sub-uuid'));
   });
 });

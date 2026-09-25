@@ -204,6 +204,14 @@ interface WatcherState {
    */
   pendingFilePath?: string;
   pendingProbeTimer?: ReturnType<typeof setInterval>;
+  /**
+   * File UUIDs this watcher has proven do NOT belong to it (a claim attempt
+   * failed because another session already owns the file). Once a UUID lands
+   * here it is permanently excluded from every future candidate check for the
+   * lifetime of this watcher — otherwise a directory-scan/rotation poll can
+   * flip-flop back onto the same contested file every tick.
+   */
+  excludedFileIds: Set<string>;
 }
 
 const watchers = new Map<string, WatcherState>();
@@ -227,9 +235,37 @@ function fileUuid(filePath: string): string {
   return basename(filePath, '.jsonl');
 }
 
-/** Register a file UUID as belonging to a watcher (called on activate). */
+/** Register a file UUID as belonging to a watcher (called on activate).
+ *  Never overwrites an existing DIFFERENT owner — ownership is only ever
+ *  released explicitly (stopWatching), so a stale/misdirected caller can't
+ *  steal a file a live session already owns. */
 function registerOwnership(sessionName: string, filePath: string): void {
-  ownedFileIds.set(fileUuid(filePath), sessionName);
+  const uuid = fileUuid(filePath);
+  const existing = ownedFileIds.get(uuid);
+  if (existing && existing !== sessionName) {
+    logger.warn({ sessionName, existing, filePath }, 'jsonl-watcher: refusing to steal file ownership from another session');
+    return;
+  }
+  ownedFileIds.set(uuid, sessionName);
+}
+
+/**
+ * Reserve a Claude Code session transcript UUID as belonging to `sessionName`
+ * without starting a jsonl-watcher for it. Claude-code-sdk (transport)
+ * sessions still write a JSONL transcript to disk, but their events arrive
+ * over the provider stream rather than by tailing that file — nothing else
+ * ever calls `registerOwnership` for them. Without an explicit reservation,
+ * another session's directory-scan/rotation logic sees an unclaimed file and
+ * freely adopts it. Idempotent; never overwrites a different session's
+ * existing reservation.
+ */
+export function reserveSessionFile(sessionName: string, ccSessionId: string): void {
+  const existing = ownedFileIds.get(ccSessionId);
+  if (existing && existing !== sessionName) {
+    logger.warn({ sessionName, existing, ccSessionId }, 'jsonl-watcher: refusing to overwrite existing session-file reservation');
+    return;
+  }
+  ownedFileIds.set(ccSessionId, sessionName);
 }
 
 /** Returns true if the file's UUID is owned by a DIFFERENT watcher. */
@@ -248,8 +284,14 @@ function releaseOwnership(sessionName: string): void {
 /** Which session has claimed each JSONL file path (prevents cross-session stealing). */
 const claimedFiles = new Map<string, string>(); // filePath → sessionName
 
-/** Manually claim a file for a session (prevents directory scan from stealing it). */
+/** Manually claim a file for a session (prevents directory scan from stealing it).
+ *  Refuses to overwrite a claim/ownership already held by a DIFFERENT session —
+ *  the caller's own subsequent `canClaim` check (e.g. in `drainNewLines`) will
+ *  then see the claim never actually transferred and back off. */
 export function preClaimFile(sessionName: string, filePath: string): void {
+  if (isOwnedByOther(sessionName, filePath)) return;
+  const currentClaimant = claimedFiles.get(filePath);
+  if (currentClaimant && currentClaimant !== sessionName) return;
   // Release any previous file claimed by this session
   for (const [fp, sn] of claimedFiles) {
     if (sn === sessionName) { claimedFiles.delete(fp); break; }
@@ -274,6 +316,30 @@ function canClaim(sessionName: string, filePath: string): boolean {
 
 function isTrackedClaudeFile(state: WatcherState, filePath: string): boolean {
   if (state.ccSessionId) return fileUuid(filePath) === state.ccSessionId;
+  return true;
+}
+
+/**
+ * Single choke point for "should this watcher adopt filePath?". Combines the
+ * existing ccSessionId/ownership checks with permanent per-watcher exclusion:
+ * once `canClaim` proves a file belongs to another session, its UUID is
+ * recorded on `state.excludedFileIds` so this watcher never reconsiders it
+ * again — closing the flip-flop where a directory scan or rotation poll
+ * repeatedly grabs, loses, and re-grabs the same contested file.
+ *
+ * Never excludes `state.ccSessionId` itself — that's this watcher's OWN
+ * designated file. A transient claim conflict on it must stay recoverable
+ * (retried on the next poll), or a momentary race would permanently blind
+ * the one session that's supposed to track that file.
+ */
+function canAdopt(sessionName: string, state: WatcherState, filePath: string): boolean {
+  const uuid = fileUuid(filePath);
+  if (state.excludedFileIds.has(uuid)) return false;
+  if (!isTrackedClaudeFile(state, filePath)) return false;
+  if (!canClaim(sessionName, filePath)) {
+    if (uuid !== state.ccSessionId) state.excludedFileIds.add(uuid);
+    return false;
+  }
   return true;
 }
 
@@ -429,7 +495,7 @@ export async function startWatching(sessionName: string, workDir: string, ccSess
     projectDir, activeFile: null, fileOffset: 0,
     abort: new AbortController(), stopped: false,
     pendingPartialLine: '', status: 'waiting_for_file',
-    ccSessionId,
+    ccSessionId, excludedFileIds: new Set(),
   };
   watchers.set(sessionName, state);
   const control = watcherControl(sessionName);
@@ -441,7 +507,7 @@ export async function startWatching(sessionName: string, workDir: string, ccSess
 
   // Bind to the known Claude session transcript when possible.
   const preferred = ccSessionId ? scanForJsonlBySessionId(ccSessionId) : await findLatestJsonl(projectDir);
-  if (preferred && isTrackedClaudeFile(state, preferred) && canClaim(sessionName, preferred)) {
+  if (preferred && canAdopt(sessionName, state, preferred)) {
     await activateFile(sessionName, state, preferred);
     state.status = 'active';
   } else {
@@ -464,20 +530,26 @@ export function watcherStatus(sessionName: string): WatcherStatus | null {
   return watchers.get(sessionName)?.status ?? null;
 }
 
-/** Stop watching and release all file handles for a session. */
+/** Stop watching and release all file handles for a session.
+ *  Always releases claims/ownership for `sessionName`, even when no
+ *  WatcherState exists — `reserveSessionFile` registers ownership for
+ *  sessions (e.g. claude-code-sdk transports) that never call
+ *  `startWatching`/`startWatchingFile`, so this is the only place their
+ *  reservation ever gets released. */
 export function stopWatching(sessionName: string): void {
   const state = watchers.get(sessionName);
-  if (!state) return;
-  state.stopped = true;
-  state.status = 'stopped';
-  state.abort.abort();
-  if (state.pollTimer) clearInterval(state.pollTimer);
-  // Clear the slow stat-probe that waits for a delayed JSONL file in the
-  // pre-activation path. Left running, it would keep hitting `stat()` on
-  // a path whose session has been torn down.
-  if (state.pendingProbeTimer) clearInterval(state.pendingProbeTimer);
-  watchers.delete(sessionName);
-  unregisterWatcherControl(sessionName);
+  if (state) {
+    state.stopped = true;
+    state.status = 'stopped';
+    state.abort.abort();
+    if (state.pollTimer) clearInterval(state.pollTimer);
+    // Clear the slow stat-probe that waits for a delayed JSONL file in the
+    // pre-activation path. Left running, it would keep hitting `stat()` on
+    // a path whose session has been torn down.
+    if (state.pendingProbeTimer) clearInterval(state.pendingProbeTimer);
+    watchers.delete(sessionName);
+    unregisterWatcherControl(sessionName);
+  }
   releaseFiles(sessionName);
   releaseOwnership(sessionName);
   // Drop per-session pending tool-call state in both the main-thread fallback
@@ -502,7 +574,7 @@ export async function startWatchingFile(sessionName: string, filePath: string, c
     projectDir: dirname(filePath), activeFile: null, fileOffset: 0,
     abort: new AbortController(), stopped: false,
     pendingPartialLine: '', status: 'waiting_for_file',
-    ccSessionId,
+    ccSessionId, excludedFileIds: new Set(),
   };
   watchers.set(sessionName, state);
   const control = watcherControl(sessionName);
@@ -609,7 +681,7 @@ async function maybeRotateToLatest(sessionName: string, state: WatcherState): Pr
   if (!state.activeFile) return;
   try {
     const latest = await findLatestJsonl(state.projectDir);
-    if (latest && latest !== state.activeFile && isTrackedClaudeFile(state, latest) && canClaim(sessionName, latest)) {
+    if (latest && latest !== state.activeFile && canAdopt(sessionName, state, latest)) {
       logger.info({ sessionName, oldFile: basename(state.activeFile), newFile: basename(latest) },
         'jsonl-watcher: newer file detected (poll fallback), switching (CC rotation)');
       await activateFile(sessionName, state, latest);
@@ -658,7 +730,7 @@ async function watchFile(sessionName: string, state: WatcherState, filePath: str
       await runSerializedWatcherWork(sessionName, state, async () => {
         if (changedFile === state.activeFile) {
           await drainNewLines(sessionName, state);
-        } else if (isTrackedClaudeFile(state, changedFile) && canClaim(sessionName, changedFile)) {
+        } else if (canAdopt(sessionName, state, changedFile)) {
           // A different JSONL file is being written — CC may have rotated (context overflow).
           // Only switch if the new file is actually newer to avoid grabbing another session's file
           // whose claim was momentarily released (matches watchDir's checkNewer guard).
@@ -716,8 +788,7 @@ async function watchDir(sessionName: string, state: WatcherState): Promise<void>
       // Skip if another session has already claimed it.
       await runSerializedWatcherWork(sessionName, state, async () => {
         if (changedFile !== state.activeFile) {
-          if (!isTrackedClaudeFile(state, changedFile)) return;
-          if (!canClaim(sessionName, changedFile)) return; // claimed by another session
+          if (!canAdopt(sessionName, state, changedFile)) return; // not ours, or claimed by another session
           const isNewer = await checkNewer(changedFile, state.activeFile);
           if (isNewer || !state.activeFile) {
             logger.debug({ sessionName, file: event.filename }, 'jsonl-watcher: switching to new JSONL file');
@@ -760,7 +831,7 @@ async function pollTick(sessionName: string, state: WatcherState, checkRotation 
   if (!state.activeFile) {
     try {
       const preferred = state.ccSessionId ? scanForJsonlBySessionId(state.ccSessionId) : null;
-      if (preferred && isTrackedClaudeFile(state, preferred) && canClaim(sessionName, preferred)) {
+      if (preferred && canAdopt(sessionName, state, preferred)) {
         await activateFile(sessionName, state, preferred);
         state.status = 'active';
       } else if (!state.ccSessionId) {
@@ -769,7 +840,7 @@ async function pollTick(sessionName: string, state: WatcherState, checkRotation 
         const withStats = await Promise.all(
           jsonls.map(async (f) => {
             const fp = join(state.projectDir, f);
-            if (!isTrackedClaudeFile(state, fp) || !canClaim(sessionName, fp)) return null;
+            if (!canAdopt(sessionName, state, fp)) return null;
             try { return { fp, mtime: (await stat(fp)).mtimeMs }; } catch { return null; }
           }),
         );
@@ -805,12 +876,32 @@ export async function refreshTrackedSession(sessionName: string): Promise<boolea
   return true;
 }
 
+/** Test-only: current owner of a file's UUID (via claim or ownership registry), or undefined. */
+export function ownerForTests(filePath: string): string | undefined {
+  return ownedFileIds.get(fileUuid(filePath));
+}
+
+/** Test-only: snapshot of a watcher's permanently-excluded file UUIDs (flip-flop protection). */
+export function excludedFileIdsForTests(sessionName: string): string[] {
+  return [...(watchers.get(sessionName)?.excludedFileIds ?? [])];
+}
+
+/** Test-only: the file this watcher currently considers active, or null. */
+export function activeFileForTests(sessionName: string): string | null {
+  return watchers.get(sessionName)?.activeFile ?? null;
+}
+
 /** Read any new lines from the active JSONL file since the last offset. */
 async function drainNewLines(sessionName: string, state: WatcherState): Promise<void> {
   if (!state.activeFile) return;
 
-  // If another session has claimed our active file, release it so we can re-acquire our own
+  // If another session has claimed our active file, release it so we can re-acquire our own.
+  // Proven conflict — permanently exclude this UUID so a later poll can't flip back onto it.
+  // Exception: never exclude this watcher's OWN ccSessionId file — a transient
+  // conflict on it must stay retryable, not permanently blind this session.
   if (!canClaim(sessionName, state.activeFile)) {
+    const uuid = fileUuid(state.activeFile);
+    if (uuid !== state.ccSessionId) state.excludedFileIds.add(uuid);
     state.activeFile = null;
     return;
   }

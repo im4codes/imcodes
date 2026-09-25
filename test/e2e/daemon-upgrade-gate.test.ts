@@ -187,6 +187,7 @@ vi.mock('../../src/agent/tmux.js', () => ({
 }));
 
 vi.mock('../../src/daemon/jsonl-watcher.js', () => ({
+  reserveSessionFile: vi.fn(),
   startWatching: vi.fn(),
   startWatchingFile: vi.fn(),
   stopWatching: vi.fn(),

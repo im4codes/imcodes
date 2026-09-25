@@ -12,7 +12,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // ── All mocks hoisted so factories can reference them ─────────────────────────
 
 const {
-  storeMock, tmuxListMock, startWatchingMock, startWatchingFileMock,
+  storeMock, tmuxListMock, startWatchingMock, startWatchingFileMock, reserveSessionFileMock,
   isWatchingMock, restartSessionMock, getPaneStartCommandMock, upsertSessionMock, updateSessionStateMock,
   discoverLatestOpenCodeSessionIdMock, opencodeStartWatchingMock, opencodeIsWatchingMock,
   newSessionMock, timelineEmitMock, getSessionMock, respawnPaneMock,
@@ -23,6 +23,7 @@ const {
   tmuxListMock: vi.fn().mockResolvedValue(['deck_Cd_brain', 'deck_sub_5907196l']),
   startWatchingMock: vi.fn().mockResolvedValue(undefined),
   startWatchingFileMock: vi.fn().mockResolvedValue(undefined),
+  reserveSessionFileMock: vi.fn(),
   isWatchingMock: vi.fn().mockReturnValue(false),
   restartSessionMock: vi.fn().mockResolvedValue(undefined),
   getPaneStartCommandMock: vi.fn().mockResolvedValue('claude --dangerously-skip-permissions'),
@@ -70,6 +71,7 @@ vi.mock('../../src/agent/tmux.js', () => ({
 }));
 
 vi.mock('../../src/daemon/jsonl-watcher.js', () => ({
+  reserveSessionFile: reserveSessionFileMock,
   startWatching: startWatchingMock,
   startWatchingFile: startWatchingFileMock,
   stopWatching: vi.fn(),
@@ -198,6 +200,45 @@ describe('restoreFromStore — sub-session JSONL watcher regression', () => {
     const dirWatchCalls = vi.mocked(startWatching).mock.calls;
     const subSessionDirCalls = dirWatchCalls.filter(([session]) => session === 'deck_sub_5907196l');
     expect(subSessionDirCalls).toHaveLength(0);
+  });
+
+  it('never restarts the watcher for a sub-session already marked state=stopped, even if tmux still reports it live', async () => {
+    // Reproduces the real bug: a sub-session was explicitly retired (state
+    // persisted as 'stopped'), but its tmux artifact (remain-on-exit) still
+    // exists, so tmuxListSessions() reports it as live. Tmux liveness alone
+    // must never override a persisted 'stopped' state.
+    tmuxListMock.mockResolvedValue(['deck_Cd_brain', 'deck_sub_5907196l']);
+    storeMock.mockReturnValue([
+      {
+        name: 'deck_Cd_brain', agentType: 'claude-code-sdk',
+        projectDir: '/proj', ccSessionId: 'brain-sdk-uuid', state: 'running',
+      },
+      {
+        name: 'deck_sub_5907196l', agentType: 'claude-code',
+        projectDir: '/proj', ccSessionId: 'stale-sub-uuid', state: 'stopped',
+      },
+    ]);
+
+    await restoreFromStore();
+
+    const fileWatchCalls = vi.mocked(startWatchingFile).mock.calls;
+    expect(fileWatchCalls.filter(([session]) => session === 'deck_sub_5907196l')).toHaveLength(0);
+    const dirWatchCalls = vi.mocked(startWatching).mock.calls;
+    expect(dirWatchCalls.filter(([session]) => session === 'deck_sub_5907196l')).toHaveLength(0);
+  });
+
+  it('reserves the ccSessionId of a claude-code-sdk session up front, before any watcher polling starts', async () => {
+    storeMock.mockReturnValue([
+      {
+        name: 'deck_Cd_brain', agentType: 'claude-code-sdk',
+        projectDir: '/proj', ccSessionId: 'brain-sdk-uuid', state: 'running',
+      },
+    ]);
+    tmuxListMock.mockResolvedValue([]);
+
+    await restoreFromStore();
+
+    expect(reserveSessionFileMock).toHaveBeenCalledWith('deck_Cd_brain', 'brain-sdk-uuid');
   });
 
   it('still starts startWatchingFile for the main brain session', async () => {
