@@ -1,3 +1,6 @@
+import { taskPairService } from './task-pairs/service.js';
+import { taskPairAutomation } from './task-pairs/scheduler.js';
+import { getTaskPairStore } from './task-pairs/store.js';
 import { loadStore, flushStore, listSessions, getSession, upsertSession, removeSession, type SessionRecord } from '../store/session-store.js';
 import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, setTransportSessionRestoredCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute, resyncTransportSessionStatesAfterLinkRestore } from '../agent/session-manager.js';
 import { sessionExists, isPaneAlive, BACKEND, killSession } from '../agent/tmux.js';
@@ -1401,6 +1404,23 @@ export async function startup(): Promise<DaemonContext> {
     },
   }));
   supervisionAutomation.init();
+  taskPairService.init();
+  taskPairService.setScheduler(taskPairAutomation);
+  taskPairAutomation.start();
+  // In-flight legacy tasks of `pairs` projects are imported once; off the startup path.
+  setImmediate(() => {
+    void (async () => {
+      try {
+        const [{ importLegacyTasks }, { getSupervisionTaskRegistry }] = await Promise.all([
+          import('./task-pairs/legacy-import.js'),
+          import('./supervision-state-store.js'),
+        ]);
+        importLegacyTasks(getSupervisionTaskRegistry());
+      } catch (error) {
+        logger.warn({ err: error }, 'task-pair: legacy import failed');
+      }
+    })();
+  });
   supervisionAutomation.setServerLink(serverLink);
   // One recovery pass closes the durable ready_for_audit -> dispatch crash
   // window. Post-open hooks own normal materialization; no polling worker.
@@ -1458,6 +1478,19 @@ export async function startup(): Promise<DaemonContext> {
       onError: (error) => logger.warn({ error }, 'supervision console projection unavailable'),
     });
     logger.info({ epoch: supervisionConsole.projectionEpoch }, 'supervision console bound');
+    // Pair changes refresh the task console (resync) and the session badges,
+    // coalesced per project so a burst of markers costs one refresh.
+    const pendingPairRefresh = new Map<string, NodeJS.Timeout>();
+    getTaskPairStore().onPairSaved((project) => {
+      if (pendingPairRefresh.has(project)) return;
+      const timer = setTimeout(() => {
+        pendingPairRefresh.delete(project);
+        supervisionConsole?.sessions.resyncProject(project, 'task_pair_changed');
+        taskPairAutomation.publishBadges();
+      }, 250);
+      timer.unref?.();
+      pendingPairRefresh.set(project, timer);
+    });
   } catch (err) {
     supervisionConsole = undefined;
     logger.warn({ err }, 'supervision console binding failed');

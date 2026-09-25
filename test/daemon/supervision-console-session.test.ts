@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { SupervisionConsoleSessionRegistry } from '../../src/daemon/supervision-console-session.js';
 import { SupervisionConsoleProducer } from '../../src/daemon/supervision-console-producer.js';
 import { migrateSupervisionStore, type SupervisionMigrationDb } from '../../src/daemon/supervision-store-migrations.js';
@@ -176,5 +176,46 @@ describe('frame ownership', () => {
     expect(registry.handleFrame(null)).toBe(false);
     expect(registry.handleFrame({ type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT })).toBe(true);
     expect(sent).toHaveLength(0);
+  });
+});
+
+describe('pairs engine rows', () => {
+  const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
+  beforeEach(async () => {
+    process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    const { TaskPairStore, setTaskPairStoreForTests } = await import('../../src/daemon/task-pairs/store.js');
+    setTaskPairStoreForTests(new TaskPairStore(':memory:'));
+  });
+  afterEach(async () => {
+    const { setTaskPairStoreForTests } = await import('../../src/daemon/task-pairs/store.js');
+    setTaskPairStoreForTests(undefined);
+    if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
+    else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
+  });
+
+  it('builds the snapshot of a pairs project from the pair store, grouped by the closest legacy status', async () => {
+    const { taskPairService } = await import('../../src/daemon/task-pairs/service.js');
+    taskPairService.ingestText('codedeck', 'deck_cd_brain',
+      '<!-- IMCODES_TASK DISPATCH P1 executor=deck_sub_exec auditor=deck_sub_aud title="Export" -->', 'console-turn-1');
+    taskPairService.ingestText('codedeck', 'deck_sub_exec', '<!-- IMCODES_TASK READY_FOR_AUDIT P1 -->', 'console-turn-2');
+    taskPairService.ingestText('codedeck', 'deck_sub_aud', '<!-- IMCODES_TASK REWORK P1 blocking=P0 p0=1 p2=1 -->', 'console-turn-3');
+    registry.handleFrame(subscribe());
+    const snapshot = sent[0];
+    expect(snapshot.tasks).toEqual([expect.objectContaining({
+      taskId: 'P1', title: 'Export', status: 'rework', auditRound: '1', auditVerdict: 'REWORK',
+      pair: expect.objectContaining({ status: 'rework', executor: 'deck_sub_exec', auditor: 'deck_sub_aud', round: 1, severityCounts: expect.objectContaining({ P0: 1, P2: 1 }) }),
+    })]);
+    expect(snapshot.assignments.map((row: { role: string; ownerSessionName: string }) => [row.role, row.ownerSessionName]))
+      .toEqual([['implementer', 'deck_sub_exec'], ['auditor', 'deck_sub_aud']]);
+  });
+
+  it('asks every viewer of a project to resync when a pair changes', () => {
+    registry.handleFrame(subscribe());
+    sent.length = 0;
+    registry.resyncProject('codedeck', 'task_pair_changed');
+    registry.resyncProject('otherproject', 'task_pair_changed');
+    expect(sent).toEqual([expect.objectContaining({
+      type: SUPERVISION_TASK_CONSOLE_MSG.RESYNC_REQUIRED, subscriptionId: 'sub-1', reason: 'task_pair_changed',
+    })]);
   });
 });

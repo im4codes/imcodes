@@ -48,6 +48,8 @@ import {
   TASK_RUN_PROMPT_VERSION,
   type SupervisionMode,
 } from '@shared/supervision-config.js';
+import type { TaskPairAllowlistEntry, TaskPairEngine } from '@shared/task-pair.js';
+import { TaskPairSettingsSection } from './TaskPairSettingsSection.js';
 import {
   buildSupervisionExecutionCapabilityId,
   isExcludedDevelopmentModel,
@@ -170,6 +172,9 @@ type SupervisionDraft = {
   maxAuditLoops?: number;
   auditBlockingSeverities?: AuditSeverity[];
   taskRunPromptVersion?: string;
+  pairEngine?: TaskPairEngine;
+  pairAllowlist?: TaskPairAllowlistEntry[];
+  pairMaxConcurrency?: number;
 };
 
 // Account-level automatic-supervision runtime. Sessions can still customize
@@ -712,6 +717,15 @@ function SupervisionExecutionPoolsEditor({
   return <>{renderPool('primary')}{renderPool('economy')}</>;
 }
 
+/** Pair settings carried unchanged through every supervision draft rebuild. */
+function pairSettingsOf(draft: Pick<SupervisionDraft, 'pairEngine' | 'pairAllowlist' | 'pairMaxConcurrency'>): Pick<SupervisionDraft, 'pairEngine' | 'pairAllowlist' | 'pairMaxConcurrency'> {
+  return {
+    ...(draft.pairEngine ? { pairEngine: draft.pairEngine } : {}),
+    ...(draft.pairAllowlist ? { pairAllowlist: draft.pairAllowlist } : {}),
+    ...(draft.pairMaxConcurrency ? { pairMaxConcurrency: draft.pairMaxConcurrency } : {}),
+  };
+}
+
 export function SessionSettingsDialog({
   serverId,
   sessionName,
@@ -738,6 +752,7 @@ export function SessionSettingsDialog({
   onSaved,
 }: Props) {
   const { t } = useTranslation();
+  const isMainSession = !subSessionId && !parentSession;
   const hasPersistedSupervision = useMemo(() => !!(transportConfig && typeof transportConfig === 'object' && transportConfig.supervision), [transportConfig]);
   const hasInvalidPersistedSupervision = useMemo(
     () => hasInvalidSessionSupervisionSnapshot(transportConfig),
@@ -1189,6 +1204,8 @@ export function SessionSettingsDialog({
           taskRunPromptVersion,
         }
       : {}),
+    // Marker-driven task-pair settings live on the project Brain only.
+    ...(isMainSession ? pairSettingsOf(supervision) : {}),
     })
     : transportConfig ?? null, [
     canControlAutomaticSupervision,
@@ -1197,6 +1214,10 @@ export function SessionSettingsDialog({
     defaultsSupportsPreset,
     supervision.mode,
     supervisionAuditBlockingSeverities.join(','),
+    isMainSession,
+    supervision.pairEngine,
+    supervision.pairMaxConcurrency,
+    JSON.stringify(supervision.pairAllowlist ?? null),
     supervisionAuditLoops,
     supervisionAutoContinueStreak,
     supervisionAutoContinueTotal,
@@ -1286,6 +1307,7 @@ export function SessionSettingsDialog({
           maxAuditLoops: prev.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS,
           ...(prev.auditBlockingSeverities ? { auditBlockingSeverities: prev.auditBlockingSeverities } : {}),
           taskRunPromptVersion: prev.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION,
+          ...pairSettingsOf(prev),
         };
       }
       if (nextMode === 'supervised_audit') {
@@ -1306,6 +1328,7 @@ export function SessionSettingsDialog({
           maxAuditLoops: prev.maxAuditLoops ?? DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS,
           ...(prev.auditBlockingSeverities ? { auditBlockingSeverities: prev.auditBlockingSeverities } : {}),
           taskRunPromptVersion: prev.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION,
+          ...pairSettingsOf(prev),
         };
       }
       return {
@@ -1323,6 +1346,7 @@ export function SessionSettingsDialog({
           : prev.maxAutoContinueTotal,
         maxParseRetries: prev.maxParseRetries ?? DEFAULT_SUPERVISION_MAX_PARSE_RETRIES,
         taskRunPromptVersion: prev.taskRunPromptVersion ?? TASK_RUN_PROMPT_VERSION,
+        ...pairSettingsOf(prev),
       };
     });
   };
@@ -1794,6 +1818,19 @@ export function SessionSettingsDialog({
                 </div>
 
               </div>
+            )}
+
+            {isMainSession && (
+              <TaskPairSettingsSection
+                value={pairSettingsOf(supervision)}
+                disabled={saving}
+                onChange={(next) => setSupervision((prev) => ({
+                  ...prev,
+                  pairEngine: next.pairEngine,
+                  pairAllowlist: next.pairAllowlist,
+                  pairMaxConcurrency: next.pairMaxConcurrency,
+                }))}
+              />
             )}
 
             <div class="session-settings-summary">

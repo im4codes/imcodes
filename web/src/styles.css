@@ -14381,3 +14381,39 @@ button.quick-agent-delegation-preset.active {
   font-size: 11px;
   font-weight: 700;
 }
+
+/* Task-pair marker chip (marker-driven supervision) */
+.task-pair-chip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  opacity: 0.9;
+  padding: 2px 8px;
+}
+.task-pair-chip-task { font-weight: 600; }
+.task-pair-chip-status,
+.task-pair-chip-counts,
+.task-pair-chip-held,
+.task-pair-chip-unusual {
+  border-radius: 8px;
+  padding: 0 6px;
+  border: 1px solid var(--border-color, rgba(128, 128, 128, 0.35));
+}
+.task-pair-chip-held { border-color: var(--warning-color, #c98a00); }
+.task-pair-chip-unusual { opacity: 0.75; font-style: italic; }
+
+.supervision-task-console-pair {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 11px;
+  opacity: 0.9;
+  margin: 2px 0;
+}
+.supervision-task-console-pair-flag {
+  border-radius: 8px;
+  padding: 0 6px;
+  border: 1px solid var(--warning-color, #c98a00);
+}

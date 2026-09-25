@@ -519,23 +519,32 @@ export function SubSessionWindow({
       }
     };
     window.addEventListener('resize', onResize);
-    requestAnimationFrame(onResize);
-    return () => window.removeEventListener('resize', onResize);
+    // Cancel on unmount: a frame firing after the window closed would set
+    // state on an unmounted component and schedule a render nobody owns.
+    const frame = requestAnimationFrame(onResize);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener('resize', onResize);
+    };
   }, [isMobile, isDesktopMaximized]);
 
   // Scroll to bottom whenever switching to chat view;
   // force fit + full terminal refresh when switching to terminal view.
   useEffect(() => {
     if (viewMode === 'chat') {
-      setTimeout(() => chatScrollRef.current?.(), 50);
-    } else if (viewMode === 'terminal') {
-      requestAnimationFrame(() => {
+      const timer = setTimeout(() => chatScrollRef.current?.(), 50);
+      return () => clearTimeout(timer);
+    }
+    if (viewMode === 'terminal') {
+      const frame = requestAnimationFrame(() => {
         termFitFnRef.current?.();
         if (ws && connected && active) {
           try { ws.sendSnapshotRequest(sub.sessionName); } catch { /* ignore */ }
         }
       });
+      return () => cancelAnimationFrame(frame);
     }
+    return undefined;
   }, [viewMode, ws, connected, active, sub.sessionName]);
 
   // Shell/script window: hold the raw PTY stream for the window's ENTIRE

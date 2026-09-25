@@ -1,3 +1,5 @@
+import { isPairsEngineProject } from './task-pairs/engine.js';
+import { taskPairService } from './task-pairs/service.js';
 import path from 'path';
 import { buildAuditSeverityPolicyLines, type AuditSeverity } from '../../shared/audit-convergence.js';
 import { attachDaemonUserNotice, DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
@@ -1231,6 +1233,24 @@ function supervisionIdentityMatches(
     && left.sessionName === right.sessionName);
 }
 
+const PAIRS_POOL_TASK_KEYS = ['autoProvision', 'executionPool', 'requestedExecutionType'] as const;
+
+function hasLegacyTaskMetadata(input: SendMessageInput): boolean {
+  if (input.audit) return true;
+  if (!input.task) return false;
+  return Object.keys(input.task).some((key) => !(PAIRS_POOL_TASK_KEYS as readonly string[]).includes(key));
+}
+
+function stripToPoolMetadata(input: SendMessageInput): SendMessageInput {
+  const { audit: _audit, task, ...rest } = input;
+  if (!task) return rest;
+  const poolTask: Partial<SupervisionTaskMetadata> = {};
+  for (const key of PAIRS_POOL_TASK_KEYS) {
+    if (task[key] !== undefined) (poolTask as Record<string, unknown>)[key] = task[key];
+  }
+  return Object.keys(poolTask).length > 0 ? { ...rest, task: poolTask as SupervisionTaskMetadata } : rest;
+}
+
 export async function dispatchSendMessage(
   caller: SendRuntimeCaller,
   input: SendMessageInput,
@@ -1248,6 +1268,26 @@ export async function dispatchSendMessage(
   const callerProjectName = effectiveCallerProjectName(caller, allSessions);
   if (!callerProjectName) {
     return { status: 'error', reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN, error: 'send_message requires a scoped caller' };
+  }
+  // On the `pairs` engine task/audit metadata is advisory: it can create a
+  // missing pair (implicit DISPATCH) but never binds a legacy assignment,
+  // triggers automatic audit dispatch, or rejects on identity. Only the
+  // execution-pool provisioning fields keep their meaning.
+  if (!input.automaticSupervision && isPairsEngineProject(callerProjectName) && hasLegacyTaskMetadata(input)) {
+    const taskId = input.task?.taskId?.trim();
+    const result = await dispatchSendMessage(caller, stripToPoolMetadata(input), deps);
+    if (taskId && result.status === 'accepted') {
+      for (const delivery of result.deliveries) {
+        taskPairService.implicitDispatch({
+          project: callerProjectName,
+          sender: caller.sessionName,
+          target: delivery.target,
+          taskId,
+          eventId: `implicit:${delivery.messageId ?? result.dispatchId}`,
+        });
+      }
+    }
+    return result;
   }
   const autoProvision = input.task?.autoProvision === true;
   if (!input.target && !input.broadcast && !autoProvision) {
@@ -3838,6 +3878,8 @@ export async function dispatchReadyAudit(
   const registry = deps.registry ?? getSupervisionTaskRegistry();
   const task = registry.get(taskId);
   if (!task) return { status: 'ignored', reason: 'task_not_found' };
+  // No automatic audit dispatch or stale redelivery on a `pairs` project.
+  if (isPairsEngineProject(task.projectName)) return { status: 'ignored', reason: 'pairs_engine' };
   // A task without a policy is normally not auto-audited. The one exception is
   // a pre-existing explicit attempt that is already bound to this revision:
   // routing it is recovery, not automatic materialisation.
@@ -4937,6 +4979,7 @@ export async function runSupervisionConvergenceTick(
     try {
       converged = await registry.convergeLifecycle(now, {
         ...(deps.limit ? { limit: deps.limit } : {}),
+        skipProject: (projectName) => isPairsEngineProject(projectName),
         resolveAuthoritativeBrain: (projectName, sessionName) => resolveAuthoritativeBrainIdentity(
           projectName,
           (deps.listSessions ?? listSessions)(),

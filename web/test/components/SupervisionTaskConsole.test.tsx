@@ -247,6 +247,42 @@ describe('SupervisionTaskConsole', () => {
     expect(document.querySelector('[data-awaiting-external-ci="true"]')).not.toBeNull();
   });
 
+  it('renders the pair status, round, verdict counts and flags of a pairs-engine row', () => {
+    const base = state();
+    render(
+      <SupervisionTaskConsoleView
+        state={{
+          ...base,
+          tasks: {
+            ...base.tasks,
+            'task-1': {
+              ...base.tasks['task-1']!,
+              status: 'rework',
+              phase: 'rework',
+              pair: {
+                status: 'rework', flags: ['verdict_inconsistent'], executor: 'deck_alpha_worker', auditor: 'deck_alpha_auditor',
+                round: 2, blocking: ['P0'], severityCounts: { P0: 1, P1: 0, P2: 3, P3: 0, P4: 0 }, lastVerdict: 'REWORK',
+              },
+            },
+          },
+        }}
+        mobile={false}
+        now={NOW}
+        width={720}
+        maxWidth={920}
+        onResizeKeyDown={() => {}}
+        onClose={() => {}}
+        onNavigateSession={() => {}}
+      />,
+    );
+    expect(screen.getAllByText(/taskPair\.status\.rework/).length).toBeGreaterThan(0);
+    const details = document.querySelector('.supervision-task-console-pair')!;
+    expect(details.textContent).toContain('taskPair.round');
+    expect(details.textContent).toContain('taskPair.verb.rework');
+    expect(details.textContent).toContain('taskPair.severity');
+    expect(document.querySelector('.flag-verdict_inconsistent')?.textContent).toContain('taskPair.flag.verdict_inconsistent');
+  });
+
   it('uses the full task objective as the console title instead of the concise prompt title', () => {
     const fullObjective = 'Repair the supervision task console title. Preserve this complete objective for task details and tooltips.';
     const base = state();
@@ -867,8 +903,10 @@ describe('SupervisionTaskConsole', () => {
     expect(screen.queryByText('Cancelled load 0')).toBeNull();
     const historyTab = screen.getByRole('tab', { name: /supervision_task_console\.tab_history 36/ });
     fireEvent.click(historyTab);
+    // A text query: a role query recomputes accessible names for every card's
+    // buttons and grew to ~300 ms per page, which timed out under full-suite load.
     for (let page = 10; page < 36; page += 10) {
-      fireEvent.click(screen.getByRole('button', { name: 'supervision_task_console.show_more' }));
+      fireEvent.click(screen.getByText('supervision_task_console.show_more', { selector: 'button' }));
     }
     const historyCards = screen.getAllByTestId(/task-card-/);
     expect(historyCards).toHaveLength(36);

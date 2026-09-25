@@ -25,6 +25,8 @@ export const TASK_PAIR_BRIEF_END_TAG = 'IMCODES_TASK_END' as const;
 export const TASK_PAIR_TIMELINE_EVENT = 'task_pair.event' as const;
 /** Every daemon-authored pair message id starts with this prefix plus the task id. */
 export const TASK_PAIR_NUDGE_ID_PREFIX = 'task-pair-nudge:' as const;
+/** Hook path through which MCP child processes hand legacy supervision tool calls to the daemon. */
+export const TASK_PAIR_LEGACY_TOOL_HOOK_PATH = '/task-pairs/legacy-tool' as const;
 /** Automation kind stamped on daemon-authored pair messages. */
 export const TASK_PAIR_AUTOMATION_KIND = 'task-pair' as const;
 
@@ -102,10 +104,10 @@ export interface TaskPairAllowlistEntry {
   modelPattern: string;
 }
 
-/** Owner policy at introduction: Claude Code SDK sessions on Opus or Sonnet. */
+/** Owner routing policy: executors on Codex gpt-6-luna, auditors on Claude Opus. */
 export const TASK_PAIR_DEFAULT_ALLOWLIST: readonly TaskPairAllowlistEntry[] = [
-  { role: 'both', agentType: 'claude-code-sdk', modelPattern: 'opus' },
-  { role: 'both', agentType: 'claude-code-sdk', modelPattern: 'sonnet' },
+  { role: 'executor', agentType: 'codex-sdk', modelPattern: 'gpt-6-luna' },
+  { role: 'auditor', agentType: 'claude-code-sdk', modelPattern: 'opus' },
 ];
 
 export function normalizeTaskPairAllowlist(value: unknown): TaskPairAllowlistEntry[] {
@@ -770,6 +772,18 @@ export function taskPairSideToAct(pair: TaskPairState): 'executor' | 'auditor' |
 export function formatTaskPairSeverityCounts(counts: TaskPairSeverityCounts): string {
   return AUDIT_SEVERITY_LEVELS.map((level) => `${level.toLowerCase()}=${counts[level]}`).join(' ');
 }
+
+/** Closest legacy lifecycle per pair status, so the task console groups pair rows like legacy ones. */
+export const TASK_PAIR_CONSOLE_LEGACY_STATUS = {
+  queued: 'planned',
+  working: 'implementing',
+  in_audit: 'auditing',
+  awaiting_audit: 'ready_for_audit',
+  rework: 'rework',
+  passed: 'passed',
+  done: 'finalized',
+  cancelled: 'cancelled',
+} as const satisfies Record<TaskPairStatus, string>;
 
 // ---------------------------------------------------------------------------
 // Wire payloads

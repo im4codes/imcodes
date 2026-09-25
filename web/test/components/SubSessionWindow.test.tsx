@@ -190,6 +190,11 @@ function setElementRect(el: HTMLElement, top: number, height: number): void {
 }
 
 
+
+// Unmount after every test, so no window keeps a pending frame or timer past
+// the file and fires into a torn-down jsdom.
+afterEach(() => cleanup());
+
 describe('SubSessionWindow metadata wiring', () => {
   const ws = {
     onMessage: vi.fn(() => () => undefined),
@@ -208,6 +213,44 @@ describe('SubSessionWindow metadata wiring', () => {
     vi.clearAllMocks();
     timelineEventsMock = [];
     activeToolCallMock = false;
+  });
+
+  it('cancels its pending resize frame and chat-scroll timer when the window unmounts', () => {
+    const frames: number[] = [];
+    const rafSpy = vi.spyOn(window, 'requestAnimationFrame').mockImplementation(() => {
+      frames.push(frames.length + 9_000);
+      return frames[frames.length - 1]!;
+    });
+    const cafSpy = vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => undefined);
+    const clearSpy = vi.spyOn(window, 'clearTimeout');
+    try {
+      const view = render(
+        <SubSessionWindow
+          sub={makeSubSession({ type: 'codex-sdk', sessionInstanceId: 'window-instance-raf', runtimeEpoch: 'window-runtime-raf' })}
+          ws={ws}
+          connected={true}
+          active={true}
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+          onMinimize={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          onRename={vi.fn()}
+          zIndex={1}
+          onFocus={vi.fn()}
+        />,
+      );
+      const scheduled = [...frames];
+      clearSpy.mockClear();
+      view.unmount();
+      // Every frame this window scheduled is cancelled, and the chat-scroll timer is cleared.
+      for (const frame of scheduled) expect(cafSpy).toHaveBeenCalledWith(frame);
+      expect(clearSpy).toHaveBeenCalled();
+    } finally {
+      rafSpy.mockRestore();
+      cafSpy.mockRestore();
+      clearSpy.mockRestore();
+    }
   });
 
   it('projects canonical peer-audit identity/model metadata into SessionControls', () => {

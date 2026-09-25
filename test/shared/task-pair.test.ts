@@ -311,12 +311,14 @@ describe('task-pair state machine', () => {
 });
 
 describe('task-pair allowlist', () => {
-  it('matches Claude Code SDK Opus/Sonnet by default and skips others', () => {
+  it('defaults to Codex gpt-6-luna executors and Claude Opus auditors', () => {
     const allowlist = normalizeTaskPairAllowlist(undefined);
     expect(allowlist).toEqual(TASK_PAIR_DEFAULT_ALLOWLIST);
-    expect(matchesTaskPairAllowlist(allowlist, 'auditor', 'claude-code-sdk', 'claude-sonnet-5')).toBe(true);
-    expect(matchesTaskPairAllowlist(allowlist, 'auditor', 'claude-code-sdk', 'claude-haiku-4-5')).toBe(false);
-    expect(matchesTaskPairAllowlist(allowlist, 'executor', 'codex-sdk', 'gpt-5.5')).toBe(false);
+    expect(matchesTaskPairAllowlist(allowlist, 'executor', 'codex-sdk', 'gpt-6-luna')).toBe(true);
+    expect(matchesTaskPairAllowlist(allowlist, 'auditor', 'claude-code-sdk', 'claude-opus-5-5')).toBe(true);
+    expect(matchesTaskPairAllowlist(allowlist, 'executor', 'claude-code-sdk', 'claude-opus-5-5')).toBe(false);
+    expect(matchesTaskPairAllowlist(allowlist, 'auditor', 'claude-code-sdk', 'claude-sonnet-5')).toBe(false);
+    expect(matchesTaskPairAllowlist(allowlist, 'auditor', 'codex-sdk', 'gpt-6-luna')).toBe(false);
   });
 
   it('honours a configured entry and role', () => {

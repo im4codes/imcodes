@@ -1,3 +1,4 @@
+import { withPairsLegacyTools } from './task-pairs/legacy-tools.js';
 import { z } from 'zod';
 import type { CapabilityMcpToolDeps } from './capability-mcp-tools.js';
 import { execFile as execFileCallback } from 'node:child_process';
@@ -311,6 +312,8 @@ type MemoryMcpListSummaries = (query: {
 const repositoryIdentityService = new GitOriginRepositoryIdentityService();
 
 export interface MemoryMcpToolDeps {
+  /** MCP child only: hand legacy supervision tool calls to the daemon (pairs engine). */
+  legacyToolForwarder?: import('./task-pairs/legacy-tools.js').TaskPairLegacyToolForwarder;
   /**
    * Production stdio seam: execute memory-owning tools in the daemon process,
    * whose process-wide context-store and embedding workers are shared by all
@@ -3898,7 +3901,7 @@ export function registerMemoryMcpTools(
   caller: McpRuntimeCaller,
   deps: MemoryMcpToolDeps = {},
 ): ReadonlyMap<string, RegisteredTool> {
-  const handlers = createMemoryMcpToolHandlers(caller, deps);
+  const handlers = withPairsLegacyTools(caller.sessionName, createMemoryMcpToolHandlers(caller, deps), deps.legacyToolForwarder);
   const registered = new Map<string, RegisteredTool>();
   // Role-gate the advertised surface: a controlled node never registers the
   // FULL-only machine tools, so its daemon.hello / tools/list excludes them (10.12).

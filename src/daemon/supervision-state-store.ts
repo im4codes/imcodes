@@ -934,6 +934,8 @@ export interface SupervisionLifecycleConvergenceAction {
 /** Runtime authority the registry cannot know by itself. */
 export interface SupervisionLifecycleConvergenceOptions {
   limit?: number;
+  /** Projects whose tasks this pass leaves alone (the `pairs` supervision engine). */
+  skipProject?: (projectName: string) => boolean;
   /**
    * Read-only inspection of the assignment's authoritative worktree.
    *
@@ -10904,6 +10906,7 @@ export class SupervisionTaskRegistry {
       // A terminal task (pushed/finalized/blocked/cancelled) is never advanced:
       // `blocked` in particular is an operator decision, not a derivable fact.
       if (!task || isTerminalSupervisionTaskStatus(task.status)) continue;
+      if (options.skipProject?.(task.projectName)) continue;
       const retired = this.#convergeConsumedIntegrationSlice(task, now);
       if (retired) {
         actions.push(retired);

@@ -9,6 +9,7 @@
  * Every schema enum is spread from the SAME constant the state machine uses, so
  * the published tool surface cannot drift from the transition table.
  */
+import { withPairsLegacyTools, type TaskPairLegacyToolForwarder } from './task-pairs/legacy-tools.js';
 import { z } from 'zod';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { McpServer, RegisteredTool } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -1837,8 +1838,10 @@ export function registerSupervisionMcpTools(
   server: McpServer,
   caller: McpRuntimeCaller,
   deps: SupervisionMcpToolDeps = {},
+  /** MCP child only: hand legacy supervision tool calls to the daemon (pairs engine). */
+  legacyToolForwarder?: TaskPairLegacyToolForwarder,
 ): ReadonlyMap<string, RegisteredTool> {
-  const handlers = createSupervisionMcpToolHandlers(caller, deps);
+  const handlers = withPairsLegacyTools(caller.sessionName, createSupervisionMcpToolHandlers(caller, deps), legacyToolForwarder);
   const registered = new Map<string, RegisteredTool>();
   for (const name of SUPERVISION_MCP_REGISTERED_TOOLS) {
     registered.set(name, server.registerTool(name, {

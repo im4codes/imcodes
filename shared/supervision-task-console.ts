@@ -31,6 +31,8 @@
  * `node:crypto` via memory-content-hash); ids cross this boundary as plain
  * values and only `import type` may ever reference that module.
  */
+import type { AuditSeverity } from './audit-convergence.js';
+import type { TaskPairFlag, TaskPairSeverityCounts, TaskPairStatus } from './task-pair.js';
 import {
   isSupervisionTaskLifecycleStatus,
   SUPERVISION_TASK_STATUS_CONTRACT_VERSION,
@@ -78,6 +80,8 @@ export const SUPERVISION_CONSOLE_RESYNC_REASONS = [
   'outbox_truncated',
   'authority_epoch_changed',
   'stale_subscription',
+  /** A marker-driven task pair changed (`pairs` engine rows are rebuilt from the pair store). */
+  'task_pair_changed',
 ] as const;
 export type SupervisionConsoleResyncReason = typeof SUPERVISION_CONSOLE_RESYNC_REASONS[number];
 
@@ -426,8 +430,22 @@ export interface SupervisionTaskConsoleProgress {
   total: number;
 }
 
+/** Pair details on a console row of a `pairs`-engine project. */
+export interface SupervisionConsolePairInfo {
+  status: TaskPairStatus;
+  flags: TaskPairFlag[];
+  executor?: string;
+  auditor?: string;
+  round: number;
+  blocking: AuditSeverity[];
+  severityCounts?: TaskPairSeverityCounts;
+  lastVerdict?: 'PASS' | 'REWORK';
+}
+
 export interface SupervisionTaskConsoleTaskRow {
   taskId: string;
+  /** Present on `pairs`-engine projects; `status` then holds the closest legacy lifecycle for grouping. */
+  pair?: SupervisionConsolePairInfo;
   semanticKey?: string;
   topLevelTaskId?: string;
   title: string;

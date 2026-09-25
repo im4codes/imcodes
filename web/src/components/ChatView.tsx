@@ -113,6 +113,8 @@ import {
   readAgentDelegationSupervisionTaskProjection,
 } from '@shared/agent-delegation.js';
 import { parseTimelineDisplayText } from '../timeline-display-text.js';
+import { TASK_PAIR_TIMELINE_EVENT } from '@shared/task-pair.js';
+import { TaskPairEventChip } from './TaskPairEventChip.js';
 import {
   MESSAGE_PIN_LIMITS,
   isMessagePinEventType,
@@ -5099,6 +5101,9 @@ const ChatEvent = memo(function ChatEvent({
 
     case 'peer_audit.status':
       return null;
+
+    case TASK_PAIR_TIMELINE_EVENT:
+      return <TaskPairEventChip eventId={event.eventId} payload={event.payload} />;
 
     case AGENT_DELEGATION_REPLY_TIMELINE_EVENT: {
       const source = String(event.payload.sourceLabel ?? event.payload.sourceSessionName ?? '—');

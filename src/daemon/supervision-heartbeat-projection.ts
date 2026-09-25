@@ -9,6 +9,8 @@ type ProjectionListener = (sessionName: string, snapshot: SupervisionHeartbeatSn
 export const SUPERVISION_HEARTBEAT_PROJECTION_SOURCE = {
   AUTOMATION: 'automation',
   ASSIGNMENT: 'assignment',
+  /** Marker-driven task pairs: the pair heartbeat of an executor or auditor. */
+  PAIR: 'pair',
 } as const;
 type ProjectionSource = (typeof SUPERVISION_HEARTBEAT_PROJECTION_SOURCE)[keyof typeof SUPERVISION_HEARTBEAT_PROJECTION_SOURCE];
 

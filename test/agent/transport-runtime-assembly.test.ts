@@ -15,6 +15,7 @@ import { VERIFICATION_MACHINE_MCP_TOOLS } from '../../shared/verification-machin
 import { ALIAS_MCP_TOOLS } from '../../shared/alias-types.js';
 import { MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
 import { AUDIT_CONVERGENCE_CONTRACT_ID } from '../../shared/audit-convergence.js';
+import { TASK_PAIR_CONTRACT_ID } from '../../shared/task-pair.js';
 import { buildFileOutputContract } from '../../shared/file-output-contract.js';
 import { CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../shared/cron-types.js';
 import { buildBrainWorkDelegationContractRef } from '../../src/daemon/supervision-prompts.js';
@@ -307,6 +308,19 @@ describe('buildProviderContextPayload', () => {
   // messages only reference the convergence contract by id. So the body must be
   // registered in the stable system prompt of every managed session -- once per
   // thread, never resent through the per-turn channel or the user message.
+  it('registers the task-pair marker contract in the stable system prompt of every managed provider', () => {
+    const body = `[Contract: ${TASK_PAIR_CONTRACT_ID}]`;
+    for (const providerId of TRANSPORT_SESSION_AGENT_TYPES.filter((id) => id !== 'openclaw')) {
+      const payload = buildProviderContextPayload(makeProvider('full-normalized-context-injection', providerId), {
+        userMessage: 'work on the task',
+        sessionIdentity: { sessionName: 'deck_proj_w1', label: 'W1', role: 'w1' },
+        namespace: { scope: 'personal', projectId: 'repo-1' },
+      });
+      expect(payload.sessionSystemText, providerId).toContain(body);
+      expect(payload.userMessage, providerId).not.toContain(body);
+    }
+  });
+
   it('registers the audit convergence contract in the stable system prompt of every managed provider', () => {
     const body = `"contractId":"${AUDIT_CONVERGENCE_CONTRACT_ID}"`;
     const structuredEvidencePolicy = 'default-accept exact-bound implementer structured test results';

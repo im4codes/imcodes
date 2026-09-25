@@ -1798,6 +1798,53 @@ describe('SupervisionAutomation', () => {
     }
   });
 
+  it('sends no audit-target recovery nudge to an auditor the pair heartbeat covers', async () => {
+    const { TaskPairStore, setTaskPairStoreForTests } = await import('../../src/daemon/task-pairs/store.js');
+    const { taskPairService } = await import('../../src/daemon/task-pairs/service.js');
+    setTaskPairStoreForTests(new TaskPairStore(':memory:'));
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const attemptId = await startAuditForRecoveryTest('cmd-audit-target-idle-pairs');
+      process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+      taskPairService.ingestText('supervision', 'deck_supervision_lead', '<!-- IMCODES_TASK DISPATCH H3 executor=deck_supervision_brain auditor=deck_sub_reviewer -->', 'recovery-pair-1');
+      beginAuditTargetTurn(attemptId);
+      mockAuditTargetStatus = 'idle';
+      mockAuditTargetSending = false;
+      mockAuditTargetLastProviderError = null;
+      timelineEmitter.emit('deck_sub_reviewer', 'session.state', { state: 'idle' });
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(mockAuditTargetRuntime.send).not.toHaveBeenCalled();
+    } finally {
+      process.env.IMCODES_SUPERVISION_ENGINE = 'legacy';
+      setTaskPairStoreForTests(undefined);
+      finishAuditRecoveryTestCleanup();
+      vi.useRealTimers();
+    }
+  });
+
+  it('still sends the audit-target recovery nudge on a pairs project when no pair covers the auditor', async () => {
+    const { TaskPairStore, setTaskPairStoreForTests } = await import('../../src/daemon/task-pairs/store.js');
+    setTaskPairStoreForTests(new TaskPairStore(':memory:'));
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const attemptId = await startAuditForRecoveryTest('cmd-audit-target-idle-pairs-uncovered');
+      process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+      beginAuditTargetTurn(attemptId);
+      mockAuditTargetStatus = 'idle';
+      mockAuditTargetSending = false;
+      mockAuditTargetLastProviderError = null;
+      timelineEmitter.emit('deck_sub_reviewer', 'session.state', { state: 'idle' });
+      await vi.advanceTimersByTimeAsync(1_500);
+      expect(mockAuditTargetRuntime.send).toHaveBeenCalledTimes(1);
+      expect(String(mockAuditTargetRuntime.send.mock.calls[0]?.[0])).toContain('Observed failed state: idle_without_audit_reply');
+    } finally {
+      process.env.IMCODES_SUPERVISION_ENGINE = 'legacy';
+      setTaskPairStoreForTests(undefined);
+      finishAuditRecoveryTestCleanup();
+      vi.useRealTimers();
+    }
+  });
+
   it('cancels an idle-without-report recovery tick when the audit reply arrives during backoff', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     try {
@@ -5967,6 +6014,104 @@ describe('SupervisionAutomation', () => {
     }
   });
 
+  describe('one heartbeat source per session', () => {
+    async function parkedAutoAuditSession(commandId: string) {
+      const snapshot = await seedSession('supervised_audit', false, 2);
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent('deck_supervision_brain', commandId, 'wait for the result', snapshot);
+      beginRun(commandId, 'wait for the result');
+      completeTurn(`Request sent.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    const legacyHeartbeats = () => mockTransportRuntime.send.mock.calls.filter((call) => (
+      String(call[1] ?? '').startsWith('supervision-waiting-heartbeat:')
+      || String(call[0]).includes(`[Contract: ${SUPERVISION_CONTRACT_IDS.WAITING_HEARTBEAT}]`)
+    ));
+
+    it('on a pairs project with auto-audit on, only the pair heartbeat nudges: one per interval, no legacy copies', async () => {
+      const { TaskPairStore, setTaskPairStoreForTests } = await import('../../src/daemon/task-pairs/store.js');
+      const { setTaskPairDeliveryDepsForTests } = await import('../../src/daemon/task-pairs/delivery.js');
+      const { taskPairService } = await import('../../src/daemon/task-pairs/service.js');
+      const { TaskPairAutomation } = await import('../../src/daemon/task-pairs/scheduler.js');
+      setTaskPairStoreForTests(new TaskPairStore(':memory:'));
+      const pairSends: Array<{ target: string; at: number }> = [];
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+      process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+      setTaskPairDeliveryDepsForTests({ send: async (target) => { pairSends.push({ target, at: Date.now() }); } });
+      try {
+        mockTransportRuntime.send.mockClear();
+        await parkedAutoAuditSession('cmd-one-source-pairs');
+        taskPairService.ingestText('supervision', 'deck_supervision_lead', '<!-- IMCODES_TASK DISPATCH H1 executor=deck_supervision_brain auditor=deck_sub_reviewer -->', 'one-source-1');
+        const pairs = new TaskPairAutomation({ now: () => Date.now(), isBusy: () => false, isLimited: () => false, importLegacy: () => undefined });
+        for (let tick = 0; tick < 2; tick += 1) {
+          await vi.advanceTimersByTimeAsync(10 * 60_000);
+          const before = pairSends.length;
+          await pairs.tick();
+          expect(pairSends.length - before).toBe(1);
+        }
+        expect(pairSends.every((entry) => entry.target === 'deck_supervision_brain')).toBe(true);
+        expect(legacyHeartbeats()).toHaveLength(0);
+      } finally {
+        process.env.IMCODES_SUPERVISION_ENGINE = 'legacy';
+        setTaskPairDeliveryDepsForTests(undefined);
+        setTaskPairStoreForTests(undefined);
+        vi.useRealTimers();
+      }
+    });
+
+    it('on a pairs project, a WAITING session that no pair covers keeps its one session heartbeat per interval', async () => {
+      const { TaskPairStore, setTaskPairStoreForTests } = await import('../../src/daemon/task-pairs/store.js');
+      setTaskPairStoreForTests(new TaskPairStore(':memory:'));
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+      process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+      try {
+        mockTransportRuntime.send.mockClear();
+        await parkedAutoAuditSession('cmd-one-source-uncovered');
+        for (let interval = 1; interval <= 3; interval += 1) {
+          await vi.advanceTimersByTimeAsync(10 * 60_000);
+          expect(legacyHeartbeats()).toHaveLength(interval);
+        }
+      } finally {
+        process.env.IMCODES_SUPERVISION_ENGINE = 'legacy';
+        setTaskPairStoreForTests(undefined);
+        vi.useRealTimers();
+      }
+    });
+
+    it('on a legacy project with auto-audit on, only the session heartbeat nudges: the pair scheduler stays silent', async () => {
+      const { TaskPairStore, setTaskPairStoreForTests } = await import('../../src/daemon/task-pairs/store.js');
+      const { setTaskPairDeliveryDepsForTests } = await import('../../src/daemon/task-pairs/delivery.js');
+      const { taskPairService } = await import('../../src/daemon/task-pairs/service.js');
+      const { TaskPairAutomation } = await import('../../src/daemon/task-pairs/scheduler.js');
+      const store = new TaskPairStore(':memory:');
+      setTaskPairStoreForTests(store);
+      const pairSends: string[] = [];
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+      setTaskPairDeliveryDepsForTests({ send: async (target) => { pairSends.push(target); } });
+      try {
+        mockTransportRuntime.send.mockClear();
+        // A pair row left from before a rollback to legacy must not be driven.
+        process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+        taskPairService.ingestText('supervision', 'deck_supervision_lead', '<!-- IMCODES_TASK DISPATCH H2 executor=deck_supervision_brain auditor=deck_sub_reviewer -->', 'one-source-2');
+        process.env.IMCODES_SUPERVISION_ENGINE = 'legacy';
+        await parkedAutoAuditSession('cmd-one-source-legacy');
+        const pairs = new TaskPairAutomation({ now: () => Date.now(), isBusy: () => false, isLimited: () => false, importLegacy: () => undefined });
+        for (let interval = 1; interval <= 3; interval += 1) {
+          await vi.advanceTimersByTimeAsync(10 * 60_000);
+          await pairs.tick();
+          expect(legacyHeartbeats()).toHaveLength(interval);
+        }
+        expect(pairSends).toHaveLength(0);
+      } finally {
+        process.env.IMCODES_SUPERVISION_ENGINE = 'legacy';
+        setTaskPairDeliveryDepsForTests(undefined);
+        setTaskPairStoreForTests(undefined);
+        vi.useRealTimers();
+      }
+    });
+  });
+
   it('adopts and persists a Brain WAITING turn that was woken only by an internal delegation notification', async () => {
     await seedSession('supervised_audit');
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
@@ -7840,6 +7985,27 @@ describe('SupervisionAutomation', () => {
       });
       expect(registry.listEvents(taskId).filter((event) => event.eventType === 'implementation_heartbeat'))
         .toHaveLength(2);
+    });
+
+    it('sends no legacy continuation to a task of a pairs-engine project', async () => {
+      const taskId = 'watchdog-pairs-engine';
+      const assignmentId = 'watchdog-pairs-engine-assignment';
+      const { registry } = activeWorker({ taskId, assignmentId });
+      mockTransportRuntime.send.mockClear();
+      const due = 3_000 + 10 * 60_000;
+      process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+      try {
+        await supervisionAutomation.__checkImplementationAssignmentsForTests(due);
+        await supervisionAutomation.__checkImplementationAssignmentsForTests(due + 10 * 60_000);
+        await supervisionAutomation.__checkImplementationAssignmentsForTests(due + 20 * 60_000);
+      } finally {
+        process.env.IMCODES_SUPERVISION_ENGINE = 'legacy';
+      }
+      expect(mockTransportRuntime.send).not.toHaveBeenCalled();
+      expect(registry.listEvents(taskId).filter((event) => event.eventType === 'implementation_heartbeat')).toHaveLength(0);
+      // The same worker on the legacy engine gets its continuation.
+      await supervisionAutomation.__checkImplementationAssignmentsForTests(due + 30 * 60_000);
+      expect(mockTransportRuntime.send).toHaveBeenCalledOnce();
     });
 
     it('regression: tool and text activity alone prevent the post-heartbeat Brain wait', async () => {

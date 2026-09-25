@@ -1,3 +1,4 @@
+import { TASK_PAIR_LEGACY_TOOL_HOOK_PATH } from '../../shared/task-pair.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { createIdempotentShutdown, installMcpStdioLifecycle,
@@ -336,7 +337,9 @@ export function createMemoryMcpServer(
   for (const [name, tool] of registerMessagePinMcpTools(server, caller, exactStoreToolDeps)) registered.set(name, tool);
   // Supervision registry: exact server-backed operations, same separation as
   // alias/message-pin tools -- outside the fuzzy-memory contract + firewall.
-  for (const [name, tool] of registerSupervisionMcpTools(server, caller, supervisionToolDeps)) registered.set(name, tool);
+  for (const [name, tool] of registerSupervisionMcpTools(server, caller, supervisionToolDeps, toolDeps.legacyToolForwarder)) {
+    registered.set(name, tool);
+  }
   registerMcpToolDiscovery(server, registered, { catalogMode: catalogOptions.toolCatalogMode });
   return server;
 }
@@ -586,6 +589,15 @@ export function mergeDefaultToolDeps(
       if (!caller.sessionName) throw new Error('session_model requires a scoped caller');
       return postHookSend(port, { from: caller.sessionName, to: target }, MEMORY_MCP_SESSION_MODEL_LIST_HOOK_PATH, caller.sessionName);
     }),
+    legacyToolForwarder: toolDeps.legacyToolForwarder ?? (caller.sessionName ? async (tool, input) => {
+      const port = await resolveHookPort();
+      if (!port) throw new Error('daemon task-pair hook is unavailable');
+      const response = await postHookSend(port, { from: caller.sessionName, tool, input }, TASK_PAIR_LEGACY_TOOL_HOOK_PATH, caller.sessionName!);
+      return {
+        handled: response.handled === true,
+        ...(response.result && typeof response.result === 'object' ? { result: response.result as Record<string, unknown> } : {}),
+      };
+    } : undefined),
     setSessionModel: toolDeps.setSessionModel ?? (async (target, model) => {
       const port = await resolveHookPort();
       if (!port) throw new Error('daemon model control is unavailable');

@@ -21,6 +21,7 @@ vi.mock('react-i18next', () => ({
       if (key.endsWith('.kind.waiting')) return 'supervision';
       if (key.endsWith('.kind.audit')) return 'audit';
       if (key.endsWith('.kind.implementation')) return 'implementation';
+      if (key.endsWith('.kind.pair')) return 'task pair';
       return `${key}:${JSON.stringify(values ?? {})}`;
     },
   }),
@@ -69,6 +70,26 @@ describe('SupervisionHeartbeatBadge', () => {
     expect(screen.getByRole('status').classList.contains('is-sending')).toBe(true);
     act(() => vi.advanceTimersByTime(30_000));
     expect(screen.getByRole('status').textContent).not.toContain('-');
+  });
+
+  it('shows a task-pair heartbeat even when the session supervision mode is off', () => {
+    render(<SupervisionHeartbeatBadge
+      mode={SUPERVISION_MODE.OFF}
+      heartbeat={{
+        state: SUPERVISION_HEARTBEAT_STATE.ARMED,
+        kind: SUPERVISION_HEARTBEAT_KIND.PAIR,
+        updatedAt: 1_000_000,
+        nextHeartbeatAt: 1_360_000,
+      }}
+    />);
+    expect(screen.getByRole('timer').textContent).toBe('❤️06:00');
+    expect(screen.getByRole('timer').getAttribute('aria-label')).toContain('task pair');
+    cleanup();
+    const { container } = render(<SupervisionHeartbeatBadge
+      mode={SUPERVISION_MODE.OFF}
+      heartbeat={{ state: SUPERVISION_HEARTBEAT_STATE.ARMED, kind: SUPERVISION_HEARTBEAT_KIND.AUDIT, updatedAt: 1, nextHeartbeatAt: 2 }}
+    />);
+    expect(container.textContent).toBe('');
   });
 
   it('does not tick while hidden and resynchronizes immediately when visible', () => {

@@ -11,6 +11,9 @@
  * throw at a named boundary and assert the durable state that results, which is
  * the only way to show the transaction actually holds.
  */
+import { TASK_PAIR_CONSOLE_LEGACY_STATUS, TASK_PAIR_NO_AUDITOR } from '../../shared/task-pair.js';
+import { getTaskPairStore } from './task-pairs/store.js';
+import { isPairsEngineProject } from './task-pairs/engine.js';
 import {
   SUPERVISION_TASK_CONSOLE_MSG,
   SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
@@ -577,9 +580,76 @@ export class SupervisionConsoleProducer {
     };
   }
 
+  /**
+   * `pairs`-engine projects: rows come from the task-pair store. `status`
+   * carries the closest legacy lifecycle so the console groups them like
+   * legacy rows; `pair` carries the real pair state.
+   */
+  readPairRows(projectName: string): { tasks: SupervisionTaskConsoleTaskRow[]; assignments: SupervisionTaskConsoleAssignmentRow[] } {
+    const tasks: SupervisionTaskConsoleTaskRow[] = [];
+    const assignments: SupervisionTaskConsoleAssignmentRow[] = [];
+    for (const stored of getTaskPairStore().listPairs(projectName)) {
+      const pair = stored.state;
+      const status = TASK_PAIR_CONSOLE_LEGACY_STATUS[pair.status];
+      const phase = supervisionConsoleStatusGroup(status);
+      const heartbeatAt = Math.max(stored.liveness.progressExecutorAt, stored.liveness.progressAuditorAt) || undefined;
+      tasks.push({
+        taskId: pair.taskId,
+        title: pair.title ?? pair.taskId,
+        status,
+        phase,
+        ...(pair.executor ? { ownerSessionName: pair.executor } : {}),
+        ...(pair.executorPool === 'primary' || pair.executorPool === 'economy' ? { poolKind: pair.executorPool } : {}),
+        validationState: 'unknown',
+        ...(pair.flags.includes('blocked') ? { blocker: 'blocked' } : {}),
+        ...(pair.round > 0 ? { auditRound: String(pair.round) } : {}),
+        ...(pair.lastVerdict ? { auditVerdict: pair.lastVerdict.verb } : {}),
+        ...(heartbeatAt ? { heartbeatAt } : {}),
+        updatedAt: pair.updatedAt,
+        lastEventId: 0,
+        pair: {
+          status: pair.status,
+          flags: [...pair.flags],
+          ...(pair.executor ? { executor: pair.executor } : {}),
+          ...(pair.auditor ? { auditor: pair.auditor } : {}),
+          round: pair.round,
+          blocking: [...pair.blocking],
+          ...(pair.lastVerdict ? { severityCounts: { ...pair.lastVerdict.counts }, lastVerdict: pair.lastVerdict.verb } : {}),
+        },
+      });
+      const roles: Array<['implementer' | 'auditor', string | undefined, number]> = [
+        ['implementer', pair.executor, stored.liveness.progressExecutorAt],
+        ['auditor', pair.auditor === TASK_PAIR_NO_AUDITOR ? undefined : pair.auditor, stored.liveness.progressAuditorAt],
+      ];
+      for (const [role, session, progressAt] of roles) {
+        if (!session) continue;
+        const presentation = this.#resolveSessionPresentation?.(session, progressAt);
+        assignments.push({
+          assignmentId: `${pair.taskId}:${role}`,
+          taskId: pair.taskId,
+          status,
+          phase,
+          role,
+          ownerSessionName: session,
+          ownerSessionLabel: presentation?.label,
+          sessionState: presentation?.state ?? 'unknown',
+          sessionStateSource: presentation?.source ?? 'registry',
+          sessionStateObservedAt: presentation?.observedAt ?? progressAt,
+          validationState: 'unknown',
+          ...(role === 'auditor' && pair.lastVerdict ? { auditVerdict: pair.lastVerdict.verb } : {}),
+          ...(progressAt ? { heartbeatAt: progressAt } : {}),
+          updatedAt: pair.updatedAt,
+          lastEventId: 0,
+        });
+      }
+    }
+    return { tasks, assignments };
+  }
+
   buildSnapshot(scope: SupervisionTaskConsoleScope, subscriptionId: string): SupervisionTaskConsoleSnapshot {
     const cursor = this.restoreCursor(scope);
-    const tasks = [...this.#visibleTaskIds(scope.projectName)]
+    const pairRows = isPairsEngineProject(scope.projectName) ? this.readPairRows(scope.projectName) : undefined;
+    const tasks = pairRows?.tasks ?? [...this.#visibleTaskIds(scope.projectName)]
       .map((taskId) => this.readTaskRow(taskId, scope.projectName))
       .filter((row): row is SupervisionTaskConsoleTaskRow => !!row);
     return {
@@ -593,7 +663,7 @@ export class SupervisionConsoleProducer {
       projectionEpoch: cursor.projectionEpoch,
       generatedAt: this.#now(),
       tasks,
-      assignments: this.readAssignmentRows(scope.projectName),
+      assignments: pairRows?.assignments ?? this.readAssignmentRows(scope.projectName),
       pools: this.readPools(scope.projectName),
     };
   }

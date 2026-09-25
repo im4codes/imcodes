@@ -226,6 +226,14 @@ export class SupervisionConsoleSessionRegistry {
     this.#deps.send({ ...delta, subscriptionId: active.subscriptionId });
   }
 
+  /** A `pairs`-engine project changed: every viewer of it re-subscribes for a fresh snapshot. */
+  resyncProject(projectName: string, reason: SupervisionConsoleResyncReason): void {
+    for (const subscription of this.#subscriptions.values()) {
+      if (subscription.scope.projectName !== projectName) continue;
+      this.#demandResync(subscription.scope, subscription.subscriptionId, reason);
+    }
+  }
+
   /** Project newly committed registry events for every currently viewed scope. */
   refreshActiveSubscriptions(): void {
     for (const subscription of this.#subscriptions.values()) {

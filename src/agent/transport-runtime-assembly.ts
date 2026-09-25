@@ -35,10 +35,12 @@ import {
   buildBrainWorkDelegationContractRef,
 } from '../daemon/supervision-prompts.js';
 import { buildAuditConvergenceContract } from '../../shared/audit-convergence.js';
+import { buildTaskPairMarkerContract } from '../../shared/task-pair.js';
 import { CRON_CONTROL_PROTOCOL, CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../shared/cron-types.js';
 
 /** Stable text: rendered once, registered in every managed session's system prompt. */
 const AUDIT_CONVERGENCE_SYSTEM_CONTRACT = buildAuditConvergenceContract();
+const TASK_PAIR_SYSTEM_CONTRACT = buildTaskPairMarkerContract();
 import type { SessionRecord } from '../store/session-store.js';
 import { identitySpanForSegment, joinSpanned } from './priority-preserving-context-cap.js';
 
@@ -452,6 +454,11 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
   const auditConvergenceContract = input.suppressMcpMemorySearchGuidance
     ? undefined
     : AUDIT_CONVERGENCE_SYSTEM_CONTRACT;
+  // Task-pair markers are the supervision protocol of the default `pairs`
+  // engine; like the audit contract, messages reference it by id only.
+  const taskPairContract = input.suppressMcpMemorySearchGuidance
+    ? undefined
+    : TASK_PAIR_SYSTEM_CONTRACT;
   // Execution authority is not optional MCP guidance. Keep it in the
   // provider's system/developer channel even for slash-control turns.
   const cronControlTrustedSystemClause = CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE;
@@ -501,6 +508,7 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
     filePathReportingGuidance,
     realDeviceTestingGuidance,
     auditConvergenceContract,
+    taskPairContract,
     memorySearchGuidance,
     agentProgressGuidance,
   ], '\n\n');

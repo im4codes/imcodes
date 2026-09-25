@@ -1,5 +1,6 @@
 import { advanceMarkdownFence, type MarkdownFenceState } from './markdown-fence.js';
 import { normalizeAuditBlockingSeverities, type AuditSeverity } from './audit-convergence.js';
+import { normalizeTaskPairAllowlist, type TaskPairAllowlistEntry, type TaskPairEngine } from './task-pair.js';
 import type { SharedContextRuntimeBackend } from './context-types.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../src/shared/models/options.js';
 import { PROVIDER_ERROR_CODES } from './provider-error-codes.js';
@@ -1240,6 +1241,12 @@ export interface SessionSupervisionSnapshot extends SupervisorDefaultConfig {
    * resolveSupervisionAuditBlockingSeverities, which defaults to P0 only.
    */
   auditBlockingSeverities?: AuditSeverity[];
+  /** Project supervision engine chosen on the Brain (`pairs` default; `legacy` = manual rollback). */
+  pairEngine?: TaskPairEngine;
+  /** Allowlist for daemon picks of pair executors/auditors. */
+  pairAllowlist?: TaskPairAllowlistEntry[];
+  /** Brain's maximum of open pairs. */
+  pairMaxConcurrency?: number;
   taskRunPromptVersion: string;
 }
 
@@ -1576,6 +1583,11 @@ export function normalizeSessionSupervisionSnapshot(
     ...(merged.auditBlockingSeverities !== undefined
       ? { auditBlockingSeverities: normalizeAuditBlockingSeverities(merged.auditBlockingSeverities) }
       : {}),
+    ...(merged.pairEngine === 'pairs' || merged.pairEngine === 'legacy' ? { pairEngine: merged.pairEngine } : {}),
+    ...(merged.pairAllowlist !== undefined ? { pairAllowlist: normalizeTaskPairAllowlist(merged.pairAllowlist) } : {}),
+    ...(typeof merged.pairMaxConcurrency === 'number' && Number.isFinite(merged.pairMaxConcurrency) && merged.pairMaxConcurrency >= 1
+      ? { pairMaxConcurrency: Math.floor(merged.pairMaxConcurrency) }
+      : {}),
     taskRunPromptVersion: trimString(merged.taskRunPromptVersion) ?? SUPERVISION_DEFAULT_TASK_RUN_PROMPT_VERSION,
   };
 }
@@ -1696,9 +1708,13 @@ export function buildTransportConfigWithSupervision(
   const hasConfiguredExecutionPools = normalized.executionPools.state === 'configured'
     && (normalized.executionPools.primaryDevelopmentPool.configs.length > 0
       || normalized.executionPools.economyTaskPool.configs.length > 0);
+  const hasPairSettings = normalized.pairEngine !== undefined
+    || normalized.pairAllowlist !== undefined
+    || normalized.pairMaxConcurrency !== undefined;
   if (normalized.mode === SUPERVISION_MODE.OFF
     && !normalized.auditTargetSessionName
-    && !hasConfiguredExecutionPools) {
+    && !hasConfiguredExecutionPools
+    && !hasPairSettings) {
     if (!transportConfig) return null;
     const next = { ...transportConfig };
     delete next[SUPERVISION_TRANSPORT_CONFIG_KEY];

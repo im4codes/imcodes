@@ -103,7 +103,7 @@ export function clearSupervisionAutoProvisionStateForTests(): void {
   cooldownUntil.clear();
 }
 
-function configuredPools(parent: SessionRecord) {
+export function configuredPools(parent: SessionRecord) {
   const raw = parent.transportConfig?.[SUPERVISION_TRANSPORT_CONFIG_KEY];
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const executionPools = (raw as Record<string, unknown>).executionPools;
@@ -111,7 +111,7 @@ function configuredPools(parent: SessionRecord) {
   return normalized.state === 'configured' ? normalized : undefined;
 }
 
-function poolDefinition(parent: SessionRecord, pool: SupervisionAutoProvisionRequest['pool']) {
+export function poolDefinition(parent: SessionRecord, pool: SupervisionAutoProvisionRequest['pool']) {
   const pools = configuredPools(parent);
   if (!pools) return undefined;
   return pool === 'primary' ? pools.primaryDevelopmentPool : pools.economyTaskPool;
@@ -167,7 +167,7 @@ function sessionMatchesProvisionedIdentity(session: SessionRecord, identityPromp
   return Boolean(persistedSection && session.identityPrompt?.includes(persistedSection));
 }
 
-function configMatchesSession(
+export function configMatchesSession(
   config: SupervisionExecutionConfig,
   session: SessionRecord,
   identityPrompt?: string,
@@ -281,6 +281,13 @@ export async function defaultHasActiveSupervisionLease(
   sessionName: string,
   registryOverride?: Pick<SupervisionTaskRegistry, 'list'>,
 ): Promise<boolean> {
+  // On the `pairs` engine a session is leased while it is the executor or
+  // auditor of an open pair, so pool controls keep bounding provisioning.
+  const pairs = await import('./task-pairs/engine.js');
+  if (!registryOverride && pairs.isPairsEngineSession(sessionName)) {
+    const { getTaskPairStore } = await import('./task-pairs/store.js');
+    return getTaskPairStore().isParticipantOfOpenPair(sessionName);
+  }
   const registry = registryOverride
     ?? (await import('./supervision-state-store.js')).getSupervisionTaskRegistry();
   let cursor: string | undefined;
@@ -310,6 +317,15 @@ export async function defaultCountActiveSupervisionAssignments(
   pool: SupervisionAutoProvisionRequest['pool'],
   registryOverride?: Pick<SupervisionTaskRegistry, 'countActiveLeasedAssignmentsByPool'>,
 ): Promise<number> {
+  const pairs = await import('./task-pairs/engine.js');
+  if (!registryOverride && pairs.isPairsEngineProject(parent.projectName)) {
+    const { getTaskPairStore } = await import('./task-pairs/store.js');
+    const { TASK_PAIR_OPEN_STATUSES } = await import('../../shared/task-pair.js');
+    return getTaskPairStore().listActivePairs(parent.projectName).filter((pair) => (
+      TASK_PAIR_OPEN_STATUSES.includes(pair.state.status)
+      && (pair.state.executorPool ?? 'primary') === pool
+    )).length;
+  }
   const registry = registryOverride
     ?? (await import('./supervision-state-store.js')).getSupervisionTaskRegistry();
   return registry.countActiveLeasedAssignmentsByPool({

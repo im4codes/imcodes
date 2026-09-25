@@ -16,6 +16,7 @@ import { EXECUTION_CLONE_TIMELINE } from '../../../shared/execution-clone.js';
 import { AGENT_DELEGATION_REPLY_TIMELINE_EVENT } from '../../../shared/agent-delegation.js';
 import { NATIVE_COLLABORATION_POLICY_TIMELINE_EVENT } from '../../../shared/native-collaboration-policy.js';
 import { SUPERVISION_ASSIGNMENT_STATUS_TIMELINE_EVENT } from '../../../shared/supervision-assignment-start.js';
+import { TASK_PAIR_TIMELINE_EVENT, stripTaskPairMarkersForDisplay } from '../../../shared/task-pair.js';
 import {
   parseSupervisionExecutionStateDetailsFromText,
   stripSupervisionExecutionMarkersForDisplay,
@@ -63,6 +64,8 @@ export type TimelineEventType =
   // provider-native agent. Never model input and never a task candidate.
   | typeof NATIVE_COLLABORATION_POLICY_TIMELINE_EVENT
   | typeof SUPERVISION_ASSIGNMENT_STATUS_TIMELINE_EVENT
+  // Marker-driven task pair event (applied or recorded marker), rendered as a chip.
+  | typeof TASK_PAIR_TIMELINE_EVENT
   // Emitted once per memory-compression call (NOT manual /compact, which is
   // forwarded to the SDK transport unchanged). Carries the backend+model that
   // did the compression plus token telemetry. Persisted to JSONL history for
@@ -124,6 +127,7 @@ export const TIMELINE_CHAT_RENDERABLE_TYPES: readonly string[] = [
   'assistant.text',
   'peer_audit.result',
   AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+  TASK_PAIR_TIMELINE_EVENT,
   'tool.call',
   'tool.result',
   'mode.state',
@@ -190,7 +194,7 @@ export interface AssistantTextDisplayProjection {
 export function projectAssistantTextForDisplay(text: unknown): AssistantTextDisplayProjection {
   const raw = String(text ?? '');
   return {
-    text: stripSupervisionExecutionMarkersForDisplay(raw)
+    text: stripTaskPairMarkersForDisplay(stripSupervisionExecutionMarkersForDisplay(raw))
     .trim()
       .replace(/\n{3,}/g, '\n\n'),
     executionState: parseSupervisionExecutionStateDetailsFromText(raw).state,
@@ -255,6 +259,7 @@ export const TIMELINE_HISTORY_CONTENT_TYPES = [
   // Hidden, but restored with history so a reloaded dispatch card still shows
   // the assignment's live status instead of the status frozen at send time.
   SUPERVISION_ASSIGNMENT_STATUS_TIMELINE_EVENT,
+  TASK_PAIR_TIMELINE_EVENT,
   'memory.compression',
 ] as const satisfies readonly TimelineEventType[];
 

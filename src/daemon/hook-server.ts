@@ -13,6 +13,7 @@
  * After startHookServer() resolves, `activeHookPort` holds the actual port.
  * All hook scripts and plugins read this value at write time.
  */
+import { TASK_PAIR_LEGACY_TOOL_HOOK_PATH } from '../../shared/task-pair.js';
 import http from 'http';
 import logger from '../util/logger.js';
 import { timelineEmitter } from './timeline-emitter.js';
@@ -785,7 +786,8 @@ async function invokeDaemonMemoryMcpTool(
   input?: unknown,
 ): Promise<Record<string, unknown>> {
   const { createMemoryMcpToolHandlers } = await import('./memory-mcp-tools.js');
-  return createMemoryMcpToolHandlers(caller)[tool](input) as Promise<Record<string, unknown>>;
+  const { withPairsLegacyTools } = await import('./task-pairs/legacy-tools.js');
+  return withPairsLegacyTools(caller.sessionName, createMemoryMcpToolHandlers(caller))[tool](input) as Promise<Record<string, unknown>>;
 }
 
 export async function startHookServer(
@@ -1117,6 +1119,39 @@ export async function startHookServer(
           res.writeHead(400);
           res.end(JSON.stringify({ ok: false, error: 'bad request' }));
         }
+      }
+      return;
+    }
+
+    if (url === TASK_PAIR_LEGACY_TOOL_HOOK_PATH) {
+      // A legacy supervision tool called in an MCP child process. The daemon
+      // owns pair state, messages and timeline, so it answers here on the
+      // `pairs` engine and declines otherwise (the child then runs the tool).
+      const contentType = req.headers['content-type'] ?? '';
+      if (!contentType.includes('application/json')) {
+        res.writeHead(415, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Content-Type must be application/json' }));
+        return;
+      }
+      try {
+        const body = JSON.parse(await readBody(req, MAX_BODY_SIZE)) as Record<string, unknown>;
+        const senderHeader = req.headers['x-imcodes-session'];
+        const authenticatedSender = Array.isArray(senderHeader) ? senderHeader[0] : senderHeader;
+        const from = typeof body.from === 'string' ? body.from.trim() : '';
+        const tool = typeof body.tool === 'string' ? body.tool : '';
+        if (!from || !tool || authenticatedSender !== from || !getSession(from)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'invalid task-pair legacy tool request' }));
+          return;
+        }
+        const { answerLegacyToolInDaemon } = await import('./task-pairs/legacy-tools.js');
+        const answer = await answerLegacyToolInDaemon(tool, from, body.input);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(answer));
+      } catch (err) {
+        const status = (err as Error).message === 'body too large' ? 413 : 400;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: status === 413 ? 'request body too large' : 'bad request' }));
       }
       return;
     }

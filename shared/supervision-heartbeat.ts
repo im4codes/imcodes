@@ -20,6 +20,8 @@ export const SUPERVISION_HEARTBEAT_KIND = {
   WAITING: 'waiting',
   AUDIT: 'audit',
   IMPLEMENTATION: 'implementation',
+  /** Marker-driven task pair heartbeat (`pairs` supervision engine). */
+  PAIR: 'pair',
 } as const;
 
 export type SupervisionHeartbeatKind =

@@ -6,6 +6,7 @@ import {
   supervisionConsoleStatusGroup,
   supervisionConsoleTabForTask,
   type SupervisionConsoleTab,
+  type SupervisionConsolePairInfo,
   type SupervisionConsoleSessionState,
   type SupervisionTaskConsoleAssignmentRow,
   type SupervisionTaskConsoleTaskRow,
@@ -13,6 +14,7 @@ import {
   supervisionConsoleAssignmentsForTask,
 } from '@shared/supervision-task-console.js';
 import { isSupervisionTaskLifecycleStatus } from '@shared/supervision-config.js';
+import { AUDIT_SEVERITY_LEVELS } from '@shared/audit-convergence.js';
 import type { WsClient } from '../ws-client.js';
 import { useSupervisionTaskConsole } from '../hooks/useSupervisionTaskConsole.js';
 import {
@@ -85,18 +87,45 @@ export function SupervisionTaskConsoleToggle(props: {
   );
 }
 
+/** Pair round, severity counts of the last verdict, and flags (`pairs` engine rows only). */
+function TaskPairConsoleDetails({ pair }: { pair: SupervisionConsolePairInfo }) {
+  const { t } = useTranslation();
+  const counts = pair.severityCounts
+    ? AUDIT_SEVERITY_LEVELS
+      .filter((level) => (pair.severityCounts?.[level] ?? 0) > 0)
+      .map((level) => t('taskPair.severity', { level, count: pair.severityCounts?.[level] }))
+      .join(' · ')
+    : '';
+  return (
+    <div class="supervision-task-console-pair">
+      {pair.round > 0 && <span>{t('taskPair.round', { round: pair.round })}</span>}
+      {pair.lastVerdict && <span>{t(`taskPair.verb.${pair.lastVerdict.toLowerCase()}`)}{counts ? ` · ${counts}` : ''}</span>}
+      <span>{t('taskPair.blocking', { levels: pair.blocking.join(',') })}</span>
+      {pair.flags.map((flag) => (
+        <span key={flag} class={`supervision-task-console-pair-flag flag-${flag}`}>{t(`taskPair.flag.${flag}`)}</span>
+      ))}
+    </div>
+  );
+}
+
 function displayStatusKey(status: unknown): string {
   return isSupervisionTaskLifecycleStatus(status)
     ? `supervision_task_console.status.${status}`
     : 'supervision_task_console.unsupported';
 }
 
+/** One formatter per language: constructing Intl.DateTimeFormat per card dominated large console renders. */
+const timestampFormatters = new Map<string, Intl.DateTimeFormat>();
+
 function safeTimestamp(timestamp: number | undefined, language: string): string {
   if (timestamp === undefined || !Number.isFinite(timestamp)) return '—';
   try {
-    return new Intl.DateTimeFormat(language, {
-      hour: '2-digit', minute: '2-digit', second: '2-digit',
-    }).format(new Date(timestamp));
+    let formatter = timestampFormatters.get(language);
+    if (!formatter) {
+      formatter = new Intl.DateTimeFormat(language, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      timestampFormatters.set(language, formatter);
+    }
+    return formatter.format(new Date(timestamp));
   } catch {
     return '—';
   }
@@ -298,7 +327,9 @@ function TaskCard(props: {
             aria-controls={`task-console-details-${props.task.taskId}`}
             onClick={props.onToggle}
           >
-          <span class={`supervision-task-console-status status-${props.task.status}`}>{t(displayStatusKey(props.task.status))}</span>
+          <span class={`supervision-task-console-status status-${props.task.status}`}>
+            {props.task.pair ? t(`taskPair.status.${props.task.pair.status}`) : t(displayStatusKey(props.task.status))}
+          </span>
           <span aria-hidden="true" class="supervision-task-console-chevron">{props.expanded ? '⌃' : '⌄'}</span>
           </button>
         </div>
@@ -307,6 +338,7 @@ function TaskCard(props: {
           {auditor && <SessionButton assignment={auditor} taskStatus={props.task.status} taskTab={taskTab} lane="auditor" onNavigateSession={props.onNavigateSession} />}
         </div>
       </div>
+      {props.task.pair && <TaskPairConsoleDetails pair={props.task.pair} />}
       <div class={`supervision-task-console-stage-track phase-${props.task.phase}`} aria-label={t(displayStatusKey(props.task.status))}>
         <span /><span /><span /><span />
       </div>

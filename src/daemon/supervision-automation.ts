@@ -1,3 +1,4 @@
+import { isPairsEngineProject, isSessionCoveredByPairHeartbeat } from './task-pairs/engine.js';
 import { readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -1702,6 +1703,8 @@ class SupervisionAutomation {
         logger.warn({ err: error }, 'Supervision audit re-dispatch tick failed');
       });
     for (const task of registry.list()) {
+      // The pair heartbeat is the only driver on a `pairs` project (design D8).
+      if (isPairsEngineProject(task.projectName)) continue;
       const events = registry.listEvents(task.taskId);
       for (const assignment of task.assignments) {
         const watchdogKind = assignment.role === 'implementer'
@@ -3521,6 +3524,9 @@ class SupervisionAutomation {
   }
 
   private scheduleAuditTargetRecovery(run: ActiveTaskRunState, failedState: string): void {
+    // An audit target the pair heartbeat covers gets its nudges from there only.
+    const auditTarget = run.snapshot.auditTargetSessionName;
+    if (auditTarget && isSessionCoveredByPairHeartbeat(auditTarget)) return;
     if (run.auditTargetRecoveryTimer || run.auditTargetRecoveryAttempts >= AUDIT_TARGET_MAX_RECOVERY_CONTINUES) {
       if (
         run.auditTargetRecoveryAttempts >= AUDIT_TARGET_MAX_RECOVERY_CONTINUES
@@ -3617,8 +3623,11 @@ class SupervisionAutomation {
     if (!current.waitingStartedAt) return;
     // A busy session keeps the previous heartbeat in its durable FIFO. Never
     // queue another copy behind it: skip this beat and re-arm for the next.
+    // Likewise while the pair heartbeat covers this session (it is the
+    // executor or auditor of an open pair): exactly one heartbeat source.
     const pendingRuntime = getTransportRuntime(current.sessionName);
-    if (pendingRuntime?.pendingEntries.some((entry) => entry.clientMessageId.startsWith(`${SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND}:`))) {
+    if (isSessionCoveredByPairHeartbeat(current.sessionName)
+      || pendingRuntime?.pendingEntries.some((entry) => entry.clientMessageId.startsWith(`${SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND}:`))) {
       current.waitingNextHeartbeatAt = now + SUPERVISION_WAITING_HEARTBEAT_MS;
       this.armNextWaitingHeartbeat(current);
       this.persistWaitState(current, 'waiting');

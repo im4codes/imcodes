@@ -19,6 +19,7 @@ export function formatSupervisionHeartbeatCountdown(milliseconds: number): strin
 function heartbeatKindKey(kind: SupervisionHeartbeatKind | undefined): string {
   if (kind === SUPERVISION_HEARTBEAT_KIND.AUDIT) return 'audit';
   if (kind === SUPERVISION_HEARTBEAT_KIND.IMPLEMENTATION) return 'implementation';
+  if (kind === SUPERVISION_HEARTBEAT_KIND.PAIR) return 'pair';
   return 'waiting';
 }
 
@@ -32,7 +33,9 @@ export function SupervisionHeartbeatBadge({
   inline?: boolean;
 }) {
   const { t } = useTranslation();
-  if (mode === SUPERVISION_MODE.OFF
+  // A task-pair heartbeat belongs to the `pairs` engine, not to the session's
+  // supervision mode, so it is shown whatever that mode is.
+  if ((mode === SUPERVISION_MODE.OFF && heartbeat?.kind !== SUPERVISION_HEARTBEAT_KIND.PAIR)
     || !heartbeat
     || heartbeat.state === SUPERVISION_HEARTBEAT_STATE.OFF) return null;
 
