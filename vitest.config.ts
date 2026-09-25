@@ -37,7 +37,7 @@ export default defineConfig({
           // time (src/util/logger.ts even opens daemon.log there), so without
           // this the suite appends to the developer's real production log.
           // See test/setup/isolated-home.ts.
-          setupFiles: ['./test/setup/isolated-home.ts', './test/setup/legacy-supervision-engine.ts'],
+          setupFiles: ['./test/setup/isolated-home.ts'],
           // Owns the directory those per-worker homes live in and removes it once
           // every worker has exited — including workers that were killed. See
           // test/setup/isolated-home-global.ts.
