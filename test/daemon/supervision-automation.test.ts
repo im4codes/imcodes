@@ -5932,6 +5932,41 @@ describe('SupervisionAutomation', () => {
     }
   });
 
+  it('never queues a second waiting heartbeat while the first is still pending on a busy session', async () => {
+    const snapshot = await seedSession('supervised', false, 2);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      supervisionAutomation.init();
+      supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-heartbeat-busy', 'wait for the result', snapshot);
+      beginRun('cmd-heartbeat-busy', 'wait for the result');
+      completeTurn(`Request sent.\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      const heartbeatCalls = () => mockTransportRuntime.send.mock.calls.filter((call) => (
+        String(call[0]).includes(`[Contract: ${SUPERVISION_CONTRACT_IDS.WAITING_HEARTBEAT}]`)
+      ));
+      expect(heartbeatCalls()).toHaveLength(1);
+      // The session stays busy: the first heartbeat is still in its durable FIFO.
+      const firstId = String(mockTransportRuntime.send.mock.calls.at(-1)?.[1]);
+      expect(firstId.startsWith('supervision-waiting-heartbeat:')).toBe(true);
+      mockTransportRuntime.pendingEntries.push({ clientMessageId: firstId });
+
+      await vi.advanceTimersByTimeAsync(3 * 10 * 60_000);
+      expect(heartbeatCalls()).toHaveLength(1);
+      expect(getSupervisionHeartbeatProjection('deck_supervision_brain')).toMatchObject({ state: 'armed', kind: 'waiting' });
+
+      // Once it drains, the next interval sends again.
+      mockTransportRuntime.pendingEntries.length = 0;
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(heartbeatCalls()).toHaveLength(2);
+    } finally {
+      mockTransportRuntime.pendingEntries.length = 0;
+      vi.useRealTimers();
+    }
+  });
+
   it('adopts and persists a Brain WAITING turn that was woken only by an internal delegation notification', async () => {
     await seedSession('supervised_audit');
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });

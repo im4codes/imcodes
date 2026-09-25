@@ -3615,6 +3615,15 @@ class SupervisionAutomation {
     if (!isAutomaticSupervisionEnabled(current.snapshot)) return;
     const now = Date.now();
     if (!current.waitingStartedAt) return;
+    // A busy session keeps the previous heartbeat in its durable FIFO. Never
+    // queue another copy behind it: skip this beat and re-arm for the next.
+    const pendingRuntime = getTransportRuntime(current.sessionName);
+    if (pendingRuntime?.pendingEntries.some((entry) => entry.clientMessageId.startsWith(`${SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND}:`))) {
+      current.waitingNextHeartbeatAt = now + SUPERVISION_WAITING_HEARTBEAT_MS;
+      this.armNextWaitingHeartbeat(current);
+      this.persistWaitState(current, 'waiting');
+      return;
+    }
     const heartbeatPrompt = buildSupervisionWaitingHeartbeatPrompt(current.snapshot, current.snapshot.uiLocale);
     const heartbeatId = `${SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND}:${current.generation}:${now}`;
     current.waitingNextHeartbeatAt = now + SUPERVISION_WAITING_HEARTBEAT_MS;

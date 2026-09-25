@@ -1,3 +1,4 @@
+import { advanceMarkdownFence, type MarkdownFenceState } from './markdown-fence.js';
 import { normalizeAuditBlockingSeverities, type AuditSeverity } from './audit-convergence.js';
 import type { SharedContextRuntimeBackend } from './context-types.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../src/shared/models/options.js';
@@ -1820,26 +1821,18 @@ export interface ParsedSupervisionExecutionState {
 
 const SUPERVISION_EXECUTION_MARKER_LINE_RE = /^[ \t]{0,3}<!--\s*IMCODES_EXEC:\s*(NEEDS_INPUT|WAITING)\s*-->[ \t]*$/;
 const RETIRED_SUPERVISION_EXECUTION_MARKER_LINE_RE = /^[ \t]{0,3}<!--\s*IMCODES_EXEC:\s*(?:ADVANCE|AUDIT_READY)\s*-->[ \t]*$/;
-const MARKDOWN_FENCE_OPEN_RE = /^[ \t]{0,3}(`{3,}|~{3,})/;
-
 function scanAssistantAuthoredExecutionLines(text: string): {
   matches: Array<{ marker: string; lineIndex: number }>;
   retiredExecutionMarker: boolean;
 } {
   const matches: Array<{ marker: string; lineIndex: number }> = [];
   let retiredExecutionMarker = false;
-  let fence: { delimiter: '`' | '~'; length: number } | undefined;
+  let fence: MarkdownFenceState | undefined;
   const lines = text.split(/\r?\n/u);
   for (const [lineIndex, line] of lines.entries()) {
-    const fenceMatch = line.match(MARKDOWN_FENCE_OPEN_RE)?.[1];
-    if (fence) {
-      if (fenceMatch?.[0] === fence.delimiter && fenceMatch.length >= fence.length) fence = undefined;
-      continue;
-    }
-    if (fenceMatch) {
-      fence = { delimiter: fenceMatch[0] as '`' | '~', length: fenceMatch.length };
-      continue;
-    }
+    const advanced = advanceMarkdownFence(line, fence);
+    fence = advanced.fence;
+    if (advanced.fenced) continue;
     const marker = line.match(SUPERVISION_EXECUTION_MARKER_LINE_RE)?.[1];
     if (marker) matches.push({ marker, lineIndex });
     else if (RETIRED_SUPERVISION_EXECUTION_MARKER_LINE_RE.test(line)) retiredExecutionMarker = true;
