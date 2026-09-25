@@ -119,15 +119,27 @@ function isAllowedPath(path: string): boolean {
   );
 }
 
+const SKIPPED_WALK_DIRS = new Set(['node_modules', 'dist', 'coverage', 'fixtures', '__fixtures__', 'snapshots', '__snapshots__']);
+
 function walkFiles(root: string): string[] {
   if (!existsSync(root)) return [];
   const out: string[] = [];
   const entries = readdirSync(root);
   for (const entry of entries) {
     const path = join(root, entry);
+    // A fixture/snapshot directory is already exempt from every violation
+    // below via isFixtureOrSnapshotPath, so descending into one buys nothing.
+    // It DOES cost something: test/setup/isolated-home.test.ts creates and
+    // deletes throwaway *.config.ts probes under test/setup/fixtures/ while
+    // this walk runs in parallel (a real vitest.config.ts there must live
+    // inside the repo tree for `vitest/config` to resolve, so it cannot move
+    // out of a directory that is walked). readdirSync/statSync/readFileSync
+    // on a file that vanished mid-walk throws ENOENT -- skipping the whole
+    // subtree, not just filtering its results afterward, is what actually
+    // removes the race instead of outrunning it.
+    if (SKIPPED_WALK_DIRS.has(entry)) continue;
     const stats = statSync(path);
     if (stats.isDirectory()) {
-      if (entry === 'node_modules' || entry === 'dist' || entry === 'coverage') continue;
       out.push(...walkFiles(path));
       continue;
     }
