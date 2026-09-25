@@ -24,6 +24,7 @@ import {
 } from './startup-diagnostics.js';
 import {
   downloadControlledNodeMacosRemoteDesktopComponentSet,
+  startControlledNodeUpgradeScavenger,
   startControlledNodeSelfUpgrade,
 } from './self-upgrade.js';
 import { promoteMacosRemoteDesktopArtifact, selectMacosRemoteDesktopArtifact } from './macos-remote-desktop-artifact.js';
@@ -365,6 +366,8 @@ export interface ControlledNodeRuntimeOptions {
   };
   /** Test seam for the normal Server-requested upgrade path. */
   startSelfUpgrade?: typeof startControlledNodeSelfUpgrade;
+  /** Test seam for crash-left self-upgrade staging recovery at process start. */
+  upgradeStagingRoot?: string;
   platform?: NodeJS.Platform;
   arch?: string;
   now?: () => number;
@@ -405,6 +408,7 @@ export function createControlledNodeRuntime(
   let onMacosRemoteDesktopProfileChanged = (): void => undefined;
   const platform = options.platform ?? process.platform;
   const arch = options.arch ?? process.arch;
+  startControlledNodeUpgradeScavenger(options.upgradeStagingRoot);
   // Pure observability: records what this startup actually observed. See
   // ./startup-diagnostics.ts. Armed once, for the lifetime of THIS process,
   // against the same 120s window the Server's restart_health gate enforces —

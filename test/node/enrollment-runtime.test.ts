@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -115,6 +115,36 @@ afterEach(async () => {
 });
 
 describe('controlled node enrollment and runtime', () => {
+  it('scavenges crash-left upgrade staging at runtime startup but preserves a young live directory', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-runtime-upgrade-sweep-'));
+    temporaryDirs.push(root);
+    const stale = join(root, 'imcodes-node-upgrade-stale01');
+    const young = join(root, 'imcodes-node-upgrade-young1');
+    const marker = (name: string, pid: number, createdAt: number) => JSON.stringify({
+      schemaVersion: 1,
+      product: 'imcodes-controlled-node-upgrade',
+      directoryName: name,
+      ownerToken: '12345678-1234-4123-8123-123456789abc',
+      createdAt,
+      pid,
+    });
+    await mkdir(stale);
+    await writeFile(join(stale, '.imcodes-controlled-node-upgrade.json'), marker('imcodes-node-upgrade-stale01', 2_805_176, Date.now() - 2 * 24 * 60 * 60 * 1_000));
+    await mkdir(young);
+    await writeFile(join(young, '.imcodes-controlled-node-upgrade.json'), marker('imcodes-node-upgrade-young1', process.pid, Date.now()));
+    const old = (Date.now() - 2 * 24 * 60 * 60 * 1_000) / 1_000;
+    await utimes(stale, old, old);
+    await utimes(join(stale, '.imcodes-controlled-node-upgrade.json'), old, old);
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example', serverId: 'sweep-test', token: 'secret', nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => new MockSocket(), { upgradeStagingRoot: root });
+    await vi.waitFor(async () => {
+      await expect(lstat(stale)).rejects.toMatchObject({ code: 'ENOENT' });
+    });
+    expect((await lstat(young)).isDirectory()).toBe(true);
+    runtime.stop();
+  });
+
   it('enforces persisted pause before native admission, stops existing routes, and republishes on resume', async () => {
     const first = new MockSocket();
     const second = new MockSocket();

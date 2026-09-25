@@ -21,6 +21,7 @@ import {
   buildWindowsControlledNodeUpgradeScript,
   CONTROLLED_NODE_UPGRADE_ABSOLUTE_TTL_MS,
   CONTROLLED_NODE_UPGRADE_DIR_PREFIX,
+  CONTROLLED_NODE_UPGRADE_MIN_FREE_BYTES,
   CONTROLLED_NODE_UPGRADE_OWNERSHIP_MARKER,
   CONTROLLED_NODE_UPGRADE_PROGRESS_FILE,
   CONTROLLED_NODE_UPGRADE_STALE_AFTER_MS,
@@ -783,6 +784,22 @@ describe('controlled-node self-upgrade', () => {
     expect(mainArtifactAttempts).toBe(3);
   });
 
+  it('refuses to stage when the temporary filesystem is below the free-space guard', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-self-upgrade-low-space-'));
+    dirs.push(root);
+    const fetchImpl = vi.fn(async () => new Response(null, { status: 500 })) as unknown as typeof fetch;
+    const result = await startControlledNodeSelfUpgrade(credential, '2026.9.1', {
+      fetchImpl,
+      platform: 'linux',
+      arch: 'x64',
+      tmpdir: () => root,
+      freeBytes: async () => CONTROLLED_NODE_UPGRADE_MIN_FREE_BYTES - 1,
+    });
+    expect(result).toEqual(expect.objectContaining({ ok: false, reason: 'insufficient_disk_space' }));
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(await readdir(root)).toEqual([]);
+  });
+
   it('does not schedule the main executable when its Windows worker bundle is unavailable', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'imcodes-self-upgrade-worker-missing-'));
     dirs.push(dir);
@@ -854,6 +871,19 @@ describe('controlled-node self-upgrade', () => {
     })).rejects.toThrow('download_failed_503');
     expect(diagnostics).toContainEqual(expect.objectContaining({ outcome: 'failed', code: 'ENOSPC' }));
     expect(diagnostics.map((entry) => JSON.stringify(entry)).join('\n')).not.toContain(root);
+  });
+
+  it('removes its staging directory on download failure with the default cleanup', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-self-upgrade-download-cleanup-default-'));
+    dirs.push(root);
+    await expect(startControlledNodeSelfUpgrade(credential, '2026.7.1', {
+      fetchImpl: (async () => new Response(null, { status: 503 })) as unknown as typeof fetch,
+      platform: 'linux',
+      arch: 'x64',
+      tmpdir: () => root,
+      sleep: async () => {},
+    })).rejects.toThrow('download_failed_503');
+    expect(await readdir(root)).toEqual([]);
   });
 
   it.each([
@@ -965,7 +995,7 @@ describe('controlled-node self-upgrade', () => {
     const preflightCleanup = script.indexOf('Remove-Item -LiteralPath $stagingDir', preflightPersist);
     expect(preflightPersist).toBeGreaterThan(0);
     expect(preflightCleanup).toBeGreaterThan(preflightPersist);
-    expect(script).toContain("if (-not $upgradeResultPersisted) { Write-Warning 'IMCODES_UPGRADE_CLEANUP_SKIPPED phase=helper_finally code=result_not_persisted'");
+    expect(script).not.toContain('IMCODES_UPGRADE_CLEANUP_SKIPPED');
   });
 
   it('scavenges only old direct owned non-reparse staging directories and preserves live/new/unowned entries', async () => {
@@ -1470,6 +1500,82 @@ describe('controlled-node self-upgrade', () => {
     }
   });
 
+  it('binds POSIX staging cleanup to the owned marker and runs it on exit', () => {
+    const script = buildPosixControlledNodeUpgradeScript({
+      platform: 'linux',
+      stagedArtifactPath: '/tmp/imcodes-node-upgrade-abcd12/imcodes-node',
+      stagedManifestPath: '/tmp/imcodes-node-upgrade-abcd12/imcodes-node.manifest.json',
+      destinationPath: '/opt/imcodes-node/imcodes-node',
+      destinationManifestPath: '/opt/imcodes-node/imcodes-node.manifest.json',
+      stagingOwnership: {
+        directoryPath: '/tmp/imcodes-node-upgrade-abcd12',
+        markerPath: '/tmp/imcodes-node-upgrade-abcd12/.imcodes-controlled-node-upgrade.json',
+        ownerToken: '12345678-1234-4123-8123-123456789abc',
+      },
+    });
+    expect(script).toContain('trap cleanup_staging EXIT');
+    expect(script).toContain('"product":"imcodes-controlled-node-upgrade"');
+    expect(script).toContain('"ownerToken":"12345678-1234-4123-8123-123456789abc"');
+    expect(script).toContain('rm -rf --');
+    expect(script).toContain('! -L');
+  });
+
+  it.runIf(process.platform === 'linux')('executes POSIX cleanup only for the exact owned marker and refuses symlinks', async () => {
+    const runCase = async (name: string, markerToken: string, shape: 'valid' | 'dir-symlink' | 'marker-symlink'): Promise<boolean> => {
+      const root = await mkdtemp(join(tmpdir(), `imcodes-posix-cleanup-${name}-`));
+      dirs.push(root);
+      const stage = join(root, 'imcodes-node-upgrade-abcd12');
+      const destinationPath = join(root, 'installed-node');
+      const destinationManifestPath = `${destinationPath}.manifest.json`;
+      const stagedArtifactPath = join(stage, 'imcodes-node');
+      const stagedManifestPath = `${stagedArtifactPath}.manifest.json`;
+      await mkdir(stage, { recursive: true });
+      await writeFile(stagedArtifactPath, 'new', { mode: 0o755 });
+      await writeFile(stagedManifestPath, JSON.stringify({ build: { version: 'test' } }));
+      await writeFile(destinationPath, 'old', { mode: 0o755 });
+      await writeFile(join(stage, CONTROLLED_NODE_UPGRADE_OWNERSHIP_MARKER), JSON.stringify({
+        schemaVersion: 1,
+        product: 'imcodes-controlled-node-upgrade',
+        directoryName: 'imcodes-node-upgrade-abcd12',
+        ownerToken: markerToken,
+        createdAt: Date.now(),
+        pid: process.pid,
+      }));
+      const markerPath = join(stage, CONTROLLED_NODE_UPGRADE_OWNERSHIP_MARKER);
+      if (shape === 'dir-symlink') {
+        const target = join(root, 'real-stage');
+        await rm(stage, { recursive: true, force: true });
+        await mkdir(target);
+        await symlink(target, stage, 'dir');
+      } else if (shape === 'marker-symlink') {
+        const target = join(root, 'real-marker.json');
+        await writeFile(target, JSON.stringify({
+          product: 'imcodes-controlled-node-upgrade',
+          directoryName: basename(stage),
+          ownerToken: markerToken,
+          createdAt: new Date().toISOString(),
+          pid: process.pid,
+        }));
+        await rm(markerPath);
+        await symlink(target, markerPath, 'file');
+      }
+      const binDir = join(root, 'bin');
+      await mkdir(binDir);
+      await writeFile(join(binDir, 'systemctl'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      const scriptPath = join(root, 'upgrade.sh');
+      await writeFile(scriptPath, buildPosixControlledNodeUpgradeScript({
+        platform: 'linux', stagedArtifactPath, stagedManifestPath, destinationPath, destinationManifestPath,
+        stagingOwnership: { directoryPath: stage, markerPath, ownerToken: '12345678-1234-4123-8123-123456789abc' },
+      }), { mode: 0o755 });
+      await execFileAsync('/bin/sh', [scriptPath], { timeout: 15_000, env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}` } });
+      try { await lstat(stage); return true; } catch { return false; }
+    };
+    expect(await runCase('valid', '12345678-1234-4123-8123-123456789abc', 'valid')).toBe(false);
+    expect(await runCase('wrong-token', 'abcdefab-cdef-4abc-8def-abcdefabcdef', 'valid')).toBe(true);
+    expect(await runCase('dir-link', '12345678-1234-4123-8123-123456789abc', 'dir-symlink')).toBe(true);
+    expect(await runCase('marker-link', '12345678-1234-4123-8123-123456789abc', 'marker-symlink')).toBe(true);
+  });
+
   it('refuses to publish a macOS binary the kernel would kill, and leaves the old one intact', () => {
     const script = buildPosixControlledNodeUpgradeScript({
       platform: 'darwin',
@@ -1578,6 +1684,50 @@ describe('controlled-node self-upgrade', () => {
       expect(serviceLog).toContain('stop');
       expect(serviceLog).toContain('start');
     }
+  });
+
+  it.runIf(process.platform === 'linux')('executes POSIX cleanup and removes the owned staging directory after handoff', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-native-upgrade-staging-cleanup-'));
+    dirs.push(root);
+    const stage = join(root, 'imcodes-node-upgrade-abcd12');
+    const stagedArtifactPath = join(stage, 'imcodes-node');
+    const stagedManifestPath = `${stagedArtifactPath}.manifest.json`;
+    const destinationPath = join(root, 'installed-node');
+    const destinationManifestPath = `${destinationPath}.manifest.json`;
+    const binDir = join(root, 'bin');
+    await mkdir(stage, { recursive: true });
+    await mkdir(binDir);
+    await writeFile(join(binDir, 'systemctl'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    await writeFile(stagedArtifactPath, 'staged-artifact', { mode: 0o755 });
+    await writeFile(stagedManifestPath, JSON.stringify({ build: { version: 'test' } }));
+    await writeFile(destinationPath, 'old-artifact', { mode: 0o755 });
+    await writeFile(join(stage, CONTROLLED_NODE_UPGRADE_OWNERSHIP_MARKER), JSON.stringify({
+      schemaVersion: 1,
+      product: 'imcodes-controlled-node-upgrade',
+      directoryName: 'imcodes-node-upgrade-abcd12',
+      ownerToken: '12345678-1234-4123-8123-123456789abc',
+      createdAt: Date.now(),
+      pid: process.pid,
+    }));
+    const scriptPath = join(root, 'upgrade.sh');
+    await writeFile(scriptPath, buildPosixControlledNodeUpgradeScript({
+      platform: 'linux',
+      stagedArtifactPath,
+      stagedManifestPath,
+      destinationPath,
+      destinationManifestPath,
+      stagingOwnership: {
+        directoryPath: stage,
+        markerPath: join(stage, CONTROLLED_NODE_UPGRADE_OWNERSHIP_MARKER),
+        ownerToken: '12345678-1234-4123-8123-123456789abc',
+      },
+    }), { mode: 0o755 });
+    await execFileAsync('/bin/sh', [scriptPath], {
+      timeout: 15_000,
+      env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}` },
+    });
+    expect(await readFile(destinationPath, 'utf8')).toBe('staged-artifact');
+    await expect(lstat(stage)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it.runIf(process.platform === 'win32')('restores after a transient rollback lock and preserves bytes after a permanent lock timeout', async () => {

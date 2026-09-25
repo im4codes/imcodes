@@ -1,6 +1,6 @@
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { appendFile, chmod, lstat, mkdir, mkdtemp, open, opendir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, lstat, mkdir, mkdtemp, open, opendir, readFile, rename, rm, stat, statfs, writeFile } from 'node:fs/promises';
 import { tmpdir, uptime } from 'node:os';
 import { basename, dirname, join, resolve, win32 as pathWin32 } from 'node:path';
 import {
@@ -70,6 +70,8 @@ export const CONTROLLED_NODE_UPGRADE_OWNERSHIP_MARKER = '.imcodes-controlled-nod
 export const CONTROLLED_NODE_UPGRADE_PROGRESS_FILE = '.imcodes-controlled-node-upgrade.progress.jsonl';
 export const CONTROLLED_NODE_UPGRADE_STALE_AFTER_MS = 24 * 60 * 60 * 1_000;
 export const CONTROLLED_NODE_UPGRADE_ABSOLUTE_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
+export const CONTROLLED_NODE_UPGRADE_MIN_FREE_BYTES = 512 * 1024 * 1024;
+export const CONTROLLED_NODE_UPGRADE_SWEEP_INTERVAL_MS = 60 * 60 * 1_000;
 const CONTROLLED_NODE_UPGRADE_MAX_ENUMERATE = 128;
 const CONTROLLED_NODE_UPGRADE_MAX_LSTAT = 128;
 const CONTROLLED_NODE_UPGRADE_MAX_MARKER_READ = 64;
@@ -100,6 +102,7 @@ const CONTROLLED_NODE_UPGRADE_PRODUCT = CONTROLLED_NODE_WINDOWS_UPGRADE_PRODUCT;
 const CONTROLLED_NODE_UPGRADE_DIR_PATTERN = /^imcodes-node-upgrade-[A-Za-z0-9_-]{6,128}$/;
 const CONTROLLED_NODE_UPGRADE_TOKEN_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const activeControlledNodeUpgradeDirs = new Set<string>();
+const scheduledUpgradeSweeps = new Set<string>();
 
 export interface ControlledNodeUpgradeCleanupDiagnostic {
   event: 'controlled_node_upgrade_cleanup';
@@ -132,6 +135,7 @@ export interface ControlledNodeSelfUpgradeDeps {
   onStaleScavengeOperation?: (operation: 'enumerate' | 'lstat' | 'marker_read' | 'delete') => void;
   beforeStaleCandidateRevalidation?: (candidatePath: string) => Promise<void>;
   sleep?: (ms: number) => Promise<void>;
+  freeBytes?: (path: string) => Promise<number | null>;
 }
 
 export interface ControlledNodeSelfUpgradeResult {
@@ -140,6 +144,50 @@ export interface ControlledNodeSelfUpgradeResult {
   targetVersion: string;
   artifactSha256?: string;
   scriptPath?: string;
+}
+
+async function defaultFreeBytes(path: string): Promise<number | null> {
+  try {
+    const filesystem = await statfs(path);
+    return Number(filesystem.bavail) * Number(filesystem.bsize);
+  } catch {
+    // A platform/filesystem that cannot report free space must not make an
+    // upgrade permanently unavailable. The staging and sweep guards remain
+    // authoritative on the filesystems that support statfs.
+    return null;
+  }
+}
+
+function ensurePeriodicUpgradeSweep(tempRoot: string, deps: ControlledNodeSelfUpgradeDeps): void {
+  const canonicalRoot = resolve(tempRoot);
+  if (scheduledUpgradeSweeps.has(canonicalRoot)) return;
+  scheduledUpgradeSweeps.add(canonicalRoot);
+  const timer = setInterval(() => {
+    void scavengeStaleControlledNodeUpgradeDirs(canonicalRoot, deps).catch(() => {});
+  }, CONTROLLED_NODE_UPGRADE_SWEEP_INTERVAL_MS);
+  timer.unref?.();
+}
+
+/**
+ * Arm crash-recovery scavenging for the controlled-node process itself. This
+ * is intentionally fire-and-forget: startup must not be blocked by a hostile
+ * or unavailable temporary filesystem, while the hourly sweep remains active
+ * for the lifetime of the process.
+ */
+export function startControlledNodeUpgradeScavenger(
+  tempRoot: string = tmpdir(),
+  deps: Pick<ControlledNodeSelfUpgradeDeps,
+    | 'now'
+    | 'uptime'
+    | 'removeUpgradeDir'
+    | 'isProcessAlive'
+    | 'onCleanupDiagnostic'
+    | 'onStaleScavengeOperation'
+    | 'beforeStaleCandidateRevalidation'
+  > = {},
+): void {
+  void scavengeStaleControlledNodeUpgradeDirs(tempRoot, deps).catch(() => {});
+  ensurePeriodicUpgradeSweep(tempRoot, deps);
 }
 
 function psQuote(value: string): string {
@@ -1073,13 +1121,13 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     ? `try { Unregister-ScheduledTask -TaskName ${psQuote(input.upgradeTaskName)} -Confirm:$false -ErrorAction Stop } catch { Write-Warning 'IMCODES_UPGRADE_CLEANUP_FAILED phase=helper_finally code=task_unregister_failed' }\r\n`
     : '';
   const stagingCleanup = input.stagingOwnership
-    ? `if (-not $upgradeResultPersisted) { Write-Warning 'IMCODES_UPGRADE_CLEANUP_SKIPPED phase=helper_finally code=result_not_persisted' } else { try {\r\n`
+    ? `try {\r\n`
       + `  $stagingItem = Get-Item -LiteralPath $stagingDir -Force -ErrorAction Stop\r\n`
       + `  $stagingMarkerItem = Get-Item -LiteralPath $stagingOwnershipMarker -Force -ErrorAction Stop\r\n`
       + `  $stagingMarker = Get-Content -LiteralPath $stagingOwnershipMarker -Raw -ErrorAction Stop | ConvertFrom-Json\r\n`
       + `  if (-not $stagingItem.PSIsContainer -or ($stagingItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $stagingMarkerItem.PSIsContainer -or ($stagingMarkerItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $stagingItem.Name -cnotmatch '^imcodes-node-upgrade-[A-Za-z0-9_-]{6,128}$' -or [int]$stagingMarker.schemaVersion -ne 1 -or [string]$stagingMarker.product -cne ${psQuote(CONTROLLED_NODE_UPGRADE_PRODUCT)} -or [string]$stagingMarker.directoryName -cne $stagingItem.Name -or [string]$stagingMarker.ownerToken -cne $stagingOwnerToken) { throw 'staging ownership refused' }\r\n`
       + `  Remove-Item -LiteralPath $stagingDir -Recurse -Force -ErrorAction Stop\r\n`
-      + `} catch { Write-Warning 'IMCODES_UPGRADE_CLEANUP_FAILED phase=helper_finally code=cleanup_refused_or_failed' } }\r\n`
+      + `} catch { Write-Warning 'IMCODES_UPGRADE_CLEANUP_FAILED phase=helper_finally code=cleanup_refused_or_failed' }\r\n`
     : '';
   const stagingActivation = input.stagingOwnership
     ? `$stagingItem = Get-Item -LiteralPath $stagingDir -Force -ErrorAction Stop\r\n`
@@ -1433,10 +1481,8 @@ export function buildWindowsControlledNodeUpgradeScript(input: {
     + `} finally {\r\n`
     + `if ($transactionTerminal) { Remove-Item -Force -LiteralPath $upgradeMarker -ErrorAction SilentlyContinue }\r\n`
     + `Start-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue\r\n`
-    + `if ($transactionTerminal) {\r\n`
     + upgradeTaskCleanup.split('\r\n').filter(Boolean).map((line) => `  ${line}\r\n`).join('')
     + stagingCleanup.split('\r\n').filter(Boolean).map((line) => `  ${line}\r\n`).join('')
-    + `}\r\n`
     + `}\r\n`;
 }
 
@@ -1490,6 +1536,11 @@ export function buildPosixControlledNodeUpgradeScript(input: {
   destinationPath: string;
   destinationManifestPath: string;
   destinationJournalPath?: string;
+  stagingOwnership?: {
+    directoryPath: string;
+    markerPath: string;
+    ownerToken: string;
+  };
 }): string {
   const journalCopy = input.stagedJournalPath && input.destinationJournalPath
     ? `cp -f ${shQuote(input.stagedJournalPath)} ${shQuote(input.destinationJournalPath)} 2>/dev/null || true\n`
@@ -1546,10 +1597,23 @@ export function buildPosixControlledNodeUpgradeScript(input: {
     + (helperCopy || remoteDesktopWorkerCopy || journalCopy ? '\n' : '')
     + `fi\n`
     + `rm -f ${shQuote(pending)} 2>/dev/null || true\n`;
+  const stagingCleanup = input.stagingOwnership
+    ? `\ncleanup_staging() {\n`
+      + `  [ -d ${shQuote(input.stagingOwnership.directoryPath)} ] || return 0\n`
+      + `  [ ! -L ${shQuote(input.stagingOwnership.directoryPath)} ] || return 0\n`
+      + `  marker=${shQuote(input.stagingOwnership.markerPath)}\n`
+      + `  [ -f \"$marker\" ] || return 0\n`
+      + `  [ ! -L \"$marker\" ] || return 0\n`
+      + `  grep -Fq ${shQuote(`\"product\":\"${CONTROLLED_NODE_UPGRADE_PRODUCT}\"`)} \"$marker\" || return 0\n`
+      + `  grep -Fq ${shQuote(`\"directoryName\":\"${basename(input.stagingOwnership.directoryPath)}\"`)} \"$marker\" || return 0\n`
+      + `  grep -Fq ${shQuote(`\"ownerToken\":\"${input.stagingOwnership.ownerToken}\"`)} \"$marker\" || return 0\n`
+      + `  rm -rf -- ${shQuote(input.stagingOwnership.directoryPath)}\n`
+      + `}\ntrap cleanup_staging EXIT\n`
+    : '';
   if (input.platform === 'linux') {
-    return `#!/bin/sh\nset +e\nsleep 3\nsystemctl stop ${CONTROLLED_NODE_SERVICE.LINUX_UNIT}\n${copy}systemctl start ${CONTROLLED_NODE_SERVICE.LINUX_UNIT}\n`;
+    return `#!/bin/sh\nset +e${stagingCleanup}\nsleep 3\nsystemctl stop ${CONTROLLED_NODE_SERVICE.LINUX_UNIT}\n${copy}systemctl start ${CONTROLLED_NODE_SERVICE.LINUX_UNIT}\n`;
   }
-  return `#!/bin/sh\nset +e\nlaunchctl bootout system/${CONTROLLED_NODE_SERVICE.MACOS_WATCHDOG_LABEL}\nsleep 3\nlaunchctl bootout system/${CONTROLLED_NODE_SERVICE.MACOS_LABEL}\n${copy}launchctl bootstrap system ${shQuote(MACOS_PLIST_PATH)}\nlaunchctl kickstart -k system/${CONTROLLED_NODE_SERVICE.MACOS_LABEL}\nlaunchctl bootstrap system ${shQuote(MACOS_WATCHDOG_PLIST_PATH)}\n`;
+  return `#!/bin/sh\nset +e${stagingCleanup}\nlaunchctl bootout system/${CONTROLLED_NODE_SERVICE.MACOS_WATCHDOG_LABEL}\nsleep 3\nlaunchctl bootout system/${CONTROLLED_NODE_SERVICE.MACOS_LABEL}\n${copy}launchctl bootstrap system ${shQuote(MACOS_PLIST_PATH)}\nlaunchctl kickstart -k system/${CONTROLLED_NODE_SERVICE.MACOS_LABEL}\nlaunchctl bootstrap system ${shQuote(MACOS_WATCHDOG_PLIST_PATH)}\n`;
 }
 
 async function prepareUpgradeJournal(input: {
@@ -1654,10 +1718,15 @@ export async function startControlledNodeSelfUpgrade(
   if (!fetchImpl) return { ok: false, targetVersion, reason: 'fetch_unavailable' };
 
   const tempRoot = deps.tmpdir?.() ?? tmpdir();
-  if (platform === 'win32') {
-    // Crash recovery is deliberately best-effort. It runs before allocating a
-    // new directory and can only inspect bounded, direct, owned children.
-    await scavengeStaleControlledNodeUpgradeDirs(tempRoot, deps);
+  // Crash recovery is deliberately best-effort. It runs before allocating a
+  // new directory and can only inspect bounded, direct, owned children. Run it
+  // on every supported platform: a killed POSIX helper is just as capable of
+  // stranding its downloaded artifact as the Windows task.
+  await scavengeStaleControlledNodeUpgradeDirs(tempRoot, deps);
+  ensurePeriodicUpgradeSweep(tempRoot, deps);
+  const freeBytes = await (deps.freeBytes ?? defaultFreeBytes)(tempRoot);
+  if (freeBytes !== null && freeBytes < CONTROLLED_NODE_UPGRADE_MIN_FREE_BYTES) {
+    return { ok: false, targetVersion, reason: 'insufficient_disk_space' };
   }
 
   let updateDir: string | undefined;
@@ -1792,6 +1861,11 @@ export async function startControlledNodeSelfUpgrade(
         destinationPath,
         destinationManifestPath,
         destinationJournalPath,
+        stagingOwnership: {
+          directoryPath: updateDir,
+          markerPath: ownershipMarkerPath,
+          ownerToken: ownership.ownerToken,
+        },
       });
     await writeUpgradeFile(scriptPath, script, { mode: 0o700 });
     if (platform !== 'win32') await chmod(scriptPath, 0o700).catch(() => {});
