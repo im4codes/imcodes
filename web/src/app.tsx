@@ -2182,6 +2182,10 @@ export function App() {
     }, { bringToFront: true });
   }, [ensureDesktopWindow]);
 
+  const openRemoteDesktopById = useCallback(() => {
+    window.open('/remote-desktop/access', '_blank', 'noopener,noreferrer');
+  }, []);
+
   const closeRemoteDesktopWall = useCallback((hostKeys: readonly string[]) => {
     const retained = new Set(remoteDesktopWorkspace.orderedHostKeys);
     for (const hostKey of hostKeys) {
@@ -6090,6 +6094,7 @@ export function App() {
                 <ControlledNodeQuickMenu
                   onOpenRemoteDesktop={openRemoteDesktop}
                   onOpenRemoteDesktopWall={openRemoteDesktopWall}
+                  onConnectById={openRemoteDesktopById}
                 />
               </div>
               {/* Session-list show/hide toggle — same as the mobile sidebar ⊞ button */}
@@ -7295,6 +7300,7 @@ export function App() {
           <ControlledNodesPanel
             onOpenRemoteDesktop={openRemoteDesktop}
             onOpenRemoteDesktopWall={openRemoteDesktopWall}
+            onConnectById={openRemoteDesktopById}
             projectKey={activeSessionInfo?.contextNamespace?.projectId || activeSessionInfo?.project}
             initialNodeId={aideskManagementNodeId ?? undefined}
             initialAction={aideskManagementAction}
@@ -7355,6 +7361,7 @@ export function App() {
           onMinimize={() => setRemoteDesktopWallMinimized(true)}
           onRestore={() => setRemoteDesktopWallMinimized(false)}
           onOpenStandalone={openRemoteDesktopWallStandalone}
+          onConnectById={openRemoteDesktopById}
           onOpenHost={openRemoteDesktop}
           onHostKeysChange={setRemoteDesktopWallHostKeys}
           onClose={closeRemoteDesktopWall}

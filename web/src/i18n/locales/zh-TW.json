@@ -73,7 +73,8 @@
     "refresh": "重新整理",
     "show": "顯示",
     "hide": "隱藏",
-    "this_feature": "此功能"
+    "this_feature": "此功能",
+    "remove": "刪除"
   },
   "usageSummary": {
     "title": "Usage",
@@ -830,7 +831,8 @@
         "kind": {
           "waiting": "監督",
           "audit": "稽核",
-          "implementation": "實作"
+          "implementation": "實作",
+          "pair": "任務配對"
         }
       },
       "globalDefaultsTitle": "全域預設配置",
@@ -4210,7 +4212,9 @@
       "waiting_help": "請保持此頁面開啟。完成同意前不會傳輸桌面資料。",
       "try_again": "重試",
       "generic_error": "無法完成要求。",
-      "remote_screen": "遠端桌面畫面"
+      "remote_screen": "遠端桌面畫面",
+      "save_device": "儲存到我的裝置",
+      "saved_device": "已儲存到我的裝置"
     },
     "exit_fullscreen": "退出全螢幕",
     "fullscreen_captures_shortcuts": "全螢幕後，瀏覽器自己佔用的快速鍵（如 ⌘T、⌘N）也會傳給遠端",
@@ -4285,6 +4289,79 @@
     "quality_priority_resolution": "優先清晰",
     "quality_relay_cap": "中繼 ≤ {{mbps}} Mbps",
     "quality_relay_cap_hint": "目前連線經過限速的中繼伺服器，直連不受限制。",
-    "quality_latency_guard_note": "這些設定只影響你自己，其他觀看者各自獨立。預設模式在畫面開始延遲時還會自動降低位元率。"
+    "quality_latency_guard_note": "這些設定只影響你自己，其他觀看者各自獨立。預設模式在畫面開始延遲時還會自動降低位元率。",
+    "connect_by_id": "透過 ID 連線",
+    "access_password": "遠端桌面存取密碼"
+  },
+  "taskPair": {
+    "chip": "{{writer}}：{{verb}}",
+    "daemon": "IM.codes",
+    "unusual": "非常規",
+    "verdict_held": "結論未採納：不符合嚴重等級規則",
+    "round": "第 {{round}} 輪",
+    "blocking": "阻斷等級 {{levels}}",
+    "severity": "{{level}}×{{count}}",
+    "verb": {
+      "dispatch": "已派發",
+      "queue": "已排隊",
+      "started": "已開始",
+      "working": "進行中",
+      "ready_for_audit": "待審計",
+      "pass": "通過",
+      "rework": "返工",
+      "done": "完成",
+      "blocked": "受阻",
+      "needs_input": "需要輸入",
+      "reassign": "已改派",
+      "cancel": "已取消",
+      "send": "已傳送資料",
+      "import": "已匯入",
+      "other": "已記錄"
+    },
+    "status": {
+      "queued": "排隊中",
+      "working": "執行中",
+      "in_audit": "審計中",
+      "awaiting_audit": "等待審計",
+      "rework": "返工",
+      "passed": "已通過",
+      "done": "已完成",
+      "cancelled": "已取消"
+    },
+    "flag": {
+      "blocked": "受阻",
+      "needs_input": "需要輸入",
+      "unaudited": "未審計",
+      "needs_auditor": "缺少審計者",
+      "over_limit": "超出上限",
+      "off_pool": "池外",
+      "economy_unreviewed": "經濟池未複核",
+      "waiting_for_capacity": "等待空閒工作階段",
+      "executor_silent": "執行者無回應",
+      "verdict_inconsistent": "結論不一致",
+      "awaiting_audit_ignored": "審計提醒被忽略",
+      "replacement_churn": "審計者頻繁更換",
+      "markers_unresolved": "標記無法比對"
+    },
+    "settings": {
+      "title": "任務配對（標記驅動監督）",
+      "help": "Brain 派發執行者 + 審計者配對；模型寫標記，守護程序維護狀態。",
+      "engine": "監督引擎",
+      "engine_pairs": "任務配對（預設）",
+      "engine_legacy": "舊版登錄表（回復）",
+      "engine_help": "舊版僅作為本專案的手動回復。",
+      "max_concurrency": "最大並行配對數",
+      "allowlist": "自動選擇白名單",
+      "allowlist_help": "守護程序自行挑選執行者或審計者時使用（佇列派發、審計者替換）。",
+      "allowlist_role": "角色",
+      "role_executor": "執行者",
+      "role_auditor": "審計者",
+      "role_both": "兩者",
+      "agent_type": "代理類型",
+      "model_pattern": "模型包含",
+      "add": "新增",
+      "remove": "移除",
+      "reset": "恢復預設"
+    }
   }
 }

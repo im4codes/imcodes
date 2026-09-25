@@ -73,7 +73,8 @@
     "refresh": "Refresh",
     "show": "Show",
     "hide": "Hide",
-    "this_feature": "This feature"
+    "this_feature": "This feature",
+    "remove": "Remove"
   },
   "usageSummary": {
     "title": "Usage",
@@ -830,7 +831,8 @@
         "kind": {
           "waiting": "Supervision",
           "audit": "Audit",
-          "implementation": "Implementation"
+          "implementation": "Implementation",
+          "pair": "Task pair"
         }
       },
       "globalDefaultsTitle": "Global defaults",
@@ -4210,7 +4212,9 @@
       "waiting_help": "Keep this page open. No desktop traffic starts until approval completes.",
       "try_again": "Try again",
       "generic_error": "The request could not be completed.",
-      "remote_screen": "Remote desktop screen"
+      "remote_screen": "Remote desktop screen",
+      "save_device": "Save to my devices",
+      "saved_device": "Saved to my devices"
     },
     "exit_fullscreen": "Exit full screen",
     "fullscreen_captures_shortcuts": "Full screen also sends the shortcuts the browser keeps for itself, such as ⌘T and ⌘N",
@@ -4285,6 +4289,79 @@
     "quality_priority_resolution": "Keep it sharp",
     "quality_relay_cap": "Relay ≤ {{mbps}} Mbps",
     "quality_relay_cap_hint": "This connection goes through a bandwidth-limited relay server. A direct connection is not limited.",
-    "quality_latency_guard_note": "Only you see these settings; other viewers keep their own. Preset modes also lower the bitrate automatically when the picture starts to lag."
+    "quality_latency_guard_note": "Only you see these settings; other viewers keep their own. Preset modes also lower the bitrate automatically when the picture starts to lag.",
+    "connect_by_id": "Connect by ID",
+    "access_password": "Access password"
+  },
+  "taskPair": {
+    "chip": "{{writer}}: {{verb}}",
+    "daemon": "IM.codes",
+    "unusual": "unusual",
+    "verdict_held": "verdict held: severity rules",
+    "round": "Round {{round}}",
+    "blocking": "Blocking {{levels}}",
+    "severity": "{{level}}×{{count}}",
+    "verb": {
+      "dispatch": "dispatched",
+      "queue": "queued",
+      "started": "started",
+      "working": "working",
+      "ready_for_audit": "ready for audit",
+      "pass": "PASS",
+      "rework": "REWORK",
+      "done": "done",
+      "blocked": "blocked",
+      "needs_input": "needs input",
+      "reassign": "reassigned",
+      "cancel": "cancelled",
+      "send": "sent materials",
+      "import": "imported",
+      "other": "recorded"
+    },
+    "status": {
+      "queued": "Queued",
+      "working": "Working",
+      "in_audit": "In audit",
+      "awaiting_audit": "Awaiting audit",
+      "rework": "Rework",
+      "passed": "Passed",
+      "done": "Done",
+      "cancelled": "Cancelled"
+    },
+    "flag": {
+      "blocked": "Blocked",
+      "needs_input": "Needs input",
+      "unaudited": "Unaudited",
+      "needs_auditor": "Needs auditor",
+      "over_limit": "Over limit",
+      "off_pool": "Off pool",
+      "economy_unreviewed": "Economy unreviewed",
+      "waiting_for_capacity": "Waiting for capacity",
+      "executor_silent": "Executor silent",
+      "verdict_inconsistent": "Verdict inconsistent",
+      "awaiting_audit_ignored": "Audit reminder ignored",
+      "replacement_churn": "Auditor churn",
+      "markers_unresolved": "Unresolved markers"
+    },
+    "settings": {
+      "title": "Task pairs (marker-driven supervision)",
+      "help": "Brain dispatches executor + auditor pairs; models write markers and the daemon keeps the state.",
+      "engine": "Supervision engine",
+      "engine_pairs": "Task pairs (default)",
+      "engine_legacy": "Legacy registry (rollback)",
+      "engine_help": "Legacy is only a manual rollback for this project.",
+      "max_concurrency": "Maximum open pairs",
+      "allowlist": "Allowlist for automatic picks",
+      "allowlist_help": "Used when the daemon picks an executor or auditor itself (queue dispatch, auditor replacement).",
+      "allowlist_role": "Role",
+      "role_executor": "Executor",
+      "role_auditor": "Auditor",
+      "role_both": "Both",
+      "agent_type": "Agent type",
+      "model_pattern": "Model contains",
+      "add": "Add",
+      "remove": "Remove",
+      "reset": "Reset to default"
+    }
   }
 }

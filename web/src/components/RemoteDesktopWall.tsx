@@ -49,6 +49,7 @@ export interface RemoteDesktopWallProps {
   onMinimize?(): void;
   onRestore?(): void;
   onOpenStandalone?(): void;
+  onConnectById?(): void;
   onOpenHost(machine: RemoteDesktopWorkspaceMachine): void;
   onHostKeysChange(hostKeys: readonly string[]): void;
   onClose(hostKeys: readonly string[]): void;
@@ -69,6 +70,7 @@ export function RemoteDesktopWall({
   onMinimize,
   onRestore,
   onOpenStandalone,
+  onConnectById,
   onOpenHost,
   onHostKeysChange,
   onClose,
@@ -188,6 +190,13 @@ export function RemoteDesktopWall({
       <header class="remote-desktop-workspace-header remote-desktop-wall-header">
         <strong>{t('remote_desktop.workspace_wall')}</strong>
         <div class="remote-desktop-workspace-actions">
+          {onConnectById && <button
+            class="remote-desktop-workspace-chrome-button"
+            type="button"
+            onClick={onConnectById}
+            aria-label={t('remote_desktop.connect_by_id')}
+            title={t('remote_desktop.connect_by_id')}
+          >#</button>}
           <button
             class="remote-desktop-workspace-chrome-button remote-desktop-wall-column-toggle"
             type="button"

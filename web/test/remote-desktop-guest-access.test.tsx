@@ -175,4 +175,36 @@ describe('RemoteDesktopGuestAccess', () => {
     expect((screen.getByLabelText(/public_id/) as HTMLInputElement).value).toBe('5123456789');
     expect((screen.getByLabelText(/password/) as HTMLInputElement).value).toBe('');
   });
+
+  it('offers save only after a node-password proof and sends the short-lived proof binding', async () => {
+    const browserKey = await generateRemoteDesktopBrowserKeyPair();
+    const provePassword = vi.fn(async () => ({
+      status: 'ready' as const,
+      hostId: 'host-1',
+      serverId: 'server-1',
+      bootstrapTicket: 'B'.repeat(43),
+      expiresAt: Date.now() + 30_000,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      source: REMOTE_DESKTOP_ACTOR_SOURCE.NODE_PASSWORD,
+      browserKey,
+    }));
+    const saveDevice = vi.fn(async () => ({ id: 'saved-1', publicNodeId: '5123456789', displayName: '5123456789', savedAt: Date.now() }));
+    const starter: RemoteDesktopGuestSessionStarter = { start: vi.fn(async () => ({ stop: vi.fn() })) };
+    render(<RemoteDesktopGuestAccess api={{ provePassword, saveDevice } as unknown as RemoteDesktopAccessApi} sessionStarter={starter} />);
+    fireEvent.input(screen.getByLabelText(/public_id/), { target: { value: '5123456789' } });
+    fireEvent.input(screen.getByLabelText(/password/), { target: { value: 'secret-password' } });
+    fireEvent.click(screen.getByRole('button', { name: /connect/ }));
+    const save = await screen.findByRole('button', { name: 'remote_desktop.guest.save_device' });
+    expect(document.body.textContent).not.toContain('server-1');
+    expect(document.body.textContent).not.toContain('host-1');
+    expect(document.body.innerHTML).not.toContain('B'.repeat(43));
+    expect(document.body.innerHTML).not.toContain(browserKey.thumbprint);
+    fireEvent.click(save);
+    await waitFor(() => expect(saveDevice).toHaveBeenCalledWith({
+      publicNodeId: '5123456789',
+      bootstrapTicket: 'B'.repeat(43),
+      browserKeyThumbprint: browserKey.thumbprint,
+    }));
+    expect(screen.queryByRole('button', { name: 'remote_desktop.guest.save_device' })).toBeNull();
+  });
 });

@@ -48,7 +48,15 @@ type GuestUiState =
   | 'password_unavailable'
   | 'unavailable';
 
+type GuestSaveContext = {
+  publicNodeId: string;
+  bootstrapTicket: string;
+  browserKeyThumbprint: string;
+};
+
 function readResumablePublicNodeId(): string {
+  const queryValue = new URLSearchParams(window.location.search).get('publicId');
+  if (queryValue && /^[5-9]\d{9}$/.test(queryValue)) return queryValue;
   const state = window.history.state;
   if (!state || typeof state !== 'object') return '';
   const candidate = (state as Record<string, unknown>)[REMOTE_DESKTOP_PUBLIC_ID_HISTORY_STATE_KEY];
@@ -79,6 +87,11 @@ export function RemoteDesktopGuestAccess({
   const [error, setError] = useState<string | null>(null);
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [authMode, setAuthMode] = useState<'login' | 'register' | null>(null);
+  // Bearer/proof material is operational state only. Keep it out of the
+  // render tree and clear it whenever this guest session stops.
+  const saveReady = useRef<GuestSaveContext | null>(null);
+  const [saveAvailable, setSaveAvailable] = useState(false);
+  const [saved, setSaved] = useState(false);
   const session = useRef<{ stop(origin: RemoteDesktopStopOrigin): void } | null>(null);
   const invite = useRef<PersistedRemoteDesktopInviteBinding | null>(null);
   const video = useRef<HTMLVideoElement | null>(null);
@@ -108,6 +121,33 @@ export function RemoteDesktopGuestAccess({
         if (alive.current) setStream(snapshot.stream);
       },
     }, (next) => { if (alive.current) setState(next); });
+  };
+
+  const saveCurrentDevice = async () => {
+    const context = saveReady.current;
+    if (!context) return;
+    try {
+      await api.saveDevice(context);
+      setSaved(true);
+      saveReady.current = null;
+      setSaveAvailable(false);
+    } catch (reason) {
+      setError(mapRemoteDesktopApiError(reason));
+    }
+  };
+
+  const captureSaveContext = (ready: RemoteDesktopGuestReady, targetLabel: string) => {
+    if (ready.source !== REMOTE_DESKTOP_ACTOR_SOURCE.NODE_PASSWORD) {
+      saveReady.current = null;
+      setSaveAvailable(false);
+      return;
+    }
+    saveReady.current = {
+      publicNodeId: targetLabel,
+      bootstrapTicket: ready.bootstrapTicket,
+      browserKeyThumbprint: ready.browserKey.thumbprint,
+    };
+    setSaveAvailable(true);
   };
 
   const resolveInvite = async () => {
@@ -165,6 +205,7 @@ export function RemoteDesktopGuestAccess({
       session.current?.stop(REMOTE_DESKTOP_STOP_ORIGIN.GUEST_UNMOUNT);
       session.current = null;
       invite.current = null;
+      saveReady.current = null;
       setStream(null);
       setPassword('');
     };
@@ -191,6 +232,8 @@ export function RemoteDesktopGuestAccess({
         return;
       }
       replacePublicNodeIdHistoryState(null);
+      captureSaveContext(result, targetLabel);
+      setSaved(false);
       await startReady(result, targetLabel);
     } catch (reason) {
       setPassword('');
@@ -204,6 +247,9 @@ export function RemoteDesktopGuestAccess({
     session.current = null;
     setStream(null);
     setTarget(null);
+    saveReady.current = null;
+    setSaveAvailable(false);
+    setSaved(false);
     setError(null);
     if (invite.current) {
       void resolveInvite();
@@ -255,6 +301,10 @@ export function RemoteDesktopGuestAccess({
           <strong>{t(`remote_desktop.guest.state_${state}`)}</strong>
           {target && <p>{t('remote_desktop.guest.target', { target })}</p>}
           {state === 'waiting_for_consent' && <p>{t('remote_desktop.guest.waiting_help')}</p>}
+          {saveAvailable && !saved && (state === 'approved' || state === 'waiting_for_consent') && <button type="button" onClick={() => void saveCurrentDevice()}>
+            {t('remote_desktop.guest.save_device')}
+          </button>}
+          {saved && <p role="status">{t('remote_desktop.guest.saved_device')}</p>}
           {state === 'auth_required' && <>
             <p>{t('remote_desktop.guest.auth_required_help')}</p>
             <div class="remote-desktop-guest-auth-actions">

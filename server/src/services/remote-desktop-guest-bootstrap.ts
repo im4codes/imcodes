@@ -752,6 +752,12 @@ export async function redeemBootstrapForRoute(input: {
       [sessionId, sessionId, input.routeGeneration, input.clientIp, input.now],
     );
     if (bound.changes !== 1) throw new GuestAdmissionRefused();
+    await tx.execute(
+      `UPDATE remote_desktop_guest_bootstraps
+          SET resume_session_id = $2
+        WHERE ticket_hash = $1`,
+      [hashBootstrapTicket(input.proof.ticket), sessionId],
+    );
     await reserveRouteTx(tx, {
       hostId: redeemed.hostId,
       routeId: sessionId,

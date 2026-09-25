@@ -1097,6 +1097,14 @@ export async function applyUnattendedPasswordMutationTx(
     if (updated.changes !== 1) throw new Error('password_generation_raced');
   }
 
+  // Saved locators are tied to the accepted password generation. Rotation and
+  // disable revoke them atomically with the credential mutation; they never
+  // become an alternate authenticated share.
+  await tx.execute(
+    'DELETE FROM remote_desktop_saved_devices WHERE host_id = $1',
+    [host.id],
+  );
+
   const routes = await tx.query<PasswordMutationRouteRow>(
     `SELECT route.route_id,
             route.route_generation,

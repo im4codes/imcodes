@@ -73,7 +73,8 @@
     "refresh": "Actualizar",
     "show": "Mostrar",
     "hide": "Ocultar",
-    "this_feature": "Esta función"
+    "this_feature": "Esta función",
+    "remove": "Eliminar"
   },
   "usageSummary": {
     "title": "Usage",
@@ -830,7 +831,8 @@
         "kind": {
           "waiting": "supervisión",
           "audit": "auditoría",
-          "implementation": "implementación"
+          "implementation": "implementación",
+          "pair": "Par de tareas"
         }
       },
       "globalDefaultsTitle": "Valores globales por defecto",
@@ -4210,7 +4212,9 @@
       "waiting_help": "Keep this page open. No desktop traffic starts until approval completes.",
       "try_again": "Try again",
       "generic_error": "The request could not be completed.",
-      "remote_screen": "Remote desktop screen"
+      "remote_screen": "Remote desktop screen",
+      "save_device": "Guardar en mis dispositivos",
+      "saved_device": "Guardado en mis dispositivos"
     },
     "exit_fullscreen": "Salir de pantalla completa",
     "fullscreen_captures_shortcuts": "En pantalla completa también se envían los atajos que el navegador se reserva, como ⌘T y ⌘N",
@@ -4285,6 +4289,79 @@
     "quality_priority_resolution": "Priorizar nitidez",
     "quality_relay_cap": "Relé ≤ {{mbps}} Mbps",
     "quality_relay_cap_hint": "Esta conexión pasa por un servidor relé con ancho de banda limitado. Una conexión directa no tiene límite.",
-    "quality_latency_guard_note": "Solo tú ves estos ajustes; cada espectador tiene los suyos. Los modos predefinidos también bajan la tasa de bits automáticamente si la imagen empieza a retrasarse."
+    "quality_latency_guard_note": "Solo tú ves estos ajustes; cada espectador tiene los suyos. Los modos predefinidos también bajan la tasa de bits automáticamente si la imagen empieza a retrasarse.",
+    "connect_by_id": "Conectar por ID",
+    "access_password": "Contraseña de acceso"
+  },
+  "taskPair": {
+    "chip": "{{writer}}: {{verb}}",
+    "daemon": "IM.codes",
+    "unusual": "inusual",
+    "verdict_held": "veredicto retenido: reglas de severidad",
+    "round": "Ronda {{round}}",
+    "blocking": "Bloqueantes {{levels}}",
+    "severity": "{{level}}×{{count}}",
+    "verb": {
+      "dispatch": "asignada",
+      "queue": "en cola",
+      "started": "iniciada",
+      "working": "en curso",
+      "ready_for_audit": "lista para auditoría",
+      "pass": "APROBADA",
+      "rework": "REHACER",
+      "done": "terminada",
+      "blocked": "bloqueada",
+      "needs_input": "necesita datos",
+      "reassign": "reasignada",
+      "cancel": "cancelada",
+      "send": "materiales enviados",
+      "import": "importada",
+      "other": "registrada"
+    },
+    "status": {
+      "queued": "En cola",
+      "working": "En curso",
+      "in_audit": "En auditoría",
+      "awaiting_audit": "Esperando auditoría",
+      "rework": "Rehacer",
+      "passed": "Aprobada",
+      "done": "Terminada",
+      "cancelled": "Cancelada"
+    },
+    "flag": {
+      "blocked": "Bloqueada",
+      "needs_input": "Necesita datos",
+      "unaudited": "Sin auditar",
+      "needs_auditor": "Falta auditor",
+      "over_limit": "Sobre el límite",
+      "off_pool": "Fuera del grupo",
+      "economy_unreviewed": "Económica sin revisar",
+      "waiting_for_capacity": "Esperando capacidad",
+      "executor_silent": "Ejecutor sin respuesta",
+      "verdict_inconsistent": "Veredicto incoherente",
+      "awaiting_audit_ignored": "Recordatorio ignorado",
+      "replacement_churn": "Cambios de auditor",
+      "markers_unresolved": "Marcadores sin resolver"
+    },
+    "settings": {
+      "title": "Pares de tareas (supervisión por marcadores)",
+      "help": "El Brain asigna pares ejecutor + auditor; los modelos escriben marcadores y el daemon mantiene el estado.",
+      "engine": "Motor de supervisión",
+      "engine_pairs": "Pares de tareas (predeterminado)",
+      "engine_legacy": "Registro heredado (reversión)",
+      "engine_help": "El heredado es solo una reversión manual para este proyecto.",
+      "max_concurrency": "Máximo de pares abiertos",
+      "allowlist": "Lista permitida para selección automática",
+      "allowlist_help": "Se usa cuando el daemon elige por sí mismo un ejecutor o auditor (cola, reemplazo de auditor).",
+      "allowlist_role": "Rol",
+      "role_executor": "Ejecutor",
+      "role_auditor": "Auditor",
+      "role_both": "Ambos",
+      "agent_type": "Tipo de agente",
+      "model_pattern": "El modelo contiene",
+      "add": "Añadir",
+      "remove": "Quitar",
+      "reset": "Restablecer"
+    }
   }
 }

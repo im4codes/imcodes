@@ -73,7 +73,8 @@
     "refresh": "刷新",
     "show": "显示",
     "hide": "隐藏",
-    "this_feature": "此功能"
+    "this_feature": "此功能",
+    "remove": "删除"
   },
   "usageSummary": {
     "title": "Usage",
@@ -830,7 +831,8 @@
         "kind": {
           "waiting": "监督",
           "audit": "审计",
-          "implementation": "实施"
+          "implementation": "实施",
+          "pair": "任务配对"
         }
       },
       "globalDefaultsTitle": "全局默认配置",
@@ -4210,7 +4212,9 @@
       "waiting_help": "请保持此页面打开。完成同意前不会传输桌面数据。",
       "try_again": "重试",
       "generic_error": "无法完成请求。",
-      "remote_screen": "远程桌面画面"
+      "remote_screen": "远程桌面画面",
+      "save_device": "保存到我的设备",
+      "saved_device": "已保存到我的设备"
     },
     "exit_fullscreen": "退出全屏",
     "fullscreen_captures_shortcuts": "全屏后，浏览器自己占用的快捷键（如 ⌘T、⌘N）也会发给远程",
@@ -4285,6 +4289,79 @@
     "quality_priority_resolution": "优先清晰",
     "quality_relay_cap": "中继 ≤ {{mbps}} Mbps",
     "quality_relay_cap_hint": "当前连接经过限速的中继服务器，直连不受限制。",
-    "quality_latency_guard_note": "这些设置只影响你自己，其他观看者各自独立。预设模式在画面开始延迟时还会自动降低码率。"
+    "quality_latency_guard_note": "这些设置只影响你自己，其他观看者各自独立。预设模式在画面开始延迟时还会自动降低码率。",
+    "connect_by_id": "通过 ID 连接",
+    "access_password": "远桌访问密码"
+  },
+  "taskPair": {
+    "chip": "{{writer}}：{{verb}}",
+    "daemon": "IM.codes",
+    "unusual": "非常规",
+    "verdict_held": "结论未采纳：不符合严重级别规则",
+    "round": "第 {{round}} 轮",
+    "blocking": "阻断级别 {{levels}}",
+    "severity": "{{level}}×{{count}}",
+    "verb": {
+      "dispatch": "已派发",
+      "queue": "已排队",
+      "started": "已开始",
+      "working": "进行中",
+      "ready_for_audit": "待审计",
+      "pass": "通过",
+      "rework": "返工",
+      "done": "完成",
+      "blocked": "受阻",
+      "needs_input": "需要输入",
+      "reassign": "已改派",
+      "cancel": "已取消",
+      "send": "已发送材料",
+      "import": "已导入",
+      "other": "已记录"
+    },
+    "status": {
+      "queued": "排队中",
+      "working": "执行中",
+      "in_audit": "审计中",
+      "awaiting_audit": "等待审计",
+      "rework": "返工",
+      "passed": "已通过",
+      "done": "已完成",
+      "cancelled": "已取消"
+    },
+    "flag": {
+      "blocked": "受阻",
+      "needs_input": "需要输入",
+      "unaudited": "未审计",
+      "needs_auditor": "缺少审计者",
+      "over_limit": "超出上限",
+      "off_pool": "池外",
+      "economy_unreviewed": "经济池未复核",
+      "waiting_for_capacity": "等待空闲会话",
+      "executor_silent": "执行者无响应",
+      "verdict_inconsistent": "结论不一致",
+      "awaiting_audit_ignored": "审计提醒被忽略",
+      "replacement_churn": "审计者频繁更换",
+      "markers_unresolved": "标记无法匹配"
+    },
+    "settings": {
+      "title": "任务配对（标记驱动监督）",
+      "help": "Brain 派发执行者 + 审计者配对；模型写标记，守护进程维护状态。",
+      "engine": "监督引擎",
+      "engine_pairs": "任务配对（默认）",
+      "engine_legacy": "旧版注册表（回滚）",
+      "engine_help": "旧版仅作为本项目的手动回滚。",
+      "max_concurrency": "最大并行配对数",
+      "allowlist": "自动选择白名单",
+      "allowlist_help": "守护进程自行挑选执行者或审计者时使用（队列派发、审计者替换）。",
+      "allowlist_role": "角色",
+      "role_executor": "执行者",
+      "role_auditor": "审计者",
+      "role_both": "两者",
+      "agent_type": "智能体类型",
+      "model_pattern": "模型包含",
+      "add": "添加",
+      "remove": "移除",
+      "reset": "恢复默认"
+    }
   }
 }

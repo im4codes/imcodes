@@ -73,7 +73,8 @@
     "refresh": "새로고침",
     "show": "표시",
     "hide": "숨기기",
-    "this_feature": "이 기능"
+    "this_feature": "이 기능",
+    "remove": "삭제"
   },
   "usageSummary": {
     "title": "Usage",
@@ -830,7 +831,8 @@
         "kind": {
           "waiting": "감독",
           "audit": "감사",
-          "implementation": "구현"
+          "implementation": "구현",
+          "pair": "작업 페어"
         }
       },
       "globalDefaultsTitle": "전역 기본값",
@@ -4209,7 +4211,9 @@
       "waiting_help": "Keep this page open. No desktop traffic starts until approval completes.",
       "try_again": "Try again",
       "generic_error": "The request could not be completed.",
-      "remote_screen": "Remote desktop screen"
+      "remote_screen": "Remote desktop screen",
+      "save_device": "내 기기에 저장",
+      "saved_device": "내 기기에 저장됨"
     },
     "exit_fullscreen": "전체 화면 종료",
     "fullscreen_captures_shortcuts": "전체 화면에서는 ⌘T, ⌘N 처럼 브라우저가 가로채는 단축키도 전송됩니다",
@@ -4284,6 +4288,79 @@
     "quality_priority_resolution": "선명함 우선",
     "quality_relay_cap": "릴레이 ≤ {{mbps}}Mbps",
     "quality_relay_cap_hint": "이 연결은 대역폭이 제한된 릴레이 서버를 거칩니다. 직접 연결은 제한되지 않습니다.",
-    "quality_latency_guard_note": "이 설정은 나에게만 적용되며 다른 시청자는 각자 설정합니다. 프리셋 모드는 화면이 지연되기 시작하면 비트레이트도 자동으로 낮춥니다."
+    "quality_latency_guard_note": "이 설정은 나에게만 적용되며 다른 시청자는 각자 설정합니다. 프리셋 모드는 화면이 지연되기 시작하면 비트레이트도 자동으로 낮춥니다.",
+    "connect_by_id": "ID로 연결",
+    "access_password": "접속 비밀번호"
+  },
+  "taskPair": {
+    "chip": "{{writer}}: {{verb}}",
+    "daemon": "IM.codes",
+    "unusual": "비정상",
+    "verdict_held": "판정 보류: 심각도 규칙",
+    "round": "{{round}}라운드",
+    "blocking": "차단 수준 {{levels}}",
+    "severity": "{{level}}×{{count}}",
+    "verb": {
+      "dispatch": "배정됨",
+      "queue": "대기열 등록",
+      "started": "시작",
+      "working": "작업 중",
+      "ready_for_audit": "감사 준비",
+      "pass": "통과",
+      "rework": "재작업",
+      "done": "완료",
+      "blocked": "막힘",
+      "needs_input": "입력 필요",
+      "reassign": "재배정",
+      "cancel": "취소",
+      "send": "자료 전송",
+      "import": "가져옴",
+      "other": "기록됨"
+    },
+    "status": {
+      "queued": "대기 중",
+      "working": "작업 중",
+      "in_audit": "감사 중",
+      "awaiting_audit": "감사 대기",
+      "rework": "재작업",
+      "passed": "통과",
+      "done": "완료",
+      "cancelled": "취소됨"
+    },
+    "flag": {
+      "blocked": "막힘",
+      "needs_input": "입력 필요",
+      "unaudited": "감사 안 됨",
+      "needs_auditor": "감사자 필요",
+      "over_limit": "한도 초과",
+      "off_pool": "풀 외부",
+      "economy_unreviewed": "이코노미 미검토",
+      "waiting_for_capacity": "여유 세션 대기",
+      "executor_silent": "실행자 무응답",
+      "verdict_inconsistent": "판정 불일치",
+      "awaiting_audit_ignored": "감사 알림 무시됨",
+      "replacement_churn": "감사자 잦은 교체",
+      "markers_unresolved": "해결되지 않은 마커"
+    },
+    "settings": {
+      "title": "작업 페어(마커 기반 감독)",
+      "help": "Brain이 실행자 + 감사자 페어를 배정하고, 모델이 마커를 쓰며, 데몬이 상태를 관리합니다.",
+      "engine": "감독 엔진",
+      "engine_pairs": "작업 페어(기본)",
+      "engine_legacy": "레거시 레지스트리(롤백)",
+      "engine_help": "레거시는 이 프로젝트의 수동 롤백 전용입니다.",
+      "max_concurrency": "최대 열린 페어 수",
+      "allowlist": "자동 선택 허용 목록",
+      "allowlist_help": "데몬이 실행자나 감사자를 직접 고를 때(대기열 배정, 감사자 교체) 사용합니다.",
+      "allowlist_role": "역할",
+      "role_executor": "실행자",
+      "role_auditor": "감사자",
+      "role_both": "둘 다",
+      "agent_type": "에이전트 유형",
+      "model_pattern": "모델 포함",
+      "add": "추가",
+      "remove": "제거",
+      "reset": "기본값으로"
+    }
   }
 }

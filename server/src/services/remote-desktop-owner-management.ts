@@ -135,6 +135,10 @@ export async function rotateOwnerPublicNodeId(
               AND redeemed_at IS NULL`,
           [input.hostId],
         );
+        await rotationTx.execute(
+          'DELETE FROM remote_desktop_saved_devices WHERE host_id = $1',
+          [input.hostId],
+        );
       },
     });
     const host = await loadOwnedHost(tx, input.accountSession.userId, input.hostId);

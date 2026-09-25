@@ -54,6 +54,7 @@ import {
 } from '../machine-grouping.js';
 
 import { VerificationMachinesSection } from './VerificationMachinesSection.js';
+import { createRemoteDesktopAccessApi, type SavedRemoteDesktopDevice } from '../api/remote-desktop-access.js';
 
 /**
  * Auto unlock exists only where the remote-desktop worker does: it is that
@@ -120,6 +121,7 @@ const PLATFORM_PRESENTATION: Record<ControlledNodeOs, { glyph: string; name: str
 export interface ControlledNodesPanelProps {
   onOpenRemoteDesktop?(machine: MachineListItem): void;
   onOpenRemoteDesktopWall?(): void;
+  onConnectById?(): void;
   projectKey?: string;
   initialNodeId?: string;
   initialAction?: typeof REMOTE_DESKTOP_LOCAL_WEB_ACTION[
@@ -132,12 +134,15 @@ const CONTROLLED_NODES_MOBILE_ACTIONS_MAX_WIDTH = 640;
 export function ControlledNodesPanel({
   onOpenRemoteDesktop,
   onOpenRemoteDesktopWall,
+  onConnectById,
   projectKey,
   initialNodeId,
   initialAction = REMOTE_DESKTOP_LOCAL_WEB_ACTION.MANAGE,
 }: ControlledNodesPanelProps) {
   const { t, i18n } = useTranslation();
   const { machines, loaded, loading, error, refetch } = useMachines();
+  const [savedRemoteDevices, setSavedRemoteDevices] = useState<SavedRemoteDesktopDevice[]>([]);
+  const savedRemoteDesktopApi = useMemo(() => createRemoteDesktopAccessApi(), []);
 
   const [artifacts, setArtifacts] = useState<ControlledNodeArtifactMetadata[]>([]);
   const [downloadTargets, setDownloadTargets] = useState<ControlledNodeArtifactSelection[]>([]);
@@ -176,9 +181,22 @@ export function ControlledNodesPanel({
   const [editingServerId, setEditingServerId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [sharingMachine, setSharingMachine] = useState<MachineListItem | null>(null);
+  const [sharingMachineSection, setSharingMachineSection] = useState<'account' | 'remote-desktop'>('account');
   const [mobileActions, setMobileActions] = useState(
     () => typeof window !== 'undefined' && window.innerWidth <= CONTROLLED_NODES_MOBILE_ACTIONS_MAX_WIDTH,
   );
+
+  useEffect(() => {
+    let active = true;
+    void savedRemoteDesktopApi.listSavedDevices().then((devices) => {
+      if (active) setSavedRemoteDevices(devices);
+    }).catch(() => { if (active) setSavedRemoteDevices([]); });
+    return () => { active = false; };
+  }, [savedRemoteDesktopApi]);
+
+  const openSavedRemoteDevice = (device: SavedRemoteDesktopDevice) => {
+    window.open(`/remote-desktop/access?publicId=${encodeURIComponent(device.publicNodeId)}`, '_blank', 'noopener,noreferrer');
+  };
   const [mobileActionMenuServerId, setMobileActionMenuServerId] = useState<string | null>(null);
   const mobileActionMenuTriggerRef = useRef<HTMLButtonElement | null>(null);
   const mobileActionMenuPanelRef = useRef<HTMLDivElement | null>(null);
@@ -632,11 +650,22 @@ export function ControlledNodesPanel({
               disabled={busyServerId === machine.serverId}
               onClick={() => {
                 closeAfterAction();
+                setSharingMachineSection('account');
                 setSharingMachine(machine);
               }}
             >
               {t('share.menu.shareTab')}
             </button>
+            {machine.remoteDesktopHostId && <button
+              type="button"
+              class="controlled-nodes-share"
+              disabled={busyServerId === machine.serverId}
+              onClick={() => {
+                closeAfterAction();
+                setSharingMachineSection('remote-desktop');
+                setSharingMachine(machine);
+              }}
+            >{t('remote_desktop.access_password')}</button>}
             <button
               type="button"
               class="controlled-nodes-rename"
@@ -783,6 +812,9 @@ export function ControlledNodesPanel({
             <h3>{t('controlled_nodes.machines_title')}</h3>
           </div>
           <div class="controlled-nodes-machines-actions">
+            {onConnectById && <button type="button" class="controlled-nodes-wall" onClick={onConnectById}>
+              <span aria-hidden="true">#</span>{t('remote_desktop.connect_by_id')}
+            </button>}
             {onOpenRemoteDesktopWall && (
               <button type="button" class="controlled-nodes-wall" onClick={onOpenRemoteDesktopWall}>
                 <span aria-hidden="true">▦</span>{t('remote_desktop.workspace_wall')}
@@ -800,6 +832,20 @@ export function ControlledNodesPanel({
           </div>
         </div>
         {actionError && <p class="controlled-nodes-error" role="alert">{actionError}</p>}
+        {savedRemoteDevices.length > 0 && <section class="controlled-nodes-saved-remote" aria-label={t('remote_desktop.guest.saved_device')}>
+          <h4>{t('remote_desktop.guest.saved_device')}</h4>
+          <ul>
+            {savedRemoteDevices.map((device) => <li key={device.id}>
+              <span><strong>{device.displayName}</strong> <small>{device.publicNodeId}</small></span>
+              <button type="button" onClick={() => openSavedRemoteDevice(device)}>{t('remote_desktop.connect_by_id')}</button>
+              <button type="button" onClick={() => void savedRemoteDesktopApi.removeSavedDevice(device.id)
+                .then(() => setSavedRemoteDevices((items) => items.filter((item) => item.id !== device.id)))
+                .catch(() => setActionError(t('controlled_nodes.refresh_error')))}>
+                {t('common.remove')}
+              </button>
+            </li>)}
+          </ul>
+        </section>}
         {(presenceRefreshFailed || error) && (
           <p class="controlled-nodes-error controlled-nodes-presence-error" role="alert">
             {t('controlled_nodes.refresh_error')}
@@ -1194,6 +1240,7 @@ export function ControlledNodesPanel({
             hostId: sharingMachine.remoteDesktopHostId ?? null,
             endpointLabel: sharingMachine.displayName,
           }}
+          initialMachineSection={sharingMachineSection}
           onClose={() => setSharingMachine(null)}
           onSharesChanged={() => { void refreshPresence(); }}
         />

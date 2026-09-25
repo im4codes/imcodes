@@ -13,6 +13,8 @@ import {
   REMOTE_DESKTOP_SHELL_MSG,
   isCanonicalRemoteDesktopLinkToken,
   isCanonicalRemoteDesktopCreationRequestId,
+  isCanonicalRemoteDesktopBrowserKeyThumbprint,
+  isRemoteDesktopPublicNodeId,
   validateRemoteDesktopClaimProof,
   validateRemoteDesktopLinkCreateRequest,
   validateRemoteDesktopShellMessage,
@@ -73,6 +75,11 @@ import {
   redeemRemoteDesktopShellLaunchContext,
 } from '../services/remote-desktop-shell-launch-context.js';
 import logger from '../util/logger.js';
+import {
+  listSavedRemoteDesktopDevices,
+  removeSavedRemoteDesktopDevice,
+  saveRemoteDesktopDevice,
+} from '../services/remote-desktop-saved-devices.js';
 
 /**
  * Account-authenticated guest-access surface plus account-Owner management.
@@ -213,6 +220,32 @@ function parseRevoke(value: unknown): Omit<NonNullable<ReturnType<typeof parseMu
   return rest;
 }
 
+function parseSavedDeviceProof(value: unknown): {
+  publicNodeId: string;
+  bootstrapTicket: string;
+  browserKeyThumbprint: string;
+} | null {
+  const body = asExactRecord(value, ['publicNodeId', 'bootstrapTicket', 'browserKeyThumbprint']);
+  if (!body
+    || !isRemoteDesktopPublicNodeId(Number(body.publicNodeId))
+    || typeof body.publicNodeId !== 'string'
+    || typeof body.bootstrapTicket !== 'string'
+    || body.bootstrapTicket.length < 20 || body.bootstrapTicket.length > 512
+    || !isCanonicalRemoteDesktopBrowserKeyThumbprint(body.browserKeyThumbprint)) return null;
+  return {
+    publicNodeId: body.publicNodeId,
+    bootstrapTicket: body.bootstrapTicket,
+    browserKeyThumbprint: body.browserKeyThumbprint,
+  };
+}
+
+function presentSavedDevice(device: Awaited<ReturnType<typeof saveRemoteDesktopDevice>>): Record<string, unknown> | null {
+  if (!device) return null;
+  // Guest locators intentionally do not disclose the owner's internal host id
+  // or server display name; the public ID is the only reconnect label.
+  return { id: device.id, publicNodeId: device.publicNodeId, displayName: device.publicNodeId, savedAt: device.savedAt };
+}
+
 /** Explicit response allowlist: hashes, bearers and browser material cannot leak if the service grows. */
 function presentOwnerLink(link: OwnerLinkView): Record<string, unknown> {
   return {
@@ -331,6 +364,41 @@ remoteDesktopGuestAccessRoutes.post('/remote-desktop/guest/resolve', async (c) =
     mode: result.mode,
     source: result.source,
   });
+});
+
+/**
+ * Save only the locator produced by a recent password proof. This does not
+ * create a server share: every future connection still returns to ID/password.
+ */
+remoteDesktopGuestAccessRoutes.get('/remote-desktop/guest/saved-devices', async (c) => {
+  c.header('Cache-Control', 'no-store');
+  const accountSession = await resolveRemoteDesktopAccountSession(c);
+  if (!accountSession) return c.json({ error: 'unauthorized' }, 401);
+  const devices = await listSavedRemoteDesktopDevices(c.env.DB, accountSession.userId, Date.now());
+  return c.json({ devices: devices.map((device) => presentSavedDevice(device)) });
+});
+
+remoteDesktopGuestAccessRoutes.post('/remote-desktop/guest/saved-devices', async (c) => {
+  c.header('Cache-Control', 'no-store');
+  const accountSession = await resolveRemoteDesktopAccountSession(c);
+  if (!accountSession) return c.json({ error: 'unauthorized' }, 401);
+  const parsed = parseSavedDeviceProof(await readJson(c));
+  if (!parsed) return c.json({ error: 'not_found_or_unauthorized' }, 404);
+  const device = await saveRemoteDesktopDevice(c.env.DB, {
+    userId: accountSession.userId,
+    ...parsed,
+    now: Date.now(),
+  });
+  const presented = presentSavedDevice(device);
+  return presented ? c.json({ device: presented }) : c.json({ error: 'not_found_or_unauthorized' }, 404);
+});
+
+remoteDesktopGuestAccessRoutes.delete('/remote-desktop/guest/saved-devices/:id', async (c) => {
+  c.header('Cache-Control', 'no-store');
+  const accountSession = await resolveRemoteDesktopAccountSession(c);
+  if (!accountSession) return c.json({ error: 'unauthorized' }, 401);
+  const removed = await removeSavedRemoteDesktopDevice(c.env.DB, accountSession.userId, c.req.param('id'));
+  return removed ? c.json({ ok: true }) : c.json({ error: 'not_found' }, 404);
 });
 
 /** Owner canonical-host summary. Public ID is non-secret but still Owner-scoped. */

@@ -27,6 +27,7 @@ interface Props {
   variant?: 'session' | 'machine';
   /** Owner-only public remote-desktop access lives inside the machine share dialog. */
   remoteDesktopAccess?: RemoteDesktopShareAccess;
+  initialMachineSection?: 'account' | 'remote-desktop';
 }
 
 type TargetChoice = 'current-tab' | 'server';
@@ -49,10 +50,11 @@ export function ShareSessionDialog({
   fixedTarget,
   variant = 'session',
   remoteDesktopAccess,
+  initialMachineSection = 'account',
 }: Props) {
   const { t } = useTranslation();
   const [targetChoice, setTargetChoice] = useState<TargetChoice>('current-tab');
-  const [machineSection, setMachineSection] = useState<MachineShareSection>('account');
+  const [machineSection, setMachineSection] = useState<MachineShareSection>(initialMachineSection);
   const [role, setRole] = useState<ShareRole>('viewer');
   const [targetUser, setTargetUser] = useState('');
   const [submitting, setSubmitting] = useState(false);

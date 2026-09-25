@@ -73,7 +73,8 @@
     "refresh": "Обновить",
     "show": "Показать",
     "hide": "Скрыть",
-    "this_feature": "Эта функция"
+    "this_feature": "Эта функция",
+    "remove": "Удалить"
   },
   "usageSummary": {
     "title": "Usage",
@@ -830,7 +831,8 @@
         "kind": {
           "waiting": "надзор",
           "audit": "аудит",
-          "implementation": "реализация"
+          "implementation": "реализация",
+          "pair": "Пара задач"
         }
       },
       "globalDefaultsTitle": "Глобальные значения по умолчанию",
@@ -4209,7 +4211,9 @@
       "waiting_help": "Keep this page open. No desktop traffic starts until approval completes.",
       "try_again": "Try again",
       "generic_error": "The request could not be completed.",
-      "remote_screen": "Remote desktop screen"
+      "remote_screen": "Remote desktop screen",
+      "save_device": "Сохранить в мои устройства",
+      "saved_device": "Сохранено в моих устройствах"
     },
     "exit_fullscreen": "Выйти из полноэкранного режима",
     "fullscreen_captures_shortcuts": "В полноэкранном режиме передаются и горячие клавиши самого браузера, например ⌘T и ⌘N",
@@ -4284,6 +4288,79 @@
     "quality_priority_resolution": "Сохранять чёткость",
     "quality_relay_cap": "Ретранслятор ≤ {{mbps}} Мбит/с",
     "quality_relay_cap_hint": "Соединение идёт через ретранслятор с ограниченной скоростью. Прямое соединение не ограничено.",
-    "quality_latency_guard_note": "Эти настройки видите только вы; у других зрителей свои. Готовые режимы также автоматически снижают битрейт, когда изображение начинает отставать."
+    "quality_latency_guard_note": "Эти настройки видите только вы; у других зрителей свои. Готовые режимы также автоматически снижают битрейт, когда изображение начинает отставать.",
+    "connect_by_id": "Подключиться по ID",
+    "access_password": "Пароль доступа"
+  },
+  "taskPair": {
+    "chip": "{{writer}}: {{verb}}",
+    "daemon": "IM.codes",
+    "unusual": "необычно",
+    "verdict_held": "вердикт отложен: правила серьёзности",
+    "round": "Раунд {{round}}",
+    "blocking": "Блокирующие {{levels}}",
+    "severity": "{{level}}×{{count}}",
+    "verb": {
+      "dispatch": "назначена",
+      "queue": "в очереди",
+      "started": "начата",
+      "working": "в работе",
+      "ready_for_audit": "готова к аудиту",
+      "pass": "PASS",
+      "rework": "REWORK",
+      "done": "готово",
+      "blocked": "заблокирована",
+      "needs_input": "нужен ввод",
+      "reassign": "переназначена",
+      "cancel": "отменена",
+      "send": "материалы отправлены",
+      "import": "импортирована",
+      "other": "записано"
+    },
+    "status": {
+      "queued": "В очереди",
+      "working": "В работе",
+      "in_audit": "На аудите",
+      "awaiting_audit": "Ждёт аудита",
+      "rework": "Доработка",
+      "passed": "Принята",
+      "done": "Готово",
+      "cancelled": "Отменена"
+    },
+    "flag": {
+      "blocked": "Заблокирована",
+      "needs_input": "Нужен ввод",
+      "unaudited": "Без аудита",
+      "needs_auditor": "Нужен аудитор",
+      "over_limit": "Сверх лимита",
+      "off_pool": "Вне пула",
+      "economy_unreviewed": "Эконом без проверки",
+      "waiting_for_capacity": "Ждёт свободную сессию",
+      "executor_silent": "Исполнитель молчит",
+      "verdict_inconsistent": "Противоречивый вердикт",
+      "awaiting_audit_ignored": "Напоминание проигнорировано",
+      "replacement_churn": "Частая смена аудитора",
+      "markers_unresolved": "Неразрешённые маркеры"
+    },
+    "settings": {
+      "title": "Пары задач (надзор по маркерам)",
+      "help": "Brain назначает пары исполнитель + аудитор; модели пишут маркеры, демон ведёт состояние.",
+      "engine": "Движок надзора",
+      "engine_pairs": "Пары задач (по умолчанию)",
+      "engine_legacy": "Старый реестр (откат)",
+      "engine_help": "Старый движок — только ручной откат для этого проекта.",
+      "max_concurrency": "Максимум открытых пар",
+      "allowlist": "Разрешённый список для автовыбора",
+      "allowlist_help": "Используется, когда демон сам выбирает исполнителя или аудитора (очередь, замена аудитора).",
+      "allowlist_role": "Роль",
+      "role_executor": "Исполнитель",
+      "role_auditor": "Аудитор",
+      "role_both": "Обе",
+      "agent_type": "Тип агента",
+      "model_pattern": "Модель содержит",
+      "add": "Добавить",
+      "remove": "Удалить",
+      "reset": "Сбросить"
+    }
   }
 }

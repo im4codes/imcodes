@@ -73,7 +73,8 @@
     "refresh": "更新",
     "show": "表示",
     "hide": "隠す",
-    "this_feature": "この機能"
+    "this_feature": "この機能",
+    "remove": "削除"
   },
   "usageSummary": {
     "title": "Usage",
@@ -830,7 +831,8 @@
         "kind": {
           "waiting": "監督",
           "audit": "監査",
-          "implementation": "実装"
+          "implementation": "実装",
+          "pair": "タスクペア"
         }
       },
       "globalDefaultsTitle": "グローバル既定値",
@@ -4209,7 +4211,9 @@
       "waiting_help": "Keep this page open. No desktop traffic starts until approval completes.",
       "try_again": "Try again",
       "generic_error": "The request could not be completed.",
-      "remote_screen": "Remote desktop screen"
+      "remote_screen": "Remote desktop screen",
+      "save_device": "デバイスに保存",
+      "saved_device": "デバイスに保存しました"
     },
     "exit_fullscreen": "全画面を終了",
     "fullscreen_captures_shortcuts": "フルスクリーンなら、ブラウザが使う ⌘T や ⌘N などのショートカットも送信されます",
@@ -4284,6 +4288,79 @@
     "quality_priority_resolution": "精細さ優先",
     "quality_relay_cap": "リレー ≤ {{mbps}} Mbps",
     "quality_relay_cap_hint": "この接続は帯域制限のあるリレーサーバーを経由しています。直接接続には制限がありません。",
-    "quality_latency_guard_note": "この設定はあなたにだけ適用され、他の閲覧者はそれぞれ独自の設定です。プリセットモードでは映像が遅れ始めるとビットレートも自動で下げます。"
+    "quality_latency_guard_note": "この設定はあなたにだけ適用され、他の閲覧者はそれぞれ独自の設定です。プリセットモードでは映像が遅れ始めるとビットレートも自動で下げます。",
+    "connect_by_id": "IDで接続",
+    "access_password": "アクセスパスワード"
+  },
+  "taskPair": {
+    "chip": "{{writer}}：{{verb}}",
+    "daemon": "IM.codes",
+    "unusual": "通常外",
+    "verdict_held": "判定保留：重大度ルール",
+    "round": "第 {{round}} ラウンド",
+    "blocking": "ブロッキング {{levels}}",
+    "severity": "{{level}}×{{count}}",
+    "verb": {
+      "dispatch": "割り当て済み",
+      "queue": "キュー登録",
+      "started": "開始",
+      "working": "作業中",
+      "ready_for_audit": "監査待ち",
+      "pass": "合格",
+      "rework": "差し戻し",
+      "done": "完了",
+      "blocked": "ブロック",
+      "needs_input": "入力が必要",
+      "reassign": "再割り当て",
+      "cancel": "キャンセル",
+      "send": "資料送付",
+      "import": "インポート",
+      "other": "記録"
+    },
+    "status": {
+      "queued": "キュー中",
+      "working": "作業中",
+      "in_audit": "監査中",
+      "awaiting_audit": "監査待ち",
+      "rework": "差し戻し",
+      "passed": "合格",
+      "done": "完了",
+      "cancelled": "キャンセル"
+    },
+    "flag": {
+      "blocked": "ブロック",
+      "needs_input": "入力が必要",
+      "unaudited": "未監査",
+      "needs_auditor": "監査者なし",
+      "over_limit": "上限超過",
+      "off_pool": "プール外",
+      "economy_unreviewed": "エコノミー未レビュー",
+      "waiting_for_capacity": "空き待ち",
+      "executor_silent": "実行者無応答",
+      "verdict_inconsistent": "判定の不整合",
+      "awaiting_audit_ignored": "監査リマインダー無視",
+      "replacement_churn": "監査者の頻繁な交代",
+      "markers_unresolved": "未解決のマーカー"
+    },
+    "settings": {
+      "title": "タスクペア（マーカー駆動の監督）",
+      "help": "Brain が実行者 + 監査者のペアを割り当て、モデルがマーカーを書き、デーモンが状態を管理します。",
+      "engine": "監督エンジン",
+      "engine_pairs": "タスクペア（既定）",
+      "engine_legacy": "従来のレジストリ（ロールバック）",
+      "engine_help": "従来方式はこのプロジェクトの手動ロールバック専用です。",
+      "max_concurrency": "同時オープンペア数の上限",
+      "allowlist": "自動選択の許可リスト",
+      "allowlist_help": "デーモンが実行者や監査者を自ら選ぶとき（キュー割り当て、監査者の交代）に使います。",
+      "allowlist_role": "ロール",
+      "role_executor": "実行者",
+      "role_auditor": "監査者",
+      "role_both": "両方",
+      "agent_type": "エージェント種別",
+      "model_pattern": "モデルに含む",
+      "add": "追加",
+      "remove": "削除",
+      "reset": "既定に戻す"
+    }
   }
 }

@@ -7,6 +7,7 @@ import { ControlledNodeMachineMenu } from './ControlledNodeMachineMenu.js';
 interface ControlledNodeQuickMenuProps {
   onOpenRemoteDesktop?(machine: MachineListItem): void;
   onOpenRemoteDesktopWall?(): void;
+  onConnectById?(): void;
 }
 
 /**
@@ -16,7 +17,7 @@ interface ControlledNodeQuickMenuProps {
  * split-button menu is deliberately read-only: it lists every accessible node
  * and jumps straight into remote control without opening the management panel.
  */
-export function ControlledNodeQuickMenu({ onOpenRemoteDesktop, onOpenRemoteDesktopWall }: ControlledNodeQuickMenuProps) {
+export function ControlledNodeQuickMenu({ onOpenRemoteDesktop, onOpenRemoteDesktopWall, onConnectById }: ControlledNodeQuickMenuProps) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -46,15 +47,14 @@ export function ControlledNodeQuickMenu({ onOpenRemoteDesktop, onOpenRemoteDeskt
         onClose={close}
         onSelect={(machine) => onOpenRemoteDesktop?.(machine)}
         onOpenInWindow={(machine) => { openRemoteDesktopWindow(machine.serverId); }}
-        titleAction={onOpenRemoteDesktopWall && (
-          <button
-            type="button"
-            class="controlled-node-quick-wall"
-            role="menuitem"
-            aria-label={t('remote_desktop.wall_short_title')}
-            onClick={() => { close(); onOpenRemoteDesktopWall(); }}
-          >{t('remote_desktop.wall_short_title')}</button>
-        )}
+        titleAction={(onOpenRemoteDesktopWall || onConnectById) && <>
+          {onConnectById && <button type="button" class="controlled-node-quick-wall" role="menuitem" onClick={() => { close(); onConnectById(); }}>
+            {t('remote_desktop.connect_by_id')}
+          </button>}
+          {onOpenRemoteDesktopWall && <button type="button" class="controlled-node-quick-wall" role="menuitem" aria-label={t('remote_desktop.wall_short_title')} onClick={() => { close(); onOpenRemoteDesktopWall(); }}>
+            {t('remote_desktop.wall_short_title')}
+          </button>}
+        </>}
       />
     </>
   );

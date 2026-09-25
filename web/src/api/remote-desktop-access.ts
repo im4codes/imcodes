@@ -48,6 +48,14 @@ export interface RemoteDesktopOwnerHostSummary {
   mergeState: 'resolved' | 'conflict_pending';
 }
 
+export interface SavedRemoteDesktopDevice {
+  id: string;
+  hostId?: string;
+  publicNodeId: string;
+  displayName: string;
+  savedAt: number;
+}
+
 export interface RemoteDesktopOwnerLinkView {
   id: string;
   hostId: string;
@@ -102,6 +110,9 @@ export interface RemoteDesktopAccessApi {
   endPrivacy(hostId: string, privacy: RemoteDesktopPrivacyEpochRef): Promise<void>;
   resolveInvite(input: { token: string; browserKey: RemoteDesktopBrowserKeyPair }): Promise<RemoteDesktopGuestProofResult>;
   provePassword(input: { publicNodeId: number; password: string; browserKey: RemoteDesktopBrowserKeyPair }): Promise<RemoteDesktopGuestProofResult>;
+  listSavedDevices(): Promise<SavedRemoteDesktopDevice[]>;
+  saveDevice(input: { publicNodeId: string; bootstrapTicket: string; browserKeyThumbprint: string }): Promise<SavedRemoteDesktopDevice>;
+  removeSavedDevice(id: string): Promise<void>;
 }
 
 export interface CreateOwnerLinkInput {
@@ -454,6 +465,19 @@ function decodeGuestReady(value: unknown, browserKey: RemoteDesktopBrowserKeyPai
   };
 }
 
+function decodeSavedDevice(value: unknown): SavedRemoteDesktopDevice {
+  if (!isRecord(value) || typeof value.id !== 'string' || (value.hostId !== undefined && typeof value.hostId !== 'string')
+    || typeof value.publicNodeId !== 'string' || typeof value.displayName !== 'string'
+    || typeof value.savedAt !== 'number') throw new Error('invalid_saved_remote_desktop_device');
+  return {
+    id: value.id,
+    ...(typeof value.hostId === 'string' ? { hostId: value.hostId } : {}),
+    publicNodeId: value.publicNodeId,
+    displayName: value.displayName,
+    savedAt: value.savedAt,
+  };
+}
+
 function decodeGuestErrorBody(body: string, browserKey: RemoteDesktopBrowserKeyPair): RemoteDesktopGuestProofResult {
   try {
     return decodeGuestReady(JSON.parse(body), browserKey);
@@ -615,6 +639,22 @@ export function createRemoteDesktopAccessApi(): RemoteDesktopAccessApi {
         password: input.password,
         browserKey: input.browserKey,
       });
+    },
+    async listSavedDevices() {
+      const response = await apiFetch('/api/remote-desktop/guest/saved-devices');
+      if (!isRecord(response) || !Array.isArray(response.devices)) throw new Error('invalid_saved_remote_desktop_devices');
+      return response.devices.map(decodeSavedDevice);
+    },
+    async saveDevice(input) {
+      const response = await apiFetch('/api/remote-desktop/guest/saved-devices', {
+        method: 'POST',
+        body: JSON.stringify(input),
+      });
+      if (!isRecord(response) || !isRecord(response.device)) throw new Error('invalid_saved_remote_desktop_device');
+      return decodeSavedDevice(response.device);
+    },
+    async removeSavedDevice(id) {
+      await apiFetch(`/api/remote-desktop/guest/saved-devices/${encodeURIComponent(id)}`, { method: 'DELETE' });
     },
   };
 }

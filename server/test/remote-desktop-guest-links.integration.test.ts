@@ -61,16 +61,23 @@ import {
   hashLinkToken,
   hashBootstrapTicket,
   issueClaimChallenge,
+  issueNodePasswordBootstrap,
   redeemBootstrap,
   redeemBootstrapForRoute,
   resolveLinkProof,
   sweepExpiredBootstraps,
 } from '../src/services/remote-desktop-guest-bootstrap.js';
 import {
+  listSavedRemoteDesktopDevices,
+  removeSavedRemoteDesktopDevice,
+  saveRemoteDesktopDevice,
+} from '../src/services/remote-desktop-saved-devices.js';
+import {
   applyUnattendedPasswordMutationTx,
   createServerUnattendedPasswordPepperRing,
   deriveUnattendedPasswordVerifier,
 } from '../src/services/remote-desktop-unattended-password.js';
+import { rotateOwnerPublicNodeId } from '../src/services/remote-desktop-owner-management.js';
 
 let db: Database;
 const NOW = 1_700_000_000_000;
@@ -1360,6 +1367,249 @@ describe('public proof and sticky bootstrap (5.1–5.4)', () => {
     expect(rows).toHaveLength(1);
     // The surviving row is the redeemed one; redeemed tickets are kept for audit.
     expect(rows[0].redeemed_at).not.toBeNull();
+  });
+});
+
+describe('saved password devices (real PostgreSQL)', () => {
+  async function seedSavedPassword() {
+    const fx = await seedFixture({ endpointRole: 'full' });
+    await db.execute('UPDATE servers SET status = $2, last_heartbeat_at = $3 WHERE id = $1', [fx.serverId, 'online', NOW]);
+    const material = await deriveUnattendedPasswordVerifier({
+      password: 'correct-horse-battery-42!',
+      peppers: createServerUnattendedPasswordPepperRing('saved-device-test-secret-012345678901234567890123'),
+    });
+    await db.transaction((tx) => applyUnattendedPasswordMutationTx(tx, {
+      accountSession: fx.session, privacyEpoch: fx.privacy,
+      mutation: { hostId: fx.hostId, action: 'set', requestId: newRequestId() }, material, now: NOW,
+    }));
+    await endPrivacy(fx);
+    const publicId = (await db.queryOne<{ public_id: string }>(
+      'SELECT public_id FROM remote_desktop_public_ids WHERE host_id = $1 AND status = \'active\'', [fx.hostId],
+    ))!.public_id;
+    const key = newBrowserProofKey();
+    const issued = await issueNodePasswordBootstrap(db, {
+      hostId: fx.hostId, publicNodeId: publicId, credentialGeneration: 1,
+      browserPublicKeySpki: key.browserPublicKeySpki, browserKeyThumbprint: key.browserKeyThumbprint,
+      now: NOW + 10, fullEndpointEligible: async () => true, endpointEligible: async () => true,
+    });
+    if (!issued?.ok) throw new Error('password bootstrap failed');
+    const userId = `u_saved_${randomUUID()}`;
+    await createUser(db, userId);
+    return { fx, material, publicId, key, issued, userId };
+  }
+
+  async function reShield(fx: Fixture, now: number) {
+    const epoch = await beginPrivacyEpoch(db, {
+      hostId: fx.hostId, epochId: randomUUID(), presentationSource: 'management_web',
+      initiatingSessionHash: `saved-device-${now}`, executionServerId: fx.serverId,
+      daemonGeneration: 1, leaseExpiresAt: NOW + 300_000, deadline: NOW + 60_000, now,
+    });
+    fx.privacy = { epochId: epoch.epochId, revision: epoch.revision };
+  }
+
+  it('saves only after a password proof and revokes the locator on rotation/disable', async () => {
+    const fx = await seedFixture({ endpointRole: 'full' });
+    await db.execute('UPDATE servers SET status = $2, last_heartbeat_at = $3 WHERE id = $1', [fx.serverId, 'online', NOW]);
+    const material = await deriveUnattendedPasswordVerifier({
+      password: 'correct-horse-battery-42!',
+      peppers: createServerUnattendedPasswordPepperRing('saved-device-test-secret-012345678901234567890123'),
+    });
+    await db.transaction((tx) => applyUnattendedPasswordMutationTx(tx, {
+      accountSession: fx.session,
+      privacyEpoch: fx.privacy,
+      mutation: { hostId: fx.hostId, action: 'set', requestId: newRequestId() },
+      material,
+      now: NOW,
+    }));
+    await endPrivacy(fx);
+    const publicId = (await db.queryOne<{ public_id: string }>(
+      'SELECT public_id FROM remote_desktop_public_ids WHERE host_id = $1 AND status = \'active\'', [fx.hostId],
+    ))!.public_id;
+    const key = newBrowserProofKey();
+    const issued = await issueNodePasswordBootstrap(db, {
+      hostId: fx.hostId,
+      publicNodeId: publicId,
+      credentialGeneration: 1,
+      browserPublicKeySpki: key.browserPublicKeySpki,
+      browserKeyThumbprint: key.browserKeyThumbprint,
+      now: NOW + 10,
+      fullEndpointEligible: async () => true,
+      endpointEligible: async () => true,
+    });
+    expect(issued?.ok).toBe(true);
+    if (!issued?.ok) throw new Error('password bootstrap failed');
+    const guestUserId = `u_saved_${randomUUID()}`;
+    await createUser(db, guestUserId);
+    const saved = await saveRemoteDesktopDevice(db, {
+      userId: guestUserId,
+      publicNodeId: publicId,
+      bootstrapTicket: issued!.bootstrapTicket,
+      browserKeyThumbprint: key.browserKeyThumbprint,
+      now: NOW + 11,
+    });
+    expect(saved?.publicNodeId).toBe(publicId);
+    expect((await listSavedRemoteDesktopDevices(db, guestUserId, NOW + 12))).toHaveLength(1);
+    expect(await removeSavedRemoteDesktopDevice(db, guestUserId, saved!.id)).toBe(true);
+    expect(await listSavedRemoteDesktopDevices(db, guestUserId, NOW + 13)).toHaveLength(0);
+
+    const key2 = newBrowserProofKey();
+    const issued2 = await issueNodePasswordBootstrap(db, {
+      hostId: fx.hostId,
+      publicNodeId: publicId,
+      credentialGeneration: 1,
+      browserPublicKeySpki: key2.browserPublicKeySpki,
+      browserKeyThumbprint: key2.browserKeyThumbprint,
+      now: NOW + 20,
+      fullEndpointEligible: async () => true,
+      endpointEligible: async () => true,
+    });
+    expect(issued2?.ok).toBe(true);
+    if (!issued2?.ok) throw new Error('second password bootstrap failed');
+    const saved2 = await saveRemoteDesktopDevice(db, {
+      userId: guestUserId,
+      publicNodeId: publicId,
+      bootstrapTicket: issued2!.bootstrapTicket,
+      browserKeyThumbprint: key2.browserKeyThumbprint,
+      now: NOW + 21,
+    });
+    expect(saved2).not.toBeNull();
+    await rotateOwnerPublicNodeId(db, {
+      accountSession: fx.session,
+      hostId: fx.hostId,
+      requestId: newRequestId(),
+      now: NOW + 22,
+    });
+    expect(await listSavedRemoteDesktopDevices(db, guestUserId, NOW + 23)).toHaveLength(0);
+    const reShield = await beginPrivacyEpoch(db, {
+      hostId: fx.hostId,
+      epochId: randomUUID(),
+      presentationSource: 'management_web',
+      initiatingSessionHash: 'saved-device-reshield',
+      executionServerId: fx.serverId,
+      daemonGeneration: 1,
+      leaseExpiresAt: NOW + 300_000,
+      deadline: NOW + 60_000,
+      now: NOW + 25,
+    });
+    fx.privacy = { epochId: reShield.epochId, revision: reShield.revision };
+    await db.transaction((tx) => applyUnattendedPasswordMutationTx(tx, {
+      accountSession: fx.session,
+      privacyEpoch: fx.privacy,
+      mutation: { hostId: fx.hostId, action: 'disable', requestId: newRequestId() },
+      material: null,
+      now: NOW + 30,
+    }));
+    expect(await listSavedRemoteDesktopDevices(db, guestUserId, NOW + 31)).toHaveLength(0);
+  });
+
+  it('authorizes a post-TTL live session, then fences closed/stale sessions and invalid proofs', async () => {
+    const { fx, publicId, key, issued, userId } = await seedSavedPassword();
+    const admitted = await redeemBootstrapForRoute({
+      db, proof: makeBootstrapProof(issued.bootstrapTicket, key), redeemingServerId: fx.serverId,
+      routeGeneration: 1, clientIp: '127.0.0.1', now: NOW + 20,
+    });
+    expect(admitted?.sessionId).toBeTruthy();
+    const afterTtl = await saveRemoteDesktopDevice(db, {
+      userId, publicNodeId: publicId, bootstrapTicket: issued.bootstrapTicket,
+      browserKeyThumbprint: key.browserKeyThumbprint, now: NOW + 120_000,
+    });
+    expect(afterTtl).not.toBeNull();
+    const staleKey = newBrowserProofKey();
+    const staleIssued = await issueNodePasswordBootstrap(db, {
+      hostId: fx.hostId, publicNodeId: publicId, credentialGeneration: 1,
+      browserPublicKeySpki: staleKey.browserPublicKeySpki, browserKeyThumbprint: staleKey.browserKeyThumbprint,
+      now: NOW + 30, fullEndpointEligible: async () => true, endpointEligible: async () => true,
+    });
+    if (!staleIssued?.ok) throw new Error('stale-session bootstrap failed');
+    const staleAdmission = await redeemBootstrapForRoute({
+      db, proof: makeBootstrapProof(staleIssued.bootstrapTicket, staleKey), redeemingServerId: fx.serverId,
+      routeGeneration: 2, clientIp: '127.0.0.1', now: NOW + 31,
+    });
+    await db.execute('UPDATE remote_desktop_guest_sessions SET password_generation = $2 WHERE id = $1', [staleAdmission!.sessionId, 999]);
+    expect(await saveRemoteDesktopDevice(db, {
+      userId, publicNodeId: publicId, bootstrapTicket: staleIssued.bootstrapTicket,
+      browserKeyThumbprint: staleKey.browserKeyThumbprint, now: NOW + 120_000,
+    })).toBeNull();
+    await db.execute("UPDATE remote_desktop_guest_sessions SET state = 'closed' WHERE id = $1", [admitted!.sessionId]);
+    expect(await saveRemoteDesktopDevice(db, {
+      userId, publicNodeId: publicId, bootstrapTicket: issued.bootstrapTicket,
+      browserKeyThumbprint: key.browserKeyThumbprint, now: NOW + 120_001,
+    })).toBeNull();
+
+    const unknown = await saveRemoteDesktopDevice(db, {
+      userId, publicNodeId: publicId, bootstrapTicket: randomBytes(32).toString('base64url'),
+      browserKeyThumbprint: key.browserKeyThumbprint, now: NOW + 1,
+    });
+    expect(unknown).toBeNull();
+    expect(await saveRemoteDesktopDevice(db, {
+      userId, publicNodeId: String(Number(publicId) + 1), bootstrapTicket: issued.bootstrapTicket,
+      browserKeyThumbprint: key.browserKeyThumbprint, now: NOW + 1,
+    })).toBeNull();
+    expect(await saveRemoteDesktopDevice(db, {
+      userId, publicNodeId: publicId, bootstrapTicket: issued.bootstrapTicket,
+      browserKeyThumbprint: newBrowserProofKey().browserKeyThumbprint, now: NOW + 1,
+    })).toBeNull();
+    const expiredKey = newBrowserProofKey();
+    const expired = await issueNodePasswordBootstrap(db, {
+      hostId: fx.hostId, publicNodeId: publicId, credentialGeneration: 1,
+      browserPublicKeySpki: expiredKey.browserPublicKeySpki, browserKeyThumbprint: expiredKey.browserKeyThumbprint,
+      now: NOW + 2, ttlMs: 1, fullEndpointEligible: async () => true, endpointEligible: async () => true,
+    });
+    expect(expired?.ok).toBe(true);
+    expect(await saveRemoteDesktopDevice(db, {
+      userId, publicNodeId: publicId, bootstrapTicket: expired!.bootstrapTicket,
+      browserKeyThumbprint: expiredKey.browserKeyThumbprint, now: NOW + 100,
+    })).toBeNull();
+    const linkTicket = randomBytes(32).toString('base64url');
+    await db.execute(
+      `INSERT INTO remote_desktop_guest_bootstraps
+       (ticket_hash, ticket_hash_version, host_id, link_id, target_server_id, actor_source, mode,
+        authority_generation, expiry_revision, credential_generation, browser_key_hash,
+        browser_public_key_spki, expires_at, created_at)
+       VALUES ($1,'v1',$2,NULL,$3,'attended_link','control',1,NULL,1,$4,$5,$6,$6)`,
+      [hashBootstrapTicket(linkTicket), fx.hostId, fx.serverId, 'link-hash', key.browserPublicKeySpki, NOW + 100_000],
+    );
+    expect(await saveRemoteDesktopDevice(db, {
+      userId, publicNodeId: publicId, bootstrapTicket: linkTicket,
+      browserKeyThumbprint: key.browserKeyThumbprint, now: NOW + 1,
+    })).toBeNull();
+  });
+
+  it('revokes on password change/disable and isolates users', async () => {
+    const first = await seedSavedPassword();
+    const saved = await saveRemoteDesktopDevice(db, {
+      userId: first.userId, publicNodeId: first.publicId, bootstrapTicket: first.issued.bootstrapTicket,
+      browserKeyThumbprint: first.key.browserKeyThumbprint, now: NOW + 11,
+    });
+    expect(saved).not.toBeNull();
+    const otherUser = `u_other_${randomUUID()}`;
+    await createUser(db, otherUser);
+    expect(await listSavedRemoteDesktopDevices(db, otherUser, NOW + 12)).toHaveLength(0);
+    expect(await removeSavedRemoteDesktopDevice(db, otherUser, saved!.id)).toBe(false);
+    expect(await listSavedRemoteDesktopDevices(db, first.userId, NOW + 13)).toHaveLength(1);
+    await reShield(first.fx, NOW + 20);
+    const changed = await deriveUnattendedPasswordVerifier({
+      password: 'changed-horse-battery-42!',
+      peppers: createServerUnattendedPasswordPepperRing('saved-device-test-secret-012345678901234567890123'),
+    });
+    await db.transaction((tx) => applyUnattendedPasswordMutationTx(tx, {
+      accountSession: first.fx.session, privacyEpoch: first.fx.privacy,
+      mutation: { hostId: first.fx.hostId, action: 'change', requestId: newRequestId() }, material: changed, now: NOW + 21,
+    }));
+    expect(await listSavedRemoteDesktopDevices(db, first.userId, NOW + 22)).toHaveLength(0);
+
+    const second = await seedSavedPassword();
+    const savedSecond = await saveRemoteDesktopDevice(db, {
+      userId: second.userId, publicNodeId: second.publicId, bootstrapTicket: second.issued.bootstrapTicket,
+      browserKeyThumbprint: second.key.browserKeyThumbprint, now: NOW + 11,
+    });
+    expect(savedSecond).not.toBeNull();
+    await reShield(second.fx, NOW + 20);
+    await db.transaction((tx) => applyUnattendedPasswordMutationTx(tx, {
+      accountSession: second.fx.session, privacyEpoch: second.fx.privacy,
+      mutation: { hostId: second.fx.hostId, action: 'disable', requestId: newRequestId() }, material: null, now: NOW + 21,
+    }));
+    expect(await listSavedRemoteDesktopDevices(db, second.userId, NOW + 22)).toHaveLength(0);
   });
 });
 

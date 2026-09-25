@@ -50,6 +50,7 @@ export function RemoteDesktopWallStandalone() {
         standalone
         manager={manager}
         retainedHostKeys={retainedWorkspaceHostKeys}
+        onConnectById={() => window.open('/remote-desktop/access', '_blank', 'noopener,noreferrer')}
         onOpenHost={(machine) => setWorkspace((current) => (
           openRemoteDesktopWorkspaceHost(current, machine)
         ))}
