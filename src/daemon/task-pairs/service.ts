@@ -16,6 +16,9 @@ import {
   TASK_PAIR_NO_AUDITOR,
   TASK_PAIR_OPEN_STATUSES,
   TASK_PAIR_TIMELINE_EVENT,
+  TASK_PAIR_WORKSPACE_EFFECTS,
+  TASK_PAIR_WORKSPACE_EVENT_VERB,
+  TASK_PAIR_WORKSPACE_RETENTION_MS,
   applyTaskPairMarker,
   isTerminalTaskPairStatus,
   mayContainTaskPairMarker,
@@ -31,7 +34,15 @@ import {
 import { getTaskPairStore, type StoredTaskPair, type TaskPairLiveness } from './store.js';
 import { isPairsEngineProject, projectBrainSession, projectOfSession } from './engine.js';
 import { noteTaskPairFocus, sendTaskPairMessage, taskPairFocusOf } from './delivery.js';
+import { resolveTaskPairMaterial } from './material.js';
+import { copyTaskPairOutput, provisionTaskPairWorkspace, releaseTaskPairWorkspace } from './workspace.js';
+import { clearTaskPairProviderError, noteTaskPairProviderError } from './provider-errors.js';
 import {
+  buildAuditRequestMessage,
+  buildAuditorAssignmentMessage,
+  buildExecutorPairBrief,
+  buildOutputFailedLine,
+  buildWorkspaceKeptLine,
   buildBrainNoticeMessage,
   buildCorrectionMessage,
   buildDoneReminderMessage,
@@ -71,6 +82,10 @@ export class TaskPairService {
     this.#unsubscribe = timelineEmitter.on((event) => {
       // Cheap filter inline; all store work runs after the emit returns, off
       // the relay/watcher call stack (design D3). Replays stay idempotent.
+      if (event.type === 'session.state') {
+        noteTaskPairProviderError(event);
+        return;
+      }
       if (event.type !== 'assistant.text') return;
       setImmediate(() => {
         try {
@@ -100,6 +115,7 @@ export class TaskPairService {
     const project = projectOfSession(writer);
     if (!project || !isPairsEngineProject(project)) return;
     const now = event.ts ?? Date.now();
+    clearTaskPairProviderError(writer);
     this.recordProgress(writer, now, text);
     if (!mayContainTaskPairMarker(text)) return;
     this.ingestText(project, writer, text, event.eventId, now);
@@ -165,6 +181,18 @@ export class TaskPairService {
     }
     this.#emitEvent(input, taskId ?? input.marker.taskId, role, transition, stored?.state ?? existing?.state);
     void this.#executeIntents(input.project, stored?.state, transition.intents);
+    // A pair Brain opens (DISPATCH marker, plain or task-tagged dispatch) tells
+    // its participants what a pair is. The queue sends its own brief.
+    if (stored && input.source !== 'queue' && input.marker.knownVerb === 'DISPATCH'
+      && (transition.effect === 'created' || transition.effect === 'dispatched')) {
+      void this.briefParticipants(input.project, stored.state.taskId);
+    }
+    // A pair that just ended (DONE, CANCEL, DONE force=true): its workspace
+    // starts its retention and a deliverable named on DONE is kept.
+    if (stored && transition.toStatus && isTerminalTaskPairStatus(transition.toStatus)
+      && (!transition.fromStatus || !isTerminalTaskPairStatus(transition.fromStatus))) {
+      void this.endWorkspace(input.project, stored.state.taskId, now);
+    }
     if (stored && transition.toStatus === 'passed' && transition.fromStatus !== 'passed') {
       this.#scheduler?.flagEconomyUnreviewed?.(input.project, stored.state.taskId);
     }
@@ -318,12 +346,162 @@ export class TaskPairService {
           case 'brain_notice':
             await sendTaskPairMessage(pair.brain, pair.taskId, `brain-${intent.flag}`, buildBrainNoticeMessage(pair, intent.flag));
             break;
+          case 'audit_request': {
+            const material = await resolveTaskPairMaterial(pair);
+            await sendTaskPairMessage(intent.to, pair.taskId, 'audit-request', buildAuditRequestMessage(pair, material));
+            break;
+          }
           default:
             await this.#scheduler?.onIntent(project, pair, intent);
         }
       } catch (error) {
         logger.warn({ err: error, taskId: pair.taskId, intent: intent.kind }, 'task-pair: intent failed');
       }
+    }
+  }
+
+  /**
+   * The pair's workspace, created once per pair and recorded on it; a reopened
+   * pair takes its ended workspace back. Returns the pair as stored afterwards
+   * (re-read: markers may have landed while git ran).
+   */
+  async ensureWorkspace(project: string, taskId: string): Promise<TaskPairState | undefined> {
+    const store = getTaskPairStore();
+    const current = store.getPair(project, taskId)?.state;
+    if (!current || !current.executor || isTerminalTaskPairStatus(current.status)) return current;
+    if (current.workspace && current.workspace.status !== 'removed') {
+      if (current.workspace.status === 'active') return current;
+      const { endedAt: _endedAt, keptReason: _keptReason, ...workspace } = current.workspace;
+      const reopened: TaskPairState = { ...current, workspace: { ...workspace, status: 'active' } };
+      store.savePair(project, reopened);
+      return reopened;
+    }
+    const provision = await provisionTaskPairWorkspace(project, current).catch((error: unknown) => ({
+      ok: false as const, detail: error instanceof Error ? error.message : 'workspace provisioning failed',
+    }));
+    const latest = store.getPair(project, taskId);
+    if (!latest) return undefined;
+    if (!provision.ok) {
+      logger.warn({ taskId, detail: provision.detail }, 'task-pair: executor workspace not created');
+      return latest.state;
+    }
+    const next: TaskPairState = {
+      ...latest.state,
+      workspace: {
+        kind: provision.kind,
+        path: provision.path,
+        ...(provision.base ? { base: provision.base } : {}),
+        createdAt: Date.now(),
+        status: 'active',
+      },
+    };
+    store.savePair(project, next);
+    return next;
+  }
+
+  /**
+   * The pair ended: its workspace starts the retention period (the sweep
+   * removes it later), and a deliverable named on DONE is copied into the
+   * project directory and shown to the user.
+   */
+  async endWorkspace(project: string, taskId: string, now: number): Promise<void> {
+    const store = getTaskPairStore();
+    const pair = store.getPair(project, taskId)?.state;
+    if (!pair) return;
+    try {
+      let next = pair;
+      if (pair.workspace?.status === 'active') {
+        next = { ...pair, workspace: { ...pair.workspace, status: 'ended', endedAt: now } };
+        store.savePair(project, next);
+      }
+      if (next.status !== 'done' || !next.output) return;
+      const copied = await copyTaskPairOutput(next);
+      const latest = store.getPair(project, taskId)?.state ?? next;
+      const effect = copied.ok ? TASK_PAIR_WORKSPACE_EFFECTS.OUTPUT_SAVED : TASK_PAIR_WORKSPACE_EFFECTS.OUTPUT_FAILED;
+      this.#recordWorkspaceEvent(project, latest, effect, {
+        output: next.output.path,
+        ...(copied.ok ? { dest: copied.dest } : { reason: copied.reason }),
+      }, copied.ok ? { outputPath: copied.dest } : { outputError: copied.reason }, !copied.ok);
+      if (!copied.ok) await sendTaskPairMessage(latest.brain, taskId, 'brain-output-failed', buildOutputFailedLine(latest, copied.reason));
+    } catch (error) {
+      logger.warn({ err: error, taskId }, 'task-pair: ending the workspace failed');
+    }
+  }
+
+  #lastSweepAt = 0;
+
+  /**
+   * Remove the workspaces of pairs that ended at least the retention period
+   * ago. A worktree that still holds unsaved work is kept (Brain is told once)
+   * and retried on later sweeps. Runs at most hourly unless forced.
+   */
+  async sweepWorkspaces(now: number, options: { force?: boolean } = {}): Promise<void> {
+    if (!options.force && now - this.#lastSweepAt < 60 * 60_000) return;
+    this.#lastSweepAt = now;
+    const store = getTaskPairStore();
+    for (const stored of store.listEndedWorkspacePairs()) {
+      const pair = stored.state;
+      const workspace = pair.workspace;
+      if (!workspace || !isTerminalTaskPairStatus(pair.status)) continue;
+      if (now - (workspace.endedAt ?? pair.updatedAt) < TASK_PAIR_WORKSPACE_RETENTION_MS) continue;
+      try {
+        const released = await releaseTaskPairWorkspace(pair);
+        if (released.action === 'absent') continue;
+        const latest = store.getPair(stored.project, pair.taskId)?.state ?? pair;
+        if (!latest.workspace || !isTerminalTaskPairStatus(latest.status)) continue;
+        const firstKeep = released.action === 'kept' && latest.workspace.status !== 'kept';
+        const next: TaskPairState = {
+          ...latest,
+          workspace: released.action === 'kept'
+            ? { ...latest.workspace, status: 'kept', keptReason: released.reason }
+            : { ...latest.workspace, status: 'removed' },
+        };
+        store.savePair(stored.project, next);
+        if (released.action === 'removed') {
+          this.#recordWorkspaceEvent(stored.project, next, TASK_PAIR_WORKSPACE_EFFECTS.REMOVED, { path: workspace.path }, {}, false);
+        } else if (firstKeep) {
+          this.#recordWorkspaceEvent(stored.project, next, TASK_PAIR_WORKSPACE_EFFECTS.KEPT, { path: workspace.path, reason: released.reason }, {}, true);
+          // The worktree GC backstop removes it too once the work is saved.
+          const { getSupervisionTaskRegistry } = await import('../supervision-state-store.js');
+          getSupervisionTaskRegistry().requestWorktreeGc(stored.project);
+          await sendTaskPairMessage(next.brain, pair.taskId, 'brain-workspace-kept', buildWorkspaceKeptLine(next, released.reason));
+        }
+      } catch (error) {
+        logger.warn({ err: error, taskId: pair.taskId }, 'task-pair: workspace sweep failed');
+      }
+    }
+  }
+
+  #recordWorkspaceEvent(
+    project: string,
+    pair: TaskPairState,
+    effect: string,
+    attrs: Record<string, string>,
+    payload: Pick<TaskPairEventPayload, 'outputPath' | 'outputError'>,
+    unusual: boolean,
+  ): void {
+    const at = Date.now();
+    const eventId = `workspace:${pair.taskId}:${effect}:${at}`;
+    getTaskPairStore().recordEvent({
+      id: eventId, project, taskId: pair.taskId, writer: 'daemon', role: 'daemon', verb: TASK_PAIR_WORKSPACE_EVENT_VERB,
+      attrs, effect, unusual, source: 'heartbeat', fromStatus: pair.status, toStatus: pair.status, at,
+    });
+    emitTaskPairDaemonEvent(pair, {
+      eventId, verb: TASK_PAIR_WORKSPACE_EVENT_VERB, effect, source: 'heartbeat', fromStatus: pair.status, toStatus: pair.status, unusual, ...payload,
+    });
+  }
+
+  /** Tell a pair's executor and auditor what the pair is and where the work lives. */
+  async briefParticipants(project: string, taskId: string): Promise<void> {
+    try {
+      const pair = await this.ensureWorkspace(project, taskId);
+      if (!pair) return;
+      if (pair.executor) await sendTaskPairMessage(pair.executor, pair.taskId, 'pair-brief', buildExecutorPairBrief(pair));
+      if (pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR) {
+        await sendTaskPairMessage(pair.auditor, pair.taskId, 'auditor-assigned', buildAuditorAssignmentMessage(pair));
+      }
+    } catch (error) {
+      logger.warn({ err: error, taskId }, 'task-pair: participant brief failed');
     }
   }
 
@@ -373,7 +551,7 @@ export function emitTaskPairTimelineEvent(
 /** A daemon-authored pair event (not a marker), e.g. a data correction. */
 export function emitTaskPairDaemonEvent(
   pair: TaskPairState,
-  event: Pick<TaskPairEventPayload, 'verb' | 'effect' | 'source' | 'fromStatus' | 'toStatus' | 'unusual'> & { eventId: string },
+  event: Pick<TaskPairEventPayload, 'verb' | 'effect' | 'source' | 'fromStatus' | 'toStatus' | 'unusual' | 'outputPath' | 'outputError'> & { eventId: string },
 ): void {
   const { eventId, ...rest } = event;
   emitTaskPairTimelineEvent({ taskId: pair.taskId, writer: 'daemon', role: 'daemon', ...rest }, pair, eventId);

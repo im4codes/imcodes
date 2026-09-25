@@ -3,6 +3,8 @@ import { AUDIT_SEVERITY_LEVELS } from '@shared/audit-convergence.js';
 import {
   TASK_PAIR_STATUSES,
   TASK_PAIR_VERBS,
+  TASK_PAIR_WORKSPACE_EFFECTS,
+  TASK_PAIR_WORKSPACE_EVENT_VERB,
   type TaskPairEventPayload,
   type TaskPairStatus,
 } from '@shared/task-pair.js';
@@ -13,6 +15,20 @@ function isStatus(value: unknown): value is TaskPairStatus {
 
 function verbKey(verb: unknown): string {
   return typeof verb === 'string' && (TASK_PAIR_VERBS as readonly string[]).includes(verb) ? verb.toLowerCase() : 'other';
+}
+
+/** Text of a daemon workspace event: where a kept deliverable went, or what happened to the workspace. */
+function workspaceText(t: (key: string, options?: Record<string, unknown>) => string, event: Partial<TaskPairEventPayload>): string {
+  switch (event.effect) {
+    case TASK_PAIR_WORKSPACE_EFFECTS.OUTPUT_SAVED:
+      return t('taskPair.output_saved', { path: event.outputPath ?? '' });
+    case TASK_PAIR_WORKSPACE_EFFECTS.OUTPUT_FAILED:
+      return t('taskPair.output_failed', { reason: event.outputError ?? '' });
+    case TASK_PAIR_WORKSPACE_EFFECTS.KEPT:
+      return t('taskPair.workspace_kept');
+    default:
+      return t('taskPair.workspace_removed');
+  }
 }
 
 /** Compact chat chip for one task-pair marker event (it replaces the hidden marker line). */
@@ -40,7 +56,11 @@ export function TaskPairEventChip({ eventId, payload }: { eventId: string; paylo
       data-task-id={taskId}
     >
       <span class="task-pair-chip-task">{event.title ? `${taskId} · ${event.title}` : taskId}</span>
-      <span class="task-pair-chip-text">{t('taskPair.chip', { writer: writer === 'daemon' ? t('taskPair.daemon') : writer, verb })}</span>
+      <span class="task-pair-chip-text">
+        {event.verb === TASK_PAIR_WORKSPACE_EVENT_VERB
+          ? workspaceText(t, event)
+          : t('taskPair.chip', { writer: writer === 'daemon' ? t('taskPair.daemon') : writer, verb })}
+      </span>
       {status && <span class={`task-pair-chip-status status-${String(event.toStatus)}`}>{status}</span>}
       {counts && <span class="task-pair-chip-counts">{counts}</span>}
       {held && <span class="task-pair-chip-held">{t('taskPair.verdict_held')}</span>}

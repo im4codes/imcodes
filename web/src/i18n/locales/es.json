@@ -4362,6 +4362,10 @@
       "add": "Añadir",
       "remove": "Quitar",
       "reset": "Restablecer"
-    }
+    },
+    "output_saved": "Entregable guardado en {{path}}",
+    "output_failed": "Entregable no guardado ({{reason}})",
+    "workspace_removed": "Espacio de trabajo eliminado",
+    "workspace_kept": "Espacio de trabajo conservado: aún tiene trabajo sin guardar"
   }
 }

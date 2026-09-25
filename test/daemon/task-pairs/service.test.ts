@@ -161,6 +161,9 @@ describe('task-pair marker ingestion', () => {
   it('sends a verdict correction to the auditor and a rework notice to the executor', async () => {
     await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T9 executor=${EXEC} auditor=${AUD} -->`);
     await say(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T9 -->');
+    // Pair briefs and the audit request are covered elsewhere.
+    await vi.waitFor(() => expect(sent.filter((entry) => /:(pair-brief|auditor-assigned|audit-request):/.test(entry.id))).toHaveLength(3));
+    sent = [];
     await say(AUD, '<!-- IMCODES_TASK REWORK T9 blocking=P0 p0=0 p1=2 -->');
     await flush();
     expect(sent.map((entry) => entry.target)).toEqual([AUD]);
@@ -174,6 +177,8 @@ describe('task-pair marker ingestion', () => {
 
   it('reminds the executor once per DONE without PASS', async () => {
     await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T10 executor=${EXEC} auditor=${AUD} -->`);
+    await vi.waitFor(() => expect(sent.filter((entry) => /:(pair-brief|auditor-assigned):/.test(entry.id))).toHaveLength(2));
+    sent = [];
     await say(EXEC, '<!-- IMCODES_TASK DONE T10 -->');
     await flush();
     expect(pair('T10')?.status).toBe('awaiting_audit');

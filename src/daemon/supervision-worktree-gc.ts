@@ -17,6 +17,7 @@ import {
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
+import { TASK_PAIR_WORKTREE_PREFIX } from '../../shared/task-pair.js';
 import type { SupervisionRetentionGcResult } from './supervision-retention-gc.js';
 import {
   SUPERVISION_QUARANTINE_GRACE_MS,
@@ -37,12 +38,14 @@ export const SUPERVISION_WORKTREE_GC_LOCK_STALE_MS = 10 * 60_000;
 export const SUPERVISION_WORKTREE_GC_ORPHAN_GRACE_MS = 24 * 60 * 60_000;
 export const SUPERVISION_WORKTREE_GC_MAX_BACKUP_PATCH_BYTES = 16 * 1024 * 1024;
 
-const ASSIGNMENT_NAME = /^(?:supervision_assignment_[0-9a-z-]+|asg_[0-9a-z]+)$/;
+// Pair worktrees (`pair_<taskId>`, task-pairs/workspace.ts) are registered here
+// too; their owner is the pair store, not the legacy registry.
+const ASSIGNMENT_NAME = new RegExp(`^(?:supervision_assignment_[0-9a-z-]+|asg_[0-9a-z]+|${TASK_PAIR_WORKTREE_PREFIX}[0-9a-z_-]+)$`);
 const SESSION_NAME = /^deck_[0-9a-z_-]+$/i;
 const EVIDENCE_NAME = /^evidence(?:-[0-9a-z_.-]+)?$/i;
 const METADATA_MAX_BYTES = 16 * 1024;
 const JOURNAL_VERSION = 1 as const;
-const QUARANTINED_ASSIGNMENT_NAME = /^((?:supervision_assignment_[0-9a-z-]+|asg_[0-9a-z]+))\.gc-[0-9a-z-]+$/;
+const QUARANTINED_ASSIGNMENT_NAME = new RegExp(`^((?:supervision_assignment_[0-9a-z-]+|asg_[0-9a-z]+|${TASK_PAIR_WORKTREE_PREFIX}[0-9a-z_-]+))\\.gc-[0-9a-z-]+$`);
 
 export const SUPERVISION_WORKTREE_GC_REASONS = Object.freeze({
   ELIGIBLE: 'eligible',
@@ -144,6 +147,17 @@ export interface SupervisionWorktreeRegistryReference {
   }>;
 }
 
+/** What the pair store knows about the pair that owns a `pair_…` worktree. */
+export interface TaskPairWorktreeReference {
+  available: boolean;
+  found?: boolean;
+  projectName?: string;
+  /** DONE or CANCEL: the worktree is no longer in use. */
+  terminal?: boolean;
+  /** The pair ended at least the workspace retention (7 days) ago. */
+  retentionElapsed?: boolean;
+}
+
 export interface SupervisionWorktreeGitInspection {
   ok: boolean;
   reason?: SupervisionWorktreeGcReason;
@@ -208,6 +222,9 @@ export interface SupervisionWorktreeGcDeps {
     sessionName: string;
     repoPath: string;
   }) => Promise<SupervisionWorktreeRegistryReference> | SupervisionWorktreeRegistryReference;
+  countTaskPairUnpushedCommits?: (repoPath: string, baseRevision: string) => Promise<number | undefined>;
+  /** Owner lookup for pair worktrees; without it they are never touched. */
+  resolveTaskPairWorktree?: (input: { taskId: string; repoPath: string }) => Promise<TaskPairWorktreeReference> | TaskPairWorktreeReference;
   protectedPaths?: readonly string[];
   /** Production-only opt-in: preserve local-only bytes, then reclaim terminal owners. */
   preserveTerminalChanges?: boolean;
@@ -526,7 +543,20 @@ export async function inspectSupervisionGitWorktree(repoPath: string): Promise<S
   };
 }
 
-async function removeRegisteredGitWorktree(
+/**
+ * Commits a pair's executor made (`base..HEAD`) that no remote has. Unlike the
+ * generic `unpushed` check this ignores the base itself, so a worktree at an
+ * untouched base in a project without any remote holds nothing unique.
+ * Undefined when git cannot answer (callers then keep the worktree).
+ */
+export async function countTaskPairUnpushedCommits(repoPath: string, baseRevision: string): Promise<number | undefined> {
+  const result = await runGit(repoPath, ['rev-list', '--count', `${baseRevision}..HEAD`, '--not', '--remotes']);
+  if (!result.ok) return undefined;
+  const count = Number.parseInt(result.stdout.trim(), 10);
+  return Number.isFinite(count) ? count : undefined;
+}
+
+export async function removeRegisteredGitWorktree(
   inspection: SupervisionWorktreeGitInspection,
   repoPath: string,
 ): Promise<boolean> {
@@ -749,6 +779,9 @@ async function evaluateCandidate(
   )) {
     return retain(SUPERVISION_WORKTREE_GC_REASONS.INVALID_LAYOUT, undefined, 'metadata_layout');
   }
+  if (candidate.assignmentId.startsWith(TASK_PAIR_WORKTREE_PREFIX)) {
+    return evaluateTaskPairCandidate(candidate, parsed, projectName, deps, candidateRepoPath, retain);
+  }
   let reference: SupervisionWorktreeRegistryReference;
   try {
     deps.onScanOperation?.('registry');
@@ -903,6 +936,53 @@ async function evaluateCandidate(
   };
 }
 
+/**
+ * A pair worktree is removed only once its pair ended and only when nothing in
+ * it exists solely there. Unlike terminal legacy worktrees it is never backed up
+ * and deleted: uncommitted, untracked or unpushed work keeps it (the pair engine
+ * has told Brain), and a later pass removes it once it is clean.
+ */
+async function evaluateTaskPairCandidate(
+  candidate: CandidatePath,
+  parsed: { metadata: SupervisionWorktreeMetadata; text: string } | undefined,
+  projectName: string,
+  deps: SupervisionWorktreeGcDeps,
+  candidateRepoPath: string | undefined,
+  retain: (reason: SupervisionWorktreeGcReason, taskId?: string, detail?: string) => { entry: SupervisionWorktreeGcEntry },
+): Promise<{ entry: SupervisionWorktreeGcEntry; metadataText?: string; inspection?: SupervisionWorktreeGitInspection; repoMissing?: boolean }> {
+  if (!parsed) return retain(SUPERVISION_WORKTREE_GC_REASONS.INVALID_LAYOUT, undefined, 'pair_metadata');
+  const taskId = parsed.metadata.taskId;
+  if (!deps.resolveTaskPairWorktree) return retain(SUPERVISION_WORKTREE_GC_REASONS.UNKNOWN_OWNER, taskId, 'pair');
+  let reference: TaskPairWorktreeReference;
+  try {
+    deps.onScanOperation?.('registry');
+    reference = await deps.resolveTaskPairWorktree({ taskId, repoPath: parsed.metadata.repoPath });
+  } catch {
+    return retain(SUPERVISION_WORKTREE_GC_REASONS.REGISTRY_UNAVAILABLE, taskId);
+  }
+  if (!reference.available) return retain(SUPERVISION_WORKTREE_GC_REASONS.REGISTRY_UNAVAILABLE, taskId);
+  if (!reference.found) return retain(SUPERVISION_WORKTREE_GC_REASONS.UNKNOWN_OWNER, taskId, 'pair');
+  if (reference.projectName !== projectName) return retain(SUPERVISION_WORKTREE_GC_REASONS.PROJECT_MISMATCH, taskId);
+  if (!reference.terminal) return retain(SUPERVISION_WORKTREE_GC_REASONS.ACTIVE_REFERENCE, taskId, 'pair_open');
+  // An ended pair keeps its worktree for the retention period.
+  if (!reference.retentionElapsed) return retain(SUPERVISION_WORKTREE_GC_REASONS.ACTIVE_REFERENCE, taskId, 'pair_retention');
+  const deleteEntry = (detail?: string): SupervisionWorktreeGcEntry => ({
+    key: candidate.key, assignmentId: candidate.assignmentId, taskId,
+    path: candidate.candidatePath, repoPath: candidate.repoPath,
+    action: 'delete', reason: SUPERVISION_WORKTREE_GC_REASONS.ELIGIBLE, ...(detail ? { detail } : {}),
+  });
+  if (!candidateRepoPath) return { entry: deleteEntry('pair_shell_without_repo'), metadataText: parsed.text, repoMissing: true };
+  deps.onScanOperation?.('git');
+  const inspection = await (deps.inspectGit ?? inspectSupervisionGitWorktree)(candidate.repoPath);
+  if (!inspection.ok) return retain(inspection.reason ?? SUPERVISION_WORKTREE_GC_REASONS.GIT_UNAVAILABLE, taskId);
+  if (inspection.locked) return retain(SUPERVISION_WORKTREE_GC_REASONS.GIT_LOCKED, taskId);
+  if (inspection.dirty) return retain(SUPERVISION_WORKTREE_GC_REASONS.DIRTY, taskId, 'pair_kept');
+  if (inspection.untracked) return retain(SUPERVISION_WORKTREE_GC_REASONS.UNTRACKED, taskId, 'pair_kept');
+  const unpushed = await (deps.countTaskPairUnpushedCommits ?? countTaskPairUnpushedCommits)(candidate.repoPath, parsed.metadata.baseRevision);
+  if (unpushed === undefined || unpushed > 0) return retain(SUPERVISION_WORKTREE_GC_REASONS.UNPUSHED_BRANCH, taskId, 'pair_kept');
+  return { entry: deleteEntry('pair_ended'), metadataText: parsed.text, inspection };
+}
+
 async function writeJsonAtomic(path: string, value: unknown, runId: string): Promise<void> {
   const temporary = `${path}.${runId}.tmp`;
   await writeFile(temporary, `${JSON.stringify(value)}\n`, { mode: 0o600 });
@@ -970,6 +1050,20 @@ async function releaseRunLock(path: string, runId: string): Promise<void> {
   } catch { /* a lost/replaced lock must never be removed */ }
 }
 
+/** Apply-time re-check for a pair worktree: its pair still exists, in this project, and has ended. */
+async function taskPairRemovalStillAuthorized(
+  metadata: SupervisionWorktreeMetadata | undefined,
+  assignmentId: string,
+  projectName: string,
+  deps: SupervisionWorktreeGcDeps,
+): Promise<boolean> {
+  if (!assignmentId.startsWith(TASK_PAIR_WORKTREE_PREFIX) || !metadata || !deps.resolveTaskPairWorktree) return false;
+  const reference = await Promise.resolve(deps.resolveTaskPairWorktree({ taskId: metadata.taskId, repoPath: metadata.repoPath }))
+    .catch((): TaskPairWorktreeReference => ({ available: false }));
+  return reference.available && reference.found === true && reference.terminal === true
+    && reference.retentionElapsed === true && reference.projectName === projectName;
+}
+
 async function postGitRemoveCandidate(
   journalPath: string,
   journal: GcJournal,
@@ -1018,7 +1112,8 @@ async function postGitRemoveCandidate(
       deps.now?.() ?? Date.now(),
       Math.max(60_000, deps.handoffGraceMs ?? SUPERVISION_WORKTREE_HANDOFF_GRACE_MS),
     );
-  if (!orphanStillUnknown && !terminalStillAuthorized) return false;
+  const pairStillEnded = await taskPairRemovalStillAuthorized(parsed?.metadata, journal.assignmentId, projectName, deps);
+  if (!orphanStillUnknown && !terminalStillAuthorized && !pairStillEnded) return false;
   if (await lstat(journal.repoPath).then(() => true, () => false)) return false;
   const contentReason = await inspectCandidateContents(candidatePath, false).catch(
     () => SUPERVISION_WORKTREE_GC_REASONS.UNKNOWN_CONTENT,
@@ -1111,10 +1206,12 @@ async function recoverInterruptedApply(
         deps.now?.() ?? Date.now(),
         Math.max(60_000, deps.handoffGraceMs ?? SUPERVISION_WORKTREE_HANDOFF_GRACE_MS),
       );
+    const pairStillEnded = metadataMatches
+      && await taskPairRemovalStillAuthorized(parsed?.metadata, journal.assignmentId, projectName, deps);
     if (!quarantineStat.isDirectory() || quarantineStat.isSymbolicLink()
       || !metadataMatches
       || (parsed && (parsed.metadata.assignmentId !== journal.assignmentId || parsed.metadata.taskId !== journal.taskId))
-      || (!orphanStillUnknown && !terminalStillAuthorized)
+      || (!orphanStillUnknown && !terminalStillAuthorized && !pairStillEnded)
       || await inspectCandidateContents(journal.quarantinePath, false).catch(() => SUPERVISION_WORKTREE_GC_REASONS.UNKNOWN_CONTENT)) {
       return { ok: false, deleted: 0, mutations: 0, releasedBytes: 0, assignmentId: journal.assignmentId };
     }

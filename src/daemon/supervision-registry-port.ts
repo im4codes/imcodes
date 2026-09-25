@@ -10,6 +10,8 @@
  */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { getTaskPairStore } from './task-pairs/store.js';
+import { TASK_PAIR_WORKSPACE_RETENTION_MS, isTerminalTaskPairStatus } from '../../shared/task-pair.js';
 import { getSupervisionTaskRegistry, SUPERVISION_REVISION_AUTHORITATIVE_INTENTS } from './supervision-state-store.js';
 import { listSessions, type SessionRecord } from '../store/session-store.js';
 import { resolveEffectiveProjectName } from '../../shared/session-scope.js';
@@ -376,6 +378,21 @@ export function createSupervisionWorktreeGcDeps(): SupervisionWorktreeGcDeps {
     resolveRegistryReferenceByAssignment: ({ assignmentId }) => (
       resolveWorktreeRegistryReference(assignmentId)
     ),
+    resolveTaskPairWorktree: ({ taskId, repoPath }) => {
+      try {
+        const owner = getTaskPairStore().findPairsByTaskId(taskId)
+          .find((pair) => pair.state.workspace?.kind === 'worktree' && pair.state.workspace.path === repoPath);
+        if (!owner) return { available: true, found: false };
+        const terminal = isTerminalTaskPairStatus(owner.state.status);
+        const endedAt = owner.state.workspace?.endedAt ?? owner.state.updatedAt;
+        return {
+          available: true, found: true, projectName: owner.project, terminal,
+          retentionElapsed: terminal && Date.now() - endedAt >= TASK_PAIR_WORKSPACE_RETENTION_MS,
+        };
+      } catch {
+        return { available: false };
+      }
+    },
     // Protect only paths that are actually in use as a session workspace.
     // Persistent sessions are normally `idle`; protecting every assignment
     // directory below their name would make terminal worktrees immortal.

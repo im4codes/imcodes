@@ -2443,6 +2443,20 @@ export class SupervisionTaskRegistry {
       record.resolvedAt ?? null, record.evidenceId);
   }
 
+  /**
+   * Put a project on the worktree GC schedule now (the pair engine does this
+   * for a pair worktree it had to keep, so a later clean state is reclaimed).
+   */
+  requestWorktreeGc(projectName: string, now = Date.now()): void {
+    if (!projectName || this.#closed) return;
+    this.#db.prepare(
+      `INSERT INTO supervision_worktree_gc_state (project_name, cursor, next_due_at, updated_at)
+       VALUES (?, NULL, ?, ?)
+       ON CONFLICT(project_name) DO UPDATE SET
+         next_due_at = MIN(next_due_at, excluded.next_due_at), updated_at = excluded.updated_at`,
+    ).run(projectName, now, now);
+  }
+
   #requestHousekeeping(projectName: string, now: number): void {
     this.#db.prepare(
       `UPDATE supervision_housekeeping_state

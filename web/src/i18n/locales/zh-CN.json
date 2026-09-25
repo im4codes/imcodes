@@ -4362,6 +4362,10 @@
       "add": "添加",
       "remove": "移除",
       "reset": "恢复默认"
-    }
+    },
+    "output_saved": "成果已保存到 {{path}}",
+    "output_failed": "成果未保存（{{reason}}）",
+    "workspace_removed": "工作区已删除",
+    "workspace_kept": "工作区已保留：仍有未保存的工作"
   }
 }

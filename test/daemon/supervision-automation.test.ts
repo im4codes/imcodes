@@ -6043,6 +6043,10 @@ describe('SupervisionAutomation', () => {
         mockTransportRuntime.send.mockClear();
         await parkedAutoAuditSession('cmd-one-source-pairs');
         taskPairService.ingestText('supervision', 'deck_supervision_lead', '<!-- IMCODES_TASK DISPATCH H1 executor=deck_supervision_brain auditor=deck_sub_reviewer -->', 'one-source-1');
+        // The participants' pair briefs are not heartbeat nudges; they follow
+        // workspace provisioning (a git probe), so wait for both to land.
+        await vi.waitFor(() => expect(pairSends.map((entry) => entry.target).sort()).toEqual(['deck_sub_reviewer', 'deck_supervision_brain']), { timeout: 10_000 });
+        pairSends.length = 0;
         const pairs = new TaskPairAutomation({ now: () => Date.now(), isBusy: () => false, isLimited: () => false, importLegacy: () => undefined });
         for (let tick = 0; tick < 2; tick += 1) {
           await vi.advanceTimersByTimeAsync(10 * 60_000);
@@ -6060,7 +6064,10 @@ describe('SupervisionAutomation', () => {
       }
     });
 
-    it('on a pairs project, a WAITING session that no pair covers keeps its one session heartbeat per interval', async () => {
+    // A pairs project runs no legacy Brain-run at all (its prompts carry the
+    // registry/finalization contracts a pair never has), so there is no
+    // legacy waiting heartbeat to keep: the pair heartbeat is the one source.
+    it('on a pairs project, no legacy WAITING run exists, so no legacy session heartbeat ever fires', async () => {
       const { TaskPairStore, setTaskPairStoreForTests } = await import('../../src/daemon/task-pairs/store.js');
       setTaskPairStoreForTests(new TaskPairStore(':memory:'));
       vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
@@ -6068,9 +6075,10 @@ describe('SupervisionAutomation', () => {
       try {
         mockTransportRuntime.send.mockClear();
         await parkedAutoAuditSession('cmd-one-source-uncovered');
+        expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
         for (let interval = 1; interval <= 3; interval += 1) {
           await vi.advanceTimersByTimeAsync(10 * 60_000);
-          expect(legacyHeartbeats()).toHaveLength(interval);
+          expect(legacyHeartbeats()).toHaveLength(0);
         }
       } finally {
         process.env.IMCODES_SUPERVISION_ENGINE = 'legacy';
@@ -6094,6 +6102,9 @@ describe('SupervisionAutomation', () => {
         // A pair row left from before a rollback to legacy must not be driven.
         process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
         taskPairService.ingestText('supervision', 'deck_supervision_lead', '<!-- IMCODES_TASK DISPATCH H2 executor=deck_supervision_brain auditor=deck_sub_reviewer -->', 'one-source-2');
+        // Briefs sent while the project was still on pairs are not the scheduler.
+        await vi.advanceTimersByTimeAsync(0);
+        pairSends.length = 0;
         process.env.IMCODES_SUPERVISION_ENGINE = 'legacy';
         await parkedAutoAuditSession('cmd-one-source-legacy');
         const pairs = new TaskPairAutomation({ now: () => Date.now(), isBusy: () => false, isLimited: () => false, importLegacy: () => undefined });
@@ -6110,6 +6121,43 @@ describe('SupervisionAutomation', () => {
         vi.useRealTimers();
       }
     });
+  });
+
+  // 215 / jdzj: a Codex "Selected model is at capacity" turn error ended a
+  // legacy Brain-run with "session blocked, supervision stopped" on a pairs
+  // project. Pairs projects run no legacy Brain-run, so a provider error there
+  // stops nothing; on the legacy engine the stop is unchanged (control).
+  it('a provider capacity error blocks and stops a legacy Brain-run, but on a pairs project there is no run to stop', async () => {
+    const capacityError = 'Selected model is at capacity. Please try a different model.';
+    const blockedNotices = () => timelineEmitter.replay('deck_supervision_brain', 0).events.filter((event) => (
+      event.type === 'assistant.text'
+      && (event.payload as { noticeCode?: string }).noticeCode === DAEMON_USER_NOTICE_CODE.SUPERVISION_SESSION_BLOCKED
+    ));
+
+    // Legacy engine (the harness default): the run is blocked and stopped.
+    const legacySnapshot = await seedSession('supervised_audit');
+    supervisionAutomation.init();
+    supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-capacity-legacy', 'implement the feature', legacySnapshot);
+    beginRun('cmd-capacity-legacy', 'implement the feature');
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeDefined();
+    timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'error', error: capacityError });
+    await vi.waitFor(() => expect(blockedNotices()).toHaveLength(1));
+    expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+
+    // Pairs engine: no legacy run is ever registered, so the same error stops nothing.
+    process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    try {
+      const pairsSnapshot = await seedSession('supervised_audit');
+      supervisionAutomation.registerTaskIntent('deck_supervision_brain', 'cmd-capacity-pairs', 'implement the feature', pairsSnapshot);
+      beginRun('cmd-capacity-pairs', 'implement the feature');
+      expect(supervisionAutomation.getActiveRun('deck_supervision_brain')).toBeUndefined();
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'error', error: capacityError });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(blockedNotices()).toHaveLength(1);
+      expect(mockSupervisionDecide).not.toHaveBeenCalled();
+    } finally {
+      process.env.IMCODES_SUPERVISION_ENGINE = 'legacy';
+    }
   });
 
   it('adopts and persists a Brain WAITING turn that was woken only by an internal delegation notification', async () => {
@@ -9255,6 +9303,25 @@ describe('auto-audit mode control delivery', () => {
     timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
     await new Promise<void>((resolve) => { setTimeout(resolve, 60); });
     expect(modeControlPrompts()).toHaveLength(1);
+  }, 30_000);
+
+  it('sends a pairs-engine Brain no mode-control contract; the same change reaches a legacy Brain', async () => {
+    const snapshot = await seedSession('supervised_audit');
+    process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    try {
+      supervisionAutomation.init();
+      setSupervision(snapshot);
+      timelineEmitter.emit('deck_supervision_brain', 'session.state', { state: 'idle' });
+      await new Promise<void>((resolve) => { setTimeout(resolve, 80); });
+      expect(modeControlPrompts()).toHaveLength(0);
+    } finally {
+      process.env.IMCODES_SUPERVISION_ENGINE = 'legacy';
+    }
+    // Control: the same change on the legacy engine is delivered.
+    setSupervision(offSnapshot());
+    setSupervision(snapshot);
+    await vi.waitFor(() => expect(modeControlPrompts()).toHaveLength(1), { timeout: 2_000 });
+    expect(modeControlPrompts()[0]).toContain('autoAudit=enabled');
   }, 30_000);
 
   it('redelivers the CURRENT state after a change that could not be sent', async () => {

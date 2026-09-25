@@ -1,4 +1,5 @@
-import { TASK_PAIR_LEGACY_TOOL_HOOK_PATH } from '../../shared/task-pair.js';
+import { TASK_PAIR_ENGINE_HOOK_PATH, TASK_PAIR_LEGACY_TOOL_HOOK_PATH } from '../../shared/task-pair.js';
+import { TASK_PAIR_LEGACY_TOOL_NAMES } from './task-pairs/legacy-tools.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { createIdempotentShutdown, installMcpStdioLifecycle,
@@ -80,6 +81,8 @@ export interface MemoryMcpServerOptions {
   /** Injected by tests; production binds the real registry. */
   supervisionToolDeps?: SupervisionMcpToolDeps;
   resourceGuard?: MemoryMcpResourceGuard;
+  /** Tools this connection never publishes (see resolveTaskPairWithheldMcpTools). */
+  withheldTools?: readonly string[];
 }
 
 export interface MemoryMcpServerCatalogOptions {
@@ -87,6 +90,7 @@ export interface MemoryMcpServerCatalogOptions {
   resourceGuard?: MemoryMcpResourceGuard;
   daemonAdmissionEnabled?: boolean;
   daemonAdmissionOwner?: SessionResourceOwner | null;
+  withheldTools?: readonly string[];
 }
 
 /** Narrow daemon-bridge seams used to make transient hook outages deterministic in tests. */
@@ -339,6 +343,12 @@ export function createMemoryMcpServer(
   // alias/message-pin tools -- outside the fuzzy-memory contract + firewall.
   for (const [name, tool] of registerSupervisionMcpTools(server, caller, supervisionToolDeps, toolDeps.legacyToolForwarder)) {
     registered.set(name, tool);
+  }
+  // Withheld tools are gone from this connection: not listed, not discoverable
+  // through mcp_tool_search and not callable.
+  for (const name of catalogOptions.withheldTools ?? []) {
+    registered.get(name)?.remove();
+    registered.delete(name);
   }
   registerMcpToolDiscovery(server, registered, { catalogMode: catalogOptions.toolCatalogMode });
   return server;
@@ -763,8 +773,35 @@ export function createMemoryMcpServerFromEnv(options: MemoryMcpServerOptions = {
         admissionOwner && admissionOwner.sessionName === caller.sessionName,
       ),
       daemonAdmissionOwner: admissionOwner,
+      ...(options.withheldTools ? { withheldTools: options.withheldTools } : {}),
     },
   );
+}
+
+const TASK_PAIR_ENGINE_PROBE_TIMEOUT_MS = 2_000;
+
+/**
+ * On a `pairs` project the legacy supervision tools (supervision_*,
+ * peer_audit_reply) are not published at all: pairs work through
+ * IMCODES_TASK markers. Asked of the daemon once, at MCP startup; if the daemon
+ * cannot answer, nothing is withheld (the daemon still answers those tools
+ * with the pairs view when it is back).
+ */
+export async function resolveTaskPairWithheldMcpTools(
+  caller: McpRuntimeCaller,
+  deps: { resolveHookPort?: typeof resolveLiveHookPort; postHook?: typeof postHookSend } = {},
+): Promise<readonly string[]> {
+  if (!caller.sessionName) return [];
+  try {
+    const port = await (deps.resolveHookPort ?? resolveLiveHookPort)();
+    if (!port) return [];
+    const response = await (deps.postHook ?? postHookSend)(
+      port, { from: caller.sessionName }, TASK_PAIR_ENGINE_HOOK_PATH, caller.sessionName, TASK_PAIR_ENGINE_PROBE_TIMEOUT_MS,
+    );
+    return response.pairs === true ? TASK_PAIR_LEGACY_TOOL_NAMES : [];
+  } catch {
+    return [];
+  }
 }
 
 export async function runMemoryMcpServer(options: MemoryMcpServerOptions = {}): Promise<void> {
@@ -816,7 +853,9 @@ export async function runMemoryMcpServer(options: MemoryMcpServerOptions = {}): 
     }, () => {
       process.stderr.write('[memory-mcp] CPU pressure recovered; accepting calls\n');
     });
-    const server = createMemoryMcpServerFromEnv({ ...options, resourceGuard: guard });
+    const withheldTools = options.withheldTools
+      ?? await resolveTaskPairWithheldMcpTools(parseMcpRuntimeCallerFromEnv(env, 'stdio'));
+    const server = createMemoryMcpServerFromEnv({ ...options, resourceGuard: guard, withheldTools });
     const owner = sessionResourceOwnerFromEnv(env as NodeJS.ProcessEnv);
     // Supervised backends are safe for the CPU watchdog to terminate: the
     // lightweight parent preserves stdio and starts a clean generation. Keep

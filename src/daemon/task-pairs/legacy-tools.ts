@@ -19,12 +19,14 @@ import {
   TASK_PAIR_MARKER_TAG,
   parseTaskPairBindingId,
   taskPairRoleOf,
+  type TaskPairRole,
   type TaskPairState,
   type TaskPairVerb,
 } from '../../../shared/task-pair.js';
 import { getTaskPairStore, type StoredTaskPair } from './store.js';
 import { isPairsEngineSession, projectOfSession } from './engine.js';
 import { taskPairService } from './service.js';
+import { NO_LEGACY_ARTIFACTS } from './messages.js';
 
 /** Legacy tools answered by the pairs engine. */
 export const TASK_PAIR_LEGACY_TOOL_NAMES: readonly string[] = [
@@ -44,9 +46,21 @@ export const TASK_PAIR_LEGACY_TOOL_NAMES: readonly string[] = [
 
 type Handler = (args: unknown, ...rest: never[]) => Promise<unknown>;
 
-function hint(taskId?: string): string {
+/**
+ * What a pairs answer says about the legacy registry: an agent asking a legacy
+ * tool on a pairs task is usually looking for an assignment, attempt or bundle,
+ * so the answer states plainly that none exists and where the material is.
+ */
+const PAIRS_NOTE = `Engine: task pairs. ${NO_LEGACY_ARTIFACTS} The audit material is the executor's workspace (a worktree and head, or a task-directory path), named on READY_FOR_AUDIT and relayed to the auditor. Legacy supervision tasks are history and are not shown.`;
+
+function hint(taskId?: string, role?: TaskPairRole): string {
   const id = taskId ?? '<taskId>';
-  return `This project uses marker-driven task pairs (${TASK_PAIR_CONTRACT_ID}). Instead of this tool, write a marker line such as <!-- ${TASK_PAIR_MARKER_TAG} READY_FOR_AUDIT ${id} --> in your reply.`;
+  const example = role === 'auditor'
+    ? `<!-- ${TASK_PAIR_MARKER_TAG} PASS ${id} blocking=P0 --> or <!-- ${TASK_PAIR_MARKER_TAG} REWORK ${id} blocking=P0 p0=<n> -->`
+    : role === 'brain'
+      ? `<!-- ${TASK_PAIR_MARKER_TAG} DISPATCH ${id} executor=<session> -->`
+      : `<!-- ${TASK_PAIR_MARKER_TAG} READY_FOR_AUDIT ${id} worktree=<absolute path> head=<commit> base=<commit> -->`;
+  return `This project uses marker-driven task pairs (${TASK_PAIR_CONTRACT_ID}). Instead of this tool, write a marker line such as ${example} in your reply. ${NO_LEGACY_ARTIFACTS}`;
 }
 
 function coordinatorStartHint(taskId: string): string {
@@ -92,6 +106,8 @@ function summarize(state: TaskPairState): Record<string, unknown> {
     flags: state.flags,
     blocking: state.blocking,
     ...(state.lastVerdict ? { lastVerdict: state.lastVerdict } : {}),
+    ...(state.material ? { material: state.material } : {}),
+    ...(state.workspace ? { workspace: { kind: state.workspace.kind, path: state.workspace.path, status: state.workspace.status } } : {}),
   };
 }
 
@@ -143,14 +159,18 @@ export async function handleLegacyToolOnPairs(tool: string, callerSession: strin
     const own = projectPairs(project).filter((pair) => (
       pair.state.brain === callerSession || pair.state.executor === callerSession || pair.state.auditor === callerSession
     ));
-    return { status: 'ok', engine: 'pairs', tasks: own.map((pair) => summarize(pair.state)), hint: hint() };
+    return { status: 'ok', engine: 'pairs', pairsNote: PAIRS_NOTE, tasks: own.map((pair) => summarize(pair.state)), hint: hint() };
   }
   if (tool === SUPERVISION_MCP_TOOLS.GET) {
     const taskId = str(args, 'taskId') ?? parseTaskPairBindingId(str(args, 'assignmentId'))?.taskId;
     const pair = taskId ? store.getPair(project, taskId) : undefined;
     return pair
-      ? { status: 'ok', engine: 'pairs', task: summarize(pair.state), events: store.listEvents(project, pair.state.taskId, 20) }
-      : { status: 'ok', engine: 'pairs', task: null, hint: hint(taskId) };
+      ? {
+          status: 'ok', engine: 'pairs', pairsNote: PAIRS_NOTE, task: summarize(pair.state),
+          events: store.listEvents(project, pair.state.taskId, 20),
+          hint: hint(pair.state.taskId, taskPairRoleOf(pair.state, callerSession)),
+        }
+      : { status: 'ok', engine: 'pairs', pairsNote: PAIRS_NOTE, task: null, hint: hint(taskId) };
   }
 
   // The legacy way to open a task: Brain starts it as coordinator, then sends
@@ -176,8 +196,15 @@ export async function handleLegacyToolOnPairs(tool: string, callerSession: strin
   // A pairs receipt's assignmentId is a pair binding id; it names the task too.
   const requested = str(args, 'taskId') ?? parseTaskPairBindingId(str(args, 'assignmentId'))?.taskId;
   const taskId = requested && store.getPair(project, requested) ? requested : taskPairService.resolveTaskId(project, callerSession, TASK_PAIR_INFER_TASK_ID);
+  const callerRole = (id: string | undefined) => {
+    const state = id ? store.getPair(project, id)?.state : undefined;
+    return state ? taskPairRoleOf(state, callerSession) : tool === MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY ? 'auditor' : undefined;
+  };
   if (!verb || !taskId || taskId === TASK_PAIR_INFER_TASK_ID) {
-    return { status: 'ok', engine: 'pairs', applied: 'none', ...(taskId ? { taskId } : {}), hint: hint(taskId ?? requested) };
+    return {
+      status: 'ok', engine: 'pairs', applied: 'none', pairsNote: PAIRS_NOTE,
+      ...(taskId ? { taskId } : {}), hint: hint(taskId ?? requested, callerRole(taskId ?? requested)),
+    };
   }
   // Status-only legacy calls (heartbeat/claim/checkpoint/update) from anyone
   // but the executor are progress pings, not transitions: auditors call them
@@ -190,7 +217,7 @@ export async function handleLegacyToolOnPairs(tool: string, callerSession: strin
       source: 'legacy_tool', fromStatus: existing.status, toStatus: existing.status, at: Date.now(),
     });
     taskPairService.recordPairProgress(project, taskId, callerSession, Date.now());
-    return { status: 'ok', engine: 'pairs', applied: 'recorded', taskId, pairStatus: existing.status, hint: hint(taskId) };
+    return { status: 'ok', engine: 'pairs', applied: 'recorded', taskId, pairStatus: existing.status, pairsNote: PAIRS_NOTE, hint: hint(taskId, callerRole(taskId)) };
   }
   const transition = taskPairService.applyMarker({
     project,
@@ -206,7 +233,8 @@ export async function handleLegacyToolOnPairs(tool: string, callerSession: strin
     applied: transition.effect,
     taskId,
     ...(after ? { pairStatus: after.status } : {}),
-    hint: hint(taskId),
+    pairsNote: PAIRS_NOTE,
+    hint: hint(taskId, callerRole(taskId)),
   };
 }
 

@@ -4234,6 +4234,51 @@ describe('handleWebCommand transport queue behavior', () => {
     clearAllResend();
   });
 
+  // On a `pairs` project the pair engine owns supervision: a Brain turn starts
+  // no legacy Brain-run, so no task intent is tracked and no execution
+  // preamble with the legacy registry/finalization contracts is attached.
+  it('starts no legacy supervision run for a Brain on a pairs-engine project', async () => {
+    const { clearAllResend } = await import('../../src/daemon/transport-resend-queue.js');
+    clearAllResend();
+    const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
+    process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    try {
+      getSessionMock.mockReturnValue({
+        name: 'deck_transport_brain',
+        projectName: 'transport',
+        role: 'brain',
+        agentType: 'claude-code-sdk',
+        runtimeType: 'transport',
+        providerId: 'claude-code-sdk',
+        state: 'idle',
+        transportConfig: {
+          supervision: {
+            mode: 'supervised_audit',
+            backend: 'codex-sdk',
+            model: 'gpt-5.4',
+            timeoutMs: 12_000,
+            promptVersion: 'supervision_decision_v1',
+            maxParseRetries: 1,
+          },
+        },
+      });
+      getTransportRuntimeMock.mockReturnValue(undefined);
+      handleWebCommand({
+        type: 'session.send',
+        session: 'deck_transport_brain',
+        text: 'implement the export feature',
+        commandId: 'cmd-pairs-brain',
+      }, serverLink as any);
+      await flushAsync();
+      expect(queueTaskIntentMock).not.toHaveBeenCalledWith('deck_transport_brain', 'cmd-pairs-brain', expect.anything(), expect.anything());
+      expect(registerTaskIntentMock).not.toHaveBeenCalledWith('deck_transport_brain', 'cmd-pairs-brain', expect.anything(), expect.anything());
+    } finally {
+      if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
+      else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
+      clearAllResend();
+    }
+  });
+
   it('treats transport runtimes without a provider session id as unavailable', async () => {
     getTransportRuntimeMock.mockReturnValue({
       providerSessionId: null,

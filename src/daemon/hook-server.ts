@@ -13,7 +13,7 @@
  * After startHookServer() resolves, `activeHookPort` holds the actual port.
  * All hook scripts and plugins read this value at write time.
  */
-import { TASK_PAIR_LEGACY_TOOL_HOOK_PATH } from '../../shared/task-pair.js';
+import { TASK_PAIR_ENGINE_HOOK_PATH, TASK_PAIR_LEGACY_TOOL_HOOK_PATH } from '../../shared/task-pair.js';
 import http from 'http';
 import logger from '../util/logger.js';
 import { timelineEmitter } from './timeline-emitter.js';
@@ -1119,6 +1119,30 @@ export async function startHookServer(
           res.writeHead(400);
           res.end(JSON.stringify({ ok: false, error: 'bad request' }));
         }
+      }
+      return;
+    }
+
+    if (url === TASK_PAIR_ENGINE_HOOK_PATH) {
+      // An MCP child process asking, at startup, whether its session is on the
+      // `pairs` engine: there it publishes no legacy supervision tools.
+      try {
+        const body = JSON.parse(await readBody(req, MAX_BODY_SIZE)) as Record<string, unknown>;
+        const senderHeader = req.headers['x-imcodes-session'];
+        const authenticatedSender = Array.isArray(senderHeader) ? senderHeader[0] : senderHeader;
+        const from = typeof body.from === 'string' ? body.from.trim() : '';
+        if (!from || authenticatedSender !== from || !getSession(from)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'invalid task-pair engine request' }));
+          return;
+        }
+        const { isPairsEngineSession } = await import('./task-pairs/engine.js');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, pairs: isPairsEngineSession(from) }));
+      } catch (err) {
+        const status = (err as Error).message === 'body too large' ? 413 : 400;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: status === 413 ? 'request body too large' : 'bad request' }));
       }
       return;
     }

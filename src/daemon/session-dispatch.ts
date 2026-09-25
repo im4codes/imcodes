@@ -43,6 +43,7 @@ import { buildTransportQueueSnapshotPayload } from './transport-queue-projection
 import { enqueueResend, recipientFromSessionRecord } from './transport-resend-queue.js';
 import { injectPeerAuditBriefIntoProcessSession, type PeerAuditProcessInjectError } from './peer-audit-process-injector.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import { isPairsEngineSession } from './task-pairs/engine.js';
 import {
   createDelegationReplyAuthority,
   expireDelegationReplyAuthority,
@@ -144,7 +145,9 @@ export function buildSessionDispatchMessage(
     result += `\n\nReferenced files:\n${files.map((file) => `- ${file}`).join('\n')}`;
   }
   if (options.replyTo && isValidImcodesSessionName(options.replyTo)) {
-    result += `\n\n${buildAgentDelegationReplyInstruction(options.replyTo, options.replyAuthority)}`;
+    result += `\n\n${buildAgentDelegationReplyInstruction(options.replyTo, options.replyAuthority, {
+      taskPairEngine: isPairsEngineSession(options.replyTo),
+    })}`;
   }
   return result;
 }

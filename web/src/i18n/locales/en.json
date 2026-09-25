@@ -4362,6 +4362,10 @@
       "add": "Add",
       "remove": "Remove",
       "reset": "Reset to default"
-    }
+    },
+    "output_saved": "Deliverable saved to {{path}}",
+    "output_failed": "Deliverable not saved ({{reason}})",
+    "workspace_removed": "Workspace removed",
+    "workspace_kept": "Workspace kept: it still has unsaved work"
   }
 }

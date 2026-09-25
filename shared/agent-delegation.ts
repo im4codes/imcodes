@@ -550,13 +550,16 @@ export function buildAgentDelegationSenderLine(
 export function buildAgentDelegationReplyInstruction(
   replyToSession: string,
   authority?: AgentDelegationReplyAuthority,
+  options: { taskPairEngine?: boolean } = {},
 ): string {
   if (!isCanonicalAgentDelegationSessionName(replyToSession)) return '';
   if (authority) {
     if (!isAgentDelegationOpaqueId(authority.delegationId)) return '';
+    // A `pairs` project carries no supervision_* contract, so its reply
+    // instruction references none (the reader accepts the field's absence).
     const marker = `${AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER} ${JSON.stringify({
       delegationId: authority.delegationId,
-      contractRefs: AGENT_DELEGATION_CONTRACT_REFS,
+      ...(options.taskPairEngine && !authority.audit ? {} : { contractRefs: AGENT_DELEGATION_CONTRACT_REFS }),
     })}`;
     if (authority.audit?.kind === AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT) {
       return [

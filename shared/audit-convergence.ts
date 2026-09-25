@@ -75,6 +75,22 @@ function nonBlockingSeverities(blocking: readonly AuditSeverity[]): AuditSeverit
 }
 
 /** Full body, for the stable system prompt only. */
+/**
+ * What "evidence" means for a task pair (`task_pair_markers_v1`). A pair has no
+ * assignment, audit attempt, audit revision, immutable bundle or registry
+ * binding, so an auditor that waits for those waits forever. The material is
+ * the executor's workspace named on READY_FOR_AUDIT (a worktree at a HEAD, or a
+ * task-directory path; the daemon relays it), plus the executor's validation.
+ */
+export const TASK_PAIR_AUDIT_EVIDENCE = {
+  appliesTo: 'IMCODES_TASK pairs',
+  material: 'the executor workspace from READY_FOR_AUDIT (relayed by the daemon): a worktree path, base and HEAD, read directly (git -C <worktree> diff <base>..<head>); or a task-directory path, read directly, with no HEAD',
+  exactRevision: 'the named HEAD; for a task directory, its files as named',
+  implementerReport: 'the validation the executor reports for that HEAD (full suites required as usual)',
+  noLegacyArtifacts: 'assignmentId, auditAttemptId, auditRevision, immutable bundle/manifest and registry bindings do not exist; their absence is never a finding and never blocks',
+  materialUnreachable: 'executor limited/offline or workspace unreadable: write NEEDS_INPUT with a note and wait; never PASS, REWORK or P0 for it',
+} as const;
+
 export function buildAuditConvergenceContract(): string {
   const defaults = AUDIT_DEFAULT_BLOCKING_SEVERITIES.join('/');
   return JSON.stringify({
@@ -118,6 +134,10 @@ export function buildAuditConvergenceContract(): string {
       postDeployGate: 'preflight required secrets and base URLs before running',
       loadSafety: LOAD_VALIDATION_SAFETY_COMPACT,
     },
+    // Task pairs (IMCODES_TASK markers) have no supervision registry: the
+    // exact-revision/binding/authoritative-report wording above maps onto what
+    // a pair does have, and nothing missing from the legacy registry may block.
+    taskPairs: TASK_PAIR_AUDIT_EVIDENCE,
     slices: 'one combined audit of the integrated result; never audit slices one by one',
     commentOrDocOnly: 'binding check only, no re-audit',
     roles: {

@@ -4361,6 +4361,10 @@
       "add": "追加",
       "remove": "削除",
       "reset": "既定に戻す"
-    }
+    },
+    "output_saved": "成果物を {{path}} に保存しました",
+    "output_failed": "成果物は保存されませんでした（{{reason}}）",
+    "workspace_removed": "作業領域を削除しました",
+    "workspace_kept": "作業領域を保持しました：未保存の作業があります"
   }
 }

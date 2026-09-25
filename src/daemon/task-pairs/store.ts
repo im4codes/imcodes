@@ -157,6 +157,12 @@ export class TaskPairStore {
     return row ? rowToPair(row) : undefined;
   }
 
+  /** Pairs with this task id in any project (a worktree's metadata names only the task). */
+  findPairsByTaskId(taskId: string): StoredTaskPair[] {
+    const rows = this.#db.prepare('SELECT * FROM task_pairs WHERE task_id = ?').all(taskId) as Array<Record<string, unknown>>;
+    return rows.map(rowToPair);
+  }
+
   getPairByLegacyTaskId(legacyTaskId: string): StoredTaskPair | undefined {
     const row = this.#db.prepare('SELECT * FROM task_pairs WHERE legacy_task_id = ?').get(legacyTaskId) as Record<string, unknown> | undefined;
     return row ? rowToPair(row) : undefined;
@@ -177,6 +183,15 @@ export class TaskPairStore {
   /** Every pair of a project, newest first (for the console). */
   listPairs(project: string, limit = 200): StoredTaskPair[] {
     const rows = this.#db.prepare('SELECT * FROM task_pairs WHERE project = ? ORDER BY updated_at DESC LIMIT ?').all(project, limit) as Array<Record<string, unknown>>;
+    return rows.map(rowToPair);
+  }
+
+  /** Ended pairs whose workspace still exists (ended or kept): the workspace sweep's input. */
+  listEndedWorkspacePairs(): StoredTaskPair[] {
+    const terminal = TASK_PAIR_TERMINAL_STATUSES.map(() => '?').join(',');
+    const rows = this.#db.prepare(
+      `SELECT * FROM task_pairs WHERE status IN (${terminal}) AND json_extract(state_json, '$.workspace.status') IN ('ended', 'kept')`,
+    ).all(...TASK_PAIR_TERMINAL_STATUSES) as Array<Record<string, unknown>>;
     return rows.map(rowToPair);
   }
 

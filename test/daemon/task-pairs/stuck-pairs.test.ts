@@ -238,6 +238,8 @@ describe('pairs that stopped driving themselves (215 / jdzj)', () => {
     }
     await flush();
     sent = [];
+    // The setup's pair briefs were worked through before the first heartbeat.
+    pendingThisTick.clear();
     return ids;
   }
 

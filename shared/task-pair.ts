@@ -27,8 +27,50 @@ export const TASK_PAIR_TIMELINE_EVENT = 'task_pair.event' as const;
 export const TASK_PAIR_NUDGE_ID_PREFIX = 'task-pair-nudge:' as const;
 /** Hook path through which MCP child processes hand legacy supervision tool calls to the daemon. */
 export const TASK_PAIR_LEGACY_TOOL_HOOK_PATH = '/task-pairs/legacy-tool' as const;
+/** Hook path through which an MCP child process asks whether its session is on the `pairs` engine. */
+export const TASK_PAIR_ENGINE_HOOK_PATH = '/task-pairs/engine' as const;
+/**
+ * Brain's work-delegation contract on a `pairs` project. It has its own id so a
+ * pairs Brain never carries a `supervision_*` contract.
+ */
+export const TASK_PAIR_BRAIN_CONTRACT_ID = 'task_pair_brain_v1' as const;
 /** Automation kind stamped on daemon-authored pair messages. */
 export const TASK_PAIR_AUTOMATION_KIND = 'task-pair' as const;
+/** Directory-name prefix of a pair's executor worktree, beside legacy `asg_…` assignment worktrees. */
+export const TASK_PAIR_WORKTREE_PREFIX = 'pair_' as const;
+/**
+ * Root (under the IM.codes home, ~/.imcodes) of the task directories of pairs
+ * that are not git/code work: `~/.imcodes/works/<project>/<taskId>/`.
+ */
+export const TASK_PAIR_WORKS_DIR = 'works' as const;
+/** Environment override of the works root (tests, relocated homes). */
+export const TASK_PAIR_WORKS_ROOT_ENV = 'IMCODES_WORKS_ROOT' as const;
+/** A pair's workspace is removed this long after the pair ends (DONE/CANCEL). */
+export const TASK_PAIR_WORKSPACE_RETENTION_MS = 7 * 24 * 60 * 60_000;
+/** A git worktree for code in a git project; a plain task directory otherwise. */
+export const TASK_PAIR_WORKSPACE_KINDS = ['worktree', 'dir'] as const;
+export type TaskPairWorkspaceKind = typeof TASK_PAIR_WORKSPACE_KINDS[number];
+/** Effects of daemon workspace events on the pair timeline. */
+export const TASK_PAIR_WORKSPACE_EFFECTS = {
+  REMOVED: 'workspace_removed',
+  KEPT: 'workspace_kept',
+  OUTPUT_SAVED: 'output_saved',
+  OUTPUT_FAILED: 'output_failed',
+} as const;
+/** Verb of daemon workspace events (never a marker verb). */
+export const TASK_PAIR_WORKSPACE_EVENT_VERB = 'WORKSPACE' as const;
+
+/**
+ * The workspace rules every pair participant gets, in the marker contract and
+ * in the daemon's briefs. One text, so the contract and the deliveries agree.
+ */
+export const TASK_PAIR_WORKSPACE_RULES = [
+  'Workspace: the daemon gives every pair one and names it in the executor brief and in the auditor\'s audit request.',
+  'A code task in a git project gets a git worktree under ~/.imcodes/worktrees: READY_FOR_AUDIT <taskId> worktree=<absolute path> head=<commit> base=<commit>.',
+  `Any other task (the project is not a git repo, or Brain dispatched it with workspace=dir) gets a task directory under ~/.imcodes/${TASK_PAIR_WORKS_DIR}/<project>/<taskId>/: work and write results there; READY_FOR_AUDIT <taskId> path=<the directory or the result files>, no git HEAD needed.`,
+  'Never work in the main checkout or /tmp, and never delete the workspace by hand: the daemon removes it 7 days after the pair ends (DONE/CANCEL), and keeps a git worktree that still has uncommitted or unpushed work.',
+  'Deliverables: judge from the task type whether the result must outlive the pair (a report, document or asset the user keeps) or is only temporary (scratch work, or code that is committed and pushed). If it must be kept, end with DONE <taskId> output=<path inside the workspace> [dest=<path inside the project directory>]: the daemon copies it into the project directory (by default under the same relative path, never overwriting) and tells the user where. Temporary work: plain DONE.',
+].join(' ');
 
 export const TASK_PAIR_ENGINES = ['pairs', 'legacy'] as const;
 export type TaskPairEngine = typeof TASK_PAIR_ENGINES[number];
@@ -334,11 +376,71 @@ export interface TaskPairState {
   executorPool?: string;
   auditorPool?: string;
   brief?: string;
+  /**
+   * Where the audit material is: the executor's worktree at the HEAD it named
+   * on READY_FOR_AUDIT. Relayed to the auditor; a pair has no other artifact.
+   */
+  material?: TaskPairMaterial;
+  /** The workspace the daemon created for the pair (see task-pairs/workspace.ts). */
+  workspace?: TaskPairWorkspace;
+  /** Workspace Brain asked for on DISPATCH/QUEUE (`workspace=dir`); otherwise chosen by the project. */
+  workspaceKind?: TaskPairWorkspaceKind;
+  /** Deliverable to keep, named on DONE (`output=`, `dest=`); copied into the project when the pair ends DONE. */
+  output?: TaskPairOutput;
   /** Marker-triggered messages sent this round, per capped reason. */
   capCounts: Partial<Record<TaskPairCappedReason, number>>;
   capRound: number;
   createdAt: number;
   updatedAt: number;
+}
+
+export interface TaskPairMaterial {
+  worktree?: string;
+  head?: string;
+  base?: string;
+  /** Task-directory material: the directory or the result files. */
+  path?: string;
+  at: number;
+}
+
+export interface TaskPairWorkspace {
+  kind: TaskPairWorkspaceKind;
+  path: string;
+  /** Base commit (worktrees only). */
+  base?: string;
+  createdAt: number;
+  /**
+   * `ended` from DONE/CANCEL until the retention elapses; then `removed`, or
+   * `kept` (with why) while a worktree still holds unsaved work.
+   */
+  status: 'active' | 'ended' | 'removed' | 'kept';
+  endedAt?: number;
+  keptReason?: string;
+}
+
+export interface TaskPairOutput {
+  /** Inside the workspace. */
+  path: string;
+  /** Inside the project directory; the same relative path when absent. */
+  dest?: string;
+}
+
+/** READY_FOR_AUDIT attributes that name the audit material. */
+export const TASK_PAIR_MATERIAL_ATTRS = ['worktree', 'head', 'base', 'path'] as const;
+
+function materialFromAttrs(attrs: Record<string, string>, now: number): TaskPairMaterial | undefined {
+  const material: TaskPairMaterial = { at: now };
+  for (const key of TASK_PAIR_MATERIAL_ATTRS) if (attrs[key]) material[key] = attrs[key];
+  return material.worktree || material.head || material.base || material.path ? material : undefined;
+}
+
+function applyWorkspaceAttr(pair: TaskPairState, attrs: Record<string, string>): void {
+  const kind = attrs.workspace;
+  if (kind && (TASK_PAIR_WORKSPACE_KINDS as readonly string[]).includes(kind)) pair.workspaceKind = kind as TaskPairWorkspaceKind;
+}
+
+function applyOutputAttr(pair: TaskPairState, attrs: Record<string, string>): void {
+  if (attrs.output) pair.output = { path: attrs.output, ...(attrs.dest ? { dest: attrs.dest } : {}) };
 }
 
 export type TaskPairIntent =
@@ -347,6 +449,8 @@ export type TaskPairIntent =
   | { kind: 'correction'; to: string; judgement: TaskPairVerdictJudgement }
   | { kind: 'done_reminder'; to: string }
   | { kind: 'rework_notice'; to: string; counts: TaskPairSeverityCounts }
+  /** An audit round opened: tell the auditor where the material is. */
+  | { kind: 'audit_request'; to: string }
   | { kind: 'replace_auditor'; reason: 'executor_blocked' }
   | { kind: 'brain_notice'; flag: TaskPairFlag }
   | { kind: 'slot_changed' }
@@ -449,6 +553,9 @@ function clonePair(pair: TaskPairState): TaskPairState {
     previousAuditors: [...pair.previousAuditors],
     capCounts: { ...pair.capCounts },
     lastVerdict: pair.lastVerdict ? { ...pair.lastVerdict, counts: { ...pair.lastVerdict.counts } } : undefined,
+    material: pair.material ? { ...pair.material } : undefined,
+    workspace: pair.workspace ? { ...pair.workspace } : undefined,
+    output: pair.output ? { ...pair.output } : undefined,
   };
 }
 
@@ -506,6 +613,7 @@ function setRolesFromAttrs(pair: TaskPairState, attrs: Record<string, string>, i
   }
   if (attrs.title) pair.title = attrs.title;
   if (attrs.pool) pair.executorPool = attrs.pool;
+  applyWorkspaceAttr(pair, attrs);
   const blocking = parseBlockingAttr(attrs.blocking);
   if (blocking) pair.blocking = blocking;
   if (!pair.auditor) {
@@ -582,7 +690,11 @@ export function applyTaskPairMarker(
         if (verb === 'READY_FOR_AUDIT' && hasAudit(pair)) {
           pair.status = 'in_audit';
           pair.round = 1;
+          const material = materialFromAttrs(attrs, ctx.now);
+          if (material) pair.material = material;
+          if (pair.auditor) intents.push({ kind: 'audit_request', to: pair.auditor });
         } else if (verb === 'DONE') {
+          applyOutputAttr(pair, attrs);
           if (!hasAudit(pair)) pair.status = 'done';
           else {
             pair.status = 'awaiting_audit';
@@ -663,7 +775,13 @@ export function applyTaskPairMarker(
     }
     case 'READY_FOR_AUDIT': {
       if (!hasAudit(pair)) return recorded(existing);
-      if (pair.status === 'in_audit') return done('status');
+      const material = materialFromAttrs(attrs, ctx.now);
+      if (material) pair.material = material;
+      if (pair.status === 'in_audit') {
+        // A resubmission inside the round with new material is relayed again.
+        if (material && pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR) intents.push({ kind: 'audit_request', to: pair.auditor });
+        return done('status');
+      }
       if (pair.status === 'queued' || pair.status === 'passed' || terminal) unusual = true;
       if (terminal) intents.push({ kind: 'slot_changed' });
       pair.status = 'in_audit';
@@ -673,6 +791,8 @@ export function applyTaskPairMarker(
       if (!pair.auditor) {
         addFlag(pair, 'needs_auditor');
         intents.push({ kind: 'pick_auditor' });
+      } else {
+        intents.push({ kind: 'audit_request', to: pair.auditor });
       }
       return done('status');
     }
@@ -695,6 +815,7 @@ export function applyTaskPairMarker(
     case 'DONE': {
       const force = role === 'brain' && isTrue(attrs.force);
       if (terminal) return recorded(existing, false);
+      applyOutputAttr(pair, attrs);
       if (force) {
         if (pair.status !== 'passed' && hasAudit(pair)) addFlag(pair, 'unaudited');
         pair.status = 'done';
@@ -753,6 +874,7 @@ function setRolesFromAttrsQueued(pair: TaskPairState, attrs: Record<string, stri
   if (attrs.auditor) pair.auditor = attrs.auditor;
   if (attrs.title) pair.title = attrs.title;
   if (attrs.pool) pair.executorPool = attrs.pool;
+  applyWorkspaceAttr(pair, attrs);
   const blocking = parseBlockingAttr(attrs.blocking);
   if (blocking) pair.blocking = blocking;
 }
@@ -849,6 +971,10 @@ export interface TaskPairEventPayload {
   verdictJudgement?: TaskPairVerdictJudgement;
   executorPool?: string;
   auditorPool?: string;
+  /** Where the daemon copied a pair's kept deliverable (OUTPUT_SAVED). */
+  outputPath?: string;
+  /** Why the deliverable could not be copied (OUTPUT_FAILED). */
+  outputError?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -861,8 +987,10 @@ export function buildTaskPairMarkerContract(): string {
     'Supervised tasks are executor+auditor pairs driven by one-line markers you write on their own line in your reply (never inside code fences):',
     `<!-- ${TASK_PAIR_MARKER_TAG} <VERB> <taskId> [key=value | key="quoted value"] -->`,
     'Verbs: DISPATCH, QUEUE, STARTED, WORKING, READY_FOR_AUDIT, PASS, REWORK, DONE, BLOCKED, NEEDS_INPUT, REASSIGN, CANCEL. taskId "-" means your single open task.',
-    'Executor: write STARTED when you begin; send your materials to the auditor with send_message, then write READY_FOR_AUDIT; after PASS commit/push yourself and write DONE. DONE without a PASS is not complete. Write BLOCKED or NEEDS_INPUT with note="..." when stuck.',
-    `Auditor: judge by ${AUDIT_CONVERGENCE_CONTRACT_ID}. Reply to the executor with every finding tagged [P0]..[P4], then write PASS or REWORK with the blocking set and a count per level, e.g. REWORK <taskId> blocking=P0 p0=1 p1=2. REWORK needs at least one finding at a blocking level; PASS has none. Re-audits check only the prior blocking classes plus regressions.`,
-    `Brain: DISPATCH <taskId> executor=<session> auditor=<session>|none [blocking=P0,P1] [pool=primary|economy]; queue with QUEUE <taskId> title="..." then the full brief then <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> -->; QUEUE - max=<n> sets your queue limit; REASSIGN <taskId> auditor=<session>; DONE <taskId> force=true completes without audit; CANCEL <taskId>.`,
+    'Executor: write STARTED when you begin and work in the pair\'s workspace (below). When done, send the auditor your validation (full suites for code) with send_message and write READY_FOR_AUDIT naming the material; the daemon relays it to the auditor. After PASS commit/push code yourself and write DONE (with output= when the result must be kept). DONE without a PASS is not complete. Write BLOCKED or NEEDS_INPUT with note="..." when stuck.',
+    TASK_PAIR_WORKSPACE_RULES,
+    'Pairs have no assignmentId, auditAttemptId, auditRevision, immutable bundle, scopeFiles or control-plane binding: never wait for, ask for or block on them.',
+    `Auditor: the material is the executor's workspace (a worktree at the named head, or the named task-directory path; read it directly) plus their reported validation; judge by ${AUDIT_CONVERGENCE_CONTRACT_ID}. Reply to the executor with every finding tagged [P0]..[P4], then write PASS or REWORK with the blocking set and a count per level, e.g. REWORK <taskId> blocking=P0 p0=1 p1=2. REWORK needs at least one finding at a blocking level; PASS has none. Re-audits check only the prior blocking classes plus regressions. If the material cannot be reached (executor limited/offline, workspace unreadable), write NEEDS_INPUT <taskId> note="..." and wait: that is never a P0 or REWORK.`,
+    `Brain: DISPATCH <taskId> executor=<session> auditor=<session>|none [blocking=P0,P1] [pool=primary|economy] [workspace=dir for non-code work in a git project]; queue with QUEUE <taskId> title="..." then the full brief then <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> -->; QUEUE - max=<n> sets your queue limit; REASSIGN <taskId> auditor=<session>; DONE <taskId> force=true completes without audit; CANCEL <taskId>.`,
   ].join('\n');
 }

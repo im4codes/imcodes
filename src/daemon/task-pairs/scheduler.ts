@@ -32,6 +32,7 @@ import {
 import { getTaskPairStore, type StoredTaskPair, type TaskPairLiveness } from './store.js';
 import { isPairsEngineProject, resolveTaskPairAllowlist, resolveTaskPairMaxConcurrency } from './engine.js';
 import { sendTaskPairMessage } from './delivery.js';
+import { hasRecentTaskPairProviderError } from './provider-errors.js';
 import { taskPairService, type TaskPairScheduler } from './service.js';
 import {
   allowlistedProvisionConfig,
@@ -118,7 +119,11 @@ export class TaskPairAutomation implements TaskPairScheduler {
     this.#tickBusy?.set(session, busy);
     return busy;
   }
-  #limited(session: string): boolean { return (this.#deps.isLimited ?? ((name) => isSessionProviderLimited(name)))(session); }
+  /** A structured usage limit, or a transient provider refusal (capacity, rate, overload) in the last heartbeat. */
+  #limited(session: string): boolean {
+    return (this.#deps.isLimited ?? ((name) => isSessionProviderLimited(name)))(session)
+      || hasRecentTaskPairProviderError(session, this.#now(), this.#intervalMs);
+  }
   #poolOf(brain: string, session: string) { return (this.#deps.poolOf ?? ((b, s) => poolOfSession(b, s)))(brain, session); }
 
   #pick(input: { brain: string; role: TaskPairPickRole; pool: 'primary' | 'economy'; exclude: ReadonlySet<string>; project: string }): string | undefined {
@@ -193,6 +198,8 @@ export class TaskPairAutomation implements TaskPairScheduler {
       this.#tickBusy = undefined;
     }
     for (const [brain, project] of brains) await this.runQueue(project, brain);
+    // Workspaces of pairs that ended a week ago go (hourly at most).
+    await taskPairService.sweepWorkspaces(now);
     store.prune(now);
     this.#nextTickAt = now + this.#intervalMs;
     this.publishBadges();
@@ -387,6 +394,8 @@ export class TaskPairAutomation implements TaskPairScheduler {
       now: this.#now(),
       eventId: `heartbeat:${project}:${taskId}:executor:${next}:${this.#now()}`,
     });
+    // A dispatch that named no executor briefs the one picked for it.
+    await taskPairService.briefParticipants(project, taskId);
   }
 
   #flagOnce(project: string, taskId: string, flag: TaskPairFlag): void {
@@ -477,7 +486,9 @@ export class TaskPairAutomation implements TaskPairScheduler {
       const cleaned = { ...dispatched, flags: dispatched.flags.filter((flag) => flag !== 'waiting_for_capacity') };
       store.savePair(project, cleaned);
       open += 1;
-      await sendTaskPairMessage(executor, pair.taskId, 'dispatch', `${pair.brief}${buildDispatchTrailer(cleaned)}`);
+      // The executor's worktree exists before the brief that names it is sent.
+      const withWorkspace = await taskPairService.ensureWorkspace(project, pair.taskId) ?? cleaned;
+      await sendTaskPairMessage(executor, pair.taskId, 'dispatch', `${pair.brief}${buildDispatchTrailer(withWorkspace)}`);
       if (auditor !== TASK_PAIR_NO_AUDITOR) await sendTaskPairMessage(auditor, pair.taskId, 'auditor-assigned', buildAuditorAssignmentMessage(cleaned));
       await sendTaskPairMessage(brain, pair.taskId, 'brain-line-dispatch', buildBrainLine(cleaned, `dispatched from the queue: executor ${executor}, auditor ${auditor}.`));
     }

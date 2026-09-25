@@ -35,6 +35,7 @@ import {
 } from '../../shared/supervision-config.js';
 import { SUPERVISION_IMCODES_BACKGROUND_DOCS } from './imcodes-workflow-docs.js';
 import { FILE_OUTPUT_CONTRACT_ID } from '../../shared/file-output-contract.js';
+import { TASK_PAIR_BRAIN_CONTRACT_ID } from '../../shared/task-pair.js';
 import {
   LOAD_VALIDATION_SAFETY_BY_LOCALE,
   LOAD_VALIDATION_SAFETY_CLAUSE,
@@ -262,8 +263,61 @@ const BRAIN_NATIVE_COLLABORATION_BOUNDARY = {
   ],
 } as const;
 
-export function buildBrainSupervisedWorkDelegationContract(_locale?: SupervisionUiLocale): string {
-  return JSON.stringify({
+export function buildBrainSupervisedWorkDelegationContract(
+  _locale?: SupervisionUiLocale,
+  options: { taskPairEngine?: boolean } = {},
+): string {
+  const contract = buildBrainSupervisedWorkDelegationContractObject();
+  return JSON.stringify(options.taskPairEngine ? toTaskPairSupervisedContract(contract) : contract);
+}
+
+/**
+ * Brain duties with automatic supervision on the `pairs` engine. The routing
+ * rules (eligibility, fan-out, native-collaboration boundary, exceptions) are
+ * engine-neutral and stay. What goes is everything that only exists in the
+ * legacy registry: the task_assignment step, assignment/attempt/lease/revision
+ * repair, reuse of the same task assignment, audit-policy selection and the
+ * IMCODES_EXEC status markers of a legacy Brain-run. A pairs Brain dispatches
+ * with send_message (the daemon opens the pair), resolves pair notices with
+ * markers, and has nothing to bind or repair.
+ */
+export const BRAIN_PAIRS_SUPERVISED_WORK = {
+  newWork: 'send_message_to_one_worker_opens_the_pair_executor_is_target_auditor_auto_picked_or_named_with_DISPATCH',
+  sameWork: 'append_to_the_same_executor_same_taskId',
+  material: 'executor_workspace_on_READY_FOR_AUDIT_relayed_by_daemon_worktree_and_head_or_task_dir_path',
+  workspace: 'code_in_git_project_worktree_else_task_dir_DISPATCH_workspace=dir_for_non_code_removed_7d_after_end',
+  deliverables: 'judge_by_task_type_keep_via_DONE_output=_copied_into_project_user_told_temporary_plain_DONE',
+  legacyArtifacts: 'none_on_pairs_no_registry_step_assignmentId_auditAttemptId_auditRevision_bundle_scopeFiles_never_ask_or_explain_them',
+  notices: 'resolve_with_markers_REASSIGN_DONE_force_CANCEL',
+  heartbeat: 'daemon_pair_heartbeat',
+} as const;
+
+function toTaskPairSupervisedContract(contract: ReturnType<typeof buildBrainSupervisedWorkDelegationContractObject>) {
+  const {
+    contractId: _contractId,
+    authorityDuty: _authorityDuty,
+    blockedRecoveryDuty: _blockedRecoveryDuty,
+    taskTopology: _taskTopology,
+    status: _status,
+    ...rest
+  } = contract;
+  return {
+    // Its own id: a pairs Brain carries no `supervision_*` contract at all.
+    contractId: TASK_PAIR_BRAIN_CONTRACT_ID,
+    ...rest,
+    engine: 'pairs',
+    default: {
+      ...rest.default,
+      route: 'imcodes_visible_subsession',
+      sequence: ['send_list_targets', 'send_message'],
+      selectBy: rest.default.selectBy.filter((key) => key !== 'auditPolicy'),
+    },
+    pairs: BRAIN_PAIRS_SUPERVISED_WORK,
+  };
+}
+
+function buildBrainSupervisedWorkDelegationContractObject() {
+  return ({
     contractId: SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION,
     v: 1,
     automaticSupervision: true,
@@ -473,22 +527,22 @@ export function buildBrainManualOnlyDelegationContract(
 ): string {
   const taskPairEngine = options.taskPairEngine !== false;
   return JSON.stringify({
-    contractId: SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION,
+    contractId: taskPairEngine ? TASK_PAIR_BRAIN_CONTRACT_ID : SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION,
     v: 1,
     automaticSupervision: false,
     actor: 'Brain',
-    automatic: {
-      delegation: 'none',
-      supervisionTask: 'none',
-      audit: 'none',
-      lifecycleRecovery: 'none',
-      scheduledOrAutomatedTurn: 'no_task_no_dispatch_no_audit',
-    },
-    manual: {
-      when: 'explicit_user_request',
-      supervisionTaskAndAudit: 'allowed_as_requested',
-      auditedWork: taskPairEngine ? BRAIN_MANUAL_AUDITED_WORK.pairs : BRAIN_MANUAL_AUDITED_WORK.legacy,
-    },
+    automatic: taskPairEngine
+      ? { delegation: 'none', pair: 'none', audit: 'none', scheduledOrAutomatedTurn: 'no_pair_no_dispatch_no_audit' }
+      : {
+          delegation: 'none',
+          supervisionTask: 'none',
+          audit: 'none',
+          lifecycleRecovery: 'none',
+          scheduledOrAutomatedTurn: 'no_task_no_dispatch_no_audit',
+        },
+    manual: taskPairEngine
+      ? { when: 'explicit_user_request', pairAndAudit: 'allowed_as_requested', auditedWork: BRAIN_MANUAL_AUDITED_WORK.pairs }
+      : { when: 'explicit_user_request', supervisionTaskAndAudit: 'allowed_as_requested', auditedWork: BRAIN_MANUAL_AUDITED_WORK.legacy },
     delegation: {
       when: 'explicit_user_request',
       route: 'imcodes_visible_subsession',
@@ -513,7 +567,14 @@ export function buildBrainManualOnlyDelegationContract(
  * mechanically distinguishable -- the same discipline the continuation prompts
  * already use.
  */
-export function buildBrainWorkDelegationContractRef(automaticSupervision: boolean, taskPairEngine = true): string {
+export function buildBrainWorkDelegationContractRef(automaticSupervision: boolean, taskPairEngine?: boolean): string {
+  // A pairs Brain has no supervision decision runs and carries no
+  // `supervision_*` contract: both variants are referenced by the pairs id.
+  // An unstated engine keeps each variant's original reference (the legacy
+  // decision prompts and execution preambles call it that way).
+  if (taskPairEngine === true) {
+    return JSON.stringify({ contractRef: TASK_PAIR_BRAIN_CONTRACT_ID, automaticSupervision });
+  }
   // Both variants share one contractId, so the reference must say which one it
   // means. The supervised reference is byte-identical to what it always was --
   // `fullText` names the supervision decision entrypoints that carry its body,
@@ -523,7 +584,7 @@ export function buildBrainWorkDelegationContractRef(automaticSupervision: boolea
   // Brain there would hand it exactly the automatic duties it must not have.
   return JSON.stringify(automaticSupervision
     ? { contractRef: SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION, fullText: 'supervisionDecision' }
-    : { contractRef: SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION, automaticSupervision: false, ...(taskPairEngine ? {} : { engine: 'legacy' }) });
+    : { contractRef: SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION, automaticSupervision: false, ...(taskPairEngine === false ? { engine: 'legacy' } : {}) });
 }
 
 /**

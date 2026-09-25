@@ -475,7 +475,7 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
     ? (input.brainContractRegistered
       ? buildBrainWorkDelegationContractRef(automaticSupervision, taskPairEngine)
       : automaticSupervision
-        ? buildBrainSupervisedWorkDelegationContract()
+        ? buildBrainSupervisedWorkDelegationContract(undefined, { taskPairEngine })
         : buildBrainManualOnlyDelegationContract(undefined, { taskPairEngine }))
     : undefined;
   // Daemon-injected, session-stable identity block. NOT subject to

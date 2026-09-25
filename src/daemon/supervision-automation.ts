@@ -1,5 +1,5 @@
 import { CHAT_MESSAGE_ORIGINS } from '../../shared/chat-message-origin.js';
-import { isPairsEngineProject, isSessionCoveredByPairHeartbeat } from './task-pairs/engine.js';
+import { isPairsEngineProject, isPairsEngineSession, isSessionCoveredByPairHeartbeat } from './task-pairs/engine.js';
 import { readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -158,12 +158,22 @@ import {
   localizeSupervisionStatusLabel,
 } from './supervision-i18n.js';
 
+/**
+ * Legacy Brain-run supervision (execution preambles, supervisor decisions,
+ * automatic audit dispatch, rework/continue/waiting-heartbeat prompts, and the
+ * "session blocked, supervision stopped" stop) belongs to the legacy engine.
+ * On a `pairs` project the pair engine owns all of it -- pairs are opened by
+ * dispatch, audited by their auditor and kept moving by the pair heartbeat --
+ * so a run there would only feed agents legacy task/attempt/bundle rules and
+ * stop supervision on a transient provider error.
+ */
 function isBrainOwnedAutomaticSupervision(
   sessionName: string,
   snapshot: SessionSupervisionSnapshot | null | undefined,
 ): snapshot is SessionSupervisionSnapshot {
   return canSessionRoleOwnAutomaticSupervision(getSession(sessionName)?.role)
-    && isAutomaticSupervisionEnabled(snapshot);
+    && isAutomaticSupervisionEnabled(snapshot)
+    && !isPairsEngineSession(sessionName);
 }
 
 /**
@@ -1320,6 +1330,9 @@ class SupervisionAutomation {
     if (!source) return;
     const brain = this.resolveProjectBrain(source);
     if (!brain) return;
+    // A pairs Brain carries no supervision_* contract; it reads the mode from
+    // its per-turn delegation contract instead of a control message.
+    if (isPairsEngineProject(source.projectName)) return;
     // Mode control is owned by the project's main session. Child/worker
     // snapshots must never inject control messages into their parent Brain.
     if (source.name !== brain.name) return;

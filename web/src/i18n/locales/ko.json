@@ -4361,6 +4361,10 @@
       "add": "추가",
       "remove": "제거",
       "reset": "기본값으로"
-    }
+    },
+    "output_saved": "결과물을 {{path}}에 저장했습니다",
+    "output_failed": "결과물이 저장되지 않았습니다 ({{reason}})",
+    "workspace_removed": "작업 공간을 삭제했습니다",
+    "workspace_kept": "작업 공간을 유지했습니다: 저장되지 않은 작업이 있습니다"
   }
 }

@@ -262,6 +262,17 @@ describe('agent delegation shared contract', () => {
     expect(isAgentDelegationControlInstructionText(instruction)).toBe(true);
   });
 
+  it('omits the supervision contract reference from a pairs-engine reply instruction, except for a legacy audit', () => {
+    const delegationId = 'delegation_identity_1234567890';
+    const pairs = buildAgentDelegationReplyInstruction('deck_repo_brain', { delegationId }, { taskPairEngine: true });
+    expect(pairs).toContain(delegationId);
+    expect(pairs).not.toContain('contractRefs');
+    expect(pairs).not.toContain('supervision_messaging_v1');
+    expect(extractAgentDelegationReplyAuthorityFromInstruction(pairs)).toEqual({ delegationId });
+    expect(buildAgentDelegationReplyInstruction('deck_repo_brain', { delegationId }, { taskPairEngine: false }))
+      .toContain('supervision_messaging_v1');
+  });
+
   it('builds and validates a reusable tokenless structured delegation reply authority', () => {
     const delegationId = 'delegation_identity_1234567890';
     const instruction = buildAgentDelegationReplyInstruction('deck_repo_brain', {

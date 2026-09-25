@@ -3,6 +3,7 @@
  * Commands arrive as JSON objects with a `type` field.
  */
 import type { ChatMessageOrigin } from '../../shared/chat-message-origin.js';
+import { isPairsEngineSession } from './task-pairs/engine.js';
 import { AGENT_SKILLS_MSG } from '../../shared/agent-skills.js';
 import { AGENT_MCP_MSG } from '../../shared/agent-mcp.js';
 import type { CronRunTimelineProjection } from '../../shared/cron-types.js';
@@ -4539,8 +4540,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const supervisionSnapshot = persistedSupervisionSnapshot && requestedUiLocale
     ? { ...persistedSupervisionSnapshot, uiLocale: requestedUiLocale }
     : persistedSupervisionSnapshot;
+  // No legacy Brain-run on a `pairs` project: the pair engine owns supervision
+  // there (see isBrainOwnedAutomaticSupervision in supervision-automation.ts).
   const supervisionRunRequested = isAutomaticSupervisionEnabled(supervisionSnapshot)
     && canSessionRoleOwnAutomaticSupervision(record?.role)
+    && !isPairsEngineSession(sessionName)
     && isEligibleSupervisionTaskText(displayText);
   // Fail closed on execution pools at START as well as at save. A session
   // persisted before the save gate existed can still be carrying

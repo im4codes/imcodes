@@ -15,7 +15,12 @@ vi.mock('react-i18next', () => ({
 
 import { TaskPairEventChip } from '../../src/components/TaskPairEventChip.js';
 import { TaskPairSettingsSection, type TaskPairSettingsValue } from '../../src/components/TaskPairSettingsSection.js';
-import { TASK_PAIR_DEFAULT_ALLOWLIST, TASK_PAIR_STATUSES } from '../../../shared/task-pair.js';
+import {
+  TASK_PAIR_DEFAULT_ALLOWLIST,
+  TASK_PAIR_STATUSES,
+  TASK_PAIR_WORKSPACE_EFFECTS,
+  TASK_PAIR_WORKSPACE_EVENT_VERB,
+} from '../../../shared/task-pair.js';
 
 describe('TaskPairEventChip', () => {
   afterEach(() => cleanup());
@@ -45,6 +50,42 @@ describe('TaskPairEventChip', () => {
     expect(chip.textContent).toContain('taskPair.verdict_held');
     expect(chip.textContent).toContain('taskPair.unusual');
     expect(chip.textContent).toContain('"writer":"taskPair.daemon"');
+  });
+});
+
+describe('TaskPairEventChip workspace events', () => {
+  afterEach(() => cleanup());
+
+  it('tells the user where a kept deliverable was saved, or why it was not', () => {
+    const saved = render(<TaskPairEventChip eventId="w1" payload={{
+      taskId: 'T7', writer: 'daemon', verb: TASK_PAIR_WORKSPACE_EVENT_VERB, effect: TASK_PAIR_WORKSPACE_EFFECTS.OUTPUT_SAVED,
+      outputPath: '/home/u/proj/reports/summary.md', toStatus: 'done', unusual: false,
+    }} />);
+    expect(saved.container.textContent).toContain('taskPair.output_saved:{"path":"/home/u/proj/reports/summary.md"}');
+    expect(saved.container.textContent).not.toContain('taskPair.chip');
+    cleanup();
+    const failed = render(<TaskPairEventChip eventId="w2" payload={{
+      taskId: 'T7', writer: 'daemon', verb: TASK_PAIR_WORKSPACE_EVENT_VERB, effect: TASK_PAIR_WORKSPACE_EFFECTS.OUTPUT_FAILED,
+      outputError: 'outside_workspace', toStatus: 'done', unusual: true,
+    }} />);
+    expect(failed.container.textContent).toContain('taskPair.output_failed:{"reason":"outside_workspace"}');
+    cleanup();
+    const kept = render(<TaskPairEventChip eventId="w3" payload={{
+      taskId: 'T7', writer: 'daemon', verb: TASK_PAIR_WORKSPACE_EVENT_VERB, effect: TASK_PAIR_WORKSPACE_EFFECTS.KEPT, toStatus: 'cancelled', unusual: true,
+    }} />);
+    expect(kept.container.textContent).toContain('taskPair.workspace_kept');
+  });
+
+  it('has every workspace chip string in all seven locales', () => {
+    const WEB = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
+    for (const locale of ['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko']) {
+      const taskPair = (JSON.parse(readFileSync(join(WEB, 'src/i18n/locales', `${locale}.json`), 'utf8')) as { taskPair: Record<string, string> }).taskPair;
+      for (const key of ['output_saved', 'output_failed', 'workspace_removed', 'workspace_kept']) {
+        expect(taskPair[key], `${locale}.${key}`).toBeTruthy();
+      }
+      expect(taskPair.output_saved).toContain('{{path}}');
+      expect(taskPair.output_failed).toContain('{{reason}}');
+    }
   });
 });
 

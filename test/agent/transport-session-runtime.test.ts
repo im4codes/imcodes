@@ -8,6 +8,7 @@ import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-que
 import { resetContextStoreClientForTests } from '../../src/store/context-store-worker-client.js';
 import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
 import { CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../shared/cron-types.js';
+import { TASK_PAIR_BRAIN_CONTRACT_ID } from '../../shared/task-pair.js';
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
 const searchLocalMemorySemanticMock = vi.hoisted(() => vi.fn());
@@ -330,8 +331,11 @@ describe('TransportSessionRuntime memory provenance', () => {
 
     const OFF_BODY = '"automaticSupervision":false';
     const ON_BODY = '"automaticSupervision":true';
-    const FULL = '"contractId":"supervision_brain_work_delegation_v1"';
-    const REF = '"contractRef":"supervision_brain_work_delegation_v1"';
+    // These Brains have no project record, so they run the default `pairs`
+    // engine and carry the pairs Brain contract (never a supervision_* one).
+    const FULL = `"contractId":"${TASK_PAIR_BRAIN_CONTRACT_ID}"`;
+    const REF = `"contractRef":"${TASK_PAIR_BRAIN_CONTRACT_ID}"`;
+    const ON_DUTY = 'send_message_to_one_worker_opens_the_pair';
 
     it('re-reads the mode every turn and re-registers the full body whenever the variant changes', async () => {
       const { runtime, nextTurnText } = await brainRuntime('deck_mode_switch_brain');
@@ -341,7 +345,7 @@ describe('TransportSessionRuntime memory provenance', () => {
       const offFirst = await nextTurnText();
       expect(offFirst).toContain(FULL);
       expect(offFirst).toContain(OFF_BODY);
-      expect(offFirst).not.toContain('task_assignment');
+      expect(offFirst).not.toContain(ON_DUTY);
 
       const offAgain = await nextTurnText();
       expect(offAgain, 'the same variant re-asserts by reference').toContain(REF);
@@ -352,13 +356,14 @@ describe('TransportSessionRuntime memory provenance', () => {
       const onFirst = await nextTurnText();
       expect(onFirst, 'an off registration must not satisfy the on variant').toContain(FULL);
       expect(onFirst).toContain(ON_BODY);
-      expect(onFirst).toContain('task_assignment');
+      expect(onFirst).toContain(ON_DUTY);
 
       mode = 'off';
       const offAfterOn = await nextTurnText();
       expect(offAfterOn, 'turning supervision off re-registers the manual-only body').toContain(FULL);
       expect(offAfterOn).toContain(OFF_BODY);
-      expect(offAfterOn).not.toContain('task_assignment');
+      expect(offAfterOn).not.toContain(ON_DUTY);
+      expect(offAfterOn).not.toMatch(/supervision_[a-z_]+_v\d/);
     });
 
     it('fails closed to the manual-only contract when the mode cannot be established', async () => {
