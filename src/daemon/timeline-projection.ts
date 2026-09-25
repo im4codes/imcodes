@@ -4,6 +4,7 @@ import { extname, join } from 'node:path';
 import { homedir } from 'node:os';
 import type { TimelineEvent } from './timeline-event.js';
 import logger from '../util/logger.js';
+import { assertNotRealImcodesPathInTests } from '../util/test-home-guard.js';
 import type {
   ProjectionSessionMeta,
   ProjectionWorkerEnvelope,
@@ -38,8 +39,13 @@ const WORKER_RESPAWN_BASE_BACKOFF_MS = 1_000;
 const WORKER_RESPAWN_MAX_BACKOFF_MS = 30_000;
 
 export function getProjectionDbPath(): string {
-  return process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH?.trim()
+  const dbPath = process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH?.trim()
     || join(homedir(), '.imcodes', 'timeline.sqlite');
+  // Checked here on the main thread, not in the workers: both timeline workers
+  // receive this path, and their entry files must not gain runtime imports
+  // (they load as raw .ts without a resolver for `.js` specifiers).
+  assertNotRealImcodesPathInTests(dbPath, 'timeline.sqlite');
+  return dbPath;
 }
 
 function getWorkerModuleUrl(): URL {

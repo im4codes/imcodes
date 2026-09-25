@@ -10,7 +10,6 @@ import type {
   ProjectionWorkerRequestType,
   ProjectionWorkerResponse,
 } from './timeline-projection-types.js';
-import { assertNotRealImcodesPathInTests } from '../util/test-home-guard.js';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
@@ -39,7 +38,6 @@ function sessionFilePath(sessionId: string): string {
 
 function ensureDb(): DatabaseSyncInstance {
   if (db) return db;
-  assertNotRealImcodesPathInTests(dbPath, 'timeline.sqlite');
   mkdirSync(dirname(dbPath), { recursive: true });
   const instance = new DatabaseSync(dbPath);
   instance.exec(`
