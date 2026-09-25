@@ -211,15 +211,46 @@ describe('Brain work dispatch opens driven pairs', () => {
     const pairsManual = JSON.parse(buildBrainManualOnlyDelegationContract()) as { manual: { auditedWork: Record<string, unknown> } };
     expect(pairsManual.manual.auditedWork).toEqual(BRAIN_MANUAL_AUDITED_WORK.pairs);
     expect(pairsManual.manual.auditedWork).toMatchObject({ route: 'task_pair', brainCronSelf: 'forbidden', auditor: 'named_or_daemon_auto_pick' });
-    const legacyManual = JSON.parse(buildBrainManualOnlyDelegationContract(undefined, { taskPairEngine: false })) as { manual: { auditedWork: Record<string, unknown> } };
+    const legacyManual = JSON.parse(buildBrainManualOnlyDelegationContract(undefined, { taskPairEngine: 'legacy' })) as { manual: { auditedWork: Record<string, unknown> } };
     expect(legacyManual.manual.auditedWork).toEqual(BRAIN_MANUAL_AUDITED_WORK.legacy);
     expect(String(legacyManual.manual.auditedWork.heartbeat)).toContain('cron_create_self');
     expect(legacyManual.manual.auditedWork.stop).toBe('cron_cancel_self_when_finished');
     const supervised = JSON.parse(buildBrainSupervisedWorkDelegationContract()) as { heartbeat: Record<string, unknown> };
     expect(supervised.heartbeat).toEqual({ source: 'daemon_builtin', brainCronSelf: 'forbidden' });
     // A registered legacy variant is re-asserted as legacy, never as the pairs one.
-    expect(buildBrainWorkDelegationContractRef(false, false)).not.toBe(buildBrainWorkDelegationContractRef(false, true));
+    expect(buildBrainWorkDelegationContractRef(false, 'legacy')).not.toBe(buildBrainWorkDelegationContractRef(false, 'pairs'));
 
+  });
+
+  it('a project left in mode off with no explicit engine gets neither pairs nor legacy Brain contract, and the off variant states the project-workflow precedence', () => {
+    const offManual = JSON.parse(buildBrainManualOnlyDelegationContract(undefined, { taskPairEngine: 'off' })) as { manual: { auditedWork: Record<string, unknown> } };
+    expect(offManual.manual.auditedWork).toEqual(BRAIN_MANUAL_AUDITED_WORK.off);
+    expect(offManual.manual.auditedWork).not.toEqual(BRAIN_MANUAL_AUDITED_WORK.pairs);
+    expect(offManual.manual.auditedWork).not.toEqual(BRAIN_MANUAL_AUDITED_WORK.legacy);
+    expect(offManual.manual.auditedWork.route).not.toBe('task_pair');
+    expect(offManual.manual.auditedWork.heartbeat).toBe('none');
+    expect(String(offManual.manual.auditedWork.precedence)).toContain('takes precedence');
+    const offRef = JSON.parse(buildBrainWorkDelegationContractRef(false, 'off')) as { engine?: string };
+    expect(offRef.engine).toBe('off');
+  });
+
+  it('tells Brain to ask the user before starting a pair on a not-enabled project, and to never override the project\'s own workflow without an explicit yes', () => {
+    const offManual = JSON.parse(buildBrainManualOnlyDelegationContract(undefined, { taskPairEngine: 'off' })) as { manual: { auditedWork: Record<string, unknown> } };
+    const authorization = String(offManual.manual.auditedWork.authorization);
+    expect(authorization).toContain('never auto-start');
+    expect(authorization).toContain('ask');
+    expect(authorization).toContain('explicit');
+    expect(authorization).toContain('yes');
+    // The only real consent path: enabling it in Settings, since no tool or
+    // marker can turn the engine on for an off project (that's the gap CC1's
+    // P0-1 found -- there must be one real, working "yes" path, not just text).
+    expect(authorization).toContain('Session/Project Settings');
+    expect(authorization).toContain('Task Pairs');
+    expect(authorization).toContain('no tool or marker can enable it');
+    // Pairs and legacy projects (already enabled) get no such gate -- the
+    // ask-first rule is specific to a project that opted out or never opted in.
+    const pairsManual = JSON.parse(buildBrainManualOnlyDelegationContract()) as { manual: { auditedWork: Record<string, unknown> } };
+    expect(pairsManual.manual.auditedWork.authorization).toBeUndefined();
   });
 
   // ---- legacy coordinator start ---------------------------------------------------

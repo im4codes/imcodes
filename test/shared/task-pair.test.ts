@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
+  TASK_PAIR_BRAIN_REPORTING_RULE,
   TASK_PAIR_MESSAGE_CAP_PER_ROUND,
+  TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
   TASK_PAIR_STATUSES,
   TASK_PAIR_VERBS,
   applyTaskPairMarker,
@@ -115,6 +117,14 @@ describe('task-pair marker grammar', () => {
     expect(body).toContain('audit_convergence_v1');
     expect(body).toContain('IMCODES_TASK_END');
   });
+
+  it('ships a contract stating a project\'s own workflow takes precedence, and that Brain hears only final/terminal states', () => {
+    const body = buildTaskPairMarkerContract();
+    expect(body).toContain('takes precedence over');
+    expect(body).toContain(TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE);
+    expect(body).toContain('Report to Brain only at the end');
+    expect(body).toContain(TASK_PAIR_BRAIN_REPORTING_RULE);
+  });
 });
 
 describe('task-pair severity judgement', () => {
@@ -159,6 +169,22 @@ describe('task-pair state machine', () => {
     ]);
     expect(pair).toMatchObject({ status: 'done', round: 2, passRound: 2 });
     expect(pair.flags).not.toContain('unaudited');
+  });
+
+  it('never notices Brain during a normal round: a REWORK, its fix, and the PASS are all settled between executor and auditor', () => {
+    const { intents } = run([
+      [BRAIN, `<!-- IMCODES_TASK DISPATCH T42 executor=${EXEC} auditor=${AUD} -->`],
+      [EXEC, '<!-- IMCODES_TASK STARTED T42 -->'],
+      [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 -->'],
+      [AUD, '<!-- IMCODES_TASK REWORK T42 blocking=P0 p0=1 p1=2 -->'],
+      [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 -->'],
+      [AUD, '<!-- IMCODES_TASK PASS T42 blocking=P0 -->'],
+      [EXEC, '<!-- IMCODES_TASK DONE T42 -->'],
+    ]);
+    const brainNotices = intents.flat().filter((intent) => (intent as { kind: string }).kind === 'brain_notice');
+    expect(brainNotices).toEqual([]);
+    // The REWORK notice itself goes to the executor, never to Brain.
+    expect(intents.flat()).toContainEqual(expect.objectContaining({ kind: 'rework_notice', to: EXEC }));
   });
 
   it('tells the executor on a consistent REWORK', () => {

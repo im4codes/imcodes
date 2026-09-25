@@ -5,7 +5,7 @@ import { timelineEmitter } from '../../../src/daemon/timeline-emitter.js';
 import { TaskPairStore, setTaskPairStoreForTests, getTaskPairStore } from '../../../src/daemon/task-pairs/store.js';
 import { setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
 import { TaskPairService } from '../../../src/daemon/task-pairs/service.js';
-import { resolveTaskPairAllowlist, resolveTaskPairEngine, resolveTaskPairMaxConcurrency } from '../../../src/daemon/task-pairs/engine.js';
+import { resolveTaskPairAllowlist, resolveTaskPairEngine, resolveTaskPairEngineState, resolveTaskPairMaxConcurrency } from '../../../src/daemon/task-pairs/engine.js';
 import { normalizeSessionSupervisionSnapshot } from '../../../shared/supervision-config.js';
 import { dispatchSendMessage, clearSendIdempotencyCacheForTests } from '../../../src/daemon/send-tool.js';
 import { TASK_PAIR_TIMELINE_EVENT, taskPairBindingId } from '../../../shared/task-pair.js';
@@ -305,8 +305,13 @@ describe('task-pair marker ingestion', () => {
     expect(getTaskPairStore().listActivePairs(PROJECT)).toEqual([]);
   });
 
-  it('defaults every project to the pairs engine', async () => {
-    expect(resolveTaskPairEngine('anyproject', {})).toBe('pairs');
+  it('a project with no saved config or no Brain is inert; an explicit engine choice still wins', () => {
+    // No Brain session for 'anyproject' anywhere in this suite: no saved
+    // config means inert (owner decision, 2026-09-26) -- see
+    // engine-mode-off.test.ts for the full causal coverage.
+    expect(resolveTaskPairEngineState('anyproject', {})).toBe('off');
+    expect(resolveTaskPairEngine('anyproject', {})).toBe('legacy');
+    expect(resolveTaskPairEngine('anyproject', { IMCODES_SUPERVISION_ENGINE: 'pairs' })).toBe('pairs');
     expect(resolveTaskPairEngine('anyproject', { IMCODES_SUPERVISION_ENGINE: 'legacy' })).toBe('legacy');
     getTaskPairStore().setProjectEngine('rolledback', 'legacy');
     expect(resolveTaskPairEngine('rolledback', {})).toBe('legacy');

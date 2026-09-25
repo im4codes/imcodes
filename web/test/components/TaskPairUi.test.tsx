@@ -134,7 +134,10 @@ describe('TaskPairSettingsSection', () => {
     let value: TaskPairSettingsValue = {};
     const onChange = vi.fn((next: TaskPairSettingsValue) => { value = next; });
     const view = render(<TaskPairSettingsSection value={value} onChange={onChange} />);
-    expect((screen.getByTestId('task-pair-engine') as HTMLSelectElement).value).toBe('pairs');
+    // An unconfigured project is inert (owner decision, 2026-09-26), not
+    // 'pairs' -- the select must show that truthfully, or choosing 'pairs'
+    // fires no input event because it already matches the shown value.
+    expect((screen.getByTestId('task-pair-engine') as HTMLSelectElement).value).toBe('');
     expect((screen.getByTestId('task-pair-max-concurrency') as HTMLInputElement).value).toBe('5');
     expect(screen.getAllByTestId(/task-pair-allowlist-row-/)).toHaveLength(TASK_PAIR_DEFAULT_ALLOWLIST.length);
 
@@ -150,5 +153,25 @@ describe('TaskPairSettingsSection', () => {
     fireEvent.click(screen.getByTestId('task-pair-allowlist-add'));
     expect(value.pairAllowlist).toHaveLength(TASK_PAIR_DEFAULT_ALLOWLIST.length + 1);
     expect(value.pairAllowlist?.at(-1)).toEqual({ role: 'both', agentType: '', modelPattern: '' });
+  });
+
+  it('lets the user opt an unconfigured project into pairs, and back out to not-enabled', () => {
+    let value: TaskPairSettingsValue = {};
+    const onChange = vi.fn((next: TaskPairSettingsValue) => { value = next; });
+    const view = render(<TaskPairSettingsSection value={value} onChange={onChange} />);
+    const engine = screen.getByTestId('task-pair-engine') as HTMLSelectElement;
+    expect(engine.value).toBe('');
+
+    engine.value = 'pairs';
+    fireEvent.input(engine);
+    expect(onChange).toHaveBeenCalled();
+    expect(value.pairEngine).toBe('pairs');
+
+    view.rerender(<TaskPairSettingsSection value={value} onChange={onChange} />);
+    const reselected = screen.getByTestId('task-pair-engine') as HTMLSelectElement;
+    expect(reselected.value).toBe('pairs');
+    reselected.value = '';
+    fireEvent.input(reselected);
+    expect(value.pairEngine).toBeUndefined();
   });
 });

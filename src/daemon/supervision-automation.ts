@@ -1,5 +1,5 @@
 import { CHAT_MESSAGE_ORIGINS } from '../../shared/chat-message-origin.js';
-import { isPairsEngineProject, isPairsEngineSession, isSessionCoveredByPairHeartbeat } from './task-pairs/engine.js';
+import { isPairsEngineProject, isPairsEngineSession, isSessionCoveredByPairHeartbeat, isTaskPairEngineActive } from './task-pairs/engine.js';
 import { readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -1722,7 +1722,11 @@ class SupervisionAutomation {
       });
     for (const task of registry.list()) {
       // The pair heartbeat is the only driver on a `pairs` project (design D8).
-      if (isPairsEngineProject(task.projectName)) continue;
+      // A project left in mode `off` with no engine configured stays inert
+      // too: it must not fall through into this legacy watchdog just because
+      // it isn't `pairs`, or the daemon nudges/escalates over a task the
+      // project's own workflow is already covering.
+      if (isPairsEngineProject(task.projectName) || !isTaskPairEngineActive(task.projectName)) continue;
       const events = registry.listEvents(task.taskId);
       for (const assignment of task.assignments) {
         const watchdogKind = assignment.role === 'implementer'

@@ -77,6 +77,57 @@ export type TaskPairEngine = typeof TASK_PAIR_ENGINES[number];
 export const TASK_PAIR_DEFAULT_ENGINE: TaskPairEngine = 'pairs';
 /** Global override for every project, e.g. `IMCODES_SUPERVISION_ENGINE=legacy`. */
 export const TASK_PAIR_ENGINE_ENV = 'IMCODES_SUPERVISION_ENGINE' as const;
+/**
+ * The resolved engine state for a project, including the inert `off` state:
+ * a project whose supervision mode is `off` and which has no explicit engine
+ * choice runs neither engine. Distinct from {@link TaskPairEngine}, which is
+ * only the two engines a project can explicitly choose between.
+ */
+export type TaskPairEngineState = TaskPairEngine | 'off';
+
+/**
+ * Stated in the pairs contract (Brain's dispatch prompt, and the
+ * executor/auditor brief) so a project with its own dispatch/audit workflow
+ * is never fought over. Kept as one shared string so the clause cannot drift
+ * between the places it is injected.
+ */
+export const TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE: string =
+  'If the project defines its own dispatch/audit/pairing workflow (e.g. in '
+  + 'AGENTS.md/CLAUDE.md/project rules), that workflow takes precedence over '
+  + 'this IM.codes pairs flow. Follow the project\'s rules for auditor choice, '
+  + 'heartbeat, ledger and receipts; use IM.codes markers only where the '
+  + 'project\'s rules don\'t cover something.';
+
+/**
+ * Stated in the pairs contract and the executor/auditor briefs so Brain is
+ * never paged for what the pair can settle itself. Kept as one shared string
+ * so the rule cannot drift between the places it is injected, and so the
+ * daemon's own Brain-notification code can be reviewed against the same text.
+ */
+export const TASK_PAIR_BRAIN_REPORTING_RULE: string =
+  'Report to Brain only at the end: DONE (or a PASS ready to integrate), a '
+  + 'BLOCKED/NEEDS_INPUT the pair cannot resolve itself, or a reassignment. '
+  + 'Executor and auditor settle REWORK rounds, non-blocking findings, '
+  + 'progress and answerable questions between themselves -- no Brain '
+  + 'messages for those.';
+
+/**
+ * Stated in the Brain contract for a project not enabled for pairs (owner
+ * decision, 2026-09-26, tsk_cd_pairs_optin: pairs is no longer a zero-config
+ * default). Kept as one shared string so the daemon's own auto-start gates
+ * can be reviewed against the same text.
+ */
+export const TASK_PAIR_INERT_AUTHORIZATION_RULE: string =
+  'This project is not enabled for the pairs engine: never auto-start a '
+  + 'pair here, and no marker or DISPATCH can start one either -- the '
+  + 'engine ignores this project until it is enabled. If the user '
+  + 'explicitly asks for audited/paired work, ask them to confirm first; '
+  + 'on an explicit yes, tell them to enable it themselves (Session/Project '
+  + 'Settings -> Task Pairs -> Engine -> Task pairs) since no tool or '
+  + 'marker can enable it for them. If the project defines its own '
+  + 'dispatch/audit/pairing workflow (e.g. in AGENTS.md/CLAUDE.md/project '
+  + 'rules), tell the user about the conflict before recommending that, '
+  + 'and only recommend it if they explicitly override after hearing it.';
 
 export const TASK_PAIR_DEFAULT_MAX_CONCURRENCY = 5;
 export const TASK_PAIR_HEARTBEAT_MS = 6 * 60_000;
@@ -1009,5 +1060,7 @@ export function buildTaskPairMarkerContract(): string {
     'Pairs have no assignmentId, auditAttemptId, auditRevision, immutable bundle, scopeFiles or control-plane binding: never wait for, ask for or block on them.',
     `Auditor: the material is the executor's workspace (a worktree at the named head, or the named task-directory path; read it directly) plus their reported validation; judge by ${AUDIT_CONVERGENCE_CONTRACT_ID}. Reply to the executor with every finding tagged [P0]..[P4], then write PASS or REWORK with the blocking set and a count per level, e.g. REWORK <taskId> blocking=P0 p0=1 p1=2. REWORK needs at least one finding at a blocking level; PASS has none. Re-audits check only the prior blocking classes plus regressions. If the material cannot be reached (executor limited/offline, workspace unreadable), write NEEDS_INPUT <taskId> note="..." and wait: that is never a P0 or REWORK.`,
     `Brain: DISPATCH <taskId> executor=<session> auditor=<session>|none [blocking=P0,P1] [pool=primary|economy] [workspace=dir for non-code work in a git project]; queue with QUEUE <taskId> title="..." then the full brief then <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> -->; QUEUE - max=<n> sets your queue limit; REASSIGN <taskId> auditor=<session>; DONE <taskId> force=true completes without audit; CANCEL <taskId>. Naming executor=/auditor=<session> replaces the current holder of that role immediately, ignoring the project's pair allowlist. Naming executormodel=/auditormodel=<model> instead steers the next automatic pick or replacement for that role (also ignoring the allowlist) but does not by itself replace a role that is already filled -- REASSIGN with the session explicitly for that; no matching session or pool config for a named model replies "no session/config for requested model <model>".`,
+    TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
+    TASK_PAIR_BRAIN_REPORTING_RULE,
   ].join('\n');
 }

@@ -1,6 +1,6 @@
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../../shared/imcodes-send.js';
 import { CHAT_MESSAGE_ORIGINS } from '../../shared/chat-message-origin.js';
-import { isPairsEngineProject, projectBrainSession } from './task-pairs/engine.js';
+import { isPairsEngineProject, isTaskPairEngineActive, projectBrainSession } from './task-pairs/engine.js';
 import { taskPairService } from './task-pairs/service.js';
 import { getTaskPairStore } from './task-pairs/store.js';
 import { taskPairBindingOf } from '../../shared/task-pair.js';
@@ -3994,8 +3994,11 @@ export async function dispatchReadyAudit(
   const registry = deps.registry ?? getSupervisionTaskRegistry();
   const task = registry.get(taskId);
   if (!task) return { status: 'ignored', reason: 'task_not_found' };
-  // No automatic audit dispatch or stale redelivery on a `pairs` project.
+  // No automatic audit dispatch or stale redelivery on a `pairs` project, nor
+  // on a project left in mode `off` with no engine configured -- that
+  // project's own workflow owns audit dispatch, not the legacy registry.
   if (isPairsEngineProject(task.projectName)) return { status: 'ignored', reason: 'pairs_engine' };
+  if (!isTaskPairEngineActive(task.projectName)) return { status: 'ignored', reason: 'task_pair_engine_off' };
   // A task without a policy is normally not auto-audited. The one exception is
   // a pre-existing explicit attempt that is already bound to this revision:
   // routing it is recovery, not automatic materialisation.
@@ -5095,7 +5098,7 @@ export async function runSupervisionConvergenceTick(
     try {
       converged = await registry.convergeLifecycle(now, {
         ...(deps.limit ? { limit: deps.limit } : {}),
-        skipProject: (projectName) => isPairsEngineProject(projectName),
+        skipProject: (projectName) => isPairsEngineProject(projectName) || !isTaskPairEngineActive(projectName),
         resolveAuthoritativeBrain: (projectName, sessionName) => resolveAuthoritativeBrainIdentity(
           projectName,
           (deps.listSessions ?? listSessions)(),

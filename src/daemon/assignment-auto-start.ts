@@ -23,7 +23,7 @@
  * executing the task has its turn stopped, so nothing keeps working while the
  * registry still says `delegated`.
  */
-import { isPairsEngineProject } from './task-pairs/engine.js';
+import { isPairsEngineProject, isTaskPairEngineActive } from './task-pairs/engine.js';
 import {
   SUPERVISION_ASSIGNMENT_AUTO_START_REFUSED_ERROR,
   SUPERVISION_ASSIGNMENT_AUTO_START_SOURCE,
@@ -381,7 +381,10 @@ export function autoStartDelegatedAssignmentsFromActivity(input: {
   activeDispatchMessageIds: ReadonlySet<string>;
   candidates: readonly AssignmentAutoStartCandidate[];
 }, deps: AssignmentAutoStartDeps = {}): AssignmentAutoStartOutcome[] {
-  if (isPairsEngineProject(input.projectName)) return [];
+  // A pairs project's own heartbeat drives auto-start; a project left in
+  // mode `off` with no engine configured must stay inert too, or it falls
+  // through into legacy auto-start automation instead of staying uncovered.
+  if (isPairsEngineProject(input.projectName) || !isTaskPairEngineActive(input.projectName)) return [];
   const registry = getSupervisionTaskRegistry();
   const outcomes: AssignmentAutoStartOutcome[] = [];
   for (const { task, assignment } of input.candidates) {

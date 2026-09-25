@@ -116,8 +116,10 @@ function pairOf(taskId: string) {
 }
 
 beforeEach(() => {
-  // No override: the project resolves to the shipped default engine.
-  delete process.env[TASK_PAIR_ENGINE_ENV];
+  // Pairs is no longer a zero-config default (owner decision, 2026-09-26,
+  // tsk_cd_pairs_optin): a project must opt in, so this E2E explicitly
+  // requests the engine via the override rather than relying on a default.
+  process.env[TASK_PAIR_ENGINE_ENV] = 'pairs';
   root = mkdtempSync(join(tmpdir(), 'imcodes-pairs-e2e-'));
   process.env.IMCODES_SUPERVISION_STATE_DB_PATH = join(root, 'supervision-state.sqlite');
   resetSupervisionTaskRegistryForTests();
@@ -162,7 +164,7 @@ afterAll(() => {
   rmSync(env.home, { recursive: true, force: true });
 });
 
-describe('E2E: marker-driven task pairs (default engine)', () => {
+describe('E2E: marker-driven task pairs (explicit pairs engine)', () => {
   it('dispatches by send_message, runs a REWORK round and a PASS by markers, and finishes done', async () => {
     const dispatchMessage = vi.fn().mockResolvedValue('queued');
     const send = (from: SendRuntimeCaller, input: SendMessageInput) => dispatchSendMessage(from, input, {

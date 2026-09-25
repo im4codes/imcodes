@@ -169,7 +169,7 @@ describe('buildProviderContextPayload', () => {
         namespace: { scope: 'personal', projectId: 'repo-1' },
         brainContractRegistered,
         // The legacy contract; a pairs Brain's is covered below.
-        taskPairEngine: false,
+        taskPairEngine: 'legacy',
       },
     );
 
@@ -182,7 +182,7 @@ describe('buildProviderContextPayload', () => {
     const laterPayload = build(true);
     const later = laterPayload.sessionSystemText ?? '';
     expect(later, 'the later turn must still bind the contract by reference')
-      .toContain(buildBrainWorkDelegationContractRef(false, false));
+      .toContain(buildBrainWorkDelegationContractRef(false, 'legacy'));
     expect(later).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
     expect(laterPayload.turnSystemText ?? '').not.toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
     expect(
@@ -216,7 +216,7 @@ describe('buildProviderContextPayload', () => {
   // received the full supervised-delegation contract every turn, so it minted a
   // supervision task, drove recovery/rebind loops and dispatched its own audit
   // for a morning report nobody asked to supervise.
-  const brainSystemText = (input: { automaticSupervisionEnabled?: boolean; brainContractRegistered?: boolean; taskPairEngine?: boolean }) => (
+  const brainSystemText = (input: { automaticSupervisionEnabled?: boolean; brainContractRegistered?: boolean; taskPairEngine?: 'pairs' | 'legacy' | 'off' }) => (
     buildProviderContextPayload(
       makeProvider('full-normalized-context-injection'),
       {
@@ -233,14 +233,46 @@ describe('buildProviderContextPayload', () => {
     expect(pairs).toContain('"auditedWork":{"route":"task_pair"');
     expect(pairs).toContain('"brainCronSelf":"forbidden"');
     expect(pairs).not.toContain('cron_create_self');
-    const legacy = brainSystemText({ automaticSupervisionEnabled: false, taskPairEngine: false });
+    const legacy = brainSystemText({ automaticSupervisionEnabled: false, taskPairEngine: 'legacy' });
     expect(legacy).toContain('cron_create_self_every_10_min');
     expect(legacy).toContain('cron_cancel_self_when_finished');
     // Registered variants are re-asserted by reference to their own variant.
-    expect(brainSystemText({ automaticSupervisionEnabled: false, taskPairEngine: false, brainContractRegistered: true }))
+    expect(brainSystemText({ automaticSupervisionEnabled: false, taskPairEngine: 'legacy', brainContractRegistered: true }))
       .toContain('"engine":"legacy"');
     expect(brainSystemText({ automaticSupervisionEnabled: false, brainContractRegistered: true }))
       .not.toContain('"engine":"legacy"');
+  });
+
+  it('a project left in mode off with no explicit engine gets neither pairs nor legacy in the Brain contract, and never the Brain\'s own heartbeat', () => {
+    const off = brainSystemText({ automaticSupervisionEnabled: false, taskPairEngine: 'off' });
+    expect(off).not.toContain('"route":"task_pair"');
+    expect(off).not.toContain('cron_create_self');
+    expect(off).toContain('"heartbeat":"none"');
+    expect(off).toContain('takes precedence');
+    expect(brainSystemText({ automaticSupervisionEnabled: false, taskPairEngine: 'off', brainContractRegistered: true }))
+      .toContain('"engine":"off"');
+  });
+
+  it('never injects the task-pair marker contract into any session of an off-engine project, but still does for pairs/legacy', () => {
+    const sessionText = (taskPairEngine: 'pairs' | 'legacy' | 'off') => (
+      buildProviderContextPayload(
+        makeProvider('full-normalized-context-injection'),
+        {
+          userMessage: 'do the work',
+          sessionIdentity: { sessionName: 'deck_proj_w1', label: 'W1', role: 'w1' },
+          namespace: { scope: 'personal', projectId: 'repo-1' },
+          taskPairEngine,
+        },
+      ).sessionSystemText ?? ''
+    );
+    expect(sessionText('pairs')).toContain('[Contract: task_pair_markers_v1]');
+    expect(sessionText('legacy')).toContain('[Contract: task_pair_markers_v1]');
+    expect(sessionText('off')).not.toContain('task_pair_markers_v1');
+    // Not the marker-writing template itself -- audit_convergence_v1's own
+    // taskPairs section legitimately mentions "IMCODES_TASK" in prose
+    // (appliesTo: 'IMCODES_TASK pairs') and is injected for every session
+    // regardless of engine, since any session can be asked to audit one.
+    expect(sessionText('off')).not.toContain('<!-- IMCODES_TASK');
   });
 
   const AUTOMATIC_SUPERVISION_MARKERS = [
@@ -255,7 +287,7 @@ describe('buildProviderContextPayload', () => {
   for (const [label, automaticSupervisionEnabled] of [['off', false], ['absent', undefined]] as const) {
     it(`gives a supervision-${label} Brain the manual-only contract and none of the automatic task route`, () => {
       for (const turn of [1, 2]) {
-        const text = brainSystemText({ automaticSupervisionEnabled, taskPairEngine: false });
+        const text = brainSystemText({ automaticSupervisionEnabled, taskPairEngine: 'legacy' });
         // The per-turn baseline itself survives: the compaction fix stands.
         expect(text, `turn ${turn} must still carry the delegation contract`)
           .toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
@@ -275,7 +307,7 @@ describe('buildProviderContextPayload', () => {
   }
 
   it('keeps the full supervised-delegation contract for a legacy-engine Brain with automatic supervision enabled', () => {
-    const text = brainSystemText({ automaticSupervisionEnabled: true, taskPairEngine: false });
+    const text = brainSystemText({ automaticSupervisionEnabled: true, taskPairEngine: 'legacy' });
     expect(text).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
     expect(text).toContain('"automaticSupervision":true');
     for (const automatic of AUTOMATIC_SUPERVISION_MARKERS) {
@@ -296,7 +328,7 @@ describe('buildProviderContextPayload', () => {
       expect(text, `${legacy} must not reach a pairs Brain`).not.toContain(legacy);
     }
     const ref = brainSystemText({ automaticSupervisionEnabled: true, brainContractRegistered: true });
-    expect(ref).toContain(buildBrainWorkDelegationContractRef(true, true));
+    expect(ref).toContain(buildBrainWorkDelegationContractRef(true, 'pairs'));
     expect(ref).not.toContain('"fullText"');
   });
 
@@ -313,7 +345,7 @@ describe('buildProviderContextPayload', () => {
         const text = `${payload.sessionSystemText ?? ''}\n${payload.turnSystemText ?? ''}`;
         expect(text, `auto=${automaticSupervisionEnabled} registered=${brainContractRegistered}`).toContain(TASK_PAIR_BRAIN_CONTRACT_ID);
         expect(text, `auto=${automaticSupervisionEnabled} registered=${brainContractRegistered}`).not.toMatch(/supervision_[a-z_]+_v\d/);
-        const legacy = brainSystemText({ automaticSupervisionEnabled, brainContractRegistered, taskPairEngine: false });
+        const legacy = brainSystemText({ automaticSupervisionEnabled, brainContractRegistered, taskPairEngine: 'legacy' });
         expect(legacy).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
         expect(legacy).not.toContain(TASK_PAIR_BRAIN_CONTRACT_ID);
       }
@@ -321,10 +353,10 @@ describe('buildProviderContextPayload', () => {
   });
 
   it('makes every re-assertion name its variant, so an off reference can never stand in for the on body', () => {
-    const offRef = brainSystemText({ automaticSupervisionEnabled: false, taskPairEngine: false, brainContractRegistered: true });
-    const onRef = brainSystemText({ automaticSupervisionEnabled: true, taskPairEngine: false, brainContractRegistered: true });
-    expect(offRef).toContain(buildBrainWorkDelegationContractRef(false, false));
-    expect(onRef).toContain(buildBrainWorkDelegationContractRef(true));
+    const offRef = brainSystemText({ automaticSupervisionEnabled: false, taskPairEngine: 'legacy', brainContractRegistered: true });
+    const onRef = brainSystemText({ automaticSupervisionEnabled: true, taskPairEngine: 'legacy', brainContractRegistered: true });
+    expect(offRef).toContain(buildBrainWorkDelegationContractRef(false, 'legacy'));
+    expect(onRef).toContain(buildBrainWorkDelegationContractRef(true, 'legacy'));
     expect(offRef).toContain('"automaticSupervision":false');
     expect(offRef, 'an off reference must not name the supervised carrier').not.toContain('"fullText"');
     expect(onRef).toContain('"fullText":"supervisionDecision"');
@@ -337,7 +369,7 @@ describe('buildProviderContextPayload', () => {
   // must not be duplicated into turn-scoped authored context.
   for (const automaticSupervisionEnabled of [false, true, undefined]) {
     it(`keeps the baseline layer audit-free (automaticSupervisionEnabled=${String(automaticSupervisionEnabled)})`, () => {
-      const text = brainSystemText({ automaticSupervisionEnabled, taskPairEngine: false });
+      const text = brainSystemText({ automaticSupervisionEnabled, taskPairEngine: 'legacy' });
       expect(text).toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
       expect(text).not.toContain(SUPERVISION_CONTRACT_IDS.TASK_FINALIZATION);
       expect(text).not.toContain(SUPERVISION_CONTRACT_IDS.CONTEXTUAL_AUDIT);

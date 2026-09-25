@@ -5,10 +5,12 @@
  */
 import { AUDIT_CONVERGENCE_CONTRACT_ID, type AuditSeverity } from '../../../shared/audit-convergence.js';
 import {
+  TASK_PAIR_BRAIN_REPORTING_RULE,
   TASK_PAIR_BRIEF_END_TAG,
   TASK_PAIR_CONTRACT_ID,
   TASK_PAIR_MARKER_TAG,
   TASK_PAIR_NO_AUDITOR,
+  TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
   TASK_PAIR_WORKS_DIR,
   TASK_PAIR_WORKSPACE_RULES,
   formatTaskPairSeverityCounts,
@@ -253,6 +255,8 @@ export function buildDispatchTrailer(pair: TaskPairState): string {
   return [
     '',
     `[IM.codes task ${pair.taskId} · auditor: ${pair.auditor ?? 'none'}] Write ${marker('STARTED', pair.taskId)} when you begin and finish with ${readyMarker(pair)}; follow ${TASK_PAIR_CONTRACT_ID} and ${AUDIT_CONVERGENCE_CONTRACT_ID} (blocking=${pair.blocking.join(',')}). ${workplaceLine(pair)} ${TASK_PAIR_WORKSPACE_RULES} ${NO_LEGACY_ARTIFACTS}`,
+    TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
+    TASK_PAIR_BRAIN_REPORTING_RULE,
   ].join('\n');
 }
 
@@ -262,6 +266,8 @@ export function buildAuditorAssignmentMessage(pair: TaskPairState): string {
     `You are the auditor of this task for executor ${pair.executor}. On READY_FOR_AUDIT the daemon relays their workspace (worktree and head, or task-directory path), and they send you their validation; judge that by ${AUDIT_CONVERGENCE_CONTRACT_ID} (blocking=${pair.blocking.join(',')}) and write PASS or REWORK with severity counts.`,
     NO_LEGACY_ARTIFACTS,
     contracts(pair.blocking),
+    TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
+    TASK_PAIR_BRAIN_REPORTING_RULE,
   ].join('\n');
 }
 

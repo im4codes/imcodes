@@ -22,10 +22,10 @@ const BRAIN = 'deck_legacyproj_brain';
 const EXEC = 'deck_sub_legacyexec';
 const AUD = 'deck_sub_legacyaud';
 
-function session(name: string, role: SessionRecord['role']): SessionRecord {
+function session(name: string, role: SessionRecord['role'], extra: Partial<SessionRecord> = {}): SessionRecord {
   return {
     name, projectName: PROJECT, role, agentType: 'claude-code-sdk', projectDir: `/tmp/${PROJECT}`, state: 'idle',
-    restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1,
+    restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1, ...extra,
   } as SessionRecord;
 }
 
@@ -246,6 +246,11 @@ describe('one-time legacy import', () => {
       task('tsk_other', 'implementing', [['implementer', EXEC, 'implementing']], 'rolledbackproj'),
     ];
     getTaskPairStore().setProjectEngine('rolledbackproj', 'legacy');
+    // Pairs is no longer a zero-config default (owner decision): with the
+    // global override gone, PROJECT needs its own explicit opt-in to keep
+    // resolving to pairs, same as every other test in this file (which rely
+    // on the always-on env override).
+    getTaskPairStore().setProjectEngine(PROJECT, 'pairs');
     delete process.env.IMCODES_SUPERVISION_ENGINE;
     const registry = { list: () => tasks };
     expect(importLegacyTasks(registry, 5_000)).toBe(2);

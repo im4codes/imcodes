@@ -2,13 +2,15 @@ import { useTranslation } from 'react-i18next';
 import {
   TASK_PAIR_ALLOWLIST_ROLES,
   TASK_PAIR_DEFAULT_ALLOWLIST,
-  TASK_PAIR_DEFAULT_ENGINE,
   TASK_PAIR_DEFAULT_MAX_CONCURRENCY,
   TASK_PAIR_ENGINES,
   type TaskPairAllowlistEntry,
   type TaskPairAllowlistRole,
   type TaskPairEngine,
 } from '@shared/task-pair.js';
+
+/** The select's "nothing chosen" value: an unconfigured project is inert, not `pairs`. */
+const ENGINE_UNSET = '';
 
 export interface TaskPairSettingsValue {
   pairEngine?: TaskPairEngine;
@@ -30,7 +32,7 @@ export function TaskPairSettingsSection({
   onChange: (next: TaskPairSettingsValue) => void;
 }) {
   const { t } = useTranslation();
-  const engine = value.pairEngine ?? TASK_PAIR_DEFAULT_ENGINE;
+  const engine = value.pairEngine ?? ENGINE_UNSET;
   const allowlist = value.pairAllowlist ?? TASK_PAIR_DEFAULT_ALLOWLIST.map((entry) => ({ ...entry }));
   const max = value.pairMaxConcurrency ?? TASK_PAIR_DEFAULT_MAX_CONCURRENCY;
   const setAllowlist = (next: TaskPairAllowlistEntry[]) => onChange({ ...value, pairAllowlist: next });
@@ -48,8 +50,12 @@ export function TaskPairSettingsSection({
           data-testid="task-pair-engine"
           value={engine}
           disabled={disabled}
-          onInput={(e) => onChange({ ...value, pairEngine: (e.target as HTMLSelectElement).value as TaskPairEngine })}
+          onInput={(e) => {
+            const next = (e.target as HTMLSelectElement).value;
+            onChange({ ...value, pairEngine: next === ENGINE_UNSET ? undefined : (next as TaskPairEngine) });
+          }}
         >
+          <option value={ENGINE_UNSET}>{t('taskPair.settings.engine_unset')}</option>
           {TASK_PAIR_ENGINES.map((option) => (
             <option key={option} value={option}>{t(`taskPair.settings.engine_${option}`)}</option>
           ))}

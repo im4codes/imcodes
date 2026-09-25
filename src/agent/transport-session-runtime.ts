@@ -110,7 +110,8 @@ import logger from '../util/logger.js';
 import { incrementCounter } from '../util/metrics.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { getTransportQueueStore } from '../daemon/transport-queue-store.js';
-import { isPairsEngineSession, projectOfSession } from '../daemon/task-pairs/engine.js';
+import { projectOfSession, resolveTaskPairEngineState } from '../daemon/task-pairs/engine.js';
+import { type TaskPairEngineState } from '../../shared/task-pair.js';
 import type { DiscardTransportQueueStateResult, LegacyQueueOwnershipEvidence, QueueRecipientIdentity } from '../daemon/transport-queue-store.js';
 import type { QueueDeliveryFact, QueueSnapshot, QueueSupervisionAdmission, QueueSupervisionReference } from '../../shared/transport-queue-types.js';
 import type { PeerAuditCompletedTurnEvidence } from '../../shared/peer-audit.js';
@@ -545,8 +546,8 @@ export function transportAutoCompactRatio(env: NodeJS.ProcessEnv = process.env):
 export const TRANSPORT_AUTO_COMPACT_MIN_INTERVAL_MS = 10 * 60 * 1000;
 
 /** One registration per Brain contract variant: supervision mode and engine. */
-function brainContractVariantKey(automaticSupervision: boolean, taskPairEngine: boolean): string {
-  return `${automaticSupervision ? 'automatic' : 'manual'}:${taskPairEngine ? 'pairs' : 'legacy'}`;
+function brainContractVariantKey(automaticSupervision: boolean, taskPairEngine: TaskPairEngineState): string {
+  return `${automaticSupervision ? 'automatic' : 'manual'}:${taskPairEngine}`;
 }
 
 export class TransportSessionRuntime implements SessionRuntime {
@@ -1139,12 +1140,21 @@ export class TransportSessionRuntime implements SessionRuntime {
       return false;
     }
   }
-  /** Whether this session's project runs the `pairs` engine; the default when unknown. */
-  private resolveTaskPairEngine(): boolean {
+  /**
+   * Which task-pair engine state governs this session's manual-audited-work
+   * contract: `pairs`, `legacy`, or `off` (no engine explicitly configured,
+   * or the project is unknown -- neither pairs nor legacy automation may
+   * run, so the contract must not fall back to `pairs` or `legacy` just
+   * because it isn't the other one).
+   */
+  private resolveTaskPairEngine(): TaskPairEngineState {
+    // No `!project` short-circuit: resolveTaskPairEngineState already checks
+    // the env override before it needs a project, and an override must win
+    // even for a session whose project cannot be resolved.
     try {
-      return isPairsEngineSession(this.sessionKey) || !projectOfSession(this.sessionKey);
+      return resolveTaskPairEngineState(projectOfSession(this.sessionKey));
     } catch {
-      return true;
+      return 'off';
     }
   }
   setAgentId(agentId: string): void {

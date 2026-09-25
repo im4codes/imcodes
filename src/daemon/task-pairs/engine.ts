@@ -1,36 +1,77 @@
 /**
  * Which supervision engine a project uses, and which sessions belong to it.
  *
- * `pairs` is the default for every project. `legacy` exists only as a manual
- * per-project rollback (settings) or a global override
+ * `pairs` is active only when the project has explicitly opted in: an
+ * explicit `pairEngine` choice (env override, the Brain's saved setting, or
+ * a stored per-project setting), or a Brain session whose supervision
+ * snapshot explicitly sets mode `supervised`/`supervised_audit`. Owner
+ * decision (2026-09-26, tsk_cd_pairs_optin): no saved supervision config, or
+ * no Brain session at all, resolves to the inert `off` state -- the same as
+ * an explicit mode=off snapshot -- so a project is never silently taken over
+ * before its owner has touched supervision settings at all. `legacy` exists
+ * only as a manual per-project rollback (settings) or a global override
  * (`IMCODES_SUPERVISION_ENGINE=legacy`).
  */
 import { getSession, listSessions, type SessionRecord } from '../../store/session-store.js';
-import { extractSessionSupervisionSnapshot, type SessionSupervisionSnapshot } from '../../../shared/supervision-config.js';
+import {
+  extractSessionSupervisionSnapshot,
+  SUPERVISION_MODE,
+  type SessionSupervisionSnapshot,
+} from '../../../shared/supervision-config.js';
 import {
   TASK_PAIR_DEFAULT_ENGINE,
   TASK_PAIR_ENGINE_ENV,
   TASK_PAIR_ENGINES,
   type TaskPairAllowlistEntry,
   type TaskPairEngine,
+  type TaskPairEngineState,
 } from '../../../shared/task-pair.js';
 import { getTaskPairStore } from './store.js';
 
-export function resolveTaskPairEngine(project: string | undefined, env: NodeJS.ProcessEnv = process.env): TaskPairEngine {
+/**
+ * Resolves which engine is active for a project, including the inert `off`
+ * state. Prefer this over {@link resolveTaskPairEngine} at any call site that
+ * would otherwise treat "not pairs" as "must be legacy" -- that binary
+ * assumption is exactly what let a mode-off project fall through into legacy
+ * automation instead of staying inert.
+ */
+export function resolveTaskPairEngineState(project: string | undefined, env: NodeJS.ProcessEnv = process.env): TaskPairEngineState {
   const override = env[TASK_PAIR_ENGINE_ENV]?.trim();
   if (override && (TASK_PAIR_ENGINES as readonly string[]).includes(override)) return override as TaskPairEngine;
-  if (!project) return TASK_PAIR_DEFAULT_ENGINE;
-  const configured = brainSupervisionSettings(project)?.pairEngine;
-  if (configured) return configured;
+  if (!project) return 'off';
+  const settings = brainSupervisionSettings(project);
+  if (settings?.pairEngine) return settings.pairEngine;
   try {
-    return getTaskPairStore().getProjectSettings(project).engine ?? TASK_PAIR_DEFAULT_ENGINE;
+    const stored = getTaskPairStore().getProjectSettings(project).engine;
+    if (stored) return stored;
   } catch {
+    // fall through to the mode-aware default below
+  }
+  // No explicit engine choice anywhere: `pairs` only when the Brain has
+  // explicitly turned automatic supervision on (mode supervised or
+  // supervised_audit) -- that is the project opting in, even if only to
+  // supervision and not to pairs by name. No saved snapshot, no Brain
+  // session, or an explicit mode=off snapshot are all inert.
+  if (settings?.mode === SUPERVISION_MODE.SUPERVISED || settings?.mode === SUPERVISION_MODE.SUPERVISED_AUDIT) {
     return TASK_PAIR_DEFAULT_ENGINE;
   }
+  return 'off';
+}
+
+/**
+ * @deprecated Prefer {@link resolveTaskPairEngineState}, which distinguishes
+ * the inert `off` state from `legacy`. This narrows that state to `legacy`
+ * for callers not yet updated to the tri-state result; new call sites that
+ * branch on "pairs vs. something else" MUST use resolveTaskPairEngineState
+ * instead, or they will treat a mode-off project as legacy.
+ */
+export function resolveTaskPairEngine(project: string | undefined, env: NodeJS.ProcessEnv = process.env): TaskPairEngine {
+  const state = resolveTaskPairEngineState(project, env);
+  return state === 'off' ? 'legacy' : state;
 }
 
 /** The pair settings the owner saved on the project Brain's supervision settings, if any. */
-export function brainSupervisionSettings(project: string): Pick<SessionSupervisionSnapshot, 'pairEngine' | 'pairAllowlist' | 'pairMaxConcurrency'> | undefined {
+export function brainSupervisionSettings(project: string): Pick<SessionSupervisionSnapshot, 'mode' | 'pairEngine' | 'pairAllowlist' | 'pairMaxConcurrency'> | undefined {
   const brain = listSessions().find((session: SessionRecord) => session.projectName === project && session.role === 'brain');
   const snapshot = brain ? extractSessionSupervisionSnapshot(brain.transportConfig ?? null) : null;
   return snapshot ?? undefined;
@@ -54,11 +95,29 @@ export function projectOfSession(sessionName: string): string | undefined {
 
 export function isPairsEngineSession(sessionName: string): boolean {
   const project = projectOfSession(sessionName);
-  return !!project && resolveTaskPairEngine(project) === 'pairs';
+  return !!project && resolveTaskPairEngineState(project) === 'pairs';
 }
 
 export function isPairsEngineProject(project: string | undefined): boolean {
-  return !!project && resolveTaskPairEngine(project) === 'pairs';
+  return !!project && resolveTaskPairEngineState(project) === 'pairs';
+}
+
+/**
+ * True while `project` runs EITHER engine -- pairs or legacy. False only in
+ * the inert `off` state (mode `off`, nothing explicit configured).
+ *
+ * Call sites that branch `isPairsEngineProject ? pairsWork : legacyWork`
+ * MUST also gate the legacy branch on this, or they silently run legacy
+ * automation (nudges, heartbeats, escalations, registry dispatch) for a
+ * project the owner deliberately left uncovered by either engine.
+ */
+export function isTaskPairEngineActive(project: string | undefined): boolean {
+  return !!project && resolveTaskPairEngineState(project) !== 'off';
+}
+
+/** Session-scoped counterpart of {@link isTaskPairEngineActive}. */
+export function isTaskPairEngineActiveForSession(sessionName: string): boolean {
+  return isTaskPairEngineActive(projectOfSession(sessionName));
 }
 
 /** The project's Brain session: the escalation recipient for pairs without a dispatcher. */

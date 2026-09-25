@@ -35,7 +35,7 @@ import {
   buildBrainWorkDelegationContractRef,
 } from '../daemon/supervision-prompts.js';
 import { buildAuditConvergenceContract } from '../../shared/audit-convergence.js';
-import { buildTaskPairMarkerContract } from '../../shared/task-pair.js';
+import { buildTaskPairMarkerContract, type TaskPairEngineState } from '../../shared/task-pair.js';
 import { CRON_CONTROL_PROTOCOL, CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../shared/cron-types.js';
 
 /** Stable text: rendered once, registered in every managed session's system prompt. */
@@ -71,12 +71,13 @@ export interface TransportRuntimeAssemblyInput {
    */
   automaticSupervisionEnabled?: boolean;
   /**
-   * The session's project runs the `pairs` supervision engine (the default;
-   * absent means true). Selects how user-requested audited work is kept moving
-   * in the manual-only Brain contract. `brainContractRegistered` must refer to
-   * this variant too.
+   * The task-pair engine state governing the session's project: `pairs` (the
+   * default; absent means `pairs`), `legacy`, or `off` (mode `off`, no engine
+   * explicitly configured -- neither engine runs). Selects how
+   * user-requested audited work is kept moving in the manual-only Brain
+   * contract. `brainContractRegistered` must refer to this variant too.
    */
-  taskPairEngine?: boolean;
+  taskPairEngine?: TaskPairEngineState;
   /** Full dynamic contracts that are not yet registered on this provider thread. */
   registeredSystemContractText?: string;
   attachments?: TransportAttachment[];
@@ -461,16 +462,19 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
   const auditConvergenceContract = input.suppressMcpMemorySearchGuidance
     ? undefined
     : AUDIT_CONVERGENCE_SYSTEM_CONTRACT;
-  // Task-pair markers are the supervision protocol of the default `pairs`
-  // engine; like the audit contract, messages reference it by id only.
-  const taskPairContract = input.suppressMcpMemorySearchGuidance
-    ? undefined
-    : TASK_PAIR_SYSTEM_CONTRACT;
   // Execution authority is not optional MCP guidance. Keep it in the
   // provider's system/developer channel even for slash-control turns.
   const cronControlTrustedSystemClause = CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE;
   const automaticSupervision = input.automaticSupervisionEnabled === true;
-  const taskPairEngine = input.taskPairEngine !== false;
+  const taskPairEngine = input.taskPairEngine ?? 'pairs';
+  // Task-pair markers are the supervision protocol of the `pairs`/`legacy`
+  // engines; like the audit contract, messages reference it by id only. A
+  // session whose project is `off` (no engine active) must never be told to
+  // write IMCODES_TASK markers -- that is exactly the pairs-flow injection
+  // the project's own dispatch/audit workflow must be left undisturbed by.
+  const taskPairContract = input.suppressMcpMemorySearchGuidance || taskPairEngine === 'off'
+    ? undefined
+    : TASK_PAIR_SYSTEM_CONTRACT;
   const brainDelegationContract = input.sessionIdentity?.role === 'brain'
     ? (input.brainContractRegistered
       ? buildBrainWorkDelegationContractRef(automaticSupervision, taskPairEngine)

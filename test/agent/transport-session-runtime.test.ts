@@ -315,6 +315,20 @@ describe('TransportSessionRuntime memory provenance', () => {
   // automatic task route, and the by-reference shortcut must never let one
   // variant's registration stand in for the other after the mode changes.
   describe('Brain delegation contract follows the live supervision mode', () => {
+    // These sessions have no project record, so with no explicit engine
+    // choice they would resolve `off` (owner decision, 2026-09-26: pairs is
+    // no longer a zero-config default). This block exercises the pairs
+    // contract shape specifically, so it opts in via the env override --
+    // the same pattern the sibling task-pairs test files use.
+    const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
+    beforeEach(() => {
+      process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    });
+    afterEach(() => {
+      if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
+      else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
+    });
+
     async function brainRuntime(sessionName: string) {
       let complete: ((sessionId: string, message: AgentMessage) => void) | undefined;
       const provider = makeProvider();
@@ -345,8 +359,8 @@ describe('TransportSessionRuntime memory provenance', () => {
 
     const OFF_BODY = '"automaticSupervision":false';
     const ON_BODY = '"automaticSupervision":true';
-    // These Brains have no project record, so they run the default `pairs`
-    // engine and carry the pairs Brain contract (never a supervision_* one).
+    // The env override above opts these Brains into `pairs`, so they carry
+    // the pairs Brain contract (never a supervision_* one).
     const FULL = `"contractId":"${TASK_PAIR_BRAIN_CONTRACT_ID}"`;
     const REF = `"contractRef":"${TASK_PAIR_BRAIN_CONTRACT_ID}"`;
     const ON_DUTY = 'send_message_to_one_worker_opens_the_pair';
