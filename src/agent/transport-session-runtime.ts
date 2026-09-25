@@ -1,3 +1,4 @@
+import { isChatMessageOrigin, type ChatMessageOrigin } from '../../shared/chat-message-origin.js';
 import { randomUUID } from 'node:crypto';
 import type { SessionRecord } from '../store/session-store.js';
 import type { AliasSendAudit } from '../../shared/alias-types.js';
@@ -142,6 +143,12 @@ export interface PendingTransportMessage {
    * without it, only immediately-sent messages were auditable.
    */
   aliasAudit?: AliasSendAudit;
+  /**
+   * Who authored this message (shared/chat-message-origin.ts). Rides the queued
+   * entry like `aliasAudit`, so a daemon or agent message projected after a
+   * drain, a reconnect or a restart is not rendered as the human's input.
+   */
+  messageOrigin?: ChatMessageOrigin;
   /** Provider-visible per-turn context rendered through the shared context preamble path. */
   messagePreamble?: string;
   attachments?: TransportAttachment[];
@@ -253,6 +260,8 @@ export interface TransportSendMetadata {
   providerText?: string;
   /** Alias send audit anchor to project onto this message's timeline event. */
   aliasAudit?: AliasSendAudit;
+  /** Author of a non-human message, projected onto its eventual timeline event. */
+  messageOrigin?: ChatMessageOrigin;
   /**
    * Where to place this message when a provider turn is already active.
    * `front` is reserved for out-of-band dialog answers (ask.answer):
@@ -1535,6 +1544,7 @@ export class TransportSessionRuntime implements SessionRuntime {
             text?: unknown;
             providerText?: unknown;
             aliasAudit?: unknown;
+            messageOrigin?: unknown;
             messagePreamble?: unknown;
             attachmentRefs?: unknown;
             sharedActorEnvelope?: unknown;
@@ -1556,6 +1566,7 @@ export class TransportSessionRuntime implements SessionRuntime {
               ...(material.aliasAudit && typeof material.aliasAudit === 'object'
                 ? { aliasAudit: material.aliasAudit as AliasSendAudit }
                 : {}),
+              ...(isChatMessageOrigin(material.messageOrigin) ? { messageOrigin: material.messageOrigin } : {}),
               ...(typeof material.messagePreamble === 'string' && material.messagePreamble ? { messagePreamble: material.messagePreamble } : {}),
               ...(Array.isArray(material.attachmentRefs) && material.attachmentRefs.length ? { attachments: material.attachmentRefs as TransportAttachment[] } : {}),
               ...(material.sharedActorEnvelope ? { sharedActor: material.sharedActorEnvelope as SharedActorEnvelope } : {}),
@@ -2312,6 +2323,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         ? { providerText: metadata.providerText }
         : {}),
       ...(metadata?.aliasAudit ? { aliasAudit: metadata.aliasAudit } : {}),
+      ...(metadata?.messageOrigin ? { messageOrigin: metadata.messageOrigin } : {}),
       ...(messagePreamble?.trim() ? { messagePreamble: messagePreamble.trim() } : {}),
       ...(attachments?.length ? { attachments } : {}),
       ...(metadata?.sharedActor ? { sharedActor: metadata.sharedActor } : {}),
@@ -2375,6 +2387,7 @@ export class TransportSessionRuntime implements SessionRuntime {
               text: entry.text,
               ...(entry.providerText != null ? { providerText: entry.providerText } : {}),
               ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
+              ...(entry.messageOrigin ? { messageOrigin: entry.messageOrigin } : {}),
               ...(entry.messagePreamble ? { messagePreamble: entry.messagePreamble } : {}),
               ...(entry.attachments?.length ? { attachmentRefs: entry.attachments } : {}),
               ...(entry.sharedActor ? { sharedActorEnvelope: entry.sharedActor } : {}),

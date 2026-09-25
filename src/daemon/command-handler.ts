@@ -2,6 +2,7 @@
  * Handle commands from the web UI and inbound chat messages via ServerLink.
  * Commands arrive as JSON objects with a `type` field.
  */
+import type { ChatMessageOrigin } from '../../shared/chat-message-origin.js';
 import { AGENT_SKILLS_MSG } from '../../shared/agent-skills.js';
 import { AGENT_MCP_MSG } from '../../shared/agent-mcp.js';
 import type { CronRunTimelineProjection } from '../../shared/cron-types.js';
@@ -5153,6 +5154,8 @@ async function sendProcessSessionMessage(
       p2pDiscussionId?: string;
       p2pPhase?: string;
       cronRun?: CronRunTimelineProjection;
+      /** Author of a non-human message (shared/chat-message-origin.ts). */
+      messageOrigin?: ChatMessageOrigin;
     }>;
   },
 ): Promise<void> {
@@ -5267,6 +5270,8 @@ export async function sendProcessSessionMessageForAutomation(
       p2pDiscussionId?: string;
       p2pPhase?: string;
       cronRun?: CronRunTimelineProjection;
+      /** Author of a non-human message (shared/chat-message-origin.ts). */
+      messageOrigin?: ChatMessageOrigin;
     }>;
   },
 ): Promise<void> {

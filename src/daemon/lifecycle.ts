@@ -1,3 +1,4 @@
+import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../shared/chat-message-origin.js';
 import { taskPairService } from './task-pairs/service.js';
 import { taskPairAutomation } from './task-pairs/scheduler.js';
 import { getTaskPairStore } from './task-pairs/store.js';
@@ -2237,12 +2238,15 @@ export async function recoverCodexStalledSession(
       text: 'continue',
       clientMessageId: commandId,
       allowDuplicate: true,
+      // The watchdog's own nudge, not the human's input.
+      [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.SYSTEM,
     },
     { source: 'daemon', confidence: 'high', eventId: `transport-user:${commandId}` },
   );
   const sendResult = runtime.send('continue', commandId, undefined, undefined, {
     queuePlacement: 'front',
     timelineCommitted: true,
+    messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
   });
   if (sendResult === 'queued') await runtime.cancel();
   return true;
@@ -2305,12 +2309,15 @@ export async function recoverMemoryCompressionStalledSession(
       text: 'continue',
       clientMessageId: commandId,
       allowDuplicate: true,
+      // The watchdog's own nudge, not the human's input.
+      [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.SYSTEM,
     },
     { source: 'daemon', confidence: 'high', eventId: `transport-user:${commandId}` },
   );
   const sendResult = runtime.send('continue', commandId, undefined, undefined, {
     queuePlacement: 'front',
     timelineCommitted: true,
+    messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
   });
   if (sendResult === 'queued') await runtime.cancel();
   resolveSessionCompressionWatchRuns(sessionName);

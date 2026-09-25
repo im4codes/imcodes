@@ -2,6 +2,7 @@
  * Tests for hook server /send endpoint.
  * Covers: target resolution, queue-when-busy, circuit breakers, Content-Type, body size.
  */
+import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../shared/chat-message-origin.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import http from 'http';
 import { execFileSync } from 'node:child_process';
@@ -883,6 +884,8 @@ describe('Hook server /send endpoint', () => {
         expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith(
           worker.name,
           `${buildAgentDelegationSenderLine(brain.name)}\n\nstart assigned work`,
+          // Another session's delivery: incoming, not the human's input.
+          { userMessageMetadata: { [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.AGENT } },
         );
       } finally {
         if (priorRoot === undefined) delete process.env.IMCODES_WORKTREES_ROOT;
@@ -1027,6 +1030,8 @@ describe('Hook server /send endpoint', () => {
         expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith(
           auditor.name,
           `${buildAgentDelegationSenderLine(brain.name)}\n\ndeliver exact existing audit`,
+          // Another session's delivery: incoming, not the human's input.
+          { userMessageMetadata: { [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.AGENT } },
         );
         expect(registry.get(taskId)?.assignments.filter((assignment) => assignment.role === 'auditor'))
           .toEqual([expect.objectContaining({ assignmentId, auditAttemptId: attemptId, auditRevision: revision })]);
@@ -1083,6 +1088,8 @@ describe('Hook server /send endpoint', () => {
         expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith(
           worker.name,
           `${buildAgentDelegationSenderLine(brain.name)}\n\ncontinue exact assignment`,
+          // Another session's delivery: incoming, not the human's input.
+          { userMessageMetadata: { [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.AGENT } },
         );
       } finally {
         if (previousRoot === undefined) delete process.env.IMCODES_WORKTREES_ROOT;
@@ -1104,7 +1111,8 @@ describe('Hook server /send endpoint', () => {
       expect(res.body.ok).toBe(true);
       expect(res.body.delivered).toBe(true);
       expect(res.body.target).toBe('deck_proj_brain');
-      expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith('deck_proj_brain', 'Task: UI polish\nResult: done');
+      // A shell/script callback, not typed in the chat.
+      expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith('deck_proj_brain', 'Task: UI polish\nResult: done', { userMessageMetadata: { [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.SYSTEM } });
     });
 
     it('REGRESSION GUARD: CLI /send to process sessions must route through session.send recall pipeline and this test must not be deleted', async () => {
@@ -1128,6 +1136,7 @@ describe('Hook server /send endpoint', () => {
       expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith(
         'deck_proj_w1',
         `${buildAgentDelegationSenderLine('deck_proj_brain')}\n\nhello`,
+        { userMessageMetadata: { [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.AGENT } },
       );
       expect(sendKeysMock).not.toHaveBeenCalled();
     });
@@ -1171,6 +1180,7 @@ describe('Hook server /send endpoint', () => {
           allowDuplicate: true,
           commandId: messageId,
           clientMessageId: messageId,
+          [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.AGENT,
         },
         { source: 'daemon', confidence: 'high', eventId: `transport-user:${messageId}` },
       );
@@ -1211,7 +1221,10 @@ describe('Hook server /send endpoint', () => {
       expect(res.body.queued).toBe(true);
       const expectedQueuedText = `${buildAgentDelegationSenderLine('deck_proj_brain')}\n\nqueued transport`;
       expect(mockRuntime.appendExternalMessageToActiveTurn).toHaveBeenCalledWith(expectedQueuedText, res.body.messageId);
-      expect(mockRuntime.send).toHaveBeenCalledWith(expectedQueuedText, res.body.messageId);
+      // The queued copy carries the agent origin its drained row will render with.
+      expect(mockRuntime.send).toHaveBeenCalledWith(expectedQueuedText, res.body.messageId, undefined, undefined, {
+        messageOrigin: CHAT_MESSAGE_ORIGINS.AGENT,
+      });
       expect(timelineEmitMock).not.toHaveBeenCalledWith(
         'deck_proj_w1',
         'user.message',

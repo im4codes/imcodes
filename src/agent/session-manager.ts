@@ -1,3 +1,4 @@
+import { queuedUserMessageAttribution } from './transport-queued-user-message.js';
 import { newSession, killSession, sessionExists, isPaneAlive, respawnPane, listSessions as tmuxListSessions, sendKeys, sendKey, capturePane, showBuffer, getPaneId, getPaneCwd, getPaneStartCommand, cleanupOrphanFifos, BACKEND } from './tmux.js';
 import { randomUUID } from 'node:crypto';
 import { ClaudeCodeDriver } from './drivers/claude-code.js';
@@ -1543,10 +1544,9 @@ async function drainTransportResendQueueIntoRuntime(
               clientMessageId,
               pendingMessageVersion: observeTransportQueueRevision(sessionName, runtime.pendingVersion),
               ...(attachments.length > 0 ? { attachments } : {}),
-              ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
               // Resend delivers the expanded copy to the provider, so this
-              // user.message is the only place the anchor can land.
-              ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
+              // user.message is the only place the alias anchor can land.
+              ...queuedUserMessageAttribution(entry),
             },
             { source: 'daemon', confidence: 'high', eventId: `transport-user:${clientMessageId}` },
           );
@@ -1897,8 +1897,7 @@ function wireTransportCallbacks(
         clientMessageId: entry.clientMessageId,
         allowDuplicate: true,
         pendingMessageVersion: drainedVersion,
-        ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
-        ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
+        ...queuedUserMessageAttribution(entry),
       };
       timelineEmitter.emit(
         sessionName,
@@ -1947,8 +1946,7 @@ function wireTransportCallbacks(
         allowDuplicate: true,
         queueAppended: true,
         pendingMessageVersion,
-        ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
-        ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
+        ...queuedUserMessageAttribution(entry),
       };
       timelineEmitter.emit(
         sessionName,

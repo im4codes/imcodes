@@ -1,3 +1,4 @@
+import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS, type ChatMessageOrigin } from '../../shared/chat-message-origin.js';
 import {
   SESSION_MODEL_COMMAND,
   classifySessionControlCommand,
@@ -74,6 +75,13 @@ export interface SessionDispatchMessageOptions {
   durableQueue?: boolean;
   /** Deliver daemon-owned control traffic to the agent without a duplicate user timeline card. */
   suppressTimeline?: boolean;
+  /**
+   * Author of a non-human message (shared/chat-message-origin.ts). Stamped on
+   * the timeline row and carried on every queued copy, so the row projected
+   * after a drain is not rendered as the human's input. Absent for human input
+   * (external chat bridges route here too).
+   */
+  messageOrigin?: ChatMessageOrigin;
 }
 
 export type SessionDispatchOptions = SessionDispatchMessageOptions;
@@ -218,7 +226,7 @@ export async function dispatchSessionMessage(
       const { clearTransportConversation, supportsTransportClear } = await import('./command-handler.js');
       if (supportsTransportClear(target.agentType)) {
         if (!options.suppressTimeline) {
-          emitStructuredTransportUserMessage(target.name, message, options.messageId, options.sharedActor);
+          emitStructuredTransportUserMessage(target.name, message, options.messageId, options.sharedActor, options.messageOrigin);
         }
         await clearTransportConversation(target);
         return 'sent';
@@ -230,7 +238,7 @@ export async function dispatchSessionMessage(
       const { switchSessionModelNow } = await import('./command-handler.js');
       const requested = message.trim().slice(SESSION_MODEL_COMMAND.length).trim().split(/\s+/)[0] ?? '';
       if (!options.suppressTimeline) {
-        emitStructuredTransportUserMessage(target.name, message, options.messageId, options.sharedActor);
+        emitStructuredTransportUserMessage(target.name, message, options.messageId, options.sharedActor, options.messageOrigin);
       }
       await switchSessionModelNow(target.name, requested);
       return 'sent';
@@ -244,6 +252,7 @@ export async function dispatchSessionMessage(
         commandId: options.messageId,
         clientMessageId: options.messageId,
         ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
+        ...(options.messageOrigin ? { messageOrigin: options.messageOrigin } : {}),
         ...(options.queueSupervisionReference ? { supervisionReference: options.queueSupervisionReference } : {}),
         ...(options.suppressTimeline ? { timelineCommitted: true } : {}),
         // Daemon-owned supervision traffic is persisted before delivery. Keep
@@ -277,6 +286,7 @@ export async function dispatchSessionMessage(
         commandId: options.messageId,
         clientMessageId: options.messageId,
         ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
+        ...(options.messageOrigin ? { messageOrigin: options.messageOrigin } : {}),
         ...(options.queueSupervisionReference ? { supervisionReference: options.queueSupervisionReference } : {}),
         ...(options.suppressTimeline ? { timelineCommitted: true } : {}),
         ...(options.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
@@ -316,6 +326,7 @@ export async function dispatchSessionMessage(
               ...(options.queueSupervisionReference
                 ? { supervisionReference: options.queueSupervisionReference }
                 : {}),
+              ...originMetadata(options),
             })
           : options.sharedActor
           ? runtime.send(message, options.messageId, undefined, undefined, {
@@ -323,11 +334,15 @@ export async function dispatchSessionMessage(
               ...(options.queueSupervisionReference
                 ? { supervisionReference: options.queueSupervisionReference }
                 : {}),
+              ...originMetadata(options),
             })
           : options.queueSupervisionReference
           ? runtime.send(message, options.messageId, undefined, undefined, {
               supervisionReference: options.queueSupervisionReference,
+              ...originMetadata(options),
             })
+          : options.messageOrigin
+          ? runtime.send(message, options.messageId, undefined, undefined, originMetadata(options))
           : runtime.send(message, options.messageId);
         if (fallback === 'sent' && !options.suppressTimeline) {
           emitStructuredTransportUserMessage(
@@ -335,6 +350,7 @@ export async function dispatchSessionMessage(
             message,
             options.messageId,
             options.sharedActor,
+            options.messageOrigin,
           );
         } else {
           timelineEmitter.emit(target.name, 'session.state', {
@@ -350,6 +366,7 @@ export async function dispatchSessionMessage(
           message,
           options.messageId,
           options.sharedActor,
+          options.messageOrigin,
         );
       }
       return 'sent';
@@ -358,12 +375,15 @@ export async function dispatchSessionMessage(
       ? runtime.send(message, options.messageId, undefined, undefined, {
           ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
           timelineCommitted: true,
+          ...originMetadata(options),
         })
       : options.sharedActor
-      ? runtime.send(message, options.messageId, undefined, undefined, { sharedActor: options.sharedActor })
+      ? runtime.send(message, options.messageId, undefined, undefined, { sharedActor: options.sharedActor, ...originMetadata(options) })
+      : options.messageOrigin
+      ? runtime.send(message, options.messageId, undefined, undefined, originMetadata(options))
       : runtime.send(message, options.messageId);
     if (result === 'sent' && !options.suppressTimeline) {
-      emitStructuredTransportUserMessage(target.name, message, options.messageId, options.sharedActor);
+      emitStructuredTransportUserMessage(target.name, message, options.messageId, options.sharedActor, options.messageOrigin);
     } else if (result === 'queued') {
       const queuePayload = buildTransportQueueSnapshotPayload(target.name, 'send_tool');
       timelineEmitter.emit(target.name, 'session.state', {
@@ -375,8 +395,13 @@ export async function dispatchSessionMessage(
   }
 
   const { sendProcessSessionMessageForAutomation } = await import('./command-handler.js');
+  const userMessageMetadata = options.messageOrigin
+    ? { userMessageMetadata: { [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: options.messageOrigin } }
+    : {};
   if (options.suppressTimeline) {
-    await sendProcessSessionMessageForAutomation(target.name, message, { suppressTimeline: true });
+    await sendProcessSessionMessageForAutomation(target.name, message, { suppressTimeline: true, ...userMessageMetadata });
+  } else if (options.messageOrigin) {
+    await sendProcessSessionMessageForAutomation(target.name, message, userMessageMetadata);
   } else {
     await sendProcessSessionMessageForAutomation(target.name, message);
   }
@@ -433,6 +458,8 @@ export async function dispatchPeerAuditMessage(input: {
     const runtime = getTransportRuntime(target.name);
     if (!runtime) return { ok: false, error: PEER_AUDIT_PREFLIGHT_ERRORS.TARGET_INELIGIBLE };
     const disposition = runtime.send(input.brief, messageId, undefined, undefined, {
+      // If it queues, the drain projects it: a daemon audit brief, not the human's input.
+      messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
       peerAudit: {
         contractVersion: PEER_AUDIT_CONTRACT_VERSION,
         attemptHash: createHash('sha256').update(input.attemptId).digest('base64url'),
@@ -484,11 +511,16 @@ export function cancelQueuedPeerAuditMessage(targetSessionName: string, messageI
   return Boolean(getTransportRuntime(targetSessionName)?.removePendingMessage(messageId));
 }
 
+function originMetadata(options: SessionDispatchMessageOptions): { messageOrigin?: ChatMessageOrigin } {
+  return options.messageOrigin ? { messageOrigin: options.messageOrigin } : {};
+}
+
 function emitStructuredTransportUserMessage(
   sessionName: string,
   message: string,
   messageId: SendMessageId,
   sharedActor?: SharedActorEnvelope,
+  messageOrigin?: ChatMessageOrigin,
 ): void {
   timelineEmitter.emit(
     sessionName,
@@ -498,6 +530,7 @@ function emitStructuredTransportUserMessage(
       allowDuplicate: true,
       commandId: messageId,
       clientMessageId: messageId,
+      ...(messageOrigin ? { [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: messageOrigin } : {}),
       ...(sharedActor ? { sharedActor } : {}),
     },
     { source: 'daemon', confidence: 'high', eventId: `transport-user:${messageId}` },

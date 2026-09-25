@@ -2823,7 +2823,8 @@ describe('p2p-workflow reverse-regression', () => {
       'P2P must dispatch transport prompts through a queue-aware helper',
     ).toBe(true);
     expect(
-      /const\s+result\s*=\s*transportRuntime\.send\(args\.prompt(,\s*commandId)?\)/.test(orchestrator.text)
+      // The prompt may carry send metadata (e.g. its system message origin) after the commandId.
+      /const\s+result\s*=\s*transportRuntime\.send\(args\.prompt(,\s*commandId\b[^;]*)?\);/.test(orchestrator.text)
         && /if\s*\(result\s*===\s*'queued'\)/.test(orchestrator.text),
       'P2P must inspect transportRuntime.send() and handle queued results explicitly',
     ).toBe(true);

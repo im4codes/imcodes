@@ -26,6 +26,22 @@ html { position: fixed; }
   --supervision-needs-input-border: rgba(251, 191, 36, 0.56);
   --supervision-needs-input-text: #fde68a;
   --supervision-idle-text: #94a3b8;
+  /* Verdict/status tones shared by peer-audit outcomes, the supervision task
+     console and task-pair chips, so one state has one colour everywhere. */
+  --status-active-text: #67e8f9;
+  --status-active-border: rgba(34, 211, 238, 0.24);
+  --status-active-bg: rgba(8, 145, 178, 0.1);
+  --status-audit-text: #93c5fd;
+  --status-audit-border: rgba(96, 165, 250, 0.48);
+  --status-pass-text: #6ee7b7;
+  --status-pass-border: rgba(52, 211, 153, 0.48);
+  --status-rework-text: #fcd34d;
+  --status-rework-border: rgba(251, 191, 36, 0.5);
+  --status-done-text: #86efac;
+  --status-done-border: rgba(74, 222, 128, 0.3);
+  --status-done-bg: rgba(34, 197, 94, 0.08);
+  --status-cancelled-text: #fca5a5;
+  --status-cancelled-border: rgba(248, 113, 113, 0.3);
   /* The desktop vertical rail is one compact bottom sub-session card wide. */
   --subsession-compact-card-width: 54px;
   /* Team progress needs readable topics/status while remaining much narrower
@@ -79,10 +95,10 @@ html { position: fixed; }
 .supervision-task-console-task-title { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .supervision-task-console-task-title strong { color: #e2e8f0; font-size: 12px; }
 .supervision-task-console-task-title small { overflow: hidden; color: #64748b; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
-.supervision-task-console-status { padding: 3px 6px; border: 1px solid rgba(34,211,238,.24); border-radius: 999px; color: #67e8f9; background: rgba(8,145,178,.1); font-size: 9px; white-space: nowrap; }
+.supervision-task-console-status { padding: 3px 6px; border: 1px solid var(--status-active-border); border-radius: 999px; color: var(--status-active-text); background: var(--status-active-bg); font-size: 9px; white-space: nowrap; }
 .supervision-task-console-status.status-rework, .supervision-task-console-status.status-blocked { color: #fbbf24; border-color: rgba(245,158,11,.3); background: rgba(245,158,11,.08); }
-.supervision-task-console-status.status-cancelled { color: #fca5a5; border-color: rgba(248,113,113,.3); }
-.supervision-task-console-status.status-finalized, .supervision-task-console-status.status-pushed { color: #86efac; border-color: rgba(74,222,128,.3); background: rgba(34,197,94,.08); }
+.supervision-task-console-status.status-cancelled { color: var(--status-cancelled-text); border-color: var(--status-cancelled-border); }
+.supervision-task-console-status.status-finalized, .supervision-task-console-status.status-pushed { color: var(--status-done-text); border-color: var(--status-done-border); background: var(--status-done-bg); }
 .supervision-task-console-chevron { color: #64748b; }
 .supervision-task-console-progress { height: 2px; overflow: hidden; background: rgba(148,163,184,.09); }
 .supervision-task-console-progress > span { display: block; height: 100%; background: linear-gradient(90deg, var(--chrome-accent), var(--chrome-accent-2)); transition: width .2s ease; }
@@ -5104,6 +5120,12 @@ html.native-ios-mac .chat-dl-btn {
   width: 100%; border: 0; background: rgba(127, 29, 29, 0.28); color: #fecaca; cursor: pointer;
 }
 .chat-user { background: #1e3a5f; border-radius: 8px; padding: 6px 12px; align-self: flex-end; max-width: 80%; width: fit-content; text-align: left; word-break: break-all; overflow-wrap: break-word; position: relative; }
+/* Only the human's own input is right-aligned (shared/chat-message-origin.ts):
+   agent deliveries and daemon injections are incoming, so they sit on the left
+   in the incoming-bubble tone. */
+.chat-user.chat-user-origin-agent,
+.chat-user.chat-user-origin-system { align-self: flex-start; background: #161b22; border: 1px solid rgba(148, 163, 184, 0.16); }
+.chat-user.chat-user-supervision-prompt.chat-user-origin-system { background: transparent; border: 0; }
 .chat-user.chat-pending { background: #1e3a5f80; color: #94a3b8; }
 .chat-user.chat-failed { background: #3a1a1a; color: #fca5a5; border: 1px solid #7f1d1d; }
 .chat-user-status { display: inline-flex; align-items: center; gap: 6px; margin-top: 4px; font-size: 11px; line-height: 1; }
@@ -5119,6 +5141,8 @@ html.native-ios-mac .chat-dl-btn {
 .chat-user-message-fold-content.is-folded,
 .chat-user-message-fold-content.is-measuring { max-height: calc(1.45em * 10); overflow: hidden; }
 .chat-user-message-fold.is-folded::after { content: ''; position: absolute; left: 0; right: 0; bottom: 28px; height: 28px; background: linear-gradient(transparent, #1e3a5f); pointer-events: none; border-radius: 0 0 8px 8px; }
+.chat-user.chat-user-origin-agent .chat-user-message-fold.is-folded::after,
+.chat-user.chat-user-origin-system .chat-user-message-fold.is-folded::after { background: linear-gradient(transparent, #161b22); }
 .chat-user.chat-pending .chat-user-message-fold.is-folded::after { background: linear-gradient(transparent, rgba(30, 58, 95, 0.5)); }
 .chat-user.chat-failed .chat-user-message-fold.is-folded::after { background: linear-gradient(transparent, #3a1a1a); }
 .chat-user-message-fold-toggle { position: relative; z-index: 1; display: inline-flex; align-items: center; justify-content: center; margin-top: 6px; padding: 2px 8px; border: 1px solid rgba(147, 197, 253, 0.35); border-radius: 999px; background: rgba(15, 23, 42, 0.18); color: #bfdbfe; font-family: inherit; font-size: 11px; line-height: 1.4; cursor: pointer; -webkit-tap-highlight-color: transparent; }
@@ -6081,9 +6105,9 @@ html.native-ios-mac .chat-dl-btn {
   line-height: 1.35;
   white-space: nowrap;
 }
-.peer-audit-result-outcome--pass { border-color: rgba(52, 211, 153, 0.48); color: #6ee7b7; }
-.peer-audit-result-outcome--rework { border-color: rgba(251, 191, 36, 0.5); color: #fcd34d; }
-.peer-audit-round-chip { border-color: rgba(96, 165, 250, 0.48); color: #93c5fd; }
+.peer-audit-result-outcome--pass { border-color: var(--status-pass-border); color: var(--status-pass-text); }
+.peer-audit-result-outcome--rework { border-color: var(--status-rework-border); color: var(--status-rework-text); }
+.peer-audit-round-chip { border-color: var(--status-audit-border); color: var(--status-audit-text); }
 .delegation-reply-card-meta { min-width: 0; display: flex; flex: 0 1 auto; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 4px 7px; margin-left: auto; }
 .delegation-reply-card-head .delegation-reply-verdict {
   flex: 0 0 auto;
@@ -14181,10 +14205,10 @@ button.quick-agent-delegation-preset.active {
 .supervision-task-console-task-title { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .supervision-task-console-task-title strong { color: #e2e8f0; font-size: 12px; }
 .supervision-task-console-task-title small { overflow: hidden; color: #64748b; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
-.supervision-task-console-status { padding: 3px 6px; border: 1px solid rgba(34,211,238,.24); border-radius: 999px; color: #67e8f9; background: rgba(8,145,178,.1); font-size: 9px; white-space: nowrap; }
+.supervision-task-console-status { padding: 3px 6px; border: 1px solid var(--status-active-border); border-radius: 999px; color: var(--status-active-text); background: var(--status-active-bg); font-size: 9px; white-space: nowrap; }
 .supervision-task-console-status.status-rework, .supervision-task-console-status.status-blocked { color: #fbbf24; border-color: rgba(245,158,11,.3); background: rgba(245,158,11,.08); }
-.supervision-task-console-status.status-cancelled { color: #fca5a5; border-color: rgba(248,113,113,.3); }
-.supervision-task-console-status.status-finalized, .supervision-task-console-status.status-pushed { color: #86efac; border-color: rgba(74,222,128,.3); background: rgba(34,197,94,.08); }
+.supervision-task-console-status.status-cancelled { color: var(--status-cancelled-text); border-color: var(--status-cancelled-border); }
+.supervision-task-console-status.status-finalized, .supervision-task-console-status.status-pushed { color: var(--status-done-text); border-color: var(--status-done-border); background: var(--status-done-bg); }
 .supervision-task-console-chevron { color: #64748b; }
 .supervision-task-console-progress { height: 2px; overflow: hidden; background: rgba(148,163,184,.09); }
 .supervision-task-console-progress > span { display: block; height: 100%; background: linear-gradient(90deg, var(--chrome-accent), var(--chrome-accent-2)); transition: width .2s ease; }
@@ -14402,6 +14426,17 @@ button.quick-agent-delegation-preset.active {
   border: 1px solid var(--border-color, rgba(128, 128, 128, 0.35));
 }
 .task-pair-chip-held { border-color: var(--warning-color, #c98a00); }
+/* One colour per pair status, from the shared verdict/status tones. */
+.task-pair-chip-status { color: var(--task-pair-status-text, inherit); border-color: var(--task-pair-status-border, var(--border-color, rgba(128, 128, 128, 0.35))); background: var(--task-pair-status-bg, transparent); font-weight: 600; }
+.task-pair-chip { border-left: 2px solid var(--task-pair-status-border, transparent); }
+.task-pair-chip--queued { --task-pair-status-text: var(--supervision-idle-text); }
+.task-pair-chip--working { --task-pair-status-text: var(--status-active-text); --task-pair-status-border: var(--status-active-border); --task-pair-status-bg: var(--status-active-bg); }
+.task-pair-chip--in_audit { --task-pair-status-text: var(--status-audit-text); --task-pair-status-border: var(--status-audit-border); }
+.task-pair-chip--awaiting_audit { --task-pair-status-text: var(--supervision-waiting-text); --task-pair-status-border: var(--supervision-waiting-border); --task-pair-status-bg: var(--supervision-waiting-bg); }
+.task-pair-chip--rework { --task-pair-status-text: var(--status-rework-text); --task-pair-status-border: var(--status-rework-border); }
+.task-pair-chip--passed { --task-pair-status-text: var(--status-pass-text); --task-pair-status-border: var(--status-pass-border); }
+.task-pair-chip--done { --task-pair-status-text: var(--status-done-text); --task-pair-status-border: var(--status-done-border); --task-pair-status-bg: var(--status-done-bg); }
+.task-pair-chip--cancelled { --task-pair-status-text: var(--status-cancelled-text); --task-pair-status-border: var(--status-cancelled-border); }
 .task-pair-chip-unusual { opacity: 0.75; font-style: italic; }
 
 .supervision-task-console-pair {

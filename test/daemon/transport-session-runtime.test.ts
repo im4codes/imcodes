@@ -1,3 +1,4 @@
+import { CHAT_MESSAGE_ORIGINS } from '../../shared/chat-message-origin.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -6674,6 +6675,35 @@ ${PREFERENCE_CONTEXT_END}`;
       expect(rehydrated?.aliasAudit).toEqual(AUDIT);
       // Still delivered privately, never on the public projection.
       expect(rehydrated?.providerText).toBe(EXPANDED);
+    });
+
+    it('a queued daemon message carries its origin to onDrain and across a restart', async () => {
+      runtime.send('first turn');
+      await waitForProviderSendCount(mock.provider, 1);
+      const onDrainEntries: PendingTransportMessage[][] = [];
+      runtime.onDrain = (entries) => { onDrainEntries.push(entries); };
+      expect(runtime.send('Auto Deliver: implement task 2', 'origin-queued-1', undefined, undefined, {
+        messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+      })).toBe('queued');
+      expect(runtime.send('human follow-up', 'origin-queued-human')).toBe('queued');
+      // The origin is not secret: it survives the public projection onDrain reads.
+      expect(runtime.pendingEntries.find((e) => e.clientMessageId === 'origin-queued-1')?.messageOrigin)
+        .toBe(CHAT_MESSAGE_ORIGINS.SYSTEM);
+
+      const restartMock = makeMockProvider();
+      const restarted = new TransportSessionRuntime(restartMock.provider, 'deck_test_brain');
+      await restarted.initialize(defaultConfig);
+      expect(restarted.rehydratePendingFromStore()).toBe(2);
+      expect(restarted.pendingEntriesForResend.find((e) => e.clientMessageId === 'origin-queued-1')?.messageOrigin)
+        .toBe(CHAT_MESSAGE_ORIGINS.SYSTEM);
+      expect(restarted.pendingEntriesForResend.find((e) => e.clientMessageId === 'origin-queued-human')?.messageOrigin)
+        .toBeUndefined();
+
+      mock.fireComplete('sess-1');
+      await waitForProviderSendCount(mock.provider, 2);
+      const drained = onDrainEntries.flat();
+      expect(drained.find((e) => e.clientMessageId === 'origin-queued-1')?.messageOrigin).toBe(CHAT_MESSAGE_ORIGINS.SYSTEM);
+      expect(drained.find((e) => e.clientMessageId === 'origin-queued-human')?.messageOrigin).toBeUndefined();
     });
 
     it('editing a queued message drops the anchor along with the stale expansion', async () => {

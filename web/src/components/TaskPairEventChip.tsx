@@ -30,9 +30,12 @@ export function TaskPairEventChip({ eventId, payload }: { eventId: string; paylo
       .join(' · ')
     : '';
   const held = event.verdictJudgement === 'inconsistent' || event.verdictJudgement === 'missing_severity';
+  // One colour per status (styles.css `.task-pair-chip--<status>`).
+  const statusClass = isStatus(event.toStatus) ? ` task-pair-chip--${event.toStatus}` : '';
   return (
     <div
-      class={`chat-event chat-system task-pair-chip${event.unusual ? ' task-pair-chip--unusual' : ''}${held ? ' task-pair-chip--held' : ''}`}
+      class={`chat-event chat-system task-pair-chip${statusClass}${event.unusual ? ' task-pair-chip--unusual' : ''}${held ? ' task-pair-chip--held' : ''}`}
+      data-task-status={isStatus(event.toStatus) ? event.toStatus : undefined}
       data-event-id={eventId}
       data-task-id={taskId}
     >

@@ -1,3 +1,5 @@
+import { IMCODES_EXTERNAL_CLI_SENDER } from '../../shared/imcodes-send.js';
+import { CHAT_MESSAGE_ORIGINS } from '../../shared/chat-message-origin.js';
 import { isPairsEngineProject, projectBrainSession } from './task-pairs/engine.js';
 import { taskPairService } from './task-pairs/service.js';
 import { getTaskPairStore } from './task-pairs/store.js';
@@ -2851,6 +2853,8 @@ export async function dispatchSendMessage(
       const dispatchResult = await d.dispatchMessage(target, message, {
         dispatchId,
         messageId,
+        // Another session (or the daemon's own supervision) wrote this, never the human.
+        messageOrigin: input.automaticSupervision ? CHAT_MESSAGE_ORIGINS.SYSTEM : CHAT_MESSAGE_ORIGINS.AGENT,
         ...(input.internalDurableQueue ? { durableQueue: true } : {}),
         ...(input.internalSuppressTimeline ? { suppressTimeline: true } : {}),
         ...(input.internalQueueSupervisionReference
@@ -5376,6 +5380,7 @@ async function dispatchExecutionCloneSend(
     dispatchResult = await d.dispatchMessage(cloneRecord, message, {
       dispatchId,
       messageId,
+      messageOrigin: CHAT_MESSAGE_ORIGINS.AGENT,
       ...buildSharedServerMemberSharedActorOption(caller, callerRecord, cloneRecord, messageId, now),
     });
   } catch (err) {
@@ -5636,6 +5641,8 @@ export async function dispatchHookSend(input: HookSendDispatchInput, deps?: Send
       const result = await d.dispatchMessage(target, message, {
         dispatchId,
         messageId,
+        // A session's send, or a shell/script callback via `imcodes send`; never typed in the chat.
+        messageOrigin: input.from === IMCODES_EXTERNAL_CLI_SENDER ? CHAT_MESSAGE_ORIGINS.SYSTEM : CHAT_MESSAGE_ORIGINS.AGENT,
         deliveryMode,
         ...buildSharedServerMemberSharedActorOption(
           {

@@ -114,6 +114,7 @@ import {
 } from '../../src/daemon/openspec-auto-deliver-orchestrator.js';
 import { clearAllResend, enqueueResend, getResendEntries } from '../../src/daemon/transport-resend-queue.js';
 import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
+import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS, classifyUserMessageOrigin } from '../../shared/chat-message-origin.js';
 import { getAutoDeliverP2pLock } from '../../src/daemon/p2p-launch-admission.js';
 import { getTransportQueueStore } from '../../src/daemon/transport-queue-store.js';
 
@@ -855,6 +856,9 @@ exec "${realGit}" "$@"
       expect(transportSendMock).toHaveBeenCalledWith(
         expect.stringContaining('OpenSpec Auto Deliver context for @openspec/changes/demo-change'),
         expect.stringContaining(':implementation:'),
+        undefined,
+        undefined,
+        { [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.SYSTEM },
       );
     } finally {
       process.env.PATH = oldPath;
@@ -937,6 +941,33 @@ exec "${realGit}" "$@"
     expect(sendAfterSettle).toHaveBeenCalledTimes(1);
     expect(settleBeforeSend.mock.invocationCallOrder[0]).toBeLessThan(sendAfterSettle.mock.invocationCallOrder[0]);
     expect(String(sendAfterSettle.mock.calls[0]?.[0] ?? '')).toContain('OpenSpec Auto Deliver context for @openspec/changes/demo-change');
+  });
+
+  it('stamps a sent Auto Deliver prompt as a system message, not the human input', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    const timelineSpy = vi.spyOn(timelineEmitter, 'emit');
+    try {
+      await handleOpenSpecAutoDeliverCommand({
+        type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+        requestId: 'req-origin-stamp',
+        sessionName: 'deck_demo_brain',
+        changeName: 'demo-change',
+        presetId: 'fast',
+      }, serverLinkMock as never);
+      await waitForSend((msg) =>
+        msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+        && msg.projection?.stage === 'implementation_task_loop',
+        SEND_WAIT_MS,
+      );
+      const commandId = String(transportSendMock.mock.calls.at(-1)?.[1] ?? '');
+      const promptEvent = timelineSpy.mock.calls.find(([session, type, payload]) =>
+        session === 'deck_demo_brain' && type === 'user.message'
+        && (payload as Record<string, unknown>).commandId === commandId);
+      expect(promptEvent?.[2]).toMatchObject({ [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.SYSTEM });
+      expect(classifyUserMessageOrigin(promptEvent?.[2] as Record<string, unknown>)).toBe(CHAT_MESSAGE_ORIGINS.SYSTEM);
+    } finally {
+      timelineSpy.mockRestore();
+    }
   });
 
   it('does not preempt a busy transport turn while an active tool is running', async () => {
@@ -1084,6 +1115,8 @@ exec "${realGit}" "$@"
       expect(queuedRuntime.send).toHaveBeenCalledTimes(1);
       const commandId = String(queuedRuntime.send.mock.calls[0]?.[1] ?? '');
       expect(commandId).toContain(':implementation:');
+      // The queued copy carries the daemon origin, so its drain row renders left.
+      expect(queuedRuntime.send.mock.calls[0]?.[4]).toMatchObject({ [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.SYSTEM });
       expect(timelineSpy.mock.calls.some(([session, type, payload]) =>
         session === 'deck_demo_brain'
         && type === 'user.message'

@@ -24,6 +24,7 @@ function buildResendMetadata(
     ...(entry.sharedMachineAuthority ? { sharedMachineAuthority: entry.sharedMachineAuthority } : {}),
     ...(entry.providerText != null ? { providerText: entry.providerText } : {}),
     ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
+    ...(entry.messageOrigin ? { messageOrigin: entry.messageOrigin } : {}),
     ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
     ...(entry.historyCommitted ? { historyCommitted: true } : {}),
     ...(entry.activeTurnDeliveryKind

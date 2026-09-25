@@ -73,6 +73,7 @@ import { AgentTodoList } from './AgentTodoList.js';
 import { DelegationClaimBadge, readDelegationClaimMetadata } from './DelegationClaimBadge.js';
 import { DelegationReplyInstructionCardView, DelegationSenderCardView } from './DelegationProtocolCard.js';
 import { parseDelegationProtocolMessage } from '@shared/agent-delegation-markers.js';
+import { CHAT_MESSAGE_ORIGINS, classifyUserMessageOrigin } from '@shared/chat-message-origin.js';
 import { ExpandableTaskObjective } from './ExpandableTaskObjective.js';
 import {
   CHAT_MOUNT_SETTLE_MS,
@@ -2112,6 +2113,8 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       if (e.type !== 'user.message') continue;
       const p = e.payload as Record<string, unknown>;
       if (p.pending === true || p.failed === true) continue;
+      // The banner pins what the human sent, not an agent delivery or injection.
+      if (classifyUserMessageOrigin(p) !== CHAT_MESSAGE_ORIGINS.USER) continue;
       const text = typeof p.text === 'string' ? p.text : '';
       if (!text.trim()) continue;
       return { eventId: e.eventId, text, ts: e.ts, actorLabel: formatSharedActorLabel(t, p.sharedActor) };
@@ -4943,12 +4946,16 @@ const ChatEvent = memo(function ChatEvent({
   switch (event.type) {
     case 'user.message': {
       const rawUserText = String(event.payload.text ?? '');
+      // Only the human's own input sits on the right; agent deliveries and
+      // daemon injections are incoming messages and sit on the left.
+      const origin = classifyUserMessageOrigin(event.payload);
+      const originClass = ` chat-user-origin-${origin}`;
       const cronRun = event.source === 'daemon' && event.confidence === 'high'
         ? readCronRunTimelineProjection(event.payload[CRON_RUN_TIMELINE.PAYLOAD_KEY])
         : undefined;
       if (cronRun) {
         return (
-          <div class="chat-event chat-user chat-user-cron-run" data-event-id={event.eventId}>
+          <div class={`chat-event chat-user chat-user-cron-run${originClass}`} data-event-id={event.eventId} data-message-origin={origin}>
             <CronRunCard run={cronRun} locale={locale} />
             <ChatTime ts={event.ts} />
           </div>
@@ -4957,7 +4964,7 @@ const ChatEvent = memo(function ChatEvent({
       const supervisionPromptLabelKey = supervisionUserPromptLabelKey(event.payload);
       if (supervisionPromptLabelKey) {
         return (
-          <div class="chat-event chat-user chat-user-supervision-prompt" data-event-id={event.eventId}>
+          <div class={`chat-event chat-user chat-user-supervision-prompt${originClass}`} data-event-id={event.eventId} data-message-origin={origin}>
             <SupervisionAutomationPrompt
               text={rawUserText}
               label={t(supervisionPromptLabelKey)}
@@ -4986,7 +4993,7 @@ const ChatEvent = memo(function ChatEvent({
         // data-event-id lets the pinned-last-message banner target this bubble
         // with an IntersectionObserver so the banner only shows when the real
         // bubble has scrolled off the top of the viewport.
-        <div class={`chat-event chat-user${stateClass}`} data-event-id={event.eventId}>
+        <div class={`chat-event chat-user${originClass}${stateClass}`} data-event-id={event.eventId} data-message-origin={origin}>
           {sharedActorLabel && (
             <div class="chat-shared-actor-label" title={sharedActorLabel}>
               {sharedActorLabel}

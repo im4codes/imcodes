@@ -44,6 +44,8 @@ vi.mock('../../src/hooks/usePref.js', () => ({
 }));
 
 import { ChatView } from '../../src/components/ChatView.js';
+import { AGENT_DELEGATION_SENDER_MARKER } from '../../../shared/agent-delegation.js';
+import { TASK_PAIR_AUTOMATION_KIND } from '../../../shared/task-pair.js';
 import type { TimelineEvent } from '../../src/ws-client.js';
 
 type IOObserverCallback = (entries: IntersectionObserverEntry[]) => void;
@@ -203,6 +205,31 @@ describe('ChatView — pinned last-sent banner', () => {
     const banner = container.querySelector('.chat-pinned-last-sent') as HTMLElement | null;
     expect(banner).not.toBeNull();
     expect(banner!.textContent).toContain('investigate the recall latency regression');
+  });
+
+  it('pins the human message, not a later agent delivery or daemon injection', async () => {
+    const agentDelivery = `${AGENT_DELEGATION_SENDER_MARKER}\nMessage from IM.codes session: deck_sub_peer (label: Cx2)\n\n收到，本次复审已结束。`;
+    const events = [
+      userEvent('u1', 'ship the settings page', 1000),
+      assistantEvent('a1', 'On it.', 2000),
+      { ...userEvent('u2', agentDelivery, 3000) },
+      { ...userEvent('u3', 'pair nudge', 4000), payload: { text: 'pair nudge', automation: true, automationKind: TASK_PAIR_AUTOMATION_KIND } } as TimelineEvent,
+    ];
+    const { container } = render(
+      <ChatView events={events} loading={false} sessionId="deck_demo_brain" />,
+    );
+    await waitFor(() => expect(instances.length).toBeGreaterThan(0));
+    act(() => {
+      instances[instances.length - 1].fire([{
+        isIntersecting: false,
+        boundingClientRect: { bottom: -10, top: -30, height: 20, width: 100, left: 0, right: 100 } as DOMRectReadOnly,
+        rootBounds: { top: 0, bottom: 500, height: 500, width: 500, left: 0, right: 500 } as DOMRectReadOnly,
+      }]);
+    });
+    const banner = container.querySelector('.chat-pinned-last-sent') as HTMLElement | null;
+    expect(banner).not.toBeNull();
+    expect(banner!.textContent).toContain('ship the settings page');
+    expect(banner!.textContent).not.toContain('收到');
   });
 
   it('uses the latest recent memory Problem as the pinned preview when available', async () => {

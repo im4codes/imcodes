@@ -1,3 +1,4 @@
+import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../shared/chat-message-origin.js';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ── Hoisted mocks ─────────────────────────────────────────────────────────────
@@ -200,6 +201,8 @@ describe('executeCronJob', () => {
         userMessageMetadata: {
           allowDuplicate: true,
           memoryExcluded: true,
+          // A scheduled run renders as a system message, not the human's input.
+          [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.SYSTEM,
           cronRun: expect.objectContaining({
             scheduleId: 'job-progress-1',
             name: 'Check implementation progress',
@@ -405,7 +408,7 @@ describe('executeCronJob', () => {
     expect(clientMessageId).toBe('cron:job-registered-transport:run-transport-1:attempt:1');
     expect(attachments).toBeUndefined();
     expect(preamble).toBeUndefined();
-    expect(metadata).toEqual({ timelineCommitted: true });
+    expect(metadata).toEqual({ timelineCommitted: true, messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM });
   });
 
   it('sends command to transport session via runtime.send(), skipping busy check', async () => {

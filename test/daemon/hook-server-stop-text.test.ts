@@ -8,6 +8,7 @@
  * "/stop isn't available in this environment." while the turn kept going,
  * violating the transport command liveness mandate (CLAUDE.md).
  */
+import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../shared/chat-message-origin.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
 
@@ -154,6 +155,7 @@ describe('hook-server /send with "/stop" text', () => {
     expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith(
       'deck_alpha_w1',
       `${buildAgentDelegationSenderLine('deck_alpha_brain')}\n\n请解释 /stop 命令的作用`,
+      { userMessageMetadata: { [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.AGENT } },
     );
   });
 });

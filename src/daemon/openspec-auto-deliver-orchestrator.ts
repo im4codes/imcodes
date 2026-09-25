@@ -1,3 +1,4 @@
+import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../shared/chat-message-origin.js';
 import { lstat, mkdir, readdir, readFile, realpath, stat } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -437,6 +438,8 @@ function queueAutoDeliverPromptForTransportResend(
     text: prompt,
     commandId,
     clientMessageId: `auto-deliver:${randomUUID()}`,
+    // Projected when the resend drains; a daemon prompt, not the human's input.
+    messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
     queuedAt: Date.now(),
   });
   if (!enqueueResult.accepted) {
@@ -487,12 +490,15 @@ async function sendAutoDeliverPromptToImplementationSession(
   }
   try {
     preemptBusyRuntimeBeforeAutoDeliverPrompt(run, runtime);
-    const result = runtime.send(prompt, commandId);
+    // The origin rides a queued copy too: the drain projects its user.message.
+    const result = runtime.send(prompt, commandId, undefined, undefined, { messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM });
     if (result === 'sent') {
       timelineEmitter.emit(run.targetImplementationSessionName, 'user.message', {
         text: prompt,
         allowDuplicate: true,
         commandId,
+        // A daemon prompt, not the human's input (shared/chat-message-origin.ts).
+        [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.SYSTEM,
       }, { source: 'daemon', confidence: 'high', eventId: `openspec-auto:${commandId}` });
     }
     if (result === 'queued') {

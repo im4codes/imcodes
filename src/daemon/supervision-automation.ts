@@ -1,3 +1,4 @@
+import { CHAT_MESSAGE_ORIGINS } from '../../shared/chat-message-origin.js';
 import { isPairsEngineProject, isSessionCoveredByPairHeartbeat } from './task-pairs/engine.js';
 import { readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
@@ -181,6 +182,9 @@ function isBrainOwnedAutomaticSupervision(
  * regress a session whose own transportConfig already has a real pool, so it
  * is applied only once the cache itself is genuinely 'configured'.
  */
+
+/** Daemon-authored prompts: a queued copy must not project as the human's input. */
+const SYSTEM_ORIGIN_SEND = { messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM } as const;
 export function enrichSnapshotWithGlobalDefaults(
   snapshot: SessionSupervisionSnapshot,
 ): SessionSupervisionSnapshot {
@@ -1418,6 +1422,7 @@ class SupervisionAutomation {
       );
       const admission = runtime.send(prompt, clientMessageId, undefined, undefined, {
         timelineCommitted: true,
+        messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
         deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
       });
       // NEITHER disposition is evidence of delivery on its own.
@@ -2020,6 +2025,7 @@ class SupervisionAutomation {
         try {
           runtime.send(prompt, clientMessageId, undefined, undefined, {
             timelineCommitted: true,
+            messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
             deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
           });
         } catch (error) {
@@ -3727,7 +3733,7 @@ class SupervisionAutomation {
     const clientMessageId = `${SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND}:${attemptId}:${recoveryNumber}`;
     run.auditTargetRecoveryAttempts = recoveryNumber;
     try {
-      runtime.send(recoveryPrompt, clientMessageId);
+      runtime.send(recoveryPrompt, clientMessageId, undefined, undefined, SYSTEM_ORIGIN_SEND);
       timelineEmitter.emit(
         targetName,
         'user.message',
@@ -4944,7 +4950,7 @@ class SupervisionAutomation {
       { source: 'daemon', confidence: 'high', eventId: `${SUPERVISION_AUDIT_DELEGATION_AUTOMATION_KIND}:${current.generation}:${current.auditAttemptId}` },
     );
     try {
-      transportRuntime.send(orchestrationPrompt, `${SUPERVISION_AUDIT_DELEGATION_AUTOMATION_KIND}-${current.generation}`);
+      transportRuntime.send(orchestrationPrompt, `${SUPERVISION_AUDIT_DELEGATION_AUTOMATION_KIND}-${current.generation}`, undefined, undefined, SYSTEM_ORIGIN_SEND);
     } catch (error) {
       logger.warn({ session: current.sessionName, err: error }, 'Automatic audit orchestration dispatch failed');
       this.emitOrchestratedAuditResult(current, 'target_unavailable', 'dispatch_failed');
@@ -5107,7 +5113,7 @@ class SupervisionAutomation {
       // before send so even a synchronous running/idle projection is bounded;
       // the catch path terminates the run if admission itself fails.
       current.ignoreIdleUntilPostAuditTurnActivity = false;
-      transportRuntime.send(reworkBrief, `${PEER_AUDIT_REWORK_AUTOMATION_KIND}-${current.generation}-${current.reworkDispatches}`);
+      transportRuntime.send(reworkBrief, `${PEER_AUDIT_REWORK_AUTOMATION_KIND}-${current.generation}-${current.reworkDispatches}`, undefined, undefined, SYSTEM_ORIGIN_SEND);
       this.emitTerminalStatus(current.sessionName, 'supervision_rework_sent', SUPERVISION_REWORK_LABEL);
     } catch (error) {
       logger.warn({ session: current.sessionName, err: error }, 'Peer audit rework dispatch failed');
@@ -5151,6 +5157,9 @@ class SupervisionAutomation {
       transportRuntime.send(
         correctionPrompt,
         `supervision-audit-marker-correction-${current.generation}-${correctionNumber}`,
+        undefined,
+        undefined,
+        SYSTEM_ORIGIN_SEND,
       );
       this.emitAutomationNote(
         current.sessionName,
@@ -5226,7 +5235,7 @@ class SupervisionAutomation {
     );
 
     try {
-      transportRuntime.send(continuePrompt, `${SUPERVISION_CONTINUE_AUTOMATION_KIND}-${run.generation}-${current.continueLoops}`);
+      transportRuntime.send(continuePrompt, `${SUPERVISION_CONTINUE_AUTOMATION_KIND}-${run.generation}-${current.continueLoops}`, undefined, undefined, SYSTEM_ORIGIN_SEND);
       if (postAuditFinalization) {
         if (this.automaticPeerAuditCompatibilityForTests) {
           this.emitAutomationNote(run.sessionName, '✅ Peer audit passed. Auto is now running the deferred commit/push finalization.', 'supervision-post-audit-finalization-status');

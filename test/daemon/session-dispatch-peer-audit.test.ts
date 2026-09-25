@@ -1,3 +1,4 @@
+import { CHAT_MESSAGE_ORIGINS } from '../../shared/chat-message-origin.js';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SessionRecord } from '../../src/store/session-store.js';
 
@@ -106,7 +107,11 @@ describe('peer-audit dedicated dispatch', () => {
       expect.any(String),
       undefined,
       undefined,
-      { peerAudit: { contractVersion: 'peer_audit_v1', attemptHash: expect.any(String) } },
+      {
+        // A queued brief drains as the daemon's message, not the human's input.
+        messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+        peerAudit: { contractVersion: 'peer_audit_v1', attemptHash: expect.any(String) },
+      },
     );
   });
 

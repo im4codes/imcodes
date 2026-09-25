@@ -2,6 +2,7 @@
  * Daemon-side cron job executor.
  * Receives dispatched cron jobs and sends commands to target sessions.
  */
+import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../shared/chat-message-origin.js';
 import type { CronCommandResultMessage, CronDispatchMessage, CronParticipant } from '../../shared/cron-types.js';
 import {
   buildCompactCronControlRef,
@@ -216,12 +217,14 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
           const clientMessageId = `cron:${jobId}:${executionId ?? 'dispatch'}:attempt:${attempt}`;
           await transportRuntime.send(command, clientMessageId, undefined, undefined, {
             timelineCommitted: true,
+            messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
           });
           if (!timelineProjected && cronRun) {
             timelineEmitter.emit(name, 'user.message', {
               text: command,
               allowDuplicate: true,
               cronRun,
+              [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.SYSTEM,
             }, { source: 'daemon', confidence: 'high' });
             timelineProjected = true;
           }
@@ -264,6 +267,8 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
           userMessageMetadata: {
             allowDuplicate: true,
             memoryExcluded: true,
+            // A scheduled run, not the human's input, even without a run projection.
+            messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
             ...(cronRun ? { cronRun } : {}),
           },
         });

@@ -19,6 +19,7 @@
  *     discard pending work (`/stop`, `/clear`, session removal).
  */
 
+import type { ChatMessageOrigin } from '../../shared/chat-message-origin.js';
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import type { AliasSendAudit } from '../../shared/alias-types.js';
@@ -67,6 +68,8 @@ export interface ResendEntry {
   providerText?: string;
   /** Alias send audit anchor (names + hash only) to project when this is finally delivered. */
   aliasAudit?: AliasSendAudit;
+  /** Author of a non-human message (shared/chat-message-origin.ts), projected when delivered. */
+  messageOrigin?: ChatMessageOrigin;
   /** Provider-visible context to pass through TransportSessionRuntime messagePreamble. */
   messagePreamble?: string;
   /** Original clientMessageId so command.ack correlation survives the resend. */
@@ -201,6 +204,7 @@ function enqueueResendInternal(
     text: normalizedEntry.text,
     ...(normalizedEntry.providerText != null ? { providerText: normalizedEntry.providerText } : {}),
     ...(normalizedEntry.aliasAudit ? { aliasAudit: normalizedEntry.aliasAudit } : {}),
+    ...(normalizedEntry.messageOrigin ? { messageOrigin: normalizedEntry.messageOrigin } : {}),
     ...(normalizedEntry.messagePreamble ? { messagePreamble: normalizedEntry.messagePreamble } : {}),
     ...(normalizedEntry.attachments?.length ? { attachmentRefs: normalizedEntry.attachments } : {}),
     ...(normalizedEntry.sharedActor ? { sharedActorEnvelope: normalizedEntry.sharedActor } : {}),

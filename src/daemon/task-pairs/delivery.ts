@@ -7,6 +7,7 @@
  * as an automation row. A message for a pair is skipped while an earlier
  * message for the same pair and reason is still queued, so nothing piles up.
  */
+import { CHAT_MESSAGE_ORIGINS } from '../../../shared/chat-message-origin.js';
 import { randomUUID } from 'node:crypto';
 import { getSession } from '../../store/session-store.js';
 import { timelineEmitter } from '../timeline-emitter.js';
@@ -89,6 +90,7 @@ export async function sendTaskPairMessage(
       messageId: messageId as SendMessageId,
       durableQueue: true,
       suppressTimeline: true,
+      messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
     });
     return result === 'queued' ? 'queued' : 'sent';
   } catch (error) {

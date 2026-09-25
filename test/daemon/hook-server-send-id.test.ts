@@ -1,3 +1,4 @@
+import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../shared/chat-message-origin.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
 import { isSendDispatchId, isSendMessageId } from '../../shared/send-message-id.js';
@@ -121,6 +122,7 @@ describe('hook-server /send ids', () => {
     expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith(
       'deck_alpha_w1',
       `${buildAgentDelegationSenderLine('deck_alpha_brain')}\n\nhello`,
+      { userMessageMetadata: { [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.AGENT } },
     );
   });
 
