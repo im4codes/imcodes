@@ -24,11 +24,16 @@ import {
   IMCODES_MEMORY_MCP_LAUNCH_ARGS,
   IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
 } from '../../src/agent/providers/getDefaultMcpServers.js';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createIdempotentShutdown, installMcpStdioLifecycle } from '../../src/daemon/mcp-stdio-lifecycle.js';
+import {
+  MCP_STDIO_SHUTDOWN_REASON,
+  createIdempotentShutdown,
+  installMcpStdioLifecycle,
+  type McpStdioShutdownReason,
+} from '../../src/daemon/mcp-stdio-lifecycle.js';
 
 const repoRoot = fileURLToPath(new URL('../..', import.meta.url));
 const isWin = process.platform === 'win32';
@@ -94,6 +99,13 @@ function childEnv(home: string, extra: Record<string, string> = {}): NodeJS.Proc
     IMCODES_HOME: home,
     ...extra,
   };
+}
+
+/** The durable exit record the bootstrap writes (never visible in daemon.log). */
+function lifecycleEvents(home: string): Array<Record<string, unknown>> {
+  const path = join(home, 'logs', 'mcp-lifecycle.log');
+  if (!existsSync(path)) return [];
+  return readFileSync(path, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
 function pidAlive(pid: number): boolean {
@@ -354,6 +366,52 @@ describeOrSkip('memory MCP stdio lifecycle (subprocess)', () => {
       expect(await waitForReady(child, 60_000)).toBe(true);
       child.stdin?.end();
       expect(await waitForExit(child, 15_000), 'EOF must still terminate the server').not.toBeNull();
+      expect(lifecycleEvents(home), 'an exit must never be invisible again').toContainEqual(expect.objectContaining({
+        event: 'bootstrap_exit',
+        pid: child.pid,
+        reason: expect.stringMatching(/^stdin_(end|close)$/),
+      }));
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+    }
+  }, 90_000);
+
+  it('records who killed it (signal) and registers a provider-hosted lifetime when declared', async () => {
+    // The Codex thread's MCP child is declared provider-hosted; the registry row
+    // must carry it so relaunch cleanup / orphan sweep leave it alone, and a
+    // SIGTERM from anyone must leave a trace naming the session.
+    const home = isolatedHome();
+    const child = spawn(process.execPath, mcpArgs(), {
+      cwd: repoRoot, stdio: ['pipe', 'pipe', 'pipe'],
+      env: childEnv(home, {
+        IMCODES_SESSION: 'deck_lifecycletest_w1',
+        IMCODES_RESOURCE_SESSION_INSTANCE_ID: 'instance-life',
+        IMCODES_RESOURCE_RUNTIME_EPOCH: 'epoch-life',
+        IMCODES_MCP_HOST_LIFETIME: 'provider_host',
+      }),
+    });
+    try {
+      child.stdin?.write(INITIALIZE);
+      expect(await waitForReady(child, 60_000)).toBe(true);
+      const rowsDir = join(home, 'session-resources');
+      const bootstrapRow = () => (existsSync(rowsDir) ? readdirSync(rowsDir) : [])
+        .filter((name) => name.endsWith('.json'))
+        .map((name) => JSON.parse(readFileSync(join(rowsDir, name), 'utf8')) as Record<string, any>)
+        .find((row) => row.resourceId === `mcp-bootstrap:epoch-life:${child.pid}`);
+      expect(await waitFor(() => bootstrapRow() !== undefined, 30_000)).toBe(true);
+      expect(bootstrapRow()?.lifetime).toBe('provider_host');
+
+      child.kill('SIGTERM');
+      expect(await waitForExit(child, 15_000)).not.toBeNull();
+      expect(lifecycleEvents(home)).toContainEqual(expect.objectContaining({
+        event: 'bootstrap_exit',
+        pid: child.pid,
+        reason: 'SIGTERM',
+        session: 'deck_lifecycletest_w1',
+        runtimeEpoch: 'epoch-life',
+        lifetime: 'provider_host',
+      }));
     } finally {
       if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
       rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
@@ -428,6 +486,35 @@ describe('installMcpStdioLifecycle', () => {
     await new Promise((r) => { const t = setTimeout(r, 0); t.unref?.(); });
     expect(shutdowns, 'EOF alone must tear the server down').toBe(1);
     expect(exits).toBe(1);
+  });
+
+  it('reports exactly one shutdown reason per trigger kind', async () => {
+    const cases: Array<[McpStdioShutdownReason, (stdin: ReturnType<typeof fakeStdin>, tick: () => void, setPpid: (pid: number) => void) => void, number | undefined]> = [
+      [MCP_STDIO_SHUTDOWN_REASON.STDIN_END, (stdin) => stdin.emit('end'), undefined],
+      [MCP_STDIO_SHUTDOWN_REASON.STDIN_CLOSE, (stdin) => stdin.emit('close'), undefined],
+      [MCP_STDIO_SHUTDOWN_REASON.PARENT_EXITED, (_stdin, tick, setPpid) => { setPpid(1); tick(); }, undefined],
+      [MCP_STDIO_SHUTDOWN_REASON.DECLARED_PARENT_MISMATCH, () => {}, 999],
+    ];
+    for (const [expected, fire, expectedParentPid] of cases) {
+      const stdin = fakeStdin();
+      let ppid = 100;
+      let tick: () => void = () => {};
+      const reasons: string[] = [];
+      installMcpStdioLifecycle({
+        stdin,
+        shutdown: async () => {},
+        exit: () => {},
+        getParentPid: () => ppid,
+        initialParentPid: 100,
+        ...(expectedParentPid !== undefined ? { expectedParentPid } : {}),
+        setIntervalFn: (handler) => { tick = handler; return {}; },
+        onShutdown: (reason) => { reasons.push(reason); },
+      });
+      fire(stdin, tick, (pid) => { ppid = pid; });
+      stdin.emit('close');
+      await new Promise((r) => { const t = setTimeout(r, 0); t.unref?.(); });
+      expect(reasons, expected).toEqual([expected]);
+    }
   });
 
   it('ignores a poll callback that was already queued when the guard stopped', async () => {

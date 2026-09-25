@@ -7,10 +7,13 @@ import { promisify } from 'node:util';
 import {
   SESSION_RESOURCE_HANDLE_TYPE,
   SESSION_RESOURCE_KIND,
+  SESSION_RESOURCE_LIFETIME,
   SESSION_RESOURCE_RELEASE_REASON,
   type SessionResourceKind,
+  type SessionResourceLifetime,
   type SessionResourceOwnerIdentity,
 } from '../../shared/session-resource-lifecycle.js';
+import { MCP_LIFECYCLE_EVENT, appendMcpLifecycleEvent, mcpLifecycleLogPath } from './mcp-lifecycle-log.js';
 
 const execFile = promisify(execFileCallback);
 const RECORD_VERSION = 1;
@@ -34,6 +37,8 @@ export interface SessionResourceRegistration {
   handle: SessionResourceHandle;
   ttlMs?: number;
   idleTimeoutMs?: number;
+  /** Absent means RUNTIME. See SESSION_RESOURCE_LIFETIME. */
+  lifetime?: SessionResourceLifetime;
 }
 
 export interface SessionResourceRecord extends SessionResourceRegistration {
@@ -58,6 +63,12 @@ export interface SessionResourceRegistryOptions {
   } | undefined>;
   tmuxIdentityTimeoutMs?: number;
   pidHandleIsCurrent?: typeof sessionResourcePidHandleIsCurrent;
+  /**
+   * Where MCP releases are recorded. Defaults to the shared lifecycle log for
+   * the default (production) registry only; an injected `directory` without an
+   * explicit path records nothing, so fixtures never write to the real home.
+   */
+  lifecycleLogPath?: string | null;
 }
 
 export interface ReleaseSummary {
@@ -118,6 +129,34 @@ function validKind(value: unknown): value is SessionResourceKind {
   return Object.values(SESSION_RESOURCE_KIND).includes(value as SessionResourceKind);
 }
 
+function validLifetime(value: unknown): value is SessionResourceLifetime | undefined {
+  return value === undefined
+    || Object.values(SESSION_RESOURCE_LIFETIME).includes(value as SessionResourceLifetime);
+}
+
+/**
+ * A provider-hosted MCP process is bound to its host process, not to one
+ * runtime epoch of its owner session: owner-based reaping must leave it alone.
+ */
+function isProviderHosted(record: SessionResourceRecord): boolean {
+  return record.lifetime === SESSION_RESOURCE_LIFETIME.PROVIDER_HOST;
+}
+
+function validProviderHostedRelease(value: unknown): value is ProviderHostedRelease {
+  return Object.values(PROVIDER_HOSTED_RELEASE).includes(value as ProviderHostedRelease);
+}
+
+/** Whether an owner-scoped release covers `record` under the given hosted policy. */
+function ownedForRelease(
+  record: SessionResourceRecord,
+  owner: SessionResourceOwner,
+  providerHosted: ProviderHostedRelease,
+): boolean {
+  if (!isProviderHosted(record)) return ownerKey(record.owner) === ownerKey(owner);
+  return providerHosted === PROVIDER_HOSTED_RELEASE.REAP_ALL_EPOCHS
+    && instanceKey(record.owner) === instanceKey(owner);
+}
+
 function parseRecord(value: unknown): SessionResourceRecord | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
@@ -126,13 +165,33 @@ function parseRecord(value: unknown): SessionResourceRecord | null {
     || typeof record.createdAt !== 'number' || !Number.isFinite(record.createdAt)
     || typeof record.lastUsedAt !== 'number' || !Number.isFinite(record.lastUsedAt)
     || (record.ttlMs !== undefined && !validPositiveDuration(record.ttlMs))
-    || (record.idleTimeoutMs !== undefined && !validPositiveDuration(record.idleTimeoutMs))) return null;
+    || (record.idleTimeoutMs !== undefined && !validPositiveDuration(record.idleTimeoutMs))
+    || !validLifetime(record.lifetime)) return null;
   return record as unknown as SessionResourceRecord;
 }
 
 function ownerKey(owner: SessionResourceOwner): string {
   return JSON.stringify([owner.sessionName, owner.sessionInstanceId, owner.runtimeEpoch]);
 }
+
+/**
+ * One session instance across all of its runtime epochs. A provider-hosted MCP
+ * keeps the epoch its host thread was loaded under, so after a relaunch it is
+ * still this instance's resource while its exact owner key is an old epoch.
+ */
+function instanceKey(owner: SessionResourceOwner): string {
+  return JSON.stringify([owner.sessionName, owner.sessionInstanceId]);
+}
+
+/** What a release does with provider-hosted MCP rows (see SESSION_RESOURCE_LIFETIME). */
+export const PROVIDER_HOSTED_RELEASE = {
+  /** The host thread continues under the new runtime: leave every hosted row alone. */
+  KEEP: 'keep',
+  /** This instance is done with its host thread(s): reap hosted rows of EVERY epoch. */
+  REAP_ALL_EPOCHS: 'reap_all_epochs',
+} as const;
+
+export type ProviderHostedRelease = typeof PROVIDER_HOSTED_RELEASE[keyof typeof PROVIDER_HOSTED_RELEASE];
 
 function recordFileName(resourceId: string): string {
   return `${createHash('sha256').update(resourceId).digest('hex')}.json`;
@@ -271,6 +330,7 @@ export class SessionResourceRegistry {
   private readonly tmuxIdentityTimeoutMs: number;
   private readonly requiresStrongHandles: boolean;
   private readonly pidHandleIsCurrent: typeof sessionResourcePidHandleIsCurrent;
+  private readonly lifecycleLogPath: string | null;
   private mutationTail: Promise<void> = Promise.resolve();
 
   constructor(options: SessionResourceRegistryOptions = {}) {
@@ -284,6 +344,9 @@ export class SessionResourceRegistry {
     this.tmuxIdentityTimeoutMs = options.tmuxIdentityTimeoutMs ?? TMUX_IDENTITY_QUERY_TIMEOUT_MS;
     this.pidHandleIsCurrent = options.pidHandleIsCurrent ?? sessionResourcePidHandleIsCurrent;
     this.requiresStrongHandles = options.cleanup === undefined;
+    this.lifecycleLogPath = options.lifecycleLogPath !== undefined
+      ? options.lifecycleLogPath
+      : (options.directory === undefined ? mcpLifecycleLogPath() : null);
   }
 
   private async serialized<T>(operation: () => Promise<T>): Promise<T> {
@@ -378,8 +441,14 @@ export class SessionResourceRegistry {
       if (!boundedString(registration.resourceId) || !validKind(registration.kind)
         || !validOwner(registration.owner) || !validHandle(registration.handle)
         || (registration.ttlMs !== undefined && !validPositiveDuration(registration.ttlMs))
-        || (registration.idleTimeoutMs !== undefined && !validPositiveDuration(registration.idleTimeoutMs))) {
+        || (registration.idleTimeoutMs !== undefined && !validPositiveDuration(registration.idleTimeoutMs))
+        || !validLifetime(registration.lifetime)) {
         throw new Error('invalid_session_resource_registration');
+      }
+      if (registration.lifetime === SESSION_RESOURCE_LIFETIME.PROVIDER_HOST
+        && (registration.kind !== SESSION_RESOURCE_KIND.MCP
+          || registration.handle.type !== SESSION_RESOURCE_HANDLE_TYPE.PID)) {
+        throw new Error('session_resource_lifetime_not_supported');
       }
       if ((registration.ttlMs !== undefined || registration.idleTimeoutMs !== undefined)
         && registration.kind !== SESSION_RESOURCE_KIND.BROWSER
@@ -484,38 +553,77 @@ export class SessionResourceRegistry {
     let released = 0;
     let failed = 0;
     for (const record of records) {
+      let outcome = 'released';
       try {
         await this.cleanup(record, reason);
         await rm(this.pathFor(record.resourceId), { force: true });
         released += 1;
       } catch {
         failed += 1;
+        outcome = 'failed';
+      }
+      if (record.kind === SESSION_RESOURCE_KIND.MCP && this.lifecycleLogPath) {
+        // An MCP child killed here surfaces in its host only as "Transport
+        // closed"; record who released it and why, from the releasing process.
+        appendMcpLifecycleEvent(MCP_LIFECYCLE_EVENT.RESOURCE_RELEASED, {
+          resourceId: record.resourceId,
+          targetPid: record.handle.type === SESSION_RESOURCE_HANDLE_TYPE.PID ? record.handle.pid : undefined,
+          reason,
+          outcome,
+          lifetime: record.lifetime ?? SESSION_RESOURCE_LIFETIME.RUNTIME,
+          session: record.owner.sessionName,
+          sessionInstanceId: record.owner.sessionInstanceId,
+          runtimeEpoch: record.owner.runtimeEpoch,
+        }, this.lifecycleLogPath);
       }
     }
     return { released, failed };
   }
 
-  async releaseOwner(owner: SessionResourceOwner, reason: string): Promise<ReleaseSummary> {
-    if (!validOwner(owner) || !boundedString(reason)) throw new Error('invalid_session_resource_release');
-    return this.serialized(async () => {
-      const key = ownerKey(owner);
-      return this.releaseRecords((await this.listUnlocked()).filter((record) => ownerKey(record.owner) === key), reason);
-    });
+  /**
+   * Release everything `owner` holds. Provider-hosted MCP rows of the same
+   * instance are reaped at EVERY epoch by default: a stop/delete ends this
+   * instance's use of its host thread, and a hosted child registered under an
+   * earlier epoch (the host thread was loaded before a relaunch) would otherwise
+   * outlive the session with no reaper. A later resume of that thread re-spawns
+   * its server through the provider's pre-turn probe/reload.
+   */
+  async releaseOwner(
+    owner: SessionResourceOwner,
+    reason: string,
+    providerHosted: ProviderHostedRelease = PROVIDER_HOSTED_RELEASE.REAP_ALL_EPOCHS,
+  ): Promise<ReleaseSummary> {
+    if (!validOwner(owner) || !boundedString(reason) || !validProviderHostedRelease(providerHosted)) {
+      throw new Error('invalid_session_resource_release');
+    }
+    return this.serialized(async () => this.releaseRecords(
+      (await this.listUnlocked()).filter((record) => ownedForRelease(record, owner, providerHosted)),
+      reason,
+    ));
   }
 
+  /**
+   * Release only `kinds` (child cleanup at relaunch). The caller must say
+   * whether the provider host thread continues: KEEP when the new runtime
+   * resumes the same, still-loaded thread (its hosted MCP never respawns if
+   * reaped), REAP_ALL_EPOCHS when the relaunch abandons it (fresh thread,
+   * different agent) so no hosted child of any earlier epoch is stranded.
+   */
   async releaseOwnerKinds(
     owner: SessionResourceOwner,
     kinds: readonly SessionResourceKind[],
     reason: string,
+    providerHosted: ProviderHostedRelease,
   ): Promise<ReleaseSummary> {
-    if (!validOwner(owner) || !boundedString(reason) || kinds.length === 0 || !kinds.every(validKind)) {
+    if (!validOwner(owner) || !boundedString(reason) || kinds.length === 0 || !kinds.every(validKind)
+      || !validProviderHostedRelease(providerHosted)) {
       throw new Error('invalid_session_resource_release');
     }
     return this.serialized(async () => {
-      const key = ownerKey(owner);
       const selected = new Set(kinds);
       return this.releaseRecords(
-        (await this.listUnlocked()).filter((record) => ownerKey(record.owner) === key && selected.has(record.kind)),
+        (await this.listUnlocked()).filter((record) => selected.has(record.kind)
+          && ownedForRelease(record, owner, providerHosted)),
         reason,
       );
     });
@@ -561,6 +669,9 @@ export class SessionResourceRegistry {
       const eligible = options.eligibleOwners
         ? new Set(options.eligibleOwners.map(ownerKey))
         : null;
+      const eligibleInstances = options.eligibleOwners
+        ? new Set(options.eligibleOwners.map(instanceKey))
+        : null;
       const records = await this.listUnlocked();
       const invalidPidResources = new Set((await Promise.all(records.map(async (record) => {
         if (record.handle.type !== SESSION_RESOURCE_HANDLE_TYPE.PID || !record.handle.processStart) return null;
@@ -573,6 +684,16 @@ export class SessionResourceRegistry {
       const now = this.now();
       const orphans = records.filter((record) => {
         const key = ownerKey(record.owner);
+        if (isProviderHosted(record)) {
+          // Owner state (stopped/error) says nothing about a provider-hosted
+          // MCP: its host thread may still be live and serving turns (e.g. a
+          // cron turn into a stopped session). Only a provably exited/reused
+          // pid is stale. Eligibility is by INSTANCE: the row keeps the epoch
+          // its thread was loaded under, which a relaunch has since replaced.
+          if (eligibleInstances && !eligibleInstances.has(instanceKey(record.owner))) return false;
+          if (now - record.createdAt < minimumAgeMs) return false;
+          return invalidPidResources.has(record.resourceId);
+        }
         if (eligible && !eligible.has(key)) return false;
         if (now - record.createdAt < minimumAgeMs) return false;
         return !active.has(key) || invalidPidResources.has(record.resourceId);

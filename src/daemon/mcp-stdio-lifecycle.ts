@@ -27,6 +27,8 @@
  * outage; only a CHANGE proves the original parent is gone.
  */
 
+import { MCP_BOOTSTRAP_EXIT_REASON } from './mcp-lifecycle-log.js';
+
 /**
  * The parent observed at module evaluation, before any awaited startup work.
  *
@@ -44,6 +46,16 @@
  * own identity.
  */
 export const MCP_PROCESS_START_PARENT_PID = process.ppid;
+
+/** Why the guard is shutting the server down (reported via `onShutdown`). */
+export const MCP_STDIO_SHUTDOWN_REASON = {
+  STDIN_END: MCP_BOOTSTRAP_EXIT_REASON.STDIN_END,
+  STDIN_CLOSE: MCP_BOOTSTRAP_EXIT_REASON.STDIN_CLOSE,
+  PARENT_EXITED: MCP_BOOTSTRAP_EXIT_REASON.PARENT_EXITED,
+  DECLARED_PARENT_MISMATCH: MCP_BOOTSTRAP_EXIT_REASON.DECLARED_PARENT_MISMATCH,
+} as const;
+
+export type McpStdioShutdownReason = typeof MCP_STDIO_SHUTDOWN_REASON[keyof typeof MCP_STDIO_SHUTDOWN_REASON];
 
 /**
  * Env var through which a spawner declares its own pid to this server.
@@ -83,6 +95,11 @@ export interface McpStdioLifecycleOptions {
   expectedParentPid?: number;
   /** Called once the guard is armed, so a caller can report it. */
   onArmed?: (parentPid: number) => void;
+  /**
+   * Called once, synchronously, when the guard decides to shut down and why --
+   * before teardown starts, so the reason survives even if teardown hangs.
+   */
+  onShutdown?: (reason: McpStdioShutdownReason, detail: { parentPid: number }) => void;
   /** Bounded poll period. Defaults to 30s: a leaked process wastes a machine
    *  for days, so detection latency is irrelevant next to the cost of polling. */
   parentPollMs?: number;
@@ -118,23 +135,24 @@ export function installMcpStdioLifecycle(options: McpStdioLifecycleOptions): () 
 
   // `shutdown` is documented idempotent, but this module must not depend on
   // that: EOF and a parent-loss tick can land in the same turn of the loop.
-  const trigger = () => {
+  const trigger = (reason: McpStdioShutdownReason) => {
     if (triggered) return;
     triggered = true;
     stop();
+    try { options.onShutdown?.(reason, { parentPid: options.getParentPid() }); } catch { /* reporting only */ }
     void options.shutdown()
       .catch(() => { /* teardown is best-effort; exiting still matters */ })
       .finally(() => options.exit(0));
   };
 
-  function onEnd(): void { trigger(); }
-  function onClose(): void { trigger(); }
+  function onEnd(): void { trigger(MCP_STDIO_SHUTDOWN_REASON.STDIN_END); }
+  function onClose(): void { trigger(MCP_STDIO_SHUTDOWN_REASON.STDIN_CLOSE); }
 
   options.stdin.on('end', onEnd);
   options.stdin.on('close', onClose);
 
   timer = setIntervalFn(() => {
-    if (options.getParentPid() !== options.initialParentPid) trigger();
+    if (options.getParentPid() !== options.initialParentPid) trigger(MCP_STDIO_SHUTDOWN_REASON.PARENT_EXITED);
   }, pollMs);
   // Never let the guard itself be the reason the process stays alive.
   timer.unref?.();
@@ -146,7 +164,7 @@ export function installMcpStdioLifecycle(options: McpStdioLifecycleOptions): () 
   // the post-reparent value against itself forever, so decide it here instead.
   if (options.expectedParentPid !== undefined
     && options.getParentPid() !== options.expectedParentPid) {
-    trigger();
+    trigger(MCP_STDIO_SHUTDOWN_REASON.DECLARED_PARENT_MISMATCH);
   }
 
   return stop;

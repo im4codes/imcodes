@@ -83,6 +83,8 @@ import {
 import type { NativeAgentFenceResolver } from '../transport-provider.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
+import { IMCODES_MCP_HOST_LIFETIME_ENV, SESSION_RESOURCE_LIFETIME } from '../../../shared/session-resource-lifecycle.js';
+import { MEMORY_MCP_TOOL_NAMES } from '../../../shared/memory-mcp-contracts.js';
 import { IMCODES_DELEGATION_UNAVAILABLE_MESSAGE } from '../../../shared/delegation-availability.js';
 import {
   AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
@@ -260,10 +262,13 @@ function imcodesDelegationServerConnected(server: Record<string, unknown>): bool
 const MCP_STATUS_PAGE_LIMIT = 20;
 const CODEX_MCP_RPC_METHOD = {
   RELOAD: 'config/mcpServer/reload',
+  TOOL_CALL: 'mcpServer/tool/call',
   STATUS_LIST: 'mcpServerStatus/list',
   STATUS_UPDATED: 'mcpServer/startupStatus/updated',
 } as const;
 const CODEX_MCP_TERMINAL_STARTUP_STATUS = new Set(['failed', 'cancelled']);
+/** Bound on the pre-turn IM transport probe; a slow answer is "alive", not "dead". */
+const CODEX_IM_MCP_PROBE_TIMEOUT_MS = 2_000;
 
 export class ImcodesDelegationUnavailableError extends Error {
   constructor() {
@@ -1249,7 +1254,12 @@ export function buildCodexMcpThreadConfig(config: SessionConfig): Record<string,
         [IMCODES_MEMORY_MCP_SERVER_NAME]: {
           command: server.command,
           args: server.args,
-          env: server.env,
+          // The server is a child of the SHARED app-server and lives with this
+          // thread, which Codex keeps loaded across our session relaunch (a
+          // resume of a loaded thread never respawns MCP servers). Declare that,
+          // so relaunch cleanup and the orphan sweep never reap it by owner
+          // epoch and strand the thread on "Transport closed".
+          env: { ...server.env, [IMCODES_MCP_HOST_LIFETIME_ENV]: SESSION_RESOURCE_LIFETIME.PROVIDER_HOST },
         },
       },
     } : {}),
@@ -1426,13 +1436,17 @@ function meaningfulString(value: unknown): string | undefined {
   return trimmed.length <= CODEX_COLLAB_MAX_ID_CHARS ? trimmed : trimmed.slice(0, CODEX_COLLAB_MAX_ID_CHARS);
 }
 
+/** Codex's wording for an MCP server whose stdio transport is gone. */
+function isClosedMcpTransportMessage(message: string): boolean {
+  return /(?:^|\b)(?:transport|connection|stdio) (?:is )?closed(?:\b|$)/i.test(message)
+    || /MCP client is not connected/i.test(message);
+}
+
 function isImcodesMcpTransportClosedItem(item: Record<string, any>): boolean {
   if (item.type !== 'mcpToolCall'
     || meaningfulString(item.server) !== IMCODES_DELEGATION_MCP_SERVER
     || meaningfulString(item.status) !== 'failed') return false;
-  const message = meaningfulString(item.error?.message) ?? meaningfulString(item.error) ?? '';
-  return /(?:^|\b)(?:transport|connection|stdio) (?:is )?closed(?:\b|$)/i.test(message)
-    || /MCP client is not connected/i.test(message);
+  return isClosedMcpTransportMessage(meaningfulString(item.error?.message) ?? meaningfulString(item.error) ?? '');
 }
 
 function meaningfulStringArray(value: unknown): { values: string[]; malformed: boolean } {
@@ -3337,6 +3351,51 @@ export class CodexSdkProvider implements TransportProvider {
     }
   }
 
+  /**
+   * Pre-turn self-heal for EVERY session (not only a delegating Brain).
+   *
+   * Codex never respawns a thread's stdio MCP server on its own: once the
+   * process is gone, every IM tool call in that thread fails with "Transport
+   * closed" -- including across a `thread/resume`, which is a no-op for a
+   * loaded thread. Probe the thread's live IM transport with one read-only tool
+   * call and reload before the turn when it is closed, so the turn gets a live
+   * IM MCP instead of failing every call.
+   *
+   * The probe is `mcpServer/tool/call` rather than `mcpServerStatus/list`: the
+   * status list spawns a throwaway MCP server (bootstrap + heavy backend) per
+   * call, while a tool call rides the existing pipe, records nothing in the
+   * thread history, and fails immediately on a closed transport. Anything other
+   * than a closed-transport error -- a result, a tool error, a slow cold
+   * backend, an app-server without the method -- is not evidence and never
+   * blocks the turn.
+   */
+  private async healImcodesMcpIfTransportDead(
+    sessionId: string,
+    state: CodexSdkSessionState,
+  ): Promise<void> {
+    const threadId = state.threadId;
+    if (!threadId) return;
+    try {
+      await this.request(CODEX_MCP_RPC_METHOD.TOOL_CALL, {
+        threadId,
+        server: IMCODES_DELEGATION_MCP_SERVER,
+        tool: MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET,
+        arguments: {},
+      }, CODEX_IM_MCP_PROBE_TIMEOUT_MS);
+      return;
+    } catch (error) {
+      if (!isClosedMcpTransportMessage(error instanceof Error ? error.message : String(error))) return;
+    }
+    logger.warn({ provider: this.id, sessionId, threadId },
+      'Codex IM.codes MCP transport is closed on this thread; reloading before the turn');
+    try {
+      await this.recoverImcodesMcpAfterObservedClosure(sessionId, state, 'pre-turn-probe-transport-closed');
+    } catch (error) {
+      logger.warn({ provider: this.id, sessionId, threadId, err: error },
+        'Codex IM.codes MCP reload did not restore the thread; the turn proceeds and the next turn retries');
+    }
+  }
+
   private async reloadImcodesMcpClient(reason: string): Promise<void> {
     if (this.imcodesMcpReload) return this.imcodesMcpReload;
     const child = this.child;
@@ -3642,7 +3701,14 @@ export class CodexSdkProvider implements TransportProvider {
         && desiredSessionSystemText
         && state.lastInjectedSessionSystemText !== desiredSessionSystemText
       );
+      const reusesExistingThread = Boolean(state.threadId);
       await this.ensureThreadLoaded(sessionId, state, payload);
+      // An existing thread may be bound to an IM MCP process that is already
+      // gone (a resume of a loaded thread never respawns it). A thread started
+      // just now spawned a fresh server and has nothing to heal.
+      if (reusesExistingThread && !state.imcodesMcpRecoveryRequired) {
+        await this.healImcodesMcpIfTransportDead(sessionId, state);
+      }
       // A Brain must not begin a turn unless IM delegation is authoritatively
       // usable: with native multi-agent removed at process start there is no
       // fallback, so starting anyway would strand the user's delegation. The
@@ -5109,6 +5175,10 @@ export class CodexSdkProvider implements TransportProvider {
         // The failed MCP write has unknown outcome. Mark the generation stale,
         // but neither replay the call nor reload beneath the current turn. A
         // later explicit send crosses the pre-turn recovery boundary.
+        if (!state.imcodesMcpRecoveryRequired) {
+          logger.warn({ provider: this.id, sessionId, threadId, tool: meaningfulString(item.tool) },
+            'Codex IM.codes MCP call failed with a closed transport; recovery armed for the next turn');
+        }
         state.imcodesMcpRecoveryRequired = true;
       }
       if (closedTurn && item.type !== 'agentMessage') return;

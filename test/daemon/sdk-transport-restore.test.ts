@@ -234,6 +234,7 @@ import {
   setSessionPersistCallback,
 } from '../../src/agent/session-manager.js';
 import { newSession } from '../../src/agent/tmux.js';
+import { releaseSessionChildResources } from '../../src/daemon/session-resource-service.js';
 import { PROVIDER_ERROR_CODES, type ProviderError } from '../../src/agent/transport-provider.js';
 import { clearAllResend, enqueueResend, getResendCount, getResendEntries } from '../../src/daemon/transport-resend-queue.js';
 import { getTransportQueueStore, resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
@@ -1948,6 +1949,53 @@ describe('sdk transport session restore', () => {
     expect(mocks.claudeRuns[0].prompt).toBe('relaunch-msg-1');
     expect(mocks.claudeRuns[1].prompt).toBe('relaunch-msg-2');
   });
+
+  // Re-audit P1 (Transport closed fix): only a relaunch that resumes the SAME
+  // provider thread may keep that thread's provider-hosted MCP child; a fresh
+  // reset or an agent switch abandons the thread and must reap it.
+  for (const [label, previousAgent, fresh, continues] of [
+    ['a non-fresh codex-sdk relaunch resumes the same thread', 'codex-sdk', false, true],
+    ['a fresh (reset) codex-sdk relaunch abandons the old thread', 'codex-sdk', true, false],
+    ['switching agent to codex-sdk abandons the old provider thread', 'claude-code-sdk', false, false],
+  ] as const) {
+    it(`relaunch child cleanup: ${label}`, async () => {
+      const sessionName = `deck_sdk_hosted_${fresh ? 'fresh' : 'keep'}_${previousAgent.replace(/\W/g, '')}_w1`;
+      const createdAt = Date.now() - 10_000;
+      const existing = {
+        name: sessionName,
+        sessionInstanceId: 'hosted-instance',
+        runtimeEpoch: 'hosted-epoch-1',
+        projectName: 'sdkhosted',
+        role: 'w1',
+        agentType: previousAgent,
+        projectDir: '/tmp/sdk-hosted',
+        state: 'idle',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt,
+        updatedAt: createdAt,
+        runtimeType: 'transport',
+        ...(previousAgent === 'codex-sdk' ? { codexSessionId: 'codex-thread-hosted' } : {}),
+      };
+      mocks.store.set(sessionName, existing);
+      vi.mocked(releaseSessionChildResources).mockClear();
+
+      await connectProvider('codex-sdk', {});
+      await launchTransportSession({
+        name: sessionName,
+        projectName: 'sdkhosted',
+        role: 'w1',
+        agentType: 'codex-sdk',
+        projectDir: '/tmp/sdk-hosted',
+        ...(fresh ? { fresh: true } : { codexSessionId: 'codex-thread-hosted' }),
+      });
+
+      expect(releaseSessionChildResources).toHaveBeenCalledWith(
+        expect.objectContaining({ name: sessionName, runtimeEpoch: 'hosted-epoch-1' }),
+        { providerThreadContinues: continues },
+      );
+    });
+  }
 
   it('launchTransportSession resumes and drains a legacy queue only for the original persisted identity', async () => {
     resetTransportQueueStoreForTests();

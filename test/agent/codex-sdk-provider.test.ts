@@ -13,6 +13,8 @@ import { CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../shared/cron-types.js';
 // chance to complete while virtual provider timers are advanced.
 const realSetImmediate = setImmediate;
 let mcpStatusPages: Array<Record<string, unknown>> = [];
+/** Queued `mcpServer/tool/call` errors; an empty queue answers a live transport. */
+let mcpToolCallErrors: string[] = [];
 const realSetTimeout = setTimeout;
 
 const loggerMock = vi.hoisted(() => ({
@@ -133,6 +135,12 @@ const childProcessMock = vi.hoisted(() => {
           }
           if (msg.method === 'config/mcpServer/reload' && typeof msg.id === 'number') {
             childRecord.emits({ id: msg.id, result: {} });
+          }
+          if (msg.method === 'mcpServer/tool/call' && typeof msg.id === 'number') {
+            const toolCallError = mcpToolCallErrors.shift();
+            childRecord.emits(toolCallError
+              ? { id: msg.id, error: { message: toolCallError } }
+              : { id: msg.id, result: { content: [{ type: 'text', text: '{}' }] } });
           }
           if (msg.method === 'turn/start' && typeof msg.id === 'number') {
             const turnStartError = turnStartErrors.shift();
@@ -326,6 +334,7 @@ import {
   IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
 } from '../../src/agent/providers/getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
+import { IMCODES_MCP_HOST_LIFETIME_ENV, SESSION_RESOURCE_LIFETIME } from '../../shared/session-resource-lifecycle.js';
 import { MEMORY_MCP_STATUS } from '../../shared/memory-ws.js';
 import { AGENT_DELEGATION_NOTIFICATION_RESULTS } from '../../shared/agent-delegation.js';
 import {
@@ -474,6 +483,7 @@ function expectCodexSubagentDetail(
 describe('CodexSdkProvider', () => {
   beforeEach(() => {
     mcpStatusPages = [];
+    mcpToolCallErrors = [];
     vi.useRealTimers();
     childProcessMock.spawn.mockClear();
     childProcessMock.execFile.mockClear();
@@ -2724,6 +2734,73 @@ describe('CodexSdkProvider', () => {
     expect(methods.filter((method) => method === 'turn/start')).toHaveLength(2);
     expect(firstChild.requests.filter((request) => request.method === 'turn/start')[0]?.params?.input)
       .not.toEqual(firstChild.requests.filter((request) => request.method === 'turn/start')[1]?.params?.input);
+  });
+
+  // Production incident (Cx1, 2026-09-25): a session relaunch reaped the
+  // loaded thread's IM MCP child; `thread/resume` of a loaded thread never
+  // respawns it, so every IM call failed with "Transport closed" until an
+  // explicit reload. Every session's turn must now probe and heal first.
+  it('reloads a dead IM MCP transport before a worker turn, found by the pre-turn probe', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    // A relaunched session binds its EXISTING thread (Codex keeps it loaded).
+    await provider.createSession({ sessionKey: 'c1-probe-dead', cwd: '/tmp/project', resumeId: 'thread-relaunched' });
+    mcpToolCallErrors = ['tool call failed for `imcodes-memory/session_runtime_identity_get`: Transport closed'];
+    mcpStatusPages = [connectedPage];
+
+    await provider.send('c1-probe-dead', { ...brainPayload('c1-probe-dead'), sessionRole: 'w1' as const });
+
+    const requests = childProcessMock.children[0]!.requests;
+    const methods = requests.map((request) => request.method);
+    const probe = requests.find((request) => request.method === 'mcpServer/tool/call');
+    expect(probe?.params).toMatchObject({
+      threadId: 'thread-relaunched',
+      server: IMCODES_MEMORY_MCP_SERVER_NAME,
+      tool: 'session_runtime_identity_get',
+      arguments: {},
+    });
+    const reloadAt = methods.indexOf('config/mcpServer/reload');
+    expect(reloadAt, 'a closed transport must be reloaded').toBeGreaterThan(methods.indexOf('mcpServer/tool/call'));
+    expect(reloadAt, 'and before the turn starts').toBeLessThan(methods.indexOf('turn/start'));
+    expect(methods.indexOf('mcpServer/tool/call'), 'probed after the thread is bound').toBeGreaterThan(methods.indexOf('thread/resume'));
+    expect(methods.filter((method) => method === 'turn/start')).toHaveLength(1);
+    expect(loggerMock.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: 'c1-probe-dead', threadId: 'thread-relaunched' }),
+      expect.stringContaining('transport is closed'),
+    );
+  });
+
+  for (const [label, probeError] of [
+    ['a live transport', undefined],
+    ['a tool-level error', 'tool call failed for `imcodes-memory/session_runtime_identity_get`: identity_rejected'],
+    ['an app-server without the probe method', 'Method not found: mcpServer/tool/call'],
+  ] as const) {
+    it(`does not reload or block the turn for ${label}`, async () => {
+      const provider = createCodexProvider();
+      await provider.connect({ binaryPath: 'codex' });
+      const key = `c1-probe-${label.replace(/\W+/g, '-')}`;
+      await provider.createSession({ sessionKey: key, cwd: '/tmp/project', resumeId: `thread-${key}` });
+      mcpToolCallErrors = probeError ? [probeError] : [];
+
+      await provider.send(key, { ...brainPayload(key), sessionRole: 'w1' as const });
+
+      const methods = childProcessMock.children[0]!.requests.map((request) => request.method);
+      expect(methods).toContain('mcpServer/tool/call');
+      expect(methods).not.toContain('config/mcpServer/reload');
+      expect(methods.filter((method) => method === 'turn/start')).toHaveLength(1);
+    });
+  }
+
+  it('does not probe a thread it has just started (a fresh MCP server cannot be reaped yet)', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'c1-probe-fresh', cwd: '/tmp/project' });
+
+    await provider.send('c1-probe-fresh', { ...brainPayload('c1-probe-fresh'), sessionRole: 'w1' as const });
+
+    const methods = childProcessMock.children[0]!.requests.map((request) => request.method);
+    expect(methods).toContain('thread/start');
+    expect(methods).not.toContain('mcpServer/tool/call');
   });
 
   // E: model-agnostic matrix.
@@ -7707,6 +7784,14 @@ describe('buildCodexMcpThreadConfig — per-thread shell identity', () => {
   it('omits the shell identity when there is no session name (cannot impersonate)', () => {
     const cfg = buildCodexMcpThreadConfig({ sessionKey: 'k' } as never) as Record<string, any> | undefined;
     expect(cfg?.shell_environment_policy).toBeUndefined();
+  });
+
+  it('declares the IM MCP server provider-hosted so owner-based reaping skips it', () => {
+    // The server is a child of the shared app-server thread, which outlives our
+    // session relaunch; the registry must not reap it by owner epoch.
+    const cfg = buildCodexMcpThreadConfig({ sessionKey: 'k', sessionName: 'deck_cd_w1' } as never) as Record<string, any>;
+    expect(cfg.mcp_servers[IMCODES_MEMORY_MCP_SERVER_NAME].env[IMCODES_MCP_HOST_LIFETIME_ENV])
+      .toBe(SESSION_RESOURCE_LIFETIME.PROVIDER_HOST);
   });
 });
 

@@ -34,6 +34,40 @@ export function isSessionResourceOwnerIdentity(value: unknown): value is Session
   ));
 }
 
+/**
+ * Who bounds a resource's life.
+ *
+ * RUNTIME (the default when absent): the resource belongs to one runtime epoch
+ * of its owner session, so relaunch child-cleanup and the orphan sweep may reap
+ * it.
+ *
+ * PROVIDER_HOST: an MCP stdio process spawned by a provider process that is
+ * SHARED across sessions and OUTLIVES a session relaunch -- a codex-sdk
+ * thread's MCP server, which is a child of the one Codex app-server. Codex
+ * keeps the thread loaded across our relaunch and a `thread/resume` of a loaded
+ * thread never restarts its MCP servers, so reaping this process by owner/epoch
+ * leaves the live thread bound to a closed pipe ("Transport closed") until an
+ * explicit MCP reload. Its lifetime is bound to its host instead: the stdio
+ * lifecycle guard exits it on EOF or when the host process goes away.
+ */
+export const SESSION_RESOURCE_LIFETIME = {
+  RUNTIME: 'runtime',
+  PROVIDER_HOST: 'provider_host',
+} as const;
+
+export type SessionResourceLifetime = typeof SESSION_RESOURCE_LIFETIME[keyof typeof SESSION_RESOURCE_LIFETIME];
+
+/** Env through which a provider declares a hosted MCP server's lifetime. */
+export const IMCODES_MCP_HOST_LIFETIME_ENV = 'IMCODES_MCP_HOST_LIFETIME';
+
+export function sessionResourceLifetimeFromEnv(
+  env: Record<string, string | undefined>,
+): SessionResourceLifetime | undefined {
+  return env[IMCODES_MCP_HOST_LIFETIME_ENV]?.trim() === SESSION_RESOURCE_LIFETIME.PROVIDER_HOST
+    ? SESSION_RESOURCE_LIFETIME.PROVIDER_HOST
+    : undefined;
+}
+
 export const SESSION_RESOURCE_HANDLE_TYPE = {
   PID: 'pid',
   TMUX: 'tmux',

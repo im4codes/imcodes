@@ -55,6 +55,7 @@ import {
   TASK_ADMISSION_HOOK_PATH,
   TASK_ADMISSION_OPERATION,
   MEMORY_MCP_WATCHDOG,
+  sessionResourceLifetimeFromEnv,
 } from '../../shared/session-resource-lifecycle.js';
 import {
   registerMcpProcessResource,
@@ -810,7 +811,11 @@ export async function runMemoryMcpServer(options: MemoryMcpServerOptions = {}): 
     // legacy direct generations distinguishable so rollout never kills a
     // transport that has no reconnect owner.
     const resourcePrefix = env[IMCODES_MEMORY_MCP_BACKEND_ENV] === '1' ? 'mcp-backend' : 'mcp';
-    const resourceId = owner ? await registerMcpProcessResource(owner, process.pid, false, resourcePrefix) : null;
+    // A provider-hosted generation (see SESSION_RESOURCE_LIFETIME) shares its
+    // bootstrap's lifetime: owner-based reaping must skip the backend too.
+    const resourceId = owner
+      ? await registerMcpProcessResource(owner, process.pid, false, resourcePrefix, sessionResourceLifetimeFromEnv(env))
+      : null;
     let previousCpu = process.cpuUsage();
     let previousWall = Date.now();
     const cpuTimer = setInterval(() => {

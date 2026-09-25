@@ -8,8 +8,10 @@ import {
   SESSION_RESOURCE_OWNER_ENV,
   SESSION_RESOURCE_RELEASE_REASON,
   MEMORY_MCP_WATCHDOG,
+  type SessionResourceLifetime,
 } from '../../shared/session-resource-lifecycle.js';
 import {
+  PROVIDER_HOSTED_RELEASE,
   SessionResourceRegistry,
   sessionResourcePidHandleIsCurrent,
   type OrphanSweepSummary,
@@ -75,6 +77,7 @@ export async function registerMcpProcessResource(
   pid = process.pid,
   killTree = false,
   resourcePrefix = 'mcp',
+  lifetime?: SessionResourceLifetime,
 ): Promise<string> {
   const resourceId = `${resourcePrefix}:${owner.runtimeEpoch}:${pid}`;
   await registry.register({
@@ -82,6 +85,7 @@ export async function registerMcpProcessResource(
     kind: SESSION_RESOURCE_KIND.MCP,
     owner,
     handle: { type: SESSION_RESOURCE_HANDLE_TYPE.PID, pid, ...(killTree ? { killTree: true } : {}) },
+    ...(lifetime ? { lifetime } : {}),
   });
   return resourceId;
 }
@@ -167,7 +171,19 @@ export async function releaseSessionResources(record: SessionRecord): Promise<Re
   return registry.releaseOwner(owner, SESSION_RESOURCE_RELEASE_REASON.SESSION_COMPLETED);
 }
 
-export async function releaseSessionChildResources(record: SessionRecord): Promise<ReleaseSummary> {
+/**
+ * Child cleanup when a session's runtime is replaced in place.
+ *
+ * `providerThreadContinues` is the caller's statement that the new runtime
+ * resumes the SAME provider thread (e.g. a non-fresh codex-sdk relaunch: Codex
+ * keeps that thread loaded and never respawns its MCP server). Only then are
+ * provider-hosted MCP children kept; otherwise they are reaped at every epoch
+ * of this instance, so an abandoned thread's server cannot leak.
+ */
+export async function releaseSessionChildResources(
+  record: SessionRecord,
+  options: { providerThreadContinues: boolean },
+): Promise<ReleaseSummary> {
   const owner = sessionResourceOwner(record);
   if (!owner) return { released: 0, failed: 0 };
   return registry.releaseOwnerKinds(owner, [
@@ -175,7 +191,9 @@ export async function releaseSessionChildResources(record: SessionRecord): Promi
     SESSION_RESOURCE_KIND.BROWSER,
     SESSION_RESOURCE_KIND.CONTAINER,
     SESSION_RESOURCE_KIND.AGENT,
-  ], SESSION_RESOURCE_RELEASE_REASON.SESSION_COMPLETED);
+  ], SESSION_RESOURCE_RELEASE_REASON.SESSION_COMPLETED, options.providerThreadContinues
+    ? PROVIDER_HOSTED_RELEASE.KEEP
+    : PROVIDER_HOSTED_RELEASE.REAP_ALL_EPOCHS);
 }
 
 export async function sweepOrphanedSessionResources(records: readonly SessionRecord[]): Promise<OrphanSweepSummary> {

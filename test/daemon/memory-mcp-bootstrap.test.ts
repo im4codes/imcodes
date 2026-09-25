@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { mkdtempSync } from 'node:fs';
 import { mkdtemp, readFile, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -17,6 +18,11 @@ afterEach(async () => {
   }
 });
 
+/** Every bootstrap now writes its exit to <IMCODES_HOME>/logs; never the real home. */
+function isolatedImcodesHome(): string {
+  return mkdtempSync(join(tmpdir(), 'memory-mcp-bootstrap-home-'));
+}
+
 function connect(env: Record<string, string>): { client: Client; transport: StdioClientTransport; stderr: string[] } {
   const client = new Client({ name: 'bootstrap-test', version: '1' });
   const transport = new StdioClientTransport({
@@ -26,6 +32,7 @@ function connect(env: Record<string, string>): { client: Client; transport: Stdi
     env: {
       PATH: process.env.PATH ?? '',
       HOME: process.env.HOME ?? '',
+      IMCODES_HOME: isolatedImcodesHome(),
       NODE_ENV: 'test',
       IMCODES_MCP_TOOL_CATALOG_MODE: 'static_full',
       IMCODES_MEMORY_MCP_TEST_BACKEND_ENTRY: resolve('test/fixtures/memory-mcp-test-backend.mjs'),
@@ -78,6 +85,7 @@ function rawBootstrap(env: Record<string, string>): {
     env: {
       PATH: process.env.PATH ?? '',
       HOME: process.env.HOME ?? '',
+      IMCODES_HOME: isolatedImcodesHome(),
       NODE_ENV: 'test',
       IMCODES_MCP_TOOL_CATALOG_MODE: 'static_full',
       IMCODES_MEMORY_MCP_TEST_BACKEND_ENTRY: resolve('test/fixtures/memory-mcp-test-backend.mjs'),

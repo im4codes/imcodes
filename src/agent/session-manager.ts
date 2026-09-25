@@ -921,7 +921,8 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
 
   const resourceSessionInstanceId = record.sessionInstanceId?.trim() || randomUUID();
   const resourceRuntimeEpoch = randomUUID();
-  const oldResources = await releaseSessionChildResources(record);
+  // A process pane respawn: the old CLI process (and anything it hosted) is gone.
+  const oldResources = await releaseSessionChildResources(record, { providerThreadContinues: false });
   if (oldResources.failed > 0) {
     throw new Error(`session resource cleanup failed for ${oldResources.failed} resource(s)`);
   }
@@ -3145,7 +3146,13 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   }
 
   if (existing && !transportRuntimes.has(name)) {
-    const previousResources = await releaseSessionChildResources(existing);
+    // Only a non-fresh relaunch of the same agent resumes the same provider
+    // thread (codex-sdk keeps it loaded; its hosted MCP must survive). A fresh
+    // reset or an agent switch abandons that thread, so its hosted MCP -- of
+    // any earlier epoch -- is reaped here instead of leaking.
+    const previousResources = await releaseSessionChildResources(existing, {
+      providerThreadContinues: !opts.fresh && existing.agentType === agentType,
+    });
     if (previousResources.failed > 0) {
       throw new Error(`session resource cleanup failed for ${previousResources.failed} resource(s)`);
     }

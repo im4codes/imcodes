@@ -384,7 +384,7 @@ describe('restoreFromStore — sub-session JSONL watcher regression', () => {
 
     await respawnSession(record);
 
-    expect(releaseSessionChildResourcesMock).toHaveBeenCalledWith(record);
+    expect(releaseSessionChildResourcesMock).toHaveBeenCalledWith(record, { providerThreadContinues: false });
     expect(respawnPaneMock).toHaveBeenCalledWith(
       record.name,
       expect.stringContaining("IMCODES_RESOURCE_SESSION_INSTANCE_ID='instance-1'"),

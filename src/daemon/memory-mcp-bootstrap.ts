@@ -6,6 +6,7 @@ import {
   SESSION_RESOURCE_KIND,
   SESSION_RESOURCE_OWNER_ENV,
   SESSION_RESOURCE_RELEASE_REASON,
+  sessionResourceLifetimeFromEnv,
 } from '../../shared/session-resource-lifecycle.js';
 import { SessionResourceRegistry, type SessionResourceOwner } from './session-resource-registry.js';
 import {
@@ -14,6 +15,12 @@ import {
   MCP_PROCESS_START_PARENT_PID,
   installMcpStdioLifecycle,
 } from './mcp-stdio-lifecycle.js';
+import {
+  MCP_BOOTSTRAP_EXIT_REASON,
+  MCP_LIFECYCLE_EVENT,
+  appendMcpLifecycleEvent,
+  type McpBootstrapExitReason,
+} from './mcp-lifecycle-log.js';
 
 type JsonRpcId = string | number | null;
 type JsonRpcMessage = Record<string, unknown> & { id?: JsonRpcId; method?: string };
@@ -152,12 +159,22 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
   })();
   const resourceRegistry = owner ? new SessionResourceRegistry() : null;
   const resourceId = owner ? `mcp-bootstrap:${owner.runtimeEpoch}:${process.pid}` : null;
+  const lifetime = sessionResourceLifetimeFromEnv(process.env);
+  const lifecycleFields = {
+    session: owner?.sessionName ?? process.env.IMCODES_SESSION?.trim() ?? process.env.IMCODES_DAEMON_SESSION_NAME?.trim(),
+    sessionInstanceId: owner?.sessionInstanceId,
+    runtimeEpoch: owner?.runtimeEpoch,
+    resourceId: resourceId ?? undefined,
+    ...(lifetime ? { lifetime } : {}),
+  };
+  const startedAt = Date.now();
   const registration = owner && resourceRegistry && resourceId
     ? resourceRegistry.register({
       resourceId,
       kind: SESSION_RESOURCE_KIND.MCP,
       owner,
       handle: { type: SESSION_RESOURCE_HANDLE_TYPE.PID, pid: process.pid },
+      ...(lifetime ? { lifetime } : {}),
     }).catch((error: unknown) => {
       process.stderr.write(`[memory-mcp] bootstrap resource registration failed: ${error instanceof Error ? error.message : String(error)}\n`);
     })
@@ -348,6 +365,14 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
     child.on('error', (error) => notifyWarning(`backend process error: ${error.message}`));
     child.on('exit', (code, signal) => {
       output.close();
+      appendMcpLifecycleEvent(MCP_LIFECYCLE_EVENT.BACKEND_EXIT, {
+        ...lifecycleFields,
+        backendPid: child.pid,
+        generation: currentGeneration,
+        code,
+        signal,
+        expected: shuttingDown || backend !== child,
+      });
       if (backend !== child) return;
       backend = null;
       backendReady = false;
@@ -374,6 +399,22 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
         capabilities: {},
         clientInfo: { name: 'imcodes-memory-bootstrap', version: '0.1.0' },
       },
+    });
+  };
+
+  let exitLogged = false;
+  const logExit = (reason: McpBootstrapExitReason, extra: Record<string, unknown> = {}) => {
+    if (exitLogged) return;
+    exitLogged = true;
+    const message = `bootstrap exiting: ${reason}`;
+    process.stderr.write(`[memory-mcp] ${message}\n`);
+    appendMcpLifecycleEvent(MCP_LIFECYCLE_EVENT.BOOTSTRAP_EXIT, {
+      ...lifecycleFields,
+      reason,
+      ppid: process.ppid,
+      startParentPid: MCP_PROCESS_START_PARENT_PID,
+      uptimeMs: Date.now() - startedAt,
+      ...extra,
     });
   };
 
@@ -413,6 +454,7 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
     onArmed: (parentPid) => {
       process.stderr.write(`[memory-mcp] parent liveness guard armed (parent=${parentPid})\n`);
     },
+    onShutdown: (reason, detail) => logExit(reason, { observedParentPid: detail.parentPid }),
     ...(Number.isFinite(configuredParentPollMs) && configuredParentPollMs > 0
       ? { parentPollMs: configuredParentPollMs }
       : {}),
@@ -462,11 +504,39 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
     }
     enqueue(message);
   });
-  input.on('close', () => { void shutdown(); });
+  input.on('close', () => {
+    logExit(MCP_BOOTSTRAP_EXIT_REASON.STDIN_CLOSE);
+    void shutdown();
+  });
   for (const signal of ['SIGINT', 'SIGTERM'] as const) {
     // A registry orphan sweep holds the registry lock while signalling us.
     // Do not contend for that same lock; the sweeping owner removes the row.
-    process.once(signal, () => { void shutdown(false).finally(() => process.exit(0)); });
+    process.once(signal, () => {
+      logExit(MCP_BOOTSTRAP_EXIT_REASON[signal]);
+      void shutdown(false).finally(() => process.exit(0));
+    });
   }
+  // This process IS the host's MCP transport: dying on a stray exception closes
+  // it for the rest of the host's life (a loaded Codex thread never respawns
+  // it). Record the fault and keep serving; stdin EOF / parent loss still end
+  // the process through the lifecycle guard.
+  process.on('uncaughtException', (error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`[memory-mcp] bootstrap uncaught exception (kept alive): ${message}\n`);
+    appendMcpLifecycleEvent(MCP_LIFECYCLE_EVENT.BOOTSTRAP_FAULT, {
+      ...lifecycleFields,
+      reason: MCP_BOOTSTRAP_EXIT_REASON.UNCAUGHT_EXCEPTION,
+      error: message.slice(0, 500),
+    });
+  });
+  process.on('unhandledRejection', (error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`[memory-mcp] bootstrap unhandled rejection (kept alive): ${message}\n`);
+    appendMcpLifecycleEvent(MCP_LIFECYCLE_EVENT.BOOTSTRAP_FAULT, {
+      ...lifecycleFields,
+      reason: MCP_BOOTSTRAP_EXIT_REASON.UNHANDLED_REJECTION,
+      error: message.slice(0, 500),
+    });
+  });
   startBackend();
 }
