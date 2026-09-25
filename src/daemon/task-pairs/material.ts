@@ -3,11 +3,15 @@
  *
  * A pair has no bundle, attempt or registry binding: the material is the
  * executor's workspace. For a worktree that is the worktree at a HEAD: the
- * executor names it on READY_FOR_AUDIT (`worktree=`, `head=`, `base=`); what it
- * leaves out the daemon fills in from the pair's worktree or the executor
- * session (its project directory, and that worktree's HEAD read with one
- * bounded, asynchronous `git rev-parse`). For a task directory it is a path
- * (`path=`, else the directory itself) and there is no HEAD.
+ * executor names it on READY_FOR_AUDIT (`worktree=`, `head=`, `base=`); what
+ * it leaves out the daemon fills in from the pair's own daemon-provisioned
+ * worktree (`pair.workspace`), reading that worktree's HEAD with one
+ * bounded, asynchronous `git rev-parse`. For a task directory it is a path
+ * (`path=`, else the directory itself) and there is no HEAD. It NEVER falls
+ * back to the executor session's raw project checkout -- an unresolved
+ * pair reports its material as `pending` instead, and the daemon asks the
+ * executor to resend rather than hand the auditor a project-wide checkout
+ * that was never scoped to this task.
  */
 import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
@@ -52,8 +56,9 @@ export async function resolveTaskPairMaterial(pair: TaskPairState, deps: TaskPai
   if (workspace?.kind === 'dir' && !named?.worktree && !named?.head) {
     return { path: named?.path ?? workspace.path, source: named?.path ? 'executor' : 'workspace' };
   }
-  // The executor's own words first, then the worktree the daemon created for
-  // the pair, then the executor session's checkout.
+  // The executor's own words first, then the worktree the daemon created
+  // for the pair. Never the raw executor session checkout -- unresolved is
+  // 'pending', not a silent fallback to the project directory.
   const worktree = named?.worktree
     ?? (workspace?.kind === 'worktree' ? workspace.path : undefined);
   const head = named?.head ?? (worktree ? await (deps.gitHead ?? defaultGitHead)(worktree) : workspace?.lastHead ?? undefined);

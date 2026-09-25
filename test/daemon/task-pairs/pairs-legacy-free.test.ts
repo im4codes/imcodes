@@ -169,8 +169,14 @@ describe('pairs run without legacy supervision artifacts', () => {
     expect(String(got.hint)).toContain('PASS M1');
   });
 
-  it('resolves the material from the executor session and its real git HEAD when READY_FOR_AUDIT names none', async () => {
-    const head = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  it('never falls back to the executor session\'s raw checkout: reports material pending when READY_FOR_AUDIT names none and no pair workspace exists', async () => {
+    // This suite disables pair-workspace provisioning (projectRootOf returns
+    // undefined above) specifically to test material resolution in
+    // isolation. With no named worktree=/head= AND no daemon-provisioned
+    // workspace, there is nothing to relay -- and the relay must say so
+    // rather than reading the executor session's project directory (`repo`)
+    // directly, which would be exactly the checkout fallback removed for
+    // the "never send the auditor the project checkout" fix.
     marker(BRAIN, `<!-- IMCODES_TASK DISPATCH M2 executor=${EXEC} auditor=${AUD} -->`);
     marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT M2 -->');
     await flush();
@@ -178,8 +184,11 @@ describe('pairs run without legacy supervision artifacts', () => {
     await flush();
     const request = sentTo(AUD, 'audit-request');
     expect(request).toHaveLength(1);
-    expect(request[0]!.text).toContain(`worktree ${repo} · head ${head}`);
-    expect(request[0]!.text).toContain('resolved by the daemon from the executor session');
+    expect(request[0]!.text).toContain('Material pending for M2');
+    expect(request[0]!.text).not.toContain(repo);
+    const pendingToExecutor = sentTo(EXEC, 'material-pending');
+    expect(pendingToExecutor).toHaveLength(1);
+    expect(pendingToExecutor[0]!.text).toContain('resend READY_FOR_AUDIT with worktree=');
   });
 
   it('answers every legacy tool on a pairs task with the pairs view and a role-appropriate marker, never a legacy demand', async () => {
