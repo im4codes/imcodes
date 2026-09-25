@@ -1,6 +1,6 @@
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
 import { once } from 'node:events';
