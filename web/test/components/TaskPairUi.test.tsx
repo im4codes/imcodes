@@ -15,6 +15,8 @@ vi.mock('react-i18next', () => ({
 
 import { TaskPairEventChip } from '../../src/components/TaskPairEventChip.js';
 import { TaskPairStatusPanel } from '../../src/components/TaskPairStatusPanel.js';
+import { formatElapsedDuration } from '../../src/util/tool-duration.js';
+import { watchProjectionStore } from '../../src/watch-projection.js';
 import { TaskPairSettingsSection, type TaskPairSettingsValue } from '../../src/components/TaskPairSettingsSection.js';
 import {
   TASK_PAIR_DEFAULT_ALLOWLIST,
@@ -114,8 +116,10 @@ describe('TaskPairStatusPanel', () => {
     ] as never;
     render(<TaskPairStatusPanel events={events} />);
     expect(screen.getByText('Build panel')).toBeTruthy();
-    expect(screen.getByText('Cx6 (deck_sub_w)')).toBeTruthy();
-    expect(screen.getByText('CC2 (deck_sub_a)')).toBeTruthy();
+    expect(screen.getByText('Cx6')).toBeTruthy();
+    expect(screen.getByText('CC2')).toBeTruthy();
+    expect(screen.queryByText('Cx6 (deck_sub_w)')).toBeNull();
+    expect(screen.queryByText('CC2 (deck_sub_a)')).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: /taskPair.panel_title/ }));
     expect(screen.queryByText('Build panel')).toBeNull();
     expect(screen.getByText(/taskPair.panel_counts/)).toBeTruthy();
@@ -131,7 +135,7 @@ describe('TaskPairStatusPanel', () => {
     render(<TaskPairStatusPanel events={events} />);
     expect(screen.getByText(/Urgent queued/)).toBeTruthy();
     expect(screen.getByText(/Second queued/)).toBeTruthy();
-    expect(screen.getByText('Cx6 (deck_sub_e)')).toBeTruthy();
+    expect(screen.getByText('Cx6')).toBeTruthy();
     expect(screen.getAllByText(/taskPair.panel_unassigned/).length).toBeGreaterThan(0);
     expect(screen.getByText('!')).toBeTruthy();
   });
@@ -143,8 +147,52 @@ describe('TaskPairStatusPanel', () => {
       assignments: [{ taskId: 'S1', role: 'implementer', ownerSessionName: 'deck_sub_e', ownerSessionLabel: 'Cx6', sessionState: 'running' }],
     } }));
     await waitFor(() => expect(screen.getByText('Snapshot task')).toBeTruthy());
-    expect(screen.getByText('Cx6 (deck_sub_e)')).toBeTruthy();
+    expect(screen.getByText('Cx6')).toBeTruthy();
     expect(screen.getByText('!')).toBeTruthy();
+  });
+
+  it('renders the complete title without exposing the task id in metadata', () => {
+    const title = 'A deliberately long task title that must remain fully readable';
+    render(<TaskPairStatusPanel events={[{
+      eventId: 'title-only', type: 'task_pair.event', ts: Date.now(),
+      payload: { taskId: 'secret-id', title, toStatus: 'working' },
+    }] as never} />);
+    expect(screen.getByText(title)).toBeTruthy();
+    expect(screen.queryByText(/secret-id/)).toBeNull();
+  });
+
+  it('resolves a missing payload label from the watch session store', () => {
+    watchProjectionStore.updateFromSessionList(
+      { id: 'server-test', name: 'Test', baseUrl: 'http://test' },
+      [{ name: 'deck_sub_store', project: 'p', role: 'w1', agentType: 'codex', state: 'running', label: 'Store Cx' }],
+    );
+    try {
+      render(<TaskPairStatusPanel events={[{
+        eventId: 'store-label', type: 'task_pair.event', ts: Date.now(),
+        payload: { taskId: 'store-task', title: 'Store label', toStatus: 'working', executor: 'deck_sub_store' },
+      }] as never} />);
+      expect(screen.getByText('Store Cx')).toBeTruthy();
+      expect(screen.queryByText('deck_sub_store')).toBeNull();
+    } finally {
+      watchProjectionStore.setSnapshotStatus('switching');
+    }
+  });
+});
+
+describe('formatElapsedDuration', () => {
+  const en = { hour: 'h', minute: 'm', second: 's', separator: ' ' };
+  const zh = { hour: '小时', minute: '分', second: '秒', separator: '' };
+  it.each([
+    [0, '0s'], [59, '59s'], [60, '1m 0s'], [3599, '59m 59s'],
+    [3600, '1h 0m 0s'], [86_400, '24h 0m 0s'], [86_405, '24h 0m 5s'],
+  ])('formats %s seconds in English', (seconds, expected) => {
+    expect(formatElapsedDuration(seconds, en)).toBe(expected);
+  });
+  it.each([
+    [0, '0秒'], [59, '59秒'], [60, '1分0秒'], [3599, '59分59秒'],
+    [3600, '1小时0分0秒'], [86_400, '24小时0分0秒'], [86_405, '24小时0分5秒'],
+  ])('formats %s seconds in Simplified Chinese', (seconds, expected) => {
+    expect(formatElapsedDuration(seconds, zh)).toBe(expected);
   });
 });
 

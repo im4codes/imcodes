@@ -162,6 +162,8 @@ interface Props {
   onLoadOlder?: () => void;
   sessionState?: string;
   sessionId?: string | null;
+  /** Session labels used by task-pair status rows when the event omits one. */
+  sessions?: readonly { name: string; label?: string | null }[];
   /** Receives a function that forces the chat list to scroll to the bottom. */
   onScrollBottomFn?: (fn: () => void) => void;
   /** When true, render as a non-interactive preview (no scroll button, no status bar) */
@@ -2007,7 +2009,7 @@ function SdkAgentsDiagnosticRow({ diagnostic }: { diagnostic: SdkSubagentDiagnos
   );
 }
 
-function ChatViewImpl({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, onQuote, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false }: Props) {
+function ChatViewImpl({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, sessions, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, onQuote, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false }: Props) {
   const { t, i18n } = useTranslation();
   const locale = resolveI18nLocale(i18n);
   // Sent on every chatFileReference:true request (path click, preview, download).
@@ -3743,7 +3745,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
             <span class="chat-pinned-last-sent-text">{pinnedPreviewText}</span>
           </div>
         )}
-        {!preview && !!sessionId && !sessionId.includes('deck_sub_') && <TaskPairStatusPanel events={events} />}
+        {!preview && !!sessionId && !sessionId.includes('deck_sub_') && <TaskPairStatusPanel events={events} sessions={sessions} />}
         <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} style={chatFontStyle} onScroll={preview ? undefined : handleScroll}
           onWheel={preview ? undefined : handleWheel}
           onTouchStart={preview ? undefined : handleTouchStart}

@@ -27,3 +27,28 @@ export function formatToolDuration(ms: number): string {
   const hours = Math.floor(minutes / 60);
   return `${hours}h${String(minutes % 60).padStart(2, '0')}m`;
 }
+
+export interface ElapsedDurationUnits {
+  hour: string;
+  minute: string;
+  second: string;
+  separator?: string;
+}
+
+/**
+ * Format a whole-second elapsed duration for compact status displays.
+ * Leading zero units are omitted, while units after the first non-zero unit
+ * are retained (so one hour is rendered as `1h 0m 0s`).
+ */
+export function formatElapsedDuration(seconds: number, units: ElapsedDurationUnits): string {
+  const totalSeconds = Math.max(0, Number.isFinite(seconds) ? Math.floor(seconds) : 0);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const remainder = totalSeconds % 60;
+  const separator = units.separator ?? ' ';
+  if (hours > 0) {
+    return [`${hours}${units.hour}`, `${minutes}${units.minute}`, `${remainder}${units.second}`].join(separator);
+  }
+  if (minutes > 0) return [`${minutes}${units.minute}`, `${remainder}${units.second}`].join(separator);
+  return `${remainder}${units.second}`;
+}

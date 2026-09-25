@@ -2,6 +2,8 @@ import { useEffect, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { TimelineEvent } from '../ws-client.js';
 import { TASK_PAIR_TIMELINE_EVENT, TASK_PAIR_STATUSES, type TaskPairStatus } from '@shared/task-pair.js';
+import { formatElapsedDuration } from '../util/tool-duration.js';
+import { watchProjectionStore } from '../watch-projection.js';
 
 const STORAGE_KEY = 'imcodes.task-pair-status-panel.collapsed';
 const MAX_ROWS = 6;
@@ -21,7 +23,23 @@ function normalizeSnapshot(detail: { tasks?: readonly Record<string, unknown>[];
   });
 }
 
-export function TaskPairStatusPanel({ events }: { events: readonly TimelineEvent[] }) {
+type SessionLabelEntry = { name: string; label?: string | null };
+
+function resolveSessionLabel(
+  id: string,
+  payloadLabel: unknown,
+  sessions: readonly SessionLabelEntry[] | undefined,
+  projectionSessions: readonly { sessionName: string; title: string }[],
+): string {
+  if (typeof payloadLabel === 'string' && payloadLabel.trim()) return payloadLabel.trim();
+  const session = sessions?.find((entry) => entry.name === id);
+  if (session?.label?.trim()) return session.label.trim();
+  const projected = projectionSessions.find((entry) => entry.sessionName === id);
+  if (projected?.title.trim()) return projected.title.trim();
+  return id;
+}
+
+export function TaskPairStatusPanel({ events, sessions }: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[] }) {
   const { t } = useTranslation();
   const [collapsed, setCollapsed] = useState(() => {
     try { return window.localStorage.getItem(STORAGE_KEY) === '1'; } catch { return false; }
@@ -72,10 +90,17 @@ export function TaskPairStatusPanel({ events }: { events: readonly TimelineEvent
   }, { working: 0, audit: 0, queued: 0 });
   if (latest.size === 0) return null;
   const toggle = () => setCollapsed((value) => { const next = !value; try { window.localStorage.setItem(STORAGE_KEY, next ? '1' : '0'); } catch {} return next; });
+  const projectionSessions = watchProjectionStore.getSnapshot().sessions;
   const session = (id: unknown, label: unknown) => {
     if (typeof id !== 'string' || !id) return null;
-    const text = typeof label === 'string' && label ? `${label} (${id})` : id;
+    const text = resolveSessionLabel(id, label, sessions, projectionSessions);
     return <button type="button" class="task-pair-status-session" onClick={() => window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: id } }))}>{text}</button>;
+  };
+  const durationUnits = {
+    hour: t('taskPair.panel_duration_hour'),
+    minute: t('taskPair.panel_duration_minute'),
+    second: t('taskPair.panel_duration_second'),
+    separator: t('taskPair.panel_duration_separator'),
   };
   return <aside class={`task-pair-status-panel${collapsed ? ' is-collapsed' : ''}`} data-testid="task-pair-status-panel">
     <button type="button" class="task-pair-status-toggle" aria-expanded={!collapsed} onClick={toggle}>
@@ -85,10 +110,10 @@ export function TaskPairStatusPanel({ events }: { events: readonly TimelineEvent
     {!collapsed && <div class="task-pair-status-rows">
       {groups.map((group) => {
         const heading = <h4>{t(`taskPair.panel_group_${group.key}`)} <small>({group.rows.length})</small></h4>;
-        const content = group.rows.map((row, index) => { const payload = row.payload; const queued = group.key === 'queued'; return <div class="task-pair-status-row" key={String(payload.taskId)}>
-          <strong>{queued && <em>#{Number(payload.queuePosition ?? index + 1)} </em>}{typeof payload.title === 'string' && payload.title ? payload.title : String(payload.taskId)}</strong>
+        const content = group.rows.map((row, index) => { const payload = row.payload; const queued = group.key === 'queued'; const elapsedSeconds = Math.max(0, Math.floor((now - row.startedAt) / 1000)); const title = typeof payload.title === 'string' && payload.title.trim() ? payload.title : String(payload.taskId); return <div class="task-pair-status-row" key={String(payload.taskId)}>
+          <strong>{queued && <em>#{Number(payload.queuePosition ?? index + 1)} </em>}{title}</strong>
           {queued && payload.urgent === true && <span class="task-pair-status-urgent">!</span>}
-          <small>{String(payload.taskId)} · {t('taskPair.panel_started', { time: new Date(row.startedAt).toLocaleTimeString() })} · {queued ? t('taskPair.panel_queued', { seconds: Math.max(0, Math.floor((now - row.startedAt) / 1000)) }) : t('taskPair.panel_elapsed', { seconds: Math.max(0, Math.floor((now - row.startedAt) / 1000)) })}</small>
+          <small>{t('taskPair.panel_started', { time: new Date(row.startedAt).toLocaleTimeString() })} · {queued ? t('taskPair.panel_queued', { duration: formatElapsedDuration(elapsedSeconds, durationUnits) }) : t('taskPair.panel_elapsed', { duration: formatElapsedDuration(elapsedSeconds, durationUnits) })}</small>
           {!queued && <span>{payload.toStatus === 'rework' ? t('taskPair.status.rework_round', { round: payload.round ?? 1 }) : t(`taskPair.status.${payload.toStatus}`)} · {t('taskPair.panel_round', { round: payload.round ?? 0 })}</span>}
           <div><span class={`task-pair-status-dot ${payload.executorState === 'running' ? 'is-running' : ''}`} />{session(payload.executor, payload.executorLabel) ?? <small>{t('taskPair.panel_unassigned')}</small>}<span class={`task-pair-status-dot ${payload.auditorState === 'running' ? 'is-running' : ''}`} />{session(payload.auditor, payload.auditorLabel) ?? <small>{t('taskPair.panel_unassigned')}</small>}</div>
         </div>; });

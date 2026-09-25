@@ -14474,7 +14474,7 @@ button.quick-agent-delegation-preset.active {
 .task-pair-status-group h4 small { font-family: ui-monospace, SFMono-Regular, monospace; opacity: .7; }
 .task-pair-status-urgent { display: inline-block; width: 14px; margin-left: 4px; border-radius: 3px; color: var(--status-error-text, #f87171); border: 1px solid currentColor; text-align: center; font-weight: 700; }
 .task-pair-status-row { display: grid; gap: 2px; padding: 6px 0; border-top: 1px solid color-mix(in srgb, currentColor 18%, transparent); font-size: 11px; }
-.task-pair-status-row strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.task-pair-status-row strong { overflow: visible; text-overflow: clip; white-space: normal; overflow-wrap: anywhere; }
 .task-pair-status-row small { opacity: .62; }
 .task-pair-status-row span { color: var(--status-info-text, #67e8f9); }
 .task-pair-status-session { margin-right: 6px; padding: 0; border: 0; background: transparent; color: inherit; text-decoration: underline; cursor: pointer; font: inherit; font-size: 10px; }

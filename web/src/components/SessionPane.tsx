@@ -446,6 +446,7 @@ export function SessionPane({
           onLoadOlder={loadOlderEvents}
           onLoadMessageContext={loadMessageContext}
           sessionId={sessionName}
+          sessions={sessions}
           sessionState={liveSessionState ?? undefined}
           onScrollBottomFn={setChatScrollFn}
           workdir={session.projectDir}
