@@ -8,6 +8,7 @@ import {
   TASK_PAIR_BRIEF_END_TAG,
   TASK_PAIR_CONTRACT_ID,
   TASK_PAIR_MARKER_TAG,
+  TASK_PAIR_NO_AUDITOR,
   formatTaskPairSeverityCounts,
   type TaskPairFlag,
   type TaskPairSeverityCounts,
@@ -71,13 +72,35 @@ const FLAG_EXPLANATIONS: Partial<Record<TaskPairFlag, string>> = {
   waiting_for_capacity: 'no allowlisted pool session is free to take the next queued task',
 };
 
-export function buildBrainNoticeMessage(pair: TaskPairState, flag: TaskPairFlag): string {
+export function buildBrainNoticeMessage(pair: TaskPairState, flag: TaskPairFlag, detail?: string): string {
+  // A passed pair only needs the executor's commit/push and DONE: another
+  // executor can finish it, while DONE force=true would close it uncommitted.
+  const resolve = flag === 'executor_silent' && pair.status === 'passed'
+    ? `The audit already passed; only commit/push and DONE remain. Wait for the executor, or hand it to another session with ${marker('REASSIGN', pair.taskId, 'executor=<session>')}. Use ${marker('DONE', pair.taskId, 'force=true')} only once the work is committed.`
+    : `Resolve with a marker, e.g. ${marker('REASSIGN', pair.taskId, 'auditor=<session>')}, ${marker('DONE', pair.taskId, 'force=true')}, or ${marker('CANCEL', pair.taskId)}.`;
   return [
     header(pair),
     `Needs your decision: ${FLAG_EXPLANATIONS[flag] ?? flag}. Executor ${pair.executor ?? '-'}, auditor ${pair.auditor ?? '-'}, status ${pair.status}, round ${pair.round}.`,
-    `Resolve with a marker, e.g. ${marker('REASSIGN', pair.taskId, 'auditor=<session>')}, ${marker('DONE', pair.taskId, 'force=true')}, or ${marker('CANCEL', pair.taskId)}.`,
+    ...(detail ? [`Why: ${detail}.`] : []),
+    resolve,
     `[Contract: ${TASK_PAIR_CONTRACT_ID}]`,
   ].join('\n');
+}
+
+/** To the executor of a pair that was imported as passed without any audit. */
+export function buildLegacyImportCorrectionMessage(pair: TaskPairState): string {
+  const auditor = pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? `auditor ${pair.auditor}` : 'the auditor being assigned';
+  return [
+    header(pair),
+    'Correction: this task was imported from the old supervision engine as passed, but it never had an audit PASS. Disregard any earlier "PASS received: commit/push" message for it and do not commit/push it yet.',
+    `Send your materials to ${auditor} with send_message, then write ${marker('READY_FOR_AUDIT', pair.taskId)}. After the auditor's PASS, commit/push and write DONE.`,
+    contracts(pair.blocking),
+  ].join('\n');
+}
+
+/** One line to Brain listing the imports corrected on this pass. */
+export function buildLegacyImportCorrectionBrainLine(taskIds: readonly string[]): string {
+  return `[IM.codes task pairs] ${taskIds.length} imported legacy task(s) were marked passed without any audit PASS and are now back in audit: ${taskIds.join(', ')}. Each gets an auditor from the pool within your concurrency limit; no action needed.`;
 }
 
 export function buildBriefEndHint(taskId: string): string {

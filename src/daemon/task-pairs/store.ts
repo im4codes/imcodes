@@ -42,6 +42,8 @@ export interface TaskPairLiveness {
   progressExecutorAt: number;
   progressAuditorAt: number;
   lastTickAt: number;
+  /** Consecutive heartbeats the executor spent usage-limited while it was its turn. */
+  limitedExecutor?: number;
   /** Escalations already sent, so each is sent once. */
   notified: string[];
 }

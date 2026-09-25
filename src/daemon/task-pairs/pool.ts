@@ -100,6 +100,30 @@ export function listTaskPairCandidates(input: {
     .sort((a, b) => a.updatedAt - b.updatedAt || a.name.localeCompare(b.name));
 }
 
+/**
+ * Why the pool can never yield an auditor: the Brain's primary pool is
+ * configured, but none of its configs is on the auditor allowlist, so no pool
+ * member qualifies and nothing can be provisioned. Undefined when some config
+ * qualifies (a shortage is then temporary) or no pools are configured.
+ */
+export function describeAuditorAllowlistGap(input: {
+  brain: string;
+  allowlist: readonly TaskPairAllowlistEntry[];
+}, deps: TaskPairPoolDeps = {}): string | undefined {
+  const parent = (deps.getSession ?? getSession)(input.brain);
+  const definition = parent ? poolDefinition(parent, 'primary') : undefined;
+  if (!definition) return undefined;
+  if (definition.configs.some((config) => matchesTaskPairAllowlist(input.allowlist, 'auditor', config.agentType, config.model))) {
+    return undefined;
+  }
+  const pool = definition.configs.map((config) => `${config.agentType}/${config.model}`).join(', ') || 'none';
+  const wanted = input.allowlist
+    .filter((entry) => entry.role === 'auditor' || entry.role === 'both')
+    .map((entry) => `${entry.agentType}/${entry.modelPattern || '*'}`)
+    .join(', ') || 'none';
+  return `the auditor allowlist (${wanted}) matches none of the primary pool's configs (${pool}). Add an allowlisted auditor config to the primary pool, or widen the project's pair allowlist`;
+}
+
 /** First allowlisted pool config for auto-provisioning a role, if any. */
 export function allowlistedProvisionConfig(input: {
   brain: string;

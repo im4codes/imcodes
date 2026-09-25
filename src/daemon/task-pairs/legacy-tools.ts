@@ -49,6 +49,10 @@ function hint(taskId?: string): string {
   return `This project uses marker-driven task pairs (${TASK_PAIR_CONTRACT_ID}). Instead of this tool, write a marker line such as <!-- ${TASK_PAIR_MARKER_TAG} READY_FOR_AUDIT ${id} --> in your reply.`;
 }
 
+function coordinatorStartHint(taskId: string): string {
+  return `This project uses marker-driven task pairs (${TASK_PAIR_CONTRACT_ID}). Send the brief to the executor with send_message and task: { taskId: "${taskId}" }; that opens the pair and the daemon assigns an auditor unless you name one. Or write <!-- ${TASK_PAIR_MARKER_TAG} DISPATCH ${taskId} executor=<session> auditor=<session> --> in your reply.`;
+}
+
 function str(record: Record<string, unknown>, key: string): string | undefined {
   const value = record[key];
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
@@ -149,6 +153,25 @@ export async function handleLegacyToolOnPairs(tool: string, callerSession: strin
       : { status: 'ok', engine: 'pairs', task: null, hint: hint(taskId) };
   }
 
+  // The legacy way to open a task: Brain starts it as coordinator, then sends
+  // the brief with that task id. A pair needs its executor, so a start opens
+  // nothing yet; it hands back the id, and the brief's send_message carrying it
+  // opens the pair (the daemon picks the auditor when none is named).
+  if (tool === MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START && str(args, 'role') === 'coordinator') {
+    const idempotencyKey = str(args, 'idempotencyKey');
+    const taskId = str(args, 'taskId')
+      ?? taskPairService.mintTaskId(project, idempotencyKey ? `${callerSession}\0${idempotencyKey}` : undefined);
+    const existing = store.getPair(project, taskId)?.state;
+    return {
+      status: 'ok',
+      engine: 'pairs',
+      applied: 'task_id',
+      taskId,
+      ...(existing ? { pairStatus: existing.status } : {}),
+      hint: coordinatorStartHint(taskId),
+    };
+  }
+
   const { verb, attrs } = legacyVerb(tool, args);
   // A pairs receipt's assignmentId is a pair binding id; it names the task too.
   const requested = str(args, 'taskId') ?? parseTaskPairBindingId(str(args, 'assignmentId'))?.taskId;
@@ -166,7 +189,7 @@ export async function handleLegacyToolOnPairs(tool: string, callerSession: strin
       role: taskPairRoleOf(existing, callerSession), verb, attrs, effect: 'recorded', unusual: false,
       source: 'legacy_tool', fromStatus: existing.status, toStatus: existing.status, at: Date.now(),
     });
-    taskPairService.recordProgress(callerSession, Date.now());
+    taskPairService.recordPairProgress(project, taskId, callerSession, Date.now());
     return { status: 'ok', engine: 'pairs', applied: 'recorded', taskId, pairStatus: existing.status, hint: hint(taskId) };
   }
   const transition = taskPairService.applyMarker({

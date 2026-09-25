@@ -82,6 +82,8 @@ describe('supervision prompt custom-instructions merge', () => {
             ],
           },
         },
+        // Automatic supervision brings its own heartbeat; a Brain cron is a duplicate.
+        heartbeat: { source: 'daemon_builtin', brainCronSelf: 'forbidden' },
         // Continuing a task and starting one are different routing questions;
         // collapsing them piled separate audits onto a single ready peer.
         fanout: {

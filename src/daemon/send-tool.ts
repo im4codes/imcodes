@@ -1,4 +1,4 @@
-import { isPairsEngineProject } from './task-pairs/engine.js';
+import { isPairsEngineProject, projectBrainSession } from './task-pairs/engine.js';
 import { taskPairService } from './task-pairs/service.js';
 import { getTaskPairStore } from './task-pairs/store.js';
 import { taskPairBindingOf } from '../../shared/task-pair.js';
@@ -1258,6 +1258,88 @@ function stripToPoolMetadata(input: SendMessageInput): SendMessageInput {
   return Object.keys(poolTask).length > 0 ? { ...rest, task: poolTask as SupervisionTaskMetadata } : rest;
 }
 
+/**
+ * Inputs the implicit work-pair rule must not apply to: the inner dispatch of a
+ * send that already opened (or decided about) its pair, and scheduled cron
+ * sends, which are not a Brain dispatching work.
+ */
+const noImplicitWorkPair = new WeakSet<SendMessageInput>();
+
+function withoutImplicitWorkPair(input: SendMessageInput): SendMessageInput {
+  noImplicitWorkPair.add(input);
+  return input;
+}
+
+function mintDispatchTaskPairId(caller: SendRuntimeCaller, project: string, input: SendMessageInput): string {
+  const idempotencyKey = input.idempotencyKey?.trim();
+  return taskPairService.mintTaskId(project, idempotencyKey ? `${caller.sessionName}\0${idempotencyKey}` : undefined);
+}
+
+/**
+ * The worker a plain Brain dispatch opens a pair for, or undefined when it
+ * opens none. Exactly one reached recipient; a worker of the same project
+ * (never the Brain); and not already the executor or auditor of an open pair,
+ * because a message to a session that is working on a pair continues that
+ * pair (the Brain's progress checks, re-dispatches, audit follow-ups) rather
+ * than starting a new task.
+ */
+function implicitWorkPairTarget(
+  project: string,
+  taskId: string,
+  result: Extract<SendMessageResult, { status: 'accepted' }>,
+  sessions: readonly SessionRecord[],
+): string | undefined {
+  const reached = result.deliveries.filter((delivery) => isReachedDelivery(delivery.status));
+  if (result.deliveries.length !== 1 || reached.length !== 1) return undefined;
+  const target = reached[0]!.target;
+  const record = sessions.find((session) => session.name === target);
+  if (!record || record.projectName !== project || record.role === 'brain') return undefined;
+  // A replay of the same send (same idempotency key, same minted id) names
+  // the pair it already opened again.
+  if (getTaskPairStore().getPair(project, taskId)?.state.executor === target) return target;
+  if (getTaskPairStore().isParticipantOfOpenPair(target)) return undefined;
+  return target;
+}
+
+/** Open (or record on) the pair for each reached recipient and name it in the receipt. */
+function bindAcceptedDispatchToTaskPair(
+  caller: SendRuntimeCaller,
+  project: string,
+  result: Extract<SendMessageResult, { status: 'accepted' }>,
+  taskId: string,
+  objective: string | undefined,
+): SendMessageResult {
+  const reached = result.deliveries.filter((delivery) => isReachedDelivery(delivery.status));
+  const title = deriveSupervisionTaskTitle(objective);
+  for (const delivery of reached) {
+    taskPairService.implicitDispatch({
+      project,
+      sender: caller.sessionName!,
+      target: delivery.target,
+      taskId,
+      ...(title ? { title } : {}),
+      eventId: `implicit:${delivery.messageId ?? result.dispatchId}`,
+    });
+  }
+  const pairState = getTaskPairStore().getPair(project, taskId)?.state;
+  const pairTitle = pairState?.title;
+  const taskIdentity = {
+    taskId,
+    ...(pairTitle ? { taskTitle: pairTitle } : {}),
+    ...(objective && pairTitle === title ? { taskObjective: objective } : {}),
+  };
+  // Each reached recipient that holds a role slot of the pair gets that
+  // slot's binding id as its assignmentId (shared/task-pair.ts).
+  const deliveries = result.deliveries.map((delivery) => {
+    if (!isReachedDelivery(delivery.status)) return delivery;
+    const assignmentId = taskPairBindingOf(pairState, delivery.target);
+    return { ...delivery, ...taskIdentity, ...(assignmentId ? { assignmentId } : {}) };
+  });
+  const bindings = new Set(deliveries.map((delivery) => delivery.assignmentId).filter(Boolean));
+  const assignmentId = bindings.size === 1 ? [...bindings][0] : undefined;
+  return { ...result, ...taskIdentity, ...(assignmentId ? { assignmentId } : {}), deliveries };
+}
+
 export async function dispatchSendMessage(
   caller: SendRuntimeCaller,
   input: SendMessageInput,
@@ -1286,46 +1368,32 @@ export async function dispatchSendMessage(
   // daemon-minted id so the Brain can follow it with markers.
   if (!input.automaticSupervision && isPairsEngineProject(callerProjectName) && hasLegacyTaskMetadata(input)) {
     const objective = projectSupervisionTaskObjective(input.task?.objective);
-    const result = await dispatchSendMessage(caller, stripToPoolMetadata(input), deps);
+    const result = await dispatchSendMessage(caller, withoutImplicitWorkPair(stripToPoolMetadata(input)), deps);
     if (result.status !== 'accepted') return result;
     // A new objective opens one pair for its one recipient (an explicit target
     // or an auto-provisioned worker), never for a broadcast or a clone.
     const reached = result.deliveries.filter((delivery) => isReachedDelivery(delivery.status));
     const opensNewTask = !input.task?.taskId?.trim() && !!objective
       && !input.broadcast && !input.clone && result.deliveries.length === 1 && reached.length === 1;
-    const idempotencyKey = input.idempotencyKey?.trim();
     const taskId = input.task?.taskId?.trim() || (opensNewTask
-      ? taskPairService.mintTaskId(callerProjectName, idempotencyKey ? `${caller.sessionName}\0${idempotencyKey}` : undefined)
+      ? mintDispatchTaskPairId(caller, callerProjectName, input)
       : undefined);
     if (!taskId) return result;
-    const title = deriveSupervisionTaskTitle(objective);
-    for (const delivery of reached) {
-      taskPairService.implicitDispatch({
-        project: callerProjectName,
-        sender: caller.sessionName,
-        target: delivery.target,
-        taskId,
-        ...(title ? { title } : {}),
-        eventId: `implicit:${delivery.messageId ?? result.dispatchId}`,
-      });
-    }
-    const pairState = getTaskPairStore().getPair(callerProjectName, taskId)?.state;
-    const pairTitle = pairState?.title;
-    const taskIdentity = {
-      taskId,
-      ...(pairTitle ? { taskTitle: pairTitle } : {}),
-      ...(objective && pairTitle === title ? { taskObjective: objective } : {}),
-    };
-    // Each reached recipient that holds a role slot of the pair gets that
-    // slot's binding id as its assignmentId (shared/task-pair.ts).
-    const deliveries = result.deliveries.map((delivery) => {
-      if (!isReachedDelivery(delivery.status)) return delivery;
-      const assignmentId = taskPairBindingOf(pairState, delivery.target);
-      return { ...delivery, ...taskIdentity, ...(assignmentId ? { assignmentId } : {}) };
-    });
-    const bindings = new Set(deliveries.map((delivery) => delivery.assignmentId).filter(Boolean));
-    const assignmentId = bindings.size === 1 ? [...bindings][0] : undefined;
-    return { ...result, ...taskIdentity, ...(assignmentId ? { assignmentId } : {}), deliveries };
+    return bindAcceptedDispatchToTaskPair(caller, callerProjectName, result, taskId, objective);
+  }
+  // A Brain that dispatches work with a plain send_message (no task metadata,
+  // no DISPATCH marker) on a `pairs` project with automatic audit still gets a
+  // pair: a daemon-level rule, not model guidance, so it holds whatever the
+  // Brain's prompt says. See implicitWorkPairTarget for exactly when.
+  if (!input.automaticSupervision && !noImplicitWorkPair.has(input)
+    && isPairsEngineProject(callerProjectName) && !input.broadcast && !input.clone
+    && caller.sessionName === projectBrainSession(callerProjectName)
+    && resolveProjectAuthoritativeSupervisionSnapshot(callerProjectName, allSessions).mode === SUPERVISION_MODE.SUPERVISED_AUDIT) {
+    const result = await dispatchSendMessage(caller, withoutImplicitWorkPair({ ...input }), deps);
+    if (result.status !== 'accepted') return result;
+    const taskId = mintDispatchTaskPairId(caller, callerProjectName, input);
+    if (!implicitWorkPairTarget(callerProjectName, taskId, result, d.listSessions())) return result;
+    return bindAcceptedDispatchToTaskPair(caller, callerProjectName, result, taskId, projectSupervisionTaskObjective(input.message));
   }
   const autoProvision = input.task?.autoProvision === true;
   if (!input.target && !input.broadcast && !autoProvision) {
@@ -5608,7 +5676,7 @@ export async function dispatchCronSend(input: CronSendDispatchInput, deps?: Send
     sessionName: fromSession.name,
     projectName: fromSession.projectName,
     projectRoot: fromSession.projectDir,
-  }, {
+  }, withoutImplicitWorkPair({
     target: input.target,
     message: input.message,
     ...(input.reply !== undefined ? { reply: input.reply } : {}),
@@ -5618,7 +5686,7 @@ export async function dispatchCronSend(input: CronSendDispatchInput, deps?: Send
     // wider refusal: firing every N minutes into a target that cannot run the
     // task builds a backlog and burns the retry budget for nothing.
     newWorkload: true,
-  }, deps);
+  }), deps);
   if (result.status !== 'accepted') {
     if (result.status === 'error'
       && (result.reason === SEND_TOOL_ERROR_REASONS.TARGET_LIMITED

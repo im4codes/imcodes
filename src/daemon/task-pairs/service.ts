@@ -13,6 +13,8 @@ import type { TimelineEvent } from '../timeline-event.js';
 import logger from '../../util/logger.js';
 import {
   TASK_PAIR_INFER_TASK_ID,
+  TASK_PAIR_NO_AUDITOR,
+  TASK_PAIR_OPEN_STATUSES,
   TASK_PAIR_TIMELINE_EVENT,
   applyTaskPairMarker,
   isTerminalTaskPairStatus,
@@ -28,7 +30,7 @@ import {
 } from '../../../shared/task-pair.js';
 import { getTaskPairStore, type StoredTaskPair, type TaskPairLiveness } from './store.js';
 import { isPairsEngineProject, projectBrainSession, projectOfSession } from './engine.js';
-import { sendTaskPairMessage } from './delivery.js';
+import { noteTaskPairFocus, sendTaskPairMessage, taskPairFocusOf } from './delivery.js';
 import {
   buildBrainNoticeMessage,
   buildCorrectionMessage,
@@ -51,6 +53,13 @@ export interface ApplyMarkerInput {
   /** Stable id for this marker occurrence: replaying it is a no-op. */
   eventId: string;
   now?: number;
+}
+
+/** The text names this task id as a whole token (so `T1` is not found in `T10`; trailing punctuation is fine). */
+function mentionsTaskId(text: string, taskId: string): boolean {
+  if (!text || !text.includes(taskId)) return false;
+  const escaped = taskId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|[^A-Za-z0-9_-])${escaped}($|[^A-Za-z0-9_-])`, 'u').test(text);
 }
 
 export class TaskPairService {
@@ -91,7 +100,7 @@ export class TaskPairService {
     const project = projectOfSession(writer);
     if (!project || !isPairsEngineProject(project)) return;
     const now = event.ts ?? Date.now();
-    this.recordProgress(writer, now);
+    this.recordProgress(writer, now, text);
     if (!mayContainTaskPairMarker(text)) return;
     this.ingestText(project, writer, text, event.eventId, now);
   }
@@ -192,12 +201,16 @@ export class TaskPairService {
         : input.sender === state.auditor ? state.executor
           : undefined;
       const unusual = input.sender !== state.brain && input.target !== counterpart;
+      const at = Date.now();
       store.recordEvent({
         id: input.eventId, project, taskId: input.taskId, writer: input.sender,
         role: taskPairRoleOf(state, input.sender), verb: 'SEND', attrs: { target: input.target },
         effect: 'recorded', unusual, source: 'implicit_dispatch', fromStatus: state.status, toStatus: state.status,
-        at: Date.now(),
+        at,
       });
+      // A task-tagged send is progress on that pair, and its target now works on it.
+      this.recordPairProgress(project, input.taskId, input.sender, at);
+      noteTaskPairFocus(input.target, input.taskId);
       return { effect: 'recorded', unusual, intents: [] };
     }
     return this.applyMarker({
@@ -216,15 +229,35 @@ export class TaskPairService {
     });
   }
 
-  /** Any final assistant output is progress for the side that wrote it. */
-  recordProgress(writer: string, now: number): void {
-    const store = getTaskPairStore();
-    for (const pair of store.pairsForSession(writer)) {
-      const liveness = { ...pair.liveness };
-      if (pair.state.executor === writer) { liveness.progressExecutorAt = now; liveness.silenceExecutor = 0; }
-      if (pair.state.auditor === writer) { liveness.progressAuditorAt = now; liveness.silenceAuditor = 0; }
-      store.saveLiveness(pair.project, pair.state.taskId, liveness);
-    }
+  /**
+   * Final assistant output is progress for the pair it is about: every pair
+   * whose task id it names; otherwise the writer's only open pair; otherwise
+   * the pair the writer was last messaged about. A session in several pairs
+   * that works on one of them does not keep the others looking alive.
+   */
+  recordProgress(writer: string, now: number, text = ''): void {
+    const own = getTaskPairStore().pairsForSession(writer)
+      .filter((pair) => pair.state.executor === writer || pair.state.auditor === writer);
+    const named = own.filter((pair) => mentionsTaskId(text, pair.state.taskId));
+    const open = own.filter((pair) => TASK_PAIR_OPEN_STATUSES.includes(pair.state.status));
+    const focus = taskPairFocusOf(writer);
+    const targets = named.length > 0 ? named
+      : open.length === 1 ? open
+        : open.filter((pair) => pair.state.taskId === focus);
+    for (const pair of targets) this.#stampProgress(pair, writer, now);
+  }
+
+  /** Progress by one participant on one known pair (a task-tagged call or send). */
+  recordPairProgress(project: string, taskId: string, writer: string, now: number): void {
+    const pair = getTaskPairStore().getPair(project, taskId);
+    if (pair) this.#stampProgress(pair, writer, now);
+  }
+
+  #stampProgress(pair: StoredTaskPair, writer: string, now: number): void {
+    const liveness = { ...pair.liveness };
+    if (pair.state.executor === writer) { liveness.progressExecutorAt = now; liveness.silenceExecutor = 0; }
+    if (pair.state.auditor === writer) { liveness.progressAuditorAt = now; liveness.silenceAuditor = 0; }
+    getTaskPairStore().saveLiveness(pair.project, pair.state.taskId, liveness);
   }
 
   #livenessAfterMarker(
@@ -250,7 +283,7 @@ export class TaskPairService {
     transition: TaskPairTransition,
     pair: TaskPairState | undefined,
   ): void {
-    const payload: TaskPairEventPayload = {
+    emitTaskPairTimelineEvent({
       taskId,
       verb: input.marker.knownVerb ?? input.marker.verb,
       writer: input.writer,
@@ -260,27 +293,8 @@ export class TaskPairService {
       ...(transition.fromStatus ? { fromStatus: transition.fromStatus } : {}),
       ...(transition.toStatus ?? pair?.status ? { toStatus: transition.toStatus ?? pair?.status } : {}),
       unusual: transition.unusual,
-      ...(pair ? {
-        ...(pair.title ? { title: pair.title } : {}),
-        ...(pair.executor ? { executor: pair.executor } : {}),
-        ...(pair.auditor ? { auditor: pair.auditor } : {}),
-        round: pair.round,
-        flags: pair.flags,
-        blocking: pair.blocking,
-        ...(pair.executorPool ? { executorPool: pair.executorPool } : {}),
-        ...(pair.auditorPool ? { auditorPool: pair.auditorPool } : {}),
-      } : {}),
       ...(transition.verdict ? { severityCounts: transition.verdict.counts, verdictJudgement: transition.verdict.judgement } : {}),
-    };
-    const targets = new Set<string>(input.writer === 'daemon' ? [] : [input.writer]);
-    for (const session of [pair?.executor, pair?.auditor, pair?.brain]) {
-      if (session && session !== 'none') targets.add(session);
-    }
-    for (const session of targets) {
-      timelineEmitter.emit(session, TASK_PAIR_TIMELINE_EVENT, payload as unknown as Record<string, unknown>, {
-        source: 'daemon', confidence: 'high', eventId: `${TASK_PAIR_TIMELINE_EVENT}:${input.eventId}:${session}`,
-      });
-    }
+    }, pair, input.eventId);
   }
 
   async #executeIntents(project: string, pair: TaskPairState | undefined, intents: readonly TaskPairIntent[]): Promise<void> {
@@ -321,6 +335,48 @@ export class TaskPairService {
   isActive(pair: TaskPairState): boolean {
     return !isTerminalTaskPairStatus(pair.status);
   }
+}
+
+/**
+ * Project one pair event onto the timelines of the writer and every
+ * participant (executor, auditor, Brain), with the pair's current roles.
+ */
+export function emitTaskPairTimelineEvent(
+  base: Omit<TaskPairEventPayload, 'title' | 'executor' | 'auditor' | 'round' | 'flags' | 'blocking' | 'executorPool' | 'auditorPool'>,
+  pair: TaskPairState | undefined,
+  eventId: string,
+): void {
+  const payload: TaskPairEventPayload = {
+    ...base,
+    ...(pair ? {
+      ...(pair.title ? { title: pair.title } : {}),
+      ...(pair.executor ? { executor: pair.executor } : {}),
+      ...(pair.auditor ? { auditor: pair.auditor } : {}),
+      round: pair.round,
+      flags: pair.flags,
+      blocking: pair.blocking,
+      ...(pair.executorPool ? { executorPool: pair.executorPool } : {}),
+      ...(pair.auditorPool ? { auditorPool: pair.auditorPool } : {}),
+    } : {}),
+  };
+  const targets = new Set<string>(base.writer === 'daemon' ? [] : [base.writer]);
+  for (const session of [pair?.executor, pair?.auditor, pair?.brain]) {
+    if (session && session !== TASK_PAIR_NO_AUDITOR) targets.add(session);
+  }
+  for (const session of targets) {
+    timelineEmitter.emit(session, TASK_PAIR_TIMELINE_EVENT, payload as unknown as Record<string, unknown>, {
+      source: 'daemon', confidence: 'high', eventId: `${TASK_PAIR_TIMELINE_EVENT}:${eventId}:${session}`,
+    });
+  }
+}
+
+/** A daemon-authored pair event (not a marker), e.g. a data correction. */
+export function emitTaskPairDaemonEvent(
+  pair: TaskPairState,
+  event: Pick<TaskPairEventPayload, 'verb' | 'effect' | 'source' | 'fromStatus' | 'toStatus' | 'unusual'> & { eventId: string },
+): void {
+  const { eventId, ...rest } = event;
+  emitTaskPairTimelineEvent({ taskId: pair.taskId, writer: 'daemon', role: 'daemon', ...rest }, pair, eventId);
 }
 
 export const taskPairService = new TaskPairService();

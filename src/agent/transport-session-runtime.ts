@@ -109,6 +109,7 @@ import logger from '../util/logger.js';
 import { incrementCounter } from '../util/metrics.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { getTransportQueueStore } from '../daemon/transport-queue-store.js';
+import { isPairsEngineSession, projectOfSession } from '../daemon/task-pairs/engine.js';
 import type { DiscardTransportQueueStateResult, LegacyQueueOwnershipEvidence, QueueRecipientIdentity } from '../daemon/transport-queue-store.js';
 import type { QueueDeliveryFact, QueueSnapshot, QueueSupervisionAdmission, QueueSupervisionReference } from '../../shared/transport-queue-types.js';
 import type { PeerAuditCompletedTurnEvidence } from '../../shared/peer-audit.js';
@@ -532,6 +533,11 @@ export function transportAutoCompactRatio(env: NodeJS.ProcessEnv = process.env):
 /** At most one automatic compaction per session in this window. */
 export const TRANSPORT_AUTO_COMPACT_MIN_INTERVAL_MS = 10 * 60 * 1000;
 
+/** One registration per Brain contract variant: supervision mode and engine. */
+function brainContractVariantKey(automaticSupervision: boolean, taskPairEngine: boolean): string {
+  return `${automaticSupervision ? 'automatic' : 'manual'}:${taskPairEngine ? 'pairs' : 'legacy'}`;
+}
+
 export class TransportSessionRuntime implements SessionRuntime {
   readonly type = RUNTIME_TYPES.TRANSPORT;
 
@@ -572,12 +578,12 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _sessionIdentity: { sessionName: string; label: string | null; role?: SessionRecord['role'] } | undefined;
   /**
    * Which Brain work-delegation contract VARIANT has its full body registered on
-   * the CURRENT thread: the automaticSupervision value it was built for, or null
+   * the CURRENT thread: the variant (supervision mode and engine) it was built for, or null
    * when none is. Reset on thread (re)creation and on compaction, because those
    * are exactly the points where the registered text no longer exists. Keyed by
    * variant because a registration of one never stands in for the other.
    */
-  private _brainContractRegisteredVariant: boolean | null = null;
+  private _brainContractRegisteredVariant: string | null = null;
   /**
    * Reads the session's CURRENT supervision snapshot. Consulted on every turn,
    * so a mode change takes effect on the next turn without a restart.
@@ -1120,6 +1126,14 @@ export class TransportSessionRuntime implements SessionRuntime {
     } catch (err) {
       logger.warn({ err, sessionKey: this.sessionKey }, 'supervision mode unavailable; treating automatic supervision as off');
       return false;
+    }
+  }
+  /** Whether this session's project runs the `pairs` engine; the default when unknown. */
+  private resolveTaskPairEngine(): boolean {
+    try {
+      return isPairsEngineSession(this.sessionKey) || !projectOfSession(this.sessionKey);
+    } catch {
+      return true;
     }
   }
   setAgentId(agentId: string): void {
@@ -3776,6 +3790,8 @@ export class TransportSessionRuntime implements SessionRuntime {
       // Decided once per turn and used for both the assembly and the
       // registration below, so the variant sent is the variant recorded.
       const automaticSupervisionEnabled = this.resolveAutomaticSupervisionEnabled();
+      const taskPairEngine = this.resolveTaskPairEngine();
+      const brainContractVariant = brainContractVariantKey(automaticSupervisionEnabled, taskPairEngine);
       const dispatchResult = await dispatchSharedContextSend(this.provider, this._providerSessionId!, {
         userMessage: providerMessage,
         deliveryId: this._activeDispatchEntries.map((entry) => entry.clientMessageId).join('\n'),
@@ -3802,7 +3818,8 @@ export class TransportSessionRuntime implements SessionRuntime {
         authoredContextFilePath: isSlashControl ? undefined : this._contextAuthoredContextFilePath,
         ...(this._sessionIdentity ? { sessionIdentity: this._sessionIdentity } : {}),
         automaticSupervisionEnabled,
-        brainContractRegistered: this._brainContractRegisteredVariant === automaticSupervisionEnabled,
+        taskPairEngine,
+        brainContractRegistered: this._brainContractRegisteredVariant === brainContractVariant,
         registeredSystemContractText,
         ...(startupMemory ? { startupMemory } : {}),
         ...(memoryRecall ? { memoryRecall } : {}),
@@ -3848,7 +3865,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       // This variant's contract body (or its reference, when it was already
       // registered) reached the provider on this turn, so later turns on the
       // same thread re-assert it by reference -- until the mode changes.
-      this._brainContractRegisteredVariant = automaticSupervisionEnabled;
+      this._brainContractRegisteredVariant = brainContractVariant;
       for (const entry of this._activeDispatchEntries) {
         const contract = entry.registeredSystemContract;
         if (contract) this._registeredSystemContractSignatures.set(contract.contractId, contract.signature);

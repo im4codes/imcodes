@@ -292,6 +292,9 @@ export function buildBrainSupervisedWorkDelegationContract(_locale?: Supervision
     // IM.codes is the route at all. Continuing an existing task and starting a
     // new one pull in opposite directions, and collapsing them is what piled
     // four separate audits onto one ready peer while others sat idle.
+    // Automatic supervision has its own heartbeat (the daemon's, or the pair
+    // heartbeat on the `pairs` engine); a Brain cron on top is a duplicate.
+    heartbeat: { source: 'daemon_builtin', brainCronSelf: 'forbidden' },
     fanout: {
       sameTask: 'append_exact_existing_session_even_when_busy',
       newTask: 'distinct_ready_target_per_task_while_any_remain',
@@ -441,7 +444,34 @@ export function buildBrainSupervisedWorkDelegationContract(_locale?: Supervision
  * removed is everything automatic. Supervised work is still available -- it is
  * arranged by hand, on an explicit user request, never by the Brain itself.
  */
-export function buildBrainManualOnlyDelegationContract(_locale?: SupervisionUiLocale): string {
+/**
+ * Audited work the user asks for while automatic supervision is off. On the
+ * `pairs` engine it always opens a pair, and the daemon's pair heartbeat nudges
+ * both sides until DONE/CANCEL whatever the supervision mode, so Brain adds no
+ * heartbeat of its own. Only a project rolled back to the legacy engine has no
+ * such heartbeat: there Brain keeps one self-wakeup for the task and removes it
+ * when the task is finished.
+ */
+export const BRAIN_MANUAL_AUDITED_WORK = {
+  pairs: {
+    route: 'task_pair',
+    open: ['IMCODES_TASK DISPATCH <taskId> executor=<session> [auditor=<session>]', 'send_message task.objective'],
+    auditor: 'named_or_daemon_auto_pick',
+    heartbeat: 'daemon_pair_heartbeat_until_done_or_cancel',
+    brainCronSelf: 'forbidden',
+  },
+  legacy: {
+    heartbeat: 'cron_create_self_every_10_min_checks_executor_and_auditor_nudges_idle_side',
+    stop: 'cron_cancel_self_when_finished',
+    oneSourcePerTask: true,
+  },
+} as const;
+
+export function buildBrainManualOnlyDelegationContract(
+  _locale?: SupervisionUiLocale,
+  options: { taskPairEngine?: boolean } = {},
+): string {
+  const taskPairEngine = options.taskPairEngine !== false;
   return JSON.stringify({
     contractId: SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION,
     v: 1,
@@ -457,6 +487,7 @@ export function buildBrainManualOnlyDelegationContract(_locale?: SupervisionUiLo
     manual: {
       when: 'explicit_user_request',
       supervisionTaskAndAudit: 'allowed_as_requested',
+      auditedWork: taskPairEngine ? BRAIN_MANUAL_AUDITED_WORK.pairs : BRAIN_MANUAL_AUDITED_WORK.legacy,
     },
     delegation: {
       when: 'explicit_user_request',
@@ -482,7 +513,7 @@ export function buildBrainManualOnlyDelegationContract(_locale?: SupervisionUiLo
  * mechanically distinguishable -- the same discipline the continuation prompts
  * already use.
  */
-export function buildBrainWorkDelegationContractRef(automaticSupervision: boolean): string {
+export function buildBrainWorkDelegationContractRef(automaticSupervision: boolean, taskPairEngine = true): string {
   // Both variants share one contractId, so the reference must say which one it
   // means. The supervised reference is byte-identical to what it always was --
   // `fullText` names the supervision decision entrypoints that carry its body,
@@ -492,7 +523,7 @@ export function buildBrainWorkDelegationContractRef(automaticSupervision: boolea
   // Brain there would hand it exactly the automatic duties it must not have.
   return JSON.stringify(automaticSupervision
     ? { contractRef: SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION, fullText: 'supervisionDecision' }
-    : { contractRef: SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION, automaticSupervision: false });
+    : { contractRef: SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION, automaticSupervision: false, ...(taskPairEngine ? {} : { engine: 'legacy' }) });
 }
 
 /**

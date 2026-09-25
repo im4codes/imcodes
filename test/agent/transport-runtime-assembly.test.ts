@@ -214,7 +214,7 @@ describe('buildProviderContextPayload', () => {
   // received the full supervised-delegation contract every turn, so it minted a
   // supervision task, drove recovery/rebind loops and dispatched its own audit
   // for a morning report nobody asked to supervise.
-  const brainSystemText = (input: { automaticSupervisionEnabled?: boolean; brainContractRegistered?: boolean }) => (
+  const brainSystemText = (input: { automaticSupervisionEnabled?: boolean; brainContractRegistered?: boolean; taskPairEngine?: boolean }) => (
     buildProviderContextPayload(
       makeProvider('full-normalized-context-injection'),
       {
@@ -225,6 +225,21 @@ describe('buildProviderContextPayload', () => {
       },
     ).sessionSystemText ?? ''
   );
+
+  it('a supervision-off Brain on the pairs engine opens pairs for audited work with no own heartbeat; only a legacy-engine Brain keeps its cron', () => {
+    const pairs = brainSystemText({ automaticSupervisionEnabled: false });
+    expect(pairs).toContain('"auditedWork":{"route":"task_pair"');
+    expect(pairs).toContain('"brainCronSelf":"forbidden"');
+    expect(pairs).not.toContain('cron_create_self');
+    const legacy = brainSystemText({ automaticSupervisionEnabled: false, taskPairEngine: false });
+    expect(legacy).toContain('cron_create_self_every_10_min');
+    expect(legacy).toContain('cron_cancel_self_when_finished');
+    // Registered variants are re-asserted by reference to their own variant.
+    expect(brainSystemText({ automaticSupervisionEnabled: false, taskPairEngine: false, brainContractRegistered: true }))
+      .toContain('"engine":"legacy"');
+    expect(brainSystemText({ automaticSupervisionEnabled: false, brainContractRegistered: true }))
+      .not.toContain('"engine":"legacy"');
+  });
 
   const AUTOMATIC_SUPERVISION_MARKERS = [
     'task_assignment',

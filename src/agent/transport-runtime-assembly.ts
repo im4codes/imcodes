@@ -70,6 +70,13 @@ export interface TransportRuntimeAssemblyInput {
    * `brainContractRegistered` must refer to THIS variant's registration.
    */
   automaticSupervisionEnabled?: boolean;
+  /**
+   * The session's project runs the `pairs` supervision engine (the default;
+   * absent means true). Selects how user-requested audited work is kept moving
+   * in the manual-only Brain contract. `brainContractRegistered` must refer to
+   * this variant too.
+   */
+  taskPairEngine?: boolean;
   /** Full dynamic contracts that are not yet registered on this provider thread. */
   registeredSystemContractText?: string;
   attachments?: TransportAttachment[];
@@ -463,12 +470,13 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
   // provider's system/developer channel even for slash-control turns.
   const cronControlTrustedSystemClause = CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE;
   const automaticSupervision = input.automaticSupervisionEnabled === true;
+  const taskPairEngine = input.taskPairEngine !== false;
   const brainDelegationContract = input.sessionIdentity?.role === 'brain'
     ? (input.brainContractRegistered
-      ? buildBrainWorkDelegationContractRef(automaticSupervision)
+      ? buildBrainWorkDelegationContractRef(automaticSupervision, taskPairEngine)
       : automaticSupervision
         ? buildBrainSupervisedWorkDelegationContract()
-        : buildBrainManualOnlyDelegationContract())
+        : buildBrainManualOnlyDelegationContract(undefined, { taskPairEngine }))
     : undefined;
   // Daemon-injected, session-stable identity block. NOT subject to
   // `USER_SESSION_TEXT_MAX_CHARS` — encodes IM.codes runtime behaviour
