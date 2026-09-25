@@ -2235,8 +2235,18 @@ export function useTimeline(
       : args?.afterTs === undefined
         ? ws.sendTimelineHistoryRequest(sessionId, args?.limit ?? MAX_MEMORY_EVENTS)
         : ws.sendTimelineHistoryRequest(sessionId, args.limit ?? MAX_MEMORY_EVENTS, args.afterTs);
-    historyRequestIdRef.current = requestId;
-    armForwardHistoryTimeout(requestId, phase);
+    // ws.sendTimelineHistoryRequest de-dupes by (session, limit, afterTs): a
+    // call for a key with an already-outstanding request returns the SAME
+    // requestId without putting a new frame on the wire. Re-arming the give-up
+    // timeout unconditionally on every such no-op call lets a caller that
+    // retries faster than FORWARD_HISTORY_TIMEOUT_MS (the refresh button, a
+    // reconnect burst, a bootstrap re-run) push the deadline out indefinitely,
+    // so the fallback that stops the spinner never fires. Only a genuinely new
+    // requestId re-arms; a de-duped repeat leaves the original deadline alone.
+    if (requestId !== historyRequestIdRef.current) {
+      historyRequestIdRef.current = requestId;
+      armForwardHistoryTimeout(requestId, phase);
+    }
     return requestId;
   }, [armForwardHistoryTimeout, sessionId, ws]);
 
