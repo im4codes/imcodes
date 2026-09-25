@@ -1279,7 +1279,11 @@
     "stop_voice": "停止语音输入",
     "send": "发送",
     "mic_permission_failed": "启动失败 — 请在设置中检查麦克风/语音识别权限",
-    "error": "语音错误：{{error}}"
+    "error": "语音错误：{{error}}",
+    "notepad": "记事本",
+    "notepad_hint": "持续转录会议直到你停止，然后发给当前会话总结。请保持 App 在前台，屏幕会保持常亮。",
+    "notepad_send": "发送并总结",
+    "notepad_summary_prompt": "以下是用语音输入记录的会议/谈话转录。请总结：要点、决定、待办事项（如提到负责人请注明）。转录可能有识别错误。\n\n转录内容："
   },
   "p2p": {
     "final_original_request_reminder": "在完成讨论综合后，务必直接落实并完整回应用户的原始请求，不要只停留在讨论总结。\n用户的原始请求是：\"{{request}}\"",

@@ -3086,6 +3086,16 @@ html.native-ios-mac .chat-dl-btn {
   transition: all 0.2s;
 }
 .voice-overlay-close:hover { background: rgba(255,255,255,0.12); color: #e2e8f0; }
+.voice-overlay-actions { display: flex; align-items: center; gap: 10px; }
+.voice-notepad-toggle {
+  background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1);
+  color: #94a3b8; font-size: 13px; font-family: inherit; cursor: pointer;
+  height: 36px; padding: 0 12px; border-radius: 18px; white-space: nowrap;
+  transition: all 0.2s;
+}
+.voice-notepad-toggle:hover { background: rgba(255,255,255,0.12); color: #e2e8f0; }
+.voice-notepad-toggle-active { background: rgba(34,211,238,0.16); border-color: rgba(34,211,238,0.55); color: #a5f3fc; }
+.voice-notepad-elapsed { font-variant-numeric: tabular-nums; letter-spacing: 1px; color: #a5f3fc; }
 .voice-overlay-status {
   display: flex; align-items: center; gap: 8px;
   font-size: 13px; color: #64748b;

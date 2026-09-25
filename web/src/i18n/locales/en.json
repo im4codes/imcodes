@@ -1279,7 +1279,11 @@
     "stop_voice": "Stop voice input",
     "send": "Send",
     "mic_permission_failed": "Failed to start — check microphone/speech permissions in Settings",
-    "error": "Voice error: {{error}}"
+    "error": "Voice error: {{error}}",
+    "notepad": "Notepad",
+    "notepad_hint": "Keep transcribing a meeting until you stop, then send it to this session to summarize. Keep the app open; the screen stays on.",
+    "notepad_send": "Send & summarize",
+    "notepad_summary_prompt": "Below is a transcript of a meeting or conversation recorded with voice input. Please summarize it: key points, decisions, and action items (with owners if mentioned). The transcript may contain recognition errors.\n\nTranscript:"
   },
   "p2p": {
     "final_original_request_reminder": "After synthesizing the discussion, directly address and fulfill the user's original request instead of stopping at a discussion summary.\nThe original user request is: \"{{request}}\"",

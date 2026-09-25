@@ -1279,7 +1279,11 @@
     "stop_voice": "停止語音輸入",
     "send": "傳送",
     "mic_permission_failed": "啟動失敗 — 請在設定中檢查麥克風/語音辨識權限",
-    "error": "語音錯誤：{{error}}"
+    "error": "語音錯誤：{{error}}",
+    "notepad": "記事本",
+    "notepad_hint": "持續轉錄會議直到你停止，然後傳給目前工作階段總結。請保持 App 在前景，螢幕會保持常亮。",
+    "notepad_send": "傳送並總結",
+    "notepad_summary_prompt": "以下是用語音輸入記錄的會議/談話轉錄。請總結：重點、決定、待辦事項（如提到負責人請註明）。轉錄可能有辨識錯誤。\n\n轉錄內容："
   },
   "p2p": {
     "final_original_request_reminder": "在完成討論綜合後，務必直接落實並完整回應使用者的原始請求，不要只停留在討論總結。\n使用者的原始請求是：「{{request}}」",

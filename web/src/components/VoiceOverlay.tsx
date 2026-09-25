@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import * as VoiceInput from './VoiceInput.js';
+import { holdScreenAwake } from '../screen-awake.js';
 
 interface Props {
   open: boolean;
@@ -11,6 +12,22 @@ interface Props {
 }
 
 const BAR_COUNT = 48;
+/** Delay before re-arming the recognizer after it ends a segment by itself. */
+export const NOTEPAD_RESTART_DELAY_MS = 250;
+/** A notepad segment shorter than this counts as a failed restart. */
+export const NOTEPAD_SHORT_SEGMENT_MS = 1500;
+/** Consecutive short segments after which notepad auto-restart gives up. */
+export const NOTEPAD_MAX_SHORT_SEGMENTS = 5;
+
+function formatElapsed(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const sec = total % 60;
+  const mm = String(m).padStart(2, '0');
+  const ss = String(sec).padStart(2, '0');
+  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
 
 export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
   const { t } = useTranslation();
@@ -32,6 +49,16 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
   // Guard: true while overlay is open
   const openRef = useRef(false);
   const autoStartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Notepad mode: keep listening across recognizer segments until the user stops.
+  const [notepad, setNotepad] = useState(false);
+  const notepadRef = useRef(false);
+  const [notepadStartedAt, setNotepadStartedAt] = useState<number | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+  const restartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const segmentStartedAtRef = useRef(0);
+  const shortSegmentsRef = useRef(0);
+  // Set when auto-restart gave up; only a user action re-arms it.
+  const restartPausedRef = useRef(false);
 
   const setListeningState = useCallback((next: boolean) => {
     // stopListening() reports `false` synchronously while the effect is being
@@ -43,6 +70,12 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
     }
     listeningRef.current = next;
     setListening(next);
+  }, []);
+
+  const clearRestartTimer = useCallback(() => {
+    if (!restartTimerRef.current) return;
+    clearTimeout(restartTimerRef.current);
+    restartTimerRef.current = null;
   }, []);
 
   const clearAutoStartTimer = useCallback(() => {
@@ -60,6 +93,11 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
     setMaxH('66vh');
     setListening(false);
     listeningRef.current = false;
+    notepadRef.current = false;
+    setNotepad(false);
+    setNotepadStartedAt(null);
+    shortSegmentsRef.current = 0;
+    restartPausedRef.current = false;
     insertPosRef.current = init.length;
     voiceLenRef.current = 0;
     sessionTokenRef.current++;
@@ -96,6 +134,8 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
     }, 150);
     return () => {
       clearAutoStartTimer();
+      clearRestartTimer();
+      notepadRef.current = false;
       openRef.current = false;
       vv?.removeEventListener('resize', onResize);
       VoiceInput.onAudioLevel(null);
@@ -106,7 +146,7 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
       // ref truthful; the next open initializes both ref and rendered state.
       listeningRef.current = false;
     };
-  }, [open, clearAutoStartTimer, setListeningState]);
+  }, [open, clearAutoStartTimer, clearRestartTimer, setListeningState]);
 
   /** Start a new recognition session, inserting at given position */
   const startSession = useCallback(async (atPos: number) => {
@@ -116,6 +156,7 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
     const token = ++sessionTokenRef.current;
     insertPosRef.current = atPos;
     voiceLenRef.current = 0;
+    segmentStartedAtRef.current = Date.now();
 
     try {
       const ok = await VoiceInput.startListening((partial) => {
@@ -129,8 +170,9 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
         const before = ta.value.slice(0, pos);
         const after = ta.value.slice(pos + oldLen);
         // Add a space separator if needed
-        const needSpace = before.length > 0 && !before.endsWith(' ') && !before.endsWith('\n') && oldLen === 0;
-        const sep = needSpace ? ' ' : '';
+        const needSep = before.length > 0 && !before.endsWith(' ') && !before.endsWith('\n') && oldLen === 0;
+        // Notepad segments end at pauses, so each one starts on its own line.
+        const sep = needSep ? (notepadRef.current ? '\n' : ' ') : '';
         programmaticWriteRef.current = true;
         ta.value = before + sep + partial + after;
         programmaticWriteRef.current = false;
@@ -150,15 +192,45 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
         if (sessionTokenRef.current !== token) return;
         if (!openRef.current && next) return;
         setListeningState(next);
+        // A stop with a still-current token was not requested by the user
+        // (user stops bump the token first): the recognizer ended a segment.
+        if (!next && notepadRef.current && openRef.current) scheduleNotepadRestart();
       });
       // Check guards after async — overlay may have closed or session may have changed
       if (ok && sessionTokenRef.current === token && openRef.current) {
         setListeningState(true);
       } else if (!ok && sessionTokenRef.current === token) {
         setListeningState(false);
+        stopNotepadAutoRestart();
       }
     } catch { /* ignore */ }
   }, [setListeningState]);
+
+  /** Recognizer ended a segment on its own in notepad mode: keep going at the end. */
+  function scheduleNotepadRestart(): void {
+    if (restartPausedRef.current) return;
+    const lasted = Date.now() - segmentStartedAtRef.current;
+    shortSegmentsRef.current = lasted < NOTEPAD_SHORT_SEGMENT_MS ? shortSegmentsRef.current + 1 : 0;
+    if (shortSegmentsRef.current >= NOTEPAD_MAX_SHORT_SEGMENTS) {
+      stopNotepadAutoRestart();
+      return;
+    }
+    // Commit the finished segment; the next one appends after it.
+    insertPosRef.current += voiceLenRef.current;
+    voiceLenRef.current = 0;
+    clearRestartTimer();
+    restartTimerRef.current = setTimeout(() => {
+      restartTimerRef.current = null;
+      if (!notepadRef.current || !openRef.current || listeningRef.current) return;
+      void startSession(taRef.current?.value.length ?? 0);
+    }, NOTEPAD_RESTART_DELAY_MS);
+  }
+
+  /** Leave notepad listening paused (recognizer unavailable or failing fast). */
+  function stopNotepadAutoRestart(): void {
+    clearRestartTimer();
+    restartPausedRef.current = true;
+  }
 
   /** Stop current session and commit voice zone */
   const commitAndStop = useCallback(async () => {
@@ -177,33 +249,73 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
   }, [commitAndStop, startSession]);
 
   const handleToggle = useCallback(async () => {
-    if (listeningRef.current) {
+    if (listeningRef.current || restartTimerRef.current) {
+      clearRestartTimer();
       await commitAndStop();
       setBars(Array(BAR_COUNT).fill(2));
       barsRef.current = Array(BAR_COUNT).fill(2);
     } else {
       clearAutoStartTimer();
+      restartPausedRef.current = false;
+      shortSegmentsRef.current = 0;
       const ta = taRef.current;
       const pos = ta ? (ta.selectionStart ?? ta.value.length) : 0;
       void startSession(pos);
     }
-  }, [startSession, commitAndStop, clearAutoStartTimer]);
+  }, [startSession, commitAndStop, clearAutoStartTimer, clearRestartTimer]);
+
+  const handleNotepadToggle = useCallback(() => {
+    const next = !notepadRef.current;
+    notepadRef.current = next;
+    setNotepad(next);
+    shortSegmentsRef.current = 0;
+    restartPausedRef.current = false;
+    if (!next) {
+      clearRestartTimer();
+      setNotepadStartedAt(null);
+      return;
+    }
+    setNotepadStartedAt(Date.now());
+    setNow(Date.now());
+    if (!listeningRef.current) {
+      clearAutoStartTimer();
+      void startSession(taRef.current?.value.length ?? 0);
+    }
+  }, [clearAutoStartTimer, clearRestartTimer, startSession]);
+
+  // Elapsed-time clock while notepad mode is on.
+  useEffect(() => {
+    if (!notepad) return;
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [notepad]);
+
+  // Keep the screen on during a notepad: a locked screen backgrounds the app
+  // and the foreground recognizer stops.
+  useEffect(() => {
+    if (!notepad || !open) return;
+    return holdScreenAwake();
+  }, [notepad, open]);
 
   const handleSend = useCallback(() => {
-    const text = (taRef.current?.value ?? '').trim();
-    if (!text) return;
+    const transcript = (taRef.current?.value ?? '').trim();
+    if (!transcript) return;
+    const text = notepadRef.current ? `${t('voice.notepad_summary_prompt')}\n\n${transcript}` : transcript;
+    clearRestartTimer();
     sessionTokenRef.current++;
     VoiceInput.stopListening();
     setListeningState(false);
     if (onSend(text) === 'accepted') onClose();
-  }, [onSend, onClose, setListeningState]);
+  }, [onSend, onClose, setListeningState, clearRestartTimer, t]);
 
   const handleClose = useCallback(() => {
+    clearRestartTimer();
+    notepadRef.current = false;
     sessionTokenRef.current++;
     VoiceInput.stopListening();
     setListeningState(false);
     onClose();
-  }, [onClose, setListeningState]);
+  }, [onClose, setListeningState, clearRestartTimer]);
 
   /** User manually edited the textarea — commit voice zone and stop recognition */
   const handleInput = useCallback(() => {
@@ -211,10 +323,11 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
     // Ignore programmatic writes from partial callbacks
     if (programmaticWriteRef.current) return;
     // User typed/pasted/deleted — commit current voice segment and stop
-    if (listeningRef.current) {
+    if (listeningRef.current || restartTimerRef.current) {
+      clearRestartTimer();
       void commitAndStop();
     }
-  }, [commitAndStop]);
+  }, [commitAndStop, clearRestartTimer]);
 
   /** Cursor moved outside the active voice zone while listening — restart at new position */
   const handleCursorChange = useCallback(() => {
@@ -243,8 +356,22 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
         <div class="voice-overlay-status">
           <div class={`voice-status-dot${listening ? ' voice-status-dot-active' : ''}`} />
           <span>{listening ? t('voice.listening') : t('voice.paused')}</span>
+          {notepad && notepadStartedAt !== null && (
+            <span class="voice-notepad-elapsed">{formatElapsed(now - notepadStartedAt)}</span>
+          )}
         </div>
-        <button class="voice-overlay-close" onClick={handleClose}>✕</button>
+        <div class="voice-overlay-actions">
+          <button
+            type="button"
+            class={`voice-notepad-toggle${notepad ? ' voice-notepad-toggle-active' : ''}`}
+            aria-pressed={notepad}
+            title={t('voice.notepad_hint')}
+            onClick={handleNotepadToggle}
+          >
+            📝 {t('voice.notepad')}
+          </button>
+          <button class="voice-overlay-close" onClick={handleClose} aria-label={t('common.close')}>✕</button>
+        </div>
       </div>
 
       <textarea
@@ -300,7 +427,7 @@ export function VoiceOverlay({ open, onClose, onSend, initialText }: Props) {
             <line x1="22" y1="2" x2="11" y2="13" />
             <polygon points="22 2 15 22 11 13 2 9 22 2" />
           </svg>
-          <span>{t('voice.send')}</span>
+          <span>{notepad ? t('voice.notepad_send') : t('voice.send')}</span>
         </button>
       </div>
     </div>

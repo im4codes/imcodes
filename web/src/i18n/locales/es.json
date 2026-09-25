@@ -1279,7 +1279,11 @@
     "stop_voice": "Detener entrada de voz",
     "send": "Enviar",
     "mic_permission_failed": "Error al iniciar — verifica los permisos de micrófono/reconocimiento de voz en Ajustes",
-    "error": "Error de voz: {{error}}"
+    "error": "Error de voz: {{error}}",
+    "notepad": "Notas",
+    "notepad_hint": "Transcribe una reunión hasta que la detengas y luego envíala a esta sesión para resumirla. Mantén la app abierta; la pantalla permanece encendida.",
+    "notepad_send": "Enviar y resumir",
+    "notepad_summary_prompt": "A continuación hay una transcripción de una reunión o conversación grabada con entrada de voz. Resúmela: puntos clave, decisiones y tareas pendientes (con responsables si se mencionan). La transcripción puede contener errores de reconocimiento.\n\nTranscripción:"
   },
   "p2p": {
     "final_original_request_reminder": "No te quedes solo en el resumen de la discusión. Después de sintetizarla, asegúrate de responder y ejecutar directamente la solicitud original del usuario.\nLa solicitud original del usuario es: \"{{request}}\"",
