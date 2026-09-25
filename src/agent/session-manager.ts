@@ -2069,12 +2069,7 @@ function wireTransportSessionInfo(
 
     if (typeof info.resumeId === 'string' && info.resumeId) {
       if (agentType === 'claude-code-sdk' && next.ccSessionId !== info.resumeId) {
-        if (typeof reassignSessionFile === 'function') {
-          reassignSessionFile(sessionName, next.ccSessionId, info.resumeId);
-        } else {
-          // Compatibility with narrow test seams and older embedded callers.
-          reserveSessionFile(sessionName, info.resumeId);
-        }
+        reassignSessionFile(sessionName, next.ccSessionId, info.resumeId);
         next.ccSessionId = info.resumeId;
         changed = true;
       }

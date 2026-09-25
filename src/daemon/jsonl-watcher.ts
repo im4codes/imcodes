@@ -274,12 +274,14 @@ export function reserveSessionFile(sessionName: string, ccSessionId: string): vo
  * owns it; a conflicting owner is never disturbed.
  */
 export function reassignSessionFile(sessionName: string, previousCcSessionId: string | undefined, nextCcSessionId: string): void {
-  const previous = previousCcSessionId?.trim();
+  // Keep the old id argument in the API so callers document the transition.
+  void previousCcSessionId;
   const next = nextCcSessionId.trim();
   if (!next) return;
-  if (previous && previous !== next && ownedFileIds.get(previous) === sessionName) {
-    ownedFileIds.delete(previous);
-  }
+  // Keep the retired UUID reserved by the same session until stopWatching.
+  // A directory-scan watcher may otherwise adopt the still-present old
+  // transcript before Claude creates the new file. releaseOwnership() clears
+  // both retired and live reservations together.
   reserveSessionFile(sessionName, next);
 }
 

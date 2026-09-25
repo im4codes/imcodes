@@ -15,8 +15,10 @@ const mocks = vi.hoisted(() => {
   // Whether the mock app-server reports the IM delegation MCP server as
   // connected. Default true so ordinary Brain turns may start; a control test
   // flips it to prove the production gate actually blocks the turn.
-  return { store, claudeRuns, codexRuns, claudeFailures, mcpDelegationConnected: true };
+  return { store, claudeRuns, codexRuns, claudeFailures, mcpDelegationConnected: true, claudeSessionIdOverride: undefined as string | undefined };
 });
+
+const reassignSessionFileMock = vi.hoisted(() => vi.fn());
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
 const timelineReadByTypesPreferredMock = vi.hoisted(() => vi.fn(async () => []));
@@ -153,8 +155,9 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
           throw new Error('simulated transport failure');
         }
       }
-      yield { type: 'system', subtype: 'init', session_id: String(options.resume ?? options.sessionId), model: 'claude-sonnet-4-6' };
-      yield { type: 'result', subtype: 'success', is_error: false, session_id: String(options.resume ?? options.sessionId), result: prompt.includes('token') ? 'BANANA' : 'ACK', usage: { input_tokens: 11, output_tokens: 2, cache_read_input_tokens: 0 } };
+      const sessionId = mocks.claudeSessionIdOverride ?? String(options.resume ?? options.sessionId);
+      yield { type: 'system', subtype: 'init', session_id: sessionId, model: 'claude-sonnet-4-6' };
+      yield { type: 'result', subtype: 'success', is_error: false, session_id: sessionId, result: prompt.includes('token') ? 'BANANA' : 'ACK', usage: { input_tokens: 11, output_tokens: 2, cache_read_input_tokens: 0 } };
     }
     const q = gen() as AsyncGenerator<any, void> & { close(): void; interrupt(): Promise<void> };
     q.close = () => {};
@@ -195,7 +198,7 @@ vi.mock('../../src/agent/tmux.js', () => ({
   newSession: vi.fn().mockResolvedValue(undefined), killSession: vi.fn().mockResolvedValue(undefined), sessionExists: vi.fn(), isPaneAlive: vi.fn(), respawnPane: vi.fn(),
   sendKeys: vi.fn(), sendKey: vi.fn(), capturePane: vi.fn(), showBuffer: vi.fn(), getPaneId: vi.fn().mockResolvedValue(undefined), getPaneCwd: vi.fn().mockResolvedValue('/tmp'), getPaneStartCommand: vi.fn().mockResolvedValue(''), cleanupOrphanFifos: vi.fn(), BACKEND: 'tmux',
 }));
-vi.mock('../../src/daemon/jsonl-watcher.js', () => ({ startWatching: vi.fn().mockResolvedValue(undefined), startWatchingFile: vi.fn().mockResolvedValue(undefined), reserveSessionFile: vi.fn(), reassignSessionFile: vi.fn(), stopWatching: vi.fn(), isWatching: vi.fn(() => false), findJsonlPathBySessionId: vi.fn(() => '/tmp/mock.jsonl') }));
+vi.mock('../../src/daemon/jsonl-watcher.js', () => ({ startWatching: vi.fn().mockResolvedValue(undefined), startWatchingFile: vi.fn().mockResolvedValue(undefined), reserveSessionFile: vi.fn(), reassignSessionFile: reassignSessionFileMock, stopWatching: vi.fn(), isWatching: vi.fn(() => false), findJsonlPathBySessionId: vi.fn(() => '/tmp/mock.jsonl') }));
 vi.mock('../../src/daemon/codex-watcher.js', () => ({ startWatching: vi.fn().mockResolvedValue(undefined), startWatchingSpecificFile: vi.fn().mockResolvedValue(undefined), startWatchingById: vi.fn().mockResolvedValue(undefined), stopWatching: vi.fn(), isWatching: vi.fn(() => false), findRolloutPathByUuid: vi.fn(async () => null) }));
 vi.mock('../../src/daemon/gemini-watcher.js', () => ({ startWatching: vi.fn().mockResolvedValue(undefined), startWatchingLatest: vi.fn().mockResolvedValue(undefined), stopWatching: vi.fn(), isWatching: vi.fn(() => false) }));
 vi.mock('../../src/daemon/opencode-watcher.js', () => ({ startWatching: vi.fn().mockResolvedValue(undefined), stopWatching: vi.fn(), isWatching: vi.fn(() => false) }));
@@ -475,6 +478,8 @@ describe('sdk transport session restore', () => {
     mocks.claudeRuns.length = 0;
     mocks.codexRuns.length = 0;
     mocks.claudeFailures.clear();
+    mocks.claudeSessionIdOverride = undefined;
+    reassignSessionFileMock.mockClear();
     mocks.mcpDelegationConnected = true;
     getDshPresetTransportConfigMock.mockClear();
     clearAllResend();
@@ -2639,6 +2644,47 @@ describe('sdk transport session restore', () => {
 
     expect(run?.options.resume).toBe('cc-session-switch');
     expect(run?.options.sessionId).toBeUndefined();
+  });
+
+  it('migrates transcript ownership when a live Claude SDK stream reports a new session id', async () => {
+    const name = 'deck_resume_claim_change_brain';
+    mocks.store.set(name, {
+      name,
+      projectName: 'resume-claim-change',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/resume-claim-change',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      providerSessionId: 'route-resume-claim-change',
+      ccSessionId: 'cc-session-old',
+      requestedModel: 'sonnet',
+    });
+
+    await connectProvider('claude-code-sdk', {});
+    await launchTransportSession({
+      name,
+      projectName: 'resume-claim-change',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/resume-claim-change',
+      requestedModel: 'sonnet',
+      ccSessionId: 'cc-session-old',
+    });
+
+    mocks.claudeSessionIdOverride = 'cc-session-new';
+    const runtime = getTransportRuntime(name);
+    expect(runtime).toBeDefined();
+    runtime!.send('rotate transcript');
+    await settleClaudeRun(name, 'rotate transcript');
+
+    expect(reassignSessionFileMock).toHaveBeenCalledWith(name, 'cc-session-old', 'cc-session-new');
+    expect(mocks.store.get(name)?.ccSessionId).toBe('cc-session-new');
   });
 
   it('relaunches claude-code-sdk with a fresh provider route key while preserving the Claude resume id', async () => {

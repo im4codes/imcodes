@@ -187,6 +187,7 @@ afterEach(async () => {
   stopWatching('test_session_2');
   stopWatching('other_session');
   stopWatching('rogue_session');
+  stopWatching('rogue_scan');
   stopWatching('brain_sdk_session');
   await rm(testDir, { recursive: true, force: true }).catch(() => {});
 });
@@ -857,21 +858,26 @@ describe('reserveSessionFile — protects non-watched (e.g. claude-code-sdk) ses
     expect(ownerForTests(join(testDir, 'released-uuid.jsonl'))).toBeUndefined();
   });
 
-  it('reassigns a resumed SDK transcript atomically and excludes both stale and live ids from rogue scans', async () => {
+  it('retains the retired SDK transcript claim so directory scans cannot adopt either id', async () => {
+    const oldFile = join(claudeProjectDir(testDir), 'old-resume-id.jsonl');
+    await mkdir(claudeProjectDir(testDir), { recursive: true });
+    await writeFile(oldFile, assistantText('old transcript'));
     reserveSessionFile('brain_sdk_session', 'old-resume-id');
     reassignSessionFile('brain_sdk_session', 'old-resume-id', 'new-resume-id');
-    expect(ownerForTests(join(testDir, 'old-resume-id.jsonl'))).toBeUndefined();
+    expect(ownerForTests(oldFile)).toBe('brain_sdk_session');
     expect(ownerForTests(join(testDir, 'new-resume-id.jsonl'))).toBe('brain_sdk_session');
 
-    const rogueFile = join(testDir, 'rogue-own.jsonl');
-    await writeFile(rogueFile, assistantText('rogue'));
-    await startWatchingFile('rogue_session', rogueFile);
+    await startWatching('rogue_scan', testDir);
     await new Promise((resolve) => setTimeout(resolve, 150));
-    expect(activeFileForTests('rogue_session')).toBe(rogueFile);
-    // A directory-scan watcher cannot adopt either reserved UUID after the
-    // transport's resume id changes; the old claim is gone, the new one lives.
-    expect(ownerForTests(join(testDir, 'old-resume-id.jsonl'))).toBeUndefined();
+    expect(activeFileForTests('rogue_scan')).toBeNull();
+    // The old transcript remains present but reserved until the SDK session
+    // stops; the future transcript id is reserved before it is created.
+    expect(ownerForTests(oldFile)).toBe('brain_sdk_session');
     expect(ownerForTests(join(testDir, 'new-resume-id.jsonl'))).toBe('brain_sdk_session');
+
+    stopWatching('brain_sdk_session');
+    expect(ownerForTests(oldFile)).toBeUndefined();
+    expect(ownerForTests(join(testDir, 'new-resume-id.jsonl'))).toBeUndefined();
   });
 });
 
