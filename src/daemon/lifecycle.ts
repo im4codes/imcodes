@@ -1458,6 +1458,7 @@ export async function startup(): Promise<DaemonContext> {
         if (supervisionAutomation.isWaitingForUserInput(sessionName)) {
           return {
             label: record.label,
+            model: record.activeModel?.trim() || record.requestedModel?.trim(),
             state: 'needs_input',
             source: 'supervision',
             observedAt: record.updatedAt,
@@ -1466,6 +1467,7 @@ export async function startup(): Promise<DaemonContext> {
         const observed = resolveAuthoritativeSessionListState(record);
         return {
           label: record.label,
+          model: record.activeModel?.trim() || record.requestedModel?.trim(),
           state: observed === 'running' || observed === 'queued'
             ? 'running'
             : observed === 'idle'

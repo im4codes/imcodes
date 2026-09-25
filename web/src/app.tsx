@@ -3831,6 +3831,8 @@ export function App() {
           sessionType: sub.type ?? '',
           state: sub.state,
           label: sub.label,
+          activeModel: sub.activeModel,
+          requestedModel: sub.requestedModel,
           parentSession: sub.parentSession,
           queueEpoch: sub.queueEpoch,
           queueAuthorityId: sub.queueAuthorityId,

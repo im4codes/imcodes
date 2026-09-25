@@ -4386,6 +4386,11 @@
     "panel_group_recent": "Recently completed",
     "panel_queued": "Queued {{duration}} ago",
     "panel_unassigned": "Unassigned",
-    "panel_started": "Started {{time}}"
+    "panel_started": "Started {{time}}",
+    "panel_duration_day": "d",
+    "panel_executor": "Executor",
+    "panel_auditor": "Auditor",
+    "panel_untitled": "Untitled task",
+    "panel_model_separator": " · "
   }
 }

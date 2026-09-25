@@ -19,11 +19,11 @@ function normalizeSnapshot(detail: { tasks?: readonly Record<string, unknown>[];
   return detail.tasks.map((task) => {
     const pair = (task.pair ?? {}) as Record<string, unknown>; const roles = byTask.get(String(task.taskId)) ?? [];
     const executor = roles.find((role) => role.role === 'implementer'); const auditor = roles.find((role) => role.role === 'auditor');
-    return { ...pair, taskId: task.taskId, title: task.title, toStatus: pair.status ?? task.status, startedAt: pair.createdAt ?? task.updatedAt, queuePosition: pair.queuePosition, executor: pair.executor, auditor: pair.auditor, executorLabel: executor?.ownerSessionLabel ?? pair.executorLabel, auditorLabel: auditor?.ownerSessionLabel ?? pair.auditorLabel, executorState: executor?.sessionState ?? pair.executorState, auditorState: auditor?.sessionState ?? pair.auditorState };
+    return { ...pair, taskId: task.taskId, title: task.title, toStatus: pair.status ?? task.status, startedAt: pair.createdAt ?? task.updatedAt, queuePosition: pair.queuePosition, executor: pair.executor, auditor: pair.auditor, executorLabel: executor?.ownerSessionLabel ?? pair.executorLabel, auditorLabel: auditor?.ownerSessionLabel ?? pair.auditorLabel, executorModel: executor?.observedModel ?? pair.executorModel, auditorModel: auditor?.observedModel ?? pair.auditorModel, executorState: executor?.sessionState ?? pair.executorState, auditorState: auditor?.sessionState ?? pair.auditorState };
   });
 }
 
-type SessionLabelEntry = { name: string; label?: string | null };
+type SessionLabelEntry = { name: string; label?: string | null; activeModel?: string | null; requestedModel?: string | null };
 
 function resolveSessionLabel(
   id: string,
@@ -36,7 +36,20 @@ function resolveSessionLabel(
   if (session?.label?.trim()) return session.label.trim();
   const projected = projectionSessions.find((entry) => entry.sessionName === id);
   if (projected?.title.trim()) return projected.title.trim();
-  return id;
+  return '';
+}
+
+function resolveSessionModel(
+  id: string,
+  payloadModel: unknown,
+  sessions: readonly SessionLabelEntry[] | undefined,
+  projectionSessions: readonly { sessionName: string; title: string; activeModel?: string | null; requestedModel?: string | null }[],
+): string | undefined {
+  if (typeof payloadModel === 'string' && payloadModel.trim()) return payloadModel.trim();
+  const session = sessions?.find((entry) => entry.name === id);
+  if (session?.activeModel?.trim() || session?.requestedModel?.trim()) return session.activeModel?.trim() || session.requestedModel?.trim() || undefined;
+  const projected = projectionSessions.find((entry) => entry.sessionName === id);
+  return projected?.activeModel?.trim() || projected?.requestedModel?.trim() || undefined;
 }
 
 export function TaskPairStatusPanel({ events, sessions }: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[] }) {
@@ -91,13 +104,15 @@ export function TaskPairStatusPanel({ events, sessions }: { events: readonly Tim
   if (latest.size === 0) return null;
   const toggle = () => setCollapsed((value) => { const next = !value; try { window.localStorage.setItem(STORAGE_KEY, next ? '1' : '0'); } catch {} return next; });
   const projectionSessions = watchProjectionStore.getSnapshot().sessions;
-  const session = (id: unknown, label: unknown) => {
+  const session = (id: unknown, label: unknown, model: unknown, role: 'executor' | 'auditor') => {
     if (typeof id !== 'string' || !id) return null;
-    const text = resolveSessionLabel(id, label, sessions, projectionSessions);
-    return <button type="button" class="task-pair-status-session" onClick={() => window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: id } }))}>{text}</button>;
+    const text = resolveSessionLabel(id, label, sessions, projectionSessions) || t(`taskPair.panel_${role}`);
+    const resolvedModel = resolveSessionModel(id, model, sessions, projectionSessions);
+    return <button type="button" class="task-pair-status-session" data-session-name={id} onClick={() => window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: id } }))}>{resolvedModel ? `${text}${t('taskPair.panel_model_separator')}${resolvedModel}` : text}</button>;
   };
   const durationUnits = {
     hour: t('taskPair.panel_duration_hour'),
+    day: t('taskPair.panel_duration_day'),
     minute: t('taskPair.panel_duration_minute'),
     second: t('taskPair.panel_duration_second'),
     separator: t('taskPair.panel_duration_separator'),
@@ -110,12 +125,12 @@ export function TaskPairStatusPanel({ events, sessions }: { events: readonly Tim
     {!collapsed && <div class="task-pair-status-rows">
       {groups.map((group) => {
         const heading = <h4>{t(`taskPair.panel_group_${group.key}`)} <small>({group.rows.length})</small></h4>;
-        const content = group.rows.map((row, index) => { const payload = row.payload; const queued = group.key === 'queued'; const elapsedSeconds = Math.max(0, Math.floor((now - row.startedAt) / 1000)); const title = typeof payload.title === 'string' && payload.title.trim() ? payload.title : String(payload.taskId); return <div class="task-pair-status-row" key={String(payload.taskId)}>
+        const content = group.rows.map((row, index) => { const payload = row.payload; const queued = group.key === 'queued'; const elapsedSeconds = Math.max(0, Math.floor((now - row.startedAt) / 1000)); const title = typeof payload.title === 'string' && payload.title.trim() ? payload.title : t('taskPair.panel_untitled'); return <div class="task-pair-status-row" key={String(payload.taskId)}>
           <strong>{queued && <em>#{Number(payload.queuePosition ?? index + 1)} </em>}{title}</strong>
           {queued && payload.urgent === true && <span class="task-pair-status-urgent">!</span>}
           <small>{t('taskPair.panel_started', { time: new Date(row.startedAt).toLocaleTimeString() })} · {queued ? t('taskPair.panel_queued', { duration: formatElapsedDuration(elapsedSeconds, durationUnits) }) : t('taskPair.panel_elapsed', { duration: formatElapsedDuration(elapsedSeconds, durationUnits) })}</small>
           {!queued && <span>{payload.toStatus === 'rework' ? t('taskPair.status.rework_round', { round: payload.round ?? 1 }) : t(`taskPair.status.${payload.toStatus}`)} · {t('taskPair.panel_round', { round: payload.round ?? 0 })}</span>}
-          <div><span class={`task-pair-status-dot ${payload.executorState === 'running' ? 'is-running' : ''}`} />{session(payload.executor, payload.executorLabel) ?? <small>{t('taskPair.panel_unassigned')}</small>}<span class={`task-pair-status-dot ${payload.auditorState === 'running' ? 'is-running' : ''}`} />{session(payload.auditor, payload.auditorLabel) ?? <small>{t('taskPair.panel_unassigned')}</small>}</div>
+          <div><span class={`task-pair-status-dot ${payload.executorState === 'running' ? 'is-running' : ''}`} />{session(payload.executor, payload.executorLabel, payload.executorModel, 'executor') ?? <small>{t('taskPair.panel_unassigned')}</small>}<span class={`task-pair-status-dot ${payload.auditorState === 'running' ? 'is-running' : ''}`} />{session(payload.auditor, payload.auditorLabel, payload.auditorModel, 'auditor') ?? <small>{t('taskPair.panel_unassigned')}</small>}</div>
         </div>; });
         return group.key === 'recent'
           ? <details class={`task-pair-status-group task-pair-status-group-${group.key}`} key={group.key}><summary>{heading}</summary>{content}</details>

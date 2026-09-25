@@ -449,7 +449,9 @@ export interface SupervisionConsolePairInfo {
   queueOrder?: number;
   queuePosition?: number;
   executorLabel?: string;
+  executorModel?: string;
   auditorLabel?: string;
+  auditorModel?: string;
   executorState?: SupervisionConsoleSessionState;
   auditorState?: SupervisionConsoleSessionState;
 }

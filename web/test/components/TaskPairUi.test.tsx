@@ -177,20 +177,42 @@ describe('TaskPairStatusPanel', () => {
       watchProjectionStore.setSnapshotStatus('switching');
     }
   });
+
+  it('shows payload model, falls back to the session model, hides ids, and navigates roles', () => {
+    const navigate = vi.fn();
+    const listener = (event: Event) => navigate((event as CustomEvent).detail.session);
+    window.addEventListener('deck:navigate', listener);
+    render(<TaskPairStatusPanel sessions={[{ name: 'deck_sub_exec', label: 'Cx1', requestedModel: 'gpt-6-luna' }, { name: 'deck_sub_aud', label: 'Auditor', activeModel: 'gpt-6-astra' }]} events={[{
+      eventId: 'models', type: 'task_pair.event', ts: Date.now(),
+      payload: { taskId: 'model-task', title: 'Models', toStatus: 'working', executor: 'deck_sub_exec', executorLabel: 'Executor', executorModel: 'gpt-6-sol', auditor: 'deck_sub_aud' },
+    }] as never} />);
+    expect(screen.getByText(/Executor.*gpt-6-sol/)).toBeTruthy();
+    expect(screen.getByText(/Auditor.*gpt-6-astra/)).toBeTruthy();
+    expect(screen.queryByText(/deck_sub_(exec|aud)/)).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /Executor.*gpt-6-sol/ }));
+    expect(navigate).toHaveBeenCalledWith('deck_sub_exec');
+    window.removeEventListener('deck:navigate', listener);
+  });
+
+  it('uses localized neutral role fallbacks when labels are missing', () => {
+    render(<TaskPairStatusPanel events={[{ eventId: 'fallback', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'fallback-task', title: 'Fallback', toStatus: 'working', executor: 'deck_sub_exec' } }] as never} />);
+    expect(screen.getByText('taskPair.panel_executor')).toBeTruthy();
+    expect(screen.queryByText('deck_sub_exec')).toBeNull();
+  });
 });
 
 describe('formatElapsedDuration', () => {
-  const en = { hour: 'h', minute: 'm', second: 's', separator: ' ' };
-  const zh = { hour: '小时', minute: '分', second: '秒', separator: '' };
+  const en = { day: 'd', hour: 'h', minute: 'm', second: 's', separator: ' ' };
+  const zh = { day: '天', hour: '小时', minute: '分', second: '秒', separator: '' };
   it.each([
     [0, '0s'], [59, '59s'], [60, '1m 0s'], [3599, '59m 59s'],
-    [3600, '1h 0m 0s'], [86_400, '24h 0m 0s'], [86_405, '24h 0m 5s'],
+    [3600, '1h 0m'], [86_399, '23h 59m'], [86_400, '1d 0h'],
   ])('formats %s seconds in English', (seconds, expected) => {
     expect(formatElapsedDuration(seconds, en)).toBe(expected);
   });
   it.each([
     [0, '0秒'], [59, '59秒'], [60, '1分0秒'], [3599, '59分59秒'],
-    [3600, '1小时0分0秒'], [86_400, '24小时0分0秒'], [86_405, '24小时0分5秒'],
+    [3600, '1小时0分'], [86_399, '23小时59分'], [86_400, '1天0小时'],
   ])('formats %s seconds in Simplified Chinese', (seconds, expected) => {
     expect(formatElapsedDuration(seconds, zh)).toBe(expected);
   });

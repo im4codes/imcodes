@@ -4385,6 +4385,11 @@
     "panel_group_recent": "最近完了",
     "panel_queued": "待機 {{duration}}",
     "panel_unassigned": "未割り当て",
-    "panel_started": "開始 {{time}}"
+    "panel_started": "開始 {{time}}",
+    "panel_duration_day": "日",
+    "panel_executor": "実行者",
+    "panel_auditor": "監査役",
+    "panel_untitled": "無題のタスク",
+    "panel_model_separator": " · "
   }
 }

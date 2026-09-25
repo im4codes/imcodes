@@ -4385,6 +4385,11 @@
     "panel_group_recent": "Недавно завершённые",
     "panel_queued": "В очереди {{duration}}",
     "panel_unassigned": "Не назначено",
-    "panel_started": "Начало {{time}}"
+    "panel_started": "Начало {{time}}",
+    "panel_duration_day": "д",
+    "panel_executor": "Исполнитель",
+    "panel_auditor": "Аудитор",
+    "panel_untitled": "Задача без названия",
+    "panel_model_separator": " · "
   }
 }

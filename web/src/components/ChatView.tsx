@@ -163,7 +163,7 @@ interface Props {
   sessionState?: string;
   sessionId?: string | null;
   /** Session labels used by task-pair status rows when the event omits one. */
-  sessions?: readonly { name: string; label?: string | null }[];
+  sessions?: readonly { name: string; label?: string | null; activeModel?: string | null; requestedModel?: string | null }[];
   /** Receives a function that forces the chat list to scroll to the bottom. */
   onScrollBottomFn?: (fn: () => void) => void;
   /** When true, render as a non-interactive preview (no scroll button, no status bar) */

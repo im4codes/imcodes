@@ -642,9 +642,13 @@ export function emitTaskPairTimelineEvent(
     const record = getSession(session);
     if (role === 'executor') {
       if (record?.label) payload.executorLabel = record.label;
+      const model = record?.activeModel?.trim() || record?.requestedModel?.trim();
+      if (model) payload.executorModel = model;
       if (record?.state) payload.executorState = record.state;
     } else {
       if (record?.label) payload.auditorLabel = record.label;
+      const model = record?.activeModel?.trim() || record?.requestedModel?.trim();
+      if (model) payload.auditorModel = model;
       if (record?.state) payload.auditorState = record.state;
     }
   }

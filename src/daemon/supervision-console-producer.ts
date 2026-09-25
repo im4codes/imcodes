@@ -74,6 +74,7 @@ export interface SupervisionProducerOptions {
   /** Live daemon authority for assignment owner presentation. */
   resolveSessionPresentation?: (sessionName: string, durableObservedAt: number) => {
     label?: string;
+    model?: string;
     state: SupervisionConsoleSessionState;
     source: SupervisionConsoleSessionStateSource;
     observedAt: number;
@@ -630,8 +631,8 @@ export class SupervisionConsoleProducer {
           queueOrder: stored.queueOrder,
           ...(queuePositions.has(pair.taskId) ? { queuePosition: queuePositions.get(pair.taskId) } : {}),
           ...(pair.urgent ? { urgent: true } : {}),
-          ...(pair.executor ? (() => { const p = this.#resolveSessionPresentation?.(pair.executor!, pair.updatedAt); return { executorLabel: p?.label, executorState: p?.state }; })() : {}),
-          ...(pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? (() => { const p = this.#resolveSessionPresentation?.(pair.auditor!, pair.updatedAt); return { auditorLabel: p?.label, auditorState: p?.state }; })() : {}),
+          ...(pair.executor ? (() => { const p = this.#resolveSessionPresentation?.(pair.executor!, pair.updatedAt); return { executorLabel: p?.label, executorModel: p?.model, executorState: p?.state }; })() : {}),
+          ...(pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? (() => { const p = this.#resolveSessionPresentation?.(pair.auditor!, pair.updatedAt); return { auditorLabel: p?.label, auditorModel: p?.model, auditorState: p?.state }; })() : {}),
           ...(pair.lastVerdict ? { severityCounts: { ...pair.lastVerdict.counts }, lastVerdict: pair.lastVerdict.verb } : {}),
         },
       });
@@ -650,6 +651,7 @@ export class SupervisionConsoleProducer {
           role,
           ownerSessionName: session,
           ownerSessionLabel: presentation?.label,
+          observedModel: presentation?.model,
           sessionState: presentation?.state ?? 'unknown',
           sessionStateSource: presentation?.source ?? 'registry',
           sessionStateObservedAt: presentation?.observedAt ?? progressAt,

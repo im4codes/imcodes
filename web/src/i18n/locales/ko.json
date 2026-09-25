@@ -4385,6 +4385,11 @@
     "panel_group_recent": "최근 완료",
     "panel_queued": "대기 {{duration}}",
     "panel_unassigned": "미할당",
-    "panel_started": "시작 {{time}}"
+    "panel_started": "시작 {{time}}",
+    "panel_duration_day": "일",
+    "panel_executor": "실행자",
+    "panel_auditor": "감사자",
+    "panel_untitled": "제목 없는 작업",
+    "panel_model_separator": " · "
   }
 }

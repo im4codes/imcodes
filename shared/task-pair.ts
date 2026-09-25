@@ -1066,9 +1066,11 @@ export interface TaskPairEventPayload {
   title?: string;
   executor?: string;
   executorLabel?: string;
+  executorModel?: string;
   executorState?: string;
   auditor?: string;
   auditorLabel?: string;
+  auditorModel?: string;
   auditorState?: string;
   queuePosition?: number;
   urgent?: boolean;

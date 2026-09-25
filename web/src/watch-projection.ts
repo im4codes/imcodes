@@ -60,6 +60,8 @@ export interface WatchSessionRow {
   isSubSession: boolean;
   parentTitle?: string;
   parentSessionName?: string;
+  activeModel?: string | null;
+  requestedModel?: string | null;
   isPinned?: boolean;
   previewText?: string;
   previewUpdatedAt?: number;
@@ -104,6 +106,8 @@ export interface WatchSessionInput {
   state: string;
   label?: string | null;
   parentSession?: string | null;
+  activeModel?: string | null;
+  requestedModel?: string | null;
   queueEpoch?: string | null;
   queueAuthorityId?: string | null;
   transportPendingMessageVersion?: number | null;
@@ -118,6 +122,8 @@ export interface WatchSubSessionInput {
   state?: string;
   label?: string | null;
   parentSession?: string | null;
+  activeModel?: string | null;
+  requestedModel?: string | null;
   queueEpoch?: string | null;
   queueAuthorityId?: string | null;
   transportPendingMessageVersion?: number | null;
@@ -777,6 +783,8 @@ export class WatchProjectionStore {
       state: this.effectiveStateForSession(raw.name, baseState),
       agentBadge: badgeForType(raw.agentType ?? raw.sessionType),
       isSubSession: isSubSessionName(raw.name, raw.parentSession),
+      activeModel: raw.activeModel,
+      requestedModel: raw.requestedModel,
     };
     const preview = this.previewBySession.get(row.sessionName);
     if (preview) {
@@ -796,6 +804,8 @@ export class WatchProjectionStore {
       state: this.effectiveStateForSession(session.sessionName, baseState),
       agentBadge: badgeForType(session.sessionType),
       isSubSession: true,
+      activeModel: session.activeModel,
+      requestedModel: session.requestedModel,
     };
     const preview = this.previewBySession.get(row.sessionName);
     if (preview) {
