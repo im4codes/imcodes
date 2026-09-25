@@ -92,9 +92,18 @@ async function resolveHost(
         AND h.merge_state = 'resolved'
         AND s.revoked_at IS NULL
         AND (s.user_id = $1 OR sh.id IS NOT NULL OR ${IS_MEMBER_OF_A_MACHINE_GROUP})
-      ORDER BY CASE WHEN s.node_role = $4 THEN 0 ELSE 1 END, endpoint.server_id
+      -- A canonical host may retain stale reinstall endpoints. Prefer any
+      -- durable-online endpoint before the controlled-role preference so one
+      -- old row cannot make the wall display a live desktop as offline.
+      ORDER BY CASE
+        WHEN s.status = 'online'
+          AND s.last_heartbeat_at IS NOT NULL
+          AND s.last_heartbeat_at >= $3 - $5 THEN 0
+        ELSE 1
+      END,
+      CASE WHEN s.node_role = $4 THEN 0 ELSE 1 END, endpoint.server_id
       LIMIT 1`,
-    [userId, identity, now, NODE_ROLE.CONTROLLED],
+    [userId, identity, now, NODE_ROLE.CONTROLLED, MACHINE_PRESENCE_STALENESS_MS],
   );
   if (!row || (row.node_role === NODE_ROLE.CONTROLLED && !isControlledNodeId(row.node_id))) return null;
   const capabilities = validateControlledNodeCapabilities(row.controlled_capabilities);

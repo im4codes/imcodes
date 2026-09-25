@@ -12,7 +12,7 @@ import { randomUUID } from 'node:crypto';
 import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
 import { createServer, createUser } from '../src/db/queries.js';
-import { NODE_ROLE } from '../../shared/remote-exec.js';
+import { MACHINE_PRESENCE_STATUS, NODE_ROLE } from '../../shared/remote-exec.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '../../shared/remote-desktop.js';
 import {
   REMOTE_DESKTOP_CAPTURE_CAPABILITY,
@@ -32,6 +32,7 @@ import {
   HostIdentityError,
   allocateActivePublicNodeId,
   backfillCanonicalHosts,
+  createPostgresRemoteDesktopEndpointEligibility,
   ensureCanonicalHostForServer,
   isGuestAdmissionReady,
   resolveExecutionEndpoint,
@@ -41,6 +42,7 @@ import {
   rotatePublicNodeId,
   type PublicNodeIdRandom,
 } from '../src/services/remote-desktop-host-identity.js';
+import { getRemoteDesktopWall } from '../src/services/remote-desktop-wall.js';
 
 let db: Database;
 const NOW = 1_700_000_000_000;
@@ -68,8 +70,9 @@ async function seedEndpoint(input: {
   role: 'full' | 'controlled';
   eligible?: boolean;
   hostServerId?: string;
+  serverId?: string;
 }): Promise<string> {
-  const id = `s_${randomUUID()}`;
+  const id = input.serverId ?? `s_${randomUUID()}`;
   await createServer(
     db, id, input.userId, `srv-${id.slice(0, 8)}`, `hash-${id}`, undefined,
     input.role === 'controlled' ? NODE_ROLE.CONTROLLED : NODE_ROLE.FULL,
@@ -238,6 +241,85 @@ describe('public identity allocation (3.2, 3.3)', () => {
 });
 
 describe('endpoint selection and admission readiness (3.4)', () => {
+  it('skips a stale controlled endpoint and selects a later live endpoint for the same host', async () => {
+    const userId = await seedUser();
+    const staleControlledId = await seedEndpoint({ userId, role: 'controlled' });
+    const { hostId } = await ensureCanonicalHostForServer({
+      db, serverId: staleControlledId, now: NOW,
+    });
+    const liveControlledId = await seedEndpoint({
+      userId, role: 'controlled', hostServerId: staleControlledId,
+    });
+    await ensureCanonicalHostForServer({ db, serverId: liveControlledId, now: NOW + 1 });
+    // Put the stale reinstall row first under the deterministic latest-link
+    // ordering, proving selection must check presence for every candidate.
+    await db.execute(
+      `UPDATE remote_desktop_host_endpoints SET linked_at = $2 WHERE server_id = $1`,
+      [liveControlledId, NOW],
+    );
+    await db.execute(
+      `UPDATE remote_desktop_host_endpoints SET linked_at = $2 WHERE server_id = $1`,
+      [staleControlledId, NOW + 1],
+    );
+    await db.execute(
+      `UPDATE servers SET status = $2, last_heartbeat_at = $3 WHERE id = $1`,
+      [staleControlledId, MACHINE_PRESENCE_STATUS.OFFLINE, NOW + 1],
+    );
+    await db.execute(
+      `UPDATE servers SET status = $2, last_heartbeat_at = $3 WHERE id = $1`,
+      [liveControlledId, MACHINE_PRESENCE_STATUS.ONLINE, NOW],
+    );
+
+    const endpointEligible = createPostgresRemoteDesktopEndpointEligibility({
+      db, now: () => NOW + 2,
+    });
+    const selected = await resolveExecutionEndpoint({
+      db, hostId, endpointEligible,
+    });
+
+    expect(selected).toEqual({
+      serverId: liveControlledId,
+      role: HOST_ENDPOINT_ROLE.CONTROLLED,
+    });
+  });
+
+  it('wall presence skips a stale controlled endpoint and shows the later live endpoint', async () => {
+    const userId = await seedUser();
+    const staleControlledId = await seedEndpoint({
+      userId, role: 'controlled', serverId: `s_00000000-${randomUUID()}`,
+    });
+    const { hostId } = await ensureCanonicalHostForServer({
+      db, serverId: staleControlledId, now: NOW,
+    });
+    const liveControlledId = await seedEndpoint({
+      userId, role: 'controlled', hostServerId: staleControlledId,
+      serverId: `s_ffffffff-${randomUUID()}`,
+    });
+    await ensureCanonicalHostForServer({ db, serverId: liveControlledId, now: NOW + 1 });
+    await db.execute(
+      `UPDATE servers SET status = $2, last_heartbeat_at = $3 WHERE id = $1`,
+      [staleControlledId, MACHINE_PRESENCE_STATUS.OFFLINE, NOW + 1],
+    );
+    await db.execute(
+      `UPDATE servers SET status = $2, last_heartbeat_at = $3 WHERE id = $1`,
+      [liveControlledId, MACHINE_PRESENCE_STATUS.ONLINE, NOW],
+    );
+    await db.execute(
+      `INSERT INTO remote_desktop_walls (user_id, host_ids, layout, revision, updated_at)
+       VALUES ($1, $2::jsonb, 'grid', 0, $3)`,
+      [userId, JSON.stringify([hostId]), NOW],
+    );
+
+    const snapshot = await getRemoteDesktopWall(db, userId, NOW + 2);
+
+    expect(snapshot.hosts).toHaveLength(1);
+    expect(snapshot.hosts[0]).toMatchObject({
+      hostId,
+      serverId: liveControlledId,
+      online: true,
+    });
+  });
+
   it('prefers the qualified hosted controlled endpoint over the daemon', async () => {
     const userId = await seedUser();
     const daemonId = await seedEndpoint({ userId, role: 'full' });

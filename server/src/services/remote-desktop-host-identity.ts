@@ -350,15 +350,21 @@ export async function resolveExecutionEndpoint(input: {
     `SELECT e.server_id, e.host_id, e.endpoint_role, s.controlled_capabilities
        FROM remote_desktop_host_endpoints e
        JOIN servers s ON s.id = e.server_id
-      WHERE e.host_id = $1`,
+      WHERE e.host_id = $1
+      ORDER BY e.endpoint_role, e.linked_at DESC, e.server_id`,
     [input.hostId],
   );
-  const controlled = rows.find((row) => (
-    row.endpoint_role === HOST_ENDPOINT_ROLE.CONTROLLED && isEligibleEndpoint(row)
-  ));
-  if (controlled && (!input.endpointEligible
-    || await input.endpointEligible(controlled.server_id))) {
-    return { serverId: controlled.server_id, role: HOST_ENDPOINT_ROLE.CONTROLLED };
+  // A host can retain more than one controlled endpoint after a node
+  // reinstall/re-enrolment.  Do not select the first capability-qualified row
+  // and only then test presence: an old offline row would shadow a later live
+  // endpoint and make a healthy host appear unavailable.  Presence is part of
+  // endpoint qualification, so continue through every candidate.
+  for (const row of rows) {
+    if (row.endpoint_role !== HOST_ENDPOINT_ROLE.CONTROLLED
+      || !isEligibleEndpoint(row)) continue;
+    if (!input.endpointEligible || await input.endpointEligible(row.server_id)) {
+      return { serverId: row.server_id, role: HOST_ENDPOINT_ROLE.CONTROLLED };
+    }
   }
 
   if (!input.fullEndpointEligible) return null;
