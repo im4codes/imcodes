@@ -1240,6 +1240,11 @@ describe('daemon direct file transfer v2 lease broker', () => {
         published: existsSync(storedPath),
         intent: existsSync(commitIntentPath()),
       };
+      // Keep the host commit pending after the mock has been called — the
+      // production-shaped ordering that makes an immediate read of the
+      // promoted file / commit-intent / ledger observe pre-commit state
+      // instead of the eventual durable one.
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
       return {
         id: 'stored-id', source: 'upload', serverId: '', daemonPath: storedPath,
         originalName: 'source.bin', size: params.size, createdAt: new Date().toISOString(), downloadable: true,
@@ -1265,6 +1270,15 @@ describe('daemon direct file transfer v2 lease broker', () => {
     expect(finalizeDirectUploadedFile).toHaveBeenCalledWith(expect.objectContaining({
       destinationDirectory: 'C:\\Users\\admin\\Desktop',
     }));
+    // Being CALLED is not being DONE: finalizeDirectUploadedFile resolves
+    // asynchronously, and every check below (the promoted file, the cleared
+    // commit-intent, and the ledger state) only holds once it has actually
+    // settled. Wait for the terminal COMMITTED message — the one observable
+    // signal that the commit landed — before asserting any of it.
+    await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+      type: DIRECT_FILE_TRANSFER_MSG.TERMINAL,
+      state: DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED,
+    })));
     await expect(readFile(storedPath, 'utf8')).resolves.toBe('hello');
     expect(atRegistryWrite, 'the write-ahead record covers the publish/register window')
       .toEqual({ published: true, intent: true });
@@ -1284,7 +1298,6 @@ describe('daemon direct file transfer v2 lease broker', () => {
     expect(logText).not.toContain(operationId);
     expect(logText).not.toContain(authority.authority);
     expect(logText).not.toContain(sourcePath);
-    expect(sent).toContainEqual(expect.objectContaining({ type: DIRECT_FILE_TRANSFER_MSG.TERMINAL, state: DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED }));
 
     await direct.handleDirectFileTransferCommand({
       type: DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY,
@@ -1570,6 +1583,16 @@ describe('daemon direct file transfer v2 lease broker', () => {
 
   it('re-prepares an existing live lease at a new daemon generation without stranding its channel or status query', async () => {
     const { direct, sent, sender } = await readyLease();
+    finalizeDirectUploadedFile.mockImplementationOnce(async (params: { size: number }) => {
+      // Keep the host commit pending after the mock has been called. This is
+      // the production-shaped ordering that makes an immediate STATUS_QUERY
+      // observe ATTEMPTING instead of the eventual COMMITTED ledger state.
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      return {
+        id: 'stored-id', source: 'upload', serverId: '', daemonPath: storedPath,
+        originalName: 'source.bin', size: params.size, createdAt: new Date().toISOString(), downloadable: true,
+      };
+    });
     const authority = uploadPrepare();
     await direct.handleDirectFileTransferCommand(authority, sender);
     const channel = new FakeDataChannel(authority.channelLabel as string);
@@ -1602,6 +1625,11 @@ describe('daemon direct file transfer v2 lease broker', () => {
       totalBytes: 5,
     }));
     await vi.waitFor(() => expect(finalizeDirectUploadedFile).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+      type: DIRECT_FILE_TRANSFER_MSG.TERMINAL,
+      operationId,
+      state: DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED,
+    })));
     await direct.handleDirectFileTransferCommand({
       type: DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY,
       protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
