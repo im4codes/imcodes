@@ -137,6 +137,10 @@ class InputArbiter {
       const common::InputStamp& stamp,
       common::TopologyRevision current_topology_revision,
       std::string_view button, bool pressed);
+  common::InputResult ClickStamped(
+      const common::InputStamp& stamp,
+      common::TopologyRevision current_topology_revision,
+      std::string_view button);
   common::InputResult ApplyPointerStamped(
       const common::InputStamp& stamp,
       common::TopologyRevision current_topology_revision,

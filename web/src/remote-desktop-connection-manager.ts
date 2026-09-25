@@ -14,6 +14,7 @@ import {
   type RemoteDesktopSnapshot,
 } from './remote-desktop-client.js';
 import type { RemoteDesktopChordKey } from './remote-desktop-keyboard.js';
+import type { RemoteDesktopModifierKind } from './remote-desktop-keyboard.js';
 
 export interface RemoteDesktopHostTarget {
   serverId: string;
@@ -62,6 +63,11 @@ interface RemoteDesktopConnectionClient {
   tapChords(chords: readonly (readonly RemoteDesktopChordKey[])[]): boolean;
   text(value: string): boolean;
   releaseAll(): void;
+  reconcileModifiers?(
+    modifiers: Partial<Record<RemoteDesktopModifierKind, boolean>>,
+    exceptCode?: string,
+  ): void;
+  noteMetaChordKey?(code: string, key: string, metaHeld: boolean): void;
   releasePointerButtons(): void;
   stop(origin: RemoteDesktopStopOrigin): void;
 }
@@ -320,6 +326,12 @@ export class RemoteDesktopConnectionManager {
       tapChords: (chords) => canControl() && entry.client.tapChords(chords),
       text: (value) => canControl() && entry.client.text(value),
       releaseAll: () => entry.client.releaseAll(),
+      reconcileModifiers: (modifiers, exceptCode) => (
+        entry.client.reconcileModifiers?.(modifiers, exceptCode)
+      ),
+      noteMetaChordKey: (code, key, metaHeld) => (
+        entry.client.noteMetaChordKey?.(code, key, metaHeld)
+      ),
       releasePointerButtons: () => entry.client.releasePointerButtons(),
       stop: (origin) => this.stop(entry.hostKey, origin),
     };

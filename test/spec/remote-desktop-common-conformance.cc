@@ -362,6 +362,27 @@ int main() {
           ledger_input.button_events.size() == 5,
       "release-all leaves no duplicated ownership state");
 
+  // A physically held modifier remains authoritative even when it has been
+  // quiet for several seconds; browser/controller release is the only source
+  // allowed to clear ownership.
+  FakeInput held_input;
+  common::InputLedger held_ledger(held_input);
+  Require(held_ledger.ApplyKey(Stamp("held-controller", 1, 7), 7,
+                               "ShiftLeft", true) ==
+              common::InputResult::kApplied,
+          "held fixture admits a modifier down");
+  Require(held_ledger.ApplyKey(Stamp("held-controller", 2, 7), 7,
+                               "KeyA", true) ==
+              common::InputResult::kApplied,
+          "ordinary key can follow a held modifier");
+  Require(held_ledger.ClickButton(Stamp("held-controller", 3, 7), 7,
+                                  "primary") == common::InputResult::kApplied,
+          "click remains modified by the held modifier until explicit release");
+  Require(held_input.key_events.size() == 2 &&
+              held_input.key_events.back() ==
+                  std::pair<std::string, bool>{"KeyA", true},
+          "held modifier is not released by elapsed time");
+
   FakeCapture capture;
   FakeEncoder encoder;
   FakeInput input;

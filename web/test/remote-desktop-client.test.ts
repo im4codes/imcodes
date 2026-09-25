@@ -7,6 +7,7 @@ import {
   REMOTE_DESKTOP_DATA_MSG,
   REMOTE_DESKTOP_ERROR,
   REMOTE_DESKTOP_INPUT_BLOCKED,
+  REMOTE_DESKTOP_KEYBOARD_KIND,
   REMOTE_DESKTOP_LIMITS,
   REMOTE_DESKTOP_MSG,
   REMOTE_DESKTOP_MODE_REASON,
@@ -744,6 +745,22 @@ describe('RemoteDesktopClient', () => {
     });
     expect(client.key('ControlLeft', 'Control', false, false, { control: false, alt: false })).toBe(true);
 
+    // Browser-reserved Cmd+E can swallow KeyE's keyup. The next Meta release
+    // must heal the non-modifier as well, while an explicit exceptCode keeps
+    // the current transition untouched.
+    expect(client.key('MetaLeft', 'Meta', true, false, { control: false, alt: false })).toBe(true);
+    expect(client.key('KeyE', 'e', true, false, { control: false, alt: false })).toBe(true);
+    client.noteMetaChordKey('KeyE', 'e', true);
+    const beforeModifierReconcile = keyboard.sent.length;
+    client.reconcileModifiers({ meta: false }, 'MetaLeft');
+    expect(keyboard.sent).toHaveLength(beforeModifierReconcile + 1);
+    expect(JSON.parse(keyboard.sent.at(-1)!)).toMatchObject({
+      kind: REMOTE_DESKTOP_KEYBOARD_KIND.KEY_UP,
+      code: 'KeyE',
+      key: 'e',
+    });
+    expect(client.key('MetaLeft', 'Meta', false, false, { control: false, alt: false })).toBe(true);
+
     expect(client.key('KeyA', 'a', true, false, { control: false, alt: false })).toBe(true);
     const keyDown = JSON.parse(keyboard.sent.at(-1)!) as { sequence: number };
     expect(keyDown).toMatchObject({
@@ -1074,6 +1091,9 @@ describe('RemoteDesktopClient', () => {
       inputEnabled: false,
       reconnectCount: 1,
     });
+    const beforeNoInputReconcile = keyboard.sent.length;
+    client.reconcileModifiers({ control: false });
+    expect(keyboard.sent).toHaveLength(beforeNoInputReconcile);
     client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
     expect(JSON.parse(socket.sent.at(-1)!)).toMatchObject({
       type: REMOTE_DESKTOP_MSG.STOP,

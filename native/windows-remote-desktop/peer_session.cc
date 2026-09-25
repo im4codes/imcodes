@@ -1466,7 +1466,9 @@ void PeerSession::HandlePointer(const std::string& channel,
           stamp, static_cast<common::TopologyRevision>(layout_revision_),
           root["button"].asString(), false));
     } else {
-      accepted = input_->Click(root["button"].asString());
+      accepted = InputApplied(input_->ClickStamped(
+          stamp, static_cast<common::TopologyRevision>(layout_revision_),
+          root["button"].asString()));
     }
   } else if (kind == "wheel" && root["deltaX"].isNumeric() &&
              root["deltaY"].isNumeric() && !root.isMember("button") &&

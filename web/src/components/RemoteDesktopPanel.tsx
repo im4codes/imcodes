@@ -1175,6 +1175,30 @@ export function RemoteDesktopPanel({
     };
   }, [cachePresentedFrame]);
 
+  // One idempotent browser-side input reset for every lifecycle boundary.
+  // Releasing the worker is not enough: virtual combo keys and the synthetic
+  // Command→Control bridge live in React refs and otherwise get re-used after
+  // a tab/window switch even though the remote ledger was reset.
+  const releaseInputState = () => {
+    translatedKeyCodesRef.current.clear();
+    forwardedCommandCodesRef.current.clear();
+    suppressedCommandCodesRef.current.clear();
+    syntheticCommandControlRef.current = false;
+    commandMiddleDragPointerRef.current = null;
+    forwardedPasteShortcutAtRef.current = 0;
+    setHeldComboKeys([]);
+    clientRef.current?.releaseAll();
+    heldVirtualButtonsRef.current.clear();
+    desktopPointerPressesRef.current.clear();
+    lastDesktopClickRef.current = null;
+    touchPointsRef.current.clear();
+    if (touchGestureRef.current?.kind === 'single' && touchGestureRef.current.longPressTimer) {
+      clearTimeout(touchGestureRef.current.longPressTimer);
+    }
+    touchGestureRef.current = null;
+    virtualMouseDragRef.current = null;
+  };
+
   useEffect(() => {
     const refresh = () => setViewportGeometryRevision((current) => current + 1);
     const observer = typeof ResizeObserver === 'function'
@@ -1190,12 +1214,14 @@ export function RemoteDesktopPanel({
   }, []);
 
   useEffect(() => {
-    const release = () => clientRef.current?.releaseAll();
+    const release = () => releaseInputState();
     const visibility = () => { if (document.visibilityState !== 'visible') release(); };
     window.addEventListener('blur', release);
+    window.addEventListener('pagehide', release);
     document.addEventListener('visibilitychange', visibility);
     return () => {
       window.removeEventListener('blur', release);
+      window.removeEventListener('pagehide', release);
       document.removeEventListener('visibilitychange', visibility);
     };
   }, []);
@@ -1204,20 +1230,7 @@ export function RemoteDesktopPanel({
     const wasEnabled = previousInputEnabledRef.current;
     previousInputEnabledRef.current = snapshot.inputEnabled;
     if (snapshot.inputEnabled || !wasEnabled) return;
-    clientRef.current?.releaseAll();
-    forwardedCommandCodesRef.current.clear();
-    suppressedCommandCodesRef.current.clear();
-    syntheticCommandControlRef.current = false;
-    commandMiddleDragPointerRef.current = null;
-    heldVirtualButtonsRef.current.clear();
-    desktopPointerPressesRef.current.clear();
-    lastDesktopClickRef.current = null;
-    touchPointsRef.current.clear();
-    if (touchGestureRef.current?.kind === 'single' && touchGestureRef.current.longPressTimer) {
-      clearTimeout(touchGestureRef.current.longPressTimer);
-    }
-    touchGestureRef.current = null;
-    virtualMouseDragRef.current = null;
+    releaseInputState();
     stopVirtualMouseEdgePan();
     if (touchRingPressRef.current?.longPressTimer) {
       clearTimeout(touchRingPressRef.current.longPressTimer);
@@ -1505,12 +1518,27 @@ export function RemoteDesktopPanel({
     return { x: event.clientX - rect.left, y: event.clientY - rect.top };
   };
 
+  // Touch/virtual-mouse gestures have no browser modifier state of their own.
+  // Reconcile against the mobile combo latch before synthesizing a click, so
+  // a lost physical keyup is healed without dropping an intentional Ctrl/Shift
+  // tap (for example Ctrl-click/right-click on macOS).
+  const reconcileSyntheticClickModifiers = () => {
+    const held = new Set(heldComboKeys.map((key) => key.code));
+    clientRef.current?.reconcileModifiers?.({
+      control: held.has('ControlLeft') || held.has('ControlRight'),
+      alt: held.has('AltLeft') || held.has('AltRight'),
+      shift: held.has('ShiftLeft') || held.has('ShiftRight'),
+      meta: held.has('MetaLeft') || held.has('MetaRight'),
+    });
+  };
+
   const sendTouchClick = (
     button: DesktopPointerButton,
     point: RemoteDesktopNormalizedPoint,
   ): boolean => {
     const client = clientRef.current;
     if (!client) return false;
+    reconcileSyntheticClickModifiers();
     if (snapshot.atomicButtonClick) {
       return client.pointerClick(button, point.x, point.y);
     }
@@ -1611,6 +1639,7 @@ export function RemoteDesktopPanel({
       const normalized = clientPoint
         ? normalizedClientPoint(clientPoint.x, clientPoint.y)
         : null;
+      reconcileSyntheticClickModifiers();
       if (normalized && clientRef.current?.pointerButton(
         button,
         true,
@@ -1700,6 +1729,7 @@ export function RemoteDesktopPanel({
 
   /** Presses or releases the left button where the ring's cursor sits. */
   const sendTouchRingLeftButton = (down: boolean): boolean => {
+    if (down) reconcileSyntheticClickModifiers();
     const clientPoint = virtualMouseClientPoint();
     const normalized = clientPoint ? normalizedClientPoint(clientPoint.x, clientPoint.y) : null;
     if (down && !normalized) return false;
@@ -2172,7 +2202,35 @@ export function RemoteDesktopPanel({
     return true;
   };
 
+  const reconcileBrowserModifiers = (
+    event: Pick<KeyboardEvent, 'ctrlKey' | 'altKey' | 'shiftKey' | 'metaKey'> & {
+      getModifierState?: (keyArg: string) => boolean;
+    },
+    exceptCode?: string,
+  ) => {
+    const client = clientRef.current;
+    if (!client?.reconcileModifiers) return;
+    const modifier = (name: string, fallback: boolean) => (
+      event.getModifierState ? event.getModifierState(name) : fallback
+    );
+    const ctrlKey = modifier('Control', event.ctrlKey);
+    const altKey = modifier('Alt', event.altKey);
+    const shiftKey = modifier('Shift', event.shiftKey);
+    const metaKey = modifier('Meta', event.metaKey);
+    const controlAsCommand = !commandBridge.appleController && targetPlatform === 'macos';
+    client.reconcileModifiers({
+      control: commandBridge.translateToControl ? metaKey : !controlAsCommand && ctrlKey,
+      alt: altKey,
+      shift: shiftKey,
+      // Keep the controller's physical Meta state separate from the target
+      // platform mapping so Cmd+E can be healed even when it becomes Ctrl+E
+      // on a Windows/Linux target.
+      meta: metaKey,
+    }, exceptCode);
+  };
+
   const onPointerButton = (event: PointerEvent, down: boolean) => {
+    reconcileBrowserModifiers(event);
     if (down && snapshot.inputEnabled && !keepMobileKeyboardFocus()) {
       stageRef.current?.focus({ preventScroll: true });
     }
@@ -2304,14 +2362,26 @@ export function RemoteDesktopPanel({
     // second time (observed consistently in Safari).
     event.stopPropagation();
     const client = clientRef.current;
-    const mapped = mapRemoteDesktopKeyboardEvent(event, undefined, targetPlatform);
+    const authoritativeEvent = {
+      code: event.code,
+      key: event.key,
+      ctrlKey: event.getModifierState('Control'),
+      altKey: event.getModifierState('Alt'),
+      shiftKey: event.getModifierState('Shift'),
+      metaKey: event.getModifierState('Meta'),
+    };
+    const mapped = mapRemoteDesktopKeyboardEvent(authoritativeEvent, undefined, targetPlatform);
     if (!client || !mapped) return;
+    // A swallowed modifier key-up is common when the browser handles a
+    // reserved shortcut. Reconcile every subsequent key against the browser's
+    // modifier flags, excluding the transition currently being delivered.
+    reconcileBrowserModifiers(event, mapped.code);
     // Copy and paste are answered by the clipboard bridge rather than forwarded
     // blind: the two machines have separate clipboards, so the keystroke alone
     // copies where the operator cannot reach and pastes what they never copied.
     // Copy still reaches the remote — the bridge sends it there to make the
     // selection — so an interrupt in a remote console keeps working.
-    const clipboardShortcut = detectRemoteDesktopClipboardShortcut(event, undefined, targetPlatform);
+    const clipboardShortcut = detectRemoteDesktopClipboardShortcut(authoritativeEvent, undefined, targetPlatform);
     if (clipboardShortcut === REMOTE_DESKTOP_CLIPBOARD_SHORTCUT.PASTE
       && (!navigator.clipboard?.readText || isAppleControllerPlatform(readControllerPlatform()))) {
       // No clipboard read here: leave the key alone so the browser raises its
@@ -2330,7 +2400,7 @@ export function RemoteDesktopPanel({
       return;
     }
     if (clipboardShortcut) commandChordKeysRef.current += 1;
-    if (clipboardShortcut && shouldForwardRemoteDesktopCopyKeystroke(event, undefined, targetPlatform)) {
+    if (clipboardShortcut && shouldForwardRemoteDesktopCopyKeystroke(authoritativeEvent, undefined, targetPlatform)) {
       // A PC operator's Control+C on Linux: take the selection AND let the
       // keystroke through below -- it interrupts a remote terminal.
       if (down) void copyRemoteSelection();
@@ -2348,7 +2418,7 @@ export function RemoteDesktopPanel({
     }
     // Shortcuts the target spells differently (Command+Left is Home on a PC,
     // Home is Command+Left on a Mac, ...) are tapped whole on the remote.
-    const translated = down ? translateRemoteDesktopShortcut(event, undefined, targetPlatform) : null;
+    const translated = down ? translateRemoteDesktopShortcut(authoritativeEvent, undefined, targetPlatform) : null;
     if (translated) {
       commandChordKeysRef.current += 1;
       event.preventDefault();
@@ -2379,7 +2449,7 @@ export function RemoteDesktopPanel({
       if (!down && syntheticCommandControlRef.current) {
         releaseSyntheticCommandControl(event.altKey);
       }
-    } else if (mapped.usesCommandBridge && event.metaKey
+    } else if (mapped.usesCommandBridge && authoritativeEvent.metaKey
       && forwardedCommandCodesRef.current.size === 0
       && !syntheticCommandControlRef.current) {
       suppressedCommandCodesRef.current.clear();
@@ -2388,12 +2458,13 @@ export function RemoteDesktopPanel({
         commandBridge.key,
         true,
         false,
-        { control: commandBridge.translateToControl, alt: event.altKey },
+        { control: commandBridge.translateToControl, alt: authoritativeEvent.altKey },
       );
-    } else if (mapped.usesCommandBridge && !event.metaKey && syntheticCommandControlRef.current) {
-      releaseSyntheticCommandControl(event.altKey);
+    } else if (mapped.usesCommandBridge && !authoritativeEvent.metaKey && syntheticCommandControlRef.current) {
+      releaseSyntheticCommandControl(authoritativeEvent.altKey);
     }
     const sent = client.key(mapped.code, mapped.key, down, event.repeat, mapped.modifiers);
+    if (sent) client.noteMetaChordKey?.(mapped.code, mapped.key, authoritativeEvent.metaKey);
     if (sent && !commandEvent) commandChordKeysRef.current += 1;
     if (sent) {
       if (down && mapped.code === 'KeyV' && mapped.modifiers.control) {
@@ -2401,20 +2472,14 @@ export function RemoteDesktopPanel({
       }
       event.preventDefault();
     }
-    if (mapped.usesCommandBridge && !commandEvent && !down && event.metaKey
+    if (mapped.usesCommandBridge && !commandEvent && !down && authoritativeEvent.metaKey
       && forwardedCommandCodesRef.current.size === 0 && syntheticCommandControlRef.current) {
-      releaseSyntheticCommandControl(event.altKey);
+      releaseSyntheticCommandControl(authoritativeEvent.altKey);
     }
   };
 
   const releaseCapturedInput = () => {
-    translatedKeyCodesRef.current.clear();
-    forwardedCommandCodesRef.current.clear();
-    suppressedCommandCodesRef.current.clear();
-    syntheticCommandControlRef.current = false;
-    commandMiddleDragPointerRef.current = null;
-    forwardedPasteShortcutAtRef.current = 0;
-    clientRef.current?.releaseAll();
+    releaseInputState();
   };
 
   const openQuickInput = () => {

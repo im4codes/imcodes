@@ -100,7 +100,6 @@ class InputLedger {
       bool (InputAdapter::*emit)(std::string_view, bool));
   bool ReleaseControllerState(const std::string& controller_id,
                               ControllerState* controller) noexcept;
-
   InputAdapter& backend_;
   std::unordered_map<std::string, ControllerState> controllers_;
   std::unordered_map<std::string, std::unordered_set<std::string>> key_owners_;

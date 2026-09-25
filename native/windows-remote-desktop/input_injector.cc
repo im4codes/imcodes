@@ -608,6 +608,14 @@ common::InputResult InputArbiter::ApplyButtonStamped(
                                   pressed);
 }
 
+common::InputResult InputArbiter::ClickStamped(
+    const common::InputStamp& stamp,
+    common::TopologyRevision current_topology_revision,
+    std::string_view button) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return ledger_.ClickButton(stamp, current_topology_revision, button);
+}
+
 common::InputResult InputArbiter::ApplyPointerStamped(
     const common::InputStamp& stamp,
     common::TopologyRevision current_topology_revision,

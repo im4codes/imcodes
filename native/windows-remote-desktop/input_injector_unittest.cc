@@ -326,6 +326,28 @@ TEST(InputArbiterTest, CompletesClickAsOneNativeInputBatch) {
   EXPECT_FALSE(input.Click("sixth"));
 }
 
+TEST(InputArbiterTest, StampedClickUsesLedgerAndPreservesHeldModifier) {
+  RecordingInput recording;
+  InputArbiter input([&](UINT count, LPINPUT values, int size) {
+    return recording.Send(count, values, size);
+  });
+
+  EXPECT_EQ(input.ApplyKeyStamped(Stamp("peer-a", 1), 7, "ControlLeft", true),
+            common::InputResult::kApplied);
+  EXPECT_EQ(input.ClickStamped(Stamp("peer-a", 2), 7, "left"),
+            common::InputResult::kApplied);
+  ASSERT_EQ(recording.events.size(), 3u);
+  EXPECT_EQ(recording.events[0].type, static_cast<DWORD>(INPUT_KEYBOARD));
+  EXPECT_EQ(recording.events[0].ki.dwFlags & KEYEVENTF_KEYUP, 0u);
+  EXPECT_NE(recording.events[1].mi.dwFlags & MOUSEEVENTF_LEFTDOWN, 0u);
+  EXPECT_NE(recording.events[2].mi.dwFlags & MOUSEEVENTF_LEFTUP, 0u);
+
+  EXPECT_EQ(input.ClickStamped(Stamp("peer-a", 2), 7, "right"),
+            common::InputResult::kStaleSequence);
+  EXPECT_EQ(input.ClickStamped(Stamp("peer-a", 3, 6), 7, "right"),
+            common::InputResult::kStaleTopology);
+}
+
 TEST(InputArbiterTest, CrashRecoveryReleasesOnlySupportedKeysAndButtons) {
   RecordingInput recording;
   EXPECT_TRUE(ReleaseAllSupportedInput(

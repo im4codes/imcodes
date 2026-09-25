@@ -551,6 +551,8 @@ export class RemoteDesktopClient {
   private pointerMoveBackpressureDrops = 0;
   private pointerMoveSendFailures = 0;
   private pressedCodes = new Set<string>();
+  /** Keys pressed while Meta was held; browsers may swallow their keyup. */
+  private pressedWhileMeta = new Map<string, string>();
   /**
    * Modifiers the operator is still holding that a translated shortcut or a
    * paste lifted on the remote (see tapChords and text). One goes back down
@@ -971,8 +973,11 @@ export class RemoteDesktopClient {
     });
   }
 
-  key(code: string, key: string, down: boolean, repeat: boolean, modifiers: { control: boolean; alt: boolean }): boolean {
+  key(code: string, key: string, down: boolean, repeat: boolean, modifiers: { control: boolean; alt: boolean; meta?: boolean }): boolean {
     if (!this.canSendInput() || !isRemoteDesktopKeyAllowed(code, modifiers)) return false;
+    if (down && !repeat && this.pressedCodes.has(code)) {
+      if (!this.sendKeyTransition(code, key, false, false)) return false;
+    }
     if (this.liftedModifiers.delete(code)) {
       // Already up on the remote: releasing it is done, pressing it again is
       // an ordinary press.
@@ -980,7 +985,16 @@ export class RemoteDesktopClient {
     } else if (down && !remoteDesktopModifierKind(code) && !this.restoreLiftedModifiers()) {
       return false;
     }
-    return this.sendKeyTransition(code, key, down, repeat);
+    const sent = this.sendKeyTransition(code, key, down, repeat);
+    if (sent && !down) this.pressedWhileMeta.delete(code);
+    return sent;
+  }
+
+  /** Record a non-modifier delivered while the browser held Meta. */
+  noteMetaChordKey(code: string, key: string, metaHeld: boolean): void {
+    if (metaHeld && !remoteDesktopModifierKind(code) && this.pressedCodes.has(code)) {
+      this.pressedWhileMeta.set(code, key);
+    }
   }
 
   /**
@@ -1058,6 +1072,7 @@ export class RemoteDesktopClient {
       if (!sent) return;
     }
     this.pressedCodes.clear();
+    this.pressedWhileMeta.clear();
     this.pressedButtons.clear();
   }
 
@@ -2024,6 +2039,36 @@ export class RemoteDesktopClient {
       else this.pressedCodes.delete(code);
     }
     return sent;
+  }
+
+  /**
+   * Reconcile the browser's authoritative modifier flags with the keys that
+   * this viewer has actually sent to the worker. Browsers may swallow a
+   * modifier key-up when a window/tab loses focus (notably Command shortcuts
+   * on macOS), so the next event is the first reliable opportunity to heal the
+   * remote state without disturbing modifiers that are still physically held.
+   */
+  reconcileModifiers(
+    modifiers: Partial<Record<RemoteDesktopModifierKind, boolean>>,
+    exceptCode?: string,
+  ): void {
+    if (!this.canSendInput()) return;
+    for (const code of [...this.pressedCodes]) {
+      const kind = remoteDesktopModifierKind(code);
+      if (!kind || code === exceptCode || modifiers[kind] !== false) continue;
+      this.sendKeyTransition(code, REMOTE_DESKTOP_MODIFIER_KEY[kind], false, false);
+    }
+    if (modifiers.meta === false) {
+      for (const [code, key] of [...this.pressedWhileMeta]) {
+        if (code === exceptCode || !this.pressedCodes.has(code)) {
+          this.pressedWhileMeta.delete(code);
+          continue;
+        }
+        if (this.sendKeyTransition(code, key, false, false)) {
+          this.pressedWhileMeta.delete(code);
+        }
+      }
+    }
   }
 
   private heldModifierKinds(): Set<RemoteDesktopModifierKind> {

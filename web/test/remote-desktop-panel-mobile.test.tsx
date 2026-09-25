@@ -54,6 +54,8 @@ const pointerClick = vi.fn(() => true);
 const pointerMove = vi.fn();
 const wheel = vi.fn(() => true);
 const releaseAll = vi.fn();
+const reconcileModifiers = vi.fn();
+const noteMetaChordKey = vi.fn();
 const releasePointerButtons = vi.fn();
 const acknowledgePresentedFrame = vi.fn(() => true);
 const setDisplayMode = vi.fn(() => true);
@@ -125,6 +127,8 @@ vi.mock('../src/remote-desktop-client.js', () => ({
     start = vi.fn(async (reconnectAttempt = 0) => { clientStarts.push(reconnectAttempt); });
     stop = stop;
     releaseAll = releaseAll;
+    reconcileModifiers = reconcileModifiers;
+    noteMetaChordKey = noteMetaChordKey;
     releasePointerButtons = releasePointerButtons;
     acknowledgePresentedFrame = acknowledgePresentedFrame;
     pointerButton = pointerButton;
@@ -2099,7 +2103,35 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     pointer(stage, 'pointerup', { pointerId: 1, clientX: 200, clientY: 150 });
     expect(pointerClick).toHaveBeenCalledOnce();
     expect(pointerClick).toHaveBeenCalledWith('left', 0.5, 0.5);
+    expect(reconcileModifiers).toHaveBeenCalledWith({
+      control: false,
+      alt: false,
+      shift: false,
+      meta: false,
+    }, undefined);
     expect(pointerButton).not.toHaveBeenCalled();
+  });
+
+  it('keeps a latched mobile Control modifier across a synthetic tap', async () => {
+    const { stage, container, getByRole } = await renderPanel();
+    act(() => { (getByRole('button', { name: 'remote_desktop.mobile_keyboard' }) as HTMLButtonElement).click(); });
+    act(() => { (getByRole('tab', { name: 'remote_desktop.mobile_keyboard_tab_keys' }) as HTMLButtonElement).click(); });
+    act(() => { fireEvent.click(getByRole('checkbox', { name: 'remote_desktop.combo_mode' })); });
+    const control = [...container.querySelectorAll<HTMLButtonElement>('.remote-desktop-computer-keyboard-row button')]
+      .find((button) => button.textContent === 'Control')!;
+    act(() => { control.click(); });
+    reconcileModifiers.mockClear();
+    releaseAll.mockClear();
+    pointer(stage, 'pointerdown', { pointerId: 101, clientX: 200, clientY: 150 });
+    pointer(stage, 'pointerup', { pointerId: 101, clientX: 200, clientY: 150 });
+    expect(reconcileModifiers).toHaveBeenCalledWith({
+      control: true,
+      alt: false,
+      shift: false,
+      meta: false,
+    }, undefined);
+    expect(releaseAll).not.toHaveBeenCalled();
+    expect(control.getAttribute('aria-pressed')).toBe('true');
   });
 
   it('keeps the legacy touch down/up click for an older worker', async () => {
@@ -2936,6 +2968,68 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(releaseAll).toHaveBeenCalledTimes(1);
   });
 
+  it('does not treat touch pointerleave after a tap as focus loss', async () => {
+    const { stage } = await renderPanel();
+    releaseAll.mockClear();
+    pointer(stage, 'pointerdown', { pointerId: 91, clientX: 200, clientY: 150 });
+    pointer(stage, 'pointerup', { pointerId: 91, clientX: 200, clientY: 150 });
+    const event = new MouseEvent('pointerleave', { bubbles: true, cancelable: true });
+    Object.defineProperties(event, {
+      pointerId: { value: 91 },
+      pointerType: { value: 'touch' },
+    });
+    stage.dispatchEvent(event);
+    expect(releaseAll).not.toHaveBeenCalled();
+  });
+
+  it('reconciles a modifier swallowed by the browser on the next key event', async () => {
+    const { stage } = await renderPanel();
+    act(() => {
+      stage.dispatchEvent(new KeyboardEvent('keydown', {
+        bubbles: true,
+        cancelable: true,
+        code: 'ControlLeft',
+        key: 'Control',
+        ctrlKey: true,
+      }));
+      stage.dispatchEvent(new KeyboardEvent('keydown', {
+        bubbles: true,
+        cancelable: true,
+        code: 'KeyA',
+        key: 'a',
+        ctrlKey: false,
+      }));
+    });
+    expect(reconcileModifiers).toHaveBeenLastCalledWith({
+      control: false,
+      alt: false,
+      shift: false,
+      meta: false,
+    }, 'KeyA');
+  });
+
+  it('releases a letter whose keyup was swallowed during Cmd+E when Meta is released', async () => {
+    const { stage } = await renderPanel();
+    key.mockClear();
+    act(() => {
+      stage.dispatchEvent(new KeyboardEvent('keydown', {
+        bubbles: true, cancelable: true, code: 'MetaLeft', key: 'Meta', metaKey: true,
+      }));
+      stage.dispatchEvent(new KeyboardEvent('keydown', {
+        bubbles: true, cancelable: true, code: 'KeyE', key: 'e', metaKey: true,
+      }));
+      const metaUp = new KeyboardEvent('keyup', {
+        bubbles: true, cancelable: true, code: 'MetaLeft', key: 'Meta', metaKey: false,
+      });
+      Object.defineProperty(metaUp, 'getModifierState', {
+        value: (name: string) => name === 'Meta' ? false : false,
+      });
+      stage.dispatchEvent(metaUp);
+    });
+    expect(noteMetaChordKey).toHaveBeenCalledWith('KeyE', 'e', true);
+    expect(reconcileModifiers).toHaveBeenCalled();
+  });
+
   it('uses drag/pinch for the local viewport and never sends an accidental click', async () => {
     const { stage, video } = await renderPanel();
     act(() => {
@@ -2946,6 +3040,9 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(video.style.transform).not.toContain('scale(1)');
     act(() => {
       pointer(stage, 'pointerup', { pointerId: 2, clientX: 360, clientY: 150 });
+      const leave = new MouseEvent('pointerleave', { bubbles: true, cancelable: true });
+      Object.defineProperties(leave, { pointerId: { value: 2 }, pointerType: { value: 'touch' } });
+      stage.dispatchEvent(leave);
       pointer(stage, 'pointermove', { pointerId: 1, clientX: 180, clientY: 150 });
       pointer(stage, 'pointerup', { pointerId: 1, clientX: 180, clientY: 150 });
     });
