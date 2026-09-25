@@ -26,6 +26,7 @@ import {
 } from '../../../src/daemon/task-pairs/legacy-import.js';
 import { SupervisionTaskRegistry, type SupervisionTaskSnapshot } from '../../../src/daemon/supervision-state-store.js';
 import { timelineEmitter } from '../../../src/daemon/timeline-emitter.js';
+import { resetTaskPairProviderErrorsForTests } from '../../../src/daemon/task-pairs/provider-errors.js';
 import { suppressSqliteExperimentalWarning } from '../../../src/util/suppress-sqlite-warning.js';
 import {
   TASK_PAIR_DEFAULT_MAX_CONCURRENCY,
@@ -133,13 +134,16 @@ describe('pairs that stopped driving themselves (215 / jdzj)', () => {
       importLegacy: () => undefined,
     });
     taskPairService.setScheduler(automation);
+    taskPairService.init();
   });
 
   afterEach(() => {
+    taskPairService.dispose();
     taskPairService.setScheduler(undefined);
     setTaskPairDeliveryDepsForTests(undefined);
     setTaskPairStoreForTests(undefined);
     resetTaskPairFocusForTests();
+    resetTaskPairProviderErrorsForTests();
     for (const name of [BRAIN, EXEC, AUD, ...SPARES]) removeSession(name);
     if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
     else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
@@ -262,15 +266,18 @@ describe('pairs that stopped driving themselves (215 / jdzj)', () => {
 
     sent = [];
     await tick(2);
-    // Six pairs escalate after three silent heartbeats; P3 is only nudged.
-    const escalated = sentTo(BRAIN, 'brain-executor_silent').map((entry) => entry.id.split(':')[1]);
-    expect(new Set(escalated)).toEqual(new Set(ids.filter((id) => id !== 'P3')));
+    // Six pairs escalate after three silent heartbeats, in the SAME tick --
+    // owner report: one aggregated notice, not six separate ones. P3 is only
+    // nudged (it made progress), so it is not in the aggregate.
+    expect(sentTo(BRAIN, 'brain-executor_silent')).toHaveLength(0);
+    const aggregated = sentTo(BRAIN, 'brain-aggregate');
+    expect(aggregated).toHaveLength(1);
+    const escalatedIds = ids.filter((id) => id !== 'P3');
+    for (const id of escalatedIds) expect(aggregated[0]!.text).toContain(id);
+    expect(aggregated[0]!.text).not.toContain('P3');
     expect(pair('P3').flags).not.toContain('executor_silent');
-    // Passed pairs escalate with advice that keeps the work: no uncommitted DONE force.
-    const notice = sentTo(BRAIN, 'brain-executor_silent')[0]!.text;
-    expect(notice).toContain('REASSIGN');
-    expect(notice).toContain('executor=<session>');
-    expect(notice).toContain('only once the work is committed');
+    for (const id of escalatedIds) expect(pair(id).flags).toContain('executor_silent');
+    expect(aggregated[0]!.text).toContain('REASSIGN');
   });
 
   it('credits plain output to the only open pair, else to the pair the session was last messaged about', async () => {
@@ -300,30 +307,58 @@ describe('pairs that stopped driving themselves (215 / jdzj)', () => {
 
   // ---- 4. usage-limited executor ---------------------------------------------
 
-  it('holds a usage-limited executor without nudging, escalates only after the silence limit, and resumes after the limit clears', async () => {
+  it('reassigns a REAL rate-limited executor to a spare at once (owner correction: failover, not a hold)', async () => {
     marker(BRAIN, `<!-- IMCODES_TASK DISPATCH L1 executor=${EXEC} auditor=${AUD} -->`);
     marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT L1 -->');
     marker(AUD, '<!-- IMCODES_TASK PASS L1 blocking=P0 -->');
     await flush();
     sent = [];
     limited.add(EXEC);
-    await tick(2);
-    expect(sent).toHaveLength(0);
+    await tick(1);
+    expect(pair('L1').executor).not.toBe(EXEC);
     expect(pair('L1').flags).not.toContain('executor_silent');
+    const newExecutor = pair('L1').executor!;
+    expect(sentTo(newExecutor, 'executor-handoff')).toHaveLength(1);
+    expect(sentTo(newExecutor, 'executor-handoff')[0]?.text).toContain('taking over');
+    expect(sentTo(BRAIN, 'brain-line-reassign')[0]?.text).toContain(`${EXEC} → ${newExecutor}`);
+  });
+
+  it('holds a merely capacity-limited executor without nudging, escalates only after the silence limit, and resumes after the limit clears', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH L1b executor=${EXEC} auditor=${AUD} -->`);
+    marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT L1b -->');
+    marker(AUD, '<!-- IMCODES_TASK PASS L1b blocking=P0 -->');
+    await flush();
+    sent = [];
+    // The setup's dispatch brief was worked through before the first heartbeat.
+    pendingThisTick.clear();
+    const capacity = () => timelineEmitter.emit(EXEC, 'session.state', {
+      state: 'error', error: 'Selected model is at capacity. Please try a different model.',
+    }, { source: 'daemon', confidence: 'high', ts: now });
+    for (let i = 0; i < 2; i += 1) {
+      capacity();
+      await tick(1);
+    }
+    expect(sent).toHaveLength(0);
+    expect(pair('L1b').flags).not.toContain('executor_silent');
+    expect(pair('L1b').executor).toBe(EXEC);
+    capacity();
     await tick(1);
     expect(sentTo(BRAIN, 'brain-executor_silent')).toHaveLength(1);
+    expect(pair('L1b').executor).toBe(EXEC);
     await tick(2);
     expect(sentTo(BRAIN, 'brain-executor_silent')).toHaveLength(1);
     expect(sentTo(EXEC)).toHaveLength(0);
-    // The limit clears: the executor is nudged again, and after working on the
-    // pair it can be escalated again if it later goes silent.
-    limited.delete(EXEC);
-    await tick(1);
-    expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
+    // The error clears: the executor is nudged again (no reassignment ever
+    // happened), and after working on the pair it can be escalated again if
+    // it later goes silent.
+    timelineEmitter.emit(EXEC, 'assistant.text', { text: 'back', streaming: false }, { source: 'daemon', confidence: 'high', ts: now + 1 });
+    await flush();
+    await tick(2);
+    expect(sentTo(EXEC, 'nudge-executor').length).toBeGreaterThan(0);
     now += 1;
-    taskPairService.recordProgress(EXEC, now, 'committing L1');
+    taskPairService.recordProgress(EXEC, now, 'committing L1b');
     await tick(1);
-    expect(pair('L1').flags).not.toContain('executor_silent');
+    expect(pair('L1b').flags).not.toContain('executor_silent');
     await tick(3);
     expect(sentTo(BRAIN, 'brain-executor_silent')).toHaveLength(2);
   });

@@ -159,7 +159,7 @@ export const TASK_PAIR_OPEN_STATUSES: readonly TaskPairStatus[] = ['working', 'i
 export const TASK_PAIR_FLAGS = [
   'blocked', 'needs_input', 'unaudited', 'needs_auditor', 'over_limit', 'off_pool', 'economy_unreviewed',
   'waiting_for_capacity', 'executor_silent', 'verdict_inconsistent', 'awaiting_audit_ignored',
-  'replacement_churn', 'markers_unresolved',
+  'replacement_churn', 'markers_unresolved', 'all_providers_limited', 'auditor_capacity_hold',
 ] as const;
 export type TaskPairFlag = typeof TASK_PAIR_FLAGS[number];
 
@@ -417,6 +417,8 @@ export interface TaskPairState {
   flags: TaskPairFlag[];
   /** Which side set `blocked` / `needs_input`, so that side's progress clears it. */
   flagSides: Partial<Record<'blocked' | 'needs_input', TaskPairRole>>;
+  /** The `note=` text of the BLOCKED/NEEDS_INPUT marker that set flagSides, so an escalation can state the real cause. */
+  blockedNote?: string;
   /** Audit submissions so far. */
   round: number;
   /** Round in which a consistent PASS was recorded, if any. */
@@ -713,6 +715,7 @@ function clearSideFlags(pair: TaskPairState, role: TaskPairRole): void {
     if (pair.flagSides[flag] === role) {
       removeFlag(pair, flag);
       delete pair.flagSides[flag];
+      pair.blockedNote = undefined;
     }
   }
 }
@@ -938,6 +941,7 @@ export function applyTaskPairMarker(
       const flag = verb === 'BLOCKED' ? 'blocked' : 'needs_input';
       addFlag(pair, flag);
       pair.flagSides[flag] = role;
+      pair.blockedNote = attrs.note?.trim() || undefined;
       if (verb === 'BLOCKED' && role === 'executor' && isAboutAuditor(attrs) && hasAudit(pair)) {
         if (spendCap(pair, 'blocked_replacement', intents)) intents.push({ kind: 'replace_auditor', reason: 'executor_blocked' });
       }

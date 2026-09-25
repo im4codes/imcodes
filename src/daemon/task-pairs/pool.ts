@@ -13,6 +13,7 @@ import {
   DELEGATION_AVAILABILITY,
   resolveDelegationTargets,
 } from '../../../shared/delegation-availability.js';
+import { resolvePeerAuditProviderFamily } from '../../../shared/peer-audit.js';
 import {
   SUPERVISION_DEFAULT_EXCLUDED_DEVELOPMENT_SESSIONS,
   isExcludedDevelopmentModel,
@@ -108,6 +109,15 @@ export function listTaskPairCandidates(input: {
    * is not consulted.
    */
   requestedModel?: string;
+  /**
+   * A limit-triggered reassignment prefers a session from a DIFFERENT
+   * provider family than the one that just failed (anthropic <-> openai),
+   * so a whole-family outage does not just hand the pair to another session
+   * behind the very same limit. Preference only: a same-family candidate is
+   * still returned (last) rather than leaving the role unfilled when it is
+   * the only option.
+   */
+  avoidProviderFamily?: string;
 }, deps: TaskPairPoolDeps = {}): SessionRecord[] {
   const sessions = (deps.listSessions ?? (() => listSessions()))();
   const parent = sessions.find((session) => session.name === input.brain) ?? (deps.getSession ?? getSession)(input.brain);
@@ -122,7 +132,7 @@ export function listTaskPairCandidates(input: {
       ? sameModelId(resolveEffectiveSessionModel(session), input.requestedModel)
       : allowlisted(session, input.role, input.allowlist)
   );
-  return sessions
+  const candidates = sessions
     .filter((session) => (
       // Only the Brain's own sub-sessions: the daemon never commandeers an
       // owner-facing main session (design D12).
@@ -140,6 +150,20 @@ export function listTaskPairCandidates(input: {
       && !store.isParticipantOfOpenPair(session.name)
     ))
     .sort((a, b) => a.updatedAt - b.updatedAt || a.name.localeCompare(b.name));
+  if (!input.avoidProviderFamily) return candidates;
+  const otherFamily = candidates.filter((session) => sessionProviderFamily(session) !== input.avoidProviderFamily);
+  const sameFamily = candidates.filter((session) => sessionProviderFamily(session) === input.avoidProviderFamily);
+  return [...otherFamily, ...sameFamily];
+}
+
+export function sessionProviderFamily(session: SessionRecord): string {
+  return resolvePeerAuditProviderFamily({ providerId: session.providerId, agentType: session.agentType });
+}
+
+/** Provider family of a named session (for limit-triggered failover), or undefined if the session is unknown. */
+export function providerFamilyOfSession(sessionName: string, deps: TaskPairPoolDeps = {}): string | undefined {
+  const session = (deps.getSession ?? getSession)(sessionName);
+  return session ? sessionProviderFamily(session) : undefined;
 }
 
 /**
@@ -175,15 +199,19 @@ export function allowlistedProvisionConfig(input: {
   allowlist: readonly TaskPairAllowlistEntry[];
   /** Owner rule: see {@link listTaskPairCandidates}. */
   requestedModel?: string;
+  /** See {@link listTaskPairCandidates}. */
+  avoidProviderFamily?: string;
 }, deps: TaskPairPoolDeps = {}): SupervisionExecutionConfig | undefined {
   const parent = (deps.getSession ?? getSession)(input.brain);
   if (!parent) return undefined;
   const definition = poolDefinition(parent, input.role === 'auditor' ? 'primary' : input.pool);
-  return definition?.configs.find((config) => (
+  const matches = definition?.configs.filter((config) => (
     input.requestedModel
       ? sameModelId(config.model, input.requestedModel)
       : matchesTaskPairAllowlist(input.allowlist, input.role, config.agentType, config.model)
-  ));
+  )) ?? [];
+  if (!input.avoidProviderFamily) return matches[0];
+  return matches.find((config) => config.providerFamily !== input.avoidProviderFamily) ?? matches[0];
 }
 
 /** Provider rate/usage limit as seen by delegation availability. */
@@ -191,6 +219,66 @@ export function isSessionProviderLimited(sessionName: string, deps: TaskPairPool
   const sessions = (deps.listSessions ?? (() => listSessions()))();
   const availability = resolveDelegationTargets(delegationTargetInputs(sessions), (deps.now ?? Date.now)());
   return availability.get(sessionName)?.availability === DELEGATION_AVAILABILITY.LIMITED;
+}
+
+export interface TaskPairLimitedFamily {
+  family: string;
+  retryAt?: number;
+}
+
+/**
+ * Every eligible (allowlist/model + pool membership) session for a role that
+ * is CURRENTLY provider-limited, grouped by family with the latest known
+ * retry time per family. Undefined when the pick failed for some other
+ * reason (no eligible session at all, or all just busy) -- the daemon must
+ * not claim "every provider is limited" when the real gap is a missing or
+ * empty pool.
+ */
+export function describeLimitedProviderFamilies(input: {
+  brain: string;
+  role: TaskPairPickRole;
+  pool: SupervisionExecutionPoolKind;
+  allowlist: readonly TaskPairAllowlistEntry[];
+  exclude: ReadonlySet<string>;
+  requestedModel?: string;
+}, deps: TaskPairPoolDeps = {}): { text: string; families: TaskPairLimitedFamily[] } | undefined {
+  const sessions = (deps.listSessions ?? (() => listSessions()))();
+  const parent = sessions.find((session) => session.name === input.brain) ?? (deps.getSession ?? getSession)(input.brain);
+  if (!parent) return undefined;
+  const pools = configuredPools(parent);
+  const definition = pools ? poolDefinition(parent, input.role === 'auditor' ? 'primary' : input.pool) : undefined;
+  const availability = resolveDelegationTargets(delegationTargetInputs(sessions), (deps.now ?? Date.now)());
+  const eligibleForRole = (session: SessionRecord): boolean => (
+    input.requestedModel
+      ? sameModelId(resolveEffectiveSessionModel(session), input.requestedModel)
+      : allowlisted(session, input.role, input.allowlist)
+  );
+  const eligible = sessions.filter((session) => (
+    session.parentSession === parent.name
+    && session.role !== 'brain'
+    && !session.executionCloneMetadata
+    && !input.exclude.has(session.name)
+    && !SUPERVISION_DEFAULT_EXCLUDED_DEVELOPMENT_SESSIONS.includes(session.name)
+    && !isExcludedDevelopmentModel(resolveEffectiveSessionModel(session) ?? '')
+    && (!pools || !!definition?.configs.some((config: SupervisionExecutionConfig) => configMatchesSession(config, session)))
+    && eligibleForRole(session)
+  ));
+  const byFamily = new Map<string, TaskPairLimitedFamily>();
+  for (const session of eligible) {
+    const state = availability.get(session.name);
+    if (state?.availability !== DELEGATION_AVAILABILITY.LIMITED) continue;
+    const family = sessionProviderFamily(session);
+    const retryAt = state.retryAt;
+    const existing = byFamily.get(family);
+    if (!existing) byFamily.set(family, { family, retryAt });
+    else if (retryAt !== undefined && (existing.retryAt === undefined || retryAt > existing.retryAt)) existing.retryAt = retryAt;
+  }
+  if (byFamily.size === 0) return undefined;
+  const families = [...byFamily.values()];
+  const text = families
+    .map((entry) => `${entry.family}${entry.retryAt ? ` (until ~${new Date(entry.retryAt).toISOString()})` : ' (no estimate)'}`)
+    .join(', ');
+  return { text, families };
 }
 
 /** Running, or with messages still queued: not a moment to nudge. */

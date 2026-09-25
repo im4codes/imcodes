@@ -45,8 +45,6 @@ export interface TaskPairLiveness {
   activityExecutorAt?: number;
   activityAuditorAt?: number;
   lastTickAt: number;
-  /** Consecutive heartbeats the executor spent usage-limited while it was its turn. */
-  limitedExecutor?: number;
   /** Escalations already sent, so each is sent once. */
   notified: string[];
 }
@@ -371,7 +369,6 @@ function rowToPair(row: Record<string, unknown>): StoredTaskPair {
     activityExecutorAt: Number(raw.activityExecutorAt ?? progressExecutorAt),
     activityAuditorAt: Number(raw.activityAuditorAt ?? progressAuditorAt),
     lastTickAt: Number(raw.lastTickAt ?? 0),
-    ...(raw.limitedExecutor === undefined ? {} : { limitedExecutor: Number(raw.limitedExecutor) }),
     notified: Array.isArray(raw.notified) ? raw.notified.map(String) : [],
   };
   return {

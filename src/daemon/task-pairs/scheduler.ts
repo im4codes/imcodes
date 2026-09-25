@@ -38,23 +38,31 @@ import { taskPairService, type TaskPairScheduler } from './service.js';
 import {
   allowlistedProvisionConfig,
   describeAuditorAllowlistGap,
+  describeLimitedProviderFamilies,
   describePoolSyncGap,
   describeRequestedModelMiss,
   isSessionBusy,
   isSessionProviderLimited,
   listTaskPairCandidates,
   poolOfSession,
+  providerFamilyOfSession,
   type TaskPairPickRole,
 } from './pool.js';
 import {
+  buildAggregatedBrainNoticeMessage,
   buildAuditorAssignmentMessage,
   buildAuditorHandoffMessage,
   buildBrainLine,
   buildBrainNoticeMessage,
   buildDispatchTrailer,
+  buildExecutorHandoffMessage,
   buildExecutorResendMessage,
   buildNudgeMessage,
+  type PendingBrainNotice,
 } from './messages.js';
+
+/** Synthetic task id for an aggregated multi-pair Brain notice (dedup key only; no real pair). */
+const TASK_PAIR_AGGREGATE_NOTICE_ID = '__aggregate__' as const;
 
 /** Heartbeat interval override, e.g. for real-device testing. */
 export const TASK_PAIR_HEARTBEAT_ENV = 'IMCODES_TASK_PAIR_HEARTBEAT_MS' as const;
@@ -63,8 +71,8 @@ export interface TaskPairSchedulerDeps {
   now?: () => number;
   isBusy?: (sessionName: string) => boolean;
   isLimited?: (sessionName: string) => boolean;
-  pickCandidate?: (input: { brain: string; role: TaskPairPickRole; pool: 'primary' | 'economy'; exclude: ReadonlySet<string>; project: string; requestedModel?: string }) => string | undefined;
-  provision?: (input: { brain: string; role: TaskPairPickRole; pool: 'primary' | 'economy'; project: string; taskId: string; requestedModel?: string }) => Promise<string | undefined>;
+  pickCandidate?: (input: { brain: string; role: TaskPairPickRole; pool: 'primary' | 'economy'; exclude: ReadonlySet<string>; project: string; requestedModel?: string; avoidProviderFamily?: string }) => string | undefined;
+  provision?: (input: { brain: string; role: TaskPairPickRole; pool: 'primary' | 'economy'; project: string; taskId: string; requestedModel?: string; avoidProviderFamily?: string }) => Promise<string | undefined>;
   /** Import not-yet-imported in-flight legacy tasks of `pairs` projects (idempotent). */
   importLegacy?: (now: number) => void | Promise<void>;
   poolOf?: (brain: string, sessionName: string) => 'primary' | 'economy' | undefined;
@@ -122,20 +130,37 @@ export class TaskPairAutomation implements TaskPairScheduler {
     this.#tickBusy?.set(session, busy);
     return busy;
   }
-  /** A structured usage limit, or a transient provider refusal (capacity, rate, overload) in the last heartbeat. */
-  #limited(session: string): boolean {
-    return (this.#deps.isLimited ?? ((name) => isSessionProviderLimited(name)))(session)
-      || hasRecentTaskPairProviderError(session, this.#now(), this.#intervalMs);
+  /**
+   * A real, structured rate/usage limit (`provider_rate_limited`, a weekly
+   * quota, `availability=limited`, ...). This is the ONLY case that fails
+   * over to a different provider family: the session cannot serve this
+   * account's quota at all, so retrying it (same or different work) will not
+   * help until the provider says otherwise.
+   */
+  #rateLimited(session: string): boolean {
+    return (this.#deps.isLimited ?? ((name) => isSessionProviderLimited(name)))(session);
+  }
+
+  /**
+   * A transient provider refusal (owner correction, tsk_cd_limit_failover
+   * addendum 2): "Selected model is at capacity" and similar overload/rate-
+   * limit-shaped HTTP errors are NOT a quota limit -- the same session
+   * typically works again within a heartbeat or two. This never fails over
+   * or switches provider; the affected side just backs off (held without a
+   * wasted nudge it cannot answer) and is retried on the next heartbeat.
+   */
+  #capacityLimited(session: string): boolean {
+    return hasRecentTaskPairProviderError(session, this.#now(), this.#intervalMs);
   }
   #poolOf(brain: string, session: string) { return (this.#deps.poolOf ?? ((b, s) => poolOfSession(b, s)))(brain, session); }
 
-  #pick(input: { brain: string; role: TaskPairPickRole; pool: 'primary' | 'economy'; exclude: ReadonlySet<string>; project: string; requestedModel?: string }): string | undefined {
+  #pick(input: { brain: string; role: TaskPairPickRole; pool: 'primary' | 'economy'; exclude: ReadonlySet<string>; project: string; requestedModel?: string; avoidProviderFamily?: string }): string | undefined {
     if (this.#deps.pickCandidate) return this.#deps.pickCandidate(input);
     const allowlist = resolveTaskPairAllowlist(input.project);
     return listTaskPairCandidates({ ...input, allowlist })[0]?.name;
   }
 
-  async #provision(input: { brain: string; role: TaskPairPickRole; pool: 'primary' | 'economy'; project: string; taskId: string; requestedModel?: string }): Promise<string | undefined> {
+  async #provision(input: { brain: string; role: TaskPairPickRole; pool: 'primary' | 'economy'; project: string; taskId: string; requestedModel?: string; avoidProviderFamily?: string }): Promise<string | undefined> {
     if (this.#deps.provision) return this.#deps.provision(input);
     const allowlist = resolveTaskPairAllowlist(input.project);
     const config = allowlistedProvisionConfig({ ...input, allowlist });
@@ -187,6 +212,10 @@ export class TaskPairAutomation implements TaskPairScheduler {
     // One busy snapshot per tick: the nudge this tick queues for one pair must
     // not make the same idle session look busy for its other pairs.
     this.#tickBusy = new Map();
+    // Brain notices raised this tick are collected and sent as one message
+    // per Brain (see #queueNotice), instead of one per pair -- a single pool
+    // outage or import batch must not spam Brain with N separate escalations.
+    this.#pendingNotices = new Map();
     try {
       for (const stored of store.listActivePairs()) {
         if (!isPairsEngineProject(stored.project)) continue;
@@ -197,15 +226,50 @@ export class TaskPairAutomation implements TaskPairScheduler {
           logger.warn({ err: error, taskId: stored.state.taskId }, 'task-pair: pair tick failed');
         }
       }
+      for (const [brain, project] of brains) await this.runQueue(project, brain);
     } finally {
       this.#tickBusy = undefined;
+      await this.#flushPendingNotices();
+      this.#pendingNotices = undefined;
     }
-    for (const [brain, project] of brains) await this.runQueue(project, brain);
     // Workspaces of pairs that ended a week ago go (hourly at most).
     await taskPairService.sweepWorkspaces(now);
     store.prune(now);
     this.#nextTickAt = now + this.#intervalMs;
     this.publishBadges();
+  }
+
+  /**
+   * Brain notices raised outside a tick (marker-driven, e.g. `onIntent`) send
+   * at once, as before. Notices raised during a tick's pair loop or queue run
+   * are collected here and flushed as one message per Brain when the tick
+   * ends, so N pairs hitting the same pool outage in one heartbeat produce
+   * one notice, not N.
+   */
+  #pendingNotices?: Map<string, PendingBrainNotice[]>;
+
+  #queueNotice(pair: TaskPairState, flag: TaskPairFlag, detail?: string): void {
+    if (this.#pendingNotices) {
+      const list = this.#pendingNotices.get(pair.brain) ?? [];
+      list.push({ pair, flag, detail });
+      this.#pendingNotices.set(pair.brain, list);
+      return;
+    }
+    void sendTaskPairMessage(pair.brain, pair.taskId, `brain-${flag}`, buildBrainNoticeMessage(pair, flag, detail));
+  }
+
+  async #flushPendingNotices(): Promise<void> {
+    const pending = this.#pendingNotices;
+    if (!pending) return;
+    for (const [brain, entries] of pending) {
+      if (entries.length === 0) continue;
+      if (entries.length === 1) {
+        const { pair, flag, detail } = entries[0]!;
+        await sendTaskPairMessage(brain, pair.taskId, `brain-${flag}`, buildBrainNoticeMessage(pair, flag, detail));
+      } else {
+        await sendTaskPairMessage(brain, TASK_PAIR_AGGREGATE_NOTICE_ID, 'brain-aggregate', buildAggregatedBrainNoticeMessage(entries));
+      }
+    }
   }
 
   /**
@@ -236,12 +300,26 @@ export class TaskPairAutomation implements TaskPairScheduler {
   }
 
   async #tickPair(stored: StoredTaskPair, now: number): Promise<void> {
-    const pair = stored.state;
+    let pair = stored.state;
+    const store = getTaskPairStore();
+    // Owner report (tsk_cd_limit_failover addendum): needs_auditor must never
+    // be kept once a real auditor is actually assigned, whatever set it stale
+    // (a race with the pick that filled the role, an import, ...). Self-heal
+    // rather than let the generic "no auditor" text spam Brain forever. Not
+    // when the auditor is itself rate/capacity limited: it is real but
+    // unavailable, and needs_auditor may legitimately still describe a failed
+    // replacement attempt for it.
+    if (
+      pair.flags.includes('needs_auditor') && pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR
+      && !this.#rateLimited(pair.auditor) && !this.#capacityLimited(pair.auditor)
+    ) {
+      pair = { ...pair, flags: pair.flags.filter((flag) => flag !== 'needs_auditor'), updatedAt: now };
+      store.savePair(stored.project, pair);
+    }
     const side = taskPairSideToAct(pair);
     const liveness: TaskPairLiveness = { ...stored.liveness, notified: [...stored.liveness.notified] };
     const previousTick = liveness.lastTickAt;
     liveness.lastTickAt = now;
-    const store = getTaskPairStore();
     if (!side) { store.saveLiveness(stored.project, pair.taskId, liveness); return; }
 
     const session = side === 'executor' ? pair.executor : pair.auditor;
@@ -252,24 +330,24 @@ export class TaskPairAutomation implements TaskPairScheduler {
     }
     if (!session) { store.saveLiveness(stored.project, pair.taskId, liveness); return; }
 
-    // A usage-limited auditor is replaced at once. A usage-limited executor
-    // holds the work, so it is neither nudged (it cannot answer) nor handed to
-    // Brain while the limit may clear; it escalates only once the limit has
-    // lasted as long as the silence limit, and nudging resumes after it clears.
-    if (this.#limited(session)) {
-      if (side === 'auditor') {
-        store.saveLiveness(stored.project, pair.taskId, liveness);
-        await this.replaceAuditor(stored.project, pair.taskId, 'auditor hit a provider usage limit');
-        return;
-      }
-      liveness.limitedExecutor = (liveness.limitedExecutor ?? 0) + 1;
+    // A REAL rate/usage limit is reassigned at once, preferring a different
+    // provider family so a whole-family outage does not just hand the pair to
+    // another session behind the same limit. Only when no replacement at all
+    // is available does the pair wait, flagged and aggregated to Brain rather
+    // than escalated per pair.
+    //
+    // Owner correction (tsk_cd_limit_failover addendum 2): a transient
+    // provider refusal ("Selected model is at capacity") is NOT a rate limit
+    // and never fails over -- it is treated exactly like ordinary silence
+    // below (held without a nudge it cannot answer, escalated only once the
+    // silence limit is reached), just retried on the same session.
+    if (this.#rateLimited(session)) {
       store.saveLiveness(stored.project, pair.taskId, liveness);
-      if (liveness.limitedExecutor === TASK_PAIR_SILENCE_LIMIT) {
-        this.#escalateExecutor(stored.project, pair.taskId, `executor hit a provider usage limit for ${TASK_PAIR_SILENCE_LIMIT} heartbeats`);
-      }
+      if (side === 'auditor') await this.replaceAuditor(stored.project, pair.taskId, 'auditor hit a provider usage limit', { dueToLimit: true });
+      else await this.#replaceExecutor(stored.project, pair.taskId, 'executor hit a provider usage limit', { dueToLimit: true });
       return;
     }
-    if (side === 'executor' && liveness.limitedExecutor) liveness.limitedExecutor = 0;
+    const capacityLimited = this.#capacityLimited(session);
 
     // A pair is stuck only when *both* participants have been quiet since the
     // previous heartbeat. In that case the executor is the single owner of
@@ -278,11 +356,19 @@ export class TaskPairAutomation implements TaskPairScheduler {
     // materials arrived). One nudge per heartbeat escalates exactly once.
     const executor = pair.executor;
     const auditor = pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? pair.auditor : undefined;
+    // Neither side counts as "quiet" (needing a nudge) while it is rate- or
+    // capacity-limited: tsk_cd_limit_failover's whole point is that a limited
+    // session is never nudged (it cannot answer) and is held/failed-over by
+    // its own dedicated path below, not treated as plain silence here.
     const executorQuiet = Boolean(executor)
       && !this.#busy(executor!)
+      && !this.#rateLimited(executor!)
+      && !this.#capacityLimited(executor!)
       && (liveness.activityExecutorAt ?? liveness.progressExecutorAt) <= previousTick;
     const auditorQuiet = Boolean(auditor)
       && !this.#busy(auditor!)
+      && !this.#rateLimited(auditor!)
+      && !this.#capacityLimited(auditor!)
       && (liveness.activityAuditorAt ?? liveness.progressAuditorAt) <= previousTick;
     const executorFlagged = pair.flagSides.blocked === 'executor' || pair.flagSides.needs_input === 'executor';
     const auditorFlagged = pair.flagSides.blocked === 'auditor' || pair.flagSides.needs_input === 'auditor';
@@ -310,10 +396,21 @@ export class TaskPairAutomation implements TaskPairScheduler {
     if (side === 'executor' && progressAt > previousTick && pair.flags.includes('executor_silent')) {
       store.savePair(stored.project, { ...pair, flags: pair.flags.filter((flag) => flag !== 'executor_silent'), updatedAt: now }, { liveness });
     }
+    if (side === 'auditor' && progressAt > previousTick && pair.flags.includes('auditor_capacity_hold')) {
+      store.savePair(stored.project, { ...pair, flags: pair.flags.filter((flag) => flag !== 'auditor_capacity_hold'), updatedAt: now }, { liveness });
+    }
+    if (this.#busy(session) || progressAt > previousTick || activityAt > previousTick) {
+      store.saveLiveness(stored.project, pair.taskId, liveness);
+      return;
+    }
+    // This side flagged itself blocked/needs_input: escalate once with the
+    // real cause (owner report: never the generic no-auditor text when a
+    // named, present participant is simply stuck) instead of nudging.
     const flagSide = pair.flagSides.blocked === side || pair.flagSides.needs_input === side;
     const flagged = flagSide && (pair.flags.includes('blocked') || pair.flags.includes('needs_input'));
-    if (this.#busy(session) || progressAt > previousTick || activityAt > previousTick || flagged) {
+    if (flagged) {
       store.saveLiveness(stored.project, pair.taskId, liveness);
+      this.#escalateBlocked(stored.project, pair.taskId, side);
       return;
     }
 
@@ -323,14 +420,62 @@ export class TaskPairAutomation implements TaskPairScheduler {
     store.saveLiveness(stored.project, pair.taskId, liveness);
 
     if (silence < TASK_PAIR_SILENCE_LIMIT) {
-      await sendTaskPairMessage(session, pair.taskId, `nudge-${side}`, buildNudgeMessage(pair, side));
+      // A capacity-limited session cannot answer right now; a nudge would
+      // just fail again. Silently back off and retry on the next heartbeat.
+      if (!capacityLimited) await sendTaskPairMessage(session, pair.taskId, `nudge-${side}`, buildNudgeMessage(pair, side));
       return;
     }
     if (silence === TASK_PAIR_SILENCE_LIMIT) {
-      if (side === 'auditor') await this.replaceAuditor(stored.project, pair.taskId, `auditor silent for ${TASK_PAIR_SILENCE_LIMIT} heartbeats`);
-      else this.#escalateExecutor(stored.project, pair.taskId, `executor silent for ${TASK_PAIR_SILENCE_LIMIT} heartbeats`);
+      if (side === 'auditor' && capacityLimited) {
+        // Owner correction: a capacity error is never grounds to switch the
+        // auditor, however long it persists -- only a REAL rate limit fails
+        // over. Tell Brain once; the pair keeps retrying the same auditor.
+        this.#escalateCapacityAuditor(stored.project, pair.taskId);
+      } else if (side === 'auditor') {
+        await this.replaceAuditor(stored.project, pair.taskId, `auditor silent for ${TASK_PAIR_SILENCE_LIMIT} heartbeats`);
+      } else {
+        const because = capacityLimited
+          ? `hit a provider capacity error for ${TASK_PAIR_SILENCE_LIMIT} heartbeats`
+          : `silent for ${TASK_PAIR_SILENCE_LIMIT} heartbeats`;
+        this.#escalateExecutor(stored.project, pair.taskId, `executor ${because}`);
+      }
     }
     // Past the limit: no more nudges until that side makes progress or is reassigned.
+  }
+
+  /**
+   * Owner correction (tsk_cd_limit_failover, r1 audit): a capacity-limited
+   * auditor is retried on the same session forever, never replaced -- unlike
+   * a real rate limit (replaceAuditor with dueToLimit) or ordinary silence
+   * (replaceAuditor). One notice per round, not one per heartbeat.
+   */
+  #escalateCapacityAuditor(project: string, taskId: string): void {
+    const store = getTaskPairStore();
+    const stored = store.getPair(project, taskId);
+    if (!stored || stored.state.flags.includes('auditor_capacity_hold')) return;
+    const state = { ...stored.state, flags: [...stored.state.flags, 'auditor_capacity_hold' as TaskPairFlag], updatedAt: this.#now() };
+    store.savePair(project, state);
+    this.#queueNotice(state, 'auditor_capacity_hold', `auditor ${state.auditor} hit a provider capacity error for ${TASK_PAIR_SILENCE_LIMIT} heartbeats; retrying on the same session`);
+  }
+
+  /**
+   * The acting side flagged itself BLOCKED/NEEDS_INPUT: tell Brain the real
+   * cause (owner report: "auditor <session> BLOCKED: <note>", never the
+   * generic no-auditor text) once per round, not every heartbeat.
+   */
+  #escalateBlocked(project: string, taskId: string, side: 'executor' | 'auditor'): void {
+    const store = getTaskPairStore();
+    const stored = store.getPair(project, taskId);
+    if (!stored) return;
+    const pair = stored.state;
+    const flag = pair.flagSides.blocked === side ? 'blocked' : 'needs_input';
+    const key = `${flag}:${side}:${pair.round}`;
+    if (stored.liveness.notified.includes(key)) return;
+    store.saveLiveness(project, taskId, { ...stored.liveness, notified: [...stored.liveness.notified, key] });
+    const session = side === 'executor' ? pair.executor : pair.auditor;
+    const verb = flag === 'blocked' ? 'BLOCKED' : 'NEEDS_INPUT';
+    const detail = `${side} ${session ?? '(unknown)'} ${verb}${pair.blockedNote ? `: ${pair.blockedNote}` : ''}`;
+    this.#queueNotice(pair, flag, detail);
   }
 
   #escalateExecutor(project: string, taskId: string, reason: string): void {
@@ -340,16 +485,27 @@ export class TaskPairAutomation implements TaskPairScheduler {
     const state = { ...stored.state, flags: [...stored.state.flags, 'executor_silent' as TaskPairFlag], updatedAt: this.#now() };
     store.savePair(project, state);
     logger.info({ taskId, reason }, 'task-pair: executor escalated to Brain');
-    void sendTaskPairMessage(state.brain, taskId, 'brain-executor_silent', buildBrainNoticeMessage(state, 'executor_silent'));
+    this.#queueNotice(state, 'executor_silent');
   }
 
   // ---- auditor replacement ------------------------------------------------
 
-  async replaceAuditor(project: string, taskId: string, reason: string): Promise<boolean> {
+  async replaceAuditor(project: string, taskId: string, reason: string, opts: { dueToLimit?: boolean } = {}): Promise<boolean> {
     const store = getTaskPairStore();
     const stored = store.getPair(project, taskId);
     if (!stored || isTerminalTaskPairStatus(stored.state.status) || stored.state.auditor === TASK_PAIR_NO_AUDITOR) return false;
     const pair = stored.state;
+    const hadRealAuditor = !!pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR;
+    // Owner report (tsk_cd_limit_failover addendum): a "there is no auditor"
+    // pick must never fire, or leave needs_auditor set, once a real auditor
+    // is actually assigned. `executor_blocked`/limited/silent reasons are
+    // legitimate replacements of an existing auditor and are unaffected.
+    if (!opts.dueToLimit && (reason === 'no auditor' || reason === 'no auditor named') && hadRealAuditor) {
+      if (pair.flags.includes('needs_auditor')) {
+        store.savePair(project, { ...pair, flags: pair.flags.filter((flag) => flag !== 'needs_auditor'), updatedAt: this.#now() });
+      }
+      return true;
+    }
     // Starting an audit on a pair that has no auditor counts against Brain's
     // open-pair limit, so a batch (e.g. imported legacy work) is audited a few
     // at a time in queue order instead of provisioning an auditor for each.
@@ -362,10 +518,30 @@ export class TaskPairAutomation implements TaskPairScheduler {
       return false;
     }
     const exclude = new Set<string>([pair.brain, ...(pair.executor ? [pair.executor] : []), ...(pair.auditor ? [pair.auditor] : []), ...pair.previousAuditors]);
-    const requestedModel = pair.auditorModel;
-    const pickInput = { brain: pair.brain, role: 'auditor' as const, pool: 'primary' as const, exclude, project, requestedModel };
+    // A limit-triggered replacement drops a named model pin: retrying the
+    // exact model that just got limited can never succeed, and the point of
+    // failover is to keep going, not to wait on that specific model.
+    const requestedModel = opts.dueToLimit ? undefined : pair.auditorModel;
+    const avoidProviderFamily = opts.dueToLimit && hadRealAuditor ? providerFamilyOfSession(pair.auditor!) : undefined;
+    const pickInput = { brain: pair.brain, role: 'auditor' as const, pool: 'primary' as const, exclude, project, requestedModel, avoidProviderFamily };
     const next = this.#pick(pickInput) ?? await this.#provision({ ...pickInput, taskId });
     if (!next || exclude.has(next)) {
+      if (opts.dueToLimit) {
+        // The current (limited) auditor is EXCLUDED from `exclude` above so
+        // the pick never re-selects it -- but it must stay IN this scan, or
+        // the very session we are replacing because it is limited is never
+        // counted as a limited family.
+        const limitedScanExclude = new Set<string>([pair.brain, ...pair.previousAuditors]);
+        const limited = describeLimitedProviderFamilies({ brain: pair.brain, role: 'auditor', pool: 'primary', allowlist: resolveTaskPairAllowlist(project), exclude: limitedScanExclude });
+        if (limited) {
+          const key = `all_providers_limited:${pair.round}`;
+          if (stored.liveness.notified.includes(key)) return false;
+          const state = pair.flags.includes('all_providers_limited') ? pair : { ...pair, flags: [...pair.flags, 'all_providers_limited' as TaskPairFlag], updatedAt: this.#now() };
+          store.savePair(project, state, { liveness: { ...stored.liveness, notified: [...stored.liveness.notified, key] } });
+          this.#queueNotice(state, 'all_providers_limited', `auditor ${pair.auditor} limited; no cross-family replacement available (${limited.text})`);
+          return false;
+        }
+      }
       const key = `needs_auditor:${pair.round}`;
       if (stored.liveness.notified.includes(key)) return false;
       const state = pair.flags.includes('needs_auditor') ? pair : { ...pair, flags: [...pair.flags, 'needs_auditor' as TaskPairFlag], updatedAt: this.#now() };
@@ -376,7 +552,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
       const gap = requestedModel
         ? describeRequestedModelMiss(requestedModel)
         : describeAuditorAllowlistGap({ brain: pair.brain, allowlist: resolveTaskPairAllowlist(project) });
-      await sendTaskPairMessage(pair.brain, taskId, 'brain-needs_auditor', buildBrainNoticeMessage(state, 'needs_auditor', gap));
+      this.#queueNotice(state, 'needs_auditor', gap);
       return false;
     }
     const previousAuditor = pair.auditor;
@@ -391,16 +567,75 @@ export class TaskPairAutomation implements TaskPairScheduler {
     const updated = result.pair ?? store.getPair(project, taskId)?.state;
     if (!updated) return false;
     const auditorPool = this.#poolOf(updated.brain, next);
-    if (auditorPool || updated.flags.includes('waiting_for_capacity')) {
+    if (auditorPool || updated.flags.includes('waiting_for_capacity') || updated.flags.includes('all_providers_limited')) {
       store.savePair(project, {
         ...updated,
         ...(auditorPool ? { auditorPool } : {}),
-        flags: updated.flags.filter((flag) => flag !== 'waiting_for_capacity'),
+        flags: updated.flags.filter((flag) => flag !== 'waiting_for_capacity' && flag !== 'all_providers_limited'),
       });
     }
     await sendTaskPairMessage(next, taskId, 'handoff', buildAuditorHandoffMessage(updated));
     if (updated.executor) await sendTaskPairMessage(updated.executor, taskId, 'resend', buildExecutorResendMessage(updated, previousAuditor));
     await sendTaskPairMessage(updated.brain, taskId, 'brain-line-reassign', buildBrainLine(updated, `auditor ${previousAuditor ?? '(none)'} → ${next}: ${reason}.`));
+    return true;
+  }
+
+  /**
+   * Executor equivalent of {@link replaceAuditor}: only reached today from a
+   * limit-triggered failover (`#tickPair`). Hands the new executor the
+   * pair's existing workspace and state, and records the change in the pair
+   * events via the same REASSIGN marker path.
+   */
+  async #replaceExecutor(project: string, taskId: string, reason: string, opts: { dueToLimit?: boolean } = {}): Promise<boolean> {
+    const store = getTaskPairStore();
+    const stored = store.getPair(project, taskId);
+    if (!stored || isTerminalTaskPairStatus(stored.state.status) || !stored.state.executor) return false;
+    const pair = stored.state;
+    const pool = pair.executorPool === 'economy' ? 'economy' as const : 'primary' as const;
+    const exclude = new Set<string>([pair.brain, pair.executor!, ...(pair.auditor ? [pair.auditor] : [])]);
+    const requestedModel = opts.dueToLimit ? undefined : pair.executorModel;
+    const avoidProviderFamily = opts.dueToLimit ? providerFamilyOfSession(pair.executor!) : undefined;
+    const pickInput = { brain: pair.brain, role: 'executor' as const, pool, exclude, project, requestedModel, avoidProviderFamily };
+    const next = this.#pick(pickInput) ?? await this.#provision({ ...pickInput, taskId });
+    if (!next) {
+      if (opts.dueToLimit) {
+        // See replaceAuditor: the limited executor itself must stay IN this
+        // scan even though it is excluded from the pick.
+        const limitedScanExclude = new Set<string>([pair.brain, ...(pair.auditor ? [pair.auditor] : [])]);
+        const limited = describeLimitedProviderFamilies({ brain: pair.brain, role: 'executor', pool, allowlist: resolveTaskPairAllowlist(project), exclude: limitedScanExclude });
+        if (limited) {
+          const key = `all_providers_limited:${pair.round}`;
+          if (stored.liveness.notified.includes(key)) return false;
+          const state = pair.flags.includes('all_providers_limited') ? pair : { ...pair, flags: [...pair.flags, 'all_providers_limited' as TaskPairFlag], updatedAt: this.#now() };
+          store.savePair(project, state, { liveness: { ...stored.liveness, notified: [...stored.liveness.notified, key] } });
+          this.#queueNotice(state, 'all_providers_limited', `executor ${pair.executor} limited; no cross-family replacement available (${limited.text})`);
+          return false;
+        }
+      }
+      this.#flagOnce(project, taskId, 'waiting_for_capacity', requestedModel ? describeRequestedModelMiss(requestedModel) : describePoolSyncGap(pair.brain));
+      return false;
+    }
+    const previousExecutor = pair.executor;
+    const result = taskPairService.applyMarker({
+      project,
+      writer: 'daemon',
+      marker: { verb: 'REASSIGN', knownVerb: 'REASSIGN', taskId, attrs: { executor: next } },
+      source: 'heartbeat',
+      now: this.#now(),
+      eventId: `heartbeat:${project}:${taskId}:reassign-executor:${next}:${this.#now()}`,
+    });
+    const updated = result.pair ?? store.getPair(project, taskId)?.state;
+    if (!updated) return false;
+    const executorPool = this.#poolOf(updated.brain, next);
+    if (executorPool || updated.flags.includes('all_providers_limited')) {
+      store.savePair(project, {
+        ...updated,
+        ...(executorPool ? { executorPool } : {}),
+        flags: updated.flags.filter((flag) => flag !== 'all_providers_limited'),
+      });
+    }
+    await sendTaskPairMessage(next, taskId, 'executor-handoff', buildExecutorHandoffMessage(updated, previousExecutor, reason));
+    await sendTaskPairMessage(updated.brain, taskId, 'brain-line-reassign', buildBrainLine(updated, `executor ${previousExecutor ?? '(none)'} → ${next}: ${reason}.`));
     return true;
   }
 
@@ -450,7 +685,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
     if (!stored || stored.state.flags.includes(flag)) return;
     const state = { ...stored.state, flags: [...stored.state.flags, flag], updatedAt: this.#now() };
     store.savePair(project, state);
-    void sendTaskPairMessage(state.brain, taskId, `brain-${flag}`, buildBrainNoticeMessage(state, flag, detail));
+    this.#queueNotice(state, flag, detail);
   }
 
   /** Pool bookkeeping after role changes: record pools, flag off-pool and unreviewed economy work. */

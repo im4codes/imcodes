@@ -88,10 +88,14 @@ const FLAG_EXPLANATIONS: Partial<Record<TaskPairFlag, string>> = {
   awaiting_audit_ignored: 'the executor keeps writing DONE without getting a PASS',
   replacement_churn: 'the executor keeps reporting the auditor as blocked',
   markers_unresolved: 'markers with task id "-" cannot be matched to one task',
-  executor_silent: 'the executor has been silent for 3 heartbeats or hit a usage limit',
+  executor_silent: 'the executor has been silent for 3 heartbeats',
   needs_auditor: 'no auditor could be found or provisioned from the pool',
   economy_unreviewed: 'economy-pool work was passed by an auditor outside the primary pool',
   waiting_for_capacity: 'no allowlisted pool session is free to take the next queued task',
+  all_providers_limited: 'every eligible session across every provider family is currently limited',
+  auditor_capacity_hold: 'the auditor keeps hitting a provider capacity error and is being retried on the same session, never switched',
+  blocked: 'a participant reported being blocked',
+  needs_input: 'a participant is waiting on input',
 };
 
 export function buildBrainNoticeMessage(pair: TaskPairState, flag: TaskPairFlag, detail?: string): string {
@@ -105,6 +109,30 @@ export function buildBrainNoticeMessage(pair: TaskPairState, flag: TaskPairFlag,
     `Needs your decision: ${FLAG_EXPLANATIONS[flag] ?? flag}. Executor ${pair.executor ?? '-'}, auditor ${pair.auditor ?? '-'}, status ${pair.status}, round ${pair.round}.`,
     ...(detail ? [`Why: ${detail}.`] : []),
     resolve,
+    `[Contract: ${TASK_PAIR_CONTRACT_ID}]`,
+  ].join('\n');
+}
+
+export interface PendingBrainNotice {
+  pair: TaskPairState;
+  flag: TaskPairFlag;
+  detail?: string;
+}
+
+/**
+ * One heartbeat can find several of a Brain's pairs needing a decision at
+ * once (an auditor pool outage, several imports missing an auditor). One
+ * combined message, not one per pair -- the single-pair case still uses
+ * {@link buildBrainNoticeMessage} unchanged.
+ */
+export function buildAggregatedBrainNoticeMessage(notices: readonly PendingBrainNotice[]): string {
+  const lines = notices.map(({ pair, flag, detail }) => (
+    `- ${pair.taskId}${pair.title ? ` "${pair.title}"` : ''}: ${detail ?? FLAG_EXPLANATIONS[flag] ?? flag}. Executor ${pair.executor ?? '-'}, auditor ${pair.auditor ?? '-'}, status ${pair.status}.`
+  ));
+  return [
+    `[IM.codes task pairs] Needs your decision on ${notices.length} pairs:`,
+    ...lines,
+    `Resolve each with a marker, e.g. ${marker('REASSIGN', '<taskId>', 'auditor=<session>')}, ${marker('DONE', '<taskId>', 'force=true')}, or ${marker('CANCEL', '<taskId>')}. No further reminders until each pair's state changes.`,
     `[Contract: ${TASK_PAIR_CONTRACT_ID}]`,
   ].join('\n');
 }
@@ -247,6 +275,25 @@ export function buildExecutorResendMessage(pair: TaskPairState, previousAuditor:
   return [
     header(pair),
     `Your auditor changed${previousAuditor ? ` from ${previousAuditor}` : ''} to ${pair.auditor}. Resend your validation to ${pair.auditor} with send_message, then write ${readyMarker(pair)} if you have not already.`,
+    contracts(pair.blocking),
+  ].join('\n');
+}
+
+/** Sent to a new executor taking over an in-progress pair (e.g. the previous executor hit a provider limit). */
+export function buildExecutorHandoffMessage(pair: TaskPairState, previousExecutor: string | undefined, reason: string): string {
+  const auditor = pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? `, auditor ${pair.auditor}` : '';
+  const next = pair.status === 'rework'
+    ? `Address the auditor's blocking findings for their whole class, resend, then write ${marker('READY_FOR_AUDIT', pair.taskId)}.`
+    : pair.status === 'in_audit' || pair.status === 'awaiting_audit'
+      ? `The audit is already underway on your predecessor's material. If you need to change it materially, tell the auditor and write ${marker('READY_FOR_AUDIT', pair.taskId)} again once it is updated.`
+      : `Continue the task. When ready, send the auditor your validation (full suites for code) with send_message and write ${readyMarker(pair)}.`;
+  return [
+    header(pair),
+    `You are now the executor of this task${previousExecutor ? `, taking over from ${previousExecutor}` : ''} (${reason}). Round ${Math.max(1, pair.round)}, status ${pair.status}${auditor}.`,
+    workplaceLine(pair),
+    next,
+    TASK_PAIR_WORKSPACE_RULES,
+    NO_LEGACY_ARTIFACTS,
     contracts(pair.blocking),
   ].join('\n');
 }

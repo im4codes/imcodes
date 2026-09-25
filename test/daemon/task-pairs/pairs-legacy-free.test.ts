@@ -272,9 +272,36 @@ describe('pairs run without legacy supervision artifacts', () => {
     timelineEmitter.emit(EXEC, 'session.state', { state: 'error', error: 'Invalid API key' }, { source: 'daemon', confidence: 'high' });
     marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT M5 worktree=/w head=7654321 -->');
     await flush();
-    // Auditor refused: replaced at once, not left holding the audit.
+    // Owner correction (tsk_cd_limit_failover addendum 2, r1 audit): a
+    // capacity error is NOT a rate limit, so the auditor is never replaced
+    // for it, however long it persists -- it is held and retried on the same
+    // session forever, unlike a real rate limit (see the next test). Brain
+    // gets exactly one notice once it reaches the silence limit.
     capacity(AUD);
     await tick(1);
-    expect(pair('M5').auditor).toBe(SPARE);
+    expect(pair('M5').auditor).toBe(AUD);
+    capacity(AUD);
+    await tick(1);
+    expect(pair('M5').auditor).toBe(AUD);
+    sent = [];
+    capacity(AUD);
+    await tick(1);
+    expect(pair('M5').auditor).toBe(AUD);
+    expect(sentTo(BRAIN, 'brain-auditor_capacity_hold')).toHaveLength(1);
+    // Persisting further still never switches it, and does not notify again.
+    capacity(AUD);
+    await tick(1);
+    expect(pair('M5').auditor).toBe(AUD);
+    expect(sentTo(BRAIN, 'brain-auditor_capacity_hold')).toHaveLength(1);
+  });
+
+  it('replaces a REAL rate-limited auditor at once, unlike a mere capacity error', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH M6 executor=${EXEC} auditor=${AUD} -->`);
+    marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT M6 worktree=/w head=abc1234 -->');
+    await flush();
+    sent = [];
+    limited.add(AUD);
+    await tick(1);
+    expect(pair('M6').auditor).toBe(SPARE);
   });
 });

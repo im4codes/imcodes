@@ -4342,7 +4342,9 @@
       "verdict_inconsistent": "Veredicto incoherente",
       "awaiting_audit_ignored": "Recordatorio ignorado",
       "replacement_churn": "Cambios de auditor",
-      "markers_unresolved": "Marcadores sin resolver"
+      "markers_unresolved": "Marcadores sin resolver",
+      "all_providers_limited": "Todos los proveedores limitados",
+      "auditor_capacity_hold": "Auditor en espera (capacidad)"
     },
     "settings": {
       "title": "Pares de tareas (supervisión por marcadores)",

@@ -4342,7 +4342,9 @@
       "verdict_inconsistent": "Verdict inconsistent",
       "awaiting_audit_ignored": "Audit reminder ignored",
       "replacement_churn": "Auditor churn",
-      "markers_unresolved": "Unresolved markers"
+      "markers_unresolved": "Unresolved markers",
+      "all_providers_limited": "All providers limited",
+      "auditor_capacity_hold": "Auditor holding (capacity)"
     },
     "settings": {
       "title": "Task pairs (marker-driven supervision)",

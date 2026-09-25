@@ -1,21 +1,41 @@
 /**
- * Transient provider refusals ("Selected model is at capacity", rate limits,
- * overload) seen on pair participants.
+ * Free-text provider refusals seen on pair participants, e.g. "Selected model
+ * is at capacity" -- a plain failed turn, with no structured field a caller
+ * could trust the way `SessionRecord.providerLimit` is trusted.
  *
- * Only some providers report a structured usage limit that delegation
- * availability understands; a Codex capacity error arrives as a plain failed
- * turn. For a pair both mean the same thing: the side cannot act right now. So
- * the pair treats such a session as limited for about a heartbeat after its
- * latest error, which routes it through the existing limited path (auditor replaced,
- * executor held without nudges and escalated only if the limit lasts), instead
- * of nudging a session that cannot answer or stopping anything.
+ * OWNER RULE (tsk_cd_limit_failover addendum 2): despite the wording overlap,
+ * this is NEVER treated as a rate/usage limit. A real limit is decided ONLY
+ * by structured evidence (`isSessionProviderLimited`, `SessionRecord.providerLimit`);
+ * this regex intentionally ALSO matches rate-limit-shaped wording ("rate
+ * limit", "429", "quota exceeded") because a provider that only ever reports
+ * its limit as free text -- no structured field at all -- must still be held
+ * and retried like any other capacity error, not silently ignored. A hit here
+ * means "this session cannot act right now, retry it on the next heartbeat";
+ * it is scheduler.ts's `#capacityLimited`, checked strictly AFTER
+ * `#rateLimited`, and it never fails over or replaces the auditor, however
+ * long it persists (`#escalateCapacityAuditor`/`#escalateExecutor` just keep
+ * retrying the same session and tell Brain once). Do not read a match here as
+ * "this provider is rate-limited" -- it is not, unless structured evidence
+ * also says so.
  */
 import { TASK_PAIR_HEARTBEAT_MS } from '../../../shared/task-pair.js';
 import type { TimelineEvent } from '../timeline-event.js';
 
-/** Provider refusals that pass on their own; anything else is a real failure. */
+/**
+ * Wording that means "try again shortly" -- capacity, overload, and (despite
+ * the name of the exported check) rate-limit-shaped text with no structured
+ * evidence behind it. See the module doc above: never treated as a real
+ * limit here regardless of which of these phrases matched.
+ */
 const TRANSIENT_PROVIDER_ERROR_RE = /\bat capacity\b|\bcapacity\b.*\b(?:model|reached|exceeded)\b|rate[ _-]?limit|too many requests|\b429\b|\b529\b|\b503\b|overloaded|temporarily unavailable|usage limit|quota (?:exceeded|exhausted)/i;
 
+/**
+ * True for capacity/overload/rate-limit-SHAPED free text. Despite matching
+ * rate-limit wording, this is a capacity signal, never a rate-limit one --
+ * see the module doc above. Kept under its original name (`isTransientProviderError`)
+ * since it is exercised directly by existing tests; do not repurpose it as
+ * "is this session rate-limited".
+ */
 export function isTransientProviderError(message: string | undefined): boolean {
   return !!message && TRANSIENT_PROVIDER_ERROR_RE.test(message);
 }

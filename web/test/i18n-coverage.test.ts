@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { SUPPORTED_LOCALES } from '../src/i18n/locales/index.js';
+import { TASK_PAIR_FLAGS } from '@shared/task-pair.js';
 
 const WEB_ROOT = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
 const OPENSPEC_AUTO_DELIVER_KEYS = [
@@ -594,6 +595,17 @@ describe('generic i18n coverage guard', () => {
       // The runtime is a brand name, so every locale intentionally keeps the
       // English spelling rather than transliterating it.
       expect(label, `${locale}:session.agentType.deepseek_harness`).toBe('DeepSeek Harness');
+    }
+  });
+
+  it('keeps a taskPair.flag.<flag> label for every TASK_PAIR_FLAGS entry in every locale (a new flag must never ship without one)', () => {
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as unknown;
+      for (const flag of TASK_PAIR_FLAGS) {
+        const value = readPath(messages, `taskPair.flag.${flag}`);
+        expect(value, `${locale}:taskPair.flag.${flag}`).toEqual(expect.any(String));
+        expect((value as string | undefined)?.trim().length, `${locale}:taskPair.flag.${flag}`).toBeGreaterThan(0);
+      }
     }
   });
 });

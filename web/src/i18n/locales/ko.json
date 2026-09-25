@@ -4341,7 +4341,9 @@
       "verdict_inconsistent": "판정 불일치",
       "awaiting_audit_ignored": "감사 알림 무시됨",
       "replacement_churn": "감사자 잦은 교체",
-      "markers_unresolved": "해결되지 않은 마커"
+      "markers_unresolved": "해결되지 않은 마커",
+      "all_providers_limited": "모든 공급자 제한됨",
+      "auditor_capacity_hold": "감사자 대기(용량)"
     },
     "settings": {
       "title": "작업 페어(마커 기반 감독)",
