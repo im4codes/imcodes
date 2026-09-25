@@ -34,7 +34,7 @@ vi.mock('../../src/util/model-context.js', () => ({
 import {
   startWatching, startWatchingFile, stopWatching, isWatching,
   watcherStatus, claudeProjectDir, preClaimFile, emitRecentHistory,
-  reserveSessionFile, refreshTrackedSession,
+  reserveSessionFile, reassignSessionFile, refreshTrackedSession,
   ownerForTests, excludedFileIdsForTests, activeFileForTests,
 } from '../../src/daemon/jsonl-watcher.js';
 
@@ -855,6 +855,23 @@ describe('reserveSessionFile — protects non-watched (e.g. claude-code-sdk) ses
 
     stopWatching('brain_sdk_session');
     expect(ownerForTests(join(testDir, 'released-uuid.jsonl'))).toBeUndefined();
+  });
+
+  it('reassigns a resumed SDK transcript atomically and excludes both stale and live ids from rogue scans', async () => {
+    reserveSessionFile('brain_sdk_session', 'old-resume-id');
+    reassignSessionFile('brain_sdk_session', 'old-resume-id', 'new-resume-id');
+    expect(ownerForTests(join(testDir, 'old-resume-id.jsonl'))).toBeUndefined();
+    expect(ownerForTests(join(testDir, 'new-resume-id.jsonl'))).toBe('brain_sdk_session');
+
+    const rogueFile = join(testDir, 'rogue-own.jsonl');
+    await writeFile(rogueFile, assistantText('rogue'));
+    await startWatchingFile('rogue_session', rogueFile);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(activeFileForTests('rogue_session')).toBe(rogueFile);
+    // A directory-scan watcher cannot adopt either reserved UUID after the
+    // transport's resume id changes; the old claim is gone, the new one lives.
+    expect(ownerForTests(join(testDir, 'old-resume-id.jsonl'))).toBeUndefined();
+    expect(ownerForTests(join(testDir, 'new-resume-id.jsonl'))).toBe('brain_sdk_session');
   });
 });
 

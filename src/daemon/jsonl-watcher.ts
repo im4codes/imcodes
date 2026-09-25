@@ -268,6 +268,21 @@ export function reserveSessionFile(sessionName: string, ccSessionId: string): vo
   ownedFileIds.set(ccSessionId, sessionName);
 }
 
+/**
+ * Move a transport session's transcript reservation when Claude rotates its
+ * resume/session id.  The old UUID is released only when this session still
+ * owns it; a conflicting owner is never disturbed.
+ */
+export function reassignSessionFile(sessionName: string, previousCcSessionId: string | undefined, nextCcSessionId: string): void {
+  const previous = previousCcSessionId?.trim();
+  const next = nextCcSessionId.trim();
+  if (!next) return;
+  if (previous && previous !== next && ownedFileIds.get(previous) === sessionName) {
+    ownedFileIds.delete(previous);
+  }
+  reserveSessionFile(sessionName, next);
+}
+
 /** Returns true if the file's UUID is owned by a DIFFERENT watcher. */
 function isOwnedByOther(sessionName: string, filePath: string): boolean {
   const owner = ownedFileIds.get(fileUuid(filePath));

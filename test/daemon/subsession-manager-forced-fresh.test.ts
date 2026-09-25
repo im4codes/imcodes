@@ -73,7 +73,7 @@ vi.mock('../../src/store/session-store.js', () => ({
 }));
 
 vi.mock('../../src/daemon/jsonl-watcher.js', () => ({
-  reserveSessionFile: vi.fn(),
+  reserveSessionFile: vi.fn(), reassignSessionFile: vi.fn(),
   startWatchingFile: startWatchingFileMock,
   startWatching: jsonlStartWatchingMock,
   stopWatching: jsonlStopWatchingMock,

@@ -54,7 +54,7 @@ import {
   resourceOwnerEnv,
 } from '../daemon/session-resource-service.js';
 import { emitSessionInlineError } from '../daemon/session-error.js';
-import { startWatching, startWatchingFile, stopWatching, isWatching, findJsonlPathBySessionId, reserveSessionFile } from '../daemon/jsonl-watcher.js';
+import { startWatching, startWatchingFile, stopWatching, isWatching, findJsonlPathBySessionId, reserveSessionFile, reassignSessionFile } from '../daemon/jsonl-watcher.js';
 import { startWatching as startCodexWatching, startWatchingSpecificFile as startCodexWatchingFile, startWatchingById as startCodexWatchingById, stopWatching as stopCodexWatching, isWatching as isCodexWatching, findRolloutPathByUuid } from '../daemon/codex-watcher.js';
 import { startWatching as startGeminiWatching, startWatchingLatest as startGeminiWatchingLatest, stopWatching as stopGeminiWatching, isWatching as isGeminiWatching } from '../daemon/gemini-watcher.js';
 import { startWatching as startOpenCodeWatching, stopWatching as stopOpenCodeWatching, isWatching as isOpenCodeWatching } from '../daemon/opencode-watcher.js';
@@ -2069,6 +2069,12 @@ function wireTransportSessionInfo(
 
     if (typeof info.resumeId === 'string' && info.resumeId) {
       if (agentType === 'claude-code-sdk' && next.ccSessionId !== info.resumeId) {
+        if (typeof reassignSessionFile === 'function') {
+          reassignSessionFile(sessionName, next.ccSessionId, info.resumeId);
+        } else {
+          // Compatibility with narrow test seams and older embedded callers.
+          reserveSessionFile(sessionName, info.resumeId);
+        }
         next.ccSessionId = info.resumeId;
         changed = true;
       }
