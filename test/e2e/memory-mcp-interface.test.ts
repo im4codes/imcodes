@@ -84,7 +84,14 @@ describe('memory MCP interface e2e', () => {
   let serverConfigDir: string;
   let serverConfigPath: string;
 
+  let testHome: string;
+  const previousHome = process.env.HOME;
+
   beforeEach(async () => {
+    // The session store and the MCP child resolve ~/.imcodes from HOME; never
+    // let them reach the real one (the store refuses it under vitest).
+    testHome = await mkdtemp(join(tmpdir(), 'e2e-memory-mcp-home-'));
+    process.env.HOME = testHome;
     tempDbDir = await createIsolatedSharedContextDb('memory-mcp-interface-e2e');
     projectRoot = await mkdtemp(join(tmpdir(), 'e2e-memory-mcp-project-'));
     serverConfigDir = await mkdtemp(join(tmpdir(), 'e2e-memory-mcp-server-'));
@@ -99,6 +106,9 @@ describe('memory MCP interface e2e', () => {
     await cleanupIsolatedSharedContextDb(tempDbDir);
     await rm(projectRoot, { recursive: true, force: true });
     await rm(serverConfigDir, { recursive: true, force: true });
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    await rm(testHome, { recursive: true, force: true });
   });
 
   function childEnv(): Record<string, string> {

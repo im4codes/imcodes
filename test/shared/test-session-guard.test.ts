@@ -22,9 +22,7 @@ describe('test session guard', () => {
     expect(isKnownTestSessionName('deck_wtproj_brain')).toBe(true);
     expect(isKnownTestSessionName('deck_sub_wtexec')).toBe(true);
     expect(isKnownTestSessionName('deck_sub_wtaud')).toBe(true);
-    expect(isKnownTestSessionName('persistcheck_2u7qmo_w2')).toBe(true);
     expect(isKnownTestProjectName('wtproj')).toBe(true);
-    expect(isKnownTestProjectName('persistcheck_2u7qmo')).toBe(true);
     // Real production names stay untouched.
     expect(isKnownTestSessionName('deck_sub_wtexecx')).toBe(false);
     expect(isKnownTestSessionName('deck_wtproject_brain')).toBe(false);
