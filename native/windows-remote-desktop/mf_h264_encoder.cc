@@ -8,7 +8,9 @@
 #include <chrono>
 #include <cstring>
 #include <iterator>
+#include <set>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 
 #include "api/make_ref_counted.h"
@@ -42,7 +44,13 @@ uint64_t g_aggregate_reserved_bitrate_bps = 0;
 // registration lock.
 std::atomic<QualityPreference> g_quality_preference{QualityPreference{}};
 std::mutex g_active_encoder_mutex;
-MfH264Encoder* g_active_encoder = nullptr;
+// A worker can own one encoder per viewer.  Keeping only one pointer here
+// meant that opening a second viewer silently orphaned the first encoder from
+// quality updates (and made the global diagnostics describe whichever viewer
+// initialized last).  Keep the registrations as a set so teardown and quality
+// changes cover every live encoder without dereferencing a stale pointer.
+std::set<MfH264Encoder*> g_active_encoders;
+std::unordered_map<std::string, QualityPreference> g_pending_preferences;
 
 uint32_t ReserveAggregateBitrate(uint32_t requested_bps,
                                  uint32_t previous_reservation_bps) {
@@ -149,12 +157,51 @@ MfH264RuntimeDiagnostics GetMfH264RuntimeDiagnostics() {
   return g_diagnostics;
 }
 
+std::size_t GetMfH264ActiveEncoderCount() {
+  std::lock_guard lock(g_active_encoder_mutex);
+  return g_active_encoders.size();
+}
+
+std::optional<MfH264RuntimeDiagnostics>
+GetMfH264RuntimeDiagnosticsForSession(std::string_view session_id) {
+  std::lock_guard<std::mutex> active(g_active_encoder_mutex);
+  for (MfH264Encoder* encoder : g_active_encoders) {
+    if (encoder == nullptr || encoder->session_id() != session_id) continue;
+    const MfH264RuntimeDiagnostics diagnostics = encoder->GetRuntimeDiagnostics();
+    return diagnostics.initialized ? std::optional(diagnostics) : std::nullopt;
+  }
+  return std::nullopt;
+}
+
+MfH264QualityDecision EvaluateMfH264QualityDecision(
+    const std::optional<MfH264RuntimeDiagnostics>& own,
+    const imcodes::remote_desktop::common::QualitySelection& selection,
+    std::size_t active_encoder_count,
+    bool closed) noexcept {
+  MfH264QualityDecision decision;
+  if (!own) {
+    decision.accepted = !closed;
+    return decision;
+  }
+  decision.has_encoder_bitrate = true;
+  decision.encoder_bitrate_bps = own->bitrate_bps;
+  const bool exact = own->preset == selection.preset_id &&
+                     own->width ==
+                         static_cast<int>(selection.encoded_pixels.width) &&
+                     own->height ==
+                         static_cast<int>(selection.encoded_pixels.height) &&
+                     own->fps == static_cast<int>(selection.frame_rate) &&
+                     own->bitrate_bps == selection.bitrate_bps;
+  decision.accepted = exact || (active_encoder_count > 1 && !closed);
+  return decision;
+}
+
 void DisqualifyHardwareEncoderForProcess() {
   g_hardware_encoder_allowed = false;
 }
 
-MfH264Encoder::MfH264Encoder(bool prefer_hardware)
-    : prefer_hardware_(prefer_hardware) {}
+MfH264Encoder::MfH264Encoder(bool prefer_hardware, std::string session_id)
+    : prefer_hardware_(prefer_hardware), session_id_(std::move(session_id)) {}
 MfH264Encoder::~MfH264Encoder() {
   Release();
 }
@@ -164,13 +211,36 @@ void SetMfH264QualityPreference(const QualityPreference& preference) noexcept {
   // disabled. This boundary and the operations it invokes are non-throwing.
   g_quality_preference.store(preference);
   std::lock_guard<std::mutex> active(g_active_encoder_mutex);
-  if (g_active_encoder != nullptr) {
-    g_active_encoder->ApplyQualityPreference(preference);
+  // Preserve the historical single-viewer behaviour, but never fan one
+  // viewer's relay cap/preset into another viewer's encoder.  With multiple
+  // encoders, each one follows its own libwebrtc SetRates target below.
+  if (g_active_encoders.size() == 1) {
+    MfH264Encoder* encoder = *g_active_encoders.begin();
+    if (encoder != nullptr) encoder->ApplyQualityPreference(preference);
+  }
+}
+
+void SetMfH264QualityPreferenceForSession(
+    std::string_view session_id,
+    const QualityPreference& preference) noexcept {
+  if (session_id.empty()) {
+    SetMfH264QualityPreference(preference);
+    return;
+  }
+  std::lock_guard<std::mutex> active(g_active_encoder_mutex);
+  const std::string key(session_id);
+  g_pending_preferences[key] = preference;
+  for (MfH264Encoder* encoder : g_active_encoders) {
+    if (encoder == nullptr || encoder->session_id() != key) continue;
+    encoder->ApplyQualityPreference(preference);
+    g_pending_preferences.erase(key);
+    break;
   }
 }
 
 void MfH264Encoder::ApplyQualityPreference(const QualityPreference& preference) {
   std::lock_guard<std::mutex> lock(mutex_);
+  preference_ = preference;
   if (!initialized_) return;
   const QualitySelection next = SelectQuality(
       reserved_bitrate_bps_ > 0 ? reserved_bitrate_bps_ : bitrate_bps_,
@@ -178,6 +248,9 @@ void MfH264Encoder::ApplyQualityPreference(const QualityPreference& preference) 
   reconfigure_pending_ = reconfigure_pending_ || next.width != width_ ||
                          next.height != height_ || next.fps != fps_;
   quality_ = next;
+  width_ = next.width;
+  height_ = next.height;
+  fps_ = next.fps;
   bitrate_bps_ = next.bitrate_bps;
   VARIANT bitrate = UInt32Variant(bitrate_bps_);
   SetCodecValue(CODECAPI_AVEncCommonMeanBitRate, bitrate);
@@ -187,6 +260,19 @@ void MfH264Encoder::ApplyQualityPreference(const QualityPreference& preference) 
 
 int MfH264Encoder::InitEncode(const webrtc::VideoCodec* codec_settings,
                               const Settings& settings) {
+  // A quality ladder may publish its per-session preference before WebRTC
+  // asks the factory to initialize this encoder.  Consume that pending value
+  // before InitEncodeLocked selects the first rung; otherwise the encoder
+  // would briefly initialize at the worker default and only pick up the
+  // viewer's relay cap on a later SetRates callback.
+  if (!session_id_.empty()) {
+    std::lock_guard<std::mutex> active(g_active_encoder_mutex);
+    const auto pending = g_pending_preferences.find(session_id_);
+    if (pending != g_pending_preferences.end()) {
+      preference_ = pending->second;
+      g_pending_preferences.erase(pending);
+    }
+  }
   int result;
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -196,7 +282,7 @@ int MfH264Encoder::InitEncode(const webrtc::VideoCodec* codec_settings,
     // Registered outside mutex_ to keep the g_active_encoder_mutex -> mutex_
     // lock order; SetMfH264QualityPreference relies on it.
     std::lock_guard<std::mutex> active(g_active_encoder_mutex);
-    g_active_encoder = this;
+    g_active_encoders.insert(this);
   }
   return result;
 }
@@ -229,8 +315,10 @@ int MfH264Encoder::InitEncodeLocked(const webrtc::VideoCodec* codec_settings,
   reserved_bitrate_bps_ = ReserveAggregateBitrate(
       codec_settings->startBitrate * 1000u, 0);
   if (reserved_bitrate_bps_ == 0) return WEBRTC_VIDEO_CODEC_MEMORY;
+  const QualityPreference preference =
+      session_id_.empty() ? g_quality_preference.load() : preference_;
   quality_ = SelectQuality(reserved_bitrate_bps_, source_width_,
-                           source_height_, g_quality_preference.load());
+                           source_height_, preference);
   bitrate_bps_ = quality_.bitrate_bps;
   width_ = quality_.width;
   height_ = quality_.height;
@@ -276,7 +364,7 @@ int32_t MfH264Encoder::Release() {
     // Unregister before tearing down so a concurrent preference update can
     // never reach an encoder that is going away.
     std::lock_guard<std::mutex> active(g_active_encoder_mutex);
-    if (g_active_encoder == this) g_active_encoder = nullptr;
+    g_active_encoders.erase(this);
   }
   std::lock_guard<std::mutex> lock(mutex_);
   if (transform_) {
@@ -466,6 +554,11 @@ MfH264PerformanceDiagnostics MfH264Encoder::GetPerformanceDiagnostics() const {
   return performance_;
 }
 
+MfH264RuntimeDiagnostics MfH264Encoder::GetRuntimeDiagnostics() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return diagnostics_;
+}
+
 void MfH264Encoder::SetRates(const RateControlParameters& parameters) {
   std::lock_guard<std::mutex> lock(mutex_);
   const int64_t target_bps = parameters.bitrate.get_sum_bps();
@@ -476,9 +569,10 @@ void MfH264Encoder::SetRates(const RateControlParameters& parameters) {
       requested_bps, reserved_bitrate_bps_);
   if (granted_bps == 0) return;
   reserved_bitrate_bps_ = granted_bps;
+  const QualityPreference preference =
+      session_id_.empty() ? g_quality_preference.load() : preference_;
   const QualitySelection next =
-      SelectQuality(granted_bps, source_width_, source_height_,
-                    g_quality_preference.load());
+      SelectQuality(granted_bps, source_width_, source_height_, preference);
   // The viewer's cap (and a relayed route's ceiling) bound what is encoded,
   // not just which rung is picked.
   bitrate_bps_ = next.bitrate_bps;
@@ -1125,11 +1219,12 @@ void MfH264Encoder::RequestKeyFrame() {
 }
 
 void MfH264Encoder::PublishDiagnostics() const {
-  std::lock_guard lock(g_diagnostics_mutex);
-  g_diagnostics = {
+  diagnostics_ = {
       initialized_, hardware_, quality_.id, width_, height_, fps_,
       bitrate_bps_,
   };
+  std::lock_guard lock(g_diagnostics_mutex);
+  g_diagnostics = diagnostics_;
 }
 
 std::vector<webrtc::SdpVideoFormat>
@@ -1140,6 +1235,9 @@ MfH264EncoderFactory::GetSupportedFormats() const {
                 {"profile-level-id", "42e01f"}},
       {webrtc::ScalabilityMode::kL1T1})};
 }
+
+MfH264EncoderFactory::MfH264EncoderFactory(std::string session_id)
+    : session_id_(std::move(session_id)) {}
 
 webrtc::VideoEncoderFactory::CodecSupport
 MfH264EncoderFactory::QueryCodecSupport(
@@ -1158,7 +1256,7 @@ std::unique_ptr<webrtc::VideoEncoder> MfH264EncoderFactory::Create(
     const webrtc::SdpVideoFormat& format) {
   return IsH264(format)
              ? std::make_unique<MfH264Encoder>(
-                   HardwareEncoderAllowedByEnvironment())
+                   HardwareEncoderAllowedByEnvironment(), session_id_)
              : nullptr;
 }
 

@@ -25,6 +25,7 @@ const SOURCE_PATHS = [
   'native/windows-remote-desktop/worker_policy.cc',
   'native/windows-remote-desktop/unlock_secret.cc',
   'native/windows-remote-desktop/worker_policy.h',
+  'native/remote-desktop-common/transport_session_core.cc',
   'native/windows-remote-desktop/windows_platform_adapters.cc',
   'native/windows-virtual-display/virtual_display_driver.cc',
   'native/windows-virtual-display/imcodes-virtual-display.inf',
@@ -1761,12 +1762,162 @@ contracts.push({
   ],
 });
 
+contracts.push({
+  name: 'Windows encoder factory is deterministically session-bound',
+  guards: [
+    {
+      path: 'native/windows-remote-desktop/worker_main.cc',
+      needle: 'std::make_unique<MfH264EncoderFactory>(std::string(session_id))',
+    },
+    {
+      path: 'native/windows-remote-desktop/mf_h264_encoder.cc',
+      needle: 'std::make_unique<MfH264Encoder>(\n                   HardwareEncoderAllowedByEnvironment(), session_id_)',
+    },
+    {
+      path: 'native/windows-remote-desktop/mf_h264_encoder.cc',
+      needle: 'encoder->session_id() != session_id',
+    },
+  ],
+});
+
+mutations.push(
+  {
+    name: 'drop the per-session encoder factory identity',
+    contract: 'Windows encoder factory is deterministically session-bound',
+    path: 'native/windows-remote-desktop/worker_main.cc',
+    needle: 'std::make_unique<MfH264EncoderFactory>(std::string(session_id))',
+  },
+  {
+    name: 'restore preset-based encoder lookup',
+    contract: 'Windows encoder factory is deterministically session-bound',
+    path: 'native/windows-remote-desktop/mf_h264_encoder.cc',
+    needle: 'encoder->session_id() != session_id',
+  },
+);
+
+contracts.push({
+  // A Windows worker creates one encoder per PeerConnection.  Quality
+  // telemetry and preference updates therefore cannot use a single active
+  // pointer or a process-global selection as a peer liveness decision.
+  name: 'Windows multi-peer quality state cannot terminate a healthy peer',
+  guards: [
+    {
+      path: 'native/windows-remote-desktop/mf_h264_encoder.cc',
+      needle: 'std::set<MfH264Encoder*> g_active_encoders;',
+    },
+    {
+      path: 'native/windows-remote-desktop/mf_h264_encoder.cc',
+      needle: 'g_active_encoders.insert(this);',
+    },
+    {
+      path: 'native/windows-remote-desktop/mf_h264_encoder.cc',
+      needle: 'g_active_encoders.erase(this);',
+    },
+    {
+      path: 'native/windows-remote-desktop/peer_session.cc',
+      needle: 'EvaluateMfH264QualityDecision',
+    },
+    {
+      path: 'native/windows-remote-desktop/peer_session.cc',
+      needle: 'transport_core_.diagnostics();',
+    },
+    {
+      path: 'native/windows-remote-desktop/peer_session.cc',
+      needle: 'transport_diagnostics.quality.value_or',
+    },
+  ],
+});
+
+contracts.push({
+  // Capture ownership is reference counted, input release is scoped to one
+  // session, and liveness/relay policy live on each transport core. These
+  // shared paths must remain independent while encoder quality is repaired.
+  name: 'Windows shared capture and transport state stays per peer',
+  guards: [
+    {
+      path: 'native/windows-remote-desktop/worker_main.cc',
+      needle: '++found->second.references;',
+    },
+    {
+      path: 'native/windows-remote-desktop/worker_main.cc',
+      needle: 'if (found->second.references == 0)',
+    },
+    {
+      path: 'native/windows-remote-desktop/peer_session.cc',
+      needle: 'input_->ReleaseOwner(authority_.session_id)',
+    },
+    {
+      path: 'native/remote-desktop-common/transport_session_core.cc',
+      needle: 'last_activity_monotonic_ms_ = now.monotonic_ms;',
+    },
+    {
+      path: 'native/remote-desktop-common/transport_session_core.cc',
+      needle: 'authority_.relay_bitrate_cap_bps',
+      minimum: 2,
+    },
+  ],
+});
+
 mutations.push({
   name: 'opening the daemon pipe without overlapped I/O',
   contract: 'worker IPC writes never wait on the pending read',
   path: 'native/windows-remote-desktop/pipe_ipc.cc',
   needle: 'FILE_FLAG_OVERLAPPED',
 });
+
+mutations.push(
+  {
+    name: 'restore the single active Windows encoder pointer',
+    contract: 'Windows multi-peer quality state cannot terminate a healthy peer',
+    path: 'native/windows-remote-desktop/mf_h264_encoder.cc',
+    needle: 'std::set<MfH264Encoder*> g_active_encoders;',
+  },
+  {
+    name: 'restore global diagnostics as the peer quality authority',
+    contract: 'Windows multi-peer quality state cannot terminate a healthy peer',
+    path: 'native/windows-remote-desktop/peer_session.cc',
+    needle: 'EvaluateMfH264QualityDecision',
+  },
+  {
+    name: 'restore cross-peer quality reporting',
+    contract: 'Windows multi-peer quality state cannot terminate a healthy peer',
+    path: 'native/windows-remote-desktop/peer_session.cc',
+    needle: 'transport_diagnostics.quality.value_or',
+  },
+);
+
+mutations.push(
+  {
+    name: 'drop capture reference accounting',
+    contract: 'Windows shared capture and transport state stays per peer',
+    path: 'native/windows-remote-desktop/worker_main.cc',
+    needle: '++found->second.references;',
+  },
+  {
+    name: 'tear down a shared capture source while another peer owns it',
+    contract: 'Windows shared capture and transport state stays per peer',
+    path: 'native/windows-remote-desktop/worker_main.cc',
+    needle: 'if (found->second.references == 0)',
+  },
+  {
+    name: 'release input owned by a different peer',
+    contract: 'Windows shared capture and transport state stays per peer',
+    path: 'native/windows-remote-desktop/peer_session.cc',
+    needle: 'input_->ReleaseOwner(authority_.session_id)',
+  },
+  {
+    name: 'collapse heartbeat activity to a worker-global timestamp',
+    contract: 'Windows shared capture and transport state stays per peer',
+    path: 'native/remote-desktop-common/transport_session_core.cc',
+    needle: 'last_activity_monotonic_ms_ = now.monotonic_ms;',
+  },
+  {
+    name: 'drop per-peer relay ceiling enforcement',
+    contract: 'Windows shared capture and transport state stays per peer',
+    path: 'native/remote-desktop-common/transport_session_core.cc',
+    needle: 'authority_.relay_bitrate_cap_bps',
+  },
+);
 
 function contractHolds(contract: Contract, sources: Sources): boolean {
   return contract.guards.every((guard) => (

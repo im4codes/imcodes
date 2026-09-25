@@ -9,11 +9,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -467,13 +469,15 @@ int RunConsentOnlyWorker(PipeChannel* pipe_channel, PipeWriter* writer) {
 
 class WorkerRuntime {
  public:
+  using SessionFactory = std::function<
+      webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface>(
+          std::string_view)>;
   WorkerRuntime(webrtc::Thread* signaling_thread,
-                webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface>
-                    factory,
+                SessionFactory session_factory,
                 PipeWriter* writer,
                 LocalIndicator* indicator)
       : signaling_thread_(signaling_thread),
-        factory_(std::move(factory)),
+        session_factory_(std::move(session_factory)),
         writer_(writer),
         indicator_(indicator),
         presentation_adapter_(
@@ -895,8 +899,18 @@ class WorkerRuntime {
                                        "protected_desktop"));
         return true;
       }
+      auto session_factory = session_factory_;
+      if (!session_factory) {
+        writer_->Emit(TerminalEnvelope(signal.authority, "media_unavailable"));
+        return true;
+      }
+      auto factory = session_factory(signal.authority.session_id);
+      if (!factory) {
+        writer_->Emit(TerminalEnvelope(signal.authority, "media_unavailable"));
+        return true;
+      }
       auto session = PeerSession::Create(
-          signal.authority, factory_, std::move(displays),
+          signal.authority, std::move(factory), std::move(displays),
           [this](const common::DisplayTopology& display) {
             return AcquireSource(display);
           },
@@ -1246,7 +1260,7 @@ class WorkerRuntime {
   }
 
   webrtc::Thread* const signaling_thread_;
-  const webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory_;
+  const SessionFactory session_factory_;
   PipeWriter* const writer_;
   LocalIndicator* const indicator_;
   WindowsDisclosureSessionAdapter presentation_adapter_;
@@ -1645,68 +1659,58 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     return 8;
   }
 
-  webrtc::PeerConnectionFactoryDependencies dependencies;
-  dependencies.network_thread = network_thread.get();
-  dependencies.worker_thread = worker_thread.get();
-  dependencies.signaling_thread = signaling_thread.get();
-  dependencies.env = webrtc::CreateEnvironment();
-  // Remote desktop is video only. Without an explicit module the media engine
-  // builds the platform Core Audio device, which opens the microphone stack
-  // this product never uses and destructs through a dangling COM interface
-  // once the audio endpoints are unavailable, taking the worker down with an
-  // access violation at the sign-in desktop and across a logon transition.
-  dependencies.adm = webrtc::make_ref_counted<SilentAudioDeviceModule>();
-  if (!dependencies.adm) {
-    pipe_channel.Close();
-    webrtc::CleanupSSL();
-    MFShutdown();
-    CoUninitialize();
-    return 19;
-  }
-  dependencies.audio_encoder_factory =
-      webrtc::CreateBuiltinAudioEncoderFactory();
-  dependencies.audio_decoder_factory =
-      webrtc::CreateBuiltinAudioDecoderFactory();
-  WindowsWebRtcEncoderFactoryAdapter encoder_adapter(
-      std::make_unique<MfH264EncoderFactory>());
-  if (encoder_adapter.ProbeReadiness() != common::ReadinessState::kReady) {
+  // Probe the encoder once during startup, then construct one media factory
+  // per session.  libwebrtc invokes VideoEncoderFactory::Create from its
+  // worker/encoder thread, outside any signaling-thread scope; a factory
+  // carrying the immutable session id is therefore the only deterministic
+  // session-to-encoder binding under concurrent reconnects.
+  WindowsWebRtcEncoderFactoryAdapter probe_adapter(
+      std::make_unique<MfH264EncoderFactory>("probe"));
+  if (probe_adapter.ProbeReadiness() != common::ReadinessState::kReady) {
     pipe_channel.Close();
     webrtc::CleanupSSL();
     MFShutdown();
     CoUninitialize();
     return 20;
   }
-  dependencies.video_encoder_factory = encoder_adapter.TakeFactory();
-  if (!dependencies.video_encoder_factory) {
-    pipe_channel.Close();
-    webrtc::CleanupSSL();
-    MFShutdown();
-    CoUninitialize();
-    return 20;
-  }
-  dependencies.video_decoder_factory =
-      webrtc::CreateBuiltinVideoDecoderFactory();
-  webrtc::EnableMedia(dependencies);
-  auto factory =
-      webrtc::CreateModularPeerConnectionFactory(std::move(dependencies));
-  if (!factory) {
-    pipe_channel.Close();
-    webrtc::CleanupSSL();
-    MFShutdown();
-    CoUninitialize();
-    return 9;
-  }
+  auto session_factory =
+      [network_thread = network_thread.get(), worker_thread = worker_thread.get(),
+       signaling_thread = signaling_thread.get()](std::string_view session_id)
+      -> webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> {
+    webrtc::PeerConnectionFactoryDependencies dependencies;
+    dependencies.network_thread = network_thread;
+    dependencies.worker_thread = worker_thread;
+    dependencies.signaling_thread = signaling_thread;
+    dependencies.env = webrtc::CreateEnvironment();
+    dependencies.adm = webrtc::make_ref_counted<SilentAudioDeviceModule>();
+    if (!dependencies.adm) return nullptr;
+    dependencies.audio_encoder_factory =
+        webrtc::CreateBuiltinAudioEncoderFactory();
+    dependencies.audio_decoder_factory =
+        webrtc::CreateBuiltinAudioDecoderFactory();
+    WindowsWebRtcEncoderFactoryAdapter encoder_adapter(
+        std::make_unique<MfH264EncoderFactory>(std::string(session_id)));
+    if (encoder_adapter.ProbeReadiness() != common::ReadinessState::kReady)
+      return nullptr;
+    dependencies.video_encoder_factory = encoder_adapter.TakeFactory();
+    if (!dependencies.video_encoder_factory) return nullptr;
+    dependencies.video_decoder_factory =
+        webrtc::CreateBuiltinVideoDecoderFactory();
+    webrtc::EnableMedia(dependencies);
+    return webrtc::CreateModularPeerConnectionFactory(
+        std::move(dependencies));
+  };
 
   LocalIndicator indicator;
   // `--secure-console` is still accepted and echoed back for older services,
   // but it no longer selects behaviour: this worker follows whichever desktop
   // Windows is showing.
-  WorkerRuntime runtime(signaling_thread.get(), factory, &writer, &indicator);
+  WorkerRuntime runtime(signaling_thread.get(), std::move(session_factory),
+                        &writer, &indicator);
   ConsentDispatcher consent(&writer);
   PrivacyDispatcher privacy(&writer, &runtime);
   if (!runtime.StartPlatformAdapters()) {
     runtime.Shutdown();
-    factory = nullptr;
     pipe_channel.Close();
     webrtc::CleanupSSL();
     MFShutdown();
@@ -1793,7 +1797,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   maintenance.join();
   runtime.Shutdown();
   runtime.StopPlatformAdapters();
-  factory = nullptr;
   signaling_thread->Stop();
   worker_thread->Stop();
   network_thread->Stop();

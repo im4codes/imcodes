@@ -254,9 +254,7 @@ void PeerDataObserver::OnMessage(const webrtc::DataBuffer& buffer) {
 
 common::QualitySelection PeerSession::WindowsQualityLadder::Select(
     const common::QualityTarget& target) const noexcept {
-  // The encoder selects independently on every rate update and ApplyQuality
-  // checks the two agree, so it must see the exact preference used here.
-  SetMfH264QualityPreference(target.preference);
+  SetMfH264QualityPreferenceForSession(session_id_, target.preference);
   const QualitySelection selected = SelectQuality(
       target.bitrate_bps, static_cast<int>(target.source_pixels.width),
       static_cast<int>(target.source_pixels.height), target.preference);
@@ -308,6 +306,7 @@ PeerSession::PeerSession(
       request_unlock_(std::move(request_unlock)),
       signaling_thread_(signaling_thread),
       emit_(std::move(emit)),
+      transport_quality_ladder_(authority_.session_id),
       transport_core_(*this, transport_quality_ladder_) {
   capture_adapter_ = std::make_unique<WindowsDxgiCaptureTrackAdapter>(
       std::move(acquire_source), std::move(release_source));
@@ -769,12 +768,18 @@ bool PeerSession::EmitLocalIceCandidate(
 }
 
 bool PeerSession::ApplyQuality(const common::QualitySelection& selection) {
-  const MfH264RuntimeDiagnostics actual = GetMfH264RuntimeDiagnostics();
-  return actual.preset == selection.preset_id &&
-         actual.width == static_cast<int>(selection.encoded_pixels.width) &&
-         actual.height == static_cast<int>(selection.encoded_pixels.height) &&
-         actual.fps == static_cast<int>(selection.frame_rate) &&
-         actual.bitrate_bps == selection.bitrate_bps;
+  // Quality selection is a per-transport decision.  The Media Foundation
+  // encoder is asynchronous and its legacy diagnostics are process-wide, so
+  // comparing them here made the second viewer race the first viewer's
+  // encoder and terminate itself with kAdapterFailure.  TransportSessionCore
+  // has already validated the selection against this viewer's policy; the
+  // encoder applies it best-effort through SetRates and reports its own
+  // progress asynchronously.  A transient diagnostics mismatch must never
+  // tear down an otherwise healthy peer.
+  return EvaluateMfH264QualityDecision(
+             GetMfH264RuntimeDiagnosticsForSession(authority_.session_id),
+             selection, GetMfH264ActiveEncoderCount(), closed_)
+      .accepted;
 }
 
 void PeerSession::ReleaseControlAuthority(
@@ -1605,28 +1610,48 @@ void PeerSession::SendTopology() {
 }
 
 void PeerSession::SendQuality() {
-  const MfH264RuntimeDiagnostics diagnostics =
-      GetMfH264RuntimeDiagnostics();
-  if (diagnostics.initialized && source_) {
-    transport_core_.UpdateQualityTarget(
-        CallbackStamp(),
-        common::QualityTarget{
-            diagnostics.bitrate_bps,
-            source_->encoded_pixels(),
-        });
+  const common::TransportDiagnostics before = transport_core_.diagnostics();
+  const auto peer_actual =
+      GetMfH264RuntimeDiagnosticsForSession(authority_.session_id);
+  if (source_ && transport_core_.started() && !transport_core_.terminal()) {
+    // The encoder is created lazily. Do not publish another viewer's rate or
+    // pin the target to a default while this session is still unbound.
+    if (peer_actual && peer_actual->initialized) {
+      transport_core_.UpdateQualityTarget(
+          CallbackStamp(),
+          common::QualityTarget{peer_actual->bitrate_bps,
+                                source_->encoded_pixels()});
+    }
     if (closed_) return;
   }
+  const common::TransportDiagnostics transport_diagnostics =
+      transport_core_.diagnostics();
+  const common::QualitySelection selected =
+      peer_actual && peer_actual->initialized
+          ? common::QualitySelection{peer_actual->preset,
+                                     {static_cast<std::uint32_t>(peer_actual->width),
+                                      static_cast<std::uint32_t>(peer_actual->height)},
+                                     static_cast<std::uint32_t>(peer_actual->fps),
+                                     peer_actual->bitrate_bps}
+          : transport_diagnostics.quality.value_or(
+                common::QualitySelection{
+                    "1080p30", {1920, 1080}, 30, kInitialVideoBitrateBps});
   Json::Value root(Json::objectValue);
   root["type"] = kQualityType;
   root["protocolVersion"] = kProtocolVersion;
   root["sessionId"] = authority_.session_id;
   root["sequence"] = Json::UInt64(outbound_sequence_++);
-  root["preset"] = diagnostics.preset;
-  root["encoderClass"] = diagnostics.hardware ? "hardware" : "software";
-  root["width"] = diagnostics.width;
-  root["height"] = diagnostics.height;
-  root["fps"] = diagnostics.fps;
-  root["bitrateBps"] = diagnostics.bitrate_bps;
+  root["preset"] = selected.preset_id;
+  // Hardware/software class is process-wide capability telemetry, not the
+  // peer's quality selection. Keep the protocol field while deriving all
+  // dimensions/bitrate from this transport's own selection above.
+  root["encoderClass"] = GetMfH264RuntimeDiagnostics().hardware
+                              ? "hardware"
+                              : "software";
+  root["width"] = selected.encoded_pixels.width;
+  root["height"] = selected.encoded_pixels.height;
+  root["fps"] = selected.frame_rate;
+  root["bitrateBps"] = selected.bitrate_bps;
   root["droppedFrames"] = Json::UInt64(source_ ? source_->dropped_frames() : 0);
   root["rttMs"] = 0;
   SendControl(root);

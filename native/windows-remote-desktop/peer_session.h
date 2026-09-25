@@ -10,6 +10,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "api/data_channel_interface.h"
@@ -255,8 +256,12 @@ class PeerSession final : public webrtc::PeerConnectionObserver,
   uint32_t applied_bitrate_ceiling_bps_ = 0;
   class WindowsQualityLadder final : public common::QualityLadder {
    public:
+    explicit WindowsQualityLadder(std::string session_id)
+        : session_id_(std::move(session_id)) {}
     common::QualitySelection Select(
         const common::QualityTarget& target) const noexcept override;
+   private:
+    std::string session_id_;
   } transport_quality_ladder_;
   common::TransportSessionCore transport_core_;
   std::optional<common::TransportDiagnostics> transport_diagnostics_;
