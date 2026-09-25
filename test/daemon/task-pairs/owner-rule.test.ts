@@ -1,0 +1,173 @@
+/**
+ * Owner rule (design D-pool-sync, 2026-09-25): when the user or Brain
+ * explicitly names the model or session for a task pair's executor or
+ * auditor, the pairs engine must not apply the project's audit allowlist.
+ * The allowlist governs only an automatic pick, when neither is named.
+ */
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import type { SessionRecord } from '../../../src/store/session-store.js';
+import { upsertSession } from '../../../src/store/session-store.js';
+import { TaskPairStore, getTaskPairStore, setTaskPairStoreForTests } from '../../../src/daemon/task-pairs/store.js';
+import { setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
+import { taskPairService } from '../../../src/daemon/task-pairs/service.js';
+import { TaskPairAutomation } from '../../../src/daemon/task-pairs/scheduler.js';
+import { allowlistedProvisionConfig, listTaskPairCandidates } from '../../../src/daemon/task-pairs/pool.js';
+import { TASK_PAIR_DEFAULT_ALLOWLIST } from '../../../shared/task-pair.js';
+import { normalizeSessionSupervisionSnapshot, SUPERVISION_MODE } from '../../../shared/supervision-config.js';
+
+const PROJECT = 'ownerproj';
+const BRAIN = 'deck_ownerproj_brain';
+
+function session(name: string, role: SessionRecord['role'], extra: Partial<SessionRecord> = {}): SessionRecord {
+  return {
+    name, projectName: PROJECT, role, agentType: 'claude-code-sdk', projectDir: `/tmp/${PROJECT}`, state: 'idle',
+    sessionInstanceId: `instance_${name}`, runtimeEpoch: `epoch_${name}`,
+    restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1, ...extra,
+  } as SessionRecord;
+}
+
+describe('owner rule: pool-level allowlist bypass by requested model', () => {
+  it('lists a non-allowlisted session as an auditor candidate once its exact model is requested', () => {
+    const records = [
+      session(BRAIN, 'brain'),
+      // Opus is the only auditor the default allowlist admits; Sonnet is not.
+      session('deck_sub_sonnet', 'w1', { parentSession: BRAIN, activeModel: 'claude-sonnet-5', updatedAt: 1 }),
+    ];
+    const deps = { listSessions: () => records, hasPendingMessages: () => false };
+    // Unchanged baseline: the allowlist alone still governs an automatic pick.
+    expect(listTaskPairCandidates({
+      brain: BRAIN, role: 'auditor', pool: 'primary', allowlist: TASK_PAIR_DEFAULT_ALLOWLIST, exclude: new Set(),
+    }, deps)).toEqual([]);
+    // Owner rule: an explicit requested model bypasses the allowlist entirely.
+    const picked = listTaskPairCandidates({
+      brain: BRAIN, role: 'auditor', pool: 'primary', allowlist: TASK_PAIR_DEFAULT_ALLOWLIST, exclude: new Set(),
+      requestedModel: 'claude-sonnet-5',
+    }, deps);
+    expect(picked.map((entry) => entry.name)).toEqual(['deck_sub_sonnet']);
+    // Exact-id matching is case-insensitive: a Brain typo in casing should
+    // not miss a session that is otherwise an exact match.
+    const pickedCaseInsensitive = listTaskPairCandidates({
+      brain: BRAIN, role: 'auditor', pool: 'primary', allowlist: TASK_PAIR_DEFAULT_ALLOWLIST, exclude: new Set(),
+      requestedModel: 'Claude-Sonnet-5',
+    }, deps);
+    expect(pickedCaseInsensitive.map((entry) => entry.name)).toEqual(['deck_sub_sonnet']);
+  });
+
+  it('provisions a pool config outside the allowlist once its exact model is requested', () => {
+    const sonnetPools = {
+      state: 'configured' as const,
+      economyTaskPool: { configs: [], controls: { leaseMs: 900000, maxSpawned: 2, changeBudget: 40, maxConcurrency: 4, auditHeadroomPerProviderFamily: 1 } },
+      primaryDevelopmentPool: {
+        // Sonnet-only pool: nothing here satisfies the default auditor allowlist (Opus).
+        configs: [{ model: 'sonnet', agentType: 'claude-code-sdk', runtimeType: 'transport' as const, capabilityId: 'supervision-exec-v1:transport:claude-code-sdk:anthropic:sonnet', providerFamily: 'anthropic' }],
+        controls: { leaseMs: 1800000, maxSpawned: 2, changeBudget: 200, maxConcurrency: 4, auditHeadroomPerProviderFamily: 1 },
+      },
+    };
+    const parent = session(BRAIN, 'brain', {
+      transportConfig: { supervision: normalizeSessionSupervisionSnapshot({ mode: SUPERVISION_MODE.OFF, executionPools: sonnetPools }) },
+    } as Partial<SessionRecord>);
+    const deps = { getSession: (name: string) => (name === BRAIN ? parent : undefined) };
+    // Unchanged baseline: no allowlisted config exists in this pool for auditor.
+    expect(allowlistedProvisionConfig({
+      brain: BRAIN, role: 'auditor', pool: 'primary', allowlist: TASK_PAIR_DEFAULT_ALLOWLIST,
+    }, deps)).toBeUndefined();
+    // Owner rule: the requested model matches the pool's own config directly.
+    const config = allowlistedProvisionConfig({
+      brain: BRAIN, role: 'auditor', pool: 'primary', allowlist: TASK_PAIR_DEFAULT_ALLOWLIST, requestedModel: 'sonnet',
+    }, deps);
+    expect(config).toMatchObject({ model: 'sonnet' });
+  });
+});
+
+describe('owner rule: scheduler wires an explicit executormodel=/auditormodel= through to the pick, ignoring the allowlist', () => {
+  const EXEC = 'deck_sub_ownerexec';
+  const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
+  let now = 1_000_000;
+  let sent: Array<{ target: string; text: string }>;
+  let automation: TaskPairAutomation;
+
+  beforeEach(() => {
+    process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    setTaskPairStoreForTests(new TaskPairStore(':memory:'));
+    sent = [];
+    setTaskPairDeliveryDepsForTests({ send: async (target, text) => { sent.push({ target, text }); } });
+    for (const record of [session(BRAIN, 'brain'), session(EXEC, 'w1')]) upsertSession(record);
+  });
+  afterEach(() => {
+    setTaskPairStoreForTests(undefined);
+    if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
+    else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
+  });
+
+  it('picks the auditor purely by the requested model, never consulting the allowlist mock', () => {
+    let seenRequestedModel: string | undefined;
+    automation = new TaskPairAutomation({
+      now: () => now,
+      pickCandidate: ({ role, requestedModel }) => {
+        if (role !== 'auditor') return undefined;
+        seenRequestedModel = requestedModel;
+        // Would never match TASK_PAIR_DEFAULT_ALLOWLIST (auditor=Opus); the
+        // scheduler must still hand it a session because the model was named.
+        return requestedModel === 'claude-sonnet-5' ? 'deck_sub_ownersonnet' : undefined;
+      },
+      provision: async () => undefined,
+      poolOf: () => 'primary',
+      importLegacy: () => undefined,
+    });
+    taskPairService.setScheduler(automation);
+
+    taskPairService.ingestText(
+      PROJECT, BRAIN,
+      `<!-- IMCODES_TASK DISPATCH T60 executor=${EXEC} auditormodel=claude-sonnet-5 -->`,
+      'owner-rule-turn-1', now,
+    );
+
+    expect(seenRequestedModel).toBe('claude-sonnet-5');
+    const pair = getTaskPairStore().getPair(PROJECT, 'T60')!.state;
+    expect(pair.auditor).toBe('deck_sub_ownersonnet');
+    expect(pair.auditorModel).toBe('claude-sonnet-5');
+  });
+
+  it('names the exact requested model, not the generic allowlist gap, when nothing can serve it', async () => {
+    automation = new TaskPairAutomation({
+      now: () => now,
+      pickCandidate: () => undefined,
+      provision: async () => undefined,
+      poolOf: () => 'primary',
+      importLegacy: () => undefined,
+    });
+    taskPairService.setScheduler(automation);
+
+    taskPairService.ingestText(
+      PROJECT, BRAIN,
+      `<!-- IMCODES_TASK DISPATCH T61 executor=${EXEC} auditormodel=nonexistent-fictional-model -->`,
+      'owner-rule-turn-2', now,
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const pair = getTaskPairStore().getPair(PROJECT, 'T61')!.state;
+    expect(pair.flags).toContain('needs_auditor');
+    const notice = sent.find((entry) => entry.target === BRAIN);
+    expect(notice?.text).toContain('no session/config for requested model nonexistent-fictional-model');
+  });
+
+  it('keeps a send_message-bound requestedExecutionType.model on the pair as executorModel, surviving the attrs bridge to the marker parser', () => {
+    automation = new TaskPairAutomation({
+      now: () => now,
+      pickCandidate: () => undefined,
+      provision: async () => undefined,
+      poolOf: () => 'primary',
+      importLegacy: () => undefined,
+    });
+    taskPairService.setScheduler(automation);
+
+    taskPairService.implicitDispatch({
+      project: PROJECT, sender: BRAIN, target: EXEC, taskId: 'T62', eventId: 'owner-rule-implicit-1',
+      executorModel: 'gpt-6-luna',
+    });
+
+    const pair = getTaskPairStore().getPair(PROJECT, 'T62')!.state;
+    expect(pair.executor).toBe(EXEC);
+    expect(pair.executorModel).toBe('gpt-6-luna');
+  });
+});

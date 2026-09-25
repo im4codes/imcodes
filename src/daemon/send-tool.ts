@@ -1310,6 +1310,11 @@ function bindAcceptedDispatchToTaskPair(
   result: Extract<SendMessageResult, { status: 'accepted' }>,
   taskId: string,
   objective: string | undefined,
+  // Owner rule (design D-pool-sync): a Brain-named model on the initial
+  // send_message dispatch (task.requestedExecutionType.model) is kept on the
+  // pair so a later automatic executor replacement still honors it instead of
+  // falling back to the project's audit allowlist.
+  executorModel?: string,
 ): SendMessageResult {
   const reached = result.deliveries.filter((delivery) => isReachedDelivery(delivery.status));
   const title = deriveSupervisionTaskTitle(objective);
@@ -1320,6 +1325,7 @@ function bindAcceptedDispatchToTaskPair(
       target: delivery.target,
       taskId,
       ...(title ? { title } : {}),
+      ...(executorModel ? { executorModel } : {}),
       eventId: `implicit:${delivery.messageId ?? result.dispatchId}`,
     });
   }
@@ -1381,7 +1387,7 @@ export async function dispatchSendMessage(
       ? mintDispatchTaskPairId(caller, callerProjectName, input)
       : undefined);
     if (!taskId) return result;
-    return bindAcceptedDispatchToTaskPair(caller, callerProjectName, result, taskId, objective);
+    return bindAcceptedDispatchToTaskPair(caller, callerProjectName, result, taskId, objective, input.task?.requestedExecutionType?.model);
   }
   // A Brain that dispatches work with a plain send_message (no task metadata,
   // no DISPATCH marker) on a `pairs` project with automatic audit still gets a

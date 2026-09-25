@@ -104,6 +104,13 @@ let lastFetchedAt = 0;
 let refreshTimer: ReturnType<typeof setInterval> | null = null;
 const SUPERVISOR_DEFAULTS_REFRESH_INTERVAL_MS = 5_000;
 
+/**
+ * True from the first failed/non-ok fetch until the next successful one.
+ * Only the streak's first failure logs at warn -- every 5s retry after that
+ * logs at debug, so a prolonged outage does not spam the log.
+ */
+let fetchFailing = false;
+
 /** Exported for tests and for the WS-reconnect hook. */
 export async function refreshSupervisorDefaultsCache(): Promise<void> {
   const creds = await loadCredentials();
@@ -120,7 +127,9 @@ export async function refreshSupervisorDefaultsCache(): Promise<void> {
       },
     );
     if (!response.ok) {
-      logger.debug({ status: response.status }, 'supervisor-defaults-cache: fetch non-ok — keeping previous value');
+      const log = fetchFailing ? logger.debug.bind(logger) : logger.warn.bind(logger);
+      log({ status: response.status }, 'supervisor-defaults-cache: fetch non-ok — keeping previous value');
+      fetchFailing = true;
       return;
     }
     const body = await response.json() as { defaults?: Partial<SupervisorDefaultConfig> | null };
@@ -139,8 +148,11 @@ export async function refreshSupervisorDefaultsCache(): Promise<void> {
     }
     cachedSupervisorDefaults = next;
     lastFetchedAt = Date.now();
+    fetchFailing = false;
   } catch (err) {
-    logger.debug({ err }, 'supervisor-defaults-cache: fetch failed — keeping previous value');
+    const log = fetchFailing ? logger.debug.bind(logger) : logger.warn.bind(logger);
+    log({ err }, 'supervisor-defaults-cache: fetch failed — keeping previous value');
+    fetchFailing = true;
   }
 }
 
@@ -192,11 +204,34 @@ export function overlayCachedExecutionPools<T extends Pick<SessionSupervisionSna
   return { ...snapshot, executionPools: cached.executionPools };
 }
 
+/**
+ * Human-readable reason the pool decision fell through to a session's local
+ * mirror instead of the account-level cache, or undefined when the cache
+ * itself is genuinely 'configured' (nothing fell back). A caller that already
+ * knows it is reporting on a pool decision -- an allowlist gap, a pick miss --
+ * should surface this alongside that report: the mirror can look "configured"
+ * while badly stale, and that is otherwise invisible to the session owner.
+ */
+export function describeSupervisorDefaultsSyncGap(): string | undefined {
+  if (cachedSupervisorDefaults?.executionPools.state === 'configured') return undefined;
+  // A fetch has actually succeeded and confirmed the account has no pool at
+  // all -- that is a real, current answer, not a sync problem. Only claim a
+  // sync gap when there either has never been a successful fetch, or the
+  // most recent attempt failed and the last known-good answer is now stale.
+  if (cachedSupervisorDefaults && !fetchFailing) {
+    return "no account-level pool configured; using this session's local copy";
+  }
+  const ageMs = getSupervisorDefaultsCacheAgeMs();
+  const age = ageMs === Infinity ? 'never' : `${Math.round(ageMs / 1000)}s ago`;
+  return `account pool not synced from server (last successful fetch: ${age}); using this session's local copy`;
+}
+
 /** Test-only hook. Resets cache state (memory and disk) between tests. */
 export function __resetSupervisorDefaultsCacheForTests(): void {
   stopSupervisorDefaultsCacheRefresh();
   cachedSupervisorDefaults = null;
   lastFetchedAt = 0;
+  fetchFailing = false;
   try {
     db?.prepare('DELETE FROM supervisor_defaults_cache').run();
   } catch {

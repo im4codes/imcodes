@@ -29,6 +29,7 @@ import { getSession, listSessions } from '../store/session-store.js';
 import { resolvePeerAuditProviderFamily } from './peer-audit-candidates.js';
 import { delegationTargetInputs } from './delegation-admission.js';
 import { startSubSession, stopSubSession, type SubSessionRecord } from './subsession-manager.js';
+import { overlayCachedExecutionPools } from './supervisor-defaults-cache.js';
 import logger from '../util/logger.js';
 import {
   SESSION_IDENTITY_SCOPES,
@@ -104,9 +105,25 @@ export function clearSupervisionAutoProvisionStateForTests(): void {
 }
 
 export function configuredPools(parent: SessionRecord) {
+  // Execution pools are account-level policy. The session snapshot remains a
+  // compatibility mirror, but the daemon's supervisor-defaults cache is the
+  // authoritative source after Settings saves (and survives daemon restart).
+  // Task-pair selection and auto-provisioning must use the same overlay as
+  // send_message; otherwise the UI can show a checked pool while the pair
+  // engine still reads an old sessions.json mirror.
+  //
+  // Read the raw field directly rather than through the strict snapshot
+  // parser/extractor: a session's transportConfig can carry a perfectly
+  // usable executionPools value while failing snapshot validation for an
+  // unrelated reason (e.g. no `mode` set at all on an older/partial mirror).
+  // Routing through the strict extractor here would silently discard a real
+  // pool whenever that happens.
   const raw = parent.transportConfig?.[SUPERVISION_TRANSPORT_CONFIG_KEY];
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
-  const executionPools = (raw as Record<string, unknown>).executionPools;
+  const rawExecutionPools = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? (raw as Record<string, unknown>).executionPools
+    : undefined;
+  const local = normalizeSupervisionExecutionPools(rawExecutionPools);
+  const executionPools = overlayCachedExecutionPools({ executionPools: local }).executionPools;
   const normalized = normalizeSupervisionExecutionPools(executionPools);
   return normalized.state === 'configured' ? normalized : undefined;
 }

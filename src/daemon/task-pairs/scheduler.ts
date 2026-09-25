@@ -37,6 +37,8 @@ import { taskPairService, type TaskPairScheduler } from './service.js';
 import {
   allowlistedProvisionConfig,
   describeAuditorAllowlistGap,
+  describePoolSyncGap,
+  describeRequestedModelMiss,
   isSessionBusy,
   isSessionProviderLimited,
   listTaskPairCandidates,
@@ -60,8 +62,8 @@ export interface TaskPairSchedulerDeps {
   now?: () => number;
   isBusy?: (sessionName: string) => boolean;
   isLimited?: (sessionName: string) => boolean;
-  pickCandidate?: (input: { brain: string; role: TaskPairPickRole; pool: 'primary' | 'economy'; exclude: ReadonlySet<string>; project: string }) => string | undefined;
-  provision?: (input: { brain: string; role: TaskPairPickRole; pool: 'primary' | 'economy'; project: string; taskId: string }) => Promise<string | undefined>;
+  pickCandidate?: (input: { brain: string; role: TaskPairPickRole; pool: 'primary' | 'economy'; exclude: ReadonlySet<string>; project: string; requestedModel?: string }) => string | undefined;
+  provision?: (input: { brain: string; role: TaskPairPickRole; pool: 'primary' | 'economy'; project: string; taskId: string; requestedModel?: string }) => Promise<string | undefined>;
   /** Import not-yet-imported in-flight legacy tasks of `pairs` projects (idempotent). */
   importLegacy?: (now: number) => void | Promise<void>;
   poolOf?: (brain: string, sessionName: string) => 'primary' | 'economy' | undefined;
@@ -126,13 +128,13 @@ export class TaskPairAutomation implements TaskPairScheduler {
   }
   #poolOf(brain: string, session: string) { return (this.#deps.poolOf ?? ((b, s) => poolOfSession(b, s)))(brain, session); }
 
-  #pick(input: { brain: string; role: TaskPairPickRole; pool: 'primary' | 'economy'; exclude: ReadonlySet<string>; project: string }): string | undefined {
+  #pick(input: { brain: string; role: TaskPairPickRole; pool: 'primary' | 'economy'; exclude: ReadonlySet<string>; project: string; requestedModel?: string }): string | undefined {
     if (this.#deps.pickCandidate) return this.#deps.pickCandidate(input);
     const allowlist = resolveTaskPairAllowlist(input.project);
     return listTaskPairCandidates({ ...input, allowlist })[0]?.name;
   }
 
-  async #provision(input: { brain: string; role: TaskPairPickRole; pool: 'primary' | 'economy'; project: string; taskId: string }): Promise<string | undefined> {
+  async #provision(input: { brain: string; role: TaskPairPickRole; pool: 'primary' | 'economy'; project: string; taskId: string; requestedModel?: string }): Promise<string | undefined> {
     if (this.#deps.provision) return this.#deps.provision(input);
     const allowlist = resolveTaskPairAllowlist(input.project);
     const config = allowlistedProvisionConfig({ ...input, allowlist });
@@ -326,14 +328,20 @@ export class TaskPairAutomation implements TaskPairScheduler {
       return false;
     }
     const exclude = new Set<string>([pair.brain, ...(pair.executor ? [pair.executor] : []), ...(pair.auditor ? [pair.auditor] : []), ...pair.previousAuditors]);
-    const pickInput = { brain: pair.brain, role: 'auditor' as const, pool: 'primary' as const, exclude, project };
+    const requestedModel = pair.auditorModel;
+    const pickInput = { brain: pair.brain, role: 'auditor' as const, pool: 'primary' as const, exclude, project, requestedModel };
     const next = this.#pick(pickInput) ?? await this.#provision({ ...pickInput, taskId });
     if (!next || exclude.has(next)) {
       const key = `needs_auditor:${pair.round}`;
       if (stored.liveness.notified.includes(key)) return false;
       const state = pair.flags.includes('needs_auditor') ? pair : { ...pair, flags: [...pair.flags, 'needs_auditor' as TaskPairFlag], updatedAt: this.#now() };
       store.savePair(project, state, { liveness: { ...stored.liveness, notified: [...stored.liveness.notified, key] } });
-      const gap = describeAuditorAllowlistGap({ brain: pair.brain, allowlist: resolveTaskPairAllowlist(project) });
+      // Owner rule (design D-pool-sync): an explicitly named auditor model
+      // bypasses the allowlist entirely, so a miss here is a pool-config gap,
+      // not an allowlist gap -- name the requested model instead of guessing.
+      const gap = requestedModel
+        ? describeRequestedModelMiss(requestedModel)
+        : describeAuditorAllowlistGap({ brain: pair.brain, allowlist: resolveTaskPairAllowlist(project) });
       await sendTaskPairMessage(pair.brain, taskId, 'brain-needs_auditor', buildBrainNoticeMessage(state, 'needs_auditor', gap));
       return false;
     }
@@ -380,10 +388,14 @@ export class TaskPairAutomation implements TaskPairScheduler {
     const pair = stored.state;
     const pool = pair.executorPool === 'economy' ? 'economy' : 'primary';
     const exclude = new Set<string>([pair.brain, ...(pair.auditor ? [pair.auditor] : [])]);
-    const next = this.#pick({ brain: pair.brain, role: 'executor', pool, exclude, project })
-      ?? await this.#provision({ brain: pair.brain, role: 'executor', pool, project, taskId });
+    const requestedModel = pair.executorModel;
+    const next = this.#pick({ brain: pair.brain, role: 'executor', pool, exclude, project, requestedModel })
+      ?? await this.#provision({ brain: pair.brain, role: 'executor', pool, project, taskId, requestedModel });
     if (!next) {
-      this.#flagOnce(project, taskId, 'waiting_for_capacity');
+      this.#flagOnce(
+        project, taskId, 'waiting_for_capacity',
+        requestedModel ? describeRequestedModelMiss(requestedModel) : describePoolSyncGap(pair.brain),
+      );
       return;
     }
     taskPairService.applyMarker({
@@ -398,13 +410,13 @@ export class TaskPairAutomation implements TaskPairScheduler {
     await taskPairService.briefParticipants(project, taskId);
   }
 
-  #flagOnce(project: string, taskId: string, flag: TaskPairFlag): void {
+  #flagOnce(project: string, taskId: string, flag: TaskPairFlag, detail?: string): void {
     const store = getTaskPairStore();
     const stored = store.getPair(project, taskId);
     if (!stored || stored.state.flags.includes(flag)) return;
     const state = { ...stored.state, flags: [...stored.state.flags, flag], updatedAt: this.#now() };
     store.savePair(project, state);
-    void sendTaskPairMessage(state.brain, taskId, `brain-${flag}`, buildBrainNoticeMessage(state, flag));
+    void sendTaskPairMessage(state.brain, taskId, `brain-${flag}`, buildBrainNoticeMessage(state, flag, detail));
   }
 
   /** Pool bookkeeping after role changes: record pools, flag off-pool and unreviewed economy work. */
@@ -462,15 +474,19 @@ export class TaskPairAutomation implements TaskPairScheduler {
       }
       const pool = pair.executorPool === 'economy' ? 'economy' : 'primary';
       const executor = pair.executor
-        ?? this.#pick({ brain, role: 'executor', pool, exclude: new Set([brain, ...(pair.auditor ? [pair.auditor] : [])]), project })
-        ?? await this.#provision({ brain, role: 'executor', pool, project, taskId: pair.taskId });
+        ?? this.#pick({ brain, role: 'executor', pool, exclude: new Set([brain, ...(pair.auditor ? [pair.auditor] : [])]), project, requestedModel: pair.executorModel })
+        ?? await this.#provision({ brain, role: 'executor', pool, project, taskId: pair.taskId, requestedModel: pair.executorModel });
       const auditor = pair.auditor
         ?? (executor
-          ? this.#pick({ brain, role: 'auditor', pool: 'primary', exclude: new Set([brain, executor]), project })
-            ?? await this.#provision({ brain, role: 'auditor', pool: 'primary', project, taskId: pair.taskId })
+          ? this.#pick({ brain, role: 'auditor', pool: 'primary', exclude: new Set([brain, executor]), project, requestedModel: pair.auditorModel })
+            ?? await this.#provision({ brain, role: 'auditor', pool: 'primary', project, taskId: pair.taskId, requestedModel: pair.auditorModel })
           : undefined);
       if (!executor || !auditor || executor === auditor) {
-        this.#flagOnce(project, pair.taskId, 'waiting_for_capacity');
+        const requestedModel = !executor ? pair.executorModel : !auditor ? pair.auditorModel : undefined;
+        this.#flagOnce(
+          project, pair.taskId, 'waiting_for_capacity',
+          requestedModel ? describeRequestedModelMiss(requestedModel) : describePoolSyncGap(brain),
+        );
         return;
       }
       const result = taskPairService.applyMarker({

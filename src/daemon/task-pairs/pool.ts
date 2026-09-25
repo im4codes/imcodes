@@ -22,6 +22,7 @@ import {
 import { matchesTaskPairAllowlist, type TaskPairAllowlistEntry } from '../../../shared/task-pair.js';
 import { delegationTargetInputs } from '../delegation-admission.js';
 import { configMatchesSession, configuredPools, poolDefinition } from '../supervision-auto-provision.js';
+import { describeSupervisorDefaultsSyncGap } from '../supervisor-defaults-cache.js';
 import { getTransportRuntime } from '../../agent/session-manager.js';
 import { getTaskPairStore } from './store.js';
 
@@ -56,8 +57,36 @@ export function brainHasConfiguredPools(brain: string, deps: TaskPairPoolDeps = 
   return !!parent && !!configuredPools(parent);
 }
 
+/**
+ * The account-pool sync gap, but only worth surfacing once there IS a
+ * configured pool to have possibly gone stale -- a project that never
+ * configured pools at all (mirror or cache) has nothing to sync, so showing
+ * this there would be noise rather than a diagnostic.
+ */
+export function describePoolSyncGap(brain: string, deps: TaskPairPoolDeps = {}): string | undefined {
+  if (!brainHasConfiguredPools(brain, deps)) return undefined;
+  return describeSupervisorDefaultsSyncGap();
+}
+
+/**
+ * "no session/config for requested model X", with the sync gap appended when
+ * one exists. Unlike {@link describePoolSyncGap}, this is not gated on the
+ * Brain already having a configured pool: a stale/never-synced cache can be
+ * exactly why a named model's config is missing even when the local mirror
+ * itself shows no pool at all.
+ */
+export function describeRequestedModelMiss(requestedModel: string): string {
+  const gap = describeSupervisorDefaultsSyncGap();
+  return `no session/config for requested model ${requestedModel}${gap ? ` (${gap})` : ''}`;
+}
+
 function allowlisted(session: SessionRecord, role: TaskPairPickRole, allowlist: readonly TaskPairAllowlistEntry[]): boolean {
   return matchesTaskPairAllowlist(allowlist, role, session.agentType, resolveEffectiveSessionModel(session) ?? undefined);
+}
+
+/** A named model (`executormodel=`/`auditormodel=`) matches by exact id, case-insensitively. */
+function sameModelId(a: string | null | undefined, b: string): boolean {
+  return !!a && a.toLowerCase() === b.toLowerCase();
 }
 
 /**
@@ -71,6 +100,14 @@ export function listTaskPairCandidates(input: {
   pool: SupervisionExecutionPoolKind;
   allowlist: readonly TaskPairAllowlistEntry[];
   exclude: ReadonlySet<string>;
+  /**
+   * Owner rule (design D-pool-sync): the human or Brain explicitly named
+   * this model for the role (`executormodel=`/`auditormodel=`, or a bound
+   * `send_message task.requestedExecutionType.model`). A candidate matches
+   * by model alone; the allowlist -- which governs only an automatic pick --
+   * is not consulted.
+   */
+  requestedModel?: string;
 }, deps: TaskPairPoolDeps = {}): SessionRecord[] {
   const sessions = (deps.listSessions ?? (() => listSessions()))();
   const parent = sessions.find((session) => session.name === input.brain) ?? (deps.getSession ?? getSession)(input.brain);
@@ -80,6 +117,11 @@ export function listTaskPairCandidates(input: {
   const availability = resolveDelegationTargets(delegationTargetInputs(sessions), (deps.now ?? Date.now)());
   const hasPending = deps.hasPendingMessages ?? defaultHasPendingMessages;
   const store = getTaskPairStore();
+  const eligibleForRole = (session: SessionRecord): boolean => (
+    input.requestedModel
+      ? sameModelId(resolveEffectiveSessionModel(session), input.requestedModel)
+      : allowlisted(session, input.role, input.allowlist)
+  );
   return sessions
     .filter((session) => (
       // Only the Brain's own sub-sessions: the daemon never commandeers an
@@ -91,7 +133,7 @@ export function listTaskPairCandidates(input: {
       && !SUPERVISION_DEFAULT_EXCLUDED_DEVELOPMENT_SESSIONS.includes(session.name)
       && !isExcludedDevelopmentModel(resolveEffectiveSessionModel(session) ?? '')
       && (!pools || !!definition?.configs.some((config: SupervisionExecutionConfig) => configMatchesSession(config, session)))
-      && allowlisted(session, input.role, input.allowlist)
+      && eligibleForRole(session)
       && session.state === 'idle'
       && availability.get(session.name)?.availability === DELEGATION_AVAILABILITY.READY
       && !hasPending(session.name)
@@ -121,7 +163,8 @@ export function describeAuditorAllowlistGap(input: {
     .filter((entry) => entry.role === 'auditor' || entry.role === 'both')
     .map((entry) => `${entry.agentType}/${entry.modelPattern || '*'}`)
     .join(', ') || 'none';
-  return `the auditor allowlist (${wanted}) matches none of the primary pool's configs (${pool}). Add an allowlisted auditor config to the primary pool, or widen the project's pair allowlist`;
+  const syncGap = describeSupervisorDefaultsSyncGap();
+  return `the auditor allowlist (${wanted}) matches none of the primary pool's configs (${pool}). Add an allowlisted auditor config to the primary pool, or widen the project's pair allowlist${syncGap ? ` (${syncGap})` : ''}`;
 }
 
 /** First allowlisted pool config for auto-provisioning a role, if any. */
@@ -130,12 +173,16 @@ export function allowlistedProvisionConfig(input: {
   role: TaskPairPickRole;
   pool: SupervisionExecutionPoolKind;
   allowlist: readonly TaskPairAllowlistEntry[];
+  /** Owner rule: see {@link listTaskPairCandidates}. */
+  requestedModel?: string;
 }, deps: TaskPairPoolDeps = {}): SupervisionExecutionConfig | undefined {
   const parent = (deps.getSession ?? getSession)(input.brain);
   if (!parent) return undefined;
   const definition = poolDefinition(parent, input.role === 'auditor' ? 'primary' : input.pool);
   return definition?.configs.find((config) => (
-    matchesTaskPairAllowlist(input.allowlist, input.role, config.agentType, config.model)
+    input.requestedModel
+      ? sameModelId(config.model, input.requestedModel)
+      : matchesTaskPairAllowlist(input.allowlist, input.role, config.agentType, config.model)
   ));
 }
 

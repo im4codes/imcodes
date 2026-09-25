@@ -288,6 +288,35 @@ describe('task-pair state machine', () => {
     expect(result.intents).toContainEqual({ kind: 'pick_auditor' });
   });
 
+  it('owner rule: keeps an explicit executormodel=/auditormodel= on the pair and still asks the daemon to pick by it', () => {
+    const result = apply(undefined, BRAIN, '<!-- IMCODES_TASK DISPATCH T52 executormodel=gpt-6-luna auditormodel=claude-sonnet-5 -->');
+    expect(result.pair).toMatchObject({ executorModel: 'gpt-6-luna', auditorModel: 'claude-sonnet-5' });
+    expect(result.pair?.executor).toBeUndefined();
+    expect(result.pair?.auditor).toBeUndefined();
+    expect(result.intents).toContainEqual({ kind: 'pick_executor' });
+    expect(result.intents).toContainEqual({ kind: 'pick_auditor' });
+  });
+
+  it('owner rule: an explicit executor=/auditor= session still wins over an unrelated model attr and needs no pick', () => {
+    const result = apply(undefined, BRAIN, `<!-- IMCODES_TASK DISPATCH T53 executor=${EXEC} auditor=${AUD} auditormodel=claude-sonnet-5 -->`);
+    expect(result.pair).toMatchObject({ executor: EXEC, auditor: AUD, auditorModel: 'claude-sonnet-5' });
+    expect(result.intents).not.toContainEqual({ kind: 'pick_auditor' });
+  });
+
+  it('owner rule: REASSIGN with only auditormodel= re-triggers the pick for a pair that still has no auditor', () => {
+    const noAuditor = apply(undefined, BRAIN, `<!-- IMCODES_TASK DISPATCH T54 executor=${EXEC} -->`).pair!;
+    const result = apply(noAuditor, BRAIN, '<!-- IMCODES_TASK REASSIGN T54 auditormodel=claude-sonnet-5 -->');
+    expect(result.pair).toMatchObject({ auditorModel: 'claude-sonnet-5' });
+    expect(result.intents).toContainEqual({ kind: 'pick_auditor' });
+  });
+
+  it('owner rule: REASSIGN with only auditormodel= on a pair that already has an auditor records the model but does not replace the current auditor', () => {
+    const withAuditor = apply(undefined, BRAIN, `<!-- IMCODES_TASK DISPATCH T55 executor=${EXEC} auditor=${AUD} -->`).pair!;
+    const result = apply(withAuditor, BRAIN, '<!-- IMCODES_TASK REASSIGN T55 auditormodel=claude-sonnet-5 -->');
+    expect(result.pair).toMatchObject({ auditor: AUD, auditorModel: 'claude-sonnet-5' });
+    expect(result.intents).not.toContainEqual({ kind: 'pick_auditor' });
+  });
+
   it('gives an executor-created pair the fallback Brain', () => {
     const result = apply(undefined, EXEC, '<!-- IMCODES_TASK STARTED T51 auditor=deck_sub_aud -->');
     expect(result.pair).toMatchObject({ brain: BRAIN, executor: EXEC, status: 'working' });

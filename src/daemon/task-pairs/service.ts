@@ -216,7 +216,11 @@ export class TaskPairService {
   }
 
   /** send_message with task metadata: creates a missing pair, otherwise record only. */
-  implicitDispatch(input: { project?: string; sender: string; target: string; taskId: string; auditor?: string; title?: string; eventId: string }): TaskPairTransition | undefined {
+  implicitDispatch(input: {
+    project?: string; sender: string; target: string; taskId: string; auditor?: string; title?: string; eventId: string;
+    /** Owner rule (design D-pool-sync): a bound `task.requestedExecutionType.model` on the initial send_message dispatch, kept so a later automatic executor replacement still honors it instead of falling back to the allowlist. */
+    executorModel?: string;
+  }): TaskPairTransition | undefined {
     const project = input.project ?? projectOfSession(input.sender) ?? projectOfSession(input.target);
     if (!project || !isPairsEngineProject(project)) return undefined;
     const store = getTaskPairStore();
@@ -250,6 +254,7 @@ export class TaskPairService {
           executor: input.target,
           ...(input.auditor ? { auditor: input.auditor } : {}),
           ...(input.title ? { title: input.title } : {}),
+          ...(input.executorModel ? { executormodel: input.executorModel } : {}),
         },
       },
       source: 'implicit_dispatch',
