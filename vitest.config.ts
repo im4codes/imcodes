@@ -37,7 +37,7 @@ export default defineConfig({
           // time (src/util/logger.ts even opens daemon.log there), so without
           // this the suite appends to the developer's real production log.
           // See test/setup/isolated-home.ts.
-          setupFiles: ['./test/setup/isolated-home.ts'],
+          setupFiles: ['./test/setup/isolated-home.ts', './test/setup/legacy-supervision-engine.ts'],
           // Owns the directory those per-worker homes live in and removes it once
           // every worker has exited — including workers that were killed. See
           // test/setup/isolated-home-global.ts.
@@ -86,6 +86,11 @@ export default defineConfig({
           exclude: ['**/node_modules/**'],
           environment: 'node',
           globals: false,
+          // Same per-file temporary HOME as the daemon project: e2e files load
+          // the real session store and spawn daemon children, and must never
+          // reach the developer's (or runner's) real ~/.imcodes.
+          setupFiles: ['./test/setup/isolated-home.ts'],
+          globalSetup: ['./test/setup/isolated-home-global.ts'],
           fileParallelism: false,
           hookTimeout: 30000,
           testTimeout: 90000, // E2E tests spawn real tmux + agent processes and are unstable under file-level parallelism

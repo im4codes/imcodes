@@ -140,10 +140,6 @@ if (!(globalThis as { __imcodesIsolatedHomeCleanup?: boolean }).__imcodesIsolate
   }
 }
 
-// The shipped default engine is `pairs`. Suites written against the legacy
-// supervision registry pin `legacy` here; pair suites set `pairs` themselves.
-process.env.IMCODES_SUPERVISION_ENGINE ??= 'legacy';
-
 /**
  * Exported for the ownership test only: removes THIS worker's root and nothing
  * else, ignoring the once-per-file latch.
