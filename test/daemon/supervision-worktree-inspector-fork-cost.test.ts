@@ -95,7 +95,7 @@ function shape(options: { changedFiles: number; refs?: number }): Shape {
 }
 
 /** Runs `fn` while sampling how long the event loop is unable to schedule. */
-async function withEventLoopStall<T>(fn: () => Promise<T> | T): Promise<{ value: T; maxStallMs: number }> {
+async function withEventLoopStall<T>(fn: () => Promise<T> | T): Promise<{ value: T; maxStallMs: number; elapsedMs: number }> {
   let last = process.hrtime.bigint();
   let maxStallMs = 0;
   const timer = setInterval(() => {
@@ -104,11 +104,12 @@ async function withEventLoopStall<T>(fn: () => Promise<T> | T): Promise<{ value:
     last = now;
   }, 5);
   try {
-    last = process.hrtime.bigint();
+    const start = process.hrtime.bigint();
+    last = start;
     const value = await fn();
     const now = process.hrtime.bigint();
     maxStallMs = Math.max(maxStallMs, Number(now - last) / 1e6);
-    return { value, maxStallMs };
+    return { value, maxStallMs, elapsedMs: Number(now - start) / 1e6 };
   } finally {
     clearInterval(timer);
   }
@@ -149,12 +150,76 @@ describe('supervision worktree inspection cost (production-shaped)', () => {
   });
 
   it('does not block the daemon event loop while inspecting', async () => {
+    // A single sample of a real wall-clock stall on a shared CI runner is
+    // noisy: this test previously asserted a lone run under 60ms and flaked
+    // on macOS CI at 61.2ms -- a scheduler hiccup on an otherwise-compliant
+    // async implementation, not a regression. `no synchronous child process
+    // survives on the inspection path` below already proves the structural
+    // contract (no execFileSync/spawnSync/execSync can even be present in the
+    // source); this test adds a load-tolerant confirmation on top of that
+    // rather than trying to be the sole line of defense.
+    //
+    // An earlier revision of this fix used median-of-5 against a FIXED
+    // absolute ceiling (150ms), derived from one machine's measured
+    // synchronous-fork cost. That is not load-independent: a sync fork's
+    // stall is simply the inspection's own duration, so a faster or quieter
+    // machine (or CI's Linux runners, generally faster at process spawn than
+    // this one) drives that duration below any fixed ceiling picked on a
+    // slower/louder one. Confirmed by measurement: the same execFileSync
+    // mutant that produced a 278ms median stall on a loaded machine produced
+    // ~117ms on a quieter one -- comfortably under the old 150ms ceiling.
+    //
+    // The load-independent signal is the STALL-TO-ELAPSED RATIO, not an
+    // absolute number. A synchronous fork blocks the loop for essentially the
+    // whole call: stall/elapsed ~= 1.0, on any machine, at any speed, because
+    // the operation and the stall are the same event. An async
+    // implementation yields the loop between every git call, so its stall is
+    // bounded by scheduling noise (the 5ms sampling interval, plus whatever
+    // else is running) regardless of how long the whole inspection took to
+    // return -- measured at stall/elapsed ~= 0.07-0.09 on both a quiet and a
+    // loaded machine.
+    //
+    // Ceiling = max(ABSOLUTE_FLOOR_MS, STALL_TO_ELAPSED_RATIO * elapsed).
+    // The floor exists only so scheduling noise on a near-instant inspection
+    // can't trip a false positive; it is far above the 5ms sampling
+    // resolution and, per the ratio, is exceeded by a sync fork on any
+    // inspection slower than ABSOLUTE_FLOOR_MS / STALL_TO_ELAPSED_RATIO = 40ms
+    // -- every real measurement here, sync or async, loaded or quiet, has
+    // been at least 70ms (8+ real `git` process creations do not complete
+    // in under 40ms total on any machine this ran on). Below that floor the
+    // test could in principle miss an implausibly fast full synchronous
+    // fork chain; that bound is stated here rather than hidden.
+    //
+    // Sample several independent cold inspections of the SAME shaped repo
+    // (cache reset between each, so every one actually walks git rather than
+    // serving a hit) and take the median of both stall and elapsed, which
+    // absorbs one noisy sample the way a single run cannot. A genuine
+    // synchronous fork keeps stall/elapsed ~= 1.0 on every iteration, so it
+    // cannot hide behind the median either.
+    const STALL_SAMPLES = 5;
+    const ABSOLUTE_FLOOR_MS = 20;
+    const STALL_TO_ELAPSED_RATIO = 0.5;
     const s = shape({ changedFiles: 12 });
-    const { value, maxStallMs } = await withEventLoopStall(() => inspect(s.repo));
-    expect(value.ok).toBe(true);
-    // Synchronous execFileSync/spawnSync holds the loop for the whole
-    // inspection. An async implementation yields between every git call.
-    expect(maxStallMs, `max event-loop stall ${maxStallMs.toFixed(1)}ms`).toBeLessThan(60);
+    const stallSamples: number[] = [];
+    const elapsedSamples: number[] = [];
+    for (let i = 0; i < STALL_SAMPLES; i += 1) {
+      __resetSupervisionWorktreeInspectionCacheForTests();
+      const { value, maxStallMs, elapsedMs } = await withEventLoopStall(() => inspect(s.repo));
+      expect(value.ok).toBe(true);
+      stallSamples.push(maxStallMs);
+      elapsedSamples.push(elapsedMs);
+    }
+    const median = (values: number[]) => [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)];
+    const medianStallMs = median(stallSamples);
+    const medianElapsedMs = median(elapsedSamples);
+    const ceilingMs = Math.max(ABSOLUTE_FLOOR_MS, STALL_TO_ELAPSED_RATIO * medianElapsedMs);
+    expect(
+      medianStallMs,
+      `median stall ${medianStallMs.toFixed(1)}ms vs ceiling ${ceilingMs.toFixed(1)}ms `
+        + `(median elapsed ${medianElapsedMs.toFixed(1)}ms); `
+        + `stall samples: ${stallSamples.map((ms) => ms.toFixed(1)).join(', ')}; `
+        + `elapsed samples: ${elapsedSamples.map((ms) => ms.toFixed(1)).join(', ')}`,
+    ).toBeLessThan(ceilingMs);
   });
 
   it('re-inspects an unchanged worktree with a single bounded probe', async () => {
