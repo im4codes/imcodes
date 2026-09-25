@@ -37,6 +37,7 @@ import { noteTaskPairFocus, sendTaskPairMessage, taskPairFocusOf } from './deliv
 import { resolveTaskPairMaterial } from './material.js';
 import { copyTaskPairOutput, provisionTaskPairWorkspace, releaseTaskPairWorkspace } from './workspace.js';
 import { clearTaskPairProviderError, noteTaskPairProviderError } from './provider-errors.js';
+import { getSession } from '../../store/session-store.js';
 import {
   buildAuditRequestMessage,
   buildAuditorAssignmentMessage,
@@ -76,6 +77,7 @@ function mentionsTaskId(text: string, taskId: string): boolean {
 export class TaskPairService {
   #unsubscribe?: () => void;
   #scheduler?: TaskPairScheduler;
+  #recentBrainDispatch = new Map<string, { taskId: string; at: number }>();
 
   init(): void {
     if (this.#unsubscribe) return;
@@ -109,6 +111,15 @@ export class TaskPairService {
 
   setScheduler(scheduler: TaskPairScheduler | undefined): void {
     this.#scheduler = scheduler;
+  }
+
+  /** Returns and consumes a marker DISPATCH seen immediately before send_message. */
+  recentBrainDispatch(project: string, brain: string, target: string): string | undefined {
+    const key = `${project}\u0000${brain}\u0000${target}`;
+    const focus = this.#recentBrainDispatch.get(key);
+    if (!focus || Date.now() - focus.at > 10_000) return undefined;
+    this.#recentBrainDispatch.delete(key);
+    return focus.taskId;
   }
 
   handleTimelineEvent(event: TimelineEvent): void {
@@ -200,6 +211,10 @@ export class TaskPairService {
     }
     if (stored && transition.toStatus === 'passed' && transition.fromStatus !== 'passed') {
       this.#scheduler?.flagEconomyUnreviewed?.(input.project, stored.state.taskId);
+    }
+    if (input.marker.knownVerb === 'DISPATCH' && transition.pair?.executor
+      && input.writer === transition.pair.brain) {
+      this.#recentBrainDispatch.set(`${input.project}\u0000${transition.pair.brain}\u0000${transition.pair.executor}`, { taskId: transition.pair.taskId, at: Date.now() });
     }
     return transition;
   }
@@ -581,6 +596,17 @@ export function emitTaskPairTimelineEvent(
       ...(pair.auditorPool ? { auditorPool: pair.auditorPool } : {}),
     } : {}),
   };
+  for (const [role, session] of [['executor', pair?.executor], ['auditor', pair?.auditor]] as const) {
+    if (!session || session === TASK_PAIR_NO_AUDITOR) continue;
+    const record = getSession(session);
+    if (role === 'executor') {
+      if (record?.label) payload.executorLabel = record.label;
+      if (record?.state) payload.executorState = record.state;
+    } else {
+      if (record?.label) payload.auditorLabel = record.label;
+      if (record?.state) payload.auditorState = record.state;
+    }
+  }
   const targets = new Set<string>(base.writer === 'daemon' ? [] : [base.writer]);
   for (const session of [pair?.executor, pair?.auditor, pair?.brain]) {
     if (session && session !== TASK_PAIR_NO_AUDITOR) targets.add(session);

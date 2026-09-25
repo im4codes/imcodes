@@ -13,6 +13,7 @@ import { timelineEmitter } from './timeline-emitter.js';
 import { existsSync } from 'node:fs';
 import {
   deriveSupervisionTaskTitle,
+  deriveSupervisionTaskTitleFromBrief,
   formatSupervisionTaskIdentityHeader,
   projectSupervisionTaskObjective,
 } from '../../shared/supervision-task-identity.js';
@@ -1316,14 +1317,12 @@ function bindAcceptedDispatchToTaskPair(
   result: Extract<SendMessageResult, { status: 'accepted' }>,
   taskId: string,
   objective: string | undefined,
-  // Owner rule (design D-pool-sync): a Brain-named model on the initial
-  // send_message dispatch (task.requestedExecutionType.model) is kept on the
-  // pair so a later automatic executor replacement still honors it instead of
-  // falling back to the project's audit allowlist.
+  // Preserve both the requested executor model and an explicit human title.
   executorModel?: string,
+  explicitTitle?: string | null,
 ): SendMessageResult {
   const reached = result.deliveries.filter((delivery) => isReachedDelivery(delivery.status));
-  const title = deriveSupervisionTaskTitle(objective);
+  const title = deriveSupervisionTaskTitleFromBrief(objective, explicitTitle) ?? deriveSupervisionTaskTitle(objective);
   for (const delivery of reached) {
     taskPairService.implicitDispatch({
       project,
@@ -1393,7 +1392,15 @@ export async function dispatchSendMessage(
       ? mintDispatchTaskPairId(caller, callerProjectName, input)
       : undefined);
     if (!taskId) return result;
-    return bindAcceptedDispatchToTaskPair(caller, callerProjectName, result, taskId, objective, input.task?.requestedExecutionType?.model);
+    return bindAcceptedDispatchToTaskPair(
+      caller,
+      callerProjectName,
+      result,
+      taskId,
+      objective,
+      input.task?.requestedExecutionType?.model,
+      input.task?.title,
+    );
   }
   // A Brain that dispatches work with a plain send_message (no task metadata,
   // no DISPATCH marker) on a `pairs` project with automatic audit still gets a
@@ -1405,6 +1412,13 @@ export async function dispatchSendMessage(
     && resolveProjectAuthoritativeSupervisionSnapshot(callerProjectName, allSessions).mode === SUPERVISION_MODE.SUPERVISED_AUDIT) {
     const result = await dispatchSendMessage(caller, withoutImplicitWorkPair({ ...input }), deps);
     if (result.status !== 'accepted') return result;
+    const reached = result.deliveries.filter((delivery) => isReachedDelivery(delivery.status));
+    const target = result.deliveries.length === 1 && reached.length === 1 ? reached[0]!.target : undefined;
+    const focused = target ? taskPairService.recentBrainDispatch(callerProjectName, caller.sessionName, target) : undefined;
+    // A DISPATCH marker already opened this pair in the same turn.  Keep the
+    // ordinary send receipt unadorned and, crucially, do not mint/bind a
+    // second implicit pair for the follow-up message.
+    if (focused && target && getTaskPairStore().getPair(callerProjectName, focused)?.state.executor === target) return result;
     const taskId = mintDispatchTaskPairId(caller, callerProjectName, input);
     if (!implicitWorkPairTarget(callerProjectName, taskId, result, d.listSessions())) return result;
     return bindAcceptedDispatchToTaskPair(caller, callerProjectName, result, taskId, projectSupervisionTaskObjective(input.message));

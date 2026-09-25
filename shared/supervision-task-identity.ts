@@ -108,6 +108,35 @@ export function deriveSupervisionTaskTitle(objective: unknown): string | undefin
 }
 
 /**
+ * Derive a readable title from a free-form dispatch brief. Dispatch briefs
+ * often begin with daemon/role boilerplate; prefer an explicit Title line or
+ * an Owner request, then fall back to the first human sentence.
+ */
+export function deriveSupervisionTaskTitleFromBrief(value: unknown, explicitTitle?: unknown): string | undefined {
+  const explicit = readSupervisionTaskTitle(explicitTitle);
+  if (explicit) return explicit;
+  if (typeof value !== 'string') return undefined;
+  const projected = projectSupervisionTaskObjective(value);
+  if (!projected) return undefined;
+  const lines = projected.split('\n').map((line) => line.trim()).filter(Boolean);
+  const titleLine = lines.find((line) => /^title\s*:/iu.test(line));
+  if (titleLine) {
+    const candidate = titleLine.replace(/^title\s*:\s*/iu, '').trim().replace(/^['"“]|['"”]$/gu, '');
+    const title = readSupervisionTaskTitle(candidate);
+    if (title) return title;
+  }
+  const owner = lines.find((line) => /^owner\s+request\s*:/iu.test(line));
+  if (owner) {
+    const candidate = owner.replace(/^owner\s+request\s*:\s*/iu, '').trim().replace(/^['"“]|['"”]$/gu, '');
+    const title = readSupervisionTaskTitle(candidate);
+    if (title) return title;
+  }
+  const boilerplate = /^(?:\[brain\]|\[im\.codes task\]|you are the (?:executor|auditor)\b|repo\s*:|base\s*:|auditor\s*:|executor\s*:|rules?\s*:|process\s*:|phase\s+[a-z]\b|message from im\.codes\b)/iu;
+  const candidate = lines.find((line) => !boilerplate.test(line));
+  return readSupervisionTaskTitle(candidate ?? lines[0]);
+}
+
+/**
  * Read a concise title that crossed a trust boundary (MCP receipt, prompt
  * header metadata). Full human-facing objective surfaces use the separately
  * bounded `projectSupervisionTaskObjective` value.

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   SUPERVISION_TASK_TITLE_MAX_CHARS,
   deriveSupervisionTaskTitle,
+  deriveSupervisionTaskTitleFromBrief,
   formatSupervisionTaskIdentityHeader,
   readSupervisionTaskTitle,
 } from '../../shared/supervision-task-identity.js';
@@ -43,5 +44,10 @@ describe('concise supervision task titles', () => {
   it('recognizes a CJK sentence boundary without requiring ASCII whitespace', () => {
     const objective = '修复委派回复卡片标题。完整目标仍保留在折叠详情中。';
     expect(deriveSupervisionTaskTitle(objective)).toBe('修复委派回复卡片标题。…');
+  });
+
+  it('strips Brain boilerplate and honors an explicit title line', () => {
+    expect(deriveSupervisionTaskTitleFromBrief('[Brain] You are the executor of pair tsk_x.\nTitle: Repair task labels')).toBe('Repair task labels');
+    expect(deriveSupervisionTaskTitleFromBrief('[Brain] role boilerplate\nOwner request: "修复任务面板"')).toBe('修复任务面板');
   });
 });

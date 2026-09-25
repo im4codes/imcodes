@@ -1061,7 +1061,13 @@ export interface TaskPairEventPayload {
   unusual: boolean;
   title?: string;
   executor?: string;
+  executorLabel?: string;
+  executorState?: string;
   auditor?: string;
+  auditorLabel?: string;
+  auditorState?: string;
+  queuePosition?: number;
+  urgent?: boolean;
   round?: number;
   flags?: TaskPairFlag[];
   blocking?: AuditSeverity[];

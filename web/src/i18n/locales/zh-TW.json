@@ -4326,7 +4326,8 @@
       "rework": "返工",
       "passed": "已通過",
       "done": "已完成",
-      "cancelled": "已取消"
+      "cancelled": "已取消",
+      "rework_round": "返工第{{round}}輪"
     },
     "flag": {
       "blocked": "受阻",
@@ -4367,6 +4368,18 @@
     "output_saved": "成果已儲存到 {{path}}",
     "output_failed": "成果未儲存（{{reason}}）",
     "workspace_removed": "工作區已刪除",
-    "workspace_kept": "工作區已保留：仍有未儲存的工作"
+    "workspace_kept": "工作區已保留：仍有未儲存的工作",
+    "panel_title": "任務狀態",
+    "panel_counts": "執行中 {{working}} · 審計中 {{audit}} · 排隊 {{queued}}",
+    "panel_elapsed": "已執行 {{seconds}}秒",
+    "panel_round": "第{{round}}輪",
+    "panel_group_working": "執行中",
+    "panel_group_audit": "審計中",
+    "panel_group_rework": "返工",
+    "panel_group_queued": "排隊",
+    "panel_group_recent": "最近完成",
+    "panel_queued": "已排隊 {{seconds}} 秒",
+    "panel_unassigned": "待分配",
+    "panel_started": "開始於 {{time}}"
   }
 }

@@ -114,6 +114,11 @@ function displayStatusKey(status: unknown): string {
     : 'supervision_task_console.unsupported';
 }
 
+function pairStatusLabel(t: (key: string, options?: Record<string, unknown>) => string, pair: SupervisionConsolePairInfo): string {
+  if (pair.status === 'rework') return t('taskPair.status.rework_round', { round: pair.round });
+  return t(`taskPair.status.${pair.status}`);
+}
+
 /** One formatter per language: constructing Intl.DateTimeFormat per card dominated large console renders. */
 const timestampFormatters = new Map<string, Intl.DateTimeFormat>();
 
@@ -250,8 +255,7 @@ function SessionButton(props: {
     >
       <span class="supervision-task-console-session-icon" aria-hidden="true" />
       <span class="supervision-task-console-session-copy">
-        <strong>{assignment.ownerSessionLabel || name}</strong>
-        {assignment.ownerSessionLabel && <small>{name}</small>}
+        <strong>{assignment.ownerSessionLabel || name}</strong>{assignment.ownerSessionLabel && <small> ({name})</small>}
         <small>{assignment.observedProvider || assignment.ownerAgentType || '—'} · {assignment.observedModel || '—'}</small>
         {props.lane === 'auditor' && (assignment.auditAttemptId || assignment.auditVerdict) && <small>{assignment.auditAttemptId || '—'} · {assignment.auditVerdict || '—'}</small>}
       </span>
@@ -292,15 +296,6 @@ function TaskCard(props: {
     blocker: props.task.blocker,
     assignments: currentAssignments,
   });
-  const activityAt = authoritativeActivityAt(props.task, props.assignments);
-  const activityAssignment = taskTab === 'active'
-    ? taskRoleAssignments(currentAssignments).sort((left, right) =>
-      (right.sessionStateObservedAt ?? right.updatedAt) - (left.sessionStateObservedAt ?? left.updatedAt))[0]
-    : undefined;
-  const activitySource = activityAssignment?.sessionStateSource ?? 'registry';
-  const progress = props.task.progress && props.task.progress.total > 0
-    ? Math.min(100, Math.max(0, (props.task.progress.completed / props.task.progress.total) * 100))
-    : null;
   return (
     <article
       class={`supervision-task-console-task activity-${dominantState}`}
@@ -315,11 +310,13 @@ function TaskCard(props: {
         <div class="supervision-task-console-task-summary">
           <ExpandableTaskObjective
             className="supervision-task-console-task-title"
-            text={props.task.objective ?? props.task.title}
+            text={props.task.pair ? (props.task.title ?? props.task.objective) : (props.task.objective ?? props.task.title)}
             onActivate={props.onToggle}
             activateExpanded={props.expanded}
             activateControls={`task-console-details-${props.task.taskId}`}
           />
+          <small class="supervision-task-console-task-id">{props.task.taskId}</small>
+          {props.task.pair && props.task.objective && props.task.objective !== props.task.title && <small class="supervision-task-console-task-objective">{props.task.objective}</small>}
           <button
             type="button"
             class="supervision-task-console-details-toggle"
@@ -328,7 +325,7 @@ function TaskCard(props: {
             onClick={props.onToggle}
           >
           <span class={`supervision-task-console-status status-${props.task.status}`}>
-            {props.task.pair ? t(`taskPair.status.${props.task.pair.status}`) : t(displayStatusKey(props.task.status))}
+            {props.task.pair ? pairStatusLabel(t, props.task.pair) : t(displayStatusKey(props.task.status))}
           </span>
           <span aria-hidden="true" class="supervision-task-console-chevron">{props.expanded ? '⌃' : '⌄'}</span>
           </button>
@@ -339,20 +336,11 @@ function TaskCard(props: {
         </div>
       </div>
       {props.task.pair && <TaskPairConsoleDetails pair={props.task.pair} />}
-      <div class={`supervision-task-console-stage-track phase-${props.task.phase}`} aria-label={t(displayStatusKey(props.task.status))}>
-        <span /><span /><span /><span />
-      </div>
-      {progress !== null && props.task.progress && (
-        <div class="supervision-task-console-progress" aria-label={t('supervision_task_console.progress', { ...props.task.progress })}>
-          <span style={{ width: `${progress}%` }} />
-        </div>
-      )}
-      <div class="supervision-task-console-task-meta">
+      {!props.task.pair && (props.task.blocker || props.task.currentAction || props.task.nextAction) && <div class="supervision-task-console-task-meta">
         {props.task.blocker && <span class="is-blocker">{props.task.blocker}</span>}
         {props.task.currentAction && <span>{t('supervision_task_console.current_action')}: {props.task.currentAction}</span>}
         {props.task.nextAction && <span>{t('supervision_task_console.next_action')}: {props.task.nextAction}</span>}
-        <span>{t('supervision_task_console.recent_activity')}: {safeTimestamp(activityAt, props.language)} · {activitySource}</span>
-      </div>
+      </div>}
       {props.expanded && (
         <div id={`task-console-details-${props.task.taskId}`} class="supervision-task-console-task-details">
           <dl class="supervision-task-console-fields">
@@ -370,14 +358,12 @@ function TaskCard(props: {
             <Field label={t('supervision_task_console.recovery')} value={props.task.recoveryState} />
             <Field label={t('supervision_task_console.updated')} value={safeTimestamp(props.task.updatedAt, props.language)} />
           </dl>
-          <section aria-label={t('supervision_task_console.events')}>
+          {!props.task.pair && <section aria-label={t('supervision_task_console.events')}>
             <h4>{t('supervision_task_console.events')}</h4>
-            {props.events.length ? (
-              <ol class="supervision-task-console-events">{props.events.map((event) => (
-                <li key={`${event.projectionVersion}:${event.eventId}`}><span>{t(`supervision_task_console.event_op.${event.op}`)}</span><small>{t('supervision_task_console.event', { id: event.eventId })}</small></li>
-              ))}</ol>
-            ) : <p class="supervision-task-console-muted">{t('supervision_task_console.no_events')}</p>}
-          </section>
+            {props.events.length ? <ol class="supervision-task-console-events">{props.events.map((event) => (
+              <li key={`${event.projectionVersion}:${event.eventId}`}><span>{t(`supervision_task_console.event_op.${event.op}`)}</span><small>{t('supervision_task_console.event', { id: event.eventId })}</small></li>
+            ))}</ol> : <p class="supervision-task-console-muted">{t('supervision_task_console.no_events')}</p>}
+          </section>}
         </div>
       )}
     </article>
@@ -506,8 +492,6 @@ export function SupervisionTaskConsoleView(props: {
       </header>
       {!props.readOnly && props.mutationControls}
       <div class="supervision-task-console-cursor" aria-live="polite" data-sync-state={props.state.syncState}>
-        <span>{t('supervision_task_console.projection', { version: props.state.projectionVersion })}</span>
-        <span>{t('supervision_task_console.event', { id: props.state.lastDurableEventId ?? '—' })}</span>
         <span class="supervision-task-console-sync" role={props.state.syncState === 'error' ? 'alert' : 'status'}>
           {props.state.syncState === 'synced' && props.state.lastSyncedAt !== null
             ? t('supervision_task_console.sync_synced', { time: safeTimestamp(props.state.lastSyncedAt, language) })

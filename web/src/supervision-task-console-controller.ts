@@ -286,11 +286,13 @@ export class SupervisionTaskConsoleController {
     }
     if (message.type === SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT) {
       if (message.subscriptionId === this.state.subscriptionId) this.clearSubscribeTimeout();
+      if (typeof window !== 'undefined') { (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = message; window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: message })); }
       this.apply({ type: 'snapshot_received', payload: message, receivedAt: Date.now() });
       return;
     }
     if (message.type === SUPERVISION_TASK_CONSOLE_MSG.DELTA) {
       if (message.subscriptionId === this.state.subscriptionId) this.clearSubscribeTimeout();
+      if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: message }));
       this.apply({ type: 'delta_received', payload: message, receivedAt: Date.now() });
     }
   }

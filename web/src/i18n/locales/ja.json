@@ -4325,7 +4325,8 @@
       "rework": "差し戻し",
       "passed": "合格",
       "done": "完了",
-      "cancelled": "キャンセル"
+      "cancelled": "キャンセル",
+      "rework_round": "再作業 第{{round}}ラウンド"
     },
     "flag": {
       "blocked": "ブロック",
@@ -4366,6 +4367,18 @@
     "output_saved": "成果物を {{path}} に保存しました",
     "output_failed": "成果物は保存されませんでした（{{reason}}）",
     "workspace_removed": "作業領域を削除しました",
-    "workspace_kept": "作業領域を保持しました：未保存の作業があります"
+    "workspace_kept": "作業領域を保持しました：未保存の作業があります",
+    "panel_title": "タスク状況",
+    "panel_counts": "実行中 {{working}}・監査中 {{audit}}・待機中 {{queued}}",
+    "panel_elapsed": "経過 {{seconds}}秒",
+    "panel_round": "第{{round}}ラウンド",
+    "panel_group_working": "実行中",
+    "panel_group_audit": "監査中",
+    "panel_group_rework": "修正",
+    "panel_group_queued": "キュー",
+    "panel_group_recent": "最近完了",
+    "panel_queued": "待機 {{seconds}} 秒",
+    "panel_unassigned": "未割り当て",
+    "panel_started": "開始 {{time}}"
   }
 }

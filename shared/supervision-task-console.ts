@@ -289,7 +289,7 @@ export function supervisionConsoleTabForStatus(
 
 /** Resolve the product tab from the durable aggregate task authority. */
 export function supervisionConsoleTabForTask(
-  task: Pick<SupervisionTaskConsoleTaskRow, 'status'>,
+  task: Pick<SupervisionTaskConsoleTaskRow, 'status'> & Partial<Pick<SupervisionTaskConsoleTaskRow, 'pair'>>,
   _assignments: readonly Pick<
     SupervisionTaskConsoleAssignmentRow,
     'role' | 'required' | 'leaseActive' | 'status'
@@ -300,6 +300,11 @@ export function supervisionConsoleTabForTask(
   // the count disagree with the status pill and let stale workers overwrite a
   // finalized aggregate. Registry convergence must happen server-side rather
   // than being guessed into existence by the browser.
+  if (task.pair) {
+    if (task.pair.status === 'queued') return 'pending';
+    if (task.pair.status === 'done' || task.pair.status === 'cancelled') return 'history';
+    return 'active';
+  }
   return supervisionConsoleTabForStatus(task.status);
 }
 
@@ -440,6 +445,13 @@ export interface SupervisionConsolePairInfo {
   blocking: AuditSeverity[];
   severityCounts?: TaskPairSeverityCounts;
   lastVerdict?: 'PASS' | 'REWORK';
+  createdAt?: number;
+  queueOrder?: number;
+  queuePosition?: number;
+  executorLabel?: string;
+  auditorLabel?: string;
+  executorState?: SupervisionConsoleSessionState;
+  auditorState?: SupervisionConsoleSessionState;
 }
 
 export interface SupervisionTaskConsoleTaskRow {

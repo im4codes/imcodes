@@ -4326,7 +4326,8 @@
       "rework": "Rework",
       "passed": "Passed",
       "done": "Done",
-      "cancelled": "Cancelled"
+      "cancelled": "Cancelled",
+      "rework_round": "Rework round {{round}}"
     },
     "flag": {
       "blocked": "Blocked",
@@ -4367,6 +4368,18 @@
     "output_saved": "Deliverable saved to {{path}}",
     "output_failed": "Deliverable not saved ({{reason}})",
     "workspace_removed": "Workspace removed",
-    "workspace_kept": "Workspace kept: it still has unsaved work"
+    "workspace_kept": "Workspace kept: it still has unsaved work",
+    "panel_title": "Task status",
+    "panel_counts": "Working {{working}} · Auditing {{audit}} · Queued {{queued}}",
+    "panel_elapsed": "Elapsed {{seconds}}s",
+    "panel_round": "Round {{round}}",
+    "panel_group_working": "Working",
+    "panel_group_audit": "Auditing",
+    "panel_group_rework": "Rework",
+    "panel_group_queued": "Queued",
+    "panel_group_recent": "Recently completed",
+    "panel_queued": "Queued {{seconds}}s ago",
+    "panel_unassigned": "Unassigned",
+    "panel_started": "Started {{time}}"
   }
 }

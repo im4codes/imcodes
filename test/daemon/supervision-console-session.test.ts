@@ -209,6 +209,18 @@ describe('pairs engine rows', () => {
       .toEqual([['implementer', 'deck_sub_exec'], ['auditor', 'deck_sub_aud']]);
   });
 
+  it('projects urgent-first queue positions per Brain', async () => {
+    const { taskPairService } = await import('../../src/daemon/task-pairs/service.js');
+    taskPairService.ingestText('codedeck', 'deck_cd_brain', '<!-- IMCODES_TASK QUEUE Q-normal-1 title="Normal 1" -->', 'queue-1');
+    taskPairService.ingestText('codedeck', 'deck_cd_brain', '<!-- IMCODES_TASK QUEUE Q-normal-2 title="Normal 2" -->', 'queue-2');
+    taskPairService.ingestText('codedeck', 'deck_cd_brain', '<!-- IMCODES_TASK QUEUE Q-urgent title="Urgent" urgent=true -->', 'queue-3');
+    registry.handleFrame(subscribe());
+    const queued = sent[0].tasks.filter((row: any) => row.pair?.status === 'queued');
+    expect(Object.fromEntries(queued.map((row: any) => [row.taskId, row.pair.queuePosition]))).toEqual({
+      'Q-normal-1': 2, 'Q-normal-2': 3, 'Q-urgent': 1,
+    });
+  });
+
   it('asks every viewer of a project to resync when a pair changes', () => {
     registry.handleFrame(subscribe());
     sent.length = 0;

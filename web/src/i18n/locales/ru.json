@@ -4325,7 +4325,8 @@
       "rework": "Доработка",
       "passed": "Принята",
       "done": "Готово",
-      "cancelled": "Отменена"
+      "cancelled": "Отменена",
+      "rework_round": "Доработка, раунд {{round}}"
     },
     "flag": {
       "blocked": "Заблокирована",
@@ -4366,6 +4367,18 @@
     "output_saved": "Результат сохранён в {{path}}",
     "output_failed": "Результат не сохранён ({{reason}})",
     "workspace_removed": "Рабочая область удалена",
-    "workspace_kept": "Рабочая область сохранена: в ней есть несохранённая работа"
+    "workspace_kept": "Рабочая область сохранена: в ней есть несохранённая работа",
+    "panel_title": "Статус задач",
+    "panel_counts": "В работе {{working}} · Аудит {{audit}} · В очереди {{queued}}",
+    "panel_elapsed": "Прошло {{seconds}} с",
+    "panel_round": "Раунд {{round}}",
+    "panel_group_working": "В работе",
+    "panel_group_audit": "Аудит",
+    "panel_group_rework": "Доработка",
+    "panel_group_queued": "В очереди",
+    "panel_group_recent": "Недавно завершённые",
+    "panel_queued": "В очереди {{seconds}} с",
+    "panel_unassigned": "Не назначено",
+    "panel_started": "Начало {{time}}"
   }
 }

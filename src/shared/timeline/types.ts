@@ -127,7 +127,6 @@ export const TIMELINE_CHAT_RENDERABLE_TYPES: readonly string[] = [
   'assistant.text',
   'peer_audit.result',
   AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
-  TASK_PAIR_TIMELINE_EVENT,
   'tool.call',
   'tool.result',
   'mode.state',

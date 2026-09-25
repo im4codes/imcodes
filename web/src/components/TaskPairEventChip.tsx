@@ -48,6 +48,15 @@ export function TaskPairEventChip({ eventId, payload }: { eventId: string; paylo
   const held = event.verdictJudgement === 'inconsistent' || event.verdictJudgement === 'missing_severity';
   // One colour per status (styles.css `.task-pair-chip--<status>`).
   const statusClass = isStatus(event.toStatus) ? ` task-pair-chip--${event.toStatus}` : '';
+  const title = typeof event.title === 'string' && event.title.trim() ? event.title : undefined;
+  const sessionLabel = (id: unknown, label: unknown) => {
+    if (typeof id !== 'string' || !id) return null;
+    const text = typeof label === 'string' && label ? `${label} (${id})` : id;
+    return <button type="button" class="task-pair-chip-session" onClick={(click) => {
+      click.stopPropagation();
+      window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: id } }));
+    }}>{text}</button>;
+  };
   return (
     <div
       class={`chat-event chat-system task-pair-chip${statusClass}${event.unusual ? ' task-pair-chip--unusual' : ''}${held ? ' task-pair-chip--held' : ''}`}
@@ -55,12 +64,17 @@ export function TaskPairEventChip({ eventId, payload }: { eventId: string; paylo
       data-event-id={eventId}
       data-task-id={taskId}
     >
-      <span class="task-pair-chip-task">{event.title ? `${taskId} · ${event.title}` : taskId}</span>
+      <span class="task-pair-chip-task">
+        {title && <strong>{title}</strong>}
+        <small>{taskId}</small>
+      </span>
       <span class="task-pair-chip-text">
         {event.verb === TASK_PAIR_WORKSPACE_EVENT_VERB
           ? workspaceText(t, event)
           : t('taskPair.chip', { writer: writer === 'daemon' ? t('taskPair.daemon') : writer, verb })}
       </span>
+      {sessionLabel(event.executor, event.executorLabel)}
+      {sessionLabel(event.auditor, event.auditorLabel)}
       {status && <span class={`task-pair-chip-status status-${String(event.toStatus)}`}>{status}</span>}
       {counts && <span class="task-pair-chip-counts">{counts}</span>}
       {held && <span class="task-pair-chip-held">{t('taskPair.verdict_held')}</span>}

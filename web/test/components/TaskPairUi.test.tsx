@@ -3,7 +3,7 @@
  */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { cleanup, fireEvent, render, screen } from '@testing-library/preact';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { h } from 'preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -14,6 +14,7 @@ vi.mock('react-i18next', () => ({
 }));
 
 import { TaskPairEventChip } from '../../src/components/TaskPairEventChip.js';
+import { TaskPairStatusPanel } from '../../src/components/TaskPairStatusPanel.js';
 import { TaskPairSettingsSection, type TaskPairSettingsValue } from '../../src/components/TaskPairSettingsSection.js';
 import {
   TASK_PAIR_DEFAULT_ALLOWLIST,
@@ -32,13 +33,29 @@ describe('TaskPairEventChip', () => {
     }} />);
     const chip = container.querySelector('.task-pair-chip')!;
     expect(chip.getAttribute('data-task-id')).toBe('T42');
-    expect(chip.textContent).toContain('T42 · Fix login');
+    expect(chip.textContent).toContain('Fix loginT42');
     expect(chip.textContent).toContain('taskPair.chip:{"writer":"deck_sub_aud","verb":"taskPair.verb.rework"}');
     expect(chip.textContent).toContain('taskPair.status.rework');
     expect(chip.textContent).toContain('taskPair.severity:{"level":"P0","count":1}');
     expect(chip.textContent).toContain('taskPair.severity:{"level":"P2","count":2}');
     expect(chip.textContent).not.toContain('"level":"P1"');
     expect(chip.textContent).not.toContain('taskPair.verdict_held');
+  });
+
+  it('renders title before the muted id and opens labelled sessions', () => {
+    const navigate = vi.fn();
+    const listener = (event: Event) => navigate((event as CustomEvent).detail.session);
+    window.addEventListener('deck:navigate', listener);
+    const { container } = render(<TaskPairEventChip eventId="e-label" payload={{
+      taskId: 'T7', title: 'Readable task', writer: 'brain', verb: 'DISPATCH',
+      executor: 'deck_sub_worker', executorLabel: 'Cx6', unusual: false,
+    }} />);
+    const task = container.querySelector('.task-pair-chip-task')!;
+    expect(task.querySelector('strong')?.textContent).toBe('Readable task');
+    expect(task.querySelector('small')?.textContent).toBe('T7');
+    fireEvent.click(screen.getByRole('button', { name: 'Cx6 (deck_sub_worker)' }));
+    expect(navigate).toHaveBeenCalledWith('deck_sub_worker');
+    window.removeEventListener('deck:navigate', listener);
   });
 
   it('marks a held verdict and an unusual event, and names the daemon', () => {
@@ -86,6 +103,48 @@ describe('TaskPairEventChip workspace events', () => {
       expect(taskPair.output_saved).toContain('{{path}}');
       expect(taskPair.output_failed).toContain('{{reason}}');
     }
+  });
+});
+describe('TaskPairStatusPanel', () => {
+  afterEach(() => cleanup());
+  it('groups live pair state, keeps counts while collapsed, and persists collapse', () => {
+    const events = [
+      { eventId: 'p1', type: 'task_pair.event', ts: Date.now() - 2_000, payload: { taskId: 'T1', title: 'Build panel', toStatus: 'working', executor: 'deck_sub_w', executorLabel: 'Cx6', round: 1 } },
+      { eventId: 'p2', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'T2', title: 'Audit panel', toStatus: 'in_audit', auditor: 'deck_sub_a', auditorLabel: 'CC2', round: 2 } },
+    ] as never;
+    render(<TaskPairStatusPanel events={events} />);
+    expect(screen.getByText('Build panel')).toBeTruthy();
+    expect(screen.getByText('Cx6 (deck_sub_w)')).toBeTruthy();
+    expect(screen.getByText('CC2 (deck_sub_a)')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: /taskPair.panel_title/ }));
+    expect(screen.queryByText('Build panel')).toBeNull();
+    expect(screen.getByText(/taskPair.panel_counts/)).toBeTruthy();
+    expect(window.localStorage.getItem('imcodes.task-pair-status-panel.collapsed')).toBe('1');
+  });
+
+  it('shows queued pairs in queue order with assignment fallback and urgency', () => {
+    window.localStorage.removeItem('imcodes.task-pair-status-panel.collapsed');
+    const events = [
+      { eventId: 'q1', type: 'task_pair.event', ts: Date.now() - 5_000, payload: { taskId: 'Q1', title: 'Urgent queued', toStatus: 'queued', queuePosition: 1, urgent: true, executor: 'deck_sub_e', executorLabel: 'Cx6' } },
+      { eventId: 'q2', type: 'task_pair.event', ts: Date.now() - 2_000, payload: { taskId: 'Q2', title: 'Second queued', toStatus: 'queued', queuePosition: 2 } },
+    ] as never;
+    render(<TaskPairStatusPanel events={events} />);
+    expect(screen.getByText(/Urgent queued/)).toBeTruthy();
+    expect(screen.getByText(/Second queued/)).toBeTruthy();
+    expect(screen.getByText('Cx6 (deck_sub_e)')).toBeTruthy();
+    expect(screen.getAllByText(/taskPair.panel_unassigned/).length).toBeGreaterThan(0);
+    expect(screen.getByText('!')).toBeTruthy();
+  });
+
+  it('renders an authoritative console snapshot even when chat history has no pair events', async () => {
+    render(<TaskPairStatusPanel events={[]} />);
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: {
+      tasks: [{ taskId: 'S1', title: 'Snapshot task', updatedAt: Date.now(), pair: { status: 'queued', createdAt: Date.now() - 4_000, executor: 'deck_sub_e', urgent: true, queueOrder: 1 } }],
+      assignments: [{ taskId: 'S1', role: 'implementer', ownerSessionName: 'deck_sub_e', ownerSessionLabel: 'Cx6', sessionState: 'running' }],
+    } }));
+    await waitFor(() => expect(screen.getByText('Snapshot task')).toBeTruthy());
+    expect(screen.getByText('Cx6 (deck_sub_e)')).toBeTruthy();
+    expect(screen.getByText('!')).toBeTruthy();
   });
 });
 

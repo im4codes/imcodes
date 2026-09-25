@@ -11,7 +11,7 @@
  * throw at a named boundary and assert the durable state that results, which is
  * the only way to show the transaction actually holds.
  */
-import { TASK_PAIR_CONSOLE_LEGACY_STATUS, TASK_PAIR_NO_AUDITOR } from '../../shared/task-pair.js';
+import { compareQueuedTaskPairs, TASK_PAIR_CONSOLE_LEGACY_STATUS, TASK_PAIR_NO_AUDITOR } from '../../shared/task-pair.js';
 import { getTaskPairStore } from './task-pairs/store.js';
 import { isPairsEngineProject } from './task-pairs/engine.js';
 import {
@@ -588,7 +588,19 @@ export class SupervisionConsoleProducer {
   readPairRows(projectName: string): { tasks: SupervisionTaskConsoleTaskRow[]; assignments: SupervisionTaskConsoleAssignmentRow[] } {
     const tasks: SupervisionTaskConsoleTaskRow[] = [];
     const assignments: SupervisionTaskConsoleAssignmentRow[] = [];
-    for (const stored of getTaskPairStore().listPairs(projectName)) {
+    const pairs = getTaskPairStore().listPairs(projectName);
+    const queuePositions = new Map<string, number>();
+    const byBrain = new Map<string, typeof pairs>();
+    for (const stored of pairs) {
+      if (stored.state.status !== 'queued') continue;
+      const group = byBrain.get(stored.state.brain) ?? [];
+      group.push(stored);
+      byBrain.set(stored.state.brain, group);
+    }
+    for (const queued of byBrain.values()) {
+      queued.sort(compareQueuedTaskPairs).forEach((stored, index) => queuePositions.set(stored.state.taskId, index + 1));
+    }
+    for (const stored of pairs) {
       const pair = stored.state;
       const status = TASK_PAIR_CONSOLE_LEGACY_STATUS[pair.status];
       const phase = supervisionConsoleStatusGroup(status);
@@ -614,6 +626,12 @@ export class SupervisionConsoleProducer {
           ...(pair.auditor ? { auditor: pair.auditor } : {}),
           round: pair.round,
           blocking: [...pair.blocking],
+          createdAt: pair.createdAt,
+          queueOrder: stored.queueOrder,
+          ...(queuePositions.has(pair.taskId) ? { queuePosition: queuePositions.get(pair.taskId) } : {}),
+          ...(pair.urgent ? { urgent: true } : {}),
+          ...(pair.executor ? (() => { const p = this.#resolveSessionPresentation?.(pair.executor!, pair.updatedAt); return { executorLabel: p?.label, executorState: p?.state }; })() : {}),
+          ...(pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? (() => { const p = this.#resolveSessionPresentation?.(pair.auditor!, pair.updatedAt); return { auditorLabel: p?.label, auditorState: p?.state }; })() : {}),
           ...(pair.lastVerdict ? { severityCounts: { ...pair.lastVerdict.counts }, lastVerdict: pair.lastVerdict.verb } : {}),
         },
       });

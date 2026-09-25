@@ -115,7 +115,7 @@ import {
 } from '@shared/agent-delegation.js';
 import { parseTimelineDisplayText } from '../timeline-display-text.js';
 import { TASK_PAIR_TIMELINE_EVENT } from '@shared/task-pair.js';
-import { TaskPairEventChip } from './TaskPairEventChip.js';
+import { TaskPairStatusPanel } from './TaskPairStatusPanel.js';
 import {
   MESSAGE_PIN_LIMITS,
   isMessagePinEventType,
@@ -3743,6 +3743,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
             <span class="chat-pinned-last-sent-text">{pinnedPreviewText}</span>
           </div>
         )}
+        {!preview && !!sessionId && !sessionId.includes('deck_sub_') && <TaskPairStatusPanel events={events} />}
         <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} style={chatFontStyle} onScroll={preview ? undefined : handleScroll}
           onWheel={preview ? undefined : handleWheel}
           onTouchStart={preview ? undefined : handleTouchStart}
@@ -5110,7 +5111,7 @@ const ChatEvent = memo(function ChatEvent({
       return null;
 
     case TASK_PAIR_TIMELINE_EVENT:
-      return <TaskPairEventChip eventId={event.eventId} payload={event.payload} />;
+      return null;
 
     case AGENT_DELEGATION_REPLY_TIMELINE_EVENT: {
       const source = String(event.payload.sourceLabel ?? event.payload.sourceSessionName ?? '—');

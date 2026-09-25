@@ -892,6 +892,8 @@ export interface SupervisionTaskScopeReconciliation {
 }
 
 export interface SupervisionTaskMetadata {
+  /** Optional human-readable title shown before the protocol task id. */
+  title?: string | null;
   topLevelTaskId?: string | null;
   taskId?: string | null;
   /** Exact existing assignment for an append-only task continuation. */

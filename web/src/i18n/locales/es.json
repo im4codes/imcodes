@@ -4326,7 +4326,8 @@
       "rework": "Rehacer",
       "passed": "Aprobada",
       "done": "Terminada",
-      "cancelled": "Cancelada"
+      "cancelled": "Cancelada",
+      "rework_round": "Revisión ronda {{round}}"
     },
     "flag": {
       "blocked": "Bloqueada",
@@ -4367,6 +4368,18 @@
     "output_saved": "Entregable guardado en {{path}}",
     "output_failed": "Entregable no guardado ({{reason}})",
     "workspace_removed": "Espacio de trabajo eliminado",
-    "workspace_kept": "Espacio de trabajo conservado: aún tiene trabajo sin guardar"
+    "workspace_kept": "Espacio de trabajo conservado: aún tiene trabajo sin guardar",
+    "panel_title": "Estado de tareas",
+    "panel_counts": "En ejecución {{working}} · En auditoría {{audit}} · En cola {{queued}}",
+    "panel_elapsed": "Transcurrido {{seconds}} s",
+    "panel_round": "Ronda {{round}}",
+    "panel_group_working": "En ejecución",
+    "panel_group_audit": "En auditoría",
+    "panel_group_rework": "Rehacer",
+    "panel_group_queued": "En cola",
+    "panel_group_recent": "Completadas",
+    "panel_queued": "En cola hace {{seconds}} s",
+    "panel_unassigned": "Sin asignar",
+    "panel_started": "Inicio {{time}}"
   }
 }

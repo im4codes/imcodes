@@ -14452,3 +14452,32 @@ button.quick-agent-delegation-preset.active {
   padding: 0 6px;
   border: 1px solid var(--warning-color, #c98a00);
 }
+.task-pair-status-panel {
+  position: absolute; z-index: 12; top: 0; right: 0; bottom: 0; width: min(300px, 30vw); max-width: 300px;
+  width: min(300px, 100%);
+  max-width: 300px;
+  margin-left: auto;
+  background: color-mix(in srgb, var(--panel-bg, var(--surface-2)) 92%, var(--chrome-accent) 8%);
+  border-left: 1px solid var(--status-info-border, var(--chrome-accent));
+  box-shadow: -4px 0 18px color-mix(in srgb, var(--chrome-accent) 12%, transparent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.chat-view-wrap:has(.task-pair-status-panel) .chat-view { padding-right: min(312px, calc(30vw + 12px)); }
+@media (max-width: 720px) {
+  .task-pair-status-panel { position: relative; inset: auto; width: 100%; max-width: none; max-height: 42vh; }
+  .chat-view-wrap:has(.task-pair-status-panel) .chat-view { padding-right: 12px; }
+}
+.task-pair-status-toggle { width: 100%; display: flex; justify-content: space-between; gap: 8px; padding: 8px; color: inherit; background: transparent; border: 0; text-align: left; }
+.task-pair-status-rows { max-height: 360px; overflow: auto; padding: 0 8px 8px; }
+.task-pair-status-group { margin: 0 0 4px; }
+.task-pair-status-group h4 { margin: 5px 0 0; padding-top: 3px; border-top: 1px solid color-mix(in srgb, currentColor 22%, transparent); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; opacity: .78; }
+.task-pair-status-group h4 small { font-family: ui-monospace, SFMono-Regular, monospace; opacity: .7; }
+.task-pair-status-urgent { display: inline-block; width: 14px; margin-left: 4px; border-radius: 3px; color: var(--status-error-text, #f87171); border: 1px solid currentColor; text-align: center; font-weight: 700; }
+.task-pair-status-row { display: grid; gap: 2px; padding: 6px 0; border-top: 1px solid color-mix(in srgb, currentColor 18%, transparent); font-size: 11px; }
+.task-pair-status-row strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.task-pair-status-row small { opacity: .62; }
+.task-pair-status-row span { color: var(--status-info-text, #67e8f9); }
+.task-pair-status-session { margin-right: 6px; padding: 0; border: 0; background: transparent; color: inherit; text-decoration: underline; cursor: pointer; font: inherit; font-size: 10px; }
+.task-pair-status-dot { display: inline-block; width: 5px; height: 5px; margin: 0 3px 1px 0; border-radius: 50%; background: var(--supervision-idle-text, #94a3b8); }
+.task-pair-status-dot.is-running { background: var(--status-active-text, #4ade80); box-shadow: 0 0 5px var(--status-active-text, #4ade80); animation: task-pair-status-pulse 1.4s ease-in-out infinite; }
+@keyframes task-pair-status-pulse { 50% { opacity: .45; } }

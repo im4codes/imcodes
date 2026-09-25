@@ -91,6 +91,15 @@ describe('task-pair marker ingestion', () => {
     expect(seen[0]?.payload).toMatchObject({ taskId: 'T1', verb: 'DISPATCH', toStatus: 'working', role: 'brain', source: 'marker' });
   });
 
+  it('keeps DISPATCH deduplication independent per executor target', () => {
+    for (const [taskId, target] of [['D1', EXEC], ['D2', PROC]] as const) {
+      service.applyMarker({ project: PROJECT, writer: BRAIN, marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId, attrs: { executor: target, auditor: AUD } }, source: 'marker', now: Date.now(), eventId: `dedup-${taskId}` });
+    }
+    expect(service.recentBrainDispatch(PROJECT, BRAIN, EXEC)).toBe('D1');
+    expect(service.recentBrainDispatch(PROJECT, BRAIN, PROC)).toBe('D2');
+    expect(service.recentBrainDispatch(PROJECT, BRAIN, EXEC)).toBeUndefined();
+  });
+
   it('ingests after the emit returns, off the relay call stack', async () => {
     timelineEmitter.emit(BRAIN, 'assistant.text', {
       text: `<!-- IMCODES_TASK DISPATCH T12 executor=${EXEC} auditor=${AUD} -->`, streaming: false,

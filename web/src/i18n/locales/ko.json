@@ -4325,7 +4325,8 @@
       "rework": "재작업",
       "passed": "통과",
       "done": "완료",
-      "cancelled": "취소됨"
+      "cancelled": "취소됨",
+      "rework_round": "재작업 {{round}}차"
     },
     "flag": {
       "blocked": "막힘",
@@ -4366,6 +4367,18 @@
     "output_saved": "결과물을 {{path}}에 저장했습니다",
     "output_failed": "결과물이 저장되지 않았습니다 ({{reason}})",
     "workspace_removed": "작업 공간을 삭제했습니다",
-    "workspace_kept": "작업 공간을 유지했습니다: 저장되지 않은 작업이 있습니다"
+    "workspace_kept": "작업 공간을 유지했습니다: 저장되지 않은 작업이 있습니다",
+    "panel_title": "작업 상태",
+    "panel_counts": "실행 중 {{working}} · 감사 중 {{audit}} · 대기 {{queued}}",
+    "panel_elapsed": "경과 {{seconds}}초",
+    "panel_round": "{{round}}라운드",
+    "panel_group_working": "실행 중",
+    "panel_group_audit": "감사 중",
+    "panel_group_rework": "재작업",
+    "panel_group_queued": "대기열",
+    "panel_group_recent": "최근 완료",
+    "panel_queued": "대기 {{seconds}}초",
+    "panel_unassigned": "미할당",
+    "panel_started": "시작 {{time}}"
   }
 }
