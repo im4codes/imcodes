@@ -21,6 +21,7 @@ import { buildQueueProjectionEntry } from '../../shared/transport-queue-privacy.
 import { resolveTransportConversationKey } from '../agent/transport-resume-opts.js';
 import { getSession } from '../store/session-store.js';
 import { suppressSqliteExperimentalWarning } from '../util/suppress-sqlite-warning.js';
+import { assertNotRealImcodesPathInTests } from '../util/test-home-guard.js';
 
 const require = createRequire(import.meta.url);
 suppressSqliteExperimentalWarning();
@@ -231,6 +232,7 @@ export class TransportQueueStore {
       const dbPath = options.dbPath?.trim()
         || process.env.IMCODES_TRANSPORT_QUEUE_DB_PATH?.trim()
         || (process.env.VITEST ? ':memory:' : DEFAULT_DB_PATH);
+      assertNotRealImcodesPathInTests(dbPath, 'transport-queue.sqlite');
       if (dbPath !== ':memory:') mkdirSync(dirname(dbPath), { recursive: true });
       this.db = new DatabaseSync(dbPath);
       this.ownsDb = true;

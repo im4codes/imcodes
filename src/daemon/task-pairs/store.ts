@@ -21,6 +21,7 @@ import {
   type TaskPairState,
   type TaskPairStatus,
 } from '../../../shared/task-pair.js';
+import { assertNotRealImcodesPathInTests } from '../../util/test-home-guard.js';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
@@ -104,6 +105,7 @@ export class TaskPairStore {
   }
 
   constructor(dbPath: string = resolveTaskPairsDbPath()) {
+    assertNotRealImcodesPathInTests(dbPath, 'task-pairs.sqlite');
     if (dbPath !== ':memory:') mkdirSync(dirname(dbPath), { recursive: true });
     this.#db = new DatabaseSync(dbPath);
     this.#db.exec(`

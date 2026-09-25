@@ -108,6 +108,7 @@ import {
   isArchiveBackfillSchedulingEnabled,
   resetArchiveBackfillSchedulingForTests,
 } from './archive-backfill-scheduling.js';
+import { assertNotRealImcodesPathInTests } from '../util/test-home-guard.js';
 export { setArchiveBackfillSchedulingEnabled } from './archive-backfill-scheduling.js';
 
 function getDbPath(): string {
@@ -314,6 +315,7 @@ function backfillNamespaceFilterColumnsForDb(database: DatabaseSyncInstance): vo
 function ensureDb(): DatabaseSyncInstance {
   const dbPath = getDbPath();
   if (db && currentDbPath === dbPath) return db;
+  assertNotRealImcodesPathInTests(dbPath, 'shared-agent-context.sqlite');
   mkdirSync(dirname(dbPath), { recursive: true });
   db = new DatabaseSync(dbPath);
   currentDbPath = dbPath;

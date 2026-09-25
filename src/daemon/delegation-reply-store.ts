@@ -16,6 +16,7 @@ import {
   type AgentDelegationReplyStatus,
 } from '../../shared/agent-delegation.js';
 import { suppressSqliteExperimentalWarning } from '../util/suppress-sqlite-warning.js';
+import { assertNotRealImcodesPathInTests } from '../util/test-home-guard.js';
 
 const require = createRequire(import.meta.url);
 suppressSqliteExperimentalWarning();
@@ -209,6 +210,7 @@ export class DelegationReplyStore {
       const dbPath = options.dbPath?.trim()
         || process.env.IMCODES_DELEGATION_REPLY_DB_PATH?.trim()
         || (process.env.VITEST ? ':memory:' : DEFAULT_DB_PATH);
+      assertNotRealImcodesPathInTests(dbPath, 'delegation-replies.sqlite');
       if (dbPath !== ':memory:') mkdirSync(dirname(dbPath), { recursive: true });
       this.#db = new DatabaseSync(dbPath);
       this.#ownsDb = true;

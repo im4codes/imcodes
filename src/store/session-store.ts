@@ -17,6 +17,7 @@ import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import { EXECUTION_CLONE_KIND, type ExecutionCloneMetadata } from '../../shared/execution-clone.js';
 import { isMarkedSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
 import { emitSessionStateProbeCorrection } from './session-state-probe-events.js';
+import { assertNotRealImcodesPathInTests } from '../util/test-home-guard.js';
 
 const DEBOUNCE_MS = 500;
 const SESSION_STORE_DISK_VERSION = 2;
@@ -252,6 +253,24 @@ let writeTimerPath: string | null = null;
 let writeQueue: Promise<void> = Promise.resolve();
 let pendingWrite: Promise<void> | null = null;
 let store: SessionStore = { sessions: {} };
+/**
+ * Set once by the daemon after its startup load: from then on this process's
+ * in-memory store is the authority for sessions.json, and a read-only refresh
+ * (`loadStore({ probe: false })`, e.g. the in-daemon send_message target list)
+ * must never replace it with whatever happens to be on disk. Replacing it let a
+ * foreign/partial sessions.json silently wipe the daemon's live main sessions,
+ * which the daemon then persisted.
+ */
+let storeAuthoritative = false;
+
+export function markSessionStoreAuthoritative(): void {
+  storeAuthoritative = true;
+}
+
+/** Test seam: return to the non-authoritative (consumer) default. */
+export function resetSessionStoreAuthorityForTests(): void {
+  storeAuthoritative = false;
+}
 
 function isPersistableSessionRecord(record: SessionRecord): boolean {
   return !isKnownTestSessionLike({
@@ -340,6 +359,10 @@ export async function loadStore(options: LoadStoreOptions = {}): Promise<Session
   // a delayed startup probe must never write an old snapshot into the next
   // authority's sessions.json after that rotation.
   const targetPath = storePath();
+  assertNotRealImcodesPathInTests(targetPath, 'sessions.json');
+  // The authoritative owner already holds the newest state; a read-only refresh
+  // there is a no-op rather than a disk overwrite of live memory.
+  if (options.probe === false && storeAuthoritative) return store;
   await drainPendingWritesForRead();
   await mkdir(dirname(targetPath), { recursive: true });
   let loadedLegacySnapshot = false;
@@ -471,6 +494,9 @@ function scheduleWrite(targetPath = storePath()): void {
 }
 
 async function writeStoreToDisk(bestEffort: boolean, targetPath = storePath()): Promise<void> {
+  // Outside the best-effort catch on purpose: a test reaching the real store
+  // must fail loudly, never be swallowed as a lost write.
+  assertNotRealImcodesPathInTests(targetPath, 'sessions.json');
   try {
     await mkdir(dirname(targetPath), { recursive: true });
     await writeFile(targetPath, serializeStore(), 'utf8');

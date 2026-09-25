@@ -41,6 +41,7 @@ import {
   type SessionSupervisionSnapshot,
   type SupervisorDefaultConfig,
 } from '../../shared/supervision-config.js';
+import { assertNotRealImcodesPathInTests } from '../util/test-home-guard.js';
 
 const require = createRequire(import.meta.url);
 suppressSqliteExperimentalWarning();
@@ -59,6 +60,7 @@ let db: DatabaseSyncInstance | null = null;
 function getDb(): DatabaseSyncInstance {
   if (db) return db;
   const dbPath = resolveDbPath();
+  assertNotRealImcodesPathInTests(dbPath, 'supervisor-defaults-cache.sqlite');
   if (dbPath !== ':memory:') mkdirSync(dirname(dbPath), { recursive: true });
   const opened = new DatabaseSync(dbPath);
   opened.exec(`

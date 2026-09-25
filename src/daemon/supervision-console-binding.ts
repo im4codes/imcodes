@@ -21,6 +21,7 @@ import {
 import { isAuthorizedSupervisionProjectBrain } from './supervision-registry-port.js';
 import type { SupervisionTaskConsoleScope } from '../../shared/supervision-task-console.js';
 import type { SessionRecord } from '../store/session-store.js';
+import { assertNotRealImcodesPathInTests } from '../util/test-home-guard.js';
 
 export interface SupervisionConsoleLink {
   send(message: unknown): void;
@@ -130,6 +131,7 @@ export function createProductionSupervisionConsoleBinding(
   },
 ): ProductionSupervisionConsoleBinding {
   const databasePath = deps.databasePath ?? resolveSupervisionTaskRegistryDbPath();
+  assertNotRealImcodesPathInTests(databasePath, 'supervision-state.sqlite');
   const database = new DatabaseSync(databasePath);
   try {
     // Production uses the process-wide writer. Tests with an explicit path may

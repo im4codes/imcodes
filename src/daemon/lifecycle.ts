@@ -2,7 +2,7 @@ import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../shared/c
 import { taskPairService } from './task-pairs/service.js';
 import { taskPairAutomation } from './task-pairs/scheduler.js';
 import { getTaskPairStore } from './task-pairs/store.js';
-import { loadStore, flushStore, listSessions, getSession, upsertSession, removeSession, type SessionRecord } from '../store/session-store.js';
+import { loadStore, flushStore, listSessions, getSession, upsertSession, removeSession, markSessionStoreAuthoritative, type SessionRecord } from '../store/session-store.js';
 import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, setTransportSessionRestoredCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute, resyncTransportSessionStatesAfterLinkRestore } from '../agent/session-manager.js';
 import { sessionExists, isPaneAlive, BACKEND, killSession } from '../agent/tmux.js';
 import { detectRepo } from '../repo/detector.js';
@@ -595,6 +595,9 @@ export async function startup(): Promise<DaemonContext> {
   logger.info({ config: config.daemon }, 'Config loaded');
 
   await loadStore();
+  // From here the daemon's memory owns sessions.json; in-process refreshes must
+  // not replace it with a disk snapshot.
+  markSessionStoreAuthoritative();
   logger.info('Session store loaded');
   updateInstanceLockDiagnostics(lockServer, {
     sessionIds: listSessions().map((session) => session.name),

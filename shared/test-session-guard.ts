@@ -30,6 +30,11 @@ const SESSION_NAME_PATTERNS: RegExp[] = [
   // strictly to the TEST prefix `deck_sub_(e2e_)?execclone_` so REAL production
   // clones (random `deck_sub_<hex>` ids from subSessionName) are NEVER matched.
   /^deck_sub_(?:e2e_)?execclone_[a-z0-9_-]+$/i,
+  // test/daemon/task-pairs/pairs-workspace.test.ts fixtures.
+  /^deck_wtproj_brain$/i,
+  /^deck_sub_wt(?:exec|aud)$/i,
+  // test/e2e/daemon-reconnect.test.ts persistence check (tmux sessions).
+  /^persistcheck_[a-z0-9]+_(brain|w\d+)$/i,
 ];
 
 const PROJECT_NAME_PATTERNS: RegExp[] = [
@@ -47,6 +52,8 @@ const PROJECT_NAME_PATTERNS: RegExp[] = [
   /^imcodes-test-p2p-workflow[-_]/i,
   /^p2pworkflow[a-z0-9-]+$/i,
   /^e2e[-_]/i,
+  /^wtproj$/i,
+  /^persistcheck_[a-z0-9]+$/i,
 ];
 
 const PROJECT_DIR_PATTERNS: RegExp[] = [

@@ -101,6 +101,7 @@ import {
   type SupervisionIntegrationRefusal,
   type SupervisionIntegrationRemoteObservation,
 } from '../../shared/supervision-integration-finalization.js';
+import { assertNotRealImcodesPathInTests } from '../util/test-home-guard.js';
 
 const require = createRequire(import.meta.url);
 suppressSqliteExperimentalWarning();
@@ -323,6 +324,7 @@ export class SupervisionStateStore implements SupervisionWaitStateStore {
     } else {
       const dbPath = options.dbPath?.trim()
         || resolveSupervisionTaskRegistryDbPath();
+      assertNotRealImcodesPathInTests(dbPath, 'supervision-state.sqlite');
       if (dbPath !== ':memory:') mkdirSync(dirname(dbPath), { recursive: true });
       db = new DatabaseSync(dbPath);
       ownsDb = true;
@@ -1949,6 +1951,7 @@ export class SupervisionTaskRegistry {
     else {
       const dbPath = options.dbPath?.trim()
         || resolveSupervisionTaskRegistryDbPath();
+      assertNotRealImcodesPathInTests(dbPath, 'supervision-state.sqlite');
       if (dbPath !== ':memory:') mkdirSync(dirname(dbPath), { recursive: true });
       this.#db = withNestedTransactions(new DatabaseSync(dbPath));
       this.#ownsDb = true;

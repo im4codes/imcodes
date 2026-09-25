@@ -17,6 +17,7 @@ import type {
 } from './timeline-history-worker-types.js';
 import { TIMELINE_HISTORY_WORKER_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
 import { TIMELINE_RESPONSE_SOURCES } from '../../shared/timeline-protocol.js';
+import { assertNotRealImcodesPathInTests } from '../util/test-home-guard.js';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
@@ -31,6 +32,7 @@ let db: DatabaseSyncInstance | null = null;
 
 function ensureDb(): DatabaseSyncInstance {
   if (db) return db;
+  assertNotRealImcodesPathInTests(dbPath, 'timeline.sqlite');
   const instance = new DatabaseSync(dbPath, { readOnly: true });
   // The read worker previously opened the DB with NO pragmas: a single
   // SQLITE_BUSY (writer checkpointing the WAL) made the query throw, the pool
