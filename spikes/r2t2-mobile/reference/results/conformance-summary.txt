@@ -1,0 +1,6 @@
+zh_upstream_test.Chinese         IDENTICAL steps=42  final=之前有顾客自己带酒水也没加收钱或者不让喝。
+zh_upstream_test.auto            IDENTICAL steps=42  final=之前有顾客自己带酒水也没加收钱或者不让喝。
+en_tts.English                   IDENTICAL steps=32  final=The quarterly report is due on Friday, so please send me your numbers by Wednesday afternoon.
+en_tts.auto                      IDENTICAL steps=32  final=The quarterly report is due on Friday, so please send me your numbers by Wednesday afternoon.
+zh_quiet_onset.Chinese           IDENTICAL steps=45  final=之前有顾客自己带酒水，也没加收钱或者不让喝。
+conformance: 5 identical, 0 different
