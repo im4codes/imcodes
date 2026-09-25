@@ -53,6 +53,8 @@ export const MCP_TOOL_GROUPS: readonly McpToolGroupDefinition[] = Object.freeze(
     summary: 'Delegate work, report audits, and operate the supervised task lifecycle.',
     tools: Object.freeze([
       MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE, MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
+      MEMORY_MCP_TOOL_NAMES.PAIR_LIST, MEMORY_MCP_TOOL_NAMES.PAIR_GET,
+      MEMORY_MCP_TOOL_NAMES.PAIR_SET_MAX_CONCURRENCY, MEMORY_MCP_TOOL_NAMES.PAIR_GET_MAX_CONCURRENCY,
       MEMORY_MCP_TOOL_NAMES.SEND_STOP, MEMORY_MCP_TOOL_NAMES.SESSION_RESTART,
       MEMORY_MCP_TOOL_NAMES.SESSION_MODEL,
       MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY,
@@ -151,6 +153,10 @@ export const MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE: readonly string[] = Object.freez
   // delegation + audit receipts
   MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
   MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS,
+  // Pair inspection/config (pair_list, pair_get, pair max-concurrency) stays
+  // out of the always-active bootstrap: it would push the dynamic catalog
+  // over MCP_TOOL_SURFACE_BOOTSTRAP_BUDGET_BYTES. It remains discoverable via
+  // group:supervision below.
   MEMORY_MCP_TOOL_NAMES.SEND_STOP,
   // Session recovery is a core control-plane action. It must be callable from
   // the first tools/list generation, including when the target session is too

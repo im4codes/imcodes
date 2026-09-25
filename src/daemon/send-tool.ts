@@ -180,6 +180,7 @@ import {
   supervisionBundleMatchesAssignmentScope,
 } from './supervision-integration-scope.js';
 import { getTransportQueueStore } from './transport-queue-store.js';
+import { sessionActivityOf } from './session-activity.js';
 import type { QueueSupervisionReference } from '../../shared/transport-queue-types.js';
 import {
   SESSION_IDENTITY_SCOPES,
@@ -251,6 +252,11 @@ export interface SendTargetInfo {
   qwenModel?: string;
   status: SessionRecord['state'];
   lastActiveAt: number;
+  /** Latest participant-authored message and provider tool-call activity. */
+  lastMessageAt?: number;
+  lastToolCallAt?: number;
+  /** Open task-pair memberships, projected without provider calls. */
+  openPairs?: Array<{ taskId: string; role: 'brain' | 'executor' | 'auditor'; status: string; round: number; title?: string }>;
   /**
    * Whether this target can actually take work right now.
    *
@@ -5786,6 +5792,16 @@ function toTargetInfo(
   const requestedModel = optionalModelField(s.requestedModel);
   const modelDisplay = optionalModelField(s.modelDisplay);
   const qwenModel = optionalModelField(s.qwenModel);
+  const activity = sessionActivityOf(s.name);
+  const openPairs = getTaskPairStore().pairsForSession(s.name)
+    .filter((pair) => pair.state.brain === s.name || pair.state.executor === s.name || pair.state.auditor === s.name)
+    .map((pair) => ({
+      taskId: pair.state.taskId,
+      role: (pair.state.brain === s.name ? 'brain' : pair.state.executor === s.name ? 'executor' : 'auditor') as 'brain' | 'executor' | 'auditor',
+      status: pair.state.status,
+      round: pair.state.round,
+      ...(pair.state.title ? { title: pair.state.title } : {}),
+    }));
   return {
     target: s.name,
     label: s.label ?? null,
@@ -5799,6 +5815,9 @@ function toTargetInfo(
     ...(qwenModel ? { qwenModel } : {}),
     status: s.state,
     lastActiveAt: s.updatedAt,
+    ...(activity?.lastMessageAt === undefined ? {} : { lastMessageAt: activity.lastMessageAt }),
+    ...(activity?.lastToolCallAt === undefined ? {} : { lastToolCallAt: activity.lastToolCallAt }),
+    ...(openPairs.length === 0 ? {} : { openPairs }),
     providerFamily: resolvePeerAuditProviderFamily(s),
     availability: availability.availability,
     ...(eligiblePools === undefined ? {} : {

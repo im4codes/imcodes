@@ -192,6 +192,9 @@ import { ALIAS_DESCRIPTION_MAX, ALIAS_MCP_TOOLS, toAliasMetadata, type AliasMcpT
 import { mapLegacySupervisionUpdate, mapLegacySupervisionFinish } from './supervision-compat-shims.js';
 import { resolveSupervisionIntent } from './supervision-intent-ops.js';
 import { supervisionCallerParticipates } from './supervision-mcp-tools.js';
+import { getTaskPairStore } from './task-pairs/store.js';
+import type { StoredTaskPair } from './task-pairs/store.js';
+import { compareQueuedTaskPairs, type TaskPairState } from '../../shared/task-pair.js';
 import {
   aliasMcpList,
   aliasMcpResolve,
@@ -1536,6 +1539,57 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       return combined;
     },
   });
+  const pairCallerContext = async (): Promise<
+    { status: 'ok'; project: string; sessions: SessionRecord[] } | { status: 'error'; result: ToolResult }
+  > => {
+    if (!caller.sessionName) return { status: 'error', result: error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'bound caller session is unavailable') };
+    const sessions = await sendSessions();
+    const record = sessions.find((session) => session.name === caller.sessionName);
+    if (!record) return { status: 'error', result: error(MCP_ERROR_REASONS.IDENTITY_REJECTED, 'live caller session is unavailable') };
+    const project = resolveEffectiveProjectName(record, sessions) ?? record.projectName;
+    if (!project) return { status: 'error', result: error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'caller project is unavailable') };
+    return { status: 'ok', project, sessions };
+  };
+  const pairParticipant = (sessionName: string | undefined, sessions: SessionRecord[]) => {
+    if (!sessionName || sessionName === 'none') return null;
+    const record = sessions.find((session) => session.name === sessionName);
+    return {
+      session: sessionName,
+      label: record?.label ?? null,
+      state: record?.state ?? 'unknown',
+    };
+  };
+  // 1-based position within the same urgent-first, then-FIFO order the
+  // scheduler dispatches queued pairs in (compareQueuedTaskPairs). Built once
+  // per call over every queued pair the caller can see; absent (not queued)
+  // pairs are simply not in the map.
+  const queuePositionsOf = (pairs: StoredTaskPair[]): Map<string, number> => {
+    const queued = pairs.filter((pair) => pair.state.status === 'queued').sort(compareQueuedTaskPairs);
+    return new Map(queued.map((pair, index) => [pair.state.taskId, index + 1]));
+  };
+  const pairProjection = (
+    stored: StoredTaskPair,
+    sessions: SessionRecord[],
+    queuePositions: Map<string, number> = new Map(),
+  ) => {
+    const state = stored.state;
+    return {
+      taskId: state.taskId,
+      title: state.title ?? null,
+      status: state.status,
+      round: state.round,
+      blocking: state.blocking,
+      executor: pairParticipant(state.executor, sessions),
+      auditor: pairParticipant(state.auditor, sessions),
+      queuePosition: state.status === 'queued' ? (queuePositions.get(state.taskId) ?? null) : null,
+      urgent: (state as TaskPairState & { urgent?: boolean }).urgent === true,
+      queuedAt: state.createdAt,
+      startedAt: state.status === 'queued' ? null : state.createdAt,
+      updatedAt: state.updatedAt,
+      flags: state.flags,
+      brief: state.brief ?? null,
+    };
+  };
   // Orchestrated path is the production wiring; the legacy `getMemorySources`
   // dep is retained for tests that only want to verify the local SQLite
   // branch without involving cache/cloud resolution.
@@ -2427,6 +2481,58 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       }, sendDepsWithSessions(sessions, {
         isDispatchEnabled: () => deps.sendDeps?.isDispatchEnabled?.() ?? true,
       })) as unknown as ToolResult;
+    },
+    [MEMORY_MCP_TOOL_NAMES.PAIR_LIST]: async (input) => {
+      const context = await pairCallerContext();
+      if (context.status === 'error') return context.result;
+      const args = pickAllowedMcpArgs(input, ['includeFinished', 'limit']);
+      const includeFinished = boolArg(args, 'includeFinished') === true;
+      const limit = Math.min(500, Math.max(1, Math.floor(numberArg(args, 'limit') ?? 200)));
+      const pairs = getTaskPairStore().listPairsForBrain(caller.sessionName!, context.project, includeFinished, limit);
+      const queuePositions = queuePositionsOf(pairs);
+      // The store already groups queued pairs first; re-sort just that
+      // prefix into dispatch order so pair_list's order matches
+      // queuePosition and what the scheduler will actually start next.
+      const queued = pairs.filter((pair) => pair.state.status === 'queued').sort(compareQueuedTaskPairs);
+      const rest = pairs.filter((pair) => pair.state.status !== 'queued');
+      const ordered = [...queued, ...rest];
+      return { status: 'ok', pairs: ordered.map((pair) => pairProjection(pair, context.sessions, queuePositions)) };
+    },
+    [MEMORY_MCP_TOOL_NAMES.PAIR_GET]: async (input) => {
+      const context = await pairCallerContext();
+      if (context.status === 'error') return context.result;
+      const args = pickAllowedMcpArgs(input, ['taskId', 'eventLimit']);
+      const taskId = stringArg(args, 'taskId');
+      if (!taskId) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'taskId is required');
+      const stored = getTaskPairStore().getPair(context.project, taskId);
+      if (!stored || stored.state.brain !== caller.sessionName) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'pair not found');
+      const eventLimit = Math.min(200, Math.max(1, Math.floor(numberArg(args, 'eventLimit') ?? 50)));
+      const queuePositions = stored.state.status === 'queued'
+        ? queuePositionsOf(getTaskPairStore().listPairsForBrain(caller.sessionName!, context.project, false, 500))
+        : new Map<string, number>();
+      return {
+        status: 'ok',
+        pair: {
+          ...pairProjection(stored, context.sessions, queuePositions),
+          events: getTaskPairStore().listEvents(context.project, taskId, eventLimit),
+        },
+      };
+    },
+    [MEMORY_MCP_TOOL_NAMES.PAIR_SET_MAX_CONCURRENCY]: async (input) => {
+      const context = await pairCallerContext();
+      if (context.status === 'error') return context.result;
+      const args = pickAllowedMcpArgs(input, ['maxConcurrency']);
+      const maxConcurrency = numberArg(args, 'maxConcurrency');
+      if (!maxConcurrency || !Number.isInteger(maxConcurrency) || maxConcurrency < 1 || maxConcurrency > 100) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'maxConcurrency must be an integer from 1 to 100');
+      }
+      getTaskPairStore().setMaxConcurrency(caller.sessionName!, maxConcurrency);
+      return { status: 'ok', maxConcurrency };
+    },
+    [MEMORY_MCP_TOOL_NAMES.PAIR_GET_MAX_CONCURRENCY]: async () => {
+      const context = await pairCallerContext();
+      if (context.status === 'error') return context.result;
+      return { status: 'ok', maxConcurrency: getTaskPairStore().getMaxConcurrency(caller.sessionName!) };
     },
     [MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]: async (input) => {
       if (input && typeof input === 'object' && !Array.isArray(input) && Object.keys(input as Record<string, unknown>).length > 0) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'session_runtime_identity_get takes no arguments');
@@ -3643,6 +3749,18 @@ const schemas = {
     executionPool: z.enum(SUPERVISION_EXECUTION_POOL_KINDS).optional()
       .describe('Optional primary/economy filter; omit for all siblings.'),
   }),
+  [MEMORY_MCP_TOOL_NAMES.PAIR_LIST]: z.object({
+    includeFinished: z.boolean().optional(),
+    limit: z.number().int().min(1).max(500).optional(),
+  }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.PAIR_GET]: z.object({
+    taskId: z.string().min(1),
+    eventLimit: z.number().int().min(1).max(200).optional(),
+  }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.PAIR_SET_MAX_CONCURRENCY]: z.object({
+    maxConcurrency: z.number().int().min(1).max(100).describe('Durable pair concurrency limit.'),
+  }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.PAIR_GET_MAX_CONCURRENCY]: z.object({}).strict(),
   [MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]: z.object({}).strict(),
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: z.object({
     target: z.string().optional().describe('Exact target; omit only for autoProvision.'),

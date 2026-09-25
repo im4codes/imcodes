@@ -288,6 +288,23 @@ describe('task-pair state machine', () => {
     expect(apply(withStatus('done'), EXEC, '<!-- IMCODES_TASK DONE T42 -->')).toMatchObject({ effect: 'recorded' });
   });
 
+  it('never lets a participant revive a cancelled pair; only the Brain or daemon can', () => {
+    const cancelled = withStatus('cancelled');
+    for (const [writer, line] of [
+      [EXEC, '<!-- IMCODES_TASK STARTED T42 -->'],
+      [EXEC, '<!-- IMCODES_TASK WORKING T42 -->'],
+      [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 -->'],
+      [AUD, '<!-- IMCODES_TASK REWORK T42 blocking=P0 p0=1 -->'],
+    ] as const) {
+      const result = apply(cancelled, writer, line);
+      expect(result.pair?.status ?? cancelled.status, `${writer} ${line}`).toBe('cancelled');
+      expect(result.effect).toBe('recorded');
+    }
+    // The Brain (and the daemon, its equivalent) can still revive it explicitly.
+    expect(apply(cancelled, BRAIN, `<!-- IMCODES_TASK DISPATCH T42 executor=${EXEC} auditor=${AUD} -->`).pair?.status).toBe('working');
+    expect(apply(cancelled, BRAIN, '<!-- IMCODES_TASK QUEUE T42 title="retry" -->').pair?.status).toBe('queued');
+  });
+
   it('sets and clears side flags on progress', () => {
     const blocked = apply(withStatus('working'), EXEC, '<!-- IMCODES_TASK BLOCKED T42 note="need DB creds" -->').pair!;
     expect(blocked.flags).toContain('blocked');

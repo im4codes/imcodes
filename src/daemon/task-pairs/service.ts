@@ -80,20 +80,25 @@ export class TaskPairService {
   init(): void {
     if (this.#unsubscribe) return;
     this.#unsubscribe = timelineEmitter.on((event) => {
-      // Cheap filter inline; all store work runs after the emit returns, off
-      // the relay/watcher call stack (design D3). Replays stay idempotent.
+      // Activity is stamped synchronously so a heartbeat cannot race a just
+      // emitted message/tool event. Marker parsing remains deferred off the
+      // provider/watcher call stack.
       if (event.type === 'session.state') {
         noteTaskPairProviderError(event);
-        return;
-      }
-      if (event.type !== 'assistant.text') return;
-      setImmediate(() => {
-        try {
-          this.handleTimelineEvent(event);
-        } catch (error) {
-          logger.warn({ err: error, session: event.sessionId }, 'task-pair: marker ingestion failed');
+      } else if (event.type === 'user.message' || event.type === 'tool.call' || event.type === 'tool.result') {
+        if (!(event.type === 'user.message' && (event.payload as Record<string, unknown>).automation === true)) {
+          this.recordActivity(event.sessionId, event.ts ?? Date.now());
         }
-      });
+      } else if (event.type === 'assistant.text') {
+        this.recordActivity(event.sessionId, event.ts ?? Date.now());
+        setImmediate(() => {
+          try {
+            this.handleTimelineEvent(event);
+          } catch (error) {
+            logger.warn({ err: error, session: event.sessionId }, 'task-pair: marker ingestion failed');
+          }
+        });
+      }
     });
   }
 
@@ -286,10 +291,38 @@ export class TaskPairService {
     if (pair) this.#stampProgress(pair, writer, now);
   }
 
+  /** Record non-marker activity for every open pair the participant owns. */
+  recordActivity(writer: string, now: number): void {
+    const pairs = getTaskPairStore().pairsForSession(writer)
+      .filter((pair) => TASK_PAIR_OPEN_STATUSES.includes(pair.state.status));
+    for (const pair of pairs) this.#stampActivity(pair, writer, now);
+  }
+
   #stampProgress(pair: StoredTaskPair, writer: string, now: number): void {
     const liveness = { ...pair.liveness };
-    if (pair.state.executor === writer) { liveness.progressExecutorAt = now; liveness.silenceExecutor = 0; }
-    if (pair.state.auditor === writer) { liveness.progressAuditorAt = now; liveness.silenceAuditor = 0; }
+    if (pair.state.executor === writer) {
+      liveness.progressExecutorAt = now;
+      liveness.activityExecutorAt = now;
+      liveness.silenceExecutor = 0;
+    }
+    if (pair.state.auditor === writer) {
+      liveness.progressAuditorAt = now;
+      liveness.activityAuditorAt = now;
+      liveness.silenceAuditor = 0;
+    }
+    getTaskPairStore().saveLiveness(pair.project, pair.state.taskId, liveness);
+  }
+
+  #stampActivity(pair: StoredTaskPair, writer: string, now: number): void {
+    const liveness = { ...pair.liveness };
+    if (pair.state.executor === writer) {
+      liveness.activityExecutorAt = now;
+      liveness.silenceExecutor = 0;
+    }
+    if (pair.state.auditor === writer) {
+      liveness.activityAuditorAt = now;
+      liveness.silenceAuditor = 0;
+    }
     getTaskPairStore().saveLiveness(pair.project, pair.state.taskId, liveness);
   }
 
@@ -301,11 +334,17 @@ export class TaskPairService {
   ): TaskPairLiveness {
     const next: TaskPairLiveness = liveness
       ? { ...liveness, notified: [...liveness.notified] }
-      : { silenceExecutor: 0, silenceAuditor: 0, progressExecutorAt: now, progressAuditorAt: now, lastTickAt: now, notified: [] };
+      : { silenceExecutor: 0, silenceAuditor: 0, progressExecutorAt: now, progressAuditorAt: now, activityExecutorAt: now, activityAuditorAt: now, lastTickAt: now, notified: [] };
     if (role === 'executor') { next.progressExecutorAt = now; next.silenceExecutor = 0; }
     if (role === 'auditor') { next.progressAuditorAt = now; next.silenceAuditor = 0; }
+    if (role === 'executor') next.activityExecutorAt = now;
+    if (role === 'auditor') next.activityAuditorAt = now;
     // A new auditor starts with a clean slate.
-    if (transition.effect === 'reassigned_auditor') { next.silenceAuditor = 0; next.progressAuditorAt = now; }
+    if (transition.effect === 'reassigned_auditor') {
+      next.silenceAuditor = 0;
+      next.progressAuditorAt = now;
+      next.activityAuditorAt = now;
+    }
     return next;
   }
 

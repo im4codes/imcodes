@@ -23,6 +23,7 @@ import {
   TASK_PAIR_NO_AUDITOR,
   TASK_PAIR_OPEN_STATUSES,
   TASK_PAIR_SILENCE_LIMIT,
+  compareQueuedTaskPairs,
   isTerminalTaskPairStatus,
   taskPairSideToAct,
   type TaskPairFlag,
@@ -270,7 +271,40 @@ export class TaskPairAutomation implements TaskPairScheduler {
     }
     if (side === 'executor' && liveness.limitedExecutor) liveness.limitedExecutor = 0;
 
+    // A pair is stuck only when *both* participants have been quiet since the
+    // previous heartbeat. In that case the executor is the single owner of
+    // forward progress, regardless of the nominal side-to-act derived from
+    // the pair status (including an audit that has gone quiet before its
+    // materials arrived). One nudge per heartbeat escalates exactly once.
+    const executor = pair.executor;
+    const auditor = pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? pair.auditor : undefined;
+    const executorQuiet = Boolean(executor)
+      && !this.#busy(executor!)
+      && (liveness.activityExecutorAt ?? liveness.progressExecutorAt) <= previousTick;
+    const auditorQuiet = Boolean(auditor)
+      && !this.#busy(auditor!)
+      && (liveness.activityAuditorAt ?? liveness.progressAuditorAt) <= previousTick;
+    const executorFlagged = pair.flagSides.blocked === 'executor' || pair.flagSides.needs_input === 'executor';
+    const auditorFlagged = pair.flagSides.blocked === 'auditor' || pair.flagSides.needs_input === 'auditor';
+    if (executorQuiet && auditorQuiet && !executorFlagged && !auditorFlagged && !pair.flags.includes('executor_silent')) {
+      const silence = liveness.silenceExecutor + 1;
+      liveness.silenceExecutor = silence;
+      store.saveLiveness(stored.project, pair.taskId, liveness);
+      if (silence < TASK_PAIR_SILENCE_LIMIT) {
+        const repeat = silence > 1
+          ? `This is repeated quiet heartbeat ${silence}; take ownership now.`
+          : 'Both sides are idle; take ownership of the next action now.';
+        await sendTaskPairMessage(executor!, pair.taskId, 'nudge-executor', buildNudgeMessage(pair, 'executor', repeat));
+      } else if (silence === TASK_PAIR_SILENCE_LIMIT) {
+        this.#escalateExecutor(stored.project, pair.taskId, `both executor and auditor were silent for ${TASK_PAIR_SILENCE_LIMIT} heartbeats`);
+      }
+      return;
+    }
+
     const progressAt = side === 'executor' ? liveness.progressExecutorAt : liveness.progressAuditorAt;
+    const activityAt = side === 'executor'
+      ? (liveness.activityExecutorAt ?? progressAt)
+      : (liveness.activityAuditorAt ?? progressAt);
     // An escalated executor that is working on this pair again can be escalated
     // again if it later goes silent.
     if (side === 'executor' && progressAt > previousTick && pair.flags.includes('executor_silent')) {
@@ -278,7 +312,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
     }
     const flagSide = pair.flagSides.blocked === side || pair.flagSides.needs_input === side;
     const flagged = flagSide && (pair.flags.includes('blocked') || pair.flags.includes('needs_input'));
-    if (this.#busy(session) || progressAt > previousTick || flagged) {
+    if (this.#busy(session) || progressAt > previousTick || activityAt > previousTick || flagged) {
       store.saveLiveness(stored.project, pair.taskId, liveness);
       return;
     }
@@ -464,7 +498,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
     const max = resolveTaskPairMaxConcurrency(brain);
     const pairs = store.listActivePairs(project).filter((pair) => pair.state.brain === brain);
     let open = pairs.filter((pair) => TASK_PAIR_OPEN_STATUSES.includes(pair.state.status)).length;
-    const queued = pairs.filter((pair) => pair.state.status === 'queued').sort((a, b) => a.queueOrder - b.queueOrder);
+    const queued = pairs.filter((pair) => pair.state.status === 'queued').sort(compareQueuedTaskPairs);
     for (const stored of queued) {
       if (open >= max) return;
       const pair = stored.state;

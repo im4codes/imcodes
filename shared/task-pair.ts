@@ -448,6 +448,8 @@ export interface TaskPairState {
   workspace?: TaskPairWorkspace;
   /** Workspace Brain asked for on DISPATCH/QUEUE (`workspace=dir`); otherwise chosen by the project. */
   workspaceKind?: TaskPairWorkspaceKind;
+  /** Queue priority requested by the Brain; urgent queued work runs before normal FIFO work. */
+  urgent?: boolean;
   /** Deliverable to keep, named on DONE (`output=`, `dest=`); copied into the project when the pair ends DONE. */
   output?: TaskPairOutput;
   /** Marker-triggered messages sent this round, per capped reason. */
@@ -544,6 +546,23 @@ export interface TaskPairApplyContext {
 
 export function isTerminalTaskPairStatus(status: TaskPairStatus): boolean {
   return TASK_PAIR_TERMINAL_STATUSES.includes(status);
+}
+
+/**
+ * Single source of truth for queued-pair order: urgent first, then FIFO by
+ * queueOrder. The scheduler's dispatch loop and any queue-position reporting
+ * (pair_list/pair_get) MUST share this comparator -- two independent sorts
+ * drift the moment `urgent` is involved, showing a position that does not
+ * match what will actually run next.
+ */
+export function compareQueuedTaskPairs(
+  a: { queueOrder: number; state: { urgent?: boolean } },
+  b: { queueOrder: number; state: { urgent?: boolean } },
+): number {
+  return (
+    Number(b.state.urgent === true) - Number(a.state.urgent === true)
+    || a.queueOrder - b.queueOrder
+  );
 }
 
 export function taskPairRoleOf(pair: TaskPairState | undefined, writer: string): TaskPairRole {
@@ -790,6 +809,16 @@ export function applyTaskPairMarker(
     return recorded(existing);
   }
 
+  // A cancelled pair stays cancelled for a participant: only the Brain or the
+  // daemon (QUEUE/DISPATCH, both already role-gated below) can revive one.
+  // `done` deliberately keeps the opposite behavior (REWORK reopens it, a
+  // late-caught issue after completion) -- `cancelled` is a deliberate stop
+  // Brain made, not a pair anyone else gets to undo by simply resuming work.
+  if (existing.status === 'cancelled' && !roleAuthority
+    && (verb === 'STARTED' || verb === 'WORKING' || verb === 'READY_FOR_AUDIT' || verb === 'REWORK')) {
+    return recorded(existing);
+  }
+
   const pair = clonePair(existing);
   pair.updatedAt = ctx.now;
   const terminal = isTerminalTaskPairStatus(pair.status);
@@ -942,6 +971,7 @@ function setRolesFromAttrsQueued(pair: TaskPairState, attrs: Record<string, stri
   if (attrs.auditormodel) pair.auditorModel = attrs.auditormodel;
   if (attrs.title) pair.title = attrs.title;
   if (attrs.pool) pair.executorPool = attrs.pool;
+  if (attrs.urgent !== undefined) pair.urgent = isTrue(attrs.urgent);
   applyWorkspaceAttr(pair, attrs);
   const blocking = parseBlockingAttr(attrs.blocking);
   if (blocking) pair.blocking = blocking;

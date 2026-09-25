@@ -316,6 +316,27 @@ describe('pair workspaces', () => {
     expect(existsSync(join(unpushedPath, '..'))).toBe(false);
   });
 
+  it('Brain re-dispatching a cancelled pair reuses the same worktree, never resetting or recreating it', async () => {
+    const path = await opened('REQ1');
+    writeFileSync(join(path, 'in-progress.txt'), 'not yet committed\n');
+    marker(BRAIN, '<!-- IMCODES_TASK CANCEL REQ1 -->');
+    await vi.waitFor(() => expect(pair('REQ1').workspace?.status).toBe('ended'));
+    expect(pair('REQ1').status).toBe('cancelled');
+    expect(existsSync(join(path, 'in-progress.txt'))).toBe(true);
+
+    // A participant marker must not revive it (see the shared-level test for
+    // the full class); only the Brain's own DISPATCH does.
+    marker(EXEC, '<!-- IMCODES_TASK STARTED REQ1 -->');
+    expect(pair('REQ1').status).toBe('cancelled');
+
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH REQ1 executor=${EXEC} auditor=${AUD} -->`);
+    await vi.waitFor(() => expect(pair('REQ1').workspace?.status).toBe('active'));
+    expect(pair('REQ1').workspace?.path).toBe(path);
+    // The file from before the cancel is still there: reopening reused the
+    // same worktree instead of provisioning a fresh one.
+    expect(existsSync(join(path, 'in-progress.txt'))).toBe(true);
+  });
+
   describe('deliverables', () => {
     let plain = '';
     let timeline: Array<{ session: string; payload: Record<string, unknown> }>;

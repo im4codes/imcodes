@@ -41,6 +41,9 @@ export interface TaskPairLiveness {
   /** Last progress (marker or final assistant output) per side, epoch ms. */
   progressExecutorAt: number;
   progressAuditorAt: number;
+  /** Any visible participant activity (messages, tool calls, or markers). */
+  activityExecutorAt?: number;
+  activityAuditorAt?: number;
   lastTickAt: number;
   /** Consecutive heartbeats the executor spent usage-limited while it was its turn. */
   limitedExecutor?: number;
@@ -78,7 +81,16 @@ export interface TaskPairProjectSettings {
 }
 
 function emptyLiveness(now: number): TaskPairLiveness {
-  return { silenceExecutor: 0, silenceAuditor: 0, progressExecutorAt: now, progressAuditorAt: now, lastTickAt: now, notified: [] };
+  return {
+    silenceExecutor: 0,
+    silenceAuditor: 0,
+    progressExecutorAt: now,
+    progressAuditorAt: now,
+    activityExecutorAt: now,
+    activityAuditorAt: now,
+    lastTickAt: now,
+    notified: [],
+  };
 }
 
 export type TaskPairChangeListener = (project: string, taskId: string) => void;
@@ -183,6 +195,23 @@ export class TaskPairStore {
   /** Every pair of a project, newest first (for the console). */
   listPairs(project: string, limit = 200): StoredTaskPair[] {
     const rows = this.#db.prepare('SELECT * FROM task_pairs WHERE project = ? ORDER BY updated_at DESC LIMIT ?').all(project, limit) as Array<Record<string, unknown>>;
+    return rows.map(rowToPair);
+  }
+
+  /** All pairs owned by one Brain, optionally including terminal history. */
+  listPairsForBrain(brain: string, project?: string, includeFinished = false, limit = 500): StoredTaskPair[] {
+    const terminal = TASK_PAIR_TERMINAL_STATUSES.map(() => '?').join(',');
+    const filters = includeFinished ? 'brain = ?' : `brain = ? AND status NOT IN (${terminal})`;
+    const values = includeFinished
+      ? [brain, limit]
+      : [brain, ...TASK_PAIR_TERMINAL_STATUSES, limit];
+    const sql = project
+      ? `SELECT * FROM task_pairs WHERE ${filters} AND project = ? ORDER BY CASE WHEN status = 'queued' THEN 0 ELSE 1 END, queue_order, updated_at DESC LIMIT ?`
+      : `SELECT * FROM task_pairs WHERE ${filters} ORDER BY CASE WHEN status = 'queued' THEN 0 ELSE 1 END, queue_order, updated_at DESC LIMIT ?`;
+    const queryValues = project
+      ? (includeFinished ? [brain, project, limit] : [brain, ...TASK_PAIR_TERMINAL_STATUSES, project, limit])
+      : values;
+    const rows = this.#db.prepare(sql).all(...queryValues) as Array<Record<string, unknown>>;
     return rows.map(rowToPair);
   }
 
@@ -331,10 +360,24 @@ export class TaskPairStore {
 }
 
 function rowToPair(row: Record<string, unknown>): StoredTaskPair {
+  const raw = JSON.parse(String(row.liveness_json)) as Partial<TaskPairLiveness>;
+  const progressExecutorAt = Number(raw.progressExecutorAt ?? 0);
+  const progressAuditorAt = Number(raw.progressAuditorAt ?? 0);
+  const liveness: TaskPairLiveness = {
+    silenceExecutor: Number(raw.silenceExecutor ?? 0),
+    silenceAuditor: Number(raw.silenceAuditor ?? 0),
+    progressExecutorAt,
+    progressAuditorAt,
+    activityExecutorAt: Number(raw.activityExecutorAt ?? progressExecutorAt),
+    activityAuditorAt: Number(raw.activityAuditorAt ?? progressAuditorAt),
+    lastTickAt: Number(raw.lastTickAt ?? 0),
+    ...(raw.limitedExecutor === undefined ? {} : { limitedExecutor: Number(raw.limitedExecutor) }),
+    notified: Array.isArray(raw.notified) ? raw.notified.map(String) : [],
+  };
   return {
     project: String(row.project),
     state: JSON.parse(String(row.state_json)) as TaskPairState,
-    liveness: JSON.parse(String(row.liveness_json)) as TaskPairLiveness,
+    liveness,
     queueOrder: Number(row.queue_order),
     ...(row.legacy_task_id ? { legacyTaskId: String(row.legacy_task_id) } : {}),
   };

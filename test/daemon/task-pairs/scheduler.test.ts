@@ -146,6 +146,34 @@ describe('task-pair heartbeat, replacement and queue', () => {
     expect(sentTo(EXEC, 'nudge-executor')[0]?.text).toContain('DONE without a PASS is not complete');
   });
 
+  it('nudges the executor when both sides are idle, but stands down when either side has activity', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH BOTH_IDLE executor=${EXEC} auditor=${AUD} -->`);
+    marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT BOTH_IDLE -->');
+    await flush();
+    sent = [];
+    await tick(1);
+    expect(pair('BOTH_IDLE').status).toBe('in_audit');
+    expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
+    expect(sentTo(AUD, 'nudge-auditor')).toHaveLength(0);
+
+    sent = [];
+    now += 1;
+    taskPairService.recordActivity(AUD, now);
+    await tick(1);
+    expect(sent).toHaveLength(0);
+  });
+
+  it('escalates a repeatedly quiet pair once after the configured silence limit', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH QUIET_ESC executor=${EXEC} auditor=${AUD} -->`);
+    await flush();
+    sent = [];
+    await tick(3);
+    expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(2);
+    expect(sentTo(BRAIN, 'brain-executor_silent')).toHaveLength(1);
+    await tick(2);
+    expect(sentTo(BRAIN, 'brain-executor_silent')).toHaveLength(1);
+  });
+
   it('judges liveness per side: a busy executor does not mask a silent auditor, which is replaced', async () => {
     marker(BRAIN, `<!-- IMCODES_TASK DISPATCH T5 executor=${EXEC} auditor=${AUD} -->`);
     marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T5 -->');
@@ -227,6 +255,30 @@ describe('task-pair heartbeat, replacement and queue', () => {
     expect(q2.executor).toBe(SPARE);
     expect(q2.auditor).toBe(SPARE2);
     expect(q2.executor).not.toBe(q2.auditor);
+  });
+
+  it('urgent=true jumps a queued pair ahead of earlier-queued normal work', async () => {
+    candidates = [SPARE, SPARE2, AUD, EXEC];
+    marker(BRAIN, '<!-- IMCODES_TASK QUEUE - max=1 -->');
+    marker(BRAIN, `<!-- IMCODES_TASK QUEUE Q4 title="First" executor=${EXEC} auditor=${AUD} -->\nfirst brief\n<!-- IMCODES_TASK_END Q4 -->`);
+    marker(BRAIN, '<!-- IMCODES_TASK QUEUE Q5 title="Second (normal)" -->\nsecond brief\n<!-- IMCODES_TASK_END Q5 -->');
+    marker(BRAIN, '<!-- IMCODES_TASK QUEUE Q6 title="Third (urgent)" urgent=true -->\nthird brief\n<!-- IMCODES_TASK_END Q6 -->');
+    await flush();
+    // max=1: Q4 dispatches immediately, Q5 and Q6 both wait.
+    expect(pair('Q4').status).toBe('working');
+    expect(pair('Q5').status).toBe('queued');
+    expect(pair('Q6').status).toBe('queued');
+    expect(pair('Q6').urgent).toBe(true);
+
+    marker(BRAIN, '<!-- IMCODES_TASK DONE Q4 force=true -->');
+    await flush();
+    // Q6 (urgent, queued last) fills the freed slot before Q5 (queued first).
+    expect(pair('Q6').status).toBe('working');
+    expect(pair('Q5').status).toBe('queued');
+
+    marker(BRAIN, '<!-- IMCODES_TASK DONE Q6 force=true -->');
+    await flush();
+    expect(pair('Q5').status).toBe('working');
   });
 
   it('keeps a queued task waiting for capacity, tells Brain once, and retries on the heartbeat', async () => {
