@@ -1,5 +1,4 @@
 import { withPairsLegacyTools } from './task-pairs/legacy-tools.js';
-import { getTaskPairStore } from './task-pairs/store.js';
 import { emitTaskPairDaemonEvent } from './task-pairs/service.js';
 import { projectOfSession } from './task-pairs/engine.js';
 import { randomUUID } from 'node:crypto';

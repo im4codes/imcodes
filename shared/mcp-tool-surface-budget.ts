@@ -31,8 +31,15 @@ export const MCP_INJECTED_EXECUTION_BLOCK = Object.freeze({ taskSupport: 'forbid
 //
 // PLACEHOLDER -- resolved after combining both branches' tool additions;
 // re-measured below before use.
-export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 50_100;
-export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 56_900;
+// Measured at 50,311 authored bytes across 73 tools after combining the
+// pair_list/pair_get/pair_set_max_concurrency/pair_get_max_concurrency pair
+// inspection tools with the pair_task_get/update/check checklist tools. The
+// ceiling moves deliberately with roughly the same ~700 bytes of reviewable
+// headroom as before.
+export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 51_000;
+// Raw = authored + the MCP SDK framing, currently 7,028 bytes across 73 tools.
+// Keep a bounded allowance above the measured 57,339-byte wire payload.
+export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 58_100;
 /**
  * Default model-visible surface: one discovery tool plus the stable minimal
  * delegation, supervision-task, basic-memory/source-expansion, scheduling,
