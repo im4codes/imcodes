@@ -97,6 +97,7 @@ import {
 } from '../../shared/agent-delegation.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
+import { TIMELINE_HISTORY_LIMITS, clampTimelineHistoryLimit, clampTimelineHistoryBudget } from '../../shared/timeline-history-limits.js';
 import { hashSessionName } from '../../shared/session-hash.js';
 import { TIMELINE_DETAIL_ERROR_REASONS, TIMELINE_HISTORY_ERROR_REASONS, TIMELINE_REQUEST_ERROR_REASONS, type TimelineRequestErrorReason } from '../../shared/timeline-history-errors.js';
 import {
@@ -6805,6 +6806,19 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
     }
   }
 
+  // The content-aware query may add state rows around the selected content.
+  // Enforce the hard page count after that merge as well, otherwise a page of
+  // 200 substantive events could retain hundreds of additional state rows and
+  // recreate the large-history retention spike at the bridge.
+  if (trimmed.length > TIMELINE_HISTORY_LIMITS.MAX_EVENTS) {
+    const contentTypes = TIMELINE_HISTORY_CONTENT_TYPES as readonly string[];
+    const content = trimmed.filter((event) => contentTypes.includes(event.type));
+    const state = trimmed.filter((event) => !contentTypes.includes(event.type));
+    const stateBudget = Math.max(0, TIMELINE_HISTORY_LIMITS.MAX_EVENTS - content.length);
+    trimmed = [...content, ...state.slice(Math.max(0, state.length - stateBudget))].sort(compareTimelineEventsForReplay);
+    hasMoreHistory = true;
+  }
+
   const tSanitize = Date.now();
   const sanitized = shapeTimelineEventsForTransport(trimmed, {
     maxResponseBytes: params.maxResponseBytes,
@@ -6872,7 +6886,7 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
   const sessionName = cmd.sessionName as string | undefined;
   const requestId = cmd.requestId as string | undefined;
   const rawLimit = cmd.limit;
-  const limit = typeof rawLimit === 'number' && Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 2000) : 500;
+  const limit = clampTimelineHistoryLimit(rawLimit);
   const cursor = cmd.cursor && typeof cmd.cursor === 'object' && !Array.isArray(cmd.cursor)
     ? cmd.cursor as Record<string, unknown>
     : undefined;
@@ -6882,9 +6896,10 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
   // socket for minutes and every heartbeat/ack/session.state queues behind
   // it. Serve a smaller page instead; the response already reports
   // hasMore/droppedEvents, so the client pages for the rest.
+  const boundedBudgetBytes = clampTimelineHistoryBudget(cmd.budgetBytes);
   const maxResponseBytes = serverLink.isUplinkCongested?.()
-    ? Math.min(resolveTimelineHistoryBudgetBytes(cmd), CONGESTED_TIMELINE_RESPONSE_BUDGET_BYTES)
-    : resolveTimelineHistoryBudgetBytes(cmd);
+    ? Math.min(boundedBudgetBytes, CONGESTED_TIMELINE_RESPONSE_BUDGET_BYTES)
+    : Math.min(resolveTimelineHistoryBudgetBytes(cmd), TIMELINE_HISTORY_LIMITS.MAX_BYTES);
 
   if (!sessionName) {
     logger.warn({ requestId }, 'timeline.history_request: missing sessionName');

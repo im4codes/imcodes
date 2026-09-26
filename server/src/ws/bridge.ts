@@ -417,6 +417,11 @@ import {
   type TimelineSubscriptionMode,
 } from '../../../shared/timeline-protocol.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../../shared/timeline-payload-budget.js';
+import {
+  TIMELINE_HISTORY_LIMITS,
+  clampTimelineHistoryBudget,
+  clampTimelineHistoryLimit,
+} from '../../../shared/timeline-history-limits.js';
 import type { DaemonBuildInfo } from '../../../shared/build-manifest-types.js';
 import {
   TIMELINE_REQUEST_ERROR_REASONS,
@@ -1136,23 +1141,28 @@ type TimelineDataPlaneAttachment =
     requestId?: string;
     socket: WebSocket;
     payload: Record<string, unknown>;
+    estimatedBytes: number;
   }
   | {
     origin: 'http_request';
     requestId: string;
     pending: PendingHttpTimelineRequest;
     payload: Record<string, unknown>;
+    estimatedBytes: number;
   }
   | {
     origin: 'subscriber_fallback';
     sessionName: string;
     sockets: WebSocket[];
     payload: Record<string, unknown>;
+    estimatedBytes: number;
   };
 
 type TimelineDataPlaneJob = {
   meta: TimelineDataPlaneSendMeta;
   attachments: TimelineDataPlaneAttachment[];
+  /** Estimated encoded bytes retained by this job (per recipient). */
+  estimatedBytes: number;
   enqueuedAt: number;
   deadlineAt: number;
   queueDepthAtEnqueue: number;
@@ -1175,8 +1185,14 @@ const TIMELINE_PENDING_UNICAST_TIMEOUT_MS = 30_000;
 // and a more generous ceiling, we recover automatically instead of
 // forcing a manual page refresh.
 const DEFAULT_TIMELINE_DATA_PLANE_QUEUE_CAP = 4096;
+const DEFAULT_TIMELINE_DATA_PLANE_QUEUE_MAX_BYTES = 64 * 1024 * 1024;
+const DEFAULT_TIMELINE_DATA_PLANE_SOCKET_MAX_BYTES = 8 * 1024 * 1024;
+const DEFAULT_TIMELINE_DATA_PLANE_USER_MAX_BYTES = 32 * 1024 * 1024;
 const DEFAULT_TIMELINE_DATA_PLANE_JOB_DEADLINE_MS = 60_000;
 let timelineDataPlaneQueueCap = DEFAULT_TIMELINE_DATA_PLANE_QUEUE_CAP;
+let timelineDataPlaneQueueMaxBytes = DEFAULT_TIMELINE_DATA_PLANE_QUEUE_MAX_BYTES;
+let timelineDataPlaneSocketMaxBytes = DEFAULT_TIMELINE_DATA_PLANE_SOCKET_MAX_BYTES;
+let timelineDataPlaneUserMaxBytes = DEFAULT_TIMELINE_DATA_PLANE_USER_MAX_BYTES;
 let timelineDataPlaneJobDeadlineMs = DEFAULT_TIMELINE_DATA_PLANE_JOB_DEADLINE_MS;
 const BRIDGE_TIMELINE_LARGE_PAYLOAD_LOG_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE;
 const BRIDGE_TIMELINE_SLOW_SEND_LOG_MS = 50;
@@ -1206,20 +1222,38 @@ function deferTimelineDataPlaneTurn(): Promise<void> {
 
 export function __setTimelineDataPlaneQueueConfigForTests(config: {
   queueCap?: number;
+  maxBytes?: number;
+  socketMaxBytes?: number;
+  userMaxBytes?: number;
   deadlineMs?: number;
 }): () => void {
   const previous = {
     queueCap: timelineDataPlaneQueueCap,
+    maxBytes: timelineDataPlaneQueueMaxBytes,
+    socketMaxBytes: timelineDataPlaneSocketMaxBytes,
+    userMaxBytes: timelineDataPlaneUserMaxBytes,
     deadlineMs: timelineDataPlaneJobDeadlineMs,
   };
   if (typeof config.queueCap === 'number' && Number.isFinite(config.queueCap) && config.queueCap >= 0) {
     timelineDataPlaneQueueCap = Math.trunc(config.queueCap);
+  }
+  if (typeof config.maxBytes === 'number' && Number.isFinite(config.maxBytes) && config.maxBytes >= 0) {
+    timelineDataPlaneQueueMaxBytes = Math.trunc(config.maxBytes);
+  }
+  if (typeof config.socketMaxBytes === 'number' && Number.isFinite(config.socketMaxBytes) && config.socketMaxBytes >= 0) {
+    timelineDataPlaneSocketMaxBytes = Math.trunc(config.socketMaxBytes);
+  }
+  if (typeof config.userMaxBytes === 'number' && Number.isFinite(config.userMaxBytes) && config.userMaxBytes >= 0) {
+    timelineDataPlaneUserMaxBytes = Math.trunc(config.userMaxBytes);
   }
   if (typeof config.deadlineMs === 'number' && Number.isFinite(config.deadlineMs) && config.deadlineMs >= 0) {
     timelineDataPlaneJobDeadlineMs = Math.trunc(config.deadlineMs);
   }
   return () => {
     timelineDataPlaneQueueCap = previous.queueCap;
+    timelineDataPlaneQueueMaxBytes = previous.maxBytes;
+    timelineDataPlaneSocketMaxBytes = previous.socketMaxBytes;
+    timelineDataPlaneUserMaxBytes = previous.userMaxBytes;
     timelineDataPlaneJobDeadlineMs = previous.deadlineMs;
   };
 }
@@ -1296,6 +1330,44 @@ function timelineResponseForRequestId(msg: Record<string, unknown>, requestId: s
   }
   response.requestId = requestId;
   return response;
+}
+
+/**
+ * Estimate the bytes retained by one timeline response without re-stringifying
+ * daemon payloads that already carry the measured wire size. Older daemons do
+ * not send actualPayloadBytes, so retain a conservative one-time fallback
+ * estimate rather than allowing an unbounded object into the data-plane queue.
+ */
+function estimateTimelineDataPlaneBytes(payload: Record<string, unknown>): number {
+  const measured = optionalNumber(payload.actualPayloadBytes);
+  if (measured !== undefined && measured >= 0) return Math.max(1, Math.trunc(measured));
+  const shaped = optionalNumber(payload.payloadBytes);
+  if (shaped !== undefined && shaped >= 0) return Math.max(1, Math.trunc(shaped));
+  try {
+    return Math.max(1, Buffer.byteLength(JSON.stringify(payload), 'utf8'));
+  } catch {
+    return TIMELINE_HISTORY_LIMITS.MAX_BYTES;
+  }
+}
+
+function boundTimelineHistoryRequest(msg: Record<string, unknown>): Record<string, unknown> {
+  if (msg.type !== TIMELINE_MESSAGES.HISTORY_REQUEST && msg.type !== TIMELINE_MESSAGES.PAGE_REQUEST) return msg;
+  const bounded = { ...msg };
+  if (Object.prototype.hasOwnProperty.call(msg, 'limit')) {
+    bounded.limit = clampTimelineHistoryLimit(msg.limit);
+  }
+  if (Object.prototype.hasOwnProperty.call(msg, 'budgetBytes')) {
+    bounded.budgetBytes = clampTimelineHistoryBudget(msg.budgetBytes);
+  }
+  return bounded;
+}
+
+function timelineSerializedForRequestId(serialized: string, sourceRequestId: string | undefined, requestId: string | undefined): string {
+  if (!sourceRequestId || !requestId || sourceRequestId === requestId) return serialized;
+  const needle = `${JSON.stringify('requestId')}:${JSON.stringify(sourceRequestId)}`;
+  const replacement = `${JSON.stringify('requestId')}:${JSON.stringify(requestId)}`;
+  const index = serialized.indexOf(needle);
+  return index < 0 ? serialized : `${serialized.slice(0, index)}${replacement}${serialized.slice(index + needle.length)}`;
 }
 
 function withBridgeActualPayloadBytes(msg: Record<string, unknown>): Record<string, unknown> {
@@ -2155,6 +2227,15 @@ export class WsBridge {
   private timelineDataPlaneQueue: TimelineDataPlaneJob[] = [];
   private timelineDataPlaneScheduled = false;
   private timelineDataPlaneActive = false;
+  /** Bytes retained by queued and active timeline data-plane jobs. */
+  private timelineDataPlaneQueueBytes = 0;
+  private timelineDataPlaneBytesBySocket = new Map<WebSocket, number>();
+  private timelineDataPlaneBytesByUser = new Map<string, number>();
+  private timelineDataPlaneActiveJob: TimelineDataPlaneJob | null = null;
+  /** Canonical request id for each identical in-flight history/page request. */
+  private timelineInFlightByKey = new Map<string, string>();
+  private timelineRequestKeys = new Map<string, string>();
+  private timelineRequestAliases = new Map<string, Set<string>>();
 
   /** Lightweight per-session hot cache for Watch first-paint text. */
   private recentTextBySession = new Map<string, WatchRecentTextRow[]>();
@@ -3579,11 +3660,56 @@ export class WsBridge {
       logger.warn({ requestId, serverId: this.serverId, type: msg.type }, 'WsBridge: duplicate timeline request id replaced');
     }
     const timer = setTimeout(() => {
-      this.pendingTimelineRequests.delete(requestId);
+      this.removeTimelineRequestGroupMember(requestId);
       this.cancelDaemonTimelineRequest(requestId);
     }, TIMELINE_PENDING_UNICAST_TIMEOUT_MS);
     timer.unref?.();
     this.pendingTimelineRequests.set(requestId, { socket: ws, timer });
+  }
+
+  private removeTimelineRequestGroupMember(requestId: string): void {
+    const pending = this.pendingTimelineRequests.get(requestId);
+    if (pending) {
+      clearTimeout(pending.timer);
+      this.pendingTimelineRequests.delete(requestId);
+    }
+    const pendingHttp = this.pendingHttpTimelineRequests.get(requestId);
+    if (pendingHttp) {
+      clearTimeout(pendingHttp.timer);
+      if (pendingHttp.abortSignal && pendingHttp.abortHandler) {
+        pendingHttp.abortSignal.removeEventListener('abort', pendingHttp.abortHandler);
+      }
+      this.pendingHttpTimelineRequests.delete(requestId);
+    }
+    const key = this.timelineRequestKeys.get(requestId);
+    if (!key) return;
+    this.timelineRequestKeys.delete(requestId);
+    const aliases = this.timelineRequestAliases.get(key);
+    if (this.timelineInFlightByKey.get(key) === requestId) {
+      this.timelineInFlightByKey.delete(key);
+      for (const alias of aliases ?? []) {
+        if (alias === requestId) continue;
+        const aliasPending = this.pendingTimelineRequests.get(alias);
+        if (aliasPending) {
+          clearTimeout(aliasPending.timer);
+          this.pendingTimelineRequests.delete(alias);
+        }
+        const aliasHttp = this.pendingHttpTimelineRequests.get(alias);
+        if (aliasHttp) {
+          clearTimeout(aliasHttp.timer);
+          if (aliasHttp.abortSignal && aliasHttp.abortHandler) aliasHttp.abortSignal.removeEventListener('abort', aliasHttp.abortHandler);
+          this.pendingHttpTimelineRequests.delete(alias);
+        }
+        this.timelineRequestKeys.delete(alias);
+      }
+      this.timelineRequestAliases.delete(key);
+      return;
+    }
+    aliases?.delete(requestId);
+    if (!aliases || aliases.size === 0) {
+      this.timelineRequestAliases.delete(key);
+      this.timelineInFlightByKey.delete(key);
+    }
   }
 
   /**
@@ -3739,7 +3865,174 @@ export class WsBridge {
     setImmediate(() => this.drainTimelineDataPlaneQueue());
   }
 
+  private timelineAttachmentSockets(attachment: TimelineDataPlaneAttachment): WebSocket[] {
+    if (attachment.origin === 'browser_request') return [attachment.socket];
+    if (attachment.origin === 'subscriber_fallback') return attachment.sockets;
+    return [];
+  }
+
+  private timelineAttachmentBytes(attachment: TimelineDataPlaneAttachment): number {
+    const recipients = attachment.origin === 'http_request' ? 1 : this.timelineAttachmentSockets(attachment).length;
+    return attachment.estimatedBytes * Math.max(1, recipients);
+  }
+
+  private adjustTimelineDataPlaneAccounting(attachment: TimelineDataPlaneAttachment, delta: number): void {
+    const amount = this.timelineAttachmentBytes(attachment) * delta;
+    this.timelineDataPlaneQueueBytes = Math.max(0, this.timelineDataPlaneQueueBytes + amount);
+    for (const socket of this.timelineAttachmentSockets(attachment)) {
+      const next = Math.max(0, (this.timelineDataPlaneBytesBySocket.get(socket) ?? 0) + attachment.estimatedBytes * delta);
+      if (next === 0) this.timelineDataPlaneBytesBySocket.delete(socket);
+      else this.timelineDataPlaneBytesBySocket.set(socket, next);
+      const userId = this.browserUserIds.get(socket);
+      if (userId) {
+        const userNext = Math.max(0, (this.timelineDataPlaneBytesByUser.get(userId) ?? 0) + attachment.estimatedBytes * delta);
+        if (userNext === 0) this.timelineDataPlaneBytesByUser.delete(userId);
+        else this.timelineDataPlaneBytesByUser.set(userId, userNext);
+      }
+    }
+  }
+
+  private releaseTimelineDataPlaneAttachment(attachment: TimelineDataPlaneAttachment): void {
+    if (attachment.estimatedBytes > 0
+      && (attachment.origin !== 'subscriber_fallback' || attachment.sockets.length > 0)) {
+      this.adjustTimelineDataPlaneAccounting(attachment, -1);
+    }
+    attachment.estimatedBytes = 0;
+    attachment.payload = {};
+    if (attachment.origin === 'subscriber_fallback') attachment.sockets = [];
+  }
+
+  private pruneCanceledTimelineDataPlaneJobs(): void {
+    const retained: TimelineDataPlaneJob[] = [];
+    for (const job of this.timelineDataPlaneQueue) {
+      const attachments: TimelineDataPlaneAttachment[] = [];
+      for (const attachment of job.attachments) {
+        if (this.isTimelineDataPlaneAttachmentCanceled(attachment)) {
+          if (attachment.estimatedBytes > 0) {
+            incrementCounter('ws_bridge_timeline_data_plane_canceled', {
+              type: job.meta.type,
+              route: job.meta.route,
+            });
+          }
+          this.releaseTimelineDataPlaneAttachment(attachment);
+          continue;
+        }
+        if (attachment.origin === 'subscriber_fallback') {
+          const openSockets = attachment.sockets.filter((socket) => socket.readyState === WebSocket.OPEN);
+          if (openSockets.length !== attachment.sockets.length) {
+            for (const socket of attachment.sockets) {
+              if (openSockets.includes(socket)) continue;
+              const perSocket: TimelineDataPlaneAttachment = { ...attachment, sockets: [socket] };
+              this.adjustTimelineDataPlaneAccounting(perSocket, -1);
+            }
+            attachment.sockets = openSockets;
+          }
+          if (attachment.sockets.length === 0) {
+            this.releaseTimelineDataPlaneAttachment(attachment);
+            continue;
+          }
+        }
+        attachments.push(attachment);
+      }
+      job.attachments = attachments;
+      if (attachments.length > 0) {
+        job.estimatedBytes = attachments.reduce((sum, attachment) => sum + this.timelineAttachmentBytes(attachment), 0);
+        retained.push(job);
+      }
+    }
+    this.timelineDataPlaneQueue = retained;
+  }
+
+  private cancelTimelineDataPlaneForSocket(ws: WebSocket): void {
+    for (const job of this.timelineDataPlaneQueue) {
+      for (const attachment of job.attachments) {
+        if (attachment.origin === 'browser_request' && attachment.socket === ws) {
+          incrementCounter('ws_bridge_timeline_data_plane_canceled', {
+            type: job.meta.type,
+            route: job.meta.route,
+          });
+          this.releaseTimelineDataPlaneAttachment(attachment);
+        } else if (attachment.origin === 'subscriber_fallback' && attachment.sockets.includes(ws)) {
+          const remaining = attachment.sockets.filter((socket) => socket !== ws);
+          const removed: TimelineDataPlaneAttachment = { ...attachment, sockets: [ws] };
+          this.adjustTimelineDataPlaneAccounting(removed, -1);
+          attachment.sockets = remaining;
+          if (remaining.length === 0) this.releaseTimelineDataPlaneAttachment(attachment);
+        }
+      }
+    }
+    const active = this.timelineDataPlaneActiveJob;
+    if (active) {
+      for (const attachment of active.attachments) {
+        if (attachment.origin === 'browser_request' && attachment.socket === ws) {
+          incrementCounter('ws_bridge_timeline_data_plane_canceled', {
+            type: active.meta.type,
+            route: active.meta.route,
+          });
+          this.releaseTimelineDataPlaneAttachment(attachment);
+        } else if (attachment.origin === 'subscriber_fallback' && attachment.sockets.includes(ws)) {
+          const removed: TimelineDataPlaneAttachment = { ...attachment, sockets: [ws] };
+          this.adjustTimelineDataPlaneAccounting(removed, -1);
+          attachment.sockets = attachment.sockets.filter((socket) => socket !== ws);
+          if (attachment.sockets.length === 0) this.releaseTimelineDataPlaneAttachment(attachment);
+        }
+      }
+    }
+    this.pruneCanceledTimelineDataPlaneJobs();
+    for (const [requestId, pending] of this.pendingTimelineRequests) {
+      if (pending.socket !== ws) continue;
+      const key = this.timelineRequestKeys.get(requestId);
+      if (key) {
+        this.timelineRequestKeys.delete(requestId);
+        const aliases = this.timelineRequestAliases.get(key);
+        aliases?.delete(requestId);
+        if (aliases?.size === 0) {
+          this.timelineRequestAliases.delete(key);
+          this.timelineInFlightByKey.delete(key);
+        }
+      }
+    }
+  }
+
+  private timelineHistoryDedupeKey(msg: Record<string, unknown>): string | null {
+    if (msg.type !== TIMELINE_MESSAGES.HISTORY_REQUEST && msg.type !== TIMELINE_MESSAGES.PAGE_REQUEST) return null;
+    const sessionName = optionalString(msg.sessionName);
+    if (!sessionName) return null;
+    return JSON.stringify({
+      sessionName,
+      type: msg.type,
+      limit: clampTimelineHistoryLimit(msg.limit),
+      budgetBytes: clampTimelineHistoryBudget(msg.budgetBytes),
+      afterTs: optionalNumber(msg.afterTs) ?? optionalNumber((msg.cursor as Record<string, unknown> | undefined)?.afterTs) ?? null,
+      beforeTs: optionalNumber(msg.beforeTs) ?? optionalNumber((msg.cursor as Record<string, unknown> | undefined)?.beforeTs) ?? null,
+      afterSeq: optionalNumber((msg.cursor as Record<string, unknown> | undefined)?.afterSeq) ?? optionalNumber(msg.afterSeq) ?? null,
+      epoch: optionalNumber((msg.cursor as Record<string, unknown> | undefined)?.epoch) ?? optionalNumber(msg.epoch) ?? null,
+      direction: (msg.cursor as Record<string, unknown> | undefined)?.direction ?? null,
+    });
+  }
+
+  private registerTimelineHistoryAlias(msg: Record<string, unknown>): boolean {
+    const requestId = optionalString(msg.requestId);
+    const key = this.timelineHistoryDedupeKey(msg);
+    if (!requestId || !key) return false;
+    const canonical = this.timelineInFlightByKey.get(key);
+    this.timelineRequestKeys.set(requestId, key);
+    if (!canonical) {
+      this.timelineInFlightByKey.set(key, requestId);
+      this.timelineRequestAliases.set(key, new Set([requestId]));
+      return false;
+    }
+    this.timelineRequestAliases.get(key)?.add(requestId);
+    incrementCounter('ws_bridge_timeline_history_deduplicated');
+    return true;
+  }
+
   private finishTimelineDataPlaneJob(): void {
+    const active = this.timelineDataPlaneActiveJob;
+    if (active) {
+      for (const attachment of active.attachments) this.releaseTimelineDataPlaneAttachment(attachment);
+    }
+    this.timelineDataPlaneActiveJob = null;
     this.timelineDataPlaneActive = false;
     if (this.timelineDataPlaneQueue.length > 0) this.scheduleTimelineDataPlaneDrain();
   }
@@ -3752,8 +4045,28 @@ export class WsBridge {
     } = {},
   ): boolean {
     if (attachments.length === 0) return true;
+    this.pruneCanceledTimelineDataPlaneJobs();
     const queuedBehindCount = this.timelineDataPlaneQueue.length;
-    if (queuedBehindCount >= timelineDataPlaneQueueCap) {
+    const estimatedBytes = attachments.reduce((sum, attachment) => sum + this.timelineAttachmentBytes(attachment), 0);
+    const socketTotals = new Map<WebSocket, number>();
+    const userTotals = new Map<string, number>();
+    for (const attachment of attachments) {
+      for (const socket of this.timelineAttachmentSockets(attachment)) {
+        socketTotals.set(socket, (socketTotals.get(socket) ?? 0) + attachment.estimatedBytes);
+        const userId = this.browserUserIds.get(socket);
+        if (userId) userTotals.set(userId, (userTotals.get(userId) ?? 0) + attachment.estimatedBytes);
+      }
+    }
+    const overSocketBudget = [...socketTotals].some(([socket, bytes]) => (
+      (this.timelineDataPlaneBytesBySocket.get(socket) ?? 0) + bytes > timelineDataPlaneSocketMaxBytes
+    ));
+    const overUserBudget = [...userTotals].some(([userId, bytes]) => (
+      (this.timelineDataPlaneBytesByUser.get(userId) ?? 0) + bytes > timelineDataPlaneUserMaxBytes
+    ));
+    if (queuedBehindCount >= timelineDataPlaneQueueCap
+      || this.timelineDataPlaneQueueBytes + estimatedBytes > timelineDataPlaneQueueMaxBytes
+      || overSocketBudget
+      || overUserBudget) {
       incrementCounter('ws_bridge_timeline_data_plane_queue_full', {
         type: meta.type,
         route: meta.route,
@@ -3764,6 +4077,11 @@ export class WsBridge {
         route: meta.route,
         queueDepth: queuedBehindCount,
         queueCap: timelineDataPlaneQueueCap,
+        queueBytes: this.timelineDataPlaneQueueBytes,
+        estimatedBytes,
+        queueMaxBytes: timelineDataPlaneQueueMaxBytes,
+        overSocketBudget,
+        overUserBudget,
       }, 'WsBridge timeline data-plane queue full');
       return false;
     }
@@ -3772,11 +4090,13 @@ export class WsBridge {
     this.timelineDataPlaneQueue.push({
       meta,
       attachments,
+      estimatedBytes,
       enqueuedAt,
       deadlineAt: enqueuedAt + (options.deadlineMs ?? timelineDataPlaneJobDeadlineMs),
       queueDepthAtEnqueue,
       queuedBehindCount,
     });
+    for (const attachment of attachments) this.adjustTimelineDataPlaneAccounting(attachment, 1);
     incrementCounter('ws_bridge_timeline_data_plane_enqueue', {
       type: meta.type,
       route: meta.route,
@@ -3831,6 +4151,11 @@ export class WsBridge {
     }
     const attachments = job.attachments.filter((attachment) => !this.isTimelineDataPlaneAttachmentCanceled(attachment));
     if (attachments.length === 0) return;
+    const sharedSource = attachments.find((attachment) => attachment.origin !== 'http_request');
+    const sharedSerialized = sharedSource && this.stringifyTimelineDataPlaneResponse(sharedSource.payload, job.meta);
+    const sharedRequestId = sharedSource?.origin === 'browser_request'
+      ? optionalString(sharedSource.payload.requestId)
+      : undefined;
     let fanoutYieldCount = 0;
     for (let index = 0; index < attachments.length; index += 1) {
       if (index > 0) {
@@ -3845,12 +4170,25 @@ export class WsBridge {
         });
         continue;
       }
+      const serialized = sharedSerialized && attachment.origin !== 'http_request'
+        ? {
+          ...sharedSerialized,
+          json: timelineSerializedForRequestId(
+            sharedSerialized.json,
+            sharedRequestId,
+            attachment.origin === 'browser_request' ? optionalString(attachment.payload.requestId) : undefined,
+          ),
+          stringifyMs: index === attachments.findIndex((candidate) => candidate === sharedSource)
+            ? sharedSerialized.stringifyMs
+            : 0,
+        }
+        : undefined;
       await this.runTimelineDataPlaneAttachment(attachment, meta, {
         ...queue,
         attachmentIndex: index + 1,
         attachmentCount: attachments.length,
         fanoutYieldCount,
-      });
+      }, serialized);
     }
   }
 
@@ -3858,6 +4196,7 @@ export class WsBridge {
     attachment: TimelineDataPlaneAttachment,
     meta: TimelineDataPlaneSendMeta,
     queue: TimelineDataPlaneQueueMetrics,
+    sharedSerialized?: { json: string; jsonBytes: number; stringifyMs: number },
   ): void | Promise<void> {
     if (attachment.origin === 'http_request') {
       if (attachment.pending.settled) return;
@@ -3873,7 +4212,7 @@ export class WsBridge {
     }
 
     if (attachment.origin === 'browser_request') {
-      const serialized = this.stringifyTimelineDataPlaneResponse(attachment.payload, meta);
+      const serialized = sharedSerialized ?? this.stringifyTimelineDataPlaneResponse(attachment.payload, meta);
       if (!serialized) {
         if (attachment.socket.readyState === WebSocket.OPEN) {
           safeSend(attachment.socket, JSON.stringify(withBridgeActualPayloadBytes(
@@ -3897,7 +4236,7 @@ export class WsBridge {
       });
     }
 
-    const serialized = this.stringifyTimelineDataPlaneResponse(attachment.payload, meta);
+    const serialized = sharedSerialized ?? this.stringifyTimelineDataPlaneResponse(attachment.payload, meta);
     if (!serialized) return;
     const sockets = attachment.sockets.filter((socket) => socket.readyState === WebSocket.OPEN);
     if (sockets.length === 0) return;
@@ -3926,10 +4265,12 @@ export class WsBridge {
   private drainTimelineDataPlaneQueue(): void {
     this.timelineDataPlaneScheduled = false;
     if (this.timelineDataPlaneActive) return;
+    this.pruneCanceledTimelineDataPlaneJobs();
     const queueDepthBeforeDrain = this.timelineDataPlaneQueue.length;
     const job = this.timelineDataPlaneQueue.shift();
     if (!job) return;
     this.timelineDataPlaneActive = true;
+    this.timelineDataPlaneActiveJob = job;
     const queueMetrics: TimelineDataPlaneQueueMetrics = {
       backlogAgeMs: performance.now() - job.enqueuedAt,
       queueDepthAtEnqueue: job.queueDepthAtEnqueue,
@@ -4105,10 +4446,22 @@ export class WsBridge {
       sessionName,
       sockets,
       payload: msg,
+      estimatedBytes: estimateTimelineDataPlaneBytes(msg),
     }]);
   }
 
   private handleTimelineDataPlaneResponse(msg: Record<string, unknown>, type: string): void {
+    const primaryRequestId = optionalString(msg.requestId);
+    if (primaryRequestId) {
+      const key = this.timelineRequestKeys.get(primaryRequestId);
+      const aliases = key ? this.timelineRequestAliases.get(key) : undefined;
+      if (key && aliases) {
+        msg = { ...msg, requestIds: [...aliases] };
+        this.timelineInFlightByKey.delete(key);
+        this.timelineRequestAliases.delete(key);
+        for (const alias of aliases) this.timelineRequestKeys.delete(alias);
+      }
+    }
     const requestIds = timelineResponseRequestIds(msg);
     if (requestIds.length > 0) {
       const socketDeliveries: Array<{ requestId: string; pending: PendingTimelineRequest }> = [];
@@ -4142,12 +4495,14 @@ export class WsBridge {
           requestId,
           pending,
           payload: timelineResponseForRequestId(msg, requestId),
+          estimatedBytes: estimateTimelineDataPlaneBytes(msg),
         })),
         ...socketDeliveries.map(({ requestId, pending }): TimelineDataPlaneAttachment => ({
           origin: 'browser_request',
           requestId,
           socket: pending.socket,
           payload: timelineResponseForRequestId(msg, requestId),
+          estimatedBytes: estimateTimelineDataPlaneBytes(msg),
         })),
       ];
       this.enqueueTimelineDataPlaneFanout(attachments, {
@@ -5783,6 +6138,14 @@ export class WsBridge {
         return;
       }
 
+      // Clamp browser-controlled history page sizes before the daemon or
+      // bridge can retain the request. This applies to every ingress path,
+      // including older clients that still ask for thousands of events.
+      if (msg.type === TIMELINE_MESSAGES.HISTORY_REQUEST || msg.type === TIMELINE_MESSAGES.PAGE_REQUEST) {
+        msg = boundTimelineHistoryRequest(msg);
+        raw = JSON.stringify(msg);
+      }
+
       if (BROWSER_DATA_READ_TYPES.has(browserMessageType)) {
         const browserId = this.getBrowserId(ws);
         if (!this.browserDataReadRateLimiter.check(
@@ -6169,6 +6532,7 @@ export class WsBridge {
         return;
       }
 
+      if (TIMELINE_REQUEST_TYPES.has(browserMessageType) && this.registerTimelineHistoryAlias(msg)) return;
       this.sendToDaemon(raw);
     });
 
@@ -8585,6 +8949,7 @@ export class WsBridge {
     this.transportSubscriptions.delete(ws);
     this.timelineSubscriptions.delete(ws);
     this.timelineProtocolSockets.delete(ws);
+    this.cancelTimelineDataPlaneForSocket(ws);
     this.timelineQueues.get(ws)?.dispose();
     this.timelineQueues.delete(ws);
     this.clearPendingFsRoutesForSocket(ws);
@@ -10301,12 +10666,26 @@ export class WsBridge {
 
     const requestId = `watch-hist-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const timeoutMs = params.timeoutMs ?? HTTP_TIMELINE_TIMEOUT_MS;
+    const boundedLimit = clampTimelineHistoryLimit(params.limit);
+    const boundedBudgetBytes = clampTimelineHistoryBudget(params.budgetBytes);
+    const outbound = boundTimelineHistoryRequest({
+      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+      sessionName: params.sessionName,
+      requestId,
+      limit: boundedLimit,
+      ...(typeof params.beforeTs === 'number' ? { beforeTs: params.beforeTs } : {}),
+      ...(typeof params.afterTs === 'number' ? { afterTs: params.afterTs } : {}),
+      budgetBytes: boundedBudgetBytes,
+      ...(typeof params.includeDetails === 'boolean' ? { includeDetails: params.includeDetails } : {}),
+    });
 
     return new Promise<Record<string, unknown>>((resolve, reject) => {
       let pending: PendingHttpTimelineRequest;
       const timer = setTimeout(() => {
         const current = this.pendingHttpTimelineRequests.get(requestId) ?? pending;
         this.settlePendingHttpTimelineRequest(requestId, current, () => reject(new Error('timeout')));
+        this.pruneCanceledTimelineDataPlaneJobs();
+        this.removeTimelineRequestGroupMember(requestId);
         this.cancelDaemonTimelineRequest(requestId);
       }, timeoutMs);
       timer.unref?.();
@@ -10319,28 +10698,26 @@ export class WsBridge {
             route: 'http_request',
           });
           this.settlePendingHttpTimelineRequest(requestId, pending, () => reject(new Error(TIMELINE_REQUEST_ERROR_REASONS.REQUEST_CANCELED)));
+          this.pruneCanceledTimelineDataPlaneJobs();
+          this.removeTimelineRequestGroupMember(requestId);
           this.cancelDaemonTimelineRequest(requestId);
         };
         params.abortSignal.addEventListener('abort', pending.abortHandler, { once: true });
       }
       this.pendingHttpTimelineRequests.set(requestId, pending);
 
+      // Share one daemon history request among identical HTTP/browser callers;
+      // each caller still receives its own requestId on the response.
+      if (this.registerTimelineHistoryAlias(outbound)) return;
+
       try {
-        this.daemonWs!.send(JSON.stringify({
-          type: TIMELINE_MESSAGES.HISTORY_REQUEST,
-          sessionName: params.sessionName,
-          requestId,
-          ...(typeof params.limit === 'number' ? { limit: params.limit } : {}),
-          ...(typeof params.beforeTs === 'number' ? { beforeTs: params.beforeTs } : {}),
-          ...(typeof params.afterTs === 'number' ? { afterTs: params.afterTs } : {}),
-          ...(typeof params.budgetBytes === 'number' ? { budgetBytes: params.budgetBytes } : {}),
-          ...(typeof params.includeDetails === 'boolean' ? { includeDetails: params.includeDetails } : {}),
-        }));
+        this.daemonWs!.send(JSON.stringify(outbound));
       } catch (err) {
         const current = this.pendingHttpTimelineRequests.get(requestId) ?? pending;
         this.settlePendingHttpTimelineRequest(requestId, current, () => {
           reject(err instanceof Error ? err : new Error(String(err)));
         });
+        this.removeTimelineRequestGroupMember(requestId);
       }
     });
   }

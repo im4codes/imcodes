@@ -63,6 +63,7 @@ vi.mock('../../src/daemon/supervision-broker.js', () => ({ supervisionBroker: { 
 vi.mock('../../src/daemon/supervision-automation.js', () => ({ supervisionAutomation: { init: vi.fn(), setServerLink: vi.fn(), cancelSession: vi.fn(), queueTaskIntent: vi.fn(), updateQueuedTaskIntent: vi.fn(), removeQueuedTaskIntent: vi.fn(), registerTaskIntent: vi.fn(), applySnapshotUpdate: vi.fn() } }));
 
 import { handleWebCommand } from '../../src/daemon/command-handler.js';
+import { TIMELINE_HISTORY_LIMITS } from '../../shared/timeline-history-limits.js';
 
 const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
@@ -146,6 +147,22 @@ describe('command-handler timeline.history_request SQLite parity', () => {
         expect.objectContaining({ eventId: 'state-1' }),
         expect.objectContaining({ eventId: 'assistant-1' }),
       ]),
+    }));
+  });
+
+  it('clamps oversized history pages before projection reads', async () => {
+    handleWebCommand({
+      type: 'timeline.history_request',
+      sessionName: 'deck_proj_brain',
+      requestId: 'req-clamped',
+      limit: 10_000,
+      budgetBytes: 50 * 1024 * 1024,
+    }, serverLink as never);
+    await flushAsync();
+    expect(readByTypesPreferredMock.mock.calls[0][2]).toEqual({ limit: TIMELINE_HISTORY_LIMITS.MAX_EVENTS + 1, afterTs: undefined, beforeTs: undefined });
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      requestId: 'req-clamped',
+      actualPayloadBytes: expect.any(Number),
     }));
   });
 });

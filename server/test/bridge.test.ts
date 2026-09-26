@@ -35,12 +35,14 @@ import { FS_TRANSPORT_MSG } from '../../shared/fs-transport-messages.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 import {
   TIMELINE_HISTORY_CANCEL_CAPABILITY,
+  TIMELINE_CURSOR_DIRECTIONS,
   TIMELINE_MESSAGES,
   TIMELINE_PROTOCOL_CAPABILITY,
   TIMELINE_PROTOCOL_REVISION,
   TIMELINE_RESPONSE_SOURCES,
   TIMELINE_RESPONSE_STATUS,
 } from '../../shared/timeline-protocol.js';
+import { TIMELINE_HISTORY_LIMITS } from '../../shared/timeline-history-limits.js';
 import { TIMELINE_REQUEST_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
 import { OPENSPEC_AUTO_DELIVER_MSG } from '../../shared/openspec-auto-deliver-constants.js';
@@ -7504,6 +7506,46 @@ describe('WsBridge', () => {
       }
     });
 
+    it('deduplicates identical in-flight history requests across browser sockets', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+      const browserA = new MockWs();
+      const browserB = new MockWs();
+      bridge.handleBrowserConnection(browserA as never, 'test-user', makeDb('valid-hash'));
+      bridge.handleBrowserConnection(browserB as never, 'test-user', makeDb('valid-hash'));
+      const request = (requestId: string) => ({
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        sessionName: 'deck_sub_qwen',
+        requestId,
+        limit: 200,
+        budgetBytes: TIMELINE_HISTORY_LIMITS.MAX_BYTES,
+        cursor: { epoch: 2, direction: TIMELINE_CURSOR_DIRECTIONS.OLDER, beforeTs: 10_000 },
+      });
+      browserA.emit('message', JSON.stringify(request('dedup-a')));
+      browserB.emit('message', JSON.stringify(request('dedup-b')));
+      await flushAsync();
+      const outbound = daemonWs.sentStrings
+        .map((raw) => JSON.parse(raw) as Record<string, unknown>)
+        .filter((msg) => msg.type === TIMELINE_MESSAGES.HISTORY_REQUEST);
+      expect(outbound).toHaveLength(1);
+      expect(outbound[0]?.requestId).toBe('dedup-a');
+
+      daemonWs.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.HISTORY,
+        sessionName: 'deck_sub_qwen',
+        requestId: 'dedup-a',
+        events: [{ eventId: 'dedup-e1', sessionId: 'deck_sub_qwen', ts: 1, type: 'assistant.text', payload: { text: 'ok' } }],
+        epoch: 2,
+        actualPayloadBytes: 512,
+      }));
+      await flushBridgeDataPlane();
+      for (const [socket, requestId] of [[browserA, 'dedup-a'], [browserB, 'dedup-b']] as const) {
+        const responses = socket.sentStrings.map((raw) => JSON.parse(raw) as Record<string, unknown>)
+          .filter((msg) => msg.type === TIMELINE_MESSAGES.HISTORY);
+        expect(responses).toHaveLength(1);
+        expect(responses[0]?.requestId).toBe(requestId);
+      }
+    });
+
     it('cleans up pending request after 30s timeout', async () => {
       vi.useFakeTimers();
       const { bridge, daemonWs } = await setupAuth();
@@ -7908,11 +7950,13 @@ describe('WsBridge', () => {
           type: TIMELINE_MESSAGES.HISTORY_REQUEST,
           sessionName: 'deck_sub_qwen',
           requestId: 'queue-ok',
+          limit: 50,
         }));
         browserQueueFull.emit('message', JSON.stringify({
           type: TIMELINE_MESSAGES.HISTORY_REQUEST,
           sessionName: 'deck_sub_qwen',
           requestId: 'queue-full',
+          limit: 51,
         }));
         await flushAsync();
 
@@ -7960,6 +8004,69 @@ describe('WsBridge', () => {
           type: TIMELINE_MESSAGES.HISTORY,
           route: 'browser_request',
         })).toBe(1);
+      } finally {
+        resetQueueConfig();
+      }
+    });
+
+    it('rejects queued history by byte budget and releases bytes when a socket closes', async () => {
+      const resetQueueConfig = __setTimelineDataPlaneQueueConfigForTests({
+        queueCap: 10,
+        maxBytes: 100,
+        socketMaxBytes: 100,
+        userMaxBytes: 100,
+      });
+      try {
+        const { bridge, daemonWs } = await setupAuth();
+        const slowBrowser = new SlowMockWs();
+        const queuedBrowser = new MockWs();
+        bridge.handleBrowserConnection(slowBrowser as never, 'test-user', makeDb('valid-hash'));
+        bridge.handleBrowserConnection(queuedBrowser as never, 'other-user', makeDb('valid-hash'));
+        slowBrowser.emit('message', JSON.stringify({
+          type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+          sessionName: 'deck_sub_qwen',
+          requestId: 'bytes-first',
+          limit: 100,
+        }));
+        await flushAsync();
+        daemonWs.emit('message', JSON.stringify({
+          type: TIMELINE_MESSAGES.HISTORY,
+          sessionName: 'deck_sub_qwen',
+          requestId: 'bytes-first',
+          events: [{ eventId: 'bytes-first-e1', sessionId: 'deck_sub_qwen', ts: 1, type: 'assistant.text', payload: { text: 'hold' } }],
+          epoch: 1,
+          actualPayloadBytes: 80,
+        }));
+        await flushOneBridgeDataPlaneTurn();
+
+        queuedBrowser.emit('message', JSON.stringify({
+          type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+          sessionName: 'deck_sub_qwen',
+          requestId: 'bytes-second',
+          limit: 101,
+        }));
+        await flushAsync();
+        daemonWs.emit('message', JSON.stringify({
+          type: TIMELINE_MESSAGES.HISTORY,
+          sessionName: 'deck_sub_qwen',
+          requestId: 'bytes-second',
+          events: [{ eventId: 'bytes-second-e1', sessionId: 'deck_sub_qwen', ts: 2, type: 'assistant.text', payload: { text: 'reject' } }],
+          epoch: 1,
+          actualPayloadBytes: 80,
+        }));
+        await flushAsync();
+        expect(queuedBrowser.sentStrings.map((raw) => JSON.parse(raw) as Record<string, unknown>)).toContainEqual(expect.objectContaining({
+          requestId: 'bytes-second',
+          status: TIMELINE_RESPONSE_STATUS.ERROR,
+          errorReason: TIMELINE_REQUEST_ERROR_REASONS.QUEUE_FULL,
+        }));
+
+        slowBrowser.close();
+        await flushAsync();
+        expect(getCounter('ws_bridge_timeline_data_plane_canceled', {
+          type: TIMELINE_MESSAGES.HISTORY,
+          route: 'browser_request',
+        })).toBeGreaterThan(0);
       } finally {
         resetQueueConfig();
       }
