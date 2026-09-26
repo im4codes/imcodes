@@ -56,6 +56,7 @@ import {
   buildCorrectionMessage,
   buildDoneReminderMessage,
   buildNoAuditorDoneNotice,
+  buildPassDoneNoticeMessage,
   buildReworkNoticeMessage,
 } from './messages.js';
 
@@ -445,6 +446,25 @@ export class TaskPairService {
         stored.state.brain, stored.state.taskId, 'brain-line-done-no-auditor',
         buildNoAuditorDoneNotice(stored.state, summary),
       ));
+    }
+    // An audited pair's PASS (and, as a backstop, its later DONE) gets Brain
+    // a notice with the verdict and material by itself -- owner report: two
+    // PASSed pairs sat unintegrated for hours because Brain relied on the
+    // executor remembering to say so (mirrors the no-auditor DONE relay
+    // above). Exactly one per pair per round: whichever transition catches
+    // it first.
+    if (stored && stored.state.auditor && stored.state.auditor !== TASK_PAIR_NO_AUDITOR
+      && input.writer !== stored.state.brain
+      && ((transition.toStatus === 'passed' && transition.fromStatus !== 'passed')
+        || (input.marker.knownVerb === 'DONE' && transition.toStatus === 'done' && transition.fromStatus !== 'done'))) {
+      const key = `pass-done-notice:${stored.state.round}`;
+      if (!stored.liveness.notified.includes(key)) {
+        store.saveLiveness(input.project, stored.state.taskId, { ...stored.liveness, notified: [...stored.liveness.notified, key] });
+        this.#track(sendTaskPairMessage(
+          stored.state.brain, stored.state.taskId, 'brain-line-pass-done',
+          buildPassDoneNoticeMessage(stored.state),
+        ));
+      }
     }
     if (input.marker.knownVerb === 'DISPATCH' && transition.pair?.executor
       && input.writer === transition.pair.brain) {

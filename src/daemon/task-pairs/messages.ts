@@ -268,7 +268,7 @@ export function buildNudgeMessage(pair: TaskPairState, side: 'executor' | 'audit
     }
   } else {
     const next = pair.status === 'passed'
-      ? `PASS received: commit/push your work, then write ${marker('DONE', pair.taskId)}.`
+      ? `PASS received: commit/push your branch (never dev/main -- Brain integrates), report the branch and HEAD to Brain, then write ${marker('DONE', pair.taskId)}.`
       : pair.status === 'awaiting_audit'
         ? `DONE without a PASS is not complete: send your validation to auditor ${pair.auditor}, then write ${readyMarker(pair)}.`
         : pair.status === 'rework'
@@ -445,4 +445,27 @@ export function buildNoAuditorDoneNotice(pair: TaskPairState, executorSummary: s
   return `${header(pair)} DONE from executor ${pair.executor ?? '(unknown)'}, no auditor for this pair.${
     summary ? `\n\n${summary}` : ' (no summary text in the closing reply)'
   }`;
+}
+
+/**
+ * Relayed to Brain the moment an audited pair PASSes (or, as a backstop if
+ * that notice was somehow missed, again when it reaches DONE): owner report,
+ * two PASSed pairs sat unintegrated for hours because Brain relied on the
+ * executor remembering to say so. Exactly one per pair per round; whichever
+ * transition catches it first (see service.ts's dedup).
+ */
+export function buildPassDoneNoticeMessage(pair: TaskPairState): string {
+  const verdict = pair.lastVerdict;
+  const verdictLine = verdict
+    ? `Auditor ${pair.auditor} verdict: ${verdict.verb} (${formatTaskPairSeverityCounts(verdict.counts)}; blocking=${pair.blocking.join(',')}).`
+    : `Auditor ${pair.auditor} verdict: PASS.`;
+  const where = materialLine(pair.material);
+  return [
+    header(pair),
+    `Audited pair ${pair.status === 'done' ? 'done' : 'passed'}: executor ${pair.executor ?? '-'}.`,
+    verdictLine,
+    ...(pair.workspace?.branch ? [`Branch: ${pair.workspace.branch}.`] : []),
+    ...(where ? [where] : []),
+    'Brain integrates this from here; the executor never pushes to dev/main itself.',
+  ].join('\n');
 }
