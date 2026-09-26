@@ -14,6 +14,8 @@ import {
 } from '../api.js';
 import { isNative } from '../native.js';
 import { validatePasswordComplexity } from '@shared/password-rules.js';
+import { AUTH_ERROR_CODES } from '@shared/auth-error-codes.js';
+import { LOGIN_SESSION_NOT_STUCK_KEY } from '../login-session-not-stuck.js';
 
 export interface LoginAuthAttempt {
   isCurrent: () => boolean;
@@ -127,13 +129,13 @@ export function LoginPage({
       if (!code && typeof parsed.error === 'string') code = parsed.error;
       if (typeof parsed.retryAfterMs === 'number') retryAfterMs = parsed.retryAfterMs;
     } catch { /* non-JSON error body */ }
-    if (code === 'too_many_attempts') {
+    if (code === AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS) {
       const minutes = Math.max(1, Math.ceil((retryAfterMs ?? 60_000) / 60_000));
       return t('login.too_many_attempts', { minutes });
     }
-    if (code === 'invalid_credentials') return t('login.invalid_credentials');
-    if (code === 'account_pending') return t('login.account_pending');
-    if (code === 'account_disabled') return t('login.account_disabled');
+    if (code === AUTH_ERROR_CODES.INVALID_CREDENTIALS) return t('login.invalid_credentials');
+    if (code === AUTH_ERROR_CODES.ACCOUNT_PENDING) return t('login.account_pending');
+    if (code === AUTH_ERROR_CODES.ACCOUNT_DISABLED) return t('login.account_disabled');
     // A real ApiError with no ok status (5xx, or 0 for a fetch()-level
     // failure) is network/server-shaped by construction. A non-ApiError throw
     // (a JS error unrelated to the request) only counts as network/server-shaped
@@ -368,7 +370,7 @@ export function LoginPage({
         setMode('change_password');
       } else {
         onLogin?.();
-        try { sessionStorage.setItem('rcc_login_session_not_stuck', '1'); } catch { /* ignore */ }
+        try { sessionStorage.setItem(LOGIN_SESSION_NOT_STUCK_KEY, '1'); } catch { /* ignore */ }
         window.location.reload();
       }
     } catch (err: unknown) {
@@ -415,17 +417,17 @@ export function LoginPage({
         onLoginSuccess?.(res.userId, serverUrl!);
       } else {
         onLogin?.();
-        try { sessionStorage.setItem('rcc_login_session_not_stuck', '1'); } catch { /* ignore */ }
+        try { sessionStorage.setItem(LOGIN_SESSION_NOT_STUCK_KEY, '1'); } catch { /* ignore */ }
         window.location.reload();
       }
     } catch (err: unknown) {
       if (!attempt.isCurrent()) return;
       const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes('username_taken')) {
+      if (msg.includes(AUTH_ERROR_CODES.USERNAME_TAKEN)) {
         setError(t('login.username_taken'));
-      } else if (msg.includes('registration_disabled')) {
+      } else if (msg.includes(AUTH_ERROR_CODES.REGISTRATION_DISABLED)) {
         setError(t('login.registration_disabled'));
-      } else if (msg.includes('invalid_username_format')) {
+      } else if (msg.includes(AUTH_ERROR_CODES.INVALID_USERNAME_FORMAT)) {
         setError(t('login.invalid_username_format'));
       } else if (msg.includes('password_missing_')) {
         const key = msg.match(/password_missing_\w+/)?.[0];

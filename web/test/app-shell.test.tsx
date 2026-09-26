@@ -1246,6 +1246,32 @@ describe('App shell', () => {
     expect(sessionStorage.getItem('rcc_login_session_not_stuck')).toBeNull();
   }, 20_000);
 
+  it('shows the session-not-stuck message right away, not one reload late, when a stale local auth record also needs clearing', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain?shared=share-login-route');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    sessionStorage.setItem('rcc_login_session_not_stuck', '1');
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') {
+        const { ApiError } = await import('../src/api.js');
+        throw new ApiError(401, 'expired');
+      }
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    // The flag must be consumed and the message shown in this same mount --
+    // not swallowed by the stale-`auth` clearAuthState branch and left to
+    // surface only on a later reload.
+    expect(await screen.findByText('login.session_not_stuck')).toBeTruthy();
+    expect(sessionStorage.getItem('rcc_login_session_not_stuck')).toBeNull();
+    expect(localStorage.getItem('rcc_auth')).toBeNull();
+  }, 20_000);
+
   it('does not show the session-not-stuck message when a just-completed login does survive reload', async () => {
     history.replaceState(null, '', '/#/srv-shared/deck_beta_brain?shared=share-login-route');
     sessionStorage.setItem('rcc_login_session_not_stuck', '1');

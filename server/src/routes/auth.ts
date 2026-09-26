@@ -9,6 +9,7 @@ import { checkAuthLockout, recordAuthFailure } from '../security/lockout.js';
 import { resolveServerWebSocketAccess } from '../security/authorization.js';
 import { WsBridge } from '../ws/bridge.js';
 import { COOKIE_SESSION, COOKIE_CSRF } from '../../../shared/cookie-names.js';
+import { AUTH_ERROR_CODES } from '../../../shared/auth-error-codes.js';
 import { deleteTokenUsageFactsForUser } from '../db/token-usage-queries.js';
 import { z } from 'zod';
 import logger from '../util/logger.js';
@@ -183,7 +184,7 @@ authRoutes.post('/register', async (c) => {
   // Check if registration is enabled
   const regEnabled = await getSetting(c.env.DB, 'registration_enabled');
   if (regEnabled === 'false') {
-    return c.json({ error: 'registration_disabled' }, 403);
+    return c.json({ error: AUTH_ERROR_CODES.REGISTRATION_DISABLED }, 403);
   }
 
   // Idempotency: deduplicate retried registration requests
@@ -478,7 +479,7 @@ authRoutes.post('/refresh', async (c) => {
   const refreshToken = cookieRefresh ?? parsed.data?.refreshToken;
   if (!refreshToken) {
     logger.warn({ hasCookieRefresh: !!cookieRefresh }, '[refresh] no refresh token provided');
-    return c.json({ error: 'invalid_body' }, 400);
+    return c.json({ error: AUTH_ERROR_CODES.INVALID_BODY }, 400);
   }
 
   const tokenHash = sha256Hex(refreshToken);
@@ -503,7 +504,7 @@ authRoutes.post('/refresh', async (c) => {
   if (!refreshUser || refreshUser.status !== 'active') {
     // Consume the token to prevent replay, but don't issue new ones
     await c.env.DB.execute('UPDATE refresh_tokens SET used_at = $1 WHERE id = $2', [Date.now(), row.id]);
-    return c.json({ error: 'account_disabled' }, 403);
+    return c.json({ error: AUTH_ERROR_CODES.ACCOUNT_DISABLED }, 403);
   }
 
   // A valid refresh token is not a brute-force attempt. In particular, never
@@ -511,7 +512,7 @@ authRoutes.post('/refresh', async (c) => {
   // invalidate refresh for every other logged-in user.
   const userLockout = await checkAuthLockout(c.env.DB, `user:${row.user_id}`);
   if (userLockout.locked) {
-    return c.json({ error: 'too_many_attempts', retryAfterMs: userLockout.lockedUntil ? userLockout.lockedUntil - Date.now() : 0 }, 429);
+    return c.json({ error: AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS, retryAfterMs: userLockout.lockedUntil ? userLockout.lockedUntil - Date.now() : 0 }, 429);
   }
 
   // Mark old token consumed (rotation)
@@ -649,12 +650,12 @@ authRoutes.post('/password/register', async (c) => {
   // Check if registration is enabled
   const regEnabled = await getSetting(c.env.DB, 'registration_enabled');
   if (regEnabled === 'false') {
-    return c.json({ error: 'registration_disabled' }, 403);
+    return c.json({ error: AUTH_ERROR_CODES.REGISTRATION_DISABLED }, 403);
   }
 
   const body = await c.req.json().catch(() => null);
   const parsed = passwordRegisterSchema.safeParse(body);
-  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+  if (!parsed.success) return c.json({ error: AUTH_ERROR_CODES.INVALID_BODY }, 400);
 
   const { username, password, displayName, native } = parsed.data;
 
@@ -667,13 +668,13 @@ authRoutes.post('/password/register', async (c) => {
   // Validate username format
   const normalizedUsername = username.trim().toLowerCase();
   if (!USERNAME_REGEX.test(normalizedUsername)) {
-    return c.json({ error: 'invalid_username_format' }, 400);
+    return c.json({ error: AUTH_ERROR_CODES.INVALID_USERNAME_FORMAT }, 400);
   }
 
   // Check username availability
   const existingUser = await getUserByUsername(c.env.DB, normalizedUsername);
   if (existingUser) {
-    return c.json({ error: 'username_taken' }, 409);
+    return c.json({ error: AUTH_ERROR_CODES.USERNAME_TAKEN }, 409);
   }
 
   // Create user
@@ -753,7 +754,7 @@ const passwordLoginSchema = z.object({
 authRoutes.post('/password/login', async (c) => {
   const body = await c.req.json().catch(() => null);
   const parsed = passwordLoginSchema.safeParse(body);
-  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+  if (!parsed.success) return c.json({ error: AUTH_ERROR_CODES.INVALID_BODY }, 400);
 
   const { username, password, native } = parsed.data;
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
@@ -764,7 +765,7 @@ authRoutes.post('/password/login', async (c) => {
   // Check BEFORE user lookup to avoid timing side-channels.
   const usernameLockout = await checkAuthLockout(c.env.DB, `username:${normalizedUsername}`);
   if (usernameLockout.locked) {
-    return c.json({ error: 'too_many_attempts', retryAfterMs: usernameLockout.lockedUntil ? usernameLockout.lockedUntil - Date.now() : 0 }, 429);
+    return c.json({ error: AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS, retryAfterMs: usernameLockout.lockedUntil ? usernameLockout.lockedUntil - Date.now() : 0 }, 429);
   }
 
   const user = await getUserByUsername(c.env.DB, normalizedUsername);
@@ -772,25 +773,25 @@ authRoutes.post('/password/login', async (c) => {
     // Unified failure: record against the attempted username even when it does
     // not exist. This cannot affect another account.
     await recordAuthFailure(c.env.DB, `username:${normalizedUsername}`, 'password_login_invalid_credentials');
-    return c.json({ error: 'invalid_credentials' }, 401);
+    return c.json({ error: AUTH_ERROR_CODES.INVALID_CREDENTIALS }, 401);
   }
 
   // User ID — prevents abuse of a specific known account.
   const userLockout = await checkAuthLockout(c.env.DB, `user:${user.id}`);
   if (userLockout.locked) {
-    return c.json({ error: 'too_many_attempts', retryAfterMs: userLockout.lockedUntil ? userLockout.lockedUntil - Date.now() : 0 }, 429);
+    return c.json({ error: AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS, retryAfterMs: userLockout.lockedUntil ? userLockout.lockedUntil - Date.now() : 0 }, 429);
   }
 
   const valid = await verifyPassword(password, user.password_hash);
   if (!valid) {
     await recordAuthFailure(c.env.DB, `username:${normalizedUsername}`, 'password_login_invalid_credentials');
     await recordAuthFailure(c.env.DB, `user:${user.id}`, 'password_login_invalid_credentials');
-    return c.json({ error: 'invalid_credentials' }, 401);
+    return c.json({ error: AUTH_ERROR_CODES.INVALID_CREDENTIALS }, 401);
   }
 
   // Reject disabled/pending users
   if (user.status !== 'active') {
-    return c.json({ error: user.status === 'pending' ? 'account_pending' : 'account_disabled' }, 403);
+    return c.json({ error: user.status === 'pending' ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED }, 403);
   }
 
   // Issue access (4h) + refresh (30d) tokens

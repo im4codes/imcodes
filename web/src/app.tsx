@@ -30,6 +30,7 @@ import type { MessagePin } from '@shared/message-pins.js';
 import { mapP2pRunToDiscussion, mergeP2pDiscussionUpdate, mergeP2pStatusResponseDiscussions } from './p2p-run-mapping.js';
 import { matchDiscussionIndex, reconcileDiscussionEntry, reconcileClassicList, isBarActiveDiscussion, makeOptimisticDiscussionEntry, discussionErrorReasonKey, shouldToastDiscussionError, classifyDiscussionStop, removeDiscussionByRequestId } from './discussion-reconcile.js';
 import { PENDING_START_TIMEOUT_MS, DISCUSSION_RECONCILE_HIDDEN_MS } from '@shared/discussion-ui.js';
+import { LOGIN_SESSION_NOT_STUCK_KEY } from './login-session-not-stuck.js';
 import { useTranslation } from 'react-i18next';
 import { ErrorBoundary } from './components/ErrorBoundary.js';
 import { LanguageSwitcher } from './components/LanguageSwitcher.js';
@@ -1358,7 +1359,7 @@ export function App() {
     console.warn('[auth] mount: verifying session via /api/auth/user/me');
     void apiFetch<{ id: string }>('/api/auth/user/me').then((user) => {
       console.warn(`[auth] /me OK: userId=${user.id}`);
-      try { sessionStorage.removeItem('rcc_login_session_not_stuck'); } catch { /* ignore */ }
+      try { sessionStorage.removeItem(LOGIN_SESSION_NOT_STUCK_KEY); } catch { /* ignore */ }
       if (authGeneration !== authMutationGenerationRef.current) return;
       if (auth && auth.userId !== user.id) {
         void clearAuthState(AUTH_IDENTITY_ERRORS.CHANGED, { credentialServerUrl: auth.baseUrl });
@@ -1374,23 +1375,26 @@ export function App() {
       });
     }).catch(async (err) => {
       console.warn(`[auth] /me FAILED:`, err instanceof ApiError ? `${err.status}: ${err.body}` : err);
-      // A logged-out cold start has no auth state to clear. Running the full
-      // clear path anyway used to erase an explicit shared hash before the
-      // user could sign in and continue to that tab.
-      if (err instanceof ApiError && err.status === 401 && auth) {
-        await clearAuthState('mount_verify_401', { credentialServerUrl: auth.baseUrl });
-      } else if (err instanceof ApiError && err.status === 401) {
+      if (err instanceof ApiError && err.status === 401) {
         // Only a login that just completed sets this flag, right before its
         // own reload -- an ordinary logged-out visitor never does. Consuming
         // it here (rather than leaving it for LoginPage to read at mount)
         // means the message only ever appears once we know verification
-        // truly failed, not the instant LoginPage renders.
+        // truly failed, not the instant LoginPage renders. Checked in both
+        // branches below: a stale local `auth` record from a previous login
+        // must not swallow the flag and delay the message to a later reload.
         try {
-          if (sessionStorage.getItem('rcc_login_session_not_stuck') === '1') {
-            sessionStorage.removeItem('rcc_login_session_not_stuck');
+          if (sessionStorage.getItem(LOGIN_SESSION_NOT_STUCK_KEY) === '1') {
+            sessionStorage.removeItem(LOGIN_SESSION_NOT_STUCK_KEY);
             setSessionNotStuck(true);
           }
         } catch { /* ignore storage restrictions */ }
+        // A logged-out cold start has no auth state to clear. Running the full
+        // clear path anyway used to erase an explicit shared hash before the
+        // user could sign in and continue to that tab.
+        if (auth) {
+          await clearAuthState('mount_verify_401', { credentialServerUrl: auth.baseUrl });
+        }
       }
     }).finally(() => {
       setInitialAuthVerificationPending(false);
