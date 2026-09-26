@@ -1108,6 +1108,7 @@ export function buildTaskPairMarkerContract(): string {
     `[Contract: ${TASK_PAIR_CONTRACT_ID}]`,
     'Supervised tasks are executor+auditor pairs driven by one-line markers you write on their own line in your reply (never inside code fences):',
     `<!-- ${TASK_PAIR_MARKER_TAG} <VERB> <taskId> [key=value | key="quoted value"] -->`,
+    `A marker must be in your FINAL reply of the turn: only the last text segment is scanned, so one written before an earlier tool call in the same turn is silently lost. If you need to call a tool first, finish acting, then write the marker(s) in your closing reply. A long brief goes between QUEUE <taskId> ... and its <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> --> line, not scattered across earlier turn text.`,
     'Verbs: DISPATCH, QUEUE, STARTED, WORKING, READY_FOR_AUDIT, PASS, REWORK, DONE, BLOCKED, NEEDS_INPUT, REASSIGN, CANCEL. taskId "-" means your single open task.',
     'Executor: write STARTED when you begin and work in the pair\'s workspace (below). When done, send the auditor your validation (full suites for code) with send_message and write READY_FOR_AUDIT naming the material; the daemon relays it to the auditor. After PASS commit/push code yourself and write DONE (with output= when the result must be kept). DONE without a PASS is not complete. Write BLOCKED or NEEDS_INPUT with note="..." when stuck.',
     TASK_PAIR_WORKSPACE_RULES,

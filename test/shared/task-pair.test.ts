@@ -118,6 +118,13 @@ describe('task-pair marker grammar', () => {
     expect(body).toContain('IMCODES_TASK_END');
   });
 
+  it('warns that a marker written before a mid-turn tool call is lost, since only the final reply is scanned', () => {
+    const body = buildTaskPairMarkerContract();
+    expect(body).toContain('FINAL reply of the turn');
+    expect(body).toContain('silently lost');
+    expect(body).toContain('QUEUE <taskId> ... and its');
+  });
+
   it('ships a contract stating a project\'s own workflow takes precedence, and that Brain hears only final/terminal states', () => {
     const body = buildTaskPairMarkerContract();
     expect(body).toContain('takes precedence over');

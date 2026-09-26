@@ -66,6 +66,24 @@ export interface ApplyMarkerInput {
   /** Stable id for this marker occurrence: replaying it is a no-op. */
   eventId: string;
   now?: number;
+  /**
+   * A DISPATCH this creates with no auditor named gets one held for a short
+   * grace window instead of an immediate auto-pick, in case the Brain's own
+   * marker for the same taskId (naming the intended auditor) is still in
+   * flight. Set only for a pair minted without real task metadata (a plain
+   * send_message notice/relay) -- one opened from an explicit objective picks
+   * an auditor immediately, same as before.
+   */
+  suppressAutoPickAuditor?: boolean;
+}
+
+/** How long a DISPATCH suppressed by `suppressAutoPickAuditor` waits for a
+ *  race-arriving Brain marker before falling back to the normal auto-pick.
+ *  Read fresh on every call (not frozen at module load) so tests can override
+ *  it via IMCODES_IMPLICIT_AUDITOR_GRACE_MS regardless of import order. */
+function resolveImplicitAuditorGraceMs(): number {
+  const raw = parseInt(process.env.IMCODES_IMPLICIT_AUDITOR_GRACE_MS ?? '', 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 5_000;
 }
 
 /** The text names this task id as a whole token (so `T1` is not found in `T10`; trailing punctuation is fine). */
@@ -219,6 +237,43 @@ export class TaskPairService {
     return focus.taskId;
   }
 
+  /**
+   * (a) An existing OPEN pair the message text names, when the sender is
+   * that pair's Brain or a participant of it. An explicit reference like
+   * this is unambiguous regardless of whether the send also carries real
+   * task metadata of its own, so callers check it unconditionally.
+   */
+  resolveMentionedOpenPair(project: string, sender: string, text: string): string | undefined {
+    for (const stored of getTaskPairStore().listActivePairs(project)) {
+      const state = stored.state;
+      if (!TASK_PAIR_OPEN_STATUSES.includes(state.status)) continue;
+      if (sender !== state.brain && sender !== state.executor && sender !== state.auditor) continue;
+      if (mentionsTaskId(text, state.taskId)) return state.taskId;
+    }
+    return undefined;
+  }
+
+  /**
+   * (b) The one open pair of this Brain whose executor or auditor slot the
+   * target already holds -- a message to a session already working on a
+   * pair continues that pair rather than starting a new task. More than one
+   * match is ambiguous (which one continues?) and returns undefined.
+   *
+   * Only for a send with no real task metadata of its own (a plain
+   * send_message, or one carrying no objective): an EXPLICIT new objective
+   * is "clearly new work" (see bullet 2) even for a target already busy with
+   * something else, and must still open its own pair -- callers must not
+   * call this when the send itself names an objective.
+   */
+  resolveSingleParticipantOpenPair(sender: string, target: string): string | undefined {
+    const matches = getTaskPairStore().pairsForSession(target).filter((stored) => {
+      const state = stored.state;
+      return state.brain === sender && TASK_PAIR_OPEN_STATUSES.includes(state.status)
+        && (state.executor === target || state.auditor === target);
+    });
+    return matches.length === 1 ? matches[0]!.state.taskId : undefined;
+  }
+
   handleTimelineEvent(event: TimelineEvent): void {
     if (event.type !== 'assistant.text') return;
     const payload = event.payload as Record<string, unknown>;
@@ -310,7 +365,13 @@ export class TaskPairService {
       void refreshTaskPairWorkspaceHead(input.project, stored.state.taskId);
     }
     this.#emitEvent(input, taskId ?? input.marker.taskId, role, transition, stored?.state ?? existing?.state);
-    this.#track(this.#executeIntents(input.project, stored?.state, transition.intents));
+    const holdsAutoPickAuditor = input.suppressAutoPickAuditor
+      && transition.intents.some((intent) => intent.kind === 'pick_auditor');
+    const immediateIntents = holdsAutoPickAuditor
+      ? transition.intents.filter((intent) => intent.kind !== 'pick_auditor')
+      : transition.intents;
+    this.#track(this.#executeIntents(input.project, stored?.state, immediateIntents));
+    if (holdsAutoPickAuditor && stored) this.#track(this.#gracePickAuditor(input.project, stored.state.taskId));
     // A pair Brain opens (DISPATCH marker, plain or task-tagged dispatch) tells
     // its participants what a pair is. The queue sends its own brief.
     if (stored && input.source !== 'queue' && input.marker.knownVerb === 'DISPATCH'
@@ -354,6 +415,10 @@ export class TaskPairService {
     project?: string; sender: string; target: string; taskId: string; auditor?: string; title?: string; eventId: string;
     /** Owner rule (design D-pool-sync): a bound `task.requestedExecutionType.model` on the initial send_message dispatch, kept so a later automatic executor replacement still honors it instead of falling back to the allowlist. */
     executorModel?: string;
+    /** True only for a send carrying real task metadata (task.objective).
+     *  A pair minted for a plain send_message (no metadata) has none of the
+     *  Brain's own task description -- see suppressAutoPickAuditor. */
+    hasObjective?: boolean;
   }): TaskPairTransition | undefined {
     const project = input.project ?? projectOfSession(input.sender) ?? projectOfSession(input.target);
     if (!project || !isPairsEngineProject(project)) return undefined;
@@ -393,6 +458,11 @@ export class TaskPairService {
       },
       source: 'implicit_dispatch',
       eventId: input.eventId,
+      // Only when named the auditor is applied immediately as before; a bare
+      // dispatch with none holds the auto-pick for the grace window unless
+      // this send itself carried a real objective (clearly new work, no
+      // reason to wait).
+      ...(!input.auditor && !input.hasObjective ? { suppressAutoPickAuditor: true } : {}),
     });
   }
 
@@ -536,6 +606,22 @@ export class TaskPairService {
         logger.warn({ err: error, taskId: pair.taskId, intent: intent.kind }, 'task-pair: intent failed');
       }
     }
+  }
+
+  /** Fires the `pick_auditor` intent held by `suppressAutoPickAuditor` if the
+   *  grace window elapses with no real auditor -- i.e. the Brain's marker
+   *  never arrived (or arrived with no auditor of its own), same outcome as
+   *  an ordinary immediate pick, just delayed. */
+  async #gracePickAuditor(project: string, taskId: string): Promise<void> {
+    const graceMs = resolveImplicitAuditorGraceMs();
+    // A real setTimeout, even at 0ms, waits for Node's timer phase, which can
+    // lag behind microtasks/setImmediate under load -- exactly the busy-daemon
+    // scenario this feature exists for. Skip it entirely when grace is
+    // disabled instead of racing that phase.
+    if (graceMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, graceMs));
+    const latest = getTaskPairStore().getPair(project, taskId);
+    if (!latest || latest.state.auditor) return;
+    await this.#executeIntents(project, latest.state, [{ kind: 'pick_auditor' }]);
   }
 
   /**
