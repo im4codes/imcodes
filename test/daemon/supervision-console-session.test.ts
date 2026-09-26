@@ -197,7 +197,9 @@ describe('pairs engine rows', () => {
     const { taskPairService } = await import('../../src/daemon/task-pairs/service.js');
     taskPairService.ingestText('codedeck', 'deck_cd_brain',
       '<!-- IMCODES_TASK DISPATCH P1 executor=deck_sub_exec auditor=deck_sub_aud title="Export" -->', 'console-turn-1');
-    taskPairService.ingestText('codedeck', 'deck_sub_exec', '<!-- IMCODES_TASK READY_FOR_AUDIT P1 -->', 'console-turn-2');
+    // Owner rule: the auditor verdict must be tied to material from a real
+    // READY_FOR_AUDIT round.
+    taskPairService.ingestText('codedeck', 'deck_sub_exec', '<!-- IMCODES_TASK READY_FOR_AUDIT P1 path=/workspace -->', 'console-turn-2');
     taskPairService.ingestText('codedeck', 'deck_sub_aud', '<!-- IMCODES_TASK REWORK P1 blocking=P0 p0=1 p2=1 -->', 'console-turn-3');
     registry.handleFrame(subscribe());
     const snapshot = sent[0];

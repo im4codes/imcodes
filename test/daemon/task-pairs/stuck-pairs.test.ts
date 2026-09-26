@@ -229,6 +229,7 @@ describe('pairs that stopped driving themselves (215 / jdzj)', () => {
     expect(sentTo(BRAIN, 'brain-needs_auditor')).toHaveLength(0);
     // A finished audit frees a slot for the next one on the following heartbeat.
     const first = pair('tsk_s0');
+    marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT tsk_s0 path=/workspace -->');
     marker(first.auditor!, '<!-- IMCODES_TASK PASS tsk_s0 blocking=P0 -->');
     await tick(1);
     expect(pair(`tsk_s${TASK_PAIR_DEFAULT_MAX_CONCURRENCY}`).auditor).toBeDefined();
@@ -242,7 +243,8 @@ describe('pairs that stopped driving themselves (215 / jdzj)', () => {
     const ids = Array.from({ length: 7 }, (_, index) => `P${index + 1}`);
     for (const id of ids) {
       marker(BRAIN, `<!-- IMCODES_TASK DISPATCH ${id} executor=${EXEC} auditor=${AUD} -->`);
-      marker(EXEC, `<!-- IMCODES_TASK READY_FOR_AUDIT ${id} -->`);
+    // Owner rule: an auditor verdict requires material from READY_FOR_AUDIT.
+    marker(EXEC, `<!-- IMCODES_TASK READY_FOR_AUDIT ${id} path=/workspace -->`);
       marker(AUD, `<!-- IMCODES_TASK PASS ${id} blocking=P0 -->`);
     }
     await flush();
@@ -320,7 +322,8 @@ describe('pairs that stopped driving themselves (215 / jdzj)', () => {
 
   it('reassigns a REAL rate-limited executor to a spare at once (owner correction: failover, not a hold)', async () => {
     marker(BRAIN, `<!-- IMCODES_TASK DISPATCH L1 executor=${EXEC} auditor=${AUD} -->`);
-    marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT L1 -->');
+    // Owner rule: a PASS must close a material-backed audit round.
+    marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT L1 path=/workspace -->');
     marker(AUD, '<!-- IMCODES_TASK PASS L1 blocking=P0 -->');
     await flush();
     sent = [];
@@ -336,7 +339,8 @@ describe('pairs that stopped driving themselves (215 / jdzj)', () => {
 
   it('holds a merely capacity-limited executor without nudging, escalates only after the silence limit, and resumes after the limit clears', async () => {
     marker(BRAIN, `<!-- IMCODES_TASK DISPATCH L1b executor=${EXEC} auditor=${AUD} -->`);
-    marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT L1b -->');
+    // Owner rule: a PASS must close a material-backed audit round.
+    marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT L1b path=/workspace -->');
     marker(AUD, '<!-- IMCODES_TASK PASS L1b blocking=P0 -->');
     await flush();
     sent = [];
@@ -376,7 +380,8 @@ describe('pairs that stopped driving themselves (215 / jdzj)', () => {
 
   it('still replaces a usage-limited auditor at once', async () => {
     marker(BRAIN, `<!-- IMCODES_TASK DISPATCH L2 executor=${EXEC} auditor=${AUD} -->`);
-    marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT L2 -->');
+    // Owner rule: a verdict applies only to a material-backed audit round.
+    marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT L2 path=/workspace -->');
     await flush();
     limited.add(AUD);
     await tick(1);
@@ -440,7 +445,9 @@ describe('pairs that stopped driving themselves (215 / jdzj)', () => {
     expect(pair('tsk_plain')).toMatchObject({ status: 'in_audit', round: 1, flags: ['needs_auditor'] });
     expect(pair('tsk_plain').passRound).toBeUndefined();
     expect(pair('tsk_reassigned')).toMatchObject({ status: 'in_audit', auditor: AUD, flags: [] });
-    expect(pair('tsk_reworked').status).toBe('rework');
+    // Owner rule: a participant verdict outside in_audit cannot reopen or
+    // advance an imported pair without a real audit round.
+    expect(pair('tsk_reworked').status).toBe('passed');
     expect(pair('tsk_repassed').status).toBe('passed');
     expect(pair('tsk_forced').status).toBe('done');
     expect(pair('tsk_realpass').status).toBe('passed');
@@ -477,6 +484,7 @@ describe('pairs that stopped driving themselves (215 / jdzj)', () => {
 
     // Its real PASS is final: later passes never correct it back into audit.
     now += 1;
+    marker(pair('tsk_plain').executor, '<!-- IMCODES_TASK READY_FOR_AUDIT tsk_plain path=/workspace -->');
     marker(pair('tsk_plain').auditor!, '<!-- IMCODES_TASK PASS tsk_plain blocking=P0 -->');
     expect(pair('tsk_plain').status).toBe('passed');
     sent = [];

@@ -628,6 +628,9 @@ describe('pair workspaces', () => {
       mkdirSync(join(dir, 'reports'));
       writeFileSync(join(dir, 'reports', 'summary.md'), '# result\n');
       marker(EXEC, '<!-- IMCODES_TASK DONE O1 output=reports/summary.md -->');
+      // Owner rule: a no-auditor DONE reports to Brain; Brain must decide
+      // before the pair ends and its deliverable is copied.
+      marker(BRAIN, '<!-- IMCODES_TASK DONE O1 -->');
       const dest = join(realpathSync(plain), 'reports', 'summary.md');
       await vi.waitFor(() => expect(existsSync(dest)).toBe(true), { timeout: 10_000 });
       expect(readFileSync(dest, 'utf8')).toBe('# result\n');
@@ -644,6 +647,7 @@ describe('pair workspaces', () => {
       const dir = await opened('O2', 'auditor=none');
       writeFileSync(join(dir, 'draft.md'), 'new\n');
       marker(EXEC, '<!-- IMCODES_TASK DONE O2 output=draft.md dest=final.md -->');
+      marker(BRAIN, '<!-- IMCODES_TASK DONE O2 -->');
       const dest = join(realpathSync(plain), 'final.O2.md');
       await vi.waitFor(() => expect(existsSync(dest)).toBe(true), { timeout: 10_000 });
       expect(readFileSync(join(plain, 'final.md'), 'utf8')).toBe('the user\'s own file\n');
@@ -654,12 +658,14 @@ describe('pair workspaces', () => {
       writeFileSync(join(base, 'secret.txt'), 'x\n');
       await opened('O3', 'auditor=none');
       marker(EXEC, '<!-- IMCODES_TASK DONE O3 output=../../../secret.txt -->');
+      marker(BRAIN, '<!-- IMCODES_TASK DONE O3 -->');
       await vi.waitFor(() => expect(sentTo(BRAIN, 'brain-output-failed')).toHaveLength(1), { timeout: 10_000 });
       expect(workspaceEvents('O3')).toEqual([expect.objectContaining({ effect: TASK_PAIR_WORKSPACE_EFFECTS.OUTPUT_FAILED, attrs: expect.objectContaining({ reason: 'outside_workspace' }) })]);
 
       const dir = await opened('O4', 'auditor=none');
       writeFileSync(join(dir, 'a.txt'), 'a\n');
       marker(EXEC, '<!-- IMCODES_TASK DONE O4 output=a.txt dest=../escaped.txt -->');
+      marker(BRAIN, '<!-- IMCODES_TASK DONE O4 -->');
       await vi.waitFor(() => expect(sentTo(BRAIN, 'brain-output-failed')).toHaveLength(2), { timeout: 10_000 });
       expect(existsSync(join(base, 'escaped.txt'))).toBe(false);
       expect(workspaceEvents('O4')).toEqual([expect.objectContaining({ attrs: expect.objectContaining({ reason: 'outside_project' }) })]);
@@ -677,6 +683,7 @@ describe('pair workspaces', () => {
       const dir = await opened('O-SYMLINK', 'auditor=none');
       writeFileSync(join(dir, 'draft.md'), 'must stay in workspace\n');
       marker(EXEC, '<!-- IMCODES_TASK DONE O-SYMLINK output=draft.md dest=linked/escaped.md -->');
+      marker(BRAIN, '<!-- IMCODES_TASK DONE O-SYMLINK -->');
       await vi.waitFor(() => expect(sentTo(BRAIN, 'brain-output-failed')).toHaveLength(1), { timeout: 10_000 });
       expect(existsSync(join(outside, 'escaped.md'))).toBe(false);
       expect(workspaceEvents('O-SYMLINK')).toEqual([expect.objectContaining({
@@ -689,12 +696,15 @@ describe('pair workspaces', () => {
       const dir = await opened('O5', 'auditor=none');
       writeFileSync(join(dir, 'scratch.md'), 'temp\n');
       marker(EXEC, '<!-- IMCODES_TASK DONE O5 -->');
+      marker(BRAIN, '<!-- IMCODES_TASK DONE O5 -->');
       await endedAt('O5');
       // An output named on an early DONE (no PASS yet) is dropped when the pair is cancelled.
       const cancelled = await opened('O6', `auditor=${AUD}`);
       writeFileSync(join(cancelled, 'x.md'), 'x\n');
       marker(EXEC, '<!-- IMCODES_TASK DONE O6 output=x.md -->');
-      expect(pair('O6')).toMatchObject({ status: 'awaiting_audit', output: { path: 'x.md' } });
+      // Owner rule: an audited pair cannot advance on executor DONE before PASS.
+      expect(pair('O6')).toMatchObject({ status: 'working' });
+      expect(pair('O6').output).toBeUndefined();
       marker(BRAIN, '<!-- IMCODES_TASK CANCEL O6 -->');
       await endedAt('O6');
       await new Promise((resolve) => setTimeout(resolve, 50));

@@ -98,7 +98,8 @@ describe('legacy supervision tools and migration on the pairs engine', () => {
   });
 
   it('regression: finish with gitignored deliverables and no revision completes after a PASS', async () => {
-    marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT L1 -->');
+    // Owner rule: a PASS must close a real material-backed audit round.
+    marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT L1 path=/workspace -->');
     marker(AUD, '<!-- IMCODES_TASK PASS L1 blocking=P0 -->');
     const result = await handleLegacyToolOnPairs(MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH, EXEC, {
       assignmentId: 'asg_unknown', evidence: 'deliverables are gitignored',
@@ -110,7 +111,8 @@ describe('legacy supervision tools and migration on the pairs engine', () => {
     // Two open pairs for the same executor: without the binding id the caller's
     // task could not be inferred.
     marker(BRAIN, `<!-- IMCODES_TASK DISPATCH L2 executor=${EXEC} auditor=${AUD} -->`);
-    marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT L2 -->');
+    // Owner rule: a PASS must close a real material-backed audit round.
+    marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT L2 path=/workspace -->');
     marker(AUD, '<!-- IMCODES_TASK PASS L2 blocking=P0 -->');
     const assignmentId = taskPairBindingId('L2', 'executor');
     expect(await handleLegacyToolOnPairs(SUPERVISION_MCP_TOOLS.GET, EXEC, { assignmentId })).toMatchObject({
@@ -125,13 +127,15 @@ describe('legacy supervision tools and migration on the pairs engine', () => {
 
   it('keeps DONE-without-PASS semantics for a legacy finish', async () => {
     const result = await handleLegacyToolOnPairs(MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH, EXEC, { assignmentId: 'x' });
-    expect(result).toMatchObject({ status: 'ok', pairStatus: 'awaiting_audit' });
+    // Owner rule: an audited pair cannot advance or end on DONE before PASS.
+    expect(result).toMatchObject({ status: 'ok', pairStatus: 'working' });
   });
 
   it('maps peer_audit_reply findings to severity counts judged like a marker', async () => {
     expect(severityCountsFromFindings('[P0] null deref\n[P1] naming\n[P1] docs')).toEqual({ p0: '1', p1: '2' });
     expect(severityCountsFromFindings('- [P2] wording\n1. [P3] naming')).toEqual({ p2: '1', p3: '1' });
-    marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT L1 -->');
+    // Owner rule: audit findings apply only to a material-backed audit round.
+    marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT L1 path=/workspace -->');
     const rework = await handleLegacyToolOnPairs(MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY, AUD, {
       taskId: 'L1', verdict: 'REWORK', findings: '[P0] login null deref\n[P2] wording',
     });
@@ -142,7 +146,8 @@ describe('legacy supervision tools and migration on the pairs engine', () => {
   it('judges a realistic legacy PASS that mentions P0 in prose as consistent', async () => {
     const receipt = 'PASS: no P0 finding. Only P0 blocks.\nPASS. blocking=P0, P0=0 P1=0 P2=1\n[P2] minor wording in the README';
     expect(severityCountsFromFindings(receipt)).toEqual({ p2: '1' });
-    marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT L1 -->');
+    // Owner rule: audit verdicts require material from READY_FOR_AUDIT.
+    marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT L1 path=/workspace -->');
     const pass = await handleLegacyToolOnPairs(MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY, AUD, { taskId: 'L1', verdict: 'PASS', findings: receipt });
     expect(pass).toMatchObject({ status: 'ok', pairStatus: 'passed' });
     expect(pair('L1')?.flags).not.toContain('verdict_inconsistent');
