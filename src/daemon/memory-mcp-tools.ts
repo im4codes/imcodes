@@ -3,7 +3,7 @@ import { emitTaskPairDaemonEvent } from './task-pairs/service.js';
 import { projectOfSession } from './task-pairs/engine.js';
 import { randomUUID } from 'node:crypto';
 import { parseTaskPairChecklist, taskPairChecklistCounts, updateTaskPairChecklist } from '../../shared/task-pair-checklist.js';
-import { taskPairRoleOf } from '../../shared/task-pair.js';
+import { TASK_PAIR_MAX_CONCURRENCY_CAP, taskPairRoleOf } from '../../shared/task-pair.js';
 import { z } from 'zod';
 import type { CapabilityMcpToolDeps } from './capability-mcp-tools.js';
 import { execFile as execFileCallback } from 'node:child_process';
@@ -2589,8 +2589,8 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (context.status === 'error') return context.result;
       const args = pickAllowedMcpArgs(input, ['maxConcurrency']);
       const maxConcurrency = numberArg(args, 'maxConcurrency');
-      if (!maxConcurrency || !Number.isInteger(maxConcurrency) || maxConcurrency < 1 || maxConcurrency > 100) {
-        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'maxConcurrency must be an integer from 1 to 100');
+      if (!maxConcurrency || !Number.isInteger(maxConcurrency) || maxConcurrency < 1 || maxConcurrency > TASK_PAIR_MAX_CONCURRENCY_CAP) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `maxConcurrency must be an integer from 1 to ${TASK_PAIR_MAX_CONCURRENCY_CAP}`);
       }
       getTaskPairStore().setMaxConcurrency(caller.sessionName!, maxConcurrency);
       return { status: 'ok', maxConcurrency };
@@ -3834,7 +3834,7 @@ const schemas = {
     eventLimit: z.number().int().min(1).max(200).optional(),
   }).strict(),
   [MEMORY_MCP_TOOL_NAMES.PAIR_SET_MAX_CONCURRENCY]: z.object({
-    maxConcurrency: z.number().int().min(1).max(100).describe('Durable pair concurrency limit.'),
+    maxConcurrency: z.number().int().min(1).max(TASK_PAIR_MAX_CONCURRENCY_CAP).describe(`Durable pair concurrency limit (1-${TASK_PAIR_MAX_CONCURRENCY_CAP}).`),
   }).strict(),
   [MEMORY_MCP_TOOL_NAMES.PAIR_GET_MAX_CONCURRENCY]: z.object({}).strict(),
   [MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]: z.object({}).strict(),

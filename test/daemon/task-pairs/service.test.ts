@@ -8,7 +8,7 @@ import { TaskPairService } from '../../../src/daemon/task-pairs/service.js';
 import { resolveTaskPairEngine, resolveTaskPairEngineState, resolveTaskPairMaxConcurrency } from '../../../src/daemon/task-pairs/engine.js';
 import { normalizeSessionSupervisionSnapshot } from '../../../shared/supervision-config.js';
 import { dispatchSendMessage, clearSendIdempotencyCacheForTests } from '../../../src/daemon/send-tool.js';
-import { TASK_PAIR_TIMELINE_EVENT, taskPairBindingId } from '../../../shared/task-pair.js';
+import { TASK_PAIR_TIMELINE_EVENT, TASK_PAIR_MAX_CONCURRENCY_CAP, TASK_PAIR_DEFAULT_MAX_CONCURRENCY, taskPairBindingId } from '../../../shared/task-pair.js';
 import {
   DELEGATION_AUTHORITY_MCP_SERVER,
   DELEGATION_CLAIM_METADATA_FIELD,
@@ -466,6 +466,21 @@ describe('task-pair marker ingestion', () => {
     expect(resolveTaskPairEngine(PROJECT)).toBe('legacy');
     getTaskPairStore().setMaxConcurrency(BRAIN, 8);
     expect(resolveTaskPairMaxConcurrency(BRAIN)).toBe(3);
+  });
+
+  describe('dynamic panel concurrency setter', () => {
+    it('clamps to the shared cap, rejects invalid values, and rejects unknown brains', async () => {
+      await expect(service.setMaxConcurrency(BRAIN, TASK_PAIR_MAX_CONCURRENCY_CAP + 20)).resolves.toEqual({ ok: true, maxConcurrency: TASK_PAIR_MAX_CONCURRENCY_CAP, fixedOverride: false });
+      await expect(service.setMaxConcurrency(BRAIN, 1.5)).resolves.toMatchObject({ ok: false, error: 'invalid_request' });
+      await expect(service.setMaxConcurrency(BRAIN, 0)).resolves.toMatchObject({ ok: false, error: 'invalid_request' });
+      await expect(service.setMaxConcurrency('deck_missing', 3)).resolves.toMatchObject({ ok: false, error: 'unknown_brain' });
+    });
+
+    it('does not override a fixed Brain setting', async () => {
+      upsertSession({ ...session(BRAIN, 'brain'), transportConfig: { supervision: normalizeSessionSupervisionSnapshot({ pairMaxConcurrency: 3 }) } } as SessionRecord);
+      await expect(service.setMaxConcurrency(BRAIN, 8)).resolves.toMatchObject({ ok: false, error: 'fixed_override', maxConcurrency: 3, fixedOverride: true });
+      expect(getTaskPairStore().getMaxConcurrency(BRAIN)).toBe(TASK_PAIR_DEFAULT_MAX_CONCURRENCY);
+    });
   });
 
   it('a new pair falls back to the Brain-configured blocking set, but an explicit DISPATCH attr wins', () => {

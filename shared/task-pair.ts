@@ -23,6 +23,19 @@ export const TASK_PAIR_MARKER_TAG = 'IMCODES_TASK' as const;
 export const TASK_PAIR_BRIEF_END_TAG = 'IMCODES_TASK_END' as const;
 /** Timeline event carrying every applied or recorded marker event. */
 export const TASK_PAIR_TIMELINE_EVENT = 'task_pair.event' as const;
+/** Daemon -> web: reply to both TASK_PAIR_GET_MAX_CONCURRENCY and TASK_PAIR_SET_MAX_CONCURRENCY. */
+export const TASK_PAIR_MAX_CONCURRENCY_RESULT = 'task_pair.max_concurrency_result' as const;
+
+export interface TaskPairMaxConcurrencyResult {
+  type: typeof TASK_PAIR_MAX_CONCURRENCY_RESULT;
+  commandId: string;
+  ok: boolean;
+  /** The effective limit: the fixed setting when one is active, else the dynamic store value. */
+  maxConcurrency?: number;
+  /** True when a fixed `pairMaxConcurrency` setting is active and wins over any dynamic value. */
+  fixedOverride?: boolean;
+  error?: 'unknown_brain' | 'invalid_request' | 'fixed_override';
+}
 /** Every daemon-authored pair message id starts with this prefix plus the task id. */
 export const TASK_PAIR_NUDGE_ID_PREFIX = 'task-pair-nudge:' as const;
 /** Hook path through which MCP child processes hand legacy supervision tool calls to the daemon. */
@@ -147,6 +160,17 @@ export const TASK_PAIR_INERT_AUTHORIZATION_RULE: string =
   + 'and only recommend it if they explicitly override after hearing it.';
 
 export const TASK_PAIR_DEFAULT_MAX_CONCURRENCY = 5;
+/**
+ * Hard ceiling on a Brain's open-pair concurrency limit, enforced everywhere
+ * the value can be set or read: the panel's -/+ control, `store.setMaxConcurrency`
+ * (both write and read, so a value stored before this cap existed still reads
+ * back clamped), the `QUEUE - max=` marker, the `pair_set_max_concurrency`
+ * MCP tool's input schema, and the Brain settings `pairMaxConcurrency`
+ * normalization. Single source of truth -- never hardcode 10 anywhere else.
+ */
+export const TASK_PAIR_MAX_CONCURRENCY_CAP = 10;
+/** Large briefs are omitted from routine panel snapshots and fetched on demand. */
+export const TASK_PAIR_INLINE_BRIEF_MAX_LENGTH = 4_000;
 export const TASK_PAIR_HEARTBEAT_MS = 6 * 60_000;
 /** Silent ticks before a side stops being nudged and escalates. */
 export const TASK_PAIR_SILENCE_LIMIT = 3;
@@ -219,6 +243,8 @@ export interface TaskPairMarker {
   markerIndex: number;
   /** QUEUE brief captured between the marker and its END line, verbatim. */
   brief?: string;
+  /** True when a brief exists, including when a large one was omitted for on-demand loading. */
+  briefAvailable?: boolean;
   /** QUEUE without a matching END in the same turn. */
   briefMissing?: boolean;
 }
@@ -759,7 +785,7 @@ export function applyTaskPairMarker(
   if (verb === 'QUEUE' && marker.taskId === TASK_PAIR_INFER_TASK_ID) {
     const max = Number.parseInt(attrs.max ?? '', 10);
     if (Number.isFinite(max) && max > 0) {
-      intents.push({ kind: 'queue_settings', brain: ctx.writer, maxConcurrency: max });
+      intents.push({ kind: 'queue_settings', brain: ctx.writer, maxConcurrency: Math.min(max, TASK_PAIR_MAX_CONCURRENCY_CAP) });
       return { effect: 'queue_settings', unusual: false, intents };
     }
     return { ...recorded(undefined), effect: 'recorded' };
@@ -1125,6 +1151,10 @@ export interface TaskPairEventPayload {
   outputPath?: string;
   /** Why the deliverable could not be copied (OUTPUT_FAILED). */
   outputError?: string;
+  /** The pair's brief, verbatim, for panels that let the owner open it. */
+  brief?: string;
+  /** Checklist progress counts from `brief`, precomputed so a viewer never re-parses markdown just to show a badge. */
+  checklist?: { total: number; implemented: number; audited: number };
 }
 
 // ---------------------------------------------------------------------------

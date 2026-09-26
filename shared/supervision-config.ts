@@ -1,6 +1,6 @@
 import { advanceMarkdownFence, type MarkdownFenceState } from './markdown-fence.js';
 import { normalizeAuditBlockingSeverities, type AuditSeverity } from './audit-convergence.js';
-import type { TaskPairEngine } from './task-pair.js';
+import { TASK_PAIR_MAX_CONCURRENCY_CAP, type TaskPairEngine } from './task-pair.js';
 import type { SharedContextRuntimeBackend } from './context-types.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../src/shared/models/options.js';
 import { PROVIDER_ERROR_CODES } from './provider-error-codes.js';
@@ -1620,7 +1620,7 @@ export function normalizeSessionSupervisionSnapshot(
       : {}),
     ...(merged.pairEngine === 'pairs' || merged.pairEngine === 'legacy' ? { pairEngine: merged.pairEngine } : {}),
     ...(typeof merged.pairMaxConcurrency === 'number' && Number.isFinite(merged.pairMaxConcurrency) && merged.pairMaxConcurrency >= 1
-      ? { pairMaxConcurrency: Math.floor(merged.pairMaxConcurrency) }
+      ? { pairMaxConcurrency: Math.min(TASK_PAIR_MAX_CONCURRENCY_CAP, Math.floor(merged.pairMaxConcurrency)) }
       : {}),
     taskRunPromptVersion: trimString(merged.taskRunPromptVersion) ?? SUPERVISION_DEFAULT_TASK_RUN_PROMPT_VERSION,
   };

@@ -9,12 +9,15 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { stat } from 'node:fs/promises';
 import { SUPERVISION_ID_PREFIXES } from '../../../shared/supervision-durable-identity.js';
+import { taskPairChecklistCounts } from '../../../shared/task-pair-checklist.js';
 import { timelineEmitter } from '../timeline-emitter.js';
 import type { TimelineEvent } from '../timeline-event.js';
 import logger from '../../util/logger.js';
 import {
   TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS,
   TASK_PAIR_INFER_TASK_ID,
+  TASK_PAIR_INLINE_BRIEF_MAX_LENGTH,
+  TASK_PAIR_MAX_CONCURRENCY_CAP,
   TASK_PAIR_NO_AUDITOR,
   TASK_PAIR_OPEN_STATUSES,
   TASK_PAIR_TIMELINE_EVENT,
@@ -37,7 +40,7 @@ import {
   type TaskPairTransition,
 } from '../../../shared/task-pair.js';
 import { getTaskPairStore, type StoredTaskPair, type TaskPairLiveness } from './store.js';
-import { brainUiLocale, isPairsEngineProject, projectBrainSession, projectOfSession } from './engine.js';
+import { brainSupervisionSettings, brainUiLocale, isPairsEngineProject, projectBrainSession, projectOfSession, resolveTaskPairMaxConcurrency } from './engine.js';
 import { noteTaskPairFocus, sendTaskPairMessage, taskPairFocusOf } from './delivery.js';
 import { resolveTaskPairMaterial } from './material.js';
 import { copyTaskPairOutput, provisionTaskPairWorkspace, releaseTaskPairWorkspace, type TaskPairWorkspaceRevisionSource } from './workspace.js';
@@ -64,6 +67,8 @@ export interface TaskPairScheduler {
   onIntent(project: string, pair: TaskPairState, intent: TaskPairIntent): void | Promise<void>;
   /** A consistent PASS was applied (economy-review bookkeeping). */
   flagEconomyUnreviewed?(project: string, taskId: string): void;
+  /** A concurrency-limit change just landed: start any newly-allowed queued pairs now, not on the next heartbeat. */
+  runQueueForBrain?(project: string, brain: string): void | Promise<void>;
 }
 
 export interface ApplyMarkerInput {
@@ -242,6 +247,44 @@ export class TaskPairService {
 
   setScheduler(scheduler: TaskPairScheduler | undefined): void {
     this.#scheduler = scheduler;
+  }
+
+  /** The effective concurrency limit for `brain`, and whether a fixed setting is the reason. */
+  getMaxConcurrencyView(brain: string): { maxConcurrency: number; fixedOverride: boolean } {
+    const project = getSession(brain)?.projectName;
+    const fixed = project ? brainSupervisionSettings(project)?.pairMaxConcurrency : undefined;
+    return { maxConcurrency: resolveTaskPairMaxConcurrency(brain), fixedOverride: fixed !== undefined };
+  }
+
+  /**
+   * Sets `brain`'s dynamic concurrency limit and starts any newly-allowed
+   * queued pairs at once (never waiting for the next multi-minute heartbeat).
+   * The daemon is the authoritative enforcer of both the 1..CAP range and the
+   * fixed-setting override -- a caller (a UI that disables its own control
+   * while overridden, or a stale client that raced a setting change) is
+   * never trusted over this check.
+   */
+  async setMaxConcurrency(brain: string, requested: number): Promise<
+    | { ok: true; maxConcurrency: number; fixedOverride: boolean }
+    | { ok: false; error: 'unknown_brain' | 'invalid_request' | 'fixed_override'; maxConcurrency?: number; fixedOverride?: boolean }
+  > {
+    const session = getSession(brain);
+    if (!session) return { ok: false, error: 'unknown_brain' };
+    if (!Number.isFinite(requested) || !Number.isInteger(requested) || requested < 1) {
+      return { ok: false, error: 'invalid_request' };
+    }
+    const before = this.getMaxConcurrencyView(brain);
+    if (before.fixedOverride) return { ok: false, error: 'fixed_override', ...before };
+    const clamped = Math.min(TASK_PAIR_MAX_CONCURRENCY_CAP, Math.max(1, Math.floor(requested)));
+    getTaskPairStore().setMaxConcurrency(brain, clamped);
+    if (session.projectName) {
+      try {
+        await this.#scheduler?.runQueueForBrain?.(session.projectName, brain);
+      } catch (error) {
+        logger.warn({ err: error, brain }, 'task-pair: queue re-run after a concurrency change failed');
+      }
+    }
+    return { ok: true, ...this.getMaxConcurrencyView(brain) };
   }
 
   /** Returns and consumes a marker DISPATCH seen immediately before send_message. */
@@ -979,6 +1022,11 @@ export function emitTaskPairTimelineEvent(
       blocking: pair.blocking,
       ...(pair.executorPool ? { executorPool: pair.executorPool } : {}),
       ...(pair.auditorPool ? { auditorPool: pair.auditorPool } : {}),
+      ...(pair.brief !== undefined ? {
+        briefAvailable: true,
+        ...(pair.brief.length <= TASK_PAIR_INLINE_BRIEF_MAX_LENGTH ? { brief: pair.brief } : {}),
+        checklist: taskPairChecklistCounts(pair.brief),
+      } : {}),
     } : {}),
   };
   for (const [role, session] of [['executor', pair?.executor], ['auditor', pair?.auditor]] as const) {

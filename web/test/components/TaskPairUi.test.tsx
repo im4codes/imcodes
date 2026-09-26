@@ -3,7 +3,7 @@
  */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { h } from 'preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -18,7 +18,10 @@ import { TaskPairStatusPanel } from '../../src/components/TaskPairStatusPanel.js
 import { formatElapsedDuration } from '../../src/util/tool-duration.js';
 import { watchProjectionStore } from '../../src/watch-projection.js';
 import { TaskPairSettingsSection, type TaskPairSettingsValue } from '../../src/components/TaskPairSettingsSection.js';
+import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import {
+  TASK_PAIR_MAX_CONCURRENCY_RESULT,
+  TASK_PAIR_MAX_CONCURRENCY_CAP,
   TASK_PAIR_STATUSES,
   TASK_PAIR_WORKSPACE_EFFECTS,
   TASK_PAIR_WORKSPACE_EVENT_VERB,
@@ -107,7 +110,12 @@ describe('TaskPairEventChip workspace events', () => {
   });
 });
 describe('TaskPairStatusPanel', () => {
-  afterEach(() => cleanup());
+  afterEach(() => {
+    cleanup();
+    window.localStorage.removeItem('imcodes.task-pair-status-panel.collapsed');
+    window.localStorage.removeItem('imcodes.task-pair-status-panel.collapsed:server-a');
+    window.localStorage.removeItem('imcodes.task-pair-status-panel.collapsed:server-b');
+  });
   it('groups live pair state, keeps counts while collapsed, and persists collapse', () => {
     const events = [
       { eventId: 'p1', type: 'task_pair.event', ts: Date.now() - 2_000, payload: { taskId: 'T1', title: 'Build panel', toStatus: 'working', executor: 'deck_sub_w', executorLabel: 'Cx6', round: 1 } },
@@ -160,6 +168,142 @@ describe('TaskPairStatusPanel', () => {
     }] as never} />);
     expect(screen.getByText(title)).toBeTruthy();
     expect(screen.queryByText(/secret-id/)).toBeNull();
+  });
+
+  it('computes checklist badges from the shared brief parser, hides empty checklists, and expands the full markdown with audit state', () => {
+    const brief = '# Objective\n\nDo the thing.\n\n- [x][ ] Fix the bug\n- [x][x] Add tests\n';
+    const { container } = render(<TaskPairStatusPanel events={[{
+      eventId: 'checklist', type: 'task_pair.event', ts: Date.now(),
+      payload: { taskId: 'private-task-id', title: 'Checklist task', toStatus: 'working', brief },
+    }] as never} />);
+    expect(screen.getByText('taskPair.checklist_progress:{"total":2,"implemented":2,"audited":1}')).toBeTruthy();
+    expect(container.querySelector('.task-pair-status-brief')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'taskPair.panel_show_brief' }));
+    expect(screen.getByRole('heading', { name: 'Objective' })).toBeTruthy();
+    expect(screen.getByText('Do the thing.')).toBeTruthy();
+    const rows = [...container.querySelectorAll('.task-pair-status-checklist-row')];
+    expect(rows).toHaveLength(2);
+    expect([...rows[0]!.querySelectorAll('input')].map((input) => (input as HTMLInputElement).checked)).toEqual([true, false]);
+    expect(screen.queryByText(/private-task-id/)).toBeNull();
+  });
+
+  it('hides checklist progress when there is no checklist in the brief', () => {
+    render(<TaskPairStatusPanel events={[{
+      eventId: 'plain-brief', type: 'task_pair.event', ts: Date.now(),
+      payload: { taskId: 'plain', title: 'Prose', toStatus: 'working', brief: 'Only prose.' },
+    }] as never} />);
+    expect(screen.queryByText(/taskPair.checklist_progress/)).toBeNull();
+  });
+
+  it('loads an omitted large brief only on expand and includes serverId routing on the HTTP request', async () => {
+    const brief = '# Large task\n\n- [x][ ] Review the complete brief\n';
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      events: [{ type: 'task_pair.event', payload: { taskId: 'lazy-task', brief } }],
+      epoch: null, hasMore: false,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      render(<TaskPairStatusPanel events={[{
+        eventId: 'large', type: 'task_pair.event', ts: Date.now(),
+        payload: { taskId: 'lazy-task', title: 'Large brief', toStatus: 'working', briefAvailable: true, checklist: { total: 1, implemented: 1, audited: 0 } },
+      }] as never} brain="deck_brain" serverId="server-1" />);
+      expect(fetchMock).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole('button', { name: 'taskPair.panel_show_brief' }));
+      await screen.findByRole('heading', { name: 'Large task' });
+      const requestedUrl = String(fetchMock.mock.calls[0]![0]);
+      expect(requestedUrl).toContain('serverId=server-1');
+      expect(requestedUrl).toContain('sessionName=deck_brain');
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  function fakeWs() {
+    const handlers = new Set<(msg: unknown) => void>();
+    const sent: Record<string, unknown>[] = [];
+    return {
+      sent,
+      ws: { send: (msg: Record<string, unknown>) => sent.push(msg), onMessage: (handler: (msg: unknown) => void) => { handlers.add(handler); return () => handlers.delete(handler); } } as never,
+      emit: (msg: unknown) => handlers.forEach((handler) => handler(msg)),
+    };
+  }
+
+  it('reads concurrency from the daemon and sends a capped debounced update on click-to-edit', async () => {
+    vi.useFakeTimers();
+    try {
+      const { ws, sent, emit } = fakeWs();
+      render(<TaskPairStatusPanel events={[{ eventId: 'c', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'C1', toStatus: 'working' } }] as never} ws={ws} brain="deck_brain" />);
+      expect(sent[0]).toMatchObject({ type: DAEMON_COMMAND_TYPES.TASK_PAIR_GET_MAX_CONCURRENCY, brain: 'deck_brain' });
+      await act(async () => { emit({ type: TASK_PAIR_MAX_CONCURRENCY_RESULT, commandId: sent[0]!.commandId, ok: true, maxConcurrency: 9, fixedOverride: false }); });
+      fireEvent.click(screen.getByRole('button', { name: 'taskPair.panel_concurrency:{"max":9}' }));
+      const input = screen.getByRole('spinbutton');
+      fireEvent.input(input, { target: { value: String(TASK_PAIR_MAX_CONCURRENCY_CAP + 8) } });
+      await act(async () => { fireEvent.keyDown(input, { key: 'Enter' }); vi.advanceTimersByTime(400); });
+      expect(sent.at(-1)).toMatchObject({ type: DAEMON_COMMAND_TYPES.TASK_PAIR_SET_MAX_CONCURRENCY, maxConcurrency: TASK_PAIR_MAX_CONCURRENCY_CAP });
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('sends the incremented/decremented absolute value from the -/+ buttons, clamped at the floor, without opening the number editor', async () => {
+    vi.useFakeTimers();
+    try {
+      const { ws, sent, emit } = fakeWs();
+      render(<TaskPairStatusPanel events={[{ eventId: 'c2', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'C2', toStatus: 'working' } }] as never} ws={ws} brain="deck_brain" />);
+      await act(async () => { emit({ type: TASK_PAIR_MAX_CONCURRENCY_RESULT, commandId: sent[0]!.commandId, ok: true, maxConcurrency: 1, fixedOverride: false }); });
+      const decrease = screen.getByRole('button', { name: 'taskPair.panel_concurrency_decrease' });
+      expect(decrease.hasAttribute('disabled')).toBe(true);
+      const increase = screen.getByRole('button', { name: 'taskPair.panel_concurrency_increase' });
+      fireEvent.click(increase);
+      await act(async () => { vi.advanceTimersByTime(400); });
+      expect(sent.at(-1)).toMatchObject({ type: DAEMON_COMMAND_TYPES.TASK_PAIR_SET_MAX_CONCURRENCY, maxConcurrency: 2 });
+      expect(screen.queryByRole('spinbutton')).toBeNull();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('disables every editing control and explains the override when a fixed Brain-settings value is in effect', async () => {
+    const { ws, sent, emit } = fakeWs();
+    render(<TaskPairStatusPanel events={[{ eventId: 'c3', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'C3', toStatus: 'working' } }] as never} ws={ws} brain="deck_brain" />);
+    await act(async () => { emit({ type: TASK_PAIR_MAX_CONCURRENCY_RESULT, commandId: sent[0]!.commandId, ok: true, maxConcurrency: 4, fixedOverride: true }); });
+    expect(screen.getByRole('button', { name: 'taskPair.panel_concurrency_decrease' }).hasAttribute('disabled')).toBe(true);
+    expect(screen.getByRole('button', { name: 'taskPair.panel_concurrency_increase' }).hasAttribute('disabled')).toBe(true);
+    const value = screen.getByRole('button', { name: 'taskPair.panel_concurrency:{"max":4}' });
+    expect(value.hasAttribute('disabled')).toBe(true);
+    fireEvent.click(value);
+    expect(screen.queryByRole('spinbutton')).toBeNull();
+    expect(screen.getByText('taskPair.panel_concurrency_fixed_note')).toBeTruthy();
+  });
+
+  it('collapsing hides the rows list from the DOM entirely while the header keeps live counts updating', () => {
+    window.localStorage.removeItem('imcodes.task-pair-status-panel.collapsed');
+    const { container, rerender } = render(<TaskPairStatusPanel events={[
+      { eventId: 'collapse-1', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'CO1', title: 'Collapsible task', toStatus: 'working' } },
+    ] as never} />);
+    expect(container.querySelector('.task-pair-status-rows')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: /taskPair.panel_title/ }));
+    expect(container.querySelector('.task-pair-status-rows')).toBeNull();
+    expect(container.querySelector('.task-pair-status-header')).toBeTruthy();
+    expect(screen.getByText('taskPair.panel_count_working:{"count":1}')).toBeTruthy();
+    rerender(<TaskPairStatusPanel events={[
+      { eventId: 'collapse-1', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'CO1', title: 'Collapsible task', toStatus: 'working' } },
+      { eventId: 'collapse-2', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'CO2', title: 'Second', toStatus: 'in_audit' } },
+    ] as never} />);
+    expect(container.querySelector('.task-pair-status-rows')).toBeNull();
+    expect(screen.getByText('taskPair.panel_count_working:{"count":1}')).toBeTruthy();
+    expect(screen.getByText('taskPair.panel_count_audit:{"count":1}')).toBeTruthy();
+  });
+
+  it('persists the collapsed state per server, so a remount for the same server stays collapsed but a different server starts expanded', () => {
+    window.localStorage.removeItem('imcodes.task-pair-status-panel.collapsed:server-a');
+    window.localStorage.removeItem('imcodes.task-pair-status-panel.collapsed:server-b');
+    const events = [{ eventId: 'persist-1', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'P1', title: 'Persisted task', toStatus: 'working' } }] as never;
+    const first = render(<TaskPairStatusPanel events={events} serverId="server-a" />);
+    fireEvent.click(screen.getByRole('button', { name: /taskPair.panel_title/ }));
+    expect(window.localStorage.getItem('imcodes.task-pair-status-panel.collapsed:server-a')).toBe('1');
+    first.unmount();
+
+    const otherServer = render(<TaskPairStatusPanel events={events} serverId="server-b" />);
+    expect(otherServer.container.querySelector('.task-pair-status-rows')).toBeTruthy();
+    otherServer.unmount();
+
+    const sameServer = render(<TaskPairStatusPanel events={events} serverId="server-a" />);
+    expect(sameServer.container.querySelector('.task-pair-status-rows')).toBeNull();
   });
 
   it('resolves a missing payload label from the watch session store', () => {
@@ -351,6 +495,16 @@ describe('TaskPairStatusPanel', () => {
     expect(rootVars.has('task-pair-panel-width')).toBe(true);
   });
 
+  it('shrinks to a bare header and drops the reserved chat-view padding once collapsed, so the chat area is freed', () => {
+    const css = readCss();
+    const collapsedPanelRule = [...css.matchAll(/\.task-pair-status-panel\.is-collapsed\s*\{([^}]*)\}/g)].map((m) => m[1])[0] ?? '';
+    expect(collapsedPanelRule).toMatch(/bottom:\s*auto/);
+    const expandedPadding = /\.chat-view-wrap:has\(\.task-pair-status-panel\)\s*\.chat-view\s*\{([^}]*)\}/.exec(css)?.[1] ?? '';
+    const collapsedPadding = /\.chat-view-wrap:has\(\.task-pair-status-panel\.is-collapsed\)\s*\.chat-view\s*\{([^}]*)\}/.exec(css)?.[1] ?? '';
+    expect(expandedPadding).toMatch(/padding-right:\s*calc\(var\(--task-pair-panel-width\)/);
+    expect(collapsedPadding).toMatch(/padding-right:\s*12px/);
+  });
+
   it('has every new badge/count-count i18n key in all seven locales, and no leftover panel_counts key', () => {
     const WEB = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
     for (const locale of ['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko']) {
@@ -439,6 +593,16 @@ describe('TaskPairSettingsSection', () => {
     expect([...engine.options].map((option) => option.value)).not.toContain('legacy');
     fireEvent.input(screen.getByTestId('task-pair-max-concurrency'), { target: { value: '8' } });
     expect(value.pairMaxConcurrency).toBe(8);
+  });
+
+  it('clamps the Brain settings concurrency editor to the shared cap', () => {
+    let value: TaskPairSettingsValue = {};
+    const onChange = vi.fn((next: TaskPairSettingsValue) => { value = next; });
+    render(<TaskPairSettingsSection value={value} onChange={onChange} />);
+    const input = screen.getByTestId('task-pair-max-concurrency') as HTMLInputElement;
+    expect(input.max).toBe(String(TASK_PAIR_MAX_CONCURRENCY_CAP));
+    fireEvent.input(input, { target: { value: String(TASK_PAIR_MAX_CONCURRENCY_CAP + 8) } });
+    expect(value.pairMaxConcurrency).toBe(TASK_PAIR_MAX_CONCURRENCY_CAP);
   });
 
   it('renders a stored legacy value as inert unset without offering it again', () => {

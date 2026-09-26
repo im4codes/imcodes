@@ -31,6 +31,10 @@ export const DAEMON_COMMAND_TYPES = {
    * in-memory/disk cache now rather than waiting for the next periodic poll.
    */
   SUPERVISOR_DEFAULTS_CHANGED: 'supervisor_defaults.changed',
+  /** Web → daemon: read a Brain's effective pair concurrency limit and whether a fixed setting overrides it. */
+  TASK_PAIR_GET_MAX_CONCURRENCY: 'task_pair.get_max_concurrency',
+  /** Web → daemon: set a Brain's dynamic pair concurrency limit (rejected while a fixed setting overrides it). */
+  TASK_PAIR_SET_MAX_CONCURRENCY: 'task_pair.set_max_concurrency',
 } as const;
 
 export type DaemonCommandType =

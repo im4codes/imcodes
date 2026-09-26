@@ -4395,8 +4395,19 @@
     "panel_auditor": "監査役",
     "panel_untitled": "無題のタスク",
     "panel_model_separator": " · ",
+    "panel_show_brief": "概要を表示",
+    "panel_hide_brief": "概要を非表示",
     "checklist_progress": "実装 {{implemented}}/{{total}} · 監査 {{audited}}/{{total}}",
     "implemented": "実装",
-    "audited": "監査"
+    "audited": "監査",
+    "panel_concurrency": "並列数 {{max}}",
+    "panel_concurrency_tooltip": "このBrainで同時に実行できるペアの最大数です。−または+をクリックして変更します。",
+    "panel_concurrency_fixed_tooltip": "この上限はBrain設定で固定されており、ここでは変更できません。",
+    "panel_concurrency_fixed_note": "(設定で固定)",
+    "panel_concurrency_decrease": "並列数の上限を減らす",
+    "panel_concurrency_increase": "並列数の上限を増やす",
+    "panel_toggle_tooltip": "タスク状況パネルを折りたたむ/展開する",
+    "panel_loading_brief": "タスク概要を読み込み中…",
+    "panel_brief_load_failed": "タスク概要を読み込めませんでした。もう一度お試しください。"
   }
 }

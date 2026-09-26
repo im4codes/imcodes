@@ -14496,15 +14496,26 @@ button.quick-agent-delegation-preset.active {
    still spans the full wrap width and its right edge sits under the panel.
    Reserve the same width here so the banner and the panel never overlap. */
 .chat-view-wrap:has(.task-pair-status-panel) .chat-pinned-last-sent { margin-right: calc(var(--task-pair-panel-width) + 12px); }
+/* Collapsed panel keeps only the header; release the main chat's reserved
+   sidebar width while retaining the last-sent banner's safe margin. */
+.task-pair-status-panel.is-collapsed { bottom: auto; box-shadow: none; }
+.chat-view-wrap:has(.task-pair-status-panel.is-collapsed) .chat-view { padding-right: 12px; }
 @media (max-width: 720px) {
   .task-pair-status-panel { position: relative; inset: auto; width: 100%; max-width: none; max-height: 42vh; }
   .chat-view-wrap:has(.task-pair-status-panel) .chat-view { padding-right: 12px; }
   .chat-view-wrap:has(.task-pair-status-panel) .chat-pinned-last-sent { margin-right: 10px; }
 }
 .task-pair-status-toggle {
-  width: 100%; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 4px 8px;
+  flex: 1; min-width: 0; width: 100%; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 4px 8px;
   padding: 8px; color: inherit; background: transparent; border: 0; text-align: left; flex-shrink: 0;
 }
+.task-pair-status-header { display: flex; align-items: flex-start; flex-shrink: 0; }
+.task-pair-status-concurrency { display: flex; align-items: center; gap: 4px; flex-shrink: 0; padding: 8px 8px 8px 0; font-size: 10px; white-space: nowrap; }
+.task-pair-status-concurrency button { padding: 1px 4px; border: 1px solid color-mix(in srgb, currentColor 28%, transparent); border-radius: 4px; background: transparent; color: inherit; cursor: pointer; font: inherit; }
+.task-pair-status-concurrency button:disabled { opacity: .45; cursor: default; }
+.task-pair-status-concurrency-value { border-color: transparent !important; text-decoration: underline; }
+.task-pair-status-concurrency input { width: 3em; padding: 2px; color: inherit; background: transparent; border: 1px solid currentColor; border-radius: 3px; font: inherit; }
+.task-pair-status-concurrency-fixed { opacity: .7; }
 .task-pair-status-toggle strong { min-width: 0; overflow-wrap: anywhere; }
 .task-pair-status-summary { display: flex; flex-wrap: wrap; gap: 4px; min-width: 0; }
 .task-pair-status-rows { flex: 1; min-height: 0; overflow-y: auto; padding: 0 8px 8px; }
@@ -14554,6 +14565,13 @@ button.quick-agent-delegation-preset.active {
 .task-pair-status-dot { display: inline-block; width: 5px; height: 5px; margin: 0 1px 1px 0; border-radius: 50%; background: var(--supervision-idle-text, #94a3b8); }
 .task-pair-status-dot.is-running { background: var(--status-active-text, #4ade80); box-shadow: 0 0 5px var(--status-active-text, #4ade80); animation: task-pair-status-pulse 1.4s ease-in-out infinite; }
 @keyframes task-pair-status-pulse { 50% { opacity: .45; } }
+.task-pair-status-brief-bar { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; margin-top: 2px; }
+.task-pair-status-checklist-progress { font-size: .85em; opacity: .78; }
+.task-pair-status-brief-toggle { margin: 0; padding: 0; border: 0; background: transparent; color: inherit; text-decoration: underline; cursor: pointer; font: inherit; font-size: 10px; }
+.task-pair-status-brief { margin-top: 4px; padding-top: 4px; border-top: 1px dashed color-mix(in srgb, currentColor 18%, transparent); font-size: 11px; }
+.task-pair-status-checklist { display: grid; gap: 3px; margin-top: 6px; }
+.task-pair-status-checklist-row { display: grid; grid-template-columns: 1.2rem 1.2rem minmax(0, 1fr); align-items: center; gap: 4px; }
+.task-pair-status-checklist-row span { overflow-wrap: anywhere; }
 
 .supervision-task-console-checklist { display: grid; gap: 3px; margin-top: 4px; }
 .supervision-task-console-checklist-row { display: grid; grid-template-columns: 1.2rem 1.2rem minmax(0, 1fr); align-items: center; gap: 4px; }

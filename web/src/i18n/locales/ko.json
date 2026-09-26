@@ -4395,8 +4395,19 @@
     "panel_auditor": "감사자",
     "panel_untitled": "제목 없는 작업",
     "panel_model_separator": " · ",
+    "panel_show_brief": "요약 보기",
+    "panel_hide_brief": "요약 숨기기",
     "checklist_progress": "구현 {{implemented}}/{{total}} · 감사 {{audited}}/{{total}}",
     "implemented": "구현",
-    "audited": "감사"
+    "audited": "감사",
+    "panel_concurrency": "동시 실행 {{max}}",
+    "panel_concurrency_tooltip": "이 Brain에서 동시에 실행할 수 있는 페어의 최대 개수입니다. −/+를 클릭하여 변경하세요.",
+    "panel_concurrency_fixed_tooltip": "이 한도는 Brain 설정에서 고정되어 있어 여기서 변경할 수 없습니다.",
+    "panel_concurrency_fixed_note": "(설정에서 고정됨)",
+    "panel_concurrency_decrease": "동시 실행 한도 줄이기",
+    "panel_concurrency_increase": "동시 실행 한도 늘리기",
+    "panel_toggle_tooltip": "작업 상태 패널 접기/펼치기",
+    "panel_loading_brief": "작업 설명을 불러오는 중…",
+    "panel_brief_load_failed": "작업 설명을 불러오지 못했습니다. 다시 시도하세요."
   }
 }

@@ -11,7 +11,7 @@
  * throw at a named boundary and assert the durable state that results, which is
  * the only way to show the transaction actually holds.
  */
-import { compareQueuedTaskPairs, TASK_PAIR_CONSOLE_LEGACY_STATUS, TASK_PAIR_NO_AUDITOR } from '../../shared/task-pair.js';
+import { compareQueuedTaskPairs, TASK_PAIR_CONSOLE_LEGACY_STATUS, TASK_PAIR_INLINE_BRIEF_MAX_LENGTH, TASK_PAIR_NO_AUDITOR } from '../../shared/task-pair.js';
 import { taskPairChecklistCounts } from '../../shared/task-pair-checklist.js';
 import { getTaskPairStore } from './task-pairs/store.js';
 import { isPairsEngineProject } from './task-pairs/engine.js';
@@ -635,7 +635,7 @@ export class SupervisionConsoleProducer {
           ...(pair.executor ? (() => { const p = this.#resolveSessionPresentation?.(pair.executor!, pair.updatedAt); return { executorLabel: p?.label, executorModel: p?.model, executorState: p?.state }; })() : {}),
           ...(pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? (() => { const p = this.#resolveSessionPresentation?.(pair.auditor!, pair.updatedAt); return { auditorLabel: p?.label, auditorModel: p?.model, auditorState: p?.state }; })() : {}),
           ...(pair.lastVerdict ? { severityCounts: { ...pair.lastVerdict.counts }, lastVerdict: pair.lastVerdict.verb } : {}),
-          ...(pair.brief ? { brief: pair.brief, checklist: taskPairChecklistCounts(pair.brief) } : {}),
+          ...(pair.brief !== undefined ? { briefAvailable: true, ...(pair.brief.length <= TASK_PAIR_INLINE_BRIEF_MAX_LENGTH ? { brief: pair.brief } : {}), checklist: taskPairChecklistCounts(pair.brief) } : {}),
         },
       });
       const roles: Array<['implementer' | 'auditor', string | undefined, number]> = [

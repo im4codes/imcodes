@@ -4396,8 +4396,19 @@
     "panel_auditor": "Auditor",
     "panel_untitled": "Tarea sin título",
     "panel_model_separator": " · ",
+    "panel_show_brief": "Mostrar informe",
+    "panel_hide_brief": "Ocultar informe",
     "checklist_progress": "Implementado {{implemented}}/{{total}} · Auditado {{audited}}/{{total}}",
     "implemented": "Implementado",
-    "audited": "Auditado"
+    "audited": "Auditado",
+    "panel_concurrency": "Concurrencia {{max}}",
+    "panel_concurrency_tooltip": "Número máximo de pares que pueden ejecutarse a la vez para este Brain. Haz clic en − o + para cambiarlo.",
+    "panel_concurrency_fixed_tooltip": "Este límite está fijado en la configuración del Brain y no se puede cambiar aquí.",
+    "panel_concurrency_fixed_note": "(fijado en la configuración)",
+    "panel_concurrency_decrease": "Reducir el límite de concurrencia",
+    "panel_concurrency_increase": "Aumentar el límite de concurrencia",
+    "panel_toggle_tooltip": "Contraer o expandir el panel de estado de tareas",
+    "panel_loading_brief": "Cargando el resumen…",
+    "panel_brief_load_failed": "No se pudo cargar el resumen. Inténtalo de nuevo."
   }
 }

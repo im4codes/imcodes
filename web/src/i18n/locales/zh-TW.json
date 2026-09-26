@@ -4396,8 +4396,19 @@
     "panel_auditor": "審計者",
     "panel_untitled": "未命名任務",
     "panel_model_separator": " · ",
+    "panel_show_brief": "顯示簡報",
+    "panel_hide_brief": "隱藏簡報",
     "checklist_progress": "實作 {{implemented}}/{{total}} · 審計 {{audited}}/{{total}}",
     "implemented": "實作",
-    "audited": "審計"
+    "audited": "審計",
+    "panel_concurrency": "並發 {{max}}",
+    "panel_concurrency_tooltip": "此 Brain 可同時執行的最大配對數。點擊 − 或 + 修改。",
+    "panel_concurrency_fixed_tooltip": "此上限已在 Brain 設定中固定，無法在此修改。",
+    "panel_concurrency_fixed_note": "(已在設定中固定)",
+    "panel_concurrency_decrease": "降低並發上限",
+    "panel_concurrency_increase": "提高並發上限",
+    "panel_toggle_tooltip": "摺疊或展開工作狀態面板",
+    "panel_loading_brief": "正在載入任務說明…",
+    "panel_brief_load_failed": "任務說明載入失敗，請重試。"
   }
 }

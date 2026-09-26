@@ -4395,8 +4395,19 @@
     "panel_auditor": "Аудитор",
     "panel_untitled": "Задача без названия",
     "panel_model_separator": " · ",
+    "panel_show_brief": "Показать бриф",
+    "panel_hide_brief": "Скрыть бриф",
     "checklist_progress": "Реализовано {{implemented}}/{{total}} · Проверено {{audited}}/{{total}}",
     "implemented": "Реализовано",
-    "audited": "Проверено"
+    "audited": "Проверено",
+    "panel_concurrency": "Параллельность {{max}}",
+    "panel_concurrency_tooltip": "Максимальное число пар, которые могут выполняться одновременно для этого Brain. Нажмите − или +, чтобы изменить.",
+    "panel_concurrency_fixed_tooltip": "Этот лимит зафиксирован в настройках Brain и не может быть изменён здесь.",
+    "panel_concurrency_fixed_note": "(зафиксировано в настройках)",
+    "panel_concurrency_decrease": "Уменьшить лимит параллельности",
+    "panel_concurrency_increase": "Увеличить лимит параллельности",
+    "panel_toggle_tooltip": "Свернуть или развернуть панель статуса задач",
+    "panel_loading_brief": "Загрузка задания…",
+    "panel_brief_load_failed": "Не удалось загрузить задание. Повторите попытку."
   }
 }

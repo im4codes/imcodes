@@ -883,6 +883,11 @@ export class TaskPairAutomation implements TaskPairScheduler {
     await run;
   }
 
+  /** TaskPairScheduler's hook for a just-applied concurrency-limit change. */
+  async runQueueForBrain(project: string, brain: string): Promise<void> {
+    await this.runQueue(project, brain);
+  }
+
   async #runQueueOnce(project: string, brain: string): Promise<void> {
     const store = getTaskPairStore();
     const max = resolveTaskPairMaxConcurrency(brain);

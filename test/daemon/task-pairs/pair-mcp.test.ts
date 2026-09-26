@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ContextNamespace } from '../../../shared/context-types.js';
-import type { TaskPairState } from '../../../shared/task-pair.js';
+import { TASK_PAIR_MAX_CONCURRENCY_CAP, type TaskPairState } from '../../../shared/task-pair.js';
 import { MEMORY_MCP_TOOL_NAMES } from '../../../shared/memory-mcp-contracts.js';
 import type { McpRuntimeCaller } from '../../../src/daemon/memory-mcp-caller.js';
 import { createMemoryMcpToolHandlers } from '../../../src/daemon/memory-mcp-tools.js';
@@ -68,5 +68,15 @@ describe('pair MCP projections', () => {
     const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => [session(BRAIN, 'brain')] } });
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_SET_MAX_CONCURRENCY]({ maxConcurrency: 7 })).resolves.toEqual({ status: 'ok', maxConcurrency: 7 });
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_GET_MAX_CONCURRENCY]({})).resolves.toEqual({ status: 'ok', maxConcurrency: 7 });
+  });
+
+  it('accepts the cap itself but rejects one past it, never silently clamping a caller-supplied value', async () => {
+    const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => [session(BRAIN, 'brain')] } });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_SET_MAX_CONCURRENCY]({ maxConcurrency: TASK_PAIR_MAX_CONCURRENCY_CAP }))
+      .resolves.toEqual({ status: 'ok', maxConcurrency: TASK_PAIR_MAX_CONCURRENCY_CAP });
+    const rejected = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_SET_MAX_CONCURRENCY]({ maxConcurrency: TASK_PAIR_MAX_CONCURRENCY_CAP + 1 });
+    expect(rejected.status).toBe('error');
+    // The stored value must still be the last one that was actually accepted.
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_GET_MAX_CONCURRENCY]({})).resolves.toEqual({ status: 'ok', maxConcurrency: TASK_PAIR_MAX_CONCURRENCY_CAP });
   });
 });

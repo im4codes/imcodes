@@ -282,6 +282,24 @@ describe('task-pair heartbeat, replacement and queue', () => {
     expect(q2.executor).not.toBe(q2.auditor);
   });
 
+  it('raising the concurrency limit through taskPairService.setMaxConcurrency starts a queued pair at once, without waiting for a slot to free or a heartbeat tick', async () => {
+    candidates = [SPARE, SPARE2, AUD, EXEC];
+    marker(BRAIN, '<!-- IMCODES_TASK QUEUE - max=1 -->');
+    marker(BRAIN, `<!-- IMCODES_TASK QUEUE Q1 title="First" executor=${EXEC} auditor=${AUD} -->\nDo the first thing.\n<!-- IMCODES_TASK_END Q1 -->`);
+    marker(BRAIN, '<!-- IMCODES_TASK QUEUE Q2 title="Second" -->\nDo the second thing.\n<!-- IMCODES_TASK_END Q2 -->');
+    await flush();
+    expect(pair('Q1').status).toBe('working');
+    expect(pair('Q2').status).toBe('queued');
+
+    const result = await taskPairService.setMaxConcurrency(BRAIN, 2);
+    expect(result).toMatchObject({ ok: true, maxConcurrency: 2, fixedOverride: false });
+    await flush();
+
+    // Q1 never finished -- Q2 started purely because the limit was raised.
+    expect(pair('Q1').status).toBe('working');
+    expect(pair('Q2').status).toBe('working');
+  });
+
   it('QUEUE with executormodel=-only and auditor=none starts the pair and never picks an auditor, even though a candidate is available', async () => {
     candidates = [SPARE, SPARE2, AUD, EXEC];
     marker(BRAIN, `<!-- IMCODES_TASK QUEUE Q9 title="Bump a config value" executormodel=sonnet auditor=none -->\nbump the value\n<!-- IMCODES_TASK_END Q9 -->`);

@@ -4396,8 +4396,19 @@
     "panel_auditor": "Auditor",
     "panel_untitled": "Untitled task",
     "panel_model_separator": " · ",
+    "panel_show_brief": "Show brief",
+    "panel_hide_brief": "Hide brief",
     "checklist_progress": "Implemented {{implemented}}/{{total}} · Audited {{audited}}/{{total}}",
     "implemented": "Implemented",
-    "audited": "Audited"
+    "audited": "Audited",
+    "panel_concurrency": "Concurrency {{max}}",
+    "panel_concurrency_tooltip": "Maximum number of pairs that may run at once for this Brain. Click − or + to change it.",
+    "panel_concurrency_fixed_tooltip": "This limit is fixed in Brain settings and can't be changed here.",
+    "panel_concurrency_fixed_note": "(fixed in settings)",
+    "panel_concurrency_decrease": "Decrease concurrency limit",
+    "panel_concurrency_increase": "Increase concurrency limit",
+    "panel_toggle_tooltip": "Collapse or expand the task status panel",
+    "panel_loading_brief": "Loading brief…",
+    "panel_brief_load_failed": "Could not load the brief. Try again."
   }
 }

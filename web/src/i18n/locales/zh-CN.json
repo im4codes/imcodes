@@ -4396,8 +4396,19 @@
     "panel_auditor": "审计者",
     "panel_untitled": "未命名任务",
     "panel_model_separator": " · ",
+    "panel_show_brief": "显示简报",
+    "panel_hide_brief": "隐藏简报",
     "checklist_progress": "实现 {{implemented}}/{{total}} · 审计 {{audited}}/{{total}}",
     "implemented": "实现",
-    "audited": "审计"
+    "audited": "审计",
+    "panel_concurrency": "并发 {{max}}",
+    "panel_concurrency_tooltip": "此 Brain 可同时运行的最大配对数。点击 − 或 + 修改。",
+    "panel_concurrency_fixed_tooltip": "该上限已在 Brain 设置中固定，此处无法修改。",
+    "panel_concurrency_fixed_note": "(已在设置中固定)",
+    "panel_concurrency_decrease": "降低并发上限",
+    "panel_concurrency_increase": "提高并发上限",
+    "panel_toggle_tooltip": "折叠或展开任务状态面板",
+    "panel_loading_brief": "正在加载任务说明…",
+    "panel_brief_load_failed": "任务说明加载失败，请重试。"
   }
 }

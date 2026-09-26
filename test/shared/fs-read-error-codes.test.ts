@@ -36,6 +36,10 @@ const ALLOWED_NON_FS_READ_LITERAL_FILES = new Map<string, ReadonlySet<string>>([
   ['server/src/ws/bridge.ts', new Set(['invalid_request'])],
   ['src/daemon/file-preview-read-observability.ts', new Set(['stale_read'])],
   ['src/daemon/session-group-clone.ts', new Set(['invalid_request', 'internal_error'])],
+  // Task-pair concurrency control (setMaxConcurrency) owns its own small
+  // result-type error union; its 'invalid_request' is unrelated to the
+  // filesystem read wire contract.
+  ['src/daemon/task-pairs/service.ts', new Set(['invalid_request'])],
   ['web/src/components/CloneSessionGroupDialog.tsx', new Set(['internal_error'])],
   ['web/src/components/SessionControls.tsx', new Set(['file_too_large'])],
 ]);

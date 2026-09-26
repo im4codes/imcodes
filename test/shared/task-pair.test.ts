@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   TASK_PAIR_BRAIN_REPORTING_RULE,
+  TASK_PAIR_MAX_CONCURRENCY_CAP,
   TASK_PAIR_MESSAGE_CAP_PER_ROUND,
   TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
   TASK_PAIR_STATUSES,
@@ -442,6 +443,11 @@ describe('task-pair state machine', () => {
     expect(queued).toMatchObject({ status: 'queued', brief: 'brief body', title: 'Export', brain: BRAIN });
     expect(apply(undefined, BRAIN, '<!-- IMCODES_TASK QUEUE - max=8 -->').intents)
       .toEqual([{ kind: 'queue_settings', brain: BRAIN, maxConcurrency: 8 }]);
+  });
+
+  it('clamps QUEUE - max= to TASK_PAIR_MAX_CONCURRENCY_CAP instead of accepting an unbounded value', () => {
+    expect(apply(undefined, BRAIN, '<!-- IMCODES_TASK QUEUE - max=999 -->').intents)
+      .toEqual([{ kind: 'queue_settings', brain: BRAIN, maxConcurrency: TASK_PAIR_MAX_CONCURRENCY_CAP }]);
   });
 });
 

@@ -4,6 +4,8 @@
  */
 import type { ChatMessageOrigin } from '../../shared/chat-message-origin.js';
 import { isPairsEngineSession } from './task-pairs/engine.js';
+import { taskPairService } from './task-pairs/service.js';
+import { TASK_PAIR_MAX_CONCURRENCY_RESULT } from '../../shared/task-pair.js';
 import { AGENT_SKILLS_MSG } from '../../shared/agent-skills.js';
 import { AGENT_MCP_MSG } from '../../shared/agent-mcp.js';
 import type { CronRunTimelineProjection } from '../../shared/cron-types.js';
@@ -1764,6 +1766,12 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case DAEMON_COMMAND_TYPES.PEER_AUDIT_CANCEL:
       handlePeerAuditCancel(cmd, serverLink);
       break;
+    case DAEMON_COMMAND_TYPES.TASK_PAIR_GET_MAX_CONCURRENCY:
+      handleTaskPairGetMaxConcurrency(cmd, serverLink);
+      break;
+    case DAEMON_COMMAND_TYPES.TASK_PAIR_SET_MAX_CONCURRENCY:
+      void handleTaskPairSetMaxConcurrency(cmd, serverLink);
+      break;
     case DAEMON_COMMAND_TYPES.SESSION_EXECUTION_CLONES:
       void handleSessionExecutionClones(cmd, serverLink);
       break;
@@ -2261,6 +2269,28 @@ function handlePeerAuditCancel(cmd: Record<string, unknown>, serverLink: ServerL
   try {
     serverLink.send({ type: PEER_AUDIT_MESSAGES.CANCEL_RESULT, commandId, ...result });
   } catch { /* result timeline event converges after reconnect */ }
+}
+
+function handleTaskPairGetMaxConcurrency(cmd: Record<string, unknown>, serverLink: ServerLink): void {
+  const commandId = typeof cmd.commandId === 'string' ? cmd.commandId : '';
+  const brain = typeof cmd.brain === 'string' ? cmd.brain : '';
+  if (!brain || !getSession(brain)) {
+    try { serverLink.send({ type: TASK_PAIR_MAX_CONCURRENCY_RESULT, commandId, ok: false, error: 'unknown_brain' }); } catch { /* ignore */ }
+    return;
+  }
+  try {
+    serverLink.send({ type: TASK_PAIR_MAX_CONCURRENCY_RESULT, commandId, ok: true, ...taskPairService.getMaxConcurrencyView(brain) });
+  } catch { /* ignore */ }
+}
+
+async function handleTaskPairSetMaxConcurrency(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const commandId = typeof cmd.commandId === 'string' ? cmd.commandId : '';
+  const brain = typeof cmd.brain === 'string' ? cmd.brain : '';
+  const requested = Number(cmd.maxConcurrency);
+  const result = brain ? await taskPairService.setMaxConcurrency(brain, requested) : { ok: false as const, error: 'unknown_brain' as const };
+  try {
+    serverLink.send({ type: TASK_PAIR_MAX_CONCURRENCY_RESULT, commandId, ...result });
+  } catch { /* ignore */ }
 }
 
 async function handleP2pConfigSave(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {

@@ -11,6 +11,7 @@ import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import {
   TASK_PAIR_DEFAULT_MAX_CONCURRENCY,
+  TASK_PAIR_MAX_CONCURRENCY_CAP,
   TASK_PAIR_OPEN_STATUSES,
   TASK_PAIR_TERMINAL_STATUSES,
   type TaskPairEngine,
@@ -305,14 +306,16 @@ export class TaskPairStore {
 
   getMaxConcurrency(brain: string): number {
     const row = this.#db.prepare('SELECT max_concurrency FROM task_pair_queue_settings WHERE brain = ?').get(brain) as { max_concurrency: number } | undefined;
-    return row ? Number(row.max_concurrency) : TASK_PAIR_DEFAULT_MAX_CONCURRENCY;
+    // Clamped on read too: a row written before TASK_PAIR_MAX_CONCURRENCY_CAP
+    // existed (or restored from an older backup) must still read back capped.
+    return row ? Math.min(TASK_PAIR_MAX_CONCURRENCY_CAP, Number(row.max_concurrency)) : TASK_PAIR_DEFAULT_MAX_CONCURRENCY;
   }
 
   setMaxConcurrency(brain: string, max: number): void {
     this.#db.prepare(`
       INSERT INTO task_pair_queue_settings (brain, max_concurrency) VALUES (?, ?)
       ON CONFLICT (brain) DO UPDATE SET max_concurrency = excluded.max_concurrency
-    `).run(brain, Math.max(1, Math.floor(max)));
+    `).run(brain, Math.min(TASK_PAIR_MAX_CONCURRENCY_CAP, Math.max(1, Math.floor(max))));
   }
 
   getProjectSettings(project: string): TaskPairProjectSettings {

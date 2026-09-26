@@ -1,12 +1,21 @@
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import type { TimelineEvent } from '../ws-client.js';
-import { TASK_PAIR_TIMELINE_EVENT, TASK_PAIR_STATUSES, type TaskPairStatus } from '@shared/task-pair.js';
+import type { TimelineEvent, WsClient } from '../ws-client.js';
+import { TASK_PAIR_TIMELINE_EVENT, TASK_PAIR_STATUSES, TASK_PAIR_MAX_CONCURRENCY_CAP, TASK_PAIR_MAX_CONCURRENCY_RESULT, type TaskPairStatus } from '@shared/task-pair.js';
+import { parseTaskPairChecklist, taskPairChecklistCounts } from '@shared/task-pair-checklist.js';
+import { DAEMON_COMMAND_TYPES } from '@shared/daemon-command-types.js';
 import { formatElapsedDuration } from '../util/tool-duration.js';
 import { watchProjectionStore } from '../watch-projection.js';
+import { ChatMarkdown } from './ChatMarkdown.js';
+import { fetchTimelineHistoryHttp } from '../api.js';
 
 const STORAGE_KEY = 'imcodes.task-pair-status-panel.collapsed';
 const MAX_ROWS = 6;
+const CONCURRENCY_DEBOUNCE_MS = 400;
+
+function collapsedStorageKey(serverId?: string | null): string {
+  return serverId ? `${STORAGE_KEY}:${serverId}` : STORAGE_KEY;
+}
 
 function status(value: unknown): value is TaskPairStatus {
   return typeof value === 'string' && (TASK_PAIR_STATUSES as readonly string[]).includes(value);
@@ -52,11 +61,70 @@ function resolveSessionModel(
   return projected?.activeModel?.trim() || projected?.requestedModel?.trim() || undefined;
 }
 
-export function TaskPairStatusPanel({ events, sessions }: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[] }) {
+export function TaskPairStatusPanel({ events, sessions, ws, brain, serverId }: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; ws?: WsClient | null; brain?: string; serverId?: string | null }) {
   const { t } = useTranslation();
   const [collapsed, setCollapsed] = useState(() => {
-    try { return window.localStorage.getItem(STORAGE_KEY) === '1'; } catch { return false; }
+    try { return window.localStorage.getItem(collapsedStorageKey(serverId)) === '1'; } catch { return false; }
   });
+  const [concurrency, setConcurrency] = useState<{ maxConcurrency: number; fixedOverride: boolean } | null>(null);
+  const pendingConcurrencyCommandId = useRef<string>();
+  const debounceTimer = useRef<number>();
+  useEffect(() => {
+    if (!ws || !brain || typeof ws.onMessage !== 'function' || typeof ws.send !== 'function') { setConcurrency(null); return; }
+    const unsubscribe = ws.onMessage((msg) => {
+      const reply = msg as { type?: string; commandId?: string; ok?: boolean; maxConcurrency?: number; fixedOverride?: boolean };
+      if (reply.type !== TASK_PAIR_MAX_CONCURRENCY_RESULT || reply.commandId !== pendingConcurrencyCommandId.current) return;
+      if (reply.ok && typeof reply.maxConcurrency === 'number') setConcurrency({ maxConcurrency: Math.min(TASK_PAIR_MAX_CONCURRENCY_CAP, Math.max(1, reply.maxConcurrency)), fixedOverride: !!reply.fixedOverride });
+      else {
+        const refreshId = `pair_concurrency_get_${crypto.randomUUID()}`;
+        pendingConcurrencyCommandId.current = refreshId;
+        ws.send({ type: DAEMON_COMMAND_TYPES.TASK_PAIR_GET_MAX_CONCURRENCY, commandId: refreshId, brain });
+      }
+    });
+    const commandId = `pair_concurrency_get_${crypto.randomUUID()}`;
+    pendingConcurrencyCommandId.current = commandId;
+    ws.send({ type: DAEMON_COMMAND_TYPES.TASK_PAIR_GET_MAX_CONCURRENCY, commandId, brain });
+    return () => { unsubscribe(); if (debounceTimer.current) window.clearTimeout(debounceTimer.current); };
+  }, [ws, brain]);
+  const adjustConcurrency = (requested: number) => {
+    if (!ws || !brain || !concurrency || concurrency.fixedOverride) return;
+    const next = Math.min(TASK_PAIR_MAX_CONCURRENCY_CAP, Math.max(1, Math.floor(requested)));
+    setConcurrency({ ...concurrency, maxConcurrency: next });
+    if (debounceTimer.current) window.clearTimeout(debounceTimer.current);
+    debounceTimer.current = window.setTimeout(() => {
+      const commandId = `pair_concurrency_set_${crypto.randomUUID()}`;
+      pendingConcurrencyCommandId.current = commandId;
+      ws.send({ type: DAEMON_COMMAND_TYPES.TASK_PAIR_SET_MAX_CONCURRENCY, commandId, brain, maxConcurrency: next });
+    }, CONCURRENCY_DEBOUNCE_MS);
+  };
+  const [editingConcurrency, setEditingConcurrency] = useState(false);
+  const [concurrencyInput, setConcurrencyInput] = useState('');
+  const [expandedBriefs, setExpandedBriefs] = useState<ReadonlySet<string>>(() => new Set());
+  const [loadedBriefs, setLoadedBriefs] = useState<Readonly<Record<string, string>>>(() => ({}));
+  const [loadingBriefs, setLoadingBriefs] = useState<ReadonlySet<string>>(() => new Set());
+  const [briefLoadErrors, setBriefLoadErrors] = useState<ReadonlySet<string>>(() => new Set());
+  const toggleBrief = (taskId: string) => setExpandedBriefs((current) => { const next = new Set(current); if (next.has(taskId)) next.delete(taskId); else next.add(taskId); return next; });
+  const openBrief = async (taskId: string, inlineBrief: string | undefined, updatedAt: number) => {
+    if (expandedBriefs.has(taskId)) { toggleBrief(taskId); return; }
+    if (inlineBrief !== undefined) { toggleBrief(taskId); return; }
+    if (!serverId || !brain || loadingBriefs.has(taskId)) return;
+    setLoadingBriefs((current) => new Set(current).add(taskId));
+    setBriefLoadErrors((current) => { const next = new Set(current); next.delete(taskId); return next; });
+    try {
+      const history = await fetchTimelineHistoryHttp(serverId, brain, { afterTs: Math.max(0, updatedAt - 1), beforeTs: updatedAt + 1, limit: 500 });
+      const matching = history?.events.find((event) => {
+        const candidate = event as { type?: string; payload?: { taskId?: string; brief?: string } };
+        return candidate.type === TASK_PAIR_TIMELINE_EVENT && candidate.payload?.taskId === taskId && typeof candidate.payload.brief === 'string';
+      }) as { payload?: { brief?: string } } | undefined;
+      if (typeof matching?.payload?.brief !== 'string') throw new Error('brief_missing');
+      setLoadedBriefs((current) => ({ ...current, [taskId]: matching.payload!.brief! }));
+      toggleBrief(taskId);
+    } catch {
+      setBriefLoadErrors((current) => new Set(current).add(taskId));
+    } finally {
+      setLoadingBriefs((current) => { const next = new Set(current); next.delete(taskId); return next; });
+    }
+  };
   const [snapshotRows, setSnapshotRows] = useState<readonly Record<string, unknown>[] | null>(() => {
     const detail = (window as Window & { __imcodesTaskPairSnapshot?: { tasks?: readonly Record<string, unknown>[]; assignments?: readonly Record<string, unknown>[] } }).__imcodesTaskPairSnapshot;
     return detail ? normalizeSnapshot(detail) : null;
@@ -102,7 +170,7 @@ export function TaskPairStatusPanel({ events, sessions }: { events: readonly Tim
     return result;
   }, { working: 0, audit: 0, queued: 0 });
   if (latest.size === 0) return null;
-  const toggle = () => setCollapsed((value) => { const next = !value; try { window.localStorage.setItem(STORAGE_KEY, next ? '1' : '0'); } catch {} return next; });
+  const toggle = () => setCollapsed((value) => { const next = !value; try { window.localStorage.setItem(collapsedStorageKey(serverId), next ? '1' : '0'); } catch {} return next; });
   const projectionSessions = watchProjectionStore.getSnapshot().sessions;
   const session = (id: unknown, label: unknown, model: unknown, role: 'executor' | 'auditor') => {
     // 'none' is a real, deliberate value (auditor=none): there is no session
@@ -120,7 +188,7 @@ export function TaskPairStatusPanel({ events, sessions }: { events: readonly Tim
     separator: t('taskPair.panel_duration_separator'),
   };
   return <aside class={`task-pair-status-panel${collapsed ? ' is-collapsed' : ''}`} data-testid="task-pair-status-panel">
-    <button type="button" class="task-pair-status-toggle" aria-expanded={!collapsed} onClick={toggle}>
+    <div class="task-pair-status-header"><button type="button" class="task-pair-status-toggle" aria-expanded={!collapsed} onClick={toggle}>
       <strong>{t('taskPair.panel_title')}</strong>
       <span class="task-pair-status-summary">
         <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--working">{t('taskPair.panel_count_working', { count: counts.working })}</span>
@@ -128,10 +196,16 @@ export function TaskPairStatusPanel({ events, sessions }: { events: readonly Tim
         <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--queued">{t('taskPair.panel_count_queued', { count: counts.queued })}</span>
       </span>
     </button>
+    {concurrency && <div class="task-pair-status-concurrency" data-testid="task-pair-status-concurrency" title={concurrency.fixedOverride ? t('taskPair.panel_concurrency_fixed_tooltip') : t('taskPair.panel_concurrency_tooltip')}>
+      <button type="button" aria-label={t('taskPair.panel_concurrency_decrease')} disabled={concurrency.fixedOverride || concurrency.maxConcurrency <= 1} onClick={() => adjustConcurrency(concurrency.maxConcurrency - 1)}>−</button>
+      {editingConcurrency && !concurrency.fixedOverride ? <input aria-label={t('taskPair.panel_concurrency')} type="number" min="1" max={TASK_PAIR_MAX_CONCURRENCY_CAP} value={concurrencyInput} onInput={(event) => setConcurrencyInput((event.target as HTMLInputElement).value)} onChange={(event) => setConcurrencyInput((event.target as HTMLInputElement).value)} onBlur={(event) => { const value = Number((event.target as HTMLInputElement).value); if (Number.isFinite(value)) adjustConcurrency(value); setEditingConcurrency(false); }} onKeyDown={(event) => { if (event.key === 'Enter') { const value = Number((event.target as HTMLInputElement).value); if (Number.isFinite(value)) adjustConcurrency(value); setEditingConcurrency(false); } if (event.key === 'Escape') setEditingConcurrency(false); }} autoFocus /> : <button type="button" class="task-pair-status-concurrency-value" disabled={concurrency.fixedOverride} onClick={() => { setConcurrencyInput(String(concurrency.maxConcurrency)); setEditingConcurrency(true); }}>{t('taskPair.panel_concurrency', { max: concurrency.maxConcurrency })}</button>}
+      <button type="button" aria-label={t('taskPair.panel_concurrency_increase')} disabled={concurrency.fixedOverride || concurrency.maxConcurrency >= TASK_PAIR_MAX_CONCURRENCY_CAP} onClick={() => adjustConcurrency(concurrency.maxConcurrency + 1)}>+</button>
+      {concurrency.fixedOverride && <small class="task-pair-status-concurrency-fixed">{t('taskPair.panel_concurrency_fixed_note')}</small>}
+    </div>}</div>
     {!collapsed && <div class="task-pair-status-rows">
       {groups.map((group) => {
         const heading = <h4>{t(`taskPair.panel_group_${group.key}`)} <small>({group.rows.length})</small></h4>;
-        const content = group.rows.map((row, index) => { const payload = row.payload; const queued = group.key === 'queued'; const elapsedSeconds = Math.max(0, Math.floor((now - row.startedAt) / 1000)); const title = typeof payload.title === 'string' && payload.title.trim() ? payload.title : t('taskPair.panel_untitled'); const taskStatus = String(payload.toStatus); return <div class={`task-pair-status-row task-pair-chip--${taskStatus}`} data-status={taskStatus} key={String(payload.taskId)}>
+        const content = group.rows.map((row, index) => { const payload = row.payload; const queued = group.key === 'queued'; const elapsedSeconds = Math.max(0, Math.floor((now - row.startedAt) / 1000)); const title = typeof payload.title === 'string' && payload.title.trim() ? payload.title : t('taskPair.panel_untitled'); const taskStatus = String(payload.toStatus); const taskId = String(payload.taskId); const inlineBrief = typeof payload.brief === 'string' ? payload.brief : undefined; const brief = inlineBrief ?? loadedBriefs[taskId] ?? ''; const briefAvailable = payload.briefAvailable === true || inlineBrief !== undefined; const checklist = brief ? taskPairChecklistCounts(brief) : (payload.checklist as { total: number; implemented: number; audited: number } | undefined) ?? taskPairChecklistCounts(brief); const isExpanded = expandedBriefs.has(taskId); return <div class={`task-pair-status-row task-pair-chip--${taskStatus}`} data-status={taskStatus} key={taskId}>
           <div class="task-pair-status-row-head">
             <span class={`task-pair-status-badge task-pair-chip--${taskStatus}`}>
               <span class="task-pair-status-badge-dot" aria-hidden="true" />
@@ -149,6 +223,8 @@ export function TaskPairStatusPanel({ events, sessions }: { events: readonly Tim
               ? <span class="task-pair-role-chip task-pair-role-chip--muted">{t('taskPair.panel_no_audit')}</span>
               : <span class="task-pair-role-chip"><span class={`task-pair-status-dot ${payload.auditorState === 'running' ? 'is-running' : ''}`} />{session(payload.auditor, payload.auditorLabel, payload.auditorModel, 'auditor') ?? <small>{t('taskPair.panel_unassigned')}</small>}</span>}
           </div>
+          {briefAvailable && <div class="task-pair-status-brief-bar">{checklist.total > 0 && <span class="task-pair-status-checklist-progress">{t('taskPair.checklist_progress', checklist)}</span>}<button type="button" class="task-pair-status-brief-toggle" aria-expanded={isExpanded} disabled={loadingBriefs.has(taskId)} onClick={() => void openBrief(taskId, inlineBrief ?? loadedBriefs[taskId], row.updatedAt)}>{loadingBriefs.has(taskId) ? t('taskPair.panel_loading_brief') : t(isExpanded ? 'taskPair.panel_hide_brief' : 'taskPair.panel_show_brief')}</button>{briefLoadErrors.has(taskId) && <small role="status">{t('taskPair.panel_brief_load_failed')}</small>}</div>}
+          {!!brief && isExpanded && <div class="task-pair-status-brief"><ChatMarkdown text={brief} />{checklist.total > 0 && <div class="task-pair-status-checklist">{parseTaskPairChecklist(brief).map((item) => <div class="task-pair-status-checklist-row" key={item.index}><input type="checkbox" checked={item.implemented} readOnly aria-label={t('taskPair.implemented')} /><input type="checkbox" checked={item.audited} readOnly aria-label={t('taskPair.audited')} /><span>{item.text}</span></div>)}</div>}</div>}
         </div>; });
         return group.key === 'recent'
           ? <details class={`task-pair-status-group task-pair-status-group-${group.key}`} key={group.key}><summary>{heading}</summary>{content}</details>

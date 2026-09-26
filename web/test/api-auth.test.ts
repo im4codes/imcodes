@@ -283,7 +283,7 @@ describe('auth nonce exchange API', () => {
     expect(urls[1]).toBe('/api/server/srv%20id%2F1/local-web-preview/preview%20id%2F2');
     expect(urls[2]).toBe('/api/server/srv%20id%2F1/session/send');
     expect(urls[3]).toBe('/api/server/srv%20id%2F1/session/cancel');
-    expect(urls[4]).toBe('/api/server/srv%20id%2F1/timeline/history/full?sessionName=deck_proj_brain&limit=25');
+    expect(urls[4]).toBe('/api/server/srv%20id%2F1/timeline/history/full?sessionName=deck_proj_brain&serverId=srv+id%2F1&limit=25');
     expect(urls[5]).toBe('/api/server/srv%20id%2F1/timeline/text-tail?sessionName=deck_proj_brain');
   });
 

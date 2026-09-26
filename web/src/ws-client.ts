@@ -213,6 +213,7 @@ export type ServerMessage =
   | { type: typeof PEER_AUDIT_MESSAGES.CANDIDATES; commandId: string; ok: boolean; list?: import('../../shared/peer-audit.js').PeerAuditCandidateList; error?: string }
   | { type: typeof PEER_AUDIT_MESSAGES.QUICK_RESULT; commandId: string; ok: boolean; attemptId?: string; resultEventId?: string; error?: string }
   | { type: typeof PEER_AUDIT_MESSAGES.CANCEL_RESULT; commandId: string; ok: boolean; error?: string }
+  | import('../../shared/task-pair.js').TaskPairMaxConcurrencyResult
   | { type: typeof MSG_COMMAND_FAILED; commandId: string; session: string; reason: AckFailureReason; retryable: boolean }
   | { type: typeof MSG_DAEMON_ONLINE }
   | { type: typeof MSG_DAEMON_OFFLINE }

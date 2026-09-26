@@ -3745,7 +3745,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
             <span class="chat-pinned-last-sent-text">{pinnedPreviewText}</span>
           </div>
         )}
-        {!preview && !!sessionId && !sessionId.includes('deck_sub_') && <TaskPairStatusPanel events={events} sessions={sessions} />}
+        {!preview && !!sessionId && !sessionId.includes('deck_sub_') && <TaskPairStatusPanel events={events} sessions={sessions} ws={ws} brain={sessionId} serverId={serverId} />}
         <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} style={chatFontStyle} onScroll={preview ? undefined : handleScroll}
           onWheel={preview ? undefined : handleWheel}
           onTouchStart={preview ? undefined : handleTouchStart}

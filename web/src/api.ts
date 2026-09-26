@@ -1342,6 +1342,10 @@ export async function fetchTimelineHistoryHttp(
 ) | null> {
   const params = new URLSearchParams();
   params.set('sessionName', sessionName);
+  // The path is already server-specific for this legacy endpoint; the query
+  // routing key is included too so ingress configurations that route by
+  // ?serverId= keep this daemon-dependent backfill pod-sticky.
+  params.set('serverId', serverId);
   if (typeof opts.afterTs === 'number' && Number.isFinite(opts.afterTs)) params.set('afterTs', String(opts.afterTs));
   if (typeof opts.beforeTs === 'number' && Number.isFinite(opts.beforeTs)) params.set('beforeTs', String(opts.beforeTs));
   if (typeof opts.limit === 'number' && Number.isFinite(opts.limit)) params.set('limit', String(opts.limit));
