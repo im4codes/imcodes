@@ -22,6 +22,7 @@ import {
   __buildViewItemsForTests,
   __buildViewItemsTailForTests,
   __computeVirtualChatRangeForTests,
+  __computeVirtualChatRevealScrollTopForTests,
 } from '../src/components/ChatView.js';
 import type { TimelineEvent } from '../src/ws-client.js';
 
@@ -215,4 +216,14 @@ it('finalizes a merged assistant block when its latest event is terminal', () =>
   expect(items).toHaveLength(1);
   expect(items[0]?.assistantStreaming).toBe(false);
   expect(items[0]?.text).toContain('final answer');
+});
+
+it('reveals an offscreen pin target beyond the virtualized viewport', () => {
+  const heights = Array.from({ length: 48 }, () => 72);
+  const targetIndex = 39;
+  const targetTop = __computeVirtualChatRevealScrollTopForTests(heights, targetIndex);
+  const range = __computeVirtualChatRangeForTests(heights, targetTop, 320, 6);
+  expect(targetTop).toBe(2_808);
+  expect(range.start).toBeLessThanOrEqual(targetIndex);
+  expect(range.end).toBeGreaterThan(targetIndex);
 });

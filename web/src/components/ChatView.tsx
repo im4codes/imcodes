@@ -2080,10 +2080,23 @@ export function __computeVirtualChatRangeForTests(
   };
 }
 
+/** Return the measured/estimated scroll offset needed to reveal an item. */
+export function __computeVirtualChatRevealScrollTopForTests(
+  heights: readonly number[],
+  index: number,
+): number {
+  const end = Math.max(0, Math.min(heights.length, Math.floor(index)));
+  let offset = 0;
+  for (let i = 0; i < end; i += 1) offset += Math.max(1, heights[i] ?? 72);
+  return offset;
+}
+
 interface VirtualizedViewItemsProps {
   items: ViewItem[];
   scrollRef: { current: HTMLDivElement | null };
   enabled: boolean;
+  /** A pinned/search target that must be mounted before its caller locates it. */
+  revealKey?: string;
   renderItem: (item: ViewItem) => h.JSX.Element;
 }
 
@@ -2094,7 +2107,7 @@ interface VirtualizedViewItemsProps {
  * remains the owner of follow/anchor policy and therefore streaming and history
  * prepend semantics stay unchanged.
  */
-function VirtualizedViewItems({ items, scrollRef, enabled, renderItem }: VirtualizedViewItemsProps) {
+function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, renderItem }: VirtualizedViewItemsProps) {
   const heightsRef = useRef(new Map<string, number>());
   const [layoutVersion, setLayoutVersion] = useState(0);
   const scrollTopRef = useRef(0);
@@ -2126,6 +2139,23 @@ function VirtualizedViewItems({ items, scrollRef, enabled, renderItem }: Virtual
       rafRef.current = null;
     };
   }, [enabled, scrollRef]);
+
+  // Pin/search navigation can target an item outside the mounted overscan
+  // range. Move the real scroll viewport to its measured offset first; the
+  // next render then mounts the target and the existing locator can highlight
+  // it without rendering the entire history.
+  useEffect(() => {
+    if (!enabled || !revealKey) return undefined;
+    const root = scrollRef.current;
+    const index = items.findIndex((item) => item.key === revealKey);
+    if (!root || index < 0) return undefined;
+    const heights = items.map(getHeight);
+    const targetTop = __computeVirtualChatRevealScrollTopForTests(heights, index);
+    if (Math.abs(root.scrollTop - targetTop) > 1) root.scrollTop = targetTop;
+    scrollTopRef.current = targetTop;
+    setLayoutVersion((v) => v + 1);
+    return undefined;
+  }, [enabled, revealKey, items, scrollRef]);
 
   useEffect(() => {
     if (!enabled || typeof ResizeObserver === 'undefined') return undefined;
@@ -2212,6 +2242,9 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   const [ctxMenu, setCtxMenu] = useState<SelectionMenu | null>(null);
   const ctxMenuRef = useRef<HTMLDivElement>(null);
   const [pendingPinnedLocate, setPendingPinnedLocate] = useState<MessagePin | null>(null);
+  // The virtualizer uses this key to mount and scroll an offscreen navigation
+  // target before the locator/highlighter inspects the DOM.
+  const [virtualRevealKey, setVirtualRevealKey] = useState<string | undefined>();
   const pendingPinnedLocateIdRef = useRef<string | null>(null);
   const timelineEventsRef = useRef(events);
   timelineEventsRef.current = events;
@@ -2819,6 +2852,43 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     return sourceEvent ? (messagePinSourceText(sourceEvent, viewItems) ?? pin.text) : pin.text;
   }, [events, sessionId, viewItems]);
 
+  /**
+   * Reveal an event through the virtualizer and retry DOM lookup until the
+   * measured target is mounted. All message-navigation entry points use this
+   * helper so an offscreen target cannot leave a pending jump stuck.
+   */
+  const revealEventWithRetry = useCallback((
+    eventId: string,
+    onFound: (root: HTMLElement, target: HTMLElement) => void,
+    onTimeout?: () => void,
+  ): (() => void) => {
+    setVirtualRevealKey(eventId);
+    let cancelled = false;
+    let attempts = 0;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const attempt = () => {
+      if (cancelled) return;
+      const root = scrollRef.current;
+      const target = root ? findEventElement(root, eventId) : null;
+      if (root && target) {
+        setVirtualRevealKey(undefined);
+        onFound(root, target);
+        return;
+      }
+      if (attempts++ >= 30) {
+        setVirtualRevealKey(undefined);
+        onTimeout?.();
+        return;
+      }
+      timer = setTimeout(attempt, 16);
+    };
+    timer = setTimeout(attempt, 0);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, []);
+
   const locatePinnedMessage = useCallback(async (pin: MessagePin) => {
     if (!sessionId || pin.sessionName !== sessionId) {
       requestMessagePinNavigation(pin, sessionId);
@@ -2872,11 +2942,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     // in one task (which would revive the multi-window freeze this UI avoids).
     const requiredTailItems = viewItems.length - targetItemIndex;
     setRenderItemLimit((current) => Math.max(current, requiredTailItems));
-    const frame = requestAnimationFrame(() => {
-      const root = scrollRef.current;
-      if (!root) return;
-      const target = findEventElement(root, targetDomEventId);
-      if (!target) return;
+    return revealEventWithRetry(targetDomEventId, (root, target) => {
       const reducedMotion = typeof window.matchMedia === 'function'
         && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
       scrollEventWithinChat(root, target, reducedMotion ? 'auto' : 'smooth');
@@ -2885,9 +2951,13 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       clearPendingMessagePin(pendingPinnedLocate.id);
       pendingPinnedLocateIdRef.current = null;
       setPendingPinnedLocate(null);
+    }, () => {
+      clearPendingMessagePin(pendingPinnedLocate.id);
+      pendingPinnedLocateIdRef.current = null;
+      setPendingPinnedLocate(null);
+      setPinnedLocateError(true);
     });
-    return () => cancelAnimationFrame(frame);
-  }, [events, pendingPinnedLocate, renderedRevision, viewItems.length]);
+  }, [events, pendingPinnedLocate, renderedRevision, revealEventWithRetry, viewItems.length]);
 
   useEffect(() => {
     if (revealingOlderTimerRef.current) {
@@ -3884,20 +3954,14 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
               // behaves like a jump-to-message. Holds the expand state so a
               // long message can be read without hunting for it.
               if (!pinnedExpanded) { setPinnedExpanded(true); return; }
-              const root = scrollRef.current;
-              if (!root) return;
-              const target = findEventElement(root, lastSentUserMessage.eventId);
-              if (target) {
-                // Respect the OS reduced-motion preference — smooth scrolling
-                // is a vestibular-trigger axis for some users.
+              // The last-sent bubble may be outside the virtualizer's mounted
+              // range. Reveal it first, then perform the same centered jump.
+              revealEventWithRetry(lastSentUserMessage.eventId, (root, target) => {
                 const reducedMotion = typeof window !== 'undefined'
                   && window.matchMedia
                   && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-                target.scrollIntoView({
-                  behavior: reducedMotion ? 'auto' : 'smooth',
-                  block: 'center',
-                });
-              }
+                scrollEventWithinChat(root, target, reducedMotion ? 'auto' : 'smooth');
+              });
             }}
           >
             <span class="chat-pinned-last-sent-meta">
@@ -4031,6 +4095,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
             items={renderedViewItems}
             scrollRef={scrollRef}
             enabled={!preview}
+            revealKey={virtualRevealKey}
             renderItem={(item) => {
             if (item.type === 'supervision-status-run') {
               return <SupervisionStatusRun key={item.key} item={item} />;
