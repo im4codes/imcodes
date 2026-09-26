@@ -592,6 +592,9 @@ const SUBSESSION_OWNERSHIP_RETRY_DELAYS_MS = [50, 150, 350] as const;
 const TIMELINE_SOCKET_QUEUE_MAX_BYTES = 2 * 1024 * 1024;
 const TIMELINE_SOCKET_QUEUE_MAX_ITEMS = 512;
 const TIMELINE_SOCKET_BUFFERED_HIGH_WATER = 1 * 1024 * 1024;
+/** Bound gap-control traffic when a peer remains congested for a long time. */
+const TIMELINE_SOCKET_GAP_RATE_MAX = 16;
+const TIMELINE_SOCKET_GAP_RATE_WINDOW_MS = 1_000;
 
 /**
  * Safe ws.send: checks readyState, wraps in try/catch.
@@ -749,6 +752,8 @@ interface TimelineQueueEvent {
   seq: number;
   priority: TimelineQueuePriority;
   coalesceKey?: string;
+  gapFromSeq?: number;
+  gapToSeq?: number;
 }
 
 /**
@@ -760,6 +765,13 @@ class TimelineOutboundQueue {
   private pending: TimelineQueueEvent[] = [];
   private bytes = 0;
   private sending = false;
+  /** One merged missing range per session/epoch congestion episode. */
+  private pendingGaps = new Map<string, TimelineQueueEvent>();
+  private gapEpisodes = new Set<string>();
+  private gapSentAt: number[] = [];
+  private gapFlushScheduled = false;
+  private gapFlushTimer?: NodeJS.Timeout;
+  private gapFlushHandler?: (event: TimelineQueueEvent) => void;
 
   enqueue(ws: WebSocket, item: TimelineQueueEvent, onGap: (event: TimelineQueueEvent) => void, onCoalesced?: () => void): void {
     const existingIndex = item.coalesceKey
@@ -768,9 +780,10 @@ class TimelineOutboundQueue {
     if (existingIndex >= 0) {
       const previous = this.pending[existingIndex]!;
       // Replacing a pending latest-value frame is still a loss of its
-      // sequence number. Tell the browser to backfill it rather than making
-      // coalescing an invisible drop (this also covers full-mode overflow).
-      onGap(previous);
+      // sequence number. Record it for one merged gap per congestion episode;
+      // emitting one frame per replacement can itself overwhelm a healthy
+      // socket (and was the source of the observed gap storm).
+      this.noteGap(previous);
       onCoalesced?.();
       this.bytes -= Buffer.byteLength(previous.data, 'utf8');
       this.pending[existingIndex] = item;
@@ -785,12 +798,13 @@ class TimelineOutboundQueue {
       || this.bytes > TIMELINE_SOCKET_QUEUE_MAX_BYTES
       || this.pending.length > TIMELINE_SOCKET_QUEUE_MAX_ITEMS;
     if (pressured) {
-      this.trim(onGap);
+      this.trim();
     }
+    this.scheduleGapFlush(onGap);
     this.pump(ws, onGap);
   }
 
-  private trim(onGap: (event: TimelineQueueEvent) => void): void {
+  private trim(): void {
     while (this.bytes > TIMELINE_SOCKET_QUEUE_MAX_BYTES || this.pending.length > TIMELINE_SOCKET_QUEUE_MAX_ITEMS) {
       // Preserve final and durable events for as long as possible. Under a
       // completely wedged socket even those may be discarded, but every such
@@ -801,8 +815,61 @@ class TimelineOutboundQueue {
       const [removed] = this.pending.splice(index, 1);
       if (!removed) break;
       this.bytes -= Buffer.byteLength(removed.data, 'utf8');
-      onGap(removed);
+      this.noteGap(removed);
     }
+  }
+
+  private gapKey(event: TimelineQueueEvent): string {
+    return `${event.sessionId}\u0000${event.epoch}`;
+  }
+
+  private noteGap(event: TimelineQueueEvent): void {
+    const key = this.gapKey(event);
+    const fromSeq = event.gapFromSeq ?? event.seq;
+    const toSeq = event.gapToSeq ?? event.seq;
+    const existing = this.pendingGaps.get(key);
+    if (existing) {
+      existing.gapFromSeq = Math.min(existing.gapFromSeq ?? fromSeq, fromSeq);
+      existing.gapToSeq = Math.max(existing.gapToSeq ?? toSeq, toSeq);
+      existing.seq = existing.gapFromSeq;
+      return;
+    }
+    this.pendingGaps.set(key, { ...event, seq: fromSeq, gapFromSeq: fromSeq, gapToSeq: toSeq });
+  }
+
+  private flushGaps(onGap: (event: TimelineQueueEvent) => void): void {
+    this.gapFlushHandler = onGap;
+    const now = Date.now();
+    this.gapSentAt = this.gapSentAt.filter((timestamp) => timestamp > now - TIMELINE_SOCKET_GAP_RATE_WINDOW_MS);
+    for (const [key, gap] of this.pendingGaps) {
+      if (this.gapEpisodes.has(key) || this.gapSentAt.length >= TIMELINE_SOCKET_GAP_RATE_MAX) continue;
+      this.pendingGaps.delete(key);
+      this.gapEpisodes.add(key);
+      this.gapSentAt.push(now);
+      onGap(gap);
+    }
+    if (this.pendingGaps.size > 0 && this.gapSentAt.length >= TIMELINE_SOCKET_GAP_RATE_MAX && !this.gapFlushTimer) {
+      const retryAt = (this.gapSentAt[0] ?? now) + TIMELINE_SOCKET_GAP_RATE_WINDOW_MS;
+      this.gapFlushTimer = setTimeout(() => {
+        this.gapFlushTimer = undefined;
+        if (this.gapFlushHandler) this.flushGaps(this.gapFlushHandler);
+      }, Math.max(1, retryAt - now));
+      this.gapFlushTimer.unref?.();
+    }
+  }
+
+  private scheduleGapFlush(onGap: (event: TimelineQueueEvent) => void): void {
+    if (this.gapFlushScheduled) return;
+    this.gapFlushScheduled = true;
+    setImmediate(() => {
+      this.gapFlushScheduled = false;
+      this.flushGaps(onGap);
+    });
+  }
+
+  private finishCongestionEpisode(): void {
+    if (this.sending || this.pending.length > 0) return;
+    this.gapEpisodes.clear();
   }
 
   private pump(ws: WebSocket, onGap: (event: TimelineQueueEvent) => void): void {
@@ -817,9 +884,14 @@ class TimelineOutboundQueue {
     this.sending = true;
     safeSend(ws, item.data, (error) => {
       this.sending = false;
-      if (error) onGap(item);
+      if (error) {
+        this.noteGap(item);
+        this.scheduleGapFlush(onGap);
+      }
+      this.finishCongestionEpisode();
       this.pump(ws, onGap);
     });
+    this.finishCongestionEpisode();
   }
 }
 
@@ -8158,8 +8230,8 @@ export class WsBridge {
           type: TIMELINE_MESSAGES.SEQ_GAP,
           sessionId: dropped.sessionId,
           epoch: dropped.epoch,
-          fromSeq: dropped.seq,
-          toSeq: dropped.seq,
+          fromSeq: dropped.gapFromSeq ?? dropped.seq,
+          toSeq: dropped.gapToSeq ?? dropped.seq,
           reason: 'backpressure',
           backfill: true,
         };

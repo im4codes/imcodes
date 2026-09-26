@@ -268,6 +268,37 @@ describe('WsBridge timeline drop telemetry', () => {
     expect(getCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_COALESCED)).toBe(0);
   });
 
+  it('keeps a healthy summary socket gap-free under realistic status/tool load', async () => {
+    const { bridge, daemon } = await setupAuthedDaemon();
+    const summary = new MockWs();
+    bridge.handleBrowserConnection(summary as never, 'user-1', makeDb());
+    summary.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: SESSION,
+      mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY,
+    }));
+    await flushAsync();
+    summary.sent.length = 0;
+    for (let seq = 1; seq <= 125; seq += 1) {
+      daemon.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.EVENT,
+        event: {
+          eventId: `load-${seq}`,
+          sessionId: SESSION,
+          ts: Date.now(),
+          seq,
+          epoch: 1,
+          type: seq % 5 === 0 ? 'tool.result' : 'agent.status',
+          payload: { status: `step-${seq}`, output: seq % 5 === 0 ? 'x'.repeat(1024) : undefined },
+        },
+      }));
+    }
+    await flushAsync();
+    const gaps = summary.sentStrings.map((raw) => JSON.parse(raw)).filter((msg) => msg.type === TIMELINE_MESSAGES.SEQ_GAP);
+    expect(gaps).toHaveLength(0);
+    expect(getCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_GAP)).toBe(0);
+  });
+
   it('mode switch with a cursor reuses timeline.history_request for backfill', async () => {
     const { bridge, daemon } = await setupAuthedDaemon();
     const browser = new MockWs();
@@ -329,7 +360,7 @@ describe('WsBridge timeline drop telemetry', () => {
         payload: { text: 'hold the queue open' },
       },
     }));
-    for (const seq of [11, 12]) {
+    for (const seq of [11, 12, 13]) {
       daemon.emit('message', JSON.stringify({
         type: TIMELINE_MESSAGES.EVENT,
         event: {
@@ -347,7 +378,43 @@ describe('WsBridge timeline drop telemetry', () => {
     const gaps = slow.sentStrings.map((raw) => JSON.parse(raw))
       .filter((msg) => msg.type === TIMELINE_MESSAGES.SEQ_GAP);
     expect(gaps).toEqual(expect.arrayContaining([
-      expect.objectContaining({ sessionId: SESSION, epoch: 2, fromSeq: 11, toSeq: 11, backfill: true }),
+      expect.objectContaining({ sessionId: SESSION, epoch: 2, fromSeq: 11, toSeq: 12, backfill: true }),
     ]));
+    expect(gaps).toHaveLength(1);
+  });
+
+  it('caps gap-control frames per congested socket', async () => {
+    const { bridge, daemon } = await setupAuthedDaemon();
+    const slow = new SlowWs();
+    bridge.handleBrowserConnection(slow as never, 'user-1', makeDb());
+    const sessions = Array.from({ length: 20 }, (_, index) => `${SESSION}_${index}`);
+    for (const sessionName of sessions) {
+      slow.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.SUBSCRIBE,
+        sessionName,
+        mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY,
+      }));
+    }
+    await flushAsync();
+    slow.sent.length = 0;
+    for (const sessionName of sessions) {
+      for (const seq of [100, 101, 102, 103]) {
+        daemon.emit('message', JSON.stringify({
+          type: TIMELINE_MESSAGES.EVENT,
+          event: {
+            eventId: `${sessionName}-${seq}`,
+            sessionId: sessionName,
+            ts: Date.now(),
+            seq,
+            epoch: 1,
+            type: seq === 100 ? 'user.message' : 'agent.status',
+            payload: { status: `step-${seq}` },
+          },
+        }));
+      }
+    }
+    await flushAsync();
+    const gaps = slow.sentStrings.map((raw) => JSON.parse(raw)).filter((msg) => msg.type === TIMELINE_MESSAGES.SEQ_GAP);
+    expect(gaps.length).toBeLessThanOrEqual(16);
   });
 });
