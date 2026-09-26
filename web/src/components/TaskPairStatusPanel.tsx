@@ -2,6 +2,7 @@ import { useEffect, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { TimelineEvent } from '../ws-client.js';
 import { TASK_PAIR_TIMELINE_EVENT, TASK_PAIR_STATUSES, type TaskPairStatus } from '@shared/task-pair.js';
+import { AUDIT_DEFAULT_BLOCKING_SEVERITIES } from '@shared/audit-convergence.js';
 import { formatElapsedDuration } from '../util/tool-duration.js';
 import { watchProjectionStore } from '../watch-projection.js';
 
@@ -131,7 +132,7 @@ export function TaskPairStatusPanel({ events, sessions }: { events: readonly Tim
           <strong>{queued && <em>#{Number(payload.queuePosition ?? index + 1)} </em>}{title}</strong>
           {queued && payload.urgent === true && <span class="task-pair-status-urgent">!</span>}
           <small>{t('taskPair.panel_started', { time: new Date(row.startedAt).toLocaleTimeString() })} · {queued ? t('taskPair.panel_queued', { duration: formatElapsedDuration(elapsedSeconds, durationUnits) }) : t('taskPair.panel_elapsed', { duration: formatElapsedDuration(elapsedSeconds, durationUnits) })}</small>
-          {!queued && <span>{payload.toStatus === 'rework' ? t('taskPair.status.rework_round', { round: payload.round ?? 1 }) : t(`taskPair.status.${payload.toStatus}`)} · {t('taskPair.panel_round', { round: payload.round ?? 0 })} · {t('taskPair.blocking', { levels: Array.isArray(payload.blocking) ? payload.blocking.join(',') : 'P0' })}</span>}
+          {!queued && <span>{payload.toStatus === 'rework' ? t('taskPair.status.rework_round', { round: payload.round ?? 1 }) : t(`taskPair.status.${payload.toStatus}`)} · {t('taskPair.panel_round', { round: payload.round ?? 0 })} · {t('taskPair.blocking', { levels: Array.isArray(payload.blocking) ? payload.blocking.join(',') : AUDIT_DEFAULT_BLOCKING_SEVERITIES.join(',') })}</span>}
           <div><span class={`task-pair-status-dot ${payload.executorState === 'running' ? 'is-running' : ''}`} />{session(payload.executor, payload.executorLabel, payload.executorModel, 'executor') ?? <small>{t('taskPair.panel_unassigned')}</small>}{payload.auditor !== 'none' && <span class={`task-pair-status-dot ${payload.auditorState === 'running' ? 'is-running' : ''}`} />}{payload.auditor === 'none' ? <small>{t('taskPair.panel_no_audit')}</small> : session(payload.auditor, payload.auditorLabel, payload.auditorModel, 'auditor') ?? <small>{t('taskPair.panel_unassigned')}</small>}</div>
         </div>; });
         return group.key === 'recent'
