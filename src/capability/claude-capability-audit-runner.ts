@@ -3,6 +3,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { query, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import {
+  buildIsolatedClaudeQueryEnvironment,
+  ISOLATED_CLAUDE_QUERY_ENV_ALLOWLIST,
+} from '../agent/isolated-claude-query.js';
+import {
   CAPABILITY_AUDIT_VERDICT,
   CAPABILITY_FINDING_SEVERITY,
 } from '../../shared/capability-management.js';
@@ -40,25 +44,6 @@ const AUDIT_OUTPUT_SCHEMA = {
     },
   },
 } as const;
-
-// Do not clone the daemon environment: it routinely contains unrelated MCP,
-// provider, deployment, and user secrets. Keep only process bootstrap values
-// plus the narrowly-scoped Claude transport credential/configuration needed by
-// the isolated audit query itself.
-const AUDIT_ENV_ALLOWLIST = [
-  'PATH', 'HOME', 'USERPROFILE', 'TMPDIR', 'TEMP', 'TMP',
-  'SystemRoot', 'WINDIR', 'COMSPEC', 'PATHEXT',
-  'LANG', 'LC_ALL', 'LC_CTYPE', 'NODE_EXTRA_CA_CERTS',
-  'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL',
-  'CLAUDE_CODE_OAUTH_TOKEN',
-] as const;
-
-function buildAuditEnvironment(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
-  return Object.fromEntries(AUDIT_ENV_ALLOWLIST.flatMap((key) => {
-    const value = source[key];
-    return typeof value === 'string' && value.length > 0 ? [[key, value]] : [];
-  }));
-}
 
 function buildAuditPrompt(envelope: CapabilityAuditEnvelope): string {
   return [
@@ -113,7 +98,7 @@ export class ClaudeCapabilityAuditRunner implements CapabilityAuditRunner {
         prompt: buildAuditPrompt(envelope),
         options: {
           cwd,
-          env: buildAuditEnvironment(),
+          env: buildIsolatedClaudeQueryEnvironment(),
           abortController,
           maxTurns: 1,
           tools: [],
@@ -154,6 +139,6 @@ export class ClaudeCapabilityAuditRunner implements CapabilityAuditRunner {
 export const CLAUDE_CAPABILITY_AUDIT_TESTING = {
   outputSchema: AUDIT_OUTPUT_SCHEMA,
   buildAuditPrompt,
-  buildAuditEnvironment,
-  envAllowlist: AUDIT_ENV_ALLOWLIST,
+  buildAuditEnvironment: buildIsolatedClaudeQueryEnvironment,
+  envAllowlist: ISOLATED_CLAUDE_QUERY_ENV_ALLOWLIST,
 };

@@ -16,6 +16,7 @@ import {
   deriveSupervisionTaskTitleFromBrief,
   formatSupervisionTaskIdentityHeader,
   projectSupervisionTaskObjective,
+  readSupervisionTaskTitle,
 } from '../../shared/supervision-task-identity.js';
 import { createHash } from 'node:crypto';
 import {
@@ -1333,6 +1334,15 @@ function bindAcceptedDispatchToTaskPair(
       ...(executorModel ? { executorModel } : {}),
       eventId: `implicit:${delivery.messageId ?? result.dispatchId}`,
     });
+  }
+  // `title` above is either a real human/Brain-authored title, or a
+  // mechanical first-line extraction from the objective/message -- neither
+  // localized, and the latter not deliberately chosen. Only the latter case
+  // is worth replacing: kick off best-effort background generation of a
+  // short title in the user's configured UI locale (never blocks this
+  // return; a no-op when no locale is configured or generation fails).
+  if (!readSupervisionTaskTitle(explicitTitle) && objective) {
+    taskPairService.maybeGenerateTitle(project, taskId, objective);
   }
   const pairState = getTaskPairStore().getPair(project, taskId)?.state;
   const pairTitle = pairState?.title;

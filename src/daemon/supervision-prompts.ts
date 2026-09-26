@@ -26,6 +26,7 @@ import {
   classifySupervisionCustomInstructions,
   isAutomaticSupervisionEnabled,
   resolveSupervisionCustomInstructionsDetail,
+  SUPERVISION_OUTPUT_LANGUAGE_LABELS,
   type SessionSupervisionSnapshot,
   type SupervisionCustomInstructionsDetail,
   type SupervisionUiLocale,
@@ -815,16 +816,6 @@ function buildPeerAuditDecisionLock(request: SupervisionBrokerRequest): string {
     'These four state outcomes are exclusive. Never invent an already-dispatched audit from prose that merely says PASS is required or awaited.',
   ].join('\n');
 }
-
-const SUPERVISION_OUTPUT_LANGUAGE_LABELS: Record<NonNullable<SessionSupervisionSnapshot['uiLocale']>, string> = {
-  en: 'English',
-  'zh-CN': 'Simplified Chinese (简体中文)',
-  'zh-TW': 'Traditional Chinese (繁體中文)',
-  es: 'Spanish (Español)',
-  ru: 'Russian (Русский)',
-  ja: 'Japanese (日本語)',
-  ko: 'Korean (한국어)',
-};
 
 function buildSupervisionOutputLanguageLock(request: SupervisionBrokerRequest): string {
   const locale = request.snapshot?.uiLocale;

@@ -277,6 +277,17 @@ export const SUPERVISION_SUPPORTED_TARGET_SESSION_TYPES = TRANSPORT_SESSION_AGEN
 export const SUPERVISION_UNSUPPORTED_TARGET_SESSION_TYPES = PROCESS_SESSION_AGENT_TYPES;
 export const SUPERVISION_SUPPORTED_UI_LOCALES = ['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko'] as const;
 export type SupervisionUiLocale = typeof SUPERVISION_SUPPORTED_UI_LOCALES[number];
+
+/** Human-readable label for each supported UI locale, for prompts that must name the target language. */
+export const SUPERVISION_OUTPUT_LANGUAGE_LABELS: Record<SupervisionUiLocale, string> = {
+  en: 'English',
+  'zh-CN': 'Simplified Chinese (简体中文)',
+  'zh-TW': 'Traditional Chinese (繁體中文)',
+  es: 'Spanish (Español)',
+  ru: 'Russian (Русский)',
+  ja: 'Japanese (日本語)',
+  ko: 'Korean (한국어)',
+};
 export const DEFAULT_SUPERVISION_BACKEND: SharedContextRuntimeBackend = DEFAULT_PRIMARY_CONTEXT_BACKEND;
 
 const SUPERVISION_AUDIT_MODE_ALLOWLIST = [

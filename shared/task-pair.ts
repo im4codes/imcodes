@@ -60,6 +60,17 @@ export const TASK_PAIR_WORKSPACE_EFFECTS = {
 } as const;
 /** Verb of daemon workspace events (never a marker verb). */
 export const TASK_PAIR_WORKSPACE_EVENT_VERB = 'WORKSPACE' as const;
+/** Verb/effect of a daemon-generated localized title landing on a pair (never a marker verb). */
+export const TASK_PAIR_TITLE_EVENT_VERB = 'TITLE' as const;
+export const TASK_PAIR_TITLE_GENERATED_EFFECT = 'title_generated' as const;
+/**
+ * Known non-informative titles a pair can carry (a legacy-import default
+ * objective, a formatting fallback used elsewhere for a missing title).
+ * Back-fill treats these the same as no title at all; every other stored
+ * title is presumed deliberate (explicit or already regenerated) and is
+ * never touched.
+ */
+export const TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS = ['Delegated supervised task', '(untitled task)'] as const;
 
 /**
  * The workspace rules every pair participant gets, in the marker contract and
