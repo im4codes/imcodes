@@ -88,6 +88,17 @@ describe('hook-server exact session restart ingress', () => {
     await vi.waitFor(() => expect(restartSession).toHaveBeenCalledWith(brain.name, { reset: false }));
   });
 
+  it('defaults an omitted single-target reset flag to false for legacy callers', async () => {
+    const brain = record('deck_project_brain');
+    const worker = record('deck_project_worker');
+    getSessionMock.mockImplementation((name: string) => name === brain.name ? brain : name === worker.name ? worker : null);
+
+    const response = await postRestart(port, brain.name, { from: brain.name, to: worker.name });
+
+    expect(response.status).toBe(202);
+    await vi.waitFor(() => expect(restartSession).toHaveBeenCalledWith(worker.name, { reset: false }));
+  });
+
   it('rejects spoofed callers and cross-project targets before scheduling', async () => {
     const brain = record('deck_project_brain');
     const foreign = record('deck_other_brain', 'other');

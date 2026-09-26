@@ -1380,11 +1380,13 @@ export async function startHookServer(
           })
           : [{
             target: typeof body.to === 'string' ? body.to.trim() : '',
-            reset: body.reset,
+            // The single-target contract has always defaulted reset to false;
+            // preserve that behavior when older callers omit the field.
+            reset: typeof body.reset === 'boolean' ? body.reset : false,
             idempotencyKey: typeof body.idempotencyKey === 'string' ? body.idempotencyKey.trim() : undefined,
           }];
         if (!from || authenticatedSender !== from || items.length === 0 || items.length > SESSION_RESTART_BATCH_MAX
-          || items.some((item) => !item || !item.target || (!isBatch && typeof item.reset !== 'boolean'))) {
+          || items.some((item) => !item || !item.target)) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: isBatch ? 'invalid session restart batch request' : 'invalid exact-session restart request' }));
           return;
