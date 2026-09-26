@@ -779,6 +779,26 @@ class TimelineOutboundQueue {
   private gapFlushScheduled = false;
   private gapFlushTimer?: NodeJS.Timeout;
   private gapFlushHandler?: (event: TimelineQueueEvent) => void;
+  private disposed = false;
+
+  isIdle(): boolean {
+    return !this.sending && this.pending.length === 0 && this.bytes === 0;
+  }
+
+  statsForTests(): { bytes: number; pending: number; pendingGaps: number } {
+    return { bytes: this.bytes, pending: this.pending.length, pendingGaps: this.pendingGaps.size };
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    if (this.gapFlushTimer) clearTimeout(this.gapFlushTimer);
+    this.gapFlushTimer = undefined;
+    this.pending = [];
+    this.bytes = 0;
+    this.pendingGaps.clear();
+    this.gapEpisodes.clear();
+    this.gapSentAt = [];
+  }
 
   enqueue(ws: WebSocket, item: TimelineQueueEvent, onGap: (event: TimelineQueueEvent) => void, onCoalesced?: () => void): void {
     const bufferedAmount = typeof ws.bufferedAmount === 'number' ? ws.bufferedAmount : 0;
@@ -820,11 +840,14 @@ class TimelineOutboundQueue {
   private trim(ws: WebSocket): void {
     while (this.bytes > TIMELINE_SOCKET_QUEUE_MAX_BYTES || this.pending.length > TIMELINE_SOCKET_QUEUE_MAX_ITEMS) {
       // Preserve final and durable events for as long as possible. Under a
-      // completely wedged socket even those may be discarded, but every such
-      // discard emits a seq gap so the browser can converge via history.
+      // completely wedged socket, close it for a history resync instead of
+      // dropping durable/final events and pretending a gap can repair them.
       let index = this.pending.findIndex((entry) => entry.priority === 'coalescible');
-      if (index < 0) index = this.pending.findIndex((entry) => entry.priority === 'durable');
-      if (index < 0) index = 0;
+      if (index < 0) {
+        try { ws.close(1013, 'timeline_backpressure_resync'); } catch { /* already closing */ }
+        this.dispose();
+        return;
+      }
       const [removed] = this.pending.splice(index, 1);
       if (!removed) break;
       this.bytes -= Buffer.byteLength(removed.data, 'utf8');
@@ -905,7 +928,7 @@ class TimelineOutboundQueue {
   }
 
   private pump(ws: WebSocket, onGap: (event: TimelineQueueEvent) => void): void {
-    if (this.sending || this.pending.length === 0) return;
+    if (this.disposed || this.sending || this.pending.length === 0) return;
     this.pending.sort((a, b) => {
       const rank = (value: TimelineQueuePriority): number => value === 'final' ? 0 : value === 'durable' ? 1 : 2;
       return rank(a.priority) - rank(b.priority);
@@ -915,6 +938,7 @@ class TimelineOutboundQueue {
     this.bytes -= Buffer.byteLength(item.data, 'utf8');
     this.sending = true;
     safeSend(ws, item.data, (error) => {
+      if (this.disposed) return;
       this.sending = false;
       // A close/reload is not congestion: there is no browser left to
       // backfill, and emitting a gap on the closing socket creates telemetry
@@ -2281,6 +2305,10 @@ export class WsBridge {
 
   static getAll(): Map<string, WsBridge> {
     return WsBridge.instances;
+  }
+
+  timelineQueueStatsForTests(ws: WebSocket): { bytes: number; pending: number; pendingGaps: number } {
+    return this.timelineQueues.get(ws)?.statsForTests() ?? { bytes: 0, pending: 0, pendingGaps: 0 };
   }
 
   static setRemoteDesktopReconnectRevalidator(
@@ -8248,14 +8276,15 @@ export class WsBridge {
       // every streaming delta remains ordered. Only a real bufferedAmount
       // overflow falls back to the bounded queue/gap path.
       const existingQueue = this.timelineQueues.get(ws);
-      if ((mode === TIMELINE_SUBSCRIPTION_MODES.FULL || !existingQueue)
+      const activeQueue = existingQueue && !existingQueue.isIdle() ? existingQueue : undefined;
+      if ((mode === TIMELINE_SUBSCRIPTION_MODES.FULL || !activeQueue)
         && (typeof ws.bufferedAmount !== 'number' || ws.bufferedAmount <= TIMELINE_SOCKET_BUFFERED_HIGH_WATER)) {
         incrementCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_RECIPIENT, { mode: mode ?? 'legacy', eventType });
         addCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_BYTES, Buffer.byteLength(outgoing, 'utf8'), { mode: mode ?? 'legacy', eventType });
         if (safeSend(ws, outgoing)) recipients += 1;
         continue;
       }
-      let queue = existingQueue;
+      let queue = activeQueue;
       if (!queue) {
         queue = new TimelineOutboundQueue();
         this.timelineQueues.set(ws, queue);
@@ -8556,6 +8585,7 @@ export class WsBridge {
     this.transportSubscriptions.delete(ws);
     this.timelineSubscriptions.delete(ws);
     this.timelineProtocolSockets.delete(ws);
+    this.timelineQueues.get(ws)?.dispose();
     this.timelineQueues.delete(ws);
     this.clearPendingFsRoutesForSocket(ws);
     for (const [requestId, pending] of this.pendingRepoRequests) {

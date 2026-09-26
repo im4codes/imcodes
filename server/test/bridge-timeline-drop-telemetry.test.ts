@@ -307,6 +307,37 @@ describe('WsBridge timeline drop telemetry', () => {
     expect(getCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_GAP)).toBe(0);
   });
 
+  it('keeps cumulative healthy traffic gap-free after more than 64 MiB', async () => {
+    const { bridge, daemon } = await setupAuthedDaemon();
+    const healthy = new AsyncHealthyWs();
+    bridge.handleBrowserConnection(healthy as never, 'user-1', makeDb());
+    healthy.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: SESSION,
+      mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY,
+    }));
+    await flushAsync();
+    healthy.sent.length = 0;
+    for (let seq = 1; seq <= 20_000; seq += 1) {
+      daemon.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.EVENT,
+        event: {
+          eventId: `cumulative-${seq}`,
+          sessionId: SESSION,
+          ts: Date.now(),
+          seq,
+          epoch: 1,
+          type: 'agent.status',
+          payload: { status: 'x'.repeat(4096) },
+        },
+      }));
+    }
+    await flushAsync();
+    const gaps = healthy.sentStrings.map((raw) => JSON.parse(raw)).filter((msg) => msg.type === TIMELINE_MESSAGES.SEQ_GAP);
+    expect(gaps).toHaveLength(0);
+    expect(bridge.timelineQueueStatsForTests(healthy as never)).toEqual({ bytes: 0, pending: 0, pendingGaps: 0 });
+  }, 20_000);
+
   it('mode switch with a cursor reuses timeline.history_request for backfill', async () => {
     const { bridge, daemon } = await setupAuthedDaemon();
     const browser = new MockWs();
@@ -329,7 +360,7 @@ describe('WsBridge timeline drop telemetry', () => {
     });
   });
 
-  it('emits seq_gap when a slow summary socket exhausts its bounded queue', async () => {
+  it('closes a stalled socket before trimming durable events and keeps queue memory bounded', async () => {
     const { bridge, daemon } = await setupAuthedDaemon();
     const slow = new SlowWs();
     bridge.handleBrowserConnection(slow as never, 'user-1', makeDb());
@@ -340,9 +371,11 @@ describe('WsBridge timeline drop telemetry', () => {
       daemon.emit('message', timelineEvent('user.message', `message-${seq}`));
     }
     await flushAsync();
-    const gaps = slow.sentStrings.map((raw) => JSON.parse(raw)).filter((msg) => msg.type === TIMELINE_MESSAGES.SEQ_GAP);
-    expect(gaps.length).toBeGreaterThan(0);
-    expect(gaps[0]).toMatchObject({ sessionId: SESSION, epoch: 1, backfill: true, reason: 'backpressure' });
+    expect(slow.closed).toBe(true);
+    const stats = bridge.timelineQueueStatsForTests(slow as never);
+    expect(stats.bytes).toBeLessThanOrEqual(64 * 1024 * 1024);
+    expect(stats.pending).toBe(0);
+    expect(stats.pendingGaps).toBe(0);
   }, 20_000);
 
   it('emits seq_gap metadata when a slow socket coalesces a latest-value frame', async () => {
