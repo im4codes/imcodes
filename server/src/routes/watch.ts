@@ -17,7 +17,7 @@ import { WsBridge } from '../ws/bridge.js';
 import { IMCODES_POD_HEADER } from '../../../shared/http-header-names.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../../shared/timeline-payload-budget.js';
 import { TIMELINE_RESPONSE_STATUS } from '../../../shared/timeline-protocol.js';
-import { clampTimelineHistoryLimit } from '../../../shared/timeline-history-limits.js';
+import { TIMELINE_HISTORY_LIMITS, clampTimelineHistoryLimit } from '../../../shared/timeline-history-limits.js';
 import { getPodIdentity } from '../util/pod-identity.js';
 import logger from '../util/logger.js';
 // Shared so the daemon (command-handler.ts) and server emit the SAME log
@@ -569,7 +569,7 @@ watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) =>
     const rawEvents = Array.isArray(response.events) ? response.events : [];
     // Only filter out obviously malformed records (missing eventId/ts/type).
     // Preserve every other field so the web merge path gets the full shape.
-    const events = rawEvents.filter((event): event is Record<string, unknown> => {
+    const filteredEvents = rawEvents.filter((event): event is Record<string, unknown> => {
       if (!event || typeof event !== 'object') return false;
       const e = event as Record<string, unknown>;
       return typeof e.eventId === 'string'
@@ -577,11 +577,19 @@ watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) =>
         && typeof e.ts === 'number'
         && typeof e.type === 'string';
     });
+    // The daemon normally enforces this too, but keep the HTTP boundary safe
+    // for older daemons and protocol-faithful test daemons that may return an
+    // expanded content-aware page. Retain the newest tail and expose a cursor
+    // so callers can request the omitted older portion explicitly.
+    const events = filteredEvents.length > TIMELINE_HISTORY_LIMITS.MAX_EVENTS
+      ? filteredEvents.slice(-TIMELINE_HISTORY_LIMITS.MAX_EVENTS)
+      : filteredEvents;
+    const pageTrimmed = filteredEvents.length > events.length;
     const earliestTs = events.length > 0 && typeof events[0].ts === 'number'
       ? events[0].ts as number
       : null;
-    const hasMore = earliestTs !== null && events.length >= limit;
-    const responseHasMore = typeof response.hasMore === 'boolean' ? response.hasMore : hasMore;
+    const hasMore = pageTrimmed || (earliestTs !== null && events.length >= limit);
+    const responseHasMore = pageTrimmed || (typeof response.hasMore === 'boolean' ? response.hasMore : hasMore);
     const nextCursor = structuredTimelineCursor(response);
 
     const totalMs = Date.now() - tStart;

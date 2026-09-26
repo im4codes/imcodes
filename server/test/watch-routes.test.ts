@@ -569,10 +569,23 @@ describe('Watch routes', () => {
   });
 
   it('GET /api/server/:id/timeline/history/full clamps oversized pages to 200 events', async () => {
-    mockRequestTimelineHistory.mockResolvedValue({ epoch: 1, events: [] });
+    mockRequestTimelineHistory.mockResolvedValue({
+      epoch: 1,
+      hasMore: false,
+      events: Array.from({ length: 205 }, (_, index) => ({
+        eventId: `event-${index}`,
+        sessionId: 'deck_proj_brain',
+        ts: index + 1,
+        type: 'assistant.message',
+        payload: { text: `message-${index}` },
+      })),
+    });
     const app = await buildTestApp();
     const res = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain&limit=999');
     expect(res.status).toBe(200);
+    const body = await res.json() as { events: unknown[]; hasMore: boolean };
+    expect(body.events).toHaveLength(200);
+    expect(body.hasMore).toBe(true);
     expect(mockRequestTimelineHistory).toHaveBeenCalledWith(expect.objectContaining({
       sessionName: 'deck_proj_brain',
       limit: 200,
