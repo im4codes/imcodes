@@ -10,6 +10,7 @@ import {
   passwordLogin,
   passwordChange,
   passwordRegister,
+  ApiError,
 } from '../api.js';
 import { isNative } from '../native.js';
 import { validatePasswordComplexity } from '@shared/password-rules.js';
@@ -29,6 +30,14 @@ interface Props {
   initialMode?: LoginMode;
   /** Disable external OAuth when a caller must resume exact in-tab state. */
   showGithub?: boolean;
+  /**
+   * True only once the app's own mount-verification has confirmed a just-
+   * completed login did not keep its session (a 401 after the flag a login
+   * sets right before its own reload). Never true for an ordinary logged-out
+   * visit, and never true before verification settles -- so a session that
+   * DID stick never flashes this message.
+   */
+  sessionNotStuck?: boolean;
 }
 
 type LoginMode = 'buttons' | 'register' | 'password' | 'password_register' | 'change_password';
@@ -79,6 +88,7 @@ export function LoginPage({
   beginAuthAttempt,
   initialMode = 'buttons',
   showGithub = true,
+  sessionNotStuck = false,
 }: Props) {
   const { t } = useTranslation();
   const [mode, setMode] = useState<LoginMode>(initialMode);
@@ -97,8 +107,46 @@ export function LoginPage({
   const [confirmPassword, setConfirmPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Only show this once the app confirms mount verification actually failed
+  // for a login that had just completed (see the `sessionNotStuck` prop doc);
+  // never derived eagerly at mount, or a session that DID stick would flash
+  // it for the instant this component renders ahead of /me resolving.
+  useEffect(() => {
+    if (sessionNotStuck) setError(t('login.session_not_stuck'));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionNotStuck]);
   const [passkeySupported, setPasskeySupported] = useState(false);
   const [rememberPassword, setRememberPassword] = useState(readRememberPreference);
+  const authErrorMessage = (err: unknown): string => {
+    const apiError = err instanceof ApiError ? err : null;
+    const body = apiError?.body ?? '';
+    let code = apiError?.code ?? null;
+    let retryAfterMs: number | null = null;
+    try {
+      const parsed = JSON.parse(body) as { error?: unknown; retryAfterMs?: unknown };
+      if (!code && typeof parsed.error === 'string') code = parsed.error;
+      if (typeof parsed.retryAfterMs === 'number') retryAfterMs = parsed.retryAfterMs;
+    } catch { /* non-JSON error body */ }
+    if (code === 'too_many_attempts') {
+      const minutes = Math.max(1, Math.ceil((retryAfterMs ?? 60_000) / 60_000));
+      return t('login.too_many_attempts', { minutes });
+    }
+    if (code === 'invalid_credentials') return t('login.invalid_credentials');
+    if (code === 'account_pending') return t('login.account_pending');
+    if (code === 'account_disabled') return t('login.account_disabled');
+    // A real ApiError with no ok status (5xx, or 0 for a fetch()-level
+    // failure) is network/server-shaped by construction. A non-ApiError throw
+    // (a JS error unrelated to the request) only counts as network/server-shaped
+    // when it actually says so -- otherwise `apiError` being null would make
+    // every unrelated error default to status 0 and always match here,
+    // permanently hiding the plain "login failed" fallback below.
+    const isNetworkLike = apiError
+      ? (apiError.status >= 500 || apiError.status === 0)
+      : /network|fetch/i.test(String(err));
+    if (isNetworkLike) return t('login.network_error');
+    if (code) return t('login.login_failed_code', { code });
+    return t('login.login_failed');
+  };
   // `loading` only becomes visible after a render. Enter and click events can
   // otherwise admit a second auth flow in the same render, invalidating a
   // native attempt after it has begun writing Secure Storage/Preferences.
@@ -320,20 +368,12 @@ export function LoginPage({
         setMode('change_password');
       } else {
         onLogin?.();
+        try { sessionStorage.setItem('rcc_login_session_not_stuck', '1'); } catch { /* ignore */ }
         window.location.reload();
       }
     } catch (err: unknown) {
       if (!attempt.isCurrent()) return;
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes('account_pending')) {
-        setError(t('login.account_pending'));
-      } else if (msg.includes('account_disabled')) {
-        setError(t('login.account_disabled'));
-      } else if (msg.includes('invalid_credentials')) {
-        setError(t('login.invalid_credentials'));
-      } else {
-        setError(msg);
-      }
+      setError(authErrorMessage(err));
     } finally {
       attempt.finish();
       if (attempt.isCurrent()) setLoading(false);
@@ -375,6 +415,7 @@ export function LoginPage({
         onLoginSuccess?.(res.userId, serverUrl!);
       } else {
         onLogin?.();
+        try { sessionStorage.setItem('rcc_login_session_not_stuck', '1'); } catch { /* ignore */ }
         window.location.reload();
       }
     } catch (err: unknown) {
@@ -390,7 +431,7 @@ export function LoginPage({
         const key = msg.match(/password_missing_\w+/)?.[0];
         setError(key ? t(`login.${key}`) : msg);
       } else {
-        setError(msg);
+        setError(authErrorMessage(err));
       }
     } finally {
       attempt.finish();
@@ -435,7 +476,7 @@ export function LoginPage({
       window.location.reload();
     } catch (err: unknown) {
       if (!attempt.isCurrent()) return;
-      setError(err instanceof Error ? err.message : String(err));
+      setError(authErrorMessage(err));
     } finally {
       attempt.finish();
       if (attempt.isCurrent()) setLoading(false);

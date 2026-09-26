@@ -101,6 +101,20 @@ describe('auth nonce exchange API', () => {
     expect(init.credentials).toBe('include');
   });
 
+  it('keeps the session when refresh is rate-limited', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockResolvedValueOnce(new Response('', { status: 401 }))
+      .mockResolvedValue(new Response(JSON.stringify({ error: 'too_many_attempts', retryAfterMs: 120000 }), {
+        status: 429,
+        headers: { 'Content-Type': 'application/json' },
+      }));
+    const { configure, apiFetch } = await import('../src/api.js');
+    configure('');
+    await expect(apiFetch('/api/protected')).rejects.toMatchObject({ status: 429 });
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/api/auth/user/me'))).toBe(false);
+  });
+
   it('retries transient failures with exponential backoff', async () => {
     vi.useFakeTimers();
     const fetchMock = vi.mocked(fetch);

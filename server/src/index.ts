@@ -884,6 +884,9 @@ async function main() {
   if (bindHost === '0.0.0.0') {
     logger.warn({}, 'Server is listening on 0.0.0.0 — ensure TLS is terminated by a reverse proxy');
   }
+  if (!env.TRUSTED_PROXIES?.trim()) {
+    logger.warn({}, 'TRUSTED_PROXIES is empty; if this server is behind an ingress, set TRUSTED_PROXIES to the ingress CIDR (or configure REAL_IP_HEADER) so client IP handling is not collapsed to the proxy');
+  }
   if (!env.ALLOWED_ORIGINS && env.NODE_ENV !== 'development') {
     logger.error({}, 'ALLOWED_ORIGINS not set — all browser WebSocket connections will be rejected. Set ALLOWED_ORIGINS for production use.');
   } else if (!env.ALLOWED_ORIGINS) {

@@ -506,12 +506,9 @@ authRoutes.post('/refresh', async (c) => {
     return c.json({ error: 'account_disabled' }, 403);
   }
 
-  // Per-IP + per-user lockout check on refresh
-  const refreshIp = c.get('clientIp' as never) as string ?? 'unknown';
-  const refreshIpLockout = await checkAuthLockout(c.env.DB, `ip:${refreshIp}`);
-  if (refreshIpLockout.locked) {
-    return c.json({ error: 'too_many_attempts', retryAfterMs: refreshIpLockout.lockedUntil ? refreshIpLockout.lockedUntil - Date.now() : 0 }, 429);
-  }
+  // A valid refresh token is not a brute-force attempt. In particular, never
+  // consult a shared IP bucket here: one user's password failures must not
+  // invalidate refresh for every other logged-in user.
   const userLockout = await checkAuthLockout(c.env.DB, `user:${row.user_id}`);
   if (userLockout.locked) {
     return c.json({ error: 'too_many_attempts', retryAfterMs: userLockout.lockedUntil ? userLockout.lockedUntil - Date.now() : 0 }, 429);
@@ -762,15 +759,9 @@ authRoutes.post('/password/login', async (c) => {
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
   const normalizedUsername = username.trim().toLowerCase();
 
-  // Triple-dimension lockout checks (OWASP/NIST compliant):
-  // 1. IP — prevents single-source brute force
-  // 2. Username (normalized) — prevents distributed credential stuffing
-  // Both checked BEFORE user lookup to avoid timing side-channels.
-  const ipLockout = await checkAuthLockout(c.env.DB, `ip:${ip}`);
-  if (ipLockout.locked) {
-    return c.json({ error: 'too_many_attempts', retryAfterMs: ipLockout.lockedUntil ? ipLockout.lockedUntil - Date.now() : 0 }, 429);
-  }
-
+  // Account-only lockout checks. IP dimensions are deliberately not used:
+  // a reverse proxy can collapse all users onto one socket address.
+  // Check BEFORE user lookup to avoid timing side-channels.
   const usernameLockout = await checkAuthLockout(c.env.DB, `username:${normalizedUsername}`);
   if (usernameLockout.locked) {
     return c.json({ error: 'too_many_attempts', retryAfterMs: usernameLockout.lockedUntil ? usernameLockout.lockedUntil - Date.now() : 0 }, 429);
@@ -778,13 +769,13 @@ authRoutes.post('/password/login', async (c) => {
 
   const user = await getUserByUsername(c.env.DB, normalizedUsername);
   if (!user || !user.password_hash) {
-    // Unified failure: record against BOTH ip and username even for non-existent users
-    await recordAuthFailure(c.env.DB, `ip:${ip}`);
-    await recordAuthFailure(c.env.DB, `username:${normalizedUsername}`);
+    // Unified failure: record against the attempted username even when it does
+    // not exist. This cannot affect another account.
+    await recordAuthFailure(c.env.DB, `username:${normalizedUsername}`, 'password_login_invalid_credentials');
     return c.json({ error: 'invalid_credentials' }, 401);
   }
 
-  // 3. User ID — prevents abuse of specific known accounts
+  // User ID — prevents abuse of a specific known account.
   const userLockout = await checkAuthLockout(c.env.DB, `user:${user.id}`);
   if (userLockout.locked) {
     return c.json({ error: 'too_many_attempts', retryAfterMs: userLockout.lockedUntil ? userLockout.lockedUntil - Date.now() : 0 }, 429);
@@ -792,9 +783,8 @@ authRoutes.post('/password/login', async (c) => {
 
   const valid = await verifyPassword(password, user.password_hash);
   if (!valid) {
-    await recordAuthFailure(c.env.DB, `ip:${ip}`);
-    await recordAuthFailure(c.env.DB, `username:${normalizedUsername}`);
-    await recordAuthFailure(c.env.DB, `user:${user.id}`);
+    await recordAuthFailure(c.env.DB, `username:${normalizedUsername}`, 'password_login_invalid_credentials');
+    await recordAuthFailure(c.env.DB, `user:${user.id}`, 'password_login_invalid_credentials');
     return c.json({ error: 'invalid_credentials' }, 401);
   }
 

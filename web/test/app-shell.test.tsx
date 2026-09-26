@@ -345,12 +345,15 @@ vi.mock('../src/pages/LoginPage.js', () => ({
     onLoginSuccess,
     beginAuthAttempt,
     onChangeServer,
+    sessionNotStuck,
   }: {
     onLoginSuccess: (userId: string, url: string) => void;
     beginAuthAttempt?: () => { isCurrent: () => boolean; finish: () => void };
     onChangeServer?: () => void | Promise<void>;
+    sessionNotStuck?: boolean;
   }) => (
     <div>
+      {sessionNotStuck && <span>login.session_not_stuck</span>}
       <button
         type="button"
         onClick={async () => {
@@ -1161,6 +1164,9 @@ describe('App shell', () => {
         const { ApiError } = await import('../src/api.js');
         throw new ApiError(401, 'expired');
       }
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
       return {};
     });
 
@@ -1173,6 +1179,91 @@ describe('App shell', () => {
     expect(window.location.hash).toBe(
       '#/srv-shared/deck_beta_brain?shared=share-login-route',
     );
+    // A 401 mount verification with no prior local auth state at all is the
+    // normal state of every ordinary logged-out visitor -- it must NOT be
+    // mistaken for a login that just completed and didn't stick, so no
+    // session-not-stuck message should ever appear here.
+    expect(screen.queryByText('login.session_not_stuck')).toBeNull();
+    expect(sessionStorage.getItem('rcc_login_session_not_stuck')).toBeNull();
+  }, 20_000);
+
+  it('never shows a session-not-stuck message on a first cold-start reload for a visitor who never logged in', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain?shared=share-login-route');
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') {
+        const { ApiError } = await import('../src/api.js');
+        throw new ApiError(401, 'expired');
+      }
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+    expect(await screen.findByText('login-page')).toBeTruthy();
+    expect(screen.queryByText('login.session_not_stuck')).toBeNull();
+  }, 20_000);
+
+  it('never shows a session-not-stuck message on a second consecutive reload for a visitor who never logged in', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain?shared=share-login-route');
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') {
+        const { ApiError } = await import('../src/api.js');
+        throw new ApiError(401, 'expired');
+      }
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+    expect(await screen.findByText('login-page')).toBeTruthy();
+    expect(screen.queryByText('login.session_not_stuck')).toBeNull();
+  }, 20_000);
+
+  it('shows the session-not-stuck message once when a just-completed login does not survive reload', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain?shared=share-login-route');
+    sessionStorage.setItem('rcc_login_session_not_stuck', '1');
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') {
+        const { ApiError } = await import('../src/api.js');
+        throw new ApiError(401, 'expired');
+      }
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    expect(await screen.findByText('login.session_not_stuck')).toBeTruthy();
+    expect(sessionStorage.getItem('rcc_login_session_not_stuck')).toBeNull();
+  }, 20_000);
+
+  it('does not show the session-not-stuck message when a just-completed login does survive reload', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain?shared=share-login-route');
+    sessionStorage.setItem('rcc_login_session_not_stuck', '1');
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') {
+        return { id: 'user-1', username: 'alice' };
+      }
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(screen.queryByText('login-page')).toBeNull());
+    expect(screen.queryByText('login.session_not_stuck')).toBeNull();
   }, 20_000);
 
   it('keeps and restores an explicit shared tab across an expired-auth login boundary', async () => {

@@ -669,6 +669,12 @@ export function App() {
   const [initialAuthVerificationPending, setInitialAuthVerificationPending] = useState(
     () => !isNative(),
   );
+  // Set only once mount verification has actually concluded 401 AND a login
+  // had just set `rcc_login_session_not_stuck` before its own reload -- never
+  // on a bare 401 (that is the normal state of every logged-out visitor), and
+  // never before verification settles (or a session that DID stick would
+  // flash the message for the instant LoginPage mounts ahead of /me).
+  const [sessionNotStuck, setSessionNotStuck] = useState(false);
   const authMutationGenerationRef = useRef(0);
   const activeAuthAttemptSettlementsRef = useRef(new Set<Promise<void>>());
   const authCredentialCleanupCountRef = useRef(0);
@@ -1352,6 +1358,7 @@ export function App() {
     console.warn('[auth] mount: verifying session via /api/auth/user/me');
     void apiFetch<{ id: string }>('/api/auth/user/me').then((user) => {
       console.warn(`[auth] /me OK: userId=${user.id}`);
+      try { sessionStorage.removeItem('rcc_login_session_not_stuck'); } catch { /* ignore */ }
       if (authGeneration !== authMutationGenerationRef.current) return;
       if (auth && auth.userId !== user.id) {
         void clearAuthState(AUTH_IDENTITY_ERRORS.CHANGED, { credentialServerUrl: auth.baseUrl });
@@ -1372,6 +1379,18 @@ export function App() {
       // user could sign in and continue to that tab.
       if (err instanceof ApiError && err.status === 401 && auth) {
         await clearAuthState('mount_verify_401', { credentialServerUrl: auth.baseUrl });
+      } else if (err instanceof ApiError && err.status === 401) {
+        // Only a login that just completed sets this flag, right before its
+        // own reload -- an ordinary logged-out visitor never does. Consuming
+        // it here (rather than leaving it for LoginPage to read at mount)
+        // means the message only ever appears once we know verification
+        // truly failed, not the instant LoginPage renders.
+        try {
+          if (sessionStorage.getItem('rcc_login_session_not_stuck') === '1') {
+            sessionStorage.removeItem('rcc_login_session_not_stuck');
+            setSessionNotStuck(true);
+          }
+        } catch { /* ignore storage restrictions */ }
       }
     }).finally(() => {
       setInitialAuthVerificationPending(false);
@@ -5515,6 +5534,7 @@ export function App() {
       <LoginPage
         serverUrl={nativeServerUrl}
         beginAuthAttempt={beginAuthAttempt}
+        sessionNotStuck={sessionNotStuck}
         onLoginSuccess={(userId, url) => {
           const authState: AuthState = { userId, baseUrl: url };
           authMutationGenerationRef.current += 1;

@@ -220,6 +220,10 @@ function getCsrfToken(): string | null {
 
 // Single-flight lock: at most one refresh in progress at a time (per tab).
 let refreshPromise: Promise<boolean> | null = null;
+// A refresh failure that is not an authentication rejection is transient. Keep
+// it visible to apiFetch so it never turns a healthy session into a logout.
+let _lastRefreshFailure: { status: number; body: string } | null = null;
+let _refreshRetryAt = 0;
 
 // Cross-tab mutex: prevent multiple tabs from refreshing simultaneously.
 // Uses BroadcastChannel to coordinate — only one tab refreshes at a time.
@@ -256,13 +260,32 @@ async function doRefresh(): Promise<boolean> {
   if (res.status >= 500) {
     const body = await res.text().catch(() => '');
     console.warn(`[auth] doRefresh: server error ${res.status}: ${body}`);
+    _lastRefreshFailure = { status: res.status, body };
+    _refreshRetryAt = Date.now() + RETRY_REFRESH_MS;
+    _refreshChannel?.postMessage('refresh-done');
     throw new ApiError(res.status, body);
   }
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     console.warn(`[auth] doRefresh FAILED: ${res.status}: ${body}`);
+    if (res.status !== 401 && res.status !== 403) {
+      _lastRefreshFailure = { status: res.status, body };
+      let retryAfterMs = RETRY_REFRESH_MS;
+      try {
+        const parsed = JSON.parse(body) as { retryAfterMs?: unknown };
+        if (typeof parsed.retryAfterMs === 'number' && Number.isFinite(parsed.retryAfterMs)) {
+          retryAfterMs = Math.max(1000, parsed.retryAfterMs);
+        }
+      } catch { /* body is not JSON */ }
+      _refreshRetryAt = Date.now() + retryAfterMs;
+    } else {
+      _lastRefreshFailure = null;
+      _refreshRetryAt = 0;
+    }
     _refreshChannel?.postMessage('refresh-done');
   } else {
+    _lastRefreshFailure = null;
+    _refreshRetryAt = 0;
     _lastRefreshAt = Date.now();
     console.warn(`[auth] doRefresh OK — token refreshed`);
     _refreshChannel?.postMessage('refresh-done');
@@ -315,10 +338,13 @@ export function startProactiveRefresh(): void {
 /** Schedule a quick retry when proactive refresh fails (not from 401 handler). */
 function scheduleRetry(): void {
   if (_retryTimerId !== null) return; // already scheduled
+  const delay = _refreshRetryAt > Date.now()
+    ? Math.max(1000, _refreshRetryAt - Date.now())
+    : RETRY_REFRESH_MS;
   _retryTimerId = setTimeout(() => {
     _retryTimerId = null;
     void refreshSession(); // single retry, no cascade
-  }, RETRY_REFRESH_MS);
+  }, delay);
 }
 
 /** Stop proactive token refresh timer. Call when user logs out. */
@@ -601,6 +627,11 @@ export async function apiFetch<T = unknown>(
       if (attempt === 0) {
         await new Promise((r) => setTimeout(r, 1000));
       }
+    }
+    // 429 and other non-auth refresh failures are transient. Do not verify
+    // /me and call onAuthExpired: the current session may still be valid.
+    if (_lastRefreshFailure && _lastRefreshFailure.status !== 401 && _lastRefreshFailure.status !== 403) {
+      throw new ApiError(_lastRefreshFailure.status, _lastRefreshFailure.body);
     }
     // Both refresh attempts failed — but verify session is truly expired before logout.
     // Another tab may have refreshed successfully and our cookies are now valid.

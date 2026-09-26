@@ -32,6 +32,14 @@ const {
 }));
 
 const passwordLoginMock = vi.hoisted(() => vi.fn());
+const passwordRegisterMock = vi.hoisted(() => vi.fn());
+const ApiErrorMock = vi.hoisted(() => class ApiErrorMock extends Error {
+  code: string | null;
+  constructor(public status: number, public body: string) {
+    super(`API ${status}`);
+    this.code = (() => { try { return (JSON.parse(body) as { error?: string }).error ?? null; } catch { return null; } })();
+  }
+});
 
 vi.mock('../../src/api.js', () => ({
   configureApiKey: (...args: unknown[]) => configureApiKeyMock(...args),
@@ -42,7 +50,8 @@ vi.mock('../../src/api.js', () => ({
   passkeyRegisterComplete: vi.fn(),
   passwordLogin: (...args: unknown[]) => passwordLoginMock(...args),
   passwordChange: vi.fn(),
-  passwordRegister: vi.fn(),
+  passwordRegister: (...args: unknown[]) => passwordRegisterMock(...args),
+  ApiError: ApiErrorMock,
 }));
 
 vi.mock('../../src/native.js', () => ({
@@ -411,5 +420,98 @@ describe('LoginPage password login: remember-password', () => {
     expect(localStorage.getItem('rcc_login_remember')).toBe('0');
     expect(localStorage.getItem('rcc_login_username')).toBeNull();
     expect(localStorage.getItem('rcc_login_password')).toBeNull();
+  });
+
+  it('shows a localized lockout message with the remaining minutes', async () => {
+    passwordLoginMock.mockRejectedValueOnce(new ApiErrorMock(429, JSON.stringify({ error: 'too_many_attempts', retryAfterMs: 121000 })));
+    openPasswordMode();
+    fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), { target: { value: 'alice' } });
+    fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), { target: { value: 'bad' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
+    await waitFor(() => expect(screen.getByText('login.too_many_attempts')).toBeTruthy());
+  });
+
+  it('shows a localized invalid-credentials message', async () => {
+    passwordLoginMock.mockRejectedValueOnce(new ApiErrorMock(401, JSON.stringify({ error: 'invalid_credentials' })));
+    openPasswordMode();
+    fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), { target: { value: 'alice' } });
+    fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), { target: { value: 'bad' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
+    await waitFor(() => expect(screen.getByText('login.invalid_credentials')).toBeTruthy());
+  });
+
+  it('shows a localized pending-account message', async () => {
+    passwordLoginMock.mockRejectedValueOnce(new ApiErrorMock(403, JSON.stringify({ error: 'account_pending' })));
+    openPasswordMode();
+    fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), { target: { value: 'alice' } });
+    fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), { target: { value: 'pw' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
+    await waitFor(() => expect(screen.getByText('login.account_pending')).toBeTruthy());
+  });
+
+  it('shows a localized disabled-account message', async () => {
+    passwordLoginMock.mockRejectedValueOnce(new ApiErrorMock(403, JSON.stringify({ error: 'account_disabled' })));
+    openPasswordMode();
+    fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), { target: { value: 'alice' } });
+    fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), { target: { value: 'pw' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
+    await waitFor(() => expect(screen.getByText('login.account_disabled')).toBeTruthy());
+  });
+
+  it('shows a localized network/server-error message for a 5xx response', async () => {
+    passwordLoginMock.mockRejectedValueOnce(new ApiErrorMock(500, ''));
+    openPasswordMode();
+    fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), { target: { value: 'alice' } });
+    fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), { target: { value: 'pw' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
+    await waitFor(() => expect(screen.getByText('login.network_error')).toBeTruthy());
+  });
+
+  it('shows a localized network/server-error message for a raw network failure (not an ApiError)', async () => {
+    passwordLoginMock.mockRejectedValueOnce(new TypeError('Failed to fetch: network error'));
+    openPasswordMode();
+    fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), { target: { value: 'alice' } });
+    fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), { target: { value: 'pw' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
+    await waitFor(() => expect(screen.getByText('login.network_error')).toBeTruthy());
+  });
+
+  it('shows a generic "login failed" message plus the raw code for an unrecognized error code', async () => {
+    passwordLoginMock.mockRejectedValueOnce(new ApiErrorMock(400, JSON.stringify({ error: 'some_unrecognized_code' })));
+    openPasswordMode();
+    fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), { target: { value: 'alice' } });
+    fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), { target: { value: 'pw' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
+    await waitFor(() => expect(screen.getByText('login.login_failed_code')).toBeTruthy());
+  });
+
+  it('falls back to a generic "login failed" message with no code at all', async () => {
+    passwordLoginMock.mockRejectedValueOnce(new Error('something unexpected'));
+    openPasswordMode();
+    fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), { target: { value: 'alice' } });
+    fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), { target: { value: 'pw' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.signin' }));
+    await waitFor(() => expect(screen.getByText('login.login_failed')).toBeTruthy());
+  });
+
+  it('shows a localized message on register failure too (same authErrorMessage wiring as login)', async () => {
+    passwordRegisterMock.mockRejectedValueOnce(new ApiErrorMock(403, JSON.stringify({ error: 'account_disabled' })));
+    openPasswordMode();
+    fireEvent.click(screen.getByRole('button', { name: 'login.password_register' }));
+    fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), { target: { value: 'newuser' } });
+    fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), { target: { value: 'Passw0rd1' } });
+    fireEvent.input(screen.getByPlaceholderText('login.confirm_password_placeholder'), { target: { value: 'Passw0rd1' } });
+    fireEvent.click(screen.getByRole('button', { name: 'login.password_register_btn' }));
+    await waitFor(() => expect(screen.getByText('login.account_disabled')).toBeTruthy());
+  });
+
+  it('explains itself instead of bouncing back to login when a prior login did not keep its session', () => {
+    render(<LoginPage serverUrl="https://app.im.codes" onLogin={vi.fn()} sessionNotStuck />);
+    expect(screen.getByText('login.session_not_stuck')).toBeTruthy();
+  });
+
+  it('never shows the session-not-stuck message on an ordinary mount', () => {
+    render(<LoginPage serverUrl="https://app.im.codes" onLogin={vi.fn()} />);
+    expect(screen.queryByText('login.session_not_stuck')).toBeNull();
   });
 });
