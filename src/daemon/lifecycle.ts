@@ -1504,7 +1504,7 @@ export async function startup(): Promise<DaemonContext> {
     // payload even when no pair row was saved. Resolve by participant so main
     // sessions and sub-sessions follow the same refresh path.
     timelineEmitter.on((event) => {
-      if (event.type !== 'session.state' && event.type !== 'assistant.text'
+      if (event.type !== 'session.state' && event.type !== 'assistant.thinking' && event.type !== 'assistant.text'
         && event.type !== 'tool.call' && event.type !== 'tool.result') return;
       for (const pair of getTaskPairStore().pairsForSession(event.sessionId)) {
         schedulePairRefresh(pair.project, 'session_activity_changed');

@@ -136,6 +136,28 @@ describe('owner rule: a named model is never confined to the pool, only an autom
       brain: BRAIN, role: 'auditor', pool: 'primary', requestedModel: 'nonexistent-fictional-model',
     }, deps)).toBeUndefined();
   });
+
+  it('does not auto-pick an idle session while shared live-work reports background work', () => {
+    const parent = session(BRAIN, 'brain', {
+      transportConfig: { supervision: normalizeSessionSupervisionSnapshot({ mode: SUPERVISION_MODE.OFF, executionPools: poolWithUnrelatedModel }) },
+    } as Partial<SessionRecord>);
+    const backgroundSession = session('deck_sub_background', 'w1', {
+      parentSession: BRAIN,
+      agentType: 'codex-sdk',
+      activeModel: 'gpt-6-luna',
+      updatedAt: 1,
+    });
+    const records = [parent, backgroundSession];
+    const picked = listTaskPairCandidates({
+      brain: BRAIN, role: 'executor', pool: 'primary', exclude: new Set(),
+    }, {
+      listSessions: () => records,
+      getSession: (name: string) => records.find((entry) => entry.name === name),
+      hasPendingMessages: () => false,
+      isWorking: (name: string) => name === backgroundSession.name,
+    });
+    expect(picked).toEqual([]);
+  });
 });
 
 describe('owner rule: scheduler wires an explicit executormodel=/auditormodel= through to the pick, ignoring the allowlist', () => {

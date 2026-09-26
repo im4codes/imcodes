@@ -539,7 +539,10 @@ export class TaskPairAutomation implements TaskPairScheduler {
     if (now - idleSince < this.#bothIdleNudgeMs) return false;
     // The fast trigger fires once per uninterrupted idle spell. A later
     // ordinary heartbeat remains responsible for its normal silence cadence.
-    if (liveness.bothIdleNudgedAt !== undefined && liveness.bothIdleNudgedAt >= idleSince) return false;
+    // Equality is a valid re-arm boundary: activity can share the same
+    // millisecond as the nudge. Activity normally clears this marker, while
+    // the strict comparison is an additional safe guard for older records.
+    if (liveness.bothIdleNudgedAt !== undefined && liveness.bothIdleNudgedAt > idleSince) return false;
     return this.#nudgeBothIdleTarget(stored.project, pair, liveness, now);
   }
 

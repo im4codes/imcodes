@@ -49,6 +49,8 @@ export interface TaskPairPoolDeps {
   getSession?: (name: string) => SessionRecord | undefined;
   now?: () => number;
   hasPendingMessages?: (sessionName: string) => boolean;
+  /** Test seam for the shared live-work predicate used by automatic picks. */
+  isWorking?: (sessionName: string) => boolean;
 }
 
 function defaultHasPendingMessages(sessionName: string): boolean {
@@ -137,6 +139,7 @@ export function listTaskPairCandidates(input: {
   const definition = pools ? poolDefinition(parent, input.role === 'auditor' ? 'primary' : input.pool) : undefined;
   const availability = resolveDelegationTargets(delegationTargetInputs(sessions), (deps.now ?? Date.now)());
   const hasPending = deps.hasPendingMessages ?? defaultHasPendingMessages;
+  const isWorking = deps.isWorking ?? (deps.listSessions || deps.getSession ? (() => false) : isSessionWorking);
   const store = getTaskPairStore();
   const poolConfigOf = (session: SessionRecord): SupervisionExecutionConfig | undefined => (
     definition?.configs.find((config: SupervisionExecutionConfig) => configMatchesSession(config, session))
@@ -164,6 +167,7 @@ export function listTaskPairCandidates(input: {
       && (!!input.requestedModel || !pools || !!poolConfigOf(session))
       && eligibleForRole(session)
       && session.state === 'idle'
+      && !isWorking(session.name)
       && availability.get(session.name)?.availability === DELEGATION_AVAILABILITY.READY
       && !hasPending(session.name)
       && !store.isParticipantOfOpenPair(session.name)
