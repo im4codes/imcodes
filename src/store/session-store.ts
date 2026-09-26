@@ -12,6 +12,7 @@ import {
 } from '../../shared/delegation-availability.js';
 import type { ProviderQuotaMeta } from '../../shared/provider-quota.js';
 import type { SessionContextBootstrapState } from '../../shared/session-context-bootstrap.js';
+import type { CrossVendorHandoffSessionState } from '../../shared/cross-vendor-handoff.js';
 import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import { EXECUTION_CLONE_KIND, type ExecutionCloneMetadata } from '../../shared/execution-clone.js';
@@ -196,6 +197,8 @@ export interface SessionRecord extends SessionContextBootstrapState {
    *  synchronization from repeating after daemon restart. Cleared only for a
    *  genuinely fresh conversation (`/clear` / fresh restart). */
   summarySyncFingerprints?: string[];
+  /** Cross-vendor continuity ledger and at-most-once pending handoff pack. */
+  crossVendorHandoff?: CrossVendorHandoffSessionState;
   /** Execution-clone metadata. Present ONLY for ephemeral execution-clone
    *  sub-sessions (`kind: 'execution_clone'`). First-class field — NEVER stored
    *  inside `transportConfig` (the transport-identity scrubber would strip

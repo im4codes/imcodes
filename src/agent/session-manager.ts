@@ -43,6 +43,7 @@ import {
 } from '../store/session-store.js';
 import { markSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
 import logger from '../util/logger.js';
+import { incrementCounter } from '../util/metrics.js';
 import { mapWithConcurrency } from '../util/concurrency.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
 import { timelineStore } from '../daemon/timeline-store.js';
@@ -67,7 +68,7 @@ import { peekClaudeUsageQuotaCached } from './claude-usage-quota.js';
 import { getCodexRuntimeConfig } from './codex-runtime-config.js';
 import { mergeCodexDisplayMetadata } from './codex-display.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
-import { isClaudeCodeFamily, isCodexFamily } from '../../shared/agent-types.js';
+import { getSessionRuntimeType, isClaudeCodeFamily, isCodexFamily } from '../../shared/agent-types.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
 import { DEFAULT_CODEX_SESSION_MODEL } from '../shared/models/options.js';
 import { resolveTransportContextBootstrap } from './runtime-context-bootstrap.js';
@@ -107,6 +108,8 @@ import { getAuthenticatedCapabilityOwner } from '../capability/capability-author
 import { registerMasterCompaction } from '../daemon/master-compaction-registry.js';
 import type { DaemonTransportQueuesSnapshot } from '../util/daemon-status.js';
 import { extractSessionSupervisionSnapshot } from '../../shared/supervision-config.js';
+import { normalizeCrossVendorHandoffConfig, type CrossVendorHandoffCutoff } from '../../shared/cross-vendor-handoff.js';
+import { buildCrossVendorHandoffPack, shouldCreateCrossVendorHandoff } from '../daemon/cross-vendor-handoff.js';
 
 function isStoredTransportSession(record: Pick<SessionRecord, 'runtimeType' | 'agentType'>): boolean {
   return record.runtimeType === RUNTIME_TYPES.TRANSPORT
@@ -1152,6 +1155,47 @@ export async function relaunchSessionWithSettings(
   const targetTransportConfig = overrides.transportConfig !== undefined ? overrides.transportConfig : (record.transportConfig ?? null);
   const targetCcPreset = overrides.ccPreset !== undefined ? overrides.ccPreset : (record.ccPreset ?? null);
   const compatibleIds = targetFresh ? {} : getCompatibleSessionIds(record, targetAgentType);
+  const targetRuntimeType = getSessionRuntimeType(targetAgentType);
+  const handoffConfig = normalizeCrossVendorHandoffConfig(record.crossVendorHandoff?.config);
+  let handoffPromise: Promise<import('../../shared/cross-vendor-handoff.js').CrossVendorHandoffPack | undefined> | undefined;
+  let handoffCutoff: CrossVendorHandoffCutoff | undefined;
+  if (shouldCreateCrossVendorHandoff(record, targetAgentType, targetRuntimeType, targetFresh) && handoffConfig.enabled) {
+    try {
+      const events = await timelineStore.readPreferred(record.name, { limit: 1 });
+      const last = events.at(-1);
+      handoffCutoff = last
+        ? { epoch: last.epoch, seq: last.seq, ts: last.ts }
+        : { epoch: timelineEmitter.epoch, seq: 0, ts: Date.now() };
+    } catch {
+      handoffCutoff = { epoch: timelineEmitter.epoch, seq: 0, ts: Date.now() };
+    }
+    const cutoff = handoffCutoff ?? { epoch: timelineEmitter.epoch, seq: 0, ts: Date.now() };
+    const providerKey = targetAgentType;
+    const priorCutoff = record.crossVendorHandoff?.cutoffs?.[providerKey];
+    const persistedState = {
+      ...(record.crossVendorHandoff ?? {}),
+      config: handoffConfig,
+      cutoffs: { ...(record.crossVendorHandoff?.cutoffs ?? {}), [record.agentType]: cutoff },
+    };
+    upsertSession({ ...record, crossVendorHandoff: persistedState, updatedAt: Date.now() });
+    const build = buildCrossVendorHandoffPack(record, cutoff, targetAgentType, targetRuntimeType, {
+      ...handoffConfig,
+      // A previous cutoff means this is a switch-back; the pack builder still
+      // uses the authoritative timeline and the target runtime receives it once.
+      ...(priorCutoff ? { recentTurns: handoffConfig.recentTurns } : {}),
+    }, priorCutoff);
+    handoffPromise = Promise.race([
+      build,
+      new Promise<undefined>((resolve) => setTimeout(() => {
+        incrementCounter('handoff.build_timeout', {});
+        resolve(undefined);
+      }, handoffConfig.timeoutMs)),
+    ]).catch((err) => {
+      incrementCounter('handoff.build_failed', {});
+      logger.debug({ err, session: record.name }, 'cross-vendor handoff build failed');
+      return undefined;
+    });
+  }
   const preserveTransportBinding = record.runtimeType === RUNTIME_TYPES.TRANSPORT
     && record.agentType === targetAgentType
     // Qwen uses providerSessionId as its real resume key, so explicit restart must
@@ -1194,6 +1238,42 @@ export async function relaunchSessionWithSettings(
     ...(record.userCreated ? { userCreated: true } : {}),
     ...(targetFresh ? { fresh: true } : {}),
   });
+  if (handoffPromise) {
+    if (targetRuntimeType === RUNTIME_TYPES.TRANSPORT) {
+      transportRuntimes.get(record.name)?.setPendingHandoffReady(handoffPromise);
+    }
+    void handoffPromise.then(async (pack) => {
+      if (!pack) return;
+      if (targetRuntimeType === RUNTIME_TYPES.TRANSPORT) {
+        transportRuntimes.get(record.name)?.setPendingHandoff(pack);
+      } else {
+        try {
+          const { prepareProcessSessionPrivateWriter, runWithProcessSessionSendLock } = await import('../daemon/command-handler.js');
+          await runWithProcessSessionSendLock(record.name, async () => {
+            const writePrivate = await prepareProcessSessionPrivateWriter(record.name);
+            writePrivate(pack.text);
+          });
+          const current = getSession(record.name);
+          if (current) {
+            const state = current.crossVendorHandoff ?? {};
+            upsertSession({ ...current, crossVendorHandoff: { ...state, pending: undefined, cutoffs: { ...(state.cutoffs ?? {}), [targetAgentType]: pack.cutoff } }, updatedAt: Date.now() });
+          }
+          incrementCounter('handoff.injected', { runtime: targetRuntimeType });
+          return;
+        } catch (err) {
+          logger.debug({ err, session: record.name }, 'cross-vendor process handoff injection failed');
+          incrementCounter('handoff.injection_failed', { runtime: targetRuntimeType });
+          return;
+        }
+      }
+      const current = getSession(record.name);
+      if (current) {
+        const state = current.crossVendorHandoff ?? {};
+        upsertSession({ ...current, crossVendorHandoff: { ...state, pending: undefined, cutoffs: { ...(state.cutoffs ?? {}), [targetAgentType]: pack.cutoff } }, updatedAt: Date.now() });
+      }
+      incrementCounter('handoff.injected', { runtime: targetRuntimeType });
+    });
+  }
 }
 
 /** In-memory map of active transport session runtimes */
@@ -3498,6 +3578,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
         ...(preservedSummarySyncFingerprints && preservedSummarySyncFingerprints.length > 0
           ? { summarySyncFingerprints: preservedSummarySyncFingerprints }
           : {}),
+        ...(existing?.crossVendorHandoff ? { crossVendorHandoff: existing.crossVendorHandoff } : {}),
       });
       const launchGapEntries = getResendEntries(name);
       if (launchGapEntries.length > 0 && launchGapEntries.every((entry) => !entry.recipient)) {
@@ -3810,6 +3891,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       ...(opts.identityPrompt ? { identityPrompt: opts.identityPrompt } : {}),
       ...(opts.parentSession ? { parentSession: opts.parentSession } : {}),
       ...(opts.userCreated ? { userCreated: true } : {}),
+      ...(existing?.crossVendorHandoff ? { crossVendorHandoff: existing.crossVendorHandoff } : {}),
       ...(summarySyncFingerprints.length > 0 ? { summarySyncFingerprints } : {}),
       ...(familyDisplay ?? {}),
       ...(launchedNativeAgentFence ? { nativeAgentLaunchFence: launchedNativeAgentFence } : {}),

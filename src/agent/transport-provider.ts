@@ -32,6 +32,7 @@ import type {
   ProviderSupportClass,
   SharedScopePolicyOverride,
 } from '../../shared/context-types.js';
+import type { CrossVendorHandoffPack } from '../../shared/cross-vendor-handoff.js';
 import {
   SDK_TURN_LOST_RECOVERY_REASON as SHARED_SDK_TURN_LOST_RECOVERY_REASON,
   isSdkTurnLostRecoveryPhase as isSharedSdkTurnLostRecoveryPhase,
@@ -375,6 +376,8 @@ export interface SessionConfig {
    *  already received startup memory in a prior run). The runtime still emits
    *  the timeline status card so the UI knows it was deliberately skipped. */
   startupMemoryAlreadyInjected?: boolean;
+  /** One-shot cross-vendor context, delivered as message-side preamble. */
+  pendingHandoff?: CrossVendorHandoffPack;
 }
 
 /** Structured error emitted by a provider. */

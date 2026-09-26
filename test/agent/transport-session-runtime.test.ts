@@ -480,3 +480,54 @@ describe('TransportSessionRuntime memory provenance', () => {
     await runtime.kill();
   });
 });
+
+describe('TransportSessionRuntime cross-vendor handoff one-shot guard', () => {
+  it('injects on the first ordinary turn and consumes only after provider acceptance', async () => {
+    const provider = makeProvider();
+    const send = provider.send as ReturnType<typeof vi.fn>;
+    let complete: ((sessionId: string, message: AgentMessage) => void) | undefined;
+    provider.onComplete = (callback) => { complete = callback; return () => undefined; };
+    const runtime = new TransportSessionRuntime(provider, 'handoff-one-shot');
+    await runtime.initialize({
+      sessionKey: 'handoff-one-shot',
+      pendingHandoff: {
+        text: 'IM.codes cross-vendor handoff\nNon-authoritative prior context',
+        sourceAgentType: 'claude-code-sdk', sourceRuntimeType: 'transport',
+        sourceConversationKey: 'cc-native', cutoff: { epoch: 1, seq: 2, ts: 3 },
+        createdAt: Date.now(), tokenCount: 8,
+      },
+    });
+    runtime.send('first', 'first-id');
+    await waitForProviderSend(provider);
+    expect(send.mock.calls[0]?.[1]).toEqual(expect.objectContaining({ messagePreamble: expect.stringContaining('Non-authoritative prior context') }));
+    complete?.('provider-session-1', { id: 'done-1', sessionId: 'provider-session-1', kind: 'text', role: 'assistant', content: 'ok', timestamp: Date.now(), status: 'complete' });
+    await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'));
+    send.mockClear();
+    runtime.send('second', 'second-id');
+    await waitForProviderSend(provider);
+    expect(send.mock.calls[0]?.[1]?.messagePreamble ?? '').not.toContain('Non-authoritative prior context');
+    await runtime.kill();
+  });
+
+  it('retains the handoff when the provider rejects the first send', async () => {
+    const provider = makeProvider();
+    const send = provider.send as ReturnType<typeof vi.fn>;
+    send.mockRejectedValueOnce(new Error('provider busy')).mockResolvedValue(undefined);
+    const runtime = new TransportSessionRuntime(provider, 'handoff-retry');
+    await runtime.initialize({
+      sessionKey: 'handoff-retry',
+      pendingHandoff: {
+        text: 'Non-authoritative prior context', sourceAgentType: 'claude-code-sdk', sourceRuntimeType: 'transport',
+        cutoff: { epoch: 1, seq: 2, ts: 3 }, createdAt: Date.now(), tokenCount: 4,
+      },
+    });
+    runtime.send('first', 'retry-first');
+    await vi.waitFor(() => expect(send).toHaveBeenCalled());
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    send.mockClear();
+    runtime.send('retry', 'retry-second');
+    await waitForProviderSend(provider);
+    expect(send.mock.calls[0]?.[1]).toEqual(expect.objectContaining({ messagePreamble: expect.stringContaining('Non-authoritative prior context') }));
+    await runtime.kill();
+  });
+});

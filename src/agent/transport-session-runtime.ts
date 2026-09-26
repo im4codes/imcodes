@@ -96,6 +96,7 @@ import { buildRelatedPastWorkText, buildStartupProjectMemoryText } from '../../s
 import { isMemoryInjectionEnabled } from '../context/memory-injection-toggle.js';
 import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
 import { getContextModelConfig } from '../context/context-model-config.js';
+import { CROSS_VENDOR_HANDOFF_DEFAULTS, type CrossVendorHandoffPack } from '../../shared/cross-vendor-handoff.js';
 import { PREFERENCE_CONTEXT_END, PREFERENCE_CONTEXT_START } from '../../shared/preference-ingest.js';
 import {
   SUPERVISION_CONTRACT_PREAMBLE_END,
@@ -631,6 +632,8 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _startupMemory: TransportMemoryRecallArtifact | null = null;
   private _startupMemoryTimelineEmitted = false;
   private _startupMemoryInjected = false;
+  private _pendingHandoff: CrossVendorHandoffPack | null = null;
+  private _pendingHandoffReady: Promise<CrossVendorHandoffPack | undefined> | undefined;
   /** Last provider-visible preference context block injected into this provider conversation.
    *  Preferences are stable session context, not per-turn recall; repeat injection
    *  bloats SDK prompt windows and can trigger provider auto-compaction. */
@@ -2284,6 +2287,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   async initialize(config: SessionConfig): Promise<void> {
+    this._pendingHandoff = config.pendingHandoff ?? null;
     // When resuming/restoring an existing conversation, mark startup memory
     // injected BEFORE applyContextBootstrap runs so the bootstrap's
     // `if (!this._startupMemoryInjected) this._startupMemory = …` guard
@@ -2350,6 +2354,16 @@ export class TransportSessionRuntime implements SessionRuntime {
     // `transport_runtime_not_initialized` resend path) are delivered instead of
     // sitting in resend until the next restart.
     this._notifyProviderSessionReady();
+  }
+
+  /** Install a bounded one-shot handoff; it is rendered message-side only. */
+  setPendingHandoff(pack: CrossVendorHandoffPack | undefined): void {
+    this._pendingHandoff = pack ?? null;
+    this._pendingHandoffReady = undefined;
+  }
+
+  setPendingHandoffReady(ready: Promise<CrossVendorHandoffPack | undefined>): void {
+    this._pendingHandoffReady = ready;
   }
 
   /**
@@ -3875,6 +3889,14 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
 
     void (async () => {
+      if (!isTransportSlashControl(message) && !this._pendingHandoff && this._pendingHandoffReady) {
+        const ready = this._pendingHandoffReady;
+        this._pendingHandoffReady = undefined;
+        await Promise.race([
+          ready.then((pack) => { if (pack) this._pendingHandoff = pack; }),
+          new Promise<void>((resolve) => setTimeout(resolve, CROSS_VENDOR_HANDOFF_DEFAULTS.providerWaitMs)),
+        ]).catch(() => undefined);
+      }
       await this.refreshContextBootstrap({ phase: 'dispatch' });
       if (this.isDispatchLocallyCancelled(dispatchId)) {
         this.cancelActiveDispatchLocally(dispatchId);
@@ -3930,7 +3952,12 @@ export class TransportSessionRuntime implements SessionRuntime {
           );
       summarySyncReservation = memoryRecallResult.summaryReservation;
       const memoryRecall = memoryRecallResult.artifact;
-      const messagePreamble = isSlashControl ? undefined : this.mergeMessagePreambles(dispatchedEntries, message);
+      const handoffPreamble = !isSlashControl && this._pendingHandoff
+        ? `[${this._pendingHandoff.sourceAgentType} handoff — ${this._pendingHandoff.cutoff.ts}]\n${this._pendingHandoff.text}`
+        : undefined;
+      const messagePreamble = isSlashControl
+        ? undefined
+        : this.mergeMessagePreambles(dispatchedEntries, message, handoffPreamble);
       const registeredSystemContractText = this._activeDispatchEntries
         .map((entry) => entry.registeredSystemContract)
         .filter((contract): contract is NonNullable<typeof contract> => !!contract)
@@ -4033,6 +4060,9 @@ export class TransportSessionRuntime implements SessionRuntime {
         this.scheduleActiveAppendFlush(dispatchId);
       }
       this._recoverableDispatchRetries = 0;
+      // Handoff is consumed only after provider.send accepted this turn. A
+      // provider rejection/cancel therefore leaves it available for retry.
+      if (handoffPreamble && this._pendingHandoff) this._pendingHandoff = null;
       // This variant's contract body (or its reference, when it was already
       // registered) reached the provider on this turn, so later turns on the
       // same thread re-assert it by reference -- until the mode changes.
@@ -4639,8 +4669,8 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
   }
 
-  private mergeMessagePreambles(entries: PendingTransportMessage[] | undefined, userMessage?: string): string | undefined {
-    if (!entries || entries.length === 0) return undefined;
+  private mergeMessagePreambles(entries: PendingTransportMessage[] | undefined, userMessage?: string, extraPreamble?: string): string | undefined {
+    if (!entries || entries.length === 0) return extraPreamble?.trim() || undefined;
     const seen = new Set<string>();
     const parts: string[] = [];
     let lastSupervisionContractBlock: string | undefined;
@@ -4674,6 +4704,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       ? this.filterOneShotSupervisionContractBlock(lastSupervisionContractBlock, isControlMessage)
       : undefined;
     if (supervisionContract && !seen.has(supervisionContract)) parts.push(supervisionContract);
+    if (extraPreamble?.trim() && !seen.has(extraPreamble.trim())) parts.push(extraPreamble.trim());
     return parts.join('\n\n') || undefined;
   }
 
