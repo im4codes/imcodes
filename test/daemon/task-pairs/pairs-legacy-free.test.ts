@@ -126,8 +126,8 @@ describe('pairs run without legacy supervision artifacts', () => {
     setTaskPairWorkspaceDepsForTests({ projectRootOf: () => undefined });
   });
 
-  afterEach(() => {
-    taskPairService.dispose();
+  afterEach(async () => {
+    await taskPairService.dispose();
     taskPairService.setScheduler(undefined);
     setTaskPairDeliveryDepsForTests(undefined);
     setTaskPairMaterialDepsForTests(undefined);

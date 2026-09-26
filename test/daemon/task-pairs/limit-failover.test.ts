@@ -118,8 +118,8 @@ describe('scheduler: limit-triggered failover, needs_auditor invariant, and real
     taskPairService.init();
   });
 
-  afterEach(() => {
-    taskPairService.dispose();
+  afterEach(async () => {
+    await taskPairService.dispose();
     taskPairService.setScheduler(undefined);
     setTaskPairDeliveryDepsForTests(undefined);
     setTaskPairStoreForTests(undefined);

@@ -74,6 +74,11 @@ function sentTo(target: string, reasonPart?: string) {
 }
 async function flush() {
   for (let i = 0; i < 5; i += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+  // A marker's fire-and-forget background work (briefing participants, running
+  // intents, ending a workspace) can still be mid-flight after 5 ticks under
+  // real I/O latency; waiting it out here, not a fixed tick count, is what
+  // makes `sent` a reliable snapshot for the assertions that follow.
+  await taskPairService.waitForIdle();
 }
 async function tick(times = 1) {
   for (let i = 0; i < times; i += 1) {
@@ -137,8 +142,8 @@ describe('pairs that stopped driving themselves (215 / jdzj)', () => {
     taskPairService.init();
   });
 
-  afterEach(() => {
-    taskPairService.dispose();
+  afterEach(async () => {
+    await taskPairService.dispose();
     taskPairService.setScheduler(undefined);
     setTaskPairDeliveryDepsForTests(undefined);
     setTaskPairStoreForTests(undefined);
