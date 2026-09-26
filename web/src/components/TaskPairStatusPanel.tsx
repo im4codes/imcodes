@@ -112,13 +112,20 @@ export function TaskPairStatusPanel({ events, sessions, ws, brain, serverId }: {
     setBriefLoadErrors((current) => { const next = new Set(current); next.delete(taskId); return next; });
     try {
       // The task-pair event may be separated from the snapshot timestamp by
-      // other timeline traffic. Fetch the bounded recent page and select by
+      // other timeline traffic. Page backward through history and select by
       // task id instead of guessing a two-millisecond timestamp window.
-      const history = await fetchTimelineHistoryHttp(serverId, brain, { limit: 500 });
-      const matching = history?.events.find((event) => {
-        const candidate = event as { type?: string; payload?: { taskId?: string; brief?: string } };
-        return candidate.type === TASK_PAIR_TIMELINE_EVENT && candidate.payload?.taskId === taskId && typeof candidate.payload.brief === 'string';
-      }) as { payload?: { brief?: string } } | undefined;
+      let beforeTs: number | undefined;
+      let matching: { payload?: { brief?: string } } | undefined;
+      for (let page = 0; page < 100 && !matching; page += 1) {
+        const history = await fetchTimelineHistoryHttp(serverId, brain, { limit: 500, ...(beforeTs !== undefined ? { beforeTs } : {}) });
+        const pageMatch = history?.events.find((event) => {
+          const candidate = event as { type?: string; payload?: { taskId?: string; brief?: string } };
+          return candidate.type === TASK_PAIR_TIMELINE_EVENT && candidate.payload?.taskId === taskId && typeof candidate.payload.brief === 'string';
+        }) as { payload?: { brief?: string } } | undefined;
+        if (pageMatch) { matching = pageMatch; break; }
+        if (!history?.hasMore || typeof history.legacyBeforeTs !== 'number' || history.legacyBeforeTs >= (beforeTs ?? Infinity)) break;
+        beforeTs = history.legacyBeforeTs;
+      }
       if (typeof matching?.payload?.brief !== 'string') throw new Error('brief_missing');
       setLoadedBriefs((current) => ({ ...current, [taskId]: matching.payload!.brief! }));
       toggleBrief(taskId);
