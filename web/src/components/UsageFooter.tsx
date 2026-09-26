@@ -226,7 +226,14 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
         : t('session.state_stop_requested');
     }
     if (liveStatusMode === 'result') return statusText || t('session.state_idle');
-    if (liveStatusMode === 'waiting') return statusText || t('session.state_idle');
+    if (liveStatusMode === 'waiting') {
+      const match = liveStatus.activityDetail?.match(/^capacity_retry:(\d+):(\d+)$/);
+      if (match) {
+        const seconds = Math.max(0, Math.ceil((Number(match[1]) - (now ?? Date.now())) / 1000));
+        return t('session.capacity_retrying', { seconds, attempt: Number(match[2]), defaultValue: 'Retrying in {{seconds}}s (attempt {{attempt}})' });
+      }
+      return statusText || t('session.state_idle');
+    }
     if (liveStatus.sweep) {
       if (activeToolCall) return statusText || t('session.state_running');
       if (activeThinkingTs) return t('chat.thinking_running', { sec: Math.max(0, Math.round(((now ?? Date.now()) - activeThinkingTs) / 1000)) });
@@ -238,7 +245,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
       return t('session.state_running');
     }
     return t('session.state_idle');
-  }, [activeThinkingTs, activeToolCall, isAgentless, liveStatus.errorDetail, liveStatus.sweep, liveStatusMode, now, statusText, t]);
+  }, [activeThinkingTs, activeToolCall, isAgentless, liveStatus.activityDetail, liveStatus.errorDetail, liveStatus.sweep, liveStatusMode, now, statusText, t]);
   const showInlineStatusText = liveStatusMode === 'running' || liveStatusMode === 'thinking' || liveStatusMode === 'tool' || liveStatusMode === 'waiting' || liveStatusMode === 'stopping' || liveStatusMode === 'cancelled' || liveStatusMode === 'result' || liveStatusMode === 'error';
   // The weekly (7d) line is opt-in: it needs the daemon to read the local
   // Claude token. The 5h line needs no authorization (it comes from the SDK

@@ -22,3 +22,24 @@ export const PROVIDER_ERROR_CODES = {
 } as const;
 
 export type ProviderErrorCode = typeof PROVIDER_ERROR_CODES[keyof typeof PROVIDER_ERROR_CODES];
+
+/** Free-text provider overload/capacity wording.  Rate-limit-shaped wording
+ * is included for legacy providers that do not emit structured evidence; a
+ * structured RATE_LIMITED code must still take the failover path. */
+const TRANSIENT_PROVIDER_ERROR_RE = /\bat capacity\b|\bcapacity\b.*\b(?:model|reached|exceeded)\b|rate[ _-]?limit|too many requests|\b429\b|\b529\b|\b503\b|overloaded|temporarily unavailable|usage limit|quota (?:exceeded|exhausted)/i;
+
+export function isTransientProviderError(message: string | undefined): boolean {
+  return !!message && TRANSIENT_PROVIDER_ERROR_RE.test(message);
+}
+
+/** Capacity/overload retry signal, excluding structured account limits. */
+export function isTransientProviderCapacityError(error: { code?: string; message?: string; details?: unknown } | undefined): boolean {
+  if (!error || error.code === PROVIDER_ERROR_CODES.RATE_LIMITED) return false;
+  const code = error.code?.toLowerCase() ?? '';
+  const detailsCode = error.details && typeof error.details === 'object' && !Array.isArray(error.details)
+    ? String((error.details as Record<string, unknown>).code ?? '').toLowerCase()
+    : '';
+  if (/rate[ _-]?limit|quota/.test(code) || /rate[ _-]?limit|quota/.test(detailsCode)) return false;
+  return /capacity|overload|service.?unavailable|temporar/.test(code)
+    || isTransientProviderError(error.message);
+}

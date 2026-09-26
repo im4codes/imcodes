@@ -8,6 +8,7 @@ import type { AgentStatus } from './detect.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import type { TransportProvider, ProviderActiveTurnDeliveryKind, ProviderDelegationNotification, ProviderError, ProviderRolloutCompletionReconcileOptions, SessionConfig, SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate, ToolCallEvent, SdkTurnLostRecoveryPhase, SdkTurnLostReplayDecision } from './transport-provider.js';
 import { BACKGROUND_SUBAGENT_WAKE_MODES, PROVIDER_ACTIVE_TURN_DELIVERY_KINDS, PROVIDER_CANCEL_ORIGINS, PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_PHASES, SDK_TURN_LOST_RECOVERY_STATUS } from './transport-provider.js';
+import { isTransientProviderCapacityError } from '../../shared/provider-error-codes.js';
 import type { ApprovalRequest } from './transport-provider.js';
 import {
   NATIVE_AGENT_ADMISSION_MODES,
@@ -337,6 +338,7 @@ export interface TransportRuntimeDiagnosticSnapshot {
   backgroundWorkCount: number;
   activeToolCount: number;
   busyReasons: SessionActivityBusyReason[];
+  capacityRetry?: { attempt: number; retryAt: number; error: string };
 }
 
 const DEFAULT_TRANSPORT_CONTEXT_BUDGET_MS = 2_500;
@@ -364,6 +366,11 @@ const MAX_RECOVERABLE_DISPATCH_RETRIES = 15;
 // full generic retry budget (≈2 minutes): preserve the turn and let
 // session-manager relaunch the provider after a few confirmations.
 const MAX_RECOVERABLE_BUSY_DISPATCH_RETRIES = 3;
+// Provider capacity is distinct from account rate limits: keep the same
+// session/turn and use a human-scale bounded backoff.  The elapsed cap avoids
+// silently holding a failed turn forever while still covering short outages.
+export const CAPACITY_RETRY_BACKOFF_MS = [30_000, 60_000, 120_000, 240_000, 480_000] as const;
+export const CAPACITY_RETRY_MAX_TOTAL_MS = 60 * 60_000;
 // A final-edge supervision authority check can fail transiently while the
 // session registry/runtime projection catches up. Retry with a small capped
 // backoff, but never spin forever and never make the control row a FIFO lock.
@@ -713,6 +720,12 @@ export class TransportSessionRuntime implements SessionRuntime {
   // must remain a separate turn or they would change provider-level delivery
   // identity and could replay already-accepted side effects.
   private _recoverableRetryEntryIds: string[] = [];
+  private _capacityRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private _capacityRetryEntryIds: string[] = [];
+  private _capacityRetryAttempt = 0;
+  private _capacityRetryStartedAt = 0;
+  private _capacityRetryAt = 0;
+  private _capacityRetryError = '';
   private _pendingAuthorityRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly _pendingAuthorityRetryAttempts = new Map<string, number>();
   private _nextDispatchId = 0;
@@ -794,6 +807,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         // A completed turn means the provider is responsive and queued work is
         // about to drain — clear any recoverable-retry streak.
         this._recoverableDispatchRetries = 0;
+        this.cancelCapacityRetry(false);
         if (this._externalCompletionSettlementsToIgnore > 0) {
           this._externalCompletionSettlementsToIgnore--;
           logger.warn(
@@ -978,6 +992,25 @@ export class TransportSessionRuntime implements SessionRuntime {
           },
           'transport runtime provider error',
         );
+        // Capacity/overload is retryable on this exact session, even when the
+        // SDK marked the error non-recoverable. Preserve the failed logical
+        // turn and keep the runtime in-progress while the bounded timer owns
+        // the next drain; never fail over or switch provider here.
+        if (this.requeueAndScheduleCapacityRetry(error)) {
+          this.rollbackActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
+          this._sending = false;
+          this._activeTurn?.reject(error);
+          this._activeTurn = null;
+          this.clearStalePendingCancelFallbackTimer();
+          this._activeDispatchProviderStarted = false;
+          this._activeDispatchProviderAccepted = false;
+          this._activeDispatchCancelled = false;
+          this.closeOpenTools('errored', 'provider_error');
+          this._activeDispatchId = null;
+          this._activeDispatchStaleRecoveryStarted = false;
+          this.setStatus('thinking');
+          return;
+        }
         this.rollbackActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
         this._sending = false;
         this._activeTurn?.reject(error);
@@ -1291,6 +1324,9 @@ export class TransportSessionRuntime implements SessionRuntime {
       backgroundWorkCount: activitySnapshot.backgroundWorkCount,
       activeToolCount: activitySnapshot.activeToolCount,
       busyReasons: activitySnapshot.busyReasons,
+      ...(this._capacityRetryTimer && this._capacityRetryAt > 0
+        ? { capacityRetry: { attempt: this._capacityRetryAttempt, retryAt: this._capacityRetryAt, error: this._capacityRetryError } }
+        : {}),
     };
   }
 
@@ -2322,6 +2358,12 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (!this._providerSessionId) {
       throw new Error('TransportSessionRuntime not initialized — call initialize() first');
     }
+    // A fresh user message is an explicit takeover: cancel a pending capacity
+    // retry rather than sending the same failed turn twice.
+    if (this._capacityRetryTimer || this._capacityRetryEntryIds.length > 0) {
+      this.cancelCapacityRetry();
+      if (!this._sending && !this._activeTurn) this.setStatus('idle');
+    }
     if (isSessionCompactCommandText(message) && this.provider.capabilities.compact?.execution === 'unsupported') {
       const reason = this.provider.capabilities.compact.reason?.trim();
       throw new Error(reason || `${this.provider.id} does not support /compact`);
@@ -3017,6 +3059,12 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (!this._providerSessionId) {
       throw new Error('TransportSessionRuntime not initialized — call initialize() first');
     }
+    if (this._capacityRetryTimer && !this._activeTurn && !this._sending) {
+      this.cancelCapacityRetry();
+      this.markCurrentActivityGenerationLocallyCancelled();
+      if (!this._drainPending()) this.setStatus('idle');
+      return;
+    }
     // A recoverable auto-retry is mid-flight (re-queued message waiting on
     // backoff, no active provider turn). STOP must halt it deterministically:
     // clear the backoff, drop the queued work, and settle idle so the UI does
@@ -3160,6 +3208,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._externalCompletionSettlementsToIgnore = 0;
     this._cancelledProviderErrorsToIgnore = 0;
     this.clearRecoverableRetryTimer();
+    this.cancelCapacityRetry(false);
     this.clearPendingAuthorityRetryTimer();
     this._pendingAuthorityRetryAttempts.clear();
     this._recoverableDispatchRetries = 0;
@@ -3542,6 +3591,57 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (!this._recoverableRetryTimer) return;
     clearTimeout(this._recoverableRetryTimer);
     this._recoverableRetryTimer = null;
+  }
+
+  private clearCapacityRetryTimer(): void {
+    if (this._capacityRetryTimer) clearTimeout(this._capacityRetryTimer);
+    this._capacityRetryTimer = null;
+    this._capacityRetryAt = 0;
+  }
+
+  private cancelCapacityRetry(dropEntries = true): void {
+    this.clearCapacityRetryTimer();
+    if (dropEntries && this._capacityRetryEntryIds.length > 0) {
+      const ids = new Set(this._capacityRetryEntryIds);
+      this._pendingMessages = this._pendingMessages.filter((entry) => !ids.has(entry.clientMessageId));
+      this._pendingVersion++;
+    }
+    this._capacityRetryEntryIds = [];
+    this._capacityRetryAttempt = 0;
+    this._capacityRetryStartedAt = 0;
+    this._capacityRetryError = '';
+  }
+
+  private isCapacityRetryError(error: ProviderError): boolean {
+    return isTransientProviderCapacityError(error);
+  }
+
+  private requeueAndScheduleCapacityRetry(error: ProviderError): boolean {
+    if (!this.isCapacityRetryError(error) || this._activeDispatchEntries.length === 0) return false;
+    const now = Date.now();
+    if (!this._capacityRetryStartedAt) this._capacityRetryStartedAt = now;
+    const elapsed = now - this._capacityRetryStartedAt;
+    if (elapsed >= CAPACITY_RETRY_MAX_TOTAL_MS) return false;
+    const attempt = this._capacityRetryAttempt + 1;
+    const backoff = CAPACITY_RETRY_BACKOFF_MS[Math.min(attempt - 1, CAPACITY_RETRY_BACKOFF_MS.length - 1)]!;
+    if (elapsed + backoff > CAPACITY_RETRY_MAX_TOTAL_MS) return false;
+    this._capacityRetryAttempt = attempt;
+    this._capacityRetryError = error.message;
+    this._capacityRetryEntryIds = this._activeDispatchEntries.map((entry) => entry.clientMessageId);
+    this._pendingMessages.unshift(...this._activeDispatchEntries);
+    this._pendingVersion++;
+    this._activeDispatchEntries = [];
+    this.clearCapacityRetryTimer();
+    this._capacityRetryAt = now + backoff;
+    this._capacityRetryTimer = setTimeout(() => {
+      this._capacityRetryTimer = null;
+      this._capacityRetryAt = 0;
+      if (this._sending || this._activeTurn) return;
+      this._drainPending();
+    }, backoff);
+    this._capacityRetryTimer.unref?.();
+    logger.warn({ sessionKey: this.sessionKey, attempt, backoffMs: backoff, error: error.message }, 'transport provider capacity retry scheduled');
+    return true;
   }
 
   private clearPendingAuthorityRetryTimer(): void {
@@ -4019,6 +4119,21 @@ export class TransportSessionRuntime implements SessionRuntime {
           },
           'transport runtime dispatch failed',
         );
+        if (this.requeueAndScheduleCapacityRetry(providerError)) {
+          this.rollbackActiveSummarySyncReservation(dispatchId);
+          this._sending = false;
+          this._activeTurn.reject(providerError);
+          this._activeTurn = null;
+          this.clearStalePendingCancelFallbackTimer();
+          this._activeDispatchProviderStarted = false;
+          this._activeDispatchProviderAccepted = false;
+          this._activeDispatchCancelled = false;
+          this._activeDispatchId = null;
+          this._activeDispatchStaleRecoveryStarted = false;
+          this._locallyCancelledDispatchIds.delete(dispatchId);
+          this.setStatus('thinking');
+          return;
+        }
         const canDrain = providerError.code === PROVIDER_ERROR_CODES.CANCELLED || providerError.recoverable;
         this._sending = false;
         this._activeTurn.reject(providerError);
@@ -4331,7 +4446,11 @@ export class TransportSessionRuntime implements SessionRuntime {
     // Draining now supersedes any pending recoverable-retry backoff.
     this.clearRecoverableRetryTimer();
 
-    const retryEntryIds = this._recoverableRetryEntryIds;
+    const retryEntryIds = this._capacityRetryEntryIds.length > 0
+      ? this._capacityRetryEntryIds
+      : this._recoverableRetryEntryIds;
+    const capacityRetry = this._capacityRetryEntryIds.length > 0;
+    if (capacityRetry) this._capacityRetryEntryIds = [];
     this._recoverableRetryEntryIds = [];
     let messages: PendingTransportMessage[];
     if (retryEntryIds.length > 0) {

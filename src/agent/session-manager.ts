@@ -1754,6 +1754,7 @@ function buildTransportSessionStatePayload(
     payload.activeWorkCount = activity.blockingWorkCount;
     payload.activeToolCount = activity.activeToolCount;
     payload.busyReasons = activity.busyReasons;
+    if (activity.capacityRetry) payload.capacityRetry = activity.capacityRetry;
   }
   if (effectiveState === 'idle') {
     payload.authoritative = true;

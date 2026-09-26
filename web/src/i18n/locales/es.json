@@ -993,7 +993,8 @@
       "failed": "No se pudo cambiar el modelo: {{error}}",
       "loading": "Cargando modelos disponibles…",
       "unsupported": "Este tipo de sesión no permite cambiar el modelo."
-    }
+    },
+    "capacity_retrying": "Reintentando en {{seconds}} s (intento {{attempt}})"
   },
   "server": {
     "upgrade_daemon": "↑ Actualizar Daemon",

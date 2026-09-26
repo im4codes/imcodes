@@ -3574,6 +3574,29 @@ describe('TransportSessionRuntime', () => {
     });
   });
 
+  it('retries a provider capacity refusal on the same session with bounded backoff', async () => {
+    runtime.send('capacity retry', 'msg-capacity');
+    await flushDispatch();
+    vi.useFakeTimers();
+    mock.fireError('sess-1', {
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+      message: 'Selected model is at capacity',
+      recoverable: false,
+    });
+    expect(runtime.getStatus()).toBe('thinking');
+    expect(runtime.pendingMessages).toEqual(['capacity retry']);
+    expect(runtime.getDiagnosticSnapshot().capacityRetry?.attempt).toBe(1);
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.runAllTicks();
+    expect(mock.provider.send).toHaveBeenCalledTimes(2);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'capacity retry',
+      deliveryId: 'msg-capacity',
+    }));
+  });
+
   it('auto-retry redelivers a recoverable-failed message once the provider frees up', async () => {
     // The first provider.send rejects with a recoverable "busy" error; the
     // runtime must re-queue and auto-retry, and the next attempt (provider now

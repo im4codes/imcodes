@@ -993,7 +993,8 @@
       "failed": "Could not change model: {{error}}",
       "loading": "Loading available models…",
       "unsupported": "This session type does not support model switching."
-    }
+    },
+    "capacity_retrying": "Retrying in {{seconds}}s (attempt {{attempt}})"
   },
   "server": {
     "upgrade_daemon": "↑ Upgrade Daemon",

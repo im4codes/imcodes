@@ -19,6 +19,7 @@
  * also says so.
  */
 import { TASK_PAIR_HEARTBEAT_MS } from '../../../shared/task-pair.js';
+import { isTransientProviderError as isSharedTransientProviderError } from '../../../shared/provider-error-codes.js';
 import type { TimelineEvent } from '../timeline-event.js';
 
 /**
@@ -27,7 +28,6 @@ import type { TimelineEvent } from '../timeline-event.js';
  * evidence behind it. See the module doc above: never treated as a real
  * limit here regardless of which of these phrases matched.
  */
-const TRANSIENT_PROVIDER_ERROR_RE = /\bat capacity\b|\bcapacity\b.*\b(?:model|reached|exceeded)\b|rate[ _-]?limit|too many requests|\b429\b|\b529\b|\b503\b|overloaded|temporarily unavailable|usage limit|quota (?:exceeded|exhausted)/i;
 
 /**
  * True for capacity/overload/rate-limit-SHAPED free text. Despite matching
@@ -37,7 +37,7 @@ const TRANSIENT_PROVIDER_ERROR_RE = /\bat capacity\b|\bcapacity\b.*\b(?:model|re
  * "is this session rate-limited".
  */
 export function isTransientProviderError(message: string | undefined): boolean {
-  return !!message && TRANSIENT_PROVIDER_ERROR_RE.test(message);
+  return isSharedTransientProviderError(message);
 }
 
 const lastErrorAt = new Map<string, number>();

@@ -993,7 +993,8 @@
       "failed": "モデルを変更できませんでした：{{error}}",
       "loading": "利用可能なモデルを読み込み中…",
       "unsupported": "このセッション種別はモデル切り替えに対応していません。"
-    }
+    },
+    "capacity_retrying": "{{seconds}}秒後に再試行（{{attempt}}回目）"
   },
   "server": {
     "upgrade_daemon": "↑ Daemonをアップグレード",

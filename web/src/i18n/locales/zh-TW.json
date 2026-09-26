@@ -993,7 +993,8 @@
       "failed": "無法切換模型：{{error}}",
       "loading": "正在載入可用模型…",
       "unsupported": "此工作階段類型不支援切換模型。"
-    }
+    },
+    "capacity_retrying": "將在 {{seconds}} 秒後重試（第 {{attempt}} 次）"
   },
   "server": {
     "upgrade_daemon": "↑ 升級 Daemon",

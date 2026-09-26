@@ -15,6 +15,11 @@ export function getLatestTransportActivityDetail(events: readonly TimelineEvent[
     const event = events[index];
     if (event.type !== 'session.state') continue;
     const state = String(event.payload.state ?? '');
+    const retry = event.payload.capacityRetry;
+    if (state === 'running' && retry && typeof retry === 'object') {
+      const r = retry as Record<string, unknown>;
+      if (typeof r.retryAt === 'number' && typeof r.attempt === 'number') return `capacity_retry:${r.retryAt}:${r.attempt}`;
+    }
     if (state === 'error') {
       const error = typeof event.payload.error === 'string' ? event.payload.error.trim() : '';
       return error || null;

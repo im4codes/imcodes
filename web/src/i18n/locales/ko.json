@@ -993,7 +993,8 @@
       "failed": "모델을 변경할 수 없습니다: {{error}}",
       "loading": "사용 가능한 모델을 불러오는 중…",
       "unsupported": "이 세션 유형은 모델 전환을 지원하지 않습니다."
-    }
+    },
+    "capacity_retrying": "{{seconds}}초 후 재시도 ({{attempt}}회차)"
   },
   "server": {
     "upgrade_daemon": "↑ Daemon 업그레이드",
