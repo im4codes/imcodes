@@ -239,13 +239,15 @@ describe('E2E: marker-driven task pairs (explicit pairs engine)', () => {
     expect(getSupervisionTaskRegistry().get(taskId)).toBeUndefined();
 
     // 2. Round 1: the executor asks for audit, the auditor finds a P0.
-    await say(EXEC, `README sentence added; tests pass.\n<!-- IMCODES_TASK READY_FOR_AUDIT ${taskId} -->`);
+    // Owner rule: an auditor verdict is lawful only for a material-backed
+    // audit round, so the executor names its result path explicitly.
+    await say(EXEC, `README sentence added; tests pass.\n<!-- IMCODES_TASK READY_FOR_AUDIT ${taskId} path=/workspace -->`);
     expect(pairOf(taskId)).toMatchObject({ status: 'in_audit', round: 1 });
     await say(AUD, `[P0] the sentence contradicts the install section.\n<!-- IMCODES_TASK REWORK ${taskId} blocking=P0 p0=1 p1=0 -->`);
     expect(pairOf(taskId)).toMatchObject({ status: 'rework', round: 1 });
 
     // 3. Round 2: fixed, re-audited, PASS with zero blocking findings.
-    await say(EXEC, `Fixed the contradiction.\n<!-- IMCODES_TASK READY_FOR_AUDIT ${taskId} -->`);
+    await say(EXEC, `Fixed the contradiction.\n<!-- IMCODES_TASK READY_FOR_AUDIT ${taskId} path=/workspace -->`);
     expect(pairOf(taskId)).toMatchObject({ status: 'in_audit', round: 2 });
     await say(AUD, `No blocking findings.\n<!-- IMCODES_TASK PASS ${taskId} blocking=P0 p0=0 -->`);
     expect(pairOf(taskId)).toMatchObject({ status: 'passed', round: 2 });
@@ -285,7 +287,8 @@ describe('E2E: marker-driven task pairs (explicit pairs engine)', () => {
     const taskId = created.taskId;
     await settle();
 
-    await say(EXEC, `<!-- IMCODES_TASK READY_FOR_AUDIT ${taskId} -->`);
+    // Owner rule: the PASS below must close a material-backed audit round.
+    await say(EXEC, `<!-- IMCODES_TASK READY_FOR_AUDIT ${taskId} path=/workspace -->`);
     const before = delivered.length;
     await say(AUD, `Only nits.\n<!-- IMCODES_TASK REWORK ${taskId} blocking=P0 p0=0 p3=2 -->`);
     // Not a REWORK under audit_convergence_v1: the verdict is held, not applied.
@@ -296,4 +299,3 @@ describe('E2E: marker-driven task pairs (explicit pairs engine)', () => {
     expect(pairOf(taskId)?.status).toBe('passed');
   });
 });
-
