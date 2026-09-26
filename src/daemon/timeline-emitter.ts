@@ -12,10 +12,11 @@ import type { TimelineEvent, TimelineEventType, TimelineSource, TimelineConfiden
 import { timelineStore } from './timeline-store.js';
 import { preferTimelineEvent } from '../shared/timeline/merge.js';
 import { isMemoryNoiseTurn } from '../../shared/memory-noise-patterns.js';
-import { recordTurnUsage } from '../store/context-store.js';
+import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { getSession } from '../store/session-store.js';
 import { registerSessionStateProbeObserver } from '../store/session-state-probe-events.js';
 import logger from '../util/logger.js';
+import { incrementCounter } from '../util/metrics.js';
 import { recordTimelineEmit } from './latency-tracer.js';
 import { TIMELINE_RESPONSE_SOURCES, type TimelineResponseSource } from '../../shared/timeline-protocol.js';
 import { isSessionModelSwitchCommandText } from '../../shared/session-control-commands.js';
@@ -295,22 +296,21 @@ export class TimelineEmitter {
       timelineStore.append(event);
       traceAppendScheduleMs += performance.now() - appendStart;
       // Mirror per-turn `usage.update` into SQLite so operators can query
-      // historical token spend without parsing JSONL. Best-effort — failures
-      // never escape (recordTurnUsage swallows internally + extra try/catch).
+      // historical token spend without parsing JSONL. This MUST stay off the
+      // daemon event loop: the context-store worker owns SQLite and a large
+      // database/page cache or a stalled write must never starve ServerLink.
+      // Best-effort — failures degrade usage telemetry only.
       // Final-only: streaming deltas don't reach here.
       //
-      // Round-2 audit (0699ea64-3e6 finding A1): synchronous call + eventId
-      // idempotency key. Replaced the previous `void import(...).then(...)`
-      // pattern — there is no real cyclic dependency on context-store, and
-      // the .then deferred path lost rows under SIGTERM races. Passing
-      // `eventId` lets the partial UNIQUE index swallow replay duplicates
-      // (e.g. gemini-watcher's deterministic stableId on daemon restart).
+      // Preserve the eventId idempotency key from the earlier path. The
+      // worker-side partial UNIQUE index swallows replay duplicates (e.g.
+      // gemini-watcher's deterministic stableId on daemon restart).
       if (type === 'usage.update') {
         const usageStart = performance.now();
         try {
           const sessionRecord = getSession(sessionId);
           const parentSessionName = sessionRecord?.parentSession ?? null;
-          recordTurnUsage({
+          const usageRecord = {
             createdAt: ts,
             sessionName: sessionId,
             agentType: typeof payload.agentType === 'string' ? payload.agentType : null,
@@ -325,7 +325,16 @@ export class TimelineEmitter {
             contextWindow: typeof payload.contextWindow === 'number' ? payload.contextWindow : null,
             costUsd: typeof payload.costUsd === 'number' ? payload.costUsd : null,
             eventId,
-          });
+          };
+          // Keep this fire-and-forget from the emitter's synchronous API, but
+          // route it through the bounded worker RPC. `run()` enforces the
+          // awaited cap/timeout; a slow store rejects after its budget instead
+          // of accumulating unbounded work on the main thread.
+          void getContextStoreClient()
+            .run('recordTurnUsage', [usageRecord])
+            .catch(() => {
+              incrementCounter('mem.turn_usage.record_failed', {});
+            });
         } catch { /* swallow — telemetry must never escape */ }
         finally {
           traceUsageMs += performance.now() - usageStart;

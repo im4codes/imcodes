@@ -602,6 +602,57 @@ describe('ServerLink', () => {
     expect(link.isUplinkCongested()).toBe(true);
   });
 
+  it('recycles when heartbeat acks stop even though unrelated inbound frames keep arriving', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(300_000);
+    link.connect();
+    const openHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'open')?.[1] as
+      | (() => void)
+      | undefined;
+    const messageHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'message')?.[1] as
+      | ((event: MessageEvent) => void)
+      | undefined;
+    openHandler?.();
+    mockWsInstance.close.mockClear();
+    recordDaemonServerLinkStatusMock.mockClear();
+
+    // Keep generic traffic flowing so `lastPong` stays fresh. It must not mask
+    // the missing application-level heartbeat acknowledgement.
+    for (let i = 0; i < 14; i += 1) {
+      await vi.advanceTimersByTimeAsync(5_000);
+      messageHandler?.({ data: JSON.stringify({ type: 'daemon.stats' }) } as MessageEvent);
+    }
+
+    expect(mockWsInstance.close).toHaveBeenCalled();
+    expect(recordDaemonServerLinkStatusMock).toHaveBeenCalledWith(expect.objectContaining({
+      state: 'disconnected',
+      lastError: 'heartbeat_ack_timeout',
+    }));
+  });
+
+  it('accepts legacy heartbeat acks without a clock echo across repeated timeout windows', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(400_000);
+    link.connect();
+    const openHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'open')?.[1] as
+      | (() => void)
+      | undefined;
+    const messageHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'message')?.[1] as
+      | ((event: MessageEvent) => void)
+      | undefined;
+    openHandler?.();
+    mockWsInstance.close.mockClear();
+
+    // An older server acknowledges every heartbeat but has no sentAt echo. The
+    // FIFO fallback must retire each proof and keep the healthy link open.
+    for (let i = 0; i < 30; i += 1) {
+      await vi.advanceTimersByTimeAsync(5_000);
+      messageHandler?.({ data: JSON.stringify({ type: 'heartbeat_ack' }) } as MessageEvent);
+    }
+
+    expect(mockWsInstance.close).not.toHaveBeenCalled();
+  });
+
   it('drops only the cancelled request\'s queued reply and keeps fan-out replies for other requesters', async () => {
     __setServerLinkDataPlaneQueueConfigForTests({
       maxBytes: 1024 * 1024,

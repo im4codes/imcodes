@@ -191,10 +191,9 @@ export function isContextStoreR5ManagementOp(op: string): op is ContextStoreR5Ma
 
 /** Ops dispatched fire-and-forget (R2): best-effort telemetry and lazy embedding
  *  fill, never awaited on a hot path.
- *  NOTE: `recordTurnUsage` is deliberately NOT here — audit finding A1 made it a
- *  SYNCHRONOUS durable write (the deferred/fire-and-forget path lost rows under
- *  SIGTERM races); it is the documented sync-durability exception (design
- *  Decision 5), so it must never be dispatched fire-and-forget. */
+ *  NOTE: `recordTurnUsage` is deliberately NOT here — it is a durable awaited
+ *  RPC, not telemetry fire-and-forget. Callers must dispatch it through `run()`
+ *  so SQLite work stays off the daemon event loop. */
 export const CONTEXT_STORE_FIRE_AND_FORGET_OPS = [
   'recordMemoryHits',
   'saveProjectionEmbedding',

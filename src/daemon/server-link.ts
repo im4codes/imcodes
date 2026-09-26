@@ -229,6 +229,12 @@ const WATCHDOG_MS = 10_000;           // check connection health every 10s
 // getOpenSocketSilenceMs() still prevents this from false-reconnecting a healthy
 // socket during the daemon's own load spikes (it reports 0 silence then).
 const SILENT_CONNECTION_RECYCLE_MS = 30_000;
+// Inbound application traffic is not a heartbeat proof. A half-open socket can
+// continue delivering stale/non-ack frames while the server no longer receives
+// our heartbeats, so bound the oldest outstanding heartbeat independently of
+// `lastPong`/generic message silence. Keep this longer than one silence window
+// to tolerate a transient missed ack while still recycling in bounded time.
+const HEARTBEAT_ACK_TIMEOUT_MS = 60_000;
 // Throttle for the dropped-timeline-event warning. The counter records every
 // drop; the log line is a human-facing heartbeat so a flapping link is visible
 // in daemon.log without one line per lost message.
@@ -1122,9 +1128,14 @@ export class ServerLink {
   }
 
   private observeHeartbeatAck(echoedSentAt: unknown, receivedAt: number): void {
-    // Acks from servers that predate the clock echo carry no send time and
-    // cannot be matched; they leave congestion tracking unchanged.
-    if (typeof echoedSentAt !== 'number' || !Number.isFinite(echoedSentAt)) return;
+    // Older self-hosted servers send the heartbeat_ack envelope without the
+    // clock-echo field. The frame is still an application-level proof; retire
+    // the oldest outstanding heartbeat FIFO so the bounded ack watchdog does
+    // not reconnect a healthy legacy server every minute.
+    if (typeof echoedSentAt !== 'number' || !Number.isFinite(echoedSentAt)) {
+      this.unackedHeartbeatSentAts.shift();
+      return;
+    }
     this.lastHeartbeatRoundTripMs = Math.max(0, receivedAt - echoedSentAt);
     this.unackedHeartbeatSentAts = this.unackedHeartbeatSentAts.filter((sentAt) => sentAt > echoedSentAt);
   }
@@ -1445,6 +1456,10 @@ export class ServerLink {
     this.heartbeatTimer = setInterval(() => {
       if (this.ws?.readyState === WebSocket.OPEN) {
         const now = Date.now();
+        if (this.heartbeatAckTimedOut(now)) {
+          this.forceReconnect('heartbeat_ack_timeout');
+          return;
+        }
         const silenceMs = this.getOpenSocketSilenceMs(now);
         if (silenceMs > SILENT_CONNECTION_RECYCLE_MS) {
           this.recycleSilentConnection('heartbeat_silent_connection', silenceMs);
@@ -1500,6 +1515,11 @@ export class ServerLink {
       // event-loop freeze) so a busy daemon doesn't force-reconnect a healthy
       // socket it simply couldn't read from.
       const silenceMs = this.getOpenSocketSilenceMs();
+      if (this.heartbeatAckTimedOut()) {
+        logger.warn('ServerLink watchdog: heartbeat ack timeout, forcing reconnect');
+        this.forceReconnect('heartbeat_ack_timeout');
+        return;
+      }
       if (silenceMs > SILENT_CONNECTION_RECYCLE_MS) {
         // Haven't received anything for heartbeat interval + timeout — dead connection
         logger.warn({ silenceMs }, 'ServerLink watchdog: connection silent, forcing reconnect');
@@ -1525,6 +1545,16 @@ export class ServerLink {
       return 0;
     }
     return Math.max(0, now - this.lastPong);
+  }
+
+  /** True when the oldest heartbeat sent on a clean event loop has no
+   * application-level acknowledgement within the bounded proof window. */
+  private heartbeatAckTimedOut(now = Date.now()): boolean {
+    if (this.lastLoopProbeAt > 0 && now - this.lastLoopProbeAt > LOOP_PROBE_MS + EVENT_LOOP_STALL_THRESHOLD_MS) {
+      return false;
+    }
+    const oldestUnacked = this.unackedHeartbeatSentAts[0];
+    return oldestUnacked !== undefined && now - oldestUnacked > HEARTBEAT_ACK_TIMEOUT_MS;
   }
 
   /** Lightweight ticker that detects event-loop freezes (see LOOP_PROBE_MS). */

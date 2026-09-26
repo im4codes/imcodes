@@ -12,7 +12,8 @@
  * `emit()` synchronous guarantees (handled by timeline-emitter):
  *   - Ring buffer push completes; `replay()` immediately sees it.
  *   - Handler broadcast completes; WS / projection sync listeners see it.
- *   - `recordTurnUsage` (better-sqlite3) writes synchronously.
+ *   - usage telemetry is submitted to the context-store worker asynchronously;
+ *     emit never waits for SQLite.
  *
  * `emit()` does NOT guarantee:
  *   - JSONL file content visible to `read()` / `getLatest()` — those paths

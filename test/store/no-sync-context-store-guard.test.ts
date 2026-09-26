@@ -31,18 +31,16 @@ describe('context-store exact-path import guard', () => {
     expect(findStaleTransitionEntries()).toEqual([]);
   });
 
-  it('the permanent allowlist is exactly the worker dispatch/recall layer + A1 exception + CLI', () => {
+  it('the permanent allowlist is exactly the worker dispatch/recall layer + CLI', () => {
     // The STRICT END STATE: the only direct importers of the synchronous store
-    // are (a) the worker + its shared dispatch/recall layer (which also serves as
-    // the bounded in-process cold fallback), (b) the documented A1 sync exception
-    // (`timeline-emitter` recordTurnUsage), and (c) the CLI. Tests live in
-    // `test/` and are not scanned.
+    // are the worker + its shared dispatch/recall layer (which also serves as
+    // the bounded in-process cold fallback) and the CLI. Tests live in `test/`
+    // and are not scanned.
     expect([...PERMANENT_IMPORTERS].sort()).toEqual([
       'cli.ts',
       'context/memory-recall-bounded.ts',
       'context/memory-recall-core.ts',
       'context/memory-search.ts',
-      'daemon/timeline-emitter.ts',
       'store/context-store-op-handlers.ts',
       'store/context-store-worker.ts',
     ]);
