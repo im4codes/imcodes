@@ -99,4 +99,43 @@ describe('session_restart MCP tool', () => {
     });
     expect(restartSession).toHaveBeenCalledTimes(1);
   });
+
+  it('preserves typed hook rate limits and retry timing', async () => {
+    const self = session();
+    const restartSession = vi.fn(async () => {
+      const error = new Error('rate limit exceeded') as Error & { name: string; statusCode: number; retryAfterMs: number; retryAt: number };
+      error.name = 'HookRateLimitError';
+      error.statusCode = 429;
+      error.retryAfterMs = 1200;
+      error.retryAt = Date.now() + 1200;
+      throw error;
+    });
+    const handler = createMemoryMcpToolHandlers(caller, {
+      sendDeps: { listSessions: () => [self] },
+      restartSession,
+    })[MEMORY_MCP_TOOL_NAMES.SESSION_RESTART];
+
+    await expect(handler({ target: self.name })).resolves.toMatchObject({
+      status: 'error', reason: 'rate_limited', recoverable: true, retryAfterMs: 1200,
+    });
+  });
+
+  it('dispatches bounded restart batches with per-target idempotency keys', async () => {
+    const self = session();
+    const child = session({ name: 'deck_project_worker', role: 'w1' });
+    const restartSessionBatch = vi.fn(async () => ({ ok: true, accepted: true }));
+    const handler = createMemoryMcpToolHandlers(caller, {
+      sendDeps: { listSessions: () => [self, child] },
+      restartSessionBatch,
+    })[MEMORY_MCP_TOOL_NAMES.SESSION_RESTART];
+
+    await expect(handler({ targets: [
+      { target: self.name, reset: true, idempotencyKey: 'self-1' },
+      { target: child.name, idempotencyKey: 'child-1' },
+    ] })).resolves.toMatchObject({ status: 'ok', scheduled: true, targets: [self.name, child.name] });
+    expect(restartSessionBatch).toHaveBeenCalledWith([
+      { target: self, reset: true, idempotencyKey: 'self-1' },
+      { target: child, reset: false, idempotencyKey: 'child-1' },
+    ]);
+  });
 });

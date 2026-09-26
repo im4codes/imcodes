@@ -56,6 +56,7 @@ import { isMemoryScope, validateMemoryScopeIdentity } from '../../shared/memory-
 import type { ContextNamespace } from '../../shared/context-types.js';
 import {
   MEMORY_MCP_SESSION_RESTART_HOOK_PATH,
+  MEMORY_MCP_SESSION_RESTART_BATCH_HOOK_PATH,
   MEMORY_MCP_SESSION_MODEL_LIST_HOOK_PATH,
   MEMORY_MCP_SESSION_MODEL_SET_HOOK_PATH,
   MEMORY_MCP_SEND_DELIVERY_MODES,
@@ -90,6 +91,13 @@ const MAX_SEND_DEPTH = 3;
 const RATE_LIMIT_MAX = 10;
 /** Rate limit window: 60 seconds */
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+/** Lifecycle controls have a separate, generous burst so batch resets do not
+ * consume ordinary send capacity. Excess work waits in a bounded FIFO. */
+const LIFECYCLE_RATE_LIMIT_MAX = 30;
+const LIFECYCLE_RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const LIFECYCLE_QUEUE_MAX = 100;
+const SESSION_RESTART_BATCH_MAX = 50;
+const LIFECYCLE_IDEMPOTENCY_TTL_MS = 5 * 60 * 1000;
 /** Max broadcast recipients */
 const MAX_BROADCAST_RECIPIENTS = 8;
 
@@ -149,6 +157,17 @@ const messageQueue = new Map<string, QueuedMessage[]>();
 
 /** Rate limiter: source session → timestamps of recent sends */
 const rateLimiter = new Map<string, number[]>();
+
+interface LifecycleTask {
+  run: () => void | Promise<void>;
+}
+interface LifecycleBucket {
+  timestamps: number[];
+  queue: LifecycleTask[];
+  timer?: NodeJS.Timeout;
+}
+const lifecycleLimiter = new Map<string, LifecycleBucket>();
+const lifecycleIdempotency = new Map<string, number>();
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -422,10 +441,79 @@ function checkRateLimit(from: string): boolean {
   return recent.length < RATE_LIMIT_MAX;
 }
 
+function ordinaryRateLimitRetryAfterMs(from: string): number {
+  const timestamps = rateLimiter.get(from) ?? [];
+  const oldest = timestamps[0];
+  return oldest === undefined ? RATE_LIMIT_WINDOW_MS : Math.max(1, oldest + RATE_LIMIT_WINDOW_MS - Date.now());
+}
+
 function recordSend(from: string): void {
   const timestamps = rateLimiter.get(from) ?? [];
   timestamps.push(Date.now());
   rateLimiter.set(from, timestamps);
+}
+
+function lifecycleBucketFor(from: string): LifecycleBucket {
+  const bucket = lifecycleLimiter.get(from) ?? { timestamps: [], queue: [] };
+  lifecycleLimiter.set(from, bucket);
+  return bucket;
+}
+
+function pruneLifecycle(bucket: LifecycleBucket, now = Date.now()): void {
+  bucket.timestamps = bucket.timestamps.filter((timestamp) => timestamp > now - LIFECYCLE_RATE_LIMIT_WINDOW_MS);
+  for (const [key, createdAt] of lifecycleIdempotency) {
+    if (createdAt <= now - LIFECYCLE_IDEMPOTENCY_TTL_MS) lifecycleIdempotency.delete(key);
+  }
+}
+
+function lifecycleRetryAfterMs(bucket: LifecycleBucket, now = Date.now()): number {
+  const oldest = bucket.timestamps[0];
+  return oldest === undefined ? 0 : Math.max(1, oldest + LIFECYCLE_RATE_LIMIT_WINDOW_MS - now);
+}
+
+function drainLifecycle(from: string): void {
+  const bucket = lifecycleLimiter.get(from);
+  if (!bucket) return;
+  bucket.timer = undefined;
+  const now = Date.now();
+  pruneLifecycle(bucket, now);
+  while (bucket.queue.length > 0 && bucket.timestamps.length < LIFECYCLE_RATE_LIMIT_MAX) {
+    const task = bucket.queue.shift()!;
+    bucket.timestamps.push(Date.now());
+    setImmediate(() => { void Promise.resolve(task.run()).catch((err: unknown) => logger.warn({ err, from }, 'Lifecycle control task failed')); });
+  }
+  if (bucket.queue.length > 0) {
+    bucket.timer = setTimeout(() => drainLifecycle(from), lifecycleRetryAfterMs(bucket));
+  } else if (bucket.timestamps.length === 0) {
+    lifecycleLimiter.delete(from);
+  }
+}
+
+function scheduleLifecycleTask(
+  from: string,
+  task: LifecycleTask,
+  idempotencyKey?: string,
+): { accepted: boolean; queued: boolean; duplicate: boolean; retryAfterMs?: number } {
+  const bucket = lifecycleBucketFor(from);
+  const idempotency = idempotencyKey?.trim();
+  if (idempotency) {
+    const key = `${from}\u0000${idempotency}`;
+    if (lifecycleIdempotency.has(key)) return { accepted: true, queued: false, duplicate: true };
+  }
+  pruneLifecycle(bucket);
+  if (bucket.timestamps.length < LIFECYCLE_RATE_LIMIT_MAX) {
+    if (idempotency) lifecycleIdempotency.set(`${from}\u0000${idempotency}`, Date.now());
+    bucket.timestamps.push(Date.now());
+    setImmediate(() => { void Promise.resolve(task.run()).catch((err: unknown) => logger.warn({ err, from }, 'Lifecycle control task failed')); });
+    return { accepted: true, queued: false, duplicate: false };
+  }
+  if (bucket.queue.length >= LIFECYCLE_QUEUE_MAX) {
+    return { accepted: false, queued: false, duplicate: false, retryAfterMs: lifecycleRetryAfterMs(bucket) };
+  }
+  if (idempotency) lifecycleIdempotency.set(`${from}\u0000${idempotency}`, Date.now());
+  bucket.queue.push(task);
+  if (!bucket.timer) bucket.timer = setTimeout(() => drainLifecycle(from), lifecycleRetryAfterMs(bucket));
+  return { accepted: true, queued: true, duplicate: false };
 }
 
 /**
@@ -472,6 +560,9 @@ export function getQueue(target: string): QueuedMessage[] {
 export function clearQueues(): void {
   messageQueue.clear();
   rateLimiter.clear();
+  for (const bucket of lifecycleLimiter.values()) if (bucket.timer) clearTimeout(bucket.timer);
+  lifecycleLimiter.clear();
+  lifecycleIdempotency.clear();
 }
 
 // ─── /send Handler ───────────────────────────────────────────────────────────
@@ -538,11 +629,6 @@ async function handleSend(body: SendRequest): Promise<{ status: number; body: Re
     return { status: 429, body: { ok: false, error: 'depth limit exceeded' } };
   }
 
-  // Circuit breaker: rate limit
-  if (!checkRateLimit(from)) {
-    return { status: 429, body: { ok: false, error: 'rate limit exceeded' } };
-  }
-
   // Resolve target
   const result = resolveTarget(from, to);
   if (!result.ok) {
@@ -551,9 +637,6 @@ async function handleSend(body: SendRequest): Promise<{ status: number; body: Re
   if (body.supervision && result.targets.length !== 1) {
     return { status: 400, body: { ok: false, error: 'supervision binding requires one exact target' } };
   }
-
-  // Record send after successful resolution (prevents invalid senders from polluting rate-limit map)
-  recordSend(from);
 
   // Transport command liveness mandate (CLAUDE.md): `/stop` is a CONTROL
   // command and must take the priority stop path from EVERY ingress — never
@@ -585,6 +668,15 @@ async function handleSend(body: SendRequest): Promise<{ status: number; body: Re
       body: { ok: notStopped.length === 0, stopped, ...(notStopped.length > 0 ? { notStopped } : {}) },
     };
   }
+
+  // Ordinary messages retain abuse protection. Urgent /stop was handled above
+  // on the priority path and must never consume or wait on this bucket.
+  if (!checkRateLimit(from)) {
+    return { status: 429, body: { ok: false, error: 'rate limit exceeded', retryAfterMs: ordinaryRateLimitRetryAfterMs(from) } };
+  }
+  // Record only after exact target validation; failed requests do not pollute
+  // the ordinary send bucket.
+  recordSend(from);
 
   const sender = resolveSenderRecord(from, listSessions());
   const projectRoot = sender && sender !== 'ambiguous' ? sender.projectDir : null;
@@ -670,16 +762,10 @@ async function handleStop(body: StopRequest): Promise<{ status: number; body: Re
   if (!from || !to) {
     return { status: 400, body: { ok: false, error: 'missing required fields: from, to' } };
   }
-  if (!checkRateLimit(from)) {
-    return { status: 429, body: { ok: false, error: 'rate limit exceeded' } };
-  }
-
   const result = resolveTarget(from, to);
   if (!result.ok) {
     return { status: 404, body: { ok: false, error: result.error, available: result.available } };
   }
-  recordSend(from);
-
   // Lazy import: command-handler pulls in the whole daemon graph, so importing
   // it eagerly here would create a heavy module cycle (and broke hook-server's
   // own tests). Only loaded when /stop is actually called.
@@ -1110,7 +1196,11 @@ export async function startHookServer(
         const body = await readBody(req);
         const parsed = JSON.parse(body) as SendRequest;
         const result = await handleSend(parsed);
-        res.writeHead(result.status, { 'Content-Type': 'application/json' });
+        const retryAfterMs = result.status === 429 && typeof result.body.retryAfterMs === 'number' ? result.body.retryAfterMs : undefined;
+        res.writeHead(result.status, {
+          'Content-Type': 'application/json',
+          ...(retryAfterMs !== undefined ? { 'Retry-After': String(Math.ceil(retryAfterMs / 1000)) } : {}),
+        });
         res.end(JSON.stringify(result.body));
       } catch (err) {
         if ((err as Error).message === 'body too large') {
@@ -1221,16 +1311,34 @@ export async function startHookServer(
           res.end(JSON.stringify({ ok: false, error: 'session model caller identity is unavailable' }));
           return;
         }
-        if (isSet && !checkRateLimit(from)) {
-          res.writeHead(429, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, error: 'rate limit exceeded' }));
-          return;
-        }
-        if (isSet) recordSend(from);
         const { listSessionModelsNow, switchSessionModelNow } = await import('./command-handler.js');
-        const result = isSet
-          ? await (options.switchSessionModel ?? switchSessionModelNow)(to, model || undefined, thinking || undefined)
-          : await (options.listSessionModels ?? listSessionModelsNow)(to);
+        let result;
+        if (isSet) {
+          let resolveQueued!: (value: import('../../shared/session-model-control.js').SessionModelSwitchResult | import('../../shared/session-model-control.js').SessionThinkingSwitchResult) => void;
+          let rejectQueued!: (error: unknown) => void;
+          const completed = new Promise<import('../../shared/session-model-control.js').SessionModelSwitchResult | import('../../shared/session-model-control.js').SessionThinkingSwitchResult>((resolve, reject) => {
+            resolveQueued = resolve;
+            rejectQueued = reject;
+          });
+          const reservation = scheduleLifecycleTask(from, {
+            run: async () => {
+              try {
+                resolveQueued(await (options.switchSessionModel ?? switchSessionModelNow)(to, model || undefined, thinking || undefined));
+              } catch (error) {
+                rejectQueued(error);
+              }
+            },
+          });
+          if (!reservation.accepted) {
+            const retryAfterMs = reservation.retryAfterMs ?? LIFECYCLE_RATE_LIMIT_WINDOW_MS;
+            res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': String(Math.ceil(retryAfterMs / 1000)) });
+            res.end(JSON.stringify({ ok: false, error: 'rate limit exceeded', retryAfterMs }));
+            return;
+          }
+          result = await completed;
+        } else {
+          result = await (options.listSessionModels ?? listSessionModelsNow)(to);
+        }
         if (isSet) logger.info({ caller: from, target: to, model: model || undefined, thinking: thinking || undefined, ok: result.ok }, 'MCP session model/thinking switch');
         const { ok, ...rest } = result;
         const payload = ok
@@ -1246,7 +1354,7 @@ export async function startHookServer(
       return;
     }
 
-    if (url === MEMORY_MCP_SESSION_RESTART_HOOK_PATH) {
+    if (url === MEMORY_MCP_SESSION_RESTART_HOOK_PATH || url === MEMORY_MCP_SESSION_RESTART_BATCH_HOOK_PATH) {
       const contentType = req.headers['content-type'] ?? '';
       if (!contentType.includes('application/json')) {
         res.writeHead(415, { 'Content-Type': 'application/json' });
@@ -1254,50 +1362,76 @@ export async function startHookServer(
         return;
       }
       try {
-        const body = JSON.parse(await readBody(req, 4096)) as Record<string, unknown>;
+        const body = JSON.parse(await readBody(req, 64 * 1024)) as Record<string, unknown>;
         const senderHeader = req.headers['x-imcodes-session'];
         const authenticatedSender = Array.isArray(senderHeader) ? senderHeader[0] : senderHeader;
         const from = typeof body.from === 'string' ? body.from.trim() : '';
-        const to = typeof body.to === 'string' ? body.to.trim() : '';
-        if (!from || !to || authenticatedSender !== from || typeof body.reset !== 'boolean') {
+        const rawBatch = Array.isArray(body.targets) ? body.targets : null;
+        const isBatch = url === MEMORY_MCP_SESSION_RESTART_BATCH_HOOK_PATH || rawBatch !== null;
+        const items = rawBatch
+          ? rawBatch.map((entry) => {
+            if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+            const record = entry as Record<string, unknown>;
+            return {
+              target: typeof record.target === 'string' ? record.target.trim() : '',
+              reset: typeof record.reset === 'boolean' ? record.reset : false,
+              idempotencyKey: typeof record.idempotencyKey === 'string' ? record.idempotencyKey.trim() : undefined,
+            };
+          })
+          : [{
+            target: typeof body.to === 'string' ? body.to.trim() : '',
+            reset: body.reset,
+            idempotencyKey: typeof body.idempotencyKey === 'string' ? body.idempotencyKey.trim() : undefined,
+          }];
+        if (!from || authenticatedSender !== from || items.length === 0 || items.length > SESSION_RESTART_BATCH_MAX
+          || items.some((item) => !item || !item.target || (!isBatch && typeof item.reset !== 'boolean'))) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, error: 'invalid exact-session restart request' }));
+          res.end(JSON.stringify({ ok: false, error: isBatch ? 'invalid session restart batch request' : 'invalid exact-session restart request' }));
           return;
         }
         const callerRecord = getSession(from);
-        const targetRecord = getSession(to);
         if (!callerRecord || callerRecord.state === 'stopped') {
           res.writeHead(403, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: 'session restart caller identity is unavailable' }));
           return;
         }
-        if (!targetRecord || targetRecord.projectName !== callerRecord.projectName) {
-          res.writeHead(404, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, error: 'session restart target is unavailable' }));
-          return;
+        const targetRecords: SessionRecord[] = [];
+        for (const item of items) {
+          const targetRecord = getSession(item!.target);
+          if (!targetRecord || targetRecord.projectName !== callerRecord.projectName) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'session restart target is unavailable' }));
+            return;
+          }
+          targetRecords.push(targetRecord);
         }
-        if (!checkRateLimit(from)) {
-          res.writeHead(429, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, error: 'rate limit exceeded' }));
-          return;
-        }
-        recordSend(from);
-        const reset = body.reset;
-        res.writeHead(202, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, accepted: true, target: targetRecord.name, reset }), () => {
-          setImmediate(() => {
-            void (async () => {
-              const restart = options.restartSession ?? (async (sessionName: string, restartOptions: { reset: boolean }) => {
-                const { restartSessionNow } = await import('./command-handler.js');
-                return restartSessionNow(sessionName, restartOptions);
-              });
-              const accepted = await restart(targetRecord.name, { reset });
-              if (!accepted) logger.warn({ sessionName: targetRecord.name, reset }, 'MCP session restart was not accepted');
-            })().catch((err) => {
-              logger.error({ err, sessionName: targetRecord.name, reset }, 'MCP session restart failed after acceptance');
-            });
-          });
+        const restart = options.restartSession ?? (async (sessionName: string, restartOptions: { reset: boolean }) => {
+          const { restartSessionNow } = await import('./command-handler.js');
+          return restartSessionNow(sessionName, restartOptions);
         });
+        const reservations = targetRecords.map((targetRecord, index) => {
+          const item = items[index]!;
+          return scheduleLifecycleTask(from, {
+            run: async () => {
+              const accepted = await restart(targetRecord.name, { reset: item.reset as boolean });
+              if (!accepted) logger.warn({ sessionName: targetRecord.name, reset: item.reset }, 'MCP session restart was not accepted');
+            },
+          }, item.idempotencyKey ? `${targetRecord.name}\u0000${item.idempotencyKey}` : undefined);
+        });
+        const rejected = reservations.find((reservation) => !reservation.accepted);
+        if (rejected) {
+          const retryAfterMs = rejected.retryAfterMs ?? LIFECYCLE_RATE_LIMIT_WINDOW_MS;
+          res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': String(Math.ceil(retryAfterMs / 1000)) });
+          res.end(JSON.stringify({ ok: false, error: 'rate limit exceeded', retryAfterMs }));
+          return;
+        }
+        const queued = targetRecords.filter((_target, index) => reservations[index]!.queued).map((target) => target.name);
+        res.writeHead(202, { 'Content-Type': 'application/json' });
+        if (isBatch) {
+          res.end(JSON.stringify({ ok: true, accepted: true, targets: targetRecords.map((target) => target.name), ...(queued.length ? { queued } : {}) }));
+        } else {
+          res.end(JSON.stringify({ ok: true, accepted: true, target: targetRecords[0]!.name, reset: items[0]!.reset, ...(queued.length ? { queued: true } : {}) }));
+        }
       } catch (err) {
         const status = (err as Error).message === 'body too large' ? 413 : 400;
         res.writeHead(status, { 'Content-Type': 'application/json' });

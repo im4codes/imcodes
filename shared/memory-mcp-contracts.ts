@@ -283,6 +283,7 @@ export const MEMORY_MCP_CAPS = {
 
 /** Local daemon ingress used by the stdio MCP child for exact-session restart. */
 export const MEMORY_MCP_SESSION_RESTART_HOOK_PATH = '/session/restart' as const;
+export const MEMORY_MCP_SESSION_RESTART_BATCH_HOOK_PATH = '/session/restart-batch' as const;
 /** Local daemon ingress for the model tools (list / switch by exact session name). */
 export const MEMORY_MCP_SESSION_MODEL_LIST_HOOK_PATH = '/session/models' as const;
 export const MEMORY_MCP_SESSION_MODEL_SET_HOOK_PATH = '/session/model' as const;
@@ -743,10 +744,21 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   [MEMORY_MCP_TOOL_NAMES.SESSION_RESTART]: {
     name: MEMORY_MCP_TOOL_NAMES.SESSION_RESTART,
     description: 'Restart an exact existing current-project session; never creates one. Default resumes prior conversation. reset=true keeps the session but starts over.',
-    inputSchema: objectSchema({
-      target: stringSchema('Canonical session name; no label, wildcard, or broadcast.'),
-      reset: booleanSchema('Omit/false to restart and resume; true to reset and start over.'),
-    }, ['target']),
+    inputSchema: {
+      type: 'object', additionalProperties: false,
+      description: 'Restart one exact session, or submit a bounded batch. Batch items may carry an idempotencyKey.',
+      properties: {
+        target: stringSchema('Canonical session name; no label, wildcard, or broadcast.'),
+        reset: booleanSchema('Omit/false to restart and resume; true to reset and start over.'),
+        targets: { type: 'array', maxItems: 50, items: { type: 'object', additionalProperties: false, required: ['target'], properties: {
+          target: stringSchema('Canonical session name.'),
+          reset: booleanSchema('Omit/false to restart and resume; true to reset and start over.'),
+          idempotencyKey: stringSchema('Stable retry key for this target.'),
+        } } },
+        idempotencyKey: stringSchema('Stable retry key for this target.'),
+      },
+      anyOf: [{ required: ['target'] }, { required: ['targets'] }],
+    },
     outputSchema: objectSchema({
       status: stringSchema('Result status.'),
       target: stringSchema('Accepted session name.'),
@@ -1221,6 +1233,8 @@ export interface MemoryMcpErrorResult extends Record<string, unknown> {
   reason: MCPErrorReason;
   message?: string;
   recoverable: boolean;
+  retryAfterMs?: number;
+  retryAt?: number;
 }
 
 export interface MemoryMcpDisabledResult extends Record<string, unknown> {
@@ -1231,12 +1245,14 @@ export interface MemoryMcpDisabledResult extends Record<string, unknown> {
   recoverable: true;
 }
 
-export function buildMcpErrorResult(reason: MCPErrorReason, message?: string): MemoryMcpErrorResult {
+export function buildMcpErrorResult(reason: MCPErrorReason, message?: string, details?: { retryAfterMs?: number; retryAt?: number }): MemoryMcpErrorResult {
   return {
     status: 'error',
     reason,
     ...(message ? { message } : {}),
     recoverable: isRecoverableMcpErrorReason(reason),
+    ...(details?.retryAfterMs !== undefined ? { retryAfterMs: details.retryAfterMs } : {}),
+    ...(details?.retryAt !== undefined ? { retryAt: details.retryAt } : {}),
   };
 }
 

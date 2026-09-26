@@ -44,6 +44,7 @@ import type { ContextNamespace } from '../../shared/context-types.js';
 import {
   MEMORY_MCP_SEND_DELIVERY_MODES,
   MEMORY_MCP_SESSION_RESTART_HOOK_PATH,
+  MEMORY_MCP_SESSION_RESTART_BATCH_HOOK_PATH,
   MEMORY_MCP_SESSION_MODEL_LIST_HOOK_PATH,
   MEMORY_MCP_SESSION_MODEL_SET_HOOK_PATH,
   MEMORY_MCP_TOOL_NAMES,
@@ -437,7 +438,19 @@ export async function postHookSend(
       res.on('end', () => {
         try {
           const parsed = raw ? JSON.parse(raw) as Record<string, unknown> : {};
-          if (((res.statusCode ?? 500) >= 400 || parsed.ok === false) && !acceptStructuredError) {
+          const statusCode = res.statusCode ?? 500;
+          const retryAfterHeader = res.headers['retry-after'];
+          const retryAfterSeconds = typeof retryAfterHeader === 'string' ? Number(retryAfterHeader) : Number(Array.isArray(retryAfterHeader) ? retryAfterHeader[0] : NaN);
+          const retryAfterMs = statusCode === 429 && Number.isFinite(retryAfterSeconds)
+            ? Math.max(0, Math.ceil(retryAfterSeconds * 1000))
+            : typeof parsed.retryAfterMs === 'number' ? parsed.retryAfterMs : undefined;
+          if (retryAfterMs !== undefined) parsed.retryAfterMs = retryAfterMs;
+          if ((statusCode >= 400 || parsed.ok === false) && !acceptStructuredError) {
+            if (statusCode === 429) {
+              const error = new HookRateLimitError(typeof parsed.error === 'string' ? parsed.error : 'rate limit exceeded', retryAfterMs);
+              reject(error);
+              return;
+            }
             reject(new Error(typeof parsed.error === 'string' ? parsed.error : `hook send failed with status ${res.statusCode ?? 0}`));
             return;
           }
@@ -456,6 +469,19 @@ export async function postHookSend(
     req.write(data);
     req.end();
   });
+}
+
+export class HookRateLimitError extends Error {
+  readonly name = 'HookRateLimitError';
+  readonly statusCode = 429;
+  readonly retryAfterMs?: number;
+  readonly retryAt?: number;
+
+  constructor(message: string, retryAfterMs?: number) {
+    super(message);
+    this.retryAfterMs = retryAfterMs;
+    this.retryAt = retryAfterMs === undefined ? undefined : Date.now() + retryAfterMs;
+  }
 }
 
 /**
@@ -599,6 +625,16 @@ export function mergeDefaultToolDeps(
         reset: restartOptions.reset,
       }, MEMORY_MCP_SESSION_RESTART_HOOK_PATH, caller.sessionName);
       return response.accepted === true;
+    }),
+    restartSessionBatch: toolDeps.restartSessionBatch ?? (async (targets) => {
+      const port = await resolveHookPort();
+      if (!port) throw new Error('daemon session restart control is unavailable');
+      if (!caller.sessionName) throw new Error('session_restart requires a scoped caller');
+      const response = await postHookSend(port, {
+        from: caller.sessionName,
+        targets: targets.map((item) => ({ target: item.target.name, reset: item.reset, ...(item.idempotencyKey ? { idempotencyKey: item.idempotencyKey } : {}) })),
+      }, MEMORY_MCP_SESSION_RESTART_BATCH_HOOK_PATH, caller.sessionName);
+      return response;
     }),
     listSessionModels: toolDeps.listSessionModels ?? (async (target) => {
       const port = await resolveHookPort();

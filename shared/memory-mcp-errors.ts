@@ -46,6 +46,20 @@ export const MCP_ERROR_REASONS = {
   TARGET_UNAVAILABLE: 'target_unavailable',
 } as const;
 
+/** Details preserved when a daemon hook rejects a request with HTTP 429. */
+export interface McpRateLimitDetails {
+  retryAfterMs?: number;
+  retryAt?: number;
+}
+
+/** Detect a rate-limit error crossing the daemon/MCP process boundary. */
+export function isMcpRateLimitError(value: unknown): value is Error & McpRateLimitDetails {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as { name?: unknown; statusCode?: unknown; retryAfterMs?: unknown };
+  return (candidate.name === 'HookRateLimitError' || candidate.statusCode === 429)
+    && (candidate.retryAfterMs === undefined || typeof candidate.retryAfterMs === 'number');
+}
+
 export type MCPErrorReason = (typeof MCP_ERROR_REASONS)[keyof typeof MCP_ERROR_REASONS];
 
 export const RECOVERABLE_MCP_ERROR_REASONS: ReadonlySet<MCPErrorReason> = new Set([

@@ -37,7 +37,7 @@ import {
   type MemoryMcpSendDeliveryMode,
   type MemoryMcpToolName,
 } from '../../shared/memory-mcp-contracts.js';
-import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
+import { isMcpRateLimitError, MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
 import {
   NODE_ROLE,
   ENROLLMENT_OSES,
@@ -390,6 +390,7 @@ export interface MemoryMcpToolDeps {
     target: SessionRecord,
     options: { reset: boolean },
   ) => Promise<boolean> | boolean;
+  restartSessionBatch?: (targets: Array<{ target: SessionRecord; reset: boolean; idempotencyKey?: string }>) => Promise<Record<string, unknown>> | Record<string, unknown>;
   /** Daemon-owned model control by exact session name (no ownership check). */
   listSessionModels?: (target: string) => Promise<Record<string, unknown>>;
   setSessionModel?: (target: string, model?: string, thinking?: string) => Promise<Record<string, unknown>>;
@@ -657,8 +658,8 @@ function disabled(disabledFlag: string, extra: Record<string, unknown> = {}): To
   return buildMcpDisabledResult(disabledFlag, extra);
 }
 
-function error(reason: MCPErrorReason, message?: string): ToolResult {
-  return buildMcpErrorResult(reason, message);
+function error(reason: MCPErrorReason, message?: string, details?: { retryAfterMs?: number; retryAt?: number }): ToolResult {
+  return buildMcpErrorResult(reason, message, details);
 }
 
 
@@ -2287,20 +2288,51 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       };
     },
     [MEMORY_MCP_TOOL_NAMES.SESSION_RESTART]: async (input) => {
-      const args = pickAllowedMcpArgs(input, ['target', 'reset']);
-      const resolved = await resolveRestartTarget(stringArg(args, 'target'));
-      if (resolved.status === 'error') return resolved.result;
-      if (!deps.restartSession) {
+      const args = pickAllowedMcpArgs(input, ['target', 'targets', 'reset', 'idempotencyKey']);
+      const rawTargets = Array.isArray(args.targets)
+        ? args.targets.map((entry) => {
+          if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+          const record = entry as Record<string, unknown>;
+          return {
+            target: stringArg(record, 'target'),
+            reset: typeof record.reset === 'boolean' ? record.reset : false,
+            idempotencyKey: stringArg(record, 'idempotencyKey'),
+          };
+        })
+        : [{ target: stringArg(args, 'target'), reset: boolArg(args, 'reset') === true, idempotencyKey: stringArg(args, 'idempotencyKey') }];
+      if (rawTargets.length === 0 || rawTargets.some((entry) => !entry?.target)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'target is required');
+      }
+      const resolvedTargets: Array<{ target: SessionRecord; reset: boolean; idempotencyKey?: string }> = [];
+      for (const entry of rawTargets) {
+        const resolved = await resolveRestartTarget(entry!.target);
+        if (resolved.status === 'error') return resolved.result;
+        resolvedTargets.push({ target: resolved.target, reset: entry!.reset, ...(entry!.idempotencyKey ? { idempotencyKey: entry!.idempotencyKey } : {}) });
+      }
+      const isBatch = Array.isArray(args.targets);
+      if (isBatch && !deps.restartSessionBatch) {
+        return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'daemon session restart batch control is unavailable');
+      }
+      if (!isBatch && !deps.restartSession) {
         return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'daemon session restart control is unavailable');
       }
-      const reset = boolArg(args, 'reset') === true;
       try {
-        const scheduled = await deps.restartSession(resolved.target, { reset });
+        if (isBatch) {
+          const response = await deps.restartSessionBatch!(resolvedTargets);
+          return { status: 'ok', targets: resolvedTargets.map((entry) => entry.target.name), scheduled: true, ...response };
+        }
+        const scheduled = await deps.restartSession!(resolvedTargets[0]!.target, { reset: resolvedTargets[0]!.reset });
         if (!scheduled) {
           return error(MCP_ERROR_REASONS.TARGET_UNAVAILABLE, 'session restart was not accepted');
         }
-        return { status: 'ok', target: resolved.target.name, reset, scheduled: true };
+        return { status: 'ok', target: resolvedTargets[0]!.target.name, reset: resolvedTargets[0]!.reset, scheduled: true };
       } catch (restartError) {
+        if (isMcpRateLimitError(restartError)) {
+          return error(MCP_ERROR_REASONS.RATE_LIMITED, sanitizeMcpErrorMessage(restartError), {
+            retryAfterMs: restartError.retryAfterMs,
+            retryAt: restartError.retryAt,
+          });
+        }
         return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, sanitizeMcpErrorMessage(restartError));
       }
     },
@@ -2317,6 +2349,12 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
           ? await deps.setSessionModel!(target, model || undefined, thinking || undefined)
           : await deps.listSessionModels!(target);
       } catch (controlError) {
+        if (isMcpRateLimitError(controlError)) {
+          return error(MCP_ERROR_REASONS.RATE_LIMITED, sanitizeMcpErrorMessage(controlError), {
+            retryAfterMs: controlError.retryAfterMs,
+            retryAt: controlError.retryAt,
+          });
+        }
         return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, sanitizeMcpErrorMessage(controlError));
       }
     },
@@ -3782,9 +3820,19 @@ const schemas = {
     target: z.string().optional().describe('Exact session name; defaults to the current session.'),
   }).strict(),
   [MEMORY_MCP_TOOL_NAMES.SESSION_RESTART]: z.object({
-    target: z.string().trim().min(1).describe('Exact session name.'),
+    target: z.string().trim().min(1).optional().describe('Exact session name.'),
     reset: z.boolean().optional().describe('False/omitted: resume. True: start over.'),
-  }).strict(),
+    idempotencyKey: z.string().trim().min(1).optional(),
+    targets: z.array(z.object({
+      target: z.string().trim().min(1),
+      reset: z.boolean().optional(),
+      idempotencyKey: z.string().trim().min(1).optional(),
+    }).strict()).min(1).max(50).optional(),
+  }).strict().superRefine((value, context) => {
+    if (Boolean(value.target) === Boolean(value.targets)) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: 'provide exactly one of target or targets' });
+    }
+  }),
   [MEMORY_MCP_TOOL_NAMES.SESSION_MODEL]: z.object({
     target: z.string().trim().min(1).optional().describe('Exact session name; default caller.'),
     model: z.string().trim().max(200).optional().describe('Model id to switch to; empty/omitted keeps the current model.'),
