@@ -29,6 +29,7 @@ import {
 } from './computer-use.js';
 import { FILE_TRANSFER_PATH_MAX_BYTES } from './transport/file-transfer.js';
 import { MACHINE_FILE_TRANSFER_TRANSPORT } from './machine-direct-file-transfer.js';
+import { TRANSPORT_EFFORT_LEVELS } from './effort-levels.js';
 import {
   MACHINE_TARGET_MAX,
   MACHINE_TARGET_PATTERN,
@@ -755,10 +756,11 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SESSION_MODEL]: {
     name: MEMORY_MCP_TOOL_NAMES.SESSION_MODEL,
-    description: 'Exact session model: omit model to list current and switchable models; set model to switch now.',
+    description: 'Get or switch an exact session model and thinking level. Omit/empty both to list current model, thinking, and supported choices; set either or both to switch (model applies before thinking).',
     inputSchema: objectSchema({
       target: stringSchema('Exact session name; default caller.'),
-      model: stringSchema('Model id to switch to.'),
+      model: stringSchema('Model id to switch to; empty/omitted keeps the current model.'),
+      thinking: stringSchema('Thinking/effort level to switch to; empty/omitted keeps the current level.', { enum: [...TRANSPORT_EFFORT_LEVELS] }),
     }),
     outputSchema: statusSchema,
   },

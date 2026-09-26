@@ -49,8 +49,8 @@ function post(port: number, path: string, sender: string, body: Record<string, u
 describe('hook-server session model control', () => {
   let server: http.Server;
   let port: number;
-  const switchSessionModel = vi.fn(async (sessionName: string, model: string) => ({
-    ok: true as const, sessionName, agentType: 'claude-code-sdk', model, previousModel: 'sonnet',
+  const switchSessionModel = vi.fn(async (sessionName: string, model?: string, thinking?: string) => ({
+    ok: true as const, sessionName, agentType: 'claude-code-sdk', model, previousModel: 'sonnet', ...(thinking ? { thinking } : {}),
   }));
   const listSessionModels = vi.fn(async (sessionName: string) => ({
     ok: true as const, sessionName, agentType: 'claude-code-sdk', currentModel: 'sonnet', models: ['sonnet', 'haiku'], acceptsAnyModel: false,
@@ -78,7 +78,13 @@ describe('hook-server session model control', () => {
       status: 200,
       body: { status: 'ok', sessionName: target.name, agentType: 'claude-code-sdk', model: 'haiku', previousModel: 'sonnet' },
     });
-    expect(switchSessionModel).toHaveBeenCalledWith(target.name, 'haiku');
+    expect(switchSessionModel).toHaveBeenCalledWith(target.name, 'haiku', undefined);
+  });
+
+  it('switches thinking without requiring a model', async () => {
+    const response = await post(port, MEMORY_MCP_SESSION_MODEL_SET_HOOK_PATH, caller.name, { from: caller.name, to: target.name, thinking: 'high' });
+    expect(response.body).toMatchObject({ status: 'ok', thinking: 'high' });
+    expect(switchSessionModel).toHaveBeenCalledWith(target.name, undefined, 'high');
   });
 
   it('lists a session\'s models', async () => {

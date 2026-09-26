@@ -615,11 +615,11 @@ export function mergeDefaultToolDeps(
         ...(response.result && typeof response.result === 'object' ? { result: response.result as Record<string, unknown> } : {}),
       };
     } : undefined),
-    setSessionModel: toolDeps.setSessionModel ?? (async (target, model) => {
+    setSessionModel: toolDeps.setSessionModel ?? (async (target, model, thinking) => {
       const port = await resolveHookPort();
       if (!port) throw new Error('daemon model control is unavailable');
       if (!caller.sessionName) throw new Error('session_model requires a scoped caller');
-      return postHookSend(port, { from: caller.sessionName, to: target, model }, MEMORY_MCP_SESSION_MODEL_SET_HOOK_PATH, caller.sessionName);
+      return postHookSend(port, { from: caller.sessionName, to: target, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}) }, MEMORY_MCP_SESSION_MODEL_SET_HOOK_PATH, caller.sessionName);
     }),
     // FULL-node machine tools relay through the daemon's own bound credential.
     // An injected override (tests) wins; otherwise the daemon default is used.

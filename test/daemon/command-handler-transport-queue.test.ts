@@ -374,6 +374,7 @@ import {
   handleWebCommand,
   listSessionModelsNow,
   switchSessionModelNow,
+  switchSessionThinkingNow,
   restartSessionNow,
   __invalidateTransportListModelsCacheForTests,
   __resetTransportListModelsCacheForTests,
@@ -4471,11 +4472,42 @@ describe('handleWebCommand transport queue behavior', () => {
 
     it('lists what a Claude session accepts, with its current model', async () => {
       getSessionMock.mockReturnValue({
-        name: 'deck_sub_cc1', projectName: 'p', role: 'w1', agentType: 'claude-code-sdk', runtimeType: 'transport', state: 'running', activeModel: 'sonnet',
+        name: 'deck_sub_cc1', projectName: 'p', role: 'w1', agentType: 'claude-code-sdk', runtimeType: 'transport', state: 'running', activeModel: 'sonnet', effort: 'medium',
       });
       await expect(listSessionModelsNow('deck_sub_cc1')).resolves.toMatchObject({
-        ok: true, agentType: 'claude-code-sdk', currentModel: 'sonnet', acceptsAnyModel: false, models: expect.arrayContaining(['sonnet', 'haiku']),
+        ok: true, agentType: 'claude-code-sdk', currentModel: 'sonnet', currentThinking: 'medium', thinkingLevels: ['low', 'medium', 'high', 'max'], acceptsAnyModel: false, models: expect.arrayContaining(['sonnet', 'haiku']),
       });
+    });
+
+    it('switches thinking only, live when the transport runtime is loaded', async () => {
+      const setEffort = vi.fn();
+      getSessionMock.mockReturnValue({ name: 'deck_sub_effort', projectName: 'p', role: 'w1', agentType: 'claude-code-sdk', runtimeType: 'transport', state: 'running', effort: 'low' });
+      getTransportRuntimeMock.mockReturnValue({ setEffort, pendingCount: 0 });
+      await expect(switchSessionModelNow('deck_sub_effort', undefined, 'high')).resolves.toMatchObject({ ok: true, thinking: 'high', previousThinking: 'low', applied: 'live' });
+      expect(setEffort).toHaveBeenCalledWith('high');
+    });
+
+    it('switches both in model-then-thinking order', async () => {
+      const setAgentId = vi.fn();
+      const setEffort = vi.fn();
+      getSessionMock.mockReturnValue({ name: 'deck_sub_both', projectName: 'p', role: 'w1', agentType: 'claude-code-sdk', runtimeType: 'transport', state: 'running', activeModel: 'opus', effort: 'low' });
+      getTransportRuntimeMock.mockReturnValue({ setAgentId, setEffort, pendingCount: 0 });
+      await expect(switchSessionModelNow('deck_sub_both', 'sonnet', 'max')).resolves.toMatchObject({ ok: true, model: 'sonnet', thinking: 'max', thinkingApplied: 'live' });
+      expect(setAgentId).toHaveBeenCalledWith('sonnet');
+      expect(setEffort).toHaveBeenCalledWith('max');
+      expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({ requestedModel: 'sonnet' }));
+      expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({ effort: 'max' }));
+    });
+
+    it('returns the agent-supported levels for an invalid thinking request', async () => {
+      getSessionMock.mockReturnValue({ name: 'deck_sub_bad_effort', projectName: 'p', role: 'w1', agentType: 'codex-sdk', runtimeType: 'transport', state: 'idle' });
+      getTransportRuntimeMock.mockReturnValue(undefined);
+      await expect(switchSessionThinkingNow('deck_sub_bad_effort', 'adaptive')).resolves.toMatchObject({ ok: false, code: 'unknown_thinking_level', availableThinkingLevels: ['minimal', 'low', 'medium', 'high', 'xhigh'] });
+    });
+
+    it('rejects thinking control for agents without effort support', async () => {
+      getSessionMock.mockReturnValue({ name: 'deck_sub_unsupported_effort', projectName: 'p', role: 'w1', agentType: 'cursor-headless', runtimeType: 'transport', state: 'idle' });
+      await expect(switchSessionThinkingNow('deck_sub_unsupported_effort', 'high')).resolves.toMatchObject({ ok: false, code: 'thinking_unsupported' });
     });
   });
 

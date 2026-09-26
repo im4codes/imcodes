@@ -15,6 +15,7 @@ import {
   type SessionModelControlError,
   type SessionModelListResult,
   type SessionModelSwitchResult,
+  type SessionThinkingSwitchResult,
 } from '../../shared/session-model-control.js';
 import { startProject, stopProject, teardownProject, getTransportRuntime, launchTransportSession, isProviderSessionBound, persistSessionRecord, relaunchSessionWithSettings, stopTransportRuntimeSession, type ProjectConfig } from '../agent/session-manager.js';
 import { buildTransportResumeLaunchOpts } from '../agent/transport-resume-opts.js';
@@ -291,6 +292,7 @@ import {
   COPILOT_SDK_EFFORT_LEVELS,
   DEFAULT_TRANSPORT_EFFORT,
   OPENCLAW_THINKING_LEVELS,
+  PI_EFFORT_LEVELS,
   QWEN_EFFORT_LEVELS,
   isTransportEffortLevel,
   type TransportEffortLevel,
@@ -1151,7 +1153,55 @@ function getSupportedEffortLevels(agentType: string | undefined): readonly Trans
           ? QWEN_EFFORT_LEVELS
           : agentType === 'openclaw'
             ? OPENCLAW_THINKING_LEVELS
-            : [];
+            : agentType === 'pi'
+              ? PI_EFFORT_LEVELS
+              : [];
+}
+
+async function applyTransportEffortSwitch(
+  record: SessionRecord,
+  transportRuntime: TransportSessionRuntime | undefined,
+  requested: string,
+  serverLink?: ServerLink,
+): Promise<SessionThinkingSwitchResult> {
+  const sessionName = record.name;
+  const agentType = record.agentType ?? '';
+  const allowed = getSupportedEffortLevels(agentType);
+  if (!allowed.length) {
+    return { ok: false, sessionName, code: SESSION_MODEL_CONTROL_ERROR.THINKING_UNSUPPORTED, error: `Thinking control is not available for ${agentType || 'this session'}` };
+  }
+  if (!isTransportEffortLevel(requested) || !allowed.includes(requested)) {
+    return {
+      ok: false,
+      sessionName,
+      code: SESSION_MODEL_CONTROL_ERROR.UNKNOWN_THINKING_LEVEL,
+      error: `Unsupported thinking level: ${requested}. Supported: ${allowed.join(', ')}`,
+      availableThinkingLevels: [...allowed],
+    };
+  }
+  const previousThinking = record.effort;
+  transportRuntime?.setEffort(requested);
+  const nextRecord = { ...record, effort: requested, updatedAt: Date.now() };
+  upsertSession(nextRecord);
+  persistSessionRecord(nextRecord, sessionName);
+  if (serverLink) {
+    await handleGetSessions(serverLink);
+    syncSubSessionIfNeeded(sessionName, serverLink);
+  }
+  timelineEmitter.emit(sessionName, 'assistant.text', {
+    ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.THINKING_LEVEL_SWITCHED, `Switched thinking level to ${requested}`, { level: requested }),
+    streaming: false,
+    automation: true,
+    memoryExcluded: true,
+  }, { source: 'daemon', confidence: 'high' });
+  return {
+    ok: true,
+    sessionName,
+    agentType,
+    thinking: requested,
+    ...(previousThinking ? { previousThinking } : {}),
+    applied: transportRuntime ? SESSION_MODEL_APPLIED.LIVE : SESSION_MODEL_APPLIED.NEXT_START,
+  };
 }
 
 function getDefaultThinkingLevel(agentType: string | undefined): TransportEffortLevel | undefined {
@@ -2909,17 +2959,40 @@ function resolveModelControlTarget(sessionName: string):
  * another session never matched. Deliberately no caller/ownership check: the
  * exact session name is the only requirement.
  */
-export async function switchSessionModelNow(sessionName: string, model: string): Promise<SessionModelSwitchResult> {
-  const requested = model.trim();
+export async function switchSessionModelNow(sessionName: string, model?: string, thinking?: string): Promise<SessionModelSwitchResult | SessionThinkingSwitchResult> {
+  const requested = model?.trim();
   const target = resolveModelControlTarget(sessionName);
-  if (!target.ok) return { ok: false, sessionName, code: target.code, error: target.error };
-  if (!requested || /\s/.test(requested)) {
+  if (requested && !target.ok) return { ok: false, sessionName, code: target.code, error: target.error };
+  if (requested && /\s/.test(requested)) {
     return { ok: false, sessionName, code: SESSION_MODEL_CONTROL_ERROR.UNKNOWN_MODEL, error: 'model must be a single model id' };
   }
+  if (!requested) return switchSessionThinkingNow(sessionName, thinking ?? '');
+  if (!target.ok) return { ok: false, sessionName, code: target.code, error: target.error };
   const release = await getMutex(sessionName).acquire();
   try {
     const latest = getSession(sessionName) ?? target.record;
-    return await applyTransportModelSwitch(latest, target.runtime, requested);
+    const switched = await applyTransportModelSwitch(latest, target.runtime, requested);
+    if (!switched.ok || !thinking?.trim()) return switched;
+    const effortRecord = getSession(sessionName) ?? { ...latest, requestedModel: switched.model, activeModel: switched.model };
+    const effort = await applyTransportEffortSwitch(effortRecord, target.runtime, thinking.trim());
+    if (!effort.ok) return effort;
+    return { ...switched, thinking: effort.thinking, ...(effort.previousThinking ? { previousThinking: effort.previousThinking } : {}), thinkingApplied: effort.applied };
+  } finally {
+    release();
+  }
+}
+
+export async function switchSessionThinkingNow(sessionName: string, thinking: string): Promise<SessionThinkingSwitchResult> {
+  const record = getSession(sessionName);
+  if (!record) return { ok: false, sessionName, code: SESSION_MODEL_CONTROL_ERROR.SESSION_NOT_FOUND, error: `No session named ${sessionName}` };
+  const isTransport = record.runtimeType === 'transport' || isTransportAgent(record.agentType);
+  if (!isTransport || !supportsEffort(record.agentType)) {
+    return { ok: false, sessionName, code: SESSION_MODEL_CONTROL_ERROR.THINKING_UNSUPPORTED, error: `Thinking control is not available for ${record.agentType ?? 'this session'}` };
+  }
+  const release = await getMutex(sessionName).acquire();
+  try {
+    const latest = getSession(sessionName) ?? record;
+    return await applyTransportEffortSwitch(latest, getTransportRuntime(sessionName), thinking.trim());
   } finally {
     release();
   }
@@ -2944,7 +3017,9 @@ export async function listSessionModelsNow(sessionName: string): Promise<Session
       sessionName,
       agentType,
       ...(currentModel ? { currentModel } : {}),
+      ...(record.effort ?? getDefaultThinkingLevel(agentType) ? { currentThinking: record.effort ?? getDefaultThinkingLevel(agentType) } : {}),
       models: validated.models,
+      thinkingLevels: [...getSupportedEffortLevels(agentType)],
       acceptsAnyModel: false,
       ...(record.ccPreset && agentType === 'claude-code-sdk' ? { note: `preset ${record.ccPreset}` } : {}),
     };
@@ -2965,7 +3040,9 @@ export async function listSessionModelsNow(sessionName: string): Promise<Session
     sessionName,
     agentType,
     ...(currentModel ? { currentModel } : {}),
+    ...(record.effort ?? getDefaultThinkingLevel(agentType) ? { currentThinking: record.effort ?? getDefaultThinkingLevel(agentType) } : {}),
     models: listed.models.map((model) => model.id),
+    thinkingLevels: [...getSupportedEffortLevels(agentType)],
     // Providers without a validated list take any id; this is their picker list.
     acceptsAnyModel: isGenericModelSwitchAgent(agentType),
     ...(note ? { note } : {}),
@@ -4903,42 +4980,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       }
       if (supportsEffort(record?.agentType) && effortMatch) {
         const nextEffort = effortMatch[1];
-        const allowed = getSupportedEffortLevels(record?.agentType);
-        if (!isTransportEffortLevel(nextEffort) || !allowed.includes(nextEffort)) {
-          const supported = allowed.join(', ');
-          emitTransportUserMessage(text);
-          timelineEmitter.emit(sessionName, 'assistant.text', {
-            ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.THINKING_LEVEL_UNSUPPORTED, `⚠️ Unsupported thinking level: ${nextEffort}. Supported: ${supported}`, {
-              level: nextEffort,
-              supported,
-              detail: `Supported: ${supported}`,
-            }),
-            streaming: false,
-            memoryExcluded: true,
-          }, { source: 'daemon', confidence: 'high' });
-          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unsupported thinking level: ${nextEffort}` });
-          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: `Unsupported thinking level: ${nextEffort}` });
-          return;
-        }
-        transportRuntime.setEffort(nextEffort);
-        const nextRecord = {
-          ...record,
-          effort: nextEffort,
-          updatedAt: Date.now(),
-        };
-        upsertSession(nextRecord);
-        persistSessionRecord(nextRecord, sessionName);
-        await handleGetSessions(serverLink);
-        syncSubSessionIfNeeded(sessionName, serverLink);
         emitTransportUserMessage(text);
-        timelineEmitter.emit(sessionName, 'assistant.text', {
-          ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.THINKING_LEVEL_SWITCHED, `Switched thinking level to ${nextEffort}`, { level: nextEffort }),
-          streaming: false,
-          automation: true,
-          memoryExcluded: true,
-        }, { source: 'daemon', confidence: 'high' });
-        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
+        const result = await applyTransportEffortSwitch(record, transportRuntime, nextEffort, serverLink);
+        const status = result.ok ? (isLegacy ? 'accepted_legacy' : 'accepted') : 'error';
+        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status, ...(!result.ok ? { error: result.error } : {}) });
+        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status, ...(!result.ok ? { error: result.error } : {}) });
         return;
       }
       if (record?.agentType === 'qwen' && record.qwenAuthType === 'qwen-oauth') {

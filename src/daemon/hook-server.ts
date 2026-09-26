@@ -778,7 +778,7 @@ export interface HookServerOptions {
   restartSession?: (sessionName: string, options: { reset: boolean }) => Promise<boolean> | boolean;
   /** Test seams for the session model MCP tools. */
   listSessionModels?: (sessionName: string) => Promise<import('../../shared/session-model-control.js').SessionModelListResult>;
-  switchSessionModel?: (sessionName: string, model: string) => Promise<import('../../shared/session-model-control.js').SessionModelSwitchResult>;
+  switchSessionModel?: (sessionName: string, model?: string, thinking?: string) => Promise<import('../../shared/session-model-control.js').SessionModelSwitchResult | import('../../shared/session-model-control.js').SessionThinkingSwitchResult>;
 }
 
 async function invokeDaemonMemoryMcpTool(
@@ -1208,8 +1208,9 @@ export async function startHookServer(
         const from = typeof body.from === 'string' ? body.from.trim() : '';
         const to = typeof body.to === 'string' ? body.to.trim() : '';
         const model = typeof body.model === 'string' ? body.model.trim() : '';
+        const thinking = typeof body.thinking === 'string' ? body.thinking.trim() : '';
         const isSet = url === MEMORY_MCP_SESSION_MODEL_SET_HOOK_PATH;
-        if (!from || !to || authenticatedSender !== from || (isSet && !model)) {
+        if (!from || !to || authenticatedSender !== from || (isSet && !model && !thinking)) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: 'invalid session model request' }));
           return;
@@ -1228,9 +1229,9 @@ export async function startHookServer(
         if (isSet) recordSend(from);
         const { listSessionModelsNow, switchSessionModelNow } = await import('./command-handler.js');
         const result = isSet
-          ? await (options.switchSessionModel ?? switchSessionModelNow)(to, model)
+          ? await (options.switchSessionModel ?? switchSessionModelNow)(to, model || undefined, thinking || undefined)
           : await (options.listSessionModels ?? listSessionModelsNow)(to);
-        if (isSet) logger.info({ caller: from, target: to, model, ok: result.ok }, 'MCP session model switch');
+        if (isSet) logger.info({ caller: from, target: to, model: model || undefined, thinking: thinking || undefined, ok: result.ok }, 'MCP session model/thinking switch');
         const { ok, ...rest } = result;
         const payload = ok
           ? { status: 'ok', ...rest }

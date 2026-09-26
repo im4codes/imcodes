@@ -392,7 +392,7 @@ export interface MemoryMcpToolDeps {
   ) => Promise<boolean> | boolean;
   /** Daemon-owned model control by exact session name (no ownership check). */
   listSessionModels?: (target: string) => Promise<Record<string, unknown>>;
-  setSessionModel?: (target: string, model: string) => Promise<Record<string, unknown>>;
+  setSessionModel?: (target: string, model?: string, thinking?: string) => Promise<Record<string, unknown>>;
   peerAuditReply?: (envelope: PeerAuditReplyEnvelope) => Promise<Record<string, unknown>> | Record<string, unknown>;
   inspectSupervisionWorktree?: typeof inspectSupervisionAssignmentWorktree;
   supervisionTaskRegistry?: SupervisionTaskRegistry;
@@ -2305,14 +2305,17 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       }
     },
     [MEMORY_MCP_TOOL_NAMES.SESSION_MODEL]: async (input) => {
-      const args = pickAllowedMcpArgs(input, ['target', 'model']);
+      const args = pickAllowedMcpArgs(input, ['target', 'model', 'thinking']);
       const target = stringArg(args, 'target')?.trim() || caller.sessionName;
       const model = stringArg(args, 'model')?.trim();
+      const thinking = stringArg(args, 'thinking')?.trim();
       if (!target) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'target is required');
-      const control = model ? deps.setSessionModel : deps.listSessionModels;
+      const control = model || thinking ? deps.setSessionModel : deps.listSessionModels;
       if (!control) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'daemon model control is unavailable');
       try {
-        return model ? await deps.setSessionModel!(target, model) : await deps.listSessionModels!(target);
+        return model || thinking
+          ? await deps.setSessionModel!(target, model || undefined, thinking || undefined)
+          : await deps.listSessionModels!(target);
       } catch (controlError) {
         return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, sanitizeMcpErrorMessage(controlError));
       }
@@ -3784,7 +3787,8 @@ const schemas = {
   }).strict(),
   [MEMORY_MCP_TOOL_NAMES.SESSION_MODEL]: z.object({
     target: z.string().trim().min(1).optional().describe('Exact session name; default caller.'),
-    model: z.string().trim().min(1).max(200).optional().describe('Model id to switch to.'),
+    model: z.string().trim().max(200).optional().describe('Model id to switch to; empty/omitted keeps the current model.'),
+    thinking: z.string().trim().max(40).optional().describe('Thinking/effort level to switch to; empty/omitted keeps the current level.'),
   }).strict(),
   [MEMORY_MCP_TOOL_NAMES.VERIFICATION_MACHINE_LIST]: z.object({
     includeDisabled: z.boolean().optional(),
