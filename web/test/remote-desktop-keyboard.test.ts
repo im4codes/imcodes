@@ -313,18 +313,19 @@ describe('clipboard shortcuts', () => {
       .toBeNull();
   });
 
-  it('still delivers only a PC operator\'s plain Control+C to a Linux target', () => {
+  it('forwards Linux terminal Control+C and Control+Shift+C after reading selection', () => {
     // The Linux worker reads the selection without pressing anything, so the
     // keystroke has to arrive for itself: it interrupts a remote terminal.
     expect(shouldForwardRemoteDesktopCopyKeystroke(key({ ctrlKey: true }), 'Win32', 'linux')).toBe(true);
     expect(shouldForwardRemoteDesktopCopyKeystroke(key({ ctrlKey: true }), 'Linux x86_64', 'linux')).toBe(true);
+    expect(shouldForwardRemoteDesktopCopyKeystroke(key({ ctrlKey: true, shiftKey: true }), 'Win32', 'linux')).toBe(true);
     // A Mac operator's Command+C would arrive as that interrupt.
     expect(shouldForwardRemoteDesktopCopyKeystroke(key({ metaKey: true }), 'MacIntel', 'linux')).toBe(false);
-    expect(shouldForwardRemoteDesktopCopyKeystroke(key({ ctrlKey: true, shiftKey: true }), 'Win32', 'linux')).toBe(false);
     expect(shouldForwardRemoteDesktopCopyKeystroke(key({ code: 'Insert', ctrlKey: true }), 'Win32', 'linux')).toBe(false);
     expect(shouldForwardRemoteDesktopCopyKeystroke(key({ ctrlKey: true }), 'Win32', 'windows')).toBe(false);
     expect(shouldForwardRemoteDesktopCopyKeystroke(key({ metaKey: true }), 'MacIntel', 'macos')).toBe(false);
   });
+
 });
 
 describe('shortcut translation between Mac and PC keyboards', () => {

@@ -2412,6 +2412,10 @@ export function RemoteDesktopPanel({
       } else if (clipboardShortcut === REMOTE_DESKTOP_CLIPBOARD_SHORTCUT.CUT) {
         void cutRemoteSelection();
       } else {
+        // Some browsers still emit a paste event after a handled keydown.
+        // Mark the shortcut before the async clipboard read so onPaste can
+        // suppress that duplicate payload while this one-shot paste runs.
+        forwardedPasteShortcutAtRef.current = Date.now();
         void pasteLocalClipboard();
       }
       return;
@@ -2531,7 +2535,7 @@ export function RemoteDesktopPanel({
 
   const sendPastedText = (text: string): boolean => {
     if (!snapshot.inputEnabled || !text) return false;
-    const sent = clientRef.current?.text(text) ?? false;
+    const sent = clientRef.current?.pasteText(text) ?? false;
     if (sent) stageRef.current?.focus({ preventScroll: true });
     return sent;
   };

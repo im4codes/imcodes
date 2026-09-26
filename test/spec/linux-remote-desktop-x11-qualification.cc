@@ -19,6 +19,7 @@
 #include <cstring>
 #include <atomic>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -233,9 +234,9 @@ int main() {
   int root_y = 0;
   int win_x = 0;
   int win_y = 0;
-  unsigned int mask = 0;
+  unsigned int pointer_state_mask = 0;
   if (XQueryPointer(display, root, &root_return, &child_return, &root_x, &root_y,
-                    &win_x, &win_y, &mask) == False) {
+                    &win_x, &win_y, &pointer_state_mask) == False) {
     XCloseDisplay(display);
     return 21;
   }
@@ -255,19 +256,19 @@ int main() {
   }
   XSync(display, False);
   XQueryPointer(display, root, &root_return, &child_return, &root_x, &root_y,
-                &win_x, &win_y, &mask);
-  const bool pressed_seen = (mask & kButton1Mask) != 0;
+                &win_x, &win_y, &pointer_state_mask);
+  const bool pressed_seen = (pointer_state_mask & kButton1Mask) != 0;
   XTestFakeButtonEvent(display, 1, False, 0);
   XSync(display, False);
   XQueryPointer(display, root, &root_return, &child_return, &root_x, &root_y,
-                &win_x, &win_y, &mask);
-  const bool released = (mask & kButton1Mask) == 0;
+                &win_x, &win_y, &pointer_state_mask);
+  const bool button_released = (pointer_state_mask & kButton1Mask) == 0;
   if (!pressed_seen) {
     std::fprintf(stderr, "button press not observed in server state\n");
     XCloseDisplay(display);
     return 31;
   }
-  if (!released) {
+  if (!button_released) {
     std::fprintf(stderr, "button did not release; would leak held input\n");
     XCloseDisplay(display);
     return 32;
@@ -283,13 +284,13 @@ int main() {
   XTestFakeKeyEvent(display, shift, True, 0);
   XSync(display, False);
   XQueryPointer(display, root, &root_return, &child_return, &root_x, &root_y,
-                &win_x, &win_y, &mask);
-  const bool shift_seen = (mask & ShiftMask) != 0;
+                &win_x, &win_y, &pointer_state_mask);
+  const bool shift_seen = (pointer_state_mask & ShiftMask) != 0;
   XTestFakeKeyEvent(display, shift, False, 0);
   XSync(display, False);
   XQueryPointer(display, root, &root_return, &child_return, &root_x, &root_y,
-                &win_x, &win_y, &mask);
-  const bool shift_cleared = (mask & ShiftMask) == 0;
+                &win_x, &win_y, &pointer_state_mask);
+  const bool shift_cleared = (pointer_state_mask & ShiftMask) == 0;
   if (!shift_seen) {
     std::fprintf(stderr, "key press not observed in server modifier state\n");
     XCloseDisplay(display);
@@ -531,6 +532,114 @@ int main() {
     }
     std::printf("EmitKey: all %zu browser-allowed codes resolved\n",
                 allowed_codes.size());
+
+    // Exercise real XTest chord sequencing on the server, not only the
+    // common ledger's fake adapter: every held Control/Shift/Alt/Super
+    // subset must remain down while every representative key-class key is
+    // injected, and every side must be up after its matching release. This
+    // catches a keysym/keycode vocabulary mismatch in the Linux modifier
+    // heal path (which would otherwise release a modifier between the two
+    // XTest transitions).
+    struct ModifierCode {
+      const char* code;
+      KeySym symbol;
+    };
+    constexpr ModifierCode modifiers[] = {
+        {"ControlLeft", XK_Control_L}, {"ShiftLeft", XK_Shift_L},
+        {"AltLeft", XK_Alt_L}, {"MetaLeft", XK_Super_L}};
+    struct KeyClassCode {
+      const char* code;
+      KeySym symbol;
+    };
+    constexpr KeyClassCode key_classes[] = {
+        {"KeyA", XK_a}, {"Digit1", XK_1}, {"Semicolon", XK_semicolon},
+        {"F1", XK_F1}, {"ArrowLeft", XK_Left}, {"Tab", XK_Tab},
+        {"Enter", XK_Return}, {"Escape", XK_Escape},
+        {"Backspace", XK_BackSpace}, {"Delete", XK_Delete},
+        {"Home", XK_Home}, {"End", XK_End}, {"PageUp", XK_Prior},
+        {"PageDown", XK_Next}};
+    for (unsigned int modifier_mask = 1; modifier_mask < (1u << 4);
+         ++modifier_mask) {
+      std::vector<std::size_t> held_modifier_indices;
+      for (std::size_t index = 0; index < 4; ++index) {
+        if ((modifier_mask & (1u << index)) == 0) continue;
+        held_modifier_indices.push_back(index);
+      }
+      for (const KeyClassCode& target : key_classes) {
+        if (std::string_view(target.code) == "Delete" &&
+            (modifier_mask & ((1u << 0) | (1u << 2))) ==
+                ((1u << 0) | (1u << 2))) {
+          continue;  // Secure-attention is deliberately not synthesized.
+        }
+        bool emitted = true;
+        for (const std::size_t index : held_modifier_indices) {
+          emitted = emitted && input.EmitKey(modifiers[index].code, true);
+        }
+        const KeyCode target_keycode = XKeysymToKeycode(display, target.symbol);
+        if (!emitted || target_keycode == 0 || !input.EmitKey(target.code, true)) {
+          std::fprintf(stderr, "failed to press modifier matrix key %s (mask %u)\n",
+                       target.code, modifier_mask);
+          input.ReleaseAllEmittedState();
+          XCloseDisplay(display);
+          return 82;
+        }
+        XSync(display, False);
+        bool all_modifiers_held = true;
+        for (const std::size_t index : held_modifier_indices) {
+          const KeyCode modifier_keycode =
+              XKeysymToKeycode(display, modifiers[index].symbol);
+          all_modifiers_held = all_modifiers_held && modifier_keycode != 0 &&
+                               key_down_at_server(modifier_keycode);
+        }
+        if (!key_down_at_server(target_keycode) || !all_modifiers_held) {
+          std::fprintf(stderr,
+                       "server did not observe %s held with modifier mask %u\n",
+                       target.code, modifier_mask);
+          input.ReleaseAllEmittedState();
+          XCloseDisplay(display);
+          return 83;
+        }
+        if (!input.EmitKey(target.code, false)) {
+          std::fprintf(stderr, "failed to release matrix key %s\n", target.code);
+          input.ReleaseAllEmittedState();
+          XCloseDisplay(display);
+          return 84;
+        }
+        for (auto index = held_modifier_indices.rbegin();
+             index != held_modifier_indices.rend(); ++index) {
+          if (!input.EmitKey(modifiers[*index].code, false)) {
+            std::fprintf(stderr, "failed to release modifier %s\n",
+                         modifiers[*index].code);
+            input.ReleaseAllEmittedState();
+            XCloseDisplay(display);
+            return 85;
+          }
+        }
+        XSync(display, False);
+        bool modifiers_released = true;
+        for (const std::size_t index : held_modifier_indices) {
+          const KeyCode modifier_keycode =
+              XKeysymToKeycode(display, modifiers[index].symbol);
+          modifiers_released = modifiers_released && modifier_keycode != 0 &&
+                               !key_down_at_server(modifier_keycode);
+        }
+        if (key_down_at_server(target_keycode) || !modifiers_released) {
+          std::fprintf(stderr,
+                       "server observed a latched key after %s / mask %u\n",
+                       target.code, modifier_mask);
+          input.ReleaseAllEmittedState();
+          XCloseDisplay(display);
+          return 86;
+        }
+      }
+    }
+    if (input.held_count() != 0) {
+      std::fprintf(stderr, "modifier matrix left %zu key(s) held\n",
+                   input.held_count());
+      XCloseDisplay(display);
+      return 87;
+    }
+    std::printf("XTest modifier matrix: all supported combinations held through key and released\n");
   }
 
   // -- A session starts on a clean keyboard. A modifier whose key-up never

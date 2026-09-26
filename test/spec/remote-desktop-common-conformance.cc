@@ -457,6 +457,67 @@ int main() {
             "a button press heals a latched modifier first");
   }
 
+  // Modifier combinations are held transitions, not a text shortcut or a
+  // tap synthesized on the viewer. Exercise every modifier subset against
+  // every supported key class so a backend regression that releases a held
+  // modifier before the target key (or leaves one latched afterward) fails
+  // with the exact transition sequence. Ctrl+Alt+Delete remains deliberately
+  // excluded: it is the Windows secure-attention sequence, which the client
+  // and native workers reject rather than synthesizing.
+  {
+    constexpr std::string_view kModifiers[] = {
+        "ControlLeft", "ShiftLeft", "AltLeft", "MetaLeft"};
+    constexpr std::string_view kKeyClasses[] = {
+        "KeyA", "Digit1", "Semicolon", "F1", "ArrowLeft", "Tab",
+        "Enter", "Escape", "Backspace", "Delete", "Home", "End",
+        "PageUp", "PageDown"};
+    std::uint64_t sequence = 1;
+    for (unsigned int mask = 1; mask < (1u << 4); ++mask) {
+      std::vector<std::string> modifiers;
+      for (std::size_t index = 0; index < 4; ++index) {
+        if ((mask & (1u << index)) != 0)
+          modifiers.emplace_back(kModifiers[index]);
+      }
+      for (const std::string_view key : kKeyClasses) {
+        if (key == "Delete" &&
+            (mask & ((1u << 0) | (1u << 2))) ==
+                ((1u << 0) | (1u << 2))) {
+          continue;
+        }
+        FakeInput matrix_input;
+        common::InputLedger matrix_ledger(matrix_input);
+        std::vector<std::pair<std::string, bool>> expected;
+        for (const std::string& modifier : modifiers) {
+          expected.emplace_back(modifier, true);
+          Require(matrix_ledger.ApplyKey(
+                      Stamp("combo-matrix", sequence++, 7), 7, modifier,
+                      true) == common::InputResult::kApplied,
+                  "matrix modifier down is accepted");
+        }
+        expected.emplace_back(key, true);
+        Require(matrix_ledger.ApplyKey(
+                    Stamp("combo-matrix", sequence++, 7), 7, key, true) ==
+                    common::InputResult::kApplied,
+                "matrix target key down is accepted");
+        expected.emplace_back(key, false);
+        Require(matrix_ledger.ApplyKey(
+                    Stamp("combo-matrix", sequence++, 7), 7, key, false) ==
+                    common::InputResult::kApplied,
+                "matrix target key up is accepted");
+        for (auto modifier = modifiers.rbegin(); modifier != modifiers.rend();
+             ++modifier) {
+          expected.emplace_back(*modifier, false);
+          Require(matrix_ledger.ApplyKey(
+                      Stamp("combo-matrix", sequence++, 7), 7, *modifier,
+                      false) == common::InputResult::kApplied,
+                  "matrix modifier up is accepted");
+        }
+        Require(matrix_input.key_events == expected,
+                "modifier matrix reaches the adapter held through key, then releases");
+      }
+    }
+  }
+
   // A physically held modifier remains authoritative even when it has been
   // quiet for several seconds; browser/controller release is the only source
   // allowed to clear ownership.

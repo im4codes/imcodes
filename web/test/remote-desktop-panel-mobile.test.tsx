@@ -64,6 +64,7 @@ const setMode = vi.fn(() => true);
 const key = vi.fn(() => true);
 const tapChords = vi.fn(() => true);
 const text = vi.fn(() => true);
+const pasteText = vi.fn(() => true);
 const textByServer = vi.fn<(serverId: string, value: string) => boolean>(() => true);
 const requestRemoteClipboard = vi.fn(async () => 'selected remotely');
 const selectDisplay = vi.fn(() => true);
@@ -139,6 +140,10 @@ vi.mock('../src/remote-desktop-client.js', () => ({
     tapChords = tapChords;
     text = (value: string) => {
       text(value);
+      return textByServer(this.serverId, value);
+    };
+    pasteText = (value: string) => {
+      pasteText(value);
       return textByServer(this.serverId, value);
     };
     setMode = setMode;
@@ -1374,13 +1379,13 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       value: { getData: vi.fn(() => 'pasted from event') },
     });
     act(() => stage.dispatchEvent(pasteEvent));
-    expect(text).toHaveBeenCalledWith('pasted from event');
+    expect(pasteText).toHaveBeenCalledWith('pasted from event');
 
     await act(async () => {
       (getByRole('button', { name: 'remote_desktop.paste_local_clipboard' }) as HTMLButtonElement).click();
       await Promise.resolve();
     });
-    expect(text).toHaveBeenCalledWith('local clipboard');
+    expect(pasteText).toHaveBeenCalledWith('local clipboard');
 
     await act(async () => {
       (getByRole('button', { name: 'common.copy' }) as HTMLButtonElement).click();
@@ -1426,7 +1431,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
         value: { getData: vi.fn(() => 'pasted via native event') },
       });
       act(() => stage.dispatchEvent(pasteEvent));
-      expect(text).toHaveBeenCalledWith('pasted via native event');
+      expect(pasteText).toHaveBeenCalledWith('pasted via native event');
     } finally {
       Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
     }
@@ -1451,7 +1456,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       await Promise.resolve();
     });
     expect(readText).toHaveBeenCalledTimes(1);
-    expect(text).toHaveBeenCalledWith('from readText');
+    expect(pasteText).toHaveBeenCalledWith('from readText');
     expect(ctrlV.defaultPrevented).toBe(true);
   });
 
@@ -2700,8 +2705,44 @@ describe('RemoteDesktopPanel mobile gestures', () => {
           await Promise.resolve();
         });
         expect(readText).toHaveBeenCalledTimes(1);
-        expect(text).toHaveBeenCalledWith('from local clipboard');
+        expect(pasteText).toHaveBeenCalledWith('from local clipboard');
         expect(key).not.toHaveBeenCalled();
+        const duplicatePasteEvent = new Event('paste', { bubbles: true, cancelable: true });
+        Object.defineProperty(duplicatePasteEvent, 'clipboardData', {
+          value: { getData: vi.fn(() => 'from local clipboard') },
+        });
+        act(() => stage.dispatchEvent(duplicatePasteEvent));
+        expect(duplicatePasteEvent.defaultPrevented).toBe(true);
+        expect(pasteText).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    it('takes a PC operator\'s Linux selection on Control+Shift+C and forwards the terminal chord', async () => {
+      Object.defineProperty(navigator, 'clipboard', {
+        configurable: true,
+        value: { readText: vi.fn(async () => ''), writeText: vi.fn(async () => {}) },
+      });
+      await withControllerPlatform('Win32', async () => {
+        const { stage } = await renderPanel(undefined, [...LINUX_TARGET_CAPABILITIES]);
+        await act(async () => {
+          stage.dispatchEvent(new KeyboardEvent('keydown', {
+            bubbles: true, cancelable: true, code: 'KeyC', key: 'c',
+            ctrlKey: true, shiftKey: true,
+          }));
+          await Promise.resolve();
+        });
+        expect(requestRemoteClipboard).toHaveBeenCalledTimes(1);
+        expect(key).toHaveBeenCalledWith(
+          'KeyC', 'c', true, false, { control: true, alt: false },
+        );
+        const keyup = press(stage, 'keyup', {
+          code: 'KeyC', key: 'c', ctrlKey: true, shiftKey: true,
+        });
+        expect(keyup.defaultPrevented).toBe(true);
+        expect(key).toHaveBeenCalledWith(
+          'KeyC', 'c', false, false, { control: true, alt: false },
+        );
+        expect(requestRemoteClipboard).toHaveBeenCalledTimes(1);
       });
     });
 

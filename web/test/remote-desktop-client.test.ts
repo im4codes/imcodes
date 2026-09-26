@@ -2787,6 +2787,47 @@ describe('RemoteDesktopClient translated shortcuts and paste', () => {
 
   const released = { control: false, alt: false };
 
+  it('forwards every modifier subset through representative key classes without latching', async () => {
+    const { client, typed } = await inputReadyClient();
+    const modifiers = [
+      { code: 'ControlLeft', key: 'Control', kind: 'control' },
+      { code: 'ShiftLeft', key: 'Shift', kind: 'shift' },
+      { code: 'AltLeft', key: 'Alt', kind: 'alt' },
+      { code: 'MetaLeft', key: 'Meta', kind: 'meta' },
+    ] as const;
+    const keys = [
+      'KeyA', 'Digit1', 'Semicolon', 'F1', 'ArrowLeft', 'Tab', 'Enter',
+      'Escape', 'Backspace', 'Delete', 'Home', 'End', 'PageUp', 'PageDown',
+    ];
+
+    for (let mask = 1; mask < (1 << modifiers.length); mask += 1) {
+      const held = modifiers.filter((_, index) => (mask & (1 << index)) !== 0);
+      for (const code of keys) {
+        const flags = {
+          control: held.some((modifier) => modifier.kind === 'control'),
+          alt: held.some((modifier) => modifier.kind === 'alt'),
+        };
+        // Secure-attention is intentionally not synthesized on Windows.
+        if (code === 'Delete' && flags.control && flags.alt) continue;
+        const expected: string[] = [];
+        for (const modifier of held) {
+          expect(client.key(modifier.code, modifier.key, true, false, flags)).toBe(true);
+          expected.push(`down ${modifier.code}`);
+        }
+        expect(client.key(code, code, true, false, flags)).toBe(true);
+        expect(client.key(code, code, false, false, flags)).toBe(true);
+        expected.push(`down ${code}`, `up ${code}`);
+        for (const modifier of [...held].reverse()) {
+          expect(client.key(modifier.code, modifier.key, false, false, flags)).toBe(true);
+          expected.push(`up ${modifier.code}`);
+        }
+        expect(typed()).toEqual(expected);
+      }
+    }
+    expect(typed()).toEqual([]);
+    client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+  });
+
   it('taps a translated chord with only its own modifiers, then puts the held one back for the next key', async () => {
     const { client, typed } = await inputReadyClient();
     // A Mac operator's Command, forwarded to a PC target as Control.

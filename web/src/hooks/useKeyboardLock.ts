@@ -12,8 +12,11 @@ import { useEffect } from 'preact/hooks';
  * saw them.
  *
  * `navigator.keyboard.lock()` exists for exactly this case (remote desktop and
- * remote terminal clients are its motivating use case). It only takes effect
- * while the page holds fullscreen, and the browser then requires a held Escape
+ * remote terminal clients are its motivating use case). It can expose browser
+ * shortcuts such as Ctrl+W/T only in supporting browsers while fullscreen;
+ * Safari/Firefox do not implement the API, and OS-level shortcuts such as
+ * Cmd+Q cannot be reliably captured by a web page in any browser. It only
+ * takes effect while the page holds fullscreen, and the browser then requires a held Escape
  * to leave, so the operator can still get out. Chromium-only today: Safari and
  * Firefox implement neither half, and there the on-screen keyboard's own
  * modifier keys stay the way to send a browser-reserved chord.

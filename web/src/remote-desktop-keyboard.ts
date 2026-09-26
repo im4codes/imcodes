@@ -345,13 +345,13 @@ export function detectRemoteDesktopClipboardShortcut(
 /**
  * Whether a recognised copy keystroke should still reach the remote as well.
  *
- * Only a PC operator's plain Control+C on a Linux target: there the worker
- * reads the selection without pressing anything, and Control+C itself still
- * has to arrive -- it is how a remote terminal is interrupted, and how a
- * remote app copies into its own clipboard. A Mac operator's Command+C would
- * arrive as Control+C, i.e. as that interrupt, so it never travels (their
- * physical Control+C still does); Windows and Mac workers press their own copy
- * shortcut when asked for the selection.
+ * Only a PC operator's Control+C / Control+Shift+C on Linux: the worker
+ * reads the selection without pressing anything, and the chord itself still
+ * has to arrive -- Control+C interrupts a remote terminal, while
+ * Control+Shift+C is that terminal's copy shortcut. A Mac operator's
+ * Command+C would arrive as Control+C, i.e. as that interrupt, so it never
+ * travels (their physical Control+C still does); Windows and Mac workers
+ * press their own copy shortcut when asked for the selection.
  */
 export function shouldForwardRemoteDesktopCopyKeystroke(
   event: RemoteDesktopKeyboardEventLike & { shiftKey?: boolean },
@@ -361,7 +361,6 @@ export function shouldForwardRemoteDesktopCopyKeystroke(
   return targetPlatform === 'linux'
     && !isAppleControllerPlatform(platform)
     && event.code === 'KeyC'
-    && event.shiftKey !== true
     && detectRemoteDesktopClipboardShortcut(event, platform, targetPlatform)
       === REMOTE_DESKTOP_CLIPBOARD_SHORTCUT.COPY;
 }
