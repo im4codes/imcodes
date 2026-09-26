@@ -58,6 +58,7 @@ import { TaskPairAutomation } from '../../src/daemon/task-pairs/scheduler.js';
 import { resolveTaskPairEngine } from '../../src/daemon/task-pairs/engine.js';
 import { getSupervisionTaskRegistry, resetSupervisionTaskRegistryForTests } from '../../src/daemon/supervision-state-store.js';
 import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
+import { normalizeSessionSupervisionSnapshot, SUPERVISION_MODE } from '../../shared/supervision-config.js';
 
 const PROJECT = 'e2epairs';
 const BRAIN = 'deck_e2epairs_brain';
@@ -85,6 +86,22 @@ function session(name: string, role: SessionRecord['role'], agentType: SessionRe
     ...(role === 'brain' ? {} : { parentSession: BRAIN, userCreated: true, label: name }),
   } as SessionRecord;
 }
+
+// Pair routing comes from the Brain's execution pool (tsk_cd_pairs_use_exec_pool):
+// with no pool there is no built-in default any more (tsk_cd_pairs_no_pool_ask),
+// so the Brain names the pool roles this E2E relies on — luna executes, the
+// Opus sub-session audits.
+const PAIR_POOLS = {
+  state: 'configured' as const,
+  economyTaskPool: { configs: [], controls: { leaseMs: 900000, maxSpawned: 2, changeBudget: 40, maxConcurrency: 4, auditHeadroomPerProviderFamily: 1 } },
+  primaryDevelopmentPool: {
+    configs: [
+      { model: 'gpt-6-luna', agentType: 'codex-sdk', runtimeType: 'transport' as const, capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-6-luna', providerFamily: 'openai', role: 'executor' as const },
+      { model: 'opus[1M]', agentType: 'claude-code-sdk', runtimeType: 'transport' as const, capabilityId: 'supervision-exec-v1:transport:claude-code-sdk:anthropic:opus[1M]', providerFamily: 'anthropic', role: 'auditor' as const },
+    ],
+    controls: { leaseMs: 1800000, maxSpawned: 2, changeBudget: 200, maxConcurrency: 4, auditHeadroomPerProviderFamily: 1 },
+  },
+};
 
 function caller(name: string): SendRuntimeCaller {
   return { userId: name, sessionName: name, projectName: PROJECT, projectRoot: join(env.home, 'repo') };
@@ -129,7 +146,10 @@ beforeEach(() => {
   delivered = [];
   setTaskPairDeliveryDepsForTests({ send: async (target, text) => { delivered.push({ target, text }); } });
   live.sessions = [
-    session(BRAIN, 'brain', 'claude-code-sdk', 'claude-opus-4-7'),
+    {
+      ...session(BRAIN, 'brain', 'claude-code-sdk', 'claude-opus-4-7'),
+      transportConfig: { supervision: normalizeSessionSupervisionSnapshot({ mode: SUPERVISION_MODE.OFF, executionPools: PAIR_POOLS }) },
+    },
     session(EXEC, 'w1', 'codex-sdk', 'gpt-6-luna'),
     session(AUD, 'w2', 'claude-code-sdk', 'claude-opus-4-7'),
   ] as Array<Record<string, unknown>>;
@@ -204,7 +224,7 @@ describe('E2E: marker-driven task pairs (explicit pairs engine)', () => {
     await settle();
 
     // The pair is open with the Brain's target as executor, and the daemon
-    // picked the allowlisted Opus sub-session as auditor and told it so.
+    // picked the Opus sub-session (the pool's auditor role) as auditor and told it so.
     expect(pairOf(taskId)).toMatchObject({
       status: 'working', brain: BRAIN, executor: EXEC, auditor: AUD, round: 0, title: 'Add one README sentence',
     });
