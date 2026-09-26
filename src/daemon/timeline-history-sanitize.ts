@@ -15,6 +15,7 @@ import { isClaudeSyntheticSeedAssistantTextEvent } from '../shared/claude-synthe
 import { preferTimelineEvent } from '../shared/timeline/merge.js';
 import { AGENT_DELEGATION_REPLY_TIMELINE_EVENT } from '../../shared/agent-delegation.js';
 import { PEER_AUDIT_FINDINGS_BYTES, isPeerAuditVerdict } from '../../shared/peer-audit.js';
+import { TASK_PAIR_HISTORY_BRIEF_MAX_BYTES, TASK_PAIR_TIMELINE_EVENT } from '../../shared/task-pair.js';
 
 export const DEFAULT_TIMELINE_HISTORY_MAX_EVENT_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_EVENT;
 export const DEFAULT_TIMELINE_HISTORY_MAX_RESPONSE_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE;
@@ -292,6 +293,17 @@ function sanitizeTextPayload(
 
 function sanitizePayload(event: TimelineEvent, stats: MutableSanitizeStats, policy = NORMAL_POLICY): Record<string, unknown> {
   const payload = event.payload ?? {};
+  if (event.type === TASK_PAIR_TIMELINE_EVENT && typeof payload.brief === 'string') {
+    // Task-pair briefs have their own bounded transport path. They are loaded
+    // on demand by the panel and must not be reduced to the generic 4 KiB
+    // preview limit used by ordinary timeline fields.
+    const sanitized = sanitizeValue(payload, {
+      ...policy,
+      maxStringBytes: TASK_PAIR_HISTORY_BRIEF_MAX_BYTES,
+    }, stats) as Record<string, unknown>;
+    sanitized.brief = truncateStringByUtf8Bytes(payload.brief, TASK_PAIR_HISTORY_BRIEF_MAX_BYTES);
+    return sanitized;
+  }
   if (event.type === AGENT_DELEGATION_REPLY_TIMELINE_EVENT
     && isPeerAuditVerdict(payload.verdict)
     && typeof payload.result === 'string') {
@@ -453,7 +465,13 @@ export function sanitizeTimelineHistoryEventForTransport(
   event: TimelineEvent,
   options: TimelineHistorySanitizeOptions = {},
 ): { event: TimelineEvent; bytes: number; truncated: boolean; detailRefs: TimelineDetailRef[] } {
-  const maxEventBytes = Math.max(1024, Math.trunc(options.maxEventBytes ?? DEFAULT_TIMELINE_HISTORY_MAX_EVENT_BYTES));
+  const briefBytes = event.type === TASK_PAIR_TIMELINE_EVENT && typeof event.payload?.brief === 'string'
+    ? Buffer.byteLength(event.payload.brief, 'utf8')
+    : 0;
+  const requestedMaxEventBytes = Math.max(1024, Math.trunc(options.maxEventBytes ?? DEFAULT_TIMELINE_HISTORY_MAX_EVENT_BYTES));
+  const maxEventBytes = briefBytes > 0
+    ? Math.min(TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL, Math.max(requestedMaxEventBytes, briefBytes + 2 * 1024))
+    : requestedMaxEventBytes;
   const stats: MutableSanitizeStats = { truncatedValues: 0 };
   const originalPayloadBytes = estimateJsonBytesBounded(event.payload);
   const beforeTruncations = stats.truncatedValues;

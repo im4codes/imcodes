@@ -216,6 +216,30 @@ describe('TaskPairStatusPanel', () => {
     } finally { vi.unstubAllGlobals(); }
   });
 
+  it('expands a large brief from the authoritative snapshot without relying on a timestamp guess', async () => {
+    const brief = `# Snapshot large brief\n\n${'complete '.repeat(900)}`;
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      events: [{ type: 'task_pair.event', ts: 123, payload: { taskId: 'snapshot-large', brief } }],
+      epoch: null, hasMore: false,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      render(<TaskPairStatusPanel events={[]} brain="deck_brain" serverId="server-snapshot" />);
+      window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: {
+        tasks: [{ taskId: 'snapshot-large', title: 'Snapshot large', updatedAt: 1000, pair: { status: 'working', updatedAt: 1001, briefAvailable: true, checklist: { total: 0, implemented: 0, audited: 0 } } }],
+        assignments: [],
+      } }));
+      await screen.findByText('Snapshot large');
+      fireEvent.click(screen.getByRole('button', { name: 'taskPair.panel_show_brief' }));
+      await screen.findByRole('heading', { name: 'Snapshot large brief' });
+      expect(screen.getByText(/complete complete complete/)).toBeTruthy();
+      const requestedUrl = String(fetchMock.mock.calls[0]![0]);
+      expect(requestedUrl).toContain('serverId=server-snapshot');
+      expect(requestedUrl).not.toContain('afterTs=');
+      expect(requestedUrl).not.toContain('beforeTs=');
+    } finally { vi.unstubAllGlobals(); }
+  });
+
   function fakeWs() {
     const handlers = new Set<(msg: unknown) => void>();
     const sent: Record<string, unknown>[] = [];

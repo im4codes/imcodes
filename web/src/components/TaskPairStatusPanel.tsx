@@ -25,10 +25,10 @@ function normalizeSnapshot(detail: { tasks?: readonly Record<string, unknown>[];
   if (!Array.isArray(detail.tasks)) return null;
   const byTask = new Map<string, Record<string, unknown>[]>();
   for (const assignment of detail.assignments ?? []) { const id = typeof assignment.taskId === 'string' ? assignment.taskId : ''; if (id) byTask.set(id, [...(byTask.get(id) ?? []), assignment]); }
-  return detail.tasks.map((task) => {
-    const pair = (task.pair ?? {}) as Record<string, unknown>; const roles = byTask.get(String(task.taskId)) ?? [];
+    return detail.tasks.map((task) => {
+      const pair = (task.pair ?? {}) as Record<string, unknown>; const roles = byTask.get(String(task.taskId)) ?? [];
     const executor = roles.find((role) => role.role === 'implementer'); const auditor = roles.find((role) => role.role === 'auditor');
-    return { ...pair, taskId: task.taskId, title: task.title, toStatus: pair.status ?? task.status, startedAt: pair.createdAt ?? task.updatedAt, queuePosition: pair.queuePosition, executor: pair.executor, auditor: pair.auditor, executorLabel: executor?.ownerSessionLabel ?? pair.executorLabel, auditorLabel: auditor?.ownerSessionLabel ?? pair.auditorLabel, executorModel: executor?.observedModel ?? pair.executorModel, auditorModel: auditor?.observedModel ?? pair.auditorModel, executorState: executor?.sessionState ?? pair.executorState, auditorState: auditor?.sessionState ?? pair.auditorState };
+    return { ...pair, taskId: task.taskId, title: task.title, toStatus: pair.status ?? task.status, startedAt: pair.createdAt ?? task.updatedAt, updatedAt: pair.updatedAt ?? task.updatedAt, queuePosition: pair.queuePosition, executor: pair.executor, auditor: pair.auditor, executorLabel: executor?.ownerSessionLabel ?? pair.executorLabel, auditorLabel: auditor?.ownerSessionLabel ?? pair.auditorLabel, executorModel: executor?.observedModel ?? pair.executorModel, auditorModel: auditor?.observedModel ?? pair.auditorModel, executorState: executor?.sessionState ?? pair.executorState, auditorState: auditor?.sessionState ?? pair.auditorState };
   });
 }
 
@@ -104,14 +104,17 @@ export function TaskPairStatusPanel({ events, sessions, ws, brain, serverId }: {
   const [loadingBriefs, setLoadingBriefs] = useState<ReadonlySet<string>>(() => new Set());
   const [briefLoadErrors, setBriefLoadErrors] = useState<ReadonlySet<string>>(() => new Set());
   const toggleBrief = (taskId: string) => setExpandedBriefs((current) => { const next = new Set(current); if (next.has(taskId)) next.delete(taskId); else next.add(taskId); return next; });
-  const openBrief = async (taskId: string, inlineBrief: string | undefined, updatedAt: number) => {
+  const openBrief = async (taskId: string, inlineBrief: string | undefined) => {
     if (expandedBriefs.has(taskId)) { toggleBrief(taskId); return; }
     if (inlineBrief !== undefined) { toggleBrief(taskId); return; }
     if (!serverId || !brain || loadingBriefs.has(taskId)) return;
     setLoadingBriefs((current) => new Set(current).add(taskId));
     setBriefLoadErrors((current) => { const next = new Set(current); next.delete(taskId); return next; });
     try {
-      const history = await fetchTimelineHistoryHttp(serverId, brain, { afterTs: Math.max(0, updatedAt - 1), beforeTs: updatedAt + 1, limit: 500 });
+      // The task-pair event may be separated from the snapshot timestamp by
+      // other timeline traffic. Fetch the bounded recent page and select by
+      // task id instead of guessing a two-millisecond timestamp window.
+      const history = await fetchTimelineHistoryHttp(serverId, brain, { limit: 500 });
       const matching = history?.events.find((event) => {
         const candidate = event as { type?: string; payload?: { taskId?: string; brief?: string } };
         return candidate.type === TASK_PAIR_TIMELINE_EVENT && candidate.payload?.taskId === taskId && typeof candidate.payload.brief === 'string';
@@ -136,7 +139,7 @@ export function TaskPairStatusPanel({ events, sessions, ws, brain, serverId }: {
       if (Array.isArray(detail.tasks)) {
         setSnapshotRows(normalizeSnapshot(detail));
       } else if (detail.op === 'task_upsert' && detail.task) {
-        setSnapshotRows((current) => current ? [...current.filter((row) => row.taskId !== detail.task!.taskId), { ...(detail.task!.pair as Record<string, unknown> ?? {}), taskId: detail.task!.taskId, title: detail.task!.title, toStatus: (detail.task!.pair as Record<string, unknown> | undefined)?.status ?? detail.task!.status, startedAt: (detail.task!.pair as Record<string, unknown> | undefined)?.createdAt ?? detail.task!.updatedAt }] : current);
+        setSnapshotRows((current) => current ? [...current.filter((row) => row.taskId !== detail.task!.taskId), { ...(detail.task!.pair as Record<string, unknown> ?? {}), taskId: detail.task!.taskId, title: detail.task!.title, toStatus: (detail.task!.pair as Record<string, unknown> | undefined)?.status ?? detail.task!.status, startedAt: (detail.task!.pair as Record<string, unknown> | undefined)?.createdAt ?? detail.task!.updatedAt, updatedAt: (detail.task!.pair as Record<string, unknown> | undefined)?.updatedAt ?? detail.task!.updatedAt }] : current);
       } else if (detail.op === 'task_remove' && detail.removedId) setSnapshotRows((current) => current?.filter((row) => row.taskId !== detail.removedId) ?? current);
     };
     window.addEventListener('supervision:task-pairs', onSnapshot);
@@ -223,7 +226,7 @@ export function TaskPairStatusPanel({ events, sessions, ws, brain, serverId }: {
               ? <span class="task-pair-role-chip task-pair-role-chip--muted">{t('taskPair.panel_no_audit')}</span>
               : <span class="task-pair-role-chip"><span class={`task-pair-status-dot ${payload.auditorState === 'running' ? 'is-running' : ''}`} />{session(payload.auditor, payload.auditorLabel, payload.auditorModel, 'auditor') ?? <small>{t('taskPair.panel_unassigned')}</small>}</span>}
           </div>
-          {briefAvailable && <div class="task-pair-status-brief-bar">{checklist.total > 0 && <span class="task-pair-status-checklist-progress">{t('taskPair.checklist_progress', checklist)}</span>}<button type="button" class="task-pair-status-brief-toggle" aria-expanded={isExpanded} disabled={loadingBriefs.has(taskId)} onClick={() => void openBrief(taskId, inlineBrief ?? loadedBriefs[taskId], row.updatedAt)}>{loadingBriefs.has(taskId) ? t('taskPair.panel_loading_brief') : t(isExpanded ? 'taskPair.panel_hide_brief' : 'taskPair.panel_show_brief')}</button>{briefLoadErrors.has(taskId) && <small role="status">{t('taskPair.panel_brief_load_failed')}</small>}</div>}
+          {briefAvailable && <div class="task-pair-status-brief-bar">{checklist.total > 0 && <span class="task-pair-status-checklist-progress">{t('taskPair.checklist_progress', checklist)}</span>}<button type="button" class="task-pair-status-brief-toggle" aria-expanded={isExpanded} disabled={loadingBriefs.has(taskId)} onClick={() => void openBrief(taskId, inlineBrief ?? loadedBriefs[taskId])}>{loadingBriefs.has(taskId) ? t('taskPair.panel_loading_brief') : t(isExpanded ? 'taskPair.panel_hide_brief' : 'taskPair.panel_show_brief')}</button>{briefLoadErrors.has(taskId) && <small role="status">{t('taskPair.panel_brief_load_failed')}</small>}</div>}
           {!!brief && isExpanded && <div class="task-pair-status-brief"><ChatMarkdown text={brief} />{checklist.total > 0 && <div class="task-pair-status-checklist">{parseTaskPairChecklist(brief).map((item) => <div class="task-pair-status-checklist-row" key={item.index}><input type="checkbox" checked={item.implemented} readOnly aria-label={t('taskPair.implemented')} /><input type="checkbox" checked={item.audited} readOnly aria-label={t('taskPair.audited')} /><span>{item.text}</span></div>)}</div>}</div>}
         </div>; });
         return group.key === 'recent'

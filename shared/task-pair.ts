@@ -171,6 +171,8 @@ export const TASK_PAIR_DEFAULT_MAX_CONCURRENCY = 5;
 export const TASK_PAIR_MAX_CONCURRENCY_CAP = 10;
 /** Large briefs are omitted from routine panel snapshots and fetched on demand. */
 export const TASK_PAIR_INLINE_BRIEF_MAX_LENGTH = 4_000;
+/** Maximum complete brief carried by the dedicated task-pair timeline path. */
+export const TASK_PAIR_HISTORY_BRIEF_MAX_BYTES = 512 * 1024;
 export const TASK_PAIR_HEARTBEAT_MS = 6 * 60_000;
 /** Silent ticks before a side stops being nudged and escalates. */
 export const TASK_PAIR_SILENCE_LIMIT = 3;

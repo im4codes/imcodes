@@ -10,6 +10,7 @@ import {
   SDK_SUBAGENT_STATUS,
   SDK_SUBAGENT_DIAGNOSTIC,
 } from '../../shared/sdk-subagent-status.js';
+import { TASK_PAIR_HISTORY_BRIEF_MAX_BYTES, TASK_PAIR_TIMELINE_EVENT } from '../../shared/task-pair.js';
 
 function event(overrides: Partial<TimelineEvent>): TimelineEvent {
   return {
@@ -88,6 +89,20 @@ describe('timeline history transport sanitization', () => {
 
     expect(result.events[0]?.payload.result).toBe(findings);
     expect(JSON.stringify(result.events[0])).not.toContain('[history truncated]');
+  });
+
+  it('preserves a complete large task-pair brief through the dedicated history path', () => {
+    const brief = `# Large brief\n\n${'x'.repeat(8 * 1024)}`;
+    const result = sanitizeTimelineHistoryEventsForTransport([
+      event({
+        eventId: 'task-pair-large-brief',
+        type: TASK_PAIR_TIMELINE_EVENT,
+        payload: { taskId: 'large-brief', brief },
+      }),
+    ]);
+    expect(result.events[0]?.payload.brief).toBe(brief);
+    expect(result.events[0]?.payload.brief).not.toContain('[history truncated]');
+    expect(Buffer.byteLength(String(result.events[0]?.payload.brief), 'utf8')).toBeLessThanOrEqual(TASK_PAIR_HISTORY_BRIEF_MAX_BYTES);
   });
 
   it('caps large tool payloads before history responses leave the daemon', () => {
