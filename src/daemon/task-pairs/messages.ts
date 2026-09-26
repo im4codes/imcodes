@@ -119,22 +119,31 @@ export function buildBrainNoticeMessage(pair: TaskPairState, flag: TaskPairFlag,
   ].join('\n');
 }
 
-export interface PendingBrainNotice {
-  pair: TaskPairState;
-  flag: TaskPairFlag;
-  detail?: string;
-}
+/**
+ * A flag-driven notice explains itself from {@link FLAG_EXPLANATIONS}; a
+ * plain-line notice (e.g. a queued pair with no brief -- there is no real
+ * flag on the pair for that, just a one-off reminder text) carries its own
+ * `text` instead.
+ */
+export type PendingBrainNotice =
+  | { pair: TaskPairState; flag: TaskPairFlag; detail?: string }
+  | { pair: TaskPairState; text: string; reason: string };
 
 /**
  * One heartbeat can find several of a Brain's pairs needing a decision at
- * once (an auditor pool outage, several imports missing an auditor). One
- * combined message, not one per pair -- the single-pair case still uses
- * {@link buildBrainNoticeMessage} unchanged.
+ * once (an auditor pool outage, several imports missing an auditor, a batch
+ * of legacy-imported pairs with no brief). One combined message, not one per
+ * pair -- the single-pair case still uses {@link buildBrainNoticeMessage} or
+ * {@link buildBrainLine} unchanged.
  */
 export function buildAggregatedBrainNoticeMessage(notices: readonly PendingBrainNotice[]): string {
-  const lines = notices.map(({ pair, flag, detail }) => (
-    `- ${pair.taskId}${pair.title ? ` "${pair.title}"` : ''}: ${detail ?? FLAG_EXPLANATIONS[flag] ?? flag}. Executor ${pair.executor ?? '-'}, auditor ${pair.auditor ?? '-'}, status ${pair.status}.`
-  ));
+  const lines = notices.map((notice) => {
+    const { pair } = notice;
+    const label = `${pair.taskId}${pair.title ? ` "${pair.title}"` : ''}`;
+    if ('text' in notice) return `- ${label}: ${notice.text}`;
+    const { flag, detail } = notice;
+    return `- ${label}: ${detail ?? FLAG_EXPLANATIONS[flag] ?? flag}. Executor ${pair.executor ?? '-'}, auditor ${pair.auditor ?? '-'}, status ${pair.status}.`;
+  });
   return [
     `[IM.codes task pairs] Needs your decision on ${notices.length} pairs:`,
     ...lines,

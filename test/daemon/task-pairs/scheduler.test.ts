@@ -352,6 +352,30 @@ describe('task-pair heartbeat, replacement and queue', () => {
     expect(sentTo(BRAIN, 'brain-no_brief')).toHaveLength(1);
   });
 
+  it('imports several brief-less legacy tasks in one tick and tells Brain once, not once per task', async () => {
+    const registry = getSupervisionTaskRegistry();
+    delete process.env.IMCODES_SUPERVISION_ENGINE;
+    getTaskPairStore().setProjectEngine(PROJECT, 'legacy');
+    for (const taskId of ['tsk_a', 'tsk_b', 'tsk_c']) {
+      expect(registry.createOrGet({
+        taskId, projectName: PROJECT, classification: 'independent_top_level', objective: `legacy ${taskId}`,
+      } as never).ok).toBe(true);
+    }
+    getTaskPairStore().setProjectEngine(PROJECT, 'pairs');
+    const live = new TaskPairAutomation({ now: () => now, importLegacy: undefined, isBusy: () => true, isLimited: () => false });
+    sent = [];
+    await live.tick();
+    for (const taskId of ['tsk_a', 'tsk_b', 'tsk_c']) {
+      expect(getTaskPairStore().getPairByLegacyTaskId(taskId)?.state.status).toBe('queued');
+    }
+    expect(sentTo(BRAIN, 'brain-no_brief')).toHaveLength(0);
+    const aggregate = sentTo(BRAIN, 'brain-aggregate');
+    expect(aggregate).toHaveLength(1);
+    expect(aggregate[0]!.text).toContain('tsk_a');
+    expect(aggregate[0]!.text).toContain('tsk_b');
+    expect(aggregate[0]!.text).toContain('tsk_c');
+  });
+
   it('shows the pair heartbeat on the badges of open-pair participants and clears it when the pair ends', async () => {
     marker(BRAIN, `<!-- IMCODES_TASK DISPATCH T11 executor=${EXEC} auditor=${AUD} -->`);
     await flush();

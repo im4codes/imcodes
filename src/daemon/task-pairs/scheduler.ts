@@ -272,14 +272,34 @@ export class TaskPairAutomation implements TaskPairScheduler {
     void sendTaskPairMessage(pair.brain, pair.taskId, `brain-${flag}`, buildBrainNoticeMessage(pair, flag, detail));
   }
 
+  /**
+   * Same batching as {@link #queueNotice} for a notice with no backing flag
+   * (e.g. a queued pair with no brief): a batch of these (a legacy import
+   * that lands many brief-less pairs at once) must not spam Brain one message
+   * per pair either.
+   */
+  #queueLineNotice(pair: TaskPairState, reason: string, text: string): void {
+    if (this.#pendingNotices) {
+      const list = this.#pendingNotices.get(pair.brain) ?? [];
+      list.push({ pair, text, reason });
+      this.#pendingNotices.set(pair.brain, list);
+      return;
+    }
+    void sendTaskPairMessage(pair.brain, pair.taskId, reason, buildBrainLine(pair, text));
+  }
+
   async #flushPendingNotices(): Promise<void> {
     const pending = this.#pendingNotices;
     if (!pending) return;
     for (const [brain, entries] of pending) {
       if (entries.length === 0) continue;
       if (entries.length === 1) {
-        const { pair, flag, detail } = entries[0]!;
-        await sendTaskPairMessage(brain, pair.taskId, `brain-${flag}`, buildBrainNoticeMessage(pair, flag, detail));
+        const notice = entries[0]!;
+        if ('text' in notice) {
+          await sendTaskPairMessage(brain, notice.pair.taskId, notice.reason, buildBrainLine(notice.pair, notice.text));
+        } else {
+          await sendTaskPairMessage(brain, notice.pair.taskId, `brain-${notice.flag}`, buildBrainNoticeMessage(notice.pair, notice.flag, notice.detail));
+        }
       } else {
         await sendTaskPairMessage(brain, TASK_PAIR_AGGREGATE_NOTICE_ID, 'brain-aggregate', buildAggregatedBrainNoticeMessage(entries));
       }
@@ -920,7 +940,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
   #flagOnceWithKey(stored: StoredTaskPair, key: string, text: string): void {
     if (stored.liveness.notified.includes(key)) return;
     getTaskPairStore().saveLiveness(stored.project, stored.state.taskId, { ...stored.liveness, notified: [...stored.liveness.notified, key] });
-    void sendTaskPairMessage(stored.state.brain, stored.state.taskId, `brain-${key}`, buildBrainLine(stored.state, text));
+    this.#queueLineNotice(stored.state, `brain-${key}`, text);
   }
 }
 
