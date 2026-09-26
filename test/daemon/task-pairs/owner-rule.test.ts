@@ -2,8 +2,10 @@
  * Owner rule (design D-pool-sync, 2026-09-25): when the user or Brain
  * explicitly names the model or session for a task pair's executor or
  * auditor, the pairs engine must not apply the execution pool's per-entry
- * role (or, with no pool configured, the built-in default routing). Pool
- * roles govern only an automatic pick, when neither is named.
+ * role, or (a later owner correction) confine the pick to the pool at all --
+ * not even when no pool is configured, since there is no built-in default in
+ * that case either (see tsk_cd_pairs_no_pool_ask). Pool roles govern only an
+ * automatic pick, when neither a session nor a model is named.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { SessionRecord } from '../../../src/store/session-store.js';
@@ -27,18 +29,19 @@ function session(name: string, role: SessionRecord['role'], extra: Partial<Sessi
 }
 
 describe('owner rule: pool-role bypass by requested model', () => {
-  it('lists a non-default-routed session as an auditor candidate once its exact model is requested', () => {
+  it('lists a session as an auditor candidate once its exact model is requested, even with no pool configured at all', () => {
     const records = [
       session(BRAIN, 'brain'),
-      // No pool is configured, so the built-in default (Opus auditors) applies; Sonnet is not.
+      // No pool is configured, so an automatic pick returns nothing at all
+      // (no built-in default) -- only the named-model bypass can find this session.
       session('deck_sub_sonnet', 'w1', { parentSession: BRAIN, activeModel: 'claude-sonnet-5', updatedAt: 1 }),
     ];
     const deps = { listSessions: () => records, hasPendingMessages: () => false };
-    // Unchanged baseline: the built-in default alone still governs an automatic pick.
+    // Unchanged baseline: an automatic pick with no pool configured finds nothing.
     expect(listTaskPairCandidates({
       brain: BRAIN, role: 'auditor', pool: 'primary', exclude: new Set(),
     }, deps)).toEqual([]);
-    // Owner rule: an explicit requested model bypasses the default entirely.
+    // Owner rule: an explicit requested model bypasses "no pool = nothing" entirely.
     const picked = listTaskPairCandidates({
       brain: BRAIN, role: 'auditor', pool: 'primary', exclude: new Set(),
       requestedModel: 'claude-sonnet-5',
@@ -162,7 +165,7 @@ describe('owner rule: scheduler wires an explicit executormodel=/auditormodel= t
       pickCandidate: ({ role, requestedModel }) => {
         if (role !== 'auditor') return undefined;
         seenRequestedModel = requestedModel;
-        // Would never match the built-in default (auditor wants Opus); the
+        // Would never be picked automatically (no pool, no default); the
         // scheduler must still hand it a session because the model was named.
         return requestedModel === 'claude-sonnet-5' ? 'deck_sub_ownersonnet' : undefined;
       },

@@ -4353,7 +4353,8 @@
       "replacement_churn": "Auditor churn",
       "markers_unresolved": "Unresolved markers",
       "all_providers_limited": "All providers limited",
-      "auditor_capacity_hold": "Auditor holding (capacity)"
+      "auditor_capacity_hold": "Auditor holding (capacity)",
+      "no_pool_configured": "No execution pool configured"
     },
     "settings": {
       "title": "Task pairs (marker-driven supervision)",

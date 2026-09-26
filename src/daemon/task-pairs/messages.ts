@@ -96,6 +96,7 @@ const FLAG_EXPLANATIONS: Partial<Record<TaskPairFlag, string>> = {
   auditor_capacity_hold: 'the auditor keeps hitting a provider capacity error and is being retried on the same session, never switched',
   blocked: 'a participant reported being blocked',
   needs_input: 'a participant is waiting on input',
+  no_pool_configured: 'this project has no execution pool configured and no model was named for this role',
 };
 
 export function buildBrainNoticeMessage(pair: TaskPairState, flag: TaskPairFlag, detail?: string): string {
@@ -152,6 +153,27 @@ export function buildQueueStallNoticeMessage(pairs: readonly Pick<TaskPairState,
     `[IM.codes task pairs] ${pairs.length} queued pair(s) have been unable to start for a while:`,
     ...lines,
     'Check Settings → execution pool (pool roles, capacity) if this persists, or name a session/model on the pair directly with REASSIGN.',
+    `[Contract: ${TASK_PAIR_CONTRACT_ID}]`,
+  ].join('\n');
+}
+
+/**
+ * One combined, rate-limited notice per project: no execution pool is
+ * configured and one or more pairs have a role with no named model either,
+ * so nothing was picked or provisioned for it (owner rule: no built-in
+ * default). Every such pair is listed together, not one message per pair.
+ */
+export function buildNoPoolAskMessage(project: string, pairs: readonly Pick<TaskPairState, 'taskId' | 'title' | 'executor' | 'executorModel' | 'auditor' | 'auditorModel'>[]): string {
+  const lines = pairs.map((pair) => {
+    const needs: string[] = [];
+    if (!pair.executor && !pair.executorModel) needs.push('an executor model');
+    if (!pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR && !pair.auditorModel) needs.push('an auditor model');
+    return `- ${pair.taskId}${pair.title ? ` "${pair.title}"` : ''}: needs ${needs.join(' and ') || 'a model'}.`;
+  });
+  return [
+    `[IM.codes task pairs] project ${project} has no execution pool: ask the user which executor/auditor models to use (Settings → execution pool, or name executormodel=/auditormodel= on the task). ${pairs.length} pair(s) are waiting:`,
+    ...lines,
+    'Each starts automatically once a pool is configured or the missing model is named on it -- no further reminders until then.',
     `[Contract: ${TASK_PAIR_CONTRACT_ID}]`,
   ].join('\n');
 }

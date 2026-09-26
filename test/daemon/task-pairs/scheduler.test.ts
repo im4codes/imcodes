@@ -12,6 +12,8 @@ import {
   defaultHasActiveSupervisionLease,
 } from '../../../src/daemon/supervision-auto-provision.js';
 import { getSupervisionHeartbeatProjection } from '../../../src/daemon/supervision-heartbeat-projection.js';
+import { normalizeSessionSupervisionSnapshot, SUPERVISION_MODE } from '../../../shared/supervision-config.js';
+import { buildSupervisionExecutionCapabilityId, normalizeSupervisionExecutionModel } from '../../../shared/supervision-execution-pool.js';
 
 const PROJECT = 'schedproj';
 const BRAIN = 'deck_schedproj_brain';
@@ -400,7 +402,7 @@ describe('task-pair pool candidates', () => {
     else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
   });
 
-  it('picks only idle sub-sessions of the Brain, longest idle first (no pool configured: built-in default Opus auditors)', () => {
+  it('picks nothing for an automatic (unnamed) role when no execution pool is configured -- no built-in default', () => {
     const sessions = [
       session(BRAIN, 'brain'),
       session('deck_sub_codex', 'w1', { parentSession: BRAIN, agentType: 'codex-sdk', activeModel: 'gpt-5.5', updatedAt: 1 }),
@@ -416,7 +418,120 @@ describe('task-pair pool candidates', () => {
     const picked = listTaskPairCandidates({
       brain: BRAIN, role: 'auditor', pool: 'primary', exclude: new Set(),
     }, { listSessions: () => sessions, hasPendingMessages: () => false });
-    // Project main sessions are never commandeered; an unknown model does not match the built-in default.
-    expect(picked.map((entry) => entry.name)).toEqual(['deck_sub_opus_old', 'deck_sub_opus_new']);
+    // Owner rule: with no execution pool configured, an automatic (unnamed)
+    // pick returns nothing at all -- there is no built-in default anymore.
+    expect(picked).toEqual([]);
+    // A named model still wins regardless (unaffected by this owner rule).
+    const namedPick = listTaskPairCandidates({
+      brain: BRAIN, role: 'auditor', pool: 'primary', exclude: new Set(), requestedModel: 'claude-opus-4-8',
+    }, { listSessions: () => sessions, hasPendingMessages: () => false });
+    expect(namedPick.map((entry) => entry.name)).toEqual(['deck_sub_opus_old']);
+  });
+});
+
+describe('no execution pool configured: ask the user instead of guessing (owner rule)', () => {
+  const NP_EXEC = 'deck_sub_noolexec';
+  const NP_AUD = 'deck_sub_noolaud';
+  const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
+  let npNow = 2_000_000;
+  let npSent: Array<{ target: string; text: string; id: string }>;
+  let npAutomation: TaskPairAutomation;
+
+  function brainSession(executionPools?: unknown): SessionRecord {
+    return session(BRAIN, 'brain', executionPools ? {
+      transportConfig: { supervision: normalizeSessionSupervisionSnapshot({ mode: SUPERVISION_MODE.OFF, executionPools }) },
+    } as Partial<SessionRecord> : {});
+  }
+  function npMarker(writer: string, line: string) {
+    return taskPairService.ingestText(PROJECT, writer, line, `noolturn-${Math.random()}`, npNow);
+  }
+  function npPair(taskId: string) {
+    return getTaskPairStore().getPair(PROJECT, taskId)!.state;
+  }
+  async function npTick(times = 1) {
+    for (let i = 0; i < times; i += 1) { npNow += 6 * 60_000; await npAutomation.tick(); }
+  }
+  async function npFlush() {
+    for (let i = 0; i < 5; i += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  function npSentTo(target: string, reasonPart?: string) {
+    return npSent.filter((entry) => entry.target === target && (!reasonPart || entry.id.includes(`:${reasonPart}`)));
+  }
+
+  beforeEach(() => {
+    process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    setTaskPairStoreForTests(new TaskPairStore(':memory:'));
+    npSent = [];
+    setTaskPairDeliveryDepsForTests({ send: async (target, text, id) => { npSent.push({ target, text, id }); } });
+    upsertSession(brainSession());
+    upsertSession(session(NP_EXEC, 'w1', { parentSession: BRAIN, agentType: 'codex-sdk', activeModel: 'gpt-5.6' }));
+    upsertSession(session(NP_AUD, 'w2', { parentSession: BRAIN, agentType: 'claude-code-sdk', activeModel: 'opus' }));
+    // No pickCandidate/provision deps injected: the real pool.ts logic (and
+    // therefore the real no-pool-configured gate) runs for these tests.
+    npAutomation = new TaskPairAutomation({ now: () => npNow, importLegacy: () => undefined });
+    taskPairService.setScheduler(npAutomation);
+  });
+  afterEach(() => {
+    taskPairService.setScheduler(undefined);
+    setTaskPairDeliveryDepsForTests(undefined);
+    setTaskPairStoreForTests(undefined);
+    for (const name of [BRAIN, NP_EXEC, NP_AUD]) removeSession(name);
+    if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
+    else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
+  });
+
+  it('picks nothing for a no-pool project and sends one batched ask-the-user notice, not repeated every tick', async () => {
+    npMarker(BRAIN, '<!-- IMCODES_TASK QUEUE NP1 -->\nbrief\n<!-- IMCODES_TASK_END NP1 -->');
+    await npFlush();
+    await npTick(1);
+    expect(npPair('NP1')).toMatchObject({ status: 'queued', flags: ['no_pool_configured'] });
+    expect(npSentTo(BRAIN, 'brain-no-pool-ask')).toHaveLength(1);
+    expect(npSentTo(BRAIN, 'brain-no-pool-ask')[0]!.text).toContain('NP1');
+    await npTick(1);
+    expect(npSentTo(BRAIN, 'brain-no-pool-ask')).toHaveLength(1);
+  });
+
+  it('naming executormodel=/auditormodel= on QUEUE starts the pair even with no pool configured', async () => {
+    npMarker(BRAIN, '<!-- IMCODES_TASK QUEUE NP2 executormodel=gpt-5.6 auditormodel=opus -->\nbrief\n<!-- IMCODES_TASK_END NP2 -->');
+    await npFlush();
+    await npTick(1);
+    expect(npPair('NP2')).toMatchObject({ status: 'working', executor: NP_EXEC, auditor: NP_AUD });
+  });
+
+  it('configuring a pool starts a previously-waiting pair automatically', async () => {
+    npMarker(BRAIN, '<!-- IMCODES_TASK QUEUE NP3 -->\nbrief\n<!-- IMCODES_TASK_END NP3 -->');
+    await npFlush();
+    await npTick(1);
+    expect(npPair('NP3').flags).toContain('no_pool_configured');
+
+    const auditorModel = normalizeSupervisionExecutionModel('claude-code-sdk', 'opus');
+    const auditorConfig = { agentType: 'claude-code-sdk', providerFamily: 'anthropic', runtimeType: 'process' as const, model: auditorModel };
+    const pools = {
+      state: 'configured' as const,
+      economyTaskPool: { configs: [], controls: { leaseMs: 900000, maxSpawned: 2, changeBudget: 40, maxConcurrency: 4, auditHeadroomPerProviderFamily: 1 } },
+      primaryDevelopmentPool: {
+        configs: [
+          { agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'process' as const, model: 'gpt-5.6', capabilityId: 'supervision-exec-v1:process:codex-sdk:openai:gpt-5.6', role: 'executor' as const },
+          { ...auditorConfig, capabilityId: buildSupervisionExecutionCapabilityId(auditorConfig), role: 'auditor' as const },
+        ],
+        controls: { leaseMs: 1800000, maxSpawned: 2, changeBudget: 200, maxConcurrency: 4, auditHeadroomPerProviderFamily: 1 },
+      },
+    };
+    upsertSession(brainSession(pools));
+    await npTick(1);
+    expect(npPair('NP3')).toMatchObject({ status: 'working' });
+  });
+
+  it('auditor=none still needs an executor model when no pool is configured', async () => {
+    npMarker(BRAIN, '<!-- IMCODES_TASK QUEUE NP4 auditor=none -->\nbrief\n<!-- IMCODES_TASK_END NP4 -->');
+    await npFlush();
+    await npTick(1);
+    expect(npPair('NP4')).toMatchObject({ status: 'queued', flags: ['no_pool_configured'] });
+
+    // Naming the executor model alone is enough (no auditor model needed for auditor=none).
+    npMarker(BRAIN, '<!-- IMCODES_TASK QUEUE NP4 executormodel=gpt-5.6 -->');
+    await npFlush();
+    await npTick(1);
+    expect(npPair('NP4')).toMatchObject({ status: 'working', executor: NP_EXEC, auditor: 'none' });
   });
 });

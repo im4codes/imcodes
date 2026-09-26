@@ -4353,7 +4353,8 @@
       "replacement_churn": "Cambios de auditor",
       "markers_unresolved": "Marcadores sin resolver",
       "all_providers_limited": "Todos los proveedores limitados",
-      "auditor_capacity_hold": "Auditor en espera (capacidad)"
+      "auditor_capacity_hold": "Auditor en espera (capacidad)",
+      "no_pool_configured": "Sin grupo de ejecución configurado"
     },
     "settings": {
       "title": "Pares de tareas (supervisión por marcadores)",

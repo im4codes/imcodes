@@ -4352,7 +4352,8 @@
       "replacement_churn": "監査者の頻繁な交代",
       "markers_unresolved": "未解決のマーカー",
       "all_providers_limited": "全プロバイダー制限中",
-      "auditor_capacity_hold": "監査者待機中(容量)"
+      "auditor_capacity_hold": "監査者待機中(容量)",
+      "no_pool_configured": "実行プール未設定"
     },
     "settings": {
       "title": "タスクペア（マーカー駆動の監督）",

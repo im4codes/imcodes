@@ -4352,7 +4352,8 @@
       "replacement_churn": "Частая смена аудитора",
       "markers_unresolved": "Неразрешённые маркеры",
       "all_providers_limited": "Все провайдеры лимитированы",
-      "auditor_capacity_hold": "Аудитор ждёт (перегрузка)"
+      "auditor_capacity_hold": "Аудитор ждёт (перегрузка)",
+      "no_pool_configured": "Пул выполнения не настроен"
     },
     "settings": {
       "title": "Пары задач (надзор по маркерам)",

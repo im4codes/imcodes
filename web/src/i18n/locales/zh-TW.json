@@ -4353,7 +4353,8 @@
       "replacement_churn": "審計者頻繁更換",
       "markers_unresolved": "標記無法比對",
       "all_providers_limited": "所有服務商均受限",
-      "auditor_capacity_hold": "審計者容量保持中"
+      "auditor_capacity_hold": "審計者容量保持中",
+      "no_pool_configured": "未設定執行池"
     },
     "settings": {
       "title": "任務配對（標記驅動監督）",

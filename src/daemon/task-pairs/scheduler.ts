@@ -38,6 +38,7 @@ import { hasRecentTaskPairProviderError } from './provider-errors.js';
 import { ensureTaskPairWorkspaceAvailable, refreshTaskPairWorkspaceHead, taskPairService, type TaskPairScheduler } from './service.js';
 import {
   roleEligibleProvisionConfig,
+  brainHasConfiguredPools,
   describeAuditorPoolGap,
   describeLimitedProviderFamilies,
   describePoolSyncGap,
@@ -58,6 +59,7 @@ import {
   buildDispatchTrailer,
   buildExecutorHandoffMessage,
   buildExecutorResendMessage,
+  buildNoPoolAskMessage,
   buildNudgeMessage,
   buildQueueStallNoticeMessage,
   type PendingBrainNotice,
@@ -237,6 +239,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
       for (const [brain, project] of brains) {
         await this.runQueue(project, brain);
         await this.#checkQueueStalls(project, brain, now);
+        await this.#checkNoPoolAsk(project, brain, now);
       }
     } finally {
       this.#tickBusy = undefined;
@@ -528,6 +531,15 @@ export class TaskPairAutomation implements TaskPairScheduler {
       }
       return false;
     }
+    // Owner rule: an initial pick (never had a real auditor yet) with no
+    // pool configured and no named auditor model cannot be picked or
+    // provisioned at all -- ask the user instead of guessing. A dueToLimit
+    // replacement of an auditor that DID exist is a different case (that
+    // session was bound somehow before) and is unaffected.
+    if (!hadRealAuditor && this.#needsUserPoolChoice(pair.brain, pair.auditorModel)) {
+      await this.#flagNoPoolAndNotify(project, taskId, pair.brain);
+      return false;
+    }
     const exclude = new Set<string>([pair.brain, ...(pair.executor ? [pair.executor] : []), ...(pair.auditor ? [pair.auditor] : []), ...pair.previousAuditors]);
     // A limit-triggered replacement drops a named model pin: retrying the
     // exact model that just got limited can never succeed, and the point of
@@ -666,9 +678,13 @@ export class TaskPairAutomation implements TaskPairScheduler {
     const stored = store.getPair(project, taskId);
     if (!stored || stored.state.executor) return;
     const pair = stored.state;
+    const requestedModel = pair.executorModel;
+    if (this.#needsUserPoolChoice(pair.brain, requestedModel)) {
+      await this.#flagNoPoolAndNotify(project, taskId, pair.brain);
+      return;
+    }
     const pool = pair.executorPool === 'economy' ? 'economy' : 'primary';
     const exclude = new Set<string>([pair.brain, ...(pair.auditor ? [pair.auditor] : [])]);
-    const requestedModel = pair.executorModel;
     const next = this.#pick({ brain: pair.brain, role: 'executor', pool, exclude, project, requestedModel })
       ?? await this.#provision({ brain: pair.brain, role: 'executor', pool, project, taskId, requestedModel });
     if (!next) {
@@ -711,6 +727,51 @@ export class TaskPairAutomation implements TaskPairScheduler {
     const stored = store.getPair(project, taskId);
     if (!stored || stored.state.flags.includes(flag)) return;
     store.savePair(project, { ...stored.state, flags: [...stored.state.flags, flag], updatedAt: this.#now() });
+  }
+
+  /**
+   * Owner rule: a project with no execution pool configured has no built-in
+   * default. A role with neither a named session nor a named model there
+   * cannot be picked or provisioned at all -- ask the user instead of
+   * guessing. Injected `pickCandidate`/`provision` deps stand in for a real
+   * pool (the seam every other pool-backed pick test already relies on), so
+   * this never fires while either is overridden.
+   */
+  #needsUserPoolChoice(brain: string, requestedModel: string | undefined): boolean {
+    if (requestedModel) return false;
+    if (this.#deps.pickCandidate || this.#deps.provision) return false;
+    return !brainHasConfiguredPools(brain);
+  }
+
+  /** Flags the pair (idempotent) and tries the one combined, rate-limited ask-the-user notice for its project. */
+  async #flagNoPoolAndNotify(project: string, taskId: string, brain: string): Promise<void> {
+    this.#flagQuiet(project, taskId, 'no_pool_configured');
+    await this.#checkNoPoolAsk(project, brain, this.#now());
+  }
+
+  /**
+   * One combined, rate-limited notice per project for every pair currently
+   * unable to start because no execution pool is configured and no model
+   * was named for one of its roles. Fires promptly (unlike the queue-stall
+   * notice, there is nothing to wait out here -- the pair can never resolve
+   * this on its own) but never repeats faster than the same cooldown used
+   * for the stall notice, and stops entirely once a pool is configured.
+   */
+  async #checkNoPoolAsk(project: string, brain: string, now: number): Promise<void> {
+    if (brainHasConfiguredPools(brain)) return;
+    const store = getTaskPairStore();
+    const waiting = store.listActivePairs(project).filter((stored) => (
+      stored.state.brain === brain && stored.state.flags.includes('no_pool_configured')
+    ));
+    if (waiting.length === 0) return;
+    const key = `no_pool_ask_notice:${project}:${brain}`;
+    const lastSent = Number(store.getMeta(key) ?? 0);
+    if (now - lastSent < TASK_PAIR_QUEUE_STALL_NOTICE_MS) return;
+    store.setMeta(key, String(now));
+    await sendTaskPairMessage(
+      brain, TASK_PAIR_AGGREGATE_NOTICE_ID, 'brain-no-pool-ask',
+      buildNoPoolAskMessage(project, waiting.map((stored) => stored.state)),
+    );
   }
 
   /**
@@ -806,6 +867,17 @@ export class TaskPairAutomation implements TaskPairScheduler {
         this.#flagQuiet(project, pair.taskId, 'waiting_for_capacity');
         return;
       }
+      // Owner rule: no execution pool configured and no model named for a
+      // role this pair still needs -- nothing can be picked or provisioned
+      // for it, and it cannot resolve on its own. Unlike an ordinary
+      // capacity miss, this pair never blocks pairs behind it: it cannot
+      // start regardless of order, so later queued pairs are still tried.
+      const executorNeedsUser = !pair.executor && this.#needsUserPoolChoice(brain, pair.executorModel);
+      const auditorNeedsUser = !pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR && this.#needsUserPoolChoice(brain, pair.auditorModel);
+      if (executorNeedsUser || auditorNeedsUser) {
+        await this.#flagNoPoolAndNotify(project, pair.taskId, brain);
+        continue;
+      }
       const pool = pair.executorPool === 'economy' ? 'economy' : 'primary';
       const executor = pair.executor
         ?? this.#pick({ brain, role: 'executor', pool, exclude: new Set([brain, ...(pair.auditor ? [pair.auditor] : [])]), project, requestedModel: pair.executorModel })
@@ -834,7 +906,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
       });
       const dispatched = result.pair ?? store.getPair(project, pair.taskId)?.state;
       if (!dispatched) continue;
-      const cleaned = { ...dispatched, flags: dispatched.flags.filter((flag) => flag !== 'waiting_for_capacity') };
+      const cleaned = { ...dispatched, flags: dispatched.flags.filter((flag) => flag !== 'waiting_for_capacity' && flag !== 'no_pool_configured') };
       store.savePair(project, cleaned);
       open += 1;
       // The executor's worktree exists before the brief that names it is sent.

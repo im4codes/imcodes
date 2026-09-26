@@ -6,10 +6,13 @@
  * role -- executor, auditor, or both); the pairs engine only reads it. The
  * daemon picks a participant itself only for an AUTOMATIC dispatch or
  * auditor replacement (no named session/model), filtered by pool membership
- * and the matching entry's role. A project with no configured pool at all
- * falls back to the built-in default routing.
+ * and the matching entry's role.
  *
- * Owner rule: what the user or Brain names explicitly (an exact session, or
+ * Owner rule: a project with no execution pool configured at all has NO
+ * built-in default -- an automatic pick there returns nothing (see
+ * `brainHasConfiguredPools`); the scheduler asks the user instead of
+ * guessing (shared/task-pair.ts's marker contract states the same rule).
+ * What the user or Brain names explicitly (an exact session, or
  * `executormodel=`/`auditormodel=`) is used as-is and provisioned if it does
  * not exist yet, even outside the pool and regardless of any entry's role --
  * the pool governs only automatic picks, never a named one.
@@ -32,7 +35,6 @@ import {
   type SupervisionExecutionConfig,
   type SupervisionExecutionPoolKind,
 } from '../../../shared/supervision-execution-pool.js';
-import { matchesTaskPairBuiltinDefaultRouting } from '../../../shared/task-pair.js';
 import { delegationTargetInputs } from '../delegation-admission.js';
 import { configMatchesSession, configuredPools, poolDefinition } from '../supervision-auto-provision.js';
 import { describeSupervisorDefaultsSyncGap } from '../supervisor-defaults-cache.js';
@@ -93,10 +95,6 @@ export function describeRequestedModelMiss(requestedModel: string): string {
   return `no session/config for requested model ${requestedModel}${gap ? ` (${gap})` : ''}`;
 }
 
-function builtinDefaultRouted(session: SessionRecord, role: TaskPairPickRole): boolean {
-  return matchesTaskPairBuiltinDefaultRouting(role, session.agentType, resolveEffectiveSessionModel(session) ?? undefined);
-}
-
 /** A named model (`executormodel=`/`auditormodel=`) matches by exact id, case-insensitively. */
 function sameModelId(a: string | null | undefined, b: string): boolean {
   return !!a && a.toLowerCase() === b.toLowerCase();
@@ -144,10 +142,11 @@ export function listTaskPairCandidates(input: {
   );
   // Owner rule: a named model is never confined to the pool at all -- not
   // just its role. Only an AUTOMATIC pick (no requestedModel) is filtered by
-  // pool membership and role.
+  // pool membership and role, and has no built-in default when no pool is
+  // configured at all -- see brainHasConfiguredPools in the exclusion filter.
   const eligibleForRole = (session: SessionRecord): boolean => {
     if (input.requestedModel) return sameModelId(resolveEffectiveSessionModel(session), input.requestedModel);
-    if (!pools) return builtinDefaultRouted(session, input.role);
+    if (!pools) return false;
     const config = poolConfigOf(session);
     return !!config && supervisionExecutionConfigAllowsRole(config, input.role);
   };
@@ -190,9 +189,9 @@ export function providerFamilyOfSession(sessionName: string, deps: TaskPairPoolD
  * already both failed. Distinguishes a structural config gap (no entry
  * carries the auditor role at all -- nothing can ever be provisioned) from a
  * transient one (some entry qualifies, so the gap is every qualifying session
- * being busy, limited, or absent right now). Undefined only when no pools are
- * configured at all (the built-in default routing applies instead, and a miss
- * there is described by {@link describePoolSyncGap}).
+ * being busy, limited, or absent right now). Undefined when no pools are
+ * configured at all -- that case is the scheduler's "ask the user" path
+ * instead (see `brainHasConfiguredPools`), not a pool gap.
  */
 export function describeAuditorPoolGap(input: {
   brain: string;
@@ -291,7 +290,7 @@ export function describeLimitedProviderFamilies(input: {
   const availability = resolveDelegationTargets(delegationTargetInputs(sessions), (deps.now ?? Date.now)());
   const eligibleForRole = (session: SessionRecord): boolean => {
     if (input.requestedModel) return sameModelId(resolveEffectiveSessionModel(session), input.requestedModel);
-    if (!pools) return builtinDefaultRouted(session, input.role);
+    if (!pools) return false;
     const config = definition?.configs.find((candidate: SupervisionExecutionConfig) => configMatchesSession(candidate, session));
     return !!config && supervisionExecutionConfigAllowsRole(config, input.role);
   };

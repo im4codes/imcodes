@@ -4353,7 +4353,8 @@
       "replacement_churn": "审计者频繁更换",
       "markers_unresolved": "标记无法匹配",
       "all_providers_limited": "所有服务商均受限",
-      "auditor_capacity_hold": "审计者容量保持中"
+      "auditor_capacity_hold": "审计者容量保持中",
+      "no_pool_configured": "未配置执行池"
     },
     "settings": {
       "title": "任务配对（标记驱动监督）",

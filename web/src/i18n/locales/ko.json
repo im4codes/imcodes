@@ -4352,7 +4352,8 @@
       "replacement_churn": "감사자 잦은 교체",
       "markers_unresolved": "해결되지 않은 마커",
       "all_providers_limited": "모든 공급자 제한됨",
-      "auditor_capacity_hold": "감사자 대기(용량)"
+      "auditor_capacity_hold": "감사자 대기(용량)",
+      "no_pool_configured": "실행 풀 미구성"
     },
     "settings": {
       "title": "작업 페어(마커 기반 감독)",

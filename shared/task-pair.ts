@@ -177,6 +177,7 @@ export const TASK_PAIR_FLAGS = [
   'blocked', 'needs_input', 'unaudited', 'needs_auditor', 'over_limit', 'off_pool', 'economy_unreviewed',
   'waiting_for_capacity', 'executor_silent', 'verdict_inconsistent', 'awaiting_audit_ignored',
   'replacement_churn', 'markers_unresolved', 'all_providers_limited', 'auditor_capacity_hold',
+  'no_pool_configured',
 ] as const;
 export type TaskPairFlag = typeof TASK_PAIR_FLAGS[number];
 
@@ -199,30 +200,6 @@ export const TASK_PAIR_VERDICT_JUDGEMENTS = ['consistent', 'inconsistent', 'miss
 export type TaskPairVerdictJudgement = typeof TASK_PAIR_VERDICT_JUDGEMENTS[number];
 
 export type TaskPairSeverityCounts = Record<AuditSeverity, number>;
-
-// ---------------------------------------------------------------------------
-// Built-in default routing (daemon picks only, no execution pool configured)
-// ---------------------------------------------------------------------------
-
-/**
- * Pair routing is exactly the Brain's execution pool (each entry carries an
- * `executor` / `auditor` / `both` role): there is no separate allowlist. This
- * is the one exception -- a project that has never configured any execution
- * pool at all keeps this built-in default rather than picking nothing.
- */
-export const TASK_PAIR_BUILTIN_DEFAULT_ROUTING: Readonly<Record<'executor' | 'auditor', { agentType: string; modelPattern: string }>> = {
-  executor: { agentType: 'codex-sdk', modelPattern: 'gpt-6-luna' },
-  auditor: { agentType: 'claude-code-sdk', modelPattern: 'opus' },
-};
-
-export function matchesTaskPairBuiltinDefaultRouting(
-  role: 'executor' | 'auditor',
-  agentType: string,
-  model: string | undefined,
-): boolean {
-  const entry = TASK_PAIR_BUILTIN_DEFAULT_ROUTING[role];
-  return agentType === entry.agentType && (model ?? '').toLowerCase().includes(entry.modelPattern.toLowerCase());
-}
 
 /** How long a queued pair may sit unable to start before Brain hears about it (once, combined per project). */
 export const TASK_PAIR_QUEUE_STALL_NOTICE_MS = 30 * 60_000;
@@ -1134,7 +1111,7 @@ export function buildTaskPairMarkerContract(): string {
     TASK_PAIR_WORKSPACE_RULES,
     'Pairs have no assignmentId, auditAttemptId, auditRevision, immutable bundle, scopeFiles or control-plane binding: never wait for, ask for or block on them.',
     `Auditor: the material is the executor's workspace (a worktree at the named head, or the named task-directory path; read it directly) plus their reported validation; judge by ${AUDIT_CONVERGENCE_CONTRACT_ID}. Reply to the executor with every finding tagged [P0]..[P4], then write PASS or REWORK with the blocking set and a count per level, e.g. REWORK <taskId> blocking=P0 p0=1 p1=2. REWORK needs at least one finding at a blocking level; PASS has none. Re-audits check only the prior blocking classes plus regressions. If the material cannot be reached (executor limited/offline, workspace unreadable), write NEEDS_INPUT <taskId> note="..." and wait: that is never a P0 or REWORK.`,
-    `Brain: DISPATCH <taskId> executor=<session> auditor=<session>|none [blocking=P0,P1] [pool=primary|economy] [workspace=dir for non-code work in a git project]; queue with QUEUE <taskId> title="..." then the full brief then <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> -->; QUEUE - max=<n> sets your queue limit; REASSIGN <taskId> auditor=<session>; DONE <taskId> force=true completes without audit; CANCEL <taskId>. Naming executor=/auditor=<session> replaces the current holder of that role immediately, ignoring the execution pool's role config. Naming executormodel=/auditormodel=<model> instead steers the next automatic pick or replacement for that role (also ignoring pool roles) but does not by itself replace a role that is already filled -- REASSIGN with the session explicitly for that; no matching session or pool config for a named model replies "no session/config for requested model <model>".`,
+    `Brain: DISPATCH <taskId> executor=<session> auditor=<session>|none [blocking=P0,P1] [pool=primary|economy] [workspace=dir for non-code work in a git project]; queue with QUEUE <taskId> title="..." then the full brief then <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> -->; QUEUE - max=<n> sets your queue limit; REASSIGN <taskId> auditor=<session>; DONE <taskId> force=true completes without audit; CANCEL <taskId>. Naming executor=/auditor=<session> replaces the current holder of that role immediately, ignoring the execution pool's role config. Naming executormodel=/auditormodel=<model> instead steers the next automatic pick or replacement for that role (also ignoring pool roles) but does not by itself replace a role that is already filled -- REASSIGN with the session explicitly for that; no matching session or pool config for a named model replies "no session/config for requested model <model>". A project with no execution pool configured has no built-in default: before dispatching or queueing work there without naming executormodel=/auditormodel=/executor=/auditor= yourself, ask the user which models to use (Settings -> execution pool, or name them on the task) -- an unnamed role in that state picks nothing and waits.`,
     TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
     TASK_PAIR_BRAIN_REPORTING_RULE,
     TASK_PAIR_CHECKLIST_RULE,

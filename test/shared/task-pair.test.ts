@@ -8,7 +8,6 @@ import {
   applyTaskPairMarker,
   buildTaskPairMarkerContract,
   judgeTaskPairVerdict,
-  matchesTaskPairBuiltinDefaultRouting,
   scanTaskPairMarkers,
   stripTaskPairMarkersForDisplay,
   taskPairSideToAct,
@@ -443,16 +442,6 @@ describe('task-pair state machine', () => {
     expect(queued).toMatchObject({ status: 'queued', brief: 'brief body', title: 'Export', brain: BRAIN });
     expect(apply(undefined, BRAIN, '<!-- IMCODES_TASK QUEUE - max=8 -->').intents)
       .toEqual([{ kind: 'queue_settings', brain: BRAIN, maxConcurrency: 8 }]);
-  });
-});
-
-describe('task-pair built-in default routing', () => {
-  it('defaults to Codex gpt-6-luna executors and Claude Opus auditors when no pool is configured', () => {
-    expect(matchesTaskPairBuiltinDefaultRouting('executor', 'codex-sdk', 'gpt-6-luna')).toBe(true);
-    expect(matchesTaskPairBuiltinDefaultRouting('auditor', 'claude-code-sdk', 'claude-opus-5-5')).toBe(true);
-    expect(matchesTaskPairBuiltinDefaultRouting('executor', 'claude-code-sdk', 'claude-opus-5-5')).toBe(false);
-    expect(matchesTaskPairBuiltinDefaultRouting('auditor', 'claude-code-sdk', 'claude-sonnet-5')).toBe(false);
-    expect(matchesTaskPairBuiltinDefaultRouting('auditor', 'codex-sdk', 'gpt-6-luna')).toBe(false);
   });
 });
 
