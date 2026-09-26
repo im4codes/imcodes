@@ -63,6 +63,8 @@ import {
 /** Intents that need the pool, the heartbeat or the queue (see scheduler.ts). */
 export interface TaskPairScheduler {
   onIntent(project: string, pair: TaskPairState, intent: TaskPairIntent): void | Promise<void>;
+  /** Drain a Brain's queue after a capacity setting changes. */
+  runQueue?(project: string, brain: string): void | Promise<void>;
   /** A consistent PASS was applied (economy-review bookkeeping). */
   flagEconomyUnreviewed?(project: string, taskId: string): void;
 }
@@ -665,6 +667,13 @@ export class TaskPairService {
     for (const intent of intents) {
       if (intent.kind === 'queue_settings') {
         getTaskPairStore().setMaxConcurrency(intent.brain, intent.maxConcurrency);
+        // Avoid creating an empty run while this turn is still ingesting its
+        // following QUEUE/DISPATCH markers; that would defer the first real
+        // queue event and let a later urgent item overtake it.
+        const hasQueued = getTaskPairStore().listActivePairs(project).some((stored) => (
+          stored.state.brain === intent.brain && stored.state.status === 'queued'
+        ));
+        if (hasQueued) await this.#scheduler?.runQueue?.(project, intent.brain);
         continue;
       }
       if (!pair) continue;

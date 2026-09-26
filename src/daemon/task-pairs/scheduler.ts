@@ -79,6 +79,9 @@ export const TASK_PAIR_HEARTBEAT_ENV = 'IMCODES_TASK_PAIR_HEARTBEAT_MS' as const
 export const TASK_PAIR_BOTH_IDLE_NUDGE_ENV = 'IMCODES_TASK_PAIR_BOTH_IDLE_NUDGE_MS' as const;
 /** How often the lightweight both-idle check runs; independent of, and much cheaper than, a full heartbeat tick. */
 const TASK_PAIR_BOTH_IDLE_CHECK_INTERVAL_MS = 30_000;
+/** Bound pool discovery/provisioning so one provider or transport cannot freeze the queue. */
+export const TASK_PAIR_QUEUE_OPERATION_TIMEOUT_ENV = 'IMCODES_TASK_PAIR_QUEUE_OPERATION_TIMEOUT_MS' as const;
+const TASK_PAIR_QUEUE_OPERATION_TIMEOUT_MS = 15_000;
 
 export interface TaskPairSchedulerDeps {
   now?: () => number;
@@ -182,6 +185,41 @@ export class TaskPairAutomation implements TaskPairScheduler {
     return hasRecentTaskPairProviderError(session, this.#now(), this.#intervalMs);
   }
   #poolOf(brain: string, session: string) { return (this.#deps.poolOf ?? ((b, s) => poolOfSession(b, s)))(brain, session); }
+
+  #queueOperationTimeoutMs(): number {
+    const raw = Number(process.env[TASK_PAIR_QUEUE_OPERATION_TIMEOUT_ENV]);
+    return Number.isFinite(raw) && raw >= 1 ? raw : TASK_PAIR_QUEUE_OPERATION_TIMEOUT_MS;
+  }
+
+  async #withQueueTimeout<T>(operation: Promise<T>, label: string, taskId: string): Promise<T | undefined> {
+    const timeoutMs = this.#queueOperationTimeoutMs();
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        operation,
+        new Promise<undefined>((resolve) => {
+          timer = setTimeout(() => {
+            logger.info({ taskId, label, timeoutMs }, 'task-pair: queue operation timed out');
+            resolve(undefined);
+          }, timeoutMs);
+        }),
+      ]);
+    } catch (error) {
+      logger.info({ err: error, taskId, label }, 'task-pair: queue operation failed');
+      return undefined;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  async #queueProvision(input: { brain: string; role: TaskPairPickRole; pool: 'primary' | 'economy'; exclude?: ReadonlySet<string>; project: string; taskId: string; requestedModel?: string; avoidProviderFamily?: string }): Promise<string | undefined> {
+    const { exclude: _exclude, ...provisionInput } = input;
+    return this.#withQueueTimeout(this.#provision(provisionInput), 'provision', input.taskId);
+  }
+
+  #logQueueSkip(project: string, pair: TaskPairState, reason: string): void {
+    logger.info({ project, taskId: pair.taskId, reason }, 'task-pair: queue skipped pair');
+  }
 
   #pick(input: { brain: string; role: TaskPairPickRole; pool: 'primary' | 'economy'; exclude: ReadonlySet<string>; project: string; requestedModel?: string; avoidProviderFamily?: string }): string | undefined {
     if (this.#deps.pickCandidate) return this.#deps.pickCandidate(input);
@@ -945,11 +983,9 @@ export class TaskPairAutomation implements TaskPairScheduler {
     const queued = store.listActivePairs(project).filter((stored) => (
       stored.state.brain === brain && stored.state.status === 'queued'
     ));
-    // The run-queue loop is strict FIFO and stops at the first pair it can't
-    // start, so only the HEAD of the queue ever gets flagged/timestamped by
-    // #flagQuiet -- everything behind it is equally stuck (it cannot start
-    // until the head does), so once the head has been stuck long enough the
-    // whole queued set is reported together.
+    // Queue misses are recorded per pair. Report once any queued work has
+    // remained capacity-blocked for the stall interval; the scheduler may
+    // continue past a miss when a later pair needs a different role/model.
     const stalledHead = queued.some((stored) => (
       stored.state.flags.includes('waiting_for_capacity') && now - stored.state.updatedAt >= TASK_PAIR_QUEUE_STALL_NOTICE_MS
     ));
@@ -998,7 +1034,14 @@ export class TaskPairAutomation implements TaskPairScheduler {
   async runQueue(project: string, brain: string): Promise<void> {
     const key = `${project}\u0000${brain}`;
     const running = this.#queueRuns.get(key);
-    if (running) { await running; return; }
+    // Operations in a run are individually bounded, so waiting for an older
+    // run cannot become an unbounded queue freeze. Re-run after it drains so a
+    // trigger that arrived while the queue was settling is not lost.
+    if (running) {
+      await running;
+      if (!this.#queueRuns.has(key)) await this.runQueue(project, brain);
+      return;
+    }
     const run = this.#runQueueOnce(project, brain).finally(() => this.#queueRuns.delete(key));
     this.#queueRuns.set(key, run);
     await run;
@@ -1019,6 +1062,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
       // legitimate and starts below, briefed like an immediate DISPATCH.
       if (pair.brief === undefined && stored.legacyTaskId) {
         this.#flagOnceWithKey(stored, 'no_brief', buildNoBriefLine(pair.taskId));
+        this.#logQueueSkip(project, pair, 'legacy pair has no brief');
         continue;
       }
       // A session named explicitly on QUEUE (executor=/auditor=) is a
@@ -1029,7 +1073,8 @@ export class TaskPairAutomation implements TaskPairScheduler {
       // auto-pick -- the owner named that session on purpose.
       if ((pair.executor && this.#busy(pair.executor)) || (pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR && this.#busy(pair.auditor))) {
         this.#flagQuiet(project, pair.taskId, 'waiting_for_capacity');
-        return;
+        this.#logQueueSkip(project, pair, 'named participant busy');
+        continue;
       }
       // Owner rule: no execution pool configured and no model named for a
       // role this pair still needs -- nothing can be picked or provisioned
@@ -1040,16 +1085,20 @@ export class TaskPairAutomation implements TaskPairScheduler {
       const auditorNeedsUser = !pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR && this.#needsUserPoolChoice(brain, pair.auditorModel);
       if (executorNeedsUser || auditorNeedsUser) {
         await this.#flagNoPoolAndNotify(project, pair.taskId, brain);
+        this.#logQueueSkip(project, pair, 'no execution pool configured');
         continue;
       }
       const pool = pair.executorPool === 'economy' ? 'economy' : 'primary';
+      if (!pair.executor || (pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR)) {
+        this.#flagQuiet(project, pair.taskId, 'waiting_for_capacity');
+      }
       const executor = pair.executor
         ?? this.#pick({ brain, role: 'executor', pool, exclude: new Set([brain, ...(pair.auditor ? [pair.auditor] : [])]), project, requestedModel: pair.executorModel })
-        ?? await this.#provision({ brain, role: 'executor', pool, project, taskId: pair.taskId, requestedModel: pair.executorModel });
+        ?? await this.#queueProvision({ brain, role: 'executor', pool, project, taskId: pair.taskId, requestedModel: pair.executorModel });
       const auditor = pair.auditor
         ?? (executor
           ? this.#pick({ brain, role: 'auditor', pool: 'primary', exclude: new Set([brain, executor]), project, requestedModel: pair.auditorModel })
-            ?? await this.#provision({ brain, role: 'auditor', pool: 'primary', project, taskId: pair.taskId, requestedModel: pair.auditorModel })
+            ?? await this.#queueProvision({ brain, role: 'auditor', pool: 'primary', project, taskId: pair.taskId, requestedModel: pair.auditorModel })
           : undefined);
       if (!executor || !auditor || executor === auditor) {
         // No per-pair notice here (owner correction): a queue miss is common
@@ -1058,7 +1107,8 @@ export class TaskPairAutomation implements TaskPairScheduler {
         // limited stall notice (see #checkQueueStalls) once it has actually
         // persisted a long time.
         this.#flagQuiet(project, pair.taskId, 'waiting_for_capacity');
-        return;
+        this.#logQueueSkip(project, pair, !executor ? 'executor capacity unavailable' : !auditor ? 'auditor capacity unavailable' : 'executor and auditor collide');
+        continue;
       }
       const result = taskPairService.applyMarker({
         project,

@@ -37,7 +37,7 @@ describe('pair MCP projections', () => {
     const listed = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_LIST]({});
     expect(listed.status).toBe('ok');
     const listedPairs = listed.pairs as Array<Record<string, unknown>>;
-    expect(listedPairs.find((item) => item.taskId === 'running-1')).toMatchObject({ executor: { session: EXEC, state: 'idle' } });
+    expect(listedPairs.find((item) => item.taskId === 'running-1')).toMatchObject({ executor: { session: EXEC, state: 'idle' }, executorModel: null, auditorModel: null });
     expect(listedPairs.find((item) => item.taskId === 'queued-1')).toMatchObject({ status: 'queued', queuePosition: expect.any(Number) });
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_GET]({ taskId: 'running-1' })).resolves.toMatchObject({
       status: 'ok', pair: { taskId: 'running-1', brief: null, events: [expect.objectContaining({ id: 'evt-1' })] },
@@ -66,7 +66,17 @@ describe('pair MCP projections', () => {
 
   it('persists the Brain queue limit through pair MCP tools', async () => {
     const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => [session(BRAIN, 'brain')] } });
-    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_SET_MAX_CONCURRENCY]({ maxConcurrency: 7 })).resolves.toEqual({ status: 'ok', maxConcurrency: 7 });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_SET_MAX_CONCURRENCY]({ maxConcurrency: 7 })).resolves.toEqual({ status: 'ok', requestedMaxConcurrency: 7, maxConcurrency: 7, effectiveMaxConcurrency: 7 });
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_GET_MAX_CONCURRENCY]({})).resolves.toEqual({ status: 'ok', maxConcurrency: 7 });
+  });
+
+  it('projects requested role models and the explicit no-audit value for queued work', async () => {
+    getTaskPairStore().savePair(PROJECT, {
+      ...pair('models-1', 'queued'), executor: undefined, auditor: 'none',
+      executorModel: 'gpt-6-luna', auditorModel: undefined,
+    });
+    const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => [session(BRAIN, 'brain')] } });
+    const listed = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_LIST]({});
+    expect((listed.pairs as Array<Record<string, unknown>>)[0]).toMatchObject({ executorModel: 'gpt-6-luna', auditorModel: 'none' });
   });
 });

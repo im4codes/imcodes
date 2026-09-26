@@ -487,6 +487,53 @@ describe('task-pair heartbeat, replacement and queue', () => {
     expect(pair('Q3').flags).not.toContain('waiting_for_capacity');
   });
 
+  it('skips a capacity miss so a later pair with different needs can start', async () => {
+    queuePairDirect('HOL1', 'blocked brief');
+    queuePairDirect('HOL2', 'good brief');
+    const first = getTaskPairStore().getPair(PROJECT, 'HOL1')!.state;
+    const second = getTaskPairStore().getPair(PROJECT, 'HOL2')!.state;
+    getTaskPairStore().savePair(PROJECT, { ...first, executorModel: 'blocked', auditor: 'none' });
+    getTaskPairStore().savePair(PROJECT, { ...second, executorModel: 'good', auditor: 'none' });
+    candidates = [SPARE];
+    automation = new TaskPairAutomation({
+      now: () => now,
+      pickCandidate: ({ requestedModel }) => requestedModel === 'blocked' ? undefined : SPARE,
+      provision: async () => undefined,
+      importLegacy: () => undefined,
+    });
+    taskPairService.setScheduler(automation);
+    await automation.runQueue(PROJECT, BRAIN);
+    expect(pair('HOL1').status).toBe('queued');
+    expect(pair('HOL2')).toMatchObject({ status: 'working', executor: SPARE, auditor: 'none' });
+  });
+
+  it('bounds a hung provisioning attempt and still drains later queued work', async () => {
+    const previous = process.env.IMCODES_TASK_PAIR_QUEUE_OPERATION_TIMEOUT_MS;
+    process.env.IMCODES_TASK_PAIR_QUEUE_OPERATION_TIMEOUT_MS = '10';
+    try {
+      queuePairDirect('HANG1', 'blocked brief');
+      queuePairDirect('HANG2', 'good brief');
+      const first = getTaskPairStore().getPair(PROJECT, 'HANG1')!.state;
+      const second = getTaskPairStore().getPair(PROJECT, 'HANG2')!.state;
+      getTaskPairStore().savePair(PROJECT, { ...first, executorModel: 'blocked', auditor: 'none' });
+      getTaskPairStore().savePair(PROJECT, { ...second, executorModel: 'good', auditor: 'none' });
+      automation = new TaskPairAutomation({
+        now: () => now,
+        pickCandidate: ({ requestedModel }) => requestedModel === 'good' ? SPARE : undefined,
+        provision: () => new Promise<string | undefined>(() => {}),
+        importLegacy: () => undefined,
+      });
+      taskPairService.setScheduler(automation);
+      await automation.runQueue(PROJECT, BRAIN);
+      expect(pair('HANG1').status).toBe('queued');
+      expect(pair('HANG2')).toMatchObject({ status: 'working', executor: SPARE, auditor: 'none' });
+      await flush();
+    } finally {
+      if (previous === undefined) delete process.env.IMCODES_TASK_PAIR_QUEUE_OPERATION_TIMEOUT_MS;
+      else process.env.IMCODES_TASK_PAIR_QUEUE_OPERATION_TIMEOUT_MS = previous;
+    }
+  });
+
   it('sends one combined notice for queued tasks stalled a long time, not one per pair or per tick', async () => {
     candidates = [];
     marker(BRAIN, '<!-- IMCODES_TASK QUEUE Q3a -->\nbrief a\n<!-- IMCODES_TASK_END Q3a -->');

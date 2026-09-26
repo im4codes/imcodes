@@ -1,6 +1,7 @@
 import { withPairsLegacyTools } from './task-pairs/legacy-tools.js';
 import { emitTaskPairDaemonEvent } from './task-pairs/service.js';
-import { projectOfSession } from './task-pairs/engine.js';
+import { projectOfSession, resolveTaskPairMaxConcurrency } from './task-pairs/engine.js';
+import { taskPairAutomation } from './task-pairs/scheduler.js';
 import { randomUUID } from 'node:crypto';
 import { parseTaskPairChecklist, taskPairChecklistCounts, updateTaskPairChecklist } from '../../shared/task-pair-checklist.js';
 import { taskPairRoleOf } from '../../shared/task-pair.js';
@@ -1624,6 +1625,8 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       blocking: state.blocking,
       executor: pairParticipant(state.executor, sessions),
       auditor: pairParticipant(state.auditor, sessions),
+      executorModel: state.executorModel ?? null,
+      auditorModel: state.auditor === 'none' ? 'none' : (state.auditorModel ?? null),
       queuePosition: state.status === 'queued' ? (queuePositions.get(state.taskId) ?? null) : null,
       urgent: (state as TaskPairState & { urgent?: boolean }).urgent === true,
       queuedAt: state.createdAt,
@@ -2593,7 +2596,9 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'maxConcurrency must be an integer from 1 to 100');
       }
       getTaskPairStore().setMaxConcurrency(caller.sessionName!, maxConcurrency);
-      return { status: 'ok', maxConcurrency };
+      await taskPairAutomation.runQueue(context.project, caller.sessionName!);
+      const effectiveMaxConcurrency = resolveTaskPairMaxConcurrency(caller.sessionName!);
+      return { status: 'ok', requestedMaxConcurrency: maxConcurrency, maxConcurrency: effectiveMaxConcurrency, effectiveMaxConcurrency };
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_GET_MAX_CONCURRENCY]: async () => {
       const context = await pairCallerContext();
