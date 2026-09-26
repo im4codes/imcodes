@@ -3820,12 +3820,13 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   if (requestedUiLocale && sessionName) {
     try {
       const existingRecord = getSession(sessionName);
-      // A field-level patch (patchTransportConfigUiLocale), never a
-      // normalize/embed of the whole snapshot: the stored snapshot may be
-      // invalid or legacy-repair-only by design (hasInvalidSessionSupervisionSnapshot),
-      // kept exactly as-is pending a deliberate user fix. Rebuilding it
-      // through the normalizer on an ordinary send would silently replace
-      // that data (mode, pairEngine, custom instructions, ...) with defaults.
+      // patchTransportConfigUiLocale stores this under its own sibling
+      // transportConfig key, never inside transportConfig.supervision: that
+      // object is a strictly validated snapshot that may be intentionally
+      // absent, invalid, or legacy-repair-only, and either rebuilding it
+      // through the normalizer or merely adding a field to it here would
+      // silently change what every other reader sees (lost config, or an
+      // unconfigured/repair-pending session on an ordinary send).
       if (existingRecord && isSupportedSupervisionTargetSessionType(existingRecord.agentType)
         && readTransportConfigUiLocale(existingRecord.transportConfig ?? null) !== requestedUiLocale) {
         upsertSession({

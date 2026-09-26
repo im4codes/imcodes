@@ -1689,44 +1689,42 @@ export function embedSessionSupervisionSnapshot(
   };
 }
 
+/** A top-level `transportConfig` key, deliberately a sibling of `SUPERVISION_TRANSPORT_CONFIG_KEY`, not a field inside it. */
+export const TRANSPORT_CONFIG_UI_LOCALE_KEY = 'uiLocale' as const;
+
 /**
- * Shallow-merges only `uiLocale` into whatever raw supervision object is
- * already stored (or `{}` if none), bypassing normalize/embed entirely.
- * Deliberately does not go through `extractSessionSupervisionSnapshot` /
- * `normalizeSessionSupervisionSnapshot`: those refuse (return
- * null / a fresh default) a snapshot the codebase intentionally leaves
- * invalid or legacy-repair-only pending a deliberate user fix, and rebuilding
- * through them here would silently replace that stored data with defaults on
- * an ordinary send. Every other stored field -- valid, invalid, or one no
- * normalizer field even knows about -- survives byte-for-byte. Read back with
- * {@link readTransportConfigUiLocale}, not `extractSessionSupervisionSnapshot`.
+ * Sets the browser's UI locale as a sibling top-level `transportConfig` key.
+ * Deliberately NOT a field inside `transportConfig.supervision`
+ * (`SUPERVISION_TRANSPORT_CONFIG_KEY`): that object is a strictly validated
+ * snapshot (`getSessionSupervisionSnapshotIssues` requires `mode`, among
+ * other fields), so even patching only `uiLocale` into it -- when valid,
+ * invalid, or entirely absent -- made an otherwise-unconfigured or
+ * intentionally-invalid/repair-only session look invalid
+ * (`hasInvalidSessionSupervisionSnapshot` true) purely from an ordinary send.
+ * This key is inspected by nothing that validates or normalizes supervision,
+ * so `transportConfig.supervision` (present, absent, valid, or
+ * repair-pending) is never read, created, or modified here. Read back with
+ * {@link readTransportConfigUiLocale}.
  */
 export function patchTransportConfigUiLocale(
   transportConfig: Record<string, unknown> | null | undefined,
   uiLocale: SupervisionUiLocale,
 ): Record<string, unknown> {
   const base = isPlainObject(transportConfig) ? transportConfig : {};
-  const existingSupervision = base[SUPERVISION_TRANSPORT_CONFIG_KEY];
-  const rawSupervision = isPlainObject(existingSupervision) ? existingSupervision : {};
-  return {
-    ...base,
-    [SUPERVISION_TRANSPORT_CONFIG_KEY]: { ...rawSupervision, uiLocale },
-  };
+  return { ...base, [TRANSPORT_CONFIG_UI_LOCALE_KEY]: uiLocale };
 }
 
 /**
- * Reads `uiLocale` straight from the raw stored supervision object, tolerant
- * of a snapshot that is otherwise invalid or legacy-repair-only (which
- * `extractSessionSupervisionSnapshot` would refuse and return null for).
- * Pairs with {@link patchTransportConfigUiLocale}.
+ * Reads `uiLocale` from its sibling top-level `transportConfig` key. Pairs
+ * with {@link patchTransportConfigUiLocale}; never touches
+ * `transportConfig.supervision`, so this is safe to call regardless of
+ * whether that snapshot exists or is valid.
  */
 export function readTransportConfigUiLocale(
   transportConfig: Record<string, unknown> | null | undefined,
 ): SupervisionUiLocale | undefined {
   if (!isPlainObject(transportConfig)) return undefined;
-  const supervision = transportConfig[SUPERVISION_TRANSPORT_CONFIG_KEY];
-  if (!isPlainObject(supervision)) return undefined;
-  return normalizeSupervisionUiLocale(supervision.uiLocale);
+  return normalizeSupervisionUiLocale(transportConfig[TRANSPORT_CONFIG_UI_LOCALE_KEY]);
 }
 
 export function readSupervisionSnapshotFromTransportConfig(

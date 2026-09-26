@@ -12,12 +12,13 @@ import type { SessionRecord } from '../../../src/store/session-store.js';
 import { getSession, removeSession, upsertSession } from '../../../src/store/session-store.js';
 import { timelineEmitter } from '../../../src/daemon/timeline-emitter.js';
 import { TaskPairStore, setTaskPairStoreForTests, getTaskPairStore } from '../../../src/daemon/task-pairs/store.js';
+import { brainUiLocale } from '../../../src/daemon/task-pairs/engine.js';
 import { setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
 import { TaskPairService, taskPairService } from '../../../src/daemon/task-pairs/service.js';
 import { setTaskPairTitleGeneratorForTests } from '../../../src/daemon/task-pairs/title-generator.js';
 import { dispatchSendMessage, clearSendIdempotencyCacheForTests } from '../../../src/daemon/send-tool.js';
 import { handleWebCommand } from '../../../src/daemon/command-handler.js';
-import { hasInvalidSessionSupervisionSnapshot, normalizeSessionSupervisionSnapshot } from '../../../shared/supervision-config.js';
+import { hasInvalidSessionSupervisionSnapshot, patchTransportConfigUiLocale, type SupervisionUiLocale } from '../../../shared/supervision-config.js';
 import { TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS, TASK_PAIR_TIMELINE_EVENT } from '../../../shared/task-pair.js';
 
 const PROJECT = 'titleproj';
@@ -35,7 +36,7 @@ function session(name: string, role: SessionRecord['role'], extra: Partial<Sessi
 
 function setBrainLocale(locale: string | undefined): void {
   upsertSession(session(BRAIN, 'brain', {
-    transportConfig: locale ? { supervision: normalizeSessionSupervisionSnapshot({ uiLocale: locale }) } : undefined,
+    transportConfig: locale ? patchTransportConfigUiLocale(null, locale as SupervisionUiLocale) : undefined,
   }));
 }
 
@@ -127,7 +128,29 @@ describe('task-pair title generation', () => {
     expect(pair('T11')?.title).toBe('修复登录问题');
   });
 
-  it('persisting uiLocale on an invalid stored snapshot leaves every other field byte-for-byte unchanged', async () => {
+  it('persisting uiLocale on a session with no supervision config at all never creates or invalidates one', async () => {
+    // Regression (tsk_cd_pair_title_i18n round 3): storing uiLocale inside
+    // transportConfig.supervision -- even alone -- produced a bare
+    // `{ uiLocale }` object that fails the snapshot's own validation (no
+    // `mode`), turning an unconfigured-but-valid session into one
+    // hasInvalidSessionSupervisionSnapshot reports as invalid/repair-pending,
+    // purely from an ordinary send. 8 of 12 real Brain sessions on this
+    // machine had exactly this shape (no supervision key at all).
+    upsertSession({ ...session(BRAIN, 'brain'), transportConfig: undefined });
+    expect(hasInvalidSessionSupervisionSnapshot(getSession(BRAIN)?.transportConfig ?? null)).toBe(false);
+
+    handleWebCommand({
+      type: 'session.send', session: BRAIN, commandId: 'cmd-locale-none', uiLocale: 'zh-CN',
+    }, { send: vi.fn() } as never);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    const transportConfig = getSession(BRAIN)?.transportConfig as Record<string, unknown> | undefined;
+    expect(hasInvalidSessionSupervisionSnapshot(transportConfig ?? null)).toBe(false);
+    expect(transportConfig?.supervision).toBeUndefined();
+    expect(brainUiLocale(PROJECT)).toBe('zh-CN');
+  });
+
+  it('persisting uiLocale on an invalid stored snapshot never reads, creates, or modifies transportConfig.supervision', async () => {
     // Reproduces the exact stored shape a repair-pending session can carry
     // (hasInvalidSessionSupervisionSnapshot): an unrecognized backend. The
     // codebase deliberately keeps this as-is for the repair UI rather than
@@ -146,10 +169,12 @@ describe('task-pair title generation', () => {
 
     const transportConfig = getSession(BRAIN)?.transportConfig as Record<string, unknown>;
     expect(transportConfig.unrelatedKey).toBe('unrelated');
-    expect(transportConfig.supervision).toEqual({ ...invalidSupervision, uiLocale: 'zh-CN' });
+    expect(transportConfig.supervision).toEqual(invalidSupervision);
+    expect(transportConfig.uiLocale).toBe('zh-CN');
+    expect(brainUiLocale(PROJECT)).toBe('zh-CN');
   });
 
-  it('persisting uiLocale on a legacy repair-only snapshot (auditMode requiring repair) leaves every other field byte-for-byte unchanged', async () => {
+  it('persisting uiLocale on a legacy repair-only snapshot (auditMode requiring repair) never modifies it', async () => {
     const legacySupervision = {
       mode: 'supervised_audit', auditMode: '', pairEngine: 'pairs', pairMaxConcurrency: 2,
     };
@@ -162,7 +187,8 @@ describe('task-pair title generation', () => {
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
 
     const transportConfig = getSession(BRAIN)?.transportConfig as Record<string, unknown>;
-    expect(transportConfig.supervision).toEqual({ ...legacySupervision, uiLocale: 'ja' });
+    expect(transportConfig.supervision).toEqual(legacySupervision);
+    expect(transportConfig.uiLocale).toBe('ja');
   });
 
   it('never generates over an explicit title', async () => {

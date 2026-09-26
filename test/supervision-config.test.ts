@@ -46,6 +46,7 @@ import {
   patchTransportConfigUiLocale,
   readTransportConfigUiLocale,
   readSupervisionSnapshotFromTransportConfig,
+  TRANSPORT_CONFIG_UI_LOCALE_KEY,
   resolveSupervisionAuditBlockingSeverities,
   normalizeSupervisorDefaultConfig,
   parseSupervisionExecutionStateDetailsFromText,
@@ -646,13 +647,28 @@ describe('supervision config helpers', () => {
   });
 
   describe('patchTransportConfigUiLocale / readTransportConfigUiLocale', () => {
-    it('creates a supervision object with just uiLocale when nothing was stored', () => {
+    it('creates just a sibling uiLocale key when nothing was stored, never a supervision object', () => {
       const patched = patchTransportConfigUiLocale(null, 'zh-CN');
-      expect(patched).toEqual({ [SUPERVISION_TRANSPORT_CONFIG_KEY]: { uiLocale: 'zh-CN' } });
+      expect(patched).toEqual({ [TRANSPORT_CONFIG_UI_LOCALE_KEY]: 'zh-CN' });
+      expect(SUPERVISION_TRANSPORT_CONFIG_KEY in patched).toBe(false);
       expect(readTransportConfigUiLocale(patched)).toBe('zh-CN');
     });
 
-    it('shallow-merges over a valid stored snapshot without normalizing it, preserving every other field and unrelated keys', () => {
+    it('never creates or invalidates transportConfig.supervision for a session with none stored', () => {
+      // Regression (tsk_cd_pair_title_i18n round 3): storing uiLocale inside
+      // transportConfig.supervision -- even alone, in a config that had none
+      // before -- produced a bare `{ uiLocale }` object that fails the
+      // supervision snapshot's own validation (missing `mode`), turning an
+      // unconfigured, valid session into one hasInvalidSessionSupervisionSnapshot
+      // reports as invalid/repair-pending purely from an ordinary send.
+      const patched = patchTransportConfigUiLocale({}, 'zh-CN');
+      expect(patched).toEqual({ [TRANSPORT_CONFIG_UI_LOCALE_KEY]: 'zh-CN' });
+      expect(SUPERVISION_TRANSPORT_CONFIG_KEY in patched).toBe(false);
+      expect(hasInvalidSessionSupervisionSnapshot(patched)).toBe(false);
+      expect(readTransportConfigUiLocale(patched)).toBe('zh-CN');
+    });
+
+    it('preserves a valid stored supervision snapshot and unrelated keys completely untouched', () => {
       const snapshot = normalizeSessionSupervisionSnapshot({
         mode: SUPERVISION_MODE.SUPERVISED,
         backend: 'claude-code-sdk',
@@ -665,16 +681,19 @@ describe('supervision config helpers', () => {
       const patched = patchTransportConfigUiLocale(transportConfig, 'ja');
 
       expect(patched.unrelated).toEqual({ keep: true });
-      expect(patched[SUPERVISION_TRANSPORT_CONFIG_KEY]).toEqual({ ...snapshot, uiLocale: 'ja' });
+      expect(patched[SUPERVISION_TRANSPORT_CONFIG_KEY]).toEqual(snapshot);
+      expect(patched[TRANSPORT_CONFIG_UI_LOCALE_KEY]).toBe('ja');
       expect(readTransportConfigUiLocale(patched)).toBe('ja');
     });
 
-    it('never rewrites an invalid stored snapshot through the normalizer: every other field survives byte-for-byte', () => {
-      // Regression (tsk_cd_pair_title_i18n round 2): reading with
-      // extractSessionSupervisionSnapshot (which returns null for an invalid
-      // snapshot) and falling back to a fresh default before re-embedding
-      // silently replaced a repair-pending session's real config -- mode,
-      // pairEngine, custom instructions -- with defaults on an ordinary send.
+    it('preserves an invalid stored snapshot completely untouched (round-2 fixture)', () => {
+      // Round 2: reconstructing the snapshot through
+      // extractSessionSupervisionSnapshot (null for an invalid one) and
+      // normalizeSessionSupervisionSnapshot before re-embedding silently
+      // replaced a repair-pending session's real config -- mode, pairEngine,
+      // custom instructions -- with defaults. This must not read, create, or
+      // modify transportConfig.supervision at all, so it stays exactly as
+      // invalid (and exactly as stored) as it was before this call.
       const invalidSupervision = {
         mode: SUPERVISION_MODE.SUPERVISED_AUDIT, backend: 'bogus-backend', model: 'x',
         pairEngine: 'pairs', pairMaxConcurrency: 4, customInstructions: 'keep me',
@@ -685,11 +704,13 @@ describe('supervision config helpers', () => {
 
       const patched = patchTransportConfigUiLocale(transportConfig, 'zh-CN');
 
-      expect(patched[SUPERVISION_TRANSPORT_CONFIG_KEY]).toEqual({ ...invalidSupervision, uiLocale: 'zh-CN' });
+      expect(patched[SUPERVISION_TRANSPORT_CONFIG_KEY]).toBe(invalidSupervision);
+      expect(hasInvalidSessionSupervisionSnapshot(patched)).toBe(true);
+      expect(patched[TRANSPORT_CONFIG_UI_LOCALE_KEY]).toBe('zh-CN');
       expect(readTransportConfigUiLocale(patched)).toBe('zh-CN');
     });
 
-    it('never rewrites a legacy repair-only snapshot (auditMode requiring repair): every other field survives byte-for-byte', () => {
+    it('preserves a legacy repair-only snapshot (auditMode requiring repair) completely untouched', () => {
       const legacySupervision = {
         mode: SUPERVISION_MODE.SUPERVISED_AUDIT, auditMode: '', pairEngine: 'pairs', pairMaxConcurrency: 2,
       };
@@ -698,16 +719,16 @@ describe('supervision config helpers', () => {
 
       const patched = patchTransportConfigUiLocale(transportConfig, 'ru');
 
-      expect(patched[SUPERVISION_TRANSPORT_CONFIG_KEY]).toEqual({ ...legacySupervision, uiLocale: 'ru' });
+      expect(patched[SUPERVISION_TRANSPORT_CONFIG_KEY]).toBe(legacySupervision);
       expect(readTransportConfigUiLocale(patched)).toBe('ru');
     });
 
-    it('readTransportConfigUiLocale returns undefined for missing/malformed input', () => {
+    it('readTransportConfigUiLocale returns undefined for missing/malformed input, and never reads transportConfig.supervision', () => {
       expect(readTransportConfigUiLocale(null)).toBeUndefined();
       expect(readTransportConfigUiLocale(undefined)).toBeUndefined();
       expect(readTransportConfigUiLocale({})).toBeUndefined();
-      expect(readTransportConfigUiLocale({ [SUPERVISION_TRANSPORT_CONFIG_KEY]: 'not-an-object' })).toBeUndefined();
-      expect(readTransportConfigUiLocale({ [SUPERVISION_TRANSPORT_CONFIG_KEY]: { uiLocale: 'not-a-real-locale' } })).toBeUndefined();
+      expect(readTransportConfigUiLocale({ [TRANSPORT_CONFIG_UI_LOCALE_KEY]: 'not-a-real-locale' })).toBeUndefined();
+      expect(readTransportConfigUiLocale({ [SUPERVISION_TRANSPORT_CONFIG_KEY]: { uiLocale: 'zh-CN' } })).toBeUndefined();
     });
   });
 
