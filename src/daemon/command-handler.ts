@@ -5600,7 +5600,28 @@ async function handleAppendQueuedTransportMessages(cmd: Record<string, unknown>,
     } catch (err) {
       logger.warn({ err, sessionName }, 'expired handoff recovery failed before append');
     }
-    const result = await runtime.appendPendingMessagesToActiveTurn(clientMessageIds, commandId);
+    // This is the external, user-initiated append/append-all entry point:
+    // opt into the "no active turn -> dispatch the queue as a fresh turn"
+    // fallback (the internal scheduled active-append-flush loop does not).
+    const result = await runtime.appendPendingMessagesToActiveTurn(
+      clientMessageIds, commandId, undefined, { allowDispatchAsNewTurn: true },
+    );
+    if (result.status === 'dispatched_as_new_turn') {
+      // No turn was active by the time the runtime looked; the pending queue
+      // was dispatched as a fresh turn instead of appended in-place. This is
+      // success from the caller's point of view — the queued messages are on
+      // their way — so ack normally and broadcast the now-accurate state
+      // (the drain already flipped `sending`/`pendingCount`) instead of the
+      // stale "already finished" error this closure used to return.
+      const queuePayload = buildTransportQueueSnapshotPayload(sessionName, 'command_handler');
+      timelineEmitter.emit(sessionName, 'session.state', {
+        state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
+        ...queuePayload,
+      }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
+      emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
+      return;
+    }
     if (result.status !== 'delivered') {
       const error = result.status === 'unsupported'
         ? 'Active-turn append is not supported by this provider'

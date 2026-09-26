@@ -2463,15 +2463,24 @@ describe('sdk transport session restore', () => {
     expect(firstRuntime!.send('limited follow up one', 'cmd-retry-limit-pending-1')).toBe('queued');
     expect(firstRuntime!.send('limited follow up two', 'cmd-retry-limit-pending-2')).toBe('queued');
 
+    // The failed turn's own message is not retried, but the session-level
+    // queue is not bound to it: both ordinary follow-ups queued behind it
+    // (neither carries the always-fail marker) must still get a chance to
+    // run instead of being stuck forever, and they succeed normally.
     const deadline = Date.now() + 5_000;
     while (Date.now() < deadline) {
-      if (firstRuntime!.getStatus() === 'error') break;
+      if (firstRuntime!.getStatus() === 'idle' && firstRuntime!.pendingCount === 0) break;
       await flush();
     }
 
-    expect(firstRuntime!.getStatus()).toBe('error');
+    expect(firstRuntime!.getStatus()).toBe('idle');
+    expect(firstRuntime!.pendingCount).toBe(0);
     await flush();
-    expect(mocks.claudeRuns).toHaveLength(1);
+    // claudeRuns[0]: the failed 'cmd-retry-limit-active' turn. claudeRuns[1]:
+    // the drained, merged follow-up turn -- a normal new turn on the SAME
+    // still-connected provider, not a process relaunch (see the "auto-restart"
+    // assertions below, which are the actual invariant this test title names).
+    expect(mocks.claudeRuns).toHaveLength(2);
     expect(getTransportRuntime('deck_sdk_retry_limited_brain')).toBe(firstRuntime);
     expect(getResendEntries('deck_sdk_retry_limited_brain')).toEqual([]);
     expect(timelineEmitterEmitMock.mock.calls.some((call) => (
