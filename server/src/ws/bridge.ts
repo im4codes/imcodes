@@ -957,7 +957,10 @@ class TimelineOutboundQueue {
         this.gapEpisodes.clear();
       }
       this.finishCongestionEpisode();
-      this.pump(ws, onGap);
+      // ws implementations (and test/production adapters) may invoke the
+      // completion callback synchronously. Defer the next dequeue so a large
+      // queue cannot recurse through safeSend/pump until the stack overflows.
+      setImmediate(() => this.pump(ws, onGap));
     });
     this.finishCongestionEpisode();
   }
