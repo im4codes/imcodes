@@ -51,7 +51,7 @@ class MockWs extends EventEmitter {
 }
 
 class SlowWs extends MockWs {
-  bufferedAmount = 2 * 1024 * 1024;
+  bufferedAmount = 32 * 1024 * 1024;
 
   override send(data: string | Buffer, _opts?: unknown, _callback?: (err?: Error) => void): void {
     if (this.closed) return;
@@ -59,6 +59,14 @@ class SlowWs extends MockWs {
     // Deliberately never acknowledge: this models a browser whose event loop
     // stopped reading. The bounded timeline queue must emit a seq gap rather
     // than growing without limit.
+  }
+}
+
+class AsyncHealthyWs extends MockWs {
+  override send(data: string | Buffer, _opts?: unknown, callback?: (err?: Error) => void): void {
+    if (this.closed) { callback?.(new Error('socket closed')); return; }
+    this.sent.push(data);
+    setImmediate(() => callback?.());
   }
 }
 
@@ -270,7 +278,7 @@ describe('WsBridge timeline drop telemetry', () => {
 
   it('keeps a healthy summary socket gap-free under realistic status/tool load', async () => {
     const { bridge, daemon } = await setupAuthedDaemon();
-    const summary = new MockWs();
+    const summary = new AsyncHealthyWs();
     bridge.handleBrowserConnection(summary as never, 'user-1', makeDb());
     summary.emit('message', JSON.stringify({
       type: TIMELINE_MESSAGES.SUBSCRIBE,
@@ -328,14 +336,14 @@ describe('WsBridge timeline drop telemetry', () => {
     slow.emit('message', JSON.stringify({ type: TIMELINE_MESSAGES.SUBSCRIBE, sessionName: SESSION, mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY }));
     await flushAsync();
     slow.sent.length = 0;
-    for (let seq = 1; seq <= 600; seq += 1) {
+    for (let seq = 1; seq <= 70000; seq += 1) {
       daemon.emit('message', timelineEvent('user.message', `message-${seq}`));
     }
     await flushAsync();
     const gaps = slow.sentStrings.map((raw) => JSON.parse(raw)).filter((msg) => msg.type === TIMELINE_MESSAGES.SEQ_GAP);
     expect(gaps.length).toBeGreaterThan(0);
     expect(gaps[0]).toMatchObject({ sessionId: SESSION, epoch: 1, backfill: true, reason: 'backpressure' });
-  });
+  }, 20_000);
 
   it('emits seq_gap metadata when a slow socket coalesces a latest-value frame', async () => {
     const { bridge, daemon } = await setupAuthedDaemon();

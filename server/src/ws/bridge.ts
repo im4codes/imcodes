@@ -589,12 +589,19 @@ const SUBSESSION_OWNERSHIP_RETRY_DELAYS_MS = [50, 150, 350] as const;
 /** Timeline JSON is bounded separately from raw PTY so a slow hidden tab cannot
  * consume an unbounded amount of server memory. Control/ack frames remain on
  * their direct liveness path and never enter this queue. */
-const TIMELINE_SOCKET_QUEUE_MAX_BYTES = 2 * 1024 * 1024;
-const TIMELINE_SOCKET_QUEUE_MAX_ITEMS = 512;
-const TIMELINE_SOCKET_BUFFERED_HIGH_WATER = 1 * 1024 * 1024;
+const TIMELINE_SOCKET_QUEUE_MAX_BYTES = 64 * 1024 * 1024;
+// A healthy browser can legitimately have ~1.5k timeline frames queued during
+// initial history hydration. Keep a bounded queue, but leave enough headroom
+// that this normal burst is not mistaken for transport backpressure.
+const TIMELINE_SOCKET_QUEUE_MAX_ITEMS = 65_536;
+// Initial history hydration can legitimately enqueue several multi-hundred-KB
+// frames on a local socket. Treat only a sustained ~16 MiB transport buffer as
+// real overflow; below that, healthy sockets stay on the direct path.
+const TIMELINE_SOCKET_BUFFERED_HIGH_WATER = 16 * 1024 * 1024;
 /** Bound gap-control traffic when a peer remains congested for a long time. */
 const TIMELINE_SOCKET_GAP_RATE_MAX = 16;
 const TIMELINE_SOCKET_GAP_RATE_WINDOW_MS = 1_000;
+const TIMELINE_SOCKET_MAX_PENDING_GAPS = 256;
 
 /**
  * Safe ws.send: checks readyState, wraps in try/catch.
@@ -774,6 +781,8 @@ class TimelineOutboundQueue {
   private gapFlushHandler?: (event: TimelineQueueEvent) => void;
 
   enqueue(ws: WebSocket, item: TimelineQueueEvent, onGap: (event: TimelineQueueEvent) => void, onCoalesced?: () => void): void {
+    const bufferedAmount = typeof ws.bufferedAmount === 'number' ? ws.bufferedAmount : 0;
+    const wasSocketPressured = bufferedAmount > TIMELINE_SOCKET_BUFFERED_HIGH_WATER;
     const existingIndex = item.coalesceKey
       ? this.pending.findIndex((entry) => entry.coalesceKey === item.coalesceKey)
       : -1;
@@ -783,7 +792,12 @@ class TimelineOutboundQueue {
       // sequence number. Record it for one merged gap per congestion episode;
       // emitting one frame per replacement can itself overwhelm a healthy
       // socket (and was the source of the observed gap storm).
-      this.noteGap(previous);
+      // A latest-value replacement on an otherwise healthy asynchronous
+      // socket is normal scheduling, not backpressure. Only expose a gap when
+      // the queue/socket was already over its congestion threshold; otherwise
+      // a realistic status burst would manufacture seq_gap traffic despite a
+      // zero bufferedAmount.
+      if (wasSocketPressured) this.noteGap(previous);
       onCoalesced?.();
       this.bytes -= Buffer.byteLength(previous.data, 'utf8');
       this.pending[existingIndex] = item;
@@ -793,18 +807,17 @@ class TimelineOutboundQueue {
       this.bytes += Buffer.byteLength(item.data, 'utf8');
     }
 
-    const bufferedAmount = typeof ws.bufferedAmount === 'number' ? ws.bufferedAmount : 0;
     const pressured = bufferedAmount > TIMELINE_SOCKET_BUFFERED_HIGH_WATER
       || this.bytes > TIMELINE_SOCKET_QUEUE_MAX_BYTES
       || this.pending.length > TIMELINE_SOCKET_QUEUE_MAX_ITEMS;
     if (pressured) {
-      this.trim();
+      this.trim(ws);
     }
     this.scheduleGapFlush(onGap);
     this.pump(ws, onGap);
   }
 
-  private trim(): void {
+  private trim(ws: WebSocket): void {
     while (this.bytes > TIMELINE_SOCKET_QUEUE_MAX_BYTES || this.pending.length > TIMELINE_SOCKET_QUEUE_MAX_ITEMS) {
       // Preserve final and durable events for as long as possible. Under a
       // completely wedged socket even those may be discarded, but every such
@@ -815,7 +828,14 @@ class TimelineOutboundQueue {
       const [removed] = this.pending.splice(index, 1);
       if (!removed) break;
       this.bytes -= Buffer.byteLength(removed.data, 'utf8');
-      this.noteGap(removed);
+      // Summary/latest-value frames are intentionally lossy when only the
+      // server-side queue is busy. Do not manufacture backpressure gaps on a
+      // healthy socket whose transport bufferedAmount is still below HWM;
+      // durable/final events always retain a gap for backfill convergence.
+      if (removed.priority !== 'coalescible'
+        || (typeof ws.bufferedAmount === 'number' && ws.bufferedAmount > TIMELINE_SOCKET_BUFFERED_HIGH_WATER)) {
+        this.noteGap(removed);
+      }
     }
   }
 
@@ -834,7 +854,19 @@ class TimelineOutboundQueue {
       existing.seq = existing.gapFromSeq;
       return;
     }
-    this.pendingGaps.set(key, { ...event, seq: fromSeq, gapFromSeq: fromSeq, gapToSeq: toSeq });
+    if (this.pendingGaps.size >= TIMELINE_SOCKET_MAX_PENDING_GAPS) {
+      const oldest = this.pendingGaps.keys().next().value;
+      if (typeof oldest === 'string') this.pendingGaps.delete(oldest);
+    }
+    // Gap delivery only needs session/epoch/range metadata. Never retain the
+    // potentially multi-megabyte event payload in the bookkeeping map.
+    this.pendingGaps.set(key, {
+      ...event,
+      data: '',
+      seq: fromSeq,
+      gapFromSeq: fromSeq,
+      gapToSeq: toSeq,
+    });
   }
 
   private flushGaps(onGap: (event: TimelineQueueEvent) => void): void {
@@ -8215,14 +8247,15 @@ export class WsBridge {
       // socket takes the direct path: no coalescing, no queue scheduling, and
       // every streaming delta remains ordered. Only a real bufferedAmount
       // overflow falls back to the bounded queue/gap path.
-      if (mode === TIMELINE_SUBSCRIPTION_MODES.FULL
+      const existingQueue = this.timelineQueues.get(ws);
+      if ((mode === TIMELINE_SUBSCRIPTION_MODES.FULL || !existingQueue)
         && (typeof ws.bufferedAmount !== 'number' || ws.bufferedAmount <= TIMELINE_SOCKET_BUFFERED_HIGH_WATER)) {
         incrementCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_RECIPIENT, { mode: mode ?? 'legacy', eventType });
         addCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_BYTES, Buffer.byteLength(outgoing, 'utf8'), { mode: mode ?? 'legacy', eventType });
         if (safeSend(ws, outgoing)) recipients += 1;
         continue;
       }
-      let queue = this.timelineQueues.get(ws);
+      let queue = existingQueue;
       if (!queue) {
         queue = new TimelineOutboundQueue();
         this.timelineQueues.set(ws, queue);
