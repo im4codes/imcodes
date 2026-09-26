@@ -766,8 +766,12 @@ class TimelineOutboundQueue {
       ? this.pending.findIndex((entry) => entry.coalesceKey === item.coalesceKey)
       : -1;
     if (existingIndex >= 0) {
-      onCoalesced?.();
       const previous = this.pending[existingIndex]!;
+      // Replacing a pending latest-value frame is still a loss of its
+      // sequence number. Tell the browser to backfill it rather than making
+      // coalescing an invisible drop (this also covers full-mode overflow).
+      onGap(previous);
+      onCoalesced?.();
       this.bytes -= Buffer.byteLength(previous.data, 'utf8');
       this.pending[existingIndex] = item;
       this.bytes += Buffer.byteLength(item.data, 'utf8');

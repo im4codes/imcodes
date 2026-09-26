@@ -305,4 +305,49 @@ describe('WsBridge timeline drop telemetry', () => {
     expect(gaps.length).toBeGreaterThan(0);
     expect(gaps[0]).toMatchObject({ sessionId: SESSION, epoch: 1, backfill: true, reason: 'backpressure' });
   });
+
+  it('emits seq_gap metadata when a slow socket coalesces a latest-value frame', async () => {
+    const { bridge, daemon } = await setupAuthedDaemon();
+    const slow = new SlowWs();
+    bridge.handleBrowserConnection(slow as never, 'user-1', makeDb());
+    slow.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: SESSION,
+      mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY,
+    }));
+    await flushAsync();
+    slow.sent.length = 0;
+    daemon.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.EVENT,
+      event: {
+        eventId: 'durable-10',
+        sessionId: SESSION,
+        ts: Date.now(),
+        seq: 10,
+        epoch: 2,
+        type: 'user.message',
+        payload: { text: 'hold the queue open' },
+      },
+    }));
+    for (const seq of [11, 12]) {
+      daemon.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.EVENT,
+        event: {
+          eventId: `status-${seq}`,
+          sessionId: SESSION,
+          ts: Date.now(),
+          seq,
+          epoch: 2,
+          type: 'agent.status',
+          payload: { status: `step-${seq}` },
+        },
+      }));
+    }
+    await flushAsync();
+    const gaps = slow.sentStrings.map((raw) => JSON.parse(raw))
+      .filter((msg) => msg.type === TIMELINE_MESSAGES.SEQ_GAP);
+    expect(gaps).toEqual(expect.arrayContaining([
+      expect.objectContaining({ sessionId: SESSION, epoch: 2, fromSeq: 11, toSeq: 11, backfill: true }),
+    ]));
+  });
 });
