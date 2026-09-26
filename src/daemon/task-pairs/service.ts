@@ -38,7 +38,9 @@ import { noteTaskPairFocus, sendTaskPairMessage, taskPairFocusOf } from './deliv
 import { resolveTaskPairMaterial } from './material.js';
 import { copyTaskPairOutput, provisionTaskPairWorkspace, releaseTaskPairWorkspace, type TaskPairWorkspaceRevisionSource } from './workspace.js';
 import { clearTaskPairProviderError, noteTaskPairProviderError } from './provider-errors.js';
-import { getSession } from '../../store/session-store.js';
+import { getSession, listSessions } from '../../store/session-store.js';
+import { resolveProjectAuthoritativeSupervisionSnapshot } from '../supervision-snapshot.js';
+import { resolveSupervisionAuditBlockingSeverities } from '../../../shared/supervision-config.js';
 import {
   buildAuditRequestMessage,
   buildAuditorAssignmentMessage,
@@ -261,10 +263,18 @@ export class TaskPairService {
     if (store.hasEvent(input.eventId)) return { effect: 'replayed', unusual: false, intents: [] };
     const taskId = this.resolveTaskId(input.project, input.writer, input.marker.taskId, input.marker.knownVerb);
     const existing = taskId && taskId !== TASK_PAIR_INFER_TASK_ID ? store.getPair(input.project, taskId) : undefined;
+    // Only a newly created pair reads this (see newPair()); skip the lookup on
+    // the far more common path of updating an already-open pair.
+    const projectBlocking = !existing && taskId
+      ? resolveSupervisionAuditBlockingSeverities(
+          resolveProjectAuthoritativeSupervisionSnapshot(input.project, listSessions()),
+        )
+      : undefined;
     const transition = taskId
       ? applyTaskPairMarker(existing?.state, { ...input.marker, taskId }, {
           writer: input.writer,
           fallbackBrain: projectBrainSession(input.project),
+          projectBlocking,
           now,
           source: input.source,
         })

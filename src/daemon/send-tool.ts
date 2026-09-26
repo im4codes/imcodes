@@ -3,6 +3,10 @@ import { CHAT_MESSAGE_ORIGINS } from '../../shared/chat-message-origin.js';
 import { isPairsEngineProject, isTaskPairEngineActive, projectBrainSession } from './task-pairs/engine.js';
 import { taskPairService } from './task-pairs/service.js';
 import { getTaskPairStore } from './task-pairs/store.js';
+import {
+  resolveProjectAuthoritativeSupervisionSnapshot,
+  resolveProjectAuthoritativeSupervisionPools,
+} from './supervision-snapshot.js';
 import { taskPairBindingOf } from '../../shared/task-pair.js';
 import { DELEGATION_REACHED_DELIVERY_STATUSES } from '../../shared/delegation-claim.js';
 import path from 'path';
@@ -82,14 +86,11 @@ import {
   isAutomaticSupervisionEnabled,
   isTerminalSupervisionTaskStatus,
   isSupervisionTaskAuditPolicy,
-  readSupervisionSnapshotFromTransportConfig,
   resolveSupervisionAuditBlockingSeverities,
   supervisionTaskAuditPolicyFromSnapshot,
-  type SessionSupervisionSnapshot,
   type SupervisionMode,
   type SupervisionTaskMetadata,
 } from '../../shared/supervision-config.js';
-import { overlayCachedExecutionPools } from './supervisor-defaults-cache.js';
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import {
   buildSupervisionExecutionCapabilityId,
@@ -1112,48 +1113,7 @@ export function listSendTargets(
   };
 }
 
-/**
- * Read the one project-owned execution-pool snapshot for every legitimate
- * project participant. Read authority is project membership; only mutation of
- * the snapshot remains Brain-owned. Falling back to a sub-session's private
- * snapshot made the same target alternately configured/unconfigured depending
- * on who called send_list_targets (tsk_79u).
- *
- * Multiple active Brain snapshots are accepted only when byte-equivalent;
- * disagreement is genuine authority ambiguity and fails closed as
- * legacy_unconfigured rather than selecting by array order.
- *
- * The execution pool specifically is account-level policy keyed by model
- * type, not by which Brain session happens to carry it (see
- * `overlayCachedExecutionPools`). Applying it here, after the
- * per-session/ambiguity resolution above, means every project on the
- * account is eligible for manual task dispatch the moment the account has
- * one configured pool -- a Brain never has to individually re-save it, and
- * an ambiguous or brain-less project still resolves through it rather than
- * only through the narrower ambiguity fallback.
- */
-export function resolveProjectAuthoritativeSupervisionSnapshot(
-  projectName: string,
-  sessions: readonly SessionRecord[],
-): SessionSupervisionSnapshot {
-  const fallback = readSupervisionSnapshotFromTransportConfig(undefined);
-  const brains = sessions.filter((session) => (
-    session.role === 'brain'
-    && !session.parentSession
-    && resolveEffectiveProjectName(session, sessions) === projectName
-  ));
-  if (brains.length === 0) return overlayCachedExecutionPools(fallback);
-  const snapshots = brains.map((brain) => readSupervisionSnapshotFromTransportConfig(brain.transportConfig));
-  const encoded = new Set(snapshots.map((snapshot) => JSON.stringify(snapshot)));
-  return overlayCachedExecutionPools(encoded.size === 1 ? snapshots[0]! : fallback);
-}
-
-export function resolveProjectAuthoritativeSupervisionPools(
-  projectName: string,
-  sessions: readonly SessionRecord[],
-): SupervisionExecutionPoolsConfig {
-  return resolveProjectAuthoritativeSupervisionSnapshot(projectName, sessions).executionPools;
-}
+export { resolveProjectAuthoritativeSupervisionSnapshot, resolveProjectAuthoritativeSupervisionPools };
 
 function supervisionObservedIdentityForTarget(
   target: SessionRecord,
