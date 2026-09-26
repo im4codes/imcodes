@@ -140,7 +140,7 @@ describe('task-pair marker grammar', () => {
     expect(body).toContain('nothing auto-picks one for you');
     expect(body).toContain('write DONE straight to Brain with no PASS required');
     expect(body).toContain('leaves the pair open awaiting Brain\'s decision');
-    expect(body).toContain('what changed, the worktree/branch/HEAD or file paths, and your validation result');
+    expect(body).toContain('what changed, the worktree path and HEAD or file paths, and your validation result');
   });
 
   it('ships a contract telling Brain DISPATCH is normally enough on its own, auto-queuing over the limit instead of needing QUEUE first', () => {
