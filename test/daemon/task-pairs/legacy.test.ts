@@ -15,6 +15,7 @@ import { dispatchReadyAudit, runSupervisionConvergenceTick } from '../../../src/
 import { MEMORY_MCP_TOOL_NAMES } from '../../../shared/memory-mcp-contracts.js';
 import { SUPERVISION_MCP_TOOLS } from '../../../shared/supervision-mcp-tools.js';
 import { taskPairBindingId } from '../../../shared/task-pair.js';
+import { normalizeSessionSupervisionSnapshot } from '../../../shared/supervision-config.js';
 import type { SupervisionTaskSnapshot } from '../../../src/daemon/supervision-state-store.js';
 
 const PROJECT = 'legacyproj';
@@ -265,5 +266,19 @@ describe('one-time legacy import', () => {
     expect(getTaskPairStore().getPair('rolledbackproj', 'tsk_other')).toBeUndefined();
     // Every imported pair is nudged on the next tick.
     expect(getTaskPairStore().getPair(PROJECT, 'tsk_stuck')?.liveness.progressAuditorAt).toBe(0);
+  });
+
+  it('carries the Brain-configured blocking set into an imported pair, tagged as config-derived', () => {
+    upsertSession({
+      ...session(BRAIN, 'brain'),
+      transportConfig: {
+        supervision: normalizeSessionSupervisionSnapshot({ auditBlockingSeverities: ['P0', 'P1'] }),
+      },
+    } as SessionRecord);
+    const tasks = [task('tsk_legacy_blocking', 'implementing', [['implementer', EXEC, 'implementing']])];
+    expect(importLegacyTasks({ list: () => tasks }, 5_000)).toBe(1);
+    expect(getTaskPairStore().getPair(PROJECT, 'tsk_legacy_blocking')?.state).toMatchObject({
+      blocking: ['P0', 'P1'], blockingSource: 'config',
+    });
   });
 });

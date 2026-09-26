@@ -366,6 +366,21 @@ export function parseBlockingAttr(value: string | undefined): AuditSeverity[] | 
   return normalizeAuditBlockingSeverities(value.split(',').map((level) => level.trim().toUpperCase()));
 }
 
+/**
+ * Owner rule: a human/marker-named `blocking=` set is authoritative and never
+ * drifts on its own; a config-derived set tracks the Brain's configured
+ * `auditBlockingSeverities` and is free to change with it. A pair stored
+ * before this field existed has no recorded source -- treated as `config` so
+ * it still tracks config, matching every such pair's actual history (it was
+ * never given an explicit override, since that path always set `blocking`
+ * from the attr directly).
+ */
+export type TaskPairBlockingSource = 'explicit' | 'config';
+
+export function taskPairBlockingSource(pair: Pick<TaskPairState, 'blockingSource'>): TaskPairBlockingSource {
+  return pair.blockingSource ?? 'config';
+}
+
 export interface TaskPairVerdictJudgementResult {
   judgement: TaskPairVerdictJudgement;
   counts: TaskPairSeverityCounts;
@@ -430,6 +445,15 @@ export interface TaskPairState {
   /** Round in which a consistent PASS was recorded, if any. */
   passRound?: number;
   blocking: AuditSeverity[];
+  /**
+   * Where `blocking` came from: `explicit` when a human/marker named it
+   * (a `blocking=` attr), `config` when it tracks the Brain's configured
+   * `auditBlockingSeverities`. Missing on pairs stored before this field
+   * existed -- {@link taskPairBlockingSource} treats that as `config`, so an
+   * old pair still picks up config changes rather than freezing at whatever
+   * it happened to resolve to.
+   */
+  blockingSource?: TaskPairBlockingSource;
   lastVerdict?: { verb: 'PASS' | 'REWORK'; counts: TaskPairSeverityCounts; judgement: TaskPairVerdictJudgement; round: number };
   previousAuditors: string[];
   executorPool?: string;
@@ -664,6 +688,7 @@ function newPair(taskId: string, brain: string, ctx: TaskPairApplyContext, statu
     flagSides: {},
     round: 0,
     blocking: normalizeAuditBlockingSeverities(ctx.projectBlocking),
+    blockingSource: 'config',
     previousAuditors: [],
     capCounts: {},
     capRound: 0,
@@ -713,7 +738,7 @@ function setRolesFromAttrs(pair: TaskPairState, attrs: Record<string, string>, i
   if (attrs.pool) pair.executorPool = attrs.pool;
   applyWorkspaceAttr(pair, attrs);
   const blocking = parseBlockingAttr(attrs.blocking);
-  if (blocking) pair.blocking = blocking;
+  if (blocking) { pair.blocking = blocking; pair.blockingSource = 'explicit'; }
   if (!pair.auditor) {
     addFlag(pair, 'needs_auditor');
     intents.push({ kind: 'pick_auditor' });
@@ -895,6 +920,12 @@ export function applyTaskPairMarker(
       if (terminal) intents.push({ kind: 'slot_changed' });
       pair.status = 'in_audit';
       pair.round += 1;
+      // A config-derived set tracks the Brain's current config at the start of
+      // each new round; an explicit human/marker override never drifts.
+      if (taskPairBlockingSource(pair) !== 'explicit') {
+        pair.blocking = normalizeAuditBlockingSeverities(ctx.projectBlocking);
+        pair.blockingSource = 'config';
+      }
       resetCaps(pair);
       removeFlag(pair, 'executor_silent');
       if (!pair.auditor) {
@@ -990,7 +1021,7 @@ function setRolesFromAttrsQueued(pair: TaskPairState, attrs: Record<string, stri
   if (attrs.urgent !== undefined) pair.urgent = isTrue(attrs.urgent);
   applyWorkspaceAttr(pair, attrs);
   const blocking = parseBlockingAttr(attrs.blocking);
-  if (blocking) pair.blocking = blocking;
+  if (blocking) { pair.blocking = blocking; pair.blockingSource = 'explicit'; }
 }
 
 function resetCapFlagsOnBrainAction(pair: TaskPairState): void {

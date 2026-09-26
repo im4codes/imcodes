@@ -29,6 +29,11 @@ function contracts(blocking: readonly AuditSeverity[]): string {
   return `[Contracts: ${TASK_PAIR_CONTRACT_ID}, ${AUDIT_CONVERGENCE_CONTRACT_ID} blocking=${blocking.join(',')}]`;
 }
 
+/** Plain-English statement of the pair's effective blocking set, for briefs and assignment messages. */
+function blockingSummaryLine(pair: TaskPairState): string {
+  return `Blocking = ${pair.blocking.join(',')}: every finding at these levels must be fixed before PASS.`;
+}
+
 /**
  * Said in every executor/auditor instruction: agents that worked under the old
  * supervision engine otherwise wait for artifacts a pair never has.
@@ -193,6 +198,7 @@ export function buildAuditorHandoffMessage(pair: TaskPairState): string {
     header(pair),
     `You are now the auditor of this task for executor ${pair.executor} (round ${Math.max(1, pair.round)}; blocking=${pair.blocking.join(',')}).${previous}`,
     `The material is the executor's workspace named on READY_FOR_AUDIT (a worktree at a head, or a task-directory path; relayed to you), plus the validation they send you. Judge it by ${AUDIT_CONVERGENCE_CONTRACT_ID}, reply to the executor with every finding tagged [P0]..[P4], then write ${marker('PASS', pair.taskId, `blocking=${pair.blocking.join(',')}`)} or ${marker('REWORK', pair.taskId, `blocking=${pair.blocking.join(',')} p0=<n> ...`)}.`,
+    blockingSummaryLine(pair),
     ...(where ? [where] : []),
     `${NO_LEGACY_ARTIFACTS} If the material cannot be reached, write ${marker('NEEDS_INPUT', pair.taskId, 'note="..."')} and wait; that is never a P0.`,
     contracts(pair.blocking),
@@ -219,6 +225,7 @@ export function buildExecutorPairBrief(pair: TaskPairState): string {
   return [
     header(pair),
     `You are the executor of this task pair, with ${auditor}. Write ${marker('STARTED', pair.taskId)} when you begin.`,
+    blockingSummaryLine(pair),
     workplaceLine(pair),
     pair.auditor === TASK_PAIR_NO_AUDITOR
       ? `Write ${marker('DONE', pair.taskId)} when finished.`
@@ -311,6 +318,7 @@ export function buildAuditorAssignmentMessage(pair: TaskPairState): string {
   return [
     header(pair),
     `You are the auditor of this task for executor ${pair.executor}. On READY_FOR_AUDIT the daemon relays their workspace (worktree and head, or task-directory path), and they send you their validation; judge that by ${AUDIT_CONVERGENCE_CONTRACT_ID} (blocking=${pair.blocking.join(',')}) and write PASS or REWORK with severity counts.`,
+    blockingSummaryLine(pair),
     NO_LEGACY_ARTIFACTS,
     contracts(pair.blocking),
     TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,

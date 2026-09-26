@@ -263,9 +263,10 @@ export class TaskPairService {
     if (store.hasEvent(input.eventId)) return { effect: 'replayed', unusual: false, intents: [] };
     const taskId = this.resolveTaskId(input.project, input.writer, input.marker.taskId, input.marker.knownVerb);
     const existing = taskId && taskId !== TASK_PAIR_INFER_TASK_ID ? store.getPair(input.project, taskId) : undefined;
-    // Only a newly created pair reads this (see newPair()); skip the lookup on
-    // the far more common path of updating an already-open pair.
-    const projectBlocking = !existing && taskId
+    // Read on both pair creation (newPair()) and a config-derived pair's next
+    // round (READY_FOR_AUDIT starting a new round, applyTaskPairMarker), so
+    // an open pair picks up a Brain config change without a restart.
+    const projectBlocking = taskId
       ? resolveSupervisionAuditBlockingSeverities(
           resolveProjectAuthoritativeSupervisionSnapshot(input.project, listSessions()),
         )
