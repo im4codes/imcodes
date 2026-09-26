@@ -778,18 +778,24 @@ export class TaskPairService {
   #backfilledTitleProjects = new Set<string>();
 
   /**
-   * Once per project per daemon run: every open pair with no title, or with a
-   * known non-informative placeholder title (shared/task-pair.ts), gets a
-   * background generation pass from whatever source text it has (its QUEUE
-   * brief, or -- for an imported placeholder with nothing richer recorded --
-   * its own generic title, which is still worth showing translated). A pair
-   * with neither a brief nor a title is left alone: there is no text to
-   * generate from.
+   * Once per project per daemon run *after* the project has a configured UI
+   * locale: every open pair with no title, or with a known non-informative
+   * placeholder title (shared/task-pair.ts), gets a background generation
+   * pass from whatever source text it has (its QUEUE brief, or -- for an
+   * imported placeholder with nothing richer recorded -- its own generic
+   * title, which is still worth showing translated). A pair with neither a
+   * brief nor a title is left alone: there is no text to generate from.
+   *
+   * Not latched until a locale is actually known: the daemon can see a
+   * project's very first timeline event before the browser has sent one
+   * (`uiLocale` arrives on `session.send`, see command-handler.ts), and a
+   * project that latched "done" on that first, locale-less call would never
+   * get a real backfill pass for the rest of the run.
    */
   backfillTitlesOnce(project: string): void {
     if (this.#backfilledTitleProjects.has(project)) return;
-    this.#backfilledTitleProjects.add(project);
     if (!brainUiLocale(project)) return;
+    this.#backfilledTitleProjects.add(project);
     for (const stored of getTaskPairStore().listActivePairs(project)) {
       const pair = stored.state;
       const isGenericTitle = pair.title !== undefined

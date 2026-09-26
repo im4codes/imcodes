@@ -331,10 +331,12 @@ import { GitOriginRepositoryIdentityService } from '../agent/repository-identity
 import {
   SUPERVISION_MODE,
   canSessionRoleOwnAutomaticSupervision,
+  embedSessionSupervisionSnapshot,
   extractSessionSupervisionSnapshot,
   hasInvalidSessionSupervisionSnapshot,
   isAutomaticSupervisionEnabled,
   isSupportedSupervisionTargetSessionType,
+  normalizeSessionSupervisionSnapshot,
   normalizeSupervisionUiLocale,
   evaluateAutomaticSupervisionEnablement,
   type AutomaticSupervisionEnablementGate,
@@ -3808,6 +3810,33 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const text = cmd.text as string | undefined;
   const commandId = cmd.commandId as string | undefined;
   const requestedUiLocale = normalizeSupervisionUiLocale(cmd.uiLocale);
+  // The web sends `uiLocale` on every send, not through a separate settings
+  // save. Persist it onto the session record here (best-effort, synchronous,
+  // debounced-write only -- see session-store.ts) so it durably outlives this
+  // one turn: background work unrelated to any live prompt (e.g. task-pair
+  // title generation, src/daemon/task-pairs/engine.ts's `brainUiLocale`) reads
+  // it from the record later, not from the in-request overlay further below
+  // that exists only to steer this turn's own prompts.
+  if (requestedUiLocale && sessionName) {
+    try {
+      const existingRecord = getSession(sessionName);
+      if (existingRecord && isSupportedSupervisionTargetSessionType(existingRecord.agentType)) {
+        const existingSnapshot = extractSessionSupervisionSnapshot(existingRecord.transportConfig ?? null)
+          ?? normalizeSessionSupervisionSnapshot(null);
+        if (existingSnapshot.uiLocale !== requestedUiLocale) {
+          upsertSession({
+            ...existingRecord,
+            transportConfig: embedSessionSupervisionSnapshot(existingRecord.transportConfig ?? null, {
+              ...existingSnapshot,
+              uiLocale: requestedUiLocale,
+            }),
+          });
+        }
+      }
+    } catch (error) {
+      logger.warn({ err: error, sessionName }, 'session.send: failed to persist uiLocale');
+    }
+  }
   // Omission/unknown values are the safe default: ordinary durable FIFO.
   // Only the exact explicit append value may request a provider-native steer.
   const requestedDeliveryMode = cmd.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND

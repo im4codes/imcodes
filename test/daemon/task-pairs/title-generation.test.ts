@@ -16,6 +16,7 @@ import { setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/
 import { TaskPairService, taskPairService } from '../../../src/daemon/task-pairs/service.js';
 import { setTaskPairTitleGeneratorForTests } from '../../../src/daemon/task-pairs/title-generator.js';
 import { dispatchSendMessage, clearSendIdempotencyCacheForTests } from '../../../src/daemon/send-tool.js';
+import { handleWebCommand } from '../../../src/daemon/command-handler.js';
 import { normalizeSessionSupervisionSnapshot } from '../../../shared/supervision-config.js';
 import { TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS, TASK_PAIR_TIMELINE_EVENT } from '../../../shared/task-pair.js';
 
@@ -97,6 +98,33 @@ describe('task-pair title generation', () => {
     resolveGen('修复登录问题');
     await service.waitForIdle();
     expect(pair('T1')?.title).toBe('修复登录问题');
+  });
+
+  it('persists the browser UI locale from a real session.send, and a later titleless QUEUE pair picks it up (no hand-seeded snapshot)', async () => {
+    // Deliberately no setBrainLocale() call: the locale must come from the
+    // real session.send path (command-handler.ts), not a test shortcut.
+    setTaskPairTitleGeneratorForTests(async (brief, locale) => {
+      expect(locale).toBe('zh-CN');
+      expect(brief).toContain('Fix the login bug');
+      return '修复登录问题';
+    });
+    const serverLink = { send: vi.fn() };
+    // `text` is deliberately omitted: the locale-persist step in handleSend
+    // runs before the sessionName/text validation gate, so this exercises
+    // only that persistence side effect, not a full send pipeline.
+    handleWebCommand({
+      type: 'session.send', session: BRAIN, commandId: 'cmd-locale-1', uiLocale: 'zh-CN',
+    }, serverLink as never);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    await say(BRAIN, [
+      'Queueing.',
+      '<!-- IMCODES_TASK QUEUE T11 -->',
+      'Fix the login bug for SSO users.',
+      '<!-- IMCODES_TASK_END T11 -->',
+    ].join('\n'));
+    await service.waitForIdle();
+    expect(pair('T11')?.title).toBe('修复登录问题');
   });
 
   it('never generates over an explicit title', async () => {
@@ -196,6 +224,31 @@ describe('task-pair title generation', () => {
     await say(BRAIN, 'Another plain status update.');
     await service.waitForIdle();
     expect(gen).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries the back-fill sweep once a locale becomes known, instead of latching on the first locale-less event', async () => {
+    setBrainLocale(undefined);
+    getTaskPairStore().savePair(PROJECT, {
+      taskId: 'T12', brain: BRAIN, executor: EXEC, auditor: AUD, status: 'working',
+      title: TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS[0], flags: [], flagSides: {}, round: 0, blocking: [],
+      previousAuditors: [], capCounts: {}, capRound: 0, createdAt: 1, updatedAt: 1,
+    } as never);
+    const gen = vi.fn(async () => 'Delegated task');
+    setTaskPairTitleGeneratorForTests(gen);
+
+    // A timeline event arrives before the project has any configured locale.
+    await say(BRAIN, 'First status update, before any locale is known.');
+    await service.waitForIdle();
+    expect(gen).not.toHaveBeenCalled();
+    expect(pair('T12')?.title).toBe(TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS[0]);
+
+    // The locale becomes known afterwards; the next event must still run the
+    // sweep, not treat the project as already covered.
+    setBrainLocale('en');
+    await say(BRAIN, 'Second status update, after the locale is known.');
+    await service.waitForIdle();
+    expect(gen).toHaveBeenCalledTimes(1);
+    expect(pair('T12')?.title).toBe('Delegated task');
   });
 
   it('leaves an untitled pair with no brief alone (nothing to generate from)', async () => {
