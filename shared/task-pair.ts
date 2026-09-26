@@ -194,18 +194,19 @@ export const TASK_PAIR_VERBS = [
 ] as const;
 export type TaskPairVerb = typeof TASK_PAIR_VERBS[number];
 
+export const TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION = 'awaiting_brain_decision' as const;
 export const TASK_PAIR_STATUSES = [
-  'queued', 'working', 'in_audit', 'awaiting_audit', 'rework', 'passed', 'done', 'cancelled',
+  'queued', 'working', 'in_audit', 'awaiting_audit', TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION, 'rework', 'passed', 'done', 'cancelled',
 ] as const;
 export type TaskPairStatus = typeof TASK_PAIR_STATUSES[number];
 export const TASK_PAIR_TERMINAL_STATUSES: readonly TaskPairStatus[] = ['done', 'cancelled'];
 /** Statuses that occupy a concurrency slot. */
-export const TASK_PAIR_OPEN_STATUSES: readonly TaskPairStatus[] = ['working', 'in_audit', 'awaiting_audit', 'rework', 'passed'];
+export const TASK_PAIR_OPEN_STATUSES: readonly TaskPairStatus[] = ['working', 'in_audit', 'awaiting_audit', TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION, 'rework', 'passed'];
 
 export const TASK_PAIR_FLAGS = [
   'blocked', 'needs_input', 'unaudited', 'needs_auditor', 'over_limit', 'off_pool', 'economy_unreviewed',
   'waiting_for_capacity', 'executor_silent', 'verdict_inconsistent', 'awaiting_audit_ignored',
-  'replacement_churn', 'markers_unresolved', 'all_providers_limited', 'auditor_capacity_hold',
+  'replacement_churn', 'markers_unresolved', 'all_providers_limited', 'auditor_capacity_hold', 'policy_violation',
   'no_pool_configured',
 ] as const;
 export type TaskPairFlag = typeof TASK_PAIR_FLAGS[number];
@@ -220,6 +221,7 @@ export type TaskPairEventSource = typeof TASK_PAIR_EVENT_SOURCES[number];
 export const TASK_PAIR_CAPPED_REASONS = {
   verdict_correction: 'verdict_inconsistent',
   done_reminder: 'awaiting_audit_ignored',
+  policy_rejection: 'policy_violation',
   blocked_replacement: 'replacement_churn',
   unresolved_hint: 'markers_unresolved',
 } as const satisfies Record<string, TaskPairFlag>;
@@ -564,7 +566,8 @@ export type TaskPairIntent =
   /** A non-Brain writer's marker on a closed (cancelled/done) pair was
    *  recorded, not applied -- only Brain DISPATCH/QUEUE reopens one. Tell
    *  them so, rather than leaving the marker silently inert. */
-  | { kind: 'closed_pair_notice'; to: string };
+  | { kind: 'closed_pair_notice'; to: string }
+  | { kind: 'policy_notice'; to: string; taskId: string; text: string };
 
 export interface TaskPairTransition {
   /** New or updated pair; undefined when the marker only created nothing (recorded). */
@@ -840,7 +843,7 @@ export function applyTaskPairMarker(
           if (pair.auditor) intents.push({ kind: 'audit_request', to: pair.auditor });
         } else if (verb === 'DONE') {
           applyOutputAttr(pair, attrs);
-          if (!hasAudit(pair)) pair.status = 'done';
+          if (!hasAudit(pair)) pair.status = TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION;
           else {
             pair.status = 'awaiting_audit';
             if (spendCap(pair, 'done_reminder', intents)) intents.push({ kind: 'done_reminder', to: ctx.writer });
@@ -850,13 +853,12 @@ export function applyTaskPairMarker(
       }
       case 'PASS':
       case 'REWORK': {
-        const pair = newPair(marker.taskId, ctx.fallbackBrain, ctx, 'in_audit');
-        pair.auditor = ctx.writer;
-        pair.round = 1;
-        const verdict = judgeTaskPairVerdict(verb, attrs, pair.blocking);
-        applyVerdict(pair, verb, verdict, ctx.writer, intents);
-        return { pair, toStatus: pair.status, effect: 'created', unusual: true, intents, verdict };
+        return { ...recorded(undefined), intents: [{ kind: 'policy_notice', to: ctx.writer, taskId: marker.taskId,
+          text: `No audit round is open for ${marker.taskId}. Brain must dispatch the pair and an executor must submit material with READY_FOR_AUDIT before the auditor can write ${verb}.` }] };
       }
+      case 'CANCEL':
+        return { ...recorded(undefined), intents: [{ kind: 'policy_notice', to: ctx.writer, taskId: marker.taskId,
+          text: `Only Brain or the daemon may CANCEL ${marker.taskId}; your marker was recorded but not applied.` }] };
       default:
         return recorded(undefined);
     }
@@ -905,6 +907,11 @@ export function applyTaskPairMarker(
   const done = (effect: string, extra: Partial<TaskPairTransition> = {}): TaskPairTransition => ({
     pair, fromStatus, toStatus: pair.status, effect, unusual, intents, ...extra,
   });
+  const reject = (text: string): TaskPairTransition => {
+    if (!spendCap(pair, 'policy_rejection', intents)) return recorded(existing);
+    intents.push({ kind: 'policy_notice', to: ctx.writer, taskId: marker.taskId, text });
+    return done('recorded', { unusual: true });
+  };
 
   switch (verb) {
     case 'QUEUE': {
@@ -930,6 +937,12 @@ export function applyTaskPairMarker(
       if (!roleAuthority) return recorded(existing);
       if (terminal) unusual = true;
       resetCaps(pair);
+      if (pair.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION) {
+        setRolesFromAttrs(pair, attrs, intents);
+        if (marker.brief !== undefined) pair.brief = marker.brief;
+        pair.status = 'working';
+        return done('dispatched');
+      }
       // A (re)start of a queued/closed pair is capacity-gated exactly like
       // QUEUE, UNLESS this is the daemon's own queue-drain call (source
       // 'queue'): that call only ever fires once #runQueueOnce has already
@@ -955,6 +968,13 @@ export function applyTaskPairMarker(
     }
     case 'STARTED':
     case 'WORKING': {
+      if (pair.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION && (role === 'executor' || roleAuthority)) {
+        pair.status = 'working';
+        return done('status');
+      }
+      if (pair.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION) {
+        return reject(`Only the executor or Brain may resume ${marker.taskId} while it awaits Brain's decision; your marker was recorded but not applied.`);
+      }
       if (pair.status === 'in_audit' || pair.status === 'passed' || terminal) unusual = true;
       if (terminal) intents.push({ kind: 'slot_changed' });
       pair.status = 'working';
@@ -964,6 +984,9 @@ export function applyTaskPairMarker(
       if (!hasAudit(pair)) return recorded(existing);
       const material = materialFromAttrs(attrs, ctx.now);
       if (material) pair.material = material;
+      else if (pair.workspace?.path) {
+        pair.material = { path: pair.workspace.path, ...(pair.workspace.lastHead ? { head: pair.workspace.lastHead } : {}), at: ctx.now };
+      }
       if (pair.status === 'in_audit') {
         // A resubmission inside the round with new material is relayed again.
         if (material && pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR) intents.push({ kind: 'audit_request', to: pair.auditor });
@@ -991,16 +1014,18 @@ export function applyTaskPairMarker(
     }
     case 'PASS':
     case 'REWORK': {
-      if (!hasAudit(pair)) return recorded(existing);
-      if (role !== 'auditor' && role !== 'brain' && role !== 'daemon') unusual = true;
+      if (!hasAudit(pair) || pair.status !== 'in_audit' || !pair.material) {
+        return reject(`No material-backed audit round is open for ${marker.taskId}. READY_FOR_AUDIT with material is required before PASS or REWORK can apply.`);
+      }
+      if (role !== 'auditor' && !roleAuthority) {
+        return reject(`Only the assigned auditor may write ${verb} for ${marker.taskId}; your marker was recorded but not applied.`);
+      }
       const verdict = judgeTaskPairVerdict(verb, attrs, pair.blocking);
       if (verdict.blockingMismatch) unusual = true;
       if (terminal && verb === 'PASS') {
         pair.lastVerdict = { verb, counts: verdict.counts, judgement: verdict.judgement, round: pair.round };
         return done('recorded', { verdict });
       }
-      if (pair.status !== 'in_audit') unusual = true;
-      if (terminal) intents.push({ kind: 'slot_changed' });
       applyVerdict(pair, verb, verdict, ctx.writer, intents);
       if (role === 'brain') resetCapFlagsOnBrainAction(pair);
       return done(isAppliedVerdict(verdict.judgement) ? 'verdict' : 'verdict_held', { verdict });
@@ -1008,28 +1033,33 @@ export function applyTaskPairMarker(
     case 'DONE': {
       const force = role === 'brain' && isTrue(attrs.force);
       if (terminal) return recorded(existing, false);
-      applyOutputAttr(pair, attrs);
       if (force) {
+        applyOutputAttr(pair, attrs);
         if (pair.status !== 'passed' && hasAudit(pair)) addFlag(pair, 'unaudited');
         pair.status = 'done';
         intents.push({ kind: 'slot_changed' });
         return done('forced');
       }
-      if (!hasAudit(pair) || pair.status === 'passed') {
+      if (hasAudit(pair) && role === 'executor' && pair.status === 'passed') {
+        applyOutputAttr(pair, attrs);
         pair.status = 'done';
         intents.push({ kind: 'slot_changed' });
         return done('status');
       }
-      if (pair.status === 'in_audit') {
-        unusual = true;
-        return done('recorded');
+      if (!hasAudit(pair) && roleAuthority) {
+        applyOutputAttr(pair, attrs);
+        pair.status = 'done';
+        intents.push({ kind: 'slot_changed' });
+        return done('status');
       }
-      if (pair.status === 'queued') unusual = true;
-      pair.status = 'awaiting_audit';
-      if (pair.executor && spendCap(pair, 'done_reminder', intents)) {
-        intents.push({ kind: 'done_reminder', to: pair.executor });
+      if (!hasAudit(pair) && role === 'executor' && pair.status !== TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION) {
+        applyOutputAttr(pair, attrs);
+        pair.status = TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION;
+        return done('reported_to_brain');
       }
-      return done('status');
+      return reject(hasAudit(pair)
+        ? 'DONE cannot close or advance an audited pair. The executor may DONE only after an auditor PASS has been applied in a material-backed audit round; Brain may use DONE force=true to accept.'
+        : 'Only the executor may report completion. This pair cannot be closed by DONE from another participant; Brain decides with DONE or CANCEL.');
     }
     case 'BLOCKED':
     case 'NEEDS_INPUT': {
@@ -1064,6 +1094,7 @@ export function applyTaskPairMarker(
       return done(auditorBefore !== pair.auditor ? 'reassigned_auditor' : 'reassigned');
     }
     case 'CANCEL': {
+      if (!roleAuthority) return reject('Only Brain or the daemon may CANCEL a pair; your marker was recorded but not applied.');
       if (terminal) return recorded(existing, false);
       pair.status = 'cancelled';
       intents.push({ kind: 'slot_changed' });
@@ -1149,6 +1180,7 @@ export const TASK_PAIR_CONSOLE_LEGACY_STATUS = {
   working: 'implementing',
   in_audit: 'auditing',
   awaiting_audit: 'ready_for_audit',
+  [TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION]: 'ready_for_audit',
   rework: 'rework',
   passed: 'passed',
   done: 'finalized',
@@ -1204,13 +1236,13 @@ export function buildTaskPairMarkerContract(): string {
     `<!-- ${TASK_PAIR_MARKER_TAG} <VERB> <taskId> [key=value | key="quoted value"] -->`,
     `A marker must be in your FINAL reply of the turn: only the last text segment is scanned, so one written before an earlier tool call in the same turn is silently lost. If you need to call a tool first, finish acting, then write the marker(s) in your closing reply. A long brief goes between QUEUE <taskId> ... and its <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> --> line, not scattered across earlier turn text.`,
     'Verbs: DISPATCH, QUEUE, STARTED, WORKING, READY_FOR_AUDIT, PASS, REWORK, DONE, BLOCKED, NEEDS_INPUT, REASSIGN, CANCEL. taskId "-" means your single open task.',
-    'Executor: write STARTED when you begin and work in the pair\'s workspace (below). When done, send the auditor your validation (full suites for code) with send_message and write READY_FOR_AUDIT naming the material; the daemon relays it to the auditor. After PASS commit/push code yourself and write DONE (with output= when the result must be kept). DONE without a PASS is not complete. Write BLOCKED or NEEDS_INPUT with note="..." when stuck. auditor=none is a real choice, not a lesser one: no audit window is assigned and nothing auto-picks one for you. Do proportionate self-validation instead (full suites for code), commit/push code yourself, then write DONE straight to Brain with no PASS required -- your closing reply is what Brain reads as the completion notice, so it must state what changed, the worktree/branch/HEAD or file paths, and your validation result before the DONE marker.',
+    'Executor: write STARTED when you begin and work in the pair\'s workspace (below). When done, send the auditor your validation (full suites for code) with send_message and write READY_FOR_AUDIT naming material; the daemon relays it to the auditor. Only after the assigned auditor applies PASS in a material-backed audit round may the executor write DONE. DONE before PASS is recorded as unusual and cannot close or advance the pair. Write BLOCKED or NEEDS_INPUT with note="..." when stuck. auditor=none is a real choice, not a lesser one: no audit window is assigned and nothing auto-picks one for you. Do proportionate self-validation instead (full suites for code), commit/push code yourself, then write DONE straight to Brain with no PASS required; this reports completion but leaves the pair open awaiting Brain\'s decision. The closing reply is relayed to Brain and must state what changed, the worktree/branch/HEAD or file paths, and your validation result before the DONE marker. Brain ends it with DONE (accept) or CANCEL; further Brain work returns it to working.',
     TASK_PAIR_INTEGRATION_RULE,
     TASK_PAIR_WORKSPACE_RULES,
     'Pairs have no assignmentId, auditAttemptId, auditRevision, immutable bundle, scopeFiles or control-plane binding: never wait for, ask for or block on them.',
-    `Auditor: the material is the executor's workspace (a worktree at the named head, or the named task-directory path; read it directly) plus their reported validation; judge by ${AUDIT_CONVERGENCE_CONTRACT_ID}. Reply to the executor with every finding tagged [P0]..[P4], then write PASS or REWORK with the blocking set and a count per level, e.g. REWORK <taskId> blocking=P0 p0=1 p1=2. REWORK needs at least one finding at a blocking level; PASS has none. Re-audits check only the prior blocking classes plus regressions. If the material cannot be reached (executor limited/offline, workspace unreadable), write NEEDS_INPUT <taskId> note="..." and wait: that is never a P0 or REWORK.`,
+    `Auditor: the material is the executor's workspace (a worktree at the named head, or the named task-directory path; read it directly) plus their reported validation; judge by ${AUDIT_CONVERGENCE_CONTRACT_ID}. Reply to the executor with every finding tagged [P0]..[P4], then write PASS or REWORK with the blocking set and a count per level, e.g. REWORK <taskId> blocking=P0 p0=1 p1=2. REWORK needs at least one finding at a blocking level; PASS has none. PASS/REWORK applies only while status is in_audit and material is present; otherwise it is recorded as unusual and cannot advance the pair. After a real PASS, only the executor may DONE. CANCEL and role-changing verbs are Brain/daemon-only; invalid participant markers are recorded as unusual with a bounded notice. Re-audits check only the prior blocking classes plus regressions. If the material cannot be reached (executor limited/offline, workspace unreadable), write NEEDS_INPUT <taskId> note="..." and wait: that is never a P0 or REWORK.`,
     TASK_PAIR_ASK_DONT_JUST_REPLY_RULE,
-    `Brain: DISPATCH is normally all you need -- the daemon starts it right away if a slot and window are free, otherwise it auto-queues it (status queued, normal FIFO order, urgent=true jumps the queue) and starts it automatically later; no need to pick QUEUE just to defer work. DISPATCH <taskId> executor=<session> auditor=<session>|none [blocking=P0,P1] [pool=primary|economy] [workspace=dir for non-code work in a git project] [urgent=true], optionally with a brief exactly like QUEUE's: DISPATCH <taskId> ... then the full brief then <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> -->; the daemon starts it and delivers the brief either way. QUEUE <taskId> title="..." ... <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> --> still works (always enqueues, same mechanics) for compatibility. QUEUE - max=<n> sets your queue limit; REASSIGN <taskId> auditor=<session>; DONE <taskId> force=true completes without audit; CANCEL <taskId>. Naming executor=/auditor=<session> replaces the current holder of that role immediately, ignoring the execution pool's role config; if that named session is busy the pair waits for it rather than substituting another. Naming executormodel=/auditormodel=<model> instead steers the next automatic pick or replacement for that role (also ignoring pool roles) but does not by itself replace a role that is already filled -- REASSIGN with the session explicitly for that; no matching session or pool config for a named model replies "no session/config for requested model <model>". A project with no execution pool configured has no built-in default: before dispatching or queueing work there without naming executormodel=/auditormodel=/executor=/auditor= yourself, ask the user which models to use (Settings -> execution pool, or name them on the task) -- an unnamed role in that state picks nothing and waits.`,
+    `Brain: DISPATCH is normally all you need -- the daemon starts it right away if a slot and window are free, otherwise it auto-queues it (status queued, normal FIFO order, urgent=true jumps the queue) and starts it automatically later; no need to pick QUEUE just to defer work. DISPATCH <taskId> executor=<session> auditor=<session>|none [blocking=P0,P1] [pool=primary|economy] [workspace=dir for non-code work in a git project] [urgent=true], optionally with a brief exactly like QUEUE's: DISPATCH <taskId> ... then the full brief then <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> -->; the daemon starts it and delivers the brief either way. QUEUE <taskId> title="..." ... <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> --> still works (always enqueues, same mechanics) for compatibility. QUEUE - max=<n> sets your queue limit; REASSIGN <taskId> auditor=<session>; DONE <taskId> force=true accepts/ends from any state and marks an audited unpassed pair unaudited; CANCEL ends from any state. No-auditor DONE reports are open and hold their concurrency slot until you decide with DONE or CANCEL; more work can return them to working. Naming executor=/auditor=<session> replaces the current holder of that role immediately, ignoring the execution pool's role config; if that named session is busy the pair waits for it rather than substituting another. Naming executormodel=/auditormodel=<model> instead steers the next automatic pick or replacement for that role (also ignoring pool roles) but does not by itself replace a role that is already filled -- REASSIGN with the session explicitly for that; no matching session or pool config for a named model replies "no session/config for requested model <model>". A project with no execution pool configured has no built-in default: before dispatching or queueing work there without naming executormodel=/auditormodel=/executor=/auditor= yourself, ask the user which models to use (Settings -> execution pool, or name them on the task) -- an unnamed role in that state picks nothing and waits.`,
     TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
     TASK_PAIR_BRAIN_REPORTING_RULE,
     TASK_PAIR_CHECKLIST_RULE,

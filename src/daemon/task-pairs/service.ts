@@ -17,6 +17,7 @@ import {
   TASK_PAIR_INFER_TASK_ID,
   TASK_PAIR_NO_AUDITOR,
   TASK_PAIR_OPEN_STATUSES,
+  TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION,
   TASK_PAIR_TIMELINE_EVENT,
   TASK_PAIR_TITLE_EVENT_VERB,
   TASK_PAIR_TITLE_GENERATED_EFFECT,
@@ -176,6 +177,8 @@ export async function refreshTaskPairWorkspaceHead(project: string, taskId: stri
 export class TaskPairService {
   #unsubscribe?: () => void;
   #scheduler?: TaskPairScheduler;
+  /** Bounded notices for unknown task ids, which have no pair state for persisted caps. */
+  #policyNoticeKeys = new Set<string>();
   #recentBrainDispatch = new Map<string, { taskId: string; at: number }>();
   /**
    * Background work `applyMarker` starts and does not await (running intents,
@@ -438,8 +441,8 @@ export class TaskPairService {
     // the executor's own closing-reply prose (the marker line stripped out)
     // as the completion notice, so Brain never has to poll a pair it can't
     // watch an auditor finish for it.
-    if (stored && input.marker.knownVerb === 'DONE' && transition.toStatus === 'done'
-      && transition.fromStatus !== 'done' && stored.state.auditor === TASK_PAIR_NO_AUDITOR
+    if (stored && input.marker.knownVerb === 'DONE' && transition.toStatus === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION
+      && transition.fromStatus !== TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION && stored.state.auditor === TASK_PAIR_NO_AUDITOR
       && input.writer !== stored.state.brain) {
       const summary = input.turnText ? stripTaskPairMarkersForDisplay(input.turnText) : '';
       this.#track(sendTaskPairMessage(
@@ -515,6 +518,15 @@ export class TaskPairService {
       // Record only: ordinary traffic (materials to the auditor, replies,
       // Brain messages) never changes a pair's roles or status.
       const state = existing.state;
+      if (input.sender === state.brain && state.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION) {
+        const resumed = this.applyMarker({
+          project, writer: input.sender,
+          marker: { verb: 'WORKING', knownVerb: 'WORKING', taskId: input.taskId, attrs: {} },
+          source: 'implicit_dispatch', eventId: input.eventId,
+        });
+        noteTaskPairFocus(input.target, input.taskId);
+        return resumed;
+      }
       const counterpart = input.sender === state.executor ? state.auditor
         : input.sender === state.auditor ? state.executor
           : undefined;
@@ -660,6 +672,17 @@ export class TaskPairService {
     for (const intent of intents) {
       if (intent.kind === 'queue_settings') {
         getTaskPairStore().setMaxConcurrency(intent.brain, intent.maxConcurrency);
+        continue;
+      }
+      if (intent.kind === 'policy_notice') {
+        const key = `${intent.taskId}\u0000${intent.to}`;
+        if (pair) {
+          await sendTaskPairMessage(intent.to, pair.taskId, 'policy-rejection', intent.text);
+        } else if (!this.#policyNoticeKeys.has(key)) {
+          this.#policyNoticeKeys.add(key);
+          if (this.#policyNoticeKeys.size > 500) this.#policyNoticeKeys.delete(this.#policyNoticeKeys.values().next().value!);
+          await sendTaskPairMessage(intent.to, intent.taskId, 'policy-rejection', intent.text);
+        }
         continue;
       }
       if (!pair) continue;

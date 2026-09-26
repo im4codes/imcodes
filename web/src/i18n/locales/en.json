@@ -4338,7 +4338,8 @@
       "passed": "Passed",
       "done": "Done",
       "cancelled": "Cancelled",
-      "rework_round": "Rework round {{round}}"
+      "rework_round": "Rework round {{round}}",
+      "awaiting_brain_decision": "Awaiting Brain decision"
     },
     "flag": {
       "blocked": "Blocked",
@@ -4356,7 +4357,8 @@
       "markers_unresolved": "Unresolved markers",
       "all_providers_limited": "All providers limited",
       "auditor_capacity_hold": "Auditor holding (capacity)",
-      "no_pool_configured": "No execution pool configured"
+      "no_pool_configured": "No execution pool configured",
+      "policy_violation": "Policy violation"
     },
     "settings": {
       "title": "Task pairs (marker-driven supervision)",

@@ -24,6 +24,7 @@ import {
   TASK_PAIR_OPEN_STATUSES,
   TASK_PAIR_QUEUE_STALL_NOTICE_MS,
   TASK_PAIR_SILENCE_LIMIT,
+  TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION,
   compareQueuedTaskPairs,
   isTerminalTaskPairStatus,
   taskPairSideToAct,
@@ -373,6 +374,21 @@ export class TaskPairAutomation implements TaskPairScheduler {
     const liveness: TaskPairLiveness = { ...stored.liveness, notified: [...stored.liveness.notified] };
     const previousTick = liveness.lastTickAt;
     liveness.lastTickAt = now;
+    if (pair.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION) {
+      const reminderKey = `awaiting-brain-decision:${pair.round}`;
+      if (!liveness.notified.includes(reminderKey)) {
+        liveness.silenceExecutor += 1;
+        if (liveness.silenceExecutor >= TASK_PAIR_SILENCE_LIMIT) {
+          liveness.notified.push(reminderKey);
+          store.saveLiveness(stored.project, pair.taskId, liveness);
+          await sendTaskPairMessage(pair.brain, pair.taskId, 'brain-decision-reminder', buildBrainLine(pair,
+            `Executor ${pair.executor ?? '(unknown)'} reported completion without an auditor. Decide with DONE <taskId> force=true to accept or CANCEL <taskId>; dispatch/brief/message more work to resume it.`));
+          return;
+        }
+      }
+      store.saveLiveness(stored.project, pair.taskId, liveness);
+      return;
+    }
     if (!side) { store.saveLiveness(stored.project, pair.taskId, liveness); return; }
 
     const session = side === 'executor' ? pair.executor : pair.auditor;

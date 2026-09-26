@@ -4338,7 +4338,8 @@
       "passed": "Aprobada",
       "done": "Terminada",
       "cancelled": "Cancelada",
-      "rework_round": "Revisión ronda {{round}}"
+      "rework_round": "Revisión ronda {{round}}",
+      "awaiting_brain_decision": "Esperando decisión de Brain"
     },
     "flag": {
       "blocked": "Bloqueada",
@@ -4356,7 +4357,8 @@
       "markers_unresolved": "Marcadores sin resolver",
       "all_providers_limited": "Todos los proveedores limitados",
       "auditor_capacity_hold": "Auditor en espera (capacidad)",
-      "no_pool_configured": "Sin grupo de ejecución configurado"
+      "no_pool_configured": "Sin grupo de ejecución configurado",
+      "policy_violation": "Violación de política"
     },
     "settings": {
       "title": "Pares de tareas (supervisión por marcadores)",

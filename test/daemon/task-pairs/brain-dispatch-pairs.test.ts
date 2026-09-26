@@ -294,7 +294,7 @@ describe('Brain work dispatch opens driven pairs', () => {
     await tick(1);
     expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
 
-    taskPairService.ingestText(PROJECT, EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT U1 -->', 'user-audit-2', now + 1);
+    taskPairService.ingestText(PROJECT, EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT U1 path=/workspace -->', 'user-audit-2', now + 1);
     taskPairService.ingestText(PROJECT, AUD, '<!-- IMCODES_TASK PASS U1 blocking=P0 -->', 'user-audit-3', now + 2);
     taskPairService.ingestText(PROJECT, EXEC, '<!-- IMCODES_TASK DONE U1 -->', 'user-audit-4', now + 3);
     await flush();

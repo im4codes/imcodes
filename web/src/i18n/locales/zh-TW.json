@@ -4338,7 +4338,8 @@
       "passed": "已通過",
       "done": "已完成",
       "cancelled": "已取消",
-      "rework_round": "返工第{{round}}輪"
+      "rework_round": "返工第{{round}}輪",
+      "awaiting_brain_decision": "等待 Brain 決定"
     },
     "flag": {
       "blocked": "受阻",
@@ -4356,7 +4357,8 @@
       "markers_unresolved": "標記無法比對",
       "all_providers_limited": "所有服務商均受限",
       "auditor_capacity_hold": "審計者容量保持中",
-      "no_pool_configured": "未設定執行池"
+      "no_pool_configured": "未設定執行池",
+      "policy_violation": "策略違規"
     },
     "settings": {
       "title": "任務配對（標記驅動監督）",

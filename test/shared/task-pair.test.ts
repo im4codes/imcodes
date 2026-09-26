@@ -58,7 +58,7 @@ function dispatched(extra = ''): TaskPairState {
 }
 
 function withStatus(status: TaskPairStatus, extra = ''): TaskPairState {
-  return { ...dispatched(extra), status, round: status === 'in_audit' || status === 'rework' ? 1 : 0 };
+  return { ...dispatched(extra), status, round: status === 'in_audit' || status === 'rework' ? 1 : 0, ...(status === 'in_audit' ? { material: { path: '/workspace', at: 1_000 } } : {}) };
 }
 
 describe('task-pair marker grammar', () => {
@@ -139,6 +139,7 @@ describe('task-pair marker grammar', () => {
     expect(body).toContain('no audit window is assigned');
     expect(body).toContain('nothing auto-picks one for you');
     expect(body).toContain('write DONE straight to Brain with no PASS required');
+    expect(body).toContain('leaves the pair open awaiting Brain\'s decision');
     expect(body).toContain('what changed, the worktree/branch/HEAD or file paths, and your validation result');
   });
 
@@ -201,9 +202,9 @@ describe('task-pair state machine', () => {
     const { pair } = run([
       [BRAIN, `<!-- IMCODES_TASK DISPATCH T42 executor=${EXEC} auditor=${AUD} -->`],
       [EXEC, '<!-- IMCODES_TASK STARTED T42 -->'],
-      [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 -->'],
+      [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 path=/workspace -->'],
       [AUD, '<!-- IMCODES_TASK REWORK T42 blocking=P0 p0=1 -->'],
-      [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 -->'],
+      [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 path=/workspace -->'],
       [AUD, '<!-- IMCODES_TASK PASS T42 blocking=P0 -->'],
       [EXEC, '<!-- IMCODES_TASK DONE T42 -->'],
     ]);
@@ -215,9 +216,9 @@ describe('task-pair state machine', () => {
     const { intents } = run([
       [BRAIN, `<!-- IMCODES_TASK DISPATCH T42 executor=${EXEC} auditor=${AUD} -->`],
       [EXEC, '<!-- IMCODES_TASK STARTED T42 -->'],
-      [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 -->'],
+      [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 path=/workspace -->'],
       [AUD, '<!-- IMCODES_TASK REWORK T42 blocking=P0 p0=1 p1=2 -->'],
-      [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 -->'],
+      [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 path=/workspace -->'],
       [AUD, '<!-- IMCODES_TASK PASS T42 blocking=P0 -->'],
       [EXEC, '<!-- IMCODES_TASK DONE T42 -->'],
     ]);
@@ -252,6 +253,19 @@ describe('task-pair state machine', () => {
     expect(apply(custom, AUD, '<!-- IMCODES_TASK REWORK T42 blocking=P0,P1 p1=1 -->').pair?.status).toBe('rework');
   });
 
+  it('does not apply a PASS outside in_audit or without material, including a first marker on an unknown pair', () => {
+    const outside = apply(withStatus('working'), AUD, '<!-- IMCODES_TASK PASS T42 blocking=P0 -->');
+    expect(outside).toMatchObject({ effect: 'recorded', unusual: true, toStatus: 'working' });
+    expect(outside.intents).toContainEqual(expect.objectContaining({ kind: 'policy_notice', to: AUD }));
+    const noMaterial = apply({ ...withStatus('in_audit'), material: undefined }, AUD, '<!-- IMCODES_TASK PASS T42 blocking=P0 -->');
+    expect(noMaterial).toMatchObject({ effect: 'recorded', unusual: true, toStatus: 'in_audit' });
+    expect(noMaterial.pair?.status).toBe('in_audit');
+    expect(apply(undefined, AUD, '<!-- IMCODES_TASK PASS T999 blocking=P0 -->')).toMatchObject({
+      effect: 'recorded', unusual: true, pair: undefined,
+      intents: [expect.objectContaining({ kind: 'policy_notice', taskId: 'T999' })],
+    });
+  });
+
   it('bounds the correction loop at the per-round cap and then tells Brain once', () => {
     let pair = withStatus('in_audit');
     const corrections: unknown[] = [];
@@ -266,44 +280,53 @@ describe('task-pair state machine', () => {
     expect(notices).toEqual([{ kind: 'brain_notice', flag: 'verdict_inconsistent' }]);
     expect(pair.flags).toContain('verdict_inconsistent');
     // A new round clears the cap.
-    pair = apply({ ...pair, status: 'rework' }, EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 -->').pair!;
+    pair = apply({ ...pair, status: 'rework' }, EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 path=/workspace -->').pair!;
     expect(pair.flags).not.toContain('verdict_inconsistent');
   });
 
-  it('treats DONE without PASS as awaiting_audit with a capped reminder', () => {
-    let pair = withStatus('working');
-    const reminders: unknown[] = [];
-    const notices: unknown[] = [];
-    for (let i = 0; i < 4; i += 1) {
-      const result = apply(pair, EXEC, '<!-- IMCODES_TASK DONE T42 -->');
-      pair = result.pair!;
-      reminders.push(...result.intents.filter((intent) => intent.kind === 'done_reminder'));
-      notices.push(...result.intents.filter((intent) => intent.kind === 'brain_notice'));
-    }
-    expect(pair.status).toBe('awaiting_audit');
-    expect(reminders).toHaveLength(TASK_PAIR_MESSAGE_CAP_PER_ROUND);
-    expect(notices).toEqual([{ kind: 'brain_notice', flag: 'awaiting_audit_ignored' }]);
-    expect(taskPairSideToAct(pair)).toBe('executor');
+  it('keeps audited DONE before PASS from advancing or ending the pair', () => {
+    const pair = withStatus('working');
+    const result = apply(pair, EXEC, '<!-- IMCODES_TASK DONE T42 -->');
+    expect(result).toMatchObject({ effect: 'recorded', unusual: true, toStatus: 'working' });
+    expect(result.intents).toContainEqual(expect.objectContaining({ kind: 'policy_notice', to: EXEC }));
   });
 
   it('keeps DONE from in_audit waiting for the verdict', () => {
-    expect(apply(withStatus('in_audit'), EXEC, '<!-- IMCODES_TASK DONE T42 -->')).toMatchObject({ effect: 'recorded' });
+    expect(apply(withStatus('in_audit'), EXEC, '<!-- IMCODES_TASK DONE T42 -->')).toMatchObject({ effect: 'recorded', unusual: true, toStatus: 'in_audit' });
   });
 
   it('lets Brain force completion, flagged unaudited', () => {
     const result = apply(withStatus('rework'), BRAIN, '<!-- IMCODES_TASK DONE T42 force=true -->');
     expect(result.pair).toMatchObject({ status: 'done', flags: expect.arrayContaining(['unaudited']) });
-    // force from anyone else is an ordinary DONE
-    expect(apply(withStatus('rework'), EXEC, '<!-- IMCODES_TASK DONE T42 force=true -->').pair?.status).toBe('awaiting_audit');
+    // force from anyone else is not authority to finish.
+    expect(apply(withStatus('rework'), EXEC, '<!-- IMCODES_TASK DONE T42 force=true -->').pair?.status).toBe('rework');
   });
 
-  it('completes auditor=none tasks on DONE and ignores audit markers for them', () => {
+  it('allows only Brain/daemon to CANCEL, and Brain force/CANCEL work from any active state', () => {
+    const rejected = apply(withStatus('working'), EXEC, '<!-- IMCODES_TASK CANCEL T42 -->');
+    expect(rejected).toMatchObject({ effect: 'recorded', unusual: true, toStatus: 'working' });
+    expect(rejected.intents).toContainEqual(expect.objectContaining({ kind: 'policy_notice', to: EXEC }));
+    expect(apply(withStatus('in_audit'), BRAIN, '<!-- IMCODES_TASK CANCEL T42 -->').pair?.status).toBe('cancelled');
+    expect(apply(withStatus('in_audit'), BRAIN, '<!-- IMCODES_TASK DONE T42 force=true -->').pair?.status).toBe('done');
+  });
+
+  it('reports auditor=none DONE to Brain and waits for Brain to decide', () => {
     const none = run([[BRAIN, `<!-- IMCODES_TASK DISPATCH T42 executor=${EXEC} auditor=none -->`]]).pair;
-    expect(apply(none, EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 -->')).toMatchObject({ effect: 'recorded' });
+    expect(apply(none, EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 path=/workspace -->')).toMatchObject({ effect: 'recorded' });
     expect(apply(none, AUD, '<!-- IMCODES_TASK PASS T42 -->')).toMatchObject({ effect: 'recorded' });
-    const finished = apply(none, EXEC, '<!-- IMCODES_TASK DONE T42 -->').pair!;
-    expect(finished.status).toBe('done');
-    expect(finished.flags).not.toContain('unaudited');
+    const reported = apply(none, EXEC, '<!-- IMCODES_TASK DONE T42 -->').pair!;
+    expect(reported.status).toBe('awaiting_brain_decision');
+    expect(reported.flags).not.toContain('unaudited');
+    expect(apply(reported, BRAIN, '<!-- IMCODES_TASK DONE T42 -->').pair?.status).toBe('done');
+  });
+
+  it('does not let an unrelated participant resume a no-auditor pair awaiting Brain', () => {
+    const none = run([[BRAIN, `<!-- IMCODES_TASK DISPATCH T43 executor=${EXEC} auditor=none -->`]]).pair;
+    const reported = apply(none, EXEC, '<!-- IMCODES_TASK DONE T43 -->').pair!;
+    const result = apply(reported, 'deck_sub_other', '<!-- IMCODES_TASK WORKING T43 -->');
+    expect(result).toMatchObject({ effect: 'recorded', unusual: true, toStatus: 'awaiting_brain_decision' });
+    expect(result.pair?.status).toBe('awaiting_brain_decision');
+    expect(result.intents).toContainEqual(expect.objectContaining({ kind: 'policy_notice', to: 'deck_sub_other' }));
   });
 
   it('returns an in_audit pair to working on REASSIGN auditor=none', () => {
@@ -333,7 +356,7 @@ describe('task-pair state machine', () => {
       for (const [writer, line] of [
         [EXEC, '<!-- IMCODES_TASK STARTED T42 -->'],
         [EXEC, '<!-- IMCODES_TASK WORKING T42 -->'],
-        [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 -->'],
+        [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 path=/workspace -->'],
         [AUD, '<!-- IMCODES_TASK REWORK T42 blocking=P0 p0=1 -->'],
       ] as const) {
         const result = apply(closed, writer, line);
@@ -355,9 +378,9 @@ describe('task-pair state machine', () => {
       [BRAIN, `<!-- IMCODES_TASK DISPATCH T42 executor=${EXEC} auditor=${AUD} -->`],
       [BRAIN, '<!-- IMCODES_TASK CANCEL T42 -->'],
       // Same writer, three repeats: only the first gets a notice.
-      [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 -->'],
-      [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 -->'],
-      [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 -->'],
+      [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 path=/workspace -->'],
+      [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 path=/workspace -->'],
+      [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 path=/workspace -->'],
       // A DIFFERENT writer still gets their own first notice.
       [AUD, '<!-- IMCODES_TASK REWORK T42 blocking=P0 p0=1 -->'],
       [AUD, '<!-- IMCODES_TASK REWORK T42 blocking=P0 p0=1 -->'],
@@ -375,7 +398,7 @@ describe('task-pair state machine', () => {
     const { pair } = run([
       [BRAIN, `<!-- IMCODES_TASK DISPATCH T42 executor=${EXEC} auditor=${AUD} -->`],
       [BRAIN, '<!-- IMCODES_TASK CANCEL T42 -->'],
-      [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 -->'],
+      [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 path=/workspace -->'],
     ]);
     expect(pair.closedNoticeSentTo).toEqual([EXEC]);
     const reopened = apply(pair, BRAIN, `<!-- IMCODES_TASK DISPATCH T42 executor=${EXEC} auditor=${AUD} -->`).pair!;

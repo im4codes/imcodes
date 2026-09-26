@@ -156,9 +156,9 @@ describe('task-pair marker ingestion', () => {
 
   it('never applies the same turn twice', async () => {
     await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T3 executor=${EXEC} auditor=${AUD} -->`);
-    await say(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T3 -->', {}, 'fixed-turn');
+    await say(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T3 path=/workspace -->', {}, 'fixed-turn');
     await say(AUD, '<!-- IMCODES_TASK REWORK T3 blocking=P0 p0=1 -->');
-    await say(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T3 -->', {}, 'fixed-turn');
+    await say(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T3 path=/workspace -->', {}, 'fixed-turn');
     expect(pair('T3')).toMatchObject({ status: 'rework', round: 1 });
     // DISPATCH now records two events (queued, then the queue-drain's own
     // start), plus READY_FOR_AUDIT and REWORK -- the repeated 'fixed-turn'
@@ -194,12 +194,12 @@ describe('task-pair marker ingestion', () => {
       'Changed the timeout to 30s in config.yaml and pushed.\nRan the full suite locally: all green.\n'
       + '<!-- IMCODES_TASK DONE T60 -->',
     );
-    expect(pair('T60')?.status).toBe('done');
+    expect(pair('T60')?.status).toBe('awaiting_brain_decision');
     const notice = sent.find((entry) => entry.target === BRAIN);
     expect(notice).toBeDefined();
-    expect(notice!.text).toContain('DONE from executor');
+    expect(notice!.text).toContain('reported DONE');
     expect(notice!.text).toContain(EXEC);
-    expect(notice!.text).toContain('no auditor for this pair');
+    expect(notice!.text).toContain('no auditor was assigned');
     expect(notice!.text).toContain('Changed the timeout to 30s in config.yaml and pushed.');
     expect(notice!.text).toContain('Ran the full suite locally: all green.');
     expect(notice!.text).not.toContain('IMCODES_TASK DONE');
@@ -286,7 +286,7 @@ describe('task-pair marker ingestion', () => {
 
   it('sends a verdict correction to the auditor and a rework notice to the executor', async () => {
     await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T9 executor=${EXEC} auditor=${AUD} -->`);
-    await say(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T9 -->');
+    await say(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T9 path=/workspace -->');
     // Pair briefs and the audit request are covered elsewhere.
     await vi.waitFor(() => expect(sent.filter((entry) => /:(pair-brief|auditor-assigned|audit-request):/.test(entry.id))).toHaveLength(3));
     sent = [];
@@ -301,16 +301,16 @@ describe('task-pair marker ingestion', () => {
     expect(sent.at(-1)?.text).toContain('whole class');
   });
 
-  it('reminds the executor once per DONE without PASS', async () => {
+  it('records audited DONE without PASS and sends a bounded policy notice', async () => {
     await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T10 executor=${EXEC} auditor=${AUD} -->`);
     await vi.waitFor(() => expect(sent.filter((entry) => /:(pair-brief|auditor-assigned):/.test(entry.id))).toHaveLength(2));
     sent = [];
     await say(EXEC, '<!-- IMCODES_TASK DONE T10 -->');
     await flush();
-    expect(pair('T10')?.status).toBe('awaiting_audit');
+    expect(pair('T10')?.status).toBe('working');
     expect(sent).toHaveLength(1);
     expect(sent[0]).toMatchObject({ target: EXEC });
-    expect(sent[0]?.text).toContain('DONE without a PASS is not complete');
+    expect(sent[0]?.text).toContain('material-backed audit round');
   });
 
   it('tells the writer their marker was recorded, not applied, when the pair is closed (tsk_83375afb5a)', async () => {
