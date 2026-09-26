@@ -58,9 +58,16 @@ function queuePairDirect(taskId: string, brief?: string): void {
   } satisfies TaskPairState);
 }
 
-/** A `queued` pair with no brief. */
+/**
+ * A `queued` pair with no brief, as legacy import produces it (it carries a
+ * legacy task id). A bare DISPATCH that was auto-queued also has no brief but
+ * no legacy id, and is started normally rather than parked.
+ */
 function queueBriefLessPair(taskId: string): void {
-  queuePairDirect(taskId);
+  getTaskPairStore().savePair(PROJECT, {
+    taskId, brain: BRAIN, status: 'queued', flags: [], flagSides: {}, round: 0,
+    blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now, updatedAt: now,
+  } satisfies TaskPairState, { legacyTaskId: `legacy_${taskId}` });
 }
 
 async function tick(times = 1) {
