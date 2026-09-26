@@ -767,8 +767,50 @@ function getCodexAuthPath(env: Record<string, string | undefined>): string {
 async function readCodexAuthFingerprint(env: Record<string, string | undefined>): Promise<string | null> {
   try {
     const authPath = getCodexAuthPath(env);
-    const stats = await stat(authPath);
-    return `${authPath}:${Math.trunc(stats.mtimeMs)}:${stats.size}`;
+    const raw = await readFile(authPath, 'utf8');
+    const parsed: unknown = JSON.parse(raw);
+    // auth.json is rewritten during ordinary token refreshes. Fingerprint the
+    // durable credential identity/configuration while excluding rotating token
+    // and timestamp fields, so refreshes do not restart the app-server.
+    const volatileKeys = new Set([
+      'access_token', 'accesstoken', 'refresh_token', 'refreshtoken',
+      'id_token', 'idtoken', 'expires_at', 'expiresat', 'expires_in', 'expiresin',
+      'issued_at', 'issuedat', 'updated_at', 'updatedat', 'last_refresh', 'lastrefresh',
+    ]);
+    const canonicalize = (value: unknown): unknown => {
+      if (Array.isArray(value)) return value.map(canonicalize);
+      if (!isRecord(value)) return value;
+      const result: Record<string, unknown> = {};
+      for (const key of Object.keys(value).sort()) {
+        const lowerKey = key.toLowerCase();
+        if (lowerKey === 'id_token' || lowerKey === 'idtoken') {
+          const token = value[key];
+          if (typeof token === 'string') {
+            try {
+              const payload = token.split('.')[1];
+              if (payload) {
+                const decoded: unknown = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+                if (isRecord(decoded)) {
+                  result[key] = canonicalize(Object.fromEntries(
+                    ['sub', 'subject', 'account_id', 'accountId', 'email', 'organization_id', 'organizationId']
+                      .filter((identityKey) => decoded[identityKey] !== undefined)
+                      .map((identityKey) => [identityKey, decoded[identityKey]]),
+                  ));
+                }
+              }
+            } catch {
+              // A partial/invalid token is treated as having no stable identity.
+            }
+          }
+          continue;
+        }
+        if (volatileKeys.has(lowerKey)) continue;
+        result[key] = canonicalize(value[key]);
+      }
+      return result;
+    };
+    const canonical = JSON.stringify(canonicalize(parsed));
+    return `${authPath}:${createHash('sha256').update(canonical).digest('hex')}`;
   } catch {
     return null;
   }
@@ -2681,6 +2723,8 @@ export class CodexSdkProvider implements TransportProvider {
   private pendingRequests = new Map<number, PendingRequest>();
   private appServerAuthFingerprint: string | null = null;
   private appServerRestart: Promise<void> | null = null;
+  private pendingAuthRestartReason: string | null = null;
+  private pendingAuthRestartTimer: ReturnType<typeof setTimeout> | null = null;
   private imcodesMcpReload: Promise<void> | null = null;
   private rawSpawnAgentCalls = new Map<string, CodexRawSpawnAgentCall>();
   private rawNativeCollabCalls = new Map<string, { sessionId: string; name: string }>();
@@ -2689,6 +2733,9 @@ export class CodexSdkProvider implements TransportProvider {
   private heartbeatInFlightCount = 0;
 
   async connect(config: ProviderConfig): Promise<void> {
+    if (this.pendingAuthRestartTimer) clearTimeout(this.pendingAuthRestartTimer);
+    this.pendingAuthRestartTimer = null;
+    this.pendingAuthRestartReason = null;
     const binaryPath = this.resolveBinaryPath(config);
     // Resolve the binary (handles npm .cmd shims on Windows) and verify it.
     const resolved = resolveExecutableForSpawn(binaryPath);
@@ -2814,6 +2861,9 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   async disconnect(): Promise<void> {
+    if (this.pendingAuthRestartTimer) clearTimeout(this.pendingAuthRestartTimer);
+    this.pendingAuthRestartTimer = null;
+    this.pendingAuthRestartReason = null;
     await this.stopAppServer({ clearSessions: true });
   }
 
@@ -3509,13 +3559,62 @@ export class CodexSdkProvider implements TransportProvider {
     if (!this.config || !this.child) return;
     const current = await readCodexAuthFingerprint(this.buildSpawnEnv(this.config));
     if (current === this.appServerAuthFingerprint) return;
+    this.pendingAuthRestartReason = reason;
     logger.info({
       provider: this.id,
       reason,
       previousAuthPresent: this.appServerAuthFingerprint !== null,
       currentAuthPresent: current !== null,
-    }, 'Codex auth file changed; restarting app-server to load latest authentication');
-    await this.restartAppServerPreservingSessions(reason);
+    }, 'Codex auth identity changed; scheduling app-server restart to load latest authentication');
+    await this.tryRunPendingAuthRestart();
+  }
+
+  private schedulePendingAuthRestart(): void {
+    if (!this.pendingAuthRestartReason || this.pendingAuthRestartTimer || !this.config || !this.child) return;
+    this.pendingAuthRestartTimer = setTimeout(() => {
+      this.pendingAuthRestartTimer = null;
+      void this.tryRunPendingAuthRestart().catch((error) => {
+        logger.warn({ provider: this.id, error }, 'Codex pending auth restart attempt failed');
+        this.schedulePendingAuthRestart();
+      });
+    }, 1_000);
+    this.pendingAuthRestartTimer.unref?.();
+  }
+
+  private async tryRunPendingAuthRestart(): Promise<void> {
+    const reason = this.pendingAuthRestartReason;
+    if (!reason || !this.config || !this.child) return;
+    const latestFingerprint = await readCodexAuthFingerprint(this.buildSpawnEnv(this.config));
+    if (latestFingerprint === this.appServerAuthFingerprint) {
+      // A transient partial rewrite may have been observed between the
+      // provider's reads. If the file has settled back to the loaded identity,
+      // drop the pending restart rather than needlessly recycling the server.
+      this.pendingAuthRestartReason = null;
+      if (this.pendingAuthRestartTimer) {
+        clearTimeout(this.pendingAuthRestartTimer);
+        this.pendingAuthRestartTimer = null;
+      }
+      return;
+    }
+    if (this.getActiveWorkSessionIds().length > 0) {
+      // Auth refresh must never turn an unrelated send into a recoverable
+      // provider failure. Keep the current app-server serving work and retry
+      // once the active sessions settle, with a bounded timer as backstop.
+      this.schedulePendingAuthRestart();
+      return;
+    }
+    if (this.pendingAuthRestartTimer) {
+      clearTimeout(this.pendingAuthRestartTimer);
+      this.pendingAuthRestartTimer = null;
+    }
+    this.pendingAuthRestartReason = null;
+    try {
+      await this.restartAppServerPreservingSessions(reason);
+    } catch (error) {
+      this.pendingAuthRestartReason = reason;
+      this.schedulePendingAuthRestart();
+      throw error;
+    }
   }
 
   private async restartAppServerPreservingSessions(_reason: string, recoverySessionId?: string): Promise<void> {
@@ -3561,6 +3660,9 @@ export class CodexSdkProvider implements TransportProvider {
       code: error.code,
       message: error.message,
     }, 'Codex app-server authentication failed; restarting to load latest authentication');
+    if (this.pendingAuthRestartTimer) clearTimeout(this.pendingAuthRestartTimer);
+    this.pendingAuthRestartTimer = null;
+    this.pendingAuthRestartReason = null;
     await this.restartAppServerPreservingSessions(reason, recoverySessionId);
   }
 
@@ -5536,6 +5638,10 @@ export class CodexSdkProvider implements TransportProvider {
       },
     };
     for (const cb of this.completeCallbacks) cb(sessionId, completed);
+    void this.tryRunPendingAuthRestart().catch((error) => {
+      logger.warn({ provider: this.id, error }, 'Codex pending auth restart after turn settlement failed');
+      this.schedulePendingAuthRestart();
+    });
   }
 
   private rememberCompletedTurn(state: CodexSdkSessionState, turnId?: string): void {

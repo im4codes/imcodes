@@ -431,6 +431,13 @@ async function writeCodexAuthFile(codexHome: string, version: number): Promise<v
   );
 }
 
+async function writeCodexAuthIdentityFile(codexHome: string, accountId: string, accessToken: string): Promise<void> {
+  await writeFile(
+    join(codexHome, 'auth.json'),
+    JSON.stringify({ tokens: { account_id: accountId, access_token: accessToken, expires_at: Date.now() + 60_000 } }),
+  );
+}
+
 async function writeCodexRolloutFile(codexHome: string, threadId: string, lines: unknown[]): Promise<string> {
   const now = new Date();
   const dir = join(
@@ -1134,16 +1141,7 @@ describe('CodexSdkProvider', () => {
       );
 
       await writeCodexAuthFile(codexHome, 2);
-      await expect(provider.createSession({ sessionKey: 'route-after-auth-change', cwd: '/tmp/project' }))
-        .rejects.toMatchObject({
-          code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
-          recoverable: true,
-          details: {
-            disconnectClass: 'auth_refresh_restart',
-            activeSessionCount: 1,
-            activeSessionIds: ['route-auth-active'],
-          },
-        });
+      await provider.createSession({ sessionKey: 'route-after-auth-change', cwd: '/tmp/project' });
       expect(childProcessMock.children).toHaveLength(1);
       expect(firstChild.child.killed).toBe(false);
       expect(provider.getActiveWorkSnapshot('route-auth-active')).toMatchObject({
@@ -1160,10 +1158,61 @@ describe('CodexSdkProvider', () => {
         () => provider.getActiveWorkSnapshot('route-auth-active')?.activeWorkCount === 0,
       );
 
-      await provider.createSession({ sessionKey: 'route-after-auth-change', cwd: '/tmp/project' });
+      await waitForCondition(() => childProcessMock.children.length === 2);
       expect(childProcessMock.children).toHaveLength(2);
       expect(firstChild.child.killed).toBe(true);
       expect(childProcessMock.children[1]!.requests.some((req) => req.method === 'initialize')).toBe(true);
+    } finally {
+      await provider.disconnect().catch(() => {});
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('does not restart for a refresh-only auth rewrite, but restarts when the account identity changes', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-auth-identity-'));
+    const provider = createCodexProvider();
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      await writeCodexAuthIdentityFile(codexHome, 'account-a', 'token-a');
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-auth-identity', cwd: '/tmp/project' });
+      expect(childProcessMock.children).toHaveLength(1);
+
+      await writeCodexAuthIdentityFile(codexHome, 'account-a', 'token-refreshed');
+      await provider.createSession({ sessionKey: 'route-auth-refresh-only', cwd: '/tmp/project' });
+      expect(childProcessMock.children).toHaveLength(1);
+
+      await writeCodexAuthIdentityFile(codexHome, 'account-b', 'token-b');
+      await provider.createSession({ sessionKey: 'route-auth-account-switch', cwd: '/tmp/project' });
+      await waitForCondition(() => childProcessMock.children.length === 2);
+      expect(childProcessMock.children[0]!.child.killed).toBe(true);
+    } finally {
+      await provider.disconnect().catch(() => {});
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it('continues sending to another session while an auth restart is deferred by busy work', async () => {
+    const codexHome = await mkdtemp(join(tmpdir(), 'imcodes-codex-auth-send-'));
+    const provider = createCodexProvider();
+    try {
+      vi.stubEnv('CODEX_HOME', codexHome);
+      await writeCodexAuthFile(codexHome, 1);
+      await provider.connect({ binaryPath: 'codex' });
+      await provider.createSession({ sessionKey: 'route-auth-busy-send', cwd: '/tmp/project' });
+      await provider.send('route-auth-busy-send', 'keep working');
+      await waitForCondition(() => provider.getSessionDiagnostics('route-auth-busy-send')?.runningTurnId === 'turn-1');
+      const firstChild = childProcessMock.children[0]!;
+      firstChild.emits({
+        method: 'item/started',
+        params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'busy-tool', type: 'webSearch', action: { type: 'other' } } },
+      });
+      await waitForCondition(() => provider.getActiveWorkSnapshot('route-auth-busy-send')?.activeToolCount === 1);
+      await writeCodexAuthFile(codexHome, 2);
+      await provider.createSession({ sessionKey: 'route-auth-send-target', cwd: '/tmp/project' });
+      await expect(provider.send('route-auth-send-target', 'this must not be starved')).resolves.toBeUndefined();
+      expect(childProcessMock.children).toHaveLength(1);
+      expect(firstChild.child.killed).toBe(false);
     } finally {
       await provider.disconnect().catch(() => {});
       await rm(codexHome, { recursive: true, force: true });
