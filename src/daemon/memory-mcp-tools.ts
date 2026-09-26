@@ -1500,9 +1500,17 @@ function isToolResultValue(value: ProcessedContextProjection | ToolResult): valu
   return !('namespace' in value);
 }
 
-function pairChecklistTarget(caller: McpRuntimeCaller, taskId?: string) {
+function pairChecklistTarget(caller: McpRuntimeCaller, sessions: readonly SessionRecord[], taskId?: string) {
   const store = getTaskPairStore();
-  const project = caller.namespace.projectId?.trim() || projectOfSession(caller.sessionName ?? '') || undefined;
+  // Same project resolution as PAIR_LIST/PAIR_GET (pairCallerContext below):
+  // a sub-session's effective project is its parent's, which can differ from
+  // caller.namespace.projectId. Using the namespace value first (as this did
+  // before) queries pairs stored under the wrong project string and silently
+  // returns none -- "task pair not found" for a real participant.
+  const record = sessions.find((session) => session.name === caller.sessionName);
+  const project = (record ? resolveEffectiveProjectName(record, sessions) : undefined)
+    ?? projectOfSession(caller.sessionName ?? '')
+    ?? undefined;
   if (!project) return undefined;
   const candidates = taskId?.trim()
     ? store.listPairs(project).filter((pair) => pair.state.taskId === taskId.trim())
@@ -1822,14 +1830,14 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
   const handlers: Record<MemoryMcpToolName, MemoryMcpToolHandler> = {
     [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_GET]: async (input) => {
       const taskId = typeof input === 'object' && input !== null && typeof (input as Record<string, unknown>).taskId === 'string' ? String((input as Record<string, unknown>).taskId) : undefined;
-      const view = pairChecklistView(pairChecklistTarget(caller, taskId));
+      const view = pairChecklistView(pairChecklistTarget(caller, await sendSessions(), taskId));
       return view ? view : error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE]: async (input) => {
       const args = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
       const markdown = typeof args.markdown === 'string' ? args.markdown : undefined;
       if (markdown === undefined) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'markdown is required');
-      const pair = pairChecklistTarget(caller, typeof args.taskId === 'string' ? args.taskId : undefined);
+      const pair = pairChecklistTarget(caller, await sendSessions(), typeof args.taskId === 'string' ? args.taskId : undefined);
       if (!pair) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
       return pairChecklistView(savePairBrief(pair, markdown, caller.sessionName ?? 'unknown'))!;
     },
@@ -1838,7 +1846,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const items = Array.isArray(args.items) && args.items.every((item) => Number.isInteger(item) && Number(item) > 0) ? args.items.map(Number) : undefined;
       const box = args.box === 'implemented' || args.box === 'audited' ? args.box : undefined;
       if (!items || !box || typeof args.checked !== 'boolean') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'items, box and checked are required');
-      const pair = pairChecklistTarget(caller, typeof args.taskId === 'string' ? args.taskId : undefined);
+      const pair = pairChecklistTarget(caller, await sendSessions(), typeof args.taskId === 'string' ? args.taskId : undefined);
       if (!pair) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
       const markdown = updateTaskPairChecklist(pair.state.brief ?? '', items, box, args.checked);
       return pairChecklistView(savePairBrief(pair, markdown, caller.sessionName ?? 'unknown'))!;

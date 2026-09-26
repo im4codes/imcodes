@@ -520,7 +520,11 @@ export type TaskPairIntent =
   | { kind: 'replace_auditor'; reason: 'executor_blocked' }
   | { kind: 'brain_notice'; flag: TaskPairFlag }
   | { kind: 'slot_changed' }
-  | { kind: 'queue_settings'; brain: string; maxConcurrency: number };
+  | { kind: 'queue_settings'; brain: string; maxConcurrency: number }
+  /** A non-Brain writer's marker on a closed (cancelled/done) pair was
+   *  recorded, not applied -- only Brain DISPATCH/QUEUE reopens one. Tell
+   *  them so, rather than leaving the marker silently inert. */
+  | { kind: 'closed_pair_notice'; to: string };
 
 export interface TaskPairTransition {
   /** New or updated pair; undefined when the marker only created nothing (recorded). */
@@ -719,8 +723,8 @@ function clearSideFlags(pair: TaskPairState, role: TaskPairRole): void {
   }
 }
 
-function recorded(pair: TaskPairState | undefined, unusual = true): TaskPairTransition {
-  return { pair: undefined, fromStatus: pair?.status, toStatus: pair?.status, effect: 'recorded', unusual, intents: [] };
+function recorded(pair: TaskPairState | undefined, unusual = true, intents: TaskPairIntent[] = []): TaskPairTransition {
+  return { pair: undefined, fromStatus: pair?.status, toStatus: pair?.status, effect: 'recorded', unusual, intents };
 }
 
 /**
@@ -763,6 +767,7 @@ export function applyTaskPairMarker(
       case 'DISPATCH': {
         const pair = newPair(marker.taskId, ctx.writer, ctx, 'working');
         setRolesFromAttrs(pair, attrs, intents);
+        if (marker.brief !== undefined) pair.brief = marker.brief;
         if (!pair.executor) intents.push({ kind: 'pick_executor' });
         return { pair, toStatus: 'working', effect: 'created', unusual: false, intents };
       }
@@ -811,14 +816,16 @@ export function applyTaskPairMarker(
     return recorded(existing);
   }
 
-  // A cancelled pair stays cancelled for a participant: only the Brain or the
-  // daemon (QUEUE/DISPATCH, both already role-gated below) can revive one.
-  // `done` deliberately keeps the opposite behavior (REWORK reopens it, a
-  // late-caught issue after completion) -- `cancelled` is a deliberate stop
-  // Brain made, not a pair anyone else gets to undo by simply resuming work.
-  if (existing.status === 'cancelled' && !roleAuthority
+  // A closed pair (cancelled or done) stays closed for a participant: only
+  // the Brain or the daemon (QUEUE/DISPATCH, both already role-gated below)
+  // can revive one. A stray READY_FOR_AUDIT/REWORK/STARTED/WORKING from
+  // anyone else on a closed pair is recorded as unusual, never reopens it,
+  // and tells the writer it is closed instead of leaving the marker
+  // silently inert (owner report, tsk_83375afb5a: a non-Brain marker
+  // reopened a closed duplicate).
+  if ((existing.status === 'cancelled' || existing.status === 'done') && !roleAuthority
     && (verb === 'STARTED' || verb === 'WORKING' || verb === 'READY_FOR_AUDIT' || verb === 'REWORK')) {
-    return recorded(existing);
+    return recorded(existing, true, [{ kind: 'closed_pair_notice', to: ctx.writer }]);
   }
 
   const pair = clonePair(existing);
