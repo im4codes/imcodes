@@ -468,6 +468,29 @@ describe('task-pair marker ingestion', () => {
     expect(resolveTaskPairMaxConcurrency(BRAIN)).toBe(3);
   });
 
+  it('a new pair falls back to the Brain-configured blocking set, but an explicit DISPATCH attr wins', () => {
+    upsertSession({
+      ...session(BRAIN, 'brain'),
+      transportConfig: {
+        supervision: normalizeSessionSupervisionSnapshot({ auditBlockingSeverities: ['P0', 'P1'] }),
+      },
+    } as SessionRecord);
+
+    service.applyMarker({
+      project: PROJECT, writer: BRAIN,
+      marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: 'BLK1', attrs: { executor: EXEC, auditor: AUD } },
+      source: 'marker', now: Date.now(), eventId: 'blk-1',
+    });
+    expect(pair('BLK1')?.blocking).toEqual(['P0', 'P1']);
+
+    service.applyMarker({
+      project: PROJECT, writer: BRAIN,
+      marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: 'BLK2', attrs: { executor: EXEC, auditor: AUD, blocking: 'P0,P2' } },
+      source: 'marker', now: Date.now(), eventId: 'blk-2',
+    });
+    expect(pair('BLK2')?.blocking).toEqual(['P0', 'P2']);
+  });
+
   it('hides marker lines from displayed assistant text', async () => {
     expect(normalizeAssistantTextForDisplay('Done.\n<!-- IMCODES_TASK READY_FOR_AUDIT T1 -->')).toBe('Done.');
   });
