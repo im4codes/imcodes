@@ -216,6 +216,68 @@ describe('task-pair marker ingestion', () => {
     expect(sent[0]?.text).toContain('DONE without a PASS is not complete');
   });
 
+  it('tells the writer their marker was recorded, not applied, when the pair is closed (tsk_83375afb5a)', async () => {
+    await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T11 executor=${EXEC} auditor=${AUD} -->`);
+    await vi.waitFor(() => expect(sent.filter((entry) => /:(pair-brief|auditor-assigned):/.test(entry.id))).toHaveLength(2));
+    await say(BRAIN, '<!-- IMCODES_TASK CANCEL T11 -->');
+    await flush();
+    expect(pair('T11')?.status).toBe('cancelled');
+    sent = [];
+    await say(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T11 -->');
+    await flush();
+    expect(pair('T11')?.status).toBe('cancelled');
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ target: EXEC });
+    expect(sent[0]?.text).toContain('only Brain can reopen it');
+  });
+
+  it('delivers the stored brief to the executor on a Brain DISPATCH naming roles for an already-queued pair, not just the title (tsk_cd_upgrade_starvation)', async () => {
+    await say(BRAIN, `<!-- IMCODES_TASK QUEUE T12 title="Upgrade starvation fix" -->\nAdd a bounded max-wait, then an orderly drain.\n<!-- IMCODES_TASK_END T12 -->`);
+    await flush();
+    expect(pair('T12')).toMatchObject({ status: 'queued', brief: 'Add a bounded max-wait, then an orderly drain.' });
+    sent = [];
+    // Brain's own sequence: QUEUE with a brief, then REASSIGN models, then
+    // DISPATCH naming the actual sessions -- the executor must see the
+    // brief, not only the title and boilerplate.
+    await say(BRAIN, '<!-- IMCODES_TASK REASSIGN T12 executormodel=gpt-6-luna -->');
+    await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T12 executor=${EXEC} auditor=${AUD} -->`);
+    await vi.waitFor(() => expect(sent.some((entry) => entry.target === EXEC)).toBe(true));
+    const brief = sent.find((entry) => entry.target === EXEC);
+    expect(brief?.text).toContain('Add a bounded max-wait, then an orderly drain.');
+  });
+
+  it('briefs a newly-reassigned executor with the pair\'s stored brief, not silence', async () => {
+    await say(BRAIN, '<!-- IMCODES_TASK QUEUE T13 title="Handover test" -->\nOriginal brief text.\n<!-- IMCODES_TASK_END T13 -->');
+    await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T13 executor=${EXEC} auditor=${AUD} -->`);
+    await vi.waitFor(() => expect(sent.filter((entry) => entry.target === EXEC)).toHaveLength(1));
+    sent = [];
+    // Pre-fix: REASSIGN never briefed the new executor at all -- no title,
+    // no brief, no workspace instructions, nothing.
+    await say(BRAIN, `<!-- IMCODES_TASK REASSIGN T13 executor=${PROC} -->`);
+    await vi.waitFor(() => expect(sent.some((entry) => entry.target === PROC)).toBe(true));
+    expect(pair('T13')?.executor).toBe(PROC);
+    const brief = sent.find((entry) => entry.target === PROC);
+    expect(brief).toBeTruthy();
+    expect(brief?.text).toContain('T13');
+    expect(brief?.text).toContain('Original brief text.');
+    expect(brief?.text).toContain('executor of this task pair');
+  });
+
+  it('delivers the stored brief again when Brain re-dispatches a cancelled pair', async () => {
+    await say(BRAIN, '<!-- IMCODES_TASK QUEUE T14 title="Retry after cancel" -->\nRedo the thing that got cancelled.\n<!-- IMCODES_TASK_END T14 -->');
+    await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T14 executor=${EXEC} auditor=${AUD} -->`);
+    await vi.waitFor(() => expect(sent.filter((entry) => entry.target === EXEC)).toHaveLength(1));
+    await say(BRAIN, '<!-- IMCODES_TASK CANCEL T14 -->');
+    await flush();
+    expect(pair('T14')?.status).toBe('cancelled');
+    sent = [];
+    await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T14 executor=${EXEC} auditor=${AUD} -->`);
+    await vi.waitFor(() => expect(sent.some((entry) => entry.target === EXEC)).toBe(true));
+    expect(pair('T14')?.status).toBe('working');
+    const brief = sent.find((entry) => entry.target === EXEC);
+    expect(brief?.text).toContain('Redo the thing that got cancelled.');
+  });
+
   it('stores QUEUE - max= as the writer queue limit', async () => {
     await say(BRAIN, '<!-- IMCODES_TASK QUEUE - max=8 -->');
     expect(getTaskPairStore().getMaxConcurrency(BRAIN)).toBe(8);
@@ -272,6 +334,10 @@ describe('task-pair marker ingestion', () => {
     expect(claim).toMatchObject({ status: 'substantiated', dispatches: [{ taskId: created.taskId, assignmentId: created.assignmentId }] });
     expect(readDelegationClaim({ [DELEGATION_CLAIM_METADATA_FIELD]: JSON.parse(JSON.stringify(claim)) })?.status).toBe('substantiated');
     expect(pair(created.taskId)).toMatchObject({ status: 'working', brain: BRAIN, executor: EXEC, title: 'Add one README sentence' });
+    // The send's own objective is stored as the pair's brief -- not left
+    // empty -- so pair_task_get and a later REASSIGN/re-dispatch still have
+    // the actual brief, not just the title (tsk_cd_pair_implicit_duplicates).
+    expect(pair(created.taskId)?.brief).toBe('Add one README sentence');
 
     // A replay of the same send resolves to the same pair; a new key opens a new one.
     const replay = await dispatchSendMessage(brainCaller, input as never, { listSessions, dispatchMessage });

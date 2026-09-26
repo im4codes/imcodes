@@ -213,11 +213,21 @@ export function buildAuditRequestMessage(pair: TaskPairState, material: Resolved
   ].join('\n');
 }
 
-/** Sent to the executor when Brain opens a pair (DISPATCH marker or a plain dispatch). */
+/**
+ * Sent to the executor when Brain opens a pair (DISPATCH marker or a plain
+ * dispatch) -- every path OTHER than the queue runner's own auto-dispatch
+ * (scheduler.ts sends `${pair.brief}${trailer}` directly there). Without the
+ * stored brief here too, a DISPATCH on an already-queued pair, a REASSIGN of
+ * the executor, or a re-dispatch of a cancelled/done pair left the executor
+ * with only the title and boilerplate -- the actual brief Brain wrote never
+ * reached them (owner report, tsk_cd_upgrade_starvation: QUEUE with a brief,
+ * then REASSIGN, then DISPATCH named windows -- brief never arrived).
+ */
 export function buildExecutorPairBrief(pair: TaskPairState): string {
   const auditor = pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? `auditor ${pair.auditor}` : pair.auditor === TASK_PAIR_NO_AUDITOR ? 'no auditor' : 'an auditor the daemon is assigning';
   return [
     header(pair),
+    ...(pair.brief ? [pair.brief] : []),
     `You are the executor of this task pair, with ${auditor}. Write ${marker('STARTED', pair.taskId)} when you begin.`,
     workplaceLine(pair),
     pair.auditor === TASK_PAIR_NO_AUDITOR

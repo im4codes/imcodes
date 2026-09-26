@@ -1336,6 +1336,7 @@ function bindAcceptedDispatchToTaskPair(
       ...(title ? { title } : {}),
       ...(executorModel ? { executorModel } : {}),
       ...(hasObjective ? { hasObjective } : {}),
+      ...(objective ? { brief: objective } : {}),
       eventId: `implicit:${delivery.messageId ?? result.dispatchId}`,
     });
   }
@@ -1411,10 +1412,22 @@ export async function dispatchSendMessage(
       }
       const mentioned = taskPairService.resolveMentionedOpenPair(callerProjectName, caller.sessionName!, input.message ?? '');
       if (mentioned) {
-        return bindAcceptedDispatchToTaskPair(
-          caller, callerProjectName, result, mentioned, objective,
-          input.task?.requestedExecutionType?.model, input.task?.title,
-        );
+        // An explicit objective that merely references another open pair in
+        // its text is still new work for a target that isn't already part of
+        // THAT pair (e.g. "Fix X -- follow-up to tsk_cd_Y" going to a fresh
+        // executor): mint its own pair instead of swallowing it into the
+        // mentioned one. Only bind when the target already holds a role in
+        // the mentioned pair (or is being handed it), matching bullet 1(b)'s
+        // participant test rather than the bare-mention test.
+        const mentionedState = getTaskPairStore().getPair(callerProjectName, mentioned)?.state;
+        const targetAlreadyInMentionedPair = !!mentionedState
+          && (mentionedState.executor === singleTarget || mentionedState.auditor === singleTarget);
+        if (!objective || targetAlreadyInMentionedPair) {
+          return bindAcceptedDispatchToTaskPair(
+            caller, callerProjectName, result, mentioned, objective,
+            input.task?.requestedExecutionType?.model, input.task?.title,
+          );
+        }
       }
       if (!objective) {
         const existingTaskId = taskPairService.resolveSingleParticipantOpenPair(caller.sessionName!, singleTarget);

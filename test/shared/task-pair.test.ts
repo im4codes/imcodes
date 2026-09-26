@@ -290,26 +290,29 @@ describe('task-pair state machine', () => {
     expect(result.pair).toMatchObject({ executor: EXEC, auditor: AUD });
   });
 
-  it('reopens a finished pair on REWORK and records PASS/DONE on terminal pairs', () => {
-    expect(apply(withStatus('done'), AUD, '<!-- IMCODES_TASK REWORK T42 blocking=P0 p0=1 -->').pair).toMatchObject({ status: 'rework' });
+  it('records PASS/DONE on a terminal pair without reopening it', () => {
     expect(apply(withStatus('done'), EXEC, '<!-- IMCODES_TASK DONE T42 -->')).toMatchObject({ effect: 'recorded' });
   });
 
-  it('never lets a participant revive a cancelled pair; only the Brain or daemon can', () => {
-    const cancelled = withStatus('cancelled');
-    for (const [writer, line] of [
-      [EXEC, '<!-- IMCODES_TASK STARTED T42 -->'],
-      [EXEC, '<!-- IMCODES_TASK WORKING T42 -->'],
-      [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 -->'],
-      [AUD, '<!-- IMCODES_TASK REWORK T42 blocking=P0 p0=1 -->'],
-    ] as const) {
-      const result = apply(cancelled, writer, line);
-      expect(result.pair?.status ?? cancelled.status, `${writer} ${line}`).toBe('cancelled');
-      expect(result.effect).toBe('recorded');
+  it('never lets a participant revive a closed (cancelled or done) pair; only the Brain or daemon can, and the writer is told it is closed (tsk_83375afb5a)', () => {
+    for (const status of ['cancelled', 'done'] as const) {
+      const closed = withStatus(status);
+      for (const [writer, line] of [
+        [EXEC, '<!-- IMCODES_TASK STARTED T42 -->'],
+        [EXEC, '<!-- IMCODES_TASK WORKING T42 -->'],
+        [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 -->'],
+        [AUD, '<!-- IMCODES_TASK REWORK T42 blocking=P0 p0=1 -->'],
+      ] as const) {
+        const result = apply(closed, writer, line);
+        expect(result.pair?.status ?? closed.status, `${status} ${writer} ${line}`).toBe(status);
+        expect(result.effect, `${status} ${writer} ${line}`).toBe('recorded');
+        expect(result.unusual, `${status} ${writer} ${line}`).toBe(true);
+        expect(result.intents, `${status} ${writer} ${line}`).toEqual([{ kind: 'closed_pair_notice', to: writer }]);
+      }
+      // The Brain (and the daemon, its equivalent) can still revive it explicitly.
+      expect(apply(closed, BRAIN, `<!-- IMCODES_TASK DISPATCH T42 executor=${EXEC} auditor=${AUD} -->`).pair?.status).toBe('working');
+      expect(apply(closed, BRAIN, '<!-- IMCODES_TASK QUEUE T42 title="retry" -->').pair?.status).toBe('queued');
     }
-    // The Brain (and the daemon, its equivalent) can still revive it explicitly.
-    expect(apply(cancelled, BRAIN, `<!-- IMCODES_TASK DISPATCH T42 executor=${EXEC} auditor=${AUD} -->`).pair?.status).toBe('working');
-    expect(apply(cancelled, BRAIN, '<!-- IMCODES_TASK QUEUE T42 title="retry" -->').pair?.status).toBe('queued');
   });
 
   it('sets and clears side flags on progress', () => {

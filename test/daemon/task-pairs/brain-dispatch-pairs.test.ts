@@ -201,6 +201,27 @@ describe('Brain work dispatch opens driven pairs', () => {
     expect(pairs()).toHaveLength(1);
   });
 
+  it('an explicit objective that merely mentions another open pair still opens its own pair for a fresh target (CC8 P2)', async () => {
+    useSessions(brainWithMode(SUPERVISION_MODE.SUPERVISED_AUDIT));
+    const opened = await dispatchSendMessage(brainCaller, {
+      target: EXEC, message: 'Fix the login bug.', task: { taskId: 'T-mentioned', objective: 'Fix the login bug' },
+    } as never, deps());
+    if (opened.status !== 'accepted') throw new Error(JSON.stringify(opened));
+    await flush();
+    expect(pairs()).toHaveLength(1);
+
+    // Real new work for a target that is NOT part of T-mentioned: the text
+    // referencing it is context, not a request to continue that pair.
+    const newWork = await dispatchSendMessage(brainCaller, {
+      target: EXEC2, message: 'Fix Y -- follow-up to T-mentioned.', task: { objective: 'Fix Y' },
+    } as never, deps());
+    if (newWork.status !== 'accepted' || !newWork.taskId) throw new Error(JSON.stringify(newWork));
+    expect(newWork.taskId).not.toBe('T-mentioned');
+    await flush();
+    expect(pairs().map((entry) => entry.taskId).sort()).toEqual(['T-mentioned', newWork.taskId].sort());
+    expect(pairs().find((entry) => entry.taskId === newWork.taskId)).toMatchObject({ executor: EXEC2, title: 'Fix Y' });
+  });
+
   it('a handover message to the reassigned executor of an existing pair binds to it, never opening a second pair', async () => {
     useSessions(brainWithMode(SUPERVISION_MODE.SUPERVISED_AUDIT));
     const opened = await dispatchSendMessage(brainCaller, {

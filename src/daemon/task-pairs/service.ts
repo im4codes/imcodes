@@ -373,9 +373,14 @@ export class TaskPairService {
     this.#track(this.#executeIntents(input.project, stored?.state, immediateIntents));
     if (holdsAutoPickAuditor && stored) this.#track(this.#gracePickAuditor(input.project, stored.state.taskId));
     // A pair Brain opens (DISPATCH marker, plain or task-tagged dispatch) tells
-    // its participants what a pair is. The queue sends its own brief.
-    if (stored && input.source !== 'queue' && input.marker.knownVerb === 'DISPATCH'
-      && (transition.effect === 'created' || transition.effect === 'dispatched')) {
+    // its participants what a pair is. The queue sends its own brief. A
+    // REASSIGN that hands the executor role to someone new tells them too --
+    // pre-fix a REASSIGN never briefed the new executor at all, who got no
+    // title, brief or workspace (owner report, tsk_cd_upgrade_starvation).
+    if (stored && input.source !== 'queue'
+      && ((input.marker.knownVerb === 'DISPATCH' && (transition.effect === 'created' || transition.effect === 'dispatched'))
+        || (input.marker.knownVerb === 'REASSIGN' && !!input.marker.attrs.executor
+          && (transition.effect === 'reassigned' || transition.effect === 'reassigned_auditor')))) {
       this.#track(this.briefParticipants(input.project, stored.state.taskId));
     }
     // A pair that just ended (DONE, CANCEL, DONE force=true): its workspace
@@ -419,6 +424,14 @@ export class TaskPairService {
      *  A pair minted for a plain send_message (no metadata) has none of the
      *  Brain's own task description -- see suppressAutoPickAuditor. */
     hasObjective?: boolean;
+    /** The send's own text (objective, or the plain message as a fallback):
+     *  stored as the pair's brief when this creates a new pair with none, so
+     *  pair_task_get and a later re-dispatch/REASSIGN still have the actual
+     *  brief to hand the executor -- not just a title (owner report,
+     *  tsk_cd_pair_implicit_duplicates: stored an empty brief). Never
+     *  overwrites an existing pair's brief (the `existing` branch above
+     *  never reaches this call at all). */
+    brief?: string;
   }): TaskPairTransition | undefined {
     const project = input.project ?? projectOfSession(input.sender) ?? projectOfSession(input.target);
     if (!project || !isPairsEngineProject(project)) return undefined;
@@ -455,6 +468,7 @@ export class TaskPairService {
           ...(input.title ? { title: input.title } : {}),
           ...(input.executorModel ? { executormodel: input.executorModel } : {}),
         },
+        ...(input.brief ? { brief: input.brief } : {}),
       },
       source: 'implicit_dispatch',
       eventId: input.eventId,
@@ -583,6 +597,9 @@ export class TaskPairService {
           case 'done_reminder':
             await sendTaskPairMessage(intent.to, pair.taskId, 'done-reminder', buildDoneReminderMessage(pair));
             break;
+          case 'closed_pair_notice':
+            await sendTaskPairMessage(intent.to, pair.taskId, 'closed-pair', `${pair.taskId} is ${pair.status} -- only Brain can reopen it (DISPATCH or QUEUE). Your marker was recorded but not applied.`);
+            break;
           case 'rework_notice':
             await sendTaskPairMessage(intent.to, pair.taskId, 'rework', buildReworkNoticeMessage(pair, intent.counts));
             break;
@@ -618,7 +635,13 @@ export class TaskPairService {
     // lag behind microtasks/setImmediate under load -- exactly the busy-daemon
     // scenario this feature exists for. Skip it entirely when grace is
     // disabled instead of racing that phase.
-    if (graceMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, graceMs));
+    if (graceMs > 0) {
+      await new Promise<void>((resolve) => {
+        // #track (the caller) covers a bounded drain on shutdown/dispose; this
+        // must not ALSO hold the process open on its own in the meantime.
+        setTimeout(resolve, graceMs).unref();
+      });
+    }
     const latest = getTaskPairStore().getPair(project, taskId);
     if (!latest || latest.state.auditor) return;
     await this.#executeIntents(project, latest.state, [{ kind: 'pick_auditor' }]);
