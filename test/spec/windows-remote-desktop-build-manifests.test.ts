@@ -179,6 +179,40 @@ describe('windows remote-desktop build manifests', () => {
     }
   });
 
+  it('maps every packaged source header include to the copied SDK manifest', () => {
+    // The SDK overlay has two explicit namespaces: worker headers are copied
+    // to third_party/imcodes_remote_desktop, while shared headers are copied
+    // below third_party/imcodes_remote_desktop/common. A source include that
+    // names the wrong namespace can compile in the checkout (because another
+    // include path happens to expose it) but fail in the packaged SDK. Keep
+    // this check derived from the two manifests so every future packaged
+    // source/header addition is covered without a second hand-written list.
+    const packaged = [
+      ...expectedSources.map((name) => ({ name, path: resolve(NATIVE, name), namespace: 'worker' as const })),
+      ...expectedCommonSources.map((name) => ({ name, path: resolve(COMMON, name), namespace: 'common' as const })),
+    ];
+    const manifests = {
+      worker: new Set(expectedSources),
+      common: new Set(expectedCommonSources),
+    };
+    for (const entry of packaged) {
+      expect(existsSync(entry.path), `${entry.name} exists in its source manifest`).toBe(true);
+      const source = readFileSync(entry.path, 'utf8');
+      for (const [, include] of source.matchAll(/#include\s+"([^"]+)"/g)) {
+        let target: { name: string; namespace: 'worker' | 'common' } | undefined;
+        const common = /^third_party\/imcodes_remote_desktop\/common\/(.+)$/.exec(include!);
+        const worker = /^third_party\/imcodes_remote_desktop\/(.+)$/.exec(include!);
+        if (common) target = { name: common[1]!, namespace: 'common' };
+        else if (worker) target = { name: worker[1]!, namespace: 'worker' };
+        if (!target) continue;
+        expect(
+          manifests[target.namespace].has(target.name),
+          `${entry.namespace}/${entry.name} includes ${target.namespace}/${target.name}, which is absent from the SDK manifest`,
+        ).toBe(true);
+      }
+    }
+  });
+
   it('has a unit-test target for every unit-test source on disk', () => {
     const onDisk = readdirSync(NATIVE).filter((name) => name.endsWith('_unittest.cc'));
     for (const source of onDisk) {

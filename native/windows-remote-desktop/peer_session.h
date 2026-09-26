@@ -18,7 +18,7 @@
 #include "api/scoped_refptr.h"
 #include "rtc_base/thread.h"
 #include "third_party/imcodes_remote_desktop/common/transport_session_core.h"
-#include "third_party/imcodes_remote_desktop/clipboard_paste_assembler.h"
+#include "third_party/imcodes_remote_desktop/common/clipboard_paste_assembler.h"
 #include "third_party/imcodes_remote_desktop/display_capture.h"
 #include "third_party/imcodes_remote_desktop/input_injector.h"
 #include "third_party/imcodes_remote_desktop/json_protocol.h"

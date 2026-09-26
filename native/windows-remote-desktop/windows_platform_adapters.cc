@@ -8,7 +8,7 @@
 #include <utility>
 
 #include "third_party/imcodes_remote_desktop/display_preferences.h"
-#include "third_party/imcodes_remote_desktop/data_channel_constants.h"
+#include "third_party/imcodes_remote_desktop/common/data_channel_constants.h"
 #include "third_party/imcodes_remote_desktop/json_protocol.h"
 #include "third_party/imcodes_remote_desktop/worker_policy.h"
 
