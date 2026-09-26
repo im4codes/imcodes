@@ -21,6 +21,7 @@ vi.mock('../src/api.js', () => ({ downloadAttachment: vi.fn() }));
 import {
   __buildViewItemsForTests,
   __buildViewItemsTailForTests,
+  __computeVirtualChatRangeForTests,
 } from '../src/components/ChatView.js';
 import type { TimelineEvent } from '../src/ws-client.js';
 
@@ -195,4 +196,13 @@ describe('reaching a message older than the derivation window', () => {
     // reader sees, not a jump.
     expect(rounds).toBeLessThan(40);
   });
+});
+
+
+it('computes measured viewport ranges with overscan and exact spacer conservation', () => {
+  const range = __computeVirtualChatRangeForTests([40, 100, 60, 80, 120, 50, 90, 70], 160, 100, 1);
+  expect(range.start).toBe(1);
+  expect(range.end).toBeGreaterThan(range.start);
+  expect(range.totalHeight).toBe(610);
+  expect(range.topSpacer + range.bottomSpacer).toBeLessThanOrEqual(range.totalHeight);
 });

@@ -9,7 +9,7 @@
  * - All existing chat CSS classes
  */
 import { h } from 'preact';
-import { useMemo, useState } from 'preact/hooks';
+import { useEffect, useMemo, useState } from 'preact/hooks';
 import { marked, type Token, type Tokens } from 'marked';
 import { useTranslation } from 'react-i18next';
 import {
@@ -35,6 +35,10 @@ import {
 
 interface Props {
   text: string;
+  /** Stable event id used with the content revision to cache parsed tokens. */
+  cacheKey?: string;
+  /** Streaming blocks are refreshed at most 10Hz; finalized blocks update immediately. */
+  streaming?: boolean;
   onPathClick?: (path: string) => void;
   onUrlClick?: (url: string) => void;
   /** Called to download a file path. Only shown for paths with extensions. */
@@ -469,12 +473,71 @@ function splitPathsAndUrlsInternal(
 
 // ── Public component ────────────────────────────────────────────────────────
 
-export function ChatMarkdown({ text, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, onOpenLocalWebPreview }: Props) {
+interface CachedTokens {
+  text: string;
+  tokens: Token[];
+}
+
+const markdownTokenCache = new Map<string, CachedTokens>();
+const MARKDOWN_CACHE_LIMIT = 512;
+
+function markdownRevision(text: string): string {
+  // Fast deterministic content revision; event ids remain the primary key.
+  let hash = 2166136261;
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `${text.length}:${hash >>> 0}`;
+}
+
+export function __resetChatMarkdownCacheForTests(): void {
+  markdownTokenCache.clear();
+}
+
+export function __getChatMarkdownCacheSizeForTests(): number {
+  return markdownTokenCache.size;
+}
+
+function parseMarkdownTokens(text: string, cacheKey?: string): Token[] {
+  const normalized = normalizeLocalMarkdownDestinations(text);
+  const key = cacheKey ? `${cacheKey}:${markdownRevision(normalized)}` : `text:${markdownRevision(normalized)}`;
+  const hit = markdownTokenCache.get(key);
+  if (hit && hit.text === normalized) {
+    markdownTokenCache.delete(key);
+    markdownTokenCache.set(key, hit);
+    return hit.tokens;
+  }
+  const tokens = marked.lexer(normalized);
+  markdownTokenCache.set(key, { text: normalized, tokens });
+  while (markdownTokenCache.size > MARKDOWN_CACHE_LIMIT) {
+    const oldest = markdownTokenCache.keys().next().value;
+    if (oldest === undefined) break;
+    markdownTokenCache.delete(oldest);
+  }
+  return tokens;
+}
+
+export function ChatMarkdown({ text, cacheKey, streaming = false, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, onOpenLocalWebPreview }: Props) {
   const { t } = useTranslation();
+  // Keep raw streaming text live immediately, while limiting the expensive
+  // markdown lex/AST refresh to 10Hz. Finalized text bypasses the timer.
+  const [parsedText, setParsedText] = useState(text);
+  useEffect(() => {
+    if (!streaming) {
+      setParsedText(text);
+      return undefined;
+    }
+    const timer = window.setTimeout(() => setParsedText(text), 100);
+    return () => window.clearTimeout(timer);
+  }, [text, streaming]);
   const skipRichTextEnhancement = shouldSkipRichTextEnhancement(text);
+  // Final/non-streaming updates must be visible in the same render. Streaming
+  // blocks may use the throttled snapshot until the next refresh tick.
+  const effectiveParsedText = streaming ? parsedText : text;
   const tokens = useMemo(() => (
-    skipRichTextEnhancement ? [] : marked.lexer(normalizeLocalMarkdownDestinations(text))
-  ), [skipRichTextEnhancement, text]);
+    skipRichTextEnhancement ? [] : parseMarkdownTokens(effectiveParsedText, cacheKey)
+  ), [skipRichTextEnhancement, effectiveParsedText, cacheKey]);
   const renderContext = useMemo<RenderContext>(() => ({
     onPathClick,
     onUrlClick,
@@ -487,6 +550,14 @@ export function ChatMarkdown({ text, onPathClick, onUrlClick, onDownload, onHtml
   }), [onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, onOpenLocalWebPreview, t]);
 
   if (skipRichTextEnhancement) {
+    return (
+      <div class="chat-rich-text">
+        <span>{text}</span>
+      </div>
+    );
+  }
+
+  if (streaming && parsedText !== text) {
     return (
       <div class="chat-rich-text">
         <span>{text}</span>

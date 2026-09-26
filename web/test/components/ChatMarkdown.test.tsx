@@ -673,3 +673,22 @@ describe('ChatMarkdown', () => {
     expect(container.querySelector('.chat-dl-btn')).toBeNull();
   });
 });
+
+it('reuses finalized ASTs and invalidates only the changed revision', async () => {
+  const markdown = await import('../../src/components/ChatMarkdown');
+  markdown.__resetChatMarkdownCacheForTests();
+  const { rerender } = render(<markdown.ChatMarkdown text="**frozen**" cacheKey="event-1" />);
+  const firstSize = markdown.__getChatMarkdownCacheSizeForTests();
+  rerender(<markdown.ChatMarkdown text="**frozen**" cacheKey="event-1" />);
+  expect(markdown.__getChatMarkdownCacheSizeForTests()).toBe(firstSize);
+  rerender(<markdown.ChatMarkdown text="**changed**" cacheKey="event-1" />);
+  expect(markdown.__getChatMarkdownCacheSizeForTests()).toBe(firstSize + 1);
+});
+
+it('publishes the finalized streaming text immediately after throttled updates', async () => {
+  vi.useFakeTimers();
+  const { container, rerender } = render(<ChatMarkdown text="partial" cacheKey="stream-1" streaming />);
+  rerender(<ChatMarkdown text="final" cacheKey="stream-1" streaming={false} />);
+  expect(container.textContent).toContain('final');
+  vi.useRealTimers();
+});

@@ -211,6 +211,7 @@ interface ViewItem {
   /** Source event ids represented by an assistant block (for old-pin locate). */
   eventIds?: string[];
   assistantAutomation?: boolean;
+  assistantStreaming?: boolean;
   /** Active final execution marker from a completed source event. */
   executionState?: SupervisionExecutionState;
   /** Metadata record of the block's completed assistant message, when it
@@ -236,6 +237,7 @@ type ChatHtmlFullscreenPreviewState =
 interface AssistantBlockProps {
   text: string;
   automation?: boolean;
+  streaming?: boolean;
   executionState?: SupervisionExecutionState;
   ts: number;
   /** Completed assistant message metadata carrying the delegation-claim
@@ -992,6 +994,41 @@ function getFinalVisibleEventIds(events: TimelineEvent[], showToolCalls: boolean
  */
 const mergedToolEventCache = new WeakMap<TimelineEvent, WeakMap<TimelineEvent, TimelineEvent>>();
 
+// Stable source identities let the incremental view-model preserve unaffected
+// items across an append/update. The expensive group is rebuilt only when one
+// of its source event objects changes; Preact then skips those unchanged rows.
+const timelineObjectIds = new WeakMap<object, number>();
+let nextTimelineObjectId = 1;
+const incrementalViewItemCache = new Map<string, { signature: string; item: ViewItem }>();
+function timelineObjectId(value: object): number {
+  const hit = timelineObjectIds.get(value);
+  if (hit) return hit;
+  const id = nextTimelineObjectId++;
+  timelineObjectIds.set(value, id);
+  return id;
+}
+function stabilizeViewItems(items: ViewItem[]): ViewItem[] {
+  const next = items.map((item) => {
+    const sources = item.toolEvents ?? (item.event ? [item.event] : []);
+    const sourceIds = sources.map((event) => timelineObjectId(event)).join(',');
+    const signature = [item.type, item.text ?? '', item.lastTs ?? item.ts ?? '', item.executionState ?? '', item.eventIds?.join(',') ?? '', sourceIds, item.heartbeatCount ?? ''].join('|');
+    const cached = incrementalViewItemCache.get(item.key);
+    if (cached?.signature === signature) return cached.item;
+    incrementalViewItemCache.set(item.key, { signature, item });
+    return item;
+  });
+  while (incrementalViewItemCache.size > 4096) {
+    const first = incrementalViewItemCache.keys().next().value;
+    if (first === undefined) break;
+    incrementalViewItemCache.delete(first);
+  }
+  return next;
+}
+
+export function __resetIncrementalViewModelCacheForTests(): void {
+  incrementalViewItemCache.clear();
+}
+
 function cacheMergedToolEvent(
   call: TimelineEvent,
   result: TimelineEvent,
@@ -1288,6 +1325,7 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
   let pendingKey = '';
   let pendingEventIds: string[] = [];
   let pendingAssistantAutomation = false;
+  let pendingAssistantStreaming = false;
   let pendingExecutionState: SupervisionExecutionState | undefined;
   let pendingDelegationMetadata: Record<string, unknown> | undefined;
   let pendingTools: TimelineEvent[] = [];
@@ -1301,6 +1339,7 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
         text: pendingText.join('\n'),
         eventIds: [...pendingEventIds],
         assistantAutomation: pendingAssistantAutomation,
+        assistantStreaming: pendingAssistantStreaming,
         ...(pendingExecutionState ? { executionState: pendingExecutionState } : {}),
         ...(pendingDelegationMetadata ? { delegationMetadata: pendingDelegationMetadata } : {}),
         ts: pendingFirstTs,
@@ -1309,6 +1348,7 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
       pendingText = [];
       pendingEventIds = [];
       pendingAssistantAutomation = false;
+      pendingAssistantStreaming = false;
       pendingExecutionState = undefined;
       pendingDelegationMetadata = undefined;
     }
@@ -1363,6 +1403,7 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
         pendingFirstTs = event.ts;
         pendingAssistantAutomation = assistantAutomation;
       }
+      pendingAssistantStreaming = pendingAssistantStreaming || event.payload.streaming === true || event.payload.pending === true;
       // Only the turn's completed message carries the delegation-claim
       // projection, so the newest event that has one wins for the block.
       const delegationMetadata = readDelegationClaimMetadata(event.payload);
@@ -1400,7 +1441,7 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
   flushPending();
   flushTools();
 
-  return foldSupervisionStatusRuns(items);
+  return stabilizeViewItems(foldSupervisionStatusRuns(items));
 }
 
 type SupervisionStatusCandidate = {
@@ -2007,6 +2048,130 @@ function SdkAgentsDiagnosticRow({ diagnostic }: { diagnostic: SdkSubagentDiagnos
       {summary && <div class="chat-sdk-agent-summary">{summary}</div>}
     </div>
   );
+}
+
+export function __computeVirtualChatRangeForTests(
+  heights: readonly number[],
+  scrollTop: number,
+  viewportHeight: number,
+  overscan = 6,
+): { start: number; end: number; totalHeight: number; topSpacer: number; bottomSpacer: number } {
+  const offsets = new Array<number>(heights.length + 1);
+  offsets[0] = 0;
+  for (let i = 0; i < heights.length; i += 1) offsets[i + 1] = offsets[i] + Math.max(1, heights[i] || 0);
+  const top = Math.max(0, scrollTop);
+  const bottom = top + Math.max(1, viewportHeight);
+  let start = 0;
+  while (start < heights.length && offsets[start + 1] < top) start += 1;
+  let end = start;
+  while (end < heights.length && offsets[end] < bottom) end += 1;
+  const rangeStart = Math.max(0, start - overscan);
+  const rangeEnd = Math.min(heights.length, end + overscan);
+  return {
+    start: rangeStart,
+    end: rangeEnd,
+    totalHeight: offsets[heights.length],
+    topSpacer: offsets[rangeStart],
+    bottomSpacer: Math.max(0, offsets[heights.length] - offsets[rangeEnd]),
+  };
+}
+
+interface VirtualizedViewItemsProps {
+  items: ViewItem[];
+  scrollRef: { current: HTMLDivElement | null };
+  enabled: boolean;
+  renderItem: (item: ViewItem) => h.JSX.Element;
+}
+
+/**
+ * Viewport virtualization for the chat list. Heights are measured after mount
+ * and retained by stable item key; unknown rows use a conservative estimate.
+ * The top/bottom spacers preserve the scroll range, while the parent ChatView
+ * remains the owner of follow/anchor policy and therefore streaming and history
+ * prepend semantics stay unchanged.
+ */
+function VirtualizedViewItems({ items, scrollRef, enabled, renderItem }: VirtualizedViewItemsProps) {
+  const heightsRef = useRef(new Map<string, number>());
+  const [layoutVersion, setLayoutVersion] = useState(0);
+  const scrollTopRef = useRef(0);
+  const viewportRef = useRef(0);
+  const rafRef = useRef<number | null>(null);
+  const estimate = 72;
+  const getHeight = (item: ViewItem) => heightsRef.current.get(item.key) ?? estimate;
+
+  useEffect(() => {
+    if (!enabled) return undefined;
+    const root = scrollRef.current;
+    if (!root) return undefined;
+    scrollTopRef.current = root.scrollTop;
+    viewportRef.current = root.clientHeight;
+    setLayoutVersion((v) => v + 1);
+    const onScroll = () => {
+      scrollTopRef.current = root.scrollTop;
+      viewportRef.current = root.clientHeight;
+      if (rafRef.current !== null) return;
+      rafRef.current = requestAnimationFrame(() => {
+        rafRef.current = null;
+        setLayoutVersion((v) => v + 1);
+      });
+    };
+    root.addEventListener('scroll', onScroll, { passive: true });
+    return () => {
+      root.removeEventListener('scroll', onScroll);
+      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    };
+  }, [enabled, scrollRef]);
+
+  useEffect(() => {
+    if (!enabled || typeof ResizeObserver === 'undefined') return undefined;
+    const root = scrollRef.current;
+    if (!root) return undefined;
+    const itemIndex = new Map(items.map((item, index) => [item.key, index]));
+    const offsetBefore = (index: number): number => {
+      let total = 0;
+      for (let i = 0; i < index; i += 1) total += heightsRef.current.get(items[i].key) ?? 72;
+      return total;
+    };
+    const observer = new ResizeObserver((entries) => {
+      let changed = false;
+      let anchorDelta = 0;
+      const atBottom = root.scrollHeight - root.scrollTop - root.clientHeight < 24;
+      for (const entry of entries) {
+        const key = (entry.target as HTMLElement).dataset.virtualKey;
+        if (!key) continue;
+        const height = Math.max(1, Math.ceil(entry.contentRect.height));
+        const previous = heightsRef.current.get(key) ?? 72;
+        if (previous === height) continue;
+        const index = itemIndex.get(key);
+        if (index !== undefined && !atBottom && offsetBefore(index) < root.scrollTop) anchorDelta += height - previous;
+        heightsRef.current.set(key, height);
+        changed = true;
+      }
+      if (anchorDelta !== 0 && !atBottom) {
+        root.scrollTop += anchorDelta;
+        scrollTopRef.current = root.scrollTop;
+      }
+      if (changed) setLayoutVersion((v) => v + 1);
+    });
+    root.querySelectorAll<HTMLElement>('[data-virtual-key]').forEach((node) => observer.observe(node));
+    return () => observer.disconnect();
+  }, [enabled, items, layoutVersion, scrollRef]);
+
+  // Hidden/jsdom panes have no measurable viewport; do not drop rows until a
+  // real viewport exists, preserving deterministic rendering and accessibility.
+  if (!enabled || items.length <= 24 || viewportRef.current <= 0) return <>{items.map(renderItem)}</>;
+  // Keep the arithmetic local and deterministic; no O(n) DOM work occurs.
+  const range = __computeVirtualChatRangeForTests(items.map(getHeight), scrollTopRef.current, viewportRef.current);
+  return <>
+    <div aria-hidden="true" style={{ height: `${range.topSpacer}px`, flexShrink: 0 }} />
+    {items.slice(range.start, range.end).map((item) => (
+      <div class="chat-virtual-item" data-virtual-key={item.key} key={item.key}>
+        {renderItem(item)}
+      </div>
+    ))}
+    <div aria-hidden="true" style={{ height: `${range.bottomSpacer}px`, flexShrink: 0 }} />
+  </>;
 }
 
 function ChatViewImpl({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, sessions, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, onQuote, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false }: Props) {
@@ -3858,7 +4023,11 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
             </div>
           )}
           {/* No `loading` guard: whatever is already restored renders now. */}
-          {renderedViewItems.map((item) => {
+          <VirtualizedViewItems
+            items={renderedViewItems}
+            scrollRef={scrollRef}
+            enabled={!preview}
+            renderItem={(item) => {
             if (item.type === 'supervision-status-run') {
               return <SupervisionStatusRun key={item.key} item={item} />;
             }
@@ -3869,6 +4038,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
                   eventId={item.key}
                   text={item.text!}
                   automation={item.assistantAutomation === true}
+                  streaming={item.assistantStreaming === true}
                   executionState={item.executionState}
                   delegationMetadata={item.delegationMetadata}
                   liveAssignmentStatuses={item.delegationMetadata ? liveAssignmentStatuses : undefined}
@@ -3913,7 +4083,8 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
                 ))}
               </div>
             );
-          })}
+            }}
+          />
           {!loading && <div ref={bottomRef} />}
         </div>
         {!preview && showScrollBtn && (
@@ -4663,6 +4834,7 @@ function ToolCallGroup({
 const AssistantBlock = memo(function AssistantBlock({
   text,
   automation,
+  streaming,
   executionState,
   ts,
   eventId,
@@ -4687,7 +4859,7 @@ const AssistantBlock = memo(function AssistantBlock({
       class={`chat-event chat-assistant${automation ? ' chat-assistant-automation' : ''}${statusOnly ? ' chat-assistant-status-only' : ''}`}
       data-event-id={eventId}
     >
-      {text && <ChatMarkdown text={parseTimelineDisplayText(text)} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} />}
+      {text && <ChatMarkdown text={parseTimelineDisplayText(text)} cacheKey={eventId} streaming={streaming} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} />}
       {status && (
         <span
           class={`chat-execution-status-chip ${status.className}`}
