@@ -4,6 +4,7 @@ import { startAuthentication } from '@simplewebauthn/browser';
 import { ApiError, passwordChange, passkeyVerifyBegin, passwordSetupWithPasskey, updateDisplayName } from '../api.js';
 import { isNative } from '../native.js';
 import { validatePasswordComplexity } from '@shared/password-rules.js';
+import { AUTH_ERROR_CODES } from '@shared/auth-error-codes.js';
 
 interface Props {
   displayName: string | null;
@@ -36,9 +37,9 @@ export function SettingsPage({ displayName, username, hasPassword, serverUrl, on
   const [pwMsg, setPwMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
 
   const applySetupErrorCode = (errorCode: string | null) => {
-    if (errorCode === 'username_taken') {
+    if (errorCode === AUTH_ERROR_CODES.USERNAME_TAKEN) {
       setSetupMsg({ type: 'err', text: t('settings.username_taken') });
-    } else if (errorCode === 'invalid_username_format') {
+    } else if (errorCode === AUTH_ERROR_CODES.INVALID_USERNAME_FORMAT) {
       setSetupMsg({ type: 'err', text: t('settings.username_invalid') });
     } else if (errorCode === 'wrong_passkey') {
       setSetupMsg({ type: 'err', text: t('settings.passkey_verify_wrong_account') });
