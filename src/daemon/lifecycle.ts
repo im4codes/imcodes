@@ -1889,6 +1889,30 @@ async function performShutdown(exitCode: number): Promise<void> {
     logger.warn({ err }, 'Daemon shutdown usage-record drain failed');
   }
 
+  // applyMarker's fire-and-forget background work (running intents, briefing
+  // participants, ending or refreshing a workspace) is tracked and given a
+  // `.catch()` at creation (service.ts's #track), which alone stops it from
+  // ever surfacing as an unhandled rejection. This additionally gives it a
+  // real chance to land before exit -- bounded, so a stalled send or a
+  // wedged git call can never hang shutdown itself.
+  try {
+    const pairsDrainStart = Date.now();
+    const pendingAtStart = taskPairService.pendingCount;
+    const abandoned = await Promise.race([
+      taskPairService.dispose().then(() => 0),
+      new Promise<number>((resolve) => {
+        setTimeout(() => resolve(taskPairService.pendingCount), 3_000).unref?.();
+      }),
+    ]);
+    if (abandoned > 0) {
+      logger.warn({ abandoned, pendingAtStart }, 'Daemon shutdown: task-pair background work still in flight at the deadline');
+    } else if (pendingAtStart > 0) {
+      logger.info({ pendingAtStart, elapsedMs: Date.now() - pairsDrainStart }, 'Daemon shutdown: task-pair background work drained');
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Daemon shutdown task-pair drain failed');
+  }
+
   try {
     const { shutdownDefaultTimelineHistoryWorkerPoolForDaemon } = await import('./timeline-history-pool.js');
     await shutdownDefaultTimelineHistoryWorkerPoolForDaemon();
