@@ -1017,6 +1017,8 @@ export function emitTaskPairTimelineEvent(
       blocking: pair.blocking,
       ...(pair.executorPool ? { executorPool: pair.executorPool } : {}),
       ...(pair.auditorPool ? { auditorPool: pair.auditorPool } : {}),
+      ...(pair.executorModel ? { executorModel: pair.executorModel } : {}),
+      ...(pair.auditor === TASK_PAIR_NO_AUDITOR ? { auditorModel: TASK_PAIR_NO_AUDITOR } : pair.auditorModel ? { auditorModel: pair.auditorModel } : {}),
     } : {}),
   };
   for (const [role, session] of [['executor', pair?.executor], ['auditor', pair?.auditor]] as const) {

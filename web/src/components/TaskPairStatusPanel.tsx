@@ -112,6 +112,7 @@ export function TaskPairStatusPanel({ events, sessions }: { events: readonly Tim
     const resolvedModel = resolveSessionModel(id, model, sessions, projectionSessions);
     return <button type="button" class="task-pair-status-session" data-session-name={id} onClick={() => window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: id } }))}>{resolvedModel ? `${text}${t('taskPair.panel_model_separator')}${resolvedModel}` : text}</button>;
   };
+  const unassigned = (model: unknown) => <small>{t('taskPair.panel_unassigned')}{typeof model === 'string' && model.trim() ? `${t('taskPair.panel_model_separator')}${model.trim()}` : ''}</small>;
   const durationUnits = {
     hour: t('taskPair.panel_duration_hour'),
     day: t('taskPair.panel_duration_day'),
@@ -144,10 +145,10 @@ export function TaskPairStatusPanel({ events, sessions }: { events: readonly Tim
           <strong class="task-pair-status-row-title">{queued && <em>#{Number(payload.queuePosition ?? index + 1)} </em>}{title}</strong>
           <small class="task-pair-status-row-meta"><span class="task-pair-status-row-meta-icon" aria-hidden="true">⏱</span>{t('taskPair.panel_started', { time: new Date(row.startedAt).toLocaleTimeString() })} · {queued ? t('taskPair.panel_queued', { duration: formatElapsedDuration(elapsedSeconds, durationUnits) }) : t('taskPair.panel_elapsed', { duration: formatElapsedDuration(elapsedSeconds, durationUnits) })}</small>
           <div class="task-pair-status-row-roles">
-            <span class="task-pair-role-chip"><span class={`task-pair-status-dot ${payload.executorState === 'running' ? 'is-running' : ''}`} />{session(payload.executor, payload.executorLabel, payload.executorModel, 'executor') ?? <small>{t('taskPair.panel_unassigned')}</small>}</span>
+            <span class="task-pair-role-chip"><span class={`task-pair-status-dot ${payload.executorState === 'running' ? 'is-running' : ''}`} />{session(payload.executor, payload.executorLabel, payload.executorModel, 'executor') ?? unassigned(payload.executorModel)}</span>
             {payload.auditor === 'none'
               ? <span class="task-pair-role-chip task-pair-role-chip--muted">{t('taskPair.panel_no_audit')}</span>
-              : <span class="task-pair-role-chip"><span class={`task-pair-status-dot ${payload.auditorState === 'running' ? 'is-running' : ''}`} />{session(payload.auditor, payload.auditorLabel, payload.auditorModel, 'auditor') ?? <small>{t('taskPair.panel_unassigned')}</small>}</span>}
+              : <span class="task-pair-role-chip"><span class={`task-pair-status-dot ${payload.auditorState === 'running' ? 'is-running' : ''}`} />{session(payload.auditor, payload.auditorLabel, payload.auditorModel, 'auditor') ?? unassigned(payload.auditorModel)}</span>}
           </div>
         </div>; });
         return group.key === 'recent'

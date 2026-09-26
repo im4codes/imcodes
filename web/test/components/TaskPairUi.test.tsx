@@ -141,6 +141,22 @@ describe('TaskPairStatusPanel', () => {
     expect(screen.getByText('!')).toBeTruthy();
   });
 
+  it('shows requested models for queued unassigned roles and no audit for auditor=none', () => {
+    render(<TaskPairStatusPanel events={[{
+      eventId: 'queued-models', type: 'task_pair.event', ts: Date.now(),
+      payload: {
+        taskId: 'Q-models', title: 'Queued models', toStatus: 'queued', queuePosition: 1,
+        executorModel: 'gpt-6-luna', auditorModel: 'gpt-6-sol', auditor: undefined,
+      },
+    }, {
+      eventId: 'queued-none', type: 'task_pair.event', ts: Date.now(),
+      payload: { taskId: 'Q-none', title: 'Queued no audit', toStatus: 'queued', auditor: 'none', executorModel: 'gpt-6-luna' },
+    }] as never} />);
+    expect(screen.getAllByText(/taskPair.panel_unassigned.*gpt-6-luna/).length).toBe(2);
+    expect(screen.getByText(/taskPair.panel_unassigned.*gpt-6-sol/)).toBeTruthy();
+    expect(screen.getByText('taskPair.panel_no_audit')).toBeTruthy();
+  });
+
   it('renders an authoritative console snapshot even when chat history has no pair events', async () => {
     render(<TaskPairStatusPanel events={[]} />);
     window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: {

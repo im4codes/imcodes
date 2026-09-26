@@ -221,6 +221,14 @@ describe('pairs engine rows', () => {
     });
   });
 
+  it('keeps requested models in queued unassigned console rows', async () => {
+    const { taskPairService } = await import('../../src/daemon/task-pairs/service.js');
+    taskPairService.ingestText('codedeck', 'deck_cd_brain', '<!-- IMCODES_TASK QUEUE Q-models executormodel=gpt-6-luna auditormodel=gpt-6-sol -->', 'queue-models');
+    registry.handleFrame(subscribe());
+    const row = sent[0].tasks.find((task: any) => task.taskId === 'Q-models');
+    expect(row?.pair).toEqual(expect.objectContaining({ executorModel: 'gpt-6-luna', auditorModel: 'gpt-6-sol' }));
+  });
+
   it('asks every viewer of a project to resync when a pair changes', () => {
     registry.handleFrame(subscribe());
     sent.length = 0;

@@ -534,6 +534,29 @@ describe('task-pair heartbeat, replacement and queue', () => {
     }
   });
 
+  it('marks waiting_for_capacity before provisioning a missing auditor on an assigned-executor pair', async () => {
+    const previous = process.env.IMCODES_TASK_PAIR_QUEUE_OPERATION_TIMEOUT_MS;
+    process.env.IMCODES_TASK_PAIR_QUEUE_OPERATION_TIMEOUT_MS = '10';
+    try {
+      queuePairDirect('AUDWAIT', 'brief');
+      const queued = getTaskPairStore().getPair(PROJECT, 'AUDWAIT')!.state;
+      getTaskPairStore().savePair(PROJECT, { ...queued, executor: EXEC });
+      automation = new TaskPairAutomation({
+        now: () => now,
+        pickCandidate: () => undefined,
+        provision: () => new Promise<string | undefined>(() => {}),
+        importLegacy: () => undefined,
+      });
+      taskPairService.setScheduler(automation);
+      await automation.runQueue(PROJECT, BRAIN);
+      expect(pair('AUDWAIT').status).toBe('queued');
+      expect(pair('AUDWAIT').flags).toContain('waiting_for_capacity');
+    } finally {
+      if (previous === undefined) delete process.env.IMCODES_TASK_PAIR_QUEUE_OPERATION_TIMEOUT_MS;
+      else process.env.IMCODES_TASK_PAIR_QUEUE_OPERATION_TIMEOUT_MS = previous;
+    }
+  });
+
   it('sends one combined notice for queued tasks stalled a long time, not one per pair or per tick', async () => {
     candidates = [];
     marker(BRAIN, '<!-- IMCODES_TASK QUEUE Q3a -->\nbrief a\n<!-- IMCODES_TASK_END Q3a -->');

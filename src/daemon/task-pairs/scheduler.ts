@@ -1089,7 +1089,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
         continue;
       }
       const pool = pair.executorPool === 'economy' ? 'economy' : 'primary';
-      if (!pair.executor || (pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR)) {
+      if (!pair.executor || !pair.auditor) {
         this.#flagQuiet(project, pair.taskId, 'waiting_for_capacity');
       }
       const executor = pair.executor
