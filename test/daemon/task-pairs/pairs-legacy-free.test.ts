@@ -39,7 +39,7 @@ import { extractAgentDelegationReplyAuthorityFromInstruction } from '../../../sh
 import { MEMORY_MCP_TOOL_NAMES } from '../../../shared/memory-mcp-contracts.js';
 import { SUPERVISION_MCP_TOOLS } from '../../../shared/supervision-mcp-tools.js';
 import { TASK_PAIR_AUDIT_EVIDENCE, buildAuditConvergenceContract } from '../../../shared/audit-convergence.js';
-import { buildTaskPairMarkerContract, emptySeverityCounts, type TaskPairState } from '../../../shared/task-pair.js';
+import { TASK_PAIR_NO_AUDITOR, buildTaskPairMarkerContract, emptySeverityCounts, type TaskPairState } from '../../../shared/task-pair.js';
 
 const PROJECT = 'legacyfreeproj';
 const BRAIN = 'deck_legacyfreeproj_brain';
@@ -234,6 +234,27 @@ describe('pairs run without legacy supervision artifacts', () => {
     expect(pairs).toContain('READY_FOR_AUDIT <taskId> worktree=<absolute path> head=<commit> base=<commit>');
     expect(pairs).toContain('never wait for, ask for or block on them');
     expect(pairs).toContain('write NEEDS_INPUT <taskId> note="..." and wait: that is never a P0 or REWORK');
+  });
+
+  it('tells a no-auditor executor to self-validate, commit/push, and report straight to Brain before DONE, not just "write DONE"', () => {
+    const withAuditor: TaskPairState = {
+      taskId: 'M5', brain: BRAIN, executor: EXEC, auditor: AUD, status: 'working', flags: [], flagSides: {}, round: 0,
+      blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: 1, updatedAt: 1,
+    };
+    const none: TaskPairState = { ...withAuditor, taskId: 'M6', auditor: TASK_PAIR_NO_AUDITOR };
+    const audited = buildExecutorPairBrief(withAuditor);
+    const brief = buildExecutorPairBrief(none);
+    expect(brief).toContain('No audit window for this pair');
+    expect(brief).toContain('do proportionate self-validation instead');
+    expect(brief).toContain('commit/push code yourself if this is code');
+    expect(brief).toContain('Report straight to Brain in the same closing reply as your');
+    expect(brief).toContain('what changed, your worktree/branch/HEAD (or file paths for non-code work), and your validation result');
+    expect(brief).toContain('The daemon relays that reply to Brain as the completion notice');
+    // The audited brief must still read exactly as before -- this is additive,
+    // not a rewrite of the audited path.
+    expect(audited).toContain('send the auditor your validation');
+    expect(audited).toContain('After their PASS, commit/push code and write');
+    expect(audited).not.toContain('No audit window for this pair');
   });
 
   it('sends pairs delegations with a reply instruction that references no supervision_* contract', () => {

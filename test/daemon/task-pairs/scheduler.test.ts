@@ -256,6 +256,24 @@ describe('task-pair heartbeat, replacement and queue', () => {
     expect(q2.executor).not.toBe(q2.auditor);
   });
 
+  it('QUEUE with executormodel=-only and auditor=none starts the pair and never picks an auditor, even though a candidate is available', async () => {
+    candidates = [SPARE, SPARE2, AUD, EXEC];
+    marker(BRAIN, `<!-- IMCODES_TASK QUEUE Q9 title="Bump a config value" executormodel=sonnet auditor=none -->\nbump the value\n<!-- IMCODES_TASK_END Q9 -->`);
+    await flush();
+    const q9 = pair('Q9');
+    expect(q9.status).toBe('working');
+    expect(q9.executor).toBeTruthy();
+    expect(q9.auditor).toBe('none');
+    expect(sentTo(q9.executor!, 'dispatch')).toHaveLength(1);
+    // No auditor-assigned message went anywhere -- no auditor was picked.
+    expect(sent.filter((entry) => entry.id.includes(':auditor-assigned'))).toHaveLength(0);
+
+    // A later heartbeat tick must not retroactively pick one either.
+    await tick(3);
+    expect(pair('Q9').auditor).toBe('none');
+    expect(sent.filter((entry) => entry.id.includes(':auditor-assigned'))).toHaveLength(0);
+  });
+
   it('urgent=true jumps a queued pair ahead of earlier-queued normal work', async () => {
     candidates = [SPARE, SPARE2, AUD, EXEC];
     marker(BRAIN, '<!-- IMCODES_TASK QUEUE - max=1 -->');

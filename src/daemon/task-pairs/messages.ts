@@ -240,7 +240,7 @@ export function buildExecutorPairBrief(pair: TaskPairState): string {
     `You are the executor of this task pair, with ${auditor}. Write ${marker('STARTED', pair.taskId)} when you begin.`,
     workplaceLine(pair),
     pair.auditor === TASK_PAIR_NO_AUDITOR
-      ? `Write ${marker('DONE', pair.taskId)} when finished.`
+      ? `No audit window for this pair -- do proportionate self-validation instead (full suites for code), then commit/push code yourself if this is code. Report straight to Brain in the same closing reply as your ${marker('DONE', pair.taskId)}: what changed, your worktree/branch/HEAD (or file paths for non-code work), and your validation result. The daemon relays that reply to Brain as the completion notice, so write it as if Brain will read only that.`
       : `When done, send the auditor your validation (full suites for code) with send_message and write ${readyMarker(pair)}; the daemon relays that to the auditor. After their PASS, commit/push code and write ${marker('DONE', pair.taskId)}.`,
     TASK_PAIR_WORKSPACE_RULES,
     NO_LEGACY_ARTIFACTS,
@@ -339,4 +339,17 @@ export function buildAuditorAssignmentMessage(pair: TaskPairState): string {
 
 export function buildBrainLine(pair: TaskPairState, text: string): string {
   return `${header(pair)} ${text}`;
+}
+
+/**
+ * Relayed to Brain when the executor writes DONE on a pair with no auditor:
+ * there is no PASS to report instead, so this is the only completion notice
+ * Brain gets and the daemon sends it without being asked, so Brain never has
+ * to poll a no-auditor pair to learn it finished.
+ */
+export function buildNoAuditorDoneNotice(pair: TaskPairState, executorSummary: string): string {
+  const summary = executorSummary.trim();
+  return `${header(pair)} DONE from executor ${pair.executor ?? '(unknown)'}, no auditor for this pair.${
+    summary ? `\n\n${summary}` : ' (no summary text in the closing reply)'
+  }`;
 }
