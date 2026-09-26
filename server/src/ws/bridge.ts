@@ -884,9 +884,16 @@ class TimelineOutboundQueue {
     this.sending = true;
     safeSend(ws, item.data, (error) => {
       this.sending = false;
-      if (error) {
+      // A close/reload is not congestion: there is no browser left to
+      // backfill, and emitting a gap on the closing socket creates telemetry
+      // noise during normal reconnects. Only a failed send on an open socket
+      // belongs to the congestion episode.
+      if (error && ws.readyState === WebSocket.OPEN) {
         this.noteGap(item);
         this.scheduleGapFlush(onGap);
+      } else if (error) {
+        this.pendingGaps.clear();
+        this.gapEpisodes.clear();
       }
       this.finishCongestionEpisode();
       this.pump(ws, onGap);
