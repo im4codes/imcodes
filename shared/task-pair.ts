@@ -129,6 +129,22 @@ export const TASK_PAIR_BRAIN_REPORTING_RULE: string =
   + 'messages for those.';
 
 /**
+ * Stated in the pairs contract and the executor/auditor briefs (owner
+ * evidence: an executor's questions written only in its own reply, never
+ * sent anywhere, left a pair stalled until the owner happened to notice).
+ * Kept as one shared string so the rule cannot drift between the places it
+ * is injected.
+ */
+export const TASK_PAIR_ASK_DONT_JUST_REPLY_RULE: string =
+  'Ask, don\'t just reply: whenever you need a decision, clarification or '
+  + 'confirmation from Brain (scope, conflicting instructions, a blocked '
+  + 'tool, missing material), send it to Brain as a message (send_message to '
+  + 'the Brain session, or a BLOCKED/NEEDS_INPUT marker with note="...", '
+  + 'which the daemon relays to Brain), then continue other work or wait -- '
+  + 'never leave the question only in your own reply. Questions for your '
+  + 'partner (executor/auditor) go to them by message the same way.';
+
+/**
  * Stated in the Brain contract for a project not enabled for pairs (owner
  * decision, 2026-09-26, tsk_cd_pairs_optin: pairs is no longer a zero-config
  * default). Kept as one shared string so the daemon's own auto-start gates
@@ -282,7 +298,7 @@ export function scanTaskPairMarkers(text: string): TaskPairMarkerScan {
       markerIndex: markers.length,
     };
     markerLineIndexes.push(lineIndex);
-    if (marker.knownVerb === 'QUEUE' && taskId !== TASK_PAIR_INFER_TASK_ID) {
+    if ((marker.knownVerb === 'QUEUE' || marker.knownVerb === 'DISPATCH') && taskId !== TASK_PAIR_INFER_TASK_ID) {
       // The brief runs to the matching END line regardless of fences inside it.
       const endRe = briefEndLineRe(taskId);
       let endIndex = -1;
@@ -777,6 +793,19 @@ export function applyTaskPairMarker(
         return { pair, toStatus: 'queued', effect: 'created', unusual: false, intents: [{ kind: 'slot_changed' }] };
       }
       case 'DISPATCH': {
+        // Owner rule (D-dispatch-default): a genuine (agent/Brain-authored)
+        // DISPATCH is capacity-gated exactly like QUEUE -- it starts now only
+        // if the daemon's own queue drain finds a free slot and window right
+        // away, otherwise it queues in normal order and starts automatically
+        // later (see scheduler.ts#runQueueOnce). `implicitDispatch`
+        // (send_message with task metadata) is a distinct, narrower mechanism
+        // that keeps its original unconditional-start behavior.
+        if (ctx.source === 'marker') {
+          const pair = newPair(marker.taskId, ctx.writer, ctx, 'queued');
+          setRolesFromAttrsQueued(pair, attrs);
+          if (marker.brief !== undefined) pair.brief = marker.brief;
+          return { pair, toStatus: 'queued', effect: 'created', unusual: false, intents: [{ kind: 'slot_changed' }] };
+        }
         const pair = newPair(marker.taskId, ctx.writer, ctx, 'working');
         setRolesFromAttrs(pair, attrs, intents);
         if (marker.brief !== undefined) pair.brief = marker.brief;
@@ -888,6 +917,20 @@ export function applyTaskPairMarker(
       if (!roleAuthority) return recorded(existing);
       if (terminal) unusual = true;
       resetCaps(pair);
+      // A (re)start of a queued/closed pair is capacity-gated exactly like
+      // QUEUE, UNLESS this is the daemon's own queue-drain call (source
+      // 'queue'): that call only ever fires once #runQueueOnce has already
+      // confirmed a free slot and window, so it is the one path allowed to
+      // flip straight to 'working' -- gating it too would just re-queue the
+      // pair forever and never actually start it.
+      if ((pair.status === 'queued' || terminal) && ctx.source !== 'queue') {
+        if (terminal) pair.closedNoticeSentTo = undefined;
+        setRolesFromAttrsQueued(pair, attrs);
+        if (marker.brief !== undefined) pair.brief = marker.brief;
+        pair.status = 'queued';
+        intents.push({ kind: 'slot_changed' });
+        return done('dispatched');
+      }
       if (terminal) pair.closedNoticeSentTo = undefined;
       setRolesFromAttrs(pair, attrs, intents);
       if (!pair.executor) intents.push({ kind: 'pick_executor' });
@@ -979,9 +1022,19 @@ export function applyTaskPairMarker(
     case 'NEEDS_INPUT': {
       if (terminal) return recorded(existing, false);
       const flag = verb === 'BLOCKED' ? 'blocked' : 'needs_input';
+      const freshlyFlagged = !pair.flags.includes(flag) || pair.flagSides[flag] !== role;
       addFlag(pair, flag);
       pair.flagSides[flag] = role;
       pair.blockedNote = attrs.note?.trim() || undefined;
+      // Owner evidence: an executor's question left only in its own reply,
+      // never sent anywhere, stalled a pair until the owner happened to
+      // notice ("make sure NEEDS_INPUT/BLOCKED notes from executors reach
+      // Brain as a notice" -- executors specifically). Tell Brain immediately
+      // on a fresh executor BLOCKED/NEEDS_INPUT instead of waiting for the
+      // side to go silent. An auditor's BLOCKED/NEEDS_INPUT keeps the
+      // existing heartbeat escalation only (scheduler.ts#tickPair /
+      // #escalateBlocked) -- adding this here too would double the notice.
+      if (freshlyFlagged && role === 'executor') intents.push({ kind: 'brain_notice', flag });
       if (verb === 'BLOCKED' && role === 'executor' && isAboutAuditor(attrs) && hasAudit(pair)) {
         if (spendCap(pair, 'blocked_replacement', intents)) intents.push({ kind: 'replace_auditor', reason: 'executor_blocked' });
       }
@@ -1142,7 +1195,8 @@ export function buildTaskPairMarkerContract(): string {
     TASK_PAIR_WORKSPACE_RULES,
     'Pairs have no assignmentId, auditAttemptId, auditRevision, immutable bundle, scopeFiles or control-plane binding: never wait for, ask for or block on them.',
     `Auditor: the material is the executor's workspace (a worktree at the named head, or the named task-directory path; read it directly) plus their reported validation; judge by ${AUDIT_CONVERGENCE_CONTRACT_ID}. Reply to the executor with every finding tagged [P0]..[P4], then write PASS or REWORK with the blocking set and a count per level, e.g. REWORK <taskId> blocking=P0 p0=1 p1=2. REWORK needs at least one finding at a blocking level; PASS has none. Re-audits check only the prior blocking classes plus regressions. If the material cannot be reached (executor limited/offline, workspace unreadable), write NEEDS_INPUT <taskId> note="..." and wait: that is never a P0 or REWORK.`,
-    `Brain: DISPATCH <taskId> executor=<session> auditor=<session>|none [blocking=P0,P1] [pool=primary|economy] [workspace=dir for non-code work in a git project]; queue with QUEUE <taskId> title="..." then the full brief then <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> -->; QUEUE - max=<n> sets your queue limit; REASSIGN <taskId> auditor=<session>; DONE <taskId> force=true completes without audit; CANCEL <taskId>. Naming executor=/auditor=<session> replaces the current holder of that role immediately, ignoring the execution pool's role config. Naming executormodel=/auditormodel=<model> instead steers the next automatic pick or replacement for that role (also ignoring pool roles) but does not by itself replace a role that is already filled -- REASSIGN with the session explicitly for that; no matching session or pool config for a named model replies "no session/config for requested model <model>". A project with no execution pool configured has no built-in default: before dispatching or queueing work there without naming executormodel=/auditormodel=/executor=/auditor= yourself, ask the user which models to use (Settings -> execution pool, or name them on the task) -- an unnamed role in that state picks nothing and waits.`,
+    TASK_PAIR_ASK_DONT_JUST_REPLY_RULE,
+    `Brain: DISPATCH is normally all you need -- the daemon starts it right away if a slot and window are free, otherwise it auto-queues it (status queued, normal FIFO order, urgent=true jumps the queue) and starts it automatically later; no need to pick QUEUE just to defer work. DISPATCH <taskId> executor=<session> auditor=<session>|none [blocking=P0,P1] [pool=primary|economy] [workspace=dir for non-code work in a git project] [urgent=true], optionally with a brief exactly like QUEUE's: DISPATCH <taskId> ... then the full brief then <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> -->; the daemon starts it and delivers the brief either way. QUEUE <taskId> title="..." ... <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> --> still works (always enqueues, same mechanics) for compatibility. QUEUE - max=<n> sets your queue limit; REASSIGN <taskId> auditor=<session>; DONE <taskId> force=true completes without audit; CANCEL <taskId>. Naming executor=/auditor=<session> replaces the current holder of that role immediately, ignoring the execution pool's role config; if that named session is busy the pair waits for it rather than substituting another. Naming executormodel=/auditormodel=<model> instead steers the next automatic pick or replacement for that role (also ignoring pool roles) but does not by itself replace a role that is already filled -- REASSIGN with the session explicitly for that; no matching session or pool config for a named model replies "no session/config for requested model <model>". A project with no execution pool configured has no built-in default: before dispatching or queueing work there without naming executormodel=/auditormodel=/executor=/auditor= yourself, ask the user which models to use (Settings -> execution pool, or name them on the task) -- an unnamed role in that state picks nothing and waits.`,
     TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
     TASK_PAIR_BRAIN_REPORTING_RULE,
     TASK_PAIR_CHECKLIST_RULE,

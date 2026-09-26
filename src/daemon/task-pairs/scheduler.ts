@@ -853,10 +853,6 @@ export class TaskPairAutomation implements TaskPairScheduler {
     for (const stored of queued) {
       if (open >= max) return;
       const pair = stored.state;
-      if (pair.brief === undefined) {
-        this.#flagOnceWithKey(stored, 'no_brief', `queued without a brief: write QUEUE ${pair.taskId} … <!-- IMCODES_TASK_END ${pair.taskId} --> or DISPATCH it yourself.`);
-        continue;
-      }
       // A session named explicitly on QUEUE (executor=/auditor=) is a
       // reservation, but it is only BOUND at start: while queued it never
       // occupies a window (TASK_PAIR_OPEN_STATUSES excludes 'queued'), so
@@ -909,19 +905,22 @@ export class TaskPairAutomation implements TaskPairScheduler {
       const cleaned = { ...dispatched, flags: dispatched.flags.filter((flag) => flag !== 'waiting_for_capacity' && flag !== 'no_pool_configured') };
       store.savePair(project, cleaned);
       open += 1;
-      // The executor's worktree exists before the brief that names it is sent.
-      const withWorkspace = await taskPairService.ensureWorkspace(project, pair.taskId) ?? cleaned;
-      await sendTaskPairMessage(executor, pair.taskId, 'dispatch', `${pair.brief}${buildDispatchTrailer(withWorkspace)}`);
-      if (auditor !== TASK_PAIR_NO_AUDITOR) await sendTaskPairMessage(auditor, pair.taskId, 'auditor-assigned', buildAuditorAssignmentMessage(cleaned));
+      if (pair.brief !== undefined) {
+        // The executor's worktree exists before the brief that names it is sent.
+        const withWorkspace = await taskPairService.ensureWorkspace(project, pair.taskId) ?? cleaned;
+        await sendTaskPairMessage(executor, pair.taskId, 'dispatch', `${pair.brief}${buildDispatchTrailer(withWorkspace)}`);
+        if (auditor !== TASK_PAIR_NO_AUDITOR) await sendTaskPairMessage(auditor, pair.taskId, 'auditor-assigned', buildAuditorAssignmentMessage(cleaned));
+      } else {
+        // DISPATCH never required a brief (unlike QUEUE); a queued pair that
+        // reached here without one -- a bare DISPATCH the queue could not
+        // start right away -- is briefed the same way an immediate DISPATCH
+        // always was, instead of stalling for a brief it was never going to get.
+        await taskPairService.briefParticipants(project, pair.taskId);
+      }
       await sendTaskPairMessage(brain, pair.taskId, 'brain-line-dispatch', buildBrainLine(cleaned, `dispatched from the queue: executor ${executor}, auditor ${auditor}.`));
     }
   }
 
-  #flagOnceWithKey(stored: StoredTaskPair, key: string, text: string): void {
-    if (stored.liveness.notified.includes(key)) return;
-    getTaskPairStore().saveLiveness(stored.project, stored.state.taskId, { ...stored.liveness, notified: [...stored.liveness.notified, key] });
-    void sendTaskPairMessage(stored.state.brain, stored.state.taskId, `brain-${key}`, buildBrainLine(stored.state, text));
-  }
 }
 
 export const taskPairAutomation = new TaskPairAutomation();

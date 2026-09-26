@@ -5,6 +5,7 @@
  */
 import { AUDIT_CONVERGENCE_CONTRACT_ID, type AuditSeverity } from '../../../shared/audit-convergence.js';
 import {
+  TASK_PAIR_ASK_DONT_JUST_REPLY_RULE,
   TASK_PAIR_BRAIN_REPORTING_RULE,
   TASK_PAIR_BRIEF_END_TAG,
   TASK_PAIR_CONTRACT_ID,
@@ -110,10 +111,14 @@ export function buildBrainNoticeMessage(pair: TaskPairState, flag: TaskPairFlag,
   const resolve = flag === 'executor_silent' && pair.status === 'passed'
     ? `The audit already passed; only commit/push and DONE remain. Wait for the executor, or hand it to another session with ${marker('REASSIGN', pair.taskId, 'executor=<session>')}. Use ${marker('DONE', pair.taskId, 'force=true')} only once the work is committed.`
     : `Resolve with a marker, e.g. ${marker('REASSIGN', pair.taskId, 'auditor=<session>')}, ${marker('DONE', pair.taskId, 'force=true')}, or ${marker('CANCEL', pair.taskId)}.`;
+  // BLOCKED/NEEDS_INPUT is sent as an immediate `brain_notice` intent (no
+  // explicit detail argument, unlike the heartbeat escalation path) -- fall
+  // back to the pair's own recorded note so Brain still sees why.
+  const resolvedDetail = detail ?? ((flag === 'blocked' || flag === 'needs_input') ? pair.blockedNote : undefined);
   return [
     header(pair),
     `Needs your decision: ${FLAG_EXPLANATIONS[flag] ?? flag}. Executor ${pair.executor ?? '-'}, auditor ${pair.auditor ?? '-'}, status ${pair.status}, round ${pair.round}.`,
-    ...(detail ? [`Why: ${detail}.`] : []),
+    ...(resolvedDetail ? [`Why: ${resolvedDetail}.`] : []),
     resolve,
     `[Contract: ${TASK_PAIR_CONTRACT_ID}]`,
   ].join('\n');
@@ -283,6 +288,7 @@ export function buildExecutorPairBrief(pair: TaskPairState): string {
       : `When done, send the auditor your validation (full suites for code) with send_message and write ${readyMarker(pair)}; the daemon relays that to the auditor. After their PASS, commit/push code and write ${marker('DONE', pair.taskId)}.`,
     TASK_PAIR_WORKSPACE_RULES,
     NO_LEGACY_ARTIFACTS,
+    TASK_PAIR_ASK_DONT_JUST_REPLY_RULE,
     contracts(pair.blocking),
   ].join('\n');
 }
@@ -371,6 +377,7 @@ export function buildAuditorAssignmentMessage(pair: TaskPairState): string {
     `You are the auditor of this task for executor ${pair.executor}. On READY_FOR_AUDIT the daemon relays their workspace (worktree and head, or task-directory path), and they send you their validation; judge that by ${AUDIT_CONVERGENCE_CONTRACT_ID} (blocking=${pair.blocking.join(',')}) and write PASS or REWORK with severity counts.`,
     blockingSummaryLine(pair),
     NO_LEGACY_ARTIFACTS,
+    TASK_PAIR_ASK_DONT_JUST_REPLY_RULE,
     contracts(pair.blocking),
     TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
     TASK_PAIR_BRAIN_REPORTING_RULE,

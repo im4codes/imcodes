@@ -403,20 +403,24 @@ export class TaskPairService {
     // REASSIGN that hands the executor role to someone new tells them too --
     // pre-fix a REASSIGN never briefed the new executor at all, who got no
     // title, brief or workspace (owner report, tsk_cd_upgrade_starvation).
-    if (stored && input.source !== 'queue'
+    // A DISPATCH that landed on `queued` (no free slot/window right now, or a
+    // brand new pair the queue drain has not resolved yet) has no participant
+    // to brief -- the queue runner briefs it once it actually starts.
+    if (stored && input.source !== 'queue' && transition.toStatus !== 'queued'
       && ((input.marker.knownVerb === 'DISPATCH' && (transition.effect === 'created' || transition.effect === 'dispatched'))
         || (input.marker.knownVerb === 'REASSIGN' && !!input.marker.attrs.executor
           && (transition.effect === 'reassigned' || transition.effect === 'reassigned_auditor')))) {
       this.#track(this.briefParticipants(input.project, stored.state.taskId));
     }
-    // A QUEUE marker's `title=` is always deliberately authored (there is no
-    // other source for it), so only a brand new QUEUE pair that named no
-    // title is a candidate: generate one from its brief, best-effort. A
-    // DISPATCH/QUEUE from `implicitDispatch` (source `implicit_dispatch`)
-    // already conflated an explicit title with a mechanically derived one by
-    // the time it reaches here -- that distinction, and the matching
-    // generation call, is handled by the caller (send-tool.ts) instead.
-    if (stored && input.source === 'marker' && input.marker.knownVerb === 'QUEUE'
+    // A QUEUE/DISPATCH marker's `title=` is always deliberately authored
+    // (there is no other source for it), so only a brand new queued pair
+    // that named no title is a candidate: generate one from its brief,
+    // best-effort. A DISPATCH/QUEUE from `implicitDispatch` (source
+    // `implicit_dispatch`) already conflated an explicit title with a
+    // mechanically derived one by the time it reaches here -- that
+    // distinction, and the matching generation call, is handled by the
+    // caller (send-tool.ts) instead.
+    if (stored && input.source === 'marker' && (input.marker.knownVerb === 'QUEUE' || input.marker.knownVerb === 'DISPATCH')
       && transition.effect === 'created' && !input.marker.attrs.title && stored.state.brief) {
       this.maybeGenerateTitle(input.project, stored.state.taskId, stored.state.brief);
     }

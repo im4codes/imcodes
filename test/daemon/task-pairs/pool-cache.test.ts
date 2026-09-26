@@ -96,8 +96,16 @@ describe('task-pair pool authority: unsynced-cache visibility', () => {
     if (process.env.IMCODES_SUPERVISION_ENGINE === 'pairs') delete process.env.IMCODES_SUPERVISION_ENGINE;
   });
 
+  // A fresh DISPATCH now queues (capacity-gated like QUEUE) instead of
+  // picking immediately, so it never itself reaches replaceAuditor's
+  // diagnostic messaging (an ordinary queue miss is silent by design; see
+  // scheduler.ts#runQueueOnce). REASSIGN still triggers an immediate pick
+  // attempt on the existing pair regardless of its status, which is what
+  // this suite's pick-failure diagnostics (215/jdzj) are actually about.
   it('names the never-synced account cache in the needs_auditor Brain notice', async () => {
     taskPairService.ingestText(PROJECT, BRAIN, '<!-- IMCODES_TASK DISPATCH T80 -->', 'pool-sync-turn-1', now);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    taskPairService.ingestText(PROJECT, BRAIN, '<!-- IMCODES_TASK REASSIGN T80 -->', 'pool-sync-turn-1b', now);
     await new Promise<void>((resolve) => setImmediate(resolve));
 
     const notice = sent.find((entry) => entry.target === BRAIN);
@@ -108,6 +116,8 @@ describe('task-pair pool authority: unsynced-cache visibility', () => {
     __setCachedSupervisorDefaultsForTests({ backend: 'codex-sdk', model: 'gpt-5.6-sol', executionPools: configuredPool('gpt-5.6-sol') });
 
     taskPairService.ingestText(PROJECT, BRAIN, '<!-- IMCODES_TASK DISPATCH T81 -->', 'pool-sync-turn-2', now);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    taskPairService.ingestText(PROJECT, BRAIN, '<!-- IMCODES_TASK REASSIGN T81 -->', 'pool-sync-turn-2b', now);
     await new Promise<void>((resolve) => setImmediate(resolve));
 
     const notice = sent.find((entry) => entry.target === BRAIN);
@@ -125,6 +135,8 @@ describe('task-pair pool authority: unsynced-cache visibility', () => {
 
     taskPairService.ingestText(PROJECT, BRAIN, '<!-- IMCODES_TASK DISPATCH T82 -->', 'pool-sync-turn-3', now);
     await new Promise<void>((resolve) => setImmediate(resolve));
+    taskPairService.ingestText(PROJECT, BRAIN, '<!-- IMCODES_TASK REASSIGN T82 -->', 'pool-sync-turn-3b', now);
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
     const notice = sent.find((entry) => entry.target === BRAIN);
     expect(notice?.text).toContain("no account-level pool configured; using this session's local copy");
@@ -137,6 +149,8 @@ describe('task-pair pool authority: unsynced-cache visibility', () => {
       '<!-- IMCODES_TASK DISPATCH T83 auditormodel=nonexistent-fictional-model -->',
       'pool-sync-turn-4', now,
     );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    taskPairService.ingestText(PROJECT, BRAIN, '<!-- IMCODES_TASK REASSIGN T83 -->', 'pool-sync-turn-4b', now);
     await new Promise<void>((resolve) => setImmediate(resolve));
 
     const notice = sent.find((entry) => entry.target === BRAIN && entry.text.includes('no session/config for requested model'));

@@ -203,6 +203,12 @@ describe('owner rule: scheduler wires an explicit executormodel=/auditormodel= t
       'owner-rule-turn-2', now,
     );
     await new Promise<void>((resolve) => setImmediate(resolve));
+    // A fresh DISPATCH now queues (capacity-gated like QUEUE): an ordinary
+    // queue miss is silent by design (scheduler.ts#runQueueOnce). REASSIGN
+    // still triggers an immediate pick attempt on the existing pair
+    // regardless of status, which is what this diagnostic is actually about.
+    taskPairService.ingestText(PROJECT, BRAIN, '<!-- IMCODES_TASK REASSIGN T61 -->', 'owner-rule-turn-2b', now);
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
     const pair = getTaskPairStore().getPair(PROJECT, 'T61')!.state;
     expect(pair.flags).toContain('needs_auditor');

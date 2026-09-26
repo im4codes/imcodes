@@ -292,8 +292,14 @@ describe('pairs that stopped driving themselves (215 / jdzj)', () => {
     taskPairService.recordProgress(EXEC, now, 'still working');
     expect(getTaskPairStore().getPair(PROJECT, 'Q1')!.liveness.progressExecutorAt).toBe(now);
 
+    // Q1's own dispatch brief just "sent" to EXEC, which would otherwise look
+    // busy to Q2's queue-drain (DISPATCH now queues before it starts) and
+    // leave Q2 queued instead of open -- clear that residue so Q2 starts, the
+    // same convention sevenPassedPairs() uses below.
+    pendingThisTick.clear();
     marker(BRAIN, `<!-- IMCODES_TASK DISPATCH Q2 executor=${EXEC} auditor=${AUD} -->`);
     await flush();
+    expect(pair('Q2').status).toBe('working');
     const before = getTaskPairStore().getPair(PROJECT, 'Q1')!.liveness.progressExecutorAt;
     // Two open pairs and no focus yet: plain output is nobody's progress.
     resetTaskPairFocusForTests();

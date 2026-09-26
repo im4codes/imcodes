@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  TASK_PAIR_ASK_DONT_JUST_REPLY_RULE,
   TASK_PAIR_BRAIN_REPORTING_RULE,
   TASK_PAIR_MESSAGE_CAP_PER_ROUND,
   TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
@@ -138,6 +139,23 @@ describe('task-pair marker grammar', () => {
     expect(body).toContain('nothing auto-picks one for you');
     expect(body).toContain('write DONE straight to Brain with no PASS required');
     expect(body).toContain('what changed, the worktree/branch/HEAD or file paths, and your validation result');
+  });
+
+  it('ships a contract telling Brain DISPATCH is normally enough on its own, auto-queuing over the limit instead of needing QUEUE first', () => {
+    const body = buildTaskPairMarkerContract();
+    expect(body).toContain('DISPATCH is normally all you need');
+    expect(body).toContain('auto-queues it');
+    expect(body).toContain('urgent=true jumps the queue');
+    expect(body).toContain('no need to pick QUEUE just to defer work');
+    // QUEUE stays documented for compatibility, not removed from the contract.
+    expect(body).toContain('QUEUE <taskId> title="..." ...');
+    expect(body).toContain('always enqueues');
+  });
+
+  it('ships a contract telling both roles to ask (send a message) instead of leaving a question only in their own reply', () => {
+    const body = buildTaskPairMarkerContract();
+    expect(body).toContain(TASK_PAIR_ASK_DONT_JUST_REPLY_RULE);
+    expect(body).toContain('never leave the question only in your own reply');
   });
 });
 
@@ -316,8 +334,10 @@ describe('task-pair state machine', () => {
         expect(result.unusual, `${status} ${writer} ${line}`).toBe(true);
         expect(result.intents, `${status} ${writer} ${line}`).toEqual([{ kind: 'closed_pair_notice', to: writer }]);
       }
-      // The Brain (and the daemon, its equivalent) can still revive it explicitly.
-      expect(apply(closed, BRAIN, `<!-- IMCODES_TASK DISPATCH T42 executor=${EXEC} auditor=${AUD} -->`).pair?.status).toBe('working');
+      // The Brain (and the daemon, its equivalent) can still revive it
+      // explicitly -- a genuine marker-sourced DISPATCH reopens into 'queued'
+      // now (capacity-gated like QUEUE), same mechanics as QUEUE itself.
+      expect(apply(closed, BRAIN, `<!-- IMCODES_TASK DISPATCH T42 executor=${EXEC} auditor=${AUD} -->`).pair?.status).toBe('queued');
       expect(apply(closed, BRAIN, '<!-- IMCODES_TASK QUEUE T42 title="retry" -->').pair?.status).toBe('queued');
     }
   });
@@ -374,19 +394,31 @@ describe('task-pair state machine', () => {
     expect(pair.flags).toContain('replacement_churn');
   });
 
-  it('asks the daemon to pick an auditor when a dispatch names none', () => {
+  it('queues a marker-sourced dispatch that names no auditor instead of picking immediately -- the queue drain picks it at start', () => {
     const result = apply(undefined, BRAIN, `<!-- IMCODES_TASK DISPATCH T50 executor=${EXEC} -->`);
+    expect(result.pair).toMatchObject({ status: 'queued', executor: EXEC });
+    expect(result.pair?.flags ?? []).not.toContain('needs_auditor');
+    expect(result.intents).toEqual([{ kind: 'slot_changed' }]);
+  });
+
+  it('implicitDispatch (send_message task metadata) still asks the daemon to pick an auditor immediately when none is named', () => {
+    // Unlike a genuine Brain/agent marker (source 'marker', capacity-gated
+    // above), a `send_message` task-tagged dispatch is a distinct, narrower
+    // mechanism that keeps its original unconditional-start behavior.
+    const result = applyTaskPairMarker(undefined, marker(`<!-- IMCODES_TASK DISPATCH T50b executor=${EXEC} -->`), ctx(BRAIN, { source: 'implicit_dispatch' }));
+    expect(result.pair).toMatchObject({ status: 'working', executor: EXEC });
     expect(result.pair?.flags).toContain('needs_auditor');
     expect(result.intents).toContainEqual({ kind: 'pick_auditor' });
   });
 
   it('owner rule: keeps an explicit executormodel=/auditormodel= on the pair and still asks the daemon to pick by it', () => {
     const result = apply(undefined, BRAIN, '<!-- IMCODES_TASK DISPATCH T52 executormodel=gpt-6-luna auditormodel=claude-sonnet-5 -->');
-    expect(result.pair).toMatchObject({ executorModel: 'gpt-6-luna', auditorModel: 'claude-sonnet-5' });
+    expect(result.pair).toMatchObject({ status: 'queued', executorModel: 'gpt-6-luna', auditorModel: 'claude-sonnet-5' });
     expect(result.pair?.executor).toBeUndefined();
     expect(result.pair?.auditor).toBeUndefined();
-    expect(result.intents).toContainEqual({ kind: 'pick_executor' });
-    expect(result.intents).toContainEqual({ kind: 'pick_auditor' });
+    // Picking by the named model happens when the queue drain starts this
+    // pair (scheduler.ts#runQueueOnce), not as an immediate intent here.
+    expect(result.intents).toEqual([{ kind: 'slot_changed' }]);
   });
 
   it('owner rule: an explicit executor=/auditor= session still wins over an unrelated model attr and needs no pick', () => {

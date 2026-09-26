@@ -456,6 +456,12 @@ describe('a pool with no auditor-role entry (jdzj)', () => {
     try {
       taskPairService.ingestText(PROJECT, BRAIN, `<!-- IMCODES_TASK DISPATCH G1 executor=${EXEC} -->`, 'gap-1', now);
       await flush();
+      // A fresh DISPATCH now queues (capacity-gated like QUEUE): an ordinary
+      // queue miss is silent by design (scheduler.ts#runQueueOnce). REASSIGN
+      // still triggers an immediate pick attempt on the existing pair
+      // regardless of status, which is what this gap-diagnostic is about.
+      taskPairService.ingestText(PROJECT, BRAIN, '<!-- IMCODES_TASK REASSIGN G1 -->', 'gap-1b', now);
+      await flush();
       expect(notices).toHaveLength(1);
       expect(notices[0]).toContain('Why: no pool entry has the auditor role');
     } finally {

@@ -4,7 +4,7 @@ import { removeSession, upsertSession } from '../../../src/store/session-store.j
 import { timelineEmitter } from '../../../src/daemon/timeline-emitter.js';
 import { TaskPairStore, setTaskPairStoreForTests, getTaskPairStore } from '../../../src/daemon/task-pairs/store.js';
 import { setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
-import { TaskPairService } from '../../../src/daemon/task-pairs/service.js';
+import { TaskPairService, type TaskPairScheduler } from '../../../src/daemon/task-pairs/service.js';
 import { resolveTaskPairEngine, resolveTaskPairEngineState, resolveTaskPairMaxConcurrency } from '../../../src/daemon/task-pairs/engine.js';
 import { normalizeSessionSupervisionSnapshot } from '../../../shared/supervision-config.js';
 import { dispatchSendMessage, clearSendIdempotencyCacheForTests } from '../../../src/daemon/send-tool.js';
@@ -37,21 +37,56 @@ let service: TaskPairService;
 let sent: Array<{ target: string; text: string; id: string }>;
 let turn = 0;
 
-/** Emit a final assistant turn and wait for the deferred ingestion to run. */
+/**
+ * A DISPATCH marker now queues before it starts (owner rule, tsk_cd_dispatch_default:
+ * DISPATCH is capacity-gated exactly like QUEUE). This suite tests the service
+ * layer in isolation from the real pool/capacity machinery in scheduler.ts, so
+ * it wires the minimal stand-in a `TaskPairScheduler` needs here: a pair
+ * already naming both roles starts the moment its slot frees, with no pool,
+ * pick or capacity logic of its own to test.
+ */
+const testScheduler: TaskPairScheduler = {
+  async onIntent(project, pairState, intent) {
+    if (intent.kind !== 'slot_changed') return;
+    if (pairState.status !== 'queued' || !pairState.executor || pairState.auditor === undefined) return;
+    service.applyMarker({
+      project,
+      writer: 'daemon',
+      marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: pairState.taskId, attrs: { executor: pairState.executor, auditor: pairState.auditor } },
+      source: 'queue',
+      now: Date.now(),
+      eventId: `test-queue-drain:${pairState.taskId}:${Date.now()}:${Math.random()}`,
+    });
+    // `source: 'queue'` deliberately suppresses service.ts's own auto-brief
+    // (the real queue runner briefs participants itself right after
+    // starting a pair; see scheduler.ts#runQueueOnce) -- this stand-in does
+    // the same, so a starting pair is briefed exactly once either way.
+    await service.briefParticipants(project, pairState.taskId);
+  },
+};
+
+/** Drains every tracked background operation (intents, briefs, queue starts), transitively. */
+async function flush() {
+  for (let i = 0; i < 50; i += 1) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await service.waitForIdle();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    if (service.pendingCount === 0) return;
+  }
+}
+
+/** Emit a final assistant turn and wait for the deferred ingestion (and any queue start it triggers) to run. */
 async function say(sessionName: string, text: string, extra: Record<string, unknown> = {}, eventId?: string) {
   turn += 1;
   timelineEmitter.emit(sessionName, 'assistant.text', { text, streaming: false, ...extra }, {
     source: 'daemon', confidence: 'high', eventId: eventId ?? `turn-${turn}`,
   });
   await new Promise<void>((resolve) => setImmediate(resolve));
+  await flush();
 }
 
 function pair(taskId: string) {
   return getTaskPairStore().getPair(PROJECT, taskId)?.state;
-}
-
-async function flush() {
-  await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
 describe('task-pair marker ingestion', () => {
@@ -68,6 +103,7 @@ describe('task-pair marker ingestion', () => {
     ]) upsertSession(record);
     service = new TaskPairService();
     service.init();
+    service.setScheduler(testScheduler);
   });
 
   afterEach(async () => {
@@ -88,7 +124,10 @@ describe('task-pair marker ingestion', () => {
     off();
     expect(pair('T1')).toMatchObject({ status: 'working', brain: BRAIN, executor: EXEC, auditor: AUD, title: 'Fix login' });
     expect(new Set(seen.map((entry) => entry.session))).toEqual(new Set([BRAIN, EXEC, AUD]));
-    expect(seen[0]?.payload).toMatchObject({ taskId: 'T1', verb: 'DISPATCH', toStatus: 'working', role: 'brain', source: 'marker' });
+    // DISPATCH is capacity-gated like QUEUE: the Brain's own marker queues the
+    // pair first (this is that event), then the daemon's own queue-drain
+    // starts it (a second, separately-recorded event) once a slot is free.
+    expect(seen[0]?.payload).toMatchObject({ taskId: 'T1', verb: 'DISPATCH', toStatus: 'queued', role: 'brain', source: 'marker' });
   });
 
   it('keeps DISPATCH deduplication independent per executor target', () => {
@@ -121,7 +160,10 @@ describe('task-pair marker ingestion', () => {
     await say(AUD, '<!-- IMCODES_TASK REWORK T3 blocking=P0 p0=1 -->');
     await say(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T3 -->', {}, 'fixed-turn');
     expect(pair('T3')).toMatchObject({ status: 'rework', round: 1 });
-    expect(getTaskPairStore().listEvents(PROJECT, 'T3')).toHaveLength(3);
+    // DISPATCH now records two events (queued, then the queue-drain's own
+    // start), plus READY_FOR_AUDIT and REWORK -- the repeated 'fixed-turn'
+    // READY_FOR_AUDIT is still deduplicated, so it is not a fifth.
+    expect(getTaskPairStore().listEvents(PROJECT, 'T3')).toHaveLength(4);
   });
 
   it('relays the executor\'s own closing summary to Brain when a no-auditor pair reaches DONE, so Brain never has to poll', async () => {
@@ -296,6 +338,8 @@ describe('task-pair marker ingestion', () => {
     expect(brief?.text).toContain('T13');
     expect(brief?.text).toContain('Original brief text.');
     expect(brief?.text).toContain('executor of this task pair');
+    // Owner rule (tsk_cd_dispatch_default): ask, don't just reply.
+    expect(brief?.text).toContain('Ask, don\'t just reply');
   });
 
   it('delivers the stored brief again when Brain re-dispatches a cancelled pair', async () => {
