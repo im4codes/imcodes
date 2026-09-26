@@ -517,6 +517,34 @@ function scheduleLifecycleTask(
 }
 
 /**
+ * Batch lifecycle operations must be admitted atomically. Count only new
+ * idempotency keys against both burst and FIFO capacity before reserving any
+ * task, preventing a 429 after partially accepting a batch.
+ */
+function preflightLifecycleBatch(
+  from: string,
+  idempotencyKeys: Array<string | undefined>,
+): { accepted: boolean; retryAfterMs?: number } {
+  const bucket = lifecycleBucketFor(from);
+  pruneLifecycle(bucket);
+  const seen = new Set<string>();
+  let needed = 0;
+  for (const idempotencyKey of idempotencyKeys) {
+    const idempotency = idempotencyKey?.trim();
+    if (idempotency) {
+      const key = `${from}\u0000${idempotency}`;
+      if (lifecycleIdempotency.has(key) || seen.has(key)) continue;
+      seen.add(key);
+    }
+    needed += 1;
+  }
+  const available = Math.max(0, LIFECYCLE_RATE_LIMIT_MAX - bucket.timestamps.length)
+    + Math.max(0, LIFECYCLE_QUEUE_MAX - bucket.queue.length);
+  if (needed <= available) return { accepted: true };
+  return { accepted: false, retryAfterMs: lifecycleRetryAfterMs(bucket) || LIFECYCLE_RATE_LIMIT_WINDOW_MS };
+}
+
+/**
  * Drain queued messages for a session that just became idle.
  * Delivers FIFO, skipping expired messages.
  */
@@ -1411,6 +1439,21 @@ export async function startHookServer(
           const { restartSessionNow } = await import('./command-handler.js');
           return restartSessionNow(sessionName, restartOptions);
         });
+        if (isBatch) {
+          const preflight = preflightLifecycleBatch(
+            from,
+            targetRecords.map((targetRecord, index) => {
+              const key = items[index]!.idempotencyKey;
+              return key ? `${targetRecord.name}\u0000${key}` : undefined;
+            }),
+          );
+          if (!preflight.accepted) {
+            const retryAfterMs = preflight.retryAfterMs ?? LIFECYCLE_RATE_LIMIT_WINDOW_MS;
+            res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': String(Math.ceil(retryAfterMs / 1000)) });
+            res.end(JSON.stringify({ ok: false, error: 'rate limit exceeded', retryAfterMs }));
+            return;
+          }
+        }
         const reservations = targetRecords.map((targetRecord, index) => {
           const item = items[index]!;
           return scheduleLifecycleTask(from, {

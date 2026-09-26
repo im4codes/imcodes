@@ -183,4 +183,33 @@ describe('hook-server exact session restart ingress', () => {
     expect(overflow.body).toMatchObject({ ok: false, error: 'rate limit exceeded' });
     expect(typeof overflow.body.retryAfterMs).toBe('number');
   }, 15_000);
+
+  it('rejects an over-capacity batch atomically without starting any target', async () => {
+    const brain = record('deck_project_brain');
+    const worker = record('deck_project_worker');
+    const workerTwo = record('deck_project_worker_two');
+    getSessionMock.mockImplementation((name: string) => [brain, worker, workerTwo].find((session) => session.name === name) ?? null);
+
+    for (let index = 0; index < 129; index += 1) {
+      await expect(postRestart(port, brain.name, {
+        from: brain.name,
+        to: worker.name,
+        reset: false,
+        idempotencyKey: `batch-fill-${index}`,
+      })).resolves.toMatchObject({ status: 202 });
+    }
+    const response = await postRestart(port, brain.name, {
+      from: brain.name,
+      targets: [
+        { target: worker.name, reset: false },
+        { target: workerTwo.name, reset: false },
+      ],
+    }, MEMORY_MCP_SESSION_RESTART_BATCH_HOOK_PATH);
+
+    expect(response.status).toBe(429);
+    expect(response.body).toMatchObject({ ok: false, error: 'rate limit exceeded' });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(restartSession).toHaveBeenCalledTimes(30);
+    expect(restartSession).not.toHaveBeenCalledWith(workerTwo.name, expect.anything());
+  }, 15_000);
 });
