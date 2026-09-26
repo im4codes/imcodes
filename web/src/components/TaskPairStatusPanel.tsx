@@ -138,6 +138,7 @@ export function TaskPairStatusPanel({ events, sessions }: { events: readonly Tim
               {taskStatus === 'rework' ? t('taskPair.status.rework_round', { round: payload.round ?? 1 }) : t(`taskPair.status.${taskStatus}`)}
             </span>
             {!queued && <span class="task-pair-status-round-badge">{t('taskPair.panel_round', { round: payload.round ?? 0 })}</span>}
+            {!queued && <span class="task-pair-status-round-badge task-pair-status-blocking-badge">{t('taskPair.blocking', { levels: Array.isArray(payload.blocking) ? payload.blocking.join(',') : 'P0' })}</span>}
             {queued && payload.urgent === true && <span class="task-pair-status-urgent">!</span>}
           </div>
           <strong class="task-pair-status-row-title">{queued && <em>#{Number(payload.queuePosition ?? index + 1)} </em>}{title}</strong>

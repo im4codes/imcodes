@@ -14,9 +14,12 @@ import {
   type TaskPairState,
   type TaskPairStatus,
 } from '../../../shared/task-pair.js';
-import { normalizeAuditBlockingSeverities } from '../../../shared/audit-convergence.js';
+import { normalizeAuditBlockingSeverities, type AuditSeverity } from '../../../shared/audit-convergence.js';
+import { resolveSupervisionAuditBlockingSeverities } from '../../../shared/supervision-config.js';
 import { isSupervisionPassVerdict } from '../../../shared/supervision-durable-identity.js';
 import type { SupervisionTaskSnapshot } from '../supervision-state-store.js';
+import { listSessions } from '../../store/session-store.js';
+import { resolveProjectAuthoritativeSupervisionSnapshot } from '../supervision-snapshot.js';
 import { getTaskPairStore, type StoredTaskPair } from './store.js';
 import { isPairsEngineProject, projectBrainSession } from './engine.js';
 import { sendTaskPairMessage } from './delivery.js';
@@ -71,7 +74,25 @@ function liveSession(task: SupervisionTaskSnapshot, roles: ReadonlyArray<'coordi
   return (live.at(-1) ?? task.assignments.filter((assignment) => roles.includes(assignment.role)).at(-1))?.identity.sessionName || undefined;
 }
 
-export function legacyTaskToPair(task: SupervisionTaskSnapshot, now: number): TaskPairState | undefined {
+/** Config the Brain has configured for this project, resolved once per import pass. */
+export function resolveLegacyImportProjectBlocking(projectName: string): AuditSeverity[] {
+  return resolveSupervisionAuditBlockingSeverities(
+    resolveProjectAuthoritativeSupervisionSnapshot(projectName, listSessions()),
+  );
+}
+
+/**
+ * A legacy task never carried its own blocking set (that concept postdates
+ * the legacy engine), so an imported pair's `blocking` always comes from the
+ * Brain's current config -- `projectBlocking` defaults to the P0-only
+ * fallback so direct unit tests of this pure function need not set up a
+ * session store.
+ */
+export function legacyTaskToPair(
+  task: SupervisionTaskSnapshot,
+  now: number,
+  projectBlocking: readonly AuditSeverity[] = normalizeAuditBlockingSeverities(undefined),
+): TaskPairState | undefined {
   const mapped = mapLegacyStatus(task.status, hasLegacyPassReceipt(task));
   if (!mapped) return undefined;
   const executor = liveSession(task, ['implementer', 'integration_owner']);
@@ -92,7 +113,8 @@ export function legacyTaskToPair(task: SupervisionTaskSnapshot, now: number): Ta
     flagSides: {},
     round: inAudit ? 1 : 0,
     ...(mapped.status === 'passed' ? { passRound: 1 } : {}),
-    blocking: normalizeAuditBlockingSeverities(undefined),
+    blocking: normalizeAuditBlockingSeverities(projectBlocking),
+    blockingSource: 'config',
     previousAuditors: [],
     capCounts: {},
     capRound: inAudit ? 1 : 0,
@@ -225,7 +247,7 @@ export function importLegacyTasks(
         }
         continue;
       }
-      const pair = legacyTaskToPair(task, now);
+      const pair = legacyTaskToPair(task, now, resolveLegacyImportProjectBlocking(task.projectName));
       if (!pair) continue;
       // Progress time 0: every imported pair gets one nudge on the next tick.
       store.savePair(task.projectName, pair, {

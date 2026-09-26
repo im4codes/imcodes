@@ -488,7 +488,107 @@ describe('task-pair marker ingestion', () => {
       marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: 'BLK2', attrs: { executor: EXEC, auditor: AUD, blocking: 'P0,P2' } },
       source: 'marker', now: Date.now(), eventId: 'blk-2',
     });
-    expect(pair('BLK2')?.blocking).toEqual(['P0', 'P2']);
+    expect(pair('BLK2')).toMatchObject({ blocking: ['P0', 'P2'], blockingSource: 'explicit' });
+  });
+
+  it('falls back to P0 when nothing is configured and no explicit blocking is given', () => {
+    service.applyMarker({
+      project: PROJECT, writer: BRAIN,
+      marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: 'BLK4', attrs: { executor: EXEC, auditor: AUD } },
+      source: 'marker', now: Date.now(), eventId: 'blk4-1',
+    });
+    expect(pair('BLK4')).toMatchObject({ blocking: ['P0'], blockingSource: 'config' });
+  });
+
+  it('an explicit blocking=P0,P1,P2 on DISPATCH overrides a Brain config of just P0', () => {
+    upsertSession({
+      ...session(BRAIN, 'brain'),
+      transportConfig: { supervision: normalizeSessionSupervisionSnapshot({ auditBlockingSeverities: ['P0'] }) },
+    } as SessionRecord);
+    service.applyMarker({
+      project: PROJECT, writer: BRAIN,
+      marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: 'BLK3', attrs: { executor: EXEC, auditor: AUD, blocking: 'P0,P1,P2' } },
+      source: 'marker', now: Date.now(), eventId: 'blk3-1',
+    });
+    expect(pair('BLK3')).toMatchObject({ blocking: ['P0', 'P1', 'P2'], blockingSource: 'explicit' });
+  });
+
+  it('the QUEUE creation path also carries the Brain-configured blocking set', () => {
+    upsertSession({
+      ...session(BRAIN, 'brain'),
+      transportConfig: { supervision: normalizeSessionSupervisionSnapshot({ auditBlockingSeverities: ['P1'] }) },
+    } as SessionRecord);
+    service.applyMarker({
+      project: PROJECT, writer: BRAIN,
+      marker: { verb: 'QUEUE', knownVerb: 'QUEUE', taskId: 'BLKQ', attrs: { title: 'queued task' } },
+      source: 'marker', now: Date.now(), eventId: 'blkq-1',
+    });
+    expect(pair('BLKQ')).toMatchObject({ status: 'queued', blocking: ['P1'], blockingSource: 'config' });
+  });
+
+  it('rejects a PASS carrying a finding at a Brain-configured (non-P0) blocking level', () => {
+    upsertSession({
+      ...session(BRAIN, 'brain'),
+      transportConfig: { supervision: normalizeSessionSupervisionSnapshot({ auditBlockingSeverities: ['P0', 'P1'] }) },
+    } as SessionRecord);
+    service.applyMarker({
+      project: PROJECT, writer: BRAIN,
+      marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: 'BLKPASS', attrs: { executor: EXEC, auditor: AUD } },
+      source: 'marker', now: Date.now(), eventId: 'blkpass-1',
+    });
+    service.applyMarker({
+      project: PROJECT, writer: EXEC,
+      marker: { verb: 'READY_FOR_AUDIT', knownVerb: 'READY_FOR_AUDIT', taskId: 'BLKPASS', attrs: { worktree: '/w', head: 'h1', base: 'b1' } },
+      source: 'marker', now: Date.now(), eventId: 'blkpass-2',
+    });
+    expect(pair('BLKPASS')?.status).toBe('in_audit');
+    const transition = service.applyMarker({
+      project: PROJECT, writer: AUD,
+      marker: { verb: 'PASS', knownVerb: 'PASS', taskId: 'BLKPASS', attrs: { blocking: 'P0,P1', p1: '1' } },
+      source: 'marker', now: Date.now(), eventId: 'blkpass-3',
+    });
+    expect(transition.verdict?.judgement).toBe('inconsistent');
+    expect(pair('BLKPASS')?.status).toBe('in_audit');
+  });
+
+  it('a Brain config change updates a config-derived open pair at its next round, but never an explicit one', () => {
+    upsertSession({
+      ...session(BRAIN, 'brain'),
+      transportConfig: { supervision: normalizeSessionSupervisionSnapshot({ auditBlockingSeverities: ['P0'] }) },
+    } as SessionRecord);
+    service.applyMarker({
+      project: PROJECT, writer: BRAIN,
+      marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: 'BLKCFG', attrs: { executor: EXEC, auditor: AUD } },
+      source: 'marker', now: Date.now(), eventId: 'blkcfg-1',
+    });
+    service.applyMarker({
+      project: PROJECT, writer: BRAIN,
+      marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: 'BLKEXP', attrs: { executor: EXEC, auditor: AUD, blocking: 'P2' } },
+      source: 'marker', now: Date.now(), eventId: 'blkexp-1',
+    });
+    expect(pair('BLKCFG')).toMatchObject({ blocking: ['P0'], blockingSource: 'config' });
+    expect(pair('BLKEXP')).toMatchObject({ blocking: ['P2'], blockingSource: 'explicit' });
+
+    // The Brain raises its configured blocking set.
+    upsertSession({
+      ...session(BRAIN, 'brain'),
+      transportConfig: { supervision: normalizeSessionSupervisionSnapshot({ auditBlockingSeverities: ['P0', 'P1'] }) },
+    } as SessionRecord);
+
+    // Both pairs start a new round.
+    service.applyMarker({
+      project: PROJECT, writer: EXEC,
+      marker: { verb: 'READY_FOR_AUDIT', knownVerb: 'READY_FOR_AUDIT', taskId: 'BLKCFG', attrs: { worktree: '/w', head: 'h1', base: 'b1' } },
+      source: 'marker', now: Date.now(), eventId: 'blkcfg-2',
+    });
+    service.applyMarker({
+      project: PROJECT, writer: EXEC,
+      marker: { verb: 'READY_FOR_AUDIT', knownVerb: 'READY_FOR_AUDIT', taskId: 'BLKEXP', attrs: { worktree: '/w', head: 'h1', base: 'b1' } },
+      source: 'marker', now: Date.now(), eventId: 'blkexp-2',
+    });
+
+    expect(pair('BLKCFG')).toMatchObject({ blocking: ['P0', 'P1'], blockingSource: 'config' });
+    expect(pair('BLKEXP')).toMatchObject({ blocking: ['P2'], blockingSource: 'explicit' });
   });
 
   it('hides marker lines from displayed assistant text', async () => {
