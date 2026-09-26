@@ -262,6 +262,20 @@ describe('task-pair heartbeat, replacement and queue', () => {
       expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
     });
 
+    it('re-arms after activity at the exact fast-nudge timestamp', async () => {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH FAST5_EQUAL executor=${EXEC} auditor=${AUD} -->`);
+      await flush();
+      sent = [];
+      await bothIdleCheck(4);
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
+      // Deliberately use the exact same millisecond as the nudge. Equality
+      // must not be mistaken for the original idle spell.
+      taskPairService.recordActivity(EXEC, now);
+      sent = [];
+      await bothIdleCheck(4);
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
+    });
+
     it('counts the fast nudge toward the existing silence escalation and continues the 6-minute heartbeat cadence', async () => {
       marker(BRAIN, `<!-- IMCODES_TASK DISPATCH FAST6 executor=${EXEC} auditor=${AUD} -->`);
       await flush();

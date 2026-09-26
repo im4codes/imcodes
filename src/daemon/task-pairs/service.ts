@@ -591,11 +591,13 @@ export class TaskPairService {
       liveness.progressExecutorAt = now;
       liveness.activityExecutorAt = now;
       liveness.silenceExecutor = 0;
+      liveness.bothIdleNudgedAt = undefined;
     }
     if (pair.state.auditor === writer) {
       liveness.progressAuditorAt = now;
       liveness.activityAuditorAt = now;
       liveness.silenceAuditor = 0;
+      liveness.bothIdleNudgedAt = undefined;
     }
     getTaskPairStore().saveLiveness(pair.project, pair.state.taskId, liveness);
   }
@@ -605,10 +607,12 @@ export class TaskPairService {
     if (pair.state.executor === writer) {
       liveness.activityExecutorAt = now;
       liveness.silenceExecutor = 0;
+      liveness.bothIdleNudgedAt = undefined;
     }
     if (pair.state.auditor === writer) {
       liveness.activityAuditorAt = now;
       liveness.silenceAuditor = 0;
+      liveness.bothIdleNudgedAt = undefined;
     }
     getTaskPairStore().saveLiveness(pair.project, pair.state.taskId, liveness);
   }
@@ -626,6 +630,7 @@ export class TaskPairService {
     if (role === 'auditor') { next.progressAuditorAt = now; next.silenceAuditor = 0; }
     if (role === 'executor') next.activityExecutorAt = now;
     if (role === 'auditor') next.activityAuditorAt = now;
+    next.bothIdleNudgedAt = undefined;
     // A new auditor starts with a clean slate.
     if (transition.effect === 'reassigned_auditor') {
       next.silenceAuditor = 0;
