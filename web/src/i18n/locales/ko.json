@@ -3120,6 +3120,8 @@
       "processingModelLabel": "모델",
       "processingModelPresetTitle": "모델은 활성 프리셋이 정합니다. 다른 모델을 선택하려면 프리셋을 지우세요.",
       "processingModelDefinedByPreset": "(프리셋에서 정의됨)",
+      "processingModelFallbackBadge": "폴백",
+      "processingModelFallbackHint": "내장된 폴백 목록을 표시하고 있습니다 — 실시간 모델 카탈로그에 연결할 수 없습니다.",
       "relativeLessThanOneMinute": "1분 미만 전",
       "relativeMinutesAgo": "{{count}}분 전",
       "relativeHoursAgo": "{{count}}시간 전",

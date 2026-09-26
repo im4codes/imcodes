@@ -3113,6 +3113,8 @@
       "processingModelLabel": "模型",
       "processingModelPresetTitle": "模型由目前預設決定；清除預設後才能選擇其他模型。",
       "processingModelDefinedByPreset": "（由預設定義）",
+      "processingModelFallbackBadge": "回退清單",
+      "processingModelFallbackHint": "目前顯示內建回退清單——無法連線即時模型目錄。",
       "relativeLessThanOneMinute": "不到 1 分鐘前",
       "relativeMinutesAgo": "{{count}} 分鐘前",
       "relativeHoursAgo": "{{count}} 小時前",

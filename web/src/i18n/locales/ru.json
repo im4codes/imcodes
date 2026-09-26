@@ -3120,6 +3120,8 @@
       "processingModelLabel": "Модель",
       "processingModelPresetTitle": "Модель задается активным пресетом. Очистите пресет, чтобы выбрать другую.",
       "processingModelDefinedByPreset": "(задано пресетом)",
+      "processingModelFallbackBadge": "Резервный",
+      "processingModelFallbackHint": "Показан встроенный резервный список — не удалось получить актуальный каталог моделей.",
       "relativeLessThanOneMinute": "<1 мин назад",
       "relativeMinutesAgo": "{{count}} мин назад",
       "relativeHoursAgo": "{{count}} ч назад",

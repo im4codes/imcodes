@@ -3113,6 +3113,8 @@
       "processingModelLabel": "Model",
       "processingModelPresetTitle": "Model is set by the active preset. Clear the preset to pick another.",
       "processingModelDefinedByPreset": "(defined by preset)",
+      "processingModelFallbackBadge": "Fallback",
+      "processingModelFallbackHint": "Showing the built-in fallback list — the live model catalog could not be reached.",
       "relativeLessThanOneMinute": "<1m ago",
       "relativeMinutesAgo": "{{count}}m ago",
       "relativeHoursAgo": "{{count}}h ago",

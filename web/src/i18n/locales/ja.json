@@ -3120,6 +3120,8 @@
       "processingModelLabel": "モデル",
       "processingModelPresetTitle": "モデルは有効なプリセットで決まります。別のモデルを選ぶにはプリセットを解除してください。",
       "processingModelDefinedByPreset": "（プリセットで定義）",
+      "processingModelFallbackBadge": "フォールバック",
+      "processingModelFallbackHint": "組み込みのフォールバック一覧を表示しています——最新のモデルカタログに接続できませんでした。",
       "relativeLessThanOneMinute": "1分未満前",
       "relativeMinutesAgo": "{{count}}分前",
       "relativeHoursAgo": "{{count}}時間前",

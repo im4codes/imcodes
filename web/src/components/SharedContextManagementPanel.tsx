@@ -19,7 +19,7 @@ import {
   type MemoryMcpToolFamilyGateView,
 } from '@shared/memory-ws.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
-import { CC_PRESET_MSG } from '@shared/cc-presets.js';
+import { CC_PRESET_MSG, CUSTOM_PROVIDER_SDK_AGENT_TYPES } from '@shared/cc-presets.js';
 import {
   MEMORY_MANAGEMENT_ERROR_CODES,
   type MemoryFeatureAdminRecord,
@@ -101,7 +101,7 @@ import { AgentSkillsPanel } from './AgentSkillsPanel.js';
 import { AgentMcpPanel } from './AgentMcpPanel.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
 import type { WsClient } from '../ws-client.js';
-import { useTransportModels } from '../hooks/useTransportModels.js';
+import { supportsDynamicTransportModels, useTransportModels } from '../hooks/useTransportModels.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, mergeModelSuggestions } from '../../../src/shared/models/options.js';
 import type { MemoryScoringWeights } from '@shared/memory-scoring.js';
 
@@ -1367,17 +1367,13 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   const [processingPresets, setProcessingPresets] = useState<RuntimeModelPresetEntry[]>([]);
   const processingPrimaryDynamicModels = useTransportModels(
     ws ?? null,
-    processingPrimaryPreset && doesSharedContextBackendSupportPresets(processingPrimaryBackend)
-      ? processingPrimaryBackend
-      : null,
-    processingPrimaryPreset || undefined,
+    supportsDynamicTransportModels(processingPrimaryBackend) ? processingPrimaryBackend : null,
+    CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(processingPrimaryBackend) ? (processingPrimaryPreset || undefined) : undefined,
   );
   const processingBackupDynamicModels = useTransportModels(
     ws ?? null,
-    processingBackupPreset && doesSharedContextBackendSupportPresets(processingBackupBackend)
-      ? processingBackupBackend
-      : null,
-    processingBackupPreset || undefined,
+    supportsDynamicTransportModels(processingBackupBackend) ? processingBackupBackend : null,
+    CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(processingBackupBackend) ? (processingBackupPreset || undefined) : undefined,
   );
   const processingPrimaryModelOptions = useMemo(() => mergeModelSuggestions(
     processingPrimaryPreset ? [] : (PROCESSING_MODEL_OPTIONS_BY_BACKEND[processingPrimaryBackend] ?? []),
@@ -3657,6 +3653,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                         preset={processingPrimaryPreset}
                         presets={processingPresets}
                         modelOptions={processingPrimaryModelOptions}
+                        isFallbackModelList={processingPrimaryDynamicModels.models.length === 0}
                         idPrefix="primary"
                         onChange={({ model, preset }) => {
                           setProcessingPrimaryModel(model);
@@ -3692,6 +3689,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                         preset={processingBackupPreset}
                         presets={processingPresets}
                         modelOptions={processingBackupModelOptions}
+                        isFallbackModelList={processingBackupDynamicModels.models.length === 0}
                         idPrefix="backup"
                         onChange={({ model, preset }) => {
                           setProcessingBackupModel(model);

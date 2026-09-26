@@ -3121,6 +3121,8 @@
       "processingModelLabel": "Modelo",
       "processingModelPresetTitle": "El modelo lo fija el preajuste activo. Borra el preajuste para elegir otro.",
       "processingModelDefinedByPreset": "(definido por el preajuste)",
+      "processingModelFallbackBadge": "Reserva",
+      "processingModelFallbackHint": "Mostrando la lista de reserva integrada: no se pudo contactar el catálogo de modelos en vivo.",
       "relativeLessThanOneMinute": "hace <1 min",
       "relativeMinutesAgo": "hace {{count}} min",
       "relativeHoursAgo": "hace {{count}} h",

@@ -354,6 +354,7 @@ function SupervisionRuntimeFields({
   presets,
   timeoutSeconds,
   modelOptions,
+  isFallbackModelList = false,
   idPrefix,
   onBackendChange,
   onModelChange,
@@ -368,6 +369,7 @@ function SupervisionRuntimeFields({
   presets: readonly CcPresetSummary[];
   timeoutSeconds?: number;
   modelOptions: readonly string[];
+  isFallbackModelList?: boolean;
   idPrefix: string;
   onBackendChange: (backend: string) => void;
   onModelChange: (model: string) => void;
@@ -443,6 +445,7 @@ function SupervisionRuntimeFields({
           preset={preset}
           presets={presets}
           modelOptions={modelOptions}
+          isFallbackModelList={isFallbackModelList}
           onChange={onRuntimeChange}
           idPrefix={idPrefix}
           disabled={saving}
@@ -1543,6 +1546,7 @@ export function SessionSettingsDialog({
           presets={ccPresets}
           timeoutSeconds={supervisorDefaultsTimeoutSeconds}
           modelOptions={supervisorDefaultsModelOptions}
+          isFallbackModelList={supervisorDefaultsDynamicModels.models.length === 0}
           idPrefix="supervision-defaults"
           onBackendChange={(nextBackend) => {
             updateSupervisorDefaultsFromUser((prev) => ({ ...prev, ...updateRuntimeDraft(prev, nextBackend) }));
@@ -1567,6 +1571,7 @@ export function SessionSettingsDialog({
             preset={supervisorDefaultsBackupPreset}
             presets={ccPresets}
             modelOptions={supervisorDefaultsBackupModelOptions}
+            isFallbackModelList={supervisorDefaultsBackupDynamicModels.models.length === 0}
             idPrefix="supervision-defaults-backup"
             onBackendChange={(nextBackend) => {
               updateSupervisorDefaultsFromUser((prev) => {

@@ -28,6 +28,7 @@ export function RuntimeModelPresetSelector({
   onChange,
   idPrefix,
   disabled = false,
+  isFallbackModelList = false,
 }: {
   backend: SharedContextRuntimeBackend;
   model: string;
@@ -37,6 +38,8 @@ export function RuntimeModelPresetSelector({
   onChange: (next: { model: string; preset: string }) => void;
   idPrefix: string;
   disabled?: boolean;
+  /** True when `modelOptions` is the static fallback list, not the live SDK/provider catalog. */
+  isFallbackModelList?: boolean;
 }) {
   const { t } = useTranslation();
   const supportsPresets = doesSharedContextBackendSupportPresets(backend);
@@ -91,7 +94,18 @@ export function RuntimeModelPresetSelector({
       ) : null}
 
       <label style={fieldStyle}>
-        <span style={dimensionLabelStyle}>{t('sharedContext.management.processingModelLabel')}</span>
+        <span style={dimensionLabelStyle}>
+          {t('sharedContext.management.processingModelLabel')}
+          {isFallbackModelList && (
+            <span
+              data-testid={`${idPrefix}-model-fallback-badge`}
+              title={t('sharedContext.management.processingModelFallbackHint')}
+              style={fallbackBadgeStyle}
+            >
+              {t('sharedContext.management.processingModelFallbackBadge')}
+            </span>
+          )}
+        </span>
         <select
           class="input"
           aria-label={`${idPrefix}:model`}
@@ -135,4 +149,16 @@ const fieldStyle = {
   display: 'flex',
   flexDirection: 'column',
   minWidth: 0,
+} as const;
+
+const fallbackBadgeStyle = {
+  marginLeft: 6,
+  fontSize: 9,
+  fontWeight: 700,
+  letterSpacing: '0.05em',
+  textTransform: 'uppercase',
+  color: '#b45309',
+  border: '1px solid #b45309',
+  borderRadius: 4,
+  padding: '1px 4px',
 } as const;
