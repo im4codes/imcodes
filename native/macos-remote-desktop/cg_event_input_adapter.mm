@@ -241,10 +241,10 @@ std::uint64_t ComposeInjectedModifierFlags(
   for (std::size_t index = 0; index < common::kLatchableModifierCount; ++index) {
     const common::LatchableModifier &modifier = common::kLatchableModifiers[index];
     const ModifierBits &bits = kModifierBits[index];
-    for (const std::string &key : held_modifier_keys) {
-      if (key == modifier.left)
+    for (const std::string &held : held_modifier_keys) {
+      if (held == modifier.left)
         flags |= static_cast<std::uint64_t>(bits.mask) | bits.left;
-      else if (key == modifier.right)
+      else if (held == modifier.right)
         flags |= static_cast<std::uint64_t>(bits.mask) | bits.right;
     }
   }
