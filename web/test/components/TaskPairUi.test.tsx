@@ -121,7 +121,9 @@ describe('TaskPairStatusPanel', () => {
     expect(screen.queryByText('CC2 (deck_sub_a)')).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: /taskPair.panel_title/ }));
     expect(screen.queryByText('Build panel')).toBeNull();
-    expect(screen.getByText(/taskPair.panel_counts/)).toBeTruthy();
+    expect(screen.getByText(/taskPair.panel_count_working/)).toBeTruthy();
+    expect(screen.getByText(/taskPair.panel_count_audit/)).toBeTruthy();
+    expect(screen.getByText(/taskPair.panel_count_queued/)).toBeTruthy();
     expect(window.localStorage.getItem('imcodes.task-pair-status-panel.collapsed')).toBe('1');
   });
 
@@ -276,7 +278,9 @@ describe('TaskPairStatusPanel', () => {
     ] as never;
     const { container } = render(<TaskPairStatusPanel events={events} />);
     // 'working' + 'rework' both count toward the header's "working" bucket.
-    expect(screen.getByText(/taskPair.panel_counts:.*"working":3/)).toBeTruthy();
+    expect(screen.getByText('taskPair.panel_count_working:{"count":3}')).toBeTruthy();
+    expect(screen.getByText('taskPair.panel_count_audit:{"count":1}')).toBeTruthy();
+    expect(screen.getByText('taskPair.panel_count_queued:{"count":1}')).toBeTruthy();
     const groupCount = (key: string) => Number(container.querySelector(`.task-pair-status-group-${key} small`)?.textContent?.replace(/[()]/g, '') ?? 0);
     expect(groupCount('working') + groupCount('rework')).toBe(3);
     expect(groupCount('audit')).toBe(1);
@@ -300,6 +304,62 @@ describe('TaskPairStatusPanel', () => {
       expect(navigate).not.toHaveBeenCalledWith('none');
     } finally {
       window.removeEventListener('deck:navigate', listener);
+    }
+  });
+
+  it('gives every card the same task-pair-chip--STATUS class its badge uses, so both share one colour token instead of a duplicated palette', () => {
+    for (const toStatus of TASK_PAIR_STATUSES) {
+      const { container } = render(<TaskPairStatusPanel events={[{
+        eventId: `badge-${toStatus}`, type: 'task_pair.event', ts: Date.now(),
+        payload: { taskId: `B-${toStatus}`, title: 'Badge task', toStatus, executor: 'deck_sub_b' },
+      }] as never} />);
+      const row = container.querySelector('.task-pair-status-row')!;
+      expect(row.classList.contains(`task-pair-chip--${toStatus}`), toStatus).toBe(true);
+      const badge = row.querySelector('.task-pair-status-badge')!;
+      expect(badge.classList.contains(`task-pair-chip--${toStatus}`), toStatus).toBe(true);
+      cleanup();
+    }
+  });
+
+  it('replaces the retired single-string header counts with three separate status badges', () => {
+    render(<TaskPairStatusPanel events={[{
+      eventId: 'header-badges', type: 'task_pair.event', ts: Date.now(),
+      payload: { taskId: 'HB1', title: 'Header badges', toStatus: 'working' },
+    }] as never} />);
+    expect(screen.getByText(/taskPair.panel_count_working/)).toBeTruthy();
+    expect(screen.getByText(/taskPair.panel_count_audit/)).toBeTruthy();
+    expect(screen.getByText(/taskPair.panel_count_queued/)).toBeTruthy();
+    expect(screen.queryByText(/taskPair.panel_counts(?!:)/)).toBeNull();
+  });
+
+  it('derives the panel width, .chat-view padding-right, and the pinned "last sent" margin-right from one shared token, so they can never drift apart again', () => {
+    const css = readCss();
+    const varRef = (rule: string) => /var\(\s*(--[\w-]+)/.exec(rule)?.[1];
+    const panelRule = cssRule(css, '.task-pair-status-panel');
+    // Both the panel's own max-width and its min()-clamped width must read the
+    // same token as .chat-view and the last-sent banner below -- a flat
+    // literal (or a different vw-based formula) here is exactly the bug this
+    // guards against: the panel and its neighbours silently disagreeing on
+    // how wide the panel actually renders.
+    expect(varRef(/max-width:\s*([^;]+);/.exec(panelRule)?.[1] ?? '')).toBe('--task-pair-panel-width');
+    expect(varRef(/width:\s*([^;]+);/.exec(panelRule)?.[1] ?? '')).toBe('--task-pair-panel-width');
+    const chatViewRule = /\.chat-view-wrap:has\(\.task-pair-status-panel\) \.chat-view \{([^}]*)\}/.exec(css)?.[1] ?? '';
+    const lastSentRule = /\.chat-view-wrap:has\(\.task-pair-status-panel\) \.chat-pinned-last-sent \{([^}]*)\}/.exec(css)?.[1] ?? '';
+    expect(varRef(chatViewRule)).toBe('--task-pair-panel-width');
+    expect(varRef(lastSentRule)).toBe('--task-pair-panel-width');
+    const rootVars = new Set([...cssRule(css, ':root').matchAll(/--([\w-]+):/g)].map((match) => match[1]));
+    expect(rootVars.has('task-pair-panel-width')).toBe(true);
+  });
+
+  it('has every new badge/count-count i18n key in all seven locales, and no leftover panel_counts key', () => {
+    const WEB = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
+    for (const locale of ['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko']) {
+      const taskPair = (JSON.parse(readFileSync(join(WEB, 'src/i18n/locales', `${locale}.json`), 'utf8')) as { taskPair: Record<string, string> }).taskPair;
+      for (const key of ['panel_count_working', 'panel_count_audit', 'panel_count_queued']) {
+        expect(taskPair[key], `${locale}.${key}`).toBeTruthy();
+        expect(taskPair[key], `${locale}.${key}`).toContain('{{count}}');
+      }
+      expect(taskPair.panel_counts, `${locale}.panel_counts should be removed`).toBeUndefined();
     }
   });
 });

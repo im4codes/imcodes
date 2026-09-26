@@ -33,6 +33,7 @@ html { position: fixed; }
   --status-active-bg: rgba(8, 145, 178, 0.1);
   --status-audit-text: #93c5fd;
   --status-audit-border: rgba(96, 165, 250, 0.48);
+  --status-audit-bg: rgba(59, 130, 246, 0.1);
   --status-pass-text: #6ee7b7;
   --status-pass-border: rgba(52, 211, 153, 0.48);
   --status-rework-text: #fcd34d;
@@ -44,6 +45,10 @@ html { position: fixed; }
   --status-cancelled-border: rgba(248, 113, 113, 0.3);
   /* The desktop vertical rail is one compact bottom sub-session card wide. */
   --subsession-compact-card-width: 54px;
+  /* Single source of truth for the task-pair panel's desktop width, so its
+     own width and every sibling's reserved space (.chat-view padding-right,
+     .chat-pinned-last-sent margin-right) can never drift apart again. */
+  --task-pair-panel-width: 300px;
   /* Team progress needs readable topics/status while remaining much narrower
      than the existing sidebar or a floating panel. */
   --team-discussion-rail-width: clamp(184px, 17vw, 220px);
@@ -14434,7 +14439,7 @@ button.quick-agent-delegation-preset.active {
 .task-pair-chip { border-left: 2px solid var(--task-pair-status-border, transparent); }
 .task-pair-chip--queued { --task-pair-status-text: var(--supervision-idle-text); }
 .task-pair-chip--working { --task-pair-status-text: var(--status-active-text); --task-pair-status-border: var(--status-active-border); --task-pair-status-bg: var(--status-active-bg); }
-.task-pair-chip--in_audit { --task-pair-status-text: var(--status-audit-text); --task-pair-status-border: var(--status-audit-border); }
+.task-pair-chip--in_audit { --task-pair-status-text: var(--status-audit-text); --task-pair-status-border: var(--status-audit-border); --task-pair-status-bg: var(--status-audit-bg); }
 .task-pair-chip--awaiting_audit { --task-pair-status-text: var(--supervision-waiting-text); --task-pair-status-border: var(--supervision-waiting-border); --task-pair-status-bg: var(--supervision-waiting-bg); }
 .task-pair-chip--rework { --task-pair-status-text: var(--status-rework-text); --task-pair-status-border: var(--status-rework-border); }
 .task-pair-chip--passed { --task-pair-status-text: var(--status-pass-text); --task-pair-status-border: var(--status-pass-border); }
@@ -14464,9 +14469,8 @@ button.quick-agent-delegation-preset.active {
  * clicks meant for those toolbar buttons.
  */
 .task-pair-status-panel {
-  position: absolute; z-index: 12; top: 40px; right: 0; bottom: 0; width: min(300px, 30vw); max-width: 300px;
-  width: min(300px, 100%);
-  max-width: 300px;
+  position: absolute; z-index: 12; top: 40px; right: 0; bottom: 0;
+  width: min(var(--task-pair-panel-width), 100%); max-width: var(--task-pair-panel-width);
   margin-left: auto;
   background: color-mix(in srgb, var(--chrome-panel-2, var(--chrome-panel)) 92%, var(--chrome-accent) 8%);
   border-left: 1px solid var(--status-info-border, var(--chrome-accent));
@@ -14479,28 +14483,68 @@ button.quick-agent-delegation-preset.active {
   flex-direction: column;
   min-height: 0;
 }
-.chat-view-wrap:has(.task-pair-status-panel) .chat-view { padding-right: min(312px, calc(30vw + 12px)); }
+.chat-view-wrap:has(.task-pair-status-panel) .chat-view { padding-right: calc(var(--task-pair-panel-width) + 12px); }
+/* The pinned "last sent" banner is a flow sibling of the panel (not inside
+   .chat-view), so the .chat-view padding-right above never reaches it -- it
+   still spans the full wrap width and its right edge sits under the panel.
+   Reserve the same width here so the banner and the panel never overlap. */
+.chat-view-wrap:has(.task-pair-status-panel) .chat-pinned-last-sent { margin-right: calc(var(--task-pair-panel-width) + 12px); }
 @media (max-width: 720px) {
   .task-pair-status-panel { position: relative; inset: auto; width: 100%; max-width: none; max-height: 42vh; }
   .chat-view-wrap:has(.task-pair-status-panel) .chat-view { padding-right: 12px; }
+  .chat-view-wrap:has(.task-pair-status-panel) .chat-pinned-last-sent { margin-right: 10px; }
 }
 .task-pair-status-toggle {
   width: 100%; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 4px 8px;
   padding: 8px; color: inherit; background: transparent; border: 0; text-align: left; flex-shrink: 0;
 }
-.task-pair-status-toggle strong,
-.task-pair-status-toggle span { min-width: 0; overflow-wrap: anywhere; }
+.task-pair-status-toggle strong { min-width: 0; overflow-wrap: anywhere; }
+.task-pair-status-summary { display: flex; flex-wrap: wrap; gap: 4px; min-width: 0; }
 .task-pair-status-rows { flex: 1; min-height: 0; overflow-y: auto; padding: 0 8px 8px; }
-.task-pair-status-group { margin: 0 0 4px; }
-.task-pair-status-group h4 { margin: 5px 0 0; padding-top: 3px; border-top: 1px solid color-mix(in srgb, currentColor 22%, transparent); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; opacity: .78; }
-.task-pair-status-group h4 small { font-family: ui-monospace, SFMono-Regular, monospace; opacity: .7; }
+.task-pair-status-group { margin: 0 0 6px; }
+.task-pair-status-group h4 { display: flex; align-items: center; gap: 5px; margin: 6px 0 0; padding-top: 3px; border-top: 1px solid color-mix(in srgb, currentColor 22%, transparent); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; opacity: .78; }
+.task-pair-status-group h4 small { display: inline-flex; align-items: center; justify-content: center; min-width: 15px; height: 15px; padding: 0 4px; border-radius: 999px; background: color-mix(in srgb, currentColor 16%, transparent); font-family: ui-monospace, SFMono-Regular, monospace; font-size: 9px; opacity: .85; }
 .task-pair-status-urgent { display: inline-block; width: 14px; margin-left: 4px; border-radius: 3px; color: var(--status-error-text, #f87171); border: 1px solid currentColor; text-align: center; font-weight: 700; }
-.task-pair-status-row { display: grid; gap: 2px; padding: 6px 0; border-top: 1px solid color-mix(in srgb, currentColor 18%, transparent); font-size: 11px; }
-.task-pair-status-row strong { overflow: visible; text-overflow: clip; white-space: normal; overflow-wrap: anywhere; }
-.task-pair-status-row small { opacity: .62; }
-.task-pair-status-row span { color: var(--status-info-text, #67e8f9); }
-.task-pair-status-session { margin-right: 6px; padding: 0; border: 0; background: transparent; color: inherit; text-decoration: underline; cursor: pointer; font: inherit; font-size: 10px; }
-.task-pair-status-dot { display: inline-block; width: 5px; height: 5px; margin: 0 3px 1px 0; border-radius: 50%; background: var(--supervision-idle-text, #94a3b8); }
+
+/* Each pair is a card: a subtle tinted border + soft glow that echoes its
+   own status colour (via --task-pair-status-* from .task-pair-chip--STATUS,
+   reused rather than duplicated), with a hover lift for affordance. */
+.task-pair-status-row {
+  display: grid; gap: 4px; margin: 6px 0 0; padding: 8px 9px; border-radius: 10px; font-size: 11px;
+  background: color-mix(in srgb, var(--task-pair-status-border, var(--border-color, rgba(128, 128, 128, 0.35))) 7%, var(--chrome-panel, #0d1422) 93%);
+  border: 1px solid color-mix(in srgb, var(--task-pair-status-border, var(--border-color, rgba(128, 128, 128, 0.35))) 45%, transparent);
+  box-shadow: 0 1px 0 rgba(0, 0, 0, 0.18);
+  transition: border-color .15s, box-shadow .15s, background .15s;
+}
+.task-pair-status-row:hover {
+  border-color: color-mix(in srgb, var(--task-pair-status-border, var(--chrome-accent)) 75%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--task-pair-status-border, var(--chrome-accent)) 30%, transparent), 0 2px 10px color-mix(in srgb, var(--task-pair-status-border, var(--chrome-accent)) 16%, transparent);
+}
+.task-pair-status-row-head { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; }
+.task-pair-status-row-title { overflow: visible; text-overflow: clip; white-space: normal; overflow-wrap: anywhere; }
+.task-pair-status-row-roles small { opacity: .7; }
+.task-pair-status-row-meta { display: flex; align-items: center; gap: 4px; opacity: .62; }
+.task-pair-status-row-meta-icon { font-size: 9px; opacity: .85; }
+.task-pair-status-row-roles { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+
+/* Pill status badge: one colour per pair status, sourced from the same
+   --task-pair-status-text/border/bg custom properties the event-chip
+   classes (.task-pair-chip--STATUS) already set, so the colour system is
+   defined exactly once and shared across both UIs. */
+.task-pair-status-badge {
+  display: inline-flex; align-items: center; gap: 4px; padding: 2px 7px; border-radius: 999px; font-size: 10px; font-weight: 600; line-height: 1.5;
+  color: var(--task-pair-status-text, inherit);
+  border: 1px solid var(--task-pair-status-border, var(--border-color, rgba(128, 128, 128, 0.35)));
+  background: var(--task-pair-status-bg, color-mix(in srgb, var(--task-pair-status-text, currentColor) 14%, transparent));
+}
+.task-pair-status-badge--sm { padding: 1px 6px; font-size: 9px; }
+.task-pair-status-badge-dot { display: inline-block; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+.task-pair-status-round-badge { padding: 1px 6px; border-radius: 999px; border: 1px solid color-mix(in srgb, currentColor 30%, transparent); font-size: 9px; font-family: ui-monospace, SFMono-Regular, monospace; opacity: .75; }
+
+.task-pair-role-chip { display: inline-flex; align-items: center; gap: 4px; padding: 1px 7px; border-radius: 999px; border: 1px solid color-mix(in srgb, currentColor 20%, transparent); background: color-mix(in srgb, var(--chrome-accent, #22d3ee) 6%, transparent); font-size: 10px; }
+.task-pair-role-chip--muted { opacity: .6; font-style: italic; border-style: dashed; }
+.task-pair-status-session { margin: 0; padding: 0; border: 0; background: transparent; color: inherit; text-decoration: underline; cursor: pointer; font: inherit; font-size: 10px; }
+.task-pair-status-dot { display: inline-block; width: 5px; height: 5px; margin: 0 1px 1px 0; border-radius: 50%; background: var(--supervision-idle-text, #94a3b8); }
 .task-pair-status-dot.is-running { background: var(--status-active-text, #4ade80); box-shadow: 0 0 5px var(--status-active-text, #4ade80); animation: task-pair-status-pulse 1.4s ease-in-out infinite; }
 @keyframes task-pair-status-pulse { 50% { opacity: .45; } }
 
