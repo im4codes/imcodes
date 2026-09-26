@@ -258,7 +258,7 @@ describe('pairs that stopped driving themselves (215 / jdzj)', () => {
     // Every due pair of the idle session is nudged in the same heartbeat.
     expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(7);
     expect(new Set(sentTo(EXEC, 'nudge-executor').map((entry) => entry.id.split(':')[1]))).toEqual(new Set(ids));
-    expect(sentTo(EXEC, 'nudge-executor')[0]?.text).toContain('commit/push');
+    expect(sentTo(EXEC, 'nudge-executor')[0]?.text).toContain('commit locally');
 
     // The executor finishes P3 (and says so); its other pairs stay silent.
     now += 1;
@@ -455,10 +455,10 @@ describe('pairs that stopped driving themselves (215 / jdzj)', () => {
     // Visible on the timelines of the participants.
     expect(timeline.filter((entry) => entry.payload.verb === 'CORRECT' && entry.payload.taskId === 'tsk_plain').map((entry) => entry.sessionId).sort())
       .toEqual([BRAIN, EXEC].sort());
-    // The stale "PASS received: commit/push" expectation is withdrawn; Brain gets one line.
+    // The stale "PASS received: local commit" expectation is withdrawn; Brain gets one line.
     const correctionMessages = sentTo(EXEC, 'import-correction');
     expect(correctionMessages.map((entry) => entry.id.split(':')[1]).sort()).toEqual(['tsk_plain', 'tsk_reassigned']);
-    expect(correctionMessages[0]!.text).toContain('do not commit/push it yet');
+    expect(correctionMessages[0]!.text).toContain('do not commit it yet');
     expect(sentTo(BRAIN, 'brain-legacy-import-correction')).toHaveLength(1);
     expect(sentTo(BRAIN, 'brain-legacy-import-correction')[0]!.text).toContain('tsk_plain, tsk_reassigned');
 

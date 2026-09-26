@@ -80,9 +80,9 @@ export const TASK_PAIR_WORKSPACE_RULES = [
   'Workspace: the daemon gives every pair one and names it in the executor brief and in the auditor\'s audit request.',
   'A code task in a git project gets a git worktree under ~/.imcodes/worktrees: READY_FOR_AUDIT <taskId> worktree=<absolute path> head=<commit> base=<commit>.',
   `Any other task (the project is not a git repo, or Brain dispatched it with workspace=dir) gets a task directory under ~/.imcodes/${TASK_PAIR_WORKS_DIR}/<project>/<taskId>/: work and write results there; READY_FOR_AUDIT <taskId> path=<the directory or the result files>, no git HEAD needed.`,
-  'Never work in the main checkout or /tmp, and never delete the workspace by hand: the daemon removes it 7 days after the pair ends (DONE/CANCEL), and keeps a git worktree that still has uncommitted or unpushed work.',
+  'Never work in the main checkout or /tmp, and never delete the workspace by hand: the daemon removes it 7 days after the pair ends (DONE/CANCEL), and keeps a git worktree that still has uncommitted work or commits not yet integrated into origin/dev.',
   'If your workspace is missing, rebuild it from the original branch (or use the rebuilt path the daemon sends) and continue; do not wait.',
-  'Deliverables: judge from the task type whether the result must outlive the pair (a report, document or asset the user keeps) or is only temporary (scratch work, or code that is committed and pushed). If it must be kept, end with DONE <taskId> output=<path inside the workspace> [dest=<path inside the project directory>]: the daemon copies it into the project directory (by default under the same relative path, never overwriting) and tells the user where. Temporary work: plain DONE.',
+  'Deliverables: judge from the task type whether the result must outlive the pair (a report, document or asset the user keeps) or is only temporary (scratch work, or code that is committed locally). If it must be kept, end with DONE <taskId> output=<path inside the workspace> [dest=<path inside the project directory>]: the daemon copies it into the project directory (by default under the same relative path, never overwriting) and tells the user where. Temporary work: plain DONE.',
 ].join(' ');
 
 /** User-selectable engines. The retired `legacy` value is intentionally not
@@ -153,9 +153,9 @@ export const TASK_PAIR_ASK_DONT_JUST_REPLY_RULE: string =
  * integrates.
  */
 export const TASK_PAIR_INTEGRATION_RULE: string =
-  'After PASS: commit/push your own branch, then report the branch and HEAD '
+  'After PASS: commit locally in your pair worktree (never push any branch), then report the worktree path and HEAD '
   + 'to Brain in your reply (the daemon also tells Brain, but say it '
-  + 'yourself too). Never push to dev/main yourself -- only Brain integrates.';
+  + 'yourself too). Brain cherry-picks the commit into dev and pushes dev.';
 
 /**
  * Stated in the Brain contract for a project not enabled for pairs (owner
@@ -1212,7 +1212,7 @@ export function buildTaskPairMarkerContract(): string {
     `<!-- ${TASK_PAIR_MARKER_TAG} <VERB> <taskId> [key=value | key="quoted value"] -->`,
     `A marker must be in your FINAL reply of the turn: only the last text segment is scanned, so one written before an earlier tool call in the same turn is silently lost. If you need to call a tool first, finish acting, then write the marker(s) in your closing reply. A long brief goes between QUEUE <taskId> ... and its <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> --> line, not scattered across earlier turn text.`,
     'Verbs: DISPATCH, QUEUE, STARTED, WORKING, READY_FOR_AUDIT, PASS, REWORK, DONE, BLOCKED, NEEDS_INPUT, REASSIGN, CANCEL. taskId "-" means your single open task.',
-    'Executor: write STARTED when you begin and work in the pair\'s workspace (below). When done, send the auditor your validation (full suites for code) with send_message and write READY_FOR_AUDIT naming the material; the daemon relays it to the auditor. After PASS commit/push code yourself and write DONE (with output= when the result must be kept). DONE without a PASS is not complete. Write BLOCKED or NEEDS_INPUT with note="..." when stuck. auditor=none is a real choice, not a lesser one: no audit window is assigned and nothing auto-picks one for you. Do proportionate self-validation instead (full suites for code), commit/push code yourself, then write DONE straight to Brain with no PASS required -- your closing reply is what Brain reads as the completion notice, so it must state what changed, the worktree/branch/HEAD or file paths, and your validation result before the DONE marker.',
+    'Executor: write STARTED when you begin and work in the pair\'s workspace (below). When done, send the auditor your validation (full suites for code) with send_message and write READY_FOR_AUDIT naming the material; the daemon relays it to the auditor. After PASS commit locally in the worktree (never push any branch), report the worktree path and HEAD to Brain, and write DONE (with output= when the result must be kept). DONE without a PASS is not complete. Write BLOCKED or NEEDS_INPUT with note="..." when stuck. auditor=none is a real choice, not a lesser one: no audit window is assigned and nothing auto-picks one for you. Do proportionate self-validation instead (full suites for code), commit locally in the worktree (never push any branch), report the worktree path and HEAD to Brain, then write DONE straight to Brain with no PASS required -- your closing reply is what Brain reads as the completion notice, so it must state what changed, the worktree/branch/HEAD or file paths, and your validation result before the DONE marker. Brain merges commits into dev and pushes dev.',
     TASK_PAIR_INTEGRATION_RULE,
     TASK_PAIR_WORKSPACE_RULES,
     'Pairs have no assignmentId, auditAttemptId, auditRevision, immutable bundle, scopeFiles or control-plane binding: never wait for, ask for or block on them.',

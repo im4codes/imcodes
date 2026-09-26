@@ -159,11 +159,12 @@ describe('task-pair marker grammar', () => {
     expect(body).toContain('never leave the question only in your own reply');
   });
 
-  it('ships a contract telling the executor to report its branch/HEAD to Brain after PASS and never push to dev/main itself', () => {
+  it('ships a contract telling the executor to report its worktree/HEAD to Brain after PASS and never push any branch', () => {
     const body = buildTaskPairMarkerContract();
     expect(body).toContain(TASK_PAIR_INTEGRATION_RULE);
-    expect(body).toContain('report the branch and HEAD to Brain');
-    expect(body).toContain('Never push to dev/main yourself -- only Brain integrates.');
+    expect(body).toContain('report the worktree path and HEAD to Brain');
+    expect(body).toContain('never push any branch');
+    expect(body).toContain('Brain merges commits into dev and pushes dev');
   });
 });
 

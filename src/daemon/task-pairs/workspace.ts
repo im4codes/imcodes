@@ -33,7 +33,7 @@ import {
 import { resolveSupervisionAssignmentWorktree } from '../supervision-worktree-inspector.js';
 import { ensureSupervisionAssignmentWorktree } from '../supervision-worktree-provision.js';
 import {
-  countTaskPairUnpushedCommits,
+  countTaskPairCommitsNotInDev,
   inspectSupervisionGitWorktree,
   removeRegisteredGitWorktree,
   type SupervisionWorktreeGitInspection,
@@ -170,6 +170,7 @@ export interface TaskPairWorkspaceDeps {
   inspectGit?: (repoPath: string) => Promise<SupervisionWorktreeGitInspection>;
   /** Re-check ownership/liveness immediately before deleting the workspace. */
   beforeRemove?: () => boolean | Promise<boolean>;
+  countCommitsNotInDev?: (repoPath: string, baseRevision: string) => Promise<number | undefined>;
 }
 
 function allowWorkspaceRemoval(deps: TaskPairWorkspaceDeps): boolean | Promise<boolean> {
@@ -292,10 +293,12 @@ export async function releaseTaskPairWorkspace(
   if (inspection.locked) return { action: 'kept', reason: 'locked' };
   if (inspection.dirty) return { action: 'kept', reason: 'dirty' };
   if (inspection.untracked) return { action: 'kept', reason: 'untracked' };
-  // Commits the executor made that no remote has would be lost with a
-  // detached worktree; a pushed branch, or an untouched base, would not.
-  const unpushed = workspace.base ? await countTaskPairUnpushedCommits(repoPath, workspace.base) : undefined;
-  if (unpushed === undefined || unpushed > 0) return { action: 'kept', reason: 'unpushed' };
+  // Commits the executor made that Brain has not integrated into origin/dev
+  // would be lost. A cherry-picked equivalent in dev is safe to remove.
+  const notInDev = workspace.base
+    ? await (deps.countCommitsNotInDev ?? countTaskPairCommitsNotInDev)(repoPath, workspace.base)
+    : undefined;
+  if (notInDev === undefined || notInDev > 0) return { action: 'kept', reason: 'unpushed' };
   if (!(await removalAllowed(deps))) return { action: 'skipped' };
   if (!(await removeRegisteredGitWorktree(inspection, repoPath))) return { action: 'kept', reason: 'unreadable' };
   await rm(assignmentRoot, { recursive: true, force: true });

@@ -236,7 +236,7 @@ describe('pairs run without legacy supervision artifacts', () => {
     expect(pairs).toContain('write NEEDS_INPUT <taskId> note="..." and wait: that is never a P0 or REWORK');
   });
 
-  it('tells a no-auditor executor to self-validate, commit/push, and report straight to Brain before DONE, not just "write DONE"', () => {
+  it('tells a no-auditor executor to self-validate, commit locally, and report straight to Brain before DONE, not just "write DONE"', () => {
     const withAuditor: TaskPairState = {
       taskId: 'M5', brain: BRAIN, executor: EXEC, auditor: AUD, status: 'working', flags: [], flagSides: {}, round: 0,
       blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: 1, updatedAt: 1,
@@ -246,14 +246,14 @@ describe('pairs run without legacy supervision artifacts', () => {
     const brief = buildExecutorPairBrief(none);
     expect(brief).toContain('No audit window for this pair');
     expect(brief).toContain('do proportionate self-validation instead');
-    expect(brief).toContain('commit/push code yourself if this is code');
+    expect(brief).toContain('commit locally in the worktree (never push any branch)');
     expect(brief).toContain('Report straight to Brain in the same closing reply as your');
-    expect(brief).toContain('what changed, your worktree/branch/HEAD (or file paths for non-code work), and your validation result');
-    expect(brief).toContain('The daemon relays that reply to Brain as the completion notice');
+    expect(brief).toContain('what changed, your worktree path and HEAD (or file paths for non-code work), and your validation result');
+    expect(brief).toContain('the daemon relays that reply to Brain as the completion notice');
     // The audited brief must still read exactly as before -- this is additive,
     // not a rewrite of the audited path.
     expect(audited).toContain('send the auditor your validation');
-    expect(audited).toContain('After their PASS, commit/push code and write');
+    expect(audited).toContain('After their PASS, commit locally in the worktree (never push any branch)');
     expect(audited).not.toContain('No audit window for this pair');
   });
 

@@ -223,6 +223,7 @@ export interface SupervisionWorktreeGcDeps {
     repoPath: string;
   }) => Promise<SupervisionWorktreeRegistryReference> | SupervisionWorktreeRegistryReference;
   countTaskPairUnpushedCommits?: (repoPath: string, baseRevision: string) => Promise<number | undefined>;
+  countTaskPairCommitsNotInDev?: (repoPath: string, baseRevision: string) => Promise<number | undefined>;
   /** Owner lookup for pair worktrees; without it they are never touched. */
   resolveTaskPairWorktree?: (input: { taskId: string; repoPath: string }) => Promise<TaskPairWorktreeReference> | TaskPairWorktreeReference;
   protectedPaths?: readonly string[];
@@ -554,6 +555,21 @@ export async function countTaskPairUnpushedCommits(repoPath: string, baseRevisio
   if (!result.ok) return undefined;
   const count = Number.parseInt(result.stdout.trim(), 10);
   return Number.isFinite(count) ? count : undefined;
+}
+
+/** Count executor commits after base that are not patch-equivalent to origin/dev. */
+export async function countTaskPairCommitsNotInDev(repoPath: string, baseRevision: string): Promise<number | undefined> {
+  const commits = await runGit(repoPath, ['rev-list', '--reverse', `${baseRevision}..HEAD`]);
+  if (!commits.ok) return undefined;
+  const hashes = commits.stdout.trim().split(/\s+/u).filter(Boolean);
+  if (hashes.length === 0) return 0;
+  const cherry = await runGit(repoPath, ['cherry', 'origin/dev', 'HEAD']);
+  if (!cherry.ok) return undefined;
+  const unique = new Set(cherry.stdout.split(/\r?\n/u).flatMap((line) => {
+    const match = /^\+\s+([0-9a-f]{40})$/u.exec(line.trim());
+    return match ? [match[1]] : [];
+  }));
+  return hashes.filter((hash) => unique.has(hash)).length;
 }
 
 export async function removeRegisteredGitWorktree(
@@ -978,8 +994,8 @@ async function evaluateTaskPairCandidate(
   if (inspection.locked) return retain(SUPERVISION_WORKTREE_GC_REASONS.GIT_LOCKED, taskId);
   if (inspection.dirty) return retain(SUPERVISION_WORKTREE_GC_REASONS.DIRTY, taskId, 'pair_kept');
   if (inspection.untracked) return retain(SUPERVISION_WORKTREE_GC_REASONS.UNTRACKED, taskId, 'pair_kept');
-  const unpushed = await (deps.countTaskPairUnpushedCommits ?? countTaskPairUnpushedCommits)(candidate.repoPath, parsed.metadata.baseRevision);
-  if (unpushed === undefined || unpushed > 0) return retain(SUPERVISION_WORKTREE_GC_REASONS.UNPUSHED_BRANCH, taskId, 'pair_kept');
+  const notInDev = await (deps.countTaskPairCommitsNotInDev ?? countTaskPairCommitsNotInDev)(candidate.repoPath, parsed.metadata.baseRevision);
+  if (notInDev === undefined || notInDev > 0) return retain(SUPERVISION_WORKTREE_GC_REASONS.UNPUSHED_BRANCH, taskId, 'pair_kept');
   return { entry: deleteEntry('pair_ended'), metadataText: parsed.text, inspection };
 }
 

@@ -6,7 +6,7 @@
  *   <taskId>/ and is never git-initialised; the path goes to the executor at
  *   dispatch and to the auditor at READY_FOR_AUDIT (no HEAD for a directory);
  * - when the pair ends (DONE, CANCEL, DONE force=true) the workspace is kept
- *   for 7 days, then removed -- a worktree with uncommitted or unpushed work is
+ *   for 7 days, then removed -- a worktree with uncommitted work or commits not yet integrated into dev is
  *   kept and Brain is told;
  * - DONE output=<path> copies the deliverable into the project directory and
  *   tells the user where; plain DONE copies nothing.
@@ -150,6 +150,7 @@ describe('pair workspaces', () => {
     git(project, 'commit', '-qm', 'base');
     git(project, 'remote', 'add', 'origin', origin);
     git(project, 'push', '-q', 'origin', 'HEAD:refs/heads/main');
+    git(project, 'push', '-q', 'origin', 'HEAD:refs/heads/dev');
     git(project, 'fetch', '-q', 'origin');
     setTaskPairWorkspaceDepsForTests({ env: { ...process.env, IMCODES_WORKTREES_ROOT: worktreesRoot, IMCODES_WORKS_ROOT: worksRoot } });
     useProject(project);
@@ -370,7 +371,7 @@ describe('pair workspaces', () => {
     expect(pair('N2').workspace).toMatchObject({ status: 'kept', keptReason: 'unpushed' });
   });
 
-  it('keeps a worktree with uncommitted or unpushed work after the retention, tells Brain once, and the GC reclaims it once saved', async () => {
+  it('keeps a worktree with uncommitted work or commits not yet integrated into dev after the retention, tells Brain once, and the GC reclaims it once saved', async () => {
     const dirtyPath = await opened('K1');
     writeFileSync(join(dirtyPath, 'wip.txt'), 'unsaved\n');
     marker(BRAIN, '<!-- IMCODES_TASK CANCEL K1 -->');
@@ -402,14 +403,27 @@ describe('pair workspaces', () => {
     ]);
     git(dirtyPath, 'add', '-A');
     git(dirtyPath, '-c', 'user.email=t@e.invalid', '-c', 'user.name=T', 'commit', '-qm', 'wip');
-    git(dirtyPath, 'push', '-q', 'origin', 'HEAD:refs/heads/k1');
-    git(dirtyPath, 'fetch', '-q', 'origin');
-    git(unpushedPath, 'push', '-q', 'origin', 'HEAD:refs/heads/k2');
-    git(unpushedPath, 'fetch', '-q', 'origin');
+    git(project, 'cherry-pick', git(dirtyPath, 'rev-parse', 'HEAD'));
+    git(project, 'cherry-pick', git(unpushedPath, 'rev-parse', 'HEAD'));
+    git(project, 'push', '-q', 'origin', 'HEAD:refs/heads/dev');
     const after = await runSupervisionWorktreeGc({ projectName: PROJECT, mode: 'apply', worktreesRoot }, deps);
     expect(after.deleted, JSON.stringify(after.entries)).toBe(2);
     expect(existsSync(join(dirtyPath, '..'))).toBe(false);
     expect(existsSync(join(unpushedPath, '..'))).toBe(false);
+  });
+
+  it('removes a clean worktree once Brain cherry-picked its commit into origin/dev', async () => {
+    const path = await opened('CHERRY');
+    writeFileSync(join(path, 'feature.txt'), 'integrated\n');
+    git(path, 'add', '-A');
+    git(path, '-c', 'user.email=t@e.invalid', '-c', 'user.name=T', 'commit', '-qm', 'feature');
+    const commit = git(path, 'rev-parse', 'HEAD');
+    git(project, 'cherry-pick', commit);
+    git(project, 'push', '-q', 'origin', 'HEAD:refs/heads/dev');
+    marker(BRAIN, '<!-- IMCODES_TASK DONE CHERRY force=true -->');
+    const ended = await endedAt('CHERRY');
+    await taskPairService.sweepWorkspaces(ended + TASK_PAIR_WORKSPACE_RETENTION_MS, { force: true });
+    expect(existsSync(join(path, '..'))).toBe(false);
   });
 
   it('Brain re-dispatching a cancelled pair reuses the same worktree, never resetting or recreating it', async () => {

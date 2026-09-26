@@ -84,7 +84,7 @@ export function buildCorrectionMessage(pair: TaskPairState, judgement: TaskPairV
 export function buildDoneReminderMessage(pair: TaskPairState): string {
   return [
     header(pair),
-    `DONE without a PASS is not complete. Send your validation to auditor ${pair.auditor ?? '(being assigned)'} with send_message, then write ${readyMarker(pair)}. After the auditor's PASS, commit/push and write DONE.`,
+    `DONE without a PASS is not complete. Send your validation to auditor ${pair.auditor ?? '(being assigned)'} with send_message, then write ${readyMarker(pair)}. After the auditor's PASS, commit locally in the worktree (never push any branch), report the worktree path and HEAD to Brain, then write DONE; Brain merges into dev and pushes dev.`,
     contracts(pair.blocking),
   ].join('\n');
 }
@@ -116,10 +116,10 @@ const FLAG_EXPLANATIONS: Partial<Record<TaskPairFlag, string>> = {
 };
 
 export function buildBrainNoticeMessage(pair: TaskPairState, flag: TaskPairFlag, detail?: string): string {
-  // A passed pair only needs the executor's commit/push and DONE: another
+  // A passed pair only needs the executor's local commit and DONE: another
   // executor can finish it, while DONE force=true would close it uncommitted.
   const resolve = flag === 'executor_silent' && pair.status === 'passed'
-    ? `The audit already passed; only commit/push and DONE remain. Wait for the executor, or hand it to another session with ${marker('REASSIGN', pair.taskId, 'executor=<session>')}. Use ${marker('DONE', pair.taskId, 'force=true')} only once the work is committed.`
+    ? `The audit already passed; only a local worktree commit and DONE remain (never push any branch). Report the worktree path and HEAD to Brain; Brain merges into dev and pushes dev. Wait for the executor, or hand it to another session with ${marker('REASSIGN', pair.taskId, 'executor=<session>')}. Use ${marker('DONE', pair.taskId, 'force=true')} only once the work is committed.`
     : `Resolve with a marker, e.g. ${marker('REASSIGN', pair.taskId, 'auditor=<session>')}, ${marker('DONE', pair.taskId, 'force=true')}, or ${marker('CANCEL', pair.taskId)}.`;
   // BLOCKED/NEEDS_INPUT is sent as an immediate `brain_notice` intent (no
   // explicit detail argument, unlike the heartbeat escalation path) -- fall
@@ -238,8 +238,8 @@ export function buildLegacyImportCorrectionMessage(pair: TaskPairState): string 
   const auditor = pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? `auditor ${pair.auditor}` : 'the auditor being assigned';
   return [
     header(pair),
-    'Correction: this task was imported from the old supervision engine as passed, but it never had an audit PASS. Disregard any earlier "PASS received: commit/push" message for it and do not commit/push it yet.',
-    `Send your validation to ${auditor} with send_message, then write ${readyMarker(pair)}. After the auditor's PASS, commit/push and write DONE.`,
+    'Correction: this task was imported from the old supervision engine as passed, but it never had an audit PASS. Disregard any earlier "PASS received: local commit" message for it and do not commit it yet.',
+    `Send your validation to ${auditor} with send_message, then write ${readyMarker(pair)}. After the auditor's PASS, commit locally in the worktree (never push any branch), report the worktree path and HEAD to Brain, then write DONE; Brain merges into dev and pushes dev.`,
     contracts(pair.blocking),
   ].join('\n');
 }
@@ -268,13 +268,13 @@ export function buildNudgeMessage(pair: TaskPairState, side: 'executor' | 'audit
     }
   } else {
     const next = pair.status === 'passed'
-      ? `PASS received: commit/push your branch (never dev/main -- Brain integrates), report the branch and HEAD to Brain, then write ${marker('DONE', pair.taskId)}.`
+      ? `PASS received: commit locally in the worktree (never push any branch), report the worktree path and HEAD to Brain, then write ${marker('DONE', pair.taskId)}; Brain merges into dev and pushes dev.`
       : pair.status === 'awaiting_audit'
         ? `DONE without a PASS is not complete: send your validation to auditor ${pair.auditor}, then write ${readyMarker(pair)}.`
         : pair.status === 'rework'
           ? `Address the auditor's blocking findings for their whole class, resend, then write ${marker('READY_FOR_AUDIT', pair.taskId)}.`
           : pair.auditor === 'none'
-            ? `Continue the task; write ${marker('DONE', pair.taskId)} when finished.`
+            ? `Continue the task; commit locally in the worktree (never push any branch), report the worktree path and HEAD to Brain, then write ${marker('DONE', pair.taskId)}; Brain merges into dev and pushes dev.`
             : `Continue the task. When ready, send your validation to auditor ${pair.auditor}, then write ${readyMarker(pair)}.`;
     lines.push(`Idle with no progress. ${next} If stuck write ${marker('BLOCKED', pair.taskId, 'note="..."')}. ${NO_LEGACY_ARTIFACTS}`);
   }
@@ -330,8 +330,8 @@ export function buildExecutorPairBrief(pair: TaskPairState): string {
     blockingSummaryLine(pair),
     workplaceLine(pair),
     pair.auditor === TASK_PAIR_NO_AUDITOR
-      ? `No audit window for this pair -- do proportionate self-validation instead (full suites for code), then commit/push code yourself if this is code. Report straight to Brain in the same closing reply as your ${marker('DONE', pair.taskId)}: what changed, your worktree/branch/HEAD (or file paths for non-code work), and your validation result. The daemon relays that reply to Brain as the completion notice, so write it as if Brain will read only that.`
-      : `When done, send the auditor your validation (full suites for code) with send_message and write ${readyMarker(pair)}; the daemon relays that to the auditor. After their PASS, commit/push code and write ${marker('DONE', pair.taskId)}.`,
+      ? `No audit window for this pair -- do proportionate self-validation instead (full suites for code), then commit locally in the worktree (never push any branch). Report straight to Brain in the same closing reply as your ${marker('DONE', pair.taskId)}: what changed, your worktree path and HEAD (or file paths for non-code work), and your validation result. Brain merges commits into dev and pushes dev; the daemon relays that reply to Brain as the completion notice, so write it as if Brain will read only that.`
+      : `When done, send the auditor your validation (full suites for code) with send_message and write ${readyMarker(pair)}; the daemon relays that to the auditor. After their PASS, commit locally in the worktree (never push any branch), report the worktree path and HEAD to Brain, and write ${marker('DONE', pair.taskId)}; Brain merges into dev and pushes dev.`,
     TASK_PAIR_WORKSPACE_RULES,
     NO_LEGACY_ARTIFACTS,
     TASK_PAIR_ASK_DONT_JUST_REPLY_RULE,
@@ -348,15 +348,15 @@ function workplaceLine(pair: TaskPairState): string {
   if (workspace && workspace.status === 'active') {
     return workspace.kind === 'dir'
       ? `Work in the task directory the daemon created for this pair: ${workspace.path}. Write your results there.`
-      : `Work in the worktree the daemon created for this pair: ${workspace.path} (detached at base ${workspace.base ?? 'HEAD'}; make a branch there, commit and push it).`;
+      : `Work in the worktree the daemon created for this pair: ${workspace.path} (detached at base ${workspace.base ?? 'HEAD'}; make a local branch there if useful, commit locally, never push any branch, report the worktree path plus HEAD, and let Brain merge into dev and push dev).`;
   }
   return `No workspace could be created for this pair: use your own git worktree under ~/.imcodes/worktrees for code in a git project, else a task directory under ~/.imcodes/${TASK_PAIR_WORKS_DIR}/<project>/${pair.taskId}/, and name it on READY_FOR_AUDIT.`;
 }
 
 /** Brain: a finished pair's worktree still held unsaved work at removal time, so it was kept. */
 export function buildWorkspaceKeptLine(pair: TaskPairState, reason: string): string {
-  const why = reason === 'unpushed' ? 'has commits no remote has' : reason === 'dirty' ? 'has uncommitted changes' : reason === 'untracked' ? 'has untracked files' : `could not be checked (${reason})`;
-  return `${header(pair)} The pair ended 7 days ago but its worktree ${pair.workspace?.path ?? ''} ${why}, so it was kept instead of deleted. Have ${pair.executor ?? 'the executor'} commit/push what should survive; it is removed once it is clean.`;
+  const why = reason === 'unpushed' ? 'has commits not yet integrated into dev' : reason === 'dirty' ? 'has uncommitted changes' : reason === 'untracked' ? 'has untracked files' : `could not be checked (${reason})`;
+  return `${header(pair)} The pair ended 7 days ago but its worktree ${pair.workspace?.path ?? ''} ${why}, so it was kept instead of deleted. Have ${pair.executor ?? 'the executor'} commit locally what should survive and report its worktree plus HEAD; it is removed once clean or integrated into dev.`;
 }
 
 const OUTPUT_FAILURES: Record<string, string> = {
@@ -464,8 +464,8 @@ export function buildPassDoneNoticeMessage(pair: TaskPairState): string {
     header(pair),
     `Audited pair ${pair.status === 'done' ? 'done' : 'passed'}: executor ${pair.executor ?? '-'}.`,
     verdictLine,
-    ...(pair.workspace?.branch ? [`Branch: ${pair.workspace.branch}.`] : []),
+    ...(pair.workspace?.path ? [`Worktree: ${pair.workspace.path}.${pair.workspace.lastHead ? ` Head: ${pair.workspace.lastHead}.` : ''}`] : []),
     ...(where ? [where] : []),
-    'Brain integrates this from here; the executor never pushes to dev/main itself.',
+    'Brain merges the reported commit into dev and pushes dev; the executor never pushes any branch.',
   ].join('\n');
 }
