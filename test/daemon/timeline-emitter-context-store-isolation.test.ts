@@ -36,3 +36,51 @@ describe('TimelineEmitter context-store isolation', () => {
     );
   });
 });
+
+describe('TimelineEmitter.drainUsageWrites — bounded shutdown drain', () => {
+  it('drains a pending usage write that completes before the shutdown budget', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      let resolveWrite: (() => void) | undefined;
+      runMock.mockImplementationOnce(() => new Promise<void>((resolve) => { resolveWrite = resolve; }));
+      const { TimelineEmitter } = await import('../../src/daemon/timeline-emitter.js');
+      const emitter = new TimelineEmitter();
+      emitter.emit('session-drain-ok', 'usage.update', { inputTokens: 1, outputTokens: 1, model: 'm' });
+
+      const drainPromise = emitter.drainUsageWrites(3_000);
+      // The write settles well inside the budget -- shutdown must not wait
+      // out the full budget for a write that already finished.
+      await vi.advanceTimersByTimeAsync(50);
+      resolveWrite?.();
+      const result = await drainPromise;
+      expect(result).toEqual({ pendingAtStart: 1, abandoned: 0 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('abandons a stalled write at the budget instead of blocking shutdown past it', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      runMock.mockImplementationOnce(() => new Promise<never>(() => { /* never settles */ }));
+      const { TimelineEmitter } = await import('../../src/daemon/timeline-emitter.js');
+      const emitter = new TimelineEmitter();
+      emitter.emit('session-drain-stall', 'usage.update', { inputTokens: 1, outputTokens: 1, model: 'm' });
+
+      const drainPromise = emitter.drainUsageWrites(3_000);
+      // Exactly the budget elapses -- drainUsageWrites must resolve here, not hang.
+      await vi.advanceTimersByTimeAsync(3_000);
+      const result = await drainPromise;
+      expect(result).toEqual({ pendingAtStart: 1, abandoned: 1 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('returns immediately with nothing abandoned when no usage write is in flight', async () => {
+    const { TimelineEmitter } = await import('../../src/daemon/timeline-emitter.js');
+    const emitter = new TimelineEmitter();
+    const result = await emitter.drainUsageWrites(3_000);
+    expect(result).toEqual({ pendingAtStart: 0, abandoned: 0 });
+  });
+});

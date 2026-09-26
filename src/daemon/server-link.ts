@@ -492,6 +492,12 @@ export class ServerLink {
   private unackedHeartbeatSentAts: number[] = [];
   private lastHeartbeatRoundTripMs: number | null = null;
   private uplinkCongested = false;
+  /** True once THIS connection has received at least one heartbeat_ack. An
+   *  older self-hosted server that only ever answers with a ws pong never
+   *  sets this, so the ack-based watchdog below never applies to it -- the
+   *  existing silence/pong recycling is still what catches a truly dead
+   *  connection to that kind of server. */
+  private hasReceivedHeartbeatAck = false;
   private seq = 0;
   private readonly workerUrl: string;
   private readonly serverId: string;
@@ -1116,6 +1122,9 @@ export class ServerLink {
     this.unackedHeartbeatSentAts = [];
     this.lastHeartbeatRoundTripMs = null;
     this.uplinkCongested = false;
+    // A new connection has to prove it gets acks again -- reconnecting to a
+    // (possibly different) server never carries the proof forward.
+    this.hasReceivedHeartbeatAck = false;
   }
 
   private trackHeartbeatSent(sentAt: number): void {
@@ -1128,6 +1137,10 @@ export class ServerLink {
   }
 
   private observeHeartbeatAck(echoedSentAt: unknown, receivedAt: number): void {
+    // Reaching here at all is the proof: this server sends heartbeat_ack,
+    // with or without the clock-echo field below. Once true, the ack-based
+    // watchdog is armed for the rest of this connection.
+    this.hasReceivedHeartbeatAck = true;
     // Older self-hosted servers send the heartbeat_ack envelope without the
     // clock-echo field. The frame is still an application-level proof; retire
     // the oldest outstanding heartbeat FIFO so the bounded ack watchdog does
@@ -1548,8 +1561,15 @@ export class ServerLink {
   }
 
   /** True when the oldest heartbeat sent on a clean event loop has no
-   * application-level acknowledgement within the bounded proof window. */
+   * application-level acknowledgement within the bounded proof window.
+   * Never applies until this connection has shown it sends heartbeat_ack at
+   * all -- a server that only ever answers with a ws pong would otherwise
+   * accumulate unacked heartbeats forever and be force-reconnected roughly
+   * every heartbeat interval, even though it is perfectly healthy. Such a
+   * connection still gets reconnected on a truly dead link via the
+   * silence/pong-based watchdog check next to this one. */
   private heartbeatAckTimedOut(now = Date.now()): boolean {
+    if (!this.hasReceivedHeartbeatAck) return false;
     if (this.lastLoopProbeAt > 0 && now - this.lastLoopProbeAt > LOOP_PROBE_MS + EVENT_LOOP_STALL_THRESHOLD_MS) {
       return false;
     }

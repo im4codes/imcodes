@@ -63,6 +63,34 @@ export class TimelineEmitter {
   private recentUserMsg = new Map<string, { text: string; ts: number }>();
   /** Daemon startup timestamp — changes on restart, used for epoch-based seq continuity */
   readonly epoch = Date.now();
+  /**
+   * In-flight `recordTurnUsage` worker RPCs, fired-and-forgotten from `emit`
+   * (nothing on the heartbeat/ack/send path may await this). Tracked only so
+   * a graceful shutdown can wait for them with a bounded budget instead of
+   * exiting mid-write and losing the row -- the exact race a synchronous
+   * write used to avoid before this became fire-and-forget.
+   */
+  private pendingUsageWrites = new Set<Promise<unknown>>();
+
+  /**
+   * Wait up to `budgetMs` for every currently in-flight usage-record write to
+   * settle. Never blocks longer than the budget: whatever is still pending
+   * at the deadline is abandoned (counted, not awaited further) so shutdown
+   * itself is never at the mercy of a stalled worker.
+   */
+  async drainUsageWrites(budgetMs: number): Promise<{ pendingAtStart: number; abandoned: number }> {
+    const pendingAtStart = this.pendingUsageWrites.size;
+    if (pendingAtStart === 0) return { pendingAtStart: 0, abandoned: 0 };
+    let timedOut = false;
+    await Promise.race([
+      Promise.allSettled([...this.pendingUsageWrites]),
+      new Promise<void>((resolve) => {
+        const timer = setTimeout(() => { timedOut = true; resolve(); }, budgetMs);
+        timer.unref?.();
+      }),
+    ]);
+    return { pendingAtStart, abandoned: timedOut ? this.pendingUsageWrites.size : 0 };
+  }
 
   emit(
     sessionId: string,
@@ -329,12 +357,16 @@ export class TimelineEmitter {
           // Keep this fire-and-forget from the emitter's synchronous API, but
           // route it through the bounded worker RPC. `run()` enforces the
           // awaited cap/timeout; a slow store rejects after its budget instead
-          // of accumulating unbounded work on the main thread.
-          void getContextStoreClient()
+          // of accumulating unbounded work on the main thread. Tracked in
+          // pendingUsageWrites purely so shutdown can drain it -- nothing on
+          // this call path (or the heartbeat/ack/send paths) ever awaits it.
+          const usageWrite = getContextStoreClient()
             .run('recordTurnUsage', [usageRecord])
             .catch(() => {
               incrementCounter('mem.turn_usage.record_failed', {});
             });
+          this.pendingUsageWrites.add(usageWrite);
+          void usageWrite.finally(() => this.pendingUsageWrites.delete(usageWrite));
         } catch { /* swallow — telemetry must never escape */ }
         finally {
           traceUsageMs += performance.now() - usageStart;

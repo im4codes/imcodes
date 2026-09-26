@@ -1871,6 +1871,24 @@ async function performShutdown(exitCode: number): Promise<void> {
     logger.warn({ err }, 'Daemon shutdown timeline drain failed');
   }
 
+  // recordTurnUsage is fired-and-forgotten from timelineEmitter.emit (nothing
+  // on the heartbeat/ack/send path may await it), which is exactly the SIGTERM
+  // race a synchronous write used to avoid before it became async. Give any
+  // in-flight write a few seconds to land before the process exits under it;
+  // whatever is still pending past that budget is abandoned, not awaited
+  // further, so a stalled worker can never hang shutdown itself.
+  try {
+    const usageDrainStart = Date.now();
+    const usageDrain = await timelineEmitter.drainUsageWrites(3_000);
+    if (usageDrain.abandoned > 0) {
+      logger.warn({ ...usageDrain, elapsedMs: Date.now() - usageDrainStart }, 'Daemon shutdown: usage-record writes abandoned at the drain budget');
+    } else if (usageDrain.pendingAtStart > 0) {
+      logger.info({ ...usageDrain, elapsedMs: Date.now() - usageDrainStart }, 'Daemon shutdown: usage-record writes drained');
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Daemon shutdown usage-record drain failed');
+  }
+
   try {
     const { shutdownDefaultTimelineHistoryWorkerPoolForDaemon } = await import('./timeline-history-pool.js');
     await shutdownDefaultTimelineHistoryWorkerPoolForDaemon();

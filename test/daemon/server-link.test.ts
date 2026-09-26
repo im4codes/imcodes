@@ -602,7 +602,7 @@ describe('ServerLink', () => {
     expect(link.isUplinkCongested()).toBe(true);
   });
 
-  it('recycles when heartbeat acks stop even though unrelated inbound frames keep arriving', async () => {
+  it('never force-reconnects on the ack watchdog when this connection has never received a heartbeat_ack (legacy server, silence/pong recycling only)', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(300_000);
     link.connect();
@@ -616,8 +616,41 @@ describe('ServerLink', () => {
     mockWsInstance.close.mockClear();
     recordDaemonServerLinkStatusMock.mockClear();
 
-    // Keep generic traffic flowing so `lastPong` stays fresh. It must not mask
-    // the missing application-level heartbeat acknowledgement.
+    // An older self-hosted server that only ever answers with a ws pong,
+    // never an application-level heartbeat_ack. Unrelated frames keep
+    // `lastPong` fresh so the connection is genuinely alive, not silent --
+    // the ack-based watchdog must not fire for a connection that has never
+    // proven it gets acks at all, well past what used to be one ack-timeout
+    // window every heartbeat interval.
+    for (let i = 0; i < 14; i += 1) {
+      await vi.advanceTimersByTimeAsync(5_000);
+      messageHandler?.({ data: JSON.stringify({ type: 'daemon.stats' }) } as MessageEvent);
+    }
+
+    expect(mockWsInstance.close).not.toHaveBeenCalled();
+  });
+
+  it('still reconnects within the bound once a connection that had acks stops getting them', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(350_000);
+    link.connect();
+    const openHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'open')?.[1] as
+      | (() => void)
+      | undefined;
+    const messageHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'message')?.[1] as
+      | ((event: MessageEvent) => void)
+      | undefined;
+    openHandler?.();
+    mockWsInstance.close.mockClear();
+    recordDaemonServerLinkStatusMock.mockClear();
+
+    // This server proves it sends heartbeat_ack once...
+    await vi.advanceTimersByTimeAsync(5_000);
+    messageHandler?.({ data: JSON.stringify({ type: 'heartbeat_ack' }) } as MessageEvent);
+    expect(mockWsInstance.close).not.toHaveBeenCalled();
+
+    // ...then stops, while unrelated frames keep `lastPong` fresh so silence
+    // alone would not explain a reconnect -- only the ack watchdog does.
     for (let i = 0; i < 14; i += 1) {
       await vi.advanceTimersByTimeAsync(5_000);
       messageHandler?.({ data: JSON.stringify({ type: 'daemon.stats' }) } as MessageEvent);
