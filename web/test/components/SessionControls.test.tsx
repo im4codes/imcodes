@@ -15,6 +15,8 @@ const { mockI18n, directFileTransferMocks, voiceOverlayMock } = vi.hoisted(() =>
   mockI18n: { language: undefined as string | undefined, resolvedLanguage: undefined as string | undefined },
   directFileTransferMocks: {
     prewarmDirectFileLease: vi.fn<(...args: unknown[]) => (() => void) | undefined>(() => undefined),
+    uploadFileWithDirectFallback: vi.fn<(...args: unknown[]) => Promise<unknown>>(),
+    useUploadFileWithDirectFallbackMock: false,
   },
   // What the stub overlay last received, and the reviewed notepad it sends.
   voiceOverlayMock: {
@@ -194,6 +196,11 @@ vi.mock('../../src/direct-file-transfer.js', async (importOriginal) => {
   return {
     ...actual,
     prewarmDirectFileLease: directFileTransferMocks.prewarmDirectFileLease,
+    uploadFileWithDirectFallback: (...args: Parameters<typeof actual.uploadFileWithDirectFallback>) => (
+      directFileTransferMocks.useUploadFileWithDirectFallbackMock
+        ? directFileTransferMocks.uploadFileWithDirectFallback(...args)
+        : actual.uploadFileWithDirectFallback(...args)
+    ),
   };
 });
 
@@ -622,6 +629,8 @@ afterEach(() => {
     patchSubSessionMock.mockResolvedValue(undefined);
     sendSessionViaHttpMock.mockReset().mockResolvedValue(undefined);
     directFileTransferMocks.prewarmDirectFileLease.mockReset().mockReturnValue(undefined);
+    directFileTransferMocks.uploadFileWithDirectFallback.mockReset();
+    directFileTransferMocks.useUploadFileWithDirectFallbackMock = false;
     getUserPrefMock.mockImplementation(async (key: unknown) => {
       if (typeof key === 'string' && key.startsWith('p2p_session_config:')) {
         return JSON.stringify({
@@ -9344,6 +9353,46 @@ afterEach(() => {
     await waitFor(() => {
       expect(screen.queryByTestId('composer-upload-row')).toBeNull();
       expect(document.querySelector('.attachment-badge-name')?.textContent).toBe('failed-at-99.txt');
+    });
+  });
+
+  it.each([
+    ['status recovery', '/tmp/recovered-status.txt'],
+    ['relay fallback', '/tmp/recovered-relay.txt'],
+    ['retry', '/tmp/recovered-retry.txt'],
+    ['reconnect', '/tmp/recovered-reconnect.txt'],
+  ])('projects the final daemon path for a %s completion before send', async (completionPath, daemonPath) => {
+    // The transport-level tests prove each completion mode returns an
+    // attachment. This component-level seam proves every returned completion
+    // (including STATUS_RECOVERY) is committed to the composer before Send
+    // serializes it, rather than only updating the transient progress row.
+    directFileTransferMocks.useUploadFileWithDirectFallbackMock = true;
+    directFileTransferMocks.uploadFileWithDirectFallback.mockResolvedValue({
+      attachment: { id: `attachment-${completionPath}`, serverId: 'srv-1', daemonPath },
+    });
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: `completion-${completionPath}` })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = `send ${completionPath}`;
+    fireEvent.input(input);
+    fireEvent.paste(input, {
+      clipboardData: { files: [new File(['x'], `${completionPath}.txt`, { type: 'text/plain' })], getData: () => '' },
+    });
+
+    await waitFor(() => expect(screen.getByTestId('attachment-tag-1').textContent).toBe('#1'));
+    expect(directFileTransferMocks.uploadFileWithDirectFallback).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole('button', { name: /send/i }));
+    expectSendPayload(ws, {
+      sessionName: `completion-${completionPath}`,
+      text: `#1:(${daemonPath}) send ${completionPath}`,
     });
   });
 
