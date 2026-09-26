@@ -268,6 +268,13 @@ body {
   font-family: var(--imcodes-app-font-family);
   font-size: 14px;
   overflow: hidden;
+  /* The app font stack (Fira Code/Cascadia Code/SF Mono) has contextual
+     ligatures on by default: literal marker text like `<!-- ... -->` in chat
+     messages rendered as arrow-like glyphs ("←!—— … ——→", owner report).
+     Disabled globally so no code span or plain text anywhere in the app is
+     exempt -- source text with those characters must always show literally. */
+  font-variant-ligatures: none;
+  font-feature-settings: "calt" 0, "liga" 0;
 }
 
 html.native-ios-mac {

@@ -9,6 +9,7 @@
 import logger from '../../util/logger.js';
 import type { SupervisionTaskLifecycleStatus } from '../../../shared/supervision-config.js';
 import {
+  TASK_PAIR_BRIEF_MAX_BYTES,
   TASK_PAIR_NO_AUDITOR,
   type TaskPairFlag,
   type TaskPairState,
@@ -17,13 +18,18 @@ import {
 import { normalizeAuditBlockingSeverities, type AuditSeverity } from '../../../shared/audit-convergence.js';
 import { resolveSupervisionAuditBlockingSeverities } from '../../../shared/supervision-config.js';
 import { isSupervisionPassVerdict } from '../../../shared/supervision-durable-identity.js';
-import type { SupervisionTaskSnapshot } from '../supervision-state-store.js';
+import { SUPERVISION_TASK_DEFAULT_OBJECTIVE, type SupervisionTaskSnapshot } from '../supervision-state-store.js';
 import { listSessions } from '../../store/session-store.js';
 import { resolveProjectAuthoritativeSupervisionSnapshot } from '../supervision-snapshot.js';
 import { getTaskPairStore, type StoredTaskPair } from './store.js';
 import { isPairsEngineProject, projectBrainSession } from './engine.js';
 import { sendTaskPairMessage } from './delivery.js';
-import { buildLegacyImportCorrectionBrainLine, buildLegacyImportCorrectionMessage } from './messages.js';
+import {
+  buildLegacyImportCorrectionBrainLine,
+  buildLegacyImportCorrectionMessage,
+  buildLegacyPlaceholderDigestMessage,
+  formatTaskPairMarker,
+} from './messages.js';
 import { emitTaskPairDaemonEvent } from './service.js';
 
 const TERMINAL_LEGACY: readonly SupervisionTaskLifecycleStatus[] = ['pushed', 'finalized', 'cancelled'];
@@ -34,6 +40,18 @@ const TERMINAL_LEGACY: readonly SupervisionTaskLifecycleStatus[] = ['pushed', 'f
  * ones stayed behind so it can re-dispatch them as pairs if still wanted.
  */
 const PARKED_LEGACY: readonly SupervisionTaskLifecycleStatus[] = ['blocked', 'recovered'];
+
+/**
+ * True for an empty objective, or the old send_message wrapper's generic
+ * placeholder (`supervision-state-store.ts`'s `SUPERVISION_TASK_DEFAULT_OBJECTIVE`):
+ * there is no real work description to recover, so this task must never
+ * become its own brief-less queued pair (owner report: 26 of these landed at
+ * once and each got its own "queued without a brief" nudge).
+ */
+function isPlaceholderLegacyObjective(objective: string): boolean {
+  const trimmed = objective.trim();
+  return trimmed.length === 0 || trimmed === SUPERVISION_TASK_DEFAULT_OBJECTIVE;
+}
 
 export function mapLegacyStatus(
   status: SupervisionTaskLifecycleStatus,
@@ -102,12 +120,19 @@ export function legacyTaskToPair(
   // A passed pair's audit is over; it never needs an auditor again.
   if (!auditor && mapped.status !== 'passed') flags.push('needs_auditor');
   const inAudit = mapped.status === 'in_audit' || mapped.status === 'rework' || mapped.status === 'passed';
+  // A real objective becomes the pair's brief (import corollary of the
+  // placeholder skip below: never a queued pair with no way to dispatch it).
+  const hasRealObjective = !isPlaceholderLegacyObjective(task.objective);
+  const brief = hasRealObjective
+    ? (task.objective.length > TASK_PAIR_BRIEF_MAX_BYTES ? task.objective.slice(0, TASK_PAIR_BRIEF_MAX_BYTES) : task.objective)
+    : undefined;
   return {
     taskId: task.taskId,
     brain,
     ...(executor ? { executor } : {}),
     ...(auditor ? { auditor } : {}),
     title: task.objective.split('\n')[0]!.slice(0, 120),
+    ...(brief !== undefined ? { brief } : {}),
     status: mapped.status,
     flags,
     flagSides: {},
@@ -199,8 +224,9 @@ export interface LegacyImportRegistry {
 }
 
 /** Import every not-yet-imported non-terminal legacy task of a `pairs` project. */
-/** Parked-task notices in flight, so a notice still being delivered is not queued twice. */
+/** Parked-task and placeholder-task notices in flight, so one still being delivered is not queued twice. */
 const parkedNoticesInFlight = new Set<string>();
+const placeholderNoticesInFlight = new Set<string>();
 
 /** Delivers one Brain notice; true once it was sent or durably queued. */
 export type LegacyImportBrainNotifier = (brain: string, text: string) => boolean | Promise<boolean>;
@@ -210,6 +236,29 @@ const defaultNotifier: LegacyImportBrainNotifier = async (brain, text) => {
   return result === 'sent' || result === 'queued';
 };
 
+/**
+ * One batched digest per Brain (never one per task): each entry is marked
+ * notified only once actually delivered, so a missing Brain gets it again on
+ * a later pass instead of losing it silently.
+ */
+function deliverLegacyDigests<T extends { key: string }>(
+  store: ReturnType<typeof getTaskPairStore>,
+  notifyBrain: LegacyImportBrainNotifier,
+  now: number,
+  byBrain: ReadonlyMap<string, readonly T[]>,
+  inFlight: Set<string>,
+  buildText: (entries: readonly T[]) => string,
+): void {
+  for (const [brain, entries] of byBrain) {
+    const text = buildText(entries);
+    for (const entry of entries) inFlight.add(entry.key);
+    void Promise.resolve(notifyBrain(brain, text))
+      .then((delivered) => { if (delivered) for (const entry of entries) store.setMeta(entry.key, String(now)); })
+      .catch(() => undefined)
+      .finally(() => { for (const entry of entries) inFlight.delete(entry.key); });
+  }
+}
+
 export function importLegacyTasks(
   registry: LegacyImportRegistry,
   now = Date.now(),
@@ -218,6 +267,7 @@ export function importLegacyTasks(
   const store = getTaskPairStore();
   let imported = 0;
   const parkedByBrain = new Map<string, Array<{ key: string; label: string }>>();
+  const placeholderByBrain = new Map<string, Array<{ key: string; taskId: string }>>();
   const correctedByBrain = new Map<string, string[]>();
   let cursor: string | undefined;
   // Page until the registry runs dry. The registry caps a page below any size
@@ -247,6 +297,23 @@ export function importLegacyTasks(
         }
         continue;
       }
+      // A placeholder-only objective (the old send_message wrapper's default,
+      // or empty) has no real work to recover into a brief. Only the `queued`
+      // mapping matters here: the queue tries to auto-dispatch every queued
+      // pair and would otherwise nudge Brain once per such task (the reported
+      // spam). A task already mid-flight (working/in_audit/...) keeps going
+      // even with a placeholder objective -- its brief is simply never read.
+      if (mapLegacyStatus(task.status, hasLegacyPassReceipt(task))?.status === 'queued'
+        && isPlaceholderLegacyObjective(task.objective)) {
+        const noticeKey = `legacy_placeholder_notified:${task.taskId}`;
+        if (!store.getMeta(noticeKey) && !placeholderNoticesInFlight.has(noticeKey)) {
+          const brain = liveSession(task, ['coordinator']) ?? projectBrainSession(task.projectName);
+          const list = placeholderByBrain.get(brain) ?? [];
+          list.push({ key: noticeKey, taskId: task.taskId });
+          placeholderByBrain.set(brain, list);
+        }
+        continue;
+      }
       const pair = legacyTaskToPair(task, now, resolveLegacyImportProjectBlocking(task.projectName));
       if (!pair) continue;
       // Progress time 0: every imported pair gets one nudge on the next tick.
@@ -269,14 +336,11 @@ export function importLegacyTasks(
     void sendTaskPairMessage(brain, 'legacy-import', 'brain-legacy-import-correction', buildLegacyImportCorrectionBrainLine(taskIds));
   }
   if (imported > 0) logger.info({ imported }, 'task-pair: imported in-flight legacy tasks');
-  for (const [brain, tasks] of parkedByBrain) {
-    const text = `[IM.codes task pairs] ${tasks.length} parked legacy task(s) were not imported: ${tasks.map((entry) => entry.label).join(', ')}. Re-dispatch any that are still wanted with <!-- IMCODES_TASK DISPATCH <taskId> executor=<session> auditor=<session> -->.`;
-    for (const entry of tasks) parkedNoticesInFlight.add(entry.key);
-    // Marked as notified only once delivered, so a missing Brain gets it on a later pass.
-    void Promise.resolve(notifyBrain(brain, text))
-      .then((delivered) => { if (delivered) for (const entry of tasks) store.setMeta(entry.key, String(now)); })
-      .catch(() => undefined)
-      .finally(() => { for (const entry of tasks) parkedNoticesInFlight.delete(entry.key); });
-  }
+  deliverLegacyDigests(store, notifyBrain, now, parkedByBrain, parkedNoticesInFlight, (tasks) => (
+    `[IM.codes task pairs] ${tasks.length} parked legacy task(s) were not imported: ${tasks.map((entry) => entry.label).join(', ')}. Re-dispatch any that are still wanted with ${formatTaskPairMarker('DISPATCH', '<taskId>', 'executor=<session> auditor=<session>')}.`
+  ));
+  deliverLegacyDigests(store, notifyBrain, now, placeholderByBrain, placeholderNoticesInFlight, (tasks) => (
+    buildLegacyPlaceholderDigestMessage(tasks.map((entry) => entry.taskId))
+  ));
   return imported;
 }

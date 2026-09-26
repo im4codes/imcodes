@@ -11,6 +11,7 @@ import {
   defaultCountActiveSupervisionAssignments,
   defaultHasActiveSupervisionLease,
 } from '../../../src/daemon/supervision-auto-provision.js';
+import type { TaskPairState } from '../../../shared/task-pair.js';
 import { getSupervisionHeartbeatProjection } from '../../../src/daemon/supervision-heartbeat-projection.js';
 import { normalizeSessionSupervisionSnapshot, SUPERVISION_MODE } from '../../../shared/supervision-config.js';
 import { buildSupervisionExecutionCapabilityId, normalizeSupervisionExecutionModel } from '../../../shared/supervision-execution-pool.js';
@@ -46,6 +47,20 @@ function marker(writer: string, line: string) {
 
 function pair(taskId: string) {
   return getTaskPairStore().getPair(PROJECT, taskId)!.state;
+}
+
+/** A `queued` pair injected directly (as a legacy import would), with or without a brief, bypassing marker timing. */
+function queuePairDirect(taskId: string, brief?: string): void {
+  getTaskPairStore().savePair(PROJECT, {
+    taskId, brain: BRAIN, status: 'queued', flags: [], flagSides: {}, round: 0,
+    blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now, updatedAt: now,
+    ...(brief !== undefined ? { brief } : {}),
+  } satisfies TaskPairState);
+}
+
+/** A `queued` pair with no brief. */
+function queueBriefLessPair(taskId: string): void {
+  queuePairDirect(taskId);
 }
 
 async function tick(times = 1) {
@@ -352,28 +367,39 @@ describe('task-pair heartbeat, replacement and queue', () => {
     expect(sentTo(BRAIN, 'brain-no_brief')).toHaveLength(1);
   });
 
-  it('imports several brief-less legacy tasks in one tick and tells Brain once, not once per task', async () => {
-    const registry = getSupervisionTaskRegistry();
-    delete process.env.IMCODES_SUPERVISION_ENGINE;
-    getTaskPairStore().setProjectEngine(PROJECT, 'legacy');
-    for (const taskId of ['tsk_a', 'tsk_b', 'tsk_c']) {
-      expect(registry.createOrGet({
-        taskId, projectName: PROJECT, classification: 'independent_top_level', objective: `legacy ${taskId}`,
-      } as never).ok).toBe(true);
-    }
-    getTaskPairStore().setProjectEngine(PROJECT, 'pairs');
-    const live = new TaskPairAutomation({ now: () => now, importLegacy: undefined, isBusy: () => true, isLimited: () => false });
-    sent = [];
-    await live.tick();
-    for (const taskId of ['tsk_a', 'tsk_b', 'tsk_c']) {
-      expect(getTaskPairStore().getPairByLegacyTaskId(taskId)?.state.status).toBe('queued');
-    }
-    expect(sentTo(BRAIN, 'brain-no_brief')).toHaveLength(0);
-    const aggregate = sentTo(BRAIN, 'brain-aggregate');
-    expect(aggregate).toHaveLength(1);
-    expect(aggregate[0]!.text).toContain('tsk_a');
-    expect(aggregate[0]!.text).toContain('tsk_b');
-    expect(aggregate[0]!.text).toContain('tsk_c');
+  it('batches several brief-less queued pairs found in one heartbeat into one digest naming them all, with one example marker (not one per pair)', async () => {
+    queueBriefLessPair('Q5');
+    queueBriefLessPair('Q6');
+    queueBriefLessPair('Q7');
+    await tick(1);
+    expect(pair('Q5').status).toBe('queued');
+    expect(pair('Q6').status).toBe('queued');
+    expect(pair('Q7').status).toBe('queued');
+    // Never one individual "queued without a brief" message per pair (reasonPart
+    // needs its trailing colon: 'brain-no_brief' is also a substring of the
+    // digest's own reason, 'brain-no_brief-digest').
+    expect(sentTo(BRAIN, 'brain-no_brief:')).toHaveLength(0);
+    const digest = sentTo(BRAIN, 'brain-no_brief-digest');
+    expect(digest).toHaveLength(1);
+    expect(digest[0]!.text).toContain('Q5');
+    expect(digest[0]!.text).toContain('Q6');
+    expect(digest[0]!.text).toContain('Q7');
+    // One example of the fix-up marker, not the same marker repeated per pair.
+    expect(digest[0]!.text.match(/IMCODES_TASK QUEUE/g)).toHaveLength(1);
+  });
+
+  it('never lets brief-less queued pairs hold a slot: a briefed pair queued behind them still dispatches under max=1', async () => {
+    candidates = [SPARE, SPARE2];
+    getTaskPairStore().setMaxConcurrency(BRAIN, 1);
+    queueBriefLessPair('Q8');
+    queueBriefLessPair('Q9');
+    queuePairDirect('Q10', 'brief for Q10');
+    await tick(1);
+    expect(pair('Q10')).toMatchObject({ status: 'working', executor: SPARE });
+    expect(pair('Q8').status).toBe('queued');
+    expect(pair('Q9').status).toBe('queued');
+    expect(pair('Q8').executor).toBeUndefined();
+    expect(pair('Q9').executor).toBeUndefined();
   });
 
   it('shows the pair heartbeat on the badges of open-pair participants and clears it when the pair ends', async () => {

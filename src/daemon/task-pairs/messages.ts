@@ -21,8 +21,13 @@ import {
 } from '../../../shared/task-pair.js';
 import type { ResolvedTaskPairMaterial } from './material.js';
 
+/**
+ * Backtick-wrapped so a marker example renders as literal inline code in the
+ * web chat instead of the daemon's `<!--`/`-->` comment syntax being eaten by
+ * markdown font ligatures (owner report: shows as "←!—— … ——→").
+ */
 function marker(verb: string, taskId: string, attrs = ''): string {
-  return `<!-- ${TASK_PAIR_MARKER_TAG} ${verb} ${taskId}${attrs ? ` ${attrs}` : ''} -->`;
+  return `\`<!-- ${TASK_PAIR_MARKER_TAG} ${verb} ${taskId}${attrs ? ` ${attrs}` : ''} -->\``;
 }
 
 function contracts(blocking: readonly AuditSeverity[]): string {
@@ -123,27 +128,22 @@ export function buildBrainNoticeMessage(pair: TaskPairState, flag: TaskPairFlag,
  * A flag-driven notice explains itself from {@link FLAG_EXPLANATIONS}; a
  * plain-line notice (e.g. a queued pair with no brief -- there is no real
  * flag on the pair for that, just a one-off reminder text) carries its own
- * `text` instead.
+ * `text` and a delivery `reason` instead.
  */
-export type PendingBrainNotice =
-  | { pair: TaskPairState; flag: TaskPairFlag; detail?: string }
-  | { pair: TaskPairState; text: string; reason: string };
+export type PendingBrainFlagNotice = { pair: TaskPairState; flag: TaskPairFlag; detail?: string };
+export type PendingBrainLineNotice = { pair: TaskPairState; text: string; reason: string };
+export type PendingBrainNotice = PendingBrainFlagNotice | PendingBrainLineNotice;
 
 /**
- * One heartbeat can find several of a Brain's pairs needing a decision at
- * once (an auditor pool outage, several imports missing an auditor, a batch
- * of legacy-imported pairs with no brief). One combined message, not one per
- * pair -- the single-pair case still uses {@link buildBrainNoticeMessage} or
- * {@link buildBrainLine} unchanged.
+ * One heartbeat can find several of a Brain's pairs needing the same kind of
+ * decision at once (an auditor pool outage, several imports missing an
+ * auditor). One combined message, not one per pair -- the single-pair case
+ * still uses {@link buildBrainNoticeMessage} unchanged.
  */
-export function buildAggregatedBrainNoticeMessage(notices: readonly PendingBrainNotice[]): string {
-  const lines = notices.map((notice) => {
-    const { pair } = notice;
-    const label = `${pair.taskId}${pair.title ? ` "${pair.title}"` : ''}`;
-    if ('text' in notice) return `- ${label}: ${notice.text}`;
-    const { flag, detail } = notice;
-    return `- ${label}: ${detail ?? FLAG_EXPLANATIONS[flag] ?? flag}. Executor ${pair.executor ?? '-'}, auditor ${pair.auditor ?? '-'}, status ${pair.status}.`;
-  });
+export function buildAggregatedBrainNoticeMessage(notices: readonly PendingBrainFlagNotice[]): string {
+  const lines = notices.map(({ pair, flag, detail }) => (
+    `- ${pair.taskId}${pair.title ? ` "${pair.title}"` : ''}: ${detail ?? FLAG_EXPLANATIONS[flag] ?? flag}. Executor ${pair.executor ?? '-'}, auditor ${pair.auditor ?? '-'}, status ${pair.status}.`
+  ));
   return [
     `[IM.codes task pairs] Needs your decision on ${notices.length} pairs:`,
     ...lines,
@@ -172,6 +172,20 @@ export function buildQueueStallNoticeMessage(pairs: readonly Pick<TaskPairState,
 }
 
 /**
+ * Several queued pairs found brief-less in the same heartbeat (typically a
+ * legacy import that skipped straight-forward status mapping): their ids,
+ * plus ONE example of the fix-up marker -- not the same marker repeated once
+ * per pair, which is what actually spammed 215 (owner report).
+ */
+export function buildNoBriefDigestMessage(taskIds: readonly string[]): string {
+  return [
+    `[IM.codes task pairs] ${taskIds.length} pairs are queued without a brief: ${taskIds.join(', ')}.`,
+    `Give one a brief with ${marker('QUEUE', '<taskId>', 'title="..."')}, then its brief, then ${buildBriefEndHint('<taskId>')}; or dispatch it yourself with ${marker('DISPATCH', '<taskId>', 'executor=<session> auditor=<session>')}. No further reminders until each pair's state changes.`,
+    `[Contract: ${TASK_PAIR_CONTRACT_ID}]`,
+  ].join('\n');
+}
+
+/**
  * One combined, rate-limited notice per project: no execution pool is
  * configured and one or more pairs have a role with no named model either,
  * so nothing was picked or provisioned for it (owner rule: no built-in
@@ -192,6 +206,23 @@ export function buildNoPoolAskMessage(project: string, pairs: readonly Pick<Task
   ].join('\n');
 }
 
+/** One queued pair with no brief: how Brain can give it one. */
+export function buildNoBriefLine(taskId: string): string {
+  return `queued without a brief: give it one with ${marker('QUEUE', taskId, 'title="..."')}, then its brief, then ${buildBriefEndHint(taskId)}; or dispatch it yourself with ${marker('DISPATCH', taskId, 'executor=<session> auditor=<session>')}.`;
+}
+
+/**
+ * Legacy tasks skipped on import (never turned into a pair): their only
+ * objective is the old send_message wrapper's placeholder, so there is no
+ * real brief to give them. Brain gets one digest, not one per task.
+ */
+export function buildLegacyPlaceholderDigestMessage(taskIds: readonly string[]): string {
+  return [
+    `[IM.codes task pairs] ${taskIds.length} legacy task(s) were not imported as pairs: their only objective is the old wrapper's placeholder, so there is no real brief to recover: ${taskIds.join(', ')}.`,
+    `Give one a real brief and dispatch it yourself, e.g. ${marker('QUEUE', '<taskId>', 'title="..."')}, then its brief, then ${buildBriefEndHint('<taskId>')}; or ${marker('DISPATCH', '<taskId>', 'executor=<session> auditor=<session>')} if you already know who should do it.`,
+  ].join('\n');
+}
+
 /** To the executor of a pair that was imported as passed without any audit. */
 export function buildLegacyImportCorrectionMessage(pair: TaskPairState): string {
   const auditor = pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? `auditor ${pair.auditor}` : 'the auditor being assigned';
@@ -209,7 +240,7 @@ export function buildLegacyImportCorrectionBrainLine(taskIds: readonly string[])
 }
 
 export function buildBriefEndHint(taskId: string): string {
-  return `<!-- ${TASK_PAIR_BRIEF_END_TAG} ${taskId} -->`;
+  return `\`<!-- ${TASK_PAIR_BRIEF_END_TAG} ${taskId} -->\``;
 }
 
 export { marker as formatTaskPairMarker };

@@ -1342,4 +1342,18 @@ describe('styles.css regression contracts', () => {
       }
     });
   });
+
+  it('disables font ligatures app-wide, so literal marker text like `<!-- ... -->` never renders as arrow-like glyphs', () => {
+    // Owner report: the app font stack (Fira Code/Cascadia Code/SF Mono) has
+    // contextual ligatures on by default, and chat prose and inline code
+    // spans both inherit it (no separate font-family on .chat-rich-text or
+    // .chat-inline-code) -- `<!-- IMCODES_TASK_END tsk_x -->` rendered as
+    // "←!—— tsk_x ——→". jsdom cannot render fonts/ligatures itself, so this
+    // pins the CSS rule that disables them, on `body` so no current or future
+    // code span/plain-text element is exempt.
+    const bodyRule = cssWithoutComments.match(/\nbody\s*\{[^}]*\}/)?.[0];
+    expect(bodyRule).toBeTruthy();
+    expect(bodyRule).toMatch(/font-variant-ligatures:\s*none/);
+    expect(bodyRule).toMatch(/font-feature-settings:\s*"calt"\s*0,\s*"liga"\s*0/);
+  });
 });

@@ -53,6 +53,16 @@ describe('ChatMarkdown', () => {
     expect(links[1].textContent).toBe('./README.md');
   });
 
+  it('renders a backtick-wrapped marker example as literal inline code, not parsed HTML', () => {
+    const { container } = render(
+      <ChatMarkdown text="queued without a brief: give it one with `<!-- IMCODES_TASK QUEUE tsk_x -->`, then its brief, then `<!-- IMCODES_TASK_END tsk_x -->`." />,
+    );
+    const codeSpans = container.querySelectorAll('code.chat-inline-code');
+    expect(codeSpans.length).toBeGreaterThanOrEqual(2);
+    expect(codeSpans[0]!.textContent).toBe('<!-- IMCODES_TASK QUEUE tsk_x -->');
+    expect(codeSpans[1]!.textContent).toBe('<!-- IMCODES_TASK_END tsk_x -->');
+  });
+
   it('detects paths inside backtick code spans', () => {
     const clicked: string[] = [];
     const { container } = render(

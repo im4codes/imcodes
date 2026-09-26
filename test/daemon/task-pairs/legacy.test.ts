@@ -16,7 +16,7 @@ import { MEMORY_MCP_TOOL_NAMES } from '../../../shared/memory-mcp-contracts.js';
 import { SUPERVISION_MCP_TOOLS } from '../../../shared/supervision-mcp-tools.js';
 import { taskPairBindingId } from '../../../shared/task-pair.js';
 import { normalizeSessionSupervisionSnapshot } from '../../../shared/supervision-config.js';
-import type { SupervisionTaskSnapshot } from '../../../src/daemon/supervision-state-store.js';
+import { SUPERVISION_TASK_DEFAULT_OBJECTIVE, type SupervisionTaskSnapshot } from '../../../src/daemon/supervision-state-store.js';
 
 const PROJECT = 'legacyproj';
 const BRAIN = 'deck_legacyproj_brain';
@@ -197,9 +197,12 @@ describe('one-time legacy import', () => {
     else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
   });
 
-  function task(taskId: string, status: string, assignments: Array<[string, string, string]>, projectName = PROJECT): SupervisionTaskSnapshot {
+  function task(
+    taskId: string, status: string, assignments: Array<[string, string, string]>,
+    projectName = PROJECT, objective = `objective of ${taskId}\nmore`,
+  ): SupervisionTaskSnapshot {
     return {
-      taskId, projectName, status, objective: `objective of ${taskId}\nmore`,
+      taskId, projectName, status, objective,
       assignments: assignments.map(([role, sessionName, assignmentStatus]) => ({
         role, status: assignmentStatus, identity: { sessionName },
       })),
@@ -214,6 +217,31 @@ describe('one-time legacy import', () => {
     expect(mapLegacyStatus('committed')?.status).toBe('passed');
     expect(mapLegacyStatus('blocked')).toBeUndefined();
     expect(mapLegacyStatus('recovered')).toBeUndefined();
+  });
+
+  it('skips placeholder-only queued legacy tasks (digesting them for Brain) and gives a real objective as the pair\'s brief', async () => {
+    const tasks = [
+      task('tsk_real', 'delegated', [], PROJECT, 'fix the flaky retry path'),
+      task('tsk_empty', 'delegated', [], PROJECT, '   '),
+      task('tsk_placeholder', 'planned', [], PROJECT, SUPERVISION_TASK_DEFAULT_OBJECTIVE),
+    ];
+    const notices: Array<[string, string]> = [];
+    const registry = { list: () => tasks };
+    expect(importLegacyTasks(registry, 5_000, (brain, text) => { notices.push([brain, text]); return true; })).toBe(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(getTaskPairStore().getPair(PROJECT, 'tsk_real')?.state).toMatchObject({
+      status: 'queued', brief: 'fix the flaky retry path',
+    });
+    // Never imported as their own brief-less pair.
+    expect(getTaskPairStore().getPair(PROJECT, 'tsk_empty')).toBeUndefined();
+    expect(getTaskPairStore().getPair(PROJECT, 'tsk_placeholder')).toBeUndefined();
+    const digest = notices.find(([, text]) => text.includes('tsk_empty') && text.includes('tsk_placeholder'));
+    expect(digest).toBeDefined();
+    expect(digest?.[0]).toBe(BRAIN);
+    expect(digest?.[1]).not.toContain('tsk_real');
+    // A later pass does not repeat the digest.
+    importLegacyTasks(registry, 6_000, (brain, text) => { notices.push([brain, text]); return true; });
+    expect(notices).toHaveLength(1);
   });
 
   it('never imports parked blocked/recovered tasks as open or passed pairs, telling Brain once', async () => {

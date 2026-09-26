@@ -59,9 +59,13 @@ import {
   buildDispatchTrailer,
   buildExecutorHandoffMessage,
   buildExecutorResendMessage,
+  buildNoBriefDigestMessage,
+  buildNoBriefLine,
   buildNoPoolAskMessage,
   buildNudgeMessage,
   buildQueueStallNoticeMessage,
+  type PendingBrainFlagNotice,
+  type PendingBrainLineNotice,
   type PendingBrainNotice,
 } from './messages.js';
 
@@ -293,15 +297,30 @@ export class TaskPairAutomation implements TaskPairScheduler {
     if (!pending) return;
     for (const [brain, entries] of pending) {
       if (entries.length === 0) continue;
-      if (entries.length === 1) {
-        const notice = entries[0]!;
-        if ('text' in notice) {
+      const lineEntries = entries.filter((entry): entry is PendingBrainLineNotice => 'text' in entry);
+      const flagEntries = entries.filter((entry): entry is PendingBrainFlagNotice => !('text' in entry));
+      // Line notices batch per reason: N brief-less pairs found in one
+      // heartbeat get one digest naming them all plus one example marker,
+      // never the same marker repeated once per pair (the actual 215 spam).
+      const lineByReason = new Map<string, PendingBrainLineNotice[]>();
+      for (const notice of lineEntries) {
+        const list = lineByReason.get(notice.reason) ?? [];
+        list.push(notice);
+        lineByReason.set(notice.reason, list);
+      }
+      for (const [reason, group] of lineByReason) {
+        if (group.length === 1) {
+          const notice = group[0]!;
           await sendTaskPairMessage(brain, notice.pair.taskId, notice.reason, buildBrainLine(notice.pair, notice.text));
         } else {
-          await sendTaskPairMessage(brain, notice.pair.taskId, `brain-${notice.flag}`, buildBrainNoticeMessage(notice.pair, notice.flag, notice.detail));
+          await sendTaskPairMessage(brain, TASK_PAIR_AGGREGATE_NOTICE_ID, `${reason}-digest`, buildNoBriefDigestMessage(group.map((notice) => notice.pair.taskId)));
         }
-      } else {
-        await sendTaskPairMessage(brain, TASK_PAIR_AGGREGATE_NOTICE_ID, 'brain-aggregate', buildAggregatedBrainNoticeMessage(entries));
+      }
+      if (flagEntries.length === 1) {
+        const notice = flagEntries[0]!;
+        await sendTaskPairMessage(brain, notice.pair.taskId, `brain-${notice.flag}`, buildBrainNoticeMessage(notice.pair, notice.flag, notice.detail));
+      } else if (flagEntries.length > 1) {
+        await sendTaskPairMessage(brain, TASK_PAIR_AGGREGATE_NOTICE_ID, 'brain-aggregate', buildAggregatedBrainNoticeMessage(flagEntries));
       }
     }
   }
@@ -874,7 +893,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
       if (open >= max) return;
       const pair = stored.state;
       if (pair.brief === undefined) {
-        this.#flagOnceWithKey(stored, 'no_brief', `queued without a brief: write QUEUE ${pair.taskId} … <!-- IMCODES_TASK_END ${pair.taskId} --> or DISPATCH it yourself.`);
+        this.#flagOnceWithKey(stored, 'no_brief', buildNoBriefLine(pair.taskId));
         continue;
       }
       // A session named explicitly on QUEUE (executor=/auditor=) is a

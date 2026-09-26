@@ -615,6 +615,9 @@ export function resetSupervisionStateStoreForTests(): void {
 
 export const SUPERVISION_TASK_REGISTRY_DB_VERSION = 1 as const;
 
+/** Objective a task gets when the caller (the old send_message wrapper) never gave a real one. */
+export const SUPERVISION_TASK_DEFAULT_OBJECTIVE = 'Delegated supervised task';
+
 export interface PersistedSupervisionTaskAssignmentIdentity {
   sessionName: string;
   sessionInstanceId: string;
@@ -4636,7 +4639,7 @@ export class SupervisionTaskRegistry {
         projectName,
         topLevelTaskId: normalizeTaskString(input.topLevelTaskId) ?? taskId,
         classification,
-        objective: normalizeTaskString(input.objective) ?? 'Delegated supervised task',
+        objective: normalizeTaskString(input.objective) ?? SUPERVISION_TASK_DEFAULT_OBJECTIVE,
         acceptance: normalizeTaskArray(input.acceptance),
         ...(isSupervisionTaskAuditPolicy(input.auditPolicy) ? { auditPolicy: input.auditPolicy } : {}),
         ...(normalizeTaskString(input.baseRevision) ? { baseRevision: normalizeTaskString(input.baseRevision) } : {}),
