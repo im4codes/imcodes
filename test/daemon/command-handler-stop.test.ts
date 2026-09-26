@@ -239,6 +239,10 @@ describe('handleWebCommand shutdown failure paths', () => {
           },
         },
       ],
+      // First attempt: deferral clock just started, so 0ms in and not yet
+      // past the max-wait cap that would start an orderly queued-pair drain.
+      deferredMs: 0,
+      draining: false,
     });
   });
 

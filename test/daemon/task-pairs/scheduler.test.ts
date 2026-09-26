@@ -4,7 +4,7 @@ import { removeSession, upsertSession } from '../../../src/store/session-store.j
 import { TaskPairStore, getTaskPairStore, setTaskPairStoreForTests } from '../../../src/daemon/task-pairs/store.js';
 import { setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
 import { taskPairService } from '../../../src/daemon/task-pairs/service.js';
-import { TaskPairAutomation } from '../../../src/daemon/task-pairs/scheduler.js';
+import { TaskPairAutomation, setTaskPairUpgradeDrain } from '../../../src/daemon/task-pairs/scheduler.js';
 import { listTaskPairCandidates } from '../../../src/daemon/task-pairs/pool.js';
 import { getSupervisionTaskRegistry } from '../../../src/daemon/supervision-state-store.js';
 import {
@@ -90,6 +90,7 @@ describe('task-pair heartbeat, replacement and queue', () => {
   });
 
   afterEach(() => {
+    setTaskPairUpgradeDrain(false);
     taskPairService.setScheduler(undefined);
     setTaskPairDeliveryDepsForTests(undefined);
     setTaskPairStoreForTests(undefined);
@@ -279,6 +280,32 @@ describe('task-pair heartbeat, replacement and queue', () => {
     marker(BRAIN, '<!-- IMCODES_TASK DONE Q6 force=true -->');
     await flush();
     expect(pair('Q5').status).toBe('working');
+  });
+
+  it('withholds new queued pairs during an upgrade drain, never touching an already-running one, and resumes once the drain ends', async () => {
+    candidates = [SPARE, SPARE2];
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH T-running executor=${EXEC} auditor=${AUD} -->`);
+    await flush();
+    expect(pair('T-running').status).toBe('working');
+
+    setTaskPairUpgradeDrain(true);
+    marker(BRAIN, '<!-- IMCODES_TASK QUEUE Q-drain title="Held during drain" -->\nbrief\n<!-- IMCODES_TASK_END Q-drain -->');
+    await flush();
+    // Would ordinarily auto-dispatch immediately (two idle candidates,
+    // default concurrency) -- draining holds it queued instead.
+    expect(pair('Q-drain').status).toBe('queued');
+    expect(pair('Q-drain').flags).not.toContain('waiting_for_capacity');
+    // The already-open pair is completely unaffected: draining never touches
+    // active work, only new admission.
+    expect(pair('T-running').status).toBe('working');
+    await tick(2);
+    expect(pair('Q-drain').status).toBe('queued');
+
+    setTaskPairUpgradeDrain(false);
+    await tick(1);
+    expect(pair('Q-drain').status).toBe('working');
+    expect(pair('Q-drain').executor).toBeTruthy();
+    expect(pair('Q-drain').auditor).toBeTruthy();
   });
 
   it('keeps a queued task waiting for capacity, tells Brain once, and retries on the heartbeat', async () => {

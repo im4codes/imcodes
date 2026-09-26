@@ -4,6 +4,7 @@
  */
 import type { ChatMessageOrigin } from '../../shared/chat-message-origin.js';
 import { isPairsEngineSession } from './task-pairs/engine.js';
+import { setTaskPairUpgradeDrain } from './task-pairs/scheduler.js';
 import { AGENT_SKILLS_MSG } from '../../shared/agent-skills.js';
 import { AGENT_MCP_MSG } from '../../shared/agent-mcp.js';
 import type { CronRunTimelineProjection } from '../../shared/cron-types.js';
@@ -7853,10 +7854,11 @@ export function evaluateAutoUpgradeCooldown(
   return { onCooldown: true, remainingMs: cooldownMs - ageMs, lastAt };
 }
 
-/** How long the *session-busy* gate reports continuous deferral in logs before
- *  it marks the wait as capped. It is intentionally advisory only: a daemon
- *  self-upgrade must never force through an active turn, because restarting the
- *  daemon would kill or abandon the user's in-flight work. Override for tests
+/** How long the *session-busy* gate keeps deferring before it starts an
+ *  orderly drain of the daemon's own queued-pair admission (never an active
+ *  turn — see below). A daemon self-upgrade must never force through an
+ *  active turn, because restarting the daemon would kill or abandon the
+ *  user's in-flight work; this cap does not change that. Override for tests
  *  via IMCODES_MAX_UPGRADE_DEFER_MS. */
 const MAX_UPGRADE_DEFER_MS = (() => {
   const raw = parseInt(process.env.IMCODES_MAX_UPGRADE_DEFER_MS ?? '', 10);
@@ -7871,24 +7873,28 @@ let upgradeSessionBusyDeferredSince: number | null = null;
 
 /** Pure decision for the session-busy deferral backstop. Given whether the
  *  session gate is currently blocking and how long it has been blocking,
- *  decide whether to keep blocking and what the next "blocked since" marker
- *  should be. Extracted for deterministic unit testing. */
+ *  decide whether to keep blocking, what the next "blocked since" marker
+ *  should be, and whether continuous deferral has crossed `maxDeferMs`
+ *  (`drain`). `drain` never forces the upgrade through active work; the
+ *  caller uses it only to stop starting NEW queued pairs (the one form of
+ *  admission the daemon itself controls), so sessions that always overlap
+ *  under a constant stream of auto-dispatched work get a real chance to
+ *  drain to idle instead of being perpetually re-busied. Extracted for
+ *  deterministic unit testing. */
 export function evaluateUpgradeDeferralBackstop(args: {
   blocked: boolean;
   deferredSince: number | null;
   now: number;
   maxDeferMs: number;
-}): { proceed: boolean; forced: boolean; nextDeferredSince: number | null; deferredMs: number } {
+}): { proceed: boolean; forced: boolean; nextDeferredSince: number | null; deferredMs: number; drain: boolean } {
   const { blocked, deferredSince, now, maxDeferMs } = args;
   if (!blocked) {
-    return { proceed: true, forced: false, nextDeferredSince: null, deferredMs: 0 };
+    return { proceed: true, forced: false, nextDeferredSince: null, deferredMs: 0, drain: false };
   }
   const since = deferredSince ?? now;
   const deferredMs = Math.max(0, now - since);
-  // The cap is diagnostic, not a bypass. Keep blocking active work forever
-  // until the turn finishes or the user explicitly stops it.
-  void maxDeferMs;
-  return { proceed: false, forced: false, nextDeferredSince: since, deferredMs };
+  const drain = maxDeferMs > 0 && deferredMs >= maxDeferMs;
+  return { proceed: false, forced: false, nextDeferredSince: since, deferredMs, drain };
 }
 
 /** Test-only: reset the module-level session-busy deferral tracker. */
@@ -8095,19 +8101,28 @@ async function handleDaemonUpgrade(
     maxDeferMs: MAX_UPGRADE_DEFER_MS,
   });
   upgradeSessionBusyDeferredSince = deferralBackstop.nextDeferredSince;
+  // Resets on every attempt: the moment sessions are no longer blocking (or a
+  // fresh deferral hasn't yet crossed the cap), queued-pair admission resumes
+  // immediately rather than staying paused a moment longer than necessary.
+  setTaskPairUpgradeDrain(deferralBackstop.drain);
   if (activeSessions.length > 0 && !deferralBackstop.proceed) {
     logger.warn({
       targetVersion,
       blockedSessions: activeSessions,
       deferredMs: deferralBackstop.deferredMs,
       maxDeferMs: MAX_UPGRADE_DEFER_MS,
-    }, 'daemon.upgrade: blocked because sessions have active turns');
+      draining: deferralBackstop.drain,
+    }, deferralBackstop.drain
+      ? 'daemon.upgrade: blocked past max-wait — draining queued-pair admission until sessions go idle'
+      : 'daemon.upgrade: blocked because sessions have active turns');
     try {
       serverLink?.send({
         type: DAEMON_MSG.UPGRADE_BLOCKED,
         reason: activeSessions.every((reason) => reason.runtimeType === 'transport') ? 'transport_busy' : 'session_busy',
         activeSessionNames: activeSessions.map((reason) => reason.name),
         blockedSessions: activeSessions,
+        deferredMs: deferralBackstop.deferredMs,
+        draining: deferralBackstop.drain,
       });
     } catch { /* ignore */ }
     return;

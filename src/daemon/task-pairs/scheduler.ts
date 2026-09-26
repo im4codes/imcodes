@@ -91,6 +91,27 @@ async function defaultImportLegacy(now: number): Promise<void> {
   importLegacyTasks(getSupervisionTaskRegistry(), now);
 }
 
+/**
+ * A daemon self-upgrade must never kill an active turn (see
+ * evaluateUpgradeDeferralBackstop in command-handler.ts), so it cannot force
+ * itself through busy sessions. What it CAN do once deferred past the max-wait
+ * cap is stop the one form of admission the daemon itself controls: starting
+ * NEW queued pairs, which is exactly what perpetually re-busies sessions that
+ * would otherwise drain to idle on their own. This never touches an
+ * already-open pair or an ordinary user/Brain send.
+ */
+let upgradeDrainActive = false;
+
+/** Pause (true) or resume (false) starting new queued pairs for a pending
+ *  daemon-upgrade drain. Idempotent; safe to call every upgrade attempt. */
+export function setTaskPairUpgradeDrain(active: boolean): void {
+  upgradeDrainActive = active;
+}
+
+export function isTaskPairUpgradeDrainActive(): boolean {
+  return upgradeDrainActive;
+}
+
 export class TaskPairAutomation implements TaskPairScheduler {
   #timer?: NodeJS.Timeout;
   #deps: TaskPairSchedulerDeps;
@@ -731,6 +752,10 @@ export class TaskPairAutomation implements TaskPairScheduler {
   }
 
   async #runQueueOnce(project: string, brain: string): Promise<void> {
+    // A pending upgrade drain holds new pairs in `queued` (unchanged, still
+    // visible, still position-ordered) rather than starting them -- it never
+    // touches pairs already running.
+    if (upgradeDrainActive) return;
     const store = getTaskPairStore();
     const max = resolveTaskPairMaxConcurrency(brain);
     const pairs = store.listActivePairs(project).filter((pair) => pair.state.brain === brain);
