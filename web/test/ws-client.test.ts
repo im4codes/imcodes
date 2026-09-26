@@ -4,7 +4,7 @@ import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { P2P_WORKFLOW_MSG, isP2pWorkflowRequestId } from '@shared/p2p-workflow-messages.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import { REPO_MSG } from '@shared/repo-types.js';
-import { TIMELINE_MESSAGES } from '@shared/timeline-protocol.js';
+import { TIMELINE_MESSAGES, TIMELINE_PROTOCOL_CAPABILITY } from '@shared/timeline-protocol.js';
 import { FS_TRANSPORT_MSG } from '@shared/fs-transport-messages.js';
 import { FS_GENERIC_ERROR_CODES } from '@shared/fs-error-codes.js';
 import { FS_WRITE_MAX_BYTES } from '@shared/fs-write-limits.js';
@@ -1831,7 +1831,7 @@ describe('WsClient', () => {
     lastWs!.emit('message', { data: JSON.stringify({
       type: 'daemon.hello',
       daemonId: 'daemon-bounded',
-      capabilities: ['timeline.protocol.v1'],
+      capabilities: [TIMELINE_PROTOCOL_CAPABILITY],
       timelineProtocolRevision: 1,
       helloEpoch: 1,
       sentAt: Date.now(),
