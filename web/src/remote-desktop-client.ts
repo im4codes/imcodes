@@ -71,6 +71,10 @@ const DATA_BUFFER_LOW_WATER_BYTES = 64 * 1024;
 // browser guard is only a final escape hatch if that terminal frame is lost.
 const START_TIMEOUT_MS = REMOTE_DESKTOP_LIMITS.NEGOTIATION_TIMEOUT_MS + 5_000;
 const INPUT_ACK_TIMEOUT_MS = 3_000;
+// A paste transfer is bounded independently from the generic input ack.  If a
+// worker or SCTP association disappears after accepting the chunks, the
+// viewer must not remain permanently locked out of subsequent pastes.
+const PASTE_TRANSFER_TIMEOUT_MS = 10_000;
 /**
  * How long a display-mode, scale or monitor change may take before the session
  * is declared dead.
@@ -585,7 +589,12 @@ export class RemoteDesktopClient {
     resolve(value: string | null): void;
     timer: ReturnType<typeof setTimeout>;
   }>();
-  private pendingPaste: { id: string; text: string; finalSequence: number } | null = null;
+  private pendingPaste: {
+    id: string;
+    text: string;
+    finalSequence: number;
+    timer: ReturnType<typeof setTimeout>;
+  } | null = null;
   private controlRejectionId = 0;
   private diagnosticTrackCleanup: (() => void) | null = null;
   private snapshot: RemoteDesktopSnapshot = {
@@ -1096,8 +1105,22 @@ export class RemoteDesktopClient {
         return this.sendTypedText(value);
       }
     }
-    this.pendingPaste = { id, text: value, finalSequence };
+    const timer = setTimeout(() => {
+      const pending = this.pendingPaste;
+      if (!pending || pending.id !== id) return;
+      this.pendingPaste = null;
+      // The native side may have accepted a prefix before the channel died;
+      // retrying as typed text is the only bounded fallback available to the
+      // viewer and is preferable to silently dropping the user's paste.
+      this.sendTypedText(value);
+    }, PASTE_TRANSFER_TIMEOUT_MS);
+    this.pendingPaste = { id, text: value, finalSequence, timer };
     return true;
+  }
+
+  private clearPendingPaste(): void {
+    if (this.pendingPaste) clearTimeout(this.pendingPaste.timer);
+    this.pendingPaste = null;
   }
 
   private sendTypedText(value: string): boolean {
@@ -1119,6 +1142,9 @@ export class RemoteDesktopClient {
   }
 
   releaseAll(): void {
+    // A release/epoch transition starts a fresh native input ledger. Any
+    // in-flight paste belongs to the old ledger and must not block a new one.
+    this.clearPendingPaste();
     this.liftedModifiers.clear();
     this.pendingPointerMove = null;
     this.lastReliablePointerSyncAt = Number.NEGATIVE_INFINITY;
@@ -1270,6 +1296,7 @@ export class RemoteDesktopClient {
       this.clearStartTimer();
       this.workerInputEnabled = false;
       this.clearInputAck();
+      this.clearPendingPaste();
       this.requirePresentedFrameForCurrentTopology();
       const peerState = this.peer.connectionState;
       try {
@@ -1345,6 +1372,7 @@ export class RemoteDesktopClient {
         || message.mode !== this.snapshot.mode) {
         this.workerInputEnabled = false;
         this.clearInputAck();
+        this.clearPendingPaste();
       }
       this.publish({
         mode: message.mode,
@@ -1649,7 +1677,7 @@ export class RemoteDesktopClient {
         && parsed.value.reason === REMOTE_DESKTOP_CONTROL_REJECTION.PASTE_UNAVAILABLE
         && this.pendingPaste) {
         const pending = this.pendingPaste;
-        this.pendingPaste = null;
+        this.clearPendingPaste();
         this.sendTypedText(pending.text);
       }
       this.publishControlRejection(
@@ -1661,19 +1689,26 @@ export class RemoteDesktopClient {
       && parsed.value.kind === REMOTE_DESKTOP_CONTROL_KIND.INPUT_ACK
       && parsed.value.layoutRevision === this.snapshot.layoutRevision
       && parsed.value.inputEpoch === this.snapshot.inputEpoch
-      && parsed.value.acknowledgedSequence !== undefined
-      && parsed.value.acknowledgedSequence < this.sequence
-      && parsed.value.acknowledgedSequence > (this.snapshot.lastAcknowledgedInputSequence ?? -1)) {
-      this.publish({ lastAcknowledgedInputSequence: parsed.value.acknowledgedSequence });
-      if (this.pendingInputAckSequence !== null
-        && parsed.value.acknowledgedSequence >= this.pendingInputAckSequence) {
+      && parsed.value.acknowledgedSequence !== undefined) {
+      const acknowledged = parsed.value.acknowledgedSequence;
+      // Correlate paste completion before the generic monotonic input-ack
+      // projection. A keyboard/pointer ACK may advance that projection past
+      // this sequence, but it cannot acknowledge the paste itself; conversely
+      // a delayed exact paste ACK must still retire the pending transfer.
+      if (acknowledged < this.sequence
+        && this.pendingPaste && acknowledged === this.pendingPaste.finalSequence) {
+        this.clearPendingPaste();
+      }
+      if (acknowledged < this.sequence
+        && acknowledged > (this.snapshot.lastAcknowledgedInputSequence ?? -1)) {
+        this.publish({ lastAcknowledgedInputSequence: acknowledged });
+      }
+      if (acknowledged < this.sequence
+        && this.pendingInputAckSequence !== null
+        && acknowledged >= this.pendingInputAckSequence) {
         this.pendingInputAckSequence = null;
         if (this.inputAckTimer) clearTimeout(this.inputAckTimer);
         this.inputAckTimer = null;
-      }
-      if (this.pendingPaste
-        && parsed.value.acknowledgedSequence >= this.pendingPaste.finalSequence) {
-        this.pendingPaste = null;
       }
     }
   }
@@ -1735,6 +1770,7 @@ export class RemoteDesktopClient {
     this.channelsReady = isOpen(this.controlChannel)
       && isOpen(this.keyboardChannel)
       && isOpen(this.pointerChannel);
+    if (!this.channelsReady) this.clearPendingPaste();
     // A reopened channel is a new worker session: it has no preference yet.
     if (!isOpen(this.controlChannel)) this.sentQualityPreferenceKey = null;
     else this.flushQualityPreference();
@@ -2008,6 +2044,7 @@ export class RemoteDesktopClient {
     this.releaseAll();
     this.workerInputEnabled = false;
     this.clearInputAck();
+    this.clearPendingPaste();
     if (this.peer.connectionState !== 'connected') this.pendingIceRestart = true;
     this.publish({
       state: REMOTE_DESKTOP_STATE.RECONNECTING,

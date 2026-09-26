@@ -305,6 +305,13 @@ void ClipboardPasteAssemblerExpiresAndRejectsGaps() {
   Check(assembler.Append("paste_4", 0, 2, "alpha", start, &complete) ==
             Assembler::Result::kAccepted,
         "a gapped-transfer counterexample can start cleanly");
+  Check(assembler.Append("paste_5", 0, 2, "new ", start, &complete) ==
+            Assembler::Result::kAccepted && assembler.pending(),
+        "a fresh chunk-zero transfer supersedes abandoned content");
+  Check(assembler.Append("paste_5", 1, 2, "paste", start, &complete) ==
+            Assembler::Result::kComplete && complete == "new paste" &&
+            !assembler.pending(),
+        "the superseding transfer assembles normally");
   Check(assembler.Append("paste_4", 2, 2, "beta", start, &complete) ==
             Assembler::Result::kRejected && !assembler.pending(),
         "an out-of-order chunk clears partial content");

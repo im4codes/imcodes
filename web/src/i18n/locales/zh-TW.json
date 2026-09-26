@@ -4055,8 +4055,8 @@
       "scale_change_failed": "節點拒絕：Windows 未能套用該縮放比例。",
       "capture_failed": "節點拒絕：無法將畫面擷取切換到該顯示器。",
       "unlock_unavailable": "節點拒絕：未儲存登入密碼，或目前沒有需要解鎖的畫面。",
-      "paste_unavailable": "Remote clipboard unavailable; the text was typed instead.",
-      "paste_too_large": "Text too large for one clipboard paste; the text was typed instead."
+      "paste_unavailable": "遠端剪貼簿無法使用，已改為輸入文字。",
+      "paste_too_large": "文字太大，無法透過一次剪貼簿貼上，已改為輸入文字。"
     },
     "unlock": "解鎖",
     "unlock_hint": "讓該節點用本機儲存的密碼應答自己的登入畫面。",

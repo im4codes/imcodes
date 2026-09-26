@@ -31,6 +31,13 @@ class ClipboardPasteAssembler final {
       return Reject();
     }
 
+    // A new transfer beginning at chunk zero supersedes an abandoned partial
+    // transfer. This is required when the browser falls back after a send
+    // failure: waiting for the old timeout would otherwise reject every new
+    // paste until the worker's idle cleanup ran.
+    if (!paste_id_.empty() && paste_id != paste_id_ && chunk_index == 0) {
+      Reset();
+    }
     if (paste_id_.empty()) {
       if (chunk_index != 0) return Result::kRejected;
       paste_id_.assign(paste_id);

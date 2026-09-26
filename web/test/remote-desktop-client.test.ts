@@ -2892,6 +2892,86 @@ describe('RemoteDesktopClient translated shortcuts and paste', () => {
     client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
   });
 
+  it('does not let an unrelated higher input ack suppress paste fallback', async () => {
+    const { client, control, typed } = await inputReadyClient();
+    expect(client.pasteText('clipboard payload')).toBe(true);
+    const paste = JSON.parse(control.sent.at(-1)!) as { sequence: number };
+
+    // A keyboard/pointer ack can carry a later sequence than the paste. It is
+    // not proof that the native clipboard write + shortcut completed.
+    client.key('KeyA', 'a', true, false, released);
+    typed(); // discard the unrelated key from the test's keyboard trace
+    control.receive({
+      type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      sessionId: 'session_12345678',
+      sequence: 99,
+      layoutRevision: 1,
+      inputEpoch: 1,
+      kind: 'input_ack',
+      acknowledgedSequence: paste.sequence + 1,
+    });
+    control.receive({
+      type: REMOTE_DESKTOP_DATA_MSG.CONTROL_REJECTED,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      sessionId: 'session_12345678',
+      sequence: 100,
+      kind: REMOTE_DESKTOP_CONTROL_KIND.PASTE_TEXT,
+      reason: REMOTE_DESKTOP_CONTROL_REJECTION.PASTE_UNAVAILABLE,
+    });
+    expect(typed()).toEqual(['text clipboard payload']);
+    client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+  });
+
+  it('accepts the exact paste ack even after a higher unrelated ack', async () => {
+    const { client, control, typed } = await inputReadyClient();
+    vi.useFakeTimers();
+    try {
+      expect(client.pasteText('ack correlation')).toBe(true);
+      const paste = JSON.parse(control.sent.at(-1)!) as { sequence: number };
+      client.key('KeyA', 'a', true, false, released);
+      typed();
+      control.receive({
+        type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
+        protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+        sessionId: 'session_12345678',
+        sequence: 99,
+        layoutRevision: 1,
+        inputEpoch: 1,
+        kind: 'input_ack',
+        acknowledgedSequence: paste.sequence + 1,
+      });
+      control.receive({
+        type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
+        protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+        sessionId: 'session_12345678',
+        sequence: 100,
+        layoutRevision: 1,
+        inputEpoch: 1,
+        kind: 'input_ack',
+        acknowledgedSequence: paste.sequence,
+      });
+      vi.advanceTimersByTime(10_000);
+      expect(typed()).toEqual([]);
+      client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('falls back after a paste ack is lost instead of wedging later pastes', async () => {
+    const { client, typed } = await inputReadyClient();
+    vi.useFakeTimers();
+    try {
+      expect(client.pasteText('lost ack')).toBe(true);
+      vi.advanceTimersByTime(10_000);
+      expect(typed()).toEqual(['text lost ack']);
+      client.stop(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('does not put a lifted modifier back down once the browser reports it released', async () => {
     const { client, typed } = await inputReadyClient();
     // Command held on a Mac target, lifted for pasted text.

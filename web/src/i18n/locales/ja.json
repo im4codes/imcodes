@@ -4054,8 +4054,8 @@
       "scale_change_failed": "ノードが拒否しました: Windows がその拡大率を適用できませんでした。",
       "capture_failed": "ノードが拒否しました: 画面キャプチャをそのディスプレイに移せませんでした。",
       "unlock_unavailable": "ノードが拒否しました: サインインのパスワードが保存されていないか、今解除するものがありません。",
-      "paste_unavailable": "Remote clipboard unavailable; the text was typed instead.",
-      "paste_too_large": "Text too large for one clipboard paste; the text was typed instead."
+      "paste_unavailable": "リモートクリップボードを利用できないため、テキストを入力しました。",
+      "paste_too_large": "1回のクリップボード貼り付けには大きすぎるため、テキストを入力しました。"
     },
     "unlock": "ロック解除",
     "unlock_hint": "このノードに、保存済みのパスワードでサインイン画面へ応答させます。",

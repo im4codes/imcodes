@@ -1279,7 +1279,7 @@ void PeerSession::HandleControl(const std::string& channel,
     if (root.isMember(quality_key)) return;
   }
   const std::string kind = root["kind"].asString();
-  if (kind != "paste_text" && (root.isMember("pasteId") ||
+  if (kind != kPasteTextKind && (root.isMember("pasteId") ||
                                 root.isMember("chunkIndex") ||
                                 root.isMember("chunkCount") ||
                                 root.isMember("text"))) {
@@ -1288,7 +1288,7 @@ void PeerSession::HandleControl(const std::string& channel,
   uint64_t sequence = 0;
   const bool require_control = kind == "set_display_mode" ||
       kind == "set_display_scale" || kind == "copy_selection" ||
-      kind == "unlock" || kind == "paste_text";
+      kind == "unlock" || kind == kPasteTextKind;
   // A command that needs control but arrives without it is the one refusal the
   // controller cannot see any other way: the picture keeps updating and the
   // click simply vanishes. Answer it, but only for this session's own frames.
@@ -1404,7 +1404,7 @@ void PeerSession::HandleControl(const std::string& channel,
         !CopySelection(root["requestId"].asString())) {
       return;
     }
-  } else if (kind == "paste_text") {
+  } else if (kind == kPasteTextKind) {
     if (!root["pasteId"].isString() || !IsSafeId(root["pasteId"].asString()) ||
         !root["chunkIndex"].isUInt64() || !root["chunkCount"].isUInt64() ||
         !root["text"].isString() || root["text"].asString().empty() ||
@@ -1424,12 +1424,12 @@ void PeerSession::HandleControl(const std::string& channel,
         root["chunkCount"].asUInt64(), root["text"].asString(),
         std::chrono::steady_clock::now(), &pasted);
     if (assembled == common::ClipboardPasteAssembler::Result::kRejected) {
-      SendControlRejected("paste_text", kRejectPasteUnavailable);
+      SendControlRejected(kPasteTextKind, kRejectPasteUnavailable);
       return;
     }
     if (assembled == common::ClipboardPasteAssembler::Result::kComplete &&
         (!clipboard_adapter_ || !clipboard_adapter_->PasteText(pasted))) {
-      SendControlRejected("paste_text", kRejectPasteUnavailable);
+      SendControlRejected(kPasteTextKind, kRejectPasteUnavailable);
       return;
     }
   } else {
@@ -1437,7 +1437,7 @@ void PeerSession::HandleControl(const std::string& channel,
   }
   last_sequence_by_channel_[channel] = sequence;
   TouchActivity();
-  if (kind == "paste_text") SendInputAck(sequence);
+  if (kind == kPasteTextKind) SendInputAck(sequence);
   if (acknowledge_layout) {
     layout_acknowledged_ = true;
     SendStatus(IsRelayed() ? "relayed" : "direct", InputReady());

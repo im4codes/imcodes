@@ -1914,20 +1914,22 @@ void WorkerTransportSink::HandleDataChannelMessage(
       accepted = SendClipboard(
           *message.control.request_id,
           copied ? std::optional<std::string>(text) : std::nullopt);
-    } else if (kind == "paste_text") {
+    } else if (kind == imcodes::rd::kPasteTextKind) {
       std::string pasted_text;
       const auto assembled = clipboard_paste_assembler_.Append(
           *message.control.paste_id, *message.control.chunk_index,
           *message.control.chunk_count, *message.control.text,
           std::chrono::steady_clock::now(), &pasted_text);
       if (assembled == rd::common::ClipboardPasteAssembler::Result::kRejected) {
-        (void)SendControlRejected(kind, imcodes::rd::kRejectPasteUnavailable);
+        (void)SendControlRejected(imcodes::rd::kPasteTextKind,
+                                  imcodes::rd::kRejectPasteUnavailable);
         return;
       }
       if (assembled == rd::common::ClipboardPasteAssembler::Result::kComplete) {
         if (authority->mode != imcodes::rd::kControlMode ||
             !session_->PasteText(pasted_text)) {
-          (void)SendControlRejected(kind, imcodes::rd::kRejectPasteUnavailable);
+          (void)SendControlRejected(imcodes::rd::kPasteTextKind,
+                                    imcodes::rd::kRejectPasteUnavailable);
           return;
         }
       }

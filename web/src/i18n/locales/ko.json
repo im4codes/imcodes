@@ -4054,8 +4054,8 @@
       "scale_change_failed": "노드가 거부했습니다: Windows가 해당 배율을 적용하지 못했습니다.",
       "capture_failed": "노드가 거부했습니다: 화면 캡처를 해당 디스플레이로 옮기지 못했습니다.",
       "unlock_unavailable": "노드가 거부했습니다: 저장된 로그인 암호가 없거나 지금 해제할 대상이 없습니다.",
-      "paste_unavailable": "Remote clipboard unavailable; the text was typed instead.",
-      "paste_too_large": "Text too large for one clipboard paste; the text was typed instead."
+      "paste_unavailable": "원격 클립보드를 사용할 수 없어 텍스트를 대신 입력했습니다.",
+      "paste_too_large": "한 번의 클립보드 붙여넣기에 너무 큰 텍스트라 대신 입력했습니다."
     },
     "unlock": "잠금 해제",
     "unlock_hint": "이 노드가 저장된 암호로 자체 로그인 화면에 응답하도록 요청합니다.",
