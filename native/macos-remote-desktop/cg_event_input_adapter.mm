@@ -62,7 +62,7 @@ std::optional<CGKeyCode> MapKey(std::string_view code) {
   // Sorted, and the sorting is asserted at compile time rather than trusted,
   // because the binary search below silently returns the wrong key code for an
   // out-of-order entry instead of failing.
-  static constexpr std::array<std::pair<std::string_view, CGKeyCode>, 42> kNamedKeys = {{
+  static constexpr std::array<std::pair<std::string_view, CGKeyCode>, 43> kNamedKeys = {{
       {"AltLeft", 58},
       {"AltRight", 61},
       {"ArrowDown", 125},
@@ -83,6 +83,9 @@ std::optional<CGKeyCode> MapKey(std::string_view code) {
       {"Enter", 36},
       {"Equal", 24},
       {"Escape", 53},
+      // Fn (Globe). Never sent by a viewer; the adapter only ever releases it,
+      // clearing the Fn state an injected arrow key leaves latched.
+      {"Fn", 63},
       {"Home", 115},
       {"Insert", 114},
       {"MetaLeft", 55},
@@ -134,7 +137,8 @@ std::optional<CGKeyCode> MapKey(std::string_view code) {
       code[6] <= '9') {
     return kNumpadCodes[code[6] - '0'];
   }
-  if (code.size() >= 2 && code.size() <= 3 && code[0] == 'F') {
+  if (code.size() >= 2 && code.size() <= 3 && code[0] == 'F' &&
+      code[1] >= '0' && code[1] <= '9') {
     int number = 0;
     for (std::size_t index = 1; index < code.size(); ++index) {
       if (code[index] < '0' || code[index] > '9')
@@ -196,12 +200,42 @@ constexpr ModifierBits kModifierBits[common::kLatchableModifierCount] = {
     {kCGEventFlagMaskCommand, 0x00000008, 0x00000010},
 };
 
+// kVK_Function.
+constexpr CGKeyCode kFunctionKeyCode = 63;
+
+// Fn (Globe), numeric pad and Help: set by the keyboard itself on particular
+// keys, never a state an injected event may inherit.
+constexpr std::uint64_t kKeyIntrinsicFlags =
+    kCGEventFlagMaskSecondaryFn | kCGEventFlagMaskNumericPad |
+    kCGEventFlagMaskHelp;
+
+// What a real Mac keyboard puts on this key's own events.
+std::uint64_t IntrinsicKeyFlags(std::string_view key) noexcept {
+  if (key == "ArrowLeft" || key == "ArrowRight" || key == "ArrowUp" ||
+      key == "ArrowDown") {
+    return kCGEventFlagMaskSecondaryFn | kCGEventFlagMaskNumericPad;
+  }
+  if (key == "Home" || key == "End" || key == "PageUp" || key == "PageDown" ||
+      key == "Delete" || key == "Insert") {
+    return kCGEventFlagMaskSecondaryFn;
+  }
+  if (key.size() >= 2 && key.size() <= 3 && key[0] == 'F' && key[1] >= '1' &&
+      key[1] <= '9') {
+    return kCGEventFlagMaskSecondaryFn;
+  }
+  if (key.starts_with("Numpad") || key == "NumLock")
+    return kCGEventFlagMaskNumericPad;
+  return 0;
+}
+
 } // namespace
 
 std::uint64_t ComposeInjectedModifierFlags(
     std::uint64_t event_flags,
-    const std::vector<std::string> &held_modifier_keys) noexcept {
-  std::uint64_t flags = event_flags;
+    const std::vector<std::string> &held_modifier_keys,
+    std::string_view key) noexcept {
+  std::uint64_t flags = event_flags & ~kKeyIntrinsicFlags;
+  flags |= IntrinsicKeyFlags(key);
   for (const ModifierBits &bits : kModifierBits)
     flags &= ~(static_cast<std::uint64_t>(bits.mask) | bits.left | bits.right);
   for (std::size_t index = 0; index < common::kLatchableModifierCount; ++index) {
@@ -246,13 +280,20 @@ public:
       return {};
     const CGEventFlags flags =
         CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState);
-    return common::CollectLatchedModifiers(
+    std::vector<std::string> latched = common::CollectLatchedModifiers(
         [flags](const common::LatchableModifier &, std::size_t index) {
           const ModifierBits &bits = kModifierBits[index];
           return common::ModifierHeldSides{(flags & bits.mask) != 0,
                                            (flags & bits.left) != 0,
                                            (flags & bits.right) != 0};
         });
+    // Fn (Globe) latches too: an injected arrow key sets it (arrows carry Fn
+    // on a real keyboard) and its own key-up leaves it set, so the next
+    // letter becomes Fn+letter. A Fn key-up clears it, as a physical Fn
+    // press would.
+    if ((flags & kCGEventFlagMaskSecondaryFn) != 0)
+      latched.emplace_back("Fn");
+    return latched;
   }
 
   bool MovePointer(const common::LogicalPoint &point) override {
@@ -276,7 +317,7 @@ public:
                                                button);
     if (event != nullptr && type != kCGEventMouseMoved)
       CGEventSetIntegerValueField(event, kCGMouseEventClickState, click_count_);
-    return Post(event);
+    return Post(event, {});
   }
 
   bool EmitKey(std::string_view key, bool pressed) override {
@@ -292,7 +333,15 @@ public:
         held_modifiers_.erase(std::string(key));
     }
     CGEventRef event = CGEventCreateKeyboardEvent(nullptr, *key_code, pressed);
-    return Post(event);
+    if (!Post(event, key))
+      return false;
+    // An arrow, navigation, F- or keypad key carries Fn/numeric-pad on a real
+    // keyboard, and the window server keeps that state after the key's own
+    // key-up. Release it now, the way a physical Fn press would, so neither
+    // the next injected key nor someone typing at the Mac inherits it.
+    if (!pressed && IntrinsicKeyFlags(key) != 0)
+      Post(CGEventCreateKeyboardEvent(nullptr, kFunctionKeyCode, false), "Fn");
+    return true;
   }
 
   bool EmitButton(std::string_view button, bool pressed) override {
@@ -337,7 +386,7 @@ public:
     if (event != nullptr)
       CGEventSetIntegerValueField(event, kCGMouseEventClickState,
                                   name == last_click_button_ ? click_count_ : 1);
-    return Post(event);
+    return Post(event, {});
   }
 
   bool EmitWheel(double delta_x, double delta_y) override {
@@ -357,7 +406,7 @@ public:
       return true;
     CGEventRef event = CGEventCreateScrollWheelEvent(
         nullptr, kCGScrollEventUnitPixel, 2, vertical, horizontal);
-    return Post(event);
+    return Post(event, {});
   }
 
   bool EmitText(std::string_view text) override {
@@ -387,8 +436,8 @@ public:
                                       code_units.data());
       // Text is never a shortcut: carry no modifier at all, whatever the
       // window server currently reports as held.
-      CGEventSetFlags(down, ComposeInjectedModifierFlags(CGEventGetFlags(down), {}));
-      CGEventSetFlags(up, ComposeInjectedModifierFlags(CGEventGetFlags(up), {}));
+      CGEventSetFlags(down, ComposeInjectedModifierFlags(CGEventGetFlags(down), {}, {}));
+      CGEventSetFlags(up, ComposeInjectedModifierFlags(CGEventGetFlags(up), {}, {}));
       CGEventSetIntegerValueField(down, kCGEventSourceUserData,
                                   kImcodesSyntheticEventMarker);
       CGEventSetIntegerValueField(up, kCGEventSourceUserData,
@@ -402,18 +451,20 @@ public:
   }
 
 private:
-  bool Post(CGEventRef event) {
+  bool Post(CGEventRef event, std::string_view key) {
     if (event == nullptr)
       return false;
     // An event created without a source copies the window server's current
     // modifier flags. Once any modifier is latched there (a key-up that never
-    // arrived), every later letter would be a Command/Control/Option
-    // shortcut and every click a modified click. Stamp the modifiers this
-    // session is actually holding instead of inheriting the global state.
+    // arrived, or the Fn state an injected arrow key leaves behind), every
+    // later letter would be a shortcut -- Fn+E opens the emoji picker -- and
+    // every click a modified click. Stamp what this session actually holds
+    // and what this key itself carries instead of inheriting the global state.
     CGEventSetFlags(event, ComposeInjectedModifierFlags(
                                CGEventGetFlags(event),
                                std::vector<std::string>(held_modifiers_.begin(),
-                                                        held_modifiers_.end())));
+                                                        held_modifiers_.end()),
+                               key));
     CGEventSetIntegerValueField(event, kCGEventSourceUserData,
                                 kImcodesSyntheticEventMarker);
     CGEventPost(kCGHIDEventTap, event);

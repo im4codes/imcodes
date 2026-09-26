@@ -87,15 +87,22 @@ public:
   [[nodiscard]] virtual std::vector<std::string> LatchedModifierKeys() = 0;
 };
 
-// The CGEventFlags an injected event must carry: the event's own non-modifier
-// flags (Caps Lock, numeric pad, Fn, ...) with every Control/Shift/Option/
-// Command bit replaced by exactly the modifiers this session holds, named in
-// the adapter's key vocabulary ("ShiftLeft", ...). An event created without a
-// source otherwise copies whatever the window server holds, so one latched
-// modifier would turn every later letter into a shortcut.
+// The CGEventFlags an injected event must carry. An event created without a
+// source copies whatever the window server holds, so one latched modifier --
+// Control/Shift/Option/Command, or the Fn (Globe) and numeric-pad state an
+// arrow key leaves behind -- would turn every later letter into a shortcut
+// (Fn+E opens the emoji picker). Nothing modifier-like is inherited:
+//   - Control/Shift/Option/Command are exactly the modifiers this session
+//     holds, named in the adapter's key vocabulary ("ShiftLeft", ...);
+//   - Fn, numeric pad and Help are only what `key` itself carries on a real
+//     keyboard (arrows: Fn + numeric pad; Home/End/Page/forward-Delete/Help
+//     and F-keys: Fn; keypad keys: numeric pad). `key` is empty for mouse,
+//     wheel and text events, which carry none;
+//   - Caps Lock and every other bit are kept.
 [[nodiscard]] std::uint64_t ComposeInjectedModifierFlags(
     std::uint64_t event_flags,
-    const std::vector<std::string> &held_modifier_keys) noexcept;
+    const std::vector<std::string> &held_modifier_keys,
+    std::string_view key) noexcept;
 
 // Input ownership, epochs, sequence fencing and controller reference counts
 // stay in common::InputLedger. This class is only the platform emission seam:

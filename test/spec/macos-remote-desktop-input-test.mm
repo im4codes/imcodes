@@ -243,19 +243,66 @@ bool TestALatchedModifierHealsMidSession() {
 // CGEventFlags values: Command 0x100000 (left 0x8, right 0x10), Shift 0x20000
 // (left 0x2), Control 0x40000 (left 0x1), Caps Lock 0x10000, numeric pad
 // 0x200000.
+// Every injected event carries exactly the session's own modifiers plus what
+// its own key carries on a real keyboard. Raw CGEventFlags values: Command
+// 0x100000 (left 0x8, right 0x10), Shift 0x20000 (left 0x2), Control 0x40000
+// (left 0x1), Caps Lock 0x10000, numeric pad 0x200000, Help 0x400000, Fn
+// (Globe) 0x800000. 0x20000000 is an undocumented bit the window server sets
+// on every event; it is not modifier-like and passes through.
 bool TestInjectedEventsCarryOnlyHeldModifierFlags() {
   const std::uint64_t stale_command = 0x100000 | 0x8;
-  const std::uint64_t unrelated = 0x10000 | 0x200000;
-  return Check(input::ComposeInjectedModifierFlags(stale_command | unrelated, {}) ==
-                   unrelated,
+  // Measured on a Mac after one injected Right-arrow: Fn + numeric pad stay
+  // set in the window server, so an event created for "e" carries them and
+  // becomes Fn+E -- the emoji picker.
+  const std::uint64_t stale_after_arrow = 0x20000000 | 0x800000 | 0x200000;
+  const std::uint64_t caps_lock = 0x10000;
+  return Check(input::ComposeInjectedModifierFlags(stale_command | caps_lock, {}, "KeyE") ==
+                   caps_lock,
                "a latched Command inherited from the window server is dropped, "
-               "Caps Lock and numeric-pad flags are kept") &&
-         Check(input::ComposeInjectedModifierFlags(stale_command, {"ShiftLeft"}) ==
+               "Caps Lock is kept") &&
+         Check(input::ComposeInjectedModifierFlags(stale_after_arrow, {}, "KeyE") ==
+                   0x20000000u,
+               "the Fn and numeric-pad state an arrow left behind is dropped "
+               "from a letter: e is e, not Fn+E") &&
+         Check(input::ComposeInjectedModifierFlags(stale_after_arrow | 0x400000, {}, {}) ==
+                   0x20000000u,
+               "mouse, wheel and text events carry no Fn, numeric-pad or Help") &&
+         Check(input::ComposeInjectedModifierFlags(0, {}, "ArrowRight") ==
+                   (0x800000u | 0x200000u),
+               "an arrow carries Fn and numeric pad, as on a real keyboard") &&
+         Check(input::ComposeInjectedModifierFlags(0, {}, "F5") == 0x800000u &&
+                   input::ComposeInjectedModifierFlags(0, {}, "PageDown") == 0x800000u &&
+                   input::ComposeInjectedModifierFlags(0, {}, "Delete") == 0x800000u,
+               "F-keys and navigation keys carry Fn") &&
+         Check(input::ComposeInjectedModifierFlags(0x800000, {}, "NumpadAdd") == 0x200000u,
+               "a keypad key carries numeric pad and no inherited Fn") &&
+         Check(input::ComposeInjectedModifierFlags(stale_command, {"ShiftLeft"}, "KeyA") ==
                    (0x20000u | 0x2u),
                "a held Shift replaces the stale Command") &&
-         Check(input::ComposeInjectedModifierFlags(0, {"MetaRight", "ControlLeft"}) ==
+         Check(input::ComposeInjectedModifierFlags(0, {"MetaRight", "ControlLeft"}, "KeyC") ==
                    (0x100000u | 0x10u | 0x40000u | 0x1u),
                "held modifiers set their mask and side bits");
+}
+
+// The Fn state an injected arrow leaves latched is released before the next
+// press like any other latched modifier, and the latch report names it.
+bool TestALatchedFnHealsBeforeTheNextLetter() {
+  auto backend = std::make_unique<FakeBackend>();
+  FakeBackend *fake = backend.get();
+  input::CGEventInputAdapter adapter(42, std::move(backend));
+  const auto topology = Topology();
+  if (!Check(adapter.BindTopology(topology, topology.displays[0].display_id),
+             "current topology must bind")) {
+    return false;
+  }
+  common::InputLedger ledger(adapter);
+  fake->latched_modifiers = {"Fn"};
+  fake->key_events.clear();
+  return Check(ledger.ApplyKey(Stamp("controller-a", 1), 7, "KeyE", true) ==
+                       common::InputResult::kApplied &&
+                   fake->key_events ==
+                       std::vector<Transition>{{"Fn", false}, {"KeyE", true}},
+               "a latched Fn is released before e is pressed");
 }
 
 bool TestLedgerOnlyOperationsAndLogicalGeometry() {
@@ -550,6 +597,7 @@ int main() {
     return TestASessionStartsOnACleanKeyboard() &&
                    TestALatchedModifierHealsMidSession() &&
                    TestInjectedEventsCarryOnlyHeldModifierFlags() &&
+                   TestALatchedFnHealsBeforeTheNextLetter() &&
                    TestLedgerOnlyOperationsAndLogicalGeometry() &&
                    TestClipboardShortcutsUseRealBoundInputAndReleaseEveryKey() &&
                    TestTopologyAndSequenceFences() &&
