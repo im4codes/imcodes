@@ -190,6 +190,7 @@ describe('SubSessionCard', () => {
     expect(useTimelineSpy).toHaveBeenLastCalledWith('deck_sub_sub-card-1', null, undefined, {
       isActiveSession: false,
       isVisible: false,
+      subscriptionMode: 'summary',
     });
 
     await act(async () => {
@@ -199,6 +200,7 @@ describe('SubSessionCard', () => {
     expect(useTimelineSpy).toHaveBeenLastCalledWith('deck_sub_sub-card-1', null, undefined, {
       isActiveSession: false,
       isVisible: true,
+      subscriptionMode: 'summary',
     });
   });
 
@@ -220,6 +222,7 @@ describe('SubSessionCard', () => {
     expect(useTimelineSpy).toHaveBeenLastCalledWith('deck_sub_sub-card-1', null, undefined, {
       isActiveSession: false,
       isVisible: true,
+      subscriptionMode: 'summary',
     });
   });
 
@@ -239,6 +242,7 @@ describe('SubSessionCard', () => {
     expect(useTimelineSpy).toHaveBeenLastCalledWith('deck_sub_sub-card-1', null, undefined, {
       isActiveSession: true,
       isVisible: true,
+      subscriptionMode: 'summary',
     });
 
     view.rerender(
@@ -256,6 +260,7 @@ describe('SubSessionCard', () => {
     expect(useTimelineSpy).toHaveBeenLastCalledWith('deck_sub_sub-card-1', null, undefined, {
       isActiveSession: false,
       isVisible: true,
+      subscriptionMode: 'summary',
     });
   });
 

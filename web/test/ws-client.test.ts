@@ -148,6 +148,46 @@ describe('WsClient', () => {
     expect(handler).toHaveBeenCalledWith(msg);
   });
 
+  it('arbitrates timeline subscriptions with full for any active owner', async () => {
+    const client = await connectClient();
+    lastWs!.send.mockClear();
+    const hidden = Symbol('hidden');
+    const active = Symbol('active');
+    client.subscribeTimelineSession('s1', hidden, 'summary');
+    client.subscribeTimelineSession('s1', active, 'full');
+    const sent = lastWs!.send.mock.calls.map((call) => JSON.parse(call[0] as string));
+    expect(sent.at(-1)).toMatchObject({ type: TIMELINE_MESSAGES.SUBSCRIBE, sessionName: 's1', mode: 'full' });
+    client.unsubscribeTimelineSession('s1', active);
+    expect(JSON.parse(lastWs!.send.mock.calls.at(-1)![0] as string)).toMatchObject({ type: TIMELINE_MESSAGES.SUBSCRIBE, sessionName: 's1', mode: 'summary' });
+  });
+
+  it('keeps an active full subscription across browser visibility changes', async () => {
+    const client = await connectClient();
+    const owner = Symbol('active');
+    client.subscribeTimelineSession('s1', owner, 'full');
+    lastWs!.send.mockClear();
+    setDocumentVisibility('hidden');
+    document.dispatchEvent(new Event('visibilitychange'));
+    setDocumentVisibility('visible');
+    document.dispatchEvent(new Event('visibilitychange'));
+    const timelineFrames = lastWs!.send.mock.calls
+      .map((call) => JSON.parse(call[0] as string))
+      .filter((message) => message.type === TIMELINE_MESSAGES.SUBSCRIBE);
+    expect(timelineFrames.every((message) => message.mode === 'full')).toBe(true);
+  });
+
+  it('routes timeline frames to the matching session handler', async () => {
+    const client = await connectClient();
+    const s1 = vi.fn();
+    const s2 = vi.fn();
+    client.onSessionMessage('s1', s1);
+    client.onSessionMessage('s2', s2);
+    const event = { eventId: 'e1', sessionId: 's1', ts: 1, seq: 1, epoch: 1, source: 'daemon', confidence: 'high', type: 'assistant.text', payload: { text: 'final', streaming: false } };
+    lastWs!.emit('message', { data: JSON.stringify({ type: TIMELINE_MESSAGES.EVENT, event }) });
+    expect(s1).toHaveBeenCalledOnce();
+    expect(s2).not.toHaveBeenCalled();
+  });
+
   it('does not dispatch pong messages to handlers', async () => {
     const client = new WsClient('http://localhost:8787', 'srv-1');
     const handler = vi.fn();

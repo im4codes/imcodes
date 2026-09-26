@@ -81,6 +81,7 @@ function localizedDelegationAckError(error: unknown): string | undefined {
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'preact/hooks';
 import type { WsClient, TimelineEvent, ServerMessage } from '../ws-client.js';
 import { TimelineDB, type DrainCursor } from '../timeline-db.js';
+import { getTimelineStore, __resetTimelineStoresForTests } from '../stores/timeline-store.js';
 import {
   TIMELINE_DETAIL_FIELD_PATHS,
   mergeTimelineEvents,
@@ -189,6 +190,7 @@ sharedDb.open().catch(() => {});
 // Updated by every useTimeline instance so that a second instance for the same
 // session (e.g. SubSessionWindow opening while SubSessionCard is running) can
 // render immediately from in-memory state without waiting for IDB or network.
+// Canonical per-session stores prevent duplicate merge/cache work across panes.
 const eventsCache = new Map<string, TimelineEvent[]>();
 const cacheListeners = new Map<string, Set<(events: TimelineEvent[]) => void>>();
 // Per-cacheKey wall-clock of the last *successful* HTTP backfill (response
@@ -842,12 +844,9 @@ function setCachedEvents(cacheKey: string, events: TimelineEvent[]): void {
   const bounded = events.length > MAX_WINDOW_CACHED_EVENTS
     ? events.slice(events.length - MAX_WINDOW_CACHED_EVENTS)
     : events;
+  getTimelineStore(cacheKey).replace(bounded, undefined, undefined, MAX_WINDOW_CACHED_EVENTS);
   eventsCache.set(cacheKey, bounded);
   scheduleTimelineSnapshotPersist(cacheKey, bounded);
-  const listeners = cacheListeners.get(cacheKey);
-  if (listeners) {
-    for (const listener of listeners) listener(bounded);
-  }
 }
 
 function scheduleBrowserFrame(callback: () => void): () => void {
@@ -860,18 +859,9 @@ function scheduleBrowserFrame(callback: () => void): () => void {
 }
 
 function subscribeCache(cacheKey: string, listener: (events: TimelineEvent[]) => void): () => void {
-  let listeners = cacheListeners.get(cacheKey);
-  if (!listeners) {
-    listeners = new Set();
-    cacheListeners.set(cacheKey, listeners);
-  }
-  listeners.add(listener);
-  return () => {
-    const set = cacheListeners.get(cacheKey);
-    if (!set) return;
-    set.delete(listener);
-    if (set.size === 0) cacheListeners.delete(cacheKey);
-  };
+  const store = getTimelineStore(cacheKey);
+  const wrapped = () => listener(store.getSnapshot().events);
+  return store.subscribe(wrapped);
 }
 
 function scopeCacheKey(serverId: string | null | undefined, sessionId: string): string {
@@ -1505,6 +1495,7 @@ export function __resetTimelineCacheForTests(): void {
   flushPendingTimelineSnapshotWrites();
   eventsCache.clear();
   cacheListeners.clear();
+  __resetTimelineStoresForTests();
   lastHttpBackfillResponseAt.clear();
   watchdogStateByCacheKey.clear();
   backgroundBackfillGateByCacheKey.clear();
@@ -1687,6 +1678,8 @@ export interface UseTimelineOptions {
    * tool/result/idle frames but the daemon already reports the session idle.
    */
   authoritativeSessionState?: string;
+  /** Desired live timeline delivery for this presentation. Active/on-screen views use full; hidden cards use summary. */
+  subscriptionMode?: import('@shared/timeline-protocol.js').TimelineSubscriptionMode;
 }
 
 export type TimelineHistoryPhase = 'idle' | 'bootstrap' | 'refresh' | 'older';
@@ -2069,12 +2062,15 @@ export function useTimeline(
   const cacheKey = sessionId ? scopeCacheKey(serverId, sessionId) : sessionId;
   const isActiveSession = options?.isActiveSession ?? true;
   const isVisible = options?.isVisible ?? isActiveSession;
+  const subscriptionMode = options?.subscriptionMode ?? (isActiveSession || isVisible ? 'full' : 'summary');
   const bootstrapWhenVisible = options?.bootstrapWhenVisible ?? false;
   const shouldBootstrapVisibleHistory = isActiveSession || (bootstrapWhenVisible && isVisible);
   const disableHistory = options?.disableHistory ?? false;
   const authoritativeSessionState = options?.authoritativeSessionState;
   const wsConnected = !!ws?.connected;
   const cacheKeyRef = useRef(cacheKey);
+  const timelineSubscriptionOwnerRef = useRef<symbol>(Symbol('timeline-subscription'));
+  const previousSubscriptionModeRef = useRef<typeof subscriptionMode | null>(null);
   cacheKeyRef.current = cacheKey;
   // ── Synchronous cache seed at first render ─────────────────────────────
   // The bootstrap effect that hits memCache / localStorage / IDB runs AFTER
@@ -4344,6 +4340,32 @@ export function useTimeline(
     return () => window.clearInterval(id);
   }, [disableHistory, serverId, sessionId, ws]);
 
+  // Keep every mounted presentation subscribed. Hidden/minimized cards receive
+  // summary frames (including final assistant text), while any active/on-screen
+  // view is always full. Browser visibility never downgrades an active view.
+  useEffect(() => {
+    if (!ws || !sessionId || disableHistory) return;
+    const key = cacheKeyRef.current;
+    const snapshot = key ? getTimelineStore(key).getSnapshot() : undefined;
+    const cursor = snapshot && snapshot.epoch > 0
+      ? { epoch: snapshot.epoch, afterSeq: snapshot.seq }
+      : undefined;
+    const owner = timelineSubscriptionOwnerRef.current;
+    const previousMode = previousSubscriptionModeRef.current;
+    previousSubscriptionModeRef.current = subscriptionMode;
+    if (typeof ws.subscribeTimelineSession === 'function') {
+      ws.subscribeTimelineSession(sessionId, owner, subscriptionMode, cursor);
+    }
+    if (cursor && ws.connected && previousMode !== null && previousMode !== subscriptionMode) {
+      ws.sendTimelineHistoryRequest(sessionId, MAX_HISTORY_EVENTS, undefined, undefined, {
+        epoch: cursor.epoch, afterSeq: cursor.afterSeq, direction: TIMELINE_CURSOR_DIRECTIONS.NEWER,
+      });
+    }
+    return () => {
+      if (typeof ws.unsubscribeTimelineSession === 'function') ws.unsubscribeTimelineSession(sessionId, owner);
+    };
+  }, [disableHistory, sessionId, subscriptionMode, ws]);
+
   // Listen for WS messages
   useEffect(() => {
     if (disableHistory || !ws || !sessionId) return;
@@ -4353,6 +4375,16 @@ export function useTimeline(
         applyTransportQueueEvidence(msg);
         return;
       }
+      // Server may coalesce summary/full frames under pressure. Recover the
+      // missing ordered range from the canonical per-session history cursor.
+      if (msg.type === TIMELINE_MESSAGES.SEQ_GAP) {
+        if (msg.sessionId !== sessionId || !msg.backfill) return;
+        ws.sendTimelineHistoryRequest(sessionId, MAX_HISTORY_EVENTS, undefined, undefined, {
+          epoch: msg.epoch, afterSeq: msg.toSeq, direction: TIMELINE_CURSOR_DIRECTIONS.NEWER,
+        });
+        return;
+      }
+
       // ── Real-time event ──
       if (msg.type === TIMELINE_MESSAGES.EVENT) {
         const event = msg.event;
@@ -4877,8 +4909,15 @@ export function useTimeline(
       }
     };
 
-    const unsub = ws.onMessage(handler);
-    return unsub;
+    const hasSessionRouting = typeof ws.onSessionMessage === 'function';
+    const unsub = hasSessionRouting ? ws.onSessionMessage(sessionId, handler) : ws.onMessage(handler);
+    // Daemon lifecycle frames are intentionally global (no session id). Keep
+    // only this low-frequency control path on the global bus; high-volume
+    // timeline/terminal frames remain exact-session routed.
+    const unsubGlobal = hasSessionRouting ? ws.onMessage((msg) => {
+      if (msg.type === DAEMON_MSG.RECONNECTED) handler(msg);
+    }) : () => {};
+    return () => { unsub(); unsubGlobal(); };
   }, [applyTimelineTransportQueueEvidence, applyTransportQueueEvidence, beginReconnectRefresh, buildForwardHistoryArgs, clearForwardHistoryTimeout, clearTerminalTailIdleReconcile, disableHistory, isActiveSession, ws, sessionId, appendEvent, clearOptimisticTimer, idbPutEvents, loading, markOptimisticFailed, mergeEvents, reconcileQueuedOptimisticMessages, recordTimelineResponse, rememberSettledCommandId, replaceEvents, resetOlderState, scheduleAutoRetry, scheduleTerminalTailIdleReconcile, sendForwardHistoryRequest, serverId, settleOptimisticByCommandAck, settleOptimisticByCommandAckEvent, settleOptimisticByTimelineProgress, updateHistoryStep]);
 
   useEffect(() => {

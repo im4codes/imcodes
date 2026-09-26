@@ -1375,7 +1375,7 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
       sub.sessionName,
       ws,
       undefined,
-      { isActiveSession: false, isVisible: false, bootstrapWhenVisible: true },
+      { isActiveSession: false, isVisible: false, subscriptionMode: 'summary', bootstrapWhenVisible: true },
     );
     expect(ws.holdTerminalRaw).not.toHaveBeenCalled();
     expect(ws.subscribeTerminal).not.toHaveBeenCalled();
@@ -1408,7 +1408,7 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
       sub.sessionName,
       ws,
       undefined,
-      { isActiveSession: false, isVisible: true, bootstrapWhenVisible: true },
+      { isActiveSession: false, isVisible: true, subscriptionMode: 'full', bootstrapWhenVisible: true },
     );
   });
 

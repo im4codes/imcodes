@@ -314,6 +314,7 @@ export function SubSessionWindow({
     // HTTP/IDB work together when the browser resumes after sleep.
     isActiveSession: active,
     isVisible: visible,
+    subscriptionMode: visible ? 'full' : 'summary',
     bootstrapWhenVisible: true,
   });
 

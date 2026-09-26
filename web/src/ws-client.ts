@@ -45,6 +45,7 @@ import {
   type TimelinePageResponse,
   type TimelineReplayResponse,
 } from '@shared/timeline-protocol.js';
+import type { TimelineSeqGap, TimelineSubscriptionMode } from '@shared/timeline-protocol.js';
 import { CC_PRESET_MSG, type CcPreset, type CcPresetModelInfo } from '@shared/cc-presets.js';
 import { MEMORY_WS, type MemoryMcpStatusResponseMessage } from '@shared/memory-ws.js';
 import type {
@@ -78,6 +79,25 @@ import type { DaemonBuildInfo } from '@shared/build-manifest-types.js';
 import type { DirectFileTransferServerMessage } from '@shared/direct-file-transfer.js';
 
 export type MessageHandler = (msg: ServerMessage) => void;
+export type SessionMessageHandler = (msg: ServerMessage) => void;
+
+function sessionIdForServerMessage(msg: ServerMessage): string | null {
+  if (msg.type === TIMELINE_MESSAGES.EVENT) return msg.event.sessionId;
+  if (msg.type === TIMELINE_MESSAGES.SEQ_GAP) return msg.sessionId;
+  if (msg.type === TRANSPORT_MSG.CHAT_HISTORY
+    || msg.type === TRANSPORT_MSG.CHAT_APPROVAL
+    || msg.type === TRANSPORT_MSG.APPROVAL_RESPONSE) return msg.sessionId;
+  if (msg.type === TIMELINE_MESSAGES.HISTORY
+    || msg.type === TIMELINE_MESSAGES.REPLAY
+    || msg.type === TIMELINE_MESSAGES.PAGE
+    || msg.type === TIMELINE_MESSAGES.DETAIL) return msg.sessionName ?? null;
+  if (msg.type === 'terminal.diff') return msg.diff.sessionName;
+  if (msg.type === 'terminal.history') return msg.sessionName;
+  if (msg.type === 'terminal.stream_reset') return msg.session;
+  if (msg.type === 'session.event' || msg.type === 'session.idle' || msg.type === 'session.notification' || msg.type === 'session.tool') return msg.session;
+  if (msg.type === MSG_COMMAND_ACK || msg.type === MSG_COMMAND_FAILED) return msg.session;
+  return null;
+}
 
 export interface P2pWorkflowRequestScope {
   sessionName?: string;
@@ -188,6 +208,7 @@ export type ServerMessage =
   | { type: 'session_list'; daemonVersion?: string | null; sessions: Array<{ name: string; sessionInstanceId?: string; runtimeEpoch?: string; project: string; role: string; agentType: string; providerId?: string; agentVersion?: string; state: string; error?: string | null; projectDir?: string; runtimeType?: 'process' | 'transport'; label?: string; description?: string; userCreated?: boolean; ccPreset?: string | null; qwenModel?: string; requestedModel?: string; activeModel?: string; qwenAuthType?: string; qwenAuthLimit?: string; qwenAvailableModels?: string[]; copilotAvailableModels?: string[]; cursorAvailableModels?: string[]; codexAvailableModels?: string[]; modelDisplay?: string; planLabel?: string; permissionLabel?: string; quotaLabel?: string; quotaUsageLabel?: string; quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null; codexCreditsBalance?: string | null; codexCreditsHasCredits?: boolean | null; codexCreditsUnlimited?: boolean | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel; contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace']; contextNamespaceDiagnostics?: string[]; contextRemoteProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextLocalProcessedFreshness?: import('../../shared/context-types.js').ContextFreshness; contextRetryExhausted?: boolean; contextSharedPolicyOverride?: import('../../shared/context-types.js').SharedScopePolicyOverride; transportConfig?: Record<string, unknown> | null; supervisionMode?: import('../../shared/supervision-config.js').SupervisionMode | null; supervisionHeartbeat?: import('../../shared/supervision-heartbeat.js').SupervisionHeartbeatSnapshot | null; transportPendingMessages?: string[]; transportPendingMessageEntries?: TransportPendingMessageEntry[]; queueEpoch?: string; queueAuthorityId?: string; failedMessageEntries?: TransportPendingMessageEntry[]; pendingMessageVersion?: number; transportPendingMessageVersion?: number; activeDispatchId?: string | null }> }
   | { type: 'outbound'; platform: string; channelId: string; content: string }
   | TimelineEventMessage
+  | TimelineSeqGap
   | TimelineReplayResponseMessage
   | TimelineHistoryResponseMessage
   | TimelinePageResponseMessage
@@ -466,6 +487,7 @@ function maxOutboundMessageBytes(msg: object): number {
 export class WsClient {
   private ws: WebSocket | null = null;
   private handlers = new Set<MessageHandler>();
+  private sessionHandlers = new Map<string, Set<SessionMessageHandler>>();
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private wsTicketTimer: ReturnType<typeof setTimeout> | null = null;
@@ -543,6 +565,9 @@ export class WsClient {
   private transportSubscriptionReplayHistory = new Map<string, boolean>();
   /** Transport-chat subscriptions confirmed sent on the current browser WS. */
   private sentTransportSubscriptions = new Set<string>();
+  /** Ref-counted per-session timeline subscriptions. Full wins while any view is visible. */
+  private timelineSubscriptions = new Map<string, Map<symbol, TimelineSubscriptionMode>>();
+  private sentTimelineSubscriptions = new Map<string, TimelineSubscriptionMode>();
 
   private postConnectNonCriticalUntil = 0;
   private postConnectNonCriticalSlots = 0;
@@ -852,6 +877,56 @@ export class WsClient {
     return () => this.handlers.delete(handler);
   }
 
+  /** Subscribe only to frames belonging to one exact session. Global control frames never fan out here. */
+  onSessionMessage(sessionName: string, handler: SessionMessageHandler): () => void {
+    let set = this.sessionHandlers.get(sessionName);
+    if (!set) {
+      set = new Set();
+      this.sessionHandlers.set(sessionName, set);
+    }
+    set.add(handler);
+    return () => {
+      const current = this.sessionHandlers.get(sessionName);
+      current?.delete(handler);
+      if (current?.size === 0) this.sessionHandlers.delete(sessionName);
+    };
+  }
+
+  subscribeTimelineSession(sessionName: string, owner: symbol, mode: TimelineSubscriptionMode, cursor?: { epoch?: number; afterSeq?: number }): void {
+    if (!sessionName) return;
+    let owners = this.timelineSubscriptions.get(sessionName);
+    if (!owners) {
+      owners = new Map();
+      this.timelineSubscriptions.set(sessionName, owners);
+    }
+    owners.set(owner, mode);
+    this.syncTimelineSubscription(sessionName, cursor);
+  }
+
+  unsubscribeTimelineSession(sessionName: string, owner: symbol): void {
+    const owners = this.timelineSubscriptions.get(sessionName);
+    if (!owners) return;
+    owners.delete(owner);
+    if (owners.size === 0) this.timelineSubscriptions.delete(sessionName);
+    this.syncTimelineSubscription(sessionName);
+  }
+
+  private syncTimelineSubscription(sessionName: string, cursor?: { epoch?: number; afterSeq?: number }): void {
+    if (!this._connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const owners = this.timelineSubscriptions.get(sessionName);
+    const mode: TimelineSubscriptionMode | undefined = owners?.size
+      ? (Array.from(owners.values()).includes('full') ? 'full' : 'summary')
+      : undefined;
+    if (mode === this.sentTimelineSubscriptions.get(sessionName)) return;
+    if (!mode) {
+      this.send({ type: TIMELINE_MESSAGES.UNSUBSCRIBE, sessionName });
+      this.sentTimelineSubscriptions.delete(sessionName);
+      return;
+    }
+    this.send({ type: TIMELINE_MESSAGES.SUBSCRIBE, sessionName, mode, ...cursor });
+    this.sentTimelineSubscriptions.set(sessionName, mode);
+  }
+
   subscribeTerminal(sessionName: string, raw: boolean): void {
     this.maybeProbeForInteraction();
     this.setP2pWorkflowRequestScope({ sessionName });
@@ -944,7 +1019,14 @@ export class WsClient {
   private replayAllSubscriptionsForNewSocket(): void {
     this.sentTerminalSubscriptions.clear();
     this.sentTransportSubscriptions.clear();
+    this.sentTimelineSubscriptions.clear();
     this.terminalSubscriptionNextFlushAt = 0;
+
+    for (const [sessionName, owners] of this.timelineSubscriptions) {
+      const mode: TimelineSubscriptionMode = Array.from(owners.values()).includes('full') ? 'full' : 'summary';
+      this.send({ type: TIMELINE_MESSAGES.SUBSCRIBE, sessionName, mode });
+      this.sentTimelineSubscriptions.set(sessionName, mode);
+    }
 
     let terminalReplayIndex = 0;
     for (const session of this.terminalSubscriptions.keys()) {
@@ -1894,8 +1976,8 @@ export class WsClient {
   /** Request full timeline history for a session (used on first load / daemon reconnect).
    *  afterTs: client's latest known event timestamp — server returns only newer events.
    *  beforeTs: for backward pagination — server returns only older events. */
-  sendTimelineHistoryRequest(sessionName: string, limit = 500, afterTs?: number, beforeTs?: number): string {
-    const key = JSON.stringify([TIMELINE_MESSAGES.HISTORY_REQUEST, sessionName, limit, afterTs ?? null, beforeTs ?? null]);
+  sendTimelineHistoryRequest(sessionName: string, limit = 500, afterTs?: number, beforeTs?: number, cursor?: TimelineCursor): string {
+    const key = JSON.stringify([TIMELINE_MESSAGES.HISTORY_REQUEST, sessionName, limit, afterTs ?? null, beforeTs ?? null, cursor ?? null]);
     const requestId = this.beginOwnedDataRequest(
       key,
       (nextRequestId) => ({
@@ -1905,6 +1987,7 @@ export class WsClient {
         limit,
         ...(afterTs !== undefined ? { afterTs } : {}),
         ...(beforeTs !== undefined ? { beforeTs } : {}),
+        ...(cursor ? { cursor } : {}),
       }),
       (nextRequestId) => ({
         type: TIMELINE_MESSAGES.HISTORY,
@@ -2476,7 +2559,16 @@ export class WsClient {
     if (msg.type === P2P_WORKFLOW_MSG.DAEMON_HELLO) {
       this.handleDaemonHelloMessage(msg);
     }
-    for (const h of this.handlers) {
+    const sessionName = sessionIdForServerMessage(msg);
+    const targeted = sessionName ? this.sessionHandlers.get(sessionName) : undefined;
+    // '*' is the single app-level session/control observer. It receives all
+    // frames so the shell can update list-level state without registering one
+    // handler per pane. Exact handlers still avoid fan-out across sessions.
+    const wildcard = this.sessionHandlers.get('*');
+    const handlers = sessionName
+      ? [...(targeted ?? []), ...(wildcard ?? []), ...this.handlers]
+      : [...(wildcard ?? []), ...this.handlers];
+    for (const h of handlers) {
       try {
         h(msg);
       } catch {

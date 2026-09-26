@@ -183,6 +183,8 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
       // delayed. Without this, sub-session cards miss the typewriter phase and
       // only jump to cached/final text when the timer flips `timelineHydrated`.
       isVisible: timelineHydrated || isOpen || !!isFocused,
+      // Cards are collapsed previews; a promoted/open window owns the full stream.
+      subscriptionMode: 'summary',
     });
   const { events, refreshing } = timeline;
   const addOptimisticUserMessage = 'addOptimisticUserMessage' in timeline ? timeline.addOptimisticUserMessage : undefined;
