@@ -9,7 +9,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SessionRecord } from '../../../src/store/session-store.js';
-import { removeSession, upsertSession } from '../../../src/store/session-store.js';
+import { getSession, removeSession, upsertSession } from '../../../src/store/session-store.js';
 import { timelineEmitter } from '../../../src/daemon/timeline-emitter.js';
 import { TaskPairStore, setTaskPairStoreForTests, getTaskPairStore } from '../../../src/daemon/task-pairs/store.js';
 import { setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
@@ -17,7 +17,7 @@ import { TaskPairService, taskPairService } from '../../../src/daemon/task-pairs
 import { setTaskPairTitleGeneratorForTests } from '../../../src/daemon/task-pairs/title-generator.js';
 import { dispatchSendMessage, clearSendIdempotencyCacheForTests } from '../../../src/daemon/send-tool.js';
 import { handleWebCommand } from '../../../src/daemon/command-handler.js';
-import { normalizeSessionSupervisionSnapshot } from '../../../shared/supervision-config.js';
+import { hasInvalidSessionSupervisionSnapshot, normalizeSessionSupervisionSnapshot } from '../../../shared/supervision-config.js';
 import { TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS, TASK_PAIR_TIMELINE_EVENT } from '../../../shared/task-pair.js';
 
 const PROJECT = 'titleproj';
@@ -125,6 +125,44 @@ describe('task-pair title generation', () => {
     ].join('\n'));
     await service.waitForIdle();
     expect(pair('T11')?.title).toBe('修复登录问题');
+  });
+
+  it('persisting uiLocale on an invalid stored snapshot leaves every other field byte-for-byte unchanged', async () => {
+    // Reproduces the exact stored shape a repair-pending session can carry
+    // (hasInvalidSessionSupervisionSnapshot): an unrecognized backend. The
+    // codebase deliberately keeps this as-is for the repair UI rather than
+    // silently fixing it -- an ordinary send must not touch it either.
+    const invalidSupervision = {
+      mode: 'supervised_audit', backend: 'bogus-backend', model: 'x',
+      pairEngine: 'pairs', pairMaxConcurrency: 4, customInstructions: 'keep me',
+    };
+    upsertSession({ ...session(BRAIN, 'brain'), transportConfig: { supervision: invalidSupervision, unrelatedKey: 'unrelated' } });
+    expect(hasInvalidSessionSupervisionSnapshot(getSession(BRAIN)?.transportConfig ?? null)).toBe(true);
+
+    handleWebCommand({
+      type: 'session.send', session: BRAIN, commandId: 'cmd-locale-invalid', uiLocale: 'zh-CN',
+    }, { send: vi.fn() } as never);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    const transportConfig = getSession(BRAIN)?.transportConfig as Record<string, unknown>;
+    expect(transportConfig.unrelatedKey).toBe('unrelated');
+    expect(transportConfig.supervision).toEqual({ ...invalidSupervision, uiLocale: 'zh-CN' });
+  });
+
+  it('persisting uiLocale on a legacy repair-only snapshot (auditMode requiring repair) leaves every other field byte-for-byte unchanged', async () => {
+    const legacySupervision = {
+      mode: 'supervised_audit', auditMode: '', pairEngine: 'pairs', pairMaxConcurrency: 2,
+    };
+    upsertSession({ ...session(BRAIN, 'brain'), transportConfig: { supervision: legacySupervision } });
+    expect(hasInvalidSessionSupervisionSnapshot(getSession(BRAIN)?.transportConfig ?? null)).toBe(true);
+
+    handleWebCommand({
+      type: 'session.send', session: BRAIN, commandId: 'cmd-locale-legacy', uiLocale: 'ja',
+    }, { send: vi.fn() } as never);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    const transportConfig = getSession(BRAIN)?.transportConfig as Record<string, unknown>;
+    expect(transportConfig.supervision).toEqual({ ...legacySupervision, uiLocale: 'ja' });
   });
 
   it('never generates over an explicit title', async () => {

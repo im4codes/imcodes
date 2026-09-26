@@ -331,13 +331,13 @@ import { GitOriginRepositoryIdentityService } from '../agent/repository-identity
 import {
   SUPERVISION_MODE,
   canSessionRoleOwnAutomaticSupervision,
-  embedSessionSupervisionSnapshot,
   extractSessionSupervisionSnapshot,
   hasInvalidSessionSupervisionSnapshot,
   isAutomaticSupervisionEnabled,
   isSupportedSupervisionTargetSessionType,
-  normalizeSessionSupervisionSnapshot,
   normalizeSupervisionUiLocale,
+  patchTransportConfigUiLocale,
+  readTransportConfigUiLocale,
   evaluateAutomaticSupervisionEnablement,
   type AutomaticSupervisionEnablementGate,
 } from '../../shared/supervision-config.js';
@@ -3820,18 +3820,18 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   if (requestedUiLocale && sessionName) {
     try {
       const existingRecord = getSession(sessionName);
-      if (existingRecord && isSupportedSupervisionTargetSessionType(existingRecord.agentType)) {
-        const existingSnapshot = extractSessionSupervisionSnapshot(existingRecord.transportConfig ?? null)
-          ?? normalizeSessionSupervisionSnapshot(null);
-        if (existingSnapshot.uiLocale !== requestedUiLocale) {
-          upsertSession({
-            ...existingRecord,
-            transportConfig: embedSessionSupervisionSnapshot(existingRecord.transportConfig ?? null, {
-              ...existingSnapshot,
-              uiLocale: requestedUiLocale,
-            }),
-          });
-        }
+      // A field-level patch (patchTransportConfigUiLocale), never a
+      // normalize/embed of the whole snapshot: the stored snapshot may be
+      // invalid or legacy-repair-only by design (hasInvalidSessionSupervisionSnapshot),
+      // kept exactly as-is pending a deliberate user fix. Rebuilding it
+      // through the normalizer on an ordinary send would silently replace
+      // that data (mode, pairEngine, custom instructions, ...) with defaults.
+      if (existingRecord && isSupportedSupervisionTargetSessionType(existingRecord.agentType)
+        && readTransportConfigUiLocale(existingRecord.transportConfig ?? null) !== requestedUiLocale) {
+        upsertSession({
+          ...existingRecord,
+          transportConfig: patchTransportConfigUiLocale(existingRecord.transportConfig ?? null, requestedUiLocale),
+        });
       }
     } catch (error) {
       logger.warn({ err: error, sessionName }, 'session.send: failed to persist uiLocale');

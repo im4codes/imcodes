@@ -14,7 +14,7 @@
 import { getSession, listSessions, type SessionRecord } from '../../store/session-store.js';
 import {
   extractSessionSupervisionSnapshot,
-  normalizeSupervisionUiLocale,
+  readTransportConfigUiLocale,
   SUPERVISION_MODE,
   type SessionSupervisionSnapshot,
   type SupervisionUiLocale,
@@ -77,7 +77,7 @@ export function resolveTaskPairEngine(project: string | undefined, env: NodeJS.P
 }
 
 /** The pair settings the owner saved on the project Brain's supervision settings, if any. */
-export function brainSupervisionSettings(project: string): Pick<SessionSupervisionSnapshot, 'mode' | 'pairEngine' | 'pairAllowlist' | 'pairMaxConcurrency' | 'uiLocale'> | undefined {
+export function brainSupervisionSettings(project: string): Pick<SessionSupervisionSnapshot, 'mode' | 'pairEngine' | 'pairAllowlist' | 'pairMaxConcurrency'> | undefined {
   const brain = listSessions().find((session: SessionRecord) => session.projectName === project && session.role === 'brain');
   const snapshot = brain ? extractSessionSupervisionSnapshot(brain.transportConfig ?? null) : null;
   return snapshot ?? undefined;
@@ -86,13 +86,19 @@ export function brainSupervisionSettings(project: string): Pick<SessionSupervisi
 /**
  * The web UI locale the owner last selected, as last synced onto the
  * project's Brain session (see `web/src/components/SessionControls.tsx`,
- * which stamps `uiLocale` from `i18n.resolvedLanguage` on most sends).
- * Undefined for headless/legacy callers that never synced one -- callers
- * MUST treat that the same way the retired legacy prompts did: no rule/no
- * generation, not a fallback to English.
+ * which stamps `uiLocale` from `i18n.resolvedLanguage` on most sends, and
+ * `command-handler.ts`'s `handleSend`, which persists it durably). Reads the
+ * raw stored field directly (`readTransportConfigUiLocale`), not through
+ * `brainSupervisionSettings`/`extractSessionSupervisionSnapshot`: the rest of
+ * the Brain's supervision snapshot may be invalid or legacy-repair-only by
+ * design, and `uiLocale` must still be readable regardless. Undefined for
+ * headless/legacy callers that never synced one -- callers MUST treat that
+ * the same way the retired legacy prompts did: no rule/no generation, not a
+ * fallback to English.
  */
 export function brainUiLocale(project: string): SupervisionUiLocale | undefined {
-  return normalizeSupervisionUiLocale(brainSupervisionSettings(project)?.uiLocale);
+  const brain = listSessions().find((session: SessionRecord) => session.projectName === project && session.role === 'brain');
+  return brain ? readTransportConfigUiLocale(brain.transportConfig ?? null) : undefined;
 }
 
 /** Allowlist for daemon picks: Brain settings, else the stored project value, else the default. */

@@ -1689,6 +1689,46 @@ export function embedSessionSupervisionSnapshot(
   };
 }
 
+/**
+ * Shallow-merges only `uiLocale` into whatever raw supervision object is
+ * already stored (or `{}` if none), bypassing normalize/embed entirely.
+ * Deliberately does not go through `extractSessionSupervisionSnapshot` /
+ * `normalizeSessionSupervisionSnapshot`: those refuse (return
+ * null / a fresh default) a snapshot the codebase intentionally leaves
+ * invalid or legacy-repair-only pending a deliberate user fix, and rebuilding
+ * through them here would silently replace that stored data with defaults on
+ * an ordinary send. Every other stored field -- valid, invalid, or one no
+ * normalizer field even knows about -- survives byte-for-byte. Read back with
+ * {@link readTransportConfigUiLocale}, not `extractSessionSupervisionSnapshot`.
+ */
+export function patchTransportConfigUiLocale(
+  transportConfig: Record<string, unknown> | null | undefined,
+  uiLocale: SupervisionUiLocale,
+): Record<string, unknown> {
+  const base = isPlainObject(transportConfig) ? transportConfig : {};
+  const existingSupervision = base[SUPERVISION_TRANSPORT_CONFIG_KEY];
+  const rawSupervision = isPlainObject(existingSupervision) ? existingSupervision : {};
+  return {
+    ...base,
+    [SUPERVISION_TRANSPORT_CONFIG_KEY]: { ...rawSupervision, uiLocale },
+  };
+}
+
+/**
+ * Reads `uiLocale` straight from the raw stored supervision object, tolerant
+ * of a snapshot that is otherwise invalid or legacy-repair-only (which
+ * `extractSessionSupervisionSnapshot` would refuse and return null for).
+ * Pairs with {@link patchTransportConfigUiLocale}.
+ */
+export function readTransportConfigUiLocale(
+  transportConfig: Record<string, unknown> | null | undefined,
+): SupervisionUiLocale | undefined {
+  if (!isPlainObject(transportConfig)) return undefined;
+  const supervision = transportConfig[SUPERVISION_TRANSPORT_CONFIG_KEY];
+  if (!isPlainObject(supervision)) return undefined;
+  return normalizeSupervisionUiLocale(supervision.uiLocale);
+}
+
 export function readSupervisionSnapshotFromTransportConfig(
   transportConfig: Record<string, unknown> | null | undefined,
 ): SessionSupervisionSnapshot {
