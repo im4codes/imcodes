@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   CROSS_VENDOR_HANDOFF_DEFAULTS,
   normalizeCrossVendorHandoffConfig,
+  isCrossVendorHandoffLaunchCurrent,
 } from '../../shared/cross-vendor-handoff.js';
 import { buildCrossVendorHandoffPack, shouldCreateCrossVendorHandoff, sourceConversationKey } from '../../src/daemon/cross-vendor-handoff.js';
 import { timelineStore } from '../../src/daemon/timeline-store.js';
@@ -96,4 +97,15 @@ describe('cross-vendor handoff contract', () => {
     expect(read).not.toHaveBeenCalled();
     expect(normalizeCrossVendorHandoffConfig({ maxTokens: 6_001 }).maxTokens).toBe(6_000);
   });
+  it('degrades to no handoff when the projection is busy or unavailable', async () => {
+    vi.spyOn(timelineStore, 'readPreferred').mockRejectedValue(new Error('projection busy'));
+    await expect(buildCrossVendorHandoffPack(record('claude-code-sdk'), { epoch: 1, seq: 1, ts: 1 }, 'codex-sdk', 'transport')).resolves.toBeUndefined();
+  });
+
+  it('rejects stale callbacks from an older launch generation', () => {
+    expect(isCrossVendorHandoffLaunchCurrent({ expectedGeneration: 1, currentGeneration: 2, currentAgentType: 'claude-code-sdk', targetAgentType: 'claude-code-sdk' })).toBe(false);
+    expect(isCrossVendorHandoffLaunchCurrent({ expectedGeneration: 2, currentGeneration: 2, currentAgentType: 'claude-code-sdk', targetAgentType: 'claude-code-sdk' })).toBe(true);
+    expect(isCrossVendorHandoffLaunchCurrent({ expectedGeneration: 2, currentGeneration: 2, currentAgentType: 'codex-sdk', targetAgentType: 'claude-code-sdk' })).toBe(false);
+  });
+
 });

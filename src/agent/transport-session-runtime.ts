@@ -634,6 +634,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _startupMemoryInjected = false;
   private _pendingHandoff: CrossVendorHandoffPack | null = null;
   private _pendingHandoffReady: Promise<CrossVendorHandoffPack | undefined> | undefined;
+  private _onPendingHandoffConsumed?: () => void;
   /** Last provider-visible preference context block injected into this provider conversation.
    *  Preferences are stable session context, not per-turn recall; repeat injection
    *  bloats SDK prompt windows and can trigger provider auto-compaction. */
@@ -2366,6 +2367,11 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._pendingHandoffReady = ready;
   }
 
+  /** Called once after a provider accepts the turn carrying the handoff. */
+  setPendingHandoffConsumedHandler(handler: (() => void) | undefined): void {
+    this._onPendingHandoffConsumed = handler;
+  }
+
   /**
    * Send a message to the provider.
    *
@@ -4040,6 +4046,17 @@ export class TransportSessionRuntime implements SessionRuntime {
           }
         },
       });
+      // Provider acceptance is the durability boundary for a one-shot handoff.
+      // STOP may race with an already accepted send, so consume it before the
+      // cancellation branch to prevent duplicate injection on the next retry.
+      if (handoffPreamble && this._pendingHandoff) {
+        this._pendingHandoff = null;
+        try {
+          this._onPendingHandoffConsumed?.();
+        } catch (err) {
+          logger.warn({ err, sessionKey: this.sessionKey }, 'failed to persist consumed cross-vendor handoff');
+        }
+      }
       if (this.isDispatchLocallyCancelled(dispatchId)) {
         this.rollbackActiveSummarySyncReservation(dispatchId);
         await this.provider.cancel?.(this._providerSessionId!).catch((err: unknown) => {
@@ -4060,9 +4077,6 @@ export class TransportSessionRuntime implements SessionRuntime {
         this.scheduleActiveAppendFlush(dispatchId);
       }
       this._recoverableDispatchRetries = 0;
-      // Handoff is consumed only after provider.send accepted this turn. A
-      // provider rejection/cancel therefore leaves it available for retry.
-      if (handoffPreamble && this._pendingHandoff) this._pendingHandoff = null;
       // This variant's contract body (or its reference, when it was already
       // registered) reached the provider on this turn, so later turns on the
       // same thread re-assert it by reference -- until the mode changes.

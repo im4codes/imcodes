@@ -52,6 +52,16 @@ export interface CrossVendorHandoffSessionState {
   pending?: CrossVendorHandoffPack;
 }
 
+export function isCrossVendorHandoffLaunchCurrent(input: {
+  expectedGeneration: number;
+  currentGeneration: number | undefined;
+  currentAgentType: string | undefined;
+  targetAgentType: string;
+}): boolean {
+  return input.currentGeneration === input.expectedGeneration
+    && input.currentAgentType === input.targetAgentType;
+}
+
 export function normalizeCrossVendorHandoffConfig(input?: Partial<CrossVendorHandoffConfig> | null): CrossVendorHandoffConfig {
   const maxTokens = Number.isFinite(input?.maxTokens) ? Math.trunc(input!.maxTokens!) : CROSS_VENDOR_HANDOFF_DEFAULTS.maxTokens;
   return {

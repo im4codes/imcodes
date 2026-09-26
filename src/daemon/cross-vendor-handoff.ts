@@ -70,7 +70,15 @@ export function sourceConversationKey(record: Pick<SessionRecord, 'agentType' | 
 export async function buildCrossVendorHandoffPack(record: SessionRecord, cutoff: CrossVendorHandoffCutoff, targetAgentType: string, targetRuntimeType: 'process' | 'transport', inputConfig?: Partial<CrossVendorHandoffConfig>, afterCutoff?: CrossVendorHandoffCutoff): Promise<CrossVendorHandoffPack | undefined> {
   const config = normalizeCrossVendorHandoffConfig(inputConfig);
   if (!config.enabled) return undefined;
-  const events = await timelineStore.readPreferred(record.name, { afterTs: afterCutoff?.ts, beforeTs: cutoff.ts, limit: Math.max(100, config.recentTurns * 8) });
+  let events: TimelineEvent[];
+  try {
+    events = await timelineStore.readPreferred(record.name, { afterTs: afterCutoff?.ts, beforeTs: cutoff.ts, limit: Math.max(100, config.recentTurns * 8) });
+  } catch {
+    // A busy/open-circuit projection must never block session.send; degrade to
+    // no handoff and let the target provider proceed with its normal bootstrap.
+    incrementCounter('handoff.timeline_read_failed', {});
+    return undefined;
+  }
   const memory = await readMemory(record.contextNamespace);
   const latestUser = events.filter((event) => event.type === 'user.message').map(payloadText).filter(Boolean).slice(-1)[0] ?? 'Not available';
   const tools = renderTools(events, config);

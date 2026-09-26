@@ -108,7 +108,7 @@ import { getAuthenticatedCapabilityOwner } from '../capability/capability-author
 import { registerMasterCompaction } from '../daemon/master-compaction-registry.js';
 import type { DaemonTransportQueuesSnapshot } from '../util/daemon-status.js';
 import { extractSessionSupervisionSnapshot } from '../../shared/supervision-config.js';
-import { normalizeCrossVendorHandoffConfig, type CrossVendorHandoffCutoff } from '../../shared/cross-vendor-handoff.js';
+import { isCrossVendorHandoffLaunchCurrent, normalizeCrossVendorHandoffConfig, type CrossVendorHandoffCutoff } from '../../shared/cross-vendor-handoff.js';
 import { buildCrossVendorHandoffPack, shouldCreateCrossVendorHandoff } from '../daemon/cross-vendor-handoff.js';
 
 function isStoredTransportSession(record: Pick<SessionRecord, 'runtimeType' | 'agentType'>): boolean {
@@ -1140,10 +1140,14 @@ async function teardownSessionRuntime(record: SessionRecord): Promise<void> {
   await killSession(record.name).catch(() => {});
 }
 
+const crossVendorHandoffLaunchGenerations = new Map<string, number>();
+
 export async function relaunchSessionWithSettings(
   record: SessionRecord,
   overrides: SessionRelaunchOverrides = {},
 ): Promise<void> {
+  const launchGeneration = (crossVendorHandoffLaunchGenerations.get(record.name) ?? 0) + 1;
+  crossVendorHandoffLaunchGenerations.set(record.name, launchGeneration);
   const targetAgentType = (overrides.agentType ?? record.agentType) as AgentType;
   const targetFresh = overrides.fresh === true;
   const targetProjectDir = overrides.projectDir ?? record.projectDir;
@@ -1239,39 +1243,71 @@ export async function relaunchSessionWithSettings(
     ...(targetFresh ? { fresh: true } : {}),
   });
   if (handoffPromise) {
-    if (targetRuntimeType === RUNTIME_TYPES.TRANSPORT) {
-      transportRuntimes.get(record.name)?.setPendingHandoffReady(handoffPromise);
-    }
-    void handoffPromise.then(async (pack) => {
-      if (!pack) return;
-      if (targetRuntimeType === RUNTIME_TYPES.TRANSPORT) {
-        transportRuntimes.get(record.name)?.setPendingHandoff(pack);
-      } else {
-        try {
-          const { prepareProcessSessionPrivateWriter, runWithProcessSessionSendLock } = await import('../daemon/command-handler.js');
-          await runWithProcessSessionSendLock(record.name, async () => {
-            const writePrivate = await prepareProcessSessionPrivateWriter(record.name);
-            writePrivate(pack.text);
-          });
-          const current = getSession(record.name);
-          if (current) {
-            const state = current.crossVendorHandoff ?? {};
-            upsertSession({ ...current, crossVendorHandoff: { ...state, pending: undefined, cutoffs: { ...(state.cutoffs ?? {}), [targetAgentType]: pack.cutoff } }, updatedAt: Date.now() });
-          }
-          incrementCounter('handoff.injected', { runtime: targetRuntimeType });
-          return;
-        } catch (err) {
-          logger.debug({ err, session: record.name }, 'cross-vendor process handoff injection failed');
-          incrementCounter('handoff.injection_failed', { runtime: targetRuntimeType });
-          return;
-        }
-      }
+    const launchedTransport = targetRuntimeType === RUNTIME_TYPES.TRANSPORT
+      ? transportRuntimes.get(record.name)
+      : undefined;
+    const isCurrentLaunch = (): boolean => {
       const current = getSession(record.name);
-      if (current) {
-        const state = current.crossVendorHandoff ?? {};
+      return isCrossVendorHandoffLaunchCurrent({
+        expectedGeneration: launchGeneration,
+        currentGeneration: crossVendorHandoffLaunchGenerations.get(record.name),
+        currentAgentType: current?.agentType,
+        targetAgentType,
+      });
+    };
+    const persistPending = (pack: import('../../shared/cross-vendor-handoff.js').CrossVendorHandoffPack): void => {
+      if (!isCurrentLaunch()) return;
+      const current = getSession(record.name);
+      if (!current) return;
+      const state = current.crossVendorHandoff ?? {};
+      upsertSession({ ...current, crossVendorHandoff: { ...state, pending: pack }, updatedAt: Date.now() });
+    };
+    const markConsumed = (pack: import('../../shared/cross-vendor-handoff.js').CrossVendorHandoffPack): void => {
+      if (!isCurrentLaunch()) return;
+      const current = getSession(record.name);
+      if (!current) return;
+      const state = current.crossVendorHandoff ?? {};
+      // Clear only the exact pack that was accepted; a newer restart may have
+      // replaced pending while this callback was in flight.
+      if (state.pending && state.pending.cutoff.epoch === pack.cutoff.epoch
+        && state.pending.cutoff.seq === pack.cutoff.seq) {
         upsertSession({ ...current, crossVendorHandoff: { ...state, pending: undefined, cutoffs: { ...(state.cutoffs ?? {}), [targetAgentType]: pack.cutoff } }, updatedAt: Date.now() });
       }
       incrementCounter('handoff.injected', { runtime: targetRuntimeType });
+    };
+    const guardedPromise = handoffPromise.then((pack) => {
+      if (pack && isCurrentLaunch()) persistPending(pack);
+      return pack && isCurrentLaunch() ? pack : undefined;
+    });
+    if (launchedTransport) {
+      launchedTransport.setPendingHandoffConsumedHandler(() => {
+        // The accepted pack is tracked by the runtime callback below.
+        const current = getSession(record.name);
+        const pending = current?.crossVendorHandoff?.pending;
+        if (pending) markConsumed(pending);
+      });
+      launchedTransport.setPendingHandoffReady(guardedPromise);
+    }
+    void guardedPromise.then(async (pack) => {
+      if (!pack || !isCurrentLaunch()) return;
+      if (targetRuntimeType === RUNTIME_TYPES.TRANSPORT) {
+        launchedTransport?.setPendingHandoff(pack);
+        return;
+      }
+      try {
+        const { prepareProcessSessionPrivateWriter, runWithProcessSessionSendLock } = await import('../daemon/command-handler.js');
+        let injected = false;
+        await runWithProcessSessionSendLock(record.name, async () => {
+          if (!isCurrentLaunch()) return;
+          const writePrivate = await prepareProcessSessionPrivateWriter(record.name);
+          writePrivate(pack.text);
+          injected = true;
+        });
+        if (injected) markConsumed(pack);
+      } catch (err) {
+        logger.debug({ err, session: record.name }, 'cross-vendor process handoff injection failed');
+        incrementCounter('handoff.injection_failed', { runtime: targetRuntimeType });
+      }
     });
   }
 }

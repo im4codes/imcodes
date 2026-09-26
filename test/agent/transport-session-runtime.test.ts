@@ -531,3 +531,44 @@ describe('TransportSessionRuntime cross-vendor handoff one-shot guard', () => {
     await runtime.kill();
   });
 });
+
+it('consumes handoff before a late STOP cancellation can trigger a duplicate retry', async () => {
+  const provider = makeProvider();
+  const send = provider.send as ReturnType<typeof vi.fn>;
+  const runtime = new TransportSessionRuntime(provider, 'handoff-cancel-race');
+  await runtime.initialize({
+    sessionKey: 'handoff-cancel-race',
+    pendingHandoff: {
+      text: 'Non-authoritative prior context', sourceAgentType: 'claude-code-sdk', sourceRuntimeType: 'transport',
+      cutoff: { epoch: 1, seq: 2, ts: 3 }, createdAt: Date.now(), tokenCount: 4,
+    },
+  });
+  let stopIssued = false;
+  send.mockImplementationOnce(async () => {
+    if (!stopIssued) {
+      stopIssued = true;
+      await runtime.cancel();
+    }
+  });
+  runtime.send('first', 'cancel-first');
+  await vi.waitFor(() => expect(send).toHaveBeenCalled());
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  send.mockClear();
+  runtime.send('retry', 'cancel-retry');
+  await waitForProviderSend(provider);
+  expect(send.mock.calls[0]?.[1]?.messagePreamble ?? '').not.toContain('Non-authoritative prior context');
+  await runtime.kill();
+});
+
+it('returns session.send acknowledgement before a slow handoff build and proceeds after the bounded wait', async () => {
+  const provider = makeProvider();
+  const runtime = new TransportSessionRuntime(provider, 'handoff-ack-order');
+  await runtime.initialize({ sessionKey: 'handoff-ack-order' });
+  runtime.setPendingHandoffReady(new Promise(() => undefined));
+  const started = Date.now();
+  const result = runtime.send('ordinary', 'ack-order');
+  expect(result).toBe('sent');
+  expect(Date.now() - started).toBeLessThan(250);
+  await waitForProviderSend(provider);
+  await runtime.kill();
+});
