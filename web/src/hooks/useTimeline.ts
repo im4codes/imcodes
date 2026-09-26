@@ -458,6 +458,11 @@ if (typeof document !== 'undefined' && typeof window !== 'undefined') {
 }
 
 const MAX_MEMORY_EVENTS = 300;
+// Server/daemon history pages are hard-capped at 200 events and 1 MiB. Keep
+// newer gap/reveal requests explicit so continuation cursors never fan out an
+// unbounded payload even when older callers still pass MAX_MEMORY_EVENTS.
+const MAX_FORWARD_PAGE_EVENTS = 200;
+const MAX_FORWARD_PAGE_BYTES = 1024 * 1024;
 const MAX_HISTORY_EVENTS = 2000;
 const MAX_PIN_CONTEXT_EVENTS = MESSAGE_PIN_LIMITS.CONTEXT_EVENTS_BEFORE
   + 1
@@ -2223,14 +2228,23 @@ export function useTimeline(
 
   const sendForwardHistoryRequest = useCallback((
     phase: Exclude<TimelineHistoryPhase, 'idle'>,
-    args?: { limit?: number; afterTs?: number },
+    args?: { limit?: number; afterTs?: number; cursor?: TimelineCursor },
   ) => {
     if (!ws || !sessionId) return null;
-    const requestId = args?.limit === undefined && args?.afterTs === undefined
+    const requestId = args?.limit === undefined && args?.afterTs === undefined && args?.cursor === undefined
       ? ws.sendTimelineHistoryRequest(sessionId)
-      : args?.afterTs === undefined
+      : args?.afterTs === undefined && args?.cursor === undefined
         ? ws.sendTimelineHistoryRequest(sessionId, args?.limit ?? MAX_MEMORY_EVENTS)
-        : ws.sendTimelineHistoryRequest(sessionId, args.limit ?? MAX_MEMORY_EVENTS, args.afterTs);
+        : args?.cursor === undefined
+          ? ws.sendTimelineHistoryRequest(sessionId, args?.limit ?? MAX_MEMORY_EVENTS, args?.afterTs)
+        : ws.sendTimelineHistoryRequest(
+          sessionId,
+          args.limit ?? MAX_MEMORY_EVENTS,
+          args.afterTs,
+          undefined,
+          args.cursor,
+          args.cursor?.direction === TIMELINE_CURSOR_DIRECTIONS.NEWER ? MAX_FORWARD_PAGE_BYTES : undefined,
+        );
     // ws.sendTimelineHistoryRequest de-dupes by (session, limit, afterTs): a
     // call for a key with an already-outstanding request returns the SAME
     // requestId without putting a new frame on the wire. Re-arming the give-up
@@ -2245,6 +2259,14 @@ export function useTimeline(
     }
     return requestId;
   }, [armForwardHistoryTimeout, sessionId, ws]);
+
+  const sendNewerHistoryPage = useCallback((
+    phase: Exclude<TimelineHistoryPhase, 'idle'>,
+    cursor: TimelineCursor,
+  ) => sendForwardHistoryRequest(phase, {
+    limit: MAX_FORWARD_PAGE_EVENTS,
+    cursor: { ...cursor, direction: TIMELINE_CURSOR_DIRECTIONS.NEWER },
+  }), [sendForwardHistoryRequest]);
 
   const buildForwardHistoryArgs = useCallback((
     limit?: number,
@@ -4357,14 +4379,14 @@ export function useTimeline(
       ws.subscribeTimelineSession(sessionId, owner, subscriptionMode, cursor);
     }
     if (cursor && ws.connected && previousMode !== null && previousMode !== subscriptionMode) {
-      ws.sendTimelineHistoryRequest(sessionId, MAX_HISTORY_EVENTS, undefined, undefined, {
+      sendNewerHistoryPage('refresh', {
         epoch: cursor.epoch, afterSeq: cursor.afterSeq, direction: TIMELINE_CURSOR_DIRECTIONS.NEWER,
       });
     }
     return () => {
       if (typeof ws.unsubscribeTimelineSession === 'function') ws.unsubscribeTimelineSession(sessionId, owner);
     };
-  }, [disableHistory, sessionId, subscriptionMode, ws]);
+  }, [disableHistory, sendNewerHistoryPage, sessionId, subscriptionMode, ws]);
 
   // Listen for WS messages
   useEffect(() => {
@@ -4379,7 +4401,7 @@ export function useTimeline(
       // missing ordered range from the canonical per-session history cursor.
       if (msg.type === TIMELINE_MESSAGES.SEQ_GAP) {
         if (msg.sessionId !== sessionId || !msg.backfill) return;
-        ws.sendTimelineHistoryRequest(sessionId, MAX_HISTORY_EVENTS, undefined, undefined, {
+        sendNewerHistoryPage('refresh', {
           epoch: msg.epoch, afterSeq: msg.toSeq, direction: TIMELINE_CURSOR_DIRECTIONS.NEWER,
         });
         return;
@@ -4660,6 +4682,17 @@ export function useTimeline(
             if (!isActiveSessionRef.current) return;
             if (ws?.connected && sessionId) sendForwardHistoryRequest('bootstrap', buildForwardHistoryArgs(MAX_MEMORY_EVENTS));
           }, 1000 * historyRetryRef.current);
+        }
+        // Newer gap/reveal pages are bounded. Continue only when the server
+        // explicitly returns a newer cursor; an older cursor from an initial
+        // tail is retained for user-driven scroll and must not be auto-fetched.
+        if (
+          msg.hasMore === true
+          && msg.nextCursor?.direction === TIMELINE_CURSOR_DIRECTIONS.NEWER
+          && ws?.connected
+          && sessionId
+        ) {
+          sendNewerHistoryPage(loading ? 'bootstrap' : 'refresh', msg.nextCursor);
         }
         setLoading(false);
         setRefreshing(false);

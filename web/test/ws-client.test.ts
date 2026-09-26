@@ -1825,6 +1825,49 @@ describe('WsClient', () => {
     vi.useRealTimers();
   });
 
+  it('includes byte budgets on bounded newer history and older page requests', async () => {
+    const client = await connectClient();
+    lastWs!.send.mockClear();
+    lastWs!.emit('message', { data: JSON.stringify({
+      type: 'daemon.hello',
+      daemonId: 'daemon-bounded',
+      capabilities: ['timeline.protocol.v1'],
+      timelineProtocolRevision: 1,
+      helloEpoch: 1,
+      sentAt: Date.now(),
+    }) });
+
+    client.sendTimelineHistoryRequest('deck_bounded', 200, undefined, undefined, {
+      epoch: 7,
+      afterSeq: 41,
+      direction: 'newer',
+    }, 1024 * 1024);
+    client.sendTimelinePageRequest('deck_bounded', {
+      epoch: 7,
+      beforeTs: 1234,
+      direction: 'older',
+    }, 200, 1024 * 1024);
+
+    const messages = lastWs!.send.mock.calls.map(([raw]) => JSON.parse(String(raw)) as Record<string, unknown>);
+    expect(messages).toEqual([
+      expect.objectContaining({
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        sessionName: 'deck_bounded',
+        limit: 200,
+        budgetBytes: 1024 * 1024,
+        cursor: { epoch: 7, afterSeq: 41, direction: 'newer' },
+      }),
+      expect.objectContaining({
+        type: TIMELINE_MESSAGES.PAGE_REQUEST,
+        sessionName: 'deck_bounded',
+        limit: 200,
+        budgetBytes: 1024 * 1024,
+        cursor: { epoch: 7, beforeTs: 1234, direction: 'older' },
+      }),
+    ]);
+    client.disconnect();
+  });
+
   it('rate-limits unique owner data reads without blocking control traffic and emits a recoverable result', async () => {
     const client = await connectClient();
     const handler = vi.fn();

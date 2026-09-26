@@ -1976,8 +1976,23 @@ export class WsClient {
   /** Request full timeline history for a session (used on first load / daemon reconnect).
    *  afterTs: client's latest known event timestamp — server returns only newer events.
    *  beforeTs: for backward pagination — server returns only older events. */
-  sendTimelineHistoryRequest(sessionName: string, limit = 500, afterTs?: number, beforeTs?: number, cursor?: TimelineCursor): string {
-    const key = JSON.stringify([TIMELINE_MESSAGES.HISTORY_REQUEST, sessionName, limit, afterTs ?? null, beforeTs ?? null, cursor ?? null]);
+  sendTimelineHistoryRequest(
+    sessionName: string,
+    limit = 500,
+    afterTs?: number,
+    beforeTs?: number,
+    cursor?: TimelineCursor,
+    budgetBytes?: number,
+  ): string {
+    const key = JSON.stringify([
+      TIMELINE_MESSAGES.HISTORY_REQUEST,
+      sessionName,
+      limit,
+      afterTs ?? null,
+      beforeTs ?? null,
+      cursor ?? null,
+      budgetBytes ?? null,
+    ]);
     const requestId = this.beginOwnedDataRequest(
       key,
       (nextRequestId) => ({
@@ -1988,6 +2003,7 @@ export class WsClient {
         ...(afterTs !== undefined ? { afterTs } : {}),
         ...(beforeTs !== undefined ? { beforeTs } : {}),
         ...(cursor ? { cursor } : {}),
+        ...(budgetBytes !== undefined ? { budgetBytes } : {}),
       }),
       (nextRequestId) => ({
         type: TIMELINE_MESSAGES.HISTORY,
@@ -2047,7 +2063,7 @@ export class WsClient {
   }
 
   /** Request a bounded explicit timeline page. */
-  sendTimelinePageRequest(sessionName: string, cursor: TimelineCursor, limit = 500): string {
+  sendTimelinePageRequest(sessionName: string, cursor: TimelineCursor, limit = 500, budgetBytes = 1024 * 1024): string {
     if (!this.supportsTimelineProtocolRevision(TIMELINE_PROTOCOL_REVISION)) {
       throw new Error('timeline_protocol_unavailable');
     }
@@ -2062,6 +2078,7 @@ export class WsClient {
       ...(cursor.beforeTs !== undefined ? { beforeTs: cursor.beforeTs } : {}),
       ...(cursor.afterSeq !== undefined ? { afterSeq: cursor.afterSeq } : {}),
       epoch: cursor.epoch,
+      budgetBytes,
     });
     return requestId;
   }
