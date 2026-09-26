@@ -52,6 +52,7 @@
 #include <vector>
 
 #include "../remote-desktop-common/data_channel_payload.h"
+#include "../remote-desktop-common/clipboard_paste_assembler.h"
 #include "../remote-desktop-common/json_protocol.h"
 #include "macos_authenticated_session_readiness.h"
 #include "macos_disclosure_control.h"
@@ -768,6 +769,7 @@ class WorkerTransportSink final : public macos::MacosTransportCallbackSink {
   RouteDisclosure* disclosure_ = nullptr;
   rd::common::TopologyRevision presented_layout_revision_ = 0;
   std::uint64_t outbound_sequence_ = 0;
+  rd::common::ClipboardPasteAssembler clipboard_paste_assembler_;
   std::atomic_bool terminal_ = false;
   std::mutex events_mutex_;
   std::vector<std::function<void()>> events_;
@@ -1349,6 +1351,7 @@ void WorkerTransportSink::Post(std::function<void()> event) {
 }
 
 void WorkerTransportSink::DrainEvents() {
+  clipboard_paste_assembler_.Expire(std::chrono::steady_clock::now());
   if (wake_[0] >= 0) {
     char buffer[256];
     while (::read(wake_[0], buffer, sizeof(buffer)) > 0) {
@@ -1911,6 +1914,25 @@ void WorkerTransportSink::HandleDataChannelMessage(
       accepted = SendClipboard(
           *message.control.request_id,
           copied ? std::optional<std::string>(text) : std::nullopt);
+    } else if (kind == "paste_text") {
+      std::string pasted_text;
+      const auto assembled = clipboard_paste_assembler_.Append(
+          *message.control.paste_id, *message.control.chunk_index,
+          *message.control.chunk_count, *message.control.text,
+          std::chrono::steady_clock::now(), &pasted_text);
+      if (assembled == rd::common::ClipboardPasteAssembler::Result::kRejected) {
+        (void)SendControlRejected(kind, imcodes::rd::kRejectPasteUnavailable);
+        return;
+      }
+      if (assembled == rd::common::ClipboardPasteAssembler::Result::kComplete) {
+        if (authority->mode != imcodes::rd::kControlMode ||
+            !session_->PasteText(pasted_text)) {
+          (void)SendControlRejected(kind, imcodes::rd::kRejectPasteUnavailable);
+          return;
+        }
+      }
+      accepted = true;
+      acknowledge = true;
     } else if (kind == "set_display_mode") {
       accepted = session_->SetDisplayMode(
           *message.control.display_id,

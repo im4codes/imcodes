@@ -55,6 +55,7 @@
 #include "rtc_base/thread.h"
 
 #include "../remote-desktop-common/data_channel_payload.h"
+#include "../remote-desktop-common/clipboard_paste_assembler.h"
 #include "../remote-desktop-common/quality_ladder.h"
 #include "../remote-desktop-common/signaling_types.h"
 #include "../remote-desktop-common/session_core.h"
@@ -325,6 +326,7 @@ class LinuxRemoteDesktopSession final
   // ack arrives, so without this every keypress or click on Linux tore the
   // session down three seconds later.
   bool SendInputAck(std::uint64_t acknowledged_sequence);
+  bool SendControlRejected(const char* kind, const char* reason);
   // Answer a copy_selection request (macOS's WorkerTransportSink::
   // SendClipboard shape): the remote selection's text, or not available.
   bool SendClipboard(const std::string& request_id,
@@ -392,6 +394,7 @@ class LinuxRemoteDesktopSession final
   // sends out over a data channel (topology today; matches macOS/Windows'
   // own outbound_sequence_ convention).
   std::uint64_t outbound_sequence_ = 0;
+  common::ClipboardPasteAssembler clipboard_paste_assembler_;
   // Topology revision the browser last acknowledged actually presenting a
   // compatible decoded frame for -- see FramePresented() above. Zero (never
   // equal to a real topology's revision, which starts at 1 -- matches

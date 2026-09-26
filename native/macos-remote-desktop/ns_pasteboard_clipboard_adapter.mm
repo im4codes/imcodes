@@ -1,4 +1,5 @@
 #include "ns_pasteboard_clipboard_adapter.h"
+#include "../remote-desktop-common/data_channel_constants.h"
 
 #import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
@@ -302,7 +303,8 @@ public:
       return false;
     }
     ClipboardErrorCode validation_error = ClipboardErrorCode::kNone;
-    if (!IsValidBoundedUtf8(text, options_.max_text_bytes, &validation_error)) {
+    if (!IsValidBoundedUtf8(text, imcodes::rd::kMaxPasteTextBytes,
+                            &validation_error)) {
       SetError({validation_error,
                 validation_error == ClipboardErrorCode::kTextTooLarge
                     ? "clipboard text exceeds the byte bound"

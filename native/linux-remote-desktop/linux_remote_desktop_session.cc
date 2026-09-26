@@ -201,6 +201,7 @@ bool LinuxRemoteDesktopSession::Start(const common::RouteAuthority& authority,
 }
 
 bool LinuxRemoteDesktopSession::Tick(common::TransportTime now) {
+  clipboard_paste_assembler_.Expire(std::chrono::steady_clock::now());
   return transport_core_.Tick(now);
 }
 
@@ -695,6 +696,27 @@ bool LinuxRemoteDesktopSession::SendInputAck(
   return it->second->Send(webrtc::DataBuffer(payload));
 }
 
+bool LinuxRemoteDesktopSession::SendControlRejected(const char* kind,
+                                                    const char* reason) {
+  const common::DesktopTopology* topology = core_.topology();
+  const common::RouteAuthority* authority = transport_core_.authority();
+  auto it = channels_.find(ChannelLabel(DataChannelKind::kControl));
+  if (topology == nullptr || authority == nullptr || it == channels_.end() ||
+      !it->second ||
+      it->second->state() != webrtc::DataChannelInterface::kOpen) {
+    return false;
+  }
+  Json::Value root(Json::objectValue);
+  root["type"] = imcodes::rd::kControlRejectedType;
+  root["protocolVersion"] = imcodes::rd::kProtocolVersion;
+  root["sessionId"] = authority->identity.session_id;
+  root["sequence"] = Json::UInt64(outbound_sequence_++);
+  root["kind"] = kind;
+  root["reason"] = reason;
+  const std::string payload = imcodes::rd::WriteJson(root);
+  return it->second->Send(webrtc::DataBuffer(payload));
+}
+
 bool LinuxRemoteDesktopSession::SendClipboard(
     const std::string& request_id, const std::optional<std::string>& text) {
   const common::RouteAuthority* authority = transport_core_.authority();
@@ -888,6 +910,30 @@ void LinuxRemoteDesktopSession::HandleDataChannelMessage(
                         copied ? std::optional<std::string>(std::move(text))
                                : std::nullopt);
     accepted = true;
+  } else if (message.kind == imcodes::rd::DataChannelMessageKind::kControl &&
+             channel == DataChannelKind::kControl &&
+             message.control.kind == imcodes::rd::kPasteTextKind) {
+    std::string pasted_text;
+    const auto assembled = clipboard_paste_assembler_.Append(
+        *message.control.paste_id, *message.control.chunk_index,
+        *message.control.chunk_count, *message.control.text,
+        std::chrono::steady_clock::now(), &pasted_text);
+    if (assembled == common::ClipboardPasteAssembler::Result::kRejected) {
+      (void)SendControlRejected(imcodes::rd::kPasteTextKind,
+                                imcodes::rd::kRejectPasteUnavailable);
+      return;
+    }
+    if (assembled == common::ClipboardPasteAssembler::Result::kComplete) {
+      if (authority->mode != common::TransportSessionMode::kControl ||
+          core_.readiness().clipboard != common::ReadinessState::kReady ||
+          !adapters_.clipboard().PasteText(pasted_text)) {
+        (void)SendControlRejected(imcodes::rd::kPasteTextKind,
+                                  imcodes::rd::kRejectPasteUnavailable);
+        return;
+      }
+    }
+    accepted = true;
+    acknowledge = true;
   } else if (message.kind == imcodes::rd::DataChannelMessageKind::kControl &&
              channel == DataChannelKind::kControl &&
              message.control.kind == "set_quality_preference") {

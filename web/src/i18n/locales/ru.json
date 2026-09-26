@@ -4053,7 +4053,9 @@
       "mode_change_failed": "Узел отказал: Windows не применила это разрешение.",
       "scale_change_failed": "Узел отказал: Windows не применила этот масштаб.",
       "capture_failed": "Узел отказал: не удалось перенести захват на этот дисплей.",
-      "unlock_unavailable": "Узел отказал: пароль входа не сохранён, либо сейчас нечего разблокировать."
+      "unlock_unavailable": "Узел отказал: пароль входа не сохранён, либо сейчас нечего разблокировать.",
+      "paste_unavailable": "Remote clipboard unavailable; the text was typed instead.",
+      "paste_too_large": "Text too large for one clipboard paste; the text was typed instead."
     },
     "unlock": "Разблокировать",
     "unlock_hint": "Попросить узел ответить на свой экран входа сохранённым паролем.",

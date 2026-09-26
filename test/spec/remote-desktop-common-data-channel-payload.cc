@@ -10,6 +10,7 @@
 #include <string>
 
 #include "data_channel_payload.h"
+#include "clipboard_paste_assembler.h"
 
 namespace rd = imcodes::rd;
 
@@ -253,6 +254,62 @@ void ControlCarriesTypedOptionalOperations() {
         "an unknown control kind is refused rather than preserved");
 }
 
+void PasteTextChunksAreBoundedAndCorrelated() {
+  rd::DataChannelMessage message;
+  const std::string first = R"({"type":"remote_desktop.data.control",)" +
+      Correlation() + R"(,"kind":"paste_text","pasteId":"paste_1",)"
+      R"("chunkIndex":0,"chunkCount":2,"text":"hello "})";
+  Check(Accepts(first, &message), "a bounded paste chunk is accepted");
+  Check(message.control.paste_id == "paste_1" &&
+            message.control.chunk_index == 0 &&
+            message.control.chunk_count == 2 &&
+            message.control.text == "hello ",
+        "paste transfer id, index, count and text survive parsing");
+  Check(Rejects(R"({"type":"remote_desktop.data.control",)" +
+                Correlation() + R"(,"kind":"paste_text","pasteId":"paste_1",)"
+                R"("chunkIndex":0,"chunkCount":33,"text":"x"})"),
+        "a chunk count above the 64 KiB transfer bound is refused");
+  Check(Rejects(R"({"type":"remote_desktop.data.control",)" +
+                Correlation() + R"(,"kind":"paste_text","pasteId":"paste_1",)"
+                R"("chunkIndex":2,"chunkCount":2,"text":"x"})"),
+        "an out-of-range chunk index is refused");
+  Check(Rejects(R"({"type":"remote_desktop.data.control",)" +
+                Correlation() + R"(,"kind":"paste_text","pasteId":"paste_1",)"
+                R"("chunkIndex":0,"chunkCount":1,"text":"x","requestId":"other"})"),
+        "paste chunks cannot smuggle a copy-selection request id");
+}
+
+void ClipboardPasteAssemblerExpiresAndRejectsGaps() {
+  using Assembler = imcodes::remote_desktop::common::ClipboardPasteAssembler;
+  using Clock = std::chrono::steady_clock;
+  Assembler assembler;
+  const auto start = Clock::time_point{};
+  std::string complete;
+  Check(assembler.Append("paste_1", 0, 2, "alpha", start, &complete) ==
+            Assembler::Result::kAccepted && assembler.pending(),
+        "first chunk is retained without executing a partial paste");
+  Check(assembler.Append("paste_1", 1, 2, "beta", start +
+             std::chrono::milliseconds(5), &complete) ==
+            Assembler::Result::kComplete && complete == "alphabeta" &&
+            !assembler.pending(),
+        "all chunks assemble once, then clear pending state");
+  Check(assembler.Append("paste_2", 0, 2, "alpha", start, &complete) ==
+            Assembler::Result::kAccepted,
+        "a second transfer can start");
+  assembler.Expire(start + std::chrono::milliseconds(
+      imcodes::rd::kPasteTextTransferTimeoutMs));
+  Check(!assembler.pending(), "an incomplete transfer expires at its deadline");
+  Check(assembler.Append("paste_3", 1, 2, "beta", start, &complete) ==
+            Assembler::Result::kRejected && !assembler.pending(),
+        "a transfer cannot begin with a skipped chunk");
+  Check(assembler.Append("paste_4", 0, 2, "alpha", start, &complete) ==
+            Assembler::Result::kAccepted,
+        "a gapped-transfer counterexample can start cleanly");
+  Check(assembler.Append("paste_4", 2, 2, "beta", start, &complete) ==
+            Assembler::Result::kRejected && !assembler.pending(),
+        "an out-of-order chunk clears partial content");
+}
+
 }  // namespace
 
 int main() {
@@ -262,6 +319,8 @@ int main() {
   CorrelationIsMandatoryAndBounded();
   StructuralAbuseIsRefusedNotIgnored();
   ControlCarriesTypedOptionalOperations();
+  PasteTextChunksAreBoundedAndCorrelated();
+  ClipboardPasteAssemblerExpiresAndRejectsGaps();
 
   if (g_failures != 0) {
     std::fprintf(stderr, "%d data-channel payload failure(s)\n", g_failures);

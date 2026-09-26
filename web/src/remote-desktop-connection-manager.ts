@@ -62,6 +62,7 @@ interface RemoteDesktopConnectionClient {
   ): boolean;
   tapChords(chords: readonly (readonly RemoteDesktopChordKey[])[]): boolean;
   text(value: string): boolean;
+  pasteText?(value: string): boolean;
   releaseAll(): void;
   reconcileModifiers?(
     modifiers: Partial<Record<RemoteDesktopModifierKind, boolean>>,
@@ -325,6 +326,8 @@ export class RemoteDesktopConnectionManager {
       ),
       tapChords: (chords) => canControl() && entry.client.tapChords(chords),
       text: (value) => canControl() && entry.client.text(value),
+      pasteText: (value) => canControl()
+        && (entry.client.pasteText?.(value) ?? entry.client.text(value)),
       releaseAll: () => entry.client.releaseAll(),
       reconcileModifiers: (modifiers, exceptCode) => (
         entry.client.reconcileModifiers?.(modifiers, exceptCode)

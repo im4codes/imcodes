@@ -1177,8 +1177,9 @@ describe('RemoteDesktopClient', () => {
       new TextEncoder().encode(chunk).byteLength <= REMOTE_DESKTOP_LIMITS.TEXT_BYTES
       && chunk.length <= REMOTE_DESKTOP_LIMITS.TEXT_CODE_UNITS
     ))).toBe(true);
-    expect(chunkRemoteDesktopText('x'.repeat(REMOTE_DESKTOP_LIMITS.PASTE_TEXT_BYTES + 1)))
-      .toBeNull();
+    const oversized = chunkRemoteDesktopText('x'.repeat(REMOTE_DESKTOP_LIMITS.PASTE_TEXT_BYTES + 1));
+    expect(oversized).not.toBeNull();
+    expect(oversized!.join('')).toHaveLength(REMOTE_DESKTOP_LIMITS.PASTE_TEXT_BYTES + 1);
   });
 
   it('keeps the browser peer and visible state while Windows hands off to a new console session', async () => {

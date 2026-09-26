@@ -125,6 +125,11 @@ struct ControlPayload {
   std::optional<std::uint64_t> max_fps;
   std::optional<std::uint64_t> max_bitrate_bps;
   std::optional<std::string> priority;
+  // paste_text only, bounded by kMaxPasteTextChunkBytes.
+  std::optional<std::string> text;
+  std::optional<std::string> paste_id;
+  std::optional<std::uint64_t> chunk_index;
+  std::optional<std::uint64_t> chunk_count;
 };
 
 struct DataChannelMessage {

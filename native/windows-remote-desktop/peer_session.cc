@@ -651,6 +651,7 @@ bool PeerSession::SetMode(const Authority& update, const std::string& reason) {
 }
 
 bool PeerSession::Tick(int64_t now_unix_ms) {
+  clipboard_paste_assembler_.Expire(std::chrono::steady_clock::now());
   common::TransportTime now = CurrentTransportTime();
   now.unix_ms = now_unix_ms;
   return transport_core_.Tick(now);
@@ -1223,7 +1224,8 @@ void PeerSession::HandleControl(const std::string& channel,
                  {"displayId", "width", "height", "dpiScalePercent",
                   "requestId",
                   "frameWidth", "frameHeight", "acknowledgedSequence",
-                  "maxHeight", "maxFps", "maxBitrateBps", "priority"}) ||
+                  "maxHeight", "maxFps", "maxBitrateBps", "priority",
+                  "pasteId", "chunkIndex", "chunkCount", "text"}) ||
       !root["kind"].isString()) {
     return;
   }
@@ -1277,10 +1279,16 @@ void PeerSession::HandleControl(const std::string& channel,
     if (root.isMember(quality_key)) return;
   }
   const std::string kind = root["kind"].asString();
+  if (kind != "paste_text" && (root.isMember("pasteId") ||
+                                root.isMember("chunkIndex") ||
+                                root.isMember("chunkCount") ||
+                                root.isMember("text"))) {
+    return;
+  }
   uint64_t sequence = 0;
   const bool require_control = kind == "set_display_mode" ||
       kind == "set_display_scale" || kind == "copy_selection" ||
-      kind == "unlock";
+      kind == "unlock" || kind == "paste_text";
   // A command that needs control but arrives without it is the one refusal the
   // controller cannot see any other way: the picture keeps updating and the
   // click simply vanishes. Answer it, but only for this session's own frames.
@@ -1396,11 +1404,40 @@ void PeerSession::HandleControl(const std::string& channel,
         !CopySelection(root["requestId"].asString())) {
       return;
     }
+  } else if (kind == "paste_text") {
+    if (!root["pasteId"].isString() || !IsSafeId(root["pasteId"].asString()) ||
+        !root["chunkIndex"].isUInt64() || !root["chunkCount"].isUInt64() ||
+        !root["text"].isString() || root["text"].asString().empty() ||
+        root["text"].asString().size() > kMaxPasteTextChunkBytes ||
+        root["chunkCount"].asUInt64() == 0 ||
+        root["chunkCount"].asUInt64() > kMaxPasteTextChunks ||
+        root["chunkIndex"].asUInt64() >= root["chunkCount"].asUInt64() ||
+        root.isMember("displayId") || root.isMember("width") ||
+        root.isMember("height") || root.isMember("dpiScalePercent") ||
+        root.isMember("requestId") || root.isMember("frameWidth") ||
+        root.isMember("frameHeight") || root.isMember("acknowledgedSequence")) {
+      return;
+    }
+    std::string pasted;
+    const auto assembled = clipboard_paste_assembler_.Append(
+        root["pasteId"].asString(), root["chunkIndex"].asUInt64(),
+        root["chunkCount"].asUInt64(), root["text"].asString(),
+        std::chrono::steady_clock::now(), &pasted);
+    if (assembled == common::ClipboardPasteAssembler::Result::kRejected) {
+      SendControlRejected("paste_text", kRejectPasteUnavailable);
+      return;
+    }
+    if (assembled == common::ClipboardPasteAssembler::Result::kComplete &&
+        (!clipboard_adapter_ || !clipboard_adapter_->PasteText(pasted))) {
+      SendControlRejected("paste_text", kRejectPasteUnavailable);
+      return;
+    }
   } else {
     return;
   }
   last_sequence_by_channel_[channel] = sequence;
   TouchActivity();
+  if (kind == "paste_text") SendInputAck(sequence);
   if (acknowledge_layout) {
     layout_acknowledged_ = true;
     SendStatus(IsRelayed() ? "relayed" : "direct", InputReady());

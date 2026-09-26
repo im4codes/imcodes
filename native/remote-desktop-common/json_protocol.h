@@ -81,6 +81,7 @@ inline constexpr char kRejectModeChangeFailed[] = "mode_change_failed";
 inline constexpr char kRejectScaleChangeFailed[] = "scale_change_failed";
 inline constexpr char kRejectCaptureFailed[] = "capture_failed";
 inline constexpr char kRejectUnlockUnavailable[] = "unlock_unavailable";
+inline constexpr char kRejectPasteUnavailable[] = "paste_unavailable";
 
 // Why a controlling session still cannot send input. Reported on the status
 // frame so a toolbar full of greyed controls can say what it is waiting on.

@@ -4054,7 +4054,9 @@
       "mode_change_failed": "The node refused: Windows would not apply that resolution.",
       "scale_change_failed": "The node refused: Windows would not apply that scale.",
       "capture_failed": "The node refused: capture could not be moved to that display.",
-      "unlock_unavailable": "The node refused: it has no stored sign-in secret, or there is nothing to unlock right now."
+      "unlock_unavailable": "The node refused: it has no stored sign-in secret, or there is nothing to unlock right now.",
+      "paste_unavailable": "Remote clipboard unavailable; the text was typed instead.",
+      "paste_too_large": "Text too large for one clipboard paste; the text was typed instead."
     },
     "unlock": "Unlock",
     "unlock_hint": "Ask this node to answer its sign-in screen with the secret it stores.",

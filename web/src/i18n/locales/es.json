@@ -4054,7 +4054,9 @@
       "mode_change_failed": "El nodo lo rechazó: Windows no aplicó esa resolución.",
       "scale_change_failed": "El nodo lo rechazó: Windows no aplicó esa escala.",
       "capture_failed": "El nodo lo rechazó: no se pudo mover la captura a esa pantalla.",
-      "unlock_unavailable": "El nodo lo rechazó: no guarda ninguna clave de inicio de sesión, o no hay nada que desbloquear ahora mismo."
+      "unlock_unavailable": "El nodo lo rechazó: no guarda ninguna clave de inicio de sesión, o no hay nada que desbloquear ahora mismo.",
+      "paste_unavailable": "Remote clipboard unavailable; the text was typed instead.",
+      "paste_too_large": "Text too large for one clipboard paste; the text was typed instead."
     },
     "unlock": "Desbloquear",
     "unlock_hint": "Pide a este nodo que responda a su pantalla de inicio de sesión con la clave que guarda.",

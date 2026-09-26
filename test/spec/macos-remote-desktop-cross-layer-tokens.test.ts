@@ -158,6 +158,7 @@ describe('macOS remote-desktop cross-layer token agreement', () => {
       kControlRejectedType: REMOTE_DESKTOP_DATA_MSG.CONTROL_REJECTED,
       kInputAckKind: REMOTE_DESKTOP_CONTROL_KIND.INPUT_ACK,
       kCopySelectionKind: REMOTE_DESKTOP_CONTROL_KIND.COPY_SELECTION,
+      kPasteTextKind: REMOTE_DESKTOP_CONTROL_KIND.PASTE_TEXT,
       kHelloKind: REMOTE_DESKTOP_CONTROL_KIND.HELLO,
       kKeepaliveKind: REMOTE_DESKTOP_CONTROL_KIND.KEEPALIVE,
     };

@@ -200,6 +200,9 @@ export const REMOTE_DESKTOP_CONTROL_KIND = {
   SET_DISPLAY_MODE: 'set_display_mode',
   SET_DISPLAY_SCALE: 'set_display_scale',
   COPY_SELECTION: 'copy_selection',
+  // Paste text through bounded control chunks; the node assembles them, writes
+  // its OS clipboard once, then injects the platform paste shortcut once.
+  PASTE_TEXT: 'paste_text',
   // Ask the node to answer the sign-in screen with its stored secret now.
   // Auto unlock does this on its own, but the sign-in UI can swallow a
   // keystroke, so a watching controller keeps a way to say "try again".
@@ -262,6 +265,10 @@ export const REMOTE_DESKTOP_CONTROL_REJECTION = {
   CAPTURE_FAILED: 'capture_failed',
   /** No stored sign-in secret, or nothing to unlock right now. */
   UNLOCK_UNAVAILABLE: 'unlock_unavailable',
+  /** The node's clipboard is not ready, or the paste action itself failed/timed out. */
+  PASTE_UNAVAILABLE: 'paste_unavailable',
+  /** Too large for a single clipboard-paste message; typed instead. Never sent by the node -- the browser knows its own paste's size. */
+  PASTE_TOO_LARGE: 'paste_too_large',
 } as const;
 
 export type RemoteDesktopControlRejection = typeof REMOTE_DESKTOP_CONTROL_REJECTION[
@@ -418,6 +425,8 @@ export const REMOTE_DESKTOP_LIMITS = {
   TEXT_BYTES: 4 * 1024,
   TEXT_CODE_UNITS: 2 * 1024,
   PASTE_TEXT_BYTES: 64 * 1024,
+  // Worst-case JSON escaping stays safely under the 16 KiB native frame cap.
+  PASTE_TEXT_CHUNK_BYTES: 2 * 1024,
   CLIPBOARD_TEXT_BYTES: 12 * 1024,
   ERROR_DETAIL_BYTES: 512,
   // A cold Windows path includes Authenticode re-verification, active-user
@@ -888,6 +897,13 @@ export interface RemoteDesktopControl extends RemoteDesktopInputBase {
   maxFps?: number;
   maxBitrateBps?: number;
   priority?: RemoteDesktopQualityPriority;
+  /** paste_text only, bounded by PASTE_TEXT_CHUNK_BYTES. */
+  text?: string;
+  /** paste_text only; identifies one chunked paste transfer. */
+  pasteId?: string;
+  /** paste_text only; zero-based chunk ordinal and total chunk count. */
+  chunkIndex?: number;
+  chunkCount?: number;
 }
 
 export interface RemoteDesktopReleaseAll extends RemoteDesktopInputBase {
@@ -1452,7 +1468,7 @@ function validateKeyboard(value: Record<string, unknown>): boolean {
 }
 
 function validateControl(value: Record<string, unknown>): boolean {
-  if (!hasExactKeys(value, ['type', 'protocolVersion', 'sessionId', 'sequence', 'layoutRevision', 'inputEpoch', 'kind'], ['displayId', 'width', 'height', 'dpiScalePercent', 'requestId', 'frameWidth', 'frameHeight', 'acknowledgedSequence', 'maxHeight', 'maxFps', 'maxBitrateBps', 'priority'])
+  if (!hasExactKeys(value, ['type', 'protocolVersion', 'sessionId', 'sequence', 'layoutRevision', 'inputEpoch', 'kind'], ['displayId', 'width', 'height', 'dpiScalePercent', 'requestId', 'frameWidth', 'frameHeight', 'acknowledgedSequence', 'maxHeight', 'maxFps', 'maxBitrateBps', 'priority', 'text', 'pasteId', 'chunkIndex', 'chunkCount'])
     || !hasInputCorrelation(value)
     || typeof value.kind !== 'string' || !CONTROL_KINDS.has(value.kind)) return false;
   const qualityFieldsAbsent = value.maxHeight === undefined && value.maxFps === undefined
@@ -1462,7 +1478,9 @@ function validateControl(value: Record<string, unknown>): boolean {
       && value.displayId === undefined && value.width === undefined
       && value.height === undefined && value.dpiScalePercent === undefined
       && value.requestId === undefined && value.frameWidth === undefined
-      && value.frameHeight === undefined && value.acknowledgedSequence === undefined;
+      && value.frameHeight === undefined && value.acknowledgedSequence === undefined
+      && value.text === undefined && value.pasteId === undefined
+      && value.chunkIndex === undefined && value.chunkCount === undefined;
   }
   if (!qualityFieldsAbsent) return false;
   if (value.kind === REMOTE_DESKTOP_CONTROL_KIND.SELECT_DISPLAY) {
@@ -1470,7 +1488,9 @@ function validateControl(value: Record<string, unknown>): boolean {
       && value.width === undefined && value.height === undefined
       && value.dpiScalePercent === undefined && value.requestId === undefined
       && value.frameWidth === undefined && value.frameHeight === undefined
-      && value.acknowledgedSequence === undefined;
+      && value.acknowledgedSequence === undefined && value.text === undefined
+      && value.pasteId === undefined && value.chunkIndex === undefined
+      && value.chunkCount === undefined;
   }
   if (value.kind === REMOTE_DESKTOP_CONTROL_KIND.SET_DISPLAY_MODE) {
     // Bounded, not enumerated: which resolutions exist is the node's answer,
@@ -1483,7 +1503,9 @@ function validateControl(value: Record<string, unknown>): boolean {
       && (value.height as number) <= REMOTE_DESKTOP_DISPLAY_MODE_LIMITS.MAX_EDGE
       && value.dpiScalePercent === undefined && value.requestId === undefined
       && value.frameWidth === undefined && value.frameHeight === undefined
-      && value.acknowledgedSequence === undefined;
+      && value.acknowledgedSequence === undefined && value.text === undefined
+      && value.pasteId === undefined && value.chunkIndex === undefined
+      && value.chunkCount === undefined;
   }
   if (value.kind === REMOTE_DESKTOP_CONTROL_KIND.SET_DISPLAY_SCALE) {
     return isBoundedString(value.displayId, REMOTE_DESKTOP_LIMITS.DISPLAY_ID_BYTES)
@@ -1494,20 +1516,40 @@ function validateControl(value: Record<string, unknown>): boolean {
       && value.width === undefined && value.height === undefined
       && value.requestId === undefined
       && value.frameWidth === undefined && value.frameHeight === undefined
-      && value.acknowledgedSequence === undefined;
+      && value.acknowledgedSequence === undefined && value.text === undefined
+      && value.pasteId === undefined && value.chunkIndex === undefined
+      && value.chunkCount === undefined;
   }
   if (value.kind === REMOTE_DESKTOP_CONTROL_KIND.COPY_SELECTION) {
     return isId(value.requestId)
       && value.displayId === undefined && value.width === undefined
       && value.height === undefined && value.dpiScalePercent === undefined
       && value.frameWidth === undefined && value.frameHeight === undefined
-      && value.acknowledgedSequence === undefined;
+      && value.acknowledgedSequence === undefined && value.text === undefined
+      && value.pasteId === undefined && value.chunkIndex === undefined
+      && value.chunkCount === undefined;
+  }
+  if (value.kind === REMOTE_DESKTOP_CONTROL_KIND.PASTE_TEXT) {
+    return isId(value.pasteId)
+      && isSafeNonNegative(value.chunkIndex)
+      && isSafePositive(value.chunkCount)
+      && value.chunkCount <= Math.ceil(
+        REMOTE_DESKTOP_LIMITS.PASTE_TEXT_BYTES / REMOTE_DESKTOP_LIMITS.PASTE_TEXT_CHUNK_BYTES,
+      )
+      && value.chunkIndex < value.chunkCount
+      && isBoundedString(value.text, REMOTE_DESKTOP_LIMITS.PASTE_TEXT_CHUNK_BYTES)
+      && value.displayId === undefined && value.width === undefined
+      && value.height === undefined && value.dpiScalePercent === undefined
+      && value.frameWidth === undefined && value.frameHeight === undefined
+      && value.acknowledgedSequence === undefined && value.requestId === undefined;
   }
   if (value.kind === REMOTE_DESKTOP_CONTROL_KIND.UNLOCK) {
     return value.displayId === undefined && value.width === undefined
       && value.height === undefined && value.dpiScalePercent === undefined
       && value.requestId === undefined && value.frameWidth === undefined
-      && value.frameHeight === undefined && value.acknowledgedSequence === undefined;
+      && value.frameHeight === undefined && value.acknowledgedSequence === undefined
+      && value.text === undefined && value.pasteId === undefined
+      && value.chunkIndex === undefined && value.chunkCount === undefined;
   }
   if (value.kind === REMOTE_DESKTOP_CONTROL_KIND.FRAME_PRESENTED) {
     return isBoundedString(value.displayId, REMOTE_DESKTOP_LIMITS.DISPLAY_ID_BYTES)
@@ -1515,19 +1557,25 @@ function validateControl(value: Record<string, unknown>): boolean {
       && isSafePositive(value.frameHeight) && (value.frameHeight as number) <= 16_384
       && value.width === undefined && value.height === undefined
       && value.dpiScalePercent === undefined && value.requestId === undefined
-      && value.acknowledgedSequence === undefined;
+      && value.acknowledgedSequence === undefined && value.text === undefined
+      && value.pasteId === undefined && value.chunkIndex === undefined
+      && value.chunkCount === undefined;
   }
   if (value.kind === REMOTE_DESKTOP_CONTROL_KIND.INPUT_ACK) {
     return isSafeNonNegative(value.acknowledgedSequence)
       && value.displayId === undefined && value.width === undefined
       && value.height === undefined && value.frameWidth === undefined
       && value.frameHeight === undefined && value.dpiScalePercent === undefined
-      && value.requestId === undefined;
+      && value.requestId === undefined && value.text === undefined
+      && value.pasteId === undefined && value.chunkIndex === undefined
+      && value.chunkCount === undefined;
   }
   return value.displayId === undefined && value.width === undefined
     && value.height === undefined && value.frameWidth === undefined
     && value.frameHeight === undefined && value.acknowledgedSequence === undefined
-    && value.dpiScalePercent === undefined && value.requestId === undefined;
+    && value.dpiScalePercent === undefined && value.requestId === undefined
+    && value.text === undefined && value.pasteId === undefined
+    && value.chunkIndex === undefined && value.chunkCount === undefined;
 }
 
 function validateControlRejected(value: Record<string, unknown>): boolean {

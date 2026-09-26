@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "third_party/imcodes_remote_desktop/display_preferences.h"
+#include "third_party/imcodes_remote_desktop/data_channel_constants.h"
 #include "third_party/imcodes_remote_desktop/json_protocol.h"
 #include "third_party/imcodes_remote_desktop/worker_policy.h"
 
@@ -91,7 +92,7 @@ common::DisplayRotation ToCommonRotation(int degrees) noexcept {
 
 std::optional<std::u16string> Utf8ToUtf16(std::string_view value) {
   static_assert(sizeof(wchar_t) == sizeof(char16_t));
-  if (value.empty() || value.size() > kMaxClipboardTextBytes ||
+  if (value.empty() || value.size() > kMaxPasteTextBytes ||
       value.size() >
           static_cast<std::size_t>(std::numeric_limits<int>::max())) {
     return std::nullopt;
@@ -375,8 +376,40 @@ common::ReadinessState WindowsClipboardAdapter::ProbeReadiness() {
 }
 
 bool WindowsClipboardAdapter::PasteText(std::string_view text) {
+  if (text.empty() || text.size() > kMaxPasteTextBytes ||
+      !input_.Available()) return false;
   const auto decoded = Utf8ToUtf16(text);
-  return decoded && input_.Text(*decoded);
+  if (!decoded || !OpenClipboard(nullptr)) return false;
+  const bool emptied = EmptyClipboard() != FALSE;
+  HGLOBAL memory = nullptr;
+  bool clipboard_written = false;
+  if (emptied) {
+    const SIZE_T bytes = (decoded->size() + 1) * sizeof(char16_t);
+    memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (memory != nullptr) {
+      auto *target = static_cast<char16_t *>(GlobalLock(memory));
+      if (target != nullptr) {
+        std::copy(decoded->begin(), decoded->end(), target);
+        target[decoded->size()] = u'\0';
+        GlobalUnlock(memory);
+        if (SetClipboardData(CF_UNICODETEXT, memory) != nullptr) {
+          clipboard_written = true;
+          memory = nullptr;  // the system owns it now
+        }
+      }
+    }
+  }
+  if (memory != nullptr) GlobalFree(memory);
+  CloseClipboard();
+  if (!clipboard_written) return false;
+
+  constexpr std::string_view kControl = "ControlLeft";
+  constexpr std::string_view kPaste = "KeyV";
+  if (!input_.KeyDown(controller_id_, std::string(kControl), false)) return false;
+  bool paste_down = input_.KeyDown(controller_id_, std::string(kPaste), false);
+  bool paste_up = paste_down && input_.KeyUp(controller_id_, std::string(kPaste));
+  const bool control_up = input_.KeyUp(controller_id_, std::string(kControl));
+  return paste_down && paste_up && control_up;
 }
 
 bool WindowsClipboardAdapter::CopySelection(std::string *text) {

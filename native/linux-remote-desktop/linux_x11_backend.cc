@@ -1,13 +1,17 @@
 #include "linux_x11_backend.h"
 #include "../remote-desktop-common/aidesk_product_name.h"
+#include "../remote-desktop-common/data_channel_constants.h"
 #include "../remote-desktop-common/local_indicator_visuals.h"
 
 #include <chrono>
+#include <algorithm>
+#include <iterator>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
 #include <ctime>
 #include <utility>
 #include <vector>
@@ -739,7 +743,9 @@ X11ClipboardAdapter::~X11ClipboardAdapter() {
 
 ReadinessState X11ClipboardAdapter::ProbeReadiness() {
   Display* display = Dpy(connection_);
-  if (display == nullptr) return ReadinessState::kUnavailable;
+  if (display == nullptr || !connection_->has_xtest()) {
+    return ReadinessState::kUnavailable;
+  }
   return ProbeClipboardReadiness(connection_->MeasureFacts());
 }
 
@@ -754,14 +760,67 @@ bool X11ClipboardAdapter::EnsureWindow() {
 
 bool X11ClipboardAdapter::PasteText(std::string_view text) {
   Display* display = Dpy(connection_);
-  if (display == nullptr || !EnsureWindow()) return false;
+  if (display == nullptr || !connection_->has_xtest() || !EnsureWindow() ||
+      text.empty() || text.size() > imcodes::rd::kMaxPasteTextBytes) return false;
   owned_text_.assign(text);
   const Atom clipboard = XInternAtom(display, "CLIPBOARD", False);
   XSetSelectionOwner(display, clipboard, static_cast<Window>(window_), CurrentTime);
   XSync(display, False);
   owns_clipboard_ =
       XGetSelectionOwner(display, clipboard) == static_cast<Window>(window_);
-  return owns_clipboard_;
+  if (!owns_clipboard_) return false;
+
+  bool terminal = false;
+  Window focused = None;
+  int revert = RevertToParent;
+  XGetInputFocus(display, &focused, &revert);
+  XClassHint hint{};
+  if (focused != None && XGetClassHint(display, focused, &hint)) {
+    std::string class_name = hint.res_class ? hint.res_class : "";
+    std::string instance_name = hint.res_name ? hint.res_name : "";
+    std::transform(class_name.begin(), class_name.end(), class_name.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::transform(instance_name.begin(), instance_name.end(), instance_name.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    const std::string identity = class_name + " " + instance_name;
+    static constexpr std::string_view kTerminals[] = {
+        "xterm", "terminal", "konsole", "gnome-terminal", "xfce4-terminal",
+        "alacritty", "kitty", "wezterm", "foot", "urxvt", "rxvt", "tilix",
+        "terminator", "ptyxis", "kgx"};
+    terminal = std::any_of(std::begin(kTerminals), std::end(kTerminals),
+                           [&](std::string_view name) {
+                             return identity.find(name) != std::string::npos;
+                           });
+    if (hint.res_name) XFree(hint.res_name);
+    if (hint.res_class) XFree(hint.res_class);
+  }
+
+  const KeyCode control = XKeysymToKeycode(display, XK_Control_L);
+  const KeyCode shift = terminal ? XKeysymToKeycode(display, XK_Shift_L) : 0;
+  const KeyCode v = XKeysymToKeycode(display, XK_v);
+  if (control == 0 || v == 0 || (terminal && shift == 0)) return false;
+  std::vector<KeyCode> pressed;
+  auto transition = [&](KeyCode keycode, bool down) {
+    if (XTestFakeKeyEvent(display, keycode, down ? True : False, CurrentTime) == 0) {
+      return false;
+    }
+    if (down) pressed.push_back(keycode);
+    else if (!pressed.empty()) pressed.pop_back();
+    return true;
+  };
+  bool ok = transition(control, true);
+  if (ok && terminal) ok = transition(shift, true);
+  if (ok) ok = transition(v, true);
+  if (ok) ok = transition(v, false);
+  if (ok && terminal) ok = transition(shift, false);
+  if (ok) ok = transition(control, false);
+  while (!pressed.empty()) {
+    const KeyCode keycode = pressed.back();
+    XTestFakeKeyEvent(display, keycode, False, CurrentTime);
+    pressed.pop_back();
+  }
+  XFlush(display);
+  return ok;
 }
 
 void X11ClipboardAdapter::PumpSelectionRequests(int max_events) {

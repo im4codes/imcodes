@@ -4054,7 +4054,9 @@
       "mode_change_failed": "节点拒绝：Windows 未能应用该分辨率。",
       "scale_change_failed": "节点拒绝：Windows 未能应用该缩放比例。",
       "capture_failed": "节点拒绝：无法将画面采集切换到该显示器。",
-      "unlock_unavailable": "节点拒绝：未保存登录口令，或当前没有需要解锁的界面。"
+      "unlock_unavailable": "节点拒绝：未保存登录口令，或当前没有需要解锁的界面。",
+      "paste_unavailable": "Remote clipboard unavailable; the text was typed instead.",
+      "paste_too_large": "Text too large for one clipboard paste; the text was typed instead."
     },
     "unlock": "解锁",
     "unlock_hint": "让该节点用本机保存的口令应答自己的登录界面。",

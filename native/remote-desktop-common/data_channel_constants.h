@@ -2,6 +2,7 @@
 #define IMCODES_REMOTE_DESKTOP_COMMON_DATA_CHANNEL_CONSTANTS_H_
 
 #include <cstddef>
+#include <cstdint>
 
 namespace imcodes::rd {
 
@@ -35,8 +36,20 @@ inline constexpr char kControlRejectedType[] =
 inline constexpr char kInputAckKind[] = "input_ack";
 // Browser to worker: read the remote selection; answered with kClipboardType.
 inline constexpr char kCopySelectionKind[] = "copy_selection";
+// Browser to worker: paste text via bounded chunks; after assembly the host
+// writes its OS clipboard once, then injects the platform paste shortcut once.
+inline constexpr char kPasteTextKind[] = "paste_text";
 inline constexpr char kHelloKind[] = "hello";
 inline constexpr char kKeepaliveKind[] = "keepalive";
+
+// Bounds pinned to REMOTE_DESKTOP_LIMITS in shared/remote-desktop.ts. At worst
+// JSON escaping expands each byte to six, so a 2 KiB raw chunk remains below
+// the 16 KiB data-frame cap.
+inline constexpr std::size_t kMaxPasteTextBytes = 64 * 1024;
+inline constexpr std::size_t kMaxPasteTextChunkBytes = 2 * 1024;
+inline constexpr std::size_t kMaxPasteTextChunks =
+    kMaxPasteTextBytes / kMaxPasteTextChunkBytes;
+inline constexpr std::uint64_t kPasteTextTransferTimeoutMs = 10'000;
 
 }  // namespace imcodes::rd
 

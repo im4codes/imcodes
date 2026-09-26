@@ -287,9 +287,7 @@ export function isRemoteDesktopKeyAllowed(
 
 export function chunkRemoteDesktopText(value: string): string[] | null {
   const encoder = new TextEncoder();
-  if (!value || encoder.encode(value).byteLength > REMOTE_DESKTOP_LIMITS.PASTE_TEXT_BYTES) {
-    return null;
-  }
+  if (!value) return null;
   const chunks: string[] = [];
   let chunk = '';
   let bytes = 0;
@@ -306,6 +304,26 @@ export function chunkRemoteDesktopText(value: string): string[] | null {
     chunk += symbol;
     bytes += symbolBytes;
     codeUnits += symbol.length;
+  }
+  if (chunk) chunks.push(chunk);
+  return chunks;
+}
+
+function chunkClipboardPasteText(value: string): string[] | null {
+  if (!value) return null;
+  const encoder = new TextEncoder();
+  const chunks: string[] = [];
+  let chunk = '';
+  let bytes = 0;
+  for (const symbol of value) {
+    const symbolBytes = encoder.encode(symbol).byteLength;
+    if (chunk && bytes + symbolBytes > REMOTE_DESKTOP_LIMITS.PASTE_TEXT_CHUNK_BYTES) {
+      chunks.push(chunk);
+      chunk = '';
+      bytes = 0;
+    }
+    chunk += symbol;
+    bytes += symbolBytes;
   }
   if (chunk) chunks.push(chunk);
   return chunks;
@@ -567,6 +585,7 @@ export class RemoteDesktopClient {
     resolve(value: string | null): void;
     timer: ReturnType<typeof setTimeout>;
   }>();
+  private pendingPaste: { id: string; text: string; finalSequence: number } | null = null;
   private controlRejectionId = 0;
   private diagnosticTrackCleanup: (() => void) | null = null;
   private snapshot: RemoteDesktopSnapshot = {
@@ -1039,6 +1058,49 @@ export class RemoteDesktopClient {
 
   text(value: string): boolean {
     if (!this.canSendInput()) return false;
+    return this.sendTypedText(value);
+  }
+
+  /** Paste a clipboard payload remotely with one OS clipboard write + native shortcut. */
+  pasteText(value: string): boolean {
+    if (!this.canSendInput() || !value) return false;
+    if (new TextEncoder().encode(value).byteLength > REMOTE_DESKTOP_LIMITS.PASTE_TEXT_BYTES) {
+      const sent = this.sendTypedText(value);
+      if (sent) this.publishControlRejection(
+        REMOTE_DESKTOP_CONTROL_KIND.PASTE_TEXT,
+        REMOTE_DESKTOP_CONTROL_REJECTION.PASTE_TOO_LARGE,
+      );
+      return sent;
+    }
+    const chunks = chunkClipboardPasteText(value);
+    if (!chunks?.length || this.pendingPaste) return false;
+    const id = globalThis.crypto?.randomUUID?.()
+      ?? `paste_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+    let finalSequence = -1;
+    for (let index = 0; index < chunks.length; index += 1) {
+      const base = this.inputBase();
+      finalSequence = base.sequence;
+      if (!this.sendControl({
+        type: REMOTE_DESKTOP_DATA_MSG.CONTROL,
+        ...base,
+        kind: REMOTE_DESKTOP_CONTROL_KIND.PASTE_TEXT,
+        pasteId: id,
+        chunkIndex: index,
+        chunkCount: chunks.length,
+        text: chunks[index],
+      })) {
+        this.publishControlRejection(
+          REMOTE_DESKTOP_CONTROL_KIND.PASTE_TEXT,
+          REMOTE_DESKTOP_CONTROL_REJECTION.PASTE_UNAVAILABLE,
+        );
+        return this.sendTypedText(value);
+      }
+    }
+    this.pendingPaste = { id, text: value, finalSequence };
+    return true;
+  }
+
+  private sendTypedText(value: string): boolean {
     const chunks = chunkRemoteDesktopText(value);
     if (!chunks) return false;
     // A paste shortcut leaves its Control or Command held. Typed underneath
@@ -1583,6 +1645,13 @@ export class RemoteDesktopClient {
       this.pendingClipboardRequests.delete(parsed.value.requestId);
       pending.resolve(parsed.value.available ? parsed.value.text ?? null : null);
     } else if (parsed.value.type === REMOTE_DESKTOP_DATA_MSG.CONTROL_REJECTED) {
+      if (parsed.value.kind === REMOTE_DESKTOP_CONTROL_KIND.PASTE_TEXT
+        && parsed.value.reason === REMOTE_DESKTOP_CONTROL_REJECTION.PASTE_UNAVAILABLE
+        && this.pendingPaste) {
+        const pending = this.pendingPaste;
+        this.pendingPaste = null;
+        this.sendTypedText(pending.text);
+      }
       this.publishControlRejection(
         parsed.value.kind,
         parsed.value.reason,
@@ -1601,6 +1670,10 @@ export class RemoteDesktopClient {
         this.pendingInputAckSequence = null;
         if (this.inputAckTimer) clearTimeout(this.inputAckTimer);
         this.inputAckTimer = null;
+      }
+      if (this.pendingPaste
+        && parsed.value.acknowledgedSequence >= this.pendingPaste.finalSequence) {
+        this.pendingPaste = null;
       }
     }
   }

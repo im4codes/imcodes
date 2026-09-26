@@ -547,7 +547,8 @@ void SkipWhitespace(std::string_view text, std::size_t* index) {
            "inputEpoch", "kind"},
           {"displayId", "width", "height", "dpiScalePercent", "requestId",
            "frameWidth", "frameHeight", "acknowledgedSequence", "maxHeight",
-           "maxFps", "maxBitrateBps", "priority"})) {
+           "maxFps", "maxBitrateBps", "priority", "text", "pasteId",
+           "chunkIndex", "chunkCount"})) {
     return false;
   }
   // Control carries no input epoch requirement beyond correlation: unlike
@@ -586,7 +587,11 @@ void SkipWhitespace(std::string_view text, std::size_t* index) {
       !ReadOptionalUnsigned(members, "maxHeight", &out->control.max_height) ||
       !ReadOptionalUnsigned(members, "maxFps", &out->control.max_fps) ||
       !ReadOptionalUnsigned(members, "maxBitrateBps",
-                            &out->control.max_bitrate_bps)) {
+                            &out->control.max_bitrate_bps) ||
+      !ReadOptionalUnsigned(members, "chunkIndex",
+                            &out->control.chunk_index) ||
+      !ReadOptionalUnsigned(members, "chunkCount",
+                            &out->control.chunk_count)) {
     return false;
   }
   const Scalar* priority = Find(members, "priority");
@@ -594,6 +599,20 @@ void SkipWhitespace(std::string_view text, std::size_t* index) {
     std::string value;
     if (!ReadBoundedString(priority, 16, &value)) return false;
     out->control.priority = std::move(value);
+  }
+  const Scalar* text = Find(members, "text");
+  if (text != nullptr) {
+    std::string value;
+    if (!ReadBoundedString(text, kMaxPasteTextChunkBytes, &value))
+      return false;
+    out->control.text = std::move(value);
+  }
+  const Scalar* paste_id = Find(members, "pasteId");
+  if (paste_id != nullptr) {
+    std::string value;
+    if (!ReadBoundedString(paste_id, kMaxRequestIdBytes, &value))
+      return false;
+    out->control.paste_id = std::move(value);
   }
 
   const auto absent = [&members](const char* name) {
@@ -609,7 +628,9 @@ void SkipWhitespace(std::string_view text, std::size_t* index) {
         !absent("displayId") || !absent("width") || !absent("height") ||
         !absent("dpiScalePercent") || !absent("requestId") ||
         !absent("frameWidth") || !absent("frameHeight") ||
-        !absent("acknowledgedSequence")) {
+        !absent("acknowledgedSequence") || !absent("text") ||
+        !absent("pasteId") || !absent("chunkIndex") ||
+        !absent("chunkCount")) {
       return false;
     }
     const std::uint64_t height = *out->control.max_height;
@@ -630,7 +651,9 @@ void SkipWhitespace(std::string_view text, std::size_t* index) {
     return absent("displayId") && absent("width") && absent("height") &&
            absent("dpiScalePercent") && absent("requestId") &&
            absent("frameWidth") && absent("frameHeight") &&
-           absent("acknowledgedSequence");
+           absent("acknowledgedSequence") && absent("text") &&
+           absent("pasteId") && absent("chunkIndex") &&
+           absent("chunkCount");
   };
 
   if (out->control.kind == "hello" || out->control.kind == "keepalive" ||
@@ -641,7 +664,9 @@ void SkipWhitespace(std::string_view text, std::size_t* index) {
     return out->control.display_id.has_value() && absent("width") &&
            absent("height") && absent("dpiScalePercent") &&
            absent("requestId") && absent("frameWidth") &&
-           absent("frameHeight") && absent("acknowledgedSequence");
+           absent("frameHeight") && absent("acknowledgedSequence") &&
+           absent("text") && absent("pasteId") && absent("chunkIndex") &&
+           absent("chunkCount");
   }
   if (out->control.kind == "set_display_mode") {
     return out->control.display_id.has_value() &&
@@ -650,13 +675,17 @@ void SkipWhitespace(std::string_view text, std::size_t* index) {
            *out->control.height >= 480 && *out->control.height <= 16'384 &&
            absent("dpiScalePercent") && absent("requestId") &&
            absent("frameWidth") && absent("frameHeight") &&
-           absent("acknowledgedSequence");
+           absent("acknowledgedSequence") && absent("text") &&
+           absent("pasteId") && absent("chunkIndex") &&
+           absent("chunkCount");
   }
   if (out->control.kind == "set_display_scale") {
     if (!out->control.display_id.has_value() ||
         !out->control.dpi_scale_percent.has_value() || !absent("width") ||
         !absent("height") || !absent("requestId") || !absent("frameWidth") ||
-        !absent("frameHeight") || !absent("acknowledgedSequence")) {
+        !absent("frameHeight") || !absent("acknowledgedSequence") ||
+        !absent("text") || !absent("pasteId") ||
+        !absent("chunkIndex") || !absent("chunkCount")) {
       return false;
     }
     switch (*out->control.dpi_scale_percent) {
@@ -677,7 +706,22 @@ void SkipWhitespace(std::string_view text, std::size_t* index) {
     return out->control.request_id.has_value() && absent("displayId") &&
            absent("width") && absent("height") && absent("dpiScalePercent") &&
            absent("frameWidth") && absent("frameHeight") &&
-           absent("acknowledgedSequence");
+           absent("acknowledgedSequence") && absent("text") &&
+           absent("pasteId") && absent("chunkIndex") &&
+           absent("chunkCount");
+  }
+  if (out->control.kind == kPasteTextKind) {
+    return out->control.paste_id.has_value() &&
+           out->control.chunk_index.has_value() &&
+           out->control.chunk_count.has_value() &&
+           *out->control.chunk_index < *out->control.chunk_count &&
+           *out->control.chunk_count > 0 &&
+           *out->control.chunk_count <= kMaxPasteTextChunks &&
+           out->control.text.has_value() &&
+           absent("displayId") && absent("width") && absent("height") &&
+           absent("dpiScalePercent") && absent("frameWidth") &&
+           absent("frameHeight") && absent("acknowledgedSequence") &&
+           absent("requestId");
   }
   if (out->control.kind == "frame_presented") {
     return out->control.display_id.has_value() &&
@@ -688,13 +732,17 @@ void SkipWhitespace(std::string_view text, std::size_t* index) {
            *out->control.frame_height > 0 &&
            *out->control.frame_height <= 16'384 && absent("width") &&
            absent("height") && absent("dpiScalePercent") &&
-           absent("requestId") && absent("acknowledgedSequence");
+           absent("requestId") && absent("acknowledgedSequence") &&
+           absent("text") && absent("pasteId") && absent("chunkIndex") &&
+           absent("chunkCount");
   }
   if (out->control.kind == "input_ack") {
     return out->control.acknowledged_sequence.has_value() &&
            absent("displayId") && absent("width") && absent("height") &&
            absent("dpiScalePercent") && absent("requestId") &&
-           absent("frameWidth") && absent("frameHeight");
+           absent("frameWidth") && absent("frameHeight") && absent("text") &&
+           absent("pasteId") && absent("chunkIndex") &&
+           absent("chunkCount");
   }
   return false;
 }
