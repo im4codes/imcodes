@@ -200,33 +200,55 @@ describe('TaskPairStatusPanel', () => {
     expect(screen.queryByText('deck_sub_exec')).toBeNull();
   });
 
-  it('fills its parent height with the rows list owning the scroll, not a fixed height on the panel', () => {
+  const readCss = () => {
     const WEB_ROOT = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
-    const css = readFileSync(join(WEB_ROOT, 'src/styles.css'), 'utf8');
-    const rule = (selector: string) => new RegExp(`${selector.replace(/[.:]/g, '\\$&')} \\{([^}]*)\\}`).exec(css)?.[1] ?? '';
-    const panelRule = rule('.task-pair-status-panel');
-    expect(panelRule).toMatch(/top:\s*0/);
+    return readFileSync(join(WEB_ROOT, 'src/styles.css'), 'utf8');
+  };
+  const cssRule = (css: string, selector: string) =>
+    new RegExp(`${selector.replace(/[.:]/g, '\\$&')} \\{([^}]*)\\}`).exec(css)?.[1] ?? '';
+
+  it('fills its parent height with the rows list owning the scroll, not a fixed height on the panel', () => {
+    const css = readCss();
+    const panelRule = cssRule(css, '.task-pair-status-panel');
     expect(panelRule).toMatch(/bottom:\s*0/);
     expect(panelRule).toMatch(/display:\s*flex/);
     expect(panelRule).toMatch(/flex-direction:\s*column/);
-    const rowsRule = rule('.task-pair-status-rows');
+    const rowsRule = cssRule(css, '.task-pair-status-rows');
     expect(rowsRule).toMatch(/flex:\s*1/);
     expect(rowsRule).toMatch(/min-height:\s*0/);
     expect(rowsRule).toMatch(/overflow-y:\s*auto/);
     expect(rowsRule).not.toMatch(/max-height/);
   });
 
-  it('keeps the toggle header clear of the sidebar toolbar cluster at every width', () => {
-    const WEB_ROOT = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
-    const css = readFileSync(join(WEB_ROOT, 'src/styles.css'), 'utf8');
-    const rule = (selector: string) => new RegExp(`${selector.replace(/[.:]/g, '\\$&')} \\{([^}]*)\\}`).exec(css)?.[1] ?? '';
+  it('starts below the sidebar toolbar cluster instead of z-index-stacking over it (which would still block its clicks)', () => {
+    const css = readCss();
     // .chat-top-actions floats at top:6px, its tallest button is 24px, and the
-    // count badge extends 4px above that -- roughly y=2..30. The toggle must
-    // clear that band regardless of the panel's own (responsive) width.
-    const toggleRule = rule('.task-pair-status-toggle');
-    const topPadding = /padding-top:\s*(\d+)px/.exec(toggleRule)?.[1];
-    expect(Number(topPadding)).toBeGreaterThanOrEqual(34);
-    expect(toggleRule).toMatch(/flex-wrap:\s*wrap/);
+    // count badge extends 4px above that -- roughly y=2..30. The panel must
+    // start at or below that band so the toolbar's buttons stay reachable
+    // (an overlapping panel, even with header padding to clear the *text*,
+    // still intercepts clicks meant for the toolbar underneath it).
+    const panelRule = cssRule(css, '.task-pair-status-panel');
+    const topOffset = /top:\s*(\d+)px/.exec(panelRule)?.[1];
+    expect(Number(topOffset)).toBeGreaterThanOrEqual(34);
+  });
+
+  it('gives the panel an opaque background from tokens that are actually defined, so it never renders transparent over the toolbar or chat text', () => {
+    const css = readCss();
+    const rootVars = new Set(
+      [...cssRule(css, ':root').matchAll(/--([\w-]+):/g)].map((match) => match[1]),
+    );
+    const panelRule = cssRule(css, '.task-pair-status-panel');
+    const background = /background:\s*([^;]+);/.exec(panelRule)?.[1] ?? '';
+    expect(background).toBeTruthy();
+    // Every var(--x, ...) reference in the background must resolve: either
+    // --x itself is a defined :root token, or its fallback chain bottoms out
+    // at one. A var() with no defined property anywhere in the chain (like
+    // the retired --panel-bg / --surface-2 pair) computes to nothing, which
+    // silently makes the whole declaration (and therefore the background)
+    // transparent -- exactly the bug this guards against.
+    const varRefs = [...background.matchAll(/var\(\s*(--[\w-]+)/g)].map((match) => match[1].slice(2));
+    expect(varRefs.length).toBeGreaterThan(0);
+    for (const name of varRefs) expect(rootVars.has(name)).toBe(true);
   });
 
   it('renders every group -- including a tall rework group -- so the list can scroll to reach it, never dropping rows from the DOM', () => {

@@ -14452,18 +14452,26 @@ button.quick-agent-delegation-preset.active {
   padding: 0 6px;
   border: 1px solid var(--warning-color, #c98a00);
 }
+/*
+ * .chat-top-actions (sync / agents / file-panel icons) floats at
+ * top:6px/right:8px in the same containing block, its tallest button plus
+ * count badge spanning roughly y=2..30. This panel starts below that band
+ * (top offset, not padding) rather than merely drawing z-index:12 over it --
+ * z-index alone would still let the panel's own toggle <button> intercept
+ * clicks meant for those toolbar buttons.
+ */
 .task-pair-status-panel {
-  position: absolute; z-index: 12; top: 0; right: 0; bottom: 0; width: min(300px, 30vw); max-width: 300px;
+  position: absolute; z-index: 12; top: 40px; right: 0; bottom: 0; width: min(300px, 30vw); max-width: 300px;
   width: min(300px, 100%);
   max-width: 300px;
   margin-left: auto;
-  background: color-mix(in srgb, var(--panel-bg, var(--surface-2)) 92%, var(--chrome-accent) 8%);
+  background: color-mix(in srgb, var(--chrome-panel-2, var(--chrome-panel)) 92%, var(--chrome-accent) 8%);
   border-left: 1px solid var(--status-info-border, var(--chrome-accent));
   box-shadow: -4px 0 18px color-mix(in srgb, var(--chrome-accent) 12%, transparent);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  /* Fill the sidebar top-to-bottom (top/right/bottom above) and let the rows
-     list -- not this box -- own the scrolling, so nothing is ever clipped by
-     a fixed height on the panel itself. */
+  /* Fill the sidebar top-to-bottom below the toolbar band (top/bottom above)
+     and let the rows list -- not this box -- own the scrolling, so nothing
+     is ever clipped by a fixed height on the panel itself. */
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -14476,11 +14484,6 @@ button.quick-agent-delegation-preset.active {
 .task-pair-status-toggle {
   width: 100%; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 4px 8px;
   padding: 8px; color: inherit; background: transparent; border: 0; text-align: left; flex-shrink: 0;
-  /* .chat-top-actions floats at top:6px/right:8px with z-index:10 over this
-     same corner (its tallest button + badge span roughly y=2..30). This panel
-     is z-index:12, so without this offset its own header text renders behind
-     those icons instead of below them. */
-  padding-top: 38px;
 }
 .task-pair-status-toggle strong,
 .task-pair-status-toggle span { min-width: 0; overflow-wrap: anywhere; }
