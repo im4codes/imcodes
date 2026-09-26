@@ -78,6 +78,37 @@ export class TaskPairService {
   #unsubscribe?: () => void;
   #scheduler?: TaskPairScheduler;
   #recentBrainDispatch = new Map<string, { taskId: string; at: number }>();
+  /**
+   * Background work `applyMarker` starts and does not await (running intents,
+   * briefing participants, ending a workspace) -- each can still be mid-flight,
+   * awaiting its own I/O, after the call that started it has returned. Tracked
+   * here so `waitForIdle` (called by `dispose`, and by tests before they close
+   * the store) can drain it instead of leaving it to resolve against a store
+   * that already closed, which would otherwise throw as an unhandled rejection
+   * -- or, in a test, land on the next test's assertions.
+   */
+  #pending = new Set<Promise<unknown>>();
+
+  /** Track a fire-and-forget background operation so it can be drained later. */
+  #track<T>(promise: Promise<T>): void {
+    this.#pending.add(promise);
+    // Attaching a handler here -- regardless of whether anything ever drains
+    // the set -- is what stops Node from treating a late rejection as
+    // unhandled, even if it settles long after the caller moved on.
+    promise.finally(() => this.#pending.delete(promise)).catch(() => { /* already logged at the call site */ });
+  }
+
+  /** Number of background operations still in flight (diagnostics/tests). */
+  get pendingCount(): number {
+    return this.#pending.size;
+  }
+
+  /** Waits for every currently-tracked background operation, draining transitively (settling one can start another). */
+  async waitForIdle(): Promise<void> {
+    while (this.#pending.size > 0) {
+      await Promise.allSettled([...this.#pending]);
+    }
+  }
 
   init(): void {
     if (this.#unsubscribe) return;
@@ -104,9 +135,11 @@ export class TaskPairService {
     });
   }
 
-  dispose(): void {
+  /** Unsubscribes first (no new background work starts), then drains whatever was already in flight. */
+  async dispose(): Promise<void> {
     this.#unsubscribe?.();
     this.#unsubscribe = undefined;
+    await this.waitForIdle();
   }
 
   setScheduler(scheduler: TaskPairScheduler | undefined): void {
@@ -212,18 +245,18 @@ export class TaskPairService {
       });
     }
     this.#emitEvent(input, taskId ?? input.marker.taskId, role, transition, stored?.state ?? existing?.state);
-    void this.#executeIntents(input.project, stored?.state, transition.intents);
+    this.#track(this.#executeIntents(input.project, stored?.state, transition.intents));
     // A pair Brain opens (DISPATCH marker, plain or task-tagged dispatch) tells
     // its participants what a pair is. The queue sends its own brief.
     if (stored && input.source !== 'queue' && input.marker.knownVerb === 'DISPATCH'
       && (transition.effect === 'created' || transition.effect === 'dispatched')) {
-      void this.briefParticipants(input.project, stored.state.taskId);
+      this.#track(this.briefParticipants(input.project, stored.state.taskId));
     }
     // A pair that just ended (DONE, CANCEL, DONE force=true): its workspace
     // starts its retention and a deliverable named on DONE is kept.
     if (stored && transition.toStatus && isTerminalTaskPairStatus(transition.toStatus)
       && (!transition.fromStatus || !isTerminalTaskPairStatus(transition.fromStatus))) {
-      void this.endWorkspace(input.project, stored.state.taskId, now);
+      this.#track(this.endWorkspace(input.project, stored.state.taskId, now));
     }
     if (stored && transition.toStatus === 'passed' && transition.fromStatus !== 'passed') {
       this.#scheduler?.flagEconomyUnreviewed?.(input.project, stored.state.taskId);

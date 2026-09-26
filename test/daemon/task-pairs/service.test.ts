@@ -70,8 +70,8 @@ describe('task-pair marker ingestion', () => {
     service.init();
   });
 
-  afterEach(() => {
-    service.dispose();
+  afterEach(async () => {
+    await service.dispose();
     setTaskPairDeliveryDepsForTests(undefined);
     setTaskPairStoreForTests(undefined);
     for (const name of [BRAIN, EXEC, AUD, PROC, OTHER_PROJECT_SESSION]) removeSession(name);

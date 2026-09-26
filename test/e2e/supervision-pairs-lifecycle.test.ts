@@ -142,11 +142,11 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => {
+afterEach(async () => {
   offTimeline?.();
   automation.stop();
   taskPairService.setScheduler(undefined);
-  taskPairService.dispose();
+  await taskPairService.dispose();
   setTaskPairDeliveryDepsForTests(undefined);
   setTaskPairStoreForTests(undefined);
   resetSupervisionTaskRegistryForTests();
