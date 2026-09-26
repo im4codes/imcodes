@@ -1403,7 +1403,11 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
         pendingFirstTs = event.ts;
         pendingAssistantAutomation = assistantAutomation;
       }
-      pendingAssistantStreaming = pendingAssistantStreaming || event.payload.streaming === true || event.payload.pending === true;
+      // The newest event is authoritative: a terminal assistant.text must
+      // clear streaming even when earlier deltas in this merged block were
+      // marked streaming/pending. This lets the markdown renderer finalize
+      // immediately and freeze its parsed AST.
+      pendingAssistantStreaming = event.payload.streaming === true || event.payload.pending === true;
       // Only the turn's completed message carries the delegation-claim
       // projection, so the newest event that has one wins for the block.
       const delegationMetadata = readDelegationClaimMetadata(event.payload);

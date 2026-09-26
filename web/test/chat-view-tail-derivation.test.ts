@@ -206,3 +206,13 @@ it('computes measured viewport ranges with overscan and exact spacer conservatio
   expect(range.totalHeight).toBe(610);
   expect(range.topSpacer + range.bottomSpacer).toBeLessThanOrEqual(range.totalHeight);
 });
+
+it('finalizes a merged assistant block when its latest event is terminal', () => {
+  const items = __buildViewItemsForTests([
+    ev(1, 'assistant.text', { text: 'partial', streaming: true }),
+    ev(2, 'assistant.text', { text: 'final answer' }),
+  ], true);
+  expect(items).toHaveLength(1);
+  expect(items[0]?.assistantStreaming).toBe(false);
+  expect(items[0]?.text).toContain('final answer');
+});
