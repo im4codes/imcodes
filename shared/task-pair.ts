@@ -451,6 +451,16 @@ export interface TaskPairState {
   /** Marker-triggered messages sent this round, per capped reason. */
   capCounts: Partial<Record<TaskPairCappedReason, number>>;
   capRound: number;
+  /**
+   * Writers already told this closed (cancelled/done) pair can't be revived
+   * by their own marker (see the closed-pair guard below). Capped at one
+   * notice per writer per closure, not per round -- a closed pair's round
+   * never advances again, so a round-scoped cap would either fire once for
+   * the pair's whole remaining lifetime regardless of writer, or (if reset)
+   * never actually cap a writer that keeps re-emitting the same marker.
+   * Cleared whenever Brain/the daemon reopens the pair (D-armed on revival).
+   */
+  closedNoticeSentTo?: readonly string[];
   createdAt: number;
   updatedAt: number;
 }
@@ -825,7 +835,21 @@ export function applyTaskPairMarker(
   // reopened a closed duplicate).
   if ((existing.status === 'cancelled' || existing.status === 'done') && !roleAuthority
     && (verb === 'STARTED' || verb === 'WORKING' || verb === 'READY_FOR_AUDIT' || verb === 'REWORK')) {
-    return recorded(existing, true, [{ kind: 'closed_pair_notice', to: ctx.writer }]);
+    // Capped at one notice per writer per closure (not per round: a closed
+    // pair's round never advances again, so a round-scoped cap would either
+    // fire once for its whole remaining lifetime regardless of writer, or
+    // never actually cap a writer that keeps re-emitting the same marker).
+    // D6.9: every daemon message a participant's own marker triggers must be
+    // bounded (CC8 audit: an agent re-emitting READY_FOR_AUDIT/REWORK after
+    // a lost marker ping-ponged with the daemon without limit).
+    if (existing.closedNoticeSentTo?.includes(ctx.writer)) return recorded(existing);
+    const pair = clonePair(existing);
+    pair.updatedAt = ctx.now;
+    pair.closedNoticeSentTo = [...(existing.closedNoticeSentTo ?? []), ctx.writer];
+    return {
+      pair, fromStatus: existing.status, toStatus: existing.status,
+      effect: 'recorded', unusual: true, intents: [{ kind: 'closed_pair_notice', to: ctx.writer }],
+    };
   }
 
   const pair = clonePair(existing);
@@ -848,6 +872,7 @@ export function applyTaskPairMarker(
       }
       if (terminal) {
         pair.status = 'queued';
+        pair.closedNoticeSentTo = undefined;
         setRolesFromAttrsQueued(pair, attrs);
         if (marker.brief !== undefined) pair.brief = marker.brief;
         unusual = true;
@@ -861,6 +886,7 @@ export function applyTaskPairMarker(
       if (!roleAuthority) return recorded(existing);
       if (terminal) unusual = true;
       resetCaps(pair);
+      if (terminal) pair.closedNoticeSentTo = undefined;
       setRolesFromAttrs(pair, attrs, intents);
       if (!pair.executor) intents.push({ kind: 'pick_executor' });
       if (pair.status === 'queued' || terminal) {

@@ -323,6 +323,38 @@ describe('task-pair state machine', () => {
     }
   });
 
+  it('caps the closed-pair notice at one per writer per closure (D6.9: every marker-triggered message is bounded)', () => {
+    const { intents } = run([
+      [BRAIN, `<!-- IMCODES_TASK DISPATCH T42 executor=${EXEC} auditor=${AUD} -->`],
+      [BRAIN, '<!-- IMCODES_TASK CANCEL T42 -->'],
+      // Same writer, three repeats: only the first gets a notice.
+      [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 -->'],
+      [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 -->'],
+      [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 -->'],
+      // A DIFFERENT writer still gets their own first notice.
+      [AUD, '<!-- IMCODES_TASK REWORK T42 blocking=P0 p0=1 -->'],
+      [AUD, '<!-- IMCODES_TASK REWORK T42 blocking=P0 p0=1 -->'],
+    ]);
+    const execNotices = intents.slice(2, 5);
+    expect(execNotices[0]).toEqual([{ kind: 'closed_pair_notice', to: EXEC }]);
+    expect(execNotices[1]).toEqual([]);
+    expect(execNotices[2]).toEqual([]);
+    const audNotices = intents.slice(5, 7);
+    expect(audNotices[0]).toEqual([{ kind: 'closed_pair_notice', to: AUD }]);
+    expect(audNotices[1]).toEqual([]);
+  });
+
+  it('re-arms the closed-pair notice once Brain reopens the pair', () => {
+    const { pair } = run([
+      [BRAIN, `<!-- IMCODES_TASK DISPATCH T42 executor=${EXEC} auditor=${AUD} -->`],
+      [BRAIN, '<!-- IMCODES_TASK CANCEL T42 -->'],
+      [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 -->'],
+    ]);
+    expect(pair.closedNoticeSentTo).toEqual([EXEC]);
+    const reopened = apply(pair, BRAIN, `<!-- IMCODES_TASK DISPATCH T42 executor=${EXEC} auditor=${AUD} -->`).pair!;
+    expect(reopened.closedNoticeSentTo).toBeUndefined();
+  });
+
   it('sets and clears side flags on progress', () => {
     const blocked = apply(withStatus('working'), EXEC, '<!-- IMCODES_TASK BLOCKED T42 note="need DB creds" -->').pair!;
     expect(blocked.flags).toContain('blocked');
