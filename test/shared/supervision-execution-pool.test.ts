@@ -8,6 +8,7 @@ import {
   normalizeSupervisionExecutionModel,
   normalizeSupervisionExecutionPools,
   planSupervisionExecutionCapacity,
+  supervisionExecutionConfigRole,
   evaluateSupervisionObservedIdentity,
   evaluateSupervisionAutomationPoolGate,
   buildSupervisionPoolGateGuidance,
@@ -106,6 +107,57 @@ describe('supervision execution pools', () => {
       primaryDevelopmentPool: { configs: [presetA] },
       economyTaskPool: { configs: [presetB] },
     });
+  });
+
+  it('keeps a pool entry authored with its exact live model id, instead of silently dropping it (tsk_cd_model_list_unified)', () => {
+    // These entries are authored the way an e2e/config file naturally would --
+    // the capabilityId built from the SAME literal (uncanonicalized) model as
+    // the `model` field -- rather than through `buildSupervisionExecutionCapabilityId`,
+    // which would collapse `claude-opus-4-7` into the generic `opus[1M]` bucket.
+    // Before the fix, `claude-opus-4-7` silently vanished from the pool while
+    // `gpt-6-astra` (a non-Claude agentType, never collapsed) survived.
+    const liveClaude = {
+      agentType: 'claude-code-sdk', providerFamily: 'anthropic', runtimeType: 'transport' as const,
+      model: 'claude-opus-4-7', role: 'auditor' as const,
+      capabilityId: 'supervision-exec-v1:transport:claude-code-sdk:anthropic:claude-opus-4-7',
+    };
+    const liveCodex = {
+      agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport' as const,
+      model: 'gpt-6-astra', role: 'executor' as const,
+      capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-6-astra',
+    };
+    const normalizedPools = normalizeSupervisionExecutionPools({
+      state: 'configured',
+      primaryDevelopmentPool: { configs: [liveClaude, liveCodex] },
+      economyTaskPool: { configs: [] },
+    });
+    // Neither entry was silently dropped. `gpt-6-astra` (a non-Claude
+    // agentType) keeps its exact literal id; `claude-opus-4-7` collapses to
+    // the canonical `opus[1M]` bucket, same as any other Claude Code family
+    // alias -- that collapsing is deliberate, existing, tested behavior (see
+    // "binds an observed ... to the canonical opus[1M] config" above). The
+    // bug was outright rejection of the whole entry, not this collapsing.
+    expect(normalizedPools.primaryDevelopmentPool.configs).toHaveLength(2);
+    const claudeEntry = normalizedPools.primaryDevelopmentPool.configs.find((c) => c.agentType === 'claude-code-sdk')!;
+    const codexEntry = normalizedPools.primaryDevelopmentPool.configs.find((c) => c.agentType === 'codex-sdk')!;
+    expect(claudeEntry.model).toBe('opus[1M]');
+    expect(codexEntry.model).toBe('gpt-6-astra');
+    expect(supervisionExecutionConfigRole(claudeEntry)).toBe('auditor');
+    expect(supervisionExecutionConfigRole(codexEntry)).toBe('executor');
+    // Picked for its role: a session actually running the live model id
+    // binds to its pool entry (both sides are normalized for comparison).
+    expect(evaluateSupervisionExecutionBinding({
+      pools: normalizedPools, pool: 'primary',
+      actual: actual(claudeEntry, { model: 'claude-opus-4-7' }),
+    })).toMatchObject({ ok: true, requested: { model: 'opus[1M]' } });
+    expect(evaluateSupervisionExecutionBinding({
+      pools: normalizedPools, pool: 'primary', actual: actual(codexEntry),
+    })).toMatchObject({ ok: true, requested: { model: 'gpt-6-astra' } });
+  });
+
+  it('still refuses an identity-laundered capabilityId that matches neither the literal nor the canonical derivation', () => {
+    const preset = config('claude-code-sdk', 'anthropic', 'MiniMax-M3', 'preset-a');
+    expect(normalizeSupervisionExecutionConfig({ ...preset, capabilityId: opus.capabilityId })).toBeUndefined();
   });
 
   it('fails closed for malformed, unsupported, missing, or mismatched CC preset identity', () => {

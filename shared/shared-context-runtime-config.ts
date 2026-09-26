@@ -4,6 +4,8 @@ import {
   CLAUDE_CODE_MODEL_IDS,
   CODEX_MODEL_IDS,
   DEFAULT_CODEX_AUTOMATION_MODEL,
+  looksLikeCodexModelId,
+  normalizeClaudeCodeModelId,
 } from '../src/shared/models/options.js';
 import { QWEN_MODEL_IDS } from './qwen-models.js';
 import {
@@ -84,6 +86,13 @@ export function inferSharedContextRuntimeBackend(model: string | null | undefine
   if (CLAUDE_CODE_MODEL_IDS.includes(trimmed as typeof CLAUDE_CODE_MODEL_IDS[number])) return 'claude-code-sdk';
   if (CODEX_MODEL_IDS.includes(trimmed as typeof CODEX_MODEL_IDS[number])) return 'codex-sdk';
   if (QWEN_MODEL_IDS.includes(trimmed as typeof QWEN_MODEL_IDS[number])) return 'qwen';
+  // A live model the daemon's SDK/provider probe returned isn't in any static
+  // list yet (a newly released id such as `gpt-6-luna` or `claude-opus-4-7`).
+  // Classify it by naming convention instead of leaving it unclassified,
+  // which would otherwise silently fall back to the default backend and
+  // validate the model against the WRONG provider's catalog.
+  if (normalizeClaudeCodeModelId(trimmed)) return 'claude-code-sdk';
+  if (looksLikeCodexModelId(trimmed)) return 'codex-sdk';
   return undefined;
 }
 
@@ -98,6 +107,19 @@ export function doesSharedContextBackendSupportPresets(backend: SharedContextRun
   return backend === 'qwen' || backend === 'claude-code-sdk';
 }
 
+/**
+ * Whether `model` is an acceptable value for `backend`.
+ *
+ * The static `*_MODEL_IDS` lists are a fallback suggestion list, not an
+ * allowlist: the daemon's live SDK/provider probe routinely returns models
+ * released after this file was last updated (`gpt-6-luna`, `claude-opus-4-7`,
+ * ...), and a static membership check silently rejected/replaced them. This
+ * only rejects a model that is recognizably a DIFFERENT backend's model (by
+ * static membership or naming pattern) — cross-backend confusion (a Claude
+ * alias configured under `qwen`, say) is still a real mistake worth catching.
+ * Anything else, including an unrecognized-but-plausible live id for the
+ * given backend, is accepted.
+ */
 export function isKnownSharedContextModelForBackend(
   backend: SharedContextRuntimeBackend,
   model: string | null | undefined,
@@ -105,20 +127,27 @@ export function isKnownSharedContextModelForBackend(
 ): boolean {
   const trimmed = model?.trim();
   if (!trimmed) return false;
+  // A preset pins the model its third-party endpoint serves (e.g. MiniMax-M3),
+  // which won't match any provider's own naming pattern — accept any non-empty
+  // model while a preset is active.
+  if (preset?.trim() && doesSharedContextBackendSupportPresets(backend)) return true;
+  // A bare backend id (e.g. "qwen") is never a real model id for any backend
+  // -- it is a degenerate/placeholder value (an unset field synced verbatim
+  // from its own backend name), not a live model the static list doesn't
+  // know about yet.
+  if ((SHARED_CONTEXT_RUNTIME_BACKENDS as readonly string[]).includes(trimmed)) return false;
+  const isClaudeShaped = CLAUDE_CODE_MODEL_IDS.includes(trimmed as typeof CLAUDE_CODE_MODEL_IDS[number])
+    || !!normalizeClaudeCodeModelId(trimmed);
+  const isCodexShaped = CODEX_MODEL_IDS.includes(trimmed as typeof CODEX_MODEL_IDS[number])
+    || looksLikeCodexModelId(trimmed);
+  const isQwenShaped = QWEN_MODEL_IDS.includes(trimmed as typeof QWEN_MODEL_IDS[number]);
   switch (backend) {
     case 'claude-code-sdk':
-      // A preset pins the model its third-party endpoint serves (e.g.
-      // MiniMax-M3), which won't be in the built-in Claude model list — accept
-      // any non-empty model when a preset is active, mirroring the qwen case.
-      return preset?.trim()
-        ? true
-        : CLAUDE_CODE_MODEL_IDS.includes(trimmed as typeof CLAUDE_CODE_MODEL_IDS[number]);
+      return !isCodexShaped && !isQwenShaped;
     case 'codex-sdk':
-      return CODEX_MODEL_IDS.includes(trimmed as typeof CODEX_MODEL_IDS[number]);
+      return !isClaudeShaped && !isQwenShaped;
     case 'qwen':
-      return preset?.trim()
-        ? true
-        : QWEN_MODEL_IDS.includes(trimmed as typeof QWEN_MODEL_IDS[number]);
+      return !isClaudeShaped && !isCodexShaped;
     case 'openclaw':
       return true;
   }

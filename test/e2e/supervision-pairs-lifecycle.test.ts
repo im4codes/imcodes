@@ -91,13 +91,18 @@ function session(name: string, role: SessionRecord['role'], agentType: SessionRe
 // with no pool there is no built-in default any more (tsk_cd_pairs_no_pool_ask),
 // so the Brain names the pool roles this E2E relies on — luna executes, the
 // Opus sub-session audits.
+// The auditor entry pins the exact live model id ("claude-opus-4-7", not the
+// generic "opus[1M]" bucket) with a capabilityId built from that same literal
+// model -- exactly how this pool entry silently vanished before
+// tsk_cd_model_list_unified fixed normalizeSupervisionExecutionConfig's
+// round-trip. Keeping it this way here is the regression coverage.
 const PAIR_POOLS = {
   state: 'configured' as const,
   economyTaskPool: { configs: [], controls: { leaseMs: 900000, maxSpawned: 2, changeBudget: 40, maxConcurrency: 4, auditHeadroomPerProviderFamily: 1 } },
   primaryDevelopmentPool: {
     configs: [
       { model: 'gpt-6-luna', agentType: 'codex-sdk', runtimeType: 'transport' as const, capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-6-luna', providerFamily: 'openai', role: 'executor' as const },
-      { model: 'opus[1M]', agentType: 'claude-code-sdk', runtimeType: 'transport' as const, capabilityId: 'supervision-exec-v1:transport:claude-code-sdk:anthropic:opus[1M]', providerFamily: 'anthropic', role: 'auditor' as const },
+      { model: 'claude-opus-4-7', agentType: 'claude-code-sdk', runtimeType: 'transport' as const, capabilityId: 'supervision-exec-v1:transport:claude-code-sdk:anthropic:claude-opus-4-7', providerFamily: 'anthropic', role: 'auditor' as const },
     ],
     controls: { leaseMs: 1800000, maxSpawned: 2, changeBudget: 200, maxConcurrency: 4, auditHeadroomPerProviderFamily: 1 },
   },

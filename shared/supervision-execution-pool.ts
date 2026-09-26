@@ -245,9 +245,11 @@ export function normalizeSupervisionExecutionModel(agentType: string, model: str
   return normalizeClaudeCodeModelId(trimmed) ?? trimmed;
 }
 
-export function buildSupervisionExecutionCapabilityId(input: Omit<SupervisionExecutionConfig, 'capabilityId'>): string {
-  const model = normalizeSupervisionExecutionModel(input.agentType, input.model);
-  const base = `supervision-exec-v1:${input.runtimeType}:${input.agentType}:${input.providerFamily}:${model}`;
+/** Builds the capabilityId string from `input.model` exactly as given, with no canonicalization. */
+function buildSupervisionExecutionCapabilityIdForModel(
+  input: Omit<SupervisionExecutionConfig, 'capabilityId'>,
+): string {
+  const base = `supervision-exec-v1:${input.runtimeType}:${input.agentType}:${input.providerFamily}:${input.model}`;
   if (input.ccPresetId === undefined) return base;
   const backend = normalizeSharedContextRuntimeBackend(input.agentType);
   if (!backend || !doesSharedContextBackendSupportPresets(backend)
@@ -257,7 +259,12 @@ export function buildSupervisionExecutionCapabilityId(input: Omit<SupervisionExe
   // Preset-backed constraints use a disjoint namespace. Appending to the
   // legacy id would let an ordinary model containing the suffix grammar alias
   // a preset-backed capability.
-  return `supervision-exec-v1-cc-preset:${input.runtimeType}:${input.agentType}:${input.providerFamily}:${encodeURIComponent(input.ccPresetId)}:${model}`;
+  return `supervision-exec-v1-cc-preset:${input.runtimeType}:${input.agentType}:${input.providerFamily}:${encodeURIComponent(input.ccPresetId)}:${input.model}`;
+}
+
+export function buildSupervisionExecutionCapabilityId(input: Omit<SupervisionExecutionConfig, 'capabilityId'>): string {
+  const model = normalizeSupervisionExecutionModel(input.agentType, input.model);
+  return buildSupervisionExecutionCapabilityIdForModel({ ...input, model });
 }
 
 export function isExcludedDevelopmentModel(model: string): boolean {
@@ -279,8 +286,18 @@ export function normalizeSupervisionExecutionConfig(value: unknown): Supervision
   if (source.ccPresetId !== undefined
     && (!ccPresetId || !backend || !doesSharedContextBackendSupportPresets(backend))) return undefined;
   const canonical = normalizeSupervisionExecutionModel(agentType, model);
-  const expected = buildSupervisionExecutionCapabilityId({ agentType, providerFamily, runtimeType, model: canonical, ccPresetId });
-  if (source.capabilityId !== expected) return undefined;
+  const expected = buildSupervisionExecutionCapabilityIdForModel({ agentType, providerFamily, runtimeType, model: canonical, ccPresetId });
+  // A config entry authored directly against its exact live model id (e.g.
+  // `claude-opus-4-7`, a model newer than the picker's canonical-alias
+  // collapsing rules) builds its capabilityId from that literal, uncollapsed
+  // model. Accept that form too -- rejecting it here silently dropped the
+  // whole pool entry (tsk_cd_model_list_unified), even though nothing about
+  // it is malformed. A capabilityId that matches NEITHER derivation (the
+  // identity-laundering case the tests below cover) is still rejected.
+  const literalExpected = canonical === model
+    ? expected
+    : buildSupervisionExecutionCapabilityIdForModel({ agentType, providerFamily, runtimeType, model, ccPresetId });
+  if (source.capabilityId !== expected && source.capabilityId !== literalExpected) return undefined;
   // 'both' and absent/invalid both mean the default; omitting them from the
   // normalized output keeps existing entries (and round-trip equality tests)
   // byte-stable, since role never feeds into capabilityId identity.

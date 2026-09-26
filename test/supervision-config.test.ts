@@ -140,7 +140,28 @@ describe('supervision config helpers', () => {
     expect(config.maxAutoContinueTotal).toBe(DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL);
   });
 
-  it('falls back to the backend default model when the model is invalid', () => {
+  it('falls back to the backend default model when the model belongs to a different backend', () => {
+    // 'sonnet' is a recognized Claude Code alias -- configuring it under
+    // `qwen` is a genuine cross-backend mistake, not merely an id the static
+    // list doesn't know about yet, so it is still replaced.
+    const config = normalizeSupervisorDefaultConfig({
+      backend: 'qwen',
+      model: 'sonnet',
+      timeoutMs: 15_000,
+      promptVersion: 'custom_prompt_v1',
+    });
+
+    expect(config.backend).toBe('qwen');
+    expect(config.model).toBe('qwen3-coder-plus');
+    expect(config.timeoutMs).toBe(SUPERVISION_MIN_TIMEOUT_MS);
+    expect(config.promptVersion).toBe('custom_prompt_v1');
+  });
+
+  // tsk_cd_model_list_unified: an id that merely isn't in the static list yet
+  // (as opposed to one recognizably belonging to a DIFFERENT backend) must
+  // survive -- silently replacing it with the default discards the user's
+  // real, live model choice.
+  it('keeps a live model unknown to the static list instead of silently replacing it', () => {
     const config = normalizeSupervisorDefaultConfig({
       backend: 'qwen',
       model: 'not-a-real-model',
@@ -149,7 +170,7 @@ describe('supervision config helpers', () => {
     });
 
     expect(config.backend).toBe('qwen');
-    expect(config.model).toBe('qwen3-coder-plus');
+    expect(config.model).toBe('not-a-real-model');
     expect(config.timeoutMs).toBe(SUPERVISION_MIN_TIMEOUT_MS);
     expect(config.promptVersion).toBe('custom_prompt_v1');
   });
@@ -894,7 +915,13 @@ describe('supervision config helpers', () => {
       expect(issues).not.toContain('invalid_model');
     });
 
-    it('unknown qwen model without preset still fails validation', () => {
+    // A model name absent from the static per-backend list is no longer
+    // grounds for rejection (tsk_cd_model_list_unified): the daemon's live
+    // SDK/provider probe returns models this file has never heard of, and a
+    // static allowlist here silently dropped/replaced them. Only truly empty
+    // model text is invalid; `isKnownSharedContextModelForBackend` now checks
+    // that and nothing else.
+    it('a live model absent from the static per-backend list still passes validation', () => {
       const issues = getSessionSupervisionSnapshotIssues({
         mode: SUPERVISION_MODE.SUPERVISED,
         backend: 'qwen',
@@ -903,7 +930,31 @@ describe('supervision config helpers', () => {
         promptVersion: SUPERVISION_DEFAULT_PROMPT_VERSION,
         maxParseRetries: 1,
       });
-      expect(issues).toContain('invalid_model');
+      expect(issues).not.toContain('invalid_model');
+    });
+
+    it.each(['gpt-6-luna', 'gpt-6-astra'])('a new live Codex model id (%s) passes validation for codex-sdk', (model) => {
+      const issues = getSessionSupervisionSnapshotIssues({
+        mode: SUPERVISION_MODE.SUPERVISED,
+        backend: 'codex-sdk',
+        model,
+        timeoutMs: 12_000,
+        promptVersion: SUPERVISION_DEFAULT_PROMPT_VERSION,
+        maxParseRetries: 1,
+      });
+      expect(issues).not.toContain('invalid_model');
+    });
+
+    it('a new live Claude model id (claude-opus-4-7) passes validation for claude-code-sdk', () => {
+      const issues = getSessionSupervisionSnapshotIssues({
+        mode: SUPERVISION_MODE.SUPERVISED,
+        backend: 'claude-code-sdk',
+        model: 'claude-opus-4-7',
+        timeoutMs: 12_000,
+        promptVersion: SUPERVISION_DEFAULT_PROMPT_VERSION,
+        maxParseRetries: 1,
+      });
+      expect(issues).not.toContain('invalid_model');
     });
 
     it('resolveEffectiveCustomInstructions reads from the snapshot fields', () => {

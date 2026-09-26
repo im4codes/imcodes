@@ -29,6 +29,17 @@ export const DEFAULT_CODEX_SESSION_MODEL = 'gpt-6-sol' as const;
 export const CODEX_MODEL_IDS = [DEFAULT_CODEX_SESSION_MODEL, 'gpt-5.6-sol', 'gpt-5.6', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', DEFAULT_CODEX_AUTOMATION_MODEL, 'gpt-5.2'] as const;
 export type CodexModelId = typeof CODEX_MODEL_IDS[number];
 
+/**
+ * Pattern match for a Codex/OpenAI-shaped model id that the static
+ * `CODEX_MODEL_IDS` list doesn't know about yet (a newly released model such
+ * as `gpt-6-luna` or `gpt-6-astra`). Used to classify a live/user-named model
+ * by naming convention rather than rejecting it for being absent from the
+ * static fallback list.
+ */
+export function looksLikeCodexModelId(value: string): boolean {
+  return /^(gpt-\d|o\d(?:$|[-_.])|codex[-_])/i.test(value.trim());
+}
+
 export const GEMINI_MODEL_IDS = [
   'auto',
   'gemini-2.5-pro',
