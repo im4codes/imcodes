@@ -362,7 +362,7 @@ export class TaskPairService {
       stored = store.savePair(input.project, pairToSave, {
         liveness: this.#livenessAfterMarker(existing?.liveness, transition, role, now),
       });
-      void refreshTaskPairWorkspaceHead(input.project, stored.state.taskId);
+      this.#track(refreshTaskPairWorkspaceHead(input.project, stored.state.taskId));
     }
     this.#emitEvent(input, taskId ?? input.marker.taskId, role, transition, stored?.state ?? existing?.state);
     const holdsAutoPickAuditor = input.suppressAutoPickAuditor

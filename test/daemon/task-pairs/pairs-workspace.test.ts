@@ -23,6 +23,7 @@ import type { SessionRecord } from '../../../src/store/session-store.js';
 import { removeSession, upsertSession } from '../../../src/store/session-store.js';
 import { TaskPairStore, getTaskPairStore, setTaskPairStoreForTests } from '../../../src/daemon/task-pairs/store.js';
 import { resetTaskPairFocusForTests, setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
+import { setTaskPairMaterialDepsForTests } from '../../../src/daemon/task-pairs/material.js';
 import { ensureTaskPairWorkspaceAvailable, refreshTaskPairWorkspaceHead, taskPairService } from '../../../src/daemon/task-pairs/service.js';
 import {
   releaseTaskPairWorkspace,
@@ -132,10 +133,17 @@ describe('pair workspaces', () => {
     useProject(project);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     vi.restoreAllMocks();
+    // Markers fired through marker()/ingestText in this suite start
+    // background work (workspace provisioning, briefs, head refreshes) that
+    // this file never subscribes/disposes for -- wait for it before the
+    // store underneath it closes, or a late write throws against an
+    // already-closed database (the original tsk_cd_pairs_bg_drain report).
+    await taskPairService.waitForIdle();
     setTaskPairDeliveryDepsForTests(undefined);
     setTaskPairWorkspaceDepsForTests(undefined);
+    setTaskPairMaterialDepsForTests(undefined);
     setTaskPairStoreForTests(undefined);
     resetTaskPairFocusForTests();
     for (const name of [BRAIN, EXEC, AUD]) removeSession(name);
@@ -524,6 +532,39 @@ describe('pair workspaces', () => {
     // still in flight.
     setTaskPairStoreForTests(new TaskPairStore(':memory:'));
     await expect(refresh).resolves.toBeUndefined();
+  });
+
+  it('tracks applyMarker\'s refreshTaskPairWorkspaceHead call so it can be drained deterministically, not just relying on its own try/catch', async () => {
+    // The test above pins that the function itself never rejects. This pins
+    // the other half of the original tsk_cd_pairs_bg_drain report: applyMarker
+    // starts it via a bare, untracked call, so nothing could ever wait for it
+    // -- a test (or daemon shutdown) that closes the store right after a
+    // marker has no way to know this write is still coming. #track fixes
+    // that; this proves it deterministically, not by racing a real git
+    // subprocess against machine load.
+    await opened('R9');
+    // WORKING on an already-working pair is a plain status echo: it produces
+    // no intents (unlike READY_FOR_AUDIT's audit_request, which would also
+    // call resolveTaskPairMaterial via #executeIntents and confound which
+    // tracked call is actually being observed here).
+    const resolvers: Array<(head: string | undefined) => void> = [];
+    setTaskPairMaterialDepsForTests({
+      gitHead: () => new Promise((resolve) => { resolvers.push(resolve); }),
+    });
+
+    marker(EXEC, '<!-- IMCODES_TASK WORKING R9 -->');
+    // Let #executeIntents([]) -- tracked for every marker regardless of
+    // whether it has any intents to run -- settle its own trivial promise, so
+    // the only thing that could still be keeping pendingCount above zero here
+    // is refreshTaskPairWorkspaceHead's real, still-in-flight gitHead await.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(taskPairService.pendingCount).toBeGreaterThan(0);
+
+    for (const resolve of resolvers) resolve('deadbeefcafefeed0000000000000000000000');
+    await taskPairService.waitForIdle();
+
+    expect(taskPairService.pendingCount).toBe(0);
+    expect(pair('R9').workspace?.lastHead).toBe('deadbeefcafefeed0000000000000000000000');
   });
 
   describe('deliverables', () => {
